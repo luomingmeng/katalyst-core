@@ -216,7 +216,7 @@ func TestUpdate(t *testing.T) {
 						1: machine.MustParse("25"),
 					}, 200<<30),
 			},
-			wantHeadroom: *resource.NewQuantity(796<<30, resource.DecimalSI),
+			wantHeadroom: *resource.NewQuantity(1000<<30-4<<30-8<<30, resource.DecimalSI),
 		},
 	}
 
