@@ -399,6 +399,11 @@ func (p *topologyAdapterImpl) getZoneAllocations(podList []*v1.Pod, podResources
 			continue
 		}
 
+		if pod.Status.Phase == v1.PodFailed ||
+			pod.Status.Phase == v1.PodSucceeded {
+			continue
+		}
+
 		// the pod resource filter will filter out unwanted pods
 		if p.podResourcesFilter != nil {
 			podResources, err = p.podResourcesFilter(pod, podResources)
