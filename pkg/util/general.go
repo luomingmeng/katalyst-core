@@ -29,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
+	"github.com/kubewharf/katalyst-core/pkg/util/native"
 )
 
 // WorkloadSPDEnabledFunc checks if the given workload is enabled with service profiling.
@@ -36,7 +37,8 @@ type WorkloadSPDEnabledFunc func(metav1.Object) bool
 
 var workloadSPDEnabledLock sync.RWMutex
 var workloadSPDEnabled WorkloadSPDEnabledFunc = func(workload metav1.Object) bool {
-	return workload.GetAnnotations()[apiconsts.WorkloadAnnotationSPDEnableKey] == apiconsts.WorkloadAnnotationSPDEnabled
+	enable, _ := native.GetObjectAnnotation(workload, apiconsts.WorkloadAnnotationSPDEnableKey)
+	return enable == apiconsts.WorkloadAnnotationSPDEnabled
 }
 
 // SetWorkloadEnableFunc provides a way to set the

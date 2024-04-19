@@ -47,7 +47,7 @@ func (wo *WebhookVPAOverlapValidator) ValidateVPA(vpa *apis.KatalystVerticalPodA
 	}
 
 	// todo: add cache here to avoid list all vpa
-	vpas, err := wo.vpaLister.List(labels.Everything())
+	vpas, err := wo.vpaLister.KatalystVerticalPodAutoscalers(vpa.Namespace).List(labels.Everything())
 	if err != nil {
 		return false, "failed to list all vpas", err
 	}

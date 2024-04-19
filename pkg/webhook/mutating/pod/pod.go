@@ -168,20 +168,20 @@ func (wp *WebhookPod) Mutate(ctx context.Context, obj metav1.Object) (bool, erro
 		return false, err
 	}
 
-	klog.V(5).Infof("begin to mutate pod %s", pod.Name)
+	klog.V(5).Infof("begin to mutate pod %s", ar.Name)
 	for _, mutator := range wp.mutators {
 		mutated, err := mutator.MutatePod(pod, ar.Namespace)
 		if err != nil {
-			klog.Errorf("failed to mutate pod %s: %v", pod.Name, err)
+			klog.Errorf("failed to mutate pod %s: %v", ar.Name, err)
 			return false, err
 		}
 		if !mutated {
-			klog.Infof("pod %s mutation isn't allowed", pod.Name)
+			klog.Infof("pod %s mutation isn't allowed", ar.Name)
 			return false, nil
 		}
 	}
 
-	klog.Infof("pod %s was mutated ", pod.Name)
+	klog.Infof("pod %s was mutated ", ar.Name)
 	return true, nil
 
 }

@@ -34,6 +34,7 @@ import (
 )
 
 var (
+	objectFieldsForAnnotations         = []string{"metadata", "annotations"}
 	objectFieldsForLabelSelector       = []string{"spec", "selector"}
 	objectFieldsForTemplateAnnotations = []string{"spec", "template", "metadata", "annotations"}
 	objectFieldsForPodTemplate         = []string{"spec", "template"}
@@ -152,8 +153,7 @@ func CheckObjectEqual(obj1, obj2 metav1.Object) bool {
 
 // GetUnstructuredSelector parse a unstructured object and return its labelSelector (for pods)
 func GetUnstructuredSelector(object *unstructured.Unstructured) (labels.Selector, error) {
-	anno := object.GetAnnotations()
-	if selectorStr, ok := anno[consts.WorkloadAnnotationVPASelectorKey]; ok {
+	if selectorStr, ok := GetUnstructuredAnnotation(object, consts.WorkloadAnnotationVPASelectorKey); ok {
 		selector, err := labels.Parse(selectorStr)
 		if err != nil {
 			return nil, err
@@ -172,6 +172,27 @@ func GetUnstructuredSelector(object *unstructured.Unstructured) (labels.Selector
 	_ = runtime.DefaultUnstructuredConverter.FromUnstructured(val.(map[string]interface{}), selector)
 
 	return metav1.LabelSelectorAsSelector(selector)
+}
+
+// GetObjectAnnotation retrieves the annotation value for a specified key from a metav1.Object to avoid map copy.
+func GetObjectAnnotation(object metav1.Object, key string) (string, bool) {
+	var (
+		value string
+		has   bool
+	)
+	if u, ok := object.(*unstructured.Unstructured); ok {
+		value, has = GetUnstructuredAnnotation(u, key)
+	} else {
+		value, has = object.GetAnnotations()[key]
+	}
+
+	return value, has
+}
+
+// GetUnstructuredAnnotation retrieves the annotation value for a specified key from an unstructured.Unstructured object to avoid map copy.
+func GetUnstructuredAnnotation(object *unstructured.Unstructured, key string) (string, bool) {
+	value, found, _ := unstructured.NestedString(object.Object, append(objectFieldsForAnnotations, key)...)
+	return value, found
 }
 
 // GetUnstructuredTemplateAnnotations parse a unstructured object and return its template's annotations (for workload like deployments, statefulsets)

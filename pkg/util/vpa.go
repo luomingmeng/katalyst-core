@@ -153,7 +153,7 @@ func GetWorkloadForVPA(vpa *apis.KatalystVerticalPodAutoscaler, workloadLister c
 // GetVPAForWorkload is used to get vpa that should manage the given workload
 func GetVPAForWorkload(workload *unstructured.Unstructured, vpaIndexer cache.Indexer,
 	vpaLister autoscalelister.KatalystVerticalPodAutoscalerLister) (*apis.KatalystVerticalPodAutoscaler, error) {
-	if vpaName, ok := workload.GetAnnotations()[apiconsts.WorkloadAnnotationVPANameKey]; ok {
+	if vpaName, ok := native.GetUnstructuredAnnotation(workload, apiconsts.WorkloadAnnotationVPANameKey); ok {
 		vpa, err := vpaLister.KatalystVerticalPodAutoscalers(workload.GetNamespace()).Get(vpaName)
 		if err == nil && checkTargetRefMatch(vpa.Spec.TargetRef, workload) {
 			return vpa, nil
@@ -352,7 +352,8 @@ func CheckWorkloadEnableVPA(runtimeObject runtime.Object) bool {
 		return false
 	}
 
-	return object.GetAnnotations()[apiconsts.WorkloadAnnotationVPAEnabledKey] == apiconsts.WorkloadAnnotationVPAEnabled
+	enable, _ := native.GetObjectAnnotation(object, apiconsts.WorkloadAnnotationVPAEnabledKey)
+	return enable == apiconsts.WorkloadAnnotationVPAEnabled
 }
 
 func CheckVPARecommendationMatchVPA(vpaRec *apis.VerticalPodAutoscalerRecommendation, vpa *apis.KatalystVerticalPodAutoscaler) bool {

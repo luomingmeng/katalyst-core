@@ -519,7 +519,7 @@ func (vc *VPAController) filterPodsByUpdatePolicy(vpa *apis.KatalystVerticalPodA
 
 // setVPAAnnotations add vpa name in workload annotations
 func (vc *VPAController) setVPAAnnotations(workload *unstructured.Unstructured, gvk schema.GroupVersionKind, vpaName string) error {
-	if workload.GetAnnotations()[apiconsts.WorkloadAnnotationVPANameKey] == vpaName {
+	if name, _ := native.GetUnstructuredAnnotation(workload, apiconsts.WorkloadAnnotationVPANameKey); name == vpaName {
 		return nil
 	}
 
@@ -544,7 +544,7 @@ func (vc *VPAController) setVPAAnnotations(workload *unstructured.Unstructured, 
 
 // cleanVPAAnnotations removes vpa name in workload annotations
 func (vc *VPAController) cleanVPAAnnotations(workload *unstructured.Unstructured, gvk schema.GroupVersionKind) error {
-	if _, ok := workload.GetAnnotations()[apiconsts.WorkloadAnnotationVPANameKey]; !ok {
+	if _, ok := native.GetUnstructuredAnnotation(workload, apiconsts.WorkloadAnnotationVPANameKey); !ok {
 		return nil
 	}
 
