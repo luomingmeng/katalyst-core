@@ -207,16 +207,17 @@ func (p *MetricSyncerPod) receiveRawPod(ctx context.Context, pod *v1.Pod, rChan 
 			klog.V(4).Infof("get metric %v for pod %v, collect time %+v, left len %v",
 				response.Req.MetricName, name, response.Time, len(rChan))
 			if len(tags) > 0 {
-				_ = p.dataEmitter.StoreFloat64(targetMetricName, response.Value, metrics.MetricTypeNameRaw, append(tags,
-					metrics.MetricTag{
-						Key: fmt.Sprintf("%s", data.CustomMetricLabelKeyTimestamp),
-						Val: fmt.Sprintf("%v", response.Time.UnixMilli()),
-					},
+				metricTags := append(tags,
 					metrics.MetricTag{
 						Key: fmt.Sprintf("%scontainer", data.CustomMetricLabelSelectorPrefixKey),
 						Val: response.Req.ContainerName,
 					},
-				)...)
+				)
+				_ = p.dataEmitter.StoreFloat64(targetMetricName, response.Value, metrics.MetricTypeNameRaw, append(metricTags, metrics.MetricTag{
+					Key: fmt.Sprintf("%s", data.CustomMetricLabelKeyTimestamp),
+					Val: fmt.Sprintf("%v", response.Time.UnixMilli()),
+				})...)
+				_ = p.metricEmitter.StoreFloat64(targetMetricName, response.Value, metrics.MetricTypeNameRaw, metricTags...)
 			}
 		case <-ctx.Done():
 			klog.Infof("all metric emitters should be stopped, pod %v", name)
