@@ -87,6 +87,8 @@ type spdFetcher struct {
 	checkpointManager checkpointmanager.CheckpointManager
 	getPodSPDNameFunc GetPodSPDNameFunc
 
+	serviceProfileEnableNamespaces []string
+
 	// spdCache is a cache of namespace/name to current target spd
 	spdCache *Cache
 }
@@ -101,11 +103,12 @@ func NewSPDFetcher(clientSet *client.GenericClientSet, emitter metrics.MetricEmi
 	}
 
 	m := &spdFetcher{
-		started:           atomic.NewBool(false),
-		client:            clientSet,
-		emitter:           emitter,
-		checkpointManager: checkpointManager,
-		cncFetcher:        cncFetcher,
+		started:                        atomic.NewBool(false),
+		client:                         clientSet,
+		emitter:                        emitter,
+		checkpointManager:              checkpointManager,
+		cncFetcher:                     cncFetcher,
+		serviceProfileEnableNamespaces: conf.ServiceProfileEnableNamespaces,
 	}
 
 	m.getPodSPDNameFunc = util.GetPodSPDName
@@ -125,7 +128,12 @@ func (s *spdFetcher) GetSPD(ctx context.Context, podMeta metav1.ObjectMeta) (*wo
 		return nil, errors.NewNotFound(workloadapis.Resource(workloadapis.ResourceNameServiceProfileDescriptors), fmt.Sprintf("for pod(%v/%v)", podMeta.Namespace, podMeta.Name))
 	}
 
-	return s.getSPDByNamespaceName(ctx, podMeta.GetNamespace(), spdName)
+	spdNamespace := podMeta.GetNamespace()
+	if !general.IsNameEnabled(spdNamespace, nil, s.serviceProfileEnableNamespaces) {
+		return nil, errors.NewNotFound(workloadapis.Resource(workloadapis.ResourceNameServiceProfileDescriptors), fmt.Sprintf("for pod(%v/%v)", podMeta.Namespace, podMeta.Name))
+	}
+
+	return s.getSPDByNamespaceName(ctx, spdNamespace, spdName)
 }
 
 // SetGetPodSPDNameFunc set get spd name function to override default getPodSPDNameFunc before started
