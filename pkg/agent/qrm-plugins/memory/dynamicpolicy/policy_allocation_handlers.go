@@ -80,11 +80,7 @@ func (p *DynamicPolicy) reclaimedCoresAllocationHandler(ctx context.Context,
 		return nil, fmt.Errorf("not support inplace update resize for reclaiemd cores")
 	}
 
-	// TODO: currently we set all numas as cpuset.mems for reclaimed_cores containers,
-	// 	we will support adjusting cpuset.mems for reclaimed_cores dynamically according to memory advisor.
-	// Notice: before supporting dynamic adjustment, not to hybrid reclaimed_cores
-	//  with dedicated_cores numa_binding containers.
-	return p.allocateTargetNUMAs(req, apiconsts.PodAnnotationQoSLevelReclaimedCores, p.topology.CPUDetails.NUMANodes())
+	return p.reclaimedCoresNUMABindingAllocationHandler(ctx, req)
 }
 
 func (p *DynamicPolicy) dedicatedCoresAllocationHandler(ctx context.Context,
@@ -216,6 +212,89 @@ func (p *DynamicPolicy) numaBindingAllocationHandler(ctx context.Context,
 
 	podResourceEntries = p.state.GetPodResourceEntries()
 	machineState, err = state.GenerateMachineStateFromPodEntries(p.state.GetMachineInfo(), podResourceEntries, p.state.GetReservedMemory())
+	if err != nil {
+		general.Errorf("pod: %s/%s, container: %s GenerateMachineStateFromPodEntries failed with error: %v",
+			req.PodNamespace, req.PodName, req.ContainerName, err)
+		return nil, fmt.Errorf("calculate memoryState by updated pod entries failed with error: %v", err)
+	}
+	p.state.SetMachineState(machineState)
+
+	err = p.adjustAllocationEntries()
+	if err != nil {
+		return nil, fmt.Errorf("adjustAllocationEntries failed with error: %v", err)
+	}
+
+	resp, err := packAllocationResponse(allocationInfo, req)
+	if err != nil {
+		general.Errorf("pod: %s/%s, container: %s packAllocationResponse failed with error: %v",
+			req.PodNamespace, req.PodName, req.ContainerName, err)
+		return nil, fmt.Errorf("packAllocationResponse failed with error: %v", err)
+	}
+	return resp, nil
+}
+
+func (p *DynamicPolicy) reclaimedCoresNUMABindingAllocationHandler(ctx context.Context,
+	req *pluginapi.ResourceRequest,
+) (*pluginapi.ResourceAllocationResponse, error) {
+	if req.ContainerType == pluginapi.ContainerType_SIDECAR {
+		// sidecar container admit after main container
+		return p.numaBindingAllocationSidecarHandler(ctx, req, apiconsts.PodAnnotationQoSLevelReclaimedCores)
+	}
+
+	allocationInfo := p.state.GetAllocationInfo(v1.ResourceMemory, req.PodUid, req.ContainerName)
+	if allocationInfo != nil {
+		general.InfoS("already allocated and meet requirement",
+			"podNamespace", req.PodNamespace,
+			"podName", req.PodName,
+			"containerName", req.ContainerName,
+			"memoryReq(bytes)", allocationInfo.AggregatedQuantity,
+			"currentResult(bytes)", allocationInfo.AggregatedQuantity)
+		return packAllocationResponse(allocationInfo, req)
+	}
+
+	// use the pod aggregated request to instead of main container.
+	podAggregatedRequest, _, err := util.GetPodAggregatedRequestResource(req)
+	if err != nil {
+		return nil, fmt.Errorf("GetPodAggregatedRequestResource failed with error: %v", err)
+	}
+
+	machineState := p.state.GetMachineState()
+	memoryState := machineState[v1.ResourceMemory]
+
+	allocationInfo = &state.AllocationInfo{
+		AllocationMeta:     state.GenerateMemoryContainerAllocationMeta(req, apiconsts.PodAnnotationQoSLevelReclaimedCores),
+		AggregatedQuantity: uint64(podAggregatedRequest),
+	}
+
+	nonReclaimActualBindingNUMAs := memoryState.GetNUMANodesWithoutReclaimedActualNUMABindingPods()
+	reclaimActualBindingNUMAs := memoryState.GetNUMANodesWithoutReclaimedNonActualNUMABindingPods()
+
+	var numaAllocationResult machine.CPUSet
+	if req.Hint != nil && len(req.Hint.Nodes) == 1 &&
+		(reclaimActualBindingNUMAs.Contains(int(req.Hint.Nodes[0])) ||
+			!nonReclaimActualBindingNUMAs.Equals(machine.NewCPUSet(int(req.Hint.Nodes[0])))) {
+		allocationInfo.SetSpecifiedNUMABindingNUMAID(req.Hint.Nodes[0])
+		numaAllocationResult = machine.NewCPUSet(int(req.Hint.Nodes[0]))
+	} else {
+		numaAllocationResult = nonReclaimActualBindingNUMAs
+	}
+
+	if numaAllocationResult.IsEmpty() {
+		return nil, fmt.Errorf("allocate memory failed with empty numa allocation result")
+	}
+
+	allocationInfo.NumaAllocationResult = numaAllocationResult
+
+	general.InfoS("allocate memory successfully",
+		"podNamespace", req.PodNamespace,
+		"podName", req.PodName,
+		"containerName", req.ContainerName,
+		"reqMemoryQuantity", podAggregatedRequest,
+		"numaAllocationResult", numaAllocationResult.String())
+
+	p.state.SetAllocationInfo(v1.ResourceMemory, req.PodUid, req.ContainerName, allocationInfo)
+
+	machineState, err = state.GenerateMachineStateFromPodEntries(p.state.GetMachineInfo(), p.state.GetPodResourceEntries(), p.state.GetReservedMemory())
 	if err != nil {
 		general.Errorf("pod: %s/%s, container: %s GenerateMachineStateFromPodEntries failed with error: %v",
 			req.PodNamespace, req.PodName, req.ContainerName, err)
@@ -404,7 +483,7 @@ func (p *DynamicPolicy) adjustAllocationEntries() error {
 	p.adjustAllocationEntriesForSharedCores(numaSetChangedContainers, podEntries, machineState)
 	p.adjustAllocationEntriesForDedicatedCores(numaSetChangedContainers, podEntries, machineState)
 	p.adjustAllocationEntriesForSystemCores(numaSetChangedContainers, podEntries, machineState)
-	// todo: adjust allocation entries for reclaimed cores
+	p.adjustAllocationEntriesForReclaimedCores(numaSetChangedContainers, podEntries, machineState)
 
 	resourcesMachineState, err := state.GenerateMachineStateFromPodEntries(p.state.GetMachineInfo(), podResourceEntries, p.state.GetReservedMemory())
 	if err != nil {
@@ -709,6 +788,31 @@ func (p *DynamicPolicy) adjustAllocationEntriesForSystemCores(numaSetChangedCont
 				// todo: currently we only update cpuset.mems for system_cores pods to NUMAs without dedicated and NUMA binding and NUMA exclusive pod,
 				// 		in the future, we will update cpuset.mems for system_cores according to their cpuset_pool annotation.
 				p.updateNUMASetChangedContainers(numaSetChangedContainers, allocationInfo, defaultSystemCoresNUMAs)
+			}
+		}
+	}
+}
+
+func (p *DynamicPolicy) adjustAllocationEntriesForReclaimedCores(numaSetChangedContainers map[string]map[string]*state.AllocationInfo,
+	podEntries state.PodEntries, machineState state.NUMANodeMap,
+) {
+	nonReclaimActualBindingNUMAs := machineState.GetNUMANodesWithoutReclaimedActualNUMABindingPods()
+
+	for podUID, containerEntries := range podEntries {
+		for containerName, allocationInfo := range containerEntries {
+			if allocationInfo == nil {
+				general.Errorf("pod: %s, container: %s has nil allocationInfo", podUID, containerName)
+				continue
+			} else if containerName == "" {
+				general.Errorf("pod: %s has empty containerName entry", podUID)
+				continue
+			} else if !allocationInfo.CheckReclaimed() {
+				continue
+			}
+
+			if !allocationInfo.CheckActualNUMABinding() {
+				// update container to target numa set for non-actual numa binding reclaim cores
+				p.updateNUMASetChangedContainers(numaSetChangedContainers, allocationInfo, nonReclaimActualBindingNUMAs)
 			}
 		}
 	}
