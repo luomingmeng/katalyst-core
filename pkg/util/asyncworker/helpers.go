@@ -111,3 +111,11 @@ func EmitCustomizedAsyncedMetrics(ctx context.Context, metricName string, metric
 
 	return emitter.StoreInt64(metricName, metricValue, metrics.MetricTypeNameRaw, tags...)
 }
+
+func WithMetricEmitter(ctx context.Context, emitter metrics.MetricEmitter) context.Context {
+	return context.WithValue(ctx, contextKeyMetricEmitter, emitter)
+}
+
+func WithMetricName(ctx context.Context, metricName string) context.Context {
+	return context.WithValue(ctx, contextKeyMetricName, metricName)
+}

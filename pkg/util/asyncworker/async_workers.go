@@ -215,8 +215,8 @@ func (aws *AsyncWorkers) contextForWork(workName string, work *Work) context.Con
 	if status.ctx == nil || status.ctx.Err() == context.Canceled {
 		ctx := context.Background()
 		if names := strings.Split(workName, WorkNameSeperator); len(names) > 0 {
-			ctx = context.WithValue(ctx, contextKeyMetricName, names[len(names)-1])
-			ctx = context.WithValue(ctx, contextKeyMetricEmitter, aws.emitter)
+			ctx = WithMetricName(ctx, names[len(names)-1])
+			ctx = WithMetricEmitter(ctx, aws.emitter)
 		}
 		status.ctx, status.cancelFn = context.WithCancel(ctx)
 

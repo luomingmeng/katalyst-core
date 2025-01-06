@@ -148,8 +148,8 @@ func (alw *AsyncLimitedWorkers) prepareWork(work *Work) context.Context {
 
 	ctx := context.Background()
 	if names := strings.Split(work.Name, WorkNameSeperator); len(names) > 0 {
-		ctx = context.WithValue(ctx, contextKeyMetricName, names[len(names)-1])
-		ctx = context.WithValue(ctx, contextKeyMetricEmitter, alw.emitter)
+		ctx = WithMetricName(ctx, names[len(names)-1])
+		ctx = WithMetricEmitter(ctx, alw.emitter)
 	}
 
 	status := &workStatus{
