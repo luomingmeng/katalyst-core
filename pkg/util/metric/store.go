@@ -277,6 +277,10 @@ func (c *MetricStore) GetContainerNumaMetrics(podUID, containerName, metricName 
 			}
 		}
 	}
+
+	if len(res) == 0 {
+		return nil, errors.New(fmt.Sprintf("[MetricStore] empty map, metric=%v, podUID=%v, containerName=%v", metricName, podUID, containerName))
+	}
 	return res, nil
 }
 
