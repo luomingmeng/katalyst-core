@@ -41,6 +41,7 @@ import (
 	plugincache "k8s.io/kubernetes/pkg/kubelet/pluginmanager/cache"
 
 	internalfake "github.com/kubewharf/katalyst-api/pkg/client/clientset/versioned/fake"
+	"github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-api/pkg/plugins/registration"
 	"github.com/kubewharf/katalyst-core/cmd/katalyst-agent/app/options"
 	"github.com/kubewharf/katalyst-core/pkg/agent/resourcemanager/fetcher"
@@ -217,6 +218,16 @@ type MockHeadroomManager struct {
 	getCapacityErr        error
 	getNumaAllocatableErr error
 	getNumaCapacityErr    error
+	name                  v1.ResourceName
+	milliValue            bool
+}
+
+func (m *MockHeadroomManager) Name() v1.ResourceName {
+	return m.name
+}
+
+func (m *MockHeadroomManager) MilliValue() bool {
+	return m.milliValue
 }
 
 func (m *MockHeadroomManager) GetAllocatable() (resource.Quantity, error) {
@@ -255,6 +266,8 @@ func TestGetReclaimedResource(t *testing.T) {
 					m.capacity = resource.MustParse("20")
 					m.numaAllocatable = map[int]resource.Quantity{0: resource.MustParse("5")}
 					m.numaCapacity = map[int]resource.Quantity{0: resource.MustParse("10")}
+					m.name = v1.ResourceCPU
+					m.milliValue = false
 				},
 			},
 			wantResources: &reclaimedResource{
@@ -262,6 +275,12 @@ func TestGetReclaimedResource(t *testing.T) {
 				capacity:        v1.ResourceList{v1.ResourceCPU: resource.MustParse("20")},
 				numaAllocatable: map[int]v1.ResourceList{0: {v1.ResourceCPU: resource.MustParse("5")}},
 				numaCapacity:    map[int]v1.ResourceList{0: {v1.ResourceCPU: resource.MustParse("10")}},
+				resourceNameMap: map[v1.ResourceName]v1.ResourceName{
+					v1.ResourceCPU: v1.ResourceCPU,
+				},
+				milliValue: map[v1.ResourceName]bool{
+					v1.ResourceCPU: false,
+				},
 			},
 		},
 		{
@@ -281,6 +300,8 @@ func TestGetReclaimedResource(t *testing.T) {
 					m.capacity = resource.MustParse("20")
 					m.numaAllocatable = map[int]resource.Quantity{0: resource.MustParse("0")}
 					m.numaCapacity = map[int]resource.Quantity{0: resource.MustParse("10")}
+					m.name = v1.ResourceCPU
+					m.milliValue = false
 				},
 			},
 			wantResources: &reclaimedResource{
@@ -288,6 +309,12 @@ func TestGetReclaimedResource(t *testing.T) {
 				capacity:        v1.ResourceList{v1.ResourceCPU: resource.MustParse("20")},
 				numaAllocatable: map[int]v1.ResourceList{0: {v1.ResourceCPU: resource.MustParse("0")}},
 				numaCapacity:    map[int]v1.ResourceList{0: {v1.ResourceCPU: resource.MustParse("10")}},
+				resourceNameMap: map[v1.ResourceName]v1.ResourceName{
+					v1.ResourceCPU: v1.ResourceCPU,
+				},
+				milliValue: map[v1.ResourceName]bool{
+					v1.ResourceCPU: false,
+				},
 			},
 		},
 		{
@@ -298,12 +325,16 @@ func TestGetReclaimedResource(t *testing.T) {
 					m.capacity = resource.MustParse("20")
 					m.numaAllocatable = map[int]resource.Quantity{0: resource.MustParse("0")}
 					m.numaCapacity = map[int]resource.Quantity{0: resource.MustParse("10")}
+					m.name = v1.ResourceCPU
+					m.milliValue = false
 				},
 				v1.ResourceMemory: func(m *MockHeadroomManager) {
 					m.allocatable = resource.MustParse("15Gi")
 					m.capacity = resource.MustParse("30Gi")
 					m.numaAllocatable = map[int]resource.Quantity{0: resource.MustParse("7Gi")}
 					m.numaCapacity = map[int]resource.Quantity{0: resource.MustParse("15Gi")}
+					m.name = v1.ResourceMemory
+					m.milliValue = false
 				},
 			},
 			wantResources: &reclaimedResource{
@@ -326,6 +357,65 @@ func TestGetReclaimedResource(t *testing.T) {
 						v1.ResourceCPU:    resource.MustParse("10"),
 						v1.ResourceMemory: resource.MustParse("15Gi"),
 					},
+				},
+				resourceNameMap: map[v1.ResourceName]v1.ResourceName{
+					v1.ResourceCPU:    v1.ResourceCPU,
+					v1.ResourceMemory: v1.ResourceMemory,
+				},
+				milliValue: map[v1.ResourceName]bool{
+					v1.ResourceCPU:    false,
+					v1.ResourceMemory: false,
+				},
+			},
+		},
+		{
+			name: "test report name and resource name is different",
+			setupMock: map[v1.ResourceName]func(*MockHeadroomManager){
+				consts.ReclaimedResourceMilliCPU: func(m *MockHeadroomManager) {
+					m.allocatable = resource.MustParse("0")
+					m.capacity = resource.MustParse("20000")
+					m.numaAllocatable = map[int]resource.Quantity{0: resource.MustParse("0")}
+					m.numaCapacity = map[int]resource.Quantity{0: resource.MustParse("10000")}
+					m.name = v1.ResourceCPU
+					m.milliValue = true
+				},
+				consts.ReclaimedResourceMemory: func(m *MockHeadroomManager) {
+					m.allocatable = resource.MustParse("15Gi")
+					m.capacity = resource.MustParse("30Gi")
+					m.numaAllocatable = map[int]resource.Quantity{0: resource.MustParse("7Gi")}
+					m.numaCapacity = map[int]resource.Quantity{0: resource.MustParse("15Gi")}
+					m.name = v1.ResourceMemory
+					m.milliValue = false
+				},
+			},
+			wantResources: &reclaimedResource{
+				allocatable: v1.ResourceList{
+					consts.ReclaimedResourceMilliCPU: resource.MustParse("0"),
+					consts.ReclaimedResourceMemory:   resource.MustParse("15Gi"),
+				},
+				capacity: v1.ResourceList{
+					consts.ReclaimedResourceMilliCPU: resource.MustParse("20000"),
+					consts.ReclaimedResourceMemory:   resource.MustParse("30Gi"),
+				},
+				numaAllocatable: map[int]v1.ResourceList{
+					0: {
+						consts.ReclaimedResourceMilliCPU: resource.MustParse("0"),
+						consts.ReclaimedResourceMemory:   resource.MustParse("7Gi"),
+					},
+				},
+				numaCapacity: map[int]v1.ResourceList{
+					0: {
+						consts.ReclaimedResourceMilliCPU: resource.MustParse("10000"),
+						consts.ReclaimedResourceMemory:   resource.MustParse("15Gi"),
+					},
+				},
+				resourceNameMap: map[v1.ResourceName]v1.ResourceName{
+					consts.ReclaimedResourceMilliCPU: v1.ResourceCPU,
+					consts.ReclaimedResourceMemory:   v1.ResourceMemory,
+				},
+				milliValue: map[v1.ResourceName]bool{
+					consts.ReclaimedResourceMilliCPU: true,
+					consts.ReclaimedResourceMemory:   false,
 				},
 			},
 		},
@@ -364,6 +454,12 @@ func TestGetReclaimedResource(t *testing.T) {
 				}
 				if !reflect.DeepEqual(got.numaCapacity, tt.wantResources.numaCapacity) {
 					t.Errorf("numaCapacity mismatch\ngot: %+v\nwant: %+v", got.numaCapacity, tt.wantResources.numaCapacity)
+				}
+				if !reflect.DeepEqual(got.resourceNameMap, tt.wantResources.resourceNameMap) {
+					t.Errorf("resourceNameMap mismatch\ngot: %+v\nwant: %+v", got.resourceNameMap, tt.wantResources.resourceNameMap)
+				}
+				if !reflect.DeepEqual(got.milliValue, tt.wantResources.milliValue) {
+					t.Errorf("milliValue mismatch\ngot: %+v\nwant: %+v", got.milliValue, tt.wantResources.milliValue)
 				}
 			}
 		})
@@ -547,6 +643,91 @@ func TestReviseReclaimedResource(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "test resource name and report name is different",
+			setupConf: func(c *dynamic.Configuration) {
+				c.MinIgnoredReclaimedResourceForReport = v1.ResourceList{
+					v1.ResourceCPU:    resource.MustParse("0"),
+					v1.ResourceMemory: resource.MustParse("0Gi"),
+				}
+			},
+			inputResource: &reclaimedResource{
+				allocatable: v1.ResourceList{
+					consts.ReclaimedResourceMilliCPU: resource.MustParse("4000"),
+					consts.ReclaimedResourceMemory:   resource.MustParse("30Gi"),
+				},
+				capacity: v1.ResourceList{
+					consts.ReclaimedResourceMilliCPU: resource.MustParse("8000"),
+					consts.ReclaimedResourceMemory:   resource.MustParse("30Gi"),
+				},
+				numaAllocatable: map[int]v1.ResourceList{
+					0: {
+						consts.ReclaimedResourceMilliCPU: resource.MustParse("0"),
+						consts.ReclaimedResourceMemory:   resource.MustParse("15Gi"),
+					},
+					1: {
+						consts.ReclaimedResourceMilliCPU: resource.MustParse("4000"),
+						consts.ReclaimedResourceMemory:   resource.MustParse("15Gi"),
+					},
+				},
+				numaCapacity: map[int]v1.ResourceList{
+					0: {
+						consts.ReclaimedResourceMilliCPU: resource.MustParse("4000"),
+						consts.ReclaimedResourceMemory:   resource.MustParse("15Gi"),
+					},
+					1: {
+						consts.ReclaimedResourceMilliCPU: resource.MustParse("4000"),
+						consts.ReclaimedResourceMemory:   resource.MustParse("15Gi"),
+					},
+				},
+				resourceNameMap: map[v1.ResourceName]v1.ResourceName{
+					consts.ReclaimedResourceMilliCPU: v1.ResourceCPU,
+					consts.ReclaimedResourceMemory:   v1.ResourceMemory,
+				},
+				milliValue: map[v1.ResourceName]bool{
+					consts.ReclaimedResourceMilliCPU: true,
+					consts.ReclaimedResourceMemory:   false,
+				},
+			},
+			wantResources: &reclaimedResource{
+				allocatable: v1.ResourceList{
+					consts.ReclaimedResourceMilliCPU: resource.MustParse("4000"),
+					consts.ReclaimedResourceMemory:   resource.MustParse("15Gi"),
+				},
+				capacity: v1.ResourceList{
+					consts.ReclaimedResourceMilliCPU: resource.MustParse("8000"),
+					consts.ReclaimedResourceMemory:   resource.MustParse("30Gi"),
+				},
+				numaAllocatable: map[int]v1.ResourceList{
+					0: {
+						consts.ReclaimedResourceMilliCPU: resource.MustParse("0"),
+						consts.ReclaimedResourceMemory:   resource.MustParse("0"),
+					},
+					1: {
+						consts.ReclaimedResourceMilliCPU: resource.MustParse("4000"),
+						consts.ReclaimedResourceMemory:   resource.MustParse("15Gi"),
+					},
+				},
+				numaCapacity: map[int]v1.ResourceList{
+					0: {
+						consts.ReclaimedResourceMilliCPU: resource.MustParse("4000"),
+						consts.ReclaimedResourceMemory:   resource.MustParse("15Gi"),
+					},
+					1: {
+						consts.ReclaimedResourceMilliCPU: resource.MustParse("4000"),
+						consts.ReclaimedResourceMemory:   resource.MustParse("15Gi"),
+					},
+				},
+				resourceNameMap: map[v1.ResourceName]v1.ResourceName{
+					consts.ReclaimedResourceMilliCPU: v1.ResourceCPU,
+					consts.ReclaimedResourceMemory:   v1.ResourceMemory,
+				},
+				milliValue: map[v1.ResourceName]bool{
+					consts.ReclaimedResourceMilliCPU: true,
+					consts.ReclaimedResourceMemory:   false,
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -583,6 +764,12 @@ func TestReviseReclaimedResource(t *testing.T) {
 				}
 				if !apiequality.Semantic.DeepEqual(got.numaCapacity, tt.wantResources.numaCapacity) {
 					t.Errorf("numaCapacity mismatch\ngot: %+v\nwant: %+v", got.numaCapacity, tt.wantResources.numaCapacity)
+				}
+				if !reflect.DeepEqual(got.resourceNameMap, tt.wantResources.resourceNameMap) {
+					t.Errorf("resourceNameMap mismatch\ngot: %+v\nwant: %+v", got.resourceNameMap, tt.wantResources.resourceNameMap)
+				}
+				if !reflect.DeepEqual(got.milliValue, tt.wantResources.milliValue) {
+					t.Errorf("milliValue mismatch\ngot: %+v\nwant: %+v", got.milliValue, tt.wantResources.milliValue)
 				}
 			}
 		})

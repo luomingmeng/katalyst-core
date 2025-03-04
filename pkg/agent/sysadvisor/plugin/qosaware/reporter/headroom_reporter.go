@@ -113,6 +113,9 @@ type reclaimedResource struct {
 	capacity        v1.ResourceList
 	numaAllocatable map[int]v1.ResourceList
 	numaCapacity    map[int]v1.ResourceList
+
+	resourceNameMap map[v1.ResourceName]v1.ResourceName
+	milliValue      map[v1.ResourceName]bool
 }
 
 type headroomReporterPlugin struct {
@@ -266,21 +269,26 @@ func (r *headroomReporterPlugin) getReclaimedResource() (*reclaimedResource, err
 	capacity := make(v1.ResourceList)
 	numaAllocatable := make(map[int]v1.ResourceList)
 	numaCapacity := make(map[int]v1.ResourceList)
-	for resourceName, rm := range r.headroomManagers {
-		allocatable[resourceName], err = rm.GetAllocatable()
+	resourceNameMap := make(map[v1.ResourceName]v1.ResourceName)
+	milliValue := make(map[v1.ResourceName]bool)
+	for reportName, rm := range r.headroomManagers {
+		// get origin resource name
+		resourceNameMap[reportName] = rm.Name()
+		milliValue[reportName] = rm.MilliValue()
+		allocatable[reportName], err = rm.GetAllocatable()
 		if err != nil {
-			errList = append(errList, fmt.Errorf("get reclaimed %s allocatable failed: %s", resourceName, err))
+			errList = append(errList, fmt.Errorf("get reclaimed %s allocatable failed: %s", reportName, err))
 		}
 
-		capacity[resourceName], err = rm.GetCapacity()
+		capacity[reportName], err = rm.GetCapacity()
 		if err != nil {
-			errList = append(errList, err, fmt.Errorf("get reclaimed %s capacity failed: %s", resourceName, err))
+			errList = append(errList, err, fmt.Errorf("get reclaimed %s capacity failed: %s", reportName, err))
 		}
 
 		// get allocatable per numa
 		allocatableMap, err := rm.GetNumaAllocatable()
 		if err != nil {
-			errList = append(errList, fmt.Errorf("get reclaimed %s numa allocatable failed: %s", resourceName, err))
+			errList = append(errList, fmt.Errorf("get reclaimed %s numa allocatable failed: %s", reportName, err))
 		} else {
 			for numaID, quantity := range allocatableMap {
 				perNumaAllocatable, ok := numaAllocatable[numaID]
@@ -288,14 +296,14 @@ func (r *headroomReporterPlugin) getReclaimedResource() (*reclaimedResource, err
 					perNumaAllocatable = make(v1.ResourceList)
 					numaAllocatable[numaID] = perNumaAllocatable
 				}
-				perNumaAllocatable[resourceName] = quantity
+				perNumaAllocatable[reportName] = quantity
 			}
 		}
 
 		// get capacity per numa
 		capacityMap, err := rm.GetNumaCapacity()
 		if err != nil {
-			errList = append(errList, fmt.Errorf("get reclaimed %s numa capacity failed: %s", resourceName, err))
+			errList = append(errList, fmt.Errorf("get reclaimed %s numa capacity failed: %s", reportName, err))
 		} else {
 			for numaID, quantity := range capacityMap {
 				perNumaCapacity, ok := numaCapacity[numaID]
@@ -303,7 +311,7 @@ func (r *headroomReporterPlugin) getReclaimedResource() (*reclaimedResource, err
 					perNumaCapacity = make(v1.ResourceList)
 					numaCapacity[numaID] = perNumaCapacity
 				}
-				perNumaCapacity[resourceName] = quantity
+				perNumaCapacity[reportName] = quantity
 			}
 		}
 	}
@@ -317,6 +325,8 @@ func (r *headroomReporterPlugin) getReclaimedResource() (*reclaimedResource, err
 		capacity:        capacity,
 		numaAllocatable: numaAllocatable,
 		numaCapacity:    numaCapacity,
+		milliValue:      milliValue,
+		resourceNameMap: resourceNameMap,
 	}, nil
 }
 
@@ -396,14 +406,30 @@ func (r *headroomReporterPlugin) getReportNUMAReclaimedResource(reclaimedResourc
 }
 
 func (r *headroomReporterPlugin) reviseReclaimedResource(res *reclaimedResource) error {
+	if res == nil {
+		return fmt.Errorf("reclaimed resource is nil")
+	}
+
 	conf := r.dynamicConf.GetDynamicConfiguration()
 	reviseFunc := func(resList v1.ResourceList) bool {
 		revise := false
-		for resourceName, quantity := range resList {
+		for reportName, quantity := range resList {
+			resourceName, ok := res.resourceNameMap[reportName]
+			if !ok {
+				resourceName = reportName
+			}
+
 			minIgnored, ok := conf.MinIgnoredReclaimedResourceForReport[resourceName]
-			if ok && quantity.Cmp(minIgnored) <= 0 {
-				revise = true
-				break
+			if ok {
+				milliValue, ok := res.milliValue[reportName]
+				if ok && milliValue {
+					minIgnored = *apiresource.NewQuantity(minIgnored.MilliValue(), minIgnored.Format)
+				}
+
+				if quantity.Cmp(minIgnored) <= 0 {
+					revise = true
+					break
+				}
 			}
 		}
 
