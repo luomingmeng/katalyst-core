@@ -36,9 +36,11 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/plugin/qosaware/reporter/manager/resource"
 	hmadvisor "github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/plugin/qosaware/resource"
 	"github.com/kubewharf/katalyst-core/pkg/config"
+	"github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util"
+	"github.com/kubewharf/katalyst-core/pkg/util/native"
 )
 
 func init() {
@@ -118,9 +120,10 @@ type headroomReporterPlugin struct {
 	headroomManagers      map[v1.ResourceName]manager.HeadroomManager
 	numaSocketZoneNodeMap map[util.ZoneNode]util.ZoneNode
 
-	ctx     context.Context
-	cancel  context.CancelFunc
-	started bool
+	dynamicConf *dynamic.DynamicAgentConfiguration
+	ctx         context.Context
+	cancel      context.CancelFunc
+	started     bool
 }
 
 func newHeadroomReporterPlugin(emitter metrics.MetricEmitter, metaServer *metaserver.MetaServer,
@@ -131,6 +134,11 @@ func newHeadroomReporterPlugin(emitter metrics.MetricEmitter, metaServer *metase
 		errList []error
 	)
 
+	// init numa topo info by metaServer
+	if metaServer == nil || metaServer.MachineInfo == nil {
+		return nil, nil, fmt.Errorf("get metaserver machine info is nil")
+	}
+
 	initializers := manager.GetRegisteredManagerInitializers()
 	headroomManagers := make(map[v1.ResourceName]manager.HeadroomManager, len(initializers))
 	for name, initializer := range initializers {
@@ -140,11 +148,6 @@ func newHeadroomReporterPlugin(emitter metrics.MetricEmitter, metaServer *metase
 		}
 	}
 
-	// init numa topo info by metaServer
-	if metaServer == nil || metaServer.MachineInfo == nil {
-		errList = append(errList, fmt.Errorf("get metaserver machine info is nil"))
-	}
-
 	if len(errList) > 0 {
 		return nil, nil, errors.NewAggregate(errList)
 	}
@@ -152,6 +155,7 @@ func newHeadroomReporterPlugin(emitter metrics.MetricEmitter, metaServer *metase
 	reporter := &headroomReporterPlugin{
 		headroomManagers:      headroomManagers,
 		numaSocketZoneNodeMap: util.GenerateNumaSocketZone(metaServer.MachineInfo.Topology),
+		dynamicConf:           conf.DynamicAgentConfiguration,
 	}
 	pluginWrapper, err := skeleton.NewRegistrationPluginWrapper(reporter, []string{conf.PluginRegistrationDir},
 		func(key string, value int64) {
@@ -219,6 +223,12 @@ func (r *headroomReporterPlugin) Stop() error {
 func (r *headroomReporterPlugin) GetReportContent(_ context.Context, _ *v1alpha1.Empty) (*v1alpha1.GetReportContentResponse, error) {
 	var err error
 	res, err := r.getReclaimedResource()
+	if err != nil {
+		return nil, err
+	}
+
+	// revise reclaimed resource to avoid resource fragmentation
+	err = r.reviseReclaimedResource(res)
 	if err != nil {
 		return nil, err
 	}
@@ -296,7 +306,6 @@ func (r *headroomReporterPlugin) getReclaimedResource() (*reclaimedResource, err
 				perNumaCapacity[resourceName] = quantity
 			}
 		}
-
 	}
 
 	if len(errList) > 0 {
@@ -308,7 +317,7 @@ func (r *headroomReporterPlugin) getReclaimedResource() (*reclaimedResource, err
 		capacity:        capacity,
 		numaAllocatable: numaAllocatable,
 		numaCapacity:    numaCapacity,
-	}, err
+	}, nil
 }
 
 func (r *headroomReporterPlugin) getReportReclaimedResourceForCNR(reclaimedResource *reclaimedResource) (*v1alpha1.ReportContent, error) {
@@ -384,4 +393,44 @@ func (r *headroomReporterPlugin) getReportNUMAReclaimedResource(reclaimedResourc
 		FieldName: util.CNRFieldNameTopologyZone,
 		Value:     value,
 	}, nil
+}
+
+func (r *headroomReporterPlugin) reviseReclaimedResource(res *reclaimedResource) error {
+	conf := r.dynamicConf.GetDynamicConfiguration()
+	reviseFunc := func(resList v1.ResourceList) bool {
+		revise := false
+		for resourceName, quantity := range resList {
+			minIgnored, ok := conf.MinIgnoredReclaimedResourceForReport[resourceName]
+			if ok && quantity.Cmp(minIgnored) <= 0 {
+				revise = true
+				break
+			}
+		}
+
+		if revise {
+			for resourceName := range resList {
+				resList[resourceName] = apiresource.Quantity{}
+			}
+		}
+
+		return revise
+	}
+
+	numaRevised := false
+	for numaID := range res.numaAllocatable {
+		if reviseFunc(res.numaAllocatable[numaID]) {
+			numaRevised = true
+		}
+	}
+
+	if numaRevised {
+		sumNUMAAllocatable := v1.ResourceList{}
+		for _, allocatable := range res.numaAllocatable {
+			sumNUMAAllocatable = native.AddResources(sumNUMAAllocatable, allocatable)
+		}
+		res.allocatable = sumNUMAAllocatable
+	}
+
+	reviseFunc(res.allocatable)
+	return nil
 }
