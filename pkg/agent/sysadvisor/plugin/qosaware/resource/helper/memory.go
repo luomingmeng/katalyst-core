@@ -39,13 +39,22 @@ func GetAvailableNUMAsAndReclaimedCores(conf *config.Configuration, metaReader m
 	reclaimedCoresContainers := make([]*types.ContainerInfo, 0)
 
 	metaReader.RangeContainer(func(podUID string, containerName string, containerInfo *types.ContainerInfo) bool {
+		ctx := context.Background()
 		if reclaimedContainersFilter(containerInfo) {
-			reclaimedCoresContainers = append(reclaimedCoresContainers, containerInfo)
+			pod, err := metaServer.GetPod(ctx, podUID)
+			if err != nil {
+				errList = append(errList, err)
+				return true
+			}
+
+			if native.PodIsActive(pod) {
+				reclaimedCoresContainers = append(reclaimedCoresContainers, containerInfo)
+			}
 			return true
 		}
 
 		nodeReclaim := conf.GetDynamicConfiguration().EnableReclaim
-		reclaimEnable, err := PodEnableReclaim(context.Background(), metaServer, podUID, nodeReclaim)
+		reclaimEnable, err := PodEnableReclaim(ctx, metaServer, podUID, nodeReclaim)
 		if err != nil {
 			errList = append(errList, err)
 			return true
