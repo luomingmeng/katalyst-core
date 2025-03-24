@@ -43,6 +43,7 @@ const (
 type nicManagerImpl struct {
 	sync.RWMutex
 
+	conf                   *config.Configuration
 	emitter                metrics.MetricEmitter
 	nics                   *NICs
 	defaultAllocatableNICs []machine.InterfaceInfo
@@ -57,6 +58,7 @@ func NewNICManager(metaServer *metaserver.MetaServer, emitter metrics.MetricEmit
 	}
 
 	return &nicManagerImpl{
+		conf:                   conf,
 		emitter:                emitter,
 		defaultAllocatableNICs: defaultAllocatableNICs,
 		// we initialize nics with defaultAllocatableNICs, since we don't want to miss any nics
@@ -85,7 +87,7 @@ func (n *nicManagerImpl) updateNICs(_ context.Context) {
 		return
 	}
 
-	nics, err := checkNICs(n.emitter, n.checkers, n.defaultAllocatableNICs)
+	nics, err := n.checkNICs(n.defaultAllocatableNICs)
 	if err != nil {
 		general.Errorf("failed to check nics: %v", err)
 		return
@@ -118,7 +120,7 @@ func initHealthCheckers(registry checker.Registry, enableCheckers []string) (map
 	return checkers, nil
 }
 
-func checkNICs(emitter metrics.MetricEmitter, checkers map[string]checker.NICHealthChecker, nics []machine.InterfaceInfo) (*NICs, error) {
+func (n *nicManagerImpl) checkNICs(nics []machine.InterfaceInfo) (*NICs, error) {
 	var (
 		healthyNICs   []machine.InterfaceInfo
 		unHealthyNICs []machine.InterfaceInfo
@@ -127,9 +129,9 @@ func checkNICs(emitter metrics.MetricEmitter, checkers map[string]checker.NICHea
 
 	for _, nic := range nics {
 		successCheckers := sets.NewString()
-		err := machine.DoNetNS(nic.NSName, nic.NSAbsolutePath, func(sysFsDir, nsAbsPath string) error {
+		err := machine.DoNetNS(nic.NSName, n.conf.NetNSDirAbsPath, func(sysFsDir, nsAbsPath string) error {
 			for i := 0; i <= nicHealthCheckTime; i++ {
-				for name, healthChecker := range checkers {
+				for name, healthChecker := range n.checkers {
 					health, err := healthChecker.CheckHealth(nic)
 					if err != nil {
 						general.Warningf("NIC %s health check '%s' error: %v", nic.Iface, name, err)
@@ -149,15 +151,15 @@ func checkNICs(emitter metrics.MetricEmitter, checkers map[string]checker.NICHea
 			continue
 		}
 
-		if successCheckers.Len() == len(checkers) {
+		if successCheckers.Len() == len(n.checkers) {
 			general.Infof("NIC %s passed all health checks", nic.Iface)
 			healthyNICs = append(healthyNICs, nic)
 		} else {
-			general.Warningf("NIC %s health check partitial success: %v, checkers: %v", nic.Iface, successCheckers.List(), checkers)
+			general.Warningf("NIC %s health check partitial success: %v, checkers: %v", nic.Iface, successCheckers.List(), n.checkers)
 			unHealthyNICs = append(unHealthyNICs, nic)
-			for name := range checkers {
+			for name := range n.checkers {
 				if !successCheckers.Has(name) {
-					_ = emitter.StoreInt64(metricsNameNICUnhealthyState, 1, metrics.MetricTypeNameRaw,
+					_ = n.emitter.StoreInt64(metricsNameNICUnhealthyState, 1, metrics.MetricTypeNameRaw,
 						metrics.MetricTag{Key: "nic", Val: nic.Iface},
 						metrics.MetricTag{Key: "checker", Val: name},
 					)

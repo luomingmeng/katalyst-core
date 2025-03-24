@@ -180,8 +180,12 @@ func TestCheckNICs(t *testing.T) {
 
 		checkers := map[string]checker.NICHealthChecker{"mockChecker": mockChecker}
 		nics := []machine.InterfaceInfo{{Iface: "eth0"}, {Iface: "eth1"}}
+		n := &nicManagerImpl{
+			checkers: checkers,
+			emitter:  mockEmitter,
+		}
 
-		result, err := checkNICs(mockEmitter, checkers, nics)
+		result, err := n.checkNICs(nics)
 		assert.NoError(t, err)
 		assert.Len(t, result.HealthyNICs, 2)
 		assert.Empty(t, result.UnhealthyNICs)
@@ -195,8 +199,12 @@ func TestCheckNICs(t *testing.T) {
 
 		checkers := map[string]checker.NICHealthChecker{"mockChecker": mockChecker}
 		nics := []machine.InterfaceInfo{{Iface: "eth0"}, {Iface: "eth1"}}
+		n := &nicManagerImpl{
+			checkers: checkers,
+			emitter:  mockEmitter,
+		}
 
-		result, err := checkNICs(mockEmitter, checkers, nics)
+		result, err := n.checkNICs(nics)
 		assert.NoError(t, err)
 		assert.Len(t, result.HealthyNICs, 1)
 		assert.Len(t, result.UnhealthyNICs, 1)
@@ -209,8 +217,12 @@ func TestCheckNICs(t *testing.T) {
 
 		checkers := map[string]checker.NICHealthChecker{"mockChecker": mockChecker}
 		nics := []machine.InterfaceInfo{{Iface: "eth0"}}
+		n := &nicManagerImpl{
+			checkers: checkers,
+			emitter:  mockEmitter,
+		}
 
-		result, err := checkNICs(mockEmitter, checkers, nics)
+		result, err := n.checkNICs(nics)
 		assert.Error(t, err)
 		assert.Nil(t, result)
 	})
