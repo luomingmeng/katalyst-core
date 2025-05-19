@@ -110,21 +110,16 @@ func GetCpuCodeName(metricsFetcher types.MetricsFetcher) string {
 	return cpuCodeName
 }
 
-func GetIsVm(metricsFetcher types.MetricsFetcher) (bool, string) {
+func GetIsVM(metricsFetcher types.MetricsFetcher) (bool, string) {
 	isVMInterface := metricsFetcher.GetByStringIndex(consts.MetricInfoIsVM)
 	if isVMInterface == nil {
 		general.Warningf("isVM metric not found")
 		return false, ""
 	}
-	isVMStr, ok := isVMInterface.(string)
+	isVMBool, ok := isVMInterface.(bool)
 	if !ok {
 		general.Warningf("parse is vm %v failed", isVMInterface)
 		return false, ""
 	}
-	parseBool, err := strconv.ParseBool(isVMStr)
-	if err != nil {
-		general.Warningf("parse is vm %v failed %v", isVMInterface, err)
-		return false, ""
-	}
-	return parseBool, isVMStr
+	return isVMBool, strconv.FormatBool(isVMBool)
 }

@@ -73,7 +73,7 @@ func TestGetIsVm(t *testing.T) {
 		{
 			name: "test",
 			setFakeMetric: func(store *metric.FakeMetricsFetcher) {
-				store.SetByStringIndex(consts.MetricInfoIsVM, "true")
+				store.SetByStringIndex(consts.MetricInfoIsVM, true)
 			},
 			wantBool: true,
 			wantStr:  "true",
@@ -81,7 +81,7 @@ func TestGetIsVm(t *testing.T) {
 		{
 			name: "test",
 			setFakeMetric: func(store *metric.FakeMetricsFetcher) {
-				store.SetByStringIndex(consts.MetricInfoIsVM, "false")
+				store.SetByStringIndex(consts.MetricInfoIsVM, false)
 			},
 			wantBool: false,
 			wantStr:  "false",
@@ -127,7 +127,7 @@ func TestGetIsVm(t *testing.T) {
 			store := metricsFetcher.(*metric.FakeMetricsFetcher)
 			tt.setFakeMetric(store)
 
-			wantBool, wantStr := GetIsVm(metricsFetcher)
+			wantBool, wantStr := GetIsVM(metricsFetcher)
 			assert.Equalf(t, tt.wantBool, wantBool, "GetCpuCodeName")
 			assert.Equalf(t, tt.wantStr, wantStr, "GetCpuCodeName")
 		})

@@ -41,7 +41,7 @@ func (p *NumaCPUPressureEviction) pullThresholds(_ context.Context) {
 	}
 
 	cpuCodeName := helper.GetCpuCodeName(p.metaServer.MetricsFetcher)
-	isVM, _ := helper.GetIsVm(p.metaServer.MetricsFetcher)
+	isVM, _ := helper.GetIsVM(p.metaServer.MetricsFetcher)
 
 	globalThresholds := p.conf.DynamicAgentConfiguration.GetDynamicConfiguration().MetricThreshold
 	thresholds := getOverLoadThreshold(globalThresholds, cpuCodeName, isVM)
