@@ -197,7 +197,7 @@ func (p *DynamicPolicy) sharedCoresWithoutNUMABindingAllocationHandler(_ context
 	return resp, nil
 }
 
-func (p *DynamicPolicy) reclaimedCoresAllocationHandler(_ context.Context,
+func (p *DynamicPolicy) reclaimedCoresAllocationHandler(ctx context.Context,
 	req *pluginapi.ResourceRequest, persistCheckpoint bool,
 ) (*pluginapi.ResourceAllocationResponse, error) {
 	if req == nil {
@@ -206,6 +206,10 @@ func (p *DynamicPolicy) reclaimedCoresAllocationHandler(_ context.Context,
 
 	if util.PodInplaceUpdateResizing(req) {
 		return nil, fmt.Errorf("not support inplace update resize for reclaimed cores")
+	}
+
+	if req.ContainerType == pluginapi.ContainerType_SIDECAR {
+		return p.allocationSidecarHandler(ctx, req, apiconsts.PodAnnotationQoSLevelReclaimedCores, persistCheckpoint)
 	}
 
 	_, reqFloat64, err := util.GetQuantityFromResourceReq(req)
