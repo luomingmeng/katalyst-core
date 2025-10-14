@@ -22,13 +22,14 @@ import (
 	"sort"
 	"sync"
 
+	gpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/consts"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/state"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
 	"github.com/kubewharf/katalyst-core/cmd/katalyst-agent/app/agent"
-	gpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/consts"
-	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/state"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/qrm"
@@ -45,46 +46,52 @@ const (
 
 // BasePlugin is a shared plugin that provides common functionalities and fields for GPU resource plugins and custom device plugins.
 type BasePlugin struct {
-	sync.Mutex
+	mu sync.RWMutex
+	*config.Configuration
 
-	QosConfig           *generic.QoSConfiguration
-	QrmConfig           *qrm.QRMPluginsConfiguration
-	GpuTopologyProvider machine.GPUTopologyProvider
+	QosConfig *generic.QoSConfiguration
+	QrmConfig *qrm.QRMPluginsConfiguration
 
 	Emitter    metrics.MetricEmitter
 	MetaServer *metaserver.MetaServer
 	AgentCtx   *agent.GenericContext
-	State      state.State
 
 	PodAnnotationKeptKeys []string
 	PodLabelKeptKeys      []string
 	AssociatedDevicesName sets.String
+
+	// Map of checkpoints for each sub-plugin
+	State state.State
+	// Registry of device topology providers
+	DeviceTopologyRegistry *machine.DeviceTopologyRegistry
 }
 
 func NewBasePlugin(
 	agentCtx *agent.GenericContext, conf *config.Configuration, wrappedEmitter metrics.MetricEmitter,
 ) (*BasePlugin, error) {
-	gpuTopologyProvider := machine.NewGPUTopologyProvider(conf.GPUResourceNames)
+	deviceTopologyRegistry := machine.NewDeviceTopologyRegistry()
+
 	stateImpl, err := state.NewCheckpointState(conf.QRMPluginsConfiguration, conf.GenericQRMPluginConfiguration.StateFileDirectory, GPUPluginStateFileName,
-		gpuconsts.GPUResourcePluginPolicyNameStatic, gpuTopologyProvider, conf.SkipGPUStateCorruption, wrappedEmitter)
+		gpuconsts.GPUResourcePluginPolicyNameStatic, deviceTopologyRegistry, conf.SkipGPUStateCorruption, wrappedEmitter)
 
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("NewCheckpointState failed with error: %v", err)
 	}
 
 	return &BasePlugin{
-		QosConfig:           conf.QoSConfiguration,
-		QrmConfig:           conf.QRMPluginsConfiguration,
-		GpuTopologyProvider: gpuTopologyProvider,
+		QosConfig: conf.QoSConfiguration,
+		QrmConfig: conf.QRMPluginsConfiguration,
 
 		Emitter:    wrappedEmitter,
 		MetaServer: agentCtx.MetaServer,
 		AgentCtx:   agentCtx,
-		State:      stateImpl,
 
 		PodAnnotationKeptKeys: conf.PodAnnotationKeptKeys,
 		PodLabelKeptKeys:      conf.PodLabelKeptKeys,
 		AssociatedDevicesName: sets.NewString(conf.GPUResourceNames...),
+
+		State:                  stateImpl,
+		DeviceTopologyRegistry: deviceTopologyRegistry,
 	}, nil
 }
 
@@ -138,7 +145,7 @@ func (p *BasePlugin) PackAllocationResponse(
 				resourceName: {
 					IsNodeResource:    true,
 					IsScalarResource:  true, // to avoid re-allocating
-					AllocatedQuantity: allocationInfo.AllocatedAllocation.GPUMemoryQuantity,
+					AllocatedQuantity: allocationInfo.AllocatedAllocation.Quantity,
 					Annotations:       resourceAllocationAnnotations,
 					ResourceHints: &pluginapi.ListOfTopologyHints{
 						Hints: []*pluginapi.TopologyHint{
@@ -154,13 +161,16 @@ func (p *BasePlugin) PackAllocationResponse(
 }
 
 func (p *BasePlugin) CalculateAssociatedDevices(
-	gpuTopology *machine.GPUTopology, gpuMemoryRequest float64, hintNodes machine.CPUSet,
-	request *pluginapi.AssociatedDeviceRequest,
+	gpuTopology *machine.DeviceTopology, gpuMemoryRequest float64, hintNodes machine.CPUSet,
+	request *pluginapi.AssociatedDeviceRequest, resourceName v1.ResourceName,
 ) ([]string, map[string]float64, error) {
 	gpuRequest := request.DeviceRequest.GetDeviceRequest()
 	gpuMemoryPerGPU := gpuMemoryRequest / float64(gpuRequest)
 
-	machineState := p.State.GetMachineState()
+	machineState, ok := p.State.GetMachineState()[resourceName]
+	if !ok {
+		return nil, nil, fmt.Errorf("no machine state for resource %s", resourceName)
+	}
 
 	allocatedDevices := sets.NewString()
 	needed := gpuRequest
@@ -188,9 +198,9 @@ func (p *BasePlugin) CalculateAssociatedDevices(
 
 	// allocate must include devices first
 	for _, device := range reusableDevices {
-		if machineState.GPUMemorySatisfiedRequest(device, gpuMemoryPerGPU) {
+		if machineState.IsGPURequestSatisfied(device, gpuMemoryPerGPU, float64(p.GPUMemoryAllocatablePerGPU.Value())) {
 			general.Warningf("must include gpu %s has enough memory to allocate, gpuMemoryAllocatable: %f, gpuMemoryAllocated: %f, gpuMemoryPerGPU: %f",
-				device, machineState.GetGPUMemoryAllocatable(device), machineState.GPUMemoryAllocated(device), gpuMemoryPerGPU)
+				device, float64(p.GPUMemoryAllocatablePerGPU.Value()), machineState.GetQuantityAllocated(device), gpuMemoryPerGPU)
 		}
 		allocateDevices(device)
 	}
@@ -201,7 +211,7 @@ func (p *BasePlugin) CalculateAssociatedDevices(
 	}
 
 	isNUMAAffinityDevice := func(device string) bool {
-		info, ok := gpuTopology.GPUs[device]
+		info, ok := gpuTopology.Devices[device]
 		if !ok {
 			general.Errorf("failed to find hint node for device %s", device)
 			return false
@@ -216,7 +226,7 @@ func (p *BasePlugin) CalculateAssociatedDevices(
 	}
 
 	sort.SliceStable(availableDevices, func(i, j int) bool {
-		return machineState.GPUMemoryAllocated(availableDevices[i]) > machineState.GPUMemoryAllocated(availableDevices[j])
+		return machineState.GetQuantityAllocated(availableDevices[i]) > machineState.GetQuantityAllocated(availableDevices[j])
 	})
 
 	// second allocate available and numa-affinity gpus
@@ -229,9 +239,9 @@ func (p *BasePlugin) CalculateAssociatedDevices(
 			continue
 		}
 
-		if !machineState.GPUMemorySatisfiedRequest(device, gpuMemoryPerGPU) {
+		if !machineState.IsGPURequestSatisfied(device, gpuMemoryPerGPU, float64(p.GPUMemoryAllocatablePerGPU.Value())) {
 			general.Infof("available numa affinity gpu %s has not enough memory to allocate, gpuMemoryAllocatable: %f, gpuMemoryAllocated: %f, gpuMemoryPerGPU: %f",
-				device, machineState.GetGPUMemoryAllocatable(device), machineState.GPUMemoryAllocated(device), gpuMemoryPerGPU)
+				device, float64(p.GPUMemoryAllocatablePerGPU.Value()), machineState.GetQuantityAllocated(device), gpuMemoryPerGPU)
 			continue
 		}
 

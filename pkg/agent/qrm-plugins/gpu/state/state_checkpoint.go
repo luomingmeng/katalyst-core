@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager"
 	cmerrors "k8s.io/kubernetes/pkg/kubelet/checkpointmanager/errors"
 
@@ -39,7 +40,7 @@ const (
 
 var (
 	_          State = &stateCheckpoint{}
-	generalLog       = general.LoggerWithPrefix("gpu_plugin", general.LoggingPKGFull)
+	generalLog       = general.LoggerWithPrefix("gpu_mem_plugin", general.LoggingPKGFull)
 )
 
 // stateCheckpoint is an in-memory implementation of State;
@@ -57,11 +58,11 @@ type stateCheckpoint struct {
 	emitter             metrics.MetricEmitter
 }
 
-func (s *stateCheckpoint) SetMachineState(gpuMap GPUMap, persist bool) {
+func (s *stateCheckpoint) SetMachineState(allocationResourcesMap AllocationResourcesMap, persist bool) {
 	s.Lock()
 	defer s.Unlock()
 
-	s.cache.SetMachineState(gpuMap, persist)
+	s.cache.SetMachineState(allocationResourcesMap, persist)
 	if persist {
 		err := s.storeState()
 		if err != nil {
@@ -70,11 +71,11 @@ func (s *stateCheckpoint) SetMachineState(gpuMap GPUMap, persist bool) {
 	}
 }
 
-func (s *stateCheckpoint) SetPodEntries(podEntries PodEntries, persist bool) {
+func (s *stateCheckpoint) SetPodResourceEntries(podResourceEntries PodResourceEntries, persist bool) {
 	s.Lock()
 	defer s.Unlock()
 
-	s.cache.SetPodEntries(podEntries, persist)
+	s.cache.SetPodResourceEntries(podResourceEntries, persist)
 	if persist {
 		err := s.storeState()
 		if err != nil {
@@ -83,11 +84,13 @@ func (s *stateCheckpoint) SetPodEntries(podEntries PodEntries, persist bool) {
 	}
 }
 
-func (s *stateCheckpoint) SetAllocationInfo(podUID, containerName string, allocationInfo *AllocationInfo, persist bool) {
+func (s *stateCheckpoint) SetAllocationInfo(
+	resourceName v1.ResourceName, podUID, containerName string, allocationInfo *AllocationInfo, persist bool,
+) {
 	s.Lock()
 	defer s.Unlock()
 
-	s.cache.SetAllocationInfo(podUID, containerName, allocationInfo, persist)
+	s.cache.SetAllocationInfo(resourceName, podUID, containerName, allocationInfo, persist)
 	if persist {
 		err := s.storeState()
 		if err != nil {
@@ -96,11 +99,11 @@ func (s *stateCheckpoint) SetAllocationInfo(podUID, containerName string, alloca
 	}
 }
 
-func (s *stateCheckpoint) Delete(podUID, containerName string, persist bool) {
+func (s *stateCheckpoint) Delete(resourceName v1.ResourceName, podUID, containerName string, persist bool) {
 	s.Lock()
 	defer s.Unlock()
 
-	s.cache.Delete(podUID, containerName, persist)
+	s.cache.Delete(resourceName, podUID, containerName, persist)
 	if persist {
 		err := s.storeState()
 		if err != nil {
@@ -126,25 +129,34 @@ func (s *stateCheckpoint) StoreState() error {
 	return s.storeState()
 }
 
-func (s *stateCheckpoint) GetMachineState() GPUMap {
+func (s *stateCheckpoint) GetMachineState() AllocationResourcesMap {
 	s.RLock()
 	defer s.RUnlock()
 
 	return s.cache.GetMachineState()
 }
 
-func (s *stateCheckpoint) GetPodEntries() PodEntries {
+func (s *stateCheckpoint) GetPodResourceEntries() PodResourceEntries {
 	s.RLock()
 	defer s.RUnlock()
 
-	return s.cache.GetPodEntries()
+	return s.cache.GetPodResourceEntries()
 }
 
-func (s *stateCheckpoint) GetAllocationInfo(podUID, containerName string) *AllocationInfo {
+func (s *stateCheckpoint) GetPodEntries(resourceName v1.ResourceName) PodEntries {
 	s.RLock()
 	defer s.RUnlock()
 
-	return s.cache.GetAllocationInfo(podUID, containerName)
+	return s.cache.GetPodEntries(resourceName)
+}
+
+func (s *stateCheckpoint) GetAllocationInfo(
+	resourceName v1.ResourceName, podUID, containerName string,
+) *AllocationInfo {
+	s.RLock()
+	defer s.RUnlock()
+
+	return s.cache.GetAllocationInfo(resourceName, podUID, containerName)
 }
 
 func (s *stateCheckpoint) storeState() error {
@@ -158,7 +170,7 @@ func (s *stateCheckpoint) storeState() error {
 	checkpoint := NewGPUPluginCheckpoint()
 	checkpoint.PolicyName = s.policyName
 	checkpoint.MachineState = s.cache.GetMachineState()
-	checkpoint.PodEntries = s.cache.GetPodEntries()
+	checkpoint.PodResourceEntries = s.cache.GetPodResourceEntries()
 
 	err := s.checkpointManager.CreateCheckpoint(s.checkpointName, checkpoint)
 	if err != nil {
@@ -168,7 +180,7 @@ func (s *stateCheckpoint) storeState() error {
 	return nil
 }
 
-func (s *stateCheckpoint) restoreState(conf *qrm.QRMPluginsConfiguration, gpuTopologyProvider machine.GPUTopologyProvider) error {
+func (s *stateCheckpoint) restoreState(topologyRegistry *machine.DeviceTopologyRegistry) error {
 	s.Lock()
 	defer s.Unlock()
 	var err error
@@ -194,13 +206,13 @@ func (s *stateCheckpoint) restoreState(conf *qrm.QRMPluginsConfiguration, gpuTop
 		return fmt.Errorf("configured policy %q differs from state checkpoint policy %q", s.policyName, checkpoint.PolicyName)
 	}
 
-	machineState, err := GenerateMachineStateFromPodEntries(conf, checkpoint.PodEntries, gpuTopologyProvider)
+	machineState, err := GenerateMachineStateFromPodEntries(checkpoint.PodResourceEntries, topologyRegistry)
 	if err != nil {
 		return fmt.Errorf("GenerateMachineStateFromPodEntries failed with error: %v", err)
 	}
 
 	s.cache.SetMachineState(machineState, false)
-	s.cache.SetPodEntries(checkpoint.PodEntries, false)
+	s.cache.SetPodResourceEntries(checkpoint.PodResourceEntries, false)
 
 	if !reflect.DeepEqual(machineState, checkpoint.MachineState) {
 		generalLog.Warningf("machine state changed: "+
@@ -227,15 +239,16 @@ func (s *stateCheckpoint) restoreState(conf *qrm.QRMPluginsConfiguration, gpuTop
 	return nil
 }
 
-func NewCheckpointState(conf *qrm.QRMPluginsConfiguration, stateDir, checkpointName, policyName string,
-	gpuTopologyProvider machine.GPUTopologyProvider, skipStateCorruption bool, emitter metrics.MetricEmitter,
+func NewCheckpointState(
+	conf *qrm.QRMPluginsConfiguration, stateDir, checkpointName, policyName string,
+	topologyRegistry *machine.DeviceTopologyRegistry, skipStateCorruption bool, emitter metrics.MetricEmitter,
 ) (State, error) {
 	checkpointManager, err := checkpointmanager.NewCheckpointManager(stateDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize checkpoint manager: %v", err)
 	}
 
-	defaultCache, err := NewGPUPluginState(conf, gpuTopologyProvider)
+	defaultCache, err := NewGPUPluginState(conf, topologyRegistry)
 	if err != nil {
 		return nil, fmt.Errorf("NewGPUPluginState failed with error: %v", err)
 	}
@@ -249,7 +262,7 @@ func NewCheckpointState(conf *qrm.QRMPluginsConfiguration, stateDir, checkpointN
 		emitter:             emitter,
 	}
 
-	if err := sc.restoreState(conf, gpuTopologyProvider); err != nil {
+	if err := sc.restoreState(topologyRegistry); err != nil {
 		return nil, fmt.Errorf("could not restore state from checkpoint: %v, please drain this node and delete "+
 			"the gpu plugin checkpoint file %q before restarting Kubelet",
 			err, path.Join(stateDir, checkpointName))
