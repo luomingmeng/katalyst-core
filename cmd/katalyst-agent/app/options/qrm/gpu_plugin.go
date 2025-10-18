@@ -25,16 +25,19 @@ import (
 
 type GPUOptions struct {
 	PolicyName                 string
-	GPUResourceNames           []string
+	GPUDeviceNames             []string
 	GPUMemoryAllocatablePerGPU string
 	SkipGPUStateCorruption     bool
+	RDMADeviceNames            []string
+	ResourcePluginsNames       []string
 }
 
 func NewGPUOptions() *GPUOptions {
 	return &GPUOptions{
 		PolicyName:                 "static",
-		GPUResourceNames:           []string{"nvidia.com/gpu"},
+		GPUDeviceNames:             []string{"nvidia.com/gpu"},
 		GPUMemoryAllocatablePerGPU: "100",
+		RDMADeviceNames:            []string{"bytedance.com/rdma"},
 	}
 }
 
@@ -43,21 +46,24 @@ func (o *GPUOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 
 	fs.StringVar(&o.PolicyName, "gpu-resource-plugin-policy",
 		o.PolicyName, "The policy gpu resource plugin should use")
-	fs.StringSliceVar(&o.GPUResourceNames, "gpu-resource-names", o.GPUResourceNames, "The name of the GPU resource")
+	fs.StringSliceVar(&o.GPUDeviceNames, "gpu-resource-names", o.GPUDeviceNames, "The name of the GPU resource")
 	fs.StringVar(&o.GPUMemoryAllocatablePerGPU, "gpu-memory-allocatable-per-gpu",
 		o.GPUMemoryAllocatablePerGPU, "The total memory allocatable for each GPU, e.g. 100")
 	fs.BoolVar(&o.SkipGPUStateCorruption, "skip-gpu-state-corruption",
 		o.SkipGPUStateCorruption, "skip gpu state corruption, and it will be used after updating state properties")
+	fs.StringSliceVar(&o.ResourcePluginsNames, "gpu-resource-plugins-names", o.ResourcePluginsNames, "The names of the enabled gpu resource plugins")
 }
 
 func (o *GPUOptions) ApplyTo(conf *qrmconfig.GPUQRMPluginConfig) error {
 	conf.PolicyName = o.PolicyName
-	conf.GPUResourceNames = o.GPUResourceNames
+	conf.GPUDeviceNames = o.GPUDeviceNames
 	gpuMemory, err := resource.ParseQuantity(o.GPUMemoryAllocatablePerGPU)
 	if err != nil {
 		return err
 	}
 	conf.GPUMemoryAllocatablePerGPU = gpuMemory
 	conf.SkipGPUStateCorruption = o.SkipGPUStateCorruption
+	conf.RDMADeviceNames = o.RDMADeviceNames
+	conf.ResourcePluginsNames = o.ResourcePluginsNames
 	return nil
 }
