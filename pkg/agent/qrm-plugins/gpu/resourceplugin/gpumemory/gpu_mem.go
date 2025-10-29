@@ -427,8 +427,8 @@ func (p *GPUMemPlugin) GetTopologyAwareAllocatableResources() (*gpuconsts.Alloca
 func (p *GPUMemPlugin) Allocate(
 	resourceReq *pluginapi.ResourceRequest, deviceReq *pluginapi.DeviceRequest,
 ) (*pluginapi.ResourceAllocationResponse, error) {
-	_, exists := resourceReq.Annotations[p.ResourceName()]
-	if !exists {
+	quantity, exists := resourceReq.ResourceRequests[p.ResourceName()]
+	if !exists || quantity == 0 {
 		general.InfoS("No GPU memory annotation detected and no GPU memory requested, returning empty response",
 			"podNamespace", resourceReq.PodNamespace,
 			"podName", resourceReq.PodName,
