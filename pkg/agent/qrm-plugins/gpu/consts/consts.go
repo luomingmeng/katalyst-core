@@ -19,18 +19,35 @@ package consts
 import (
 	"time"
 
-	"github.com/kubewharf/katalyst-api/pkg/consts"
+	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
+	"github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/cmd/katalyst-agent/app/agent/qrm"
 )
 
+type AllocatedResource struct {
+	ResourceName string
+	PodName      string
+	PodNamespace string
+	*pluginapi.TopologyAwareResource
+}
+
+type AllocatableResource struct {
+	ResourceName string
+	*pluginapi.AllocatableTopologyAwareResource
+}
+
 const (
+	GPUDeviceType  = "gpu_device"
+	RDMADeviceType = "rdma_device"
 
 	// GPUResourcePluginPolicyNameStatic is the policy name of static gpu resource plugin
 	GPUResourcePluginPolicyNameStatic = string(consts.ResourcePluginPolicyNameStatic)
 
 	GPUPluginDynamicPolicyName = qrm.QRMPluginNameGPU + "_" + GPUResourcePluginPolicyNameStatic
 	ClearResidualState         = GPUPluginDynamicPolicyName + "_clear_residual_state"
+
+	GPUMemPluginName = "gpu_mem_resource_plugin"
 
 	StateCheckPeriod          = 30 * time.Second
 	StateCheckTolerationTimes = 3

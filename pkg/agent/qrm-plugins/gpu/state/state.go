@@ -18,6 +18,11 @@ package state
 
 import (
 	"encoding/json"
+	"sync"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/klog/v2"
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
@@ -26,40 +31,42 @@ import (
 type AllocationInfo struct {
 	commonstate.AllocationMeta `json:",inline"`
 
-	AllocatedAllocation      GPUAllocation            `json:"allocated_allocation"`
-	TopologyAwareAllocations map[string]GPUAllocation `json:"topology_aware_allocations"`
+	AllocatedAllocation      Allocation            `json:"allocated_allocation"`
+	TopologyAwareAllocations map[string]Allocation `json:"topology_aware_allocations"`
 }
 
-type GPUAllocation struct {
-	GPUMemoryQuantity float64 `json:"gpu_memory_quantity"`
-	NUMANodes         []int   `json:"numa_nodes"`
+type Allocation struct {
+	// Quantity refers to the amount of device allocated
+	Quantity  float64 `json:"quantity"`
+	NUMANodes []int   `json:"numa_nodes"`
 }
 
-func (a *GPUAllocation) Clone() GPUAllocation {
+func (a *Allocation) Clone() Allocation {
 	if a == nil {
-		return GPUAllocation{}
+		return Allocation{}
 	}
 
 	numaNodes := make([]int, len(a.NUMANodes))
 	copy(numaNodes, a.NUMANodes)
-	return GPUAllocation{
-		GPUMemoryQuantity: a.GPUMemoryQuantity,
-		NUMANodes:         numaNodes,
+	return Allocation{
+		Quantity:  a.Quantity,
+		NUMANodes: numaNodes,
 	}
 }
 
 type (
-	ContainerEntries map[string]*AllocationInfo  // Keyed by container name
-	PodEntries       map[string]ContainerEntries // Keyed by pod UID
+	ContainerEntries   map[string]*AllocationInfo     // Keyed by container name
+	PodEntries         map[string]ContainerEntries    // Keyed by pod UID
+	PodResourceEntries map[v1.ResourceName]PodEntries // Keyed by resource name
 )
 
-type GPUState struct {
-	GPUMemoryAllocatable float64    `json:"gpu_memory_allocatable"`
-	GPUMemoryAllocated   float64    `json:"gpu_memory_allocated"`
-	PodEntries           PodEntries `json:"pod_entries"`
+type AllocationState struct {
+	PodEntries PodEntries `json:"pod_entries"`
 }
 
-type GPUMap map[string]*GPUState // GPUMap keyed by gpu device name i.e. GPU-fef8089b-4820-abfc-e83e-94318197576e
+type AllocationMap map[string]*AllocationState // AllocationMap keyed by device name i.e. GPU-fef8089b-4820-abfc-e83e-94318197576e
+
+type AllocationResourcesMap map[v1.ResourceName]AllocationMap // AllocationResourcesMap keyed by resource name i.e. v1.ResourceName("nvidia.com/gpu")
 
 func (i *AllocationInfo) String() string {
 	if i == nil {
@@ -85,7 +92,7 @@ func (i *AllocationInfo) Clone() *AllocationInfo {
 	}
 
 	if i.TopologyAwareAllocations != nil {
-		clone.TopologyAwareAllocations = make(map[string]GPUAllocation)
+		clone.TopologyAwareAllocations = make(map[string]Allocation)
 		for k, v := range i.TopologyAwareAllocations {
 			clone.TopologyAwareAllocations[k] = v.Clone()
 		}
@@ -143,141 +150,226 @@ func (e PodEntries) SetAllocationInfo(podUID string, containerName string, alloc
 	e[podUID][containerName] = allocationInfo.Clone()
 }
 
-func (ns *GPUState) String() string {
-	if ns == nil {
+func (pre PodResourceEntries) String() string {
+	if pre == nil {
 		return ""
 	}
 
-	contentBytes, err := json.Marshal(ns)
+	contentBytes, err := json.Marshal(pre)
 	if err != nil {
-		general.LoggerWithPrefix("GPUState.String", general.LoggingPKGFull).Errorf("marshal GPUState failed with error: %v", err)
+		general.LoggerWithPrefix("PodResourceEntries.String", general.LoggingPKGFull).Errorf("[PodResourceEntries.String] marshal PodResourceEntries failed with error: %v", err)
 		return ""
 	}
 	return string(contentBytes)
 }
 
-func (ns *GPUState) Clone() *GPUState {
-	if ns == nil {
+func (pre PodResourceEntries) Clone() PodResourceEntries {
+	if pre == nil {
 		return nil
 	}
 
-	return &GPUState{
-		GPUMemoryAllocatable: ns.GPUMemoryAllocatable,
-		GPUMemoryAllocated:   ns.GPUMemoryAllocated,
-		PodEntries:           ns.PodEntries.Clone(),
+	clone := make(PodResourceEntries)
+	for resourceName, podEntries := range pre {
+		clone[resourceName] = podEntries.Clone()
 	}
+	return clone
 }
 
-func (ns *GPUState) GetGPUMemoryAllocatable() float64 {
-	if ns == nil {
-		return 0
-	}
-
-	return ns.GPUMemoryAllocatable
-}
-
-func (ns *GPUState) GetGPUMemoryAllocated() float64 {
-	if ns == nil {
-		return 0
-	}
-
-	return ns.GPUMemoryAllocated
-}
-
-// SetAllocationInfo adds a new AllocationInfo (for pod/container pairs) into the given NICState
-func (ns *GPUState) SetAllocationInfo(podUID string, containerName string, allocationInfo *AllocationInfo) {
-	if ns == nil {
+func (pre PodResourceEntries) RemovePod(podUID string) {
+	if pre == nil {
 		return
 	}
 
-	if allocationInfo == nil {
-		general.LoggerWithPrefix("GPUState.SetAllocationInfo", general.LoggingPKGFull).Errorf("passed allocationInfo is nil")
+	for _, podEntries := range pre {
+		delete(podEntries, podUID)
+	}
+}
+
+// GetTotalAllocatedResourceOfContainer returns the total allocated resource quantity of a container together with
+// the specific resource IDs that are allocated.
+func (pre PodResourceEntries) GetTotalAllocatedResourceOfContainer(
+	resourceName v1.ResourceName, podUID, containerName string,
+) (int, sets.String) {
+	if podEntries, ok := pre[resourceName]; ok {
+		if allocationInfo := podEntries.GetAllocationInfo(podUID, containerName); allocationInfo != nil {
+			totalAllocationQuantity := int(allocationInfo.AllocatedAllocation.Quantity)
+			allocationIDs := sets.NewString()
+			for id := range allocationInfo.TopologyAwareAllocations {
+				allocationIDs.Insert(id)
+			}
+			return totalAllocationQuantity, allocationIDs
+		}
+	}
+	return 0, nil
+}
+
+func (as *AllocationState) String() string {
+	if as == nil {
+		return ""
+	}
+
+	contentBytes, err := json.Marshal(as)
+	if err != nil {
+		general.LoggerWithPrefix("AllocationState.String", general.LoggingPKGFull).Errorf("[AllocationState.String]marshal AllocationState failed with error: %v", err)
+		return ""
+	}
+	return string(contentBytes)
+}
+
+func (as *AllocationState) Clone() *AllocationState {
+	if as == nil {
+		return nil
+	}
+
+	return &AllocationState{
+		PodEntries: as.PodEntries.Clone(),
+	}
+}
+
+func (as *AllocationState) SetAllocationInfo(podUID string, containerName string, allocationInfo *AllocationInfo) {
+	if as == nil {
 		return
 	}
 
-	if ns.PodEntries == nil {
-		ns.PodEntries = make(PodEntries)
+	if as.PodEntries == nil {
+		as.PodEntries = make(PodEntries)
 	}
 
-	if _, ok := ns.PodEntries[podUID]; !ok {
-		ns.PodEntries[podUID] = make(ContainerEntries)
+	if _, ok := as.PodEntries[podUID]; !ok {
+		as.PodEntries[podUID] = make(ContainerEntries)
 	}
 
-	ns.PodEntries[podUID][containerName] = allocationInfo.Clone()
+	as.PodEntries[podUID][containerName] = allocationInfo.Clone()
 }
 
-func (m GPUMap) Clone() GPUMap {
-	clone := make(GPUMap)
-	for id, ns := range m {
+func (am AllocationMap) String() string {
+	if am == nil {
+		return ""
+	}
+
+	contentBytes, err := json.Marshal(am)
+	if err != nil {
+		general.LoggerWithPrefix("AllocationMap.String", general.LoggingPKGFull).Errorf("[AllocationMap.String]marshal AllocationMap failed with error: %v", err)
+		return ""
+	}
+	return string(contentBytes)
+}
+
+func (am AllocationMap) Clone() AllocationMap {
+	if am == nil {
+		return nil
+	}
+
+	clone := make(AllocationMap)
+	for id, ns := range am {
 		clone[id] = ns.Clone()
 	}
 	return clone
 }
 
-func (m GPUMap) String() string {
-	if m == nil {
+func (arm AllocationResourcesMap) String() string {
+	if arm == nil {
 		return ""
 	}
 
-	contentBytes, err := json.Marshal(m)
+	contentBytes, err := json.Marshal(arm)
 	if err != nil {
-		general.LoggerWithPrefix("GPUMap.String", general.LoggingPKGFull).Errorf("marshal GPUMap failed with error: %v", err)
+		klog.Errorf("[AllocationResourcesMap.String] marshal AllocationResourcesMap failed with error: %v", err)
 		return ""
 	}
 	return string(contentBytes)
 }
 
-func (m GPUMap) GetGPUMemoryAllocatable(id string) float64 {
-	if m == nil {
+func (arm AllocationResourcesMap) Clone() AllocationResourcesMap {
+	clone := make(AllocationResourcesMap)
+	for resourceName, am := range arm {
+		clone[resourceName] = am.Clone()
+	}
+	return clone
+}
+
+// GetRatioOfAccompanyResourceToTargetResource returns the ratio of total accompany resource to total target resource.
+// For example, if the total number of accompany resource is 4 and the total number of target resource is 2,
+// the ratio is 2.
+func (arm AllocationResourcesMap) GetRatioOfAccompanyResourceToTargetResource(accompanyResourceName, targetResourceName string) float64 {
+	// Find the ratio of the total number of accompany resource to the total number of target resource
+	accompanyResourceMap := arm[v1.ResourceName(accompanyResourceName)].Clone()
+	accompanyResourceNumber := accompanyResourceMap.getNumberDevices()
+
+	targetResourceMap := arm[v1.ResourceName(targetResourceName)].Clone()
+	targetResourceNumber := targetResourceMap.getNumberDevices()
+
+	if targetResourceNumber == 0 {
 		return 0
 	}
-	return m[id].GetGPUMemoryAllocatable()
+
+	return float64(accompanyResourceNumber) / float64(targetResourceNumber)
 }
 
-func (m GPUMap) GPUMemoryAllocated(id string) float64 {
-	if m == nil {
+func (as *AllocationState) GetQuantityAllocated() float64 {
+	if as == nil {
 		return 0
 	}
 
-	return m[id].GetGPUMemoryAllocated()
+	quantityAllocated := float64(0)
+	for _, podEntries := range as.PodEntries {
+		for _, allocationInfo := range podEntries {
+			quantityAllocated += allocationInfo.AllocatedAllocation.Quantity
+		}
+	}
+	return quantityAllocated
 }
 
-func (m GPUMap) GPUMemorySatisfiedRequest(id string, request float64) bool {
-	if m == nil {
-		return false
+func (am AllocationMap) GetQuantityAllocated(id string) float64 {
+	if am == nil {
+		return 0
 	}
 
-	gpuMemoryAllocatable := m.GetGPUMemoryAllocatable(id)
-	gpuMemoryAllocated := m.GPUMemoryAllocated(id)
-	return gpuMemoryAllocatable-gpuMemoryAllocated >= request
+	return am[id].GetQuantityAllocated()
 }
 
-// reader is used to get information from local states
-type reader interface {
-	GetMachineState() GPUMap
-	GetPodEntries() PodEntries
-	GetAllocationInfo(podUID, containerName string) *AllocationInfo
+func (am AllocationMap) IsRequestSatisfied(id string, request float64, allocatable float64) bool {
+	allocated := am.GetQuantityAllocated(id)
+	return allocatable-allocated >= request
 }
 
-// writer is used to store information into local states,
-// and it also provides functionality to maintain the local files
-type writer interface {
-	SetMachineState(gpuMap GPUMap, persist bool)
-	SetPodEntries(podEntries PodEntries, persist bool)
-	SetAllocationInfo(podUID, containerName string, allocationInfo *AllocationInfo, persist bool)
+func (am AllocationMap) getNumberDevices() int {
+	if am == nil {
+		return 0
+	}
 
-	Delete(podUID, containerName string, persist bool)
-	ClearState()
-	StoreState() error
+	return len(am)
 }
 
-// ReadonlyState interface only provides methods for tracking pod assignments
-type ReadonlyState interface {
-	reader
+type DefaultResourceStateGeneratorRegistry struct {
+	mutex      sync.RWMutex
+	generators map[string]DefaultResourceStateGenerator
 }
 
-// State interface provides methods for tracking and setting pod assignments
-type State interface {
-	writer
-	ReadonlyState
+func NewDefaultResourceStateGeneratorRegistry() *DefaultResourceStateGeneratorRegistry {
+	return &DefaultResourceStateGeneratorRegistry{
+		generators: make(map[string]DefaultResourceStateGenerator),
+	}
+}
+
+func (r *DefaultResourceStateGeneratorRegistry) RegisterResourceStateGenerator(resourceName string, generator DefaultResourceStateGenerator) {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	r.generators[resourceName] = generator
+}
+
+func (r *DefaultResourceStateGeneratorRegistry) GetGenerators() map[string]DefaultResourceStateGenerator {
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+
+	return r.generators
+}
+
+func (r *DefaultResourceStateGeneratorRegistry) GetGenerator(resourceName string) (DefaultResourceStateGenerator, bool) {
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+
+	generator, ok := r.generators[resourceName]
+	return generator, ok
 }

@@ -19,69 +19,56 @@ package staticpolicy
 import (
 	"context"
 	"fmt"
-	"math"
-	"sort"
 	"sync"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
-	"github.com/kubewharf/katalyst-api/pkg/apis/node/v1alpha1"
 	"github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-api/pkg/plugins/skeleton"
 	"github.com/kubewharf/katalyst-core/cmd/katalyst-agent/app/agent"
 	appqrm "github.com/kubewharf/katalyst-core/cmd/katalyst-agent/app/agent/qrm"
-	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/baseplugin"
 	gpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/consts"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/customdeviceplugin"
+	devicepluginregistry "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/customdeviceplugin/registry"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/resourceplugin"
+	resourcepluginregistry "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/resourceplugin/registry"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/state"
-	gpuutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/util"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/periodicalhandler"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
-	"github.com/kubewharf/katalyst-core/pkg/config/agent/qrm"
-	"github.com/kubewharf/katalyst-core/pkg/config/generic"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
-	"github.com/kubewharf/katalyst-core/pkg/util/machine"
-	"github.com/kubewharf/katalyst-core/pkg/util/metric"
-)
-
-const (
-	GPUPluginStateFileName = "gpu_plugin_state"
 )
 
 // StaticPolicy is the static gpu policy
 type StaticPolicy struct {
-	sync.Mutex
+	sync.RWMutex
 	pluginapi.UnimplementedResourcePluginServer
+	*baseplugin.BasePlugin
 
-	name                string
-	stopCh              chan struct{}
-	started             bool
-	qosConfig           *generic.QoSConfiguration
-	qrmConfig           *qrm.QRMPluginsConfiguration
-	gpuTopologyProvider machine.GPUTopologyProvider
+	name    string
+	stopCh  chan struct{}
+	started bool
 
-	emitter    metrics.MetricEmitter
-	metaServer *metaserver.MetaServer
-	agentCtx   *agent.GenericContext
-	state      state.State
-
-	podAnnotationKeptKeys []string
-	podLabelKeptKeys      []string
-	resourceNames         sets.String
+	emitter metrics.MetricEmitter
 
 	residualHitMap map[string]int64
+
+	associatedDeviceNames sets.String
+	resourcePlugins       map[string]resourceplugin.ResourcePlugin
+	customDevicePlugins   map[string]customdeviceplugin.CustomDevicePlugin
 }
 
 // NewStaticPolicy returns a static gpu policy
-func NewStaticPolicy(agentCtx *agent.GenericContext, conf *config.Configuration,
+func NewStaticPolicy(
+	agentCtx *agent.GenericContext, conf *config.Configuration,
 	_ interface{}, agentName string,
 ) (bool, agent.Component, error) {
 	wrappedEmitter := agentCtx.EmitterPool.GetDefaultMetricsEmitter().WithTags(agentName, metrics.MetricTag{
@@ -89,27 +76,33 @@ func NewStaticPolicy(agentCtx *agent.GenericContext, conf *config.Configuration,
 		Val: gpuconsts.GPUResourcePluginPolicyNameStatic,
 	})
 
-	gpuTopologyProvider := machine.NewGPUTopologyProvider(conf.GPUResourceNames)
-	stateImpl, err := state.NewCheckpointState(conf.QRMPluginsConfiguration, conf.GenericQRMPluginConfiguration.StateFileDirectory, GPUPluginStateFileName,
-		gpuconsts.GPUResourcePluginPolicyNameStatic, gpuTopologyProvider, conf.SkipGPUStateCorruption, wrappedEmitter)
+	basePlugin, err := baseplugin.NewBasePlugin(agentCtx, conf, wrappedEmitter)
 	if err != nil {
-		return false, agent.ComponentStub{}, fmt.Errorf("NewCheckpointState failed with error: %v", err)
+		return false, agent.ComponentStub{}, fmt.Errorf("failed to create base plugin: %w", err)
 	}
 
 	policyImplement := &StaticPolicy{
 		emitter:               wrappedEmitter,
-		metaServer:            agentCtx.MetaServer,
-		agentCtx:              agentCtx,
 		stopCh:                make(chan struct{}),
 		name:                  fmt.Sprintf("%s_%s", agentName, gpuconsts.GPUResourcePluginPolicyNameStatic),
-		qosConfig:             conf.QoSConfiguration,
-		qrmConfig:             conf.QRMPluginsConfiguration,
-		gpuTopologyProvider:   gpuTopologyProvider,
-		state:                 stateImpl,
-		podAnnotationKeptKeys: conf.PodAnnotationKeptKeys,
-		podLabelKeptKeys:      conf.PodLabelKeptKeys,
 		residualHitMap:        make(map[string]int64),
-		resourceNames:         sets.NewString(conf.GPUResourceNames...),
+		BasePlugin:            basePlugin,
+		resourcePlugins:       make(map[string]resourceplugin.ResourcePlugin),
+		associatedDeviceNames: sets.NewString(),
+		customDevicePlugins:   make(map[string]customdeviceplugin.CustomDevicePlugin),
+	}
+
+	if err = policyImplement.registerResourcePlugins(); err != nil {
+		return false, agent.ComponentStub{}, fmt.Errorf("failed to register resource plugins: %w", err)
+	}
+	if err = policyImplement.registerCustomDevicePlugins(); err != nil {
+		return false, agent.ComponentStub{}, fmt.Errorf("failed to register custom device plugins: %w", err)
+	}
+
+	// init state must be done after resource plugins and custom device plugins are registered
+	err = policyImplement.InitState()
+	if err != nil {
+		return false, agent.ComponentStub{}, fmt.Errorf("failed to init state: %w", err)
 	}
 
 	pluginWrapper, err := skeleton.NewRegistrationPluginWrapper(policyImplement, conf.QRMPluginSocketDirs,
@@ -122,6 +115,8 @@ func NewStaticPolicy(agentCtx *agent.GenericContext, conf *config.Configuration,
 
 	return true, &agent.PluginWrapper{GenericPlugin: pluginWrapper}, nil
 }
+
+var _ skeleton.QRMPlugin = (*StaticPolicy)(nil)
 
 // Start starts this plugin
 func (p *StaticPolicy) Start() (err error) {
@@ -151,7 +146,7 @@ func (p *StaticPolicy) Start() (err error) {
 	}, time.Second*30, p.stopCh)
 
 	err = periodicalhandler.RegisterPeriodicalHandlerWithHealthz(gpuconsts.ClearResidualState, general.HealthzCheckStateNotReady,
-		appqrm.QRMNetworkPluginPeriodicalHandlerGroupName, p.clearResidualState, gpuconsts.StateCheckPeriod, gpuconsts.StateCheckTolerationTimes)
+		appqrm.QRMGPUPluginPeriodicalHandlerGroupName, p.clearResidualState, gpuconsts.StateCheckPeriod, gpuconsts.StateCheckTolerationTimes)
 	if err != nil {
 		general.Errorf("start %v failed, err: %v", gpuconsts.ClearResidualState, err)
 	}
@@ -193,7 +188,8 @@ func (p *StaticPolicy) ResourceName() string {
 }
 
 // GetTopologyHints returns hints of corresponding resources
-func (p *StaticPolicy) GetTopologyHints(_ context.Context,
+func (p *StaticPolicy) GetTopologyHints(
+	_ context.Context,
 	req *pluginapi.ResourceRequest,
 ) (resp *pluginapi.ResourceHintsResponse, err error) {
 	general.InfofV(4, "called")
@@ -201,104 +197,26 @@ func (p *StaticPolicy) GetTopologyHints(_ context.Context,
 		return nil, fmt.Errorf("GetTopologyHints got nil req")
 	}
 
-	existReallocAnno, isReallocation := util.IsReallocation(req.Annotations)
+	p.RLock()
+	defer p.RUnlock()
 
-	qosLevel, err := util.GetKatalystQoSLevelFromResourceReq(p.qosConfig, req, p.podAnnotationKeptKeys, p.podLabelKeptKeys)
-	if err != nil {
-		err = fmt.Errorf("GetKatalystQoSLevelFromResourceReq for pod: %s/%s, container: %s failed with error: %v",
-			req.PodNamespace, req.PodName, req.ContainerName, err)
-		general.Errorf("%s", err.Error())
-		return nil, err
+	resourcePlugin := p.getResourcePlugin(req.ResourceName)
+	if resourcePlugin == nil {
+		return nil, fmt.Errorf("failed to find resource plugin by name %s", req.ResourceName)
 	}
-
-	_, gpuMemory, err := util.GetQuantityFromResourceRequests(req.ResourceRequests, p.ResourceName(), false)
-	if err != nil {
-		return nil, fmt.Errorf("getReqQuantityFromResourceReq failed with error: %v", err)
-	}
-
-	gpuCount, gpuNames, err := p.getGPUCount(req)
-	if err != nil {
-		general.Errorf("getGPUCount failed from req %v with error: %v", req, err)
-		return nil, fmt.Errorf("getGPUCount failed with error: %v", err)
-	}
-
-	if gpuCount == 0 {
-		general.Errorf("getGPUCount failed from req %v with error: no GPU resources found", req)
-		return nil, fmt.Errorf("no GPU resources found")
-	}
-
-	general.InfoS("called",
-		"podNamespace", req.PodNamespace,
-		"podName", req.PodName,
-		"containerName", req.ContainerName,
-		"qosLevel", qosLevel,
-		"reqAnnotations", req.Annotations,
-		"gpuMemory", gpuMemory,
-		"gpuNames", gpuNames.List(),
-		"gpuCount", gpuCount)
-
-	p.Lock()
-	defer func() {
-		if err := p.state.StoreState(); err != nil {
-			general.ErrorS(err, "store state failed", "podName", req.PodName, "containerName", req.ContainerName)
-		}
-		p.Unlock()
-		if err != nil {
-			metricTags := []metrics.MetricTag{
-				{Key: "error_message", Val: metric.MetricTagValueFormat(err)},
-			}
-			if existReallocAnno {
-				metricTags = append(metricTags, metrics.MetricTag{Key: "reallocation", Val: isReallocation})
-			}
-			_ = p.emitter.StoreInt64(util.MetricNameGetTopologyHintsFailed, 1, metrics.MetricTypeNameRaw, metricTags...)
-		}
-	}()
-
-	var hints map[string]*pluginapi.ListOfTopologyHints
-	machineState := p.state.GetMachineState()
-	allocationInfo := p.state.GetAllocationInfo(req.PodUid, req.ContainerName)
-	if allocationInfo != nil {
-		hints = gpuutil.RegenerateGPUMemoryHints(allocationInfo, false)
-
-		// regenerateHints failed. need to clear container record and re-calculate.
-		if hints == nil {
-			podEntries := p.state.GetPodEntries()
-			delete(podEntries[req.PodUid], req.ContainerName)
-			if len(podEntries[req.PodUid]) == 0 {
-				delete(podEntries, req.PodUid)
-			}
-
-			var err error
-			machineState, err = state.GenerateMachineStateFromPodEntries(p.qrmConfig, p.state.GetPodEntries(), p.gpuTopologyProvider)
-			if err != nil {
-				general.Errorf("pod: %s/%s, container: %s GenerateMachineStateFromPodEntries failed with error: %v",
-					req.PodNamespace, req.PodName, req.ContainerName, err)
-				return nil, fmt.Errorf("GenerateMachineStateFromPodEntries failed with error: %v", err)
-			}
-		}
-	}
-
-	// otherwise, calculate hint for container without allocated memory
-	if hints == nil {
-		var calculateErr error
-		// calculate hint for container without allocated cpus
-		hints, calculateErr = p.calculateHints(gpuMemory, gpuCount, machineState, req)
-		if calculateErr != nil {
-			return nil, fmt.Errorf("calculateHints failed with error: %v", calculateErr)
-		}
-	}
-
-	return util.PackResourceHintsResponse(req, p.ResourceName(), hints)
+	return resourcePlugin.GetTopologyHints(req)
 }
 
 // GetPodTopologyHints returns hints of corresponding resources
-func (p *StaticPolicy) GetPodTopologyHints(_ context.Context,
+func (p *StaticPolicy) GetPodTopologyHints(
+	_ context.Context,
 	req *pluginapi.PodResourceRequest,
 ) (resp *pluginapi.PodResourceHintsResponse, err error) {
 	return nil, util.ErrNotImplemented
 }
 
-func (p *StaticPolicy) RemovePod(_ context.Context,
+func (p *StaticPolicy) RemovePod(
+	_ context.Context,
 	req *pluginapi.RemovePodRequest,
 ) (*pluginapi.RemovePodResponse, error) {
 	if req == nil {
@@ -308,6 +226,7 @@ func (p *StaticPolicy) RemovePod(_ context.Context,
 	p.Lock()
 	defer p.Unlock()
 
+	// For every resource plugin and custom resource plugin, remove pod from their state
 	if err := p.removePod(req.PodUid); err != nil {
 		general.ErrorS(err, "remove pod failed with error", "podUID", req.PodUid)
 		return nil, err
@@ -317,7 +236,8 @@ func (p *StaticPolicy) RemovePod(_ context.Context,
 }
 
 // GetResourcesAllocation returns allocation results of corresponding resources
-func (p *StaticPolicy) GetResourcesAllocation(_ context.Context,
+func (p *StaticPolicy) GetResourcesAllocation(
+	_ context.Context,
 	_ *pluginapi.GetResourcesAllocationRequest,
 ) (*pluginapi.GetResourcesAllocationResponse, error) {
 	general.InfofV(4, "called")
@@ -325,7 +245,8 @@ func (p *StaticPolicy) GetResourcesAllocation(_ context.Context,
 }
 
 // GetTopologyAwareResources returns allocation results of corresponding resources as topology aware format
-func (p *StaticPolicy) GetTopologyAwareResources(_ context.Context,
+func (p *StaticPolicy) GetTopologyAwareResources(
+	_ context.Context,
 	req *pluginapi.GetTopologyAwareResourcesRequest,
 ) (*pluginapi.GetTopologyAwareResourcesResponse, error) {
 	general.InfofV(4, "called")
@@ -333,47 +254,79 @@ func (p *StaticPolicy) GetTopologyAwareResources(_ context.Context,
 		return nil, fmt.Errorf("GetTopologyAwareResources got nil req")
 	}
 
-	allocationInfo := p.state.GetAllocationInfo(req.PodUid, req.ContainerName)
-	if allocationInfo == nil {
-		return &pluginapi.GetTopologyAwareResourcesResponse{}, nil
+	p.RLock()
+	defer p.RUnlock()
+
+	// Get topology aware resources for all resource plugins
+	allocatedResourcesList := make([]*pluginapi.GetTopologyAwareResourcesResponse, 0)
+	for _, resourcePlugin := range p.resourcePlugins {
+		allocatedResource, err := resourcePlugin.GetTopologyAwareResources(req.PodUid, req.ContainerName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get topology aware resources for plugin %s: %w", resourcePlugin.ResourceName(), err)
+		}
+
+		if allocatedResource == nil {
+			continue
+		}
+		allocatedResourcesList = append(allocatedResourcesList, allocatedResource)
 	}
 
-	topologyAwareQuantityList := make([]*pluginapi.TopologyAwareQuantity, 0, len(allocationInfo.TopologyAwareAllocations))
-	for deviceID, alloc := range allocationInfo.TopologyAwareAllocations {
-		topologyAwareQuantityList = append(topologyAwareQuantityList, &pluginapi.TopologyAwareQuantity{
-			ResourceValue: alloc.GPUMemoryQuantity,
-			Name:          deviceID,
-			Type:          string(v1alpha1.TopologyTypeGPU),
-			Annotations: map[string]string{
-				consts.ResourceAnnotationKeyResourceIdentifier: "",
-			},
-		})
-	}
-
-	resp := &pluginapi.GetTopologyAwareResourcesResponse{
-		PodUid:       allocationInfo.PodUid,
-		PodName:      allocationInfo.PodName,
-		PodNamespace: allocationInfo.PodNamespace,
-		ContainerTopologyAwareResources: &pluginapi.ContainerTopologyAwareResources{
-			ContainerName: allocationInfo.ContainerName,
-			AllocatedResources: map[string]*pluginapi.TopologyAwareResource{
-				p.ResourceName(): {
-					IsNodeResource:                    true,
-					IsScalarResource:                  true,
-					AggregatedQuantity:                allocationInfo.AllocatedAllocation.GPUMemoryQuantity,
-					OriginalAggregatedQuantity:        allocationInfo.AllocatedAllocation.GPUMemoryQuantity,
-					TopologyAwareQuantityList:         topologyAwareQuantityList,
-					OriginalTopologyAwareQuantityList: topologyAwareQuantityList,
-				},
-			},
-		},
+	// Merge the respective response into one response
+	resp, err := p.mergeTopologyAwareResourcesResponse(req.PodUid, req.ContainerName, allocatedResourcesList)
+	if err != nil {
+		return nil, fmt.Errorf("failed to merge topology aware resources: %w", err)
 	}
 
 	return resp, nil
 }
 
+// mergeTopologyAwareResourcesResponse takes the separate topology aware resources response from the different sub-plugins and
+// merge them into one response.
+func (p *StaticPolicy) mergeTopologyAwareResourcesResponse(
+	podUID, containerName string, respList []*pluginapi.GetTopologyAwareResourcesResponse,
+) (*pluginapi.GetTopologyAwareResourcesResponse, error) {
+	result := &pluginapi.GetTopologyAwareResourcesResponse{
+		PodUid: podUID,
+		ContainerTopologyAwareResources: &pluginapi.ContainerTopologyAwareResources{
+			ContainerName: containerName,
+		},
+	}
+
+	allocatedResources := make(map[string]*pluginapi.TopologyAwareResource)
+	for _, resp := range respList {
+		if resp == nil {
+			continue
+		}
+
+		if result.PodName != "" && result.PodName != resp.PodName {
+			general.Errorf("pod name %s not match, expect %s", resp.PodName, result.PodName)
+			return nil, fmt.Errorf("pod name %s not match, expect %s", resp.PodName, result.PodName)
+		}
+
+		if result.PodNamespace != "" && result.PodNamespace != resp.PodNamespace {
+			general.Errorf("pod namespace %s not match, expect %s", resp.PodNamespace, result.PodNamespace)
+			return nil, fmt.Errorf("pod namespace %s not match, expect %s", resp.PodNamespace, result.PodNamespace)
+		}
+
+		if result.PodName == "" {
+			result.PodName = resp.PodName
+		}
+		if result.PodNamespace == "" {
+			result.PodNamespace = resp.PodNamespace
+		}
+
+		for resourceName, resource := range resp.ContainerTopologyAwareResources.AllocatedResources {
+			allocatedResources[resourceName] = resource
+		}
+	}
+
+	result.ContainerTopologyAwareResources.AllocatedResources = allocatedResources
+	return result, nil
+}
+
 // GetTopologyAwareAllocatableResources returns corresponding allocatable resources as topology aware format
-func (p *StaticPolicy) GetTopologyAwareAllocatableResources(_ context.Context,
+func (p *StaticPolicy) GetTopologyAwareAllocatableResources(
+	_ context.Context,
 	req *pluginapi.GetTopologyAwareAllocatableResourcesRequest,
 ) (*pluginapi.GetTopologyAwareAllocatableResourcesResponse, error) {
 	general.InfofV(4, "called")
@@ -381,189 +334,70 @@ func (p *StaticPolicy) GetTopologyAwareAllocatableResources(_ context.Context,
 		return nil, fmt.Errorf("GetTopologyAwareAllocatableResources got nil req")
 	}
 
-	p.Lock()
-	defer p.Unlock()
+	p.RLock()
+	defer p.RUnlock()
 
-	machineState := p.state.GetMachineState()
-
-	topologyAwareAllocatableQuantityList := make([]*pluginapi.TopologyAwareQuantity, 0, len(machineState))
-	topologyAwareCapacityQuantityList := make([]*pluginapi.TopologyAwareQuantity, 0, len(machineState))
-	var aggregatedAllocatableQuantity, aggregatedCapacityQuantity float64
-	for deviceID, gpuState := range machineState {
-		aggregatedAllocatableQuantity += gpuState.GetGPUMemoryAllocatable()
-		aggregatedCapacityQuantity += gpuState.GetGPUMemoryAllocatable()
-		topologyAwareAllocatableQuantityList = append(topologyAwareAllocatableQuantityList, &pluginapi.TopologyAwareQuantity{
-			ResourceValue: gpuState.GetGPUMemoryAllocatable(),
-			Name:          deviceID,
-			Type:          string(v1alpha1.TopologyTypeGPU),
-			Annotations: map[string]string{
-				consts.ResourceAnnotationKeyResourceIdentifier: "",
-			},
-		})
-		topologyAwareCapacityQuantityList = append(topologyAwareCapacityQuantityList, &pluginapi.TopologyAwareQuantity{
-			ResourceValue: gpuState.GetGPUMemoryAllocatable(),
-			Name:          deviceID,
-			Type:          string(v1alpha1.TopologyTypeGPU),
-			Annotations: map[string]string{
-				consts.ResourceAnnotationKeyResourceIdentifier: "",
-			},
-		})
+	// Get topology aware allocatable resources for all resource plugins
+	allocatableResources := make(map[string]*pluginapi.AllocatableTopologyAwareResource)
+	for _, resourcePlugin := range p.resourcePlugins {
+		allocatableResource, err := resourcePlugin.GetTopologyAwareAllocatableResources()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get topology aware allocatable resources for plugin %s: %w", resourcePlugin.ResourceName(), err)
+		}
+		allocatableResources[allocatableResource.ResourceName] = allocatableResource.AllocatableTopologyAwareResource
 	}
 
 	return &pluginapi.GetTopologyAwareAllocatableResourcesResponse{
-		AllocatableResources: map[string]*pluginapi.AllocatableTopologyAwareResource{
-			p.ResourceName(): {
-				IsNodeResource:                       true,
-				IsScalarResource:                     true,
-				AggregatedAllocatableQuantity:        aggregatedAllocatableQuantity,
-				TopologyAwareAllocatableQuantityList: topologyAwareAllocatableQuantityList,
-				AggregatedCapacityQuantity:           aggregatedCapacityQuantity,
-				TopologyAwareCapacityQuantityList:    topologyAwareCapacityQuantityList,
-			},
-		},
+		AllocatableResources: allocatableResources,
 	}, nil
 }
 
 // GetResourcePluginOptions returns options to be communicated with Resource Manager
-func (p *StaticPolicy) GetResourcePluginOptions(context.Context,
+func (p *StaticPolicy) GetResourcePluginOptions(
+	context.Context,
 	*pluginapi.Empty,
 ) (*pluginapi.ResourcePluginOptions, error) {
 	return &pluginapi.ResourcePluginOptions{
 		PreStartRequired:      false,
 		WithTopologyAlignment: true,
 		NeedReconcile:         false,
-		AssociatedDevices:     p.resourceNames.List(),
+		AssociatedDevices:     p.associatedDeviceNames.List(),
 	}, nil
 }
 
 // Allocate is called during pod admit so that the resource
 // plugin can allocate corresponding resource for the container
 // according to resource request
-func (p *StaticPolicy) Allocate(_ context.Context,
+func (p *StaticPolicy) Allocate(
+	_ context.Context,
 	req *pluginapi.ResourceRequest,
 ) (resp *pluginapi.ResourceAllocationResponse, err error) {
 	if req == nil {
 		return nil, fmt.Errorf("GetTopologyHints got nil req")
 	}
 
-	existReallocAnno, isReallocation := util.IsReallocation(req.Annotations)
-
-	qosLevel, err := util.GetKatalystQoSLevelFromResourceReq(p.qosConfig, req, p.podAnnotationKeptKeys, p.podLabelKeptKeys)
-	if err != nil {
-		err = fmt.Errorf("GetKatalystQoSLevelFromResourceReq for pod: %s/%s, container: %s failed with error: %v",
-			req.PodNamespace, req.PodName, req.ContainerName, err)
-		general.Errorf("%s", err.Error())
-		return nil, err
-	}
-
-	_, gpuMemory, err := util.GetQuantityFromResourceRequests(req.ResourceRequests, p.ResourceName(), false)
-	if err != nil {
-		return nil, fmt.Errorf("getReqQuantityFromResourceReq failed with error: %v", err)
-	}
-
-	gpuCount, gpuNames, err := p.getGPUCount(req)
-	if err != nil {
-		general.Errorf("getGPUCount failed from req %v with error: %v", req, err)
-		return nil, fmt.Errorf("getGPUCount failed with error: %v", err)
-	}
-
-	general.InfoS("called",
-		"podNamespace", req.PodNamespace,
-		"podName", req.PodName,
-		"containerName", req.ContainerName,
-		"qosLevel", qosLevel,
-		"reqAnnotations", req.Annotations,
-		"gpuMemory", gpuMemory,
-		"gpuNames", gpuNames.List(),
-		"gpuCount", gpuCount)
-
 	p.Lock()
 	defer func() {
-		if err := p.state.StoreState(); err != nil {
-			general.ErrorS(err, "store state failed", "podName", req.PodName, "containerName", req.ContainerName)
+		if err != nil {
+			_ = p.removeContainer(req.PodUid, req.ContainerName, v1.ResourceName(req.ResourceName))
 		}
 		p.Unlock()
-		if err != nil {
-			metricTags := []metrics.MetricTag{
-				{Key: "error_message", Val: metric.MetricTagValueFormat(err)},
-			}
-			if existReallocAnno {
-				metricTags = append(metricTags, metrics.MetricTag{Key: "reallocation", Val: isReallocation})
-			}
-			_ = p.emitter.StoreInt64(util.MetricNameAllocateFailed, 1, metrics.MetricTypeNameRaw, metricTags...)
-		}
 	}()
 
-	emptyResponse := &pluginapi.ResourceAllocationResponse{
-		PodUid:         req.PodUid,
-		PodNamespace:   req.PodNamespace,
-		PodName:        req.PodName,
-		ContainerName:  req.ContainerName,
-		ContainerType:  req.ContainerType,
-		ContainerIndex: req.ContainerIndex,
-		PodRole:        req.PodRole,
-		PodType:        req.PodType,
-		ResourceName:   p.ResourceName(),
-		Labels:         general.DeepCopyMap(req.Labels),
-		Annotations:    general.DeepCopyMap(req.Annotations),
+	resourcePlugin := p.getResourcePlugin(req.ResourceName)
+	if resourcePlugin == nil {
+		return nil, fmt.Errorf("failed to get resource plugin by name %s", req.ResourceName)
 	}
 
-	// currently, not to deal with init containers
-	if req.ContainerType == pluginapi.ContainerType_INIT {
-		return emptyResponse, nil
-	} else if req.ContainerType == pluginapi.ContainerType_SIDECAR {
-		// not to deal with sidecars, and return a trivial allocationResult to avoid re-allocating
-		return p.packAllocationResponse(req, &state.AllocationInfo{}, nil)
-	}
-
-	allocationInfo := p.state.GetAllocationInfo(req.PodUid, req.ContainerName)
-	if allocationInfo != nil {
-		resp, packErr := p.packAllocationResponse(req, allocationInfo, nil)
-		if packErr != nil {
-			general.Errorf("pod: %s/%s, container: %s packAllocationResponse failed with error: %v",
-				req.PodNamespace, req.PodName, req.ContainerName, packErr)
-			return nil, fmt.Errorf("packAllocationResponse failed with error: %v", packErr)
-		}
-		return resp, nil
-	}
-
-	// get hint nodes from request
-	hintNodes, err := machine.NewCPUSetUint64(req.GetHint().GetNodes()...)
-	if err != nil {
-		general.Warningf("failed to get hint nodes: %v", err)
-		return nil, fmt.Errorf("failed to get hint nodes: %v", err)
-	}
-
-	newAllocation := &state.AllocationInfo{
-		AllocationMeta: commonstate.GenerateGenericContainerAllocationMeta(req, commonstate.EmptyOwnerPoolName, qosLevel),
-		AllocatedAllocation: state.GPUAllocation{
-			GPUMemoryQuantity: gpuMemory,
-			NUMANodes:         hintNodes.ToSliceInt(),
-		},
-	}
-
-	p.state.SetAllocationInfo(req.PodUid, req.ContainerName, newAllocation, false)
-
-	machineState, stateErr := state.GenerateMachineStateFromPodEntries(p.qrmConfig, p.state.GetPodEntries(), p.gpuTopologyProvider)
-	if stateErr != nil {
-		general.ErrorS(stateErr, "GenerateMachineStateFromPodEntries failed",
-			"podNamespace", req.PodNamespace,
-			"podName", req.PodName,
-			"containerName", req.ContainerName,
-			"gpuMemory", gpuMemory)
-		return nil, fmt.Errorf("GenerateMachineStateFromPodEntries failed with error: %v", stateErr)
-	}
-
-	// update state cache
-	p.state.SetMachineState(machineState, true)
-
-	return p.packAllocationResponse(req, newAllocation, nil)
+	resp, err = resourcePlugin.Allocate(req, nil)
+	return resp, err
 }
 
 // AllocateForPod is called during pod admit so that the resource
 // plugin can allocate corresponding resource for the pod
 // according to resource request
-func (p *StaticPolicy) AllocateForPod(_ context.Context,
+func (p *StaticPolicy) AllocateForPod(
+	_ context.Context,
 	req *pluginapi.PodResourceRequest,
 ) (resp *pluginapi.PodResourceAllocationResponse, err error) {
 	return nil, util.ErrNotImplemented
@@ -572,36 +406,78 @@ func (p *StaticPolicy) AllocateForPod(_ context.Context,
 // PreStartContainer is called, if indicated by resource plugin during registration phase,
 // before each container start. Resource plugin can run resource specific operations
 // such as resetting the resource before making resources available to the container
-func (p *StaticPolicy) PreStartContainer(context.Context,
+func (p *StaticPolicy) PreStartContainer(
+	context.Context,
 	*pluginapi.PreStartContainerRequest,
 ) (*pluginapi.PreStartContainerResponse, error) {
 	return &pluginapi.PreStartContainerResponse{}, nil
 }
 
 func (p *StaticPolicy) removePod(podUID string) error {
-	// update state cache
-	podEntries := p.state.GetPodEntries()
-	delete(podEntries, podUID)
+	return p.removeWithUpdate(podUID, func(podResourceEntries state.PodResourceEntries) bool {
+		found := false
+		for _, podEntries := range podResourceEntries {
+			if podEntries[podUID] != nil {
+				found = true
+			}
+			delete(podEntries, podUID)
+		}
+		return found
+	})
+}
 
-	machineState, err := state.GenerateMachineStateFromPodEntries(p.qrmConfig, podEntries, p.gpuTopologyProvider)
+// removeContainer removes container entry given the specific podUID, container name and resource name.
+func (p *StaticPolicy) removeContainer(podUID, containerName string, resourceName v1.ResourceName) error {
+	return p.removeWithUpdate(podUID, func(podResourceEntries state.PodResourceEntries) bool {
+		found := false
+		for resource, podEntries := range podResourceEntries {
+			if resourceName != resource {
+				continue
+			}
+
+			if _, ok := podEntries[podUID]; !ok {
+				continue
+			}
+
+			if _, ok := podEntries[podUID][containerName]; ok {
+				found = true
+			}
+			delete(podEntries[podUID], containerName)
+		}
+		return found
+	})
+}
+
+func (p *StaticPolicy) removeWithUpdate(
+	podUID string, removeFn func(podResourceEntries state.PodResourceEntries) bool,
+) error {
+	podResourceEntries := p.State.GetPodResourceEntries()
+
+	found := removeFn(podResourceEntries)
+	if !found {
+		return nil
+	}
+
+	machineState, err := p.GenerateMachineStateFromPodEntries(podResourceEntries)
 	if err != nil {
 		general.Errorf("pod: %s, GenerateMachineStateFromPodEntries failed with error: %v", podUID, err)
 		return fmt.Errorf("calculate machineState by updated pod entries failed with error: %v", err)
 	}
 
-	p.state.SetPodEntries(podEntries, false)
-	p.state.SetMachineState(machineState, false)
+	p.State.SetPodResourceEntries(podResourceEntries, false)
+	p.State.SetMachineState(machineState, false)
 
-	err = p.state.StoreState()
-	if err != nil {
+	if err := p.State.StoreState(); err != nil {
 		general.Errorf("store state failed with error: %v", err)
 		return err
 	}
+
 	return nil
 }
 
 // clearResidualState is used to clean residual pods in local state
-func (p *StaticPolicy) clearResidualState(_ *config.Configuration,
+func (p *StaticPolicy) clearResidualState(
+	_ *config.Configuration,
 	_ interface{},
 	_ *dynamicconfig.DynamicAgentConfiguration,
 	_ metrics.MetricEmitter,
@@ -618,13 +494,13 @@ func (p *StaticPolicy) clearResidualState(_ *config.Configuration,
 		_ = general.UpdateHealthzStateByError(gpuconsts.ClearResidualState, err)
 	}()
 
-	if p.metaServer == nil {
+	if p.MetaServer == nil {
 		general.Errorf("nil metaServer")
 		return
 	}
 
 	ctx := context.Background()
-	podList, err = p.metaServer.GetPodList(ctx, nil)
+	podList, err = p.MetaServer.GetPodList(ctx, nil)
 	if err != nil {
 		general.Errorf("get pod list failed: %v", err)
 		return
@@ -638,12 +514,14 @@ func (p *StaticPolicy) clearResidualState(_ *config.Configuration,
 	p.Lock()
 	defer p.Unlock()
 
-	podEntries := p.state.GetPodEntries()
-	for podUID := range podEntries {
-		if !podSet.Has(podUID) {
-			residualSet[podUID] = true
-			p.residualHitMap[podUID] += 1
-			general.Infof("found pod: %s with state but doesn't show up in pod watcher, hit count: %d", podUID, p.residualHitMap[podUID])
+	podResourceEntries := p.State.GetPodResourceEntries()
+	for _, podEntries := range podResourceEntries {
+		for podUID := range podEntries {
+			if !podSet.Has(podUID) {
+				residualSet[podUID] = true
+				p.residualHitMap[podUID] += 1
+				general.Infof("found pod: %s with state but doesn't show up in pod watcher, hit count: %d", podUID, p.residualHitMap[podUID])
+			}
 		}
 	}
 
@@ -668,19 +546,19 @@ func (p *StaticPolicy) clearResidualState(_ *config.Configuration,
 			}
 
 			general.Infof("clear residual pod: %s in state", podUID)
-			delete(podEntries, podUID)
+			podResourceEntries.RemovePod(podUID)
 		}
 
-		machineState, err := state.GenerateMachineStateFromPodEntries(p.qrmConfig, podEntries, p.gpuTopologyProvider)
+		machineState, err := p.GenerateMachineStateFromPodEntries(podResourceEntries)
 		if err != nil {
 			general.Errorf("GenerateMachineStateFromPodEntries failed with error: %v", err)
 			return
 		}
 
-		p.state.SetPodEntries(podEntries, false)
-		p.state.SetMachineState(machineState, false)
+		p.State.SetPodResourceEntries(podResourceEntries, false)
+		p.State.SetMachineState(machineState, false)
 
-		err = p.state.StoreState()
+		err = p.State.StoreState()
 		if err != nil {
 			general.Errorf("store state failed: %v", err)
 			return
@@ -688,462 +566,163 @@ func (p *StaticPolicy) clearResidualState(_ *config.Configuration,
 	}
 }
 
-// packAllocationResponse fills pluginapi.ResourceAllocationResponse with information from AllocationInfo and pluginapi.ResourceRequest
-func (p *StaticPolicy) packAllocationResponse(
-	req *pluginapi.ResourceRequest,
-	allocationInfo *state.AllocationInfo,
-	resourceAllocationAnnotations map[string]string,
-) (*pluginapi.ResourceAllocationResponse, error) {
-	if allocationInfo == nil {
-		return nil, fmt.Errorf("packAllocationResponse got nil allocationInfo")
-	} else if req == nil {
-		return nil, fmt.Errorf("packAllocationResponse got nil request")
-	}
-
-	return &pluginapi.ResourceAllocationResponse{
-		PodUid:         req.PodUid,
-		PodNamespace:   req.PodNamespace,
-		PodName:        req.PodName,
-		ContainerName:  req.ContainerName,
-		ContainerType:  req.ContainerType,
-		ContainerIndex: req.ContainerIndex,
-		PodRole:        req.PodRole,
-		PodType:        req.PodType,
-		ResourceName:   req.ResourceName,
-		AllocationResult: &pluginapi.ResourceAllocation{
-			ResourceAllocation: map[string]*pluginapi.ResourceAllocationInfo{
-				p.ResourceName(): {
-					IsNodeResource:    true,
-					IsScalarResource:  true, // to avoid re-allocating
-					AllocatedQuantity: allocationInfo.AllocatedAllocation.GPUMemoryQuantity,
-					Annotations:       resourceAllocationAnnotations,
-					ResourceHints: &pluginapi.ListOfTopologyHints{
-						Hints: []*pluginapi.TopologyHint{
-							req.Hint,
-						},
-					},
-				},
-			},
-		},
-		Labels:      general.DeepCopyMap(req.Labels),
-		Annotations: general.DeepCopyMap(req.Annotations),
-	}, nil
-}
-
-func (p *StaticPolicy) getGPUCount(req *pluginapi.ResourceRequest) (float64, sets.String, error) {
-	gpuCount := float64(0)
-	gpuNames := sets.NewString()
-	for resourceName := range p.resourceNames {
-		_, request, err := util.GetQuantityFromResourceRequests(req.ResourceRequests, resourceName, false)
-		if err != nil && !errors.IsNotFound(err) {
-			return 0, nil, err
-		}
-		gpuCount += request
-		gpuNames.Insert(resourceName)
-	}
-	return gpuCount, gpuNames, nil
-}
-
-func (p *StaticPolicy) calculateHints(gpuMemory float64, gpuReq float64, machineState state.GPUMap, req *pluginapi.ResourceRequest) (map[string]*pluginapi.ListOfTopologyHints, error) {
-	gpuTopology, numaTopologyReady, err := p.gpuTopologyProvider.GetGPUTopology()
-	if err != nil {
-		return nil, err
-	}
-
-	if !numaTopologyReady {
-		return nil, fmt.Errorf("numa topology is ready")
-	}
-
-	perGPUMemory := gpuMemory / gpuReq
-	general.Infof("gpuMemory: %f, gpuReq: %f, perGPUMemory: %f", gpuMemory, gpuReq, perGPUMemory)
-
-	numaToAvailableGPUCount := make(map[int]float64)
-	numaToMostAllocatedGPUMemory := make(map[int]float64)
-	for gpuID, s := range machineState {
-		if s == nil {
-			continue
-		}
-
-		if s.GetGPUMemoryAllocated()+perGPUMemory <= s.GetGPUMemoryAllocatable() {
-			info, ok := gpuTopology.GPUs[gpuID]
-			if !ok {
-				return nil, fmt.Errorf("gpu %s not found in gpuTopology", gpuID)
-			}
-
-			for _, numaNode := range info.GetNUMANode() {
-				numaToAvailableGPUCount[numaNode] += 1
-				numaToMostAllocatedGPUMemory[numaNode] = math.Max(s.GetGPUMemoryAllocated(), numaToMostAllocatedGPUMemory[numaNode])
-			}
-		}
-	}
-
-	numaNodes := make([]int, 0, p.metaServer.NumNUMANodes)
-	for numaNode := range p.metaServer.NUMAToCPUs {
-		numaNodes = append(numaNodes, numaNode)
-	}
-	sort.Ints(numaNodes)
-
-	minNUMAsCountNeeded, _, err := gpuutil.GetNUMANodesCountToFitGPUReq(gpuReq, p.metaServer.CPUTopology, gpuTopology)
-	if err != nil {
-		return nil, err
-	}
-
-	numaCountPerSocket, err := p.metaServer.NUMAsPerSocket()
-	if err != nil {
-		return nil, fmt.Errorf("NUMAsPerSocket failed with error: %v", err)
-	}
-
-	numaBound := len(numaNodes)
-	if numaBound > machine.LargeNUMAsPoint {
-		// [TODO]: to discuss refine minNUMAsCountNeeded+1
-		numaBound = minNUMAsCountNeeded + 1
-	}
-
-	var availableNumaHints []*pluginapi.TopologyHint
-	machine.IterateBitMasks(numaNodes, numaBound, func(mask machine.BitMask) {
-		maskCount := mask.Count()
-		if maskCount < minNUMAsCountNeeded {
-			return
-		}
-
-		maskBits := mask.GetBits()
-		numaCountNeeded := mask.Count()
-
-		allAvailableGPUsCountInMask := float64(0)
-		for _, nodeID := range maskBits {
-			allAvailableGPUsCountInMask += numaToAvailableGPUCount[nodeID]
-		}
-
-		if allAvailableGPUsCountInMask < gpuReq {
-			return
-		}
-
-		crossSockets, err := machine.CheckNUMACrossSockets(maskBits, p.metaServer.CPUTopology)
-		if err != nil {
-			return
-		} else if numaCountNeeded <= numaCountPerSocket && crossSockets {
-			return
-		}
-
-		preferred := maskCount == minNUMAsCountNeeded
-		availableNumaHints = append(availableNumaHints, &pluginapi.TopologyHint{
-			Nodes:     machine.MaskToUInt64Array(mask),
-			Preferred: preferred,
-		})
-	})
-
-	// prefer numa nodes with most allocated gpu memory
-	p.preferGPUMemoryMostAllocatedHints(availableNumaHints, numaToMostAllocatedGPUMemory)
-
-	// NOTE: because grpc is inability to distinguish between an empty array and nil,
-	//       we return an error instead of an empty array.
-	//       we should resolve this issue if we need to manage multi-resource in one plugin.
-	if len(availableNumaHints) == 0 {
-		general.Warningf("got no available gpu memory hints for pod: %s/%s, container: %s",
-			req.PodNamespace, req.PodName, req.ContainerName)
-		return nil, gpuutil.ErrNoAvailableGPUMemoryHints
-	}
-
-	return map[string]*pluginapi.ListOfTopologyHints{
-		p.ResourceName(): {
-			Hints: availableNumaHints,
-		},
-	}, nil
-}
-
-func (p *StaticPolicy) UpdateAllocatableAssociatedDevices(_ context.Context, request *pluginapi.UpdateAllocatableAssociatedDevicesRequest) (*pluginapi.UpdateAllocatableAssociatedDevicesResponse, error) {
+func (p *StaticPolicy) UpdateAllocatableAssociatedDevices(
+	_ context.Context, request *pluginapi.UpdateAllocatableAssociatedDevicesRequest,
+) (*pluginapi.UpdateAllocatableAssociatedDevicesResponse, error) {
 	if request == nil || len(request.Devices) == 0 {
 		return nil, fmt.Errorf("request is nil")
 	}
 
-	gpuTopology := &machine.GPUTopology{
-		GPUs: make(map[string]machine.GPUInfo, len(request.Devices)),
+	customDevicePlugin := p.getCustomDevicePlugin(request.DeviceName)
+	if customDevicePlugin == nil {
+		return nil, fmt.Errorf("no custom device plugin found for device %s", request.DeviceName)
 	}
 
-	for _, device := range request.Devices {
-		var numaNode []int
-		if device.Topology != nil {
-			numaNode = make([]int, 0, len(device.Topology.Nodes))
-
-			for _, node := range device.Topology.Nodes {
-				if node == nil {
-					continue
-				}
-				numaNode = append(numaNode, int(node.ID))
-			}
-		}
-
-		gpuTopology.GPUs[device.ID] = machine.GPUInfo{
-			Health:   device.Health,
-			NUMANode: numaNode,
-		}
-	}
-
-	err := p.gpuTopologyProvider.SetGPUTopology(gpuTopology)
-	if err != nil {
-		general.Errorf("set gpu topology failed with error: %v", err)
-		return nil, fmt.Errorf("set gpu topology failed with error: %v", err)
-	}
-
-	general.Infof("got device %s gpuTopology success: %v", request.DeviceName, gpuTopology)
-
-	return &pluginapi.UpdateAllocatableAssociatedDevicesResponse{}, nil
+	return customDevicePlugin.UpdateAllocatableAssociatedDevices(request)
 }
 
-func (*StaticPolicy) GetAssociatedDeviceTopologyHints(_ context.Context, _ *pluginapi.AssociatedDeviceRequest) (*pluginapi.AssociatedDeviceHintsResponse, error) {
+func (*StaticPolicy) GetAssociatedDeviceTopologyHints(
+	_ context.Context, _ *pluginapi.AssociatedDeviceRequest,
+) (*pluginapi.AssociatedDeviceHintsResponse, error) {
 	return &pluginapi.AssociatedDeviceHintsResponse{}, nil
 }
 
-func (p *StaticPolicy) AllocateAssociatedDevice(_ context.Context, req *pluginapi.AssociatedDeviceRequest) (*pluginapi.AssociatedDeviceAllocationResponse, error) {
+// AllocateAssociatedDevice allocates a device in this sequence:
+// 1. Find the resource plugin that corresponds to the accompanyResourceName and allocate
+// 2. Find the custom device plugin that corresponds to the deviceName and allocate
+func (p *StaticPolicy) AllocateAssociatedDevice(
+	_ context.Context, req *pluginapi.AssociatedDeviceRequest,
+) (resp *pluginapi.AssociatedDeviceAllocationResponse, respErr error) {
+	var isAccompanyResourcePlugin bool
+	var isAccompanyCustomDevicePlugin bool
 	if req == nil || req.ResourceRequest == nil || req.DeviceRequest == nil {
 		return nil, fmt.Errorf("req is nil")
 	}
 
-	if req.ResourceRequest.Hint == nil || req.ResourceRequest.Hint.Nodes == nil {
-		general.Warningf("got nil resource hint")
-		return &pluginapi.AssociatedDeviceAllocationResponse{
-			AllocationResult: nil,
-		}, nil
-	}
-
-	if req.DeviceRequest.Hint == nil || req.DeviceRequest.Hint.Nodes == nil {
-		general.Warningf("got nil device hint")
-		return &pluginapi.AssociatedDeviceAllocationResponse{
-			AllocationResult: nil,
-		}, nil
-	}
-
-	qosLevel, err := util.GetKatalystQoSLevelFromResourceReq(p.qosConfig, req.ResourceRequest, p.podAnnotationKeptKeys, p.podLabelKeptKeys)
-	if err != nil {
-		err = fmt.Errorf("GetKatalystQoSLevelFromResourceReq for pod: %s/%s, container: %s failed with error: %v",
-			req.ResourceRequest.PodNamespace, req.ResourceRequest.PodName, req.ResourceRequest.ContainerName, err)
-		general.Errorf("%s", err.Error())
-		return nil, err
-	}
-
-	general.InfoS("called",
-		"podNamespace", req.ResourceRequest.PodNamespace,
-		"podName", req.ResourceRequest.PodName,
-		"containerName", req.ResourceRequest.ContainerName,
-		"qosLevel", qosLevel,
-		"reqAnnotations", req.ResourceRequest.Annotations,
-		"resourceRequests", req.ResourceRequest.ResourceRequests,
-		"deviceName", req.DeviceRequest.DeviceName,
-		"resourceHint", req.ResourceRequest.Hint,
-		"deviceHint", req.DeviceRequest.Hint,
-		"availableDevices", req.DeviceRequest.AvailableDevices,
-		"reusableDevices", req.DeviceRequest.ReusableDevices,
-		"deviceRequest", req.DeviceRequest.DeviceRequest,
-	)
-
-	allocationInfo := p.state.GetAllocationInfo(req.ResourceRequest.PodUid, req.ResourceRequest.ContainerName)
-	if allocationInfo != nil && allocationInfo.TopologyAwareAllocations != nil {
-		allocatedDevices := make([]string, 0, len(allocationInfo.TopologyAwareAllocations))
-		for gpuID := range allocationInfo.TopologyAwareAllocations {
-			allocatedDevices = append(allocatedDevices, gpuID)
-		}
-		return &pluginapi.AssociatedDeviceAllocationResponse{
-			AllocationResult: &pluginapi.AssociatedDeviceAllocation{
-				AllocatedDevices: allocatedDevices,
-			},
-		}, nil
-	}
-
-	_, gpuMemoryRequest, err := util.GetQuantityFromResourceRequests(req.ResourceRequest.ResourceRequests, p.ResourceName(), false)
-	if err != nil {
-		return nil, err
-	}
-
-	// get hint nodes from request
-	hintNodes, err := machine.NewCPUSetUint64(req.DeviceRequest.GetHint().GetNodes()...)
-	if err != nil {
-		general.Warningf("failed to get hint nodes: %v", err)
-		return nil, err
-	}
-
-	gpuTopology, numaTopologyReady, err := p.gpuTopologyProvider.GetGPUTopology()
-	if err != nil {
-		general.Warningf("failed to get gpu topology: %v", err)
-		return nil, err
-	}
-
-	if !numaTopologyReady {
-		general.Warningf("numa topology is not ready")
-		return nil, fmt.Errorf("numa topology is not ready")
-	}
-
-	allocatedDevices, allocatedGPUMemory, err := p.calculateAssociatedDevices(gpuTopology, gpuMemoryRequest, hintNodes, req)
-	if err != nil {
-		general.Warningf("failed to allocate associated devices: %v", err)
-		return nil, err
-	}
-
-	topologyAwareAllocations := make(map[string]state.GPUAllocation)
-	for _, device := range allocatedDevices {
-		info, ok := gpuTopology.GPUs[device]
-		if !ok {
-			return nil, fmt.Errorf("failed to get gpu topology for device: %s", device)
-		}
-
-		topologyAwareAllocations[device] = state.GPUAllocation{
-			GPUMemoryQuantity: allocatedGPUMemory[device],
-			NUMANodes:         info.GetNUMANode(),
-		}
-	}
-
-	if allocationInfo == nil {
-		allocationInfo = &state.AllocationInfo{
-			AllocationMeta: commonstate.GenerateGenericContainerAllocationMeta(req.ResourceRequest, commonstate.EmptyOwnerPoolName, qosLevel),
-			AllocatedAllocation: state.GPUAllocation{
-				GPUMemoryQuantity: gpuMemoryRequest,
-				NUMANodes:         hintNodes.ToSliceInt(),
-			},
-		}
-	}
-
-	allocationInfo.TopologyAwareAllocations = topologyAwareAllocations
-	p.state.SetAllocationInfo(req.ResourceRequest.PodUid, req.ResourceRequest.ContainerName, allocationInfo, false)
-	machineState, err := state.GenerateMachineStateFromPodEntries(p.qrmConfig, p.state.GetPodEntries(), p.gpuTopologyProvider)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate machine state from pod entries: %v", err)
-	}
-
-	p.state.SetMachineState(machineState, true)
-
-	general.InfoS("allocated devices",
-		"podNamespace", req.ResourceRequest.PodNamespace,
-		"podName", req.ResourceRequest.PodName,
-		"containerName", req.ResourceRequest.ContainerName,
-		"qosLevel", qosLevel,
-		"allocatedDevices", allocatedDevices)
-
-	return &pluginapi.AssociatedDeviceAllocationResponse{
-		AllocationResult: &pluginapi.AssociatedDeviceAllocation{
-			AllocatedDevices: allocatedDevices,
-		},
-	}, nil
-}
-
-func (p *StaticPolicy) calculateAssociatedDevices(gpuTopology *machine.GPUTopology, gpuMemoryRequest float64, hintNodes machine.CPUSet, request *pluginapi.AssociatedDeviceRequest) ([]string, map[string]float64, error) {
-	gpuRequest := request.DeviceRequest.GetDeviceRequest()
-	gpuMemoryPerGPU := gpuMemoryRequest / float64(gpuRequest)
-
-	machineState := p.state.GetMachineState()
-
-	allocatedDevices := sets.NewString()
-	needed := gpuRequest
-	allocateDevices := func(devices ...string) bool {
-		for _, device := range devices {
-			allocatedDevices.Insert(device)
-			needed--
-			if needed == 0 {
-				return true
+	p.Lock()
+	defer func() {
+		// Reset state for accompany resource and target resource if there is an error
+		if respErr != nil {
+			if isAccompanyResourcePlugin {
+				_ = p.removeContainer(req.ResourceRequest.PodUid, req.ResourceRequest.ContainerName, v1.ResourceName(req.AccompanyResourceName))
+			}
+			if isAccompanyCustomDevicePlugin {
+				accompanyDeviceType, _ := p.GetResourceTypeFromDeviceName(req.AccompanyResourceName)
+				if accompanyDeviceType != "" {
+					_ = p.removeContainer(req.ResourceRequest.PodUid, req.ResourceRequest.ContainerName, v1.ResourceName(accompanyDeviceType))
+				}
+			}
+			deviceType, _ := p.GetResourceTypeFromDeviceName(req.DeviceName)
+			if deviceType != "" {
+				_ = p.removeContainer(req.ResourceRequest.PodUid, req.ResourceRequest.ContainerName, v1.ResourceName(deviceType))
 			}
 		}
-		return false
-	}
+		p.Unlock()
+	}()
 
-	allocatedGPUMemory := func(devices ...string) map[string]float64 {
-		memory := make(map[string]float64)
-		for _, device := range devices {
-			memory[device] = gpuMemoryPerGPU
-		}
-		return memory
-	}
-
-	availableDevices := request.DeviceRequest.GetAvailableDevices()
-	reusableDevices := request.DeviceRequest.GetReusableDevices()
-
-	// allocate must include devices first
-	for _, device := range reusableDevices {
-		if machineState.GPUMemorySatisfiedRequest(device, gpuMemoryPerGPU) {
-			general.Warningf("must include gpu %s has enough memory to allocate, gpuMemoryAllocatable: %f, gpuMemoryAllocated: %f, gpuMemoryPerGPU: %f",
-				device, machineState.GetGPUMemoryAllocatable(device), machineState.GPUMemoryAllocated(device), gpuMemoryPerGPU)
-		}
-		allocateDevices(device)
-	}
-
-	// if allocated devices is enough, return immediately
-	if allocatedDevices.Len() >= int(gpuRequest) {
-		return allocatedDevices.UnsortedList(), allocatedGPUMemory(allocatedDevices.UnsortedList()...), nil
-	}
-
-	isNUMAAffinityDevice := func(device string) bool {
-		info, ok := gpuTopology.GPUs[device]
-		if !ok {
-			general.Errorf("failed to find hint node for device %s", device)
-			return false
-		}
-
-		// check if gpu's numa node is the subset of hint nodes
-		// todo support multi numa node
-		if machine.NewCPUSet(info.GetNUMANode()...).IsSubsetOf(hintNodes) {
-			return true
-		}
-		return false
-	}
-
-	sort.SliceStable(availableDevices, func(i, j int) bool {
-		return machineState.GPUMemoryAllocated(availableDevices[i]) > machineState.GPUMemoryAllocated(availableDevices[j])
-	})
-
-	// second allocate available and numa-affinity gpus
-	for _, device := range availableDevices {
-		if allocatedDevices.Has(device) {
-			continue
-		}
-
-		if !isNUMAAffinityDevice(device) {
-			continue
-		}
-
-		if !machineState.GPUMemorySatisfiedRequest(device, gpuMemoryPerGPU) {
-			general.Infof("available numa affinity gpu %s has not enough memory to allocate, gpuMemoryAllocatable: %f, gpuMemoryAllocated: %f, gpuMemoryPerGPU: %f",
-				device, machineState.GetGPUMemoryAllocatable(device), machineState.GPUMemoryAllocated(device), gpuMemoryPerGPU)
-			continue
-		}
-
-		if allocateDevices(device) {
-			return allocatedDevices.UnsortedList(), allocatedGPUMemory(allocatedDevices.UnsortedList()...), nil
+	// Find the target device that we want to allocate for
+	var targetDeviceReq *pluginapi.DeviceRequest
+	for _, deviceRequest := range req.DeviceRequest {
+		if deviceRequest.DeviceName == req.DeviceName {
+			targetDeviceReq = deviceRequest
 		}
 	}
 
-	return nil, nil, fmt.Errorf("no enough available GPUs found in gpuTopology, availableDevices len: %d, allocatedDevices len: %d", len(availableDevices), len(allocatedDevices))
+	if targetDeviceReq == nil {
+		return nil, fmt.Errorf("no target device plugin found for target device %s", req.DeviceName)
+	}
+
+	// Allocate accompany resource
+	// Check if accompany resource maps to a resource plugin; if it does, allocate it first
+	accompanyResourcePlugin := p.getResourcePlugin(req.AccompanyResourceName)
+	if accompanyResourcePlugin != nil {
+		_, err := accompanyResourcePlugin.Allocate(req.ResourceRequest, targetDeviceReq)
+		if err != nil {
+			return nil, fmt.Errorf("allocate accompany resource %s failed with error: %v", req.AccompanyResourceName, err)
+		}
+		isAccompanyResourcePlugin = true
+	} else {
+		// Accompany resource maps to a custom device plugin; allocate for it
+		accompanyCustomDevicePlugin := p.getCustomDevicePlugin(req.AccompanyResourceName)
+		if accompanyCustomDevicePlugin != nil {
+			// Get device request for accompany device
+			var accompanyDeviceReq *pluginapi.DeviceRequest
+			for _, deviceRequest := range req.DeviceRequest {
+				if deviceRequest.DeviceName == req.AccompanyResourceName {
+					accompanyDeviceReq = deviceRequest
+				}
+			}
+
+			if accompanyDeviceReq == nil {
+				return nil, fmt.Errorf("nil accompany device request")
+			}
+
+			_, err := p.allocateAssociatedDevice(accompanyCustomDevicePlugin, req.ResourceRequest, accompanyDeviceReq, "")
+			if err != nil {
+				return nil, fmt.Errorf("AllocateAssociatedDevice accompany resource %s failed with error: %v", req.AccompanyResourceName, err)
+			}
+			isAccompanyCustomDevicePlugin = true
+		}
+	}
+
+	// Allocate target custom device
+	targetCustomDevicePlugin := p.getCustomDevicePlugin(req.DeviceName)
+	if targetCustomDevicePlugin == nil {
+		return nil, fmt.Errorf("no custom device plugin found for target device %s", req.DeviceName)
+	}
+
+	return p.allocateAssociatedDevice(targetCustomDevicePlugin, req.ResourceRequest, targetDeviceReq, req.AccompanyResourceName)
 }
 
-func (p *StaticPolicy) preferGPUMemoryMostAllocatedHints(hints []*pluginapi.TopologyHint, numaToMostAllocatedGPUMemory map[int]float64) {
-	hintGPUMemoryMostAllocated := make(map[int]float64)
-	for index, hint := range hints {
-		if !hint.Preferred {
-			continue
-		}
-
-		gpuMemoryMostAllocated := float64(0)
-		for _, nodeID := range hint.Nodes {
-			gpuMemoryMostAllocated = math.Max(gpuMemoryMostAllocated, numaToMostAllocatedGPUMemory[int(nodeID)])
-		}
-		hintGPUMemoryMostAllocated[index] = gpuMemoryMostAllocated
-	}
-
-	mostAllocatedHintIndex := -1
-	for index, hint := range hints {
-		if !hint.Preferred {
-			continue
-		}
-
-		if mostAllocatedHintIndex == -1 || hintGPUMemoryMostAllocated[index] > hintGPUMemoryMostAllocated[mostAllocatedHintIndex] {
-			mostAllocatedHintIndex = index
+func (p *StaticPolicy) allocateAssociatedDevice(
+	devicePlugin customdeviceplugin.CustomDevicePlugin,
+	resReq *pluginapi.ResourceRequest, deviceReq *pluginapi.DeviceRequest, accompanyResourceName string,
+) (*pluginapi.AssociatedDeviceAllocationResponse, error) {
+	defaultAccompanyResourceName := devicePlugin.DefaultAccompanyResourceName()
+	if defaultAccompanyResourceName != "" && accompanyResourceName != defaultAccompanyResourceName {
+		accompanyResourcePlugin := p.getResourcePlugin(defaultAccompanyResourceName)
+		if accompanyResourcePlugin != nil {
+			_, err := accompanyResourcePlugin.Allocate(resReq, deviceReq)
+			if err != nil {
+				_ = p.removeContainer(resReq.PodUid, resReq.ContainerName, v1.ResourceName(defaultAccompanyResourceName))
+				return nil, fmt.Errorf("allocate accompany resource %s failed with error: %v", defaultAccompanyResourceName, err)
+			}
 		}
 	}
 
-	if mostAllocatedHintIndex < 0 {
-		return
-	}
+	return devicePlugin.AllocateAssociatedDevice(resReq, deviceReq, accompanyResourceName)
+}
 
-	for index, hint := range hints {
-		if !hint.Preferred || mostAllocatedHintIndex == index {
-			continue
-		}
-		hint.Preferred = false
+func (p *StaticPolicy) registerResourcePlugins() error {
+	allInitFuncs := resourcepluginregistry.GetRegisteredResourcePlugin()
+	for _, initFunc := range allInitFuncs {
+		resourcePlugin := initFunc(p.BasePlugin)
+		p.resourcePlugins[resourcePlugin.ResourceName()] = resourcePlugin
+		general.Infof("Registered resource plugin: %s", resourcePlugin.ResourceName())
 	}
+	return nil
+}
+
+func (p *StaticPolicy) registerCustomDevicePlugins() error {
+	allInitFuncs := devicepluginregistry.GetRegisteredCustomDevicePlugin()
+	for name := range allInitFuncs {
+		initFunc := allInitFuncs[name]
+		customDevicePlugin := initFunc(p.BasePlugin)
+		deviceNames := customDevicePlugin.DeviceNames()
+		for _, deviceName := range deviceNames {
+			p.customDevicePlugins[deviceName] = customDevicePlugin
+			p.associatedDeviceNames.Insert(deviceName)
+		}
+	}
+	return nil
+}
+
+func (p *StaticPolicy) getResourcePlugin(resourceName string) resourceplugin.ResourcePlugin {
+	resourcePlugin := p.resourcePlugins[resourceName]
+	return resourcePlugin
+}
+
+func (p *StaticPolicy) getCustomDevicePlugin(deviceName string) customdeviceplugin.CustomDevicePlugin {
+	customDevicePlugin := p.customDevicePlugins[deviceName]
+	return customDevicePlugin
 }

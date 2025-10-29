@@ -21,55 +21,20 @@ import (
 	"math"
 
 	pkgerrors "github.com/pkg/errors"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
-	"github.com/kubewharf/katalyst-api/pkg/consts"
-	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/state"
+	qrmutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
 var ErrNoAvailableGPUMemoryHints = pkgerrors.New("no available gpu memory hints")
 
-// RegenerateGPUMemoryHints regenerates hints for container that'd already been allocated gpu memory,
-// and regenerateHints will assemble hints based on already-existed AllocationInfo,
-// without any calculation logics at all
-func RegenerateGPUMemoryHints(allocationInfo *state.AllocationInfo, regenerate bool) map[string]*pluginapi.ListOfTopologyHints {
-	if allocationInfo == nil {
-		general.Errorf("RegenerateHints got nil allocationInfo")
-		return nil
-	}
-
-	hints := map[string]*pluginapi.ListOfTopologyHints{}
-	if regenerate {
-		general.ErrorS(nil, "need to regenerate hints",
-			"podNamespace", allocationInfo.PodNamespace,
-			"podName", allocationInfo.PodName,
-			"podUID", allocationInfo.PodUid,
-			"containerName", allocationInfo.ContainerName)
-
-		return nil
-	}
-
-	allocatedNumaNodes := machine.NewCPUSet(allocationInfo.AllocatedAllocation.NUMANodes...)
-
-	general.InfoS("regenerating machineInfo hints, gpu memory was already allocated to pod",
-		"podNamespace", allocationInfo.PodNamespace,
-		"podName", allocationInfo.PodName,
-		"containerName", allocationInfo.ContainerName,
-		"hint", allocatedNumaNodes)
-	hints[string(consts.ResourceGPUMemory)] = &pluginapi.ListOfTopologyHints{
-		Hints: []*pluginapi.TopologyHint{
-			{
-				Nodes:     allocatedNumaNodes.ToSliceUInt64(),
-				Preferred: true,
-			},
-		},
-	}
-	return hints
-}
-
-func GetNUMANodesCountToFitGPUReq(gpuReq float64, cpuTopology *machine.CPUTopology, gpuTopology *machine.GPUTopology) (int, int, error) {
+func GetNUMANodesCountToFitGPUReq(
+	gpuReq float64, cpuTopology *machine.CPUTopology, gpuTopology *machine.DeviceTopology,
+) (int, int, error) {
 	if gpuTopology == nil {
 		return 0, 0, fmt.Errorf("GetNUMANodesCountToFitGPUReq got nil gpuTopology")
 	}
@@ -79,19 +44,52 @@ func GetNUMANodesCountToFitGPUReq(gpuReq float64, cpuTopology *machine.CPUTopolo
 		return 0, 0, fmt.Errorf("there is no NUMA in cpuTopology")
 	}
 
-	if len(gpuTopology.GPUs)%numaCount != 0 {
-		general.Warningf("GPUs count %d cannot be evenly divisible by NUMA count %d", len(gpuTopology.GPUs), numaCount)
+	if len(gpuTopology.Devices)%numaCount != 0 {
+		general.Warningf("GPUs count %d cannot be evenly divisible by NUMA count %d", len(gpuTopology.Devices), numaCount)
 	}
 
-	gpusPerNUMA := (len(gpuTopology.GPUs) + numaCount - 1) / numaCount
+	gpusPerNUMA := (len(gpuTopology.Devices) + numaCount - 1) / numaCount
 	numaCountNeeded := int(math.Ceil(gpuReq / float64(gpusPerNUMA)))
 	if numaCountNeeded == 0 {
 		numaCountNeeded = 1
 	}
 	if numaCountNeeded > numaCount {
-		return 0, 0, fmt.Errorf("invalid gpu req: %.3f in topology with NUMAs count: %d and GPUs count: %d", gpuReq, numaCount, len(gpuTopology.GPUs))
+		return 0, 0, fmt.Errorf("invalid gpu req: %.3f in topology with NUMAs count: %d and GPUs count: %d", gpuReq, numaCount, len(gpuTopology.Devices))
 	}
 
 	gpusCountNeededPerNUMA := int(math.Ceil(gpuReq / float64(numaCountNeeded)))
 	return numaCountNeeded, gpusCountNeededPerNUMA, nil
+}
+
+func IsNUMAAffinityDevice(
+	device string, deviceTopology *machine.DeviceTopology, hintNodes machine.CPUSet,
+) bool {
+	info, ok := deviceTopology.Devices[device]
+	if !ok {
+		general.Errorf("failed to find device info for device %s", device)
+		return false
+	}
+
+	return machine.NewCPUSet(info.GetNUMANode()...).IsSubsetOf(hintNodes)
+}
+
+// GetGPUCount extracts GPU count from resource request
+func GetGPUCount(req *pluginapi.ResourceRequest, deviceNames []string) (float64, sets.String, error) {
+	gpuCount := float64(0)
+	gpuNames := sets.NewString()
+
+	for _, resourceName := range deviceNames {
+		_, request, err := qrmutil.GetQuantityFromResourceRequests(req.ResourceRequests, resourceName, false)
+		if err != nil && !errors.IsNotFound(err) {
+			return 0, nil, err
+		}
+		gpuCount += request
+		gpuNames.Insert(resourceName)
+	}
+
+	if gpuCount == 0 {
+		return 0, gpuNames, fmt.Errorf("no available GPU count")
+	}
+
+	return gpuCount, gpuNames, nil
 }
