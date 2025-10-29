@@ -387,9 +387,11 @@ func TestBind(t *testing.T) {
 					},
 				},
 			},
-			sortedDevices: []string{"gpu-1", "gpu-2", "gpu-3", "gpu-5", "gpu-6", "gpu-7", "gpu-8"},
+			// Allocate gpu-1, gpu-2 in first level, then allocate gpu-3 as it has affinity with gpu-1 and gpu-2
+			// Then allocate gpu-5 as gpu-6 is already allocated
+			sortedDevices: []string{"gpu-1", "gpu-2", "gpu-3", "gpu-5", "gpu-7", "gpu-8"},
 			expectedResult: &allocate.AllocationResult{
-				AllocatedDevices: []string{"gpu-1", "gpu-2", "gpu-5", "gpu-7"},
+				AllocatedDevices: []string{"gpu-1", "gpu-2", "gpu-3", "gpu-5"},
 				Success:          true,
 			},
 		},

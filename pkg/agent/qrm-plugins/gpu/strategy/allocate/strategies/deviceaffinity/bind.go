@@ -42,13 +42,11 @@ type possibleAllocation struct {
 	candidateDevices sets.String
 }
 
-// allocationByIntersectionResult is the result of allocating devices by maximising intersection size of possible allocations
+// allocationByIntersectionResult is the result of allocating devices by maximizing intersection size of possible allocations
 // with an affinity group.
 type allocationByIntersectionResult struct {
-	allocatedDevices sets.String
-	availableDevices sets.String
-	finished         bool
-	err              error
+	finished bool
+	err      error
 }
 
 // Bind binds the sorted devices to the allocation context by searching for the devices that have affinity to each other.
@@ -202,19 +200,18 @@ func (s *DeviceAffinityStrategy) allocateCandidateDevices(
 			return nil, fmt.Errorf("affinity priority %v not found", priority)
 		}
 
+		fmt.Println("available devices: ", availableDevicesSet.UnsortedList())
+
 		intersectionToPossibleAllocationsMap := s.makeIntersectionToPossibleAllocationsMap(groups, availableDevicesSet, allocatedDevices)
 
-		allocateByIntersectionRes := s.allocateByIntersection(intersectionToPossibleAllocationsMap, allocatedDevices, availableDevicesSet, devicesToAllocate, priority == len(affinityMap)-1)
+		allocateByIntersectionRes := s.allocateByIntersection(intersectionToPossibleAllocationsMap, allocatedDevices, devicesToAllocate, priority == len(affinityMap)-1)
 		if allocateByIntersectionRes.err != nil {
 			return nil, allocateByIntersectionRes.err
 		}
 
 		if allocateByIntersectionRes.finished {
-			return allocateByIntersectionRes.allocatedDevices, nil
+			return allocatedDevices, nil
 		}
-
-		allocatedDevices = allocateByIntersectionRes.allocatedDevices
-		availableDevicesSet = allocateByIntersectionRes.availableDevices
 	}
 
 	return allocatedDevices, nil
@@ -259,17 +256,14 @@ func (s *DeviceAffinityStrategy) allocateAvailableDevicesWithAffinity(
 			})
 		}
 
-		allocateByIntersectionRes := s.allocateByIntersection(intersectionToPossibleAllocationsMap, allocatedDevices, unallocatedAvailableDevices, devicesToAllocate, priority == len(allocatedAffinityGroupIds)-1)
+		allocateByIntersectionRes := s.allocateByIntersection(intersectionToPossibleAllocationsMap, allocatedDevices, devicesToAllocate, priority == len(allocatedAffinityGroupIds)-1)
 		if allocateByIntersectionRes.err != nil {
 			return nil, allocateByIntersectionRes.err
 		}
 
 		if allocateByIntersectionRes.finished {
-			return allocateByIntersectionRes.allocatedDevices, nil
+			return allocatedDevices, nil
 		}
-
-		allocatedDevices = allocateByIntersectionRes.allocatedDevices
-		unallocatedAvailableDevices = allocateByIntersectionRes.availableDevices
 	}
 
 	return allocatedDevices, nil
@@ -325,7 +319,7 @@ func (s *DeviceAffinityStrategy) makeIntersectionToPossibleAllocationsMap(
 
 // allocateByIntersection allocates devices by the following algorithm
 //  1. Sort the intersection sizes of possible allocations in descending order, we want to allocate devices with larger intersection size with an affinity group.
-//  2. For each intersection size, merge and sort the possible allocations by their unallocated size in ascending order, this is to maximise
+//  2. For each intersection size, merge and sort the possible allocations by their unallocated size in ascending order, this is to maximize
 //     bin-packing (try to fill up an affinity group that is already allocated with other devices.
 //  3. For each intersection size, allocate devices in the order of the sorted possible allocations.
 //  4. If a possible allocation has a number of intersected devices larger than the devices needed for allocation, we go to the next priority and try to find an allocation from there.
@@ -333,7 +327,7 @@ func (s *DeviceAffinityStrategy) makeIntersectionToPossibleAllocationsMap(
 //     to fill up the remaining devices.
 func (s *DeviceAffinityStrategy) allocateByIntersection(
 	intersectionToPossibleAllocationsMap map[int][]possibleAllocation, allocatedDevices sets.String,
-	unallocatedAvailableDevices sets.String, devicesToAllocate int, isLastPriority bool,
+	devicesToAllocate int, isLastPriority bool,
 ) allocationByIntersectionResult {
 	// Sort the intersection sizes of possible allocations in descending order
 	intersectionSizes := make([]int, 0, len(intersectionToPossibleAllocationsMap))
@@ -362,22 +356,17 @@ func (s *DeviceAffinityStrategy) allocateByIntersection(
 			// go to the next priority and try to allocate
 			if !isLastPriority && possibleAlloc.candidateDevices.Len() > devicesToAllocate-allocatedDevices.Len() {
 				return allocationByIntersectionResult{
-					finished:         false,
-					err:              nil,
-					allocatedDevices: allocatedDevices,
-					availableDevices: unallocatedAvailableDevices,
+					finished: false,
+					err:      nil,
 				}
 			}
 
 			for device := range possibleAlloc.candidateDevices {
 				allocatedDevices.Insert(device)
-				unallocatedAvailableDevices.Delete(device)
 				if allocatedDevices.Len() == devicesToAllocate {
 					return allocationByIntersectionResult{
-						finished:         true,
-						err:              nil,
-						allocatedDevices: allocatedDevices,
-						availableDevices: unallocatedAvailableDevices,
+						finished: true,
+						err:      nil,
 					}
 				}
 			}
@@ -402,13 +391,10 @@ func (s *DeviceAffinityStrategy) allocateByIntersection(
 				for _, possibleAlloc := range possibleAllocations {
 					for device := range possibleAlloc.candidateDevices {
 						allocatedDevices.Insert(device)
-						unallocatedAvailableDevices.Delete(device)
 						if allocatedDevices.Len() == devicesToAllocate {
 							return allocationByIntersectionResult{
-								finished:         true,
-								err:              nil,
-								allocatedDevices: allocatedDevices,
-								availableDevices: unallocatedAvailableDevices,
+								finished: true,
+								err:      nil,
 							}
 						}
 					}
@@ -417,10 +403,8 @@ func (s *DeviceAffinityStrategy) allocateByIntersection(
 		}
 	}
 	return allocationByIntersectionResult{
-		finished:         false,
-		err:              nil,
-		allocatedDevices: allocatedDevices,
-		availableDevices: unallocatedAvailableDevices,
+		finished: false,
+		err:      nil,
 	}
 }
 
