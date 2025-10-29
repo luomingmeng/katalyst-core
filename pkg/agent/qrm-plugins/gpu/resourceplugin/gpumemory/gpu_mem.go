@@ -156,18 +156,10 @@ func (p *GPUMemPlugin) calculateHints(
 
 	numaToAvailableGPUCount := make(map[int]float64)
 	numaToMostAllocatedGPUMemory := make(map[int]float64)
-	for gpuID, s := range machineState {
-		if s == nil {
-			continue
-		}
-
+	for gpuID, info := range gpuTopology.Devices {
+		s := machineState[gpuID]
 		allocated := s.GetQuantityAllocated()
 		if allocated+perGPUMemory <= float64(p.Conf.GPUMemoryAllocatablePerGPU.Value()) {
-			info, ok := gpuTopology.Devices[gpuID]
-			if !ok {
-				return nil, fmt.Errorf("gpu %s not found in gpuTopology", gpuID)
-			}
-
 			for _, numaNode := range info.GetNUMANode() {
 				numaToAvailableGPUCount[numaNode] += 1
 				numaToMostAllocatedGPUMemory[numaNode] = math.Max(allocated, numaToMostAllocatedGPUMemory[numaNode])

@@ -62,10 +62,7 @@ func (s *GPUMemoryStrategy) filterGPUDevices(
 	gpuMemoryPerGPU := gpuMemoryRequest / float64(gpuRequest)
 	gpuMemoryAllocatablePerGPU := float64(ctx.GPUQRMPluginConfig.GPUMemoryAllocatablePerGPU.Value())
 
-	machineState, ok := ctx.MachineState[consts.ResourceGPUMemory]
-	if !ok {
-		return nil, fmt.Errorf("machine state for %s is not available", consts.ResourceGPUMemory)
-	}
+	machineState := ctx.MachineState[consts.ResourceGPUMemory]
 	filteredDevices := sets.NewString()
 	for _, device := range allAvailableDevices {
 		if !machineState.IsRequestSatisfied(device, gpuMemoryPerGPU, gpuMemoryAllocatablePerGPU) {
