@@ -23,7 +23,6 @@ import (
 
 	"github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate"
-	gpuutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/util"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 )
@@ -69,10 +68,6 @@ func (s *GPUMemoryStrategy) filterGPUDevices(
 	}
 	filteredDevices := sets.NewString()
 	for _, device := range allAvailableDevices {
-		if !ctx.HintNodes.IsEmpty() && !gpuutil.IsNUMAAffinityDevice(device, ctx.DeviceTopology, ctx.HintNodes) {
-			continue
-		}
-
 		if !machineState.IsRequestSatisfied(device, gpuMemoryPerGPU, gpuMemoryAllocatablePerGPU) {
 			general.Warningf("must include gpu %s has enough memory to allocate, gpuMemoryAllocatable: %f, gpuMemoryAllocated: %f, gpuMemoryPerGPU: %f",
 				device, gpuMemoryAllocatablePerGPU, machineState.GetQuantityAllocated(device), gpuMemoryPerGPU)
