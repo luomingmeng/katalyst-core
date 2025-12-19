@@ -31,9 +31,9 @@ import (
 type (
 	CustomCompareKey       string
 	PodMetaCustomProcessor struct {
-		PodMetaCustomKeyProcessor      func(podMeta metav1.ObjectMeta, spdBaselinePodMeta *SPDBaselinePodMeta, customKey CustomCompareKey) error
-		PodMetaCustomSentinelProcessor func(podMetaList []SPDBaselinePodMeta, baselinePercent *int32) *SPDBaselinePodMeta
-		PodMetaCustomCmp               func(c1 SPDBaselinePodMeta, c2 SPDBaselinePodMeta) int
+		CustomValueGetter    func(podMeta metav1.ObjectMeta) (interface{}, error)
+		CustomSentinelGetter func(podMetaList []SPDBaselinePodMeta, baselinePercent int32) *SPDBaselinePodMeta
+		CustomCmp            func(c1 SPDBaselinePodMeta, c2 SPDBaselinePodMeta) int
 	}
 )
 
@@ -44,7 +44,12 @@ func RegisterSPDPodMetaCustomProcessor(key CustomCompareKey, processor *PodMetaC
 	klog.Infof("[spd] registered SPD pod meta custom processor: %v", key)
 }
 
-func GetSPDPodMetaCustomProcessor(key CustomCompareKey) (*PodMetaCustomProcessor, error) {
+func GetSPDPodMetaCustomProcessor(spd *v1alpha1.ServiceProfileDescriptor) (*PodMetaCustomProcessor, error) {
+	key := GetSPDCustomCompareKey(spd)
+	if key == "" {
+		return nil, nil
+	}
+
 	value, ok := spdPodMetaCustomProcessor.Load(key)
 	if !ok {
 		return nil, fmt.Errorf("custom processor for %s not found", key)
@@ -59,18 +64,12 @@ func GetSPDPodMetaCustomProcessor(key CustomCompareKey) (*PodMetaCustomProcessor
 }
 
 type SPDBaselinePodMeta struct {
-	TimeStamp          metav1.Time      `json:"timeStamp"`
-	PodName            string           `json:"podName"`
-	CustomCompareKey   CustomCompareKey `json:"customCompareKey"`
-	CustomCompareValue interface{}      `json:"customCompareValue"`
+	TimeStamp          metav1.Time `json:"timeStamp"`
+	PodName            string      `json:"podName"`
+	CustomCompareValue interface{} `json:"customCompareValue,omitempty"`
 }
 
 func (c SPDBaselinePodMeta) Cmp(c1 SPDBaselinePodMeta) int {
-	if c.CustomCompareKey != "" && c.CustomCompareKey == c1.CustomCompareKey {
-		customKeyProcessor, _ := GetSPDPodMetaCustomProcessor(c.CustomCompareKey)
-		customCmpFunc := customKeyProcessor.PodMetaCustomCmp
-		return customCmpFunc(c, c1)
-	}
 	if c.TimeStamp.Time.Before(c1.TimeStamp.Time) {
 		return -1
 	}
@@ -88,6 +87,14 @@ func (c SPDBaselinePodMeta) Cmp(c1 SPDBaselinePodMeta) int {
 	return 0
 }
 
+func CustomCmp(c1 SPDBaselinePodMeta, c2 SPDBaselinePodMeta, customProcessor *PodMetaCustomProcessor) int {
+	if customProcessor != nil && customProcessor.CustomCmp != nil {
+		return customProcessor.CustomCmp(c1, c2)
+	}
+
+	return c1.Cmp(c2)
+}
+
 func (c SPDBaselinePodMeta) String() string {
 	d, err := json.Marshal(&c)
 	if err != nil {
@@ -97,7 +104,7 @@ func (c SPDBaselinePodMeta) String() string {
 }
 
 // IsBaselinePod check whether a pod is baseline pod
-func IsBaselinePod(podMeta metav1.ObjectMeta, baselinePercent *int32, baselineSentinel *SPDBaselinePodMeta, spdCustomCompareKey CustomCompareKey) (bool, error) {
+func IsBaselinePod(podMeta metav1.ObjectMeta, baselinePercent *int32, baselineSentinel *SPDBaselinePodMeta, customProcessor *PodMetaCustomProcessor) (bool, error) {
 	// if spd baseline percent not config means baseline is disabled
 	if baselinePercent == nil {
 		return false, nil
@@ -111,11 +118,12 @@ func IsBaselinePod(podMeta metav1.ObjectMeta, baselinePercent *int32, baselineSe
 		return false, fmt.Errorf("baseline percent is already set but baseline sentinel is nil")
 	}
 
-	pm, err := GetSPDBaselinePodMeta(podMeta, spdCustomCompareKey)
+	pm, err := GetSPDBaselinePodMeta(podMeta, customProcessor)
 	if err != nil {
 		return false, fmt.Errorf("invalid pod meta %s: %v", podMeta.Name, err)
 	}
-	if pm.Cmp(*baselineSentinel) <= 0 {
+
+	if CustomCmp(*pm, *baselineSentinel, customProcessor) <= 0 {
 		return true, nil
 	}
 
@@ -123,14 +131,18 @@ func IsBaselinePod(podMeta metav1.ObjectMeta, baselinePercent *int32, baselineSe
 }
 
 // IsExtendedBaselinePod check whether a pod is baseline pod by extended indicator
-func IsExtendedBaselinePod(podMeta metav1.ObjectMeta, baselinePercent *int32, podMetaMap map[string]*SPDBaselinePodMeta, name string, spdCustomCompareKey CustomCompareKey) (bool, error) {
+func IsExtendedBaselinePod(
+	podMeta metav1.ObjectMeta, baselinePercent *int32,
+	podMetaMap map[string]*SPDBaselinePodMeta, name string,
+	customProcessor *PodMetaCustomProcessor,
+) (bool, error) {
 	var baselineSentinel *SPDBaselinePodMeta
 	sentinel, ok := podMetaMap[name]
 	if ok {
 		baselineSentinel = sentinel
 	}
 
-	isBaseline, err := IsBaselinePod(podMeta, baselinePercent, baselineSentinel, spdCustomCompareKey)
+	isBaseline, err := IsBaselinePod(podMeta, baselinePercent, baselineSentinel, customProcessor)
 	if err != nil {
 		return false, err
 	}
@@ -139,29 +151,24 @@ func IsExtendedBaselinePod(podMeta metav1.ObjectMeta, baselinePercent *int32, po
 }
 
 // GetSPDBaselinePodMeta get the baseline coefficient of this pod
-func GetSPDBaselinePodMeta(podMeta metav1.ObjectMeta, spdCustomCompareKey CustomCompareKey) (*SPDBaselinePodMeta, error) {
+func GetSPDBaselinePodMeta(podMeta metav1.ObjectMeta, customProcessor *PodMetaCustomProcessor) (*SPDBaselinePodMeta, error) {
 	baselinePodMeta := SPDBaselinePodMeta{
 		TimeStamp: podMeta.CreationTimestamp,
 		PodName:   podMeta.Name,
 	}
-	if spdCustomCompareKey == "" {
-		return &baselinePodMeta, nil
-	}
 
-	customKeyProcessor, err := GetSPDPodMetaCustomProcessor(spdCustomCompareKey)
-	if err != nil {
-		return nil, err
-	}
-	customKeyFunc := customKeyProcessor.PodMetaCustomKeyProcessor
-	err = customKeyFunc(podMeta, &baselinePodMeta, spdCustomCompareKey)
-	if err != nil {
-		return nil, err
+	if customProcessor != nil && customProcessor.CustomValueGetter != nil {
+		val, err := customProcessor.CustomValueGetter(podMeta)
+		if err != nil {
+			return nil, err
+		}
+		baselinePodMeta.CustomCompareValue = val
 	}
 
 	return &baselinePodMeta, nil
 }
 
-func GetSPDCustomCompareKeys(spd *v1alpha1.ServiceProfileDescriptor) CustomCompareKey {
+func GetSPDCustomCompareKey(spd *v1alpha1.ServiceProfileDescriptor) CustomCompareKey {
 	var spdCustomCompareKey CustomCompareKey
 	key, ok := spd.Annotations[consts.SPDAnnotationKeyCustomCompareKey]
 	if !ok {

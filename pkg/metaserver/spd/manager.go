@@ -204,9 +204,12 @@ func (m *serviceProfilingManager) ServiceExtendedIndicator(ctx context.Context, 
 		return false, err
 	}
 
-	spdCustomCompareKey := util.GetSPDCustomCompareKeys(spd)
+	customProcessor, err := util.GetSPDPodMetaCustomProcessor(spd)
+	if err != nil {
+		return false, fmt.Errorf("cannot get custom processor: %v", err)
+	}
 
-	return util.IsExtendedBaselinePod(podMeta, baselinePercent, extendedBaselineSentinel, name, spdCustomCompareKey)
+	return util.IsExtendedBaselinePod(podMeta, baselinePercent, extendedBaselineSentinel, name, customProcessor)
 }
 
 func (m *serviceProfilingManager) ServiceBaseline(ctx context.Context, podMeta metav1.ObjectMeta) (bool, error) {
@@ -220,8 +223,12 @@ func (m *serviceProfilingManager) ServiceBaseline(ctx context.Context, podMeta m
 		return false, err
 	}
 
-	spdCustomCompareKey := util.GetSPDCustomCompareKeys(spd)
-	isBaseline, err := util.IsBaselinePod(podMeta, spd.Spec.BaselinePercent, baselineSentinel, spdCustomCompareKey)
+	customProcessor, err := util.GetSPDPodMetaCustomProcessor(spd)
+	if err != nil {
+		return false, fmt.Errorf("cannot get custom processor: %v", err)
+	}
+
+	isBaseline, err := util.IsBaselinePod(podMeta, spd.Spec.BaselinePercent, baselineSentinel, customProcessor)
 	if err != nil {
 		return false, err
 	}

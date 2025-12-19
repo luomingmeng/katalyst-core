@@ -95,7 +95,7 @@ func TestBaselineCoefficient_String(t *testing.T) {
 				TimeStamp: metav1.NewTime(time.UnixMilli(1)),
 				PodName:   "pod2",
 			},
-			want: "{\"timeStamp\":\"1970-01-01T00:00:00Z\",\"podName\":\"pod2\",\"customCompareKey\":\"\",\"customCompareValue\":null}",
+			want: "{\"timeStamp\":\"1970-01-01T00:00:00Z\",\"podName\":\"pod2\"}",
 		},
 	}
 	for _, tt := range tests {
@@ -113,8 +113,8 @@ func TestGetPodBaselineCoefficient(t *testing.T) {
 	t.Parallel()
 
 	type args struct {
-		pod              *v1.Pod
-		customCompareKey CustomCompareKey
+		pod             *v1.Pod
+		customProcessor *PodMetaCustomProcessor
 	}
 	tests := []struct {
 		name string
@@ -142,7 +142,7 @@ func TestGetPodBaselineCoefficient(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := GetSPDBaselinePodMeta(tt.args.pod.ObjectMeta, tt.args.customCompareKey)
+			got, err := GetSPDBaselinePodMeta(tt.args.pod.ObjectMeta, tt.args.customProcessor)
 			if err != nil {
 				t.Errorf("getSPDBaselinePodMeta() error = %v", err)
 				return
@@ -204,7 +204,7 @@ func TestIsBaselinePod(t *testing.T) {
 		pod              *v1.Pod
 		baselinePercent  *int32
 		baselineSentinel *SPDBaselinePodMeta
-		customCompareKey CustomCompareKey
+		customProcessor  *PodMetaCustomProcessor
 	}
 	tests := []struct {
 		name              string
@@ -294,7 +294,7 @@ func TestIsBaselinePod(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := IsBaselinePod(tt.args.pod.ObjectMeta, tt.args.baselinePercent, tt.args.baselineSentinel, tt.args.customCompareKey)
+			got, err := IsBaselinePod(tt.args.pod.ObjectMeta, tt.args.baselinePercent, tt.args.baselineSentinel, tt.args.customProcessor)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("IsBaselinePod() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -335,7 +335,7 @@ func TestSetSPDBaselinePercentile(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "test-spd",
 					Annotations: map[string]string{
-						consts.SPDAnnotationBaselineSentinelKey: "{\"timeStamp\":\"1970-01-20T13:40:48Z\",\"podName\":\"test-spd\",\"customCompareKey\":\"\",\"customCompareValue\":null}",
+						consts.SPDAnnotationBaselineSentinelKey: "{\"timeStamp\":\"1970-01-20T13:40:48Z\",\"podName\":\"test-spd\"}",
 					},
 				},
 			},

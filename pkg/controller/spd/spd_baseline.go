@@ -42,13 +42,18 @@ func (sc *SPDController) updateBaselineSentinel(spd *v1alpha1.ServiceProfileDesc
 		return nil
 	}
 
-	podMetaList, err := sc.getSPDPodMetaList(spd)
+	customProcessor, err := util.GetSPDPodMetaCustomProcessor(spd)
+	if err != nil {
+		return fmt.Errorf("cannot get custom processor: %v", err)
+	}
+
+	podMetaList, err := sc.getSPDPodMetaList(spd, customProcessor)
 	if err != nil {
 		return err
 	}
 
 	// calculate baseline sentinel
-	baselineSentinel, err := calculateBaselineSentinel(podMetaList, spd.Spec.BaselinePercent)
+	baselineSentinel, err := calculateBaselineSentinel(podMetaList, spd.Spec.BaselinePercent, customProcessor)
 	if err != nil {
 		return err
 	}
@@ -56,7 +61,7 @@ func (sc *SPDController) updateBaselineSentinel(spd *v1alpha1.ServiceProfileDesc
 	// calculate extended baseline sentinel for each extended indicator
 	extendedBaselineSentinel := make(map[string]util.SPDBaselinePodMeta)
 	for _, indicator := range spd.Spec.ExtendedIndicator {
-		sentinel, err := calculateBaselineSentinel(podMetaList, indicator.BaselinePercent)
+		sentinel, err := calculateBaselineSentinel(podMetaList, indicator.BaselinePercent, customProcessor)
 		if err != nil {
 			return err
 		}
@@ -73,7 +78,7 @@ func (sc *SPDController) updateBaselineSentinel(spd *v1alpha1.ServiceProfileDesc
 }
 
 // getSPDPodMetaList get spd pod meta list in order
-func (sc *SPDController) getSPDPodMetaList(spd *v1alpha1.ServiceProfileDescriptor) ([]util.SPDBaselinePodMeta, error) {
+func (sc *SPDController) getSPDPodMetaList(spd *v1alpha1.ServiceProfileDescriptor, customProcessor *util.PodMetaCustomProcessor) ([]util.SPDBaselinePodMeta, error) {
 	podList, err := util.GetPodListForSPD(spd, sc.podIndexer, sc.conf.SPDPodLabelIndexerKeys, sc.workloadLister, sc.podLister)
 	if err != nil {
 		return nil, err
@@ -86,18 +91,16 @@ func (sc *SPDController) getSPDPodMetaList(spd *v1alpha1.ServiceProfileDescripto
 		return nil, nil
 	}
 
-	spdCustomCompareKey := util.GetSPDCustomCompareKeys(spd)
-
 	podMetaList := make([]util.SPDBaselinePodMeta, 0, len(podList))
 	for _, p := range podList {
-		podMeta, err := util.GetSPDBaselinePodMeta(p.ObjectMeta, spdCustomCompareKey)
+		podMeta, err := util.GetSPDBaselinePodMeta(p.ObjectMeta, customProcessor)
 		if err != nil {
 			return nil, err
 		}
 		podMetaList = append(podMetaList, *podMeta)
 	}
 	sort.SliceStable(podMetaList, func(i, j int) bool {
-		return podMetaList[i].Cmp(podMetaList[j]) < 0
+		return util.CustomCmp(podMetaList[i], podMetaList[j], customProcessor) < 0
 	})
 
 	return podMetaList, nil
@@ -105,7 +108,7 @@ func (sc *SPDController) getSPDPodMetaList(spd *v1alpha1.ServiceProfileDescripto
 
 // calculateBaselineSentinel returns the sentinel one for a list of pods
 // referenced by the SPD. If one pod's createTime is less than the sentinel pod
-func calculateBaselineSentinel(podMetaList []util.SPDBaselinePodMeta, baselinePercent *int32) (*util.SPDBaselinePodMeta, error) {
+func calculateBaselineSentinel(podMetaList []util.SPDBaselinePodMeta, baselinePercent *int32, customProcessor *util.PodMetaCustomProcessor) (*util.SPDBaselinePodMeta, error) {
 	if baselinePercent == nil || *baselinePercent >= consts.SPDBaselinePercentMax ||
 		*baselinePercent <= consts.SPDBaselinePercentMin {
 		return nil, nil
@@ -116,17 +119,9 @@ func calculateBaselineSentinel(podMetaList []util.SPDBaselinePodMeta, baselinePe
 	}
 
 	baselineIndex := int(math.Floor(float64(len(podMetaList)-1) * float64(*baselinePercent) / 100))
-
-	customCompareKey := podMetaList[0].CustomCompareKey
-	if customCompareKey == "" {
-		return &podMetaList[baselineIndex], nil
+	if customProcessor != nil && customProcessor.CustomSentinelGetter != nil {
+		return customProcessor.CustomSentinelGetter(podMetaList, *baselinePercent), nil
 	}
 
-	customKeyProcessor, err := util.GetSPDPodMetaCustomProcessor(customCompareKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get custom processor for %s: %v", customCompareKey, err)
-	}
-
-	customSentinelFunc := customKeyProcessor.PodMetaCustomSentinelProcessor
-	return customSentinelFunc(podMetaList, baselinePercent), nil
+	return &podMetaList[baselineIndex], nil
 }

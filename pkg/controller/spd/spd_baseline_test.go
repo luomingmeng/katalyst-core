@@ -303,8 +303,8 @@ func TestSPDController_updateDeployBaselinePercentile(t *testing.T) {
 					Namespace: "default",
 					Name:      "spd1",
 					Annotations: map[string]string{
-						consts.SPDAnnotationBaselineSentinelKey:         "{\"timeStamp\":\"2023-08-01T00:00:01Z\",\"podName\":\"pod2\",\"customCompareKey\":\"\",\"customCompareValue\":null}",
-						consts.SPDAnnotationExtendedBaselineSentinelKey: "{\"TestExtended\":{\"timeStamp\":\"2023-08-01T00:00:01Z\",\"podName\":\"pod2\",\"customCompareKey\":\"\",\"customCompareValue\":null}}",
+						consts.SPDAnnotationBaselineSentinelKey:         "{\"timeStamp\":\"2023-08-01T00:00:01Z\",\"podName\":\"pod2\"}",
+						consts.SPDAnnotationExtendedBaselineSentinelKey: "{\"TestExtended\":{\"timeStamp\":\"2023-08-01T00:00:01Z\",\"podName\":\"pod2\"}}",
 					},
 				},
 				Spec: apiworkload.ServiceProfileDescriptorSpec{
