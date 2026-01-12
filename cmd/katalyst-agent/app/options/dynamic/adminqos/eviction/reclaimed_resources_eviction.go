@@ -35,6 +35,7 @@ func NewReclaimedResourcesEvictionOptions() *ReclaimedResourcesEvictionOptions {
 		EvictionThreshold: native.ResourceThreshold{
 			consts.ReclaimedResourceMilliCPU: 5.0,
 			consts.ReclaimedResourceMemory:   5.0,
+			consts.ResourceGPUMemory:         5.0,
 		},
 		GracePeriod:                   60,
 		ThresholdMetToleranceDuration: 0,
