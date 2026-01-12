@@ -31,6 +31,7 @@ import (
 
 	"github.com/kubewharf/katalyst-api/pkg/apis/config/v1alpha1"
 	workloadapis "github.com/kubewharf/katalyst-api/pkg/apis/workload/v1alpha1"
+	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	commonstate "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	gpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/consts"
 	gpustate "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/state"
@@ -265,6 +266,24 @@ func Test_Allocate_Ignores_NonMain(t *testing.T) {
 	m.Allocate(context.Background(), alloc)
 	if m.EnableShareGPU("GPU-1") {
 		t.Fatalf("non-main container should not mark device")
+	}
+}
+
+func Test_evaluateDeviceShareStatus_Ignores_reclaimed(t *testing.T) {
+	t.Parallel()
+	m := NewShareGPUManager().(*shareGPUManager)
+	alloc := makeContainer("u2", "ns", "pod", "c", true, "GPU-1")
+	alloc.QoSLevel = apiconsts.PodAnnotationQoSLevelReclaimedCores
+	as := &gpustate.AllocationState{
+		PodEntries: map[string]gpustate.ContainerEntries{
+			"u2": {
+				"c": alloc,
+			},
+		},
+	}
+
+	if !m.evaluateDeviceShareStatus(context.Background(), as, make(map[types.UID]bool)) {
+		t.Fatalf("reclaimed container should not mark device")
 	}
 }
 

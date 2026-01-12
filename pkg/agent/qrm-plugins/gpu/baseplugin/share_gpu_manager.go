@@ -181,7 +181,7 @@ func (s *shareGPUManager) evaluateDeviceShareStatus(ctx context.Context, alloc *
 	// Default to shareable and short-circuit to false once a disallowed pod is found.
 	for _, containerEntries := range alloc.PodEntries {
 		for _, container := range containerEntries {
-			if !container.CheckMainContainer() {
+			if !container.CheckMainContainer() || container.CheckReclaimed() {
 				continue
 			}
 
