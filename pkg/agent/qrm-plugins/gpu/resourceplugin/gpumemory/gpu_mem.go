@@ -376,14 +376,14 @@ func (p *GPUMemPlugin) GetTopologyAwareAllocatableResources(ctx context.Context)
 	topologyAwareCapacityQuantityList := make([]*pluginapi.TopologyAwareQuantity, 0, len(gpuTopology.Devices))
 	var aggregatedAllocatableQuantity, aggregatedCapacityQuantity float64
 	for deviceID, deviceInfo := range gpuTopology.Devices {
-		aggregatedAllocatableQuantity += float64(p.Conf.GPUMemoryAllocatablePerGPU.Value())
-		aggregatedCapacityQuantity += float64(p.Conf.GPUMemoryAllocatablePerGPU.Value())
 		gpuMemoryAllocatablePerGPU := float64(p.Conf.GPUMemoryAllocatablePerGPU.Value())
 		gpuMemoryCapacityPerGPU := float64(p.Conf.GPUMemoryAllocatablePerGPU.Value())
 		if deviceInfo.Health != deviceplugin.Healthy || !p.ShareGPUManager.EnableShareGPU(deviceID) {
 			// if the device is not healthy or not enabled to share, then set allocatable to 0
 			gpuMemoryAllocatablePerGPU = 0
 		}
+		aggregatedAllocatableQuantity += gpuMemoryAllocatablePerGPU
+		aggregatedCapacityQuantity += gpuMemoryCapacityPerGPU
 		if len(deviceInfo.NumaNodes) > 0 {
 			gpuMemoryAllocatablePerGPU = gpuMemoryAllocatablePerGPU / float64(len(deviceInfo.NumaNodes))
 			gpuMemoryCapacityPerGPU = gpuMemoryCapacityPerGPU / float64(len(deviceInfo.NumaNodes))
