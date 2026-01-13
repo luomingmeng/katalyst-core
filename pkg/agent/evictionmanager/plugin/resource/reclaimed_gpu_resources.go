@@ -35,6 +35,10 @@ const (
 	ReclaimedGPUResourcesEvictionPluginName = "reclaimed-gpu-resource-pressure-eviction-plugin"
 )
 
+const (
+	thresholdMetToleranceDurationForGPU = 15
+)
+
 type ReclaimedGPUResourcesPlugin struct {
 	*process.StopControl
 	*ZoneResourcesPlugin
@@ -59,7 +63,7 @@ func NewReclaimedGPUResourcesEvictionPlugin(_ *client.GenericClientSet, _ events
 	}
 
 	thresholdMetToleranceDurationGetter := func() int64 {
-		return conf.GetDynamicConfiguration().ThresholdMetToleranceDuration
+		return int64(thresholdMetToleranceDurationForGPU)
 	}
 
 	p := NewZoneResourcesPlugin(
