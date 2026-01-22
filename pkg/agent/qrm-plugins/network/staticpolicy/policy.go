@@ -811,7 +811,8 @@ func (p *StaticPolicy) Allocate(ctx context.Context,
 			"containerName", req.ContainerName,
 			"netBandwidthReq(Mbps)", reqInt,
 			"nicState", p.state.GetMachineState().String())
-		return nil, fmt.Errorf("failed to meet the bandwidth requirement of %d Mbps", reqInt)
+		unhealthyReasons := getNICsUnhealthyReasons(p.nicManager)
+		return nil, fmt.Errorf("no healthy NICs to meet the bandwidth requirement of %d Mbps, unhealthy reason: %s", reqInt, strings.Join(unhealthyReasons, ", "))
 	}
 
 	// we only support one policy and hard code it for now
@@ -1391,4 +1392,9 @@ func (p *StaticPolicy) clearNetClassIfNeed(podUID string) error {
 func getAllNICs(nicManager nic.NICManager) []machine.InterfaceInfo {
 	nics := nicManager.GetNICs()
 	return append(nics.HealthyNICs, nics.UnhealthyNICs...)
+}
+
+func getNICsUnhealthyReasons(nicManager nic.NICManager) []string {
+	nics := nicManager.GetNICs()
+	return nics.UnhealthyReasons
 }
