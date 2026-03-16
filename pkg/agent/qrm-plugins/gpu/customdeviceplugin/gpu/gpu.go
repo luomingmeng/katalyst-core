@@ -181,15 +181,16 @@ func (p *GPUDevicePlugin) AllocateAssociatedDevice(
 		filterOccupiedDevicesFromRequest(deviceReq, p.GetState().GetMachineState())
 
 		// Use the strategy framework to allocate GPU devices
-		result, err := manager.AllocateGPUUsingStrategy(
+		result, err := manager.AllocateDevicesUsingStrategy(
 			resReq,
 			deviceReq,
-			gpuTopology,
+			p.DeviceTopologyRegistry,
 			p.Conf.GPUQRMPluginConfig,
 			p.Emitter,
 			p.MetaServer,
 			p.GetState().GetMachineState(),
 			qosLevel,
+			"",
 			"",
 		)
 		if err != nil {

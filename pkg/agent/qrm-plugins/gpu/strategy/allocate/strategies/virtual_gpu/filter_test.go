@@ -28,7 +28,6 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/state"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/qrm"
-	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
 func TestVirtualGPUStrategy_Filter(t *testing.T) {
@@ -42,32 +41,8 @@ func TestVirtualGPUStrategy_Filter(t *testing.T) {
 		expectedErr             bool
 	}{
 		{
-			name: "gpu topology is nil",
-			ctx: &allocate.AllocationContext{
-				ResourceReq: &v1alpha1.ResourceRequest{
-					ResourceRequests: map[string]float64{
-						string(consts.ResourceGPUMemory): 4,
-					},
-				},
-				DeviceReq: &v1alpha1.DeviceRequest{
-					DeviceRequest: 2,
-				},
-				GPUQRMPluginConfig: &qrm.GPUQRMPluginConfig{
-					GPUMemoryAllocatablePerGPU: *resource.NewQuantity(2, resource.DecimalSI),
-				},
-			},
-			expectedErr: true,
-		},
-		{
 			name: "gpu compute does not exist, just allocate every device",
 			ctx: &allocate.AllocationContext{
-				DeviceTopology: &machine.DeviceTopology{
-					Devices: map[string]machine.DeviceInfo{
-						"gpu-0": {},
-						"gpu-1": {},
-						"gpu-2": {},
-					},
-				},
 				ResourceReq: &v1alpha1.ResourceRequest{
 					ResourceRequests: map[string]float64{
 						string(consts.ResourceMemoryBandwidth): 4,
@@ -86,13 +61,6 @@ func TestVirtualGPUStrategy_Filter(t *testing.T) {
 		{
 			name: "gpu compute is 0, so we use all the available devices",
 			ctx: &allocate.AllocationContext{
-				DeviceTopology: &machine.DeviceTopology{
-					Devices: map[string]machine.DeviceInfo{
-						"gpu-0": {},
-						"gpu-1": {},
-						"gpu-2": {},
-					},
-				},
 				ResourceReq: &v1alpha1.ResourceRequest{
 					ResourceRequests: map[string]float64{
 						string(consts.ResourceGPUMemory): 0,
@@ -111,13 +79,6 @@ func TestVirtualGPUStrategy_Filter(t *testing.T) {
 		{
 			name: "allocate available devices with available gpu compute",
 			ctx: &allocate.AllocationContext{
-				DeviceTopology: &machine.DeviceTopology{
-					Devices: map[string]machine.DeviceInfo{
-						"gpu-0": {},
-						"gpu-1": {},
-						"gpu-2": {},
-					},
-				},
 				ResourceReq: &v1alpha1.ResourceRequest{
 					ResourceRequests: map[string]float64{
 						string(consts.ResourceGPUMemory): 4,
@@ -143,14 +104,6 @@ func TestVirtualGPUStrategy_Filter(t *testing.T) {
 		{
 			name: "exclude devices with not enough gpu compute",
 			ctx: &allocate.AllocationContext{
-				DeviceTopology: &machine.DeviceTopology{
-					Devices: map[string]machine.DeviceInfo{
-						"gpu-0": {},
-						"gpu-1": {},
-						"gpu-2": {},
-						"gpu-3": {},
-					},
-				},
 				ResourceReq: &v1alpha1.ResourceRequest{
 					ResourceRequests: map[string]float64{
 						string(consts.ResourceGPUMemory): 4,

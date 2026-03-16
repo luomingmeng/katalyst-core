@@ -17,6 +17,7 @@ limitations under the License.
 package manager
 
 import (
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate/strategies/accompanyresource"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate/strategies/canonical"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate/strategies/deviceaffinity"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate/strategies/scheduler"
@@ -27,11 +28,11 @@ import (
 // registerDefaultFilterStrategies register filtering strategies
 func registerDefaultFilterStrategies(manager *StrategyManager) {
 	if err := manager.RegisterFilteringStrategy(virtual_gpu.NewVirtualGPUStrategy()); err != nil {
-		general.Errorf("Failed to register filtering strategy: %v", err)
+		general.Errorf("Failed to register filtering strategy gpu-memory: %v", err)
 	}
 
 	if err := manager.RegisterFilteringStrategy(canonical.NewCanonicalStrategy()); err != nil {
-		general.Errorf("Failed to register sorting strategy: %v", err)
+		general.Errorf("Failed to register filtering strategy canonical: %v", err)
 	}
 
 	if err := manager.RegisterFilteringStrategy(scheduler.NewSchedulerStrategy()); err != nil {
@@ -42,18 +43,22 @@ func registerDefaultFilterStrategies(manager *StrategyManager) {
 // registerDefaultSortingStrategies register sorting strategies
 func registerDefaultSortingStrategies(manager *StrategyManager) {
 	if err := manager.RegisterSortingStrategy(virtual_gpu.NewVirtualGPUStrategy()); err != nil {
-		general.Errorf("Failed to register sorting strategy: %v", err)
+		general.Errorf("Failed to register sorting strategy gpu-memory: %v", err)
 	}
 }
 
 // registerDefaultBindingStrategies register binding strategies
 func registerDefaultBindingStrategies(manager *StrategyManager) {
 	if err := manager.RegisterBindingStrategy(canonical.NewCanonicalStrategy()); err != nil {
-		general.Errorf("Failed to register binding strategy: %v", err)
+		general.Errorf("Failed to register binding strategy canonical: %v", err)
 	}
 
 	if err := manager.RegisterBindingStrategy(deviceaffinity.NewDeviceAffinityStrategy()); err != nil {
-		general.Errorf("Failed to register binding strategy: %v", err)
+		general.Errorf("Failed to register binding strategy device-affinity: %v", err)
+	}
+
+	if err := manager.RegisterBindingStrategy(accompanyresource.NewAccompanyResourceStrategy()); err != nil {
+		general.Errorf("Failed to register binding strategy pre-allocate: %v", err)
 	}
 }
 
