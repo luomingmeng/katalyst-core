@@ -39,6 +39,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	"github.com/kubewharf/katalyst-core/pkg/util/native"
 	"github.com/kubewharf/katalyst-core/pkg/util/qos"
+	resourcepackage "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 )
 
 const (
@@ -371,16 +372,8 @@ func CalculateCPUBurstFromPercent(percent float64, cpuQuota int64) uint64 {
 func GetAggResourcePackagePinnedCPUSet(attributeSelector labels.Selector, machineState state.NUMANodeMap) machine.CPUSet {
 	res := machine.NewCPUSet()
 	numaStates := machineState.GetNUMAResourcePackageStates()
-	for _, pkgStates := range numaStates {
-		for _, rpState := range pkgStates {
-			if rpState == nil {
-				continue
-			}
-			if !attributeSelector.Matches(labels.Set(rpState.Attributes)) {
-				continue
-			}
-			res = res.Union(rpState.PinnedCPUSet)
-		}
+	for _, cpuset := range resourcepackage.GetNUMAMatchedPinnedCPUSet(numaStates, attributeSelector) {
+		res = res.Union(cpuset)
 	}
 	return res
 }
