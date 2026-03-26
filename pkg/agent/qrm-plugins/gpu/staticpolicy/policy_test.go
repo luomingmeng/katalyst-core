@@ -70,6 +70,8 @@ const (
 	testResourcePluginName      = "resource-plugin-stub"
 	testCustomDevicePluginName  = "custom-device-plugin-stub"
 	testCustomDevicePluginName2 = "custom-device-plugin-stub-2"
+	// RDMA device name used for tests so that RDMA default state generation succeeds
+	testRDMADeviceName = "rdma-stub"
 )
 
 func generateTestConfiguration(t *testing.T) *config.Configuration {
@@ -79,6 +81,8 @@ func generateTestConfiguration(t *testing.T) *config.Configuration {
 	conf.CheckpointManagerDir = tmpDir
 	conf.KubeletDevicePluginPath = tmpDir
 	conf.GPUDeviceNames = []string{testResourcePluginName} // Add default device name for tests
+	// Ensure RDMA generator has a device name to reference during InitState
+	conf.RDMADeviceNames = []string{testRDMADeviceName}
 
 	return conf
 }
@@ -183,6 +187,15 @@ func makeTestStaticPolicy(t *testing.T) *StaticPolicy {
 		},
 	}
 	err = staticPolicy.DeviceTopologyRegistry.SetDeviceTopology(testResourcePluginName, testDeviceTopology)
+	assert.NoError(t, err)
+
+	// Also set a minimal RDMA device topology to satisfy RDMA default state generation during InitState
+	rdmaDeviceTopology := &machine.DeviceTopology{
+		Devices: map[string]machine.DeviceInfo{
+			"rdma-1": {},
+		},
+	}
+	err = staticPolicy.DeviceTopologyRegistry.SetDeviceTopology(testRDMADeviceName, rdmaDeviceTopology)
 	assert.NoError(t, err)
 
 	return staticPolicy

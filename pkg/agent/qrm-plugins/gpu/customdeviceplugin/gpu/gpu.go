@@ -52,8 +52,8 @@ func NewGPUDevicePlugin(base *baseplugin.BasePlugin) customdeviceplugin.CustomDe
 		base.DeviceTopologyRegistry.RegisterDeviceTopologyProvider(deviceName, gpuTopologyProvider)
 	}
 
-	// GPUDeviceType is the key used for state management in the QRM framework,
-	// while GPUDeviceNames are the actual resource names used to fetch the device topologies.
+	// GPUDeviceType is the key used for GPU state management in the QRM framework,
+	// while GPUDeviceNames are the actual resource names used to fetch the GPU device topologies.
 	base.DefaultResourceStateGeneratorRegistry.RegisterResourceStateGenerator(gpuconsts.GPUDeviceType,
 		state.NewGenericDefaultResourceStateGenerator(base.Conf.GPUDeviceNames, base.DeviceTopologyRegistry, 1))
 	base.RegisterDeviceNames(base.Conf.GPUDeviceNames, gpuconsts.GPUDeviceType)
@@ -170,12 +170,6 @@ func (p *GPUDevicePlugin) AllocateAssociatedDevice(
 			"podName", resReq.PodName,
 			"containerName", resReq.ContainerName)
 
-		// Get GPU topology using the specific device resource name
-		gpuTopology, err := p.DeviceTopologyRegistry.GetDeviceTopology(deviceReq.DeviceName)
-		if err != nil {
-			general.Warningf("failed to get gpu topology: %v", err)
-			return nil, fmt.Errorf("failed to get gpu topology: %w", err)
-		}
 
 		// Filter out devices that already have allocations in other resources
 		filterOccupiedDevicesFromRequest(deviceReq, p.GetState().GetMachineState())
@@ -190,7 +184,7 @@ func (p *GPUDevicePlugin) AllocateAssociatedDevice(
 			p.MetaServer,
 			p.GetState().GetMachineState(),
 			qosLevel,
-			"",
+			deviceReq.DeviceName,
 			"",
 		)
 		if err != nil {
