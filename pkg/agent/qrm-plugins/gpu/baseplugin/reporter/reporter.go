@@ -277,9 +277,9 @@ func (p *gpuReporterPlugin) GetReportContent(ctx context.Context, _ *v1alpha1.Em
 
 func (p *gpuReporterPlugin) buildReportResponse() (*v1alpha1.GetReportContentResponse, error) {
 	// The reporter picks the latest topology from all configured GPU devices to report to CNR.
-	topologiesMap, err := p.deviceTopologyRegistry.GetDeviceTopologies(p.gpuDeviceNames)
-	if err != nil {
-		return nil, err
+	topologiesMap, ok := p.deviceTopologyRegistry.GetDeviceTopologies(p.gpuDeviceNames)
+	if !ok {
+		return nil, fmt.Errorf("failed to get any device topology")
 	}
 	latestDeviceTopology := machine.PickLatestDeviceTopology(topologiesMap)
 
@@ -552,6 +552,11 @@ func (p *gpuReporterPlugin) addStateAllocations(idToAllocations map[string]util.
 
 					// Override the resource name if there is a specified device name
 					if allocInfo.DeviceName != "" {
+						// Skip reporting if it is not a GPU device
+						if _, ok := topologiesMap[allocInfo.DeviceName]; !ok {
+							continue
+						}
+
 						resourceName = v1.ResourceName(allocInfo.DeviceName)
 					}
 
