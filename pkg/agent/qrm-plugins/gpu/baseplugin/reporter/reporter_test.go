@@ -2231,7 +2231,7 @@ func TestAddStateAllocations(t *testing.T) {
 		},
 	}
 
-	p.addStateAllocations(idToAllocations, machineState)
+	p.addStateAllocations(nil, idToAllocations, machineState)
 
 	assert.Contains(t, idToAllocations, "gpu-1")
 	assert.Len(t, idToAllocations["gpu-1"], 1)

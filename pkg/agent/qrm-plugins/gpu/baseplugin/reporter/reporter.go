@@ -344,7 +344,7 @@ func (p *gpuReporterPlugin) getTopologyZoneReportField(topologiesMap map[string]
 		return nil, fmt.Errorf("no zone resources found for device topology")
 	}
 
-	zoneAllocations, err := p.getZoneAllocations(machineState)
+	zoneAllocations, err := p.getZoneAllocations(topologiesMap, machineState)
 	if err != nil {
 		return nil, err
 	}
@@ -504,12 +504,12 @@ func (p *gpuReporterPlugin) getZoneResources(topologiesMap map[string]*machine.D
 }
 
 // getZoneAllocations returns the map of gpu zone nodes to their pod allocations
-func (p *gpuReporterPlugin) getZoneAllocations(machineState state.AllocationResourcesMap) (map[util.ZoneNode]util.ZoneAllocations, error) {
+func (p *gpuReporterPlugin) getZoneAllocations(topologiesMap map[string]*machine.DeviceTopology, machineState state.AllocationResourcesMap) (map[util.ZoneNode]util.ZoneAllocations, error) {
 	// First construct map of device id to allocations
 	idToAllocations := make(map[string]util.ZoneAllocations)
 
 	// Add allocations from machine state
-	p.addStateAllocations(idToAllocations, machineState)
+	p.addStateAllocations(topologiesMap, idToAllocations, machineState)
 
 	// Add allocations from kubelet device manager checkpoint as a fallback.
 	if p.enableKubeletCheckpointFallback {
@@ -535,7 +535,7 @@ func (p *gpuReporterPlugin) getZoneAllocations(machineState state.AllocationReso
 // addStateAllocations merges the allocations stored in the local machine state
 // (Katalyst's QRM state) into the target idToAllocations map. This map acts as
 // an intermediate state mapping device IDs to their corresponding pod allocations.
-func (p *gpuReporterPlugin) addStateAllocations(idToAllocations map[string]util.ZoneAllocations, machineState state.AllocationResourcesMap) {
+func (p *gpuReporterPlugin) addStateAllocations(topologiesMap map[string]*machine.DeviceTopology, idToAllocations map[string]util.ZoneAllocations, machineState state.AllocationResourcesMap) {
 	for resourceName, allocMap := range machineState {
 		for id, allocState := range allocMap {
 			if _, ok := idToAllocations[id]; !ok {
