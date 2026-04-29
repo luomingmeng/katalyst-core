@@ -33,6 +33,24 @@ import (
 	metricspool "github.com/kubewharf/katalyst-core/pkg/metrics/metrics-pool"
 )
 
+type notifyModelInputFetcher struct {
+	ch chan int64
+}
+
+func (f *notifyModelInputFetcher) FetchModelInput(
+	ctx context.Context,
+	metaReader metacache.MetaReader,
+	metaWriter metacache.MetaWriter,
+	metaServer *metaserver.MetaServer,
+	timestamp int64,
+) error {
+	select {
+	case f.ch <- timestamp:
+	default:
+	}
+	return nil
+}
+
 func NewNilModelInputFetcher(fetcherName string, conf *config.Configuration, extraConf interface{},
 	emitterPool metricspool.MetricsEmitterPool, metaServer *metaserver.MetaServer,
 	metaCache metacache.MetaCache,
@@ -101,6 +119,7 @@ func TestNewInferencePlugin(t *testing.T) {
 
 func TestInferencePlugin_Run(t *testing.T) {
 	t.Parallel()
+
 	type fields struct {
 		name                 string
 		period               time.Duration
@@ -111,22 +130,16 @@ func TestInferencePlugin_Run(t *testing.T) {
 		metaReader           metacache.MetaReader
 		metaWriter           metacache.MetaWriter
 	}
-	type args struct {
-		ctx context.Context
-	}
+
 	tests := []struct {
 		name   string
 		fields fields
-		args   args
 	}{
 		{
 			name: "test running inference plugin",
 			fields: fields{
 				name:   types.AdvisorPluginNameInference,
-				period: 5 * time.Second,
-				modelsInputFetchers: map[string]modelinputfetcher.ModelInputFetcher{
-					"test": modelinputfetcher.DummyModelInputFetcher{},
-				},
+				period: 20 * time.Millisecond,
 				modelsResultFetchers: map[string]modelresultfetcher.ModelResultFetcher{
 					"test": modelresultfetcher.DummyModelResultFetcher{},
 				},
@@ -135,25 +148,49 @@ func TestInferencePlugin_Run(t *testing.T) {
 			},
 		},
 	}
+
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			var cancel context.CancelFunc
-			tt.args.ctx, cancel = context.WithCancel(context.Background())
+			ch := make(chan int64, 1)
+			done := make(chan struct{})
+
 			infp := &InferencePlugin{
-				name:                 tt.fields.name,
-				period:               tt.fields.period,
-				modelsInputFetchers:  tt.fields.modelsInputFetchers,
+				name:   tt.fields.name,
+				period: tt.fields.period,
+				modelsInputFetchers: map[string]modelinputfetcher.ModelInputFetcher{
+					"test": &notifyModelInputFetcher{ch: ch},
+				},
 				modelsResultFetchers: tt.fields.modelsResultFetchers,
 				metaServer:           tt.fields.metaServer,
 				metricEmitter:        tt.fields.emitter,
 				metaReader:           tt.fields.metaReader,
 				metaWriter:           tt.fields.metaWriter,
 			}
-			go infp.Run(tt.args.ctx)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			go func() {
+				infp.Run(ctx)
+				close(done)
+			}()
+
+			select {
+			case <-ch:
+			case <-time.After(500 * time.Millisecond):
+				t.Fatalf("Run() did not trigger fetcher")
+			}
+
 			cancel()
+
+			select {
+			case <-done:
+			case <-time.After(500 * time.Millisecond):
+				t.Fatalf("Run() did not stop after cancel")
+			}
 		})
 	}
 }
@@ -365,7 +402,7 @@ func TestInferencePlugin_fetchModelInput(t *testing.T) {
 				metaReader:          tt.fields.metaReader,
 				metaWriter:          tt.fields.metaWriter,
 			}
-			infp.fetchModelInput(tt.args.ctx)
+			infp.fetchModelInput(tt.args.ctx, 0)
 		})
 	}
 }

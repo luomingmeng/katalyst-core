@@ -34,7 +34,7 @@ import (
 type dummyModelInputFetcher struct{}
 
 func (d *dummyModelInputFetcher) FetchModelInput(_ context.Context, _ metacache.MetaReader,
-	_ metacache.MetaWriter, _ *metaserver.MetaServer,
+	_ metacache.MetaWriter, _ *metaserver.MetaServer, _ int64,
 ) error {
 	return nil
 }

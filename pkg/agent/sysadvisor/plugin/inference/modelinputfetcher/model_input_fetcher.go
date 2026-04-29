@@ -28,7 +28,7 @@ import (
 
 type ModelInputFetcher interface {
 	FetchModelInput(ctx context.Context, metaReader metacache.MetaReader,
-		metaWriter metacache.MetaWriter, metaServer *metaserver.MetaServer) error
+		metaWriter metacache.MetaWriter, metaServer *metaserver.MetaServer, timestamp int64) error
 }
 
 var _ ModelInputFetcher = DummyModelInputFetcher{}
@@ -36,7 +36,7 @@ var _ ModelInputFetcher = DummyModelInputFetcher{}
 type DummyModelInputFetcher struct{}
 
 func (d DummyModelInputFetcher) FetchModelInput(ctx context.Context, metaReader metacache.MetaReader,
-	metaWriter metacache.MetaWriter, metaServer *metaserver.MetaServer,
+	metaWriter metacache.MetaWriter, metaServer *metaserver.MetaServer, timestamp int64,
 ) error {
 	return nil
 }

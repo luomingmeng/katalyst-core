@@ -51,9 +51,8 @@ type CPUStats struct {
 	ThrottledUsec uint64 `json:"throttled_usec"`
 }
 
-type DeviceIoDetails struct {
-	Data map[string]uint64
-}
+type DeviceIoDetails map[string]uint64
+
 type BpfFsData struct {
 	FsCreated    uint64 `json:"fs_created"`
 	FsOpen       uint64 `json:"fs_open"`
