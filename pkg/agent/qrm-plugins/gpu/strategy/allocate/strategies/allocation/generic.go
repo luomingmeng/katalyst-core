@@ -17,6 +17,10 @@ limitations under the License.
 package allocation
 
 import (
+	"fmt"
+
+	"github.com/pkg/errors"
+
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate/registry"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
@@ -68,7 +72,22 @@ func (s *GenericAllocationStrategy) Clone(name string) *GenericAllocationStrateg
 
 // Allocate performs the allocation using the combined strategies
 func (s *GenericAllocationStrategy) Allocate(ctx *allocate.AllocationContext) (*allocate.AllocationResult, error) {
-	var err error
+	if ctx == nil {
+		return nil, errors.New("nil AllocationContext")
+	}
+
+	var podNamespace, podName, containerName string
+	if ctx.ResourceReq != nil {
+		podNamespace = ctx.ResourceReq.PodNamespace
+		podName = ctx.ResourceReq.PodName
+		containerName = ctx.ResourceReq.ContainerName
+	}
+	podInfo := fmt.Sprintf("pod: %s/%s, container: %s", podNamespace, podName, containerName)
+
+	var (
+		filterAvailableDevices []string
+		err                    error
+	)
 	resourceName := ctx.DeviceReq.DeviceName
 	allAvailableDevices := append(ctx.DeviceReq.ReusableDevices, ctx.DeviceReq.AvailableDevices...)
 	tags := []metrics.MetricTag{
@@ -78,32 +97,43 @@ func (s *GenericAllocationStrategy) Allocate(ctx *allocate.AllocationContext) (*
 
 	// Apply filtering strategy
 	for _, fs := range s.getFilteringStrategies(ctx, resourceName) {
-		allAvailableDevices, err = withFilterTiming(fs, ctx.Emitter, tags...).Filter(ctx, allAvailableDevices)
+		filterAvailableDevices, err = withFilterTiming(fs, ctx.Emitter, tags...).Filter(ctx, allAvailableDevices)
 		if err != nil {
+			general.Errorf("%s, failed to filter available devices with strategy %s, resource %s, err: %v", podInfo, fs.Name(), resourceName, err)
 			return &allocate.AllocationResult{
 				Success:      false,
 				ErrorMessage: err.Error(),
 			}, err
 		}
+
+		general.Infof("%s, success filter %s, resource %s, available devices %v -> %v", podInfo, fs.Name(),
+			resourceName, allAvailableDevices, filterAvailableDevices)
+		allAvailableDevices = filterAvailableDevices
 	}
 
 	// Apply sorting strategy
 	sortedDevices, err := withSortTiming(s.getSortingStrategy(ctx, resourceName), ctx.Emitter, tags...).Sort(ctx, allAvailableDevices)
 	if err != nil {
+		general.Errorf("%s, failed to sort available devices with strategy %s, resource %s, err: %v", podInfo, sortingStrategy.Name(), resourceName, err)
 		return &allocate.AllocationResult{
 			Success:      false,
 			ErrorMessage: err.Error(),
 		}, err
 	}
 
+	general.Infof("%s, success sort available devices with strategy %s, resource %s: %v", podInfo, sortingStrategy.Name(), resourceName, sortedDevices)
+
 	// Apply binding strategy
 	result, err := withBindTiming(s.getBindingStrategy(ctx, resourceName), ctx.Emitter, tags...).Bind(ctx, sortedDevices)
 	if err != nil {
+		general.Errorf("%s, failed to bind available devices with strategy %s, resource %s, err: %v", podInfo, bindingStrategy.Name(), resourceName, err)
 		return &allocate.AllocationResult{
 			Success:      false,
 			ErrorMessage: err.Error(),
 		}, err
 	}
+
+	general.Infof("%s, success bind available devices with strategy %s, resource %s: %v", podInfo, bindingStrategy.Name(), resourceName, result.AllocatedDevices)
 
 	return result, nil
 }
