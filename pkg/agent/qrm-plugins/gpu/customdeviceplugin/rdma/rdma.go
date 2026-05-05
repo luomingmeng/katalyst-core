@@ -20,6 +20,8 @@ import (
 	"context"
 	"fmt"
 
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
@@ -28,7 +30,8 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/customdeviceplugin"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/state"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate/manager"
-	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
+	gpuutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/util"
+	qrmutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
@@ -70,15 +73,80 @@ func (p *RDMADevicePlugin) UpdateAllocatableAssociatedDevices(ctx context.Contex
 	return p.BasePlugin.UpdateAllocatableAssociatedDevices(request)
 }
 
-func (p *RDMADevicePlugin) GetAssociatedDeviceTopologyHints(context.Context, *pluginapi.AssociatedDeviceRequest) (*pluginapi.AssociatedDeviceHintsResponse, error) {
-	return &pluginapi.AssociatedDeviceHintsResponse{}, nil
+func (p *RDMADevicePlugin) GetAssociatedDeviceTopologyHints(ctx context.Context, req *pluginapi.AssociatedDeviceRequest) (*pluginapi.AssociatedDeviceHintsResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("GetAssociatedDeviceTopologyHints got nil req")
+	}
+
+	resReq := req.ResourceRequest
+	if resReq == nil {
+		return nil, fmt.Errorf("GetAssociatedDeviceTopologyHints got nil resReq")
+	}
+
+	qosLevel, err := qrmutil.GetKatalystQoSLevelFromResourceReq(p.Conf.QoSConfiguration, resReq, p.PodAnnotationKeptKeys, p.PodLabelKeptKeys)
+	if err != nil {
+		err = fmt.Errorf("GetKatalystQoSLevelFromResourceReq for pod: %s/%s, container: %s failed with error: %v",
+			resReq.PodNamespace, resReq.PodName, resReq.ContainerName, err)
+		general.Errorf("%s", err.Error())
+		return nil, err
+	}
+
+	general.InfoS("called",
+		"podNamespace", resReq.PodNamespace,
+		"podName", resReq.PodName,
+		"containerName", resReq.ContainerName,
+		"deviceName", req.DeviceName,
+		"qosLevel", qosLevel,
+	)
+
+	// Find the target device request
+	var targetDeviceReq *pluginapi.DeviceRequest
+	for _, deviceRequest := range req.DeviceRequest {
+		if deviceRequest.DeviceName == req.DeviceName {
+			targetDeviceReq = deviceRequest
+			break
+		}
+	}
+
+	if targetDeviceReq == nil {
+		return nil, fmt.Errorf("no target device plugin found for target device %s", req.DeviceName)
+	}
+
+	var hints []*pluginapi.TopologyHint
+
+	// 1. Check if RDMA device allocation already exists.
+	rdmaAllocationInfo := p.GetState().GetAllocationInfo(gpuconsts.RDMADeviceType, resReq.PodUid, resReq.ContainerName)
+	if rdmaAllocationInfo != nil && rdmaAllocationInfo.TopologyAwareAllocations != nil {
+		general.InfoS("generating hints from existing RDMA allocation",
+			"podNamespace", resReq.PodNamespace,
+			"podName", resReq.PodName,
+			"containerName", resReq.ContainerName,
+			"deviceName", req.DeviceName,
+		)
+		hints = p.generateHintsFromAllocation(rdmaAllocationInfo)
+	} else {
+		// 2. If it does not exist, get the rdmaTopology
+		rdmaTopology, err := p.DeviceTopologyRegistry.GetDeviceTopology(targetDeviceReq.DeviceName)
+		if err != nil {
+			general.Warningf("failed to get rdma topology: %v", err)
+			return nil, fmt.Errorf("failed to get rdma topology: %w", err)
+		}
+
+		hints = p.generateDeviceTopologyHints(targetDeviceReq, rdmaTopology, req.AccompanyResourceName, resReq)
+	}
+
+	if len(hints) == 0 {
+		return nil, fmt.Errorf("GetAssociatedDeviceTopologyHints got empty hints")
+	}
+
+	return p.buildAssociatedDeviceHintsResponse(req, hints), nil
 }
 
 // AllocateAssociatedDevice check if rdma is allocated to other containers, make sure they do not share rdma
 func (p *RDMADevicePlugin) AllocateAssociatedDevice(
 	ctx context.Context, resReq *pluginapi.ResourceRequest, deviceReq *pluginapi.DeviceRequest, accompanyResourceName string,
 ) (*pluginapi.AssociatedDeviceAllocationResponse, error) {
-	qosLevel, err := util.GetKatalystQoSLevelFromResourceReq(p.Conf.QoSConfiguration, resReq, p.PodAnnotationKeptKeys, p.PodLabelKeptKeys)
+	qosLevel, err := qrmutil.GetKatalystQoSLevelFromResourceReq(p.Conf.QoSConfiguration, resReq, p.PodAnnotationKeptKeys, p.PodLabelKeptKeys)
 	if err != nil {
 		err = fmt.Errorf("GetKatalystQoSLevelFromResourceReq for pod: %s/%s, container: %s failed with error: %v",
 			resReq.PodNamespace, resReq.PodName, resReq.ContainerName, err)
@@ -195,4 +263,165 @@ func (p *RDMADevicePlugin) AllocateAssociatedDevice(
 			AllocatedDevices: allocatedRdmaDevices,
 		},
 	}, nil
+}
+
+func (p *RDMADevicePlugin) generateHintsFromAllocation(allocationInfo *state.AllocationInfo) []*pluginapi.TopologyHint {
+	nodesSet := sets.NewInt()
+	for _, alloc := range allocationInfo.TopologyAwareAllocations {
+		nodesSet.Insert(alloc.NUMANodes...)
+	}
+
+	nodes := make([]uint64, 0, nodesSet.Len())
+	for _, node := range nodesSet.List() {
+		nodes = append(nodes, uint64(node))
+	}
+
+	return []*pluginapi.TopologyHint{
+		{
+			Nodes:     nodes,
+			Preferred: true,
+		},
+	}
+}
+
+func (p *RDMADevicePlugin) generateDeviceTopologyHints(
+	deviceReq *pluginapi.DeviceRequest,
+	rdmaTopology *machine.DeviceTopology,
+	accompanyResourceName string,
+	resReq *pluginapi.ResourceRequest,
+) []*pluginapi.TopologyHint {
+	request := int(deviceReq.DeviceRequest)
+	available := sets.NewString(deviceReq.AvailableDevices...)
+	reusable := sets.NewString(deviceReq.ReusableDevices...)
+
+	// In scenarios where RDMA is requested implicitly (request == 0) alongside an accompany resource (e.g., GPU),
+	// the number of RDMA devices needed is proportional to the number of accompany devices allocated to the container.
+	if request == 0 && accompanyResourceName != "" {
+		machineState := p.GetState().GetMachineState()
+
+		accompanyResourceNameInState := gpuutil.ResolveResourceName(p.GetDeviceNameToTypeMap(), accompanyResourceName, false)
+		resourceNameInState := gpuutil.ResolveResourceName(p.GetDeviceNameToTypeMap(), deviceReq.DeviceName, false)
+
+		accompanyAllocatedDeviceIDs := machineState.GetAllocatedDeviceIDs(v1.ResourceName(accompanyResourceNameInState), resReq.PodUid, resReq.ContainerName)
+
+		if len(accompanyAllocatedDeviceIDs) > 0 {
+			// Use the node-level ratio of accompany resources to target resources to determine
+			// the fair share of RDMA devices for the already allocated accompany devices.
+			accompanyResourceToDeviceRatio := machineState.GetRatioOfAccompanyResourceToTargetResource(accompanyResourceNameInState, resourceNameInState)
+			request = machineState.CalculateTargetDevicesToAllocate(accompanyResourceToDeviceRatio, len(accompanyAllocatedDeviceIDs))
+		}
+	}
+
+	if available.Union(reusable).Len() < request {
+		general.Warningf("Unable to generate topology hints: requested number of devices unavailable, request: %d, available: %d",
+			request, available.Union(reusable).Len())
+		return nil
+	}
+
+	// Gather all NUMA nodes that have healthy RDMAs
+	numaNodesSet := sets.NewInt()
+	for _, dev := range rdmaTopology.Devices {
+		if dev.Health != pluginapi.Healthy {
+			continue
+		}
+
+		numaNodesSet.Insert(dev.NumaNodes...)
+	}
+	numaNodes := numaNodesSet.List()
+
+	// minAffinitySize tracks the minimum mask size that satisfies the Strategy
+	minAffinitySize := len(numaNodes)
+	var hints []*pluginapi.TopologyHint
+
+	// Iterate through all combinations of NUMA Nodes and build hints from them.
+	machine.IterateBitMasks(numaNodes, len(numaNodes), func(mask machine.BitMask) {
+		// Fast Path: Check to see if all of the reusable devices are part of the bitmask.
+		numMatching := 0
+		for d := range reusable {
+			dev, ok := rdmaTopology.Devices[d]
+			if !ok {
+				general.Errorf("Reusable device %s not found in topology", d)
+				continue
+			}
+			if len(dev.NumaNodes) == 0 {
+				general.Errorf("Reusable device %s has no NUMA nodes", d)
+				continue
+			}
+			if !mask.AnySet(dev.NumaNodes) {
+				return
+			}
+			numMatching++
+		}
+
+		// Fast Path: Check to see if enough available devices remain on the
+		// current NUMA node combination to satisfy the device request.
+		for d := range available {
+			dev, ok := rdmaTopology.Devices[d]
+			if !ok {
+				general.Errorf("Available device %s not found in topology", d)
+				continue
+			}
+			if len(dev.NumaNodes) == 0 {
+				general.Errorf("Available device %s has no NUMA nodes", d)
+				continue
+			}
+			if mask.AnySet(dev.NumaNodes) {
+				numMatching++
+			}
+		}
+
+		// If they don't, then move onto the next combination.
+		if numMatching < request {
+			return
+		}
+
+		bits := mask.GetBits()
+		nodes := make([]uint64, len(bits))
+		for i, bit := range bits {
+			nodes[i] = uint64(bit)
+		}
+
+		if mask.Count() < minAffinitySize {
+			minAffinitySize = mask.Count()
+		}
+
+		// Add it to the list of hints. We set all hint preferences to 'false' on the first pass through.
+		hints = append(hints, &pluginapi.TopologyHint{
+			Nodes:     nodes,
+			Preferred: false,
+		})
+	})
+
+	for i := range hints {
+		if len(hints[i].Nodes) == minAffinitySize {
+			hints[i].Preferred = true
+		}
+	}
+
+	return hints
+}
+
+func (p *RDMADevicePlugin) buildAssociatedDeviceHintsResponse(
+	req *pluginapi.AssociatedDeviceRequest,
+	hints []*pluginapi.TopologyHint,
+) *pluginapi.AssociatedDeviceHintsResponse {
+	resReq := req.ResourceRequest
+	var deviceHints *pluginapi.ListOfTopologyHints
+	if hints != nil {
+		deviceHints = &pluginapi.ListOfTopologyHints{Hints: hints}
+	}
+	return &pluginapi.AssociatedDeviceHintsResponse{
+		PodUid:         resReq.PodUid,
+		PodNamespace:   resReq.PodNamespace,
+		PodName:        resReq.PodName,
+		ContainerName:  resReq.ContainerName,
+		ContainerType:  resReq.ContainerType,
+		ContainerIndex: resReq.ContainerIndex,
+		PodRole:        resReq.PodRole,
+		PodType:        resReq.PodType,
+		DeviceName:     req.DeviceName,
+		DeviceHints:    deviceHints,
+		Labels:         resReq.Labels,
+		Annotations:    resReq.Annotations,
+	}
 }

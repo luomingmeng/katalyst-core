@@ -1005,7 +1005,7 @@ func TestGPUDevicePlugin_GetAssociatedDeviceTopologyHints(t *testing.T) {
 				if len(tt.deviceTopology.PriorityDimensions) > 0 {
 					basePlugin.Conf.GPUQRMPluginConfig.RequiredDeviceAffinity = tt.requiredDeviceAffinity
 
-					err = manager.GetGlobalStrategyManager().RegisterGenericAllocationStrategy(
+					err = manager.GetGlobalStrategyManager(basePlugin.Conf.GPUQRMPluginConfig).RegisterGenericAllocationStrategy(
 						testDeviceAffinityAllocation,
 						[]string{canonical.StrategyNameCanonical, gpu_memory.StrategyNameGPUMemory},
 						gpu_memory.StrategyNameGPUMemory,

@@ -18,6 +18,7 @@ package state
 
 import (
 	"encoding/json"
+	"math"
 	"sync"
 
 	v1 "k8s.io/api/core/v1"
@@ -322,6 +323,23 @@ func (arm AllocationResourcesMap) GetRatioOfAccompanyResourceToTargetResource(ac
 	}
 
 	return float64(accompanyResourceNumber) / float64(targetResourceNumber)
+}
+
+// CalculateTargetDevicesToAllocate calculates the number of target devices to be allocated
+// proportionally to the accompany resource devices.
+func (arm AllocationResourcesMap) CalculateTargetDevicesToAllocate(ratio float64, accompanyAllocatedDeviceCount int) int {
+	if ratio <= 0 {
+		ratio = 1
+	}
+
+	devicesNeededFloat := float64(accompanyAllocatedDeviceCount) / ratio
+	devicesToBeAllocated := int(math.Floor(devicesNeededFloat))
+	// Should have a minimum of 1 device to be allocated at all times
+	if devicesToBeAllocated < 1 {
+		devicesToBeAllocated = 1
+	}
+
+	return devicesToBeAllocated
 }
 
 func (as *AllocationState) GetQuantityAllocated() float64 {

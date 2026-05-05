@@ -88,17 +88,7 @@ func (s *AccompanyResourceStrategy) Bind(ctx *allocate.AllocationContext, sorted
 	accompanyResourceToDeviceRatio := machineState.GetRatioOfAccompanyResourceToTargetResource(accompanyResourceNameInState, resourceNameInState)
 
 	// Find out the number of target devices to be allocated proportionally to the accompany resource devices
-	ratio := accompanyResourceToDeviceRatio
-	if ratio <= 0 {
-		ratio = 1
-	}
-
-	devicesNeededFloat := float64(len(accompanyAllocatedDeviceIDs)) / ratio
-	devicesToBeAllocated := int(math.Floor(devicesNeededFloat))
-	// Should have a minimum of 1 device to be allocated at all times
-	if devicesToBeAllocated < 1 {
-		devicesToBeAllocated = 1
-	}
+	devicesToBeAllocated := machineState.CalculateTargetDevicesToAllocate(accompanyResourceToDeviceRatio, len(accompanyAllocatedDeviceIDs))
 
 	if allocatedDevices.Len() >= devicesToBeAllocated {
 		return &allocate.AllocationResult{

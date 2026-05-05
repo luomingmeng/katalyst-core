@@ -538,3 +538,229 @@ func evaluateAllocatedDevicesResult(t *testing.T, expectedResp, actualResp *plug
 
 	assert.ElementsMatch(t, expectedResp.AllocationResult.AllocatedDevices, actualResp.AllocationResult.AllocatedDevices)
 }
+
+func TestRDMADevicePlugin_GetAssociatedDeviceTopologyHints(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                  string
+		podUID                string
+		containerName         string
+		req                   *pluginapi.AssociatedDeviceRequest
+		allocationInfo        *state.AllocationInfo
+		deviceTopology        *machine.DeviceTopology
+		machineState          state.AllocationResourcesMap
+		accompanyResourceName string
+		expectedErr           bool
+		expectedHints         []*pluginapi.TopologyHint
+	}{
+		{
+			name: "Allocation already exists",
+			req: &pluginapi.AssociatedDeviceRequest{
+				DeviceName: "test-rdma",
+				ResourceRequest: &pluginapi.ResourceRequest{
+					PodUid:        "test-pod",
+					ContainerName: "test-container",
+				},
+				DeviceRequest: []*pluginapi.DeviceRequest{
+					{
+						DeviceName: "test-rdma",
+					},
+				},
+			},
+			podUID:        "test-pod",
+			containerName: "test-container",
+			allocationInfo: &state.AllocationInfo{
+				TopologyAwareAllocations: map[string]state.Allocation{
+					"test-rdma-0": {
+						Quantity:  1,
+						NUMANodes: []int{0, 1},
+					},
+				},
+			},
+			expectedHints: []*pluginapi.TopologyHint{
+				{
+					Nodes:     []uint64{0, 1},
+					Preferred: true,
+				},
+			},
+		},
+		{
+			name: "No allocation, generate from topology with request > 0",
+			req: &pluginapi.AssociatedDeviceRequest{
+				DeviceName: "test-rdma",
+				ResourceRequest: &pluginapi.ResourceRequest{
+					PodUid:        "test-pod",
+					ContainerName: "test-container",
+				},
+				DeviceRequest: []*pluginapi.DeviceRequest{
+					{
+						DeviceName:       "test-rdma",
+						DeviceRequest:    2,
+						AvailableDevices: []string{"test-rdma-0", "test-rdma-1"},
+					},
+				},
+			},
+			podUID:        "test-pod",
+			containerName: "test-container",
+			deviceTopology: &machine.DeviceTopology{
+				Devices: map[string]machine.DeviceInfo{
+					"test-rdma-0": {
+						NumaNodes: []int{0},
+						Health:    pluginapi.Healthy,
+					},
+					"test-rdma-1": {
+						NumaNodes: []int{1},
+						Health:    pluginapi.Healthy,
+					},
+				},
+			},
+			expectedHints: []*pluginapi.TopologyHint{
+				{
+					Nodes:     []uint64{0, 1},
+					Preferred: true,
+				},
+			},
+		},
+		{
+			name: "No allocation, request == 0 with accompany resource",
+			req: &pluginapi.AssociatedDeviceRequest{
+				DeviceName:            "test-rdma",
+				AccompanyResourceName: "test-gpu",
+				ResourceRequest: &pluginapi.ResourceRequest{
+					PodUid:        "test-pod",
+					ContainerName: "test-container",
+				},
+				DeviceRequest: []*pluginapi.DeviceRequest{
+					{
+						DeviceName:       "test-rdma",
+						DeviceRequest:    0,
+						AvailableDevices: []string{"test-rdma-0", "test-rdma-1"},
+					},
+				},
+			},
+			podUID:                "test-pod",
+			containerName:         "test-container",
+			accompanyResourceName: "test-gpu",
+			deviceTopology: &machine.DeviceTopology{
+				Devices: map[string]machine.DeviceInfo{
+					"test-rdma-0": {
+						NumaNodes: []int{0},
+						Health:    pluginapi.Healthy,
+					},
+					"test-rdma-1": {
+						NumaNodes: []int{1},
+						Health:    pluginapi.Healthy,
+					},
+				},
+			},
+			machineState: state.AllocationResourcesMap{
+				gpuconsts.RDMADeviceType: {
+					"test-rdma-0": {},
+					"test-rdma-1": {},
+				},
+				gpuconsts.GPUDeviceType: {
+					"test-gpu-0": {
+						PodEntries: map[string]state.ContainerEntries{
+							"test-pod": {
+								"test-container": {
+									AllocatedAllocation: state.Allocation{
+										Quantity: 1,
+									},
+								},
+							},
+						},
+					},
+					"test-gpu-1": {
+						PodEntries: map[string]state.ContainerEntries{
+							"test-pod": {
+								"test-container": {
+									AllocatedAllocation: state.Allocation{
+										Quantity: 1,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedHints: []*pluginapi.TopologyHint{
+				{
+					Nodes:     []uint64{0, 1},
+					Preferred: true,
+				},
+			},
+		},
+		{
+			name: "Devices have no NUMA nodes",
+			req: &pluginapi.AssociatedDeviceRequest{
+				DeviceName: "test-rdma",
+				ResourceRequest: &pluginapi.ResourceRequest{
+					PodUid:        "test-pod",
+					ContainerName: "test-container",
+				},
+				DeviceRequest: []*pluginapi.DeviceRequest{
+					{
+						DeviceName:       "test-rdma",
+						DeviceRequest:    1,
+						AvailableDevices: []string{"test-rdma-0"},
+					},
+				},
+			},
+			podUID:        "test-pod",
+			containerName: "test-container",
+			deviceTopology: &machine.DeviceTopology{
+				Devices: map[string]machine.DeviceInfo{
+					"test-rdma-0": {
+						NumaNodes: []int{}, // Empty NUMA nodes
+						Health:    pluginapi.Healthy,
+					},
+					"test-rdma-1": {
+						NumaNodes: []int{0}, // Added to trigger NUMA iteration
+						Health:    pluginapi.Healthy,
+					},
+				},
+			},
+			expectedErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			basePlugin := makeTestBasePlugin(t)
+			devicePlugin := NewRDMADevicePlugin(basePlugin)
+
+			if tt.allocationInfo != nil {
+				basePlugin.GetState().SetAllocationInfo(gpuconsts.RDMADeviceType, tt.podUID, tt.containerName, tt.allocationInfo, false)
+			}
+
+			if tt.deviceTopology != nil {
+				err := basePlugin.DeviceTopologyRegistry.SetDeviceTopology(basePlugin.Conf.RDMADeviceNames[0], tt.deviceTopology)
+				assert.NoError(t, err)
+			}
+
+			if tt.machineState != nil {
+				basePlugin.GetState().SetMachineState(tt.machineState, false)
+			}
+
+			resp, err := devicePlugin.GetAssociatedDeviceTopologyHints(context.Background(), tt.req)
+			if tt.expectedErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.NotNil(t, resp)
+				if len(tt.expectedHints) > 0 {
+					assert.NotNil(t, resp.DeviceHints)
+					assert.Equal(t, len(tt.expectedHints), len(resp.DeviceHints.Hints))
+					for i, expectedHint := range tt.expectedHints {
+						assert.ElementsMatch(t, expectedHint.Nodes, resp.DeviceHints.Hints[i].Nodes)
+						assert.Equal(t, expectedHint.Preferred, resp.DeviceHints.Hints[i].Preferred)
+					}
+				}
+			}
+		})
+	}
+}

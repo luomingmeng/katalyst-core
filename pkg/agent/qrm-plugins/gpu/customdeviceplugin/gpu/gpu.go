@@ -284,15 +284,18 @@ func (p *GPUDevicePlugin) generateDeviceTopologyHints(
 			Preferred: false,
 		}
 
-		result, err := manager.AllocateGPUUsingStrategy(
+		result, err := manager.AllocateDevicesUsingStrategy(
 			resReq,
 			&deviceReqCopy,
-			gpuTopology,
+			p.DeviceTopologyRegistry,
 			p.Conf.GPUQRMPluginConfig,
 			p.Emitter,
 			p.MetaServer,
 			p.GetState().GetMachineState(),
 			qosLevel,
+			deviceReq.DeviceName,
+			"",
+			p.GetDeviceNameToTypeMap(),
 		)
 
 		if err != nil || !result.Success {
