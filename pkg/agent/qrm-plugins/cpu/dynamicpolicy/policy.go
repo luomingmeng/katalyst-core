@@ -85,6 +85,8 @@ const (
 
 var AccompanyResourceRegistry = accompanyresource.NewRegistry()
 
+type AllocationHook func(oldAllocationInfo, newAllocationInfo *state.AllocationInfo) error
+
 // DynamicPolicy is the policy that's used by default;
 // it will consider the dynamic running information to calculate
 // and adjust resource requirements and configurations
@@ -111,6 +113,7 @@ type DynamicPolicy struct {
 	residualHitMap     map[string]int64
 	allocationHandlers map[string]util.AllocationHandler
 	hintHandlers       map[string]util.HintHandler
+	allocationHooks    []AllocationHook
 
 	cpuPressureEviction       agent.Component
 	cpuPressureEvictionCancel context.CancelFunc
@@ -562,6 +565,7 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 			if allocationInfo == nil {
 				continue
 			}
+			originAllocationInfo := allocationInfo
 			allocationInfo = allocationInfo.Clone()
 
 			// sync allocation info from main container to sidecar
@@ -569,7 +573,11 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 				if p.applySidecarAllocationInfoFromMainContainer(allocationInfo, mainContainerAllocationInfo) {
 					general.Infof("pod: %s/%s, container: %s sync allocation info from main container",
 						allocationInfo.PodNamespace, allocationInfo.PodName, containerName)
-					p.state.SetAllocationInfo(podUID, containerName, allocationInfo, true)
+					if err := p.updateAllocationInfo(podUID, containerName, originAllocationInfo, allocationInfo, true); err != nil {
+						general.Errorf("updateAllocationInfo failed for pod: %s/%s, container: %s: %v",
+							allocationInfo.PodNamespace, allocationInfo.PodName, containerName, err)
+						continue
+					}
 					needUpdateMachineState = true
 				}
 			}
@@ -593,11 +601,18 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 				}
 
 				allocationInfo.InitTimestamp = time.Now().Format(util.QRMTimeFormat)
-				p.state.SetAllocationInfo(podUID, containerName, allocationInfo, true)
+				if err := p.updateAllocationInfo(podUID, containerName, originAllocationInfo, allocationInfo, true); err != nil {
+					general.Errorf("updateAllocationInfo failed for pod: %s/%s, container: %s: %v",
+						allocationInfo.PodNamespace, allocationInfo.PodName, containerName, err)
+				}
 			} else if allocationInfo.RampUp && time.Now().After(initTs.Add(p.transitionPeriod)) {
 				general.Infof("pod: %s/%s, container: %s ramp up finished", allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName)
 				allocationInfo.RampUp = false
-				p.state.SetAllocationInfo(podUID, containerName, allocationInfo, true)
+				if err := p.updateAllocationInfo(podUID, containerName, originAllocationInfo, allocationInfo, true); err != nil {
+					general.Errorf("updateAllocationInfo failed for pod: %s/%s, container: %s: %v",
+						allocationInfo.PodNamespace, allocationInfo.PodName, containerName, err)
+					continue
+				}
 
 				if allocationInfo.CheckShared() {
 					allocationInfosJustFinishRampUp = append(allocationInfosJustFinishRampUp, allocationInfo)
@@ -1429,4 +1444,63 @@ func (p *DynamicPolicy) applySidecarAllocationInfoFromMainContainer(sidecarAlloc
 	}
 
 	return changed
+}
+
+// RegisterAllocationHook registers a hook that is called before allocation info is updated.
+// It is concurrency-safe.
+func (p *DynamicPolicy) RegisterAllocationHook(hook AllocationHook) {
+	p.Lock()
+	defer p.Unlock()
+	p.allocationHooks = append(p.allocationHooks, hook)
+}
+
+// invokeAllocationHooks executes all registered hooks. It is called without re-acquiring the lock.
+func (p *DynamicPolicy) invokeAllocationHooks(oldAllocationInfo, newAllocationInfo *state.AllocationInfo) error {
+	for _, hook := range p.allocationHooks {
+		if err := hook(oldAllocationInfo, newAllocationInfo); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// invokeAllocationHooksForPodEntries triggers allocation hooks for non-pool containers before committing to state.
+func (p *DynamicPolicy) invokeAllocationHooksForPodEntries(curEntries, newEntries state.PodEntries) error {
+	if len(p.allocationHooks) == 0 {
+		return nil
+	}
+
+	for podUID, containerEntries := range newEntries {
+		if containerEntries.IsPoolEntry() {
+			continue
+		}
+		for containerName, newAllocationInfo := range containerEntries {
+			var oldAllocationInfo *state.AllocationInfo
+			// retrieve old allocation info from curEntries directly to avoid the overhead
+			// of GetAllocationInfo which involves Clone() operations.
+			if curContainerEntries, ok := curEntries[podUID]; ok {
+				oldAllocationInfo = curContainerEntries[containerName]
+			}
+			if err := p.invokeAllocationHooks(oldAllocationInfo, newAllocationInfo); err != nil {
+				return fmt.Errorf("invokeAllocationHooks failed for pod: %s, container: %s: %v", podUID, containerName, err)
+			}
+		}
+	}
+	return nil
+}
+
+// updateAllocationInfo wraps state.SetAllocationInfo with hook execution.
+// If no hooks are registered, it avoids the overhead of retrieving the old allocation info.
+func (p *DynamicPolicy) updateAllocationInfo(podUID, containerName string, oldAllocationInfo, allocationInfo *state.AllocationInfo, persist bool) error {
+	if len(p.allocationHooks) > 0 {
+		if oldAllocationInfo == nil {
+			oldAllocationInfo = p.state.GetAllocationInfo(podUID, containerName)
+		}
+		if err := p.invokeAllocationHooks(oldAllocationInfo, allocationInfo); err != nil {
+			return err
+		}
+	}
+
+	p.state.SetAllocationInfo(podUID, containerName, allocationInfo, persist)
+	return nil
 }
