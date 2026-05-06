@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -1674,6 +1675,42 @@ func TestGetTopologyHints(t *testing.T) {
 		numaNumberAnnotationKey  string
 		numaIDsAnnotationKey     string
 	}{
+		{
+			name: "req for system_cores container",
+			req: &pluginapi.ResourceRequest{
+				PodUid:         string(uuid.NewUUID()),
+				PodNamespace:   testName,
+				PodName:        testName,
+				ContainerName:  testName,
+				ContainerType:  pluginapi.ContainerType_MAIN,
+				ContainerIndex: 0,
+				ResourceName:   string(v1.ResourceCPU),
+				ResourceRequests: map[string]float64{
+					string(v1.ResourceCPU): 2,
+				},
+				Annotations: map[string]string{
+					consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSystemCores,
+				},
+			},
+			expectedResp: &pluginapi.ResourceHintsResponse{
+				PodNamespace:   testName,
+				PodName:        testName,
+				ContainerName:  testName,
+				ContainerType:  pluginapi.ContainerType_MAIN,
+				ContainerIndex: 0,
+				ResourceName:   string(v1.ResourceCPU),
+				ResourceHints: map[string]*pluginapi.ListOfTopologyHints{
+					string(v1.ResourceCPU): nil,
+				},
+				Labels: map[string]string{
+					consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSystemCores,
+				},
+				Annotations: map[string]string{
+					consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSystemCores,
+				},
+			},
+			cpuTopology: cpuTopology,
+		},
 		{
 			name: "req for container of debug pod",
 			req: &pluginapi.ResourceRequest{
@@ -8290,6 +8327,557 @@ func TestNewDynamicPolicy(t *testing.T) {
 			if got != tt.want {
 				t.Errorf("NewDynamicPolicy() got = %v, want %v", got, tt.want)
 			}
+		})
+	}
+}
+
+func TestDynamicPolicy_AllocationHooks(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name         string
+		req          *pluginapi.ResourceRequest
+		hook         AllocationHook
+		expectErr    bool
+		errContains  string
+		preRun       func(policy *DynamicPolicy)
+		verifyResult func(t *testing.T, policy *DynamicPolicy)
+	}{
+		{
+			name: "hook modifies allocation",
+			req: &pluginapi.ResourceRequest{
+				PodUid:        "modify-pod-uid",
+				PodNamespace:  "default",
+				PodName:       "modify-pod",
+				ContainerName: "c1",
+				ContainerType: pluginapi.ContainerType_MAIN,
+				ResourceName:  string(v1.ResourceCPU),
+				Annotations: map[string]string{
+					consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+				},
+				ResourceRequests: map[string]float64{
+					string(v1.ResourceCPU): 1,
+				},
+			},
+			hook: func(oldAlloc, newAlloc *state.AllocationInfo) error {
+				if newAlloc.PodName == "modify-pod" {
+					if newAlloc.Annotations == nil {
+						newAlloc.Annotations = make(map[string]string)
+					}
+					newAlloc.Annotations["hook-modified"] = "true"
+				}
+				return nil
+			},
+			expectErr: false,
+			verifyResult: func(t *testing.T, policy *DynamicPolicy) {
+				allocInfo := policy.state.GetAllocationInfo("modify-pod-uid", "c1")
+				require.NotNil(t, allocInfo)
+				require.Equal(t, "true", allocInfo.Annotations["hook-modified"])
+			},
+		},
+		{
+			name: "hook modifies allocation for reclaimed_cores",
+			req: &pluginapi.ResourceRequest{
+				PodUid:        "modify-reclaimed-pod-uid",
+				PodNamespace:  "default",
+				PodName:       "modify-reclaimed-pod",
+				ContainerName: "c1",
+				ContainerType: pluginapi.ContainerType_MAIN,
+				ResourceName:  string(v1.ResourceCPU),
+				Annotations: map[string]string{
+					consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelReclaimedCores,
+				},
+				ResourceRequests: map[string]float64{
+					string(v1.ResourceCPU): 1,
+				},
+			},
+			hook: func(oldAlloc, newAlloc *state.AllocationInfo) error {
+				if newAlloc.PodName == "modify-reclaimed-pod" {
+					if newAlloc.Annotations == nil {
+						newAlloc.Annotations = make(map[string]string)
+					}
+					newAlloc.Annotations["hook-modified-reclaimed"] = "true"
+				}
+				return nil
+			},
+			expectErr: false,
+			verifyResult: func(t *testing.T, policy *DynamicPolicy) {
+				allocInfo := policy.state.GetAllocationInfo("modify-reclaimed-pod-uid", "c1")
+				require.NotNil(t, allocInfo)
+				require.Equal(t, "true", allocInfo.Annotations["hook-modified-reclaimed"])
+			},
+		},
+		{
+			name: "hook modifies allocation for dedicated_cores",
+			req: &pluginapi.ResourceRequest{
+				PodUid:        "modify-dedicated-pod-uid",
+				PodNamespace:  "default",
+				PodName:       "modify-dedicated-pod",
+				ContainerName: "c1",
+				ContainerType: pluginapi.ContainerType_MAIN,
+				ResourceName:  string(v1.ResourceCPU),
+				Annotations: map[string]string{
+					consts.PodAnnotationQoSLevelKey:          consts.PodAnnotationQoSLevelDedicatedCores,
+					consts.PodAnnotationMemoryEnhancementKey: `{"numa_binding": "true", "numa_exclusive": "true"}`,
+				},
+				ResourceRequests: map[string]float64{
+					string(v1.ResourceCPU): 2,
+				},
+				Hint: &pluginapi.TopologyHint{
+					Nodes:     []uint64{0},
+					Preferred: true,
+				},
+			},
+			hook: func(oldAlloc, newAlloc *state.AllocationInfo) error {
+				if newAlloc.PodName == "modify-dedicated-pod" {
+					if newAlloc.Annotations == nil {
+						newAlloc.Annotations = make(map[string]string)
+					}
+					newAlloc.Annotations["hook-modified-dedicated"] = "true"
+				}
+				return nil
+			},
+			expectErr: false,
+			verifyResult: func(t *testing.T, policy *DynamicPolicy) {
+				allocInfo := policy.state.GetAllocationInfo("modify-dedicated-pod-uid", "c1")
+				require.NotNil(t, allocInfo)
+				require.Equal(t, "true", allocInfo.Annotations["hook-modified-dedicated"])
+			},
+		},
+		{
+			name: "hook modifies allocation for system_cores",
+			req: &pluginapi.ResourceRequest{
+				PodUid:        "modify-system-pod-uid",
+				PodNamespace:  "default",
+				PodName:       "modify-system-pod",
+				ContainerName: "c1",
+				ContainerType: pluginapi.ContainerType_MAIN,
+				ResourceName:  string(v1.ResourceCPU),
+				Annotations: map[string]string{
+					consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSystemCores,
+				},
+				ResourceRequests: map[string]float64{
+					string(v1.ResourceCPU): 1,
+				},
+			},
+			hook: func(oldAlloc, newAlloc *state.AllocationInfo) error {
+				if newAlloc.PodName == "modify-system-pod" {
+					if newAlloc.Annotations == nil {
+						newAlloc.Annotations = make(map[string]string)
+					}
+					newAlloc.Annotations["hook-modified-system"] = "true"
+				}
+				return nil
+			},
+			expectErr: false,
+			verifyResult: func(t *testing.T, policy *DynamicPolicy) {
+				allocInfo := policy.state.GetAllocationInfo("modify-system-pod-uid", "c1")
+				require.NotNil(t, allocInfo)
+				require.Equal(t, "true", allocInfo.Annotations["hook-modified-system"])
+			},
+		},
+		{
+			name: "hook modifies allocation for sidecar container",
+			req: &pluginapi.ResourceRequest{
+				PodUid:        "modify-sidecar-pod-uid",
+				PodNamespace:  "default",
+				PodName:       "modify-sidecar-pod",
+				ContainerName: "c1",
+				ContainerType: pluginapi.ContainerType_SIDECAR,
+				ResourceName:  string(v1.ResourceCPU),
+				Annotations: map[string]string{
+					consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+				},
+				ResourceRequests: map[string]float64{
+					string(v1.ResourceCPU): 1,
+				},
+			},
+			hook: func(oldAlloc, newAlloc *state.AllocationInfo) error {
+				if newAlloc.PodName == "modify-sidecar-pod" {
+					if newAlloc.Annotations == nil {
+						newAlloc.Annotations = make(map[string]string)
+					}
+					newAlloc.Annotations["hook-modified-sidecar"] = "true"
+				}
+				return nil
+			},
+			preRun: func(policy *DynamicPolicy) {
+				policy.state.SetAllocationInfo("modify-sidecar-pod-uid", "main-c", &state.AllocationInfo{
+					AllocationMeta: commonstate.AllocationMeta{
+						PodUid:        "modify-sidecar-pod-uid",
+						PodNamespace:  "default",
+						PodName:       "modify-sidecar-pod",
+						ContainerName: "main-c",
+						ContainerType: pluginapi.ContainerType_MAIN.String(),
+					},
+					AllocationResult: machine.NewCPUSet(0, 1),
+				}, false)
+			},
+			expectErr: false,
+			verifyResult: func(t *testing.T, policy *DynamicPolicy) {
+				allocInfo := policy.state.GetAllocationInfo("modify-sidecar-pod-uid", "c1")
+				require.NotNil(t, allocInfo)
+				require.Equal(t, "true", allocInfo.Annotations["hook-modified-sidecar"])
+			},
+		},
+		{
+			name: "hook returns error for shared_cores",
+			req: &pluginapi.ResourceRequest{
+				PodUid:        "error-pod-uid",
+				PodNamespace:  "default",
+				PodName:       "error-pod",
+				ContainerName: "c1",
+				ContainerType: pluginapi.ContainerType_MAIN,
+				ResourceName:  string(v1.ResourceCPU),
+				Annotations: map[string]string{
+					consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+				},
+				ResourceRequests: map[string]float64{
+					string(v1.ResourceCPU): 1,
+				},
+			},
+			hook: func(oldAlloc, newAlloc *state.AllocationInfo) error {
+				if newAlloc.PodName == "error-pod" {
+					return fmt.Errorf("hook injected error")
+				}
+				return nil
+			},
+			expectErr:   true,
+			errContains: "hook injected error",
+			verifyResult: func(t *testing.T, policy *DynamicPolicy) {
+				allocInfo := policy.state.GetAllocationInfo("error-pod-uid", "c1")
+				require.Nil(t, allocInfo)
+			},
+		},
+		{
+			name: "hook returns error for reclaimed_cores",
+			req: &pluginapi.ResourceRequest{
+				PodUid:        "error-reclaimed-pod-uid",
+				PodNamespace:  "default",
+				PodName:       "error-reclaimed-pod",
+				ContainerName: "c1",
+				ContainerType: pluginapi.ContainerType_MAIN,
+				ResourceName:  string(v1.ResourceCPU),
+				Annotations: map[string]string{
+					consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelReclaimedCores,
+				},
+				ResourceRequests: map[string]float64{
+					string(v1.ResourceCPU): 1,
+				},
+			},
+			hook: func(oldAlloc, newAlloc *state.AllocationInfo) error {
+				if newAlloc.PodName == "error-reclaimed-pod" {
+					return fmt.Errorf("hook injected error for reclaimed")
+				}
+				return nil
+			},
+			expectErr:   true,
+			errContains: "hook injected error for reclaimed",
+		},
+		{
+			name: "hook returns error for dedicated_cores",
+			req: &pluginapi.ResourceRequest{
+				PodUid:        "error-dedicated-pod-uid",
+				PodNamespace:  "default",
+				PodName:       "error-dedicated-pod",
+				ContainerName: "c1",
+				ContainerType: pluginapi.ContainerType_MAIN,
+				ResourceName:  string(v1.ResourceCPU),
+				Annotations: map[string]string{
+					consts.PodAnnotationQoSLevelKey:          consts.PodAnnotationQoSLevelDedicatedCores,
+					consts.PodAnnotationMemoryEnhancementKey: `{"numa_binding": "true", "numa_exclusive": "true"}`,
+				},
+				ResourceRequests: map[string]float64{
+					string(v1.ResourceCPU): 2,
+				},
+				Hint: &pluginapi.TopologyHint{
+					Nodes:     []uint64{0},
+					Preferred: true,
+				},
+			},
+			hook: func(oldAlloc, newAlloc *state.AllocationInfo) error {
+				if newAlloc.PodName == "error-dedicated-pod" {
+					return fmt.Errorf("hook injected error for dedicated")
+				}
+				return nil
+			},
+			expectErr:   true,
+			errContains: "hook injected error for dedicated",
+		},
+		{
+			name: "hook returns error for system_cores",
+			req: &pluginapi.ResourceRequest{
+				PodUid:        "error-system-pod-uid",
+				PodNamespace:  "default",
+				PodName:       "error-system-pod",
+				ContainerName: "c1",
+				ContainerType: pluginapi.ContainerType_MAIN,
+				ResourceName:  string(v1.ResourceCPU),
+				Annotations: map[string]string{
+					consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSystemCores,
+				},
+				ResourceRequests: map[string]float64{
+					string(v1.ResourceCPU): 1,
+				},
+			},
+			hook: func(oldAlloc, newAlloc *state.AllocationInfo) error {
+				if newAlloc.PodName == "error-system-pod" {
+					return fmt.Errorf("hook injected error for system")
+				}
+				return nil
+			},
+			expectErr:   true,
+			errContains: "hook injected error for system",
+		},
+		{
+			name: "hook returns error for sidecar container",
+			req: &pluginapi.ResourceRequest{
+				PodUid:        "error-sidecar-pod-uid",
+				PodNamespace:  "default",
+				PodName:       "error-sidecar-pod",
+				ContainerName: "c1",
+				ContainerType: pluginapi.ContainerType_SIDECAR,
+				ResourceName:  string(v1.ResourceCPU),
+				Annotations: map[string]string{
+					consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+				},
+				ResourceRequests: map[string]float64{
+					string(v1.ResourceCPU): 1,
+				},
+			},
+			hook: func(oldAlloc, newAlloc *state.AllocationInfo) error {
+				if newAlloc.PodName == "error-sidecar-pod" {
+					return fmt.Errorf("hook injected error for sidecar")
+				}
+				return nil
+			},
+			preRun: func(policy *DynamicPolicy) {
+				policy.state.SetAllocationInfo("error-sidecar-pod-uid", "main-c", &state.AllocationInfo{
+					AllocationMeta: commonstate.AllocationMeta{
+						PodUid:        "error-sidecar-pod-uid",
+						PodNamespace:  "default",
+						PodName:       "error-sidecar-pod",
+						ContainerName: "main-c",
+						ContainerType: pluginapi.ContainerType_MAIN.String(),
+					},
+					AllocationResult: machine.NewCPUSet(0, 1),
+				}, false)
+			},
+			expectErr:   true,
+			errContains: "hook injected error for sidecar",
+		},
+		{
+			name: "hook returns error for shared_cores with NUMA binding",
+			req: &pluginapi.ResourceRequest{
+				PodUid:        "error-shared-numa-pod-uid",
+				PodNamespace:  "default",
+				PodName:       "error-shared-numa-pod",
+				ContainerName: "c1",
+				ContainerType: pluginapi.ContainerType_MAIN,
+				ResourceName:  string(v1.ResourceCPU),
+				Annotations: map[string]string{
+					consts.PodAnnotationQoSLevelKey:          consts.PodAnnotationQoSLevelSharedCores,
+					consts.PodAnnotationMemoryEnhancementKey: `{"numa_binding": "true"}`,
+				},
+				ResourceRequests: map[string]float64{
+					string(v1.ResourceCPU): 2,
+				},
+				Hint: &pluginapi.TopologyHint{
+					Nodes:     []uint64{0},
+					Preferred: true,
+				},
+			},
+			hook: func(oldAlloc, newAlloc *state.AllocationInfo) error {
+				if newAlloc.PodName == "error-shared-numa-pod" {
+					return fmt.Errorf("hook injected error for shared numa")
+				}
+				return nil
+			},
+			expectErr:   true,
+			errContains: "hook injected error for shared numa",
+		},
+		{
+			name: "hook returns error for dedicated_cores without numa_binding",
+			req: &pluginapi.ResourceRequest{
+				PodUid:        "error-dedicated-no-numa-pod-uid",
+				PodNamespace:  "default",
+				PodName:       "error-dedicated-no-numa-pod",
+				ContainerName: "c1",
+				ContainerType: pluginapi.ContainerType_MAIN,
+				ResourceName:  string(v1.ResourceCPU),
+				Annotations: map[string]string{
+					consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelDedicatedCores,
+				},
+				ResourceRequests: map[string]float64{
+					string(v1.ResourceCPU): 2,
+				},
+			},
+			hook: func(oldAlloc, newAlloc *state.AllocationInfo) error {
+				return nil
+			},
+			expectErr:   true,
+			errContains: "not support dedicated_cores without NUMA binding",
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			tmpDir := t.TempDir()
+			topology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+			require.NoError(t, err)
+
+			policy, err := getTestDynamicPolicyWithInitialization(topology, tmpDir)
+			require.NoError(t, err)
+			defer func() {
+				_ = policy.Stop()
+			}()
+
+			if tc.preRun != nil {
+				tc.preRun(policy)
+			}
+
+			policy.RegisterAllocationHook(tc.hook)
+
+			resp, err := policy.Allocate(context.TODO(), tc.req)
+			if tc.expectErr {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tc.errContains)
+				require.Nil(t, resp)
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, resp)
+			}
+
+			if tc.verifyResult != nil {
+				tc.verifyResult(t, policy)
+			}
+		})
+	}
+}
+
+func TestDynamicPolicy_InvokeAllocationHooksForPodEntries(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name         string
+		setupHook    func(policy *DynamicPolicy)
+		verifyResult func(t *testing.T, err error, newEntries state.PodEntries)
+	}{
+		{
+			name:      "success without hooks",
+			setupHook: func(policy *DynamicPolicy) {},
+			verifyResult: func(t *testing.T, err error, newEntries state.PodEntries) {
+				require.NoError(t, err)
+			},
+		},
+		{
+			name: "success with hooks modifying allocation info",
+			setupHook: func(policy *DynamicPolicy) {
+				modifyHook := func(oldAlloc, newAlloc *state.AllocationInfo) error {
+					if oldAlloc != nil {
+						newAlloc.Annotations["hook-saw-old"] = oldAlloc.Annotations["old"]
+					} else {
+						newAlloc.Annotations["hook-saw-old"] = "false"
+					}
+					return nil
+				}
+				policy.RegisterAllocationHook(modifyHook)
+			},
+			verifyResult: func(t *testing.T, err error, newEntries state.PodEntries) {
+				require.NoError(t, err)
+				assert.Equal(t, "true", newEntries["pod-1"]["container-1"].Annotations["hook-saw-old"])
+				assert.Equal(t, "false", newEntries["pod-2"]["container-2"].Annotations["hook-saw-old"])
+			},
+		},
+		{
+			name: "hook returns error",
+			setupHook: func(policy *DynamicPolicy) {
+				errorHook := func(oldAlloc, newAlloc *state.AllocationInfo) error {
+					if newAlloc.PodUid == "pod-2" {
+						return fmt.Errorf("injected error for pod-2")
+					}
+					return nil
+				}
+				policy.RegisterAllocationHook(errorHook)
+			},
+			verifyResult: func(t *testing.T, err error, newEntries state.PodEntries) {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "invokeAllocationHooks failed for pod: pod-2")
+				assert.Contains(t, err.Error(), "injected error for pod-2")
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			tmpDir := t.TempDir()
+			topology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+			require.NoError(t, err)
+
+			policy, err := getTestDynamicPolicyWithInitialization(topology, tmpDir)
+			require.NoError(t, err)
+			defer func() {
+				_ = policy.Stop()
+			}()
+
+			curEntries := state.PodEntries{
+				"pod-1": state.ContainerEntries{
+					"container-1": &state.AllocationInfo{
+						AllocationMeta: commonstate.AllocationMeta{
+							PodUid:        "pod-1",
+							ContainerName: "container-1",
+							Annotations:   map[string]string{"old": "true"},
+						},
+					},
+				},
+				"pool-1": state.ContainerEntries{
+					"": &state.AllocationInfo{
+						AllocationMeta: commonstate.AllocationMeta{
+							PodUid:        "pool-1",
+							ContainerName: "",
+						},
+					},
+				},
+			}
+
+			newEntries := state.PodEntries{
+				"pod-1": state.ContainerEntries{
+					"container-1": &state.AllocationInfo{
+						AllocationMeta: commonstate.AllocationMeta{
+							PodUid:        "pod-1",
+							ContainerName: "container-1",
+							Annotations:   map[string]string{"new": "true"},
+						},
+					},
+				},
+				"pod-2": state.ContainerEntries{
+					"container-2": &state.AllocationInfo{
+						AllocationMeta: commonstate.AllocationMeta{
+							PodUid:        "pod-2",
+							ContainerName: "container-2",
+							Annotations:   map[string]string{"new": "true"},
+						},
+					},
+				},
+				"pool-1": state.ContainerEntries{
+					"": &state.AllocationInfo{
+						AllocationMeta: commonstate.AllocationMeta{
+							PodUid:        "pool-1",
+							ContainerName: "",
+						},
+					},
+				},
+			}
+
+			tc.setupHook(policy)
+			err = policy.invokeAllocationHooksForPodEntries(curEntries, newEntries)
+			tc.verifyResult(t, err, newEntries)
 		})
 	}
 }

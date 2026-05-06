@@ -1544,6 +1544,11 @@ func (p *DynamicPolicy) applyBlocks(blockCPUSet advisorapi.BlockCPUSet, resp *ad
 		}
 	}
 
+	// trigger allocation hooks for non-pool containers before committing to state.
+	if err := p.invokeAllocationHooksForPodEntries(curEntries, newEntries); err != nil {
+		return err
+	}
+
 	// use pod entries generated above to generate machine state info, and store in local state
 	newMachineState, err := generateMachineStateFromPodEntries(p.machineInfo.CPUTopology, newEntries, p.state.GetMachineState())
 	if err != nil {
