@@ -2316,3 +2316,84 @@ func TestMarkPreferredNUMANodes(t *testing.T) {
 		})
 	}
 }
+
+func TestVirtualGPUPlugin_calculateEnvVariables(t *testing.T) {
+	t.Parallel()
+
+	basePlugin := makeTestBasePlugin(t)
+	basePlugin.Conf.VirtualGPUMemoryWeightEnvName = "KUBE_GPU_MEMORY_WEIGHT"
+	basePlugin.Conf.VirtualGPUComputeWeightEnvName = "KUBE_GPU_COMPUTE_WEIGHT"
+	basePlugin.Conf.VirtualGPUTimesliceEnvName = "KUBE_GPU_TIMESLICE"
+	basePlugin.Conf.VirtualGPUTimesliceEnvValue = 1
+	basePlugin.Conf.VirtualGPUComputePolicyEnvName = "KUBE_GPU_COMPUTE_POLICY"
+	basePlugin.Conf.VirtualGPUComputePolicyEnvValue = 2
+	basePlugin.Conf.VirtualGPUVisibleDevicesEnvNames = []string{"NVIDIA_VISIBLE_DEVICES"}
+
+	resourcePlugin := NewVirtualGPUPlugin(basePlugin)
+	plugin, ok := resourcePlugin.(*VirtualGPUPlugin)
+	assert.True(t, ok)
+
+	tests := []struct {
+		name              string
+		resName           v1.ResourceName
+		allocatedDevices  []string
+		resQuantityPerGPU float64
+		expectedEnvs      map[string]string
+	}{
+		{
+			name:              "gpu memory weight single device",
+			resName:           consts.ResourceGPUMemory,
+			allocatedDevices:  []string{"gpu-0"},
+			resQuantityPerGPU: 5, // 5 / 10 = 50%
+			expectedEnvs: map[string]string{
+				"KUBE_GPU_MEMORY_WEIGHT": "gpu-0:50",
+			},
+		},
+		{
+			name:              "gpu memory weight multiple devices",
+			resName:           consts.ResourceGPUMemory,
+			allocatedDevices:  []string{"gpu-0", "gpu-1"},
+			resQuantityPerGPU: 5, // multiple devices -> no weight env
+			expectedEnvs:      nil,
+		},
+		{
+			name:              "milligpu weight single device",
+			resName:           consts.ResourceMilliGPU,
+			allocatedDevices:  []string{"gpu-0"},
+			resQuantityPerGPU: 250, // 250 / 1000 = 25%
+			expectedEnvs: map[string]string{
+				"KUBE_GPU_COMPUTE_WEIGHT": "gpu-0:25",
+				"KUBE_GPU_TIMESLICE":      "1",
+				"KUBE_GPU_COMPUTE_POLICY": "2",
+				"NVIDIA_VISIBLE_DEVICES":  "gpu-0",
+			},
+		},
+		{
+			name:              "milligpu multiple devices",
+			resName:           consts.ResourceMilliGPU,
+			allocatedDevices:  []string{"gpu-0", "gpu-1"},
+			resQuantityPerGPU: 250,
+			expectedEnvs: map[string]string{
+				"KUBE_GPU_TIMESLICE":      "1",
+				"KUBE_GPU_COMPUTE_POLICY": "2",
+				"NVIDIA_VISIBLE_DEVICES":  "gpu-0,gpu-1",
+			},
+		},
+		{
+			name:              "unknown resource",
+			resName:           v1.ResourceCPU,
+			allocatedDevices:  []string{"gpu-0"},
+			resQuantityPerGPU: 1,
+			expectedEnvs:      nil,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			envs := plugin.calculateEnvVariables(tt.resName, tt.allocatedDevices, tt.resQuantityPerGPU)
+			assert.Equal(t, tt.expectedEnvs, envs)
+		})
+	}
+}

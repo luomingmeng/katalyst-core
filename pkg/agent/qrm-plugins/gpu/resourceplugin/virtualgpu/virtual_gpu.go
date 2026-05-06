@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 
 	v1 "k8s.io/api/core/v1"
@@ -903,47 +904,67 @@ func (p *VirtualGPUPlugin) allocate(
 		}
 	}
 
-	p.mergeTimesliceAndPolicyEnvs(resourceAllocationEnvs)
-
 	return p.PackAllocationResponse(resourceReq, allocationInfoMap, nil, p.ResourceName(), resourceAllocationEnvs)
 }
 
-// mergeTimesliceAndPolicyEnvs merges the timeslice and policy environment variables into the resource allocation environments
-func (p *VirtualGPUPlugin) mergeTimesliceAndPolicyEnvs(resourceAllocationEnvs map[string]map[string]string) {
-	for _, envs := range resourceAllocationEnvs {
-		// Inject timeslice configuration for Virtual GPU isolation if the environment name is configured
-		if p.Conf.VirtualGPUTimesliceEnvName != "" {
-			envs[p.Conf.VirtualGPUTimesliceEnvName] = strconv.Itoa(p.Conf.VirtualGPUTimesliceEnvValue)
-		}
-		// Inject compute policy configuration for Virtual GPU isolation if the environment name is configured
-		if p.Conf.VirtualGPUComputePolicyEnvName != "" {
-			envs[p.Conf.VirtualGPUComputePolicyEnvName] = strconv.Itoa(p.Conf.VirtualGPUComputePolicyEnvValue)
-		}
+// calculateEnvVariables computes the environment variable map for a given GPU resource.
+func (p *VirtualGPUPlugin) calculateEnvVariables(resName v1.ResourceName, allocatedDevices []string, resQuantityPerGPU float64) map[string]string {
+	envs := make(map[string]string)
+
+	switch resName {
+	case consts.ResourceGPUMemory:
+		p.injectGPUMemoryEnvVariables(envs, allocatedDevices, resQuantityPerGPU)
+	case consts.ResourceMilliGPU:
+		p.injectMilliGPUEnvVariables(envs, allocatedDevices, resQuantityPerGPU)
+	}
+
+	if len(envs) > 0 {
+		return envs
+	}
+	return nil
+}
+
+// injectWeightEnvVariable calculates the allocated percentage of the given GPU resource and injects it as an environment variable.
+// It only applies when a single GPU device is allocated and the corresponding environment name is configured.
+func (p *VirtualGPUPlugin) injectWeightEnvVariable(envs map[string]string, resName v1.ResourceName, envName string, allocatedDevices []string, resQuantityPerGPU float64) {
+	if envName == "" || len(allocatedDevices) != 1 {
+		return
+	}
+
+	allocatableQuantity := p.getResourceAllocatableQuantity(resName)
+	if !allocatableQuantity.IsZero() {
+		// Calculate the allocated percentage of the GPU resource (minimum 1, max 100)
+		fraction := (resQuantityPerGPU / float64(allocatableQuantity.Value())) * 100
+		envs[envName] = fmt.Sprintf("%s:%.0f", allocatedDevices[0], fraction)
 	}
 }
 
-// calculateEnvVariables computes the environment variable map for a given GPU resource.
-// It calculates the allocated fraction percentage (granularity 1, max 100) and formats it
-// as "<deviceID>:<percentage>" when exactly one device is allocated.
-func (p *VirtualGPUPlugin) calculateEnvVariables(resName v1.ResourceName, allocatedDevices []string, resQuantityPerGPU float64) map[string]string {
-	envName := ""
-	if resName == consts.ResourceGPUMemory {
-		envName = p.Conf.VirtualGPUMemoryWeightEnvName
-	} else if resName == consts.ResourceMilliGPU {
-		envName = p.Conf.VirtualGPUComputeWeightEnvName
+// injectGPUMemoryEnvVariables injects the GPU memory allocation weight environment variable.
+func (p *VirtualGPUPlugin) injectGPUMemoryEnvVariables(envs map[string]string, allocatedDevices []string, resQuantityPerGPU float64) {
+	p.injectWeightEnvVariable(envs, consts.ResourceGPUMemory, p.Conf.VirtualGPUMemoryWeightEnvName, allocatedDevices, resQuantityPerGPU)
+}
+
+// injectMilliGPUEnvVariables injects the compute allocation weight, timeslice configuration, compute policy, and visible devices environment variables.
+func (p *VirtualGPUPlugin) injectMilliGPUEnvVariables(envs map[string]string, allocatedDevices []string, resQuantityPerGPU float64) {
+	p.injectWeightEnvVariable(envs, consts.ResourceMilliGPU, p.Conf.VirtualGPUComputeWeightEnvName, allocatedDevices, resQuantityPerGPU)
+
+	// Inject timeslice configuration for Virtual GPU isolation if the environment name is configured
+	if p.Conf.VirtualGPUTimesliceEnvName != "" {
+		envs[p.Conf.VirtualGPUTimesliceEnvName] = strconv.Itoa(p.Conf.VirtualGPUTimesliceEnvValue)
 	}
 
-	if envName != "" && len(allocatedDevices) == 1 {
-		allocatableQuantity := p.getResourceAllocatableQuantity(resName)
-		if !allocatableQuantity.IsZero() {
-			// Calculate the allocated percentage of the GPU resource (minimum 1, max 100)
-			fraction := (resQuantityPerGPU / float64(allocatableQuantity.Value())) * 100
-			return map[string]string{
-				envName: fmt.Sprintf("%s:%.0f", allocatedDevices[0], fraction),
-			}
+	// Inject compute policy configuration for Virtual GPU isolation if the environment name is configured
+	if p.Conf.VirtualGPUComputePolicyEnvName != "" {
+		envs[p.Conf.VirtualGPUComputePolicyEnvName] = strconv.Itoa(p.Conf.VirtualGPUComputePolicyEnvValue)
+	}
+
+	// Inject visible devices configuration
+	if len(p.Conf.VirtualGPUVisibleDevicesEnvNames) > 0 && len(allocatedDevices) > 0 {
+		visibleDevices := strings.Join(allocatedDevices, ",")
+		for _, env := range p.Conf.VirtualGPUVisibleDevicesEnvNames {
+			envs[env] = visibleDevices
 		}
 	}
-	return nil
 }
 
 func (p *VirtualGPUPlugin) generateDeviceRequestForMilliGPU(resourceReq *pluginapi.ResourceRequest) (*pluginapi.DeviceRequest, error) {

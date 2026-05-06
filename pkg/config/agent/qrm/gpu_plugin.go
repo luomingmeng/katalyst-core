@@ -44,6 +44,9 @@ type GPUQRMPluginConfig struct {
 	// If true, it sorts devices by available GPU memory and compute in descending order (spreading).
 	// If false, it sorts in ascending order (packing).
 	VirtualGPUPrefersSpreading bool
+	// VirtualGPUVisibleDevicesEnvNames is the environment variable names injected into the pod to specify
+	// the allocated Virtual GPU visible devices. The format will be "<deviceID1>,<deviceID2>,...".
+	VirtualGPUVisibleDevicesEnvNames []string
 	// VirtualGPUMemoryWeightEnvName is the environment variable name injected into the pod to specify
 	// the allocated GPU memory percentage. The format will be "<deviceID>:<percentage>",
 	// where the percentage is an integer from 1 to 100.

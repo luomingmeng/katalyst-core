@@ -26,40 +26,42 @@ import (
 )
 
 type GPUOptions struct {
-	PolicyName                      string
-	GPUDeviceNames                  []string
-	GPUMemoryAllocatablePerGPU      string
-	MilliGPUAllocatablePerGPU       string
-	SkipGPUStateCorruption          bool
-	RDMADeviceNames                 []string
-	RequiredDeviceAffinity          bool
-	EnableKubeletCheckpointFallback bool
-	VirtualGPUPrefersSpreading      bool
-	VirtualGPUMemoryWeightEnvName   string
-	VirtualGPUComputeWeightEnvName  string
-	VirtualGPUTimesliceEnvName      string
-	VirtualGPUComputePolicyEnvName  string
-	GPUSelectionResultAnnotationKey string
-	VirtualGPUTimesliceEnvValue     int
-	VirtualGPUComputePolicyEnvValue int
+	PolicyName                       string
+	GPUDeviceNames                   []string
+	GPUMemoryAllocatablePerGPU       string
+	MilliGPUAllocatablePerGPU        string
+	SkipGPUStateCorruption           bool
+	RDMADeviceNames                  []string
+	RequiredDeviceAffinity           bool
+	EnableKubeletCheckpointFallback  bool
+	VirtualGPUPrefersSpreading       bool
+	VirtualGPUVisibleDevicesEnvNames []string
+	VirtualGPUMemoryWeightEnvName    string
+	VirtualGPUComputeWeightEnvName   string
+	VirtualGPUTimesliceEnvName       string
+	VirtualGPUComputePolicyEnvName   string
+	GPUSelectionResultAnnotationKey  string
+	VirtualGPUTimesliceEnvValue      int
+	VirtualGPUComputePolicyEnvValue  int
 
 	GPUStrategyOptions *gpustrategy.GPUStrategyOptions
 }
 
 func NewGPUOptions() *GPUOptions {
 	return &GPUOptions{
-		PolicyName:                      "static",
-		GPUDeviceNames:                  []string{"nvidia.com/gpu"},
-		GPUMemoryAllocatablePerGPU:      "100",
-		MilliGPUAllocatablePerGPU:       "1000",
-		RDMADeviceNames:                 []string{},
-		GPUStrategyOptions:              gpustrategy.NewGPUStrategyOptions(),
-		RequiredDeviceAffinity:          true,
-		EnableKubeletCheckpointFallback: true,
-		VirtualGPUPrefersSpreading:      false,
-		GPUSelectionResultAnnotationKey: consts.PodAnnotationGPUSelectionResultKey,
-		VirtualGPUTimesliceEnvValue:     300,
-		VirtualGPUComputePolicyEnvValue: 0,
+		PolicyName:                       "static",
+		GPUDeviceNames:                   []string{"nvidia.com/gpu"},
+		GPUMemoryAllocatablePerGPU:       "100",
+		MilliGPUAllocatablePerGPU:        "1000",
+		RDMADeviceNames:                  []string{},
+		GPUStrategyOptions:               gpustrategy.NewGPUStrategyOptions(),
+		RequiredDeviceAffinity:           true,
+		EnableKubeletCheckpointFallback:  true,
+		VirtualGPUPrefersSpreading:       false,
+		VirtualGPUVisibleDevicesEnvNames: []string{"NVIDIA_VISIBLE_DEVICES"},
+		GPUSelectionResultAnnotationKey:  consts.PodAnnotationGPUSelectionResultKey,
+		VirtualGPUTimesliceEnvValue:      300,
+		VirtualGPUComputePolicyEnvValue:  0,
 	}
 }
 
@@ -82,6 +84,8 @@ func (o *GPUOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 		"enable fallback to kubelet device plugin checkpoint for device allocation.")
 	fs.BoolVar(&o.VirtualGPUPrefersSpreading, "virtual-gpu-prefers-spreading",
 		o.VirtualGPUPrefersSpreading, "whether virtual GPU prefers spreading across devices")
+	fs.StringSliceVar(&o.VirtualGPUVisibleDevicesEnvNames, "virtual-gpu-visible-devices-env-names",
+		o.VirtualGPUVisibleDevicesEnvNames, "The environment variable names for Virtual GPU visible devices")
 	fs.StringVar(&o.VirtualGPUMemoryWeightEnvName, "virtual-gpu-memory-weight-env-name",
 		o.VirtualGPUMemoryWeightEnvName, "The environment variable name for Virtual GPU memory weight")
 	fs.StringVar(&o.VirtualGPUComputeWeightEnvName, "virtual-gpu-compute-weight-env-name",
@@ -117,6 +121,7 @@ func (o *GPUOptions) ApplyTo(conf *qrmconfig.GPUQRMPluginConfig) error {
 	conf.RequiredDeviceAffinity = o.RequiredDeviceAffinity
 	conf.EnableKubeletCheckpointFallback = o.EnableKubeletCheckpointFallback
 	conf.VirtualGPUPrefersSpreading = o.VirtualGPUPrefersSpreading
+	conf.VirtualGPUVisibleDevicesEnvNames = o.VirtualGPUVisibleDevicesEnvNames
 	conf.VirtualGPUMemoryWeightEnvName = o.VirtualGPUMemoryWeightEnvName
 	conf.VirtualGPUComputeWeightEnvName = o.VirtualGPUComputeWeightEnvName
 	conf.VirtualGPUTimesliceEnvName = o.VirtualGPUTimesliceEnvName
