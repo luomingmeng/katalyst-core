@@ -594,6 +594,9 @@ func takeFreeCoresByNumaBalance(acc *cpuAccumulator) bool {
 					if acc.isSatisfied() {
 						return true
 					}
+					if !acc.needs(info.CPUsPerCore()) {
+						return false
+					}
 				}
 			}
 		}

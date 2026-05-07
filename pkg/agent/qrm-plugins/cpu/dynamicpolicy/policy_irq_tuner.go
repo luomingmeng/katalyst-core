@@ -160,6 +160,7 @@ func (p *DynamicPolicy) GetIRQForbiddenCores() (machine.CPUSet, error) {
 
 	// get irq forbidden cores from cpu plugin checkpoint
 	forbiddenCores = forbiddenCores.Union(p.reservedCPUs)
+	forbiddenCores = forbiddenCores.Union(state.GetUnitedPoolsCPUs(p.state.GetPodEntries(), commonstate.IsSystemPool))
 
 	// get irq forbidden cores from pinned resource package
 	irqForbiddenCPUSet := p.getPinnedResourcePackageIRQForbiddenCPUSet()

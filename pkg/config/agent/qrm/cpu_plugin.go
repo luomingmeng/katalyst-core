@@ -76,6 +76,8 @@ type CPUDynamicPolicyConfig struct {
 	// IRQForbiddenPinnedResourcePackageAttributeSelector is the selector to filter pinned resource packages that are
 	// forbidden for irq binding.
 	IRQForbiddenPinnedResourcePackageAttributeSelector labels.Selector
+	// EnableSystemExclusivePool indicates whether to enable exclusive cpu binding for pool of system cores
+	EnableSystemExclusivePool bool
 
 	*hintoptimizer.HintOptimizerConfiguration
 	*irqtuner.IRQTunerConfiguration

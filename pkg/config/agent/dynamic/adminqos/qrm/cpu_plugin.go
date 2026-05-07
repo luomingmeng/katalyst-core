@@ -16,10 +16,16 @@ limitations under the License.
 
 package qrm
 
-import "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic/crd"
+import (
+	"github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic/crd"
+)
 
 type CPUPluginConfiguration struct {
-	PreferUseExistNUMAHintResult bool
+	PreferUseExistNUMAHintResult   bool
+	SystemExclusivePool            map[string]int
+	SystemExclusivePoolShrinkRatio *float64
+	SystemExclusivePoolShrinkMin   *int64
+	SystemExclusivePoolShrinkMax   *int64
 }
 
 func NewCPUPluginConfiguration() *CPUPluginConfiguration {
@@ -33,5 +39,9 @@ func (c *CPUPluginConfiguration) ApplyConfiguration(conf *crd.DynamicConfigCRD) 
 		if config.PreferUseExistNUMAHintResult != nil {
 			c.PreferUseExistNUMAHintResult = *config.PreferUseExistNUMAHintResult
 		}
+		c.SystemExclusivePool = config.SystemExclusivePool
+		c.SystemExclusivePoolShrinkRatio = config.SystemExclusivePoolShrinkRatio
+		c.SystemExclusivePoolShrinkMin = config.SystemExclusivePoolShrinkMin
+		c.SystemExclusivePoolShrinkMax = config.SystemExclusivePoolShrinkMax
 	}
 }

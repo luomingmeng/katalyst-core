@@ -147,3 +147,10 @@ func GetSpecifiedNUMABindingPoolName(qosLevel string, annotations map[string]str
 
 	return GetNUMAPoolName(specifiedPoolName, numaID), nil
 }
+
+func GetSystemPoolName(poolName string) string {
+	if IsSystemPool(poolName) {
+		return poolName
+	}
+	return fmt.Sprintf("%s-%s", PoolNamePrefixSystem, poolName)
+}

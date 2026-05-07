@@ -321,16 +321,27 @@ func (pe PodEntries) GetFilteredPoolsCPUSet(ignorePools sets.String) machine.CPU
 	return ret
 }
 
-// GetFilteredPoolsCPUSetMap returns a mapping of pools for all of them (except for those skipped ones)
-func (pe PodEntries) GetFilteredPoolsCPUSetMap(ignorePools sets.String) (map[string]map[int]machine.CPUSet, error) {
+// GetFilteredPoolsCPUSetMap returns a mapping of pools for all of them (except for those filtered out by the filter)
+func (pe PodEntries) GetFilteredPoolsCPUSetMap(filter ...func(name string) bool) (map[string]map[int]machine.CPUSet, error) {
 	ret := make(map[string]map[int]machine.CPUSet)
 	if pe == nil {
 		return ret, nil
 	}
 
 	for poolName, entries := range pe {
+		filterOut := false
+		for _, f := range filter {
+			if f(poolName) {
+				filterOut = true
+				break
+			}
+		}
+		if filterOut {
+			continue
+		}
+
 		allocationInfo := entries.GetPoolEntry()
-		if allocationInfo != nil && !ignorePools.Has(poolName) {
+		if allocationInfo != nil {
 			cset := allocationInfo.AllocationResult.Clone()
 
 			// pool entry containing SharedNUMABinding containers also has SharedNUMABinding declarations,

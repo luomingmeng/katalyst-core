@@ -344,6 +344,14 @@ func TestDynamicPolicy_GetIRQForbiddenCores(t *testing.T) {
 	}
 	policy.state.SetMachineState(machineState, false)
 
+	systemPoolName := commonstate.GetSystemPoolName("latency")
+	systemPoolCPUSet := machine.NewCPUSet(4, 5)
+	policy.state.SetAllocationInfo(systemPoolName, commonstate.FakedContainerName, &state.AllocationInfo{
+		AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(systemPoolName),
+		AllocationResult:         systemPoolCPUSet,
+		OriginalAllocationResult: systemPoolCPUSet,
+	}, true)
+
 	// Configure attribute selector
 	selector, err := labels.Parse("type=forbidden")
 	require.NoError(t, err)
@@ -353,9 +361,9 @@ func TestDynamicPolicy_GetIRQForbiddenCores(t *testing.T) {
 	forbiddenCores, err := policy.GetIRQForbiddenCores()
 	require.NoError(t, err)
 
-	// Expected: Reserved CPUs (0, 1) + Pinned CPUs for pkg1 (2, 3) = (0, 1, 2, 3)
+	// Expected: Reserved CPUs (0, 1) + Pinned CPUs for pkg1 (2, 3) + system pool (4, 5) = (0, 1, 2, 3, 4, 5)
 	// pkg2 is excluded because type=allowed != type=forbidden
-	expected := machine.NewCPUSet(0, 1, 2, 3)
+	expected := machine.NewCPUSet(0, 1, 2, 3, 4, 5)
 	assert.True(t, expected.Equals(forbiddenCores), "expected %v, got %v", expected, forbiddenCores)
 }
 
@@ -429,6 +437,24 @@ func TestDynamicPolicy_SetExclusiveIRQCPUSet(t *testing.T) {
 
 		irqCPUSet := machine.NewCPUSet(forbidden.ToSliceInt()[0])
 		err = policyImpl.SetExclusiveIRQCPUSet(irqCPUSet)
+		as.ErrorIs(err, irqutil.ContainForbiddenCPUErr)
+	})
+
+	t.Run("contain system exclusive pool cpu", func(t *testing.T) {
+		t.Parallel()
+
+		as := require.New(t)
+		policyImpl := newTestDynamicPolicy(t, "set-exclusive-irq-cpuset-system-pool")
+
+		systemPoolName := commonstate.GetSystemPoolName("latency")
+		systemPoolCPUSet := machine.NewCPUSet(6, 8)
+		policyImpl.state.SetAllocationInfo(systemPoolName, commonstate.FakedContainerName, &state.AllocationInfo{
+			AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(systemPoolName),
+			AllocationResult:         systemPoolCPUSet,
+			OriginalAllocationResult: systemPoolCPUSet,
+		}, true)
+
+		err := policyImpl.SetExclusiveIRQCPUSet(machine.NewCPUSet(6))
 		as.ErrorIs(err, irqutil.ContainForbiddenCPUErr)
 	})
 

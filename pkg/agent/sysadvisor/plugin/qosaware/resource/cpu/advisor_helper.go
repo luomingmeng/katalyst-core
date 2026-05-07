@@ -162,15 +162,18 @@ func (cra *cpuResourceAdvisor) updateNumasAvailableResource() {
 	reservePoolInfo, _ := cra.metaCache.GetPoolInfo(commonstate.PoolNameReserve)
 
 	forbiddenCPUsMap := make(map[int]int)
-	for _, poolName := range state.ForbiddenPools.List() {
-		poolInfo, ok := cra.metaCache.GetPoolInfo(poolName)
-		if poolInfo == nil || !ok {
-			continue
+	cra.metaCache.RangePool(func(poolName string, poolInfo *types.PoolInfo) bool {
+		if poolInfo == nil {
+			return true
+		}
+		if !state.ForbiddenPools.Has(poolName) && !commonstate.IsSystemPool(poolName) {
+			return true
 		}
 		for numaID, cpuset := range poolInfo.TopologyAwareAssignments {
 			forbiddenCPUsMap[numaID] += cpuset.Size()
 		}
-	}
+		return true
+	})
 
 	cra.updateReservedForReclaim()
 

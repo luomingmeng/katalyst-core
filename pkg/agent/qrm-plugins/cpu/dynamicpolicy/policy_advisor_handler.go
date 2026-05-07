@@ -855,14 +855,9 @@ func (p *DynamicPolicy) allocateStaticAndForbiddenPools(resp *advisorapi.ListAnd
 		availableCPUs = availableCPUs.Difference(blockCPUSet[blockID])
 	}
 
-	for _, poolName := range state.ForbiddenPools.List() {
-		allocationInfo := p.state.GetAllocationInfo(poolName, commonstate.FakedContainerName)
-		if allocationInfo == nil {
-			continue
-		}
-
-		availableCPUs = availableCPUs.Difference(allocationInfo.AllocationResult.Clone())
-	}
+	// Deduct CPUs that should not be allocated to user containers.
+	notAllocatablePoolsCPUs := state.GetUnitedPoolsCPUs(p.state.GetPodEntries(), state.IsForbiddenPool, commonstate.IsSystemPool)
+	availableCPUs = availableCPUs.Difference(notAllocatablePoolsCPUs)
 	return availableCPUs, nil
 }
 
@@ -1408,6 +1403,28 @@ func (p *DynamicPolicy) applyBlocks(blockCPUSet advisorapi.BlockCPUSet, resp *ad
 		}
 	}
 
+	// deal with interrupt pools
+	if subEntry, ok := curEntries[commonstate.PoolNameInterrupt]; ok {
+		newEntries[commonstate.PoolNameInterrupt] = make(state.ContainerEntries)
+		if ai, ok := subEntry[commonstate.FakedContainerName]; ok && ai != nil {
+			newEntries[commonstate.PoolNameInterrupt][commonstate.FakedContainerName] = ai.Clone()
+		}
+	}
+
+	// deal with system exclusive pools
+	for name, subEntry := range curEntries {
+		if !commonstate.IsSystemPool(name) {
+			continue
+		}
+		if _, exists := newEntries[name]; exists {
+			return fmt.Errorf("system pool %s already exists", name)
+		}
+		newEntries[name] = make(state.ContainerEntries)
+		if ai, ok := subEntry[commonstate.FakedContainerName]; ok && ai != nil {
+			newEntries[name][commonstate.FakedContainerName] = ai.Clone()
+		}
+	}
+
 	// revise reclaim pool size to avoid reclaimed_cores and numa_binding dedicated_cores containers
 	// in NUMAs without cpuset actual binding
 	err := p.reviseReclaimPool(newEntries, nonReclaimActualBindingNUMAs, pooledUnionDedicatedCPUSet)
@@ -1421,11 +1438,13 @@ func (p *DynamicPolicy) applyBlocks(blockCPUSet advisorapi.BlockCPUSet, resp *ad
 		return fmt.Errorf("GetSharedBindingNUMAs failed with error: %v", err)
 	}
 	sharedBindingNUMACPUs := p.machineInfo.CPUDetails.CPUsInNUMANodes(sharedBindingNUMAs.UnsortedList()...)
+	notAllocatablePoolsCPUs := state.GetUnitedPoolsCPUs(p.state.GetPodEntries(), state.IsForbiddenPool, commonstate.IsSystemPool)
 	// rampUpCPUs include reclaim pool in NUMAs without NUMA_binding cpus
 	rampUpCPUs := p.machineInfo.CPUDetails.CPUs().
 		Difference(p.reservedCPUs).
 		Difference(dedicatedCPUSet).
-		Difference(sharedBindingNUMACPUs)
+		Difference(sharedBindingNUMACPUs).
+		Difference(notAllocatablePoolsCPUs)
 
 	rampUpCPUsTopologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, rampUpCPUs)
 	if err != nil {
@@ -1536,14 +1555,6 @@ func (p *DynamicPolicy) applyBlocks(blockCPUSet advisorapi.BlockCPUSet, resp *ad
 		}
 	}
 
-	// deal with interrupt pools
-	if subEntry, ok := curEntries[commonstate.PoolNameInterrupt]; ok {
-		newEntries[commonstate.PoolNameInterrupt] = make(state.ContainerEntries)
-		if ai, ok := subEntry[commonstate.FakedContainerName]; ok && ai != nil {
-			newEntries[commonstate.PoolNameInterrupt][commonstate.FakedContainerName] = ai.Clone()
-		}
-	}
-
 	// trigger allocation hooks for non-pool containers before committing to state.
 	if err := p.invokeAllocationHooksForPodEntries(curEntries, newEntries); err != nil {
 		return err
@@ -1611,15 +1622,11 @@ func (p *DynamicPolicy) applyNUMAHeadroom(resp *advisorapi.ListAndWatchResponse)
 }
 
 func (p *DynamicPolicy) reviseReclaimPool(newEntries state.PodEntries, nonReclaimActualBindingNUMAs, pooledUnionDedicatedCPUSet machine.CPUSet) error {
-	forbiddenCPUs, err := state.GetUnitedPoolsCPUs(state.ForbiddenPools, p.state.GetPodEntries())
-	if err != nil {
-		return fmt.Errorf("GetUnitedPoolsCPUs for forbidden pools failed with error: %v", err)
-	}
-
 	// if there is no block for state.PoolNameReclaim pool,
 	// we must make it existing here even if cause overlap
 	if newEntries.CheckPoolEmpty(commonstate.PoolNameReclaim) {
-		reclaimPoolCPUSet := p.machineInfo.CPUDetails.CPUs().Difference(p.reservedCPUs).Difference(pooledUnionDedicatedCPUSet).Difference(forbiddenCPUs)
+		notAllocatablePoolsCPUs := state.GetUnitedPoolsCPUs(p.state.GetPodEntries(), state.IsForbiddenPool, commonstate.IsSystemPool)
+		reclaimPoolCPUSet := p.machineInfo.CPUDetails.CPUs().Difference(p.reservedCPUs).Difference(pooledUnionDedicatedCPUSet).Difference(notAllocatablePoolsCPUs)
 		if reclaimPoolCPUSet.IsEmpty() {
 			reclaimPoolCPUSet = p.reservedReclaimedCPUSet.Clone()
 			general.Infof("fallback takeByNUMABalance for reclaimPoolCPUSet: %s", reclaimPoolCPUSet.String())

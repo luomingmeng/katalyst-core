@@ -61,6 +61,9 @@ type MetaReader interface {
 	GetPoolInfo(poolName string) (*types.PoolInfo, bool)
 	// GetPoolSize returns the size of pool as integer
 	GetPoolSize(poolName string) (int, bool)
+	// RangePool applies a function to every poolName, poolInfo set.
+	// If f returns false, range stops the iteration.
+	RangePool(f func(poolName string, poolInfo *types.PoolInfo) bool)
 
 	// GetRegionInfo returns a RegionInfo copy by region name
 	GetRegionInfo(regionName string) (*types.RegionInfo, bool)
@@ -273,6 +276,17 @@ func (mc *MetaCacheImp) GetPoolInfo(poolName string) (*types.PoolInfo, bool) {
 
 	poolInfo, ok := mc.poolEntries[poolName]
 	return poolInfo.Clone(), ok
+}
+
+func (mc *MetaCacheImp) RangePool(f func(poolName string, poolInfo *types.PoolInfo) bool) {
+	mc.poolMutex.RLock()
+	defer mc.poolMutex.RUnlock()
+
+	for poolName, poolInfo := range mc.poolEntries.Clone() {
+		if !f(poolName, poolInfo) {
+			break
+		}
+	}
 }
 
 func (mc *MetaCacheImp) GetPoolSize(poolName string) (int, bool) {
