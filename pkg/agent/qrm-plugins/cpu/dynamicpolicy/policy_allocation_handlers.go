@@ -133,7 +133,7 @@ func (p *DynamicPolicy) sharedCoresWithoutNUMABindingAllocationHandler(_ context
 					req.PodNamespace, req.PodName, req.ContainerName)
 				allocationInfo.RampUp = true
 			} else {
-				if err := p.updateAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, allocationInfo, persistCheckpoint); err != nil {
+				if err := p.updateAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, originAllocationInfo, allocationInfo, persistCheckpoint); err != nil {
 					return nil, err
 				}
 				_, err = p.doAndCheckPutAllocationInfo(allocationInfo, false, persistCheckpoint)
@@ -164,7 +164,7 @@ func (p *DynamicPolicy) sharedCoresWithoutNUMABindingAllocationHandler(_ context
 				req.PodNamespace, req.PodName, req.ContainerName, allocationInfo.RequestQuantity, reqFloat64)
 			allocationInfo.RequestQuantity = reqFloat64
 
-			if err := p.updateAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, allocationInfo, persistCheckpoint); err != nil {
+			if err := p.updateAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, originAllocationInfo, allocationInfo, persistCheckpoint); err != nil {
 				return nil, err
 			}
 			_, err := p.doAndCheckPutAllocationInfoPodResizingAware(originAllocationInfo, allocationInfo, false, true, persistCheckpoint)
@@ -189,7 +189,7 @@ func (p *DynamicPolicy) sharedCoresWithoutNUMABindingAllocationHandler(_ context
 		// update pod entries directly.
 		// if one of subsequent steps is failed,
 		// we will delete current allocationInfo from podEntries in defer function of allocation function.
-		if err := p.updateAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, allocationInfo, persistCheckpoint); err != nil {
+		if err := p.updateAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, originAllocationInfo, allocationInfo, persistCheckpoint); err != nil {
 			return nil, err
 		}
 		podEntries := p.state.GetPodEntries()
@@ -242,6 +242,7 @@ func (p *DynamicPolicy) reclaimedCoresAllocationHandler(ctx context.Context,
 	}
 
 	allocationInfo := p.state.GetAllocationInfo(req.PodUid, req.ContainerName)
+	originAllocationInfo := allocationInfo.Clone()
 	if util.PodInplaceUpdateResizing(req) {
 		if allocationInfo == nil {
 			return nil, fmt.Errorf("pod request to cpu inplace update resize, but origin allocationInfo is nil")
@@ -261,7 +262,7 @@ func (p *DynamicPolicy) reclaimedCoresAllocationHandler(ctx context.Context,
 		general.Infof("pod: %s/%s, container: %s request to cpu inplace update resize allocation, request: %.2f->%.2f",
 			req.PodNamespace, req.PodName, req.ContainerName, allocationInfo.RequestQuantity, reqFloat64)
 		allocationInfo.RequestQuantity = reqFloat64
-		if err := p.updateAllocationInfo(req.PodUid, req.ContainerName, allocationInfo, persistCheckpoint); err != nil {
+		if err := p.updateAllocationInfo(req.PodUid, req.ContainerName, originAllocationInfo, allocationInfo, persistCheckpoint); err != nil {
 			return nil, err
 		}
 	} else {
@@ -306,7 +307,7 @@ func (p *DynamicPolicy) reclaimedCoresAllocationHandler(ctx context.Context,
 
 		// update pod entries directly.
 		// if one of subsequent steps is failed, we will delete current allocationInfo from podEntries in defer function of allocation function.
-		if err := p.updateAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, allocationInfo, persistCheckpoint); err != nil {
+		if err := p.updateAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, originAllocationInfo, allocationInfo, persistCheckpoint); err != nil {
 			return nil, err
 		}
 
@@ -497,7 +498,7 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 
 	// update pod entries directly.
 	// if one of subsequent steps is failed, we will delete current allocationInfo from podEntries in defer function of allocation function.
-	if err := p.updateAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, allocationInfo, persistCheckpoint); err != nil {
+	if err := p.updateAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, nil, allocationInfo, persistCheckpoint); err != nil {
 		return nil, err
 	}
 	podEntries := p.state.GetPodEntries()
@@ -573,7 +574,7 @@ func (p *DynamicPolicy) allocationSidecarHandler(_ context.Context,
 
 	// update pod entries directly.
 	// if one of subsequent steps is failed, we will delete current allocationInfo from podEntries in defer function of allocation function.
-	if err := p.updateAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, allocationInfo, persistCheckpoint); err != nil {
+	if err := p.updateAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, nil, allocationInfo, persistCheckpoint); err != nil {
 		return nil, err
 	}
 	podEntries = p.state.GetPodEntries()
@@ -820,7 +821,7 @@ func (p *DynamicPolicy) allocateSharedNumaBindingCPUs(req *pluginapi.ResourceReq
 
 		general.Infof("pod: %s/%s, container: %s request to cpu inplace update resize allocation (%.02f->%.02f)",
 			req.PodNamespace, req.PodName, req.ContainerName, originAllocationInfo.RequestQuantity, allocationInfo.RequestQuantity)
-		if err := p.updateAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, allocationInfo, persistCheckpoint); err != nil {
+		if err := p.updateAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, originAllocationInfo, allocationInfo, persistCheckpoint); err != nil {
 			return nil, err
 		}
 		checkedAllocationInfo, err := p.doAndCheckPutAllocationInfoPodResizingAware(originAllocationInfo, allocationInfo, false, true, persistCheckpoint)
@@ -832,7 +833,7 @@ func (p *DynamicPolicy) allocateSharedNumaBindingCPUs(req *pluginapi.ResourceReq
 		}
 		return checkedAllocationInfo, nil
 	} else {
-		if err := p.updateAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, allocationInfo, persistCheckpoint); err != nil {
+		if err := p.updateAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, nil, allocationInfo, persistCheckpoint); err != nil {
 			return nil, err
 		}
 		checkedAllocationInfo, err := p.doAndCheckPutAllocationInfo(allocationInfo, true, persistCheckpoint)
@@ -2193,7 +2194,7 @@ func (p *DynamicPolicy) systemCoresAllocationHandler(ctx context.Context, req *p
 	allocationInfo.TopologyAwareAssignments = topologyAwareAssignments
 	allocationInfo.OriginalTopologyAwareAssignments = machine.DeepcopyCPUAssignment(topologyAwareAssignments)
 
-	if err := p.updateAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, allocationInfo, persistCheckpoint); err != nil {
+	if err := p.updateAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, nil, allocationInfo, persistCheckpoint); err != nil {
 		return nil, err
 	}
 	podEntries := p.state.GetPodEntries()

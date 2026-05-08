@@ -565,6 +565,7 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 			if allocationInfo == nil {
 				continue
 			}
+			originAllocationInfo := allocationInfo
 			allocationInfo = allocationInfo.Clone()
 
 			// sync allocation info from main container to sidecar
@@ -572,7 +573,7 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 				if p.applySidecarAllocationInfoFromMainContainer(allocationInfo, mainContainerAllocationInfo) {
 					general.Infof("pod: %s/%s, container: %s sync allocation info from main container",
 						allocationInfo.PodNamespace, allocationInfo.PodName, containerName)
-					if err := p.updateAllocationInfo(podUID, containerName, allocationInfo, true); err != nil {
+					if err := p.updateAllocationInfo(podUID, containerName, originAllocationInfo, allocationInfo, true); err != nil {
 						general.Errorf("updateAllocationInfo failed for pod: %s/%s, container: %s: %v",
 							allocationInfo.PodNamespace, allocationInfo.PodName, containerName, err)
 						continue
@@ -600,14 +601,14 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 				}
 
 				allocationInfo.InitTimestamp = time.Now().Format(util.QRMTimeFormat)
-				if err := p.updateAllocationInfo(podUID, containerName, allocationInfo, true); err != nil {
+				if err := p.updateAllocationInfo(podUID, containerName, originAllocationInfo, allocationInfo, true); err != nil {
 					general.Errorf("updateAllocationInfo failed for pod: %s/%s, container: %s: %v",
 						allocationInfo.PodNamespace, allocationInfo.PodName, containerName, err)
 				}
 			} else if allocationInfo.RampUp && time.Now().After(initTs.Add(p.transitionPeriod)) {
 				general.Infof("pod: %s/%s, container: %s ramp up finished", allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName)
 				allocationInfo.RampUp = false
-				if err := p.updateAllocationInfo(podUID, containerName, allocationInfo, true); err != nil {
+				if err := p.updateAllocationInfo(podUID, containerName, originAllocationInfo, allocationInfo, true); err != nil {
 					general.Errorf("updateAllocationInfo failed for pod: %s/%s, container: %s: %v",
 						allocationInfo.PodNamespace, allocationInfo.PodName, containerName, err)
 					continue
@@ -1485,9 +1486,11 @@ func (p *DynamicPolicy) invokeAllocationHooksForPodEntries(curEntries, newEntrie
 
 // updateAllocationInfo wraps state.SetAllocationInfo with hook execution.
 // If no hooks are registered, it avoids the overhead of retrieving the old allocation info.
-func (p *DynamicPolicy) updateAllocationInfo(podUID, containerName string, allocationInfo *state.AllocationInfo, persist bool) error {
+func (p *DynamicPolicy) updateAllocationInfo(podUID, containerName string, oldAllocationInfo, allocationInfo *state.AllocationInfo, persist bool) error {
 	if len(p.allocationHooks) > 0 {
-		oldAllocationInfo := p.state.GetAllocationInfo(podUID, containerName)
+		if oldAllocationInfo == nil {
+			oldAllocationInfo = p.state.GetAllocationInfo(podUID, containerName)
+		}
 		if err := p.invokeAllocationHooks(oldAllocationInfo, allocationInfo); err != nil {
 			return err
 		}
