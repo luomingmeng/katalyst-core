@@ -23,12 +23,14 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/kubewharf/katalyst-core/pkg/metrics"
 )
 
 func TestDeviceTopologyRegistry_TopologyChangeNotifiers(t *testing.T) {
 	t.Parallel()
 
-	registry := NewDeviceTopologyRegistry()
+	registry := NewDeviceTopologyRegistry(metrics.DummyMetrics{})
 	registry.RegisterDeviceTopologyProvider("gpu", NewDeviceTopologyProviderStub())
 
 	callCount := 0
@@ -105,7 +107,7 @@ func TestDeviceTopologyRegistry_GetDeviceNUMAAffinity(t *testing.T) {
 	}
 
 	// Register device topology providers
-	registry := NewDeviceTopologyRegistry()
+	registry := NewDeviceTopologyRegistry(metrics.DummyMetrics{})
 	registry.RegisterDeviceTopologyProvider("npu", NewDeviceTopologyProviderStub())
 	registry.RegisterDeviceTopologyProvider("gpu", NewDeviceTopologyProviderStub())
 	registry.RegisterDeviceTopologyProvider("xpu", NewDeviceTopologyProviderStub())
@@ -382,7 +384,7 @@ func TestDeviceTopologyRegistry_runAffinityProviders(t *testing.T) {
 	stopCh := make(chan struct{})
 
 	// Set up the device topology registry and register the affinity provider stub
-	registry := NewDeviceTopologyRegistry()
+	registry := NewDeviceTopologyRegistry(metrics.DummyMetrics{})
 	affinityProviderWithValidChannel := newAffinityProviderStub(false)
 	registry.RegisterDeviceTopologyProvider("test", NewDeviceTopologyProviderStub())
 	registry.RegisterTopologyAffinityProvider("test", affinityProviderWithValidChannel)
@@ -423,7 +425,7 @@ func TestDeviceTopologyRegistry_runAffinityProviders(t *testing.T) {
 func TestDeviceTopologyRegistry_GetDeviceTopologies(t *testing.T) {
 	t.Parallel()
 
-	registry := NewDeviceTopologyRegistry()
+	registry := NewDeviceTopologyRegistry(metrics.DummyMetrics{})
 	gpu1Provider := NewDeviceTopologyProviderStub()
 	gpu2Provider := NewDeviceTopologyProviderStub()
 	registry.RegisterDeviceTopologyProvider("gpu-1", gpu1Provider)
@@ -506,7 +508,7 @@ func TestDeviceInfo_GetDimensions(t *testing.T) {
 func TestDeviceTopologyRegistry_GetLatestDeviceTopology(t *testing.T) {
 	t.Parallel()
 
-	registry := NewDeviceTopologyRegistry()
+	registry := NewDeviceTopologyRegistry(metrics.DummyMetrics{})
 	gpu1Provider := NewDeviceTopologyProviderStub()
 	gpu2Provider := NewDeviceTopologyProviderStub()
 	registry.RegisterDeviceTopologyProvider("gpu-1", gpu1Provider)

@@ -71,9 +71,11 @@ type BasePlugin struct {
 }
 
 func NewBasePlugin(
-	agentCtx *agent.GenericContext, conf *config.Configuration, wrappedEmitter metrics.MetricEmitter,
+	agentCtx *agent.GenericContext,
+	conf *config.Configuration,
+	wrappedEmitter metrics.MetricEmitter,
 ) (*BasePlugin, error) {
-	deviceTopologyRegistry := machine.NewDeviceTopologyRegistry()
+	deviceTopologyRegistry := machine.NewDeviceTopologyRegistry(wrappedEmitter)
 
 	basePlugin := &BasePlugin{
 		Conf: conf,

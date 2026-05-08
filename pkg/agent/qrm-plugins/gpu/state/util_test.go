@@ -21,13 +21,14 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
 func TestGenerateDefaultResourceState_MultiDevices(t *testing.T) {
 	t.Parallel()
 
-	registry := machine.NewDeviceTopologyRegistry()
+	registry := machine.NewDeviceTopologyRegistry(metrics.DummyMetrics{})
 	registry.RegisterDeviceTopologyProvider("gpu-1", machine.NewDeviceTopologyProviderStub())
 	registry.RegisterDeviceTopologyProvider("gpu-2", machine.NewDeviceTopologyProviderStub())
 
@@ -58,7 +59,7 @@ func TestGenerateDefaultResourceState_MultiDevices(t *testing.T) {
 func TestGenerateDefaultResourceState_PartialMissing(t *testing.T) {
 	t.Parallel()
 
-	registry := machine.NewDeviceTopologyRegistry()
+	registry := machine.NewDeviceTopologyRegistry(metrics.DummyMetrics{})
 	registry.RegisterDeviceTopologyProvider("gpu-1", machine.NewDeviceTopologyProviderStub())
 
 	topo1 := &machine.DeviceTopology{
