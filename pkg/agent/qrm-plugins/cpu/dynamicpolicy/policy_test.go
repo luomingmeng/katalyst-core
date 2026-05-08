@@ -72,7 +72,6 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/spd"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	metricspool "github.com/kubewharf/katalyst-core/pkg/metrics/metrics-pool"
-	"github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 	cgroupcm "github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 	cgroupcmutils "github.com/kubewharf/katalyst-core/pkg/util/cgroup/manager"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
@@ -168,7 +167,14 @@ func getTestDynamicPolicyWithoutInitialization(
 		numaNumberAnnotationKey:   consts.PodAnnotationCPUEnhancementNumaNumber,
 		numaIDsAnnotationKey:      consts.PodAnnotationCPUEnhancementNumaIDs,
 		resourcePackageManager:    resourcepackage.NewCachedResourcePackageManager(resourcepackage.NewResourcePackageManager(&npd.DummyNPDFetcher{NPD: &nodev1alpha1.NodeProfileDescriptor{}})),
+
+		topologyAllocationAnnotationKey: coreconsts.QRMPodAnnotationTopologyAllocationKey,
 	}
+
+	// Important: We must register the topologyAllocationHook and set the annotation keys
+	// to ensure that the test environment correctly generates NUMA topology annotations
+	// in the allocation response, matching the production behavior.
+	policyImplement.RegisterAllocationHook(policyImplement.topologyAllocationHook)
 
 	// register allocation behaviors for pods with different QoS level
 	policyImplement.allocationHandlers = map[string]util.AllocationHandler{
@@ -441,6 +447,9 @@ func TestAllocate(t *testing.T) {
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{nil},
 							},
+							Annotations: map[string]string{
+								consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+							},
 						},
 					},
 				},
@@ -496,6 +505,9 @@ func TestAllocate(t *testing.T) {
 							},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{nil},
+							},
+							Annotations: map[string]string{
+								consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelReclaimedCores,
 							},
 						},
 					},
@@ -561,7 +573,10 @@ func TestAllocate(t *testing.T) {
 								},
 							},
 							Annotations: map[string]string{
-								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"cpu":"3"},"attributes":{"CpusetCpus":"1,8-9"}}}}`,
+								consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelDedicatedCores,
+								consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+								consts.PodAnnotationMemoryEnhancementNumaExclusive: consts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
+								coreconsts.QRMPodAnnotationTopologyAllocationKey:   `{"Numa":{"0":{"allocated":{"cpu":"3"},"attributes":{"CpusetCpus":"1,8-9"}}}}`,
 							},
 						},
 					},
@@ -629,7 +644,11 @@ func TestAllocate(t *testing.T) {
 								},
 							},
 							Annotations: map[string]string{
-								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"cpu":"2"},"attributes":{"CpusetCpus":"1,9"}}}}`,
+								consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelDedicatedCores,
+								consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+								consts.PodAnnotationMemoryEnhancementNumaExclusive: "false",
+								cpuconsts.CPUStateAnnotationKeyNUMAHint:            "0",
+								coreconsts.QRMPodAnnotationTopologyAllocationKey:   `{"Numa":{"0":{"allocated":{"cpu":"2"},"attributes":{"CpusetCpus":"1,9"}}}}`,
 							},
 						},
 					},
@@ -697,7 +716,10 @@ func TestAllocate(t *testing.T) {
 								},
 							},
 							Annotations: map[string]string{
-								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"cpu":"3"},"attributes":{"CpusetCpus":"1,8-9"}}}}`,
+								consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelDedicatedCores,
+								consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+								consts.PodAnnotationMemoryEnhancementNumaExclusive: consts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
+								coreconsts.QRMPodAnnotationTopologyAllocationKey:   `{"Numa":{"0":{"allocated":{"cpu":"3"},"attributes":{"CpusetCpus":"1,8-9"}}}}`,
 							},
 						},
 					},
@@ -768,6 +790,9 @@ func TestAllocate(t *testing.T) {
 								},
 							},
 							Annotations: map[string]string{
+								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelDedicatedCores,
+								consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+								cpuconsts.CPUStateAnnotationKeyNUMAHint:          "0",
 								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"cpu":"2"},"attributes":{"CpusetCpus":"1,9"}}}}`,
 							},
 						},
@@ -835,6 +860,9 @@ func TestAllocate(t *testing.T) {
 								},
 							},
 							Annotations: map[string]string{
+								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelSharedCores,
+								consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+								cpuconsts.CPUStateAnnotationKeyNUMAHint:          "0",
 								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"cpu":"2"}}}}`,
 							},
 						},
@@ -903,6 +931,9 @@ func TestAllocate(t *testing.T) {
 								},
 							},
 							Annotations: map[string]string{
+								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelSharedCores,
+								consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+								cpuconsts.CPUStateAnnotationKeyNUMAHint:          "0",
 								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"cpu":"300m"}}}}`,
 							},
 						},
@@ -999,6 +1030,9 @@ func TestAllocate(t *testing.T) {
 								},
 							},
 							Annotations: map[string]string{
+								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelSharedCores,
+								consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+								cpuconsts.CPUStateAnnotationKeyNUMAHint:          "0",
 								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"cpu":"1"}}}}`,
 							},
 						},
@@ -1057,6 +1091,10 @@ func TestAllocate(t *testing.T) {
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{nil},
 							},
+							Annotations: map[string]string{
+								"cpuset_pool":                   "reserve",
+								consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSystemCores,
+							},
 						},
 					},
 				},
@@ -1113,6 +1151,9 @@ func TestAllocate(t *testing.T) {
 							},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{nil},
+							},
+							Annotations: map[string]string{
+								consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSystemCores,
 							},
 						},
 					},
@@ -1179,6 +1220,9 @@ func TestAllocate(t *testing.T) {
 								},
 							},
 							Annotations: map[string]string{
+								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelReclaimedCores,
+								consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+								cpuconsts.CPUStateAnnotationKeyNUMAHint:          "0",
 								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"cpu":"300m"}}}}`,
 							},
 						},
@@ -1249,6 +1293,10 @@ func TestAllocate(t *testing.T) {
 									},
 								},
 							},
+							Annotations: map[string]string{
+								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelReclaimedCores,
+								consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+							},
 						},
 					},
 				},
@@ -1317,7 +1365,11 @@ func TestAllocate(t *testing.T) {
 								},
 							},
 							Annotations: map[string]string{
-								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"2":{"allocated":{"cpu":"2"},"attributes":{"CpusetCpus":"4,12"}},"3":{"allocated":{"cpu":"2"},"attributes":{"CpusetCpus":"6,14"}}}}`,
+								consts.PodAnnotationQoSLevelKey:                              consts.PodAnnotationQoSLevelDedicatedCores,
+								consts.PodAnnotationMemoryEnhancementNumaBinding:             consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+								consts.PodAnnotationCPUEnhancementDistributeEvenlyAcrossNuma: consts.PodAnnotationCPUEnhancementDistributeEvenlyAcrossNumaEnable,
+								consts.PodAnnotationCPUEnhancementNumaNumber:                 "2",
+								coreconsts.QRMPodAnnotationTopologyAllocationKey:             `{"Numa":{"2":{"allocated":{"cpu":"2"},"attributes":{"CpusetCpus":"4,12"}},"3":{"allocated":{"cpu":"2"},"attributes":{"CpusetCpus":"6,14"}}}}`,
 							},
 						},
 					},
@@ -1388,6 +1440,10 @@ func TestAllocate(t *testing.T) {
 								},
 							},
 							Annotations: map[string]string{
+								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelDedicatedCores,
+								consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+								cpuconsts.CPUStateAnnotationKeyNUMAHint:          "2",
+								"full_pcpus_pairing":                             "true",
 								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"2":{"allocated":{"cpu":"2"},"attributes":{"CpusetCpus":"4,12"}}}}`,
 							},
 						},
@@ -1488,7 +1544,12 @@ func TestAllocate(t *testing.T) {
 								},
 							},
 							Annotations: map[string]string{
-								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"2":{"allocated":{"cpu":"3"},"attributes":{"CpusetCpus":"4-5,12"}},"3":{"allocated":{"cpu":"3"},"attributes":{"CpusetCpus":"6-7,14"}}}}`,
+								consts.PodAnnotationQoSLevelKey:                              consts.PodAnnotationQoSLevelDedicatedCores,
+								consts.PodAnnotationMemoryEnhancementNumaBinding:             consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+								consts.PodAnnotationCPUEnhancementDistributeEvenlyAcrossNuma: consts.PodAnnotationCPUEnhancementDistributeEvenlyAcrossNumaEnable,
+								consts.PodAnnotationCPUEnhancementFullPCPUsPairing:           consts.PodAnnotationCPUEnhancementFullPCPUsPairingEnable,
+								consts.PodAnnotationCPUEnhancementNumaNumber:                 "2",
+								coreconsts.QRMPodAnnotationTopologyAllocationKey:             `{"Numa":{"2":{"allocated":{"cpu":"3"},"attributes":{"CpusetCpus":"4-5,12"}},"3":{"allocated":{"cpu":"3"},"attributes":{"CpusetCpus":"6-7,14"}}}}`,
 							},
 						},
 					},
@@ -1561,6 +1622,9 @@ func TestAllocate(t *testing.T) {
 								},
 							},
 							Annotations: map[string]string{
+								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelDedicatedCores,
+								consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+								consts.PodAnnotationCPUEnhancementNumaNumber:     "2",
 								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"2":{"allocated":{"cpu":"4"},"attributes":{"CpusetCpus":"4-5,12-13"}},"3":{"allocated":{"cpu":"2"},"attributes":{"CpusetCpus":"6,14"}}}}`,
 							},
 						},
@@ -5712,6 +5776,9 @@ func TestGetResourcesAllocation(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 10,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+		},
 	}, resp1.PodResources[req.PodUid].ContainerResources[testName].ResourceAllocation[string(v1.ResourceCPU)])
 
 	// test after ramping up
@@ -5736,6 +5803,9 @@ func TestGetResourcesAllocation(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 10,
 		AllocationResult:  machine.NewCPUSet(1, 3, 4, 5, 6, 7, 8, 9, 10, 11).String(),
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+		},
 	}, resp2.PodResources[req.PodUid].ContainerResources[testName].ResourceAllocation[string(v1.ResourceCPU)])
 
 	// test for reclaimed_cores
@@ -5773,6 +5843,9 @@ func TestGetResourcesAllocation(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 4,
 		AllocationResult:  machine.NewCPUSet(12, 13, 14, 15).String(),
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelReclaimedCores,
+		},
 	}, resp2.PodResources[req.PodUid].ContainerResources[testName].ResourceAllocation[string(v1.ResourceCPU)])
 
 	req = &pluginapi.ResourceRequest{
@@ -5836,6 +5909,9 @@ func TestGetResourcesAllocation(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 14,
 		AllocationResult:  machine.NewCPUSet(1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15).String(),
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+		},
 	}, resp3.PodResources[req.PodUid].ContainerResources[testName].ResourceAllocation[string(v1.ResourceCPU)])
 
 	reclaimEntry := dynamicPolicy.state.GetAllocationInfo(commonstate.PoolNameReclaim, "")
@@ -7453,28 +7529,35 @@ func TestCheckCPUSet(t *testing.T) {
 }
 
 func TestSchedIdle(t *testing.T) {
+	// this test is used to verify the sched idle support status
 	t.Parallel()
 
 	as := require.New(t)
 
+	// check if cpu.idle file exists in cgroup mount point
 	_, err1 := os.Stat("/sys/fs/cgroup/cpu/kubepods/cpu.idle")
 	_, err2 := os.Stat("/sys/fs/cgroup/kubepods/cpu.idle")
 
 	support := err1 == nil && err2 == nil
 
+	// verify if IsCPUIdleSupported returns the correct status
 	as.Equalf(support, cgroupcm.IsCPUIdleSupported(), "sched idle support status isn't correct")
 
 	if cgroupcm.IsCPUIdleSupported() {
-		absCgroupPath := common.GetAbsCgroupPath("cpu", "test")
+		// get absolute cgroup path for the given subsystem and relative path
+		absCgroupPath := cgroupcm.GetAbsCgroupPath("cpu", "test")
 
 		fs := &utilfs.DefaultFs{}
+		// create cgroup directory for testing
 		err := fs.MkdirAll(absCgroupPath, 0o755)
 
 		as.Nil(err)
 
 		var enableCPUIdle bool
+		// apply cpu idle configuration
 		_ = cgroupcmutils.ApplyCPUWithRelativePath("test", &cgroupcm.CPUData{CpuIdlePtr: &enableCPUIdle})
 
+		// verify if cpu.idle file is updated correctly
 		contents, err := ioutil.ReadFile(filepath.Join(absCgroupPath, "cpu.idle")) //nolint:gosec
 		as.Nil(err)
 
