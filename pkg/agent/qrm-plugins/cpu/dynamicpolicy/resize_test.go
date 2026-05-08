@@ -118,6 +118,13 @@ func TestSNBVPA(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 3, // 分配到numa0    (cpu0 -> reserved, cpu1,cpu8,cpu9 for snb)
 		AllocationResult:  "1,8-9",
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
+			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			consts.PodAnnotationMemoryEnhancementNumaExclusive: "false",
+			cpuconsts.CPUStateAnnotationKeyNUMAHint:            "0",
+			coreconsts.QRMPodAnnotationTopologyAllocationKey:   `{"Numa":{"0":{"allocated":{"cpu":"2"}}}}`,
+		},
 	}, resp1.PodResources[req.PodUid].ContainerResources[testName].ResourceAllocation[string(v1.ResourceCPU)])
 
 	// resize exceed
@@ -209,6 +216,14 @@ func TestSNBVPA(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 3, // 分配到numa0    (cpu0 -> reserved, cpu1,cpu8,cpu9 for snb)
 		AllocationResult:  "1,8-9",
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
+			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			consts.PodAnnotationMemoryEnhancementNumaExclusive: "false",
+			cpuconsts.CPUStateAnnotationKeyNUMAHint:            "0",
+			consts.PodAnnotationInplaceUpdateResizingKey:       "true",
+			coreconsts.QRMPodAnnotationTopologyAllocationKey:   `{"Numa":{"0":{"allocated":{"cpu":"3"}}}}`,
+		},
 	}, resp1.PodResources[req.PodUid].ContainerResources[testName].ResourceAllocation[string(v1.ResourceCPU)])
 }
 
@@ -359,6 +374,14 @@ func TestSNBInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 11, // 分配到numa0    (cpu0 -> reserved, cpu1~cpu5,cpu24~cpu29 for snb)
 		AllocationResult:  "1-5,24-29",
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
+			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			consts.PodAnnotationMemoryEnhancementNumaExclusive: "false",
+			cpuconsts.CPUStateAnnotationKeyNUMAHint:            "0",
+			consts.PodAnnotationAggregatedRequestsKey:          "{\"cpu\":\"3\"}",
+			coreconsts.QRMPodAnnotationTopologyAllocationKey:   `{"Numa":{"0":{"allocated":{"cpu":"3"}}}}`,
+		},
 	}, allocationRes.PodResources[mainReq.PodUid].ContainerResources[mainContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
 	// reallocate for sidecar
@@ -381,6 +404,14 @@ func TestSNBInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 11, // 分配到numa0    (cpu0 -> reserved, cpu1~cpu5,cpu24~cpu29 for snb)
 		AllocationResult:  "1-5,24-29",
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
+			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			consts.PodAnnotationMemoryEnhancementNumaExclusive: "false",
+			cpuconsts.CPUStateAnnotationKeyNUMAHint:            "0",
+			consts.PodAnnotationAggregatedRequestsKey:          "{\"cpu\":\"3\"}",
+			coreconsts.QRMPodAnnotationTopologyAllocationKey:   `{"Numa":{"0":{"allocated":{"cpu":"3"}}}}`,
+		},
 	}, allocationRes.PodResources[mainReq.PodUid].ContainerResources[sidecarContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
 	// check container allocation request
@@ -456,6 +487,15 @@ func TestSNBInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 11, // 分配到numa0    (cpu0 -> reserved, cpu1~cpu5,cpu24~cpu29 for snb)
 		AllocationResult:  "1-5,24-29",
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
+			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			consts.PodAnnotationMemoryEnhancementNumaExclusive: "false",
+			cpuconsts.CPUStateAnnotationKeyNUMAHint:            "0",
+			consts.PodAnnotationInplaceUpdateResizingKey:       "true",
+			consts.PodAnnotationAggregatedRequestsKey:          "{\"cpu\":\"4\"}",
+			coreconsts.QRMPodAnnotationTopologyAllocationKey:   `{"Numa":{"0":{"allocated":{"cpu":"4"}}}}`,
+		},
 	}, resizeMainContainerAllocations.PodResources[podUID].ContainerResources[mainContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
 	as.NotNil(resizeMainContainerAllocations.PodResources[podUID].ContainerResources[sidecarContainerName])
@@ -466,6 +506,15 @@ func TestSNBInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 11, // 分配到numa0    (cpu0 -> reserved, cpu1~cpu5,cpu24~cpu29 for snb)
 		AllocationResult:  "1-5,24-29",
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
+			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			consts.PodAnnotationMemoryEnhancementNumaExclusive: "false",
+			cpuconsts.CPUStateAnnotationKeyNUMAHint:            "0",
+			consts.PodAnnotationInplaceUpdateResizingKey:       "true",
+			consts.PodAnnotationAggregatedRequestsKey:          "{\"cpu\":\"4\"}",
+			coreconsts.QRMPodAnnotationTopologyAllocationKey:   `{"Numa":{"0":{"allocated":{"cpu":"4"}}}}`,
+		},
 	}, resizeMainContainerAllocations.PodResources[podUID].ContainerResources[sidecarContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
 	mainContainerAllocation = dynamicPolicy.state.GetAllocationInfo(podUID, mainContainerName)
@@ -581,15 +630,25 @@ func TestSNBInplaceUpdateResizeWithSidecar(t *testing.T) {
 	as.Nil(err)
 
 	as.NotNil(resizeSidecarContainerAllocations.PodResources[podUID])
-	as.NotNil(resizeSidecarContainerAllocations.PodResources[podUID].ContainerResources[mainContainerName])
-	as.NotNil(resizeSidecarContainerAllocations.PodResources[podUID].ContainerResources[mainContainerName].ResourceAllocation[string(v1.ResourceCPU)])
+	as.NotNil(resizeSidecarContainerAllocations.PodResources[podUID].ContainerResources[sidecarContainerName])
+	as.NotNil(resizeSidecarContainerAllocations.PodResources[podUID].ContainerResources[sidecarContainerName].ResourceAllocation[string(v1.ResourceCPU)])
+	// reserve pool size: 2, reclaimed pool size: 4, share-NUMA0 pool size: 11
 	as.Equal(&pluginapi.ResourceAllocationInfo{
 		OciPropertyName:   util.OCIPropertyNameCPUSetCPUs,
 		IsNodeResource:    false,
 		IsScalarResource:  true,
 		AllocatedQuantity: 11, // 分配到numa0    (cpu0 -> reserved, cpu1~cpu5,cpu24~cpu29 for snb)
 		AllocationResult:  "1-5,24-29",
-	}, resizeSidecarContainerAllocations.PodResources[podUID].ContainerResources[mainContainerName].ResourceAllocation[string(v1.ResourceCPU)])
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
+			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			consts.PodAnnotationMemoryEnhancementNumaExclusive: "false",
+			cpuconsts.CPUStateAnnotationKeyNUMAHint:            "0",
+			consts.PodAnnotationInplaceUpdateResizingKey:       "true",
+			consts.PodAnnotationAggregatedRequestsKey:          "{\"cpu\":\"5\"}",
+			coreconsts.QRMPodAnnotationTopologyAllocationKey:   `{"Numa":{"0":{"allocated":{"cpu":"5"}}}}`,
+		},
+	}, resizeSidecarContainerAllocations.PodResources[podUID].ContainerResources[sidecarContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
 	as.NotNil(resizeSidecarContainerAllocations.PodResources[podUID].ContainerResources[mainContainerName])
 	as.NotNil(resizeSidecarContainerAllocations.PodResources[podUID].ContainerResources[mainContainerName].ResourceAllocation[string(v1.ResourceCPU)])
@@ -599,6 +658,15 @@ func TestSNBInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 11, // 分配到numa0    (cpu0 -> reserved, cpu1~cpu5,cpu24~cpu29 for snb)
 		AllocationResult:  "1-5,24-29",
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
+			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			consts.PodAnnotationMemoryEnhancementNumaExclusive: "false",
+			cpuconsts.CPUStateAnnotationKeyNUMAHint:            "0",
+			consts.PodAnnotationInplaceUpdateResizingKey:       "true",
+			consts.PodAnnotationAggregatedRequestsKey:          "{\"cpu\":\"5\"}",
+			coreconsts.QRMPodAnnotationTopologyAllocationKey:   `{"Numa":{"0":{"allocated":{"cpu":"5"}}}}`,
+		},
 	}, resizeSidecarContainerAllocations.PodResources[podUID].ContainerResources[mainContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
 	mainContainerAllocation = dynamicPolicy.state.GetAllocationInfo(podUID, mainContainerName)
@@ -689,6 +757,9 @@ func TestNonBindingShareCoresInplaceUpdateResize(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 10,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+		},
 	}, resp1.PodResources[req.PodUid].ContainerResources[testName].ResourceAllocation[string(v1.ResourceCPU)])
 
 	resizeReq := &pluginapi.ResourceRequest{
@@ -758,6 +829,10 @@ func TestNonBindingShareCoresInplaceUpdateResize(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 10,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelSharedCores,
+			consts.PodAnnotationInplaceUpdateResizingKey: "true",
+		},
 	}, resp1.PodResources[req.PodUid].ContainerResources[testName].ResourceAllocation[string(v1.ResourceCPU)])
 
 	allocation := dynamicPolicy.state.GetAllocationInfo(req.PodUid, testName)
@@ -840,6 +915,10 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 42,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey:           consts.PodAnnotationQoSLevelSharedCores,
+			consts.PodAnnotationAggregatedRequestsKey: "{\"cpu\":\"3\"}",
+		},
 	}, allocationRes.PodResources[podUID].ContainerResources[sidecarContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
 	mainReq := &pluginapi.ResourceRequest{
@@ -889,6 +968,10 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 42,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey:           consts.PodAnnotationQoSLevelSharedCores,
+			consts.PodAnnotationAggregatedRequestsKey: "{\"cpu\":\"3\"}",
+		},
 	}, allocationRes.PodResources[podUID].ContainerResources[mainContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
 	// no reallocate for share cores sidecar
@@ -947,6 +1030,11 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 42,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelSharedCores,
+			consts.PodAnnotationInplaceUpdateResizingKey: "true",
+			consts.PodAnnotationAggregatedRequestsKey:    "{\"cpu\":\"4\"}",
+		},
 	}, resizeMainContainerAllocations.PodResources[podUID].ContainerResources[mainContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
 	as.NotNil(resizeMainContainerAllocations.PodResources[podUID].ContainerResources[sidecarContainerName])
@@ -958,6 +1046,11 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 42,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelSharedCores,
+			consts.PodAnnotationInplaceUpdateResizingKey: "true",
+			consts.PodAnnotationAggregatedRequestsKey:    "{\"cpu\":\"4\"}",
+		},
 	}, resizeMainContainerAllocations.PodResources[podUID].ContainerResources[sidecarContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
 	mainContainerAllocation = dynamicPolicy.state.GetAllocationInfo(podUID, mainContainerName)
@@ -1024,10 +1117,15 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 42,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelSharedCores,
+			consts.PodAnnotationInplaceUpdateResizingKey: "true",
+			consts.PodAnnotationAggregatedRequestsKey:    "{\"cpu\":\"5\"}",
+		},
 	}, resizeSidecarContainerAllocations.PodResources[podUID].ContainerResources[mainContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
-	as.NotNil(resizeSidecarContainerAllocations.PodResources[podUID].ContainerResources[mainContainerName])
-	as.NotNil(resizeSidecarContainerAllocations.PodResources[podUID].ContainerResources[mainContainerName].ResourceAllocation[string(v1.ResourceCPU)])
+	as.NotNil(resizeSidecarContainerAllocations.PodResources[podUID].ContainerResources[sidecarContainerName])
+	as.NotNil(resizeSidecarContainerAllocations.PodResources[podUID].ContainerResources[sidecarContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 	// reserve pool size: 2, reclaimed pool size: 4, share pool size: 42
 	as.Equal(&pluginapi.ResourceAllocationInfo{
 		OciPropertyName:   util.OCIPropertyNameCPUSetCPUs,
@@ -1035,6 +1133,11 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 42,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelSharedCores,
+			consts.PodAnnotationInplaceUpdateResizingKey: "true",
+			consts.PodAnnotationAggregatedRequestsKey:    "{\"cpu\":\"5\"}",
+		},
 	}, resizeSidecarContainerAllocations.PodResources[podUID].ContainerResources[sidecarContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
 	mainContainerAllocation = dynamicPolicy.state.GetAllocationInfo(podUID, mainContainerName)
@@ -1089,7 +1192,9 @@ func TestReclaimedCoresVPA(t *testing.T) {
 								consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelReclaimedCores,
 							},
 							Annotations: map[string]string{
-								consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelReclaimedCores,
+								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelReclaimedCores,
+								consts.PodAnnotationMemoryEnhancementNumaBinding: "false",
+								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"cpu":"3"},"attributes":{"CpusetCpus":"0-2"}},"1":{"allocated":{"cpu":"3"},"attributes":{"CpusetCpus":"4-6"}}}}`,
 							},
 							QoSLevel: consts.PodAnnotationQoSLevelReclaimedCores,
 						},
@@ -1167,6 +1272,11 @@ func TestReclaimedCoresVPA(t *testing.T) {
 							},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{nil},
+							},
+							Annotations: map[string]string{
+								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelReclaimedCores,
+								consts.PodAnnotationMemoryEnhancementNumaBinding: "false",
+								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"cpu":"3"},"attributes":{"CpusetCpus":"0-2"}},"1":{"allocated":{"cpu":"3"},"attributes":{"CpusetCpus":"4-6"}}}}`,
 							},
 						},
 					},
@@ -1293,6 +1403,9 @@ func TestReclaimedCoresVPA(t *testing.T) {
 								},
 							},
 							Annotations: map[string]string{
+								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelReclaimedCores,
+								consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+								cpuconsts.CPUStateAnnotationKeyNUMAHint:          "0",
 								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"cpu":"1"}}}}`,
 							},
 						},
@@ -1421,6 +1534,9 @@ func TestReclaimedCoresVPA(t *testing.T) {
 								},
 							},
 							Annotations: map[string]string{
+								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelReclaimedCores,
+								consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+								cpuconsts.CPUStateAnnotationKeyNUMAHint:          "0",
 								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"cpu":"3"}}}}`,
 							},
 						},
@@ -1491,7 +1607,7 @@ func TestReclaimedCoresVPA(t *testing.T) {
 					},
 				},
 			},
-			requestQuantity:  4,
+			requestQuantity:  6,
 			expectedHintErr:  true,
 			expectedHintResp: nil,
 		},
@@ -1608,6 +1724,10 @@ func TestReclaimedCoresVPA(t *testing.T) {
 										Preferred: true,
 									},
 								},
+							},
+							Annotations: map[string]string{
+								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelReclaimedCores,
+								consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
 							},
 						},
 					},
@@ -1738,7 +1858,7 @@ func TestReclaimedCoresVPA(t *testing.T) {
 			}
 
 			hintResp, err := dynamicPolicy.GetTopologyHints(context.Background(), hintReq)
-			as.Equalf(err != nil, tc.expectedHintErr, "expected hint error: %v, got: %v", tc.expectedHintErr, err)
+			as.Equalf(tc.expectedHintErr, err != nil, "expected hint error: %v, got: %v", tc.expectedHintErr, err)
 			as.Equal(tc.expectedHintResp, hintResp, "got unexpected hint response")
 
 			if tc.expectedHintErr {
