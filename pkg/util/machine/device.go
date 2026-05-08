@@ -176,7 +176,7 @@ func (r *DeviceTopologyRegistry) SetDeviceTopology(deviceName string, deviceTopo
 
 	topologyAffinityProvider, ok := r.deviceTopologyAffinityProviders[deviceName]
 	if ok {
-		topologyAffinityProvider.SetDeviceAffinity(deviceTopology)
+		generateAndSetDeviceAffinity(topologyAffinityProvider, deviceTopology)
 		general.Infof("set device affinity provider for device %s, %v", deviceName, deviceTopology)
 	} else {
 		general.Infof("no device affinity provider found for device %s", deviceName)
