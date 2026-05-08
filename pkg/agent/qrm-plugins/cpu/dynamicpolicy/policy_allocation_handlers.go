@@ -203,7 +203,7 @@ func (p *DynamicPolicy) sharedCoresWithoutNUMABindingAllocationHandler(_ context
 		p.state.SetMachineState(updatedMachineState, persistCheckpoint)
 	}
 
-	resp, err := cpuutil.PackAllocationResponse(allocationInfo, string(v1.ResourceCPU), util.OCIPropertyNameCPUSetCPUs, false, true, req)
+	resp, err := cpuutil.PackAllocationResponse(allocationInfo, string(v1.ResourceCPU), util.OCIPropertyNameCPUSetCPUs, false, true, req, allocationInfo.Annotations)
 	if err != nil {
 		general.Errorf("pod: %s/%s, container: %s packAllocationResponse failed with error: %v",
 			req.PodNamespace, req.PodName, req.ContainerName, err)
@@ -334,17 +334,7 @@ func (p *DynamicPolicy) reclaimedCoresAllocationHandler(ctx context.Context,
 		p.state.SetMachineState(updatedMachineState, persistCheckpoint)
 	}
 
-	// Get topology allocation for numa binding reclaimed cores
-	var topologyAllocationAnnotations map[string]string
-	if allocationInfo.CheckReclaimedActualNUMABinding() {
-		var err error
-		topologyAllocationAnnotations, err = cpuutil.GetCPUTopologyAllocationsAnnotations(allocationInfo, p.conf.TopologyAllocationAnnotationKey, req)
-		if err != nil {
-			return nil, fmt.Errorf("GetCPUTopologyAllocationsAnnotations failed with error: %v", err)
-		}
-	}
-
-	resp, err := cpuutil.PackAllocationResponse(allocationInfo, string(v1.ResourceCPU), util.OCIPropertyNameCPUSetCPUs, false, true, req, topologyAllocationAnnotations)
+	resp, err := cpuutil.PackAllocationResponse(allocationInfo, string(v1.ResourceCPU), util.OCIPropertyNameCPUSetCPUs, false, true, req, allocationInfo.Annotations)
 	if err != nil {
 		general.Errorf("pod: %s/%s, container: %s packAllocationResponse failed with error: %v",
 			req.PodNamespace, req.PodName, req.ContainerName, err)
@@ -518,13 +508,8 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 		return nil, fmt.Errorf("adjustAllocationEntries failed with error: %v", err)
 	}
 
-	topologyAllocationAnnotations, err := cpuutil.GetCPUTopologyAllocationsAnnotations(allocationInfo, p.conf.TopologyAllocationAnnotationKey, req)
-	if err != nil {
-		return nil, fmt.Errorf("GetCPUTopologyAllocationsAnnotations failed with error: %v", err)
-	}
-
 	resp, err := cpuutil.PackAllocationResponse(allocationInfo, string(v1.ResourceCPU),
-		util.OCIPropertyNameCPUSetCPUs, false, true, req, topologyAllocationAnnotations)
+		util.OCIPropertyNameCPUSetCPUs, false, true, req, allocationInfo.Annotations)
 	if err != nil {
 		general.Errorf("pod: %s/%s, container: %s PackResourceAllocationResponseByAllocationInfo failed with error: %v",
 			req.PodNamespace, req.PodName, req.ContainerName, err)
@@ -587,7 +572,7 @@ func (p *DynamicPolicy) allocationSidecarHandler(_ context.Context,
 	}
 	p.state.SetMachineState(updatedMachineState, persistCheckpoint)
 
-	resp, err := cpuutil.PackAllocationResponse(allocationInfo, string(v1.ResourceCPU), util.OCIPropertyNameCPUSetCPUs, false, true, req)
+	resp, err := cpuutil.PackAllocationResponse(allocationInfo, string(v1.ResourceCPU), util.OCIPropertyNameCPUSetCPUs, false, true, req, allocationInfo.Annotations)
 	if err != nil {
 		general.Errorf("pod: %s/%s, container: %s packAllocationResponse failed with error: %v",
 			req.PodNamespace, req.PodName, req.ContainerName, err)
@@ -622,13 +607,8 @@ func (p *DynamicPolicy) sharedCoresWithNUMABindingAllocationHandler(ctx context.
 
 	// there is no need to call SetPodEntries and SetMachineState,
 	// since they are already done in doAndCheckPutAllocationInfo of allocateSharedNumaBindingCPUs
-	topologyAllocationAnnotations, err := cpuutil.GetCPUTopologyAllocationsAnnotations(allocationInfo, p.conf.TopologyAllocationAnnotationKey, req)
-	if err != nil {
-		return nil, fmt.Errorf("GetCPUTopologyAllocationsAnnotations failed with error: %v", err)
-	}
-
 	resp, err := cpuutil.PackAllocationResponse(allocationInfo,
-		string(v1.ResourceCPU), util.OCIPropertyNameCPUSetCPUs, false, true, req, topologyAllocationAnnotations)
+		string(v1.ResourceCPU), util.OCIPropertyNameCPUSetCPUs, false, true, req, allocationInfo.Annotations)
 	if err != nil {
 		general.Errorf("pod: %s/%s, container: %s PackResourceAllocationResponseByAllocationInfo failed with error: %v",
 			req.PodNamespace, req.PodName, req.ContainerName, err)
@@ -2207,7 +2187,7 @@ func (p *DynamicPolicy) systemCoresAllocationHandler(ctx context.Context, req *p
 	}
 	p.state.SetMachineState(updatedMachineState, persistCheckpoint)
 
-	resp, err := cpuutil.PackAllocationResponse(allocationInfo, string(v1.ResourceCPU), util.OCIPropertyNameCPUSetCPUs, false, true, req)
+	resp, err := cpuutil.PackAllocationResponse(allocationInfo, string(v1.ResourceCPU), util.OCIPropertyNameCPUSetCPUs, false, true, req, allocationInfo.Annotations)
 	if err != nil {
 		general.Errorf("pod: %s/%s, container: %s PackResourceAllocationResponseByAllocationInfo failed with error: %v",
 			req.PodNamespace, req.PodName, req.ContainerName, err)
