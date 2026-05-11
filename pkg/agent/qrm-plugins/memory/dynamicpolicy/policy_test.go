@@ -3026,11 +3026,12 @@ func TestGetResourcesAllocation(t *testing.T) {
 				}
 			},
 			expectedMemory: &pluginapi.ResourceAllocationInfo{
-				OciPropertyName:   util.OCIPropertyNameCPUSetMems,
-				IsNodeResource:    false,
-				IsScalarResource:  true,
-				AllocatedQuantity: 1073741824,
-				AllocationResult:  machine.NewCPUSet(0, 1, 2, 3).String(),
+				OciPropertyName:     util.OCIPropertyNameCPUSetMems,
+				IsNodeResource:      false,
+				IsScalarResource:    true,
+				AllocatedQuantity:   1073741824,
+				AllocationResult:    machine.NewCPUSet(0, 1, 2, 3).String(),
+				TopologyAssignments: map[uint64]uint64{},
 			},
 		},
 		{
@@ -3058,11 +3059,12 @@ func TestGetResourcesAllocation(t *testing.T) {
 				}
 			},
 			expectedMemory: &pluginapi.ResourceAllocationInfo{
-				OciPropertyName:   util.OCIPropertyNameCPUSetMems,
-				IsNodeResource:    false,
-				IsScalarResource:  true,
-				AllocatedQuantity: 1073741824,
-				AllocationResult:  machine.NewCPUSet(0, 1, 2, 3).String(),
+				OciPropertyName:     util.OCIPropertyNameCPUSetMems,
+				IsNodeResource:      false,
+				IsScalarResource:    true,
+				AllocatedQuantity:   1073741824,
+				AllocationResult:    machine.NewCPUSet(0, 1, 2, 3).String(),
+				TopologyAssignments: map[uint64]uint64{},
 			},
 		},
 		{
@@ -3100,6 +3102,9 @@ func TestGetResourcesAllocation(t *testing.T) {
 				IsScalarResource:  true,
 				AllocatedQuantity: 7516192768,
 				AllocationResult:  machine.NewCPUSet(0).String(),
+				TopologyAssignments: map[uint64]uint64{
+					0: 7516192768,
+				},
 			},
 		},
 		{
@@ -3132,11 +3137,12 @@ func TestGetResourcesAllocation(t *testing.T) {
 				}
 			},
 			expectedMemory: &pluginapi.ResourceAllocationInfo{
-				OciPropertyName:   util.OCIPropertyNameCPUSetMems,
-				IsNodeResource:    false,
-				IsScalarResource:  true,
-				AllocatedQuantity: 0,
-				AllocationResult:  machine.NewCPUSet(0, 1, 2, 3).String(),
+				OciPropertyName:     util.OCIPropertyNameCPUSetMems,
+				IsNodeResource:      false,
+				IsScalarResource:    true,
+				AllocatedQuantity:   0,
+				AllocationResult:    machine.NewCPUSet(0, 1, 2, 3).String(),
+				TopologyAssignments: map[uint64]uint64{},
 			},
 		},
 		{
@@ -3236,6 +3242,9 @@ func TestGetResourcesAllocation(t *testing.T) {
 				IsScalarResource:  true,
 				AllocatedQuantity: 2147483648,
 				AllocationResult:  machine.NewCPUSet(0).String(),
+				TopologyAssignments: map[uint64]uint64{
+					0: 2147483648,
+				},
 			},
 			checkHugepages: true,
 			expectedHugepages: &pluginapi.ResourceAllocationInfo{
@@ -3244,6 +3253,9 @@ func TestGetResourcesAllocation(t *testing.T) {
 				IsScalarResource:  true,
 				AllocatedQuantity: 2147483648,
 				AllocationResult:  machine.NewCPUSet(0).String(),
+				TopologyAssignments: map[uint64]uint64{
+					0: 2147483648,
+				},
 			},
 		},
 	}

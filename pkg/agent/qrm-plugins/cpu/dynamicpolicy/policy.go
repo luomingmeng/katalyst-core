@@ -685,15 +685,22 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 			if podResources[podUID].ContainerResources == nil {
 				podResources[podUID].ContainerResources = make(map[string]*pluginapi.ResourceAllocation)
 			}
+
+			topologyAssignments := make(map[uint64]uint64)
+			for numaID, cset := range allocationInfo.TopologyAwareAssignments {
+				topologyAssignments[uint64(numaID)] = uint64(cset.Size())
+			}
+
 			podResources[podUID].ContainerResources[containerName] = &pluginapi.ResourceAllocation{
 				ResourceAllocation: map[string]*pluginapi.ResourceAllocationInfo{
 					string(v1.ResourceCPU): {
-						OciPropertyName:   util.OCIPropertyNameCPUSetCPUs,
-						IsNodeResource:    false,
-						IsScalarResource:  true,
-						AllocatedQuantity: float64(allocationInfo.AllocationResult.Size()),
-						AllocationResult:  allocationInfo.AllocationResult.String(),
-						Annotations:       general.DeepCopyMap(allocationInfo.Annotations),
+						OciPropertyName:     util.OCIPropertyNameCPUSetCPUs,
+						IsNodeResource:      false,
+						IsScalarResource:    true,
+						AllocatedQuantity:   float64(allocationInfo.AllocationResult.Size()),
+						AllocationResult:    allocationInfo.AllocationResult.String(),
+						TopologyAssignments: topologyAssignments,
+						Annotations:         general.DeepCopyMap(allocationInfo.Annotations),
 					},
 				},
 			}

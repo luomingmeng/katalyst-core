@@ -5776,6 +5776,12 @@ func TestGetResourcesAllocation(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 10,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
+		TopologyAssignments: map[uint64]uint64{
+			0: 3,
+			1: 3,
+			2: 2,
+			3: 2,
+		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
 		},
@@ -5803,6 +5809,12 @@ func TestGetResourcesAllocation(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 10,
 		AllocationResult:  machine.NewCPUSet(1, 3, 4, 5, 6, 7, 8, 9, 10, 11).String(),
+		TopologyAssignments: map[uint64]uint64{
+			0: 3,
+			1: 3,
+			2: 2,
+			3: 2,
+		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
 		},
@@ -5843,6 +5855,10 @@ func TestGetResourcesAllocation(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 4,
 		AllocationResult:  machine.NewCPUSet(12, 13, 14, 15).String(),
+		TopologyAssignments: map[uint64]uint64{
+			uint64(2): 2,
+			uint64(3): 2,
+		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelReclaimedCores,
 		},
@@ -5909,6 +5925,12 @@ func TestGetResourcesAllocation(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 14,
 		AllocationResult:  machine.NewCPUSet(1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15).String(),
+		TopologyAssignments: map[uint64]uint64{
+			uint64(0): 3,
+			uint64(1): 3,
+			uint64(2): 4,
+			uint64(3): 4,
+		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
 		},
