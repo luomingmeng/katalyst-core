@@ -26,8 +26,21 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate/strategies"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/util"
+	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
+)
+
+const (
+	// metricNameNoAccompanyAffinityDevices is the metric name to record the number of
+	// instances when the accompany strategy could not find any affinity devices between
+	// the accompany resource and the main resource.
+	metricNameNoAccompanyAffinityDevices = "no_accompany_affinity_devices"
+
+	// metricNameNotEnoughAllocatedDevicesAccompanyBind is the metric name to record the number of
+	// instances when the accompany strategy could not find enough affinity devices to satisfy
+	// the requested allocation.
+	metricNameNotEnoughAllocatedDevicesAccompanyBind = "not_enough_allocated_devices_accompany_bind"
 )
 
 // Bind tries to allocate devices by maximizing affinity with the accompany resource devices, making sure that it is
@@ -41,14 +54,16 @@ func (s *AccompanyResourceStrategy) Bind(ctx *allocate.AllocationContext, sorted
 		return &allocate.AllocationResult{
 			Success:      false,
 			ErrorMessage: errMsg,
-		}, fmt.Errorf(errMsg)
+		}, fmt.Errorf("%s", errMsg)
 	}
 
 	accompanyResourceName := ctx.AccompanyResourceName
-	// Use generic canonical strategy to bind devices if there is no accompany resource name
+	// AccompanyResource strategy requires an accompany resource name; without it, return an error.
 	if accompanyResourceName == "" {
-		general.Infof("No accompany resource name specified, using fallback canonical strategy to bind devices")
-		return s.CanonicalStrategy.Bind(ctx, sortedDevices)
+		return &allocate.AllocationResult{
+			Success:      false,
+			ErrorMessage: "no accompany resource name specified",
+		}, fmt.Errorf("no accompany resource name specified")
 	}
 
 	// resourceName is the name of the target resource to be allocated
@@ -70,9 +85,10 @@ func (s *AccompanyResourceStrategy) Bind(ctx *allocate.AllocationContext, sorted
 	// Get the allocated accompany resource devices from machine state
 	accompanyAllocatedDeviceIDs := machineState.GetAllocatedDeviceIDs(v1.ResourceName(accompanyResourceNameInState), ctx.ResourceReq.PodUid, ctx.ResourceReq.ContainerName)
 	if len(accompanyAllocatedDeviceIDs) == 0 {
-		general.Infof("No accompany resource device found for pod %s, container %s, resource %s, falling back to canonical strategy",
-			ctx.ResourceReq.PodUid, ctx.ResourceReq.ContainerName, accompanyResourceNameInState)
-		return s.CanonicalStrategy.Bind(ctx, sortedDevices)
+		return &allocate.AllocationResult{
+			Success:      false,
+			ErrorMessage: fmt.Sprintf("no accompany resource device found for pod %s, container %s, resource %s", ctx.ResourceReq.PodUid, ctx.ResourceReq.ContainerName, accompanyResourceNameInState),
+		}, fmt.Errorf("no accompany resource device found for pod %s, container %s, resource %s", ctx.ResourceReq.PodUid, ctx.ResourceReq.ContainerName, accompanyResourceNameInState)
 	}
 
 	// Find the name of resource in state
@@ -88,7 +104,13 @@ func (s *AccompanyResourceStrategy) Bind(ctx *allocate.AllocationContext, sorted
 	accompanyResourceToDeviceRatio := machineState.GetRatioOfAccompanyResourceToTargetResource(accompanyResourceNameInState, resourceNameInState)
 
 	// Find out the number of target devices to be allocated proportionally to the accompany resource devices
-	devicesToBeAllocated := machineState.CalculateTargetDevicesToAllocate(accompanyResourceToDeviceRatio, len(accompanyAllocatedDeviceIDs))
+	devicesToBeAllocated, err := machineState.CalculateTargetDevicesToAllocate(accompanyResourceToDeviceRatio, len(accompanyAllocatedDeviceIDs))
+	if err != nil {
+		return &allocate.AllocationResult{
+			Success:      false,
+			ErrorMessage: err.Error(),
+		}, fmt.Errorf("failed to calculate target devices to allocate: %w", err)
+	}
 
 	if allocatedDevices.Len() >= devicesToBeAllocated {
 		return &allocate.AllocationResult{
@@ -105,15 +127,31 @@ func (s *AccompanyResourceStrategy) Bind(ctx *allocate.AllocationContext, sorted
 	}
 
 	// Choose allocation path based on presence of affinity info
-	// If there are no affinity devices, return an error.
+	// If there are no affinity devices, log a warning, emit a metric for visibility, and return
+	// success with an empty allocation. This lets the pod proceed to be allocated (e.g. without RDMA devices in this
+	// scenario) instead of being rejected.
 	if len(affinityDevices) == 0 {
-		return nil, fmt.Errorf("no affinity devices between accompany resource %s and main resource %s", accompanyResourceName, resourceName)
+		general.Warningf("no affinity devices between accompany resource %s and main resource %s, pod: %s/%s, container: %s",
+			accompanyResourceName, resourceName,
+			ctx.ResourceReq.PodNamespace, ctx.ResourceReq.PodName, ctx.ResourceReq.ContainerName)
+		emitAccompanyResourceAllocationMetric(ctx, metricNameNoAccompanyAffinityDevices, accompanyResourceName)
+
+		return &allocate.AllocationResult{
+			Success:          true,
+			AllocatedDevices: []string{},
+		}, nil
 	}
 
 	// Get the priority dimensions from the accompany resource's topology
 	var priorityDimensions []string
 	accompanyTopology, err := ctx.DeviceTopologyRegistry.GetDeviceTopology(accompanyResourceName)
-	if err == nil && accompanyTopology != nil {
+	if err != nil {
+		return &allocate.AllocationResult{
+			Success:      false,
+			ErrorMessage: fmt.Sprintf("failed to get device topology for accompany resource %s: %v", accompanyResourceName, err),
+		}, fmt.Errorf("failed to get device topology for accompany resource %s: %w", accompanyResourceName, err)
+	}
+	if accompanyTopology != nil {
 		priorityDimensions = accompanyTopology.PriorityDimensions
 	}
 
@@ -187,8 +225,32 @@ func (s *AccompanyResourceStrategy) allocateWithAffinity(
 		}
 	}
 
+	// Not enough affinity devices are currently available to satisfy the proportional accompany allocation.
+	// Rather than failing pod admission, we log a warning, emit a metric for visibility, and return
+	// success with an empty allocation. This lets the pod proceed to be allocated (e.g. without RDMA devices in this
+	// scenario) instead of being rejected.
+	general.Warningf("not enough devices to allocate: need %d, have %d, pod: %s/%s, container: %s, resourceName: %s, accompanyResource: %s",
+		devicesToAllocate, len(selected),
+		ctx.ResourceReq.PodNamespace, ctx.ResourceReq.PodName, ctx.ResourceReq.ContainerName,
+		ctx.ResourceName, accompanyResourceName)
+	emitAccompanyResourceAllocationMetric(ctx, metricNameNotEnoughAllocatedDevicesAccompanyBind, accompanyResourceName)
+
 	return &allocate.AllocationResult{
-		Success:      false,
-		ErrorMessage: fmt.Sprintf("not enough devices to allocate: need %d, have %d", devicesToAllocate, len(selected)),
-	}, fmt.Errorf("not enough devices to allocate: need %d, have %d", devicesToAllocate, len(selected))
+		Success:          true,
+		AllocatedDevices: []string{},
+	}, nil
+}
+
+// emitAccompanyResourceAllocationMetric emits a raw metric tagged with the pod / container /
+// resource information that is common across the various accompany allocation failure
+// scenarios.
+func emitAccompanyResourceAllocationMetric(ctx *allocate.AllocationContext, metricName string, accompanyResourceName string) {
+	tags := metrics.ConvertMapToTags(map[string]string{
+		"podNamespace":          ctx.ResourceReq.PodNamespace,
+		"podName":               ctx.ResourceReq.PodName,
+		"containerName":         ctx.ResourceReq.ContainerName,
+		"resourceName":          ctx.ResourceName,
+		"accompanyResourceName": accompanyResourceName,
+	})
+	_ = ctx.Emitter.StoreInt64(metricName, 1, metrics.MetricTypeNameRaw, tags...)
 }

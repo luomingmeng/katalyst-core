@@ -691,23 +691,26 @@ func TestDeviceTopologyRegistry_GetLatestDeviceTopology(t *testing.T) {
 	_ = registry.SetDeviceTopology("gpu-2", topo2)
 
 	tests := []struct {
-		name        string
-		deviceNames []string
-		expectedLen int
-		expectErr   bool
-		checkHealth map[string]string
+		name         string
+		deviceNames  []string
+		expectedLen  int
+		expectedName string
+		expectErr    bool
+		checkHealth  map[string]string
 	}{
 		{
-			name:        "pick latest from two existing devices",
-			deviceNames: []string{"gpu-1", "gpu-2"},
-			expectedLen: 2, // Only topo2.Devices (d1, d3)
-			checkHealth: map[string]string{"d1": "Healthy", "d3": "Healthy"},
+			name:         "pick latest from two existing devices",
+			deviceNames:  []string{"gpu-1", "gpu-2"},
+			expectedLen:  2, // Only topo2.Devices (d1, d3)
+			expectedName: "gpu-2",
+			checkHealth:  map[string]string{"d1": "Healthy", "d3": "Healthy"},
 		},
 		{
-			name:        "one device missing, pick existing one",
-			deviceNames: []string{"gpu-1", "non-existent"},
-			expectedLen: 2, // Only topo1.Devices (d1, d2)
-			checkHealth: map[string]string{"d1": "Unhealthy", "d2": "Healthy"},
+			name:         "one device missing, pick existing one",
+			deviceNames:  []string{"gpu-1", "non-existent"},
+			expectedLen:  2, // Only topo1.Devices (d1, d2)
+			expectedName: "gpu-1",
+			checkHealth:  map[string]string{"d1": "Unhealthy", "d2": "Healthy"},
 		},
 		{
 			name:        "all devices missing",
@@ -718,14 +721,162 @@ func TestDeviceTopologyRegistry_GetLatestDeviceTopology(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			latest, err := registry.GetLatestDeviceTopology(tt.deviceNames)
+			latest, latestName, err := registry.GetLatestDeviceTopology(tt.deviceNames)
 			if tt.expectErr {
 				assert.Error(t, err)
 			} else {
 				assert.NoError(t, err)
 				assert.Len(t, latest.Devices, tt.expectedLen)
+				assert.Equal(t, tt.expectedName, latestName)
 				for id, health := range tt.checkHealth {
 					assert.Equal(t, health, latest.Devices[id].Health)
+				}
+			}
+		})
+	}
+}
+
+func TestGetAffinityFromDimensions(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		topoA    *DeviceTopology
+		topoB    *DeviceTopology
+		expected map[string]map[string]DeviceIDs
+	}{
+		{
+			name: "common keys (numa, pcie) with matching values are grouped per dimension",
+			topoA: &DeviceTopology{
+				Devices: map[string]DeviceInfo{
+					"a0": {
+						Dimensions: DeviceDimensions{"pcie": "p0", "numa": "0"},
+					},
+				},
+			},
+			topoB: &DeviceTopology{
+				Devices: map[string]DeviceInfo{
+					"b0": {
+						Dimensions: DeviceDimensions{"numa": "0", "pcie": "p0"},
+					},
+					"b1": {
+						Dimensions: DeviceDimensions{"numa": "0", "pcie": "p1"},
+					},
+					"b2": {
+						Dimensions: DeviceDimensions{"numa": "1", "pcie": "p0"},
+					},
+				},
+			},
+			expected: map[string]map[string]DeviceIDs{
+				"a0": {
+					"numa": {"b0", "b1"},
+					"pcie": {"b0", "b2"},
+				},
+			},
+		},
+		{
+			name: "no common dimension keys produces empty result",
+			topoA: &DeviceTopology{
+				Devices: map[string]DeviceInfo{
+					"a0": {
+						Dimensions: DeviceDimensions{"pcie": "p0"},
+					},
+				},
+			},
+			topoB: &DeviceTopology{
+				Devices: map[string]DeviceInfo{
+					"b0": {
+						Dimensions: DeviceDimensions{"socket": "s0"},
+					},
+				},
+			},
+			expected: map[string]map[string]DeviceIDs{},
+		},
+		{
+			name: "common key with no matching value omits device A entry",
+			topoA: &DeviceTopology{
+				Devices: map[string]DeviceInfo{
+					"a0": {
+						Dimensions: DeviceDimensions{"numa": "0"},
+					},
+				},
+			},
+			topoB: &DeviceTopology{
+				Devices: map[string]DeviceInfo{
+					"b0": {
+						Dimensions: DeviceDimensions{"numa": "1"},
+					},
+				},
+			},
+			expected: map[string]map[string]DeviceIDs{},
+		},
+		{
+			name: "partial overlap: only the shared key with matching value is reported",
+			topoA: &DeviceTopology{
+				Devices: map[string]DeviceInfo{
+					"a0": {
+						Dimensions: DeviceDimensions{"numa": "0", "pcie": "p0"},
+					},
+				},
+			},
+			topoB: &DeviceTopology{
+				Devices: map[string]DeviceInfo{
+					"b0": {
+						// Has numa key with matching value; no pcie key.
+						Dimensions: DeviceDimensions{"numa": "0"},
+					},
+				},
+			},
+			expected: map[string]map[string]DeviceIDs{
+				"a0": {
+					"numa": {"b0"},
+				},
+			},
+		},
+		{
+			name: "multiple devices in A produce per-device groupings",
+			topoA: &DeviceTopology{
+				Devices: map[string]DeviceInfo{
+					"a0": {
+						Dimensions: DeviceDimensions{"numa": "0"},
+					},
+					"a1": {
+						Dimensions: DeviceDimensions{"numa": "1"},
+					},
+				},
+			},
+			topoB: &DeviceTopology{
+				Devices: map[string]DeviceInfo{
+					"b0": {
+						Dimensions: DeviceDimensions{"numa": "0"},
+					},
+					"b1": {
+						Dimensions: DeviceDimensions{"numa": "1"},
+					},
+				},
+			},
+			expected: map[string]map[string]DeviceIDs{
+				"a0": {"numa": {"b0"}},
+				"a1": {"numa": {"b1"}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := getAffinityFromDimensions(tt.topoA, tt.topoB)
+			assert.Len(t, got, len(tt.expected))
+			for deviceA, expectedDimGroups := range tt.expected {
+				gotDimGroups, ok := got[deviceA]
+				assert.True(t, ok, "expected device %s in result", deviceA)
+				assert.Len(t, gotDimGroups, len(expectedDimGroups))
+				for dimKey, expectedIDs := range expectedDimGroups {
+					gotIDs, ok := gotDimGroups[dimKey]
+					assert.True(t, ok, "expected dimension key %s for device %s", dimKey, deviceA)
+					assert.ElementsMatch(t, expectedIDs, gotIDs)
 				}
 			}
 		})

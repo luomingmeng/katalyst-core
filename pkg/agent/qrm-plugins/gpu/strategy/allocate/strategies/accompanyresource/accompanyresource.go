@@ -18,7 +18,6 @@ package accompanyresource
 
 import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate"
-	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate/strategies/canonical"
 )
 
 const (
@@ -28,7 +27,6 @@ const (
 // AccompanyResourceStrategy allocates devices based on the allocation of an accompany resource.
 type AccompanyResourceStrategy struct {
 	targetDeviceName string
-	canonical.CanonicalStrategy
 }
 
 func NewAccompanyResourceStrategy() *AccompanyResourceStrategy {

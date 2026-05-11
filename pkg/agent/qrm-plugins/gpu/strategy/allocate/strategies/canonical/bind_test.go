@@ -24,6 +24,7 @@ import (
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate"
+	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -134,7 +135,7 @@ func TestCanonicalStrategy_Bind(t *testing.T) {
 			t.Parallel()
 			// Prepare topology registry if provided
 			if tt.topology != nil {
-				reg := machine.NewDeviceTopologyRegistry()
+				reg := machine.NewDeviceTopologyRegistry(metrics.DummyMetrics{})
 				reg.RegisterDeviceTopologyProvider(consts.GPUDeviceType, machine.NewDeviceTopologyProvider())
 				_ = reg.SetDeviceTopology(consts.GPUDeviceType, tt.topology)
 				tt.ctx.DeviceTopologyRegistry = reg

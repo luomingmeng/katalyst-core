@@ -1299,7 +1299,7 @@ func TestBind_NumberOfDevicesAllocated(t *testing.T) {
 			t.Parallel()
 			// Setup topology registry when a topology is provided
 			if tt.topology != nil {
-				reg := machine.NewDeviceTopologyRegistry()
+				reg := machine.NewDeviceTopologyRegistry(metrics.DummyMetrics{})
 				reg.RegisterDeviceTopologyProvider(consts.GPUDeviceType, machine.NewDeviceTopologyProvider())
 				_ = reg.SetDeviceTopology(consts.GPUDeviceType, tt.topology)
 				if tt.ctx == nil {
@@ -1590,7 +1590,7 @@ func TestBind_Dimensions(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			if tt.topology != nil {
-				reg := machine.NewDeviceTopologyRegistry()
+				reg := machine.NewDeviceTopologyRegistry(metrics.DummyMetrics{})
 				reg.RegisterDeviceTopologyProvider(consts.GPUDeviceType, machine.NewDeviceTopologyProvider())
 				_ = reg.SetDeviceTopology(consts.GPUDeviceType, tt.topology)
 				if tt.ctx == nil {
@@ -1964,7 +1964,7 @@ func TestBind_Dimensions_RequiredStrict(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			if tt.topology != nil {
-				reg := machine.NewDeviceTopologyRegistry()
+				reg := machine.NewDeviceTopologyRegistry(metrics.DummyMetrics{})
 				reg.RegisterDeviceTopologyProvider(consts.GPUDeviceType, machine.NewDeviceTopologyProvider())
 				_ = reg.SetDeviceTopology(consts.GPUDeviceType, tt.topology)
 				if tt.ctx == nil {

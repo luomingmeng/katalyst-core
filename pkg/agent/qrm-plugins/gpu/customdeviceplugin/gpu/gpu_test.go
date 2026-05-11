@@ -36,7 +36,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate/manager"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate/strategies/canonical"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate/strategies/deviceaffinity"
-	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate/strategies/gpu_memory"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate/strategies/virtual_gpu"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/statedirectory"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
@@ -192,7 +192,7 @@ func TestGPUDevicePlugin_AllocateAssociatedDevice(t *testing.T) {
 		containerName                     string
 		allocationInfo                    *state.AllocationInfo
 		preAllocateResourceAllocationInfo *state.AllocationInfo
-		otherResourceAllocationMap      map[v1.ResourceName]state.AllocationMap
+		otherResourceAllocationMap        map[v1.ResourceName]state.AllocationMap
 		deviceReq                         *pluginapi.DeviceRequest
 		deviceTopology                    *machine.DeviceTopology
 		expectedErr                       bool
@@ -479,6 +479,7 @@ func TestGPUDevicePlugin_GetAssociatedDeviceTopologyHints(t *testing.T) {
 		qosLevel                          string
 		allocationInfo                    *state.AllocationInfo
 		preAllocateResourceAllocationInfo *state.AllocationInfo
+		otherResourceAllocationMap        map[v1.ResourceName]state.AllocationMap
 		deviceReq                         *pluginapi.AssociatedDeviceRequest
 		deviceTopology                    *machine.DeviceTopology
 		requiredDeviceAffinity            bool
@@ -982,6 +983,203 @@ func TestGPUDevicePlugin_GetAssociatedDeviceTopologyHints(t *testing.T) {
 				},
 			},
 		},
+		{
+			name:          "filter occupied milligpu device leaves only NUMA 1 hint",
+			podUID:        "test-uid",
+			containerName: "test-container",
+			deviceTopology: &machine.DeviceTopology{
+				Devices: map[string]machine.DeviceInfo{
+					"test-gpu-0": {NumaNodes: []int{0}, Health: pluginapi.Healthy},
+					"test-gpu-1": {NumaNodes: []int{1}, Health: pluginapi.Healthy},
+				},
+			},
+			otherResourceAllocationMap: map[v1.ResourceName]state.AllocationMap{
+				consts.ResourceMilliGPU: {
+					"test-gpu-0": &state.AllocationState{
+						PodEntries: state.PodEntries{
+							"another-pod": state.ContainerEntries{
+								"another-container": &state.AllocationInfo{},
+							},
+						},
+					},
+				},
+			},
+			deviceReq: &pluginapi.AssociatedDeviceRequest{
+				ResourceRequest: &pluginapi.ResourceRequest{
+					PodUid:        "test-uid",
+					ContainerName: "test-container",
+					Annotations:   map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+					Labels:        map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+				},
+				DeviceName: "test-gpu",
+				DeviceRequest: []*pluginapi.DeviceRequest{
+					{
+						DeviceName:       "test-gpu",
+						AvailableDevices: []string{"test-gpu-0", "test-gpu-1"},
+						DeviceRequest:    1,
+					},
+				},
+			},
+			expectedResp: &pluginapi.AssociatedDeviceHintsResponse{
+				PodUid:        "test-uid",
+				ContainerName: "test-container",
+				DeviceName:    "test-gpu",
+				Annotations:   map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+				Labels:        map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+				DeviceHints: &pluginapi.ListOfTopologyHints{
+					Hints: []*pluginapi.TopologyHint{
+						// test-gpu-0 (NUMA 0) is occupied by another container via milligpu,
+						// so only test-gpu-1 (NUMA 1) remains available.
+						// Mask {0} cannot satisfy the request (no available device in NUMA 0).
+						// Mask {1} and {0,1} are valid; only {1} is preferred since it has the
+						// minimum affinity size.
+						{Nodes: []uint64{1}, Preferred: true},
+						{Nodes: []uint64{0, 1}, Preferred: false},
+					},
+				},
+			},
+		},
+		{
+			name:          "filter occupied milligpu device causes not enough available -> error",
+			podUID:        "test-uid",
+			containerName: "test-container",
+			deviceTopology: &machine.DeviceTopology{
+				Devices: map[string]machine.DeviceInfo{
+					"test-gpu-0": {NumaNodes: []int{0}, Health: pluginapi.Healthy},
+					"test-gpu-1": {NumaNodes: []int{1}, Health: pluginapi.Healthy},
+				},
+			},
+			otherResourceAllocationMap: map[v1.ResourceName]state.AllocationMap{
+				consts.ResourceMilliGPU: {
+					"test-gpu-0": &state.AllocationState{
+						PodEntries: state.PodEntries{
+							"another-pod": state.ContainerEntries{
+								"another-container": &state.AllocationInfo{},
+							},
+						},
+					},
+				},
+			},
+			deviceReq: &pluginapi.AssociatedDeviceRequest{
+				ResourceRequest: &pluginapi.ResourceRequest{
+					PodUid:        "test-uid",
+					ContainerName: "test-container",
+					Annotations:   map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+					Labels:        map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+				},
+				DeviceName: "test-gpu",
+				DeviceRequest: []*pluginapi.DeviceRequest{
+					{
+						DeviceName:       "test-gpu",
+						AvailableDevices: []string{"test-gpu-0", "test-gpu-1"},
+						DeviceRequest:    2,
+					},
+				},
+			},
+			// After filtering test-gpu-0, only 1 device remains but request is 2 -> empty hints -> error.
+			expectedErr: true,
+		},
+		{
+			name:          "filter does not affect existing GPU allocation path",
+			podUID:        "test-uid",
+			containerName: "test-container",
+			allocationInfo: &state.AllocationInfo{
+				TopologyAwareAllocations: map[string]state.Allocation{
+					"test-gpu-0": {NUMANodes: []int{0}},
+				},
+			},
+			otherResourceAllocationMap: map[v1.ResourceName]state.AllocationMap{
+				// test-gpu-0 is occupied by another container, but since the GPU allocation
+				// path is taken first (allocationInfo != nil), the filter is bypassed and
+				// hints should still come from the existing allocation.
+				consts.ResourceMilliGPU: {
+					"test-gpu-0": &state.AllocationState{
+						PodEntries: state.PodEntries{
+							"another-pod": state.ContainerEntries{
+								"another-container": &state.AllocationInfo{},
+							},
+						},
+					},
+				},
+			},
+			deviceReq: &pluginapi.AssociatedDeviceRequest{
+				ResourceRequest: &pluginapi.ResourceRequest{
+					PodUid:        "test-uid",
+					ContainerName: "test-container",
+					Annotations:   map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+					Labels:        map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+				},
+				DeviceName: "test-gpu",
+				DeviceRequest: []*pluginapi.DeviceRequest{
+					{DeviceName: "test-gpu", DeviceRequest: 1},
+				},
+			},
+			expectedResp: &pluginapi.AssociatedDeviceHintsResponse{
+				PodUid:        "test-uid",
+				ContainerName: "test-container",
+				DeviceName:    "test-gpu",
+				Annotations:   map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+				Labels:        map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+				DeviceHints: &pluginapi.ListOfTopologyHints{
+					Hints: []*pluginapi.TopologyHint{
+						{Nodes: []uint64{0}, Preferred: true},
+					},
+				},
+			},
+		},
+		{
+			name:          "non-milligpu allocation does not filter devices",
+			podUID:        "test-uid",
+			containerName: "test-container",
+			deviceTopology: &machine.DeviceTopology{
+				Devices: map[string]machine.DeviceInfo{
+					"test-gpu-0": {NumaNodes: []int{0}, Health: pluginapi.Healthy},
+					"test-gpu-1": {NumaNodes: []int{1}, Health: pluginapi.Healthy},
+				},
+			},
+			otherResourceAllocationMap: map[v1.ResourceName]state.AllocationMap{
+				// gpu_memory allocations are NOT considered by the filter (only milligpu is).
+				consts.ResourceGPUMemory: {
+					"test-gpu-0": &state.AllocationState{
+						PodEntries: state.PodEntries{
+							"another-pod": state.ContainerEntries{
+								"another-container": &state.AllocationInfo{},
+							},
+						},
+					},
+				},
+			},
+			deviceReq: &pluginapi.AssociatedDeviceRequest{
+				ResourceRequest: &pluginapi.ResourceRequest{
+					PodUid:        "test-uid",
+					ContainerName: "test-container",
+					Annotations:   map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+					Labels:        map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+				},
+				DeviceName: "test-gpu",
+				DeviceRequest: []*pluginapi.DeviceRequest{
+					{
+						DeviceName:       "test-gpu",
+						AvailableDevices: []string{"test-gpu-0", "test-gpu-1"},
+						DeviceRequest:    1,
+					},
+				},
+			},
+			expectedResp: &pluginapi.AssociatedDeviceHintsResponse{
+				PodUid:        "test-uid",
+				ContainerName: "test-container",
+				DeviceName:    "test-gpu",
+				Annotations:   map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+				Labels:        map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+				DeviceHints: &pluginapi.ListOfTopologyHints{
+					Hints: []*pluginapi.TopologyHint{
+						{Nodes: []uint64{0}, Preferred: true},
+						{Nodes: []uint64{1}, Preferred: true},
+						{Nodes: []uint64{0, 1}, Preferred: false},
+					},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -998,6 +1196,13 @@ func TestGPUDevicePlugin_GetAssociatedDeviceTopologyHints(t *testing.T) {
 			if tt.preAllocateResourceAllocationInfo != nil {
 				basePlugin.GetState().SetAllocationInfo(v1.ResourceName(defaultPreAllocateResourceName), tt.podUID, tt.containerName, tt.preAllocateResourceAllocationInfo, false)
 			}
+			if len(tt.otherResourceAllocationMap) > 0 {
+				machineState := basePlugin.GetState().GetMachineState()
+				for resName, allocMap := range tt.otherResourceAllocationMap {
+					machineState[resName] = allocMap
+				}
+				basePlugin.GetState().SetMachineState(machineState, false)
+			}
 			if tt.deviceTopology != nil {
 				err := basePlugin.DeviceTopologyRegistry.SetDeviceTopology("test-gpu", tt.deviceTopology)
 				assert.NoError(t, err)
@@ -1007,8 +1212,8 @@ func TestGPUDevicePlugin_GetAssociatedDeviceTopologyHints(t *testing.T) {
 
 					err = manager.GetGlobalStrategyManager(basePlugin.Conf.GPUQRMPluginConfig).RegisterGenericAllocationStrategy(
 						testDeviceAffinityAllocation,
-						[]string{canonical.StrategyNameCanonical, gpu_memory.StrategyNameGPUMemory},
-						gpu_memory.StrategyNameGPUMemory,
+						[]string{canonical.StrategyNameCanonical, virtual_gpu.StrategyNameVirtualGPU},
+						virtual_gpu.StrategyNameVirtualGPU,
 						deviceaffinity.StrategyNameDeviceAffinity,
 					)
 					// Ignore already registered error

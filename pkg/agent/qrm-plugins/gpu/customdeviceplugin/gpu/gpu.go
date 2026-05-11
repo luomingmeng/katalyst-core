@@ -31,6 +31,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/customdeviceplugin"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/state"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate/manager"
+	gpuutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/util"
 	qrmutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
@@ -136,19 +137,6 @@ func (p *GPUDevicePlugin) GetAssociatedDeviceTopologyHints(
 		"qosLevel", qosLevel,
 	)
 
-	// Find the target device request
-	var targetDeviceReq *pluginapi.DeviceRequest
-	for _, deviceRequest := range req.DeviceRequest {
-		if deviceRequest.DeviceName == req.DeviceName {
-			targetDeviceReq = deviceRequest
-			break
-		}
-	}
-
-	if targetDeviceReq == nil {
-		return nil, fmt.Errorf("no target device plugin found for target device %s", req.DeviceName)
-	}
-
 	var hints []*pluginapi.TopologyHint
 
 	// 1. Check if GPU device allocation already exists.
@@ -171,7 +159,16 @@ func (p *GPUDevicePlugin) GetAssociatedDeviceTopologyHints(
 		)
 		hints = p.generateHintsFromAllocation(preAllocateResourceAllocationInfo)
 	} else {
-		// 3. Fallback to generating hints from the available devices and the GPU topology.
+		// 3. No existing allocation: locate the target DeviceRequest, filter out devices already
+		// occupied by other containers, and generate hints from the GPU topology.
+		targetDeviceReq := gpuutil.FindDeviceRequest(req.DeviceRequest, req.DeviceName)
+
+		if targetDeviceReq == nil {
+			return nil, fmt.Errorf("no target device plugin found for target device %s", req.DeviceName)
+		}
+
+		filterOccupiedDevicesFromRequest(targetDeviceReq, p.GetState().GetMachineState())
+
 		gpuTopology, err := p.DeviceTopologyRegistry.GetDeviceTopology(targetDeviceReq.DeviceName)
 		if err != nil {
 			general.Warningf("failed to get gpu topology: %v", err)
@@ -408,7 +405,6 @@ func (p *GPUDevicePlugin) AllocateAssociatedDevice(
 			"podNamespace", resReq.PodNamespace,
 			"podName", resReq.PodName,
 			"containerName", resReq.ContainerName)
-
 
 		// Filter out devices that already have allocations in other resources
 		filterOccupiedDevicesFromRequest(deviceReq, p.GetState().GetMachineState())

@@ -281,7 +281,7 @@ func (p *gpuReporterPlugin) buildReportResponse() (*v1alpha1.GetReportContentRes
 	if !ok {
 		return nil, fmt.Errorf("failed to get any device topology")
 	}
-	latestDeviceTopology := machine.PickLatestDeviceTopology(topologiesMap)
+	latestDeviceTopology, _ := machine.PickLatestDeviceTopology(topologiesMap)
 
 	stateImpl := p.stateGetter()
 	if stateImpl == nil {

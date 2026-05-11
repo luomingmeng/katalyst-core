@@ -81,7 +81,7 @@ func GenerateMachineStateFromPodEntries(
 			continue
 		}
 
-		// Skip generating the default resource state if the device topology is not initialized
+		// Skip generators that opt out of default resource state initialization
 		if !generator.MustInitDefaultResourceState() {
 			general.Infof("skipping generator for resource %s as we do not need to init default resource state", resourceName)
 			continue
@@ -165,7 +165,7 @@ func (g *genericDefaultResourceStateGenerator) GenerateDefaultResourceState() (A
 	}
 
 	// We pick the latest topology from multiple device names to generate a single unified state
-	latestTopology, err := g.topologyRegistry.GetLatestDeviceTopology(g.deviceNames)
+	latestTopology, _, err := g.topologyRegistry.GetLatestDeviceTopology(g.deviceNames)
 	if err != nil {
 		return nil, fmt.Errorf("topology provider registry failed to get latest topology: %v", err)
 	}

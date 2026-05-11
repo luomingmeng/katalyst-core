@@ -18,6 +18,7 @@ package state
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"sync"
 
@@ -327,19 +328,25 @@ func (arm AllocationResourcesMap) GetRatioOfAccompanyResourceToTargetResource(ac
 
 // CalculateTargetDevicesToAllocate calculates the number of target devices to be allocated
 // proportionally to the accompany resource devices.
-func (arm AllocationResourcesMap) CalculateTargetDevicesToAllocate(ratio float64, accompanyAllocatedDeviceCount int) int {
+func (arm AllocationResourcesMap) CalculateTargetDevicesToAllocate(ratio float64, accompanyAllocatedDeviceCount int) (int, error) {
 	if ratio <= 0 {
 		ratio = 1
 	}
 
 	devicesNeededFloat := float64(accompanyAllocatedDeviceCount) / ratio
-	devicesToBeAllocated := int(math.Floor(devicesNeededFloat))
+
+	// Ensure the calculated devices needed is a whole number (with a small epsilon for floating point precision)
+	if math.Abs(devicesNeededFloat-math.Round(devicesNeededFloat)) > 1e-9 {
+		return 0, fmt.Errorf("number of devices needed is not a whole number: %d / %g = %.2f", accompanyAllocatedDeviceCount, ratio, devicesNeededFloat)
+	}
+
+	devicesToBeAllocated := int(math.Round(devicesNeededFloat))
 	// Should have a minimum of 1 device to be allocated at all times
 	if devicesToBeAllocated < 1 {
 		devicesToBeAllocated = 1
 	}
 
-	return devicesToBeAllocated
+	return devicesToBeAllocated, nil
 }
 
 func (as *AllocationState) GetQuantityAllocated() float64 {

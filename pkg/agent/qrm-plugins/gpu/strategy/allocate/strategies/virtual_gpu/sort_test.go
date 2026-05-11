@@ -25,9 +25,11 @@ import (
 	"k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
 	"github.com/kubewharf/katalyst-api/pkg/consts"
+	gpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/state"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/qrm"
+	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -37,6 +39,7 @@ func TestVirtualGPUStrategy_Sort(t *testing.T) {
 	tests := []struct {
 		name                  string
 		ctx                   *allocate.AllocationContext
+		topology              *machine.DeviceTopology
 		filteredDevices       []string
 		expectedSortedDevices []string
 		expectedErr           bool
@@ -56,16 +59,16 @@ func TestVirtualGPUStrategy_Sort(t *testing.T) {
 		{
 			name: "gpu compute is 0 returns all available devices without sorting",
 			ctx: &allocate.AllocationContext{
-				DeviceTopology: &machine.DeviceTopology{
-					Devices: map[string]machine.DeviceInfo{
-						"gpu-1": {},
-						"gpu-2": {},
-					},
-				},
 				ResourceReq: &v1alpha1.ResourceRequest{
 					ResourceRequests: map[string]float64{
 						string(consts.ResourceGPUMemory): 0,
 					},
+				},
+			},
+			topology: &machine.DeviceTopology{
+				Devices: map[string]machine.DeviceInfo{
+					"gpu-1": {},
+					"gpu-2": {},
 				},
 			},
 			filteredDevices:       []string{"gpu-1", "gpu-2"},
@@ -74,17 +77,6 @@ func TestVirtualGPUStrategy_Sort(t *testing.T) {
 		{
 			name: "devices are sorted by NUMA affinity first",
 			ctx: &allocate.AllocationContext{
-				DeviceTopology: &machine.DeviceTopology{
-					// gpu-1 has NUMA affinity but gpu-2 does not
-					Devices: map[string]machine.DeviceInfo{
-						"gpu-1": {
-							NumaNodes: []int{1},
-						},
-						"gpu-2": {
-							NumaNodes: []int{0},
-						},
-					},
-				},
 				ResourceReq: &v1alpha1.ResourceRequest{
 					ResourceRequests: map[string]float64{
 						string(consts.ResourceGPUMemory): 1,
@@ -97,25 +89,23 @@ func TestVirtualGPUStrategy_Sort(t *testing.T) {
 				},
 				HintNodes: machine.NewCPUSet(0),
 			},
+			topology: &machine.DeviceTopology{
+				// gpu-1 has NUMA affinity but gpu-2 does not
+				Devices: map[string]machine.DeviceInfo{
+					"gpu-1": {
+						NumaNodes: []int{1},
+					},
+					"gpu-2": {
+						NumaNodes: []int{0},
+					},
+				},
+			},
 			filteredDevices:       []string{"gpu-1", "gpu-2"},
 			expectedSortedDevices: []string{"gpu-2", "gpu-1"},
 		},
 		{
 			name: "for devices with NUMA affinity, they are sorted by available memory in ascending order",
 			ctx: &allocate.AllocationContext{
-				DeviceTopology: &machine.DeviceTopology{
-					Devices: map[string]machine.DeviceInfo{
-						"gpu-1": {
-							NumaNodes: []int{0},
-						},
-						"gpu-2": {
-							NumaNodes: []int{1},
-						},
-						"gpu-3": {
-							NumaNodes: []int{2},
-						},
-					},
-				},
 				ResourceReq: &v1alpha1.ResourceRequest{
 					ResourceRequests: map[string]float64{
 						string(consts.ResourceGPUMemory): 1,
@@ -158,25 +148,25 @@ func TestVirtualGPUStrategy_Sort(t *testing.T) {
 					},
 				},
 			},
+			topology: &machine.DeviceTopology{
+				Devices: map[string]machine.DeviceInfo{
+					"gpu-1": {
+						NumaNodes: []int{0},
+					},
+					"gpu-2": {
+						NumaNodes: []int{1},
+					},
+					"gpu-3": {
+						NumaNodes: []int{2},
+					},
+				},
+			},
 			filteredDevices:       []string{"gpu-1", "gpu-2", "gpu-3"},
 			expectedSortedDevices: []string{"gpu-2", "gpu-1", "gpu-3"},
 		},
 		{
 			name: "for devices with same NUMA affinity and same GPU compute, they are sorted by available milligpu in ascending order",
 			ctx: &allocate.AllocationContext{
-				DeviceTopology: &machine.DeviceTopology{
-					Devices: map[string]machine.DeviceInfo{
-						"gpu-1": {
-							NumaNodes: []int{0},
-						},
-						"gpu-2": {
-							NumaNodes: []int{0},
-						},
-						"gpu-3": {
-							NumaNodes: []int{0},
-						},
-					},
-				},
 				ResourceReq: &v1alpha1.ResourceRequest{
 					ResourceRequests: map[string]float64{
 						string(consts.ResourceGPUMemory): 1,
@@ -257,6 +247,19 @@ func TestVirtualGPUStrategy_Sort(t *testing.T) {
 								},
 							},
 						},
+					},
+				},
+			},
+			topology: &machine.DeviceTopology{
+				Devices: map[string]machine.DeviceInfo{
+					"gpu-1": {
+						NumaNodes: []int{0},
+					},
+					"gpu-2": {
+						NumaNodes: []int{0},
+					},
+					"gpu-3": {
+						NumaNodes: []int{0},
 					},
 				},
 			},
@@ -266,22 +269,6 @@ func TestVirtualGPUStrategy_Sort(t *testing.T) {
 		{
 			name: "for devices with same NUMA affinity, different GPU compute and different milligpu, they are sorted by GPU compute then milligpu ascending",
 			ctx: &allocate.AllocationContext{
-				DeviceTopology: &machine.DeviceTopology{
-					Devices: map[string]machine.DeviceInfo{
-						"gpu-1": {
-							NumaNodes: []int{0},
-						},
-						"gpu-2": {
-							NumaNodes: []int{0},
-						},
-						"gpu-3": {
-							NumaNodes: []int{0},
-						},
-						"gpu-4": {
-							NumaNodes: []int{0},
-						},
-					},
-				},
 				ResourceReq: &v1alpha1.ResourceRequest{
 					ResourceRequests: map[string]float64{
 						string(consts.ResourceGPUMemory): 1,
@@ -384,6 +371,22 @@ func TestVirtualGPUStrategy_Sort(t *testing.T) {
 								},
 							},
 						},
+					},
+				},
+			},
+			topology: &machine.DeviceTopology{
+				Devices: map[string]machine.DeviceInfo{
+					"gpu-1": {
+						NumaNodes: []int{0},
+					},
+					"gpu-2": {
+						NumaNodes: []int{0},
+					},
+					"gpu-3": {
+						NumaNodes: []int{0},
+					},
+					"gpu-4": {
+						NumaNodes: []int{0},
 					},
 				},
 			},
@@ -393,19 +396,6 @@ func TestVirtualGPUStrategy_Sort(t *testing.T) {
 		{
 			name: "spreading mode (VirtualGPUPrefersSpreading true), devices with same NUMA affinity sorted by available memory descending then milligpu descending",
 			ctx: &allocate.AllocationContext{
-				DeviceTopology: &machine.DeviceTopology{
-					Devices: map[string]machine.DeviceInfo{
-						"gpu-1": {
-							NumaNodes: []int{0},
-						},
-						"gpu-2": {
-							NumaNodes: []int{0},
-						},
-						"gpu-3": {
-							NumaNodes: []int{0},
-						},
-					},
-				},
 				ResourceReq: &v1alpha1.ResourceRequest{
 					ResourceRequests: map[string]float64{
 						string(consts.ResourceGPUMemory): 1,
@@ -490,25 +480,25 @@ func TestVirtualGPUStrategy_Sort(t *testing.T) {
 					},
 				},
 			},
+			topology: &machine.DeviceTopology{
+				Devices: map[string]machine.DeviceInfo{
+					"gpu-1": {
+						NumaNodes: []int{0},
+					},
+					"gpu-2": {
+						NumaNodes: []int{0},
+					},
+					"gpu-3": {
+						NumaNodes: []int{0},
+					},
+				},
+			},
 			filteredDevices:       []string{"gpu-1", "gpu-2", "gpu-3"},
 			expectedSortedDevices: []string{"gpu-1", "gpu-3", "gpu-2"},
 		},
 		{
 			name: "spreading mode (VirtualGPUPrefersSpreading true), devices with same NUMA affinity and same memory sorted by available milligpu descending",
 			ctx: &allocate.AllocationContext{
-				DeviceTopology: &machine.DeviceTopology{
-					Devices: map[string]machine.DeviceInfo{
-						"gpu-1": {
-							NumaNodes: []int{0},
-						},
-						"gpu-2": {
-							NumaNodes: []int{0},
-						},
-						"gpu-3": {
-							NumaNodes: []int{0},
-						},
-					},
-				},
 				ResourceReq: &v1alpha1.ResourceRequest{
 					ResourceRequests: map[string]float64{
 						string(consts.ResourceGPUMemory): 1,
@@ -590,6 +580,19 @@ func TestVirtualGPUStrategy_Sort(t *testing.T) {
 								},
 							},
 						},
+					},
+				},
+			},
+			topology: &machine.DeviceTopology{
+				Devices: map[string]machine.DeviceInfo{
+					"gpu-1": {
+						NumaNodes: []int{0},
+					},
+					"gpu-2": {
+						NumaNodes: []int{0},
+					},
+					"gpu-3": {
+						NumaNodes: []int{0},
 					},
 				},
 			},
@@ -602,6 +605,13 @@ func TestVirtualGPUStrategy_Sort(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
+			if tt.topology != nil {
+				reg := machine.NewDeviceTopologyRegistry(metrics.DummyMetrics{})
+				reg.RegisterDeviceTopologyProvider(gpuconsts.GPUDeviceType, machine.NewDeviceTopologyProvider())
+				_ = reg.SetDeviceTopology(gpuconsts.GPUDeviceType, tt.topology)
+				tt.ctx.DeviceTopologyRegistry = reg
+				tt.ctx.ResourceName = gpuconsts.GPUDeviceType
+			}
 			strategy := NewVirtualGPUStrategy()
 			sortedDevices, err := strategy.Sort(tt.ctx, tt.filteredDevices)
 

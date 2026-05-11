@@ -27,8 +27,8 @@ import (
 	gpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/state"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate"
-	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate/strategies/canonical"
 	qrm "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm"
+	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -185,7 +185,7 @@ func TestBind(t *testing.T) {
 			},
 		},
 		{
-			name: "empty affinity: returns error when no affinity devices",
+			name: "empty affinity: returns success with empty allocation when no affinity devices",
 			ctx: &allocate.AllocationContext{
 				AccompanyResourceName: "rdma",
 				ResourceName:          "gpu",
@@ -208,10 +208,13 @@ func TestBind(t *testing.T) {
 				GPUQRMPluginConfig:     &qrm.GPUQRMPluginConfig{GPUDeviceNames: []string{"gpu"}, RDMADeviceNames: []string{"rdma"}},
 			},
 			sortedDevices: []string{"g0", "g1", "g2"},
-			expectedErr:   true,
+			expectedResult: &allocate.AllocationResult{
+				AllocatedDevices: []string{},
+				Success:          true,
+			},
 		},
 		{
-			name: "empty affinity with reusable devices returns error",
+			name: "empty affinity with reusable devices returns success with empty allocation",
 			ctx: &allocate.AllocationContext{
 				AccompanyResourceName: "rdma",
 				ResourceName:          "gpu",
@@ -236,7 +239,10 @@ func TestBind(t *testing.T) {
 				GPUQRMPluginConfig: &qrm.GPUQRMPluginConfig{GPUDeviceNames: []string{"gpu"}, RDMADeviceNames: []string{"rdma"}},
 			},
 			sortedDevices: []string{"g0", "g1", "g2"},
-			expectedErr:   true,
+			expectedResult: &allocate.AllocationResult{
+				AllocatedDevices: []string{},
+				Success:          true,
+			},
 		},
 		{
 			name: "affinity missing for a preallocated device returns error",
@@ -304,7 +310,7 @@ func TestBind(t *testing.T) {
 			},
 		},
 		{
-			name: "empty affinity: not enough devices causes error",
+			name: "empty affinity: returns success with empty allocation when not enough devices",
 			ctx: &allocate.AllocationContext{
 				AccompanyResourceName: "rdma",
 				ResourceName:          "gpu",
@@ -329,7 +335,10 @@ func TestBind(t *testing.T) {
 			},
 			// Only g0 available; g1 unavailable -> not enough
 			sortedDevices: []string{"g0"},
-			expectedErr:   true,
+			expectedResult: &allocate.AllocationResult{
+				AllocatedDevices: []string{},
+				Success:          true,
+			},
 		},
 		{
 			name: "no pre-allocate resource name",
@@ -339,14 +348,11 @@ func TestBind(t *testing.T) {
 					DeviceRequest: 2,
 				},
 				// Non-nil registry to satisfy validation; canonical strategy doesn't use it further
-				DeviceTopologyRegistry: machine.NewDeviceTopologyRegistry(),
+				DeviceTopologyRegistry: machine.NewDeviceTopologyRegistry(metrics.DummyMetrics{}),
 				ResourceReq:            &v1alpha1.ResourceRequest{},
 			},
 			sortedDevices: []string{"0", "1", "2", "3"},
-			expectedResult: &allocate.AllocationResult{
-				AllocatedDevices: []string{"0", "1"},
-				Success:          true,
-			},
+			expectedErr:   true,
 		},
 		{
 			name: "pre-allocate resource not found",
@@ -356,13 +362,13 @@ func TestBind(t *testing.T) {
 				ResourceReq:           &v1alpha1.ResourceRequest{},
 				// Empty machine state means no pre-allocated resource entry exists
 				MachineState:           state.AllocationResourcesMap{},
-				DeviceTopologyRegistry: machine.NewDeviceTopologyRegistry(),
+				DeviceTopologyRegistry: machine.NewDeviceTopologyRegistry(metrics.DummyMetrics{}),
 				DeviceReq:              &v1alpha1.DeviceRequest{},
 			},
 			expectedErr: true,
 		},
 		{
-			name: "not enough devices to allocate",
+			name: "not enough devices to allocate returns success with empty allocation",
 			ctx: &allocate.AllocationContext{
 				AccompanyResourceName: "rdma",
 				ResourceName:          "gpu",
@@ -384,12 +390,16 @@ func TestBind(t *testing.T) {
 					"1": {"1"},
 				}),
 				DeviceReq:          &v1alpha1.DeviceRequest{},
-				ResourceReq:        &v1alpha1.ResourceRequest{},
+				ResourceReq:        &v1alpha1.ResourceRequest{PodUid: "p", ContainerName: "c"},
 				GPUQRMPluginConfig: &qrm.GPUQRMPluginConfig{GPUDeviceNames: []string{"gpu"}, RDMADeviceNames: []string{"rdma"}},
 			},
 			preAllocatedResourceToTargetDeviceRatio: 1,
-			sortedDevices:                           []string{"0"},
-			expectedErr:                             true,
+			// Need 2 devices (2 accompany rdmas, ratio 1) but only "0" is available -> not enough.
+			sortedDevices: []string{"0"},
+			expectedResult: &allocate.AllocationResult{
+				AllocatedDevices: []string{},
+				Success:          true,
+			},
 		},
 		{
 			name: "successful allocation",
@@ -492,7 +502,7 @@ func TestBind(t *testing.T) {
 			},
 		},
 		{
-			name: "ratio 2/3 with affinity: need 3 but limit 1 per device -> error",
+			name: "ratio 2/3 with affinity: need 3 but limit 1 per device -> success with empty allocation",
 			ctx: &allocate.AllocationContext{
 				AccompanyResourceName: "rdma",
 				ResourceName:          "gpu",
@@ -519,10 +529,13 @@ func TestBind(t *testing.T) {
 				GPUQRMPluginConfig: &qrm.GPUQRMPluginConfig{GPUDeviceNames: []string{"gpu"}, RDMADeviceNames: []string{"rdma"}},
 			},
 			sortedDevices: []string{"g0", "g1", "g2"},
-			expectedErr:   true,
+			expectedResult: &allocate.AllocationResult{
+				AllocatedDevices: []string{},
+				Success:          true,
+			},
 		},
 		{
-			name: "ratio 2/5 with affinity: need 5 but total per-device capacity 4 -> error",
+			name: "ratio 2/5 with affinity: need 5 but total per-device capacity 4 -> success with empty allocation",
 			ctx: &allocate.AllocationContext{
 				AccompanyResourceName: "rdma",
 				ResourceName:          "gpu",
@@ -551,10 +564,45 @@ func TestBind(t *testing.T) {
 				GPUQRMPluginConfig: &qrm.GPUQRMPluginConfig{GPUDeviceNames: []string{"gpu"}, RDMADeviceNames: []string{"rdma"}},
 			},
 			sortedDevices: []string{"g0", "g1", "g2", "g3", "g4"},
+			expectedResult: &allocate.AllocationResult{
+				AllocatedDevices: []string{},
+				Success:          true,
+			},
+		},
+		{
+			name: "fractional ratio returns error",
+			ctx: &allocate.AllocationContext{
+				AccompanyResourceName: "rdma",
+				ResourceName:          "gpu",
+				ResourceReq:           &v1alpha1.ResourceRequest{PodUid: "p", ContainerName: "c"},
+				MachineState: func() state.AllocationResourcesMap {
+					// 2 rdma devices, 3 gpu devices -> ratio = 2/3.
+					// accompany allocated = 1
+					// 1 / (2/3) = 1.5 -> fractional, returns error
+					return state.AllocationResourcesMap{
+						gpuconsts.RDMADeviceType: {
+							"r0": preallocState("p", "c"), // 1 allocated
+							"r1": nil,                     // total 2
+						},
+						gpuconsts.GPUDeviceType: {
+							"g0": nil,
+							"g1": nil,
+							"g2": nil,
+						},
+					}
+				}(),
+				DeviceTopologyRegistry: buildMultiPriorityAffinityRegistry(map[string]map[int][]string{
+					"r0": {0: {"g0"}},
+					"r1": {0: {"g1", "g2"}},
+				}),
+				DeviceReq:          &v1alpha1.DeviceRequest{},
+				GPUQRMPluginConfig: &qrm.GPUQRMPluginConfig{GPUDeviceNames: []string{"gpu"}, RDMADeviceNames: []string{"rdma"}},
+			},
+			sortedDevices: []string{"g0", "g1", "g2"},
 			expectedErr:   true,
 		},
 		{
-			name: "ratio 1/3 without affinity returns error",
+			name: "ratio 1/3 without affinity returns success with empty allocation",
 			ctx: &allocate.AllocationContext{
 				AccompanyResourceName: "rdma",
 				ResourceName:          "gpu",
@@ -576,7 +624,10 @@ func TestBind(t *testing.T) {
 				GPUQRMPluginConfig:     &qrm.GPUQRMPluginConfig{GPUDeviceNames: []string{"gpu"}, RDMADeviceNames: []string{"rdma"}},
 			},
 			sortedDevices: []string{"g0", "g1", "g2"},
-			expectedErr:   true,
+			expectedResult: &allocate.AllocationResult{
+				AllocatedDevices: []string{},
+				Success:          true,
+			},
 		},
 		{
 			name: "ratio 1/3 with affinity: allocate all from one accompany device",
@@ -693,8 +744,11 @@ func TestBind(t *testing.T) {
 				}
 			}
 
+			if tc.ctx.Emitter == nil {
+				tc.ctx.Emitter = metrics.DummyMetrics{}
+			}
+
 			s := NewAccompanyResourceStrategy()
-			s.CanonicalStrategy = *canonical.NewCanonicalStrategy()
 
 			result, err := s.Bind(tc.ctx, tc.sortedDevices)
 
@@ -712,7 +766,7 @@ func TestBind(t *testing.T) {
 // buildSimpleAffinityRegistry builds a real DeviceTopologyRegistry where each rdma device ID
 // has affinity to the listed gpu device IDs under the same priority level.
 func buildSimpleAffinityRegistry(rdmaToGPU map[string][]string) *machine.DeviceTopologyRegistry {
-	reg := machine.NewDeviceTopologyRegistry()
+	reg := machine.NewDeviceTopologyRegistry(metrics.DummyMetrics{})
 
 	// Register topology providers for both devices
 	reg.RegisterDeviceTopologyProvider("rdma", machine.NewDeviceTopologyProvider())
@@ -748,7 +802,7 @@ func buildSimpleAffinityRegistry(rdmaToGPU map[string][]string) *machine.DeviceT
 // priority levels mapped to specific gpu device IDs. The generated topologies ensure that
 // GetAffinityDevices returns a map with contiguous priority levels starting from 0.
 func buildMultiPriorityAffinityRegistry(cfg map[string]map[int][]string) *machine.DeviceTopologyRegistry {
-	reg := machine.NewDeviceTopologyRegistry()
+	reg := machine.NewDeviceTopologyRegistry(metrics.DummyMetrics{})
 
 	reg.RegisterDeviceTopologyProvider("rdma", machine.NewDeviceTopologyProvider())
 	reg.RegisterDeviceTopologyProvider("gpu", machine.NewDeviceTopologyProvider())
@@ -816,7 +870,7 @@ func buildMultiPriorityAffinityRegistry(cfg map[string]map[int][]string) *machin
 // buildNoAffinityRegistry builds a registry where RDMA and GPU topologies have disjoint affinity dimensions
 // so that GetAffinityDevices returns an empty map without error.
 func buildNoAffinityRegistry() *machine.DeviceTopologyRegistry {
-	reg := machine.NewDeviceTopologyRegistry()
+	reg := machine.NewDeviceTopologyRegistry(metrics.DummyMetrics{})
 
 	reg.RegisterDeviceTopologyProvider("rdma", machine.NewDeviceTopologyProvider())
 	reg.RegisterDeviceTopologyProvider("gpu", machine.NewDeviceTopologyProvider())
@@ -840,7 +894,7 @@ func buildNoAffinityRegistry() *machine.DeviceTopologyRegistry {
 
 // buildNumaAffinityRegistry builds a registry where RDMA and GPU devices have affinity based on NUMA nodes
 func buildNumaAffinityRegistry(rdmaToNuma map[string][]int, gpuToNuma map[string][]int) *machine.DeviceTopologyRegistry {
-	reg := machine.NewDeviceTopologyRegistry()
+	reg := machine.NewDeviceTopologyRegistry(metrics.DummyMetrics{})
 
 	reg.RegisterDeviceTopologyProvider("rdma", machine.NewDeviceTopologyProvider())
 	reg.RegisterDeviceTopologyProvider("gpu", machine.NewDeviceTopologyProvider())

@@ -118,3 +118,14 @@ func ResolveResourceName(deviceNameToTypeMap map[string]string, resourceName str
 	}
 	return ""
 }
+
+// FindDeviceRequest returns the *DeviceRequest from deviceReqs whose DeviceName
+// matches name, or nil if not found.
+func FindDeviceRequest(deviceReqs []*pluginapi.DeviceRequest, name string) *pluginapi.DeviceRequest {
+	for _, dr := range deviceReqs {
+		if dr.DeviceName == name {
+			return dr
+		}
+	}
+	return nil
+}

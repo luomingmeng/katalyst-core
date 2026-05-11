@@ -144,6 +144,71 @@ func TestAllocationResourcesMap_GetRatioOfAccompanyResourceToTargetResource(t *t
 	}
 }
 
+func TestAllocationResourcesMap_CalculateTargetDevicesToAllocate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                          string
+		ratio                         float64
+		accompanyAllocatedDeviceCount int
+		want                          int
+		wantErr                       bool
+	}{
+		{
+			name:                          "ratio <= 0 falls back to 1",
+			ratio:                         -1.0,
+			accompanyAllocatedDeviceCount: 3,
+			want:                          3,
+			wantErr:                       false,
+		},
+		{
+			name:                          "whole number division",
+			ratio:                         2.0,
+			accompanyAllocatedDeviceCount: 4,
+			want:                          2,
+			wantErr:                       false,
+		},
+		{
+			name:                          "whole number division resulting in < 1 falls back to 1",
+			ratio:                         5.0,
+			accompanyAllocatedDeviceCount: 2,
+			want:                          0,
+			wantErr:                       true,
+		},
+		{
+			name:                          "fractional result returns error (4/3)",
+			ratio:                         3.0,
+			accompanyAllocatedDeviceCount: 4,
+			want:                          0,
+			wantErr:                       true,
+		},
+		{
+			name:                          "fractional result returns error (5/2)",
+			ratio:                         2.0,
+			accompanyAllocatedDeviceCount: 5,
+			want:                          0,
+			wantErr:                       true,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			arm := AllocationResourcesMap{}
+			got, err := arm.CalculateTargetDevicesToAllocate(tt.ratio, tt.accompanyAllocatedDeviceCount)
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("CalculateTargetDevicesToAllocate() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("CalculateTargetDevicesToAllocate() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestNewGPUPluginCheckpoint(t *testing.T) {
 	t.Parallel()
 

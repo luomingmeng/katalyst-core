@@ -261,18 +261,19 @@ func (r *DeviceTopologyRegistry) GetDeviceTopologies(deviceNames []string) (map[
 }
 
 // GetLatestDeviceTopology gets device topologies for the given device names and picks the latest one.
-func (r *DeviceTopologyRegistry) GetLatestDeviceTopology(deviceNames []string) (*DeviceTopology, error) {
+// It also returns the device name whose topology was picked.
+func (r *DeviceTopologyRegistry) GetLatestDeviceTopology(deviceNames []string) (*DeviceTopology, string, error) {
 	topologiesMap, ok := r.GetDeviceTopologies(deviceNames)
 	if !ok {
-		return nil, fmt.Errorf("failed to get any device topology")
+		return nil, "", fmt.Errorf("failed to get any device topology")
 	}
 
-	latestTopology := PickLatestDeviceTopology(topologiesMap)
+	latestTopology, latestName := PickLatestDeviceTopology(topologiesMap)
 	if latestTopology == nil {
-		return nil, fmt.Errorf("no latest device topology")
+		return nil, "", fmt.Errorf("no latest device topology")
 	}
 
-	return latestTopology, nil
+	return latestTopology, latestName, nil
 }
 
 // getAffinityFromDimensions returns, for each device id in deviceTopologyA.Devices,
@@ -513,17 +514,20 @@ func (p *deviceTopologyProviderImpl) GetDeviceTopology() (*DeviceTopology, error
 }
 
 // PickLatestDeviceTopology selects the latest device topology from the given map based on UpdateTime.
-func PickLatestDeviceTopology(topologies map[string]*DeviceTopology) *DeviceTopology {
+// It also returns the map key of the picked topology (empty string if none was picked).
+func PickLatestDeviceTopology(topologies map[string]*DeviceTopology) (*DeviceTopology, string) {
 	var latest *DeviceTopology
-	for _, t := range topologies {
+	var latestName string
+	for name, t := range topologies {
 		if t == nil {
 			continue
 		}
 
 		if latest == nil || t.UpdateTime > latest.UpdateTime {
 			latest = t
+			latestName = name
 		}
 	}
 
-	return latest
+	return latest, latestName
 }

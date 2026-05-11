@@ -2620,7 +2620,7 @@ func TestGpuReporterPlugin_GetZoneAllocations_KubeletCheckpointFailureEmitsMetri
 		},
 	}
 
-	zoneAllocations, err := p.getZoneAllocations(state.AllocationResourcesMap{})
+	zoneAllocations, err := p.getZoneAllocations(map[string]*machine.DeviceTopology{}, state.AllocationResourcesMap{})
 	assert.Error(t, err)
 	assert.Nil(t, zoneAllocations)
 
@@ -2653,7 +2653,7 @@ func TestGpuReporterPlugin_GetZoneAllocations_KubeletCheckpointFailureNilEmitter
 		},
 	}
 
-	zoneAllocations, err := p.getZoneAllocations(state.AllocationResourcesMap{})
+	zoneAllocations, err := p.getZoneAllocations(map[string]*machine.DeviceTopology{}, state.AllocationResourcesMap{})
 	assert.Error(t, err)
 	assert.Nil(t, zoneAllocations)
 }
