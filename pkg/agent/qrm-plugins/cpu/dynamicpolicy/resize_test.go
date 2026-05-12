@@ -118,6 +118,9 @@ func TestSNBVPA(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 3, // 分配到numa0    (cpu0 -> reserved, cpu1,cpu8,cpu9 for snb)
 		AllocationResult:  "1,8-9",
+		TopologyAssignments: map[uint64]uint64{
+			uint64(0): 3,
+		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
 			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
@@ -216,6 +219,9 @@ func TestSNBVPA(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 3, // 分配到numa0    (cpu0 -> reserved, cpu1,cpu8,cpu9 for snb)
 		AllocationResult:  "1,8-9",
+		TopologyAssignments: map[uint64]uint64{
+			uint64(0): 3,
+		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
 			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
@@ -374,6 +380,9 @@ func TestSNBInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 11, // 分配到numa0    (cpu0 -> reserved, cpu1~cpu5,cpu24~cpu29 for snb)
 		AllocationResult:  "1-5,24-29",
+		TopologyAssignments: map[uint64]uint64{
+			uint64(0): 11,
+		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
 			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
@@ -404,6 +413,9 @@ func TestSNBInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 11, // 分配到numa0    (cpu0 -> reserved, cpu1~cpu5,cpu24~cpu29 for snb)
 		AllocationResult:  "1-5,24-29",
+		TopologyAssignments: map[uint64]uint64{
+			uint64(0): 11,
+		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
 			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
@@ -487,6 +499,9 @@ func TestSNBInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 11, // 分配到numa0    (cpu0 -> reserved, cpu1~cpu5,cpu24~cpu29 for snb)
 		AllocationResult:  "1-5,24-29",
+		TopologyAssignments: map[uint64]uint64{
+			uint64(0): 11,
+		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
 			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
@@ -506,6 +521,9 @@ func TestSNBInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 11, // 分配到numa0    (cpu0 -> reserved, cpu1~cpu5,cpu24~cpu29 for snb)
 		AllocationResult:  "1-5,24-29",
+		TopologyAssignments: map[uint64]uint64{
+			uint64(0): 11,
+		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
 			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
@@ -639,6 +657,9 @@ func TestSNBInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 11, // 分配到numa0    (cpu0 -> reserved, cpu1~cpu5,cpu24~cpu29 for snb)
 		AllocationResult:  "1-5,24-29",
+		TopologyAssignments: map[uint64]uint64{
+			uint64(0): 11,
+		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
 			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
@@ -658,6 +679,9 @@ func TestSNBInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 11, // 分配到numa0    (cpu0 -> reserved, cpu1~cpu5,cpu24~cpu29 for snb)
 		AllocationResult:  "1-5,24-29",
+		TopologyAssignments: map[uint64]uint64{
+			uint64(0): 11,
+		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
 			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
@@ -757,6 +781,12 @@ func TestNonBindingShareCoresInplaceUpdateResize(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 10,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
+		TopologyAssignments: map[uint64]uint64{
+			uint64(0): 3,
+			uint64(1): 3,
+			uint64(2): 2,
+			uint64(3): 2,
+		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
 		},
@@ -829,6 +859,12 @@ func TestNonBindingShareCoresInplaceUpdateResize(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 10,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
+		TopologyAssignments: map[uint64]uint64{
+			uint64(0): 3,
+			uint64(1): 3,
+			uint64(2): 2,
+			uint64(3): 2,
+		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelSharedCores,
 			consts.PodAnnotationInplaceUpdateResizingKey: "true",
@@ -915,6 +951,12 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 42,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
+		TopologyAssignments: map[uint64]uint64{
+			uint64(0): 11,
+			uint64(1): 11,
+			uint64(2): 10,
+			uint64(3): 10,
+		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:           consts.PodAnnotationQoSLevelSharedCores,
 			consts.PodAnnotationAggregatedRequestsKey: "{\"cpu\":\"3\"}",
@@ -968,6 +1010,12 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 42,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
+		TopologyAssignments: map[uint64]uint64{
+			uint64(0): 11,
+			uint64(1): 11,
+			uint64(2): 10,
+			uint64(3): 10,
+		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:           consts.PodAnnotationQoSLevelSharedCores,
 			consts.PodAnnotationAggregatedRequestsKey: "{\"cpu\":\"3\"}",
@@ -1030,6 +1078,12 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 42,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
+		TopologyAssignments: map[uint64]uint64{
+			uint64(0): 11,
+			uint64(1): 11,
+			uint64(2): 10,
+			uint64(3): 10,
+		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelSharedCores,
 			consts.PodAnnotationInplaceUpdateResizingKey: "true",
@@ -1046,6 +1100,12 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 42,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
+		TopologyAssignments: map[uint64]uint64{
+			uint64(0): 11,
+			uint64(1): 11,
+			uint64(2): 10,
+			uint64(3): 10,
+		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelSharedCores,
 			consts.PodAnnotationInplaceUpdateResizingKey: "true",
@@ -1117,6 +1177,12 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 42,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
+		TopologyAssignments: map[uint64]uint64{
+			uint64(0): 11,
+			uint64(1): 11,
+			uint64(2): 10,
+			uint64(3): 10,
+		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelSharedCores,
 			consts.PodAnnotationInplaceUpdateResizingKey: "true",
@@ -1133,6 +1199,12 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 42,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
+		TopologyAssignments: map[uint64]uint64{
+			uint64(0): 11,
+			uint64(1): 11,
+			uint64(2): 10,
+			uint64(3): 10,
+		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelSharedCores,
 			consts.PodAnnotationInplaceUpdateResizingKey: "true",
