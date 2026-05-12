@@ -1102,7 +1102,7 @@ func (p *StaticPolicy) calculateHints(req *pluginapi.ResourceRequest) (map[strin
 	}
 
 	// check if restricted affinity requested
-	if !isReqAffinityRestricted(req.Annotations) {
+	if !util.IsNetworkAffinityRestricted(req.Annotations) {
 		general.InfoS("add all NUMAs to hint to avoid affinity error",
 			"podNamespace", req.PodNamespace,
 			"podName", req.PodName,
