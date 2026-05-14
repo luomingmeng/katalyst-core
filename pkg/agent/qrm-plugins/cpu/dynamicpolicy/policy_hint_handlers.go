@@ -39,6 +39,37 @@ import (
 	qosutil "github.com/kubewharf/katalyst-core/pkg/util/qos"
 )
 
+func (p *DynamicPolicy) checkVPAResizeCPUThreshold(
+	req *pluginapi.ResourceRequest,
+	request float64,
+	totalAssignable float64,
+	scope string,
+) error {
+	if req == nil {
+		return fmt.Errorf("got nil request")
+	}
+
+	ratio := p.vpaResizeCPUThresholdRatio
+	if ratio <= 0 || !util.PodInplaceUpdateResizing(req) {
+		return nil
+	}
+	if ratio > 1 {
+		return fmt.Errorf("invalid cpu vpa resize threshold ratio: %.3f", ratio)
+	}
+	if totalAssignable <= 0 {
+		return fmt.Errorf("pod: %s/%s, container: %s got non-positive cpu vpa resize threshold total assignable: %.3f, scope: %s",
+			req.PodNamespace, req.PodName, req.ContainerName, totalAssignable, scope)
+	}
+
+	allowed := totalAssignable * ratio
+	if !cpuutil.CPUIsSufficient(request, allowed) {
+		return fmt.Errorf("pod: %s/%s, container: %s cpu inplace update resize request %.3f exceeds threshold %.3f, total assignable: %.3f, ratio: %.3f, scope: %s",
+			req.PodNamespace, req.PodName, req.ContainerName, request, allowed, totalAssignable, ratio, scope)
+	}
+
+	return nil
+}
+
 func (p *DynamicPolicy) sharedCoresHintHandler(ctx context.Context,
 	req *pluginapi.ResourceRequest,
 ) (*pluginapi.ResourceHintsResponse, error) {
@@ -668,6 +699,13 @@ func (p *DynamicPolicy) sharedCoresWithNUMABindingHintHandler(_ context.Context,
 				return nil, fmt.Errorf("snb port not support cross numa")
 			}
 			nodeID := numaSet.ToSliceInt()[0]
+			if util.PodInplaceUpdateResizing(req) {
+				allocatableCPUQuantity := p.machineInfo.CPUDetails.CPUsInNUMANodes(nodeID).Difference(p.reservedCPUs).Size()
+				if err := p.checkVPAResizeCPUThreshold(req, request, float64(allocatableCPUQuantity), fmt.Sprintf("numa:%s", numaSet.String())); err != nil {
+					return nil, err
+				}
+			}
+
 			availableCPUQuantity := machineState[nodeID].GetAvailableCPUQuantity(p.reservedCPUs)
 			originRequest, _ := allocationInfo.GetPodAggregatedRequest()
 

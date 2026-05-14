@@ -17,6 +17,7 @@ limitations under the License.
 package dynamicpolicy
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -729,6 +730,210 @@ func TestPopulateHintsByAlreadyExistedNUMABindingResult(t *testing.T) {
 			}
 
 			assert.Equal(t, tt.wantHints, tt.hints)
+		})
+	}
+}
+
+func newTestPolicyForVPAResizeCPUThreshold(t *testing.T) *DynamicPolicy {
+	t.Helper()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	require.NoError(t, err)
+
+	policy, err := getTestDynamicPolicyWithoutInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+
+	policy.vpaResizeCPUThresholdRatio = 0.5
+	return policy
+}
+
+func newVPAResizeCPUThresholdReq(qosLevel string, reqCpu float64) *pluginapi.ResourceRequest {
+	return &pluginapi.ResourceRequest{
+		PodUid:         "pod-uid",
+		PodNamespace:   "default",
+		PodName:        "pod",
+		ContainerName:  "main",
+		ContainerType:  pluginapi.ContainerType_MAIN,
+		ContainerIndex: 0,
+		ResourceName:   string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{
+			string(v1.ResourceCPU): reqCpu,
+		},
+		Labels: map[string]string{
+			consts.PodAnnotationQoSLevelKey: qosLevel,
+		},
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey:              qosLevel,
+			consts.PodAnnotationMemoryEnhancementKey:     `{"numa_binding": "true"}`,
+			consts.PodAnnotationInplaceUpdateResizingKey: "true",
+		},
+	}
+}
+
+func TestCheckVPAResizeCPUThresholdReqNilError(t *testing.T) {
+	t.Parallel()
+	policy := newTestPolicyForVPAResizeCPUThreshold(t)
+	var req *pluginapi.ResourceRequest
+	policy.vpaResizeCPUThresholdRatio = 0.5
+	require.ErrorContains(t, policy.checkVPAResizeCPUThreshold(req, 1, -1, "numa 0"), "got nil request")
+}
+
+func TestCheckVPAResizeCPUThresholdInvalid(t *testing.T) {
+	t.Parallel()
+	policy := newTestPolicyForVPAResizeCPUThreshold(t)
+	req := newVPAResizeCPUThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 1)
+	policy.vpaResizeCPUThresholdRatio = 2
+	require.ErrorContains(t, policy.checkVPAResizeCPUThreshold(req, 1, 4, "numa 0"), "invalid")
+}
+
+func TestCheckVPAResizeCPUThresholdTotalAssignableError(t *testing.T) {
+	t.Parallel()
+	policy := newTestPolicyForVPAResizeCPUThreshold(t)
+	req := newVPAResizeCPUThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 1)
+	policy.vpaResizeCPUThresholdRatio = 0.5
+	require.ErrorContains(t, policy.checkVPAResizeCPUThreshold(req, 1, -1, "numa 0"), "non-positive")
+}
+
+func TestCheckVPAResizeCPUThresholdNUMABinding(t *testing.T) {
+	t.Parallel()
+	policy := newTestPolicyForVPAResizeCPUThreshold(t)
+	req := newVPAResizeCPUThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 1)
+
+	numaCPUSet := policy.machineInfo.CPUDetails.CPUsInNUMANodes(0)
+	allowed := float64(numaCPUSet.Size()) * policy.vpaResizeCPUThresholdRatio
+	require.NoError(t, policy.checkVPAResizeCPUThreshold(req, allowed, float64(numaCPUSet.Size()), "numa:0"))
+	require.ErrorContains(t, policy.checkVPAResizeCPUThreshold(req, allowed+0.001, float64(numaCPUSet.Size()), "numa:0"), "exceeds threshold")
+}
+
+func TestCheckVPAResizeCPUThresholdDisabled(t *testing.T) {
+	t.Parallel()
+	policy := newTestPolicyForVPAResizeCPUThreshold(t)
+	policy.vpaResizeCPUThresholdRatio = 0
+
+	req := newVPAResizeCPUThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 4)
+	require.NoError(t, policy.checkVPAResizeCPUThreshold(req, 100, 0, ""))
+}
+
+func TestVPAResizeCPUThresholdReject(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name           string
+		qosLevel       string
+		request        float64
+		allocationInfo *state.AllocationInfo
+		expectedError  bool
+	}{
+		{
+			name:     "shared numa binding with request less than vpa cpu threshold",
+			qosLevel: consts.PodAnnotationQoSLevelSharedCores,
+			request:  1,
+			allocationInfo: &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-uid",
+					PodNamespace:  "default",
+					PodName:       "pod",
+					ContainerName: "main",
+					Annotations: map[string]string{
+						consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+					},
+					QoSLevel: consts.PodAnnotationQoSLevelSharedCores,
+				},
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: machine.NewCPUSet(0, 1, 2, 3),
+				},
+				RequestQuantity: 1,
+			},
+			expectedError: false,
+		},
+		{
+			name:     "shared numa binding with request equals vpa cpu threshold",
+			qosLevel: consts.PodAnnotationQoSLevelSharedCores,
+			request:  1.5,
+			allocationInfo: &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-uid",
+					PodNamespace:  "default",
+					PodName:       "pod",
+					ContainerName: "main",
+					Annotations: map[string]string{
+						consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+					},
+					QoSLevel: consts.PodAnnotationQoSLevelSharedCores,
+				},
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: machine.NewCPUSet(0, 1, 2, 3),
+				},
+				RequestQuantity: 1,
+			},
+			expectedError: false,
+		},
+		{
+			name:     "shared numa binding with request greater than vpa cpu threshold",
+			qosLevel: consts.PodAnnotationQoSLevelSharedCores,
+			request:  1.6,
+			allocationInfo: &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-uid",
+					PodNamespace:  "default",
+					PodName:       "pod",
+					ContainerName: "main",
+					Annotations: map[string]string{
+						consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+					},
+					QoSLevel: consts.PodAnnotationQoSLevelSharedCores,
+				},
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: machine.NewCPUSet(0, 1, 2, 3),
+				},
+				RequestQuantity: 1,
+			},
+			expectedError: true,
+		},
+		{
+			name:     "shared numa binding with request equals all numa cpu allocatable",
+			qosLevel: consts.PodAnnotationQoSLevelSharedCores,
+			request:  3,
+			allocationInfo: &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-uid",
+					PodNamespace:  "default",
+					PodName:       "pod",
+					ContainerName: "main",
+					Annotations: map[string]string{
+						consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+					},
+					QoSLevel: consts.PodAnnotationQoSLevelSharedCores,
+				},
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: machine.NewCPUSet(0, 1, 2, 3),
+				},
+				RequestQuantity: 1,
+			},
+			expectedError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			policy := newTestPolicyForVPAResizeCPUThreshold(t)
+			policy.podAnnotationKeptKeys = []string{
+				consts.PodAnnotationInplaceUpdateResizingKey,
+			}
+			req := newVPAResizeCPUThresholdReq(tt.qosLevel, tt.request)
+			if tt.allocationInfo != nil {
+				policy.state.SetAllocationInfo(tt.allocationInfo.AllocationMeta.PodUid, tt.allocationInfo.AllocationMeta.ContainerName, tt.allocationInfo, true)
+				if tt.allocationInfo.CheckNUMABinding() {
+					req.Annotations[consts.PodAnnotationMemoryEnhancementNumaBinding] = consts.PodAnnotationMemoryEnhancementNumaBindingEnable
+				}
+			}
+			_, err := policy.GetTopologyHints(context.Background(), req)
+			if tt.expectedError {
+				require.ErrorContains(t, err, "exceeds threshold")
+			} else {
+				require.NoError(t, err)
+			}
 		})
 	}
 }
