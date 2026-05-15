@@ -19,6 +19,7 @@ package qrm
 import (
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/sets"
 	cliflag "k8s.io/component-base/cli/flag"
 
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
@@ -114,6 +115,8 @@ type ResctrlOptions struct {
 	MonGroupEnabledClosIDs []string
 	// MonGroupMaxCountRatio is the ratio of mon_groups max count in info/L3_MON/num_rmids
 	MonGroupMaxCountRatio float64
+
+	SkipCleanupClosIDs []string
 }
 
 func NewMemoryOptions() *MemoryOptions {
@@ -160,6 +163,7 @@ func NewMemoryOptions() *MemoryOptions {
 			DefaultSharedSubgroup:                 -1,
 			EnabledQoS:                            []string{apiconsts.PodAnnotationQoSLevelSharedCores},
 			MonGroupEnabledClosIDs:                []string{},
+			SkipCleanupClosIDs:                    []string{},
 		},
 		ExtraMemoryResources: []string{},
 	}
@@ -242,8 +246,8 @@ func (o *MemoryOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 		o.MonGroupEnabledClosIDs, "enabled-closid mon-groups")
 	fs.Float64Var(&o.MonGroupMaxCountRatio, "resctrl-mon-groups-max-count-ratio",
 		o.MonGroupMaxCountRatio, "ratio of mon_groups max count")
-	fs.StringSliceVar(&o.ExtraMemoryResources, "extra-memory-resources", o.ExtraMemoryResources,
-		"extra memory resources such as hugepages-*")
+	fs.StringSliceVar(&o.SkipCleanupClosIDs, "resctrl-skip-cleanup-closids",
+		o.SkipCleanupClosIDs, "a list of resctrl closID directories to skip cleaning")
 }
 
 func (o *MemoryOptions) ApplyTo(conf *qrmconfig.MemoryQRMPluginConfig) error {
@@ -283,7 +287,7 @@ func (o *MemoryOptions) ApplyTo(conf *qrmconfig.MemoryQRMPluginConfig) error {
 	conf.EnabledQoS = o.EnabledQoS
 	conf.MonGroupEnabledClosIDs = o.MonGroupEnabledClosIDs
 	conf.MonGroupMaxCountRatio = o.MonGroupMaxCountRatio
-	conf.ExtraMemoryResources = o.ExtraMemoryResources
+	conf.SkipCleanupClosIDs = sets.NewString(o.SkipCleanupClosIDs...)
 
 	for _, reservation := range o.ReservedNumaMemory {
 		conf.ReservedNumaMemory[reservation.NumaNode] = reservation.Limits

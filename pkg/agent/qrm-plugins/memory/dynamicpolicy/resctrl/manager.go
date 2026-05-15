@@ -120,7 +120,7 @@ func (m *managerImpl) Cleanup(activePodUIDs sets.String) error {
 	root := m.root
 	m.RUnlock()
 
-	walkMonGroupsDirs(root, func(uid, closID, path string) {
+	walkMonGroupsDirs(root, m.config.SkipCleanupClosIDs, func(uid, closID, path string) {
 		if activePodUIDs.Has(uid) || !isTasksEmpty(path) {
 			return
 		}
@@ -182,7 +182,7 @@ func isTasksEmpty(root string) bool {
 	return f.Size() == 0
 }
 
-func walkMonGroupsDirs(root string, walkMonGroupsFunc func(uid, closID, path string), walkClosIDFunc func(closID, path string)) {
+func walkMonGroupsDirs(root string, skipClosIDs sets.String, walkMonGroupsFunc func(uid, closID, path string), walkClosIDFunc func(closID, path string)) {
 	subdirs, err := os.ReadDir(root)
 	if err != nil {
 		general.Errorf("resctrl: read root %s error: %v", root, err)
@@ -196,6 +196,9 @@ func walkMonGroupsDirs(root string, walkMonGroupsFunc func(uid, closID, path str
 			continue
 		}
 		closID := subdir.Name()
+		if skipClosIDs != nil && skipClosIDs.Has(closID) {
+			continue
+		}
 		monGroupPath := filepath.Join(root, closID, MonGroupsDir)
 
 		monGroupsSubdirs, err := os.ReadDir(monGroupPath)

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 type MemoryQRMPluginConfig struct {
@@ -138,6 +139,9 @@ type ResctrlConfig struct {
 	MonGroupEnabledClosIDs []string
 	// MonGroupMaxCountRatio is the ratio of mon_groups max count in info/L3_MON/num_rmids
 	MonGroupMaxCountRatio float64
+
+	// SkipCleanupClosIDs is a list of resctrl closID directories to skip cleaning
+	SkipCleanupClosIDs sets.String
 }
 
 func NewMemoryQRMPluginConfig() *MemoryQRMPluginConfig {

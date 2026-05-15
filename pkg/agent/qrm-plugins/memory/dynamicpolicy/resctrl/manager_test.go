@@ -222,6 +222,61 @@ func TestManagerImpl_Cleanup_Disabled(t *testing.T) {
 	assert.NoError(t, err, "inactive pod dir should still exist when cleanup is disabled")
 }
 
+func TestManagerImpl_Cleanup_SkipClosIDs(t *testing.T) {
+	t.Parallel()
+	tmpDir, err := os.MkdirTemp("", "resctrl_cleanup_skip_test")
+	assert.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	m := &managerImpl{
+		root: tmpDir,
+		config: &qrm.ResctrlConfig{
+			EnableResctrlGroupLifecycleManagement: true,
+			SkipCleanupClosIDs:                    sets.NewString("shared-skip", "non-exist-skip", ""),
+		},
+	}
+	m.enabled.Store(true)
+
+	// Create a dir that will be skipped
+	err = m.Create("skip_pod", "shared-skip", true)
+	assert.NoError(t, err)
+	skipPodPath := filepath.Join(tmpDir, "shared-skip", MonGroupsDir, PodDirPrefix+"skip_pod")
+	err = os.MkdirAll(skipPodPath, 0o755)
+	assert.NoError(t, err)
+	err = os.WriteFile(filepath.Join(skipPodPath, tasks), []byte(""), 0o644)
+	assert.NoError(t, err)
+
+	// Create a dir that will NOT be skipped
+	err = m.Create("noskip_pod", "shared-noskip", true)
+	assert.NoError(t, err)
+	noskipPodPath := filepath.Join(tmpDir, "shared-noskip", MonGroupsDir, PodDirPrefix+"noskip_pod")
+	err = os.MkdirAll(noskipPodPath, 0o755)
+	assert.NoError(t, err)
+	err = os.WriteFile(filepath.Join(noskipPodPath, tasks), []byte(""), 0o644)
+	assert.NoError(t, err)
+
+	// Run Cleanup
+	activeUIDs := sets.NewString()
+	err = m.Cleanup(activeUIDs)
+	assert.NoError(t, err)
+
+	// Verify skipped dir should STILL exist
+	_, err = os.Stat(skipPodPath)
+	assert.NoError(t, err, "skipped pod dir should still exist")
+
+	// Verify not skipped dir should be gone
+	_, err = os.Stat(noskipPodPath)
+	assert.True(t, os.IsNotExist(err), "not skipped pod dir should be cleaned up")
+
+	// Verify skipped closID dir should STILL exist
+	_, err = os.Stat(filepath.Join(tmpDir, "shared-skip"))
+	assert.NoError(t, err, "skipped closID dir should still exist")
+
+	// Verify not skipped closID dir should be gone
+	_, err = os.Stat(filepath.Join(tmpDir, "shared-noskip"))
+	assert.True(t, os.IsNotExist(err), "not skipped closID dir should be cleaned up")
+}
+
 func TestManagerImpl_GetMonGroupsCount(t *testing.T) {
 	t.Parallel()
 	tmpDir, err := os.MkdirTemp("", "resctrl_count_test")
