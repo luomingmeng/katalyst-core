@@ -25,6 +25,8 @@ import (
 	"path/filepath"
 
 	"github.com/moby/sys/mountinfo"
+
+	"github.com/kubewharf/katalyst-core/pkg/consts"
 )
 
 func findResctrlMountpointDir() (string, error) {
@@ -44,7 +46,7 @@ func findResctrlMountpointDir() (string, error) {
 	}
 
 	// 2. Fallback to default path check
-	defaultPath := "/sys/fs/resctrl"
+	defaultPath := consts.DefaultResctrlRootDir
 	if _, err := os.Stat(filepath.Join(defaultPath, cpus)); err == nil {
 		if _, err := os.Stat(filepath.Join(defaultPath, schemata)); err == nil {
 			return defaultPath, nil
