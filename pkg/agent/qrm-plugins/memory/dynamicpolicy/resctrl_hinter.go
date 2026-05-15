@@ -36,6 +36,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/memory/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/qrm"
+	"github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 )
@@ -43,7 +44,6 @@ import (
 const (
 	templateSharedSubgroup = "shared-%02d"
 	sharedGroup            = "share"
-	resctrlRoot            = "/sys/fs/resctrl"
 
 	metricNameResctrlMonGroupsNum       = "resctrl_mon_groups_num"
 	metricNameResctrlMonGroupsOverlimit = "resctrl_mon_groups_over_limit"
@@ -235,7 +235,7 @@ func newResctrlHinter(config *qrm.ResctrlConfig, emitter metrics.MetricEmitter, 
 	r := &resctrlHinter{
 		emitter: emitter,
 		config:  config,
-		root:    resctrlRoot,
+		root:    consts.DefaultResctrlRootDir,
 		manager: resctrl.NewManager(config),
 		state:   state,
 	}

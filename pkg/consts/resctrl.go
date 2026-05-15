@@ -29,4 +29,6 @@ const (
 	ResctrlSubgroupSeparator            = "-"
 	ResctrlShareSubgroupPrefix          = "share-"
 	ResctrlObsoleteSharedSubgroupPrefix = "shared-"
+
+	DefaultResctrlRootDir = "/sys/fs/resctrl"
 )
