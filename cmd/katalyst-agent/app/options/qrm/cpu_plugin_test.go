@@ -20,11 +20,28 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	cliflag "k8s.io/component-base/cli/flag"
 
 	qrmconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm"
 )
 
-func TestCPUOptionsApplyToVPAResizeCPUThresholdRatio(t *testing.T) {
+func TestCPUOptionsAddFlagsSNBCPUThresholdRatio(t *testing.T) {
+	t.Parallel()
+
+	options := NewCPUOptions()
+	fss := &cliflag.NamedFlagSets{}
+	options.AddFlags(fss)
+
+	fs := fss.FlagSet("cpu_resource_plugin")
+	flag := fs.Lookup("snb-cpu-threshold-ratio")
+	require.NotNil(t, flag)
+	require.Equal(t, "0", flag.DefValue)
+
+	require.NoError(t, fs.Set("snb-cpu-threshold-ratio", "0.75"))
+	require.Equal(t, 0.75, options.SNBCPUThresholdRatio)
+}
+
+func TestCPUOptionsApplyToSNBCPUThresholdRatio(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
@@ -41,7 +58,7 @@ func TestCPUOptionsApplyToVPAResizeCPUThresholdRatio(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			options := NewCPUOptions()
-			options.VPAResizeCPUThresholdRatio = tc.ratio
+			options.SNBCPUThresholdRatio = tc.ratio
 			conf := qrmconfig.NewCPUQRMPluginConfig()
 			err := options.ApplyTo(conf)
 
@@ -50,7 +67,7 @@ func TestCPUOptionsApplyToVPAResizeCPUThresholdRatio(t *testing.T) {
 				return
 			}
 			require.NoError(t, err)
-			require.Equal(t, tc.ratio, conf.VPAResizeCPUThresholdRatio)
+			require.Equal(t, tc.ratio, conf.SNBCPUThresholdRatio)
 		})
 	}
 }

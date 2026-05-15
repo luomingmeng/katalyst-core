@@ -39,7 +39,7 @@ import (
 	qosutil "github.com/kubewharf/katalyst-core/pkg/util/qos"
 )
 
-func (p *DynamicPolicy) checkVPAResizeCPUThreshold(
+func (p *DynamicPolicy) checkSNBCPUThreshold(
 	req *pluginapi.ResourceRequest,
 	request float64,
 	totalAssignable float64,
@@ -49,25 +49,80 @@ func (p *DynamicPolicy) checkVPAResizeCPUThreshold(
 		return fmt.Errorf("got nil request")
 	}
 
-	ratio := p.vpaResizeCPUThresholdRatio
-	if ratio <= 0 || !util.PodInplaceUpdateResizing(req) {
+	ratio := p.snbCPUThresholdRatio
+	if ratio <= 0 {
 		return nil
 	}
 	if ratio > 1 {
-		return fmt.Errorf("invalid cpu vpa resize threshold ratio: %.3f", ratio)
+		return fmt.Errorf("invalid shared_cores numa_binding cpu threshold ratio: %.3f", ratio)
 	}
+
 	if totalAssignable <= 0 {
-		return fmt.Errorf("pod: %s/%s, container: %s got non-positive cpu vpa resize threshold total assignable: %.3f, scope: %s",
+		return fmt.Errorf("pod: %s/%s, container: %s got non-positive shared_cores numa_binding cpu threshold total assignable: %.3f, scope: %s",
 			req.PodNamespace, req.PodName, req.ContainerName, totalAssignable, scope)
 	}
 
 	allowed := totalAssignable * ratio
 	if !cpuutil.CPUIsSufficient(request, allowed) {
-		return fmt.Errorf("pod: %s/%s, container: %s cpu inplace update resize request %.3f exceeds threshold %.3f, total assignable: %.3f, ratio: %.3f, scope: %s",
+		return fmt.Errorf("pod: %s/%s, container: %s shared_cores numa_binding cpu request %.3f exceeds threshold %.3f, total assignable: %.3f, ratio: %.3f, scope: %s",
 			req.PodNamespace, req.PodName, req.ContainerName, request, allowed, totalAssignable, ratio, scope)
 	}
-
 	return nil
+}
+
+func (p *DynamicPolicy) filterHintsBySNBCPUThreshold(
+	req *pluginapi.ResourceRequest,
+	request float64,
+	hints map[string]*pluginapi.ListOfTopologyHints,
+) (map[string]*pluginapi.ListOfTopologyHints, error) {
+	if req == nil {
+		return nil, fmt.Errorf("got nil request")
+	}
+
+	if p.snbCPUThresholdRatio <= 0 {
+		return hints, nil
+	}
+	if p.snbCPUThresholdRatio > 1 {
+		return nil, fmt.Errorf("invalid shared_cores numa_binding cpu threshold ratio: %.3f", p.snbCPUThresholdRatio)
+	}
+
+	cpuHints := hints[string(v1.ResourceCPU)]
+	if cpuHints == nil {
+		return hints, nil
+	}
+	if len(cpuHints.Hints) == 0 {
+		return nil, cpuutil.ErrNoAvailableCPUHints
+	}
+
+	filteredTopologyHints := make([]*pluginapi.TopologyHint, 0, len(cpuHints.Hints))
+	scope := ""
+	for _, hint := range cpuHints.Hints {
+		if hint == nil {
+			continue
+		}
+
+		hintNUMASet, err := machine.NewCPUSetUint64(hint.Nodes...)
+		if err != nil {
+			return nil, err
+		}
+
+		totalAssignable := float64(p.machineInfo.CPUDetails.CPUsInNUMANodes(hintNUMASet.ToSliceInt()...).Difference(p.reservedCPUs).Size())
+		if err := p.checkSNBCPUThreshold(req, request, totalAssignable, fmt.Sprintf("numa:%s", hintNUMASet.String())); err != nil {
+			general.Warningf("filter out topology hint %v for pod: %s/%s container %s error: %v",
+				hint.Nodes, req.PodNamespace, req.PodName, req.ContainerName, err)
+			scope += fmt.Sprintf("numa%s ", hintNUMASet.String())
+			continue
+		}
+		filteredTopologyHints = append(filteredTopologyHints, hint)
+	}
+
+	if len(filteredTopologyHints) == 0 {
+		return nil, fmt.Errorf("pod: %s/%s, container: %s shared_cores numa_binding cpu request %.3f exceeds threshold, ratio: %.3f, scope: %s: %w",
+			req.PodNamespace, req.PodName, req.ContainerName, request, p.snbCPUThresholdRatio, scope, cpuutil.ErrNoAvailableCPUHints)
+	}
+
+	hints[string(v1.ResourceCPU)] = &pluginapi.ListOfTopologyHints{Hints: filteredTopologyHints}
+	return hints, nil
 }
 
 func (p *DynamicPolicy) sharedCoresHintHandler(ctx context.Context,
@@ -699,13 +754,6 @@ func (p *DynamicPolicy) sharedCoresWithNUMABindingHintHandler(_ context.Context,
 				return nil, fmt.Errorf("snb port not support cross numa")
 			}
 			nodeID := numaSet.ToSliceInt()[0]
-			if util.PodInplaceUpdateResizing(req) {
-				allocatableCPUQuantity := p.machineInfo.CPUDetails.CPUsInNUMANodes(nodeID).Difference(p.reservedCPUs).Size()
-				if err := p.checkVPAResizeCPUThreshold(req, request, float64(allocatableCPUQuantity), fmt.Sprintf("numa:%s", numaSet.String())); err != nil {
-					return nil, err
-				}
-			}
-
 			availableCPUQuantity := machineState[nodeID].GetAvailableCPUQuantity(p.reservedCPUs)
 			originRequest, _ := allocationInfo.GetPodAggregatedRequest()
 
@@ -727,9 +775,13 @@ func (p *DynamicPolicy) sharedCoresWithNUMABindingHintHandler(_ context.Context,
 			return nil, fmt.Errorf("calculateHintsForNUMABindingSharedCores failed with error: %v", calculateErr)
 		}
 	}
-
 	if err := AccompanyResourceRegistry.GetAccompanyResourceTopologyHints(req, hints[string(v1.ResourceCPU)]); err != nil {
 		return nil, fmt.Errorf("accompany resource AugmentTopologyHints failed with error: %v", err)
+	}
+
+	hints, err = p.filterHintsBySNBCPUThreshold(req, request, hints)
+	if err != nil {
+		return nil, err
 	}
 
 	return util.PackResourceHintsResponse(req, string(v1.ResourceCPU), hints)

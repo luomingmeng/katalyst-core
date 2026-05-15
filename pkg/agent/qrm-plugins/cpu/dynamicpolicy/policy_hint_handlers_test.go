@@ -29,6 +29,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/hintoptimizer"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	cpuutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/util"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
@@ -734,7 +735,7 @@ func TestPopulateHintsByAlreadyExistedNUMABindingResult(t *testing.T) {
 	}
 }
 
-func newTestPolicyForVPAResizeCPUThreshold(t *testing.T) *DynamicPolicy {
+func newTestPolicyForSNBCPUThreshold(t *testing.T, ratio float64) *DynamicPolicy {
 	t.Helper()
 
 	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
@@ -743,11 +744,23 @@ func newTestPolicyForVPAResizeCPUThreshold(t *testing.T) *DynamicPolicy {
 	policy, err := getTestDynamicPolicyWithoutInitialization(cpuTopology, t.TempDir())
 	require.NoError(t, err)
 
-	policy.vpaResizeCPUThresholdRatio = 0.5
+	policy.podAnnotationKeptKeys = []string{
+		consts.PodAnnotationInplaceUpdateResizingKey,
+	}
+
+	policy.snbCPUThresholdRatio = ratio
 	return policy
 }
 
-func newVPAResizeCPUThresholdReq(qosLevel string, reqCpu float64) *pluginapi.ResourceRequest {
+func newSNBCPUThresholdReq(qosLevel string, reqCPU float64, inplaceResize bool) *pluginapi.ResourceRequest {
+	annotations := map[string]string{
+		consts.PodAnnotationQoSLevelKey:          qosLevel,
+		consts.PodAnnotationMemoryEnhancementKey: `{"numa_binding": "true"}`,
+	}
+	if inplaceResize {
+		annotations[consts.PodAnnotationInplaceUpdateResizingKey] = "true"
+	}
+
 	return &pluginapi.ResourceRequest{
 		PodUid:         "pod-uid",
 		PodNamespace:   "default",
@@ -757,76 +770,155 @@ func newVPAResizeCPUThresholdReq(qosLevel string, reqCpu float64) *pluginapi.Res
 		ContainerIndex: 0,
 		ResourceName:   string(v1.ResourceCPU),
 		ResourceRequests: map[string]float64{
-			string(v1.ResourceCPU): reqCpu,
+			string(v1.ResourceCPU): reqCPU,
 		},
 		Labels: map[string]string{
 			consts.PodAnnotationQoSLevelKey: qosLevel,
 		},
-		Annotations: map[string]string{
-			consts.PodAnnotationQoSLevelKey:              qosLevel,
-			consts.PodAnnotationMemoryEnhancementKey:     `{"numa_binding": "true"}`,
-			consts.PodAnnotationInplaceUpdateResizingKey: "true",
-		},
+		Annotations: annotations,
 	}
 }
 
-func TestCheckVPAResizeCPUThresholdReqNilError(t *testing.T) {
+func TestCheckSNBCPUThresholdReqNilError(t *testing.T) {
 	t.Parallel()
-	policy := newTestPolicyForVPAResizeCPUThreshold(t)
+	policy := newTestPolicyForSNBCPUThreshold(t, 0.5)
 	var req *pluginapi.ResourceRequest
-	policy.vpaResizeCPUThresholdRatio = 0.5
-	require.ErrorContains(t, policy.checkVPAResizeCPUThreshold(req, 1, -1, "numa 0"), "got nil request")
+	require.ErrorContains(t, policy.checkSNBCPUThreshold(req, 1, -1, "numa 0"), "got nil request")
 }
 
-func TestCheckVPAResizeCPUThresholdInvalid(t *testing.T) {
+func TestCheckSNBCPUThresholdInvalid(t *testing.T) {
 	t.Parallel()
-	policy := newTestPolicyForVPAResizeCPUThreshold(t)
-	req := newVPAResizeCPUThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 1)
-	policy.vpaResizeCPUThresholdRatio = 2
-	require.ErrorContains(t, policy.checkVPAResizeCPUThreshold(req, 1, 4, "numa 0"), "invalid")
+	policy := newTestPolicyForSNBCPUThreshold(t, 2)
+	req := newSNBCPUThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 1, false)
+	require.ErrorContains(t, policy.checkSNBCPUThreshold(req, 1, 4, "numa 0"), "invalid")
 }
 
-func TestCheckVPAResizeCPUThresholdTotalAssignableError(t *testing.T) {
+func TestCheckSNBCPUThresholdTotalAssignableError(t *testing.T) {
 	t.Parallel()
-	policy := newTestPolicyForVPAResizeCPUThreshold(t)
-	req := newVPAResizeCPUThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 1)
-	policy.vpaResizeCPUThresholdRatio = 0.5
-	require.ErrorContains(t, policy.checkVPAResizeCPUThreshold(req, 1, -1, "numa 0"), "non-positive")
+	policy := newTestPolicyForSNBCPUThreshold(t, 0.5)
+	req := newSNBCPUThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 1, false)
+	require.ErrorContains(t, policy.checkSNBCPUThreshold(req, 1, -1, "numa 0"), "non-positive")
 }
 
-func TestCheckVPAResizeCPUThresholdNUMABinding(t *testing.T) {
+func TestCheckSNBCPUThreshold(t *testing.T) {
 	t.Parallel()
-	policy := newTestPolicyForVPAResizeCPUThreshold(t)
-	req := newVPAResizeCPUThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 1)
+	policy := newTestPolicyForSNBCPUThreshold(t, 0.5)
+	req := newSNBCPUThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 1, false)
 
 	numaCPUSet := policy.machineInfo.CPUDetails.CPUsInNUMANodes(0)
-	allowed := float64(numaCPUSet.Size()) * policy.vpaResizeCPUThresholdRatio
-	require.NoError(t, policy.checkVPAResizeCPUThreshold(req, allowed, float64(numaCPUSet.Size()), "numa:0"))
-	require.ErrorContains(t, policy.checkVPAResizeCPUThreshold(req, allowed+0.001, float64(numaCPUSet.Size()), "numa:0"), "exceeds threshold")
+	allowed := float64(numaCPUSet.Size()) * policy.snbCPUThresholdRatio
+	require.NoError(t, policy.checkSNBCPUThreshold(req, allowed, float64(numaCPUSet.Size()), "numa:0"))
+	require.ErrorContains(t, policy.checkSNBCPUThreshold(req, allowed+0.001, float64(numaCPUSet.Size()), "numa:0"), "exceeds threshold")
 }
 
-func TestCheckVPAResizeCPUThresholdDisabled(t *testing.T) {
+func TestCheckSNBCPUThresholdDisabled(t *testing.T) {
 	t.Parallel()
-	policy := newTestPolicyForVPAResizeCPUThreshold(t)
-	policy.vpaResizeCPUThresholdRatio = 0
+	policy := newTestPolicyForSNBCPUThreshold(t, 0)
 
-	req := newVPAResizeCPUThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 4)
-	require.NoError(t, policy.checkVPAResizeCPUThreshold(req, 100, 0, ""))
+	req := newSNBCPUThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 4, false)
+	require.NoError(t, policy.checkSNBCPUThreshold(req, 100, 0, ""))
 }
 
-func TestVPAResizeCPUThresholdReject(t *testing.T) {
+func TestFilterHintsBySNBCPUThresholdEmptyHints(t *testing.T) {
+	t.Parallel()
+	policy := newTestPolicyForSNBCPUThreshold(t, 0.5)
+	req := newSNBCPUThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 1, false)
+
+	_, err := policy.filterHintsBySNBCPUThreshold(req, 1, map[string]*pluginapi.ListOfTopologyHints{
+		string(v1.ResourceCPU): {Hints: []*pluginapi.TopologyHint{}},
+	})
+	require.ErrorIs(t, err, cpuutil.ErrNoAvailableCPUHints)
+}
+
+func TestFilterHintsBySNBCPUThresholdDefensiveBranches(t *testing.T) {
+	t.Parallel()
+
+	req := newSNBCPUThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 1, false)
+
+	for _, tt := range []struct {
+		name        string
+		ratio       float64
+		req         *pluginapi.ResourceRequest
+		hints       map[string]*pluginapi.ListOfTopologyHints
+		wantErr     string
+		wantHintLen int
+	}{
+		{
+			name:    "nil request",
+			ratio:   0.5,
+			hints:   map[string]*pluginapi.ListOfTopologyHints{},
+			wantErr: "got nil request",
+		},
+		{
+			name:  "invalid ratio",
+			ratio: 2,
+			req:   req,
+			hints: map[string]*pluginapi.ListOfTopologyHints{
+				string(v1.ResourceCPU): {Hints: []*pluginapi.TopologyHint{{Nodes: []uint64{0}, Preferred: true}}},
+			},
+			wantErr: "invalid",
+		},
+		{
+			name:  "nil cpu hints",
+			ratio: 0.5,
+			req:   req,
+			hints: map[string]*pluginapi.ListOfTopologyHints{
+				string(v1.ResourceCPU): nil,
+			},
+		},
+		{
+			name:  "nil topology hint skipped",
+			ratio: 0.5,
+			req:   req,
+			hints: map[string]*pluginapi.ListOfTopologyHints{
+				string(v1.ResourceCPU): {Hints: []*pluginapi.TopologyHint{nil, {Nodes: []uint64{0}, Preferred: true}}},
+			},
+			wantHintLen: 1,
+		},
+		{
+			name:  "invalid topology hint node",
+			ratio: 0.5,
+			req:   req,
+			hints: map[string]*pluginapi.ListOfTopologyHints{
+				string(v1.ResourceCPU): {Hints: []*pluginapi.TopologyHint{{Nodes: []uint64{^uint64(0)}, Preferred: true}}},
+			},
+			wantErr: "parse elem",
+		},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			policy := newTestPolicyForSNBCPUThreshold(t, tt.ratio)
+			filteredHints, err := policy.filterHintsBySNBCPUThreshold(tt.req, 1, tt.hints)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+
+			require.NoError(t, err)
+			if tt.wantHintLen > 0 {
+				require.Len(t, filteredHints[string(v1.ResourceCPU)].Hints, tt.wantHintLen)
+			}
+		})
+	}
+}
+
+func TestSNBCPUThresholdRejectExistingAllocation(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name           string
 		qosLevel       string
-		request        float64
+		reqCount       float64
+		inplaceResize  bool
 		allocationInfo *state.AllocationInfo
 		expectedError  bool
 	}{
 		{
-			name:     "shared numa binding with request less than vpa cpu threshold",
-			qosLevel: consts.PodAnnotationQoSLevelSharedCores,
-			request:  1,
+			name:          "non-vpa shared numa binding with request less than cpu threshold",
+			qosLevel:      consts.PodAnnotationQoSLevelSharedCores,
+			reqCount:      1.5,
+			inplaceResize: false,
 			allocationInfo: &state.AllocationInfo{
 				AllocationMeta: commonstate.AllocationMeta{
 					PodUid:        "pod-uid",
@@ -846,9 +938,10 @@ func TestVPAResizeCPUThresholdReject(t *testing.T) {
 			expectedError: false,
 		},
 		{
-			name:     "shared numa binding with request equals vpa cpu threshold",
-			qosLevel: consts.PodAnnotationQoSLevelSharedCores,
-			request:  1.5,
+			name:          "vpa shared numa binding with request equals cpu threshold",
+			qosLevel:      consts.PodAnnotationQoSLevelSharedCores,
+			reqCount:      1.5,
+			inplaceResize: true,
 			allocationInfo: &state.AllocationInfo{
 				AllocationMeta: commonstate.AllocationMeta{
 					PodUid:        "pod-uid",
@@ -868,9 +961,10 @@ func TestVPAResizeCPUThresholdReject(t *testing.T) {
 			expectedError: false,
 		},
 		{
-			name:     "shared numa binding with request greater than vpa cpu threshold",
-			qosLevel: consts.PodAnnotationQoSLevelSharedCores,
-			request:  1.6,
+			name:          "non-vpa shared numa binding with request greater than cpu threshold",
+			qosLevel:      consts.PodAnnotationQoSLevelSharedCores,
+			reqCount:      1.8,
+			inplaceResize: false,
 			allocationInfo: &state.AllocationInfo{
 				AllocationMeta: commonstate.AllocationMeta{
 					PodUid:        "pod-uid",
@@ -890,9 +984,10 @@ func TestVPAResizeCPUThresholdReject(t *testing.T) {
 			expectedError: true,
 		},
 		{
-			name:     "shared numa binding with request equals all numa cpu allocatable",
-			qosLevel: consts.PodAnnotationQoSLevelSharedCores,
-			request:  3,
+			name:          "vpa shared numa binding with request equals all numa cpu allocatable",
+			qosLevel:      consts.PodAnnotationQoSLevelSharedCores,
+			reqCount:      1.8,
+			inplaceResize: true,
 			allocationInfo: &state.AllocationInfo{
 				AllocationMeta: commonstate.AllocationMeta{
 					PodUid:        "pod-uid",
@@ -917,11 +1012,8 @@ func TestVPAResizeCPUThresholdReject(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			policy := newTestPolicyForVPAResizeCPUThreshold(t)
-			policy.podAnnotationKeptKeys = []string{
-				consts.PodAnnotationInplaceUpdateResizingKey,
-			}
-			req := newVPAResizeCPUThresholdReq(tt.qosLevel, tt.request)
+			policy := newTestPolicyForSNBCPUThreshold(t, 0.5)
+			req := newSNBCPUThresholdReq(tt.qosLevel, tt.reqCount, tt.inplaceResize)
 			if tt.allocationInfo != nil {
 				policy.state.SetAllocationInfo(tt.allocationInfo.AllocationMeta.PodUid, tt.allocationInfo.AllocationMeta.ContainerName, tt.allocationInfo, true)
 				if tt.allocationInfo.CheckNUMABinding() {
@@ -929,10 +1021,66 @@ func TestVPAResizeCPUThresholdReject(t *testing.T) {
 				}
 			}
 			_, err := policy.GetTopologyHints(context.Background(), req)
+
 			if tt.expectedError {
 				require.ErrorContains(t, err, "exceeds threshold")
+				require.ErrorIs(t, err, cpuutil.ErrNoAvailableCPUHints)
 			} else {
 				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestSNBCPUThresholdRejectNewPod(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name             string
+		reqCount         float64
+		expectedError    bool
+		expectedRespSize int
+	}{
+		{
+			name:             "request less than cpu threshold",
+			reqCount:         1,
+			expectedRespSize: 4,
+		},
+		{
+			name:             "request equals cpu threshold",
+			reqCount:         1.5,
+			expectedRespSize: 4,
+		},
+		{
+			name:             "request greater than cpu threshold slightly",
+			reqCount:         2,
+			expectedRespSize: 2,
+		},
+		{
+			name:             "request greater than cpu threshold",
+			reqCount:         2.1,
+			expectedError:    true,
+			expectedRespSize: 0,
+		},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			policy := newTestPolicyForSNBCPUThreshold(t, 0.5)
+			req := newSNBCPUThresholdReq(consts.PodAnnotationQoSLevelSharedCores, tt.reqCount, false)
+
+			resp, err := policy.GetTopologyHints(context.Background(), req)
+			if tt.expectedError {
+				require.ErrorContains(t, err, "exceeds threshold")
+				require.ErrorIs(t, err, cpuutil.ErrNoAvailableCPUHints)
+			} else {
+				require.NoError(t, err)
+			}
+			if resp != nil {
+				require.Equal(t, tt.expectedRespSize, len(resp.ResourceHints[string(v1.ResourceCPU)].Hints))
+			} else {
+				require.Equal(t, tt.expectedRespSize, 0)
 			}
 		})
 	}

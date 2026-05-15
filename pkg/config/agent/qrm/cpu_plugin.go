@@ -71,9 +71,9 @@ type CPUDynamicPolicyConfig struct {
 	EnableDefaultSharedCoresCPUBurst bool
 	// EnableCPUBurstForMainContainerOnly indicates whether cpu burst is only enabled for the main container
 	EnableCPUBurstForMainContainerOnly bool
-	// VPAResizeCPUThresholdRatio limits in-place resize CPU request by current NUMA binding or pool size.
-	// 0 means disabled. Only support shared cores with numa binding.
-	VPAResizeCPUThresholdRatio float64
+	// SNBCPUThresholdRatio limits shared_cores NUMA binding CPU request by NUMA total assignable CPU.
+	// 0 means disabled.
+	SNBCPUThresholdRatio float64
 
 	*hintoptimizer.HintOptimizerConfiguration
 	*irqtuner.IRQTunerConfiguration

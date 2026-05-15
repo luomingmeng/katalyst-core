@@ -56,7 +56,7 @@ type CPUDynamicPolicyOptions struct {
 	EnableDefaultDedicatedCoresCPUBurst bool
 	EnableDefaultSharedCoresCPUBurst    bool
 	EnableCPUBurstForMainContainerOnly  bool
-	VPAResizeCPUThresholdRatio          float64
+	SNBCPUThresholdRatio                float64
 	*irqtuner.IRQTunerOptions
 	*hintoptimizer.HintOptimizerOptions
 }
@@ -145,8 +145,8 @@ func (o *CPUOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 		o.EnableDefaultDedicatedCoresCPUBurst, "if set true, it will enable cpu burst for dedicated cores by default")
 	fs.BoolVar(&o.EnableCPUBurstForMainContainerOnly, "enable-cpu-burst-for-main-container-only",
 		o.EnableCPUBurstForMainContainerOnly, "if set true, it will enable cpu burst for main container only")
-	fs.Float64Var(&o.VPAResizeCPUThresholdRatio, "vpa-resize-cpu-threshold-ratio",
-		o.VPAResizeCPUThresholdRatio, "ratio in [0,1] to limit inplace resize CPU request by current NUMA binding or pool size; 0 disables the limit")
+	fs.Float64Var(&o.SNBCPUThresholdRatio, "snb-cpu-threshold-ratio",
+		o.SNBCPUThresholdRatio, "ratio in [0,1] to limit shared_cores NUMA binding CPU request by NUMA total assignable CPU; 0 disables the limit")
 	o.HintOptimizerOptions.AddFlags(fss)
 	o.IRQTunerOptions.AddFlags(fss)
 }
@@ -172,10 +172,10 @@ func (o *CPUOptions) ApplyTo(conf *qrmconfig.CPUQRMPluginConfig) error {
 	conf.EnableDefaultDedicatedCoresCPUBurst = o.EnableDefaultDedicatedCoresCPUBurst
 	conf.EnableDefaultSharedCoresCPUBurst = o.EnableDefaultSharedCoresCPUBurst
 	conf.EnableCPUBurstForMainContainerOnly = o.EnableCPUBurstForMainContainerOnly
-	if o.VPAResizeCPUThresholdRatio < 0 || o.VPAResizeCPUThresholdRatio > 1 {
-		return fmt.Errorf("vpa-resize-cpu-threshold-ratio should be in [0,1], got %v", o.VPAResizeCPUThresholdRatio)
+	if o.SNBCPUThresholdRatio < 0 || o.SNBCPUThresholdRatio > 1 {
+		return fmt.Errorf("snb-cpu-threshold-ratio should be in [0,1], got %v", o.SNBCPUThresholdRatio)
 	}
-	conf.VPAResizeCPUThresholdRatio = o.VPAResizeCPUThresholdRatio
+	conf.SNBCPUThresholdRatio = o.SNBCPUThresholdRatio
 	if err := o.HintOptimizerOptions.ApplyTo(conf.HintOptimizerConfiguration); err != nil {
 		return err
 	}
