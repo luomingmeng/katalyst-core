@@ -135,6 +135,10 @@ func TestStaticPolicy_GetTopologyHints(t *testing.T) {
 								Nodes:     []uint64{2, 3},
 								Preferred: true,
 							},
+							{
+								Nodes:     []uint64{0, 1, 2, 3},
+								Preferred: false,
+							},
 						},
 					},
 				},
@@ -199,6 +203,10 @@ func TestStaticPolicy_GetTopologyHints(t *testing.T) {
 						{
 							Nodes:     []uint64{0, 1},
 							Preferred: true,
+						},
+						{
+							Nodes:     []uint64{0, 1, 2, 3},
+							Preferred: false,
 						},
 					},
 				},
