@@ -143,6 +143,7 @@ func (m *MBPlugin) Start() (err error) {
 			m.conf.MaxCCDMB,
 			m.conf.CCDCapGroups,
 			m.advisor,
+			m.emitter,
 		)
 		general.Infof("[mbm] P-Controller advisor enabled with groups=%v, Kp=%.2f", m.conf.CCDCapGroups, m.conf.CCDCapKp)
 	}

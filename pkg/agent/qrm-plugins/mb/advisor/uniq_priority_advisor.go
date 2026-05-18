@@ -59,6 +59,8 @@ type uniqPriorityAdvisor struct {
 	flower        sankey.DomainFlower
 	adjusters     map[string]adjuster.Adjuster
 	ccdDistribute distributor.Distributor
+
+	lastQuotaSuppressedCCDs map[int]map[string][]int
 }
 
 func (a *uniqPriorityAdvisor) GetPlan(ctx context.Context, domainsMon *monitor.DomainStats) (*plan.MBPlan, error) {
@@ -83,6 +85,8 @@ func (a *uniqPriorityAdvisor) GetPlan(ctx context.Context, domainsMon *monitor.D
 			stringify(groupedDomIncomingTargets))
 	}
 	a.emitIncomingTargets(groupedDomIncomingTargets)
+
+	a.detectQuotaSuppression(domIncomingInfo, domIncomingQuotas, domainsMon.Outgoings)
 
 	// for each group, based on incoming targets, decide what the outgoing targets are
 	var groupedDomOutgoingTargets map[string][]int
@@ -134,6 +138,62 @@ func (a *uniqPriorityAdvisor) getNoThrottleMB() int {
 	}
 
 	return a.defaultDomainCapacity
+}
+
+func (a *uniqPriorityAdvisor) detectQuotaSuppression(
+	domIncomingInfo map[int]*resource.MBGroupIncomingStat,
+	domIncomingQuotas resource.DomQuotas,
+	outgoings map[int]monitor.GroupMBStats,
+) {
+	a.lastQuotaSuppressedCCDs = make(map[int]map[string][]int)
+
+	for domID, incomingInfo := range domIncomingInfo {
+		if incomingInfo.ResourceState != resource.ResourceStressful {
+			continue
+		}
+
+		domQuotas, ok := domIncomingQuotas[domID]
+		if !ok {
+			continue
+		}
+
+		domOutgoing, hasOutgoing := outgoings[domID]
+		if !hasOutgoing {
+			continue
+		}
+
+		for group, groupOutgoing := range domOutgoing {
+			if a.groupNeverThrottles.Has(group) {
+				continue
+			}
+
+			quota, hasQuota := domQuotas[group]
+			if !hasQuota {
+				continue
+			}
+
+			groupTotalUse := incomingInfo.GroupTotalUses[group]
+			if groupTotalUse < quota {
+				continue
+			}
+
+			var suppressedCCDs []int
+			for ccd, mbInfo := range groupOutgoing {
+				if mbInfo.TotalMB > 0 {
+					suppressedCCDs = append(suppressedCCDs, ccd)
+				}
+			}
+
+			if len(suppressedCCDs) == 0 {
+				continue
+			}
+
+			if _, ok := a.lastQuotaSuppressedCCDs[domID]; !ok {
+				a.lastQuotaSuppressedCCDs[domID] = make(map[string][]int)
+			}
+			a.lastQuotaSuppressedCCDs[domID][group] = suppressedCCDs
+		}
+	}
 }
 
 func (a *uniqPriorityAdvisor) adjust(_ context.Context,

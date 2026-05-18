@@ -23,6 +23,7 @@ import (
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/mb/monitor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/mb/plan"
+	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 )
 
@@ -32,6 +33,7 @@ import (
 type pControllerAdvisor struct {
 	ccdMinMB, ccdMaxMB int
 	inner              Advisor
+	emitter            metrics.MetricEmitter
 
 	groupStates map[string]*groupPCtrlState
 }
@@ -50,6 +52,8 @@ func (p *pControllerAdvisor) GetPlan(ctx context.Context, domainsMon *monitor.Do
 	for group, state := range p.groupStates {
 		p.restrictGroupCCDCap(group, state, domainsMon, result)
 	}
+
+	p.detectCCDLimitSuppression(domainsMon)
 
 	return result, nil
 }
@@ -99,6 +103,31 @@ func (p *pControllerAdvisor) maxObservedCCDMBForGroup(outgoings map[int]monitor.
 	return max
 }
 
+func (p *pControllerAdvisor) detectCCDLimitSuppression(domainsMon *monitor.DomainStats) {
+	if p.emitter == nil {
+		return
+	}
+
+	for group, state := range p.groupStates {
+		target := state.pCtrl.target
+		if target <= 0 || state.ccdCapMB >= p.ccdMaxMB {
+			continue
+		}
+
+		for domID, domStats := range domainsMon.Outgoings {
+			ccdStats, ok := domStats[group]
+			if !ok {
+				continue
+			}
+			for ccd, mbInfo := range ccdStats {
+				if mbInfo.TotalMB >= target {
+					emitCCDSuppressed(p.emitter, domID, group, ccd, suppressionTypeCCDLimit)
+				}
+			}
+		}
+	}
+}
+
 func applyGroupCCDBoundsChecks(ccdMBs plan.GroupCCDPlan, lower, upper int) {
 	for ccd, mb := range ccdMBs {
 		ccdMBs[ccd] = clampMB(mb, lower, upper)
@@ -120,6 +149,7 @@ func NewPControllerAdvisor(Kp float64,
 	minValue, maxValue int,
 	groupTargets map[string]int,
 	inner Advisor,
+	emitter metrics.MetricEmitter,
 ) Advisor {
 	groupStates := make(map[string]*groupPCtrlState, len(groupTargets))
 	for group, target := range groupTargets {
@@ -136,6 +166,7 @@ func NewPControllerAdvisor(Kp float64,
 		ccdMinMB:    minValue,
 		ccdMaxMB:    maxValue,
 		inner:       inner,
+		emitter:     emitter,
 		groupStates: groupStates,
 	}
 }

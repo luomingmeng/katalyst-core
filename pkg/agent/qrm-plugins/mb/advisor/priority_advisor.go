@@ -59,6 +59,9 @@ func (a *priorityAdvisor) GetPlan(ctx context.Context, domainsMon *monitor.Domai
 	if err != nil {
 		return nil, err
 	}
+
+	a.emitQuotaSuppressionMetrics(groupInfos)
+
 	return a.splitPlan(mbPlan, groupInfos), nil
 }
 
@@ -108,6 +111,41 @@ func (a *priorityAdvisor) splitPlan(mbPlan *plan.MBPlan, groupInfos *groupInfo) 
 		delete(mbPlan.MBGroups, groupKey)
 	}
 	return mbPlan
+}
+
+func (a *priorityAdvisor) emitQuotaSuppressionMetrics(groupInfos *groupInfo) {
+	suppressed := a.uniqPriorityAdvisor.lastQuotaSuppressedCCDs
+	if len(suppressed) == 0 {
+		return
+	}
+
+	emitter := a.uniqPriorityAdvisor.emitter
+
+	for domID, groupCCDs := range suppressed {
+		for groupKey, ccdIDs := range groupCCDs {
+			if isCombinedGroup(groupKey) {
+				domGroupMapping, hasMapping := groupInfos.DomainGroups[domID]
+				if !hasMapping {
+					continue
+				}
+				combinedMapping, hasCombined := domGroupMapping[groupKey]
+				if !hasCombined {
+					continue
+				}
+				for realGroup, ccdSet := range combinedMapping {
+					for _, ccd := range ccdIDs {
+						if ccdSet.Has(ccd) {
+							emitCCDSuppressed(emitter, domID, realGroup, ccd, suppressionTypeDomainStress)
+						}
+					}
+				}
+			} else {
+				for _, ccd := range ccdIDs {
+					emitCCDSuppressed(emitter, domID, groupKey, ccd, suppressionTypeDomainStress)
+				}
+			}
+		}
+	}
 }
 
 func New(emitter metrics.MetricEmitter, domains domain.Domains, ccdMinMB, ccdMaxMB int, defaultDomainCapacity int,
