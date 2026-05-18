@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
+	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-api/pkg/plugins/skeleton"
 	"github.com/kubewharf/katalyst-core/cmd/katalyst-agent/app/agent"
 	appqrm "github.com/kubewharf/katalyst-core/cmd/katalyst-agent/app/agent/qrm"
@@ -33,6 +34,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/sriov/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/sriov/state"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/sriov/utils"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	qrmutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/periodicalhandler"
 	"github.com/kubewharf/katalyst-core/pkg/config"
@@ -218,6 +220,20 @@ func (p *StaticPolicy) GetTopologyHints(_ context.Context,
 			Nodes: p.agentCtx.CPUDetails.NUMANodesInSockets(socket).ToSliceUInt64(),
 			// as well as there has available vfs, the preferred is true
 			Preferred: true,
+		})
+	}
+
+	// check if restricted affinity requested
+	if !util.IsNetworkAffinityRestricted(req.Annotations) {
+		general.InfoS("add all NUMAs to hint to avoid affinity error",
+			"podNamespace", req.PodNamespace,
+			"podName", req.PodName,
+			"containerName", req.ContainerName,
+			req.Annotations[apiconsts.PodAnnotationNetworkEnhancementAffinityRestricted],
+			apiconsts.PodAnnotationNetworkEnhancementAffinityRestrictedTrue)
+
+		hints = append(hints, &pluginapi.TopologyHint{
+			Nodes: p.agentCtx.CPUDetails.NUMANodes().ToSliceUInt64(),
 		})
 	}
 

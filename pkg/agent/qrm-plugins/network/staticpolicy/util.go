@@ -52,12 +52,6 @@ const (
 
 type NICFilter func(nics []machine.InterfaceInfo, req *pluginapi.ResourceRequest, agentCtx *agent.GenericContext) []machine.InterfaceInfo
 
-// isReqAffinityRestricted returns true if allocated network interface must have affinity with allocated numa
-func isReqAffinityRestricted(reqAnnotations map[string]string) bool {
-	return reqAnnotations[consts.PodAnnotationNetworkEnhancementAffinityRestricted] ==
-		consts.PodAnnotationNetworkEnhancementAffinityRestrictedTrue
-}
-
 // checkNICPreferenceOfReq returns true if allocate network interface matches up with the
 // preference of requests, and it will return error if it breaks hard restrictions.
 func checkNICPreferenceOfReq(nic machine.InterfaceInfo, reqAnnotations map[string]string) (bool, error) {
