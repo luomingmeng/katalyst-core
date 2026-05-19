@@ -18,9 +18,12 @@ package eviction
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/spf13/pflag"
 	"k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
 	cliflag "k8s.io/component-base/cli/flag"
 
 	evictionconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/eviction"
@@ -61,6 +64,48 @@ type GenericEvictionOptions struct {
 
 	// HostPathNotifierPathRoot is the root path for host-path notifier
 	HostPathNotifierRootPath string
+
+	// EvictionAnnotationOptions configures annotations added to Eviction objects.
+	EvictionAnnotationOptions EvictionAnnotationOptions
+}
+
+// EvictionAnnotationOptions holds the CLI-friendly configuration for adding
+// annotations to Eviction objects based on the evicted pod's annotations.
+type EvictionAnnotationOptions struct {
+	// PodAnnotations is a flag-friendly form of EvictionAnnotationConfig.PodAnnotations:
+	// each map value is a "|"-delimited list of accepted pod annotation values
+	// for the corresponding key.
+	PodAnnotations map[string]string
+	// EvictionAnnotationKey backs EvictionAnnotationConfig.EvictionAnnotationKey.
+	EvictionAnnotationKey string
+}
+
+// AddFlags registers the flags for EvictionAnnotationOptions on the provided FlagSet.
+func (o *EvictionAnnotationOptions) AddFlags(fs *pflag.FlagSet) {
+	fs.StringToStringVar(&o.PodAnnotations, "eviction-annotation-pod-annotations",
+		o.PodAnnotations,
+		"Pod annotation keys mapped to their accepted values. "+
+			"Format: podKey=val1|val2 (use ',' between entries, '|' between values). "+
+			"The rule fires when the pod has any of these keys set to any of that key's listed values.")
+	fs.StringVar(&o.EvictionAnnotationKey, "eviction-annotation-eviction-key",
+		o.EvictionAnnotationKey,
+		"Annotation key set on the Eviction object when the rule matches; its value is always \"true\".")
+}
+
+// ApplyTo translates EvictionAnnotationOptions into the typed EvictionAnnotationConfig.
+func (o *EvictionAnnotationOptions) ApplyTo(c *evictionconfig.GenericEvictionConfiguration) error {
+	podAnnotations := make(map[string]sets.String, len(o.PodAnnotations))
+	for podKey, raw := range o.PodAnnotations {
+		if podKey == "" || raw == "" {
+			return fmt.Errorf("invalid eviction-annotation-pod-annotations entry: key=%q values=%q", podKey, raw)
+		}
+		podAnnotations[podKey] = sets.NewString(strings.Split(raw, "|")...)
+	}
+	c.EvictionAnnotationConfig = evictionconfig.EvictionAnnotationConfig{
+		PodAnnotations:        podAnnotations,
+		EvictionAnnotationKey: o.EvictionAnnotationKey,
+	}
+	return nil
 }
 
 // NewGenericEvictionOptions creates a new Options with a default config.
@@ -75,6 +120,9 @@ func NewGenericEvictionOptions() *GenericEvictionOptions {
 		HostPathNotifierRootPath:      "/opt/katalyst",
 		PodKiller:                     consts.KillerNameEvictionKiller,
 		StrictAuthentication:          false,
+		EvictionAnnotationOptions: EvictionAnnotationOptions{
+			PodAnnotations: map[string]string{},
+		},
 	}
 }
 
@@ -118,6 +166,8 @@ func (o *GenericEvictionOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 
 	fs.StringVar(&o.HostPathNotifierRootPath, "pod-notifier-root-path", o.HostPathNotifierRootPath,
 		"root path of host-path notifier")
+
+	o.EvictionAnnotationOptions.AddFlags(fs)
 }
 
 // ApplyTo fills up config with options
@@ -134,6 +184,11 @@ func (o *GenericEvictionOptions) ApplyTo(c *evictionconfig.GenericEvictionConfig
 	c.PodMetricLabels.Insert(o.PodMetricLabels...)
 	c.RecordManager = o.RecordManager
 	c.HostPathNotifierRootPath = o.HostPathNotifierRootPath
+
+	if err := o.EvictionAnnotationOptions.ApplyTo(c); err != nil {
+		return err
+	}
+
 	return nil
 }
 

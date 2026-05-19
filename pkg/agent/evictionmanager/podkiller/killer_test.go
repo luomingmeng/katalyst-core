@@ -24,12 +24,18 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
+	policy "k8s.io/api/policy/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/kubernetes/fake"
+	coretesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/events"
 	critesting "k8s.io/cri-api/pkg/apis/testing"
 
 	katalyst_base "github.com/kubewharf/katalyst-core/cmd/base"
+	"github.com/kubewharf/katalyst-core/pkg/config"
+	evictionconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/eviction"
 	"github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 )
@@ -174,5 +180,165 @@ func TestContainerKiller_Evict(t *testing.T) {
 			require.NoError(t, evictErr)
 			require.Equal(t, tt.wantKillContainerCount, len(fakeRuntimeService.GetCalls()))
 		}
+	}
+}
+
+func TestEvictionAPIKiller_buildEvictionAnnotations(t *testing.T) {
+	t.Parallel()
+
+	newConf := func(podAnnos map[string]sets.String, evictKey string) *config.Configuration {
+		c := config.NewConfiguration()
+		c.GenericEvictionConfiguration.EvictionAnnotationConfig = evictionconfig.EvictionAnnotationConfig{
+			PodAnnotations:        podAnnos,
+			EvictionAnnotationKey: evictKey,
+		}
+		return c
+	}
+
+	tests := []struct {
+		name           string
+		conf           *config.Configuration
+		podAnnotations map[string]string
+		want           map[string]string
+	}{
+		{
+			name:           "nil conf returns nil",
+			conf:           nil,
+			podAnnotations: map[string]string{"shield": "strict"},
+			want:           nil,
+		},
+		{
+			name:           "empty eviction key disables rule",
+			conf:           newConf(map[string]sets.String{"shield": sets.NewString("strict")}, ""),
+			podAnnotations: map[string]string{"shield": "strict"},
+			want:           nil,
+		},
+		{
+			name:           "empty PodAnnotations disables rule",
+			conf:           newConf(map[string]sets.String{}, "evicted-by"),
+			podAnnotations: map[string]string{"shield": "strict"},
+			want:           nil,
+		},
+		{
+			name:           "single key/value match",
+			conf:           newConf(map[string]sets.String{"shield": sets.NewString("strict")}, "evicted-by"),
+			podAnnotations: map[string]string{"shield": "strict"},
+			want:           map[string]string{"evicted-by": evictionconfig.EvictionAnnotationValue},
+		},
+		{
+			name:           "match via second value in set",
+			conf:           newConf(map[string]sets.String{"shield": sets.NewString("strict", "loose")}, "evicted-by"),
+			podAnnotations: map[string]string{"shield": "loose"},
+			want:           map[string]string{"evicted-by": evictionconfig.EvictionAnnotationValue},
+		},
+		{
+			name: "match via second key in map",
+			conf: newConf(map[string]sets.String{
+				"shield":    sets.NewString("strict"),
+				"protected": sets.NewString("true"),
+			}, "evicted-by"),
+			podAnnotations: map[string]string{"protected": "true"},
+			want:           map[string]string{"evicted-by": evictionconfig.EvictionAnnotationValue},
+		},
+		{
+			name:           "no match: wrong value",
+			conf:           newConf(map[string]sets.String{"shield": sets.NewString("strict")}, "evicted-by"),
+			podAnnotations: map[string]string{"shield": "off"},
+			want:           nil,
+		},
+		{
+			name:           "no match: key missing",
+			conf:           newConf(map[string]sets.String{"shield": sets.NewString("strict")}, "evicted-by"),
+			podAnnotations: map[string]string{"other": "anything"},
+			want:           nil,
+		},
+		{
+			name:           "no match: pod has nil annotations",
+			conf:           newConf(map[string]sets.String{"shield": sets.NewString("strict")}, "evicted-by"),
+			podAnnotations: nil,
+			want:           nil,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			e := &EvictionAPIKiller{conf: tt.conf}
+			pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: tt.podAnnotations}}
+			got := e.buildEvictionAnnotations(pod)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestEvictionAPIKiller_EvictAddsAnnotations(t *testing.T) {
+	t.Parallel()
+
+	type tcase struct {
+		name           string
+		podAnnotations map[string]string
+		wantAnnos      map[string]string
+	}
+	cases := []tcase{
+		{
+			name:           "matching pod gets eviction annotation",
+			podAnnotations: map[string]string{"shield": "strict"},
+			wantAnnos:      map[string]string{"evicted-by": evictionconfig.EvictionAnnotationValue},
+		},
+		{
+			name:           "non-matching pod gets no eviction annotation",
+			podAnnotations: map[string]string{"shield": "off"},
+			wantAnnos:      nil,
+		},
+	}
+
+	for _, tt := range cases {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "pod-1",
+					Namespace:   "ns-1",
+					UID:         "uid-1",
+					Annotations: tt.podAnnotations,
+				},
+			}
+
+			ctx, err := katalyst_base.GenerateFakeGenericContext([]runtime.Object{pod})
+			require.NoError(t, err)
+			fakeKube := ctx.Client.KubeClient.(*fake.Clientset)
+
+			var captured *policy.Eviction
+			fakeKube.PrependReactor("create", "pods", func(action coretesting.Action) (bool, runtime.Object, error) {
+				if action.GetSubresource() != "eviction" {
+					return false, nil, nil
+				}
+				captured = action.(coretesting.CreateAction).GetObject().(*policy.Eviction)
+				// Simulate the API server actually deleting the pod so that
+				// waitForDeleted in evict() returns promptly.
+				_ = fakeKube.Tracker().Delete(
+					v1.SchemeGroupVersion.WithResource("pods"),
+					captured.Namespace, captured.Name,
+				)
+				return true, nil, nil
+			})
+
+			conf := config.NewConfiguration()
+			conf.GenericEvictionConfiguration.EvictionAnnotationConfig = evictionconfig.EvictionAnnotationConfig{
+				PodAnnotations:        map[string]sets.String{"shield": sets.NewString("strict")},
+				EvictionAnnotationKey: "evicted-by",
+			}
+
+			killer, err := NewEvictionAPIKiller(conf, ctx.Client.KubeClient, &events.FakeRecorder{}, metrics.DummyMetrics{})
+			require.NoError(t, err)
+
+			require.NoError(t, killer.Evict(context.Background(), pod, 0, "test-api", "test"))
+
+			require.NotNil(t, captured)
+			assert.Equal(t, tt.wantAnnos, captured.ObjectMeta.Annotations)
+		})
 	}
 }

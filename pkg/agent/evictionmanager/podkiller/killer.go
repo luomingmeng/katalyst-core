@@ -37,6 +37,7 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/cri/remote"
 
 	"github.com/kubewharf/katalyst-core/pkg/config"
+	evictionconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/eviction"
 	"github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 )
@@ -71,18 +72,46 @@ type EvictionAPIKiller struct {
 	emitter  metrics.MetricEmitter
 	client   kubernetes.Interface
 	recorder events.EventRecorder
+	conf     *config.Configuration
 }
 
 // NewEvictionAPIKiller returns a new updater Object.
-func NewEvictionAPIKiller(_ *config.Configuration, client kubernetes.Interface, recorder events.EventRecorder, emitter metrics.MetricEmitter) (Killer, error) {
+func NewEvictionAPIKiller(conf *config.Configuration, client kubernetes.Interface, recorder events.EventRecorder, emitter metrics.MetricEmitter) (Killer, error) {
 	return &EvictionAPIKiller{
 		emitter:  emitter,
 		client:   client,
 		recorder: recorder,
+		conf:     conf,
 	}, nil
 }
 
 func (e *EvictionAPIKiller) Name() string { return consts.KillerNameEvictionKiller }
+
+// buildEvictionAnnotations returns the annotations that should be attached to
+// the Eviction object for the given pod, based on EvictionAnnotationConfig.
+// It returns nil when the rule is disabled or no configured pod-annotation
+// (key, value) pair matches.
+func (e *EvictionAPIKiller) buildEvictionAnnotations(pod *v1.Pod) map[string]string {
+	if e.conf == nil || e.conf.GenericEvictionConfiguration == nil {
+		return nil
+	}
+	rule := e.conf.GenericEvictionConfiguration.EvictionAnnotationConfig
+	if rule.EvictionAnnotationKey == "" || len(rule.PodAnnotations) == 0 {
+		return nil
+	}
+	for podKey, allowedValues := range rule.PodAnnotations {
+		podVal, exists := pod.Annotations[podKey]
+		if !exists {
+			continue
+		}
+		if allowedValues.Has(podVal) {
+			return map[string]string{
+				rule.EvictionAnnotationKey: evictionconfig.EvictionAnnotationValue,
+			}
+		}
+	}
+	return nil
+}
 
 func (e *EvictionAPIKiller) Evict(_ context.Context, pod *v1.Pod, gracePeriodSeconds int64, reason, plugin string) error {
 	const (
@@ -100,8 +129,9 @@ func (e *EvictionAPIKiller) Evict(_ context.Context, pod *v1.Pod, gracePeriodSec
 				Kind:       evictionKind,
 			},
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      pod.Name,
-				Namespace: pod.Namespace,
+				Name:        pod.Name,
+				Namespace:   pod.Namespace,
+				Annotations: e.buildEvictionAnnotations(pod),
 			},
 			DeleteOptions: deleteOptions,
 		}

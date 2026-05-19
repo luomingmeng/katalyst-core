@@ -22,6 +22,22 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
+// EvictionAnnotationValue is the constant value applied to the Eviction
+// object annotation generated through EvictionAnnotationConfig.
+const EvictionAnnotationValue = "true"
+
+// EvictionAnnotationConfig describes the rule for adding an annotation to
+// an Eviction object based on the evicted pod's annotations.
+type EvictionAnnotationConfig struct {
+	// PodAnnotations maps a pod annotation key to its accepted values.
+	// The rule fires when the pod has at least one of these keys set to
+	// any of that key's listed values.
+	PodAnnotations map[string]sets.String
+	// EvictionAnnotationKey is the annotation key set on the Eviction object
+	// when the rule matches; its value is always EvictionAnnotationValue.
+	EvictionAnnotationKey string
+}
+
 type GenericEvictionConfiguration struct {
 	// Inner plugins is the list of plugins implemented in katalyst to enable or disable
 	// '*' means "all enabled by default"
@@ -60,6 +76,11 @@ type GenericEvictionConfiguration struct {
 
 	// HostPathNotifierRootPath
 	HostPathNotifierRootPath string
+
+	// EvictionAnnotationConfig is the rule used to enrich the Eviction object's
+	// annotations based on the evicted pod's annotations. The rule is inactive
+	// when EvictionAnnotationKey is empty or PodAnnotations is empty.
+	EvictionAnnotationConfig EvictionAnnotationConfig
 }
 
 type EvictionConfiguration struct {
