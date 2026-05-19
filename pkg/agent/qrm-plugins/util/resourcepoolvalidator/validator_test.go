@@ -47,7 +47,7 @@ type stubAllocatedProvider struct {
 	calls     int
 }
 
-func (s *stubAllocatedProvider) GetAllocated(poolName string, scope Scope) (v1.ResourceList, error) {
+func (s *stubAllocatedProvider) GetAllocated(poolName string, scope Scope, _ ...string) (v1.ResourceList, error) {
 	s.calls++
 	if s.err != nil {
 		return nil, s.err

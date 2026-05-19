@@ -56,7 +56,7 @@ func (p *DynamicPolicy) sharedCoresHintHandler(ctx context.Context,
 	// TODO: support sidecar follow main container for non-binding share cores in future
 	if req.ContainerType == pluginapi.ContainerType_MAIN {
 		if p.enableNonBindingShareCoresMemoryResourceCheck {
-			ok, err := p.checkNonBindingShareCoresMemoryResource(req)
+			ok, err := p.checkNonBindingShareCoresMemoryResource(ctx, req)
 			if err != nil {
 				general.Errorf("failed to check share cores resource: %q", err)
 				return nil, fmt.Errorf("failed to check share cores resource: %q", err)
@@ -451,7 +451,7 @@ func (p *DynamicPolicy) calculateHints(
 	var memRPAllocCache map[int]v1.ResourceList
 	if poolName := resourcepool.GetResourcePoolName(req.Annotations); poolName != "" {
 		memRPAllocCache, _ = p.resourcePoolValidator.PrefetchNumaAllocations(
-			ctx, poolName, numaNodes)
+			ctx, poolName, numaNodes, req.PodUid)
 	}
 	machine.IterateBitMasks(numaNodes, numaBound, func(mask machine.BitMask) {
 		maskCount := mask.Count()
@@ -549,7 +549,7 @@ func (p *DynamicPolicy) calculateHints(
 				incomingPerNUMA[resourceName] = *resource.NewQuantity(int64(requestedSize)/int64(maskCount), resource.BinarySI)
 				resources = append(resources, resourceName)
 			}
-			if rpvalidator.MaskExceeds(ctx, p.resourcePoolValidator, poolName, incomingPerNUMA, resources, maskBits, memRPAllocCache) {
+			if rpvalidator.MaskExceeds(ctx, p.resourcePoolValidator, poolName, incomingPerNUMA, resources, maskBits, memRPAllocCache, req.PodUid) {
 				return
 			}
 		}

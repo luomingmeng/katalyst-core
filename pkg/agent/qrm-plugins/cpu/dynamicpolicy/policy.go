@@ -816,9 +816,6 @@ func (p *DynamicPolicy) GetTopologyHints(ctx context.Context,
 	if p.hintHandlers[qosLevel] == nil {
 		return nil, fmt.Errorf("katalyst QoS level: %s is not supported yet", qosLevel)
 	}
-	if err := p.validateResourcePool(ctx, req, reqFloat64); err != nil {
-		return nil, err
-	}
 	return p.hintHandlers[qosLevel](ctx, req)
 }
 
@@ -1363,7 +1360,7 @@ func (p *DynamicPolicy) getContainerRequestedCores(allocationInfo *state.Allocat
 	return cpuutil.GetContainerRequestedCores(p.metaServer, allocationInfo)
 }
 
-func (p *DynamicPolicy) checkNonBindingShareCoresCpuResource(req *pluginapi.ResourceRequest) (bool, error) {
+func (p *DynamicPolicy) checkNonBindingShareCoresCpuResource(ctx context.Context, req *pluginapi.ResourceRequest) (bool, error) {
 	_, reqFloat64, err := util.GetPodAggregatedRequestResource(req)
 	if err != nil {
 		return false, fmt.Errorf("GetQuantityFromResourceReq failed with error: %v", err)
@@ -1381,6 +1378,10 @@ func (p *DynamicPolicy) checkNonBindingShareCoresCpuResource(req *pluginapi.Reso
 		general.Warningf("[checkNonBindingShareCoresCpuResource] no enough cpu resource for non-binding share cores pod: %s/%s, container: %s (request: %.02f, node allocated: %d, node allocatable: %d)",
 			req.PodNamespace, req.PodName, req.ContainerName, reqFloat64, shareCoresAllocatedInt, pooledCPUs.Size())
 		return false, nil
+	}
+
+	if err := p.validateResourcePool(ctx, req, reqFloat64); err != nil {
+		return false, err
 	}
 
 	general.InfoS("checkNonBindingShareCoresCpuResource cpu successfully",

@@ -53,7 +53,7 @@ func (p *DynamicPolicy) sharedCoresHintHandler(ctx context.Context,
 
 	// TODO: support sidecar follow main container for non-binding share cores in future
 	if req.ContainerType == pluginapi.ContainerType_MAIN {
-		ok, err := p.checkNonBindingShareCoresCpuResource(req)
+		ok, err := p.checkNonBindingShareCoresCpuResource(ctx, req)
 		if err != nil {
 			general.Errorf("failed to check share cores cpu resource for pod: %s/%s, container: %s",
 				req.PodNamespace, req.PodName, req.ContainerName)
@@ -307,7 +307,7 @@ func (p *DynamicPolicy) calculateHints(
 	var cpuRPAllocCache map[int]v1.ResourceList
 	if poolName := resourcepool.GetResourcePoolName(req.Annotations); poolName != "" {
 		cpuRPAllocCache, _ = p.resourcePoolValidator.PrefetchNumaAllocations(
-			ctx, poolName, numaNodes)
+			ctx, poolName, numaNodes, req.PodUid)
 	}
 	// minAffinitySize is the minimum number of NUMA nodes from the hints
 	minAffinitySize := p.machineInfo.CPUDetails.NUMANodes().Size()
@@ -698,6 +698,14 @@ func (p *DynamicPolicy) sharedCoresWithNUMABindingHintHandler(ctx context.Contex
 					req.PodNamespace, req.PodName, req.ContainerName)
 				return nil, cpuutil.ErrNoAvailableCPUHints
 			}
+
+			if poolName := resourcepool.GetResourcePoolName(req.Annotations); poolName != "" {
+				if p.cpuResourcePoolMaskExceeds(ctx, req, request, []int{nodeID}, nil) {
+					general.Errorf("pod: %s/%s, container: %s request cpu inplace update resize, but resource pool %s exceeds for numa %d",
+						req.PodNamespace, req.PodName, req.ContainerName, poolName, nodeID)
+					return nil, cpuutil.ErrNoAvailableCPUHints
+				}
+			}
 			general.Infof("pod: %s/%s, container: %s request inplace update resize, there is enough resource for it in current NUMA",
 				req.PodNamespace, req.PodName, req.ContainerName)
 			hints = cpuutil.RegenerateHints(allocationInfo, false)
@@ -792,11 +800,9 @@ func (p *DynamicPolicy) calculateHintsForNUMABindingSharedCores(ctx context.Cont
 	// per-NUMA share equals the full request). Skip entirely when the pod
 	// has no resource pool annotation.
 	if snbPoolName := resourcepool.GetResourcePoolName(req.Annotations); snbPoolName != "" && len(numaNodes) > 0 {
-		snbAllocCache, _ := p.resourcePoolValidator.PrefetchNumaAllocations(
-			ctx, snbPoolName, numaNodes)
 		filtered := numaNodes[:0]
 		for _, n := range numaNodes {
-			if !p.cpuResourcePoolMaskExceeds(ctx, req, request, []int{n}, snbAllocCache) {
+			if !p.cpuResourcePoolMaskExceeds(ctx, req, request, []int{n}, nil) {
 				filtered = append(filtered, n)
 			}
 		}

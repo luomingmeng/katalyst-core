@@ -65,8 +65,14 @@ type ResourcePoolsProvider interface {
 // AllocatedProvider returns the already-allocated resource amounts for a given
 // (poolName, scope) pair. Each QRM plugin implements this against its own
 // in-memory state so the validator stays agnostic of plugin internals.
+//
+// excludePodUIDs lists pod UIDs that should be excluded from the allocated
+// total. This is needed during inplace-update-resize: the current pod's
+// existing allocation is already counted in the state, and the incoming
+// request represents the full new request, so excluding the pod avoids
+// double-counting.
 type AllocatedProvider interface {
-	GetAllocated(poolName string, scope Scope) (v1.ResourceList, error)
+	GetAllocated(poolName string, scope Scope, excludePodUIDs ...string) (v1.ResourceList, error)
 }
 
 // Validator checks that admitting an incoming request to the given pool would
@@ -106,9 +112,12 @@ type Validator interface {
 	//     batch path where the caller has already fetched allocations via
 	//     PrefetchNumaAllocations. If the map is missing a resource name, its
 	//     allocated quantity is treated as zero.
+	//
+	// excludePodUIDs is forwarded to GetAllocated when allocated == nil so
+	// that the specified pods are excluded from the allocated total.
 	Validate(ctx context.Context, poolName string, scope Scope,
 		incoming v1.ResourceList, resources []v1.ResourceName,
-		allocated v1.ResourceList) error
+		allocated v1.ResourceList, excludePodUIDs ...string) error
 
 	// PrefetchNumaAllocations batch-fetches per-NUMA allocated quantities for
 	// the given pool across all specified NUMA nodes. The returned map (key:
@@ -116,9 +125,12 @@ type Validator interface {
 	// Validate inside IterateBitMasks loops to avoid redundant GetAllocated
 	// calls.
 	//
+	// excludePodUIDs is forwarded to GetAllocated so that the specified pods
+	// are excluded from the allocated total.
+	//
 	// Returns nil if the provider is nil, poolName is empty, or numaIDs is
 	// empty. Returns an error if any individual GetAllocated call fails.
-	PrefetchNumaAllocations(ctx context.Context, poolName string, numaIDs []int) (
+	PrefetchNumaAllocations(ctx context.Context, poolName string, numaIDs []int, excludePodUIDs ...string) (
 		map[int]v1.ResourceList, error)
 }
 
@@ -149,7 +161,7 @@ type validator struct {
 //     internally.
 func (v *validator) Validate(ctx context.Context, poolName string, scope Scope,
 	incoming v1.ResourceList, resources []v1.ResourceName,
-	allocated v1.ResourceList,
+	allocated v1.ResourceList, excludePodUIDs ...string,
 ) error {
 	if poolName == "" {
 		return nil
@@ -166,7 +178,7 @@ func (v *validator) Validate(ctx context.Context, poolName string, scope Scope,
 	}
 
 	if allocated == nil {
-		allocated, err = v.allocated.GetAllocated(poolName, scope)
+		allocated, err = v.allocated.GetAllocated(poolName, scope, excludePodUIDs...)
 		if err != nil {
 			return err
 		}
@@ -208,14 +220,14 @@ func (v *validator) Validate(ctx context.Context, poolName string, scope Scope,
 //
 // Returns nil if the provider or pool name is empty, or numaIDs is empty.
 func (v *validator) PrefetchNumaAllocations(
-	ctx context.Context, poolName string, numaIDs []int,
+	ctx context.Context, poolName string, numaIDs []int, excludePodUIDs ...string,
 ) (map[int]v1.ResourceList, error) {
 	if v == nil || v.allocated == nil || poolName == "" || len(numaIDs) == 0 {
 		return nil, nil
 	}
 	result := make(map[int]v1.ResourceList, len(numaIDs))
 	for _, nid := range numaIDs {
-		alloc, err := v.allocated.GetAllocated(poolName, NumaScope(nid))
+		alloc, err := v.allocated.GetAllocated(poolName, NumaScope(nid), excludePodUIDs...)
 		if err != nil {
 			return nil, err
 		}

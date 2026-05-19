@@ -35,6 +35,10 @@ import (
 // Validator.PrefetchNumaAllocations once before the loop. When allocCache is
 // nil or does not contain a given numaID, that NUMA's allocation is fetched
 // on demand — making it safe to use even without a complete cache.
+//
+// excludePodUIDs is forwarded to Validator.Validate (and ultimately
+// GetAllocated) so that the specified pods are excluded from the allocated
+// total. This avoids double-counting during inplace-update-resize.
 func MaskExceeds(
 	ctx context.Context,
 	validator Validator,
@@ -43,6 +47,7 @@ func MaskExceeds(
 	resources []v1.ResourceName,
 	maskBits []int,
 	allocCache map[int]v1.ResourceList,
+	excludePodUIDs ...string,
 ) bool {
 	if validator == nil || poolName == "" {
 		return false
@@ -56,7 +61,7 @@ func MaskExceeds(
 			alloc = allocCache[numaID]
 		}
 		err := validator.Validate(ctx, poolName, NumaScope(numaID),
-			incomingPerNUMA, resources, alloc)
+			incomingPerNUMA, resources, alloc, excludePodUIDs...)
 		if err == nil {
 			continue
 		}

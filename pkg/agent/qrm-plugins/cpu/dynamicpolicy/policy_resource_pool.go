@@ -52,14 +52,22 @@ func newCPUResourcePoolAllocatedProvider(s state.ReadonlyState) rpvalidator.Allo
 //     share landing on this NUMA via TopologyAwareAssignments. Containers
 //     that are neither SNB nor DNB are skipped under NumaScope because they
 //     are not bound to a specific NUMA.
-func (c *cpuResourcePoolAllocatedProvider) GetAllocated(poolName string, scope rpvalidator.Scope) (v1.ResourceList, error) {
+func (c *cpuResourcePoolAllocatedProvider) GetAllocated(poolName string, scope rpvalidator.Scope, excludePodUIDs ...string) (v1.ResourceList, error) {
 	if c == nil || c.state == nil || poolName == "" {
 		return nil, nil
 	}
 
+	excluded := make(map[string]struct{}, len(excludePodUIDs))
+	for _, uid := range excludePodUIDs {
+		excluded[uid] = struct{}{}
+	}
+
 	var totalMilli int64
-	for _, containerEntries := range c.state.GetPodEntries() {
+	for podUid, containerEntries := range c.state.GetPodEntries() {
 		if containerEntries.IsPoolEntry() {
+			continue
+		}
+		if _, skip := excluded[podUid]; skip {
 			continue
 		}
 
@@ -141,7 +149,7 @@ func (p *DynamicPolicy) validateResourcePool(ctx context.Context, req *pluginapi
 	incoming := v1.ResourceList{
 		v1.ResourceCPU: *resource.NewMilliQuantity(int64(reqFloat64*1000), resource.DecimalSI),
 	}
-	return p.resourcePoolValidator.Validate(ctx, poolName, rpvalidator.NodeScope(), incoming, []v1.ResourceName{v1.ResourceCPU}, nil)
+	return p.resourcePoolValidator.Validate(ctx, poolName, rpvalidator.NodeScope(), incoming, []v1.ResourceName{v1.ResourceCPU}, nil, req.PodUid)
 }
 
 // cpuResourcePoolMaskExceeds is the CPU-flavoured wrapper of
@@ -173,5 +181,6 @@ func (p *DynamicPolicy) cpuResourcePoolMaskExceeds(
 		[]v1.ResourceName{v1.ResourceCPU},
 		maskBits,
 		allocCache,
+		req.PodUid,
 	)
 }

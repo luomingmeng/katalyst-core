@@ -34,7 +34,7 @@ type fakeValidator struct {
 }
 
 func (f *fakeValidator) Validate(_ context.Context, _ string, scope Scope,
-	_ v1.ResourceList, _ []v1.ResourceName, _ v1.ResourceList,
+	_ v1.ResourceList, _ []v1.ResourceName, _ v1.ResourceList, _ ...string,
 ) error {
 	if f.errs == nil {
 		return nil
@@ -42,7 +42,7 @@ func (f *fakeValidator) Validate(_ context.Context, _ string, scope Scope,
 	return f.errs[scope.NumaID]
 }
 
-func (f *fakeValidator) PrefetchNumaAllocations(_ context.Context, _ string, _ []int) (
+func (f *fakeValidator) PrefetchNumaAllocations(_ context.Context, _ string, _ []int, _ ...string) (
 	map[int]v1.ResourceList, error,
 ) {
 	return nil, nil

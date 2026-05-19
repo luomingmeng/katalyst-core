@@ -49,15 +49,23 @@ func newMemoryResourcePoolAllocatedProvider(s state.ReadonlyState) rpvalidator.A
 //     of each matching container is summed.
 //   - When scope.NumaID >= 0, only the per-NUMA share recorded in
 //     TopologyAwareAllocations[numa] is summed.
-func (m *memoryResourcePoolAllocatedProvider) GetAllocated(poolName string, scope rpvalidator.Scope) (v1.ResourceList, error) {
+func (m *memoryResourcePoolAllocatedProvider) GetAllocated(poolName string, scope rpvalidator.Scope, excludePodUIDs ...string) (v1.ResourceList, error) {
 	if m == nil || m.state == nil || poolName == "" {
 		return nil, nil
+	}
+
+	excluded := make(map[string]struct{}, len(excludePodUIDs))
+	for _, uid := range excludePodUIDs {
+		excluded[uid] = struct{}{}
 	}
 
 	out := v1.ResourceList{}
 	for resName, podEntries := range m.state.GetPodResourceEntries() {
 		var totalBytes int64
-		for _, containerEntries := range podEntries {
+		for podUid, containerEntries := range podEntries {
+			if _, skip := excluded[podUid]; skip {
+				continue
+			}
 			for _, ai := range containerEntries {
 				if ai == nil {
 					continue
@@ -108,5 +116,5 @@ func (p *DynamicPolicy) validateResourcePool(ctx context.Context, req *pluginapi
 	if len(resources) == 0 {
 		return nil
 	}
-	return p.resourcePoolValidator.Validate(ctx, poolName, rpvalidator.NodeScope(), incoming, resources, nil)
+	return p.resourcePoolValidator.Validate(ctx, poolName, rpvalidator.NodeScope(), incoming, resources, nil, req.PodUid)
 }
