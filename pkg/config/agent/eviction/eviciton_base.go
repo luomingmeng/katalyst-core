@@ -22,20 +22,41 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
-// EvictionAnnotationValue is the constant value applied to the Eviction
-// object annotation generated through EvictionAnnotationConfig.
-const EvictionAnnotationValue = "true"
+// EvictionExplicitTriggerAnnotationValue is the constant value applied to the
+// explicit-trigger annotation that katalyst stamps on Eviction API objects.
+// It is intentionally fixed (not configurable) so that higher-level
+// components can match on the presence of the explicit-trigger key alone.
+const EvictionExplicitTriggerAnnotationValue = "true"
 
-// EvictionAnnotationConfig describes the rule for adding an annotation to
-// an Eviction object based on the evicted pod's annotations.
-type EvictionAnnotationConfig struct {
-	// PodAnnotations maps a pod annotation key to its accepted values.
-	// The rule fires when the pod has at least one of these keys set to
-	// any of that key's listed values.
-	PodAnnotations map[string]sets.String
-	// EvictionAnnotationKey is the annotation key set on the Eviction object
-	// when the rule matches; its value is always EvictionAnnotationValue.
-	EvictionAnnotationKey string
+// EvictionExplicitTriggerAnnotationConfig declares when and how katalyst-agent
+// should stamp an explicit-trigger annotation onto the Eviction API object.
+//
+// The explicit-trigger annotation is the contract between the agent and any
+// higher-level component (controller, operator, or external automation)
+// that needs to react to an eviction — for example to reschedule, repair,
+// escalate, or notify. By writing the explicit-trigger key onto the
+// Eviction object itself (rather than relying on the pod's annotations,
+// which disappear the moment the pod is deleted), upstream consumers can
+// observe and act on the eviction via the eviction subresource, admission
+// webhooks, or audit logs.
+//
+// The rule is "fire if any single (key, value) pair on the pod matches":
+//   - keys are OR-combined (any configured key on the pod is enough),
+//   - values within a key are OR-combined (any allowed value matches).
+//
+// The rule is inactive when ExplicitTriggerAnnotationKey is empty or
+// ExplicitlyTriggeringPodAnnotations is empty, so the feature is opt-in.
+type EvictionExplicitTriggerAnnotationConfig struct {
+	// ExplicitlyTriggeringPodAnnotations maps a pod-annotation key to the set of
+	// values that should cause the explicit-trigger annotation to be stamped on
+	// the Eviction object. When the evicted pod has any one of these keys set
+	// to any one of that key's listed values, the rule fires.
+	ExplicitlyTriggeringPodAnnotations map[string]sets.String
+	// ExplicitTriggerAnnotationKey is the annotation key written onto the
+	// Eviction object when the rule fires. The corresponding value is always
+	// EvictionExplicitTriggerAnnotationValue. Higher-level components should
+	// match on this key.
+	ExplicitTriggerAnnotationKey string
 }
 
 type GenericEvictionConfiguration struct {
@@ -77,10 +98,10 @@ type GenericEvictionConfiguration struct {
 	// HostPathNotifierRootPath
 	HostPathNotifierRootPath string
 
-	// EvictionAnnotationConfig is the rule used to enrich the Eviction object's
-	// annotations based on the evicted pod's annotations. The rule is inactive
-	// when EvictionAnnotationKey is empty or PodAnnotations is empty.
-	EvictionAnnotationConfig EvictionAnnotationConfig
+	// *EvictionExplicitTriggerAnnotationConfig configures the marker annotation
+	// that katalyst stamps onto Eviction API objects so that higher-level
+	// components can react to specific evictions. Inactive by default.
+	*EvictionExplicitTriggerAnnotationConfig
 }
 
 type EvictionConfiguration struct {
@@ -91,9 +112,16 @@ type EvictionConfiguration struct {
 
 func NewGenericEvictionConfiguration() *GenericEvictionConfiguration {
 	return &GenericEvictionConfiguration{
-		EvictionSkippedAnnotationKeys: sets.NewString(),
-		EvictionSkippedLabelKeys:      sets.NewString(),
-		PodMetricLabels:               sets.NewString(),
+		EvictionSkippedAnnotationKeys:           sets.NewString(),
+		EvictionSkippedLabelKeys:                sets.NewString(),
+		PodMetricLabels:                         sets.NewString(),
+		EvictionExplicitTriggerAnnotationConfig: NewEvictionExplicitTriggerAnnotationConfig(),
+	}
+}
+
+func NewEvictionExplicitTriggerAnnotationConfig() *EvictionExplicitTriggerAnnotationConfig {
+	return &EvictionExplicitTriggerAnnotationConfig{
+		ExplicitlyTriggeringPodAnnotations: map[string]sets.String{},
 	}
 }
 

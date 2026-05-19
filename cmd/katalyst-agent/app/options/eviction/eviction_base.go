@@ -65,64 +65,84 @@ type GenericEvictionOptions struct {
 	// HostPathNotifierPathRoot is the root path for host-path notifier
 	HostPathNotifierRootPath string
 
-	// EvictionAnnotationOptions configures annotations added to Eviction objects.
-	EvictionAnnotationOptions EvictionAnnotationOptions
+	*EvictionExplicitTriggerAnnotationOptions
 }
 
-// EvictionAnnotationOptions holds the CLI-friendly configuration for adding
-// annotations to Eviction objects based on the evicted pod's annotations.
-type EvictionAnnotationOptions struct {
-	// PodAnnotations is a flag-friendly form of EvictionAnnotationConfig.PodAnnotations:
+// EvictionExplicitTriggerAnnotationOptions is the CLI-facing form of
+// EvictionExplicitTriggerAnnotationConfig. It configures the marker annotation
+// that katalyst stamps onto Eviction API objects so that higher-level
+// components (controllers, operators, external automation) can react to
+// specific evictions. See EvictionExplicitTriggerAnnotationConfig for the
+// full contract.
+type EvictionExplicitTriggerAnnotationOptions struct {
+	// ExplicitlyTriggeringPodAnnotations is a flag-friendly form of
+	// EvictionExplicitTriggerAnnotationConfig.ExplicitlyTriggeringPodAnnotations:
 	// each map value is a "|"-delimited list of accepted pod annotation values
 	// for the corresponding key.
-	PodAnnotations map[string]string
-	// EvictionAnnotationKey backs EvictionAnnotationConfig.EvictionAnnotationKey.
-	EvictionAnnotationKey string
+	ExplicitlyTriggeringPodAnnotations map[string]string
+	// ExplicitTriggerAnnotationKey backs
+	// EvictionExplicitTriggerAnnotationConfig.ExplicitTriggerAnnotationKey.
+	ExplicitTriggerAnnotationKey string
 }
 
-// AddFlags registers the flags for EvictionAnnotationOptions on the provided FlagSet.
-func (o *EvictionAnnotationOptions) AddFlags(fs *pflag.FlagSet) {
-	fs.StringToStringVar(&o.PodAnnotations, "eviction-annotation-pod-annotations",
-		o.PodAnnotations,
-		"Pod annotation keys mapped to their accepted values. "+
-			"Format: podKey=val1|val2 (use ',' between entries, '|' between values). "+
-			"The rule fires when the pod has any of these keys set to any of that key's listed values.")
-	fs.StringVar(&o.EvictionAnnotationKey, "eviction-annotation-eviction-key",
-		o.EvictionAnnotationKey,
-		"Annotation key set on the Eviction object when the rule matches; its value is always \"true\".")
+// NewEvictionExplicitTriggerAnnotationOptions creates a new
+// EvictionExplicitTriggerAnnotationOptions with default values.
+func NewEvictionExplicitTriggerAnnotationOptions() *EvictionExplicitTriggerAnnotationOptions {
+	return &EvictionExplicitTriggerAnnotationOptions{
+		ExplicitlyTriggeringPodAnnotations: map[string]string{},
+	}
 }
 
-// ApplyTo translates EvictionAnnotationOptions into the typed EvictionAnnotationConfig.
-func (o *EvictionAnnotationOptions) ApplyTo(c *evictionconfig.GenericEvictionConfiguration) error {
-	podAnnotations := make(map[string]sets.String, len(o.PodAnnotations))
-	for podKey, raw := range o.PodAnnotations {
-		if podKey == "" || raw == "" {
-			return fmt.Errorf("invalid eviction-annotation-pod-annotations entry: key=%q values=%q", podKey, raw)
+// AddFlags registers the flags for EvictionExplicitTriggerAnnotationOptions on the provided FlagSet.
+func (o *EvictionExplicitTriggerAnnotationOptions) AddFlags(fs *pflag.FlagSet) {
+	fs.StringToStringVar(&o.ExplicitlyTriggeringPodAnnotations, "eviction-explicit-trigger-pod-annotations",
+		o.ExplicitlyTriggeringPodAnnotations,
+		"Pod annotations that should cause katalyst to stamp the explicit-trigger "+
+			"annotation onto the Eviction API object so that higher-level components "+
+			"can react. Format: podKey=val1|val2 (',' between entries, '|' between "+
+			"values). Use 'podKey=' (empty value) to match any value for the key. "+
+			"The rule fires when the pod has any of these keys set to any of that "+
+			"key's listed values (or any value at all if the entry has no values).")
+	fs.StringVar(&o.ExplicitTriggerAnnotationKey, "eviction-explicit-trigger-annotation-key",
+		o.ExplicitTriggerAnnotationKey,
+		"Annotation key written onto the Eviction object when the explicit-trigger rule "+
+			"fires; its value is always \"true\". Higher-level components match on "+
+			"this key.")
+}
+
+// ApplyTo translates EvictionExplicitTriggerAnnotationOptions into the typed EvictionExplicitTriggerAnnotationConfig.
+// An entry of the form "podKey=" (empty raw value) is preserved as an empty
+// sets.String, which the killer interprets as "match any value for podKey".
+func (o *EvictionExplicitTriggerAnnotationOptions) ApplyTo(c *evictionconfig.EvictionExplicitTriggerAnnotationConfig) error {
+	explicitlyTriggeringPodAnnotations := make(map[string]sets.String, len(o.ExplicitlyTriggeringPodAnnotations))
+	for podKey, raw := range o.ExplicitlyTriggeringPodAnnotations {
+		if podKey == "" {
+			return fmt.Errorf("invalid eviction-explicit-trigger-pod-annotations entry: key=%q values=%q", podKey, raw)
 		}
-		podAnnotations[podKey] = sets.NewString(strings.Split(raw, "|")...)
+		var values []string
+		if raw != "" {
+			values = strings.Split(raw, "|")
+		}
+		explicitlyTriggeringPodAnnotations[podKey] = sets.NewString(values...)
 	}
-	c.EvictionAnnotationConfig = evictionconfig.EvictionAnnotationConfig{
-		PodAnnotations:        podAnnotations,
-		EvictionAnnotationKey: o.EvictionAnnotationKey,
-	}
+	c.ExplicitlyTriggeringPodAnnotations = explicitlyTriggeringPodAnnotations
+	c.ExplicitTriggerAnnotationKey = o.ExplicitTriggerAnnotationKey
 	return nil
 }
 
 // NewGenericEvictionOptions creates a new Options with a default config.
 func NewGenericEvictionOptions() *GenericEvictionOptions {
 	return &GenericEvictionOptions{
-		InnerPlugins:                  []string{},
-		ConditionTransitionPeriod:     5 * time.Minute,
-		EvictionManagerSyncPeriod:     5 * time.Second,
-		EvictionSkippedAnnotationKeys: []string{},
-		EvictionSkippedLabelKeys:      []string{},
-		EvictionBurst:                 3,
-		HostPathNotifierRootPath:      "/opt/katalyst",
-		PodKiller:                     consts.KillerNameEvictionKiller,
-		StrictAuthentication:          false,
-		EvictionAnnotationOptions: EvictionAnnotationOptions{
-			PodAnnotations: map[string]string{},
-		},
+		InnerPlugins:                             []string{},
+		ConditionTransitionPeriod:                5 * time.Minute,
+		EvictionManagerSyncPeriod:                5 * time.Second,
+		EvictionSkippedAnnotationKeys:            []string{},
+		EvictionSkippedLabelKeys:                 []string{},
+		EvictionBurst:                            3,
+		HostPathNotifierRootPath:                 "/opt/katalyst",
+		PodKiller:                                consts.KillerNameEvictionKiller,
+		StrictAuthentication:                     false,
+		EvictionExplicitTriggerAnnotationOptions: NewEvictionExplicitTriggerAnnotationOptions(),
 	}
 }
 
@@ -167,7 +187,7 @@ func (o *GenericEvictionOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 	fs.StringVar(&o.HostPathNotifierRootPath, "pod-notifier-root-path", o.HostPathNotifierRootPath,
 		"root path of host-path notifier")
 
-	o.EvictionAnnotationOptions.AddFlags(fs)
+	o.EvictionExplicitTriggerAnnotationOptions.AddFlags(fs)
 }
 
 // ApplyTo fills up config with options
@@ -185,7 +205,7 @@ func (o *GenericEvictionOptions) ApplyTo(c *evictionconfig.GenericEvictionConfig
 	c.RecordManager = o.RecordManager
 	c.HostPathNotifierRootPath = o.HostPathNotifierRootPath
 
-	if err := o.EvictionAnnotationOptions.ApplyTo(c); err != nil {
+	if err := o.EvictionExplicitTriggerAnnotationOptions.ApplyTo(c.EvictionExplicitTriggerAnnotationConfig); err != nil {
 		return err
 	}
 

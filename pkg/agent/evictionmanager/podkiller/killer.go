@@ -87,26 +87,34 @@ func NewEvictionAPIKiller(conf *config.Configuration, client kubernetes.Interfac
 
 func (e *EvictionAPIKiller) Name() string { return consts.KillerNameEvictionKiller }
 
-// buildEvictionAnnotations returns the annotations that should be attached to
-// the Eviction object for the given pod, based on EvictionAnnotationConfig.
-// It returns nil when the rule is disabled or no configured pod-annotation
-// (key, value) pair matches.
-func (e *EvictionAPIKiller) buildEvictionAnnotations(pod *v1.Pod) map[string]string {
+// buildEvictionExplicitTriggerAnnotations returns the annotation set that
+// should be stamped onto the Eviction API object for the given pod, based on
+// the configured EvictionExplicitTriggerAnnotationConfig.
+//
+// This is the explicit-trigger marker that signals higher-level components
+// (controllers, operators, external automation) that a specific eviction
+// needs their follow-up handling. It returns nil when the rule is disabled
+// or no configured pod-annotation (key, value) pair matches — i.e. the
+// eviction is "ordinary" and no upstream action is requested.
+//
+// An entry whose allowed-values set is empty acts as a wildcard: the rule
+// fires whenever the pod has that annotation key set to *any* value.
+func (e *EvictionAPIKiller) buildEvictionExplicitTriggerAnnotations(pod *v1.Pod) map[string]string {
 	if e.conf == nil || e.conf.GenericEvictionConfiguration == nil {
 		return nil
 	}
-	rule := e.conf.GenericEvictionConfiguration.EvictionAnnotationConfig
-	if rule.EvictionAnnotationKey == "" || len(rule.PodAnnotations) == 0 {
+	rule := e.conf.GenericEvictionConfiguration.EvictionExplicitTriggerAnnotationConfig
+	if rule == nil || rule.ExplicitTriggerAnnotationKey == "" || len(rule.ExplicitlyTriggeringPodAnnotations) == 0 {
 		return nil
 	}
-	for podKey, allowedValues := range rule.PodAnnotations {
+	for podKey, allowedValues := range rule.ExplicitlyTriggeringPodAnnotations {
 		podVal, exists := pod.Annotations[podKey]
 		if !exists {
 			continue
 		}
-		if allowedValues.Has(podVal) {
+		if allowedValues.Len() == 0 || allowedValues.Has(podVal) {
 			return map[string]string{
-				rule.EvictionAnnotationKey: evictionconfig.EvictionAnnotationValue,
+				rule.ExplicitTriggerAnnotationKey: evictionconfig.EvictionExplicitTriggerAnnotationValue,
 			}
 		}
 	}
@@ -131,7 +139,7 @@ func (e *EvictionAPIKiller) Evict(_ context.Context, pod *v1.Pod, gracePeriodSec
 			ObjectMeta: metav1.ObjectMeta{
 				Name:        pod.Name,
 				Namespace:   pod.Namespace,
-				Annotations: e.buildEvictionAnnotations(pod),
+				Annotations: e.buildEvictionExplicitTriggerAnnotations(pod),
 			},
 			DeleteOptions: deleteOptions,
 		}

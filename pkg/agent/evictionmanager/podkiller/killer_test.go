@@ -183,14 +183,14 @@ func TestContainerKiller_Evict(t *testing.T) {
 	}
 }
 
-func TestEvictionAPIKiller_buildEvictionAnnotations(t *testing.T) {
+func TestEvictionAPIKiller_buildEvictionExplicitTriggerAnnotations(t *testing.T) {
 	t.Parallel()
 
 	newConf := func(podAnnos map[string]sets.String, evictKey string) *config.Configuration {
 		c := config.NewConfiguration()
-		c.GenericEvictionConfiguration.EvictionAnnotationConfig = evictionconfig.EvictionAnnotationConfig{
-			PodAnnotations:        podAnnos,
-			EvictionAnnotationKey: evictKey,
+		c.GenericEvictionConfiguration.EvictionExplicitTriggerAnnotationConfig = &evictionconfig.EvictionExplicitTriggerAnnotationConfig{
+			ExplicitlyTriggeringPodAnnotations: podAnnos,
+			ExplicitTriggerAnnotationKey:       evictKey,
 		}
 		return c
 	}
@@ -208,13 +208,13 @@ func TestEvictionAPIKiller_buildEvictionAnnotations(t *testing.T) {
 			want:           nil,
 		},
 		{
-			name:           "empty eviction key disables rule",
+			name:           "empty trigger key disables rule",
 			conf:           newConf(map[string]sets.String{"shield": sets.NewString("strict")}, ""),
 			podAnnotations: map[string]string{"shield": "strict"},
 			want:           nil,
 		},
 		{
-			name:           "empty PodAnnotations disables rule",
+			name:           "empty ExplicitlyTriggeringPodAnnotations disables rule",
 			conf:           newConf(map[string]sets.String{}, "evicted-by"),
 			podAnnotations: map[string]string{"shield": "strict"},
 			want:           nil,
@@ -223,13 +223,13 @@ func TestEvictionAPIKiller_buildEvictionAnnotations(t *testing.T) {
 			name:           "single key/value match",
 			conf:           newConf(map[string]sets.String{"shield": sets.NewString("strict")}, "evicted-by"),
 			podAnnotations: map[string]string{"shield": "strict"},
-			want:           map[string]string{"evicted-by": evictionconfig.EvictionAnnotationValue},
+			want:           map[string]string{"evicted-by": evictionconfig.EvictionExplicitTriggerAnnotationValue},
 		},
 		{
 			name:           "match via second value in set",
 			conf:           newConf(map[string]sets.String{"shield": sets.NewString("strict", "loose")}, "evicted-by"),
 			podAnnotations: map[string]string{"shield": "loose"},
-			want:           map[string]string{"evicted-by": evictionconfig.EvictionAnnotationValue},
+			want:           map[string]string{"evicted-by": evictionconfig.EvictionExplicitTriggerAnnotationValue},
 		},
 		{
 			name: "match via second key in map",
@@ -238,7 +238,7 @@ func TestEvictionAPIKiller_buildEvictionAnnotations(t *testing.T) {
 				"protected": sets.NewString("true"),
 			}, "evicted-by"),
 			podAnnotations: map[string]string{"protected": "true"},
-			want:           map[string]string{"evicted-by": evictionconfig.EvictionAnnotationValue},
+			want:           map[string]string{"evicted-by": evictionconfig.EvictionExplicitTriggerAnnotationValue},
 		},
 		{
 			name:           "no match: wrong value",
@@ -258,6 +258,18 @@ func TestEvictionAPIKiller_buildEvictionAnnotations(t *testing.T) {
 			podAnnotations: nil,
 			want:           nil,
 		},
+		{
+			name:           "wildcard: empty allowed values matches any pod value",
+			conf:           newConf(map[string]sets.String{"shield": sets.NewString()}, "evicted-by"),
+			podAnnotations: map[string]string{"shield": "anything"},
+			want:           map[string]string{"evicted-by": evictionconfig.EvictionExplicitTriggerAnnotationValue},
+		},
+		{
+			name:           "wildcard: empty allowed values still requires the key",
+			conf:           newConf(map[string]sets.String{"shield": sets.NewString()}, "evicted-by"),
+			podAnnotations: map[string]string{"other": "anything"},
+			want:           nil,
+		},
 	}
 
 	for _, tt := range tests {
@@ -266,13 +278,13 @@ func TestEvictionAPIKiller_buildEvictionAnnotations(t *testing.T) {
 			t.Parallel()
 			e := &EvictionAPIKiller{conf: tt.conf}
 			pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: tt.podAnnotations}}
-			got := e.buildEvictionAnnotations(pod)
+			got := e.buildEvictionExplicitTriggerAnnotations(pod)
 			assert.Equal(t, tt.want, got)
 		})
 	}
 }
 
-func TestEvictionAPIKiller_EvictAddsAnnotations(t *testing.T) {
+func TestEvictionAPIKiller_EvictStampsExplicitTriggerAnnotation(t *testing.T) {
 	t.Parallel()
 
 	type tcase struct {
@@ -282,12 +294,12 @@ func TestEvictionAPIKiller_EvictAddsAnnotations(t *testing.T) {
 	}
 	cases := []tcase{
 		{
-			name:           "matching pod gets eviction annotation",
+			name:           "matching pod gets explicit-trigger annotation",
 			podAnnotations: map[string]string{"shield": "strict"},
-			wantAnnos:      map[string]string{"evicted-by": evictionconfig.EvictionAnnotationValue},
+			wantAnnos:      map[string]string{"evicted-by": evictionconfig.EvictionExplicitTriggerAnnotationValue},
 		},
 		{
-			name:           "non-matching pod gets no eviction annotation",
+			name:           "non-matching pod gets no explicit-trigger annotation",
 			podAnnotations: map[string]string{"shield": "off"},
 			wantAnnos:      nil,
 		},
@@ -327,9 +339,9 @@ func TestEvictionAPIKiller_EvictAddsAnnotations(t *testing.T) {
 			})
 
 			conf := config.NewConfiguration()
-			conf.GenericEvictionConfiguration.EvictionAnnotationConfig = evictionconfig.EvictionAnnotationConfig{
-				PodAnnotations:        map[string]sets.String{"shield": sets.NewString("strict")},
-				EvictionAnnotationKey: "evicted-by",
+			conf.GenericEvictionConfiguration.EvictionExplicitTriggerAnnotationConfig = &evictionconfig.EvictionExplicitTriggerAnnotationConfig{
+				ExplicitlyTriggeringPodAnnotations: map[string]sets.String{"shield": sets.NewString("strict")},
+				ExplicitTriggerAnnotationKey:       "evicted-by",
 			}
 
 			killer, err := NewEvictionAPIKiller(conf, ctx.Client.KubeClient, &events.FakeRecorder{}, metrics.DummyMetrics{})
