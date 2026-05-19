@@ -52,6 +52,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/validator"
 	cpuutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/util"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
+	rpvalidator "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util/resourcepoolvalidator"
 	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation"
 	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/periodicalhandler"
 	"github.com/kubewharf/katalyst-core/pkg/config"
@@ -148,6 +149,10 @@ type DynamicPolicy struct {
 
 	sharedCoresNUMABindingHintOptimizer    hintoptimizer.HintOptimizer
 	dedicatedCoresNUMABindingHintOptimizer hintoptimizer.HintOptimizer
+
+	// resourcePoolValidator enforces MaxAllocatable of ResourcePool annotated
+	// pods at GetTopologyHints / Allocate time. nil disables the check.
+	resourcePoolValidator rpvalidator.Validator
 }
 
 func NewDynamicPolicy(agentCtx *agent.GenericContext, conf *config.Configuration,
@@ -238,6 +243,14 @@ func NewDynamicPolicy(agentCtx *agent.GenericContext, conf *config.Configuration
 	if err != nil {
 		return false, nil, err
 	}
+
+	// initialize the ResourcePool MaxAllocatable validator. The MetaServer
+	// already embeds resourcepool.ResourcePoolManager, which satisfies
+	// rpvalidator.ResourcePoolsProvider.
+	policyImplement.resourcePoolValidator = rpvalidator.NewValidator(
+		agentCtx.MetaServer,
+		newCPUResourcePoolAllocatedProvider(stateImpl),
+	)
 
 	if conf.EnableIRQTuner {
 		irqTuner, err := irqtuingcontroller.NewIrqTuningController(conf.AgentConfiguration, policyImplement, policyImplement.emitter, policyImplement.machineInfo)
@@ -802,6 +815,9 @@ func (p *DynamicPolicy) GetTopologyHints(ctx context.Context,
 
 	if p.hintHandlers[qosLevel] == nil {
 		return nil, fmt.Errorf("katalyst QoS level: %s is not supported yet", qosLevel)
+	}
+	if err := p.validateResourcePool(ctx, req, reqFloat64); err != nil {
+		return nil, err
 	}
 	return p.hintHandlers[qosLevel](ctx, req)
 }

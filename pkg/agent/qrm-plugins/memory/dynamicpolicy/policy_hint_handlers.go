@@ -23,6 +23,7 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 	"k8s.io/kubernetes/pkg/apis/core/v1/helper"
 
@@ -31,10 +32,12 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/memory/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util/preoccupation"
+	rpvalidator "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util/resourcepoolvalidator"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	qosutil "github.com/kubewharf/katalyst-core/pkg/util/qos"
+	resourcepool "github.com/kubewharf/katalyst-core/pkg/util/resource-pool"
 )
 
 var errNoAvailableMemoryHints = fmt.Errorf("no available memory hints")
@@ -127,7 +130,7 @@ func (p *DynamicPolicy) dedicatedCoresHintHandler(ctx context.Context,
 	}
 }
 
-func (p *DynamicPolicy) numaBindingHintHandler(_ context.Context,
+func (p *DynamicPolicy) numaBindingHintHandler(ctx context.Context,
 	req *pluginapi.ResourceRequest,
 ) (*pluginapi.ResourceHintsResponse, error) {
 	// currently, we set cpuset of sidecar to the cpuset of its main container,
@@ -208,7 +211,7 @@ func (p *DynamicPolicy) numaBindingHintHandler(_ context.Context,
 		// otherwise, calculate hint for container without allocated memory
 		var calculateErr error
 		// calculate hint for container without allocated memory
-		hints, calculateErr = p.calculateHints(resourcesMachineState, req, requestedResources)
+		hints, calculateErr = p.calculateHints(ctx, resourcesMachineState, req, requestedResources)
 		if calculateErr != nil {
 			general.Errorf("failed to calculate hints for pod: %s/%s, container: %s, error: %v",
 				req.PodNamespace, req.PodName, req.ContainerName, calculateErr)
@@ -330,6 +333,7 @@ func (p *DynamicPolicy) dedicatedCoresWithoutNUMABindingHintHandler(_ context.Co
 // calculateHints is a helper function to calculate the topology hints
 // with the given container requests.
 func (p *DynamicPolicy) calculateHints(
+	ctx context.Context,
 	resourcesMachineState state.NUMANodeResourcesMap,
 	req *pluginapi.ResourceRequest,
 	requestedResources map[v1.ResourceName]int,
@@ -441,6 +445,14 @@ func (p *DynamicPolicy) calculateHints(
 	}
 
 	availableNumaHints := make(map[string]*pluginapi.ListOfTopologyHints)
+	// Pre-fetch per-NUMA ResourcePool allocations once so that the
+	// MaskExceeds check inside IterateBitMasks does not redundantly call
+	// GetAllocated for the same (poolName, numaID) across every mask.
+	var memRPAllocCache map[int]v1.ResourceList
+	if poolName := resourcepool.GetResourcePoolName(req.Annotations); poolName != "" {
+		memRPAllocCache, _ = p.resourcePoolValidator.PrefetchNumaAllocations(
+			ctx, poolName, numaNodes)
+	}
 	machine.IterateBitMasks(numaNodes, numaBound, func(mask machine.BitMask) {
 		maskCount := mask.Count()
 		if maskCount < minNUMAsCountNeeded {
@@ -488,7 +500,7 @@ func (p *DynamicPolicy) calculateHints(
 			minAffinitySize = mask.Count()
 		}
 
-		// Start generating hints for each memory resource type
+		// verify that for all memory types the node mask has enough free resources
 		for resourceName, requestedSize := range requestedResources {
 			var freeBytesInMask uint64 = 0
 			for _, nodeID := range maskBits {
@@ -526,7 +538,24 @@ func (p *DynamicPolicy) calculateHints(
 					}
 				}
 			}
+		}
 
+		// ResourcePool NumaScope mask filter: skip masks that would exceed
+		// pool capacity for any requested resource (memory + hugepages-*).
+		if poolName := resourcepool.GetResourcePoolName(req.Annotations); poolName != "" && maskCount > 0 {
+			incomingPerNUMA := make(v1.ResourceList, len(requestedResources))
+			resources := make([]v1.ResourceName, 0, len(requestedResources))
+			for resourceName, requestedSize := range requestedResources {
+				incomingPerNUMA[resourceName] = *resource.NewQuantity(int64(requestedSize)/int64(maskCount), resource.BinarySI)
+				resources = append(resources, resourceName)
+			}
+			if rpvalidator.MaskExceeds(ctx, p.resourcePoolValidator, poolName, incomingPerNUMA, resources, maskBits, memRPAllocCache) {
+				return
+			}
+		}
+
+		// Start generating hints for each memory resource type
+		for resourceName := range requestedResources {
 			if _, ok := availableNumaHints[string(resourceName)]; !ok {
 				availableNumaHints[string(resourceName)] = &pluginapi.ListOfTopologyHints{
 					Hints: make([]*pluginapi.TopologyHint, 0),

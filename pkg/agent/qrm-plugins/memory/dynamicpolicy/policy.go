@@ -49,6 +49,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/memory/handlers/sockmem"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util/reactor"
+	rpvalidator "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util/resourcepoolvalidator"
 	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation"
 	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/periodicalhandler"
 	"github.com/kubewharf/katalyst-core/pkg/config"
@@ -168,6 +169,10 @@ type DynamicPolicy struct {
 	numaBindResultResourceAllocationAnnotationKey string
 
 	extraResourceNames []string
+
+	// resourcePoolValidator enforces MaxAllocatable of ResourcePool annotated
+	// pods at GetTopologyHints / Allocate time. nil disables the check.
+	resourcePoolValidator rpvalidator.Validator
 }
 
 func NewDynamicPolicy(agentCtx *agent.GenericContext, conf *config.Configuration,
@@ -260,6 +265,14 @@ func NewDynamicPolicy(agentCtx *agent.GenericContext, conf *config.Configuration
 	policyImplement.asyncLimitedWorkersMap = map[string]*asyncworker.AsyncLimitedWorkers{
 		memoryPluginAsyncWorkTopicMovePage: asyncworker.NewAsyncLimitedWorkers(memoryPluginAsyncWorkTopicMovePage, movePagesWorkLimit, wrappedEmitter),
 	}
+
+	// initialize the ResourcePool MaxAllocatable validator. The MetaServer
+	// already embeds resourcepool.ResourcePoolManager, which satisfies
+	// rpvalidator.ResourcePoolsProvider.
+	policyImplement.resourcePoolValidator = rpvalidator.NewValidator(
+		agentCtx.MetaServer,
+		newMemoryResourcePoolAllocatedProvider(stateImpl),
+	)
 
 	if policyImplement.enableOOMPriority {
 		policyImplement.enhancementHandlers.Register(apiconsts.QRMPhaseRemovePod,
@@ -649,6 +662,9 @@ func (p *DynamicPolicy) GetTopologyHints(ctx context.Context,
 
 	if p.hintHandlers[qosLevel] == nil {
 		return nil, fmt.Errorf("katalyst QoS level: %s is not supported yet", qosLevel)
+	}
+	if err := p.validateResourcePool(ctx, req, resourceReqInt); err != nil {
+		return nil, err
 	}
 	return p.hintHandlers[qosLevel](ctx, req)
 }
