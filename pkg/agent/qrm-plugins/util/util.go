@@ -31,6 +31,7 @@ import (
 	"k8s.io/klog/v2"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
+	"github.com/kubewharf/katalyst-api/pkg/consts"
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/config/generic"
 	"github.com/kubewharf/katalyst-core/pkg/util/asyncworker"
@@ -493,4 +494,10 @@ func GetMainContainer(pod *v1.Pod, mainContainerAnnotationKey string) string {
 	}
 
 	return mainContainerName
+}
+
+// IsNetworkAffinityRestricted returns true if allocated network interface must have affinity with allocated numa
+func IsNetworkAffinityRestricted(reqAnnotations map[string]string) bool {
+	return reqAnnotations[consts.PodAnnotationNetworkEnhancementAffinityRestricted] ==
+		consts.PodAnnotationNetworkEnhancementAffinityRestrictedTrue
 }
