@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
+	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 )
 
@@ -47,13 +48,20 @@ type DeviceTopologyRegistry struct {
 
 	// topologyChangeNotifiers is a list of callbacks to invoke when topology changes
 	topologyChangeNotifiers []func()
+
+	// emitter is used to emit metrics
+	emitter metrics.MetricEmitter
 }
 
-func NewDeviceTopologyRegistry() *DeviceTopologyRegistry {
+func NewDeviceTopologyRegistry(emitter metrics.MetricEmitter) *DeviceTopologyRegistry {
+	if emitter == nil {
+		emitter = metrics.DummyMetrics{}
+	}
 	return &DeviceTopologyRegistry{
 		deviceTopologyProviders:         make(map[string]DeviceTopologyProvider),
 		deviceTopologyAffinityProviders: make(map[string]DeviceAffinityProvider),
 		lastDeviceTopologies:            make(map[string]*DeviceTopology),
+		emitter:                         emitter,
 	}
 }
 
@@ -176,7 +184,7 @@ func (r *DeviceTopologyRegistry) SetDeviceTopology(deviceName string, deviceTopo
 
 	topologyAffinityProvider, ok := r.deviceTopologyAffinityProviders[deviceName]
 	if ok {
-		topologyAffinityProvider.SetDeviceAffinity(deviceTopology)
+		generateAndSetDeviceAffinity(topologyAffinityProvider, deviceTopology, r.emitter)
 		general.Infof("set device affinity provider for device %s, %v", deviceName, deviceTopology)
 	} else {
 		general.Infof("no device affinity provider found for device %s", deviceName)

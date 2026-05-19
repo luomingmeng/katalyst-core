@@ -1821,7 +1821,7 @@ func TestGpuReporterPlugin_GetReportContent(t *testing.T) {
 				gpuDeviceNames = []string{"test-gpu"}
 			}
 
-			topologyRegistry := machine.NewDeviceTopologyRegistry()
+			topologyRegistry := machine.NewDeviceTopologyRegistry(metrics.DummyMetrics{})
 			for _, dn := range gpuDeviceNames {
 				topologyRegistry.RegisterDeviceTopologyProvider(dn, machine.NewDeviceTopologyProvider())
 			}
@@ -1919,7 +1919,7 @@ func TestListAndWatchReportContent(t *testing.T) {
 	testConfig.EnableKubeletCheckpointFallback = true
 	deviceTypeToNames := map[string]sets.String{"test-gpu": sets.NewString("test-gpu")}
 
-	topologyRegistry := machine.NewDeviceTopologyRegistry()
+	topologyRegistry := machine.NewDeviceTopologyRegistry(metrics.DummyMetrics{})
 	mockProvider := machine.NewDeviceTopologyProviderStub()
 	topologyRegistry.RegisterDeviceTopologyProvider("test-gpu", mockProvider)
 
@@ -2032,7 +2032,7 @@ func TestListAndWatchReportContentRetry(t *testing.T) {
 	testConfig.GPUDeviceNames = []string{"test-gpu"}
 	deviceTypeToNames := map[string]sets.String{"test-gpu": sets.NewString("test-gpu")}
 
-	topologyRegistry := machine.NewDeviceTopologyRegistry()
+	topologyRegistry := machine.NewDeviceTopologyRegistry(metrics.DummyMetrics{})
 	mockProvider := machine.NewDeviceTopologyProviderStub()
 	topologyRegistry.RegisterDeviceTopologyProvider("test-gpu", mockProvider)
 
