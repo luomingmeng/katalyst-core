@@ -47,6 +47,9 @@ type GPUQRMPluginConfig struct {
 	// VirtualGPUVisibleDevicesEnvNames is the environment variable names injected into the pod to specify
 	// the allocated Virtual GPU visible devices. The format will be "<deviceID1>,<deviceID2>,...".
 	VirtualGPUVisibleDevicesEnvNames []string
+	// VirtualGPUUUIDEnvName is the environment variable name injected into the pod to specify
+	// the pod UID for Virtual GPU related consumers.
+	VirtualGPUUUIDEnvName string
 	// VirtualGPUMemoryWeightEnvName is the environment variable name injected into the pod to specify
 	// the allocated GPU memory percentage. The format will be "<deviceID>:<percentage>",
 	// where the percentage is an integer from 1 to 100.

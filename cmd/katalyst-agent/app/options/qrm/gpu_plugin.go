@@ -36,6 +36,7 @@ type GPUOptions struct {
 	EnableKubeletCheckpointFallback             bool
 	VirtualGPUPrefersSpreading                  bool
 	VirtualGPUVisibleDevicesEnvNames            []string
+	VirtualGPUUUIDEnvName                       string
 	VirtualGPUMemoryWeightEnvName               string
 	VirtualGPUComputeWeightEnvName              string
 	VirtualGPUTimesliceEnvName                  string
@@ -88,6 +89,8 @@ func (o *GPUOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 		o.VirtualGPUPrefersSpreading, "whether virtual GPU prefers spreading across devices")
 	fs.StringSliceVar(&o.VirtualGPUVisibleDevicesEnvNames, "virtual-gpu-visible-devices-env-names",
 		o.VirtualGPUVisibleDevicesEnvNames, "The environment variable names for Virtual GPU visible devices")
+	fs.StringVar(&o.VirtualGPUUUIDEnvName, "virtual-gpu-uuid-env-name",
+		o.VirtualGPUUUIDEnvName, "The environment variable name for the Virtual GPU pod UID")
 	fs.StringVar(&o.VirtualGPUMemoryWeightEnvName, "virtual-gpu-memory-weight-env-name",
 		o.VirtualGPUMemoryWeightEnvName, "The environment variable name for Virtual GPU memory weight")
 	fs.StringVar(&o.VirtualGPUComputeWeightEnvName, "virtual-gpu-compute-weight-env-name",
@@ -127,6 +130,7 @@ func (o *GPUOptions) ApplyTo(conf *qrmconfig.GPUQRMPluginConfig) error {
 	conf.EnableKubeletCheckpointFallback = o.EnableKubeletCheckpointFallback
 	conf.VirtualGPUPrefersSpreading = o.VirtualGPUPrefersSpreading
 	conf.VirtualGPUVisibleDevicesEnvNames = o.VirtualGPUVisibleDevicesEnvNames
+	conf.VirtualGPUUUIDEnvName = o.VirtualGPUUUIDEnvName
 	conf.VirtualGPUMemoryWeightEnvName = o.VirtualGPUMemoryWeightEnvName
 	conf.VirtualGPUComputeWeightEnvName = o.VirtualGPUComputeWeightEnvName
 	conf.VirtualGPUTimesliceEnvName = o.VirtualGPUTimesliceEnvName

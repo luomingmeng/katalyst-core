@@ -907,7 +907,7 @@ func (p *VirtualGPUPlugin) allocate(
 		}
 
 		// Calculate the environment variables
-		envs := p.calculateEnvVariables(resName, result.AllocatedDevices, resQuantityPerGPU)
+		envs := p.calculateEnvVariables(resName, result.AllocatedDevices, resQuantityPerGPU, resourceReq.PodUid)
 		if len(envs) > 0 {
 			resourceAllocationEnvs[string(resName)] = envs
 		}
@@ -938,14 +938,14 @@ func (p *VirtualGPUPlugin) shouldSkipEnvInjection(resourceReq *pluginapi.Resourc
 }
 
 // calculateEnvVariables computes the environment variable map for a given GPU resource.
-func (p *VirtualGPUPlugin) calculateEnvVariables(resName v1.ResourceName, allocatedDevices []string, resQuantityPerGPU float64) map[string]string {
+func (p *VirtualGPUPlugin) calculateEnvVariables(resName v1.ResourceName, allocatedDevices []string, resQuantityPerGPU float64, podUID string) map[string]string {
 	envs := make(map[string]string)
 
 	switch resName {
 	case consts.ResourceGPUMemory:
 		p.injectGPUMemoryEnvVariables(envs, allocatedDevices, resQuantityPerGPU)
 	case consts.ResourceMilliGPU:
-		p.injectMilliGPUEnvVariables(envs, allocatedDevices, resQuantityPerGPU)
+		p.injectMilliGPUEnvVariables(envs, allocatedDevices, resQuantityPerGPU, podUID)
 	}
 
 	if len(envs) > 0 {
@@ -974,8 +974,9 @@ func (p *VirtualGPUPlugin) injectGPUMemoryEnvVariables(envs map[string]string, a
 	p.injectWeightEnvVariable(envs, consts.ResourceGPUMemory, p.Conf.VirtualGPUMemoryWeightEnvName, allocatedDevices, resQuantityPerGPU)
 }
 
-// injectMilliGPUEnvVariables injects the compute allocation weight, timeslice configuration, compute policy, and visible devices environment variables.
-func (p *VirtualGPUPlugin) injectMilliGPUEnvVariables(envs map[string]string, allocatedDevices []string, resQuantityPerGPU float64) {
+// injectMilliGPUEnvVariables injects the compute allocation weight, timeslice configuration, compute policy,
+// pod UID, and visible devices environment variables.
+func (p *VirtualGPUPlugin) injectMilliGPUEnvVariables(envs map[string]string, allocatedDevices []string, resQuantityPerGPU float64, podUID string) {
 	p.injectWeightEnvVariable(envs, consts.ResourceMilliGPU, p.Conf.VirtualGPUComputeWeightEnvName, allocatedDevices, resQuantityPerGPU)
 
 	// Inject timeslice configuration for Virtual GPU isolation if the environment name is configured
@@ -986,6 +987,10 @@ func (p *VirtualGPUPlugin) injectMilliGPUEnvVariables(envs map[string]string, al
 	// Inject compute policy configuration for Virtual GPU isolation if the environment name is configured
 	if p.Conf.VirtualGPUComputePolicyEnvName != "" {
 		envs[p.Conf.VirtualGPUComputePolicyEnvName] = strconv.Itoa(p.Conf.VirtualGPUComputePolicyEnvValue)
+	}
+
+	if p.Conf.VirtualGPUUUIDEnvName != "" {
+		envs[p.Conf.VirtualGPUUUIDEnvName] = podUID
 	}
 
 	// Inject visible devices configuration

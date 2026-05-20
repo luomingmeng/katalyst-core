@@ -2328,6 +2328,7 @@ func TestVirtualGPUPlugin_calculateEnvVariables(t *testing.T) {
 	basePlugin.Conf.VirtualGPUComputePolicyEnvName = "KUBE_GPU_COMPUTE_POLICY"
 	basePlugin.Conf.VirtualGPUComputePolicyEnvValue = 2
 	basePlugin.Conf.VirtualGPUVisibleDevicesEnvNames = []string{"NVIDIA_VISIBLE_DEVICES"}
+	basePlugin.Conf.VirtualGPUUUIDEnvName = "KUBE_POD_UID"
 
 	resourcePlugin := NewVirtualGPUPlugin(basePlugin)
 	plugin, ok := resourcePlugin.(*VirtualGPUPlugin)
@@ -2337,6 +2338,7 @@ func TestVirtualGPUPlugin_calculateEnvVariables(t *testing.T) {
 		name              string
 		resName           v1.ResourceName
 		allocatedDevices  []string
+		podUID            string
 		resQuantityPerGPU float64
 		expectedEnvs      map[string]string
 	}{
@@ -2344,6 +2346,7 @@ func TestVirtualGPUPlugin_calculateEnvVariables(t *testing.T) {
 			name:              "gpu memory weight single device",
 			resName:           consts.ResourceGPUMemory,
 			allocatedDevices:  []string{"gpu-0"},
+			podUID:            "test-pod-uid",
 			resQuantityPerGPU: 5, // 5 / 10 = 50%
 			expectedEnvs: map[string]string{
 				"KUBE_GPU_MEMORY_WEIGHT": "gpu-0:50",
@@ -2353,6 +2356,7 @@ func TestVirtualGPUPlugin_calculateEnvVariables(t *testing.T) {
 			name:              "gpu memory weight multiple devices",
 			resName:           consts.ResourceGPUMemory,
 			allocatedDevices:  []string{"gpu-0", "gpu-1"},
+			podUID:            "test-pod-uid",
 			resQuantityPerGPU: 5, // multiple devices -> no weight env
 			expectedEnvs:      nil,
 		},
@@ -2360,11 +2364,13 @@ func TestVirtualGPUPlugin_calculateEnvVariables(t *testing.T) {
 			name:              "milligpu weight single device",
 			resName:           consts.ResourceMilliGPU,
 			allocatedDevices:  []string{"gpu-0"},
+			podUID:            "test-pod-uid",
 			resQuantityPerGPU: 250, // 250 / 1000 = 25%
 			expectedEnvs: map[string]string{
 				"KUBE_GPU_COMPUTE_WEIGHT": "gpu-0:25",
 				"KUBE_GPU_TIMESLICE":      "1",
 				"KUBE_GPU_COMPUTE_POLICY": "2",
+				"KUBE_POD_UID":            "test-pod-uid",
 				"NVIDIA_VISIBLE_DEVICES":  "gpu-0",
 			},
 		},
@@ -2372,10 +2378,12 @@ func TestVirtualGPUPlugin_calculateEnvVariables(t *testing.T) {
 			name:              "milligpu multiple devices",
 			resName:           consts.ResourceMilliGPU,
 			allocatedDevices:  []string{"gpu-0", "gpu-1"},
+			podUID:            "test-pod-uid",
 			resQuantityPerGPU: 250,
 			expectedEnvs: map[string]string{
 				"KUBE_GPU_TIMESLICE":      "1",
 				"KUBE_GPU_COMPUTE_POLICY": "2",
+				"KUBE_POD_UID":            "test-pod-uid",
 				"NVIDIA_VISIBLE_DEVICES":  "gpu-0,gpu-1",
 			},
 		},
@@ -2383,6 +2391,7 @@ func TestVirtualGPUPlugin_calculateEnvVariables(t *testing.T) {
 			name:              "unknown resource",
 			resName:           v1.ResourceCPU,
 			allocatedDevices:  []string{"gpu-0"},
+			podUID:            "test-pod-uid",
 			resQuantityPerGPU: 1,
 			expectedEnvs:      nil,
 		},
@@ -2392,7 +2401,7 @@ func TestVirtualGPUPlugin_calculateEnvVariables(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			envs := plugin.calculateEnvVariables(tt.resName, tt.allocatedDevices, tt.resQuantityPerGPU)
+			envs := plugin.calculateEnvVariables(tt.resName, tt.allocatedDevices, tt.resQuantityPerGPU, tt.podUID)
 			assert.Equal(t, tt.expectedEnvs, envs)
 		})
 	}
@@ -2508,6 +2517,7 @@ func TestVirtualGPUPlugin_Allocate_DisableEnvInjectionAnnotation(t *testing.T) {
 			basePlugin.Conf.VirtualGPUComputePolicyEnvName = "KUBE_GPU_COMPUTE_POLICY"
 			basePlugin.Conf.VirtualGPUComputePolicyEnvValue = 2
 			basePlugin.Conf.VirtualGPUVisibleDevicesEnvNames = []string{"NVIDIA_VISIBLE_DEVICES"}
+			basePlugin.Conf.VirtualGPUUUIDEnvName = "KUBE_POD_UID"
 
 			err := basePlugin.DeviceTopologyRegistry.SetDeviceTopology("test-gpu", &machine.DeviceTopology{
 				Devices: map[string]machine.DeviceInfo{
@@ -2573,6 +2583,7 @@ func TestVirtualGPUPlugin_Allocate_DisableEnvInjectionAnnotation(t *testing.T) {
 				"KUBE_GPU_COMPUTE_WEIGHT": "gpu-0:25",
 				"KUBE_GPU_TIMESLICE":      "1",
 				"KUBE_GPU_COMPUTE_POLICY": "2",
+				"KUBE_POD_UID":            "test-pod-env-gate",
 				"NVIDIA_VISIBLE_DEVICES":  "gpu-0",
 			}
 
