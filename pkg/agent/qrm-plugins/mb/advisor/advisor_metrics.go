@@ -125,6 +125,16 @@ func emitKV(emitter metrics.MetricEmitter, k string, v int, tags map[string]stri
 	)
 }
 
+func emitCCDSuppressionTypes(emitter metrics.MetricEmitter, domGroupCCDTypes map[int]map[string]map[int]string) {
+	for domID, groupCCDTypes := range domGroupCCDTypes {
+		for group, ccdTypes := range groupCCDTypes {
+			for ccdID, suppressionType := range ccdTypes {
+				emitCCDSuppressed(emitter, domID, group, ccdID, suppressionType)
+			}
+		}
+	}
+}
+
 func emitCCDSuppressed(emitter metrics.MetricEmitter, domID int, group string, ccdID int, suppressionType string) {
 	tags := map[string]string{
 		"domain": fmt.Sprintf("%d", domID),

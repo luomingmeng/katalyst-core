@@ -113,15 +113,10 @@ func (a *priorityAdvisor) splitPlan(mbPlan *plan.MBPlan, groupInfos *groupInfo) 
 	return mbPlan
 }
 
-func (a *priorityAdvisor) emitQuotaSuppressionMetrics(groupInfos *groupInfo) {
-	suppressed := a.uniqPriorityAdvisor.lastQuotaSuppressedCCDs
-	if len(suppressed) == 0 {
-		return
-	}
+func (a *priorityAdvisor) getDomainQuotaSuppression(groupInfos *groupInfo) map[int]map[string]map[int]string {
+	var result map[int]map[string]map[int]string
 
-	emitter := a.uniqPriorityAdvisor.emitter
-
-	for domID, groupCCDs := range suppressed {
+	for domID, groupCCDs := range a.uniqPriorityAdvisor.lastQuotaSuppressedCCDs {
 		for groupKey, ccdIDs := range groupCCDs {
 			if isCombinedGroup(groupKey) {
 				domGroupMapping, hasMapping := groupInfos.DomainGroups[domID]
@@ -135,17 +130,42 @@ func (a *priorityAdvisor) emitQuotaSuppressionMetrics(groupInfos *groupInfo) {
 				for realGroup, ccdSet := range combinedMapping {
 					for _, ccd := range ccdIDs {
 						if ccdSet.Has(ccd) {
-							emitCCDSuppressed(emitter, domID, realGroup, ccd, suppressionTypeDomainStress)
+							addQuadruplet(&result, domID, realGroup, ccd, suppressionTypeDomainStress)
 						}
 					}
 				}
 			} else {
 				for _, ccd := range ccdIDs {
-					emitCCDSuppressed(emitter, domID, groupKey, ccd, suppressionTypeDomainStress)
+					addQuadruplet(&result, domID, groupKey, ccd, suppressionTypeDomainStress)
 				}
 			}
 		}
 	}
+
+	return result
+}
+
+func addQuadruplet(receptacle *map[int]map[string]map[int]string,
+	domID int, group string, ccd int, suppressionTypeCCDLimit string,
+) {
+	if *receptacle == nil {
+		*receptacle = make(map[int]map[string]map[int]string)
+	}
+	result := *receptacle
+
+	if _, ok := result[domID]; !ok {
+		result[domID] = make(map[string]map[int]string)
+	}
+
+	if _, ok := result[domID][group]; !ok {
+		result[domID][group] = make(map[int]string)
+	}
+
+	result[domID][group][ccd] = suppressionTypeCCDLimit
+}
+
+func (a *priorityAdvisor) emitQuotaSuppressionMetrics(groupInfos *groupInfo) {
+	emitCCDSuppressionTypes(a.uniqPriorityAdvisor.emitter, a.getDomainQuotaSuppression(groupInfos))
 }
 
 func New(emitter metrics.MetricEmitter, domains domain.Domains, ccdMinMB, ccdMaxMB int, defaultDomainCapacity int,

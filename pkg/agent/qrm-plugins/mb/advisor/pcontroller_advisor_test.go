@@ -261,3 +261,59 @@ func TestPControllerAdvisor_GetPlan_May_Update_CCDCap(t *testing.T) {
 		})
 	}
 }
+
+func Test_pControllerAdvisor_detectCCDLimitSuppression(t *testing.T) {
+	t.Parallel()
+	type fields struct {
+		ccdMaxMB    int
+		groupStates map[string]*groupPCtrlState
+	}
+	type args struct {
+		domainsMon *monitor.DomainStats
+	}
+	tests := []struct {
+		name   string
+		fields fields
+		args   args
+		want   map[int]map[string]map[int]string
+	}{
+		{
+			name: "happy path",
+			fields: fields{
+				ccdMaxMB: 60000,
+				groupStates: map[string]*groupPCtrlState{
+					"dedicated": {
+						pCtrl:    pController{target: 666},
+						ccdCapMB: 333,
+					},
+				},
+			},
+			args: args{
+				domainsMon: &monitor.DomainStats{
+					Outgoings: map[int]monitor.DomainMonStat{
+						2: map[string]monitor.GroupMB{
+							"dedicated": map[int]monitor.MBInfo{
+								16: {TotalMB: 777},
+								18: {TotalMB: 500},
+							},
+						},
+					},
+				},
+			},
+			want: map[int]map[string]map[int]string{
+				2: {"dedicated": {16: "ccd_limit"}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			p := &pControllerAdvisor{
+				ccdMaxMB:    tt.fields.ccdMaxMB,
+				groupStates: tt.fields.groupStates,
+			}
+			assert.Equalf(t, tt.want, p.getCCDLimitSuppression(tt.args.domainsMon), "getCCDLimitSuppression(%v)", tt.args.domainsMon)
+		})
+	}
+}

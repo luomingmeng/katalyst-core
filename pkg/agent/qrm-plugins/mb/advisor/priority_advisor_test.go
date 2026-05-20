@@ -20,6 +20,9 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"k8s.io/apimachinery/pkg/util/sets"
+
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/mb/advisor/priority"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/mb/monitor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/mb/plan"
@@ -272,6 +275,61 @@ func Test_priorityGroupDecorator_splitPlan(t *testing.T) {
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("splitPlan() = %v, want %v", got, tt.want)
 			}
+		})
+	}
+}
+
+func Test_priorityAdvisor_getDomainQuotaSuppression(t *testing.T) {
+	t.Parallel()
+	type fields struct {
+		uniqPriorityAdvisor *uniqPriorityAdvisor
+	}
+	type args struct {
+		groupInfos *groupInfo
+	}
+	tests := []struct {
+		name   string
+		fields fields
+		args   args
+		want   map[int]map[string]map[int]string
+	}{
+		{
+			name: "happy path",
+			fields: fields{
+				uniqPriorityAdvisor: &uniqPriorityAdvisor{
+					lastQuotaSuppressedCCDs: map[int]map[string][]int{
+						1: {"combined-9000": {9, 27}},
+					},
+				},
+			},
+			args: args{
+				groupInfos: &groupInfo{
+					DomainGroups: map[int]domainGroupMapping{
+						1: map[string]combinedGroupMapping{
+							"combined-9000": map[string]ccdSet{
+								"dedicated": sets.NewInt(27),
+								"machine":   sets.NewInt(9),
+							},
+						},
+					},
+				},
+			},
+			want: map[int]map[string]map[int]string{
+				1: {
+					"dedicated": {27: "domain_stress"},
+					"machine":   {9: "domain_stress"},
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			a := &priorityAdvisor{
+				uniqPriorityAdvisor: tt.fields.uniqPriorityAdvisor,
+			}
+			assert.Equalf(t, tt.want, a.getDomainQuotaSuppression(tt.args.groupInfos), "getDomainQuotaSuppression(%v)", tt.args.groupInfos)
 		})
 	}
 }

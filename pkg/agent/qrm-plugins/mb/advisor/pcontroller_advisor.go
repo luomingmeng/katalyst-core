@@ -53,7 +53,9 @@ func (p *pControllerAdvisor) GetPlan(ctx context.Context, domainsMon *monitor.Do
 		p.restrictGroupCCDCap(group, state, domainsMon, result)
 	}
 
-	p.detectCCDLimitSuppression(domainsMon)
+	if p.emitter != nil {
+		emitCCDSuppressionTypes(p.emitter, p.getCCDLimitSuppression(domainsMon))
+	}
 
 	return result, nil
 }
@@ -103,10 +105,8 @@ func (p *pControllerAdvisor) maxObservedCCDMBForGroup(outgoings map[int]monitor.
 	return max
 }
 
-func (p *pControllerAdvisor) detectCCDLimitSuppression(domainsMon *monitor.DomainStats) {
-	if p.emitter == nil {
-		return
-	}
+func (p *pControllerAdvisor) getCCDLimitSuppression(domainsMon *monitor.DomainStats) map[int]map[string]map[int]string {
+	var result map[int]map[string]map[int]string
 
 	for group, state := range p.groupStates {
 		target := state.pCtrl.target
@@ -121,11 +121,13 @@ func (p *pControllerAdvisor) detectCCDLimitSuppression(domainsMon *monitor.Domai
 			}
 			for ccd, mbInfo := range ccdStats {
 				if mbInfo.TotalMB >= target {
-					emitCCDSuppressed(p.emitter, domID, group, ccd, suppressionTypeCCDLimit)
+					addQuadruplet(&result, domID, group, ccd, suppressionTypeCCDLimit)
 				}
 			}
 		}
 	}
+
+	return result
 }
 
 func applyGroupCCDBoundsChecks(ccdMBs plan.GroupCCDPlan, lower, upper int) {

@@ -21,6 +21,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/mb/advisor/adjuster"
@@ -535,6 +536,66 @@ func Test_domainAdvisor_GetPlan(t *testing.T) {
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("GetPlan() got = %v, want %v", got, tt.want)
 			}
+		})
+	}
+}
+
+func Test_uniqPriorityAdvisor_detectQuotaSuppression(t *testing.T) {
+	t.Parallel()
+	type fields struct {
+		groupNeverThrottles sets.String
+	}
+	type args struct {
+		domIncomingInfo   map[int]*resource.MBGroupIncomingStat
+		domIncomingQuotas resource.DomQuotas
+		outgoings         map[int]monitor.GroupMBStats
+	}
+	tests := []struct {
+		name   string
+		fields fields
+		args   args
+		want   map[int]map[string][]int
+	}{
+		{
+			name:   "happy path",
+			fields: fields{},
+			args: args{
+				domIncomingInfo: map[int]*resource.MBGroupIncomingStat{
+					1: {
+						GroupTotalUses: map[string]int{
+							"dedicated": 19000,
+							"shared-50": 7777,
+						},
+						ResourceState: "stressful",
+					},
+				},
+				domIncomingQuotas: map[int]resource.GroupSettings{
+					1: map[string]int{
+						"dedicated": 20000,
+						"shared-50": 5000,
+					},
+				},
+				outgoings: map[int]monitor.GroupMBStats{
+					1: map[string]monitor.GroupMB{
+						"dedicated": map[int]monitor.MBInfo{8: {TotalMB: 20000}},
+						"shared-50": map[int]monitor.MBInfo{9: {TotalMB: 4500}},
+					},
+				},
+			},
+			want: map[int]map[string][]int{
+				1: {"shared-50": {9}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			a := &uniqPriorityAdvisor{
+				groupNeverThrottles: tt.fields.groupNeverThrottles,
+			}
+			a.detectDomainQuotaSuppression(tt.args.domIncomingInfo, tt.args.domIncomingQuotas, tt.args.outgoings)
+			assert.Equal(t, tt.want, a.lastQuotaSuppressedCCDs, "domain-stress ccd")
 		})
 	}
 }

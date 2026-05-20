@@ -86,7 +86,7 @@ func (a *uniqPriorityAdvisor) GetPlan(ctx context.Context, domainsMon *monitor.D
 	}
 	a.emitIncomingTargets(groupedDomIncomingTargets)
 
-	a.detectQuotaSuppression(domIncomingInfo, domIncomingQuotas, domainsMon.Outgoings)
+	a.detectDomainQuotaSuppression(domIncomingInfo, domIncomingQuotas, domainsMon.Outgoings)
 
 	// for each group, based on incoming targets, decide what the outgoing targets are
 	var groupedDomOutgoingTargets map[string][]int
@@ -140,7 +140,7 @@ func (a *uniqPriorityAdvisor) getNoThrottleMB() int {
 	return a.defaultDomainCapacity
 }
 
-func (a *uniqPriorityAdvisor) detectQuotaSuppression(
+func (a *uniqPriorityAdvisor) detectDomainQuotaSuppression(
 	domIncomingInfo map[int]*resource.MBGroupIncomingStat,
 	domIncomingQuotas resource.DomQuotas,
 	outgoings map[int]monitor.GroupMBStats,
