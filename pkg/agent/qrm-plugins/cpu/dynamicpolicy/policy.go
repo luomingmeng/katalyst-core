@@ -121,7 +121,7 @@ type DynamicPolicy struct {
 	enableCPUAdvisor                          bool
 	getAdviceInterval                         time.Duration
 	reservedCPUs                              machine.CPUSet
-	snbCPUThresholdRatio                      float64
+	snbCPUTotalRequestThresholdRatio          float64
 	cpuAdvisorSocketAbsPath                   string
 	cpuPluginSocketAbsPath                    string
 	extraStateFileAbsPath                     string
@@ -207,22 +207,22 @@ func NewDynamicPolicy(agentCtx *agent.GenericContext, conf *config.Configuration
 
 		cpuPressureEviction: cpuPressureEviction,
 
-		conf:                          conf,
-		qosConfig:                     conf.QoSConfiguration,
-		dynamicConfig:                 conf.DynamicAgentConfiguration,
-		cpuAdvisorSocketAbsPath:       conf.CPUAdvisorSocketAbsPath,
-		cpuPluginSocketAbsPath:        conf.CPUPluginSocketAbsPath,
-		enableReclaimNUMABinding:      conf.EnableReclaimNUMABinding,
-		enableSNBHighNumaPreference:   conf.EnableSNBHighNumaPreference,
-		enableCPUAdvisor:              conf.CPUQRMPluginConfig.EnableCPUAdvisor,
-		getAdviceInterval:             conf.CPUQRMPluginConfig.GetAdviceInterval,
-		snbCPUThresholdRatio:          conf.CPUQRMPluginConfig.SNBCPUThresholdRatio,
-		reservedCPUs:                  reservedCPUs,
-		extraStateFileAbsPath:         conf.ExtraStateFileAbsPath,
-		enableCPUBurst:                conf.CPUQRMPluginConfig.EnableCPUBurst,
-		enableSyncingCPUIdle:          conf.CPUQRMPluginConfig.EnableSyncingCPUIdle,
-		enableCPUIdle:                 conf.CPUQRMPluginConfig.EnableCPUIdle,
-		reclaimRelativeRootCgroupPath: conf.ReclaimRelativeRootCgroupPath,
+		conf:                             conf,
+		qosConfig:                        conf.QoSConfiguration,
+		dynamicConfig:                    conf.DynamicAgentConfiguration,
+		cpuAdvisorSocketAbsPath:          conf.CPUAdvisorSocketAbsPath,
+		cpuPluginSocketAbsPath:           conf.CPUPluginSocketAbsPath,
+		enableReclaimNUMABinding:         conf.EnableReclaimNUMABinding,
+		enableSNBHighNumaPreference:      conf.EnableSNBHighNumaPreference,
+		enableCPUAdvisor:                 conf.CPUQRMPluginConfig.EnableCPUAdvisor,
+		getAdviceInterval:                conf.CPUQRMPluginConfig.GetAdviceInterval,
+		snbCPUTotalRequestThresholdRatio: conf.CPUQRMPluginConfig.SNBCPUTotalRequestThresholdRatio,
+		reservedCPUs:                     reservedCPUs,
+		extraStateFileAbsPath:            conf.ExtraStateFileAbsPath,
+		enableCPUBurst:                   conf.CPUQRMPluginConfig.EnableCPUBurst,
+		enableSyncingCPUIdle:             conf.CPUQRMPluginConfig.EnableSyncingCPUIdle,
+		enableCPUIdle:                    conf.CPUQRMPluginConfig.EnableCPUIdle,
+		reclaimRelativeRootCgroupPath:    conf.ReclaimRelativeRootCgroupPath,
 		numaBindingReclaimRelativeRootCgroupPaths: common.GetNUMABindingReclaimRelativeRootCgroupPaths(conf.ReclaimRelativeRootCgroupPath,
 			agentCtx.CPUDetails.NUMANodes().ToSliceNoSortInt()),
 		podDebugAnnoKeys:               conf.PodDebugAnnoKeys,

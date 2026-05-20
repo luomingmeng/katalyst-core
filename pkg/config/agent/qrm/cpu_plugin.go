@@ -71,9 +71,10 @@ type CPUDynamicPolicyConfig struct {
 	EnableDefaultSharedCoresCPUBurst bool
 	// EnableCPUBurstForMainContainerOnly indicates whether cpu burst is only enabled for the main container
 	EnableCPUBurstForMainContainerOnly bool
-	// SNBCPUThresholdRatio limits shared_cores NUMA binding CPU request by NUMA total assignable CPU.
+	// SNBCPUTotalRequestThresholdRatio limits total NUMA binding pod CPU requests on a NUMA
+	// when admitting shared_cores NUMA binding pods.
 	// 0 means disabled.
-	SNBCPUThresholdRatio float64
+	SNBCPUTotalRequestThresholdRatio float64
 
 	*hintoptimizer.HintOptimizerConfiguration
 	*irqtuner.IRQTunerConfiguration

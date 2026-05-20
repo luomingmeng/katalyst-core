@@ -56,7 +56,7 @@ type CPUDynamicPolicyOptions struct {
 	EnableDefaultDedicatedCoresCPUBurst bool
 	EnableDefaultSharedCoresCPUBurst    bool
 	EnableCPUBurstForMainContainerOnly  bool
-	SNBCPUThresholdRatio                float64
+	SNBCPUTotalRequestThresholdRatio    float64
 	*irqtuner.IRQTunerOptions
 	*hintoptimizer.HintOptimizerOptions
 }
@@ -145,8 +145,9 @@ func (o *CPUOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 		o.EnableDefaultDedicatedCoresCPUBurst, "if set true, it will enable cpu burst for dedicated cores by default")
 	fs.BoolVar(&o.EnableCPUBurstForMainContainerOnly, "enable-cpu-burst-for-main-container-only",
 		o.EnableCPUBurstForMainContainerOnly, "if set true, it will enable cpu burst for main container only")
-	fs.Float64Var(&o.SNBCPUThresholdRatio, "snb-cpu-threshold-ratio",
-		o.SNBCPUThresholdRatio, "ratio in [0,1] to limit shared_cores NUMA binding CPU request by NUMA total assignable CPU; 0 disables the limit")
+	fs.Float64Var(&o.SNBCPUTotalRequestThresholdRatio, "snb-cpu-total-request-threshold-ratio",
+		o.SNBCPUTotalRequestThresholdRatio, "ratio in [0,1] to limit total NUMA binding pod CPU requests on a NUMA "+
+			"when admitting shared_cores NUMA binding pods; 0 disables the limit")
 	o.HintOptimizerOptions.AddFlags(fss)
 	o.IRQTunerOptions.AddFlags(fss)
 }
@@ -172,10 +173,10 @@ func (o *CPUOptions) ApplyTo(conf *qrmconfig.CPUQRMPluginConfig) error {
 	conf.EnableDefaultDedicatedCoresCPUBurst = o.EnableDefaultDedicatedCoresCPUBurst
 	conf.EnableDefaultSharedCoresCPUBurst = o.EnableDefaultSharedCoresCPUBurst
 	conf.EnableCPUBurstForMainContainerOnly = o.EnableCPUBurstForMainContainerOnly
-	if o.SNBCPUThresholdRatio < 0 || o.SNBCPUThresholdRatio > 1 {
-		return fmt.Errorf("snb-cpu-threshold-ratio should be in [0,1], got %v", o.SNBCPUThresholdRatio)
+	if o.SNBCPUTotalRequestThresholdRatio < 0 || o.SNBCPUTotalRequestThresholdRatio > 1 {
+		return fmt.Errorf("snb-cpu-total-request-threshold-ratio should be in [0,1], got %v", o.SNBCPUTotalRequestThresholdRatio)
 	}
-	conf.SNBCPUThresholdRatio = o.SNBCPUThresholdRatio
+	conf.SNBCPUTotalRequestThresholdRatio = o.SNBCPUTotalRequestThresholdRatio
 	if err := o.HintOptimizerOptions.ApplyTo(conf.HintOptimizerConfiguration); err != nil {
 		return err
 	}
