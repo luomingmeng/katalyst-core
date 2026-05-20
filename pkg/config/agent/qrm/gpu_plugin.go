@@ -68,6 +68,10 @@ type GPUQRMPluginConfig struct {
 	// GPUSelectionResultAnnotationKey is the pod annotation key used to retrieve the GPU selection result
 	// (e.g., a comma-separated list of device IDs) scheduled by the control plane scheduler.
 	GPUSelectionResultAnnotationKey string
+	// VirtualGPUDisableEnvsInjectionAnnotationKey disables Virtual GPU env injection
+	// when the annotation exists on ResourceRequest.Annotations and its value is "true".
+	// If empty, env injection keeps the current behavior.
+	VirtualGPUDisableEnvsInjectionAnnotationKey string
 
 	*gpustrategy.GPUStrategyConfig
 }

@@ -26,42 +26,44 @@ import (
 )
 
 type GPUOptions struct {
-	PolicyName                       string
-	GPUDeviceNames                   []string
-	GPUMemoryAllocatablePerGPU       string
-	MilliGPUAllocatablePerGPU        string
-	SkipGPUStateCorruption           bool
-	RDMADeviceNames                  []string
-	RequiredDeviceAffinity           bool
-	EnableKubeletCheckpointFallback  bool
-	VirtualGPUPrefersSpreading       bool
-	VirtualGPUVisibleDevicesEnvNames []string
-	VirtualGPUMemoryWeightEnvName    string
-	VirtualGPUComputeWeightEnvName   string
-	VirtualGPUTimesliceEnvName       string
-	VirtualGPUComputePolicyEnvName   string
-	GPUSelectionResultAnnotationKey  string
-	VirtualGPUTimesliceEnvValue      int
-	VirtualGPUComputePolicyEnvValue  int
+	PolicyName                                  string
+	GPUDeviceNames                              []string
+	GPUMemoryAllocatablePerGPU                  string
+	MilliGPUAllocatablePerGPU                   string
+	SkipGPUStateCorruption                      bool
+	RDMADeviceNames                             []string
+	RequiredDeviceAffinity                      bool
+	EnableKubeletCheckpointFallback             bool
+	VirtualGPUPrefersSpreading                  bool
+	VirtualGPUVisibleDevicesEnvNames            []string
+	VirtualGPUMemoryWeightEnvName               string
+	VirtualGPUComputeWeightEnvName              string
+	VirtualGPUTimesliceEnvName                  string
+	VirtualGPUComputePolicyEnvName              string
+	GPUSelectionResultAnnotationKey             string
+	VirtualGPUDisableEnvsInjectionAnnotationKey string
+	VirtualGPUTimesliceEnvValue                 int
+	VirtualGPUComputePolicyEnvValue             int
 
 	GPUStrategyOptions *gpustrategy.GPUStrategyOptions
 }
 
 func NewGPUOptions() *GPUOptions {
 	return &GPUOptions{
-		PolicyName:                       "static",
-		GPUDeviceNames:                   []string{"nvidia.com/gpu"},
-		GPUMemoryAllocatablePerGPU:       "100",
-		MilliGPUAllocatablePerGPU:        "1000",
-		RDMADeviceNames:                  []string{},
-		GPUStrategyOptions:               gpustrategy.NewGPUStrategyOptions(),
-		RequiredDeviceAffinity:           true,
-		EnableKubeletCheckpointFallback:  true,
-		VirtualGPUPrefersSpreading:       false,
-		VirtualGPUVisibleDevicesEnvNames: []string{"NVIDIA_VISIBLE_DEVICES"},
-		GPUSelectionResultAnnotationKey:  consts.PodAnnotationGPUSelectionResultKey,
-		VirtualGPUTimesliceEnvValue:      300,
-		VirtualGPUComputePolicyEnvValue:  0,
+		PolicyName:                                  "static",
+		GPUDeviceNames:                              []string{"nvidia.com/gpu"},
+		GPUMemoryAllocatablePerGPU:                  "100",
+		MilliGPUAllocatablePerGPU:                   "1000",
+		RDMADeviceNames:                             []string{},
+		GPUStrategyOptions:                          gpustrategy.NewGPUStrategyOptions(),
+		RequiredDeviceAffinity:                      true,
+		EnableKubeletCheckpointFallback:             true,
+		VirtualGPUPrefersSpreading:                  false,
+		VirtualGPUVisibleDevicesEnvNames:            []string{"NVIDIA_VISIBLE_DEVICES"},
+		GPUSelectionResultAnnotationKey:             consts.PodAnnotationGPUSelectionResultKey,
+		VirtualGPUDisableEnvsInjectionAnnotationKey: "",
+		VirtualGPUTimesliceEnvValue:                 300,
+		VirtualGPUComputePolicyEnvValue:             0,
 	}
 }
 
@@ -96,6 +98,9 @@ func (o *GPUOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 		o.VirtualGPUComputePolicyEnvName, "The environment variable name for Virtual GPU compute policy")
 	fs.StringVar(&o.GPUSelectionResultAnnotationKey, "gpu-selection-result-annotation-key",
 		o.GPUSelectionResultAnnotationKey, "The annotation key for GPU selection result")
+	fs.StringVar(&o.VirtualGPUDisableEnvsInjectionAnnotationKey, "virtual-gpu-disable-envs-injection-annotation-key",
+		o.VirtualGPUDisableEnvsInjectionAnnotationKey,
+		"If this annotation key exists on the resource request and its value is true, skip Virtual GPU env injection")
 	fs.IntVar(&o.VirtualGPUTimesliceEnvValue, "virtual-gpu-timeslice-env-value",
 		o.VirtualGPUTimesliceEnvValue, "The environment variable value for Virtual GPU timeslice")
 	fs.IntVar(&o.VirtualGPUComputePolicyEnvValue, "virtual-gpu-compute-policy-env-value",
@@ -129,6 +134,7 @@ func (o *GPUOptions) ApplyTo(conf *qrmconfig.GPUQRMPluginConfig) error {
 	conf.VirtualGPUTimesliceEnvValue = o.VirtualGPUTimesliceEnvValue
 	conf.VirtualGPUComputePolicyEnvValue = o.VirtualGPUComputePolicyEnvValue
 	conf.GPUSelectionResultAnnotationKey = o.GPUSelectionResultAnnotationKey
+	conf.VirtualGPUDisableEnvsInjectionAnnotationKey = o.VirtualGPUDisableEnvsInjectionAnnotationKey
 	if err := o.GPUStrategyOptions.ApplyTo(conf.GPUStrategyConfig); err != nil {
 		return err
 	}

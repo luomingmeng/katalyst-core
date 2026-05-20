@@ -2397,3 +2397,192 @@ func TestVirtualGPUPlugin_calculateEnvVariables(t *testing.T) {
 		})
 	}
 }
+
+func TestVirtualGPUPlugin_shouldSkipEnvInjection(t *testing.T) {
+	t.Parallel()
+
+	basePlugin := makeTestBasePlugin(t)
+	resourcePlugin := NewVirtualGPUPlugin(basePlugin)
+	plugin, ok := resourcePlugin.(*VirtualGPUPlugin)
+	if !assert.True(t, ok) {
+		return
+	}
+
+	annotationKey := "example.com/disable-gpu-envs"
+
+	tests := []struct {
+		name        string
+		configured  string
+		annotations map[string]string
+		expected    bool
+	}{
+		{
+			name:       "empty configured key",
+			configured: "",
+			annotations: map[string]string{
+				annotationKey: disableEnvsInjectionAnnotationValue,
+			},
+			expected: false,
+		},
+		{
+			name:        "nil annotations",
+			configured:  annotationKey,
+			annotations: nil,
+			expected:    false,
+		},
+		{
+			name:       "annotation absent",
+			configured: annotationKey,
+			annotations: map[string]string{
+				"other-key": disableEnvsInjectionAnnotationValue,
+			},
+			expected: false,
+		},
+		{
+			name:       "annotation false",
+			configured: annotationKey,
+			annotations: map[string]string{
+				annotationKey: "false",
+			},
+			expected: false,
+		},
+		{
+			name:       "annotation true",
+			configured: annotationKey,
+			annotations: map[string]string{
+				annotationKey: disableEnvsInjectionAnnotationValue,
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			plugin.Conf.VirtualGPUDisableEnvsInjectionAnnotationKey = tt.configured
+
+			req := &pluginapi.ResourceRequest{
+				Annotations: tt.annotations,
+			}
+
+			assert.Equal(t, tt.expected, plugin.shouldSkipEnvInjection(req))
+		})
+	}
+}
+
+func TestVirtualGPUPlugin_Allocate_DisableEnvInjectionAnnotation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                    string
+		annotations             map[string]string
+		expectResourceEnvsEmpty bool
+	}{
+		{
+			name:                    "annotation absent keeps env injection",
+			annotations:             nil,
+			expectResourceEnvsEmpty: false,
+		},
+		{
+			name: "annotation true disables env injection",
+			annotations: map[string]string{
+				"example.com/disable-gpu-envs": disableEnvsInjectionAnnotationValue,
+			},
+			expectResourceEnvsEmpty: true,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			basePlugin := makeTestBasePlugin(t)
+			basePlugin.Conf.VirtualGPUDisableEnvsInjectionAnnotationKey = "example.com/disable-gpu-envs"
+			basePlugin.Conf.VirtualGPUMemoryWeightEnvName = "KUBE_GPU_MEMORY_WEIGHT"
+			basePlugin.Conf.VirtualGPUComputeWeightEnvName = "KUBE_GPU_COMPUTE_WEIGHT"
+			basePlugin.Conf.VirtualGPUTimesliceEnvName = "KUBE_GPU_TIMESLICE"
+			basePlugin.Conf.VirtualGPUTimesliceEnvValue = 1
+			basePlugin.Conf.VirtualGPUComputePolicyEnvName = "KUBE_GPU_COMPUTE_POLICY"
+			basePlugin.Conf.VirtualGPUComputePolicyEnvValue = 2
+			basePlugin.Conf.VirtualGPUVisibleDevicesEnvNames = []string{"NVIDIA_VISIBLE_DEVICES"}
+
+			err := basePlugin.DeviceTopologyRegistry.SetDeviceTopology("test-gpu", &machine.DeviceTopology{
+				Devices: map[string]machine.DeviceInfo{
+					"gpu-0": {
+						NumaNodes: []int{0},
+						Health:    deviceplugin.Healthy,
+					},
+				},
+			})
+			assert.NoError(t, err)
+
+			basePlugin.GetState().SetMachineState(state.AllocationResourcesMap{
+				"gpu_device": {},
+				consts.ResourceGPUMemory: {
+					"gpu-0": {
+						Allocatable: 10,
+						PodEntries:  map[string]state.ContainerEntries{},
+					},
+				},
+				consts.ResourceMilliGPU: {
+					"gpu-0": {
+						Allocatable: 1000,
+						PodEntries:  map[string]state.ContainerEntries{},
+					},
+				},
+			}, true)
+
+			resourcePlugin := NewVirtualGPUPlugin(basePlugin)
+			plugin, ok := resourcePlugin.(*VirtualGPUPlugin)
+			if !assert.True(t, ok) {
+				return
+			}
+
+			resp, err := plugin.Allocate(context.Background(), &pluginapi.ResourceRequest{
+				PodUid:        "test-pod-env-gate",
+				ContainerName: "test-container-env-gate",
+				ContainerType: pluginapi.ContainerType_MAIN,
+				Hint:          &pluginapi.TopologyHint{Nodes: []uint64{0}},
+				Annotations:   tt.annotations,
+				ResourceRequests: map[string]float64{
+					string(consts.ResourceGPUMemory): 5,
+					string(consts.ResourceMilliGPU):  250,
+				},
+			}, nil)
+			assert.NoError(t, err)
+			if !assert.NotNil(t, resp) || !assert.NotNil(t, resp.AllocationResult) {
+				return
+			}
+
+			gpuMemoryAllocation, ok := resp.AllocationResult.ResourceAllocation[string(consts.ResourceGPUMemory)]
+			if !assert.True(t, ok) || !assert.NotNil(t, gpuMemoryAllocation) {
+				return
+			}
+			milliGPUAllocation, ok := resp.AllocationResult.ResourceAllocation[string(consts.ResourceMilliGPU)]
+			if !assert.True(t, ok) || !assert.NotNil(t, milliGPUAllocation) {
+				return
+			}
+
+			expectedMemoryEnvs := map[string]string{
+				"KUBE_GPU_MEMORY_WEIGHT": "gpu-0:50",
+			}
+			expectedMilliGPUEnvs := map[string]string{
+				"KUBE_GPU_COMPUTE_WEIGHT": "gpu-0:25",
+				"KUBE_GPU_TIMESLICE":      "1",
+				"KUBE_GPU_COMPUTE_POLICY": "2",
+				"NVIDIA_VISIBLE_DEVICES":  "gpu-0",
+			}
+
+			if tt.expectResourceEnvsEmpty {
+				assert.Nil(t, gpuMemoryAllocation.Envs)
+				assert.Nil(t, milliGPUAllocation.Envs)
+			} else {
+				assert.Equal(t, expectedMemoryEnvs, gpuMemoryAllocation.Envs)
+				assert.Equal(t, expectedMilliGPUEnvs, milliGPUAllocation.Envs)
+			}
+		})
+	}
+}

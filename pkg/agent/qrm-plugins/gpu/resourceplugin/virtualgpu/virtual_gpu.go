@@ -51,6 +51,8 @@ type VirtualGPUPlugin struct {
 	*baseplugin.BasePlugin
 }
 
+const disableEnvsInjectionAnnotationValue = "true"
+
 // NewVirtualGPUPlugin creates and returns a new GPU compute resource plugin
 func NewVirtualGPUPlugin(base *baseplugin.BasePlugin) resourceplugin.ResourcePlugin {
 	// string(consts.ResourceGPUMemory) is the key used for state management in the QRM framework,
@@ -718,6 +720,8 @@ func (p *VirtualGPUPlugin) Allocate(
 		return util.CreateEmptyAllocationResponse(resourceReq, p.ResourceName()), nil
 	}
 
+	skipEnvInjection := p.shouldSkipEnvInjection(resourceReq)
+
 	qosLevel, err := util.GetKatalystQoSLevelFromResourceReq(p.Conf.QoSConfiguration, resourceReq, p.PodAnnotationKeptKeys, p.PodLabelKeptKeys)
 	if err != nil {
 		err = fmt.Errorf("GetKatalystQoSLevelFromResourceReq for pod: %s/%s, container: %s failed with error: %v",
@@ -810,7 +814,7 @@ func (p *VirtualGPUPlugin) Allocate(
 
 	general.Infof("deviceReq: %v", deviceReq.String())
 
-	return p.allocate(resourceReq, deviceReq, resourceQuantities, qosLevel)
+	return p.allocate(resourceReq, deviceReq, resourceQuantities, qosLevel, skipEnvInjection)
 }
 
 // allocate allocates GPU compute resources when physical GPU devices are requested
@@ -819,6 +823,7 @@ func (p *VirtualGPUPlugin) allocate(
 	deviceReq *pluginapi.DeviceRequest,
 	resourceQuantities map[v1.ResourceName]float64,
 	qosLevel string,
+	skipEnvInjection bool,
 ) (*pluginapi.ResourceAllocationResponse, error) {
 	gpuTopology, err := p.DeviceTopologyRegistry.GetLatestDeviceTopology(p.Conf.GPUDeviceNames)
 	if err != nil {
@@ -897,6 +902,10 @@ func (p *VirtualGPUPlugin) allocate(
 		p.GetState().SetResourceState(resName, machineState, true)
 		allocationInfoMap[string(resName)] = newAllocation
 
+		if skipEnvInjection {
+			continue
+		}
+
 		// Calculate the environment variables
 		envs := p.calculateEnvVariables(resName, result.AllocatedDevices, resQuantityPerGPU)
 		if len(envs) > 0 {
@@ -905,6 +914,27 @@ func (p *VirtualGPUPlugin) allocate(
 	}
 
 	return p.PackAllocationResponse(resourceReq, allocationInfoMap, nil, p.ResourceName(), resourceAllocationEnvs)
+}
+
+// shouldSkipEnvInjection reports whether Virtual GPU env injection should be skipped
+// for the current request. Injection is disabled only when the configured annotation
+// key is present on the resource request and its value is exactly "true".
+func (p *VirtualGPUPlugin) shouldSkipEnvInjection(resourceReq *pluginapi.ResourceRequest) bool {
+	if resourceReq == nil {
+		return false
+	}
+
+	key := p.Conf.VirtualGPUDisableEnvsInjectionAnnotationKey
+	if key == "" || resourceReq.Annotations == nil {
+		return false
+	}
+
+	value, ok := resourceReq.Annotations[key]
+	if !ok {
+		return false
+	}
+
+	return value == disableEnvsInjectionAnnotationValue
 }
 
 // calculateEnvVariables computes the environment variable map for a given GPU resource.
