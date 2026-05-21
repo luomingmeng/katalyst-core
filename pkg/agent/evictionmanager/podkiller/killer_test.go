@@ -27,7 +27,6 @@ import (
 	policy "k8s.io/api/policy/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes/fake"
 	coretesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/events"
@@ -35,7 +34,6 @@ import (
 
 	katalyst_base "github.com/kubewharf/katalyst-core/cmd/base"
 	"github.com/kubewharf/katalyst-core/pkg/config"
-	evictionconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/eviction"
 	"github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 )
@@ -186,89 +184,52 @@ func TestContainerKiller_Evict(t *testing.T) {
 func TestEvictionAPIKiller_buildEvictionExplicitTriggerAnnotations(t *testing.T) {
 	t.Parallel()
 
-	newConf := func(podAnnos map[string]sets.String, evictKey string) *config.Configuration {
+	newConf := func(key, value string) *config.Configuration {
 		c := config.NewConfiguration()
-		c.GenericEvictionConfiguration.EvictionExplicitTriggerAnnotationConfig = &evictionconfig.EvictionExplicitTriggerAnnotationConfig{
-			ExplicitlyTriggeringPodAnnotations: podAnnos,
-			ExplicitTriggerAnnotationKey:       evictKey,
-		}
+		c.GenericEvictionConfiguration.EvictionExplicitTriggerAnnotationKey = key
+		c.GenericEvictionConfiguration.EvictionExplicitTriggerAnnotationValue = value
+		return c
+	}
+	newConfWithNilGenericEviction := func() *config.Configuration {
+		c := config.NewConfiguration()
+		c.GenericEvictionConfiguration = nil
 		return c
 	}
 
 	tests := []struct {
-		name           string
-		conf           *config.Configuration
-		podAnnotations map[string]string
-		want           map[string]string
+		name string
+		conf *config.Configuration
+		want map[string]string
 	}{
 		{
-			name:           "nil conf returns nil",
-			conf:           nil,
-			podAnnotations: map[string]string{"shield": "strict"},
-			want:           nil,
+			name: "nil conf returns nil",
+			conf: nil,
+			want: nil,
 		},
 		{
-			name:           "empty trigger key disables rule",
-			conf:           newConf(map[string]sets.String{"shield": sets.NewString("strict")}, ""),
-			podAnnotations: map[string]string{"shield": "strict"},
-			want:           nil,
+			name: "nil generic eviction config returns nil",
+			conf: newConfWithNilGenericEviction(),
+			want: nil,
 		},
 		{
-			name:           "empty ExplicitlyTriggeringPodAnnotations disables rule",
-			conf:           newConf(map[string]sets.String{}, "evicted-by"),
-			podAnnotations: map[string]string{"shield": "strict"},
-			want:           nil,
+			name: "empty trigger key disables rule",
+			conf: newConf("", "true"),
+			want: nil,
 		},
 		{
-			name:           "single key/value match",
-			conf:           newConf(map[string]sets.String{"shield": sets.NewString("strict")}, "evicted-by"),
-			podAnnotations: map[string]string{"shield": "strict"},
-			want:           map[string]string{"evicted-by": evictionconfig.EvictionExplicitTriggerAnnotationValue},
+			name: "empty trigger value disables rule",
+			conf: newConf("evicted-by", ""),
+			want: nil,
 		},
 		{
-			name:           "match via second value in set",
-			conf:           newConf(map[string]sets.String{"shield": sets.NewString("strict", "loose")}, "evicted-by"),
-			podAnnotations: map[string]string{"shield": "loose"},
-			want:           map[string]string{"evicted-by": evictionconfig.EvictionExplicitTriggerAnnotationValue},
+			name: "configured key and value are stamped",
+			conf: newConf("evicted-by", "memory-pressure"),
+			want: map[string]string{"evicted-by": "memory-pressure"},
 		},
 		{
-			name: "match via second key in map",
-			conf: newConf(map[string]sets.String{
-				"shield":    sets.NewString("strict"),
-				"protected": sets.NewString("true"),
-			}, "evicted-by"),
-			podAnnotations: map[string]string{"protected": "true"},
-			want:           map[string]string{"evicted-by": evictionconfig.EvictionExplicitTriggerAnnotationValue},
-		},
-		{
-			name:           "no match: wrong value",
-			conf:           newConf(map[string]sets.String{"shield": sets.NewString("strict")}, "evicted-by"),
-			podAnnotations: map[string]string{"shield": "off"},
-			want:           nil,
-		},
-		{
-			name:           "no match: key missing",
-			conf:           newConf(map[string]sets.String{"shield": sets.NewString("strict")}, "evicted-by"),
-			podAnnotations: map[string]string{"other": "anything"},
-			want:           nil,
-		},
-		{
-			name:           "no match: pod has nil annotations",
-			conf:           newConf(map[string]sets.String{"shield": sets.NewString("strict")}, "evicted-by"),
-			podAnnotations: nil,
-			want:           nil,
-		},
-		{
-			name:           "wildcard: empty allowed values matches any pod value",
-			conf:           newConf(map[string]sets.String{"shield": sets.NewString()}, "evicted-by"),
-			podAnnotations: map[string]string{"shield": "anything"},
-			want:           map[string]string{"evicted-by": evictionconfig.EvictionExplicitTriggerAnnotationValue},
-		},
-		{
-			name:           "wildcard: empty allowed values still requires the key",
-			conf:           newConf(map[string]sets.String{"shield": sets.NewString()}, "evicted-by"),
-			podAnnotations: map[string]string{"other": "anything"},
-			want:           nil,
+			name: "pod annotations do not affect stamping",
+			conf: newConf("evicted-by", "katalyst"),
+			want: map[string]string{"evicted-by": "katalyst"},
 		},
 	}
 
@@ -277,8 +238,7 @@ func TestEvictionAPIKiller_buildEvictionExplicitTriggerAnnotations(t *testing.T)
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			e := &EvictionAPIKiller{conf: tt.conf}
-			pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: tt.podAnnotations}}
-			got := e.buildEvictionExplicitTriggerAnnotations(pod)
+			got := e.buildEvictionExplicitTriggerAnnotations()
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -288,20 +248,29 @@ func TestEvictionAPIKiller_EvictStampsExplicitTriggerAnnotation(t *testing.T) {
 	t.Parallel()
 
 	type tcase struct {
-		name           string
-		podAnnotations map[string]string
-		wantAnnos      map[string]string
+		name  string
+		key   string
+		value string
+		want  map[string]string
 	}
 	cases := []tcase{
 		{
-			name:           "matching pod gets explicit-trigger annotation",
-			podAnnotations: map[string]string{"shield": "strict"},
-			wantAnnos:      map[string]string{"evicted-by": evictionconfig.EvictionExplicitTriggerAnnotationValue},
+			name:  "configured key and value are stamped",
+			key:   "evicted-by",
+			value: "katalyst",
+			want:  map[string]string{"evicted-by": "katalyst"},
 		},
 		{
-			name:           "non-matching pod gets no explicit-trigger annotation",
-			podAnnotations: map[string]string{"shield": "off"},
-			wantAnnos:      nil,
+			name:  "empty key results in no annotation",
+			key:   "",
+			value: "katalyst",
+			want:  nil,
+		},
+		{
+			name:  "empty value results in no annotation",
+			key:   "evicted-by",
+			value: "",
+			want:  nil,
 		},
 	}
 
@@ -315,7 +284,7 @@ func TestEvictionAPIKiller_EvictStampsExplicitTriggerAnnotation(t *testing.T) {
 					Name:        "pod-1",
 					Namespace:   "ns-1",
 					UID:         "uid-1",
-					Annotations: tt.podAnnotations,
+					Annotations: map[string]string{"shield": "strict"},
 				},
 			}
 
@@ -339,10 +308,8 @@ func TestEvictionAPIKiller_EvictStampsExplicitTriggerAnnotation(t *testing.T) {
 			})
 
 			conf := config.NewConfiguration()
-			conf.GenericEvictionConfiguration.EvictionExplicitTriggerAnnotationConfig = &evictionconfig.EvictionExplicitTriggerAnnotationConfig{
-				ExplicitlyTriggeringPodAnnotations: map[string]sets.String{"shield": sets.NewString("strict")},
-				ExplicitTriggerAnnotationKey:       "evicted-by",
-			}
+			conf.GenericEvictionConfiguration.EvictionExplicitTriggerAnnotationKey = tt.key
+			conf.GenericEvictionConfiguration.EvictionExplicitTriggerAnnotationValue = tt.value
 
 			killer, err := NewEvictionAPIKiller(conf, ctx.Client.KubeClient, &events.FakeRecorder{}, metrics.DummyMetrics{})
 			require.NoError(t, err)
@@ -350,7 +317,7 @@ func TestEvictionAPIKiller_EvictStampsExplicitTriggerAnnotation(t *testing.T) {
 			require.NoError(t, killer.Evict(context.Background(), pod, 0, "test-api", "test"))
 
 			require.NotNil(t, captured)
-			assert.Equal(t, tt.wantAnnos, captured.ObjectMeta.Annotations)
+			assert.Equal(t, tt.want, captured.ObjectMeta.Annotations)
 		})
 	}
 }

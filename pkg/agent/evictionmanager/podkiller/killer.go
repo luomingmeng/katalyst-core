@@ -37,7 +37,6 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/cri/remote"
 
 	"github.com/kubewharf/katalyst-core/pkg/config"
-	evictionconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/eviction"
 	"github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 )
@@ -88,37 +87,23 @@ func NewEvictionAPIKiller(conf *config.Configuration, client kubernetes.Interfac
 func (e *EvictionAPIKiller) Name() string { return consts.KillerNameEvictionKiller }
 
 // buildEvictionExplicitTriggerAnnotations returns the annotation set that
-// should be stamped onto the Eviction API object for the given pod, based on
-// the configured EvictionExplicitTriggerAnnotationConfig.
+// should be stamped onto the Eviction API object.
 //
-// This is the explicit-trigger marker that signals higher-level components
-// (controllers, operators, external automation) that a specific eviction
-// needs their follow-up handling. It returns nil when the rule is disabled
-// or no configured pod-annotation (key, value) pair matches — i.e. the
-// eviction is "ordinary" and no upstream action is requested.
-//
-// An entry whose allowed-values set is empty acts as a wildcard: the rule
-// fires whenever the pod has that annotation key set to *any* value.
-func (e *EvictionAPIKiller) buildEvictionExplicitTriggerAnnotations(pod *v1.Pod) map[string]string {
+// This marker conveys that the eviction request is triggered by
+// katalyst-agent, so higher-level components can listen to this information
+// and react accordingly. It returns nil when the marker is not configured.
+func (e *EvictionAPIKiller) buildEvictionExplicitTriggerAnnotations() map[string]string {
 	if e.conf == nil || e.conf.GenericEvictionConfiguration == nil {
 		return nil
 	}
-	rule := e.conf.GenericEvictionConfiguration.EvictionExplicitTriggerAnnotationConfig
-	if rule == nil || rule.ExplicitTriggerAnnotationKey == "" || len(rule.ExplicitlyTriggeringPodAnnotations) == 0 {
+
+	key := e.conf.GenericEvictionConfiguration.EvictionExplicitTriggerAnnotationKey
+	val := e.conf.GenericEvictionConfiguration.EvictionExplicitTriggerAnnotationValue
+	if key == "" || val == "" {
 		return nil
 	}
-	for podKey, allowedValues := range rule.ExplicitlyTriggeringPodAnnotations {
-		podVal, exists := pod.Annotations[podKey]
-		if !exists {
-			continue
-		}
-		if allowedValues.Len() == 0 || allowedValues.Has(podVal) {
-			return map[string]string{
-				rule.ExplicitTriggerAnnotationKey: evictionconfig.EvictionExplicitTriggerAnnotationValue,
-			}
-		}
-	}
-	return nil
+
+	return map[string]string{key: val}
 }
 
 func (e *EvictionAPIKiller) Evict(_ context.Context, pod *v1.Pod, gracePeriodSeconds int64, reason, plugin string) error {
@@ -139,7 +124,7 @@ func (e *EvictionAPIKiller) Evict(_ context.Context, pod *v1.Pod, gracePeriodSec
 			ObjectMeta: metav1.ObjectMeta{
 				Name:        pod.Name,
 				Namespace:   pod.Namespace,
-				Annotations: e.buildEvictionExplicitTriggerAnnotations(pod),
+				Annotations: e.buildEvictionExplicitTriggerAnnotations(),
 			},
 			DeleteOptions: deleteOptions,
 		}
