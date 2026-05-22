@@ -235,6 +235,13 @@ const (
 	MetricZramOriginDataSize = "zram.origin.usage.system"
 )
 
+// System disk metrics
+const (
+	MetricDiskTotal = "disk.total.system"
+	MetricDiskFree  = "disk.free.system"
+	MetricDiskUsage = "disk.usage.system"
+)
+
 // container cpu metrics
 const (
 	MetricCPULimitContainer      = "cpu.limit.container"

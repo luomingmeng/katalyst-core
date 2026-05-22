@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	defaultInferenceSyncPeriod = 10 * time.Second
+	defaultInferenceSyncPeriod = 30 * time.Second
 )
 
 // InferencePluginOptions holds the configurations for inference plugin.

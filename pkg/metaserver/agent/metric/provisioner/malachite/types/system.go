@@ -39,9 +39,21 @@ type DiskIo struct {
 }
 
 type SystemIoData struct {
-	DiskIo     []DiskIo   `json:"disk_io"`
-	ZramStat   []ZramStat `json:"zram_stat"`
-	UpdateTime int64      `json:"update_time"`
+	DiskIo     []DiskIo    `json:"disk_io"`
+	DiskUsage  []DiskUsage `json:"disk_usage"`
+	ZramStat   []ZramStat  `json:"zram_stat"`
+	UpdateTime int64       `json:"update_time"`
+}
+
+type DiskUsage struct {
+	MountPoint     string  `json:"mount_point"`
+	FilesystemType string  `json:"filesystem_type"`
+	DeviceName     string  `json:"device_name"`
+	Total          uint64  `json:"total"`
+	Free           uint64  `json:"free"`
+	Usage          float32 `json:"usage"`
+	TotalInodes    uint64  `json:"total_inodes"`
+	FreeInodes     uint64  `json:"free_inodes"`
 }
 
 type ZramStat struct {

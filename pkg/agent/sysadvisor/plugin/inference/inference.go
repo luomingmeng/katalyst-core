@@ -22,8 +22,6 @@ import (
 	"sync"
 	"time"
 
-	"k8s.io/apimachinery/pkg/util/wait"
-
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/metacache"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/plugin"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/plugin/inference/modelinputfetcher"
@@ -125,8 +123,35 @@ func NewInferencePlugin(pluginName string, conf *config.Configuration, extraConf
 	return &inferencePlugin, nil
 }
 
+// Run aligns each inference cycle and its timestamp to period boundaries to avoid cumulative drift,
+// and executes cycles serially.
 func (infp *InferencePlugin) Run(ctx context.Context) {
-	wait.UntilWithContext(ctx, infp.inference, infp.period)
+	now := time.Now()
+	next := now.Truncate(infp.period).Add(infp.period)
+
+	timer := time.NewTimer(time.Until(next))
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+		return
+	}
+
+	ticker := time.NewTicker(infp.period)
+	defer ticker.Stop()
+
+	for {
+		tickTime := next
+		infp.inference(ctx, tickTime.Unix())
+
+		select {
+		case nextTick := <-ticker.C:
+			next = nextTick
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // Name returns the name of inference plugin
@@ -139,14 +164,14 @@ func (infp *InferencePlugin) Init() error {
 	return nil
 }
 
-func (infp *InferencePlugin) fetchModelInput(ctx context.Context) {
+func (infp *InferencePlugin) fetchModelInput(ctx context.Context, timestamp int64) {
 	var wg sync.WaitGroup
 	for modelName, fetcher := range infp.modelsInputFetchers {
 		wg.Add(1)
 		go func(modelName string, fetcher modelinputfetcher.ModelInputFetcher) {
 			defer wg.Done()
 			general.Infof("FetchModelInput for model: %s start", modelName)
-			err := fetcher.FetchModelInput(ctx, infp.metaReader, infp.metaWriter, infp.metaServer)
+			err := fetcher.FetchModelInput(ctx, infp.metaReader, infp.metaWriter, infp.metaServer, timestamp)
 			if err != nil {
 				general.Errorf("FetchModelInput for model: %s failed with error: %v", modelName, err)
 			}
@@ -174,7 +199,7 @@ func (infp *InferencePlugin) fetchModelResult(ctx context.Context) {
 	wg.Wait()
 }
 
-func (infp *InferencePlugin) inference(ctx context.Context) {
-	infp.fetchModelInput(ctx)
+func (infp *InferencePlugin) inference(ctx context.Context, timestamp int64) {
+	infp.fetchModelInput(ctx, timestamp)
 	infp.fetchModelResult(ctx)
 }

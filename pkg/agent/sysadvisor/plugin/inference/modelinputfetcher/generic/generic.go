@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-	"time"
 
 	v1 "k8s.io/api/core/v1"
 
@@ -100,11 +99,11 @@ func NewGenericModelInputFetcher(fetcherName string, conf *config.Configuration,
 }
 
 func (bmif *GenericModelInputFetcher) FetchModelInput(ctx context.Context, metaReader metacache.MetaReader,
-	metaWriter metacache.MetaWriter, metaServer *metaserver.MetaServer,
+	metaWriter metacache.MetaWriter, metaServer *metaserver.MetaServer, timestamp int64,
 ) error {
 	var nodeErrs, numaErrs, containerErrs []error
 
-	callTimestampInSec := time.Now().Unix()
+	callTimestampInSec := timestamp
 	if getNodeFeatureValue == nil {
 		return fmt.Errorf("getNodeFeatureValue is nil")
 	}
