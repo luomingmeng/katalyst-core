@@ -391,42 +391,6 @@ func (ns *NUMANodeState) GetAvailableCPUQuantity(reservedCPUs machine.CPUSet) fl
 	return general.MaxFloat64(float64(allocatableQuantity)-preciseAllocatedQuantity, 0)
 }
 
-// GetNUMABindingRequestedQuantity returns existing NUMA binding pod request quantity attributable to this NUMA.
-func (ns *NUMANodeState) GetNUMABindingRequestedQuantity(excludePodUID string) float64 {
-	if ns == nil {
-		return 0
-	}
-
-	var requestedQuantity float64
-	for podUID, containerEntries := range ns.PodEntries {
-		if containerEntries.IsPoolEntry() || podUID == excludePodUID {
-			continue
-		}
-
-		if mainContainerEntry := containerEntries.GetMainContainerEntry(); mainContainerEntry != nil {
-			if !mainContainerEntry.CheckSharedOrDedicatedNUMABinding() {
-				continue
-			}
-
-			aggregatedPodResource, ok := mainContainerEntry.GetPodAggregatedRequest()
-			if ok {
-				requestedQuantity += aggregatedPodResource
-				continue
-			}
-		}
-
-		for _, allocationInfo := range containerEntries {
-			if allocationInfo == nil || !allocationInfo.CheckSharedOrDedicatedNUMABinding() {
-				continue
-			}
-
-			requestedQuantity += allocationInfo.RequestQuantity
-		}
-	}
-
-	return requestedQuantity
-}
-
 func (ns *NUMANodeState) GetAvailableReclaimCPUQuantity(allocatableQuantity float64) float64 {
 	if ns == nil {
 		return 0

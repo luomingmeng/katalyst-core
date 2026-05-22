@@ -1290,3 +1290,111 @@ func TestSNBCPUTotalRequestThresholdRejectNewPod(t *testing.T) {
 		})
 	}
 }
+
+func TestGetSNBCPUTotalRequest(t *testing.T) {
+	t.Parallel()
+
+	policy := newTestPolicyForSNBCPUTotalRequestThreshold(t, 0.5)
+
+	newAllocation := func(podUID, containerName, containerType, ownerPoolName, qosLevel string,
+		numaBinding bool, request float64, extraAnnotations map[string]string,
+	) *state.AllocationInfo {
+		annotations := map[string]string{
+			consts.PodAnnotationQoSLevelKey: qosLevel,
+		}
+		if numaBinding {
+			annotations[consts.PodAnnotationMemoryEnhancementNumaBinding] = consts.PodAnnotationMemoryEnhancementNumaBindingEnable
+		}
+		for k, v := range extraAnnotations {
+			annotations[k] = v
+		}
+		return &state.AllocationInfo{
+			AllocationMeta: commonstate.AllocationMeta{
+				PodUid:        podUID,
+				PodNamespace:  "default",
+				PodName:       podUID,
+				ContainerName: containerName,
+				ContainerType: containerType,
+				OwnerPoolName: ownerPoolName,
+				Annotations:   annotations,
+				QoSLevel:      qosLevel,
+			},
+			RequestQuantity: request,
+		}
+	}
+
+	//  NUMANodeMap，cover SNB / non NUMA-binding / DNB / Reclaimed / pool entry，
+	// and "self pod"（to exclude in-place resize itself）
+	machineState := state.NUMANodeMap{
+		0: &state.NUMANodeState{
+			DefaultCPUSet:   machine.NewCPUSet(0, 1, 2, 3),
+			AllocatedCPUSet: machine.NewCPUSet(),
+			PodEntries: state.PodEntries{
+				// SNB pod：main + sidecar ；nil entry
+				"snb-pod": state.ContainerEntries{
+					"main": newAllocation("snb-pod", "main", pluginapi.ContainerType_MAIN.String(),
+						commonstate.PoolNameShare, consts.PodAnnotationQoSLevelSharedCores, true, 1.25, nil),
+					"sidecar": newAllocation("snb-pod", "sidecar", pluginapi.ContainerType_SIDECAR.String(),
+						commonstate.PoolNameShare, consts.PodAnnotationQoSLevelSharedCores, true, 0.5, nil),
+					"nil": nil,
+				},
+				// legacy SNB pod
+				"legacy-snb-pod": state.ContainerEntries{
+					"main": newAllocation("legacy-snb-pod", "main", pluginapi.ContainerType_MAIN.String(),
+						commonstate.PoolNameShare, consts.PodAnnotationQoSLevelSharedCores, true, 1.5, nil),
+				},
+				// non-binding shared pod
+				"non-binding-pod": state.ContainerEntries{
+					"main": newAllocation("non-binding-pod", "main", pluginapi.ContainerType_MAIN.String(),
+						commonstate.PoolNameShare, consts.PodAnnotationQoSLevelSharedCores, false, 10, nil),
+				},
+				// DNB pod
+				"dedicated-pod": state.ContainerEntries{
+					"main": newAllocation("dedicated-pod", "main", pluginapi.ContainerType_MAIN.String(),
+						commonstate.PoolNameDedicated, consts.PodAnnotationQoSLevelDedicatedCores, true, 4, nil),
+				},
+				// Reclaimed NUMA-binding pod
+				"reclaimed-pod": state.ContainerEntries{
+					"main": newAllocation("reclaimed-pod", "main", pluginapi.ContainerType_MAIN.String(),
+						commonstate.PoolNameReclaim, consts.PodAnnotationQoSLevelReclaimedCores, true, 2, nil),
+				},
+				// self pod entry：to test exclude。
+				"pod-uid": state.ContainerEntries{
+					"main": newAllocation("pod-uid", "main", pluginapi.ContainerType_MAIN.String(),
+						commonstate.PoolNameShare, consts.PodAnnotationQoSLevelSharedCores, true, 0.4, nil),
+				},
+				// pool entry：skipped by PodEntries.IsPoolEntry()
+				commonstate.PoolNameShare: state.ContainerEntries{
+					commonstate.FakedContainerName: newAllocation(commonstate.PoolNameShare, commonstate.FakedContainerName,
+						pluginapi.ContainerType_MAIN.String(), commonstate.PoolNameShare,
+						consts.PodAnnotationQoSLevelSharedCores, true, 100, nil),
+				},
+			},
+		},
+		1: &state.NUMANodeState{
+			DefaultCPUSet:   machine.NewCPUSet(4, 5, 6, 7),
+			AllocatedCPUSet: machine.NewCPUSet(),
+			PodEntries: state.PodEntries{
+				// NUMA 1 SNB pod
+				"snb-on-numa-1": state.ContainerEntries{
+					"main": newAllocation("snb-on-numa-1", "main", pluginapi.ContainerType_MAIN.String(),
+						commonstate.PoolNameShare, consts.PodAnnotationQoSLevelSharedCores, true, 2, nil),
+				},
+			},
+		},
+	}
+
+	// req.PodUid == "pod-uid" -> in-place resize exclude itself 0.4。
+	req := newSNBCPUTotalRequestThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 1, true)
+
+	// numaSet = {0}: SNB(1.25+0.5) + legacy SNB(1.5) + DNB(4) + request(1) = 8.25
+	require.InDelta(t, 8.25, policy.getSNBCPUTotalRequest(req, 1.0, machineState, machine.NewCPUSet(0)), 1e-9)
+
+	// numaSet = {0, 1}: add numa 1 SNB(2) = 10.25
+	require.InDelta(t, 10.25, policy.getSNBCPUTotalRequest(req, 1.0, machineState, machine.NewCPUSet(0, 1)), 1e-9)
+
+	// different pod uid: not exclude "pod-uid"
+	reqNew := newSNBCPUTotalRequestThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 1, false)
+	reqNew.PodUid = "another-pod"
+	require.InDelta(t, 8.65, policy.getSNBCPUTotalRequest(reqNew, 1.0, machineState, machine.NewCPUSet(0)), 1e-9)
+}

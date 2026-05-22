@@ -78,7 +78,13 @@ func (p *DynamicPolicy) getSNBCPUTotalRequest(
 ) float64 {
 	existingRequestedQuantity := 0.0
 	for _, nodeID := range numaSet.ToSliceNoSortInt() {
-		existingRequestedQuantity += machineState[nodeID].GetNUMABindingRequestedQuantity(req.PodUid)
+		existingRequestedQuantity += state.GetRequestedQuantityFromPodEntries(machineState[nodeID].PodEntries,
+			func(ai *state.AllocationInfo) bool {
+				if ai == nil || ai.PodUid == req.PodUid {
+					return false
+				}
+				return ai.CheckSharedOrDedicatedNUMABinding()
+			}, p.getContainerRequestedCores)
 	}
 
 	return existingRequestedQuantity + request
