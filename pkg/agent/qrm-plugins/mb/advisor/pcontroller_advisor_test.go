@@ -43,6 +43,11 @@ func (m *mockAdvisor) GetPlan(ctx context.Context, domainsMon *monitor.DomainSta
 	return returnedPlan, args.Error(1)
 }
 
+func (m *mockAdvisor) GetSuppressedCCDs() []SuppressedCCD {
+	args := m.Called()
+	return args.Get(0).([]SuppressedCCD)
+}
+
 func TestPControllerAdvisor_GetPlan_May_Update_CCDCap(t *testing.T) {
 	t.Parallel()
 
@@ -316,4 +321,28 @@ func Test_pControllerAdvisor_detectCCDLimitSuppression(t *testing.T) {
 			assert.Equalf(t, tt.want, p.getCCDLimitSuppression(tt.args.domainsMon), "getCCDLimitSuppression(%v)", tt.args.domainsMon)
 		})
 	}
+}
+
+func TestPControllerAdvisor_GetSuppressedCCDs(t *testing.T) {
+	t.Parallel()
+
+	innerSuppressed := []SuppressedCCD{
+		{DomID: 0, Group: "share", CCDID: 2, SuppressionType: "domain_stress"},
+	}
+
+	mockInner := new(mockAdvisor)
+	mockInner.On("GetSuppressedCCDs").Return(innerSuppressed)
+
+	pCtrl := &pControllerAdvisor{
+		inner: mockInner,
+		lastCCDLimitSuppression: map[int]map[string]map[int]string{
+			0: {"dedicated": {4: "ccd_limit"}},
+		},
+	}
+
+	got := pCtrl.GetSuppressedCCDs()
+
+	assert.Len(t, got, 2)
+	assert.Contains(t, got, innerSuppressed[0])
+	assert.Contains(t, got, SuppressedCCD{DomID: 0, Group: "dedicated", CCDID: 4, SuppressionType: "ccd_limit"})
 }

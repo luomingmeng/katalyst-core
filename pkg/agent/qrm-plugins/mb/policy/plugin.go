@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"golang.org/x/exp/maps"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
@@ -31,6 +32,7 @@ import (
 	"github.com/kubewharf/katalyst-api/pkg/plugins/skeleton"
 
 	"github.com/kubewharf/katalyst-core/cmd/katalyst-agent/app/agent"
+	cpustate "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/mb/advisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/mb/advisor/priority"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/mb/allocator"
@@ -40,15 +42,20 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/mb/reader"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	metrictypes "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric/types"
+	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	metricspool "github.com/kubewharf/katalyst-core/pkg/metrics/metrics-pool"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
+	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
 const (
 	name       = "qrm_mb_plugin_generic_policy"
 	metricName = name
 	interval   = time.Second * 1
+
+	metricMBMLoadSuppressed = "mbm_load_suppressed"
+	defaultPSM              = "-"
 )
 
 type MBPlugin struct {
@@ -69,6 +76,8 @@ type MBPlugin struct {
 	metricFetcher metrictypes.MetricsFetcher
 	conf          *config.Configuration
 	agentCtx      *agent.GenericContext
+	machineInfo   *machine.KatalystMachineInfo
+	podFetcher    pod.PodFetcher
 }
 
 func (m *MBPlugin) Name() string {
@@ -246,7 +255,105 @@ func (m *MBPlugin) run() {
 		return
 	}
 
+	m.emitLoadSuppressionMetrics()
+
 	general.InfofV(6, "[mbm] plugin run end")
+}
+
+func (m *MBPlugin) buildCCDToPodsMap() map[int]map[string]*corev1.Pod {
+	cpuState, err := cpustate.GetReadonlyState()
+	if err != nil {
+		general.InfofV(6, "[mbm] cpu readonly state unavailable: %v", err)
+		return nil
+	}
+
+	ccdToPods := make(map[int]map[string]*corev1.Pod)
+	podIndexer := make(map[string]*corev1.Pod)
+	if klog.V(6).Enabled() {
+		general.Infof("[mbm] cpuState.GetPodEntries(): %v", cpuState.GetPodEntries())
+	}
+	for podUID, containerEntries := range cpuState.GetPodEntries() {
+		for _, allocationInfo := range containerEntries {
+			if allocationInfo == nil {
+				continue
+			}
+			cpus := allocationInfo.AllocationResult.ToSliceInt()
+			for _, cpu := range cpus {
+				ccdID := m.machineInfo.CPUDetails[cpu].L3CacheID
+				if ccdToPods[ccdID] == nil {
+					ccdToPods[ccdID] = make(map[string]*corev1.Pod)
+				}
+				if _, exists := ccdToPods[ccdID][podUID]; exists {
+					continue
+				}
+				podInfo, ok := podIndexer[podUID]
+				if !ok {
+					var err error
+					podInfo, err = m.podFetcher.GetPod(context.Background(), podUID)
+					if err != nil || podInfo == nil {
+						continue
+					}
+					podIndexer[podUID] = podInfo
+				}
+				ccdToPods[ccdID][podUID] = podInfo
+			}
+		}
+	}
+	return ccdToPods
+}
+
+func (m *MBPlugin) emitSuppressedPodsMetrics(suppressedCCDs []advisor.SuppressedCCD, ccdToPods map[int]map[string]*corev1.Pod) {
+	seen := make(map[string]struct{})
+	for _, s := range suppressedCCDs {
+		pods, ok := ccdToPods[s.CCDID]
+		if !ok {
+			continue
+		}
+		for _, p := range pods {
+			key := string(p.UID) + "/" + s.SuppressionType
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+
+			psm := p.Labels["psm"]
+			if psm == "" {
+				psm = defaultPSM
+			}
+
+			emitPodSuppressed(m.emitter, p.Namespace, p.Name, s.SuppressionType, psm)
+		}
+	}
+}
+
+func (m *MBPlugin) emitLoadSuppressionMetrics() {
+	suppressedCCDs := m.advisor.GetSuppressedCCDs()
+	if klog.V(6).Enabled() {
+		general.Infof("[mbm] suppressed ccds: %v", suppressedCCDs)
+	}
+	if len(suppressedCCDs) == 0 {
+		return
+	}
+
+	ccdToPods := m.buildCCDToPodsMap()
+	if klog.V(6).Enabled() {
+		general.Infof("[mbm] ccd to pod mappings: %v", ccdToPods)
+	}
+	if ccdToPods == nil {
+		return
+	}
+
+	m.emitSuppressedPodsMetrics(suppressedCCDs, ccdToPods)
+}
+
+func emitPodSuppressed(emitter metrics.MetricEmitter, namespace, podName, suppressionType string, psm string) {
+	tags := map[string]string{
+		"namespace": namespace,
+		"pod_name":  podName,
+		"type":      suppressionType,
+		"psm":       psm,
+	}
+	_ = emitter.StoreInt64(metricMBMLoadSuppressed, 1, metrics.MetricTypeNameRaw, metrics.ConvertMapToTags(tags)...)
 }
 
 func newMBPlugin(agentCtx *agent.GenericContext, conf *config.Configuration,
@@ -268,5 +375,7 @@ func newMBPlugin(agentCtx *agent.GenericContext, conf *config.Configuration,
 		metricFetcher: metricFetcher,
 		conf:          conf,
 		agentCtx:      agentCtx,
+		machineInfo:   agentCtx.KatalystMachineInfo,
+		podFetcher:    agentCtx.MetaServer.PodFetcher,
 	}
 }

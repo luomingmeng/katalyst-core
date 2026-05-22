@@ -34,6 +34,7 @@ import (
 // todo: enhance to handle multiple groups of same priority sharing ccd
 type priorityAdvisor struct {
 	uniqPriorityAdvisor *uniqPriorityAdvisor
+	lastSuppressedCCDs  []SuppressedCCD
 }
 
 // groupInfo stores the mapping of groups and their CCDs for each domain
@@ -165,7 +166,26 @@ func addQuadruplet(receptacle *map[int]map[string]map[int]string,
 }
 
 func (a *priorityAdvisor) emitQuotaSuppressionMetrics(groupInfos *groupInfo) {
-	emitCCDSuppressionTypes(a.uniqPriorityAdvisor.emitter, a.getDomainQuotaSuppression(groupInfos))
+	domGroupCCDTypes := a.getDomainQuotaSuppression(groupInfos)
+	emitCCDSuppressionTypes(a.uniqPriorityAdvisor.emitter, domGroupCCDTypes)
+
+	a.lastSuppressedCCDs = nil
+	for domID, groupCCDTypes := range domGroupCCDTypes {
+		for group, ccdTypes := range groupCCDTypes {
+			for ccdID, suppressionType := range ccdTypes {
+				a.lastSuppressedCCDs = append(a.lastSuppressedCCDs, SuppressedCCD{
+					DomID:           domID,
+					Group:           group,
+					CCDID:           ccdID,
+					SuppressionType: suppressionType,
+				})
+			}
+		}
+	}
+}
+
+func (a *priorityAdvisor) GetSuppressedCCDs() []SuppressedCCD {
+	return a.lastSuppressedCCDs
 }
 
 func New(emitter metrics.MetricEmitter, domains domain.Domains, ccdMinMB, ccdMaxMB int, defaultDomainCapacity int,

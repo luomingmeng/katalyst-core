@@ -23,6 +23,14 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/mb/plan"
 )
 
+type SuppressedCCD struct {
+	DomID           int
+	Group           string
+	CCDID           int
+	SuppressionType string
+}
+
 type Advisor interface {
 	GetPlan(ctx context.Context, domainsMon *monitor.DomainStats) (*plan.MBPlan, error)
+	GetSuppressedCCDs() []SuppressedCCD
 }

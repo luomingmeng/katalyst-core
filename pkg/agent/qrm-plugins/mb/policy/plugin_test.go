@@ -21,6 +21,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/mock"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/mb/advisor"
@@ -41,6 +43,11 @@ func (ma *mockAdvisor) GetPlan(ctx context.Context, domainsMon *monitor.DomainSt
 	return args.Get(0).(*plan.MBPlan), args.Error(1)
 }
 
+func (ma *mockAdvisor) GetSuppressedCCDs() []advisor.SuppressedCCD {
+	args := ma.Called()
+	return args.Get(0).([]advisor.SuppressedCCD)
+}
+
 type mockPlanAlloctor struct {
 	mock.Mock
 	allocator.PlanAllocator
@@ -58,6 +65,16 @@ type mockReader struct {
 func (mr *mockReader) GetMBData() (*reader.MBData, error) {
 	args := mr.Called()
 	return args.Get(0).(*reader.MBData), args.Error(1)
+}
+
+type mockMetricEmitter struct {
+	mock.Mock
+	metrics.MetricEmitter
+}
+
+func (m *mockMetricEmitter) StoreInt64(key string, val int64, emitType metrics.MetricTypeName, tags ...metrics.MetricTag) error {
+	args := m.Called(key, val, emitType, tags)
+	return args.Error(0)
 }
 
 func TestMBPlugin_run(t *testing.T) {
@@ -86,6 +103,7 @@ func TestMBPlugin_run(t *testing.T) {
 
 	mAdvisor := new(mockAdvisor)
 	mAdvisor.On("GetPlan", mock.Anything, mock.Anything).Return(dummyPlan, nil)
+	mAdvisor.On("GetSuppressedCCDs").Return([]advisor.SuppressedCCD{})
 
 	mPlanAllocator := new(mockPlanAlloctor)
 	mPlanAllocator.On("Allocate", mock.Anything, dummyPlan).Return(nil)
@@ -136,4 +154,79 @@ func TestMBPlugin_run(t *testing.T) {
 			mock.AssertExpectationsForObjects(t, tt.fields.planAllocator)
 		})
 	}
+}
+
+func TestEmitSuppressedPodsMetrics(t *testing.T) {
+	t.Parallel()
+
+	podUID1 := "uid-1"
+	podUID2 := "uid-2"
+
+	pod1 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       "uid-1",
+			Namespace: "ns1",
+			Name:      "pod-a",
+			Labels:    map[string]string{"psm": "svc-a"},
+		},
+	}
+	pod2 := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       "uid-2",
+			Namespace: "ns2",
+			Name:      "pod-b",
+		},
+	}
+
+	ccdToPods := map[int]map[string]*corev1.Pod{
+		0: {podUID1: pod1},
+		1: {podUID2: pod2},
+		2: {podUID1: pod1},
+		3: {podUID2: pod2},
+	}
+
+	suppressedCCDs := []advisor.SuppressedCCD{
+		{CCDID: 0, SuppressionType: "domain_stress"},
+		{CCDID: 1, SuppressionType: "ccd_limit"},
+		{CCDID: 2, SuppressionType: "domain_stress"},
+		{CCDID: 3, SuppressionType: "ccd_limit"},
+		{CCDID: 99, SuppressionType: "domain_stress"},
+	}
+
+	emitter := new(mockMetricEmitter)
+	emitter.On("StoreInt64", "mbm_load_suppressed", int64(1), metrics.MetricTypeNameRaw,
+		mock.MatchedBy(func(tags []metrics.MetricTag) bool {
+			return tagsMatch(tags, map[string]string{
+				"namespace": "ns1",
+				"pod_name":  "pod-a",
+				"type":      "domain_stress",
+				"psm":       "svc-a",
+			})
+		})).Return(nil)
+	emitter.On("StoreInt64", "mbm_load_suppressed", int64(1), metrics.MetricTypeNameRaw,
+		mock.MatchedBy(func(tags []metrics.MetricTag) bool {
+			return tagsMatch(tags, map[string]string{
+				"namespace": "ns2",
+				"pod_name":  "pod-b",
+				"type":      "ccd_limit",
+				"psm":       "-",
+			})
+		})).Return(nil)
+
+	m := &MBPlugin{emitter: emitter}
+	m.emitSuppressedPodsMetrics(suppressedCCDs, ccdToPods)
+
+	mock.AssertExpectationsForObjects(t, emitter)
+}
+
+func tagsMatch(tags []metrics.MetricTag, expected map[string]string) bool {
+	if len(tags) != len(expected) {
+		return false
+	}
+	for _, tag := range tags {
+		if v, ok := expected[tag.Key]; !ok || v != tag.Val {
+			return false
+		}
+	}
+	return true
 }
