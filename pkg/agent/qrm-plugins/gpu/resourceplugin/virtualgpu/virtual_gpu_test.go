@@ -1191,6 +1191,24 @@ func TestVirtualGPUPlugin_Allocate(t *testing.T) {
 			},
 		},
 		{
+			name: "no gpu memory or milligpu request returns empty response",
+			resourceReq: &pluginapi.ResourceRequest{
+				PodUid:        "test-pod-no-gpu-resources",
+				ContainerName: "test-container-no-gpu-resources",
+				ResourceRequests: map[string]float64{
+					"test-gpu": 2,
+				},
+				ContainerType: pluginapi.ContainerType_MAIN,
+			},
+			deviceReq: nil,
+			expectedResp: &pluginapi.ResourceAllocationResponse{
+				PodUid:        "test-pod-no-gpu-resources",
+				ContainerName: "test-container-no-gpu-resources",
+				ContainerType: pluginapi.ContainerType_MAIN,
+				ResourceName:  string(consts.ResourceGPUMemory),
+			},
+		},
+		{
 			name: "existing allocation",
 			resourceReq: &pluginapi.ResourceRequest{
 				ResourceName:  string(consts.ResourceGPUMemory),
@@ -1360,6 +1378,55 @@ func TestVirtualGPUPlugin_Allocate(t *testing.T) {
 			},
 			expectedSelectedGPUID: "gpu-1", // gpu-1 is chosen here
 			expectedErr:           false,
+		},
+		{
+			name: "allocate with only milligpu request generates device request and continues",
+			resourceReq: &pluginapi.ResourceRequest{
+				PodUid:        "test-pod-milligpu-only",
+				ContainerName: "test-container-milligpu-only",
+				ResourceRequests: map[string]float64{
+					string(consts.ResourceMilliGPU): 250,
+				},
+				ContainerType: pluginapi.ContainerType_MAIN,
+			},
+			deviceReq: nil,
+			allocationResourcesMap: &state.AllocationResourcesMap{
+				"gpu_device": {},
+				consts.ResourceGPUMemory: {
+					"gpu-0": {
+						Allocatable: 4,
+						PodEntries:  map[string]state.ContainerEntries{},
+					},
+					"gpu-1": {
+						Allocatable: 4,
+						PodEntries:  map[string]state.ContainerEntries{},
+					},
+				},
+				consts.ResourceMilliGPU: {
+					"gpu-0": {
+						Allocatable: 1000,
+						PodEntries:  map[string]state.ContainerEntries{},
+					},
+					"gpu-1": {
+						Allocatable: 1000,
+						PodEntries:  map[string]state.ContainerEntries{},
+					},
+				},
+			},
+			deviceTopology: &machine.DeviceTopology{
+				Devices: map[string]machine.DeviceInfo{
+					"gpu-0": {
+						NumaNodes: []int{0},
+						Health:    deviceplugin.Healthy,
+					},
+					"gpu-1": {
+						NumaNodes: []int{1},
+						Health:    deviceplugin.Healthy,
+					},
+				},
+			},
+			virtualGPUPrefersSpreading: false,
+			expectedErr:                false,
 		},
 		{
 			name: "allocate with both gpu compute and milligpu request - packing mode",
@@ -1777,10 +1844,19 @@ func TestVirtualGPUPlugin_Allocate(t *testing.T) {
 					assert.Equal(t, tt.expectedResp, resp)
 				} else if _, ok := tt.resourceReq.ResourceRequests[string(consts.ResourceMilliGPU)]; ok && tt.deviceReq == nil {
 					// For other allocateWithoutGPUDevices test cases, check allocation info in state
-					allocationInfoGPU := basePlugin.GetState().GetAllocationInfo(consts.ResourceGPUMemory, tt.resourceReq.PodUid, tt.resourceReq.ContainerName)
 					allocationInfoMilliGPU := basePlugin.GetState().GetAllocationInfo(consts.ResourceMilliGPU, tt.resourceReq.PodUid, tt.resourceReq.ContainerName)
-					assert.NotNil(t, allocationInfoGPU)
 					assert.NotNil(t, allocationInfoMilliGPU)
+
+					if _, hasGPUMemory := tt.resourceReq.ResourceRequests[string(consts.ResourceGPUMemory)]; hasGPUMemory {
+						allocationInfoGPU := basePlugin.GetState().GetAllocationInfo(consts.ResourceGPUMemory, tt.resourceReq.PodUid, tt.resourceReq.ContainerName)
+						assert.NotNil(t, allocationInfoGPU)
+					} else {
+						if assert.NotNil(t, resp) && assert.NotNil(t, resp.AllocationResult) {
+							allocationInfo, ok := resp.AllocationResult.ResourceAllocation[string(consts.ResourceMilliGPU)]
+							assert.True(t, ok)
+							assert.NotNil(t, allocationInfo)
+						}
+					}
 				} else {
 					// For regular test cases, check expected response
 					assert.Equal(t, tt.expectedResp, resp)

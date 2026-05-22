@@ -101,6 +101,76 @@ func TestGetQuantityFromResourceReq(t *testing.T) {
 	}
 }
 
+func TestIsAnyResourceQuantityExist(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name             string
+		resourceRequests map[string]float64
+		resourceNames    sets.String
+		want             bool
+	}{
+		{
+			name: "one target resource exists with positive quantity",
+			resourceRequests: map[string]float64{
+				string(v1.ResourceCPU): 2,
+			},
+			resourceNames: sets.NewString(string(v1.ResourceCPU), string(v1.ResourceMemory)),
+			want:          true,
+		},
+		{
+			name: "target resources missing",
+			resourceRequests: map[string]float64{
+				"example.com/other": 1,
+			},
+			resourceNames: sets.NewString(string(consts.ResourceGPUMemory), string(consts.ResourceMilliGPU)),
+			want:          false,
+		},
+		{
+			name: "target resources present but zero",
+			resourceRequests: map[string]float64{
+				string(consts.ResourceGPUMemory): 0,
+				string(consts.ResourceMilliGPU):  0,
+			},
+			resourceNames: sets.NewString(string(consts.ResourceGPUMemory), string(consts.ResourceMilliGPU)),
+			want:          false,
+		},
+		{
+			name: "only milligpu positive",
+			resourceRequests: map[string]float64{
+				string(consts.ResourceMilliGPU): 250,
+			},
+			resourceNames: sets.NewString(string(consts.ResourceGPUMemory), string(consts.ResourceMilliGPU)),
+			want:          true,
+		},
+		{
+			name: "only gpu memory positive",
+			resourceRequests: map[string]float64{
+				string(consts.ResourceGPUMemory): 8,
+			},
+			resourceNames: sets.NewString(string(consts.ResourceGPUMemory), string(consts.ResourceMilliGPU)),
+			want:          true,
+		},
+		{
+			name: "both gpu resources positive",
+			resourceRequests: map[string]float64{
+				string(consts.ResourceGPUMemory): 8,
+				string(consts.ResourceMilliGPU):  250,
+			},
+			resourceNames: sets.NewString(string(consts.ResourceGPUMemory), string(consts.ResourceMilliGPU)),
+			want:          true,
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.want, IsAnyResourceQuantityExist(tc.resourceRequests, tc.resourceNames))
+		})
+	}
+}
+
 func TestDeepCopyTopologyAwareAssignments(t *testing.T) {
 	t.Parallel()
 

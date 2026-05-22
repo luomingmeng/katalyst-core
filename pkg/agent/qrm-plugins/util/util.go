@@ -52,6 +52,22 @@ func GetQuantityFromResourceReq(req *pluginapi.ResourceRequest) (int, float64, e
 	return GetQuantityFromResourceRequests(req.ResourceRequests, req.ResourceName, req.Annotations)
 }
 
+// IsResourceQuantityExist returns true when the resource exists in the request map and its quantity is greater than zero.
+func IsResourceQuantityExist(resourceRequests map[string]float64, resourceName string) bool {
+	quantity, ok := resourceRequests[resourceName]
+	return ok && quantity > 0
+}
+
+// IsAnyResourceQuantityExist returns true when any resource in the set exists in the request map and its quantity is greater than zero.
+func IsAnyResourceQuantityExist(resourceRequests map[string]float64, resourceNames sets.String) bool {
+	for resourceName := range resourceNames {
+		if IsResourceQuantityExist(resourceRequests, resourceName) {
+			return true
+		}
+	}
+	return false
+}
+
 func GetQuantityFromResourceRequests(resourceRequests map[string]float64, resourceName string, reqAnnotations map[string]string) (int, float64, error) {
 	quantity, ok := resourceRequests[resourceName]
 	if !ok {

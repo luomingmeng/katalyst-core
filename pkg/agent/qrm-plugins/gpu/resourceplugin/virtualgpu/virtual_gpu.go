@@ -711,9 +711,11 @@ func hasMilligpuRequest(resourceReq *pluginapi.ResourceRequest) bool {
 func (p *VirtualGPUPlugin) Allocate(
 	ctx context.Context, resourceReq *pluginapi.ResourceRequest, deviceReq *pluginapi.DeviceRequest,
 ) (*pluginapi.ResourceAllocationResponse, error) {
-	quantity, exists := resourceReq.ResourceRequests[p.ResourceName()]
-	if !exists || quantity == 0 {
-		general.InfoS("No GPU compute annotation detected and no GPU compute requested, returning empty response",
+	if !util.IsAnyResourceQuantityExist(
+		resourceReq.ResourceRequests,
+		sets.NewString(p.ResourceName(), string(consts.ResourceMilliGPU)),
+	) {
+		general.InfoS("No GPU resource requested, returning empty response",
 			"podNamespace", resourceReq.PodNamespace,
 			"podName", resourceReq.PodName,
 			"containerName", resourceReq.ContainerName)
