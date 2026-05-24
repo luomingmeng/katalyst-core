@@ -18,17 +18,20 @@ package hintoptimizer
 
 type HintOptimizerConfiguration struct {
 	SharedCoresHintOptimizerPolicies    []string
+	SharedCoresHintFilterPolicies       []string
 	DedicatedCoresHintOptimizerPolicies []string
 
 	*CanonicalHintOptimizerConfig
 	*MemoryBandwidthHintOptimizerConfig
 	*MetricBasedHintOptimizerConfig
+	*TotalRequestThresholdHintOptimizerConfig
 }
 
 func NewHintOptimizerConfiguration() *HintOptimizerConfiguration {
 	return &HintOptimizerConfiguration{
-		CanonicalHintOptimizerConfig:       NewCanonicalHintOptimizerConfig(),
-		MemoryBandwidthHintOptimizerConfig: NewMemoryBandwidthHintOptimizerConfig(),
-		MetricBasedHintOptimizerConfig:     NewMetricBasedHintOptimizerConfig(),
+		CanonicalHintOptimizerConfig:             NewCanonicalHintOptimizerConfig(),
+		MemoryBandwidthHintOptimizerConfig:       NewMemoryBandwidthHintOptimizerConfig(),
+		MetricBasedHintOptimizerConfig:           NewMetricBasedHintOptimizerConfig(),
+		TotalRequestThresholdHintOptimizerConfig: NewTotalRequestThresholdHintOptimizerConfig(),
 	}
 }

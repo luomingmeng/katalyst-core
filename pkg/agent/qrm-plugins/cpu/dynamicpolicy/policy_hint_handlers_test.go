@@ -736,7 +736,7 @@ func TestPopulateHintsByAlreadyExistedNUMABindingResult(t *testing.T) {
 	}
 }
 
-func newTestPolicyForSNBCPUTotalRequestThreshold(t *testing.T, ratio float64) *DynamicPolicy {
+func newTestPolicyForCPUTotalRequestThreshold(t *testing.T, ratio float64) *DynamicPolicy {
 	t.Helper()
 
 	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
@@ -749,11 +749,11 @@ func newTestPolicyForSNBCPUTotalRequestThreshold(t *testing.T, ratio float64) *D
 		consts.PodAnnotationInplaceUpdateResizingKey,
 	}
 
-	policy.snbCPUTotalRequestThresholdRatio = ratio
+	policy.conf.CPUQRMPluginConfig.TotalRequestThresholdHintOptimizerConfig.CPUTotalRequestThresholdRatio = ratio
 	return policy
 }
 
-func newSNBCPUTotalRequestThresholdReq(qosLevel string, reqCPU float64, inplaceResize bool) *pluginapi.ResourceRequest {
+func newCPUTotalRequestThresholdReq(qosLevel string, reqCPU float64, inplaceResize bool) *pluginapi.ResourceRequest {
 	annotations := map[string]string{
 		consts.PodAnnotationQoSLevelKey:          qosLevel,
 		consts.PodAnnotationMemoryEnhancementKey: `{"numa_binding": "true"}`,
@@ -815,7 +815,7 @@ func newCPUTotalRequestThresholdAllocationInfo(podUID, qosLevel string, numaID i
 	}
 }
 
-func setSNBCPUTotalRequestThresholdPodEntries(t *testing.T, policy *DynamicPolicy, podEntries state.PodEntries) {
+func setCPUTotalRequestThresholdPodEntries(t *testing.T, policy *DynamicPolicy, podEntries state.PodEntries) {
 	t.Helper()
 
 	machineState, err := generateMachineStateFromPodEntries(policy.machineInfo.CPUTopology, podEntries, policy.state.GetMachineState())
@@ -825,141 +825,7 @@ func setSNBCPUTotalRequestThresholdPodEntries(t *testing.T, policy *DynamicPolic
 	policy.state.SetMachineState(machineState, false)
 }
 
-func TestCheckSNBCPUTotalRequestThresholdReqNilError(t *testing.T) {
-	t.Parallel()
-	policy := newTestPolicyForSNBCPUTotalRequestThreshold(t, 0.5)
-	var req *pluginapi.ResourceRequest
-	require.ErrorContains(t, policy.checkSNBCPUTotalRequestThreshold(req, 1, 4, "numa 0"), "got nil request")
-}
-
-func TestCheckSNBCPUTotalRequestThresholdInvalid(t *testing.T) {
-	t.Parallel()
-	policy := newTestPolicyForSNBCPUTotalRequestThreshold(t, 2)
-	req := newSNBCPUTotalRequestThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 1, false)
-	require.ErrorContains(t, policy.checkSNBCPUTotalRequestThreshold(req, 1, 4, "numa 0"), "invalid")
-}
-
-func TestCheckSNBCPUTotalRequestThresholdTotalAllocatableError(t *testing.T) {
-	t.Parallel()
-	policy := newTestPolicyForSNBCPUTotalRequestThreshold(t, 0.5)
-	req := newSNBCPUTotalRequestThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 1, false)
-	require.ErrorContains(t, policy.checkSNBCPUTotalRequestThreshold(req, 1, -1, "numa 0"), "non-positive")
-}
-
-func TestCheckSNBCPUTotalRequestThreshold(t *testing.T) {
-	t.Parallel()
-	policy := newTestPolicyForSNBCPUTotalRequestThreshold(t, 0.5)
-	req := newSNBCPUTotalRequestThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 1, false)
-
-	numaCPUSet := policy.machineInfo.CPUDetails.CPUsInNUMANodes(0)
-	allowed := float64(numaCPUSet.Size()) * policy.snbCPUTotalRequestThresholdRatio
-	require.NoError(t, policy.checkSNBCPUTotalRequestThreshold(req, allowed, float64(numaCPUSet.Size()), "numa:0"))
-	require.ErrorContains(t, policy.checkSNBCPUTotalRequestThreshold(req, allowed+0.001, float64(numaCPUSet.Size()), "numa:0"), "exceeds threshold")
-}
-
-func TestCheckSNBCPUTotalRequestThresholdDisabled(t *testing.T) {
-	t.Parallel()
-	policy := newTestPolicyForSNBCPUTotalRequestThreshold(t, 0)
-
-	req := newSNBCPUTotalRequestThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 4, false)
-	require.NoError(t, policy.checkSNBCPUTotalRequestThreshold(req, 100, 0, ""))
-}
-
-func TestFilterHintsBySNBCPUTotalRequestThresholdEmptyHints(t *testing.T) {
-	t.Parallel()
-	policy := newTestPolicyForSNBCPUTotalRequestThreshold(t, 0.5)
-	req := newSNBCPUTotalRequestThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 1, false)
-
-	_, err := policy.filterHintsBySNBCPUTotalRequestThreshold(req, 1, policy.state.GetMachineState(), map[string]*pluginapi.ListOfTopologyHints{
-		string(v1.ResourceCPU): {Hints: []*pluginapi.TopologyHint{}},
-	})
-	require.ErrorIs(t, err, cpuutil.ErrNoAvailableCPUHints)
-}
-
-func TestFilterHintsBySNBCPUTotalRequestThresholdDefensiveBranches(t *testing.T) {
-	t.Parallel()
-
-	req := newSNBCPUTotalRequestThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 1, false)
-
-	for _, tt := range []struct {
-		name        string
-		ratio       float64
-		req         *pluginapi.ResourceRequest
-		hints       map[string]*pluginapi.ListOfTopologyHints
-		wantErr     string
-		wantHintLen int
-	}{
-		{
-			name:    "nil request",
-			ratio:   0.5,
-			hints:   map[string]*pluginapi.ListOfTopologyHints{},
-			wantErr: "got nil request",
-		},
-		{
-			name:  "invalid ratio",
-			ratio: 2,
-			req:   req,
-			hints: map[string]*pluginapi.ListOfTopologyHints{
-				string(v1.ResourceCPU): {Hints: []*pluginapi.TopologyHint{{Nodes: []uint64{0}, Preferred: true}}},
-			},
-			wantErr: "invalid",
-		},
-		{
-			name:  "nil cpu hints",
-			ratio: 0.5,
-			req:   req,
-			hints: map[string]*pluginapi.ListOfTopologyHints{
-				string(v1.ResourceCPU): nil,
-			},
-		},
-		{
-			name:  "disabled ratio",
-			ratio: 0,
-			req:   req,
-			hints: map[string]*pluginapi.ListOfTopologyHints{
-				string(v1.ResourceCPU): {Hints: []*pluginapi.TopologyHint{{Nodes: []uint64{0}, Preferred: true}}},
-			},
-			wantHintLen: 1,
-		},
-		{
-			name:  "nil topology hint skipped",
-			ratio: 0.5,
-			req:   req,
-			hints: map[string]*pluginapi.ListOfTopologyHints{
-				string(v1.ResourceCPU): {Hints: []*pluginapi.TopologyHint{nil, {Nodes: []uint64{0}, Preferred: true}}},
-			},
-			wantHintLen: 1,
-		},
-		{
-			name:  "invalid topology hint node",
-			ratio: 0.5,
-			req:   req,
-			hints: map[string]*pluginapi.ListOfTopologyHints{
-				string(v1.ResourceCPU): {Hints: []*pluginapi.TopologyHint{{Nodes: []uint64{^uint64(0)}, Preferred: true}}},
-			},
-			wantErr: "parse elem",
-		},
-	} {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			policy := newTestPolicyForSNBCPUTotalRequestThreshold(t, tt.ratio)
-			filteredHints, err := policy.filterHintsBySNBCPUTotalRequestThreshold(tt.req, 1, policy.state.GetMachineState(), tt.hints)
-			if tt.wantErr != "" {
-				require.ErrorContains(t, err, tt.wantErr)
-				return
-			}
-
-			require.NoError(t, err)
-			if tt.wantHintLen > 0 {
-				require.Len(t, filteredHints[string(v1.ResourceCPU)].Hints, tt.wantHintLen)
-			}
-		})
-	}
-}
-
-func TestSNBCPUTotalRequestThresholdRejectExistingAllocation(t *testing.T) {
+func TestCPUTotalRequestThresholdRejectExistingAllocation(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name           string
@@ -1016,7 +882,7 @@ func TestSNBCPUTotalRequestThresholdRejectExistingAllocation(t *testing.T) {
 			expectedError: false,
 		},
 		{
-			name:          "non-vpa shared numa binding with request greater than cpu threshold",
+			name:          "non-vpa shared numa binding with request greater than cpu threshold reuses existing hint",
 			qosLevel:      consts.PodAnnotationQoSLevelSharedCores,
 			reqCount:      1.8,
 			inplaceResize: false,
@@ -1036,7 +902,7 @@ func TestSNBCPUTotalRequestThresholdRejectExistingAllocation(t *testing.T) {
 				},
 				RequestQuantity: 1,
 			},
-			expectedError: true,
+			expectedError: false,
 		},
 		{
 			name:          "vpa shared numa binding with request greater than cpu threshold",
@@ -1067,8 +933,8 @@ func TestSNBCPUTotalRequestThresholdRejectExistingAllocation(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			policy := newTestPolicyForSNBCPUTotalRequestThreshold(t, 0.5)
-			req := newSNBCPUTotalRequestThresholdReq(tt.qosLevel, tt.reqCount, tt.inplaceResize)
+			policy := newTestPolicyForCPUTotalRequestThreshold(t, 0.5)
+			req := newCPUTotalRequestThresholdReq(tt.qosLevel, tt.reqCount, tt.inplaceResize)
 			if tt.allocationInfo != nil {
 				policy.state.SetAllocationInfo(tt.allocationInfo.AllocationMeta.PodUid, tt.allocationInfo.AllocationMeta.ContainerName, tt.allocationInfo, true)
 				if tt.allocationInfo.CheckNUMABinding() {
@@ -1087,7 +953,7 @@ func TestSNBCPUTotalRequestThresholdRejectExistingAllocation(t *testing.T) {
 	}
 }
 
-func TestSNBCPUTotalRequestThresholdRejectByNUMATotalRequest(t *testing.T) {
+func TestCPUTotalRequestThresholdRejectByNUMATotalRequest(t *testing.T) {
 	t.Parallel()
 
 	type existingRequest struct {
@@ -1152,7 +1018,7 @@ func TestSNBCPUTotalRequestThresholdRejectByNUMATotalRequest(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			policy := newTestPolicyForSNBCPUTotalRequestThreshold(t, 0.5)
+			policy := newTestPolicyForCPUTotalRequestThreshold(t, 0.5)
 			podEntries := state.PodEntries{}
 			for numaID, requests := range tt.existingRequests {
 				for i, existing := range requests {
@@ -1162,9 +1028,9 @@ func TestSNBCPUTotalRequestThresholdRejectByNUMATotalRequest(t *testing.T) {
 					}
 				}
 			}
-			setSNBCPUTotalRequestThresholdPodEntries(t, policy, podEntries)
+			setCPUTotalRequestThresholdPodEntries(t, policy, podEntries)
 
-			req := newSNBCPUTotalRequestThresholdReq(consts.PodAnnotationQoSLevelSharedCores, tt.reqCount, false)
+			req := newCPUTotalRequestThresholdReq(consts.PodAnnotationQoSLevelSharedCores, tt.reqCount, false)
 			resp, err := policy.GetTopologyHints(context.Background(), req)
 			if tt.expectedError {
 				require.ErrorContains(t, err, "exceeds threshold")
@@ -1181,7 +1047,7 @@ func TestSNBCPUTotalRequestThresholdRejectByNUMATotalRequest(t *testing.T) {
 	}
 }
 
-func TestSNBCPUTotalRequestThresholdInplaceResizeByNUMATotalRequest(t *testing.T) {
+func TestCPUTotalRequestThresholdInplaceResizeByNUMATotalRequest(t *testing.T) {
 	t.Parallel()
 
 	for _, tt := range []struct {
@@ -1209,7 +1075,7 @@ func TestSNBCPUTotalRequestThresholdInplaceResizeByNUMATotalRequest(t *testing.T
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			policy := newTestPolicyForSNBCPUTotalRequestThreshold(t, 0.5)
+			policy := newTestPolicyForCPUTotalRequestThreshold(t, 0.5)
 			podEntries := state.PodEntries{
 				"pod-uid": {
 					"main": newCPUTotalRequestThresholdAllocationInfo("pod-uid", consts.PodAnnotationQoSLevelSharedCores, 2, 1, true),
@@ -1218,9 +1084,9 @@ func TestSNBCPUTotalRequestThresholdInplaceResizeByNUMATotalRequest(t *testing.T
 					"main": newCPUTotalRequestThresholdAllocationInfo("existing-pod", consts.PodAnnotationQoSLevelSharedCores, 2, tt.existingRequest, true),
 				},
 			}
-			setSNBCPUTotalRequestThresholdPodEntries(t, policy, podEntries)
+			setCPUTotalRequestThresholdPodEntries(t, policy, podEntries)
 
-			req := newSNBCPUTotalRequestThresholdReq(consts.PodAnnotationQoSLevelSharedCores, tt.resizedRequest, true)
+			req := newCPUTotalRequestThresholdReq(consts.PodAnnotationQoSLevelSharedCores, tt.resizedRequest, true)
 			resp, err := policy.GetTopologyHints(context.Background(), req)
 			if tt.expectedError {
 				require.ErrorContains(t, err, "exceeds threshold")
@@ -1237,7 +1103,7 @@ func TestSNBCPUTotalRequestThresholdInplaceResizeByNUMATotalRequest(t *testing.T
 	}
 }
 
-func TestSNBCPUTotalRequestThresholdRejectNewPod(t *testing.T) {
+func TestCPUTotalRequestThresholdRejectNewPod(t *testing.T) {
 	t.Parallel()
 
 	for _, tt := range []struct {
@@ -1272,8 +1138,8 @@ func TestSNBCPUTotalRequestThresholdRejectNewPod(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			policy := newTestPolicyForSNBCPUTotalRequestThreshold(t, 0.5)
-			req := newSNBCPUTotalRequestThresholdReq(consts.PodAnnotationQoSLevelSharedCores, tt.reqCount, false)
+			policy := newTestPolicyForCPUTotalRequestThreshold(t, 0.5)
+			req := newCPUTotalRequestThresholdReq(consts.PodAnnotationQoSLevelSharedCores, tt.reqCount, false)
 
 			resp, err := policy.GetTopologyHints(context.Background(), req)
 			if tt.expectedError {
@@ -1289,112 +1155,4 @@ func TestSNBCPUTotalRequestThresholdRejectNewPod(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestGetSNBCPUTotalRequest(t *testing.T) {
-	t.Parallel()
-
-	policy := newTestPolicyForSNBCPUTotalRequestThreshold(t, 0.5)
-
-	newAllocation := func(podUID, containerName, containerType, ownerPoolName, qosLevel string,
-		numaBinding bool, request float64, extraAnnotations map[string]string,
-	) *state.AllocationInfo {
-		annotations := map[string]string{
-			consts.PodAnnotationQoSLevelKey: qosLevel,
-		}
-		if numaBinding {
-			annotations[consts.PodAnnotationMemoryEnhancementNumaBinding] = consts.PodAnnotationMemoryEnhancementNumaBindingEnable
-		}
-		for k, v := range extraAnnotations {
-			annotations[k] = v
-		}
-		return &state.AllocationInfo{
-			AllocationMeta: commonstate.AllocationMeta{
-				PodUid:        podUID,
-				PodNamespace:  "default",
-				PodName:       podUID,
-				ContainerName: containerName,
-				ContainerType: containerType,
-				OwnerPoolName: ownerPoolName,
-				Annotations:   annotations,
-				QoSLevel:      qosLevel,
-			},
-			RequestQuantity: request,
-		}
-	}
-
-	//  NUMANodeMap，cover SNB / non NUMA-binding / DNB / Reclaimed / pool entry，
-	// and "self pod"（to exclude in-place resize itself）
-	machineState := state.NUMANodeMap{
-		0: &state.NUMANodeState{
-			DefaultCPUSet:   machine.NewCPUSet(0, 1, 2, 3),
-			AllocatedCPUSet: machine.NewCPUSet(),
-			PodEntries: state.PodEntries{
-				// SNB pod：main + sidecar ；nil entry
-				"snb-pod": state.ContainerEntries{
-					"main": newAllocation("snb-pod", "main", pluginapi.ContainerType_MAIN.String(),
-						commonstate.PoolNameShare, consts.PodAnnotationQoSLevelSharedCores, true, 1.25, nil),
-					"sidecar": newAllocation("snb-pod", "sidecar", pluginapi.ContainerType_SIDECAR.String(),
-						commonstate.PoolNameShare, consts.PodAnnotationQoSLevelSharedCores, true, 0.5, nil),
-					"nil": nil,
-				},
-				// legacy SNB pod
-				"legacy-snb-pod": state.ContainerEntries{
-					"main": newAllocation("legacy-snb-pod", "main", pluginapi.ContainerType_MAIN.String(),
-						commonstate.PoolNameShare, consts.PodAnnotationQoSLevelSharedCores, true, 1.5, nil),
-				},
-				// non-binding shared pod
-				"non-binding-pod": state.ContainerEntries{
-					"main": newAllocation("non-binding-pod", "main", pluginapi.ContainerType_MAIN.String(),
-						commonstate.PoolNameShare, consts.PodAnnotationQoSLevelSharedCores, false, 10, nil),
-				},
-				// DNB pod
-				"dedicated-pod": state.ContainerEntries{
-					"main": newAllocation("dedicated-pod", "main", pluginapi.ContainerType_MAIN.String(),
-						commonstate.PoolNameDedicated, consts.PodAnnotationQoSLevelDedicatedCores, true, 4, nil),
-				},
-				// Reclaimed NUMA-binding pod
-				"reclaimed-pod": state.ContainerEntries{
-					"main": newAllocation("reclaimed-pod", "main", pluginapi.ContainerType_MAIN.String(),
-						commonstate.PoolNameReclaim, consts.PodAnnotationQoSLevelReclaimedCores, true, 2, nil),
-				},
-				// self pod entry：to test exclude。
-				"pod-uid": state.ContainerEntries{
-					"main": newAllocation("pod-uid", "main", pluginapi.ContainerType_MAIN.String(),
-						commonstate.PoolNameShare, consts.PodAnnotationQoSLevelSharedCores, true, 0.4, nil),
-				},
-				// pool entry：skipped by PodEntries.IsPoolEntry()
-				commonstate.PoolNameShare: state.ContainerEntries{
-					commonstate.FakedContainerName: newAllocation(commonstate.PoolNameShare, commonstate.FakedContainerName,
-						pluginapi.ContainerType_MAIN.String(), commonstate.PoolNameShare,
-						consts.PodAnnotationQoSLevelSharedCores, true, 100, nil),
-				},
-			},
-		},
-		1: &state.NUMANodeState{
-			DefaultCPUSet:   machine.NewCPUSet(4, 5, 6, 7),
-			AllocatedCPUSet: machine.NewCPUSet(),
-			PodEntries: state.PodEntries{
-				// NUMA 1 SNB pod
-				"snb-on-numa-1": state.ContainerEntries{
-					"main": newAllocation("snb-on-numa-1", "main", pluginapi.ContainerType_MAIN.String(),
-						commonstate.PoolNameShare, consts.PodAnnotationQoSLevelSharedCores, true, 2, nil),
-				},
-			},
-		},
-	}
-
-	// req.PodUid == "pod-uid" -> in-place resize exclude itself 0.4。
-	req := newSNBCPUTotalRequestThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 1, true)
-
-	// numaSet = {0}: SNB(1.25+0.5) + legacy SNB(1.5) + DNB(4) + request(1) = 8.25
-	require.InDelta(t, 8.25, policy.getSNBCPUTotalRequest(req, 1.0, machineState, machine.NewCPUSet(0)), 1e-9)
-
-	// numaSet = {0, 1}: add numa 1 SNB(2) = 10.25
-	require.InDelta(t, 10.25, policy.getSNBCPUTotalRequest(req, 1.0, machineState, machine.NewCPUSet(0, 1)), 1e-9)
-
-	// different pod uid: not exclude "pod-uid"
-	reqNew := newSNBCPUTotalRequestThresholdReq(consts.PodAnnotationQoSLevelSharedCores, 1, false)
-	reqNew.PodUid = "another-pod"
-	require.InDelta(t, 8.65, policy.getSNBCPUTotalRequest(reqNew, 1.0, machineState, machine.NewCPUSet(0)), 1e-9)
 }

@@ -121,7 +121,6 @@ type DynamicPolicy struct {
 	enableCPUAdvisor                          bool
 	getAdviceInterval                         time.Duration
 	reservedCPUs                              machine.CPUSet
-	snbCPUTotalRequestThresholdRatio          float64
 	cpuAdvisorSocketAbsPath                   string
 	cpuPluginSocketAbsPath                    string
 	extraStateFileAbsPath                     string
@@ -207,22 +206,21 @@ func NewDynamicPolicy(agentCtx *agent.GenericContext, conf *config.Configuration
 
 		cpuPressureEviction: cpuPressureEviction,
 
-		conf:                             conf,
-		qosConfig:                        conf.QoSConfiguration,
-		dynamicConfig:                    conf.DynamicAgentConfiguration,
-		cpuAdvisorSocketAbsPath:          conf.CPUAdvisorSocketAbsPath,
-		cpuPluginSocketAbsPath:           conf.CPUPluginSocketAbsPath,
-		enableReclaimNUMABinding:         conf.EnableReclaimNUMABinding,
-		enableSNBHighNumaPreference:      conf.EnableSNBHighNumaPreference,
-		enableCPUAdvisor:                 conf.CPUQRMPluginConfig.EnableCPUAdvisor,
-		getAdviceInterval:                conf.CPUQRMPluginConfig.GetAdviceInterval,
-		snbCPUTotalRequestThresholdRatio: conf.CPUQRMPluginConfig.SNBCPUTotalRequestThresholdRatio,
-		reservedCPUs:                     reservedCPUs,
-		extraStateFileAbsPath:            conf.ExtraStateFileAbsPath,
-		enableCPUBurst:                   conf.CPUQRMPluginConfig.EnableCPUBurst,
-		enableSyncingCPUIdle:             conf.CPUQRMPluginConfig.EnableSyncingCPUIdle,
-		enableCPUIdle:                    conf.CPUQRMPluginConfig.EnableCPUIdle,
-		reclaimRelativeRootCgroupPath:    conf.ReclaimRelativeRootCgroupPath,
+		conf:                          conf,
+		qosConfig:                     conf.QoSConfiguration,
+		dynamicConfig:                 conf.DynamicAgentConfiguration,
+		cpuAdvisorSocketAbsPath:       conf.CPUAdvisorSocketAbsPath,
+		cpuPluginSocketAbsPath:        conf.CPUPluginSocketAbsPath,
+		enableReclaimNUMABinding:      conf.EnableReclaimNUMABinding,
+		enableSNBHighNumaPreference:   conf.EnableSNBHighNumaPreference,
+		enableCPUAdvisor:              conf.CPUQRMPluginConfig.EnableCPUAdvisor,
+		getAdviceInterval:             conf.CPUQRMPluginConfig.GetAdviceInterval,
+		reservedCPUs:                  reservedCPUs,
+		extraStateFileAbsPath:         conf.ExtraStateFileAbsPath,
+		enableCPUBurst:                conf.CPUQRMPluginConfig.EnableCPUBurst,
+		enableSyncingCPUIdle:          conf.CPUQRMPluginConfig.EnableSyncingCPUIdle,
+		enableCPUIdle:                 conf.CPUQRMPluginConfig.EnableCPUIdle,
+		reclaimRelativeRootCgroupPath: conf.ReclaimRelativeRootCgroupPath,
 		numaBindingReclaimRelativeRootCgroupPaths: common.GetNUMABindingReclaimRelativeRootCgroupPaths(conf.ReclaimRelativeRootCgroupPath,
 			agentCtx.CPUDetails.NUMANodes().ToSliceNoSortInt()),
 		podDebugAnnoKeys:               conf.PodDebugAnnoKeys,
@@ -1155,10 +1153,15 @@ func (p *DynamicPolicy) initAdvisorClientConn() (err error) {
 
 func (p *DynamicPolicy) initHintOptimizers() error {
 	var err error
-	p.sharedCoresNUMABindingHintOptimizer, err = registry.SharedCoresHintOptimizerRegistry.HintOptimizer(p.conf.SharedCoresHintOptimizerPolicies,
-		p.generateHintOptimizerFactoryOptions())
+	hintOptimizerFactoryOptions := p.generateHintOptimizerFactoryOptions()
+
+	p.sharedCoresNUMABindingHintOptimizer, err = registry.SharedCoresHintOptimizerRegistry.HintOptimizerWithFilters(
+		p.conf.SharedCoresHintOptimizerPolicies,
+		p.conf.SharedCoresHintFilterPolicies,
+		hintOptimizerFactoryOptions,
+	)
 	if err != nil {
-		return fmt.Errorf("SharedCoresHintOptimizerRegistry.HintOptimizer failed with error: %v", err)
+		return fmt.Errorf("SharedCoresHintOptimizerRegistry.HintOptimizerWithFilters failed with error: %v", err)
 	}
 
 	p.dedicatedCoresNUMABindingHintOptimizer, err = registry.DedicatedCoresHintOptimizerRegistry.HintOptimizer(p.conf.DedicatedCoresHintOptimizerPolicies,
