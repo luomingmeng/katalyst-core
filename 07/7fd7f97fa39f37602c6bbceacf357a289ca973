@@ -1,0 +1,31 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "077fd7f97fa39f37602c6bbceacf357a289ca973",
+  "prompts": {
+    "f594aeb1c0eeb3c5": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a05d3e1e2085cbd63f70e76",
+        "model": "gemini-3.1-pro__dev"
+      },
+      "human_author": "luomingmeng <luomingmeng@bytedance.com>",
+      "messages": [],
+      "total_additions": 64,
+      "total_deletions": 19,
+      "accepted_lines": 64,
+      "overriden_lines": 0
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {
+    "f594aeb1c0eeb3c5": {
+      "tool": "trae",
+      "conversation_id": "6a05d3e1e2085cbd63f70e76",
+      "session_id": "6a05d3e1e2085cbd63f70e76",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
