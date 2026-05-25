@@ -18,6 +18,7 @@ package baseplugin
 
 import (
 	"context"
+	"reflect"
 	"sync"
 	"time"
 
@@ -236,7 +237,13 @@ func (s *shareGPUManager) sync(ctx context.Context) {
 		shareGPUMap[id] = s.evaluateDeviceShareStatus(ctx, alloc, indicatorCache)
 	}
 
+	if reflect.DeepEqual(s.shareGPUMap, shareGPUMap) {
+		return
+	}
+
+	general.Infof("share gpu manager updated from: %v, to: %v", s.shareGPUMap, shareGPUMap)
 	s.shareGPUMap = shareGPUMap
+	s.basePlugin.TriggerReporter()
 }
 
 // evaluateDeviceShareStatus scans main containers for a device and returns true
@@ -252,7 +259,7 @@ func (s *shareGPUManager) evaluateDeviceShareStatus(ctx context.Context, alloc *
 	// Default to shareable and short-circuit to false once a disallowed pod is found.
 	for _, containerEntries := range alloc.PodEntries {
 		for _, container := range containerEntries {
-			if !container.CheckMainContainer() {
+			if !container.CheckMainContainer() || container.CheckReclaimed() {
 				continue
 			}
 
@@ -270,11 +277,6 @@ func (s *shareGPUManager) evaluateDeviceShareStatus(ctx context.Context, alloc *
 // If a cache is provided, it memoizes decisions by pod UID.
 // Complexity: O(1) with cache hit; O(ExternalCall) otherwise.
 func (s *shareGPUManager) evaluateContainerDeviceShareStatus(ctx context.Context, container *state.AllocationInfo, cache map[types.UID]bool) bool {
-	// If the container is not using a GPU device, it is shareable.
-	if container.DeviceName == "" {
-		return true
-	}
-
 	podMeta := s.preparePodMeta(container)
 
 	if cache != nil {
