@@ -345,6 +345,8 @@ const (
 	MetricMbmlocalPsContainer  = "mbm.local.ps.container"
 	MetricMbmVictimPsContainer = "mbm.victim.ps.container"
 	MetricResctrlDataContainer = "resctrl.data.container"
+
+	MetricMbmTotalPsContainerL3 = "mbm.total.ps.container.l3"
 )
 
 // container blkio metrics

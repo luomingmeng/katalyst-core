@@ -436,10 +436,16 @@ func Test_setContainerMbmTotalMetric(t *testing.T) {
 				Value: float64(mb1),
 				Time:  ptrTime(now.Add(-10 * time.Second)),
 			},
-			wantData: utilmetric.MetricData{Value: float64(mb2-mb1) / 10, Time: &now},
+			wantData: utilmetric.MetricData{
+				Value: float64(mb2-mb1)/10 + float64(mbLocal2-mbLocal1)/10*2/3,
+				Time:  &now,
+			},
 			// Local MBM with Genoa adjustment: localRate + localRate*2/3 = localRate*5/3
-			wantLocalData: &utilmetric.MetricData{Value: float64(mbLocal2-mbLocal1) / 10 * 5 / 3, Time: &now},
-			expectSet:     true,
+			wantLocalData: &utilmetric.MetricData{
+				Value: float64(mbLocal2-mbLocal1) / 10,
+				Time:  &now,
+			},
+			expectSet: true,
 		},
 		{
 			name: "no data adjustments for local MBM",
@@ -484,7 +490,8 @@ func Test_setContainerMbmTotalMetric(t *testing.T) {
 			}
 			// Set previous resctrl data if needed
 			if tc.prevResctrlData != nil {
-				store.SetByStringIndex(consts.MetricResctrlDataContainer, *tc.prevResctrlData)
+				resctrlKey := getContainerStringIndexKey(consts.MetricResctrlDataContainer, tc.args.podUID, tc.args.containerName)
+				store.SetByStringIndex(resctrlKey, *tc.prevResctrlData)
 			}
 			mmp := &MalachiteMetricsProvisioner{
 				metricStore: store,

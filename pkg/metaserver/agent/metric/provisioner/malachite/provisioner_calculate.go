@@ -338,11 +338,15 @@ func (m *MalachiteMetricsProvisioner) setContainerRateMetric(podUID, containerNa
 
 // setContainerMbmTotalMetric calcuate the total memory bandwidth usage of a container
 func (m *MalachiteMetricsProvisioner) setContainerMbmTotalMetric(podUID, containerName string, resctrlData types.MbmbandData, updateTime *time.Time) {
+	resctrlKey := getContainerStringIndexKey(consts.MetricResctrlDataContainer, podUID, containerName)
+	l3MetricKey := getContainerStringIndexKey(consts.MetricMbmTotalPsContainerL3, podUID, containerName)
+
 	// 1. get previous data
-	oldResctrlData, ok := m.metricStore.GetByStringIndex(consts.MetricResctrlDataContainer).(types.MbmbandData)
+	oldResctrlData, ok := m.metricStore.GetByStringIndex(resctrlKey).(types.MbmbandData)
 	if !ok || len(oldResctrlData.Mbm) == 0 || len(resctrlData.Mbm) == 0 {
 		// No previous or current data, store current for next round and return
-		m.metricStore.SetByStringIndex(consts.MetricResctrlDataContainer, resctrlData)
+		m.metricStore.SetByStringIndex(resctrlKey, resctrlData)
+		m.metricStore.SetByStringIndex(l3MetricKey, map[int]types.L3CacheBytesPS{})
 		return
 	}
 
@@ -350,7 +354,8 @@ func (m *MalachiteMetricsProvisioner) setContainerMbmTotalMetric(podUID, contain
 	prevMetric, err := m.metricStore.GetContainerMetric(podUID, containerName, consts.MetricMbmTotalPsContainer)
 	if err != nil || prevMetric.Time == nil {
 		// if no previous metric, store current for next round and return
-		m.metricStore.SetByStringIndex(consts.MetricResctrlDataContainer, resctrlData)
+		m.metricStore.SetByStringIndex(resctrlKey, resctrlData)
+		m.metricStore.SetByStringIndex(l3MetricKey, map[int]types.L3CacheBytesPS{})
 		m.metricStore.SetContainerMetric(podUID, containerName, consts.MetricMbmTotalPsContainer,
 			metric.MetricData{Value: 0, Time: updateTime})
 		m.metricStore.SetContainerMetric(podUID, containerName, consts.MetricMbmlocalPsContainer,
@@ -362,7 +367,15 @@ func (m *MalachiteMetricsProvisioner) setContainerMbmTotalMetric(podUID, contain
 	if timeInterval <= 0 {
 		return
 	}
+
+	cpuCodeName := ""
+	if val, ok := m.metricStore.GetByStringIndex(consts.MetricCPUCodeName).(string); ok {
+		cpuCodeName = val
+	}
+
 	var totalMbmBytesPS, totalLocalBytesPS float64
+	l3CacheBandwidthStats := make(map[int]types.L3CacheBytesPS)
+
 	for _, l3Mon := range resctrlData.Mbm {
 		l3CacheID := l3Mon.ID
 
@@ -385,7 +398,6 @@ func (m *MalachiteMetricsProvisioner) setContainerMbmTotalMetric(podUID, contain
 				continue
 			}
 		}
-		totalMbmBytesPS += totalBytesPS
 
 		// Calculate local bandwidth
 		var localBytesPS float64
@@ -395,16 +407,27 @@ func (m *MalachiteMetricsProvisioner) setContainerMbmTotalMetric(podUID, contain
 				continue
 			}
 		}
+
+		numaID, maxBytesPS := getNumaAndMaxBandwidth(int(l3CacheID), cpuCodeName)
+		adjustedTotalBytesPS := totalBytesPS
+
+		if strings.Contains(cpuCodeName, consts.AMDGenoaArch) {
+			// Notice: data adjustments needed due to genoa hardware bug
+			adjustedTotalBytesPS += localBytesPS / 3 * 2
+		}
+		totalMbmBytesPS += adjustedTotalBytesPS
 		totalLocalBytesPS += localBytesPS
-		cpuCodeName := m.metricStore.GetByStringIndex(consts.MetricCPUCodeName)
-		if codeName, ok := cpuCodeName.(string); ok {
-			if strings.Contains(codeName, consts.AMDGenoaArch) {
-				// Notice: data adjustments needed due to genoa hardware bug
-				totalLocalBytesPS += localBytesPS / 3 * 2
-			}
+		l3CacheBandwidthStats[int(l3CacheID)] = types.L3CacheBytesPS{
+			NumaID:           numaID,
+			MbmTotalBytesPS:  uint64(adjustedTotalBytesPS),
+			MbmLocalBytesPS:  uint64(localBytesPS),
+			MbmVictimBytesPS: 0,
+			MBMMaxBytesPS:    maxBytesPS,
 		}
 	}
-	m.metricStore.SetByStringIndex(consts.MetricResctrlDataContainer, resctrlData)
+
+	m.metricStore.SetByStringIndex(resctrlKey, resctrlData)
+	m.metricStore.SetByStringIndex(l3MetricKey, l3CacheBandwidthStats)
 	m.metricStore.SetContainerMetric(podUID, containerName, consts.MetricMbmTotalPsContainer,
 		metric.MetricData{Value: totalMbmBytesPS, Time: updateTime})
 	m.metricStore.SetContainerMetric(podUID, containerName, consts.MetricMbmlocalPsContainer,
@@ -580,4 +603,8 @@ func aggregateNUMABytesPS(l3BytesPS map[int]types.L3CacheBytesPS, cpuCodeName st
 		numaBytesPS[mbmStat.NumaID] = numaBandwidthStats
 	}
 	return numaBytesPS
+}
+
+func getContainerStringIndexKey(metricName, podUID, containerName string) string {
+	return fmt.Sprintf("%s/%s/%s", metricName, podUID, containerName)
 }
