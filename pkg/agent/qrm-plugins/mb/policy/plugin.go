@@ -58,7 +58,6 @@ const (
 
 	metricMBMLoadSuppressed = "mbm_load_suppressed"
 	metricMBMCCDSuppressed  = "mbm_ccd_suppressed"
-	defaultPSM              = "-"
 )
 
 type MBPlugin struct {
@@ -275,8 +274,12 @@ func (m *MBPlugin) buildCCDToPodsMap() map[int]map[string]*corev1.Pod {
 		general.Infof("[mbm] cpuState.GetPodEntries(): %v", cpuState.GetPodEntries())
 	}
 	for podUID, containerEntries := range cpuState.GetPodEntries() {
+		if containerEntries == nil || containerEntries.IsPoolEntry() {
+			continue
+		}
+
 		for _, allocationInfo := range containerEntries {
-			if allocationInfo == nil {
+			if allocationInfo == nil || !allocationInfo.CheckMainContainer() {
 				continue
 			}
 			cpus := allocationInfo.AllocationResult.ToSliceInt()
@@ -317,6 +320,8 @@ func (m *MBPlugin) emitSuppressedCCDsMetrics(suppressedCCDs []advisor.Suppressed
 }
 
 func (m *MBPlugin) emitSuppressedPodsMetrics(suppressedCCDs []advisor.SuppressedCCD, ccdToPods map[int]map[string]*corev1.Pod) {
+	// reuse GenericEvictionConfiguration.PodMetricLabels as MB plugin does not have its own
+	podMetricLabels := m.conf.GenericEvictionConfiguration.PodMetricLabels
 	seen := make(map[string]struct{})
 	for _, s := range suppressedCCDs {
 		pods, ok := ccdToPods[s.CCDID]
@@ -330,12 +335,7 @@ func (m *MBPlugin) emitSuppressedPodsMetrics(suppressedCCDs []advisor.Suppressed
 			}
 			seen[key] = struct{}{}
 
-			psm := p.Labels["psm"]
-			if psm == "" {
-				psm = defaultPSM
-			}
-
-			emitPodSuppressed(m.emitter, p.Namespace, p.Name, s.SuppressionType, psm)
+			emitPodSuppressed(m.emitter, p.Namespace, p.Name, s.SuppressionType, p.Labels, podMetricLabels)
 		}
 	}
 }
@@ -369,14 +369,19 @@ func (m *MBPlugin) emitSuppressionMetrics() {
 	}
 }
 
-func emitPodSuppressed(emitter metrics.MetricEmitter, namespace, podName, suppressionType string, psm string) {
-	tags := map[string]string{
-		"namespace": namespace,
-		"pod_name":  podName,
-		"type":      suppressionType,
-		"psm":       psm,
+func emitPodSuppressed(emitter metrics.MetricEmitter, namespace, podName, suppressionType string, labels map[string]string, podMetricLabels sets.String) {
+	tags := []metrics.MetricTag{
+		{Key: "suppressed_namespace", Val: namespace},
+		{Key: "suppressed_pod", Val: podName},
+		{Key: "suppression_type", Val: suppressionType},
 	}
-	_ = emitter.StoreInt64(metricMBMLoadSuppressed, 1, metrics.MetricTypeNameRaw, metrics.ConvertMapToTags(tags)...)
+	for _, label := range podMetricLabels.List() {
+		value, ok := labels[label]
+		if ok {
+			tags = append(tags, metrics.MetricTag{Key: label, Val: value})
+		}
+	}
+	_ = emitter.StoreInt64(metricMBMLoadSuppressed, 1, metrics.MetricTypeNameRaw, tags...)
 }
 
 func newMBPlugin(agentCtx *agent.GenericContext, conf *config.Configuration,

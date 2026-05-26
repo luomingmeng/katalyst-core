@@ -31,6 +31,9 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/mb/monitor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/mb/plan"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/mb/reader"
+	"github.com/kubewharf/katalyst-core/pkg/config"
+	"github.com/kubewharf/katalyst-core/pkg/config/agent"
+	"github.com/kubewharf/katalyst-core/pkg/config/agent/eviction"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 )
 
@@ -196,23 +199,32 @@ func TestEmitSuppressedPodsMetrics(t *testing.T) {
 	emitter.On("StoreInt64", "mbm_load_suppressed", int64(1), metrics.MetricTypeNameRaw,
 		mock.MatchedBy(func(tags []metrics.MetricTag) bool {
 			return tagsMatch(tags, map[string]string{
-				"namespace": "ns1",
-				"pod_name":  "pod-a",
-				"type":      "domain_stress",
-				"psm":       "svc-a",
+				"suppressed_namespace": "ns1",
+				"suppressed_pod":       "pod-a",
+				"suppression_type":     "domain_stress",
+				"psm":                  "svc-a",
 			})
 		})).Return(nil)
 	emitter.On("StoreInt64", "mbm_load_suppressed", int64(1), metrics.MetricTypeNameRaw,
 		mock.MatchedBy(func(tags []metrics.MetricTag) bool {
 			return tagsMatch(tags, map[string]string{
-				"namespace": "ns2",
-				"pod_name":  "pod-b",
-				"type":      "ccd_limit",
-				"psm":       "-",
+				"suppressed_namespace": "ns2",
+				"suppressed_pod":       "pod-b",
+				"suppression_type":     "ccd_limit",
 			})
 		})).Return(nil)
 
-	m := &MBPlugin{emitter: emitter}
+	conf := &config.Configuration{
+		AgentConfiguration: &agent.AgentConfiguration{
+			GenericAgentConfiguration: &agent.GenericAgentConfiguration{
+				GenericEvictionConfiguration: &eviction.GenericEvictionConfiguration{
+					PodMetricLabels: sets.NewString("psm"),
+				},
+			},
+		},
+	}
+
+	m := &MBPlugin{emitter: emitter, conf: conf}
 	m.emitSuppressedPodsMetrics(suppressedCCDs, ccdToPods)
 
 	mock.AssertExpectationsForObjects(t, emitter)
