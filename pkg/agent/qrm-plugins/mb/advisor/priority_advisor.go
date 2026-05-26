@@ -18,6 +18,7 @@ package advisor
 
 import (
 	"context"
+	"sync"
 
 	"k8s.io/apimachinery/pkg/util/sets"
 
@@ -33,6 +34,7 @@ import (
 // It targets the scenarios where the groups of same priority don't share ccd.
 // todo: enhance to handle multiple groups of same priority sharing ccd
 type priorityAdvisor struct {
+	mu                  sync.Mutex
 	uniqPriorityAdvisor *uniqPriorityAdvisor
 	lastSuppressedCCDs  []SuppressedCCD
 }
@@ -61,7 +63,7 @@ func (a *priorityAdvisor) GetPlan(ctx context.Context, domainsMon *monitor.Domai
 		return nil, err
 	}
 
-	a.emitQuotaSuppressionMetrics(groupInfos)
+	a.updateSuppressedCCDs(groupInfos)
 
 	return a.splitPlan(mbPlan, groupInfos), nil
 }
@@ -165,15 +167,31 @@ func addQuadruplet(receptacle *map[int]map[string]map[int]string,
 	result[domID][group][ccd] = suppressionTypeCCDLimit
 }
 
-func (a *priorityAdvisor) emitQuotaSuppressionMetrics(groupInfos *groupInfo) {
+func (a *priorityAdvisor) updateSuppressedCCDs(groupInfos *groupInfo) {
 	domGroupCCDTypes := a.getDomainQuotaSuppression(groupInfos)
-	emitCCDSuppressionTypes(a.uniqPriorityAdvisor.emitter, domGroupCCDTypes)
+	capHint := a.getLastSuppressedCCDCap()
+	suppressed := buildSuppressedCCDs(domGroupCCDTypes, nil, capHint)
+	a.setLastSuppressedCCDs(suppressed)
+}
 
-	a.lastSuppressedCCDs = nil
+func (a *priorityAdvisor) getLastSuppressedCCDCap() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return cap(a.lastSuppressedCCDs)
+}
+
+func (a *priorityAdvisor) setLastSuppressedCCDs(v []SuppressedCCD) {
+	a.mu.Lock()
+	a.lastSuppressedCCDs = v
+	a.mu.Unlock()
+}
+
+func buildSuppressedCCDs(domGroupCCDTypes map[int]map[string]map[int]string, extra []SuppressedCCD, bufCap int) []SuppressedCCD {
+	result := make([]SuppressedCCD, 0, bufCap)
 	for domID, groupCCDTypes := range domGroupCCDTypes {
 		for group, ccdTypes := range groupCCDTypes {
 			for ccdID, suppressionType := range ccdTypes {
-				a.lastSuppressedCCDs = append(a.lastSuppressedCCDs, SuppressedCCD{
+				result = append(result, SuppressedCCD{
 					DomID:           domID,
 					Group:           group,
 					CCDID:           ccdID,
@@ -182,9 +200,13 @@ func (a *priorityAdvisor) emitQuotaSuppressionMetrics(groupInfos *groupInfo) {
 			}
 		}
 	}
+	result = append(result, extra...)
+	return result
 }
 
 func (a *priorityAdvisor) GetSuppressedCCDs() []SuppressedCCD {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	return a.lastSuppressedCCDs
 }
 

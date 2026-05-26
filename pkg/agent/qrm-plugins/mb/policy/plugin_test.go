@@ -103,7 +103,6 @@ func TestMBPlugin_run(t *testing.T) {
 
 	mAdvisor := new(mockAdvisor)
 	mAdvisor.On("GetPlan", mock.Anything, mock.Anything).Return(dummyPlan, nil)
-	mAdvisor.On("GetSuppressedCCDs").Return([]advisor.SuppressedCCD{})
 
 	mPlanAllocator := new(mockPlanAlloctor)
 	mPlanAllocator.On("Allocate", mock.Anything, dummyPlan).Return(nil)

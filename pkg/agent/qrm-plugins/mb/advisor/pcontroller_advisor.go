@@ -18,12 +18,12 @@ package advisor
 
 import (
 	"context"
+	"sync"
 
 	"k8s.io/klog/v2"
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/mb/monitor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/mb/plan"
-	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 )
 
@@ -31,9 +31,10 @@ import (
 // based on P-Controler (Proportional Controller) of closed-looped automation system to compare output feedback
 // against a target value and adjust inputs in predefined ratio Kp to achieve a desired state
 type pControllerAdvisor struct {
+	mu sync.Mutex
+
 	ccdMinMB, ccdMaxMB int
 	inner              Advisor
-	emitter            metrics.MetricEmitter
 
 	groupStates             map[string]*groupPCtrlState
 	lastCCDLimitSuppression map[int]map[string]map[int]string
@@ -50,35 +51,29 @@ func (p *pControllerAdvisor) GetPlan(ctx context.Context, domainsMon *monitor.Do
 		return nil, err
 	}
 
+	p.mu.Lock()
 	for group, state := range p.groupStates {
 		p.restrictGroupCCDCap(group, state, domainsMon, result)
 	}
 
-	p.lastCCDLimitSuppression = p.getCCDLimitSuppression(domainsMon)
-	if p.emitter != nil {
-		emitCCDSuppressionTypes(p.emitter, p.lastCCDLimitSuppression)
-	}
+	suppression := computeCCDLimitSuppression(domainsMon, p.groupStates, p.ccdMaxMB)
+	p.lastCCDLimitSuppression = suppression
+	p.mu.Unlock()
 
 	return result, nil
 }
 
 func (p *pControllerAdvisor) GetSuppressedCCDs() []SuppressedCCD {
+	p.mu.Lock()
 	innerSuppressed := p.inner.GetSuppressedCCDs()
+	lastSuppression := p.lastCCDLimitSuppression
+	p.mu.Unlock()
 
-	var result []SuppressedCCD
-	for domID, groupCCDTypes := range p.lastCCDLimitSuppression {
-		for group, ccdTypes := range groupCCDTypes {
-			for ccdID, suppressionType := range ccdTypes {
-				result = append(result, SuppressedCCD{
-					DomID:           domID,
-					Group:           group,
-					CCDID:           ccdID,
-					SuppressionType: suppressionType,
-				})
-			}
-		}
-	}
-	result = append(result, innerSuppressed...)
+	result := buildSuppressedCCDs(lastSuppression, innerSuppressed,
+		len(lastSuppression)+len(innerSuppressed),
+		// len(lastSuppression) is a lower bound (top-level domain count in 3-level nested map);
+		// computing the exact count requires a full traversal which defeats the purpose of the hint
+	)
 
 	return result
 }
@@ -128,12 +123,12 @@ func (p *pControllerAdvisor) maxObservedCCDMBForGroup(outgoings map[int]monitor.
 	return max
 }
 
-func (p *pControllerAdvisor) getCCDLimitSuppression(domainsMon *monitor.DomainStats) map[int]map[string]map[int]string {
+func computeCCDLimitSuppression(domainsMon *monitor.DomainStats, groupStates map[string]*groupPCtrlState, ccdMaxMB int) map[int]map[string]map[int]string {
 	var result map[int]map[string]map[int]string
 
-	for group, state := range p.groupStates {
+	for group, state := range groupStates {
 		target := state.pCtrl.target
-		if target <= 0 || state.ccdCapMB >= p.ccdMaxMB {
+		if target <= 0 || state.ccdCapMB >= ccdMaxMB {
 			continue
 		}
 
@@ -174,7 +169,6 @@ func NewPControllerAdvisor(Kp float64,
 	minValue, maxValue int,
 	groupTargets map[string]int,
 	inner Advisor,
-	emitter metrics.MetricEmitter,
 ) Advisor {
 	groupStates := make(map[string]*groupPCtrlState, len(groupTargets))
 	for group, target := range groupTargets {
@@ -191,7 +185,6 @@ func NewPControllerAdvisor(Kp float64,
 		ccdMinMB:    minValue,
 		ccdMaxMB:    maxValue,
 		inner:       inner,
-		emitter:     emitter,
 		groupStates: groupStates,
 	}
 }

@@ -35,7 +35,6 @@ const (
 	nameMBMAdjustedOutgoingTarget = "mbm_outgoing_target_adjusted"
 	namePlanRaw                   = "mbm_plan_raw"
 	namePlanUpdate                = "mbm_plan_update"
-	nameMBMCCDSuppressed          = "mbm_ccd_suppressed"
 
 	suppressionTypeDomainStress = "domain_stress"
 	suppressionTypeCCDLimit     = "ccd_limit"
@@ -123,26 +122,6 @@ func emitKV(emitter metrics.MetricEmitter, k string, v int, tags map[string]stri
 		metrics.MetricTypeNameRaw,
 		metrics.ConvertMapToTags(tags)...,
 	)
-}
-
-func emitCCDSuppressionTypes(emitter metrics.MetricEmitter, domGroupCCDTypes map[int]map[string]map[int]string) {
-	for domID, groupCCDTypes := range domGroupCCDTypes {
-		for group, ccdTypes := range groupCCDTypes {
-			for ccdID, suppressionType := range ccdTypes {
-				emitCCDSuppressed(emitter, domID, group, ccdID, suppressionType)
-			}
-		}
-	}
-}
-
-func emitCCDSuppressed(emitter metrics.MetricEmitter, domID int, group string, ccdID int, suppressionType string) {
-	tags := map[string]string{
-		"domain": fmt.Sprintf("%d", domID),
-		"group":  group,
-		"ccd":    fmt.Sprintf("%d", ccdID),
-		"type":   suppressionType,
-	}
-	emitKV(emitter, nameMBMCCDSuppressed, 1, tags)
 }
 
 func emitNamedGroupTargets(emitter metrics.MetricEmitter, name string, groupedDomTargets map[string][]int) {

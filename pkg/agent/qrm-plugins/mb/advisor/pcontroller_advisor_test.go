@@ -318,7 +318,7 @@ func Test_pControllerAdvisor_detectCCDLimitSuppression(t *testing.T) {
 				ccdMaxMB:    tt.fields.ccdMaxMB,
 				groupStates: tt.fields.groupStates,
 			}
-			assert.Equalf(t, tt.want, p.getCCDLimitSuppression(tt.args.domainsMon), "getCCDLimitSuppression(%v)", tt.args.domainsMon)
+			assert.Equalf(t, tt.want, computeCCDLimitSuppression(tt.args.domainsMon, p.groupStates, p.ccdMaxMB), "computeCCDLimitSuppression(%v)", tt.args.domainsMon)
 		})
 	}
 }

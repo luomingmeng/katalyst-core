@@ -54,7 +54,10 @@ const (
 	metricName = name
 	interval   = time.Second * 1
 
+	suppressEmitInterval = time.Second * 30
+
 	metricMBMLoadSuppressed = "mbm_load_suppressed"
+	metricMBMCCDSuppressed  = "mbm_ccd_suppressed"
 	defaultPSM              = "-"
 )
 
@@ -152,7 +155,6 @@ func (m *MBPlugin) Start() (err error) {
 			m.conf.MaxCCDMB,
 			m.conf.CCDCapGroups,
 			m.advisor,
-			m.emitter,
 		)
 		general.Infof("[mbm] P-Controller advisor enabled with groups=%v, Kp=%.2f", m.conf.CCDCapGroups, m.conf.CCDCapKp)
 	}
@@ -166,6 +168,8 @@ func (m *MBPlugin) Start() (err error) {
 			general.Errorf("mbm: reset resctrl FS on stop failed: %v", err)
 		}
 	}()
+
+	go wait.Until(m.emitSuppressionMetrics, suppressEmitInterval, m.chStop)
 
 	return nil
 }
@@ -255,8 +259,6 @@ func (m *MBPlugin) run() {
 		return
 	}
 
-	m.emitLoadSuppressionMetrics()
-
 	general.InfofV(6, "[mbm] plugin run end")
 }
 
@@ -302,6 +304,18 @@ func (m *MBPlugin) buildCCDToPodsMap() map[int]map[string]*corev1.Pod {
 	return ccdToPods
 }
 
+func (m *MBPlugin) emitSuppressedCCDsMetrics(suppressedCCDs []advisor.SuppressedCCD) {
+	for _, ccd := range suppressedCCDs {
+		tags := map[string]string{
+			"domain": fmt.Sprintf("%d", ccd.DomID),
+			"group":  ccd.Group,
+			"ccd":    fmt.Sprintf("%d", ccd.CCDID),
+			"type":   ccd.SuppressionType,
+		}
+		_ = m.emitter.StoreInt64(metricMBMCCDSuppressed, 1, metrics.MetricTypeNameRaw, metrics.ConvertMapToTags(tags)...)
+	}
+}
+
 func (m *MBPlugin) emitSuppressedPodsMetrics(suppressedCCDs []advisor.SuppressedCCD, ccdToPods map[int]map[string]*corev1.Pod) {
 	seen := make(map[string]struct{})
 	for _, s := range suppressedCCDs {
@@ -326,24 +340,33 @@ func (m *MBPlugin) emitSuppressedPodsMetrics(suppressedCCDs []advisor.Suppressed
 	}
 }
 
-func (m *MBPlugin) emitLoadSuppressionMetrics() {
+func (m *MBPlugin) emitSuppressionMetrics() {
+	if klog.V(6).Enabled() {
+		general.Infof("[mbm] metrics: start emitting suppression metrics")
+	}
+
 	suppressedCCDs := m.advisor.GetSuppressedCCDs()
 	if klog.V(6).Enabled() {
-		general.Infof("[mbm] suppressed ccds: %v", suppressedCCDs)
+		general.Infof("[mbm] metrics: suppressed ccds: %v", suppressedCCDs)
 	}
 	if len(suppressedCCDs) == 0 {
 		return
 	}
 
+	m.emitSuppressedCCDsMetrics(suppressedCCDs)
+
 	ccdToPods := m.buildCCDToPodsMap()
 	if klog.V(6).Enabled() {
-		general.Infof("[mbm] ccd to pod mappings: %v", ccdToPods)
+		general.Infof("[mbm] metrics: ccds to pod mappings: %v", ccdToPods)
 	}
 	if ccdToPods == nil {
 		return
 	}
 
 	m.emitSuppressedPodsMetrics(suppressedCCDs, ccdToPods)
+	if klog.V(6).Enabled() {
+		general.Infof("[mbm] metrics: done emitting suppression metrics")
+	}
 }
 
 func emitPodSuppressed(emitter metrics.MetricEmitter, namespace, podName, suppressionType string, psm string) {
