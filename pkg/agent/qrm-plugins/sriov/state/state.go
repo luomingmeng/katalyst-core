@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"sync"
 
 	"k8s.io/apimachinery/pkg/util/sets"
 
@@ -265,6 +266,31 @@ type ReadonlyState interface {
 type State interface {
 	writer
 	ReadonlyState
+}
+
+var (
+	readonlyStateLock sync.RWMutex
+	readonlyState     ReadonlyState
+)
+
+// GetReadonlyState retrieves the readonlyState in a thread-safe manner.
+// Returns an error if readonlyState is not set.
+func GetReadonlyState() (ReadonlyState, error) {
+	readonlyStateLock.RLock()
+	defer readonlyStateLock.RUnlock()
+
+	if readonlyState == nil {
+		return nil, fmt.Errorf("readonlyState isn't set")
+	}
+	return readonlyState, nil
+}
+
+// SetReadonlyState updates the readonlyState in a thread-safe manner.
+func SetReadonlyState(state ReadonlyState) {
+	readonlyStateLock.Lock()
+	defer readonlyStateLock.Unlock()
+
+	readonlyState = state
 }
 
 func GenerateDummyState(pfCount int, vfPerPF int, allocatedVFSet map[int]sets.Int) (VFState, PodEntries) {
