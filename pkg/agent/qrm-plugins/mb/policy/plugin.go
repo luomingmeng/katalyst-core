@@ -54,10 +54,11 @@ const (
 	metricName = name
 	interval   = time.Second * 1
 
-	suppressEmitInterval = time.Second * 30
+	emitInterval30s = time.Second * 30
 
 	metricMBMLoadSuppressed = "mbm_load_suppressed"
 	metricMBMCCDSuppressed  = "mbm_ccd_suppressed"
+	metricMBMHealthStatus   = "mbm_health_status"
 )
 
 type MBPlugin struct {
@@ -104,9 +105,10 @@ func (m *MBPlugin) Start() (err error) {
 	// todo: consider option not to reset resctrl FS on start to avoid hiccup between deployment updates
 	general.Infof("mbm: to reset resctrl FS on start")
 	ccds := sets.NewInt(maps.Keys(m.ccdToDomain)...)
+	m.chStop = make(chan struct{})
 	if err = m.planAllocator.Reset(context.Background(), ccds); err != nil {
 		general.Errorf("mbm: reset resctrl FS on start failed: %v", err)
-		general.Warningf("mbm: likely resctrl is not mounted; not to manage mem bandwidth")
+		go wait.Until(m.emitResctrlResetFailure, emitInterval30s, m.chStop)
 		return nil
 	}
 
@@ -115,7 +117,6 @@ func (m *MBPlugin) Start() (err error) {
 		return nil
 	}
 
-	m.chStop = make(chan struct{})
 	if !cache.WaitForCacheSync(m.chStop, m.metricFetcher.HasSynced) {
 		general.Errorf("mbm: wait for metric fetcher cache sync failed")
 		return fmt.Errorf("mbm plugin failed to wait for metric fetcher cache sync")
@@ -168,7 +169,7 @@ func (m *MBPlugin) Start() (err error) {
 		}
 	}()
 
-	go wait.Until(m.emitSuppressionMetrics, suppressEmitInterval, m.chStop)
+	go wait.Until(m.emitSuppressionMetrics, emitInterval30s, m.chStop)
 
 	return nil
 }
@@ -367,6 +368,14 @@ func (m *MBPlugin) emitSuppressionMetrics() {
 	if klog.V(6).Enabled() {
 		general.Infof("[mbm] metrics: done emitting suppression metrics")
 	}
+}
+
+func (m *MBPlugin) emitResctrlResetFailure() {
+	_ = m.emitter.StoreInt64(metricMBMHealthStatus, 1, metrics.MetricTypeNameRaw,
+		metrics.MetricTag{Key: "healthy", Val: "false"},
+		metrics.MetricTag{Key: "sub_system", Val: "resctrl"},
+		metrics.MetricTag{Key: "reason", Val: "reset_failure"},
+	)
 }
 
 func emitPodSuppressed(emitter metrics.MetricEmitter, namespace, podName, suppressionType string, labels map[string]string, podMetricLabels sets.String) {
