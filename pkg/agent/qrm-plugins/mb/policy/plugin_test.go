@@ -18,13 +18,19 @@ package policy
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	cpustate "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/mb/advisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/mb/allocator"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/mb/domain"
@@ -35,6 +41,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/config/agent"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/eviction"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
+	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
 type mockAdvisor struct {
@@ -78,6 +85,130 @@ type mockMetricEmitter struct {
 func (m *mockMetricEmitter) StoreInt64(key string, val int64, emitType metrics.MetricTypeName, tags ...metrics.MetricTag) error {
 	args := m.Called(key, val, emitType, tags)
 	return args.Error(0)
+}
+
+func TestBuildCCDToPodsMapFromState(t *testing.T) {
+	t.Parallel()
+
+	newAllocationInfo := func(cpus ...int) *cpustate.AllocationInfo {
+		return &cpustate.AllocationInfo{
+			AllocationMeta: commonstate.AllocationMeta{
+				ContainerType: pluginapi.ContainerType_MAIN.String(),
+			},
+			AllocationResult: machine.NewCPUSet(cpus...),
+		}
+	}
+
+	tests := []struct {
+		name        string
+		cpuTopology machine.CPUDetails
+		podEntries  cpustate.PodEntries
+		getPod      getPodFunc
+		want        map[int]map[string]*corev1.Pod
+	}{
+		{
+			name: "happy path - two pods on different ccds",
+			cpuTopology: machine.CPUDetails{
+				0: {L3CacheID: 0}, 1: {L3CacheID: 0},
+				2: {L3CacheID: 1}, 3: {L3CacheID: 1},
+			},
+			podEntries: cpustate.PodEntries{
+				"uid-1": cpustate.ContainerEntries{"main": newAllocationInfo(0, 1)},
+				"uid-2": cpustate.ContainerEntries{"main": newAllocationInfo(2, 3)},
+			},
+			getPod: successPodFetcher,
+			want: map[int]map[string]*corev1.Pod{
+				0: {"uid-1": stubPod("uid-1")},
+				1: {"uid-2": stubPod("uid-2")},
+			},
+		},
+		{
+			name: "single pod spans multiple ccds",
+			cpuTopology: machine.CPUDetails{
+				0: {L3CacheID: 0},
+				2: {L3CacheID: 1},
+			},
+			podEntries: cpustate.PodEntries{
+				"uid-1": cpustate.ContainerEntries{"main": newAllocationInfo(0, 2)},
+			},
+			getPod: successPodFetcher,
+			want: map[int]map[string]*corev1.Pod{
+				0: {"uid-1": stubPod("uid-1")},
+				1: {"uid-1": stubPod("uid-1")},
+			},
+		},
+		{
+			name:        "nil pod entries",
+			cpuTopology: machine.CPUDetails{0: {L3CacheID: 0}},
+			podEntries:  nil,
+			want:        map[int]map[string]*corev1.Pod{},
+		},
+		{
+			name: "nil allocation info is skipped",
+			cpuTopology: machine.CPUDetails{
+				0: {L3CacheID: 0},
+			},
+			podEntries: cpustate.PodEntries{
+				"uid-1": cpustate.ContainerEntries{"main": nil},
+			},
+			want: map[int]map[string]*corev1.Pod{},
+		},
+		{
+			name: "getPod returns error",
+			cpuTopology: machine.CPUDetails{
+				0: {L3CacheID: 0},
+			},
+			podEntries: cpustate.PodEntries{
+				"uid-1": cpustate.ContainerEntries{"main": newAllocationInfo(0)},
+			},
+			getPod: func(_ context.Context, _ string) (*corev1.Pod, error) {
+				return nil, errors.New("fetch error")
+			},
+			want: map[int]map[string]*corev1.Pod{},
+		},
+		{
+			name: "getPod returns nil pod",
+			cpuTopology: machine.CPUDetails{
+				0: {L3CacheID: 0},
+			},
+			podEntries: cpustate.PodEntries{
+				"uid-1": cpustate.ContainerEntries{"main": newAllocationInfo(0)},
+			},
+			getPod: func(_ context.Context, _ string) (*corev1.Pod, error) {
+				return nil, nil
+			},
+			want: map[int]map[string]*corev1.Pod{},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := buildCCDToPodsMapFromState(tt.podEntries, tt.cpuTopology, tt.getPod)
+
+			assert.Equal(t, len(tt.want), len(got))
+			for ccdID, expectedPods := range tt.want {
+				gotPods, ok := got[ccdID]
+				assert.True(t, ok, "ccd %d not found in result", ccdID)
+				assert.Equal(t, len(expectedPods), len(gotPods))
+				for podUID, expectedPod := range expectedPods {
+					gotPod, ok := gotPods[podUID]
+					assert.True(t, ok, "pod %s not found in ccd %d", podUID, ccdID)
+					assert.Equal(t, expectedPod.Name, gotPod.Name)
+				}
+			}
+		})
+	}
+}
+
+func successPodFetcher(_ context.Context, podUID string) (*corev1.Pod, error) {
+	return stubPod(podUID), nil
+}
+
+func stubPod(uid string) *corev1.Pod {
+	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{UID: types.UID(uid), Name: "pod-" + uid}}
 }
 
 func TestMBPlugin_run(t *testing.T) {

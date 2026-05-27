@@ -265,16 +265,29 @@ func (m *MBPlugin) run() {
 func (m *MBPlugin) buildCCDToPodsMap() map[int]map[string]*corev1.Pod {
 	cpuState, err := cpustate.GetReadonlyState()
 	if err != nil {
-		general.InfofV(6, "[mbm] cpu readonly state unavailable: %v", err)
+		general.Warningf("[mbm] cpu readonly state unavailable: %v", err)
 		return nil
 	}
 
+	podEntries := cpuState.GetPodEntries()
+
+	if klog.V(6).Enabled() {
+		general.Infof("[mbm] cpuState.GetPodEntries(): %v", podEntries)
+	}
+
+	return buildCCDToPodsMapFromState(
+		podEntries,
+		m.machineInfo.CPUDetails,
+		m.podFetcher.GetPod,
+	)
+}
+
+type getPodFunc func(ctx context.Context, podUID string) (*corev1.Pod, error)
+
+func buildCCDToPodsMapFromState(podEntries cpustate.PodEntries, cpuTopology machine.CPUDetails, getPod getPodFunc) map[int]map[string]*corev1.Pod {
 	ccdToPods := make(map[int]map[string]*corev1.Pod)
 	podIndexer := make(map[string]*corev1.Pod)
-	if klog.V(6).Enabled() {
-		general.Infof("[mbm] cpuState.GetPodEntries(): %v", cpuState.GetPodEntries())
-	}
-	for podUID, containerEntries := range cpuState.GetPodEntries() {
+	for podUID, containerEntries := range podEntries {
 		if containerEntries == nil || containerEntries.IsPoolEntry() {
 			continue
 		}
@@ -284,22 +297,21 @@ func (m *MBPlugin) buildCCDToPodsMap() map[int]map[string]*corev1.Pod {
 				continue
 			}
 			cpus := allocationInfo.AllocationResult.ToSliceInt()
-			for _, cpu := range cpus {
-				ccdID := m.machineInfo.CPUDetails[cpu].L3CacheID
-				if ccdToPods[ccdID] == nil {
-					ccdToPods[ccdID] = make(map[string]*corev1.Pod)
-				}
-				if _, exists := ccdToPods[ccdID][podUID]; exists {
+
+			podInfo, ok := podIndexer[podUID]
+			if !ok {
+				var err error
+				podInfo, err = getPod(context.Background(), podUID)
+				if err != nil || podInfo == nil {
 					continue
 				}
-				podInfo, ok := podIndexer[podUID]
-				if !ok {
-					var err error
-					podInfo, err = m.podFetcher.GetPod(context.Background(), podUID)
-					if err != nil || podInfo == nil {
-						continue
-					}
-					podIndexer[podUID] = podInfo
+				podIndexer[podUID] = podInfo
+			}
+
+			for _, cpu := range cpus {
+				ccdID := cpuTopology[cpu].L3CacheID
+				if ccdToPods[ccdID] == nil {
+					ccdToPods[ccdID] = make(map[string]*corev1.Pod)
 				}
 				ccdToPods[ccdID][podUID] = podInfo
 			}
