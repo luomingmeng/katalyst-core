@@ -95,7 +95,8 @@ func (m *MBPlugin) Start() (err error) {
 	ccds := sets.NewInt(maps.Keys(m.ccdToDomain)...)
 	if err = m.planAllocator.Reset(context.Background(), ccds); err != nil {
 		general.Errorf("mbm: reset resctrl FS on start failed: %v", err)
-		return err
+		general.Warningf("mbm: likely resctrl is not mounted; not to manage mem bandwidth")
+		return nil
 	}
 
 	if m.conf.ResetResctrlOnly {
