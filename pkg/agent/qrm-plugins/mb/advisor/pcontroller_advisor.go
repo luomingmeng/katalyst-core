@@ -31,7 +31,7 @@ import (
 // based on P-Controler (Proportional Controller) of closed-looped automation system to compare output feedback
 // against a target value and adjust inputs in predefined ratio Kp to achieve a desired state
 type pControllerAdvisor struct {
-	mu sync.Mutex
+	mu sync.RWMutex
 
 	ccdMinMB, ccdMaxMB int
 	inner              Advisor
@@ -64,10 +64,10 @@ func (p *pControllerAdvisor) GetPlan(ctx context.Context, domainsMon *monitor.Do
 }
 
 func (p *pControllerAdvisor) GetSuppressedCCDs() []SuppressedCCD {
-	p.mu.Lock()
+	p.mu.RLock()
 	innerSuppressed := p.inner.GetSuppressedCCDs()
 	lastSuppression := p.lastCCDLimitSuppression
-	p.mu.Unlock()
+	p.mu.RUnlock()
 
 	result := buildSuppressedCCDs(lastSuppression, innerSuppressed,
 		len(lastSuppression)+len(innerSuppressed),

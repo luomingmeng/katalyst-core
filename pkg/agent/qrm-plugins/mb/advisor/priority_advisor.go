@@ -34,7 +34,7 @@ import (
 // It targets the scenarios where the groups of same priority don't share ccd.
 // todo: enhance to handle multiple groups of same priority sharing ccd
 type priorityAdvisor struct {
-	mu                  sync.Mutex
+	mu                  sync.RWMutex
 	uniqPriorityAdvisor *uniqPriorityAdvisor
 	lastSuppressedCCDs  []SuppressedCCD
 }
@@ -175,8 +175,8 @@ func (a *priorityAdvisor) updateSuppressedCCDs(groupInfos *groupInfo) {
 }
 
 func (a *priorityAdvisor) getLastSuppressedCCDCap() int {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	return cap(a.lastSuppressedCCDs)
 }
 
@@ -205,8 +205,8 @@ func buildSuppressedCCDs(domGroupCCDTypes map[int]map[string]map[int]string, ext
 }
 
 func (a *priorityAdvisor) GetSuppressedCCDs() []SuppressedCCD {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	return a.lastSuppressedCCDs
 }
 

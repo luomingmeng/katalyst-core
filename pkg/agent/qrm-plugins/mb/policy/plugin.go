@@ -385,7 +385,7 @@ func (m *MBPlugin) emitSuppressionMetrics() {
 func (m *MBPlugin) emitResctrlResetFailure() {
 	_ = m.emitter.StoreInt64(metricMBMHealthStatus, 1, metrics.MetricTypeNameRaw,
 		metrics.MetricTag{Key: "healthy", Val: "false"},
-		metrics.MetricTag{Key: "sub_system", Val: "resctrl"},
+		metrics.MetricTag{Key: "component", Val: "resctrl"},
 		metrics.MetricTag{Key: "reason", Val: "reset_failure"},
 	)
 }
