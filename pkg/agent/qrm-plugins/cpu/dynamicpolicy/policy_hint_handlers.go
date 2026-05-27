@@ -681,12 +681,21 @@ func (p *DynamicPolicy) sharedCoresWithNUMABindingHintHandler(_ context.Context,
 			general.Infof("pod: %s/%s, container: %s request inplace update resize, there is enough resource for it in current NUMA",
 				req.PodNamespace, req.PodName, req.ContainerName)
 			hints = cpuutil.RegenerateHints(allocationInfo, false)
+			err = p.sharedCoresNUMABindingHintOptimizer.OptimizeHints(
+				hintoptimizer.Request{
+					ResourceRequest: req,
+					CPURequest:      request,
+					FilterOnly:      true,
+				}, hints[string(v1.ResourceCPU)])
+			if err != nil {
+				return nil, err
+			}
 		}
 	} else {
 		var calculateErr error
 		hints, calculateErr = p.calculateHintsForNUMABindingSharedCores(request, podEntries, machineState, req)
 		if calculateErr != nil {
-			return nil, fmt.Errorf("calculateHintsForNUMABindingSharedCores failed with error: %v", calculateErr)
+			return nil, fmt.Errorf("calculateHintsForNUMABindingSharedCores failed with error: %w", calculateErr)
 		}
 	}
 

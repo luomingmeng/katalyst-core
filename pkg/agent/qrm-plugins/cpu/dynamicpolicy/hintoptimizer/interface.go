@@ -24,6 +24,7 @@ import (
 type Request struct {
 	*pluginapi.ResourceRequest
 	CPURequest float64
+	FilterOnly bool
 }
 
 // HintOptimizer is the interface for optimizing topology hints.

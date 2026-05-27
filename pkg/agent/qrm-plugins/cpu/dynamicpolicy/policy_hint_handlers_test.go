@@ -17,6 +17,8 @@ limitations under the License.
 package dynamicpolicy
 
 import (
+	"context"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -28,6 +30,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/hintoptimizer"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	cpuutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/util"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
@@ -729,6 +732,427 @@ func TestPopulateHintsByAlreadyExistedNUMABindingResult(t *testing.T) {
 			}
 
 			assert.Equal(t, tt.wantHints, tt.hints)
+		})
+	}
+}
+
+func newTestPolicyForCPUTotalRequestThreshold(t *testing.T, ratio float64) *DynamicPolicy {
+	t.Helper()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	require.NoError(t, err)
+
+	policy, err := getTestDynamicPolicyWithoutInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+
+	policy.podAnnotationKeptKeys = []string{
+		consts.PodAnnotationInplaceUpdateResizingKey,
+	}
+
+	policy.conf.CPUQRMPluginConfig.TotalRequestThresholdHintOptimizerConfig.CPUTotalRequestThresholdRatio = ratio
+	return policy
+}
+
+func newCPUTotalRequestThresholdReq(qosLevel string, reqCPU float64, inplaceResize bool) *pluginapi.ResourceRequest {
+	annotations := map[string]string{
+		consts.PodAnnotationQoSLevelKey:          qosLevel,
+		consts.PodAnnotationMemoryEnhancementKey: `{"numa_binding": "true"}`,
+	}
+	if inplaceResize {
+		annotations[consts.PodAnnotationInplaceUpdateResizingKey] = "true"
+	}
+
+	return &pluginapi.ResourceRequest{
+		PodUid:         "pod-uid",
+		PodNamespace:   "default",
+		PodName:        "pod",
+		ContainerName:  "main",
+		ContainerType:  pluginapi.ContainerType_MAIN,
+		ContainerIndex: 0,
+		ResourceName:   string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{
+			string(v1.ResourceCPU): reqCPU,
+		},
+		Labels: map[string]string{
+			consts.PodAnnotationQoSLevelKey: qosLevel,
+		},
+		Annotations: annotations,
+	}
+}
+
+func newCPUTotalRequestThresholdAllocationInfo(podUID, qosLevel string, numaID int, request float64, numaBinding bool) *state.AllocationInfo {
+	ownerPoolName := commonstate.PoolNameShare
+	switch qosLevel {
+	case consts.PodAnnotationQoSLevelDedicatedCores:
+		ownerPoolName = commonstate.PoolNameDedicated
+	case consts.PodAnnotationQoSLevelReclaimedCores:
+		ownerPoolName = commonstate.PoolNameReclaim
+	}
+
+	annotations := map[string]string{}
+	if numaBinding {
+		annotations[consts.PodAnnotationMemoryEnhancementNumaBinding] = consts.PodAnnotationMemoryEnhancementNumaBindingEnable
+	}
+
+	return &state.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        podUID,
+			PodNamespace:  "default",
+			PodName:       podUID,
+			ContainerName: "main",
+			ContainerType: pluginapi.ContainerType_MAIN.String(),
+			OwnerPoolName: ownerPoolName,
+			Annotations:   annotations,
+			QoSLevel:      qosLevel,
+		},
+		TopologyAwareAssignments: map[int]machine.CPUSet{
+			numaID: machine.NewCPUSet(numaID),
+		},
+		OriginalTopologyAwareAssignments: map[int]machine.CPUSet{
+			numaID: machine.NewCPUSet(numaID),
+		},
+		RequestQuantity: request,
+	}
+}
+
+func setCPUTotalRequestThresholdPodEntries(t *testing.T, policy *DynamicPolicy, podEntries state.PodEntries) {
+	t.Helper()
+
+	machineState, err := generateMachineStateFromPodEntries(policy.machineInfo.CPUTopology, podEntries, policy.state.GetMachineState())
+	require.NoError(t, err)
+
+	policy.state.SetPodEntries(podEntries, false)
+	policy.state.SetMachineState(machineState, false)
+}
+
+func TestCPUTotalRequestThresholdRejectExistingAllocation(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name           string
+		qosLevel       string
+		reqCount       float64
+		inplaceResize  bool
+		allocationInfo *state.AllocationInfo
+		expectedError  bool
+	}{
+		{
+			name:          "non-vpa shared numa binding with request less than cpu threshold",
+			qosLevel:      consts.PodAnnotationQoSLevelSharedCores,
+			reqCount:      1.5,
+			inplaceResize: false,
+			allocationInfo: &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-uid",
+					PodNamespace:  "default",
+					PodName:       "pod",
+					ContainerName: "main",
+					Annotations: map[string]string{
+						consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+					},
+					QoSLevel: consts.PodAnnotationQoSLevelSharedCores,
+				},
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: machine.NewCPUSet(0, 1, 2, 3),
+				},
+				RequestQuantity: 1,
+			},
+			expectedError: false,
+		},
+		{
+			name:          "vpa shared numa binding with request equals cpu threshold",
+			qosLevel:      consts.PodAnnotationQoSLevelSharedCores,
+			reqCount:      1.5,
+			inplaceResize: true,
+			allocationInfo: &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-uid",
+					PodNamespace:  "default",
+					PodName:       "pod",
+					ContainerName: "main",
+					Annotations: map[string]string{
+						consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+					},
+					QoSLevel: consts.PodAnnotationQoSLevelSharedCores,
+				},
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: machine.NewCPUSet(0, 1, 2, 3),
+				},
+				RequestQuantity: 1,
+			},
+			expectedError: false,
+		},
+		{
+			name:          "non-vpa shared numa binding with request greater than cpu threshold reuses existing hint",
+			qosLevel:      consts.PodAnnotationQoSLevelSharedCores,
+			reqCount:      1.8,
+			inplaceResize: false,
+			allocationInfo: &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-uid",
+					PodNamespace:  "default",
+					PodName:       "pod",
+					ContainerName: "main",
+					Annotations: map[string]string{
+						consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+					},
+					QoSLevel: consts.PodAnnotationQoSLevelSharedCores,
+				},
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: machine.NewCPUSet(0, 1, 2, 3),
+				},
+				RequestQuantity: 1,
+			},
+			expectedError: false,
+		},
+		{
+			name:          "vpa shared numa binding with request greater than cpu threshold",
+			qosLevel:      consts.PodAnnotationQoSLevelSharedCores,
+			reqCount:      1.8,
+			inplaceResize: true,
+			allocationInfo: &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-uid",
+					PodNamespace:  "default",
+					PodName:       "pod",
+					ContainerName: "main",
+					Annotations: map[string]string{
+						consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+					},
+					QoSLevel: consts.PodAnnotationQoSLevelSharedCores,
+				},
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: machine.NewCPUSet(0, 1, 2, 3),
+				},
+				RequestQuantity: 1,
+			},
+			expectedError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			policy := newTestPolicyForCPUTotalRequestThreshold(t, 0.5)
+			req := newCPUTotalRequestThresholdReq(tt.qosLevel, tt.reqCount, tt.inplaceResize)
+			if tt.allocationInfo != nil {
+				policy.state.SetAllocationInfo(tt.allocationInfo.AllocationMeta.PodUid, tt.allocationInfo.AllocationMeta.ContainerName, tt.allocationInfo, true)
+				if tt.allocationInfo.CheckNUMABinding() {
+					req.Annotations[consts.PodAnnotationMemoryEnhancementNumaBinding] = consts.PodAnnotationMemoryEnhancementNumaBindingEnable
+				}
+			}
+			_, err := policy.GetTopologyHints(context.Background(), req)
+
+			if tt.expectedError {
+				require.ErrorContains(t, err, "exceeds threshold")
+				require.ErrorIs(t, err, cpuutil.ErrNoAvailableCPUHints)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestCPUTotalRequestThresholdRejectByNUMATotalRequest(t *testing.T) {
+	t.Parallel()
+
+	type existingRequest struct {
+		qosLevel    string
+		request     float64
+		numaBinding bool
+	}
+
+	for _, tt := range []struct {
+		name             string
+		existingRequests map[int][]existingRequest
+		reqCount         float64
+		expectedError    bool
+		expectedRespSize int
+	}{
+		{
+			name: "one numa exceeds threshold by total request",
+			existingRequests: map[int][]existingRequest{
+				2: {{qosLevel: consts.PodAnnotationQoSLevelDedicatedCores, request: 0.6, numaBinding: true}},
+			},
+			reqCount:         1.5,
+			expectedRespSize: 3,
+		},
+		{
+			name: "total request equals threshold",
+			existingRequests: map[int][]existingRequest{
+				2: {{qosLevel: consts.PodAnnotationQoSLevelReclaimedCores, request: 0.5, numaBinding: true}},
+			},
+			reqCount:         1.5,
+			expectedRespSize: 4,
+		},
+		{
+			name: "non-binding shared request is ignored",
+			existingRequests: map[int][]existingRequest{
+				2: {{qosLevel: consts.PodAnnotationQoSLevelSharedCores, request: 10, numaBinding: false}},
+			},
+			reqCount:         1.5,
+			expectedRespSize: 4,
+		},
+		{
+			name: "numa-binding reclaimed request is ignored",
+			existingRequests: map[int][]existingRequest{
+				2: {{qosLevel: consts.PodAnnotationQoSLevelReclaimedCores, request: 10, numaBinding: true}},
+			},
+			reqCount:         1.5,
+			expectedRespSize: 4,
+		},
+		{
+			name: "all numas exceed threshold by total request",
+			existingRequests: map[int][]existingRequest{
+				0: {{qosLevel: consts.PodAnnotationQoSLevelSharedCores, request: 0.1, numaBinding: true}},
+				1: {{qosLevel: consts.PodAnnotationQoSLevelDedicatedCores, request: 0.1, numaBinding: true}},
+				2: {{qosLevel: consts.PodAnnotationQoSLevelSharedCores, request: 0.6, numaBinding: true}},
+				3: {{qosLevel: consts.PodAnnotationQoSLevelDedicatedCores, request: 0.6, numaBinding: true}},
+			},
+			reqCount:         1.5,
+			expectedError:    true,
+			expectedRespSize: 0,
+		},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			policy := newTestPolicyForCPUTotalRequestThreshold(t, 0.5)
+			podEntries := state.PodEntries{}
+			for numaID, requests := range tt.existingRequests {
+				for i, existing := range requests {
+					podUID := fmt.Sprintf("existing-%s-pod-%d-%d", existing.qosLevel, numaID, i)
+					podEntries[podUID] = state.ContainerEntries{
+						"main": newCPUTotalRequestThresholdAllocationInfo(podUID, existing.qosLevel, numaID, existing.request, existing.numaBinding),
+					}
+				}
+			}
+			setCPUTotalRequestThresholdPodEntries(t, policy, podEntries)
+
+			req := newCPUTotalRequestThresholdReq(consts.PodAnnotationQoSLevelSharedCores, tt.reqCount, false)
+			resp, err := policy.GetTopologyHints(context.Background(), req)
+			if tt.expectedError {
+				require.ErrorContains(t, err, "exceeds threshold")
+				require.ErrorIs(t, err, cpuutil.ErrNoAvailableCPUHints)
+			} else {
+				require.NoError(t, err)
+			}
+			if resp != nil {
+				require.Equal(t, tt.expectedRespSize, len(resp.ResourceHints[string(v1.ResourceCPU)].Hints))
+			} else {
+				require.Equal(t, tt.expectedRespSize, 0)
+			}
+		})
+	}
+}
+
+func TestCPUTotalRequestThresholdInplaceResizeByNUMATotalRequest(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name             string
+		existingRequest  float64
+		resizedRequest   float64
+		expectedError    bool
+		expectedRespSize int
+	}{
+		{
+			name:             "exclude origin request and pass total request threshold",
+			existingRequest:  0.4,
+			resizedRequest:   1.5,
+			expectedRespSize: 1,
+		},
+		{
+			name:             "reject resized request by total request threshold",
+			existingRequest:  0.6,
+			resizedRequest:   1.5,
+			expectedError:    true,
+			expectedRespSize: 0,
+		},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			policy := newTestPolicyForCPUTotalRequestThreshold(t, 0.5)
+			podEntries := state.PodEntries{
+				"pod-uid": {
+					"main": newCPUTotalRequestThresholdAllocationInfo("pod-uid", consts.PodAnnotationQoSLevelSharedCores, 2, 1, true),
+				},
+				"existing-pod": {
+					"main": newCPUTotalRequestThresholdAllocationInfo("existing-pod", consts.PodAnnotationQoSLevelSharedCores, 2, tt.existingRequest, true),
+				},
+			}
+			setCPUTotalRequestThresholdPodEntries(t, policy, podEntries)
+
+			req := newCPUTotalRequestThresholdReq(consts.PodAnnotationQoSLevelSharedCores, tt.resizedRequest, true)
+			resp, err := policy.GetTopologyHints(context.Background(), req)
+			if tt.expectedError {
+				require.ErrorContains(t, err, "exceeds threshold")
+				require.ErrorIs(t, err, cpuutil.ErrNoAvailableCPUHints)
+			} else {
+				require.NoError(t, err)
+			}
+			if resp != nil {
+				require.Equal(t, tt.expectedRespSize, len(resp.ResourceHints[string(v1.ResourceCPU)].Hints))
+			} else {
+				require.Equal(t, tt.expectedRespSize, 0)
+			}
+		})
+	}
+}
+
+func TestCPUTotalRequestThresholdRejectNewPod(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name             string
+		reqCount         float64
+		expectedError    bool
+		expectedRespSize int
+	}{
+		{
+			name:             "request less than cpu threshold",
+			reqCount:         1,
+			expectedRespSize: 4,
+		},
+		{
+			name:             "request equals cpu threshold",
+			reqCount:         1.5,
+			expectedRespSize: 4,
+		},
+		{
+			name:             "request greater than cpu threshold slightly",
+			reqCount:         2,
+			expectedRespSize: 2,
+		},
+		{
+			name:             "request greater than cpu threshold",
+			reqCount:         2.1,
+			expectedError:    true,
+			expectedRespSize: 0,
+		},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			policy := newTestPolicyForCPUTotalRequestThreshold(t, 0.5)
+			req := newCPUTotalRequestThresholdReq(consts.PodAnnotationQoSLevelSharedCores, tt.reqCount, false)
+
+			resp, err := policy.GetTopologyHints(context.Background(), req)
+			if tt.expectedError {
+				require.ErrorContains(t, err, "exceeds threshold")
+				require.ErrorIs(t, err, cpuutil.ErrNoAvailableCPUHints)
+			} else {
+				require.NoError(t, err)
+			}
+			if resp != nil {
+				require.Equal(t, tt.expectedRespSize, len(resp.ResourceHints[string(v1.ResourceCPU)].Hints))
+			} else {
+				require.Equal(t, tt.expectedRespSize, 0)
+			}
 		})
 	}
 }

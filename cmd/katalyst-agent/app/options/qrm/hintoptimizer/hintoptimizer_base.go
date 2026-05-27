@@ -23,25 +23,30 @@ import (
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/hintoptimizer/policy/canonical"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/hintoptimizer/policy/metricbased"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/hintoptimizer/policy/totalrequestthreshold"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/hintoptimizer/registry"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/hintoptimizer"
 )
 
 type HintOptimizerOptions struct {
 	SharedCoresHintOptimizerPolicies    []string
+	SharedCoresHintFilterPolicies       []string
 	DedicatedCoresHintOptimizerPolicies []string
 
 	*CanonicalHintOptimizerOptions
 	*MemoryBandwidthHintOptimizerOptions
 	*MetricBasedHintOptimizerOptions
+	*TotalRequestThresholdHintOptimizerOptions
 }
 
 func NewHintOptimizerOptions() *HintOptimizerOptions {
 	return &HintOptimizerOptions{
-		SharedCoresHintOptimizerPolicies:    []string{metricbased.HintOptimizerNameMetricBased, canonical.HintOptimizerNameCanonical},
-		CanonicalHintOptimizerOptions:       NewCanonicalHintOptimizerOptions(),
-		MemoryBandwidthHintOptimizerOptions: NewMemoryBandwidthHintOptimizerOptions(),
-		MetricBasedHintOptimizerOptions:     NewMetricBasedHintOptimizerOptions(),
+		SharedCoresHintOptimizerPolicies:          []string{metricbased.HintOptimizerNameMetricBased, canonical.HintOptimizerNameCanonical},
+		SharedCoresHintFilterPolicies:             []string{totalrequestthreshold.HintOptimizerNameTotalRequestThreshold},
+		CanonicalHintOptimizerOptions:             NewCanonicalHintOptimizerOptions(),
+		MemoryBandwidthHintOptimizerOptions:       NewMemoryBandwidthHintOptimizerOptions(),
+		MetricBasedHintOptimizerOptions:           NewMetricBasedHintOptimizerOptions(),
+		TotalRequestThresholdHintOptimizerOptions: NewTotalRequestThresholdHintOptimizerOptions(),
 	}
 }
 
@@ -50,12 +55,15 @@ func (o *HintOptimizerOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 
 	fs.StringSliceVar(&o.SharedCoresHintOptimizerPolicies, "shared-cores-hint-optimizer-policies", o.SharedCoresHintOptimizerPolicies,
 		"it indicates the hint optimizer policies for shared cores, the order of the policies is important, and the first policy will be applied first")
+	fs.StringSliceVar(&o.SharedCoresHintFilterPolicies, "shared-cores-hint-filter-policies", o.SharedCoresHintFilterPolicies,
+		"it indicates the hint filter policies for shared cores, all filters will be executed in order before applying the optimizer policies")
 	fs.StringSliceVar(&o.DedicatedCoresHintOptimizerPolicies, "dedicated-cores-hint-optimizer-policies", o.DedicatedCoresHintOptimizerPolicies,
 		"it indicates the hint optimizer policies for dedicated cores, the order of the policies is important, and the first policy will be applied first")
 
 	o.CanonicalHintOptimizerOptions.AddFlags(fss)
 	o.MemoryBandwidthHintOptimizerOptions.AddFlags(fss)
 	o.MetricBasedHintOptimizerOptions.AddFlags(fss)
+	o.TotalRequestThresholdHintOptimizerOptions.AddFlags(fss)
 }
 
 func (o *HintOptimizerOptions) ApplyTo(conf *hintoptimizer.HintOptimizerConfiguration) error {
@@ -64,6 +72,12 @@ func (o *HintOptimizerOptions) ApplyTo(conf *hintoptimizer.HintOptimizerConfigur
 			return fmt.Errorf("policy %s is not registered in the registry", policy)
 		}
 		conf.SharedCoresHintOptimizerPolicies = append(conf.SharedCoresHintOptimizerPolicies, policy)
+	}
+	for _, policy := range o.SharedCoresHintFilterPolicies {
+		if _, ok := registry.SharedCoresHintOptimizerRegistry[policy]; !ok {
+			return fmt.Errorf("filter policy %s is not registered in the registry", policy)
+		}
+		conf.SharedCoresHintFilterPolicies = append(conf.SharedCoresHintFilterPolicies, policy)
 	}
 	for _, policy := range o.DedicatedCoresHintOptimizerPolicies {
 		if _, ok := registry.DedicatedCoresHintOptimizerRegistry[policy]; !ok {
@@ -79,6 +93,9 @@ func (o *HintOptimizerOptions) ApplyTo(conf *hintoptimizer.HintOptimizerConfigur
 		return err
 	}
 	if err := o.MetricBasedHintOptimizerOptions.ApplyTo(conf.MetricBasedHintOptimizerConfig); err != nil {
+		return err
+	}
+	if err := o.TotalRequestThresholdHintOptimizerOptions.ApplyTo(conf.TotalRequestThresholdHintOptimizerConfig); err != nil {
 		return err
 	}
 	return nil

@@ -22,13 +22,15 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/hintoptimizer/policy/memorybandwidth"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/hintoptimizer/policy/metricbased"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/hintoptimizer/policy/resourcepackage"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/hintoptimizer/policy/totalrequestthreshold"
 )
 
 var SharedCoresHintOptimizerRegistry = policy.HintOptimizerRegistry{
-	canonical.HintOptimizerNameCanonical:             canonical.NewCanonicalHintOptimizer,
-	memorybandwidth.HintOptimizerNameMemoryBandwidth: memorybandwidth.NewMemoryBandwidthHintOptimizer,
-	metricbased.HintOptimizerNameMetricBased:         metricbased.NewMetricBasedHintOptimizer,
-	resourcepackage.HintOptimizerNameResourcePackage: resourcepackage.NewResourcePackageHintOptimizer,
+	canonical.HintOptimizerNameCanonical:                         canonical.NewCanonicalHintOptimizer,
+	memorybandwidth.HintOptimizerNameMemoryBandwidth:             memorybandwidth.NewMemoryBandwidthHintOptimizer,
+	metricbased.HintOptimizerNameMetricBased:                     metricbased.NewMetricBasedHintOptimizer,
+	resourcepackage.HintOptimizerNameResourcePackage:             resourcepackage.NewResourcePackageHintOptimizer,
+	totalrequestthreshold.HintOptimizerNameTotalRequestThreshold: totalrequestthreshold.NewTotalRequestThresholdHintOptimizer,
 }
 
 var DedicatedCoresHintOptimizerRegistry = policy.HintOptimizerRegistry{

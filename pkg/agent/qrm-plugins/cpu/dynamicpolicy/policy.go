@@ -1153,10 +1153,15 @@ func (p *DynamicPolicy) initAdvisorClientConn() (err error) {
 
 func (p *DynamicPolicy) initHintOptimizers() error {
 	var err error
-	p.sharedCoresNUMABindingHintOptimizer, err = registry.SharedCoresHintOptimizerRegistry.HintOptimizer(p.conf.SharedCoresHintOptimizerPolicies,
-		p.generateHintOptimizerFactoryOptions())
+	hintOptimizerFactoryOptions := p.generateHintOptimizerFactoryOptions()
+
+	p.sharedCoresNUMABindingHintOptimizer, err = registry.SharedCoresHintOptimizerRegistry.HintOptimizerWithFilters(
+		p.conf.SharedCoresHintOptimizerPolicies,
+		p.conf.SharedCoresHintFilterPolicies,
+		hintOptimizerFactoryOptions,
+	)
 	if err != nil {
-		return fmt.Errorf("SharedCoresHintOptimizerRegistry.HintOptimizer failed with error: %v", err)
+		return fmt.Errorf("SharedCoresHintOptimizerRegistry.HintOptimizerWithFilters failed with error: %v", err)
 	}
 
 	p.dedicatedCoresNUMABindingHintOptimizer, err = registry.DedicatedCoresHintOptimizerRegistry.HintOptimizer(p.conf.DedicatedCoresHintOptimizerPolicies,

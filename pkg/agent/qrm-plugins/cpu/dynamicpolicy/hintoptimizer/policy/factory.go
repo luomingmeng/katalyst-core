@@ -49,16 +49,53 @@ func (h *HintOptimizerRegistry) Register(name string, factory HintOptimizerFacto
 }
 
 func (h *HintOptimizerRegistry) HintOptimizer(policies []string, options HintOptimizerFactoryOptions) (hintoptimizer.HintOptimizer, error) {
+	return h.HintOptimizerWithFilters(policies, nil, options)
+}
+
+func (h *HintOptimizerRegistry) HintOptimizerWithFilters(policies, filterPolicies []string, options HintOptimizerFactoryOptions) (hintoptimizer.HintOptimizer, error) {
+	if len(policies) > 0 && len(filterPolicies) > 0 {
+		filterSet := make(map[string]struct{}, len(filterPolicies))
+		for _, name := range filterPolicies {
+			filterSet[name] = struct{}{}
+		}
+
+		configuredPolicies := make([]string, 0, len(policies))
+		for _, name := range policies {
+			if _, ok := filterSet[name]; ok {
+				general.Warningf("skip configured hint optimizer %s because it is registered as mandatory filter", name)
+				continue
+			}
+			configuredPolicies = append(configuredPolicies, name)
+		}
+		policies = configuredPolicies
+	}
+
+	optimizers, err := h.newNamedHintOptimizers(policies, options)
+	if err != nil {
+		return nil, err
+	}
+	filters, err := h.newNamedHintOptimizers(filterPolicies, options)
+	if err != nil {
+		return nil, err
+	}
+
+	return &multiHintOptimizer{
+		optimizers: optimizers,
+		filters:    filters,
+	}, nil
+}
+
+func (h *HintOptimizerRegistry) newNamedHintOptimizers(policies []string, options HintOptimizerFactoryOptions) ([]namedHintOptimizer, error) {
 	optimizers := make([]namedHintOptimizer, 0, len(policies))
 	for _, name := range policies {
 		f, ok := (*h)[name]
 		if !ok {
-			return nil, fmt.Errorf("hint namedHintOptimizer %s not registered", name)
+			return nil, fmt.Errorf("hint optimizer %s not registered", name)
 		}
 
 		o, err := f(options)
 		if err != nil {
-			return nil, fmt.Errorf("hint namedHintOptimizer %s failed with error: %v", name, err)
+			return nil, fmt.Errorf("hint optimizer %s failed with error: %v", name, err)
 		}
 
 		optimizers = append(optimizers, namedHintOptimizer{
@@ -66,9 +103,7 @@ func (h *HintOptimizerRegistry) HintOptimizer(policies []string, options HintOpt
 			hintOptimizer: o,
 		})
 	}
-	return &multiHintOptimizer{
-		optimizers: optimizers,
-	}, nil
+	return optimizers, nil
 }
 
 type namedHintOptimizer struct {
@@ -78,29 +113,65 @@ type namedHintOptimizer struct {
 
 type multiHintOptimizer struct {
 	optimizers []namedHintOptimizer
+	filters    []namedHintOptimizer
 }
 
 func (m multiHintOptimizer) OptimizeHints(request hintoptimizer.Request, hints *pluginapi.ListOfTopologyHints) error {
-	for _, optimizer := range m.optimizers {
-		err := optimizer.hintOptimizer.OptimizeHints(request, hints)
+	for _, filter := range m.filters {
+		if filter.hintOptimizer == nil {
+			continue
+		}
+
+		err := filter.hintOptimizer.OptimizeHints(request, hints)
 		if err != nil {
 			if hintoptimizerutil.IsSkipOptimizeHintsError(err) {
-				general.Warningf("hint optimizer %s continue with error: %v", optimizer.name, err.Error())
+				general.Warningf("hint filter %s continue with error: %v", filter.name, err.Error())
 				continue
 			}
 			return err
 		}
-		// if no error, return directly
-		// todo: support post-filtering hints later
-		return nil
 	}
+
+	if !request.FilterOnly {
+		for _, optimizer := range m.optimizers {
+			if optimizer.hintOptimizer == nil {
+				continue
+			}
+
+			err := optimizer.hintOptimizer.OptimizeHints(request, hints)
+			if err != nil {
+				if hintoptimizerutil.IsSkipOptimizeHintsError(err) {
+					general.Warningf("hint optimizer %s continue with error: %v", optimizer.name, err.Error())
+					continue
+				}
+				return err
+			}
+			// if no error, return directly
+			return nil
+		}
+	}
+
 	return nil
 }
 
 func (m multiHintOptimizer) Run(stopCh <-chan struct{}) error {
 	var errList []error
 	for _, optimizer := range m.optimizers {
+		if optimizer.hintOptimizer == nil {
+			continue
+		}
+
 		err := optimizer.hintOptimizer.Run(stopCh)
+		if err != nil {
+			errList = append(errList, err)
+		}
+	}
+	for _, filter := range m.filters {
+		if filter.hintOptimizer == nil {
+			continue
+		}
+
+		err := filter.hintOptimizer.Run(stopCh)
 		if err != nil {
 			errList = append(errList, err)
 		}
