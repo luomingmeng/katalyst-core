@@ -18,6 +18,7 @@ package advisor
 
 import (
 	"context"
+	"sync"
 
 	"k8s.io/klog/v2"
 
@@ -30,10 +31,13 @@ import (
 // based on P-Controler (Proportional Controller) of closed-looped automation system to compare output feedback
 // against a target value and adjust inputs in predefined ratio Kp to achieve a desired state
 type pControllerAdvisor struct {
+	mu sync.RWMutex
+
 	ccdMinMB, ccdMaxMB int
 	inner              Advisor
 
-	groupStates map[string]*groupPCtrlState
+	groupStates             map[string]*groupPCtrlState
+	lastCCDLimitSuppression map[int]map[string]map[int]string
 }
 
 type groupPCtrlState struct {
@@ -47,11 +51,31 @@ func (p *pControllerAdvisor) GetPlan(ctx context.Context, domainsMon *monitor.Do
 		return nil, err
 	}
 
+	p.mu.Lock()
 	for group, state := range p.groupStates {
 		p.restrictGroupCCDCap(group, state, domainsMon, result)
 	}
 
+	suppression := computeCCDLimitSuppression(domainsMon, p.groupStates, p.ccdMaxMB)
+	p.lastCCDLimitSuppression = suppression
+	p.mu.Unlock()
+
 	return result, nil
+}
+
+func (p *pControllerAdvisor) GetSuppressedCCDs() []SuppressedCCD {
+	p.mu.RLock()
+	innerSuppressed := p.inner.GetSuppressedCCDs()
+	lastSuppression := p.lastCCDLimitSuppression
+	p.mu.RUnlock()
+
+	result := buildSuppressedCCDs(lastSuppression, innerSuppressed,
+		len(lastSuppression)+len(innerSuppressed),
+		// len(lastSuppression) is a lower bound (top-level domain count in 3-level nested map);
+		// computing the exact count requires a full traversal which defeats the purpose of the hint
+	)
+
+	return result
 }
 
 func (p *pControllerAdvisor) restrictGroupCCDCap(group string, groupState *groupPCtrlState,
@@ -68,7 +92,7 @@ func (p *pControllerAdvisor) restrictGroupCCDCap(group string, groupState *group
 	applyGroupCCDBoundsChecks(ccdMBs, p.ccdMinMB, groupState.ccdCapMB)
 
 	if klog.V(6).Enabled() {
-		general.InfofV(6, "[mbm] [pController] group=%s maxObserved=%d target=%d cap=%d",
+		general.Infof("[mbm] [pController] group=%s maxObserved=%d target=%d cap=%d",
 			group, maxObservedMB, groupState.pCtrl.target, groupState.ccdCapMB)
 	}
 }
@@ -97,6 +121,31 @@ func (p *pControllerAdvisor) maxObservedCCDMBForGroup(outgoings map[int]monitor.
 		}
 	}
 	return max
+}
+
+func computeCCDLimitSuppression(domainsMon *monitor.DomainStats, groupStates map[string]*groupPCtrlState, ccdMaxMB int) map[int]map[string]map[int]string {
+	var result map[int]map[string]map[int]string
+
+	for group, state := range groupStates {
+		target := state.pCtrl.target
+		if target <= 0 || state.ccdCapMB >= ccdMaxMB {
+			continue
+		}
+
+		for domID, domStats := range domainsMon.Outgoings {
+			ccdStats, ok := domStats[group]
+			if !ok {
+				continue
+			}
+			for ccd, mbInfo := range ccdStats {
+				if mbInfo.TotalMB >= target {
+					addQuadruplet(&result, domID, group, ccd, suppressionTypeCCDLimit)
+				}
+			}
+		}
+	}
+
+	return result
 }
 
 func applyGroupCCDBoundsChecks(ccdMBs plan.GroupCCDPlan, lower, upper int) {

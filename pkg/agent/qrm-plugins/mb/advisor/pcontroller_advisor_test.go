@@ -43,6 +43,11 @@ func (m *mockAdvisor) GetPlan(ctx context.Context, domainsMon *monitor.DomainSta
 	return returnedPlan, args.Error(1)
 }
 
+func (m *mockAdvisor) GetSuppressedCCDs() []SuppressedCCD {
+	args := m.Called()
+	return args.Get(0).([]SuppressedCCD)
+}
+
 func TestPControllerAdvisor_GetPlan_May_Update_CCDCap(t *testing.T) {
 	t.Parallel()
 
@@ -260,4 +265,84 @@ func TestPControllerAdvisor_GetPlan_May_Update_CCDCap(t *testing.T) {
 			assert.Equal(t, tt.wantDedicatedCCDCapMB, pCtrl.groupStates["dedicated"].ccdCapMB, "new cap should be")
 		})
 	}
+}
+
+func Test_pControllerAdvisor_detectCCDLimitSuppression(t *testing.T) {
+	t.Parallel()
+	type fields struct {
+		ccdMaxMB    int
+		groupStates map[string]*groupPCtrlState
+	}
+	type args struct {
+		domainsMon *monitor.DomainStats
+	}
+	tests := []struct {
+		name   string
+		fields fields
+		args   args
+		want   map[int]map[string]map[int]string
+	}{
+		{
+			name: "happy path",
+			fields: fields{
+				ccdMaxMB: 60000,
+				groupStates: map[string]*groupPCtrlState{
+					"dedicated": {
+						pCtrl:    pController{target: 666},
+						ccdCapMB: 333,
+					},
+				},
+			},
+			args: args{
+				domainsMon: &monitor.DomainStats{
+					Outgoings: map[int]monitor.DomainMonStat{
+						2: map[string]monitor.GroupMB{
+							"dedicated": map[int]monitor.MBInfo{
+								16: {TotalMB: 777},
+								18: {TotalMB: 500},
+							},
+						},
+					},
+				},
+			},
+			want: map[int]map[string]map[int]string{
+				2: {"dedicated": {16: "ccd_limit"}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			p := &pControllerAdvisor{
+				ccdMaxMB:    tt.fields.ccdMaxMB,
+				groupStates: tt.fields.groupStates,
+			}
+			assert.Equalf(t, tt.want, computeCCDLimitSuppression(tt.args.domainsMon, p.groupStates, p.ccdMaxMB), "computeCCDLimitSuppression(%v)", tt.args.domainsMon)
+		})
+	}
+}
+
+func TestPControllerAdvisor_GetSuppressedCCDs(t *testing.T) {
+	t.Parallel()
+
+	innerSuppressed := []SuppressedCCD{
+		{DomID: 0, Group: "share", CCDID: 2, SuppressionType: "domain_stress"},
+	}
+
+	mockInner := new(mockAdvisor)
+	mockInner.On("GetSuppressedCCDs").Return(innerSuppressed)
+
+	pCtrl := &pControllerAdvisor{
+		inner: mockInner,
+		lastCCDLimitSuppression: map[int]map[string]map[int]string{
+			0: {"dedicated": {4: "ccd_limit"}},
+		},
+	}
+
+	got := pCtrl.GetSuppressedCCDs()
+
+	assert.Len(t, got, 2)
+	assert.Contains(t, got, innerSuppressed[0])
+	assert.Contains(t, got, SuppressedCCD{DomID: 0, Group: "dedicated", CCDID: 4, SuppressionType: "ccd_limit"})
 }

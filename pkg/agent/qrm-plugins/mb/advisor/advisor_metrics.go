@@ -35,6 +35,9 @@ const (
 	nameMBMAdjustedOutgoingTarget = "mbm_outgoing_target_adjusted"
 	namePlanRaw                   = "mbm_plan_raw"
 	namePlanUpdate                = "mbm_plan_update"
+
+	suppressionTypeDomainStress = "domain_stress"
+	suppressionTypeCCDLimit     = "ccd_limit"
 )
 
 func (a *uniqPriorityAdvisor) emitDomIncomingStatSummaryMetrics(domLimits map[int]*resource.MBGroupIncomingStat) {

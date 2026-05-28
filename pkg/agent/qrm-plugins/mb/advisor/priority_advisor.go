@@ -18,6 +18,7 @@ package advisor
 
 import (
 	"context"
+	"sync"
 
 	"k8s.io/apimachinery/pkg/util/sets"
 
@@ -33,7 +34,9 @@ import (
 // It targets the scenarios where the groups of same priority don't share ccd.
 // todo: enhance to handle multiple groups of same priority sharing ccd
 type priorityAdvisor struct {
+	mu                  sync.RWMutex
 	uniqPriorityAdvisor *uniqPriorityAdvisor
+	lastSuppressedCCDs  []SuppressedCCD
 }
 
 // groupInfo stores the mapping of groups and their CCDs for each domain
@@ -59,6 +62,9 @@ func (a *priorityAdvisor) GetPlan(ctx context.Context, domainsMon *monitor.Domai
 	if err != nil {
 		return nil, err
 	}
+
+	a.updateSuppressedCCDs(groupInfos)
+
 	return a.splitPlan(mbPlan, groupInfos), nil
 }
 
@@ -108,6 +114,100 @@ func (a *priorityAdvisor) splitPlan(mbPlan *plan.MBPlan, groupInfos *groupInfo) 
 		delete(mbPlan.MBGroups, groupKey)
 	}
 	return mbPlan
+}
+
+func (a *priorityAdvisor) getDomainQuotaSuppression(groupInfos *groupInfo) map[int]map[string]map[int]string {
+	var result map[int]map[string]map[int]string
+
+	for domID, groupCCDs := range a.uniqPriorityAdvisor.lastQuotaSuppressedCCDs {
+		for groupKey, ccdIDs := range groupCCDs {
+			if isCombinedGroup(groupKey) {
+				domGroupMapping, hasMapping := groupInfos.DomainGroups[domID]
+				if !hasMapping {
+					continue
+				}
+				combinedMapping, hasCombined := domGroupMapping[groupKey]
+				if !hasCombined {
+					continue
+				}
+				for realGroup, ccdSet := range combinedMapping {
+					for _, ccd := range ccdIDs {
+						if ccdSet.Has(ccd) {
+							addQuadruplet(&result, domID, realGroup, ccd, suppressionTypeDomainStress)
+						}
+					}
+				}
+			} else {
+				for _, ccd := range ccdIDs {
+					addQuadruplet(&result, domID, groupKey, ccd, suppressionTypeDomainStress)
+				}
+			}
+		}
+	}
+
+	return result
+}
+
+func addQuadruplet(receptacle *map[int]map[string]map[int]string,
+	domID int, group string, ccd int, suppressionType string,
+) {
+	if *receptacle == nil {
+		*receptacle = make(map[int]map[string]map[int]string)
+	}
+	result := *receptacle
+
+	if _, ok := result[domID]; !ok {
+		result[domID] = make(map[string]map[int]string)
+	}
+
+	if _, ok := result[domID][group]; !ok {
+		result[domID][group] = make(map[int]string)
+	}
+
+	result[domID][group][ccd] = suppressionType
+}
+
+func (a *priorityAdvisor) updateSuppressedCCDs(groupInfos *groupInfo) {
+	domGroupCCDTypes := a.getDomainQuotaSuppression(groupInfos)
+	capHint := a.getLastSuppressedCCDCap()
+	suppressed := buildSuppressedCCDs(domGroupCCDTypes, nil, capHint)
+	a.setLastSuppressedCCDs(suppressed)
+}
+
+func (a *priorityAdvisor) getLastSuppressedCCDCap() int {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return cap(a.lastSuppressedCCDs)
+}
+
+func (a *priorityAdvisor) setLastSuppressedCCDs(v []SuppressedCCD) {
+	a.mu.Lock()
+	a.lastSuppressedCCDs = v
+	a.mu.Unlock()
+}
+
+func buildSuppressedCCDs(domGroupCCDTypes map[int]map[string]map[int]string, extra []SuppressedCCD, bufCap int) []SuppressedCCD {
+	result := make([]SuppressedCCD, 0, bufCap)
+	for domID, groupCCDTypes := range domGroupCCDTypes {
+		for group, ccdTypes := range groupCCDTypes {
+			for ccdID, suppressionType := range ccdTypes {
+				result = append(result, SuppressedCCD{
+					DomID:           domID,
+					Group:           group,
+					CCDID:           ccdID,
+					SuppressionType: suppressionType,
+				})
+			}
+		}
+	}
+	result = append(result, extra...)
+	return result
+}
+
+func (a *priorityAdvisor) GetSuppressedCCDs() []SuppressedCCD {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.lastSuppressedCCDs
 }
 
 func New(emitter metrics.MetricEmitter, domains domain.Domains, ccdMinMB, ccdMaxMB int, defaultDomainCapacity int,
