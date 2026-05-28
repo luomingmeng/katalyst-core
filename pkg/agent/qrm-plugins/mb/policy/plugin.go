@@ -105,7 +105,9 @@ func (m *MBPlugin) Start() (err error) {
 	// todo: consider option not to reset resctrl FS on start to avoid hiccup between deployment updates
 	general.Infof("mbm: to reset resctrl FS on start")
 	ccds := sets.NewInt(maps.Keys(m.ccdToDomain)...)
-	m.chStop = make(chan struct{})
+	if m.chStop == nil {
+		m.chStop = make(chan struct{})
+	}
 	if err = m.planAllocator.Reset(context.Background(), ccds); err != nil {
 		general.Errorf("mbm: reset resctrl FS on start failed: %v", err)
 		go wait.Until(m.emitResctrlResetFailure, emitInterval30s, m.chStop)

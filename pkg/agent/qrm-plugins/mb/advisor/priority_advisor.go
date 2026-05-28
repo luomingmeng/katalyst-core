@@ -149,7 +149,7 @@ func (a *priorityAdvisor) getDomainQuotaSuppression(groupInfos *groupInfo) map[i
 }
 
 func addQuadruplet(receptacle *map[int]map[string]map[int]string,
-	domID int, group string, ccd int, suppressionTypeCCDLimit string,
+	domID int, group string, ccd int, suppressionType string,
 ) {
 	if *receptacle == nil {
 		*receptacle = make(map[int]map[string]map[int]string)
@@ -164,7 +164,7 @@ func addQuadruplet(receptacle *map[int]map[string]map[int]string,
 		result[domID][group] = make(map[int]string)
 	}
 
-	result[domID][group][ccd] = suppressionTypeCCDLimit
+	result[domID][group][ccd] = suppressionType
 }
 
 func (a *priorityAdvisor) updateSuppressedCCDs(groupInfos *groupInfo) {
