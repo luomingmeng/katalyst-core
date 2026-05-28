@@ -22,7 +22,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"golang.org/x/time/rate"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -154,21 +153,24 @@ func (w *podFetcherImpl) GetContainerID(podUID, containerName string) (string, e
 	return native.GetContainerID(pod, containerName)
 }
 
-func (w *podFetcherImpl) Run(ctx context.Context) {
-	watcherInfo := general.FileWatcherInfo{
-		Path:     w.cgroupRootPaths,
-		Filename: "",
-		Op:       fsnotify.Create,
-	}
-
-	general.RegisterHeartbeatCheck(podFetcherKubeletHealthCheckName, tolerationTurns*w.podConf.KubeletPodCacheSyncPeriod,
-		general.HealthzCheckStateNotReady, tolerationTurns*w.podConf.KubeletPodCacheSyncPeriod)
-	general.RegisterHeartbeatCheck(podFetcherRuntimeHealthCheckName, tolerationTurns*w.podConf.RuntimePodCacheSyncPeriod,
-		general.HealthzCheckStateNotReady, tolerationTurns*w.podConf.RuntimePodCacheSyncPeriod)
-
-	watcherCh, err := general.RegisterFileEventWatcher(ctx.Done(), watcherInfo)
+// startSyncKubeletPods starts the kubelet pod cache synchronization loop driven by
+// cgroup directory changes and a periodic fallback timer.
+//
+// Directory watching (root cgroup paths plus their first-level pod-level child
+// directories) is delegated to general.RegisterSubDirEventWatcher, which reports
+// a "needs-sync" signal whenever a watched root or child directory is created or
+// removed. On top of that signal this function applies:
+//   - a rate limiter to bound sync frequency for filesystem-triggered events;
+//   - a periodic timer to ensure syncs happen even without filesystem notifications.
+//
+// The loop exits when ctx is canceled, at which point the underlying watcher
+// is closed by the util.
+func (w *podFetcherImpl) startSyncKubeletPods(ctx context.Context) {
+	syncCh, watchList, err := general.RegisterSubDirEventWatcher(ctx.Done(), general.SubDirWatcherInfo{
+		RootPaths: w.cgroupRootPaths,
+	})
 	if err != nil {
-		klog.Fatalf("register file event watcher failed: %s", err)
+		klog.Fatalf("init kubelet pod cgroup watcher failed: %v", err)
 	}
 
 	timer := time.NewTimer(w.podConf.KubeletPodCacheSyncPeriod)
@@ -177,12 +179,16 @@ func (w *podFetcherImpl) Run(ctx context.Context) {
 	go func() {
 		for {
 			select {
-			case <-watcherCh:
+			case _, ok := <-syncCh:
+				if !ok {
+					return
+				}
 				if rateLimiter.Allow() {
 					w.syncKubeletPod(ctx)
 					timer.Reset(w.podConf.KubeletPodCacheSyncPeriod)
 				}
 			case <-timer.C:
+				klog.Infof("cgroup watch list %v", watchList())
 				w.syncKubeletPod(ctx)
 				timer.Reset(w.podConf.KubeletPodCacheSyncPeriod)
 			case <-ctx.Done():
@@ -193,7 +199,15 @@ func (w *podFetcherImpl) Run(ctx context.Context) {
 			}
 		}
 	}()
+}
 
+func (w *podFetcherImpl) Run(ctx context.Context) {
+	general.RegisterHeartbeatCheck(podFetcherKubeletHealthCheckName, tolerationTurns*w.podConf.KubeletPodCacheSyncPeriod,
+		general.HealthzCheckStateNotReady, tolerationTurns*w.podConf.KubeletPodCacheSyncPeriod)
+	general.RegisterHeartbeatCheck(podFetcherRuntimeHealthCheckName, tolerationTurns*w.podConf.RuntimePodCacheSyncPeriod,
+		general.HealthzCheckStateNotReady, tolerationTurns*w.podConf.RuntimePodCacheSyncPeriod)
+
+	w.startSyncKubeletPods(ctx)
 	go wait.UntilWithContext(ctx, w.syncRuntimePod, w.podConf.RuntimePodCacheSyncPeriod)
 	go wait.Until(w.checkPodCache, 30*time.Second, ctx.Done())
 	<-ctx.Done()
@@ -291,6 +305,7 @@ func (w *podFetcherImpl) syncRuntimePod(_ context.Context) {
 
 // syncKubeletPod sync local kubelet pod cache from kubelet pod fetcher.
 func (w *podFetcherImpl) syncKubeletPod(ctx context.Context) {
+	klog.Infof("sync kubelet pod")
 	kubeletPods, err := w.kubeletPodFetcher.GetPodList(ctx, nil)
 	_ = general.UpdateHealthzStateByError(podFetcherKubeletHealthCheckName, err)
 	if err != nil {
@@ -316,6 +331,13 @@ func (w *podFetcherImpl) syncKubeletPod(ctx context.Context) {
 				"source":  "kubelet",
 				"success": "true",
 			})...)
+	}
+
+	if klog.V(5).Enabled() {
+		klog.Infof("sync kubelet pod success")
+		for _, pod := range kubeletPods {
+			klog.InfoS("dump pod", "pod", pod.String())
+		}
 	}
 
 	kubeletPodsCache := make(map[string]*v1.Pod, len(kubeletPods))
