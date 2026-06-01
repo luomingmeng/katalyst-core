@@ -201,10 +201,15 @@ func (p *gpuReporterPlugin) Start() (err error) {
 		}
 
 		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
 			for {
 				select {
 				case <-watcherCh:
 					general.Infof("kubelet device plugin checkpoint changed, trigger report")
+					p.Trigger()
+				case <-ticker.C:
+					general.Infof("periodic ticker fired, trigger report")
 					p.Trigger()
 				case <-p.ctx.Done():
 					general.Infof("file watcher stopped for kubelet device plugin checkpoint")
@@ -600,6 +605,11 @@ func (p *gpuReporterPlugin) addKubeletCheckpointAllocations(idToAllocations map[
 				pod, err := p.metaServer.GetPod(context.WithValue(p.ctx, metaserverpod.BypassCacheKey, metaserverpod.BypassCacheTrue), entry.PodUID)
 				if err != nil {
 					general.Warningf("failed to get pod %s: %v", entry.PodUID, err)
+					continue
+				}
+
+				if !native.PodIsActive(pod) {
+					general.Warningf("pod %s is not active, skipping pod", pod.Name)
 					continue
 				}
 
