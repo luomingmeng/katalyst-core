@@ -28,6 +28,7 @@ import (
 	"github.com/pkg/errors"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager"
@@ -52,6 +53,7 @@ const (
 	gpuReporterPluginName      = "gpu-reporter-plugin"
 	propertyNameGPUTopology    = "gpu_topology_attribute_key"
 	defaultReportRetryInterval = 5 * time.Second
+	metricGetPodListFailed     = "qrm_gpu_reporter_get_pod_list_failed"
 )
 
 var zeroQuantity = *resource.NewQuantity(0, resource.DecimalSI)
@@ -573,8 +575,22 @@ func (p *gpuReporterPlugin) addKubeletCheckpointAllocations(idToAllocations map[
 	}
 
 	podDeviceEntries, _ := checkpointData.GetDataInLatestFormat()
+	if len(podDeviceEntries) == 0 {
+		return nil
+	}
 
 	validDeviceNames := sets.NewString(p.gpuDeviceNames...)
+
+	activePods, err := p.metaServer.GetPodList(context.WithValue(p.ctx, metaserverpod.BypassCacheKey, metaserverpod.BypassCacheTrue), native.PodIsActive)
+	if err != nil {
+		general.Warningf("failed to get active pod list: %v", err)
+		if p.emitter != nil {
+			_ = p.emitter.StoreInt64(metricGetPodListFailed, 1, metrics.MetricTypeNameRaw)
+		}
+	}
+	activePodMap := native.GetPodKeyMap(activePods, func(obj metav1.Object) string {
+		return string(obj.GetUID())
+	})
 
 	for _, entry := range podDeviceEntries {
 		// Check if the reported resource is a valid GPU device name.
@@ -584,6 +600,15 @@ func (p *gpuReporterPlugin) addKubeletCheckpointAllocations(idToAllocations map[
 		}
 
 		resourceName := v1.ResourceName(entry.ResourceName)
+
+		pod, ok := activePodMap[entry.PodUID]
+		if !ok {
+			general.Warningf("pod %s is not active or not found, skipping pod", entry.PodUID)
+			continue
+		}
+
+		// Generate consumer key using namespace, name and podUID
+		consumer := native.GenerateNamespaceNameUIDKey(pod.Namespace, pod.Name, entry.PodUID)
 
 		// Iterate through all devices per NUMA node
 		for numaNode, deviceIDs := range entry.DeviceIDs {
@@ -600,21 +625,6 @@ func (p *gpuReporterPlugin) addKubeletCheckpointAllocations(idToAllocations map[
 				// Create resource list - quantity is 1 since each device entry represents one device
 				gpuResourceList := make(v1.ResourceList)
 				gpuResourceList[resourceName] = *resource.NewQuantity(1, resource.DecimalSI)
-
-				// Find the pod from the metaserver to get its namespace and name
-				pod, err := p.metaServer.GetPod(context.WithValue(p.ctx, metaserverpod.BypassCacheKey, metaserverpod.BypassCacheTrue), entry.PodUID)
-				if err != nil {
-					general.Warningf("failed to get pod %s: %v", entry.PodUID, err)
-					continue
-				}
-
-				if !native.PodIsActive(pod) {
-					general.Warningf("pod %s is not active, skipping pod", pod.Name)
-					continue
-				}
-
-				// Generate consumer key using namespace, name and podUID
-				consumer := native.GenerateNamespaceNameUIDKey(pod.Namespace, pod.Name, entry.PodUID)
 
 				idToAllocations[deviceID] = append(idToAllocations[deviceID], &nodev1alpha1.Allocation{
 					Consumer: consumer,

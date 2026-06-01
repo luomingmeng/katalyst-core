@@ -2264,6 +2264,7 @@ func TestAddKubeletCheckpointAllocations(t *testing.T) {
 		{
 			name: "skip device not in gpuDeviceNames",
 			p: &gpuReporterPlugin{
+				ctx:            context.TODO(),
 				gpuDeviceNames: []string{"test-resource-other"},
 				checkpointManager: &mockCheckpointManager{
 					checkpointData: checkpoint.New([]checkpoint.PodDevicesEntry{
@@ -2277,6 +2278,13 @@ func TestAddKubeletCheckpointAllocations(t *testing.T) {
 							AllocResp: []byte(""),
 						},
 					}, make(map[string][]string)),
+				},
+				metaServer: &metaserver.MetaServer{
+					MetaAgent: &metaagent.MetaAgent{
+						PodFetcher: &pod.PodFetcherStub{
+							PodList: []*v1.Pod{},
+						},
+					},
 				},
 			},
 			expectedEmpty: true,
@@ -2319,14 +2327,8 @@ func TestAddKubeletCheckpointAllocations(t *testing.T) {
 					},
 				},
 			},
-			// the device id is recorded via initial map insertion before the
-			// active-check, but no allocation entry is appended for the
-			// inactive pod, so the slice is empty.
-			expectedEmpty:    false,
-			expectedErr:      false,
-			expectedID:       "test-device-1",
-			expectedLen:      0,
-			expectedConsumer: "",
+			expectedEmpty: true,
+			expectedErr:   false,
 		},
 		{
 			name: "skip pod that is not active (failed phase)",
@@ -2366,11 +2368,8 @@ func TestAddKubeletCheckpointAllocations(t *testing.T) {
 				},
 			},
 			// no allocation appended because pod is not active
-			expectedEmpty:    false,
-			expectedErr:      false,
-			expectedID:       "test-device-1",
-			expectedLen:      0,
-			expectedConsumer: "",
+			expectedEmpty: true,
+			expectedErr:   false,
 		},
 	}
 
