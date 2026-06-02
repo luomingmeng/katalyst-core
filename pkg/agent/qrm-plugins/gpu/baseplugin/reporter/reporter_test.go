@@ -2264,6 +2264,7 @@ func TestAddKubeletCheckpointAllocations(t *testing.T) {
 		{
 			name: "skip device not in gpuDeviceNames",
 			p: &gpuReporterPlugin{
+				ctx:            context.TODO(),
 				gpuDeviceNames: []string{"test-resource-other"},
 				checkpointManager: &mockCheckpointManager{
 					checkpointData: checkpoint.New([]checkpoint.PodDevicesEntry{
@@ -2278,7 +2279,95 @@ func TestAddKubeletCheckpointAllocations(t *testing.T) {
 						},
 					}, make(map[string][]string)),
 				},
+				metaServer: &metaserver.MetaServer{
+					MetaAgent: &metaagent.MetaAgent{
+						PodFetcher: &pod.PodFetcherStub{
+							PodList: []*v1.Pod{},
+						},
+					},
+				},
 			},
+			expectedEmpty: true,
+			expectedErr:   false,
+		},
+		{
+			name: "skip pod that is not active (succeeded phase)",
+			p: &gpuReporterPlugin{
+				ctx:            context.TODO(),
+				gpuDeviceNames: []string{"test-resource"},
+				checkpointManager: &mockCheckpointManager{
+					checkpointData: checkpoint.New([]checkpoint.PodDevicesEntry{
+						{
+							PodUID:        "test-pod-uid",
+							ContainerName: "test-container",
+							ResourceName:  "test-resource",
+							DeviceIDs: map[int64][]string{
+								0: {"test-device-1"},
+							},
+							AllocResp: []byte(""),
+						},
+					}, make(map[string][]string)),
+				},
+				metaServer: &metaserver.MetaServer{
+					MetaAgent: &metaagent.MetaAgent{
+						PodFetcher: &pod.PodFetcherStub{
+							PodList: []*v1.Pod{
+								{
+									ObjectMeta: metav1.ObjectMeta{
+										Name:      "test-pod",
+										Namespace: "default",
+										UID:       "test-pod-uid",
+									},
+									Status: v1.PodStatus{
+										Phase: v1.PodSucceeded,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedEmpty: true,
+			expectedErr:   false,
+		},
+		{
+			name: "skip pod that is not active (failed phase)",
+			p: &gpuReporterPlugin{
+				ctx:            context.TODO(),
+				gpuDeviceNames: []string{"test-resource"},
+				checkpointManager: &mockCheckpointManager{
+					checkpointData: checkpoint.New([]checkpoint.PodDevicesEntry{
+						{
+							PodUID:        "test-pod-uid",
+							ContainerName: "test-container",
+							ResourceName:  "test-resource",
+							DeviceIDs: map[int64][]string{
+								0: {"test-device-1"},
+							},
+							AllocResp: []byte(""),
+						},
+					}, make(map[string][]string)),
+				},
+				metaServer: &metaserver.MetaServer{
+					MetaAgent: &metaagent.MetaAgent{
+						PodFetcher: &pod.PodFetcherStub{
+							PodList: []*v1.Pod{
+								{
+									ObjectMeta: metav1.ObjectMeta{
+										Name:      "test-pod",
+										Namespace: "default",
+										UID:       "test-pod-uid",
+									},
+									Status: v1.PodStatus{
+										Phase: v1.PodFailed,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			// no allocation appended because pod is not active
 			expectedEmpty: true,
 			expectedErr:   false,
 		},
@@ -2304,7 +2393,9 @@ func TestAddKubeletCheckpointAllocations(t *testing.T) {
 				assert.NotEmpty(t, idToAllocations)
 				assert.Contains(t, idToAllocations, tt.expectedID)
 				assert.Len(t, idToAllocations[tt.expectedID], tt.expectedLen)
-				assert.Equal(t, tt.expectedConsumer, idToAllocations[tt.expectedID][0].Consumer)
+				if tt.expectedLen > 0 {
+					assert.Equal(t, tt.expectedConsumer, idToAllocations[tt.expectedID][0].Consumer)
+				}
 			}
 		})
 	}
