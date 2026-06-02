@@ -42,6 +42,9 @@ func TestSchedulerStrategy_Filter(t *testing.T) {
 			name: "nil ResourceReq",
 			ctx: &allocate.AllocationContext{
 				ResourceReq: nil,
+				DeviceReq: &pluginapi.DeviceRequest{
+					DeviceRequest: 1,
+				},
 				GPUQRMPluginConfig: &qrm.GPUQRMPluginConfig{
 					GPUSelectionResultAnnotationKey: "gpu-selection-result",
 				},
@@ -58,6 +61,9 @@ func TestSchedulerStrategy_Filter(t *testing.T) {
 						"gpu-selection-result": "gpu-0",
 					},
 				},
+				DeviceReq: &pluginapi.DeviceRequest{
+					DeviceRequest: 1,
+				},
 				GPUQRMPluginConfig: nil,
 				Emitter:            metrics.DummyMetrics{},
 			},
@@ -69,6 +75,9 @@ func TestSchedulerStrategy_Filter(t *testing.T) {
 			ctx: &allocate.AllocationContext{
 				ResourceReq: &pluginapi.ResourceRequest{
 					Annotations: map[string]string{},
+				},
+				DeviceReq: &pluginapi.DeviceRequest{
+					DeviceRequest: 1,
 				},
 				GPUQRMPluginConfig: &qrm.GPUQRMPluginConfig{
 					GPUSelectionResultAnnotationKey: "gpu-selection-result",
@@ -86,6 +95,9 @@ func TestSchedulerStrategy_Filter(t *testing.T) {
 						"gpu-selection-result": "",
 					},
 				},
+				DeviceReq: &pluginapi.DeviceRequest{
+					DeviceRequest: 1,
+				},
 				GPUQRMPluginConfig: &qrm.GPUQRMPluginConfig{
 					GPUSelectionResultAnnotationKey: "gpu-selection-result",
 				},
@@ -101,6 +113,9 @@ func TestSchedulerStrategy_Filter(t *testing.T) {
 					Annotations: map[string]string{
 						"gpu-selection-result": "gpu-0,gpu-2",
 					},
+				},
+				DeviceReq: &pluginapi.DeviceRequest{
+					DeviceRequest: 2,
 				},
 				GPUQRMPluginConfig: &qrm.GPUQRMPluginConfig{
 					GPUSelectionResultAnnotationKey: "gpu-selection-result",
@@ -118,6 +133,9 @@ func TestSchedulerStrategy_Filter(t *testing.T) {
 						"gpu-selection-result": "gpu-4,gpu-5",
 					},
 				},
+				DeviceReq: &pluginapi.DeviceRequest{
+					DeviceRequest: 2,
+				},
 				GPUQRMPluginConfig: &qrm.GPUQRMPluginConfig{
 					GPUSelectionResultAnnotationKey: "gpu-selection-result",
 				},
@@ -127,12 +145,34 @@ func TestSchedulerStrategy_Filter(t *testing.T) {
 			expectedFilteredDevices: []string{"gpu-0", "gpu-1"},
 		},
 		{
+			name: "intersection smaller than device request, should return all available",
+			ctx: &allocate.AllocationContext{
+				ResourceReq: &pluginapi.ResourceRequest{
+					Annotations: map[string]string{
+						"gpu-selection-result": "gpu-0,gpu-4",
+					},
+				},
+				DeviceReq: &pluginapi.DeviceRequest{
+					DeviceRequest: 2,
+				},
+				GPUQRMPluginConfig: &qrm.GPUQRMPluginConfig{
+					GPUSelectionResultAnnotationKey: "gpu-selection-result",
+				},
+				Emitter: metrics.DummyMetrics{},
+			},
+			availableDevices:        []string{"gpu-0", "gpu-1", "gpu-2"},
+			expectedFilteredDevices: []string{"gpu-0", "gpu-1", "gpu-2"},
+		},
+		{
 			name: "all requested devices available",
 			ctx: &allocate.AllocationContext{
 				ResourceReq: &pluginapi.ResourceRequest{
 					Annotations: map[string]string{
 						"gpu-selection-result": "gpu-1",
 					},
+				},
+				DeviceReq: &pluginapi.DeviceRequest{
+					DeviceRequest: 1,
 				},
 				GPUQRMPluginConfig: &qrm.GPUQRMPluginConfig{
 					GPUSelectionResultAnnotationKey: "gpu-selection-result",
@@ -141,6 +181,44 @@ func TestSchedulerStrategy_Filter(t *testing.T) {
 			},
 			availableDevices:        []string{"gpu-1"},
 			expectedFilteredDevices: []string{"gpu-1"},
+		},
+		{
+			name: "selection result contains leading and trailing whitespace",
+			ctx: &allocate.AllocationContext{
+				ResourceReq: &pluginapi.ResourceRequest{
+					Annotations: map[string]string{
+						"gpu-selection-result": "  gpu-0 , gpu-2  ",
+					},
+				},
+				DeviceReq: &pluginapi.DeviceRequest{
+					DeviceRequest: 2,
+				},
+				GPUQRMPluginConfig: &qrm.GPUQRMPluginConfig{
+					GPUSelectionResultAnnotationKey: "gpu-selection-result",
+				},
+				Emitter: metrics.DummyMetrics{},
+			},
+			availableDevices:        []string{"gpu-0", "gpu-1", "gpu-2", "gpu-3"},
+			expectedFilteredDevices: []string{"gpu-0", "gpu-2"},
+		},
+		{
+			name: "selection result has empty entries from extra commas and spaces",
+			ctx: &allocate.AllocationContext{
+				ResourceReq: &pluginapi.ResourceRequest{
+					Annotations: map[string]string{
+						"gpu-selection-result": " gpu-0 ,  , gpu-1 ,",
+					},
+				},
+				DeviceReq: &pluginapi.DeviceRequest{
+					DeviceRequest: 2,
+				},
+				GPUQRMPluginConfig: &qrm.GPUQRMPluginConfig{
+					GPUSelectionResultAnnotationKey: "gpu-selection-result",
+				},
+				Emitter: metrics.DummyMetrics{},
+			},
+			availableDevices:        []string{"gpu-0", "gpu-1", "gpu-2"},
+			expectedFilteredDevices: []string{"gpu-0", "gpu-1"},
 		},
 	}
 

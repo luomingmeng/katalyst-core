@@ -31,7 +31,7 @@ import (
 func (s *SchedulerStrategy) Filter(
 	ctx *allocate.AllocationContext, allAvailableDevices []string,
 ) ([]string, error) {
-	if ctx.ResourceReq == nil || ctx.GPUQRMPluginConfig == nil {
+	if ctx.ResourceReq == nil || ctx.GPUQRMPluginConfig == nil || ctx.DeviceReq == nil {
 		return allAvailableDevices, nil
 	}
 
@@ -43,12 +43,17 @@ func (s *SchedulerStrategy) Filter(
 		return allAvailableDevices, nil
 	}
 
-	selectedDevices := strings.Split(selectionResult, ",")
-	selectedSet := sets.NewString(selectedDevices...)
+	selectedSet := sets.NewString()
+	for _, deviceID := range strings.Split(selectionResult, ",") {
+		if deviceID = strings.TrimSpace(deviceID); deviceID != "" {
+			selectedSet.Insert(deviceID)
+		}
+	}
 	availableSet := sets.NewString(allAvailableDevices...)
 
 	intersection := availableSet.Intersection(selectedSet)
-	if intersection.Len() == 0 {
+	// Return all the available devices if the intersection is smaller than the device request.
+	if uint64(intersection.Len()) < ctx.DeviceReq.DeviceRequest {
 		_ = ctx.Emitter.StoreInt64("gpu_scheduler_selection_mismatch", 1, metrics.MetricTypeNameCount)
 		return allAvailableDevices, nil
 	}
