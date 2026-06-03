@@ -21,6 +21,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 
@@ -285,6 +286,79 @@ func TestGetMemoryTopologyAllocationsAnnotations(t *testing.T) {
 					t.Fatalf("unexpected topology allocation for resource %q. got=%v, want=%v", resourceName, ta, want)
 				}
 			}
+		})
+	}
+}
+
+func TestIsTopologyAllocationChanged(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name     string
+		oldInfo  *state.AllocationInfo
+		newInfo  *state.AllocationInfo
+		expected bool
+	}{
+		{
+			name:     "oldInfo is nil",
+			oldInfo:  nil,
+			newInfo:  &state.AllocationInfo{},
+			expected: true,
+		},
+		{
+			name:     "newInfo is nil",
+			oldInfo:  &state.AllocationInfo{},
+			newInfo:  nil,
+			expected: true,
+		},
+		{
+			name: "NumaAllocationResult changed",
+			oldInfo: &state.AllocationInfo{
+				NumaAllocationResult: machine.NewCPUSet(0),
+			},
+			newInfo: &state.AllocationInfo{
+				NumaAllocationResult: machine.NewCPUSet(1),
+			},
+			expected: true,
+		},
+		{
+			name: "AggregatedQuantity changed",
+			oldInfo: &state.AllocationInfo{
+				NumaAllocationResult: machine.NewCPUSet(0),
+				AggregatedQuantity:   1024,
+			},
+			newInfo: &state.AllocationInfo{
+				NumaAllocationResult: machine.NewCPUSet(0),
+				AggregatedQuantity:   2048,
+			},
+			expected: true,
+		},
+		{
+			name: "unchanged",
+			oldInfo: &state.AllocationInfo{
+				NumaAllocationResult: machine.NewCPUSet(0),
+				AggregatedQuantity:   1024,
+				TopologyAwareAllocations: map[int]uint64{
+					0: 1024,
+				},
+			},
+			newInfo: &state.AllocationInfo{
+				NumaAllocationResult: machine.NewCPUSet(0),
+				AggregatedQuantity:   1024,
+				TopologyAwareAllocations: map[int]uint64{
+					0: 1024,
+				},
+			},
+			expected: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			actual := IsTopologyAllocationChanged(tc.oldInfo, tc.newInfo)
+			assert.Equal(t, tc.expected, actual)
 		})
 	}
 }
