@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 
 	"github.com/kubewharf/katalyst-api/pkg/apis/node/v1alpha1"
+	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/memory/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	"github.com/kubewharf/katalyst-core/pkg/config"
@@ -203,15 +204,58 @@ func getReservedHugePagesMemory(conf *config.Configuration, metaServer *metaserv
 	return reservedMemory, nil
 }
 
-func applySidecarAllocationInfoFromMainContainer(sidecarAllocationInfo, mainAllocationInfo *state.AllocationInfo) bool {
+// applySidecarAllocationInfoFromMainContainer syncs the NUMA binding result and a small
+// set of sync-required annotations from the main container to the sidecar. It returns
+// true if any field was modified.
+//
+// Annotation handling strategy:
+//   - Whitelisted keys (aggregated requests / inplace update resize policy /
+//     numa-bind-result / topology-allocation): force-override with the value from main;
+//     when a key is absent on main it is also deleted from the sidecar, so that no stale
+//     annotation can mislead downstream consumers.
+//   - Non-whitelisted keys: keep the historical "fill-missing" semantics so that
+//     sidecar-owned annotations are not clobbered.
+func (p *DynamicPolicy) applySidecarAllocationInfoFromMainContainer(sidecarAllocationInfo, mainAllocationInfo *state.AllocationInfo) bool {
 	changed := false
 	if !sidecarAllocationInfo.NumaAllocationResult.Equals(mainAllocationInfo.NumaAllocationResult) {
 		sidecarAllocationInfo.NumaAllocationResult = mainAllocationInfo.NumaAllocationResult.Clone()
 		changed = true
 	}
 
-	// Copy missing annotations from main container
+	mainSidecarSyncKeys := map[string]struct{}{
+		apiconsts.PodAnnotationAggregatedRequestsKey:        {},
+		apiconsts.PodAnnotationInplaceUpdateResizePolicyKey: {},
+	}
+	if p.numaBindResultResourceAllocationAnnotationKey != "" {
+		mainSidecarSyncKeys[p.numaBindResultResourceAllocationAnnotationKey] = struct{}{}
+	}
+	if p.topologyAllocationAnnotationKey != "" {
+		mainSidecarSyncKeys[p.topologyAllocationAnnotationKey] = struct{}{}
+	}
+
+	if sidecarAllocationInfo.Annotations == nil {
+		sidecarAllocationInfo.Annotations = make(map[string]string)
+	}
+
+	// 1) whitelisted keys: enforce strict equality with main.
+	for key := range mainSidecarSyncKeys {
+		mainVal, mainHas := mainAllocationInfo.Annotations[key]
+		sideVal, sideHas := sidecarAllocationInfo.Annotations[key]
+		switch {
+		case mainHas && (!sideHas || sideVal != mainVal):
+			sidecarAllocationInfo.Annotations[key] = mainVal
+			changed = true
+		case !mainHas && sideHas:
+			delete(sidecarAllocationInfo.Annotations, key)
+			changed = true
+		}
+	}
+
+	// 2) non-whitelisted keys: keep fill-missing semantics.
 	for key, value := range mainAllocationInfo.Annotations {
+		if _, isWhitelisted := mainSidecarSyncKeys[key]; isWhitelisted {
+			continue
+		}
 		if _, ok := sidecarAllocationInfo.Annotations[key]; !ok {
 			sidecarAllocationInfo.Annotations[key] = value
 			changed = true

@@ -767,7 +767,7 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 				}
 
 				if allocationInfo.CheckSideCar() && mainContainerAllocationInfo != nil {
-					if applySidecarAllocationInfoFromMainContainer(allocationInfo, mainContainerAllocationInfo) {
+					if p.applySidecarAllocationInfoFromMainContainer(allocationInfo, mainContainerAllocationInfo) {
 						general.Infof("pod: %s/%s sidecar container: %s update its allocation",
 							allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName)
 						if hookErr := p.updateAllocationInfo(resourceName, podUID, containerName, nil, allocationInfo, true); hookErr != nil {

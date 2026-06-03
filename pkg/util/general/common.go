@@ -519,7 +519,11 @@ func ConvertLinuxListToString(numbers []int64) string {
 }
 
 // ParseSelector returns a labels.Selector from the given string.
-// If the string is empty, it returns labels.Nothing() and nil error.
+//
+// Note: an empty string is treated as "match nothing" (returns labels.Nothing()),
+// not "match everything". Any caller that exposes this selector through a flag
+// must document this semantic explicitly so that operators do not assume the
+// opposite default.
 func ParseSelector(selectorStr string) (labels.Selector, error) {
 	if selectorStr == "" {
 		return labels.Nothing(), nil
@@ -527,6 +531,12 @@ func ParseSelector(selectorStr string) (labels.Selector, error) {
 	return labels.Parse(selectorStr)
 }
 
+// MergeAnnotations merges multiple annotation maps into a single map.
+//
+// Override semantics: when multiple maps contain the same key, later maps override
+// earlier ones (right-most wins). Empty/nil inputs are skipped; if all inputs are
+// empty, nil is returned to preserve compatibility with callers that distinguish
+// nil from an empty map.
 func MergeAnnotations(annotations ...map[string]string) map[string]string {
 	// For compatibility, no annotations returns nil map
 	if len(annotations) == 0 {
