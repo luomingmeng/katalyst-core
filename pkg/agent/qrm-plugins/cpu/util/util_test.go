@@ -23,6 +23,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 	"k8s.io/utils/ptr"
 
@@ -1030,6 +1031,110 @@ func TestIsSoleSharedCoresPod(t *testing.T) {
 
 			actual := IsSoleSharedCoresPod(tt.conf, tt.podList, dynamicConfig)
 			assert.Equal(t, tt.expected, actual)
+		})
+	}
+}
+
+func TestGetAggResourcePackagePinnedCPUSet(t *testing.T) {
+	t.Parallel()
+
+	type args struct {
+		attributeSelector labels.Selector
+		machineState      state.NUMANodeMap
+	}
+	tests := []struct {
+		name string
+		args args
+		want machine.CPUSet
+	}{
+		{
+			name: "empty resource package map",
+			args: args{
+				attributeSelector: labels.Everything(),
+				machineState:      state.NUMANodeMap{},
+			},
+			want: machine.NewCPUSet(),
+		},
+		{
+			name: "resource package matches selector",
+			args: args{
+				attributeSelector: labels.SelectorFromSet(labels.Set{"key1": "value1"}),
+				machineState: state.NUMANodeMap{
+					0: {
+						ResourcePackageStates: map[string]*state.ResourcePackageState{
+							"pkg1": {
+								Attributes:   map[string]string{"key1": "value1"},
+								PinnedCPUSet: machine.NewCPUSet(1, 2),
+							},
+						},
+					},
+				},
+			},
+			want: machine.NewCPUSet(1, 2),
+		},
+		{
+			name: "resource package does not match selector",
+			args: args{
+				attributeSelector: labels.SelectorFromSet(labels.Set{"key1": "value2"}),
+				machineState: state.NUMANodeMap{
+					0: {
+						ResourcePackageStates: map[string]*state.ResourcePackageState{
+							"pkg1": {
+								Attributes:   map[string]string{"key1": "value1"},
+								PinnedCPUSet: machine.NewCPUSet(1, 2),
+							},
+						},
+					},
+				},
+			},
+			want: machine.NewCPUSet(),
+		},
+		{
+			name: "missing machine state",
+			args: args{
+				attributeSelector: labels.SelectorFromSet(labels.Set{"key1": "value1"}),
+				machineState:      state.NUMANodeMap{},
+			},
+			want: machine.NewCPUSet(),
+		},
+		{
+			name: "multiple numa nodes and packages",
+			args: args{
+				attributeSelector: labels.SelectorFromSet(labels.Set{"type": "A"}),
+				machineState: state.NUMANodeMap{
+					0: {
+						ResourcePackageStates: map[string]*state.ResourcePackageState{
+							"pkg1": {
+								Attributes:   map[string]string{"type": "A"},
+								PinnedCPUSet: machine.NewCPUSet(0, 1),
+							},
+						},
+					},
+					1: {
+						ResourcePackageStates: map[string]*state.ResourcePackageState{
+							"pkg2": {
+								Attributes:   map[string]string{"type": "A"},
+								PinnedCPUSet: machine.NewCPUSet(2, 3),
+							},
+							"pkg3": {
+								Attributes:   map[string]string{"type": "B"},
+								PinnedCPUSet: machine.NewCPUSet(4, 5),
+							},
+						},
+					},
+				},
+			},
+			want: machine.NewCPUSet(0, 1, 2, 3),
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := GetAggResourcePackagePinnedCPUSet(tt.args.attributeSelector, tt.args.machineState)
+			if !got.Equals(tt.want) {
+				t.Errorf("GetAggResourcePackagePinnedCPUSet() = %v, want %v", got, tt.want)
+			}
 		})
 	}
 }
