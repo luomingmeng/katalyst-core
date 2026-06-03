@@ -435,24 +435,34 @@ func GetPodAggregatedRequestResourceMap(req *pluginapi.ResourceRequest) (map[v1.
 	return intQuantities, floatQuantities, nil
 }
 
-// GetPodAggregatedRequestResource returns both integer and float64 quantities for the main resource in the pod request.
-// If the pod has aggregated resource annotations, those values are used; otherwise, it falls back to the original
-// request quantities. Returns an error if any calculation fails.
-func GetPodAggregatedRequestResource(req *pluginapi.ResourceRequest) (int, float64, error) {
-	annotations := req.Annotations
+// GetPodAggregatedRequestResourceByAnnotations returns both integer and float64 quantities for the main resource based on annotations.
+// If the annotations contain aggregated resource keys, those values are used; otherwise, it falls back to the fallback function.
+// Returns an error if any calculation fails.
+func GetPodAggregatedRequestResourceByAnnotations(annotations map[string]string, resourceName v1.ResourceName, fallback func() (int, float64, error)) (int, float64, error) {
 	if annotations == nil {
-		return GetQuantityFromResourceReq(req)
+		return fallback()
 	}
 	value, ok := annotations[apiconsts.PodAnnotationAggregatedRequestsKey]
 	if !ok {
-		return GetQuantityFromResourceReq(req)
+		return fallback()
 	}
 	var resourceList v1.ResourceList
 	if err := json.Unmarshal([]byte(value), &resourceList); err != nil {
-		return GetQuantityFromResourceReq(req)
+		return fallback()
 	}
 
-	return calculateAggregatedResource(v1.ResourceName(req.ResourceName), resourceList)
+	if _, ok = resourceList[resourceName]; !ok {
+		return fallback()
+	}
+
+	return calculateAggregatedResource(resourceName, resourceList)
+}
+
+// GetPodAggregatedRequestResource returns both integer and float64 quantities for the main resource in the pod request.
+func GetPodAggregatedRequestResource(req *pluginapi.ResourceRequest) (int, float64, error) {
+	return GetPodAggregatedRequestResourceByAnnotations(req.Annotations, v1.ResourceName(req.ResourceName), func() (int, float64, error) {
+		return GetQuantityFromResourceReq(req)
+	})
 }
 
 func calculateAggregatedResource(resourceName v1.ResourceName, resourceList v1.ResourceList) (int, float64, error) {

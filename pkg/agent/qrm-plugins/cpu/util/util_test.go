@@ -32,6 +32,7 @@ import (
 	"github.com/kubewharf/katalyst-api/pkg/apis/node/v1alpha1"
 	"github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	"github.com/kubewharf/katalyst-core/pkg/config"
@@ -840,7 +841,6 @@ func TestGetCPUTopologyAllocationsAnnotations(t *testing.T) {
 	tests := []struct {
 		name         string
 		ai           *state.AllocationInfo
-		req          *pluginapi.ResourceRequest
 		wantNilAnno  bool
 		wantErr      bool
 		wantTopology v1alpha1.TopologyAllocation
@@ -848,7 +848,6 @@ func TestGetCPUTopologyAllocationsAnnotations(t *testing.T) {
 		{
 			name:        "nil allocation info returns nil",
 			ai:          nil,
-			req:         nil,
 			wantNilAnno: true,
 		},
 		{
@@ -858,12 +857,7 @@ func TestGetCPUTopologyAllocationsAnnotations(t *testing.T) {
 					ContainerType: pluginapi.ContainerType_MAIN.String(),
 				},
 				TopologyAwareAssignments: map[int]machine.CPUSet{},
-			},
-			req: &pluginapi.ResourceRequest{
-				ResourceName: string(v1.ResourceCPU),
-				ResourceRequests: map[string]float64{
-					string(v1.ResourceCPU): 2,
-				},
+				RequestQuantity:          2,
 			},
 			wantTopology: v1alpha1.TopologyAllocation{
 				v1alpha1.TopologyTypeNuma: map[string]v1alpha1.ZoneAllocation{},
@@ -879,12 +873,7 @@ func TestGetCPUTopologyAllocationsAnnotations(t *testing.T) {
 					0: machine.NewCPUSet(0, 1),
 					2: machine.NewCPUSet(4),
 				},
-			},
-			req: &pluginapi.ResourceRequest{
-				ResourceName: string(v1.ResourceCPU),
-				ResourceRequests: map[string]float64{
-					string(v1.ResourceCPU): 2,
-				},
+				RequestQuantity: 2,
 			},
 			wantTopology: v1alpha1.TopologyAllocation{
 				v1alpha1.TopologyTypeNuma: map[string]v1alpha1.ZoneAllocation{
@@ -917,12 +906,7 @@ func TestGetCPUTopologyAllocationsAnnotations(t *testing.T) {
 					0: machine.NewCPUSet(0, 1),       // size 2 => "2"
 					1: machine.NewCPUSet(3, 5, 6, 7), // size 4 => "4"
 				},
-			},
-			req: &pluginapi.ResourceRequest{
-				ResourceName: string(v1.ResourceCPU),
-				ResourceRequests: map[string]float64{
-					string(v1.ResourceCPU): 4,
-				},
+				RequestQuantity: 4,
 			},
 			wantTopology: v1alpha1.TopologyAllocation{
 				v1alpha1.TopologyTypeNuma: map[string]v1alpha1.ZoneAllocation{
@@ -958,12 +942,7 @@ func TestGetCPUTopologyAllocationsAnnotations(t *testing.T) {
 				TopologyAwareAssignments: map[int]machine.CPUSet{
 					0: machine.NewCPUSet(0, 1, 2),
 				},
-			},
-			req: &pluginapi.ResourceRequest{
-				ResourceName: string(v1.ResourceCPU),
-				ResourceRequests: map[string]float64{
-					string(v1.ResourceCPU): 2,
-				},
+				RequestQuantity: 2,
 			},
 			wantTopology: v1alpha1.TopologyAllocation{
 				v1alpha1.TopologyTypeNuma: map[string]v1alpha1.ZoneAllocation{
@@ -988,12 +967,7 @@ func TestGetCPUTopologyAllocationsAnnotations(t *testing.T) {
 				TopologyAwareAssignments: map[int]machine.CPUSet{
 					0: machine.NewCPUSet(0, 1, 2),
 				},
-			},
-			req: &pluginapi.ResourceRequest{
-				ResourceName: string(v1.ResourceCPU),
-				ResourceRequests: map[string]float64{
-					string(v1.ResourceCPU): 0.5,
-				},
+				RequestQuantity: 0.5,
 			},
 			wantTopology: v1alpha1.TopologyAllocation{
 				v1alpha1.TopologyTypeNuma: map[string]v1alpha1.ZoneAllocation{
@@ -1018,12 +992,7 @@ func TestGetCPUTopologyAllocationsAnnotations(t *testing.T) {
 				TopologyAwareAssignments: map[int]machine.CPUSet{
 					0: machine.NewCPUSet(0, 1, 2),
 				},
-			},
-			req: &pluginapi.ResourceRequest{
-				ResourceName: string(v1.ResourceCPU),
-				ResourceRequests: map[string]float64{
-					string(v1.ResourceCPU): 0.125,
-				},
+				RequestQuantity: 0.125,
 			},
 			wantTopology: v1alpha1.TopologyAllocation{
 				v1alpha1.TopologyTypeNuma: map[string]v1alpha1.ZoneAllocation{
@@ -1043,17 +1012,13 @@ func TestGetCPUTopologyAllocationsAnnotations(t *testing.T) {
 					QoSLevel:      consts.PodAnnotationQoSLevelReclaimedCores,
 					Annotations: map[string]string{
 						consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+						cpuconsts.CPUStateAnnotationKeyNUMAHint:          "1",
 					},
 				},
 				TopologyAwareAssignments: map[int]machine.CPUSet{
 					1: machine.NewCPUSet(4, 5),
 				},
-			},
-			req: &pluginapi.ResourceRequest{
-				ResourceName: string(v1.ResourceCPU),
-				ResourceRequests: map[string]float64{
-					string(v1.ResourceCPU): 1.75,
-				},
+				RequestQuantity: 1.75,
 			},
 			wantTopology: v1alpha1.TopologyAllocation{
 				v1alpha1.TopologyTypeNuma: map[string]v1alpha1.ZoneAllocation{
@@ -1076,12 +1041,7 @@ func TestGetCPUTopologyAllocationsAnnotations(t *testing.T) {
 					0: machine.NewCPUSet(0, 1),
 					1: machine.NewCPUSet(8, 9, 10),
 				},
-			},
-			req: &pluginapi.ResourceRequest{
-				ResourceName: string(v1.ResourceCPU),
-				ResourceRequests: map[string]float64{
-					string(v1.ResourceCPU): 5,
-				},
+				RequestQuantity: 5,
 			},
 			wantTopology: v1alpha1.TopologyAllocation{
 				v1alpha1.TopologyTypeNuma: map[string]v1alpha1.ZoneAllocation{
@@ -1118,12 +1078,7 @@ func TestGetCPUTopologyAllocationsAnnotations(t *testing.T) {
 					0: machine.NewCPUSet(0),
 					1: machine.NewCPUSet(1),
 				},
-			},
-			req: &pluginapi.ResourceRequest{
-				ResourceName: string(v1.ResourceCPU),
-				ResourceRequests: map[string]float64{
-					string(v1.ResourceCPU): 2,
-				},
+				RequestQuantity: 2,
 			},
 			wantErr: true,
 		},
@@ -1133,7 +1088,7 @@ func TestGetCPUTopologyAllocationsAnnotations(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := GetCPUTopologyAllocationsAnnotations(tt.ai, coreconsts.QRMPodAnnotationTopologyAllocationKey, tt.req)
+			got, err := GetCPUTopologyAllocationsAnnotations(tt.ai, coreconsts.QRMPodAnnotationTopologyAllocationKey)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("expected error, got nil")
@@ -1482,6 +1437,191 @@ func TestGetAggResourcePackagePinnedCPUSet(t *testing.T) {
 			got := GetAggResourcePackagePinnedCPUSet(tt.args.attributeSelector, tt.args.machineState)
 			if !got.Equals(tt.want) {
 				t.Errorf("GetAggResourcePackagePinnedCPUSet() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsTopologyAllocationChanged(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		oldInfo  *state.AllocationInfo
+		newInfo  *state.AllocationInfo
+		expected bool
+	}{
+		{
+			name:     "old is nil",
+			oldInfo:  nil,
+			newInfo:  &state.AllocationInfo{},
+			expected: true,
+		},
+		{
+			name:     "new is nil",
+			oldInfo:  &state.AllocationInfo{},
+			newInfo:  nil,
+			expected: true,
+		},
+		{
+			name: "allocation result changed",
+			oldInfo: &state.AllocationInfo{
+				AllocationResult: machine.NewCPUSet(0, 1),
+			},
+			newInfo: &state.AllocationInfo{
+				AllocationResult: machine.NewCPUSet(0, 2),
+			},
+			expected: true,
+		},
+		{
+			name: "request quantity changed",
+			oldInfo: &state.AllocationInfo{
+				AllocationResult: machine.NewCPUSet(0, 1),
+				RequestQuantity:  2.0,
+			},
+			newInfo: &state.AllocationInfo{
+				AllocationResult: machine.NewCPUSet(0, 1),
+				RequestQuantity:  3.0,
+			},
+			expected: true,
+		},
+		{
+			name: "topology aware assignments changed",
+			oldInfo: &state.AllocationInfo{
+				AllocationResult: machine.NewCPUSet(0, 1),
+				RequestQuantity:  2.0,
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: machine.NewCPUSet(0),
+					1: machine.NewCPUSet(1),
+				},
+			},
+			newInfo: &state.AllocationInfo{
+				AllocationResult: machine.NewCPUSet(0, 1),
+				RequestQuantity:  2.0,
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: machine.NewCPUSet(0, 1),
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "no change",
+			oldInfo: &state.AllocationInfo{
+				AllocationResult: machine.NewCPUSet(0, 1),
+				RequestQuantity:  2.0,
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: machine.NewCPUSet(0),
+					1: machine.NewCPUSet(1),
+				},
+			},
+			newInfo: &state.AllocationInfo{
+				AllocationResult: machine.NewCPUSet(0, 1),
+				RequestQuantity:  2.0,
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: machine.NewCPUSet(0),
+					1: machine.NewCPUSet(1),
+				},
+			},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := IsTopologyAllocationChanged(tt.oldInfo, tt.newInfo)
+			assert.Equal(t, tt.expected, got)
+		})
+	}
+}
+
+func TestGetPodAggregatedRequestResourceFromAllocationInfo(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		ai           *state.AllocationInfo
+		resourceName v1.ResourceName
+		wantInt      int
+		wantFloat    float64
+		wantErr      bool
+	}{
+		{
+			name:    "nil allocation info returns error",
+			ai:      nil,
+			wantErr: true,
+		},
+		{
+			name: "fallback to request quantity",
+			ai: &state.AllocationInfo{
+				RequestQuantity: 2.5,
+			},
+			resourceName: v1.ResourceCPU,
+			wantInt:      3,
+			wantFloat:    2.5,
+			wantErr:      false,
+		},
+		{
+			name: "use aggregated request from annotations",
+			ai: &state.AllocationInfo{
+				RequestQuantity: 2.5,
+				AllocationMeta: commonstate.AllocationMeta{
+					Annotations: map[string]string{
+						consts.PodAnnotationAggregatedRequestsKey: `{"cpu":"4"}`,
+					},
+				},
+			},
+			resourceName: v1.ResourceCPU,
+			wantInt:      4,
+			wantFloat:    4,
+			wantErr:      false,
+		},
+		{
+			name: "aggregated request from annotations with milli-cpu",
+			ai: &state.AllocationInfo{
+				RequestQuantity: 2.5,
+				AllocationMeta: commonstate.AllocationMeta{
+					Annotations: map[string]string{
+						consts.PodAnnotationAggregatedRequestsKey: `{"cpu":"500m"}`,
+					},
+				},
+			},
+			resourceName: v1.ResourceCPU,
+			wantInt:      1,
+			wantFloat:    0.5,
+			wantErr:      false,
+		},
+		{
+			name: "fallback when resource not in aggregated requests",
+			ai: &state.AllocationInfo{
+				RequestQuantity: 2.5,
+				AllocationMeta: commonstate.AllocationMeta{
+					Annotations: map[string]string{
+						consts.PodAnnotationAggregatedRequestsKey: `{"memory":"1Gi"}`,
+					},
+				},
+			},
+			resourceName: v1.ResourceCPU,
+			wantInt:      3,
+			wantFloat:    2.5,
+			wantErr:      false,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			gotInt, gotFloat, err := GetPodAggregatedRequestResourceFromAllocationInfo(tt.ai, tt.resourceName)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("GetPodAggregatedRequestResourceFromAllocationInfo() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr {
+				assert.Equal(t, tt.wantInt, gotInt)
+				assert.Equal(t, tt.wantFloat, gotFloat)
 			}
 		})
 	}

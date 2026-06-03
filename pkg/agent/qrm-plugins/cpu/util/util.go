@@ -164,7 +164,9 @@ func RegenerateHints(allocationInfo *state.AllocationInfo, regenerate bool) map[
 	return hints
 }
 
-// PackAllocationResponse fills pluginapi.ResourceAllocationResponse with information from AllocationInfo and pluginapi.ResourceRequest
+// PackAllocationResponse assembles a ResourceAllocationResponse for the CPU plugin.
+// It populates the response with pod/container metadata and resource allocation results,
+// and directly applies the provided resourceAllocationAnnotations to the response.
 func PackAllocationResponse(allocationInfo *state.AllocationInfo, resourceName, ociPropertyName string,
 	isNodeResource, isScalarResource bool, req *pluginapi.ResourceRequest, resourceAllocationAnnotations ...map[string]string,
 ) (*pluginapi.ResourceAllocationResponse, error) {
@@ -213,16 +215,38 @@ func PackAllocationResponse(allocationInfo *state.AllocationInfo, resourceName, 
 	}, nil
 }
 
+// IsTopologyAllocationChanged checks if the topology allocation of a container has changed.
+func IsTopologyAllocationChanged(oldInfo, newInfo *state.AllocationInfo) bool {
+	// If this is a newly allocated container (oldInfo is nil), or we somehow lost newInfo, re-injection is needed.
+	if oldInfo == nil || newInfo == nil {
+		return true
+	}
+
+	// Check if any physical CPU allocation results, quantities, or NUMA-aware topology assignments have changed.
+	// These directly impact the topology info and NUMA node annotations we generate for UCE pods.
+	if !oldInfo.AllocationResult.Equals(newInfo.AllocationResult) ||
+		oldInfo.RequestQuantity != newInfo.RequestQuantity ||
+		!state.CheckAllocationInfoTopologyAwareAssignments(oldInfo, newInfo) {
+		return true
+	}
+	return false
+}
+
 // GetCPUTopologyAllocationsAnnotations returns the topology-aware CPU allocation annotations for a given container.
 // It handles different QoS levels:
 // - For DedicatedCores: uses the actual assigned CPUSet size on each NUMA node.
 // - For SharedCores/ReclaimedCores with NUMA binding: uses the pod's aggregated request quantity.
 // This function only processes main containers and returns nil for sidecars or invalid allocation info.
 func GetCPUTopologyAllocationsAnnotations(allocationInfo *state.AllocationInfo,
-	topologyAllocationAnnotationKey string, req *pluginapi.ResourceRequest,
+	topologyAllocationAnnotationKey string,
 ) (map[string]string, error) {
 	// Skip processing if allocation info is invalid or it's not the main container.
 	if allocationInfo == nil || !allocationInfo.CheckMainContainer() {
+		return nil, nil
+	}
+
+	// Skip processing if reclaimed cores but non-actual NUMA binding.
+	if allocationInfo.CheckReclaimedNonActualNUMABinding() {
 		return nil, nil
 	}
 
@@ -239,7 +263,7 @@ func GetCPUTopologyAllocationsAnnotations(allocationInfo *state.AllocationInfo,
 		}
 
 		// Use the aggregated pod request quantity for shared/reclaimed cores to represent the logical allocation.
-		_, reqFloat64, err := util.GetPodAggregatedRequestResource(req)
+		_, reqFloat64, err := GetPodAggregatedRequestResourceFromAllocationInfo(allocationInfo, v1.ResourceCPU)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get aggregated request resource: %v", err)
 		}
@@ -272,6 +296,19 @@ func GetCPUTopologyAllocationsAnnotations(allocationInfo *state.AllocationInfo,
 		topologyAllocation,
 		topologyAllocationAnnotationKey,
 	), nil
+}
+
+// GetPodAggregatedRequestResourceFromAllocationInfo returns both integer and float64 quantities for the main resource based on allocationInfo.
+// If the allocationInfo.Annotations contain aggregated resource keys, those values are used;
+// otherwise, it falls back to use quantities in allocationInfo.
+func GetPodAggregatedRequestResourceFromAllocationInfo(allocationInfo *state.AllocationInfo, resourceName v1.ResourceName) (int, float64, error) {
+	if allocationInfo == nil {
+		return 0, 0, fmt.Errorf("GetPodAggregatedRequestResourceFromAllocationInfo got nil allocationInfo")
+	}
+
+	return util.GetPodAggregatedRequestResourceByAnnotations(allocationInfo.Annotations, resourceName, func() (int, float64, error) {
+		return int(math.Ceil(allocationInfo.RequestQuantity)), allocationInfo.RequestQuantity, nil
+	})
 }
 
 // buildZoneAllocation creates a ZoneAllocation for a specific NUMA node.
