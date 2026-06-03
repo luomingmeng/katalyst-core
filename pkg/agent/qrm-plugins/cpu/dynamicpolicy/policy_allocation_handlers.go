@@ -323,7 +323,17 @@ func (p *DynamicPolicy) reclaimedCoresAllocationHandler(ctx context.Context,
 		p.state.SetMachineState(updatedMachineState, persistCheckpoint)
 	}
 
-	resp, err := cpuutil.PackAllocationResponse(allocationInfo, string(v1.ResourceCPU), util.OCIPropertyNameCPUSetCPUs, false, true, req)
+	// Get topology allocation for numa binding reclaimed cores
+	var topologyAllocationAnnotations map[string]string
+	if allocationInfo.CheckReclaimedActualNUMABinding() {
+		var err error
+		topologyAllocationAnnotations, err = cpuutil.GetCPUTopologyAllocationsAnnotations(allocationInfo, p.conf.TopologyAllocationAnnotationKey, req)
+		if err != nil {
+			return nil, fmt.Errorf("GetCPUTopologyAllocationsAnnotations failed with error: %v", err)
+		}
+	}
+
+	resp, err := cpuutil.PackAllocationResponse(allocationInfo, string(v1.ResourceCPU), util.OCIPropertyNameCPUSetCPUs, false, true, req, topologyAllocationAnnotations)
 	if err != nil {
 		general.Errorf("pod: %s/%s, container: %s packAllocationResponse failed with error: %v",
 			req.PodNamespace, req.PodName, req.ContainerName, err)
@@ -495,7 +505,13 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 		return nil, fmt.Errorf("adjustAllocationEntries failed with error: %v", err)
 	}
 
-	resp, err := cpuutil.PackAllocationResponse(allocationInfo, string(v1.ResourceCPU), util.OCIPropertyNameCPUSetCPUs, false, true, req)
+	topologyAllocationAnnotations, err := cpuutil.GetCPUTopologyAllocationsAnnotations(allocationInfo, p.conf.TopologyAllocationAnnotationKey, req)
+	if err != nil {
+		return nil, fmt.Errorf("GetCPUTopologyAllocationsAnnotations failed with error: %v", err)
+	}
+
+	resp, err := cpuutil.PackAllocationResponse(allocationInfo, string(v1.ResourceCPU),
+		util.OCIPropertyNameCPUSetCPUs, false, true, req, topologyAllocationAnnotations)
 	if err != nil {
 		general.Errorf("pod: %s/%s, container: %s PackResourceAllocationResponseByAllocationInfo failed with error: %v",
 			req.PodNamespace, req.PodName, req.ContainerName, err)
@@ -591,8 +607,13 @@ func (p *DynamicPolicy) sharedCoresWithNUMABindingAllocationHandler(ctx context.
 
 	// there is no need to call SetPodEntries and SetMachineState,
 	// since they are already done in doAndCheckPutAllocationInfo of allocateSharedNumaBindingCPUs
+	topologyAllocationAnnotations, err := cpuutil.GetCPUTopologyAllocationsAnnotations(allocationInfo, p.conf.TopologyAllocationAnnotationKey, req)
+	if err != nil {
+		return nil, fmt.Errorf("GetCPUTopologyAllocationsAnnotations failed with error: %v", err)
+	}
 
-	resp, err := cpuutil.PackAllocationResponse(allocationInfo, string(v1.ResourceCPU), util.OCIPropertyNameCPUSetCPUs, false, true, req)
+	resp, err := cpuutil.PackAllocationResponse(allocationInfo,
+		string(v1.ResourceCPU), util.OCIPropertyNameCPUSetCPUs, false, true, req, topologyAllocationAnnotations)
 	if err != nil {
 		general.Errorf("pod: %s/%s, container: %s PackResourceAllocationResponseByAllocationInfo failed with error: %v",
 			req.PodNamespace, req.PodName, req.ContainerName, err)
@@ -641,29 +662,28 @@ func (p *DynamicPolicy) allocateNumaBindingCPUs(numCPUs int, hint *pluginapi.Top
 
 	result := machine.NewCPUSet()
 	alignedAvailableCPUs := machine.CPUSet{}
-	availableCPUsPerNUMA := make(map[uint64]machine.CPUSet)
+	alignedAvailableCPUsPerNUMA := make(map[uint64]machine.CPUSet)
 	hintNodes := hint.Nodes
+	pkgName := rputil.GetResourcePackageName(reqAnnotations)
+	numaRPPinnedCPUSet := machineState.GetNUMAResourcePackagePinnedCPUSet()
+
 	for _, numaNode := range hintNodes {
 		availableCPUs := machineState[int(numaNode)].GetAvailableCPUSet(p.reservedCPUs)
-		availableCPUsPerNUMA[numaNode] = availableCPUs
-		alignedAvailableCPUs = alignedAvailableCPUs.Union(availableCPUs)
-	}
 
-	// if the resource package is specified and the resource package is pinned,
-	// then only the pinned CPUs are available for allocation
-	// pkgName represents the name of the resource package requested by the container
-	pkgName := rputil.GetResourcePackageName(reqAnnotations)
-	if pkgName != "" {
-		rpPinnedCPUSet := machineState.GetResourcePackagePinnedCPUSet()
-		if !rpPinnedCPUSet[pkgName].IsEmpty() {
-			// If the package has pinned CPUs, restrict allocation to those CPUs
-			alignedAvailableCPUs = alignedAvailableCPUs.Intersection(rpPinnedCPUSet[pkgName])
-		} else if len(rpPinnedCPUSet) > 0 {
-			// If the package is not pinned but other packages are, exclude pinned CPUs of other packages
-			for _, pinnedCPUs := range rpPinnedCPUSet {
-				alignedAvailableCPUs = alignedAvailableCPUs.Difference(pinnedCPUs)
+		// Filter available CPUs based on Resource Package (RP) pinning rules:
+		// 1. If the current RP has pinned CPUs, restrict allocation strictly to those CPUs.
+		// 2. Otherwise (no RP specified or RP has no pinned CPUs), exclude all CPUs pinned by other RPs.
+		pinnedCPUSetsInNUMA := numaRPPinnedCPUSet[int(numaNode)]
+		if pkgName != "" && !pinnedCPUSetsInNUMA[pkgName].IsEmpty() {
+			availableCPUs = availableCPUs.Intersection(pinnedCPUSetsInNUMA[pkgName])
+		} else if len(pinnedCPUSetsInNUMA) > 0 {
+			for _, pinnedCPUs := range pinnedCPUSetsInNUMA {
+				availableCPUs = availableCPUs.Difference(pinnedCPUs)
 			}
 		}
+
+		alignedAvailableCPUsPerNUMA[numaNode] = availableCPUs
+		alignedAvailableCPUs = alignedAvailableCPUs.Union(availableCPUs)
 	}
 
 	var alignedCPUs machine.CPUSet
@@ -677,7 +697,7 @@ func (p *DynamicPolicy) allocateNumaBindingCPUs(numCPUs int, hint *pluginapi.Top
 
 		// Evenly allocate cpus for distribute_evenly_across_numa
 		if distributeEvenlyAcrossNuma {
-			alignedCPUs, err = p.allocateEvenlyAcrossNUMAs(numCPUs, hintNodes, availableCPUsPerNUMA)
+			alignedCPUs, err = p.allocateEvenlyAcrossNUMAs(numCPUs, hintNodes, alignedAvailableCPUsPerNUMA)
 			if err != nil {
 				return machine.NewCPUSet(), fmt.Errorf("allocateEvenlyAcrossNUMA failed with error: %v", err)
 			}
@@ -1080,7 +1100,8 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntries(
 		return fmt.Errorf("reclaimOverlapShareRatio failed with error: %v", err)
 	}
 
-	general.Infof("poolsQuantityMap: %#v, rpPinnedCPUSet: %v, availableCPUs: %v, reclaimOverlapShareRatio: %#v", poolsQuantityMap, rpPinnedCPUSet, availableCPUs, reclaimOverlapShareRatio)
+	general.Infof("poolsQuantityMap: %#v, isolatedQuantityMap: %#v, rpPinnedCPUSet: %v, availableCPUs: %v, reclaimOverlapShareRatio: %#v",
+		poolsQuantityMap, isolatedQuantityMap, rpPinnedCPUSet, availableCPUs, reclaimOverlapShareRatio)
 
 	poolsCPUSet, isolatedCPUSet, err := p.groupAndAllocatePools(poolsQuantityMap, isolatedQuantityMap, availableCPUs, rpPinnedCPUSet, reclaimOverlapShareRatio)
 	if err != nil {
@@ -1153,6 +1174,8 @@ func (p *DynamicPolicy) groupAndAllocatePools(
 
 	for pkgName, poolsMap := range pinnedPoolsByPkg {
 		pkgAvailableCPUs := availableCPUs.Intersection(rpPinnedCPUSet[pkgName])
+
+		general.Infof("pkgName: %s, poolsMap: %#v, pkgAvailableCPUs: %v", pkgName, poolsMap, pkgAvailableCPUs)
 		// Call generatePoolsAndIsolation for this package
 		// Pass nil for isolatedQuantityMap as we assume isolated containers go to common
 		pPools, _, err := p.generatePoolsAndIsolation(poolsMap, nil, pkgAvailableCPUs, reclaimOverlapShareRatio)
@@ -1165,7 +1188,8 @@ func (p *DynamicPolicy) groupAndAllocatePools(
 	}
 
 	// 4. Process Common Pools
-	// Pass rpPinnedCPUSet to generatePoolsAndIsolation to handle pinned resources (Legacy comment removed)
+	// Pass rpPinnedCPUSet to generatePoolsAndIsolation to handle pinned resources
+	general.Infof("commonPoolsQuantityMap: %#v, commonAvailableCPUs: %v", commonPoolsQuantityMap, commonAvailableCPUs)
 	cPools, cIso, err := p.generatePoolsAndIsolation(commonPoolsQuantityMap, isolatedQuantityMap, commonAvailableCPUs, reclaimOverlapShareRatio)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generatePoolsAndIsolation failed with error: %v", err)
@@ -1433,7 +1457,7 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 							if numaSet.Size() == 1 {
 								targetNUMAID := numaSet.ToSliceNoSortInt()[0]
 								if pinnedSets, ok := machineState.GetNUMAResourcePackagePinnedCPUSet()[targetNUMAID]; ok {
-									if _, exists := pinnedSets[pkgName]; exists {
+									if cpuSet, exists := pinnedSets[pkgName]; exists && cpuSet.Size() > 0 {
 										ownerPoolName = rputil.WrapOwnerPoolName(ownerPoolName, pkgName)
 									}
 								}

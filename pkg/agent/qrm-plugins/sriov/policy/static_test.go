@@ -452,8 +452,9 @@ func TestStaticPolicy_Allocate(t *testing.T) {
 						IsScalarResource:  true,
 						AllocatedQuantity: 1,
 						Annotations: map[string]string{
-							pciAnnotationKey:   `[{"address":"0000:40:00.0","repName":"eth0_0","vfName":"eth0_0"}]`,
-							netNsAnnotationKey: "/var/run/netns/ns2",
+							pciAnnotationKey:                `[{"address":"0000:40:00.0","repName":"eth0_0","vfName":"eth0_0"}]`,
+							netNsAnnotationKey:              "/var/run/netns/ns2",
+							topologyAllocationAnnotationKey: `{"Socket":{"0":{"allocated":{"resource.katalyst.kubewharf.io/sriov_nic":"1"}}}}`,
 						},
 						Devices: []*pluginapi.DeviceSpec{
 							{
@@ -513,8 +514,9 @@ func TestStaticPolicy_Allocate(t *testing.T) {
 						IsScalarResource:  true,
 						AllocatedQuantity: 1,
 						Annotations: map[string]string{
-							pciAnnotationKey:   `[{"address":"0000:40:00.1","repName":"eth0_1","vfName":"eth0_1"}]`,
-							netNsAnnotationKey: "/var/run/netns/ns2",
+							pciAnnotationKey:                `[{"address":"0000:40:00.1","repName":"eth0_1","vfName":"eth0_1"}]`,
+							netNsAnnotationKey:              "/var/run/netns/ns2",
+							topologyAllocationAnnotationKey: `{"Socket":{"0":{"allocated":{"resource.katalyst.kubewharf.io/sriov_nic":"1"}}}}`,
 						},
 						Devices: []*pluginapi.DeviceSpec{
 							{

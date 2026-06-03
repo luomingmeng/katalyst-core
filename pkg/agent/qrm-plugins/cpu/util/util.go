@@ -20,16 +20,20 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strconv"
 
 	pkgerrors "github.com/pkg/errors"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/klog/v2"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
+	"github.com/kubewharf/katalyst-api/pkg/apis/node/v1alpha1"
 	"github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/calculator"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/config/generic"
@@ -39,6 +43,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	"github.com/kubewharf/katalyst-core/pkg/util/native"
 	"github.com/kubewharf/katalyst-core/pkg/util/qos"
+	resourcepackage "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 )
 
 const (
@@ -161,12 +166,17 @@ func RegenerateHints(allocationInfo *state.AllocationInfo, regenerate bool) map[
 
 // PackAllocationResponse fills pluginapi.ResourceAllocationResponse with information from AllocationInfo and pluginapi.ResourceRequest
 func PackAllocationResponse(allocationInfo *state.AllocationInfo, resourceName, ociPropertyName string,
-	isNodeResource, isScalarResource bool, req *pluginapi.ResourceRequest,
+	isNodeResource, isScalarResource bool, req *pluginapi.ResourceRequest, resourceAllocationAnnotations ...map[string]string,
 ) (*pluginapi.ResourceAllocationResponse, error) {
 	if allocationInfo == nil {
 		return nil, fmt.Errorf("packAllocationResponse got nil allocationInfo")
 	} else if req == nil {
 		return nil, fmt.Errorf("packAllocationResponse got nil request")
+	}
+
+	topologyAssignments := make(map[uint64]uint64)
+	for numaID, cset := range allocationInfo.TopologyAwareAssignments {
+		topologyAssignments[uint64(numaID)] = uint64(cset.Size())
 	}
 
 	return &pluginapi.ResourceAllocationResponse{
@@ -182,16 +192,18 @@ func PackAllocationResponse(allocationInfo *state.AllocationInfo, resourceName, 
 		AllocationResult: &pluginapi.ResourceAllocation{
 			ResourceAllocation: map[string]*pluginapi.ResourceAllocationInfo{
 				resourceName: {
-					OciPropertyName:   ociPropertyName,
-					IsNodeResource:    isNodeResource,
-					IsScalarResource:  isScalarResource,
-					AllocatedQuantity: float64(allocationInfo.AllocationResult.Size()),
-					AllocationResult:  allocationInfo.AllocationResult.String(),
+					OciPropertyName:     ociPropertyName,
+					IsNodeResource:      isNodeResource,
+					IsScalarResource:    isScalarResource,
+					AllocatedQuantity:   float64(allocationInfo.AllocationResult.Size()),
+					AllocationResult:    allocationInfo.AllocationResult.String(),
+					TopologyAssignments: topologyAssignments,
 					ResourceHints: &pluginapi.ListOfTopologyHints{
 						Hints: []*pluginapi.TopologyHint{
 							req.Hint,
 						},
 					},
+					Annotations: general.MergeAnnotations(resourceAllocationAnnotations...),
 				},
 			},
 		},
@@ -199,6 +211,87 @@ func PackAllocationResponse(allocationInfo *state.AllocationInfo, resourceName, 
 		Annotations:    general.DeepCopyMap(req.Annotations),
 		NativeQosClass: req.NativeQosClass,
 	}, nil
+}
+
+// GetCPUTopologyAllocationsAnnotations returns the topology-aware CPU allocation annotations for a given container.
+// It handles different QoS levels:
+// - For DedicatedCores: uses the actual assigned CPUSet size on each NUMA node.
+// - For SharedCores/ReclaimedCores with NUMA binding: uses the pod's aggregated request quantity.
+// This function only processes main containers and returns nil for sidecars or invalid allocation info.
+func GetCPUTopologyAllocationsAnnotations(allocationInfo *state.AllocationInfo,
+	topologyAllocationAnnotationKey string, req *pluginapi.ResourceRequest,
+) (map[string]string, error) {
+	// Skip processing if allocation info is invalid or it's not the main container.
+	if allocationInfo == nil || !allocationInfo.CheckMainContainer() {
+		return nil, nil
+	}
+
+	assignments := allocationInfo.TopologyAwareAssignments
+	// Determine if this is a shared or reclaimed QoS level with NUMA binding enabled.
+	// This affects whether we use the request quantity or the physical assignment size.
+	isSharedOrReclaimedNUMABinding := allocationInfo.CheckSharedNUMABinding() || allocationInfo.CheckReclaimedNUMABinding()
+
+	// For shared or reclaimed cores with NUMA binding, they must be restricted to a single NUMA node.
+	var reqQty float64
+	if isSharedOrReclaimedNUMABinding {
+		if len(assignments) != 1 {
+			return nil, fmt.Errorf("shared/reclaimed cores with NUMA binding should be pinned to exactly 1 NUMA node, got %d", len(assignments))
+		}
+
+		// Use the aggregated pod request quantity for shared/reclaimed cores to represent the logical allocation.
+		_, reqFloat64, err := util.GetPodAggregatedRequestResource(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get aggregated request resource: %v", err)
+		}
+		reqQty = reqFloat64
+	}
+
+	// Initialize the internal TopologyAllocation structure.
+	topologyAllocation := v1alpha1.TopologyAllocation{
+		v1alpha1.TopologyTypeNuma: make(map[string]v1alpha1.ZoneAllocation),
+	}
+
+	for numaNode, assignment := range assignments {
+		var cpuQty float64
+		var assignmentToReport machine.CPUSet
+		if isSharedOrReclaimedNUMABinding {
+			cpuQty = reqQty
+			// For shared/reclaimed cores, we don't report the CPUSet attribute in the annotation.
+			assignmentToReport = machine.NewCPUSet()
+		} else {
+			// For dedicated cores, the quantity is the physical count of CPUs assigned on this NUMA node.
+			cpuQty = float64(assignment.Size())
+			assignmentToReport = assignment
+		}
+
+		topologyAllocation[v1alpha1.TopologyTypeNuma][strconv.Itoa(numaNode)] = buildZoneAllocation(cpuQty, assignmentToReport)
+	}
+
+	// Generate the final resource allocation annotations from the topology structure.
+	return util.MakeTopologyAllocationResourceAllocationAnnotations(
+		topologyAllocation,
+		topologyAllocationAnnotationKey,
+	), nil
+}
+
+// buildZoneAllocation creates a ZoneAllocation for a specific NUMA node.
+// It uses NewMilliQuantity to accurately represent decimal CPU quantities (up to 0.001 core precision).
+func buildZoneAllocation(cpuQty float64, assignment machine.CPUSet) v1alpha1.ZoneAllocation {
+	za := v1alpha1.ZoneAllocation{
+		Allocated: map[v1.ResourceName]resource.Quantity{
+			// Convert cores to milli-cores and round to the nearest integer.
+			v1.ResourceCPU: *resource.NewMilliQuantity(int64(math.Round(cpuQty*1000)), resource.DecimalSI),
+		},
+	}
+
+	// Only report the CPUSet attribute if the assignment is non-empty.
+	if !assignment.IsEmpty() {
+		za.Attributes = map[string]string{
+			util.OCIPropertyNameCPUSetCPUs: assignment.String(),
+		}
+	}
+
+	return za
 }
 
 // AdvisorDegradation checks if the advisor is in a degraded state.
@@ -446,16 +539,8 @@ func IsSoleSharedCoresPod(conf *config.Configuration, podList []*v1.Pod, dynamic
 func GetAggResourcePackagePinnedCPUSet(attributeSelector labels.Selector, machineState state.NUMANodeMap) machine.CPUSet {
 	res := machine.NewCPUSet()
 	numaStates := machineState.GetNUMAResourcePackageStates()
-	for _, pkgStates := range numaStates {
-		for _, rpState := range pkgStates {
-			if rpState == nil {
-				continue
-			}
-			if !attributeSelector.Matches(labels.Set(rpState.Attributes)) {
-				continue
-			}
-			res = res.Union(rpState.PinnedCPUSet)
-		}
+	for _, cpuset := range resourcepackage.GetNUMAMatchedPinnedCPUSet(numaStates, attributeSelector) {
+		res = res.Union(cpuset)
 	}
 	return res
 }

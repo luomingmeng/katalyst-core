@@ -430,6 +430,7 @@ func (cs *cpuServer) updateMetaCacheInput(ctx context.Context, req *cpuadvisor.G
 	livingPoolNameSet := sets.NewString()
 
 	if req.GetResourcePackageConfig() == nil {
+		general.InfoS("resource package config is nil, skip updating meta cache")
 		_ = cs.metaCache.SetResourcePackageConfig(nil)
 	} else {
 		cfg := make(types.ResourcePackageConfig)
@@ -470,6 +471,7 @@ func (cs *cpuServer) updateMetaCacheInput(ctx context.Context, req *cpuadvisor.G
 				}
 			}
 		}
+		general.InfoS("updated resource package config", "cfg", cfg)
 		_ = cs.metaCache.SetResourcePackageConfig(cfg)
 	}
 
@@ -667,7 +669,7 @@ func (cs *cpuServer) setContainerInfoBasedOnContainerAllocationInfo(
 			// get resource package config from meta cache, make sure it has been set already before setting owner pool name
 			cfg := cs.metaCache.GetResourcePackageConfig()
 			if pinnedSets, ok := cfg[targetNUMAID]; ok {
-				if _, exists := pinnedSets[pkgName]; exists {
+				if state, exists := pinnedSets[pkgName]; exists && state.GetPinnedCPUSet().Size() > 0 {
 					poolName = resourcepackage.WrapOwnerPoolName(poolName, pkgName)
 				}
 			}

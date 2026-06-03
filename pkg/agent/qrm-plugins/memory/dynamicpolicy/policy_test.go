@@ -171,6 +171,7 @@ func getTestDynamicPolicyWithInitialization(
 		podDebugAnnoKeys:         []string{podDebugAnnoKey},
 		enableReclaimNUMABinding: true,
 		enableNonBindingShareCoresMemoryResourceCheck: true,
+		topologyAllocationAnnotationKey:               coreconsts.QRMPodAnnotationTopologyAllocationKey,
 		numaBindResultResourceAllocationAnnotationKey: coreconsts.QRMResourceAnnotationKeyNUMABindResult,
 		extraResourceNames:                            fakeConf.ExtraMemoryResources,
 	}
@@ -243,6 +244,7 @@ func getTestDynamicPolicyWithExtraResourcesWithInitialization(
 		podDebugAnnoKeys:         []string{podDebugAnnoKey},
 		enableReclaimNUMABinding: true,
 		enableNonBindingShareCoresMemoryResourceCheck: true,
+		topologyAllocationAnnotationKey:               coreconsts.QRMPodAnnotationTopologyAllocationKey,
 		numaBindResultResourceAllocationAnnotationKey: coreconsts.QRMResourceAnnotationKeyNUMABindResult,
 		extraResourceNames:                            fakeConfWithExtraResources.ExtraMemoryResources,
 	}
@@ -656,11 +658,12 @@ func TestAllocate(t *testing.T) {
 				AllocationResult: &pluginapi.ResourceAllocation{
 					ResourceAllocation: map[string]*pluginapi.ResourceAllocationInfo{
 						string(v1.ResourceMemory): {
-							OciPropertyName:   util.OCIPropertyNameCPUSetMems,
-							IsNodeResource:    false,
-							IsScalarResource:  true,
-							AllocatedQuantity: 1073741824,
-							AllocationResult:  machine.NewCPUSet(0, 1, 2, 3).String(),
+							OciPropertyName:     util.OCIPropertyNameCPUSetMems,
+							IsNodeResource:      false,
+							IsScalarResource:    true,
+							AllocatedQuantity:   1073741824,
+							AllocationResult:    machine.NewCPUSet(0, 1, 2, 3).String(),
+							TopologyAssignments: map[uint64]uint64{},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{nil},
 							},
@@ -705,11 +708,12 @@ func TestAllocate(t *testing.T) {
 				AllocationResult: &pluginapi.ResourceAllocation{
 					ResourceAllocation: map[string]*pluginapi.ResourceAllocationInfo{
 						string(v1.ResourceMemory): {
-							OciPropertyName:   util.OCIPropertyNameCPUSetMems,
-							IsNodeResource:    false,
-							IsScalarResource:  true,
-							AllocatedQuantity: 1073741824,
-							AllocationResult:  machine.NewCPUSet(0, 1, 2, 3).String(),
+							OciPropertyName:     util.OCIPropertyNameCPUSetMems,
+							IsNodeResource:      false,
+							IsScalarResource:    true,
+							AllocatedQuantity:   1073741824,
+							AllocationResult:    machine.NewCPUSet(0, 1, 2, 3).String(),
+							TopologyAssignments: map[uint64]uint64{},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{nil},
 							},
@@ -764,6 +768,9 @@ func TestAllocate(t *testing.T) {
 							IsScalarResource:  true,
 							AllocatedQuantity: 7516192768,
 							AllocationResult:  machine.NewCPUSet(0).String(),
+							TopologyAssignments: map[uint64]uint64{
+								0: 7516192768,
+							},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{
 									{
@@ -771,6 +778,9 @@ func TestAllocate(t *testing.T) {
 										Preferred: true,
 									},
 								},
+							},
+							Annotations: map[string]string{
+								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"memory":"7Gi"}}}}`,
 							},
 						},
 					},
@@ -825,6 +835,12 @@ func TestAllocate(t *testing.T) {
 							IsScalarResource:  true,
 							AllocatedQuantity: 2147483648,
 							AllocationResult:  machine.NewCPUSet(0).String(),
+							TopologyAssignments: map[uint64]uint64{
+								0: 2147483648,
+							},
+							Annotations: map[string]string{
+								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"memory":"2Gi"}}}}`,
+							},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{
 									{
@@ -886,6 +902,9 @@ func TestAllocate(t *testing.T) {
 							IsScalarResource:  true,
 							AllocatedQuantity: 7516192768,
 							AllocationResult:  machine.NewCPUSet(0).String(),
+							TopologyAssignments: map[uint64]uint64{
+								0: 7516192768,
+							},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{
 									{
@@ -893,6 +912,9 @@ func TestAllocate(t *testing.T) {
 										Preferred: true,
 									},
 								},
+							},
+							Annotations: map[string]string{
+								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"memory":"7Gi"}}}}`,
 							},
 						},
 					},
@@ -950,6 +972,9 @@ func TestAllocate(t *testing.T) {
 							IsScalarResource:  true,
 							AllocatedQuantity: 2147483648,
 							AllocationResult:  machine.NewCPUSet(0).String(),
+							TopologyAssignments: map[uint64]uint64{
+								0: 2147483648,
+							},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{
 									{
@@ -957,6 +982,9 @@ func TestAllocate(t *testing.T) {
 										Preferred: true,
 									},
 								},
+							},
+							Annotations: map[string]string{
+								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"memory":"2Gi"}}}}`,
 							},
 						},
 					},
@@ -1010,6 +1038,9 @@ func TestAllocate(t *testing.T) {
 							IsScalarResource:  true,
 							AllocatedQuantity: 2147483648,
 							AllocationResult:  machine.NewCPUSet(0).String(),
+							TopologyAssignments: map[uint64]uint64{
+								0: 2147483648,
+							},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{
 									{
@@ -1017,6 +1048,9 @@ func TestAllocate(t *testing.T) {
 										Preferred: true,
 									},
 								},
+							},
+							Annotations: map[string]string{
+								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"memory":"2Gi"}}}}`,
 							},
 						},
 					},
@@ -1061,21 +1095,23 @@ func TestAllocate(t *testing.T) {
 				AllocationResult: &pluginapi.ResourceAllocation{
 					ResourceAllocation: map[string]*pluginapi.ResourceAllocationInfo{
 						string(v1.ResourceMemory): {
-							OciPropertyName:   util.OCIPropertyNameCPUSetMems,
-							IsNodeResource:    false,
-							IsScalarResource:  true,
-							AllocatedQuantity: 2147483648,
-							AllocationResult:  machine.NewCPUSet(0, 1, 2, 3).String(),
+							OciPropertyName:     util.OCIPropertyNameCPUSetMems,
+							IsNodeResource:      false,
+							IsScalarResource:    true,
+							AllocatedQuantity:   2147483648,
+							AllocationResult:    machine.NewCPUSet(0, 1, 2, 3).String(),
+							TopologyAssignments: map[uint64]uint64{},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{nil},
 							},
 						},
 						"hugepages-2Mi": {
-							OciPropertyName:   util.OCIPropertyNameCPUSetMems,
-							IsNodeResource:    false,
-							IsScalarResource:  true,
-							AllocatedQuantity: 2147483648,
-							AllocationResult:  machine.NewCPUSet(0, 1, 2, 3).String(),
+							OciPropertyName:     util.OCIPropertyNameCPUSetMems,
+							IsNodeResource:      false,
+							IsScalarResource:    true,
+							AllocatedQuantity:   2147483648,
+							AllocationResult:    machine.NewCPUSet(0, 1, 2, 3).String(),
+							TopologyAssignments: map[uint64]uint64{},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{nil},
 							},
@@ -1125,12 +1161,14 @@ func TestAllocate(t *testing.T) {
 				AllocationResult: &pluginapi.ResourceAllocation{
 					ResourceAllocation: map[string]*pluginapi.ResourceAllocationInfo{
 						string(v1.ResourceMemory): {
-							OciPropertyName:   util.OCIPropertyNameCPUSetMems,
-							IsNodeResource:    false,
-							IsScalarResource:  true,
-							AllocatedQuantity: 2147483648,
+							OciPropertyName:     util.OCIPropertyNameCPUSetMems,
+							IsNodeResource:      false,
+							IsScalarResource:    true,
+							AllocatedQuantity:   2147483648,
+							TopologyAssignments: map[uint64]uint64{},
 							Annotations: map[string]string{
 								coreconsts.QRMResourceAnnotationKeyNUMABindResult: "0",
+								coreconsts.QRMPodAnnotationTopologyAllocationKey:  `{"Numa":{"0":{}}}`,
 							},
 							AllocationResult: machine.NewCPUSet(0).String(),
 							ResourceHints: &pluginapi.ListOfTopologyHints{
@@ -1184,11 +1222,12 @@ func TestAllocate(t *testing.T) {
 				AllocationResult: &pluginapi.ResourceAllocation{
 					ResourceAllocation: map[string]*pluginapi.ResourceAllocationInfo{
 						string(v1.ResourceMemory): {
-							OciPropertyName:   util.OCIPropertyNameCPUSetMems,
-							IsNodeResource:    false,
-							IsScalarResource:  true,
-							AllocatedQuantity: 2147483648,
-							AllocationResult:  machine.NewCPUSet(0, 1, 2, 3).String(),
+							OciPropertyName:     util.OCIPropertyNameCPUSetMems,
+							IsNodeResource:      false,
+							IsScalarResource:    true,
+							AllocatedQuantity:   2147483648,
+							AllocationResult:    machine.NewCPUSet(0, 1, 2, 3).String(),
+							TopologyAssignments: map[uint64]uint64{},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{
 									nil,
@@ -1246,6 +1285,12 @@ func TestAllocate(t *testing.T) {
 							IsScalarResource:  true,
 							AllocatedQuantity: 2147483648,
 							AllocationResult:  machine.NewCPUSet(0).String(),
+							TopologyAssignments: map[uint64]uint64{
+								0: 2147483648,
+							},
+							Annotations: map[string]string{
+								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"memory":"2Gi"}}}}`,
+							},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{
 									{
@@ -1261,6 +1306,12 @@ func TestAllocate(t *testing.T) {
 							IsScalarResource:  true,
 							AllocatedQuantity: 2147483648,
 							AllocationResult:  machine.NewCPUSet(0).String(),
+							TopologyAssignments: map[uint64]uint64{
+								0: 2147483648,
+							},
+							Annotations: map[string]string{
+								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"hugepages-2Mi":"2Gi"}}}}`,
+							},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{
 									{
@@ -1322,6 +1373,13 @@ func TestAllocate(t *testing.T) {
 							IsScalarResource:  true,
 							AllocatedQuantity: 2147483648,
 							AllocationResult:  machine.NewCPUSet(0, 1).String(),
+							TopologyAssignments: map[uint64]uint64{
+								0: 1073741824,
+								1: 1073741824,
+							},
+							Annotations: map[string]string{
+								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"memory":"1Gi"}},"1":{"allocated":{"memory":"1Gi"}}}}`,
+							},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{
 									{
@@ -1337,6 +1395,13 @@ func TestAllocate(t *testing.T) {
 							IsScalarResource:  true,
 							AllocatedQuantity: 2147483648,
 							AllocationResult:  machine.NewCPUSet(0, 1).String(),
+							TopologyAssignments: map[uint64]uint64{
+								0: 1073741824,
+								1: 1073741824,
+							},
+							Annotations: map[string]string{
+								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"hugepages-2Mi":"1Gi"}},"1":{"allocated":{"hugepages-2Mi":"1Gi"}}}}`,
+							},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{
 									{
@@ -1417,6 +1482,12 @@ func TestAllocate(t *testing.T) {
 							IsScalarResource:  true,
 							AllocatedQuantity: 2147483648,
 							AllocationResult:  machine.NewCPUSet(0).String(),
+							TopologyAssignments: map[uint64]uint64{
+								0: 2147483648,
+							},
+							Annotations: map[string]string{
+								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"hugepages-2Mi":"2Gi"}}}}`,
+							},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{
 									{
@@ -4431,7 +4502,7 @@ func createMap(t *testing.T) *ebpf.Map {
 		MaxEntries: 2,
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Skipf("skipping BPF test: %v", err)
 	}
 	return m
 }

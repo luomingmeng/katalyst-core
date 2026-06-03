@@ -21,6 +21,7 @@ import (
 	"math"
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 
 	configapi "github.com/kubewharf/katalyst-api/pkg/apis/config/v1alpha1"
@@ -33,6 +34,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
+	resourcepackage "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 )
 
 type ProvisionAssemblerCommon struct {
@@ -208,22 +210,35 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		numaSet = machine.NewCPUSet(numaID)
 	}
 
-	pinnedCPUSizeByPkg := pa.getPinnedCPUSizeByPackage(numaSet)
+	cfg := pa.metaReader.GetResourcePackageConfig()
+	pinnedCPUSizeByPkg := pa.getPinnedCPUSizeByPackage(numaSet, cfg)
 	totalPinnedCPUSize := general.SumUpMapValues(pinnedCPUSizeByPkg)
 
-	unpinnedShareRegionInfo, pinnedShareRegionInfos, err := extractShareRegionInfo(shareRegions, pinnedCPUSizeByPkg)
+	disableReclaimSelectorStr := pa.conf.GetDynamicConfiguration().DisableReclaimPinnedCPUSetResourcePackageSelector
+	disableReclaimSelector, err := general.ParseSelector(disableReclaimSelectorStr)
+	if err != nil {
+		return err
+	}
+	nonReclaimablePackages := sets.NewString()
+	for _, numaID := range numaSet.ToSliceInt() {
+		if pkgMap, ok := cfg[numaID]; ok {
+			nonReclaimablePackages = nonReclaimablePackages.Union(resourcepackage.GetMatchedPackages(pkgMap, disableReclaimSelector))
+		}
+	}
+
+	unpinnedShareRegionInfo, pinnedShareRegionInfos, err := extractShareRegionInfo(shareRegions, pinnedCPUSizeByPkg, nonReclaimablePackages)
 	if err != nil {
 		return err
 	}
 
 	isolationRegions := regionHelper.GetRegions(numaID, configapi.QoSRegionTypeIsolation)
-	unpinnedIsolationInfo, pinnedIsolationInfo, err := extractIsolationRegionInfo(isolationRegions, pinnedCPUSizeByPkg)
+	unpinnedIsolationInfo, pinnedIsolationInfo, err := extractIsolationRegionInfo(isolationRegions, pinnedCPUSizeByPkg, nonReclaimablePackages)
 	if err != nil {
 		return err
 	}
 
 	dedicatedRegions := regionHelper.GetRegions(numaID, configapi.QoSRegionTypeDedicated)
-	unpinnedDedicatedInfo, pinnedDedicatedInfo, err := extractDedicatedRegionInfo(dedicatedRegions, pinnedCPUSizeByPkg)
+	unpinnedDedicatedInfo, pinnedDedicatedInfo, err := extractDedicatedRegionInfo(dedicatedRegions, pinnedCPUSizeByPkg, nonReclaimablePackages)
 	if err != nil {
 		return err
 	}
@@ -265,7 +280,19 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 			regulateSharePoolSizes = sharePoolSizeRequirements
 		}
 		unexpandableRequirements := general.MergeMapInt(isolationPoolSizes, dedicatedRegionInfo.requests)
+
+		general.InfoS("getShareAndIsolateDedicatedPoolSizesFunc pre regulatePoolSizes",
+			"shareAndIsolatedDedicatedPoolAvailable", shareAndIsolatedDedicatedPoolAvailable,
+			"allowExpand", allowExpand,
+			"regulateSharePoolSizes", regulateSharePoolSizes,
+			"unexpandableRequirements", unexpandableRequirements)
+
 		shareAndIsolateDedicatedPoolSizes, poolThrottled := regulatePoolSizes(regulateSharePoolSizes, unexpandableRequirements, shareAndIsolatedDedicatedPoolAvailable, allowExpand)
+
+		general.InfoS("getShareAndIsolateDedicatedPoolSizesFunc post regulatePoolSizes",
+			"shareAndIsolateDedicatedPoolSizes", shareAndIsolateDedicatedPoolSizes,
+			"poolThrottled", poolThrottled)
+
 		for _, r := range shareRegionInfo.regionMap {
 			r.SetThrottled(poolThrottled)
 		}
@@ -279,11 +306,35 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 	shareAndIsolateDedicatedPoolSizes := make(map[string]int)
 	unpinnedShareAndIsolatedDedicatedPoolAvailable := general.Max(0, shareAndIsolatedDedicatedPoolAvailable-totalPinnedCPUSize)
 	pinnedCPUSetAllInfo := getPinnedCPUSetAllRegionInfo(pinnedShareRegionInfos, pinnedIsolationInfo, pinnedDedicatedInfo)
+	totalUnusedNonReclaimablePinnedCPUSize := 0
+
+	general.InfoS("pool info start",
+		"numaID", numaID,
+		"shareAndIsolatedDedicatedPoolAvailable", shareAndIsolatedDedicatedPoolAvailable,
+		"totalPinnedCPUSize", totalPinnedCPUSize,
+		"unpinnedShareAndIsolatedDedicatedPoolAvailable", unpinnedShareAndIsolatedDedicatedPoolAvailable,
+		"nonReclaimablePackages", nonReclaimablePackages,
+		"disableReclaimSelector", disableReclaimSelector)
 
 	// first calculate share and isolate dedicated pool sizes for each pinned region
-	for pkgName, allInfo := range pinnedCPUSetAllInfo {
-		pinnedCPUSize := pinnedCPUSizeByPkg[pkgName]
+	for pkgName, pinnedCPUSize := range pinnedCPUSizeByPkg {
+		allInfo, ok := pinnedCPUSetAllInfo[pkgName]
+		if !ok {
+			// No regions for this package, so allocated size is 0
+			if nonReclaimablePackages.Has(pkgName) {
+				totalUnusedNonReclaimablePinnedCPUSize += pinnedCPUSize
+			}
+			continue
+		}
+
 		poolSizes := getShareAndIsolateDedicatedPoolSizesFunc(pinnedCPUSize, allInfo.shareRegionInfo, allInfo.dedicatedRegionInfos, allInfo.isolationRegionInfo)
+
+		allocatedForPkg := general.SumUpMapValues(poolSizes)
+		unusedForPkg := pinnedCPUSize - allocatedForPkg
+		if nonReclaimablePackages.Has(pkgName) {
+			totalUnusedNonReclaimablePinnedCPUSize += unusedForPkg
+		}
+
 		for poolName, size := range poolSizes {
 			shareAndIsolateDedicatedPoolSizes[poolName] = size
 		}
@@ -347,7 +398,9 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		"isolationUpperSizes", isolationInfo.isolationUpperSizes,
 		"isolationLowerSizes", isolationInfo.isolationLowerSizes,
 		"shareAndIsolateDedicatedPoolSizes", shareAndIsolateDedicatedPoolSizes,
-		"shareAndIsolatedDedicatedPoolAvailable", shareAndIsolatedDedicatedPoolAvailable)
+		"shareAndIsolatedDedicatedPoolAvailable", shareAndIsolatedDedicatedPoolAvailable,
+		"totalUnusedNonReclaimablePinnedCPUSize", totalUnusedNonReclaimablePinnedCPUSize,
+		"unpinnedShareAndIsolatedDedicatedPoolAvailable", unpinnedShareAndIsolatedDedicatedPoolAvailable)
 
 	// fill in regulated share-and-isolated pool entries
 	for poolName, poolSize := range shareAndIsolateDedicatedPoolSizes {
@@ -373,6 +426,7 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		reservedForReclaim:                     reservedForReclaim,
 		nodeEnableReclaim:                      nodeEnableReclaim,
 		numaID:                                 numaID,
+		totalUnusedNonReclaimablePinnedCPUSize: totalUnusedNonReclaimablePinnedCPUSize,
 	}
 
 	reclaimedCoresSize, overlapReclaimedCoresSize, reclaimedCoresQuota, err := pa.calculateReclaimPool(reclaimPoolData, result)
@@ -405,6 +459,7 @@ type reclaimPoolCalculationData struct {
 	reservedForReclaim                     int
 	nodeEnableReclaim                      bool
 	numaID                                 int
+	totalUnusedNonReclaimablePinnedCPUSize int
 }
 
 func (pa *ProvisionAssemblerCommon) calculateReclaimPool(
@@ -462,9 +517,11 @@ func (pa *ProvisionAssemblerCommon) calculateOverlapReclaimPool(
 	}
 
 	overlapReclaimSize := make(map[string]int)
+	// We deduct totalUnusedNonReclaimablePinnedCPUSize here to ensure that the unused portion of non-reclaimable
+	// resource packages is not added to the reclaim pool, preventing those CPUs from being reclaimed.
 	shareReclaimCoresSize := data.shareAndIsolatedDedicatedPoolAvailable - isolated -
 		general.SumUpMapValues(nonReclaimableSharePoolSizes) - general.SumUpMapValues(reclaimableShareRequirements) -
-		general.SumUpMapValues(data.dedicatedPoolSizes)
+		general.SumUpMapValues(data.dedicatedPoolSizes) - data.totalUnusedNonReclaimablePinnedCPUSize
 
 	if data.nodeEnableReclaim {
 		reclaimedCoresSize = shareReclaimCoresSize + data.dedicatedReclaimCoresSize
@@ -604,7 +661,9 @@ func (pa *ProvisionAssemblerCommon) calculateNonOverlapReclaimPool(
 			}
 		}
 
-		shareReclaimedCoresSize := data.shareAndIsolatedDedicatedPoolAvailable - general.SumUpMapValues(data.shareAndIsolateDedicatedPoolSizes)
+		// We deduct totalUnusedNonReclaimablePinnedCPUSize here to ensure that the unused portion of non-reclaimable
+		// resource packages is not added to the reclaim pool, preventing those CPUs from being reclaimed.
+		shareReclaimedCoresSize := data.shareAndIsolatedDedicatedPoolAvailable - general.SumUpMapValues(data.shareAndIsolateDedicatedPoolSizes) - data.totalUnusedNonReclaimablePinnedCPUSize
 		reclaimedCoresSize = shareReclaimedCoresSize + data.dedicatedReclaimCoresSize + data.reservedForReclaim
 	} else {
 		reclaimedCoresSize = data.reservedForReclaim
@@ -662,10 +721,9 @@ func initRegionInfo() regionInfo {
 	}
 }
 
-func (pa *ProvisionAssemblerCommon) getPinnedCPUSizeByPackage(numaSet machine.CPUSet) map[string]int {
+func (pa *ProvisionAssemblerCommon) getPinnedCPUSizeByPackage(numaSet machine.CPUSet, cfg types.ResourcePackageConfig) map[string]int {
 	pinnedCPUSizeByPkg := make(map[string]int)
 
-	cfg := pa.metaReader.GetResourcePackageConfig()
 	if len(cfg) > 0 {
 		for _, numaID := range numaSet.ToSliceInt() {
 			pkgMap, ok := cfg[numaID]
@@ -688,7 +746,7 @@ func (pa *ProvisionAssemblerCommon) getPinnedCPUSizeByPackage(numaSet machine.CP
 	return pinnedCPUSizeByPkg
 }
 
-func extractShareRegionInfo(shareRegions []region.QoSRegion, pinnedCPUSizeByPkg map[string]int) (regionInfo, map[string]*regionInfo, error) {
+func extractShareRegionInfo(shareRegions []region.QoSRegion, pinnedCPUSizeByPkg map[string]int, nonReclaimablePackages sets.String) (regionInfo, map[string]*regionInfo, error) {
 	unpinnedRegionInfo := initRegionInfo()
 	pinnedRegionInfos := make(map[string]*regionInfo)
 
@@ -710,10 +768,15 @@ func extractShareRegionInfo(shareRegions []region.QoSRegion, pinnedCPUSizeByPkg 
 			}
 		}
 
+		reclaimEnable := r.EnableReclaim()
+		if pkgName != "" && nonReclaimablePackages.Has(pkgName) {
+			reclaimEnable = false // override reclaim Enable if the resource package is non-reclaimable
+		}
+
 		ri.requirements[r.OwnerPoolName()] = general.Max(1, int(controlKnob[configapi.ControlKnobNonReclaimedCPURequirement].Value))
 		ri.requests[r.OwnerPoolName()] = general.Max(1, int(math.Ceil(r.GetPodsRequest())))
-		ri.reclaimEnable[r.OwnerPoolName()] = r.EnableReclaim()
-		if r.EnableReclaim() {
+		ri.reclaimEnable[r.OwnerPoolName()] = reclaimEnable
+		if reclaimEnable {
 			if quota, ok := controlKnob[configapi.ControlKnobReclaimedCoresCPUQuota]; ok {
 				if ri.minReclaimedCoresCPUQuota == -1 || quota.Value < ri.minReclaimedCoresCPUQuota {
 					ri.minReclaimedCoresCPUQuota = quota.Value
@@ -760,7 +823,7 @@ func initIsolationRegionInfo() isolationRegionInfo {
 	}
 }
 
-func extractIsolationRegionInfo(isolationRegions []region.QoSRegion, pinnedCPUSizeByPkg map[string]int) (isolationRegionInfo, map[string]*isolationRegionInfo, error) {
+func extractIsolationRegionInfo(isolationRegions []region.QoSRegion, pinnedCPUSizeByPkg map[string]int, _ sets.String) (isolationRegionInfo, map[string]*isolationRegionInfo, error) {
 	unpinnedRegionInfo := initIsolationRegionInfo()
 	pinnedRegionInfos := make(map[string]*isolationRegionInfo)
 
@@ -782,6 +845,8 @@ func extractIsolationRegionInfo(isolationRegions []region.QoSRegion, pinnedCPUSi
 			}
 		}
 
+		// Isolation region currently doesn't use reclaimEnable in the same way as Share and Dedicated,
+		// but we still process it just in case, though it only sets upper/lower sizes.
 		ri.isolationUpperSizes[r.Name()] = int(controlKnob[configapi.ControlKnobNonIsolatedUpperCPUSize].Value)
 		ri.isolationLowerSizes[r.Name()] = int(controlKnob[configapi.ControlKnobNonIsolatedLowerCPUSize].Value)
 	}
@@ -789,7 +854,7 @@ func extractIsolationRegionInfo(isolationRegions []region.QoSRegion, pinnedCPUSi
 	return unpinnedRegionInfo, pinnedRegionInfos, nil
 }
 
-func extractDedicatedRegionInfo(regions []region.QoSRegion, pinnedCPUSizeByPkg map[string]int) (regionInfo, map[string]*regionInfo, error) {
+func extractDedicatedRegionInfo(regions []region.QoSRegion, pinnedCPUSizeByPkg map[string]int, nonReclaimablePackages sets.String) (regionInfo, map[string]*regionInfo, error) {
 	unpinnedRegionInfo := initRegionInfo()
 	pinnedRegionInfos := make(map[string]*regionInfo)
 
@@ -815,6 +880,11 @@ func extractDedicatedRegionInfo(regions []region.QoSRegion, pinnedCPUSizeByPkg m
 			}
 		}
 
+		reclaimEnable := r.EnableReclaim()
+		if pkgName != "" && nonReclaimablePackages.Has(pkgName) {
+			reclaimEnable = false // override reclaim Enable if the resource package is non-reclaimable
+		}
+
 		regionName := r.Name()
 		ri.requirements[regionName] = general.Max(1, int(controlKnob[configapi.ControlKnobNonReclaimedCPURequirement].Value))
 		if r.IsNumaBinding() {
@@ -826,9 +896,9 @@ func extractDedicatedRegionInfo(regions []region.QoSRegion, pinnedCPUSizeByPkg m
 		} else {
 			ri.requests[regionName] = int(math.Ceil(r.GetPodsRequest()))
 		}
-		ri.reclaimEnable[regionName] = r.EnableReclaim()
+		ri.reclaimEnable[regionName] = reclaimEnable
 		ri.podSet[regionName] = r.GetPods()
-		if r.EnableReclaim() {
+		if reclaimEnable {
 			if quota, ok := controlKnob[configapi.ControlKnobReclaimedCoresCPUQuota]; ok {
 				if ri.minReclaimedCoresCPUQuota == -1 || quota.Value < ri.minReclaimedCoresCPUQuota {
 					ri.minReclaimedCoresCPUQuota = quota.Value
