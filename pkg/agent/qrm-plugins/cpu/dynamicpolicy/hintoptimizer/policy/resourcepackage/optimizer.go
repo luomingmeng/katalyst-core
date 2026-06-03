@@ -132,6 +132,11 @@ func (o *resourcePackageHintOptimizer) Run(_ <-chan struct{}) error {
 }
 
 // populateHintsByResourcePackage optimizes hints based on resource package information.
+//
+// Single-NUMA hints are preferred: if at least one single-NUMA hint passes the resource-package
+// quota and unpinned-capacity checks, only those hints are kept. If no single-NUMA hint can
+// satisfy the request, multi-NUMA hints are kept as a fallback so that the optimizer does not
+// silently drop all candidates and force the upstream caller to fail with "no hints found".
 func (o *resourcePackageHintOptimizer) populateHintsByResourcePackage(
 	hints *pluginapi.ListOfTopologyHints,
 	cpuRequest float64,
@@ -172,14 +177,23 @@ func (o *resourcePackageHintOptimizer) populateHintsByResourcePackage(
 	}
 
 	optimizedHints := make([]*pluginapi.TopologyHint, 0, len(hints.Hints))
+	multiNUMAHints := make([]*pluginapi.TopologyHint, 0, len(hints.Hints))
 	for _, hint := range hints.Hints {
 		if len(hint.Nodes) != 1 {
+			multiNUMAHints = append(multiNUMAHints, hint)
 			continue
 		}
 
 		if canAllocateNodes.Has(int(hint.Nodes[0])) {
 			optimizedHints = append(optimizedHints, hint)
 		}
+	}
+
+	// fall back to multi-NUMA hints when no single-NUMA hint is feasible.
+	if len(optimizedHints) == 0 && len(multiNUMAHints) > 0 {
+		general.Infof("no single-NUMA hint satisfies resource package %s (cpu request %.3f); falling back to %d multi-NUMA hint(s)",
+			resourcePackage, cpuRequest, len(multiNUMAHints))
+		optimizedHints = multiNUMAHints
 	}
 
 	hints.Hints = optimizedHints
@@ -274,11 +288,31 @@ func (o *resourcePackageHintOptimizer) calculateNodeCPUMetrics(
 			continue
 		}
 
-		// 1. Calculate logically allocated CPU requests for the specific resource package
+		// 1. Calculate logically allocated CPU requests for the specific resource package.
+		// Prefer the main container's pod-aggregated request to avoid double-counting
+		// main+sidecar within the same pod, and to honor in-place resize aggregations.
+		// Fall back to per-container RequestQuantity only when no aggregated value is set.
 		if resourcePackage != "" {
-			for _, entry := range containerEntries {
-				if entry != nil && rputil.GetResourcePackageName(entry.Annotations) == resourcePackage {
-					allocatedForRP += entry.RequestQuantity
+			mainContainerEntry := containerEntries.GetMainContainerEntry()
+			if mainContainerEntry != nil &&
+				rputil.GetResourcePackageName(mainContainerEntry.Annotations) == resourcePackage {
+				if aggregatedPodResource, ok := mainContainerEntry.GetPodAggregatedRequest(); ok {
+					allocatedForRP += aggregatedPodResource
+				} else {
+					for _, entry := range containerEntries {
+						if entry != nil && rputil.GetResourcePackageName(entry.Annotations) == resourcePackage {
+							allocatedForRP += entry.RequestQuantity
+						}
+					}
+				}
+			} else {
+				// Main container missing or not in this resource package: fall back to
+				// per-container accumulation (covers degenerate cases where only sidecar
+				// entries exist on this NUMA snapshot).
+				for _, entry := range containerEntries {
+					if entry != nil && rputil.GetResourcePackageName(entry.Annotations) == resourcePackage {
+						allocatedForRP += entry.RequestQuantity
+					}
 				}
 			}
 		}

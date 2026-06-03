@@ -1678,8 +1678,15 @@ func (p *DynamicPolicy) reviseReclaimPool(newEntries state.PodEntries, nonReclai
 		}
 	}
 
+	// when the advisor has not assigned any reclaim CPUs to non-RNB NUMAs, fall back to
+	// the pre-computed reservedReclaimedTopologyAwareAssignments for those NUMAs so that
+	// the reclaim pool is never empty. Iterate the non-RNB NUMA IDs, not the (already
+	// empty) cpu set, otherwise this branch is dead code.
 	if nonReclaimActualBindingNUMAsAllocation.IsEmpty() {
-		for _, numaID := range nonReclaimActualBindingNUMAsAllocation.ToSliceInt() {
+		for _, numaID := range p.machineInfo.CPUDetails.NUMANodes().ToSliceInt() {
+			if !nonReclaimActualBindingNUMAs.Contains(numaID) {
+				continue
+			}
 			reclaimPool.AllocationResult = reclaimPool.AllocationResult.Union(p.reservedReclaimedTopologyAwareAssignments[numaID])
 			reclaimPool.OriginalAllocationResult = reclaimPool.OriginalAllocationResult.Union(p.reservedReclaimedTopologyAwareAssignments[numaID])
 			reclaimPool.TopologyAwareAssignments[numaID] = p.reservedReclaimedTopologyAwareAssignments[numaID].Clone()

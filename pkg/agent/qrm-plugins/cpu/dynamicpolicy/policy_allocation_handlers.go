@@ -82,7 +82,7 @@ func (p *DynamicPolicy) sharedCoresWithoutNUMABindingAllocationHandler(_ context
 		return nil, fmt.Errorf("getForbiddenCPUs failed with error: %v", err)
 	}
 
-	pooledCPUs.Difference(forbiddenCPUs)
+	pooledCPUs = pooledCPUs.Difference(forbiddenCPUs)
 
 	if pooledCPUs.IsEmpty() {
 		general.Errorf("pod: %s/%s, container: %s get empty pooledCPUs", req.PodNamespace, req.PodName, req.ContainerName)
