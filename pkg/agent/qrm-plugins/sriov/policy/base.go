@@ -82,6 +82,8 @@ func newBasePolicy(agentCtx *agent.GenericContext, conf *config.Configuration,
 		return nil, fmt.Errorf("NewCheckpointState failed with error: %v", err)
 	}
 
+	state.SetReadonlyState(stateImpl)
+
 	runtimeClient, err := remote.NewRemoteRuntimeService(conf.BaseConfiguration.RuntimeEndpoint, 2*time.Minute)
 	if err != nil {
 		return nil, fmt.Errorf("create remote runtime service failed %s", err)
