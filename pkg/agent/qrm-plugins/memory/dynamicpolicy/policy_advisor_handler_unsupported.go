@@ -26,8 +26,13 @@ import (
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
+	"github.com/kubewharf/katalyst-core/pkg/util/general"
 )
 
+// handleAdvisorMemoryHigh is a no-op on non-linux platforms because memory.high tuning
+// relies on cgroup v2 facilities that are unavailable here. We log a warning so that the
+// silent skip is observable at runtime; nil is returned to keep the upstream advisor
+// loop quiescent.
 func (p *DynamicPolicy) handleAdvisorMemoryHigh(
 	_ *config.Configuration,
 	_ interface{},
@@ -37,5 +42,7 @@ func (p *DynamicPolicy) handleAdvisorMemoryHigh(
 	entryName, subEntryName string,
 	calculationInfo *advisorsvc.CalculationInfo, podResourceEntries state.PodResourceEntries,
 ) error {
+	general.Warningf("handleAdvisorMemoryHigh is not supported on this platform; skipping entry: %s, sub-entry: %s",
+		entryName, subEntryName)
 	return nil
 }

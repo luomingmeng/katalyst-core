@@ -116,15 +116,24 @@ func (ai *AllocationInfo) GetResourceAllocation() (*pluginapi.ResourceAllocation
 		return nil, fmt.Errorf("GetResourceAllocation of nil AllocationInfo")
 	}
 
+	// build per-NUMA topology assignments so that downstream consumers can see the
+	// numa-level breakdown of the aggregated allocation, mirroring the behavior of
+	// PodResourceEntries.GetResourceAllocation.
+	topologyAssignments := make(map[uint64]uint64)
+	for numaID, quantity := range ai.TopologyAwareAllocations {
+		topologyAssignments[uint64(numaID)] = quantity
+	}
+
 	// deal with main resource
 	resourceAllocation := &pluginapi.ResourceAllocation{
 		ResourceAllocation: map[string]*pluginapi.ResourceAllocationInfo{
 			string(v1.ResourceMemory): {
-				OciPropertyName:   util.OCIPropertyNameCPUSetMems,
-				IsNodeResource:    false,
-				IsScalarResource:  true,
-				AllocatedQuantity: float64(ai.AggregatedQuantity),
-				AllocationResult:  ai.NumaAllocationResult.String(),
+				OciPropertyName:     util.OCIPropertyNameCPUSetMems,
+				IsNodeResource:      false,
+				IsScalarResource:    true,
+				AllocatedQuantity:   float64(ai.AggregatedQuantity),
+				AllocationResult:    ai.NumaAllocationResult.String(),
+				TopologyAssignments: topologyAssignments,
 			},
 		},
 	}

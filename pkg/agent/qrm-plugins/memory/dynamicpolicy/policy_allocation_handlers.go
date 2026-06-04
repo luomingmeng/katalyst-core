@@ -150,9 +150,15 @@ func (p *DynamicPolicy) numaBindingAllocationHandler(ctx context.Context,
 			}
 
 			// remove the main container of this pod (the main container involve the whole pod requests), and the
-			// sidecar container request in state is zero.
+			// sidecar container request in state is zero. We also wipe sidecar entries to avoid stale residual
+			// records skewing the regenerated machine state until the next reconcile.
 			containerEntries := podEntries[req.PodUid]
 			delete(containerEntries, req.ContainerName)
+			for cName, cInfo := range containerEntries {
+				if cInfo != nil && cInfo.CheckSideCar() {
+					delete(containerEntries, cName)
+				}
+			}
 
 			var stateErr error
 			memoryState, stateErr = state.GenerateMemoryStateFromPodEntries(p.state.GetMachineInfo(), p.state.GetMemoryTopology(), podEntries, p.state.GetReservedMemory(), resourceName)
@@ -326,9 +332,15 @@ func (p *DynamicPolicy) reclaimedCoresBestEffortNUMABindingAllocationHandler(ctx
 				"currentResult(bytes)", allocationInfo.AggregatedQuantity)
 
 			// remove the main container of this pod (the main container involve the whole pod requests), and the
-			// sidecar container request in state is zero.
+			// sidecar container request in state is zero. We also wipe sidecar entries to avoid stale residual
+			// records skewing the regenerated machine state until the next reconcile.
 			containerEntries := podEntries[req.PodUid]
 			delete(containerEntries, req.ContainerName)
+			for cName, cInfo := range containerEntries {
+				if cInfo != nil && cInfo.CheckSideCar() {
+					delete(containerEntries, cName)
+				}
+			}
 
 			var stateErr error
 			memoryState, stateErr = state.GenerateMemoryStateFromPodEntries(p.state.GetMachineInfo(), p.state.GetMemoryTopology(), podEntries, p.state.GetReservedMemory(), v1.ResourceMemory)
@@ -454,7 +466,7 @@ func (p *DynamicPolicy) numaBindingAllocationSidecarHandler(_ context.Context,
 			TopologyAwareAllocations: nil, // not count sidecar quantity
 		}
 
-		applySidecarAllocationInfoFromMainContainer(allocationInfo, mainContainerAllocationInfo)
+		p.applySidecarAllocationInfoFromMainContainer(allocationInfo, mainContainerAllocationInfo)
 
 		resourceAllocationInfo[v1.ResourceName(resourceName)] = allocationInfo
 	}

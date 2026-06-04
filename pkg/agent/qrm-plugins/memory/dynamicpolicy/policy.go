@@ -562,7 +562,11 @@ func (p *DynamicPolicy) Start() (err error) {
 func (p *DynamicPolicy) Stop() error {
 	p.Lock()
 	defer func() {
-		p.oomPriorityMap.Close()
+		// nil-safe release: oomPriorityMap is only initialized when EnableOOMPriority is true
+		// and the eBPF map is successfully loaded; otherwise it remains nil.
+		if p.oomPriorityMap != nil {
+			p.oomPriorityMap.Close()
+		}
 		p.started = false
 		p.Unlock()
 		general.Warningf("stopped")
@@ -575,6 +579,11 @@ func (p *DynamicPolicy) Stop() error {
 	close(p.stopCh)
 
 	periodicalhandler.StopHandlersByGroup(qrm.QRMMemoryPluginPeriodicalHandlerGroupName)
+
+	// close memory advisor grpc connection if it has been established (mirrors cpu DynamicPolicy.Stop).
+	if p.advisorConn != nil {
+		return p.advisorConn.Close()
+	}
 
 	return nil
 }
@@ -758,7 +767,7 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 				}
 
 				if allocationInfo.CheckSideCar() && mainContainerAllocationInfo != nil {
-					if applySidecarAllocationInfoFromMainContainer(allocationInfo, mainContainerAllocationInfo) {
+					if p.applySidecarAllocationInfoFromMainContainer(allocationInfo, mainContainerAllocationInfo) {
 						general.Infof("pod: %s/%s sidecar container: %s update its allocation",
 							allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName)
 						if hookErr := p.updateAllocationInfo(resourceName, podUID, containerName, nil, allocationInfo, true); hookErr != nil {
@@ -1324,7 +1333,9 @@ func (p *DynamicPolicy) checkNonBindingShareCoresMemoryResource(req *pluginapi.R
 				continue
 			}
 			// shareCoresAllocated should involve both main and sidecar containers
-			if containerAllocation.CheckDedicated() && !containerAllocation.CheckNUMABinding() {
+			// for shared-qos pods that are not numa-bound (i.e. consume the
+			// non-binding share-cores memory pool).
+			if containerAllocation.CheckShared() && !containerAllocation.CheckNUMABinding() {
 				shareCoresAllocated += p.getContainerRequestedMemoryBytes(containerAllocation)
 			}
 		}

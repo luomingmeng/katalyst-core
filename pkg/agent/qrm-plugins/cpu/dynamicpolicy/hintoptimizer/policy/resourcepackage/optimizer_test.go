@@ -508,7 +508,10 @@ func TestResourcePackageHintOptimizer_populateHintsByResourcePackage(t *testing.
 				resourcePackage: "test-package",
 				allocatableMap:  map[int]float64{0: 2.0},
 				allocatedMap:    map[int]float64{0: 0.5},
-				expectedHints:   []*pluginapi.TopologyHint{}, // Multi-node hints should be filtered out
+				// No single-NUMA hint available; fall back to multi-NUMA hints.
+				expectedHints: []*pluginapi.TopologyHint{
+					{Nodes: []uint64{0, 1}},
+				},
 			},
 			{
 				name: "hints with single node - sufficient resources",
