@@ -27,43 +27,46 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 )
 
-// Sort sorts the filtered GPU devices based on available GPU compute
-// It prioritizes devices with less available memory and considers NUMA affinity
+// Sort sorts the filtered GPU devices based on available GPU resources (memory & milligpu)
+// It prioritizes devices with less available memory and considers NUMA affinity.
+// When the request only carries ResourceMilliGPU (no GPU memory), sorting falls back to
+// milligpu headroom so that milligpu-only requests still benefit from spread/pack ordering
+// rather than returning the unsorted slice.
 // TODO: support multiple resources, prioritize virtual_gpu for sorting, then milligpu
 func (s *VirtualGPUStrategy) Sort(ctx *allocate.AllocationContext, filteredDevices []string) ([]string, error) {
 	if ctx.DeviceTopology == nil {
 		return nil, fmt.Errorf("GPU topology is nil")
 	}
 
-	_, gpuCompute, err := qrmutil.GetQuantityFromResourceRequests(ctx.ResourceReq.ResourceRequests, string(consts.ResourceGPUMemory), nil)
-	if err != nil {
-		general.Warningf("getReqQuantityFromResourceReq failed with error: %v, use default filtered devices", err)
+	_, gpuMemory, memErr := qrmutil.GetQuantityFromResourceRequests(ctx.ResourceReq.ResourceRequests, string(consts.ResourceGPUMemory), nil)
+	_, milliGPU, milliErr := qrmutil.GetQuantityFromResourceRequests(ctx.ResourceReq.ResourceRequests, string(consts.ResourceMilliGPU), nil)
+	if memErr != nil && milliErr != nil {
+		general.Warningf("getReqQuantityFromResourceReq failed for both gpu_memory (err=%v) and milligpu (err=%v), use default filtered devices", memErr, milliErr)
+		return filteredDevices, nil
+	}
+	if gpuMemory == 0 && milliGPU == 0 {
+		general.Infof("no non-zero gpu_memory or milligpu request, use default available devices")
 		return filteredDevices, nil
 	}
 
-	if gpuCompute == 0 {
-		general.Infof("GPU Compute is 0, use default available devices")
-		return filteredDevices, nil
-	}
-
-	gpuComputeAllocatablePerGPU := float64(ctx.GPUQRMPluginConfig.GPUMemoryAllocatablePerGPU.Value())
-	milliGPUAllocatablePerGPU := float64(ctx.GPUQRMPluginConfig.MilliGPUAllocatablePerGPU.Value())
-	gpuComputeMachineState := ctx.MachineState[consts.ResourceGPUMemory]
+	gpuMemoryAllocatablePerGPU := ctx.GPUQRMPluginConfig.GPUMemoryAllocatablePerGPU.Value()
+	milliGPUAllocatablePerGPU := ctx.GPUQRMPluginConfig.MilliGPUAllocatablePerGPU.Value()
+	gpuMemoryMachineState := ctx.MachineState[consts.ResourceGPUMemory]
 	milliGPUMachineState := ctx.MachineState[consts.ResourceMilliGPU]
 
 	// Create a slice of device info with available memory and available milligpu
 	type deviceInfo struct {
 		ID                string
-		AvailableMemory   float64
-		AvailableMilliGPU float64
+		AvailableMemory   int64
+		AvailableMilliGPU int64
 		NUMAAffinity      bool
 	}
 
 	devices := make([]deviceInfo, 0, len(filteredDevices))
 
 	for _, deviceID := range filteredDevices {
-		availableMemory := gpuComputeAllocatablePerGPU - gpuComputeMachineState.GetQuantityAllocated(deviceID)
-		availableMilliGPU := milliGPUAllocatablePerGPU - milliGPUMachineState.GetQuantityAllocated(deviceID)
+		availableMemory := gpuMemoryAllocatablePerGPU - int64(gpuMemoryMachineState.GetQuantityAllocated(deviceID))
+		availableMilliGPU := milliGPUAllocatablePerGPU - int64(milliGPUMachineState.GetQuantityAllocated(deviceID))
 		devices = append(devices, deviceInfo{
 			ID:                deviceID,
 			AvailableMemory:   availableMemory,

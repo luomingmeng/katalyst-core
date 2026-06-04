@@ -17,6 +17,7 @@ limitations under the License.
 package allocation
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate"
@@ -24,6 +25,24 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 )
+
+// allocationLogContext extracts pod and resource identifiers from the
+// allocation context for use in log messages. Safe to call with a nil ctx.
+func allocationLogContext(ctx *allocate.AllocationContext) (podInfo, resourceName string) {
+	var podNamespace, podName, containerName string
+	if ctx != nil {
+		if ctx.ResourceReq != nil {
+			podNamespace = ctx.ResourceReq.PodNamespace
+			podName = ctx.ResourceReq.PodName
+			containerName = ctx.ResourceReq.ContainerName
+		}
+		if ctx.DeviceReq != nil {
+			resourceName = ctx.DeviceReq.DeviceName
+		}
+	}
+	podInfo = fmt.Sprintf("pod: %s/%s, container: %s", podNamespace, podName, containerName)
+	return
+}
 
 // emitDuration emits the elapsed time since startTime as a raw float64
 // millisecond metric and logs it. Safe to call with a nil emitter.
@@ -49,9 +68,20 @@ type timedFilteringStrategy struct {
 // Filter overrides the promoted Filter() to add timing/metrics.
 func (t *timedFilteringStrategy) Filter(ctx *allocate.AllocationContext, devices []string) ([]string, error) {
 	start := time.Now()
-	tags := append(t.tags, metrics.MetricTag{Key: "strategyName", Val: t.FilteringStrategy.Name()})
+	strategyName := t.FilteringStrategy.Name()
+	tags := append(t.tags, metrics.MetricTag{Key: "strategyName", Val: strategyName})
 	defer emitDuration(t.emitter, t.metricName, start, tags...)
-	return t.FilteringStrategy.Filter(ctx, devices)
+
+	podInfo, resourceName := allocationLogContext(ctx)
+	filtered, err := t.FilteringStrategy.Filter(ctx, devices)
+	if err != nil {
+		general.Errorf("%s, failed to filter available devices with strategy %s, resource %s, err: %v",
+			podInfo, strategyName, resourceName, err)
+		return filtered, err
+	}
+	general.Infof("%s, success filter %s, resource %s, available devices %v -> %v",
+		podInfo, strategyName, resourceName, devices, filtered)
+	return filtered, nil
 }
 
 // timedSortingStrategy wraps a SortingStrategy and emits its Sort duration.
@@ -64,9 +94,20 @@ type timedSortingStrategy struct {
 
 func (t *timedSortingStrategy) Sort(ctx *allocate.AllocationContext, devices []string) ([]string, error) {
 	start := time.Now()
-	tags := append(t.tags, metrics.MetricTag{Key: "strategyName", Val: t.SortingStrategy.Name()})
+	strategyName := t.SortingStrategy.Name()
+	tags := append(t.tags, metrics.MetricTag{Key: "strategyName", Val: strategyName})
 	defer emitDuration(t.emitter, t.metricName, start, tags...)
-	return t.SortingStrategy.Sort(ctx, devices)
+
+	podInfo, resourceName := allocationLogContext(ctx)
+	sorted, err := t.SortingStrategy.Sort(ctx, devices)
+	if err != nil {
+		general.Errorf("%s, failed to sort available devices with strategy %s, resource %s, err: %v",
+			podInfo, strategyName, resourceName, err)
+		return sorted, err
+	}
+	general.Infof("%s, success sort available devices with strategy %s, resource %s: %v",
+		podInfo, strategyName, resourceName, sorted)
+	return sorted, nil
 }
 
 // timedBindingStrategy wraps a BindingStrategy and emits its Bind duration.
@@ -79,9 +120,24 @@ type timedBindingStrategy struct {
 
 func (t *timedBindingStrategy) Bind(ctx *allocate.AllocationContext, devices []string) (*allocate.AllocationResult, error) {
 	start := time.Now()
-	tags := append(t.tags, metrics.MetricTag{Key: "strategyName", Val: t.BindingStrategy.Name()})
+	strategyName := t.BindingStrategy.Name()
+	tags := append(t.tags, metrics.MetricTag{Key: "strategyName", Val: strategyName})
 	defer emitDuration(t.emitter, t.metricName, start, tags...)
-	return t.BindingStrategy.Bind(ctx, devices)
+
+	podInfo, resourceName := allocationLogContext(ctx)
+	result, err := t.BindingStrategy.Bind(ctx, devices)
+	if err != nil {
+		general.Errorf("%s, failed to bind available devices with strategy %s, resource %s, err: %v",
+			podInfo, strategyName, resourceName, err)
+		return result, err
+	}
+	var allocated []string
+	if result != nil {
+		allocated = result.AllocatedDevices
+	}
+	general.Infof("%s, success bind available devices with strategy %s, resource %s: %v",
+		podInfo, strategyName, resourceName, allocated)
+	return result, nil
 }
 
 // withFilterTiming returns a FilteringStrategy that emits filter duration metrics.

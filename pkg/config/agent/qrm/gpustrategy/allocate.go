@@ -24,5 +24,10 @@ type AllocateStrategyConfig struct {
 }
 
 func NewGPUAllocateStrategyConfig() *AllocateStrategyConfig {
-	return &AllocateStrategyConfig{}
+	return &AllocateStrategyConfig{
+		CustomFilteringStrategies: map[string][]string{},
+		CustomSortingStrategy:     map[string]string{},
+		CustomBindingStrategy:     map[string]string{},
+		CustomAllocationStrategy:  map[string]string{},
+	}
 }

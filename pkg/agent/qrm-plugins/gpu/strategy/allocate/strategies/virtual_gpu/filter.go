@@ -63,8 +63,17 @@ func (s *VirtualGPUStrategy) filterGPUDevices(
 	gpuRequest := ctx.DeviceReq.GetDeviceRequest()
 
 	requestPerGPU := make(map[v1.ResourceName]float64)
-	for res, req := range resourceRequests {
-		requestPerGPU[res] = req / float64(gpuRequest)
+	// gpuRequest can legitimately be 0 for milligpu-only requests (no whole GPU is asked for).
+	// In that case the request is satisfiable on any GPU that has enough headroom for the
+	// per-resource request, so treat the per-GPU request as the full request quantity.
+	if gpuRequest == 0 {
+		for res, req := range resourceRequests {
+			requestPerGPU[res] = req
+		}
+	} else {
+		for res, req := range resourceRequests {
+			requestPerGPU[res] = req / float64(gpuRequest)
+		}
 	}
 
 	allocatablePerGPU := map[v1.ResourceName]float64{
