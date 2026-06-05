@@ -2520,3 +2520,164 @@ func TestGpuReporterPlugin_StartDisabledFallback(t *testing.T) {
 	err = p.Stop()
 	assert.NoError(t, err)
 }
+
+type mockMetricsEmitter struct {
+	metrics.DummyMetrics
+	storedInt64 map[string][]int64
+	storedTags  map[string][][]metrics.MetricTag
+}
+
+func newMockMetricsEmitter() *mockMetricsEmitter {
+	return &mockMetricsEmitter{
+		storedInt64: make(map[string][]int64),
+		storedTags:  make(map[string][][]metrics.MetricTag),
+	}
+}
+
+func (m *mockMetricsEmitter) StoreInt64(key string, val int64, _ metrics.MetricTypeName, tags ...metrics.MetricTag) error {
+	m.storedInt64[key] = append(m.storedInt64[key], val)
+	m.storedTags[key] = append(m.storedTags[key], tags)
+	return nil
+}
+
+func (m *mockMetricsEmitter) WithTags(unit string, commonTags ...metrics.MetricTag) metrics.MetricEmitter {
+	w := &metrics.MetricTagWrapper{MetricEmitter: m}
+	return w.WithTags(unit, commonTags...)
+}
+
+// TestGpuReporterPlugin_GetZoneAllocations_KubeletCheckpointFailureEmitsMetric verifies that
+// when addKubeletCheckpointAllocations returns an error, getZoneAllocations emits the
+// metricAddKubeletCheckpointAllocationsFailed metric with the error_message tag and
+// propagates the error.
+func TestGpuReporterPlugin_GetZoneAllocations_KubeletCheckpointFailureEmitsMetric(t *testing.T) {
+	t.Parallel()
+
+	emitter := newMockMetricsEmitter()
+	checkpointErr := fmt.Errorf("boom: checkpoint manager exploded")
+
+	p := &gpuReporterPlugin{
+		ctx:                             context.TODO(),
+		emitter:                         emitter,
+		gpuDeviceNames:                  []string{"test-resource"},
+		enableKubeletCheckpointFallback: true,
+		checkpointManager: &mockCheckpointManager{
+			getErr: checkpointErr,
+		},
+	}
+
+	zoneAllocations, err := p.getZoneAllocations(state.AllocationResourcesMap{})
+	assert.Error(t, err)
+	assert.Nil(t, zoneAllocations)
+
+	vals := emitter.storedInt64[metricAddKubeletCheckpointAllocationsFailed]
+	assert.Equal(t, []int64{1}, vals, "expected failure metric to be emitted exactly once")
+
+	tagsList := emitter.storedTags[metricAddKubeletCheckpointAllocationsFailed]
+	assert.Len(t, tagsList, 1)
+
+	tagMap := make(map[string]string)
+	for _, tag := range tagsList[0] {
+		tagMap[tag.Key] = tag.Val
+	}
+	assert.NotEmpty(t, tagMap["error_message"], "expected error_message tag to be set")
+}
+
+// TestGpuReporterPlugin_GetZoneAllocations_KubeletCheckpointFailureNilEmitter verifies
+// that when the emitter is nil, the failure path does not panic and the error is still
+// propagated.
+func TestGpuReporterPlugin_GetZoneAllocations_KubeletCheckpointFailureNilEmitter(t *testing.T) {
+	t.Parallel()
+
+	p := &gpuReporterPlugin{
+		ctx:                             context.TODO(),
+		emitter:                         nil,
+		gpuDeviceNames:                  []string{"test-resource"},
+		enableKubeletCheckpointFallback: true,
+		checkpointManager: &mockCheckpointManager{
+			getErr: fmt.Errorf("checkpoint failure"),
+		},
+	}
+
+	zoneAllocations, err := p.getZoneAllocations(state.AllocationResourcesMap{})
+	assert.Error(t, err)
+	assert.Nil(t, zoneAllocations)
+}
+
+// TestGpuReporterPlugin_StartEnsureKubeletDevicePluginPathFailure verifies that when the
+// kubelet device plugin path cannot be created (because a regular file occupies the parent
+// component of the requested path), Start returns an error and the
+// metricEnsureKubeletDevicePluginPathFailed metric is emitted with the error_message and
+// path tags.
+func TestGpuReporterPlugin_StartEnsureKubeletDevicePluginPathFailure(t *testing.T) {
+	t.Parallel()
+
+	tempDir, err := os.MkdirTemp("", "kubelet-device-plugin-ensure-fail")
+	assert.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	// Create a regular file; its sub-path cannot be created as a directory because the
+	// parent is a file, which forces general.EnsureDirectory -> MkdirAll to fail.
+	parentFile := filepath.Join(tempDir, "not-a-dir")
+	err = os.WriteFile(parentFile, []byte("blocker"), 0o644)
+	assert.NoError(t, err)
+	invalidPath := filepath.Join(parentFile, "child")
+
+	emitter := newMockMetricsEmitter()
+
+	p := &gpuReporterPlugin{
+		emitter:                         emitter,
+		kubeletDevicePluginPath:         invalidPath,
+		enableKubeletCheckpointFallback: true,
+		reportNotifyCh:                  make(chan struct{}, 1),
+	}
+
+	err = p.Start()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "ensure kubelet device plugin path")
+
+	// metric should be emitted exactly once with the expected tags
+	vals := emitter.storedInt64[metricEnsureKubeletDevicePluginPathFailed]
+	assert.Equal(t, []int64{1}, vals, "expected ensure-path failure metric to be emitted exactly once")
+
+	tagsList := emitter.storedTags[metricEnsureKubeletDevicePluginPathFailed]
+	assert.Len(t, tagsList, 1)
+
+	tagMap := make(map[string]string)
+	for _, tag := range tagsList[0] {
+		tagMap[tag.Key] = tag.Val
+	}
+	assert.NotEmpty(t, tagMap["error_message"], "expected error_message tag to be set")
+	assert.NotEmpty(t, tagMap["path"], "expected path tag to be set")
+
+	// The plugin should not be marked as started since Start failed.
+	p.RLock()
+	assert.False(t, p.started)
+	p.RUnlock()
+}
+
+// TestGpuReporterPlugin_StartEnsureKubeletDevicePluginPathFailureNilEmitter verifies that
+// when EnsureDirectory fails and the emitter is nil, Start does not panic and still
+// returns the wrapped error.
+func TestGpuReporterPlugin_StartEnsureKubeletDevicePluginPathFailureNilEmitter(t *testing.T) {
+	t.Parallel()
+
+	tempDir, err := os.MkdirTemp("", "kubelet-device-plugin-ensure-fail-nil")
+	assert.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
+	parentFile := filepath.Join(tempDir, "not-a-dir")
+	err = os.WriteFile(parentFile, []byte("blocker"), 0o644)
+	assert.NoError(t, err)
+	invalidPath := filepath.Join(parentFile, "child")
+
+	p := &gpuReporterPlugin{
+		emitter:                         nil,
+		kubeletDevicePluginPath:         invalidPath,
+		enableKubeletCheckpointFallback: true,
+		reportNotifyCh:                  make(chan struct{}, 1),
+	}
+
+	err = p.Start()
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "ensure kubelet device plugin path")
+}
