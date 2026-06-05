@@ -20,10 +20,15 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/sets"
 	cliflag "k8s.io/component-base/cli/flag"
 
 	"github.com/kubewharf/katalyst-core/pkg/config/controller"
 )
+
+type CNRLifecycleOptions struct {
+	LabelKeepKeys []string
+}
 
 type HealthzOptions struct {
 	DryRun        bool
@@ -49,6 +54,7 @@ type LifeCycleOptions struct {
 	EnableCNCLifecycle bool
 	EnableCNRLifecycle bool
 
+	*CNRLifecycleOptions
 	*HealthzOptions
 }
 
@@ -58,6 +64,9 @@ func NewLifeCycleOptions() *LifeCycleOptions {
 		EnableHealthz:      false,
 		EnableCNCLifecycle: true,
 		EnableCNRLifecycle: true,
+		CNRLifecycleOptions: &CNRLifecycleOptions{
+			LabelKeepKeys: []string{},
+		},
 		HealthzOptions: &HealthzOptions{
 			DryRun:        false,
 			NodeSelector:  "",
@@ -87,6 +96,9 @@ func (o *LifeCycleOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 		"whether to enable the cnc lifecycle controller")
 	fs.BoolVar(&o.EnableCNRLifecycle, "cnr-lifecycle-enabled", o.EnableCNRLifecycle,
 		"whether to enable the cnr lifecycle controller")
+
+	fs.StringSliceVar(&o.LabelKeepKeys, "cnr-lifecycle-label-keep-keys", o.LabelKeepKeys,
+		"label keys that should be preserved on CNR even when absent on the Node")
 
 	fs.BoolVar(&o.DryRun, "healthz-dry-run", o.DryRun,
 		"a bool to enable and disable dry-run logic of healthz controller.")
@@ -122,6 +134,11 @@ func (o *LifeCycleOptions) ApplyTo(c *controller.LifeCycleConfig) error {
 	c.EnableHealthz = o.EnableHealthz
 	c.EnableCNCLifecycle = o.EnableCNCLifecycle
 	c.EnableCNRLifecycle = o.EnableCNRLifecycle
+
+	if c.CNRLifecycleConfig == nil {
+		c.CNRLifecycleConfig = &controller.CNRLifecycleConfig{}
+	}
+	c.CNRLifecycleConfig.LabelKeepKeys = sets.NewString(o.LabelKeepKeys...)
 
 	c.DryRun = o.DryRun
 
