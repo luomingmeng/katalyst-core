@@ -67,9 +67,12 @@ type SPDBaselinePodMeta struct {
 
 func (c SPDBaselinePodMeta) Cmp(c1 SPDBaselinePodMeta) int {
 	if c.CustomCompareKey != "" && c.CustomCompareKey == c1.CustomCompareKey {
-		customKeyProcessor, _ := GetSPDPodMetaCustomProcessor(c.CustomCompareKey)
-		customCmpFunc := customKeyProcessor.PodMetaCustomCmp
-		return customCmpFunc(c, c1)
+		if customKeyProcessor, err := GetSPDPodMetaCustomProcessor(c.CustomCompareKey); err == nil && customKeyProcessor.PodMetaCustomCmp != nil {
+			return customKeyProcessor.PodMetaCustomCmp(c, c1)
+		}
+		// the processor for this key is not registered in the current binary;
+		// fall back to the default timestamp/podName comparison instead of panicking.
+		klog.Warningf("[spd] no custom processor registered for compare key %v, falling back to default comparison", c.CustomCompareKey)
 	}
 	if c.TimeStamp.Time.Before(c1.TimeStamp.Time) {
 		return -1
