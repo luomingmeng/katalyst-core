@@ -310,22 +310,22 @@ func TestNodeMetricUpdate(t *testing.T) {
 						NUMAUsage: []nodeapis.NUMAMetricInfo{
 							{
 								NUMAId: 0,
-								Usage: &nodeapis.ResourceMetric{
-									Memory: mustParse("40Gi"),
-									CPU:    mustParse("2"),
+								Usage: corev1.ResourceList{
+									corev1.ResourceMemory: *mustParse("40Gi"),
+									corev1.ResourceCPU:    *mustParse("2"),
 								},
 							},
 							{
 								NUMAId: 1,
-								Usage: &nodeapis.ResourceMetric{
-									Memory: mustParse("40Gi"),
-									CPU:    mustParse("2"),
+								Usage: corev1.ResourceList{
+									corev1.ResourceMemory: *mustParse("40Gi"),
+									corev1.ResourceCPU:    *mustParse("2"),
 								},
 							},
 						},
-						GenericUsage: &nodeapis.ResourceMetric{
-							CPU:    mustParse("8"),
-							Memory: mustParse("200Gi"),
+						GenericUsage: corev1.ResourceList{
+							corev1.ResourceCPU:    *mustParse("8"),
+							corev1.ResourceMemory: *mustParse("200Gi"),
 						},
 					},
 				},
@@ -336,22 +336,22 @@ func TestNodeMetricUpdate(t *testing.T) {
 							NUMAUsage: []nodeapis.NUMAMetricInfo{
 								{
 									NUMAId: 0,
-									Usage: &nodeapis.ResourceMetric{
-										Memory: mustParse("0"),
-										CPU:    mustParse("0"),
+									Usage: corev1.ResourceList{
+										corev1.ResourceMemory: *mustParse("0"),
+										corev1.ResourceCPU:    *mustParse("0"),
 									},
 								},
 								{
 									NUMAId: 1,
-									Usage: &nodeapis.ResourceMetric{
-										Memory: mustParse("0"),
-										CPU:    mustParse("0"),
+									Usage: corev1.ResourceList{
+										corev1.ResourceMemory: *mustParse("0"),
+										corev1.ResourceCPU:    *mustParse("0"),
 									},
 								},
 							},
-							GenericUsage: &nodeapis.ResourceMetric{
-								CPU:    mustParse("1"),
-								Memory: mustParse("10Gi"),
+							GenericUsage: corev1.ResourceList{
+								corev1.ResourceCPU:    *mustParse("1"),
+								corev1.ResourceMemory: *mustParse("10Gi"),
 							},
 						},
 						PodList: []string{"default/pod2"},
@@ -362,22 +362,22 @@ func TestNodeMetricUpdate(t *testing.T) {
 							NUMAUsage: []nodeapis.NUMAMetricInfo{
 								{
 									NUMAId: 0,
-									Usage: &nodeapis.ResourceMetric{
-										CPU:    mustParse("2"),
-										Memory: mustParse("11Gi"),
+									Usage: corev1.ResourceList{
+										corev1.ResourceCPU:    *mustParse("2"),
+										corev1.ResourceMemory: *mustParse("11Gi"),
 									},
 								},
 								{
 									NUMAId: 1,
-									Usage: &nodeapis.ResourceMetric{
-										CPU:    mustParse("2"),
-										Memory: mustParse("11Gi"),
+									Usage: corev1.ResourceList{
+										corev1.ResourceCPU:    *mustParse("2"),
+										corev1.ResourceMemory: *mustParse("11Gi"),
 									},
 								},
 							},
-							GenericUsage: &nodeapis.ResourceMetric{
-								CPU:    mustParse("3"),
-								Memory: mustParse("30Gi"),
+							GenericUsage: corev1.ResourceList{
+								corev1.ResourceCPU:    *mustParse("3"),
+								corev1.ResourceMemory: *mustParse("30Gi"),
 							},
 						},
 						PodList: []string{"default/pod1", "default/pod4"},
@@ -388,22 +388,22 @@ func TestNodeMetricUpdate(t *testing.T) {
 							NUMAUsage: []nodeapis.NUMAMetricInfo{
 								{
 									NUMAId: 0,
-									Usage: &nodeapis.ResourceMetric{
-										Memory: mustParse("0"),
-										CPU:    mustParse("0"),
+									Usage: corev1.ResourceList{
+										corev1.ResourceMemory: *mustParse("0"),
+										corev1.ResourceCPU:    *mustParse("0"),
 									},
 								},
 								{
 									NUMAId: 1,
-									Usage: &nodeapis.ResourceMetric{
-										Memory: mustParse("0"),
-										CPU:    mustParse("0"),
+									Usage: corev1.ResourceList{
+										corev1.ResourceMemory: *mustParse("0"),
+										corev1.ResourceCPU:    *mustParse("0"),
 									},
 								},
 							},
-							GenericUsage: &nodeapis.ResourceMetric{
-								CPU:    mustParse("1"),
-								Memory: mustParse("10Gi"),
+							GenericUsage: corev1.ResourceList{
+								corev1.ResourceCPU:    *mustParse("1"),
+								corev1.ResourceMemory: *mustParse("10Gi"),
 							},
 						},
 						PodList: []string{"default/pod3"},
@@ -414,22 +414,22 @@ func TestNodeMetricUpdate(t *testing.T) {
 							NUMAUsage: []nodeapis.NUMAMetricInfo{
 								{
 									NUMAId: 0,
-									Usage: &nodeapis.ResourceMetric{
-										Memory: mustParse("0"),
-										CPU:    mustParse("0"),
+									Usage: corev1.ResourceList{
+										corev1.ResourceMemory: *mustParse("0"),
+										corev1.ResourceCPU:    *mustParse("0"),
 									},
 								},
 								{
 									NUMAId: 1,
-									Usage: &nodeapis.ResourceMetric{
-										Memory: mustParse("0"),
-										CPU:    mustParse("0"),
+									Usage: corev1.ResourceList{
+										corev1.ResourceMemory: *mustParse("0"),
+										corev1.ResourceCPU:    *mustParse("0"),
 									},
 								},
 							},
-							GenericUsage: &nodeapis.ResourceMetric{
-								CPU:    mustParse("0"),
-								Memory: mustParse("0"),
+							GenericUsage: corev1.ResourceList{
+								corev1.ResourceCPU:    *mustParse("0"),
+								corev1.ResourceMemory: *mustParse("0"),
 							},
 						},
 						PodList: nil,
