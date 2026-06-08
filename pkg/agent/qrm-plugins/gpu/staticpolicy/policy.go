@@ -727,7 +727,7 @@ func (p *StaticPolicy) AllocateAssociatedDevice(
 
 		elapsed := time.Since(startTime)
 		_ = p.emitter.StoreFloat64(util.MetricNameAllocateAssociatedDeviceDuration,
-			float64(elapsed/time.Millisecond), metrics.MetricTypeNameRaw,
+			float64(elapsed)/float64(time.Millisecond), metrics.MetricTypeNameRaw,
 			metrics.MetricTag{Key: "deviceName", Val: req.DeviceName},
 			metrics.MetricTag{Key: "accompanyResourceName", Val: req.AccompanyResourceName},
 			metrics.MetricTag{Key: "success", Val: strconv.FormatBool(respErr == nil)},
