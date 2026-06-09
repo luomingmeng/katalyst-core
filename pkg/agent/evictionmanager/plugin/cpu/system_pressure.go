@@ -456,6 +456,9 @@ func (s *SystemPressureEvictionPlugin) GetTopEvictionPods(
 		}
 	}
 
+	general.Infof("cpu system eviction get top (len=%d) pods: %v, candidate pods (len=%d): %v, over metric name: %s",
+		len(topNPods), native.GetNamespacedNameListFromSlice(topNPods), len(candidatePods), native.GetNamespacedNameListFromSlice(candidatePods), s.overMetricName)
+
 	s.overMetricName = ""
 	return resp, nil
 }
