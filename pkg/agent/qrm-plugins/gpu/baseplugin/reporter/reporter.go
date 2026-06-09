@@ -46,14 +46,17 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
+	"github.com/kubewharf/katalyst-core/pkg/util/metric"
 	"github.com/kubewharf/katalyst-core/pkg/util/native"
 )
 
 const (
-	gpuReporterPluginName      = "gpu-reporter-plugin"
-	propertyNameGPUTopology    = "gpu_topology_attribute_key"
-	defaultReportRetryInterval = 5 * time.Second
-	metricGetPodListFailed     = "qrm_gpu_reporter_get_pod_list_failed"
+	gpuReporterPluginName                       = "gpu-reporter-plugin"
+	propertyNameGPUTopology                     = "gpu_topology_attribute_key"
+	defaultReportRetryInterval                  = 5 * time.Second
+	metricGetPodListFailed                      = "qrm_gpu_reporter_get_pod_list_failed"
+	metricAddKubeletCheckpointAllocationsFailed = "qrm_gpu_reporter_add_kubelet_checkpoint_allocations_failed"
+	metricEnsureKubeletDevicePluginPathFailed   = "qrm_gpu_reporter_ensure_kubelet_device_plugin_path_failed"
 )
 
 var zeroQuantity = *resource.NewQuantity(0, resource.DecimalSI)
@@ -187,6 +190,11 @@ func (p *gpuReporterPlugin) Start() (err error) {
 	if p.enableKubeletCheckpointFallback && p.kubeletDevicePluginPath != "" {
 		err = general.EnsureDirectory(p.kubeletDevicePluginPath)
 		if err != nil {
+			if p.emitter != nil {
+				_ = p.emitter.StoreInt64(metricEnsureKubeletDevicePluginPathFailed, 1, metrics.MetricTypeNameRaw,
+					metrics.MetricTag{Key: "error_message", Val: metric.MetricTagValueFormat(err)},
+					metrics.MetricTag{Key: "path", Val: metric.MetricTagValueFormat(p.kubeletDevicePluginPath)})
+			}
 			return fmt.Errorf("ensure kubelet device plugin path %s exists failed: %w", p.kubeletDevicePluginPath, err)
 		}
 
@@ -506,6 +514,10 @@ func (p *gpuReporterPlugin) getZoneAllocations(machineState state.AllocationReso
 	// Add allocations from kubelet device manager checkpoint as a fallback.
 	if p.enableKubeletCheckpointFallback {
 		if err := p.addKubeletCheckpointAllocations(idToAllocations); err != nil {
+			if p.emitter != nil {
+				_ = p.emitter.StoreInt64(metricAddKubeletCheckpointAllocationsFailed, 1, metrics.MetricTypeNameRaw,
+					metrics.MetricTag{Key: "error_message", Val: metric.MetricTagValueFormat(err)})
+			}
 			return nil, err
 		}
 	}

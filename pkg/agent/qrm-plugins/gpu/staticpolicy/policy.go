@@ -45,6 +45,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
+	"github.com/kubewharf/katalyst-core/pkg/util/metric"
 )
 
 // StaticPolicy is the static gpu policy
@@ -710,6 +711,13 @@ func (p *StaticPolicy) AllocateAssociatedDevice(
 			if deviceType != "" {
 				_ = p.removeContainer(req.ResourceRequest.PodUid, req.ResourceRequest.ContainerName, v1.ResourceName(deviceType))
 			}
+
+			metricTags := []metrics.MetricTag{
+				{Key: "error_message", Val: metric.MetricTagValueFormat(respErr)},
+				{Key: "device_name", Val: req.DeviceName},
+				{Key: "accompany_resource_name", Val: req.AccompanyResourceName},
+			}
+			_ = p.emitter.StoreInt64(util.MetricNameAllocateAssociatedDeviceFailed, 1, metrics.MetricTypeNameRaw, metricTags...)
 		}
 		p.Unlock()
 	}()
