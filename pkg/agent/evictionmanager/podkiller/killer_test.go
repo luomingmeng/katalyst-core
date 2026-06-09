@@ -24,12 +24,16 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
+	policy "k8s.io/api/policy/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
+	coretesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/events"
 	critesting "k8s.io/cri-api/pkg/apis/testing"
 
 	katalyst_base "github.com/kubewharf/katalyst-core/cmd/base"
+	"github.com/kubewharf/katalyst-core/pkg/config"
 	"github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 )
@@ -174,5 +178,146 @@ func TestContainerKiller_Evict(t *testing.T) {
 			require.NoError(t, evictErr)
 			require.Equal(t, tt.wantKillContainerCount, len(fakeRuntimeService.GetCalls()))
 		}
+	}
+}
+
+func TestEvictionAPIKiller_buildEvictionExplicitTriggerAnnotations(t *testing.T) {
+	t.Parallel()
+
+	newConf := func(key, value string) *config.Configuration {
+		c := config.NewConfiguration()
+		c.GenericEvictionConfiguration.EvictionExplicitTriggerAnnotationKey = key
+		c.GenericEvictionConfiguration.EvictionExplicitTriggerAnnotationValue = value
+		return c
+	}
+	newConfWithNilGenericEviction := func() *config.Configuration {
+		c := config.NewConfiguration()
+		c.GenericEvictionConfiguration = nil
+		return c
+	}
+
+	tests := []struct {
+		name string
+		conf *config.Configuration
+		want map[string]string
+	}{
+		{
+			name: "nil conf returns nil",
+			conf: nil,
+			want: nil,
+		},
+		{
+			name: "nil generic eviction config returns nil",
+			conf: newConfWithNilGenericEviction(),
+			want: nil,
+		},
+		{
+			name: "empty trigger key disables rule",
+			conf: newConf("", "true"),
+			want: nil,
+		},
+		{
+			name: "empty trigger value disables rule",
+			conf: newConf("evicted-by", ""),
+			want: nil,
+		},
+		{
+			name: "configured key and value are stamped",
+			conf: newConf("evicted-by", "memory-pressure"),
+			want: map[string]string{"evicted-by": "memory-pressure"},
+		},
+		{
+			name: "pod annotations do not affect stamping",
+			conf: newConf("evicted-by", "katalyst"),
+			want: map[string]string{"evicted-by": "katalyst"},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			e := &EvictionAPIKiller{conf: tt.conf}
+			got := e.buildEvictionExplicitTriggerAnnotations()
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestEvictionAPIKiller_EvictStampsExplicitTriggerAnnotation(t *testing.T) {
+	t.Parallel()
+
+	type tcase struct {
+		name  string
+		key   string
+		value string
+		want  map[string]string
+	}
+	cases := []tcase{
+		{
+			name:  "configured key and value are stamped",
+			key:   "evicted-by",
+			value: "katalyst",
+			want:  map[string]string{"evicted-by": "katalyst"},
+		},
+		{
+			name:  "empty key results in no annotation",
+			key:   "",
+			value: "katalyst",
+			want:  nil,
+		},
+		{
+			name:  "empty value results in no annotation",
+			key:   "evicted-by",
+			value: "",
+			want:  nil,
+		},
+	}
+
+	for _, tt := range cases {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "pod-1",
+					Namespace:   "ns-1",
+					UID:         "uid-1",
+					Annotations: map[string]string{"shield": "strict"},
+				},
+			}
+
+			ctx, err := katalyst_base.GenerateFakeGenericContext([]runtime.Object{pod})
+			require.NoError(t, err)
+			fakeKube := ctx.Client.KubeClient.(*fake.Clientset)
+
+			var captured *policy.Eviction
+			fakeKube.PrependReactor("create", "pods", func(action coretesting.Action) (bool, runtime.Object, error) {
+				if action.GetSubresource() != "eviction" {
+					return false, nil, nil
+				}
+				captured = action.(coretesting.CreateAction).GetObject().(*policy.Eviction)
+				// Simulate the API server actually deleting the pod so that
+				// waitForDeleted in evict() returns promptly.
+				_ = fakeKube.Tracker().Delete(
+					v1.SchemeGroupVersion.WithResource("pods"),
+					captured.Namespace, captured.Name,
+				)
+				return true, nil, nil
+			})
+
+			conf := config.NewConfiguration()
+			conf.GenericEvictionConfiguration.EvictionExplicitTriggerAnnotationKey = tt.key
+			conf.GenericEvictionConfiguration.EvictionExplicitTriggerAnnotationValue = tt.value
+
+			killer, err := NewEvictionAPIKiller(conf, ctx.Client.KubeClient, &events.FakeRecorder{}, metrics.DummyMetrics{})
+			require.NoError(t, err)
+
+			require.NoError(t, killer.Evict(context.Background(), pod, 0, "test-api", "test"))
+
+			require.NotNil(t, captured)
+			assert.Equal(t, tt.want, captured.ObjectMeta.Annotations)
+		})
 	}
 }
