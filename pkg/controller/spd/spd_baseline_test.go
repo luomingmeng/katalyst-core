@@ -593,3 +593,49 @@ func TestSPDController_updateDeployBaselinePercentile(t *testing.T) {
 		})
 	}
 }
+
+func TestCalculateBaselineSentinel(t *testing.T) {
+	t.Parallel()
+
+	mk := func(name string, ms int64) util.SPDBaselinePodMeta {
+		return util.SPDBaselinePodMeta{PodName: name, TimeStamp: metav1.NewTime(time.UnixMilli(ms))}
+	}
+	list := []util.SPDBaselinePodMeta{mk("p0", 0), mk("p1", 1), mk("p2", 2)}
+
+	// baseline disabled / boundary percent -> nil sentinel
+	for _, p := range []*int32{nil, pointer.Int32(0), pointer.Int32(100)} {
+		got, err := calculateBaselineSentinel(list, p)
+		assert.NoError(t, err)
+		assert.Nil(t, got)
+	}
+
+	// empty pod list -> nil sentinel
+	got, err := calculateBaselineSentinel(nil, pointer.Int32(50))
+	assert.NoError(t, err)
+	assert.Nil(t, got)
+
+	// default (no custom key): index = floor((len-1)*pct/100) = floor(2*0.5) = 1
+	got, err = calculateBaselineSentinel(list, pointer.Int32(50))
+	assert.NoError(t, err)
+	assert.NotNil(t, got)
+	assert.Equal(t, "p1", got.PodName)
+
+	// custom key set but no processor registered -> error
+	_, err = calculateBaselineSentinel([]util.SPDBaselinePodMeta{{CustomCompareKey: "ctrl_sentinel_no_proc"}}, pointer.Int32(50))
+	assert.Error(t, err)
+
+	// custom key with processor -> delegates to the custom sentinel func
+	const key util.CustomCompareKey = "ctrl_sentinel_custom"
+	util.RegisterSPDPodMetaCustomProcessor(key, &util.PodMetaCustomProcessor{
+		PodMetaCustomSentinelProcessor: func(l []util.SPDBaselinePodMeta, bp *int32) *util.SPDBaselinePodMeta {
+			return &l[len(l)-1]
+		},
+	})
+	got, err = calculateBaselineSentinel([]util.SPDBaselinePodMeta{
+		{CustomCompareKey: key, PodName: "cp0"},
+		{CustomCompareKey: key, PodName: "cp1"},
+	}, pointer.Int32(50))
+	assert.NoError(t, err)
+	assert.NotNil(t, got)
+	assert.Equal(t, "cp1", got.PodName)
+}
