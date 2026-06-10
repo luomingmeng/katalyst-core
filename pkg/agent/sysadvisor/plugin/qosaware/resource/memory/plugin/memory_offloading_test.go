@@ -26,8 +26,12 @@ import (
 	"github.com/bytedance/mockey"
 	"github.com/stretchr/testify/assert"
 
+	v1alpha1 "github.com/kubewharf/katalyst-api/pkg/apis/config/v1alpha1"
+
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/memory/dynamicpolicy/memoryadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/consts"
+	tmoconf "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic/tmo"
+	"github.com/kubewharf/katalyst-core/pkg/metrics"
 )
 
 var transparentMemoryOffloadingTestMutex sync.Mutex
@@ -109,4 +113,138 @@ func TestTransparentMemoryOffloading_GetAdvices_DyingMemcgReclaimReadDirError(t 
 
 	result := tmo.GetAdvices()
 	assert.Len(t, result.ExtraEntries, 0)
+}
+
+func TestTmoEngineCalculateOffloadingTargetSize_SkipWhenCacheCloseToMapped(t *testing.T) {
+	t.Parallel()
+	transparentMemoryOffloadingTestMutex.Lock()
+	defer transparentMemoryOffloadingTestMutex.Unlock()
+	defer mockey.UnPatchAll()
+
+	RegisterTMOPolicyFunc(v1alpha1.TMOPolicyNamePSI, psiPolicyFunc)
+	defer RegisterTMOPolicyFunc(v1alpha1.TMOPolicyNamePSI, psiPolicyFunc)
+	RegisterTMOPolicyFunc(v1alpha1.TMOPolicyNamePSI,
+		func(lastStats TmoStats, currStats TmoStats, conf *tmoconf.TMOConfigDetail, emitter metrics.MetricEmitter) (error, float64) {
+			return nil, 128
+		})
+
+	engine := &tmoEngineInstance{
+		conf: &tmoconf.TMOConfigDetail{
+			EnableTMO:  true,
+			EnableSwap: false,
+			Interval:   0,
+			PolicyName: v1alpha1.TMOPolicyNamePSI,
+		},
+		lastTime: time.Now().Add(-time.Second),
+	}
+
+	mockey.Mock((*tmoEngineInstance).getStats).IncludeCurrentGoRoutine().Return(TmoStats{
+		cache:  100,
+		mapped: 60,
+	}, nil).Build()
+
+	engine.CalculateOffloadingTargetSize()
+	assert.Equal(t, 0.0, engine.GetOffloadingTargetSize())
+}
+
+func TestTmoEngineCalculateOffloadingTargetSize_ClampByReservedInactiveFile(t *testing.T) {
+	t.Parallel()
+	transparentMemoryOffloadingTestMutex.Lock()
+	defer transparentMemoryOffloadingTestMutex.Unlock()
+	defer mockey.UnPatchAll()
+
+	RegisterTMOPolicyFunc(v1alpha1.TMOPolicyNamePSI, psiPolicyFunc)
+	defer RegisterTMOPolicyFunc(v1alpha1.TMOPolicyNamePSI, psiPolicyFunc)
+	RegisterTMOPolicyFunc(v1alpha1.TMOPolicyNamePSI,
+		func(lastStats TmoStats, currStats TmoStats, conf *tmoconf.TMOConfigDetail, emitter metrics.MetricEmitter) (error, float64) {
+			return nil, 128
+		})
+
+	engine := &tmoEngineInstance{
+		conf: &tmoconf.TMOConfigDetail{
+			EnableTMO:            true,
+			EnableSwap:           false,
+			ReservedInactiveFile: 100,
+			Interval:             0,
+			PolicyName:           v1alpha1.TMOPolicyNamePSI,
+		},
+		lastTime: time.Now().Add(-time.Second),
+	}
+
+	mockey.Mock((*tmoEngineInstance).getStats).IncludeCurrentGoRoutine().Return(TmoStats{
+		memInactiveFile: 350,
+		cache:           1000,
+		mapped:          100,
+	}, nil).Build()
+
+	engine.CalculateOffloadingTargetSize()
+	assert.Equal(t, 50.0, engine.GetOffloadingTargetSize())
+}
+
+func TestTmoEngineCalculateOffloadingTargetSize_ClampToZeroByReservedInactiveFile(t *testing.T) {
+	t.Parallel()
+	transparentMemoryOffloadingTestMutex.Lock()
+	defer transparentMemoryOffloadingTestMutex.Unlock()
+	defer mockey.UnPatchAll()
+
+	RegisterTMOPolicyFunc(v1alpha1.TMOPolicyNamePSI, psiPolicyFunc)
+	defer RegisterTMOPolicyFunc(v1alpha1.TMOPolicyNamePSI, psiPolicyFunc)
+	RegisterTMOPolicyFunc(v1alpha1.TMOPolicyNamePSI,
+		func(lastStats TmoStats, currStats TmoStats, conf *tmoconf.TMOConfigDetail, emitter metrics.MetricEmitter) (error, float64) {
+			return nil, 128
+		})
+
+	engine := &tmoEngineInstance{
+		conf: &tmoconf.TMOConfigDetail{
+			EnableTMO:            true,
+			EnableSwap:           false,
+			ReservedInactiveFile: 100,
+			Interval:             0,
+			PolicyName:           v1alpha1.TMOPolicyNamePSI,
+		},
+		lastTime: time.Now().Add(-time.Second),
+	}
+
+	mockey.Mock((*tmoEngineInstance).getStats).IncludeCurrentGoRoutine().Return(TmoStats{
+		memInactiveFile: 280,
+		cache:           1000,
+		mapped:          100,
+	}, nil).Build()
+
+	engine.CalculateOffloadingTargetSize()
+	assert.Equal(t, 0.0, engine.GetOffloadingTargetSize())
+}
+
+func TestTmoEngineCalculateOffloadingTargetSize_SkipReservedInactiveFileClampWhenSwapEnabled(t *testing.T) {
+	t.Parallel()
+	transparentMemoryOffloadingTestMutex.Lock()
+	defer transparentMemoryOffloadingTestMutex.Unlock()
+	defer mockey.UnPatchAll()
+
+	RegisterTMOPolicyFunc(v1alpha1.TMOPolicyNamePSI, psiPolicyFunc)
+	defer RegisterTMOPolicyFunc(v1alpha1.TMOPolicyNamePSI, psiPolicyFunc)
+	RegisterTMOPolicyFunc(v1alpha1.TMOPolicyNamePSI,
+		func(lastStats TmoStats, currStats TmoStats, conf *tmoconf.TMOConfigDetail, emitter metrics.MetricEmitter) (error, float64) {
+			return nil, 128
+		})
+
+	engine := &tmoEngineInstance{
+		conf: &tmoconf.TMOConfigDetail{
+			EnableTMO:            true,
+			EnableSwap:           true,
+			ReservedInactiveFile: 100,
+			Interval:             0,
+			PolicyName:           v1alpha1.TMOPolicyNamePSI,
+		},
+		lastTime: time.Now().Add(-time.Second),
+	}
+
+	mockey.Mock((*tmoEngineInstance).getStats).IncludeCurrentGoRoutine().Return(TmoStats{
+		memInactiveFile: 280,
+		cache:           1000,
+		mapped:          100,
+	}, nil).Build()
+
+	engine.CalculateOffloadingTargetSize()
+	assert.Equal(t, 128.0, engine.GetOffloadingTargetSize())
 }
