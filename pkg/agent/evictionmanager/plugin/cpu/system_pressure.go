@@ -456,6 +456,9 @@ func (s *SystemPressureEvictionPlugin) GetTopEvictionPods(
 		}
 	}
 
+	general.Infof("cpu system eviction get top (len=%d) pods: %v, candidate pods (len=%d): %v, over metric name: %s",
+		len(topNPods), native.GetNamespacedNameListFromSlice(topNPods), len(candidatePods), native.GetNamespacedNameListFromSlice(candidatePods), s.overMetricName)
+
 	s.overMetricName = ""
 	return resp, nil
 }
@@ -505,19 +508,11 @@ func (s *SystemPressureEvictionPlugin) getEvictionCmpFunc(dynamicConfig *evictio
 	cmpFuncs := make([]general.CmpFunc, 0)
 	rankingMetrics := dynamicConfig.EvictionRankingMetrics
 
-	if s.overMetricName != "" {
-		if !sets.NewString(rankingMetrics...).Has(s.overMetricName) {
-			rankingMetrics = append([]string{s.overMetricName}, rankingMetrics...)
-		} else {
-			// move overMetricName to front
-			newRanking := []string{s.overMetricName}
-			for _, m := range rankingMetrics {
-				if m != s.overMetricName {
-					newRanking = append(newRanking, m)
-				}
-			}
-			rankingMetrics = newRanking
-		}
+	// prefer the order of dynamicConfig.EvictionRankingMetrics:
+	//   - if it already contains overMetricName, keep the configured order as-is;
+	//   - otherwise, append overMetricName to the end as a fallback tie-breaker.
+	if s.overMetricName != "" && !sets.NewString(rankingMetrics...).Has(s.overMetricName) {
+		rankingMetrics = append(rankingMetrics, s.overMetricName)
 	}
 
 	for _, m := range rankingMetrics {
