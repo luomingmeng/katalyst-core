@@ -327,3 +327,23 @@ func TestCalculateSPDHash(t *testing.T) {
 		})
 	}
 }
+
+func TestCalculateSPDHash_CustomKeyAnnotation(t *testing.T) {
+	t.Parallel()
+
+	base := &apiworkload.ServiceProfileDescriptor{ObjectMeta: metav1.ObjectMeta{Name: "spd"}}
+	withKey := &apiworkload.ServiceProfileDescriptor{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "spd",
+			Annotations: map[string]string{apiconsts.SPDAnnotationKeyCustomCompareKey: "shard_id"},
+		},
+	}
+
+	baseHash, err := CalculateSPDHash(base)
+	assert.NoError(t, err)
+	withKeyHash, err := CalculateSPDHash(withKey)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, withKeyHash)
+	// the custom-compare-key annotation participates in the hash
+	assert.NotEqual(t, baseHash, withKeyHash)
+}
