@@ -1,3 +1,6 @@
+//go:build !linux
+// +build !linux
+
 /*
 Copyright 2022 The Katalyst Authors.
 
@@ -14,21 +17,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package consts
+package resctrl
 
-const (
-	// resctrl group names roughly correspond to pool names used by qrm plugins
-	// todo: consider to consolidate qrm pool names with this common consts set
-	ResctrlGroupRoot      = "/"
-	ResctrlGroupDedicated = "dedicated"
-	ResctrlGroupSystem    = "system"
-	ResctrlGroupShare     = "share"
-	ResctrlGroupReclaim   = "reclaim"
-
-	// subgroup related
-	ResctrlSubgroupSeparator            = "-"
-	ResctrlShareSubgroupPrefix          = "share-"
-	ResctrlObsoleteSharedSubgroupPrefix = "shared-"
-
-	DefaultResctrlRootDir = "/sys/fs/resctrl"
+import (
+	"fmt"
 )
+
+func findResctrlMountpointDir() (string, error) {
+	return "", fmt.Errorf("resctrl mountpoint not found")
+}
