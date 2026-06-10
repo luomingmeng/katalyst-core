@@ -61,6 +61,14 @@ type GenericEvictionOptions struct {
 
 	// HostPathNotifierPathRoot is the root path for host-path notifier
 	HostPathNotifierRootPath string
+
+	// EvictionExplicitTriggerAnnotationKey/Value configure the marker
+	// annotation that katalyst-agent stamps onto Eviction API objects it
+	// creates. This signals to higher-level components that the eviction is
+	// triggered by katalyst-agent and provides information for them to listen
+	// to and react on.
+	EvictionExplicitTriggerAnnotationKey   string
+	EvictionExplicitTriggerAnnotationValue string
 }
 
 // NewGenericEvictionOptions creates a new Options with a default config.
@@ -118,6 +126,17 @@ func (o *GenericEvictionOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 
 	fs.StringVar(&o.HostPathNotifierRootPath, "pod-notifier-root-path", o.HostPathNotifierRootPath,
 		"root path of host-path notifier")
+
+	fs.StringVar(&o.EvictionExplicitTriggerAnnotationKey, "eviction-explicit-trigger-annotation-key",
+		o.EvictionExplicitTriggerAnnotationKey,
+		"Marker annotation key stamped onto the Eviction API object created by katalyst-agent. "+
+			"This indicates the eviction is triggered by katalyst-agent, so higher-level "+
+			"components can listen to this information and react accordingly. "+
+			"Requires non-empty value too.")
+	fs.StringVar(&o.EvictionExplicitTriggerAnnotationValue, "eviction-explicit-trigger-annotation-value",
+		o.EvictionExplicitTriggerAnnotationValue,
+		"Marker annotation value stamped onto the Eviction API object created by katalyst-agent. "+
+			"Requires non-empty key too.")
 }
 
 // ApplyTo fills up config with options
@@ -134,6 +153,9 @@ func (o *GenericEvictionOptions) ApplyTo(c *evictionconfig.GenericEvictionConfig
 	c.PodMetricLabels.Insert(o.PodMetricLabels...)
 	c.RecordManager = o.RecordManager
 	c.HostPathNotifierRootPath = o.HostPathNotifierRootPath
+	c.EvictionExplicitTriggerAnnotationKey = o.EvictionExplicitTriggerAnnotationKey
+	c.EvictionExplicitTriggerAnnotationValue = o.EvictionExplicitTriggerAnnotationValue
+
 	return nil
 }
 

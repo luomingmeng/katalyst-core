@@ -71,18 +71,40 @@ type EvictionAPIKiller struct {
 	emitter  metrics.MetricEmitter
 	client   kubernetes.Interface
 	recorder events.EventRecorder
+	conf     *config.Configuration
 }
 
 // NewEvictionAPIKiller returns a new updater Object.
-func NewEvictionAPIKiller(_ *config.Configuration, client kubernetes.Interface, recorder events.EventRecorder, emitter metrics.MetricEmitter) (Killer, error) {
+func NewEvictionAPIKiller(conf *config.Configuration, client kubernetes.Interface, recorder events.EventRecorder, emitter metrics.MetricEmitter) (Killer, error) {
 	return &EvictionAPIKiller{
 		emitter:  emitter,
 		client:   client,
 		recorder: recorder,
+		conf:     conf,
 	}, nil
 }
 
 func (e *EvictionAPIKiller) Name() string { return consts.KillerNameEvictionKiller }
+
+// buildEvictionExplicitTriggerAnnotations returns the annotation set that
+// should be stamped onto the Eviction API object.
+//
+// This marker conveys that the eviction request is triggered by
+// katalyst-agent, so higher-level components can listen to this information
+// and react accordingly. It returns nil when the marker is not configured.
+func (e *EvictionAPIKiller) buildEvictionExplicitTriggerAnnotations() map[string]string {
+	if e.conf == nil || e.conf.GenericEvictionConfiguration == nil {
+		return nil
+	}
+
+	key := e.conf.GenericEvictionConfiguration.EvictionExplicitTriggerAnnotationKey
+	val := e.conf.GenericEvictionConfiguration.EvictionExplicitTriggerAnnotationValue
+	if key == "" || val == "" {
+		return nil
+	}
+
+	return map[string]string{key: val}
+}
 
 func (e *EvictionAPIKiller) Evict(_ context.Context, pod *v1.Pod, gracePeriodSeconds int64, reason, plugin string) error {
 	const (
@@ -100,8 +122,9 @@ func (e *EvictionAPIKiller) Evict(_ context.Context, pod *v1.Pod, gracePeriodSec
 				Kind:       evictionKind,
 			},
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      pod.Name,
-				Namespace: pod.Namespace,
+				Name:        pod.Name,
+				Namespace:   pod.Namespace,
+				Annotations: e.buildEvictionExplicitTriggerAnnotations(),
 			},
 			DeleteOptions: deleteOptions,
 		}

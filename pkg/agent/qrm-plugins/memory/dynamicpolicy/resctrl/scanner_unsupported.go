@@ -1,3 +1,6 @@
+//go:build !linux
+// +build !linux
+
 /*
 Copyright 2022 The Katalyst Authors.
 
@@ -14,20 +17,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package gpustrategy
+package resctrl
 
-type AllocateStrategyConfig struct {
-	CustomFilteringStrategies map[string][]string
-	CustomSortingStrategy     map[string]string
-	CustomBindingStrategy     map[string]string
-	CustomAllocationStrategy  map[string]string
-}
+import (
+	"fmt"
+)
 
-func NewGPUAllocateStrategyConfig() *AllocateStrategyConfig {
-	return &AllocateStrategyConfig{
-		CustomFilteringStrategies: map[string][]string{},
-		CustomSortingStrategy:     map[string]string{},
-		CustomBindingStrategy:     map[string]string{},
-		CustomAllocationStrategy:  map[string]string{},
-	}
+func findResctrlMountpointDir() (string, error) {
+	return "", fmt.Errorf("resctrl mountpoint not found")
 }

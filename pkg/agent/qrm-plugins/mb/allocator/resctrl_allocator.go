@@ -28,11 +28,11 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/mb/plan"
+	"github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 )
 
 const (
-	fsRoot            = "/sys/fs/resctrl/"
 	fileSchemata      = "schemata"
 	filePermSchemata  = 0o644
 	defaultCCDMBValue = 256_000
@@ -57,7 +57,7 @@ func validatePath(name string) error {
 }
 
 func (r *resctrlAllocator) getResctrlControlGroups() ([]string, error) {
-	fileInfos, err := afero.ReadDir(r.fs, fsRoot)
+	fileInfos, err := afero.ReadDir(r.fs, consts.DefaultResctrlRootDir)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to read resctrl directory")
 	}
@@ -66,7 +66,7 @@ func (r *resctrlAllocator) getResctrlControlGroups() ([]string, error) {
 	for _, fileInfo := range fileInfos {
 		if fileInfo.IsDir() {
 			subFolder := fileInfo.Name()
-			schemataFile := filepath.Join(fsRoot, subFolder, fileSchemata)
+			schemataFile := filepath.Join(consts.DefaultResctrlRootDir, subFolder, fileSchemata)
 			ok, _ := afero.Exists(r.fs, schemataFile)
 			if ok {
 				result = append(result, subFolder)
@@ -124,7 +124,7 @@ func (r *resctrlAllocator) allocateGroupPlan(group string, ccdPlan plan.GroupCCD
 		return errors.Wrap(err, fmt.Sprintf("invalid group name %q", group))
 	}
 
-	schemataPath := path.Join(fsRoot, group, fileSchemata)
+	schemataPath := path.Join(consts.DefaultResctrlRootDir, group, fileSchemata)
 	if _, err := r.fs.Stat(schemataPath); err != nil {
 		return errors.Wrap(err, fmt.Sprintf("unable to locate schemata file for group %s", group))
 	}

@@ -19,6 +19,7 @@ package staticpolicy
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -45,6 +46,8 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
+	"github.com/kubewharf/katalyst-core/pkg/util/metric"
+	"github.com/kubewharf/katalyst-core/pkg/util/native"
 )
 
 // StaticPolicy is the static gpu policy
@@ -305,19 +308,23 @@ func (p *StaticPolicy) GetTopologyAwareResources(
 	p.RLock()
 	defer p.RUnlock()
 
-	// Get topology aware resources for all resource plugins
+	// Collect all topology-aware resource responses
 	allocatedResourcesList := make([]*pluginapi.GetTopologyAwareResourcesResponse, 0)
 	for _, resourcePlugin := range p.resourcePlugins {
-		allocatedResource, err := resourcePlugin.GetTopologyAwareResources(ctx, req.PodUid, req.ContainerName)
+		pluginResources, err := resourcePlugin.GetTopologyAwareResources(ctx, req.PodUid, req.ContainerName)
 		if err != nil {
 			general.Errorf("failed to get topology aware resources for plugin %s: %v", resourcePlugin.ResourceName(), err)
 			continue
 		}
 
-		if allocatedResource == nil {
+		if pluginResources == nil {
 			continue
 		}
-		allocatedResourcesList = append(allocatedResourcesList, allocatedResource)
+
+		// Add all resources from the plugin
+		for _, resp := range pluginResources {
+			allocatedResourcesList = append(allocatedResourcesList, resp)
+		}
 	}
 
 	// Merge the respective response into one response
@@ -402,17 +409,20 @@ func (p *StaticPolicy) GetTopologyAwareAllocatableResources(
 	// Get topology aware allocatable resources for all resource plugins
 	allocatableResources := make(map[string]*pluginapi.AllocatableTopologyAwareResource)
 	for _, resourcePlugin := range p.resourcePlugins {
-		allocatableResource, err := resourcePlugin.GetTopologyAwareAllocatableResources(ctx)
+		pluginResources, err := resourcePlugin.GetTopologyAwareAllocatableResources(ctx)
 		if err != nil {
 			general.Errorf("failed to get topology aware allocatable resources for plugin %s: %v", resourcePlugin.ResourceName(), err)
 			continue
 		}
 
-		if allocatableResource == nil {
+		if pluginResources == nil {
 			continue
 		}
 
-		allocatableResources[allocatableResource.ResourceName] = allocatableResource.AllocatableTopologyAwareResource
+		// Add all resources from the plugin to the response
+		for resourceName, allocatableResource := range pluginResources {
+			allocatableResources[resourceName] = allocatableResource
+		}
 	}
 
 	return &pluginapi.GetTopologyAwareAllocatableResourcesResponse{
@@ -425,11 +435,23 @@ func (p *StaticPolicy) GetResourcePluginOptions(
 	context.Context,
 	*pluginapi.Empty,
 ) (*pluginapi.ResourcePluginOptions, error) {
+	p.Lock()
+	defer p.Unlock()
+
+	// Collect all extra resources from all resource plugins
+	collectedExtraResources := sets.NewString()
+	for _, rp := range p.resourcePlugins {
+		for _, er := range rp.GetExtraResources() {
+			collectedExtraResources.Insert(er)
+		}
+	}
+
 	return &pluginapi.ResourcePluginOptions{
 		PreStartRequired:      false,
 		WithTopologyAlignment: true,
 		NeedReconcile:         false,
 		AssociatedDevices:     p.associatedDeviceNames.List(),
+		ExtraResources:        collectedExtraResources.List(),
 	}, nil
 }
 
@@ -577,7 +599,7 @@ func (p *StaticPolicy) clearResidualState(
 	}
 
 	ctx := context.Background()
-	podList, err = p.MetaServer.GetPodList(ctx, nil)
+	podList, err = p.MetaServer.GetPodList(ctx, native.PodIsActive)
 	if err != nil {
 		general.Errorf("get pod list failed: %v", err)
 		return
@@ -684,6 +706,8 @@ func (p *StaticPolicy) AllocateAssociatedDevice(
 		return nil, fmt.Errorf("req is nil")
 	}
 
+	startTime := time.Now()
+
 	if err := p.ensureState(req.DeviceName); err != nil {
 		return nil, fmt.Errorf("ensure state failed: %v", err)
 	}
@@ -710,8 +734,30 @@ func (p *StaticPolicy) AllocateAssociatedDevice(
 			if deviceType != "" {
 				_ = p.removeContainer(req.ResourceRequest.PodUid, req.ResourceRequest.ContainerName, v1.ResourceName(deviceType))
 			}
+
+			metricTags := []metrics.MetricTag{
+				{Key: "error_message", Val: metric.MetricTagValueFormat(respErr)},
+				{Key: "device_name", Val: req.DeviceName},
+				{Key: "accompany_resource_name", Val: req.AccompanyResourceName},
+			}
+			_ = p.emitter.StoreInt64(util.MetricNameAllocateAssociatedDeviceFailed, 1, metrics.MetricTypeNameRaw, metricTags...)
 		}
 		p.Unlock()
+
+		elapsed := time.Since(startTime)
+		_ = p.emitter.StoreFloat64(util.MetricNameAllocateAssociatedDeviceDuration,
+			float64(elapsed)/float64(time.Millisecond), metrics.MetricTypeNameRaw,
+			metrics.MetricTag{Key: "deviceName", Val: req.DeviceName},
+			metrics.MetricTag{Key: "accompanyResourceName", Val: req.AccompanyResourceName},
+			metrics.MetricTag{Key: "success", Val: strconv.FormatBool(respErr == nil)},
+		)
+		general.InfoS("finished",
+			"duration", elapsed,
+			"podUID", req.ResourceRequest.PodUid,
+			"containerName", req.ResourceRequest.ContainerName,
+			"deviceName", req.DeviceName,
+			"accompanyResourceName", req.AccompanyResourceName,
+		)
 	}()
 
 	// Find the target device that we want to allocate for
@@ -796,6 +842,7 @@ func (p *StaticPolicy) registerDefaultResourcePlugins() error {
 		p.resourcePlugins[resourcePlugin.ResourceName()] = resourcePlugin
 		general.Infof("Registered resource plugin: %s", resourcePlugin.ResourceName())
 	}
+
 	return nil
 }
 

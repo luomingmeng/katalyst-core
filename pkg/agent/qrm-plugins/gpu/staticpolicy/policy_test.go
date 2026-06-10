@@ -34,12 +34,37 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/customdeviceplugin"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/resourceplugin"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/state"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/statedirectory"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
+
+type mockMetricsEmitter struct {
+	metrics.DummyMetrics
+	storedInt64 map[string][]int64
+	storedTags  map[string][][]metrics.MetricTag
+}
+
+func newMockMetricsEmitter() *mockMetricsEmitter {
+	return &mockMetricsEmitter{
+		storedInt64: make(map[string][]int64),
+		storedTags:  make(map[string][][]metrics.MetricTag),
+	}
+}
+
+func (m *mockMetricsEmitter) StoreInt64(key string, val int64, _ metrics.MetricTypeName, tags ...metrics.MetricTag) error {
+	m.storedInt64[key] = append(m.storedInt64[key], val)
+	m.storedTags[key] = append(m.storedTags[key], tags)
+	return nil
+}
+
+func (m *mockMetricsEmitter) WithTags(unit string, commonTags ...metrics.MetricTag) metrics.MetricEmitter {
+	w := &metrics.MetricTagWrapper{MetricEmitter: m}
+	return w.WithTags(unit, commonTags...)
+}
 
 const (
 	testResourcePluginName      = "resource-plugin-stub"
@@ -135,6 +160,7 @@ func makeTestStaticPolicy(t *testing.T) *StaticPolicy {
 
 	staticPolicy := &StaticPolicy{
 		BasePlugin:            basePlugin,
+		emitter:               metrics.DummyMetrics{},
 		resourcePlugins:       make(map[string]resourceplugin.ResourcePlugin),
 		customDevicePlugins:   make(map[string]customdeviceplugin.CustomDevicePlugin),
 		associatedDeviceNames: sets.NewString(),
@@ -851,6 +877,67 @@ func TestStaticPolicy_AllocateAssociatedDevices(t *testing.T) {
 	resp, err = policy.AllocateAssociatedDevice(context.Background(), req)
 	assert.NoError(t, err)
 	assert.NotNil(t, resp)
+}
+
+func TestStaticPolicy_AllocateAssociatedDevices_EmitsFailureMetric(t *testing.T) {
+	t.Parallel()
+
+	policy := makeTestStaticPolicy(t)
+	emitter := newMockMetricsEmitter()
+	policy.emitter = emitter
+
+	policy.RegisterResourcePlugin(resourceplugin.NewResourcePluginStub(policy.BasePlugin))
+	policy.RegisterCustomDevicePlugin(customdeviceplugin.NewCustomDevicePluginStub(policy.BasePlugin))
+
+	registerGeneratorWithTopology(t, policy, testResourcePluginName)
+	registerGeneratorWithTopology(t, policy, testCustomDevicePluginName)
+
+	podUID := string(uuid.NewUUID())
+	testName := "test"
+
+	// req passes ensureState (valid DeviceName + AccompanyResourceName) so the deferred
+	// failure-metric block is reached, but the DeviceRequest list does not contain an entry
+	// matching DeviceName, so AllocateAssociatedDevice returns an error and the failure metric
+	// is emitted from the defer.
+	req := &pluginapi.AssociatedDeviceRequest{
+		ResourceRequest: &pluginapi.ResourceRequest{
+			PodUid:        podUID,
+			PodNamespace:  testName,
+			PodName:       testName,
+			ContainerName: testName,
+			ContainerType: pluginapi.ContainerType_MAIN,
+			ResourceName:  testResourcePluginName,
+			ResourceRequests: map[string]float64{
+				testResourcePluginName: 2,
+			},
+			Labels:      map[string]string{},
+			Annotations: map[string]string{},
+		},
+		DeviceRequest: []*pluginapi.DeviceRequest{
+			// Intentionally a different device name so no targetDeviceReq is found.
+			{DeviceName: "some-other-device"},
+		},
+		DeviceName:            testCustomDevicePluginName,
+		AccompanyResourceName: testResourcePluginName,
+	}
+
+	resp, err := policy.AllocateAssociatedDevice(context.Background(), req)
+	assert.Error(t, err)
+	assert.Nil(t, resp)
+
+	vals := emitter.storedInt64[util.MetricNameAllocateAssociatedDeviceFailed]
+	assert.Equal(t, []int64{1}, vals, "expected failure metric to be emitted exactly once")
+
+	tagsList := emitter.storedTags[util.MetricNameAllocateAssociatedDeviceFailed]
+	assert.Len(t, tagsList, 1)
+
+	tagMap := make(map[string]string)
+	for _, tag := range tagsList[0] {
+		tagMap[tag.Key] = tag.Val
+	}
+	assert.Equal(t, testCustomDevicePluginName, tagMap["device_name"])
+	assert.Equal(t, testResourcePluginName, tagMap["accompany_resource_name"])
+	assert.NotEmpty(t, tagMap["error_message"])
 }
 
 func registerGeneratorWithTopology(t *testing.T, policy *StaticPolicy, resourceName string) {

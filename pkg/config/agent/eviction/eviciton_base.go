@@ -60,6 +60,15 @@ type GenericEvictionConfiguration struct {
 
 	// HostPathNotifierRootPath
 	HostPathNotifierRootPath string
+
+	// EvictionExplicitTriggerAnnotationKey/Value configures a marker annotation
+	// that katalyst-agent stamps onto the Eviction API object it creates.
+	//
+	// This marker conveys that the eviction request is triggered by
+	// katalyst-agent, so higher-level components can watch Eviction objects
+	// and listen to this information for follow-up handling.
+	EvictionExplicitTriggerAnnotationKey   string
+	EvictionExplicitTriggerAnnotationValue string
 }
 
 type EvictionConfiguration struct {
