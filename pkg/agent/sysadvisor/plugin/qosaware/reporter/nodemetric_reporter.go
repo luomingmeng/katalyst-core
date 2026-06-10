@@ -285,7 +285,7 @@ func (p *nodeMetricsReporterPlugin) getNodeMetricInfo() (*nodeapis.NodeMetricInf
 	nmi := &nodeapis.NodeMetricInfo{
 		ResourceUsage: nodeapis.ResourceUsage{
 			NUMAUsage:    make([]nodeapis.NUMAMetricInfo, 0),
-			GenericUsage: &nodeapis.ResourceMetric{},
+			GenericUsage: v1.ResourceList{},
 		},
 	}
 
@@ -293,30 +293,30 @@ func (p *nodeMetricsReporterPlugin) getNodeMetricInfo() (*nodeapis.NodeMetricInf
 	if err != nil {
 		errList = append(errList, err)
 	} else {
-		nmi.GenericUsage.Memory = memory
+		nmi.GenericUsage[v1.ResourceMemory] = *memory
 	}
 
 	cpuUsage, err := p.getNodeCPUUsage()
 	if err != nil {
 		errList = append(errList, err)
 	} else {
-		nmi.GenericUsage.CPU = cpuUsage
+		nmi.GenericUsage[v1.ResourceCPU] = *cpuUsage
 	}
 
 	for numaID := 0; numaID < p.metaServer.NumNUMANodes; numaID++ {
-		numaUsage := nodeapis.NUMAMetricInfo{NUMAId: numaID, Usage: &nodeapis.ResourceMetric{}}
+		numaUsage := nodeapis.NUMAMetricInfo{NUMAId: numaID, Usage: v1.ResourceList{}}
 		memoryUsage, err := p.getNodeNUMAMemoryUsage(numaID)
 		if err != nil {
 			errList = append(errList, err)
 		} else {
-			numaUsage.Usage.Memory = memoryUsage
+			numaUsage.Usage[v1.ResourceMemory] = *memoryUsage
 		}
 
 		numaCpuUsage, err := p.getNodeNUMACPUUsage(numaID)
 		if err != nil {
 			errList = append(errList, err)
 		} else {
-			numaUsage.Usage.CPU = numaCpuUsage
+			numaUsage.Usage[v1.ResourceCPU] = *numaCpuUsage
 		}
 
 		nmi.NUMAUsage = append(nmi.NUMAUsage, numaUsage)
@@ -329,7 +329,7 @@ func newGroupMetricInfo(qosLevel string) *nodeapis.GroupMetricInfo {
 		QoSLevel: qosLevel,
 		ResourceUsage: nodeapis.ResourceUsage{
 			NUMAUsage:    make([]nodeapis.NUMAMetricInfo, 0),
-			GenericUsage: &nodeapis.ResourceMetric{},
+			GenericUsage: v1.ResourceList{},
 		},
 		PodList: make([]string, 0),
 	}
@@ -468,7 +468,7 @@ func (p *nodeMetricsReporterPlugin) getPodUsage(pod *v1.Pod) (v1.ResourceList, m
 	return v1.ResourceList{v1.ResourceMemory: *memory, v1.ResourceCPU: *cpu}, numaUsage, assignedNUMAs, rampUp, errors.NewAggregate(errList)
 }
 
-func (p *nodeMetricsReporterPlugin) getGroupUsage(pods []*v1.Pod, qosLevel string) (*nodeapis.ResourceMetric, []nodeapis.NUMAMetricInfo, []*v1.Pod, error) {
+func (p *nodeMetricsReporterPlugin) getGroupUsage(pods []*v1.Pod, qosLevel string) (v1.ResourceList, []nodeapis.NUMAMetricInfo, []*v1.Pod, error) {
 	var errList []error
 
 	cpu := resource.NewQuantity(0, resource.DecimalSI)
@@ -523,20 +523,20 @@ func (p *nodeMetricsReporterPlugin) getGroupUsage(pods []*v1.Pod, qosLevel strin
 			"memory", general.FormatMemoryQuantity(podUsage.Memory().AsApproximateFloat64()), "numaUsage", numaUsages)
 	}
 
-	resourceMetric := &nodeapis.ResourceMetric{}
+	resourceMetric := v1.ResourceList{}
 	resourceNUMAMetrics := make([]nodeapis.NUMAMetricInfo, 0)
 	aggMemory := p.getAggregatedMetric(memory, v1.ResourceMemory, "getGroupUsage", qosLevel, "memory")
 	if aggMemory == nil {
 		errList = append(errList, fmt.Errorf("failed to get enhough samples for group memory, qosLevel=%v", qosLevel))
 	} else {
-		resourceMetric.Memory = aggMemory
+		resourceMetric[v1.ResourceMemory] = *aggMemory
 	}
 
 	aggCPU := p.getAggregatedMetric(cpu, v1.ResourceCPU, "getGroupUsage", qosLevel, "cpu")
 	if aggCPU == nil {
 		errList = append(errList, fmt.Errorf("failed to get enhough samples for group cpu, qosLevel=%v", qosLevel))
 	} else {
-		resourceMetric.CPU = aggCPU
+		resourceMetric[v1.ResourceCPU] = *aggCPU
 	}
 
 	for numaID := 0; numaID < p.metaServer.NumNUMANodes; numaID++ {
@@ -547,14 +547,14 @@ func (p *nodeMetricsReporterPlugin) getGroupUsage(pods []*v1.Pod, qosLevel strin
 				v1.ResourceMemory: *resource.NewQuantity(0, resource.BinarySI),
 			}
 		}
-		resourceNUMAMetric := nodeapis.ResourceMetric{}
+		resourceNUMAMetric := v1.ResourceList{}
 
 		cpuUsage := resourceUsages[v1.ResourceCPU]
 		aggNUMACPU := p.getAggregatedMetric(&cpuUsage, v1.ResourceCPU, "getGroupNUMAUsage", qosLevel, "cpu", strconv.Itoa(numaID))
 		if aggNUMACPU == nil {
 			errList = append(errList, fmt.Errorf("failed to get enhough samples for group numa cpu, qosLevel=%v, numa=%v", qosLevel, numaID))
 		} else {
-			resourceNUMAMetric.CPU = aggNUMACPU
+			resourceNUMAMetric[v1.ResourceCPU] = *aggNUMACPU
 		}
 
 		memUsage := resourceUsages[v1.ResourceMemory]
@@ -562,12 +562,12 @@ func (p *nodeMetricsReporterPlugin) getGroupUsage(pods []*v1.Pod, qosLevel strin
 		if aggNUMAMem == nil {
 			errList = append(errList, fmt.Errorf("failed to get enhough samples for group numa memory, qosLevel=%v, numa=%v", qosLevel, numaID))
 		} else {
-			resourceNUMAMetric.Memory = aggNUMAMem
+			resourceNUMAMetric[v1.ResourceMemory] = *aggNUMAMem
 		}
 
 		resourceNUMAMetrics = append(resourceNUMAMetrics, nodeapis.NUMAMetricInfo{
 			NUMAId: numaID,
-			Usage:  &resourceNUMAMetric,
+			Usage:  resourceNUMAMetric,
 		})
 	}
 

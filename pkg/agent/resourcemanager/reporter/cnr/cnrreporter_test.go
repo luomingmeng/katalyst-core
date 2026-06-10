@@ -287,7 +287,8 @@ func Test_parseReportFieldToCNR(t *testing.T) {
 					        ],
 					        "genericUsage":{
 					            "cpu":"10",
-					            "memory":"2Gi"
+					            "memory":"2Gi",
+					            "resource.katalyst.kubewharf.io/power":"500"
 					        }
 					    },
 					    "groupMetric":[
@@ -328,20 +329,21 @@ func Test_parseReportFieldToCNR(t *testing.T) {
 								NUMAUsage: []nodev1alpha1.NUMAMetricInfo{
 									{
 										NUMAId: 0,
-										Usage: &nodev1alpha1.ResourceMetric{
-											Memory: mustParse("1Gi"),
+										Usage: v1.ResourceList{
+											v1.ResourceMemory: *mustParse("1Gi"),
 										},
 									},
 									{
 										NUMAId: 1,
-										Usage: &nodev1alpha1.ResourceMetric{
-											Memory: mustParse("1Gi"),
+										Usage: v1.ResourceList{
+											v1.ResourceMemory: *mustParse("1Gi"),
 										},
 									},
 								},
-								GenericUsage: &nodev1alpha1.ResourceMetric{
-									CPU:    mustParse("10"),
-									Memory: mustParse("2Gi"),
+								GenericUsage: v1.ResourceList{
+									v1.ResourceCPU:          *mustParse("10"),
+									v1.ResourceMemory:       *mustParse("2Gi"),
+									apiconsts.ResourcePower: *mustParse("500"),
 								},
 							},
 						},
@@ -349,18 +351,18 @@ func Test_parseReportFieldToCNR(t *testing.T) {
 							{
 								QoSLevel: apiconsts.PodAnnotationQoSLevelReclaimedCores,
 								ResourceUsage: nodev1alpha1.ResourceUsage{
-									GenericUsage: &nodev1alpha1.ResourceMetric{
-										CPU:    mustParse("0"),
-										Memory: mustParse("0"),
+									GenericUsage: v1.ResourceList{
+										v1.ResourceCPU:    *mustParse("0"),
+										v1.ResourceMemory: *mustParse("0"),
 									},
 								},
 							},
 							{
 								QoSLevel: apiconsts.PodAnnotationQoSLevelSharedCores,
 								ResourceUsage: nodev1alpha1.ResourceUsage{
-									GenericUsage: &nodev1alpha1.ResourceMetric{
-										CPU:    mustParse("10"),
-										Memory: mustParse("1Gi"),
+									GenericUsage: v1.ResourceList{
+										v1.ResourceCPU:    *mustParse("10"),
+										v1.ResourceMemory: *mustParse("1Gi"),
 									},
 								},
 								PodList: []string{"platform/pod1", "platform/pod2"},
