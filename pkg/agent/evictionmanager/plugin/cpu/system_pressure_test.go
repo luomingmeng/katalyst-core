@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/kubernetes/pkg/features"
 
+	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-api/pkg/protocol/evictionplugin/v1alpha1"
 	cpuutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/util"
 	"github.com/kubewharf/katalyst-core/pkg/config"
@@ -505,4 +506,193 @@ func TestCPUSystemPressureEvictionPlugin_collectMetrics_PodAggregated(t *testing
 	assert.NotNil(t, plugin.nodeMetricsHistory[consts.MetricCPUUsageSystem].Queue[0])
 	// pod1(30) + pod2(40) = 70
 	assert.Equal(t, float64(70), plugin.nodeMetricsHistory[consts.MetricCPUUsageSystem].Queue[0].Info.Value)
+}
+
+// makeRankPod is a helper to construct a pod for ranking tests.
+func makeRankPod(name string, qosLevel string, priority *int32) *v1.Pod {
+	p := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+			UID:  types.UID(name),
+		},
+		Spec: v1.PodSpec{
+			Priority: priority,
+		},
+	}
+	if qosLevel != "" {
+		p.Annotations = map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey: qosLevel,
+		}
+	}
+	return p
+}
+
+// pushPodMetric pushes a metric value to the given plugin's pod metrics history.
+func pushPodMetric(p *SystemPressureEvictionPlugin, metricName, podUID string, value float64) {
+	if p.podMetricsHistory == nil {
+		p.podMetricsHistory = map[string]entries{}
+	}
+	if _, ok := p.podMetricsHistory[metricName]; !ok {
+		p.podMetricsHistory[metricName] = map[string]*cpuutil.MetricRing{}
+	}
+	if _, ok := p.podMetricsHistory[metricName][podUID]; !ok {
+		p.podMetricsHistory[metricName][podUID] = cpuutil.CreateMetricRing(10)
+	}
+	p.podMetricsHistory[metricName][podUID].Push(&cpuutil.MetricSnapshot{
+		Info: cpuutil.MetricInfo{Name: metricName, Value: value},
+		Time: 1,
+	})
+}
+
+// TestCPUSystemPressureEvictionPlugin_GetTopEvictionPods_RankByQoSAndPriority verifies that
+// the eviction ranking honors the configured EvictionRankingMetrics order
+// (QoS first, Priority second by default), and that overMetricName is appended
+// only as a tie-breaker when it is not already in the configured list.
+func TestCPUSystemPressureEvictionPlugin_GetTopEvictionPods_RankByQoSAndPriority(t *testing.T) {
+	t.Parallel()
+
+	prioHigh := int32(100)
+	prioLow := int32(10)
+
+	tests := []struct {
+		name           string
+		rankingMetrics []string
+		overMetricName string
+		// (name, qosLevel, priority)
+		pods       []*v1.Pod
+		topN       uint64
+		metricVals map[string]float64 // overMetricName value per pod uid
+		// expected first-evicted pod name
+		expectedFirst string
+	}{
+		{
+			name:           "default ranking: reclaimed_cores evicted first",
+			rankingMetrics: evictionconfig.DefaultEvictionRankingMetrics,
+			overMetricName: consts.MetricLoad1MinContainer,
+			pods: []*v1.Pod{
+				// shared_cores with high priority should be evicted last
+				makeRankPod("shared-high", apiconsts.PodAnnotationQoSLevelSharedCores, &prioHigh),
+				// reclaimed_cores has the lowest QoS, regardless of priority/metric value
+				makeRankPod("reclaimed-low", apiconsts.PodAnnotationQoSLevelReclaimedCores, &prioHigh),
+			},
+			topN: 1,
+			// even though shared-high has higher metric value, reclaimed_cores wins by QoS
+			metricVals:    map[string]float64{"shared-high": 100, "reclaimed-low": 1},
+			expectedFirst: "reclaimed-low",
+		},
+		{
+			name:           "default ranking: same QoS, lower priority evicted first",
+			rankingMetrics: evictionconfig.DefaultEvictionRankingMetrics,
+			overMetricName: consts.MetricLoad1MinContainer,
+			pods: []*v1.Pod{
+				makeRankPod("shared-high", apiconsts.PodAnnotationQoSLevelSharedCores, &prioHigh),
+				makeRankPod("shared-low", apiconsts.PodAnnotationQoSLevelSharedCores, &prioLow),
+			},
+			topN:          1,
+			metricVals:    map[string]float64{"shared-high": 100, "shared-low": 1},
+			expectedFirst: "shared-low",
+		},
+		{
+			name:           "tie on QoS+Priority: fall back to overMetricName appended at the end",
+			rankingMetrics: evictionconfig.DefaultEvictionRankingMetrics,
+			overMetricName: consts.MetricLoad1MinContainer,
+			pods: []*v1.Pod{
+				makeRankPod("a", apiconsts.PodAnnotationQoSLevelSharedCores, &prioHigh),
+				makeRankPod("b", apiconsts.PodAnnotationQoSLevelSharedCores, &prioHigh),
+			},
+			topN:          1,
+			metricVals:    map[string]float64{"a": 1, "b": 99},
+			expectedFirst: "b",
+		},
+		{
+			name: "overMetricName already in rankingMetrics: keep configured order, no duplication",
+			rankingMetrics: []string{
+				evictionconfig.FakeMetricQoSLevel,
+				evictionconfig.FakeMetricPriority,
+				consts.MetricLoad1MinContainer,
+			},
+			overMetricName: consts.MetricLoad1MinContainer,
+			pods: []*v1.Pod{
+				// pod-a has higher metric, but lower priority pod-b should still win by priority
+				makeRankPod("pod-a", apiconsts.PodAnnotationQoSLevelSharedCores, &prioHigh),
+				makeRankPod("pod-b", apiconsts.PodAnnotationQoSLevelSharedCores, &prioLow),
+			},
+			topN:          1,
+			metricVals:    map[string]float64{"pod-a": 100, "pod-b": 1},
+			expectedFirst: "pod-b",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			conf := config.NewConfiguration()
+			dynConf := evictionconfig.NewCPUSystemPressureEvictionPluginConfiguration()
+			dynConf.EnableCPUSystemEviction = true
+			dynConf.EvictionCoolDownTime = 0
+			dynConf.GracePeriod = 0
+			dynConf.EvictionRankingMetrics = tt.rankingMetrics
+			conf.GetDynamicConfiguration().EvictionConfiguration.CPUSystemPressureEvictionPluginConfiguration = dynConf
+
+			metaServer := makeMetaServer()
+			emitter := metrics.DummyMetrics{}
+
+			plugin := NewCPUSystemPressureEvictionPlugin(nil, nil, metaServer, emitter, conf).(*SystemPressureEvictionPlugin)
+			plugin.overMetricName = tt.overMetricName
+
+			if tt.overMetricName != "" {
+				for uid, val := range tt.metricVals {
+					pushPodMetric(plugin, tt.overMetricName, uid, val)
+				}
+			}
+
+			req := &v1alpha1.GetTopEvictionPodsRequest{
+				ActivePods: tt.pods,
+				TopN:       tt.topN,
+			}
+			resp, err := plugin.GetTopEvictionPods(context.Background(), req)
+			assert.NoError(t, err)
+			assert.Len(t, resp.TargetPods, int(tt.topN))
+			assert.Equal(t, tt.expectedFirst, resp.TargetPods[0].Name)
+		})
+	}
+}
+
+// TestCPUSystemPressureEvictionPlugin_getEvictionCmpFunc_OverMetricNotDuplicated verifies
+// that when overMetricName already exists in EvictionRankingMetrics, the resulting
+// comparator chain has the same length as EvictionRankingMetrics (i.e. no duplication
+// or reordering happens).
+func TestCPUSystemPressureEvictionPlugin_getEvictionCmpFunc_OverMetricNotDuplicated(t *testing.T) {
+	t.Parallel()
+
+	conf := config.NewConfiguration()
+	dynConf := evictionconfig.NewCPUSystemPressureEvictionPluginConfiguration()
+	dynConf.EvictionRankingMetrics = []string{
+		evictionconfig.FakeMetricQoSLevel,
+		evictionconfig.FakeMetricPriority,
+		consts.MetricLoad1MinContainer,
+	}
+	conf.GetDynamicConfiguration().EvictionConfiguration.CPUSystemPressureEvictionPluginConfiguration = dynConf
+
+	plugin := NewCPUSystemPressureEvictionPlugin(nil, nil, makeMetaServer(), metrics.DummyMetrics{}, conf).(*SystemPressureEvictionPlugin)
+
+	// overMetricName already in the list.
+	plugin.overMetricName = consts.MetricLoad1MinContainer
+	cmpFuncs := plugin.getEvictionCmpFunc(dynConf)
+	assert.Len(t, cmpFuncs, len(dynConf.EvictionRankingMetrics),
+		"overMetricName already in rankingMetrics should not introduce extra cmp func")
+
+	// overMetricName not in the list -> appended as tie-breaker.
+	plugin.overMetricName = consts.MetricCPUUsageContainer
+	cmpFuncs = plugin.getEvictionCmpFunc(dynConf)
+	assert.Len(t, cmpFuncs, len(dynConf.EvictionRankingMetrics)+1,
+		"overMetricName not in rankingMetrics should be appended as a tie-breaker")
+
+	// overMetricName empty -> no append.
+	plugin.overMetricName = ""
+	cmpFuncs = plugin.getEvictionCmpFunc(dynConf)
+	assert.Len(t, cmpFuncs, len(dynConf.EvictionRankingMetrics),
+		"empty overMetricName should not introduce extra cmp func")
 }
