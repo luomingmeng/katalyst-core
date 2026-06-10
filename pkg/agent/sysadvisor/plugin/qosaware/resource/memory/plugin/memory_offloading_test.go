@@ -29,8 +29,8 @@ import (
 	v1alpha1 "github.com/kubewharf/katalyst-api/pkg/apis/config/v1alpha1"
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/memory/dynamicpolicy/memoryadvisor"
-	"github.com/kubewharf/katalyst-core/pkg/consts"
 	tmoconf "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic/tmo"
+	"github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 )
 
