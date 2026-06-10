@@ -70,7 +70,7 @@ func (p *GPUDevicePlugin) DefaultPreAllocateResourceName() string {
 
 // filterOccupiedDevicesFromRequest filters out devices with existing allocations from
 // the provided DeviceRequest's AvailableDevices and ReusableDevices in place.
-// A device is considered occupied if any non-gpu_device resource in AllocationResourcesMap
+// A device is considered occupied if the ResourceMilliGPU resource in AllocationResourcesMap
 // has len(PodEntries) > 0 for that device.
 func filterOccupiedDevicesFromRequest(
 	req *pluginapi.DeviceRequest,
@@ -82,14 +82,12 @@ func filterOccupiedDevicesFromRequest(
 		for _, deviceID := range devices {
 			deviceOccupied := false
 			for resourceName, allocationMap := range allocationResourcesMap {
-				// Skip checking gpu_device resource
-				if string(resourceName) == gpuconsts.GPUDeviceType {
-					continue
-				}
-				if allocationState, exists := allocationMap[deviceID]; exists {
-					if len(allocationState.PodEntries) > 0 {
-						deviceOccupied = true
-						break
+				if string(resourceName) == string(consts.ResourceMilliGPU) {
+					if allocationState, exists := allocationMap[deviceID]; exists {
+						if len(allocationState.PodEntries) > 0 {
+							deviceOccupied = true
+							break
+						}
 					}
 				}
 			}

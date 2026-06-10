@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/uuid"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
+	"github.com/kubewharf/katalyst-api/pkg/consts"
 	katalyst_base "github.com/kubewharf/katalyst-core/cmd/base"
 	"github.com/kubewharf/katalyst-core/cmd/katalyst-agent/app/agent"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/baseplugin"
@@ -300,7 +301,7 @@ func TestGPUDevicePlugin_AllocateAssociatedDevice(t *testing.T) {
 		{
 			name: "non-gpu_device resource has devices occupied",
 			otherResourceAllocationMap: map[v1.ResourceName]state.AllocationMap{
-				"test-other-resource": {
+				consts.ResourceMilliGPU: {
 					"test-gpu-0": &state.AllocationState{
 						PodEntries: state.PodEntries{
 							"existing-pod": state.ContainerEntries{
@@ -500,9 +501,27 @@ func TestFilterOccupiedDevicesFromRequest(t *testing.T) {
 			expectedReusableDevices:  []string{"dev-0", "dev-1"},
 		},
 		{
-			name: "non-gpu_device resource has allocations (filtered out)",
+			name: "gpu_memory resource has allocations (not filtered out)",
 			allocationResourcesMap: state.AllocationResourcesMap{
-				"test-resource": state.AllocationMap{
+				consts.ResourceGPUMemory: state.AllocationMap{
+					"dev-0": &state.AllocationState{
+						PodEntries: state.PodEntries{
+							"test-pod": state.ContainerEntries{
+								"test-container": &state.AllocationInfo{},
+							},
+						},
+					},
+				},
+			},
+			availableDevices:         []string{"dev-0", "dev-1"},
+			reusableDevices:          []string{"dev-0", "dev-1"},
+			expectedAvailableDevices: []string{"dev-0", "dev-1"},
+			expectedReusableDevices:  []string{"dev-0", "dev-1"},
+		},
+		{
+			name: "milligpu resource has allocations (filtered out)",
+			allocationResourcesMap: state.AllocationResourcesMap{
+				consts.ResourceMilliGPU: state.AllocationMap{
 					"dev-0": &state.AllocationState{
 						PodEntries: state.PodEntries{
 							"test-pod": state.ContainerEntries{
@@ -518,9 +537,27 @@ func TestFilterOccupiedDevicesFromRequest(t *testing.T) {
 			expectedReusableDevices:  []string{"dev-1"},
 		},
 		{
-			name: "both gpu_device and non-gpu_device have allocations (non-gpu_device triggers filtering)",
+			name: "non-milligpu resource has allocations (not filtered out)",
 			allocationResourcesMap: state.AllocationResourcesMap{
-				v1.ResourceName(gpuconsts.GPUDeviceType): state.AllocationMap{
+				"test-resource": state.AllocationMap{
+					"dev-0": &state.AllocationState{
+						PodEntries: state.PodEntries{
+							"test-pod": state.ContainerEntries{
+								"test-container": &state.AllocationInfo{},
+							},
+						},
+					},
+				},
+			},
+			availableDevices:         []string{"dev-0", "dev-1"},
+			reusableDevices:          []string{"dev-0", "dev-1"},
+			expectedAvailableDevices: []string{"dev-0", "dev-1"},
+			expectedReusableDevices:  []string{"dev-0", "dev-1"},
+		},
+		{
+			name: "gpu_memory and milligpu both have allocations (only milligpu triggers filtering)",
+			allocationResourcesMap: state.AllocationResourcesMap{
+				consts.ResourceGPUMemory: state.AllocationMap{
 					"dev-1": &state.AllocationState{
 						PodEntries: state.PodEntries{
 							"test-pod-2": state.ContainerEntries{
@@ -529,7 +566,7 @@ func TestFilterOccupiedDevicesFromRequest(t *testing.T) {
 						},
 					},
 				},
-				"test-resource": state.AllocationMap{
+				consts.ResourceMilliGPU: state.AllocationMap{
 					"dev-0": &state.AllocationState{
 						PodEntries: state.PodEntries{
 							"test-pod": state.ContainerEntries{

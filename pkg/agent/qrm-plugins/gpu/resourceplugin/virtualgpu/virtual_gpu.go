@@ -713,7 +713,7 @@ func (p *VirtualGPUPlugin) Allocate(
 ) (*pluginapi.ResourceAllocationResponse, error) {
 	if !util.IsAnyResourceQuantityExist(
 		resourceReq.ResourceRequests,
-		sets.NewString(p.ResourceName(), string(consts.ResourceMilliGPU)),
+		sets.NewString(append(p.GetExtraResources(), p.ResourceName())...),
 	) {
 		general.InfoS("No GPU resource requested, returning empty response",
 			"podNamespace", resourceReq.PodNamespace,
@@ -874,6 +874,9 @@ func (p *VirtualGPUPlugin) allocate(
 			TopologyAwareAllocations: make(map[string]state.Allocation),
 		}
 
+		if deviceReq.DeviceRequest == 0 {
+			return nil, fmt.Errorf("deviceReq.DeviceRequest is 0, cannot allocate resource %s", resName)
+		}
 		resQuantityPerGPU := quantity / float64(deviceReq.DeviceRequest)
 		for _, deviceID := range result.AllocatedDevices {
 			info, ok := gpuTopology.Devices[deviceID]
