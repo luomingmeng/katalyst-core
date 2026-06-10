@@ -34,6 +34,7 @@ import (
 	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/calculator"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuburst"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuweight"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	coreconfig "github.com/kubewharf/katalyst-core/pkg/config"
@@ -857,4 +858,26 @@ func (p *DynamicPolicy) adjustSystemCoresPodAllocation() error {
 	}
 
 	return nil
+}
+
+func (p *DynamicPolicy) syncCPUWeight(_ *coreconfig.Configuration,
+	_ interface{},
+	_ *dynamicconfig.DynamicAgentConfiguration,
+	_ metrics.MetricEmitter,
+	_ *metaserver.MetaServer,
+) {
+	general.Infof("exec syncCPUWeight")
+
+	var err error
+	defer func() {
+		if err != nil {
+			general.ErrorS(err, "syncCPUWeight failed")
+		} else {
+			general.Infof("syncCPUWeight succeed")
+		}
+		_ = general.UpdateHealthzStateByError(cpuconsts.SyncCPUWeight, err)
+	}()
+
+	cpuWeightManager := cpuweight.GetManager(p.metaServer)
+	err = cpuWeightManager.UpdateCPUWeight(p.dynamicConfig)
 }

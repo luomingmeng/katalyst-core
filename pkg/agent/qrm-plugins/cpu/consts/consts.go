@@ -35,6 +35,7 @@ const (
 	CommunicateWithAdvisor     = CPUPluginDynamicPolicyName + "_communicate_with_advisor"
 	SyncCPUBurst               = CPUPluginDynamicPolicyName + "_sync_cpu_burst"
 	SyncSystemExclusivePool    = CPUPluginDynamicPolicyName + "_sync_system_exclusive_pool"
+	SyncCPUWeight              = CPUPluginDynamicPolicyName + "_sync_cpu_weight"
 )
 
 const (
