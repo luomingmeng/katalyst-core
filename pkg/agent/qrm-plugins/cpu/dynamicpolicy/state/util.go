@@ -19,7 +19,6 @@ package state
 import (
 	"fmt"
 	"math"
-	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -55,20 +54,32 @@ var (
 	)
 )
 
-// GetUnitedPoolsCPUs returns the union of the specified pools' cpus.
-func GetUnitedPoolsCPUs(poolsName sets.String, entries PodEntries) (machine.CPUSet, error) {
-	unitedPoolsCPUs := machine.NewCPUSet()
-	for _, poolName := range poolsName.List() {
-		cpus, err := entries.GetCPUSetForPool(poolName)
-		if err != nil && !strings.Contains(err.Error(), commonstate.PoolNotFoundErrMsg) {
-			return unitedPoolsCPUs, err
-		} else {
-			general.Warningf("the current pool %s does not exist", poolName)
-		}
+func IsResidentPool(name string) bool {
+	return ResidentPools.Has(name)
+}
 
-		unitedPoolsCPUs = unitedPoolsCPUs.Union(cpus)
+func IsForbiddenPool(name string) bool {
+	return ForbiddenPools.Has(name)
+}
+
+// GetUnitedPoolsCPUs returns the union of the specified pools' cpus.
+// If filters are provided, only pools that pass at least one of the filters will be considered.
+func GetUnitedPoolsCPUs(entries PodEntries, filters ...func(poolName string) bool) machine.CPUSet {
+	unitedPoolsCPUs := machine.NewCPUSet()
+	for poolName, entry := range entries {
+		allocationInfo := entry.GetPoolEntry()
+		if allocationInfo == nil {
+			continue
+		}
+		for _, filter := range filters {
+			if filter(poolName) {
+				unitedPoolsCPUs = unitedPoolsCPUs.Union(allocationInfo.AllocationResult)
+				break
+			}
+		}
 	}
-	return unitedPoolsCPUs, nil
+
+	return unitedPoolsCPUs
 }
 
 // WrapAllocationMetaFilter takes a filter function that operates on

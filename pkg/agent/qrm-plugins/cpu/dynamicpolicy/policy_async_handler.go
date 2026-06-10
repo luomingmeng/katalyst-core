@@ -19,6 +19,8 @@ package dynamicpolicy
 import (
 	"context"
 	"fmt"
+	"math"
+	"sort"
 	"strconv"
 	"time"
 
@@ -30,6 +32,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/advisorsvc"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/calculator"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuburst"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
@@ -47,6 +50,10 @@ import (
 
 const (
 	metricsNamePodTotalRequestLargerThanBindingCPUSet = "pod_total_request_larger_than_cpu_set"
+
+	defaultSystemExclusivePoolShrinkRatio = 0.15
+	defaultSystemExclusivePoolShrinkMin   = 2
+	defaultSystemExclusivePoolShrinkMax   = 8
 )
 
 // checkCPUSet emit errors if the memory allocation falls into unexpected results
@@ -486,4 +493,368 @@ func (p *DynamicPolicy) syncCPUBurst(_ *coreconfig.Configuration,
 
 	cpuBurstManager := cpuburst.GetManager(p.metaServer)
 	err = cpuBurstManager.UpdateCPUBurst(p.conf, p.dynamicConfig)
+}
+
+func (p *DynamicPolicy) syncSystemExclusivePool(_ *coreconfig.Configuration,
+	_ interface{},
+	_ *dynamicconfig.DynamicAgentConfiguration,
+	_ metrics.MetricEmitter,
+	_ *metaserver.MetaServer,
+) {
+	general.Infof("[SystemExclusivePool] exec sync")
+
+	var err error
+
+	p.Lock()
+	defer func() {
+		p.Unlock()
+		if err != nil {
+			general.Errorf("[SystemExclusivePool] failed with error: %v", err)
+		}
+		general.Infof("[SystemExclusivePool] completed successfully")
+		_ = general.UpdateHealthzStateByError(cpuconsts.SyncSystemExclusivePool, err)
+	}()
+
+	if !p.conf.EnableSystemExclusivePool {
+		general.Infof("[SystemExclusivePool] disabled")
+		return
+	}
+
+	err = p.reconcileSystemExclusivePools()
+}
+
+func (p *DynamicPolicy) reconcileSystemExclusivePools() error {
+	currentPools := p.listCurrentSystemExclusivePools()
+
+	expectedPools := p.getExpectedSystemExclusivePools()
+
+	toCreate, toUpdate, toDelete := p.calculateSystemExclusivePoolChanges(currentPools, expectedPools)
+
+	if len(toCreate) == 0 && len(toUpdate) == 0 && toDelete.Len() == 0 {
+		return nil
+	}
+
+	if err := p.applySystemExclusivePoolChanges(toCreate, toUpdate, toDelete); err != nil {
+		return fmt.Errorf("apply system exclusive pool changes failed: %v", err)
+	}
+
+	return nil
+}
+
+func (p *DynamicPolicy) listCurrentSystemExclusivePools() map[string]*state.AllocationInfo {
+	currentPools := make(map[string]*state.AllocationInfo)
+	for name, entry := range p.state.GetPodEntries() {
+		if !entry.IsPoolEntry() || !commonstate.IsSystemPool(name) {
+			continue
+		}
+		currentPools[name] = entry[commonstate.FakedContainerName].Clone()
+	}
+	return currentPools
+}
+
+func (p *DynamicPolicy) getExpectedSystemExclusivePools() map[string]int {
+	dynamicConfig := p.dynamicConfig.GetDynamicConfiguration()
+	configuredPools := dynamicConfig.SystemExclusivePool
+
+	expectedPools := make(map[string]int)
+	for name, size := range configuredPools {
+		if size <= 0 {
+			general.Warningf("[SystemExclusivePool] system exclusive pool %s size %d is invalid, skip", name, size)
+			continue
+		}
+		expectedPools[commonstate.GetSystemPoolName(name)] = size
+	}
+
+	return expectedPools
+}
+
+// calculateSystemExclusivePoolChanges calculates the system exclusive pool changes according to the current pools and expected pools
+// it returns the pools to change:
+//
+//	toCreate: the pools to create, the key is the pool name, the value is the size to allocate
+//	toUpdate: the pools to update, the key is the pool name, the value is the size to shrink or expand depending on it is positive or negative
+//	toDelete: the list of pool names to delete
+func (p *DynamicPolicy) calculateSystemExclusivePoolChanges(
+	currentPools map[string]*state.AllocationInfo,
+	expectedPools map[string]int,
+) (map[string]int, map[string]int, sets.String) {
+	shrinkRatio := defaultSystemExclusivePoolShrinkRatio
+	shrinkMin := defaultSystemExclusivePoolShrinkMin
+	shrinkMax := defaultSystemExclusivePoolShrinkMax
+	dynamicConfig := p.dynamicConfig.GetDynamicConfiguration()
+	if dynamicConfig.SystemExclusivePoolShrinkRatio != nil {
+		shrinkRatio = *dynamicConfig.SystemExclusivePoolShrinkRatio
+	}
+	if shrinkRatio <= 0.0 || shrinkRatio >= 1.0 {
+		general.Warningf("[SystemExclusivePool] invalid shrinkRatio(%f) from dynamic config, "+
+			"fallback to default value: shrinkRatio(%f)", shrinkRatio, defaultSystemExclusivePoolShrinkRatio)
+		shrinkRatio = defaultSystemExclusivePoolShrinkRatio
+	}
+	if dynamicConfig.SystemExclusivePoolShrinkMin != nil && *dynamicConfig.SystemExclusivePoolShrinkMin > 0 {
+		shrinkMin = int(*dynamicConfig.SystemExclusivePoolShrinkMin)
+	}
+	if dynamicConfig.SystemExclusivePoolShrinkMax != nil && *dynamicConfig.SystemExclusivePoolShrinkMax > 0 {
+		shrinkMax = int(*dynamicConfig.SystemExclusivePoolShrinkMax)
+	}
+	if shrinkMin >= shrinkMax {
+		general.Warningf("[SystemExclusivePool] invalid shrinkMin(%d) or shrinkMax(%d) from dynamic config, "+
+			"fallback to default value: shrinkMin(%d) shrinkMax(%d)", shrinkMin, shrinkMax, defaultSystemExclusivePoolShrinkMin, defaultSystemExclusivePoolShrinkMax)
+		shrinkMin = defaultSystemExclusivePoolShrinkMin
+		shrinkMax = defaultSystemExclusivePoolShrinkMax
+	}
+
+	var (
+		toCreate = make(map[string]int)
+		toUpdate = make(map[string]int)
+		toDelete = sets.NewString()
+	)
+
+	for name, allocationInfo := range currentPools {
+		expectedSize, exists := expectedPools[name]
+		if !exists {
+			toDelete.Insert(name)
+			continue
+		}
+
+		currentSize := allocationInfo.AllocationResult.Size()
+		delta := expectedSize - currentSize
+		if delta == 0 {
+			continue
+		}
+
+		if delta > 0 {
+			toUpdate[name] = delta
+		} else {
+			// make sure shrinkSize is even so that we can shrink evenly
+			shrinkSize := int(math.Ceil(float64(currentSize) * shrinkRatio))
+			if shrinkSize < shrinkMin {
+				shrinkSize = shrinkMin
+			}
+			if shrinkSize%2 != 0 {
+				shrinkSize += 1
+			}
+			if shrinkSize > shrinkMax {
+				shrinkSize = shrinkMax
+			}
+			if shrinkSize%2 != 0 {
+				shrinkSize -= 1
+			}
+			if shrinkSize > int(math.Abs(float64(delta))) {
+				shrinkSize = int(math.Abs(float64(delta)))
+			}
+			toUpdate[name] = -shrinkSize
+		}
+	}
+
+	// only create pool used by pod
+	systemPoolsWithPod := sets.NewString()
+	for _, entry := range p.state.GetPodEntries() {
+		if entry.IsPoolEntry() {
+			continue
+		}
+		for _, allocationInfo := range entry {
+			if !allocationInfo.CheckSystem() {
+				continue
+			}
+			systemPoolsWithPod.Insert(allocationInfo.GetOwnerPoolName())
+		}
+	}
+	for poolName, size := range expectedPools {
+		if _, exists := currentPools[poolName]; !exists && systemPoolsWithPod.Has(poolName) {
+			toCreate[poolName] = size
+		}
+	}
+
+	return toCreate, toUpdate, toDelete
+}
+
+func (p *DynamicPolicy) applySystemExclusivePoolChanges(toCreate, toUpdate map[string]int, toDelete sets.String) error {
+	availableCPUs := p.state.GetMachineState().GetFilteredAvailableCPUSet(p.reservedCPUs,
+		state.WrapAllocationMetaFilter((*commonstate.AllocationMeta).CheckDedicated),
+		state.WrapAllocationMetaFilter((*commonstate.AllocationMeta).CheckDedicatedNUMABindingNUMAExclusive))
+	notAllocatablePoolsCPUs := state.GetUnitedPoolsCPUs(p.state.GetPodEntries(), state.IsForbiddenPool, commonstate.IsSystemPool)
+	availableCPUs = availableCPUs.Difference(notAllocatablePoolsCPUs)
+
+	availableCPUs, err := p.deleteSystemExclusivePool(toDelete, availableCPUs)
+	if err != nil {
+		return fmt.Errorf("delete system exclusive pool failed with error: %v", err)
+	}
+
+	availableCPUs, err = p.updateSystemExclusivePool(toUpdate, availableCPUs)
+	if err != nil {
+		return fmt.Errorf("shrink system exclusive pool failed with error: %v", err)
+	}
+
+	_, err = p.createSystemExclusivePool(toCreate, availableCPUs)
+	if err != nil {
+		return fmt.Errorf("create system exclusive pool failed with error: %v", err)
+	}
+
+	if err := p.adjustSystemCoresPodAllocation(); err != nil {
+		return fmt.Errorf("adjust system exclusive pool failed with error: %v", err)
+	}
+
+	// update machine state and save
+	updatedMachineState, err := generateMachineStateFromPodEntries(p.machineInfo.CPUTopology, p.state.GetPodEntries(), p.state.GetMachineState())
+	if err != nil {
+		return fmt.Errorf("GenerateMachineStateFromPodEntries failed: %v", err)
+	}
+	p.state.SetMachineState(updatedMachineState, false)
+	if err := p.state.StoreState(); err != nil {
+		return fmt.Errorf("store state failed: %v", err)
+	}
+
+	return nil
+}
+
+func (p *DynamicPolicy) deleteSystemExclusivePool(toDelete sets.String, availableCPUs machine.CPUSet) (machine.CPUSet, error) {
+	for _, name := range toDelete.List() {
+		allocationInfo := p.state.GetAllocationInfo(name, commonstate.FakedContainerName)
+		if allocationInfo == nil {
+			general.Warningf("[SystemExclusivePool] get nil allocationInfo for pool %s, skip.", name)
+			continue
+		}
+
+		general.Infof("[SystemExclusivePool] delete pool %s", name)
+		p.state.Delete(name, commonstate.FakedContainerName, false)
+		availableCPUs = availableCPUs.Union(allocationInfo.AllocationResult)
+	}
+
+	return availableCPUs, nil
+}
+
+func (p *DynamicPolicy) updateSystemExclusivePool(toShrink map[string]int, availableCPUs machine.CPUSet) (machine.CPUSet, error) {
+	sortedPool := make([]string, 0, len(toShrink))
+	for poolName := range toShrink {
+		sortedPool = append(sortedPool, poolName)
+	}
+	sort.Slice(sortedPool, func(i, j int) bool {
+		return toShrink[sortedPool[i]] < toShrink[sortedPool[j]]
+	})
+	for _, name := range sortedPool {
+		delta := toShrink[name]
+		allocationInfo := p.state.GetAllocationInfo(name, commonstate.FakedContainerName)
+		if allocationInfo == nil {
+			general.Warningf("[SystemExclusivePool] get nil allocationInfo for pool %s, skip.", name)
+			continue
+		}
+
+		var allocationResult machine.CPUSet
+		if delta > 0 {
+			deltaCPUs, _, err := calculator.TakeByNUMABalance(p.machineInfo, availableCPUs, delta)
+			if err != nil {
+				return machine.CPUSet{}, fmt.Errorf("take HT by NUMABalace failed for pool %s with error: %v", name, err)
+			}
+			allocationResult = allocationInfo.AllocationResult.Union(deltaCPUs)
+			availableCPUs = availableCPUs.Difference(deltaCPUs)
+		} else {
+			deltaCPUs, _, err := calculator.TakeByNUMABalanceReversely(p.machineInfo, allocationInfo.AllocationResult, -delta)
+			if err != nil {
+				return machine.CPUSet{}, fmt.Errorf("take HT by NUMABalace failed for pool %s with error: %v", name, err)
+			}
+			allocationResult = allocationInfo.AllocationResult.Difference(deltaCPUs)
+			availableCPUs = availableCPUs.Union(deltaCPUs)
+		}
+
+		topologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, allocationResult)
+		if err != nil {
+			return machine.CPUSet{}, fmt.Errorf("failed to get numa aware assignments for pool %s: %v", name, err)
+		}
+
+		general.Infof("[SystemExclusivePool] update pool %s, delta: %d, origin cpuset: %s, target cpuset: %s", name,
+			delta, allocationInfo.AllocationResult, allocationResult)
+
+		allocationInfo.AllocationResult = allocationResult
+		allocationInfo.OriginalAllocationResult = allocationResult
+		allocationInfo.TopologyAwareAssignments = topologyAwareAssignments
+		allocationInfo.OriginalTopologyAwareAssignments = topologyAwareAssignments
+		p.state.SetAllocationInfo(name, commonstate.FakedContainerName, allocationInfo, false)
+	}
+
+	return availableCPUs, nil
+}
+
+func (p *DynamicPolicy) createSystemExclusivePool(toCreate map[string]int, availableCPUs machine.CPUSet) (machine.CPUSet, error) {
+	for name, size := range toCreate {
+		allocationResult, _, err := calculator.TakeByNUMABalance(p.machineInfo, availableCPUs, size)
+		if err != nil {
+			return machine.CPUSet{}, fmt.Errorf("failed to allocate CPUs for system exclusive pool %s: %v", name, err)
+		}
+
+		topologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, allocationResult)
+		if err != nil {
+			return machine.CPUSet{}, fmt.Errorf("failed to get numa aware assignments for system exclusive pool %s: %v", name, err)
+		}
+
+		poolAllocationInfo := &state.AllocationInfo{
+			AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(name),
+			AllocationResult:                 allocationResult,
+			OriginalAllocationResult:         allocationResult,
+			TopologyAwareAssignments:         topologyAwareAssignments,
+			OriginalTopologyAwareAssignments: topologyAwareAssignments,
+		}
+
+		general.Infof("[SystemExclusivePool] creating pool %s with size %d, cpuset: %s", name, size, allocationResult)
+
+		p.state.SetAllocationInfo(name, commonstate.FakedContainerName, poolAllocationInfo, false)
+		availableCPUs = availableCPUs.Difference(allocationResult)
+	}
+
+	return availableCPUs, nil
+}
+
+func (p *DynamicPolicy) adjustSystemCoresPodAllocation() error {
+	defaultSystemCoresCPUSet := p.machineInfo.CPUDetails.CPUs()
+	defaultSystemCoresTopologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, defaultSystemCoresCPUSet)
+	if err != nil {
+		return fmt.Errorf("failed to get numa aware assignments for default system cores: %v", err)
+	}
+
+	for podUID, entry := range p.state.GetPodEntries() {
+		if entry.IsPoolEntry() {
+			continue
+		}
+
+		for containerName, allocationInfo := range entry {
+			if !allocationInfo.CheckSystem() {
+				continue
+			}
+
+			poolName := allocationInfo.GetOwnerPoolName()
+			if poolName == commonstate.EmptyOwnerPoolName {
+				continue
+			}
+
+			poolAllocationInfo := p.state.GetAllocationInfo(poolName, commonstate.FakedContainerName)
+			if poolAllocationInfo == nil {
+				// pool not found, use default system cores
+				if !allocationInfo.AllocationResult.Equals(defaultSystemCoresCPUSet) {
+					general.Infof("[SystemExclusivePool] no configured pool for pod %s/%s container %s, using default cpuset: %s",
+						allocationInfo.PodNamespace, allocationInfo.PodName, containerName, defaultSystemCoresCPUSet)
+
+					allocationInfo.AllocationResult = defaultSystemCoresCPUSet
+					allocationInfo.OriginalAllocationResult = defaultSystemCoresCPUSet
+					allocationInfo.TopologyAwareAssignments = defaultSystemCoresTopologyAwareAssignments
+					allocationInfo.OriginalTopologyAwareAssignments = defaultSystemCoresTopologyAwareAssignments
+					p.state.SetAllocationInfo(podUID, containerName, allocationInfo, false)
+				}
+				continue
+			}
+
+			if allocationInfo.AllocationResult.Equals(poolAllocationInfo.AllocationResult) {
+				continue
+			}
+
+			general.Infof("[SystemExclusivePool] adjust cpuset of pod %s/%s container %s, according to pool %s, origin cpuset: %s, target cpuset: %s",
+				allocationInfo.PodNamespace, allocationInfo.PodName, containerName, poolName, allocationInfo.AllocationResult, poolAllocationInfo.AllocationResult)
+
+			allocationInfo.AllocationResult = poolAllocationInfo.AllocationResult.Clone()
+			allocationInfo.OriginalAllocationResult = poolAllocationInfo.OriginalAllocationResult.Clone()
+			allocationInfo.TopologyAwareAssignments = machine.DeepcopyCPUAssignment(poolAllocationInfo.TopologyAwareAssignments)
+			allocationInfo.OriginalTopologyAwareAssignments = machine.DeepcopyCPUAssignment(poolAllocationInfo.OriginalTopologyAwareAssignments)
+			p.state.SetAllocationInfo(podUID, containerName, allocationInfo, false)
+		}
+	}
+
+	return nil
 }

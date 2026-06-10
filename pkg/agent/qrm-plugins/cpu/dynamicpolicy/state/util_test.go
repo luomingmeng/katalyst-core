@@ -537,6 +537,74 @@ func TestGenerateCPUMachineStateByPodEntries(t *testing.T) {
 	}
 }
 
+func TestGetUnitedPoolsCPUs(t *testing.T) {
+	t.Parallel()
+
+	makePoolEntry := func(poolName string, allocationResult machine.CPUSet) ContainerEntries {
+		return ContainerEntries{
+			commonstate.FakedContainerName: &AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(poolName),
+				AllocationResult: allocationResult,
+			},
+		}
+	}
+
+	tests := []struct {
+		name    string
+		entries PodEntries
+		filters []func(poolName string) bool
+		want    machine.CPUSet
+	}{
+		{
+			name: "union pools matched by any filter and ignore non-pool entries",
+			entries: PodEntries{
+				commonstate.PoolNameShare:             makePoolEntry(commonstate.PoolNameShare, machine.MustParse("1-2")),
+				commonstate.PoolNameReclaim:           makePoolEntry(commonstate.PoolNameReclaim, machine.MustParse("3,5")),
+				commonstate.PoolNameReserve:           makePoolEntry(commonstate.PoolNameReserve, machine.MustParse("6")),
+				commonstate.PoolNameInterrupt:         makePoolEntry(commonstate.PoolNameInterrupt, machine.MustParse("7-9")),
+				commonstate.GetSystemPoolName("test"): makePoolEntry(commonstate.GetSystemPoolName("test"), machine.MustParse("10-11")),
+				"pod-uid": {
+					"main": &AllocationInfo{
+						AllocationMeta: commonstate.AllocationMeta{
+							PodUid:        "pod-uid",
+							ContainerName: "main",
+							OwnerPoolName: commonstate.PoolNameShare,
+						},
+						AllocationResult: machine.MustParse("9"),
+					},
+				},
+			},
+			filters: []func(poolName string) bool{
+				IsForbiddenPool,
+				commonstate.IsSystemPool,
+			},
+			want: machine.MustParse("7-11"),
+		},
+		{
+			name: "skip nil pool entries and unmatched pools",
+			entries: PodEntries{
+				commonstate.PoolNameShare: {
+					commonstate.FakedContainerName: nil,
+				},
+				commonstate.PoolNameReclaim: makePoolEntry(commonstate.PoolNameReclaim, machine.MustParse("3-4")),
+			},
+			filters: []func(poolName string) bool{
+				func(poolName string) bool { return poolName == commonstate.PoolNameShare },
+			},
+			want: machine.NewCPUSet(),
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := GetUnitedPoolsCPUs(tt.entries, tt.filters...)
+			require.Truef(t, got.Equals(tt.want), "GetUnitedPoolsCPUs() = %s, want %s", got.String(), tt.want.String())
+		})
+	}
+}
+
 func TestCountAllocationInfosToPoolsQuantityMap(t *testing.T) {
 	t.Parallel()
 	testName := "test"

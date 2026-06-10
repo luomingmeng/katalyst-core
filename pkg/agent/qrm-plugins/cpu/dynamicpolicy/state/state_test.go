@@ -29,7 +29,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager"
@@ -2854,7 +2853,7 @@ func TestPodEntries_GetFilteredPoolsCPUSetMap(t *testing.T) {
 	t.Parallel()
 	testName := "test"
 	type args struct {
-		ignorePools sets.String
+		poolFilter func(name string) bool
 	}
 	tests := []struct {
 		name    string
@@ -3052,7 +3051,9 @@ func TestPodEntries_GetFilteredPoolsCPUSetMap(t *testing.T) {
 				},
 			},
 			args: args{
-				ignorePools: ResidentPools,
+				poolFilter: func(name string) bool {
+					return ResidentPools.Has(name)
+				},
 			},
 			want: map[string]map[int]machine.CPUSet{
 				"share": {
@@ -3069,7 +3070,7 @@ func TestPodEntries_GetFilteredPoolsCPUSetMap(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got, err := tt.pe.GetFilteredPoolsCPUSetMap(tt.args.ignorePools)
+			got, err := tt.pe.GetFilteredPoolsCPUSetMap(tt.args.poolFilter)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("PodEntries.GetFilteredPoolsCPUSetMap() error = %v, wantErr %v", err, tt.wantErr)
 				return
