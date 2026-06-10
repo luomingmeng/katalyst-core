@@ -17,6 +17,8 @@ limitations under the License.
 package allocation
 
 import (
+	"github.com/pkg/errors"
+
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate/registry"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
@@ -68,7 +70,14 @@ func (s *GenericAllocationStrategy) Clone(name string) *GenericAllocationStrateg
 
 // Allocate performs the allocation using the combined strategies
 func (s *GenericAllocationStrategy) Allocate(ctx *allocate.AllocationContext) (*allocate.AllocationResult, error) {
-	var err error
+	if ctx == nil {
+		return nil, errors.New("nil AllocationContext")
+	}
+
+	var (
+		filterAvailableDevices []string
+		err                    error
+	)
 	resourceName := ctx.DeviceReq.DeviceName
 	allAvailableDevices := append(ctx.DeviceReq.ReusableDevices, ctx.DeviceReq.AvailableDevices...)
 	tags := []metrics.MetricTag{
@@ -78,13 +87,14 @@ func (s *GenericAllocationStrategy) Allocate(ctx *allocate.AllocationContext) (*
 
 	// Apply filtering strategy
 	for _, fs := range s.getFilteringStrategies(ctx, resourceName) {
-		allAvailableDevices, err = withFilterTiming(fs, ctx.Emitter, tags...).Filter(ctx, allAvailableDevices)
+		filterAvailableDevices, err = withFilterTiming(fs, ctx.Emitter, tags...).Filter(ctx, allAvailableDevices)
 		if err != nil {
 			return &allocate.AllocationResult{
 				Success:      false,
 				ErrorMessage: err.Error(),
 			}, err
 		}
+		allAvailableDevices = filterAvailableDevices
 	}
 
 	// Apply sorting strategy
@@ -140,7 +150,7 @@ func (s *GenericAllocationStrategy) SetBindingStrategy(bindingStrategy allocate.
 
 func (s *GenericAllocationStrategy) getFilteringStrategies(ctx *allocate.AllocationContext, resourceName string) []allocate.FilteringStrategy {
 	if strategyNames, ok := ctx.GPUQRMPluginConfig.CustomFilteringStrategies[resourceName]; ok {
-		filteringStrategies := make([]allocate.FilteringStrategy, len(strategyNames))
+		filteringStrategies := make([]allocate.FilteringStrategy, 0, len(strategyNames))
 		for _, fs := range strategyNames {
 			fs, err := s.registry.GetFilteringStrategy(fs)
 			if err != nil {

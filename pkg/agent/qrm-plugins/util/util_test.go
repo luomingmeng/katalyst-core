@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/sets"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
 	"github.com/kubewharf/katalyst-api/pkg/consts"
@@ -97,6 +98,76 @@ func TestGetQuantityFromResourceReq(t *testing.T) {
 		} else {
 			as.EqualValues(tc.result, res)
 		}
+	}
+}
+
+func TestIsAnyResourceQuantityExist(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name             string
+		resourceRequests map[string]float64
+		resourceNames    sets.String
+		want             bool
+	}{
+		{
+			name: "one target resource exists with positive quantity",
+			resourceRequests: map[string]float64{
+				string(v1.ResourceCPU): 2,
+			},
+			resourceNames: sets.NewString(string(v1.ResourceCPU), string(v1.ResourceMemory)),
+			want:          true,
+		},
+		{
+			name: "target resources missing",
+			resourceRequests: map[string]float64{
+				"example.com/other": 1,
+			},
+			resourceNames: sets.NewString(string(consts.ResourceGPUMemory), string(consts.ResourceMilliGPU)),
+			want:          false,
+		},
+		{
+			name: "target resources present but zero",
+			resourceRequests: map[string]float64{
+				string(consts.ResourceGPUMemory): 0,
+				string(consts.ResourceMilliGPU):  0,
+			},
+			resourceNames: sets.NewString(string(consts.ResourceGPUMemory), string(consts.ResourceMilliGPU)),
+			want:          false,
+		},
+		{
+			name: "only milligpu positive",
+			resourceRequests: map[string]float64{
+				string(consts.ResourceMilliGPU): 250,
+			},
+			resourceNames: sets.NewString(string(consts.ResourceGPUMemory), string(consts.ResourceMilliGPU)),
+			want:          true,
+		},
+		{
+			name: "only gpu memory positive",
+			resourceRequests: map[string]float64{
+				string(consts.ResourceGPUMemory): 8,
+			},
+			resourceNames: sets.NewString(string(consts.ResourceGPUMemory), string(consts.ResourceMilliGPU)),
+			want:          true,
+		},
+		{
+			name: "both gpu resources positive",
+			resourceRequests: map[string]float64{
+				string(consts.ResourceGPUMemory): 8,
+				string(consts.ResourceMilliGPU):  250,
+			},
+			resourceNames: sets.NewString(string(consts.ResourceGPUMemory), string(consts.ResourceMilliGPU)),
+			want:          true,
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.want, IsAnyResourceQuantityExist(tc.resourceRequests, tc.resourceNames))
+		})
 	}
 }
 
@@ -627,11 +698,12 @@ func TestGetPodAggregatedRequestResourceMap(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name            string
-		resourceRequest *pluginapi.ResourceRequest
-		expectedInt     map[v1.ResourceName]int
-		expectedFloat   map[v1.ResourceName]float64
-		expectedErr     bool
+		name             string
+		resourceRequest  *pluginapi.ResourceRequest
+		allowedResources sets.String
+		expectedInt      map[v1.ResourceName]int
+		expectedFloat    map[v1.ResourceName]float64
+		expectedErr      bool
 	}{
 		{
 			name: "no annotations",
@@ -642,6 +714,7 @@ func TestGetPodAggregatedRequestResourceMap(t *testing.T) {
 				},
 				Annotations: nil,
 			},
+			allowedResources: sets.NewString(string(v1.ResourceCPU), string(v1.ResourceMemory)),
 			expectedInt: map[v1.ResourceName]int{
 				v1.ResourceCPU:    1,
 				v1.ResourceMemory: 2 * 1024 * 1024 * 1024, // 2Gi
@@ -663,6 +736,7 @@ func TestGetPodAggregatedRequestResourceMap(t *testing.T) {
 					"some-other-annotation": "value",
 				},
 			},
+			allowedResources: sets.NewString(string(v1.ResourceCPU), string(v1.ResourceMemory)),
 			expectedInt: map[v1.ResourceName]int{
 				v1.ResourceCPU:    1,
 				v1.ResourceMemory: 1 * 1024 * 1024 * 1024, // 1Gi
@@ -683,6 +757,7 @@ func TestGetPodAggregatedRequestResourceMap(t *testing.T) {
 					consts.PodAnnotationAggregatedRequestsKey: "{invalid json",
 				},
 			},
+			allowedResources: sets.NewString(string(v1.ResourceCPU)),
 			expectedInt: map[v1.ResourceName]int{
 				v1.ResourceCPU: 2,
 			},
@@ -710,6 +785,7 @@ func TestGetPodAggregatedRequestResourceMap(t *testing.T) {
 					}(),
 				},
 			},
+			allowedResources: sets.NewString(string(v1.ResourceCPU), string(v1.ResourceMemory), "example.com/gpu"),
 			expectedInt: map[v1.ResourceName]int{
 				v1.ResourceCPU:    2,
 				v1.ResourceMemory: 2 * 1024 * 1024 * 1024,
@@ -740,6 +816,7 @@ func TestGetPodAggregatedRequestResourceMap(t *testing.T) {
 					}(),
 				},
 			},
+			allowedResources: sets.NewString(string(v1.ResourceCPU), string(v1.ResourceMemory)),
 			expectedInt: map[v1.ResourceName]int{
 				v1.ResourceCPU:    2,
 				v1.ResourceMemory: 3 * 1024 * 1024 * 1024,
@@ -765,6 +842,7 @@ func TestGetPodAggregatedRequestResourceMap(t *testing.T) {
 					}(),
 				},
 			},
+			allowedResources: sets.NewString(string(v1.ResourceCPU), string(v1.ResourceMemory)),
 			expectedInt: map[v1.ResourceName]int{
 				v1.ResourceCPU:    1,
 				v1.ResourceMemory: 1 * 1024 * 1024 * 1024,
@@ -786,7 +864,7 @@ func TestGetPodAggregatedRequestResourceMap(t *testing.T) {
 			// behave as expected and that GetQuantityFromResourceReq is intended to take
 			// the current resource name as an implicit argument or processes it correctly
 			// within the loop context.
-			gotInt, gotFloat, err := GetPodAggregatedRequestResourceMap(tt.resourceRequest)
+			gotInt, gotFloat, err := GetPodAggregatedRequestResourceMap(tt.resourceRequest, tt.allowedResources)
 
 			if (err != nil) != tt.expectedErr {
 				t.Errorf("GetPodAggregatedRequestResourceMap() error = %v, expectedErr %v", err, tt.expectedErr)
