@@ -51,6 +51,13 @@ const CgroupFSMountPoint = "/sys/fs/cgroup"
 
 const DyingMemcgThreshold int = 2000
 
+const (
+	// Keep each memory.reclaim write capped to a conservative 1GiB upper bound.
+	// Large single-shot reclaim requests are more likely to create long reclaim stalls,
+	// while chunked reclaim keeps the pressure smoother until this value is made tunable.
+	memoryReclaimChunkSize int64 = 1 << 30 // 1GiB
+)
+
 func ApplyMemoryWithRelativePath(relCgroupPath string, data *common.MemoryData) error {
 	if data == nil {
 		return fmt.Errorf("ApplyMemoryWithRelativePath with nil cgroup data")
@@ -545,12 +552,11 @@ func MemoryOffloadingWithAbsolutePath(ctx context.Context, absCgroupPath string,
 			return nil
 		}
 		// cgv2
-		const reclaimChunkSize int64 = 1 << 30 // 1GiB
 		memReclaimPath := filepath.Join(absCgroupPath, "memory.reclaim")
 
 		remaining := nbytes
 		for remaining > 0 {
-			chunk := reclaimChunkSize
+			chunk := memoryReclaimChunkSize
 			if remaining < chunk {
 				chunk = remaining
 			}
