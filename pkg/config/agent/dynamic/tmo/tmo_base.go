@@ -91,8 +91,8 @@ type TMOConfigDetail struct {
 	Interval             time.Duration
 	PolicyName           v1alpha1.TMOPolicyName
 	ReservedInactiveFile uint64
-	*PSIPolicyConf
-	*RefaultPolicyConf
+	PSIPolicyConf        *PSIPolicyConf
+	RefaultPolicyConf    *RefaultPolicyConf
 }
 
 func NewTMOConfigDetail(defaultConfigs *TMODefaultConfigurations) *TMOConfigDetail {
