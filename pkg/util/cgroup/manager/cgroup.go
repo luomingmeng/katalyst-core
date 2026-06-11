@@ -56,6 +56,9 @@ const (
 	// Large single-shot reclaim requests are more likely to create long reclaim stalls,
 	// while chunked reclaim keeps the pressure smoother until this value is made tunable.
 	memoryReclaimChunkSize int64 = 1 << 30 // 1GiB
+	// Leave a short gap between chunked reclaim writes so large reclaim requests do not
+	// hammer memory.reclaim continuously; 10ms is a conservative pacing interval.
+	memoryReclaimChunkInterval = 10 * time.Millisecond
 )
 
 func ApplyMemoryWithRelativePath(relCgroupPath string, data *common.MemoryData) error {
@@ -570,7 +573,7 @@ func MemoryOffloadingWithAbsolutePath(ctx context.Context, absCgroupPath string,
 
 			remaining -= chunk
 			if remaining > 0 {
-				time.Sleep(10 * time.Millisecond)
+				time.Sleep(memoryReclaimChunkInterval)
 			}
 		}
 
