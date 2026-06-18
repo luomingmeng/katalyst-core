@@ -375,6 +375,53 @@ func (r *DeviceTopologyRegistry) GetAffinityDevices(deviceA, deviceB string) (ma
 	return result, nil
 }
 
+// HasAnyDeviceAffinity returns true if there exists at least one (a, b) pair
+// where a is in deviceASet and b is in deviceBSet such that affinity exists
+// between them. It short-circuits on the first matching dimension or NUMA-node
+// pair instead of materializing the full affinity map.
+func (r *DeviceTopologyRegistry) HasAnyDeviceAffinity(deviceASet, deviceBSet []string) bool {
+	for _, deviceA := range deviceASet {
+		topoA, err := r.GetDeviceTopology(deviceA)
+		if err != nil {
+			continue
+		}
+		for _, deviceB := range deviceBSet {
+			topoB, err := r.GetDeviceTopology(deviceB)
+			if err != nil {
+				continue
+			}
+			if hasAnyDeviceAffinity(topoA, topoB) {
+				general.Infof("found affinity between device %s and device %s", deviceA, deviceB)
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasAnyDeviceAffinity reports whether any device in topoA shares a dimension
+// value or a NUMA node with any device in topoB. It returns on the first hit
+// without building the full affinity map.
+func hasAnyDeviceAffinity(topoA, topoB *DeviceTopology) bool {
+	for _, devA := range topoA.Devices {
+		for _, devB := range topoB.Devices {
+			for dim, valA := range devA.Dimensions {
+				if valB, ok := devB.Dimensions[dim]; ok && valA == valB {
+					return true
+				}
+			}
+			for _, numaA := range devA.NumaNodes {
+				for _, numaB := range devB.NumaNodes {
+					if numaA == numaB {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
 type DeviceTopology struct {
 	Devices map[string]DeviceInfo
 	// PriorityDimensions distinguishes the different dimensions of device affinity and their priority level.

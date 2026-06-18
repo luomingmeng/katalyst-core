@@ -351,6 +351,183 @@ func evaluateDeviceAffinityMap(t *testing.T, expected map[string]map[string][]st
 	}
 }
 
+func TestDeviceTopologyRegistry_HasAnyDeviceAffinity(t *testing.T) {
+	t.Parallel()
+
+	// gpu and rdma share NUMA node 0 → affinity exists.
+	gpuTopology := &DeviceTopology{
+		Devices: map[string]DeviceInfo{
+			"gpu-0": {NumaNodes: []int{0}},
+		},
+	}
+	rdmaTopology := &DeviceTopology{
+		Devices: map[string]DeviceInfo{
+			"rdma-0": {NumaNodes: []int{0}},
+		},
+	}
+	// disjoint topologies for negative cases.
+	apuTopology := &DeviceTopology{
+		PriorityDimensions: []string{"pcie"},
+		Devices: map[string]DeviceInfo{
+			"apu-0": {Dimensions: map[string]string{"pcie": "0"}, NumaNodes: []int{50}},
+		},
+	}
+	bpuTopology := &DeviceTopology{
+		PriorityDimensions: []string{"fabric"},
+		Devices: map[string]DeviceInfo{
+			"bpu-0": {Dimensions: map[string]string{"fabric": "0"}, NumaNodes: []int{99}},
+		},
+	}
+
+	registry := NewDeviceTopologyRegistry(metrics.DummyMetrics{})
+	registry.RegisterDeviceTopologyProvider("gpu", NewDeviceTopologyProviderStub())
+	registry.RegisterDeviceTopologyProvider("rdma", NewDeviceTopologyProviderStub())
+	registry.RegisterDeviceTopologyProvider("apu", NewDeviceTopologyProviderStub())
+	registry.RegisterDeviceTopologyProvider("bpu", NewDeviceTopologyProviderStub())
+	assert.NoError(t, registry.SetDeviceTopology("gpu", gpuTopology))
+	assert.NoError(t, registry.SetDeviceTopology("rdma", rdmaTopology))
+	assert.NoError(t, registry.SetDeviceTopology("apu", apuTopology))
+	assert.NoError(t, registry.SetDeviceTopology("bpu", bpuTopology))
+
+	tests := []struct {
+		name     string
+		setA     []string
+		setB     []string
+		expected bool
+	}{
+		{name: "affinity exists", setA: []string{"gpu"}, setB: []string{"rdma"}, expected: true},
+		{name: "no affinity", setA: []string{"apu"}, setB: []string{"bpu"}, expected: false},
+		{name: "found across multiple A", setA: []string{"apu", "gpu"}, setB: []string{"rdma"}, expected: true},
+		{name: "unknown devices return false", setA: []string{"nonexistent"}, setB: []string{"also-missing"}, expected: false},
+		{name: "empty A", setA: nil, setB: []string{"gpu"}, expected: false},
+		{name: "empty B", setA: []string{"gpu"}, setB: nil, expected: false},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := registry.HasAnyDeviceAffinity(tc.setA, tc.setB)
+			assert.Equal(t, tc.expected, got)
+		})
+	}
+}
+
+func TestHasAnyDeviceAffinity(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		topoA    *DeviceTopology
+		topoB    *DeviceTopology
+		expected bool
+	}{
+		{
+			name: "matching dimension value",
+			topoA: &DeviceTopology{Devices: map[string]DeviceInfo{
+				"a-0": {Dimensions: map[string]string{"pcie": "0"}},
+			}},
+			topoB: &DeviceTopology{Devices: map[string]DeviceInfo{
+				"b-0": {Dimensions: map[string]string{"pcie": "0"}},
+			}},
+			expected: true,
+		},
+		{
+			name: "matching numa node",
+			topoA: &DeviceTopology{Devices: map[string]DeviceInfo{
+				"a-0": {NumaNodes: []int{0, 1}},
+			}},
+			topoB: &DeviceTopology{Devices: map[string]DeviceInfo{
+				"b-0": {NumaNodes: []int{1, 2}},
+			}},
+			expected: true,
+		},
+		{
+			name: "dimension key shared but values differ",
+			topoA: &DeviceTopology{Devices: map[string]DeviceInfo{
+				"a-0": {Dimensions: map[string]string{"pcie": "0"}},
+			}},
+			topoB: &DeviceTopology{Devices: map[string]DeviceInfo{
+				"b-0": {Dimensions: map[string]string{"pcie": "1"}},
+			}},
+			expected: false,
+		},
+		{
+			name: "dimension keys disjoint",
+			topoA: &DeviceTopology{Devices: map[string]DeviceInfo{
+				"a-0": {Dimensions: map[string]string{"pcie": "0"}},
+			}},
+			topoB: &DeviceTopology{Devices: map[string]DeviceInfo{
+				"b-0": {Dimensions: map[string]string{"fabric": "0"}},
+			}},
+			expected: false,
+		},
+		{
+			name: "numa nodes disjoint",
+			topoA: &DeviceTopology{Devices: map[string]DeviceInfo{
+				"a-0": {NumaNodes: []int{0}},
+			}},
+			topoB: &DeviceTopology{Devices: map[string]DeviceInfo{
+				"b-0": {NumaNodes: []int{1}},
+			}},
+			expected: false,
+		},
+		{
+			name: "match found across multiple devices",
+			topoA: &DeviceTopology{Devices: map[string]DeviceInfo{
+				"a-0": {NumaNodes: []int{0}},
+				"a-1": {NumaNodes: []int{2}},
+			}},
+			topoB: &DeviceTopology{Devices: map[string]DeviceInfo{
+				"b-0": {NumaNodes: []int{1}},
+				"b-1": {NumaNodes: []int{2}},
+			}},
+			expected: true,
+		},
+		{
+			name: "dimension match preferred when both present",
+			topoA: &DeviceTopology{Devices: map[string]DeviceInfo{
+				"a-0": {Dimensions: map[string]string{"pcie": "0"}, NumaNodes: []int{9}},
+			}},
+			topoB: &DeviceTopology{Devices: map[string]DeviceInfo{
+				"b-0": {Dimensions: map[string]string{"pcie": "0"}, NumaNodes: []int{0}},
+			}},
+			expected: true,
+		},
+		{
+			name:     "empty topoA",
+			topoA:    &DeviceTopology{Devices: map[string]DeviceInfo{}},
+			topoB:    &DeviceTopology{Devices: map[string]DeviceInfo{"b-0": {NumaNodes: []int{0}}}},
+			expected: false,
+		},
+		{
+			name:     "empty topoB",
+			topoA:    &DeviceTopology{Devices: map[string]DeviceInfo{"a-0": {NumaNodes: []int{0}}}},
+			topoB:    &DeviceTopology{Devices: map[string]DeviceInfo{}},
+			expected: false,
+		},
+		{
+			name: "device without dimensions or numa nodes",
+			topoA: &DeviceTopology{Devices: map[string]DeviceInfo{
+				"a-0": {},
+			}},
+			topoB: &DeviceTopology{Devices: map[string]DeviceInfo{
+				"b-0": {NumaNodes: []int{0}, Dimensions: map[string]string{"pcie": "0"}},
+			}},
+			expected: false,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := hasAnyDeviceAffinity(tc.topoA, tc.topoB)
+			assert.Equal(t, tc.expected, got)
+		})
+	}
+}
+
 func TestDeviceTopology_GroupDeviceAffinity(t *testing.T) {
 	t.Parallel()
 

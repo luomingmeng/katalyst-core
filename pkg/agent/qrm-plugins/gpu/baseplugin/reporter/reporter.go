@@ -40,6 +40,7 @@ import (
 	"github.com/kubewharf/katalyst-api/pkg/protocol/reporterplugin/v1alpha1"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/state"
 	"github.com/kubewharf/katalyst-core/pkg/config"
+	pkgconsts "github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	metaserverpod "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
@@ -52,7 +53,6 @@ import (
 
 const (
 	gpuReporterPluginName                       = "gpu-reporter-plugin"
-	propertyNameGPUTopology                     = "gpu_topology_attribute_key"
 	defaultReportRetryInterval                  = 5 * time.Second
 	metricGetPodListFailed                      = "qrm_gpu_reporter_get_pod_list_failed"
 	metricAddKubeletCheckpointAllocationsFailed = "qrm_gpu_reporter_add_kubelet_checkpoint_allocations_failed"
@@ -114,6 +114,7 @@ type gpuReporterPlugin struct {
 	metaServer *metaserver.MetaServer
 
 	gpuDeviceNames         []string
+	rdmaDeviceNames        []string
 	numaSocketZoneNodeMap  map[util.ZoneNode]util.ZoneNode
 	deviceTopologyRegistry *machine.DeviceTopologyRegistry
 	stateGetter            func() state.State
@@ -142,6 +143,7 @@ func newGPUReporterPlugin(emitter metrics.MetricEmitter, metaServer *metaserver.
 
 	reporter := &gpuReporterPlugin{
 		gpuDeviceNames:                  conf.GPUDeviceNames,
+		rdmaDeviceNames:                 conf.RDMADeviceNames,
 		numaSocketZoneNodeMap:           util.GenerateNumaSocketZone(metaServer.MachineInfo.Topology),
 		emitter:                         emitter,
 		deviceTopologyRegistry:          topologyRegistry,
@@ -365,12 +367,16 @@ func (p *gpuReporterPlugin) getTopologyZoneReportField(topologiesMap map[string]
 }
 
 func (p *gpuReporterPlugin) getResourcePropertyReportField(latestDeviceTopology *machine.DeviceTopology) (*v1alpha1.ReportField, error) {
-	resourceProperty := p.getGPUResourceProperty(latestDeviceTopology)
-	if resourceProperty == nil {
+	properties := p.getGPUResourceProperty(latestDeviceTopology)
+	if rdmaProperty := p.getRDMAResourceProperty(); rdmaProperty != nil {
+		properties = append(properties, rdmaProperty)
+	}
+
+	if len(properties) == 0 {
 		return nil, nil
 	}
 
-	propertyValues, err := json.Marshal(&resourceProperty)
+	propertyValues, err := json.Marshal(&properties)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal resource property values: %w", err)
 	}
@@ -390,9 +396,29 @@ func (p *gpuReporterPlugin) getGPUResourceProperty(deviceTopology *machine.Devic
 
 	return []*nodev1alpha1.Property{
 		{
-			PropertyName:   propertyNameGPUTopology,
+			PropertyName:   pkgconsts.PropertyNameGPUTopology,
 			PropertyValues: deviceTopology.PriorityDimensions,
 		},
+	}
+}
+
+// getRDMAResourceProperty reports whether any RDMA device has affinity with
+// any GPU device, as a single property with value "true" or "false".
+func (p *gpuReporterPlugin) getRDMAResourceProperty() *nodev1alpha1.Property {
+	if len(p.rdmaDeviceNames) == 0 || len(p.gpuDeviceNames) == 0 {
+		return nil
+	}
+
+	hasAffinity := p.deviceTopologyRegistry.HasAnyDeviceAffinity(p.gpuDeviceNames, p.rdmaDeviceNames)
+
+	value := "false"
+	if hasAffinity {
+		value = "true"
+	}
+
+	return &nodev1alpha1.Property{
+		PropertyName:   pkgconsts.PropertyNameRDMAAffinityWithGPU,
+		PropertyValues: []string{value},
 	}
 }
 

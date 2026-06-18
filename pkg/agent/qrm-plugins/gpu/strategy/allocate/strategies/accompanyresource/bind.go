@@ -57,6 +57,11 @@ func (s *AccompanyResourceStrategy) Bind(ctx *allocate.AllocationContext, sorted
 		}, fmt.Errorf("%s", errMsg)
 	}
 
+	// Two distinct identifiers are used throughout this strategy and must not be mixed:
+	//   - device/resource name (e.g. "nvidia.com/gpu"): used by DeviceTopologyRegistry,
+	//     which is keyed by the raw device resource name.
+	//   - state name (e.g. "gpu"): used by MachineState, which is keyed by the device
+	//     type. Resolve via util.ResolveResourceName before any state lookup.
 	accompanyResourceName := ctx.AccompanyResourceName
 	// AccompanyResource strategy requires an accompany resource name; without it, return an error.
 	if accompanyResourceName == "" {
@@ -66,14 +71,14 @@ func (s *AccompanyResourceStrategy) Bind(ctx *allocate.AllocationContext, sorted
 		}, fmt.Errorf("no accompany resource name specified")
 	}
 
-	// resourceName is the name of the target resource to be allocated
+	// resourceName is the raw target resource name (used for topology registry lookups).
 	resourceName := ctx.ResourceName
 
 	// Allocate all the reusable devices first
 	allocatedDevices := sets.NewString(ctx.DeviceReq.ReusableDevices...)
 	machineState := ctx.MachineState
 
-	// Find the name of accompany resource in state
+	// Resolve resource name -> state name for any MachineState lookup below.
 	accompanyResourceNameInState := util.ResolveResourceName(ctx.DeviceNameToTypeMap, accompanyResourceName, false)
 	if accompanyResourceNameInState == "" {
 		return &allocate.AllocationResult{
@@ -82,7 +87,7 @@ func (s *AccompanyResourceStrategy) Bind(ctx *allocate.AllocationContext, sorted
 		}, fmt.Errorf("invalid accompany resource %s in state", accompanyResourceName)
 	}
 
-	// Get the allocated accompany resource devices from machine state
+	// MachineState lookup: use the state-name identifier.
 	accompanyAllocatedDeviceIDs := machineState.GetAllocatedDeviceIDs(v1.ResourceName(accompanyResourceNameInState), ctx.ResourceReq.PodUid, ctx.ResourceReq.ContainerName)
 	if len(accompanyAllocatedDeviceIDs) == 0 {
 		return &allocate.AllocationResult{
@@ -91,7 +96,7 @@ func (s *AccompanyResourceStrategy) Bind(ctx *allocate.AllocationContext, sorted
 		}, fmt.Errorf("no accompany resource device found for pod %s, container %s, resource %s", ctx.ResourceReq.PodUid, ctx.ResourceReq.ContainerName, accompanyResourceNameInState)
 	}
 
-	// Find the name of resource in state
+	// Resolve resource name -> state name for the target resource.
 	resourceNameInState := util.ResolveResourceName(ctx.DeviceNameToTypeMap, resourceName, false)
 	if resourceNameInState == "" {
 		return &allocate.AllocationResult{
@@ -100,7 +105,7 @@ func (s *AccompanyResourceStrategy) Bind(ctx *allocate.AllocationContext, sorted
 		}, fmt.Errorf("invalid resource %s in state", resourceName)
 	}
 
-	// Get ratio of accompany resource to target device
+	// MachineState lookup: pass state-name identifiers.
 	accompanyResourceToDeviceRatio := machineState.GetRatioOfAccompanyResourceToTargetResource(accompanyResourceNameInState, resourceNameInState)
 
 	// Find out the number of target devices to be allocated proportionally to the accompany resource devices
@@ -119,7 +124,7 @@ func (s *AccompanyResourceStrategy) Bind(ctx *allocate.AllocationContext, sorted
 		}, nil
 	}
 
-	// Obtain the target devices that have affinity with the accompany resource devices
+	// DeviceTopologyRegistry lookup: pass the raw resource names (not the state names).
 	affinityDevices, err := ctx.DeviceTopologyRegistry.GetAffinityDevices(accompanyResourceName, resourceName)
 	if err != nil {
 		general.Warningf("failed to get affinity devices between %s and %s: %v", accompanyResourceName, resourceName, err)
@@ -142,7 +147,7 @@ func (s *AccompanyResourceStrategy) Bind(ctx *allocate.AllocationContext, sorted
 		}, nil
 	}
 
-	// Get the priority dimensions from the accompany resource's topology
+	// DeviceTopologyRegistry lookup: pass the raw resource name (not the state name).
 	var priorityDimensions []string
 	accompanyTopology, err := ctx.DeviceTopologyRegistry.GetDeviceTopology(accompanyResourceName)
 	if err != nil {
@@ -166,7 +171,10 @@ func (s *AccompanyResourceStrategy) Bind(ctx *allocate.AllocationContext, sorted
 
 	// maxAllocationPerDevice is the maximum number of target devices that can be allocated to each accompany resource device.
 	// This is to uniformly distribute the target devices to each accompany resource device.
-	maxAllocationPerDevice := int(math.Max(1/accompanyResourceToDeviceRatio, 1))
+	maxAllocationPerDevice := 1
+	if accompanyResourceToDeviceRatio > 0 {
+		maxAllocationPerDevice = int(math.Max(1/accompanyResourceToDeviceRatio, 1))
+	}
 	return s.allocateWithAffinity(ctx, accompanyAllocatedDeviceIDs, affinityDevices, priorityDimensions, availableDevices, allocatedDevices, devicesToBeAllocated, maxAllocationPerDevice, accompanyResourceName)
 }
 

@@ -44,6 +44,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/state"
 	"github.com/kubewharf/katalyst-core/pkg/config"
+	pkgconsts "github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	metaagent "github.com/kubewharf/katalyst-core/pkg/metaserver/agent"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
@@ -403,7 +404,7 @@ func TestGpuReporterPlugin_GetReportContent(t *testing.T) {
 			},
 			expectedSpec: []*nodev1alpha1.Property{
 				{
-					PropertyName:   propertyNameGPUTopology,
+					PropertyName:   pkgconsts.PropertyNameGPUTopology,
 					PropertyValues: []string{"numa"},
 				},
 			},
@@ -678,7 +679,7 @@ func TestGpuReporterPlugin_GetReportContent(t *testing.T) {
 			},
 			expectedSpec: []*nodev1alpha1.Property{
 				{
-					PropertyName:   propertyNameGPUTopology,
+					PropertyName:   pkgconsts.PropertyNameGPUTopology,
 					PropertyValues: []string{"pcie", "numa"},
 				},
 			},
@@ -970,7 +971,7 @@ func TestGpuReporterPlugin_GetReportContent(t *testing.T) {
 			},
 			expectedSpec: []*nodev1alpha1.Property{
 				{
-					PropertyName:   propertyNameGPUTopology,
+					PropertyName:   pkgconsts.PropertyNameGPUTopology,
 					PropertyValues: []string{"numa"},
 				},
 			},
@@ -1415,7 +1416,7 @@ func TestGpuReporterPlugin_GetReportContent(t *testing.T) {
 			expectedErr: false,
 			expectedSpec: []*nodev1alpha1.Property{
 				{
-					PropertyName:   propertyNameGPUTopology,
+					PropertyName:   pkgconsts.PropertyNameGPUTopology,
 					PropertyValues: []string{"pcie", "numa"},
 				},
 			},
@@ -1590,7 +1591,7 @@ func TestGpuReporterPlugin_GetReportContent(t *testing.T) {
 			},
 			expectedSpec: []*nodev1alpha1.Property{
 				{
-					PropertyName:   propertyNameGPUTopology,
+					PropertyName:   pkgconsts.PropertyNameGPUTopology,
 					PropertyValues: []string{"numa"},
 				},
 			},
@@ -1658,7 +1659,7 @@ func TestGpuReporterPlugin_GetReportContent(t *testing.T) {
 				},
 			},
 			machineState: buildMachineStateWithAllocatable(v1.ResourceName("test-gpu-resource"), map[string]float64{"gpu-0": 4, "gpu-1": 2}),
-			expectedSpec: []*nodev1alpha1.Property{{PropertyName: propertyNameGPUTopology, PropertyValues: []string{"numa"}}},
+			expectedSpec: []*nodev1alpha1.Property{{PropertyName: pkgconsts.PropertyNameGPUTopology, PropertyValues: []string{"numa"}}},
 			expectedStatus: []*nodev1alpha1.TopologyZone{
 				{
 					Type: nodev1alpha1.TopologyTypeSocket,
@@ -1729,7 +1730,7 @@ func TestGpuReporterPlugin_GetReportContent(t *testing.T) {
 					},
 				},
 			},
-			expectedSpec: []*nodev1alpha1.Property{{PropertyName: propertyNameGPUTopology, PropertyValues: []string{"numa"}}},
+			expectedSpec: []*nodev1alpha1.Property{{PropertyName: pkgconsts.PropertyNameGPUTopology, PropertyValues: []string{"numa"}}},
 			expectedStatus: []*nodev1alpha1.TopologyZone{
 				{
 					Type: nodev1alpha1.TopologyTypeSocket,
@@ -1786,7 +1787,7 @@ func TestGpuReporterPlugin_GetReportContent(t *testing.T) {
 					},
 				},
 			},
-			expectedSpec: []*nodev1alpha1.Property{{PropertyName: propertyNameGPUTopology, PropertyValues: []string{"numa"}}},
+			expectedSpec: []*nodev1alpha1.Property{{PropertyName: pkgconsts.PropertyNameGPUTopology, PropertyValues: []string{"numa"}}},
 			expectedStatus: []*nodev1alpha1.TopologyZone{
 				{
 					Type: nodev1alpha1.TopologyTypeSocket,
@@ -1833,7 +1834,7 @@ func TestGpuReporterPlugin_GetReportContent(t *testing.T) {
 			},
 			machineTopology: []cadvisorapi.Node{{Id: 0, Cores: []cadvisorapi.Core{{SocketID: 0, Id: 0, Threads: []int{0, 4}}}}},
 			machineState:    buildMachineStateWithAllocatable(v1.ResourceName("test-gpu-resource"), map[string]float64{"gpu-0": 3}),
-			expectedSpec:    []*nodev1alpha1.Property{{PropertyName: propertyNameGPUTopology, PropertyValues: []string{"numa"}}},
+			expectedSpec:    []*nodev1alpha1.Property{{PropertyName: pkgconsts.PropertyNameGPUTopology, PropertyValues: []string{"numa"}}},
 			expectedStatus: []*nodev1alpha1.TopologyZone{
 				{
 					Type: nodev1alpha1.TopologyTypeSocket,
@@ -2149,6 +2150,195 @@ func TestListAndWatchReportContentRetry(t *testing.T) {
 	cancel()
 	err = <-errCh
 	assert.NoError(t, err)
+}
+
+func TestGpuReporterPlugin_getRDMAResourceProperty(t *testing.T) {
+	t.Parallel()
+
+	makeRegistry := func(gpuTopo, rdmaTopo *machine.DeviceTopology) *machine.DeviceTopologyRegistry {
+		reg := machine.NewDeviceTopologyRegistry(metrics.DummyMetrics{})
+		reg.RegisterDeviceTopologyProvider("gpu", machine.NewDeviceTopologyProvider())
+		reg.RegisterDeviceTopologyProvider("rdma", machine.NewDeviceTopologyProvider())
+		_ = reg.SetDeviceTopology("gpu", gpuTopo)
+		_ = reg.SetDeviceTopology("rdma", rdmaTopo)
+		return reg
+	}
+
+	gpuTopoSharedNuma := &machine.DeviceTopology{
+		Devices: map[string]machine.DeviceInfo{"gpu-0": {NumaNodes: []int{0}}},
+	}
+	rdmaTopoSharedNuma := &machine.DeviceTopology{
+		Devices: map[string]machine.DeviceInfo{"rdma-0": {NumaNodes: []int{0}}},
+	}
+	gpuTopoDisjoint := &machine.DeviceTopology{
+		Devices: map[string]machine.DeviceInfo{"gpu-0": {NumaNodes: []int{0}}},
+	}
+	rdmaTopoDisjoint := &machine.DeviceTopology{
+		Devices: map[string]machine.DeviceInfo{"rdma-0": {NumaNodes: []int{99}}},
+	}
+
+	// Dimension-based affinity: gpu and rdma share the same "pcie" dimension value.
+	gpuTopoSharedDimension := &machine.DeviceTopology{
+		Devices: map[string]machine.DeviceInfo{
+			"gpu-0": {Dimensions: machine.DeviceDimensions{"pcie": "0"}, NumaNodes: []int{5}},
+		},
+	}
+	rdmaTopoSharedDimension := &machine.DeviceTopology{
+		Devices: map[string]machine.DeviceInfo{
+			"rdma-0": {Dimensions: machine.DeviceDimensions{"pcie": "0"}, NumaNodes: []int{7}},
+		},
+	}
+
+	// Dimension-based: same dimension key, different values → no affinity.
+	gpuTopoMismatchedDimension := &machine.DeviceTopology{
+		Devices: map[string]machine.DeviceInfo{
+			"gpu-0": {Dimensions: machine.DeviceDimensions{"pcie": "0"}, NumaNodes: []int{5}},
+		},
+	}
+	rdmaTopoMismatchedDimension := &machine.DeviceTopology{
+		Devices: map[string]machine.DeviceInfo{
+			"rdma-0": {Dimensions: machine.DeviceDimensions{"pcie": "1"}, NumaNodes: []int{7}},
+		},
+	}
+
+	// Dimension-based: completely disjoint dimension keys → no affinity, and disjoint NUMA.
+	gpuTopoDifferentDimensionKey := &machine.DeviceTopology{
+		Devices: map[string]machine.DeviceInfo{
+			"gpu-0": {Dimensions: machine.DeviceDimensions{"socket": "0"}, NumaNodes: []int{5}},
+		},
+	}
+	rdmaTopoDifferentDimensionKey := &machine.DeviceTopology{
+		Devices: map[string]machine.DeviceInfo{
+			"rdma-0": {Dimensions: machine.DeviceDimensions{"pcie": "0"}, NumaNodes: []int{7}},
+		},
+	}
+
+	// Dimension match wins even when NUMA does not overlap.
+	gpuTopoDimensionOnly := &machine.DeviceTopology{
+		Devices: map[string]machine.DeviceInfo{
+			"gpu-0": {Dimensions: machine.DeviceDimensions{"socket": "1"}, NumaNodes: []int{0}},
+		},
+	}
+	rdmaTopoDimensionOnly := &machine.DeviceTopology{
+		Devices: map[string]machine.DeviceInfo{
+			"rdma-0": {Dimensions: machine.DeviceDimensions{"socket": "1"}, NumaNodes: []int{99}},
+		},
+	}
+
+	tests := []struct {
+		name     string
+		gpu      []string
+		rdma     []string
+		registry *machine.DeviceTopologyRegistry
+		expected *nodev1alpha1.Property
+	}{
+		{
+			name:     "affinity true",
+			gpu:      []string{"gpu"},
+			rdma:     []string{"rdma"},
+			registry: makeRegistry(gpuTopoSharedNuma, rdmaTopoSharedNuma),
+			expected: &nodev1alpha1.Property{PropertyName: pkgconsts.PropertyNameRDMAAffinityWithGPU, PropertyValues: []string{"true"}},
+		},
+		{
+			name:     "affinity false",
+			gpu:      []string{"gpu"},
+			rdma:     []string{"rdma"},
+			registry: makeRegistry(gpuTopoDisjoint, rdmaTopoDisjoint),
+			expected: &nodev1alpha1.Property{PropertyName: pkgconsts.PropertyNameRDMAAffinityWithGPU, PropertyValues: []string{"false"}},
+		},
+		{
+			name:     "dimension match true",
+			gpu:      []string{"gpu"},
+			rdma:     []string{"rdma"},
+			registry: makeRegistry(gpuTopoSharedDimension, rdmaTopoSharedDimension),
+			expected: &nodev1alpha1.Property{PropertyName: pkgconsts.PropertyNameRDMAAffinityWithGPU, PropertyValues: []string{"true"}},
+		},
+		{
+			name:     "dimension key matches but values differ false",
+			gpu:      []string{"gpu"},
+			rdma:     []string{"rdma"},
+			registry: makeRegistry(gpuTopoMismatchedDimension, rdmaTopoMismatchedDimension),
+			expected: &nodev1alpha1.Property{PropertyName: pkgconsts.PropertyNameRDMAAffinityWithGPU, PropertyValues: []string{"false"}},
+		},
+		{
+			name:     "different dimension keys false",
+			gpu:      []string{"gpu"},
+			rdma:     []string{"rdma"},
+			registry: makeRegistry(gpuTopoDifferentDimensionKey, rdmaTopoDifferentDimensionKey),
+			expected: &nodev1alpha1.Property{PropertyName: pkgconsts.PropertyNameRDMAAffinityWithGPU, PropertyValues: []string{"false"}},
+		},
+		{
+			name:     "dimension match without numa overlap true",
+			gpu:      []string{"gpu"},
+			rdma:     []string{"rdma"},
+			registry: makeRegistry(gpuTopoDimensionOnly, rdmaTopoDimensionOnly),
+			expected: &nodev1alpha1.Property{PropertyName: pkgconsts.PropertyNameRDMAAffinityWithGPU, PropertyValues: []string{"true"}},
+		},
+		{
+			name:     "rdma names empty returns nil",
+			gpu:      []string{"gpu"},
+			rdma:     nil,
+			registry: makeRegistry(gpuTopoSharedNuma, rdmaTopoSharedNuma),
+			expected: nil,
+		},
+		{
+			name:     "gpu names empty returns nil",
+			gpu:      nil,
+			rdma:     []string{"rdma"},
+			registry: makeRegistry(gpuTopoSharedNuma, rdmaTopoSharedNuma),
+			expected: nil,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			p := &gpuReporterPlugin{
+				gpuDeviceNames:         tc.gpu,
+				rdmaDeviceNames:        tc.rdma,
+				deviceTopologyRegistry: tc.registry,
+			}
+			got := p.getRDMAResourceProperty()
+			assert.Equal(t, tc.expected, got)
+		})
+	}
+}
+
+func TestGpuReporterPlugin_getResourcePropertyReportField_RDMAOnly(t *testing.T) {
+	t.Parallel()
+
+	gpuTopo := &machine.DeviceTopology{
+		Devices: map[string]machine.DeviceInfo{"gpu-0": {NumaNodes: []int{0}}},
+	}
+	rdmaTopo := &machine.DeviceTopology{
+		Devices: map[string]machine.DeviceInfo{"rdma-0": {NumaNodes: []int{0}}},
+	}
+
+	registry := machine.NewDeviceTopologyRegistry(metrics.DummyMetrics{})
+	registry.RegisterDeviceTopologyProvider("gpu", machine.NewDeviceTopologyProvider())
+	registry.RegisterDeviceTopologyProvider("rdma", machine.NewDeviceTopologyProvider())
+	_ = registry.SetDeviceTopology("gpu", gpuTopo)
+	_ = registry.SetDeviceTopology("rdma", rdmaTopo)
+
+	p := &gpuReporterPlugin{
+		gpuDeviceNames:         []string{"gpu"},
+		rdmaDeviceNames:        []string{"rdma"},
+		deviceTopologyRegistry: registry,
+	}
+
+	// latestDeviceTopology with no PriorityDimensions → gpu property is nil.
+	field, err := p.getResourcePropertyReportField(&machine.DeviceTopology{})
+	assert.NoError(t, err)
+	assert.NotNil(t, field)
+	assert.Equal(t, util.CNRFieldNameNodeResourceProperties, field.FieldName)
+
+	var properties []*nodev1alpha1.Property
+	err = json.Unmarshal(field.Value, &properties)
+	assert.NoError(t, err)
+	assert.Equal(t, []*nodev1alpha1.Property{
+		{PropertyName: pkgconsts.PropertyNameRDMAAffinityWithGPU, PropertyValues: []string{"true"}},
+	}, properties)
 }
 
 func TestHasExistingPodAllocation(t *testing.T) {
