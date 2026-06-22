@@ -20,14 +20,15 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	cliflag "k8s.io/component-base/cli/flag"
 
+	"github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/cmd/katalyst-agent/app/options/qrm/gpustrategy"
 	qrmconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm"
 )
 
 type GPUOptions struct {
-	PolicyName                      string
-	GPUDeviceNames                  []string
-	ShareGPUResourceNames           []string
+	PolicyName                                  string
+	GPUDeviceNames                              []string
+	ShareGPUResourceNames                       []string
 	GPUMemoryAllocatablePerGPU                  string
 	MilliGPUAllocatablePerGPU                   string
 	SkipGPUStateCorruption                      bool
@@ -51,15 +52,15 @@ type GPUOptions struct {
 
 func NewGPUOptions() *GPUOptions {
 	return &GPUOptions{
-		PolicyName:                      "static",
-		GPUDeviceNames:                  []string{"nvidia.com/gpu"},
-		ShareGPUResourceNames:           nil,
-		GPUMemoryAllocatablePerGPU:      "100",
+		PolicyName:                                  "static",
+		GPUDeviceNames:                              []string{"nvidia.com/gpu"},
+		ShareGPUResourceNames:                       nil,
+		GPUMemoryAllocatablePerGPU:                  "100",
 		MilliGPUAllocatablePerGPU:                   "1000",
-		RDMADeviceNames:                 []string{},
-		GPUStrategyOptions:              gpustrategy.NewGPUStrategyOptions(),
-		RequiredDeviceAffinity:          true,
-		EnableKubeletCheckpointFallback: true,
+		RDMADeviceNames:                             []string{},
+		GPUStrategyOptions:                          gpustrategy.NewGPUStrategyOptions(),
+		RequiredDeviceAffinity:                      true,
+		EnableKubeletCheckpointFallback:             true,
 		VirtualGPUPrefersSpreading:                  false,
 		VirtualGPUVisibleDevicesEnvNames:            []string{"NVIDIA_VISIBLE_DEVICES"},
 		GPUSelectionResultAnnotationKey:             consts.PodAnnotationGPUSelectionResultKey,
