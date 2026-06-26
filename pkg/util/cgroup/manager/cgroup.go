@@ -51,6 +51,16 @@ const CgroupFSMountPoint = "/sys/fs/cgroup"
 
 const DyingMemcgThreshold int = 2000
 
+const (
+	// Keep each memory.reclaim write capped to a conservative 1GiB upper bound.
+	// Large single-shot reclaim requests are more likely to create long reclaim stalls,
+	// while chunked reclaim keeps the pressure smoother until this value is made tunable.
+	memoryReclaimChunkSize int64 = 1 << 30 // 1GiB
+	// Leave a short gap between chunked reclaim writes so large reclaim requests do not
+	// hammer memory.reclaim continuously; 10ms is a conservative pacing interval.
+	memoryReclaimChunkInterval = 10 * time.Millisecond
+)
+
 func ApplyMemoryWithRelativePath(relCgroupPath string, data *common.MemoryData) error {
 	if data == nil {
 		return fmt.Errorf("ApplyMemoryWithRelativePath with nil cgroup data")
@@ -535,29 +545,59 @@ func DisableSwapMaxWithAbsolutePathRecursive(absCgroupPath string) error {
 
 func MemoryOffloadingWithAbsolutePath(ctx context.Context, absCgroupPath string, nbytes int64, mems machine.CPUSet) error {
 	startTime := time.Now()
-
-	var cmd string
+	var (
+		cmd string
+		err error
+	)
 	if common.CheckCgroup2UnifiedMode() {
 		if nbytes <= 0 {
 			general.Infof("[MemoryOffloadingWithAbsolutePath] skip memory reclaim on %s since nbytes is not valid", absCgroupPath)
 			return nil
 		}
 		// cgv2
-		cmd = fmt.Sprintf("echo %d > %s", nbytes, filepath.Join(absCgroupPath, "memory.reclaim"))
+		memReclaimPath := filepath.Join(absCgroupPath, "memory.reclaim")
+
+		remaining := nbytes
+		for remaining > 0 {
+			chunk := memoryReclaimChunkSize
+			if remaining < chunk {
+				chunk = remaining
+			}
+
+			cmd = fmt.Sprintf("echo %d > %s", chunk, memReclaimPath)
+
+			if e := doReclaimMemory(cmd, mems); e != nil {
+				err = e
+				break
+			}
+
+			remaining -= chunk
+			if remaining > 0 {
+				time.Sleep(memoryReclaimChunkInterval)
+			}
+		}
+
 	} else {
 		// cgv1
 		general.Infof("[MemoryOffloadingWithAbsolutePath] is not supported on cgroupv1")
 		return nil
 	}
 
-	err := doReclaimMemory(cmd, mems)
-
 	_ = asyncworker.EmitAsyncedMetrics(ctx, metrics.ConvertMapToTags(map[string]string{
 		"absCGPath": absCgroupPath,
 		"succeeded": fmt.Sprintf("%v", err == nil),
 	})...)
-	delta := time.Since(startTime).Seconds()
-	general.Infof("[MemoryOffloadingWithAbsolutePath] it takes %v to do \"%s\" on cgroup: %s", delta, cmd, absCgroupPath)
+
+	deltaMs := time.Since(startTime).Milliseconds()
+	_ = asyncworker.EmitCustomizedAsyncedMetrics(ctx,
+		util.MetricNameMemoryHandlerAdvisorMemoryOffloadTime,
+		deltaMs,
+		metrics.ConvertMapToTags(map[string]string{
+			"entryName":    absCgroupPath,
+			"subEntryName": "",
+		})...,
+	)
+	general.Infof("[MemoryOffloadingWithAbsolutePath] memory reclaim finished, cost=%dms, bytes=%d, cgroup=%s", deltaMs, nbytes, absCgroupPath)
 
 	return err
 }
