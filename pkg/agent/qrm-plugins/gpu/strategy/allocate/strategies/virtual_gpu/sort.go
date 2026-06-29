@@ -34,8 +34,13 @@ import (
 // rather than returning the unsorted slice.
 // TODO: support multiple resources, prioritize virtual_gpu for sorting, then milligpu
 func (s *VirtualGPUStrategy) Sort(ctx *allocate.AllocationContext, filteredDevices []string) ([]string, error) {
-	if ctx.DeviceTopology == nil {
-		return nil, fmt.Errorf("GPU topology is nil")
+	if ctx.DeviceTopologyRegistry == nil {
+		return nil, fmt.Errorf("GPU topology registry is nil")
+	}
+
+	gpuTopology, err := ctx.DeviceTopologyRegistry.GetDeviceTopology(ctx.ResourceName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get gpu topology: %w", err)
 	}
 
 	_, gpuMemory, memErr := qrmutil.GetQuantityFromResourceRequests(ctx.ResourceReq.ResourceRequests, string(consts.ResourceGPUMemory), nil)
@@ -71,7 +76,7 @@ func (s *VirtualGPUStrategy) Sort(ctx *allocate.AllocationContext, filteredDevic
 			ID:                deviceID,
 			AvailableMemory:   availableMemory,
 			AvailableMilliGPU: availableMilliGPU,
-			NUMAAffinity:      util.IsNUMAAffinityDevice(deviceID, ctx.DeviceTopology, ctx.HintNodes),
+			NUMAAffinity:      util.IsNUMAAffinityDevice(deviceID, gpuTopology, ctx.HintNodes),
 		})
 	}
 

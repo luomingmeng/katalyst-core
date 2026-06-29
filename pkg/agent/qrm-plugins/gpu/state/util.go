@@ -35,6 +35,11 @@ func GenerateMachineState(
 
 	allocationResourcesMap := make(AllocationResourcesMap)
 	for resourceName, generator := range defaultMachineStateGenerators.GetGenerators() {
+		if !generator.MustInitDefaultResourceState() {
+			general.Infof("skipping generator for resource %s as we do not need to init default resource state", resourceName)
+			continue
+		}
+
 		allocationMap, err := generator.GenerateDefaultResourceState()
 		if err != nil {
 			return nil, fmt.Errorf("GenerateDefaultResourceState for resource %s failed with error: %v", resourceName, err)
@@ -73,6 +78,12 @@ func GenerateMachineStateFromPodEntries(
 	// fill in the rest of the resources with default state
 	for resourceName, generator := range defaultMachineStateGenerators.GetGenerators() {
 		if _, ok := machineState[v1.ResourceName(resourceName)]; ok {
+			continue
+		}
+
+		// Skip generators that opt out of default resource state initialization
+		if !generator.MustInitDefaultResourceState() {
+			general.Infof("skipping generator for resource %s as we do not need to init default resource state", resourceName)
 			continue
 		}
 
@@ -118,17 +129,29 @@ func GenerateResourceStateFromPodEntries(
 }
 
 type genericDefaultResourceStateGenerator struct {
-	deviceNames      []string
-	topologyRegistry *machine.DeviceTopologyRegistry
-	allocatable      float64
+	deviceNames                  []string
+	topologyRegistry             *machine.DeviceTopologyRegistry
+	allocatable                  float64
+	mustInitDefaultResourceState bool
 }
 
 func NewGenericDefaultResourceStateGenerator(
 	deviceNames []string,
 	topologyRegistry *machine.DeviceTopologyRegistry,
 	allocatable float64,
+	mustInitDefaultResourceState bool,
 ) DefaultResourceStateGenerator {
-	return &genericDefaultResourceStateGenerator{deviceNames: deviceNames, topologyRegistry: topologyRegistry, allocatable: allocatable}
+	return &genericDefaultResourceStateGenerator{
+		deviceNames:                  deviceNames,
+		topologyRegistry:             topologyRegistry,
+		allocatable:                  allocatable,
+		mustInitDefaultResourceState: mustInitDefaultResourceState,
+	}
+}
+
+// MustInitDefaultResourceState returns true if we need to initialize the default resource state at the start
+func (g *genericDefaultResourceStateGenerator) MustInitDefaultResourceState() bool {
+	return g.mustInitDefaultResourceState
 }
 
 // GenerateDefaultResourceState return a default resource state by topology
@@ -142,7 +165,7 @@ func (g *genericDefaultResourceStateGenerator) GenerateDefaultResourceState() (A
 	}
 
 	// We pick the latest topology from multiple device names to generate a single unified state
-	latestTopology, err := g.topologyRegistry.GetLatestDeviceTopology(g.deviceNames)
+	latestTopology, _, err := g.topologyRegistry.GetLatestDeviceTopology(g.deviceNames)
 	if err != nil {
 		return nil, fmt.Errorf("topology provider registry failed to get latest topology: %v", err)
 	}

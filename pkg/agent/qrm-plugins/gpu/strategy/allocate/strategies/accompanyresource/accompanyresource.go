@@ -14,25 +14,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package strategies
+package accompanyresource
 
 import (
-	"fmt"
-
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate"
 )
 
-// IsBindingContextValid checks if the context given for binding is valid
-func IsBindingContextValid(ctx *allocate.AllocationContext, sortedDevices []string) (bool, string) {
-	if ctx.DeviceTopologyRegistry == nil {
-		return false, "GPU topology registry is nil"
-	}
+const (
+	StrategyNameAccompanyResource = "AccompanyResource"
+)
 
-	// Determine how many devices to allocate
-	devicesToAllocate := int(ctx.DeviceReq.DeviceRequest)
-	if devicesToAllocate > len(sortedDevices) {
-		return false, fmt.Sprintf("not enough devices: need %d, have %d", devicesToAllocate, len(sortedDevices))
-	}
+// AccompanyResourceStrategy allocates devices based on the allocation of an accompany resource.
+type AccompanyResourceStrategy struct {
+	targetDeviceName string
+}
 
-	return true, ""
+func NewAccompanyResourceStrategy() *AccompanyResourceStrategy {
+	return &AccompanyResourceStrategy{}
+}
+
+var _ allocate.BindingStrategy = &AccompanyResourceStrategy{}
+
+// Name returns the name of the strategy.
+func (s *AccompanyResourceStrategy) Name() string {
+	return StrategyNameAccompanyResource
 }

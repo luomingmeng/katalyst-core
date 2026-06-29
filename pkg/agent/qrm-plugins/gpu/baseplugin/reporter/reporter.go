@@ -40,6 +40,7 @@ import (
 	"github.com/kubewharf/katalyst-api/pkg/protocol/reporterplugin/v1alpha1"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/state"
 	"github.com/kubewharf/katalyst-core/pkg/config"
+	pkgconsts "github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	metaserverpod "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
@@ -52,7 +53,6 @@ import (
 
 const (
 	gpuReporterPluginName                       = "gpu-reporter-plugin"
-	propertyNameGPUTopology                     = "gpu_topology_attribute_key"
 	defaultReportRetryInterval                  = 5 * time.Second
 	metricGetPodListFailed                      = "qrm_gpu_reporter_get_pod_list_failed"
 	metricAddKubeletCheckpointAllocationsFailed = "qrm_gpu_reporter_add_kubelet_checkpoint_allocations_failed"
@@ -114,6 +114,7 @@ type gpuReporterPlugin struct {
 	metaServer *metaserver.MetaServer
 
 	gpuDeviceNames         []string
+	rdmaDeviceNames        []string
 	numaSocketZoneNodeMap  map[util.ZoneNode]util.ZoneNode
 	deviceTopologyRegistry *machine.DeviceTopologyRegistry
 	stateGetter            func() state.State
@@ -142,6 +143,7 @@ func newGPUReporterPlugin(emitter metrics.MetricEmitter, metaServer *metaserver.
 
 	reporter := &gpuReporterPlugin{
 		gpuDeviceNames:                  conf.GPUDeviceNames,
+		rdmaDeviceNames:                 conf.RDMADeviceNames,
 		numaSocketZoneNodeMap:           util.GenerateNumaSocketZone(metaServer.MachineInfo.Topology),
 		emitter:                         emitter,
 		deviceTopologyRegistry:          topologyRegistry,
@@ -277,11 +279,11 @@ func (p *gpuReporterPlugin) GetReportContent(ctx context.Context, _ *v1alpha1.Em
 
 func (p *gpuReporterPlugin) buildReportResponse() (*v1alpha1.GetReportContentResponse, error) {
 	// The reporter picks the latest topology from all configured GPU devices to report to CNR.
-	topologiesMap, err := p.deviceTopologyRegistry.GetDeviceTopologies(p.gpuDeviceNames)
-	if err != nil {
-		return nil, err
+	topologiesMap, ok := p.deviceTopologyRegistry.GetDeviceTopologies(p.gpuDeviceNames)
+	if !ok {
+		return nil, fmt.Errorf("failed to get any device topology")
 	}
-	latestDeviceTopology := machine.PickLatestDeviceTopology(topologiesMap)
+	latestDeviceTopology, _ := machine.PickLatestDeviceTopology(topologiesMap)
 
 	stateImpl := p.stateGetter()
 	if stateImpl == nil {
@@ -344,7 +346,7 @@ func (p *gpuReporterPlugin) getTopologyZoneReportField(topologiesMap map[string]
 		return nil, fmt.Errorf("no zone resources found for device topology")
 	}
 
-	zoneAllocations, err := p.getZoneAllocations(machineState)
+	zoneAllocations, err := p.getZoneAllocations(topologiesMap, machineState)
 	if err != nil {
 		return nil, err
 	}
@@ -365,12 +367,16 @@ func (p *gpuReporterPlugin) getTopologyZoneReportField(topologiesMap map[string]
 }
 
 func (p *gpuReporterPlugin) getResourcePropertyReportField(latestDeviceTopology *machine.DeviceTopology) (*v1alpha1.ReportField, error) {
-	resourceProperty := p.getGPUResourceProperty(latestDeviceTopology)
-	if resourceProperty == nil {
+	properties := p.getGPUResourceProperty(latestDeviceTopology)
+	if rdmaProperty := p.getRDMAResourceProperty(); rdmaProperty != nil {
+		properties = append(properties, rdmaProperty)
+	}
+
+	if len(properties) == 0 {
 		return nil, nil
 	}
 
-	propertyValues, err := json.Marshal(&resourceProperty)
+	propertyValues, err := json.Marshal(&properties)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal resource property values: %w", err)
 	}
@@ -384,15 +390,35 @@ func (p *gpuReporterPlugin) getResourcePropertyReportField(latestDeviceTopology 
 
 // getGPUResourceProperty returns the different dimensions to differentiate affinity priority of gpu devices.
 func (p *gpuReporterPlugin) getGPUResourceProperty(deviceTopology *machine.DeviceTopology) []*nodev1alpha1.Property {
-	if deviceTopology == nil || deviceTopology.PriorityDimensions == nil {
+	if deviceTopology == nil || len(deviceTopology.PriorityDimensions) == 0 {
 		return nil
 	}
 
 	return []*nodev1alpha1.Property{
 		{
-			PropertyName:   propertyNameGPUTopology,
+			PropertyName:   pkgconsts.PropertyNameGPUTopology,
 			PropertyValues: deviceTopology.PriorityDimensions,
 		},
+	}
+}
+
+// getRDMAResourceProperty reports whether any RDMA device has affinity with
+// any GPU device, as a single property with value "true" or "false".
+func (p *gpuReporterPlugin) getRDMAResourceProperty() *nodev1alpha1.Property {
+	if len(p.rdmaDeviceNames) == 0 || len(p.gpuDeviceNames) == 0 {
+		return nil
+	}
+
+	hasAffinity := p.deviceTopologyRegistry.HasAnyDeviceAffinity(p.gpuDeviceNames, p.rdmaDeviceNames)
+
+	value := "false"
+	if hasAffinity {
+		value = "true"
+	}
+
+	return &nodev1alpha1.Property{
+		PropertyName:   pkgconsts.PropertyNameRDMAAffinityWithGPU,
+		PropertyValues: []string{value},
 	}
 }
 
@@ -504,12 +530,12 @@ func (p *gpuReporterPlugin) getZoneResources(topologiesMap map[string]*machine.D
 }
 
 // getZoneAllocations returns the map of gpu zone nodes to their pod allocations
-func (p *gpuReporterPlugin) getZoneAllocations(machineState state.AllocationResourcesMap) (map[util.ZoneNode]util.ZoneAllocations, error) {
+func (p *gpuReporterPlugin) getZoneAllocations(topologiesMap map[string]*machine.DeviceTopology, machineState state.AllocationResourcesMap) (map[util.ZoneNode]util.ZoneAllocations, error) {
 	// First construct map of device id to allocations
 	idToAllocations := make(map[string]util.ZoneAllocations)
 
 	// Add allocations from machine state
-	p.addStateAllocations(idToAllocations, machineState)
+	p.addStateAllocations(topologiesMap, idToAllocations, machineState)
 
 	// Add allocations from kubelet device manager checkpoint as a fallback.
 	if p.enableKubeletCheckpointFallback {
@@ -535,7 +561,7 @@ func (p *gpuReporterPlugin) getZoneAllocations(machineState state.AllocationReso
 // addStateAllocations merges the allocations stored in the local machine state
 // (Katalyst's QRM state) into the target idToAllocations map. This map acts as
 // an intermediate state mapping device IDs to their corresponding pod allocations.
-func (p *gpuReporterPlugin) addStateAllocations(idToAllocations map[string]util.ZoneAllocations, machineState state.AllocationResourcesMap) {
+func (p *gpuReporterPlugin) addStateAllocations(topologiesMap map[string]*machine.DeviceTopology, idToAllocations map[string]util.ZoneAllocations, machineState state.AllocationResourcesMap) {
 	for resourceName, allocMap := range machineState {
 		for id, allocState := range allocMap {
 			if _, ok := idToAllocations[id]; !ok {
@@ -552,6 +578,11 @@ func (p *gpuReporterPlugin) addStateAllocations(idToAllocations map[string]util.
 
 					// Override the resource name if there is a specified device name
 					if allocInfo.DeviceName != "" {
+						// Skip reporting if it is not a GPU device
+						if _, ok := topologiesMap[allocInfo.DeviceName]; !ok {
+							continue
+						}
+
 						resourceName = v1.ResourceName(allocInfo.DeviceName)
 					}
 

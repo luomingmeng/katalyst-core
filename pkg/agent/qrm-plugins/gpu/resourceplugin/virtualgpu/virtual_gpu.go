@@ -58,9 +58,9 @@ func NewVirtualGPUPlugin(base *baseplugin.BasePlugin) resourceplugin.ResourcePlu
 	// string(consts.ResourceGPUMemory) is the key used for state management in the QRM framework,
 	// while GPUDeviceNames are the actual resource names used to fetch the device topologies.
 	base.DefaultResourceStateGeneratorRegistry.RegisterResourceStateGenerator(string(consts.ResourceGPUMemory),
-		state.NewGenericDefaultResourceStateGenerator(base.Conf.GPUDeviceNames, base.DeviceTopologyRegistry, float64(base.Conf.GPUMemoryAllocatablePerGPU.Value())))
+		state.NewGenericDefaultResourceStateGenerator(base.Conf.GPUDeviceNames, base.DeviceTopologyRegistry, float64(base.Conf.GPUMemoryAllocatablePerGPU.Value()), true))
 	base.DefaultResourceStateGeneratorRegistry.RegisterResourceStateGenerator(string(consts.ResourceMilliGPU),
-		state.NewGenericDefaultResourceStateGenerator(base.Conf.GPUDeviceNames, base.DeviceTopologyRegistry, float64(base.Conf.MilliGPUAllocatablePerGPU.Value())))
+		state.NewGenericDefaultResourceStateGenerator(base.Conf.GPUDeviceNames, base.DeviceTopologyRegistry, float64(base.Conf.MilliGPUAllocatablePerGPU.Value()), true))
 	return &VirtualGPUPlugin{
 		BasePlugin: base,
 	}
@@ -199,7 +199,7 @@ func (p *VirtualGPUPlugin) calculateHints(
 	resourceMachineState state.AllocationResourcesMap, gpuState state.AllocationMap,
 	req *pluginapi.ResourceRequest,
 ) (map[string]*pluginapi.ListOfTopologyHints, error) {
-	gpuTopology, err := p.DeviceTopologyRegistry.GetLatestDeviceTopology(p.Conf.GPUDeviceNames)
+	gpuTopology, _, err := p.DeviceTopologyRegistry.GetLatestDeviceTopology(p.Conf.GPUDeviceNames)
 	if err != nil {
 		return nil, fmt.Errorf("GetLatestDeviceTopology failed with error: %v", err)
 	}
@@ -645,7 +645,7 @@ func (p *VirtualGPUPlugin) GetTopologyAwareAllocatableResources(ctx context.Cont
 	p.Lock()
 	defer p.Unlock()
 
-	gpuTopology, err := p.DeviceTopologyRegistry.GetLatestDeviceTopology(p.Conf.GPUDeviceNames)
+	gpuTopology, _, err := p.DeviceTopologyRegistry.GetLatestDeviceTopology(p.Conf.GPUDeviceNames)
 	if err != nil {
 		return nil, err
 	}
@@ -827,22 +827,25 @@ func (p *VirtualGPUPlugin) allocate(
 	qosLevel string,
 	skipEnvInjection bool,
 ) (*pluginapi.ResourceAllocationResponse, error) {
-	gpuTopology, err := p.DeviceTopologyRegistry.GetLatestDeviceTopology(p.Conf.GPUDeviceNames)
+	gpuTopology, _, err := p.DeviceTopologyRegistry.GetLatestDeviceTopology(p.Conf.GPUDeviceNames)
 	if err != nil {
 		general.Warningf("failed to get gpu topology: %v", err)
 		return nil, fmt.Errorf("failed to get gpu topology: %v", err)
 	}
 
 	// Use the strategy framework to allocate GPU compute
-	result, err := manager.AllocateGPUUsingStrategy(
+	result, err := manager.AllocateDevicesUsingStrategy(
 		resourceReq,
 		deviceReq,
-		gpuTopology,
+		p.DeviceTopologyRegistry,
 		p.Conf.GPUQRMPluginConfig,
 		p.Emitter,
 		p.MetaServer,
 		p.GetState().GetMachineState(),
 		qosLevel,
+		deviceReq.DeviceName,
+		"",
+		p.GetDeviceNameToTypeMap(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("GPU allocation using strategy failed: %v", err)
@@ -1007,9 +1010,12 @@ func (p *VirtualGPUPlugin) injectMilliGPUEnvVariables(envs map[string]string, al
 	}
 }
 
+// generateDeviceRequestForMilliGPU fabricates a DeviceRequest for milligpu-only requests (which arrive
+// without one from kubelet). DeviceName is set to the picked GPU device name so downstream strategies
+// can resolve the topology via ctx.ResourceName.
 func (p *VirtualGPUPlugin) generateDeviceRequestForMilliGPU(resourceReq *pluginapi.ResourceRequest) (*pluginapi.DeviceRequest, error) {
 	// Get topology to find all available healthy devices
-	gpuTopology, err := p.DeviceTopologyRegistry.GetLatestDeviceTopology(p.Conf.GPUDeviceNames)
+	gpuTopology, gpuDeviceName, err := p.DeviceTopologyRegistry.GetLatestDeviceTopology(p.Conf.GPUDeviceNames)
 	if err != nil {
 		return nil, fmt.Errorf("GetLatestDeviceTopology failed with error: %v", err)
 	}
@@ -1024,6 +1030,7 @@ func (p *VirtualGPUPlugin) generateDeviceRequestForMilliGPU(resourceReq *plugina
 	// Create a preliminary DeviceRequest
 	// TODO: we currently don't support init containers, so we don't have reusable devices.
 	deviceReq := &pluginapi.DeviceRequest{
+		DeviceName:       gpuDeviceName,
 		DeviceRequest:    1,
 		Hint:             resourceReq.GetHint(),
 		AvailableDevices: allHealthyDevices,

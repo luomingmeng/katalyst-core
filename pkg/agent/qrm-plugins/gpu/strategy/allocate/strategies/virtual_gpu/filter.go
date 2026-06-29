@@ -31,8 +31,8 @@ import (
 // Filter filters the available GPU devices based on available GPU resources (memory & milligpu)
 // It returns devices that have enough available resources for all the requests
 func (s *VirtualGPUStrategy) Filter(ctx *allocate.AllocationContext, allAvailableDevices []string) ([]string, error) {
-	if ctx.DeviceTopology == nil {
-		return nil, fmt.Errorf("GPU topology is nil")
+	if ctx.DeviceTopologyRegistry == nil {
+		return nil, fmt.Errorf("GPU topology registry is nil")
 	}
 
 	allowedResources := sets.NewString(string(consts.ResourceGPUMemory), string(consts.ResourceMilliGPU))

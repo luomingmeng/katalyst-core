@@ -31,6 +31,7 @@ import (
 
 const (
 	resyncInterval = 30 * time.Second
+	DimensionNuma  = "numa"
 )
 
 // DeviceTopologyRegistry is a registry of all topology providers that knows how to provide topology information of machine devices
@@ -236,8 +237,9 @@ func (r *DeviceTopologyRegistry) GetDeviceTopology(deviceName string) (*DeviceTo
 }
 
 // GetDeviceTopologies gets device topologies for the given device names.
-// It returns a map of device name to their respective device topology.
-func (r *DeviceTopologyRegistry) GetDeviceTopologies(deviceNames []string) (map[string]*DeviceTopology, error) {
+// It returns a map of device name to their respective device topology,
+// along with a boolean indicating whether any topology is found.
+func (r *DeviceTopologyRegistry) GetDeviceTopologies(deviceNames []string) (map[string]*DeviceTopology, bool) {
 	r.mux.RLock()
 	defer r.mux.RUnlock()
 
@@ -252,55 +254,172 @@ func (r *DeviceTopologyRegistry) GetDeviceTopologies(deviceNames []string) (map[
 	}
 
 	if len(topologies) == 0 {
-		return nil, fmt.Errorf("failed to get any device topology")
+		return nil, false
 	}
 
-	return topologies, nil
+	return topologies, true
 }
 
 // GetLatestDeviceTopology gets device topologies for the given device names and picks the latest one.
-func (r *DeviceTopologyRegistry) GetLatestDeviceTopology(deviceNames []string) (*DeviceTopology, error) {
-	topologiesMap, err := r.GetDeviceTopologies(deviceNames)
-	if err != nil {
-		return nil, err
+// It also returns the device name whose topology was picked.
+func (r *DeviceTopologyRegistry) GetLatestDeviceTopology(deviceNames []string) (*DeviceTopology, string, error) {
+	topologiesMap, ok := r.GetDeviceTopologies(deviceNames)
+	if !ok {
+		return nil, "", fmt.Errorf("failed to get any device topology")
 	}
 
-	latestTopology := PickLatestDeviceTopology(topologiesMap)
+	latestTopology, latestName := PickLatestDeviceTopology(topologiesMap)
 	if latestTopology == nil {
-		return nil, fmt.Errorf("no latest device topology")
+		return nil, "", fmt.Errorf("no latest device topology")
 	}
 
-	return latestTopology, nil
+	return latestTopology, latestName, nil
 }
 
-// GetDeviceNUMAAffinity retrieves a map of a certain device A to the list of devices in device B that it has an affinity with.
-// A device is considered to have an affinity with another device if they are on the exact same NUMA node(s)
-func (r *DeviceTopologyRegistry) GetDeviceNUMAAffinity(deviceA, deviceB string) (map[string][]string, error) {
-	deviceTopologyKey, err := r.GetDeviceTopology(deviceA)
+// getAffinityFromDimensions returns, for each device id in deviceTopologyA.Devices,
+// the set of device ids in deviceTopologyB.Devices grouped by dimension key,
+// such that the dimension value is the same between deviceA and deviceB.
+func getAffinityFromDimensions(deviceTopologyA, deviceTopologyB *DeviceTopology) map[string]map[string]DeviceIDs {
+	result := make(map[string]map[string]DeviceIDs)
+	for deviceNameA, deviceInfoA := range deviceTopologyA.Devices {
+		// Group deviceB by dimension key
+		grouped := make(map[string]sets.String)
+		// Iterate over each dimension of deviceA
+		for dimName, dimValueA := range deviceInfoA.Dimensions {
+			// Find all deviceB with the same dimension value
+			for deviceNameB, deviceInfoB := range deviceTopologyB.Devices {
+				dimValueB, ok := deviceInfoB.Dimensions[dimName]
+				if !ok {
+					continue
+				}
+				if dimValueB != dimValueA {
+					continue
+				}
+				if _, exists := grouped[dimName]; !exists {
+					grouped[dimName] = sets.NewString()
+				}
+				grouped[dimName].Insert(deviceNameB)
+			}
+		}
+
+		if len(grouped) > 0 {
+			dimensionGroups := make(map[string]DeviceIDs)
+			for dimName, setIDs := range grouped {
+				dimensionGroups[dimName] = setIDs.UnsortedList()
+			}
+			result[deviceNameA] = dimensionGroups
+		}
+	}
+	return result
+}
+
+// getAffinityFromNumaNodes returns, for each device id in deviceTopologyA.Devices,
+// the set of device ids in deviceTopologyB.Devices grouped under "numa" key,
+// such that they share at least one NUMA node with deviceA.
+func getAffinityFromNumaNodes(deviceTopologyA, deviceTopologyB *DeviceTopology) map[string]map[string]DeviceIDs {
+	result := make(map[string]map[string]DeviceIDs)
+	for deviceNameA, deviceInfoA := range deviceTopologyA.Devices {
+		if len(deviceInfoA.NumaNodes) == 0 {
+			continue
+		}
+
+		// Use a set to track unique NUMA node values for deviceA
+		numaSetA := sets.NewInt(deviceInfoA.NumaNodes...)
+		grouped := make(map[string]sets.String)
+		for deviceNameB, deviceInfoB := range deviceTopologyB.Devices {
+			for _, numaNodeB := range deviceInfoB.NumaNodes {
+				if numaSetA.Has(numaNodeB) {
+					if _, exists := grouped[DimensionNuma]; !exists {
+						grouped[DimensionNuma] = sets.NewString()
+					}
+					grouped[DimensionNuma].Insert(deviceNameB)
+					break // no need to check other numa nodes for this deviceB
+				}
+			}
+		}
+
+		if len(grouped) > 0 {
+			dimensionGroups := make(map[string]DeviceIDs)
+			for dimName, setIDs := range grouped {
+				dimensionGroups[dimName] = setIDs.UnsortedList()
+			}
+			result[deviceNameA] = dimensionGroups
+		}
+	}
+	return result
+}
+
+// GetAffinityDevices returns, for each device id in deviceA, the set of deviceB ids
+// grouped by dimension key, first checking Dimensions, then falling back to NumaNodes.
+// The returned structure is:
+//
+//	map[deviceAId]map[dimensionKey]DeviceIDs.
+//
+// If no affinities exist for a deviceAId, that id is omitted from the result.
+func (r *DeviceTopologyRegistry) GetAffinityDevices(deviceA, deviceB string) (map[string]map[string]DeviceIDs, error) {
+	deviceTopologyA, err := r.GetDeviceTopology(deviceA)
 	if err != nil {
 		return nil, fmt.Errorf("error getting device topology for device %s: %v", deviceA, err)
 	}
 
-	deviceTopologyValue, err := r.GetDeviceTopology(deviceB)
+	deviceTopologyB, err := r.GetDeviceTopology(deviceB)
 	if err != nil {
 		return nil, fmt.Errorf("error getting device topology for device %s: %v", deviceB, err)
 	}
 
-	deviceAffinity := make(map[string][]string)
-	for keyName, keyInfo := range deviceTopologyKey.Devices {
-		devicesWithAffinity := make([]string, 0)
-		for valueName, valueInfo := range deviceTopologyValue.Devices {
-			deviceKeyNUMANodes := keyInfo.GetNUMANodes()
-			deviceValueNUMANodes := valueInfo.GetNUMANodes()
-
-			if len(deviceKeyNUMANodes) != 0 && sets.NewInt(deviceKeyNUMANodes...).Equal(sets.NewInt(deviceValueNUMANodes...)) {
-				devicesWithAffinity = append(devicesWithAffinity, valueName)
-			}
-		}
-		deviceAffinity[keyName] = devicesWithAffinity
+	result := getAffinityFromDimensions(deviceTopologyA, deviceTopologyB)
+	if len(result) == 0 {
+		result = getAffinityFromNumaNodes(deviceTopologyA, deviceTopologyB)
 	}
 
-	return deviceAffinity, nil
+	return result, nil
+}
+
+// HasAnyDeviceAffinity returns true if there exists at least one (a, b) pair
+// where a is in deviceASet and b is in deviceBSet such that affinity exists
+// between them. It short-circuits on the first matching dimension or NUMA-node
+// pair instead of materializing the full affinity map.
+func (r *DeviceTopologyRegistry) HasAnyDeviceAffinity(deviceASet, deviceBSet []string) bool {
+	for _, deviceA := range deviceASet {
+		topoA, err := r.GetDeviceTopology(deviceA)
+		if err != nil {
+			continue
+		}
+		for _, deviceB := range deviceBSet {
+			topoB, err := r.GetDeviceTopology(deviceB)
+			if err != nil {
+				continue
+			}
+			if hasAnyDeviceAffinity(topoA, topoB) {
+				general.Infof("found affinity between device %s and device %s", deviceA, deviceB)
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasAnyDeviceAffinity reports whether any device in topoA shares a dimension
+// value or a NUMA node with any device in topoB. It returns on the first hit
+// without building the full affinity map.
+func hasAnyDeviceAffinity(topoA, topoB *DeviceTopology) bool {
+	for _, devA := range topoA.Devices {
+		for _, devB := range topoB.Devices {
+			for dim, valA := range devA.Dimensions {
+				if valB, ok := devB.Dimensions[dim]; ok && valA == valB {
+					return true
+				}
+			}
+			for _, numaA := range devA.NumaNodes {
+				for _, numaB := range devB.NumaNodes {
+					if numaA == numaB {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
 }
 
 type DeviceTopology struct {
@@ -442,17 +561,20 @@ func (p *deviceTopologyProviderImpl) GetDeviceTopology() (*DeviceTopology, error
 }
 
 // PickLatestDeviceTopology selects the latest device topology from the given map based on UpdateTime.
-func PickLatestDeviceTopology(topologies map[string]*DeviceTopology) *DeviceTopology {
+// It also returns the map key of the picked topology (empty string if none was picked).
+func PickLatestDeviceTopology(topologies map[string]*DeviceTopology) (*DeviceTopology, string) {
 	var latest *DeviceTopology
-	for _, t := range topologies {
+	var latestName string
+	for name, t := range topologies {
 		if t == nil {
 			continue
 		}
 
 		if latest == nil || t.UpdateTime > latest.UpdateTime {
 			latest = t
+			latestName = name
 		}
 	}
 
-	return latest
+	return latest, latestName
 }

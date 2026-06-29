@@ -25,7 +25,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager"
 	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager/errors"
 
@@ -145,86 +144,50 @@ func TestAllocationResourcesMap_GetRatioOfAccompanyResourceToTargetResource(t *t
 	}
 }
 
-func TestPodResourceEntries_GetTotalAllocatedResourceOfContainer(t *testing.T) {
+func TestAllocationResourcesMap_CalculateTargetDevicesToAllocate(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name                        string
-		resourceName                v1.ResourceName
-		podUID                      string
-		containerName               string
-		pre                         PodResourceEntries
-		wantTotalAllocationQuantity int
-		wantAllocationIDs           sets.String
+		name                          string
+		ratio                         float64
+		accompanyAllocatedDeviceCount int
+		want                          int
+		wantErr                       bool
 	}{
 		{
-			name:          "normal case",
-			resourceName:  v1.ResourceName("testResource"),
-			podUID:        "podUID",
-			containerName: "containerName",
-			pre: PodResourceEntries{
-				v1.ResourceName("testResource"): {
-					"podUID2": {
-						"containerName": {
-							AllocatedAllocation: Allocation{
-								Quantity: 2,
-							},
-							TopologyAwareAllocations: map[string]Allocation{
-								"test-1": {
-									Quantity: 1,
-								},
-								"test-2": {
-									Quantity: 1,
-								},
-							},
-						},
-					},
-					"podUID": {
-						"containerName": {
-							AllocatedAllocation: Allocation{
-								Quantity: 2,
-							},
-							TopologyAwareAllocations: map[string]Allocation{
-								"test-3": {
-									Quantity: 1,
-								},
-								"test-4": {
-									Quantity: 1,
-								},
-							},
-						},
-					},
-				},
-			},
-			wantTotalAllocationQuantity: 2,
-			wantAllocationIDs:           sets.NewString("test-3", "test-4"),
+			name:                          "ratio <= 0 falls back to 1",
+			ratio:                         -1.0,
+			accompanyAllocatedDeviceCount: 3,
+			want:                          3,
+			wantErr:                       false,
 		},
 		{
-			name:          "no allocation",
-			resourceName:  v1.ResourceName("testResource"),
-			podUID:        "podUID",
-			containerName: "containerName",
-			pre: PodResourceEntries{
-				v1.ResourceName("testResource"): {
-					"podUID2": {
-						"containerName": {
-							AllocatedAllocation: Allocation{
-								Quantity: 2,
-							},
-							TopologyAwareAllocations: map[string]Allocation{
-								"test-1": {
-									Quantity: 1,
-								},
-								"test-2": {
-									Quantity: 1,
-								},
-							},
-						},
-					},
-				},
-			},
-			wantTotalAllocationQuantity: 0,
-			wantAllocationIDs:           sets.NewString(),
+			name:                          "whole number division",
+			ratio:                         2.0,
+			accompanyAllocatedDeviceCount: 4,
+			want:                          2,
+			wantErr:                       false,
+		},
+		{
+			name:                          "whole number division resulting in < 1 falls back to 1",
+			ratio:                         5.0,
+			accompanyAllocatedDeviceCount: 2,
+			want:                          0,
+			wantErr:                       true,
+		},
+		{
+			name:                          "fractional result returns error (4/3)",
+			ratio:                         3.0,
+			accompanyAllocatedDeviceCount: 4,
+			want:                          0,
+			wantErr:                       true,
+		},
+		{
+			name:                          "fractional result returns error (5/2)",
+			ratio:                         2.0,
+			accompanyAllocatedDeviceCount: 5,
+			want:                          0,
+			wantErr:                       true,
 		},
 	}
 
@@ -232,10 +195,16 @@ func TestPodResourceEntries_GetTotalAllocatedResourceOfContainer(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			gotTotalAllocationQuantity, gotAllocationIDs := tt.pre.GetTotalAllocatedResourceOfContainer(tt.resourceName, tt.podUID, tt.containerName)
-			assert.Equal(t, tt.wantTotalAllocationQuantity, gotTotalAllocationQuantity)
+			arm := AllocationResourcesMap{}
+			got, err := arm.CalculateTargetDevicesToAllocate(tt.ratio, tt.accompanyAllocatedDeviceCount)
 
-			assert.ElementsMatch(t, tt.wantAllocationIDs.UnsortedList(), gotAllocationIDs.UnsortedList())
+			if (err != nil) != tt.wantErr {
+				t.Errorf("CalculateTargetDevicesToAllocate() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("CalculateTargetDevicesToAllocate() = %v, want %v", got, tt.want)
+			}
 		})
 	}
 }
@@ -348,6 +317,110 @@ func TestNewGPUPluginCheckpoint(t *testing.T) {
 				assert.Equal(t, newCheckpoint, oldCheckpoint)
 			} else {
 				assert.NotEqual(t, newCheckpoint, oldCheckpoint)
+			}
+		})
+	}
+}
+
+func TestAllocationResourcesMap_GetAllocatedDeviceIDs(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		resourceName  v1.ResourceName
+		podUID        string
+		containerName string
+		arm           AllocationResourcesMap
+		wantIDs       []string
+	}{
+		{
+			name:          "normal two devices",
+			resourceName:  v1.ResourceName("nvidia.com/gpu"),
+			podUID:        "pod-1",
+			containerName: "ctr-1",
+			arm: AllocationResourcesMap{
+				v1.ResourceName("nvidia.com/gpu"): AllocationMap{
+					"devA": &AllocationState{PodEntries: PodEntries{
+						"pod-1": ContainerEntries{
+							"ctr-1": &AllocationInfo{},
+						},
+					}},
+					"devB": &AllocationState{PodEntries: PodEntries{
+						"pod-1": ContainerEntries{
+							"ctr-1": &AllocationInfo{},
+						},
+					}},
+				},
+			},
+			wantIDs: []string{"devA", "devB"},
+		},
+		{
+			name:          "resource missing",
+			resourceName:  v1.ResourceName("nvidia.com/gpu"),
+			podUID:        "pod-1",
+			containerName: "ctr-1",
+			arm: AllocationResourcesMap{
+				v1.ResourceName("another.resource"): AllocationMap{
+					"devX": &AllocationState{PodEntries: PodEntries{
+						"pod-1": ContainerEntries{
+							"ctr-1": &AllocationInfo{},
+						},
+					}},
+				},
+			},
+			wantIDs: []string{},
+		},
+		{
+			name:          "nil states and mismatches are ignored",
+			resourceName:  v1.ResourceName("example.com/device"),
+			podUID:        "pod-1",
+			containerName: "ctr-1",
+			arm: AllocationResourcesMap{
+				v1.ResourceName("example.com/device"): AllocationMap{
+					// nil AllocationState
+					"nilState": nil,
+					// nil PodEntries
+					"nilEntries": &AllocationState{},
+					// different podUID
+					"otherPod": &AllocationState{PodEntries: PodEntries{
+						"pod-2": ContainerEntries{
+							"ctr-1": &AllocationInfo{},
+						},
+					}},
+					// container present but nil AllocationInfo
+					"nilAllocInfo": &AllocationState{PodEntries: PodEntries{
+						"pod-1": ContainerEntries{
+							"ctr-1": nil,
+						},
+					}},
+					// valid match
+					"match": &AllocationState{PodEntries: PodEntries{
+						"pod-1": ContainerEntries{
+							"ctr-1": &AllocationInfo{},
+						},
+					}},
+				},
+			},
+			wantIDs: []string{"match"},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := tt.arm.GetAllocatedDeviceIDs(tt.resourceName, tt.podUID, tt.containerName)
+
+			// Compare as sets since map iteration order is nondeterministic
+			assert.Equal(t, len(tt.wantIDs), len(got))
+			wantSet := map[string]struct{}{}
+			for _, id := range tt.wantIDs {
+				wantSet[id] = struct{}{}
+			}
+			for _, id := range got {
+				if _, ok := wantSet[id]; !ok {
+					t.Fatalf("unexpected id %q in result %v, want %v", id, got, tt.wantIDs)
+				}
 			}
 		})
 	}

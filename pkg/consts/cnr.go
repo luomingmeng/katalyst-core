@@ -37,4 +37,12 @@ const (
 	// Example: a cache group zone may expose "2-5,10-13" to show its CPU membership.
 	// Note: this is typically reported for L3 cache groups and may be vendor-gated.
 	ZoneAttributeNameCPULists = "cpu_lists"
+
+	// PropertyNameGPUTopology is the attribute key on a NodeResourceProperty that
+	// carries the GPU topology priority dimensions (e.g. ["NVLINK", "PCIE"]).
+	PropertyNameGPUTopology = "gpu_topology_attribute_key"
+	// PropertyNameRDMAAffinityWithGPU is the attribute key on a NodeResourceProperty
+	// indicating whether any RDMA device has affinity with any GPU device.
+	// Values are the literal strings "true" or "false".
+	PropertyNameRDMAAffinityWithGPU = "rdma_gpu_affinity_attribute_key"
 )

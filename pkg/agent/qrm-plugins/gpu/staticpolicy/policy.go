@@ -39,6 +39,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/resourceplugin"
 	resourcepluginregistry "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/resourceplugin/registry"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/state"
+	gpuutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/util"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/periodicalhandler"
 	"github.com/kubewharf/katalyst-core/pkg/config"
@@ -200,7 +201,7 @@ func (p *StaticPolicy) ensureState(resourceName string) error {
 		return nil
 	}
 
-	resourceName = p.ResolveResourceName(resourceName, true)
+	resourceName = gpuutil.ResolveResourceName(p.GetDeviceNameToTypeMap(), resourceName, true)
 	// Check if resource exists in state
 	machineState := p.GetState().GetMachineState()
 	if _, ok := machineState[v1.ResourceName(resourceName)]; !ok {
@@ -686,10 +687,29 @@ func (p *StaticPolicy) UpdateAllocatableAssociatedDevices(
 	return resp, nil
 }
 
-func (*StaticPolicy) GetAssociatedDeviceTopologyHints(
-	_ context.Context, _ *pluginapi.AssociatedDeviceRequest,
+func (p *StaticPolicy) GetAssociatedDeviceTopologyHints(
+	ctx context.Context, req *pluginapi.AssociatedDeviceRequest,
 ) (*pluginapi.AssociatedDeviceHintsResponse, error) {
-	return &pluginapi.AssociatedDeviceHintsResponse{}, nil
+	general.InfofV(4, "called")
+	if req == nil {
+		return nil, fmt.Errorf("request is nil")
+	}
+
+	if err := p.ensureState(req.DeviceName); err != nil {
+		return nil, fmt.Errorf("ensure state failed: %v", err)
+	}
+
+	customDevicePlugin := p.getCustomDevicePlugin(req.DeviceName)
+	if customDevicePlugin == nil {
+		return nil, fmt.Errorf("no custom device plugin found for device %s", req.DeviceName)
+	}
+
+	resp, err := customDevicePlugin.GetAssociatedDeviceTopologyHints(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("custom device plugin GetAssociatedDeviceTopologyHints failed with error: %v", err)
+	}
+
+	return resp, nil
 }
 
 // AllocateAssociatedDevice allocates a device in this sequence:
@@ -725,12 +745,12 @@ func (p *StaticPolicy) AllocateAssociatedDevice(
 				_ = p.removeContainer(req.ResourceRequest.PodUid, req.ResourceRequest.ContainerName, v1.ResourceName(req.AccompanyResourceName))
 			}
 			if isPreAllocateCustomDevicePlugin {
-				preAllocateDeviceType := p.ResolveResourceName(req.AccompanyResourceName, false)
+				preAllocateDeviceType := gpuutil.ResolveResourceName(p.GetDeviceNameToTypeMap(), req.AccompanyResourceName, false)
 				if preAllocateDeviceType != "" {
 					_ = p.removeContainer(req.ResourceRequest.PodUid, req.ResourceRequest.ContainerName, v1.ResourceName(preAllocateDeviceType))
 				}
 			}
-			deviceType := p.ResolveResourceName(req.DeviceName, false)
+			deviceType := gpuutil.ResolveResourceName(p.GetDeviceNameToTypeMap(), req.DeviceName, false)
 			if deviceType != "" {
 				_ = p.removeContainer(req.ResourceRequest.PodUid, req.ResourceRequest.ContainerName, v1.ResourceName(deviceType))
 			}

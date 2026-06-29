@@ -104,3 +104,28 @@ func GetGPUCount(req *pluginapi.ResourceRequest, deviceNames []string) (float64,
 
 	return gpuCount, gpuNames, nil
 }
+
+// ResolveResourceName takes in a resourceName and tries to find a mapping of resource type from deviceNameToTypeMap.
+// If no mapping is found, resourceName is returned if fallback is true. If fallback is false, an empty string is returned.
+func ResolveResourceName(deviceNameToTypeMap map[string]string, resourceName string, fallback bool) string {
+	resourceType, ok := deviceNameToTypeMap[resourceName]
+	if ok {
+		return resourceType
+	}
+	general.Infof("no device type found for resource %s", resourceName)
+	if fallback {
+		return resourceName
+	}
+	return ""
+}
+
+// FindDeviceRequest returns the *DeviceRequest from deviceReqs whose DeviceName
+// matches name, or nil if not found.
+func FindDeviceRequest(deviceReqs []*pluginapi.DeviceRequest, name string) *pluginapi.DeviceRequest {
+	for _, dr := range deviceReqs {
+		if dr.DeviceName == name {
+			return dr
+		}
+	}
+	return nil
+}
