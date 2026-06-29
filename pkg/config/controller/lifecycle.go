@@ -20,9 +20,15 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
-type CNRLifecycleConfig struct{}
+type CNRLifecycleConfig struct {
+	// LabelKeepKeys lists label keys that must NOT be removed from CNR
+	// even if the corresponding key is absent on the Node. Other Node-absent
+	// keys on CNR will be cleaned up during label sync.
+	LabelKeepKeys sets.String
+}
 
 type CNCLifecycleConfig struct{}
 
@@ -62,7 +68,7 @@ func NewLifeCycleConfig() *LifeCycleConfig {
 		EnableHealthz:      false,
 		EnableCNCLifecycle: true,
 		EnableCNRLifecycle: true,
-		CNRLifecycleConfig: &CNRLifecycleConfig{},
+		CNRLifecycleConfig: &CNRLifecycleConfig{LabelKeepKeys: sets.NewString()},
 		CNCLifecycleConfig: &CNCLifecycleConfig{},
 		HealthzConfig:      &HealthzConfig{},
 	}

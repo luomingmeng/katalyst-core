@@ -26,6 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/utils/pointer"
 
@@ -171,13 +172,14 @@ func TestCNRLifecycle_updateOrCreateCNR(t *testing.T) {
 	t.Parallel()
 
 	type fields struct {
-		node *corev1.Node
-		cnr  *nodeapis.CustomNodeResource
+		node          *corev1.Node
+		cnr           *nodeapis.CustomNodeResource
+		labelKeepKeys sets.String
 	}
 	tests := []struct {
-		name    string
-		fields  fields
-		wantCNR *nodeapis.CustomNodeResource
+		name       string
+		fields     fields
+		wantLabels map[string]string
 	}{
 		{
 			name: "test-update",
@@ -199,23 +201,85 @@ func TestCNRLifecycle_updateOrCreateCNR(t *testing.T) {
 					},
 				},
 			},
-			wantCNR: &nodeapis.CustomNodeResource{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "node1",
-					Labels: map[string]string{
-						"test": "test-1",
-					},
-					OwnerReferences: []metav1.OwnerReference{
-						{
-							APIVersion:         "v1",
-							Kind:               "Node",
-							Name:               "node1",
-							UID:                "",
-							Controller:         pointer.Bool(true),
-							BlockOwnerDeletion: pointer.Bool(true),
+			wantLabels: map[string]string{
+				"test": "test-1",
+			},
+		},
+		{
+			name: "clean-stale-label",
+			fields: fields{
+				node: &corev1.Node{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "node1",
+						Labels: map[string]string{
+							"a": "1",
 						},
 					},
 				},
+				cnr: &nodeapis.CustomNodeResource{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "node1",
+						Labels: map[string]string{
+							"a":     "1",
+							"stale": "x",
+						},
+					},
+				},
+			},
+			wantLabels: map[string]string{
+				"a": "1",
+			},
+		},
+		{
+			name: "keep-list-preserve",
+			fields: fields{
+				node: &corev1.Node{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "node1",
+						Labels: map[string]string{
+							"a": "1",
+						},
+					},
+				},
+				cnr: &nodeapis.CustomNodeResource{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "node1",
+						Labels: map[string]string{
+							"a":    "1",
+							"keep": "old",
+						},
+					},
+				},
+				labelKeepKeys: sets.NewString("keep"),
+			},
+			wantLabels: map[string]string{
+				"a":    "1",
+				"keep": "old",
+			},
+		},
+		{
+			name: "keep-list-overridden-by-node",
+			fields: fields{
+				node: &corev1.Node{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "node1",
+						Labels: map[string]string{
+							"keep": "new",
+						},
+					},
+				},
+				cnr: &nodeapis.CustomNodeResource{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "node1",
+						Labels: map[string]string{
+							"keep": "old",
+						},
+					},
+				},
+				labelKeepKeys: sets.NewString("keep"),
+			},
+			wantLabels: map[string]string{
+				"keep": "new",
 			},
 		},
 	}
@@ -242,9 +306,17 @@ func TestCNRLifecycle_updateOrCreateCNR(t *testing.T) {
 			)
 			assert.NoError(t, err)
 
-			// test cache not synced
+			if tt.fields.labelKeepKeys != nil {
+				cl.labelKeepKeys = tt.fields.labelKeepKeys
+			}
+
 			err = cl.updateOrCreateCNR(tt.fields.node)
 			assert.NoError(t, err)
+
+			gotCNR, err := cl.client.InternalClient.NodeV1alpha1().CustomNodeResources().Get(
+				context.Background(), tt.fields.node.Name, metav1.GetOptions{})
+			assert.NoError(t, err)
+			assert.Equal(t, tt.wantLabels, gotCNR.Labels)
 		})
 	}
 }

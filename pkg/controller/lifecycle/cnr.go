@@ -27,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	corelisters "k8s.io/client-go/listers/core/v1"
@@ -68,6 +69,10 @@ type CNRLifecycle struct {
 	// queue for node
 	syncQueue workqueue.RateLimitingInterface
 
+	// labelKeepKeys is the whitelist of label keys that must NOT be removed
+	// from CNR even when the corresponding key is absent on the Node.
+	labelKeepKeys sets.String
+
 	// metricsEmitter for emit metrics
 	metricsEmitter metrics.MetricEmitter
 }
@@ -75,7 +80,7 @@ type CNRLifecycle struct {
 func NewCNRLifecycle(ctx context.Context,
 	genericConf *generic.GenericConfiguration,
 	_ *controller.GenericControllerConfiguration,
-	_ *controller.CNRLifecycleConfig,
+	cnrLifecycleConfig *controller.CNRLifecycleConfig,
 	client *client.GenericClientSet,
 	nodeInformer coreinformers.NodeInformer,
 	cnrInformer informers.CustomNodeResourceInformer,
@@ -86,6 +91,11 @@ func NewCNRLifecycle(ctx context.Context,
 		client: client,
 		syncQueue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(),
 			cnrLifecycleControllerName),
+		labelKeepKeys: sets.NewString(),
+	}
+
+	if cnrLifecycleConfig != nil && cnrLifecycleConfig.LabelKeepKeys != nil {
+		cnrLifecycle.labelKeepKeys = cnrLifecycleConfig.LabelKeepKeys
 	}
 
 	nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -319,7 +329,7 @@ func (cl *CNRLifecycle) updateOrCreateCNR(node *corev1.Node) error {
 	}
 
 	newCNR := cnr.DeepCopy()
-	newCNR.Labels = general.MergeMap(newCNR.Labels, node.Labels)
+	newCNR.Labels = mergeLabelsWithKeepList(cnr.Labels, node.Labels, cl.labelKeepKeys)
 	setCNROwnerReference(newCNR, node)
 	if apiequality.Semantic.DeepEqual(newCNR, cnr) {
 		return nil
@@ -345,4 +355,23 @@ func setCNROwnerReference(cnr *apis.CustomNodeResource, node *corev1.Node) {
 			BlockOwnerDeletion: &blocker,
 		},
 	}
+}
+
+// mergeLabelsWithKeepList builds the desired CNR label map:
+//   - take all labels from node;
+//   - for keys in keepKeys, preserve the value already on CNR if node does not have it.
+func mergeLabelsWithKeepList(cnrLabels, nodeLabels map[string]string, keepKeys sets.String) map[string]string {
+	result := make(map[string]string, len(nodeLabels)+keepKeys.Len())
+	for k, v := range nodeLabels {
+		result[k] = v
+	}
+	for k := range keepKeys {
+		if _, ok := nodeLabels[k]; ok {
+			continue
+		}
+		if v, ok := cnrLabels[k]; ok {
+			result[k] = v
+		}
+	}
+	return result
 }
