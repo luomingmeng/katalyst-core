@@ -565,6 +565,75 @@ func TestGPUDevicePlugin_GetAssociatedDeviceTopologyHints(t *testing.T) {
 			},
 		},
 		{
+			name:          "device request is 0 short-circuits with nil hints",
+			podUID:        "test-uid",
+			containerName: "test-container",
+			deviceReq: &pluginapi.AssociatedDeviceRequest{
+				ResourceRequest: &pluginapi.ResourceRequest{
+					PodUid:        "test-uid",
+					ContainerName: "test-container",
+					Annotations:   map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+					Labels:        map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+				},
+				DeviceName: "test-gpu",
+				DeviceRequest: []*pluginapi.DeviceRequest{
+					{
+						DeviceName:       "test-gpu",
+						AvailableDevices: []string{"test-gpu-0", "test-gpu-1"},
+						DeviceRequest:    0,
+					},
+				},
+			},
+			expectedResp: &pluginapi.AssociatedDeviceHintsResponse{
+				PodUid:        "test-uid",
+				ContainerName: "test-container",
+				DeviceName:    "test-gpu",
+				Annotations:   map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+				Labels:        map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+				DeviceHints:   nil,
+			},
+		},
+		{
+			name:          "device request is 0 short-circuits before filtering occupied devices",
+			podUID:        "test-uid",
+			containerName: "test-container",
+			otherResourceAllocationMap: map[v1.ResourceName]state.AllocationMap{
+				consts.ResourceMilliGPU: {
+					"test-gpu-0": &state.AllocationState{
+						PodEntries: state.PodEntries{
+							"another-pod": state.ContainerEntries{
+								"another-container": &state.AllocationInfo{},
+							},
+						},
+					},
+				},
+			},
+			deviceReq: &pluginapi.AssociatedDeviceRequest{
+				ResourceRequest: &pluginapi.ResourceRequest{
+					PodUid:        "test-uid",
+					ContainerName: "test-container",
+					Annotations:   map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+					Labels:        map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+				},
+				DeviceName: "test-gpu",
+				DeviceRequest: []*pluginapi.DeviceRequest{
+					{
+						DeviceName:       "test-gpu",
+						AvailableDevices: []string{"test-gpu-0", "test-gpu-1"},
+						DeviceRequest:    0,
+					},
+				},
+			},
+			expectedResp: &pluginapi.AssociatedDeviceHintsResponse{
+				PodUid:        "test-uid",
+				ContainerName: "test-container",
+				DeviceName:    "test-gpu",
+				Annotations:   map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+				Labels:        map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+				DeviceHints:   nil,
+			},
+		},
+		{
 			name:          "device topology does not exist",
 			podUID:        "test-uid",
 			containerName: "test-container",
