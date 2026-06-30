@@ -167,6 +167,11 @@ func (p *GPUDevicePlugin) GetAssociatedDeviceTopologyHints(
 			return nil, fmt.Errorf("no target device plugin found for target device %s", req.DeviceName)
 		}
 
+		// Short circuit with nil hints when the request is 0
+		if targetDeviceReq.DeviceRequest == 0 {
+			return p.buildAssociatedDeviceHintsResponse(req, nil), nil
+		}
+
 		filterOccupiedDevicesFromRequest(targetDeviceReq, p.GetState().GetMachineState())
 
 		gpuTopology, err := p.DeviceTopologyRegistry.GetDeviceTopology(targetDeviceReq.DeviceName)
