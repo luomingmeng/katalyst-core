@@ -689,11 +689,22 @@ func (p *StaticPolicy) UpdateAllocatableAssociatedDevices(
 
 func (p *StaticPolicy) GetAssociatedDeviceTopologyHints(
 	ctx context.Context, req *pluginapi.AssociatedDeviceRequest,
-) (*pluginapi.AssociatedDeviceHintsResponse, error) {
+) (resp *pluginapi.AssociatedDeviceHintsResponse, respErr error) {
 	general.InfofV(4, "called")
 	if req == nil {
 		return nil, fmt.Errorf("request is nil")
 	}
+
+	defer func() {
+		if respErr != nil {
+			metricTags := []metrics.MetricTag{
+				{Key: "error_message", Val: metric.MetricTagValueFormat(respErr)},
+				{Key: "device_name", Val: req.DeviceName},
+				{Key: "accompany_resource_name", Val: req.AccompanyResourceName},
+			}
+			_ = p.emitter.StoreInt64(util.MetricNameGetAssociatedDeviceTopologyHintsFailed, 1, metrics.MetricTypeNameRaw, metricTags...)
+		}
+	}()
 
 	if err := p.ensureState(req.DeviceName); err != nil {
 		return nil, fmt.Errorf("ensure state failed: %v", err)

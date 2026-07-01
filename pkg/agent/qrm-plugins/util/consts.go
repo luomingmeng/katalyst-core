@@ -33,6 +33,7 @@ const (
 	MetricNameAllocateAccompanyResourceFailed         = "allocate_accompany_resource_failed"
 	MetricNameAllocateAssociatedDeviceDuration        = "allocate_associated_device_duration"
 	MetricNameAllocateAssociatedDeviceFailed          = "allocate_associated_device_failed"
+	MetricNameGetAssociatedDeviceTopologyHintsFailed  = "get_associated_device_topology_hints_failed"
 	MetricNameAllocateFilterDuration                  = "allocate_filter_duration"
 	MetricNameAllocateSortDuration                    = "allocate_sort_duration"
 	MetricNameAllocateBindDuration                    = "allocate_bind_duration"
