@@ -967,3 +967,78 @@ func registerGeneratorWithTopology(t *testing.T, policy *StaticPolicy, resourceN
 	policy.DefaultResourceStateGeneratorRegistry.RegisterResourceStateGenerator(resourceName,
 		state.NewGenericDefaultResourceStateGenerator([]string{resourceName}, policy.DeviceTopologyRegistry, 1, true))
 }
+
+func TestStaticPolicy_GetAssociatedDeviceTopologyHints_EmitsFailureMetric(t *testing.T) {
+	t.Parallel()
+
+	// Case 1: unknown device name causes ensureState to fail and the failure metric to be emitted
+	// with the request's device_name and accompany_resource_name tags.
+	policy := makeTestStaticPolicy(t)
+	emitter := newMockMetricsEmitter()
+	policy.emitter = emitter
+
+	policy.RegisterResourcePlugin(resourceplugin.NewResourcePluginStub(policy.BasePlugin))
+	policy.RegisterCustomDevicePlugin(customdeviceplugin.NewCustomDevicePluginStub(policy.BasePlugin))
+	registerGeneratorWithTopology(t, policy, testResourcePluginName)
+	registerGeneratorWithTopology(t, policy, testCustomDevicePluginName)
+
+	unknownDeviceName := "unknown-device"
+	req := &pluginapi.AssociatedDeviceRequest{
+		DeviceName:            unknownDeviceName,
+		AccompanyResourceName: testResourcePluginName,
+	}
+
+	resp, err := policy.GetAssociatedDeviceTopologyHints(context.Background(), req)
+	assert.Error(t, err)
+	assert.Nil(t, resp)
+
+	vals := emitter.storedInt64[util.MetricNameGetAssociatedDeviceTopologyHintsFailed]
+	assert.Equal(t, []int64{1}, vals, "expected failure metric to be emitted exactly once")
+
+	tagsList := emitter.storedTags[util.MetricNameGetAssociatedDeviceTopologyHintsFailed]
+	assert.Len(t, tagsList, 1)
+
+	tagMap := make(map[string]string)
+	for _, tag := range tagsList[0] {
+		tagMap[tag.Key] = tag.Val
+	}
+	assert.Equal(t, unknownDeviceName, tagMap["device_name"])
+	assert.Equal(t, testResourcePluginName, tagMap["accompany_resource_name"])
+	assert.NotEmpty(t, tagMap["error_message"])
+
+	// Case 2: nil request returns an error but must NOT emit the failure metric
+	// (defer is registered after the nil-guard, matching AllocateAssociatedDevice).
+	policyNil := makeTestStaticPolicy(t)
+	emitterNil := newMockMetricsEmitter()
+	policyNil.emitter = emitterNil
+
+	respNil, errNil := policyNil.GetAssociatedDeviceTopologyHints(context.Background(), nil)
+	assert.Error(t, errNil)
+	assert.Nil(t, respNil)
+	assert.Empty(t, emitterNil.storedInt64[util.MetricNameGetAssociatedDeviceTopologyHintsFailed])
+}
+
+func TestStaticPolicy_GetAssociatedDeviceTopologyHints_SuccessDoesNotEmitFailureMetric(t *testing.T) {
+	t.Parallel()
+
+	policy := makeTestStaticPolicy(t)
+	emitter := newMockMetricsEmitter()
+	policy.emitter = emitter
+
+	policy.RegisterResourcePlugin(resourceplugin.NewResourcePluginStub(policy.BasePlugin))
+	policy.RegisterCustomDevicePlugin(customdeviceplugin.NewCustomDevicePluginStub(policy.BasePlugin))
+	registerGeneratorWithTopology(t, policy, testResourcePluginName)
+	registerGeneratorWithTopology(t, policy, testCustomDevicePluginName)
+
+	req := &pluginapi.AssociatedDeviceRequest{
+		DeviceName:            testCustomDevicePluginName,
+		AccompanyResourceName: testResourcePluginName,
+	}
+
+	resp, err := policy.GetAssociatedDeviceTopologyHints(context.Background(), req)
+	assert.NoError(t, err)
+	assert.NotNil(t, resp)
+
+	assert.Empty(t, emitter.storedInt64[util.MetricNameGetAssociatedDeviceTopologyHintsFailed],
+		"failure metric must not be emitted on the success path")
+}
