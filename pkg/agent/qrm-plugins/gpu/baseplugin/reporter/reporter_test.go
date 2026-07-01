@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"testing"
 	"time"
 
@@ -2925,4 +2927,130 @@ func TestGpuReporterPlugin_StartEnsureKubeletDevicePluginPathFailureNilEmitter(t
 	err = p.Start()
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "ensure kubelet device plugin path")
+}
+
+func TestGpuReporterPlugin_addGPUZoneNodes(t *testing.T) {
+	t.Parallel()
+
+	numaSocketMap := map[util.ZoneNode]util.ZoneNode{
+		util.GenerateNumaZoneNode(0): util.GenerateSocketZoneNode(0),
+		util.GenerateNumaZoneNode(1): util.GenerateSocketZoneNode(0),
+	}
+
+	testCases := []struct {
+		name              string
+		topology          *machine.DeviceTopology
+		expectedParents   map[string][]int
+		expectFallbackIDs []string
+	}{
+		{
+			name:              "nil topology is a no-op",
+			topology:          nil,
+			expectedParents:   map[string][]int{},
+			expectFallbackIDs: nil,
+		},
+		{
+			name: "device with populated NumaNodes",
+			topology: &machine.DeviceTopology{
+				Devices: map[string]machine.DeviceInfo{
+					"gpu-0": {NumaNodes: []int{0}},
+				},
+			},
+			expectedParents:   map[string][]int{"gpu-0": {0}},
+			expectFallbackIDs: nil,
+		},
+		{
+			name: "device with nil NumaNodes falls back to NUMA 0",
+			topology: &machine.DeviceTopology{
+				Devices: map[string]machine.DeviceInfo{
+					"gpu-0": {NumaNodes: nil},
+				},
+			},
+			expectedParents:   map[string][]int{"gpu-0": {0}},
+			expectFallbackIDs: []string{"gpu-0"},
+		},
+		{
+			name: "device with empty NumaNodes slice falls back to NUMA 0",
+			topology: &machine.DeviceTopology{
+				Devices: map[string]machine.DeviceInfo{
+					"gpu-0": {NumaNodes: []int{}},
+				},
+			},
+			expectedParents:   map[string][]int{"gpu-0": {0}},
+			expectFallbackIDs: []string{"gpu-0"},
+		},
+		{
+			name: "mixed devices: populated + empty",
+			topology: &machine.DeviceTopology{
+				Devices: map[string]machine.DeviceInfo{
+					"gpu-0": {NumaNodes: []int{1}},
+					"gpu-1": {NumaNodes: nil},
+				},
+			},
+			expectedParents:   map[string][]int{"gpu-0": {1}, "gpu-1": {0}},
+			expectFallbackIDs: []string{"gpu-1"},
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			generator, err := util.NewNumaSocketTopologyZoneGenerator(numaSocketMap)
+			assert.NoError(t, err)
+
+			emitter := newMockMetricsEmitter()
+			p := &gpuReporterPlugin{emitter: emitter}
+
+			err = p.addGPUZoneNodes(tc.topology, generator)
+			assert.NoError(t, err)
+
+			got := collectDeviceParents(t, generator)
+			assert.Equal(t, tc.expectedParents, got)
+
+			gotVals := emitter.storedInt64[metricAddGPUZoneNodesFallbackNUMA]
+			assert.Len(t, gotVals, len(tc.expectFallbackIDs))
+
+			gotTagIDs := make([]string, 0, len(emitter.storedTags[metricAddGPUZoneNodesFallbackNUMA]))
+			for _, tags := range emitter.storedTags[metricAddGPUZoneNodesFallbackNUMA] {
+				for _, tag := range tags {
+					if tag.Key == "device_id" {
+						gotTagIDs = append(gotTagIDs, tag.Val)
+					}
+				}
+			}
+			assert.ElementsMatch(t, tc.expectFallbackIDs, gotTagIDs)
+		})
+	}
+}
+
+// collectDeviceParents walks the topology zone tree produced by `generator` and
+// returns a mapping from each device zone's Name (= device id) to the sorted
+// list of NUMA IDs that appear as its parent in the tree.
+func collectDeviceParents(t *testing.T, generator *util.TopologyZoneGenerator) map[string][]int {
+	t.Helper()
+	zones := generator.GenerateTopologyZoneStatus(nil, nil, nil, nil, nil, nil)
+
+	out := map[string][]int{}
+	var walk func(parentNumaID *int, zs []*nodev1alpha1.TopologyZone)
+	walk = func(parentNumaID *int, zs []*nodev1alpha1.TopologyZone) {
+		for _, z := range zs {
+			var nextParent *int
+			if z.Type == nodev1alpha1.TopologyTypeNuma {
+				id, err := strconv.Atoi(z.Name)
+				assert.NoError(t, err)
+				nextParent = &id
+			} else if z.Type == nodev1alpha1.TopologyTypeGPU && parentNumaID != nil {
+				out[z.Name] = append(out[z.Name], *parentNumaID)
+			}
+			walk(nextParent, z.Children)
+		}
+	}
+	walk(nil, zones)
+
+	for k := range out {
+		sort.Ints(out[k])
+	}
+	return out
 }
