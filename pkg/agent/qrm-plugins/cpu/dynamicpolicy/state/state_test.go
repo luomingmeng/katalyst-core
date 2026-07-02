@@ -90,8 +90,10 @@ func TestNewCheckpointState(t *testing.T) {
 			"",
 			"",
 			&cpuPluginState{
-				podEntries:     make(PodEntries),
-				machineState:   GetDefaultMachineState(cpuTopology),
+				cpuPluginStateData: cpuPluginStateData{
+					podEntries:   make(PodEntries),
+					machineState: GetDefaultMachineState(cpuTopology),
+				},
 				socketTopology: cpuTopology.GetSocketTopology(),
 				cpuTopology:    cpuTopology,
 			},
@@ -543,7 +545,8 @@ func TestNewCheckpointState(t *testing.T) {
 }`,
 			"",
 			&cpuPluginState{
-				podEntries: PodEntries{
+				cpuPluginStateData: cpuPluginStateData{
+					podEntries: PodEntries{
 					"373d08e4-7a6b-4293-aaaf-b135ff8123bf": ContainerEntries{
 						testName: &AllocationInfo{
 							AllocationMeta: commonstate.AllocationMeta{
@@ -1010,6 +1013,7 @@ func TestNewCheckpointState(t *testing.T) {
 							},
 						},
 					},
+				},
 				},
 			},
 		},

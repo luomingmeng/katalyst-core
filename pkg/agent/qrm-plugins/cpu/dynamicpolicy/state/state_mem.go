@@ -33,11 +33,16 @@ type cpuPluginState struct {
 
 	cpuTopology *machine.CPUTopology
 
-	podEntries                            PodEntries
-	machineState                          NUMANodeMap
-	numaHeadroom                          map[int]float64
-	allowSharedCoresOverlapReclaimedCores bool
-	socketTopology                        map[int]string
+	// cpuPluginStateData holds the mutable, lock-free portion of the plugin
+	// state (pod entries, machine state, NUMA headroom, overlap flag). The
+	// outer cpuPluginState wraps every read with an RLock+Clone and every
+	// write with a Lock+Clone to keep its long-standing external contract:
+	// callers receive fully-owned copies. The lock-free reader methods
+	// promoted from cpuPluginStateData are intentionally shadowed below to
+	// preserve those semantics.
+	cpuPluginStateData
+
+	socketTopology map[int]string
 }
 
 func GetDefaultMachineState(topology *machine.CPUTopology) NUMANodeMap {
@@ -59,8 +64,10 @@ func GetDefaultMachineState(topology *machine.CPUTopology) NUMANodeMap {
 func NewCPUPluginState(topology *machine.CPUTopology) *cpuPluginState {
 	klog.InfoS("[cpu_plugin] initializing new cpu plugin in-memory state store")
 	return &cpuPluginState{
-		podEntries:     make(PodEntries),
-		machineState:   GetDefaultMachineState(topology),
+		cpuPluginStateData: cpuPluginStateData{
+			podEntries:   make(PodEntries),
+			machineState: GetDefaultMachineState(topology),
+		},
 		socketTopology: topology.GetSocketTopology(),
 		cpuTopology:    topology,
 	}
@@ -166,10 +173,7 @@ func (s *cpuPluginState) Snapshot() *ReadonlyStateSnapshot {
 	defer s.RUnlock()
 
 	return &ReadonlyStateSnapshot{
-		MachineState:                          s.machineState.Clone(),
-		PodEntries:                            s.podEntries.Clone(),
-		NUMAHeadroom:                          general.DeepCopyIntToFloat64Map(s.numaHeadroom),
-		AllowSharedCoresOverlapReclaimedCores: s.allowSharedCoresOverlapReclaimedCores,
+		cpuPluginStateData: s.cpuPluginStateData.Clone(),
 	}
 }
 
