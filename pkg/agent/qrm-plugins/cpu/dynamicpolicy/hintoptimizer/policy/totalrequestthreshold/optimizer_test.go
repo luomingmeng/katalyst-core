@@ -66,6 +66,14 @@ func (f *fakeState) GetAllowSharedCoresOverlapReclaimedCores() bool {
 	return f.allowOverlap
 }
 
+func (f *fakeState) Snapshot() *state.ReadonlyStateSnapshot {
+	return &state.ReadonlyStateSnapshot{
+		MachineState:                          f.machineState,
+		PodEntries:                            f.podEntries,
+		AllowSharedCoresOverlapReclaimedCores: f.allowOverlap,
+	}
+}
+
 func (f *fakeState) SetMachineState(numaNodeMap state.NUMANodeMap, _ bool) {
 	f.machineState = numaNodeMap
 }

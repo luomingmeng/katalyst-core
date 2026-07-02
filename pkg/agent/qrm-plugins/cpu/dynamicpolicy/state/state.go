@@ -747,6 +747,12 @@ type reader interface {
 	GetPodEntries() PodEntries
 	GetAllocationInfo(podUID string, containerName string) *AllocationInfo
 	GetAllowSharedCoresOverlapReclaimedCores() bool
+	// Snapshot returns a deep-copied, lock-free view of the reader's data so
+	// downstream consumers (e.g. periodical handlers that fan out across
+	// multiple goroutines within a single tick) can iterate over a stable
+	// snapshot without contending for the underlying lock or paying repeated
+	// clone costs. Every read on the returned snapshot is a plain field access.
+	Snapshot() *ReadonlyStateSnapshot
 }
 
 // writer is used to store information into local states,
@@ -772,6 +778,77 @@ type State interface {
 // ReadonlyState interface only provides methods for tracking pod assignments
 type ReadonlyState interface {
 	reader
+}
+
+// ReadonlyStateSnapshot is a deep-copied, lock-free view of the cpu-plugin
+// state at a single point in time. It implements the reader interface so it
+// can be passed through the same channels as a live ReadonlyState while
+// guaranteeing that every read observes the same stable value.
+//
+// The struct is intentionally not thread-safe for writes: build it once via
+// Snapshot() at the top of a tick and treat every field as immutable
+// afterwards. Consumers that need a modified view should call Clone() on the
+// individual sub-fields they care about.
+type ReadonlyStateSnapshot struct {
+	MachineState                          NUMANodeMap
+	PodEntries                            PodEntries
+	NUMAHeadroom                          map[int]float64
+	AllowSharedCoresOverlapReclaimedCores bool
+}
+
+// GetMachineState returns the pre-cloned machine state captured at snapshot
+// time. It intentionally does not clone again: callers must not mutate the
+// returned map.
+func (s *ReadonlyStateSnapshot) GetMachineState() NUMANodeMap {
+	if s == nil {
+		return nil
+	}
+	return s.MachineState
+}
+
+// GetNUMAHeadroom returns the pre-cloned NUMA headroom map captured at
+// snapshot time.
+func (s *ReadonlyStateSnapshot) GetNUMAHeadroom() map[int]float64 {
+	if s == nil {
+		return nil
+	}
+	return s.NUMAHeadroom
+}
+
+// GetPodEntries returns the pre-cloned pod entries captured at snapshot time.
+func (s *ReadonlyStateSnapshot) GetPodEntries() PodEntries {
+	if s == nil {
+		return nil
+	}
+	return s.PodEntries
+}
+
+// GetAllocationInfo returns the allocation info for the given pod/container
+// from the snapshot. The returned pointer is shared with the snapshot; do not
+// mutate it.
+func (s *ReadonlyStateSnapshot) GetAllocationInfo(podUID string, containerName string) *AllocationInfo {
+	if s == nil {
+		return nil
+	}
+	if entries, ok := s.PodEntries[podUID]; ok {
+		return entries[containerName]
+	}
+	return nil
+}
+
+// GetAllowSharedCoresOverlapReclaimedCores returns the snapshotted flag value.
+func (s *ReadonlyStateSnapshot) GetAllowSharedCoresOverlapReclaimedCores() bool {
+	if s == nil {
+		return false
+	}
+	return s.AllowSharedCoresOverlapReclaimedCores
+}
+
+// Snapshot is idempotent on a snapshot: returning the receiver keeps the
+// reader interface satisfiable and lets tick-scoped code pass the snapshot
+// through helpers that expect any reader without extra copies.
+func (s *ReadonlyStateSnapshot) Snapshot() *ReadonlyStateSnapshot {
+	return s
 }
 
 type GenerateMachineStateFromPodEntriesFunc func(topology *machine.CPUTopology, podEntries PodEntries, originMachineState NUMANodeMap) (NUMANodeMap, error)
