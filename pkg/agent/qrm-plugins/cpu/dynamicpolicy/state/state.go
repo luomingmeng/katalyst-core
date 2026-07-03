@@ -754,10 +754,13 @@ type cpuPluginStateData struct {
 	allowSharedCoresOverlapReclaimedCores bool
 }
 
-// Clone deep-copies every field of cpuPluginStateData. It is intentionally
-// defined on a value receiver so the caller gets a fresh, fully-owned copy
-// that is safe to hand off to another goroutine without extra synchronization.
-func (d cpuPluginStateData) Clone() cpuPluginStateData {
+// Clone deep-copies every field of cpuPluginStateData. The caller receives a
+// fresh, fully-owned copy that is safe to hand off to another goroutine
+// without extra synchronization.
+func (d *cpuPluginStateData) Clone() cpuPluginStateData {
+	if d == nil {
+		return cpuPluginStateData{}
+	}
 	return cpuPluginStateData{
 		podEntries:                            d.podEntries.Clone(),
 		machineState:                          d.machineState.Clone(),
