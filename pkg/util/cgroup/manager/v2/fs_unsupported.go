@@ -49,7 +49,7 @@ func (m *unsupportedManager) ApplyCPUSetPartition(_ string, _ common.CPUSetParti
 }
 
 func (m *unsupportedManager) ApplySchedLoadBalance(_ string, _ bool) error {
-	return fmt.Errorf("unsupported manager v2")
+	return fmt.Errorf("unsupported manager v2: %w", common.ErrNotSupported)
 }
 
 func (m *unsupportedManager) ApplyNetCls(_ string, _ *common.NetClsData) error {
