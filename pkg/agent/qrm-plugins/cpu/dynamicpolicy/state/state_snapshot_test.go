@@ -102,7 +102,14 @@ func TestReadonlyStateSnapshot_ImplementsReadonlyState(t *testing.T) {
 	t.Parallel()
 
 	podEntries, machineState, numaHeadroom := newSnapshotFixture()
-	var s ReadonlyState = NewReadonlyStateSnapshot(podEntries, machineState, numaHeadroom, true)
+	var s ReadonlyState = &ReadonlyStateSnapshot{
+		cpuPluginStateData: cpuPluginStateData{
+			podEntries:                            podEntries,
+			machineState:                          machineState,
+			numaHeadroom:                          numaHeadroom,
+			allowSharedCoresOverlapReclaimedCores: true,
+		},
+	}
 
 	assert.NotNil(t, s.GetMachineState())
 	assert.NotNil(t, s.GetPodEntries())
@@ -186,7 +193,13 @@ func TestGetReadonlyStateSnapshot_Idempotent(t *testing.T) {
 	defer readonlyStateSingletonMu.Unlock()
 
 	podEntries, machineState, numaHeadroom := newSnapshotFixture()
-	fixture := NewReadonlyStateSnapshot(podEntries, machineState, numaHeadroom, false)
+	fixture := &ReadonlyStateSnapshot{
+		cpuPluginStateData: cpuPluginStateData{
+			podEntries:   podEntries,
+			machineState: machineState,
+			numaHeadroom: numaHeadroom,
+		},
+	}
 
 	// Preserve and restore the pre-existing singleton so we don't pollute
 	// downstream tests that expect an empty or externally-configured state.

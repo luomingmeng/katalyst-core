@@ -821,12 +821,6 @@ type reader interface {
 	GetPodEntries() PodEntries
 	GetAllocationInfo(podUID string, containerName string) *AllocationInfo
 	GetAllowSharedCoresOverlapReclaimedCores() bool
-	// Snapshot returns a deep-copied, lock-free view of the reader's data so
-	// downstream consumers (e.g. periodical handlers that fan out across
-	// multiple goroutines within a single tick) can iterate over a stable
-	// snapshot without contending for the underlying lock or paying repeated
-	// clone costs. Every read on the returned snapshot is a plain field access.
-	Snapshot() *ReadonlyStateSnapshot
 }
 
 // writer is used to store information into local states,
@@ -845,13 +839,19 @@ type writer interface {
 
 // State interface provides methods for tracking and setting pod assignments
 type State interface {
-	reader
+	ReadonlyState
 	writer
 }
 
 // ReadonlyState interface only provides methods for tracking pod assignments
 type ReadonlyState interface {
 	reader
+	// Snapshot returns a deep-copied, lock-free view of the reader's data so
+	// downstream consumers (e.g. periodical handlers that fan out across
+	// multiple goroutines within a single tick) can iterate over a stable
+	// snapshot without contending for the underlying lock or paying repeated
+	// clone costs. Every read on the returned snapshot is a plain field access.
+	Snapshot() ReadonlyState
 }
 
 // ReadonlyStateSnapshot is a deep-copied, lock-free view of the cpu-plugin
@@ -871,32 +871,10 @@ type ReadonlyStateSnapshot struct {
 	cpuPluginStateData
 }
 
-// NewReadonlyStateSnapshot builds a ReadonlyStateSnapshot from the given
-// fields without cloning. The caller is responsible for ensuring the inputs
-// are safe to be treated as immutable for the lifetime of the returned
-// snapshot (typically by deep-copying beforehand). This constructor exists
-// to keep the embedded cpuPluginStateData fields unexported while still
-// allowing tests and adapters to synthesize a snapshot directly.
-func NewReadonlyStateSnapshot(
-	podEntries PodEntries,
-	machineState NUMANodeMap,
-	numaHeadroom map[int]float64,
-	allowSharedCoresOverlapReclaimedCores bool,
-) *ReadonlyStateSnapshot {
-	return &ReadonlyStateSnapshot{
-		cpuPluginStateData: cpuPluginStateData{
-			podEntries:                            podEntries,
-			machineState:                          machineState,
-			numaHeadroom:                          numaHeadroom,
-			allowSharedCoresOverlapReclaimedCores: allowSharedCoresOverlapReclaimedCores,
-		},
-	}
-}
-
 // Snapshot is idempotent on a snapshot: returning the receiver keeps the
 // reader interface satisfiable and lets tick-scoped code pass the snapshot
 // through helpers that expect any reader without extra copies.
-func (s *ReadonlyStateSnapshot) Snapshot() *ReadonlyStateSnapshot {
+func (s *ReadonlyStateSnapshot) Snapshot() ReadonlyState {
 	return s
 }
 
@@ -925,7 +903,7 @@ func GetReadonlyState() (ReadonlyState, error) {
 // that fan out multiple concurrent reads within a single tick) should prefer
 // this helper over calling GetReadonlyState().Snapshot() manually so that
 // snapshot semantics stay centralized.
-func GetReadonlyStateSnapshot() (*ReadonlyStateSnapshot, error) {
+func GetReadonlyStateSnapshot() (ReadonlyState, error) {
 	s, err := GetReadonlyState()
 	if err != nil {
 		return nil, err
