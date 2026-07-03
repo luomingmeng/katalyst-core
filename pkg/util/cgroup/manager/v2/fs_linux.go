@@ -216,7 +216,7 @@ func (m *manager) ApplyCPUSetPartition(absCgroupPath string, partitionFlag commo
 }
 
 // ApplySchedLoadBalance is a no-op on cgroup v2: the unified hierarchy removed
-// the cpuset.sched_load_balance knob in favour of the partition mechanism.
+// the cpuset.sched_load_balance knob in favor of the partition mechanism.
 // Callers that need equivalent semantics on v2 should use ApplyCPUSetPartition.
 func (m *manager) ApplySchedLoadBalance(_ string, _ bool) error {
 	return fmt.Errorf("cpuset.sched_load_balance: %w on cgroup v2", common.ErrNotSupported)

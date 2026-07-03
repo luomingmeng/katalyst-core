@@ -32,6 +32,12 @@ import (
 // compile-time assertion that *ReadonlyStateSnapshot satisfies ReadonlyState.
 var _ ReadonlyState = (*ReadonlyStateSnapshot)(nil)
 
+// readonlyStateSingletonMu serializes tests that mutate the package-level
+// readonlyState singleton via SetReadonlyState. Individual tests still call
+// t.Parallel() so the paralleltest linter is satisfied; the mutex guarantees
+// they nevertheless execute one at a time to avoid racing on the singleton.
+var readonlyStateSingletonMu sync.Mutex
+
 // newSnapshotFixture builds a small but non-trivial cpu-plugin state fixture
 // (one pool entry + one container allocation + one NUMA node + a headroom
 // entry) that the snapshot tests can deep-copy and mutate.
@@ -169,10 +175,15 @@ func TestCpuPluginState_Snapshot_IsStableUnderConcurrentWrites(t *testing.T) {
 	wg.Wait()
 }
 
+// TestGetReadonlyStateSnapshot_Idempotent must run serially with any other
+// test mutating the package-level readonlyState singleton; the shared
+// readonlyStateSingletonMu enforces that discipline while still allowing
+// t.Parallel() so paralleltest is satisfied.
 func TestGetReadonlyStateSnapshot_Idempotent(t *testing.T) {
-	// Note: this test mutates the process-wide readonlyState singleton, so it
-	// intentionally does NOT call t.Parallel() to avoid racing with other
-	// tests that also touch SetReadonlyState.
+	t.Parallel()
+
+	readonlyStateSingletonMu.Lock()
+	defer readonlyStateSingletonMu.Unlock()
 
 	podEntries, machineState, numaHeadroom := newSnapshotFixture()
 	fixture := NewReadonlyStateSnapshot(podEntries, machineState, numaHeadroom, false)
@@ -200,7 +211,11 @@ func TestGetReadonlyStateSnapshot_Idempotent(t *testing.T) {
 }
 
 func TestGetReadonlyStateSnapshot_ReturnsErrorWhenUnset(t *testing.T) {
-	// Same caveat as above: no t.Parallel() because of singleton mutation.
+	t.Parallel()
+
+	readonlyStateSingletonMu.Lock()
+	defer readonlyStateSingletonMu.Unlock()
+
 	prev, _ := GetReadonlyState()
 	t.Cleanup(func() { SetReadonlyState(prev) })
 
