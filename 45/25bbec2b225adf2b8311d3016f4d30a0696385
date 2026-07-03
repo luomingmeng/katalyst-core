@@ -1,0 +1,66 @@
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/state/state.go
+  s_c9c120a59ba717::t_75499f40811ab5 757-763 gitai:{"mixed_line_ranges":[],"operations":[{"operation_id":"6a474263ca6ce20bdc43499d","tool_type":"agent","tool_id":"Edit","line_ranges":[{"Range":[757,763]}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "4525bbec2b225adf2b8311d3016f4d30a0696385",
+  "prompts": {},
+  "sessions": {
+    "s_c9c120a59ba717": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a310018684d96e37a301e00",
+        "model": "Doubao-Seed-2.1-Turbo__dev"
+      },
+      "human_author": "luomingmeng <luomingmeng@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {
+    "pkg/agent/qrm-plugins/cpu/dynamicpolicy/state/state.go": [
+      {
+        "hash": "s_c9c120a59ba717::t_75499f40811ab5",
+        "line_ranges": [
+          {
+            "Range": [
+              757,
+              763
+            ]
+          }
+        ],
+        "mixed_line_ranges": [],
+        "operations": [
+          {
+            "operation_id": "6a474263ca6ce20bdc43499d",
+            "tool_type": "agent",
+            "tool_id": "Edit",
+            "line_ranges": [
+              {
+                "Range": [
+                  757,
+                  763
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_c9c120a59ba717": {
+      "tool": "trae",
+      "conversation_id": "6a310018684d96e37a301e00",
+      "session_id": "6a310018684d96e37a301e00",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_c9c120a59ba717::t_75499f40811ab5": {
+      "tool": "trae",
+      "conversation_id": "6a310018684d96e37a301e00",
+      "session_id": "6a310018684d96e37a301e00",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
