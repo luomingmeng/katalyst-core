@@ -1,0 +1,47 @@
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/hintoptimizer/policy/totalrequestthreshold/optimizer_test.go
+  s_7a16919da12e2d::t_5ddb852ad49a8d 69
+  s_7a16919da12e2d::t_392e396b64b7ec 70
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/state/state_snapshot_test.go
+  s_7a16919da12e2d::t_331cd543d71798 196-202
+  s_7a16919da12e2d::t_1a350f63ab5103 105-112
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/hintoptimizer/policy/resourcepackage/optimizer_test.go
+  s_7a16919da12e2d::t_0fc2d0649d7917 61
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/state/state_checkpoint.go
+  s_7a16919da12e2d::t_cc447d1a853ccc 268
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/state/state_mem.go
+  s_7a16919da12e2d::t_eba4731b95695a 87
+  s_7a16919da12e2d::t_59816cafe8afd6 168
+  s_7a16919da12e2d::t_f56539eff3f310 80
+  s_7a16919da12e2d::t_77cd7f798183bc 94
+  s_7a16919da12e2d::t_853dda6836191b 101
+  s_7a16919da12e2d::t_5c41190da8ad1d 162
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/state/state.go
+  s_7a16919da12e2d::t_8024c2d817aeef 906
+  s_7a16919da12e2d::t_37236ca581993a 849-853
+  s_7a16919da12e2d::t_dd4b9ca47e17e0 854
+  s_7a16919da12e2d::t_9b181da83007e4 842
+  s_7a16919da12e2d::t_cffa49dd1adefc 877
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "18efbd367085e958085ef2f608a3a38d7092e0c7",
+  "prompts": {},
+  "humans": {
+    "h_0c8c3dbd27f05a": {
+      "author": "luomingmeng <luomingmeng@bytedance.com>"
+    }
+  },
+  "sessions": {
+    "s_7a16919da12e2d": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a474308ca6ce20bdc4349b0",
+        "model": "Doubao-Seed-2.1-Turbo__dev"
+      },
+      "human_author": "luomingmeng <luomingmeng@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
