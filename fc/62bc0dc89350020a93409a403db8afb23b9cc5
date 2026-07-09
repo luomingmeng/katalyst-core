@@ -1,0 +1,14 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fc62bc0dc89350020a93409a403db8afb23b9cc5",
+  "prompts": {},
+  "humans": {
+    "h_0c8c3dbd27f05a": {
+      "author": "luomingmeng <luomingmeng@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
