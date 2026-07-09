@@ -1,0 +1,86 @@
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/state/state_mem.go
+  s_7a16919da12e2d::t_77cd7f798183bc 94
+  s_7a16919da12e2d::t_5c41190da8ad1d 162
+  s_7a16919da12e2d::t_eba4731b95695a 87
+  s_7a16919da12e2d::t_f56539eff3f310 80
+  s_7a16919da12e2d::t_59816cafe8afd6 168
+  s_7a16919da12e2d::t_853dda6836191b 101
+  s_7a16919da12e2d::t_f533fc71b0f05c 163-167
+  s_7a16919da12e2d::t_71fe99b36f2cdf 169-171
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/state/state.go
+  s_7a16919da12e2d::t_dd4b9ca47e17e0 854
+  s_c9c120a59ba717::t_75499f40811ab5 757-763,769,775,777,783,785,791,793,800,802,805,811,813,910
+  s_7a16919da12e2d::t_cffa49dd1adefc 877
+  s_7a16919da12e2d::t_9b181da83007e4 842
+  s_7a16919da12e2d::t_8024c2d817aeef 906
+  s_7a16919da12e2d::t_37236ca581993a 849-853
+  s_c9c120a59ba717::t_6e19db0ad510b2 754-756
+  s_c9c120a59ba717::t_713fe51fb0c3be 764-768
+  s_c9c120a59ba717::t_e55c42349520eb 770-774
+  s_c9c120a59ba717::t_8130f75f39c202 776
+  s_c9c120a59ba717::t_6bec28147dde24 778-782
+  s_c9c120a59ba717::t_76fa7283456ed4 784
+  s_c9c120a59ba717::t_545eb5529ba770 786-790
+  s_c9c120a59ba717::t_233aa434d52c0f 792
+  s_c9c120a59ba717::t_224d815f8db5aa 794-799
+  s_c9c120a59ba717::t_cf709085e319a1 801
+  s_c9c120a59ba717::t_82b989999ad711 803-804
+  s_c9c120a59ba717::t_6f0d3c30117e86 806-810
+  s_c9c120a59ba717::t_febca35ab5ad47 812
+  s_c9c120a59ba717::t_1156868a237c39 814-816
+  s_7a16919da12e2d::t_d7ef16d0a9d823 855-857,874-876
+  s_7a16919da12e2d::t_559b33e6e00705 878
+  s_7a16919da12e2d::t_bca9e75eb93b69 903-905
+  s_c9c120a59ba717::t_d71029e4a41333 911-913
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/state/state_snapshot_test.go
+  s_7a16919da12e2d::t_1a350f63ab5103 105-112
+  s_7a16919da12e2d::t_331cd543d71798 54,63-64,70-71,85,133,137-138,145,147,179,196-202
+  s_7a16919da12e2d::t_f72a797df82089 51-53
+  s_7a16919da12e2d::t_a8d47cd464bdff 55-57,60-62
+  s_7a16919da12e2d::t_bd9f8905cd6074 65-69
+  s_7a16919da12e2d::t_32d9569eedb248 72-74,82-84
+  s_7a16919da12e2d::t_108863754b2675 86-88,102-104
+  s_7a16919da12e2d::t_b38f69303f368c 113-115,130-132
+  s_7a16919da12e2d::t_0810a4782ab19e 134-136
+  s_7a16919da12e2d::t_0213c78b9ac2f1 139-144
+  s_7a16919da12e2d::t_acb8f22b7aeb90 146
+  s_7a16919da12e2d::t_72aa49c6952e7d 148-150,176-178
+  s_7a16919da12e2d::t_8c2a9675879b91 180-182,193-195
+  s_7a16919da12e2d::t_4a4663ce4b8333 203-205
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/state/state_checkpoint.go
+  s_7a16919da12e2d::t_cc447d1a853ccc 268
+  s_7a16919da12e2d::t_ebde6a29049c48 265-267
+  s_7a16919da12e2d::t_55b9e00ac84a85 269-271
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/hintoptimizer/policy/totalrequestthreshold/optimizer_test.go
+  s_7a16919da12e2d::t_392e396b64b7ec 70
+  s_7a16919da12e2d::t_5ddb852ad49a8d 69
+  s_7a16919da12e2d::t_ad2f010c600aa1 71-72
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/hintoptimizer/policy/resourcepackage/optimizer_test.go
+  s_7a16919da12e2d::t_0fc2d0649d7917 61
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "879b9268e45bb202a377fab8014a4f0853505488",
+  "prompts": {},
+  "sessions": {
+    "s_7a16919da12e2d": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a474308ca6ce20bdc4349b0",
+        "model": "Doubao-Seed-2.1-Turbo__dev"
+      },
+      "human_author": "luomingmeng <luomingmeng@bytedance.com>"
+    },
+    "s_c9c120a59ba717": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a310018684d96e37a301e00",
+        "model": "Doubao-Seed-2.1-Turbo__dev"
+      },
+      "human_author": "luomingmeng <luomingmeng@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
