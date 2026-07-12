@@ -1,0 +1,165 @@
+cmd/katalyst-agent/app/options/qrm/bulkhead/bulkhead.go
+  s_5d3b4bb57f8952::t_8a4a978a8f3203 1-108
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/registry/registry_test.go
+  s_5d3b4bb57f8952::t_cfb33bce736b10 1-23
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/registry/registry.go
+  s_5d3b4bb57f8952::t_03cfa2c3a9b693 1-52
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api/types.go
+  s_5d3b4bb57f8952::t_4de740f43dbc3e 1-50
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/util/bypass.go
+  s_5d3b4bb57f8952::t_14bdc66a8e819e 34
+  s_2d4cdfa377d888::t_85bdec0cc7f8f5 1-33,35-39
+pkg/config/agent/dynamic/dynamic_base.go
+  s_5d3b4bb57f8952::t_918799f753bec3 43-45
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/manager_test.go
+  s_2d4cdfa377d888::t_6eee65c449aba4 34
+  s_2d4cdfa377d888::t_2c5b55f1a67ac6 10,17,19,27,42,57
+  s_2d4cdfa377d888::t_5b65c5808e71d5 11,45-48,60-64
+  s_2d4cdfa377d888::t_1bb3bc794b69fc 26
+  s_2d4cdfa377d888::t_3c4c75584cf4b1 12,18,33,36-37,78-79
+  s_5d3b4bb57f8952::t_b7156d38eecceb 6-9,22,28,31,35,39,43,50,53-54,58,66,69-70,75,80-98
+  s_5d3b4bb57f8952::t_9d962586532fc2 72,77
+  s_5d3b4bb57f8952::t_9b3b35635f2065 3-5
+  s_2d4cdfa377d888::t_301e98d97bd535 13-16
+  s_5d3b4bb57f8952::t_b491bf401ade77 29-30
+  s_5d3b4bb57f8952::t_79b7cc05da73ea 51-52
+  s_5d3b4bb57f8952::t_d2f401d801096e 67-68
+  s_5d3b4bb57f8952::t_53c8250cadb28c 71
+  s_5d3b4bb57f8952::t_234e0a03dfa8ff 73-74
+  s_5d3b4bb57f8952::t_0ff7102bed6462 76
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/plugins/workqueue/plugin.go
+  s_2d4cdfa377d888::t_0543649a1b25d1 39,49-50,56,76,80,104,106,111,113-127
+  s_5d3b4bb57f8952::t_ddab1748169240 32
+  s_5d3b4bb57f8952::t_faaaa13f3ba146 43-44
+  s_5d3b4bb57f8952::t_f7a9ee97a62a80 28,37,42
+  s_2d4cdfa377d888::t_3eb6e89d8c525c 17
+  s_5d3b4bb57f8952::t_47a71f13740a06 25,41,58-72
+  s_5d3b4bb57f8952::t_24f15dbb006cb9 45-47
+  s_2d4cdfa377d888::t_021e563db0264f 84-103
+  s_2d4cdfa377d888::t_421311adabb66b 14-16
+  s_5d3b4bb57f8952::t_7c3b53051ca8bc 26-27
+  s_5d3b4bb57f8952::t_b149f6fe2c29af 29-31
+  s_5d3b4bb57f8952::t_8fb18c801480e6 33-36
+  s_2d4cdfa377d888::t_41aea3246a21c7 51-55
+  s_2d4cdfa377d888::t_ffda3bd92223ee 77-79
+  s_2d4cdfa377d888::t_c7dc9acaa0c9d8 81-83
+  s_2d4cdfa377d888::t_0b15c44794ff46 105
+  s_2d4cdfa377d888::t_1df7bdd0209d79 107-110
+  s_2d4cdfa377d888::t_3136e4c89a7961 112
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/manager.go
+  s_2d4cdfa377d888::t_41f8a3cb7e8ed5 31,61
+  s_5d3b4bb57f8952::t_2b5e52dcd41b0e 127-134,154
+  s_2d4cdfa377d888::t_1ca8eb73153302 22,37,44,46-50,59,73-76,83-87,115,148-152,155-176
+  s_5d3b4bb57f8952::t_06f9bcb1361aed 139
+  s_5d3b4bb57f8952::t_0a6ddd57bd5f76 28-29,40-43,51-55,65,70,97,100,136-138,140-145
+  s_2d4cdfa377d888::t_dfbc035dbe2c2b 118-122
+  s_2d4cdfa377d888::t_f50d5b76f216c5 82,89-93,135
+  s_2d4cdfa377d888::t_5f66b3c62a9e51 30,57,66-69,71-72,78-81,88,95-96,98-99,101-102,105-114
+  s_2d4cdfa377d888::t_ccef9946d52413 103-104
+  s_5d3b4bb57f8952::t_38e68a0798f981 27,123,153
+  s_2d4cdfa377d888::t_77b359e53c6813 19-21
+  s_2d4cdfa377d888::t_a29704bf5e2d96 32-36
+  s_2d4cdfa377d888::t_785056a30a91ee 45
+  s_2d4cdfa377d888::t_bac0e58ad1a679 58
+  s_2d4cdfa377d888::t_894dd83bbc0dec 60
+  s_2d4cdfa377d888::t_8ebeaaa5e0b413 77
+  s_2d4cdfa377d888::t_feee05a0a5ed8a 94
+  s_2d4cdfa377d888::t_273444d1ea2bc2 116-117
+  s_5d3b4bb57f8952::t_0515412267a322 124-126
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/plugins/cpusettopology/plugin_test.go
+  s_2d4cdfa377d888::t_e7d4225336fe6d 1
+  s_5d3b4bb57f8952::t_8de754146d8f06 6-11
+  s_5d3b4bb57f8952::t_16ce461273423c 12-14
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology_inputs.go
+  s_5d3b4bb57f8952::t_a387ac76e1d4ed 9-17
+  s_2d4cdfa377d888::t_a1962b4c03579b 1-8
+  s_5d3b4bb57f8952::t_91f404b85ffb1f 18-20
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/view.go
+  s_2d4cdfa377d888::t_034b5357570b49 17-155
+  s_2d4cdfa377d888::t_a010b2197aee7b 14-16
+  s_2d4cdfa377d888::t_5b0108423b79a9 156-158
+pkg/config/agent/qrm/cpu_plugin.go
+  s_5d3b4bb57f8952::t_02d2871b8e844f 24,85,103
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/rels.go
+  s_2d4cdfa377d888::t_0ac1d815920fba 17
+  s_5d3b4bb57f8952::t_c6c56b9f706731 23-45
+  s_2d4cdfa377d888::t_47f4d07ba146ab 14-16
+  s_5d3b4bb57f8952::t_8a76fdff76b86f 46-48
+cmd/katalyst-agent/app/options/qrm/cpu_plugin.go
+  s_5d3b4bb57f8952::t_5ce2ea9d121074 201
+  s_5d3b4bb57f8952::t_0cebdedb2d6fa3 26,63,98
+  s_5d3b4bb57f8952::t_94150899ba9a2c 202-203
+pkg/config/agent/qrm/bulkhead/bulkhead.go
+  s_5d3b4bb57f8952::t_2c65b6740a2965 1-51
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/plugins/cpusettopology/plugin.go
+  s_5d3b4bb57f8952::t_397f4e608b9d92 50-55
+  s_2d4cdfa377d888::t_3232e1459af54e 17
+  s_5d3b4bb57f8952::t_b9a37a8526ee5c 28,49,66,106-140
+  s_5d3b4bb57f8952::t_c4b9604e8c7dbf 33-45
+  s_2d4cdfa377d888::t_6dbf18f57eb764 71-100
+  s_2d4cdfa377d888::t_c89f785f1797cd 47,57-58,64,69,102,143,158,161,163,168,176,180,187,222,225,230,232,248,250-263
+  s_2d4cdfa377d888::t_a24004e6673c46 14-16
+  s_5d3b4bb57f8952::t_bcbe70dd164fe1 29-32
+  s_2d4cdfa377d888::t_bfcb1d2df672d4 59-63
+  s_2d4cdfa377d888::t_f9fd465281f8d9 70
+  s_2d4cdfa377d888::t_b9cca461ab187f 101
+  s_2d4cdfa377d888::t_62bf8a517bb92c 144-146,155-157
+  s_2d4cdfa377d888::t_0efad49f0a5574 159-160
+  s_2d4cdfa377d888::t_8ede0c9bdc5570 162
+  s_2d4cdfa377d888::t_8cf0b6c93a1ec1 164-167
+  s_2d4cdfa377d888::t_00c56876208f15 169-171,173-175
+  s_2d4cdfa377d888::t_9a9deda04f0a9f 177-179
+  s_2d4cdfa377d888::t_a72ce52360c6e5 181-186
+  s_2d4cdfa377d888::t_f37a649d4a1998 188-190,219-221
+  s_2d4cdfa377d888::t_79ba2d72fcd6c7 223-224
+  s_2d4cdfa377d888::t_8fa0f5c82dd26d 226-229
+  s_2d4cdfa377d888::t_67d989b36d4ad2 231
+  s_2d4cdfa377d888::t_c638f8e6ebaac2 233-235,245-247
+  s_2d4cdfa377d888::t_a4534c4678dbc0 249
+pkg/config/agent/qrm/bulkhead/bulkhead_test.go
+  s_5d3b4bb57f8952::t_90cbe91b89ecd9 1-14
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bypass_cpuset_adjustment_handler.go
+  s_2d4cdfa377d888::t_db62eb5e4811bb 25-56
+  s_5d3b4bb57f8952::t_dd59ed780e8289 58
+  s_2d4cdfa377d888::t_358556a0488bc5 22-24
+  s_5d3b4bb57f8952::t_85514099ef61c1 59-61
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/policy.go
+  s_2d4cdfa377d888::t_e3a173ff05ed07 306
+  s_2d4cdfa377d888::t_56bfa458d63724 53,86,120-125
+  s_5d3b4bb57f8952::t_9c010b828da720 424
+  s_5d3b4bb57f8952::t_ab1db405ccc27c 302
+  s_2d4cdfa377d888::t_c6d30bfc376390 307-309
+  s_5d3b4bb57f8952::t_ecf1ea4e12e86f 423
+  s_5d3b4bb57f8952::t_c364b8f34012a4 425-427
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/rels_test.go
+  s_2d4cdfa377d888::t_7f2b79aea56f0c 1
+  s_5d3b4bb57f8952::t_9b2b410be1e6a1 6-32
+  s_5d3b4bb57f8952::t_1edf09a2dc0fdd 33-35
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "40c4c4db125ba509f413e5857debbe0364afc03f",
+  "prompts": {},
+  "sessions": {
+    "s_2d4cdfa377d888": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a52f74df090bbcb40cba9a9",
+        "model": "gpt-5.5__dev",
+        "display_model_name": "GPT-5.5"
+      },
+      "human_author": "luomingmeng <luomingmeng@bytedance.com>"
+    },
+    "s_5d3b4bb57f8952": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a53074ef090bbcb40cbb655",
+        "model": "gpt-5.5__dev"
+      },
+      "human_author": "luomingmeng <luomingmeng@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
