@@ -153,6 +153,75 @@ func TestVerifyChecksumCorrupted(t *testing.T) {
 		"mismatched checksum should return ErrCorruptCheckpoint")
 }
 
+func TestVerifyChecksumAllowsMigratableLegacyCheckpoint(t *testing.T) {
+	t.Parallel()
+
+	data := buildTestCheckpointData(t)
+	item := &DataItem{
+		Data:     data,
+		Checksum: checksum.Checksum(0xDEADBEEF),
+	}
+	assert.NotEqual(t, computeJSONChecksum(data), item.Checksum,
+		"test setup should simulate a checkpoint whose JSON checksum does not match")
+	assert.NotEqual(t, computeLegacyChecksum(data), item.Checksum,
+		"test setup should simulate a checkpoint whose current legacy checksum does not match")
+
+	blob, err := json.Marshal(item)
+	assert.NoError(t, err)
+
+	restored := NewCheckpoint(make(map[string]TargetConfigData))
+	err = restored.UnmarshalCheckpoint(blob)
+	assert.NoError(t, err)
+
+	err = restored.VerifyChecksum()
+	assert.NoError(t, err,
+		"decoded checkpoint with valid KCC data should be accepted for one-time upgrade migration")
+}
+
+func TestVerifyChecksumRejectsMigratableCheckpointWithUnknownKind(t *testing.T) {
+	t.Parallel()
+
+	data := buildTestCheckpointData(t)
+	data["UnknownConfiguration"] = data[crd.ResourceKindAdminQoSConfiguration]
+	item := &DataItem{
+		Data:     data,
+		Checksum: checksum.Checksum(0xDEADBEEF),
+	}
+	blob, err := json.Marshal(item)
+	assert.NoError(t, err)
+
+	restored := NewCheckpoint(make(map[string]TargetConfigData))
+	err = restored.UnmarshalCheckpoint(blob)
+	assert.NoError(t, err)
+
+	err = restored.VerifyChecksum()
+	assert.ErrorIs(t, err, errors.ErrCorruptCheckpoint,
+		"unknown config kind should not be accepted by migration fallback")
+}
+
+func TestVerifyChecksumRejectsMigratableCheckpointWithNilValue(t *testing.T) {
+	t.Parallel()
+
+	data := buildTestCheckpointData(t)
+	entry := data[crd.ResourceKindAdminQoSConfiguration]
+	entry.Value = nil
+	data[crd.ResourceKindAdminQoSConfiguration] = entry
+	item := &DataItem{
+		Data:     data,
+		Checksum: checksum.Checksum(0xDEADBEEF),
+	}
+	blob, err := json.Marshal(item)
+	assert.NoError(t, err)
+
+	restored := NewCheckpoint(make(map[string]TargetConfigData))
+	err = restored.UnmarshalCheckpoint(blob)
+	assert.NoError(t, err)
+
+	err = restored.VerifyChecksum()
+	assert.ErrorIs(t, err, errors.ErrCorruptCheckpoint,
+		"nil config value should not be accepted by migration fallback")
+}
+
 func TestComputeJSONChecksumDeterministic(t *testing.T) {
 	t.Parallel()
 

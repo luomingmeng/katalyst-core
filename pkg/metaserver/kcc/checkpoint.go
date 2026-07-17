@@ -47,6 +47,8 @@ type TargetConfigData struct {
 type Data struct {
 	sync.Mutex
 	Item *DataItem
+
+	loadedFromCheckpoint bool
 }
 
 type DataItem struct {
@@ -80,7 +82,11 @@ func (d *Data) UnmarshalCheckpoint(blob []byte) error {
 	d.Lock()
 	defer d.Unlock()
 
-	return json.Unmarshal(blob, d.Item)
+	if err := json.Unmarshal(blob, d.Item); err != nil {
+		return err
+	}
+	d.loadedFromCheckpoint = true
+	return nil
 }
 
 func (d *Data) VerifyChecksum() error {
@@ -99,7 +105,43 @@ func (d *Data) VerifyChecksum() error {
 		return nil
 	}
 
+	if d.isMigratableDecodedCheckpoint() {
+		return nil
+	}
+
 	return errors.ErrCorruptCheckpoint
+}
+
+func (d *Data) isMigratableDecodedCheckpoint() bool {
+	if !d.loadedFromCheckpoint || d.Item == nil || len(d.Item.Data) == 0 {
+		return false
+	}
+
+	for kind, data := range d.Item.Data {
+		if !isValidMigratableConfig(kind, data) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func isValidMigratableConfig(kind string, data TargetConfigData) bool {
+	if data.Value == nil || data.Timestamp <= 0 {
+		return false
+	}
+
+	configValue := reflect.ValueOf(data.Value)
+	if configValue.Kind() != reflect.Ptr || configValue.IsNil() {
+		return false
+	}
+
+	configField := configValue.Elem().FieldByName(kind)
+	if !configField.IsValid() || configField.Kind() != reflect.Ptr || configField.IsNil() {
+		return false
+	}
+
+	return true
 }
 
 // computeJSONChecksum computes a checksum from the JSON-serialized form of
