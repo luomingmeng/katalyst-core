@@ -1,0 +1,39 @@
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/plugins/cpusettopology/plugin.go
+  s_2d4cdfa377d888::t_8cf0b6c93a1ec1 380
+  s_2d4cdfa377d888::t_c89f785f1797cd 379
+  s_2d4cdfa377d888::t_073308efb7c5c3 376-378
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "10876f49d045f3220ecfe29dc0d55c4dd294b1c1",
+  "prompts": {},
+  "sessions": {
+    "s_2d4cdfa377d888": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a52f74df090bbcb40cba9a9",
+        "model": "gpt-5.5__dev",
+        "display_model_name": "GPT-5.5"
+      },
+      "human_author": "luomingmeng <luomingmeng@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {
+    "s_7a97430c8515a3": {
+      "tool": "trae",
+      "conversation_id": "6a59a5bd2566e99f31438849",
+      "session_id": "6a59a5bd2566e99f31438849",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_7a97430c8515a3::t_e648b991575867": {
+      "tool": "trae",
+      "conversation_id": "6a59a5bd2566e99f31438849",
+      "session_id": "6a59a5bd2566e99f31438849",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
