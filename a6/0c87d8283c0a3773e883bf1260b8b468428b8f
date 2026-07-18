@@ -1,0 +1,98 @@
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/plugins/cpusettopology/plugin.go
+  s_82053e68bab3e6::t_6f3b096920aee3 225-226
+  s_369f54c682c62f::t_b4878e934da4a8 23,251-254
+  s_369f54c682c62f::t_a603376b8aa489 227
+  s_369f54c682c62f::t_1bd9ac8ee47198 83-86,156-159
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/plugins/cpusetmems/plugin_test.go
+  s_369f54c682c62f::t_1df8b165142af5 193,218-219,221-222
+pkg/config/agent/dynamic/adminqos/qrm/cpu_plugin_test.go
+  s_369f54c682c62f::t_fd874383884324 39,79,85,122-123
+  s_369f54c682c62f::t_50fbc9187f59aa 124
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/manager.go
+  s_369f54c682c62f::t_18f66259dc35b7 209-210,212-213
+  s_82053e68bab3e6::t_fdc6eececb6895 211
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology/dag.go
+  s_369f54c682c62f::t_49ba3a271f81d8 17-18,45-48,52-57,72-77,110,125,145-153
+  s_369f54c682c62f::t_98192a95d1aadd 154-155
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/plugins/systemservice/plugin.go
+  s_369f54c682c62f::t_4f4b828caabc58 262
+  s_369f54c682c62f::t_684fed1eb092a8 242-243
+  s_369f54c682c62f::t_dfe1c9aaafa95a 246-248
+  s_369f54c682c62f::t_1f05e75692819f 49,51,169-172,193-195,270,276-278
+  s_369f54c682c62f::t_fcc0ea0eeb5028 55-56
+  s_369f54c682c62f::t_d39d7a3cc294af 279
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/rels_test.go
+  s_369f54c682c62f::t_fc986fecb58e12 63-66
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology/writer_test.go
+  s_369f54c682c62f::t_134dba738b8179 143,166,169,175-176,291
+  s_369f54c682c62f::t_707bb408405d78 147-148,154-156,163,170,172-173
+  s_369f54c682c62f::t_e4d8c168fc8052 167
+  s_369f54c682c62f::t_98a01a35a31f5b 91-96,104,112-114,174,293,305,313,318
+  s_369f54c682c62f::t_1742a49bcc4532 171
+  s_369f54c682c62f::t_15665e36b4435b 288-290
+  s_369f54c682c62f::t_b73f34b179c526 292
+  s_369f54c682c62f::t_ac3068c69dd4ee 294-296,302-304
+  s_369f54c682c62f::t_46791d49a9901b 306-308,310-312
+  s_369f54c682c62f::t_01d14f40ed0f4c 314-317
+  s_369f54c682c62f::t_5d1e313744b126 319-321
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/view.go
+  s_369f54c682c62f::t_96c62cee09d1d2 249-251
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/plugins/systemservice/plugin_test.go
+  s_369f54c682c62f::t_f9d0ca250defc4 759,772-773,775-776,781-782,797-798
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology_inputs.go
+  s_369f54c682c62f::t_6060d309246b41 20-22,40,79-81,114-116,127
+  s_369f54c682c62f::t_68ba2fde318f56 52-54
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology/dag_test.go
+  s_369f54c682c62f::t_1f937135881bf6 47-49,56-58,62-63
+  s_369f54c682c62f::t_531c2d7d419646 50-55,59-61
+cmd/katalyst-agent/app/options/dynamic/adminqos/qrm/qrm_base_test.go
+  s_369f54c682c62f::t_3a4dc7bea23aa2 57-58,98-99,119-124
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api/types.go
+  h_0c8c3dbd27f05a 41
+  s_82053e68bab3e6::t_023e306a833d9c 42-44
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology/writer.go
+  s_369f54c682c62f::t_1cc507852b0a6c 272-274
+  s_369f54c682c62f::t_709be214029fd6 214-216
+  s_369f54c682c62f::t_4d8f4d623917c7 258-260
+  s_369f54c682c62f::t_26aacae1083b64 168,927-933
+  s_369f54c682c62f::t_200b14c855a4e3 255-257,261-265,288-291,294-296,298
+  s_369f54c682c62f::t_5dfe6760037d2e 951
+  s_369f54c682c62f::t_8fef4507919650 297,448,934-935,938-948,952
+  s_369f54c682c62f::t_c3b35a40a55e39 81-82,170-171,196,220-224,246,292-293
+  s_369f54c682c62f::t_bc3ee7a87cc8f3 266-271,275-287
+  s_369f54c682c62f::t_35eaba73f4aad8 449-451
+  s_369f54c682c62f::t_1eebf14fbe8845 949-950
+pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/plugins/cpusetmems/plugin.go
+  s_369f54c682c62f::t_3e25e7ec169112 130-133,162-165
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a60c87d8283c0a3773e883bf1260b8b468428b8f",
+  "prompts": {},
+  "humans": {
+    "h_0c8c3dbd27f05a": {
+      "author": "luomingmeng <luomingmeng@bytedance.com>"
+    }
+  },
+  "sessions": {
+    "s_369f54c682c62f": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a5adad32566e99f31438c3e",
+        "model": "gpt-5.5__dev"
+      },
+      "human_author": "luomingmeng <luomingmeng@bytedance.com>"
+    },
+    "s_82053e68bab3e6": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a5b40332566e99f3143a25f",
+        "model": "gpt-5.5__dev"
+      },
+      "human_author": "luomingmeng <luomingmeng@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
