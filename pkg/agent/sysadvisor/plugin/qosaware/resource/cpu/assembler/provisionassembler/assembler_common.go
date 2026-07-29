@@ -84,28 +84,33 @@ func (pa *ProvisionAssemblerCommon) cpuCountInNUMAs(numas machine.CPUSet) int {
 // returns the inputs unchanged; a negative limit (e.g. the -1 "no quota limit"
 // sentinel) is preserved as-is.
 //
-// The cap is rounded down to the nearest even number, then raised to the
-// reclaim reservation in the same CPU scope when necessary.
+// The cap is rounded down and must remain strictly greater than the reclaim
+// reservation in the same CPU scope. Both are hard constraints, so a conflict
+// is reported instead of silently exceeding the ratio or reducing the reserve.
 func clampByReclaimedCPUMaxRatio(
 	size int,
 	limit float64,
 	ratio float64,
 	cpuCount int,
 	reservedForReclaim int,
-) (int, float64) {
+) (int, float64, error) {
 	if ratio <= 0 {
-		return size, limit
+		return size, limit, nil
 	}
 	capCores := int(math.Floor(ratio * float64(cpuCount)))
-	capCores -= capCores % 2
-	capCores = general.Max(capCores, reservedForReclaim)
+	if capCores <= reservedForReclaim {
+		return 0, 0, fmt.Errorf(
+			"reclaimed CPU ratio cap %d must be greater than reservedForReclaim %d (ratio=%v, cpuCount=%d)",
+			capCores, reservedForReclaim, ratio, cpuCount,
+		)
+	}
 	if size > capCores {
 		size = capCores
 	}
 	if limit >= 0 && limit > float64(capCores) {
 		limit = float64(capCores)
 	}
-	return size, limit
+	return size, limit, nil
 }
 
 func (pa *ProvisionAssemblerCommon) assembleDedicatedNUMAExclusiveRegion(r region.QoSRegion, result *types.InternalCPUCalculationResult) error {
@@ -144,13 +149,16 @@ func (pa *ProvisionAssemblerCommon) assembleDedicatedNUMAExclusiveRegion(r regio
 
 	if ratio := pa.conf.GetDynamicConfiguration().ReclaimedCPUMaxRatio; ratio > 0 {
 		if cpuCount := pa.cpuCountInNUMAs(r.GetBindingNumas()); cpuCount > 0 {
-			reclaimedCoresSize, reclaimedCoresLimit = clampByReclaimedCPUMaxRatio(
+			reclaimedCoresSize, reclaimedCoresLimit, err = clampByReclaimedCPUMaxRatio(
 				reclaimedCoresSize,
 				reclaimedCoresLimit,
 				ratio,
 				cpuCount,
 				reservedForReclaim,
 			)
+			if err != nil {
+				return fmt.Errorf("clamp reclaim pool for dedicated NUMA-exclusive region %q: %w", r.Name(), err)
+			}
 		}
 	}
 
@@ -488,13 +496,16 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 
 	if ratio := pa.conf.GetDynamicConfiguration().ReclaimedCPUMaxRatio; ratio > 0 {
 		if cpuCount := pa.cpuCountInNUMAs(numaSet); cpuCount > 0 {
-			reclaimedCoresSize, reclaimedCoresQuota = clampByReclaimedCPUMaxRatio(
+			reclaimedCoresSize, reclaimedCoresQuota, err = clampByReclaimedCPUMaxRatio(
 				reclaimedCoresSize,
 				reclaimedCoresQuota,
 				ratio,
 				cpuCount,
 				reservedForReclaim,
 			)
+			if err != nil {
+				return fmt.Errorf("clamp reclaim pool for NUMAs %q: %w", numaSet.String(), err)
+			}
 		}
 	}
 
