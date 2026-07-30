@@ -591,6 +591,8 @@ github.com/luomingmeng/katalyst-api v0.0.0-20260717084125-4a8dbf141210 h1:R+NuSk
 github.com/luomingmeng/katalyst-api v0.0.0-20260717084125-4a8dbf141210/go.mod h1:BZMVGVl3EP0eCn5xsDgV41/gjYkoh43abIYxrB10e3k=
 github.com/luomingmeng/katalyst-api v0.0.0-20260727080047-a777f7e7e39a h1:mzP2XFKB6ITdYhVCssqG7y5dc/bkVX81u5J0crnyAD8=
 github.com/luomingmeng/katalyst-api v0.0.0-20260727080047-a777f7e7e39a/go.mod h1:BZMVGVl3EP0eCn5xsDgV41/gjYkoh43abIYxrB10e3k=
+github.com/luomingmeng/katalyst-api v0.0.0-20260729162944-c341ef21ae95 h1:P6U28pc085j2wy0PLusS2lXeL4yY0Y+Jo/PtobDrOQE=
+github.com/luomingmeng/katalyst-api v0.0.0-20260729162944-c341ef21ae95/go.mod h1:BZMVGVl3EP0eCn5xsDgV41/gjYkoh43abIYxrB10e3k=
 github.com/lyft/protoc-gen-validate v0.0.13/go.mod h1:XbGvPuh87YZc5TdIa2/I4pLk0QoUACkjt2znoq26NVQ=
 github.com/magiconair/properties v1.8.0/go.mod h1:PppfXfuXeibc/6YijjN8zIbojt8czPbwD3XqdrwzmxQ=
 github.com/magiconair/properties v1.8.1/go.mod h1:PppfXfuXeibc/6YijjN8zIbojt8czPbwD3XqdrwzmxQ=

@@ -18,7 +18,6 @@ package dynamicpolicy
 
 import (
 	"bytes"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -30,21 +29,20 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
-	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/memory/dynamicpolicy/resctrl"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/memory/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
-	"github.com/kubewharf/katalyst-core/pkg/config/agent/qrm"
+	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
+	qrmresctrl "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/resctrl"
 	"github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
+	"github.com/kubewharf/katalyst-core/pkg/util/external/rdt"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
+	resctrlutil "github.com/kubewharf/katalyst-core/pkg/util/resctrl"
 )
 
 const (
-	templateSharedSubgroup = "shared-%02d"
-	sharedGroup            = "share"
-
 	metricNameResctrlMonGroupsNum       = "resctrl_mon_groups_num"
 	metricNameResctrlMonGroupsOverlimit = "resctrl_mon_groups_over_limit"
 )
@@ -57,31 +55,16 @@ type ResctrlHinter interface {
 
 type resctrlHinter struct {
 	emitter              metrics.MetricEmitter
-	config               *qrm.ResctrlConfig
+	config               *qrmresctrl.ResctrlConfig
 	closidEnablingGroups sets.String
 	enabledQoS           sets.String
 	monGroupsMaxCount    *atomic.Int64
 	root                 string
 	// manager handles resctrl filesystem operations (creation/cleanup),
 	// logic migrated from kubelet resctrlmanager.
-	manager resctrl.Manager
-	state   state.State
-}
-
-func getSharedSubgroup(val int) string {
-	// typical mon group is like "shared-xx", except for
-	// negative value indicates using "shared" mon group
-	if val < 0 {
-		return sharedGroup
-	}
-	return fmt.Sprintf(templateSharedSubgroup, val)
-}
-
-func (r *resctrlHinter) getSharedSubgroupByPool(pool string) string {
-	if v, ok := r.config.CPUSetPoolToSharedSubgroup[pool]; ok {
-		return getSharedSubgroup(v)
-	}
-	return getSharedSubgroup(r.config.DefaultSharedSubgroup)
+	manager     resctrl.Manager
+	state       state.ReadonlyState
+	dynamicConf *dynamicconfig.DynamicAgentConfiguration
 }
 
 func injectRespAnnotation(resourceAllocation *pluginapi.ResourceAllocation, k, v string) {
@@ -111,19 +94,8 @@ func (r *resctrlHinter) hintResourceAllocation(podMeta commonstate.AllocationMet
 		return
 	}
 
-	var resctrlGroup string
-	switch podMeta.QoSLevel {
-	case apiconsts.PodAnnotationQoSLevelSystemCores:
-		// tweak the case of system qos
-		resctrlGroup = commonstate.PoolNamePrefixSystem
-	case apiconsts.PodAnnotationQoSLevelSharedCores:
-		resctrlGroup = r.getSharedSubgroupByPool(podMeta.OwnerPoolName)
-	default:
-		resctrlGroup = podMeta.OwnerPoolName
-	}
-
-	// when no recognized qos can be identified, no hint
-	if resctrlGroup == commonstate.EmptyOwnerPoolName {
+	resctrlGroup, err := resctrlutil.ResolvePoolClosID(podMeta.ToClosAssignmentMeta(), r.config)
+	if err != nil {
 		general.Errorf("pod admit: fail to identify resctrl top level group for qos %s; skip resctl hint", podMeta.QoSLevel)
 		return
 	}
@@ -219,9 +191,7 @@ func (r *resctrlHinter) Run(stopCh <-chan struct{}) {
 	go wait.Until(func() {
 		entries := r.state.GetPodResourceEntries()
 		uids := entries.GetAllPodUIDs()
-		if err := r.manager.Cleanup(uids); err != nil {
-			general.Errorf("resctrl: cleanup failed: %v", err)
-		}
+		r.reconcileClos(uids)
 	}, time.Minute, stopCh)
 
 	wait.Until(func() {
@@ -231,13 +201,60 @@ func (r *resctrlHinter) Run(stopCh <-chan struct{}) {
 	}, 10*time.Minute, stopCh)
 }
 
-func newResctrlHinter(config *qrm.ResctrlConfig, emitter metrics.MetricEmitter, state state.State) ResctrlHinter {
+func (r *resctrlHinter) reconcileClos(activePodUIDs sets.String) {
+	disableRDT := false
+	if r.dynamicConf != nil {
+		if dynamicConfiguration := r.dynamicConf.GetDynamicConfiguration(); dynamicConfiguration != nil &&
+			dynamicConfiguration.QRMPluginConfiguration != nil {
+			disableRDT = dynamicConfiguration.RDTConfig.DisableRDT
+		}
+	}
+	if err := r.manager.ReconcileClos(resctrl.ClosReconcileState{
+		DisableRDT:      disableRDT,
+		ExpectedClosIDs: r.expectedClosIDs(),
+		ActivePodUIDs:   activePodUIDs,
+	}); err != nil {
+		general.Errorf("resctrl: reconcile clos failed: %v", err)
+	}
+}
+
+func (r *resctrlHinter) expectedClosIDs() sets.String {
+	expected := sets.NewString()
+	if r == nil || r.state == nil || r.config == nil {
+		return expected
+	}
+	metas := make([]resctrlutil.ClosAssignmentMeta, 0)
+	for _, podEntries := range r.state.GetPodResourceEntries() {
+		for _, containerEntries := range podEntries {
+			for _, allocationInfo := range containerEntries {
+				if allocationInfo == nil {
+					continue
+				}
+				metas = append(metas, allocationInfo.AllocationMeta.ToClosAssignmentMeta())
+			}
+		}
+	}
+	poolsByClos, err := resctrlutil.BuildExpectedClosPools(metas, r.config)
+	if err != nil {
+		general.Errorf("resctrl: build expected CLOS IDs failed: %v", err)
+		return expected
+	}
+	for closID := range poolsByClos {
+		expected.Insert(closID)
+	}
+	return expected
+}
+
+func newResctrlHinter(config *qrmresctrl.ResctrlConfig, dynamicConf *dynamicconfig.DynamicAgentConfiguration,
+	emitter metrics.MetricEmitter, state state.ReadonlyState,
+) ResctrlHinter {
 	r := &resctrlHinter{
-		emitter: emitter,
-		config:  config,
-		root:    consts.DefaultResctrlRootDir,
-		manager: resctrl.NewManager(config),
-		state:   state,
+		emitter:     emitter,
+		config:      config,
+		root:        consts.DefaultResctrlRootDir,
+		manager:     resctrl.NewManager(config, rdt.NewDefaultManager()),
+		state:       state,
+		dynamicConf: dynamicConf,
 	}
 
 	if config != nil {

@@ -1300,7 +1300,7 @@ func TestNewManagerRegistersDefaultPluginsInOrder(t *testing.T) {
 	for _, plugin := range m.plugins {
 		got = append(got, plugin.Name())
 	}
-	want := []string{"cpuset_topology", "cpuset_mems", "workqueue", "system_service"}
+	want := []string{"cpuset_topology", "cpuset_mems", "workqueue", "system_service", "rdt_cpulist", "rdt_cat"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected plugin names, got %v want %v", got, want)
 	}

@@ -99,6 +99,7 @@ func (o *GenericQRMPluginOptions) ApplyTo(conf *qrmconfig.GenericQRMPluginConfig
 }
 
 type QRMPluginsOptions struct {
+	ResctrlOptions *ResctrlOptions
 	CPUOptions     *CPUOptions
 	MemoryOptions  *MemoryOptions
 	NetworkOptions *NetworkOptions
@@ -110,6 +111,7 @@ type QRMPluginsOptions struct {
 
 func NewQRMPluginsOptions() *QRMPluginsOptions {
 	return &QRMPluginsOptions{
+		ResctrlOptions: NewResctrlOptions(),
 		CPUOptions:     NewCPUOptions(),
 		MemoryOptions:  NewMemoryOptions(),
 		NetworkOptions: NewNetworkOptions(),
@@ -121,6 +123,7 @@ func NewQRMPluginsOptions() *QRMPluginsOptions {
 }
 
 func (o *QRMPluginsOptions) AddFlags(fss *cliflag.NamedFlagSets) {
+	o.ResctrlOptions.AddFlags(fss)
 	o.CPUOptions.AddFlags(fss)
 	o.MemoryOptions.AddFlags(fss)
 	o.NetworkOptions.AddFlags(fss)
@@ -131,6 +134,9 @@ func (o *QRMPluginsOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 }
 
 func (o *QRMPluginsOptions) ApplyTo(conf *qrmconfig.QRMPluginsConfiguration) error {
+	if err := o.ResctrlOptions.ApplyTo(conf.ResctrlConfig); err != nil {
+		return err
+	}
 	if err := o.CPUOptions.ApplyTo(conf.CPUQRMPluginConfig); err != nil {
 		return err
 	}
