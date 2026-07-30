@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>代码评审报告 — katalyst-core</title>
+  <style>
+    :root {
+      --color-p0: #dc2626;
+      --color-p0-bg: #fef2f2;
+      --color-p0-border: #fca5a5;
+      --color-p1: #d97706;
+      --color-p1-bg: #fffbeb;
+      --color-p1-border: #fcd34d;
+      --color-p2: #2563eb;
+      --color-p2-bg: #eff6ff;
+      --color-p2-border: #93c5fd;
+      --color-bg: #f8fafc;
+      --color-card: #ffffff;
+      --color-border: #e2e8f0;
+      --color-text: #1e293b;
+      --color-text-secondary: #64748b;
+      --color-code-bg: #f1f5f9;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans SC", sans-serif;
+      background: var(--color-bg);
+      color: var(--color-text);
+      line-height: 1.6;
+      padding: 24px;
+    }
+
+    .container {
+      max-width: 960px;
+      margin: 0 auto;
+    }
+
+    /* --- Header --- */
+    .report-header {
+      background: var(--color-card);
+      border: 1px solid var(--color-border);
+      border-radius: 12px;
+      padding: 28px 32px;
+      margin-bottom: 20px;
+    }
+
+    .report-header h1 {
+      font-size: 22px;
+      font-weight: 700;
+      margin-bottom: 16px;
+    }
+
+    .meta-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 12px;
+    }
+
+    .meta-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+      color: var(--color-text-secondary);
+    }
+
+    .meta-item .label { font-weight: 600; color: var(--color-text); }
+
+    /* --- P0 Alert Banner --- */
+    .p0-alert {
+      background: var(--color-p0-bg);
+      border: 1px solid var(--color-p0-border);
+      border-left: 4px solid var(--color-p0);
+      border-radius: 8px;
+      padding: 16px 20px;
+      margin-bottom: 20px;
+      display: none;
+    }
+
+    .p0-alert-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--color-p0);
+      margin-bottom: 8px;
+    }
+
+    .p0-alert-list {
+      list-style: none;
+      font-size: 14px;
+    }
+
+    .p0-alert-list li {
+      padding: 2px 0;
+      color: var(--color-text);
+    }
+
+    /* --- Summary Bar --- */
+    .summary-bar {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 24px;
+      flex-wrap: wrap;
+    }
+
+    .summary-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 16px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      background: var(--color-card);
+      border: 1px solid var(--color-border);
+    }
+
+    .summary-chip .count {
+      font-size: 20px;
+      font-weight: 700;
+    }
+
+    .summary-chip.p0 { border-color: var(--color-p0); color: var(--color-p0); }
+    .summary-chip.p1 { border-color: var(--color-p1); color: var(--color-p1); }
+    .summary-chip.p2 { border-color: var(--color-p2); color: var(--color-p2); }
+    .summary-chip.total { border-color: var(--color-text); color: var(--color-text); }
+
+    /* --- Defect Cards --- */
+    .defect-list { display: flex; flex-direction: column; gap: 16px; }
+
+    .defect-card {
+      background: var(--color-card);
+      border: 1px solid var(--color-border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+
+    .defect-card.severity-P0 { border-left: 4px solid var(--color-p0); }
+    .defect-card.severity-P1 { border-left: 4px solid var(--color-p1); }
+    .defect-card.severity-P2 { border-left: 4px solid var(--color-p2); }
+
+    .defect-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--color-border);
+      flex-wrap: wrap;
+    }
+
+    .severity-badge {
+      display: inline-block;
+      padding: 2px 10px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 700;
+      color: #fff;
+    }
+
+    .severity-badge.P0 { background: var(--color-p0); }
+    .severity-badge.P1 { background: var(--color-p1); }
+    .severity-badge.P2 { background: var(--color-p2); }
+
+    .category-badge {
+      display: inline-block;
+      padding: 2px 10px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 600;
+      background: var(--color-code-bg);
+      color: var(--color-text-secondary);
+    }
+
+    .defect-title {
+      font-size: 15px;
+      font-weight: 600;
+      flex: 1;
+    }
+
+    .confidence-tag {
+      font-size: 12px;
+      color: var(--color-text-secondary);
+      white-space: nowrap;
+    }
+
+    .defect-body { padding: 20px; }
+
+    .defect-location {
+      font-size: 13px;
+      color: var(--color-text-secondary);
+      margin-bottom: 12px;
+      font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+    }
+
+    .defect-section { margin-bottom: 16px; }
+    .defect-section:last-child { margin-bottom: 0; }
+
+    .defect-section-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--color-text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 6px;
+    }
+
+    .defect-section p {
+      font-size: 14px;
+      line-height: 1.7;
+    }
+
+    .code-block {
+      background: var(--color-code-bg);
+      border: 1px solid var(--color-border);
+      border-radius: 6px;
+      padding: 12px 16px;
+      font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+      font-size: 13px;
+      line-height: 1.6;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    /* --- Empty State --- */
+    .empty-state {
+      text-align: center;
+      padding: 64px 32px;
+      background: var(--color-card);
+      border: 1px solid var(--color-border);
+      border-radius: 12px;
+    }
+
+    .empty-state h2 {
+      font-size: 18px;
+      color: #16a34a;
+      margin-bottom: 8px;
+    }
+
+    .empty-state p {
+      font-size: 14px;
+      color: var(--color-text-secondary);
+    }
+
+    /* --- Footer --- */
+    .report-footer {
+      text-align: center;
+      padding: 20px;
+      font-size: 12px;
+      color: var(--color-text-secondary);
+    }
+
+    /* --- Responsive --- */
+    @media (max-width: 640px) {
+      body { padding: 12px; }
+      .report-header { padding: 20px; }
+      .defect-header { padding: 12px 16px; }
+      .defect-body { padding: 16px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+
+    <!-- ====== Header ====== -->
+    <div class="report-header">
+      <h1>代码评审报告</h1>
+      <div class="meta-grid">
+        <div class="meta-item">
+          <span class="label">仓库：</span>
+          <span>katalyst-core</span>
+        </div>
+        <div class="meta-item">
+          <span class="label">检测模式：</span>
+          <span>方案与关联代码深度审查</span>
+        </div>
+        <div class="meta-item">
+          <span class="label">检测范围：</span>
+          <span>RDT bulkhead 设计文档及关联 resctrl、memory、CPU bulkhead、RDT 代码</span>
+        </div>
+        <div class="meta-item">
+          <span class="label">生成时间：</span>
+          <span>2026-07-29 02:07</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ====== P0 Alert (hidden when no P0) ====== -->
+    <div class="p0-alert">
+      <div class="p0-alert-title">高优先级告警 — 发现 P0 级别缺陷，建议立即处理</div>
+      <ul class="p0-alert-list">
+        
+      </ul>
+    </div>
+
+    <!-- ====== Summary ====== -->
+    <div class="summary-bar">
+      <div class="summary-chip p0"><span class="count">0</span> P0</div>
+      <div class="summary-chip p1"><span class="count">5</span> P1</div>
+      <div class="summary-chip p2"><span class="count">0</span> P2</div>
+      <div class="summary-chip total"><span class="count">5</span> 合计</div>
+    </div>
+
+    <!-- ====== Defect List ====== -->
+    <div class="defect-list">
+      
+    <div class="defect-card severity-P1">
+      <div class="defect-header">
+        <span class="severity-badge P1">P1</span>
+        <span class="category-badge">业务语义问题</span>
+        <span class="defect-title">RDT lifecycle 关闭会被仍启用的 CPUList 永久阻塞</span>
+        <span class="confidence-tag">置信度 9/10</span>
+      </div>
+      <div class="defect-body">
+        <div class="defect-location">docs/superpowers/specs/2026-07-28-rdt-bulkhead-resource-plugins-design.md:348-356</div>
+        <div class="defect-section">
+          <div class="defect-section-title">问题描述</div>
+          <p>设计要求 draining 后只有 tasks、pod mon group、cpu_list 都排空才能进入 disabled；同时明确 lifecycle 不触发资源插件 disabled handler，CPUList 与 lifecycle 开关独立。只关闭 EnableRDTLifecycle 而 CPUList 保持启用时，后续 CPU adjustment 会持续把 shared/dedicated target 写回 cpu_list，manager 永远不能删除 CLOS，也无法结束 draining。</p>
+        </div>
+        <div class="defect-section">
+          <div class="defect-section-title">修复建议</div>
+          <p>定义 lifecycle drain 的资源排空协议：进入 draining 时暂停 CPUList 正常收敛并清空可回收受管 CLOS 的 cpu_list，或将 lifecycle 关闭实现为先完成 CPUList 回滚再开始 drain。不能要求运维手工按顺序关闭多个 AQC 开关；至少应在 AQC 校验层拒绝该不收敛组合。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="defect-card severity-P1">
+      <div class="defect-header">
+        <span class="severity-badge P1">P1</span>
+        <span class="category-badge">业务语义问题</span>
+        <span class="defect-title">draining 所需的 task 回迁在现有接口中不可执行</span>
+        <span class="confidence-tag">置信度 10/10</span>
+      </div>
+      <div class="defect-body">
+        <div class="defect-location">pkg/util/external/rdt/manager_linux.go:45-48</div>
+        <div class="defect-section">
+          <div class="defect-section-title">问题描述</div>
+          <p>设计要求 runtime adapter 枚举受管 Pod/sandbox task、逐项迁回 root/default、确认结果并重试；但 manager 接口没有 task inventory 或 migrator 注入，现有 RDTManager.ApplyTasks 在 Linux 上直接返回 not implemented。关闭 lifecycle 时没有可调用的执行器来完成 drain，已运行 task 会留在 CLOS 中。</p>
+        </div>
+        <div class="defect-section">
+          <div class="defect-section-title">修复建议</div>
+          <p>新增受管 task registry 与 TaskMigrator 契约，包含 ListManagedTasks、MoveToRoot、Verify、Generation 和可恢复的 RetryState；分别实现 kubelet Pod 与 sandmanlet sandbox adapter。manager 仅迁移 registry 中由 Katalyst 接管的对象，adapter 确认全部 task 离开后才允许删除对应 CLOS。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="defect-card severity-P1">
+      <div class="defect-header">
+        <span class="severity-badge P1">P1</span>
+        <span class="category-badge">业务语义问题</span>
+        <span class="defect-title">sandbox-only 节点不会创建 reclaim CLOS</span>
+        <span class="confidence-tag">置信度 9/10</span>
+      </div>
+      <div class="defect-body">
+        <div class="defect-location">docs/superpowers/specs/2026-07-28-rdt-bulkhead-resource-plugins-design.md:136-146</div>
+        <div class="defect-section">
+          <div class="defect-section-title">问题描述</div>
+          <p>sandbox plugin 固定返回 reclaim，但 manager 的 ExpectedClosSet 仅由 CPU/memory state 的 AllocationMeta 转换结果构建。若节点没有 Kubernetes reclaimed Pod，state 中不存在 reclaim 需求，manager 不会创建 reclaim；资源插件也禁止创建目录，sandmanlet/runtime 将无法迁移 sandbox task。</p>
+        </div>
+        <div class="defect-section">
+          <div class="defect-section-title">修复建议</div>
+          <p>将 sandbox 活跃需求纳入 ClosReconcileState，例如 ExpectedSandboxClosIDs 与 ActiveSandboxIDs；sandbox owner 在功能启用且存在任务时注册 reclaim 为期望 CLOS。manager 应以 Pod 与 sandbox 的联合期望集创建和保活 reclaim，而不能依赖 Kubernetes reclaimed workload 偶然存在。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="defect-card severity-P1">
+      <div class="defect-header">
+        <span class="severity-badge P1">P1</span>
+        <span class="category-badge">业务语义问题</span>
+        <span class="defect-title">CAT 与现有 MB/MBA 会互相覆盖同一个 schemata 文件</span>
+        <span class="confidence-tag">置信度 10/10</span>
+      </div>
+      <div class="defect-body">
+        <div class="defect-location">pkg/agent/qrm-plugins/mb/allocator/resctrl_allocator.go:135-138</div>
+        <div class="defect-section">
+          <div class="defect-section-title">问题描述</div>
+          <p>设计要求 CAT 生成并写入完整 schemata，现有 MB allocator 也整体写 schemata 中的 MB 配置。resctrl 的 schemata 是同一文件，CAT 完整写会抹掉 MB 行，MB 后续写也会抹掉 L3/CAT 行，直接违反文档中 CAT、MBA 资源独立 owner 的原则。</p>
+        </div>
+        <div class="defect-section">
+          <div class="defect-section-title">修复建议</div>
+          <p>以 schemata 行而非文件定义资源所有权。实现单一 read-modify-write coordinator 和同一把锁/串行队列：CAT 只更新 L3 行，MB/MBA 只更新 MB 行，并保留内核返回的其他行。写前保存完整旧值；同一 CAT 资源写入中途失败时回滚已写目标，避免对称 cache-domain 策略被破坏。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="defect-card severity-P1">
+      <div class="defect-header">
+        <span class="severity-badge P1">P1</span>
+        <span class="category-badge">性能问题</span>
+        <span class="defect-title">RDT 插件的文件 I/O 实际运行在 DynamicPolicy.Lock 内</span>
+        <span class="confidence-tag">置信度 10/10</span>
+      </div>
+      <div class="defect-body">
+        <div class="defect-location">pkg/agent/qrm-plugins/cpu/dynamicpolicy/policy_allocation_handlers.go:1235-1239</div>
+        <div class="defect-section">
+          <div class="defect-section-title">问题描述</div>
+          <p>设计承诺所有 RDT 文件写入在 DynamicPolicy.Lock 之外，但现有 CPU policy 在持有 DynamicPolicy.Lock 的分配/advisor 链路中同步调用 bulkhead handlers。CPUList/CAT 对 resctrl 的目录扫描和文件写入会因此阻塞 CPU Allocate、Remove 与 advisor 更新；挂载卡顿或内核拒绝时会放大为全局策略延迟。</p>
+        </div>
+        <div class="defect-section">
+          <div class="defect-section-title">修复建议</div>
+          <p>锁内只构造不可变的 CPUSetPartitionView、动态配置快照和 generation；释放 DynamicPolicy.Lock 后执行资源插件 I/O。完成后以 generation/CAS 确认结果仍对应最新 state，再更新插件成功快照。为异步 I/O 设置单飞/合并策略和 bounded queue，避免 CPU adjustment 高频触发重复写入。</p>
+        </div>
+      </div>
+    </div>
+    </div>
+
+    <!-- ====== Empty State (shown when no defects) ====== -->
+    <!-- __EMPTY_STATE_START__
+    <div class="empty-state">
+      <h2>未发现缺陷</h2>
+      <p>本次评审未发现 P0-P2 级别的缺陷。共检查 12 个文件，约 761 行变更。</p>
+    </div>
+    __EMPTY_STATE_END__ -->
+
+    <div class="report-footer">
+      bits-code-guard &middot; 由 AI 辅助生成 &middot; 2026-07-29 02:07
+    </div>
+
+  </div>
+</body>
+</html>
+
+<!--
+╔══════════════════════════════════════════════════════════════╗
+║                        占位符说明                           ║
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  --- 报告元信息 ---                                          ║
+║  katalyst-core           仓库名称                            ║
+║  方案与关联代码深度审查         检测模式                            ║
+║  RDT bulkhead 设计文档及关联 resctrl、memory、CPU bulkhead、RDT 代码          检测范围描述                         ║
+║  2026-07-29 02:07        报告生成时间 (YYYY-MM-DD HH:mm)     ║
+║                                                              ║
+║  --- 统计数据 ---                                            ║
+║  0            P0 缺陷数量                         ║
+║  5            P1 缺陷数量                         ║
+║  0            P2 缺陷数量                         ║
+║  5         缺陷总数                            ║
+║                                                              ║
+║  --- P0 告警 ---                                             ║
+║  none    有 P0 时为 "block"，无 P0 时为      ║
+║                          "none"                              ║
+║        P0 缺陷摘要列表，每项格式：         ║
+║    <li>[P0][类型] file:line | {title}</li>                   ║
+║                                                              ║
+║  --- 缺陷卡片 ---                                            ║
+║  
+    <div class="defect-card severity-P1">
+      <div class="defect-header">
+        <span class="severity-badge P1">P1</span>
+        <span class="category-badge">业务语义问题</span>
+        <span class="defect-title">RDT lifecycle 关闭会被仍启用的 CPUList 永久阻塞</span>
+        <span class="confidence-tag">置信度 9/10</span>
+      </div>
+      <div class="defect-body">
+        <div class="defect-location">docs/superpowers/specs/2026-07-28-rdt-bulkhead-resource-plugins-design.md:348-356</div>
+        <div class="defect-section">
+          <div class="defect-section-title">问题描述</div>
+          <p>设计要求 draining 后只有 tasks、pod mon group、cpu_list 都排空才能进入 disabled；同时明确 lifecycle 不触发资源插件 disabled handler，CPUList 与 lifecycle 开关独立。只关闭 EnableRDTLifecycle 而 CPUList 保持启用时，后续 CPU adjustment 会持续把 shared/dedicated target 写回 cpu_list，manager 永远不能删除 CLOS，也无法结束 draining。</p>
+        </div>
+        <div class="defect-section">
+          <div class="defect-section-title">修复建议</div>
+          <p>定义 lifecycle drain 的资源排空协议：进入 draining 时暂停 CPUList 正常收敛并清空可回收受管 CLOS 的 cpu_list，或将 lifecycle 关闭实现为先完成 CPUList 回滚再开始 drain。不能要求运维手工按顺序关闭多个 AQC 开关；至少应在 AQC 校验层拒绝该不收敛组合。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="defect-card severity-P1">
+      <div class="defect-header">
+        <span class="severity-badge P1">P1</span>
+        <span class="category-badge">业务语义问题</span>
+        <span class="defect-title">draining 所需的 task 回迁在现有接口中不可执行</span>
+        <span class="confidence-tag">置信度 10/10</span>
+      </div>
+      <div class="defect-body">
+        <div class="defect-location">pkg/util/external/rdt/manager_linux.go:45-48</div>
+        <div class="defect-section">
+          <div class="defect-section-title">问题描述</div>
+          <p>设计要求 runtime adapter 枚举受管 Pod/sandbox task、逐项迁回 root/default、确认结果并重试；但 manager 接口没有 task inventory 或 migrator 注入，现有 RDTManager.ApplyTasks 在 Linux 上直接返回 not implemented。关闭 lifecycle 时没有可调用的执行器来完成 drain，已运行 task 会留在 CLOS 中。</p>
+        </div>
+        <div class="defect-section">
+          <div class="defect-section-title">修复建议</div>
+          <p>新增受管 task registry 与 TaskMigrator 契约，包含 ListManagedTasks、MoveToRoot、Verify、Generation 和可恢复的 RetryState；分别实现 kubelet Pod 与 sandmanlet sandbox adapter。manager 仅迁移 registry 中由 Katalyst 接管的对象，adapter 确认全部 task 离开后才允许删除对应 CLOS。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="defect-card severity-P1">
+      <div class="defect-header">
+        <span class="severity-badge P1">P1</span>
+        <span class="category-badge">业务语义问题</span>
+        <span class="defect-title">sandbox-only 节点不会创建 reclaim CLOS</span>
+        <span class="confidence-tag">置信度 9/10</span>
+      </div>
+      <div class="defect-body">
+        <div class="defect-location">docs/superpowers/specs/2026-07-28-rdt-bulkhead-resource-plugins-design.md:136-146</div>
+        <div class="defect-section">
+          <div class="defect-section-title">问题描述</div>
+          <p>sandbox plugin 固定返回 reclaim，但 manager 的 ExpectedClosSet 仅由 CPU/memory state 的 AllocationMeta 转换结果构建。若节点没有 Kubernetes reclaimed Pod，state 中不存在 reclaim 需求，manager 不会创建 reclaim；资源插件也禁止创建目录，sandmanlet/runtime 将无法迁移 sandbox task。</p>
+        </div>
+        <div class="defect-section">
+          <div class="defect-section-title">修复建议</div>
+          <p>将 sandbox 活跃需求纳入 ClosReconcileState，例如 ExpectedSandboxClosIDs 与 ActiveSandboxIDs；sandbox owner 在功能启用且存在任务时注册 reclaim 为期望 CLOS。manager 应以 Pod 与 sandbox 的联合期望集创建和保活 reclaim，而不能依赖 Kubernetes reclaimed workload 偶然存在。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="defect-card severity-P1">
+      <div class="defect-header">
+        <span class="severity-badge P1">P1</span>
+        <span class="category-badge">业务语义问题</span>
+        <span class="defect-title">CAT 与现有 MB/MBA 会互相覆盖同一个 schemata 文件</span>
+        <span class="confidence-tag">置信度 10/10</span>
+      </div>
+      <div class="defect-body">
+        <div class="defect-location">pkg/agent/qrm-plugins/mb/allocator/resctrl_allocator.go:135-138</div>
+        <div class="defect-section">
+          <div class="defect-section-title">问题描述</div>
+          <p>设计要求 CAT 生成并写入完整 schemata，现有 MB allocator 也整体写 schemata 中的 MB 配置。resctrl 的 schemata 是同一文件，CAT 完整写会抹掉 MB 行，MB 后续写也会抹掉 L3/CAT 行，直接违反文档中 CAT、MBA 资源独立 owner 的原则。</p>
+        </div>
+        <div class="defect-section">
+          <div class="defect-section-title">修复建议</div>
+          <p>以 schemata 行而非文件定义资源所有权。实现单一 read-modify-write coordinator 和同一把锁/串行队列：CAT 只更新 L3 行，MB/MBA 只更新 MB 行，并保留内核返回的其他行。写前保存完整旧值；同一 CAT 资源写入中途失败时回滚已写目标，避免对称 cache-domain 策略被破坏。</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="defect-card severity-P1">
+      <div class="defect-header">
+        <span class="severity-badge P1">P1</span>
+        <span class="category-badge">性能问题</span>
+        <span class="defect-title">RDT 插件的文件 I/O 实际运行在 DynamicPolicy.Lock 内</span>
+        <span class="confidence-tag">置信度 10/10</span>
+      </div>
+      <div class="defect-body">
+        <div class="defect-location">pkg/agent/qrm-plugins/cpu/dynamicpolicy/policy_allocation_handlers.go:1235-1239</div>
+        <div class="defect-section">
+          <div class="defect-section-title">问题描述</div>
+          <p>设计承诺所有 RDT 文件写入在 DynamicPolicy.Lock 之外，但现有 CPU policy 在持有 DynamicPolicy.Lock 的分配/advisor 链路中同步调用 bulkhead handlers。CPUList/CAT 对 resctrl 的目录扫描和文件写入会因此阻塞 CPU Allocate、Remove 与 advisor 更新；挂载卡顿或内核拒绝时会放大为全局策略延迟。</p>
+        </div>
+        <div class="defect-section">
+          <div class="defect-section-title">修复建议</div>
+          <p>锁内只构造不可变的 CPUSetPartitionView、动态配置快照和 generation；释放 DynamicPolicy.Lock 后执行资源插件 I/O。完成后以 generation/CAS 确认结果仍对应最新 state，再更新插件成功快照。为异步 I/O 设置单飞/合并策略和 bounded queue，避免 CPU adjustment 高频触发重复写入。</p>
+        </div>
+      </div>
+    </div>        所有缺陷卡片的 HTML，单张卡片格式：  ║
+║                                                              ║
+║    <div class="defect-card severity-{severity}">             ║
+║      <div class="defect-header">                             ║
+║        <span class="severity-badge {severity}">              ║
+║          {severity}</span>                                   ║
+║        <span class="category-badge">                         ║
+║          {category_zh}</span>                                ║
+║        <span class="defect-title">                           ║
+║          {title}</span>                                       ║
+║        <span class="confidence-tag">                         ║
+║          置信度 {confidence}/10</span>                       ║
+║      </div>                                                  ║
+║      <div class="defect-body">                               ║
+║        <div class="defect-location">                         ║
+║          {file}:{start_line}-{end_line}</div>                ║
+║        <div class="defect-section">                          ║
+║          <div class="defect-section-title">                  ║
+║            问题描述</div>                                    ║
+║          <p>{rationale}</p>                                  ║
+║        </div>                                                ║
+║        <div class="defect-section">                          ║
+║          <div class="defect-section-title">                  ║
+║            问题代码</div>                                    ║
+║          <div class="code-block">                            ║
+║            {代码片段}</div>                                  ║
+║        </div>                                                ║
+║        <div class="defect-section">                          ║
+║          <div class="defect-section-title">                  ║
+║            修复建议</div>                                    ║
+║          <p>{suggestion}</p>                                 ║
+║        </div>                                                ║
+║      </div>                                                  ║
+║    </div>                                                    ║
+║                                                              ║
+║  --- 空状态 ---                                              ║
+║  无缺陷时：取消注释 __EMPTY_STATE_START__ 到                 ║
+║  __EMPTY_STATE_END__ 之间的内容，并删除 defect-list 区块      ║
+║  12          检查的文件数                         ║
+║  761          变更行数                            ║
+║                                                              ║
+║  --- category 中英文映射 ---                                  ║
+║  LOGIC       → 逻辑错误                                     ║
+║  BUSINESS_SEMANTICS → 业务语义问题                           ║
+║  SECURITY    → 安全漏洞                                      ║
+║  CONCURRENCY → 并发问题                                      ║
+║  ROBUSTNESS  → 健壮性问题                                    ║
+║  PERFORMANCE → 性能问题                                      ║
+║  QUALITY     → 代码质量问题                                  ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+-->
