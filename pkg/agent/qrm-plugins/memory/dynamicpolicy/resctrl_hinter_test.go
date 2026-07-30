@@ -22,23 +22,104 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
+	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/memory/dynamicpolicy/resctrl"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/memory/dynamicpolicy/state"
-	"github.com/kubewharf/katalyst-core/pkg/config/agent/qrm"
+	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
+	qrmresctrl "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/resctrl"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
+	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
 type mockResctrlManager struct {
-	count int64
+	count          int64
+	reconcileState resctrl.ClosReconcileState
 }
 
 func (m *mockResctrlManager) Run(stopCh <-chan struct{})                              {}
 func (m *mockResctrlManager) Create(podUID, closID string, createMonGroup bool) error { return nil }
-func (m *mockResctrlManager) Cleanup(activePodUIDs sets.String) error                 { return nil }
-func (m *mockResctrlManager) GetMonGroupsCount() (int64, error)                       { return m.count, nil }
+func (m *mockResctrlManager) ReconcileClos(state resctrl.ClosReconcileState) error {
+	m.reconcileState = state
+	return nil
+}
+func (m *mockResctrlManager) GetMonGroupsCount() (int64, error) { return m.count, nil }
+
+func TestResctrlHinterReconcileClosUsesDynamicDisableRDT(t *testing.T) {
+	dynamicConf := dynamicconfig.NewDynamicAgentConfiguration()
+	dynamicConf.GetDynamicConfiguration().RDTConfig.DisableRDT = true
+	manager := &mockResctrlManager{}
+	hinter := &resctrlHinter{
+		dynamicConf: dynamicConf,
+		manager:     manager,
+	}
+
+	hinter.reconcileClos(sets.NewString("pod-a"))
+
+	if !manager.reconcileState.DisableRDT {
+		t.Fatal("ReconcileClos DisableRDT = false, want true")
+	}
+	assert.True(t, manager.reconcileState.ActivePodUIDs.Has("pod-a"))
+}
+
+func TestResctrlHinterReconcileClosBuildsExpectedClosIDsFromState(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(4, 1, 1)
+	require.NoError(t, err)
+	machineInfo, err := machine.GenerateDummyMachineInfo(1, 8)
+	require.NoError(t, err)
+	memoryState, err := state.NewMemoryPluginState(topology, machineInfo, nil, nil, nil)
+	require.NoError(t, err)
+	memoryState.SetPodResourceEntries(state.PodResourceEntries{
+		v1.ResourceMemory: {
+			"pod-a": {
+				"main": &state.AllocationInfo{AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-a",
+					ContainerName: "main",
+					OwnerPoolName: "batch",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+				}},
+			},
+			"pod-b": {
+				"main": &state.AllocationInfo{AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-b",
+					ContainerName: "main",
+					OwnerPoolName: "dedicated",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+				}},
+			},
+			"pod-c": {
+				"main": &state.AllocationInfo{AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-c",
+					ContainerName: "main",
+					OwnerPoolName: "reclaim",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelReclaimedCores,
+				}},
+			},
+		},
+	})
+
+	manager := &mockResctrlManager{}
+	hinter := &resctrlHinter{
+		config: &qrmresctrl.ResctrlConfig{
+			CPUSetPoolToSharedSubgroup: map[string]int{"batch": 3},
+			DefaultSharedSubgroup:      1,
+		},
+		manager: manager,
+		state:   memoryState,
+	}
+
+	hinter.reconcileClos(sets.NewString("pod-a", "pod-b", "pod-c"))
+
+	assert.True(t, manager.reconcileState.ExpectedClosIDs.Has("share-03"))
+	assert.True(t, manager.reconcileState.ExpectedClosIDs.Has("dedicated"))
+	assert.True(t, manager.reconcileState.ExpectedClosIDs.Has("reclaim"))
+}
 
 func TestResctrlProcessor_HintResp(t *testing.T) {
 	t.Parallel()
@@ -62,7 +143,7 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 		dirs     []string
 	}
 	type fields struct {
-		config     *qrm.ResctrlConfig
+		config     *qrmresctrl.ResctrlConfig
 		resctrl    *fsResctrl
 		isAllocate bool
 	}
@@ -92,7 +173,7 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 		{
 			name: "disabled opt no change",
 			fields: fields{
-				config: &qrm.ResctrlConfig{
+				config: &qrmresctrl.ResctrlConfig{
 					EnableResctrlHint:          false,
 					CPUSetPoolToSharedSubgroup: map[string]int{"batch": 30},
 					DefaultSharedSubgroup:      50,
@@ -113,13 +194,13 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 		{
 			name: "batch is share-30 if specified so, and no pod mon-group",
 			fields: fields{
-				config: &qrm.ResctrlConfig{
+				config: &qrmresctrl.ResctrlConfig{
 					EnableResctrlHint: true,
 					CPUSetPoolToSharedSubgroup: map[string]int{
 						"batch": 30,
 					},
 					EnabledQoS:             []string{"shared_cores"},
-					MonGroupEnabledClosIDs: []string{"dedicated", "shared-50"},
+					MonGroupEnabledClosIDs: []string{"dedicated", "share-50"},
 				},
 			},
 			args: args{
@@ -137,7 +218,7 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 						"memory": {
 							Annotations: map[string]string{
 								"test-key":                             "test-value",
-								"rdt.resources.beta.kubernetes.io/pod": "shared-30",
+								"rdt.resources.beta.kubernetes.io/pod": "share-30",
 								"rdt.resources.beta.kubernetes.io/need-mon-groups": "false",
 							},
 						},
@@ -148,13 +229,13 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 		{
 			name: "batch is share-30, and default yes pod mon-group",
 			fields: fields{
-				config: &qrm.ResctrlConfig{
+				config: &qrmresctrl.ResctrlConfig{
 					EnableResctrlHint: true,
 					CPUSetPoolToSharedSubgroup: map[string]int{
 						"batch": 30,
 					},
 					EnabledQoS:             []string{"shared_cores"},
-					MonGroupEnabledClosIDs: []string{"dedicated", "shared-30"},
+					MonGroupEnabledClosIDs: []string{"dedicated", "share-30"},
 				},
 			},
 			args: args{
@@ -172,7 +253,7 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 						"memory": {
 							Annotations: map[string]string{
 								"test-key":                             "test-value",
-								"rdt.resources.beta.kubernetes.io/pod": "shared-30",
+								"rdt.resources.beta.kubernetes.io/pod": "share-30",
 							},
 						},
 					},
@@ -182,7 +263,7 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 		{
 			name: "default shared-50, and mon_groups not over limit",
 			fields: fields{
-				config: &qrm.ResctrlConfig{
+				config: &qrmresctrl.ResctrlConfig{
 					EnableResctrlHint:     true,
 					DefaultSharedSubgroup: 50,
 					EnabledQoS:            []string{"shared_cores"},
@@ -192,8 +273,8 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 					numRmids: "5",
 					dirs: []string{
 						"info",
-						"shared-50/mon_groups/pod1",
-						"shared-50/mon_groups/pod2",
+						"share-50/mon_groups/pod1",
+						"share-50/mon_groups/pod2",
 					},
 				},
 				isAllocate: true,
@@ -209,7 +290,7 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 						"memory": {
 							Annotations: map[string]string{
 								"test-key":                             "test-value",
-								"rdt.resources.beta.kubernetes.io/pod": "shared-50",
+								"rdt.resources.beta.kubernetes.io/pod": "share-50",
 							},
 						},
 					},
@@ -219,7 +300,7 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 		{
 			name: "default shared-50, and mon_groups is over limit",
 			fields: fields{
-				config: &qrm.ResctrlConfig{
+				config: &qrmresctrl.ResctrlConfig{
 					EnableResctrlHint:     true,
 					DefaultSharedSubgroup: 50,
 					EnabledQoS:            []string{"shared_cores"},
@@ -229,9 +310,9 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 					numRmids: "5",
 					dirs: []string{
 						"info",
-						"shared-50/mon_groups/pod1",
-						"shared-50/mon_groups/pod2",
-						"shared-50/mon_groups/pod3",
+						"share-50/mon_groups/pod1",
+						"share-50/mon_groups/pod2",
+						"share-50/mon_groups/pod3",
 					},
 				},
 				isAllocate: true,
@@ -247,7 +328,7 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 						"memory": {
 							Annotations: map[string]string{
 								"test-key":                             "test-value",
-								"rdt.resources.beta.kubernetes.io/pod": "shared-50",
+								"rdt.resources.beta.kubernetes.io/pod": "share-50",
 								"rdt.resources.beta.kubernetes.io/need-mon-groups": "false",
 							},
 						},
@@ -258,13 +339,13 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 		{
 			name: "resp is nil",
 			fields: fields{
-				config: &qrm.ResctrlConfig{
+				config: &qrmresctrl.ResctrlConfig{
 					EnableResctrlHint: true,
 					CPUSetPoolToSharedSubgroup: map[string]int{
 						"batch": 30,
 					},
 					EnabledQoS:             []string{"shared_cores"},
-					MonGroupEnabledClosIDs: []string{"dedicated", "shared-50"},
+					MonGroupEnabledClosIDs: []string{"dedicated", "share-50"},
 				},
 			},
 			args: args{
@@ -287,7 +368,7 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			r := newResctrlHinter(tt.fields.config, metrics.DummyMetrics{}, nil)
+			r := newResctrlHinter(tt.fields.config, nil, metrics.DummyMetrics{}, nil)
 
 			if tt.fields.resctrl != nil {
 				root := t.TempDir()
@@ -300,7 +381,7 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 				monGroupsCount := int64(0)
 				for _, dir := range tt.fields.resctrl.dirs {
 					// Count mon_groups
-					// dirs example: "shared-50/mon_groups/pod1"
+					// dirs example: "share-50/mon_groups/pod1"
 					if path.Base(path.Dir(dir)) == "mon_groups" {
 						monGroupsCount++
 					}

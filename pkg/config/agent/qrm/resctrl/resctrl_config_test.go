@@ -1,5 +1,5 @@
 /*
-Copyright 2022 The Katalyst Authors.
+Copyright 2026 The Katalyst Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,26 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package registry
+package resctrl
 
 import (
-	"reflect"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
-func TestNewDefaultPluginsPreservesOrder(t *testing.T) {
+func TestNewResctrlConfigInitializesContainersOnly(t *testing.T) {
 	t.Parallel()
 
-	plugins, err := NewDefaultPlugins(nil)
-	if err != nil {
-		t.Fatalf("NewDefaultPlugins failed: %v", err)
-	}
-	got := make([]string, 0, len(plugins))
-	for _, plugin := range plugins {
-		got = append(got, plugin.Name())
-	}
-	want := []string{"cpuset_topology", "cpuset_mems", "workqueue", "system_service", "rdt_cpulist", "rdt_cat"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("unexpected plugin order, got %v want %v", got, want)
-	}
+	config := NewResctrlConfig()
+	require.Empty(t, config.DefaultClosIDs)
+	require.Equal(t, -1, config.DefaultSharedSubgroup)
+	require.NotNil(t, config.CPUSetPoolToSharedSubgroup)
+	require.NotNil(t, config.SkipCleanupClosIDs)
 }

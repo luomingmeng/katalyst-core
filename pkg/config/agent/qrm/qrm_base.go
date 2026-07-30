@@ -18,6 +18,7 @@ package qrm
 
 import (
 	"github.com/kubewharf/katalyst-api/pkg/consts"
+	"github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/resctrl"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/statedirectory"
 )
 
@@ -51,6 +52,7 @@ type GenericQRMPluginConfiguration struct {
 }
 
 type QRMPluginsConfiguration struct {
+	ResctrlConfig *resctrl.ResctrlConfig
 	*CPUQRMPluginConfig
 	*MemoryQRMPluginConfig
 	*NetworkQRMPluginConfig
@@ -73,6 +75,7 @@ func NewGenericQRMPluginConfiguration() *GenericQRMPluginConfiguration {
 
 func NewQRMPluginsConfiguration() *QRMPluginsConfiguration {
 	return &QRMPluginsConfiguration{
+		ResctrlConfig:          resctrl.NewResctrlConfig(),
 		CPUQRMPluginConfig:     NewCPUQRMPluginConfig(),
 		MemoryQRMPluginConfig:  NewMemoryQRMPluginConfig(),
 		NetworkQRMPluginConfig: NewNetworkQRMPluginConfig(),
