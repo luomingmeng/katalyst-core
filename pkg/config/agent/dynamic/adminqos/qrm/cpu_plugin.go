@@ -50,6 +50,14 @@ type DynamicBulkheadConfiguration struct {
 	EnableBulkheadWorkqueue      bool
 	EnableBulkheadSystemService  bool
 	NonReclaimPoolMinSize        int64
+	BulkheadRDTConfig            DynamicBulkheadRDTConfiguration
+}
+
+type DynamicBulkheadRDTConfiguration struct {
+	EnableCPUList  bool
+	EnableCAT      bool
+	DefaultCATWays int64
+	ClosCATWays    map[string]int64
 }
 
 func NewCPUPluginConfiguration() *CPUPluginConfiguration {
@@ -88,6 +96,21 @@ func (c *CPUPluginConfiguration) ApplyConfiguration(conf *crd.DynamicConfigCRD) 
 			}
 			if config.BulkheadConfig.NonReclaimPoolMinSize != nil {
 				c.BulkheadConfig.NonReclaimPoolMinSize = *config.BulkheadConfig.NonReclaimPoolMinSize
+			}
+			if config.BulkheadConfig.BulkheadRDTConfig != nil {
+				bulkheadRDTConfig := config.BulkheadConfig.BulkheadRDTConfig
+				if bulkheadRDTConfig.EnableCPUList != nil {
+					c.BulkheadConfig.BulkheadRDTConfig.EnableCPUList = *bulkheadRDTConfig.EnableCPUList
+				}
+				if bulkheadRDTConfig.EnableCAT != nil {
+					c.BulkheadConfig.BulkheadRDTConfig.EnableCAT = *bulkheadRDTConfig.EnableCAT
+				}
+				if bulkheadRDTConfig.DefaultCATWays != nil {
+					c.BulkheadConfig.BulkheadRDTConfig.DefaultCATWays = *bulkheadRDTConfig.DefaultCATWays
+				}
+				if bulkheadRDTConfig.ClosCATWays != nil {
+					c.BulkheadConfig.BulkheadRDTConfig.ClosCATWays = bulkheadRDTConfig.ClosCATWays
+				}
 			}
 		}
 		if config.DisableSharedCoresRampUp != nil {
