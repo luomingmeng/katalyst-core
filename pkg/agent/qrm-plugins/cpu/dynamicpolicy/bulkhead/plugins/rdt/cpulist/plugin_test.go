@@ -25,7 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	bulkheadapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api"
-	bulkheadutils "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	qrmresctrl "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/resctrl"
@@ -63,14 +63,14 @@ func newTestPlugin(manager *fakeCPUListManager) *CPUListPlugin {
 	}, manager)
 }
 
-func handlerContext(view *bulkheadutils.CPUSetPartitionView) bulkheadapi.HandlerContext {
+func handlerContext(view *model.CPUSetPartitionView) bulkheadapi.HandlerContext {
 	return bulkheadapi.HandlerContext{View: view}
 }
 
 func TestCPUListPluginSharedPoolsUnionForSameClos(t *testing.T) {
 	manager := &fakeCPUListManager{clos: []Clos{{ID: "share-03", Epoch: 1}}}
 	plugin := newTestPlugin(manager)
-	view := &bulkheadutils.CPUSetPartitionView{
+	view := &model.CPUSetPartitionView{
 		SharePoolMap: map[string]machine.CPUSet{
 			"share-a": machine.NewCPUSet(1, 2),
 			"share-b": machine.NewCPUSet(3, 4),
@@ -95,7 +95,7 @@ func TestCPUListPluginDisabledByTopLevelDisableRDT(t *testing.T) {
 func TestCPUListPluginWritesDedicatedTarget(t *testing.T) {
 	manager := &fakeCPUListManager{clos: []Clos{{ID: "dedicated", Epoch: 1}}}
 	plugin := newTestPlugin(manager)
-	view := &bulkheadutils.CPUSetPartitionView{Dedicated: machine.NewCPUSet(5, 6)}
+	view := &model.CPUSetPartitionView{Dedicated: machine.NewCPUSet(5, 6)}
 
 	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(view)))
 	require.Equal(t, []cpuListWrite{{closID: "dedicated", target: "5-6"}}, manager.writes)
@@ -104,7 +104,7 @@ func TestCPUListPluginWritesDedicatedTarget(t *testing.T) {
 func TestCPUListPluginAppliesMissingTargetClos(t *testing.T) {
 	manager := &fakeCPUListManager{}
 	plugin := newTestPlugin(manager)
-	view := &bulkheadutils.CPUSetPartitionView{Dedicated: machine.NewCPUSet(5, 6)}
+	view := &model.CPUSetPartitionView{Dedicated: machine.NewCPUSet(5, 6)}
 
 	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(view)))
 	require.Equal(t, []cpuListWrite{{closID: "dedicated", target: "5-6"}}, manager.writes)
@@ -112,7 +112,7 @@ func TestCPUListPluginAppliesMissingTargetClos(t *testing.T) {
 
 func TestCPUListPluginBuildTargetsSkipsEmptyCPUSets(t *testing.T) {
 	plugin := newTestPlugin(&fakeCPUListManager{})
-	view := &bulkheadutils.CPUSetPartitionView{
+	view := &model.CPUSetPartitionView{
 		SharePoolMap: map[string]machine.CPUSet{
 			"share-a": machine.NewCPUSet(),
 			"share-b": machine.NewCPUSet(1),
@@ -130,7 +130,7 @@ func TestCPUListPluginClearsEmptyTarget(t *testing.T) {
 	}}
 	plugin := newTestPlugin(manager)
 
-	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(&bulkheadutils.CPUSetPartitionView{})))
+	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(&model.CPUSetPartitionView{})))
 	require.Equal(t, []cpuListWrite{
 		{closID: consts.ResctrlGroupDedicated, target: ""},
 	}, manager.writes)
@@ -139,7 +139,7 @@ func TestCPUListPluginClearsEmptyTarget(t *testing.T) {
 func TestCPUListPluginSkipsUnchangedCanonicalTarget(t *testing.T) {
 	manager := &fakeCPUListManager{clos: []Clos{{ID: "dedicated", Epoch: 1}}}
 	plugin := newTestPlugin(manager)
-	view := &bulkheadutils.CPUSetPartitionView{Dedicated: machine.NewCPUSet(3, 1, 2)}
+	view := &model.CPUSetPartitionView{Dedicated: machine.NewCPUSet(3, 1, 2)}
 
 	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(view)))
 	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(view)))
@@ -152,7 +152,7 @@ func TestCPUListPluginRetriesFailedWrite(t *testing.T) {
 		writeErr: errors.New("write cpu_list"),
 	}
 	plugin := newTestPlugin(manager)
-	view := &bulkheadutils.CPUSetPartitionView{Dedicated: machine.NewCPUSet(1)}
+	view := &model.CPUSetPartitionView{Dedicated: machine.NewCPUSet(1)}
 
 	require.Error(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(view)))
 	manager.writeErr = nil
@@ -166,7 +166,7 @@ func TestCPUListPluginRetriesFailedWrite(t *testing.T) {
 func TestCPUListPluginRewritesRecreatedClos(t *testing.T) {
 	manager := &fakeCPUListManager{clos: []Clos{{ID: "dedicated", Epoch: 1}}}
 	plugin := newTestPlugin(manager)
-	view := &bulkheadutils.CPUSetPartitionView{Dedicated: machine.NewCPUSet(1)}
+	view := &model.CPUSetPartitionView{Dedicated: machine.NewCPUSet(1)}
 
 	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(view)))
 	manager.clos = []Clos{{ID: "dedicated", Epoch: 2}}
@@ -242,7 +242,7 @@ func TestCPUListPluginScopesSharedClosToConfiguredSubgroups(t *testing.T) {
 		plugin := NewCPUListPluginWithManager(config, manager)
 
 		require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(
-			&bulkheadutils.CPUSetPartitionView{
+			&model.CPUSetPartitionView{
 				Dedicated: machine.NewCPUSet(1),
 				SharePoolMap: map[string]machine.CPUSet{
 					"share-a":  machine.NewCPUSet(2),
