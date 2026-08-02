@@ -44,6 +44,15 @@ type cpuListWrite struct {
 	target string
 }
 
+type driftCPUListManager struct {
+	*fakeCPUListManager
+	matches bool
+}
+
+func (m *driftCPUListManager) CPUListMatches(context.Context, string, string) (bool, error) {
+	return m.matches, nil
+}
+
 func (m *fakeCPUListManager) ListManagedClos(context.Context) ([]Clos, error) {
 	return append([]Clos(nil), m.clos...), nil
 }
@@ -144,6 +153,23 @@ func TestCPUListPluginSkipsUnchangedCanonicalTarget(t *testing.T) {
 	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(view)))
 	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(view)))
 	require.Equal(t, []cpuListWrite{{closID: "dedicated", target: "1-3"}}, manager.writes)
+}
+
+func TestCPUListPluginRewritesUnchangedTargetAfterLiveDrift(t *testing.T) {
+	base := &fakeCPUListManager{clos: []Clos{{ID: "dedicated", Epoch: 1}}}
+	manager := &driftCPUListManager{fakeCPUListManager: base, matches: true}
+	plugin := newTestPlugin(manager.fakeCPUListManager)
+	plugin.manager = manager
+	view := &model.CPUSetPartitionView{Dedicated: machine.NewCPUSet(1)}
+
+	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(view)))
+	manager.matches = false
+	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(view)))
+
+	require.Equal(t, []cpuListWrite{
+		{closID: "dedicated", target: "1"},
+		{closID: "dedicated", target: "1"},
+	}, manager.writes)
 }
 
 func TestCPUListPluginRetriesFailedWrite(t *testing.T) {

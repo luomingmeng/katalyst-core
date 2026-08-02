@@ -86,6 +86,23 @@ func TestCPUListManagerApplyCPUListRejectsCPUOutsideMaskWidth(t *testing.T) {
 	require.ErrorContains(t, manager.ApplyCPUList(context.Background(), "dedicated", "32"), "exceeds resctrl cpus mask width")
 }
 
+func TestCPUListManagerCPUListMatchesObservesLiveMask(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, cpus), []byte("ffffffff\n"), 0o644))
+	require.NoError(t, os.Mkdir(filepath.Join(root, "dedicated"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "dedicated", cpus), []byte("00000002\n"), 0o644))
+	manager := newCPUListManager(root)
+
+	matches, err := manager.CPUListMatches(context.Background(), "dedicated", "1")
+	require.NoError(t, err)
+	require.True(t, matches)
+
+	require.NoError(t, os.WriteFile(filepath.Join(root, "dedicated", cpus), []byte("00000004\n"), 0o644))
+	matches, err = manager.CPUListMatches(context.Background(), "dedicated", "1")
+	require.NoError(t, err)
+	require.False(t, matches)
+}
+
 func TestCPUListManagerWritesExistingClosAndBumpsEpochAfterRecreate(t *testing.T) {
 	root := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(root, cpus), []byte("ffffffff\n"), 0o644))
