@@ -32,11 +32,13 @@ import (
 type closOwnershipCheckpoint struct {
 	Version        int      `json:"version"`
 	ClosIDs        []string `json:"clos_ids"`
+	PendingCreates []string `json:"pending_creates,omitempty"`
 	PendingDeletes []string `json:"pending_deletes,omitempty"`
 }
 
 type closOwnershipState struct {
 	owned          sets.String
+	pendingCreates sets.String
 	pendingDeletes sets.String
 }
 
@@ -81,7 +83,37 @@ func (s *ClosOwnershipStore) Register(closID string) error {
 		return err
 	}
 	state.owned.Insert(closID)
+	state.pendingCreates.Delete(closID)
 	state.pendingDeletes.Delete(closID)
+	return s.writeLocked(state)
+}
+
+func (s *ClosOwnershipStore) BeginCreate(closID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.loadStateLocked()
+	if err != nil {
+		return err
+	}
+	if !state.owned.Has(closID) {
+		state.pendingCreates.Insert(closID)
+	}
+	state.pendingDeletes.Delete(closID)
+	return s.writeLocked(state)
+}
+
+func (s *ClosOwnershipStore) FinishCreate(closID string) error {
+	return s.Register(closID)
+}
+
+func (s *ClosOwnershipStore) AbortCreate(closID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.loadStateLocked()
+	if err != nil {
+		return err
+	}
+	state.pendingCreates.Delete(closID)
 	return s.writeLocked(state)
 }
 
@@ -93,6 +125,7 @@ func (s *ClosOwnershipStore) Unregister(closID string) error {
 		return err
 	}
 	state.owned.Delete(closID)
+	state.pendingCreates.Delete(closID)
 	state.pendingDeletes.Delete(closID)
 	return s.writeLocked(state)
 }
@@ -124,6 +157,16 @@ func (s *ClosOwnershipStore) PendingDeletes() (sets.String, error) {
 	return sets.NewString(state.pendingDeletes.UnsortedList()...), nil
 }
 
+func (s *ClosOwnershipStore) PendingCreates() (sets.String, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.loadStateLocked()
+	if err != nil {
+		return nil, err
+	}
+	return sets.NewString(state.pendingCreates.UnsortedList()...), nil
+}
+
 func (s *ClosOwnershipStore) Load() (sets.String, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -132,6 +175,7 @@ func (s *ClosOwnershipStore) Load() (sets.String, error) {
 		return nil, err
 	}
 	active := sets.NewString(state.owned.UnsortedList()...)
+	active.Delete(state.pendingCreates.UnsortedList()...)
 	active.Delete(state.pendingDeletes.UnsortedList()...)
 	return active, nil
 }
@@ -139,6 +183,7 @@ func (s *ClosOwnershipStore) Load() (sets.String, error) {
 func (s *ClosOwnershipStore) loadStateLocked() (closOwnershipState, error) {
 	state := closOwnershipState{
 		owned:          sets.NewString(),
+		pendingCreates: sets.NewString(),
 		pendingDeletes: sets.NewString(),
 	}
 	if s.path == "" {
@@ -155,12 +200,15 @@ func (s *ClosOwnershipStore) loadStateLocked() (closOwnershipState, error) {
 	if err := json.Unmarshal(content, &checkpoint); err != nil {
 		return state, fmt.Errorf("decode resctrl CLOS ownership checkpoint: %w", err)
 	}
-	if checkpoint.Version != 1 && checkpoint.Version != 2 {
+	if checkpoint.Version < 1 || checkpoint.Version > 3 {
 		return state, fmt.Errorf("unsupported resctrl CLOS ownership checkpoint version %d", checkpoint.Version)
 	}
 	state.owned.Insert(checkpoint.ClosIDs...)
 	if checkpoint.Version >= 2 {
 		state.pendingDeletes.Insert(checkpoint.PendingDeletes...)
+	}
+	if checkpoint.Version >= 3 {
+		state.pendingCreates.Insert(checkpoint.PendingCreates...)
 	}
 	return state, nil
 }
@@ -171,11 +219,14 @@ func (s *ClosOwnershipStore) writeLocked(state closOwnershipState) error {
 	}
 	closIDs := state.owned.UnsortedList()
 	sort.Strings(closIDs)
+	pendingCreates := state.pendingCreates.UnsortedList()
+	sort.Strings(pendingCreates)
 	pendingDeletes := state.pendingDeletes.UnsortedList()
 	sort.Strings(pendingDeletes)
 	content, err := json.Marshal(closOwnershipCheckpoint{
-		Version:        2,
+		Version:        3,
 		ClosIDs:        closIDs,
+		PendingCreates: pendingCreates,
 		PendingDeletes: pendingDeletes,
 	})
 	if err != nil {

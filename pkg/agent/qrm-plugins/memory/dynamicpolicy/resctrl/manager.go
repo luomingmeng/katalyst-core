@@ -78,6 +78,7 @@ type managerImpl struct {
 	ownershipStore          *qrmresctrlmanager.ClosOwnershipStore
 	ownershipLoadErr        error
 	removeAll               func(string) error
+	mkdir                   func(string, os.FileMode) error
 	readFile                func(string) ([]byte, error)
 	invalidator             ClosInvalidator
 	sync.RWMutex
@@ -88,6 +89,7 @@ func NewManager(config *qrmresctrl.ResctrlConfig, invalidators ...ClosInvalidato
 		config:                  config,
 		lifecycleManagedClosIDs: sets.NewString(),
 		removeAll:               os.RemoveAll,
+		mkdir:                   os.Mkdir,
 		readFile:                os.ReadFile,
 	}
 	if config != nil {
@@ -129,6 +131,9 @@ func (m *managerImpl) Create(podUID, closID string, createMonGroup bool) error {
 	if !m.enabled.Load() || m.root == "" {
 		return nil
 	}
+	if err := m.recoverPendingCreatesLocked(); err != nil {
+		return err
+	}
 	if err := m.recoverPendingDeletesLocked(); err != nil {
 		return err
 	}
@@ -161,6 +166,9 @@ func (m *managerImpl) ReconcileClos(state ClosReconcileState) error {
 	m.disableRDT = state.DisableRDT
 	if !m.enabled.Load() || m.root == "" {
 		return nil
+	}
+	if err := m.recoverPendingCreatesLocked(); err != nil {
+		return err
 	}
 	if err := m.recoverPendingDeletesLocked(); err != nil {
 		return err
@@ -303,13 +311,33 @@ func (m *managerImpl) createClosLocked(closID string) (string, error) {
 		} else if !os.IsNotExist(err) {
 			return false, fmt.Errorf("stat clos_id dir %s failed: %w", closIDPath, err)
 		}
-		if err := m.markLifecycleManagedClosLocked(closID); err != nil {
-			return false, fmt.Errorf("checkpoint CLOS %q ownership: %w", closID, err)
+		if m.ownershipCheckpointPath != "" {
+			if err := m.ownershipStore.BeginCreate(closID); err != nil {
+				return false, fmt.Errorf("checkpoint pending CLOS %q creation: %w", closID, err)
+			}
 		}
-		if err := os.MkdirAll(closIDPath, 0o755); err != nil {
-			_ = m.unmarkLifecycleManagedClosLocked(closID)
+		mkdir := m.mkdir
+		if mkdir == nil {
+			mkdir = os.Mkdir
+		}
+		if err := mkdir(closIDPath, 0o755); err != nil {
+			if m.ownershipCheckpointPath != "" {
+				_ = m.ownershipStore.AbortCreate(closID)
+			}
+			if os.IsExist(err) {
+				return false, nil
+			}
 			return false, fmt.Errorf("create clos_id dir %s failed: %w", closIDPath, err)
 		}
+		if m.ownershipCheckpointPath != "" {
+			if err := m.ownershipStore.FinishCreate(closID); err != nil {
+				return false, fmt.Errorf("checkpoint CLOS %q ownership: %w", closID, err)
+			}
+		}
+		if m.lifecycleManagedClosIDs == nil {
+			m.lifecycleManagedClosIDs = sets.NewString()
+		}
+		m.lifecycleManagedClosIDs.Insert(closID)
 		return true, nil
 	})
 	return closIDPath, err
@@ -369,6 +397,37 @@ func (m *managerImpl) recoverPendingDeletesLocked() error {
 			return true, nil
 		}); err != nil {
 			return fmt.Errorf("recover pending deletion of CLOS %q: %w", closID, err)
+		}
+	}
+	return nil
+}
+
+func (m *managerImpl) recoverPendingCreatesLocked() error {
+	if m.ownershipCheckpointPath == "" {
+		return nil
+	}
+	pending, err := m.ownershipStore.PendingCreates()
+	if err != nil {
+		return err
+	}
+	for closID := range pending {
+		path := filepath.Join(m.root, closID)
+		if err := m.runClosLifecycleLocked(closID, func() (bool, error) {
+			_, statErr := os.Stat(path)
+			existed := statErr == nil
+			if statErr != nil && !os.IsNotExist(statErr) {
+				return false, statErr
+			}
+			if err := m.remove(path); err != nil {
+				return false, err
+			}
+			if err := m.ownershipStore.AbortCreate(closID); err != nil {
+				return false, err
+			}
+			m.lifecycleManagedClosIDs.Delete(closID)
+			return existed, nil
+		}); err != nil {
+			return fmt.Errorf("recover pending creation of CLOS %q: %w", closID, err)
 		}
 	}
 	return nil

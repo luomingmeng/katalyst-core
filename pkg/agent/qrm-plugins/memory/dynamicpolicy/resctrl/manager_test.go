@@ -171,11 +171,33 @@ func TestManagerExistingClosDoesNotBumpEpochOrInvalidate(t *testing.T) {
 	require.Empty(t, lifecycle.closIDs)
 }
 
+func TestManagerCreateDoesNotClaimExternalClosThatWinsCreateRace(t *testing.T) {
+	root := t.TempDir()
+	checkpointPath := filepath.Join(t.TempDir(), "resctrl-clos-ownership.json")
+	manager := NewManager(&qrmresctrl.ResctrlConfig{
+		OwnershipCheckpointPath: checkpointPath,
+	}).(*managerImpl)
+	manager.root = root
+	manager.enabled.Store(true)
+	manager.mkdir = func(path string, mode os.FileMode) error {
+		require.NoError(t, os.Mkdir(path, mode))
+		return os.ErrExist
+	}
+
+	require.NoError(t, manager.Create("", "shared", false))
+
+	owned, err := qrmresctrlmanager.NewClosOwnershipStore(checkpointPath).Load()
+	require.NoError(t, err)
+	require.False(t, owned.Has("shared"))
+	require.False(t, manager.lifecycleManagedClosIDs.Has("shared"))
+	require.DirExists(t, filepath.Join(root, "shared"))
+}
+
 func TestManagerImpl_Create(t *testing.T) {
 	t.Parallel()
 	tmpDir, err := os.MkdirTemp("", "resctrl_test")
 	assert.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
 
 	m := &managerImpl{
 		root: tmpDir,
@@ -837,6 +859,31 @@ func TestManagerRecoversPendingClosDeletionAfterRestart(t *testing.T) {
 	pending, err := store.PendingDeletes()
 	require.NoError(t, err)
 	require.False(t, pending.Has("dedicated"))
+}
+
+func TestManagerRecoversPendingCreateWithoutClaimingLaterExternalClos(t *testing.T) {
+	root := t.TempDir()
+	checkpointPath := filepath.Join(t.TempDir(), "resctrl-clos-ownership.json")
+	store := qrmresctrlmanager.NewClosOwnershipStore(checkpointPath)
+	require.NoError(t, store.BeginCreate("dedicated"))
+
+	restarted := NewManager(&qrmresctrl.ResctrlConfig{
+		OwnershipCheckpointPath: checkpointPath,
+	}).(*managerImpl)
+	restarted.root = root
+	restarted.enabled.Store(true)
+
+	require.NoError(t, restarted.ReconcileClos(ClosReconcileState{}))
+	pending, err := store.PendingCreates()
+	require.NoError(t, err)
+	require.False(t, pending.Has("dedicated"))
+	owned, err := store.Load()
+	require.NoError(t, err)
+	require.False(t, owned.Has("dedicated"))
+
+	require.NoError(t, os.Mkdir(filepath.Join(root, "dedicated"), 0o755))
+	require.NoError(t, restarted.ReconcileClos(ClosReconcileState{DisableRDT: true}))
+	require.DirExists(t, filepath.Join(root, "dedicated"))
 }
 
 func TestManagerCreateRecoversPendingDeletionBeforeConfirmingClos(t *testing.T) {
