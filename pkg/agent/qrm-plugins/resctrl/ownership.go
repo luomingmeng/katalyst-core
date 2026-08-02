@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"syscall"
 
 	"k8s.io/apimachinery/pkg/util/sets"
 
@@ -30,16 +31,58 @@ import (
 )
 
 type closOwnershipCheckpoint struct {
-	Version        int      `json:"version"`
-	ClosIDs        []string `json:"clos_ids"`
-	PendingCreates []string `json:"pending_creates,omitempty"`
-	PendingDeletes []string `json:"pending_deletes,omitempty"`
+	Version                   int                        `json:"version"`
+	ClosIDs                   []string                   `json:"clos_ids"`
+	PendingCreates            []string                   `json:"pending_creates,omitempty"`
+	PendingDeletes            []string                   `json:"pending_deletes,omitempty"`
+	PendingCreateTransactions map[string]ClosTransaction `json:"pending_create_transactions,omitempty"`
+	PendingDeleteTransactions map[string]ClosTransaction `json:"pending_delete_transactions,omitempty"`
+	NextGeneration            uint64                     `json:"next_generation,omitempty"`
 }
 
 type closOwnershipState struct {
-	owned          sets.String
-	pendingCreates sets.String
-	pendingDeletes sets.String
+	owned                     sets.String
+	pendingCreates            sets.String
+	pendingDeletes            sets.String
+	pendingCreateTransactions map[string]ClosTransaction
+	pendingDeleteTransactions map[string]ClosTransaction
+	nextGeneration            uint64
+}
+
+// DirectoryIdentity identifies one concrete incarnation of a CLOS directory.
+type DirectoryIdentity struct {
+	Device uint64 `json:"device"`
+	Inode  uint64 `json:"inode"`
+}
+
+// ClosTransaction binds an in-flight filesystem operation to a generation and,
+// once available, the exact directory incarnation it is allowed to mutate.
+type ClosTransaction struct {
+	Generation uint64             `json:"generation"`
+	Identity   *DirectoryIdentity `json:"identity,omitempty"`
+}
+
+func DirectoryIdentityForPath(path string) (DirectoryIdentity, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return DirectoryIdentity{}, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return DirectoryIdentity{}, fmt.Errorf("unsupported filesystem identity for %q", path)
+	}
+	return DirectoryIdentity{Device: uint64(stat.Dev), Inode: stat.Ino}, nil
+}
+
+func SameDirectoryIdentity(path string, expected *DirectoryIdentity) (bool, error) {
+	if expected == nil {
+		return false, nil
+	}
+	actual, err := DirectoryIdentityForPath(path)
+	if err != nil {
+		return false, err
+	}
+	return actual == *expected, nil
 }
 
 var ownershipCheckpointLocks sync.Map
@@ -85,6 +128,8 @@ func (s *ClosOwnershipStore) Register(closID string) error {
 	state.owned.Insert(closID)
 	state.pendingCreates.Delete(closID)
 	state.pendingDeletes.Delete(closID)
+	delete(state.pendingCreateTransactions, closID)
+	delete(state.pendingDeleteTransactions, closID)
 	return s.writeLocked(state)
 }
 
@@ -97,8 +142,27 @@ func (s *ClosOwnershipStore) BeginCreate(closID string) error {
 	}
 	if !state.owned.Has(closID) {
 		state.pendingCreates.Insert(closID)
+		state.pendingCreateTransactions[closID] = ClosTransaction{Generation: state.nextGeneration}
+		state.nextGeneration++
 	}
 	state.pendingDeletes.Delete(closID)
+	delete(state.pendingDeleteTransactions, closID)
+	return s.writeLocked(state)
+}
+
+func (s *ClosOwnershipStore) BindCreate(closID string, identity DirectoryIdentity) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.loadStateLocked()
+	if err != nil {
+		return err
+	}
+	transaction, ok := state.pendingCreateTransactions[closID]
+	if !ok {
+		return fmt.Errorf("no pending CLOS %q creation to bind", closID)
+	}
+	transaction.Identity = &identity
+	state.pendingCreateTransactions[closID] = transaction
 	return s.writeLocked(state)
 }
 
@@ -114,6 +178,7 @@ func (s *ClosOwnershipStore) AbortCreate(closID string) error {
 		return err
 	}
 	state.pendingCreates.Delete(closID)
+	delete(state.pendingCreateTransactions, closID)
 	return s.writeLocked(state)
 }
 
@@ -127,10 +192,12 @@ func (s *ClosOwnershipStore) Unregister(closID string) error {
 	state.owned.Delete(closID)
 	state.pendingCreates.Delete(closID)
 	state.pendingDeletes.Delete(closID)
+	delete(state.pendingCreateTransactions, closID)
+	delete(state.pendingDeleteTransactions, closID)
 	return s.writeLocked(state)
 }
 
-func (s *ClosOwnershipStore) BeginDelete(closID string) error {
+func (s *ClosOwnershipStore) BeginDelete(closID string, identities ...DirectoryIdentity) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	state, err := s.loadStateLocked()
@@ -139,6 +206,13 @@ func (s *ClosOwnershipStore) BeginDelete(closID string) error {
 	}
 	if state.owned.Has(closID) {
 		state.pendingDeletes.Insert(closID)
+		transaction := ClosTransaction{Generation: state.nextGeneration}
+		state.nextGeneration++
+		if len(identities) > 0 {
+			identity := identities[0]
+			transaction.Identity = &identity
+		}
+		state.pendingDeleteTransactions[closID] = transaction
 	}
 	return s.writeLocked(state)
 }
@@ -167,6 +241,26 @@ func (s *ClosOwnershipStore) PendingCreates() (sets.String, error) {
 	return sets.NewString(state.pendingCreates.UnsortedList()...), nil
 }
 
+func (s *ClosOwnershipStore) PendingCreateTransactions() (map[string]ClosTransaction, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.loadStateLocked()
+	if err != nil {
+		return nil, err
+	}
+	return cloneTransactions(state.pendingCreates, state.pendingCreateTransactions), nil
+}
+
+func (s *ClosOwnershipStore) PendingDeleteTransactions() (map[string]ClosTransaction, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, err := s.loadStateLocked()
+	if err != nil {
+		return nil, err
+	}
+	return cloneTransactions(state.pendingDeletes, state.pendingDeleteTransactions), nil
+}
+
 func (s *ClosOwnershipStore) Load() (sets.String, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -182,9 +276,12 @@ func (s *ClosOwnershipStore) Load() (sets.String, error) {
 
 func (s *ClosOwnershipStore) loadStateLocked() (closOwnershipState, error) {
 	state := closOwnershipState{
-		owned:          sets.NewString(),
-		pendingCreates: sets.NewString(),
-		pendingDeletes: sets.NewString(),
+		owned:                     sets.NewString(),
+		pendingCreates:            sets.NewString(),
+		pendingDeletes:            sets.NewString(),
+		pendingCreateTransactions: make(map[string]ClosTransaction),
+		pendingDeleteTransactions: make(map[string]ClosTransaction),
+		nextGeneration:            1,
 	}
 	if s.path == "" {
 		return state, nil
@@ -200,7 +297,7 @@ func (s *ClosOwnershipStore) loadStateLocked() (closOwnershipState, error) {
 	if err := json.Unmarshal(content, &checkpoint); err != nil {
 		return state, fmt.Errorf("decode resctrl CLOS ownership checkpoint: %w", err)
 	}
-	if checkpoint.Version < 1 || checkpoint.Version > 3 {
+	if checkpoint.Version < 1 || checkpoint.Version > 4 {
 		return state, fmt.Errorf("unsupported resctrl CLOS ownership checkpoint version %d", checkpoint.Version)
 	}
 	state.owned.Insert(checkpoint.ClosIDs...)
@@ -209,6 +306,14 @@ func (s *ClosOwnershipStore) loadStateLocked() (closOwnershipState, error) {
 	}
 	if checkpoint.Version >= 3 {
 		state.pendingCreates.Insert(checkpoint.PendingCreates...)
+	}
+	if checkpoint.Version >= 4 {
+		state.pendingCreateTransactions = cloneTransactions(state.pendingCreates, checkpoint.PendingCreateTransactions)
+		state.pendingDeleteTransactions = cloneTransactions(state.pendingDeletes, checkpoint.PendingDeleteTransactions)
+		state.nextGeneration = checkpoint.NextGeneration
+		if state.nextGeneration == 0 {
+			state.nextGeneration = 1
+		}
 	}
 	return state, nil
 }
@@ -224,10 +329,13 @@ func (s *ClosOwnershipStore) writeLocked(state closOwnershipState) error {
 	pendingDeletes := state.pendingDeletes.UnsortedList()
 	sort.Strings(pendingDeletes)
 	content, err := json.Marshal(closOwnershipCheckpoint{
-		Version:        3,
-		ClosIDs:        closIDs,
-		PendingCreates: pendingCreates,
-		PendingDeletes: pendingDeletes,
+		Version:                   4,
+		ClosIDs:                   closIDs,
+		PendingCreates:            pendingCreates,
+		PendingDeletes:            pendingDeletes,
+		PendingCreateTransactions: cloneTransactions(state.pendingCreates, state.pendingCreateTransactions),
+		PendingDeleteTransactions: cloneTransactions(state.pendingDeletes, state.pendingDeleteTransactions),
+		NextGeneration:            state.nextGeneration,
 	})
 	if err != nil {
 		return fmt.Errorf("encode resctrl CLOS ownership checkpoint: %w", err)
@@ -265,4 +373,17 @@ func (s *ClosOwnershipStore) writeLocked(state closOwnershipState) error {
 		return fmt.Errorf("sync resctrl CLOS ownership checkpoint directory: %w", err)
 	}
 	return nil
+}
+
+func cloneTransactions(ids sets.String, transactions map[string]ClosTransaction) map[string]ClosTransaction {
+	result := make(map[string]ClosTransaction, ids.Len())
+	for closID := range ids {
+		transaction := transactions[closID]
+		if transaction.Identity != nil {
+			identity := *transaction.Identity
+			transaction.Identity = &identity
+		}
+		result[closID] = transaction
+	}
+	return result
 }

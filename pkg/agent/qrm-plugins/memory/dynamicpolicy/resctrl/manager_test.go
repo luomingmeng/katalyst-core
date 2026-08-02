@@ -863,8 +863,10 @@ func TestManagerRecoversPendingClosDeletionAfterRestart(t *testing.T) {
 	checkpointPath := filepath.Join(t.TempDir(), "resctrl-clos-ownership.json")
 	store := qrmresctrlmanager.NewClosOwnershipStore(checkpointPath)
 	require.NoError(t, store.Register("dedicated"))
-	require.NoError(t, store.BeginDelete("dedicated"))
 	require.NoError(t, os.Mkdir(filepath.Join(root, "dedicated"), 0o755))
+	identity, err := qrmresctrlmanager.DirectoryIdentityForPath(filepath.Join(root, "dedicated"))
+	require.NoError(t, err)
+	require.NoError(t, store.BeginDelete("dedicated", identity))
 
 	restarted := NewManager(&qrmresctrl.ResctrlConfig{
 		OwnershipCheckpointPath: checkpointPath,
@@ -878,6 +880,35 @@ func TestManagerRecoversPendingClosDeletionAfterRestart(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, owned.Has("dedicated"))
 	pending, err := store.PendingDeletes()
+	require.NoError(t, err)
+	require.False(t, pending.Has("dedicated"))
+}
+
+func TestManagerPendingDeletePreservesReplacementWithDifferentIdentity(t *testing.T) {
+	root := t.TempDir()
+	checkpointPath := filepath.Join(t.TempDir(), "resctrl-clos-ownership.json")
+	config := &qrmresctrl.ResctrlConfig{OwnershipCheckpointPath: checkpointPath}
+	first := NewManager(config).(*managerImpl)
+	first.root = root
+	first.enabled.Store(true)
+	require.NoError(t, first.Create("", "dedicated", false))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "dedicated", tasks), nil, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "dedicated", cpus), nil, 0o644))
+	first.removeAll = func(string) error { return errors.New("injected delete failure") }
+	require.ErrorContains(t, first.ReconcileClos(ClosReconcileState{}), "injected delete failure")
+
+	require.NoError(t, os.RemoveAll(filepath.Join(root, "dedicated")))
+	require.NoError(t, os.Mkdir(filepath.Join(root, "dedicated"), 0o755))
+	replacementMarker := filepath.Join(root, "dedicated", "external")
+	require.NoError(t, os.WriteFile(replacementMarker, []byte("keep"), 0o644))
+
+	restarted := NewManager(config).(*managerImpl)
+	restarted.root = root
+	restarted.enabled.Store(true)
+	require.NoError(t, restarted.ReconcileClos(ClosReconcileState{}))
+
+	require.FileExists(t, replacementMarker)
+	pending, err := qrmresctrlmanager.NewClosOwnershipStore(checkpointPath).PendingDeletes()
 	require.NoError(t, err)
 	require.False(t, pending.Has("dedicated"))
 }
@@ -912,8 +943,10 @@ func TestManagerCreateRecoversPendingDeletionBeforeConfirmingClos(t *testing.T) 
 	checkpointPath := filepath.Join(t.TempDir(), "resctrl-clos-ownership.json")
 	store := qrmresctrlmanager.NewClosOwnershipStore(checkpointPath)
 	require.NoError(t, store.Register("dedicated"))
-	require.NoError(t, store.BeginDelete("dedicated"))
 	require.NoError(t, os.Mkdir(filepath.Join(root, "dedicated"), 0o755))
+	identity, err := qrmresctrlmanager.DirectoryIdentityForPath(filepath.Join(root, "dedicated"))
+	require.NoError(t, err)
+	require.NoError(t, store.BeginDelete("dedicated", identity))
 
 	restarted := NewManager(&qrmresctrl.ResctrlConfig{
 		OwnershipCheckpointPath: checkpointPath,
