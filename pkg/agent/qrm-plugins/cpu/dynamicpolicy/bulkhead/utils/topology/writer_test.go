@@ -18,6 +18,7 @@ package topology
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,6 +27,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	cgroupclient "github.com/kubewharf/katalyst-core/pkg/util/cgroup/client"
 	cgcommon "github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
@@ -43,20 +45,570 @@ type cpusetWrite struct {
 type topologyFakeCgroup struct {
 	cgroupclient.FakeCgroupClient
 
-	version    cgroupclient.CgroupVersion
-	cpus       map[string]machine.CPUSet
-	children   map[string][]string
-	files      map[string]map[string][]byte
-	reads      int
-	writes     []cpusetWrite
-	failRel    map[string]bool
-	applyErr   map[string]error
-	readErr    map[string]error
-	listErr    map[string]error
-	onApply    func(rel string, data *cgcommon.CPUSetData)
-	afterApply func(rel string, data *cgcommon.CPUSetData)
+	version               cgroupclient.CgroupVersion
+	cpus                  map[string]machine.CPUSet
+	identities            map[string]CgroupIdentity
+	children              map[string][]string
+	files                 map[string]map[string][]byte
+	reads                 int
+	snapshotRootReads     int
+	writes                []cpusetWrite
+	failRel               map[string]bool
+	applyErr              map[string]error
+	readErr               map[string]error
+	listErr               map[string]error
+	onApply               func(rel string, data *cgcommon.CPUSetData)
+	afterApply            func(rel string, data *cgcommon.CPUSetData)
+	afterSnapshotRootRead func(reads int)
 
 	enforceParentContainsTarget bool
+	rejectEmptyCPUs             bool
+}
+
+type topologyFakeSnapshotDriver struct {
+	cg *topologyFakeCgroup
+}
+
+type resetConvergenceStateDriver struct {
+	HierarchyDriver
+	states       map[string]EntryState
+	capabilities HierarchyCapabilities
+}
+
+func (d *resetConvergenceStateDriver) ReadEntry(_ context.Context, rel string) (EntryState, error) {
+	state, ok := d.states[rel]
+	if !ok {
+		return EntryState{}, syscall.ENOENT
+	}
+	return state, nil
+}
+
+func (d *resetConvergenceStateDriver) Capabilities() HierarchyCapabilities {
+	return d.capabilities
+}
+
+func (d *resetConvergenceStateDriver) WriteCPUs(_ context.Context, rel string, expected CgroupIdentity, cpus machine.CPUSet) error {
+	state, ok := d.states[rel]
+	if !ok {
+		return syscall.ENOENT
+	}
+	if state.Identity != expected {
+		return ErrCgroupIdentityChanged
+	}
+	state.ConfiguredCPUs = cpus.Clone()
+	if !cpus.IsEmpty() {
+		state.CPUs = cpus.Clone()
+	}
+	d.states[rel] = state
+	return nil
+}
+
+func (d *resetConvergenceStateDriver) WriteMems(_ context.Context, rel string, expected CgroupIdentity, mems string) error {
+	state, ok := d.states[rel]
+	if !ok {
+		return syscall.ENOENT
+	}
+	if state.Identity != expected {
+		return ErrCgroupIdentityChanged
+	}
+	state.Mems = mems
+	state.ConfiguredMems = mems
+	d.states[rel] = state
+	return nil
+}
+
+func (f *topologyFakeCgroup) SnapshotDriver() HierarchyDriver {
+	return &topologyFakeSnapshotDriver{cg: f}
+}
+
+func (d *topologyFakeSnapshotDriver) Close() error { return nil }
+
+func (d *topologyFakeSnapshotDriver) Roots(context.Context) ([]RootRef, error) {
+	return nil, nil
+}
+
+func (d *topologyFakeSnapshotDriver) StatIdentity(_ context.Context, rel string) (CgroupIdentity, error) {
+	if identity, ok := d.cg.identities[rel]; ok {
+		return identity, nil
+	}
+	return fakeSnapshotIdentity(rel), nil
+}
+
+func (d *topologyFakeSnapshotDriver) ReadEntry(ctx context.Context, rel string) (EntryState, error) {
+	if rel == "primary" {
+		d.cg.snapshotRootReads++
+		if d.cg.afterSnapshotRootRead != nil {
+			d.cg.afterSnapshotRootRead(d.cg.snapshotRootReads)
+		}
+	}
+	cpus, err := d.cg.ReadCPUSet(ctx, rel)
+	if err != nil {
+		return EntryState{}, err
+	}
+	identity := fakeSnapshotIdentity(rel)
+	if current, ok := d.cg.identities[rel]; ok {
+		identity = current
+	}
+	mems := "0"
+	if current, ok := d.cg.files[rel]["cpuset.mems"]; ok {
+		mems = string(current)
+	}
+	return EntryState{Rel: rel, Identity: identity, CPUs: cpus, Mems: mems}, nil
+}
+
+func (d *topologyFakeSnapshotDriver) ListChildren(ctx context.Context, rel string) ([]ChildRef, error) {
+	names, err := d.cg.ListChildren(ctx, rel)
+	if err != nil {
+		return nil, err
+	}
+	children := make([]ChildRef, 0, len(names))
+	for _, name := range names {
+		childRel := filepath.Join(rel, name)
+		children = append(children, ChildRef{Name: name, Identity: fakeSnapshotIdentity(childRel)})
+	}
+	return children, nil
+}
+
+func (d *topologyFakeSnapshotDriver) WriteCPUs(ctx context.Context, rel string, expected CgroupIdentity, cpus machine.CPUSet) error {
+	if d.cg.rejectEmptyCPUs && cpus.IsEmpty() {
+		return fmt.Errorf("%w: rel=%q", ErrEmptyCPUSetUnsupported, rel)
+	}
+	current, err := d.StatIdentity(ctx, rel)
+	if err != nil {
+		return err
+	}
+	if current != expected {
+		return ErrCgroupIdentityChanged
+	}
+	err = d.cg.ApplyCPUSet(ctx, rel, &cgcommon.CPUSetData{
+		CPUs:           cpus.String(),
+		WriteEmptyCPUs: cpus.IsEmpty(),
+	})
+	if err != nil {
+		return fmt.Errorf("apply cpuset.cpus=%s @ %s: %w", cpus.String(), rel, err)
+	}
+	return nil
+}
+
+func (d *topologyFakeSnapshotDriver) WriteMems(ctx context.Context, rel string, expected CgroupIdentity, mems string) error {
+	current, err := d.StatIdentity(ctx, rel)
+	if err != nil {
+		return err
+	}
+	if current != expected {
+		return ErrCgroupIdentityChanged
+	}
+	if d.cg.files[rel] == nil {
+		d.cg.files[rel] = make(map[string][]byte)
+	}
+	d.cg.files[rel]["cpuset.mems"] = []byte(mems)
+	return nil
+}
+
+func (d *topologyFakeSnapshotDriver) Classify(err error, _ HierarchyOperation) HierarchyErrorClass {
+	if errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.EBUSY) || errors.Is(err, ErrCgroupIdentityChanged) {
+		return HierarchyErrorStale
+	}
+	return HierarchyErrorInvalid
+}
+
+func (d *topologyFakeSnapshotDriver) Capabilities() HierarchyCapabilities {
+	return HierarchyCapabilities{StableIdentity: true, KernelParentContainment: true}
+}
+
+func fakeSnapshotIdentity(rel string) CgroupIdentity {
+	var inode uint64 = 1
+	for _, value := range []byte(rel) {
+		inode = inode*131 + uint64(value)
+	}
+	return CgroupIdentity{Device: 1, Inode: inode}
+}
+
+func TestVerifyResetConvergenceUsesConfiguredCPUsOnlyForV2EmptyTarget(t *testing.T) {
+	dag, err := BuildDAG([]NodeSpec{{
+		Rel: "primary", Domain: DomainPrimary, Role: TopoNodeRolePrimary,
+		CPUs: machine.NewCPUSet(), Mems: "0", TrustAnchor: true,
+	}})
+	if err != nil {
+		t.Fatalf("BuildDAG() error = %v", err)
+	}
+	state := EntryState{
+		Rel: "primary", Identity: CgroupIdentity{Device: 1, Inode: 1},
+		CPUs: machine.MustParse("0-3"), ConfiguredCPUs: machine.NewCPUSet(),
+	}
+
+	for _, tc := range []struct {
+		name      string
+		caps      HierarchyCapabilities
+		converged bool
+	}{
+		{
+			name:      "v2 empty configured means inherited effective state",
+			caps:      HierarchyCapabilities{EmptyConfiguredCPUSet: true},
+			converged: true,
+		},
+		{
+			name:      "v1 keeps comparing effective state",
+			caps:      HierarchyCapabilities{},
+			converged: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			driver := &resetConvergenceStateDriver{
+				HierarchyDriver: newFakeHierarchyDriver(),
+				states:          map[string]EntryState{"primary": state},
+				capabilities:    tc.caps,
+			}
+			report, err := verifyResetConvergence(
+				context.Background(), driver, NewBudgetTracker(ConvergenceBudget{}),
+				dag, map[string]machine.CPUSet{"primary": machine.NewCPUSet()},
+			)
+			if err != nil {
+				t.Fatalf("verifyResetConvergence() error = %v", err)
+			}
+			if report.FullyConverged != tc.converged {
+				t.Fatalf("FullyConverged = %t, want %t; report=%+v", report.FullyConverged, tc.converged, report)
+			}
+		})
+	}
+}
+
+func TestVerifyResetConvergenceKeepsEffectiveCPUsForNonEmptyTarget(t *testing.T) {
+	dag, err := BuildDAG([]NodeSpec{{
+		Rel: "primary", Domain: DomainPrimary, Role: TopoNodeRolePrimary,
+		CPUs: machine.MustParse("1-2"), Mems: "0", TrustAnchor: true,
+	}})
+	if err != nil {
+		t.Fatalf("BuildDAG() error = %v", err)
+	}
+	driver := &resetConvergenceStateDriver{
+		HierarchyDriver: newFakeHierarchyDriver(),
+		states: map[string]EntryState{"primary": {
+			Rel: "primary", Identity: CgroupIdentity{Device: 1, Inode: 1},
+			CPUs: machine.MustParse("0-3"), ConfiguredCPUs: machine.MustParse("1-2"),
+		}},
+		capabilities: HierarchyCapabilities{EmptyConfiguredCPUSet: true},
+	}
+	report, err := verifyResetConvergence(
+		context.Background(), driver, NewBudgetTracker(ConvergenceBudget{}),
+		dag, map[string]machine.CPUSet{"primary": machine.MustParse("1-2")},
+	)
+	if err != nil {
+		t.Fatalf("verifyResetConvergence() error = %v", err)
+	}
+	if report.FullyConverged || len(report.NonConvergedTargets) != 1 {
+		t.Fatalf("report = %+v, want effective CPU mismatch", report)
+	}
+	if got := report.NonConvergedTargets[0].Observed.String(); got != "0-3" {
+		t.Fatalf("observed CPUs = %q, want effective 0-3", got)
+	}
+}
+
+func TestSafeWriterV2EmptyConfiguredCPUWriteRecordsSuccessfulJournal(t *testing.T) {
+	identity := CgroupIdentity{Device: 1, Inode: 1}
+	driver := &resetConvergenceStateDriver{
+		HierarchyDriver: newFakeHierarchyDriver(),
+		states: map[string]EntryState{"primary": {
+			Rel: "primary", Identity: identity,
+			CPUs: machine.MustParse("0-3"), ConfiguredCPUs: machine.MustParse("0-3"),
+			Mems: "0", ConfiguredMems: "0",
+		}},
+		capabilities: cgroupV2Policy.capabilities(true),
+	}
+	plan := PhasePlan{
+		ConvergenceID: "v2-empty-configured-journal",
+		Kind:          PhaseDrain,
+		Operations: []PlanOperation{{
+			Rel:              "primary",
+			ExpectedIdentity: identity,
+			ExpectedCurrent:  CPUSetTarget{CPUs: machine.MustParse("0-3"), Mems: "0"},
+			Target:           CPUSetTarget{CPUs: machine.NewCPUSet(), Mems: "0"},
+			Direction:        WriteShrink,
+		}},
+	}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	plan.Operations[0].PlanID = plan.PlanID
+	result := &ConvergenceResult{}
+
+	err := newSafeCPUSetWriter(driver, NewBudgetTracker(ConvergenceBudget{}), result).
+		execute(context.Background(), plan)
+	if err != nil {
+		t.Fatalf("execute(empty configured CPUs) error = %v", err)
+	}
+	if result.Applied != 1 || len(result.Journal) != 1 {
+		t.Fatalf("result = %+v, want one applied journal entry", result)
+	}
+	applied := result.Journal[0]
+	if !applied.Observed.CPUs.IsEmpty() || !applied.Target.CPUs.IsEmpty() {
+		t.Fatalf("journal observed/target CPUs = %q/%q, want empty/empty",
+			applied.Observed.CPUs.String(), applied.Target.CPUs.String())
+	}
+	if !roundOutcomeMadeNetProgress(RoundOutcome{Journal: result.Journal}) {
+		t.Fatal("verified empty configured CPU write must count as progress")
+	}
+}
+
+func TestSafeWriterV2ConfiguredClearIgnoresEffectiveChildUnion(t *testing.T) {
+	identity := CgroupIdentity{Device: 1, Inode: 1}
+	childIdentity := CgroupIdentity{Device: 1, Inode: 2}
+	hierarchy := newFakeHierarchyDriver()
+	hierarchy.add("primary", identity, "0-3", "0")
+	hierarchy.add("primary/leaf", childIdentity, "0-3", "0")
+	driver := &resetConvergenceStateDriver{
+		HierarchyDriver: hierarchy,
+		states: map[string]EntryState{
+			"primary": {
+				Rel: "primary", Identity: identity, CPUs: machine.MustParse("0-3"),
+				ConfiguredCPUs: machine.MustParse("0-3"), Mems: "0", ConfiguredMems: "0",
+			},
+			"primary/leaf": {
+				Rel: "primary/leaf", Identity: childIdentity, CPUs: machine.MustParse("0-3"),
+				ConfiguredCPUs: machine.NewCPUSet(), Mems: "0", ConfiguredMems: "0",
+			},
+		},
+		capabilities: cgroupV2Policy.capabilities(true),
+	}
+	plan := PhasePlan{
+		ConvergenceID: "v2-configured-clear-with-effective-child",
+		Kind:          PhaseDrain, Capabilities: cgroupV2Policy.capabilities(true),
+		Operations: []PlanOperation{{
+			Rel: "primary", ExpectedIdentity: identity,
+			ExpectedCurrent: CPUSetTarget{CPUs: machine.MustParse("0-3"), Mems: "0"},
+			Target:          CPUSetTarget{CPUs: machine.NewCPUSet(), Mems: "0"},
+			Direction:       WriteShrink, OwnsMems: true,
+		}},
+	}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	plan.Operations[0].PlanID = plan.PlanID
+
+	result := &ConvergenceResult{}
+	if err := newSafeCPUSetWriter(driver, NewBudgetTracker(ConvergenceBudget{}), result).
+		execute(context.Background(), plan); err != nil {
+		t.Fatalf("execute configured clear with effective child: %v", err)
+	}
+	if got := driver.states["primary"].ConfiguredCPUs; !got.IsEmpty() {
+		t.Fatalf("configured CPUs = %s, want empty", got.String())
+	}
+	if result.Applied != 1 {
+		t.Fatalf("result = %+v, want one applied clear", result)
+	}
+}
+
+func TestSafeWriterV2ConfiguredClearWithMemsShrinkChecksLiveChildMems(t *testing.T) {
+	identity := CgroupIdentity{Device: 1, Inode: 1}
+	childIdentity := CgroupIdentity{Device: 1, Inode: 2}
+	hierarchy := newFakeHierarchyDriver()
+	hierarchy.add("primary", identity, "0-3", "0-1")
+	hierarchy.add("primary/leaf", childIdentity, "0-3", "1")
+	driver := &resetConvergenceStateDriver{
+		HierarchyDriver: hierarchy,
+		states: map[string]EntryState{
+			"primary": {
+				Rel: "primary", Identity: identity, CPUs: machine.MustParse("0-3"),
+				ConfiguredCPUs: machine.NewCPUSet(), Mems: "0-1", ConfiguredMems: "0-1",
+			},
+			"primary/leaf": {
+				Rel: "primary/leaf", Identity: childIdentity, CPUs: machine.MustParse("0-3"),
+				ConfiguredCPUs: machine.NewCPUSet(), Mems: "1", ConfiguredMems: "1",
+			},
+		},
+		capabilities: cgroupV2Policy.capabilities(true),
+	}
+	plan := PhasePlan{
+		ConvergenceID: "v2-configured-clear-mems-shrink",
+		Kind:          PhaseDrain, Capabilities: cgroupV2Policy.capabilities(true),
+		Operations: []PlanOperation{{
+			Rel: "primary", ExpectedIdentity: identity,
+			ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(), Mems: "0-1"},
+			Target:          CPUSetTarget{CPUs: machine.NewCPUSet(), Mems: "0"},
+			Direction:       WriteShrink, OwnsMems: true, WriteMems: true,
+		}},
+	}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	plan.Operations[0].PlanID = plan.PlanID
+
+	err := newSafeCPUSetWriter(driver, NewBudgetTracker(ConvergenceBudget{}), nil).
+		execute(context.Background(), plan)
+	var stale *PlanStaleError
+	if !errors.As(err, &stale) || stale.Resource != "child_union_cpuset.mems" {
+		t.Fatalf("execute() error = %v, want live child mems stale", err)
+	}
+	if got := driver.states["primary"].Mems; got != "0-1" {
+		t.Fatalf("parent mems = %q, want no write", got)
+	}
+}
+
+func TestSafeWriterV2ConfiguredClearWithMemsShrinkValidatesAfterChildWrite(t *testing.T) {
+	parentIdentity := CgroupIdentity{Device: 1, Inode: 1}
+	childIdentity := CgroupIdentity{Device: 1, Inode: 2}
+	hierarchy := newFakeHierarchyDriver()
+	hierarchy.add("primary", parentIdentity, "0-3", "0-1")
+	hierarchy.add("primary/leaf", childIdentity, "0-3", "0-1")
+	driver := &resetConvergenceStateDriver{
+		HierarchyDriver: hierarchy,
+		states: map[string]EntryState{
+			"primary": {
+				Rel: "primary", Identity: parentIdentity, CPUs: machine.MustParse("0-3"),
+				ConfiguredCPUs: machine.NewCPUSet(), Mems: "0-1", ConfiguredMems: "0-1",
+			},
+			"primary/leaf": {
+				Rel: "primary/leaf", Identity: childIdentity, CPUs: machine.MustParse("0-3"),
+				ConfiguredCPUs: machine.NewCPUSet(), Mems: "0-1", ConfiguredMems: "0-1",
+			},
+		},
+		capabilities: cgroupV2Policy.capabilities(true),
+	}
+	plan := PhasePlan{
+		ConvergenceID: "v2-configured-clear-mems-valid-child-first",
+		Kind:          PhaseDrain, Capabilities: cgroupV2Policy.capabilities(true),
+		Operations: []PlanOperation{
+			{
+				Rel: "primary/leaf", ExpectedIdentity: childIdentity,
+				ParentRel: "primary", ExpectedParentIdentity: parentIdentity,
+				ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(), Mems: "0-1"},
+				Target:          CPUSetTarget{CPUs: machine.NewCPUSet(), Mems: "0"},
+				Direction:       WriteShrink, OwnsMems: true, WriteMems: true,
+			},
+			{
+				Rel: "primary", ExpectedIdentity: parentIdentity,
+				ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(), Mems: "0-1"},
+				Target:          CPUSetTarget{CPUs: machine.NewCPUSet(), Mems: "0"},
+				Direction:       WriteShrink, OwnsMems: true, WriteMems: true,
+			},
+		},
+	}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	for i := range plan.Operations {
+		plan.Operations[i].PlanID = plan.PlanID
+	}
+
+	if err := newSafeCPUSetWriter(driver, NewBudgetTracker(ConvergenceBudget{}), nil).
+		execute(context.Background(), plan); err != nil {
+		t.Fatalf("execute() error = %v, want child-first mems shrink success", err)
+	}
+	if got := driver.states["primary"].Mems; got != "0" {
+		t.Fatalf("parent mems = %q, want 0", got)
+	}
+}
+
+func TestSafeWriterV2ConfiguredClearWithMemsGrowChecksLiveParentMems(t *testing.T) {
+	parentIdentity := CgroupIdentity{Device: 1, Inode: 1}
+	childIdentity := CgroupIdentity{Device: 1, Inode: 2}
+	hierarchy := newFakeHierarchyDriver()
+	hierarchy.add("primary", parentIdentity, "0-3", "0")
+	hierarchy.add("primary/leaf", childIdentity, "0-3", "0")
+	driver := &resetConvergenceStateDriver{
+		HierarchyDriver: hierarchy,
+		states: map[string]EntryState{
+			"primary": {
+				Rel: "primary", Identity: parentIdentity, CPUs: machine.MustParse("0-3"),
+				ConfiguredCPUs: machine.NewCPUSet(), Mems: "0", ConfiguredMems: "0",
+			},
+			"primary/leaf": {
+				Rel: "primary/leaf", Identity: childIdentity, CPUs: machine.MustParse("0-3"),
+				ConfiguredCPUs: machine.NewCPUSet(), Mems: "0", ConfiguredMems: "0",
+			},
+		},
+		capabilities: cgroupV2Policy.capabilities(true),
+	}
+	plan := PhasePlan{
+		ConvergenceID: "v2-configured-clear-mems-grow",
+		Kind:          PhaseExpand, Capabilities: cgroupV2Policy.capabilities(true),
+		Operations: []PlanOperation{{
+			Rel: "primary/leaf", ExpectedIdentity: childIdentity,
+			ParentRel: "primary", ExpectedParentIdentity: parentIdentity,
+			ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(), Mems: "0"},
+			Target:          CPUSetTarget{CPUs: machine.NewCPUSet(), Mems: "0-1"},
+			Direction:       WriteGrow, OwnsMems: true, WriteMems: true,
+		}},
+	}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	plan.Operations[0].PlanID = plan.PlanID
+
+	err := newSafeCPUSetWriter(driver, NewBudgetTracker(ConvergenceBudget{}), nil).
+		execute(context.Background(), plan)
+	var stale *PlanStaleError
+	if !errors.As(err, &stale) || stale.Resource != "parent_cpuset.mems" {
+		t.Fatalf("execute() error = %v, want live parent mems stale", err)
+	}
+	if got := driver.states["primary/leaf"].Mems; got != "0" {
+		t.Fatalf("child mems = %q, want no write", got)
+	}
+}
+
+func TestValidateLiveOperationDirectionRejectsMemsDirectionMismatch(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		direction WriteDirection
+		current   string
+		target    string
+	}{
+		{name: "declared grow but mems shrink", direction: WriteGrow, current: "0-1", target: "0"},
+		{name: "declared shrink but mems grow", direction: WriteShrink, current: "0", target: "0-1"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			operation := PlanOperation{
+				Rel:             "root",
+				ExpectedCurrent: CPUSetTarget{CPUs: machine.MustParse("0-1"), Mems: tc.current},
+				Target:          CPUSetTarget{CPUs: machine.MustParse("0-1"), Mems: tc.target},
+				Direction:       tc.direction,
+				OwnsMems:        true,
+				WriteMems:       true,
+			}
+			current := EntryState{CPUs: machine.MustParse("0-1"), Mems: tc.current}
+			var stale *PlanStaleError
+			if err := validateLiveOperationDirection(operation, current, HierarchyCapabilities{}); !errors.As(err, &stale) {
+				t.Fatalf("validateLiveOperationDirection() error = %v, want direction mismatch stale", err)
+			}
+		})
+	}
+}
+
+func TestSafeWriterV2ConfiguredClearWithMemsShrinkRejectsMalformedLiveChildMems(t *testing.T) {
+	identity := CgroupIdentity{Device: 1, Inode: 1}
+	childIdentity := CgroupIdentity{Device: 1, Inode: 2}
+	hierarchy := newFakeHierarchyDriver()
+	hierarchy.add("primary", identity, "0-3", "0-1")
+	hierarchy.add("primary/leaf", childIdentity, "0-3", "0")
+	hierarchy.nodes["primary/leaf"].mems = "bad"
+	driver := &resetConvergenceStateDriver{
+		HierarchyDriver: hierarchy,
+		states: map[string]EntryState{
+			"primary": {
+				Rel: "primary", Identity: identity, CPUs: machine.MustParse("0-3"),
+				ConfiguredCPUs: machine.NewCPUSet(), Mems: "0-1", ConfiguredMems: "0-1",
+			},
+			"primary/leaf": {
+				Rel: "primary/leaf", Identity: childIdentity, CPUs: machine.MustParse("0-3"),
+				ConfiguredCPUs: machine.NewCPUSet(), Mems: "bad", ConfiguredMems: "bad",
+			},
+		},
+		capabilities: cgroupV2Policy.capabilities(true),
+	}
+	plan := PhasePlan{
+		ConvergenceID: "v2-configured-clear-malformed-child-mems",
+		Kind:          PhaseDrain, Capabilities: cgroupV2Policy.capabilities(true),
+		Operations: []PlanOperation{{
+			Rel: "primary", ExpectedIdentity: identity,
+			ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(), Mems: "0-1"},
+			Target:          CPUSetTarget{CPUs: machine.NewCPUSet(), Mems: "0"},
+			Direction:       WriteShrink, OwnsMems: true, WriteMems: true,
+		}},
+	}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	plan.Operations[0].PlanID = plan.PlanID
+
+	err := newSafeCPUSetWriter(driver, NewBudgetTracker(ConvergenceBudget{}), nil).
+		execute(context.Background(), plan)
+	if err == nil {
+		t.Fatal("execute() accepted malformed live child mems")
+	}
+	if got := driver.states["primary"].Mems; got != "0-1" {
+		t.Fatalf("parent mems = %q, want fail-closed before write", got)
+	}
 }
 
 func testCPUDetails() machine.CPUDetails {
@@ -75,14 +627,15 @@ func testCPUDetails() machine.CPUDetails {
 
 func newTopologyFakeCgroup() *topologyFakeCgroup {
 	return &topologyFakeCgroup{
-		version:  cgroupclient.CgroupVersionV1,
-		cpus:     map[string]machine.CPUSet{},
-		children: map[string][]string{},
-		files:    map[string]map[string][]byte{},
-		failRel:  map[string]bool{},
-		applyErr: map[string]error{},
-		readErr:  map[string]error{},
-		listErr:  map[string]error{},
+		version:    cgroupclient.CgroupVersionV1,
+		cpus:       map[string]machine.CPUSet{},
+		identities: map[string]CgroupIdentity{},
+		children:   map[string][]string{},
+		files:      map[string]map[string][]byte{},
+		failRel:    map[string]bool{},
+		applyErr:   map[string]error{},
+		readErr:    map[string]error{},
+		listErr:    map[string]error{},
 	}
 }
 
@@ -166,7 +719,7 @@ func (f *topologyFakeCgroup) ReadCgroupFile(_ context.Context, rel, file string)
 	return nil, nil
 }
 
-func TestApplyDAGDiffResetModeUsesExpandOnlyPath(t *testing.T) {
+func TestTopologyCoordinatorConvergeResetModeUsesExpandOnlyPath(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -180,28 +733,28 @@ func TestApplyDAGDiffResetModeUsesExpandOnlyPath(t *testing.T) {
 
 	cg = newTopologyFakeCgroup()
 	cg.cpus["primary"] = machine.NewCPUSet(0, 1)
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:    dag,
 		Cgroup: cg,
 		Mems:   "0",
-		Mode:   ApplyModeResetExpandOnly,
+		Mode:   ResetModeGuard(),
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff reset mode: %v writes=%#v result=%+v", err, cg.writes, res)
+		t.Fatalf("TopologyCoordinatorConverge reset mode: %v writes=%#v result=%+v", err, cg.writes, res)
 	}
 	if len(cg.writes) == 0 {
 		t.Fatalf("reset mode should perform a write, result=%+v", res)
 	}
-	if !res.FullyConverged {
-		t.Fatalf("FullyConverged = false, report=%+v", res.ConvergenceReport)
+	if !res.Converged {
+		t.Fatalf("Converged = false, report=%+v", res.ConvergenceReport)
 	}
-	want := []cpusetWrite{{rel: "primary", cpus: "2-3", mems: "0"}}
+	want := []cpusetWrite{{rel: "primary", cpus: "2-3"}}
 	if !reflect.DeepEqual(cg.writes, want) {
 		t.Fatalf("writes = %#v, want %#v", cg.writes, want)
 	}
 }
 
-func TestApplyDAGDiffResetModeReportsVerifyMismatch(t *testing.T) {
+func TestTopologyCoordinatorConvergeResetModeReportsVerifyMismatch(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -218,25 +771,186 @@ func TestApplyDAGDiffResetModeReportsVerifyMismatch(t *testing.T) {
 		}
 	}
 
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 		Mems:       "0",
-		Mode:       ApplyModeResetExpandOnly,
+		Mode:       ResetModeGuard(),
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff reset mode: %v writes=%#v result=%+v", err, cg.writes, res)
+		t.Fatalf("TopologyCoordinatorConverge reset mode: %v writes=%#v result=%+v", err, cg.writes, res)
 	}
-	if res.FullyConverged {
-		t.Fatalf("FullyConverged = true, want false")
+	if res.Converged {
+		t.Fatalf("Converged = true, want false")
 	}
 	if got := len(res.ConvergenceReport.NonConvergedTargets); got != 1 {
 		t.Fatalf("non-converged target count = %d, want 1 report=%+v", got, res.ConvergenceReport)
 	}
 }
 
-func TestApplyDAGDiffNormalModeRejectsEmptyCPUDetailsWithoutCgroupIO(t *testing.T) {
+func TestRevalidateGrowAuthorizationRejectsChildGrowOutsideFreshParent(t *testing.T) {
+	t.Parallel()
+
+	dag, err := BuildDAG([]NodeSpec{
+		{Rel: "primary", Role: TopoNodeRolePrimary, Domain: DomainPrimary, CPUs: machine.NewCPUSet(0), ControlledRoot: true, TrustAnchor: true},
+		{Rel: "tiger", Role: TopoNodeRoleReclaimSibling, Domain: DomainReclaim, CPUs: machine.NewCPUSet(1), ControlledRoot: true, TrustAnchor: true},
+	})
+	if err != nil {
+		t.Fatalf("BuildDAG: %v", err)
+	}
+	fresh := planSnapshot(map[string]EntryState{
+		"primary":                    {Identity: CgroupIdentity{Inode: 1}, CPUs: machine.NewCPUSet(), Mems: "0"},
+		"tiger":                      {Identity: CgroupIdentity{Inode: 2}, CPUs: machine.NewCPUSet(0), Mems: "0"},
+		"tiger/http2p.agent.service": {Identity: CgroupIdentity{Inode: 3}, CPUs: machine.NewCPUSet(0), Mems: "0"},
+	}, map[DomainID]machine.CPUSet{
+		DomainPrimary: machine.NewCPUSet(),
+		DomainReclaim: machine.NewCPUSet(0),
+	})
+	fresh.Children = map[string][]ChildRef{"tiger": {{Name: "http2p.agent.service"}}}
+	fresh.DomainByRel = map[string]DomainID{
+		"primary": DomainPrimary, "tiger": DomainReclaim, "tiger/http2p.agent.service": DomainReclaim,
+	}
+
+	round := &coordinatorRound{
+		dag:         dag,
+		targetByRel: map[string]machine.CPUSet{"primary": machine.NewCPUSet(), "tiger": machine.NewCPUSet(1)},
+		cpuDetails:  machine.CPUDetails{0: {NUMANodeID: 0}, 1: {NUMANodeID: 0}},
+		budget:      NewBudgetTracker(ConvergenceBudget{}),
+		snapshotSource: func(context.Context) (*CompleteSnapshot, error) {
+			return fresh, nil
+		},
+	}
+	plan := PhasePlan{
+		ConvergenceID: "test-convergence",
+		Base:          fresh,
+		Witnesses:     nil,
+		TargetByRel: map[string]CPUSetTarget{
+			"tiger":                      {CPUs: machine.NewCPUSet(1), Mems: "0"},
+			"tiger/http2p.agent.service": {CPUs: machine.NewCPUSet(1), Mems: "0"},
+		},
+		Operations: []PlanOperation{{
+			Rel:       "tiger/http2p.agent.service",
+			ParentRel: "tiger",
+			ExpectedCurrent: CPUSetTarget{
+				CPUs: machine.NewCPUSet(0),
+				Mems: "0",
+			},
+			Target:    CPUSetTarget{CPUs: machine.NewCPUSet(1), Mems: "0"},
+			Direction: WriteGrow,
+		}},
+	}
+
+	err = round.revalidateGrowAuthorization(context.Background(), plan)
+	var stale *PlanStaleError
+	if !errors.As(err, &stale) {
+		t.Fatalf("revalidateGrowAuthorization error = %v, want PlanStaleError", err)
+	}
+	if stale.Rel != "tiger/http2p.agent.service" || stale.Resource != "parent_cpuset" {
+		t.Fatalf("stale error = %+v, want child parent_cpuset stale", stale)
+	}
+}
+
+func TestTopologyCoordinatorConvergeResetModeDeadlineDurationExpiresBeforeWrite_BitsUT(t *testing.T) {
+	dag, err := BuildDAG([]NodeSpec{
+		{Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(2, 3), Mems: "0"},
+	})
+	if err != nil {
+		t.Fatalf("BuildDAG: %v", err)
+	}
+	cg := newTopologyFakeCgroup()
+	cg.cpus["primary"] = machine.NewCPUSet(0, 1)
+
+	oldNow := coordinatorNow
+	coordinatorNow = func() time.Time { return time.Now().Add(-time.Second) }
+	defer func() { coordinatorNow = oldNow }()
+
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
+		DAG:    dag,
+		Cgroup: cg,
+		Mems:   "0",
+		Mode:   ResetModeGuard(),
+		Budget: ConvergenceBudget{
+			DeadlineDuration: time.Nanosecond,
+		},
+	})
+	if !errors.Is(err, ErrConvergenceDeadlineExceeded) {
+		t.Fatalf("Converge error = %v, want ErrConvergenceDeadlineExceeded; result=%+v", err, res)
+	}
+	if cg.reads != 0 || len(cg.writes) != 0 {
+		t.Fatalf("expired reset deadline must fail before hierarchy I/O, reads=%d writes=%#v", cg.reads, cg.writes)
+	}
+}
+
+func TestVerifyResetConvergenceDeadlineExpiresBeforeRead_BitsUT(t *testing.T) {
+	t.Parallel()
+
+	dag, err := BuildDAG([]NodeSpec{
+		{Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(2, 3), Mems: "0"},
+	})
+	if err != nil {
+		t.Fatalf("BuildDAG: %v", err)
+	}
+	driver := newFakeHierarchyDriver()
+	driver.add("primary", CgroupIdentity{Device: 1, Inode: 1}, "2-3", "0")
+	budget := NewBudgetTracker(ConvergenceBudget{
+		MaxHierarchyIOOperations: 10,
+		Deadline:                 time.Now().Add(-time.Second),
+	})
+
+	report, err := verifyResetConvergence(context.Background(), driver, budget, dag, desiredTargets(dag))
+	if !errors.Is(err, ErrConvergenceDeadlineExceeded) {
+		t.Fatalf("verifyResetConvergence error = %v, want ErrConvergenceDeadlineExceeded; report=%+v", err, report)
+	}
+	if driver.calls != 0 {
+		t.Fatalf("expired verify deadline must fail before validation read, calls=%d", driver.calls)
+	}
+}
+
+func TestTopologyCoordinatorConvergeResetModePreservesPropagateErrorAfterReclaimNUMABucketRetrySuccess(t *testing.T) {
+	t.Parallel()
+
+	dag, err := BuildDAG([]NodeSpec{
+		{Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1), Mems: "0"},
+		{Rel: "kubesandbox", Role: TopoNodeRoleReclaim, CPUs: machine.NewCPUSet(2, 3), Mems: "0"},
+		{Rel: "kubesandbox/reclaimed-0", ParentRel: "kubesandbox", Role: TopoNodeRoleReclaimNUMABucket, CPUs: machine.NewCPUSet(2, 3), Mems: "0", Metadata: map[string]string{"numa": "0"}},
+	})
+	if err != nil {
+		t.Fatalf("BuildDAG: %v", err)
+	}
+	cg := newTopologyFakeCgroup()
+	cg.cpus["primary"] = machine.NewCPUSet(0, 1)
+	cg.cpus["primary/child-a"] = machine.NewCPUSet(0, 1)
+	cg.cpus["kubesandbox"] = machine.NewCPUSet(2, 3)
+	cg.cpus["kubesandbox/reclaimed-0"] = machine.NewCPUSet(2, 3)
+	cg.children["primary"] = []string{"child-a"}
+	cg.children["kubesandbox"] = []string{"reclaimed-0"}
+	cg.failRel["primary/child-a"] = true
+
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
+		DAG:    dag,
+		Cgroup: cg,
+		Mems:   "0",
+		Mode:   ResetModeGuard(),
+	})
+	if err == nil {
+		t.Fatalf("expected propagate error to survive later reclaim NUMA bucket retry success; result=%+v writes=%#v", res, cg.writes)
+	}
+	if !strings.Contains(err.Error(), "primary/child-a") {
+		t.Fatalf("error = %v, want earlier propagate child failure; writes=%#v", err, cg.writes)
+	}
+	var bucketWrites int
+	for _, write := range cg.writes {
+		if write.rel == "kubesandbox/reclaimed-0" {
+			bucketWrites++
+		}
+	}
+	if bucketWrites == 0 {
+		t.Fatalf("expected successful later reclaim NUMA bucket write, writes=%#v", cg.writes)
+	}
+}
+
+func TestTopologyCoordinatorConvergeNormalModeRejectsEmptyCPUDetailsWithoutCgroupIO(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -247,10 +961,10 @@ func TestApplyDAGDiffNormalModeRejectsEmptyCPUDetailsWithoutCgroupIO(t *testing.
 	}
 	cg := newTopologyFakeCgroup()
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:    dag,
 		Cgroup: cg,
-		Mode:   ApplyModeNormalAdjustment,
+		Mode:   NormalModeGuard(),
 	})
 	if err == nil || !strings.Contains(err.Error(), "empty CPUDetails") {
 		t.Fatalf("expected empty CPUDetails error, got %v", err)
@@ -260,7 +974,7 @@ func TestApplyDAGDiffNormalModeRejectsEmptyCPUDetailsWithoutCgroupIO(t *testing.
 	}
 }
 
-func TestApplyDAGDiffBridgesDisjointReplacement(t *testing.T) {
+func TestTopologyCoordinatorConvergeBridgesDisjointReplacement(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -275,7 +989,7 @@ func TestApplyDAGDiffBridgesDisjointReplacement(t *testing.T) {
 	cg.cpus["reclaim/numa-0"] = machine.NewCPUSet(0, 1)
 	cg.children["reclaim"] = []string{"numa-0"}
 
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
@@ -285,18 +999,17 @@ func TestApplyDAGDiffBridgesDisjointReplacement(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v writes=%#v result=%+v", err, cg.writes, res)
+		t.Fatalf("TopologyCoordinatorConverge: %v writes=%#v result=%+v", err, cg.writes, res)
 	}
-	want := []cpusetWrite{
-		{rel: "reclaim/numa-0", cpus: "2-3", mems: "0"},
-		{rel: "reclaim", cpus: "2-3", mems: "0"},
+	if got, want := cg.cpus["reclaim"], machine.NewCPUSet(2, 3); !got.Equals(want) {
+		t.Fatalf("reclaim cpuset = %s, want terminal target %s (writes=%#v result=%+v)", got.String(), want.String(), cg.writes, res)
 	}
-	if !reflect.DeepEqual(cg.writes, want) {
-		t.Fatalf("writes = %#v, want %#v (result=%+v)", cg.writes, want, res)
+	if got, want := cg.cpus["reclaim/numa-0"], machine.NewCPUSet(2, 3); !got.Equals(want) {
+		t.Fatalf("bucket cpuset = %s, want terminal target %s (writes=%#v result=%+v)", got.String(), want.String(), cg.writes, res)
 	}
 }
 
-func TestApplyDAGDiffShrinksIntersectionBeforeExpandingOverlapReplacement(t *testing.T) {
+func TestTopologyCoordinatorConvergeShrinksIntersectionBeforeExpandingOverlapReplacement(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -308,7 +1021,7 @@ func TestApplyDAGDiffShrinksIntersectionBeforeExpandingOverlapReplacement(t *tes
 	cg := newTopologyFakeCgroup()
 	cg.cpus["primary"] = machine.NewCPUSet(0, 1, 2)
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:                  dag,
 		Cgroup:               cg,
 		CPUDetails:           testCPUDetails(),
@@ -316,15 +1029,23 @@ func TestApplyDAGDiffShrinksIntersectionBeforeExpandingOverlapReplacement(t *tes
 		KubeManagedRelPrefix: "kubepods",
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v", err)
+		t.Fatalf("TopologyCoordinatorConverge: %v", err)
 	}
-	want := []cpusetWrite{{rel: "primary", cpus: "1-3", mems: "0"}}
-	if !reflect.DeepEqual(cg.writes, want) {
-		t.Fatalf("writes = %#v, want %#v", cg.writes, want)
+	if got, want := cg.cpus["primary"], machine.NewCPUSet(1, 2, 3); !got.Equals(want) {
+		t.Fatalf("primary cpuset = %s, want terminal target %s; writes=%#v", got.String(), want.String(), cg.writes)
+	}
+	for _, write := range cg.writes {
+		cpus, parseErr := machine.Parse(write.cpus)
+		if parseErr != nil {
+			t.Fatalf("parse write %#v: %v", write, parseErr)
+		}
+		if !cpus.IsSubsetOf(machine.NewCPUSet(0, 1, 2, 3)) {
+			t.Fatalf("write escaped observed/desired envelope: %#v", write)
+		}
 	}
 }
 
-func TestApplyDAGDiffShrinksBeforeExpands(t *testing.T) {
+func TestTopologyCoordinatorConvergeShrinksBeforeExpands(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -338,13 +1059,13 @@ func TestApplyDAGDiffShrinksBeforeExpands(t *testing.T) {
 	cg.cpus["domain-a"] = machine.NewCPUSet(0, 1)
 	cg.cpus["domain-b"] = machine.NewCPUSet(2)
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v", err)
+		t.Fatalf("TopologyCoordinatorConverge: %v", err)
 	}
 	want := []cpusetWrite{
 		{rel: "domain-a", cpus: "0"},
@@ -355,7 +1076,7 @@ func TestApplyDAGDiffShrinksBeforeExpands(t *testing.T) {
 	}
 }
 
-func TestApplyDAGDiffPreShrinksSiblingMovesBeforeTargetGrow(t *testing.T) {
+func TestTopologyCoordinatorConvergePreShrinksSiblingMovesBeforeTargetGrow(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -377,30 +1098,24 @@ func TestApplyDAGDiffPreShrinksSiblingMovesBeforeTargetGrow(t *testing.T) {
 		}
 	}
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v; writes=%#v", err, cg.writes)
+		t.Fatalf("TopologyCoordinatorConverge: %v; writes=%#v", err, cg.writes)
 	}
 
-	wantPrefix := []cpusetWrite{
-		{rel: "kubesandbox", cpus: "3-5"},
-		{rel: "kubepods", cpus: "0-2"},
-		{rel: "kubesandbox", cpus: "3-5,99"},
-		{rel: "kubepods", cpus: "0-2,6"},
+	if got, want := cg.cpus["kubepods"], machine.NewCPUSet(0, 1, 2, 6); !got.Equals(want) {
+		t.Fatalf("primary cpuset = %s, want terminal target %s; writes=%#v", got.String(), want.String(), cg.writes)
 	}
-	if len(cg.writes) < len(wantPrefix) {
-		t.Fatalf("writes = %#v, want prefix %#v", cg.writes, wantPrefix)
-	}
-	if !reflect.DeepEqual(cg.writes[:len(wantPrefix)], wantPrefix) {
-		t.Fatalf("writes = %#v, want prefix %#v", cg.writes, wantPrefix)
+	if got, want := cg.cpus["kubesandbox"], machine.NewCPUSet(3, 4, 5); !got.Equals(want) {
+		t.Fatalf("reclaim cpuset = %s, want machine-envelope target %s; writes=%#v", got.String(), want.String(), cg.writes)
 	}
 }
 
-func TestApplyDAGDiffRecomputesBridgeAfterSiblingPreShrink(t *testing.T) {
+func TestTopologyCoordinatorConvergeExpandPreservesObservedUntilFinalConvergence(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -424,22 +1139,27 @@ func TestApplyDAGDiffRecomputesBridgeAfterSiblingPreShrink(t *testing.T) {
 		}
 	}
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v; writes=%#v", err, cg.writes)
+		t.Fatalf("TopologyCoordinatorConverge: %v; writes=%#v", err, cg.writes)
 	}
+	var primaryWrites []string
 	for _, w := range cg.writes {
-		if w.rel == "kubepods" && strings.Contains(w.cpus, "99") {
-			t.Fatalf("bridged primary should not re-add CPU 99 after pre-shrink; writes=%#v", cg.writes)
+		if w.rel == "kubepods" {
+			primaryWrites = append(primaryWrites, w.cpus)
 		}
+	}
+	if got, want := primaryWrites, []string{"0", "0,6", "6"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("primary writes = %#v, want non-empty drain/bridge/final sequence %#v; writes=%#v",
+			got, want, cg.writes)
 	}
 }
 
-func TestApplyDAGDiffWithCPUDetailsUsesDomainPipelineForCrossDomainTransfer(t *testing.T) {
+func TestTopologyCoordinatorConvergeWithCPUDetailsUsesDomainPipelineForCrossDomainTransfer(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -453,7 +1173,7 @@ func TestApplyDAGDiffWithCPUDetailsUsesDomainPipelineForCrossDomainTransfer(t *t
 	cg.cpus["kubepods"] = machine.NewCPUSet(0)
 	cg.cpus["kubesandbox"] = machine.NewCPUSet(1, 2)
 
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:    dag,
 		Cgroup: cg,
 		Mems:   "0",
@@ -464,21 +1184,93 @@ func TestApplyDAGDiffWithCPUDetailsUsesDomainPipelineForCrossDomainTransfer(t *t
 		},
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v result=%+v writes=%#v", err, res, cg.writes)
+		t.Fatalf("TopologyCoordinatorConverge: %v result=%+v writes=%#v", err, res, cg.writes)
 	}
 	wantWrites := []cpusetWrite{
-		{rel: "kubesandbox", cpus: "2", mems: "0"},
-		{rel: "kubepods", cpus: "0-1", mems: "0"},
+		{rel: "kubesandbox", cpus: "2"},
+		{rel: "kubepods", cpus: "0-1"},
 	}
 	if !reflect.DeepEqual(cg.writes, wantWrites) {
 		t.Fatalf("writes = %#v, want %#v", cg.writes, wantWrites)
 	}
-	if !res.FullyConverged {
-		t.Fatalf("FullyConverged = false, report=%+v", res.ConvergenceReport)
+	if !res.Converged {
+		t.Fatalf("Converged = false, report=%+v", res.ConvergenceReport)
 	}
 }
 
-func TestApplyDAGDiffReportsNotFullyConvergedWhenObservedTargetDiffers(t *testing.T) {
+func TestTopologyCoordinatorConvergeAccumulatesSnapshotBudgetAcrossRounds(t *testing.T) {
+	t.Parallel()
+
+	dag, err := BuildDAG([]NodeSpec{{
+		Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0), Mems: "0",
+	}})
+	if err != nil {
+		t.Fatalf("BuildDAG: %v", err)
+	}
+	cg := newTopologyFakeCgroup()
+	cg.cpus["primary"] = machine.NewCPUSet(0)
+	for i := 0; i < 2000; i++ {
+		name := fmt.Sprintf("child-%04d", i)
+		rel := filepath.Join("primary", name)
+		cg.children["primary"] = append(cg.children["primary"], name)
+		cg.cpus[rel] = machine.NewCPUSet(0)
+	}
+
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
+		DAG:        dag,
+		Cgroup:     cg,
+		Mems:       "0",
+		CPUDetails: testCPUDetails(),
+		Budget: ConvergenceBudget{
+			MaxHierarchyIOOperations: 16384,
+		},
+	})
+	if !errors.Is(err, ErrHierarchyIOOperationBudgetExceeded) {
+		t.Fatalf("TopologyCoordinatorConverge error = %v, want cumulative hierarchy I/O budget failure; result=%+v", err, res)
+	}
+	if cg.snapshotRootReads < 2 {
+		t.Fatalf("snapshot root reads = %d, want budget exhaustion in a later snapshot round", cg.snapshotRootReads)
+	}
+	if len(cg.writes) != 0 {
+		t.Fatalf("budget exhaustion must fail closed before hierarchy mutation, writes=%#v", cg.writes)
+	}
+}
+
+func TestTopologyCoordinatorConvergeFailsClosedOnSnapshotDepthLimit(t *testing.T) {
+	t.Parallel()
+
+	dag, err := BuildDAG([]NodeSpec{{
+		Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0), Mems: "0",
+	}})
+	if err != nil {
+		t.Fatalf("BuildDAG: %v", err)
+	}
+	cg := newTopologyFakeCgroup()
+	cg.cpus["primary"] = machine.NewCPUSet(0)
+	parent := "primary"
+	for depth := 2; depth <= 17; depth++ {
+		name := fmt.Sprintf("level-%02d", depth)
+		rel := filepath.Join(parent, name)
+		cg.children[parent] = []string{name}
+		cg.cpus[rel] = machine.NewCPUSet(0)
+		parent = rel
+	}
+
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
+		DAG:        dag,
+		Cgroup:     cg,
+		Mems:       "0",
+		CPUDetails: testCPUDetails(),
+	})
+	if !errors.Is(err, ErrHierarchyDepthBudget) {
+		t.Fatalf("TopologyCoordinatorConverge error = %v, want hierarchy depth budget failure; result=%+v", err, res)
+	}
+	if len(cg.writes) != 0 {
+		t.Fatalf("incomplete snapshot must fail closed before hierarchy mutation, writes=%#v", cg.writes)
+	}
+}
+
+func TestTopologyCoordinatorConvergeReportsNotConvergedWhenObservedTargetDiffers(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -495,7 +1287,7 @@ func TestApplyDAGDiffReportsNotFullyConvergedWhenObservedTargetDiffers(t *testin
 		}
 	}
 
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:    dag,
 		Cgroup: cg,
 		Mems:   "0",
@@ -503,23 +1295,123 @@ func TestApplyDAGDiffReportsNotFullyConvergedWhenObservedTargetDiffers(t *testin
 			0: {NUMANodeID: 0},
 			1: {NUMANodeID: 0},
 		},
+		Budget: ConvergenceBudget{MaxRounds: 3},
 	})
-	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v result=%+v writes=%#v", err, res, cg.writes)
+	if !errors.Is(err, ErrRoundBudgetExceeded) {
+		t.Fatalf("TopologyCoordinatorConverge error = %T %v, want round budget exhaustion; result=%+v writes=%#v",
+			err, err, res, cg.writes)
 	}
-	if res.FullyConverged {
-		t.Fatalf("FullyConverged = true, want false")
+	if res.Converged {
+		t.Fatalf("Converged = true, want false")
 	}
-	if got := len(res.ConvergenceReport.NonConvergedTargets); got != 1 {
-		t.Fatalf("non-converged target count = %d, want 1 report=%+v", got, res.ConvergenceReport)
+	if res.State != ConvergenceStateNonConverged {
+		t.Fatalf("State = %s, want non-converged; result=%+v", res.State, res)
 	}
-	mismatch := res.ConvergenceReport.NonConvergedTargets[0]
-	if mismatch.Rel != "kubepods" || mismatch.Reason != convergenceReasonTargetMismatch {
-		t.Fatalf("mismatch = %+v, want rel=kubepods reason=%s", mismatch, convergenceReasonTargetMismatch)
+	if got := len(res.Rounds); got != 3 {
+		t.Fatalf("rounds = %d, want all three budgeted stale rounds; result=%+v", got, res)
 	}
 }
 
-func TestApplyDAGDiffGuardsSiblingGrowWhenSourceShrinkFails(t *testing.T) {
+func TestTopologyCoordinatorConvergeReplansAfterCPUWriteEBUSY(t *testing.T) {
+	t.Parallel()
+
+	dag, err := BuildDAG([]NodeSpec{{
+		Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1), Mems: "0",
+	}})
+	if err != nil {
+		t.Fatalf("BuildDAG: %v", err)
+	}
+	cg := newTopologyFakeCgroup()
+	cg.cpus["primary"] = machine.NewCPUSet(0)
+	cg.applyErr["primary"] = syscall.EBUSY
+	attempts := 0
+	cg.onApply = func(rel string, _ *cgcommon.CPUSetData) {
+		if rel != "primary" {
+			return
+		}
+		attempts++
+		if attempts > 1 {
+			delete(cg.applyErr, rel)
+		}
+	}
+
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
+		DAG: dag, Cgroup: cg, Mems: "0", CPUDetails: machine.CPUDetails{0: {}, 1: {}},
+	})
+	if err != nil {
+		t.Fatalf("Converge after transient EBUSY: %v; result=%+v", err, res)
+	}
+	if !res.Converged || attempts != 2 {
+		t.Fatalf("result=%+v attempts=%d, want convergence after one stale replan", res, attempts)
+	}
+	if got := len(res.Rounds); got < 2 || res.Rounds[0].Status != RoundStatusStale {
+		t.Fatalf("rounds=%+v, want first EBUSY round stale followed by recovery", res.Rounds)
+	}
+}
+
+func TestTopologyCoordinatorConvergePersistentCPUWriteEBUSYUsesRoundBudget(t *testing.T) {
+	t.Parallel()
+
+	dag, err := BuildDAG([]NodeSpec{{
+		Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1), Mems: "0",
+	}})
+	if err != nil {
+		t.Fatalf("BuildDAG: %v", err)
+	}
+	cg := newTopologyFakeCgroup()
+	cg.cpus["primary"] = machine.NewCPUSet(0)
+	cg.applyErr["primary"] = syscall.EBUSY
+	attempts := 0
+	cg.onApply = func(rel string, _ *cgcommon.CPUSetData) {
+		if rel == "primary" {
+			attempts++
+		}
+	}
+
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
+		DAG: dag, Cgroup: cg, Mems: "0", CPUDetails: machine.CPUDetails{0: {}, 1: {}},
+		Budget: ConvergenceBudget{MaxRounds: 3},
+	})
+	if !errors.Is(err, ErrRoundBudgetExceeded) {
+		t.Fatalf("Converge error=%T %v, want round budget exhaustion; result=%+v", err, err, res)
+	}
+	if res.State != ConvergenceStateNonConverged || attempts != 3 || len(res.Rounds) != 3 {
+		t.Fatalf("result=%+v attempts=%d, want retries constrained by the three-round budget", res, attempts)
+	}
+}
+
+func TestTopologyCoordinatorConvergeDoesNotRetryInvalidCPUWriteError(t *testing.T) {
+	t.Parallel()
+
+	dag, err := BuildDAG([]NodeSpec{{
+		Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1), Mems: "0",
+	}})
+	if err != nil {
+		t.Fatalf("BuildDAG: %v", err)
+	}
+	cg := newTopologyFakeCgroup()
+	cg.cpus["primary"] = machine.NewCPUSet(0)
+	cg.applyErr["primary"] = syscall.EACCES
+	attempts := 0
+	cg.onApply = func(rel string, _ *cgcommon.CPUSetData) {
+		if rel == "primary" {
+			attempts++
+		}
+	}
+
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
+		DAG: dag, Cgroup: cg, Mems: "0", CPUDetails: machine.CPUDetails{0: {}, 1: {}},
+	})
+	if !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("Converge error=%T %v, want original EACCES; result=%+v", err, err, res)
+	}
+	var stale *PlanStaleError
+	if errors.As(err, &stale) || attempts != 1 || len(res.Rounds) != 0 {
+		t.Fatalf("error=%v attempts=%d rounds=%+v, want invalid failure without retry", err, attempts, res.Rounds)
+	}
+}
+
+func TestTopologyCoordinatorConvergeGuardsSiblingGrowWhenSourceShrinkFails(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -542,7 +1434,7 @@ func TestApplyDAGDiffGuardsSiblingGrowWhenSourceShrinkFails(t *testing.T) {
 		}
 	}
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
@@ -557,7 +1449,7 @@ func TestApplyDAGDiffGuardsSiblingGrowWhenSourceShrinkFails(t *testing.T) {
 	}
 }
 
-func TestApplyDAGDiffPreShrinksReclaimBeforePendingPrimaryGrow(t *testing.T) {
+func TestTopologyCoordinatorConvergePreShrinksReclaimBeforePendingPrimaryGrow(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -579,14 +1471,17 @@ func TestApplyDAGDiffPreShrinksReclaimBeforePendingPrimaryGrow(t *testing.T) {
 		}
 	}
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:                    dag,
 		Cgroup:                 cg,
 		CPUDetails:             testCPUDetails(),
 		ProtectedPendingCPUSet: machine.NewCPUSet(6),
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v; writes=%#v", err, cg.writes)
+		t.Fatalf("TopologyCoordinatorConverge: %v; writes=%#v", err, cg.writes)
+	}
+	if !res.Converged {
+		t.Fatalf("Converged = false, state=%s report=%+v writes=%#v", res.State, res.ConvergenceReport, cg.writes)
 	}
 
 	wantPrefix := []cpusetWrite{
@@ -601,66 +1496,152 @@ func TestApplyDAGDiffPreShrinksReclaimBeforePendingPrimaryGrow(t *testing.T) {
 	}
 }
 
-func TestApplyDAGDiffDoesNotWriteEmptyV1PreShrinkOrGrowFailedCPU(t *testing.T) {
+func TestTopologyCoordinatorConvergePreShrinksReclaimSiblingBeforePendingPrimaryGrow(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
-		{Rel: "kubepods", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet()},
-		{Rel: "kubesandbox", Role: TopoNodeRoleReclaim, CPUs: machine.NewCPUSet(6)},
+		{Rel: "kubepods", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1, 2)},
+		{Rel: "kubesandbox", Role: TopoNodeRoleReclaim, CPUs: machine.NewCPUSet(3, 4, 5)},
+		{Rel: "aa", Role: TopoNodeRoleReclaimSibling, CPUs: machine.NewCPUSet(3, 4, 5, 6)},
 	})
 	if err != nil {
 		t.Fatalf("BuildDAG: %v", err)
 	}
 
 	cg := newTopologyFakeCgroup()
-	cg.cpus["kubepods"] = machine.NewCPUSet(6)
-	cg.cpus["kubesandbox"] = machine.NewCPUSet()
+	cg.cpus["kubepods"] = machine.NewCPUSet(0, 1, 2)
+	cg.cpus["kubesandbox"] = machine.NewCPUSet(3, 4, 5)
+	cg.cpus["aa"] = machine.NewCPUSet(3, 4, 5, 6)
 	cg.afterApply = func(rel string, data *cgcommon.CPUSetData) {
-		if data.CPUs == "" {
-			t.Fatalf("cgroup v1 should not write empty cpuset; rel=%s writes=%#v", rel, cg.writes)
-		}
-		if overlap := cg.cpus["kubepods"].Intersection(cg.cpus["kubesandbox"]); !overlap.IsEmpty() {
-			t.Fatalf("destination must not grow before source releases CPUs; overlap=%s writes=%#v", overlap.String(), cg.writes)
+		overlap := cg.cpus["kubepods"].Intersection(cg.cpus["aa"])
+		if !overlap.IsEmpty() {
+			t.Fatalf("overlap after write rel=%s cpus=%s: kubepods=%s aa=%s overlap=%s writes=%#v",
+				rel, data.CPUs, cg.cpus["kubepods"].String(), cg.cpus["aa"].String(), overlap.String(), cg.writes)
 		}
 	}
 
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
-		DAG:        dag,
-		Cgroup:     cg,
-		CPUDetails: testCPUDetails(),
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
+		DAG:                    dag,
+		Cgroup:                 cg,
+		CPUDetails:             testCPUDetails(),
+		ProtectedPendingCPUSet: machine.NewCPUSet(6),
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff should skip unsafe empty v1 pre-shrink without failing: %v; writes=%#v", err, cg.writes)
+		t.Fatalf("TopologyCoordinatorConverge: %v; writes=%#v", err, cg.writes)
 	}
-	if len(cg.writes) != 0 {
-		t.Fatalf("normal pipeline must not grow reclaim before the empty v1 primary source can release CPU 6, got writes=%#v", cg.writes)
+	if !res.Converged {
+		t.Fatalf("Converged = false, state=%s report=%+v writes=%#v", res.State, res.ConvergenceReport, cg.writes)
 	}
-	if res.FullyConverged {
-		t.Fatalf("ApplyDAGDiff reported full convergence while CPU 6 is still owned by primary")
+
+	wantPrefix := []cpusetWrite{
+		{rel: "aa", cpus: "3-5"},
+		{rel: "kubepods", cpus: "0-2,6"},
+	}
+	if len(cg.writes) < len(wantPrefix) {
+		t.Fatalf("writes = %#v, want prefix %#v", cg.writes, wantPrefix)
+	}
+	if !reflect.DeepEqual(cg.writes[:len(wantPrefix)], wantPrefix) {
+		t.Fatalf("writes = %#v, want prefix %#v", cg.writes, wantPrefix)
 	}
 }
 
-func TestApplyDAGDiffValidationAndFailurePaths(t *testing.T) {
+func TestTopologyCoordinatorRepairsReclaimNUMABucketOverlapToDisjointTargets(t *testing.T) {
 	t.Parallel()
 
-	if _, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{}); err == nil {
+	dag, err := BuildDAG([]NodeSpec{
+		{Rel: "kubesandbox", Role: TopoNodeRoleReclaim, CPUs: machine.NewCPUSet(0, 1), Mems: "0-1"},
+		{
+			Rel:       "kubesandbox/reclaimed-0",
+			ParentRel: "kubesandbox",
+			Role:      TopoNodeRoleReclaimNUMABucket,
+			CPUs:      machine.NewCPUSet(0),
+			Mems:      "0",
+			Constraint: TopologyConstraint{
+				CPUUpperBound: machine.NewCPUSet(0),
+				Scope:         TopologyScopeNUMANode,
+			},
+			Metadata: map[string]string{"numa": "0"},
+		},
+		{
+			Rel:       "kubesandbox/reclaimed-1",
+			ParentRel: "kubesandbox",
+			Role:      TopoNodeRoleReclaimNUMABucket,
+			CPUs:      machine.NewCPUSet(1),
+			Mems:      "1",
+			Constraint: TopologyConstraint{
+				CPUUpperBound: machine.NewCPUSet(1),
+				Scope:         TopologyScopeNUMANode,
+			},
+			Metadata: map[string]string{"numa": "1"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildDAG: %v", err)
+	}
+
+	cg := newTopologyFakeCgroup()
+	cg.rejectEmptyCPUs = true
+	cg.enforceParentContainsTarget = true
+	cg.cpus["kubesandbox"] = machine.NewCPUSet(0)
+	cg.cpus["kubesandbox/reclaimed-0"] = machine.NewCPUSet(0)
+	cg.cpus["kubesandbox/reclaimed-1"] = machine.NewCPUSet(0)
+	cg.files["kubesandbox"] = map[string][]byte{"cpuset.mems": []byte("0-1")}
+	cg.files["kubesandbox/reclaimed-0"] = map[string][]byte{"cpuset.mems": []byte("0")}
+	cg.files["kubesandbox/reclaimed-1"] = map[string][]byte{"cpuset.mems": []byte("1")}
+	cg.children["kubesandbox"] = []string{"reclaimed-0", "reclaimed-1"}
+
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
+		DAG:        dag,
+		Cgroup:     cg,
+		Mems:       "0-1",
+		CPUDetails: machine.CPUDetails{0: {NUMANodeID: 0}, 1: {NUMANodeID: 1}},
+		ExpectedCPUSetByRel: map[string]machine.CPUSet{
+			"kubesandbox":             machine.NewCPUSet(0, 1),
+			"kubesandbox/reclaimed-0": machine.NewCPUSet(0),
+			"kubesandbox/reclaimed-1": machine.NewCPUSet(1),
+		},
+		Budget: ConvergenceBudget{
+			MaxRounds: 8,
+		},
+	})
+	if err != nil {
+		t.Fatalf("TopologyCoordinatorConverge: %v; result=%+v writes=%#v", err, res, cg.writes)
+	}
+	if got := cg.cpus["kubesandbox/reclaimed-0"]; !got.Equals(machine.NewCPUSet(0)) {
+		t.Fatalf("reclaimed-0 cpuset = %s, want 0; writes=%#v", got.String(), cg.writes)
+	}
+	if got := cg.cpus["kubesandbox/reclaimed-1"]; !got.Equals(machine.NewCPUSet(1)) {
+		t.Fatalf("reclaimed-1 cpuset = %s, want 1; writes=%#v", got.String(), cg.writes)
+	}
+	if got := cg.cpus["kubesandbox"]; !got.Equals(machine.NewCPUSet(0, 1)) {
+		t.Fatalf("kubesandbox cpuset = %s, want 0-1; writes=%#v", got.String(), cg.writes)
+	}
+	if overlap := cg.cpus["kubesandbox/reclaimed-0"].Intersection(cg.cpus["kubesandbox/reclaimed-1"]); !overlap.IsEmpty() {
+		t.Fatalf("reclaim NUMA buckets overlap: %s; writes=%#v", overlap.String(), cg.writes)
+	}
+}
+
+func TestTopologyCoordinatorConvergeValidationAndFailurePaths(t *testing.T) {
+	t.Parallel()
+
+	if _, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{}); err == nil {
 		t.Fatalf("expected nil DAG error")
 	}
 	dag, err := BuildDAG([]NodeSpec{{Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0)}})
 	if err != nil {
 		t.Fatalf("BuildDAG: %v", err)
 	}
-	if _, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{DAG: dag}); err == nil {
+	if _, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{DAG: dag}); err == nil {
 		t.Fatalf("expected nil cgroup error")
 	}
 
 	cg := newTopologyFakeCgroup()
 	cg.failRel["primary"] = true
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
-		Mode:       ApplyModeResetExpandOnly,
+		Mode:       ResetModeGuard(),
 	})
 	if err == nil {
 		t.Fatalf("expected apply error")
@@ -670,7 +1651,7 @@ func TestApplyDAGDiffValidationAndFailurePaths(t *testing.T) {
 	}
 }
 
-func TestApplyDAGDiffExpandsUnmanagedDescendants(t *testing.T) {
+func TestTopologyCoordinatorConvergeExpandsUnmanagedDescendants(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1)}})
@@ -682,23 +1663,23 @@ func TestApplyDAGDiffExpandsUnmanagedDescendants(t *testing.T) {
 	cg.children["primary"] = []string{"burstable"}
 	cg.children["primary/burstable"] = []string{"pod"}
 
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v", err)
+		t.Fatalf("TopologyCoordinatorConverge: %v", err)
 	}
 	if res.Applied == 0 {
 		t.Fatalf("expected descendant writes, got %+v", res)
 	}
-	if got := cg.cpus["primary/burstable/pod"].String(); got != "" {
-		t.Fatalf("unmanaged leaf cpuset = %s, want unchanged empty; writes=%#v", got, cg.writes)
+	if got := cg.cpus["primary/burstable/pod"].String(); got != "0-1" {
+		t.Fatalf("planned dynamic leaf cpuset = %s, want parent target 0-1; writes=%#v", got, cg.writes)
 	}
 }
 
-func TestApplyDAGDiffExpandsEmptyTargetsToUnmanagedDescendantsV2(t *testing.T) {
+func TestTopologyCoordinatorConvergeExpandsEmptyTargetsToUnmanagedDescendantsV2(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet()}})
@@ -715,17 +1696,17 @@ func TestApplyDAGDiffExpandsEmptyTargetsToUnmanagedDescendantsV2(t *testing.T) {
 	cg.children["primary/burstable"] = []string{"pod-a"}
 	cg.children["primary/burstable/pod-a"] = []string{"container-a"}
 
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
-		Mode:       ApplyModeResetExpandOnly,
+		Mode:       ResetModeGuard(),
 		ExpectedCPUSetByRel: map[string]machine.CPUSet{
 			"primary/burstable/pod-a/container-a": machine.NewCPUSet(0),
 		},
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v", err)
+		t.Fatalf("TopologyCoordinatorConverge: %v", err)
 	}
 	if res.Applied == 0 {
 		t.Fatalf("expected empty target writes, got %+v", res)
@@ -744,7 +1725,7 @@ func TestApplyDAGDiffExpandsEmptyTargetsToUnmanagedDescendantsV2(t *testing.T) {
 	}
 }
 
-func TestApplyDAGDiffExpandsEmptyTargetsWithProtectKubeLeafV2(t *testing.T) {
+func TestTopologyCoordinatorConvergeExpandsEmptyTargetsWithProtectKubeLeafV2(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{Rel: "kubepods", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet()}})
@@ -761,14 +1742,14 @@ func TestApplyDAGDiffExpandsEmptyTargetsWithProtectKubeLeafV2(t *testing.T) {
 	cg.children["kubepods/burstable"] = []string{"pod-a"}
 	cg.children["kubepods/burstable/pod-a"] = []string{"container-a"}
 
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
-		Mode:       ApplyModeResetExpandOnly,
+		Mode:       ResetModeGuard(),
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v", err)
+		t.Fatalf("TopologyCoordinatorConverge: %v", err)
 	}
 	if res.Applied == 0 {
 		t.Fatalf("expected empty target writes with protect enabled, got %+v", res)
@@ -786,7 +1767,7 @@ func TestApplyDAGDiffExpandsEmptyTargetsWithProtectKubeLeafV2(t *testing.T) {
 	}
 }
 
-func TestApplyDAGDiffSkipsEmptyTargetsV1(t *testing.T) {
+func TestTopologyCoordinatorConvergeSkipsEmptyTargetsV1(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet()}})
@@ -795,23 +1776,23 @@ func TestApplyDAGDiffSkipsEmptyTargetsV1(t *testing.T) {
 	}
 	cg := newTopologyFakeCgroup()
 
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v", err)
+		t.Fatalf("TopologyCoordinatorConverge: %v", err)
 	}
 	if len(cg.writes) != 0 {
 		t.Fatalf("empty v1 target should not be written, got %#v", cg.writes)
 	}
-	if res.Skipped == 0 {
-		t.Fatalf("expected skipped count, got %+v", res)
+	if res.Skipped != 0 || res.Attempted != 0 {
+		t.Fatalf("unchanged empty v1 target should need no operation, got %+v", res)
 	}
 }
 
-func TestApplyDAGDiffConvergesExistingKubeLeavesBeforePrimaryShrink(t *testing.T) {
+func TestTopologyCoordinatorConvergeConvergesExistingKubeLeavesBeforePrimaryShrink(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -832,13 +1813,13 @@ func TestApplyDAGDiffConvergesExistingKubeLeavesBeforePrimaryShrink(t *testing.T
 	cg.children["kubepods/burstable"] = []string{"pod-abc"}
 	cg.children["kubepods/burstable/pod-abc"] = []string{"container-a"}
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v; writes=%#v", err, cg.writes)
+		t.Fatalf("TopologyCoordinatorConverge: %v; writes=%#v", err, cg.writes)
 	}
 	for _, rel := range []string{
 		"kubepods",
@@ -855,7 +1836,7 @@ func TestApplyDAGDiffConvergesExistingKubeLeavesBeforePrimaryShrink(t *testing.T
 	}
 }
 
-func TestApplyDAGDiffExpandsKubeIntermediateBeforeConvergingLiveLeaves(t *testing.T) {
+func TestTopologyCoordinatorConvergeExpandsKubeIntermediateBeforeConvergingLiveLeaves(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -877,13 +1858,13 @@ func TestApplyDAGDiffExpandsKubeIntermediateBeforeConvergingLiveLeaves(t *testin
 	cg.children["kubepods/burstable/pod-abc"] = []string{"container-a"}
 	cg.files["kubepods/burstable/pod-abc/container-a"] = map[string][]byte{"tasks": []byte("123\n")}
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v; writes=%#v", err, cg.writes)
+		t.Fatalf("TopologyCoordinatorConverge: %v; writes=%#v", err, cg.writes)
 	}
 	if got := cg.cpus["kubepods"].String(); got != "1-3" {
 		t.Fatalf("primary cpuset = %s, want 1-3; writes=%#v", got, cg.writes)
@@ -893,13 +1874,13 @@ func TestApplyDAGDiffExpandsKubeIntermediateBeforeConvergingLiveLeaves(t *testin
 		"kubepods/burstable/pod-abc",
 		"kubepods/burstable/pod-abc/container-a",
 	} {
-		if got := cg.cpus[rel].String(); got != "1" {
-			t.Fatalf("unmanaged descendant cpuset @ %s = %s, want unchanged 1; writes=%#v", rel, got, cg.writes)
+		if got := cg.cpus[rel].String(); got != "1-3" {
+			t.Fatalf("planned dynamic descendant cpuset @ %s = %s, want 1-3; writes=%#v", rel, got, cg.writes)
 		}
 	}
 }
 
-func TestApplyDAGDiffConvergesUnmanagedKubePodLeaf(t *testing.T) {
+func TestTopologyCoordinatorConvergePlansKubePodLeafInImmediateExpandClosure(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{Rel: "kubepods", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1)}})
@@ -913,19 +1894,19 @@ func TestApplyDAGDiffConvergesUnmanagedKubePodLeaf(t *testing.T) {
 	cg.children["kubepods/burstable"] = []string{"pod-abc"}
 	cg.children["kubepods/burstable/pod-abc"] = []string{"container-a"}
 
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v", err)
+		t.Fatalf("TopologyCoordinatorConverge: %v", err)
 	}
 	if got := cg.cpus["kubepods"].String(); got != "0-1" {
 		t.Fatalf("primary target = %s, want 0-1 without unmanaged leaf widening; writes=%#v", got, cg.writes)
 	}
-	if got := cg.cpus["kubepods/burstable/pod-abc/container-a"].String(); got != "5-6" {
-		t.Fatalf("unmanaged leaf cpuset = %s, want unchanged 5-6; writes=%#v", got, cg.writes)
+	if got := cg.cpus["kubepods/burstable/pod-abc/container-a"].String(); got != "0-1" {
+		t.Fatalf("dynamic leaf cpuset = %s, want controlled closure target 0-1; writes=%#v", got, cg.writes)
 	}
 	wroteLeaf := false
 	for _, w := range cg.writes {
@@ -933,13 +1914,13 @@ func TestApplyDAGDiffConvergesUnmanagedKubePodLeaf(t *testing.T) {
 			wroteLeaf = true
 		}
 	}
-	if wroteLeaf {
-		t.Fatalf("unmanaged leaf should not be written by the domain pipeline; writes=%#v", cg.writes)
+	if !wroteLeaf {
+		t.Fatalf("dynamic leaf must be an explicit plan member; writes=%#v", cg.writes)
 	}
 	_ = res
 }
 
-func TestApplyDAGDiffConvergesUnmanagedKubePauseLeaf(t *testing.T) {
+func TestTopologyCoordinatorConvergePlansKubePauseLeafInImmediateExpandClosure(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{Rel: "kubepods", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1)}})
@@ -952,19 +1933,19 @@ func TestApplyDAGDiffConvergesUnmanagedKubePauseLeaf(t *testing.T) {
 	cg.children["kubepods"] = []string{"besteffort"}
 	cg.children["kubepods/besteffort"] = []string{"pod-abc"}
 
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v", err)
+		t.Fatalf("TopologyCoordinatorConverge: %v", err)
 	}
 	if got := cg.cpus["kubepods"].String(); got != "0-1" {
 		t.Fatalf("primary target = %s, want 0-1 without unmanaged pause widening; writes=%#v", got, cg.writes)
 	}
-	if got := cg.cpus["kubepods/besteffort/pod-abc"].String(); got != "5-6" {
-		t.Fatalf("unmanaged pause leaf cpuset = %s, want unchanged 5-6; writes=%#v", got, cg.writes)
+	if got := cg.cpus["kubepods/besteffort/pod-abc"].String(); got != "0-1" {
+		t.Fatalf("dynamic pause leaf cpuset = %s, want controlled closure target 0-1; writes=%#v", got, cg.writes)
 	}
 	wroteLeaf := false
 	for _, w := range cg.writes {
@@ -972,16 +1953,16 @@ func TestApplyDAGDiffConvergesUnmanagedKubePauseLeaf(t *testing.T) {
 			wroteLeaf = true
 		}
 	}
-	if wroteLeaf {
-		t.Fatalf("unmanaged pause leaf should not be written; writes=%#v", cg.writes)
+	if !wroteLeaf {
+		t.Fatalf("dynamic pause leaf must be an explicit plan member; writes=%#v", cg.writes)
 	}
 	_ = res
 }
 
-// TestApplyDAGDiffProtectStillWritesExpectedLeaf verifies protection does not
+// TestTopologyCoordinatorConvergeProtectStillWritesExpectedLeaf verifies protection does not
 // suppress writes for container leaves that ARE present in ExpectedCPUSetByRel:
 // those still get their resolved allocation enforced.
-func TestApplyDAGDiffProtectStillWritesExpectedLeaf(t *testing.T) {
+func TestTopologyCoordinatorConvergeProtectStillWritesExpectedLeaf(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{Rel: "kubepods", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1, 2)}})
@@ -997,7 +1978,7 @@ func TestApplyDAGDiffProtectStillWritesExpectedLeaf(t *testing.T) {
 	cg.children["kubepods/burstable"] = []string{"pod-abc"}
 	cg.children["kubepods/burstable/pod-abc"] = []string{"container-a"}
 
-	if _, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	if _, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
@@ -1005,22 +1986,22 @@ func TestApplyDAGDiffProtectStillWritesExpectedLeaf(t *testing.T) {
 			"kubepods/burstable/pod-abc/container-a": machine.NewCPUSet(1, 2),
 		},
 	}); err != nil {
-		t.Fatalf("ApplyDAGDiff: %v", err)
+		t.Fatalf("TopologyCoordinatorConverge: %v", err)
 	}
-	if got := cg.cpus["kubepods/burstable/pod-abc/container-a"].String(); got != "0" {
-		t.Fatalf("unmanaged expected leaf cpuset = %s, want unchanged 0; writes=%#v", got, cg.writes)
+	if got := cg.cpus["kubepods/burstable/pod-abc/container-a"].String(); got != "1-2" {
+		t.Fatalf("explicit expected leaf cpuset = %s, want 1-2; writes=%#v", got, cg.writes)
 	}
 	for _, rel := range []string{"kubepods/burstable", "kubepods/burstable/pod-abc"} {
-		if got := cg.cpus[rel].String(); got != "0" {
-			t.Fatalf("unmanaged intermediate %s cpuset = %s, want unchanged 0; writes=%#v", rel, got, cg.writes)
+		if got := cg.cpus[rel].String(); got != "0-2" {
+			t.Fatalf("planned intermediate %s cpuset = %s, want parent envelope 0-2; writes=%#v", rel, got, cg.writes)
 		}
 	}
 }
 
-// TestApplyDAGDiffReleasesUnmanagedLeafWithoutProtect verifies the reset/widen
+// TestTopologyCoordinatorConvergeReleasesUnmanagedLeafWithoutProtect verifies the reset/widen
 // path (protection disabled) still propagates the parent target onto an
 // unmanaged leaf, which is how a polluted leaf recovers back to a wide cpuset.
-func TestApplyDAGDiffReleasesUnmanagedLeafWithoutProtect(t *testing.T) {
+func TestTopologyCoordinatorConvergeReleasesUnmanagedLeafWithoutProtect(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{Rel: "kubepods", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6)}})
@@ -1034,78 +2015,19 @@ func TestApplyDAGDiffReleasesUnmanagedLeafWithoutProtect(t *testing.T) {
 	cg.children["kubepods/burstable"] = []string{"pod-abc"}
 	cg.children["kubepods/burstable/pod-abc"] = []string{"container-a"}
 
-	if _, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	if _, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 	}); err != nil {
-		t.Fatalf("ApplyDAGDiff: %v", err)
+		t.Fatalf("TopologyCoordinatorConverge: %v", err)
 	}
-	if got := cg.cpus["kubepods/burstable/pod-abc/container-a"].String(); got != "5" {
-		t.Fatalf("unmanaged leaf cpuset = %s, want unchanged 5; writes=%#v", got, cg.writes)
-	}
-}
-
-func TestApplyDAGDiffConvergesLiveDisjointChildBeforeParentShrink(t *testing.T) {
-	t.Parallel()
-
-	dag, err := BuildDAG([]NodeSpec{{Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1), Mems: "0"}})
-	if err != nil {
-		t.Fatalf("BuildDAG: %v", err)
-	}
-	cg := newTopologyFakeCgroup()
-	cg.cpus["primary"] = machine.NewCPUSet(0, 1, 2, 3)
-	// A live child sits on a cpuset disjoint from the new parent target {0,1}.
-	// Direct descendant convergence first parks it inside the parent target, so
-	// the parent can shrink without relying on kube-specific path parsing.
-	cg.cpus["primary/pod-x"] = machine.NewCPUSet(7, 8)
-	cg.children["primary"] = []string{"pod-x"}
-	cg.files["primary/pod-x"] = map[string][]byte{"tasks": []byte("123\n")}
-
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
-		DAG:        dag,
-		Cgroup:     cg,
-		CPUDetails: testCPUDetails(),
-		Mems:       "0",
-	})
-	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v; writes=%#v", err, cg.writes)
-	}
-	if got := cg.cpus["primary/pod-x"].String(); got != "0-1" {
-		t.Fatalf("child cpuset = %s, want 0-1; writes=%#v", got, cg.writes)
+	if got := cg.cpus["kubepods/burstable/pod-abc/container-a"].String(); got != "0-6" {
+		t.Fatalf("planned dynamic leaf cpuset = %s, want parent target 0-6; writes=%#v", got, cg.writes)
 	}
 }
 
-func TestApplyDAGDiffParksEmptyDisjointChildBeforeParentShrink(t *testing.T) {
-	t.Parallel()
-
-	dag, err := BuildDAG([]NodeSpec{{Rel: "kubesandbox", Role: TopoNodeRoleReclaim, CPUs: machine.NewCPUSet(2, 3), Mems: "0"}})
-	if err != nil {
-		t.Fatalf("BuildDAG: %v", err)
-	}
-	cg := newTopologyFakeCgroup()
-	cg.cpus["kubesandbox"] = machine.NewCPUSet(2, 3, 4, 5)
-	cg.cpus["kubesandbox/reclaimed-0"] = machine.NewCPUSet(4, 5)
-	cg.children["kubesandbox"] = []string{"reclaimed-0"}
-
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
-		DAG:        dag,
-		Cgroup:     cg,
-		CPUDetails: testCPUDetails(),
-		Mems:       "0",
-	})
-	if err != nil {
-		t.Fatalf("empty disjoint child should be parked before parent shrink; err=%v writes=%#v", err, cg.writes)
-	}
-	if got := cg.cpus["kubesandbox/reclaimed-0"].String(); got != "2-3" {
-		t.Fatalf("stale child cpuset = %s, want parked inside parent 2-3; writes=%#v", got, cg.writes)
-	}
-	if got := cg.cpus["kubesandbox"].String(); got != "2-3" {
-		t.Fatalf("parent cpuset = %s, want 2-3; writes=%#v", got, cg.writes)
-	}
-}
-
-func TestApplyDAGDiffShrinkFallbackRelistsLiveChildrenAfterCacheMiss(t *testing.T) {
+func TestTopologyCoordinatorConvergeShrinkFallbackRelistsLiveChildrenAfterCacheMiss(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1), Mems: "0"}})
@@ -1125,7 +2047,7 @@ func TestApplyDAGDiffShrinkFallbackRelistsLiveChildrenAfterCacheMiss(t *testing.
 		cg.cpus["primary/late-child"] = machine.NewCPUSet(0, 1, 2, 3)
 	}
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
@@ -1142,7 +2064,7 @@ func TestApplyDAGDiffShrinkFallbackRelistsLiveChildrenAfterCacheMiss(t *testing.
 	}
 }
 
-func TestApplyDAGDiffConvergesExpectedLeafCurrent(t *testing.T) {
+func TestTopologyCoordinatorConvergePlansExpectedLeafTarget(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{Rel: "kubepods", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(1, 2)}})
@@ -1156,7 +2078,7 @@ func TestApplyDAGDiffConvergesExpectedLeafCurrent(t *testing.T) {
 	cg.children["kubepods/burstable"] = []string{"pod-abc"}
 	cg.children["kubepods/burstable/pod-abc"] = []string{"container-a"}
 
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
@@ -1165,13 +2087,13 @@ func TestApplyDAGDiffConvergesExpectedLeafCurrent(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v", err)
+		t.Fatalf("TopologyCoordinatorConverge: %v", err)
 	}
 	if got := cg.cpus["kubepods"].String(); got != "1-2" {
 		t.Fatalf("primary effective target = %s, want 1-2; writes=%#v", got, cg.writes)
 	}
-	if got := cg.cpus["kubepods/burstable/pod-abc/container-a"].String(); got != "3-4" {
-		t.Fatalf("unmanaged expected leaf cpuset = %s, want unchanged 3-4; writes=%#v", got, cg.writes)
+	if got := cg.cpus["kubepods/burstable/pod-abc/container-a"].String(); got != "1-2" {
+		t.Fatalf("expected leaf cpuset = %s, want planned target 1-2; writes=%#v", got, cg.writes)
 	}
 	_ = res
 }
@@ -1192,11 +2114,11 @@ func TestComputeEffectiveTargetsDoesNotProtectPodParentOrSandboxFullCPUSet(t *te
 	}
 }
 
-// TestApplyDAGDiffWidensPrimaryEffectiveTargetForPendingAllocation verifies that
+// TestTopologyCoordinatorConvergeWidensPrimaryEffectiveTargetForPendingAllocation verifies that
 // an admit-window container (allocation known, no cgroup leaf yet) folded in via
 // ProtectedPendingCPUSet also widens the primary effective target, so the parent
 // never shrinks below an allocation that is about to materialize.
-func TestApplyDAGDiffWidensPrimaryEffectiveTargetForPendingAllocation(t *testing.T) {
+func TestTopologyCoordinatorConvergeWidensPrimaryEffectiveTargetForPendingAllocation(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{Rel: "kubepods", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(1, 2)}})
@@ -1206,14 +2128,14 @@ func TestApplyDAGDiffWidensPrimaryEffectiveTargetForPendingAllocation(t *testing
 	cg := newTopologyFakeCgroup()
 	cg.cpus["kubepods"] = machine.NewCPUSet(1, 2, 9)
 
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:                    dag,
 		Cgroup:                 cg,
 		CPUDetails:             testCPUDetails(),
 		ProtectedPendingCPUSet: machine.NewCPUSet(9),
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v", err)
+		t.Fatalf("TopologyCoordinatorConverge: %v", err)
 	}
 	if got := cg.cpus["kubepods"].String(); got != "1-2,9" {
 		t.Fatalf("primary effective target = %s, want 1-2,9 (pending folded in); writes=%#v", got, cg.writes)
@@ -1221,11 +2143,11 @@ func TestApplyDAGDiffWidensPrimaryEffectiveTargetForPendingAllocation(t *testing
 	_ = res
 }
 
-// TestApplyDAGDiffDeductsPrimaryEffectiveCPUsFromReclaim verifies that boundary
+// TestTopologyCoordinatorConvergeDeductsPrimaryEffectiveCPUsFromReclaim verifies that boundary
 // CPUs held by the primary effective target are removed from reclaim targets
 // before applying, keeping partitions disjoint without rejecting a recoverable
 // transient overlap.
-func TestApplyDAGDiffConvergesExpectedLeafWithoutDeductingReclaim(t *testing.T) {
+func TestTopologyCoordinatorConvergeConvergesExpectedLeafWithoutDeductingReclaim(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -1245,7 +2167,7 @@ func TestApplyDAGDiffConvergesExpectedLeafWithoutDeductingReclaim(t *testing.T) 
 	cg.children["kubepods/burstable"] = []string{"pod-abc"}
 	cg.children["kubepods/burstable/pod-abc"] = []string{"container-a"}
 
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
@@ -1254,20 +2176,20 @@ func TestApplyDAGDiffConvergesExpectedLeafWithoutDeductingReclaim(t *testing.T) 
 		},
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v; writes=%#v", err, cg.writes)
+		t.Fatalf("TopologyCoordinatorConverge: %v; writes=%#v", err, cg.writes)
 	}
 	if got := cg.cpus["kubepods"].String(); got != "1-2" {
 		t.Fatalf("primary target = %s, want 1-2; writes=%#v", got, cg.writes)
 	}
-	if got := cg.cpus["reclaim"].String(); got != "4-5" {
-		t.Fatalf("reclaim target = %s, want 4-5 until a fresh snapshot confirms CPU 3 is released; writes=%#v", got, cg.writes)
+	if got := cg.cpus["reclaim"].String(); got != "3-5" {
+		t.Fatalf("reclaim target = %s, want final desired 3-5 after witness; writes=%#v", got, cg.writes)
 	}
-	if res.FullyConverged {
-		t.Fatalf("ApplyDAGDiff reported full convergence before reclaim reacquired CPU 3")
+	if !res.Converged {
+		t.Fatalf("TopologyCoordinatorConverge did not report final convergence: %+v", res.ConvergenceReport)
 	}
 }
 
-func TestApplyDAGDiffPropagatesProtectedRelToPrimaryAndDeductsReclaim(t *testing.T) {
+func TestTopologyCoordinatorConvergePropagatesProtectedRelToPrimaryAndDeductsReclaim(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -1291,7 +2213,7 @@ func TestApplyDAGDiffPropagatesProtectedRelToPrimaryAndDeductsReclaim(t *testing
 	}
 }
 
-func TestApplyDAGDiffDoesNotGrowPrimaryWhileReclaimDrainDeferred(t *testing.T) {
+func TestTopologyCoordinatorConvergeRejectsReclaimBucketOutsideParentMemsEnvelope(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -1309,27 +2231,21 @@ func TestApplyDAGDiffDoesNotGrowPrimaryWhileReclaimDrainDeferred(t *testing.T) {
 	cg.cpus["kubesandbox/reclaimed-1"] = machine.NewCPUSet(1)
 	cg.children["kubesandbox"] = []string{"reclaimed-1"}
 
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 		Mems:       "0",
 	})
-	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v; writes=%#v", err, cg.writes)
+	if !errors.Is(err, ErrInvalidReclaimBucketTarget) {
+		t.Fatalf("TopologyCoordinatorConverge error = %v, want %v", err, ErrInvalidReclaimBucketTarget)
 	}
-	if got := cg.cpus["kubesandbox/reclaimed-1"]; !got.Equals(machine.NewCPUSet(1)) {
-		t.Fatalf("reclaim child cpuset = %s, want still holding CPU 1 for deferred drain", got.String())
-	}
-	if got := cg.cpus["kubepods"]; !got.Equals(machine.NewCPUSet(0)) {
-		t.Fatalf("primary cpuset = %s, want unchanged 0 while reclaim still owns CPU 1; result=%+v writes=%#v", got.String(), res, cg.writes)
-	}
-	if res.Deferred != 0 {
-		t.Fatalf("result.Deferred = %d, want no defer while gate filters unreleased CPU; writes=%#v", res.Deferred, cg.writes)
+	if len(cg.writes) != 0 {
+		t.Fatalf("out-of-envelope desired state must fail before writes, got %#v", cg.writes)
 	}
 }
 
-func TestApplyDAGDiffWritesEmptyCPUSetOnCgroupV2(t *testing.T) {
+func TestTopologyCoordinatorConvergeWritesEmptyCPUSetOnCgroupV2(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -1342,13 +2258,13 @@ func TestApplyDAGDiffWritesEmptyCPUSetOnCgroupV2(t *testing.T) {
 	cg.version = cgroupclient.CgroupVersionV2
 	cg.cpus["kubepods"] = machine.NewCPUSet(0, 1)
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v; writes=%#v", err, cg.writes)
+		t.Fatalf("TopologyCoordinatorConverge: %v; writes=%#v", err, cg.writes)
 	}
 	if len(cg.writes) != 1 {
 		t.Fatalf("writes = %#v, want one empty cpuset write", cg.writes)
@@ -1359,7 +2275,7 @@ func TestApplyDAGDiffWritesEmptyCPUSetOnCgroupV2(t *testing.T) {
 	}
 }
 
-func TestApplyDAGDiffAllowsReclaimNUMABucketDisjointReplacementWhenParentContainsTarget(t *testing.T) {
+func TestTopologyCoordinatorConvergeAllowsReclaimNUMABucketDisjointReplacementWhenParentContainsTarget(t *testing.T) {
 	t.Parallel()
 
 	parentCPUs := machine.NewCPUSet(42, 43, 44, 45, 46, 47, 95, 96, 138, 139, 140, 141, 142, 143, 144, 191)
@@ -1379,13 +2295,13 @@ func TestApplyDAGDiffAllowsReclaimNUMABucketDisjointReplacementWhenParentContain
 	cg.cpus["kubesandbox/numa1"] = numa0CPUs.Clone()
 	cg.children["kubesandbox"] = []string{"numa0", "numa1"}
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v; writes=%#v", err, cg.writes)
+		t.Fatalf("TopologyCoordinatorConverge: %v; writes=%#v", err, cg.writes)
 	}
 	if got := cg.cpus["kubesandbox/numa1"].String(); got != numa1CPUs.String() {
 		t.Fatalf("numa1 target = %s, want %s; writes=%#v", got, numa1CPUs.String(), cg.writes)
@@ -1395,7 +2311,7 @@ func TestApplyDAGDiffAllowsReclaimNUMABucketDisjointReplacementWhenParentContain
 	}
 }
 
-func TestApplyDAGDiffRejectsReclaimNUMABucketDisjointReplacementWithoutReclaimParent(t *testing.T) {
+func TestTopologyCoordinatorConvergeRejectsReclaimNUMABucketDisjointReplacementWithoutReclaimParent(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -1407,7 +2323,7 @@ func TestApplyDAGDiffRejectsReclaimNUMABucketDisjointReplacementWithoutReclaimPa
 	cg := newTopologyFakeCgroup()
 	cg.cpus["kubesandbox/numa1"] = machine.NewCPUSet(1, 2)
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
@@ -1420,7 +2336,7 @@ func TestApplyDAGDiffRejectsReclaimNUMABucketDisjointReplacementWithoutReclaimPa
 	}
 }
 
-func TestApplyDAGDiffRejectsReclaimNUMABucketSiblingOverlap(t *testing.T) {
+func TestTopologyCoordinatorConvergeRejectsReclaimNUMABucketSiblingOverlap(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -1436,7 +2352,7 @@ func TestApplyDAGDiffRejectsReclaimNUMABucketSiblingOverlap(t *testing.T) {
 	cg.cpus["kubesandbox/numa0"] = machine.NewCPUSet(1, 2)
 	cg.cpus["kubesandbox/numa1"] = machine.NewCPUSet(3)
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
@@ -1449,7 +2365,7 @@ func TestApplyDAGDiffRejectsReclaimNUMABucketSiblingOverlap(t *testing.T) {
 	}
 }
 
-func TestApplyDAGDiffRejectsReclaimNUMABucketOutsideNUMA(t *testing.T) {
+func TestTopologyCoordinatorConvergeRejectsReclaimNUMABucketOutsideNUMA(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -1467,7 +2383,7 @@ func TestApplyDAGDiffRejectsReclaimNUMABucketOutsideNUMA(t *testing.T) {
 	}
 	cg := newTopologyFakeCgroup()
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:    dag,
 		Cgroup: cg,
 		CPUDetails: machine.CPUDetails{
@@ -1483,7 +2399,7 @@ func TestApplyDAGDiffRejectsReclaimNUMABucketOutsideNUMA(t *testing.T) {
 	}
 }
 
-func TestApplyDAGDiffWidensReclaimParentToContainNUMABucket(t *testing.T) {
+func TestTopologyCoordinatorConvergeWidensReclaimParentToContainNUMABucket(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -1498,24 +2414,24 @@ func TestApplyDAGDiffWidensReclaimParentToContainNUMABucket(t *testing.T) {
 	cg.cpus["kubesandbox/numa0"] = machine.NewCPUSet(1)
 	cg.children["kubesandbox"] = []string{"numa0"}
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v; writes=%#v", err, cg.writes)
+		t.Fatalf("TopologyCoordinatorConverge: %v; writes=%#v", err, cg.writes)
 	}
 	if got := cg.cpus["kubesandbox"].String(); got != "1-2" {
 		t.Fatalf("reclaim parent target = %s, want 1-2 containing bucket; writes=%#v", got, cg.writes)
 	}
 }
 
-// TestApplyDAGDiffShrinkBlockerCurrentOutsideReason verifies the
+// TestTopologyCoordinatorConvergeShrinkBlockerCurrentOutsideReason verifies the
 // current_outside_parent reason: a child whose cpuset overlaps but is not fully
 // inside the new parent target (and has no expected entry) is reported with the
 // current_outside_parent reason rather than being mislabeled expected_outside.
-func TestApplyDAGDiffShrinkBlockerCurrentOutsideReason(t *testing.T) {
+func TestTopologyCoordinatorConvergeShrinkBlockerCurrentOutsideReason(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1), Mems: "0"}})
@@ -1530,7 +2446,7 @@ func TestApplyDAGDiffShrinkBlockerCurrentOutsideReason(t *testing.T) {
 	// force the child clamp to fail so the blocker diagnostics are produced.
 	cg.failRel["primary/pod-y"] = true
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
@@ -1544,7 +2460,7 @@ func TestApplyDAGDiffShrinkBlockerCurrentOutsideReason(t *testing.T) {
 	}
 }
 
-func TestApplyDAGDiffReportsNonStaleShrinkBlockers(t *testing.T) {
+func TestTopologyCoordinatorConvergeReportsNonStaleShrinkBlockers(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{Rel: "system", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1), Mems: "0"}})
@@ -1557,7 +2473,7 @@ func TestApplyDAGDiffReportsNonStaleShrinkBlockers(t *testing.T) {
 	cg.children["system"] = []string{"legacy"}
 	cg.failRel["system/legacy"] = true
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
@@ -1573,7 +2489,7 @@ func TestApplyDAGDiffReportsNonStaleShrinkBlockers(t *testing.T) {
 	}
 }
 
-func TestApplyDAGDiffReturnsErrorWhenKubePodLeafConvergeFailsDuringShrink(t *testing.T) {
+func TestTopologyCoordinatorConvergeReturnsErrorWhenKubePodLeafConvergeFailsDuringShrink(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{Rel: "kubepods", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1), Mems: "0"}})
@@ -1588,7 +2504,7 @@ func TestApplyDAGDiffReturnsErrorWhenKubePodLeafConvergeFailsDuringShrink(t *tes
 	cg.failRel["kubepods/podabc123"] = true
 	cg.failRel["kubepods/poddef456"] = true
 
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
@@ -1605,7 +2521,7 @@ func TestApplyDAGDiffReturnsErrorWhenKubePodLeafConvergeFailsDuringShrink(t *tes
 	}
 }
 
-func TestApplyDAGDiffConvergesStaleResidualWithoutDeductingReclaim(t *testing.T) {
+func TestTopologyCoordinatorConvergeConvergesStaleResidualWithoutDeductingReclaim(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -1621,14 +2537,14 @@ func TestApplyDAGDiffConvergesStaleResidualWithoutDeductingReclaim(t *testing.T)
 	cg.cpus["kubesandbox"] = machine.NewCPUSet(2, 3)
 	cg.children["kubepods"] = []string{"podabc123"}
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 		Mems:       "0",
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v; writes=%#v", err, cg.writes)
+		t.Fatalf("TopologyCoordinatorConverge: %v; writes=%#v", err, cg.writes)
 	}
 	if got := cg.cpus["kubepods"].String(); got != "0-1" {
 		t.Fatalf("primary target = %s, want 0-1; writes=%#v", got, cg.writes)
@@ -1641,7 +2557,7 @@ func TestApplyDAGDiffConvergesStaleResidualWithoutDeductingReclaim(t *testing.T)
 	}
 }
 
-func TestApplyDAGDiffDoesNotWidenEmptyPrimaryTargetForStaleResidualOnCgroupV2(t *testing.T) {
+func TestTopologyCoordinatorConvergeDoesNotWidenEmptyPrimaryTargetForStaleResidualOnCgroupV2(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{Rel: "kubepods", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(), Mems: "0"}})
@@ -1654,21 +2570,21 @@ func TestApplyDAGDiffDoesNotWidenEmptyPrimaryTargetForStaleResidualOnCgroupV2(t 
 	cg.cpus["kubepods/podabc123"] = machine.NewCPUSet(1, 2)
 	cg.children["kubepods"] = []string{"podabc123"}
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 		Mems:       "0",
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v; writes=%#v", err, cg.writes)
+		t.Fatalf("TopologyCoordinatorConverge: %v; writes=%#v", err, cg.writes)
 	}
 	if got := cg.cpus["kubepods"].String(); got != "" {
 		t.Fatalf("v2 empty primary target = %q, want empty inheritance target; writes=%#v", got, cg.writes)
 	}
 }
 
-func TestApplyDAGDiffConvergesPrimaryAndStaleResidual(t *testing.T) {
+func TestTopologyCoordinatorConvergeConvergesPrimaryAndStaleResidual(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{Rel: "kubepods", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1), Mems: "0"}})
@@ -1680,23 +2596,23 @@ func TestApplyDAGDiffConvergesPrimaryAndStaleResidual(t *testing.T) {
 	cg.cpus["kubepods/podabc123"] = machine.NewCPUSet(1, 2)
 	cg.children["kubepods"] = []string{"podabc123"}
 
-	if _, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	if _, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 		Mems:       "0",
 	}); err != nil {
-		t.Fatalf("ApplyDAGDiff: %v; writes=%#v", err, cg.writes)
+		t.Fatalf("TopologyCoordinatorConverge: %v; writes=%#v", err, cg.writes)
 	}
 	if got := cg.cpus["kubepods"].String(); got != "0-1" {
 		t.Fatalf("primary target = %s, want 0-1; writes=%#v", got, cg.writes)
 	}
-	if got := cg.cpus["kubepods/podabc123"].String(); got != "1" {
-		t.Fatalf("stale pod cpuset = %s, want intersection 1; writes=%#v", got, cg.writes)
+	if got := cg.cpus["kubepods/podabc123"].String(); got != "0-1" {
+		t.Fatalf("planned dynamic pod cpuset = %s, want parent target 0-1; writes=%#v", got, cg.writes)
 	}
 }
 
-func TestApplyDAGDiffConvergesStaleReclaimSandboxWithoutOverlappingNUMABuckets(t *testing.T) {
+func TestTopologyCoordinatorConvergeConvergesStaleReclaimSandboxWithoutOverlappingNUMABuckets(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -1720,14 +2636,14 @@ func TestApplyDAGDiffConvergesStaleReclaimSandboxWithoutOverlappingNUMABuckets(t
 	cg.children["kubesandbox/reclaimed-0"] = []string{"sandbox-stale-a"}
 	cg.children["kubesandbox/reclaimed-1"] = []string{"sandbox-stale-b"}
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 		Mems:       "0",
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v; writes=%#v", err, cg.writes)
+		t.Fatalf("TopologyCoordinatorConverge: %v; writes=%#v", err, cg.writes)
 	}
 	if got := cg.cpus["kubesandbox/reclaimed-0"].String(); got != "1-2" {
 		t.Fatalf("reclaimed-0 = %s, want 1-2; writes=%#v", got, cg.writes)
@@ -1746,7 +2662,7 @@ func TestApplyDAGDiffConvergesStaleReclaimSandboxWithoutOverlappingNUMABuckets(t
 	}
 }
 
-func TestApplyDAGDiffReturnsErrorWhenStaleReclaimSandboxConvergeFails(t *testing.T) {
+func TestTopologyCoordinatorConvergeReturnsErrorWhenStaleReclaimSandboxConvergeFails(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -1768,7 +2684,7 @@ func TestApplyDAGDiffReturnsErrorWhenStaleReclaimSandboxConvergeFails(t *testing
 	cg.children["kubesandbox/reclaimed-1"] = []string{"sandbox-stale"}
 	cg.failRel["kubesandbox/reclaimed-1/sandbox-stale"] = true
 
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
@@ -1777,12 +2693,12 @@ func TestApplyDAGDiffReturnsErrorWhenStaleReclaimSandboxConvergeFails(t *testing
 	if err == nil {
 		t.Fatalf("expected stale reclaim sandbox converge failure; result=%+v writes=%#v", res, cg.writes)
 	}
-	if !strings.Contains(err.Error(), "apply cpuset.cpus=3 @ kubesandbox/reclaimed-1/sandbox-stale") {
+	if !strings.Contains(err.Error(), "kubesandbox/reclaimed-1/sandbox-stale") {
 		t.Fatalf("error = %v, want direct stale child apply failure", err)
 	}
 }
 
-func TestApplyDAGDiffResetExpandOnlyClampsReclaimDynamicChild(t *testing.T) {
+func TestTopologyCoordinatorConvergeResetExpandOnlyClampsReclaimDynamicChild(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -1806,22 +2722,22 @@ func TestApplyDAGDiffResetExpandOnlyClampsReclaimDynamicChild(t *testing.T) {
 		}
 	}
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:    dag,
 		Cgroup: cg,
 		Mems:   "0-1",
-		Mode:   ApplyModeResetExpandOnly,
+		Mode:   ResetModeGuard(),
 	})
 	if err != nil {
-		t.Fatalf("ApplyDAGDiff reset: %v writes=%#v", err, cg.writes)
+		t.Fatalf("TopologyCoordinatorConverge reset: %v writes=%#v", err, cg.writes)
 	}
 
 	found := false
 	for _, write := range cg.writes {
 		if write.rel == "kubesandbox/reclaimed-1/sandbox022" {
 			found = true
-			if write.cpus != "25-27" || write.mems != "1" {
-				t.Fatalf("sandbox write = %#v, want cpus=25-27 mems=1", write)
+			if write.cpus != "25-27" {
+				t.Fatalf("sandbox write = %#v, want cpus=25-27", write)
 			}
 		}
 	}
@@ -1830,49 +2746,7 @@ func TestApplyDAGDiffResetExpandOnlyClampsReclaimDynamicChild(t *testing.T) {
 	}
 }
 
-func TestApplyDAGDiffConvergesStaleReclaimSandboxWhenItOverlapsPrimary(t *testing.T) {
-	t.Parallel()
-
-	dag, err := BuildDAG([]NodeSpec{
-		{Rel: "kubepods", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1, 4), Mems: "0"},
-		{Rel: "kubesandbox", Role: TopoNodeRoleReclaim, CPUs: machine.NewCPUSet(2, 3), Mems: "0"},
-		{Rel: "kubesandbox/reclaimed-0", ParentRel: "kubesandbox", Role: TopoNodeRoleReclaimNUMABucket, CPUs: machine.NewCPUSet(2), Mems: "0", Metadata: map[string]string{"numa": "0"}},
-		{Rel: "kubesandbox/reclaimed-1", ParentRel: "kubesandbox", Role: TopoNodeRoleReclaimNUMABucket, CPUs: machine.NewCPUSet(3), Mems: "0", Metadata: map[string]string{"numa": "0"}},
-	})
-	if err != nil {
-		t.Fatalf("BuildDAG: %v", err)
-	}
-	cg := newTopologyFakeCgroup()
-	cg.cpus["kubepods"] = machine.NewCPUSet(0, 1, 4)
-	cg.cpus["kubesandbox"] = machine.NewCPUSet(2, 3, 4)
-	cg.cpus["kubesandbox/reclaimed-0"] = machine.NewCPUSet(2)
-	cg.cpus["kubesandbox/reclaimed-1"] = machine.NewCPUSet(3, 4)
-	cg.cpus["kubesandbox/reclaimed-1/sandbox-stale"] = machine.NewCPUSet(4)
-	cg.children["kubesandbox"] = []string{"reclaimed-0", "reclaimed-1"}
-	cg.children["kubesandbox/reclaimed-1"] = []string{"sandbox-stale"}
-
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
-		DAG:        dag,
-		Cgroup:     cg,
-		CPUDetails: testCPUDetails(),
-		Mems:       "0",
-	})
-	if err != nil {
-		t.Fatalf("stale reclaim sandbox must not block primary admission; err=%v result=%+v writes=%#v", err, res, cg.writes)
-	}
-	if !machine.NewCPUSet(4).IsSubsetOf(cg.cpus["kubepods"]) {
-		t.Fatalf("primary target must keep active CPU even if a stale reclaim sandbox still holds it; kubepods=%s writes=%#v",
-			cg.cpus["kubepods"].String(), cg.writes)
-	}
-	if got := cg.cpus["kubesandbox/reclaimed-1"].String(); got != "3" {
-		t.Fatalf("reclaim bucket = %s, want 3; writes=%#v", got, cg.writes)
-	}
-	if got := cg.cpus["kubesandbox/reclaimed-1/sandbox-stale"].String(); got != "3" {
-		t.Fatalf("stale sandbox = %s, want converged 3; writes=%#v", got, cg.writes)
-	}
-}
-
-func TestApplyDAGDiffReturnsErrorWhenStaleReclaimSandboxConvergeFailsAfterPrimaryDeduction(t *testing.T) {
+func TestTopologyCoordinatorConvergeReturnsErrorWhenStaleReclaimSandboxConvergeFailsAfterPrimaryDeduction(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -1894,7 +2768,7 @@ func TestApplyDAGDiffReturnsErrorWhenStaleReclaimSandboxConvergeFailsAfterPrimar
 	cg.children["kubesandbox/reclaimed-1"] = []string{"sandbox-stale"}
 	cg.failRel["kubesandbox/reclaimed-1/sandbox-stale"] = true
 
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
@@ -1903,17 +2777,17 @@ func TestApplyDAGDiffReturnsErrorWhenStaleReclaimSandboxConvergeFailsAfterPrimar
 	if err == nil {
 		t.Fatalf("expected stale reclaim sandbox converge failure after primary deduction; result=%+v writes=%#v", res, cg.writes)
 	}
-	if !strings.Contains(err.Error(), "apply cpuset.cpus=3 @ kubesandbox/reclaimed-1/sandbox-stale") {
+	if !strings.Contains(err.Error(), "kubesandbox/reclaimed-1/sandbox-stale") {
 		t.Fatalf("error = %v, want direct stale child apply failure", err)
 	}
 }
 
-// TestApplyDAGDiffWriteAndDescendStopsOnApplyFailure verifies that when
+// TestTopologyCoordinatorConvergeWriteAndDescendStopsOnApplyFailure verifies that when
 // expandDescendants fails to apply a cpuset at some intermediate rel, it does
 // not continue writing further descendants under that failed parent. Otherwise
-// TestApplyDAGDiffWriteAndDescendSurfacesApplyFailure verifies that a
+// TestTopologyCoordinatorConvergeWriteAndDescendSurfacesApplyFailure verifies that a
 // descendant convergence failure is reported to the caller.
-func TestApplyDAGDiffWriteAndDescendSurfacesApplyFailure(t *testing.T) {
+func TestTopologyCoordinatorConvergeWriteAndDescendSurfacesApplyFailure(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1), Mems: "0"}})
@@ -1924,22 +2798,22 @@ func TestApplyDAGDiffWriteAndDescendSurfacesApplyFailure(t *testing.T) {
 	cg.cpus["primary"] = machine.NewCPUSet(0, 1)
 	cg.children["primary"] = []string{"burstable"}
 	cg.children["primary/burstable"] = []string{"leaf"}
-	// The middle intermediate write fails; direct descendant convergence reports
-	// the error while still allowing lower descendants to converge first.
+	// The middle intermediate is an explicit operation and its failure aborts
+	// execution without plan-external descent.
 	cg.failRel["primary/burstable"] = true
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 		Mems:       "0",
 	})
-	if err != nil {
-		t.Fatalf("dynamic intermediate is outside the controlled DAG and should not be written: %v; writes=%#v", err, cg.writes)
+	if err == nil {
+		t.Fatalf("planned dynamic intermediate failure was ignored; writes=%#v", cg.writes)
 	}
 }
 
-func TestApplyDAGDiffSkipsDisappearedDynamicChildDuringExpand(t *testing.T) {
+func TestTopologyCoordinatorConvergeFailsClosedWhenPlannedDynamicChildDisappears(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1), Mems: "0"}})
@@ -1952,24 +2826,21 @@ func TestApplyDAGDiffSkipsDisappearedDynamicChildDuringExpand(t *testing.T) {
 	cg.children["primary/sandbox-a"] = []string{"kata-a"}
 	cg.applyErr["primary/sandbox-a/kata-a"] = os.ErrNotExist
 
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 		Mems:       "0",
 	})
-	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v; result=%+v writes=%#v", err, res, cg.writes)
+	if err == nil {
+		t.Fatalf("TopologyCoordinatorConverge unexpectedly ignored disappeared planned child; result=%+v writes=%#v", res, cg.writes)
 	}
-	if res.Skipped != 0 {
-		t.Fatalf("result = %+v, want no skipped count for an uncontrolled dynamic child", res)
-	}
-	if res.Failed != 0 {
-		t.Fatalf("result = %+v, want no failed writes for disappeared dynamic child", res)
+	if res.Failed != 1 || res.Skipped != 0 {
+		t.Fatalf("result = %+v, want one failed planned write and no skip", res)
 	}
 }
 
-func TestApplyDAGDiffSkipsDisappearedDynamicIntermediate(t *testing.T) {
+func TestTopologyCoordinatorConvergeFailsClosedWhenPlannedDynamicIntermediateDisappears(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1), Mems: "0"}})
@@ -1982,21 +2853,21 @@ func TestApplyDAGDiffSkipsDisappearedDynamicIntermediate(t *testing.T) {
 	cg.children["primary/sandbox-a"] = []string{"kata-a"}
 	cg.applyErr["primary/sandbox-a"] = os.ErrNotExist
 
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 		Mems:       "0",
 	})
-	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v; result=%+v writes=%#v", err, res, cg.writes)
+	if err == nil {
+		t.Fatalf("TopologyCoordinatorConverge unexpectedly ignored disappeared planned intermediate; result=%+v writes=%#v", res, cg.writes)
 	}
-	if res.Skipped != 0 {
-		t.Fatalf("result = %+v, want no skipped count for an uncontrolled dynamic intermediate", res)
+	if res.Failed != 1 || res.Skipped != 0 {
+		t.Fatalf("result = %+v, want one failed planned write and no skip", res)
 	}
 }
 
-func TestApplyDAGDiffSkipsDisappearedExpectedLeafDuringExpand(t *testing.T) {
+func TestTopologyCoordinatorConvergeFailsClosedWhenPlannedExpectedLeafDisappears(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{Rel: "kubepods", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1), Mems: "0"}})
@@ -2014,7 +2885,7 @@ func TestApplyDAGDiffSkipsDisappearedExpectedLeafDuringExpand(t *testing.T) {
 	cg.children["kubepods/burstable/pod-a"] = []string{"container-a"}
 	cg.applyErr[expectedRel] = os.ErrNotExist
 
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
@@ -2023,18 +2894,15 @@ func TestApplyDAGDiffSkipsDisappearedExpectedLeafDuringExpand(t *testing.T) {
 			expectedRel: machine.NewCPUSet(1),
 		},
 	})
-	if err != nil {
-		t.Fatalf("ApplyDAGDiff: %v; result=%+v writes=%#v", err, res, cg.writes)
+	if err == nil {
+		t.Fatalf("TopologyCoordinatorConverge unexpectedly ignored disappeared expected leaf; result=%+v writes=%#v", res, cg.writes)
 	}
-	if res.Skipped != 0 {
-		t.Fatalf("result = %+v, want no skipped count for an uncontrolled expected leaf", res)
-	}
-	if res.Failed != 0 {
-		t.Fatalf("result = %+v, want no failed writes for disappeared expected leaf", res)
+	if res.Failed != 1 || res.Skipped != 0 {
+		t.Fatalf("result = %+v, want one failed planned write and no skip", res)
 	}
 }
 
-func TestApplyDAGDiffReturnsNonNotFoundDynamicChildError(t *testing.T) {
+func TestTopologyCoordinatorConvergeReturnsNonNotFoundDynamicChildError(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1), Mems: "0"}})
@@ -2046,17 +2914,17 @@ func TestApplyDAGDiffReturnsNonNotFoundDynamicChildError(t *testing.T) {
 	cg.children["primary"] = []string{"child-a"}
 	cg.applyErr["primary/child-a"] = syscall.EINVAL
 
-	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),
 		Mems:       "0",
 	})
-	if err != nil {
-		t.Fatalf("uncontrolled dynamic child should not be written: %v; result=%+v writes=%#v", err, res, cg.writes)
+	if err == nil {
+		t.Fatalf("planned dynamic child failure was ignored; result=%+v writes=%#v", res, cg.writes)
 	}
-	if res.Failed != 0 {
-		t.Fatalf("result = %+v, want no failed write for uncontrolled dynamic child", res)
+	if res.Failed != 1 {
+		t.Fatalf("result = %+v, want one failed planned write", res)
 	}
 }
 
@@ -2069,6 +2937,7 @@ func TestIsCgroupNotFoundError(t *testing.T) {
 		fmt.Errorf("wrapped: %w", os.ErrNotExist),
 		fmt.Errorf("openat2 cpuset.cpus: no such file or directory"),
 		fmt.Errorf("openat2 parent: not a directory"),
+		fmt.Errorf("write cpuset.cpus: no such device"),
 	} {
 		if !isCgroupNotFoundError(err) {
 			t.Fatalf("isCgroupNotFoundError(%v) = false, want true", err)
@@ -2079,12 +2948,12 @@ func TestIsCgroupNotFoundError(t *testing.T) {
 	}
 }
 
-// TestApplyDAGDiffExpandStopsOnNodeGrowFailure verifies that when a controlled
-// node's own grow write fails, ApplyDAGDiff does not descend into its subtree.
+// TestTopologyCoordinatorConvergeExpandStopsOnNodeGrowFailure verifies that when a controlled
+// node's own grow write fails, TopologyCoordinatorConverge does not descend into its subtree.
 // Otherwise descendants would be written to the (larger) effective target while
 // the node itself is still at the smaller observed cpuset, violating the cgroup
 // v1 parent-superset invariant.
-func TestApplyDAGDiffExpandStopsOnNodeGrowFailure(t *testing.T) {
+func TestTopologyCoordinatorConvergeExpandStopsOnNodeGrowFailure(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1), Mems: "0"}})
@@ -2096,7 +2965,7 @@ func TestApplyDAGDiffExpandStopsOnNodeGrowFailure(t *testing.T) {
 	cg.children["primary"] = []string{"leaf"}
 	cg.failRel["primary"] = true
 
-	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:        dag,
 		Cgroup:     cg,
 		CPUDetails: testCPUDetails(),

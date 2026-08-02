@@ -35,12 +35,38 @@ const (
 	TopoNodeRoleReclaimSibling    TopoNodeRole = "reclaim_sibling"
 )
 
+// DomainID identifies an ownership domain without relying on cgroup names.
+type DomainID string
+
+const (
+	DomainPrimary DomainID = "primary"
+	DomainReclaim DomainID = "reclaim"
+)
+
+type TopologyScope string
+
+const (
+	TopologyScopeNone     TopologyScope = ""
+	TopologyScopeNUMANode TopologyScope = "numa_node"
+)
+
+// TopologyConstraint records planner-visible placement bounds explicitly.
+type TopologyConstraint struct {
+	CPUUpperBound machine.CPUSet
+	MemUpperBound machine.CPUSet
+	Scope         TopologyScope
+}
+
 type TopoNode struct {
-	Rel      string
-	Role     TopoNodeRole
-	CPUs     machine.CPUSet
-	Mems     string
-	Metadata map[string]string
+	Rel            string
+	Role           TopoNodeRole
+	CPUs           machine.CPUSet
+	Mems           string
+	Domain         DomainID
+	ControlledRoot bool
+	TrustAnchor    bool
+	Constraint     TopologyConstraint
+	Metadata       map[string]string
 
 	// parent is set only by BuildDAG from NodeSpec.ParentRel. Keeping it private
 	// preserves the DAG invariants while allowing bridge validation to inspect
@@ -56,12 +82,16 @@ type TopoNode struct {
 // BuildDAG input. CPUs and Mems carry the desired cpuset values, and Metadata
 // preserves caller-specific labels used by the writer.
 type NodeSpec struct {
-	Rel       string
-	Role      TopoNodeRole
-	CPUs      machine.CPUSet
-	Mems      string
-	ParentRel string
-	Metadata  map[string]string
+	Rel            string
+	Role           TopoNodeRole
+	CPUs           machine.CPUSet
+	Mems           string
+	ParentRel      string
+	Domain         DomainID
+	ControlledRoot bool
+	TrustAnchor    bool
+	Constraint     TopologyConstraint
+	Metadata       map[string]string
 }
 
 type TopoDAG struct {
@@ -92,7 +122,21 @@ func BuildDAG(specs []NodeSpec) (*TopoDAG, error) {
 				metadata[k] = v
 			}
 		}
-		d.index[rel] = &TopoNode{Rel: rel, Role: spec.Role, CPUs: spec.CPUs, Mems: spec.Mems, Metadata: metadata}
+		domain := spec.Domain
+		if domain == "" {
+			domain = DomainID(domainOf(spec.Role))
+		}
+		d.index[rel] = &TopoNode{
+			Rel:            rel,
+			Role:           spec.Role,
+			CPUs:           spec.CPUs,
+			Mems:           spec.Mems,
+			Domain:         domain,
+			ControlledRoot: spec.ControlledRoot,
+			TrustAnchor:    spec.TrustAnchor,
+			Constraint:     spec.Constraint,
+			Metadata:       metadata,
+		}
 	}
 
 	pendingChildren := make(map[string][]*TopoNode)

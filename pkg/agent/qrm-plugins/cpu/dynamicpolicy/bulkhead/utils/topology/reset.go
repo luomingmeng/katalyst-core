@@ -19,19 +19,29 @@ package topology
 import (
 	"context"
 
-	cgroupclient "github.com/kubewharf/katalyst-core/pkg/util/cgroup/client"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
-func verifyResetConvergence(ctx context.Context, cg cgroupclient.CgroupClient, dag *TopoDAG, targetByRel map[string]machine.CPUSet) ConvergenceReport {
+func verifyResetConvergence(ctx context.Context, driver HierarchyDriver, budget *BudgetTracker, dag *TopoDAG, targetByRel map[string]machine.CPUSet) (ConvergenceReport, error) {
 	// This reports the post-reset state of statically controlled DAG targets only.
 	// It does not prove convergence of dynamic descendants, which are not read.
 	// It neither relies on fail-open behavior nor on a recovered live hierarchy.
 	report := ConvergenceReport{}
+	if driver == nil {
+		return report, nil
+	}
+	if budget == nil {
+		return report, nil
+	}
+	capabilities := driver.Capabilities()
+	verifyDriver := NewBudgetedHierarchyDriver(driver, budget)
 	for _, node := range dag.Nodes() {
 		target := targetByRel[node.Rel]
-		observed, err := cg.ReadCPUSet(ctx, node.Rel)
+		observed, err := verifyDriver.ReadEntry(ctx, node.Rel)
 		if err != nil {
+			if isConvergenceBudgetError(err) {
+				return report, err
+			}
 			report.NonConvergedTargets = append(report.NonConvergedTargets, RelConvergence{
 				Rel:    node.Rel,
 				Target: target.Clone(),
@@ -39,15 +49,16 @@ func verifyResetConvergence(ctx context.Context, cg cgroupclient.CgroupClient, d
 			})
 			continue
 		}
-		if !observed.Equals(target) {
+		convergedCPUs := observedCPUsForTargetProof(observed, target, capabilities)
+		if !convergedCPUs.Equals(target) {
 			report.NonConvergedTargets = append(report.NonConvergedTargets, RelConvergence{
 				Rel:      node.Rel,
-				Observed: observed.Clone(),
+				Observed: convergedCPUs.Clone(),
 				Target:   target.Clone(),
 				Reason:   convergenceReasonTargetMismatch,
 			})
 		}
 	}
 	report.FullyConverged = len(report.NonConvergedTargets) == 0
-	return report
+	return report, nil
 }
