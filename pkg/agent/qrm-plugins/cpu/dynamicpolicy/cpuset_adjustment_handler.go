@@ -19,10 +19,12 @@ package dynamicpolicy
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
@@ -55,10 +57,73 @@ func (p *DynamicPolicy) RegisterCPUSetAdjustmentHandler(name string, handler cpu
 	return nil
 }
 
+type cpuSetAdjustmentStateSnapshot struct {
+	machineState state.NUMANodeMap
+	numaHeadroom map[int]float64
+	podEntries   state.PodEntries
+	allowOverlap bool
+}
+
+func newCPUSetAdjustmentStateSnapshot(source state.ReadonlyState) *cpuSetAdjustmentStateSnapshot {
+	if source == nil {
+		return nil
+	}
+	return &cpuSetAdjustmentStateSnapshot{
+		machineState: source.GetMachineState(),
+		numaHeadroom: source.GetNUMAHeadroom(),
+		podEntries:   source.GetPodEntries(),
+		allowOverlap: source.GetAllowSharedCoresOverlapReclaimedCores(),
+	}
+}
+
+func (s *cpuSetAdjustmentStateSnapshot) matches(source state.ReadonlyState) bool {
+	if s == nil || source == nil {
+		return s == nil && source == nil
+	}
+	return s.allowOverlap == source.GetAllowSharedCoresOverlapReclaimedCores() &&
+		reflect.DeepEqual(s.machineState, source.GetMachineState()) &&
+		reflect.DeepEqual(s.numaHeadroom, source.GetNUMAHeadroom()) &&
+		reflect.DeepEqual(s.podEntries, source.GetPodEntries())
+}
+
+func (s *cpuSetAdjustmentStateSnapshot) GetMachineState() state.NUMANodeMap {
+	return s.machineState.Clone()
+}
+
+func (s *cpuSetAdjustmentStateSnapshot) GetNUMAHeadroom() map[int]float64 {
+	out := make(map[int]float64, len(s.numaHeadroom))
+	for numaID, headroom := range s.numaHeadroom {
+		out[numaID] = headroom
+	}
+	return out
+}
+
+func (s *cpuSetAdjustmentStateSnapshot) GetPodEntries() state.PodEntries {
+	return s.podEntries.Clone()
+}
+
+func (s *cpuSetAdjustmentStateSnapshot) GetAllocationInfo(podUID, containerName string) *state.AllocationInfo {
+	if allocationInfo := s.podEntries[podUID][containerName]; allocationInfo != nil {
+		return allocationInfo.Clone()
+	}
+	return nil
+}
+
+func (s *cpuSetAdjustmentStateSnapshot) GetAllowSharedCoresOverlapReclaimedCores() bool {
+	return s.allowOverlap
+}
+
 func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context) error {
 	if len(p.cpuSetAdjustmentHandlers) == 0 {
 		return nil
 	}
+
+	// Serialize complete adjustment rounds without retaining the policy lock.
+	// Waiting before taking the immutable snapshot ensures a queued round plans
+	// from state left by the preceding round and its caller-side error handling.
+	p.Unlock()
+	p.cpuSetAdjustmentExecutionMu.Lock()
+	p.Lock()
 
 	var topology *machine.CPUTopology
 	if p.machineInfo != nil {
@@ -68,23 +133,48 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context) error {
 	if p.dynamicConfig != nil {
 		dynamicConf = p.dynamicConfig.GetDynamicConfiguration()
 	}
+	stateSnapshot := newCPUSetAdjustmentStateSnapshot(p.state)
 	handlerCtx := cpusetutil.CPUSetAdjustmentHandlerCtx{
 		CoreConf:    p.conf,
 		DynamicConf: dynamicConf,
 		Emitter:     p.emitter,
 		MetaServer:  p.metaServer,
-		State:       p.state,
+		State:       stateSnapshot,
 		Topology:    topology,
+	}
+	p.cpuSetAdjustmentGeneration++
+	handlerCtx.Generation = p.cpuSetAdjustmentGeneration
+	handlerCtx.CommitIfGenerationCurrent = func(generation uint64, commit func()) bool {
+		p.Lock()
+		defer p.Unlock()
+		var currentDynamicConf *dynamicconfig.Configuration
+		if p.dynamicConfig != nil {
+			currentDynamicConf = p.dynamicConfig.GetDynamicConfiguration()
+		}
+		if generation != p.cpuSetAdjustmentGeneration ||
+			dynamicConf != currentDynamicConf ||
+			!stateSnapshot.matches(p.state) {
+			return false
+		}
+		commit()
+		return true
 	}
 
 	names := make([]string, 0, len(p.cpuSetAdjustmentHandlers))
+	handlers := make(map[string]cpusetutil.CPUSetAdjustmentHandler, len(p.cpuSetAdjustmentHandlers))
 	for name := range p.cpuSetAdjustmentHandlers {
 		names = append(names, name)
+		handlers[name] = p.cpuSetAdjustmentHandlers[name]
 	}
 	sort.Strings(names)
+
+	p.Unlock()
+	defer func() {
+		p.Lock()
+		p.cpuSetAdjustmentExecutionMu.Unlock()
+	}()
 	for _, name := range names {
-		handler := p.cpuSetAdjustmentHandlers[name]
-		if err := handler(ctx, handlerCtx); err != nil {
+		if err := handlers[name](ctx, handlerCtx); err != nil {
 			return fmt.Errorf("run cpuset adjustment handler %q: %w", name, err)
 		}
 	}

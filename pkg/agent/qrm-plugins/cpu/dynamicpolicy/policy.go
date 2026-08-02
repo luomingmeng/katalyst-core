@@ -117,12 +117,14 @@ type DynamicPolicy struct {
 	advisorMonitor     *timemonitor.TimeMonitor
 	featureGateManager featuregatenegotiation.FeatureGateManager
 
-	state                    state.State
-	residualHitMap           map[string]int64
-	allocationHandlers       map[string]util.AllocationHandler
-	hintHandlers             map[string]util.HintHandler
-	allocationHooks          []AllocationHook
-	cpuSetAdjustmentHandlers map[string]cpusetutil.CPUSetAdjustmentHandler
+	state                       state.State
+	residualHitMap              map[string]int64
+	allocationHandlers          map[string]util.AllocationHandler
+	hintHandlers                map[string]util.HintHandler
+	allocationHooks             []AllocationHook
+	cpuSetAdjustmentHandlers    map[string]cpusetutil.CPUSetAdjustmentHandler
+	cpuSetAdjustmentExecutionMu sync.Mutex
+	cpuSetAdjustmentGeneration  uint64
 
 	cpuPressureEviction       agent.Component
 	cpuPressureEvictionCancel context.CancelFunc
