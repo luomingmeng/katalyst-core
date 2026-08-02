@@ -333,6 +333,13 @@ func (m *managerImpl) createClosLocked(closID string) (string, error) {
 			return false, fmt.Errorf("create clos_id dir %s failed: %w", closIDPath, err)
 		}
 		if m.ownershipCheckpointPath != "" {
+			identity, err := qrmresctrlmanager.DirectoryIdentityForPath(closIDPath)
+			if err != nil {
+				return false, fmt.Errorf("identify created CLOS %q: %w", closID, err)
+			}
+			if err := m.ownershipStore.BindCreate(closID, identity); err != nil {
+				return false, fmt.Errorf("bind pending CLOS %q creation: %w", closID, err)
+			}
 			if err := m.ownershipStore.FinishCreate(closID); err != nil {
 				return false, fmt.Errorf("checkpoint CLOS %q ownership: %w", closID, err)
 			}
@@ -358,7 +365,11 @@ func (m *managerImpl) removeClosLocked(closID, path string) error {
 	return m.runClosLifecycleLocked(closID, func() (bool, error) {
 		wasManaged := m.lifecycleManagedClosIDs.Has(closID)
 		if wasManaged && m.ownershipCheckpointPath != "" {
-			if err := m.ownershipStore.BeginDelete(closID); err != nil {
+			identity, err := qrmresctrlmanager.DirectoryIdentityForPath(path)
+			if err != nil {
+				return false, fmt.Errorf("identify CLOS %q before deletion: %w", closID, err)
+			}
+			if err := m.ownershipStore.BeginDelete(closID, identity); err != nil {
 				return false, err
 			}
 		}
@@ -383,21 +394,39 @@ func (m *managerImpl) recoverPendingDeletesLocked() error {
 	if m.ownershipCheckpointPath == "" {
 		return nil
 	}
-	pending, err := m.ownershipStore.PendingDeletes()
+	pending, err := m.ownershipStore.PendingDeleteTransactions()
 	if err != nil {
 		return err
 	}
-	for closID := range pending {
+	for closID, transaction := range pending {
 		path := filepath.Join(m.root, closID)
 		if err := m.runClosLifecycleLocked(closID, func() (bool, error) {
-			if err := m.remove(path); err != nil {
+			if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
+				if err := m.ownershipStore.FinishDelete(closID); err != nil {
+					return false, err
+				}
+				m.lifecycleManagedClosIDs.Delete(closID)
+				return false, nil
+			} else if statErr != nil {
+				return false, statErr
+			}
+			matches, err := qrmresctrlmanager.SameDirectoryIdentity(path, transaction.Identity)
+			if err != nil {
 				return false, err
+			}
+			if matches {
+				if err := m.remove(path); err != nil {
+					return false, err
+				}
+			} else {
+				general.Warningf("resctrl: preserve CLOS %q while recovering unproven pending delete generation %d",
+					closID, transaction.Generation)
 			}
 			if err := m.ownershipStore.FinishDelete(closID); err != nil {
 				return false, err
 			}
 			m.lifecycleManagedClosIDs.Delete(closID)
-			return true, nil
+			return matches, nil
 		}); err != nil {
 			return fmt.Errorf("recover pending deletion of CLOS %q: %w", closID, err)
 		}
@@ -409,11 +438,11 @@ func (m *managerImpl) recoverPendingCreatesLocked() error {
 	if m.ownershipCheckpointPath == "" {
 		return nil
 	}
-	pending, err := m.ownershipStore.PendingCreates()
+	pending, err := m.ownershipStore.PendingCreateTransactions()
 	if err != nil {
 		return err
 	}
-	for closID := range pending {
+	for closID, transaction := range pending {
 		path := filepath.Join(m.root, closID)
 		if err := m.runClosLifecycleLocked(closID, func() (bool, error) {
 			_, statErr := os.Stat(path)
@@ -421,14 +450,27 @@ func (m *managerImpl) recoverPendingCreatesLocked() error {
 			if statErr != nil && !os.IsNotExist(statErr) {
 				return false, statErr
 			}
-			if err := m.remove(path); err != nil {
-				return false, err
+			removed := false
+			if existed {
+				matches, err := qrmresctrlmanager.SameDirectoryIdentity(path, transaction.Identity)
+				if err != nil {
+					return false, err
+				}
+				if matches {
+					if err := m.remove(path); err != nil {
+						return false, err
+					}
+					removed = true
+				} else {
+					general.Warningf("resctrl: preserve CLOS %q while recovering unproven pending create generation %d",
+						closID, transaction.Generation)
+				}
 			}
 			if err := m.ownershipStore.AbortCreate(closID); err != nil {
 				return false, err
 			}
 			m.lifecycleManagedClosIDs.Delete(closID)
-			return existed, nil
+			return removed, nil
 		}); err != nil {
 			return fmt.Errorf("recover pending creation of CLOS %q: %w", closID, err)
 		}

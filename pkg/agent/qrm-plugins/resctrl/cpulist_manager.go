@@ -29,6 +29,7 @@ import (
 
 	"github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/util/external/rdt"
+	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -138,6 +139,15 @@ func (m *cpuListManager) ApplyCPUList(_ context.Context, closID, target string) 
 		if err != nil {
 			return false, err
 		}
+		if !created {
+			owned, err := m.ownership.Load()
+			if err != nil {
+				return false, fmt.Errorf("load CLOS ownership: %w", err)
+			}
+			if !owned.Has(closID) {
+				return false, nil
+			}
+		}
 		if err := os.WriteFile(filepath.Join(m.root, closID, cpus), []byte(mask), 0o644); err != nil {
 			if os.IsNotExist(err) && !createMissingClos {
 				return created, nil
@@ -171,21 +181,35 @@ func (m *cpuListManager) CPUListMatches(_ context.Context, closID, target string
 }
 
 func (m *cpuListManager) ensureClos(closID string, create bool) (bool, error) {
-	if !create {
-		return false, nil
-	}
 	closPath := filepath.Join(m.root, closID)
-	pendingCreates, err := m.ownership.PendingCreates()
+	pendingCreates, err := m.ownership.PendingCreateTransactions()
 	if err != nil {
 		return false, fmt.Errorf("load pending CLOS creations: %w", err)
 	}
-	if pendingCreates.Has(closID) {
-		if err := os.RemoveAll(closPath); err != nil {
-			return false, fmt.Errorf("recover pending creation of CLOS %q: %w", closID, err)
+	if transaction, ok := pendingCreates[closID]; ok {
+		matches := false
+		if _, statErr := os.Stat(closPath); statErr == nil {
+			matches, err = SameDirectoryIdentity(closPath, transaction.Identity)
+			if err != nil {
+				return false, fmt.Errorf("identify pending creation of CLOS %q: %w", closID, err)
+			}
+			if matches {
+				if err := os.RemoveAll(closPath); err != nil {
+					return false, fmt.Errorf("recover pending creation of CLOS %q: %w", closID, err)
+				}
+			} else {
+				general.Warningf("resctrl: preserve CLOS %q while recovering unproven pending create generation %d",
+					closID, transaction.Generation)
+			}
+		} else if !os.IsNotExist(statErr) {
+			return false, fmt.Errorf("stat pending creation of CLOS %q: %w", closID, statErr)
 		}
 		if err := m.ownership.AbortCreate(closID); err != nil {
 			return false, fmt.Errorf("finish recovery of pending CLOS %q creation: %w", closID, err)
 		}
+	}
+	if !create {
+		return false, nil
 	}
 	if _, err := os.Stat(closPath); err == nil {
 		return false, nil
@@ -201,6 +225,13 @@ func (m *cpuListManager) ensureClos(closID string, create bool) (bool, error) {
 			return false, nil
 		}
 		return false, fmt.Errorf("create CLOS %q: %w", closID, err)
+	}
+	identity, err := DirectoryIdentityForPath(closPath)
+	if err != nil {
+		return false, fmt.Errorf("identify created CLOS %q: %w", closID, err)
+	}
+	if err := m.ownership.BindCreate(closID, identity); err != nil {
+		return false, fmt.Errorf("bind pending CLOS %q creation: %w", closID, err)
 	}
 	if err := m.ownership.FinishCreate(closID); err != nil {
 		return false, fmt.Errorf("checkpoint CLOS %q ownership: %w", closID, err)
