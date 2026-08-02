@@ -18,7 +18,9 @@ package bulkhead
 
 import (
 	"fmt"
+	"math"
 	"strings"
+	"time"
 
 	cliflag "k8s.io/component-base/cli/flag"
 
@@ -39,6 +41,10 @@ type BulkheadOptions struct {
 	BulkheadSystemServiceProcfsPath  string
 	BulkheadSystemdCommBlacklist     []string
 	BulkheadSystemKThreadCommSubstrs []string
+
+	MaxCPUsDrainRatio           float64
+	TopologyConvergenceDeadline time.Duration
+	MaxDeadlockProbeOperations  int
 }
 
 func NewBulkheadOptions() BulkheadOptions {
@@ -56,6 +62,8 @@ func NewBulkheadOptions() BulkheadOptions {
 		// Do NOT include per-CPU kthreads (migration/N, ksoftirqd/N) —
 		// they are not migratable.
 		BulkheadSystemKThreadCommSubstrs: []string{"kswapd", "kcompactd"},
+		TopologyConvergenceDeadline:      bulkheadconfig.DefaultTopologyConvergenceDeadline,
+		MaxDeadlockProbeOperations:       bulkheadconfig.DefaultDeadlockProbeOperations,
 	}
 }
 
@@ -83,11 +91,26 @@ func (o *BulkheadOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 		o.BulkheadSystemdCommBlacklist, "The userspace process comm exact-match blacklist kept in the cgroup root (not migrated) by cpu bulkhead system_service.")
 	fs.StringSliceVar(&o.BulkheadSystemKThreadCommSubstrs, "qrm-cpu-bulkhead-system-kthread-comm-substrs",
 		o.BulkheadSystemKThreadCommSubstrs, "The kernel-thread comm substring whitelist migrated by cpu bulkhead system_service.")
+	fs.Float64Var(&o.MaxCPUsDrainRatio, "qrm-cpu-bulkhead-max-cpus-drain-ratio",
+		o.MaxCPUsDrainRatio, "The maximum ratio of logical CPUs drained in one cpu bulkhead round; 0 disables the limit.")
+	fs.DurationVar(&o.TopologyConvergenceDeadline, "qrm-cpu-bulkhead-topology-convergence-deadline",
+		o.TopologyConvergenceDeadline, "The deadline for one cpu bulkhead topology convergence invocation.")
+	fs.IntVar(&o.MaxDeadlockProbeOperations, "qrm-cpu-bulkhead-deadlock-probe-operations",
+		o.MaxDeadlockProbeOperations, "The maximum projected operations used by one cpu bulkhead deadlock probe.")
 }
 
 func (o *BulkheadOptions) ApplyTo(conf *bulkheadconfig.BulkheadConfiguration) error {
 	if conf == nil {
 		return fmt.Errorf("nil BulkheadConfiguration")
+	}
+	if math.IsNaN(o.MaxCPUsDrainRatio) || o.MaxCPUsDrainRatio < 0 || o.MaxCPUsDrainRatio > 1 {
+		return fmt.Errorf("qrm-cpu-bulkhead-max-cpus-drain-ratio must be within [0,1], got %v", o.MaxCPUsDrainRatio)
+	}
+	if o.TopologyConvergenceDeadline <= 0 {
+		return fmt.Errorf("qrm-cpu-bulkhead-topology-convergence-deadline must be positive, got %s", o.TopologyConvergenceDeadline)
+	}
+	if o.MaxDeadlockProbeOperations <= 0 {
+		return fmt.Errorf("qrm-cpu-bulkhead-deadlock-probe-operations must be positive, got %d", o.MaxDeadlockProbeOperations)
 	}
 	conf.BulkheadPrimaryRelPath = normalizeRel(o.BulkheadPrimaryRelPath)
 	conf.BulkheadReclaimRelPaths = normalizeRelSlice(o.BulkheadReclaimRelPaths)
@@ -100,6 +123,9 @@ func (o *BulkheadOptions) ApplyTo(conf *bulkheadconfig.BulkheadConfiguration) er
 	conf.BulkheadSystemServiceProcfsPath = strings.TrimSpace(o.BulkheadSystemServiceProcfsPath)
 	conf.BulkheadSystemdCommBlacklist = trimStringSlice(o.BulkheadSystemdCommBlacklist)
 	conf.BulkheadSystemKThreadCommSubstrs = trimStringSlice(o.BulkheadSystemKThreadCommSubstrs)
+	conf.TopologyDrainSelection.MaxCPUsDrainRatio = o.MaxCPUsDrainRatio
+	conf.TopologyConvergenceBudget.DeadlineDuration = o.TopologyConvergenceDeadline
+	conf.TopologyConvergenceBudget.MaxDeadlockProbeOperations = o.MaxDeadlockProbeOperations
 	if len(conf.BulkheadReclaimNumaPrefixes) > len(conf.BulkheadReclaimRelPaths) {
 		return fmt.Errorf("qrm cpu bulkhead reclaim numa prefixes count %d exceeds reclaim rel paths count %d",
 			len(conf.BulkheadReclaimNumaPrefixes), len(conf.BulkheadReclaimRelPaths))

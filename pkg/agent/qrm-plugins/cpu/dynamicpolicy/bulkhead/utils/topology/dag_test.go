@@ -107,3 +107,27 @@ func TestBuildDAGErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildDAGPreservesExplicitDomainBoundaryMetadata(t *testing.T) {
+	const domain DomainID = "exclusive-a"
+	constraint := TopologyConstraint{
+		CPUUpperBound: machine.NewCPUSet(2, 3),
+		MemUpperBound: machine.NewCPUSet(1),
+		Scope:         TopologyScopeNUMANode,
+	}
+	dag, err := BuildDAG([]NodeSpec{{
+		Rel:            "root",
+		Role:           TopoNodeRolePrimary,
+		Domain:         domain,
+		ControlledRoot: true,
+		TrustAnchor:    true,
+		Constraint:     constraint,
+	}})
+	if err != nil {
+		t.Fatalf("BuildDAG() error = %v", err)
+	}
+	node := dag.index["root"]
+	if node.Domain != domain || !node.ControlledRoot || !node.TrustAnchor || !reflect.DeepEqual(node.Constraint, constraint) {
+		t.Fatalf("node metadata = %+v, want explicit domain/boundary metadata", node)
+	}
+}

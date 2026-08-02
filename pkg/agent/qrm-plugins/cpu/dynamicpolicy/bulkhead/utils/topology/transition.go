@@ -16,77 +16,106 @@ limitations under the License.
 
 package topology
 
-import "github.com/kubewharf/katalyst-core/pkg/util/machine"
+import (
+	"fmt"
+	"strings"
 
-type nodeTransition struct {
-	node     *TopoNode
-	domain   cpusetDomain
-	observed machine.CPUSet
-	target   machine.CPUSet
+	"github.com/kubewharf/katalyst-core/pkg/util/machine"
+)
 
-	entering machine.CPUSet
-
-	crossDomainEntering machine.CPUSet
-	crossDomainLeaving  machine.CPUSet
+// RelTransition contains only the inputs needed to derive one phase target.
+// SafeDrainTarget is computed by the bottom-up drain projection. Entering CPUs
+// are supplied exclusively by DomainGate.
+type RelTransition struct {
+	Current            machine.CPUSet
+	Final              machine.CPUSet
+	SafeDrainTarget    machine.CPUSet
+	AuthorizedEntering machine.CPUSet
+	AllowEmptyTarget   bool
 }
 
-type transitionPlan struct {
-	drainReclaimToPrimary []nodeTransition
-	expandPrimary         []nodeTransition
-	drainPrimaryToReclaim []nodeTransition
-	expandReclaim         []nodeTransition
+func buildPhaseTransition(kind PhaseKind, transition RelTransition) (machine.CPUSet, error) {
+	switch kind {
+	case PhaseDrain:
+		target := transition.SafeDrainTarget.Intersection(transition.Current)
+		if !transition.AllowEmptyTarget && target.IsEmpty() &&
+			!transition.Current.IsEmpty() {
+			return transition.Current.Clone(), nil
+		}
+		return target, nil
+	case PhaseExpand:
+		entering := transition.Final.
+			Difference(transition.Current).
+			Intersection(transition.AuthorizedEntering)
+		return transition.Current.Union(entering), nil
+	default:
+		return machine.NewCPUSet(), fmt.Errorf("unsupported phase kind %q", kind)
+	}
 }
 
-func buildTransitionPlan(dag *TopoDAG, snapshot domainSnapshot) transitionPlan {
-	plan := transitionPlan{}
-	for _, node := range dag.Nodes() {
-		domain := domainOf(node.Role)
-		if domain == cpusetDomainUnknown {
+// validateFinalTargets validates immutable placement, before transfer graph or
+// operation generation. Observed state is intentionally not constrained here:
+// an observed overflow is repair input, not an invalid desired partition.
+func validateFinalTargets(in PhasePlanInput) error {
+	if in.DAG == nil {
+		return nil
+	}
+	bucketUnionByRoot := make(map[string]machine.CPUSet)
+	bucketCountByRoot := make(map[string]int)
+	reclaimFinalByRoot := make(map[string]machine.CPUSet)
+	for _, node := range in.DAG.Nodes() {
+		final := in.DesiredByRel[node.Rel]
+		if !node.Constraint.CPUUpperBound.IsEmpty() &&
+			!final.IsSubsetOf(node.Constraint.CPUUpperBound) {
+			return fmt.Errorf("%w: rel=%q final CPUs=%s upper=%s",
+				ErrInvalidReclaimBucketTarget, node.Rel, final.String(),
+				node.Constraint.CPUUpperBound.String())
+		}
+		if node.Role == TopoNodeRoleReclaim {
+			reclaimFinalByRoot[reclaimValidationGroup(node)] = final
+		}
+		if node.Role != TopoNodeRoleReclaimNUMABucket {
 			continue
 		}
-		observed := snapshot.observedByRel[node.Rel]
-		target := snapshot.targetByRel[node.Rel]
-		t := classifyNodeTransition(node, domain, observed, target, snapshot)
-		plan.appendPhase(t)
+		root := reclaimValidationGroup(node)
+		if overlap := bucketUnionByRoot[root].Intersection(final); !overlap.IsEmpty() {
+			return fmt.Errorf("%w: reclaim root=%q bucket=%q overlaps sibling final CPUs=%s",
+				ErrInvalidReclaimBucketTarget, root, node.Rel, overlap.String())
+		}
+		bucketUnionByRoot[root] = bucketUnionByRoot[root].Union(final)
+		bucketCountByRoot[root]++
 	}
-	return plan
+	for root, count := range bucketCountByRoot {
+		if count == 0 {
+			continue
+		}
+		reclaimFinal, hasReclaimRoot := reclaimFinalByRoot[root]
+		if !hasReclaimRoot {
+			continue
+		}
+		if !bucketUnionByRoot[root].Equals(reclaimFinal) {
+			return fmt.Errorf("%w: reclaim root=%q covered final CPUs=%s per-NUMA bucket union=%s",
+				ErrInvalidReclaimBucketTarget, root, reclaimFinal.String(),
+				bucketUnionByRoot[root].String())
+		}
+	}
+	return nil
 }
 
-func classifyNodeTransition(node *TopoNode, domain cpusetDomain, observed, target machine.CPUSet, snapshot domainSnapshot) nodeTransition {
-	t := nodeTransition{
-		node:     node,
-		domain:   domain,
-		observed: observed.Clone(),
-		target:   target.Clone(),
-		entering: target.Difference(observed),
+func reclaimValidationGroup(node *TopoNode) string {
+	if node == nil {
+		return ""
 	}
-	leaving := observed.Difference(target)
-	switch domain {
-	case cpusetDomainPrimary:
-		t.crossDomainEntering = t.entering.Intersection(snapshot.observedReclaimDomain)
-		t.crossDomainLeaving = leaving.Intersection(snapshot.targetReclaimDomain)
-	case cpusetDomainReclaim:
-		t.crossDomainEntering = t.entering.Intersection(snapshot.observedPrimaryDomain)
-		t.crossDomainLeaving = leaving.Intersection(snapshot.targetPrimaryDomain)
-	}
-	return t
-}
-
-func (p *transitionPlan) appendPhase(t nodeTransition) {
-	switch t.domain {
-	case cpusetDomainPrimary:
-		if !t.crossDomainLeaving.IsEmpty() {
-			p.drainPrimaryToReclaim = append(p.drainPrimaryToReclaim, t)
-		}
-		if !t.entering.IsEmpty() {
-			p.expandPrimary = append(p.expandPrimary, t)
-		}
-	case cpusetDomainReclaim:
-		if !t.crossDomainLeaving.IsEmpty() {
-			p.drainReclaimToPrimary = append(p.drainReclaimToPrimary, t)
-		}
-		if !t.entering.IsEmpty() {
-			p.expandReclaim = append(p.expandReclaim, t)
+	for current := node; current != nil; current = current.parent {
+		if current.Role == TopoNodeRoleReclaim {
+			if reclaimIndex := strings.TrimSpace(current.Metadata["reclaim-index"]); reclaimIndex != "" {
+				return "reclaim-index:" + reclaimIndex
+			}
+			return "reclaim-root:" + current.Rel
 		}
 	}
+	if reclaimIndex := strings.TrimSpace(node.Metadata["reclaim-index"]); reclaimIndex != "" {
+		return "reclaim-index:" + reclaimIndex
+	}
+	return ""
 }

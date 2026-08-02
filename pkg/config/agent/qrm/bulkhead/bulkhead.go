@@ -19,7 +19,38 @@ package bulkhead
 import (
 	"strconv"
 	"strings"
+	"time"
 )
+
+const (
+	// DefaultTopologyConvergenceDeadline covers the observed cgroup v1
+	// multi-round convergence window under high-churn E2E workloads.
+	DefaultTopologyConvergenceDeadline = 10 * time.Second
+	DefaultDeadlockProbeOperations     = 4096
+	// The outer handler also runs cpuset_mems, workqueue, and system_service
+	// after topology convergence, so it must not expire at the topology budget.
+	minTopologyHandlerTimeoutMargin = 100 * time.Millisecond
+	maxTopologyHandlerTimeoutMargin = 5 * time.Second
+	maxTopologyHandlerTimeout       = time.Duration(1<<63 - 1)
+)
+
+type ConvergenceBudget struct {
+	MaxRounds                  int
+	MaxHierarchyIOOperations   int
+	MaxSnapshotNodes           int
+	MaxSnapshotDepth           int
+	MaxDomains                 int
+	MaxTransferEdges           int
+	MaxPlanOperations          int
+	MaxDeadlockProbeOperations int
+	DeadlineDuration           time.Duration
+}
+
+type DrainSelectionPolicy struct {
+	MaxCPUsDrainRatio         float64
+	GroupByNUMA               bool
+	RequirePairedSwapProgress bool
+}
 
 type BulkheadConfiguration struct {
 	BulkheadPrimaryRelPath        string
@@ -45,10 +76,60 @@ type BulkheadConfiguration struct {
 	// kthreads (kswapd, kcompactd). Never populate this with per-CPU
 	// kthreads (migration/N, ksoftirqd/N) — they cannot be moved.
 	BulkheadSystemKThreadCommSubstrs []string
+
+	TopologyConvergenceBudget ConvergenceBudget
+	TopologyDrainSelection    DrainSelectionPolicy
 }
 
 func NewBulkheadConfiguration() *BulkheadConfiguration {
-	return &BulkheadConfiguration{}
+	return &BulkheadConfiguration{
+		TopologyConvergenceBudget: DefaultConvergenceBudget(),
+		TopologyDrainSelection:    DefaultDrainSelectionPolicy(),
+	}
+}
+
+func DefaultConvergenceBudget() ConvergenceBudget {
+	return ConvergenceBudget{
+		MaxRounds:                  0,
+		MaxHierarchyIOOperations:   0,
+		MaxSnapshotNodes:           4096,
+		MaxSnapshotDepth:           16,
+		MaxDomains:                 256,
+		MaxTransferEdges:           4096,
+		MaxPlanOperations:          0,
+		MaxDeadlockProbeOperations: DefaultDeadlockProbeOperations,
+		DeadlineDuration:           DefaultTopologyConvergenceDeadline,
+	}
+}
+
+// TopologyHandlerTimeout derives the outer handler bound from the configured
+// coordinator deadline so the inner convergence budget always expires first.
+func TopologyHandlerTimeout(c *BulkheadConfiguration) time.Duration {
+	deadline := DefaultTopologyConvergenceDeadline
+	if c != nil && c.TopologyConvergenceBudget.DeadlineDuration > 0 {
+		deadline = c.TopologyConvergenceBudget.DeadlineDuration
+	}
+	margin := deadline / 2
+	if margin < minTopologyHandlerTimeoutMargin {
+		margin = minTopologyHandlerTimeoutMargin
+	}
+	if margin > maxTopologyHandlerTimeoutMargin {
+		margin = maxTopologyHandlerTimeoutMargin
+	}
+	// Saturate instead of wrapping when an extreme configured deadline leaves
+	// no representable room for the outer-handler margin.
+	if deadline > maxTopologyHandlerTimeout-margin {
+		return maxTopologyHandlerTimeout
+	}
+	return deadline + margin
+}
+
+func DefaultDrainSelectionPolicy() DrainSelectionPolicy {
+	return DrainSelectionPolicy{
+		MaxCPUsDrainRatio:         0,
+		GroupByNUMA:               false,
+		RequirePairedSwapProgress: true,
+	}
 }
 
 func FormatBulkheadNUMARel(prefix string, numaID int) string {

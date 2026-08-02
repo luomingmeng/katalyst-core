@@ -100,7 +100,7 @@ func validateNoPrimaryReclaimOverlap(dag *TopoDAG, effective map[string]machine.
 		for _, r := range reclaims {
 			overlap := primaryTarget.Intersection(effective[r.Rel])
 			if !overlap.IsEmpty() {
-				return fmt.Errorf("ApplyDAGDiff: partition cpuset overlap: primary=%s target=%s reclaim=%s target=%s overlap=%s",
+				return fmt.Errorf("TopologyCoordinatorConverge: partition cpuset overlap: primary=%s target=%s reclaim=%s target=%s overlap=%s",
 					n.Rel, primaryTarget.String(), r.Rel, effective[r.Rel].String(), overlap.String())
 			}
 		}
@@ -118,7 +118,7 @@ func validateReclaimNUMABucketSiblingsDisjoint(dag *TopoDAG, effective map[strin
 				right := buckets[j]
 				overlap := effective[left.Rel].Intersection(effective[right.Rel])
 				if !overlap.IsEmpty() {
-					return fmt.Errorf("ApplyDAGDiff: reclaim numa bucket overlap: parent=%s left=%s target=%s right=%s target=%s overlap=%s",
+					return fmt.Errorf("TopologyCoordinatorConverge: reclaim numa bucket overlap: parent=%s left=%s target=%s right=%s target=%s overlap=%s",
 						parent.Rel,
 						left.Rel, effective[left.Rel].String(),
 						right.Rel, effective[right.Rel].String(),
@@ -141,7 +141,7 @@ func validateReclaimNUMABucketNUMABinding(dag *TopoDAG, effective map[string]mac
 		rawNUMA := node.Metadata["numa"]
 		numaID, err := strconv.Atoi(rawNUMA)
 		if err != nil {
-			return fmt.Errorf("ApplyDAGDiff: reclaim numa bucket missing numa metadata: rel=%s numa=%q", node.Rel, rawNUMA)
+			return fmt.Errorf("TopologyCoordinatorConverge: reclaim numa bucket missing numa metadata: rel=%s numa=%q", node.Rel, rawNUMA)
 		}
 		allowed := cpuDetails.CPUsInNUMANodes(numaID)
 		target := effective[node.Rel]
@@ -149,7 +149,7 @@ func validateReclaimNUMABucketNUMABinding(dag *TopoDAG, effective map[string]mac
 			continue
 		}
 		outside := target.Difference(allowed)
-		return fmt.Errorf("ApplyDAGDiff: reclaim numa bucket outside numa cpuset: rel=%s numa=%d target=%s allowed=%s outside=%s",
+		return fmt.Errorf("TopologyCoordinatorConverge: reclaim numa bucket outside numa cpuset: rel=%s numa=%d target=%s allowed=%s outside=%s",
 			node.Rel, numaID, target.String(), allowed.String(), outside.String())
 	}
 	return nil

@@ -37,14 +37,6 @@ func domainOf(role TopoNodeRole) cpusetDomain {
 	}
 }
 
-func isPrimaryRole(role TopoNodeRole) bool {
-	return domainOf(role) == cpusetDomainPrimary
-}
-
-func isReclaimRole(role TopoNodeRole) bool {
-	return domainOf(role) == cpusetDomainReclaim
-}
-
 func domainNodes(dag *TopoDAG, domain cpusetDomain) []*TopoNode {
 	if dag == nil || domain == cpusetDomainUnknown {
 		return nil

@@ -16,12 +16,7 @@ limitations under the License.
 
 package topology
 
-import (
-	"context"
-
-	cgroupclient "github.com/kubewharf/katalyst-core/pkg/util/cgroup/client"
-	"github.com/kubewharf/katalyst-core/pkg/util/machine"
-)
+import "github.com/kubewharf/katalyst-core/pkg/util/machine"
 
 type ConvergenceReport struct {
 	FullyConverged        bool
@@ -33,10 +28,12 @@ type ConvergenceReport struct {
 }
 
 type RelConvergence struct {
-	Rel      string
-	Observed machine.CPUSet
-	Target   machine.CPUSet
-	Reason   string
+	Rel          string
+	Observed     machine.CPUSet
+	Target       machine.CPUSet
+	ObservedMems string
+	TargetMems   string
+	Reason       string
 }
 
 const (
@@ -45,35 +42,34 @@ const (
 )
 
 func buildConvergenceReport(
-	ctx context.Context,
-	cg cgroupclient.CgroupClient,
+	snapshot *CompleteSnapshot,
 	dag *TopoDAG,
 	targetByRel map[string]machine.CPUSet,
-	cpuDetails machine.CPUDetails,
-	reservedCPUs machine.CPUSet,
+	targetMemsByRel map[string]string,
+	desired map[DomainID]machine.CPUSet,
+	allowedCPUs machine.CPUSet,
+	capabilities HierarchyCapabilities,
 	allowEmptyTarget bool,
-	cache *applyCache,
 ) (ConvergenceReport, error) {
-	snapshot, err := buildDomainSnapshot(ctx, cg, dag, targetByRel, cpuDetails, reservedCPUs, cache)
+	gate, err := NewDomainGate("convergence-report", snapshot, desired, allowedCPUs, nil)
 	if err != nil {
 		return ConvergenceReport{}, err
 	}
-	gate := newDomainGate(snapshot)
 	// Successful writes alone do not prove convergence: runtime descendants may
 	// appear between writes. Compare the current hierarchy with targets to expose
 	// incomplete convergence.
 	report := ConvergenceReport{
-		PendingToPrimary:      gate.pendingToPrimary.Clone(),
-		PendingToReclaim:      gate.pendingToReclaim.Clone(),
-		CleanupPendingPrimary: gate.cleanupPendingPrimary.Clone(),
-		CleanupPendingReclaim: gate.cleanupPendingReclaim.Clone(),
+		PendingToPrimary:      gate.pending[DomainPrimary].Clone(),
+		PendingToReclaim:      gate.pending[DomainReclaim].Clone(),
+		CleanupPendingPrimary: gate.cleanupPending[DomainPrimary].Clone(),
+		CleanupPendingReclaim: gate.cleanupPending[DomainReclaim].Clone(),
 	}
 	for _, node := range dag.Nodes() {
 		target := targetByRel[node.Rel]
 		if target.IsEmpty() && !allowEmptyTarget {
 			continue
 		}
-		observed, ok := snapshot.observedByRel[node.Rel]
+		entry, ok := snapshot.Entries[node.Rel]
 		if !ok {
 			report.NonConvergedTargets = append(report.NonConvergedTargets, RelConvergence{
 				Rel:    node.Rel,
@@ -82,12 +78,22 @@ func buildConvergenceReport(
 			})
 			continue
 		}
-		if !observed.Equals(target) {
+		targetMems := targetMemsByRel[node.Rel]
+		memsMatch := true
+		if targetMems != "" {
+			observedSet, observedErr := machine.Parse(entry.Mems)
+			targetSet, targetErr := machine.Parse(targetMems)
+			memsMatch = observedErr == nil && targetErr == nil && observedSet.Equals(targetSet)
+		}
+		observedCPUs := observedCPUsForTargetProof(entry, target, capabilities)
+		if !observedCPUs.Equals(target) || !memsMatch {
 			report.NonConvergedTargets = append(report.NonConvergedTargets, RelConvergence{
-				Rel:      node.Rel,
-				Observed: observed.Clone(),
-				Target:   target.Clone(),
-				Reason:   convergenceReasonTargetMismatch,
+				Rel:          node.Rel,
+				Observed:     observedCPUs.Clone(),
+				Target:       target.Clone(),
+				ObservedMems: entry.Mems,
+				TargetMems:   targetMems,
+				Reason:       convergenceReasonTargetMismatch,
 			})
 		}
 	}

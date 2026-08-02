@@ -16,7 +16,10 @@ limitations under the License.
 
 package bulkhead
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestBulkheadReclaimPerNUMAUsesTrimmedPrefix(t *testing.T) {
 	t.Parallel()
@@ -28,5 +31,57 @@ func TestBulkheadReclaimPerNUMAUsesTrimmedPrefix(t *testing.T) {
 	}
 	if got := cfg.ReclaimPerNUMA(1, 2); got != "" {
 		t.Fatalf("out-of-range prefix should return empty rel, got %q", got)
+	}
+}
+
+func TestNewBulkheadConfigurationDefaultsConvergenceBudgetAndDrainSelection(t *testing.T) {
+	t.Parallel()
+
+	cfg := NewBulkheadConfiguration()
+	if DefaultTopologyConvergenceDeadline != 10*time.Second {
+		t.Fatalf("default topology convergence deadline = %s, want 10s validated by high-churn E2E",
+			DefaultTopologyConvergenceDeadline)
+	}
+	budget := cfg.TopologyConvergenceBudget
+	if budget.MaxRounds != 0 {
+		t.Fatalf("round budget default = %d, want 0/auto", budget.MaxRounds)
+	}
+	if budget.MaxHierarchyIOOperations != 0 {
+		t.Fatalf("hierarchy I/O budget default = %d, want 0/auto", budget.MaxHierarchyIOOperations)
+	}
+	if budget.MaxPlanOperations != 0 {
+		t.Fatalf("plan operation budget default = %d, want 0/auto", budget.MaxPlanOperations)
+	}
+	if budget.MaxSnapshotNodes <= 0 ||
+		budget.MaxSnapshotDepth <= 0 ||
+		budget.MaxDomains <= 0 ||
+		budget.MaxTransferEdges <= 0 ||
+		budget.MaxDeadlockProbeOperations <= 0 {
+		t.Fatalf("budget defaults must be non-zero defensive limits: %+v", budget)
+	}
+	if budget.DeadlineDuration != DefaultTopologyConvergenceDeadline {
+		t.Fatalf("deadline default = %s, want %s", budget.DeadlineDuration, DefaultTopologyConvergenceDeadline)
+	}
+	if got := TopologyHandlerTimeout(cfg); got != 15*time.Second {
+		t.Fatalf("outer handler timeout = %s, want 15s to preserve post-topology handler budget", got)
+	}
+	selection := cfg.TopologyDrainSelection
+	if selection.MaxCPUsDrainRatio != 0 {
+		t.Fatalf("default drain ratio = %v, want 0/full-drain", selection.MaxCPUsDrainRatio)
+	}
+	if selection.GroupByNUMA || !selection.RequirePairedSwapProgress {
+		t.Fatalf("selection defaults must use full-drain with paired progress and no small-step topology grouping: %+v", selection)
+	}
+}
+
+func TestTopologyHandlerTimeoutSaturatesNearMaxDuration(t *testing.T) {
+	t.Parallel()
+
+	const maxDuration = time.Duration(1<<63 - 1)
+	cfg := NewBulkheadConfiguration()
+	cfg.TopologyConvergenceBudget.DeadlineDuration = maxDuration
+
+	if got := TopologyHandlerTimeout(cfg); got != maxDuration {
+		t.Fatalf("outer handler timeout = %s, want saturation at %s", got, maxDuration)
 	}
 }

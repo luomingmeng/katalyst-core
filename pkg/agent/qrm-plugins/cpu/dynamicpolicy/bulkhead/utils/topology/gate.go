@@ -16,81 +16,250 @@ limitations under the License.
 
 package topology
 
-import "github.com/kubewharf/katalyst-core/pkg/util/machine"
+import (
+	"crypto/sha256"
+	"fmt"
+	"sort"
+	"strings"
 
-type domainGate struct {
-	releasedToPrimary machine.CPUSet
-	releasedToReclaim machine.CPUSet
+	"github.com/kubewharf/katalyst-core/pkg/util/machine"
+)
 
-	pendingToPrimary machine.CPUSet
-	pendingToReclaim machine.CPUSet
-
-	cleanupPendingPrimary machine.CPUSet
-	cleanupPendingReclaim machine.CPUSet
-
-	safeUnownedToPrimary machine.CPUSet
-	safeUnownedToReclaim machine.CPUSet
+type ReleaseWitness struct {
+	ConvergenceID             string
+	Source                    DomainID
+	Destination               DomainID
+	CPUs                      machine.CPUSet
+	SourceEvidenceID          SnapshotID
+	SourceBoundaryFingerprint string
 }
 
-func newDomainGate(snapshot domainSnapshot) domainGate {
-	gate := domainGate{
-		releasedToPrimary:     machine.NewCPUSet(),
-		releasedToReclaim:     machine.NewCPUSet(),
-		safeUnownedToPrimary:  machine.NewCPUSet(),
-		safeUnownedToReclaim:  machine.NewCPUSet(),
-		pendingToPrimary:      machine.NewCPUSet(),
-		pendingToReclaim:      machine.NewCPUSet(),
-		cleanupPendingPrimary: machine.NewCPUSet(),
-		cleanupPendingReclaim: machine.NewCPUSet(),
+type DomainGate struct {
+	convergenceID   string
+	allowedCPUs     machine.CPUSet
+	witnesses       []ReleaseWitness
+	allowedEntering map[DomainID]machine.CPUSet
+	pending         map[DomainID]machine.CPUSet
+	cleanupPending  map[DomainID]machine.CPUSet
+}
+
+func NewReleaseWitness(
+	convergenceID string,
+	source, destination DomainID,
+	releaseCandidate machine.CPUSet,
+	after *CompleteSnapshot,
+) ReleaseWitness {
+	released := machine.NewCPUSet()
+	if after != nil {
+		released = releaseCandidate.Difference(after.DomainUnion[source])
 	}
-	gate.recomputePending(snapshot)
-	return gate
+	return ReleaseWitness{
+		ConvergenceID:             convergenceID,
+		Source:                    source,
+		Destination:               destination,
+		CPUs:                      released,
+		SourceEvidenceID:          sourceEvidenceID(after, source),
+		SourceBoundaryFingerprint: sourceBoundaryFingerprint(after, source),
+	}
 }
 
-func (g *domainGate) recomputePending(snapshot domainSnapshot) {
-	primaryLeaving := snapshot.observedPrimaryDomain.Difference(snapshot.targetPrimaryDomain)
-	reclaimLeaving := snapshot.observedReclaimDomain.Difference(snapshot.targetReclaimDomain)
-
-	g.pendingToPrimary = reclaimLeaving.Intersection(snapshot.targetPrimaryDomain)
-	g.pendingToReclaim = primaryLeaving.Intersection(snapshot.targetReclaimDomain)
-	g.cleanupPendingPrimary = primaryLeaving.
-		Difference(snapshot.targetReclaimDomain)
-	g.cleanupPendingReclaim = reclaimLeaving.
-		Difference(snapshot.targetPrimaryDomain)
-	g.safeUnownedToPrimary = snapshot.safeUnownedToPrimary()
-	g.safeUnownedToReclaim = snapshot.safeUnownedToReclaim()
+func ValidateReleaseWitness(
+	witness ReleaseWitness,
+	convergenceID string,
+	source, destination DomainID,
+	freshSource *CompleteSnapshot,
+) bool {
+	if freshSource == nil ||
+		witness.ConvergenceID != convergenceID ||
+		witness.Source != source ||
+		witness.Destination != destination ||
+		witness.SourceEvidenceID == (SnapshotID{}) ||
+		witness.SourceEvidenceID != sourceEvidenceID(freshSource, source) ||
+		witness.SourceBoundaryFingerprint != sourceBoundaryFingerprint(freshSource, source) {
+		return false
+	}
+	return witness.CPUs.Intersection(freshSource.DomainUnion[source]).IsEmpty()
 }
 
-func (g *domainGate) publishReleased(fromDomain cpusetDomain, releaseBatch machine.CPUSet, snapshot domainSnapshot) machine.CPUSet {
-	var stillOwned machine.CPUSet
-	switch fromDomain {
-	case cpusetDomainPrimary:
-		stillOwned = snapshot.observedPrimaryDomain
-	case cpusetDomainReclaim:
-		stillOwned = snapshot.observedReclaimDomain
-	default:
+func NewDomainGate(
+	convergenceID string,
+	snapshot *CompleteSnapshot,
+	desired map[DomainID]machine.CPUSet,
+	allowedCPUs machine.CPUSet,
+	witnesses []ReleaseWitness,
+) (*DomainGate, error) {
+	gate := &DomainGate{
+		convergenceID:   convergenceID,
+		allowedCPUs:     allowedCPUs.Clone(),
+		witnesses:       append([]ReleaseWitness(nil), witnesses...),
+		allowedEntering: make(map[DomainID]machine.CPUSet, len(desired)),
+		pending:         make(map[DomainID]machine.CPUSet, len(desired)),
+		cleanupPending:  make(map[DomainID]machine.CPUSet, len(desired)),
+	}
+	if strings.TrimSpace(convergenceID) == "" {
+		return nil, fmt.Errorf("domain gate requires non-empty ConvergenceID")
+	}
+	if allowedCPUs.IsEmpty() {
+		return nil, fmt.Errorf("domain gate requires explicit non-empty AllowedCPUs")
+	}
+	if snapshot == nil {
+		return gate, nil
+	}
+	gate.Revalidate(convergenceID, snapshot, desired)
+	return gate, nil
+}
+
+// Revalidate rebuilds all expand authorization from a fresh snapshot. Both the
+// recomputable source evidence ID and its scan boundary must still match;
+// destination-only writes do not change either source-scoped value.
+func (g *DomainGate) Revalidate(convergenceID string, snapshot *CompleteSnapshot, desired map[DomainID]machine.CPUSet) {
+	if g == nil {
+		return
+	}
+	g.allowedEntering = make(map[DomainID]machine.CPUSet, len(desired))
+	g.pending = make(map[DomainID]machine.CPUSet, len(desired))
+	g.cleanupPending = make(map[DomainID]machine.CPUSet, len(desired))
+	if snapshot == nil || convergenceID == "" || convergenceID != g.convergenceID {
+		return
+	}
+	owned := machine.NewCPUSet()
+	for _, cpus := range snapshot.DomainUnion {
+		owned = owned.Union(cpus)
+	}
+	unowned := g.allowedCPUs.Difference(owned)
+	for _, cpu := range unowned.ToSliceInt() {
+		var destination DomainID
+		count := 0
+		for domain, target := range desired {
+			if target.Contains(cpu) {
+				destination = domain
+				count++
+			}
+		}
+		if count == 1 {
+			safe := machine.NewCPUSet(cpu)
+			g.allowedEntering[destination] = g.allowedEntering[destination].Union(safe)
+		}
+	}
+	for _, witness := range g.witnesses {
+		if witness.Destination == "" || witness.Source == witness.Destination {
+			continue
+		}
+		if !ValidateReleaseWitness(witness, convergenceID, witness.Source, witness.Destination, snapshot) {
+			continue
+		}
+		heldOutsideDestination := machine.NewCPUSet()
+		for domain, cpus := range snapshot.DomainUnion {
+			if domain != witness.Destination {
+				heldOutsideDestination = heldOutsideDestination.Union(cpus)
+			}
+		}
+		g.allowedEntering[witness.Destination] =
+			g.allowedEntering[witness.Destination].Union(
+				witness.CPUs.Difference(heldOutsideDestination).
+					Intersection(desired[witness.Destination]).Intersection(g.allowedCPUs))
+	}
+	g.recomputePending(snapshot, desired)
+}
+
+func (g *DomainGate) AllowedEntering(domain DomainID) machine.CPUSet {
+	if g == nil {
 		return machine.NewCPUSet()
 	}
-	actuallyReleased := releaseBatch.Difference(stillOwned)
-	switch fromDomain {
-	case cpusetDomainPrimary:
-		g.releasedToReclaim = g.releasedToReclaim.Union(actuallyReleased.Intersection(snapshot.targetReclaimDomain))
-	case cpusetDomainReclaim:
-		g.releasedToPrimary = g.releasedToPrimary.Union(actuallyReleased.Intersection(snapshot.targetPrimaryDomain))
-	}
-	g.recomputePending(snapshot)
-	return actuallyReleased
+	return g.allowedEntering[domain].Clone()
 }
 
-func (g *domainGate) allowedGrowTarget(domain cpusetDomain, desired machine.CPUSet, observed machine.CPUSet) machine.CPUSet {
-	switch domain {
-	case cpusetDomainPrimary:
-		allowed := observed.Union(g.releasedToPrimary).Union(g.safeUnownedToPrimary)
-		return desired.Intersection(allowed).Difference(g.pendingToPrimary)
-	case cpusetDomainReclaim:
-		allowed := observed.Union(g.releasedToReclaim).Union(g.safeUnownedToReclaim)
-		return desired.Intersection(allowed).Difference(g.pendingToReclaim)
-	default:
-		return machine.NewCPUSet()
+func (g *DomainGate) AllowedGrowTarget(domain DomainID, desired, observed machine.CPUSet) machine.CPUSet {
+	if g == nil {
+		return observed.Clone()
 	}
+	return observed.Union(desired.Difference(observed).Intersection(g.allowedEntering[domain]))
+}
+
+func (g *DomainGate) recomputePending(snapshot *CompleteSnapshot, desired map[DomainID]machine.CPUSet) {
+	if g == nil || snapshot == nil {
+		return
+	}
+	for destination, target := range desired {
+		pending := machine.NewCPUSet()
+		for source, observed := range snapshot.DomainUnion {
+			if source == destination {
+				continue
+			}
+			pending = pending.Union(observed.Difference(desired[source]).Intersection(target))
+		}
+		g.pending[destination] = pending.Difference(g.allowedEntering[destination])
+		cleanup := snapshot.DomainUnion[destination].Difference(target)
+		for other, otherTarget := range desired {
+			if other != destination {
+				cleanup = cleanup.Difference(otherTarget)
+			}
+		}
+		g.cleanupPending[destination] = cleanup
+	}
+}
+
+func sourceBoundaryFingerprint(snapshot *CompleteSnapshot, source DomainID) string {
+	if snapshot == nil {
+		return ""
+	}
+	hash := sha256.New()
+	writeHashString(hash, "bulkhead-source-boundary-v1")
+	writeHashString(hash, string(source))
+	for _, root := range snapshot.ScanBoundary.Roots {
+		if snapshotRelBelongsToDomain(snapshot, root, source) {
+			writeHashString(hash, root)
+		}
+	}
+	for _, rel := range snapshot.ScanBoundary.ExpandedRels {
+		if snapshotRelBelongsToDomain(snapshot, rel, source) {
+			writeHashString(hash, rel)
+		}
+	}
+	return string(hash.Sum(nil))
+}
+
+func sourceEvidenceID(snapshot *CompleteSnapshot, source DomainID) SnapshotID {
+	if snapshot == nil {
+		return SnapshotID{}
+	}
+	hash := sha256.New()
+	writeHashString(hash, "bulkhead-source-evidence-v1")
+	writeHashString(hash, string(source))
+	rels := make([]string, 0)
+	for rel := range snapshot.Entries {
+		if snapshotRelBelongsToDomain(snapshot, rel, source) {
+			rels = append(rels, rel)
+		}
+	}
+	sort.Strings(rels)
+	for _, rel := range rels {
+		entry := snapshot.Entries[rel]
+		writeHashString(hash, rel)
+		writeHashUint64(hash, entry.Identity.Device)
+		writeHashUint64(hash, entry.Identity.Inode)
+		writeHashString(hash, entry.CPUs.String())
+		writeHashString(hash, entry.Mems)
+		for _, child := range snapshot.Children[rel] {
+			writeHashString(hash, child.Name)
+			writeHashUint64(hash, child.Identity.Device)
+			writeHashUint64(hash, child.Identity.Inode)
+		}
+	}
+	writeHashString(hash, snapshot.DomainUnion[source].String())
+	var id SnapshotID
+	copy(id[:], hash.Sum(nil))
+	return id
+}
+
+func snapshotRelBelongsToDomain(snapshot *CompleteSnapshot, rel string, source DomainID) bool {
+	if len(snapshot.DomainByRel) > 0 {
+		return snapshot.DomainByRel[rel] == source
+	}
+	for _, root := range snapshot.ScanBoundary.Roots {
+		if rel == root || len(rel) > len(root) && rel[:len(root)] == root && rel[len(root)] == '/' {
+			return true
+		}
+	}
+	return len(snapshot.ScanBoundary.Roots) == 0
 }
