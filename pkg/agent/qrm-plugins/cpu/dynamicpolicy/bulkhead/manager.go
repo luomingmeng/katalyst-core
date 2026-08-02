@@ -191,7 +191,11 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 				}
 				continue
 			}
-			if err := p.CPUSetAdjustmentDisabledHandler(ctx, handlerCtx); err != nil {
+			err := p.CPUSetAdjustmentDisabledHandler(ctx, handlerCtx)
+			if !commitIfGenerationCurrent(in, func() {}) {
+				return empty, staleGenerationError()
+			}
+			if err != nil {
 				emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment_disabled", p.Name(), "failed", err.Error())
 				return empty, fmt.Errorf("bulkhead plugin %q disabled transition failed: %w", p.Name(), err)
 			}
@@ -212,6 +216,9 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 			// manager state from the middle of this transaction.
 			topologyCtx.ReportTopologyResult = nil
 			result, err := topologyPlugin.Apply(ctx, topologyCtx)
+			if !commitIfGenerationCurrent(in, func() {}) {
+				return empty, staleGenerationError()
+			}
 			if err != nil {
 				emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", p.Name(), "failed", err.Error())
 				return empty, fmt.Errorf("bulkhead plugin %q cpuset adjustment failed: %w", p.Name(), err)
