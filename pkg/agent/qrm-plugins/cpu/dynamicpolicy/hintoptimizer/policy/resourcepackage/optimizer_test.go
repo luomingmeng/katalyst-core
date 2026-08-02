@@ -66,6 +66,13 @@ func (m *MockState) SetAllocationInfo(podUID string, containerName string, alloc
 
 func (m *MockState) SetAllowSharedCoresOverlapReclaimedCores(allowSharedCoresOverlapReclaimedCores, persist bool) {
 }
+func (m *MockState) CommitAdvisorState(
+	podEntries state.PodEntries,
+	machineState state.NUMANodeMap,
+	allowSharedCoresOverlapReclaimedCores, persist bool,
+) error {
+	return nil
+}
 func (m *MockState) Delete(podUID string, containerName string, persist bool) {}
 func (m *MockState) ClearState()                                              {}
 func (m *MockState) StoreState() error                                        { return nil }

@@ -1232,7 +1232,7 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntries(
 		return fmt.Errorf("cleanPools failed with error: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), cpuSetAdjustmentHandlerTimeout(p.conf))
 	defer cancel()
 	if err := p.runCPUSetAdjustmentHandlers(ctx); err != nil {
 		return fmt.Errorf("runCPUSetAdjustmentHandlers failed with error: %v", err)
@@ -1456,7 +1456,12 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 
 	// revise reclaim pool size to avoid reclaimed_cores and numa_binding containers
 	// in NUMAs without cpuset actual binding
-	err := p.reviseReclaimPool(newPodEntries, nonReclaimActualBindingNUMAs, unionDedicatedIsolatedCPUSet)
+	err := p.reviseReclaimPool(
+		newPodEntries,
+		nonReclaimActualBindingNUMAs,
+		unionDedicatedIsolatedCPUSet,
+		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+	)
 	if err != nil {
 		return err
 	}

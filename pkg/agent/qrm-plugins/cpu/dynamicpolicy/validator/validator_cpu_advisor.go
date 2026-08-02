@@ -32,11 +32,11 @@ import (
 type cpuAdvisorValidationFunc func(resp *advisorapi.ListAndWatchResponse) error
 
 type CPUAdvisorValidator struct {
-	state       state.State
+	state       state.ReadonlyState
 	machineInfo *machine.KatalystMachineInfo
 }
 
-func NewCPUAdvisorValidator(state state.State, machineInfo *machine.KatalystMachineInfo) *CPUAdvisorValidator {
+func NewCPUAdvisorValidator(state state.ReadonlyState, machineInfo *machine.KatalystMachineInfo) *CPUAdvisorValidator {
 	return &CPUAdvisorValidator{
 		state:       state,
 		machineInfo: machineInfo,
@@ -257,6 +257,10 @@ func (c *CPUAdvisorValidator) validateBlocks(resp *advisorapi.ListAndWatchRespon
 		return fmt.Errorf("validateBlocksByTopology got nil topology")
 	}
 
+	if err := c.validateReclaimNUMAResults(resp); err != nil {
+		return err
+	}
+
 	numaToBlocks, err := resp.GetBlocks()
 	if err != nil {
 		return fmt.Errorf("GetBlocks failed with error: %v", err)
@@ -294,6 +298,63 @@ func (c *CPUAdvisorValidator) validateBlocks(resp *advisorapi.ListAndWatchRespon
 
 	if totalQuantity > c.machineInfo.CPUTopology.NumCPUs {
 		return fmt.Errorf("numaQuantity: %d exceeds total capacity: %d", totalQuantity, c.machineInfo.CPUTopology.NumCPUs)
+	}
+	return nil
+}
+
+func (c *CPUAdvisorValidator) validateReclaimNUMAResults(resp *advisorapi.ListAndWatchResponse) error {
+	if resp == nil || resp.AllowSharedCoresOverlapReclaimedCores {
+		return nil
+	}
+	reclaimInfo := getReclaimCalculationInfo(resp)
+	if reclaimInfo == nil {
+		return nil
+	}
+
+	for numaID, result := range reclaimInfo.CalculationResultsByNumas {
+		if numaID == commonstate.FakedNUMAID {
+			continue
+		}
+		if result == nil {
+			return fmt.Errorf("empty reclaim blocks for NUMA: %d", numaID)
+		}
+		if len(result.Blocks) == 0 {
+			return fmt.Errorf("empty reclaim blocks for NUMA: %d", numaID)
+		}
+		hasValidBlock := false
+		for _, block := range result.Blocks {
+			if block != nil {
+				hasValidBlock = true
+				break
+			}
+		}
+		if !hasValidBlock {
+			return fmt.Errorf("empty reclaim blocks for NUMA: %d", numaID)
+		}
+	}
+	return nil
+}
+
+func getReclaimCalculationInfo(resp *advisorapi.ListAndWatchResponse) *advisorapi.CalculationInfo {
+	if resp == nil || resp.Entries == nil {
+		return nil
+	}
+	reclaimEntries := resp.Entries[commonstate.PoolNameReclaim]
+	if reclaimEntries == nil {
+		return nil
+	}
+	if info := reclaimEntries.Entries[commonstate.FakedContainerName]; info != nil {
+		return info
+	}
+	for _, info := range reclaimEntries.Entries {
+		if info != nil && info.OwnerPoolName == commonstate.PoolNameReclaim {
+			return info
+		}
+	}
+	for _, info := range reclaimEntries.Entries {
+		if info != nil {
+			return info
+		}
 	}
 	return nil
 }

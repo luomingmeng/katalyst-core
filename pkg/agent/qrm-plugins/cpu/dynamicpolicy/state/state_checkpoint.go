@@ -255,6 +255,38 @@ func (sc *stateCheckpoint) SetAllowSharedCoresOverlapReclaimedCores(allowSharedC
 	}
 }
 
+// CommitAdvisorState atomically updates all state derived from one advisor response.
+func (sc *stateCheckpoint) CommitAdvisorState(
+	podEntries PodEntries,
+	machineState NUMANodeMap,
+	allowSharedCoresOverlapReclaimedCores bool,
+	persist bool,
+) error {
+	sc.Lock()
+	defer sc.Unlock()
+
+	oldPodEntries := sc.cache.GetPodEntries()
+	oldMachineState := sc.cache.GetMachineState()
+	oldAllowOverlap := sc.cache.GetAllowSharedCoresOverlapReclaimedCores()
+
+	if err := sc.cache.CommitAdvisorState(
+		podEntries,
+		machineState,
+		allowSharedCoresOverlapReclaimedCores,
+		false,
+	); err != nil {
+		return err
+	}
+	if !persist {
+		return nil
+	}
+	if err := sc.storeState(); err != nil {
+		_ = sc.cache.CommitAdvisorState(oldPodEntries, oldMachineState, oldAllowOverlap, false)
+		return err
+	}
+	return nil
+}
+
 func (sc *stateCheckpoint) GetAllowSharedCoresOverlapReclaimedCores() bool {
 	sc.RLock()
 	defer sc.RUnlock()

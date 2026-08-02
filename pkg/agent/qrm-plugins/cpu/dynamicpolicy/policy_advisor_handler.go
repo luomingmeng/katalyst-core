@@ -521,7 +521,14 @@ func (p *DynamicPolicy) allocateByCPUAdvisor(
 		return fmt.Errorf("generateBlockCPUSet failed with error: %v", aErr)
 	}
 
-	applyErr := p.applyBlocks(blockToCPUSet, resp)
+	curAllowSharedCoresOverlapReclaimedCores := p.state.GetAllowSharedCoresOverlapReclaimedCores()
+	if curAllowSharedCoresOverlapReclaimedCores != resp.AllowSharedCoresOverlapReclaimedCores {
+		general.Infof("set allowSharedCoresOverlapReclaimedCores from %v to %v",
+			curAllowSharedCoresOverlapReclaimedCores, resp.AllowSharedCoresOverlapReclaimedCores)
+	}
+
+	responseAllowOverlap := resp.AllowSharedCoresOverlapReclaimedCores
+	applyErr := p.applyBlocks(blockToCPUSet, resp, responseAllowOverlap)
 	if applyErr != nil {
 		return fmt.Errorf("applyBlocks failed with error: %v", applyErr)
 	}
@@ -536,15 +543,7 @@ func (p *DynamicPolicy) allocateByCPUAdvisor(
 		return fmt.Errorf("applyCgroupConfigs failed with error: %v", applyErr)
 	}
 
-	curAllowSharedCoresOverlapReclaimedCores := p.state.GetAllowSharedCoresOverlapReclaimedCores()
-
-	if curAllowSharedCoresOverlapReclaimedCores != resp.AllowSharedCoresOverlapReclaimedCores {
-		general.Infof("set allowSharedCoresOverlapReclaimedCores from %v to %v",
-			curAllowSharedCoresOverlapReclaimedCores, resp.AllowSharedCoresOverlapReclaimedCores)
-		p.state.SetAllowSharedCoresOverlapReclaimedCores(resp.AllowSharedCoresOverlapReclaimedCores, true)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), cpuSetAdjustmentHandlerTimeout(p.conf))
 	defer cancel()
 	if err := p.runCPUSetAdjustmentHandlers(ctx); err != nil {
 		return fmt.Errorf("runCPUSetAdjustmentHandlers failed with error: %v", err)
@@ -1463,7 +1462,11 @@ func (p *DynamicPolicy) generateBlockCPUSet(resp *advisorapi.ListAndWatchRespons
 // 1. construct entries for dedicated containers and pools
 // 2. ensure reclaimed pool exists
 // 3. construct entries for shared and reclaimed containers
-func (p *DynamicPolicy) applyBlocks(blockCPUSet advisorapi.BlockCPUSet, resp *advisorapi.ListAndWatchResponse) error {
+func (p *DynamicPolicy) applyBlocks(
+	blockCPUSet advisorapi.BlockCPUSet,
+	resp *advisorapi.ListAndWatchResponse,
+	allowSharedCoresOverlapReclaimedCores bool,
+) error {
 	if resp == nil {
 		return fmt.Errorf("applyBlocks got nil resp")
 	}
@@ -1590,7 +1593,12 @@ func (p *DynamicPolicy) applyBlocks(blockCPUSet advisorapi.BlockCPUSet, resp *ad
 
 	// revise reclaim pool size to avoid reclaimed_cores and numa_binding dedicated_cores containers
 	// in NUMAs without cpuset actual binding
-	err := p.reviseReclaimPool(newEntries, nonReclaimActualBindingNUMAs, pooledUnionDedicatedCPUSet)
+	err := p.reviseReclaimPool(
+		newEntries,
+		nonReclaimActualBindingNUMAs,
+		pooledUnionDedicatedCPUSet,
+		allowSharedCoresOverlapReclaimedCores,
+	)
 	if err != nil {
 		return err
 	}
@@ -1728,10 +1736,76 @@ func (p *DynamicPolicy) applyBlocks(blockCPUSet advisorapi.BlockCPUSet, resp *ad
 	if err != nil {
 		return fmt.Errorf("calculate machineState by newPodEntries failed with error: %v", err)
 	}
-	p.state.SetPodEntries(newEntries, false)
-	p.state.SetMachineState(newMachineState, false)
-	if err := p.state.StoreState(); err != nil {
-		general.ErrorS(err, "store state failed")
+	if err := p.validateAdvisorPartitionBeforeCommit(
+		newEntries,
+		allowSharedCoresOverlapReclaimedCores,
+	); err != nil {
+		return err
+	}
+	return p.state.CommitAdvisorState(
+		newEntries,
+		newMachineState,
+		allowSharedCoresOverlapReclaimedCores,
+		true,
+	)
+}
+
+func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommit(
+	newEntries state.PodEntries,
+	allowSharedCoresOverlapReclaimedCores bool,
+) error {
+	if p == nil || p.state == nil || p.machineInfo == nil || p.machineInfo.CPUTopology == nil {
+		return nil
+	}
+	reclaimEntries := newEntries[commonstate.PoolNameReclaim]
+	if reclaimEntries == nil {
+		return nil
+	}
+	reclaimPool := reclaimEntries[commonstate.FakedContainerName]
+	if reclaimPool == nil {
+		return nil
+	}
+
+	for numaID, reclaimInNUMA := range reclaimPool.TopologyAwareAssignments {
+		if numaID == commonstate.FakedNUMAID {
+			continue
+		}
+		numaCPUs := p.machineInfo.CPUDetails.CPUsInNUMANodes(numaID)
+		if !reclaimInNUMA.IsSubsetOf(numaCPUs) {
+			return fmt.Errorf("reclaim pool assignment crosses NUMA: numa=%d cpus=%s allowed=%s",
+				numaID, reclaimInNUMA.String(), numaCPUs.String())
+		}
+	}
+
+	if allowSharedCoresOverlapReclaimedCores {
+		return nil
+	}
+
+	nonReclaim := machine.NewCPUSet()
+	for name, containerEntries := range newEntries {
+		if containerEntries == nil {
+			continue
+		}
+		if containerEntries.IsPoolEntry() {
+			if name == commonstate.PoolNameReclaim {
+				continue
+			}
+			if ai := containerEntries[commonstate.FakedContainerName]; ai != nil {
+				nonReclaim = nonReclaim.Union(ai.AllocationResult)
+			}
+			continue
+		}
+		for _, ai := range containerEntries {
+			if ai == nil {
+				continue
+			}
+			if !ai.CheckReclaimed() {
+				nonReclaim = nonReclaim.Union(ai.AllocationResult)
+			}
+		}
+	}
+	if overlap := reclaimPool.AllocationResult.Intersection(nonReclaim); !overlap.IsEmpty() {
+		return fmt.Errorf("reclaim pool overlaps non-reclaim partition before commit: %s", overlap.String())
 	}
 	return nil
 }
@@ -1789,13 +1863,19 @@ func (p *DynamicPolicy) applyNUMAHeadroom(calculationInfo *advisorsvc.Calculatio
 	return nil
 }
 
-func (p *DynamicPolicy) reviseReclaimPool(newEntries state.PodEntries, nonReclaimActualBindingNUMAs, pooledUnionDedicatedCPUSet machine.CPUSet) error {
-	// if there is no block for state.PoolNameReclaim pool,
-	// we must make it existing here even if cause overlap
+func (p *DynamicPolicy) reviseReclaimPool(
+	newEntries state.PodEntries,
+	nonReclaimActualBindingNUMAs, pooledUnionDedicatedCPUSet machine.CPUSet,
+	allowSharedCoresOverlapReclaimedCores bool,
+) error {
+	notAllocatablePoolsCPUs := state.GetUnitedPoolsCPUs(newEntries, state.IsForbiddenPool, commonstate.IsSystemPool)
+	nonReclaimCPUSet := pooledUnionDedicatedCPUSet.Union(notAllocatablePoolsCPUs)
+
+	// Ensure the reclaim pool entry exists when the advisor omits its block.
+	// Only overlap mode may fall back to CPUs already assigned to non-reclaim entries.
 	if newEntries.CheckPoolEmpty(commonstate.PoolNameReclaim) {
-		notAllocatablePoolsCPUs := state.GetUnitedPoolsCPUs(p.state.GetPodEntries(), state.IsForbiddenPool, commonstate.IsSystemPool)
 		reclaimPoolCPUSet := p.machineInfo.CPUDetails.CPUs().Difference(p.reservedCPUs).Difference(pooledUnionDedicatedCPUSet).Difference(notAllocatablePoolsCPUs)
-		if reclaimPoolCPUSet.IsEmpty() {
+		if reclaimPoolCPUSet.IsEmpty() && allowSharedCoresOverlapReclaimedCores {
 			reclaimPoolCPUSet = p.reservedReclaimedCPUSet.Clone()
 			general.Infof("fallback takeByNUMABalance for reclaimPoolCPUSet: %s", reclaimPoolCPUSet.String())
 		}
@@ -1838,10 +1918,14 @@ func (p *DynamicPolicy) reviseReclaimPool(newEntries state.PodEntries, nonReclai
 		}
 
 		if reclaimPool.TopologyAwareAssignments[numaID].IsEmpty() {
-			reclaimPool.AllocationResult = reclaimPool.AllocationResult.Union(p.reservedReclaimedTopologyAwareAssignments[numaID])
-			reclaimPool.OriginalAllocationResult = reclaimPool.OriginalAllocationResult.Union(p.reservedReclaimedTopologyAwareAssignments[numaID])
-			reclaimPool.TopologyAwareAssignments[numaID] = p.reservedReclaimedTopologyAwareAssignments[numaID].Clone()
-			reclaimPool.OriginalTopologyAwareAssignments[numaID] = p.reservedReclaimedTopologyAwareAssignments[numaID].Clone()
+			fallbackCPUSet := p.reservedReclaimedTopologyAwareAssignments[numaID]
+			if !allowSharedCoresOverlapReclaimedCores {
+				fallbackCPUSet = fallbackCPUSet.Difference(nonReclaimCPUSet)
+			}
+			reclaimPool.AllocationResult = reclaimPool.AllocationResult.Union(fallbackCPUSet)
+			reclaimPool.OriginalAllocationResult = reclaimPool.OriginalAllocationResult.Union(fallbackCPUSet)
+			reclaimPool.TopologyAwareAssignments[numaID] = fallbackCPUSet.Clone()
+			reclaimPool.OriginalTopologyAwareAssignments[numaID] = fallbackCPUSet.Clone()
 		}
 	}
 
@@ -1862,10 +1946,14 @@ func (p *DynamicPolicy) reviseReclaimPool(newEntries state.PodEntries, nonReclai
 			if !nonReclaimActualBindingNUMAs.Contains(numaID) {
 				continue
 			}
-			reclaimPool.AllocationResult = reclaimPool.AllocationResult.Union(p.reservedReclaimedTopologyAwareAssignments[numaID])
-			reclaimPool.OriginalAllocationResult = reclaimPool.OriginalAllocationResult.Union(p.reservedReclaimedTopologyAwareAssignments[numaID])
-			reclaimPool.TopologyAwareAssignments[numaID] = p.reservedReclaimedTopologyAwareAssignments[numaID].Clone()
-			reclaimPool.OriginalTopologyAwareAssignments[numaID] = p.reservedReclaimedTopologyAwareAssignments[numaID].Clone()
+			fallbackCPUSet := p.reservedReclaimedTopologyAwareAssignments[numaID]
+			if !allowSharedCoresOverlapReclaimedCores {
+				fallbackCPUSet = fallbackCPUSet.Difference(nonReclaimCPUSet)
+			}
+			reclaimPool.AllocationResult = reclaimPool.AllocationResult.Union(fallbackCPUSet)
+			reclaimPool.OriginalAllocationResult = reclaimPool.OriginalAllocationResult.Union(fallbackCPUSet)
+			reclaimPool.TopologyAwareAssignments[numaID] = fallbackCPUSet.Clone()
+			reclaimPool.OriginalTopologyAwareAssignments[numaID] = fallbackCPUSet.Clone()
 		}
 	}
 

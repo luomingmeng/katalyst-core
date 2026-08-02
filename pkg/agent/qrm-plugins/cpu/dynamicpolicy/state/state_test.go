@@ -17,6 +17,7 @@ limitations under the License.
 package state
 
 import (
+	stderrors "errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -25,6 +26,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -48,6 +50,158 @@ const (
 	cpuPluginStateFileName = "cpu_plugin_state"
 	policyName             = "dynamic"
 )
+
+type advisorCommitCheckpointManager struct {
+	mu          sync.Mutex
+	createCalls int
+	createErr   error
+}
+
+func (m *advisorCommitCheckpointManager) CreateCheckpoint(_ string, _ checkpointmanager.Checkpoint) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.createCalls++
+	return m.createErr
+}
+
+func (m *advisorCommitCheckpointManager) GetCheckpoint(string, checkpointmanager.Checkpoint) error {
+	return nil
+}
+
+func (m *advisorCommitCheckpointManager) RemoveCheckpoint(string) error {
+	return nil
+}
+
+func (m *advisorCommitCheckpointManager) ListCheckpoints() ([]string, error) {
+	return nil, nil
+}
+
+func (m *advisorCommitCheckpointManager) calls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.createCalls
+}
+
+func TestCPUPluginStateCommitAdvisorStateIsAtomic(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
+	require.NoError(t, err)
+	s := NewCPUPluginState(topology)
+
+	makeVersion := func(version int) (PodEntries, NUMANodeMap, bool) {
+		allowOverlap := version%2 == 1
+		cpuID := version % 2
+		return PodEntries{
+				fmt.Sprintf("version-%d", cpuID): {
+					"main": &AllocationInfo{AllocationResult: machine.NewCPUSet(cpuID)},
+				},
+			}, NUMANodeMap{
+				0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(cpuID)},
+			}, allowOverlap
+	}
+
+	entries, machineState, allowOverlap := makeVersion(0)
+	require.NoError(t, s.CommitAdvisorState(entries, machineState, allowOverlap, false))
+
+	const iterations = 1000
+	var wg sync.WaitGroup
+	errCh := make(chan error, iterations)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 1; i <= iterations; i++ {
+			entries, machineState, allowOverlap := makeVersion(i)
+			if err := s.CommitAdvisorState(entries, machineState, allowOverlap, false); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			s.RLock()
+			entries := s.cpuPluginStateData.GetPodEntries()
+			machineState := s.cpuPluginStateData.GetMachineState()
+			allowOverlap := s.cpuPluginStateData.GetAllowSharedCoresOverlapReclaimedCores()
+			hasVersionOne := entries["version-1"] != nil
+			machineHasVersionOne := machineState[0].AllocatedCPUSet.Equals(machine.NewCPUSet(1))
+			s.RUnlock()
+			if hasVersionOne != machineHasVersionOne || hasVersionOne != allowOverlap {
+				errCh <- fmt.Errorf("observed mixed advisor state: entries=%v machine=%v overlap=%v",
+					hasVersionOne, machineHasVersionOne, allowOverlap)
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		require.NoError(t, err)
+	}
+}
+
+func TestCheckpointStateCommitAdvisorState(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
+	require.NoError(t, err)
+
+	newEntries := PodEntries{
+		"new": {
+			"main": &AllocationInfo{AllocationResult: machine.NewCPUSet(1)},
+		},
+	}
+	newMachineState := NUMANodeMap{
+		0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(1)},
+	}
+
+	t.Run("persists exactly once", func(t *testing.T) {
+		manager := &advisorCommitCheckpointManager{}
+		sc := &stateCheckpoint{
+			cache:             NewCPUPluginState(topology),
+			checkpointManager: manager,
+			checkpointName:    cpuPluginStateFileName,
+			emitter:           metrics.DummyMetrics{},
+		}
+
+		require.NoError(t, sc.CommitAdvisorState(newEntries, newMachineState, true, true))
+		require.Equal(t, 1, manager.calls())
+		require.True(t, sc.GetAllocationInfo("new", "main").AllocationResult.Equals(machine.NewCPUSet(1)))
+		require.True(t, sc.GetMachineState()[0].AllocatedCPUSet.Equals(machine.NewCPUSet(1)))
+		require.True(t, sc.GetAllowSharedCoresOverlapReclaimedCores())
+	})
+
+	t.Run("does not persist when disabled", func(t *testing.T) {
+		manager := &advisorCommitCheckpointManager{}
+		sc := &stateCheckpoint{
+			cache:             NewCPUPluginState(topology),
+			checkpointManager: manager,
+			checkpointName:    cpuPluginStateFileName,
+			emitter:           metrics.DummyMetrics{},
+		}
+
+		require.NoError(t, sc.CommitAdvisorState(newEntries, newMachineState, true, false))
+		require.Equal(t, 0, manager.calls())
+	})
+
+	t.Run("restores memory when persistence fails", func(t *testing.T) {
+		manager := &advisorCommitCheckpointManager{createErr: stderrors.New("store failed")}
+		sc := &stateCheckpoint{
+			cache:             NewCPUPluginState(topology),
+			checkpointManager: manager,
+			checkpointName:    cpuPluginStateFileName,
+			emitter:           metrics.DummyMetrics{},
+		}
+		oldEntries := sc.GetPodEntries()
+		oldMachineState := sc.GetMachineState()
+		oldAllowOverlap := sc.GetAllowSharedCoresOverlapReclaimedCores()
+
+		err := sc.CommitAdvisorState(newEntries, newMachineState, true, true)
+		require.EqualError(t, err, "store failed")
+		require.Equal(t, 1, manager.calls())
+		require.Equal(t, oldEntries, sc.GetPodEntries())
+		require.Equal(t, oldMachineState, sc.GetMachineState())
+		require.Equal(t, oldAllowOverlap, sc.GetAllowSharedCoresOverlapReclaimedCores())
+	})
+}
 
 func TestStateSkipsNilAllocationInfo(t *testing.T) {
 	t.Parallel()
