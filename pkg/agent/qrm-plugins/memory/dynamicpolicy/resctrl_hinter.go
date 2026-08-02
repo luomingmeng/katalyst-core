@@ -100,11 +100,6 @@ func (r *resctrlHinter) hintResourceAllocation(podMeta commonstate.AllocationMet
 		return
 	}
 
-	// inject shared subgroup if share pool
-	if r.enabledQoS.Has(podMeta.QoSLevel) {
-		injectRespAnnotation(resourceAllocation, util.AnnotationRdtClosID, resctrlGroup)
-	}
-
 	// inject pod mon group (false only) if applicable
 	needMonGroups := true
 	if isPodLevelSubgroupDisabled(resctrlGroup, r.closidEnablingGroups) {
@@ -123,6 +118,13 @@ func (r *resctrlHinter) hintResourceAllocation(podMeta commonstate.AllocationMet
 			general.Errorf("mbm: failed to create resctrl group for pod %s/%s: %v", podMeta.PodNamespace, podMeta.PodName, err)
 			return
 		}
+	}
+
+	// Allocate must establish the CLOS before publishing it to kubelet. In
+	// particular, a DisableRDT true->false transition may still be pending in
+	// the manager even though the latest dynamic configuration is enabled.
+	if r.enabledQoS.Has(podMeta.QoSLevel) {
+		injectRespAnnotation(resourceAllocation, util.AnnotationRdtClosID, resctrlGroup)
 	}
 
 	if !needMonGroups {
