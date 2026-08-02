@@ -86,6 +86,26 @@ func TestCPUListManagerRegistersOwnershipBeforeCreatingClos(t *testing.T) {
 	require.DirExists(t, filepath.Join(root, "dedicated"))
 }
 
+func TestClosOwnershipStoreTracksPendingCreateUntilFinished(t *testing.T) {
+	store := NewClosOwnershipStore(filepath.Join(t.TempDir(), "ownership.json"))
+
+	require.NoError(t, store.BeginCreate("dedicated"))
+	owned, err := store.Load()
+	require.NoError(t, err)
+	require.False(t, owned.Has("dedicated"))
+	pending, err := store.PendingCreates()
+	require.NoError(t, err)
+	require.True(t, pending.Has("dedicated"))
+
+	require.NoError(t, store.FinishCreate("dedicated"))
+	owned, err = store.Load()
+	require.NoError(t, err)
+	require.True(t, owned.Has("dedicated"))
+	pending, err = store.PendingCreates()
+	require.NoError(t, err)
+	require.False(t, pending.Has("dedicated"))
+}
+
 func TestCPUListManagerApplyCPUListSkipsMissingClosForEmptyTarget(t *testing.T) {
 	root := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(root, cpus), []byte("ffffffff\n"), 0o644))

@@ -175,20 +175,35 @@ func (m *cpuListManager) ensureClos(closID string, create bool) (bool, error) {
 		return false, nil
 	}
 	closPath := filepath.Join(m.root, closID)
+	pendingCreates, err := m.ownership.PendingCreates()
+	if err != nil {
+		return false, fmt.Errorf("load pending CLOS creations: %w", err)
+	}
+	if pendingCreates.Has(closID) {
+		if err := os.RemoveAll(closPath); err != nil {
+			return false, fmt.Errorf("recover pending creation of CLOS %q: %w", closID, err)
+		}
+		if err := m.ownership.AbortCreate(closID); err != nil {
+			return false, fmt.Errorf("finish recovery of pending CLOS %q creation: %w", closID, err)
+		}
+	}
 	if _, err := os.Stat(closPath); err == nil {
 		return false, nil
 	} else if !os.IsNotExist(err) {
 		return false, fmt.Errorf("stat CLOS %q: %w", closID, err)
 	}
-	if err := m.ownership.Register(closID); err != nil {
-		return false, fmt.Errorf("checkpoint CLOS %q ownership: %w", closID, err)
+	if err := m.ownership.BeginCreate(closID); err != nil {
+		return false, fmt.Errorf("checkpoint pending CLOS %q creation: %w", closID, err)
 	}
 	if err := os.Mkdir(closPath, 0o755); err != nil {
-		_ = m.ownership.Unregister(closID)
+		_ = m.ownership.AbortCreate(closID)
 		if os.IsExist(err) {
 			return false, nil
 		}
 		return false, fmt.Errorf("create CLOS %q: %w", closID, err)
+	}
+	if err := m.ownership.FinishCreate(closID); err != nil {
+		return false, fmt.Errorf("checkpoint CLOS %q ownership: %w", closID, err)
 	}
 	return true, nil
 }
