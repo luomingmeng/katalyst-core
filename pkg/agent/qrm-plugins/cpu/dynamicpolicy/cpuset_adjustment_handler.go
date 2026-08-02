@@ -29,6 +29,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	bulkheadconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/bulkhead"
+	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -181,9 +182,28 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context) error {
 			}
 		}
 		p.Lock()
-		if roundInvalidated && ctx.Err() == nil {
-			continue
+		if roundInvalidated {
+			if ctx.Err() == nil {
+				continue
+			}
+			p.scheduleCPUSetAdjustmentRetry()
+			if roundErr != nil {
+				return fmt.Errorf("%v; scheduled latest cpuset adjustment after canceled stale round: %w", roundErr, ctx.Err())
+			}
+			return ctx.Err()
 		}
 		return roundErr
 	}
+}
+
+func (p *DynamicPolicy) scheduleCPUSetAdjustmentRetry() {
+	go func() {
+		p.Lock()
+		defer p.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), cpuSetAdjustmentHandlerTimeout(p.conf))
+		defer cancel()
+		if err := p.runCPUSetAdjustmentHandlers(ctx); err != nil {
+			general.Errorf("retry latest cpuset adjustment after stale round failed: %v", err)
+		}
+	}()
 }
