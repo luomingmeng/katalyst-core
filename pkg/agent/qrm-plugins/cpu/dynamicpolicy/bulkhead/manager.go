@@ -253,7 +253,11 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 			emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", p.Name(), "success", "")
 			continue
 		}
-		if err := p.CPUSetAdjustmentHandler(ctx, handlerCtx); err != nil {
+		err := p.CPUSetAdjustmentHandler(ctx, handlerCtx)
+		if !commitIfGenerationCurrent(in, func() {}) {
+			return empty, staleGenerationError()
+		}
+		if err != nil {
 			emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", p.Name(), "failed", err.Error())
 			return empty, fmt.Errorf("bulkhead plugin %q cpuset adjustment failed: %w", p.Name(), err)
 		}
