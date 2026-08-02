@@ -21,19 +21,21 @@ import (
 
 	qrmresctrlmanager "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/resctrl"
 	qrmresctrl "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/resctrl"
-	resctrlutil "github.com/kubewharf/katalyst-core/pkg/util/resctrl"
 )
 
 type configuredClosManager struct {
-	manager qrmresctrlmanager.CPUListManager
-	config  *qrmresctrl.ResctrlConfig
+	manager   qrmresctrlmanager.CPUListManager
+	ownership *qrmresctrlmanager.ClosOwnershipStore
 }
 
 func newConfiguredClosManager(config *qrmresctrl.ResctrlConfig, manager qrmresctrlmanager.CPUListManager) *configuredClosManager {
 	if config == nil {
 		config = qrmresctrl.NewResctrlConfig()
 	}
-	return &configuredClosManager{manager: manager, config: config}
+	return &configuredClosManager{
+		manager:   manager,
+		ownership: qrmresctrlmanager.NewClosOwnershipStore(config.OwnershipCheckpointPath),
+	}
 }
 
 func (m *configuredClosManager) ListCATManagedClos(ctx context.Context) ([]qrmresctrlmanager.CPUListClos, error) {
@@ -41,9 +43,13 @@ func (m *configuredClosManager) ListCATManagedClos(ctx context.Context) ([]qrmre
 	if err != nil {
 		return nil, err
 	}
+	owned, err := m.ownership.Load()
+	if err != nil {
+		return nil, err
+	}
 	managed := make([]qrmresctrlmanager.CPUListClos, 0, len(clos))
 	for _, current := range clos {
-		if resctrlutil.IsManagedClosID(current.ID, m.config) {
+		if owned.Has(current.ID) {
 			managed = append(managed, current)
 		}
 	}

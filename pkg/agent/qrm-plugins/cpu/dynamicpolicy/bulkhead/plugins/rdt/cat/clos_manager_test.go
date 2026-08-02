@@ -18,6 +18,7 @@ package cat
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -37,8 +38,11 @@ func (m *fakeCPUListManager) ListManagedClos(context.Context) ([]qrmresctrlmanag
 func (*fakeCPUListManager) ApplyCPUList(context.Context, string, string) error { return nil }
 
 func TestConfiguredClosManagerReturnsOnlyExplicitlyOwnedClos(t *testing.T) {
+	checkpointPath := filepath.Join(t.TempDir(), "ownership.json")
+	require.NoError(t, qrmresctrlmanager.NewClosOwnershipStore(checkpointPath).Register("share-03"))
 	manager := newConfiguredClosManager(&qrmresctrl.ResctrlConfig{
 		CPUSetPoolToSharedSubgroup: map[string]int{"batch": 3},
+		OwnershipCheckpointPath:    checkpointPath,
 	}, &fakeCPUListManager{clos: []qrmresctrlmanager.CPUListClos{
 		{ID: "dedicated", Epoch: 1}, {ID: "share-03", Epoch: 2},
 		{ID: "shared-foreign", Epoch: 3}, {ID: "external", Epoch: 4},
@@ -48,7 +52,6 @@ func TestConfiguredClosManagerReturnsOnlyExplicitlyOwnedClos(t *testing.T) {
 
 	require.NoError(t, err)
 	require.Equal(t, []qrmresctrlmanager.CPUListClos{
-		{ID: "dedicated", Epoch: 1},
 		{ID: "share-03", Epoch: 2},
 	}, clos)
 }
