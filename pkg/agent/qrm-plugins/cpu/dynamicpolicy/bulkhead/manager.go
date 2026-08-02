@@ -135,7 +135,11 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 	defer m.mu.Unlock()
 
 	empty := machine.NewCPUSet()
-	m.appliedViewValidForPeriodical = false
+	if !commitIfGenerationCurrent(in, func() {
+		m.appliedViewValidForPeriodical = false
+	}) {
+		return empty, staleGenerationError()
+	}
 	handlerCtx := bulkheadapi.HandlerContext{
 		CPUSetAdjustmentHandlerCtx: in,
 		AppliedView:                m.appliedView.DeepCopy(),
@@ -147,7 +151,11 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 		// cgroup or sysfs rollback state, which is still bulkhead-owned behavior
 		// and can introduce unexpected changes after the user explicitly turns
 		// bulkhead off.
-		m.lastCPUSetAdjustmentEnabled = nil
+		if !commitIfGenerationCurrent(in, func() {
+			m.lastCPUSetAdjustmentEnabled = nil
+		}) {
+			return empty, staleGenerationError()
+		}
 		emitBulkheadViewChanged(handlerCtx.Emitter, false)
 		return empty, nil
 	}
@@ -165,6 +173,7 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 	topologyStopped := false
 	topologyApplied := false
 	verifiedReclaim := machine.NewCPUSet()
+	var topologyResult bulkheadapi.DAGApplyResult
 	desiredSnapshot := handlerCtx.DesiredView.DeepCopy()
 	handlerCtx.ReportTopologyResult = func(result bulkheadapi.TopologyResult) {
 		result.AppliedView = result.AppliedView.DeepCopy()
@@ -234,6 +243,7 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 			if !model.EqualAppliedView(m.appliedView, handlerCtx.AppliedView) {
 				handlerCtx.AppliedViewRevision++
 			}
+			topologyResult = result
 			topologyApplied = true
 			topologyPublished = true
 			anyAdjusted = true
@@ -254,13 +264,27 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 		}
 	}
 	if topologyApplied {
-		m.appliedView = handlerCtx.AppliedView.DeepCopy()
-		m.appliedViewRevision = handlerCtx.AppliedViewRevision
-		m.appliedViewValidForPeriodical = true
-		m.publishLatestAppliedReclaim(verifiedReclaim)
+		if !commitIfGenerationCurrent(in, func() {
+			m.appliedView = handlerCtx.AppliedView.DeepCopy()
+			m.appliedViewRevision = handlerCtx.AppliedViewRevision
+			m.appliedViewValidForPeriodical = true
+			m.publishLatestAppliedReclaim(verifiedReclaim)
+			m.lastCPUSetAdjustmentEnabled = currentEnabled
+		}) {
+			topologyResult.FinalSnapshotCurrent = false
+			nonConverged := staleGenerationError()
+			nonConverged.Result = topologyResult
+			emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", "generation_fence", "failed", nonConverged.Error())
+			return empty, nonConverged
+		}
+	} else {
+		if !commitIfGenerationCurrent(in, func() {
+			m.lastCPUSetAdjustmentEnabled = currentEnabled
+		}) {
+			return empty, staleGenerationError()
+		}
 	}
 	emitBulkheadViewChanged(handlerCtx.Emitter, anyAdjusted)
-	m.lastCPUSetAdjustmentEnabled = currentEnabled
 	if topologyApplied {
 		return verifiedReclaim.Clone(), nil
 	}
@@ -299,12 +323,27 @@ func (m *Manager) tryPublishAppliedView(
 	if !model.EqualDesiredView(finalDesired, desiredSnapshot) {
 		return false
 	}
-	m.appliedView = result.AppliedView.DeepCopy()
-	m.appliedViewRevision++
-	m.appliedViewValidForPeriodical = true
-	in.AppliedView = m.appliedView.DeepCopy()
-	in.AppliedViewRevision = m.appliedViewRevision
-	return true
+	return commitIfGenerationCurrent(in.CPUSetAdjustmentHandlerCtx, func() {
+		m.appliedView = result.AppliedView.DeepCopy()
+		m.appliedViewRevision++
+		m.appliedViewValidForPeriodical = true
+		in.AppliedView = m.appliedView.DeepCopy()
+		in.AppliedViewRevision = m.appliedViewRevision
+	})
+}
+
+func commitIfGenerationCurrent(in cpusetutil.CPUSetAdjustmentHandlerCtx, commit func()) bool {
+	if in.CommitIfGenerationCurrent == nil {
+		commit()
+		return true
+	}
+	return in.CommitIfGenerationCurrent(in.Generation, commit)
+}
+
+func staleGenerationError() *NonConvergedError {
+	return &NonConvergedError{Result: bulkheadapi.DAGApplyResult{
+		FinalSnapshotCurrent: false,
+	}}
 }
 
 func (m *Manager) cpuSetPartitionViewOptions(in cpusetutil.CPUSetAdjustmentHandlerCtx) bulkheadutils.CPUSetPartitionViewOptions {

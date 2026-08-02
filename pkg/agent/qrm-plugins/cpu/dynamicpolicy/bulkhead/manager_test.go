@@ -397,6 +397,90 @@ func TestManagerApplyDoesNotPublishTypedTopologyResultBeforeDependentsSucceed(t 
 	}
 }
 
+func TestManagerApplyDoesNotPublishWhenPolicyGenerationIsStale(t *testing.T) {
+	t.Parallel()
+
+	oldApplied := &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ReclaimEffective: machine.NewCPUSet(3),
+	}}
+	newApplied := &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ReclaimEffective: machine.NewCPUSet(1, 2),
+	}}
+	topologyPlugin := &fakeTopologyPlugin{
+		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
+		result: bulkheadapi.DAGApplyResult{
+			FullyConverged:       true,
+			FinalSnapshotCurrent: true,
+			AppliedView:          newApplied,
+		},
+	}
+	dependent := &fakePlugin{name: "rdt_cpulist", enabled: true}
+	m := &Manager{
+		plugins:                       []bulkheadapi.Plugin{topologyPlugin, dependent},
+		appliedView:                   oldApplied,
+		appliedViewRevision:           7,
+		appliedViewValidForPeriodical: true,
+	}
+	m.publishLatestAppliedReclaim(oldApplied.ReclaimEffective)
+	state, topology := testBulkheadStateAndTopology()
+	fenceCalls := 0
+
+	_, err := m.Apply(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
+		DynamicConf: dynamicBulkheadConf(true),
+		State:       state,
+		Topology:    topology,
+		Generation:  11,
+		CommitIfGenerationCurrent: func(generation uint64, commit func()) bool {
+			if generation != 11 {
+				t.Fatalf("commit generation = %d, want 11", generation)
+			}
+			fenceCalls++
+			if fenceCalls == 1 {
+				commit()
+				return true
+			}
+			return false
+		},
+	})
+	var nonConverged *NonConvergedError
+	if !errors.As(err, &nonConverged) {
+		t.Fatalf("Apply() error = %v, want stale generation rejected as *NonConvergedError", err)
+	}
+	if got := len(dependent.adjustViews); got != 1 {
+		t.Fatalf("dependent calls = %d, want completed lock-free execution before commit fence", got)
+	}
+	if m.appliedViewRevision != 7 {
+		t.Fatalf("applied revision = %d, want old revision 7 retained", m.appliedViewRevision)
+	}
+	assertCPUSet(t, "retained applied reclaim", m.appliedView.ReclaimEffective, "3")
+	assertCPUSet(t, "retained latest reclaim", m.LatestAppliedReclaim(), "3")
+	if m.appliedViewValidForPeriodical {
+		t.Fatal("stale generation must not authorize periodical handlers")
+	}
+}
+
+func TestManagerApplyRejectsStaleGenerationBeforeSideEffects(t *testing.T) {
+	t.Parallel()
+
+	plugin := &fakePlugin{name: "rdt_cpulist", enabled: true}
+	m := &Manager{plugins: []bulkheadapi.Plugin{plugin}}
+
+	_, err := m.Apply(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
+		DynamicConf: dynamicBulkheadConf(true),
+		Generation:  10,
+		CommitIfGenerationCurrent: func(uint64, func()) bool {
+			return false
+		},
+	})
+	var nonConverged *NonConvergedError
+	if !errors.As(err, &nonConverged) {
+		t.Fatalf("Apply() error = %v, want stale generation rejected as *NonConvergedError", err)
+	}
+	if got := len(plugin.adjustViews); got != 0 {
+		t.Fatalf("plugin calls = %d, want stale round rejected before side effects", got)
+	}
+}
+
 func TestManagerApplyRejectsTypedTopologyResultWhenDesiredViewChanges(t *testing.T) {
 	t.Parallel()
 

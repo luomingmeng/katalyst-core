@@ -30,10 +30,12 @@ import (
 type CPUSetAdjustmentHandler func(context.Context, CPUSetAdjustmentHandlerCtx) error
 
 type CPUSetAdjustmentHandlerCtx struct {
-	CoreConf    *config.Configuration
-	DynamicConf *dynamicconfig.Configuration
-	Emitter     metrics.MetricEmitter
-	MetaServer  *metaserver.MetaServer
-	State       state.ReadonlyState
-	Topology    *machine.CPUTopology
+	CoreConf                  *config.Configuration
+	DynamicConf               *dynamicconfig.Configuration
+	Emitter                   metrics.MetricEmitter
+	MetaServer                *metaserver.MetaServer
+	State                     state.ReadonlyState
+	Topology                  *machine.CPUTopology
+	Generation                uint64
+	CommitIfGenerationCurrent func(generation uint64, commit func()) bool
 }
