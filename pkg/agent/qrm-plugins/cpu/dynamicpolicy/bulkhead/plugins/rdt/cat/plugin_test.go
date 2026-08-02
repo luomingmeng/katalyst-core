@@ -57,6 +57,8 @@ type catWrite struct {
 type fakeRDTManager struct {
 	writes      []catWrite
 	invalidated []string
+	failClos    string
+	failOnce    bool
 }
 
 func (*fakeRDTManager) CheckSupportRDT() (bool, error)    { return true, nil }
@@ -64,6 +66,10 @@ func (*fakeRDTManager) InitRDT() error                    { return nil }
 func (*fakeRDTManager) ApplyTasks(string, []string) error { return nil }
 func (m *fakeRDTManager) ApplyCAT(clos string, mask map[int]uint64) error {
 	m.writes = append(m.writes, catWrite{clos: clos, mask: mask})
+	if clos == m.failClos && m.failOnce {
+		m.failOnce = false
+		return errors.New("injected CAT write failure")
+	}
 	return nil
 }
 func (*fakeRDTManager) ApplyMBA(string, map[int]int) error { return nil }
@@ -144,6 +150,44 @@ func TestCATPluginDisabledRestoresRootAndManagedClosOnly(t *testing.T) {
 	conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.EnableCAT = false
 	require.NoError(t, plugin.PeriodicalHandler(context.Background(), handlerCtx))
 	require.Equal(t, []catWrite{
+		{clos: "dedicated", mask: map[int]uint64{0: 0x03}},
+	}, manager.writes)
+}
+
+func TestCATPluginPartialFailureRollsBackEveryManagedClos(t *testing.T) {
+	manager := &fakeRDTManager{failClos: "share-03", failOnce: true}
+	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{
+		clos: []qrmresctrlmanager.CPUListClos{{ID: "dedicated"}, {ID: "share-03"}},
+	}, manager, fakeCapabilityProvider{capabilities: map[int]rdt.CATCapability{
+		0: {CBMMask: 0xff, MinCBMBits: 1},
+	}})
+
+	_, err := plugin.reconcile(context.Background(), 2, map[string]int64{"dedicated": 4, "share-03": 4})
+
+	require.ErrorContains(t, err, "apply CAT")
+	require.Equal(t, []catWrite{
+		{clos: "dedicated", mask: map[int]uint64{0: 0x0f}},
+		{clos: "share-03", mask: map[int]uint64{0: 0x0f}},
+		{clos: "dedicated", mask: map[int]uint64{0: 0x03}},
+		{clos: "share-03", mask: map[int]uint64{0: 0x03}},
+	}, manager.writes)
+}
+
+func TestCATPluginRestartedDisabledStateIdempotentlyRollsBack(t *testing.T) {
+	manager := &fakeRDTManager{}
+	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{
+		clos: []qrmresctrlmanager.CPUListClos{{ID: "dedicated"}},
+	}, manager, fakeCapabilityProvider{capabilities: map[int]rdt.CATCapability{
+		0: {CBMMask: 0xff, MinCBMBits: 1},
+	}})
+	conf := dynamicconfig.NewConfiguration()
+	conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.DefaultCATWays = 2
+
+	require.NoError(t, plugin.PeriodicalHandler(context.Background(), periodicalContext(conf)))
+	require.NoError(t, plugin.PeriodicalHandler(context.Background(), periodicalContext(conf)))
+
+	require.Equal(t, []catWrite{
+		{clos: "dedicated", mask: map[int]uint64{0: 0x03}},
 		{clos: "dedicated", mask: map[int]uint64{0: 0x03}},
 	}, manager.writes)
 }
