@@ -35,6 +35,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
+	metaagent "github.com/kubewharf/katalyst-core/pkg/metaserver/agent"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	metricspool "github.com/kubewharf/katalyst-core/pkg/metrics/metrics-pool"
@@ -1294,15 +1295,100 @@ func TestClampReclaimOverlapMetadataClearsZeroBudget(t *testing.T) {
 	require.Empty(t, result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0])
 }
 
-func TestClampReclaimAndOverlap(t *testing.T) {
+func TestClampByReclaimedCPUMaxRatio(t *testing.T) {
 	t.Parallel()
 
-	newPA := func(ratio float64) *ProvisionAssemblerCommon {
-		conf, err := options.NewOptions().Config()
-		require.NoError(t, err)
-		conf.GetDynamicConfiguration().ReclaimedCPUMaxRatio = ratio
-		return &ProvisionAssemblerCommon{conf: conf}
+	tests := []struct {
+		name               string
+		size               int
+		limit              float64
+		ratio              float64
+		cpuCount           int
+		reservedForReclaim int
+		wantSize           int
+		wantLimit          float64
+	}{
+		{
+			name:               "ratio disabled",
+			size:               40,
+			limit:              30,
+			ratio:              0,
+			cpuCount:           96,
+			reservedForReclaim: 30,
+			wantSize:           40,
+			wantLimit:          30,
+		},
+		{
+			name:               "floor fractional cap to even",
+			size:               40,
+			limit:              40,
+			ratio:              0.3,
+			cpuCount:           24,
+			reservedForReclaim: 2,
+			wantSize:           6,
+			wantLimit:          6,
+		},
+		{
+			name:               "size below cap is unchanged",
+			size:               8,
+			limit:              8,
+			ratio:              0.5,
+			cpuCount:           24,
+			reservedForReclaim: 2,
+			wantSize:           8,
+			wantLimit:          8,
+		},
+		{
+			name:               "negative limit sentinel is unchanged",
+			size:               20,
+			limit:              -1,
+			ratio:              0.5,
+			cpuCount:           24,
+			reservedForReclaim: 2,
+			wantSize:           12,
+			wantLimit:          -1,
+		},
+		{
+			name:               "cap equal to reserved is allowed",
+			size:               8,
+			limit:              8,
+			ratio:              0.25,
+			cpuCount:           8,
+			reservedForReclaim: 2,
+			wantSize:           2,
+			wantLimit:          2,
+		},
+		{
+			name:               "cap below reserved returns reserved",
+			size:               8,
+			limit:              8,
+			ratio:              0.1,
+			cpuCount:           8,
+			reservedForReclaim: 3,
+			wantSize:           3,
+			wantLimit:          3,
+		},
 	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			gotSize, gotLimit := clampByReclaimedCPUMaxRatio(
+				tt.size,
+				tt.limit,
+				tt.ratio,
+				tt.cpuCount,
+				tt.reservedForReclaim,
+			)
+			require.Equal(t, tt.wantSize, gotSize)
+			require.Equal(t, tt.wantLimit, gotLimit)
+		})
+	}
+}
+
+func TestClampReclaimAndOverlap(t *testing.T) {
+	t.Parallel()
 
 	tests := []struct {
 		name        string
@@ -1332,13 +1418,13 @@ func TestClampReclaimAndOverlap(t *testing.T) {
 			wantOverlap: map[string]int{"share": 8},
 		},
 		{
-			name:        "overlap exceeds cap is scaled down proportionally",
+			name:        "overlap exceeds cap is bounded deterministically",
 			ratio:       0.5,
 			size:        20,
 			overlap:     map[string]int{"a": 15, "b": 10},
 			cpuCount:    24,
 			wantSize:    12,
-			wantOverlap: map[string]int{"a": 7, "b": 4},
+			wantOverlap: map[string]int{"a": 12},
 		},
 		{
 			name:        "nil overlap map is safe",
@@ -1355,19 +1441,27 @@ func TestClampReclaimAndOverlap(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			pa := newPA(tt.ratio)
 
-			var inputSnapshot map[string]int
+			var overlap, inputSnapshot map[string]int
 			if tt.overlap != nil {
+				overlap = make(map[string]int, len(tt.overlap))
 				inputSnapshot = make(map[string]int, len(tt.overlap))
 				for k, v := range tt.overlap {
+					overlap[k] = v
 					inputSnapshot[k] = v
 				}
 			}
+			result := &types.InternalCPUCalculationResult{
+				PoolOverlapInfo: map[string]map[int]map[string]int{
+					commonstate.PoolNameReclaim: {0: overlap},
+				},
+			}
 
-			gotSize, gotOverlap, _ := pa.clampReclaimAndOverlap(tt.size, tt.overlap, -1, tt.cpuCount)
+			gotSize, _ := clampByReclaimedCPUMaxRatio(tt.size, -1, tt.ratio, tt.cpuCount, 0)
+			clampReclaimOverlapMetadata(result, 0, gotSize)
+
 			require.Equal(t, tt.wantSize, gotSize)
-			require.Equal(t, tt.wantOverlap, gotOverlap)
+			require.Equal(t, tt.wantOverlap, result.PoolOverlapInfo[commonstate.PoolNameReclaim][0])
 			require.Equal(t, inputSnapshot, tt.overlap, "input overlap map must not be mutated")
 		})
 	}
@@ -1375,13 +1469,6 @@ func TestClampReclaimAndOverlap(t *testing.T) {
 
 func TestClampReclaimAndOverlap_Quota(t *testing.T) {
 	t.Parallel()
-
-	newPA := func(ratio float64) *ProvisionAssemblerCommon {
-		conf, err := options.NewOptions().Config()
-		require.NoError(t, err)
-		conf.GetDynamicConfiguration().ReclaimedCPUMaxRatio = ratio
-		return &ProvisionAssemblerCommon{conf: conf}
-	}
 
 	tests := []struct {
 		name      string
@@ -1393,7 +1480,7 @@ func TestClampReclaimAndOverlap_Quota(t *testing.T) {
 		wantQuota float64
 	}{
 		{name: "quota_below_cap", ratio: 0.5, size: 8, quota: 8, cpuCount: 24, wantSize: 8, wantQuota: 8},
-		{name: "quota_above_cap_clamped", ratio: 0.5, size: 20, quota: 20, cpuCount: 24, wantSize: 20, wantQuota: 12},
+		{name: "quota_above_cap_clamped", ratio: 0.5, size: 20, quota: 20, cpuCount: 24, wantSize: 12, wantQuota: 12},
 		{name: "quota_negative_sentinel_unchanged", ratio: 0.5, size: 20, quota: -1, cpuCount: 24, wantSize: 12, wantQuota: -1},
 		{name: "ratio_disabled_passthrough", ratio: 0, size: 20, quota: 15, cpuCount: 24, wantSize: 20, wantQuota: 15},
 	}
@@ -1402,10 +1489,86 @@ func TestClampReclaimAndOverlap_Quota(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			pa := newPA(tt.ratio)
-			gotSize, _, gotQuota := pa.clampReclaimAndOverlap(tt.size, nil, tt.quota, tt.cpuCount)
+			gotSize, gotQuota := clampByReclaimedCPUMaxRatio(tt.size, tt.quota, tt.ratio, tt.cpuCount, 0)
 			require.Equal(t, tt.wantSize, gotSize)
 			require.Equal(t, tt.wantQuota, gotQuota)
 		})
 	}
+}
+
+func TestAssembleProvisionUsesReservedWhenEvenRatioCapIsLower(t *testing.T) {
+	t.Parallel()
+
+	newAssembler := func(t *testing.T, regionMap map[string]region.QoSRegion, nonBindingNUMAs machine.CPUSet) *ProvisionAssemblerCommon {
+		t.Helper()
+
+		conf, err := options.NewOptions().Config()
+		require.NoError(t, err)
+		conf.GetDynamicConfiguration().ReclaimedCPUMaxRatio = 0.1
+
+		cpuDetails := machine.CPUDetails{}
+		for cpuID := 0; cpuID < 8; cpuID++ {
+			cpuDetails[cpuID] = machine.CPUTopoInfo{NUMANodeID: 0}
+		}
+		metaServer := &metaserver.MetaServer{
+			MetaAgent: &metaagent.MetaAgent{
+				KatalystMachineInfo: &machine.KatalystMachineInfo{
+					CPUTopology: &machine.CPUTopology{
+						NumCPUs:      8,
+						NumCores:     8,
+						NumSockets:   1,
+						NumNUMANodes: 1,
+						CPUDetails:   cpuDetails,
+					},
+				},
+			},
+		}
+
+		metaReader := metacache.NewDummyMetaCacheImp()
+		reservedForReclaim := map[int]int{0: 2}
+		numaAvailable := map[int]int{0: 8}
+		allowOverlap := true
+		return NewProvisionAssemblerCommon(
+			conf,
+			nil,
+			&regionMap,
+			&reservedForReclaim,
+			&numaAvailable,
+			&nonBindingNUMAs,
+			&allowOverlap,
+			metaReader,
+			metaServer,
+			metrics.DummyMetrics{},
+		).(*ProvisionAssemblerCommon)
+	}
+
+	t.Run("ordinary NUMA pool", func(t *testing.T) {
+		t.Parallel()
+
+		pa := newAssembler(t, map[string]region.QoSRegion{}, machine.NewCPUSet(0))
+		result, err := pa.AssembleProvision()
+		require.NoError(t, err)
+		require.Equal(t, 2, result.PoolEntries[commonstate.PoolNameReclaim][commonstate.FakedNUMAID].Size)
+	})
+
+	t.Run("dedicated NUMA-exclusive region", func(t *testing.T) {
+		t.Parallel()
+
+		dedicatedRegion := NewFakeRegion("dedicated-exclusive", configapi.QoSRegionTypeDedicated, "dedicated-exclusive")
+		dedicatedRegion.SetBindingNumas(machine.NewCPUSet(0))
+		dedicatedRegion.SetIsNumaBinding(true)
+		dedicatedRegion.isNumaExclusive = true
+		dedicatedRegion.SetPods(types.PodSet{"pod": {"container": {}}})
+		regionMap := map[string]region.QoSRegion{dedicatedRegion.Name(): dedicatedRegion}
+
+		pa := newAssembler(t, regionMap, machine.NewCPUSet())
+		result := &types.InternalCPUCalculationResult{
+			PoolEntries:                 map[string]map[int]types.CPUResource{},
+			PoolOverlapInfo:             map[string]map[int]map[string]int{},
+			PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{},
+		}
+		err := pa.assembleDedicatedNUMAExclusiveRegion(dedicatedRegion, result)
+		require.NoError(t, err)
+		require.Equal(t, 2, result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["pod"]["container"])
+	})
 }
