@@ -95,6 +95,9 @@ func (p *CPUSetMemsPlugin) PeriodicalHandler(ctx context.Context, in bulkheadapi
 		return err
 	}
 	if enableBulkheadCpusetMemsByDynamicConf(in.DynamicConf) {
+		if in.EffectiveEnabled != nil && *in.EffectiveEnabled && in.AppliedView == nil {
+			return nil
+		}
 		return p.reconcileNUMAMems(ctx, version, numaIDs)
 	}
 	return p.rollbackNUMAMems(ctx, version, numaIDs)

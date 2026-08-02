@@ -21,11 +21,21 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
+	"github.com/kubewharf/katalyst-core/pkg/config"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
+	bulkheadconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/bulkhead"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
+
+func cpuSetAdjustmentHandlerTimeout(conf *config.Configuration) time.Duration {
+	if conf == nil || conf.CPUQRMPluginConfig == nil {
+		return bulkheadconfig.TopologyHandlerTimeout(nil)
+	}
+	return bulkheadconfig.TopologyHandlerTimeout(conf.CPUQRMPluginConfig.BulkheadConfiguration)
+}
 
 func (p *DynamicPolicy) RegisterCPUSetAdjustmentHandler(name string, handler cpusetutil.CPUSetAdjustmentHandler) error {
 	name = strings.TrimSpace(name)

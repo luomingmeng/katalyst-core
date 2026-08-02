@@ -26,9 +26,10 @@ import (
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	bulkheadapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api"
-	bulkheadutils "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	cpustate "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
+	"github.com/kubewharf/katalyst-core/pkg/config"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
@@ -36,16 +37,28 @@ import (
 )
 
 type fakePlugin struct {
-	name           string
-	adjustViews    []*bulkheadutils.CPUSetPartitionView
-	periodicCalls  int
-	periodicStates []interface{}
-	disabledCalls  int
-	enableStates   []interface{}
-	enabled        bool
-	adjustErr      error
-	periodicErr    error
-	disabledErr    error
+	name                   string
+	adjustViews            []*model.DesiredView
+	adjustOwnedViews       []*model.CPUSetPartitionView
+	adjustApplied          []*model.AppliedView
+	adjustRevision         []uint64
+	periodicCalls          int
+	periodicStates         []interface{}
+	periodicApplied        []*model.AppliedView
+	periodicRevision       []uint64
+	periodicValid          []bool
+	disabledCalls          int
+	enableStates           []interface{}
+	enabled                bool
+	adjustErr              error
+	periodicErr            error
+	disabledErr            error
+	topologyResult         *bulkheadapi.TopologyResult
+	afterReport            func()
+	adjustStarted          chan struct{}
+	adjustRelease          chan struct{}
+	periodicWaitForContext bool
+	periodicContextErr     error
 }
 
 type capturedMetric struct {
@@ -86,20 +99,69 @@ func (p *fakePlugin) Enable(in bulkheadapi.HandlerContext) bool {
 	return p.enabled
 }
 
-func (p *fakePlugin) CPUSetAdjustmentHandler(_ context.Context, in bulkheadapi.HandlerContext) error {
-	p.adjustViews = append(p.adjustViews, in.View)
+func (p *fakePlugin) CPUSetAdjustmentHandler(ctx context.Context, in bulkheadapi.HandlerContext) error {
+	p.adjustViews = append(p.adjustViews, in.DesiredView)
+	p.adjustOwnedViews = append(p.adjustOwnedViews, in.View)
+	p.adjustApplied = append(p.adjustApplied, in.AppliedView)
+	p.adjustRevision = append(p.adjustRevision, in.AppliedViewRevision)
+	if p.topologyResult != nil && in.ReportTopologyResult != nil {
+		if p.afterReport != nil {
+			p.afterReport()
+		}
+		in.ReportTopologyResult(*p.topologyResult)
+	}
+	if p.adjustStarted != nil {
+		close(p.adjustStarted)
+	}
+	if p.adjustRelease != nil {
+		select {
+		case <-p.adjustRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	return p.adjustErr
 }
 
+type fakeTopologyPlugin struct {
+	*fakePlugin
+	result       bulkheadapi.DAGApplyResult
+	err          error
+	reportLegacy bool
+	afterApply   func()
+}
+
+func (p *fakeTopologyPlugin) Apply(_ context.Context, in bulkheadapi.HandlerContext) (bulkheadapi.DAGApplyResult, error) {
+	if p.reportLegacy && in.ReportTopologyResult != nil {
+		in.ReportTopologyResult(bulkheadapi.TopologyResult{
+			Converged:            p.result.FullyConverged,
+			FinalSnapshotCurrent: p.result.FinalSnapshotCurrent,
+			AppliedView:          p.result.AppliedView.DeepCopy(),
+		})
+	}
+	if p.afterApply != nil {
+		p.afterApply()
+	}
+	return p.result, p.err
+}
+
 func (p *fakePlugin) PeriodicalHandler(
-	_ context.Context,
+	ctx context.Context,
 	in bulkheadapi.PeriodicalHandlerContext,
 ) error {
 	p.periodicCalls++
+	p.periodicApplied = append(p.periodicApplied, in.AppliedView)
+	p.periodicRevision = append(p.periodicRevision, in.AppliedViewRevision)
+	p.periodicValid = append(p.periodicValid, in.AppliedViewValidForPeriodical)
 	if in.EffectiveEnabled == nil {
 		p.periodicStates = append(p.periodicStates, nil)
 	} else {
 		p.periodicStates = append(p.periodicStates, *in.EffectiveEnabled)
+	}
+	if p.periodicWaitForContext {
+		<-ctx.Done()
+		p.periodicContextErr = ctx.Err()
+		return ctx.Err()
 	}
 	return p.periodicErr
 }
@@ -107,6 +169,327 @@ func (p *fakePlugin) PeriodicalHandler(
 func (p *fakePlugin) CPUSetAdjustmentDisabledHandler(_ context.Context, _ bulkheadapi.HandlerContext) error {
 	p.disabledCalls++
 	return p.disabledErr
+}
+
+func TestManagerApplyLockWaitIsCancelable(t *testing.T) {
+	blocking := &fakePlugin{
+		name:          "blocking",
+		enabled:       true,
+		adjustStarted: make(chan struct{}),
+		adjustRelease: make(chan struct{}),
+	}
+	m := &Manager{plugins: []bulkheadapi.Plugin{blocking}}
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := m.Apply(context.Background(), enabledCPUSetAdjustmentCtx())
+		firstDone <- err
+	}()
+	<-blocking.adjustStarted
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := m.Apply(ctx, enabledCPUSetAdjustmentCtx())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second Apply error = %v, want context deadline while waiting for manager lock", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("canceled lock wait took %s", elapsed)
+	}
+
+	close(blocking.adjustRelease)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+}
+
+func TestManagerPeriodicalHandlerUsesBoundedContext(t *testing.T) {
+	plugin := &fakePlugin{name: "periodical", periodicWaitForContext: true}
+	m := &Manager{plugins: []bulkheadapi.Plugin{plugin}}
+	coreConf := config.NewConfiguration()
+	coreConf.CPUQRMPluginConfig.BulkheadConfiguration.TopologyConvergenceBudget.DeadlineDuration = time.Millisecond
+
+	started := time.Now()
+	m.RunPeriodicalHandlers(coreConf, nil, enabledDynamicAgentConf(), nil, nil)
+	if !errors.Is(plugin.periodicContextErr, context.DeadlineExceeded) {
+		t.Fatalf("periodical context error = %v, want deadline exceeded", plugin.periodicContextErr)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("bounded periodical handler took %s", elapsed)
+	}
+}
+
+func TestManagerApplyRequiresFullyConvergedTopologyBeforeDependents(t *testing.T) {
+	t.Parallel()
+
+	topologyPlugin := &fakeTopologyPlugin{
+		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
+		result: bulkheadapi.DAGApplyResult{
+			FullyConverged:       false,
+			FinalSnapshotCurrent: true,
+		},
+	}
+	dependent := &fakePlugin{name: "workqueue", enabled: true}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, dependent}}
+
+	got, err := m.Apply(context.Background(), enabledCPUSetAdjustmentCtx())
+	var nonConverged *NonConvergedError
+	if !errors.As(err, &nonConverged) {
+		t.Fatalf("Apply() error = %v, want *NonConvergedError", err)
+	}
+	if !got.IsEmpty() {
+		t.Fatalf("Apply() reclaim = %s, want empty on non-convergence", got.String())
+	}
+	if len(dependent.adjustViews) != 0 {
+		t.Fatalf("dependent calls = %d, want 0", len(dependent.adjustViews))
+	}
+	if !m.LatestAppliedReclaim().IsEmpty() {
+		t.Fatalf("non-converged apply published reclaim %s", m.LatestAppliedReclaim().String())
+	}
+}
+
+func TestManagerApplyAcceptsExactEmptyNUMABucketBeforePluginWrites(t *testing.T) {
+	t.Parallel()
+
+	state := cpustate.NewCPUPluginState(nil)
+	state.SetAllocationInfo(
+		commonstate.PoolNameReserve,
+		commonstate.FakedContainerName,
+		&cpustate.AllocationInfo{
+			AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReserve),
+			AllocationResult: machine.NewCPUSet(0),
+		},
+	)
+	state.SetAllocationInfo(
+		commonstate.PoolNameReclaim,
+		commonstate.FakedContainerName,
+		&cpustate.AllocationInfo{
+			AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+			AllocationResult: machine.NewCPUSet(1),
+		},
+	)
+	_, topology := testBulkheadStateAndTopology()
+	plugin := &fakePlugin{name: "writer", enabled: true}
+	m := &Manager{plugins: []bulkheadapi.Plugin{plugin}}
+
+	got, err := m.Apply(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
+		DynamicConf: dynamicBulkheadConf(true),
+		State:       state,
+		Topology:    topology,
+	})
+	if err != nil {
+		t.Fatalf("Apply() error = %v, want exact empty NUMA bucket accepted", err)
+	}
+	if !got.IsEmpty() {
+		t.Fatalf("Apply() reclaim = %s, want empty without topology owner", got.String())
+	}
+	if len(plugin.enableStates) != 1 || len(plugin.adjustViews) != 1 {
+		t.Fatalf("valid exact NUMA projection did not reach plugin: enable=%d adjust=%d",
+			len(plugin.enableStates), len(plugin.adjustViews))
+	}
+}
+
+func TestManagerApplyPassesOwnedVerifiedViewToDependentsAndReturnsReclaim(t *testing.T) {
+	t.Parallel()
+
+	verified := machine.NewCPUSet(2, 3)
+	applied := &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
+		NonReclaimPool:   machine.NewCPUSet(0),
+		ReclaimEffective: verified,
+		ReclaimEffectivePerNUMA: map[int]machine.CPUSet{
+			0: machine.NewCPUSet(),
+			1: verified,
+		},
+	}}
+	topologyPlugin := &fakeTopologyPlugin{
+		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
+		result: bulkheadapi.DAGApplyResult{
+			FullyConverged:       true,
+			FinalSnapshotCurrent: true,
+			AppliedView:          applied,
+		},
+	}
+	dependent := &fakePlugin{name: "workqueue", enabled: true}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, dependent}}
+
+	got, err := m.Apply(context.Background(), enabledCPUSetAdjustmentCtx())
+	if err != nil {
+		t.Fatalf("Apply() error: %v", err)
+	}
+	if !got.Equals(verified) {
+		t.Fatalf("Apply() reclaim = %s, want %s", got.String(), verified.String())
+	}
+	if len(dependent.adjustOwnedViews) != 1 || dependent.adjustOwnedViews[0] == nil {
+		t.Fatalf("dependent owned views = %#v, want one explicit view", dependent.adjustOwnedViews)
+	}
+	if !dependent.adjustOwnedViews[0].ReclaimEffective.Equals(verified) {
+		t.Fatalf("dependent reclaim = %s, want %s",
+			dependent.adjustOwnedViews[0].ReclaimEffective.String(), verified.String())
+	}
+	if !dependent.adjustOwnedViews[0].NonReclaimPool.Equals(machine.NewCPUSet(0)) {
+		t.Fatalf("dependent non-reclaim = %s, want final-snapshot value 0",
+			dependent.adjustOwnedViews[0].NonReclaimPool.String())
+	}
+	if !dependent.adjustOwnedViews[0].ReclaimEffectivePerNUMA[1].Equals(verified) {
+		t.Fatalf("dependent reclaim NUMA bucket = %s, want final-snapshot value %s",
+			dependent.adjustOwnedViews[0].ReclaimEffectivePerNUMA[1].String(), verified.String())
+	}
+	if !m.LatestAppliedReclaim().Equals(verified) {
+		t.Fatalf("latest reclaim = %s, want %s", m.LatestAppliedReclaim().String(), verified.String())
+	}
+	applied.NonReclaimPool.Add(1)
+	if dependent.adjustOwnedViews[0].NonReclaimPool.Contains(1) {
+		t.Fatal("dependent view aliases topology result AppliedView")
+	}
+}
+
+func TestManagerLatestAppliedReclaimPublishesAndReturnsClones(t *testing.T) {
+	t.Parallel()
+
+	m := &Manager{}
+	source := machine.NewCPUSet(1, 2)
+	m.publishLatestAppliedReclaim(source)
+	source.Add(3)
+
+	first := m.LatestAppliedReclaim()
+	if !first.Equals(machine.NewCPUSet(1, 2)) {
+		t.Fatalf("first latest reclaim = %s, want 1-2", first.String())
+	}
+	first.Add(4)
+	second := m.LatestAppliedReclaim()
+	if !second.Equals(machine.NewCPUSet(1, 2)) {
+		t.Fatalf("second latest reclaim = %s, want 1-2", second.String())
+	}
+}
+
+func TestManagerApplyDoesNotPublishTypedTopologyResultBeforeDependentsSucceed(t *testing.T) {
+	t.Parallel()
+
+	topologyPlugin := &fakeTopologyPlugin{
+		fakePlugin:   &fakePlugin{name: "cpuset_topology", enabled: true},
+		reportLegacy: true,
+		result: bulkheadapi.DAGApplyResult{
+			FullyConverged:       true,
+			FinalSnapshotCurrent: true,
+			AppliedView: &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
+				ReclaimEffective: machine.NewCPUSet(2, 3),
+			}},
+		},
+	}
+	dependent := &fakePlugin{name: "workqueue", enabled: true, adjustErr: errors.New("dependent failed")}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, dependent}}
+	state, topology := testBulkheadStateAndTopology()
+	in := enabledCPUSetAdjustmentCtx()
+	in.State = state
+	in.Topology = topology
+
+	if _, err := m.Apply(context.Background(), in); err == nil {
+		t.Fatal("Apply() error = nil, want dependent failure")
+	}
+	if m.appliedView != nil {
+		t.Fatalf("failed transaction published applied view: %#v", m.appliedView)
+	}
+	if m.appliedViewRevision != 0 {
+		t.Fatalf("failed transaction revision = %d, want 0", m.appliedViewRevision)
+	}
+	if !m.LatestAppliedReclaim().IsEmpty() {
+		t.Fatalf("failed transaction published reclaim %s", m.LatestAppliedReclaim().String())
+	}
+}
+
+func TestManagerApplyRejectsTypedTopologyResultWhenDesiredViewChanges(t *testing.T) {
+	t.Parallel()
+
+	state := cpustate.NewCPUPluginState(nil)
+	state.SetAllocationInfo(commonstate.PoolNameReserve, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReserve),
+		AllocationResult: machine.NewCPUSet(0),
+	})
+	state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+		AllocationResult: machine.NewCPUSet(1, 2, 3),
+	})
+	_, topology := testBulkheadStateAndTopology()
+	oldApplied := &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ReclaimEffective: machine.NewCPUSet(3),
+	}}
+	topologyPlugin := &fakeTopologyPlugin{
+		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
+		result: bulkheadapi.DAGApplyResult{
+			FullyConverged:       true,
+			FinalSnapshotCurrent: true,
+			AppliedView: &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
+				ReclaimEffective: machine.NewCPUSet(1),
+			}},
+		},
+		afterApply: func() {
+			state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(2, 3),
+			})
+		},
+	}
+	dependent := &fakePlugin{name: "workqueue", enabled: true}
+	m := &Manager{
+		plugins:             []bulkheadapi.Plugin{topologyPlugin, dependent},
+		appliedView:         oldApplied,
+		appliedViewRevision: 7,
+	}
+
+	_, err := m.Apply(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
+		DynamicConf: dynamicBulkheadConf(true),
+		State:       state,
+		Topology:    topology,
+	})
+	var nonConverged *NonConvergedError
+	if !errors.As(err, &nonConverged) {
+		t.Fatalf("Apply() error = %v, want stale typed result rejected as *NonConvergedError", err)
+	}
+	if got := len(dependent.adjustViews); got != 0 {
+		t.Fatalf("dependent calls = %d, want 0 after desired view changes", got)
+	}
+	if m.appliedViewRevision != 7 {
+		t.Fatalf("applied revision = %d, want old revision 7 retained", m.appliedViewRevision)
+	}
+	assertCPUSet(t, "retained applied reclaim", m.appliedView.ReclaimEffective, "3")
+}
+
+func TestManagerApplyRetainsRevisionForConsecutiveIdenticalTypedAppliedViews(t *testing.T) {
+	t.Parallel()
+
+	state, topology := testBulkheadStateAndTopology()
+	applied := &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
+		NonReclaimPool:   machine.NewCPUSet(0),
+		ReclaimEffective: machine.NewCPUSet(1, 2, 3),
+	}}
+	topologyPlugin := &fakeTopologyPlugin{
+		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
+		result: bulkheadapi.DAGApplyResult{
+			FullyConverged:       true,
+			FinalSnapshotCurrent: true,
+			AppliedView:          applied,
+		},
+	}
+	dependent := &fakePlugin{name: "workqueue", enabled: true}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, dependent}}
+	in := cpusetutil.CPUSetAdjustmentHandlerCtx{
+		DynamicConf: dynamicBulkheadConf(true),
+		State:       state,
+		Topology:    topology,
+	}
+
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("first Apply() error: %v", err)
+	}
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("second Apply() error: %v", err)
+	}
+	if m.appliedViewRevision != 1 {
+		t.Fatalf("applied revision = %d, want 1 for identical payloads", m.appliedViewRevision)
+	}
+	if !reflect.DeepEqual(dependent.adjustRevision, []uint64{1, 1}) {
+		t.Fatalf("dependent revisions = %v, want [1 1]", dependent.adjustRevision)
+	}
 }
 
 func TestRunCPUSetAdjustmentHandlersCallsEnabledPluginEveryRun(t *testing.T) {
@@ -146,13 +529,13 @@ func TestRunCPUSetAdjustmentHandlersReconcilesWhenNonReclaimPoolMinSizeChanges(t
 	topology := &machine.CPUTopology{
 		NumCPUs:      4,
 		NumCores:     4,
-		NumSockets:   2,
-		NumNUMANodes: 2,
+		NumSockets:   1,
+		NumNUMANodes: 1,
 		CPUDetails: machine.CPUDetails{
 			0: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
 			1: {NUMANodeID: 0, SocketID: 0, CoreID: 1},
-			2: {NUMANodeID: 1, SocketID: 1, CoreID: 2},
-			3: {NUMANodeID: 1, SocketID: 1, CoreID: 3},
+			2: {NUMANodeID: 0, SocketID: 0, CoreID: 2},
+			3: {NUMANodeID: 0, SocketID: 0, CoreID: 3},
 		},
 	}
 
@@ -199,13 +582,13 @@ func TestRunCPUSetAdjustmentHandlersUsesDefaultNonReclaimPoolMinSize(t *testing.
 	topology := &machine.CPUTopology{
 		NumCPUs:      4,
 		NumCores:     4,
-		NumSockets:   2,
-		NumNUMANodes: 2,
+		NumSockets:   1,
+		NumNUMANodes: 1,
 		CPUDetails: machine.CPUDetails{
 			0: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
 			1: {NUMANodeID: 0, SocketID: 0, CoreID: 1},
-			2: {NUMANodeID: 1, SocketID: 1, CoreID: 2},
-			3: {NUMANodeID: 1, SocketID: 1, CoreID: 3},
+			2: {NUMANodeID: 0, SocketID: 0, CoreID: 2},
+			3: {NUMANodeID: 0, SocketID: 0, CoreID: 3},
 		},
 	}
 
@@ -396,6 +779,288 @@ func TestRunCPUSetAdjustmentHandlersDoesNotCacheFailedView(t *testing.T) {
 	}
 	if got := len(plugin.adjustViews); got != 2 {
 		t.Fatalf("expected failed view not cached, got %d calls", got)
+	}
+}
+
+func TestRunCPUSetAdjustmentHandlersPublishesAppliedViewAfterTopologyConverges_BitsUT(t *testing.T) {
+	t.Parallel()
+
+	topologyApplied := &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
+		NonReclaimPool:   machine.NewCPUSet(0, 2, 3),
+		ReclaimEffective: machine.NewCPUSet(1),
+	}}
+	topologyPlugin := &fakePlugin{name: "cpuset_topology", enabled: true, topologyResult: &bulkheadapi.TopologyResult{
+		Converged:            true,
+		FinalSnapshotCurrent: true,
+		AppliedView:          topologyApplied,
+	}}
+	consumer := &fakePlugin{name: "workqueue", enabled: true}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, consumer}}
+	state, topology := testBulkheadStateAndTopology()
+
+	if err := m.RunCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
+		DynamicConf: dynamicBulkheadConf(true),
+		State:       state,
+		Topology:    topology,
+	}); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	if got := len(consumer.adjustApplied); got != 1 {
+		t.Fatalf("consumer applied view calls = %d, want 1", got)
+	}
+	if consumer.adjustApplied[0] == nil {
+		t.Fatalf("consumer should receive published AppliedView")
+	}
+	if consumer.adjustRevision[0] != 1 {
+		t.Fatalf("consumer applied revision = %d, want 1", consumer.adjustRevision[0])
+	}
+	if topologyPlugin.adjustApplied[0] != nil {
+		t.Fatalf("topology plugin should see previous applied view before publish")
+	}
+	assertCPUSet(t, "consumer applied reclaim from final snapshot", consumer.adjustApplied[0].ReclaimEffective, "1")
+
+	consumer.adjustApplied[0].ReclaimEffective.Add(99)
+	if m.appliedView.ReclaimEffective.Contains(99) {
+		t.Fatalf("mutating consumer AppliedView copy should not mutate manager published view")
+	}
+}
+
+func TestRunCPUSetAdjustmentHandlersShortCircuitsConsumersUntilTopologyConverges_BitsUT(t *testing.T) {
+	t.Parallel()
+
+	topologyPlugin := &fakePlugin{name: "cpuset_topology", enabled: true}
+	consumer := &fakePlugin{name: "workqueue", enabled: true}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, consumer}}
+	state, topology := testBulkheadStateAndTopology()
+
+	if err := m.RunCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
+		DynamicConf: dynamicBulkheadConf(true),
+		State:       state,
+		Topology:    topology,
+	}); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	if got := len(consumer.adjustViews); got != 0 {
+		t.Fatalf("consumer calls = %d, want 0 before topology convergence", got)
+	}
+	if m.appliedView != nil || m.appliedViewRevision != 0 {
+		t.Fatalf("manager should not publish applied view before convergence, view=%v revision=%d", m.appliedView, m.appliedViewRevision)
+	}
+}
+
+func TestRunCPUSetAdjustmentHandlersRetainsRevisionWhenTopologyResultIsNotCurrent_BitsUT(t *testing.T) {
+	t.Parallel()
+
+	oldApplied := &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ReclaimEffective: machine.NewCPUSet(3),
+	}}
+	topologyPlugin := &fakePlugin{name: "cpuset_topology", enabled: true, topologyResult: &bulkheadapi.TopologyResult{
+		Converged:            true,
+		FinalSnapshotCurrent: false,
+		AppliedView: &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
+			ReclaimEffective: machine.NewCPUSet(1),
+		}},
+	}}
+	consumer := &fakePlugin{name: "workqueue", enabled: true}
+	m := &Manager{
+		plugins:             []bulkheadapi.Plugin{topologyPlugin, consumer},
+		appliedView:         oldApplied,
+		appliedViewRevision: 7,
+	}
+	state, topology := testBulkheadStateAndTopology()
+
+	if err := m.RunCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
+		DynamicConf: dynamicBulkheadConf(true),
+		State:       state,
+		Topology:    topology,
+	}); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	if got := len(consumer.adjustViews); got != 0 {
+		t.Fatalf("consumer calls = %d, want 0 for stale final snapshot", got)
+	}
+	if m.appliedViewRevision != 7 {
+		t.Fatalf("applied revision = %d, want old revision 7 retained", m.appliedViewRevision)
+	}
+	assertCPUSet(t, "retained applied reclaim", m.appliedView.ReclaimEffective, "3")
+}
+
+func TestRunCPUSetAdjustmentHandlersRetainsRevisionWhenDesiredChangesBeforeTopologyCallback_BitsUT(t *testing.T) {
+	t.Parallel()
+
+	state := cpustate.NewCPUPluginState(nil)
+	state.SetAllocationInfo(commonstate.PoolNameReserve, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReserve),
+		AllocationResult: machine.NewCPUSet(0),
+	})
+	state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+		AllocationResult: machine.NewCPUSet(1, 2, 3),
+	})
+	_, topology := testBulkheadStateAndTopology()
+	oldApplied := &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ReclaimEffective: machine.NewCPUSet(3),
+	}}
+	topologyPlugin := &fakePlugin{
+		name:    "cpuset_topology",
+		enabled: true,
+		topologyResult: &bulkheadapi.TopologyResult{
+			Converged:            true,
+			FinalSnapshotCurrent: true,
+			AppliedView: &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
+				ReclaimEffective: machine.NewCPUSet(1),
+			}},
+		},
+		afterReport: func() {
+			state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(2, 3),
+			})
+		},
+	}
+	consumer := &fakePlugin{name: "workqueue", enabled: true}
+	m := &Manager{
+		plugins:             []bulkheadapi.Plugin{topologyPlugin, consumer},
+		appliedView:         oldApplied,
+		appliedViewRevision: 7,
+	}
+
+	if err := m.RunCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
+		DynamicConf: dynamicBulkheadConf(true),
+		State:       state,
+		Topology:    topology,
+	}); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	if got := len(consumer.adjustViews); got != 0 {
+		t.Fatalf("consumer calls = %d, want 0 after desired intent changes", got)
+	}
+	if m.appliedViewRevision != 7 {
+		t.Fatalf("applied revision = %d, want old revision 7 retained", m.appliedViewRevision)
+	}
+	assertCPUSet(t, "retained applied reclaim", m.appliedView.ReclaimEffective, "3")
+}
+
+func TestRunCPUSetAdjustmentHandlersShortCircuitsConsumersWhenTopologyDisabled_BitsUT(t *testing.T) {
+	t.Parallel()
+
+	topologyPlugin := &fakePlugin{name: "cpuset_topology", enabled: false}
+	consumer := &fakePlugin{name: "workqueue", enabled: true}
+	m := &Manager{
+		plugins:                     []bulkheadapi.Plugin{topologyPlugin, consumer},
+		appliedView:                 (&model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{ReclaimEffective: machine.NewCPUSet(1)}}).ToAppliedView(),
+		appliedViewRevision:         1,
+		lastCPUSetAdjustmentEnabled: map[string]bool{topologyPlugin.Name(): true, consumer.Name(): true},
+	}
+	state, topology := testBulkheadStateAndTopology()
+
+	if err := m.RunCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
+		DynamicConf: dynamicBulkheadConf(true),
+		State:       state,
+		Topology:    topology,
+	}); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	if got := len(consumer.adjustViews); got != 0 {
+		t.Fatalf("consumer calls = %d, want 0 when topology is disabled", got)
+	}
+	if m.appliedViewRevision != 1 {
+		t.Fatalf("applied revision = %d, want old revision 1 retained", m.appliedViewRevision)
+	}
+}
+
+func TestRunCPUSetAdjustmentHandlersRunsDisabledResetAfterTopologyDisabled_BitsUT(t *testing.T) {
+	t.Parallel()
+
+	topologyPlugin := &fakePlugin{name: "cpuset_topology", enabled: false}
+	enabledConsumer := &fakePlugin{name: "cpuset_mems", enabled: true}
+	disabledReset := &fakePlugin{name: "workqueue", enabled: false}
+	m := &Manager{
+		plugins: []bulkheadapi.Plugin{topologyPlugin, enabledConsumer, disabledReset},
+		lastCPUSetAdjustmentEnabled: map[string]bool{
+			topologyPlugin.Name():  true,
+			enabledConsumer.Name(): true,
+			disabledReset.Name():   true,
+		},
+	}
+	state, topology := testBulkheadStateAndTopology()
+
+	if err := m.RunCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
+		DynamicConf: dynamicBulkheadConf(true),
+		State:       state,
+		Topology:    topology,
+	}); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+
+	if got := len(enabledConsumer.adjustViews); got != 0 {
+		t.Fatalf("enabled consumer calls = %d, want 0 when topology is disabled", got)
+	}
+	if topologyPlugin.disabledCalls != 1 {
+		t.Fatalf("topology disabled calls = %d, want 1", topologyPlugin.disabledCalls)
+	}
+	if disabledReset.disabledCalls != 1 {
+		t.Fatalf("downstream disabled reset calls = %d, want 1", disabledReset.disabledCalls)
+	}
+	if m.appliedViewValidForPeriodical {
+		t.Fatalf("periodical AppliedView must remain invalid when topology is disabled")
+	}
+}
+
+func TestRunPeriodicalHandlersWithholdsOldAppliedViewWhenTopologyNotPublished_BitsUT(t *testing.T) {
+	t.Parallel()
+
+	topologyPlugin := &fakePlugin{name: "cpuset_topology", enabled: true, topologyResult: &bulkheadapi.TopologyResult{
+		Converged:            true,
+		FinalSnapshotCurrent: true,
+		AppliedView: &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
+			ReclaimEffective: machine.NewCPUSet(1, 2, 3),
+		}},
+	}}
+	systemService := &fakePlugin{name: "system_service", enabled: true}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, systemService}}
+	state, topology := testBulkheadStateAndTopology()
+
+	if err := m.RunCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
+		DynamicConf: dynamicBulkheadConf(true),
+		State:       state,
+		Topology:    topology,
+	}); err != nil {
+		t.Fatalf("initial converged run failed: %v", err)
+	}
+	if m.appliedView == nil || m.appliedViewRevision != 1 {
+		t.Fatalf("initial run should publish internal applied view, view=%v revision=%d", m.appliedView, m.appliedViewRevision)
+	}
+
+	topologyPlugin.topologyResult = nil
+	if err := m.RunCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
+		DynamicConf: dynamicBulkheadConf(true),
+		State:       state,
+		Topology:    topology,
+	}); err != nil {
+		t.Fatalf("non-converged run failed: %v", err)
+	}
+	if m.appliedView == nil || m.appliedViewRevision != 1 {
+		t.Fatalf("non-publish run must retain internal old applied view/revision, view=%v revision=%d", m.appliedView, m.appliedViewRevision)
+	}
+
+	m.RunPeriodicalHandlers(nil, nil, enabledDynamicAgentConf(), nil, nil)
+	if systemService.periodicCalls != 1 {
+		t.Fatalf("periodical calls = %d, want 1", systemService.periodicCalls)
+	}
+	if systemService.periodicApplied[0] != nil {
+		t.Fatalf("periodical context should withhold old AppliedView when current round did not publish")
+	}
+	if systemService.periodicRevision[0] != 0 {
+		t.Fatalf("periodical revision = %d, want 0 for unpublished current round", systemService.periodicRevision[0])
+	}
+	if systemService.periodicValid[0] {
+		t.Fatalf("periodical valid flag = true, want false for unpublished current round")
 	}
 }
 
@@ -590,6 +1255,31 @@ func enabledDynamicAgentConf() *dynamicconfig.DynamicAgentConfiguration {
 	conf := dynamicconfig.NewDynamicAgentConfiguration()
 	conf.SetDynamicConfiguration(dynamicBulkheadConf(true))
 	return conf
+}
+
+func testBulkheadStateAndTopology() (cpustate.ReadonlyState, *machine.CPUTopology) {
+	state := cpustate.NewCPUPluginState(nil)
+	state.SetAllocationInfo(commonstate.PoolNameReserve, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReserve),
+		AllocationResult: machine.NewCPUSet(0),
+	})
+	state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+		AllocationResult: machine.NewCPUSet(1, 2, 3),
+	})
+	topology := &machine.CPUTopology{
+		NumCPUs:      4,
+		NumCores:     4,
+		NumSockets:   2,
+		NumNUMANodes: 2,
+		CPUDetails: machine.CPUDetails{
+			0: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
+			1: {NUMANodeID: 0, SocketID: 0, CoreID: 1},
+			2: {NUMANodeID: 1, SocketID: 1, CoreID: 2},
+			3: {NUMANodeID: 1, SocketID: 1, CoreID: 3},
+		},
+	}
+	return state, topology
 }
 
 func assertCPUSet(t *testing.T, name string, got machine.CPUSet, want string) {

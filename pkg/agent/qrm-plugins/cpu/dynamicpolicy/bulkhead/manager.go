@@ -27,22 +27,76 @@ import (
 
 	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
 	bulkheadapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/registry"
 	bulkheadutils "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils"
 	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
+	bulkheadconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/bulkhead"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
+	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	metricutil "github.com/kubewharf/katalyst-core/pkg/util/metric"
 )
 
 type Manager struct {
-	mu                           sync.Mutex
-	plugins                      []bulkheadapi.Plugin
-	defaultNonReclaimPoolMinSize int64
-	lastCPUSetAdjustmentEnabled  map[string]bool
+	mu                            cancelableMutex
+	latestAppliedReclaimMu        sync.RWMutex
+	plugins                       []bulkheadapi.Plugin
+	defaultNonReclaimPoolMinSize  int64
+	lastCPUSetAdjustmentEnabled   map[string]bool
+	appliedView                   *model.AppliedView
+	appliedViewRevision           uint64
+	appliedViewValidForPeriodical bool
+	latestAppliedReclaim          machine.CPUSet
+}
+
+// cancelableMutex is a zero-value-ready binary semaphore. Unlike sync.Mutex,
+// acquisition can stop when the caller's context expires.
+type cancelableMutex struct {
+	once  sync.Once
+	token chan struct{}
+}
+
+func (m *cancelableMutex) init() {
+	m.once.Do(func() {
+		m.token = make(chan struct{}, 1)
+		m.token <- struct{}{}
+	})
+}
+
+func (m *cancelableMutex) Lock(ctx context.Context) error {
+	m.init()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-m.token:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *cancelableMutex) Unlock() {
+	m.init()
+	m.token <- struct{}{}
+}
+
+// NonConvergedError reports a retryable topology outcome that must not be
+// treated as successful Bulkhead apply or authorize dependent plugins.
+type NonConvergedError struct {
+	Result bulkheadapi.DAGApplyResult
+}
+
+func (e *NonConvergedError) Error() string {
+	return fmt.Sprintf("bulkhead topology not fully converged: current=%t deferred=%d report=%+v",
+		e.Result.FinalSnapshotCurrent, e.Result.Deferred, e.Result.ConvergenceReport)
 }
 
 const (
@@ -68,10 +122,25 @@ func NewManager(conf *config.Configuration) (*Manager, error) {
 }
 
 func (m *Manager) RunCPUSetAdjustmentHandlers(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-	m.mu.Lock()
+	_, err := m.Apply(ctx, in)
+	return err
+}
+
+// Apply converges topology before running partition-dependent plugins and
+// returns the reclaim CPUSet verified by the topology layer's final snapshot.
+func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) (machine.CPUSet, error) {
+	if err := m.mu.Lock(ctx); err != nil {
+		return machine.NewCPUSet(), fmt.Errorf("acquire bulkhead manager lock: %w", err)
+	}
 	defer m.mu.Unlock()
 
-	handlerCtx := bulkheadapi.HandlerContext{CPUSetAdjustmentHandlerCtx: in}
+	empty := machine.NewCPUSet()
+	m.appliedViewValidForPeriodical = false
+	handlerCtx := bulkheadapi.HandlerContext{
+		CPUSetAdjustmentHandlerCtx: in,
+		AppliedView:                m.appliedView.DeepCopy(),
+		AppliedViewRevision:        m.appliedViewRevision,
+	}
 	if !bulkheadEnabled(in.DynamicConf) {
 		// The global bulkhead switch is a hard gate: when it is off, do not run
 		// plugin Enable/adjust/disabled handlers. Disabled handlers may write
@@ -80,47 +149,176 @@ func (m *Manager) RunCPUSetAdjustmentHandlers(ctx context.Context, in cpusetutil
 		// bulkhead off.
 		m.lastCPUSetAdjustmentEnabled = nil
 		emitBulkheadViewChanged(handlerCtx.Emitter, false)
-		return nil
+		return empty, nil
 	}
 	if in.State != nil {
-		nonReclaimPoolMinSize := bulkheadNonReclaimPoolMinSize(in.DynamicConf)
-		if nonReclaimPoolMinSize <= 0 {
-			nonReclaimPoolMinSize = m.defaultNonReclaimPoolMinSize
+		desiredView, err := bulkheadutils.BuildValidatedCPUSetPartitionView(in.State, in.Topology, m.cpuSetPartitionViewOptions(in))
+		if err != nil {
+			return empty, fmt.Errorf("build bulkhead desired view failed: %w", err)
 		}
-		opts := bulkheadutils.CPUSetPartitionViewOptions{
-			NonReclaimPoolMinSize: nonReclaimPoolMinSize,
-		}
-		if in.CoreConf != nil {
-			opts.ReserveCPUReversely = in.CoreConf.EnableReserveCPUReversely
-		}
-		handlerCtx.View = bulkheadutils.BuildCPUSetPartitionView(in.State, in.Topology, opts)
+		handlerCtx.DesiredView = desiredView
+		handlerCtx.View = desiredView.CPUSetPartitionView.DeepCopy()
 	}
 	currentEnabled := m.buildPluginEnabledState(handlerCtx)
 	anyAdjusted := false
+	topologyPublished := false
+	topologyStopped := false
+	topologyApplied := false
+	verifiedReclaim := machine.NewCPUSet()
+	desiredSnapshot := handlerCtx.DesiredView.DeepCopy()
+	handlerCtx.ReportTopologyResult = func(result bulkheadapi.TopologyResult) {
+		result.AppliedView = result.AppliedView.DeepCopy()
+		topologyPublished = m.tryPublishAppliedView(&handlerCtx, desiredSnapshot, &result)
+	}
 
 	for _, p := range m.plugins {
 		if !currentEnabled[p.Name()] {
 			if !m.needsDisabledReset(p.Name()) {
+				if p.Name() == "cpuset_topology" {
+					topologyStopped = true
+				}
 				continue
 			}
 			if err := p.CPUSetAdjustmentDisabledHandler(ctx, handlerCtx); err != nil {
 				emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment_disabled", p.Name(), "failed", err.Error())
-				return fmt.Errorf("bulkhead plugin %q disabled transition failed: %w", p.Name(), err)
+				return empty, fmt.Errorf("bulkhead plugin %q disabled transition failed: %w", p.Name(), err)
 			}
 			emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment_disabled", p.Name(), "success", "")
 			anyAdjusted = true
+			if p.Name() == "cpuset_topology" {
+				topologyStopped = true
+			}
+			continue
+		}
+		if topologyStopped {
+			continue
+		}
+		if topologyPlugin, ok := p.(bulkheadapi.TopologyPlugin); ok {
+			topologyCtx := handlerCtx
+			// The typed result is the sole publication path for TopologyPlugin.
+			// Suppress the legacy callback so a dependent failure cannot publish
+			// manager state from the middle of this transaction.
+			topologyCtx.ReportTopologyResult = nil
+			result, err := topologyPlugin.Apply(ctx, topologyCtx)
+			if err != nil {
+				emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", p.Name(), "failed", err.Error())
+				return empty, fmt.Errorf("bulkhead plugin %q cpuset adjustment failed: %w", p.Name(), err)
+			}
+			if !result.FullyConverged || !result.FinalSnapshotCurrent || result.AppliedView == nil {
+				nonConverged := &NonConvergedError{Result: result}
+				emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", p.Name(), "failed", nonConverged.Error())
+				return empty, nonConverged
+			}
+			if desiredSnapshot != nil {
+				// Rebuild desired intent after topology Apply so a result cannot be
+				// accepted, or authorize dependent side effects, after state changed.
+				currentDesired, err := bulkheadutils.BuildValidatedCPUSetPartitionView(
+					in.State,
+					in.Topology,
+					m.cpuSetPartitionViewOptions(in),
+				)
+				if err != nil {
+					return empty, fmt.Errorf("rebuild bulkhead desired view after topology apply failed: %w", err)
+				}
+				if !model.EqualDesiredView(currentDesired, desiredSnapshot) {
+					result.FinalSnapshotCurrent = false
+					nonConverged := &NonConvergedError{Result: result}
+					emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", p.Name(), "failed", nonConverged.Error())
+					return empty, nonConverged
+				}
+			}
+			handlerCtx.AppliedView = result.AppliedView.DeepCopy()
+			handlerCtx.View = handlerCtx.AppliedView.CPUSetPartitionView.DeepCopy()
+			verifiedReclaim = handlerCtx.AppliedView.ReclaimEffective.Clone()
+			handlerCtx.AppliedViewRevision = m.appliedViewRevision
+			if !model.EqualAppliedView(m.appliedView, handlerCtx.AppliedView) {
+				handlerCtx.AppliedViewRevision++
+			}
+			topologyApplied = true
+			topologyPublished = true
+			anyAdjusted = true
+			emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", p.Name(), "success", "")
 			continue
 		}
 		if err := p.CPUSetAdjustmentHandler(ctx, handlerCtx); err != nil {
 			emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", p.Name(), "failed", err.Error())
-			return fmt.Errorf("bulkhead plugin %q cpuset adjustment failed: %w", p.Name(), err)
+			return empty, fmt.Errorf("bulkhead plugin %q cpuset adjustment failed: %w", p.Name(), err)
 		}
 		emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", p.Name(), "success", "")
 		anyAdjusted = true
+		if p.Name() == "cpuset_topology" {
+			if !topologyPublished {
+				topologyStopped = true
+				continue
+			}
+		}
+	}
+	if topologyApplied {
+		m.appliedView = handlerCtx.AppliedView.DeepCopy()
+		m.appliedViewRevision = handlerCtx.AppliedViewRevision
+		m.appliedViewValidForPeriodical = true
+		m.publishLatestAppliedReclaim(verifiedReclaim)
 	}
 	emitBulkheadViewChanged(handlerCtx.Emitter, anyAdjusted)
 	m.lastCPUSetAdjustmentEnabled = currentEnabled
-	return nil
+	if topologyApplied {
+		return verifiedReclaim.Clone(), nil
+	}
+	if topologyPublished && m.appliedView != nil {
+		return m.appliedView.ReclaimEffective.Clone(), nil
+	}
+	return empty, nil
+}
+
+func (m *Manager) publishLatestAppliedReclaim(cpus machine.CPUSet) {
+	m.latestAppliedReclaimMu.Lock()
+	defer m.latestAppliedReclaimMu.Unlock()
+	m.latestAppliedReclaim = cpus.Clone()
+}
+
+func (m *Manager) LatestAppliedReclaim() machine.CPUSet {
+	m.latestAppliedReclaimMu.RLock()
+	defer m.latestAppliedReclaimMu.RUnlock()
+	return m.latestAppliedReclaim.Clone()
+}
+
+func (m *Manager) tryPublishAppliedView(
+	in *bulkheadapi.HandlerContext,
+	desiredSnapshot *model.DesiredView,
+	result *bulkheadapi.TopologyResult,
+) bool {
+	if in == nil || in.DesiredView == nil || desiredSnapshot == nil ||
+		result == nil || !result.Converged || !result.FinalSnapshotCurrent || result.AppliedView == nil {
+		return false
+	}
+	opts := m.cpuSetPartitionViewOptions(in.CPUSetAdjustmentHandlerCtx)
+	finalDesired, err := bulkheadutils.BuildValidatedCPUSetPartitionView(in.State, in.Topology, opts)
+	if err != nil {
+		return false
+	}
+	if !model.EqualDesiredView(finalDesired, desiredSnapshot) {
+		return false
+	}
+	m.appliedView = result.AppliedView.DeepCopy()
+	m.appliedViewRevision++
+	m.appliedViewValidForPeriodical = true
+	in.AppliedView = m.appliedView.DeepCopy()
+	in.AppliedViewRevision = m.appliedViewRevision
+	return true
+}
+
+func (m *Manager) cpuSetPartitionViewOptions(in cpusetutil.CPUSetAdjustmentHandlerCtx) bulkheadutils.CPUSetPartitionViewOptions {
+	nonReclaimPoolMinSize := bulkheadNonReclaimPoolMinSize(in.DynamicConf)
+	if nonReclaimPoolMinSize <= 0 {
+		nonReclaimPoolMinSize = m.defaultNonReclaimPoolMinSize
+	}
+	opts := bulkheadutils.CPUSetPartitionViewOptions{
+		NonReclaimPoolMinSize: nonReclaimPoolMinSize,
+	}
+	if in.CoreConf != nil {
+		opts.ReserveCPUReversely = in.CoreConf.EnableReserveCPUReversely
+	}
+	return opts
 }
 
 func (m *Manager) buildPluginEnabledState(in bulkheadapi.HandlerContext) map[string]bool {
@@ -159,7 +357,13 @@ func (m *Manager) RunPeriodicalHandlers(
 	emitter metrics.MetricEmitter,
 	metaServer *metaserver.MetaServer,
 ) {
-	m.mu.Lock()
+	ctx, cancel := context.WithTimeout(context.Background(), managerHandlerTimeout(coreConf))
+	defer cancel()
+	if err := m.mu.Lock(ctx); err != nil {
+		_ = general.UpdateHealthzStateByError(cpuconsts.SyncBulkhead, err)
+		general.ErrorS(err, "bulkhead periodical handlers failed to acquire manager lock")
+		return
+	}
 	defer m.mu.Unlock()
 
 	// Start timing after acquiring m.mu so the slow-handler log reflects the
@@ -178,7 +382,6 @@ func (m *Manager) RunPeriodicalHandlers(
 		}
 	}()
 
-	ctx := context.Background()
 	var conf *dynamicconfig.Configuration
 	if dynamicConf != nil {
 		conf = dynamicConf.GetDynamicConfiguration()
@@ -192,11 +395,16 @@ func (m *Manager) RunPeriodicalHandlers(
 		return
 	}
 	handlerCtx := bulkheadapi.PeriodicalHandlerContext{
-		CoreConf:    coreConf,
-		ExtraConf:   extraConf,
-		DynamicConf: conf,
-		Emitter:     emitter,
-		MetaServer:  metaServer,
+		CoreConf:                      coreConf,
+		ExtraConf:                     extraConf,
+		DynamicConf:                   conf,
+		Emitter:                       emitter,
+		MetaServer:                    metaServer,
+		AppliedViewValidForPeriodical: m.appliedViewValidForPeriodical,
+	}
+	if m.appliedViewValidForPeriodical {
+		handlerCtx.AppliedView = m.appliedView.DeepCopy()
+		handlerCtx.AppliedViewRevision = m.appliedViewRevision
 	}
 	var errs []error
 	for _, p := range m.plugins {
@@ -220,6 +428,13 @@ func (m *Manager) RunPeriodicalHandlers(
 		emitBulkheadPluginResult(emitter, "periodical", p.Name(), "success", "")
 	}
 	err = apierrors.NewAggregate(errs)
+}
+
+func managerHandlerTimeout(coreConf *config.Configuration) time.Duration {
+	if coreConf == nil || coreConf.CPUQRMPluginConfig == nil {
+		return bulkheadconfig.TopologyHandlerTimeout(nil)
+	}
+	return bulkheadconfig.TopologyHandlerTimeout(coreConf.CPUQRMPluginConfig.BulkheadConfiguration)
 }
 
 func emitBulkheadPluginResult(emitter metrics.MetricEmitter, phase, plugin, status, reason string) {

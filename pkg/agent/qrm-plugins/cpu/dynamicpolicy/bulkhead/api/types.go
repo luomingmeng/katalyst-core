@@ -19,7 +19,8 @@ package api
 import (
 	"context"
 
-	bulkheadutils "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology"
 	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
@@ -29,15 +30,55 @@ import (
 
 type HandlerContext struct {
 	cpusetutil.CPUSetAdjustmentHandlerCtx
-	View *bulkheadutils.CPUSetPartitionView
+	// View is an owned copy of the partition that the current plugin may read
+	// and mutate without aliasing manager state. Before topology convergence it
+	// contains the desired partition; dependent plugins receive a view rebuilt
+	// from the topology layer's write-verified reclaim target.
+	View                 *model.CPUSetPartitionView
+	DesiredView          *model.DesiredView
+	AppliedView          *model.AppliedView
+	AppliedViewRevision  uint64
+	ReportTopologyResult func(TopologyResult)
+}
+
+// TopologyResult is the typed handoff from the cpuset topology owner to the
+// manager. AppliedView is publishable only when convergence was verified
+// against the coordinator's still-current final snapshot.
+type TopologyResult struct {
+	Converged            bool
+	FinalSnapshotCurrent bool
+	AppliedView          *model.AppliedView
+}
+
+// DAGApplyResult is the Bulkhead-layer result returned by the topology owner.
+// AppliedView is valid only when FullyConverged and FinalSnapshotCurrent are
+// both true. It is derived directly from the coordinator's final snapshot and
+// is the canonical handoff to the manager.
+type DAGApplyResult struct {
+	Attempted            int
+	Applied              int
+	Skipped              int
+	Failed               int
+	Deferred             int
+	FullyConverged       bool
+	FinalSnapshotCurrent bool
+	ConvergenceReport    topology.ConvergenceReport
+	AppliedView          *model.AppliedView
 }
 
 type PeriodicalHandlerContext struct {
-	CoreConf    *config.Configuration
-	ExtraConf   interface{}
-	DynamicConf *dynamicconfig.Configuration
-	Emitter     metrics.MetricEmitter
-	MetaServer  *metaserver.MetaServer
+	CoreConf            *config.Configuration
+	ExtraConf           interface{}
+	DynamicConf         *dynamicconfig.Configuration
+	Emitter             metrics.MetricEmitter
+	MetaServer          *metaserver.MetaServer
+	AppliedView         *model.AppliedView
+	AppliedViewRevision uint64
+	// AppliedViewValidForPeriodical is true only when the manager published
+	// AppliedView in the latest CPUSetAdjustment handler round. A non-nil
+	// AppliedView without this flag must be treated as stale internal state and
+	// must not authorize periodical side effects.
+	AppliedViewValidForPeriodical bool
 	// EffectiveEnabled is derived from the same state-aware rule used by
 	// CPUSetAdjustmentHandler. nil distinguishes an unset value from an
 	// explicit disabled state.
@@ -50,6 +91,11 @@ type Plugin interface {
 	CPUSetAdjustmentHandler(context.Context, HandlerContext) error
 	CPUSetAdjustmentDisabledHandler(context.Context, HandlerContext) error
 	PeriodicalHandler(context.Context, PeriodicalHandlerContext) error
+}
+
+type TopologyPlugin interface {
+	Plugin
+	Apply(context.Context, HandlerContext) (DAGApplyResult, error)
 }
 
 type PluginFactory func(conf *config.Configuration) Plugin

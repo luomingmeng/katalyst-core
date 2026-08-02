@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology"
 	bulkheadconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/bulkhead"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
@@ -34,11 +35,18 @@ type RelExistsFunc func(rel string) error
 
 func BuildTopologyNodeSpecsFromView(
 	cfg bulkheadconfig.BulkheadConfiguration,
-	view *CPUSetPartitionView,
+	view *model.CPUSetPartitionView,
+	cpuDetails machine.CPUDetails,
 	reclaimSiblings []string,
 	relExists RelExistsFunc,
 ) ([]topology.NodeSpec, error) {
-	specs := []topology.NodeSpec{{Rel: cfg.BulkheadPrimaryRelPath, Role: topology.TopoNodeRolePrimary}}
+	specs := []topology.NodeSpec{{
+		Rel:            cfg.BulkheadPrimaryRelPath,
+		Role:           topology.TopoNodeRolePrimary,
+		Domain:         topology.DomainPrimary,
+		ControlledRoot: true,
+		TrustAnchor:    true,
+	}}
 	if view != nil {
 		specs[0].CPUs = view.NonReclaimPool
 	}
@@ -52,11 +60,19 @@ func BuildTopologyNodeSpecsFromView(
 				if !errors.Is(err, os.ErrNotExist) {
 					return nil, fmt.Errorf("stat reclaim rel path %q: %w", reclaimRel, err)
 				}
-				general.InfofV(4, "bulkhead: reclaim rel path does not exist, skipping topology spec, rel=%q err=%v", reclaimRel, err)
-				continue
+				general.InfofV(4, "bulkhead: reclaim rel path does not exist, retaining topology boundary, rel=%q err=%v", reclaimRel, err)
 			}
 		}
-		reclaimSpec := topology.NodeSpec{Rel: reclaimRel, Role: topology.TopoNodeRoleReclaim}
+		reclaimSpec := topology.NodeSpec{
+			Rel:            reclaimRel,
+			Role:           topology.TopoNodeRoleReclaim,
+			Domain:         topology.DomainReclaim,
+			ControlledRoot: true,
+			TrustAnchor:    true,
+			Metadata: map[string]string{
+				"reclaim-index": strconv.Itoa(reclaimIdx),
+			},
+		}
 		if view != nil {
 			reclaimSpec.CPUs = view.ReclaimEffective
 		}
@@ -67,8 +83,9 @@ func BuildTopologyNodeSpecsFromView(
 		}
 		for _, numaID := range sortedNUMAIDs(view.ReclaimEffectivePerNUMA) {
 			cpus := view.ReclaimEffectivePerNUMA[numaID]
-			if cpus.IsEmpty() {
-				continue
+			physicalNUMACPUs := cpuDetails.CPUsInNUMANodes(numaID)
+			if physicalNUMACPUs.IsEmpty() {
+				return nil, fmt.Errorf("build reclaim NUMA bucket %d: physical CPU topology is required", numaID)
 			}
 			rel := cfg.ReclaimPerNUMA(reclaimIdx, numaID)
 			if rel == "" {
@@ -79,19 +96,24 @@ func BuildTopologyNodeSpecsFromView(
 					if !errors.Is(err, os.ErrNotExist) {
 						return nil, fmt.Errorf("stat reclaim NUMA rel path %q: %w", rel, err)
 					}
-					general.InfofV(4, "bulkhead: reclaim NUMA rel path does not exist, skipping topology spec, rel=%q err=%v", rel, err)
-					continue
+					general.InfofV(4, "bulkhead: reclaim NUMA rel path does not exist, retaining topology boundary, rel=%q err=%v", rel, err)
 				}
 			}
 			// cpuset_topology owns cpuset.cpus only. cpuset.mems for reclaim
 			// NUMA buckets is reconciled by the independent cpuset_mems plugin
 			// so it can run outside admission and be rolled back separately.
 			specs = append(specs, topology.NodeSpec{
-				Rel:       rel,
-				Role:      topology.TopoNodeRoleReclaimNUMABucket,
-				CPUs:      cpus,
-				Mems:      strconv.Itoa(numaID),
-				ParentRel: parentRelForReclaimNUMA(reclaimRel, rel),
+				Rel:         rel,
+				Role:        topology.TopoNodeRoleReclaimNUMABucket,
+				CPUs:        cpus,
+				ParentRel:   parentRelForReclaimNUMA(reclaimRel, rel),
+				Domain:      topology.DomainReclaim,
+				TrustAnchor: true,
+				Constraint: topology.TopologyConstraint{
+					CPUUpperBound: physicalNUMACPUs,
+					MemUpperBound: machine.NewCPUSet(numaID),
+					Scope:         topology.TopologyScopeNUMANode,
+				},
 				Metadata: map[string]string{
 					"numa":          strconv.Itoa(numaID),
 					"reclaim-index": strconv.Itoa(reclaimIdx),
@@ -115,17 +137,63 @@ func BuildTopologyNodeSpecsFromView(
 				if !errors.Is(err, os.ErrNotExist) {
 					return nil, fmt.Errorf("stat reclaim sibling rel path %q: %w", rel, err)
 				}
-				general.InfofV(4, "bulkhead: reclaim sibling rel path does not exist, skipping topology spec, rel=%q err=%v", rel, err)
-				continue
+				general.InfofV(4, "bulkhead: reclaim sibling rel path does not exist, retaining topology boundary, rel=%q err=%v", rel, err)
 			}
 		}
-		spec := topology.NodeSpec{Rel: rel, Role: topology.TopoNodeRoleReclaimSibling}
+		spec := topology.NodeSpec{
+			Rel:            rel,
+			Role:           topology.TopoNodeRoleReclaimSibling,
+			Domain:         topology.DomainReclaim,
+			ControlledRoot: true,
+			TrustAnchor:    true,
+		}
 		if view != nil {
 			spec.CPUs = view.ReclaimEffective
 		}
 		specs = append(specs, spec)
 	}
+	if err := completeReclaimHierarchyEnvelopes(specs); err != nil {
+		return nil, err
+	}
 	return specs, nil
+}
+
+func completeReclaimHierarchyEnvelopes(specs []topology.NodeSpec) error {
+	reclaimIndexes := make([]int, 0)
+	for i := range specs {
+		if specs[i].Role == topology.TopoNodeRoleReclaim {
+			reclaimIndexes = append(reclaimIndexes, i)
+		}
+	}
+
+	for _, index := range reclaimIndexes {
+		specs[index].ParentRel = nearestReclaimAncestor(specs[index].Rel, specs, reclaimIndexes)
+	}
+
+	for i := range specs {
+		if specs[i].Role != topology.TopoNodeRoleReclaimNUMABucket {
+			continue
+		}
+		specs[i].ParentRel = nearestReclaimAncestor(specs[i].Rel, specs, reclaimIndexes)
+	}
+	return nil
+}
+
+func nearestReclaimAncestor(rel string, specs []topology.NodeSpec, reclaimIndexes []int) string {
+	parent := ""
+	for _, index := range reclaimIndexes {
+		candidate := specs[index].Rel
+		if isStrictRelDescendant(rel, candidate) && len(candidate) > len(parent) {
+			parent = candidate
+		}
+	}
+	return parent
+}
+
+func isStrictRelDescendant(rel, ancestor string) bool {
+	rel = strings.Trim(rel, "/")
+	ancestor = strings.Trim(ancestor, "/")
+	return rel != "" && ancestor != "" && rel != ancestor && strings.HasPrefix(rel, ancestor+"/")
 }
 
 func sortedNUMAIDs(perNUMA map[int]machine.CPUSet) []int {
