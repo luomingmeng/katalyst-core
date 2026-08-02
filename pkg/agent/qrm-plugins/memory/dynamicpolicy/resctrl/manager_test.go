@@ -257,6 +257,19 @@ func TestManagerImpl_CreateIgnoresLegacyLifecycleFlag(t *testing.T) {
 	assert.DirExists(t, filepath.Join(closPath, MonGroupsDir, PodDirPrefix+"pod1"))
 }
 
+func TestManagerCreateFailsWhileDisableRDTTransitionIsPending(t *testing.T) {
+	manager := &managerImpl{
+		root:       t.TempDir(),
+		disableRDT: true,
+	}
+	manager.enabled.Store(true)
+
+	err := manager.Create("pod-a", "share-01", true)
+
+	require.ErrorContains(t, err, "RDT is disabled")
+	require.NoDirExists(t, filepath.Join(manager.root, "share-01"))
+}
+
 func TestManagerImpl_ReconcileClosCleansInactivePodsAndStaleClos(t *testing.T) {
 	t.Parallel()
 	tmpDir, err := os.MkdirTemp("", "resctrl_cleanup_test")
@@ -732,7 +745,7 @@ func TestManagerImpl_ReconcileClosCleansPreviouslyCreatedCustomClos(t *testing.T
 	assert.NoDirExists(t, filepath.Join(root, "custom-pool"))
 }
 
-func TestManagerImpl_CreateSkipsClosWhileRDTDisabled(t *testing.T) {
+func TestManagerImpl_CreateRejectsClosWhileRDTDisabled(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	m := newEnabledManager(root, &qrmresctrl.ResctrlConfig{
@@ -740,7 +753,7 @@ func TestManagerImpl_CreateSkipsClosWhileRDTDisabled(t *testing.T) {
 	})
 
 	assert.NoError(t, m.ReconcileClos(ClosReconcileState{DisableRDT: true}))
-	assert.NoError(t, m.Create("pod", "shared-01", true))
+	assert.ErrorIs(t, m.Create("pod", "shared-01", true), ErrRDTDisabled)
 	assert.NoDirExists(t, filepath.Join(root, "shared-01"))
 
 	assert.NoError(t, m.ReconcileClos(ClosReconcileState{DisableRDT: false}))

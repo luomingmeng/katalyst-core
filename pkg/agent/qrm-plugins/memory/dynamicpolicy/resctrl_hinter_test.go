@@ -17,6 +17,7 @@ limitations under the License.
 package dynamicpolicy
 
 import (
+	"errors"
 	"os"
 	"path"
 	"testing"
@@ -41,13 +42,14 @@ import (
 type mockResctrlManager struct {
 	count          int64
 	createCalls    int
+	createErr      error
 	reconcileState resctrl.ClosReconcileState
 }
 
 func (m *mockResctrlManager) Run(stopCh <-chan struct{}) {}
 func (m *mockResctrlManager) Create(podUID, closID string, createMonGroup bool) error {
 	m.createCalls++
-	return nil
+	return m.createErr
 }
 func (m *mockResctrlManager) ReconcileClos(state resctrl.ClosReconcileState) error {
 	m.reconcileState = state
@@ -101,6 +103,32 @@ func TestResctrlHinterDisableRDTSynchronouslyGatesHintAndAllocate(t *testing.T) 
 		require.Empty(t, allocation.ResourceAllocation)
 	}
 	require.Zero(t, manager.createCalls)
+}
+
+func TestResctrlHinterAllocateDoesNotInjectClosWhenCreateFails(t *testing.T) {
+	manager := &mockResctrlManager{createErr: errors.New("disable transition pending")}
+	hinter := &resctrlHinter{
+		config: &qrmresctrl.ResctrlConfig{
+			EnableResctrlHint: true,
+			EnabledQoS:        []string{apiconsts.PodAnnotationQoSLevelSharedCores},
+		},
+		enabledQoS:           sets.NewString(apiconsts.PodAnnotationQoSLevelSharedCores),
+		closidEnablingGroups: sets.NewString(),
+		monGroupsMaxCount:    atomic.NewInt64(0),
+		manager:              manager,
+	}
+	allocation := &pluginapi.ResourceAllocation{
+		ResourceAllocation: map[string]*pluginapi.ResourceAllocationInfo{},
+	}
+
+	hinter.Allocate(commonstate.AllocationMeta{
+		PodUid:        "pod-a",
+		OwnerPoolName: "share",
+		QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+	}, allocation)
+
+	require.Equal(t, 1, manager.createCalls)
+	require.Empty(t, allocation.ResourceAllocation)
 }
 
 func TestResctrlHinterReconcileClosBuildsExpectedClosIDsFromState(t *testing.T) {

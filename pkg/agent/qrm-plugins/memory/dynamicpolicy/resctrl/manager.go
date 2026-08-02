@@ -18,6 +18,7 @@ package resctrl
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -41,6 +42,8 @@ const (
 	cpus         = "cpus"
 	schemata     = "schemata"
 )
+
+var ErrRDTDisabled = errors.New("RDT is disabled")
 
 type Manager interface {
 	Run(stopCh <-chan struct{})
@@ -119,7 +122,10 @@ func (m *managerImpl) Create(podUID, closID string, createMonGroup bool) error {
 	if m.ownershipLoadErr != nil {
 		return m.ownershipLoadErr
 	}
-	if m.disableRDT || !m.enabled.Load() || m.root == "" {
+	if m.disableRDT {
+		return ErrRDTDisabled
+	}
+	if !m.enabled.Load() || m.root == "" {
 		return nil
 	}
 
