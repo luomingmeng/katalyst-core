@@ -129,6 +129,12 @@ func (m *managerImpl) Create(podUID, closID string, createMonGroup bool) error {
 	if !m.enabled.Load() || m.root == "" {
 		return nil
 	}
+	if err := m.recoverPendingDeletesLocked(); err != nil {
+		return err
+	}
+	if err := m.refreshOwnershipLocked(); err != nil {
+		return err
+	}
 
 	closIDPath, err := m.createClosLocked(closID)
 	if err != nil {
