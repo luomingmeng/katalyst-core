@@ -22,7 +22,7 @@ import (
 	"sort"
 
 	bulkheadapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api"
-	bulkheadutils "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	qrmresctrlmanager "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/resctrl"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
@@ -147,7 +147,7 @@ func (p *CPUListPlugin) PeriodicalHandler(context.Context, bulkheadapi.Periodica
 	return nil
 }
 
-func (p *CPUListPlugin) buildTargets(view *bulkheadutils.CPUSetPartitionView) map[string]string {
+func (p *CPUListPlugin) buildTargets(view *model.CPUSetPartitionView) map[string]string {
 	cpuSets := make(map[string]machine.CPUSet)
 	if view == nil {
 		return map[string]string{}
