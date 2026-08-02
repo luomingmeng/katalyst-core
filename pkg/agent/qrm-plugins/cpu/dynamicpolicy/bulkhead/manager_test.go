@@ -481,6 +481,35 @@ func TestManagerApplyRejectsStaleGenerationBeforeSideEffects(t *testing.T) {
 	}
 }
 
+func TestManagerApplyChecksGenerationAfterFailedSideEffect(t *testing.T) {
+	t.Parallel()
+
+	pluginErr := errors.New("partial side effect failed")
+	plugin := &fakePlugin{name: "rdt_cpulist", enabled: true, adjustErr: pluginErr}
+	m := &Manager{plugins: []bulkheadapi.Plugin{plugin}}
+	fenceCalls := 0
+
+	_, err := m.Apply(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
+		DynamicConf: dynamicBulkheadConf(true),
+		Generation:  10,
+		CommitIfGenerationCurrent: func(uint64, func()) bool {
+			fenceCalls++
+			return fenceCalls <= 2
+		},
+	})
+
+	var nonConverged *NonConvergedError
+	if !errors.As(err, &nonConverged) {
+		t.Fatalf("Apply() error = %v, want stale generation after failed side effect", err)
+	}
+	if fenceCalls != 3 {
+		t.Fatalf("generation fence calls = %d, want entry, pre-, and post-side-effect checks", fenceCalls)
+	}
+	if got := len(plugin.adjustViews); got != 1 {
+		t.Fatalf("plugin calls = %d, want failed side effect to run once", got)
+	}
+}
+
 func TestManagerApplyRejectsTypedTopologyResultWhenDesiredViewChanges(t *testing.T) {
 	t.Parallel()
 
