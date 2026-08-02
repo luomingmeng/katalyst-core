@@ -19,19 +19,24 @@ package systemservice
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	bulkheadapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	bulkheadconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/bulkhead"
 	cgroupclient "github.com/kubewharf/katalyst-core/pkg/util/cgroup/client"
 	utilfs "github.com/kubewharf/katalyst-core/pkg/util/fs"
+	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	procfscommon "github.com/kubewharf/katalyst-core/pkg/util/procfs/common"
 )
 
@@ -72,20 +77,30 @@ var _ utilfs.FS = (*fakeFS)(nil)
 
 type fakeCgroup struct {
 	cgroupclient.FakeCgroupClient
-	existingDirs map[string]bool // rel -> whether StatDir succeeds
-	attaches     []attachCall
-	attachErr    error
+	existingDirs       map[string]bool // rel -> whether StatDir succeeds
+	attaches           []attachCall
+	identityAttaches   []identityAttachCall
+	attachErr          error
+	attachHook         func()
+	identityAttachHook func()
 
 	// cgroupFiles simulates reading files like cgroup.procs under a given
 	// rel. Keys: rel -> file basename -> file bytes. The reset path uses
 	// this to enumerate PIDs currently in targetRel/cgroup.procs.
 	cgroupFiles   map[string]map[string][]byte
 	cgroupFileErr error
+	cpuSets       map[string]machine.CPUSet
 }
 
 type attachCall struct {
 	rel string
 	pid int
+}
+
+type identityAttachCall struct {
+	rel      string
+	identity cgroupclient.CgroupIdentity
+	pid      int
 }
 
 func newFakeCgroup() *fakeCgroup {
@@ -100,9 +115,29 @@ func (f *fakeCgroup) StatDir(_ context.Context, rel string) (time.Time, error) {
 }
 
 func (f *fakeCgroup) AttachPID(_ context.Context, rel string, pid int) error {
+	if f.attachHook != nil {
+		f.attachHook()
+	}
 	if f.attachErr != nil {
 		return f.attachErr
 	}
+	f.attaches = append(f.attaches, attachCall{rel: rel, pid: pid})
+	return nil
+}
+
+func (f *fakeCgroup) AttachPIDWithIdentity(
+	_ context.Context,
+	rel string,
+	identity cgroupclient.CgroupIdentity,
+	pid int,
+) error {
+	if f.identityAttachHook != nil {
+		f.identityAttachHook()
+	}
+	if f.attachErr != nil {
+		return f.attachErr
+	}
+	f.identityAttaches = append(f.identityAttaches, identityAttachCall{rel: rel, identity: identity, pid: pid})
 	f.attaches = append(f.attaches, attachCall{rel: rel, pid: pid})
 	return nil
 }
@@ -119,10 +154,21 @@ func (f *fakeCgroup) ReadCgroupFile(_ context.Context, rel, file string) ([]byte
 	return nil, os.ErrNotExist
 }
 
+func (f *fakeCgroup) ReadCPUSet(_ context.Context, rel string) (machine.CPUSet, error) {
+	if cpus, ok := f.cpuSets[rel]; ok {
+		return cpus, nil
+	}
+	if f.existingDirs[rel] {
+		return machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7), nil
+	}
+	return machine.NewCPUSet(), os.ErrNotExist
+}
+
 // rootProcsPath is the cpuset controller root cgroup.procs path the test
 // plugin is wired to; tests seed fakeFS.reads[rootProcsPath] with the
 // whitespace-separated PID list the plugin should classify.
 const rootProcsPath = "/sys/fs/cgroup/cpuset/cgroup.procs"
+const rootTasksPath = "/sys/fs/cgroup/cpuset/tasks"
 
 func seedRootPIDs(fFS *fakeFS, pids ...int) {
 	var b strings.Builder
@@ -131,6 +177,15 @@ func seedRootPIDs(fFS *fakeFS, pids ...int) {
 		b.WriteByte('\n')
 	}
 	fFS.reads[rootProcsPath] = b.String()
+}
+
+func seedRootTasks(fFS *fakeFS, pids ...int) {
+	var b strings.Builder
+	for _, pid := range pids {
+		b.WriteString(strconv.Itoa(pid))
+		b.WriteByte('\n')
+	}
+	fFS.reads[rootTasksPath] = b.String()
 }
 
 // seedTargetPIDs writes a synthetic cgroup.procs into the fake CgroupClient
@@ -151,6 +206,31 @@ func seedTargetPIDs(fCg *fakeCgroup, targetRel string, pids ...int) {
 	fCg.cgroupFiles[targetRel]["cgroup.procs"] = []byte(b.String())
 }
 
+func seedTargetTasks(fCg *fakeCgroup, targetRel string, pids ...int) {
+	if fCg.cgroupFiles == nil {
+		fCg.cgroupFiles = map[string]map[string][]byte{}
+	}
+	if fCg.cgroupFiles[targetRel] == nil {
+		fCg.cgroupFiles[targetRel] = map[string][]byte{}
+	}
+	var b strings.Builder
+	for _, pid := range pids {
+		b.WriteString(strconv.Itoa(pid))
+		b.WriteByte('\n')
+	}
+	fCg.cgroupFiles[targetRel]["tasks"] = []byte(b.String())
+}
+
+func seedTargetEffectiveCPUSet(fCg *fakeCgroup, targetRel, cpus string) {
+	if fCg.cgroupFiles == nil {
+		fCg.cgroupFiles = map[string]map[string][]byte{}
+	}
+	if fCg.cgroupFiles[targetRel] == nil {
+		fCg.cgroupFiles[targetRel] = map[string][]byte{}
+	}
+	fCg.cgroupFiles[targetRel]["cpuset.cpus.effective"] = []byte(cpus)
+}
+
 // ---------------------------------------------------------------------------
 // fake ProcReader
 // ---------------------------------------------------------------------------
@@ -159,6 +239,7 @@ type fakeProc struct {
 	procs    map[int]procfscommon.ProcInfo
 	listErr  error
 	affinity map[int][]int
+	readHook func(int)
 }
 
 func (f *fakeProc) ListPIDs() ([]int, error) {
@@ -174,6 +255,9 @@ func (f *fakeProc) ListPIDs() ([]int, error) {
 }
 
 func (f *fakeProc) ReadProc(pid int) (procfscommon.ProcInfo, error) {
+	if f.readHook != nil {
+		f.readHook(pid)
+	}
 	info, ok := f.procs[pid]
 	if !ok {
 		return procfscommon.ProcInfo{}, errors.New("no such pid")
@@ -192,6 +276,17 @@ func (f *fakeProc) SchedSetaffinity(pid int, cpus []int) error {
 }
 
 var _ procfscommon.ProcReader = (*fakeProc)(nil)
+
+type fakePIDPin struct {
+	onClose func()
+}
+
+func (p *fakePIDPin) Close() error {
+	if p.onClose != nil {
+		p.onClose()
+	}
+	return nil
+}
 
 // raceyProcReader wraps fakeProc but returns an error for a specific PID on
 // ReadProc to simulate a "process exited between ListPIDs and ReadProc" race.
@@ -223,6 +318,9 @@ func newTestPlugin(targetRel string, fFS *fakeFS, fProc procfscommon.ProcReader,
 		cgroup:              fCg,
 		targetRel:           targetRel,
 		rootCgroupProcsPath: rootProcsPath,
+		pinPID: func(int) (io.Closer, error) {
+			return &fakePIDPin{}, nil
+		},
 	}
 }
 
@@ -409,7 +507,255 @@ func TestCPUSetAdjustmentDisabledHandler_NoOp(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func periodCtx(enabled bool) bulkheadapi.PeriodicalHandlerContext {
-	return bulkheadapi.PeriodicalHandlerContext{DynamicConf: dynConf(enabled)}
+	ctx := bulkheadapi.PeriodicalHandlerContext{DynamicConf: dynConf(enabled)}
+	if enabled {
+		ctx.AppliedView = appliedViewWithReclaim(machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7))
+		ctx.AppliedViewRevision = 1
+		ctx.AppliedViewValidForPeriodical = true
+	}
+	return ctx
+}
+
+func appliedPeriodCtx(enabled bool, revision uint64, reclaim machine.CPUSet) bulkheadapi.PeriodicalHandlerContext {
+	ctx := bulkheadapi.PeriodicalHandlerContext{DynamicConf: dynConf(enabled)}
+	if enabled {
+		ctx.AppliedView = appliedViewWithReclaim(reclaim)
+		ctx.AppliedViewRevision = revision
+		ctx.AppliedViewValidForPeriodical = true
+	}
+	return ctx
+}
+
+func appliedViewWithReclaim(reclaim machine.CPUSet) *model.AppliedView {
+	view := model.NewDesiredView()
+	view.ReclaimEffective = reclaim.Clone()
+	applied := view.ToAppliedView()
+	applied.CPUSetByRel = map[string]machine.CPUSet{"system": reclaim.Clone()}
+	applied.RelProofByRel = map[string]model.CgroupRelProof{
+		"system": {Device: 7, Inode: 11, CPUSet: reclaim.Clone()},
+	}
+	return applied
+}
+
+func TestPeriodicalHandler_MigrationUsesAppliedProofIdentity(t *testing.T) {
+	t.Parallel()
+
+	fFS := newFakeFS()
+	seedRootPIDs(fFS, 100)
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		100: {PID: 100, Comm: "crond"},
+	}}
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+
+	if err := p.PeriodicalHandler(context.Background(), periodCtx(true)); err != nil {
+		t.Fatalf("PeriodicalHandler() error = %v", err)
+	}
+	if len(fCg.identityAttaches) != 1 {
+		t.Fatalf("identity-bound attaches = %+v, want one", fCg.identityAttaches)
+	}
+	got := fCg.identityAttaches[0]
+	if got.rel != "system" || got.pid != 100 ||
+		got.identity != (cgroupclient.CgroupIdentity{Device: 7, Inode: 11}) {
+		t.Fatalf("identity-bound attach = %+v", got)
+	}
+}
+
+func TestPeriodicalHandler_PinsPIDBeforeClassificationUntilIdentityAttachCompletes(t *testing.T) {
+	t.Parallel()
+
+	events := make([]string, 0, 4)
+	fFS := newFakeFS()
+	seedRootPIDs(fFS, 100)
+	fProc := &fakeProc{
+		procs:    map[int]procfscommon.ProcInfo{100: {PID: 100, Comm: "crond"}},
+		readHook: func(int) { events = append(events, "read") },
+	}
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	fCg.identityAttachHook = func() { events = append(events, "attach") }
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+	p.pinPID = func(pid int) (io.Closer, error) {
+		if pid != 100 {
+			t.Fatalf("pin pid = %d, want 100", pid)
+		}
+		events = append(events, "pin")
+		return &fakePIDPin{onClose: func() { events = append(events, "close") }}, nil
+	}
+
+	if err := p.PeriodicalHandler(context.Background(), periodCtx(true)); err != nil {
+		t.Fatalf("PeriodicalHandler: %v", err)
+	}
+	if got, want := strings.Join(events, ","), "pin,read,attach,close"; got != want {
+		t.Fatalf("PID identity lifetime events = %q, want %q", got, want)
+	}
+}
+
+func TestPeriodicalHandler_PinsTaskOnlyKThreadBeforeClassification(t *testing.T) {
+	t.Parallel()
+
+	events := make([]string, 0, 4)
+	fFS := newFakeFS()
+	seedRootPIDs(fFS)
+	seedRootTasks(fFS, 400)
+	fProc := &fakeProc{
+		procs: map[int]procfscommon.ProcInfo{
+			400: {PID: 400, Comm: "kswapd0", IsKThread: true, PPID: 2},
+		},
+		readHook: func(int) { events = append(events, "read") },
+	}
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	fCg.identityAttachHook = func() { events = append(events, "attach") }
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{
+		BulkheadSystemKThreadCommSubstrs: []string{"kswapd"},
+	})
+	p.pinPID = func(int) (io.Closer, error) {
+		events = append(events, "pin")
+		return &fakePIDPin{onClose: func() { events = append(events, "close") }}, nil
+	}
+
+	if err := p.PeriodicalHandler(context.Background(), periodCtx(true)); err != nil {
+		t.Fatalf("PeriodicalHandler: %v", err)
+	}
+	if got, want := strings.Join(events, ","), "pin,read,attach,close"; got != want {
+		t.Fatalf("task-only PID identity lifetime events = %q, want %q", got, want)
+	}
+}
+
+func TestPeriodicalHandler_PIDFDUnavailableFailsClosedBeforeClassification(t *testing.T) {
+	t.Parallel()
+
+	read := false
+	fFS := newFakeFS()
+	seedRootPIDs(fFS, 100)
+	fProc := &fakeProc{
+		procs:    map[int]procfscommon.ProcInfo{100: {PID: 100, Comm: "crond"}},
+		readHook: func(int) { read = true },
+	}
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+	p.pinPID = func(int) (io.Closer, error) {
+		return nil, errors.New("pidfd_open unsupported")
+	}
+
+	if err := p.PeriodicalHandler(context.Background(), periodCtx(true)); err == nil {
+		t.Fatal("PeriodicalHandler must fail closed when pidfd_open is unavailable")
+	}
+	if read || len(fCg.identityAttaches) != 0 {
+		t.Fatalf("unsupported pidfd must prevent classification and attach: read=%v attaches=%+v", read, fCg.identityAttaches)
+	}
+}
+
+func TestPeriodicalHandler_PIDFDOpenESRCHSkipsExitedPID(t *testing.T) {
+	t.Parallel()
+
+	read := false
+	fFS := newFakeFS()
+	seedRootPIDs(fFS, 100)
+	fProc := &fakeProc{
+		procs:    map[int]procfscommon.ProcInfo{100: {PID: 100, Comm: "crond"}},
+		readHook: func(int) { read = true },
+	}
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+	p.pinPID = func(int) (io.Closer, error) {
+		return nil, syscall.ESRCH
+	}
+
+	if err := p.PeriodicalHandler(context.Background(), periodCtx(true)); err != nil {
+		t.Fatalf("exited PID must be skipped: %v", err)
+	}
+	if read || len(fCg.identityAttaches) != 0 {
+		t.Fatalf("exited PID must not be classified or attached: read=%v attaches=%+v", read, fCg.identityAttaches)
+	}
+}
+
+func TestPeriodicalHandler_PIDFDOpenEINVALSkipsTaskOnlyUserspaceThread(t *testing.T) {
+	t.Parallel()
+
+	readPIDs := make([]int, 0, 1)
+	fFS := newFakeFS()
+	seedRootPIDs(fFS, 100)
+	seedRootTasks(fFS, 100, 101)
+	fProc := &fakeProc{
+		procs: map[int]procfscommon.ProcInfo{
+			100: {PID: 100, Comm: "crond"},
+		},
+		readHook: func(pid int) { readPIDs = append(readPIDs, pid) },
+	}
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+	p.pinPID = func(pid int) (io.Closer, error) {
+		if pid == 101 {
+			return nil, syscall.EINVAL
+		}
+		return &fakePIDPin{}, nil
+	}
+
+	if err := p.PeriodicalHandler(context.Background(), periodCtx(true)); err != nil {
+		t.Fatalf("task-only userspace thread must be covered by its cgroup.procs leader: %v", err)
+	}
+	if len(readPIDs) != 1 || readPIDs[0] != 100 {
+		t.Fatalf("only the pinned leader may be classified, got reads=%v", readPIDs)
+	}
+	if len(fCg.identityAttaches) != 1 || fCg.identityAttaches[0].pid != 100 {
+		t.Fatalf("only the userspace leader should be attached, got %+v", fCg.identityAttaches)
+	}
+}
+
+func TestPeriodicalHandler_PIDFDOpenEINVALForLeaderFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	read := false
+	fFS := newFakeFS()
+	seedRootPIDs(fFS, 100)
+	seedRootTasks(fFS, 100)
+	fProc := &fakeProc{
+		procs:    map[int]procfscommon.ProcInfo{100: {PID: 100, Comm: "crond"}},
+		readHook: func(int) { read = true },
+	}
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+	p.pinPID = func(int) (io.Closer, error) {
+		return nil, syscall.EINVAL
+	}
+
+	if err := p.PeriodicalHandler(context.Background(), periodCtx(true)); err == nil {
+		t.Fatal("pidfd_open EINVAL for a cgroup.procs leader must fail closed")
+	}
+	if read || len(fCg.identityAttaches) != 0 {
+		t.Fatalf("an unpinned leader must not be classified or attached: read=%v attaches=%+v", read, fCg.identityAttaches)
+	}
+}
+
+func TestPeriodicalHandler_MigrationFailsClosedWithoutIdentityAttachCapability(t *testing.T) {
+	t.Parallel()
+
+	fFS := newFakeFS()
+	seedRootPIDs(fFS, 100)
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		100: {PID: 100, Comm: "crond"},
+	}}
+	inner := newFakeCgroup()
+	inner.existingDirs["system"] = true
+	p := newTestPlugin("system", fFS, fProc, &cgroupClientWithoutIdentity{CgroupClient: inner}, bulkheadconfig.BulkheadConfiguration{})
+
+	if err := p.PeriodicalHandler(context.Background(), periodCtx(true)); err == nil {
+		t.Fatalf("PeriodicalHandler() must fail without identity-bound attach capability")
+	}
+	if len(inner.attaches) != 0 {
+		t.Fatalf("migration must not fall back to path-only AttachPID, got %+v", inner.attaches)
+	}
+}
+
+type cgroupClientWithoutIdentity struct {
+	cgroupclient.CgroupClient
 }
 
 func TestPeriodicalHandler_DisabledByConfig(t *testing.T) {
@@ -491,6 +837,73 @@ func TestPeriodicalHandler_MigratesKThreadAndUserspaceViaAttachPID(t *testing.T)
 	}
 }
 
+func TestPeriodicalHandler_EnabledMigrationTreatsESRCHAsSatisfied(t *testing.T) {
+	t.Parallel()
+
+	fFS := newFakeFS()
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		100: {PID: 100, Comm: "movable"},
+	}}
+	seedRootPIDs(fFS, 100)
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	fCg.cpuSets = map[string]machine.CPUSet{}
+	fCg.cpuSets["system"] = machine.NewCPUSet(0, 1)
+	fCg.attachErr = syscall.ESRCH
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+	in := appliedPeriodCtx(true, 9, machine.NewCPUSet(0, 1))
+
+	if err := p.PeriodicalHandler(context.Background(), in); err != nil {
+		t.Fatalf("PeriodicalHandler: %v", err)
+	}
+	if p.lastMigratedAppliedViewRevision != 9 {
+		t.Fatalf("last migrated revision = %d, want ESRCH-satisfied revision 9", p.lastMigratedAppliedViewRevision)
+	}
+}
+
+func TestPeriodicalHandler_MigratesKThreadDiscoveredOnlyInRootTasks_BitsUT(t *testing.T) {
+	t.Parallel()
+	fFS := newFakeFS()
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		400: {PID: 400, Comm: "kswapd0", IsKThread: true, PPID: 2},
+	}}
+	seedRootPIDs(fFS)
+	seedRootTasks(fFS, 400)
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{
+		BulkheadSystemKThreadCommSubstrs: []string{"kswapd"},
+	})
+	if err := p.PeriodicalHandler(context.Background(), periodCtx(true)); err != nil {
+		t.Fatalf("PeriodicalHandler: %v", err)
+	}
+	if len(fCg.attaches) != 1 || fCg.attaches[0] != (attachCall{rel: "system", pid: 400}) {
+		t.Fatalf("root tasks kthread attach = %+v, want system/400", fCg.attaches)
+	}
+}
+
+func TestPeriodicalHandler_DoesNotMigrateBlacklistedUserspaceThreadFromTasks_BitsUT(t *testing.T) {
+	t.Parallel()
+	fFS := newFakeFS()
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		200: {PID: 200, Comm: "kubelet"},
+		201: {PID: 201, Comm: "grpc-worker"},
+	}}
+	seedRootPIDs(fFS, 200)
+	seedRootTasks(fFS, 200, 201)
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{
+		BulkheadSystemdCommBlacklist: []string{"kubelet"},
+	})
+	if err := p.PeriodicalHandler(context.Background(), periodCtx(true)); err != nil {
+		t.Fatalf("PeriodicalHandler: %v", err)
+	}
+	if len(fCg.attaches) != 0 {
+		t.Fatalf("blacklisted userspace thread from tasks must not be migrated, got %+v", fCg.attaches)
+	}
+}
+
 func TestPeriodicalHandler_EmptyBlacklistMigratesAllUserspace(t *testing.T) {
 	t.Parallel()
 	fFS := newFakeFS()
@@ -540,6 +953,163 @@ func TestPeriodicalHandler_ToleratesReadProcError(t *testing.T) {
 	}
 }
 
+func TestSystemServiceConsumesAppliedReclaimUnionOrSafeSubset(t *testing.T) {
+	t.Parallel()
+	fFS := newFakeFS()
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		100: {PID: 100, Comm: "crond"},
+	}}
+	seedRootPIDs(fFS, 100)
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	seedTargetEffectiveCPUSet(fCg, "system", "2-3")
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+
+	in := appliedPeriodCtx(true, 7, machine.NewCPUSet(2, 3, 4))
+	in.AppliedView.CPUSetByRel["system"] = machine.NewCPUSet(2, 3)
+	in.AppliedView.RelProofByRel["system"] = model.CgroupRelProof{
+		Device: 7, Inode: 11, CPUSet: machine.NewCPUSet(2, 3),
+	}
+	if err := p.PeriodicalHandler(context.Background(), in); err != nil {
+		t.Fatalf("PeriodicalHandler: %v", err)
+	}
+	if len(fCg.attaches) != 1 || fCg.attaches[0].pid != 100 || fCg.attaches[0].rel != "system" {
+		t.Fatalf("target cpuset safe subset of AppliedView reclaim must authorize migration, got %+v", fCg.attaches)
+	}
+	if p.lastMigratedAppliedViewRevision != 7 {
+		t.Fatalf("last migrated revision = %d, want 7", p.lastMigratedAppliedViewRevision)
+	}
+}
+
+func TestPeriodicalSystemServiceDoesNotResampleDesiredPartition(t *testing.T) {
+	t.Parallel()
+	fFS := newFakeFS()
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		100: {PID: 100, Comm: "crond"},
+	}}
+	seedRootPIDs(fFS, 100)
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	seedTargetEffectiveCPUSet(fCg, "system", "0-1")
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{
+		BulkheadReclaimRelPaths: []string{"reclaimed"},
+	})
+
+	in := appliedPeriodCtx(true, 8, machine.NewCPUSet(2, 3))
+	if err := p.PeriodicalHandler(context.Background(), in); err != nil {
+		t.Fatalf("PeriodicalHandler: %v", err)
+	}
+	if len(fCg.attaches) != 0 {
+		t.Fatalf("target outside AppliedView reclaim must not migrate even if static config exists, got %+v", fCg.attaches)
+	}
+	if p.lastMigratedAppliedViewRevision != 0 {
+		t.Fatalf("unauthorized target must not consume revision, got %d", p.lastMigratedAppliedViewRevision)
+	}
+}
+
+func TestPeriodicalSystemServiceRequiresPerRelAppliedProof(t *testing.T) {
+	t.Parallel()
+	fFS := newFakeFS()
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		100: {PID: 100, Comm: "crond"},
+	}}
+	seedRootPIDs(fFS, 100)
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	seedTargetEffectiveCPUSet(fCg, "system", "0-1")
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+
+	in := appliedPeriodCtx(true, 8, machine.NewCPUSet(0, 1, 2, 3))
+	in.AppliedView.CPUSetByRel["system"] = machine.NewCPUSet(2, 3)
+	if err := p.PeriodicalHandler(context.Background(), in); err != nil {
+		t.Fatalf("PeriodicalHandler: %v", err)
+	}
+	if len(fCg.attaches) != 0 {
+		t.Fatalf("aggregate reclaim membership must not replace per-rel proof, got %+v", fCg.attaches)
+	}
+}
+
+func TestPeriodicalSystemServiceSkipsWhenAppliedViewMissing(t *testing.T) {
+	t.Parallel()
+	fFS := newFakeFS()
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		100: {PID: 100, Comm: "crond"},
+	}}
+	seedRootPIDs(fFS, 100)
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+
+	if err := p.PeriodicalHandler(context.Background(), bulkheadapi.PeriodicalHandlerContext{
+		DynamicConf: dynConf(true),
+	}); err != nil {
+		t.Fatalf("PeriodicalHandler: %v", err)
+	}
+	if len(fCg.attaches) != 0 {
+		t.Fatalf("missing AppliedView must short-circuit migration, got %+v", fCg.attaches)
+	}
+}
+
+func TestPeriodicalSystemServiceSkipsOldAppliedViewWhenInvalidForPeriodical_BitsUT(t *testing.T) {
+	t.Parallel()
+	fFS := newFakeFS()
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		100: {PID: 100, Comm: "crond"},
+	}}
+	seedRootPIDs(fFS, 100)
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	seedTargetEffectiveCPUSet(fCg, "system", "2-3")
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+
+	in := bulkheadapi.PeriodicalHandlerContext{
+		DynamicConf:         dynConf(true),
+		AppliedView:         appliedViewWithReclaim(machine.NewCPUSet(2, 3)),
+		AppliedViewRevision: 9,
+	}
+	if err := p.PeriodicalHandler(context.Background(), in); err != nil {
+		t.Fatalf("PeriodicalHandler: %v", err)
+	}
+	if len(fCg.attaches) != 0 {
+		t.Fatalf("old AppliedView invalid for current periodical round must not authorize AttachPID, got %+v", fCg.attaches)
+	}
+	if p.lastMigratedAppliedViewRevision != 0 {
+		t.Fatalf("invalid AppliedView must not consume revision, got %d", p.lastMigratedAppliedViewRevision)
+	}
+}
+
+func TestPeriodicalSystemServiceContinuesScanningSameAppliedViewRevision(t *testing.T) {
+	t.Parallel()
+	fFS := newFakeFS()
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		100: {PID: 100, Comm: "crond"},
+		101: {PID: 101, Comm: "rsyslogd"},
+		102: {PID: 102, Comm: "new-daemon"},
+	}}
+	seedRootPIDs(fFS, 100, 101)
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	seedTargetEffectiveCPUSet(fCg, "system", "2-3")
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+
+	in := appliedPeriodCtx(true, 9, machine.NewCPUSet(2, 3))
+	if err := p.PeriodicalHandler(context.Background(), in); err != nil {
+		t.Fatalf("first PeriodicalHandler: %v", err)
+	}
+	if len(fCg.attaches) != 2 {
+		t.Fatalf("first fresh applied revision should migrate both userspace pids, got %+v", fCg.attaches)
+	}
+	fCg.attaches = nil
+	seedRootPIDs(fFS, 102)
+
+	if err := p.PeriodicalHandler(context.Background(), in); err != nil {
+		t.Fatalf("second PeriodicalHandler: %v", err)
+	}
+	if len(fCg.attaches) != 1 || fCg.attaches[0] != (attachCall{rel: "system", pid: 102}) {
+		t.Fatalf("same applied revision must continue scanning newly arrived PIDs, got %+v", fCg.attaches)
+	}
+}
+
 func TestPeriodicalHandler_TolerateAttachFailures(t *testing.T) {
 	t.Parallel()
 	fFS := newFakeFS()
@@ -552,10 +1122,41 @@ func TestPeriodicalHandler_TolerateAttachFailures(t *testing.T) {
 	fCg.existingDirs["system"] = true
 	fCg.attachErr = errors.New("EBUSY")
 	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
-	// Per-PID AttachPID failures MUST NOT surface — they are logged and the
-	// loop continues.
-	if err := p.PeriodicalHandler(context.Background(), periodCtx(true)); err != nil {
-		t.Fatalf("PeriodicalHandler must swallow per-PID attach errors: %v", err)
+	if err := p.PeriodicalHandler(context.Background(), periodCtx(true)); err == nil {
+		t.Fatal("PeriodicalHandler must return non-ESRCH per-PID attach errors")
+	}
+}
+
+func TestPeriodicalHandler_AttachFailureDoesNotConsumeAppliedViewRevision_BitsUT(t *testing.T) {
+	t.Parallel()
+	fFS := newFakeFS()
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		100: {PID: 100, Comm: "crond"},
+	}}
+	seedRootPIDs(fFS, 100)
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	seedTargetEffectiveCPUSet(fCg, "system", "2-3")
+	fCg.attachErr = errors.New("EBUSY")
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+
+	in := appliedPeriodCtx(true, 11, machine.NewCPUSet(2, 3))
+	if err := p.PeriodicalHandler(context.Background(), in); err == nil {
+		t.Fatal("first PeriodicalHandler must return non-ESRCH attach errors")
+	}
+	if p.lastMigratedAppliedViewRevision != 0 {
+		t.Fatalf("failed AttachPID must not consume revision, got %d", p.lastMigratedAppliedViewRevision)
+	}
+
+	fCg.attachErr = nil
+	if err := p.PeriodicalHandler(context.Background(), in); err != nil {
+		t.Fatalf("second PeriodicalHandler should retry same revision: %v", err)
+	}
+	if len(fCg.attaches) != 1 || fCg.attaches[0].pid != 100 || fCg.attaches[0].rel != "system" {
+		t.Fatalf("same revision should retry AttachPID after prior failure, got %+v", fCg.attaches)
+	}
+	if p.lastMigratedAppliedViewRevision != 11 {
+		t.Fatalf("successful retry should consume revision 11, got %d", p.lastMigratedAppliedViewRevision)
 	}
 }
 
@@ -641,6 +1242,107 @@ func TestPeriodicalHandler_EnableToDisableTransitionResets(t *testing.T) {
 	}
 	if !gotPids[100] || !gotPids[400] {
 		t.Fatalf("reset must reattach PIDs 100 and 400 to root, got %+v", gotPids)
+	}
+}
+
+func TestPeriodicalHandler_ResetPinsPIDUntilRootAttachCompletes(t *testing.T) {
+	t.Parallel()
+
+	events := make([]string, 0, 3)
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	seedTargetPIDs(fCg, "system", 100)
+	fCg.attachHook = func() { events = append(events, "attach") }
+	p := newTestPlugin("system", newFakeFS(), &fakeProc{}, fCg, bulkheadconfig.BulkheadConfiguration{})
+	p.pinPID = func(int) (io.Closer, error) {
+		events = append(events, "pin")
+		return &fakePIDPin{onClose: func() { events = append(events, "close") }}, nil
+	}
+	enabled := true
+	p.lastPeriodicalEnabled = &enabled
+
+	if err := p.PeriodicalHandler(context.Background(), periodCtx(false)); err != nil {
+		t.Fatalf("PeriodicalHandler reset: %v", err)
+	}
+	if got, want := strings.Join(events, ","), "pin,attach,close"; got != want {
+		t.Fatalf("reset PID identity lifetime events = %q, want %q", got, want)
+	}
+}
+
+func TestPeriodicalHandler_ResetPIDFDUnavailableFailsClosedAndRemainsPending(t *testing.T) {
+	t.Parallel()
+
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	seedTargetPIDs(fCg, "system", 100)
+	p := newTestPlugin("system", newFakeFS(), &fakeProc{}, fCg, bulkheadconfig.BulkheadConfiguration{})
+	p.pinPID = func(int) (io.Closer, error) {
+		return nil, errors.New("pidfd_open unsupported")
+	}
+	enabled := true
+	p.lastPeriodicalEnabled = &enabled
+
+	if err := p.PeriodicalHandler(context.Background(), periodCtx(false)); err == nil {
+		t.Fatal("reset must fail closed when pidfd_open is unavailable")
+	}
+	if len(fCg.attaches) != 0 {
+		t.Fatalf("reset must not attach an unpinned numeric PID, got %+v", fCg.attaches)
+	}
+	if !trackerVal(t, p) {
+		t.Fatal("failed reset must remain pending")
+	}
+}
+
+func TestPeriodicalHandler_ResetPIDFDOpenEINVALSkipsTaskOnlyUserspaceThread(t *testing.T) {
+	t.Parallel()
+
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	seedTargetPIDs(fCg, "system", 100)
+	seedTargetTasks(fCg, "system", 100, 101)
+	p := newTestPlugin("system", newFakeFS(), &fakeProc{}, fCg, bulkheadconfig.BulkheadConfiguration{})
+	p.pinPID = func(pid int) (io.Closer, error) {
+		if pid == 101 {
+			return nil, syscall.EINVAL
+		}
+		return &fakePIDPin{}, nil
+	}
+	enabled := true
+	p.lastPeriodicalEnabled = &enabled
+
+	if err := p.PeriodicalHandler(context.Background(), periodCtx(false)); err != nil {
+		t.Fatalf("reset task-only userspace thread must be covered by its cgroup.procs leader: %v", err)
+	}
+	if len(fCg.attaches) != 1 || fCg.attaches[0] != (attachCall{rel: "", pid: 100}) {
+		t.Fatalf("reset must attach only the pinned userspace leader, got %+v", fCg.attaches)
+	}
+	if trackerVal(t, p) {
+		t.Fatal("reset with only a covered task-only thread must complete")
+	}
+}
+
+func TestPeriodicalHandler_DisabledResetReadsTargetTasks_BitsUT(t *testing.T) {
+	t.Parallel()
+	fFS := newFakeFS()
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		400: {PID: 400, Comm: "kswapd0", IsKThread: true, PPID: 2},
+	}}
+	seedRootPIDs(fFS)
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	seedTargetPIDs(fCg, "system")
+	seedTargetTasks(fCg, "system", 400)
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{
+		BulkheadSystemKThreadCommSubstrs: []string{"kswapd"},
+	})
+	enabled := true
+	p.lastPeriodicalEnabled = &enabled
+
+	if err := p.PeriodicalHandler(context.Background(), periodCtx(false)); err != nil {
+		t.Fatalf("disabled reset: %v", err)
+	}
+	if len(fCg.attaches) != 1 || fCg.attaches[0] != (attachCall{rel: "", pid: 400}) {
+		t.Fatalf("target tasks reset attach = %+v, want root/400", fCg.attaches)
 	}
 }
 
@@ -797,6 +1499,26 @@ func TestPeriodicalHandler_ResetToleratesAttachPIDErrors(t *testing.T) {
 	}
 }
 
+func TestPeriodicalHandler_ResetIgnoresExitedPID(t *testing.T) {
+	t.Parallel()
+	fFS := newFakeFS()
+	fProc := &fakeProc{}
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	seedTargetPIDs(fCg, "system", 100)
+	fCg.attachErr = fmt.Errorf("write cgroup.procs: %w", syscall.ESRCH)
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+	tr := true
+	p.lastPeriodicalEnabled = &tr
+
+	if err := p.PeriodicalHandler(context.Background(), periodCtx(false)); err != nil {
+		t.Fatalf("exited PID must be treated as an already-completed reset: %v", err)
+	}
+	if trackerVal(t, p) {
+		t.Fatalf("tracker must become disabled after only stale PID races")
+	}
+}
+
 // TestPeriodicalHandler_ResetListError asserts that when reading targetRel's
 // cgroup.procs fails, PeriodicalHandler surfaces the error and keeps the
 // transition pending so a later disabled tick retries.
@@ -812,7 +1534,7 @@ func TestPeriodicalHandler_ResetListError(t *testing.T) {
 	p.lastPeriodicalEnabled = &tr
 
 	if err := p.PeriodicalHandler(context.Background(), periodCtx(false)); err == nil {
-		t.Fatalf("PeriodicalHandler must surface listTargetCgroupPIDs error")
+		t.Fatalf("PeriodicalHandler must surface listTargetCgroupCandidates error")
 	}
 	if trackerVal(t, p) != true {
 		t.Fatalf("tracker must remain pending after reset listing error, got &false")

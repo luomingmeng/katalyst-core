@@ -22,12 +22,13 @@ limitations under the License.
 // ksoftirqd, audit, systemd itself) untouched.
 //
 // Migration strategy:
-//   - Everything goes through a single unified path: PID lookup from the
-//     cgroup ROOT's cgroup.procs, per-PID classification via /proc/<pid>/stat
-//     (see procfscommon.ProcInfo.IsKThread which reads PF_KTHREAD), and
-//     CgroupClient.AttachPID into the target "system" cgroup. AttachPID changes
-//     cgroup membership only; it does not set or otherwise guarantee a PID's
-//     scheduler affinity.
+//   - Everything goes through a single unified path: userspace PID lookup from
+//     the cgroup ROOT's cgroup.procs, kthread-only TID supplementation from
+//     ROOT/tasks, per-PID classification via /proc/<pid>/stat
+//     (see procfscommon.ProcInfo.IsKThread which reads PF_KTHREAD), and an
+//     identity-bound cgroup attach into the target "system" cgroup. The attach
+//     changes cgroup membership only; it does not set or otherwise guarantee a
+//     PID's scheduler affinity.
 //   - Kernel threads (info.IsKThread == true) are migrated only when their
 //     comm contains one of the whitelisted substrings
 //     (BulkheadSystemKThreadCommSubstrs). This is a positive-list to guard
@@ -39,8 +40,8 @@ limitations under the License.
 //
 // When the plugin's dynamic switch transitions from enabled to disabled
 // (or the first PeriodicalHandler tick after restart observes disabled),
-// a one-shot inverse migration reads every PID currently listed in
-// targetRel/cgroup.procs and reattaches it to the cpuset root. It does not
+// a one-shot inverse migration reads every PID/TID currently listed in
+// targetRel/cgroup.procs or targetRel/tasks and reattaches it to the cpuset root. It does not
 // recurse into child cgroups or filter PIDs by managed status. Subsequent ticks
 // while disabled are no-ops.
 //
@@ -51,14 +52,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/util/errors"
 
 	bulkheadapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	bulkheadconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/bulkhead"
@@ -67,6 +72,7 @@ import (
 	cgcommon "github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 	utilfs "github.com/kubewharf/katalyst-core/pkg/util/fs"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
+	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	procfscommon "github.com/kubewharf/katalyst-core/pkg/util/procfs/common"
 )
 
@@ -90,6 +96,9 @@ type SystemServicePlugin struct {
 	fs     utilfs.FS
 	proc   procfscommon.ProcReader
 	cgroup cgroupclient.CgroupClient
+	// pinPID opens a process identity handle. Tests replace it to exercise
+	// PID-reuse races without depending on host pidfd support.
+	pinPID func(pid int) (io.Closer, error)
 
 	// targetRel is the cgroup-relative path of the system-reclaim target
 	// (e.g. "system"). We use the CgroupClient AttachPID interface to migrate
@@ -112,6 +121,12 @@ type SystemServicePlugin struct {
 	// from PeriodicalHandler, which the bulkhead Manager invokes under
 	// Manager.mu — no plugin-local lock is required.
 	lastPeriodicalEnabled *bool
+
+	// lastMigratedAppliedViewRevision records the most recent applied-view
+	// revision used by a successful enabled migration sweep. It is diagnostic
+	// state only: a stable revision remains valid for later sweeps because new
+	// processes may enter the root cgroup at any time.
+	lastMigratedAppliedViewRevision uint64
 }
 
 func NewSystemServicePlugin(conf *config.Configuration) bulkheadapi.Plugin {
@@ -134,6 +149,7 @@ func NewSystemServicePlugin(conf *config.Configuration) bulkheadapi.Plugin {
 		fs:     fs,
 		proc:   procfscommon.NewProcReader(fs, procfsPath),
 		cgroup: cgroupclient.NewCgroupClient(),
+		pinPID: openPIDIdentity,
 		// The cpuset cgroup ROOT (mount point on v2, <mount>/cpuset on v1) is
 		// the only place we scan for candidate PIDs: processes still sitting in
 		// the cpuset root are the host-level services / kthreads not yet claimed
@@ -162,7 +178,7 @@ func (p *SystemServicePlugin) CPUSetAdjustmentDisabledHandler(context.Context, b
 }
 
 // PeriodicalHandler migrates every eligible root-cgroup PID into the target
-// cgroup via CgroupClient.AttachPID when the plugin's dynamic switch is
+// cgroup via identity-bound attach when the plugin's dynamic switch is
 // enabled. When the switch transitions from enabled to disabled (or the
 // first tick after restart observes disabled), it runs a one-shot reset
 // that reads every PID currently listed in targetRel/cgroup.procs and
@@ -171,6 +187,9 @@ func (p *SystemServicePlugin) CPUSetAdjustmentDisabledHandler(context.Context, b
 // are no-ops.
 func (p *SystemServicePlugin) PeriodicalHandler(ctx context.Context, in bulkheadapi.PeriodicalHandlerContext) error {
 	enabled := enableBulkheadSystemService(in.DynamicConf)
+	if enabled && in.EffectiveEnabled != nil && *in.EffectiveEnabled && !in.AppliedViewValidForPeriodical {
+		return nil
+	}
 
 	if !enabled {
 		// Trigger a reset on enabled → disabled transition, or on the first
@@ -198,9 +217,9 @@ func (p *SystemServicePlugin) PeriodicalHandler(ctx context.Context, in bulkhead
 }
 
 // runMigrate performs the enabled-path migration: read root cgroup PIDs,
-// classify each via ReadProc, and AttachPID into targetRel for the eligible
-// subset. Ineligible / racing PIDs are logged at V(4) and skipped without
-// aborting the sweep.
+// classify each via ReadProc, and attach eligible processes to the exact
+// device/inode identity published for targetRel. Ineligible / racing PIDs are
+// logged at V(4) and skipped without aborting the sweep.
 func (p *SystemServicePlugin) runMigrate(ctx context.Context, in bulkheadapi.PeriodicalHandlerContext) error {
 	migrateStart := time.Now()
 	defer func() {
@@ -209,58 +228,180 @@ func (p *SystemServicePlugin) runMigrate(ctx context.Context, in bulkheadapi.Per
 			"system_service: migrate sweep elapsed=%s", migrateElapsed)
 	}()
 
-	// Target cgroup not created yet — bail early, cpuset_topology owns
-	// creation. Next tick will retry.
-	if _, err := p.cgroup.StatDir(ctx, p.targetRel); err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("stat target cgroup %q: %w", p.targetRel, err)
-		}
-		general.InfofV(4, "system_service: target cgroup missing, skipping, rel=%q err=%v",
-			p.targetRel, err)
-		emitBulkheadSystemServiceResult(in.Emitter, "migrate", "skipped", "target_cgroup_missing")
+	targetRel, proof, ok, err := p.authorizedMigrationTarget(ctx, in)
+	if err != nil {
+		return err
+	}
+	if !ok {
 		return nil
 	}
+	identityAttacher, ok := p.cgroup.(cgroupclient.IdentityBoundPIDAttacher)
+	if !ok {
+		return fmt.Errorf("identity-bound cgroup attach capability is required for target %q", targetRel)
+	}
 
-	pids, err := p.listRootCgroupPIDs()
+	candidates, err := p.listRootMigrationCandidates()
 	if err != nil {
 		emitBulkheadSystemServiceResult(in.Emitter, "migrate", "skipped", "list_root_cgroup_pids")
 		return fmt.Errorf("list root cgroup pids: %w", err)
 	}
 
-	for _, pid := range pids {
+	var attachErrors []error
+	for _, candidate := range candidates {
+		pid := candidate.pid
 		if ctx.Err() != nil {
 			emitBulkheadSystemServiceResult(in.Emitter, "migrate", "failed", "context_canceled")
 			return fmt.Errorf("context canceled: %w", ctx.Err())
 		}
+		pin, err := p.pinProcess(pid)
+		if err != nil {
+			if errors.Is(err, syscall.ESRCH) {
+				general.InfofV(4, "system_service: migration skipped exited pid=%d err=%v", pid, err)
+				continue
+			}
+			// Linux pidfd_open may reject a non-leader TID with EINVAL.
+			// A task-only userspace thread is already covered by its leader
+			// from cgroup.procs; all other pin failures remain fail-closed.
+			if candidate.taskOnly && errors.Is(err, syscall.EINVAL) {
+				general.InfofV(4, "system_service: migration skipped task-only tid=%d rejected by pidfd_open err=%v", pid, err)
+				continue
+			}
+			attachErrors = append(attachErrors, fmt.Errorf("pin pid %d before migration: %w", pid, err))
+			continue
+		}
 		info, err := p.proc.ReadProc(pid)
 		if err != nil {
-			// PID likely exited between listing and read — normal race.
+			// The pinned identity prevents this numeric PID from being reused.
+			// A read failure therefore refers only to the listed process.
+			_ = pin.Close()
+			continue
+		}
+		if candidate.taskOnly && !info.IsKThread {
+			_ = pin.Close()
 			continue
 		}
 		if !p.shouldMigrate(info) {
+			_ = pin.Close()
 			continue
 		}
 		attachStart := time.Now()
-		// AttachPID moves the task's cgroup membership only; it does not set or
-		// guarantee the task's scheduler affinity.
-		err = p.cgroup.AttachPID(ctx, p.targetRel, pid)
+		// The identity-bound attach pins and verifies the exact cgroup proved by
+		// cpuset_topology before writing cgroup.procs.
+		err = identityAttacher.AttachPIDWithIdentity(ctx, targetRel, cgroupclient.CgroupIdentity{
+			Device: proof.Device,
+			Inode:  proof.Inode,
+		}, pid)
 		attachElapsed := time.Since(attachStart)
+		closeErr := pin.Close()
 		if attachElapsed >= slowAttachThreshold {
 			general.InfofV(2, "system_service: slow cgroup attach, pid=%d comm=%q kthread=%v elapsed=%s err=%v",
 				pid, info.Comm, info.IsKThread, attachElapsed, err)
 		}
 		if err != nil {
-			// PID may have exited, or the kernel may refuse to migrate a
-			// per-CPU / non-movable kthread. Log and move on — retries next tick.
+			// The PID list is a point-in-time snapshot. ESRCH means the task
+			// exited before attach, so this PID already needs no migration and
+			// must not keep the applied-view revision pending forever.
+			if errors.Is(err, syscall.ESRCH) {
+				general.InfofV(4, "system_service: migration skipped exited pid=%d comm=%q err=%v",
+					pid, info.Comm, err)
+				continue
+			}
 			general.InfofV(4, "system_service: cgroup migration failed, pid=%d comm=%q kthread=%v err=%v",
 				pid, info.Comm, info.IsKThread, err)
+			attachErrors = append(attachErrors, fmt.Errorf("attach pid %d to %q: %w", pid, targetRel, err))
+			continue
+		}
+		if closeErr != nil {
+			attachErrors = append(attachErrors, fmt.Errorf("close pid identity for %d after migration: %w", pid, closeErr))
 			continue
 		}
 		general.InfofV(2, "system_service: migrated process, pid=%d comm=%q kthread=%v",
 			pid, info.Comm, info.IsKThread)
 	}
+	if len(attachErrors) != 0 {
+		emitBulkheadSystemServiceResult(in.Emitter, "migrate", "failed", "attach_error")
+		return apierrors.NewAggregate(attachErrors)
+	}
 	emitBulkheadSystemServiceResult(in.Emitter, "migrate", "success", "")
+	p.lastMigratedAppliedViewRevision = in.AppliedViewRevision
 	return nil
+}
+
+// authorizedMigrationTarget fail-closes the enabled migration path unless the
+// manager supplies a newly-published AppliedView and the configured target
+// cgroup's current cpuset matches a non-empty per-rel proof carrying a stable
+// device/inode identity. This keeps system_service from resampling desired
+// topology or trusting a static rel path that cpuset_topology did not authorize
+// in the most recent converged publication.
+func (p *SystemServicePlugin) authorizedMigrationTarget(
+	ctx context.Context,
+	in bulkheadapi.PeriodicalHandlerContext,
+) (string, model.CgroupRelProof, bool, error) {
+	if !in.AppliedViewValidForPeriodical || in.AppliedView == nil {
+		general.InfofV(4, "system_service: migration skipped, missing applied view")
+		emitBulkheadSystemServiceResult(in.Emitter, "migrate", "skipped", "missing_applied_view")
+		return "", model.CgroupRelProof{}, false, nil
+	}
+	if in.AppliedViewRevision == 0 {
+		general.InfofV(4, "system_service: migration skipped, invalid applied view revision=0")
+		emitBulkheadSystemServiceResult(in.Emitter, "migrate", "skipped", "stale_applied_view")
+		return "", model.CgroupRelProof{}, false, nil
+	}
+
+	targetRel := strings.Trim(p.targetRel, "/")
+	if targetRel == "" {
+		general.InfofV(4, "system_service: migration skipped, empty target rel")
+		emitBulkheadSystemServiceResult(in.Emitter, "migrate", "skipped", "empty_target_rel")
+		return "", model.CgroupRelProof{}, false, nil
+	}
+	// Target cgroup not created yet — bail early, cpuset_topology owns
+	// creation. Next tick will retry the same AppliedView revision.
+	if _, err := p.cgroup.StatDir(ctx, targetRel); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", model.CgroupRelProof{}, false, fmt.Errorf("stat target cgroup %q: %w", targetRel, err)
+		}
+		general.InfofV(4, "system_service: target cgroup missing, skipping, rel=%q err=%v",
+			targetRel, err)
+		emitBulkheadSystemServiceResult(in.Emitter, "migrate", "skipped", "target_cgroup_missing")
+		return "", model.CgroupRelProof{}, false, nil
+	}
+
+	proof, proved := in.AppliedView.RelProofByRel[targetRel]
+	if !proved || proof.Device == 0 || proof.Inode == 0 || proof.CPUSet.IsEmpty() {
+		general.InfofV(4, "system_service: migration skipped, target rel lacks non-empty identity-bound applied proof, rel=%q", targetRel)
+		emitBulkheadSystemServiceResult(in.Emitter, "migrate", "skipped", "missing_target_rel_proof")
+		return "", model.CgroupRelProof{}, false, nil
+	}
+	targetCPUSet, err := p.readTargetCPUSet(ctx, targetRel)
+	if err != nil {
+		return "", model.CgroupRelProof{}, false, err
+	}
+	if targetCPUSet.IsEmpty() || !targetCPUSet.Equals(proof.CPUSet) {
+		general.InfofV(4, "system_service: migration skipped, target rel differs from applied proof, rel=%q target=%s applied=%s",
+			targetRel, targetCPUSet.String(), proof.CPUSet.String())
+		emitBulkheadSystemServiceResult(in.Emitter, "migrate", "skipped", "target_not_in_applied_view")
+		return "", model.CgroupRelProof{}, false, nil
+	}
+	return targetRel, proof, true, nil
+}
+
+func (p *SystemServicePlugin) readTargetCPUSet(ctx context.Context, targetRel string) (machine.CPUSet, error) {
+	raw, err := p.cgroup.ReadCgroupFile(ctx, targetRel, "cpuset.cpus.effective")
+	if err == nil {
+		cpuset, parseErr := machine.Parse(strings.TrimSpace(string(raw)))
+		if parseErr != nil {
+			return machine.NewCPUSet(), fmt.Errorf("parse target cpuset.cpus.effective %q @ %s: %w", strings.TrimSpace(string(raw)), targetRel, parseErr)
+		}
+		return cpuset, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return machine.NewCPUSet(), fmt.Errorf("read target cpuset.cpus.effective @ %s: %w", targetRel, err)
+	}
+	cpuset, err := p.cgroup.ReadCPUSet(ctx, targetRel)
+	if err != nil {
+		return machine.NewCPUSet(), fmt.Errorf("read target cpuset @ %s: %w", targetRel, err)
+	}
+	return cpuset, nil
 }
 
 // resetTargetToRoot performs the one-shot inverse migration when the plugin's
@@ -283,7 +424,7 @@ func (p *SystemServicePlugin) resetTargetToRoot(ctx context.Context, in bulkhead
 		return nil
 	}
 
-	pids, err := p.listTargetCgroupPIDs(ctx)
+	candidates, err := p.listTargetCgroupCandidates(ctx)
 	if err != nil {
 		emitBulkheadSystemServiceResult(in.Emitter, "reset", "skipped", "list_target_cgroup_pids")
 		return fmt.Errorf("list target cgroup pids: %w", err)
@@ -291,14 +432,43 @@ func (p *SystemServicePlugin) resetTargetToRoot(ctx context.Context, in bulkhead
 
 	moved := 0
 	var errs []error
-	for _, pid := range pids {
+	for _, candidate := range candidates {
+		pid := candidate.pid
 		if ctx.Err() != nil {
 			emitBulkheadSystemServiceResult(in.Emitter, "reset", "failed", "context_canceled")
 			return fmt.Errorf("context canceled: %w", ctx.Err())
 		}
-		if err := p.cgroup.AttachPID(ctx, "", pid); err != nil {
-			general.InfofV(4, "system_service: reset attach failed, pid=%d err=%v", pid, err)
-			errs = append(errs, fmt.Errorf("attach pid %d to root: %w", pid, err))
+		pin, pinErr := p.pinProcess(pid)
+		if pinErr != nil {
+			if errors.Is(pinErr, syscall.ESRCH) {
+				general.InfofV(4, "system_service: reset skipped exited pid=%d err=%v", pid, pinErr)
+				continue
+			}
+			// A task-only non-leader TID is moved with the userspace leader
+			// listed in cgroup.procs, so EINVAL is safe only for this case.
+			if candidate.taskOnly && errors.Is(pinErr, syscall.EINVAL) {
+				general.InfofV(4, "system_service: reset skipped task-only tid=%d rejected by pidfd_open err=%v", pid, pinErr)
+				continue
+			}
+			errs = append(errs, fmt.Errorf("pin pid %d before reset: %w", pid, pinErr))
+			continue
+		}
+		attachErr := p.cgroup.AttachPID(ctx, "", pid)
+		closeErr := pin.Close()
+		if attachErr != nil {
+			// cgroup.procs is only a point-in-time snapshot. A process may
+			// exit after listing and before the attach; ESRCH means it no
+			// longer needs to be moved and the reset is already satisfied.
+			if errors.Is(attachErr, syscall.ESRCH) {
+				general.InfofV(4, "system_service: reset skipped exited pid=%d err=%v", pid, attachErr)
+				continue
+			}
+			general.InfofV(4, "system_service: reset attach failed, pid=%d err=%v", pid, attachErr)
+			errs = append(errs, fmt.Errorf("attach pid %d to root: %w", pid, attachErr))
+			continue
+		}
+		if closeErr != nil {
+			errs = append(errs, fmt.Errorf("close pid identity for %d after reset: %w", pid, closeErr))
 			continue
 		}
 		general.InfofV(2, "system_service: reset migrated pid=%d back to root cgroup", pid)
@@ -309,7 +479,7 @@ func (p *SystemServicePlugin) resetTargetToRoot(ctx context.Context, in bulkhead
 		return apierrors.NewAggregate(errs)
 	}
 	emitBulkheadSystemServiceResult(in.Emitter, "reset", "success", "")
-	general.InfofV(4, "system_service: reset complete, scanned=%d moved=%d", len(pids), moved)
+	general.InfofV(4, "system_service: reset complete, scanned=%d moved=%d", len(candidates), moved)
 	return nil
 }
 
@@ -340,28 +510,89 @@ func (p *SystemServicePlugin) shouldMigrate(info procfscommon.ProcInfo) bool {
 	return true
 }
 
-// listRootCgroupPIDs reads the cgroup ROOT's cgroup.procs and returns the
-// PIDs sitting directly in it. This restricts the candidate set to the
-// host-level tasks that no managed sub-cgroup has claimed — the only
-// processes this plugin is ever allowed to steer. Malformed / non-numeric
-// lines are skipped defensively; a read error is surfaced to the caller.
-func (p *SystemServicePlugin) listRootCgroupPIDs() ([]int, error) {
+type migrationCandidate struct {
+	pid      int
+	taskOnly bool
+}
+
+// listRootMigrationCandidates returns process leaders from cgroup.procs plus
+// task-only candidates from the v1 tasks file. Classification is deliberately
+// deferred until after each PID has been pinned, preventing a task-list PID
+// from being reused before ReadProc.
+func (p *SystemServicePlugin) listRootMigrationCandidates() ([]migrationCandidate, error) {
 	data, err := p.fs.ReadFile(p.rootCgroupProcsPath)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", p.rootCgroupProcsPath, err)
 	}
-	return parsePIDList(data), nil
+	leaders := stableUniquePIDs(parsePIDList(data))
+	byPID := make(map[int]migrationCandidate, len(leaders))
+	for _, pid := range leaders {
+		byPID[pid] = migrationCandidate{pid: pid}
+	}
+	tasks, err := p.fs.ReadFile(rootCgroupTasksPath(p.rootCgroupProcsPath))
+	if err == nil {
+		for _, tid := range stableUniquePIDs(parsePIDList(tasks)) {
+			if _, exists := byPID[tid]; !exists {
+				byPID[tid] = migrationCandidate{pid: tid, taskOnly: true}
+			}
+		}
+	}
+	pids := make([]int, 0, len(byPID))
+	for pid := range byPID {
+		pids = append(pids, pid)
+	}
+	sort.Ints(pids)
+	out := make([]migrationCandidate, 0, len(pids))
+	for _, pid := range pids {
+		out = append(out, byPID[pid])
+	}
+	return out, nil
 }
 
-// listTargetCgroupPIDs reads targetRel's cgroup.procs via CgroupClient and
-// returns the PID list. Malformed / non-numeric tokens are skipped
-// defensively; read errors are surfaced to the caller.
-func (p *SystemServicePlugin) listTargetCgroupPIDs(ctx context.Context) ([]int, error) {
+func (p *SystemServicePlugin) pinProcess(pid int) (io.Closer, error) {
+	pinPID := p.pinPID
+	if pinPID == nil {
+		pinPID = openPIDIdentity
+	}
+	return pinPID(pid)
+}
+
+// listTargetCgroupCandidates reads targetRel's cgroup.procs and tasks via
+// CgroupClient. Entries found only in tasks are marked so pidfd_open EINVAL
+// can be handled without weakening the pin requirement for process leaders.
+// tasks is needed for kthreads on cgroup v1; read errors on tasks are ignored
+// for compatibility with cgroup clients that expose only cgroup.procs.
+func (p *SystemServicePlugin) listTargetCgroupCandidates(ctx context.Context) ([]migrationCandidate, error) {
 	data, err := p.cgroup.ReadCgroupFile(ctx, p.targetRel, "cgroup.procs")
 	if err != nil {
 		return nil, fmt.Errorf("read target cgroup.procs @ %s: %w", p.targetRel, err)
 	}
-	return parsePIDList(data), nil
+	leaders := stableUniquePIDs(parsePIDList(data))
+	byPID := make(map[int]migrationCandidate, len(leaders))
+	for _, pid := range leaders {
+		byPID[pid] = migrationCandidate{pid: pid}
+	}
+	if tasks, err := p.cgroup.ReadCgroupFile(ctx, p.targetRel, "tasks"); err == nil {
+		for _, tid := range stableUniquePIDs(parsePIDList(tasks)) {
+			if _, exists := byPID[tid]; !exists {
+				byPID[tid] = migrationCandidate{pid: tid, taskOnly: true}
+			}
+		}
+	}
+	pids := make([]int, 0, len(byPID))
+	for pid := range byPID {
+		pids = append(pids, pid)
+	}
+	sort.Ints(pids)
+	out := make([]migrationCandidate, 0, len(pids))
+	for _, pid := range pids {
+		out = append(out, byPID[pid])
+	}
+	return out, nil
+}
+
+func rootCgroupTasksPath(rootCgroupProcsPath string) string {
+	return strings.TrimSuffix(rootCgroupProcsPath, "cgroup.procs") + "tasks"
 }
 
 // parsePIDList parses a whitespace-separated cgroup.procs payload into a PID
@@ -375,6 +606,23 @@ func parsePIDList(data []byte) []int {
 			continue
 		}
 		out = append(out, pid)
+	}
+	return out
+}
+
+func stableUniquePIDs(pids []int) []int {
+	if len(pids) == 0 {
+		return nil
+	}
+	sort.Ints(pids)
+	out := pids[:0]
+	last := 0
+	for i, pid := range pids {
+		if i > 0 && pid == last {
+			continue
+		}
+		out = append(out, pid)
+		last = pid
 	}
 	return out
 }

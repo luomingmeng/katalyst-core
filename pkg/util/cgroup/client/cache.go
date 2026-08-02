@@ -34,6 +34,11 @@ type cachedCgroupClient struct {
 	cache map[cacheKey]cacheEntry
 }
 
+type identityBoundCachedCgroupClient struct {
+	*cachedCgroupClient
+	attacher IdentityBoundPIDAttacher
+}
+
 type cacheKey struct {
 	rel  string
 	file string
@@ -50,10 +55,26 @@ func NewCachedCgroupClient(inner CgroupClient) CgroupClient {
 	if inner == nil {
 		panic("NewCachedCgroupClient: inner CgroupClient must not be nil")
 	}
-	return &cachedCgroupClient{
+	cached := &cachedCgroupClient{
 		inner: inner,
 		cache: map[cacheKey]cacheEntry{},
 	}
+	if attacher, ok := inner.(IdentityBoundPIDAttacher); ok {
+		return &identityBoundCachedCgroupClient{
+			cachedCgroupClient: cached,
+			attacher:           attacher,
+		}
+	}
+	return cached
+}
+
+func (c *identityBoundCachedCgroupClient) AttachPIDWithIdentity(
+	ctx context.Context,
+	rel string,
+	identity CgroupIdentity,
+	pid int,
+) error {
+	return c.attacher.AttachPIDWithIdentity(ctx, rel, identity, pid)
 }
 
 func (c *cachedCgroupClient) Version(ctx context.Context) CgroupVersion {

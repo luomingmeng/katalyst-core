@@ -107,6 +107,20 @@ type countingFake struct {
 	cpuSetData            []cgcommon.CPUSetData
 }
 
+type identityAttachFake struct {
+	*countingFake
+	gotRel      string
+	gotIdentity CgroupIdentity
+	gotPID      int
+}
+
+func (f *identityAttachFake) AttachPIDWithIdentity(_ context.Context, rel string, identity CgroupIdentity, pid int) error {
+	f.gotRel = rel
+	f.gotIdentity = identity
+	f.gotPID = pid
+	return nil
+}
+
 func newCountingFake() *countingFake {
 	f := &countingFake{
 		version: CgroupVersionV2,
@@ -115,6 +129,24 @@ func newCountingFake() *countingFake {
 	atomic.StoreInt64(&f.mtime, 1)
 	atomic.StoreInt64(&f.size, 4)
 	return f
+}
+
+func TestCachedCgroupClientForwardsIdentityBoundAttach(t *testing.T) {
+	t.Parallel()
+
+	inner := &identityAttachFake{countingFake: newCountingFake()}
+	cached := NewCachedCgroupClient(inner)
+	attacher, ok := cached.(IdentityBoundPIDAttacher)
+	if !ok {
+		t.Fatalf("cached client does not expose identity-bound attach capability")
+	}
+	wantIdentity := CgroupIdentity{Device: 7, Inode: 11}
+	if err := attacher.AttachPIDWithIdentity(context.Background(), "system", wantIdentity, 123); err != nil {
+		t.Fatalf("AttachPIDWithIdentity() error = %v", err)
+	}
+	if inner.gotRel != "system" || inner.gotIdentity != wantIdentity || inner.gotPID != 123 {
+		t.Fatalf("forwarded attach = rel=%q identity=%+v pid=%d", inner.gotRel, inner.gotIdentity, inner.gotPID)
+	}
 }
 
 func (f *countingFake) bumpMTime() {
