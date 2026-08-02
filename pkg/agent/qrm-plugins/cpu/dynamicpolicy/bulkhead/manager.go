@@ -181,6 +181,9 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 	}
 
 	for _, p := range m.plugins {
+		if !commitIfGenerationCurrent(in, func() {}) {
+			return empty, staleGenerationError()
+		}
 		if !currentEnabled[p.Name()] {
 			if !m.needsDisabledReset(p.Name()) {
 				if p.Name() == "cpuset_topology" {
