@@ -31,6 +31,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/util/sets"
 
+	qrmresctrlmanager "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/resctrl"
 	qrmresctrl "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/resctrl"
 )
 
@@ -796,6 +797,22 @@ func TestManagerRestoresClosOwnershipFromCheckpointBeforeCleanup(t *testing.T) {
 	require.NoError(t, restarted.ReconcileClos(ClosReconcileState{}))
 
 	require.NoDirExists(t, filepath.Join(root, "custom-owned"))
+}
+
+func TestManagerRefreshesOwnershipRegisteredByCPUList(t *testing.T) {
+	root := t.TempDir()
+	checkpointPath := filepath.Join(t.TempDir(), "resctrl-clos-ownership.json")
+	manager := NewManager(&qrmresctrl.ResctrlConfig{
+		OwnershipCheckpointPath: checkpointPath,
+	}).(*managerImpl)
+	manager.root = root
+	manager.enabled.Store(true)
+	require.NoError(t, os.Mkdir(filepath.Join(root, "dedicated"), 0o755))
+	require.NoError(t, qrmresctrlmanager.NewClosOwnershipStore(checkpointPath).Register("dedicated"))
+
+	require.NoError(t, manager.ReconcileClos(ClosReconcileState{DisableRDT: true}))
+
+	require.NoDirExists(t, filepath.Join(root, "dedicated"))
 }
 
 func TestManagerDisableRDTPreservesExternalClosEvenWithManagedName(t *testing.T) {

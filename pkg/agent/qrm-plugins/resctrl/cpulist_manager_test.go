@@ -18,6 +18,7 @@ package resctrl
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sync"
@@ -65,6 +66,24 @@ func TestCPUListManagerApplyCPUListCreatesMissingClosBeforeWrite(t *testing.T) {
 	content, err := os.ReadFile(filepath.Join(root, "dedicated", cpus))
 	require.NoError(t, err)
 	require.Equal(t, "00000002", string(content))
+}
+
+func TestCPUListManagerRegistersOwnershipBeforeCreatingClos(t *testing.T) {
+	root := t.TempDir()
+	checkpointPath := filepath.Join(t.TempDir(), "ownership.json")
+	require.NoError(t, os.WriteFile(filepath.Join(root, cpus), []byte("ffffffff\n"), 0o644))
+
+	manager := newCPUListManagerWithOwnership(root, nil, checkpointPath)
+	require.NoError(t, manager.ApplyCPUList(context.Background(), "dedicated", "1"))
+
+	content, err := os.ReadFile(checkpointPath)
+	require.NoError(t, err)
+	var checkpoint struct {
+		ClosIDs []string `json:"clos_ids"`
+	}
+	require.NoError(t, json.Unmarshal(content, &checkpoint))
+	require.Equal(t, []string{"dedicated"}, checkpoint.ClosIDs)
+	require.DirExists(t, filepath.Join(root, "dedicated"))
 }
 
 func TestCPUListManagerApplyCPUListSkipsMissingClosForEmptyTarget(t *testing.T) {

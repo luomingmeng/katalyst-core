@@ -60,26 +60,36 @@ type closResourceUpdater interface {
 type cpuListManager struct {
 	root string
 
-	mu       sync.Mutex
-	epochs   map[string]uint64
-	previous map[string]os.FileInfo
-	updater  closResourceUpdater
+	mu        sync.Mutex
+	epochs    map[string]uint64
+	previous  map[string]os.FileInfo
+	updater   closResourceUpdater
+	ownership *ClosOwnershipStore
 }
 
-func NewCPUListManager() CPUListManager {
-	return newCPUListManagerWithResourceUpdater(consts.DefaultResctrlRootDir, rdt.NewDefaultManager())
+func NewCPUListManager(ownershipCheckpointPath ...string) CPUListManager {
+	path := ""
+	if len(ownershipCheckpointPath) > 0 {
+		path = ownershipCheckpointPath[0]
+	}
+	return newCPUListManagerWithOwnership(consts.DefaultResctrlRootDir, rdt.NewDefaultManager(), path)
 }
 
 func newCPUListManager(root string) *cpuListManager {
-	return newCPUListManagerWithResourceUpdater(root, nil)
+	return newCPUListManagerWithOwnership(root, nil, "")
 }
 
 func newCPUListManagerWithResourceUpdater(root string, updater closResourceUpdater) *cpuListManager {
+	return newCPUListManagerWithOwnership(root, updater, "")
+}
+
+func newCPUListManagerWithOwnership(root string, updater closResourceUpdater, checkpointPath string) *cpuListManager {
 	return &cpuListManager{
-		root:     root,
-		epochs:   make(map[string]uint64),
-		previous: make(map[string]os.FileInfo),
-		updater:  updater,
+		root:      root,
+		epochs:    make(map[string]uint64),
+		previous:  make(map[string]os.FileInfo),
+		updater:   updater,
+		ownership: NewClosOwnershipStore(checkpointPath),
 	}
 }
 
@@ -164,7 +174,17 @@ func (m *cpuListManager) ensureClos(closID string, create bool) (bool, error) {
 	if !create {
 		return false, nil
 	}
-	if err := os.Mkdir(filepath.Join(m.root, closID), 0o755); err != nil {
+	closPath := filepath.Join(m.root, closID)
+	if _, err := os.Stat(closPath); err == nil {
+		return false, nil
+	} else if !os.IsNotExist(err) {
+		return false, fmt.Errorf("stat CLOS %q: %w", closID, err)
+	}
+	if err := m.ownership.Register(closID); err != nil {
+		return false, fmt.Errorf("checkpoint CLOS %q ownership: %w", closID, err)
+	}
+	if err := os.Mkdir(closPath, 0o755); err != nil {
+		_ = m.ownership.Unregister(closID)
 		if os.IsExist(err) {
 			return false, nil
 		}
