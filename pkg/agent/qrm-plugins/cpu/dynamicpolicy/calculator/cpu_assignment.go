@@ -41,11 +41,11 @@ type cpuAccumulator struct {
 	result machine.CPUSet
 }
 
-func newCPUAccumulator(machineInfo *machine.KatalystMachineInfo, availableCPUs machine.CPUSet, numCPUs int) *cpuAccumulator {
+func newCPUAccumulator(cpuTopology *machine.CPUTopology, availableCPUs machine.CPUSet, numCPUs int) *cpuAccumulator {
 	a := &cpuAccumulator{
 		numCPUsNeeded: numCPUs,
-		cpuTopology:   machineInfo.CPUTopology,
-		cpuDetails:    machineInfo.CPUDetails.KeepOnly(availableCPUs),
+		cpuTopology:   cpuTopology,
+		cpuDetails:    cpuTopology.CPUDetails.KeepOnly(availableCPUs),
 		result:        machine.NewCPUSet(),
 	}
 	return a
@@ -351,19 +351,38 @@ func (a *cpuAccumulator) isFailed() bool {
 func TakeByTopology(info *machine.KatalystMachineInfo, availableCPUs machine.CPUSet,
 	cpuRequirement int, alignByL3Caches bool,
 ) (machine.CPUSet, error) {
-	// Initialize accumulator with topology-aware state
-	acc := newCPUAccumulator(info, availableCPUs, cpuRequirement)
+	return SelectCPUsByTopology(info.CPUTopology, availableCPUs, cpuRequirement, alignByL3Caches)
+}
 
+// SelectCPUsByTopology selects CPUs from candidates using socket, optional L3
+// cache, complete core, and remaining thread priority. It accepts CPUTopology
+// directly so callers that do not own KatalystMachineInfo can share the same
+// allocation algorithm as TakeByTopology.
+func SelectCPUsByTopology(cpuTopology *machine.CPUTopology, candidates machine.CPUSet,
+	cpuRequirement int, alignByL3Caches bool,
+) (machine.CPUSet, error) {
 	// Fast-path: Handle edge cases immediately
-	if acc.isSatisfied() {
+	if cpuRequirement < 1 {
 		// Zero CPU requirement - return empty set immediately
-		return acc.result.Clone(), nil
+		return machine.NewCPUSet(), nil
 	}
-	if acc.isFailed() {
+	if cpuRequirement > candidates.Size() {
 		// Insufficient resources - fail fast with descriptive error
 		return machine.NewCPUSet(), fmt.Errorf("insufficient CPUs: requested %d, available %d",
-			cpuRequirement, availableCPUs.Size())
+			cpuRequirement, candidates.Size())
 	}
+
+	if cpuTopology == nil {
+		result := machine.NewCPUSet()
+		for _, cpu := range candidates.ToSliceInt()[:cpuRequirement] {
+			result = result.Union(machine.NewCPUSet(cpu))
+		}
+		return result, nil
+	}
+
+	// Initialize accumulator with topology-aware state. Candidates without
+	// metadata are retained separately for the final thread-level fallback.
+	acc := newCPUAccumulator(cpuTopology, candidates, cpuRequirement)
 
 	// Phase 1: Socket-level allocation for maximum locality
 	// This phase attempts to allocate entire CPU sockets when beneficial
@@ -399,6 +418,14 @@ func TakeByTopology(info *machine.KatalystMachineInfo, availableCPUs machine.CPU
 		return acc.result.Clone(), nil
 	}
 
+	for _, cpu := range candidates.Difference(cpuTopology.CPUDetails.CPUs()).ToSliceInt() {
+		klog.V(4).InfoS("TakeByTopology: claiming CPU without topology metadata", "cpu", cpu)
+		acc.take(machine.NewCPUSet(cpu))
+		if acc.isSatisfied() {
+			return acc.result.Clone(), nil
+		}
+	}
+
 	// Exhaustive allocation failed - no combination satisfies requirement
 	return machine.NewCPUSet(), fmt.Errorf("topology-aware allocation failed: requested %d CPUs, exhausted all allocation strategies", cpuRequirement)
 }
@@ -409,7 +436,7 @@ func TakeByNUMABalance(info *machine.KatalystMachineInfo, availableCPUs machine.
 	cpuRequirement int,
 ) (machine.CPUSet, machine.CPUSet, error) {
 	var err error
-	acc := newCPUAccumulator(info, availableCPUs, cpuRequirement)
+	acc := newCPUAccumulator(info.CPUTopology, availableCPUs, cpuRequirement)
 
 	if acc.isSatisfied() {
 		goto successful
@@ -453,7 +480,7 @@ func TakeHTByNUMABalance(info *machine.KatalystMachineInfo, availableCPUs machin
 	cpuRequirement int,
 ) (machine.CPUSet, machine.CPUSet, error) {
 	var err error
-	acc := newCPUAccumulator(info, availableCPUs, cpuRequirement)
+	acc := newCPUAccumulator(info.CPUTopology, availableCPUs, cpuRequirement)
 	if acc.isSatisfied() {
 		goto successful
 	}
@@ -491,7 +518,7 @@ func TakeHTByNUMABalanceReversely(info *machine.KatalystMachineInfo, availableCP
 	cpuRequirement int,
 ) (machine.CPUSet, machine.CPUSet, error) {
 	var err error
-	acc := newCPUAccumulator(info, availableCPUs, cpuRequirement)
+	acc := newCPUAccumulator(info.CPUTopology, availableCPUs, cpuRequirement)
 	if acc.isSatisfied() {
 		goto successful
 	}
@@ -530,7 +557,7 @@ func TakeByNUMABalanceReversely(info *machine.KatalystMachineInfo, availableCPUs
 	cpuRequirement int,
 ) (machine.CPUSet, machine.CPUSet, error) {
 	var err error
-	acc := newCPUAccumulator(info, availableCPUs, cpuRequirement)
+	acc := newCPUAccumulator(info.CPUTopology, availableCPUs, cpuRequirement)
 
 	if acc.isSatisfied() {
 		goto successful
@@ -638,7 +665,7 @@ func takeFreeCoresByNumaBalanceReversely(acc *cpuAccumulator) bool {
 
 // GetFreeCores returns all free physical cores given a CPU topology and the available CPUs
 func GetFreeCores(topology *machine.KatalystMachineInfo, availableCPUs machine.CPUSet) machine.CPUSet {
-	acc := newCPUAccumulator(topology, availableCPUs, 0)
+	acc := newCPUAccumulator(topology.CPUTopology, availableCPUs, 0)
 
 	return machine.NewCPUSet(acc.freeCores()...)
 }
