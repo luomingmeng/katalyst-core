@@ -510,6 +510,69 @@ func TestManagerApplyChecksGenerationAfterFailedSideEffect(t *testing.T) {
 	}
 }
 
+func TestManagerApplyChecksGenerationAfterDisabledHandlerError(t *testing.T) {
+	t.Parallel()
+
+	plugin := &fakePlugin{
+		name:        "rdt_cpulist",
+		enabled:     false,
+		disabledErr: errors.New("partial disabled reset failed"),
+	}
+	m := &Manager{
+		plugins:                     []bulkheadapi.Plugin{plugin},
+		lastCPUSetAdjustmentEnabled: map[string]bool{plugin.name: true},
+	}
+	fenceCalls := 0
+
+	_, err := m.Apply(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
+		DynamicConf: dynamicBulkheadConf(true),
+		Generation:  10,
+		CommitIfGenerationCurrent: func(uint64, func()) bool {
+			fenceCalls++
+			return fenceCalls <= 2
+		},
+	})
+
+	var nonConverged *NonConvergedError
+	if !errors.As(err, &nonConverged) {
+		t.Fatalf("Apply() error = %v, want stale generation after failed disabled reset", err)
+	}
+	if fenceCalls != 3 {
+		t.Fatalf("generation fence calls = %d, want entry, pre-, and post-disabled checks", fenceCalls)
+	}
+	if plugin.disabledCalls != 1 {
+		t.Fatalf("disabled calls = %d, want failed reset to run once", plugin.disabledCalls)
+	}
+}
+
+func TestManagerApplyChecksGenerationAfterTopologyError(t *testing.T) {
+	t.Parallel()
+
+	topologyPlugin := &fakeTopologyPlugin{
+		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
+		err:        errors.New("partial topology apply failed"),
+	}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin}}
+	fenceCalls := 0
+
+	_, err := m.Apply(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
+		DynamicConf: dynamicBulkheadConf(true),
+		Generation:  10,
+		CommitIfGenerationCurrent: func(uint64, func()) bool {
+			fenceCalls++
+			return fenceCalls <= 2
+		},
+	})
+
+	var nonConverged *NonConvergedError
+	if !errors.As(err, &nonConverged) {
+		t.Fatalf("Apply() error = %v, want stale generation after failed topology apply", err)
+	}
+	if fenceCalls != 3 {
+		t.Fatalf("generation fence calls = %d, want entry, pre-, and post-topology checks", fenceCalls)
+	}
+}
+
 func TestManagerApplyRejectsTypedTopologyResultWhenDesiredViewChanges(t *testing.T) {
 	t.Parallel()
 
