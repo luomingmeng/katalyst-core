@@ -132,7 +132,7 @@ func TestResctrlHinterAllocateDoesNotInjectClosWhenCreateFails(t *testing.T) {
 }
 
 func TestResctrlHinterHintDoesNotInjectClosWhenConfirmationFails(t *testing.T) {
-	manager := &mockResctrlManager{createErr: resctrl.ErrRDTDisabled}
+	manager := &mockResctrlManager{createErr: resctrl.ErrRDTUnavailable}
 	hinter := &resctrlHinter{
 		config: &qrmresctrl.ResctrlConfig{
 			EnableResctrlHint: true,
