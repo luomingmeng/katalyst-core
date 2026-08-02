@@ -18,6 +18,7 @@ package dynamicpolicy
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -183,6 +184,55 @@ func TestRunCPUSetAdjustmentHandlersRetriesLatestStateAfterFenceRejection(t *tes
 		}
 	case <-time.After(time.Second):
 		t.Fatal("latest policy state was not scheduled after stale generation rejection")
+	}
+}
+
+func TestRunCPUSetAdjustmentHandlersSchedulesLatestStateAfterCanceledStaleRound(t *testing.T) {
+	firstStarted := make(chan struct{})
+	firstRelease := make(chan struct{})
+	latestCommitted := make(chan struct{})
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 4)
+	if err != nil {
+		t.Fatalf("GenerateDummyCPUTopology() error = %v", err)
+	}
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	if err != nil {
+		t.Fatalf("getTestDynamicPolicyWithInitialization() error = %v", err)
+	}
+	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"generation-aware": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			if in.Generation == 1 {
+				close(firstStarted)
+				<-firstRelease
+			}
+			if in.CommitIfGenerationCurrent(in.Generation, func() {}) && in.Generation > 1 {
+				close(latestCommitted)
+			}
+			return nil
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() {
+		p.Lock()
+		defer p.Unlock()
+		runDone <- p.runCPUSetAdjustmentHandlers(ctx)
+	}()
+	<-firstStarted
+	p.Lock()
+	p.state.SetAllowSharedCoresOverlapReclaimedCores(true, false)
+	p.Unlock()
+	cancel()
+	close(firstRelease)
+
+	if err := <-runDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("runCPUSetAdjustmentHandlers() error = %v, want context.Canceled", err)
+	}
+	select {
+	case <-latestCommitted:
+	case <-time.After(time.Second):
+		t.Fatal("latest policy state was not scheduled after canceled stale round")
 	}
 }
 
