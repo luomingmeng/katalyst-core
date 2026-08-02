@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"math/bits"
 
+	apierrors "k8s.io/apimachinery/pkg/util/errors"
+
 	bulkheadapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api"
 	qrmresctrlmanager "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/resctrl"
 	"github.com/kubewharf/katalyst-core/pkg/config"
@@ -106,7 +108,7 @@ func (p *CATPlugin) PeriodicalHandler(ctx context.Context, in bulkheadapi.Period
 		p.active = applied
 		return nil
 	}
-	if !p.active {
+	if !p.active && ways <= 0 {
 		return nil
 	}
 	if err := p.rollback(ctx, ways); err != nil {
@@ -151,7 +153,15 @@ func (p *CATPlugin) reconcile(ctx context.Context, defaultWays int64, overrides 
 	}
 	for _, target := range targets {
 		if err := p.rdtManager.ApplyCAT(target.clos, target.mask); err != nil {
-			return false, fmt.Errorf("apply CAT for CLOS %q: %w", target.clos, err)
+			applyErr := fmt.Errorf("apply CAT for CLOS %q: %w", target.clos, err)
+			rollbackTarget, targetErr := symmetricTarget(capabilities, defaultWays)
+			if targetErr != nil {
+				return false, apierrors.NewAggregate([]error{applyErr, fmt.Errorf("build CAT rollback target: %w", targetErr)})
+			}
+			if rollbackErr := p.applyTargetToClos(clos, rollbackTarget); rollbackErr != nil {
+				return false, apierrors.NewAggregate([]error{applyErr, rollbackErr})
+			}
+			return false, applyErr
 		}
 	}
 	return len(targets) > 0, nil
@@ -173,12 +183,17 @@ func (p *CATPlugin) rollback(ctx context.Context, defaultWays int64) error {
 	if err != nil {
 		return fmt.Errorf("build CAT rollback target: %w", err)
 	}
+	return p.applyTargetToClos(clos, target)
+}
+
+func (p *CATPlugin) applyTargetToClos(clos []qrmresctrlmanager.CPUListClos, target map[int]uint64) error {
+	var errs []error
 	for _, current := range clos {
 		if err := p.rdtManager.ApplyCAT(current.ID, target); err != nil {
-			return fmt.Errorf("restore CAT for CLOS %q: %w", current.ID, err)
+			errs = append(errs, fmt.Errorf("restore CAT for CLOS %q: %w", current.ID, err))
 		}
 	}
-	return nil
+	return apierrors.NewAggregate(errs)
 }
 
 func (p *CATPlugin) resolveOverrides(overrides map[string]int64) (map[string]int64, error) {
