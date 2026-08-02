@@ -148,6 +148,18 @@ func (m *cpuListManager) ApplyCPUList(_ context.Context, closID, target string) 
 	return nil
 }
 
+func (m *cpuListManager) CPUListMatches(_ context.Context, closID, target string) (bool, error) {
+	mask, err := m.formatCPUListMask(target)
+	if err != nil {
+		return false, fmt.Errorf("format CLOS %q cpu_list %q: %w", closID, target, err)
+	}
+	content, err := os.ReadFile(filepath.Join(m.root, closID, cpus))
+	if err != nil {
+		return false, fmt.Errorf("read CLOS %q cpu_list: %w", closID, err)
+	}
+	return strings.TrimSpace(string(content)) == mask, nil
+}
+
 func (m *cpuListManager) ensureClos(closID string, create bool) (bool, error) {
 	if !create {
 		return false, nil

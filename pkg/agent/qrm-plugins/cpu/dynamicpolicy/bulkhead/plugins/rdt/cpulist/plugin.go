@@ -46,6 +46,10 @@ type Clos = qrmresctrlmanager.CPUListClos
 // CLOS only when applying a non-empty target.
 type CPUListManager = qrmresctrlmanager.CPUListManager
 
+type cpuListObserver interface {
+	CPUListMatches(context.Context, string, string) (bool, error)
+}
+
 type appliedTarget struct {
 	cpuSet string
 }
@@ -184,7 +188,17 @@ func (p *CPUListPlugin) isManaged(closID string) bool {
 
 func (p *CPUListPlugin) apply(ctx context.Context, clos Clos, target string) error {
 	if previous, ok := p.applied[clos]; ok && previous.cpuSet == target {
-		return nil
+		if observer, ok := p.manager.(cpuListObserver); ok {
+			matches, err := observer.CPUListMatches(ctx, clos.ID, target)
+			if err != nil {
+				return fmt.Errorf("observe cpu_list for CLOS %q: %w", clos.ID, err)
+			}
+			if matches {
+				return nil
+			}
+		} else {
+			return nil
+		}
 	}
 	if err := p.manager.ApplyCPUList(ctx, clos.ID, target); err != nil {
 		return fmt.Errorf("apply cpu_list=%q for CLOS %q: %w", target, clos.ID, err)
