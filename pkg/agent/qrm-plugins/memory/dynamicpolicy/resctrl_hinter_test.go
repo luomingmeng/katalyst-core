@@ -234,6 +234,7 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 	type fields struct {
 		config     *qrmresctrl.ResctrlConfig
 		resctrl    *fsResctrl
+		manager    *mockResctrlManager
 		isAllocate bool
 	}
 	type args struct {
@@ -291,6 +292,7 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 					EnabledQoS:             []string{"shared_cores"},
 					MonGroupEnabledClosIDs: []string{"dedicated", "share-50"},
 				},
+				manager: &mockResctrlManager{},
 			},
 			args: args{
 				qosLevel: "shared_cores",
@@ -326,6 +328,7 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 					EnabledQoS:             []string{"shared_cores"},
 					MonGroupEnabledClosIDs: []string{"dedicated", "share-30"},
 				},
+				manager: &mockResctrlManager{},
 			},
 			args: args{
 				qosLevel: "shared_cores",
@@ -458,6 +461,10 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			r := newResctrlHinter(tt.fields.config, nil, metrics.DummyMetrics{}, nil)
+
+			if tt.fields.manager != nil {
+				r.(*resctrlHinter).manager = tt.fields.manager
+			}
 
 			if tt.fields.resctrl != nil {
 				root := t.TempDir()
