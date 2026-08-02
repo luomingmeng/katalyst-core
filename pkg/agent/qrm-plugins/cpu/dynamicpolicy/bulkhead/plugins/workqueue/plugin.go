@@ -59,8 +59,8 @@ func (p *WorkqueuePlugin) Enable(in bulkheadapi.HandlerContext) bool {
 }
 
 func (p *WorkqueuePlugin) CPUSetAdjustmentHandler(_ context.Context, in bulkheadapi.HandlerContext) error {
-	if in.View == nil {
-		return p.resetWorkqueue(in)
+	if in.AppliedView == nil {
+		return nil
 	}
 	return p.reconcileWorkqueue(in)
 }
@@ -77,7 +77,7 @@ func (p *WorkqueuePlugin) PeriodicalHandler(
 }
 
 func (p *WorkqueuePlugin) reconcileWorkqueue(in bulkheadapi.HandlerContext) error {
-	reclaim := in.View.ReclaimEffective
+	reclaim := in.AppliedView.ReclaimEffective
 	if reclaim.IsEmpty() {
 		return p.resetWorkqueue(in)
 	}

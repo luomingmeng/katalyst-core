@@ -17,13 +17,111 @@ limitations under the License.
 package utils
 
 import (
+	"strings"
 	"testing"
 
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	cpustate "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
+
+func TestValidateCPUSetPartitionViewRequiresExactNUMABucketProjection(t *testing.T) {
+	t.Parallel()
+
+	valid := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+		NonReclaimPool:          machine.NewCPUSet(0, 1, 2, 3, 4),
+		ReclaimEffective:        machine.NewCPUSet(5, 6, 7),
+		DesiredReclaimEffective: machine.NewCPUSet(5, 6, 7),
+		ReclaimEffectivePerNUMA: map[int]machine.CPUSet{
+			0: machine.NewCPUSet(),
+			1: machine.NewCPUSet(5, 6, 7),
+		},
+		DesiredReclaimEffectivePerNUMA: map[int]machine.CPUSet{
+			0: machine.NewCPUSet(),
+			1: machine.NewCPUSet(5, 6, 7),
+		},
+	}}
+	if err := ValidateCPUSetPartitionView(valid, testTwoNUMATopology()); err != nil {
+		t.Fatalf("exact projection with empty NUMA bucket rejected: %v", err)
+	}
+
+	invalid := valid.DeepCopy()
+	invalid.ReclaimEffectivePerNUMA[0] = machine.NewCPUSet(0)
+	invalid.ReclaimEffectivePerNUMA[1] = machine.NewCPUSet(6, 7)
+	if err := ValidateCPUSetPartitionView(invalid, testTwoNUMATopology()); err == nil ||
+		!strings.Contains(err.Error(), "reclaim effective NUMA bucket 0") {
+		t.Fatalf("ValidateCPUSetPartitionView() error = %v, want exact NUMA projection error", err)
+	}
+}
+
+func TestValidateCPUSetPartitionViewRejectsCPUsOutsideTopology(t *testing.T) {
+	t.Parallel()
+
+	view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+		NonReclaimPool:          machine.NewCPUSet(0, 1, 8),
+		ReclaimEffective:        machine.NewCPUSet(2, 3),
+		DesiredReclaimEffective: machine.NewCPUSet(2, 3),
+		ReclaimEffectivePerNUMA: map[int]machine.CPUSet{
+			0: machine.NewCPUSet(2, 3),
+			1: machine.NewCPUSet(),
+		},
+		DesiredReclaimEffectivePerNUMA: map[int]machine.CPUSet{
+			0: machine.NewCPUSet(2, 3),
+			1: machine.NewCPUSet(),
+		},
+	}}
+
+	err := ValidateCPUSetPartitionView(view, testTwoNUMATopology())
+	if err == nil || !strings.Contains(err.Error(), "outside machine topology") {
+		t.Fatalf("ValidateCPUSetPartitionView() error = %v, want outside-topology error", err)
+	}
+}
+
+func TestBuildCPUSetPartitionViewFromTargetOwnsVerifiedReclaim(t *testing.T) {
+	t.Parallel()
+
+	desired := model.NewDesiredView()
+	desired.Reserve = machine.NewCPUSet(0)
+	desired.Dedicated = machine.NewCPUSet(1)
+	desired.SharePool = machine.NewCPUSet(2)
+	desired.ReclaimRaw = machine.NewCPUSet(3, 4, 5)
+	desired.ContainerCPUSetByPod["pod"] = map[string]machine.CPUSet{
+		"container": machine.NewCPUSet(1),
+	}
+	topology := &machine.CPUTopology{CPUDetails: machine.CPUDetails{
+		0: {NUMANodeID: 0},
+		1: {NUMANodeID: 0},
+		2: {NUMANodeID: 0},
+		3: {NUMANodeID: 0},
+		4: {NUMANodeID: 1},
+		5: {NUMANodeID: 1},
+	}}
+	target := machine.NewCPUSet(3, 5)
+
+	got := BuildCPUSetPartitionViewFromTarget(desired, target, topology)
+
+	if got == nil {
+		t.Fatal("BuildCPUSetPartitionViewFromTarget() returned nil")
+	}
+	if !got.ReclaimEffective.Equals(target) {
+		t.Fatalf("reclaim effective = %s, want %s", got.ReclaimEffective.String(), target.String())
+	}
+	if !got.NonReclaimPool.Equals(machine.NewCPUSet(1, 2, 4)) {
+		t.Fatalf("non-reclaim pool = %s, want 1-2,4", got.NonReclaimPool.String())
+	}
+	if !got.ReclaimEffectivePerNUMA[0].Equals(machine.NewCPUSet(3)) ||
+		!got.ReclaimEffectivePerNUMA[1].Equals(machine.NewCPUSet(5)) {
+		t.Fatalf("reclaim per NUMA = %#v, want numa0=3 numa1=5", got.ReclaimEffectivePerNUMA)
+	}
+
+	target.Add(99)
+	desired.ContainerCPUSetByPod["pod"]["container"].Add(98)
+	if got.ReclaimEffective.Contains(99) || got.ContainerCPUSetByPod["pod"]["container"].Contains(98) {
+		t.Fatal("returned view aliases caller-owned target or desired view")
+	}
+}
 
 func TestBuildCPUSetPartitionViewAndDeepCopy(t *testing.T) {
 	t.Parallel()
@@ -102,8 +200,35 @@ func TestBuildCPUSetPartitionViewNilInputs(t *testing.T) {
 	if view.DeepCopy() == nil {
 		t.Fatalf("DeepCopy of non-nil empty view returned nil")
 	}
-	if (*CPUSetPartitionView)(nil).DeepCopy() != nil {
+	if (*model.DesiredView)(nil).DeepCopy() != nil {
 		t.Fatalf("DeepCopy of nil view should be nil")
+	}
+}
+
+func TestBuildCPUSetPartitionViewKeepsDenseReclaimPerNUMAKeys(t *testing.T) {
+	t.Parallel()
+
+	state := cpustate.NewCPUPluginState(nil)
+	state.SetAllocationInfo(commonstate.PoolNameReserve, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReserve),
+		AllocationResult: machine.NewCPUSet(0),
+	})
+	state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+		AllocationResult: machine.NewCPUSet(5, 6),
+	})
+
+	view := BuildCPUSetPartitionView(state, testTwoNUMATopology(), CPUSetPartitionViewOptions{})
+
+	assertCPUSet(t, "desired reclaim numa 0 empty", view.DesiredReclaimEffectivePerNUMA[0], "")
+	assertCPUSet(t, "desired reclaim numa 1", view.DesiredReclaimEffectivePerNUMA[1], "5-6")
+	assertCPUSet(t, "effective reclaim numa 0 empty", view.ReclaimEffectivePerNUMA[0], "")
+	assertCPUSet(t, "effective reclaim numa 1", view.ReclaimEffectivePerNUMA[1], "5-6")
+	if _, ok := view.ReclaimEffectivePerNUMA[0]; !ok {
+		t.Fatalf("empty NUMA 0 reclaim bucket must be preserved")
+	}
+	if _, ok := view.DesiredReclaimEffectivePerNUMA[0]; !ok {
+		t.Fatalf("empty NUMA 0 desired reclaim bucket must be preserved")
 	}
 }
 
@@ -127,9 +252,8 @@ func TestBuildCPUSetPartitionViewPadsNonReclaimPoolToMinSize(t *testing.T) {
 	assertCPUSet(t, "reserve", view.Reserve, "0")
 	assertCPUSet(t, "non reclaim absorbs CPUs without raw reclaim", view.NonReclaimPool, "1-7")
 	assertCPUSet(t, "reclaim effective is empty without raw reclaim", view.ReclaimEffective, "")
-	if len(view.ReclaimEffectivePerNUMA) != 0 {
-		t.Fatalf("reclaim per NUMA should be empty without raw reclaim: %v", view.ReclaimEffectivePerNUMA)
-	}
+	assertCPUSet(t, "empty reclaim numa 0", view.ReclaimEffectivePerNUMA[0], "")
+	assertCPUSet(t, "empty reclaim numa 1", view.ReclaimEffectivePerNUMA[1], "")
 }
 
 func TestBuildCPUSetPartitionViewAppliesTransientProtectedNonReclaim(t *testing.T) {
@@ -157,15 +281,14 @@ func TestBuildCPUSetPartitionViewAppliesTransientProtectedNonReclaim(t *testing.
 	if !view.NonReclaimPool.Intersection(view.ReclaimEffective).IsEmpty() {
 		t.Fatalf("applied non reclaim and reclaim overlap: non=%s reclaim=%s", view.NonReclaimPool.String(), view.ReclaimEffective.String())
 	}
-	if len(view.ReclaimEffectivePerNUMA) != 0 {
-		t.Fatalf("reclaim per NUMA should be empty without raw reclaim: %v", view.ReclaimEffectivePerNUMA)
-	}
+	assertCPUSet(t, "empty reclaim numa 0", view.ReclaimEffectivePerNUMA[0], "")
+	assertCPUSet(t, "empty reclaim numa 1", view.ReclaimEffectivePerNUMA[1], "")
 }
 
 func TestApplyTransientProtectedNonReclaimRebuildsReclaimPerNUMA(t *testing.T) {
 	t.Parallel()
 
-	view := &CPUSetPartitionView{
+	view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
 		Reserve:                        machine.NewCPUSet(),
 		DesiredNonReclaimPool:          machine.NewCPUSet(1, 2),
 		DesiredReclaimEffective:        machine.NewCPUSet(3, 4, 5, 6, 7),
@@ -173,15 +296,17 @@ func TestApplyTransientProtectedNonReclaimRebuildsReclaimPerNUMA(t *testing.T) {
 		ReclaimEffective:               machine.NewCPUSet(3, 4, 5, 6, 7),
 		ReclaimEffectivePerNUMA:        map[int]machine.CPUSet{0: machine.NewCPUSet(3), 1: machine.NewCPUSet(4, 5, 6, 7)},
 		DesiredReclaimEffectivePerNUMA: map[int]machine.CPUSet{0: machine.NewCPUSet(3), 1: machine.NewCPUSet(4, 5, 6, 7)},
-	}
+	}}
 
 	ApplyTransientProtectedNonReclaim(view, testTwoNUMATopology(), machine.NewCPUSet(3, 4))
 
 	assertCPUSet(t, "applied reclaim", view.ReclaimEffective, "5-7")
-	if _, ok := view.ReclaimEffectivePerNUMA[0]; ok {
-		t.Fatalf("reclaim numa 0 should be removed after protected CPUs are deducted: %s", view.ReclaimEffectivePerNUMA[0].String())
-	}
+	assertCPUSet(t, "applied reclaim numa 0 empty", view.ReclaimEffectivePerNUMA[0], "")
 	assertCPUSet(t, "applied reclaim numa 1", view.ReclaimEffectivePerNUMA[1], "5-7")
+	err := ValidateCPUSetPartitionView(view, testTwoNUMATopology())
+	if err != nil {
+		t.Fatalf("ValidateCPUSetPartitionView() rejected exact projection with empty NUMA bucket: %v", err)
+	}
 }
 
 func TestBuildCPUSetPartitionViewPadsNonReclaimPoolReversely(t *testing.T) {
@@ -200,9 +325,8 @@ func TestBuildCPUSetPartitionViewPadsNonReclaimPoolReversely(t *testing.T) {
 
 	assertCPUSet(t, "reverse non reclaim absorbs CPUs without raw reclaim", view.NonReclaimPool, "1-7")
 	assertCPUSet(t, "reverse reclaim effective is empty without raw reclaim", view.ReclaimEffective, "")
-	if len(view.ReclaimEffectivePerNUMA) != 0 {
-		t.Fatalf("reclaim per NUMA should be empty without raw reclaim: %v", view.ReclaimEffectivePerNUMA)
-	}
+	assertCPUSet(t, "reverse empty reclaim numa 0", view.ReclaimEffectivePerNUMA[0], "")
+	assertCPUSet(t, "reverse empty reclaim numa 1", view.ReclaimEffectivePerNUMA[1], "")
 }
 
 func TestBuildCPUSetPartitionViewDoesNotPadWhenOverlapAllowed(t *testing.T) {

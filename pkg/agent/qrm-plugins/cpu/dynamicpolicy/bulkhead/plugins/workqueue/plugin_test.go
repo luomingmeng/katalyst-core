@@ -24,7 +24,7 @@ import (
 	"testing"
 
 	bulkheadapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api"
-	bulkheadutils "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	bulkheadconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/bulkhead"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
@@ -92,9 +92,9 @@ func TestWorkqueuePluginResetsMasksWhenReclaimBecomesEmpty(t *testing.T) {
 
 	ctx := context.Background()
 	if err := p.CPUSetAdjustmentHandler(ctx, bulkheadapi.HandlerContext{
-		View: &bulkheadutils.CPUSetPartitionView{
+		AppliedView: &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
 			ReclaimEffective: machine.NewCPUSet(0, 1),
-		},
+		}},
 	}); err != nil {
 		t.Fatalf("reclaim handler: %v", err)
 	}
@@ -103,14 +103,14 @@ func TestWorkqueuePluginResetsMasksWhenReclaimBecomesEmpty(t *testing.T) {
 	}
 
 	if err := p.CPUSetAdjustmentHandler(ctx, bulkheadapi.HandlerContext{
-		View: &bulkheadutils.CPUSetPartitionView{ReclaimEffective: machine.NewCPUSet()},
+		AppliedView: &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{ReclaimEffective: machine.NewCPUSet()}},
 	}); err != nil {
 		t.Fatalf("empty reclaim handler without topology: %v", err)
 	}
 
 	in := bulkheadapi.HandlerContext{}
 	in.Topology = topology
-	in.View = &bulkheadutils.CPUSetPartitionView{ReclaimEffective: machine.NewCPUSet()}
+	in.AppliedView = &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{ReclaimEffective: machine.NewCPUSet()}}
 	if err := p.CPUSetAdjustmentHandler(ctx, in); err != nil {
 		t.Fatalf("empty reclaim reset handler: %v", err)
 	}
@@ -168,9 +168,9 @@ func TestWorkqueuePluginSkipsUnchangedMasks(t *testing.T) {
 		fs: f,
 	}
 	in := bulkheadapi.HandlerContext{
-		View: &bulkheadutils.CPUSetPartitionView{
+		AppliedView: &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
 			ReclaimEffective: machine.NewCPUSet(0, 1),
-		},
+		}},
 	}
 	ctx := context.Background()
 	if err := p.CPUSetAdjustmentHandler(ctx, in); err != nil {

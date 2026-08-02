@@ -6647,6 +6647,7 @@ func TestAllocateByQoSAwareServerListAndWatchResp(t *testing.T) {
 				},
 			},
 			lwResp: &advisorapi.ListAndWatchResponse{
+				AllowSharedCoresOverlapReclaimedCores: true,
 				Entries: map[string]*advisorapi.CalculationEntries{
 					commonstate.PoolNameShare: {
 						Entries: map[string]*advisorapi.CalculationInfo{
@@ -7316,6 +7317,7 @@ func TestAllocateByQoSAwareServerListAndWatchResp(t *testing.T) {
 				},
 			},
 			lwResp: &advisorapi.ListAndWatchResponse{
+				AllowSharedCoresOverlapReclaimedCores: true,
 				Entries: map[string]*advisorapi.CalculationEntries{
 					commonstate.PoolNameShare: {
 						Entries: map[string]*advisorapi.CalculationInfo{

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	bulkheadconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/bulkhead"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	cgcommon "github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
@@ -69,7 +70,7 @@ func ResolveContainerRelPath(metaServer *metaserver.MetaServer, podUID, containe
 
 func CollectActiveRels(
 	cfg bulkheadconfig.BulkheadConfiguration,
-	view *CPUSetPartitionView,
+	view *model.CPUSetPartitionView,
 	metaServer *metaserver.MetaServer,
 	reclaimSiblings []string,
 	relExists RelExistsFunc,

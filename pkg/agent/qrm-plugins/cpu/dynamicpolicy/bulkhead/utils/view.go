@@ -17,28 +17,13 @@ limitations under the License.
 package utils
 
 import (
+	"fmt"
+
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	cpustate "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
-
-type CPUSetPartitionView struct {
-	Reserve                             machine.CPUSet
-	Dedicated                           machine.CPUSet
-	ReclaimRaw                          machine.CPUSet
-	SharePool                           machine.CPUSet
-	SharePoolMap                        map[string]machine.CPUSet
-	Isolation                           machine.CPUSet
-	DesiredNonReclaimPool               machine.CPUSet
-	DesiredReclaimEffective             machine.CPUSet
-	DesiredReclaimEffectivePerNUMA      map[int]machine.CPUSet
-	TransientProtectedNonReclaim        machine.CPUSet
-	TransientProtectedNonReclaimPerNUMA map[int]machine.CPUSet
-	NonReclaimPool                      machine.CPUSet
-	ReclaimEffective                    machine.CPUSet
-	ReclaimEffectivePerNUMA             map[int]machine.CPUSet
-	ContainerCPUSetByPod                map[string]map[string]machine.CPUSet
-}
 
 type CPUSetPartitionViewOptions struct {
 	NonReclaimPoolMinSize        int64
@@ -46,24 +31,8 @@ type CPUSetPartitionViewOptions struct {
 	TransientProtectedNonReclaim machine.CPUSet
 }
 
-func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CPUTopology, opts CPUSetPartitionViewOptions) *CPUSetPartitionView {
-	view := &CPUSetPartitionView{
-		Reserve:                             machine.NewCPUSet(),
-		Dedicated:                           machine.NewCPUSet(),
-		ReclaimRaw:                          machine.NewCPUSet(),
-		SharePool:                           machine.NewCPUSet(),
-		SharePoolMap:                        map[string]machine.CPUSet{},
-		Isolation:                           machine.NewCPUSet(),
-		DesiredNonReclaimPool:               machine.NewCPUSet(),
-		DesiredReclaimEffective:             machine.NewCPUSet(),
-		DesiredReclaimEffectivePerNUMA:      map[int]machine.CPUSet{},
-		TransientProtectedNonReclaim:        machine.NewCPUSet(),
-		TransientProtectedNonReclaimPerNUMA: map[int]machine.CPUSet{},
-		NonReclaimPool:                      machine.NewCPUSet(),
-		ReclaimEffective:                    machine.NewCPUSet(),
-		ReclaimEffectivePerNUMA:             map[int]machine.CPUSet{},
-		ContainerCPUSetByPod:                map[string]map[string]machine.CPUSet{},
-	}
+func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CPUTopology, opts CPUSetPartitionViewOptions) *model.DesiredView {
+	view := model.NewDesiredView()
 	if state == nil || topology == nil {
 		return view
 	}
@@ -171,8 +140,115 @@ func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CP
 	return view
 }
 
-func ApplyTransientProtectedNonReclaim(view *CPUSetPartitionView, topology *machine.CPUTopology, protected machine.CPUSet) {
-	if view == nil || topology == nil || protected.IsEmpty() {
+func BuildValidatedCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CPUTopology, opts CPUSetPartitionViewOptions) (*model.DesiredView, error) {
+	view := BuildCPUSetPartitionView(state, topology, opts)
+	if err := ValidateCPUSetPartitionView(view, topology); err != nil {
+		return nil, err
+	}
+	return view, nil
+}
+
+// BuildCPUSetPartitionViewFromTarget creates an owned partition view whose
+// reclaim domain is the topology layer's write-verified target. Metadata that
+// is independent of partition ownership is copied from desired.
+func BuildCPUSetPartitionViewFromTarget(
+	desired *model.DesiredView,
+	reclaimTarget machine.CPUSet,
+	topology *machine.CPUTopology,
+) *model.CPUSetPartitionView {
+	view := model.NewCPUSetPartitionView()
+	if desired != nil {
+		view = *desired.CPUSetPartitionView.DeepCopy()
+	}
+
+	view.ReclaimEffective = reclaimTarget.Clone()
+	view.ReclaimEffectivePerNUMA = map[int]machine.CPUSet{}
+	if topology == nil {
+		view.NonReclaimPool = machine.NewCPUSet()
+		return &view
+	}
+
+	available := topology.CPUDetails.CPUs().Difference(view.Reserve)
+	view.NonReclaimPool = available.Difference(view.ReclaimEffective)
+	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceNoSortInt() {
+		view.ReclaimEffectivePerNUMA[numaID] =
+			view.ReclaimEffective.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
+	}
+	return &view
+}
+
+func ValidateCPUSetPartitionView(view *model.DesiredView, topology *machine.CPUTopology) error {
+	if view == nil || topology == nil {
+		return nil
+	}
+	machineCPUs := topology.CPUDetails.CPUs()
+	for name, cpus := range map[string]machine.CPUSet{
+		"reserve":                         view.Reserve,
+		"share pool":                      view.SharePool,
+		"dedicated":                       view.Dedicated,
+		"isolation":                       view.Isolation,
+		"reclaim raw":                     view.ReclaimRaw,
+		"non-reclaim pool":                view.NonReclaimPool,
+		"reclaim effective":               view.ReclaimEffective,
+		"desired non-reclaim pool":        view.DesiredNonReclaimPool,
+		"desired reclaim effective":       view.DesiredReclaimEffective,
+		"transient protected non-reclaim": view.TransientProtectedNonReclaim,
+	} {
+		if outside := cpus.Difference(machineCPUs); !outside.IsEmpty() {
+			return fmt.Errorf("bulkhead cpuset partition %s has CPUs outside machine topology: %s", name, outside.String())
+		}
+	}
+	if overlap := view.NonReclaimPool.Intersection(view.ReclaimEffective); !overlap.IsEmpty() {
+		return fmt.Errorf("bulkhead cpuset partition has non-reclaim/reclaim overlap: %s", overlap.String())
+	}
+	if err := validateExactNUMAProjection(
+		"reclaim effective", view.ReclaimEffective, view.ReclaimEffectivePerNUMA, topology); err != nil {
+		return err
+	}
+	if err := validateExactNUMAProjection(
+		"desired reclaim effective", view.DesiredReclaimEffective, view.DesiredReclaimEffectivePerNUMA, topology); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateExactNUMAProjection(
+	name string,
+	global machine.CPUSet,
+	perNUMA map[int]machine.CPUSet,
+	topology *machine.CPUTopology,
+) error {
+	numaIDs := topology.CPUDetails.NUMANodes()
+	if len(perNUMA) != numaIDs.Size() {
+		return fmt.Errorf("bulkhead cpuset partition %s NUMA bucket count %d does not match machine NUMA count %d",
+			name, len(perNUMA), numaIDs.Size())
+	}
+	for numaID := range perNUMA {
+		if !numaIDs.Contains(numaID) {
+			return fmt.Errorf("bulkhead cpuset partition %s has unknown NUMA bucket: %d", name, numaID)
+		}
+	}
+	for _, numaID := range numaIDs.ToSliceInt() {
+		actual, ok := perNUMA[numaID]
+		if !ok {
+			return fmt.Errorf("bulkhead cpuset partition missing %s NUMA bucket: %d", name, numaID)
+		}
+		expected := global.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
+		if !actual.Equals(expected) {
+			return fmt.Errorf("bulkhead cpuset partition %s NUMA bucket %d is %s, want exact global projection %s",
+				name, numaID, actual.String(), expected.String())
+		}
+	}
+	return nil
+}
+
+func ApplyTransientProtectedNonReclaim(view *model.DesiredView, topology *machine.CPUTopology, protected machine.CPUSet) {
+	if view == nil || topology == nil {
+		return
+	}
+	if protected.IsEmpty() {
+		view.TransientProtectedNonReclaim = machine.NewCPUSet()
+		rebuildTransientProtectedNonReclaimPerNUMA(view, topology)
 		return
 	}
 	available := topology.CPUDetails.CPUs().Difference(view.Reserve)
@@ -183,7 +259,7 @@ func ApplyTransientProtectedNonReclaim(view *CPUSetPartitionView, topology *mach
 	rebuildTransientProtectedNonReclaimPerNUMA(view, topology)
 }
 
-func padNonReclaimPoolToMinSize(view *CPUSetPartitionView, topology *machine.CPUTopology, opts CPUSetPartitionViewOptions) {
+func padNonReclaimPoolToMinSize(view *model.DesiredView, topology *machine.CPUTopology, opts CPUSetPartitionViewOptions) {
 	if view == nil || topology == nil || opts.NonReclaimPoolMinSize <= 0 {
 		return
 	}
@@ -246,7 +322,7 @@ func takeCPUsByNUMABalanceWithSeed(topology *machine.CPUTopology, candidates, se
 	return result
 }
 
-func rebuildReclaimEffectivePerNUMA(view *CPUSetPartitionView, topology *machine.CPUTopology) {
+func rebuildReclaimEffectivePerNUMA(view *model.DesiredView, topology *machine.CPUTopology) {
 	if view == nil {
 		return
 	}
@@ -256,13 +332,11 @@ func rebuildReclaimEffectivePerNUMA(view *CPUSetPartitionView, topology *machine
 	}
 	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceNoSortInt() {
 		intersection := view.ReclaimEffective.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
-		if !intersection.IsEmpty() {
-			view.ReclaimEffectivePerNUMA[numaID] = intersection
-		}
+		view.ReclaimEffectivePerNUMA[numaID] = intersection
 	}
 }
 
-func rebuildDesiredReclaimEffectivePerNUMA(view *CPUSetPartitionView, topology *machine.CPUTopology) {
+func rebuildDesiredReclaimEffectivePerNUMA(view *model.DesiredView, topology *machine.CPUTopology) {
 	if view == nil {
 		return
 	}
@@ -272,13 +346,11 @@ func rebuildDesiredReclaimEffectivePerNUMA(view *CPUSetPartitionView, topology *
 	}
 	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceNoSortInt() {
 		intersection := view.DesiredReclaimEffective.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
-		if !intersection.IsEmpty() {
-			view.DesiredReclaimEffectivePerNUMA[numaID] = intersection
-		}
+		view.DesiredReclaimEffectivePerNUMA[numaID] = intersection
 	}
 }
 
-func rebuildTransientProtectedNonReclaimPerNUMA(view *CPUSetPartitionView, topology *machine.CPUTopology) {
+func rebuildTransientProtectedNonReclaimPerNUMA(view *model.DesiredView, topology *machine.CPUTopology) {
 	if view == nil {
 		return
 	}
@@ -288,50 +360,6 @@ func rebuildTransientProtectedNonReclaimPerNUMA(view *CPUSetPartitionView, topol
 	}
 	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceNoSortInt() {
 		intersection := view.TransientProtectedNonReclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
-		if !intersection.IsEmpty() {
-			view.TransientProtectedNonReclaimPerNUMA[numaID] = intersection
-		}
+		view.TransientProtectedNonReclaimPerNUMA[numaID] = intersection
 	}
-}
-
-func (v *CPUSetPartitionView) DeepCopy() *CPUSetPartitionView {
-	if v == nil {
-		return nil
-	}
-	out := &CPUSetPartitionView{
-		Reserve:                             v.Reserve.Clone(),
-		Dedicated:                           v.Dedicated.Clone(),
-		ReclaimRaw:                          v.ReclaimRaw.Clone(),
-		SharePool:                           v.SharePool.Clone(),
-		SharePoolMap:                        map[string]machine.CPUSet{},
-		Isolation:                           v.Isolation.Clone(),
-		DesiredNonReclaimPool:               v.DesiredNonReclaimPool.Clone(),
-		DesiredReclaimEffective:             v.DesiredReclaimEffective.Clone(),
-		DesiredReclaimEffectivePerNUMA:      map[int]machine.CPUSet{},
-		TransientProtectedNonReclaim:        v.TransientProtectedNonReclaim.Clone(),
-		TransientProtectedNonReclaimPerNUMA: map[int]machine.CPUSet{},
-		NonReclaimPool:                      v.NonReclaimPool.Clone(),
-		ReclaimEffective:                    v.ReclaimEffective.Clone(),
-		ReclaimEffectivePerNUMA:             map[int]machine.CPUSet{},
-		ContainerCPUSetByPod:                map[string]map[string]machine.CPUSet{},
-	}
-	for numaID, cpus := range v.ReclaimEffectivePerNUMA {
-		out.ReclaimEffectivePerNUMA[numaID] = cpus.Clone()
-	}
-	for numaID, cpus := range v.DesiredReclaimEffectivePerNUMA {
-		out.DesiredReclaimEffectivePerNUMA[numaID] = cpus.Clone()
-	}
-	for numaID, cpus := range v.TransientProtectedNonReclaimPerNUMA {
-		out.TransientProtectedNonReclaimPerNUMA[numaID] = cpus.Clone()
-	}
-	for poolName, cpus := range v.SharePoolMap {
-		out.SharePoolMap[poolName] = cpus.Clone()
-	}
-	for podUID, containers := range v.ContainerCPUSetByPod {
-		out.ContainerCPUSetByPod[podUID] = map[string]machine.CPUSet{}
-		for containerName, cpus := range containers {
-			out.ContainerCPUSetByPod[podUID][containerName] = cpus.Clone()
-		}
-	}
-	return out
 }
