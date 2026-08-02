@@ -2,12 +2,12 @@
 
 ## 文档状态
 
-- 状态：设计评审稿
-- 范围：cgroup v1 下 Bulkhead cpuset 的跨 domain 迁移、动态层级写入和下游视图一致性
+- 状态：已实现（as-built）
+- 范围：cgroup v1/v2 下 Bulkhead cpuset 的跨 domain 迁移、动态层级写入和下游视图一致性
 - 目标代码：`pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead`
-- 不包含：CPU Advisor 分配算法、NUMA hint 计算、cgroup v2 空 cpuset 语义重构
+- 不包含：CPU Advisor 分配算法、NUMA hint 计算
 
-本文档基于真实节点 high-churn 验证、50ms cpuset 文件采样和当前代码审查。文中的“现状”已由代码或日志确认；“目标设计”尚未实现。
+本文档描述当前已实现架构，并基于真实节点 standard、high-churn、overlap-churn 验证和代码审查更新。实施过程中的临时 pipeline、client-backed hierarchy driver、固定 drain step 和分散 writer fallback 不属于最终架构。
 
 ## 问题与目标
 
@@ -20,7 +20,7 @@ reclaim: B -> A
 
 cgroup v1 只强制 `child cpuset ⊆ parent cpuset`，不强制 sibling domain 互斥。任一 destination 在 source 真正释放 CPU 前扩张，都会产生文件层 overlap；parent 过早 shrink 会返回 `EBUSY`，child 在 parent 尚未 widen 时 grow 会返回 `EACCES`。当前 drain、generic converge、dynamic leaf、workqueue 和 system cpuset 分别推导中间目标，因而会观察或写入不同版本的 partition。
 
-目标设计由 Topology Coordinator 单独生成阶段计划并传播写后事实，满足：
+Topology Coordinator 单独生成阶段计划并传播写后事实，满足：
 
 1. 每次可观察写入后，任意两个互斥 domain 都不重叠。
 2. 每个已发现 child 的 target 都被 immediate parent target 覆盖。
@@ -309,7 +309,7 @@ type HierarchyCapabilities struct {
 }
 ```
 
-cgroup v1 driver 负责配置 cpuset、非空限制和 `EBUSY/EACCES` 分类；未来 cgroup v2 driver 负责 `cpuset.cpus.effective`、继承空值、`cgroup.subtree_control` 和 partition root 状态。新 backend 未通过同一 invariant suite 前只能启用 read-only diagnostic mode。
+cgroup v1/v2 共用 pinned-root FD engine，通过 immutable policy 区分 observed/configured 文件、空 configured CPUSet 和 effective CPUSet 语义。v1 driver 负责非空限制和 `EBUSY/EACCES` 分类；v2 driver 读取 `cpuset.cpus.effective`/`cpuset.mems.effective`，并以 configured 空值表达继承。新 backend 未通过同一 invariant suite 前只能启用 read-only diagnostic mode。
 
 NUMA/reclaim 特例不从 rel 名称解析，而由 DAG metadata 提供通用约束：
 
@@ -366,14 +366,13 @@ DrainBatch = StableSelect(edgeCandidate, policy)
 
 ```go
 type DrainSelectionPolicy struct {
-    MaxPhysicalCoresPerDrainRound int
-    PreserveSMTSiblings bool
+    MaxCPUsDrainRatio float64
     GroupByNUMA bool
     RequirePairedSwapProgress bool
 }
 ```
 
-`MaxPhysicalCoresPerDrainRound == 0` 表示选择全部合法候选。第一版使用该默认值；后续可按 NUMA 和 physical core group 限步。`PreserveSMTSiblings` 与 `GroupByNUMA` 默认开启，稳定排序键为 `(NUMA ID, physical core ID, min logical CPU ID)`。topology 缺失时可按 logical CPU 稳定排序并记录 degraded metric，但不得声称保持 physical core 完整性。步长只改变 round 数，不得改变最终 partition。
+`MaxCPUsDrainRatio` 将每轮 drain 限制为整机逻辑 CPU 数量的比例，并向下对齐为可执行的 SMT group；零值表示不额外限步。`GroupByNUMA` 保证 bucket 局部选择，`RequirePairedSwapProgress` 要求 cycle 中存在可执行的 paired progress。稳定排序键为 `(NUMA ID, physical core ID, min logical CPU ID)`；topology 缺失时按 logical CPU 稳定降级，但不得声称保持 physical core 完整性。比例只改变 round 数，不得改变最终 partition。
 
 每个 reclaimed NUMA bucket 只能处理 `DrainBatch ∩ CPUsOfNUMA(bucket)`。不得跨 bucket 借核、拆跨 NUMA core group 或改变 DesiredView 的 NUMA 归属。仍被 dynamic child 持有的 CPU 可以留在 candidate 中，但必须经 leaf-to-root 写序真实释放；写后仍被观察到时不会产生 witness。
 
@@ -606,25 +605,25 @@ flowchart TD
 图 8：workqueue/system 不读取 DesiredView 或自行采样重建中间态。
 
 - workqueue 使用 `AppliedView.ReclaimEffective`；
-- system service periodical handler 只迁 PID，target 等于最近 applied reclaim union 或其安全子集；
+- system service periodical handler 只迁 PID，target 必须匹配最新 `AppliedView` 的逐 rel CPUSet 与 `(device, inode)` identity proof；
 - topology 失败时 Manager 不执行后续 partition consumer；
 - `cpuset.mems` 可独立 reconcile，但不能改变 CPU ownership phase；
 - 每个插件分别读 cgroup 会重新引入多个 applied-state owner，因此禁止。
 
-## 实施顺序
+## 已实现组件
 
-依赖顺序如下，前置安全能力未完成时不得启用 normal cross-domain transfer：
+当前实现按以下依赖链组织：
 
-1. 扩展 `HierarchyDriver` stable identity、fake identity revision 和 budget decorator。
-2. 实现 fail-closed `CompleteSnapshot` 与按证据范围扫描。
-3. 实现 DomainID transfer graph、层级闭包和只读 `PhasePlan`。
-4. 实现 `ReleaseWitness` SnapshotID/boundary 门禁。
-5. 让 writer 只接收 plan，加入 precheck 和 typed error classification。
-6. 收敛 controlled write wrapper、mode guard、phase journal，删除重复 writer。
-7. 将 drain/witness/expand/verify 收入 coordinator loop并发布 `RoundOutcome.AppliedView`。
-8. 基础全量 drain 通过后，再启用 NUMA/physical-core 步长。
+1. `HierarchyDriver` 提供 stable identity、统一 v1/v2 FD engine 和 invocation-scoped budget。
+2. `CompleteSnapshot` 提供 fail-closed hierarchy evidence、configured/effective 状态和 target proof。
+3. `PhasePlan` 负责 transfer graph、层级 envelope、v1 non-empty contract 和 structural deadlock proof。
+4. safe writer 只执行 canonical plan，并在同一 generation 上完成 precheck、conditional write 和 readback。
+5. coordinator 在 drain/witness/expand/verify 间 replan，并由 deadline、round、I/O 和 no-progress budget 限制。
+6. cpuset topology plugin 从 current final snapshot 派生 `AppliedView` 和逐 rel identity proof。
+7. Manager 只在 DesiredView 未变化且 dependent plugins 成功后发布新 revision。
+8. workqueue 与 system service 只消费已发布事实；PID attach 同时绑定 cgroup identity 和 pidfd identity。
 
-清理项包括：
+已删除的旧路径包括：
 
 - normal mode 后置 generic converge 和 constrained-target 二次写；
 - `withConstrainBridgeGrowth` 及分散的 `keep_parent_bridge_*`；
@@ -664,7 +663,7 @@ budget usage never exceeds configured limits
 | bucket gate 不足 | 只加入 witness 授权且在双重上界内的 CPU |
 | bucket observed 已越界 | 先 repair/drain，否则 blocked |
 | protected pending/rel | protected CPU 不进入 DrainBatch |
-| fixed step | 每 domain 每轮 physical core group 不超配置 |
+| ratio step | 每 domain 每轮选择量不超过 ratio 上限，最终 partition 不变 |
 | SMT sibling | 默认整组迁移，不拆 physical core |
 | topology 缺失 | logical CPU 稳定排序并记录 degraded metric |
 | stable selection | 同 snapshot、desired、policy 得到相同 batch |
