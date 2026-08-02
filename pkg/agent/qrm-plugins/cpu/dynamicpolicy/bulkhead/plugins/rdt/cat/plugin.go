@@ -108,9 +108,6 @@ func (p *CATPlugin) PeriodicalHandler(ctx context.Context, in bulkheadapi.Period
 		p.active = applied
 		return nil
 	}
-	if !p.active && ways <= 0 {
-		return nil
-	}
 	if err := p.rollback(ctx, ways); err != nil {
 		return err
 	}
@@ -179,11 +176,32 @@ func (p *CATPlugin) rollback(ctx context.Context, defaultWays int64) error {
 	if err != nil {
 		return fmt.Errorf("list CAT-managed CLOS for rollback: %w", err)
 	}
-	target, err := symmetricTarget(capabilities, defaultWays)
+	target, err := catRollbackTarget(capabilities, defaultWays)
 	if err != nil {
 		return fmt.Errorf("build CAT rollback target: %w", err)
 	}
 	return p.applyTargetToClos(clos, target)
+}
+
+func catRollbackTarget(capabilities map[int]rdt.CATCapability, defaultWays int64) (map[int]uint64, error) {
+	if defaultWays > 0 {
+		return symmetricTarget(capabilities, defaultWays)
+	}
+	if len(capabilities) == 0 {
+		return nil, fmt.Errorf("no L3 CAT domains")
+	}
+	target := make(map[int]uint64, len(capabilities))
+	for domain, capability := range capabilities {
+		if !isContiguousMask(capability.CBMMask) {
+			return nil, fmt.Errorf("domain %d has non-contiguous CAT capability mask %x", domain, capability.CBMMask)
+		}
+		if bits.OnesCount64(capability.CBMMask) < int(capability.MinCBMBits) {
+			return nil, fmt.Errorf("domain %d CAT capability mask %x is smaller than minimum %d",
+				domain, capability.CBMMask, capability.MinCBMBits)
+		}
+		target[domain] = capability.CBMMask
+	}
+	return target, nil
 }
 
 func (p *CATPlugin) applyTargetToClos(clos []qrmresctrlmanager.CPUListClos, target map[int]uint64) error {
