@@ -89,10 +89,10 @@ func TestRunCPUSetAdjustmentHandlersDoesNotHoldPolicyLockDuringExecution(t *test
 	}
 }
 
-func TestRunCPUSetAdjustmentHandlersFenceRejectsStateMutationWithoutNewRound(t *testing.T) {
+func TestRunCPUSetAdjustmentHandlersFenceRejectsStaleStateBeforeRetry(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
-	committed := make(chan bool, 1)
+	committed := make(chan bool, 2)
 	topology, err := machine.GenerateDummyCPUTopology(8, 1, 4)
 	if err != nil {
 		t.Fatalf("GenerateDummyCPUTopology() error = %v", err)
@@ -103,8 +103,10 @@ func TestRunCPUSetAdjustmentHandlersFenceRejectsStateMutationWithoutNewRound(t *
 	}
 	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"blocking-io": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-			close(started)
-			<-release
+			if in.Generation == 1 {
+				close(started)
+				<-release
+			}
 			committed <- in.CommitIfGenerationCurrent(in.Generation, func() {})
 			return nil
 		},
@@ -128,6 +130,59 @@ func TestRunCPUSetAdjustmentHandlersFenceRejectsStateMutationWithoutNewRound(t *
 	}
 	if <-committed {
 		t.Fatal("generation fence accepted a result calculated from stale policy state")
+	}
+	if !<-committed {
+		t.Fatal("latest generation did not converge after rejecting stale policy state")
+	}
+}
+
+func TestRunCPUSetAdjustmentHandlersRetriesLatestStateAfterFenceRejection(t *testing.T) {
+	firstStarted := make(chan struct{})
+	firstRelease := make(chan struct{})
+	committedGenerations := make(chan uint64, 1)
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 4)
+	if err != nil {
+		t.Fatalf("GenerateDummyCPUTopology() error = %v", err)
+	}
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	if err != nil {
+		t.Fatalf("getTestDynamicPolicyWithInitialization() error = %v", err)
+	}
+	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"generation-aware": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			if in.Generation == 1 {
+				close(firstStarted)
+				<-firstRelease
+			}
+			if in.CommitIfGenerationCurrent(in.Generation, func() {}) {
+				committedGenerations <- in.Generation
+			}
+			return nil
+		},
+	}
+
+	runDone := make(chan error, 1)
+	go func() {
+		p.Lock()
+		defer p.Unlock()
+		runDone <- p.runCPUSetAdjustmentHandlers(context.Background())
+	}()
+	<-firstStarted
+	p.Lock()
+	p.state.SetAllowSharedCoresOverlapReclaimedCores(true, false)
+	p.Unlock()
+	close(firstRelease)
+
+	if err := <-runDone; err != nil {
+		t.Fatalf("runCPUSetAdjustmentHandlers() error = %v", err)
+	}
+	select {
+	case generation := <-committedGenerations:
+		if generation != 2 {
+			t.Fatalf("committed generation = %d, want latest generation 2", generation)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("latest policy state was not scheduled after stale generation rejection")
 	}
 }
 

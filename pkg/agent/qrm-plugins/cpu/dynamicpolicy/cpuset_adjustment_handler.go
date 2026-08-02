@@ -124,59 +124,66 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context) error {
 	p.Unlock()
 	p.cpuSetAdjustmentExecutionMu.Lock()
 	p.Lock()
+	defer p.cpuSetAdjustmentExecutionMu.Unlock()
 
-	var topology *machine.CPUTopology
-	if p.machineInfo != nil {
-		topology = p.machineInfo.CPUTopology
-	}
-	var dynamicConf *dynamicconfig.Configuration
-	if p.dynamicConfig != nil {
-		dynamicConf = p.dynamicConfig.GetDynamicConfiguration()
-	}
-	stateSnapshot := newCPUSetAdjustmentStateSnapshot(p.state)
-	handlerCtx := cpusetutil.CPUSetAdjustmentHandlerCtx{
-		CoreConf:    p.conf,
-		DynamicConf: dynamicConf,
-		Emitter:     p.emitter,
-		MetaServer:  p.metaServer,
-		State:       stateSnapshot,
-		Topology:    topology,
-	}
-	p.cpuSetAdjustmentGeneration++
-	handlerCtx.Generation = p.cpuSetAdjustmentGeneration
-	handlerCtx.CommitIfGenerationCurrent = func(generation uint64, commit func()) bool {
-		p.Lock()
-		defer p.Unlock()
-		var currentDynamicConf *dynamicconfig.Configuration
+	for {
+		var topology *machine.CPUTopology
+		if p.machineInfo != nil {
+			topology = p.machineInfo.CPUTopology
+		}
+		var dynamicConf *dynamicconfig.Configuration
 		if p.dynamicConfig != nil {
-			currentDynamicConf = p.dynamicConfig.GetDynamicConfiguration()
+			dynamicConf = p.dynamicConfig.GetDynamicConfiguration()
 		}
-		if generation != p.cpuSetAdjustmentGeneration ||
-			dynamicConf != currentDynamicConf ||
-			!stateSnapshot.matches(p.state) {
-			return false
+		stateSnapshot := newCPUSetAdjustmentStateSnapshot(p.state)
+		handlerCtx := cpusetutil.CPUSetAdjustmentHandlerCtx{
+			CoreConf:    p.conf,
+			DynamicConf: dynamicConf,
+			Emitter:     p.emitter,
+			MetaServer:  p.metaServer,
+			State:       stateSnapshot,
+			Topology:    topology,
 		}
-		commit()
-		return true
-	}
+		p.cpuSetAdjustmentGeneration++
+		handlerCtx.Generation = p.cpuSetAdjustmentGeneration
+		roundInvalidated := false
+		handlerCtx.CommitIfGenerationCurrent = func(generation uint64, commit func()) bool {
+			p.Lock()
+			defer p.Unlock()
+			var currentDynamicConf *dynamicconfig.Configuration
+			if p.dynamicConfig != nil {
+				currentDynamicConf = p.dynamicConfig.GetDynamicConfiguration()
+			}
+			if generation != p.cpuSetAdjustmentGeneration ||
+				dynamicConf != currentDynamicConf ||
+				!stateSnapshot.matches(p.state) {
+				roundInvalidated = true
+				return false
+			}
+			commit()
+			return true
+		}
 
-	names := make([]string, 0, len(p.cpuSetAdjustmentHandlers))
-	handlers := make(map[string]cpusetutil.CPUSetAdjustmentHandler, len(p.cpuSetAdjustmentHandlers))
-	for name := range p.cpuSetAdjustmentHandlers {
-		names = append(names, name)
-		handlers[name] = p.cpuSetAdjustmentHandlers[name]
-	}
-	sort.Strings(names)
+		names := make([]string, 0, len(p.cpuSetAdjustmentHandlers))
+		handlers := make(map[string]cpusetutil.CPUSetAdjustmentHandler, len(p.cpuSetAdjustmentHandlers))
+		for name := range p.cpuSetAdjustmentHandlers {
+			names = append(names, name)
+			handlers[name] = p.cpuSetAdjustmentHandlers[name]
+		}
+		sort.Strings(names)
 
-	p.Unlock()
-	defer func() {
+		p.Unlock()
+		var roundErr error
+		for _, name := range names {
+			if err := handlers[name](ctx, handlerCtx); err != nil {
+				roundErr = fmt.Errorf("run cpuset adjustment handler %q: %w", name, err)
+				break
+			}
+		}
 		p.Lock()
-		p.cpuSetAdjustmentExecutionMu.Unlock()
-	}()
-	for _, name := range names {
-		if err := handlers[name](ctx, handlerCtx); err != nil {
-			return fmt.Errorf("run cpuset adjustment handler %q: %w", name, err)
+		if roundInvalidated && ctx.Err() == nil {
+			continue
 		}
+		return roundErr
 	}
-	return nil
 }

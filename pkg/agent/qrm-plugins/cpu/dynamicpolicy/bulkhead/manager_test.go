@@ -397,7 +397,7 @@ func TestManagerApplyDoesNotPublishTypedTopologyResultBeforeDependentsSucceed(t 
 	}
 }
 
-func TestManagerApplyDoesNotPublishWhenPolicyGenerationIsStale(t *testing.T) {
+func TestManagerApplyRejectsStaleGenerationBeforeDependentSideEffects(t *testing.T) {
 	t.Parallel()
 
 	oldApplied := &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
@@ -435,7 +435,7 @@ func TestManagerApplyDoesNotPublishWhenPolicyGenerationIsStale(t *testing.T) {
 				t.Fatalf("commit generation = %d, want 11", generation)
 			}
 			fenceCalls++
-			if fenceCalls == 1 {
+			if fenceCalls <= 2 {
 				commit()
 				return true
 			}
@@ -446,8 +446,8 @@ func TestManagerApplyDoesNotPublishWhenPolicyGenerationIsStale(t *testing.T) {
 	if !errors.As(err, &nonConverged) {
 		t.Fatalf("Apply() error = %v, want stale generation rejected as *NonConvergedError", err)
 	}
-	if got := len(dependent.adjustViews); got != 1 {
-		t.Fatalf("dependent calls = %d, want completed lock-free execution before commit fence", got)
+	if got := len(dependent.adjustViews); got != 0 {
+		t.Fatalf("dependent calls = %d, want stale generation rejected before dependent side effects", got)
 	}
 	if m.appliedViewRevision != 7 {
 		t.Fatalf("applied revision = %d, want old revision 7 retained", m.appliedViewRevision)
