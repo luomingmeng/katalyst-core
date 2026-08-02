@@ -42,7 +42,10 @@ const (
 	schemata     = "schemata"
 )
 
-var ErrRDTDisabled = errors.New("RDT is disabled")
+var (
+	ErrRDTDisabled    = errors.New("RDT is disabled")
+	ErrRDTUnavailable = errors.New("resctrl is unavailable")
+)
 
 type Manager interface {
 	Run(stopCh <-chan struct{})
@@ -129,7 +132,7 @@ func (m *managerImpl) Create(podUID, closID string, createMonGroup bool) error {
 		return ErrRDTDisabled
 	}
 	if !m.enabled.Load() || m.root == "" {
-		return nil
+		return ErrRDTUnavailable
 	}
 	if err := m.recoverPendingCreatesLocked(); err != nil {
 		return err

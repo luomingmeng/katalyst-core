@@ -293,6 +293,27 @@ func TestManagerCreateFailsWhileDisableRDTTransitionIsPending(t *testing.T) {
 	require.NoDirExists(t, filepath.Join(manager.root, "share-01"))
 }
 
+func TestManagerCreateReturnsUnavailableUntilResctrlIsReady(t *testing.T) {
+	tests := []struct {
+		name    string
+		enabled bool
+		root    string
+	}{
+		{name: "not enabled", root: t.TempDir()},
+		{name: "root unavailable", enabled: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manager := &managerImpl{root: tt.root}
+			manager.enabled.Store(tt.enabled)
+
+			err := manager.Create("pod-a", "share-01", false)
+
+			require.ErrorIs(t, err, ErrRDTUnavailable)
+		})
+	}
+}
+
 func TestManagerImpl_ReconcileClosCleansInactivePodsAndStaleClos(t *testing.T) {
 	t.Parallel()
 	tmpDir, err := os.MkdirTemp("", "resctrl_cleanup_test")
@@ -1000,7 +1021,7 @@ func TestManagerImpl_SkipFilesystemAccessWhenResctrlUnavailable(t *testing.T) {
 			staleClosPath := filepath.Join(testRoot, "stale")
 			assert.NoError(t, os.MkdirAll(staleClosPath, 0o755))
 
-			assert.NoError(t, m.Create("pod", "created", false))
+			assert.ErrorIs(t, m.Create("pod", "created", false), ErrRDTUnavailable)
 			assert.NoError(t, m.ReconcileClos(ClosReconcileState{
 				DisableRDT:      true,
 				ExpectedClosIDs: sets.NewString("expected"),
