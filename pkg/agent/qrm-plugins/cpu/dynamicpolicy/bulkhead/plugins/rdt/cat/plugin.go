@@ -151,7 +151,7 @@ func (p *CATPlugin) reconcile(ctx context.Context, defaultWays int64, overrides 
 	for _, target := range targets {
 		if err := p.rdtManager.ApplyCAT(target.clos, target.mask); err != nil {
 			applyErr := fmt.Errorf("apply CAT for CLOS %q: %w", target.clos, err)
-			rollbackTarget, targetErr := symmetricTarget(capabilities, defaultWays)
+			rollbackTarget, targetErr := catRollbackTarget(capabilities, defaultWays)
 			if targetErr != nil {
 				return false, apierrors.NewAggregate([]error{applyErr, fmt.Errorf("build CAT rollback target: %w", targetErr)})
 			}
