@@ -65,7 +65,10 @@ func NewCPUListPlugin(conf *config.Configuration) bulkheadapi.Plugin {
 	if conf != nil && conf.QRMPluginsConfiguration != nil {
 		resctrlConfig = conf.QRMPluginsConfiguration.ResctrlConfig
 	}
-	return NewCPUListPluginWithManager(resctrlConfig, qrmresctrlmanager.NewCPUListManager())
+	return NewCPUListPluginWithManager(
+		resctrlConfig,
+		qrmresctrlmanager.NewCPUListManager(qrmresctrlmanager.OwnershipCheckpointPath(conf)),
+	)
 }
 
 func NewCPUListPluginWithManager(config *qrmresctrl.ResctrlConfig, manager CPUListManager) *CPUListPlugin {
