@@ -90,7 +90,7 @@ func isPodLevelSubgroupDisabled(group string, enablingGroups sets.String) bool {
 }
 
 func (r *resctrlHinter) hintResourceAllocation(podMeta commonstate.AllocationMeta, resourceAllocation *pluginapi.ResourceAllocation, isAllocate bool) {
-	if r.config == nil || resourceAllocation == nil || !r.config.EnableResctrlHint {
+	if r.config == nil || resourceAllocation == nil || !r.config.EnableResctrlHint || r.isRDTDisabled() {
 		return
 	}
 
@@ -130,6 +130,16 @@ func (r *resctrlHinter) hintResourceAllocation(podMeta commonstate.AllocationMet
 	}
 
 	return
+}
+
+func (r *resctrlHinter) isRDTDisabled() bool {
+	if r == nil || r.dynamicConf == nil {
+		return false
+	}
+	dynamicConfiguration := r.dynamicConf.GetDynamicConfiguration()
+	return dynamicConfiguration != nil &&
+		dynamicConfiguration.QRMPluginConfiguration != nil &&
+		dynamicConfiguration.RDTConfig.DisableRDT
 }
 
 func (r *resctrlHinter) getMonGroupsMaxCount() int64 {
@@ -202,15 +212,8 @@ func (r *resctrlHinter) Run(stopCh <-chan struct{}) {
 }
 
 func (r *resctrlHinter) reconcileClos(activePodUIDs sets.String) {
-	disableRDT := false
-	if r.dynamicConf != nil {
-		if dynamicConfiguration := r.dynamicConf.GetDynamicConfiguration(); dynamicConfiguration != nil &&
-			dynamicConfiguration.QRMPluginConfiguration != nil {
-			disableRDT = dynamicConfiguration.RDTConfig.DisableRDT
-		}
-	}
 	if err := r.manager.ReconcileClos(resctrl.ClosReconcileState{
-		DisableRDT:      disableRDT,
+		DisableRDT:      r.isRDTDisabled(),
 		ExpectedClosIDs: r.expectedClosIDs(),
 		ActivePodUIDs:   activePodUIDs,
 	}); err != nil {
