@@ -40,11 +40,15 @@ import (
 
 type mockResctrlManager struct {
 	count          int64
+	createCalls    int
 	reconcileState resctrl.ClosReconcileState
 }
 
-func (m *mockResctrlManager) Run(stopCh <-chan struct{})                              {}
-func (m *mockResctrlManager) Create(podUID, closID string, createMonGroup bool) error { return nil }
+func (m *mockResctrlManager) Run(stopCh <-chan struct{}) {}
+func (m *mockResctrlManager) Create(podUID, closID string, createMonGroup bool) error {
+	m.createCalls++
+	return nil
+}
 func (m *mockResctrlManager) ReconcileClos(state resctrl.ClosReconcileState) error {
 	m.reconcileState = state
 	return nil
@@ -66,6 +70,37 @@ func TestResctrlHinterReconcileClosUsesDynamicDisableRDT(t *testing.T) {
 		t.Fatal("ReconcileClos DisableRDT = false, want true")
 	}
 	assert.True(t, manager.reconcileState.ActivePodUIDs.Has("pod-a"))
+}
+
+func TestResctrlHinterDisableRDTSynchronouslyGatesHintAndAllocate(t *testing.T) {
+	dynamicConf := dynamicconfig.NewDynamicAgentConfiguration()
+	dynamicConf.GetDynamicConfiguration().RDTConfig.DisableRDT = true
+	manager := &mockResctrlManager{}
+	hinter := &resctrlHinter{
+		config: &qrmresctrl.ResctrlConfig{
+			EnableResctrlHint: true,
+			EnabledQoS:        []string{apiconsts.PodAnnotationQoSLevelSharedCores},
+		},
+		enabledQoS:           sets.NewString(apiconsts.PodAnnotationQoSLevelSharedCores),
+		closidEnablingGroups: sets.NewString(),
+		monGroupsMaxCount:    atomic.NewInt64(0),
+		dynamicConf:          dynamicConf,
+		manager:              manager,
+	}
+	meta := commonstate.AllocationMeta{
+		PodUid:        "pod-a",
+		OwnerPoolName: "share",
+		QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+	}
+
+	for _, allocate := range []bool{false, true} {
+		allocation := &pluginapi.ResourceAllocation{
+			ResourceAllocation: map[string]*pluginapi.ResourceAllocationInfo{},
+		}
+		hinter.hintResourceAllocation(meta, allocation, allocate)
+		require.Empty(t, allocation.ResourceAllocation)
+	}
+	require.Zero(t, manager.createCalls)
 }
 
 func TestResctrlHinterReconcileClosBuildsExpectedClosIDsFromState(t *testing.T) {
