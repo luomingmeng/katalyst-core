@@ -78,6 +78,21 @@ type CgroupClient interface {
 	Prune(activeRels map[string]struct{})
 }
 
+// CgroupIdentity identifies a cgroup directory independently of its path.
+type CgroupIdentity struct {
+	Device uint64
+	Inode  uint64
+}
+
+// ErrCgroupIdentityMismatch indicates that a rel was recreated after proof publication.
+var ErrCgroupIdentityMismatch = errors.New("cgroup identity does not match proof")
+
+// IdentityBoundPIDAttacher is an optional capability for attaching a PID only
+// when rel still names the cgroup directory identified by the supplied proof.
+type IdentityBoundPIDAttacher interface {
+	AttachPIDWithIdentity(ctx context.Context, rel string, identity CgroupIdentity, pid int) error
+}
+
 type coreCgroupClient struct{}
 
 const slowAttachPIDThreshold = 200 * time.Millisecond

@@ -33,8 +33,10 @@ func TestNewCgroupClient_ReturnsCachedClient(t *testing.T) {
 	if c == nil {
 		t.Fatalf("NewCgroupClient() = nil")
 	}
-	if _, ok := c.(*cachedCgroupClient); !ok {
-		t.Fatalf("NewCgroupClient() type = %T, want *cachedCgroupClient", c)
+	switch c.(type) {
+	case *cachedCgroupClient, *identityBoundCachedCgroupClient:
+	default:
+		t.Fatalf("NewCgroupClient() type = %T, want a cached cgroup client", c)
 	}
 }
 
