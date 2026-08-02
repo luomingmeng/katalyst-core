@@ -852,6 +852,7 @@ type writer interface {
 	SetPodEntries(podEntries PodEntries, writeThrough bool)
 	SetAllocationInfo(podUID string, containerName string, allocationInfo *AllocationInfo, persist bool)
 	SetAllowSharedCoresOverlapReclaimedCores(allowSharedCoresOverlapReclaimedCores, persist bool)
+	CommitAdvisorState(podEntries PodEntries, machineState NUMANodeMap, allowSharedCoresOverlapReclaimedCores, persist bool) error
 
 	Delete(podUID string, containerName string, persist bool)
 	ClearState()

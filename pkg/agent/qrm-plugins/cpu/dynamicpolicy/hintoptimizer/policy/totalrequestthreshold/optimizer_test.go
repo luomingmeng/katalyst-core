@@ -90,6 +90,17 @@ func (f *fakeState) SetAllowSharedCoresOverlapReclaimedCores(allowSharedCoresOve
 	f.allowOverlap = allowSharedCoresOverlapReclaimedCores
 }
 
+func (f *fakeState) CommitAdvisorState(
+	podEntries state.PodEntries,
+	machineState state.NUMANodeMap,
+	allowSharedCoresOverlapReclaimedCores, _ bool,
+) error {
+	f.podEntries = podEntries
+	f.machineState = machineState
+	f.allowOverlap = allowSharedCoresOverlapReclaimedCores
+	return nil
+}
+
 func (f *fakeState) Delete(podUID string, containerName string, _ bool) {
 	if f.allocations != nil {
 		delete(f.allocations[podUID], containerName)

@@ -163,6 +163,22 @@ func (s *cpuPluginState) SetAllowSharedCoresOverlapReclaimedCores(allowSharedCor
 	s.allowSharedCoresOverlapReclaimedCores = allowSharedCoresOverlapReclaimedCores
 }
 
+// CommitAdvisorState atomically replaces the state fields produced by one advisor response.
+func (s *cpuPluginState) CommitAdvisorState(
+	podEntries PodEntries,
+	machineState NUMANodeMap,
+	allowSharedCoresOverlapReclaimedCores bool,
+	_ bool,
+) error {
+	s.Lock()
+	defer s.Unlock()
+
+	s.podEntries = podEntries.Clone()
+	s.machineState = machineState.Clone()
+	s.allowSharedCoresOverlapReclaimedCores = allowSharedCoresOverlapReclaimedCores
+	return nil
+}
+
 func (s *cpuPluginState) GetAllowSharedCoresOverlapReclaimedCores() bool {
 	s.RLock()
 	defer s.RUnlock()
