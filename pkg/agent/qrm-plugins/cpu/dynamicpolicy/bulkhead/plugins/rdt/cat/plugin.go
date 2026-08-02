@@ -56,9 +56,19 @@ func NewCATPlugin(conf *config.Configuration) bulkheadapi.Plugin {
 	if conf != nil && conf.QRMPluginsConfiguration != nil {
 		resctrlConfig = conf.QRMPluginsConfiguration.ResctrlConfig
 	}
+	if resctrlConfig == nil {
+		resctrlConfig = qrmresctrl.NewResctrlConfig()
+	} else {
+		configCopy := *resctrlConfig
+		resctrlConfig = &configCopy
+	}
+	resctrlConfig.OwnershipCheckpointPath = qrmresctrlmanager.OwnershipCheckpointPath(conf)
 	return NewCATPluginWithManager(
 		resctrlConfig,
-		newConfiguredClosManager(resctrlConfig, qrmresctrlmanager.NewCPUListManager()),
+		newConfiguredClosManager(
+			resctrlConfig,
+			qrmresctrlmanager.NewCPUListManager(resctrlConfig.OwnershipCheckpointPath),
+		),
 		rdt.NewDefaultManager(),
 		rdt.NewCATCapabilityProvider(),
 	)
