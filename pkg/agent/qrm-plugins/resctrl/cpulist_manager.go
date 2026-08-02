@@ -80,10 +80,6 @@ func newCPUListManager(root string) *cpuListManager {
 	return newCPUListManagerWithOwnership(root, nil, "")
 }
 
-func newCPUListManagerWithResourceUpdater(root string, updater closResourceUpdater) *cpuListManager {
-	return newCPUListManagerWithOwnership(root, updater, "")
-}
-
 func newCPUListManagerWithOwnership(root string, updater closResourceUpdater, checkpointPath string) *cpuListManager {
 	return &cpuListManager{
 		root:      root,

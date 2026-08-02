@@ -485,22 +485,6 @@ func (m *managerImpl) remove(path string) error {
 	return os.RemoveAll(path)
 }
 
-func (m *managerImpl) markLifecycleManagedClosLocked(closID string) error {
-	if m.lifecycleManagedClosIDs == nil {
-		m.lifecycleManagedClosIDs = sets.NewString()
-	}
-	if m.lifecycleManagedClosIDs.Has(closID) {
-		return nil
-	}
-	if m.ownershipCheckpointPath != "" {
-		if err := m.ownershipStore.Register(closID); err != nil {
-			return err
-		}
-	}
-	m.lifecycleManagedClosIDs.Insert(closID)
-	return nil
-}
-
 func (m *managerImpl) unmarkLifecycleManagedClosLocked(closID string) error {
 	if m.lifecycleManagedClosIDs == nil || !m.lifecycleManagedClosIDs.Has(closID) {
 		return nil
