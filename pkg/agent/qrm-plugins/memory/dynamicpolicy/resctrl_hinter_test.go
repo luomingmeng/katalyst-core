@@ -131,6 +131,32 @@ func TestResctrlHinterAllocateDoesNotInjectClosWhenCreateFails(t *testing.T) {
 	require.Empty(t, allocation.ResourceAllocation)
 }
 
+func TestResctrlHinterHintDoesNotInjectClosWhenConfirmationFails(t *testing.T) {
+	manager := &mockResctrlManager{createErr: resctrl.ErrRDTDisabled}
+	hinter := &resctrlHinter{
+		config: &qrmresctrl.ResctrlConfig{
+			EnableResctrlHint: true,
+			EnabledQoS:        []string{apiconsts.PodAnnotationQoSLevelSharedCores},
+		},
+		enabledQoS:           sets.NewString(apiconsts.PodAnnotationQoSLevelSharedCores),
+		closidEnablingGroups: sets.NewString(),
+		monGroupsMaxCount:    atomic.NewInt64(0),
+		manager:              manager,
+	}
+	allocation := &pluginapi.ResourceAllocation{
+		ResourceAllocation: map[string]*pluginapi.ResourceAllocationInfo{},
+	}
+
+	hinter.HintResourceAllocation(commonstate.AllocationMeta{
+		PodUid:        "pod-a",
+		OwnerPoolName: "share",
+		QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+	}, allocation)
+
+	require.Equal(t, 1, manager.createCalls)
+	require.Empty(t, allocation.ResourceAllocation)
+}
+
 func TestResctrlHinterReconcileClosBuildsExpectedClosIDsFromState(t *testing.T) {
 	topology, err := machine.GenerateDummyCPUTopology(4, 1, 1)
 	require.NoError(t, err)

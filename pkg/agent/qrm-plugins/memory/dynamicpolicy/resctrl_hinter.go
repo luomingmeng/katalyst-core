@@ -113,14 +113,12 @@ func (r *resctrlHinter) hintResourceAllocation(podMeta commonstate.AllocationMet
 		needMonGroups = false
 	}
 
-	if isAllocate {
-		if err := r.manager.Create(podMeta.PodUid, resctrlGroup, needMonGroups); err != nil {
-			general.Errorf("mbm: failed to create resctrl group for pod %s/%s: %v", podMeta.PodNamespace, podMeta.PodName, err)
-			return
-		}
+	if err := r.manager.Create(podMeta.PodUid, resctrlGroup, isAllocate && needMonGroups); err != nil {
+		general.Errorf("mbm: failed to confirm resctrl group for pod %s/%s: %v", podMeta.PodNamespace, podMeta.PodName, err)
+		return
 	}
 
-	// Allocate must establish the CLOS before publishing it to kubelet. In
+	// Hint and Allocate must establish the CLOS before publishing it to kubelet. In
 	// particular, a DisableRDT true->false transition may still be pending in
 	// the manager even though the latest dynamic configuration is enabled.
 	if r.enabledQoS.Has(podMeta.QoSLevel) {
