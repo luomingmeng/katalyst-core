@@ -173,6 +173,28 @@ func TestCATPluginPartialFailureRollsBackEveryManagedClos(t *testing.T) {
 	}, manager.writes)
 }
 
+func TestCATPluginPartialFailureWithZeroDefaultRollsBackCapabilityBaseline(t *testing.T) {
+	manager := &fakeRDTManager{failClos: "share-03", failOnce: true}
+	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{
+		clos: []qrmresctrlmanager.CPUListClos{{ID: "dedicated"}, {ID: "share-03"}},
+	}, manager, fakeCapabilityProvider{capabilities: map[int]rdt.CATCapability{
+		0: {CBMMask: 0xff, MinCBMBits: 1},
+	}})
+
+	_, err := plugin.reconcile(context.Background(), 0, map[string]int64{
+		"dedicated": 4,
+		"share-03":  4,
+	})
+
+	require.ErrorContains(t, err, "apply CAT")
+	require.Equal(t, []catWrite{
+		{clos: "dedicated", mask: map[int]uint64{0: 0x0f}},
+		{clos: "share-03", mask: map[int]uint64{0: 0x0f}},
+		{clos: "dedicated", mask: map[int]uint64{0: 0xff}},
+		{clos: "share-03", mask: map[int]uint64{0: 0xff}},
+	}, manager.writes)
+}
+
 func TestCATPluginRestartedDisabledStateIdempotentlyRollsBack(t *testing.T) {
 	manager := &fakeRDTManager{}
 	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{
