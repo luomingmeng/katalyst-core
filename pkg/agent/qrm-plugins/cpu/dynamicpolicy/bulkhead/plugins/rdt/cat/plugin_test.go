@@ -192,6 +192,22 @@ func TestCATPluginRestartedDisabledStateIdempotentlyRollsBack(t *testing.T) {
 	}, manager.writes)
 }
 
+func TestCATPluginRestartedDisabledWithZeroDefaultRestoresCapabilityBaseline(t *testing.T) {
+	manager := &fakeRDTManager{}
+	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{
+		clos: []qrmresctrlmanager.CPUListClos{{ID: "dedicated"}},
+	}, manager, fakeCapabilityProvider{capabilities: map[int]rdt.CATCapability{
+		0: {CBMMask: 0xf0, MinCBMBits: 2},
+		1: {CBMMask: 0x0f, MinCBMBits: 2},
+	}})
+	conf := dynamicconfig.NewConfiguration()
+
+	require.NoError(t, plugin.PeriodicalHandler(context.Background(), periodicalContext(conf)))
+	require.Equal(t, []catWrite{
+		{clos: "dedicated", mask: map[int]uint64{0: 0xf0, 1: 0x0f}},
+	}, manager.writes)
+}
+
 func TestCATPluginDisabledByTopLevelDisableRDT(t *testing.T) {
 	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{}, &fakeRDTManager{},
 		fakeCapabilityProvider{capabilities: map[int]rdt.CATCapability{
@@ -208,7 +224,7 @@ func TestCATPluginDisabledByTopLevelDisableRDT(t *testing.T) {
 func TestCATPluginDisabledWithoutPriorTakeoverIsNoop(t *testing.T) {
 	manager := &fakeRDTManager{}
 	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{}, manager,
-		fakeCapabilityProvider{err: errors.New("RDT CAT is unsupported")})
+		fakeCapabilityProvider{err: rdt.ErrCATUnsupported})
 
 	conf := dynamicconfig.NewConfiguration()
 
