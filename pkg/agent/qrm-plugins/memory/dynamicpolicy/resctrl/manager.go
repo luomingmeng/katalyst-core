@@ -152,12 +152,15 @@ func (m *managerImpl) ReconcileClos(state ClosReconcileState) error {
 	if m.ownershipLoadErr != nil {
 		return m.ownershipLoadErr
 	}
-	if err := m.refreshOwnershipLocked(); err != nil {
-		return err
-	}
 	m.disableRDT = state.DisableRDT
 	if !m.enabled.Load() || m.root == "" {
 		return nil
+	}
+	if err := m.recoverPendingDeletesLocked(); err != nil {
+		return err
+	}
+	if err := m.refreshOwnershipLocked(); err != nil {
+		return err
 	}
 
 	entries, err := os.ReadDir(m.root)
@@ -317,19 +320,52 @@ func (m *managerImpl) isClosEmptyLocked(path string) bool {
 func (m *managerImpl) removeClosLocked(closID, path string) error {
 	return m.runClosLifecycleLocked(closID, func() (bool, error) {
 		wasManaged := m.lifecycleManagedClosIDs.Has(closID)
-		if wasManaged {
-			if err := m.unmarkLifecycleManagedClosLocked(closID); err != nil {
+		if wasManaged && m.ownershipCheckpointPath != "" {
+			if err := m.ownershipStore.BeginDelete(closID); err != nil {
 				return false, err
 			}
 		}
 		if err := m.remove(path); err != nil {
-			if wasManaged {
-				_ = m.markLifecycleManagedClosLocked(closID)
-			}
 			return false, err
+		}
+		if wasManaged {
+			if m.ownershipCheckpointPath != "" {
+				if err := m.ownershipStore.FinishDelete(closID); err != nil {
+					return false, err
+				}
+				m.lifecycleManagedClosIDs.Delete(closID)
+			} else if err := m.unmarkLifecycleManagedClosLocked(closID); err != nil {
+				return false, err
+			}
 		}
 		return true, nil
 	})
+}
+
+func (m *managerImpl) recoverPendingDeletesLocked() error {
+	if m.ownershipCheckpointPath == "" {
+		return nil
+	}
+	pending, err := m.ownershipStore.PendingDeletes()
+	if err != nil {
+		return err
+	}
+	for closID := range pending {
+		path := filepath.Join(m.root, closID)
+		if err := m.runClosLifecycleLocked(closID, func() (bool, error) {
+			if err := m.remove(path); err != nil {
+				return false, err
+			}
+			if err := m.ownershipStore.FinishDelete(closID); err != nil {
+				return false, err
+			}
+			m.lifecycleManagedClosIDs.Delete(closID)
+			return true, nil
+		}); err != nil {
+			return fmt.Errorf("recover pending deletion of CLOS %q: %w", closID, err)
+		}
+	}
+	return nil
 }
 
 func (m *managerImpl) remove(path string) error {

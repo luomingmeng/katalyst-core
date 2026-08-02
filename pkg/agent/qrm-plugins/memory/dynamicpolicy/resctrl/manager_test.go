@@ -815,6 +815,30 @@ func TestManagerRefreshesOwnershipRegisteredByCPUList(t *testing.T) {
 	require.NoDirExists(t, filepath.Join(root, "dedicated"))
 }
 
+func TestManagerRecoversPendingClosDeletionAfterRestart(t *testing.T) {
+	root := t.TempDir()
+	checkpointPath := filepath.Join(t.TempDir(), "resctrl-clos-ownership.json")
+	store := qrmresctrlmanager.NewClosOwnershipStore(checkpointPath)
+	require.NoError(t, store.Register("dedicated"))
+	require.NoError(t, store.BeginDelete("dedicated"))
+	require.NoError(t, os.Mkdir(filepath.Join(root, "dedicated"), 0o755))
+
+	restarted := NewManager(&qrmresctrl.ResctrlConfig{
+		OwnershipCheckpointPath: checkpointPath,
+	}).(*managerImpl)
+	restarted.root = root
+	restarted.enabled.Store(true)
+
+	require.NoError(t, restarted.ReconcileClos(ClosReconcileState{}))
+	require.NoDirExists(t, filepath.Join(root, "dedicated"))
+	owned, err := store.Load()
+	require.NoError(t, err)
+	require.False(t, owned.Has("dedicated"))
+	pending, err := store.PendingDeletes()
+	require.NoError(t, err)
+	require.False(t, pending.Has("dedicated"))
+}
+
 func TestManagerDisableRDTPreservesExternalClosEvenWithManagedName(t *testing.T) {
 	root := t.TempDir()
 	for _, closID := range []string{"dedicated", "external"} {
