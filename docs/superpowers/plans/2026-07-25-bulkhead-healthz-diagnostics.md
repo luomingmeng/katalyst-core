@@ -102,4 +102,3 @@ NODE_CHECK_RETRIES=18 RUN_TAG=<new-tag> PREFIX=<new-prefix> ROUNDS=5 \
 
 - [ ] On healthz timeout, preserve emitted evidence and perform state-drain-aware final reset.
 - [ ] Package logs, run `tar -tzf`, compare local SHA with remote `REMOTE_LOG_SHA`, and report pass only if all five rounds and final reset return zero.
-
