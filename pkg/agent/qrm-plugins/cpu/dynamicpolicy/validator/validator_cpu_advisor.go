@@ -32,11 +32,11 @@ import (
 type cpuAdvisorValidationFunc func(resp *advisorapi.ListAndWatchResponse) error
 
 type CPUAdvisorValidator struct {
-	state       state.State
+	state       state.ReadonlyState
 	machineInfo *machine.KatalystMachineInfo
 }
 
-func NewCPUAdvisorValidator(state state.State, machineInfo *machine.KatalystMachineInfo) *CPUAdvisorValidator {
+func NewCPUAdvisorValidator(state state.ReadonlyState, machineInfo *machine.KatalystMachineInfo) *CPUAdvisorValidator {
 	return &CPUAdvisorValidator{
 		state:       state,
 		machineInfo: machineInfo,

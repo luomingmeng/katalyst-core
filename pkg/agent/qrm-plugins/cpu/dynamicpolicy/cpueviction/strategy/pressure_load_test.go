@@ -394,7 +394,7 @@ func TestThresholdMet(t *testing.T) {
 
 		for entryName, entries := range tt.podEntries {
 			for subEntryName, entry := range entries {
-				stateImpl.SetAllocationInfo(entryName, subEntryName, entry, true)
+				setAllocationInfoForTest(t, stateImpl, entryName, subEntryName, entry)
 
 				if entries.IsPoolEntry() {
 					continue
@@ -768,7 +768,7 @@ func TestGetTopEvictionPods(t *testing.T) {
 
 		for entryName, entries := range tt.podEntries {
 			for subEntryName, entry := range entries {
-				stateImpl.SetAllocationInfo(entryName, subEntryName, entry, true)
+				setAllocationInfoForTest(t, stateImpl, entryName, subEntryName, entry)
 
 				if entries.IsPoolEntry() {
 					continue
@@ -1638,7 +1638,7 @@ func TestCPUPressureLoadEviction_collectMetrics(t *testing.T) {
 			now := time.Now()
 			for entryName, entries := range tt.podEntries {
 				for subEntryName, entry := range entries {
-					stateImpl.SetAllocationInfo(entryName, subEntryName, entry, true)
+					setAllocationInfoForTest(t, stateImpl, entryName, subEntryName, entry)
 
 					if entries.IsPoolEntry() {
 						continue

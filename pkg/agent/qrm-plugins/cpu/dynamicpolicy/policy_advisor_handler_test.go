@@ -25,11 +25,13 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bytedance/mockey"
 	"github.com/smartystreets/goconvey/convey"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 	v1 "k8s.io/api/core/v1"
 	resource2 "k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,9 +41,11 @@ import (
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/advisorsvc"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpusetmaterializer"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/planner"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
-	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/statedirectory"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
@@ -51,11 +55,484 @@ import (
 	cgroupclient "github.com/kubewharf/katalyst-core/pkg/util/cgroup/client"
 	"github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 	cgroupmgr "github.com/kubewharf/katalyst-core/pkg/util/cgroup/manager"
+	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	"github.com/kubewharf/katalyst-core/pkg/util/native"
 )
 
 var advisorTestMutex = &sync.Mutex{}
+
+type blockingGetAdviceClient struct {
+	advisorapi.CPUAdvisorClient
+	entered chan struct{}
+	release chan struct{}
+}
+
+type deadlineRecordingGetAdviceClient struct {
+	advisorapi.CPUAdvisorClient
+	contextErr error
+	deadline   time.Time
+}
+
+type staticFeatureGateManager struct {
+	gates map[string]*advisorsvc.FeatureGate
+}
+
+func (m staticFeatureGateManager) GetWantedFeatureGates(string) (map[string]*advisorsvc.FeatureGate, error) {
+	return m.gates, nil
+}
+
+func (c *deadlineRecordingGetAdviceClient) GetAdvice(
+	ctx context.Context,
+	_ *advisorapi.GetAdviceRequest,
+	_ ...grpc.CallOption,
+) (*advisorapi.GetAdviceResponse, error) {
+	c.contextErr = ctx.Err()
+	c.deadline, _ = ctx.Deadline()
+	return nil, errors.New("advisor failed")
+}
+
+func (c *blockingGetAdviceClient) GetAdvice(
+	context.Context,
+	*advisorapi.GetAdviceRequest,
+	...grpc.CallOption,
+) (*advisorapi.GetAdviceResponse, error) {
+	close(c.entered)
+	<-c.release
+	return nil, errors.New("advisor failed")
+}
+
+func TestDynamicPolicy_getAdviceDoesNotHoldTransactionLockDuringRPC(t *testing.T) {
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+
+	client := &blockingGetAdviceClient{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	policy.advisorClient = client
+
+	adviceDone := make(chan error, 1)
+	go func() {
+		_, adviceErr := policy.getAdviceFromAdvisor(context.Background())
+		adviceDone <- adviceErr
+	}()
+	<-client.entered
+
+	mutationDone := make(chan error, 1)
+	go func() {
+		mutationDone <- policy.transact(context.Background(), func(base *state.TargetState) (*state.TargetState, error) {
+			return base, nil
+		})
+	}()
+
+	select {
+	case err := <-mutationDone:
+		require.NoError(t, err)
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("mutation blocked behind advisor RPC")
+	}
+
+	close(client.release)
+	require.ErrorContains(t, <-adviceDone, "advisor failed")
+}
+
+func TestDynamicPolicy_getAdviceUsesIndependentBoundedRPCContext(t *testing.T) {
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	client := &deadlineRecordingGetAdviceClient{}
+	policy.advisorClient = client
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = policy.getAdviceFromAdvisor(requestCtx)
+
+	require.ErrorContains(t, err, "advisor failed")
+	require.NoError(t, client.contextErr)
+	require.False(t, client.deadline.IsZero())
+	remaining := time.Until(client.deadline)
+	require.Positive(t, remaining)
+	require.LessOrEqual(t, remaining, cpuAdvisorRPCTimeout)
+}
+
+func TestNormalizedGetAdviceRequestHashIsDeterministic(t *testing.T) {
+	requestA := &advisorapi.GetAdviceRequest{
+		Entries: map[string]*advisorapi.ContainerAllocationInfoEntries{
+			"pod-b": {Entries: map[string]*advisorapi.ContainerAllocationInfo{
+				"sidecar": {Metadata: &advisorsvc.ContainerMetadata{PodUid: "pod-b", ContainerName: "sidecar"}},
+			}},
+			"pod-a": {Entries: map[string]*advisorapi.ContainerAllocationInfo{
+				"main": {Metadata: &advisorsvc.ContainerMetadata{
+					PodUid: "pod-a", ContainerName: "main",
+					Labels: map[string]string{"z": "last", "a": "first"},
+				}},
+			}},
+		},
+		WantedFeatureGates: map[string]*advisorsvc.FeatureGate{
+			"gate-b": {Name: "gate-b"},
+			"gate-a": {Name: "gate-a"},
+		},
+	}
+	requestB := &advisorapi.GetAdviceRequest{
+		Entries: map[string]*advisorapi.ContainerAllocationInfoEntries{
+			"pod-a": {Entries: map[string]*advisorapi.ContainerAllocationInfo{
+				"main": {Metadata: &advisorsvc.ContainerMetadata{
+					PodUid: "pod-a", ContainerName: "main",
+					Labels: map[string]string{"a": "first", "z": "last"},
+				}},
+			}},
+			"pod-b": {Entries: map[string]*advisorapi.ContainerAllocationInfo{
+				"sidecar": {Metadata: &advisorsvc.ContainerMetadata{PodUid: "pod-b", ContainerName: "sidecar"}},
+			}},
+		},
+		WantedFeatureGates: map[string]*advisorsvc.FeatureGate{
+			"gate-a": {Name: "gate-a"},
+			"gate-b": {Name: "gate-b"},
+		},
+	}
+
+	hashA, err := normalizedGetAdviceRequestHash(requestA)
+	require.NoError(t, err)
+	hashB, err := normalizedGetAdviceRequestHash(requestB)
+	require.NoError(t, err)
+	require.Equal(t, hashA, hashB)
+}
+
+func TestDynamicPolicy_createGetAdviceRequestForTargetStaysBoundToOwnedBase(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	tmpDir, err := os.MkdirTemp("", "checkpoint-TestDynamicPolicy_validateGetAdviceRequestSnapshotRejectsStaleState")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
+	require.NoError(t, err)
+
+	base, err := policy.state.PrepareDurableTarget()
+	require.NoError(t, err)
+	req, err := policy.createGetAdviceRequestForTarget(base)
+	require.NoError(t, err)
+
+	allocationResult := machine.NewCPUSet(0, 1)
+	setAllocationInfoForTest(t, policy.state, "stale-pod", "main", &state.AllocationInfo{
+		AllocationMeta: commonstate.GenerateGenericContainerAllocationMeta(&pluginapi.ResourceRequest{
+			PodUid:         "stale-pod",
+			PodNamespace:   "default",
+			PodName:        "stale-pod",
+			ContainerName:  "main",
+			ContainerType:  pluginapi.ContainerType_MAIN,
+			ContainerIndex: 0,
+			Labels: map[string]string{
+				apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelSharedCores,
+			},
+			Annotations: map[string]string{
+				apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelSharedCores,
+			},
+		}, commonstate.EmptyOwnerPoolName, apiconsts.PodAnnotationQoSLevelSharedCores),
+		AllocationResult:         allocationResult,
+		OriginalAllocationResult: allocationResult.Clone(),
+	}, false)
+
+	currentReq, err := policy.createGetAdviceRequestForTarget(base)
+	require.NoError(t, err)
+	require.Equal(t, req, currentReq)
+	require.NotContains(t, currentReq.Entries, "stale-pod")
+}
+
+func TestDynamicPolicy_createGetAdviceRequestReportsStableAfterTransitionWhenHardPartitionEnabled(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	tmpDir, err := os.MkdirTemp("", "checkpoint-TestDynamicPolicy_createGetAdviceRequestReportsStableAfterTransitionWhenHardPartitionEnabled")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
+	require.NoError(t, err)
+	policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	policy.transitionPeriod = time.Millisecond
+
+	allocationResult := machine.NewCPUSet(0, 1)
+	setAllocationInfoForTest(t, policy.state, "expired-ramp-up-pod", "main", &state.AllocationInfo{
+		AllocationMeta: commonstate.GenerateGenericContainerAllocationMeta(&pluginapi.ResourceRequest{
+			PodUid:         "expired-ramp-up-pod",
+			PodNamespace:   "default",
+			PodName:        "expired-ramp-up-pod",
+			ContainerName:  "main",
+			ContainerType:  pluginapi.ContainerType_MAIN,
+			ContainerIndex: 0,
+			Labels: map[string]string{
+				apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelSharedCores,
+			},
+			Annotations: map[string]string{
+				apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelSharedCores,
+			},
+		}, commonstate.EmptyOwnerPoolName, apiconsts.PodAnnotationQoSLevelSharedCores),
+		RampUp:                   true,
+		InitTimestamp:            time.Now().Add(-time.Hour).Format(util.QRMTimeFormat),
+		AllocationResult:         allocationResult,
+		OriginalAllocationResult: allocationResult.Clone(),
+	}, false)
+
+	base, err := policy.state.PrepareDurableTarget()
+	require.NoError(t, err)
+	req, err := policy.createGetAdviceRequestForTarget(base)
+	require.NoError(t, err)
+	require.False(t, req.Entries["expired-ramp-up-pod"].Entries["main"].AllocationInfo.RampUp)
+
+	allocationInfo := policy.state.GetAllocationInfo("expired-ramp-up-pod", "main")
+	require.NotNil(t, allocationInfo)
+	require.True(t, allocationInfo.RampUp)
+}
+
+func TestDynamicPolicyAdviceSnapshotRejectsSupersededAdvisorToken(t *testing.T) {
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+
+	_, _, pending, err := policy.prepareGetAdviceRequest()
+	require.NoError(t, err)
+	_, _, newer, err := policy.prepareGetAdviceRequest()
+	require.NoError(t, err)
+	require.Greater(t, newer.Token, pending.Token)
+
+	planCalled := false
+	err = policy.transactIfAdviceFresh(context.Background(), pending, func(base *state.TargetState) (*state.TargetState, error) {
+		planCalled = true
+		return base, nil
+	})
+	require.ErrorContains(t, err, "advice freshness token mismatch")
+	require.False(t, planCalled)
+}
+
+func TestDynamicPolicyAdviceSnapshotRejectsRequestConfigChange(t *testing.T) {
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	policy.featureGateManager = staticFeatureGateManager{gates: map[string]*advisorsvc.FeatureGate{
+		"before": {Name: "before"},
+	}}
+
+	_, _, pending, err := policy.prepareGetAdviceRequest()
+	require.NoError(t, err)
+	policy.featureGateManager = staticFeatureGateManager{gates: map[string]*advisorsvc.FeatureGate{
+		"after": {Name: "after"},
+	}}
+
+	planCalled := false
+	err = policy.transactIfAdviceFresh(context.Background(), pending, func(base *state.TargetState) (*state.TargetState, error) {
+		planCalled = true
+		return base, nil
+	})
+	require.ErrorContains(t, err, "advice freshness normalized request hash mismatch")
+	require.False(t, planCalled)
+}
+
+func TestDynamicPolicyAdviceSnapshotRejectsRampUpDeadlineCrossing(t *testing.T) {
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	policy.transitionPeriod = 80 * time.Millisecond
+
+	allocationResult := machine.NewCPUSet(0, 1)
+	setAllocationInfoForTest(t, policy.state, "deadline-pod", "main", &state.AllocationInfo{
+		AllocationMeta: commonstate.GenerateGenericContainerAllocationMeta(&pluginapi.ResourceRequest{
+			PodUid:        "deadline-pod",
+			PodNamespace:  "default",
+			PodName:       "deadline-pod",
+			ContainerName: "main",
+			ContainerType: pluginapi.ContainerType_MAIN,
+			Labels: map[string]string{
+				apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelSharedCores,
+			},
+			Annotations: map[string]string{
+				apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelSharedCores,
+			},
+		}, commonstate.EmptyOwnerPoolName, apiconsts.PodAnnotationQoSLevelSharedCores),
+		RampUp:                   true,
+		InitTimestamp:            time.Now().Format(util.QRMTimeFormat),
+		AllocationResult:         allocationResult,
+		OriginalAllocationResult: allocationResult.Clone(),
+	}, false)
+
+	_, request, pending, err := policy.prepareGetAdviceRequest()
+	require.NoError(t, err)
+	require.True(t, request.Entries["deadline-pod"].Entries["main"].AllocationInfo.RampUp)
+	time.Sleep(100 * time.Millisecond)
+
+	planCalled := false
+	err = policy.transactIfAdviceFresh(context.Background(), pending, func(base *state.TargetState) (*state.TargetState, error) {
+		planCalled = true
+		return base, nil
+	})
+	require.ErrorContains(t, err, "advice freshness normalized request hash mismatch")
+	require.False(t, planCalled)
+}
+
+func TestDynamicPolicyAdviceSnapshotRejectsABACommits(t *testing.T) {
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+
+	_, originalRequest, pending, err := policy.prepareGetAdviceRequest()
+	require.NoError(t, err)
+	require.NoError(t, policy.transact(context.Background(), func(base *state.TargetState) (*state.TargetState, error) {
+		base.AllowSharedCoresOverlapReclaimedCores = true
+		return base, nil
+	}))
+	require.NoError(t, policy.transact(context.Background(), func(base *state.TargetState) (*state.TargetState, error) {
+		base.AllowSharedCoresOverlapReclaimedCores = false
+		return base, nil
+	}))
+	_, currentRequest, err := policy.prepareCurrentGetAdviceRequest()
+	require.NoError(t, err)
+	require.Equal(t, originalRequest, currentRequest, "A→B→A must restore the same normalized request")
+
+	planCalled := false
+	err = policy.transactIfAdviceFresh(context.Background(), pending, func(base *state.TargetState) (*state.TargetState, error) {
+		planCalled = true
+		return base, nil
+	})
+	require.ErrorContains(t, err, "advice freshness in-memory revision mismatch")
+	require.False(t, planCalled)
+}
+
+func TestHasRampUpInGetAdviceRequest(t *testing.T) {
+	t.Parallel()
+
+	require.False(t, hasRampUpInGetAdviceRequest(nil))
+	require.False(t, hasRampUpInGetAdviceRequest(&advisorapi.GetAdviceRequest{
+		Entries: map[string]*advisorapi.ContainerAllocationInfoEntries{
+			"pod": {Entries: map[string]*advisorapi.ContainerAllocationInfo{
+				"container": {AllocationInfo: &advisorapi.AllocationInfo{RampUp: false}},
+			}},
+		},
+	}))
+	require.True(t, hasRampUpInGetAdviceRequest(&advisorapi.GetAdviceRequest{
+		Entries: map[string]*advisorapi.ContainerAllocationInfoEntries{
+			"pod": {Entries: map[string]*advisorapi.ContainerAllocationInfo{
+				"container": {AllocationInfo: &advisorapi.AllocationInfo{RampUp: true}},
+			}},
+		},
+	}))
+}
+
+func TestDynamicPolicy_allocateByCPUAdvisorRejectsListAndWatchWhenHardPartitionEnabled(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	tmpDir, err := os.MkdirTemp("", "checkpoint-TestDynamicPolicy_allocateByCPUAdvisorRejectsListAndWatchWhenHardPartitionEnabled")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
+	require.NoError(t, err)
+	policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+
+	err = policy.allocateByCPUAdvisor(nil, &advisorapi.ListAndWatchResponse{}, map[string]*advisorsvc.FeatureGate{})
+	require.ErrorContains(t, err, "legacy ListAndWatch response is not allowed")
+}
+
+func TestDynamicPolicyApplyBlocksUsesGetAdviceRampUpSnapshotForExpiredSharedCores(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	policy.transitionPeriod = time.Millisecond
+
+	rampUpCPUSet := machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)
+	entries := policy.state.GetPodEntries()
+	entries["expired-ramp-up-pod"] = state.ContainerEntries{
+		"main": {
+			RequestQuantity: 1,
+			AllocationMeta: commonstate.GenerateGenericContainerAllocationMeta(&pluginapi.ResourceRequest{
+				PodUid:         "expired-ramp-up-pod",
+				PodNamespace:   "default",
+				PodName:        "expired-ramp-up-pod",
+				ContainerName:  "main",
+				ContainerType:  pluginapi.ContainerType_MAIN,
+				ContainerIndex: 0,
+				Labels: map[string]string{
+					apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelSharedCores,
+				},
+				Annotations: map[string]string{
+					apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelSharedCores,
+				},
+			}, commonstate.EmptyOwnerPoolName, apiconsts.PodAnnotationQoSLevelSharedCores),
+			RampUp:                           true,
+			InitTimestamp:                    time.Now().Add(-time.Hour).Format(util.QRMTimeFormat),
+			AllocationResult:                 rampUpCPUSet,
+			OriginalAllocationResult:         rampUpCPUSet.Clone(),
+			TopologyAwareAssignments:         map[int]machine.CPUSet{0: rampUpCPUSet.Clone()},
+			OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: rampUpCPUSet.Clone()},
+		},
+	}
+	setPodEntriesForTest(t, policy.state, entries, false)
+	machineState, err := state.GenerateMachineStateFromPodEntries(cpuTopology, entries, policy.state.GetMachineState())
+	require.NoError(t, err)
+	setMachineStateForTest(t, policy.state, machineState, false)
+	setAdvisorCgroupTargetTestPods(policy, entries)
+
+	base, err := policy.state.PrepareDurableTarget()
+	require.NoError(t, err)
+	req, err := policy.createGetAdviceRequestForTarget(base)
+	require.NoError(t, err)
+	require.False(t, req.Entries["expired-ramp-up-pod"].Entries["main"].AllocationInfo.RampUp)
+	require.True(t, policy.state.GetAllocationInfo("expired-ramp-up-pod", "main").RampUp)
+
+	resp := &advisorapi.ListAndWatchResponse{
+		Entries: map[string]*advisorapi.CalculationEntries{
+			commonstate.PoolNameShare: {Entries: map[string]*advisorapi.CalculationInfo{
+				commonstate.FakedContainerName: {
+					OwnerPoolName: commonstate.PoolNameShare,
+					CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+						commonstate.FakedNUMAID: {Blocks: []*advisorapi.Block{{BlockId: "share-block", Result: 2}}},
+					},
+				},
+			}},
+			commonstate.PoolNameReclaim: {Entries: map[string]*advisorapi.CalculationInfo{
+				commonstate.FakedContainerName: {
+					OwnerPoolName: commonstate.PoolNameReclaim,
+					CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+						commonstate.FakedNUMAID: {Blocks: []*advisorapi.Block{{BlockId: "reclaim-block", Result: 2}}},
+					},
+				},
+			}},
+			"expired-ramp-up-pod": {Entries: map[string]*advisorapi.CalculationInfo{
+				"main": {
+					OwnerPoolName: commonstate.PoolNameShare,
+				},
+			}},
+		},
+	}
+	blocks := advisorapi.BlockCPUSet{
+		"share-block":   machine.NewCPUSet(2, 3),
+		"reclaim-block": machine.NewCPUSet(4, 5),
+	}
+
+	require.NoError(t, policy.applyBlocks(blocks, resp, req))
+	committed := policy.state.GetAllocationInfo("expired-ramp-up-pod", "main")
+	require.NotNil(t, committed)
+	require.False(t, committed.RampUp)
+	require.Equal(t, commonstate.PoolNameShare, committed.OwnerPoolName)
+	require.True(t, committed.AllocationResult.Equals(machine.NewCPUSet(2, 3)))
+}
 
 func TestDynamicPolicy_checkAndApplyIfCgroupV1(t *testing.T) {
 	t.Parallel()
@@ -123,7 +600,7 @@ func TestDynamicPolicy_checkAndApplyIfCgroupV1(t *testing.T) {
 		mockey.Mock((*DynamicPolicy).getPodAndRelativePath).IncludeCurrentGoRoutine().Return(mockPod, "test_relative_path", nil).Build()
 		mockey.Mock((*DynamicPolicy).checkAndApplyAllPodsQuota).IncludeCurrentGoRoutine().Return(nil).Build()
 
-		err := p.checkAndApplyIfCgroupV1(mockCal, resources)
+		err := p.checkAndApplyIfCgroupV1(context.Background(), mockCal, resources)
 		convey.So(err, convey.ShouldBeNil)
 	})
 
@@ -134,7 +611,7 @@ func TestDynamicPolicy_checkAndApplyIfCgroupV1(t *testing.T) {
 		mockey.Mock((*DynamicPolicy).getPodAndRelativePath).IncludeCurrentGoRoutine().Return(mockPod, "test_relative_path", nil).Build()
 		mockey.Mock((*DynamicPolicy).checkAndApplyAllPodsQuota).IncludeCurrentGoRoutine().Return(nil).Build()
 
-		err := p.checkAndApplyIfCgroupV1(mockCal, resources)
+		err := p.checkAndApplyIfCgroupV1(context.Background(), mockCal, resources)
 		convey.So(err, convey.ShouldBeNil)
 	})
 }
@@ -149,14 +626,17 @@ func TestDynamicPolicy_getAllDirs(t *testing.T) {
 
 		advisorTestMutex.Lock()
 		defer advisorTestMutex.Unlock()
-		_ = mockey.Mock(os.ReadDir).IncludeCurrentGoRoutine().To(func(dirname string) ([]os.DirEntry, error) {
+		readDirMock := mockey.Mock(os.ReadDir).IncludeCurrentGoRoutine().To(func(dirname string) ([]os.DirEntry, error) {
 			return []os.DirEntry{
 				mockDirEntry{"foo", true},
 				mockDirEntry{"bar", true},
 			}, nil
 		}).Build()
+		t.Cleanup(func() {
+			readDirMock.UnPatch()
+		})
 
-		dirs, err := policy.getAllDirs("/fake/path")
+		dirs, err := policy.getAllDirs(context.Background(), "/fake/path")
 		assert.NoError(t, err)
 		assert.ElementsMatch(t, dirs, []string{"foo", "bar"})
 	})
@@ -206,7 +686,7 @@ func TestDynamic_getCurrentPathAllPodsDirAndMap(t *testing.T) {
 			},
 		}
 
-		resultMap, dirs, err := p.getCurrentPathAllPodsDirAndMap("test_group_path")
+		resultMap, dirs, err := p.getCurrentPathAllPodsDirAndMap(context.Background(), "test_group_path")
 		convey.So(err, convey.ShouldBeNil)
 		convey.So(resultMap, convey.ShouldNotBeNil)
 		convey.So(dirs, convey.ShouldNotBeNil)
@@ -286,7 +766,7 @@ func TestDynamicPolicy_getAllPodsPathMap(t *testing.T) {
 		mockey.Mock((*pod.PodFetcherStub).GetPodList).IncludeCurrentGoRoutine().Return(mockPods, nil).Build()
 		mockey.Mock(common.GetPodAbsCgroupPath).IncludeCurrentGoRoutine().Return("test-pod-1-path", nil).Build()
 
-		podPathMap, err := p.getAllPodsPathMap()
+		podPathMap, err := p.getAllPodsPathMap(context.Background())
 
 		convey.So(err, convey.ShouldBeNil)
 		convey.So(len(podPathMap), convey.ShouldEqual, len(mockPods))
@@ -326,7 +806,8 @@ func TestDynamicPolicy_getAllContainersRelativePathMap(t *testing.T) {
 		mockey.Mock(native.GetContainerID).IncludeCurrentGoRoutine().Return("test-container-ID", nil).Build()
 		mockey.Mock(common.GetContainerRelativeCgroupPath).IncludeCurrentGoRoutine().Return("test-container-relative-path", nil).Build()
 
-		testMap := p.getAllContainersRelativePathMap(mockPod)
+		testMap, err := p.getAllContainersRelativePathMap(context.Background(), mockPod)
+		convey.So(err, convey.ShouldBeNil)
 
 		convey.So(len(testMap), convey.ShouldEqual, 1)
 		convey.So(testMap["test-container-relative-path"].Name, convey.ShouldEqual, mockPod.Spec.Containers[0].Name)
@@ -412,26 +893,26 @@ func TestDynamicPolicy_checkAllPodsQuota(t *testing.T) {
 		mockey.Mock(cgroupmgr.ApplyCPUWithRelativePath).IncludeCurrentGoRoutine().Return(nil).Build()
 		mockey.Mock(cgroupmgr.GetCPUWithRelativePath).IncludeCurrentGoRoutine().Return(mockBG, nil).Build()
 
-		err := p.checkAndApplyAllPodsQuota(mockCal, mockBG.CpuQuota)
+		err := p.checkAndApplyAllPodsQuota(context.Background(), mockCal, mockBG.CpuQuota)
 		convey.So(err, convey.ShouldBeNil)
 
-		err = p.checkAndApplyAllPodsQuota(mockCal, mockBG2.CpuQuota)
+		err = p.checkAndApplyAllPodsQuota(context.Background(), mockCal, mockBG2.CpuQuota)
 		convey.So(err, convey.ShouldBeNil)
 
-		err = p.checkAndApplyAllPodsQuota(mockCal, mockBG3.CpuQuota)
+		err = p.checkAndApplyAllPodsQuota(context.Background(), mockCal, mockBG3.CpuQuota)
 		convey.So(err, convey.ShouldBeNil)
 	})
 
 	mockey.PatchConvey("test checkAndApplyAllPodsQuota", t, func() {
 		mockey.Mock((*DynamicPolicy).getCurrentPathAllPodsDirAndMap).IncludeCurrentGoRoutine().Return(nil, nil, mockErr).Build()
-		err := p.checkAndApplyAllPodsQuota(mockCal, mockBG.CpuQuota)
+		err := p.checkAndApplyAllPodsQuota(context.Background(), mockCal, mockBG.CpuQuota)
 		convey.So(err, convey.ShouldNotBeNil)
 	})
 
 	mockey.PatchConvey("test checkAndApplyAllPodsQuota", t, func() {
 		mockey.Mock((*DynamicPolicy).getCurrentPathAllPodsDirAndMap).IncludeCurrentGoRoutine().Return(mockPodPathMap, mockPodDirs, nil).Build()
 		mockey.Mock((*DynamicPolicy).getPodAndRelativePath).IncludeCurrentGoRoutine().Return(mockPod, "test_relative_path", mockErr).Build()
-		err := p.checkAndApplyAllPodsQuota(mockCal, mockBG.CpuQuota)
+		err := p.checkAndApplyAllPodsQuota(context.Background(), mockCal, mockBG.CpuQuota)
 		convey.So(err, convey.ShouldBeNil)
 	})
 
@@ -439,7 +920,7 @@ func TestDynamicPolicy_checkAllPodsQuota(t *testing.T) {
 		mockey.Mock((*DynamicPolicy).getCurrentPathAllPodsDirAndMap).IncludeCurrentGoRoutine().Return(mockPodPathMap, mockPodDirs, nil).Build()
 		mockey.Mock((*DynamicPolicy).getPodAndRelativePath).IncludeCurrentGoRoutine().Return(mockPod, "test_relative_path", nil).Build()
 		mockey.Mock(cgroupmgr.GetCPUWithRelativePath).IncludeCurrentGoRoutine().Return(mockBG, mockErr).Build()
-		err := p.checkAndApplyAllPodsQuota(mockCal, mockBG.CpuQuota)
+		err := p.checkAndApplyAllPodsQuota(context.Background(), mockCal, mockBG.CpuQuota)
 		convey.So(err, convey.ShouldNotBeNil)
 	})
 
@@ -450,13 +931,13 @@ func TestDynamicPolicy_checkAllPodsQuota(t *testing.T) {
 		mockey.Mock(cgroupmgr.ApplyCPUWithRelativePath).IncludeCurrentGoRoutine().Return(nil).Build()
 		mockey.Mock(cgroupmgr.GetCPUWithRelativePath).IncludeCurrentGoRoutine().Return(mockBG, nil).Build()
 
-		err := p.checkAndApplyAllPodsQuota(mockCal, mockBG.CpuQuota)
+		err := p.checkAndApplyAllPodsQuota(context.Background(), mockCal, mockBG.CpuQuota)
 		convey.So(err, convey.ShouldBeNil)
 
-		err = p.checkAndApplyAllPodsQuota(mockCal, mockBG2.CpuQuota)
+		err = p.checkAndApplyAllPodsQuota(context.Background(), mockCal, mockBG2.CpuQuota)
 		convey.So(err, convey.ShouldBeNil)
 
-		err = p.checkAndApplyAllPodsQuota(mockCal, mockBG3.CpuQuota)
+		err = p.checkAndApplyAllPodsQuota(context.Background(), mockCal, mockBG3.CpuQuota)
 		convey.So(err, convey.ShouldBeNil)
 	})
 
@@ -467,13 +948,13 @@ func TestDynamicPolicy_checkAllPodsQuota(t *testing.T) {
 		mockey.Mock(cgroupmgr.ApplyCPUWithRelativePath).IncludeCurrentGoRoutine().Return(mockErr).Build()
 		mockey.Mock(cgroupmgr.GetCPUWithRelativePath).IncludeCurrentGoRoutine().Return(mockBG, nil).Build()
 
-		err := p.checkAndApplyAllPodsQuota(mockCal, mockBG.CpuQuota)
+		err := p.checkAndApplyAllPodsQuota(context.Background(), mockCal, mockBG.CpuQuota)
 		convey.So(err, convey.ShouldNotBeNil)
 
-		err = p.checkAndApplyAllPodsQuota(mockCal, mockBG2.CpuQuota)
+		err = p.checkAndApplyAllPodsQuota(context.Background(), mockCal, mockBG2.CpuQuota)
 		convey.So(err, convey.ShouldNotBeNil)
 
-		err = p.checkAndApplyAllPodsQuota(mockCal, mockBG3.CpuQuota)
+		err = p.checkAndApplyAllPodsQuota(context.Background(), mockCal, mockBG3.CpuQuota)
 		convey.So(err, convey.ShouldNotBeNil)
 	})
 }
@@ -539,18 +1020,34 @@ func TestDynamicPolicy_applyAllContainersQuota(t *testing.T) {
 	advisorTestMutex.Lock()
 	defer advisorTestMutex.Unlock()
 	mockey.PatchConvey("test checkAllContainersQuota", t, func() {
-		mockey.Mock((*DynamicPolicy).getAllContainersRelativePathMap).IncludeCurrentGoRoutine().Return(containerPathMap).Build()
+		mockey.Mock((*DynamicPolicy).getAllContainersRelativePathMap).IncludeCurrentGoRoutine().Return(containerPathMap, nil).Build()
 		mockey.Mock((*DynamicPolicy).applyAllSubCgroupQuotaToUnLimit).IncludeCurrentGoRoutine().Return(nil).Build()
 		mockey.Mock(cgroupmgr.GetCPUWithRelativePath).IncludeCurrentGoRoutine().Return(mockCPU, nil).Build()
 		apply := mockey.Mock(cgroupmgr.ApplyCPUWithRelativePath).IncludeCurrentGoRoutine().Return(nil).Build()
 
-		err := p.applyAllContainersQuota(pod, true)
+		err := p.applyAllContainersQuota(context.Background(), pod, true)
 
 		convey.So(err, convey.ShouldBeNil)
 		convey.So(apply.Times(), convey.ShouldEqual, 2)
 
-		err = p.applyAllContainersQuota(pod, false)
+		err = p.applyAllContainersQuota(context.Background(), pod, false)
 		convey.So(err, convey.ShouldBeNil)
+	})
+
+	mockey.PatchConvey("cancellation after the first container write prevents later writes", t, func() {
+		mockey.Mock((*DynamicPolicy).getAllContainersRelativePathMap).IncludeCurrentGoRoutine().Return(containerPathMap, nil).Build()
+		mockey.Mock(cgroupmgr.GetCPUWithRelativePath).IncludeCurrentGoRoutine().Return(mockCPU, nil).Build()
+		ctx, cancel := context.WithCancel(context.Background())
+		apply := mockey.Mock(cgroupmgr.ApplyCPUWithRelativePath).IncludeCurrentGoRoutine().
+			To(func(string, *common.CPUData) error {
+				cancel()
+				return nil
+			}).Build()
+
+		err := p.applyAllContainersQuota(ctx, pod, true)
+
+		convey.So(errors.Is(err, context.Canceled), convey.ShouldBeTrue)
+		convey.So(apply.Times(), convey.ShouldEqual, 1)
 	})
 }
 
@@ -569,13 +1066,13 @@ func TestDynamicPolicy_checkAndApplySubCgroupPath(t *testing.T) {
 	defer advisorTestMutex.Unlock()
 	mockey.PatchConvey("test checkAndApplySubCgroupPath", t, func() {
 		d1 := mockDirEntry{isDir: false}
-		err1 := p.checkAndApplySubCgroupPath("path1", d1, nil)
+		err1 := p.checkAndApplySubCgroupPath(context.Background(), "path1", d1, nil)
 		convey.So(err1, convey.ShouldBeNil)
 
 		d2 := mockDirEntry{isDir: true}
 		subCPU2 := &common.CPUStats{CpuQuota: -1}
 		mockey.Mock(cgroupmgr.GetCPUWithAbsolutePath).IncludeCurrentGoRoutine().Return(subCPU2, nil).Build()
-		err2 := p.checkAndApplySubCgroupPath("path2", d2, nil)
+		err2 := p.checkAndApplySubCgroupPath(context.Background(), "path2", d2, nil)
 		convey.So(err2, convey.ShouldBeNil)
 	})
 
@@ -584,29 +1081,43 @@ func TestDynamicPolicy_checkAndApplySubCgroupPath(t *testing.T) {
 		subCPU3 := &common.CPUStats{CpuQuota: 1000}
 		mockey.Mock(cgroupmgr.GetCPUWithAbsolutePath).IncludeCurrentGoRoutine().Return(subCPU3, nil).Build()
 		mockey.Mock(cgroupmgr.ApplyCPUWithAbsolutePath).IncludeCurrentGoRoutine().Return(nil).Build()
-		err3 := p.checkAndApplySubCgroupPath("path3", d3, nil)
+		err3 := p.checkAndApplySubCgroupPath(context.Background(), "path3", d3, nil)
 		convey.So(err3, convey.ShouldBeNil)
 	})
 }
 
-func TestDynamicPolicy_syncAdvisorOverlapFlags_PersistsDisableDedicatedCoresFlag(t *testing.T) {
-	topo, err := machine.GenerateDummyCPUTopology(4, 1, 1)
-	assert.NoError(t, err)
+func TestDynamicPolicy_cgroupV1PreprocessingHonorsCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 
-	stateDirectoryConfig := &statedirectory.StateDirectoryConfiguration{
-		StateFileDirectory: t.TempDir(),
-	}
-	st, err := state.NewCheckpointState(
-		stateDirectoryConfig, "test", "test", topo, false, state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{},
-	)
-	assert.NoError(t, err)
+	p := &DynamicPolicy{}
+	calculationInfo := &advisorsvc.CalculationInfo{CgroupPath: "test"}
+	pod := &v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{{Name: "test"}}}}
 
-	policy := &DynamicPolicy{state: st}
-	policy.syncAdvisorOverlapFlags(&advisorapi.ListAndWatchResponse{
+	_, err := p.getAllDirs(ctx, "/unused")
+	require.ErrorIs(t, err, context.Canceled)
+	_, err = p.getAllPodsPathMap(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	_, _, err = p.getCurrentPathAllPodsDirAndMap(ctx, "unused")
+	require.ErrorIs(t, err, context.Canceled)
+	_, err = p.getAllContainersRelativePathMap(ctx, pod)
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, p.checkAndApplyIfCgroupV1(ctx, calculationInfo, &common.CgroupResources{}), context.Canceled)
+	require.ErrorIs(t, p.checkAndApplyAllPodsQuota(ctx, calculationInfo, 1), context.Canceled)
+	require.ErrorIs(t, p.applyAllContainersQuota(ctx, pod, true), context.Canceled)
+	require.ErrorIs(t, p.checkAndApplySubCgroupPath(ctx, "unused", nil, nil), context.Canceled)
+	require.ErrorIs(t, p.applyAllSubCgroupQuotaToUnLimit(ctx, "unused"), context.Canceled)
+}
+
+func TestMergeAdvisorOverlapFlagsIntoOwnedTarget(t *testing.T) {
+	target := &state.TargetState{}
+	mergeAdvisorOverlapFlags(target, &advisorapi.ListAndWatchResponse{
+		AllowSharedCoresOverlapReclaimedCores:      true,
 		DisableDedicatedCoresOverlapReclaimedCores: true,
 	})
 
-	assert.True(t, st.GetDisableDedicatedCoresOverlapReclaimedCores())
+	assert.True(t, target.AllowSharedCoresOverlapReclaimedCores)
+	assert.True(t, target.DisableDedicatedCoresOverlapReclaimedCores)
 }
 
 // TestDynamicPolicy_generateBlockCPUSet verifies the block CPUSet generation logic.
@@ -652,7 +1163,7 @@ func TestDynamicPolicy_generateBlockCPUSet(t *testing.T) {
 						PinnedCPUSet: machine.NewCPUSet(8, 9),
 					},
 				}
-				st.SetMachineState(machineState, false)
+				setMachineStateForTest(t, st, machineState, false)
 			},
 			advisorResponse: &advisorapi.ListAndWatchResponse{
 				Entries: map[string]*advisorapi.CalculationEntries{
@@ -699,7 +1210,7 @@ func TestDynamicPolicy_generateBlockCPUSet(t *testing.T) {
 						PinnedCPUSet: machine.NewCPUSet(4, 5), // NUMA 1 (CPUs 4,5,6,7,12,13,14,15)
 					},
 				}
-				st.SetMachineState(machineState, false)
+				setMachineStateForTest(t, st, machineState, false)
 			},
 			advisorResponse: &advisorapi.ListAndWatchResponse{
 				Entries: map[string]*advisorapi.CalculationEntries{
@@ -768,7 +1279,7 @@ func TestDynamicPolicy_generateBlockCPUSet(t *testing.T) {
 						},
 					},
 				}
-				st.SetPodEntries(podEntries, false)
+				setPodEntriesForTest(t, st, podEntries, false)
 
 				machineState, _ := state.GenerateMachineStateFromPodEntries(topo, podEntries, nil)
 				// Add non-reclaimable package on NUMA 0 (CPUs 0, 1)
@@ -784,7 +1295,7 @@ func TestDynamicPolicy_generateBlockCPUSet(t *testing.T) {
 						PinnedCPUSet: machine.NewCPUSet(4, 5, 6, 7, 12, 13, 14, 15), // NUMA 1 (CPUs 4,5,6,7,12,13,14,15)
 					},
 				}
-				st.SetMachineState(machineState, false)
+				setMachineStateForTest(t, st, machineState, false)
 			},
 			advisorResponse: &advisorapi.ListAndWatchResponse{
 				Entries: map[string]*advisorapi.CalculationEntries{
@@ -917,7 +1428,7 @@ func TestDynamicPolicy_generateBlockCPUSet(t *testing.T) {
 						PinnedCPUSet: machine.NewCPUSet(0, 1, 2, 3),
 					},
 				}
-				st.SetMachineState(machineState, false)
+				setMachineStateForTest(t, st, machineState, false)
 			},
 			advisorResponse: &advisorapi.ListAndWatchResponse{
 				Entries: map[string]*advisorapi.CalculationEntries{
@@ -1008,7 +1519,7 @@ func TestDynamicPolicy_generateBlockCPUSet(t *testing.T) {
 						},
 					},
 				}
-				st.SetPodEntries(podEntries, false)
+				setPodEntriesForTest(t, st, podEntries, false)
 			},
 			advisorResponse: &advisorapi.ListAndWatchResponse{
 				Entries: map[string]*advisorapi.CalculationEntries{
@@ -1076,7 +1587,7 @@ func TestDynamicPolicy_generateBlockCPUSet(t *testing.T) {
 						},
 					},
 				}
-				st.SetPodEntries(podEntries, false)
+				setPodEntriesForTest(t, st, podEntries, false)
 			},
 			advisorResponse: &advisorapi.ListAndWatchResponse{
 				Entries: map[string]*advisorapi.CalculationEntries{
@@ -1120,7 +1631,7 @@ func TestDynamicPolicy_generateBlockCPUSet(t *testing.T) {
 						PinnedCPUSet: machine.NewCPUSet(0, 1, 2, 3, 8, 9, 10), // only CPU 11 is available
 					},
 				}
-				st.SetMachineState(machineState, false)
+				setMachineStateForTest(t, st, machineState, false)
 			},
 			advisorResponse: &advisorapi.ListAndWatchResponse{
 				Entries: map[string]*advisorapi.CalculationEntries{
@@ -1171,7 +1682,7 @@ func TestDynamicPolicy_generateBlockCPUSet(t *testing.T) {
 
 			// Prepare initial machine state (e.g. static pools)
 			machineState, _ := state.GenerateMachineStateFromPodEntries(topo, nil, nil)
-			st.SetMachineState(machineState, false)
+			setMachineStateForTest(t, st, machineState, false)
 
 			if tc.setupMachineState != nil {
 				tc.setupMachineState(st, topo)
@@ -1185,7 +1696,7 @@ func TestDynamicPolicy_generateBlockCPUSet(t *testing.T) {
 				conf:  conf,
 			}
 
-			blockCPUSet, err := policy.generateBlockCPUSet(tc.advisorResponse)
+			blockCPUSet, err := policy.generateBlockCPUSet(tc.advisorResponse, false)
 			if tc.expectedError {
 				as.Error(err)
 				if tc.expectedErrorStr != "" {
@@ -1222,6 +1733,7 @@ func TestDynamicPolicy_generateReclaimBlockCPUSet_NUMAAwareInsufficientCPUsRetur
 		machine.NewCPUSet(0),
 		machine.NewCPUSet(),
 		blockCPUSet,
+		machine.NewCPUSet(),
 	)
 
 	require.Error(t, err)
@@ -1252,7 +1764,7 @@ func TestDynamicPolicyPlanBlocks(t *testing.T) {
 			},
 		},
 	}
-	policy.state.SetPodEntries(entries, false)
+	setPodEntriesForTest(t, policy.state, entries, false)
 
 	resp := &advisorapi.ListAndWatchResponse{
 		Entries: map[string]*advisorapi.CalculationEntries{
@@ -1306,7 +1818,254 @@ func TestDynamicPolicyPlanBlocks(t *testing.T) {
 	require.Equal(t, target.MachineState, after.MachineState)
 }
 
-func TestDynamicPolicyApplyBlocksEmitsPoolMetricsBeforeFailingHook(t *testing.T) {
+type advisorTargetRecordingState struct {
+	state.State
+	events          []string
+	setCalls        int
+	storeCalls      int
+	commitCalls     int
+	prepareErr      error
+	commitErr       error
+	committedTarget *state.TargetState
+}
+
+func (s *advisorTargetRecordingState) PrepareDurableTarget() (*state.TargetState, error) {
+	s.events = append(s.events, "prepare")
+	if s.prepareErr != nil {
+		return nil, s.prepareErr
+	}
+	return s.State.PrepareDurableTarget()
+}
+
+func (s *advisorTargetRecordingState) CommitTarget(target *state.TargetState) error {
+	s.events = append(s.events, "commit")
+	s.commitCalls++
+	s.committedTarget = target.Clone()
+	if s.commitErr != nil {
+		return s.commitErr
+	}
+	return s.State.CommitTarget(target)
+}
+
+func newAdvisorOwnedTargetFixture(t *testing.T) (*DynamicPolicy, advisorapi.BlockCPUSet, *advisorapi.ListAndWatchResponse) {
+	t.Helper()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	entries := policy.state.GetPodEntries()
+	entries["pod-dedicated"] = state.ContainerEntries{
+		"container": {
+			AllocationResult:         machine.NewCPUSet(0, 1),
+			OriginalAllocationResult: machine.NewCPUSet(0, 1),
+			TopologyAwareAssignments: map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1)},
+			AllocationMeta: commonstate.AllocationMeta{
+				PodUid:        "pod-dedicated",
+				ContainerName: "container",
+				ContainerType: pluginapi.ContainerType_MAIN.String(),
+				QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+			},
+		},
+	}
+	setPodEntriesForTest(t, policy.state, entries, false)
+	machineState, err := state.GenerateMachineStateFromPodEntries(topology, entries, policy.state.GetMachineState())
+	require.NoError(t, err)
+	setMachineStateForTest(t, policy.state, machineState, true)
+
+	resp := &advisorapi.ListAndWatchResponse{
+		AllowSharedCoresOverlapReclaimedCores:      true,
+		DisableDedicatedCoresOverlapReclaimedCores: true,
+		Entries: map[string]*advisorapi.CalculationEntries{
+			"pod-dedicated": {Entries: map[string]*advisorapi.CalculationInfo{
+				"container": {
+					OwnerPoolName: commonstate.PoolNameDedicated,
+					CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+						commonstate.FakedNUMAID: {Blocks: []*advisorapi.Block{{BlockId: "dedicated-block", Result: 2}}},
+					},
+				},
+			}},
+			commonstate.PoolNameShare: {Entries: map[string]*advisorapi.CalculationInfo{
+				commonstate.FakedContainerName: {
+					OwnerPoolName: commonstate.PoolNameShare,
+					CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+						commonstate.FakedNUMAID: {Blocks: []*advisorapi.Block{{BlockId: "share-block", Result: 2}}},
+					},
+				},
+			}},
+			commonstate.PoolNameReclaim: {Entries: map[string]*advisorapi.CalculationInfo{
+				commonstate.FakedContainerName: {
+					OwnerPoolName: commonstate.PoolNameReclaim,
+					CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+						commonstate.FakedNUMAID: {Blocks: []*advisorapi.Block{{BlockId: "reclaim-block", Result: 2}}},
+					},
+				},
+			}},
+		},
+		ExtraEntries: []*advisorsvc.CalculationInfo{{
+			CalculationResult: &advisorsvc.CalculationResult{
+				Values: map[string]string{string(advisorapi.ControlKnobKeyCPUNUMAHeadroom): `{"0":3.5}`},
+			},
+		}},
+	}
+	blocks := advisorapi.BlockCPUSet{
+		"dedicated-block": machine.NewCPUSet(0, 1),
+		"share-block":     machine.NewCPUSet(2, 3),
+		"reclaim-block":   machine.NewCPUSet(4, 5),
+	}
+	return policy, blocks, resp
+}
+
+func TestDynamicPolicyApplyAdvisorResponseCommitsOneOwnedTargetAfterBulkhead(t *testing.T) {
+	policy, blocks, resp := newAdvisorOwnedTargetFixture(t)
+	recordingState := &advisorTargetRecordingState{State: policy.state}
+	policy.state = recordingState
+	policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	policy.cpuSetMaterializer = &transactionRecordingMaterializer{
+		events:  &recordingState.events,
+		results: []cpusetmaterializer.Result{{Converged: true}},
+		onCall: func(target cpusetmaterializer.Target) {
+			require.True(t, target.ReclaimCPUSet().Equals(machine.NewCPUSet(4, 5)))
+			require.False(t, target.AllowReclaimOverlap(),
+				"hard disjoint must override the raw advisor overlap flag")
+		},
+	}
+
+	require.NoError(t, policy.applyAdvisorResponseTarget(context.Background(), blocks, resp, nil))
+
+	require.Equal(t, []string{"prepare", "materialize", "commit"}, recordingState.events)
+	require.Equal(t, 1, recordingState.commitCalls)
+	require.Zero(t, recordingState.setCalls)
+	require.Zero(t, recordingState.storeCalls)
+	require.NotNil(t, recordingState.committedTarget)
+	require.Equal(t, map[int]float64{0: 3.5}, policy.state.GetNUMAHeadroom())
+	require.True(t, policy.state.GetAllowSharedCoresOverlapReclaimedCores())
+	require.True(t, policy.state.GetDisableDedicatedCoresOverlapReclaimedCores())
+}
+
+func TestDynamicPolicyApplyAdvisorResponseCgroupConfigFailureKeepsCommittedTarget(t *testing.T) {
+	policy, blocks, resp := newAdvisorOwnedTargetFixture(t)
+	advisorTestMutex.Lock()
+	defer advisorTestMutex.Unlock()
+
+	recordingState := &advisorTargetRecordingState{State: policy.state}
+	policy.state = recordingState
+	resp.ExtraEntries = append(resp.ExtraEntries, &advisorsvc.CalculationInfo{
+		CgroupPath: "invalid-config",
+		CalculationResult: &advisorsvc.CalculationResult{
+			Values: map[string]string{
+				string(advisorapi.ControlKnobKeyCgroupConfig): "{",
+			},
+		},
+	})
+	policy.cpuSetMaterializer = &transactionRecordingMaterializer{
+		events:  &recordingState.events,
+		results: []cpusetmaterializer.Result{{Converged: true}},
+	}
+	isPathExistsMock := mockey.Mock(general.IsPathExists).IncludeCurrentGoRoutine().Return(true).Build()
+	defer isPathExistsMock.UnPatch()
+
+	require.NoError(t, policy.applyAdvisorResponseTarget(context.Background(), blocks, resp, nil))
+	require.Equal(t, []string{"prepare", "materialize", "commit"}, recordingState.events)
+	require.Equal(t, 1, recordingState.commitCalls)
+	require.NotNil(t, recordingState.committedTarget)
+	require.Equal(t, recordingState.committedTarget, cloneAdvisorState(policy.state))
+	require.Equal(t, policyLifecycleReady, policy.lifecycleState)
+}
+
+func TestDynamicPolicyApplyAdvisorResponseDerivesActiveFloorFromCommittedBase(t *testing.T) {
+	policy, blocks, resp := newAdvisorOwnedTargetFixture(t)
+	policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+
+	entries := policy.state.GetPodEntries()
+	reclaim := entries[commonstate.PoolNameReclaim][commonstate.FakedContainerName]
+	require.NotNil(t, reclaim)
+	reclaim.AllocationResult = machine.NewCPUSet(6, 7)
+	reclaim.OriginalAllocationResult = machine.NewCPUSet(6, 7)
+	reclaim.TopologyAwareAssignments = map[int]machine.CPUSet{0: machine.NewCPUSet(6, 7)}
+	reclaim.OriginalTopologyAwareAssignments = map[int]machine.CPUSet{0: machine.NewCPUSet(6, 7)}
+	entries["active-ramp-up"] = state.ContainerEntries{
+		"container": {
+			RampUp:                   true,
+			AllocationResult:         machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
+			TopologyAwareAssignments: map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)},
+			AllocationMeta: commonstate.AllocationMeta{
+				PodUid:        "active-ramp-up",
+				ContainerName: "container",
+				ContainerType: pluginapi.ContainerType_MAIN.String(),
+				QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+			},
+		},
+	}
+	setPodEntriesForTest(t, policy.state, entries, false)
+	machineState, err := state.GenerateMachineStateFromPodEntries(
+		policy.machineInfo.CPUTopology, entries, policy.state.GetMachineState())
+	require.NoError(t, err)
+	setMachineStateForTest(t, policy.state, machineState, false)
+
+	require.NoError(t, policy.applyAdvisorResponseTarget(context.Background(), blocks, resp, nil))
+
+	got := policy.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	require.NotNil(t, got)
+	require.True(t, got.AllocationResult.Equals(machine.NewCPUSet(4, 5, 6, 7)), "reclaim=%s", got.AllocationResult.String())
+}
+
+func TestDynamicPolicyApplyAdvisorResponseEnabledToDisabledDropsActiveFloor(t *testing.T) {
+	policy, blocks, resp := newAdvisorOwnedTargetFixture(t)
+	policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+
+	entries := policy.state.GetPodEntries()
+	reclaim := entries[commonstate.PoolNameReclaim][commonstate.FakedContainerName]
+	require.NotNil(t, reclaim)
+	reclaim.AllocationResult = machine.NewCPUSet(6, 7)
+	reclaim.OriginalAllocationResult = machine.NewCPUSet(6, 7)
+	entries["active-ramp-up"] = state.ContainerEntries{
+		"container": {
+			RampUp:                   true,
+			AllocationResult:         machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
+			TopologyAwareAssignments: map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)},
+			AllocationMeta: commonstate.AllocationMeta{
+				PodUid:        "active-ramp-up",
+				ContainerName: "container",
+				ContainerType: pluginapi.ContainerType_MAIN.String(),
+				QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+			},
+		},
+	}
+	setPodEntriesForTest(t, policy.state, entries, false)
+	policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = false
+
+	require.NoError(t, policy.applyAdvisorResponseTarget(context.Background(), blocks, resp, nil))
+
+	got := policy.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	require.NotNil(t, got)
+	require.True(t, got.AllocationResult.Equals(machine.NewCPUSet(4, 5)), "reclaim=%s", got.AllocationResult.String())
+}
+
+func TestDynamicPolicyApplyAdvisorResponseFailureKeepsDurableBaseAndHint(t *testing.T) {
+	policy, blocks, resp := newAdvisorOwnedTargetFixture(t)
+	recordingState := &advisorTargetRecordingState{State: policy.state}
+	policy.state = recordingState
+	base, err := policy.state.PrepareDurableTarget()
+	require.NoError(t, err)
+	recordingState.events = nil
+	policy.cpuSetMaterializer = &transactionRecordingMaterializer{
+		events:  &recordingState.events,
+		results: []cpusetmaterializer.Result{{}, {Converged: true}},
+		errs:    []error{errors.New("injected materializer failure"), nil},
+	}
+
+	err = policy.applyAdvisorResponseTarget(context.Background(), blocks, resp, nil)
+	require.ErrorContains(t, err, "injected materializer failure")
+	require.Equal(t, []string{"prepare", "materialize", "materialize"}, recordingState.events)
+	require.Zero(t, recordingState.commitCalls)
+	require.Zero(t, recordingState.setCalls)
+	require.Zero(t, recordingState.storeCalls)
+	require.Equal(t, base, cloneAdvisorState(policy.state))
+}
+
+func TestDynamicPolicyApplyBlocksDoesNotEmitPoolMetricsBeforeCommit(t *testing.T) {
 	topo, err := machine.GenerateDummyCPUTopology(8, 1, 1)
 	require.NoError(t, err)
 
@@ -1329,7 +2088,7 @@ func TestDynamicPolicyApplyBlocksEmitsPoolMetricsBeforeFailingHook(t *testing.T)
 			},
 		},
 	}
-	policy.state.SetPodEntries(entries, false)
+	setPodEntriesForTest(t, policy.state, entries, false)
 	policy.RegisterAllocationHook(func(_, _ *state.AllocationInfo) error {
 		return fmt.Errorf("injected hook failure")
 	})
@@ -1376,13 +2135,17 @@ func TestDynamicPolicyApplyBlocksEmitsPoolMetricsBeforeFailingHook(t *testing.T)
 
 	err = policy.applyBlocks(blocks, resp)
 	require.ErrorContains(t, err, "injected hook failure")
-	require.ElementsMatch(t, []int64{2, 2}, emitter.storedInt64[util.MetricNamePoolSize])
+	require.Empty(t, emitter.storedInt64[util.MetricNamePoolSize],
+		"advisor pool metrics must not be emitted by a plan that does not commit")
 }
 
 func cloneAdvisorState(s state.State) *state.TargetState {
 	return &state.TargetState{
-		PodEntries:   s.GetPodEntries(),
-		MachineState: s.GetMachineState(),
+		PodEntries:                            s.GetPodEntries(),
+		MachineState:                          s.GetMachineState(),
+		NUMAHeadroom:                          s.GetNUMAHeadroom(),
+		AllowSharedCoresOverlapReclaimedCores: s.GetAllowSharedCoresOverlapReclaimedCores(),
+		DisableDedicatedCoresOverlapReclaimedCores: s.GetDisableDedicatedCoresOverlapReclaimedCores(),
 	}
 }
 
@@ -1397,7 +2160,7 @@ func TestDynamicPolicyPlanBlocksUsesSnapshotMachineStateForSystemNUMAFallback(t 
 	currentMachineState, err := state.GenerateMachineStateFromPodEntries(topo, nil, nil)
 	require.NoError(t, err)
 	currentMachineState[0].DefaultCPUSet = machine.NewCPUSet(4, 5)
-	policy.state.SetMachineState(currentMachineState, false)
+	setMachineStateForTest(t, policy.state, currentMachineState, false)
 
 	snapshotMachineState := currentMachineState.Clone()
 	snapshotMachineState[0].DefaultCPUSet = machine.NewCPUSet(2, 3)
@@ -1453,7 +2216,7 @@ func TestDynamicPolicyPlanBlocksMissingPoolDoesNotEmitMetric(t *testing.T) {
 	require.Empty(t, emitter.storedInt64)
 }
 
-func TestDynamicPolicyApplyBlocksMissingPoolDoesNotEmitMetric(t *testing.T) {
+func TestDynamicPolicyApplyBlocksMissingPoolEmitsOrphanMetricAtBoundaryOnce(t *testing.T) {
 	topo, err := machine.GenerateDummyCPUTopology(8, 1, 1)
 	require.NoError(t, err)
 
@@ -1461,7 +2224,7 @@ func TestDynamicPolicyApplyBlocksMissingPoolDoesNotEmitMetric(t *testing.T) {
 	require.NoError(t, err)
 	emitter := NewMockMetricsEmitter()
 	policy.emitter = emitter
-	policy.state.SetPodEntries(state.PodEntries{
+	setPodEntriesForTest(t, policy.state, state.PodEntries{
 		"shared-pod": {
 			"container": {
 				RequestQuantity: 1,
@@ -1481,10 +2244,17 @@ func TestDynamicPolicyApplyBlocksMissingPoolDoesNotEmitMetric(t *testing.T) {
 		Entries: map[string]*advisorapi.CalculationEntries{},
 	})
 	require.Error(t, err)
-	require.Empty(t, emitter.storedInt64)
+	require.Equal(t, []int64{1}, emitter.storedInt64[util.MetricNameOrphanContainer])
+	require.Equal(t, [][]metrics.MetricTag{{
+		{Key: "podNamespace", Val: "default"},
+		{Key: "podName", Val: "pod"},
+		{Key: "containerName", Val: "container"},
+		{Key: "qosLevel", Val: apiconsts.PodAnnotationQoSLevelSharedCores},
+		{Key: "poolName", Val: "missing-pool"},
+	}}, emitter.storedTags[util.MetricNameOrphanContainer])
 }
 
-func TestDynamicPolicyGetAllocationPoolEntryMissingPoolEmitsMetric(t *testing.T) {
+func TestDynamicPolicyGetAllocationPoolEntryMissingPoolReturnsTypedErrorWithoutMetric(t *testing.T) {
 	emitter := NewMockMetricsEmitter()
 	policy := &DynamicPolicy{emitter: emitter}
 	allocationInfo := &state.AllocationInfo{
@@ -1498,7 +2268,14 @@ func TestDynamicPolicyGetAllocationPoolEntryMissingPoolEmitsMetric(t *testing.T)
 
 	_, err := policy.getAllocationPoolEntry(allocationInfo, "missing-pool", state.PodEntries{})
 	require.Error(t, err)
-	require.Equal(t, []int64{1}, emitter.storedInt64[util.MetricNameOrphanContainer])
+	var orphanErr *OrphanContainerError
+	require.ErrorAs(t, err, &orphanErr)
+	require.Equal(t, "default", orphanErr.PodNamespace)
+	require.Equal(t, "pod", orphanErr.PodName)
+	require.Equal(t, "container", orphanErr.ContainerName)
+	require.Equal(t, apiconsts.PodAnnotationQoSLevelSharedCores, orphanErr.QoSLevel)
+	require.Equal(t, "missing-pool", orphanErr.PoolName)
+	require.Empty(t, emitter.storedInt64)
 }
 
 type recordingAdvisorCgroupClient struct {
@@ -1577,12 +2354,12 @@ func prepareAdvisorBlocksFixture(t *testing.T) (*DynamicPolicy, advisorapi.Block
 			},
 		},
 	}
-	policy.state.SetPodEntries(entries, true)
+	setPodEntriesForTest(t, policy.state, entries, true)
 	machineState, err := state.GenerateMachineStateFromPodEntries(
 		topology, entries, policy.state.GetMachineState(),
 	)
 	require.NoError(t, err)
-	policy.state.SetMachineState(machineState, true)
+	setMachineStateForTest(t, policy.state, machineState, true)
 	setAdvisorCgroupTargetTestPods(policy, entries)
 	policy.cgroupClient = &recordingAdvisorCgroupClient{}
 
@@ -1641,14 +2418,28 @@ func TestDynamicPolicyApplyBlocksDirect(t *testing.T) {
 	require.Empty(t, policy.cgroupClient.(*recordingAdvisorCgroupClient).read)
 }
 
-func TestDynamicPolicyApplyBlocksHookFailureDoesNotUpdateStateOrRunCPUSetAdjustmentHandlers(t *testing.T) {
+func TestDynamicPolicyApplyBlocksValidatesPlannedTargetBeforeMaterialize(t *testing.T) {
 	policy, blocks, resp := prepareAdvisorBlocksFixture(t)
 	before := cloneAdvisorState(policy.state)
-	handlerCalls := 0
-	require.NoError(t, policy.RegisterCPUSetAdjustmentHandler("test", func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-		handlerCalls++
+	policy.RegisterAllocationHook(func(_, target *state.AllocationInfo) error {
+		if target.PodUid == "pod-dedicated" {
+			target.TopologyAwareAssignments = map[int]machine.CPUSet{}
+			target.OriginalTopologyAwareAssignments = map[int]machine.CPUSet{}
+		}
 		return nil
-	}))
+	})
+
+	err := policy.applyBlocks(blocks, resp)
+	require.ErrorIs(t, err, planner.ErrTopologyProjectionMismatch)
+	require.Equal(t, before, cloneAdvisorState(policy.state))
+	require.Empty(t, policy.cgroupClient.(*recordingAdvisorCgroupClient).applied)
+}
+
+func TestDynamicPolicyApplyBlocksHookFailureDoesNotUpdateStateOrMaterialize(t *testing.T) {
+	policy, blocks, resp := prepareAdvisorBlocksFixture(t)
+	before := cloneAdvisorState(policy.state)
+	materializer := &transactionRecordingMaterializer{}
+	policy.cpuSetMaterializer = materializer
 	policy.RegisterAllocationHook(func(_, _ *state.AllocationInfo) error {
 		return errors.New("hook failed")
 	})
@@ -1658,25 +2449,163 @@ func TestDynamicPolicyApplyBlocksHookFailureDoesNotUpdateStateOrRunCPUSetAdjustm
 
 	require.Equal(t, before, cloneAdvisorState(policy.state))
 	require.Empty(t, policy.cgroupClient.(*recordingAdvisorCgroupClient).applied)
-	require.Zero(t, handlerCalls)
+	require.Empty(t, materializer.targets)
 }
 
-func TestDynamicPolicyApplyBlocksDoesNotRunCPUSetAdjustmentHandlers(t *testing.T) {
+func TestDynamicPolicyApplyBlocksCommitFailureKeepsBaseAfterCPUSetAdjustment(t *testing.T) {
 	policy, blocks, resp := prepareAdvisorBlocksFixture(t)
-	handlerCalls := 0
-	require.NoError(t, policy.RegisterCPUSetAdjustmentHandler("test", func(_ context.Context, handlerCtx cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-		handlerCalls++
-		require.NotNil(t, handlerCtx)
-		committed := cloneAdvisorState(policy.state)
-		require.Equal(t, machine.NewCPUSet(6, 7), committed.PodEntries["pod-dedicated"]["container"].AllocationResult)
-		return nil
-	}))
+	commitErr := errors.New("commit advisor state failed")
+	wrappedState := &rollbackStoreState{
+		State:     policy.state,
+		commitErr: commitErr,
+	}
+	policy.state = wrappedState
+	before := cloneAdvisorState(policy.state)
+	baseReclaim := before.PodEntries[commonstate.PoolNameReclaim][commonstate.FakedContainerName].AllocationResult.Clone()
+	var observed []machine.CPUSet
+	materializer := &transactionRecordingMaterializer{
+		events:  &wrappedState.events,
+		results: []cpusetmaterializer.Result{{Converged: true}, {Converged: true}},
+		onCall: func(target cpusetmaterializer.Target) {
+			observed = append(observed, target.ReclaimCPUSet())
+		},
+	}
+	policy.cpuSetMaterializer = materializer
+
+	err := policy.applyBlocks(blocks, resp)
+	require.ErrorIs(t, err, commitErr)
+	require.ErrorContains(t, err, "commit target")
+
+	require.Equal(t, []string{"prepare", "materialize", "commit", "materialize"}, wrappedState.events)
+	require.Equal(t, 1, wrappedState.commitCalls)
+	require.Zero(t, wrappedState.storeCalls)
+	require.Empty(t, wrappedState.setPodEntryPersists)
+	require.Empty(t, wrappedState.setMachinePersists)
+	require.Equal(t, before, cloneAdvisorState(policy.state))
+	require.Empty(t, policy.cgroupClient.(*recordingAdvisorCgroupClient).applied)
+	require.Len(t, materializer.targets, 2)
+	require.True(t, observed[1].Equals(baseReclaim), "commit failure must rematerialize durable base")
+}
+
+func TestDynamicPolicyApplyBlocksMaterializesCandidateBeforeCommit(t *testing.T) {
+	policy, blocks, resp := prepareAdvisorBlocksFixture(t)
+	before := cloneAdvisorState(policy.state)
+	materializer := &transactionRecordingMaterializer{
+		events:  &[]string{},
+		results: []cpusetmaterializer.Result{{Converged: true}},
+		onCall: func(target cpusetmaterializer.Target) {
+			require.Equal(t, before, cloneAdvisorState(policy.state))
+			require.Equal(t, machine.NewCPUSet(6, 7),
+				target.ContainerCPUSetByPod()["pod-dedicated"]["container"])
+		},
+	}
+	policy.cpuSetMaterializer = materializer
 
 	require.NoError(t, policy.applyBlocks(blocks, resp))
-	require.Zero(t, handlerCalls)
+	require.Len(t, materializer.targets, 1)
 	cgroup := policy.cgroupClient.(*recordingAdvisorCgroupClient)
 	require.Empty(t, cgroup.applied)
 	require.Empty(t, cgroup.read)
+}
+
+func TestDynamicPolicyApplyBlocksCPUSetAdjustmentFailureKeepsBaseState(t *testing.T) {
+	policy, blocks, resp := prepareAdvisorBlocksFixture(t)
+	before := cloneAdvisorState(policy.state)
+	events := []string{}
+	materializer := &transactionRecordingMaterializer{
+		events:  &events,
+		results: []cpusetmaterializer.Result{{}, {Converged: true}},
+		errs:    []error{errors.New("materialization failed"), nil},
+		onCall: func(cpusetmaterializer.Target) {
+			require.Equal(t, before, cloneAdvisorState(policy.state))
+		},
+	}
+	policy.cpuSetMaterializer = materializer
+
+	err := policy.applyBlocks(blocks, resp)
+	require.ErrorContains(t, err, "materialization failed")
+
+	require.Len(t, materializer.targets, 2)
+	require.Equal(t, before, cloneAdvisorState(policy.state))
+}
+
+func TestDynamicPolicyApplyBlocksStableCandidatePersistsCheckpoint(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	stateDir := t.TempDir()
+	policy, err := getTestDynamicPolicyWithInitialization(topology, stateDir)
+	require.NoError(t, err)
+
+	entries := policy.state.GetPodEntries()
+	entries["pod-dedicated"] = state.ContainerEntries{
+		"container": {
+			AllocationResult:         machine.NewCPUSet(0, 1),
+			OriginalAllocationResult: machine.NewCPUSet(0, 1),
+			TopologyAwareAssignments: map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1)},
+			AllocationMeta: commonstate.AllocationMeta{
+				PodUid:        "pod-dedicated",
+				ContainerName: "container",
+				ContainerType: pluginapi.ContainerType_MAIN.String(),
+				QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+				OwnerPoolName: commonstate.PoolNameDedicated,
+			},
+			RampUp: true,
+		},
+	}
+	setPodEntriesForTest(t, policy.state, entries, true)
+	machineState, err := state.GenerateMachineStateFromPodEntries(topology, entries, policy.state.GetMachineState())
+	require.NoError(t, err)
+	setMachineStateForTest(t, policy.state, machineState, true)
+
+	resp := &advisorapi.ListAndWatchResponse{Entries: map[string]*advisorapi.CalculationEntries{
+		"pod-dedicated": {Entries: map[string]*advisorapi.CalculationInfo{
+			"container": {
+				OwnerPoolName: commonstate.PoolNameDedicated,
+				CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+					commonstate.FakedNUMAID: {Blocks: []*advisorapi.Block{{BlockId: "dedicated-block", Result: 2}}},
+				},
+			},
+		}},
+		commonstate.PoolNameShare: {Entries: map[string]*advisorapi.CalculationInfo{
+			commonstate.FakedContainerName: {
+				OwnerPoolName: commonstate.PoolNameShare,
+				CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+					commonstate.FakedNUMAID: {Blocks: []*advisorapi.Block{{BlockId: "share-block", Result: 2}}},
+				},
+			},
+		}},
+		commonstate.PoolNameReclaim: {Entries: map[string]*advisorapi.CalculationInfo{
+			commonstate.FakedContainerName: {
+				OwnerPoolName: commonstate.PoolNameReclaim,
+				CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+					commonstate.FakedNUMAID: {Blocks: []*advisorapi.Block{{BlockId: "reclaim-block", Result: 2}}},
+				},
+			},
+		}},
+	}}
+	blocks := advisorapi.BlockCPUSet{
+		"dedicated-block": machine.NewCPUSet(6, 7),
+		"share-block":     machine.NewCPUSet(2, 3),
+		"reclaim-block":   machine.NewCPUSet(4, 5),
+	}
+
+	require.NoError(t, policy.applyBlocks(blocks, resp))
+	committed := cloneAdvisorState(policy.state)
+	require.False(t, committed.PodEntries["pod-dedicated"]["container"].RampUp)
+	require.True(t, committed.PodEntries[commonstate.PoolNameReclaim][commonstate.FakedContainerName].AllocationResult.Equals(machine.NewCPUSet(4, 5)))
+
+	restoredState, err := state.NewCheckpointState(
+		&statedirectory.StateDirectoryConfiguration{StateFileDirectory: stateDir},
+		cpuPluginStateFileName,
+		cpuconsts.CPUResourcePluginPolicyNameDynamic,
+		topology,
+		false,
+		state.GenerateMachineStateFromPodEntries,
+		metrics.DummyMetrics{},
+	)
+	require.NoError(t, err)
+	require.Equal(t, committed.PodEntries, restoredState.GetPodEntries())
+	require.Equal(t, committed.MachineState, restoredState.GetMachineState())
 }
 
 func TestDynamicPolicyAllocateByCPUAdvisorReturnsNilResponseErrorWithoutPendingCgroupTargets(t *testing.T) {

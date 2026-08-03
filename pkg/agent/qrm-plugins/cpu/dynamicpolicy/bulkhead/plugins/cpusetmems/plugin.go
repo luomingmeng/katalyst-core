@@ -80,11 +80,11 @@ func (p *CPUSetMemsPlugin) Enable(in bulkheadapi.HandlerContext) bool {
 	return enableBulkheadCpusetMemsByDynamicConf(in.DynamicConf)
 }
 
-func (p *CPUSetMemsPlugin) CPUSetAdjustmentHandler(context.Context, bulkheadapi.HandlerContext) error {
+func (p *CPUSetMemsPlugin) Reconcile(context.Context, bulkheadapi.HandlerContext) error {
 	return nil
 }
 
-func (p *CPUSetMemsPlugin) CPUSetAdjustmentDisabledHandler(context.Context, bulkheadapi.HandlerContext) error {
+func (p *CPUSetMemsPlugin) Reset(context.Context, bulkheadapi.HandlerContext) error {
 	return nil
 }
 
@@ -94,7 +94,11 @@ func (p *CPUSetMemsPlugin) PeriodicalHandler(ctx context.Context, in bulkheadapi
 	if err != nil {
 		return err
 	}
-	if enableBulkheadCpusetMemsByDynamicConf(in.DynamicConf) {
+	enabled := enableBulkheadCpusetMemsByDynamicConf(in.DynamicConf)
+	if in.EffectiveEnabled != nil && !*in.EffectiveEnabled {
+		enabled = false
+	}
+	if enabled {
 		return p.reconcileNUMAMems(ctx, version, numaIDs)
 	}
 	return p.rollbackNUMAMems(ctx, version, numaIDs)

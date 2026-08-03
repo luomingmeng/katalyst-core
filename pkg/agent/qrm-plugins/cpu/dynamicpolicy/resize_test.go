@@ -35,6 +35,7 @@ import (
 	cpuutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/util"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	coreconsts "github.com/kubewharf/katalyst-core/pkg/consts"
+	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -592,7 +593,7 @@ func TestSNBInplaceUpdateResizeWithSidecar(t *testing.T) {
 			consts.PodAnnotationAggregatedRequestsKey:    "{\"cpu\":\"5\"}",
 		},
 	}
-	_, err = dynamicPolicy.Allocate(context.Background(), resizeSidecarContainerReq)
+	resizeSidecarAllocationResp, err := dynamicPolicy.Allocate(context.Background(), resizeSidecarContainerReq)
 	as.Nil(err)
 
 	resizeMainContainerReq = &pluginapi.ResourceRequest{
@@ -641,7 +642,7 @@ func TestSNBInplaceUpdateResizeWithSidecar(t *testing.T) {
 		},
 		Hint: resizeMainContainerResp.ResourceHints[string(v1.ResourceCPU)].Hints[0],
 	}
-	_, err = dynamicPolicy.Allocate(context.Background(), resizeMainContainerReq)
+	resizeMainAllocationResp, err := dynamicPolicy.Allocate(context.Background(), resizeMainContainerReq)
 	as.Nil(err)
 
 	resizeSidecarContainerAllocations, err := dynamicPolicy.GetResourcesAllocation(context.Background(), &pluginapi.GetResourcesAllocationRequest{})
@@ -705,12 +706,14 @@ func TestSNBInplaceUpdateResizeWithSidecar(t *testing.T) {
 
 	// resize main exceed
 	resizeMainContainerReq.ResourceRequests[string(v1.ResourceCPU)] = 10
+	resizeMainContainerReq.Annotations = general.DeepCopyMap(resizeMainAllocationResp.Annotations)
 	resizeMainContainerReq.Annotations[consts.PodAnnotationAggregatedRequestsKey] = "{\"cpu\":\"12\"}"
 	_, err = dynamicPolicy.GetTopologyHints(context.Background(), resizeMainContainerReq)
 	as.Nil(err)
 
 	// resize sidecar exceed
 	resizeSidecarContainerReq.ResourceRequests[string(v1.ResourceCPU)] = 10
+	resizeSidecarContainerReq.Annotations = general.DeepCopyMap(resizeSidecarAllocationResp.Annotations)
 	resizeSidecarContainerReq.Annotations[consts.PodAnnotationAggregatedRequestsKey] = "{\"cpu\":\"13\"}"
 	_, err = dynamicPolicy.GetTopologyHints(context.Background(), resizeSidecarContainerReq)
 	as.Nil(err)
@@ -729,6 +732,7 @@ func TestNonBindingShareCoresInplaceUpdateResize(t *testing.T) {
 
 	dynamicPolicy, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	as.Nil(err)
+	setAllowSharedOverlapForTest(t, dynamicPolicy.state, false)
 
 	dynamicPolicy.podAnnotationKeptKeys = []string{consts.PodAnnotationMemoryEnhancementNumaBinding, consts.PodAnnotationInplaceUpdateResizingKey}
 	dynamicPolicy.transitionPeriod = 10 * time.Millisecond
@@ -762,13 +766,20 @@ func TestNonBindingShareCoresInplaceUpdateResize(t *testing.T) {
 
 	_, err = dynamicPolicy.Allocate(context.Background(), req)
 	as.Nil(err)
+	reclaim := dynamicPolicy.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	as.NotNil(reclaim)
+	allocation := dynamicPolicy.state.GetAllocationInfo(req.PodUid, testName)
+	as.NotNil(allocation)
+	as.True(allocation.AllocationResult.Intersection(reclaim.AllocationResult).IsEmpty(),
+		"ramp-up allocation %s must be disjoint from reclaim target %s",
+		allocation.AllocationResult.String(), reclaim.AllocationResult.String())
 
 	time.Sleep(20 * time.Millisecond)
 
 	resp1, err := dynamicPolicy.GetResourcesAllocation(context.Background(), &pluginapi.GetResourcesAllocationRequest{})
 	as.Nil(err)
 
-	reclaim := dynamicPolicy.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	reclaim = dynamicPolicy.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
 	as.NotNil(reclaim)
 
 	as.NotNil(resp1.PodResources[req.PodUid])
@@ -781,12 +792,8 @@ func TestNonBindingShareCoresInplaceUpdateResize(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 10,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
-		TopologyAssignments: map[uint64]uint64{
-			uint64(0): 3,
-			uint64(1): 3,
-			uint64(2): 2,
-			uint64(3): 2,
-		},
+		TopologyAssignments: getTopologyAssignmentSizes(t, cpuTopology,
+			cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult)),
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
 		},
@@ -859,20 +866,19 @@ func TestNonBindingShareCoresInplaceUpdateResize(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 10,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
-		TopologyAssignments: map[uint64]uint64{
-			uint64(0): 3,
-			uint64(1): 3,
-			uint64(2): 2,
-			uint64(3): 2,
-		},
+		TopologyAssignments: getTopologyAssignmentSizes(t, cpuTopology,
+			cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult)),
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelSharedCores,
 			consts.PodAnnotationInplaceUpdateResizingKey: "true",
 		},
 	}, resp1.PodResources[req.PodUid].ContainerResources[testName].ResourceAllocation[string(v1.ResourceCPU)])
 
-	allocation := dynamicPolicy.state.GetAllocationInfo(req.PodUid, testName)
+	allocation = dynamicPolicy.state.GetAllocationInfo(req.PodUid, testName)
 	as.NotNil(allocation)
+	as.True(allocation.AllocationResult.Intersection(reclaim.AllocationResult).IsEmpty(),
+		"resized allocation %s must be disjoint from reclaim target %s",
+		allocation.AllocationResult.String(), reclaim.AllocationResult.String())
 	as.Equal(float64(3), allocation.RequestQuantity)
 }
 
@@ -889,7 +895,7 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 
 	dynamicPolicy, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	as.Nil(err)
-	dynamicPolicy.state.SetAllowSharedCoresOverlapReclaimedCores(false, true)
+	setAllowSharedOverlapForTest(t, dynamicPolicy.state, false, true)
 	dynamicPolicy.transitionPeriod = 10 * time.Millisecond
 
 	dynamicPolicy.podAnnotationKeptKeys = []string{
@@ -951,12 +957,8 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 42,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
-		TopologyAssignments: map[uint64]uint64{
-			uint64(0): 11,
-			uint64(1): 11,
-			uint64(2): 10,
-			uint64(3): 10,
-		},
+		TopologyAssignments: getTopologyAssignmentSizes(t, cpuTopology,
+			cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult)),
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:           consts.PodAnnotationQoSLevelSharedCores,
 			consts.PodAnnotationAggregatedRequestsKey: "{\"cpu\":\"3\"}",
@@ -1010,12 +1012,8 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 42,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
-		TopologyAssignments: map[uint64]uint64{
-			uint64(0): 11,
-			uint64(1): 11,
-			uint64(2): 10,
-			uint64(3): 10,
-		},
+		TopologyAssignments: getTopologyAssignmentSizes(t, cpuTopology,
+			cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult)),
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:           consts.PodAnnotationQoSLevelSharedCores,
 			consts.PodAnnotationAggregatedRequestsKey: "{\"cpu\":\"3\"}",
@@ -1078,12 +1076,8 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 42,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
-		TopologyAssignments: map[uint64]uint64{
-			uint64(0): 11,
-			uint64(1): 11,
-			uint64(2): 10,
-			uint64(3): 10,
-		},
+		TopologyAssignments: getTopologyAssignmentSizes(t, cpuTopology,
+			cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult)),
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelSharedCores,
 			consts.PodAnnotationInplaceUpdateResizingKey: "true",
@@ -1100,12 +1094,8 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 42,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
-		TopologyAssignments: map[uint64]uint64{
-			uint64(0): 11,
-			uint64(1): 11,
-			uint64(2): 10,
-			uint64(3): 10,
-		},
+		TopologyAssignments: getTopologyAssignmentSizes(t, cpuTopology,
+			cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult)),
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelSharedCores,
 			consts.PodAnnotationInplaceUpdateResizingKey: "true",
@@ -1177,12 +1167,8 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 42,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
-		TopologyAssignments: map[uint64]uint64{
-			uint64(0): 11,
-			uint64(1): 11,
-			uint64(2): 10,
-			uint64(3): 10,
-		},
+		TopologyAssignments: getTopologyAssignmentSizes(t, cpuTopology,
+			cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult)),
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelSharedCores,
 			consts.PodAnnotationInplaceUpdateResizingKey: "true",
@@ -1199,12 +1185,8 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 42,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
-		TopologyAssignments: map[uint64]uint64{
-			uint64(0): 11,
-			uint64(1): 11,
-			uint64(2): 10,
-			uint64(3): 10,
-		},
+		TopologyAssignments: getTopologyAssignmentSizes(t, cpuTopology,
+			cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult)),
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelSharedCores,
 			consts.PodAnnotationInplaceUpdateResizingKey: "true",
@@ -1890,12 +1872,12 @@ func TestReclaimedCoresVPA(t *testing.T) {
 				machineState, err := generateMachineStateFromPodEntries(cpuTopology, tc.podEntries, nil)
 				as.Nil(err)
 
-				dynamicPolicy.state.SetPodEntries(tc.podEntries, true)
-				dynamicPolicy.state.SetMachineState(machineState, true)
+				setPodEntriesForTest(t, dynamicPolicy.state, tc.podEntries, true)
+				setMachineStateForTest(t, dynamicPolicy.state, machineState, true)
 			}
 
 			if tc.numaHeadroom != nil {
-				dynamicPolicy.state.SetNUMAHeadroom(tc.numaHeadroom, true)
+				setNUMAHeadroomForTest(t, dynamicPolicy.state, tc.numaHeadroom, true)
 			}
 
 			numaBinding := false

@@ -17,249 +17,64 @@ limitations under the License.
 package utils
 
 import (
-	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
-	cpustate "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpusetmaterializer"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
 type CPUSetPartitionView struct {
-	Reserve                             machine.CPUSet
-	Dedicated                           machine.CPUSet
-	ReclaimRaw                          machine.CPUSet
-	SharePool                           machine.CPUSet
-	SharePoolMap                        map[string]machine.CPUSet
-	Isolation                           machine.CPUSet
-	DesiredNonReclaimPool               machine.CPUSet
-	DesiredReclaimEffective             machine.CPUSet
-	DesiredReclaimEffectivePerNUMA      map[int]machine.CPUSet
-	TransientProtectedNonReclaim        machine.CPUSet
-	TransientProtectedNonReclaimPerNUMA map[int]machine.CPUSet
-	NonReclaimPool                      machine.CPUSet
-	ReclaimEffective                    machine.CPUSet
-	ReclaimEffectivePerNUMA             map[int]machine.CPUSet
-	ContainerCPUSetByPod                map[string]map[string]machine.CPUSet
+	Reserve                        machine.CPUSet
+	Dedicated                      machine.CPUSet
+	ReclaimRaw                     machine.CPUSet
+	SharePool                      machine.CPUSet
+	SharePoolMap                   map[string]machine.CPUSet
+	Isolation                      machine.CPUSet
+	DesiredNonReclaimPool          machine.CPUSet
+	DesiredReclaimEffective        machine.CPUSet
+	DesiredReclaimEffectivePerNUMA map[int]machine.CPUSet
+	NonReclaimPool                 machine.CPUSet
+	ReclaimEffective               machine.CPUSet
+	ReclaimEffectivePerNUMA        map[int]machine.CPUSet
+	ContainerCPUSetByPod           map[string]map[string]machine.CPUSet
 }
 
-type CPUSetPartitionViewOptions struct {
-	NonReclaimPoolMinSize        int64
-	ReserveCPUReversely          bool
-	TransientProtectedNonReclaim machine.CPUSet
+func BuildCPUSetPartitionViewFromTarget(target cpusetmaterializer.Target) *CPUSetPartitionView {
+	reclaim := target.ReclaimCPUSet()
+	nonReclaim := target.NonReclaimCPUSet()
+	reclaimByNUMA := target.ReclaimCPUSetByNUMA()
+	return &CPUSetPartitionView{
+		Reserve:                        target.ReserveCPUSet(),
+		Dedicated:                      machine.NewCPUSet(),
+		ReclaimRaw:                     reclaim.Clone(),
+		SharePool:                      machine.NewCPUSet(),
+		SharePoolMap:                   map[string]machine.CPUSet{},
+		Isolation:                      machine.NewCPUSet(),
+		DesiredNonReclaimPool:          nonReclaim.Clone(),
+		DesiredReclaimEffective:        reclaim.Clone(),
+		DesiredReclaimEffectivePerNUMA: cloneCPUSetByNUMA(reclaimByNUMA),
+		NonReclaimPool:                 nonReclaim,
+		ReclaimEffective:               reclaim,
+		ReclaimEffectivePerNUMA:        cloneCPUSetByNUMA(reclaimByNUMA),
+		ContainerCPUSetByPod:           cloneContainerCPUSetByPod(target.ContainerCPUSetByPod()),
+	}
 }
 
-func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CPUTopology, opts CPUSetPartitionViewOptions) *CPUSetPartitionView {
-	view := &CPUSetPartitionView{
-		Reserve:                             machine.NewCPUSet(),
-		Dedicated:                           machine.NewCPUSet(),
-		ReclaimRaw:                          machine.NewCPUSet(),
-		SharePool:                           machine.NewCPUSet(),
-		SharePoolMap:                        map[string]machine.CPUSet{},
-		Isolation:                           machine.NewCPUSet(),
-		DesiredNonReclaimPool:               machine.NewCPUSet(),
-		DesiredReclaimEffective:             machine.NewCPUSet(),
-		DesiredReclaimEffectivePerNUMA:      map[int]machine.CPUSet{},
-		TransientProtectedNonReclaim:        machine.NewCPUSet(),
-		TransientProtectedNonReclaimPerNUMA: map[int]machine.CPUSet{},
-		NonReclaimPool:                      machine.NewCPUSet(),
-		ReclaimEffective:                    machine.NewCPUSet(),
-		ReclaimEffectivePerNUMA:             map[int]machine.CPUSet{},
-		ContainerCPUSetByPod:                map[string]map[string]machine.CPUSet{},
+func cloneCPUSetByNUMA(in map[int]machine.CPUSet) map[int]machine.CPUSet {
+	out := make(map[int]machine.CPUSet, len(in))
+	for numaID, cpus := range in {
+		out[numaID] = cpus.Clone()
 	}
-	if state == nil || topology == nil {
-		return view
-	}
-
-	allowOverlap := state.GetAllowSharedCoresOverlapReclaimedCores()
-	podEntries := state.GetPodEntries()
-	poolTypeOf := func(poolName string) string {
-		return commonstate.GetPoolType(commonstate.OwnerPoolNameTranslator.Translate(poolName))
-	}
-	recordContainerCPUSet := func(podUID, containerName string, cpus machine.CPUSet) {
-		if _, ok := view.ContainerCPUSetByPod[podUID]; !ok {
-			view.ContainerCPUSetByPod[podUID] = map[string]machine.CPUSet{}
-		}
-		view.ContainerCPUSetByPod[podUID][containerName] = cpus.Clone()
-	}
-
-	for _, containerEntries := range podEntries {
-		if containerEntries.IsPoolEntry() {
-			continue
-		}
-		for _, allocation := range containerEntries {
-			if allocation != nil {
-				recordContainerCPUSet(allocation.PodUid, allocation.ContainerName, allocation.AllocationResult)
-			}
-		}
-	}
-
-	for poolName, containerEntries := range podEntries {
-		if !containerEntries.IsPoolEntry() {
-			continue
-		}
-		entry := containerEntries[commonstate.FakedContainerName]
-		if entry == nil {
-			continue
-		}
-		switch poolTypeOf(poolName) {
-		case commonstate.PoolNameReserve:
-			view.Reserve = view.Reserve.Union(entry.AllocationResult)
-		case commonstate.PoolNameShare:
-			view.SharePool = view.SharePool.Union(entry.AllocationResult)
-			view.SharePoolMap[poolName] = entry.AllocationResult.Clone()
-		case commonstate.PoolNamePrefixIsolation:
-			view.Isolation = view.Isolation.Union(entry.AllocationResult)
-		}
-	}
-
-	for _, containerEntries := range podEntries {
-		if containerEntries.IsPoolEntry() {
-			continue
-		}
-		for _, allocation := range containerEntries {
-			if allocation != nil && allocation.CheckDedicated() {
-				view.Dedicated = view.Dedicated.Union(allocation.AllocationResult)
-			}
-		}
-	}
-
-	if reclaimEntries, ok := podEntries[commonstate.PoolNameReclaim]; ok {
-		if entry := reclaimEntries[commonstate.FakedContainerName]; entry != nil {
-			view.ReclaimRaw = entry.AllocationResult.Clone()
-		}
-	}
-	if allowOverlap && !view.ReclaimRaw.IsEmpty() {
-		view.SharePool = view.SharePool.Difference(view.ReclaimRaw)
-		for poolName, cpus := range view.SharePoolMap {
-			view.SharePoolMap[poolName] = cpus.Difference(view.ReclaimRaw)
-		}
-	}
-	view.NonReclaimPool = view.SharePool.Union(view.Dedicated).Union(view.Isolation)
-	if allowOverlap {
-		view.ReclaimEffective = view.ReclaimRaw.Clone()
-	} else {
-		// ReclaimRaw is the affinity budget produced by SysAdvisor after applying
-		// reclaimed-cpu-max-ratio. QRM must never widen it when deriving the
-		// cgroup target: every CPU outside the effective reclaim set belongs to
-		// the non-reclaim domain instead. The effective reclaim set is therefore
-		// derived in three steps, each of which can only shrink it:
-		//   1. start from all machine CPUs minus the non-reclaim pool and reserve
-		//      (the CPUs structurally available to reclaim);
-		//   2. intersect with ReclaimRaw so we never exceed SysAdvisor's budget;
-		//   3. recompute NonReclaimPool as the complement so the two domains stay
-		//      mutually exclusive and jointly cover every non-reserved CPU.
-		view.ReclaimEffective = topology.CPUDetails.CPUs().Difference(view.NonReclaimPool).Difference(view.Reserve)
-		view.ReclaimEffective = view.ReclaimEffective.Intersection(view.ReclaimRaw)
-		view.NonReclaimPool = topology.CPUDetails.CPUs().Difference(view.ReclaimEffective).Difference(view.Reserve)
-		// Step 3 may leave CPUs in NonReclaimPool that no share/dedicated/isolation
-		// pool claims (e.g. reclaim was clamped below its structural budget). When
-		// the share pool is otherwise empty, seed it with these spare CPUs so they
-		// are not left unassigned; this only fills a gap and never overrides an
-		// existing share allocation.
-		if view.SharePool.IsEmpty() {
-			spareShare := view.NonReclaimPool.Difference(view.Dedicated).Difference(view.Isolation)
-			if !spareShare.IsEmpty() {
-				view.SharePool = spareShare
-				view.SharePoolMap[commonstate.PoolNameShare] = spareShare.Clone()
-			}
-		}
-		padNonReclaimPoolToMinSize(view, topology, opts)
-	}
-	view.DesiredNonReclaimPool = view.NonReclaimPool.Clone()
-	view.DesiredReclaimEffective = view.ReclaimEffective.Clone()
-	rebuildDesiredReclaimEffectivePerNUMA(view, topology)
-	ApplyTransientProtectedNonReclaim(view, topology, opts.TransientProtectedNonReclaim)
-	rebuildReclaimEffectivePerNUMA(view, topology)
-	return view
+	return out
 }
 
-func ApplyTransientProtectedNonReclaim(view *CPUSetPartitionView, topology *machine.CPUTopology, protected machine.CPUSet) {
-	if view == nil || topology == nil || protected.IsEmpty() {
-		return
-	}
-	available := topology.CPUDetails.CPUs().Difference(view.Reserve)
-	view.TransientProtectedNonReclaim = protected.Intersection(available)
-	view.NonReclaimPool = view.DesiredNonReclaimPool.Union(view.TransientProtectedNonReclaim).Intersection(available)
-	view.ReclaimEffective = view.DesiredReclaimEffective.Difference(view.NonReclaimPool)
-	rebuildReclaimEffectivePerNUMA(view, topology)
-	rebuildTransientProtectedNonReclaimPerNUMA(view, topology)
-}
-
-func padNonReclaimPoolToMinSize(view *CPUSetPartitionView, topology *machine.CPUTopology, opts CPUSetPartitionViewOptions) {
-	if view == nil || topology == nil || opts.NonReclaimPoolMinSize <= 0 {
-		return
-	}
-	currentSize := view.NonReclaimPool.Size()
-	if currentSize >= int(opts.NonReclaimPoolMinSize) {
-		return
-	}
-	deficit := int(opts.NonReclaimPoolMinSize) - currentSize
-	candidates := view.ReclaimEffective.Clone()
-	if candidates.IsEmpty() {
-		return
-	}
-	if deficit > candidates.Size() {
-		deficit = candidates.Size()
-	}
-
-	padding := takeCPUsByNUMABalanceWithSeed(topology, candidates, view.NonReclaimPool, deficit, opts.ReserveCPUReversely)
-	view.NonReclaimPool = view.NonReclaimPool.Union(padding)
-	view.ReclaimEffective = view.ReclaimEffective.Difference(padding)
-}
-
-func takeCPUsByNUMABalanceWithSeed(topology *machine.CPUTopology, candidates, seed machine.CPUSet, count int, reverse bool) machine.CPUSet {
-	if topology == nil || count <= 0 || candidates.IsEmpty() {
-		return machine.NewCPUSet()
-	}
-
-	candidateByNUMA := map[int][]int{}
-	currentCountByNUMA := map[int]int{}
-	numaIDs := topology.CPUDetails.NUMANodes().ToSliceInt()
-	for _, numaID := range numaIDs {
-		numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
-		currentCountByNUMA[numaID] = seed.Intersection(numaCPUs).Size()
-		numaCandidates := candidates.Intersection(numaCPUs)
-		if reverse {
-			candidateByNUMA[numaID] = numaCandidates.ToSliceIntReversely()
-		} else {
-			candidateByNUMA[numaID] = numaCandidates.ToSliceInt()
+func cloneContainerCPUSetByPod(in map[string]map[string]machine.CPUSet) map[string]map[string]machine.CPUSet {
+	out := make(map[string]map[string]machine.CPUSet, len(in))
+	for podUID, containers := range in {
+		out[podUID] = make(map[string]machine.CPUSet, len(containers))
+		for containerName, cpus := range containers {
+			out[podUID][containerName] = cpus.Clone()
 		}
 	}
-
-	result := machine.NewCPUSet()
-	for result.Size() < count {
-		selectedNUMA := -1
-		for _, numaID := range numaIDs {
-			if len(candidateByNUMA[numaID]) == 0 {
-				continue
-			}
-			if selectedNUMA == -1 || currentCountByNUMA[numaID] < currentCountByNUMA[selectedNUMA] {
-				selectedNUMA = numaID
-			}
-		}
-		if selectedNUMA == -1 {
-			break
-		}
-		cpu := candidateByNUMA[selectedNUMA][0]
-		candidateByNUMA[selectedNUMA] = candidateByNUMA[selectedNUMA][1:]
-		result.Add(cpu)
-		currentCountByNUMA[selectedNUMA]++
-	}
-	return result
-}
-
-func rebuildReclaimEffectivePerNUMA(view *CPUSetPartitionView, topology *machine.CPUTopology) {
-	if view == nil {
-		return
-	}
-	view.ReclaimEffectivePerNUMA = map[int]machine.CPUSet{}
-	if topology == nil {
-		return
-	}
-	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceNoSortInt() {
-		intersection := view.ReclaimEffective.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
-		if !intersection.IsEmpty() {
-			view.ReclaimEffectivePerNUMA[numaID] = intersection
-		}
-	}
+	return out
 }
 
 func rebuildDesiredReclaimEffectivePerNUMA(view *CPUSetPartitionView, topology *machine.CPUTopology) {
@@ -272,25 +87,7 @@ func rebuildDesiredReclaimEffectivePerNUMA(view *CPUSetPartitionView, topology *
 	}
 	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceNoSortInt() {
 		intersection := view.DesiredReclaimEffective.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
-		if !intersection.IsEmpty() {
-			view.DesiredReclaimEffectivePerNUMA[numaID] = intersection
-		}
-	}
-}
-
-func rebuildTransientProtectedNonReclaimPerNUMA(view *CPUSetPartitionView, topology *machine.CPUTopology) {
-	if view == nil {
-		return
-	}
-	view.TransientProtectedNonReclaimPerNUMA = map[int]machine.CPUSet{}
-	if topology == nil {
-		return
-	}
-	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceNoSortInt() {
-		intersection := view.TransientProtectedNonReclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
-		if !intersection.IsEmpty() {
-			view.TransientProtectedNonReclaimPerNUMA[numaID] = intersection
-		}
+		view.DesiredReclaimEffectivePerNUMA[numaID] = intersection
 	}
 }
 
@@ -299,30 +96,25 @@ func (v *CPUSetPartitionView) DeepCopy() *CPUSetPartitionView {
 		return nil
 	}
 	out := &CPUSetPartitionView{
-		Reserve:                             v.Reserve.Clone(),
-		Dedicated:                           v.Dedicated.Clone(),
-		ReclaimRaw:                          v.ReclaimRaw.Clone(),
-		SharePool:                           v.SharePool.Clone(),
-		SharePoolMap:                        map[string]machine.CPUSet{},
-		Isolation:                           v.Isolation.Clone(),
-		DesiredNonReclaimPool:               v.DesiredNonReclaimPool.Clone(),
-		DesiredReclaimEffective:             v.DesiredReclaimEffective.Clone(),
-		DesiredReclaimEffectivePerNUMA:      map[int]machine.CPUSet{},
-		TransientProtectedNonReclaim:        v.TransientProtectedNonReclaim.Clone(),
-		TransientProtectedNonReclaimPerNUMA: map[int]machine.CPUSet{},
-		NonReclaimPool:                      v.NonReclaimPool.Clone(),
-		ReclaimEffective:                    v.ReclaimEffective.Clone(),
-		ReclaimEffectivePerNUMA:             map[int]machine.CPUSet{},
-		ContainerCPUSetByPod:                map[string]map[string]machine.CPUSet{},
+		Reserve:                        v.Reserve.Clone(),
+		Dedicated:                      v.Dedicated.Clone(),
+		ReclaimRaw:                     v.ReclaimRaw.Clone(),
+		SharePool:                      v.SharePool.Clone(),
+		SharePoolMap:                   map[string]machine.CPUSet{},
+		Isolation:                      v.Isolation.Clone(),
+		DesiredNonReclaimPool:          v.DesiredNonReclaimPool.Clone(),
+		DesiredReclaimEffective:        v.DesiredReclaimEffective.Clone(),
+		DesiredReclaimEffectivePerNUMA: map[int]machine.CPUSet{},
+		NonReclaimPool:                 v.NonReclaimPool.Clone(),
+		ReclaimEffective:               v.ReclaimEffective.Clone(),
+		ReclaimEffectivePerNUMA:        map[int]machine.CPUSet{},
+		ContainerCPUSetByPod:           map[string]map[string]machine.CPUSet{},
 	}
 	for numaID, cpus := range v.ReclaimEffectivePerNUMA {
 		out.ReclaimEffectivePerNUMA[numaID] = cpus.Clone()
 	}
 	for numaID, cpus := range v.DesiredReclaimEffectivePerNUMA {
 		out.DesiredReclaimEffectivePerNUMA[numaID] = cpus.Clone()
-	}
-	for numaID, cpus := range v.TransientProtectedNonReclaimPerNUMA {
-		out.TransientProtectedNonReclaimPerNUMA[numaID] = cpus.Clone()
 	}
 	for poolName, cpus := range v.SharePoolMap {
 		out.SharePoolMap[poolName] = cpus.Clone()

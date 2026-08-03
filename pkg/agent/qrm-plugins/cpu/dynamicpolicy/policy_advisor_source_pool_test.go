@@ -74,7 +74,7 @@ func TestDynamicPolicy_tryCarveAdvisorBlockFromSource(t *testing.T) {
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	require.NoError(t, err)
 
-	p.state.SetPodEntries(state.PodEntries{
+	setPodEntriesForTest(t, p.state, state.PodEntries{
 		"pod1": state.ContainerEntries{
 			"c": &state.AllocationInfo{
 				AllocationMeta: commonstate.AllocationMeta{
@@ -135,7 +135,7 @@ func TestDynamicPolicy_tryCarveAdvisorBlockFromSourceUsesConstrainedFallback(t *
 
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	require.NoError(t, err)
-	p.state.SetPodEntries(state.PodEntries{
+	setPodEntriesForTest(t, p.state, state.PodEntries{
 		"pod1": state.ContainerEntries{
 			"c": &state.AllocationInfo{
 				AllocationMeta: commonstate.AllocationMeta{
@@ -192,7 +192,7 @@ func TestDynamicPolicy_allocateShareBlocks_carvesIsolationFromAllocatedSource(t 
 
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	require.NoError(t, err)
-	p.state.SetPodEntries(state.PodEntries{
+	setPodEntriesForTest(t, p.state, state.PodEntries{
 		"pod1": state.ContainerEntries{
 			"c": &state.AllocationInfo{
 				AllocationMeta: commonstate.AllocationMeta{
@@ -258,7 +258,7 @@ func TestDynamicPolicy_allocateShareBlocks_sourceCarveFallbackRespectsNUMA(t *te
 
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	require.NoError(t, err)
-	p.state.SetPodEntries(state.PodEntries{
+	setPodEntriesForTest(t, p.state, state.PodEntries{
 		"pod1": state.ContainerEntries{
 			"c": &state.AllocationInfo{
 				AllocationMeta: commonstate.AllocationMeta{
@@ -326,7 +326,7 @@ func TestDynamicPolicy_allocateShareBlocks_preservesRealNUMASourceResult(t *test
 
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	require.NoError(t, err)
-	p.state.SetPodEntries(state.PodEntries{
+	setPodEntriesForTest(t, p.state, state.PodEntries{
 		"pod1": state.ContainerEntries{
 			"c": &state.AllocationInfo{
 				AllocationMeta: commonstate.AllocationMeta{
@@ -400,7 +400,7 @@ func TestDynamicPolicy_allocateAdvisorSourceBlocksForCarve(t *testing.T) {
 
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	require.NoError(t, err)
-	p.state.SetPodEntries(state.PodEntries{
+	setPodEntriesForTest(t, p.state, state.PodEntries{
 		"pod1": state.ContainerEntries{
 			"c": &state.AllocationInfo{
 				AllocationMeta: commonstate.AllocationMeta{
@@ -464,7 +464,7 @@ func TestDynamicPolicy_allocateAdvisorSourceBlocksForCarveAggregatesSharedSource
 
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	require.NoError(t, err)
-	p.state.SetPodEntries(state.PodEntries{
+	setPodEntriesForTest(t, p.state, state.PodEntries{
 		"pod-a": {
 			"c": &state.AllocationInfo{AllocationMeta: commonstate.AllocationMeta{
 				PodUid:        "pod-a",
@@ -549,7 +549,7 @@ func TestDynamicPolicy_allocateAdvisorSourceBlocksForCarveReturnsErrorWhenInsuff
 
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	require.NoError(t, err)
-	p.state.SetPodEntries(state.PodEntries{
+	setPodEntriesForTest(t, p.state, state.PodEntries{
 		"pod1": state.ContainerEntries{
 			"c": &state.AllocationInfo{
 				AllocationMeta: commonstate.AllocationMeta{
@@ -607,7 +607,7 @@ func TestDynamicPolicy_allocateAdvisorSourceBlocksForCarveExcludesNonReclaimable
 
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	require.NoError(t, err)
-	p.state.SetPodEntries(state.PodEntries{
+	setPodEntriesForTest(t, p.state, state.PodEntries{
 		"pod1": state.ContainerEntries{
 			"c": &state.AllocationInfo{
 				AllocationMeta: commonstate.AllocationMeta{
@@ -671,7 +671,7 @@ func TestDynamicPolicy_generateBlockCPUSet_combinedCarvesIsolationFromNormalShar
 
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	require.NoError(t, err)
-	p.state.SetPodEntries(state.PodEntries{
+	setPodEntriesForTest(t, p.state, state.PodEntries{
 		"pod1": state.ContainerEntries{
 			"c": &state.AllocationInfo{
 				AllocationMeta: commonstate.AllocationMeta{
@@ -726,7 +726,7 @@ func TestDynamicPolicy_generateBlockCPUSet_combinedCarvesIsolationFromNormalShar
 		},
 	}
 
-	blockCPUSet, err := p.generateBlockCPUSet(resp)
+	blockCPUSet, err := p.generateBlockCPUSet(resp, false)
 	require.NoError(t, err)
 
 	share := blockCPUSet["block-share"]

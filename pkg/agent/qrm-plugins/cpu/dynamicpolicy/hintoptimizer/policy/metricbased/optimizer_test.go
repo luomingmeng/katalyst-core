@@ -53,6 +53,14 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/threshold"
 )
 
+func commitMachineStateForTest(t *testing.T, repository state.State, machineState state.NUMANodeMap) {
+	t.Helper()
+	target, err := repository.PrepareDurableTarget()
+	require.NoError(t, err)
+	target.MachineState = machineState.Clone()
+	require.NoError(t, repository.CommitTarget(target))
+}
+
 func TestNewMetricBasedHintOptimizer(t *testing.T) {
 	t.Parallel()
 
@@ -620,7 +628,7 @@ func TestMetricBasedHintOptimizer_collectNUMAMetrics(t *testing.T) {
 			},
 		},
 	}
-	stateImpl.SetMachineState(machineState, false)
+	commitMachineStateForTest(t, stateImpl, machineState)
 
 	fakeFetcher := metric.NewFakeMetricsFetcher(metrics.DummyMetrics{}).(*metric.FakeMetricsFetcher)
 	fakeFetcher.SetContainerMetric(podUID1, containerName1, consts.MetricCPUUsageContainer, utilmetric.MetricData{Value: 2.5})

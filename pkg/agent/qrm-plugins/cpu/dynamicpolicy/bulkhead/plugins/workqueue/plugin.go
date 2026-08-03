@@ -58,14 +58,14 @@ func (p *WorkqueuePlugin) Enable(in bulkheadapi.HandlerContext) bool {
 	return enableBulkheadWorkqueue(in.DynamicConf)
 }
 
-func (p *WorkqueuePlugin) CPUSetAdjustmentHandler(_ context.Context, in bulkheadapi.HandlerContext) error {
+func (p *WorkqueuePlugin) Reconcile(_ context.Context, in bulkheadapi.HandlerContext) error {
 	if in.View == nil {
 		return p.resetWorkqueue(in)
 	}
 	return p.reconcileWorkqueue(in)
 }
 
-func (p *WorkqueuePlugin) CPUSetAdjustmentDisabledHandler(_ context.Context, in bulkheadapi.HandlerContext) error {
+func (p *WorkqueuePlugin) Reset(_ context.Context, in bulkheadapi.HandlerContext) error {
 	return p.resetWorkqueue(in)
 }
 

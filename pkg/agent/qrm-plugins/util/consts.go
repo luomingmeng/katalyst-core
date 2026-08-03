@@ -28,6 +28,8 @@ const (
 	MetricNameHandleAdvisorRespCalled                 = "handle_advisor_resp_called"
 	MetricNameHandleAdvisorRespFailed                 = "handle_advisor_resp_failed"
 	MetricNameAdvisorUnhealthy                        = "advisor_unhealthy"
+	MetricNameAdvisorPostCommitNotification           = "advisor_post_commit_notification"
+	MetricNameAdvisorCgroupPostCommitApply            = "advisor_cgroup_post_commit_apply"
 	MetricNameCheckApplyV1Error                       = "check_apply_v1_error"
 	MetricNameGetAccompanyResourceTopologyHintsFailed = "get_accompany_resource_topology_hints_failed"
 	MetricNameAllocateAccompanyResourceFailed         = "allocate_accompany_resource_failed"

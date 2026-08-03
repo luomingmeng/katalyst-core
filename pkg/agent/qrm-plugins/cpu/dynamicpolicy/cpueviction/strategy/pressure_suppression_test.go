@@ -439,7 +439,7 @@ func TestCPUPressureSuppression_GetEvictPods(t *testing.T) {
 
 			for entryName, entries := range tt.podEntries {
 				for subEntryName, entry := range entries {
-					stateImpl.SetAllocationInfo(entryName, subEntryName, entry, true)
+					setAllocationInfoForTest(t, stateImpl, entryName, subEntryName, entry)
 
 					if entries.IsPoolEntry() {
 						continue

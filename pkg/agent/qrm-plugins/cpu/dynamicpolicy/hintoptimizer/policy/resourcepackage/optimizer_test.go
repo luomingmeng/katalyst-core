@@ -72,6 +72,17 @@ func (m *MockState) SetDisableDedicatedCoresOverlapReclaimedCores(disableDedicat
 func (m *MockState) Delete(podUID string, containerName string, persist bool) {}
 func (m *MockState) ClearState()                                              {}
 func (m *MockState) StoreState() error                                        { return nil }
+func (m *MockState) PrepareDurableTarget() (*state.TargetState, error) {
+	return &state.TargetState{
+		PodEntries:   m.GetPodEntries(),
+		MachineState: m.GetMachineState(),
+	}, nil
+}
+func (m *MockState) CommitTarget(target *state.TargetState) error {
+	m.SetPodEntries(target.PodEntries, false)
+	m.SetMachineState(target.MachineState, false)
+	return nil
+}
 
 type resourcePackageManagerStub struct {
 	nodeResourcePackagesMap pkgutil.NUMAResourcePackageItems

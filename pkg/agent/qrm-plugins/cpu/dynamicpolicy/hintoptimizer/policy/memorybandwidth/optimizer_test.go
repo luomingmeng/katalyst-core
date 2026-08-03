@@ -49,6 +49,14 @@ import (
 	utilmetric "github.com/kubewharf/katalyst-core/pkg/util/metric"
 )
 
+func commitMachineStateForTest(t *testing.T, repository state.State, machineState state.NUMANodeMap) {
+	t.Helper()
+	target, err := repository.PrepareDurableTarget()
+	require.NoError(t, err)
+	target.MachineState = machineState.Clone()
+	require.NoError(t, repository.CommitTarget(target))
+}
+
 func generateTestMetricsFetcher(val0, val1 float64) *metric.FakeMetricsFetcher {
 	m := metric.NewFakeMetricsFetcher(metrics.DummyMetrics{})
 
@@ -962,7 +970,7 @@ func TestMemoryBandwidthOptimizer_OptimizeHints(t *testing.T) {
 						}},
 					}
 					st, _ := state.NewCheckpointState(stateDirectoryConfig, "test-state-success", "test", cpuTopology, false, state.GenerateMachineStateFromPodEntries, dummyEmitter)
-					st.SetMachineState(ms, false)
+					commitMachineStateForTest(t, st, ms)
 					return st
 				}()
 				mockey.Mock(spd.GetContainerMemoryBandwidthRequest).To(func(
@@ -1059,7 +1067,7 @@ func TestMemoryBandwidthOptimizer_OptimizeHints(t *testing.T) {
 						}},
 					}
 					st, _ := state.NewCheckpointState(stateDirectoryConfig, "test-state-spread", "test", cpuTopology, false, state.GenerateMachineStateFromPodEntries, dummyEmitter)
-					st.SetMachineState(ms, false)
+					commitMachineStateForTest(t, st, ms)
 					return st
 				}()
 				mockey.Mock(spd.GetContainerMemoryBandwidthRequest).To(func(
@@ -1150,7 +1158,7 @@ func TestMemoryBandwidthOptimizer_OptimizeHints(t *testing.T) {
 						1: &state.NUMANodeState{PodEntries: state.PodEntries{"p1": state.ContainerEntries{"c1": &state.AllocationInfo{AllocationMeta: commonstate.AllocationMeta{PodUid: "p1", ContainerType: pluginapi.ContainerType_MAIN.String(), Labels: map[string]string{apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable}, Annotations: map[string]string{apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable}}, RequestQuantity: 1}}}},
 					}
 					st, _ := state.NewCheckpointState(stateDirectoryConfig, "test-state-ign-neg", "test", cpuTopology, false, state.GenerateMachineStateFromPodEntries, dummyEmitter)
-					st.SetMachineState(ms, false)
+					commitMachineStateForTest(t, st, ms)
 					return st
 				}()
 				mockey.Mock(spd.GetContainerMemoryBandwidthRequest).To(func(

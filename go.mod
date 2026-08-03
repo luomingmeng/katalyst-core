@@ -20,7 +20,7 @@ require (
 	github.com/google/uuid v1.3.0
 	github.com/h2non/gock v1.2.0
 	github.com/klauspost/cpuid/v2 v2.2.6
-	github.com/kubewharf/katalyst-api v0.5.13-0.20260610123547-e619963d692b
+	github.com/kubewharf/katalyst-api v0.5.13-0.20260803030425-e20533ede1db
 	github.com/moby/sys/mountinfo v0.6.2
 	github.com/montanaflynn/stats v0.7.1
 	github.com/opencontainers/runc v1.1.6
@@ -209,5 +209,3 @@ replace (
 	k8s.io/sample-controller => k8s.io/sample-controller v0.24.6
 	sigs.k8s.io/json => sigs.k8s.io/json v0.0.0-20211020170558-c049b76a60c6
 )
-
-replace github.com/kubewharf/katalyst-api => /Users/bytedance/go/src/github.com/kubewharf/katalyst-api-ramp-up-reclaim-bulkhead-integration

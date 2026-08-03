@@ -21,19 +21,19 @@ package common
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"math"
 	"os"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/google/cadvisor/container/libcontainer"
 	"github.com/opencontainers/runc/libcontainer/cgroups"
-	"github.com/opencontainers/runc/libcontainer/configs"
+	"golang.org/x/sys/unix"
 
 	"github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/util/eventbus"
@@ -188,40 +188,115 @@ func IsCPUIdleSupported() bool {
 	return err == nil
 }
 
-// ApplyCgroupConfigs apply cgroup resources
-func ApplyCgroupConfigs(cgroupPath string, resources *CgroupResources) error {
-	subSystems, err := libcontainer.GetCgroupSubsystems(nil)
-	if err != nil {
-		return fmt.Errorf("GetCgroupSubsystems failed with error: %v", err)
-	}
-
-	paths := make(map[string]string)
-	for name, subsystem := range subSystems {
-		paths[name] = path.Join(subsystem, cgroupPath)
-	}
-
-	manager, err := libcontainer.NewCgroupManager("", paths)
-	if err != nil {
-		return fmt.Errorf("NewCgroupManager failed with error: %v", err)
-	}
-
-	if err := manager.Set(toConfigsResources(resources)); err != nil {
-		return fmt.Errorf("set cgroup resources failed with error: %#v, %v",
-			resources, err)
-	}
-
-	return nil
+type cgroupConfigWrite struct {
+	file string
+	data string
 }
 
-func toConfigsResources(resources *CgroupResources) *configs.Resources {
+// ApplyCgroupConfigs applies the supported CPU resources with a background context.
+func ApplyCgroupConfigs(cgroupPath string, resources *CgroupResources) error {
+	return ApplyCgroupConfigsWithContext(context.Background(), cgroupPath, resources)
+}
+
+// ApplyCgroupConfigsWithContext applies the supported CPU resources one cgroup
+// file at a time so cancellation can stop every subsequent write.
+func ApplyCgroupConfigsWithContext(ctx context.Context, cgroupPath string, resources *CgroupResources) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if resources == nil {
 		return nil
 	}
 
-	return &configs.Resources{
-		CpuQuota:        resources.CpuQuota,
-		CpuPeriod:       resources.CpuPeriod,
-		SkipDevices:     resources.SkipDevices,
-		SkipFreezeOnSet: resources.SkipFreezeOnSet,
+	absCgroupPath, err := resolveCPUConfigCgroupPath(cgroupPath)
+	if err != nil {
+		return err
 	}
+
+	writes := cpuConfigWrites(resources)
+	for i := 0; i < len(writes); i++ {
+		write := writes[i]
+		err := writeCgroupConfig(ctx, absCgroupPath, write)
+		if err == nil {
+			continue
+		}
+		if write.file != "cpu.cfs_period_us" || !errors.Is(err, unix.EINVAL) || resources.CpuQuota == 0 {
+			return err
+		}
+
+		quotaWrite := cgroupConfigWrite{
+			file: "cpu.cfs_quota_us",
+			data: strconv.FormatInt(resources.CpuQuota, 10),
+		}
+		if err := writeCgroupConfig(ctx, absCgroupPath, quotaWrite); err != nil {
+			return err
+		}
+		if err := writeCgroupConfig(ctx, absCgroupPath, write); err != nil {
+			return err
+		}
+		if i+1 < len(writes) && writes[i+1].file == quotaWrite.file {
+			i++
+		}
+	}
+
+	return ctx.Err()
+}
+
+func writeCgroupConfig(ctx context.Context, absCgroupPath string, write cgroupConfigWrite) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err, _, _ := InstrumentedWriteFileIfChange(absCgroupPath, write.file, write.data); err != nil {
+		return fmt.Errorf("write cgroup file %s: %w", filepath.Join(absCgroupPath, write.file), err)
+	}
+	return nil
+}
+
+func resolveCPUConfigCgroupPath(cgroupPath string) (string, error) {
+	root := filepath.Clean(GetCgroupRootPath(CgroupSubsysCPU))
+	relativePath := strings.TrimLeft(cgroupPath, string(filepath.Separator))
+	absCgroupPath := filepath.Clean(filepath.Join(root, relativePath))
+	rel, err := filepath.Rel(root, absCgroupPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve cpu cgroup path %q: %w", cgroupPath, err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("cpu cgroup path %q escapes root %q", cgroupPath, root)
+	}
+	return absCgroupPath, nil
+}
+
+func cpuConfigWrites(resources *CgroupResources) []cgroupConfigWrite {
+	if CheckCgroup2UnifiedMode() {
+		if resources.CpuQuota == 0 && resources.CpuPeriod == 0 {
+			return nil
+		}
+		quota := "max"
+		if resources.CpuQuota > 0 {
+			quota = strconv.FormatInt(resources.CpuQuota, 10)
+		}
+		period := resources.CpuPeriod
+		if period == 0 {
+			period = 100000
+		}
+		return []cgroupConfigWrite{{
+			file: "cpu.max",
+			data: quota + " " + strconv.FormatUint(period, 10),
+		}}
+	}
+
+	writes := make([]cgroupConfigWrite, 0, 2)
+	if resources.CpuPeriod != 0 {
+		writes = append(writes, cgroupConfigWrite{
+			file: "cpu.cfs_period_us",
+			data: strconv.FormatUint(resources.CpuPeriod, 10),
+		})
+	}
+	if resources.CpuQuota != 0 {
+		writes = append(writes, cgroupConfigWrite{
+			file: "cpu.cfs_quota_us",
+			data: strconv.FormatInt(resources.CpuQuota, 10),
+		})
+	}
+	return writes
 }

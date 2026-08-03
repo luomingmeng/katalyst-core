@@ -20,17 +20,15 @@ limitations under the License.
 package common
 
 import (
-	"fmt"
-	"path"
+	"context"
+	"errors"
 	"reflect"
+	"syscall"
 	"testing"
 
-	"github.com/opencontainers/runc/libcontainer/cgroups"
 	. "github.com/smartystreets/goconvey/convey"
 
 	"github.com/bytedance/mockey"
-	"github.com/google/cadvisor/container/libcontainer"
-	"github.com/opencontainers/runc/libcontainer/configs"
 )
 
 func TestParseCgroupNumaValue(t *testing.T) {
@@ -132,210 +130,167 @@ unevictable N0:0 N1:0`,
 	}
 }
 
-// MockManager is a mock implementation of libcontainer.Manager
-// We need to define this because libcontainer.Manager is an interface
-// and we need to mock its Set method.
-
-// Define a mock Manager that implements the libcontainer.Manager interface
-type mockManager struct {
-	cgroups.Manager // Embed the interface to satisfy it implicitly
-	SetFunc         func(r *configs.Resources) error
-}
-
-// Set calls the mock SetFunc
-func (m *mockManager) Set(r *configs.Resources) error {
-	if m.SetFunc != nil {
-		return m.SetFunc(r)
-	}
-	return nil
-}
-
-// GetPaths is a dummy implementation for the mockManager
-func (m *mockManager) GetPaths() map[string]string {
-	return nil
-}
-
-// GetStats is a dummy implementation for the mockManager
-func (m *mockManager) GetStats() (*cgroups.Stats, error) {
-	return nil, nil
-}
-
-// Freeze is a dummy implementation for the mockManager
-func (m *mockManager) Freeze(state configs.FreezerState) error {
-	return nil
-}
-
-// Destroy is a dummy implementation for the mockManager
-func (m *mockManager) Destroy() error {
-	return nil
-}
-
-// GetPids is a dummy implementation for the mockManager
-func (m *mockManager) GetPids() ([]int, error) {
-	return nil, nil
-}
-
-// GetAllPids is a dummy implementation for the mockManager
-func (m *mockManager) GetAllPids() ([]int, error) {
-	return nil, nil
-}
-
 func TestApplyCgroupConfigs(t *testing.T) {
-	t.Parallel()
-
 	cgroupPath := "test/path"
 	resources := &CgroupResources{
 		CpuQuota:  100000,
 		CpuPeriod: 200000,
 	}
 
-	mockey.PatchConvey("When all external calls succeed", t, func() {
-		// Arrange
-		mockSubsystems := map[string]string{
-			"cpu":    "/sys/fs/cgroup/cpu",
-			"memory": "/sys/fs/cgroup/memory",
-		}
-		mockey.Mock(libcontainer.GetCgroupSubsystems).Return(mockSubsystems, nil).Build()
-
-		mockMgr := &mockManager{
-			SetFunc: func(r *configs.Resources) error {
-				// Check if resources are correctly passed
-				So(r.CpuQuota, ShouldEqual, resources.CpuQuota)
-				So(r.CpuPeriod, ShouldEqual, resources.CpuPeriod)
-				return nil
-			},
-		}
-		mockey.Mock(libcontainer.NewCgroupManager).Return(mockMgr, nil).Build()
-
-		// Act
-		err := ApplyCgroupConfigs(cgroupPath, resources)
-
-		// Assert
-		So(err, ShouldBeNil)
-	})
-
-	mockey.PatchConvey("When GetCgroupSubsystems fails", t, func() {
-		// Arrange
-		expectedErr := fmt.Errorf("GetCgroupSubsystems failed")
-		mockey.Mock(libcontainer.GetCgroupSubsystems).Return(nil, expectedErr).Build()
-
-		// Act
-		err := ApplyCgroupConfigs(cgroupPath, resources)
-
-		// Assert
-		So(err, ShouldNotBeNil)
-		So(err.Error(), ShouldContainSubstring, expectedErr.Error())
-	})
-
-	mockey.PatchConvey("When NewCgroupManager fails", t, func() {
-		// Arrange
-		mockSubsystems := map[string]string{
-			"cpu": "/sys/fs/cgroup/cpu",
-		}
-		mockey.Mock(libcontainer.GetCgroupSubsystems).Return(mockSubsystems, nil).Build()
-
-		expectedErr := fmt.Errorf("NewCgroupManager failed")
-		mockey.Mock(libcontainer.NewCgroupManager).Return(nil, expectedErr).Build()
-
-		// Act
-		err := ApplyCgroupConfigs(cgroupPath, resources)
-
-		// Assert
-		So(err, ShouldNotBeNil)
-		So(err.Error(), ShouldContainSubstring, expectedErr.Error())
-	})
-
-	mockey.PatchConvey("When manager.Set fails", t, func() {
-		// Arrange
-		mockSubsystems := map[string]string{
-			"cpu": "/sys/fs/cgroup/cpu",
-		}
-		mockey.Mock(libcontainer.GetCgroupSubsystems).Return(mockSubsystems, nil).Build()
-
-		expectedSetErr := fmt.Errorf("manager.Set failed")
-		mockMgr := &mockManager{
-			SetFunc: func(r *configs.Resources) error {
-				return expectedSetErr
-			},
-		}
-		mockey.Mock(libcontainer.NewCgroupManager).Return(mockMgr, nil).Build()
-
-		// Act
-		err := ApplyCgroupConfigs(cgroupPath, resources)
-
-		// Assert
-		So(err, ShouldNotBeNil)
-		So(err.Error(), ShouldContainSubstring, expectedSetErr.Error())
-	})
-
-	mockey.PatchConvey("When input resources is nil", t, func() {
-		// Arrange
-		mockSubsystems := map[string]string{
-			"cpu":    "/sys/fs/cgroup/cpu",
-			"memory": "/sys/fs/cgroup/memory",
-		}
-		mockey.Mock(libcontainer.GetCgroupSubsystems).Return(mockSubsystems, nil).Build()
-
-		mockMgr := &mockManager{
-			SetFunc: func(r *configs.Resources) error {
-				// toConfigsResources will return nil if input resources is nil
-				// and manager.Set(nil) should not cause error in this mock
-				So(r, ShouldBeNil)
-				return nil
-			},
-		}
-		mockey.Mock(libcontainer.NewCgroupManager).Return(mockMgr, nil).Build()
-
-		// Act
-		err := ApplyCgroupConfigs(cgroupPath, nil) // Pass nil resources
-
-		// Assert
-		So(err, ShouldBeNil)
-	})
-
-	mockey.PatchConvey("When path.Join is called", t, func() {
-		// Arrange
-		mockSubsystems := map[string]string{
-			"cpu":    "/sys/fs/cgroup/cpu",
-			"memory": "/sys/fs/cgroup/memory",
-		}
-		mockey.Mock(libcontainer.GetCgroupSubsystems).Return(mockSubsystems, nil).Build()
-
-		var joinedPaths []string
-		mockey.Mock(path.Join).To(func(elem ...string) string {
-			// Capture the arguments passed to path.Join
-			// The original path.Join is complex to fully replicate,
-			// so we just check if it's called with expected first arg (subsystem path)
-			// and the cgroupPath.
-			if len(elem) == 2 {
-				joinedPaths = append(joinedPaths, elem[0]+"/"+elem[1])
-				return elem[0] + "/" + elem[1]
-			}
-			return "mocked/path/join/result"
+	mockey.PatchConvey("cgroup v1 writes period then quota", t, func() {
+		mockey.Mock(CheckCgroup2UnifiedMode).Return(false).Build()
+		var writes []cgroupConfigWrite
+		mockey.Mock(InstrumentedWriteFileIfChange).To(func(dir, file, data string) (error, bool, string) {
+			So(dir, ShouldEqual, "/sys/fs/cgroup/cpu/test/path")
+			writes = append(writes, cgroupConfigWrite{file: file, data: data})
+			return nil, true, ""
 		}).Build()
 
-		mockMgr := &mockManager{
-			SetFunc: func(r *configs.Resources) error {
-				return nil
-			},
-		}
-		mockey.Mock(libcontainer.NewCgroupManager).Return(mockMgr, nil).Build()
+		err := ApplyCgroupConfigsWithContext(context.Background(), cgroupPath, resources)
 
-		// Act
-		err := ApplyCgroupConfigs(cgroupPath, resources)
-
-		// Assert
 		So(err, ShouldBeNil)
-		So(len(joinedPaths), ShouldEqual, len(mockSubsystems))
-		for _, subPath := range mockSubsystems {
-			found := false
-			for _, jp := range joinedPaths {
-				if jp == subPath+"/"+cgroupPath {
-					found = true
-					break
-				}
+		So(writes, ShouldResemble, []cgroupConfigWrite{
+			{file: "cpu.cfs_period_us", data: "200000"},
+			{file: "cpu.cfs_quota_us", data: "100000"},
+		})
+	})
+
+	mockey.PatchConvey("cgroup v1 retries period after quota when period-first gets EINVAL", t, func() {
+		mockey.Mock(CheckCgroup2UnifiedMode).Return(false).Build()
+		var writes []cgroupConfigWrite
+		mockey.Mock(InstrumentedWriteFileIfChange).To(func(_, file, data string) (error, bool, string) {
+			writes = append(writes, cgroupConfigWrite{file: file, data: data})
+			if len(writes) == 1 {
+				return syscall.EINVAL, false, ""
 			}
-			So(found, ShouldBeTrue)
-		}
+			return nil, true, ""
+		}).Build()
+
+		err := ApplyCgroupConfigsWithContext(context.Background(), cgroupPath, resources)
+
+		So(err, ShouldBeNil)
+		So(writes, ShouldResemble, []cgroupConfigWrite{
+			{file: "cpu.cfs_period_us", data: "200000"},
+			{file: "cpu.cfs_quota_us", data: "100000"},
+			{file: "cpu.cfs_period_us", data: "200000"},
+		})
+	})
+
+	mockey.PatchConvey("cgroup v1 checks cancellation before retrying period", t, func() {
+		mockey.Mock(CheckCgroup2UnifiedMode).Return(false).Build()
+		ctx, cancel := context.WithCancel(context.Background())
+		var writes []cgroupConfigWrite
+		mockey.Mock(InstrumentedWriteFileIfChange).To(func(_, file, data string) (error, bool, string) {
+			writes = append(writes, cgroupConfigWrite{file: file, data: data})
+			if len(writes) == 1 {
+				return syscall.EINVAL, false, ""
+			}
+			cancel()
+			return nil, true, ""
+		}).Build()
+
+		err := ApplyCgroupConfigsWithContext(ctx, cgroupPath, resources)
+
+		So(errors.Is(err, context.Canceled), ShouldBeTrue)
+		So(writes, ShouldResemble, []cgroupConfigWrite{
+			{file: "cpu.cfs_period_us", data: "200000"},
+			{file: "cpu.cfs_quota_us", data: "100000"},
+		})
+	})
+
+	mockey.PatchConvey("cgroup v1 preserves the retry error", t, func() {
+		mockey.Mock(CheckCgroup2UnifiedMode).Return(false).Build()
+		retryErr := errors.New("retry period failed")
+		writes := 0
+		mockey.Mock(InstrumentedWriteFileIfChange).To(func(_, _, _ string) (error, bool, string) {
+			writes++
+			switch writes {
+			case 1:
+				return syscall.EINVAL, false, ""
+			case 3:
+				return retryErr, false, ""
+			default:
+				return nil, true, ""
+			}
+		}).Build()
+
+		err := ApplyCgroupConfigsWithContext(context.Background(), cgroupPath, resources)
+
+		So(errors.Is(err, retryErr), ShouldBeTrue)
+		So(err.Error(), ShouldContainSubstring, "cpu.cfs_period_us")
+		So(writes, ShouldEqual, 3)
+	})
+
+	mockey.PatchConvey("cgroup v1 cancellation after first write prevents later writes", t, func() {
+		mockey.Mock(CheckCgroup2UnifiedMode).Return(false).Build()
+		ctx, cancel := context.WithCancel(context.Background())
+		writes := 0
+		mockey.Mock(InstrumentedWriteFileIfChange).To(func(_, _, _ string) (error, bool, string) {
+			writes++
+			cancel()
+			return nil, true, ""
+		}).Build()
+
+		err := ApplyCgroupConfigsWithContext(ctx, cgroupPath, resources)
+
+		So(errors.Is(err, context.Canceled), ShouldBeTrue)
+		So(writes, ShouldEqual, 1)
+	})
+
+	mockey.PatchConvey("cgroup v2 writes the unified cpu.max file", t, func() {
+		mockey.Mock(CheckCgroup2UnifiedMode).Return(true).Build()
+		var dir, file, data string
+		mockey.Mock(InstrumentedWriteFileIfChange).To(func(gotDir, gotFile, gotData string) (error, bool, string) {
+			dir, file, data = gotDir, gotFile, gotData
+			return nil, true, ""
+		}).Build()
+
+		err := ApplyCgroupConfigsWithContext(context.Background(), cgroupPath, resources)
+
+		So(err, ShouldBeNil)
+		So(dir, ShouldEqual, "/sys/fs/cgroup/test/path")
+		So(file, ShouldEqual, "cpu.max")
+		So(data, ShouldEqual, "100000 200000")
+	})
+
+	mockey.PatchConvey("write errors preserve classification", t, func() {
+		mockey.Mock(CheckCgroup2UnifiedMode).Return(false).Build()
+		writeErr := errors.New("write failed")
+		mockey.Mock(InstrumentedWriteFileIfChange).Return(writeErr, false, "").Build()
+
+		err := ApplyCgroupConfigsWithContext(context.Background(), cgroupPath, resources)
+
+		So(errors.Is(err, writeErr), ShouldBeTrue)
+		So(err.Error(), ShouldContainSubstring, "cpu.cfs_period_us")
+	})
+
+	mockey.PatchConvey("paths cannot escape the cpu cgroup root", t, func() {
+		mockey.Mock(CheckCgroup2UnifiedMode).Return(false).Build()
+		write := mockey.Mock(InstrumentedWriteFileIfChange).Return(nil, true, "").Build()
+
+		err := ApplyCgroupConfigsWithContext(context.Background(), "../../../../tmp", resources)
+
+		So(err, ShouldNotBeNil)
+		So(err.Error(), ShouldContainSubstring, "escapes root")
+		So(write.Times(), ShouldEqual, 0)
+	})
+
+	mockey.PatchConvey("pre-canceled and nil resources perform no writes", t, func() {
+		mockey.Mock(CheckCgroup2UnifiedMode).Return(false).Build()
+		write := mockey.Mock(InstrumentedWriteFileIfChange).Return(nil, true, "").Build()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		So(errors.Is(ApplyCgroupConfigsWithContext(ctx, cgroupPath, resources), context.Canceled), ShouldBeTrue)
+		So(ApplyCgroupConfigsWithContext(context.Background(), cgroupPath, nil), ShouldBeNil)
+		So(write.Times(), ShouldEqual, 0)
+	})
+
+	mockey.PatchConvey("legacy API applies resources with a background context", t, func() {
+		mockey.Mock(CheckCgroup2UnifiedMode).Return(false).Build()
+		write := mockey.Mock(InstrumentedWriteFileIfChange).Return(nil, true, "").Build()
+
+		So(ApplyCgroupConfigs(cgroupPath, resources), ShouldBeNil)
+		So(write.Times(), ShouldEqual, 2)
 	})
 }

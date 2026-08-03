@@ -18,10 +18,28 @@ package topology
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"os"
+	"sort"
 
 	cgroupclient "github.com/kubewharf/katalyst-core/pkg/util/cgroup/client"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
+
+var ErrNotConverged = errors.New("bulkhead topology not fully converged")
+
+type ConvergenceError struct {
+	Report ConvergenceReport
+}
+
+func (e *ConvergenceError) Error() string {
+	return fmt.Sprintf("%v: %+v", ErrNotConverged, e.Report)
+}
+
+func (e *ConvergenceError) Unwrap() error {
+	return ErrNotConverged
+}
 
 type ConvergenceReport struct {
 	FullyConverged        bool
@@ -37,6 +55,7 @@ type RelConvergence struct {
 	Observed machine.CPUSet
 	Target   machine.CPUSet
 	Reason   string
+	Detail   string
 }
 
 const (
@@ -49,11 +68,16 @@ func buildConvergenceReport(
 	cg cgroupclient.CgroupClient,
 	dag *TopoDAG,
 	targetByRel map[string]machine.CPUSet,
+	controlledCPUSetByRel map[string]machine.CPUSet,
 	cpuDetails machine.CPUDetails,
 	reservedCPUs machine.CPUSet,
-	allowEmptyTarget bool,
+	_ bool,
 	cache *applyCache,
 ) (ConvergenceReport, error) {
+	// The transfer cycle cache is intentionally scoped to its gate snapshot.
+	// Final convergence is new evidence: re-enumerate descendants so runtime
+	// cgroups created after the last gate cannot be hidden by cached children.
+	cache.resetChildren()
 	snapshot, err := buildDomainSnapshot(ctx, cg, dag, targetByRel, cpuDetails, reservedCPUs, cache)
 	if err != nil {
 		return ConvergenceReport{}, err
@@ -68,23 +92,32 @@ func buildConvergenceReport(
 		CleanupPendingPrimary: gate.cleanupPendingPrimary.Clone(),
 		CleanupPendingReclaim: gate.cleanupPendingReclaim.Clone(),
 	}
-	for _, node := range dag.Nodes() {
-		target := targetByRel[node.Rel]
-		if target.IsEmpty() && !allowEmptyTarget {
-			continue
-		}
-		observed, ok := snapshot.observedByRel[node.Rel]
-		if !ok {
+	if len(controlledCPUSetByRel) == 0 {
+		controlledCPUSetByRel = targetByRel
+	}
+	rels := make([]string, 0, len(controlledCPUSetByRel))
+	for rel := range controlledCPUSetByRel {
+		rels = append(rels, rel)
+	}
+	sort.Strings(rels)
+	for _, rel := range rels {
+		target := controlledCPUSetByRel[rel]
+		observed, err := cg.ReadCPUSet(ctx, rel)
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return ConvergenceReport{}, fmt.Errorf("fresh read controlled cpuset rel=%q: %w", rel, err)
+			}
 			report.NonConvergedTargets = append(report.NonConvergedTargets, RelConvergence{
-				Rel:    node.Rel,
+				Rel:    rel,
 				Target: target.Clone(),
 				Reason: convergenceReasonReadError,
+				Detail: err.Error(),
 			})
 			continue
 		}
 		if !observed.Equals(target) {
 			report.NonConvergedTargets = append(report.NonConvergedTargets, RelConvergence{
-				Rel:      node.Rel,
+				Rel:      rel,
 				Observed: observed.Clone(),
 				Target:   target.Clone(),
 				Reason:   convergenceReasonTargetMismatch,

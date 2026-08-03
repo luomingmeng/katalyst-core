@@ -364,47 +364,6 @@ func TestShouldMigrate_EmptyEntriesIgnored(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// CPUSetAdjustmentHandler / CPUSetAdjustmentDisabledHandler are no-ops
-// ---------------------------------------------------------------------------
-
-func TestCPUSetAdjustmentHandler_IsNoOp(t *testing.T) {
-	t.Parallel()
-	fFS := newFakeFS()
-	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
-		400: {PID: 400, Comm: "kswapd0", IsKThread: true, PPID: 2},
-		100: {PID: 100, Comm: "crond"},
-	}}
-	seedRootPIDs(fFS, 100, 400)
-	fCg := newFakeCgroup()
-	fCg.existingDirs["system"] = true
-	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{
-		BulkheadSystemKThreadCommSubstrs: []string{"kswapd"},
-	})
-
-	if err := p.CPUSetAdjustmentHandler(context.Background(), bulkheadapi.HandlerContext{}); err != nil {
-		t.Fatalf("CPUSetAdjustmentHandler: %v", err)
-	}
-	if len(fProc.affinity) != 0 {
-		t.Fatalf("CPUSetAdjustmentHandler must NOT invoke SchedSetaffinity, got %+v", fProc.affinity)
-	}
-	if len(fCg.attaches) != 0 {
-		t.Fatalf("CPUSetAdjustmentHandler must NOT invoke AttachPID, got %+v", fCg.attaches)
-	}
-}
-
-func TestCPUSetAdjustmentDisabledHandler_NoOp(t *testing.T) {
-	t.Parallel()
-	fProc := &fakeProc{}
-	p := newTestPlugin("system", newFakeFS(), fProc, newFakeCgroup(), bulkheadconfig.BulkheadConfiguration{})
-	if err := p.CPUSetAdjustmentDisabledHandler(context.Background(), bulkheadapi.HandlerContext{}); err != nil {
-		t.Fatalf("CPUSetAdjustmentDisabledHandler: %v", err)
-	}
-	if len(fProc.affinity) != 0 {
-		t.Fatalf("disabled handler must not touch affinity, got %+v", fProc.affinity)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // PeriodicalHandler — unified migration path (kthread whitelist + userspace non-blacklist)
 // ---------------------------------------------------------------------------
 
@@ -430,6 +389,33 @@ func TestPeriodicalHandler_DisabledByConfig(t *testing.T) {
 	}
 	if p.lastPeriodicalEnabled == nil || *p.lastPeriodicalEnabled {
 		t.Fatalf("tracker must be &false after disabled tick, got %v", p.lastPeriodicalEnabled)
+	}
+}
+
+func TestPeriodicalHandler_EffectiveDisabledResetsInsteadOfMigrating(t *testing.T) {
+	t.Parallel()
+
+	fFS := newFakeFS()
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		200: {PID: 200, Comm: "crond"},
+	}}
+	seedRootPIDs(fFS, 200)
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	seedTargetPIDs(fCg, "system", 100)
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+	in := periodCtx(true)
+	effectiveEnabled := false
+	in.EffectiveEnabled = &effectiveEnabled
+
+	if err := p.PeriodicalHandler(context.Background(), in); err != nil {
+		t.Fatalf("PeriodicalHandler: %v", err)
+	}
+	if len(fCg.attaches) != 1 || fCg.attaches[0] != (attachCall{rel: "", pid: 100}) {
+		t.Fatalf("effective-disabled tick attaches = %+v, want reset pid 100 to cpuset root only", fCg.attaches)
+	}
+	if p.lastPeriodicalEnabled == nil || *p.lastPeriodicalEnabled {
+		t.Fatalf("tracker must be &false after effective-disabled reset, got %v", p.lastPeriodicalEnabled)
 	}
 }
 

@@ -91,7 +91,7 @@ func TestWorkqueuePluginResetsMasksWhenReclaimBecomesEmpty(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	if err := p.CPUSetAdjustmentHandler(ctx, bulkheadapi.HandlerContext{
+	if err := p.Reconcile(ctx, bulkheadapi.HandlerContext{
 		View: &bulkheadutils.CPUSetPartitionView{
 			ReclaimEffective: machine.NewCPUSet(0, 1),
 		},
@@ -102,7 +102,7 @@ func TestWorkqueuePluginResetsMasksWhenReclaimBecomesEmpty(t *testing.T) {
 		t.Fatalf("global reclaim mask = %q, want %q", got, reclaimMask)
 	}
 
-	if err := p.CPUSetAdjustmentHandler(ctx, bulkheadapi.HandlerContext{
+	if err := p.Reconcile(ctx, bulkheadapi.HandlerContext{
 		View: &bulkheadutils.CPUSetPartitionView{ReclaimEffective: machine.NewCPUSet()},
 	}); err != nil {
 		t.Fatalf("empty reclaim handler without topology: %v", err)
@@ -111,7 +111,7 @@ func TestWorkqueuePluginResetsMasksWhenReclaimBecomesEmpty(t *testing.T) {
 	in := bulkheadapi.HandlerContext{}
 	in.Topology = topology
 	in.View = &bulkheadutils.CPUSetPartitionView{ReclaimEffective: machine.NewCPUSet()}
-	if err := p.CPUSetAdjustmentHandler(ctx, in); err != nil {
+	if err := p.Reconcile(ctx, in); err != nil {
 		t.Fatalf("empty reclaim reset handler: %v", err)
 	}
 	if got := string(f.files[filepath.Join(sysfs, "cpumask")]); got != fallbackMask {
@@ -145,7 +145,7 @@ func TestWorkqueuePluginDisabledTransitionResetsMasks(t *testing.T) {
 
 	in := bulkheadapi.HandlerContext{}
 	in.Topology = topology
-	if err := p.CPUSetAdjustmentDisabledHandler(context.Background(), in); err != nil {
+	if err := p.Reset(context.Background(), in); err != nil {
 		t.Fatalf("disabled transition handler: %v", err)
 	}
 	if got := string(f.files[filepath.Join(sysfs, "cpumask")]); got != fallbackMask {
@@ -173,7 +173,7 @@ func TestWorkqueuePluginSkipsUnchangedMasks(t *testing.T) {
 		},
 	}
 	ctx := context.Background()
-	if err := p.CPUSetAdjustmentHandler(ctx, in); err != nil {
+	if err := p.Reconcile(ctx, in); err != nil {
 		t.Fatalf("first handler: %v", err)
 	}
 	global := filepath.Join(sysfs, "cpumask")
@@ -181,7 +181,7 @@ func TestWorkqueuePluginSkipsUnchangedMasks(t *testing.T) {
 	if firstWrites != 1 {
 		t.Fatalf("first run writes = %d, want 1", firstWrites)
 	}
-	if err := p.CPUSetAdjustmentHandler(ctx, in); err != nil {
+	if err := p.Reconcile(ctx, in); err != nil {
 		t.Fatalf("second handler: %v", err)
 	}
 	if got := f.writeCount[global]; got != firstWrites {

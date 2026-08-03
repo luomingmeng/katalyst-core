@@ -63,8 +63,8 @@ func (k *kubeletConfigFetcherImpl) GetKubeletConfig(ctx context.Context) (*nativ
 		}
 	} else {
 		url := fmt.Sprintf(configzApi, k.baseConf.KubeletReadOnlyPort, strings.Trim(k.baseConf.KubeletConfigEndpoint, "/"))
-		if err := process.GetAndUnmarshal(url, &configz); err != nil {
-			return nil, fmt.Errorf("failed to get kubelet config via insecure port, error: %v", err)
+		if err := process.GetAndUnmarshalWithContext(ctx, url, &configz); err != nil {
+			return nil, fmt.Errorf("failed to get kubelet config via insecure port: %w", err)
 		}
 	}
 

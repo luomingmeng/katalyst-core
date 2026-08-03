@@ -275,8 +275,8 @@ func (p *DynamicPolicy) takeCPUsForPoolsInPlaceWithPreferred(
 
 // generateProportionalPoolsCPUSetInPlaceWithPreferred mirrors
 // generateProportionalPoolsCPUSetInPlace but uses preferred-aware taking when the
-// proportional requests can be satisfied disjointly. If available CPUs cannot satisfy
-// even one CPU per pool, it preserves the legacy shared-available behavior.
+// proportional requests can be satisfied disjointly. Under scarcity it keeps
+// assignments conservative, prioritizing share pools and degrading reclaim.
 func (p *DynamicPolicy) generateProportionalPoolsCPUSetInPlaceWithPreferred(
 	poolsQuantityMap map[string]int,
 	poolsCPUSet map[string]machine.CPUSet,
@@ -294,11 +294,10 @@ func (p *DynamicPolicy) generateProportionalPoolsCPUSetInPlaceWithPreferred(
 			if _, found := poolsCPUSet[poolName]; found {
 				return availableCPUs.Clone(), fmt.Errorf("duplicated pool: %s", poolName)
 			}
-
-			poolsCPUSet[poolName] = availableCPUs.Clone()
 		}
 
-		return machine.NewCPUSet(), nil
+		proportionalPoolsQuantityMap = getScarcePoolsQuantityMap(
+			proportionalPoolsQuantityMap, availableSize)
 	}
 
 	return p.takeCPUsForPoolsInPlaceWithPreferred(

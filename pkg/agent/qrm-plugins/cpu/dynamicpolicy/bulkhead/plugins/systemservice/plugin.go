@@ -149,15 +149,15 @@ func (p *SystemServicePlugin) Enable(in bulkheadapi.HandlerContext) bool {
 	return enableBulkheadSystemService(in.DynamicConf)
 }
 
-// CPUSetAdjustmentHandler is intentionally a no-op: all migration runs in
+// Reconcile is intentionally a no-op: all migration runs in
 // PeriodicalHandler via cgroup.procs (AttachPID).
-func (p *SystemServicePlugin) CPUSetAdjustmentHandler(context.Context, bulkheadapi.HandlerContext) error {
+func (p *SystemServicePlugin) Reconcile(context.Context, bulkheadapi.HandlerContext) error {
 	return nil
 }
 
-// CPUSetAdjustmentDisabledHandler is a no-op: when bulkhead is disabled we do
+// Reset is a no-op: when bulkhead is disabled we do
 // not proactively revert cgroup placement (there is no safe global undo).
-func (p *SystemServicePlugin) CPUSetAdjustmentDisabledHandler(context.Context, bulkheadapi.HandlerContext) error {
+func (p *SystemServicePlugin) Reset(context.Context, bulkheadapi.HandlerContext) error {
 	return nil
 }
 
@@ -171,6 +171,9 @@ func (p *SystemServicePlugin) CPUSetAdjustmentDisabledHandler(context.Context, b
 // are no-ops.
 func (p *SystemServicePlugin) PeriodicalHandler(ctx context.Context, in bulkheadapi.PeriodicalHandlerContext) error {
 	enabled := enableBulkheadSystemService(in.DynamicConf)
+	if in.EffectiveEnabled != nil && !*in.EffectiveEnabled {
+		enabled = false
+	}
 
 	if !enabled {
 		// Trigger a reset on enabled → disabled transition, or on the first

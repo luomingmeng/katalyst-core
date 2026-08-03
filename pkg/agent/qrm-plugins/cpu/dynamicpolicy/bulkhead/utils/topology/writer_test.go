@@ -18,6 +18,7 @@ package topology
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -478,6 +479,49 @@ func TestApplyDAGDiffWithCPUDetailsUsesDomainPipelineForCrossDomainTransfer(t *t
 	}
 }
 
+func TestBuildConvergenceReportDoesNotFullyConvergeWhenRuntimeDescendantAppearsAfterFinalGate(t *testing.T) {
+	t.Parallel()
+
+	dag, err := BuildDAG([]NodeSpec{
+		{Rel: "kubepods", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1), Mems: "0"},
+		{Rel: "kubesandbox", Role: TopoNodeRoleReclaim, CPUs: machine.NewCPUSet(2), Mems: "0"},
+	})
+	if err != nil {
+		t.Fatalf("BuildDAG: %v", err)
+	}
+	cg := newTopologyFakeCgroup()
+	cg.cpus["kubepods"] = machine.NewCPUSet(0, 1)
+	cg.cpus["kubesandbox"] = machine.NewCPUSet(2)
+	targets := map[string]machine.CPUSet{
+		"kubepods":    machine.NewCPUSet(0, 1),
+		"kubesandbox": machine.NewCPUSet(2),
+	}
+	cpuDetails := machine.CPUDetails{
+		0: {NUMANodeID: 0},
+		1: {NUMANodeID: 0},
+		2: {NUMANodeID: 0},
+	}
+	cache := newApplyCache(cg, "kubepods")
+	if _, err := buildDomainSnapshot(context.Background(), cg, dag, targets, cpuDetails, machine.NewCPUSet(), cache); err != nil {
+		t.Fatalf("build final gate snapshot: %v", err)
+	}
+	cg.children["kubesandbox"] = []string{"runtime-descendant"}
+	cg.cpus["kubesandbox/runtime-descendant"] = machine.NewCPUSet(1)
+
+	report, err := buildConvergenceReport(
+		context.Background(), cg, dag, targets, targets, cpuDetails, machine.NewCPUSet(), false, cache,
+	)
+	if err != nil {
+		t.Fatalf("buildConvergenceReport: %v", err)
+	}
+	if report.FullyConverged {
+		t.Fatalf("FullyConverged = true after a late reclaim descendant retained primary CPU 1; report=%+v", report)
+	}
+	if got, want := report.PendingToPrimary, machine.NewCPUSet(1); !got.Equals(want) {
+		t.Fatalf("PendingToPrimary = %s, want %s after fresh descendant enumeration; report=%+v", got.String(), want.String(), report)
+	}
+}
+
 func TestApplyDAGDiffReportsNotFullyConvergedWhenObservedTargetDiffers(t *testing.T) {
 	t.Parallel()
 
@@ -640,6 +684,129 @@ func TestApplyDAGDiffDoesNotWriteEmptyV1PreShrinkOrGrowFailedCPU(t *testing.T) {
 	}
 	if res.FullyConverged {
 		t.Fatalf("ApplyDAGDiff reported full convergence while CPU 6 is still owned by primary")
+	}
+	for _, mismatch := range res.ConvergenceReport.NonConvergedTargets {
+		if mismatch.Rel == "kubepods" && mismatch.Target.IsEmpty() && mismatch.Observed.String() == "6" {
+			return
+		}
+	}
+	t.Fatalf("controlled empty target must be freshly verified, report=%+v", res.ConvergenceReport)
+}
+
+func TestApplyDAGDiffVerifiesControlledInventoryBeyondDAG(t *testing.T) {
+	t.Parallel()
+
+	dag, err := BuildDAG([]NodeSpec{
+		{Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1)},
+		{Rel: "reclaim", Role: TopoNodeRoleReclaim, CPUs: machine.NewCPUSet(2, 3)},
+	})
+	if err != nil {
+		t.Fatalf("BuildDAG: %v", err)
+	}
+	cg := newTopologyFakeCgroup()
+	cg.cpus["primary"] = machine.NewCPUSet(0, 1)
+	cg.cpus["reclaim"] = machine.NewCPUSet(2, 3)
+	cg.cpus["primary/pod/container"] = machine.NewCPUSet(1)
+
+	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+		DAG:        dag,
+		Cgroup:     cg,
+		CPUDetails: testCPUDetails(),
+		ControlledCPUSetByRel: map[string]machine.CPUSet{
+			"primary":               machine.NewCPUSet(0, 1),
+			"reclaim":               machine.NewCPUSet(2, 3),
+			"primary/pod/container": machine.NewCPUSet(0),
+		},
+	})
+	if err != nil {
+		t.Fatalf("ApplyDAGDiff: %v", err)
+	}
+	if res.FullyConverged {
+		t.Fatalf("inventory mismatch outside DAG must not converge: %+v", res.ConvergenceReport)
+	}
+	for _, mismatch := range res.ConvergenceReport.NonConvergedTargets {
+		if mismatch.Rel == "primary/pod/container" &&
+			mismatch.Reason == convergenceReasonTargetMismatch &&
+			mismatch.Observed.String() == "1" &&
+			mismatch.Target.String() == "0" {
+			return
+		}
+	}
+	t.Fatalf("fresh inventory mismatch missing from report: %+v", res.ConvergenceReport)
+}
+
+func TestApplyDAGDiffReportsMissingControlledInventoryRel(t *testing.T) {
+	t.Parallel()
+
+	dag, err := BuildDAG([]NodeSpec{
+		{Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1)},
+		{Rel: "reclaim", Role: TopoNodeRoleReclaim, CPUs: machine.NewCPUSet(2, 3)},
+	})
+	if err != nil {
+		t.Fatalf("BuildDAG: %v", err)
+	}
+	cg := newTopologyFakeCgroup()
+	cg.cpus["primary"] = machine.NewCPUSet(0, 1)
+	cg.cpus["reclaim"] = machine.NewCPUSet(2, 3)
+	cg.readErr["primary/missing-container"] = os.ErrNotExist
+
+	res, err := ApplyDAGDiff(context.Background(), DAGApplyInputs{
+		DAG:        dag,
+		Cgroup:     cg,
+		CPUDetails: testCPUDetails(),
+		ControlledCPUSetByRel: map[string]machine.CPUSet{
+			"primary":                   machine.NewCPUSet(0, 1),
+			"reclaim":                   machine.NewCPUSet(2, 3),
+			"primary/missing-container": machine.NewCPUSet(0),
+		},
+	})
+	if err != nil {
+		t.Fatalf("ApplyDAGDiff: %v", err)
+	}
+	if res.FullyConverged {
+		t.Fatalf("missing controlled rel must not converge: %+v", res.ConvergenceReport)
+	}
+	for _, mismatch := range res.ConvergenceReport.NonConvergedTargets {
+		if mismatch.Rel == "primary/missing-container" &&
+			mismatch.Reason == convergenceReasonReadError &&
+			strings.Contains(mismatch.Detail, os.ErrNotExist.Error()) {
+			return
+		}
+	}
+	t.Fatalf("missing controlled rel absent from report: %+v", res.ConvergenceReport)
+}
+
+func TestApplyDAGDiffReturnsWrappedFreshInventoryReadError(t *testing.T) {
+	t.Parallel()
+
+	dag, err := BuildDAG([]NodeSpec{
+		{Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1)},
+		{Rel: "reclaim", Role: TopoNodeRoleReclaim, CPUs: machine.NewCPUSet(2, 3)},
+	})
+	if err != nil {
+		t.Fatalf("BuildDAG: %v", err)
+	}
+	cg := newTopologyFakeCgroup()
+	cg.cpus["primary"] = machine.NewCPUSet(0, 1)
+	cg.cpus["reclaim"] = machine.NewCPUSet(2, 3)
+	readErr := errors.New("transient fresh read failure")
+	cg.readErr["primary/container"] = readErr
+
+	_, err = ApplyDAGDiff(context.Background(), DAGApplyInputs{
+		DAG:        dag,
+		Cgroup:     cg,
+		CPUDetails: testCPUDetails(),
+		ControlledCPUSetByRel: map[string]machine.CPUSet{
+			"primary":           machine.NewCPUSet(0, 1),
+			"reclaim":           machine.NewCPUSet(2, 3),
+			"primary/container": machine.NewCPUSet(0),
+		},
+	})
+	if !errors.Is(err, readErr) {
+		t.Fatalf("fresh inventory read error = %v, want wrapped %v", err, readErr)
+	}
+	if !strings.Contains(err.Error(), `primary/container`) {
+		t.Fatalf("fresh inventory read error lacks rel context: %v", err)
 	}
 }
 

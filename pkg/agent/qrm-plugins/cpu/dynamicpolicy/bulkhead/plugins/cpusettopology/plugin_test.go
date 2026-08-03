@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,8 +30,8 @@ import (
 
 	bulkheadapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api"
 	bulkheadutils "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils"
-	cpustate "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
-	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpusetmaterializer"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	bulkheadconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/bulkhead"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
@@ -188,30 +189,87 @@ func TestCPUSetTopologyPluginReconcilesPrimaryWhenReclaimEmpty(t *testing.T) {
 		cgroup: cg,
 	}
 
-	err := p.CPUSetAdjustmentHandler(context.Background(), bulkheadapi.HandlerContext{
-		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
-			Topology: &machine.CPUTopology{
-				CPUDetails: machine.CPUDetails{
-					0: {},
-					1: {},
-					2: {},
-					3: {},
-				},
+	err := p.Reconcile(context.Background(), bulkheadapi.HandlerContext{
+		Topology: &machine.CPUTopology{
+			CPUDetails: machine.CPUDetails{
+				0: {},
+				1: {},
+				2: {},
+				3: {},
 			},
 		},
 		View: &bulkheadutils.CPUSetPartitionView{
 			NonReclaimPool:   machine.NewCPUSet(0, 1, 2, 3),
 			ReclaimEffective: machine.NewCPUSet(),
 		},
+		Target: cpusetmaterializer.NewTarget(cpusetmaterializer.TargetInput{
+			NonReclaimCPUSet: machine.NewCPUSet(0, 1, 2, 3),
+			ReclaimCPUSet:    machine.NewCPUSet(),
+		}),
 	})
 	if err != nil {
-		t.Fatalf("CPUSetAdjustmentHandler: %v", err)
+		t.Fatalf("Reconcile: %v", err)
 	}
 	if got := cg.writes["primary"]; got != "0-3" {
 		t.Fatalf("primary cpuset = %q, want 0-3; writes=%v", got, cg.writes)
 	}
 	if _, ok := cg.pruned["primary"]; !ok {
 		t.Fatalf("primary rel not pruned as active: %#v", cg.pruned)
+	}
+}
+
+func TestCPUSetTopologyPluginReturnsErrorWhenApplyDoesNotConverge(t *testing.T) {
+	t.Parallel()
+
+	cg := &fakeCgroupClient{
+		existing: map[string]bool{
+			"primary": true,
+			"reclaim": true,
+		},
+		cpus: map[string]machine.CPUSet{
+			"primary": machine.NewCPUSet(0),
+			"reclaim": machine.NewCPUSet(2, 3),
+		},
+	}
+	cg.afterApply = func(rel string, _ *cgcommon.CPUSetData) {
+		if rel == "primary" {
+			cg.cpus[rel] = machine.NewCPUSet(0)
+		}
+	}
+	p := &CPUSetTopologyPlugin{
+		cfg: bulkheadconfig.BulkheadConfiguration{
+			BulkheadPrimaryRelPath:  "primary",
+			BulkheadReclaimRelPaths: []string{"reclaim"},
+		},
+		cgroup: cg,
+	}
+
+	err := p.Reconcile(context.Background(), bulkheadapi.HandlerContext{
+		Topology: &machine.CPUTopology{
+			CPUDetails: machine.CPUDetails{
+				0: {},
+				1: {},
+				2: {},
+				3: {},
+			},
+		},
+		View: &bulkheadutils.CPUSetPartitionView{
+			NonReclaimPool:   machine.NewCPUSet(0, 1),
+			ReclaimEffective: machine.NewCPUSet(2, 3),
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "not fully converged") {
+		t.Fatalf("expected non-converged error, got %v", err)
+	}
+	if !errors.Is(err, topology.ErrNotConverged) {
+		t.Fatalf("error = %v, want errors.Is(ErrNotConverged)", err)
+	}
+	var convergenceErr *topology.ConvergenceError
+	if !errors.As(err, &convergenceErr) || len(convergenceErr.Report.NonConvergedTargets) == 0 {
+		t.Fatalf("error = %v, want typed convergence report", err)
+	}
+	if cg.pruned != nil {
+		t.Fatalf("non-converged apply must not prune, got %#v", cg.pruned)
 	}
 }
 
@@ -230,7 +288,7 @@ func TestCPUSetTopologyPluginNormalEmptyTopologyReturnsErrorWithoutWrites(t *tes
 		cgroup: cg,
 	}
 
-	err := p.CPUSetAdjustmentHandler(context.Background(), bulkheadapi.HandlerContext{
+	err := p.Reconcile(context.Background(), bulkheadapi.HandlerContext{
 		View: &bulkheadutils.CPUSetPartitionView{
 			NonReclaimPool:   machine.NewCPUSet(0, 1),
 			ReclaimEffective: machine.NewCPUSet(2, 3),
@@ -259,26 +317,28 @@ func TestCPUSetTopologyPluginSkipsUnchangedApplyTarget(t *testing.T) {
 		cgroup: cg,
 	}
 	in := bulkheadapi.HandlerContext{
-		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
-			Topology: &machine.CPUTopology{CPUDetails: machine.CPUDetails{
-				0: {}, 1: {}, 2: {}, 3: {},
-			}},
-		},
+		Topology: &machine.CPUTopology{CPUDetails: machine.CPUDetails{
+			0: {}, 1: {}, 2: {}, 3: {},
+		}},
 		View: &bulkheadutils.CPUSetPartitionView{
 			NonReclaimPool:   machine.NewCPUSet(0, 1),
 			ReclaimEffective: machine.NewCPUSet(2, 3),
 		},
+		Target: cpusetmaterializer.NewTarget(cpusetmaterializer.TargetInput{
+			NonReclaimCPUSet: machine.NewCPUSet(0, 1),
+			ReclaimCPUSet:    machine.NewCPUSet(2, 3),
+		}),
 	}
 
-	if err := p.CPUSetAdjustmentHandler(context.Background(), in); err != nil {
-		t.Fatalf("first CPUSetAdjustmentHandler: %v", err)
+	if err := p.Reconcile(context.Background(), in); err != nil {
+		t.Fatalf("first Reconcile: %v", err)
 	}
 	firstApplyCount := totalApplyCount(cg.applyCounts)
 	if firstApplyCount == 0 {
 		t.Fatalf("first run should apply cpuset, writes=%v", cg.writes)
 	}
-	if err := p.CPUSetAdjustmentHandler(context.Background(), in); err != nil {
-		t.Fatalf("second CPUSetAdjustmentHandler: %v", err)
+	if err := p.Reconcile(context.Background(), in); err != nil {
+		t.Fatalf("second Reconcile: %v", err)
 	}
 	if got := totalApplyCount(cg.applyCounts); got != firstApplyCount {
 		t.Fatalf("unchanged apply target should not write again, got %d writes want %d", got, firstApplyCount)
@@ -300,25 +360,27 @@ func TestCPUSetTopologyPluginReconcilesExternalCgroupDrift(t *testing.T) {
 		cgroup: cg,
 	}
 	in := bulkheadapi.HandlerContext{
-		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
-			Topology: &machine.CPUTopology{CPUDetails: machine.CPUDetails{
-				0: {}, 1: {}, 2: {}, 3: {},
-			}},
-		},
+		Topology: &machine.CPUTopology{CPUDetails: machine.CPUDetails{
+			0: {}, 1: {}, 2: {}, 3: {},
+		}},
 		View: &bulkheadutils.CPUSetPartitionView{
 			NonReclaimPool:   machine.NewCPUSet(0, 1),
 			ReclaimEffective: machine.NewCPUSet(2, 3),
 		},
+		Target: cpusetmaterializer.NewTarget(cpusetmaterializer.TargetInput{
+			NonReclaimCPUSet: machine.NewCPUSet(0, 1),
+			ReclaimCPUSet:    machine.NewCPUSet(2, 3),
+		}),
 	}
 
-	if err := p.CPUSetAdjustmentHandler(context.Background(), in); err != nil {
-		t.Fatalf("first CPUSetAdjustmentHandler: %v", err)
+	if err := p.Reconcile(context.Background(), in); err != nil {
+		t.Fatalf("first Reconcile: %v", err)
 	}
 	firstPrimaryApplyCount := cg.applyCounts["primary"]
 	cg.cpus["primary"] = machine.NewCPUSet(0)
 
-	if err := p.CPUSetAdjustmentHandler(context.Background(), in); err != nil {
-		t.Fatalf("second CPUSetAdjustmentHandler: %v", err)
+	if err := p.Reconcile(context.Background(), in); err != nil {
+		t.Fatalf("second Reconcile: %v", err)
 	}
 	if got := cg.applyCounts["primary"]; got <= firstPrimaryApplyCount {
 		t.Fatalf("external primary drift was not reconciled, primary apply count=%d want > %d", got, firstPrimaryApplyCount)
@@ -344,7 +406,7 @@ func TestCPUSetTopologyPluginReturnsSiblingDiscoveryError(t *testing.T) {
 		cgroup: cg,
 	}
 
-	err := p.CPUSetAdjustmentHandler(context.Background(), bulkheadapi.HandlerContext{
+	err := p.Reconcile(context.Background(), bulkheadapi.HandlerContext{
 		View: &bulkheadutils.CPUSetPartitionView{
 			NonReclaimPool:   machine.NewCPUSet(0, 1),
 			ReclaimEffective: machine.NewCPUSet(2, 3),
@@ -365,9 +427,9 @@ func TestCPUSetTopologyPluginDisabledTransitionUsesTopologySpecsAndDAGExpandV1(t
 		"bulkhead-disabled-v1-container",
 	)
 
-	err := p.CPUSetAdjustmentDisabledHandler(context.Background(), in)
+	err := p.Reset(context.Background(), in)
 	if err != nil {
-		t.Fatalf("CPUSetAdjustmentDisabledHandler: %v", err)
+		t.Fatalf("Reset: %v", err)
 	}
 
 	wantMachine := "0-3"
@@ -400,6 +462,27 @@ func TestCPUSetTopologyPluginDisabledTransitionUsesTopologySpecsAndDAGExpandV1(t
 	}
 }
 
+func TestCPUSetTopologyPluginDisabledTransitionReturnsErrorWhenNotFullyConverged(t *testing.T) {
+	t.Parallel()
+
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV1,
+		"bulkhead-disabled-not-converged-pod",
+		"bulkhead-disabled-not-converged-container",
+	)
+	cg.afterApply = func(rel string, _ *cgcommon.CPUSetData) {
+		if rel == "primary" {
+			cg.cpus[rel] = machine.NewCPUSet(0)
+		}
+	}
+
+	err := p.Reset(context.Background(), in)
+	if !errors.Is(err, topology.ErrNotConverged) {
+		t.Fatalf("error = %v, want errors.Is(ErrNotConverged)", err)
+	}
+}
+
 func TestCPUSetTopologyPluginDisabledTransitionUsesTopologySpecsAndDAGExpandV2ToEmpty(t *testing.T) {
 	t.Parallel()
 
@@ -410,9 +493,13 @@ func TestCPUSetTopologyPluginDisabledTransitionUsesTopologySpecsAndDAGExpandV2To
 		"bulkhead-disabled-v2-container",
 	)
 
-	err := p.CPUSetAdjustmentDisabledHandler(context.Background(), in)
+	err := p.Reset(context.Background(), in)
+	if !errors.Is(err, topology.ErrNotConverged) {
+		t.Fatalf("first Reset error = %v, want ErrNotConverged", err)
+	}
+	err = p.Reset(context.Background(), in)
 	if err != nil {
-		t.Fatalf("CPUSetAdjustmentDisabledHandler: %v", err)
+		t.Fatalf("second Reset: %v", err)
 	}
 
 	for _, rel := range []string{
@@ -470,7 +557,7 @@ func TestCPUSetTopologyPluginDisabledTransitionReturnsErrorForInvalidV1Target(t 
 			)
 			in.Topology = tt.topology
 
-			err := p.CPUSetAdjustmentDisabledHandler(context.Background(), in)
+			err := p.Reset(context.Background(), in)
 			if err == nil {
 				t.Fatalf("expected invalid v1 reset target error")
 			}
@@ -489,7 +576,7 @@ func TestCPUSetTopologyPluginDisabledTransitionReturnsSiblingDiscoveryError(t *t
 	)
 	p.cgroup.(*fakeCgroupClient).listErr = errors.New("list failed")
 
-	err := p.CPUSetAdjustmentDisabledHandler(context.Background(), in)
+	err := p.Reset(context.Background(), in)
 	if err == nil {
 		t.Fatalf("expected sibling discovery error")
 	}
@@ -552,25 +639,23 @@ func newDisabledTransitionTestPlugin(
 		cgroup: cg,
 	}
 	in := bulkheadapi.HandlerContext{
-		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
-			MetaServer: &metaserver.MetaServer{
-				MetaAgent: &agent.MetaAgent{
-					PodFetcher: &metapod.PodFetcherStub{PodList: []*v1.Pod{{
-						ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
-						Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
-							Name:        "main",
-							ContainerID: "containerd://" + containerID,
-						}}},
+		MetaServer: &metaserver.MetaServer{
+			MetaAgent: &agent.MetaAgent{
+				PodFetcher: &metapod.PodFetcherStub{PodList: []*v1.Pod{{
+					ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+					Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
+						Name:        "main",
+						ContainerID: "containerd://" + containerID,
 					}}},
-				},
+				}}},
 			},
-			Topology: &machine.CPUTopology{
-				CPUDetails: machine.CPUDetails{
-					0: {},
-					1: {},
-					2: {},
-					3: {},
-				},
+		},
+		Topology: &machine.CPUTopology{
+			CPUDetails: machine.CPUDetails{
+				0: {},
+				1: {},
+				2: {},
+				3: {},
 			},
 		},
 		View: &bulkheadutils.CPUSetPartitionView{
@@ -709,13 +794,11 @@ func TestEnableBulkheadCpusetTopologyRequiresNonOverlapReclaimedCores(t *testing
 				tt.enableBulkheadCpusetTopology,
 				tt.confAllowSharedCoresOverlapReclaimedCores,
 			)
-			state := cpustate.NewCPUPluginState(nil)
-			state.SetAllowSharedCoresOverlapReclaimedCores(tt.stateAllowSharedCoresOverlapReclaimedCores)
 			if got := enableBulkheadCpusetTopology(bulkheadapi.HandlerContext{
-				CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
-					DynamicConf: conf,
-					State:       state,
-				},
+				DynamicConf: conf,
+				Target: cpusetmaterializer.NewTarget(cpusetmaterializer.TargetInput{
+					AllowReclaimOverlap: tt.stateAllowSharedCoresOverlapReclaimedCores,
+				}),
 			}); got != tt.want {
 				t.Fatalf("enableBulkheadCpusetTopology() = %t, want %t", got, tt.want)
 			}
@@ -755,8 +838,8 @@ func TestCPUSetTopologyPluginSkipsExpectedCPUSetForMissingPod(t *testing.T) {
 	// pending case: no error, no expected leaf, but the allocation is recorded
 	// as protected-pending so the writer keeps the parent a superset.
 	res, err := p.buildExpectedCPUSetByRel(context.Background(), bulkheadapi.HandlerContext{
-		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{MetaServer: metaServer},
-		View:                       view,
+		MetaServer: metaServer,
+		View:       view,
 	})
 	if err != nil {
 		t.Fatalf("missing pod must not error (admit-safe pending), got %v", err)
@@ -770,6 +853,178 @@ func TestCPUSetTopologyPluginSkipsExpectedCPUSetForMissingPod(t *testing.T) {
 	if got := res.PendingCPUSetUnion().String(); got != "0-1" {
 		t.Fatalf("pending union = %s, want 0-1", got)
 	}
+}
+
+func TestCPUSetTopologyPluginUnionsContainersSharingLeaf(t *testing.T) {
+	const (
+		podUIDA     = "shared-leaf-a"
+		podUIDB     = "shared-leaf-b"
+		containerID = "shared-leaf-container"
+		containerNm = "main"
+		sharedRel   = "primary/shared-leaf"
+	)
+	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+		Name: "bulkhead-shared-leaf-union",
+		Handler: func(gotPodUID, gotContainerID string) (string, error) {
+			if (gotPodUID == podUIDA || gotPodUID == podUIDB) && gotContainerID == containerID {
+				return "/" + sharedRel, nil
+			}
+			return "", errors.New("not a shared-leaf test container")
+		},
+	})
+
+	p := &CPUSetTopologyPlugin{}
+	res, err := p.buildExpectedCPUSetByRel(context.Background(), bulkheadapi.HandlerContext{
+		MetaServer: &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{
+			PodFetcher: &metapod.PodFetcherStub{PodList: []*v1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUIDA)},
+					Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
+						Name: containerNm, ContainerID: "containerd://" + containerID,
+					}}},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUIDB)},
+					Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
+						Name: containerNm, ContainerID: "containerd://" + containerID,
+					}}},
+				},
+			}},
+		}},
+		View: &bulkheadutils.CPUSetPartitionView{
+			ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+				podUIDA: {containerNm: machine.NewCPUSet(0)},
+				podUIDB: {containerNm: machine.NewCPUSet(1)},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildExpectedCPUSetByRel: %v", err)
+	}
+	if got := res.ExpectedByRel[sharedRel].String(); got != "0-1" {
+		t.Fatalf("shared leaf cpuset = %q, want union 0-1", got)
+	}
+}
+
+func TestCPUSetTopologyRejectsPendingProtectionOverlappingReclaim(t *testing.T) {
+	const podUID = "pending-reclaim-conflict"
+	target := cpusetmaterializer.NewTarget(cpusetmaterializer.TargetInput{
+		ReclaimCPUSet:    machine.NewCPUSet(2, 3),
+		NonReclaimCPUSet: machine.NewCPUSet(0, 1),
+		ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+			podUID: {"main": machine.NewCPUSet(2)},
+		},
+	})
+	cg := &fakeCgroupClient{
+		existing: map[string]bool{"primary": true, "reclaim": true},
+		cpus: map[string]machine.CPUSet{
+			"primary": machine.NewCPUSet(0, 1),
+			"reclaim": machine.NewCPUSet(2, 3),
+		},
+		children: map[string][]string{},
+	}
+	p := &CPUSetTopologyPlugin{
+		cfg: bulkheadconfig.BulkheadConfiguration{
+			BulkheadPrimaryRelPath:  "primary",
+			BulkheadReclaimRelPaths: []string{"reclaim"},
+		},
+		cgroup: cg,
+	}
+	result, err := p.ReconcileTopology(context.Background(), bulkheadapi.HandlerContext{
+		MetaServer: &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{
+			PodFetcher: &metapod.PodFetcherStub{},
+		}},
+		Topology: &machine.CPUTopology{CPUDetails: machine.CPUDetails{
+			0: {}, 1: {}, 2: {}, 3: {},
+		}},
+		Target: target,
+		View:   bulkheadutils.BuildCPUSetPartitionViewFromTarget(target),
+	})
+	if err != nil {
+		t.Fatalf("pending conflict should return convergence evidence, got error: %v", err)
+	}
+	if result.FullyConverged {
+		t.Fatalf("pending protection overlapping reclaim must not converge")
+	}
+	for _, mismatch := range result.ConvergenceReport.NonConvergedTargets {
+		if mismatch.Reason == "pending_reclaim_conflict" {
+			return
+		}
+	}
+	t.Fatalf("pending reclaim conflict missing from evidence: %+v", result.ConvergenceReport)
+}
+
+func TestCPUSetTopologyRejectsPendingProtectionOutsideNonReclaim(t *testing.T) {
+	target := cpusetmaterializer.NewTarget(cpusetmaterializer.TargetInput{
+		ReclaimCPUSet:    machine.NewCPUSet(2, 3),
+		NonReclaimCPUSet: machine.NewCPUSet(0, 1),
+	})
+	reason := validateRuntimeProtection(target, RuntimeProtection{Union: machine.NewCPUSet(4)})
+	if reason != "pending_outside_non_reclaim" {
+		t.Fatalf("validation reason = %q, want pending_outside_non_reclaim", reason)
+	}
+}
+
+func TestCPUSetTopologyPendingProtectionDoesNotMutateInput(t *testing.T) {
+	const podUID = "pending-input-immutable"
+	target := cpusetmaterializer.NewTarget(cpusetmaterializer.TargetInput{
+		ReclaimCPUSet:    machine.NewCPUSet(2, 3),
+		NonReclaimCPUSet: machine.NewCPUSet(0, 1),
+		ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+			podUID: {"main": machine.NewCPUSet(0)},
+		},
+	})
+	view := bulkheadutils.BuildCPUSetPartitionViewFromTarget(target)
+	before := view.DeepCopy()
+	cg := &fakeCgroupClient{
+		existing: map[string]bool{"primary": true, "reclaim": true},
+		cpus: map[string]machine.CPUSet{
+			"primary": machine.NewCPUSet(0, 1),
+			"reclaim": machine.NewCPUSet(2, 3),
+		},
+		children: map[string][]string{},
+	}
+	p := &CPUSetTopologyPlugin{
+		cfg: bulkheadconfig.BulkheadConfiguration{
+			BulkheadPrimaryRelPath:  "primary",
+			BulkheadReclaimRelPaths: []string{"reclaim"},
+		},
+		cgroup: cg,
+	}
+	_, err := p.ReconcileTopology(context.Background(), bulkheadapi.HandlerContext{
+		MetaServer: &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{
+			PodFetcher: &metapod.PodFetcherStub{},
+		}},
+		Topology: &machine.CPUTopology{CPUDetails: machine.CPUDetails{
+			0: {}, 1: {}, 2: {}, 3: {},
+		}},
+		Target: target,
+		View:   view,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileTopology: %v", err)
+	}
+	if !view.NonReclaimPool.Equals(before.NonReclaimPool) ||
+		!view.ReclaimEffective.Equals(before.ReclaimEffective) {
+		t.Fatalf("pending protection mutated input: before=%+v after=%+v", before, view)
+	}
+}
+
+func TestCPUSetTopologyPendingProtectionCacheIsRaceSafe(t *testing.T) {
+	p := &CPUSetTopologyPlugin{
+		pendingProtections: map[string]pendingPodProtection{},
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				p.pendingProtectedCPUSetByRel(context.Background(), nil)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func TestCPUSetTopologyPluginSkipsExpectedCPUSetForMissingContainer(t *testing.T) {
@@ -794,8 +1049,8 @@ func TestCPUSetTopologyPluginSkipsExpectedCPUSetForMissingContainer(t *testing.T
 	// A container with no status yet also fails at the container-id stage:
 	// admit-safe pending, not an error.
 	res, err := p.buildExpectedCPUSetByRel(context.Background(), bulkheadapi.HandlerContext{
-		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{MetaServer: metaServer},
-		View:                       view,
+		MetaServer: metaServer,
+		View:       view,
 	})
 	if err != nil {
 		t.Fatalf("missing container must not error (admit-safe pending), got %v", err)
@@ -831,15 +1086,26 @@ func TestCPUSetTopologyPluginFailsExpectedCPUSetForUnresolvedContainerRel(t *tes
 		},
 	}
 
-	// The container id resolves, but the relative cgroup path cannot be resolved
-	// (no handler / broken layout). This is a real error, NOT the admit window,
-	// so the round must fail-closed rather than apply a partial topology.
+	// The container id resolves, but the relative cgroup path cannot be resolved.
+	// This is not the admit window, so the round must fail closed.
 	res, err := p.buildExpectedCPUSetByRel(context.Background(), bulkheadapi.HandlerContext{
-		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{MetaServer: metaServer},
-		View:                       view,
+		MetaServer: metaServer,
+		View:       view,
 	})
 	if err == nil {
-		t.Fatalf("unresolved container rel (id known) must fail-closed, got res=%#v", res)
+		t.Fatalf("unresolved container rel (id known) must fail closed, got res=%#v", res)
+	}
+}
+
+func TestContainerWithDeletedCgroupPathFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	err := &bulkheadutils.ContainerRelPathResolveError{
+		Stage: bulkheadutils.ContainerRelPathResolveStageCgroupPath,
+		Err:   errors.New("failed to find relative path of suffix: pod-old/container-old"),
+	}
+	if isContainerNotCreatedErr(err) {
+		t.Fatal("cgroup path resolution errors must remain fail closed")
 	}
 }
 
@@ -873,17 +1139,15 @@ func TestCPUSetTopologyPluginBuildExpectedCPUSetByRelTrimsLeadingSlash(t *testin
 
 	p := &CPUSetTopologyPlugin{}
 	res, err := p.buildExpectedCPUSetByRel(context.Background(), bulkheadapi.HandlerContext{
-		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
-			MetaServer: &metaserver.MetaServer{
-				MetaAgent: &agent.MetaAgent{
-					PodFetcher: &metapod.PodFetcherStub{PodList: []*v1.Pod{{
-						ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
-						Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
-							Name:        containerNm,
-							ContainerID: "containerd://" + containerID,
-						}}},
+		MetaServer: &metaserver.MetaServer{
+			MetaAgent: &agent.MetaAgent{
+				PodFetcher: &metapod.PodFetcherStub{PodList: []*v1.Pod{{
+					ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+					Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
+						Name:        containerNm,
+						ContainerID: "containerd://" + containerID,
 					}}},
-				},
+				}}},
 			},
 		},
 		View: &bulkheadutils.CPUSetPartitionView{
@@ -907,6 +1171,119 @@ func TestCPUSetTopologyPluginBuildExpectedCPUSetByRelTrimsLeadingSlash(t *testin
 	}
 	if got := cpus.String(); got != "0-1" {
 		t.Fatalf("cpuset @ %s = %q, want 0-1", expectedRel, got)
+	}
+}
+
+func TestCPUSetTopologyMismatchProducesEvidenceForControlledContainerLeaf(t *testing.T) {
+	const (
+		podUID       = "pod-controlled-inventory"
+		containerID  = "container-controlled-inventory"
+		containerNm  = "main"
+		containerRel = "primary/pod-controlled/container"
+	)
+	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+		Name: "bulkhead-controlled-inventory-" + podUID,
+		Handler: func(gotPodUID, gotContainerID string) (string, error) {
+			if gotPodUID == podUID && gotContainerID == containerID {
+				return "/" + containerRel, nil
+			}
+			return "", errors.New("not a controlled-inventory test container")
+		},
+	})
+
+	target := cpusetmaterializer.NewTarget(cpusetmaterializer.TargetInput{
+		ReclaimCPUSet:    machine.NewCPUSet(2, 3),
+		NonReclaimCPUSet: machine.NewCPUSet(0, 1),
+		ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+			podUID: {containerNm: machine.NewCPUSet(0)},
+		},
+	})
+	cg := &fakeCgroupClient{
+		existing: map[string]bool{"primary": true, "reclaim": true, containerRel: true},
+		cpus: map[string]machine.CPUSet{
+			"primary":    machine.NewCPUSet(0, 1),
+			"reclaim":    machine.NewCPUSet(2, 3),
+			containerRel: machine.NewCPUSet(1),
+		},
+		children: map[string][]string{},
+	}
+	p := &CPUSetTopologyPlugin{
+		cfg: bulkheadconfig.BulkheadConfiguration{
+			BulkheadPrimaryRelPath:  "primary",
+			BulkheadReclaimRelPaths: []string{"reclaim"},
+		},
+		cgroup: cg,
+	}
+	result, err := p.ReconcileTopology(context.Background(), bulkheadapi.HandlerContext{
+		MetaServer: &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{
+			PodFetcher: &metapod.PodFetcherStub{PodList: []*v1.Pod{{
+				ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+				Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
+					Name: containerNm, ContainerID: "containerd://" + containerID,
+				}}},
+			}}},
+		}},
+		Topology: &machine.CPUTopology{CPUDetails: machine.CPUDetails{
+			0: {}, 1: {}, 2: {}, 3: {},
+		}},
+		Target: target,
+		View:   bulkheadutils.BuildCPUSetPartitionViewFromTarget(target),
+	})
+	if err != nil {
+		t.Fatalf("ReconcileTopology: %v", err)
+	}
+	if result.FullyConverged {
+		t.Fatalf("controlled container mismatch must not converge: %+v", result.ConvergenceReport)
+	}
+	if cg.pruned != nil {
+		t.Fatalf("non-converged fresh inventory must not prune: %#v", cg.pruned)
+	}
+	for _, mismatch := range result.ConvergenceReport.NonConvergedTargets {
+		if mismatch.Rel == containerRel && mismatch.Reason == "target_mismatch" {
+			return
+		}
+	}
+	t.Fatalf("controlled container mismatch missing from evidence: %+v", result.ConvergenceReport)
+}
+
+func TestCPUSetTopologyInventoryUsesCurrentSystemServiceSwitch(t *testing.T) {
+	target := cpusetmaterializer.NewTarget(cpusetmaterializer.TargetInput{
+		ReclaimCPUSet:    machine.NewCPUSet(2, 3),
+		NonReclaimCPUSet: machine.NewCPUSet(0, 1),
+	})
+	cg := &fakeCgroupClient{
+		existing: map[string]bool{"primary": true, "reclaim": true, "system": true},
+		cpus: map[string]machine.CPUSet{
+			"primary": machine.NewCPUSet(0, 1),
+			"reclaim": machine.NewCPUSet(2, 3),
+			"system":  machine.NewCPUSet(),
+		},
+		children: map[string][]string{},
+	}
+	p := &CPUSetTopologyPlugin{
+		cfg: bulkheadconfig.BulkheadConfiguration{
+			BulkheadPrimaryRelPath:  "primary",
+			BulkheadSystemRelPath:   "system",
+			BulkheadReclaimRelPaths: []string{"reclaim"},
+		},
+		cgroup: cg,
+	}
+	dynamicConf := enabledBulkheadCpusetTopologyDynamicConf()
+	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.EnableBulkheadSystemService = false
+
+	result, err := p.ReconcileTopology(context.Background(), bulkheadapi.HandlerContext{
+		DynamicConf: dynamicConf,
+		Topology: &machine.CPUTopology{CPUDetails: machine.CPUDetails{
+			0: {}, 1: {}, 2: {}, 3: {},
+		}},
+		Target: target,
+		View:   bulkheadutils.BuildCPUSetPartitionViewFromTarget(target),
+	})
+	if err != nil {
+		t.Fatalf("ReconcileTopology with disabled system-service: %v", err)
+	}
+	if !result.FullyConverged {
+		t.Fatalf("disabled system-service rel must not enter controlled inventory: %+v", result.ConvergenceReport)
 	}
 }
 

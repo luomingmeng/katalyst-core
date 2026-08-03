@@ -55,7 +55,7 @@ func TestAllocateFakeNUMANormalShareBlocks_ReusesOwnPoolCPUSet(t *testing.T) {
 
 	shareCPUSet := machine.NewCPUSet(26, 27, 74, 75)
 	reclaimCPUSet := machine.NewCPUSet(33, 34, 35, 36, 37, 38, 39, 81, 82, 83, 84, 85, 86, 87)
-	p.state.SetPodEntries(state.PodEntries{
+	setPodEntriesForTest(t, p.state, state.PodEntries{
 		"seedpool-test": {
 			commonstate.FakedContainerName: &state.AllocationInfo{
 				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta("seedpool-test"),
@@ -98,7 +98,7 @@ func TestGenerateBlockCPUSet_FakeNUMANormalShareDoesNotConsumePreviousReclaim(t 
 
 	shareCPUSet := machine.NewCPUSet(26, 27, 74, 75)
 	reclaimCPUSet := machine.NewCPUSet(33, 34, 35, 36, 37, 38, 39, 81, 82, 83, 84, 85, 86, 87)
-	p.state.SetPodEntries(state.PodEntries{
+	setPodEntriesForTest(t, p.state, state.PodEntries{
 		"seedpool-test": {
 			commonstate.FakedContainerName: &state.AllocationInfo{
 				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta("seedpool-test"),
@@ -142,8 +142,63 @@ func TestGenerateBlockCPUSet_FakeNUMANormalShareDoesNotConsumePreviousReclaim(t 
 		},
 	}
 
-	blockCPUSet, err := p.generateBlockCPUSet(resp)
+	blockCPUSet, err := p.generateBlockCPUSet(resp, false)
 	require.NoError(t, err)
 	require.Equal(t, shareCPUSet, blockCPUSet["new-share-block"])
 	require.Equal(t, reclaimCPUSet, blockCPUSet["new-reclaim-block"])
+}
+
+func TestGenerateBlockCPUSet_PreservesReservedCPUsFromPreviousReclaim(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	previousReclaim := machine.NewCPUSet(0, 1, 2, 3)
+	p.reservedReclaimedCPUSet = machine.NewCPUSet(0, 1)
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	setPodEntriesForTest(t, p.state, state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: previousReclaim,
+			},
+		},
+	}, false)
+
+	resp := &advisorapi.ListAndWatchResponse{
+		Entries: map[string]*advisorapi.CalculationEntries{
+			"share": {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: "share",
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "share-block", Result: 2}},
+							},
+						},
+					},
+				},
+			},
+			commonstate.PoolNameReclaim: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameReclaim,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "reclaim-block", Result: 2}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	blockCPUSet, err := p.generateBlockCPUSet(resp, false)
+	require.NoError(t, err)
+	require.True(t, p.reservedReclaimedCPUSet.IsSubsetOf(blockCPUSet["reclaim-block"]),
+		"reclaim=%s reserved=%s", blockCPUSet["reclaim-block"].String(), p.reservedReclaimedCPUSet.String())
+	require.True(t, blockCPUSet["share-block"].Intersection(p.reservedReclaimedCPUSet).IsEmpty(),
+		"share=%s reserved=%s", blockCPUSet["share-block"].String(), p.reservedReclaimedCPUSet.String())
 }

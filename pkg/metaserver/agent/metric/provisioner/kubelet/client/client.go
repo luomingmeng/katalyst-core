@@ -48,8 +48,8 @@ func (c *KubeletSummaryClient) Summary(ctx context.Context) (*statsapi.Summary, 
 		}
 	} else {
 		url := fmt.Sprintf(summaryApi, c.baseConf.KubeletReadOnlyPort, c.baseConf.KubeletSummaryEndpoint)
-		if err := process.GetAndUnmarshal(url, summary); err != nil {
-			return nil, fmt.Errorf("failed to get summary, error: %v", err)
+		if err := process.GetAndUnmarshalWithContext(ctx, url, summary); err != nil {
+			return nil, fmt.Errorf("failed to get summary: %w", err)
 		}
 	}
 

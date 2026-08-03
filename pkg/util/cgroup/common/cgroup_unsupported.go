@@ -20,6 +20,7 @@ limitations under the License.
 package common
 
 import (
+	"context"
 	"fmt"
 )
 
@@ -44,5 +45,9 @@ func CheckCgroup2UnifiedMode() bool {
 }
 
 func ApplyCgroupConfigs(cgroupPath string, resources *CgroupResources) error {
-	return nil
+	return ApplyCgroupConfigsWithContext(context.Background(), cgroupPath, resources)
+}
+
+func ApplyCgroupConfigsWithContext(ctx context.Context, cgroupPath string, resources *CgroupResources) error {
+	return ctx.Err()
 }

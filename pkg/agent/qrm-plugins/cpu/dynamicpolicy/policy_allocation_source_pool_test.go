@@ -343,6 +343,38 @@ func TestDynamicPolicy_generateProportionalPoolsCPUSetInPlaceWithPreferred(t *te
 		Equals(available))
 }
 
+func TestDynamicPolicy_generateProportionalPoolsCPUSetInPlaceWithPreferredScarcityConservesCPUs(t *testing.T) {
+	t.Parallel()
+
+	p, err := getTestDynamicPolicyWithInitialization(mustGenerateDummyCPUTopology(8, 1, 1), t.TempDir())
+	require.NoError(t, err)
+
+	available := machine.NewCPUSet(0)
+	poolsCPUSet := make(map[string]machine.CPUSet)
+	remaining, err := p.generateProportionalPoolsCPUSetInPlaceWithPreferred(
+		map[string]int{
+			commonstate.PoolNameShare:   1,
+			commonstate.PoolNameReclaim: 1,
+		},
+		poolsCPUSet,
+		available,
+		map[string]machine.CPUSet{
+			commonstate.PoolNameReclaim: available,
+		},
+	)
+	require.NoError(t, err)
+	require.True(t, remaining.IsEmpty())
+	require.True(t, poolsCPUSet[commonstate.PoolNameShare].Equals(available),
+		"share priority must override reclaim preference under scarcity, got %s",
+		poolsCPUSet[commonstate.PoolNameShare].String())
+	require.True(t, poolsCPUSet[commonstate.PoolNameReclaim].IsEmpty(),
+		"reclaim must degrade to empty, got %s", poolsCPUSet[commonstate.PoolNameReclaim].String())
+	require.True(t, poolsCPUSet[commonstate.PoolNameShare].
+		Intersection(poolsCPUSet[commonstate.PoolNameReclaim]).IsEmpty())
+	require.Equal(t, available.Size(),
+		poolsCPUSet[commonstate.PoolNameShare].Size()+poolsCPUSet[commonstate.PoolNameReclaim].Size())
+}
+
 func TestDeriveIsolationSourceSharePool(t *testing.T) {
 	t.Parallel()
 
@@ -451,7 +483,7 @@ func TestDynamicPolicy_generatePoolsAndIsolation_reclaimsIsolationCPUs(t *testin
 	require.NoError(t, err)
 
 	p.reservedCPUs = machine.NewCPUSet()
-	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, true)
+	setAllowSharedOverlapForTest(t, p.state, false, true)
 
 	// seed an existing shared_cores isolation container that historically borrowed 8,9,10
 	// from the "share" source pool.
@@ -469,7 +501,7 @@ func TestDynamicPolicy_generatePoolsAndIsolation_reclaimsIsolationCPUs(t *testin
 			},
 		},
 	}
-	p.state.SetPodEntries(entries, false)
+	setPodEntriesForTest(t, p.state, entries, false)
 
 	availableCPUs := machine.NewCPUSet(0, 1, 2, 3, 8, 9, 10, 11)
 	poolsQuantityMap := map[string]map[int]int{
@@ -501,8 +533,8 @@ func TestDynamicPolicy_generatePoolsAndIsolation_overlapReclaimsIsolationCPUs(t 
 	require.NoError(t, err)
 
 	p.reservedCPUs = machine.NewCPUSet()
-	p.state.SetAllowSharedCoresOverlapReclaimedCores(true, true)
-	p.state.SetPodEntries(state.PodEntries{
+	setAllowSharedOverlapForTest(t, p.state, true, true)
+	setPodEntriesForTest(t, p.state, state.PodEntries{
 		"pod1": state.ContainerEntries{
 			"container1": &state.AllocationInfo{
 				AllocationMeta: commonstate.AllocationMeta{

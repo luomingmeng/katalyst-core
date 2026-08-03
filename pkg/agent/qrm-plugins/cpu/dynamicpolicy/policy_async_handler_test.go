@@ -17,7 +17,9 @@ limitations under the License.
 package dynamicpolicy
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -25,10 +27,13 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2"
 	"k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
 	"github.com/kubewharf/katalyst-api/pkg/consts"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/advisorsvc"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpusetmaterializer"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
@@ -422,7 +427,7 @@ func TestCalculateSystemExclusivePoolChanges(t *testing.T) {
 		t.Parallel()
 
 		policy := newTestDynamicPolicy(t, "calculate-system-exclusive-pool-changes-2")
-		policy.state.SetPodEntries(state.PodEntries{
+		setPodEntriesForTest(t, policy.state, state.PodEntries{
 			"pod-with-pool": {
 				"main": newSystemAllocationInfo(t, policy, "pod-with-pool", "main", "new1", newCPUSet(4, 2)),
 			},
@@ -448,9 +453,9 @@ func TestUpdateSystemExclusivePool(t *testing.T) {
 	poolToShrink := commonstate.GetSystemPoolName("latency")
 	poolToExpand := commonstate.GetSystemPoolName("batch")
 
-	policy.state.SetAllocationInfo(poolToShrink, commonstate.FakedContainerName,
+	setAllocationInfoForTest(t, policy.state, poolToShrink, commonstate.FakedContainerName,
 		newPoolAllocationInfo(t, policy, poolToShrink, newCPUSet(0, 4)), false)
-	policy.state.SetAllocationInfo(poolToExpand, commonstate.FakedContainerName,
+	setAllocationInfoForTest(t, policy.state, poolToExpand, commonstate.FakedContainerName,
 		newPoolAllocationInfo(t, policy, poolToExpand, newCPUSet(4, 2)), false)
 
 	availableAfterUpdate, err := policy.updateSystemExclusivePool(map[string]int{
@@ -497,11 +502,11 @@ func TestAdjustSystemCoresPodAllocation(t *testing.T) {
 	poolName := commonstate.GetSystemPoolName("latency")
 	poolAllocation := newCPUSet(0, 2)
 
-	policy.state.SetAllocationInfo(poolName, commonstate.FakedContainerName,
+	setAllocationInfoForTest(t, policy.state, poolName, commonstate.FakedContainerName,
 		newPoolAllocationInfo(t, policy, poolName, poolAllocation), false)
-	policy.state.SetAllocationInfo("pod-with-pool", "main",
+	setAllocationInfoForTest(t, policy.state, "pod-with-pool", "main",
 		newSystemAllocationInfo(t, policy, "pod-with-pool", "main", "latency", newCPUSet(4, 2)), false)
-	policy.state.SetAllocationInfo("pod-with-missing-pool", "main",
+	setAllocationInfoForTest(t, policy.state, "pod-with-missing-pool", "main",
 		newSystemAllocationInfo(t, policy, "pod-with-missing-pool", "main", "missing", newCPUSet(6, 2)), false)
 
 	err := policy.adjustSystemCoresPodAllocation()
@@ -523,7 +528,7 @@ func TestApplySystemExclusivePoolChanges(t *testing.T) {
 	policy.reservedCPUs = machine.NewCPUSet()
 	defaultSystemCPUs := policy.machineInfo.CPUDetails.CPUs()
 
-	policy.state.SetAllocationInfo("pod-with-pool", "main",
+	setAllocationInfoForTest(t, policy.state, "pod-with-pool", "main",
 		newSystemAllocationInfo(t, policy, "pod-with-pool", "main", "latency", defaultSystemCPUs), false)
 
 	err := policy.applySystemExclusivePoolChanges(
@@ -540,4 +545,192 @@ func TestApplySystemExclusivePoolChanges(t *testing.T) {
 
 	assert.Equal(t, 2, poolAllocationInfo.AllocationResult.Size())
 	assert.True(t, podAllocationInfo.AllocationResult.Equals(poolAllocationInfo.AllocationResult))
+}
+
+func TestSyncSystemExclusivePoolBulkheadFailureKeepsDurableBase(t *testing.T) {
+	policy := newTestDynamicPolicy(t, "sync-system-exclusive-owned-target")
+	policy.reservedCPUs = machine.NewCPUSet()
+	policy.conf.EnableSystemExclusivePool = true
+	conf := dynamicconfig.NewConfiguration()
+	conf.SystemExclusivePool = map[string]int{"latency": 2}
+	policy.dynamicConfig.SetDynamicConfiguration(conf)
+	setAllocationInfoForTest(t, policy.state, "pod-with-pool", "main",
+		newSystemAllocationInfo(t, policy, "pod-with-pool", "main", "latency", policy.machineInfo.CPUDetails.CPUs()), false)
+
+	recordingState := &advisorTargetRecordingState{State: policy.state}
+	policy.state = recordingState
+	base, err := policy.state.PrepareDurableTarget()
+	require.NoError(t, err)
+	recordingState.events = nil
+	policy.cpuSetMaterializer = &transactionRecordingMaterializer{
+		events:  &recordingState.events,
+		results: []cpusetmaterializer.Result{{}, {Converged: true}},
+		errs:    []error{errors.New("injected system-exclusive materializer failure"), nil},
+	}
+	var logs bytes.Buffer
+	klog.LogToStderr(false)
+	klog.SetOutput(&logs)
+	t.Cleanup(func() {
+		klog.LogToStderr(true)
+	})
+
+	policy.syncSystemExclusivePool(nil, nil, nil, nil, nil)
+
+	require.Equal(t, []string{"prepare", "materialize", "materialize"}, recordingState.events)
+	require.Zero(t, recordingState.commitCalls)
+	require.Zero(t, recordingState.setCalls)
+	require.Zero(t, recordingState.storeCalls)
+	require.Equal(t, base, cloneAdvisorState(policy.state))
+	require.Contains(t, logs.String(), "[SystemExclusivePool] failed with error:")
+	require.NotContains(t, logs.String(), "[SystemExclusivePool] completed successfully",
+		"failed worker transaction must not log success")
+}
+
+func TestSyncSystemExclusivePoolCommitsOwnedTargetUnderPolicyLock(t *testing.T) {
+	policy := newTestDynamicPolicy(t, "sync-system-exclusive-owned-target-success")
+	policy.reservedCPUs = machine.NewCPUSet()
+	policy.conf.EnableSystemExclusivePool = true
+	conf := dynamicconfig.NewConfiguration()
+	conf.SystemExclusivePool = map[string]int{"latency": 2}
+	policy.dynamicConfig.SetDynamicConfiguration(conf)
+	setAllocationInfoForTest(t, policy.state, "pod-with-pool", "main",
+		newSystemAllocationInfo(t, policy, "pod-with-pool", "main", "latency", policy.machineInfo.CPUDetails.CPUs()), false)
+
+	recordingState := &advisorTargetRecordingState{State: policy.state}
+	policy.state = recordingState
+	policy.cpuSetMaterializer = &transactionRecordingMaterializer{
+		events:  &recordingState.events,
+		results: []cpusetmaterializer.Result{{Converged: true}},
+		onCall: func(target cpusetmaterializer.Target) {
+			if policy.TryLock() {
+				policy.Unlock()
+				t.Error("policy lock was not held during materialization")
+			}
+			require.Equal(t, 2, target.ContainerCPUSetByPod()["pod-with-pool"]["main"].Size())
+		},
+	}
+
+	policy.syncSystemExclusivePool(nil, nil, nil, nil, nil)
+
+	require.Equal(t, []string{"prepare", "materialize", "commit"}, recordingState.events)
+	require.Equal(t, 1, recordingState.commitCalls)
+	require.Zero(t, recordingState.setCalls)
+	require.Zero(t, recordingState.storeCalls)
+	pool := policy.state.GetAllocationInfo(commonstate.GetSystemPoolName("latency"), commonstate.FakedContainerName)
+	require.NotNil(t, pool)
+	require.Equal(t, 2, pool.AllocationResult.Size())
+}
+
+func TestClearResidualStateBulkheadFailureKeepsDurableBase(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	const podUID = "residual-pod"
+	setAllocationInfoForTest(t, policy.state, podUID, "main", &state.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        podUID,
+			ContainerName: "main",
+			ContainerType: v1alpha1.ContainerType_MAIN.String(),
+			QoSLevel:      consts.PodAnnotationQoSLevelSharedCores,
+			OwnerPoolName: commonstate.PoolNameShare,
+		},
+		AllocationResult: policy.machineInfo.CPUDetails.CPUs(),
+	}, false)
+	policy.residualHitMap = map[string]int64{
+		podUID: int64(maxResidualTime/stateCheckPeriod) - 1,
+	}
+	policy.metaServer = &metaserver.MetaServer{
+		MetaAgent: &agent.MetaAgent{
+			PodFetcher:          &pod.PodFetcherStub{},
+			KatalystMachineInfo: policy.machineInfo,
+		},
+	}
+
+	recordingState := &advisorTargetRecordingState{State: policy.state}
+	policy.state = recordingState
+	base, err := policy.state.PrepareDurableTarget()
+	require.NoError(t, err)
+	recordingState.events = nil
+	policy.cpuSetMaterializer = &transactionRecordingMaterializer{
+		events:  &recordingState.events,
+		results: []cpusetmaterializer.Result{{}, {Converged: true}},
+		errs:    []error{errors.New("injected residual cleanup materializer failure"), nil},
+	}
+
+	policy.clearResidualState(nil, nil, nil, nil, nil)
+
+	require.Equal(t, []string{"prepare", "materialize", "materialize"}, recordingState.events)
+	require.Zero(t, recordingState.commitCalls)
+	require.Zero(t, recordingState.setCalls)
+	require.Zero(t, recordingState.storeCalls)
+	require.Equal(t, base, cloneAdvisorState(policy.state))
+}
+
+func TestClearResidualStateCommitCoversFailedPendingAddWithOutboxRemove(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	for i, podUID := range []string{"residual-a", "residual-b"} {
+		cpus := machine.NewCPUSet(i)
+		assignments, assignmentErr := machine.GetNumaAwareAssignments(policy.machineInfo.CPUTopology, cpus)
+		require.NoError(t, assignmentErr)
+		setAllocationInfoForTest(t, policy.state, podUID, "main", &state.AllocationInfo{
+			AllocationMeta: commonstate.AllocationMeta{
+				PodUid:        podUID,
+				ContainerName: "main",
+				ContainerType: v1alpha1.ContainerType_MAIN.String(),
+				QoSLevel:      consts.PodAnnotationQoSLevelSharedCores,
+				OwnerPoolName: commonstate.PoolNameShare,
+			},
+			AllocationResult:                 cpus,
+			OriginalAllocationResult:         cpus.Clone(),
+			TopologyAwareAssignments:         assignments,
+			OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(assignments),
+		}, false)
+	}
+	policy.residualHitMap = map[string]int64{
+		"residual-a": int64(maxResidualTime/stateCheckPeriod) - 1,
+		"residual-b": int64(maxResidualTime/stateCheckPeriod) - 1,
+	}
+	policy.metaServer = &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{
+		PodFetcher:          &pod.PodFetcherStub{},
+		KatalystMachineInfo: policy.machineInfo,
+	}}
+
+	recordingState := &advisorTargetRecordingState{State: policy.state}
+	policy.state = recordingState
+	policy.cpuSetMaterializer = &transactionRecordingMaterializer{
+		events:  &recordingState.events,
+		results: []cpusetmaterializer.Result{{Converged: true}},
+	}
+	policy.enableCPUAdvisor = true
+	advisor := &outboxRecordingAdvisor{
+		addEntered:  make(chan struct{}),
+		addRelease:  make(chan struct{}),
+		addFailures: 1,
+	}
+	policy.advisorClient = advisor
+	emitter := NewMockMetricsEmitter()
+	policy.emitter = emitter
+	policy.startAdvisorPostCommitWorker()
+	t.Cleanup(policy.stopAdvisorPostCommitWorker)
+	policy.enqueueAdvisorAdd(&advisorsvc.ContainerMetadata{PodUid: "residual-a", ContainerName: "main"})
+	<-advisor.addEntered
+
+	policy.clearResidualState(nil, nil, nil, nil, nil)
+	close(advisor.addRelease)
+
+	require.Equal(t, []string{"prepare", "materialize", "commit"}, recordingState.events)
+	require.Equal(t, []recordedAdvisorCall{
+		{operation: "add", podUID: "residual-a", containerName: "main"},
+		{operation: "remove", podUID: "residual-a"},
+		{operation: "remove", podUID: "residual-b"},
+	}, waitForAdvisorCalls(t, advisor, 3))
+	require.Nil(t, policy.state.GetAllocationInfo("residual-a", "main"),
+		"failed AddContainer must not roll back committed residual cleanup")
+	require.Nil(t, policy.state.GetAllocationInfo("residual-b", "main"))
 }

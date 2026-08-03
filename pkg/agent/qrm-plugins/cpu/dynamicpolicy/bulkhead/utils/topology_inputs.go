@@ -52,8 +52,7 @@ func BuildTopologyNodeSpecsFromView(
 				if !errors.Is(err, os.ErrNotExist) {
 					return nil, fmt.Errorf("stat reclaim rel path %q: %w", reclaimRel, err)
 				}
-				general.InfofV(4, "bulkhead: reclaim rel path does not exist, skipping topology spec, rel=%q err=%v", reclaimRel, err)
-				continue
+				general.InfofV(4, "bulkhead: controlled reclaim rel path does not exist, retaining topology spec for fail-closed verification, rel=%q err=%v", reclaimRel, err)
 			}
 		}
 		reclaimSpec := topology.NodeSpec{Rel: reclaimRel, Role: topology.TopoNodeRoleReclaim}
@@ -67,9 +66,6 @@ func BuildTopologyNodeSpecsFromView(
 		}
 		for _, numaID := range sortedNUMAIDs(view.ReclaimEffectivePerNUMA) {
 			cpus := view.ReclaimEffectivePerNUMA[numaID]
-			if cpus.IsEmpty() {
-				continue
-			}
 			rel := cfg.ReclaimPerNUMA(reclaimIdx, numaID)
 			if rel == "" {
 				continue
@@ -79,8 +75,7 @@ func BuildTopologyNodeSpecsFromView(
 					if !errors.Is(err, os.ErrNotExist) {
 						return nil, fmt.Errorf("stat reclaim NUMA rel path %q: %w", rel, err)
 					}
-					general.InfofV(4, "bulkhead: reclaim NUMA rel path does not exist, skipping topology spec, rel=%q err=%v", rel, err)
-					continue
+					general.InfofV(4, "bulkhead: controlled reclaim NUMA rel path does not exist, retaining topology spec for fail-closed verification, rel=%q err=%v", rel, err)
 				}
 			}
 			// cpuset_topology owns cpuset.cpus only. cpuset.mems for reclaim

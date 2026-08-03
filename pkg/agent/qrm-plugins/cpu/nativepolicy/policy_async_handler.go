@@ -75,6 +75,11 @@ func (p *NativePolicy) clearResidualState() {
 	}
 
 	if podsToDelete.Len() > 0 {
+		target, err := p.state.PrepareDurableTarget()
+		if err != nil {
+			general.ErrorS(err, "prepare durable target failed")
+			return
+		}
 		for {
 			podUID, found := podsToDelete.PopAny()
 			if !found {
@@ -82,18 +87,17 @@ func (p *NativePolicy) clearResidualState() {
 			}
 
 			general.Infof("clear residual pod: %s in state", podUID)
-			delete(podEntries, podUID)
+			delete(target.PodEntries, podUID)
 		}
 
-		updatedMachineState, err := nativepolicyutil.GenerateMachineStateFromPodEntries(p.machineInfo.CPUTopology, podEntries, nil)
+		updatedMachineState, err := nativepolicyutil.GenerateMachineStateFromPodEntries(p.machineInfo.CPUTopology, target.PodEntries, nil)
 		if err != nil {
 			general.Errorf("GenerateMachineStateFromPodEntries failed with error: %v", err)
 			return
 		}
 
-		p.state.SetPodEntries(podEntries, false)
-		p.state.SetMachineState(updatedMachineState, false)
-		if err := p.state.StoreState(); err != nil {
+		target.MachineState = updatedMachineState
+		if err := p.state.CommitTarget(target); err != nil {
 			general.ErrorS(err, "store state failed")
 		}
 	}

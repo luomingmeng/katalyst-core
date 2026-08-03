@@ -25,6 +25,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/util/errors"
@@ -32,6 +33,7 @@ import (
 	bulkheadapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api"
 	bulkheadutils "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpusetmaterializer"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	bulkheadconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/bulkhead"
@@ -47,11 +49,13 @@ const CPUSetTopologyPluginName = "cpuset_topology"
 const defaultPendingPodProtectionTTL = 10 * time.Second
 
 var _ bulkheadapi.Plugin = (*CPUSetTopologyPlugin)(nil)
+var _ bulkheadapi.TopologyPlugin = (*CPUSetTopologyPlugin)(nil)
 
 type CPUSetTopologyPlugin struct {
 	cfg                bulkheadconfig.BulkheadConfiguration
 	cgroup             cgroupclient.CgroupClient
 	now                func() time.Time
+	pendingMu          sync.Mutex
 	pendingProtections map[string]pendingPodProtection
 }
 
@@ -59,6 +63,11 @@ type pendingPodProtection struct {
 	rel          string
 	current      machine.CPUSet
 	protectUntil time.Time
+}
+
+type RuntimeProtection struct {
+	Union machine.CPUSet
+	ByRel map[string]machine.CPUSet
 }
 
 func NewCPUSetTopologyPlugin(conf *config.Configuration) bulkheadapi.Plugin {
@@ -80,9 +89,24 @@ func (p *CPUSetTopologyPlugin) Enable(in bulkheadapi.HandlerContext) bool {
 	return enableBulkheadCpusetTopology(in)
 }
 
-func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in bulkheadapi.HandlerContext) error {
+func (p *CPUSetTopologyPlugin) Reconcile(ctx context.Context, in bulkheadapi.HandlerContext) error {
+	res, err := p.ReconcileTopology(ctx, in)
+	if err != nil {
+		return err
+	}
+	if !res.FullyConverged {
+		return &topology.ConvergenceError{Report: res.ConvergenceReport}
+	}
+	return nil
+}
+
+func (p *CPUSetTopologyPlugin) ReconcileTopology(
+	ctx context.Context,
+	in bulkheadapi.HandlerContext,
+) (topology.DAGApplyResult, error) {
+	var emptyResult topology.DAGApplyResult
 	if in.View == nil {
-		return nil
+		return emptyResult, errors.New("cpuset topology reconcile requires a target view")
 	}
 	relExists := func(rel string) error {
 		_, err := p.cgroup.StatDir(ctx, rel)
@@ -95,36 +119,35 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 		// container id yet) are classified as protected-pending and do NOT
 		// produce an error, so a normal new-pod admit is never rejected.
 		emitBulkheadPruneResult(in.Emitter, "skipped", 0, "container_error")
-		return fmt.Errorf("build expected container cpuset: %w", err)
+		return emptyResult, fmt.Errorf("build expected container cpuset: %w", err)
 	}
 	protectedByRel := p.pendingProtectedCPUSetByRel(ctx, expectedRes.PendingByPod)
-	if protected := unionCPUSetByRel(protectedByRel); !protected.IsEmpty() {
-		general.InfofV(5, "bulkhead: applying transient pending protection, pending_count=%d protected_rel_count=%d protected_union=%s protected_by_rel=%s desired_reclaim=%s desired_reclaim_per_numa=%s reclaim_before=%s reclaim_per_numa_before=%s",
-			len(expectedRes.PendingByPod), len(protectedByRel), protected.String(), formatCPUSetByRel(protectedByRel),
-			in.View.DesiredReclaimEffective.String(), formatCPUSetByNUMA(in.View.DesiredReclaimEffectivePerNUMA),
-			in.View.ReclaimEffective.String(), formatCPUSetByNUMA(in.View.ReclaimEffectivePerNUMA))
-		// Pending allocations have no leaf cgroup to update yet. Keep their CPUs
-		// protected in controlled ancestors so those ancestors do not shrink during
-		// the admission creation window before the leaf becomes available.
-		bulkheadutils.ApplyTransientProtectedNonReclaim(in.View, in.Topology, protected)
-		general.InfofV(5, "bulkhead: transient pending protection applied, protected_union=%s transient_per_numa=%s reclaim_after=%s reclaim_per_numa_after=%s non_reclaim_after=%s",
-			protected.String(), formatCPUSetByNUMA(in.View.TransientProtectedNonReclaimPerNUMA),
-			in.View.ReclaimEffective.String(), formatCPUSetByNUMA(in.View.ReclaimEffectivePerNUMA),
-			in.View.NonReclaimPool.String())
+	protection := RuntimeProtection{
+		Union: expectedRes.PendingCPUSetUnion(),
+		ByRel: protectedByRel,
+	}
+	if reason := validateRuntimeProtection(in.Target, protection); reason != "" {
+		return pendingProtectionConflictResult(protection.Union, in.Target.NonReclaimCPUSet(), reason), nil
 	}
 	siblings, err := p.discoverBulkheadReclaimSiblings(ctx, in.View)
 	if err != nil {
 		emitBulkheadPruneResult(in.Emitter, "skipped", 0, "discover_error")
-		return fmt.Errorf("discover bulkhead reclaim siblings: %w", err)
+		return emptyResult, fmt.Errorf("discover bulkhead reclaim siblings: %w", err)
 	}
 	specs, err := bulkheadutils.BuildTopologyNodeSpecsFromView(p.cfg, in.View, siblings, relExists)
 	if err != nil {
-		return fmt.Errorf("build bulkhead topology inputs: %w", err)
+		return emptyResult, fmt.Errorf("build bulkhead topology inputs: %w", err)
+	}
+	controlledInventory := bulkheadutils.BuildControlledRelInventory(
+		p.cfg, in.Target, bulkheadapi.SystemServiceEnabled(in.DynamicConf), siblings, expectedRes.ExpectedByRel)
+	controlledCPUSetByRel := make(map[string]machine.CPUSet, len(controlledInventory))
+	for _, item := range controlledInventory {
+		controlledCPUSetByRel[item.Rel] = item.Target
 	}
 	dag, err := topology.BuildDAG(specs)
 	if err != nil {
 		emitBulkheadPruneResult(in.Emitter, "skipped", 0, "dag_error")
-		return fmt.Errorf("build bulkhead topology dag: %w", err)
+		return emptyResult, fmt.Errorf("build bulkhead topology dag: %w", err)
 	}
 	general.InfofV(5, "cpuset_topology: apply start specs=%d siblings=%d expected_leaf_count=%d pending_count=%d protected_pending=%s protected_rel_count=%d",
 		len(specs), len(siblings), len(expectedRes.ExpectedByRel), len(expectedRes.PendingByPod),
@@ -146,35 +169,58 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 		ReservedCPUSet:         reservedCPUSet,
 		ExpectedCPUSetByRel:    expectedRes.ExpectedByRel,
 		KubeManagedRelPrefix:   p.cfg.BulkheadPrimaryRelPath,
-		ProtectedPendingCPUSet: expectedRes.PendingCPUSetUnion(),
-		ProtectedCPUSetByRel:   protectedByRel,
+		ProtectedPendingCPUSet: protection.Union,
+		ProtectedCPUSetByRel:   protection.ByRel,
+		ControlledCPUSetByRel:  controlledCPUSetByRel,
 	})
 	if err != nil {
 		emitBulkheadPruneResult(in.Emitter, "skipped", 0, "dag_error")
-		return fmt.Errorf("apply bulkhead topology dag: %w", err)
+		return res, fmt.Errorf("apply bulkhead topology dag: %w", err)
 	}
 	if !res.FullyConverged {
-		// A deferred generational shrink (res.Deferred>0) is an expected transient:
-		// the parent stayed a valid superset of every live child, so this handler
-		// returns nil (does NOT fail Pod admission) and the next periodical
-		// reconcile finishes the narrowing once the advisor moves the child bucket.
 		general.InfofV(4, "cpuset_topology: apply not fully converged, deferred=%d report=%+v", res.Deferred, res.ConvergenceReport)
 		reason := "not_converged"
 		if res.Deferred > 0 {
 			reason = "deferred_convergence"
 		}
 		emitBulkheadPruneResult(in.Emitter, "skipped", 0, reason)
-		return nil
+		return res, nil
 	}
 
 	activeRels := bulkheadutils.CollectActiveRels(p.cfg, in.View, in.MetaServer, siblings, relExists)
 	p.cgroup.Prune(activeRels)
 	emitBulkheadPruneResult(in.Emitter, "success", len(activeRels), "")
-	return nil
+	return res, nil
 }
 
-func (p *CPUSetTopologyPlugin) CPUSetAdjustmentDisabledHandler(ctx context.Context, in bulkheadapi.HandlerContext) error {
-	p.pendingProtections = map[string]pendingPodProtection{}
+func validateRuntimeProtection(target cpusetmaterializer.Target, protection RuntimeProtection) string {
+	if !protection.Union.Intersection(target.ReclaimCPUSet()).IsEmpty() {
+		return "pending_reclaim_conflict"
+	}
+	if !protection.Union.IsSubsetOf(target.NonReclaimCPUSet()) {
+		return "pending_outside_non_reclaim"
+	}
+	return ""
+}
+
+func pendingProtectionConflictResult(
+	protected machine.CPUSet,
+	nonReclaim machine.CPUSet,
+	reason string,
+) topology.DAGApplyResult {
+	return topology.DAGApplyResult{ConvergenceReport: topology.ConvergenceReport{
+		PendingToPrimary: protected.Clone(),
+		NonConvergedTargets: []topology.RelConvergence{{
+			Rel:      "pending-protection",
+			Observed: protected.Clone(),
+			Target:   nonReclaim.Clone(),
+			Reason:   reason,
+		}},
+	}}
+}
+
+func (p *CPUSetTopologyPlugin) Reset(ctx context.Context, in bulkheadapi.HandlerContext) error {
+	p.resetPendingProtections()
 	return p.resetCPUSetTopology(ctx, in)
 }
 
@@ -269,7 +315,7 @@ func (p *CPUSetTopologyPlugin) resetCPUSetTopology(ctx context.Context, in bulkh
 	if !res.FullyConverged {
 		general.InfofV(4, "cpuset_topology: disabled reset not fully converged, report=%+v", res.ConvergenceReport)
 		emitBulkheadPruneResult(in.Emitter, "skipped", res.Applied, "reset_not_converged")
-		return nil
+		return &topology.ConvergenceError{Report: res.ConvergenceReport}
 	}
 
 	emitBulkheadPruneResult(in.Emitter, "success", res.Applied, "")
@@ -425,7 +471,7 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(_ context.Context, in bu
 					podUID, containerName, cpus.String()))
 				continue
 			}
-			out.ExpectedByRel[rel] = cpus
+			out.ExpectedByRel[rel] = out.ExpectedByRel[rel].Union(cpus)
 		}
 	}
 	if len(errs) > 0 {
@@ -435,6 +481,9 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(_ context.Context, in bu
 }
 
 func (p *CPUSetTopologyPlugin) pendingProtectedCPUSetByRel(ctx context.Context, pendingByPod []pendingContainerCPUSet) map[string]machine.CPUSet {
+	p.pendingMu.Lock()
+	defer p.pendingMu.Unlock()
+
 	if len(pendingByPod) == 0 {
 		p.pendingProtections = map[string]pendingPodProtection{}
 		return nil
@@ -507,44 +556,10 @@ func (p *CPUSetTopologyPlugin) pendingProtectedCPUSetByRel(ctx context.Context, 
 	return out
 }
 
-func unionCPUSetByRel(byRel map[string]machine.CPUSet) machine.CPUSet {
-	union := machine.NewCPUSet()
-	for _, cpus := range byRel {
-		union = union.Union(cpus)
-	}
-	return union
-}
-
-func formatCPUSetByRel(byRel map[string]machine.CPUSet) string {
-	if len(byRel) == 0 {
-		return "{}"
-	}
-	rels := make([]string, 0, len(byRel))
-	for rel := range byRel {
-		rels = append(rels, rel)
-	}
-	sort.Strings(rels)
-	parts := make([]string, 0, len(rels))
-	for _, rel := range rels {
-		parts = append(parts, fmt.Sprintf("%s=%s", rel, byRel[rel].String()))
-	}
-	return "{" + strings.Join(parts, ",") + "}"
-}
-
-func formatCPUSetByNUMA(byNUMA map[int]machine.CPUSet) string {
-	if len(byNUMA) == 0 {
-		return "{}"
-	}
-	numaIDs := make([]int, 0, len(byNUMA))
-	for numaID := range byNUMA {
-		numaIDs = append(numaIDs, numaID)
-	}
-	sort.Ints(numaIDs)
-	parts := make([]string, 0, len(numaIDs))
-	for _, numaID := range numaIDs {
-		parts = append(parts, fmt.Sprintf("%d=%s", numaID, byNUMA[numaID].String()))
-	}
-	return "{" + strings.Join(parts, ",") + "}"
+func (p *CPUSetTopologyPlugin) resetPendingProtections() {
+	p.pendingMu.Lock()
+	defer p.pendingMu.Unlock()
+	p.pendingProtections = map[string]pendingPodProtection{}
 }
 
 func (p *CPUSetTopologyPlugin) discoverBulkheadReclaimSiblings(ctx context.Context, view *bulkheadutils.CPUSetPartitionView) ([]string, error) {
@@ -612,7 +627,7 @@ func (p *CPUSetTopologyPlugin) discoverBulkheadReclaimSiblings(ctx context.Conte
 }
 
 func enableBulkheadCpusetTopology(in bulkheadapi.HandlerContext) bool {
-	if in.State != nil && in.State.GetAllowSharedCoresOverlapReclaimedCores() {
+	if in.Target.AllowReclaimOverlap() {
 		return false
 	}
 	return enableBulkheadCpusetTopologyByDynamicConf(in.DynamicConf)

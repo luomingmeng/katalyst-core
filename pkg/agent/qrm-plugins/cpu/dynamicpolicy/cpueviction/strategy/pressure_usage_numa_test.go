@@ -139,7 +139,7 @@ func TestNumaCPUPressureEviction_update(t *testing.T) {
 		},
 	}
 
-	state1.SetPodEntries(podEntry, true)
+	setPodEntriesForTest(t, state1, podEntry)
 
 	type fields struct {
 		conf               *config.Configuration

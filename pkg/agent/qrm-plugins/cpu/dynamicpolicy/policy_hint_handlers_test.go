@@ -821,8 +821,8 @@ func setCPUTotalRequestThresholdPodEntries(t *testing.T, policy *DynamicPolicy, 
 	machineState, err := generateMachineStateFromPodEntries(policy.machineInfo.CPUTopology, podEntries, policy.state.GetMachineState())
 	require.NoError(t, err)
 
-	policy.state.SetPodEntries(podEntries, false)
-	policy.state.SetMachineState(machineState, false)
+	setPodEntriesForTest(t, policy.state, podEntries, false)
+	setMachineStateForTest(t, policy.state, machineState, false)
 }
 
 func TestCPUTotalRequestThresholdRejectExistingAllocation(t *testing.T) {
@@ -936,7 +936,7 @@ func TestCPUTotalRequestThresholdRejectExistingAllocation(t *testing.T) {
 			policy := newTestPolicyForCPUTotalRequestThreshold(t, 0.5)
 			req := newCPUTotalRequestThresholdReq(tt.qosLevel, tt.reqCount, tt.inplaceResize)
 			if tt.allocationInfo != nil {
-				policy.state.SetAllocationInfo(tt.allocationInfo.AllocationMeta.PodUid, tt.allocationInfo.AllocationMeta.ContainerName, tt.allocationInfo, true)
+				setAllocationInfoForTest(t, policy.state, tt.allocationInfo.AllocationMeta.PodUid, tt.allocationInfo.AllocationMeta.ContainerName, tt.allocationInfo, true)
 				if tt.allocationInfo.CheckNUMABinding() {
 					req.Annotations[consts.PodAnnotationMemoryEnhancementNumaBinding] = consts.PodAnnotationMemoryEnhancementNumaBindingEnable
 				}

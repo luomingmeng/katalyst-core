@@ -84,7 +84,11 @@ func (p *NativePolicy) dedicatedCoresAllocationHandler(_ context.Context,
 		}
 	}
 
-	machineState := p.state.GetMachineState()
+	target, err := p.state.PrepareDurableTarget()
+	if err != nil {
+		return nil, err
+	}
+	machineState := target.MachineState
 
 	// Allocate CPUs according to the NUMA affinity contained in the hint.
 	result, err := p.allocateCPUs(machineState, reqInt, req.Hint, p.cpusToReuse[req.PodUid])
@@ -126,24 +130,27 @@ func (p *NativePolicy) dedicatedCoresAllocationHandler(_ context.Context,
 		RequestQuantity:                  reqFloat64,
 	}
 
-	// update pod entries directly.
-	// if one of subsequent steps is failed, we will delete current allocationInfo from podEntries in defer function of allocation function.
-	p.state.SetAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, allocationInfo, true)
-	podEntries := p.state.GetPodEntries()
+	if target.PodEntries[allocationInfo.PodUid] == nil {
+		target.PodEntries[allocationInfo.PodUid] = make(state.ContainerEntries)
+	}
+	target.PodEntries[allocationInfo.PodUid][allocationInfo.ContainerName] = allocationInfo.Clone()
 
-	updatedMachineState, err := nativepolicyutil.GenerateMachineStateFromPodEntries(p.machineInfo.CPUTopology, podEntries, nil)
+	updatedMachineState, err := nativepolicyutil.GenerateMachineStateFromPodEntries(p.machineInfo.CPUTopology, target.PodEntries, nil)
 	if err != nil {
 		general.Errorf("pod: %s/%s, container: %s GenerateMachineStateFromPodEntries failed with error: %v",
 			req.PodNamespace, req.PodName, req.ContainerName, err)
 		return nil, fmt.Errorf("GenerateMachineStateFromPodEntries failed with error: %v", err)
 	}
-	p.state.SetMachineState(updatedMachineState, true)
+	target.MachineState = updatedMachineState
 
 	resp, err := cpuutil.PackAllocationResponse(allocationInfo, string(v1.ResourceCPU), util.OCIPropertyNameCPUSetCPUs, false, true, req)
 	if err != nil {
 		general.Errorf("pod: %s/%s, container: %s PackResourceAllocationResponseByAllocationInfo failed with error: %v",
 			req.PodNamespace, req.PodName, req.ContainerName, err)
 		return nil, fmt.Errorf("PackResourceAllocationResponseByAllocationInfo failed with error: %v", err)
+	}
+	if err := p.state.CommitTarget(target); err != nil {
+		return nil, err
 	}
 	return resp, nil
 }
@@ -160,7 +167,11 @@ func (p *NativePolicy) sharedPoolAllocationHandler(ctx context.Context,
 		return nil, fmt.Errorf("getReqQuantityFromResourceReq failed with error: %v", err)
 	}
 
-	defaultCPUSet := p.state.GetMachineState().GetDefaultCPUSet()
+	target, err := p.state.PrepareDurableTarget()
+	if err != nil {
+		return nil, err
+	}
+	defaultCPUSet := target.MachineState.GetDefaultCPUSet()
 	if defaultCPUSet.IsEmpty() {
 		return nil, errors.New("default cpuset is empty")
 	}
@@ -193,24 +204,27 @@ func (p *NativePolicy) sharedPoolAllocationHandler(ctx context.Context,
 		RequestQuantity:                  reqFloat64,
 	}
 
-	// update pod entries directly.
-	// if one of subsequent steps is failed, we will delete current allocationInfo from podEntries in defer function of allocation function.
-	p.state.SetAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, allocationInfo, true)
-	podEntries := p.state.GetPodEntries()
+	if target.PodEntries[allocationInfo.PodUid] == nil {
+		target.PodEntries[allocationInfo.PodUid] = make(state.ContainerEntries)
+	}
+	target.PodEntries[allocationInfo.PodUid][allocationInfo.ContainerName] = allocationInfo.Clone()
 
-	updatedMachineState, err := nativepolicyutil.GenerateMachineStateFromPodEntries(p.machineInfo.CPUTopology, podEntries, nil)
+	updatedMachineState, err := nativepolicyutil.GenerateMachineStateFromPodEntries(p.machineInfo.CPUTopology, target.PodEntries, nil)
 	if err != nil {
 		general.Errorf("pod: %s/%s, container: %s GenerateMachineStateFromPodEntries failed with error: %v",
 			req.PodNamespace, req.PodName, req.ContainerName, err)
 		return nil, fmt.Errorf("GenerateMachineStateFromPodEntries failed with error: %v", err)
 	}
-	p.state.SetMachineState(updatedMachineState, true)
+	target.MachineState = updatedMachineState
 
 	resp, err := cpuutil.PackAllocationResponse(allocationInfo, string(v1.ResourceCPU), util.OCIPropertyNameCPUSetCPUs, false, true, req)
 	if err != nil {
 		general.Errorf("pod: %s/%s, container: %s PackResourceAllocationResponseByAllocationInfo failed with error: %v",
 			req.PodNamespace, req.PodName, req.ContainerName, err)
 		return nil, fmt.Errorf("PackResourceAllocationResponseByAllocationInfo failed with error: %v", err)
+	}
+	if err := p.state.CommitTarget(target); err != nil {
+		return nil, err
 	}
 	return resp, nil
 }

@@ -112,6 +112,19 @@ func (f *fakeState) StoreState() error {
 	return nil
 }
 
+func (f *fakeState) PrepareDurableTarget() (*state.TargetState, error) {
+	return &state.TargetState{
+		PodEntries:   f.GetPodEntries(),
+		MachineState: f.GetMachineState(),
+	}, nil
+}
+
+func (f *fakeState) CommitTarget(target *state.TargetState) error {
+	f.SetPodEntries(target.PodEntries, false)
+	f.SetMachineState(target.MachineState, false)
+	return nil
+}
+
 func newTestOptimizer(ratio float64, machineState state.NUMANodeMap) *cpuTotalRequestThresholdHintOptimizer {
 	conf := config.NewConfiguration()
 	conf.CPUQRMPluginConfig.TotalRequestThresholdHintOptimizerConfig.CPUTotalRequestThresholdRatio = ratio

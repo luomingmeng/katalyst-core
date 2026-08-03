@@ -18,6 +18,7 @@ package dynamicpolicy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -28,6 +29,7 @@ import (
 	"time"
 
 	"github.com/bytedance/mockey"
+	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -51,13 +53,12 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/advisorsvc"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
-	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/calculator"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpusetmaterializer"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/hintoptimizer"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/hintoptimizer/policy/canonical"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
-	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/validator"
 	cpuutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/util"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation"
@@ -117,18 +118,24 @@ func getTestDynamicPolicyWithInitialization(
 		return nil, err
 	}
 
-	err = dynamicPolicy.initReservePool()
-	if err != nil {
-		return nil, err
-	}
-
-	err = dynamicPolicy.initReclaimPool()
+	err = dynamicPolicy.bootstrapPools(context.Background())
 	if err != nil {
 		return nil, err
 	}
 
 	dynamicPolicy.stopCh = make(chan struct{})
 	return dynamicPolicy, nil
+}
+
+func getTopologyAssignmentSizes(t *testing.T, topology *machine.CPUTopology, cpus machine.CPUSet) map[uint64]uint64 {
+	t.Helper()
+	assignments, err := machine.GetNumaAwareAssignments(topology, cpus)
+	require.NoError(t, err)
+	result := make(map[uint64]uint64, len(assignments))
+	for numaID, assignment := range assignments {
+		result[uint64(numaID)] = uint64(assignment.Size())
+	}
+	return result
 }
 
 func getTestDynamicPolicyWithoutInitialization(
@@ -160,29 +167,22 @@ func getTestDynamicPolicyWithoutInitialization(
 	if err != nil {
 		return nil, err
 	}
-	bulkheadManager, err := bulkhead.NewManager(conf)
-	if err != nil {
-		return nil, err
-	}
-
 	policyImplement := &DynamicPolicy{
-		conf:                      conf,
-		machineInfo:               machineInfo,
-		qosConfig:                 qosConfig,
-		dynamicConfig:             dynamicConfig,
-		state:                     stateImpl,
-		advisorValidator:          validator.NewCPUAdvisorValidator(stateImpl, machineInfo),
-		featureGateManager:        featuregatenegotiation.NewFeatureGateManager(config.NewConfiguration()),
-		reservedReclaimedCPUsSize: general.Max(reservedReclaimedCPUsSize, topology.NumNUMANodes),
-		reservedCPUs:              reservedCPUs,
-		enableReclaimNUMABinding:  true,
-		emitter:                   metrics.DummyMetrics{},
-		podDebugAnnoKeys:          []string{podDebugAnnoKey},
-		numaNumberAnnotationKey:   consts.PodAnnotationCPUEnhancementNumaNumber,
-		numaIDsAnnotationKey:      consts.PodAnnotationCPUEnhancementNumaIDs,
-		resourcePackageManager:    resourcepackage.NewCachedResourcePackageManager(resourcepackage.NewResourcePackageManager(&npd.DummyNPDFetcher{NPD: &nodev1alpha1.NodeProfileDescriptor{}})),
-		bulkheadManager:           bulkheadManager,
-
+		lifecycleState:                  policyLifecycleReady,
+		conf:                            conf,
+		machineInfo:                     machineInfo,
+		qosConfig:                       qosConfig,
+		dynamicConfig:                   dynamicConfig,
+		state:                           stateImpl,
+		featureGateManager:              featuregatenegotiation.NewFeatureGateManager(config.NewConfiguration()),
+		reservedReclaimedCPUsSize:       general.Max(reservedReclaimedCPUsSize, topology.NumNUMANodes),
+		reservedCPUs:                    reservedCPUs,
+		enableReclaimNUMABinding:        true,
+		emitter:                         metrics.DummyMetrics{},
+		podDebugAnnoKeys:                []string{podDebugAnnoKey},
+		numaNumberAnnotationKey:         consts.PodAnnotationCPUEnhancementNumaNumber,
+		numaIDsAnnotationKey:            consts.PodAnnotationCPUEnhancementNumaIDs,
+		resourcePackageManager:          resourcepackage.NewCachedResourcePackageManager(resourcepackage.NewResourcePackageManager(&npd.DummyNPDFetcher{NPD: &nodev1alpha1.NodeProfileDescriptor{}})),
 		topologyAllocationAnnotationKey: coreconsts.QRMPodAnnotationTopologyAllocationKey,
 	}
 
@@ -190,14 +190,6 @@ func getTestDynamicPolicyWithoutInitialization(
 	// to ensure that the test environment correctly generates NUMA topology annotations
 	// in the allocation response, matching the production behavior.
 	policyImplement.RegisterAllocationHook(policyImplement.topologyAllocationHook)
-
-	// register allocation behaviors for pods with different QoS level
-	policyImplement.allocationHandlers = map[string]util.AllocationHandler{
-		consts.PodAnnotationQoSLevelSharedCores:    policyImplement.sharedCoresAllocationHandler,
-		consts.PodAnnotationQoSLevelDedicatedCores: policyImplement.dedicatedCoresAllocationHandler,
-		consts.PodAnnotationQoSLevelReclaimedCores: policyImplement.reclaimedCoresAllocationHandler,
-		consts.PodAnnotationQoSLevelSystemCores:    policyImplement.systemCoresAllocationHandler,
-	}
 
 	// register hint providers for pods with different QoS level
 	policyImplement.hintHandlers = map[string]util.HintHandler{
@@ -262,7 +254,7 @@ func TestCleanPoolsSkipsNilAllocationInfo(t *testing.T) {
 
 	policyImpl, err := getTestDynamicPolicyWithoutInitialization(cpuTopology, tmpDir)
 	as.Nil(err)
-	policyImpl.state.SetPodEntries(state.PodEntries{
+	setPodEntriesForTest(t, policyImpl.state, state.PodEntries{
 		"pod-with-nil-entry": {
 			"container-with-nil-allocation": nil,
 		},
@@ -287,7 +279,7 @@ func TestGetResourcesAllocationSkipsNilAllocationInfo(t *testing.T) {
 
 	policyImpl, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	as.Nil(err)
-	policyImpl.state.SetPodEntries(state.PodEntries{
+	setPodEntriesForTest(t, policyImpl.state, state.PodEntries{
 		"pod-with-nil-entry": {
 			"container-with-nil-allocation": nil,
 		},
@@ -316,7 +308,7 @@ func TestSystemExclusivePoolSkipsNilAllocationInfo(t *testing.T) {
 
 	policyImpl, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	as.Nil(err)
-	policyImpl.state.SetPodEntries(state.PodEntries{
+	setPodEntriesForTest(t, policyImpl.state, state.PodEntries{
 		"pod-with-nil-entry": {
 			"container-with-nil-allocation": nil,
 		},
@@ -346,14 +338,99 @@ func TestInitPoolAndCalculator(t *testing.T) {
 	policyImpl, err := getTestDynamicPolicyWithoutInitialization(cpuTopology, tmpDir)
 	as.Nil(err)
 
-	err = policyImpl.initReclaimPool()
+	err = policyImpl.bootstrapPools(context.Background())
 	as.Nil(err)
 
 	reclaimPoolAllocationInfo := policyImpl.state.GetAllocationInfo(commonstate.PoolNameReclaim, "")
 
 	as.NotNil(reclaimPoolAllocationInfo)
 
-	as.Equal(reclaimPoolAllocationInfo.AllocationResult.Size(), reservedReclaimedCPUsSize)
+	as.Equal(policyImpl.reservedReclaimedCPUsSize, reclaimPoolAllocationInfo.AllocationResult.Size())
+}
+
+func TestReservedReclaimedCPUsSizeUsesTwoCPUsPerNUMA(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, 4, getReservedReclaimedCPUsSize(1))
+	require.Equal(t, 4, getReservedReclaimedCPUsSize(2))
+	require.Equal(t, 8, getReservedReclaimedCPUsSize(4))
+	require.Equal(t, map[int]int{0: 2, 2: 2}, getReservedReclaimedCPUsSizePerNUMA(4, []int{0, 2}))
+}
+
+func TestInitReclaimPoolReservedCPUSetPrefersPreviousReclaimPerNUMA(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 2)
+	require.NoError(t, err)
+
+	policyImpl, err := getTestDynamicPolicyWithoutInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	allAvailable := policyImpl.machineInfo.CPUDetails.CPUs().Difference(policyImpl.reservedCPUs)
+
+	previousByNUMA := make(map[int]machine.CPUSet)
+	previousReclaim := machine.NewCPUSet()
+	for _, numaID := range cpuTopology.CPUDetails.NUMANodes().ToSliceInt() {
+		candidates := allAvailable.Intersection(cpuTopology.CPUDetails.CPUsInNUMANodes(numaID)).ToSliceInt()
+		require.GreaterOrEqual(t, len(candidates), 3)
+		previousByNUMA[numaID] = machine.NewCPUSet(candidates[len(candidates)-2], candidates[len(candidates)-1])
+		previousReclaim = previousReclaim.Union(previousByNUMA[numaID])
+	}
+	setAllocationInfoForTest(t, policyImpl.state, commonstate.PoolNameReclaim, commonstate.FakedContainerName, &state.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+		AllocationResult: previousReclaim,
+	}, false)
+
+	target, err := policyImpl.state.PrepareDurableTarget()
+	require.NoError(t, err)
+	reserved, assignments, err := policyImpl.initReclaimPoolOnTarget(target)
+	require.NoError(t, err)
+	require.NoError(t, policyImpl.state.CommitTarget(target))
+	policyImpl.reservedReclaimedCPUSet = reserved
+	policyImpl.reservedReclaimedTopologyAwareAssignments = assignments
+	require.Equal(t, policyImpl.reservedReclaimedCPUsSize, policyImpl.reservedReclaimedCPUSet.Size())
+	for numaID, previous := range previousByNUMA {
+		got := policyImpl.reservedReclaimedCPUSet.Intersection(cpuTopology.CPUDetails.CPUsInNUMANodes(numaID))
+		require.True(t, got.Equals(previous), "numa=%d got=%s previous=%s", numaID, got.String(), previous.String())
+	}
+}
+
+func TestInitReclaimPoolReservedCPUSetFillsPreviousReclaimPerNUMA(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 2)
+	require.NoError(t, err)
+
+	policyImpl, err := getTestDynamicPolicyWithoutInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	allAvailable := policyImpl.machineInfo.CPUDetails.CPUs().Difference(policyImpl.reservedCPUs)
+	numaIDs := cpuTopology.CPUDetails.NUMANodes().ToSliceInt()
+	require.Len(t, numaIDs, 2)
+
+	numa0Candidates := allAvailable.Intersection(cpuTopology.CPUDetails.CPUsInNUMANodes(numaIDs[0])).ToSliceInt()
+	numa1Candidates := allAvailable.Intersection(cpuTopology.CPUDetails.CPUsInNUMANodes(numaIDs[1])).ToSliceInt()
+	require.GreaterOrEqual(t, len(numa0Candidates), 3)
+	require.GreaterOrEqual(t, len(numa1Candidates), 3)
+	previousNUMA0 := machine.NewCPUSet(numa0Candidates[len(numa0Candidates)-1])
+	previousNUMA1 := machine.NewCPUSet(numa1Candidates[len(numa1Candidates)-3], numa1Candidates[len(numa1Candidates)-2], numa1Candidates[len(numa1Candidates)-1])
+	previousReclaim := previousNUMA0.Union(previousNUMA1)
+	setAllocationInfoForTest(t, policyImpl.state, commonstate.PoolNameReclaim, commonstate.FakedContainerName, &state.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+		AllocationResult: previousReclaim,
+	}, false)
+
+	target, err := policyImpl.state.PrepareDurableTarget()
+	require.NoError(t, err)
+	reserved, assignments, err := policyImpl.initReclaimPoolOnTarget(target)
+	require.NoError(t, err)
+	require.NoError(t, policyImpl.state.CommitTarget(target))
+	policyImpl.reservedReclaimedCPUSet = reserved
+	policyImpl.reservedReclaimedTopologyAwareAssignments = assignments
+	gotNUMA0 := policyImpl.reservedReclaimedCPUSet.Intersection(cpuTopology.CPUDetails.CPUsInNUMANodes(numaIDs[0]))
+	gotNUMA1 := policyImpl.reservedReclaimedCPUSet.Intersection(cpuTopology.CPUDetails.CPUsInNUMANodes(numaIDs[1]))
+	require.Equal(t, 2, gotNUMA0.Size())
+	require.Equal(t, 2, gotNUMA1.Size())
+	require.True(t, previousNUMA0.IsSubsetOf(gotNUMA0), "got=%s previous=%s", gotNUMA0.String(), previousNUMA0.String())
+	require.Equal(t, 2, gotNUMA1.Intersection(previousNUMA1).Size(), "got=%s previous=%s", gotNUMA1.String(), previousNUMA1.String())
 }
 
 func TestRemovePod(t *testing.T) {
@@ -408,19 +485,19 @@ func TestRemovePod(t *testing.T) {
 				string(v1.ResourceCPU): {
 					IsNodeResource:             false,
 					IsScalarResource:           true,
-					AggregatedQuantity:         14,
-					OriginalAggregatedQuantity: 14,
+					AggregatedQuantity:         10,
+					OriginalAggregatedQuantity: 10,
 					TopologyAwareQuantityList: []*pluginapi.TopologyAwareQuantity{
-						{ResourceValue: 3, Node: 0},
-						{ResourceValue: 3, Node: 1},
-						{ResourceValue: 4, Node: 2},
-						{ResourceValue: 4, Node: 3},
+						{ResourceValue: 2, Node: 0},
+						{ResourceValue: 2, Node: 1},
+						{ResourceValue: 3, Node: 2},
+						{ResourceValue: 3, Node: 3},
 					},
 					OriginalTopologyAwareQuantityList: []*pluginapi.TopologyAwareQuantity{
-						{ResourceValue: 3, Node: 0},
-						{ResourceValue: 3, Node: 1},
-						{ResourceValue: 4, Node: 2},
-						{ResourceValue: 4, Node: 3},
+						{ResourceValue: 2, Node: 0},
+						{ResourceValue: 2, Node: 1},
+						{ResourceValue: 3, Node: 2},
+						{ResourceValue: 3, Node: 3},
 					},
 				},
 			},
@@ -557,13 +634,13 @@ func TestAllocate(t *testing.T) {
 							OciPropertyName:   util.OCIPropertyNameCPUSetCPUs,
 							IsNodeResource:    false,
 							IsScalarResource:  true,
-							AllocatedQuantity: 14,
-							AllocationResult:  "1,3-15",
+							AllocatedQuantity: 10,
+							AllocationResult:  "5,7-15",
 							TopologyAssignments: map[uint64]uint64{
-								0: 3,
-								1: 3,
-								2: 4,
-								3: 4,
+								0: 2,
+								1: 2,
+								2: 3,
+								3: 3,
 							},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{nil},
@@ -1785,7 +1862,7 @@ func TestAllocate(t *testing.T) {
 			}
 
 			if tc.allowSharedCoresOverlapReclaimedCores {
-				dynamicPolicy.state.SetAllowSharedCoresOverlapReclaimedCores(true, true)
+				setAllowSharedOverlapForTest(t, dynamicPolicy.state, true, true)
 			}
 
 			// TestAllocate's dedicated_cores expectations cover baseline NUMA
@@ -1793,7 +1870,7 @@ func TestAllocate(t *testing.T) {
 			// TestDynamicPolicy_allocateNumaBindingCPUs with explicit reclaim
 			// inputs. Keep this fixture independent from the default reclaim pool.
 			if tc.req.Labels[consts.PodAnnotationQoSLevelKey] == consts.PodAnnotationQoSLevelDedicatedCores {
-				dynamicPolicy.state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &state.AllocationInfo{
+				setAllocationInfoForTest(t, dynamicPolicy.state, commonstate.PoolNameReclaim, commonstate.FakedContainerName, &state.AllocationInfo{
 					AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
 					AllocationResult:         machine.NewCPUSet(),
 					OriginalAllocationResult: machine.NewCPUSet(),
@@ -5533,12 +5610,12 @@ func TestGetTopologyHints(t *testing.T) {
 				machineState, err := generateMachineStateFromPodEntries(tc.cpuTopology, tc.podEntries, nil)
 				as.Nil(err)
 
-				dynamicPolicy.state.SetPodEntries(tc.podEntries, true)
-				dynamicPolicy.state.SetMachineState(machineState, true)
+				setPodEntriesForTest(t, dynamicPolicy.state, tc.podEntries, true)
+				setMachineStateForTest(t, dynamicPolicy.state, machineState, true)
 			}
 
 			if tc.numaHeadroom != nil {
-				dynamicPolicy.state.SetNUMAHeadroom(tc.numaHeadroom, true)
+				setNUMAHeadroomForTest(t, dynamicPolicy.state, tc.numaHeadroom, true)
 			}
 
 			if tc.cpuNUMAHintPreferPolicy != "" {
@@ -5665,7 +5742,7 @@ func TestAddReclaimedCPUAllocatable(t *testing.T) {
 	numaNodes := dynamicPolicy.machineInfo.CPUDetails.NUMANodes().ToSliceInt()
 
 	// headroom is expressed in cores; the reported value is millicpu (cores * 1000).
-	dynamicPolicy.state.SetNUMAHeadroom(map[int]float64{
+	setNUMAHeadroomForTest(t, dynamicPolicy.state, map[int]float64{
 		0: 1,
 		1: 2,
 		2: 3,
@@ -5839,19 +5916,19 @@ func TestGetTopologyAwareResources(t *testing.T) {
 						string(v1.ResourceCPU): {
 							IsNodeResource:             false,
 							IsScalarResource:           true,
-							AggregatedQuantity:         14,
-							OriginalAggregatedQuantity: 14,
+							AggregatedQuantity:         10,
+							OriginalAggregatedQuantity: 10,
 							TopologyAwareQuantityList: []*pluginapi.TopologyAwareQuantity{
-								{ResourceValue: 3, Node: 0},
-								{ResourceValue: 3, Node: 1},
-								{ResourceValue: 4, Node: 2},
-								{ResourceValue: 4, Node: 3},
+								{ResourceValue: 2, Node: 0},
+								{ResourceValue: 2, Node: 1},
+								{ResourceValue: 3, Node: 2},
+								{ResourceValue: 3, Node: 3},
 							},
 							OriginalTopologyAwareQuantityList: []*pluginapi.TopologyAwareQuantity{
-								{ResourceValue: 3, Node: 0},
-								{ResourceValue: 3, Node: 1},
-								{ResourceValue: 4, Node: 2},
-								{ResourceValue: 4, Node: 3},
+								{ResourceValue: 2, Node: 0},
+								{ResourceValue: 2, Node: 1},
+								{ResourceValue: 3, Node: 2},
+								{ResourceValue: 3, Node: 3},
 							},
 						},
 					},
@@ -6033,18 +6110,14 @@ func TestGetResourcesAllocation(t *testing.T) {
 	as.NotNil(resp1.PodResources[req.PodUid])
 	as.NotNil(resp1.PodResources[req.PodUid].ContainerResources[testName])
 	as.NotNil(resp1.PodResources[req.PodUid].ContainerResources[testName].ResourceAllocation[string(v1.ResourceCPU)])
+	expectedCPUSet := cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult)
 	as.Equal(&pluginapi.ResourceAllocationInfo{
-		OciPropertyName:   util.OCIPropertyNameCPUSetCPUs,
-		IsNodeResource:    false,
-		IsScalarResource:  true,
-		AllocatedQuantity: 10,
-		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
-		TopologyAssignments: map[uint64]uint64{
-			0: 3,
-			1: 3,
-			2: 2,
-			3: 2,
-		},
+		OciPropertyName:     util.OCIPropertyNameCPUSetCPUs,
+		IsNodeResource:      false,
+		IsScalarResource:    true,
+		AllocatedQuantity:   10,
+		AllocationResult:    expectedCPUSet.String(),
+		TopologyAssignments: getTopologyAssignmentSizes(t, cpuTopology, expectedCPUSet),
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
 		},
@@ -6066,18 +6139,14 @@ func TestGetResourcesAllocation(t *testing.T) {
 	as.NotNil(resp2.PodResources[req.PodUid])
 	as.NotNil(resp2.PodResources[req.PodUid].ContainerResources[testName])
 	as.NotNil(resp2.PodResources[req.PodUid].ContainerResources[testName].ResourceAllocation[string(v1.ResourceCPU)])
+	expectedCPUSet = allocationInfo.AllocationResult
 	as.Equal(&pluginapi.ResourceAllocationInfo{
-		OciPropertyName:   util.OCIPropertyNameCPUSetCPUs,
-		IsNodeResource:    false,
-		IsScalarResource:  true,
-		AllocatedQuantity: 10,
-		AllocationResult:  machine.NewCPUSet(1, 3, 4, 5, 6, 7, 8, 9, 10, 11).String(),
-		TopologyAssignments: map[uint64]uint64{
-			0: 3,
-			1: 3,
-			2: 2,
-			3: 2,
-		},
+		OciPropertyName:     util.OCIPropertyNameCPUSetCPUs,
+		IsNodeResource:      false,
+		IsScalarResource:    true,
+		AllocatedQuantity:   10,
+		AllocationResult:    expectedCPUSet.String(),
+		TopologyAssignments: getTopologyAssignmentSizes(t, cpuTopology, expectedCPUSet),
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
 		},
@@ -6112,16 +6181,14 @@ func TestGetResourcesAllocation(t *testing.T) {
 	as.NotNil(resp2.PodResources[req.PodUid])
 	as.NotNil(resp2.PodResources[req.PodUid].ContainerResources[testName])
 	as.NotNil(resp2.PodResources[req.PodUid].ContainerResources[testName].ResourceAllocation[string(v1.ResourceCPU)])
+	expectedCPUSet = dynamicPolicy.state.GetAllocationInfo(req.PodUid, testName).AllocationResult
 	as.Equal(&pluginapi.ResourceAllocationInfo{
-		OciPropertyName:   util.OCIPropertyNameCPUSetCPUs,
-		IsNodeResource:    false,
-		IsScalarResource:  true,
-		AllocatedQuantity: 4,
-		AllocationResult:  machine.NewCPUSet(12, 13, 14, 15).String(),
-		TopologyAssignments: map[uint64]uint64{
-			uint64(2): 2,
-			uint64(3): 2,
-		},
+		OciPropertyName:     util.OCIPropertyNameCPUSetCPUs,
+		IsNodeResource:      false,
+		IsScalarResource:    true,
+		AllocatedQuantity:   4,
+		AllocationResult:    expectedCPUSet.String(),
+		TopologyAssignments: getTopologyAssignmentSizes(t, cpuTopology, expectedCPUSet),
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelReclaimedCores,
 		},
@@ -6146,9 +6213,9 @@ func TestGetResourcesAllocation(t *testing.T) {
 		},
 	}
 
-	dynamicPolicy.state.SetAllowSharedCoresOverlapReclaimedCores(true, true)
+	setAllowSharedOverlapForTest(t, dynamicPolicy.state, true, true)
 	dynamicPolicy.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
-	dynamicPolicy.state.SetAllocationInfo(commonstate.PoolNameReclaim, "", &state.AllocationInfo{
+	setAllocationInfoForTest(t, dynamicPolicy.state, commonstate.PoolNameReclaim, "", &state.AllocationInfo{
 		AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
 		AllocationResult:         machine.MustParse("1,3,4-5"),
 		OriginalAllocationResult: machine.MustParse("1,3,4-5"),
@@ -6321,7 +6388,7 @@ func TestSharedCoresRampUpDisabledAllocation(t *testing.T) {
 		}}
 
 		targetPoolCPUs := machine.NewCPUSet(2, 3, 4, 5)
-		policy.state.SetAllocationInfo(commonstate.PoolNameShare, commonstate.FakedContainerName, &state.AllocationInfo{
+		setAllocationInfoForTest(t, policy.state, commonstate.PoolNameShare, commonstate.FakedContainerName, &state.AllocationInfo{
 			AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
 			AllocationResult:         targetPoolCPUs,
 			OriginalAllocationResult: targetPoolCPUs.Clone(),
@@ -6372,16 +6439,120 @@ func TestSharedCoresRampUpDisabledAllocation(t *testing.T) {
 		assert.Equal(t, allocationInfo.AllocationResult.String(), poolInfo.AllocationResult.String())
 	})
 
+	t.Run("cold-start seed metric waits for transaction commit", func(t *testing.T) {
+		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+		require.NoError(t, err)
+		policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
+		emitter := NewMockMetricsEmitter()
+		policy.emitter = emitter
+		events := []string{}
+		policy.cpuSetMaterializer = &transactionRecordingMaterializer{
+			events:  &events,
+			results: []cpusetmaterializer.Result{{}, {Converged: true}},
+			errs:    []error{errors.New("injected seed materializer failure"), nil},
+		}
+
+		_, err = policy.Allocate(context.Background(), newSharedCoresReq("shared-seed-failed"))
+
+		require.ErrorContains(t, err, "injected seed materializer failure")
+		require.Empty(t, emitter.storedInt64[util.MetricNameSharedCoresRampUpDisabledSeeded],
+			"failed transactions must not publish seeded-rampup metrics")
+	})
+
+	t.Run("failed allocation leaves caller request unchanged", func(t *testing.T) {
+		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+		require.NoError(t, err)
+		policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
+		events := []string{}
+		policy.cpuSetMaterializer = &transactionRecordingMaterializer{
+			events:  &events,
+			results: []cpusetmaterializer.Result{{}, {Converged: true}},
+			errs:    []error{errors.New("injected immutable-request failure"), nil},
+		}
+		req := newSharedCoresReq("shared-request-immutable")
+		req.Annotations["example.com/filtered"] = "keep"
+		before := *req
+		before.Annotations = general.DeepCopyMap(req.Annotations)
+		before.Labels = general.DeepCopyMap(req.Labels)
+		before.ResourceRequests = make(map[string]float64, len(req.ResourceRequests))
+		for resourceName, quantity := range req.ResourceRequests {
+			before.ResourceRequests[resourceName] = quantity
+		}
+
+		_, err = policy.Allocate(context.Background(), req)
+
+		require.ErrorContains(t, err, "injected immutable-request failure")
+		require.Equal(t, &before, req)
+	})
+
+	t.Run("orphan error emits metric at allocate boundary once", func(t *testing.T) {
+		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+		require.NoError(t, err)
+		policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
+		emitter := NewMockMetricsEmitter()
+		policy.emitter = emitter
+		setAllocationInfoForTest(t, policy.state, "orphan-pod", "main", &state.AllocationInfo{
+			RequestQuantity: 1,
+			AllocationMeta: commonstate.AllocationMeta{
+				PodUid:        "orphan-pod",
+				PodNamespace:  "default",
+				PodName:       "orphan",
+				ContainerName: "main",
+				OwnerPoolName: "missing-pool",
+				QoSLevel:      consts.PodAnnotationQoSLevelSharedCores,
+			},
+		}, false)
+
+		_, err = policy.Allocate(context.Background(), newSharedCoresReq("shared-orphan-boundary"))
+
+		require.Error(t, err)
+		require.Equal(t, []int64{1}, emitter.storedInt64[util.MetricNameOrphanContainer])
+		require.Equal(t, [][]metrics.MetricTag{{
+			{Key: "podNamespace", Val: "default"},
+			{Key: "podName", Val: "orphan"},
+			{Key: "containerName", Val: "main"},
+			{Key: "qosLevel", Val: consts.PodAnnotationQoSLevelSharedCores},
+			{Key: "poolName", Val: "missing-pool"},
+		}}, emitter.storedTags[util.MetricNameOrphanContainer])
+	})
+
+	t.Run("successful allocation leaves caller request unchanged", func(t *testing.T) {
+		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+		require.NoError(t, err)
+		policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
+		req := newSharedCoresReq("shared-success-request-immutable")
+		req.Annotations["example.com/filtered"] = "keep"
+		before := proto.Clone(req).(*pluginapi.ResourceRequest)
+
+		_, err = policy.Allocate(context.Background(), req)
+
+		require.NoError(t, err)
+		require.Equal(t, before, req)
+	})
+
+	t.Run("cold-start seed metric is emitted after transaction commit", func(t *testing.T) {
+		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+		require.NoError(t, err)
+		policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
+		emitter := NewMockMetricsEmitter()
+		policy.emitter = emitter
+
+		_, err = policy.Allocate(context.Background(), newSharedCoresReq("shared-seed-committed"))
+
+		require.NoError(t, err)
+		require.Equal(t, []int64{1}, emitter.storedInt64[util.MetricNameSharedCoresRampUpDisabledSeeded])
+	})
+
 	t.Run("cold-start seed overlap-false excludes reclaim pool", func(t *testing.T) {
 		t.Parallel()
 		as := require.New(t)
 		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 		as.Nil(err)
 		policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
-		policy.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+		setAllowSharedOverlapForTest(t, policy.state, false, false)
 
 		reclaimCPUs := machine.NewCPUSet(10, 11, 12, 13, 14, 15)
-		policy.state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &state.AllocationInfo{
+		setAllocationInfoForTest(t, policy.state, commonstate.PoolNameReclaim, commonstate.FakedContainerName, &state.AllocationInfo{
 			AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
 			AllocationResult:                 reclaimCPUs,
 			OriginalAllocationResult:         reclaimCPUs.Clone(),
@@ -6412,10 +6583,10 @@ func TestSharedCoresRampUpDisabledAllocation(t *testing.T) {
 		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 		as.Nil(err)
 		policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
-		policy.state.SetAllowSharedCoresOverlapReclaimedCores(true, false)
+		setAllowSharedOverlapForTest(t, policy.state, true, false)
 
 		reclaimCPUs := machine.NewCPUSet(10, 11, 12, 13, 14, 15)
-		policy.state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &state.AllocationInfo{
+		setAllocationInfoForTest(t, policy.state, commonstate.PoolNameReclaim, commonstate.FakedContainerName, &state.AllocationInfo{
 			AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
 			AllocationResult:                 reclaimCPUs,
 			OriginalAllocationResult:         reclaimCPUs.Clone(),
@@ -7972,9 +8143,12 @@ func TestAllocateByQoSAwareServerListAndWatchResp(t *testing.T) {
 			machineState, err := generateMachineStateFromPodEntries(tc.cpuTopology, tc.podEntries, nil)
 			as.Nil(err)
 
-			dynamicPolicy.state.SetPodEntries(tc.podEntries, true)
-			dynamicPolicy.state.SetMachineState(machineState, true)
-			dynamicPolicy.initReservePool()
+			setPodEntriesForTest(t, dynamicPolicy.state, tc.podEntries, true)
+			setMachineStateForTest(t, dynamicPolicy.state, machineState, true)
+			target, prepareErr := dynamicPolicy.state.PrepareDurableTarget()
+			as.Nil(prepareErr)
+			as.Nil(dynamicPolicy.initReservePoolOnTarget(target))
+			as.Nil(dynamicPolicy.state.CommitTarget(target))
 
 			emptyMap := map[string]*advisorsvc.FeatureGate{}
 			dynamicPolicy.cgroupClient = &recordingAdvisorCgroupClient{}
@@ -8110,7 +8284,7 @@ func TestClearResidualStateTreatsFailedPodAsResidual(t *testing.T) {
 	as.Nil(err)
 
 	const podUID = "failed-pod-uid"
-	dynamicPolicy.state.SetPodEntries(state.PodEntries{
+	setPodEntriesForTest(t, dynamicPolicy.state, state.PodEntries{
 		podUID: state.ContainerEntries{
 			"main": &state.AllocationInfo{
 				AllocationMeta: commonstate.AllocationMeta{
@@ -8240,80 +8414,6 @@ func TestSchedIdle(t *testing.T) {
 	}
 }
 
-func TestRemoveContainer(t *testing.T) {
-	t.Parallel()
-
-	as := require.New(t)
-
-	tmpDir, err := ioutil.TempDir("", "checkpoint-TestRemoveContainer")
-	as.Nil(err)
-	defer os.RemoveAll(tmpDir)
-
-	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
-	as.Nil(err)
-
-	dynamicPolicy, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
-	as.Nil(err)
-
-	podUID := string(uuid.NewUUID())
-	containerName := "testName"
-	testName := "testName"
-
-	podEntries := state.PodEntries{
-		podUID: state.ContainerEntries{
-			containerName: &state.AllocationInfo{
-				AllocationMeta: commonstate.AllocationMeta{
-					PodUid:         podUID,
-					PodNamespace:   testName,
-					PodName:        testName,
-					ContainerName:  containerName,
-					ContainerType:  pluginapi.ContainerType_MAIN.String(),
-					ContainerIndex: 0,
-					OwnerPoolName:  commonstate.PoolNameShare,
-					Labels: map[string]string{
-						consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
-					},
-					Annotations: map[string]string{
-						consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
-					},
-					QoSLevel: consts.PodAnnotationQoSLevelSharedCores,
-				},
-				RampUp:                   false,
-				AllocationResult:         machine.MustParse("1,3-6,9,11-14"),
-				OriginalAllocationResult: machine.MustParse("1,3-6,9,11-14"),
-				TopologyAwareAssignments: map[int]machine.CPUSet{
-					0: machine.NewCPUSet(1, 9),
-					1: machine.NewCPUSet(3, 11),
-					2: machine.NewCPUSet(4, 5, 11, 12),
-					3: machine.NewCPUSet(6, 14),
-				},
-				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{
-					0: machine.NewCPUSet(1, 9),
-					1: machine.NewCPUSet(3, 11),
-					2: machine.NewCPUSet(4, 5, 11, 12),
-					3: machine.NewCPUSet(6, 14),
-				},
-				RequestQuantity: 2,
-			},
-		},
-	}
-
-	dynamicPolicy.state.SetPodEntries(podEntries, true)
-
-	allocationInfo := dynamicPolicy.state.GetAllocationInfo(podUID, containerName)
-	as.NotNil(allocationInfo)
-
-	dynamicPolicy.removeContainer(podUID, containerName, true)
-
-	allocationInfo = dynamicPolicy.state.GetAllocationInfo(podUID, containerName)
-	as.Nil(allocationInfo)
-
-	dynamicPolicy.removeContainer(podUID, containerName, true)
-
-	allocationInfo = dynamicPolicy.state.GetAllocationInfo(podUID, containerName)
-	as.Nil(allocationInfo)
-}
-
 func TestShoudSharedCoresRampUp(t *testing.T) {
 	t.Parallel()
 
@@ -8329,7 +8429,7 @@ func TestShoudSharedCoresRampUp(t *testing.T) {
 	dynamicPolicy, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	as.Nil(err)
 
-	dynamicPolicy.state.SetAllocationInfo(commonstate.PoolNameShare, "", &state.AllocationInfo{
+	setAllocationInfoForTest(t, dynamicPolicy.state, commonstate.PoolNameShare, "", &state.AllocationInfo{
 		AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
 		AllocationResult:         machine.MustParse("1,3-6,9,11-14"),
 		OriginalAllocationResult: machine.MustParse("1,3-6,9,11-14"),
@@ -8349,7 +8449,7 @@ func TestShoudSharedCoresRampUp(t *testing.T) {
 
 	existPodUID := uuid.NewUUID()
 	existName := "exist"
-	dynamicPolicy.state.SetAllocationInfo(string(existPodUID), existName, &state.AllocationInfo{
+	setAllocationInfoForTest(t, dynamicPolicy.state, string(existPodUID), existName, &state.AllocationInfo{
 		AllocationMeta: commonstate.AllocationMeta{
 			PodUid:         string(existPodUID),
 			PodNamespace:   existName,
@@ -8679,6 +8779,7 @@ func TestSNBCpuRequestWithFloat(t *testing.T) {
 
 	dynamicPolicy, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	as.Nil(err)
+	setAllowSharedOverlapForTest(t, dynamicPolicy.state, false)
 
 	dynamicPolicy.podAnnotationKeptKeys = []string{
 		consts.PodAnnotationMemoryEnhancementNumaBinding,
@@ -8718,6 +8819,18 @@ func TestSNBCpuRequestWithFloat(t *testing.T) {
 
 	_, err = dynamicPolicy.Allocate(context.Background(), req)
 	as.Nil(err)
+	reclaim := dynamicPolicy.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	as.NotNil(reclaim)
+	allocation := dynamicPolicy.state.GetAllocationInfo(req.PodUid, req.ContainerName)
+	as.NotNil(allocation)
+	sharePool := dynamicPolicy.state.GetAllocationInfo("share-NUMA0", commonstate.FakedContainerName)
+	as.NotNil(sharePool)
+	as.True(sharePool.AllocationResult.Intersection(reclaim.AllocationResult).IsEmpty(),
+		"share target %s must be disjoint from reclaim target %s",
+		sharePool.AllocationResult.String(), reclaim.AllocationResult.String())
+	as.True(allocation.AllocationResult.Intersection(reclaim.AllocationResult).IsEmpty(),
+		"shared allocation %s must be disjoint from reclaim target %s",
+		allocation.AllocationResult.String(), reclaim.AllocationResult.String())
 
 	// admit another pod with 0.5c
 	req2 := &pluginapi.ResourceRequest{
@@ -8749,6 +8862,11 @@ func TestSNBCpuRequestWithFloat(t *testing.T) {
 
 	_, err = dynamicPolicy.Allocate(context.Background(), req2)
 	as.Nil(err)
+	allocation2 := dynamicPolicy.state.GetAllocationInfo(req2.PodUid, req2.ContainerName)
+	as.NotNil(allocation2)
+	as.True(allocation2.AllocationResult.Intersection(reclaim.AllocationResult).IsEmpty(),
+		"second shared allocation %s must be disjoint from reclaim target %s",
+		allocation2.AllocationResult.String(), reclaim.AllocationResult.String())
 }
 
 type mockCPUAdvisor struct {
@@ -8994,8 +9112,8 @@ func TestSwitchBetweenAPIs(t *testing.T) {
 			machineState, err := generateMachineStateFromPodEntries(cpuTopology, podEntries, nil)
 			as.Nil(err)
 
-			dynamicPolicy.state.SetPodEntries(podEntries, true)
-			dynamicPolicy.state.SetMachineState(machineState, true)
+			setPodEntriesForTest(t, dynamicPolicy.state, podEntries, true)
+			setMachineStateForTest(t, dynamicPolicy.state, machineState, true)
 
 			enableAdvisorForTest(dynamicPolicy, tmpDir)
 
@@ -9260,7 +9378,10 @@ func TestDynamicPolicy_AllocationHooks(t *testing.T) {
 				return nil
 			},
 			preRun: func(policy *DynamicPolicy) {
-				policy.state.SetAllocationInfo("modify-sidecar-pod-uid", "main-c", &state.AllocationInfo{
+				cpus := machine.NewCPUSet(0, 1)
+				assignments, err := machine.GetNumaAwareAssignments(policy.machineInfo.CPUTopology, cpus)
+				require.NoError(t, err)
+				setAllocationInfoForTest(t, policy.state, "modify-sidecar-pod-uid", "main-c", &state.AllocationInfo{
 					AllocationMeta: commonstate.AllocationMeta{
 						PodUid:        "modify-sidecar-pod-uid",
 						PodNamespace:  "default",
@@ -9268,7 +9389,10 @@ func TestDynamicPolicy_AllocationHooks(t *testing.T) {
 						ContainerName: "main-c",
 						ContainerType: pluginapi.ContainerType_MAIN.String(),
 					},
-					AllocationResult: machine.NewCPUSet(0, 1),
+					AllocationResult:                 cpus,
+					OriginalAllocationResult:         cpus.Clone(),
+					TopologyAwareAssignments:         assignments,
+					OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(assignments),
 				}, false)
 			},
 			expectErr: false,
@@ -9410,7 +9534,7 @@ func TestDynamicPolicy_AllocationHooks(t *testing.T) {
 				return nil
 			},
 			preRun: func(policy *DynamicPolicy) {
-				policy.state.SetAllocationInfo("error-sidecar-pod-uid", "main-c", &state.AllocationInfo{
+				setAllocationInfoForTest(t, policy.state, "error-sidecar-pod-uid", "main-c", &state.AllocationInfo{
 					AllocationMeta: commonstate.AllocationMeta{
 						PodUid:        "error-sidecar-pod-uid",
 						PodNamespace:  "default",

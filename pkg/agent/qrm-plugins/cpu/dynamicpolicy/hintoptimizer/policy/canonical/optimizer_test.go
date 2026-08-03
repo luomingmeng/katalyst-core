@@ -39,6 +39,14 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
+func commitMachineStateForTest(t *testing.T, repository state.State, machineState state.NUMANodeMap) {
+	t.Helper()
+	target, err := repository.PrepareDurableTarget()
+	require.NoError(t, err)
+	target.MachineState = machineState.Clone()
+	require.NoError(t, repository.CommitTarget(target))
+}
+
 func TestNewCanonicalHintOptimizer(t *testing.T) {
 	t.Parallel()
 
@@ -150,7 +158,7 @@ func TestCanonicalHintOptimizer_OptimizeHints(t *testing.T) {
 					}
 					cpuTopology, _ := machine.GenerateDummyCPUTopology(16, 1, 2) // 2 NUMA node
 					st, _ := state.NewCheckpointState(stateDirectoryConfig, "policy_packing", "test", cpuTopology, false, state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
-					st.SetMachineState(ms, false)
+					commitMachineStateForTest(t, st, ms)
 					return st
 				}(),
 				reservedCPUs:            machine.NewCPUSet(),
@@ -188,7 +196,7 @@ func TestCanonicalHintOptimizer_OptimizeHints(t *testing.T) {
 					}
 					cpuTopology, _ := machine.GenerateDummyCPUTopology(16, 1, 2) // 2 NUMA node
 					st, _ := state.NewCheckpointState(stateDirectoryConfig, "policy_packing_one_NUMA_insufficient", "test", cpuTopology, false, state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
-					st.SetMachineState(ms, false)
+					commitMachineStateForTest(t, st, ms)
 					return st
 				}(),
 				reservedCPUs:            machine.NewCPUSet(),
@@ -225,7 +233,7 @@ func TestCanonicalHintOptimizer_OptimizeHints(t *testing.T) {
 					}
 					cpuTopology, _ := machine.GenerateDummyCPUTopology(16, 1, 2) // 2 NUMA node
 					st, _ := state.NewCheckpointState(stateDirectoryConfig, "policy_spreading", "test", cpuTopology, false, state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
-					st.SetMachineState(ms, false)
+					commitMachineStateForTest(t, st, ms)
 					return st
 				}(),
 				reservedCPUs:            machine.NewCPUSet(),
@@ -263,7 +271,7 @@ func TestCanonicalHintOptimizer_OptimizeHints(t *testing.T) {
 					}
 					cpuTopology, _ := machine.GenerateDummyCPUTopology(16, 1, 2) // 2 NUMA node
 					st, _ := state.NewCheckpointState(stateDirectoryConfig, "policy_dynamic_packing_all_above_threshold", "test", cpuTopology, false, state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
-					st.SetMachineState(ms, false)
+					commitMachineStateForTest(t, st, ms)
 					return st
 				}(),
 				reservedCPUs:                  machine.NewCPUSet(),
@@ -337,7 +345,7 @@ func TestCanonicalHintOptimizer_OptimizeHints(t *testing.T) {
 					}
 					cpuTopology, _ := machine.GenerateDummyCPUTopology(16, 1, 2) // 2 NUMA node
 					st, _ := state.NewCheckpointState(stateDirectoryConfig, "policy_dynamic_packing_one_below_threshold", "test", cpuTopology, false, state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
-					st.SetMachineState(ms, false)
+					commitMachineStateForTest(t, st, ms)
 					return st
 				}(),
 				reservedCPUs:                  machine.NewCPUSet(),
@@ -411,7 +419,7 @@ func TestCanonicalHintOptimizer_OptimizeHints(t *testing.T) {
 					}
 					cpuTopology, _ := machine.GenerateDummyCPUTopology(16, 1, 2) // 2 NUMA node
 					st, _ := state.NewCheckpointState(stateDirectoryConfig, "policy_dynamic_packing_all_below_threshold_fallback_to_spreading", "test", cpuTopology, false, state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
-					st.SetMachineState(ms, false)
+					commitMachineStateForTest(t, st, ms)
 					return st
 				}(),
 				reservedCPUs:                  machine.NewCPUSet(),
@@ -452,7 +460,7 @@ func TestCanonicalHintOptimizer_OptimizeHints(t *testing.T) {
 					}
 					cpuTopology, _ := machine.GenerateDummyCPUTopology(16, 1, 2) // 2 NUMA node
 					st, _ := state.NewCheckpointState(stateDirectoryConfig, "unknown_policy_fallback_to_spreading", "test", cpuTopology, false, state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
-					st.SetMachineState(ms, false)
+					commitMachineStateForTest(t, st, ms)
 					return st
 				}(),
 				reservedCPUs:            machine.NewCPUSet(),
@@ -489,7 +497,7 @@ func TestCanonicalHintOptimizer_OptimizeHints(t *testing.T) {
 					}
 					cpuTopology, _ := machine.GenerateDummyCPUTopology(16, 1, 2) // 2 NUMA node
 					st, _ := state.NewCheckpointState(stateDirectoryConfig, "no_available_NUMA_nodes_after_filtering", "test", cpuTopology, false, state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
-					st.SetMachineState(ms, false)
+					commitMachineStateForTest(t, st, ms)
 					return st
 				}(),
 				reservedCPUs:            machine.NewCPUSet(),
@@ -524,7 +532,7 @@ func TestCanonicalHintOptimizer_OptimizeHints(t *testing.T) {
 					}
 					cpuTopology, _ := machine.GenerateDummyCPUTopology(12, 1, 3) // 3 NUMA node
 					st, _ := state.NewCheckpointState(stateDirectoryConfig, "policy_packing_multiple_preferred_due_to_same_minLeft", "test", cpuTopology, false, state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
-					st.SetMachineState(ms, false)
+					commitMachineStateForTest(t, st, ms)
 					return st
 				}(),
 				reservedCPUs:            machine.NewCPUSet(),
@@ -563,7 +571,7 @@ func TestCanonicalHintOptimizer_OptimizeHints(t *testing.T) {
 					}
 					cpuTopology, _ := machine.GenerateDummyCPUTopology(16, 1, 2) // 2 NUMA node
 					st, _ := state.NewCheckpointState(stateDirectoryConfig, "policy_spreading_multiple_preferred_due_to_same_maxLeft", "test", cpuTopology, false, state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
-					st.SetMachineState(ms, false)
+					commitMachineStateForTest(t, st, ms)
 					return st
 				}(),
 				reservedCPUs:            machine.NewCPUSet(),
@@ -603,7 +611,7 @@ func TestCanonicalHintOptimizer_OptimizeHints(t *testing.T) {
 					}
 					cpuTopology, _ := machine.GenerateDummyCPUTopology(16, 1, 2) // 2 NUMA node
 					st, _ := state.NewCheckpointState(stateDirectoryConfig, "dynamic_packing_reserved_CPUs_affect_availability", "test", cpuTopology, false, state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
-					st.SetMachineState(ms, false)
+					commitMachineStateForTest(t, st, ms)
 					return st
 				}(),
 				reservedCPUs:                  machine.NewCPUSet(1, 5, 6), // reserve 1 from NUMA0, 5,6 from NUMA1
@@ -668,7 +676,7 @@ func TestCanonicalHintOptimizer_OptimizeHints(t *testing.T) {
 					}
 					cpuTopology, _ := machine.GenerateDummyCPUTopology(16, 1, 2) // 2 NUMA node
 					st, _ := state.NewCheckpointState(stateDirectoryConfig, "dynamic_packing_one_NUMA_filtered_out_due_to_threshold_reserved_CPUs_considered", "test", cpuTopology, false, state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
-					st.SetMachineState(ms, false)
+					commitMachineStateForTest(t, st, ms)
 					return st
 				}(),
 				reservedCPUs:                  machine.NewCPUSet(1), // reserve 1 from NUMA0
@@ -710,7 +718,7 @@ func TestCanonicalHintOptimizer_OptimizeHints(t *testing.T) {
 					}
 					cpuTopology, _ := machine.GenerateDummyCPUTopology(16, 1, 2) // 2 NUMA node
 					st, _ := state.NewCheckpointState(stateDirectoryConfig, "dynamic_packing_allocatableCPUQuantity_is_zero_for_a_NUMA", "test", cpuTopology, false, state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
-					st.SetMachineState(ms, false)
+					commitMachineStateForTest(t, st, ms)
 					return st
 				}(),
 				reservedCPUs:                  machine.NewCPUSet(1, 2), // reserve all from NUMA0

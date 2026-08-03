@@ -36,11 +36,16 @@ import (
 	utilresourcepackage "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 )
 
+type resourcePackageSyncFailureMetric struct {
+	err         error
+	numaID      int
+	packageName string
+	reason      string
+}
+
 func (p *DynamicPolicy) syncResourcePackagePinnedCPUSet() {
 	startTime := time.Now()
-	p.Lock()
 	defer func() {
-		p.Unlock()
 		general.InfoS("finished",
 			"duration", time.Since(startTime).String(),
 		)
@@ -62,55 +67,59 @@ func (p *DynamicPolicy) syncResourcePackagePinnedCPUSet() {
 		return
 	}
 
-	interruptAllocationInfo := p.state.GetAllocationInfo(commonstate.PoolNameInterrupt, commonstate.FakedContainerName)
-
-	machineState := p.state.GetMachineState()
-	podEntries := p.state.GetPodEntries()
-
 	newResourcePackageStateMap := make(map[int]map[string]*state.ResourcePackageState)
-	stateChanged := false
-
-	for _, numaID := range p.machineInfo.CPUDetails.NUMANodes().ToSliceInt() {
-		numaState := machineState[numaID]
-		if numaState == nil {
-			continue
+	var failureMetrics []resourcePackageSyncFailureMetric
+	err = p.transact(context.Background(), func(target *state.TargetState) (*state.TargetState, error) {
+		editor := newTargetMutationEditor(target)
+		interruptAllocationInfo := target.GetAllocationInfo(commonstate.PoolNameInterrupt, commonstate.FakedContainerName)
+		stateChanged := false
+		for _, numaID := range p.machineInfo.CPUDetails.NUMANodes().ToSliceInt() {
+			numaState := target.MachineState[numaID]
+			if numaState == nil {
+				continue
+			}
+			newPinnedMap, changed, syncErr := p.syncNumaResourcePackageWithFailures(
+				numaID, numaState, pinnedCPUSetSize, interruptAllocationInfo,
+				resourcePackages, &failureMetrics)
+			if syncErr != nil {
+				return nil, fmt.Errorf("failed to sync resource package for numa %d: %w", numaID, syncErr)
+			}
+			if newPinnedMap != nil {
+				newResourcePackageStateMap[numaID] = newPinnedMap
+			}
+			stateChanged = stateChanged || changed
 		}
-
-		newPinnedMap, changed, err := p.syncNumaResourcePackage(numaID, numaState, pinnedCPUSetSize, interruptAllocationInfo, resourcePackages)
-		if err != nil {
-			general.Errorf("failed to sync resource package for numa %d: %v", numaID, err)
-			_ = p.emitter.StoreInt64(util.MetricNameSyncResourcePackagePinnedCPUSetFailed, 1, metrics.MetricTypeNameRaw,
-				metrics.MetricTag{Key: "error_message", Val: metric.MetricTagValueFormat(err)},
-				metrics.MetricTag{Key: "numa_id", Val: strconv.Itoa(numaID)})
-			return
+		if !stateChanged {
+			return target, nil
 		}
-
-		if newPinnedMap != nil {
-			newResourcePackageStateMap[numaID] = newPinnedMap
-		}
-
-		if changed {
-			stateChanged = true
-		}
-	}
-
-	if stateChanged {
-		general.InfoS("resource package pinned cpuset changed, updating state", "newResourcePackageStateMap", newResourcePackageStateMap)
 		for numaID, pkgs := range newResourcePackageStateMap {
-			if machineState[numaID] != nil {
-				machineState[numaID].ResourcePackageStates = pkgs
+			if target.MachineState[numaID] != nil {
+				target.MachineState[numaID].ResourcePackageStates = pkgs
 			}
 		}
-
-		err = p.adjustAllocationEntries(podEntries, machineState, true)
-		if err != nil {
-			general.Errorf("adjustAllocationEntries failed: %v", err)
-			return
+		if adjustErr := p.adjustAllocationEntriesOnTarget(
+			target.PodEntries, target.MachineState, true, editor.target); adjustErr != nil {
+			return nil, fmt.Errorf("adjustAllocationEntries failed: %w", adjustErr)
 		}
-
-		general.InfoS("syncResourcePackagePinnedCPUSet finished with state changed")
-	} else {
+		return target, nil
+	})
+	if err != nil {
+		general.Errorf("syncResourcePackagePinnedCPUSet failed: %v", err)
+		_ = p.emitter.StoreInt64(util.MetricNameSyncResourcePackagePinnedCPUSetFailed, 1, metrics.MetricTypeNameRaw,
+			metrics.MetricTag{Key: "error_message", Val: metric.MetricTagValueFormat(err)})
+		return
+	}
+	if len(newResourcePackageStateMap) == 0 {
 		general.InfoS("syncResourcePackagePinnedCPUSet finished without state changed")
+	} else {
+		general.InfoS("syncResourcePackagePinnedCPUSet finished")
+	}
+	for _, failure := range failureMetrics {
+		_ = p.emitter.StoreInt64(util.MetricNameSyncNumaResourcePackageFailed, 1, metrics.MetricTypeNameRaw,
+			metrics.MetricTag{Key: "error_message", Val: metric.MetricTagValueFormat(failure.err)},
+			metrics.MetricTag{Key: "numa_id", Val: strconv.Itoa(failure.numaID)},
+			metrics.MetricTag{Key: "package_name", Val: failure.packageName},
+			metrics.MetricTag{Key: "reason", Val: failure.reason})
 	}
 
 	for numaID, pkgs := range newResourcePackageStateMap {
@@ -130,6 +139,18 @@ func (p *DynamicPolicy) syncNumaResourcePackage(
 	pinnedCPUSetSize map[int]map[string]int,
 	interruptAllocationInfo *state.AllocationInfo,
 	resourcePackages utilresourcepackage.NUMAResourcePackageItems,
+) (map[string]*state.ResourcePackageState, bool, error) {
+	return p.syncNumaResourcePackageWithFailures(
+		numaID, numaState, pinnedCPUSetSize, interruptAllocationInfo, resourcePackages, nil)
+}
+
+func (p *DynamicPolicy) syncNumaResourcePackageWithFailures(
+	numaID int,
+	numaState *state.NUMANodeState,
+	pinnedCPUSetSize map[int]map[string]int,
+	interruptAllocationInfo *state.AllocationInfo,
+	resourcePackages utilresourcepackage.NUMAResourcePackageItems,
+	failures *[]resourcePackageSyncFailureMetric,
 ) (map[string]*state.ResourcePackageState, bool, error) {
 	mandatoryCPUsMap := make(map[string]machine.CPUSet)
 	sharedRequestsMap := make(map[string]float64)
@@ -239,11 +260,11 @@ func (p *DynamicPolicy) syncNumaResourcePackage(
 					newCPUs, err := calculator.TakeByTopology(p.machineInfo, candidates, delta, true)
 					if err != nil {
 						general.Errorf("failed to expand pinned cpuset for pkg %s: %v", pkgName, err)
-						_ = p.emitter.StoreInt64(util.MetricNameSyncNumaResourcePackageFailed, 1, metrics.MetricTypeNameRaw,
-							metrics.MetricTag{Key: "error_message", Val: metric.MetricTagValueFormat(err)},
-							metrics.MetricTag{Key: "numa_id", Val: strconv.Itoa(numaID)},
-							metrics.MetricTag{Key: "package_name", Val: pkgName},
-							metrics.MetricTag{Key: "reason", Val: "expand_failed"})
+						if failures != nil {
+							*failures = append(*failures, resourcePackageSyncFailureMetric{
+								err: err, numaID: numaID, packageName: pkgName, reason: "expand_failed",
+							})
+						}
 						newPinned = currentPinned
 					} else {
 						newPinned = currentPinned.Union(newCPUs)
@@ -256,11 +277,11 @@ func (p *DynamicPolicy) syncNumaResourcePackage(
 						kept, err := calculator.TakeByTopology(p.machineInfo, candidates, keepSize, true)
 						if err != nil {
 							general.Errorf("failed to shrink (select kept) for pkg %s: %v", pkgName, err)
-							_ = p.emitter.StoreInt64(util.MetricNameSyncNumaResourcePackageFailed, 1, metrics.MetricTypeNameRaw,
-								metrics.MetricTag{Key: "error_message", Val: metric.MetricTagValueFormat(err)},
-								metrics.MetricTag{Key: "numa_id", Val: strconv.Itoa(numaID)},
-								metrics.MetricTag{Key: "package_name", Val: pkgName},
-								metrics.MetricTag{Key: "reason", Val: "shrink_failed"})
+							if failures != nil {
+								*failures = append(*failures, resourcePackageSyncFailureMetric{
+									err: err, numaID: numaID, packageName: pkgName, reason: "shrink_failed",
+								})
+							}
 							newPinned = currentPinned
 						} else {
 							newPinned = mandatoryCPUs.Union(kept)
@@ -282,17 +303,7 @@ func (p *DynamicPolicy) syncNumaResourcePackage(
 			newResourcePackageState[pkgName] = newState
 
 			if !newState.Equals(currentState) {
-				general.InfoS("resource package state changed",
-					"numaID", numaID,
-					"pkgName", pkgName,
-					"oldState", currentState,
-					"newState", newState)
 				stateChanged = true
-			} else {
-				general.InfoS("resource package state not changed",
-					"numaID", numaID,
-					"pkgName", pkgName,
-					"state", currentState)
 			}
 		}
 	}

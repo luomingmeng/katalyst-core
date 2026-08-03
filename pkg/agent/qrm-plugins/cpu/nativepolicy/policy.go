@@ -348,7 +348,6 @@ func (p *NativePolicy) Allocate(ctx context.Context,
 	p.Lock()
 	defer func() {
 		if respErr != nil {
-			_ = p.removeContainer(req.PodUid, req.ContainerName)
 			_ = p.emitter.StoreInt64(util.MetricNameAllocateFailed, 1, metrics.MetricTypeNameRaw)
 		}
 
@@ -422,15 +421,20 @@ func (p *NativePolicy) GetResourcesAllocation(_ context.Context,
 	p.Lock()
 	defer p.Unlock()
 
-	defaultCPUSet := p.state.GetMachineState().GetDefaultCPUSet()
+	target, err := p.state.PrepareDurableTarget()
+	if err != nil {
+		return nil, err
+	}
+	defaultCPUSet := target.MachineState.GetDefaultCPUSet()
 	defaultCPUSetTopologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, defaultCPUSet)
 	if err != nil {
 		return nil, fmt.Errorf("GetNumaAwareAssignments err: %v", err)
 	}
 
 	podResources := make(map[string]*pluginapi.ContainerResources)
+	targetChanged := false
 
-	for podUID, containerEntries := range p.state.GetPodEntries() {
+	for podUID, containerEntries := range target.PodEntries {
 		if podResources[podUID] == nil {
 			podResources[podUID] = &pluginapi.ContainerResources{}
 		}
@@ -457,7 +461,8 @@ func (p *NativePolicy) GetResourcesAllocation(_ context.Context,
 					allocationInfo.TopologyAwareAssignments = clonedDefaultCPUSetTopologyAwareAssignments
 					allocationInfo.OriginalTopologyAwareAssignments = clonedDefaultCPUSetTopologyAwareAssignments
 
-					p.state.SetAllocationInfo(podUID, containerName, allocationInfo, true)
+					target.PodEntries[podUID][containerName] = allocationInfo
+					targetChanged = true
 				}
 			default:
 				general.Errorf("skip container because the pool name is not supported, pod: %s, container: %s, cpuset: %s",
@@ -480,6 +485,11 @@ func (p *NativePolicy) GetResourcesAllocation(_ context.Context,
 					},
 				},
 			}
+		}
+	}
+	if targetChanged {
+		if err := p.state.CommitTarget(target); err != nil {
+			return nil, err
 		}
 	}
 
@@ -600,37 +610,41 @@ func (p *NativePolicy) RemovePod(ctx context.Context,
 }
 
 func (p *NativePolicy) removePod(podUID string) error {
-	podEntries := p.state.GetPodEntries()
-	if len(podEntries[podUID]) == 0 {
+	target, err := p.state.PrepareDurableTarget()
+	if err != nil {
+		return err
+	}
+	if len(target.PodEntries[podUID]) == 0 {
 		return nil
 	}
-	delete(podEntries, podUID)
+	delete(target.PodEntries, podUID)
 
-	updatedMachineState, err := nativepolicyutil.GenerateMachineStateFromPodEntries(p.machineInfo.CPUTopology, podEntries, nil)
+	updatedMachineState, err := nativepolicyutil.GenerateMachineStateFromPodEntries(p.machineInfo.CPUTopology, target.PodEntries, nil)
 	if err != nil {
 		return fmt.Errorf("GenerateMachineStateFromPodEntries failed with error: %v", err)
 	}
 
-	p.state.SetPodEntries(podEntries, false)
-	p.state.SetMachineState(updatedMachineState, false)
-	return p.state.StoreState()
+	target.MachineState = updatedMachineState
+	return p.state.CommitTarget(target)
 }
 
 func (p *NativePolicy) removeContainer(podUID, containerName string) error {
-	podEntries := p.state.GetPodEntries()
-	if podEntries[podUID][containerName] == nil {
+	target, err := p.state.PrepareDurableTarget()
+	if err != nil {
+		return err
+	}
+	if target.PodEntries[podUID][containerName] == nil {
 		return nil
 	}
-	delete(podEntries[podUID], containerName)
+	delete(target.PodEntries[podUID], containerName)
 
-	updatedMachineState, err := nativepolicyutil.GenerateMachineStateFromPodEntries(p.machineInfo.CPUTopology, podEntries, nil)
+	updatedMachineState, err := nativepolicyutil.GenerateMachineStateFromPodEntries(p.machineInfo.CPUTopology, target.PodEntries, nil)
 	if err != nil {
 		return fmt.Errorf("GenerateMachineStateFromPodEntries failed with error: %v", err)
 	}
 
-	p.state.SetPodEntries(podEntries, false)
-	p.state.SetMachineState(updatedMachineState, false)
-	return p.state.StoreState()
+	target.MachineState = updatedMachineState
+	return p.state.CommitTarget(target)
 }
 
 // getContainerRequestedCores parses and returns request cores for the given container

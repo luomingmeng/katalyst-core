@@ -20,16 +20,23 @@ import (
 	"context"
 
 	bulkheadutils "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils"
-	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
+	bulkheadtopology "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpusetmaterializer"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
+	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
 type HandlerContext struct {
-	cpusetutil.CPUSetAdjustmentHandlerCtx
-	View *bulkheadutils.CPUSetPartitionView
+	CoreConf    *config.Configuration
+	DynamicConf *dynamicconfig.Configuration
+	Emitter     metrics.MetricEmitter
+	MetaServer  *metaserver.MetaServer
+	Topology    *machine.CPUTopology
+	Target      cpusetmaterializer.Target
+	View        *bulkheadutils.CPUSetPartitionView
 }
 
 type PeriodicalHandlerContext struct {
@@ -39,7 +46,7 @@ type PeriodicalHandlerContext struct {
 	Emitter     metrics.MetricEmitter
 	MetaServer  *metaserver.MetaServer
 	// EffectiveEnabled is derived from the same state-aware rule used by
-	// CPUSetAdjustmentHandler. nil distinguishes an unset value from an
+	// Reconcile. nil distinguishes an unset value from an
 	// explicit disabled state.
 	EffectiveEnabled *bool
 }
@@ -47,9 +54,21 @@ type PeriodicalHandlerContext struct {
 type Plugin interface {
 	Name() string
 	Enable(HandlerContext) bool
-	CPUSetAdjustmentHandler(context.Context, HandlerContext) error
-	CPUSetAdjustmentDisabledHandler(context.Context, HandlerContext) error
+	Reconcile(context.Context, HandlerContext) error
+	Reset(context.Context, HandlerContext) error
 	PeriodicalHandler(context.Context, PeriodicalHandlerContext) error
 }
 
+type TopologyPlugin interface {
+	Plugin
+	ReconcileTopology(context.Context, HandlerContext) (bulkheadtopology.DAGApplyResult, error)
+}
+
 type PluginFactory func(conf *config.Configuration) Plugin
+
+func SystemServiceEnabled(conf *dynamicconfig.Configuration) bool {
+	if conf == nil || conf.AdminQoSConfiguration == nil || conf.AdminQoSConfiguration.CPUPluginConfiguration == nil {
+		return false
+	}
+	return conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.EnableBulkheadSystemService
+}

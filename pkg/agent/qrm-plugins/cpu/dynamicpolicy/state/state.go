@@ -855,25 +855,12 @@ type reader interface {
 	GetDisableDedicatedCoresOverlapReclaimedCores() bool
 }
 
-// writer is used to store information into local states,
-// and it also provides functionality to maintain the local files
-type writer interface {
-	SetMachineState(numaNodeMap NUMANodeMap, persist bool)
-	SetNUMAHeadroom(numaHeadroom map[int]float64, persist bool)
-	SetPodEntries(podEntries PodEntries, writeThrough bool)
-	SetAllocationInfo(podUID string, containerName string, allocationInfo *AllocationInfo, persist bool)
-	SetAllowSharedCoresOverlapReclaimedCores(allowSharedCoresOverlapReclaimedCores, persist bool)
-	SetDisableDedicatedCoresOverlapReclaimedCores(disableDedicatedCoresOverlapReclaimedCores, persist bool)
-
-	Delete(podUID string, containerName string, persist bool)
-	ClearState()
-	StoreState() error
-}
-
-// State interface provides methods for tracking and setting pod assignments
+// State provides read access and the only two durable mutation boundaries.
 type State interface {
 	ReadonlyState
-	writer
+
+	PrepareDurableTarget() (*TargetState, error)
+	CommitTarget(next *TargetState) error
 }
 
 // ReadonlyState interface only provides methods for tracking pod assignments

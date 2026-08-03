@@ -29,7 +29,6 @@ import (
 	"github.com/google/go-cmp/cmp"
 
 	bulkheadapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api"
-	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	adminqosconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic/adminqos"
 	qrmconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic/adminqos/qrm"
@@ -122,28 +121,6 @@ func TestCPUSetMemsPluginEnable(t *testing.T) {
 	}
 	if p.Enable(handlerCtx(false)) != false {
 		t.Fatalf("Enable() = true, want false")
-	}
-}
-
-func TestCPUSetMemsPluginAdmissionHandlersNoop(t *testing.T) {
-	t.Parallel()
-
-	cg := &fakeCgroupClient{
-		applyErr: map[string]error{
-			"reclaim/reclaim-0": &os.PathError{Op: "write", Path: "cpuset.mems", Err: syscall.EBUSY},
-		},
-	}
-	p := &CPUSetMemsPlugin{cfg: testBulkheadConfig(), cgroup: cg}
-	ctx := context.Background()
-
-	if err := p.CPUSetAdjustmentHandler(ctx, bulkheadapi.HandlerContext{}); err != nil {
-		t.Fatalf("CPUSetAdjustmentHandler: %v", err)
-	}
-	if err := p.CPUSetAdjustmentDisabledHandler(ctx, bulkheadapi.HandlerContext{}); err != nil {
-		t.Fatalf("CPUSetAdjustmentDisabledHandler: %v", err)
-	}
-	if cg.applyCallCount != 0 {
-		t.Fatalf("admission handlers wrote cpuset.mems %d times, want 0", cg.applyCallCount)
 	}
 }
 
@@ -263,6 +240,32 @@ func TestCPUSetMemsPluginPeriodicalRollbackByCgroupVersion(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCPUSetMemsPluginPeriodicalEffectiveDisabledRollsBack(t *testing.T) {
+	t.Parallel()
+
+	cg := &fakeCgroupClient{
+		version: cgroupclient.CgroupVersionV1,
+		existing: map[string]bool{
+			"reclaim/reclaim-0": true,
+			"reclaim/reclaim-1": true,
+		},
+	}
+	p := &CPUSetMemsPlugin{cfg: testBulkheadConfig(), cgroup: cg}
+	in := periodicalCtx(true)
+	effectiveEnabled := false
+	in.EffectiveEnabled = &effectiveEnabled
+
+	if err := p.PeriodicalHandler(context.Background(), in); err != nil {
+		t.Fatalf("PeriodicalHandler: %v", err)
+	}
+
+	for _, rel := range []string{"reclaim/reclaim-0", "reclaim/reclaim-1"} {
+		if write := cg.cpusetWrites[rel]; write.Mems != "0,1" || write.WriteEmptyMems {
+			t.Fatalf("effective-disabled rollback %s write = %+v, want mems 0,1 without WriteEmptyMems", rel, write)
+		}
 	}
 }
 
@@ -443,9 +446,7 @@ func dynamicConf(enableMems bool) *dynamicconfig.Configuration {
 
 func handlerCtx(enableMems bool) bulkheadapi.HandlerContext {
 	return bulkheadapi.HandlerContext{
-		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
-			DynamicConf: dynamicConf(enableMems),
-		},
+		DynamicConf: dynamicConf(enableMems),
 	}
 }
 

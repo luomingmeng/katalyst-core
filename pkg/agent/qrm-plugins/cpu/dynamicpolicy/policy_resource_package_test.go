@@ -18,6 +18,7 @@ package dynamicpolicy
 
 import (
 	"context"
+	"errors"
 	"io/ioutil"
 	"os"
 	"testing"
@@ -32,6 +33,7 @@ import (
 	"github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpusetmaterializer"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	metaresourcepackage "github.com/kubewharf/katalyst-core/pkg/metaserver/resourcepackage"
@@ -72,6 +74,51 @@ type mockResourcePackageManager struct {
 
 func (m *mockResourcePackageManager) NodeResourcePackages(ctx context.Context) (utilresourcepackage.NUMAResourcePackageItems, error) {
 	return m.items, m.err
+}
+
+func TestSyncResourcePackagePinnedCPUSetBulkheadFailureKeepsDurableBase(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(16, 2, 2)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	pinned := true
+	policy.resourcePackageManager = metaresourcepackage.NewCachedResourcePackageManager(&mockResourcePackageManager{
+		items: utilresourcepackage.NUMAResourcePackageItems{
+			0: {
+				"pkg-owned-target": {
+					ResourcePackage: nodev1alpha1.ResourcePackage{
+						PackageName: "pkg-owned-target",
+						Allocatable: &v1.ResourceList{
+							v1.ResourceCPU: *resource.NewQuantity(2, resource.DecimalSI),
+						},
+					},
+					Config: &utilresourcepackage.ResourcePackageConfig{PinnedCPUSet: &pinned},
+				},
+			},
+		},
+	})
+	stopCh := make(chan struct{})
+	require.NoError(t, policy.resourcePackageManager.Run(stopCh))
+	defer close(stopCh)
+	recordingState := &advisorTargetRecordingState{State: policy.state}
+	policy.state = recordingState
+	base, err := policy.state.PrepareDurableTarget()
+	require.NoError(t, err)
+	recordingState.events = nil
+	policy.cpuSetMaterializer = &transactionRecordingMaterializer{
+		events:  &recordingState.events,
+		results: []cpusetmaterializer.Result{{}, {Converged: true}},
+		errs:    []error{errors.New("injected resource-package materializer failure"), nil},
+	}
+
+	policy.syncResourcePackagePinnedCPUSet()
+
+	require.Equal(t, []string{"prepare", "materialize", "materialize"}, recordingState.events)
+	require.Zero(t, recordingState.commitCalls)
+	require.Zero(t, recordingState.setCalls)
+	require.Zero(t, recordingState.storeCalls)
+	require.Equal(t, base, cloneAdvisorState(policy.state))
 }
 
 func TestSyncResourcePackageStates(t *testing.T) {
@@ -126,7 +173,7 @@ func TestSyncResourcePackageStates(t *testing.T) {
 					ms[0].ResourcePackageStates = make(map[string]*state.ResourcePackageState)
 				}
 				ms[0].ResourcePackageStates["pkg-a"] = &state.ResourcePackageState{PinnedCPUSet: machine.NewCPUSet(2, 3)}
-				dp.state.SetMachineState(ms, false)
+				setMachineStateForTest(t, dp.state, ms, false)
 			},
 			resourcePackages: createPkgItems(map[int]map[string]int{
 				0: {"pkg-a": 4}, // Request expansion to 4
@@ -149,7 +196,7 @@ func TestSyncResourcePackageStates(t *testing.T) {
 				dp.reservedCPUs = machine.NewCPUSet(0, 1)
 				podEntries := dp.state.GetPodEntries()
 				delete(podEntries, commonstate.PoolNameReserve)
-				dp.state.SetPodEntries(podEntries, false)
+				setPodEntriesForTest(t, dp.state, podEntries, false)
 
 				// Calculate valid CPUSet for pkg-b on NUMA 0 (need 4 CPUs)
 				cpus0 := dp.machineInfo.CPUDetails.CPUsInNUMANodes(0).Difference(dp.reservedCPUs)
@@ -176,7 +223,7 @@ func TestSyncResourcePackageStates(t *testing.T) {
 					},
 					RequestQuantity: 1.0,
 				}
-				dp.state.SetAllocationInfo(podID, "c1", alloc, false)
+				setAllocationInfoForTest(t, dp.state, podID, "c1", alloc, false)
 
 				mockPodInMetaServer(dp, alloc, "1")
 
@@ -190,7 +237,7 @@ func TestSyncResourcePackageStates(t *testing.T) {
 					ms[0].ResourcePackageStates = make(map[string]*state.ResourcePackageState)
 				}
 				ms[0].ResourcePackageStates["pkg-b"] = &state.ResourcePackageState{PinnedCPUSet: pkgBCPUSet.Clone()}
-				dp.state.SetMachineState(ms, false)
+				setMachineStateForTest(t, dp.state, ms, false)
 			},
 			resourcePackages: createPkgItems(map[int]map[string]int{
 				0: {"pkg-b": 2}, // Request shrink to 2
@@ -230,7 +277,7 @@ func TestSyncResourcePackageStates(t *testing.T) {
 						0: machine.NewCPUSet(2, 3),
 					},
 				}
-				dp.state.SetAllocationInfo(podID, "c1", alloc, false)
+				setAllocationInfoForTest(t, dp.state, podID, "c1", alloc, false)
 
 				// Generate MS
 				podEntries := dp.state.GetPodEntries()
@@ -242,7 +289,7 @@ func TestSyncResourcePackageStates(t *testing.T) {
 					ms[0].ResourcePackageStates = make(map[string]*state.ResourcePackageState)
 				}
 				ms[0].ResourcePackageStates["pkg-c"] = &state.ResourcePackageState{PinnedCPUSet: machine.NewCPUSet(2, 3, 4, 5)}
-				dp.state.SetMachineState(ms, false)
+				setMachineStateForTest(t, dp.state, ms, false)
 			},
 			resourcePackages: createPkgItems(map[int]map[string]int{
 				0: {"pkg-c": 3}, // Request shrink to 3
@@ -262,7 +309,7 @@ func TestSyncResourcePackageStates(t *testing.T) {
 					ms[0].ResourcePackageStates = make(map[string]*state.ResourcePackageState)
 				}
 				ms[0].ResourcePackageStates["pkg-d"] = &state.ResourcePackageState{PinnedCPUSet: machine.NewCPUSet(6, 7)}
-				dp.state.SetMachineState(ms, false)
+				setMachineStateForTest(t, dp.state, ms, false)
 			},
 			resourcePackages: createPkgItems(map[int]map[string]int{
 				0: {}, // Empty config
@@ -293,7 +340,7 @@ func TestSyncResourcePackageStates(t *testing.T) {
 						0: machine.NewCPUSet(6, 7),
 					},
 				}
-				dp.state.SetAllocationInfo(podID, "c1", alloc, false)
+				setAllocationInfoForTest(t, dp.state, podID, "c1", alloc, false)
 
 				// Generate MS
 				podEntries := dp.state.GetPodEntries()
@@ -305,7 +352,7 @@ func TestSyncResourcePackageStates(t *testing.T) {
 					ms[0].ResourcePackageStates = make(map[string]*state.ResourcePackageState)
 				}
 				ms[0].ResourcePackageStates["pkg-e"] = &state.ResourcePackageState{PinnedCPUSet: machine.NewCPUSet(6, 7)}
-				dp.state.SetMachineState(ms, false)
+				setMachineStateForTest(t, dp.state, ms, false)
 			},
 			resourcePackages: createPkgItems(map[int]map[string]int{
 				0: {}, // Empty config
@@ -324,7 +371,7 @@ func TestSyncResourcePackageStates(t *testing.T) {
 					ms[0].ResourcePackageStates = make(map[string]*state.ResourcePackageState)
 				}
 				ms[0].ResourcePackageStates["pkg-f"] = &state.ResourcePackageState{PinnedCPUSet: machine.NewCPUSet(0, 1)}
-				dp.state.SetMachineState(ms, false)
+				setMachineStateForTest(t, dp.state, ms, false)
 			},
 			resourcePackages: func() utilresourcepackage.NUMAResourcePackageItems {
 				// Create config ONLY for NUMA 1, missing NUMA 0
@@ -359,7 +406,7 @@ func TestSyncResourcePackageStates(t *testing.T) {
 
 				// Set AllocatedCPUSet to occupy ALL available CPUs
 				ms[0].AllocatedCPUSet = available
-				dp.state.SetMachineState(ms, false)
+				setMachineStateForTest(t, dp.state, ms, false)
 			},
 			resourcePackages: createPkgItems(map[int]map[string]int{
 				0: {"pkg-fail": 4}, // Want to expand to 4, but 0 available
@@ -417,7 +464,7 @@ func TestSyncResourcePackageStates(t *testing.T) {
 						0: machine.NewCPUSet(4, 5, 6, 7), // Just some assignment on NUMA 0
 					},
 				}
-				dp.state.SetAllocationInfo(podID, "c1", alloc, false)
+				setAllocationInfoForTest(t, dp.state, podID, "c1", alloc, false)
 				mockPodInMetaServer(dp, alloc, "3")
 
 				// Generate MS from Pods to ensure PodEntries are populated in NUMANodeState
@@ -429,7 +476,7 @@ func TestSyncResourcePackageStates(t *testing.T) {
 					ms[0].ResourcePackageStates = make(map[string]*state.ResourcePackageState)
 				}
 				ms[0].ResourcePackageStates["pkg-h"] = &state.ResourcePackageState{PinnedCPUSet: machine.NewCPUSet(0, 2)}
-				dp.state.SetMachineState(ms, false)
+				setMachineStateForTest(t, dp.state, ms, false)
 			},
 			resourcePackages: createPkgItems(map[int]map[string]int{
 				0: {"pkg-h": 2}, // Keep size 2
@@ -465,7 +512,7 @@ func TestSyncResourcePackageStates(t *testing.T) {
 						0: machine.NewCPUSet(4, 5, 6, 7), // Just some assignment on NUMA 0
 					},
 				}
-				dp.state.SetAllocationInfo(podID, "c1", alloc, false)
+				setAllocationInfoForTest(t, dp.state, podID, "c1", alloc, false)
 				mockPodInMetaServer(dp, alloc, "7")
 
 				// Generate MS from Pods
@@ -477,7 +524,7 @@ func TestSyncResourcePackageStates(t *testing.T) {
 					ms[0].ResourcePackageStates = make(map[string]*state.ResourcePackageState)
 				}
 				ms[0].ResourcePackageStates["pkg-i"] = &state.ResourcePackageState{PinnedCPUSet: machine.NewCPUSet(0, 2)}
-				dp.state.SetMachineState(ms, false)
+				setMachineStateForTest(t, dp.state, ms, false)
 			},
 			resourcePackages: createPkgItems(map[int]map[string]int{
 				0: {"pkg-i": 4}, // Request expansion to 4
@@ -513,7 +560,7 @@ func TestSyncResourcePackageStates(t *testing.T) {
 						0: machine.NewCPUSet(4, 5, 6, 7), // Just some assignment on NUMA 0
 					},
 				}
-				dp.state.SetAllocationInfo(podID, "c1", alloc, false)
+				setAllocationInfoForTest(t, dp.state, podID, "c1", alloc, false)
 				mockPodInMetaServer(dp, alloc, "7")
 
 				// Generate MS from Pods to ensure PodEntries are populated in NUMANodeState
@@ -525,7 +572,7 @@ func TestSyncResourcePackageStates(t *testing.T) {
 					ms[0].ResourcePackageStates = make(map[string]*state.ResourcePackageState)
 				}
 				ms[0].ResourcePackageStates["pkg-j"] = &state.ResourcePackageState{PinnedCPUSet: machine.NewCPUSet(0, 2)}
-				dp.state.SetMachineState(ms, false)
+				setMachineStateForTest(t, dp.state, ms, false)
 			},
 			resourcePackages: createPkgItems(map[int]map[string]int{
 				0: {"pkg-j": 6}, // Request expansion to 6
@@ -588,7 +635,7 @@ func TestSyncResourcePackageStates(t *testing.T) {
 						"old-attr": "old-val",
 					},
 				}
-				dp.state.SetMachineState(ms, false)
+				setMachineStateForTest(t, dp.state, ms, false)
 			},
 			resourcePackages: func() utilresourcepackage.NUMAResourcePackageItems {
 				items := make(utilresourcepackage.NUMAResourcePackageItems)

@@ -17,6 +17,7 @@ limitations under the License.
 package dynamicpolicy
 
 import (
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"math"
@@ -36,6 +37,7 @@ import (
 
 	nodev1alpha1 "github.com/kubewharf/katalyst-api/pkg/apis/node/v1alpha1"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpusetmaterializer"
 	irqutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/irqtuner/utils"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	podagent "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
@@ -256,7 +258,7 @@ func TestDynamicPolicy_ListContainers(t *testing.T) {
 			commonstate.FakedContainerName: &state.AllocationInfo{},
 		},
 	}
-	policyImpl.state.SetPodEntries(podEntries, true)
+	setPodEntriesForTest(t, policyImpl.state, podEntries, true)
 
 	cis, err := policyImpl.ListContainers()
 	as.NoError(err)
@@ -346,11 +348,11 @@ func TestDynamicPolicy_GetIRQForbiddenCores(t *testing.T) {
 			Attributes:   map[string]string{"type": "other"},
 		},
 	}
-	policy.state.SetMachineState(machineState, false)
+	setMachineStateForTest(t, policy.state, machineState, false)
 
 	systemPoolName := commonstate.GetSystemPoolName("latency")
 	systemPoolCPUSet := machine.NewCPUSet(4, 5)
-	policy.state.SetAllocationInfo(systemPoolName, commonstate.FakedContainerName, &state.AllocationInfo{
+	setAllocationInfoForTest(t, policy.state, systemPoolName, commonstate.FakedContainerName, &state.AllocationInfo{
 		AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(systemPoolName),
 		AllocationResult:         systemPoolCPUSet,
 		OriginalAllocationResult: systemPoolCPUSet,
@@ -386,7 +388,7 @@ func TestDynamicPolicy_GetExclusiveIRQCPUSet(t *testing.T) {
 	podEntries[commonstate.PoolNameInterrupt] = state.ContainerEntries{commonstate.FakedContainerName: &state.AllocationInfo{
 		AllocationResult: expectedCPUSet,
 	}}
-	policyImpl.state.SetPodEntries(podEntries, true)
+	setPodEntriesForTest(t, policyImpl.state, podEntries, true)
 
 	irqCPUSet, err = policyImpl.GetExclusiveIRQCPUSet()
 	as.NoError(err)
@@ -452,7 +454,7 @@ func TestDynamicPolicy_SetExclusiveIRQCPUSet(t *testing.T) {
 
 		systemPoolName := commonstate.GetSystemPoolName("latency")
 		systemPoolCPUSet := machine.NewCPUSet(6, 8)
-		policyImpl.state.SetAllocationInfo(systemPoolName, commonstate.FakedContainerName, &state.AllocationInfo{
+		setAllocationInfoForTest(t, policyImpl.state, systemPoolName, commonstate.FakedContainerName, &state.AllocationInfo{
 			AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(systemPoolName),
 			AllocationResult:         systemPoolCPUSet,
 			OriginalAllocationResult: systemPoolCPUSet,
@@ -485,6 +487,100 @@ func TestDynamicPolicy_SetExclusiveIRQCPUSet(t *testing.T) {
 	})
 }
 
+func TestSetExclusiveIRQCPUSetBulkheadFailureKeepsDurableBase(t *testing.T) {
+	policy := newTestDynamicPolicy(t, "set-exclusive-irq-owned-target-failure")
+	policy.reservedCPUs = machine.NewCPUSet()
+
+	recordingState := &advisorTargetRecordingState{State: policy.state}
+	policy.state = recordingState
+	base, err := policy.state.PrepareDurableTarget()
+	require.NoError(t, err)
+	recordingState.events = nil
+
+	irqCPUSet := machine.NewCPUSet(0)
+	policy.cpuSetMaterializer = &transactionRecordingMaterializer{
+		events:  &recordingState.events,
+		results: []cpusetmaterializer.Result{{}, {Converged: true}},
+		errs:    []error{errors.New("injected irq materializer failure"), nil},
+	}
+
+	err = policy.SetExclusiveIRQCPUSet(irqCPUSet)
+
+	require.ErrorContains(t, err, "injected irq materializer failure")
+	require.Equal(t, []string{"prepare", "materialize", "materialize"}, recordingState.events)
+	require.Zero(t, recordingState.commitCalls)
+	require.Zero(t, recordingState.setCalls)
+	require.Zero(t, recordingState.storeCalls)
+	require.Equal(t, base, cloneAdvisorState(policy.state))
+}
+
+func TestSetExclusiveIRQCPUSetCommitsOwnedTargetUnderPolicyLock(t *testing.T) {
+	policy := newTestDynamicPolicy(t, "set-exclusive-irq-owned-target-success")
+	policy.reservedCPUs = machine.NewCPUSet()
+
+	recordingState := &advisorTargetRecordingState{State: policy.state}
+	policy.state = recordingState
+	irqCPUSet := machine.NewCPUSet(0)
+	policy.cpuSetMaterializer = &transactionRecordingMaterializer{
+		events:  &recordingState.events,
+		results: []cpusetmaterializer.Result{{Converged: true}},
+		onCall: func(cpusetmaterializer.Target) {
+			if policy.TryLock() {
+				policy.Unlock()
+				t.Error("policy lock was not held during irq materialization")
+			}
+		},
+	}
+
+	require.NoError(t, policy.SetExclusiveIRQCPUSet(irqCPUSet))
+
+	require.Equal(t, []string{"prepare", "materialize", "commit"}, recordingState.events)
+	require.Equal(t, 1, recordingState.commitCalls)
+	require.Zero(t, recordingState.setCalls)
+	require.Zero(t, recordingState.storeCalls)
+	irqInfo := policy.state.GetAllocationInfo(commonstate.PoolNameInterrupt, commonstate.FakedContainerName)
+	require.NotNil(t, irqInfo)
+	require.True(t, irqInfo.AllocationResult.Equals(irqCPUSet))
+}
+
+func TestPlanExclusiveIRQCPUSetUsesCandidateInsteadOfLiveState(t *testing.T) {
+	policy := setupPolicyForBindReclaimTest(t, "irq-candidate-state", ptrCPUSet(machine.NewCPUSet(6, 7, 8, 9, 10, 11, 12, 13, 14, 15)))
+	policy.dynamicConfig.GetDynamicConfiguration().CPUPluginConfiguration.BindIRQToReclaimedPool = true
+
+	candidate, err := policy.state.PrepareDurableTarget()
+	require.NoError(t, err)
+	candidateReclaim := machine.NewCPUSet(2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
+	candidate.PodEntries[commonstate.PoolNameReclaim][commonstate.FakedContainerName].AllocationResult = candidateReclaim
+	candidate.PodEntries[commonstate.PoolNameReclaim][commonstate.FakedContainerName].OriginalAllocationResult = candidateReclaim.Clone()
+
+	err = policy.planExclusiveIRQCPUSet(machine.NewCPUSet(2), newTargetMutationEditor(candidate))
+	require.NoError(t, err, "CPU 2 is forbidden by live state but allowed by the candidate reclaim pool")
+	require.True(t, policy.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName).
+		AllocationResult.Equals(machine.NewCPUSet(6, 7, 8, 9, 10, 11, 12, 13, 14, 15)),
+		"planning must not mutate live state")
+}
+
+func TestPlanExclusiveIRQCPUSetUsesCandidateMachineStateCapacity(t *testing.T) {
+	policy := newTestDynamicPolicy(t, "irq-candidate-machine-state-capacity")
+	policy.reservedCPUs = machine.NewCPUSet()
+
+	candidate, err := policy.state.PrepareDurableTarget()
+	require.NoError(t, err)
+	candidate.MachineState[0].DefaultCPUSet = candidate.MachineState[0].DefaultCPUSet.Union(machine.NewCPUSet(
+		16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+		28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
+	))
+
+	require.Equal(t, 1, policy.GetStepExpandableCPUsMax(), "live state capacity must remain the smaller limit")
+	require.Equal(t, 2, policy.getStepExpandableCPUsMaxForTarget(candidate), "candidate state must expose the larger limit")
+	err = policy.planExclusiveIRQCPUSet(machine.NewCPUSet(0, 1), newTargetMutationEditor(candidate))
+	require.NoError(t, err, "planner must derive the step expansion limit from the owned candidate")
+}
+
+func ptrCPUSet(value machine.CPUSet) *machine.CPUSet {
+	return &value
+}
+
 // setupPolicyForBindReclaimTest builds a DynamicPolicy fixture for the BindIRQToReclaimedPool tests.
 // It seeds reservedCPUs (0,1), a system pool (4,5) and optionally a reclaimed pool.
 func setupPolicyForBindReclaimTest(t *testing.T, _ string, reclaimCPUs *machine.CPUSet) *DynamicPolicy {
@@ -501,14 +597,14 @@ func setupPolicyForBindReclaimTest(t *testing.T, _ string, reclaimCPUs *machine.
 
 	systemPoolName := commonstate.GetSystemPoolName("latency")
 	systemPoolCPUSet := machine.NewCPUSet(4, 5)
-	policy.state.SetAllocationInfo(systemPoolName, commonstate.FakedContainerName, &state.AllocationInfo{
+	setAllocationInfoForTest(t, policy.state, systemPoolName, commonstate.FakedContainerName, &state.AllocationInfo{
 		AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(systemPoolName),
 		AllocationResult:         systemPoolCPUSet,
 		OriginalAllocationResult: systemPoolCPUSet,
 	}, true)
 
 	if reclaimCPUs != nil {
-		policy.state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &state.AllocationInfo{
+		setAllocationInfoForTest(t, policy.state, commonstate.PoolNameReclaim, commonstate.FakedContainerName, &state.AllocationInfo{
 			AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
 			AllocationResult:         reclaimCPUs.Clone(),
 			OriginalAllocationResult: reclaimCPUs.Clone(),

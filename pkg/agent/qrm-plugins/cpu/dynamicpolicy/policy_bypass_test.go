@@ -126,6 +126,8 @@ func TestGetResourcesAllocationBypassClearsNonDedicatedQoS(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
+		assignments, assignmentErr := machine.GetNumaAwareAssignments(cpuTopology, tc.cpus)
+		require.NoError(t, assignmentErr)
 		req := &pluginapi.ResourceRequest{
 			PodUid:        tc.podUID,
 			PodNamespace:  "default",
@@ -137,18 +139,14 @@ func TestGetResourcesAllocationBypassClearsNonDedicatedQoS(t *testing.T) {
 			},
 		}
 		allocationInfo := &state.AllocationInfo{
-			AllocationMeta:           commonstate.GenerateGenericContainerAllocationMeta(req, commonstate.EmptyOwnerPoolName, tc.qos),
-			AllocationResult:         tc.cpus,
-			OriginalAllocationResult: tc.cpus.Clone(),
-			TopologyAwareAssignments: map[int]machine.CPUSet{
-				0: tc.cpus,
-			},
-			OriginalTopologyAwareAssignments: map[int]machine.CPUSet{
-				0: tc.cpus.Clone(),
-			},
-			RequestQuantity: float64(tc.cpus.Size()),
+			AllocationMeta:                   commonstate.GenerateGenericContainerAllocationMeta(req, commonstate.EmptyOwnerPoolName, tc.qos),
+			AllocationResult:                 tc.cpus,
+			OriginalAllocationResult:         tc.cpus.Clone(),
+			TopologyAwareAssignments:         assignments,
+			OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(assignments),
+			RequestQuantity:                  float64(tc.cpus.Size()),
 		}
-		p.state.SetAllocationInfo(tc.podUID, "main", allocationInfo, false)
+		setAllocationInfoForTest(t, p.state, tc.podUID, "main", allocationInfo, false)
 	}
 
 	resp, err := p.GetResourcesAllocation(context.Background(), &pluginapi.GetResourcesAllocationRequest{})
@@ -235,7 +233,7 @@ func TestClearCPUSetInAllocation(t *testing.T) {
 	})
 }
 
-func TestDynamicPolicyInitializesBulkheadManager(t *testing.T) {
+func TestDynamicPolicyLeavesMaterializerNilWhenBulkheadDisabled(t *testing.T) {
 	t.Parallel()
 
 	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
@@ -243,5 +241,5 @@ func TestDynamicPolicyInitializesBulkheadManager(t *testing.T) {
 
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 	require.NoError(t, err)
-	require.NotNil(t, p.bulkheadManager)
+	require.Nil(t, p.cpuSetMaterializer)
 }

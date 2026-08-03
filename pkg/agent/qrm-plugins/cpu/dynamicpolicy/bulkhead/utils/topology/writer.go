@@ -84,6 +84,10 @@ type DAGApplyInputs struct {
 	// each protected rel to controlled ancestors, so cgroup v1 parent-superset
 	// constraints hold while kubelet/runc create child cgroups.
 	ProtectedCPUSetByRel map[string]machine.CPUSet
+	// ControlledCPUSetByRel is the complete inventory that must be freshly
+	// observed before an apply can report convergence. It may include controlled
+	// leaves that are intentionally not DAG nodes.
+	ControlledCPUSetByRel map[string]machine.CPUSet
 }
 
 func ApplyDAGDiff(ctx context.Context, in DAGApplyInputs) (DAGApplyResult, error) {
@@ -145,7 +149,8 @@ func applyTwoPhase(ctx context.Context, in DAGApplyInputs, res *DAGApplyResult) 
 	if err := convergeControlledNodesWithBridgeConstraint(ctx, in, applyTargets, allowEmptyTarget, res, constrainBridge); err != nil {
 		return err
 	}
-	report, err := buildConvergenceReport(ctx, cg, dag, effectiveTargets, in.CPUDetails, in.ReservedCPUSet, allowEmptyTarget, cache)
+	report, err := buildConvergenceReport(ctx, cg, dag, effectiveTargets, in.ControlledCPUSetByRel,
+		in.CPUDetails, in.ReservedCPUSet, allowEmptyTarget, cache)
 	if err != nil {
 		return err
 	}

@@ -696,7 +696,7 @@ func TestNumaSysCPUPressureEviction_sync(t *testing.T) {
 			"container": &state.AllocationInfo{},
 		},
 	}
-	state1.SetMachineState(machineState, false)
+	setMachineStateForTest(t, state1, machineState)
 
 	type metricData struct {
 		podUID        string

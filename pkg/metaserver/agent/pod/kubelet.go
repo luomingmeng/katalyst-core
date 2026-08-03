@@ -53,8 +53,8 @@ func (k *kubeletPodFetcherImpl) GetPodList(ctx context.Context, podFilter func(*
 		}
 	} else {
 		url := fmt.Sprintf(podsApi, k.baseConf.KubeletReadOnlyPort, k.baseConf.KubeletPodsEndpoint)
-		if err := process.GetAndUnmarshal(url, &podList); err != nil {
-			return []*v1.Pod{}, fmt.Errorf("failed to get pod list, error: %v", err)
+		if err := process.GetAndUnmarshalWithContext(ctx, url, &podList); err != nil {
+			return []*v1.Pod{}, fmt.Errorf("failed to get pod list: %w", err)
 		}
 	}
 

@@ -18,12 +18,15 @@ package utils
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpusetmaterializer"
 	bulkheadconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/bulkhead"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	cgcommon "github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
+	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
 type ContainerRelPathResolveStage string
@@ -65,6 +68,58 @@ func ResolveContainerRelPath(metaServer *metaserver.MetaServer, podUID, containe
 		return "", &ContainerRelPathResolveError{Stage: ContainerRelPathResolveStageCgroupPath, Err: err}
 	}
 	return strings.Trim(rel, "/"), nil
+}
+
+type ControlledRelTarget struct {
+	Rel    string
+	Target machine.CPUSet
+}
+
+func BuildControlledRelInventory(
+	cfg bulkheadconfig.BulkheadConfiguration,
+	target cpusetmaterializer.Target,
+	systemServiceEnabled bool,
+	siblings []string,
+	containerRels map[string]machine.CPUSet,
+) []ControlledRelTarget {
+	targetByRel := map[string]machine.CPUSet{}
+	add := func(rel string, cpus machine.CPUSet) {
+		rel = strings.Trim(rel, "/")
+		if rel == "" {
+			return
+		}
+		targetByRel[rel] = cpus.Clone()
+	}
+
+	nonReclaim := target.NonReclaimCPUSet()
+	reclaim := target.ReclaimCPUSet()
+	add(cfg.BulkheadPrimaryRelPath, nonReclaim)
+	if systemServiceEnabled {
+		add(cfg.BulkheadSystemRelPath, reclaim)
+	}
+	for reclaimIdx, reclaimRel := range cfg.BulkheadReclaimRelPaths {
+		add(reclaimRel, reclaim)
+		for numaID, cpus := range target.ReclaimCPUSetByNUMA() {
+			add(cfg.ReclaimPerNUMA(reclaimIdx, numaID), cpus)
+		}
+	}
+	for _, rel := range siblings {
+		add(rel, reclaim)
+	}
+	for rel, cpus := range containerRels {
+		add(rel, cpus)
+	}
+
+	rels := make([]string, 0, len(targetByRel))
+	for rel := range targetByRel {
+		rels = append(rels, rel)
+	}
+	sort.Strings(rels)
+	out := make([]ControlledRelTarget, 0, len(rels))
+	for _, rel := range rels {
+		out = append(out, ControlledRelTarget{Rel: rel, Target: targetByRel[rel]})
+	}
+	return out
 }
 
 func CollectActiveRels(

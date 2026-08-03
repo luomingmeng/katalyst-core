@@ -74,6 +74,39 @@ func NewCPUPluginState(topology *machine.CPUTopology) *cpuPluginState {
 	}
 }
 
+// snapshot returns a coherent, fully-owned copy of the durable target fields.
+func (s *cpuPluginState) snapshot() *TargetState {
+	s.RLock()
+	defer s.RUnlock()
+
+	return &TargetState{
+		PodEntries:                            s.podEntries.Clone(),
+		MachineState:                          s.machineState.Clone(),
+		NUMAHeadroom:                          general.DeepCopyIntToFloat64Map(s.numaHeadroom),
+		AllowSharedCoresOverlapReclaimedCores: s.allowSharedCoresOverlapReclaimedCores,
+		DisableDedicatedCoresOverlapReclaimedCores: s.disableDedicatedCoresOverlapReclaimedCores,
+	}
+}
+
+// replaceOwnedTarget atomically transfers ownership of next's durable fields
+// into the live cache. The caller must not mutate next afterwards.
+func (s *cpuPluginState) replaceOwnedTarget(next *TargetState) {
+	s.Lock()
+	defer s.Unlock()
+
+	if next == nil {
+		s.cpuPluginStateData = cpuPluginStateData{}
+		return
+	}
+	s.cpuPluginStateData = cpuPluginStateData{
+		podEntries:                            next.PodEntries,
+		machineState:                          next.MachineState,
+		numaHeadroom:                          next.NUMAHeadroom,
+		allowSharedCoresOverlapReclaimedCores: next.AllowSharedCoresOverlapReclaimedCores,
+		disableDedicatedCoresOverlapReclaimedCores: next.DisableDedicatedCoresOverlapReclaimedCores,
+	}
+}
+
 func (s *cpuPluginState) GetMachineState() NUMANodeMap {
 	s.RLock()
 	defer s.RUnlock()

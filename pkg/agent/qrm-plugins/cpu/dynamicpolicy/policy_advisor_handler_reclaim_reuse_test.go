@@ -35,10 +35,10 @@ import (
 func setReclaimPoolCPUSet(t *testing.T, p *DynamicPolicy, cpus machine.CPUSet) {
 	t.Helper()
 	if cpus.IsEmpty() {
-		p.state.SetPodEntries(state.PodEntries{}, false)
+		setPodEntriesForTest(t, p.state, state.PodEntries{}, false)
 		return
 	}
-	p.state.SetPodEntries(state.PodEntries{
+	setPodEntriesForTest(t, p.state, state.PodEntries{
 		commonstate.PoolNameReclaim: {
 			commonstate.FakedContainerName: &state.AllocationInfo{
 				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
@@ -91,7 +91,7 @@ func TestGenerateReclaimBlockCPUSet_InPlaceReuse(t *testing.T) {
 	blockCPUSet := advisorapi.BlockCPUSet{}
 	err := p.generateReclaimBlockCPUSet(
 		numaAwareReclaimBlock(0, "b0", 2),
-		node0, node0, machine.NewCPUSet(), blockCPUSet)
+		node0, node0, machine.NewCPUSet(), blockCPUSet, machine.NewCPUSet())
 	require.NoError(t, err)
 
 	got := blockCPUSet["b0"]
@@ -115,7 +115,7 @@ func TestGenerateReclaimBlockCPUSet_ReleaseRefill(t *testing.T) {
 	blockCPUSet := advisorapi.BlockCPUSet{}
 	err := p.generateReclaimBlockCPUSet(
 		numaAwareReclaimBlock(0, "b0", 4),
-		node0, node0, machine.NewCPUSet(), blockCPUSet)
+		node0, node0, machine.NewCPUSet(), blockCPUSet, machine.NewCPUSet())
 	require.NoError(t, err)
 
 	got := blockCPUSet["b0"]
@@ -139,7 +139,7 @@ func TestGenerateReclaimBlockCPUSet_FirstAllocation(t *testing.T) {
 	blockCPUSet := advisorapi.BlockCPUSet{}
 	err := p.generateReclaimBlockCPUSet(
 		numaAwareReclaimBlock(0, "b0", 4),
-		node0, node0, machine.NewCPUSet(), blockCPUSet)
+		node0, node0, machine.NewCPUSet(), blockCPUSet, machine.NewCPUSet())
 	require.NoError(t, err)
 
 	got := blockCPUSet["b0"]
@@ -165,7 +165,7 @@ func TestGenerateReclaimBlockCPUSet_CrossNUMAIsolation(t *testing.T) {
 	blockCPUSet := advisorapi.BlockCPUSet{}
 	err := p.generateReclaimBlockCPUSet(
 		numaAwareReclaimBlock(0, "b0", 2),
-		node0, node0, machine.NewCPUSet(), blockCPUSet)
+		node0, node0, machine.NewCPUSet(), blockCPUSet, machine.NewCPUSet())
 	require.NoError(t, err)
 
 	got := blockCPUSet["b0"]
@@ -191,10 +191,92 @@ func TestGenerateReclaimBlockCPUSet_NonNUMAReuse(t *testing.T) {
 		},
 	}
 	blockCPUSet := advisorapi.BlockCPUSet{}
-	err := p.generateReclaimBlockCPUSet(blocks, all, all, machine.NewCPUSet(), blockCPUSet)
+	err := p.generateReclaimBlockCPUSet(blocks, all, all, machine.NewCPUSet(), blockCPUSet, machine.NewCPUSet())
 	require.NoError(t, err)
 
 	got := blockCPUSet["b0"]
 	require.Equal(t, 2, got.Size())
 	require.True(t, got.IsSubsetOf(prev), "non-NUMA reclaim must reuse prior cores, got=%s prev=%s", got, prev)
+}
+
+func TestGenerateReclaimBlockCPUSet_HardReclaimPreferredEvenWhenReservedFromAvailable(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	hard := machine.NewCPUSet(0, 1)
+	setReclaimPoolCPUSet(t, p, hard)
+
+	node0 := p.machineInfo.CPUDetails.CPUsInNUMANodes(0)
+	availableWithoutHard := node0.Difference(hard)
+	blockCPUSet := advisorapi.BlockCPUSet{}
+	err := p.generateReclaimBlockCPUSet(
+		numaAwareReclaimBlock(0, "b0", 2),
+		availableWithoutHard,
+		availableWithoutHard,
+		machine.NewCPUSet(),
+		blockCPUSet,
+		hard,
+	)
+	require.NoError(t, err)
+
+	got := blockCPUSet["b0"]
+	require.True(t, hard.Equals(got), "hard reclaim must be materialized first, got=%s hard=%s", got.String(), hard.String())
+}
+
+func TestGenerateReclaimBlockCPUSet_NUMAUsesCommittedBase(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	committedReclaim := machine.NewCPUSet(0, 1)
+	setReclaimPoolCPUSet(t, p, committedReclaim)
+
+	node0 := p.machineInfo.CPUDetails.CPUsInNUMANodes(0)
+	blockCPUSet := advisorapi.BlockCPUSet{}
+	err := p.generateReclaimBlockCPUSet(
+		numaAwareReclaimBlock(0, "b0", 2),
+		node0,
+		node0,
+		machine.NewCPUSet(),
+		blockCPUSet,
+		machine.NewCPUSet(),
+	)
+	require.NoError(t, err)
+	require.True(t, blockCPUSet["b0"].Equals(committedReclaim),
+		"NUMA selector must use committed base without an applied cache; got=%s committed=%s",
+		blockCPUSet["b0"].String(), committedReclaim.String())
+}
+
+func TestGenerateReclaimBlockCPUSet_NonNUMAPrefersHardThenCommittedBase(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	hard := machine.NewCPUSet(0, 1)
+	committedReclaim := machine.NewCPUSet(10, 11)
+	setReclaimPoolCPUSet(t, p, committedReclaim)
+
+	all := p.machineInfo.CPUDetails.CPUs()
+	blocks := map[int][]*advisorapi.BlockInfo{
+		commonstate.FakedNUMAID: {
+			{Block: advisorapi.Block{BlockId: "b0", Result: 4}},
+		},
+	}
+	blockCPUSet := advisorapi.BlockCPUSet{}
+	err := p.generateReclaimBlockCPUSet(
+		blocks,
+		all.Difference(hard),
+		all.Difference(hard),
+		machine.NewCPUSet(),
+		blockCPUSet,
+		hard,
+	)
+	require.NoError(t, err)
+	require.True(t, blockCPUSet["b0"].Equals(hard.Union(committedReclaim)),
+		"non-NUMA selector must consume hard then committed base; got=%s hard=%s committed=%s",
+		blockCPUSet["b0"].String(), hard.String(), committedReclaim.String())
 }

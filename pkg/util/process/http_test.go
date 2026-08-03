@@ -18,8 +18,10 @@ package process
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"testing"
 	"time"
@@ -42,6 +44,31 @@ type dummyResponseWriter struct{}
 func (d dummyResponseWriter) Header() http.Header       { return make(http.Header) }
 func (d dummyResponseWriter) Write([]byte) (int, error) { return 0, nil }
 func (d dummyResponseWriter) WriteHeader(_ int)         {}
+
+func TestGetAndUnmarshalCompatibility(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"value":"ok"}`)
+	}))
+	defer server.Close()
+
+	got := struct {
+		Value string `json:"value"`
+	}{}
+	if err := GetAndUnmarshal(server.URL, &got); err != nil {
+		t.Fatalf("GetAndUnmarshal() error = %v", err)
+	}
+	assert.Equal(t, "ok", got.Value)
+}
+
+func TestGetAndUnmarshalWithContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := GetAndUnmarshalWithContext(ctx, "http://localhost", &struct{}{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("GetAndUnmarshalWithContext() error = %v, want context cancellation", err)
+	}
+}
 
 func TestHTTPHandler(t *testing.T) {
 	t.Parallel()
