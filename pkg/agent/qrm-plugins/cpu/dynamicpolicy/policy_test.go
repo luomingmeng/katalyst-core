@@ -6507,6 +6507,66 @@ func TestSharedCoresRampUpDisabledAllocation(t *testing.T) {
 	})
 }
 
+func TestSharedCoresRampUpAllocationExcludesAllNUMAReclaimFloor(t *testing.T) {
+	t.Parallel()
+
+	as := require.New(t)
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 2)
+	as.NoError(err)
+	policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	as.NoError(err)
+	policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = false
+	policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	policy.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0
+
+	numa0 := policy.machineInfo.CPUDetails.CPUsInNUMANodes(0).Difference(policy.reservedCPUs).ToSliceInt()
+	numa1 := policy.machineInfo.CPUDetails.CPUsInNUMANodes(1).Difference(policy.reservedCPUs).ToSliceInt()
+	as.GreaterOrEqual(len(numa0), 2)
+	as.GreaterOrEqual(len(numa1), 2)
+	floor := machine.NewCPUSet(numa0[0], numa0[1], numa1[0], numa1[1])
+	policy.reservedReclaimedCPUSet = floor
+	policy.reservedReclaimedCPUsSize = floor.Size()
+	policy.state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &state.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+		AllocationResult: floor,
+	}, false)
+
+	const podUID = "shared-ramp-up-all-numa-floor"
+	policy.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{{
+		ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID), Namespace: "default", Name: podUID},
+		Spec: v1.PodSpec{Containers: []v1.Container{{
+			Name: "main",
+			Resources: v1.ResourceRequirements{Requests: v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("2"),
+			}},
+		}}},
+		Status: v1.PodStatus{Phase: v1.PodPending},
+	}}}
+	req := &pluginapi.ResourceRequest{
+		PodUid: podUID, PodNamespace: "default", PodName: podUID,
+		ContainerName: "main", ContainerType: pluginapi.ContainerType_MAIN,
+		ResourceName:     string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{string(v1.ResourceCPU): 2},
+		Labels:           map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+		Annotations:      map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+	}
+
+	_, err = policy.sharedCoresWithoutNUMABindingAllocationHandler(context.Background(), req, false)
+	as.NoError(err)
+	allocation := policy.state.GetAllocationInfo(podUID, "main")
+	as.NotNil(allocation)
+	as.True(allocation.RampUp)
+	as.True(allocation.AllocationResult.Intersection(floor).IsEmpty(),
+		"ramp-up allocation %s contains reclaim floor %s", allocation.AllocationResult, floor)
+
+	_, err = policy.sharedCoresWithoutNUMABindingAllocationHandler(context.Background(), req, false)
+	as.NoError(err)
+	replayed := policy.state.GetAllocationInfo(podUID, "main")
+	as.NotNil(replayed)
+	as.True(replayed.AllocationResult.Intersection(floor).IsEmpty(),
+		"replayed ramp-up allocation %s contains reclaim floor %s", replayed.AllocationResult, floor)
+}
+
 func TestAllocateByQoSAwareServerListAndWatchResp(t *testing.T) {
 	t.Parallel()
 
