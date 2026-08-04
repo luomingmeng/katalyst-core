@@ -190,6 +190,28 @@ func TestBuildCPUSetPartitionViewAndDeepCopy(t *testing.T) {
 	assertCPUSet(t, "original share pool map unchanged", view.SharePoolMap["share-NUMA0"], "6")
 }
 
+func TestBuildCPUSetPartitionViewPreservesTwoReservedCPUs(t *testing.T) {
+	t.Parallel()
+
+	state := cpustate.NewCPUPluginState(nil)
+	state.SetAllocationInfo(commonstate.PoolNameReserve, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReserve),
+		AllocationResult: machine.NewCPUSet(0, 24),
+	})
+	state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+		AllocationResult: machine.NewCPUSet(1, 25),
+	})
+	view := BuildCPUSetPartitionView(state, &machine.CPUTopology{CPUDetails: machine.CPUDetails{
+		0: {NUMANodeID: 0}, 1: {NUMANodeID: 0}, 24: {NUMANodeID: 1}, 25: {NUMANodeID: 1},
+	}}, CPUSetPartitionViewOptions{})
+
+	assertCPUSet(t, "reserve", view.Reserve, "0,24")
+	if got := view.Reserve.Size(); got != 2 {
+		t.Fatalf("reserve size = %d, want 2", got)
+	}
+}
+
 func TestBuildCPUSetPartitionViewNilInputs(t *testing.T) {
 	t.Parallel()
 

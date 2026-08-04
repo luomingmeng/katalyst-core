@@ -17,6 +17,8 @@ limitations under the License.
 package dynamicpolicy
 
 import (
+	"context"
+	"errors"
 	"io/ioutil"
 	"os"
 	"reflect"
@@ -32,6 +34,31 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	rputil "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 )
+
+type atomicCommitTrackingState struct {
+	state.State
+	commitErr   error
+	failCommits int
+	commitCalls int
+	storeCalls  int
+}
+
+func (s *atomicCommitTrackingState) CommitAdvisorState(
+	podEntries state.PodEntries,
+	machineState state.NUMANodeMap,
+	allowOverlap, disableDedicatedOverlap, persist bool,
+) error {
+	s.commitCalls++
+	if s.commitErr != nil && (s.failCommits < 0 || s.commitCalls <= s.failCommits) {
+		return s.commitErr
+	}
+	return s.State.CommitAdvisorState(podEntries, machineState, allowOverlap, disableDedicatedOverlap, persist)
+}
+
+func (s *atomicCommitTrackingState) StoreState() error {
+	s.storeCalls++
+	return s.State.StoreState()
+}
 
 func TestDynamicPolicy_getReclaimOverlapShareRatio(t *testing.T) {
 	t.Parallel()
@@ -709,7 +736,7 @@ func TestDynamicPolicy_allocateNumaBindingCPUs(t *testing.T) {
 				AllocationResult: tt.args.reclaimCPUs.Clone(),
 			}, false)
 
-			got, err := p.allocateNumaBindingCPUs(tt.args.numCPUs, tt.args.hint, tt.args.machineState, tt.args.reqAnnotations)
+			got, _, err := p.allocateNumaBindingCPUs(tt.args.numCPUs, tt.args.hint, tt.args.machineState, tt.args.reqAnnotations, false)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("allocateNumaBindingCPUs() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -800,10 +827,10 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_reclaimPreferenceRespectsResource
 			},
 		},
 	}
-	got, err := p.allocateNumaBindingCPUs(2, &pluginapi.TopologyHint{Nodes: []uint64{0}}, machineState, map[string]string{
+	got, _, err := p.allocateNumaBindingCPUs(2, &pluginapi.TopologyHint{Nodes: []uint64{0}}, machineState, map[string]string{
 		apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
 		apiconsts.PodAnnotationResourcePackageKey:           "pkg1",
-	})
+	}, false)
 	require.NoError(t, err)
 	require.True(t, got.Equals(machine.NewCPUSet(1, 2)), "got=%s", got.String())
 	require.True(t, got.IsSubsetOf(machine.NewCPUSet(0, 1, 2)), "got=%s", got.String())
@@ -831,9 +858,9 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_fullReclaimFallsBackToAvailable(t
 	machineState := state.NUMANodeMap{
 		0: &state.NUMANodeState{DefaultCPUSet: available},
 	}
-	got, err := p.allocateNumaBindingCPUs(2, &pluginapi.TopologyHint{Nodes: []uint64{0}}, machineState, map[string]string{
+	got, _, err := p.allocateNumaBindingCPUs(2, &pluginapi.TopologyHint{Nodes: []uint64{0}}, machineState, map[string]string{
 		apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
-	})
+	}, false)
 	require.NoError(t, err)
 	require.Equal(t, 2, got.Size())
 	require.True(t, got.IsSubsetOf(available), "got=%s available=%s", got.String(), available.String())
@@ -1121,6 +1148,246 @@ func TestDynamicPolicy_generatePoolsAndIsolation_preservesAdvisorReclaimForSeedP
 		poolsCPUSet[commonstate.PoolNameReclaim].String(), wantReclaim.String())
 	require.True(t, poolsCPUSet["seedpool-stable-0"].Equals(machine.NewCPUSet(1)),
 		"seed pool should take the first available cpu, got %s", poolsCPUSet["seedpool-stable-0"].String())
+}
+
+func TestDynamicPolicyDeriveRampUpReclaimFloorCoversAllNUMAs(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(96, 2, 2)
+	require.NoError(t, err)
+
+	tmpDir, err := ioutil.TempDir("", "checkpoint-TestDynamicPolicyDeriveRampUpReclaimFloorCoversAllNUMAs")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet(0, 24)
+	p.reservedReclaimedCPUSet = machine.NewCPUSet(14, 38, 62, 86)
+	p.reservedReclaimedCPUsSize = 4
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0
+	p.state.SetPodEntries(state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(1, 25, 49, 73),
+			},
+		},
+	}, false)
+
+	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), true)
+	require.NoError(t, err)
+	require.True(t, floor.Equals(machine.NewCPUSet(14, 38, 62, 86)),
+		"floor=%s, want all-NUMA reserved reclaim CPUs", floor)
+	require.Equal(t, 2, floor.Intersection(p.machineInfo.CPUDetails.CPUsInNUMANodes(0)).Size())
+	require.Equal(t, 2, floor.Intersection(p.machineInfo.CPUDetails.CPUsInNUMANodes(1)).Size())
+
+	inactiveFloor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), false)
+	require.NoError(t, err)
+	require.True(t, inactiveFloor.IsEmpty(), "floor must not reserve capacity without an active ramp-up workload")
+
+	p.state.SetAllocationInfo("ramp-up-pod", "main", &state.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid: "ramp-up-pod", ContainerName: "main",
+		},
+		AllocationResult: machine.NewCPUSet(1),
+		RampUp:           true,
+	}, false)
+	activeFloor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), false)
+	require.NoError(t, err)
+	require.True(t, activeFloor.Equals(machine.NewCPUSet(14, 38, 62, 86)))
+}
+
+func TestDedicatedNUMAExclusiveRampUpCommitsAllocationAndReclaimAtomically(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.reservedReclaimedCPUSet = machine.NewCPUSet()
+	p.reservedReclaimedCPUsSize = 0
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.25
+	tracked := &atomicCommitTrackingState{State: p.state}
+	p.state = tracked
+
+	req := &pluginapi.ResourceRequest{
+		PodUid:         "exclusive-dnb-atomic-ramp-up",
+		PodNamespace:   "default",
+		PodName:        "exclusive-dnb-atomic-ramp-up",
+		ContainerName:  "main",
+		ContainerType:  pluginapi.ContainerType_MAIN,
+		ContainerIndex: 0,
+		ResourceName:   string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{
+			string(v1.ResourceCPU): 2,
+		},
+		Labels: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+		},
+		Annotations: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey:                    apiconsts.PodAnnotationQoSLevelDedicatedCores,
+			apiconsts.PodAnnotationMemoryEnhancementNumaBinding:   apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
+		},
+		Hint: &pluginapi.TopologyHint{Nodes: []uint64{0}},
+	}
+
+	resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(context.Background(), req, true)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Equal(t, 1, tracked.commitCalls)
+	require.Zero(t, tracked.storeCalls)
+
+	allocation := p.state.GetAllocationInfo(req.PodUid, req.ContainerName)
+	require.NotNil(t, allocation)
+	require.True(t, allocation.CheckDedicatedNUMABindingNUMAExclusive())
+	reclaim := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	require.NotNil(t, reclaim)
+	require.False(t, reclaim.AllocationResult.IsEmpty())
+	available := cpuTopology.CPUDetails.CPUs()
+	require.True(t, allocation.AllocationResult.Intersection(reclaim.AllocationResult).IsEmpty(),
+		"allocation=%s reclaim=%s", allocation.AllocationResult, reclaim.AllocationResult)
+	require.True(t, allocation.AllocationResult.Union(reclaim.AllocationResult).Equals(available),
+		"allocation=%s reclaim=%s available=%s", allocation.AllocationResult, reclaim.AllocationResult, available)
+}
+
+func TestDedicatedNUMAExclusiveRampUpCommitFailureKeepsPreviousState(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.reservedReclaimedCPUSet = machine.NewCPUSet()
+	p.reservedReclaimedCPUsSize = 0
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.25
+
+	beforeEntries := p.state.GetPodEntries()
+	beforeMachine := p.state.GetMachineState()
+	tracked := &atomicCommitTrackingState{
+		State:       p.state,
+		commitErr:   errors.New("injected atomic commit failure"),
+		failCommits: -1,
+	}
+	p.state = tracked
+	req := &pluginapi.ResourceRequest{
+		PodUid: "exclusive-dnb-commit-failure", PodNamespace: "default",
+		PodName: "exclusive-dnb-commit-failure", ContainerName: "main",
+		ContainerType: pluginapi.ContainerType_MAIN, ResourceName: string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{string(v1.ResourceCPU): 2},
+		Labels: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+		},
+		Annotations: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey:                    apiconsts.PodAnnotationQoSLevelDedicatedCores,
+			apiconsts.PodAnnotationMemoryEnhancementNumaBinding:   apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
+		},
+		Hint: &pluginapi.TopologyHint{Nodes: []uint64{0}},
+	}
+
+	resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(context.Background(), req, true)
+	require.Nil(t, resp)
+	require.ErrorContains(t, err, "injected atomic commit failure")
+	require.Equal(t, 1, tracked.commitCalls)
+	require.Zero(t, tracked.storeCalls)
+	require.True(t, reflect.DeepEqual(beforeEntries, p.state.GetPodEntries()))
+	require.True(t, reflect.DeepEqual(beforeMachine, p.state.GetMachineState()))
+}
+
+func TestDedicatedNUMAExclusiveRampUpRejectsEmptyReclaimFloor(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.reservedReclaimedCPUSet = machine.NewCPUSet()
+	p.reservedReclaimedCPUsSize = 0
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0
+	req := &pluginapi.ResourceRequest{
+		PodUid: "exclusive-dnb-empty-floor", PodNamespace: "default",
+		PodName: "exclusive-dnb-empty-floor", ContainerName: "main",
+		ContainerType: pluginapi.ContainerType_MAIN, ResourceName: string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{string(v1.ResourceCPU): 2},
+		Labels: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+		},
+		Annotations: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey:                    apiconsts.PodAnnotationQoSLevelDedicatedCores,
+			apiconsts.PodAnnotationMemoryEnhancementNumaBinding:   apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
+		},
+		Hint: &pluginapi.TopologyHint{Nodes: []uint64{0}},
+	}
+
+	resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(context.Background(), req, true)
+	require.Nil(t, resp)
+	require.ErrorContains(t, err, "requires non-empty reclaim floor on NUMA 0")
+	require.Nil(t, p.state.GetAllocationInfo(req.PodUid, req.ContainerName))
+}
+
+func TestAllocateRestoresPreviousDNBWhenAtomicCommitFails(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.reservedReclaimedCPUSet = machine.NewCPUSet()
+	p.reservedReclaimedCPUsSize = 0
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.25
+	const podUID = "existing-exclusive-dnb"
+	oldAllocation := &state.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid: podUID, PodNamespace: "default", PodName: podUID,
+			ContainerName: "main", ContainerType: pluginapi.ContainerType_MAIN.String(),
+			QoSLevel: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+			Annotations: map[string]string{
+				apiconsts.PodAnnotationMemoryEnhancementNumaBinding:   apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+				apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
+			},
+		},
+		AllocationResult:         machine.NewCPUSet(0, 1),
+		OriginalAllocationResult: machine.NewCPUSet(0, 1),
+		RampUp:                   true,
+	}
+	p.state.SetAllocationInfo(podUID, "main", oldAllocation, false)
+	tracked := &atomicCommitTrackingState{
+		State: p.state, commitErr: errors.New("injected atomic commit failure"), failCommits: 1,
+	}
+	p.state = tracked
+	req := &pluginapi.ResourceRequest{
+		PodUid: podUID, PodNamespace: "default", PodName: podUID,
+		ContainerName: "main", ContainerType: pluginapi.ContainerType_MAIN,
+		ResourceName:     string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{string(v1.ResourceCPU): 4},
+		Labels: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+		},
+		Annotations: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey:          apiconsts.PodAnnotationQoSLevelDedicatedCores,
+			apiconsts.PodAnnotationMemoryEnhancementKey: `{"numa_binding":"true","numa_exclusive":"true"}`,
+		},
+		Hint: &pluginapi.TopologyHint{Nodes: []uint64{0}},
+	}
+
+	resp, err := p.Allocate(context.Background(), req)
+	require.Nil(t, resp)
+	require.ErrorContains(t, err, "injected atomic commit failure")
+	restored := p.state.GetAllocationInfo(podUID, "main")
+	require.NotNil(t, restored)
+	require.True(t, restored.AllocationResult.Equals(oldAllocation.AllocationResult))
 }
 
 func TestDynamicPolicy_adjustPoolsAndIsolatedEntries_Pinned(t *testing.T) {
