@@ -235,7 +235,8 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 		ProtectedPendingCPUSet: expectedRes.PendingCPUSetUnion(),
 		ProtectedCPUSetByRel:   protectedByRel,
 		PublishFinalSnapshot: func(snapshot *topology.CompleteSnapshot) error {
-			appliedView, err := appliedViewFromFinalSnapshot(in.MetaServer, in.DesiredView, dag, snapshot)
+			appliedView, err := appliedViewFromFinalSnapshot(
+				in.MetaServer, in.DesiredView, dag, snapshot, expectedRes.ExpectedByRel)
 			if err != nil {
 				return fmt.Errorf("derive applied view from final topology snapshot: %w", err)
 			}
@@ -276,6 +277,7 @@ func appliedViewFromFinalSnapshot(
 	desired *model.DesiredView,
 	dag *topology.TopoDAG,
 	snapshot *topology.CompleteSnapshot,
+	expectedCPUSetByRel ...map[string]machine.CPUSet,
 ) (*model.AppliedView, error) {
 	if desired == nil || dag == nil || snapshot == nil {
 		return nil, fmt.Errorf("desired view, topology dag and final snapshot are required")
@@ -319,7 +321,11 @@ func appliedViewFromFinalSnapshot(
 		}
 		applied.ReclaimEffectivePerNUMA[numaID] = applied.ReclaimEffectivePerNUMA[numaID].Union(proof)
 	}
-	containerCPUSetByPod, err := containerCPUSetByPodFromFinalSnapshot(metaServer, desired, snapshot)
+	var expected map[string]machine.CPUSet
+	if len(expectedCPUSetByRel) > 0 {
+		expected = expectedCPUSetByRel[0]
+	}
+	containerCPUSetByPod, err := containerCPUSetByPodFromFinalSnapshot(metaServer, desired, snapshot, expected)
 	if err != nil {
 		return nil, err
 	}
@@ -331,6 +337,7 @@ func containerCPUSetByPodFromFinalSnapshot(
 	metaServer *metaserver.MetaServer,
 	desired *model.DesiredView,
 	snapshot *topology.CompleteSnapshot,
+	expectedCPUSetByRel map[string]machine.CPUSet,
 ) (map[string]map[string]machine.CPUSet, error) {
 	out := map[string]map[string]machine.CPUSet{}
 	if desired == nil || len(desired.ContainerCPUSetByPod) == 0 {
@@ -353,13 +360,25 @@ func containerCPUSetByPodFromFinalSnapshot(
 			}
 			proof, ok := snapshot.TargetProofCPUs(rel, desiredCPUs)
 			if !ok {
-				return nil, fmt.Errorf("final snapshot misses container leaf %q for pod=%q container=%q", rel, podUID, containerName)
+				if expectedCPUSetByRel != nil {
+					expectedCPUSetByRel[rel] = desiredCPUs.Clone()
+				}
+				return nil, &topology.PlanStaleError{
+					Rel: rel, Direction: topology.WriteDirection("publish"),
+					Resource: "container_cpuset", Current: "<missing>", Target: desiredCPUs.String(),
+					Err: fmt.Errorf("final snapshot misses container leaf for pod=%q container=%q", podUID, containerName),
+				}
 			}
 			if !proof.Equals(desiredCPUs) {
-				return nil, fmt.Errorf(
-					"final snapshot container leaf %q cpuset=%s does not match desired=%s for pod=%q container=%q",
-					rel, proof.String(), desiredCPUs.String(), podUID, containerName,
-				)
+				if expectedCPUSetByRel != nil {
+					expectedCPUSetByRel[rel] = desiredCPUs.Clone()
+				}
+				return nil, &topology.PlanStaleError{
+					Rel: rel, Direction: topology.WriteDirection("publish"),
+					Resource: "container_cpuset", Current: proof.String(), Target: desiredCPUs.String(),
+					Err: fmt.Errorf("final snapshot container leaf does not match desired for pod=%q container=%q",
+						podUID, containerName),
+				}
 			}
 			if out[podUID] == nil {
 				out[podUID] = map[string]machine.CPUSet{}

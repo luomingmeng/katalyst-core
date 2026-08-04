@@ -406,6 +406,22 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 			if in.PublishFinalSnapshot != nil {
 				if err := in.PublishFinalSnapshot(fresh); err != nil {
 					res.FinalSnapshotCurrent = false
+					res.FinalSnapshot = nil
+					res.Converged = false
+					if replanRequired(err) {
+						outcome.Status = RoundStatusStale
+						outcome.Snapshot = fresh
+						outcome.Blocker = err
+						res.Rounds[len(res.Rounds)-1] = outcome
+						round.pendingSnapshot = fresh
+						round.dynamicByRel = cloneCPUSetMap(in.ExpectedCPUSetByRel)
+						if replanBlocked(outcome) {
+							res.State = ConvergenceStateBlocked
+							return *res, &CoordinatorBlockedError{Blocker: err}
+						}
+						res.State = ConvergenceStateNonConverged
+						continue
+					}
 					return *res, err
 				}
 			}
