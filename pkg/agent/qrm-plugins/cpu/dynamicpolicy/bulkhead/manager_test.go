@@ -1002,6 +1002,76 @@ func TestRunCPUSetAdjustmentHandlersPublishesAppliedViewAfterTopologyConverges_B
 	}
 }
 
+func TestRunCPUSetAdjustmentHandlersABCLifecyclePreservesBOnPlanningFailure(t *testing.T) {
+	t.Parallel()
+
+	reclaimB := machine.MustParse("9-13,20-21,36,39-40,42,57,59-60,68,84,87-88,90")
+	reclaimC := machine.MustParse("13-18,20-21,35-40,42,62-66,68,83-88,90")
+	topologyPlugin := &fakeTopologyPlugin{
+		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
+		result: bulkheadapi.DAGApplyResult{
+			FullyConverged:       true,
+			FinalSnapshotCurrent: true,
+			AppliedView: &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
+				Reserve:          machine.NewCPUSet(0, 24),
+				ReclaimEffective: reclaimB,
+			}},
+		},
+	}
+	consumer := &fakePlugin{name: "workqueue", enabled: true}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, consumer}}
+	state, topology := testBulkheadStateAndTopology()
+	run := func() error {
+		return m.RunCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
+			DynamicConf: dynamicBulkheadConf(true),
+			State:       state,
+			Topology:    topology,
+		})
+	}
+
+	if err := run(); err != nil {
+		t.Fatalf("publish B: %v", err)
+	}
+	assertCPUSet(t, "applied B", m.appliedView.ReclaimEffective, reclaimB.String())
+	if m.appliedViewRevision != 1 {
+		t.Fatalf("B revision = %d, want 1", m.appliedViewRevision)
+	}
+
+	topologyPlugin.err = errors.New("plan C: deadlock probe budget exceeded")
+	if err := run(); err == nil {
+		t.Fatal("planning C should fail")
+	}
+	assertCPUSet(t, "applied remains B", m.appliedView.ReclaimEffective, reclaimB.String())
+	if m.appliedViewRevision != 1 {
+		t.Fatalf("failed C revision = %d, want 1", m.appliedViewRevision)
+	}
+	if got := len(consumer.adjustApplied); got != 1 {
+		t.Fatalf("consumer calls after failed C = %d, want 1", got)
+	}
+
+	topologyPlugin.err = nil
+	topologyPlugin.result = bulkheadapi.DAGApplyResult{
+		FullyConverged:       true,
+		FinalSnapshotCurrent: true,
+		AppliedView: &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
+			Reserve:          machine.NewCPUSet(0, 24),
+			ReclaimEffective: reclaimC,
+		}},
+	}
+	if err := run(); err != nil {
+		t.Fatalf("publish C: %v", err)
+	}
+	assertCPUSet(t, "applied C", m.appliedView.ReclaimEffective, reclaimC.String())
+	assertCPUSet(t, "reserve C", m.appliedView.Reserve, "0,24")
+	if m.appliedViewRevision != 2 {
+		t.Fatalf("C revision = %d, want 2", m.appliedViewRevision)
+	}
+	if got := len(consumer.adjustApplied); got != 2 {
+		t.Fatalf("consumer calls after C = %d, want 2", got)
+	}
+	assertCPUSet(t, "consumer sees C", consumer.adjustApplied[1].ReclaimEffective, reclaimC.String())
+}
+
 func TestRunCPUSetAdjustmentHandlersShortCircuitsConsumersUntilTopologyConverges_BitsUT(t *testing.T) {
 	t.Parallel()
 

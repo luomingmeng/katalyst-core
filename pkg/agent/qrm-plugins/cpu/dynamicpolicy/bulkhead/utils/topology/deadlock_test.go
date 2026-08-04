@@ -18,11 +18,29 @@ package topology
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
+
+type overlapChurnReplayFixture struct {
+	Source              string `json:"source"`
+	CPUCount            int    `json:"cpu_count"`
+	PrimaryCurrent      [2]int `json:"primary_current"`
+	ReclaimCurrent      [2]int `json:"reclaim_current"`
+	PrimaryDesired      [2]int `json:"primary_desired"`
+	ReclaimDesired      [2]int `json:"reclaim_desired"`
+	PendingLeafCount    int    `json:"pending_leaf_count"`
+	ProtectedRelCount   int    `json:"protected_rel_count"`
+	DeadlockProbeBudget int    `json:"deadlock_probe_budget"`
+}
 
 func TestBuildPhasePlanDetectsPrimaryReclaimSingletonV1Deadlock(t *testing.T) {
 	input := primaryReclaimSwapInput(t, machine.NewCPUSet(0), machine.NewCPUSet(1))
@@ -131,6 +149,9 @@ func TestDeadlockAnalysisBudgetExhaustionFailsClosed(t *testing.T) {
 	if analysis.SafeSeed != nil {
 		t.Fatalf("safe seed = %+v, want nil under incomplete probe", analysis.SafeSeed)
 	}
+	if analysis.ProbeStats.ProbeLimit != 2 {
+		t.Fatalf("probe limit = %d, want explicit limit 2", analysis.ProbeStats.ProbeLimit)
+	}
 	if after := input.Budget.Usage(); after.DeadlockProbeOperations != 2 {
 		t.Fatalf("deadlock probe operations = %d, want shared-budget limit 2", after.DeadlockProbeOperations)
 	}
@@ -139,6 +160,404 @@ func TestDeadlockAnalysisBudgetExhaustionFailsClosed(t *testing.T) {
 	if !errors.Is(err, ErrDeadlockProbeBudgetExceeded) {
 		t.Fatalf("BuildPhasePlan error = %v, want fail-closed deadlock probe budget error", err)
 	}
+}
+
+func TestDeadlockAnalysisOverlapChurnReplayReportsInputScale(t *testing.T) {
+	input, fixture := loadOverlapChurnReplayInput(t)
+
+	analysis, err := analyzeV1Deadlock(input)
+	if err != nil {
+		t.Fatalf("analyzeV1Deadlock: %v", err)
+	}
+	if analysis.Completeness != ProbeComplete {
+		t.Fatalf("analysis completeness = %s, want %s", analysis.Completeness, ProbeComplete)
+	}
+	stats := analysis.ProbeStats
+	if stats.Atoms != 96 || stats.SnapshotEntries != 98 ||
+		stats.SnapshotChildEdges != 96 || stats.ProtectedRels != 12 {
+		t.Fatalf("unexpected probe stats: %+v; fixture source=%q", stats, fixture.Source)
+	}
+}
+
+func TestDeadlockAnalysisOverlapChurnReplayReducesProbeOperations(t *testing.T) {
+	input, fixture := loadOverlapChurnReplayInput(t)
+	input.Budget = NewBudgetTracker(ConvergenceBudget{MaxDeadlockProbeOperations: 1_000_000})
+
+	before := measureLegacyDeadlockProbeOperations(t, input)
+	analysis, err := analyzeV1Deadlock(input)
+	if err != nil {
+		t.Fatalf("analyzeV1Deadlock optimized replay: %v", err)
+	}
+	after := analysis.ProbeStats.ProbeOperations
+	if before != 115080 {
+		t.Fatalf("legacy probe operations = %d, want fixture baseline 115080", before)
+	}
+	if after != 942 {
+		t.Fatalf("optimized probe operations = %d, want fixture baseline 942", after)
+	}
+	if after >= before {
+		t.Fatalf("probe operations before=%d after=%d, want preaggregation to reduce work; fixture source=%q",
+			before, after, fixture.Source)
+	}
+	reduction := 100 * (1 - float64(after)/float64(before))
+	t.Logf("probe_operations before=%d after=%d reduction=%.2f%%", before, after, reduction)
+}
+
+func TestDeadlockAnalysisOverlapChurnReplayDefaultBudgetCompletes(t *testing.T) {
+	input, _ := loadOverlapChurnReplayInput(t)
+	input.Budget = NewBudgetTracker(DefaultConvergenceBudget())
+
+	analysis, err := analyzeV1Deadlock(input)
+	if err != nil {
+		t.Fatalf("analyzeV1Deadlock: %v", err)
+	}
+	if analysis.Completeness != ProbeComplete {
+		t.Fatalf("analysis completeness = %s, want %s", analysis.Completeness, ProbeComplete)
+	}
+	if got := input.Budget.Usage().DeadlockProbeOperations; got != 942 {
+		t.Fatalf("default-budget probe operations = %d, want 942", got)
+	}
+}
+
+func TestDeadlockAnalysisScaledOverlapCompletesWithinDefaultBudget(t *testing.T) {
+	golden := map[int]int{96: 942, 192: 1902, 384: 3822}
+	contextGolden := map[int]int{96: 606, 192: 1182, 384: 2334}
+	baseGolden := map[int]int{96: 194, 192: 386, 384: 770}
+	for _, cpuCount := range []int{96, 192, 384} {
+		t.Run(fmt.Sprintf("%d-cpu", cpuCount), func(t *testing.T) {
+			input := buildScaledOverlapChurnInput(t, cpuCount, 12)
+			input.Budget = NewBudgetTracker(DefaultConvergenceBudget())
+
+			analysis, err := analyzeV1Deadlock(input)
+			if err != nil {
+				t.Fatalf("analyzeV1Deadlock(%d CPUs): %v", cpuCount, err)
+			}
+			if analysis.Completeness != ProbeComplete {
+				t.Fatalf("analysis completeness = %s, want %s", analysis.Completeness, ProbeComplete)
+			}
+			if got := analysis.ProbeStats.ProbeOperations; got >= defaultDeadlockProbeBudget {
+				t.Fatalf("probe operations = %d, want < %d", got, defaultDeadlockProbeBudget)
+			}
+			if got := analysis.ProbeStats.ProbeOperations; got != golden[cpuCount] {
+				t.Fatalf("probe operations = %d, want golden %d", got, golden[cpuCount])
+			}
+			if got := analysis.ProbeStats.ContextOperations; got != contextGolden[cpuCount] {
+				t.Fatalf("context operations = %d, want golden %d", got, contextGolden[cpuCount])
+			}
+			if got := analysis.ProbeStats.BaseOperations; got != baseGolden[cpuCount] {
+				t.Fatalf("base operations = %d, want golden %d", got, baseGolden[cpuCount])
+			}
+			if got := analysis.ProbeStats.AtomOperations; got != golden[cpuCount]-contextGolden[cpuCount] {
+				t.Fatalf("atom operations = %d, want golden %d",
+					got, golden[cpuCount]-contextGolden[cpuCount])
+			}
+			t.Logf("cpu_count=%d probe_operations=%d", cpuCount, analysis.ProbeStats.ProbeOperations)
+		})
+	}
+}
+
+func TestDeadlockAnalysisE2EShapeCompletesWithinDefaultBudget(t *testing.T) {
+	input := buildE2EShapeDeadlockInput(t)
+	input.Budget = NewBudgetTracker(DefaultConvergenceBudget())
+
+	analysis, err := analyzeV1Deadlock(input)
+	if err != nil {
+		t.Fatalf("analyzeV1Deadlock E2E shape: %v", err)
+	}
+	if analysis.Completeness != ProbeComplete {
+		t.Fatalf("analysis completeness = %s, want %s", analysis.Completeness, ProbeComplete)
+	}
+	if analysis.ProbeStats.SnapshotEntries != 232 {
+		t.Fatalf("snapshot entries = %d, want 232", analysis.ProbeStats.SnapshotEntries)
+	}
+	if analysis.ProbeStats.SnapshotChildEdges != 219 {
+		t.Fatalf("snapshot child edges = %d, want 219", analysis.ProbeStats.SnapshotChildEdges)
+	}
+	if analysis.ProbeStats.ProtectedRels != 2 {
+		t.Fatalf("protected rels = %d, want 2", analysis.ProbeStats.ProtectedRels)
+	}
+	if analysis.ProbeStats.ProtectedPendingCPUs != 12 {
+		t.Fatalf("protected pending CPUs = %d, want 12", analysis.ProbeStats.ProtectedPendingCPUs)
+	}
+	if analysis.ProbeStats.ProbeOperations >= defaultDeadlockProbeBudget {
+		t.Fatalf("probe operations = %d, want < %d",
+			analysis.ProbeStats.ProbeOperations, defaultDeadlockProbeBudget)
+	}
+	if analysis.ProbeStats.ProbeOperations != 1437 ||
+		analysis.ProbeStats.ContextOperations != 1357 ||
+		analysis.ProbeStats.BaseOperations != 451 ||
+		analysis.ProbeStats.AtomOperations != 80 ||
+		analysis.ProbeStats.ContextPhase != "complete" {
+		t.Fatalf("unexpected E2E-shape probe stats: %+v", analysis.ProbeStats)
+	}
+	if got := contextPhaseOperationTotal(analysis.ProbeStats); got != analysis.ProbeStats.ContextOperations {
+		t.Fatalf("context phase operation total = %d, want %d: %+v",
+			got, analysis.ProbeStats.ContextOperations, analysis.ProbeStats)
+	}
+	t.Logf("probe stats: %+v", analysis.ProbeStats)
+}
+
+func TestDeadlockAnalysisUnprotectedABCE2EShapeCompletesWithinDefaultBudget(t *testing.T) {
+	input := buildUnprotectedABCE2EInput(t)
+	input.Budget = NewBudgetTracker(DefaultConvergenceBudget())
+
+	analysis, err := analyzeV1Deadlock(input)
+	if err != nil {
+		t.Fatalf("analyzeV1Deadlock unprotected A-B-C shape: %v", err)
+	}
+	if analysis.Completeness != ProbeComplete {
+		t.Fatalf("analysis completeness = %s, want %s", analysis.Completeness, ProbeComplete)
+	}
+	if analysis.ProbeStats.SnapshotEntries != 262 ||
+		analysis.ProbeStats.SnapshotChildEdges != 249 ||
+		analysis.ProbeStats.Atoms != 23 ||
+		analysis.ProbeStats.ProtectedRels != 0 ||
+		analysis.ProbeStats.ProtectedPendingCPUs != 0 {
+		t.Fatalf("unexpected unprotected A-B-C stats: %+v", analysis.ProbeStats)
+	}
+	if got := contextPhaseOperationTotal(analysis.ProbeStats); got != analysis.ProbeStats.ContextOperations {
+		t.Fatalf("context phase operation total = %d, want %d: %+v",
+			got, analysis.ProbeStats.ContextOperations, analysis.ProbeStats)
+	}
+	if analysis.ProbeStats.ProbeLimit != 17405 {
+		t.Fatalf("auto probe limit = %d, want 17405", analysis.ProbeStats.ProbeLimit)
+	}
+	if analysis.ProbeStats.ProbeOperations != 9008 {
+		t.Fatalf("probe operations = %d, want 9008", analysis.ProbeStats.ProbeOperations)
+	}
+	t.Logf("probe stats: %+v", analysis.ProbeStats)
+}
+
+func TestDeadlockAnalysisAutoBudgetSupportsMultipleRoundsOnSharedTracker(t *testing.T) {
+	tracker := NewBudgetTracker(DefaultConvergenceBudget())
+	for round := 1; round <= 2; round++ {
+		input := buildUnprotectedABCE2EInput(t)
+		input.Budget = tracker
+		analysis, err := analyzeV1Deadlock(input)
+		if err != nil {
+			t.Fatalf("round %d analyzeV1Deadlock: %v", round, err)
+		}
+		if analysis.Completeness != ProbeComplete {
+			t.Fatalf("round %d completeness = %s, want %s",
+				round, analysis.Completeness, ProbeComplete)
+		}
+	}
+	if got := tracker.Usage().DeadlockProbeOperations; got != 18016 {
+		t.Fatalf("two-round probe operations = %d, want 18016", got)
+	}
+	if got := tracker.DeadlockProbeLimit(); got != 26413 {
+		t.Fatalf("two-round auto probe limit = %d, want 26413", got)
+	}
+}
+
+func TestDeadlockAnalysisContextBudgetErrorReportsPhase(t *testing.T) {
+	input := buildE2EShapeDeadlockInput(t)
+	input.Budget = NewBudgetTracker(ConvergenceBudget{MaxDeadlockProbeOperations: 500})
+
+	analysis, err := analyzeV1Deadlock(input)
+	if !errors.Is(err, ErrDeadlockProbeBudgetExceeded) {
+		t.Fatalf("analyzeV1Deadlock error = %v, want ErrDeadlockProbeBudgetExceeded", err)
+	}
+	if analysis.ProbeStats.ContextPhase == "" {
+		t.Fatalf("context phase is empty: stats=%+v error=%v", analysis.ProbeStats, err)
+	}
+	if !strings.Contains(err.Error(), "context_phase="+analysis.ProbeStats.ContextPhase) {
+		t.Fatalf("error %q does not contain context phase %q",
+			err, analysis.ProbeStats.ContextPhase)
+	}
+}
+
+func TestDeadlockAnalysisProtectedPreaggregationBudgetErrorReportsPhase(t *testing.T) {
+	input := buildE2EShapeDeadlockInput(t)
+	input.Budget = NewBudgetTracker(ConvergenceBudget{MaxDeadlockProbeOperations: 1})
+
+	analysis, err := analyzeV1Deadlock(input)
+	if !errors.Is(err, ErrDeadlockProbeBudgetExceeded) {
+		t.Fatalf("analyzeV1Deadlock error = %v, want ErrDeadlockProbeBudgetExceeded", err)
+	}
+	if analysis.ProbeStats.ContextPhase != "protected_descendant_preaggregation" {
+		t.Fatalf("context phase = %q, want protected_descendant_preaggregation",
+			analysis.ProbeStats.ContextPhase)
+	}
+	if analysis.ProbeStats.ContextOperations != 1 {
+		t.Fatalf("context operations = %d, want 1", analysis.ProbeStats.ContextOperations)
+	}
+}
+
+func TestSingleAtomIncrementalProjectionMatchesFullReplay(t *testing.T) {
+	input := buildScaledOverlapChurnInput(t, 96, 12)
+	input.Budget = nil
+	desiredByDomain := desiredDomainUnions(input.DAG, input.DesiredByRel)
+	depthByRel := buildSnapshotDepthByRel(input.Snapshot, nil)
+	domainByRel, parentByRel := buildPlannerRelations(input.Snapshot, input.DAG, depthByRel, nil)
+	leavingByDomain := map[DomainID]machine.CPUSet{
+		DomainPrimary: input.Snapshot.DomainUnion[DomainPrimary].Difference(desiredByDomain[DomainPrimary]),
+		DomainReclaim: input.Snapshot.DomainUnion[DomainReclaim].Difference(desiredByDomain[DomainReclaim]),
+	}
+	projectionContext, err := buildDrainProjectionContext(
+		context.Background(), input.Snapshot, input.ProtectedByRel, nil)
+	if err != nil {
+		t.Fatalf("buildDrainProjectionContext: %v", err)
+	}
+	baseInput := DrainProjectionInput{
+		PlanInput: input, LeavingByDomain: leavingByDomain,
+		DomainByRel: domainByRel, ParentByRel: parentByRel, DepthByRel: depthByRel,
+		Context: projectionContext,
+	}
+	if err := prepareIncrementalDrainProjectionContext(baseInput, projectionContext); err != nil {
+		t.Fatalf("prepareIncrementalDrainProjectionContext: %v", err)
+	}
+	for cpu := 12; cpu < 96; cpu++ {
+		source := DomainPrimary
+		destination := DomainReclaim
+		if cpu >= 48 {
+			source, destination = DomainReclaim, DomainPrimary
+		}
+		atom := DrainAtom{
+			Source: source, Destination: destination, CPUs: machine.NewCPUSet(cpu),
+		}
+		atomInput := baseInput
+		atomInput.DrainBatch = map[DomainID]machine.CPUSet{
+			DomainPrimary: machine.NewCPUSet(),
+			DomainReclaim: machine.NewCPUSet(),
+			source:        atom.CPUs,
+		}
+		full, fullErr := projectDrainTargets(atomInput)
+		incremental, incrementalErr := projectSingleAtomIncremental(atomInput, atom)
+		if (fullErr == nil) != (incrementalErr == nil) {
+			t.Fatalf("cpu=%d error mismatch full=%v incremental=%v", cpu, fullErr, incrementalErr)
+		}
+		if fullErr != nil {
+			continue
+		}
+		for _, rel := range projectionContext.affectedRelsByCPU[cpu] {
+			want := full.TargetByRel[rel]
+			got := incremental.TargetByRel[rel]
+			if !got.CPUs.Equals(want.CPUs) || got.Mems != want.Mems {
+				t.Fatalf("cpu=%d rel=%s target=%+v, want %+v", cpu, rel, got, want)
+			}
+		}
+		for _, domain := range []DomainID{DomainPrimary, DomainReclaim} {
+			if !incremental.DomainUnion[domain].Equals(full.DomainUnion[domain]) {
+				t.Fatalf("cpu=%d domain=%s union=%s, want %s",
+					cpu, domain, incremental.DomainUnion[domain].String(), full.DomainUnion[domain].String())
+			}
+		}
+		if !equalCPUSetMap(incremental.EmptyBlockers, full.EmptyBlockers) {
+			t.Fatalf("cpu=%d blockers=%v, want %v", cpu, incremental.EmptyBlockers, full.EmptyBlockers)
+		}
+	}
+}
+
+func TestSingleAtomIncrementalProjectionFallsBackForMultiCPUAtom(t *testing.T) {
+	input := buildScaledOverlapChurnInput(t, 96, 12)
+	input.Budget = nil
+	desiredByDomain := desiredDomainUnions(input.DAG, input.DesiredByRel)
+	depthByRel := buildSnapshotDepthByRel(input.Snapshot, nil)
+	domainByRel, parentByRel := buildPlannerRelations(input.Snapshot, input.DAG, depthByRel, nil)
+	leavingByDomain := map[DomainID]machine.CPUSet{
+		DomainPrimary: input.Snapshot.DomainUnion[DomainPrimary].Difference(desiredByDomain[DomainPrimary]),
+		DomainReclaim: input.Snapshot.DomainUnion[DomainReclaim].Difference(desiredByDomain[DomainReclaim]),
+	}
+	projectionContext, err := buildDrainProjectionContext(
+		context.Background(), input.Snapshot, input.ProtectedByRel, nil)
+	if err != nil {
+		t.Fatalf("buildDrainProjectionContext: %v", err)
+	}
+	projectionInput := DrainProjectionInput{
+		PlanInput: input, LeavingByDomain: leavingByDomain,
+		DomainByRel: domainByRel, ParentByRel: parentByRel, DepthByRel: depthByRel,
+		Context: projectionContext,
+	}
+	if err := prepareIncrementalDrainProjectionContext(projectionInput, projectionContext); err != nil {
+		t.Fatalf("prepareIncrementalDrainProjectionContext: %v", err)
+	}
+	atom := DrainAtom{
+		Source: DomainPrimary, Destination: DomainReclaim, CPUs: machine.NewCPUSet(12, 13),
+	}
+	projectionInput.DrainBatch = map[DomainID]machine.CPUSet{
+		DomainPrimary: atom.CPUs,
+		DomainReclaim: machine.NewCPUSet(),
+	}
+	full, err := projectDrainTargets(projectionInput)
+	if err != nil {
+		t.Fatalf("full projection: %v", err)
+	}
+	got, err := projectSingleAtomIncremental(projectionInput, atom)
+	if err != nil {
+		t.Fatalf("fallback projection: %v", err)
+	}
+	if len(got.TargetByRel) != len(input.Snapshot.Entries) {
+		t.Fatalf("fallback target count = %d, want full snapshot count %d",
+			len(got.TargetByRel), len(input.Snapshot.Entries))
+	}
+	for rel, want := range full.TargetByRel {
+		if target := got.TargetByRel[rel]; !target.CPUs.Equals(want.CPUs) || target.Mems != want.Mems {
+			t.Fatalf("rel=%s fallback target=%+v, want %+v", rel, target, want)
+		}
+	}
+}
+
+func TestSingleAtomIncrementalProjectionFallbackIncludesPartialCost(t *testing.T) {
+	input := buildScaledOverlapChurnInput(t, 96, 12)
+	input.Budget = nil
+	desiredByDomain := desiredDomainUnions(input.DAG, input.DesiredByRel)
+	depthByRel := buildSnapshotDepthByRel(input.Snapshot, nil)
+	domainByRel, parentByRel := buildPlannerRelations(input.Snapshot, input.DAG, depthByRel, nil)
+	leavingByDomain := map[DomainID]machine.CPUSet{
+		DomainPrimary: input.Snapshot.DomainUnion[DomainPrimary].Difference(desiredByDomain[DomainPrimary]),
+		DomainReclaim: input.Snapshot.DomainUnion[DomainReclaim].Difference(desiredByDomain[DomainReclaim]),
+	}
+	projectionContext, err := buildDrainProjectionContext(
+		context.Background(), input.Snapshot, input.ProtectedByRel, nil)
+	if err != nil {
+		t.Fatalf("buildDrainProjectionContext: %v", err)
+	}
+	projectionInput := DrainProjectionInput{
+		PlanInput: input, LeavingByDomain: leavingByDomain,
+		DomainByRel: domainByRel, ParentByRel: parentByRel, DepthByRel: depthByRel,
+		Context: projectionContext,
+	}
+	if err := prepareIncrementalDrainProjectionContext(projectionInput, projectionContext); err != nil {
+		t.Fatalf("prepareIncrementalDrainProjectionContext: %v", err)
+	}
+	atom := DrainAtom{
+		Source: DomainPrimary, Destination: DomainReclaim, CPUs: machine.NewCPUSet(12),
+	}
+	projectionInput.DrainBatch = map[DomainID]machine.CPUSet{
+		DomainPrimary: atom.CPUs,
+		DomainReclaim: machine.NewCPUSet(),
+	}
+	full, err := projectDrainTargets(projectionInput)
+	if err != nil {
+		t.Fatalf("full projection: %v", err)
+	}
+	leaf := "kubepods/pod-pending-12"
+	tampered := projectionContext.baseProjection.TargetByRel[leaf]
+	tampered.CPUs = tampered.CPUs.Union(machine.NewCPUSet(13))
+	projectionContext.baseProjection.TargetByRel[leaf] = tampered
+
+	fallback, err := projectSingleAtomIncremental(projectionInput, atom)
+	if err != nil {
+		t.Fatalf("fallback projection: %v", err)
+	}
+	if fallback.Cost.Total() <= full.Cost.Total() {
+		t.Fatalf("fallback cost = %d, want greater than full replay cost %d",
+			fallback.Cost.Total(), full.Cost.Total())
+	}
+}
+
+func equalCPUSetMap(left, right map[string]machine.CPUSet) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for rel, leftCPUs := range left {
+		rightCPUs, ok := right[rel]
+		if !ok || !leftCPUs.Equals(rightCPUs) {
+			return false
+		}
+	}
+	return true
 }
 
 func TestDeadlockAnalysisHonorsCanceledContext(t *testing.T) {
@@ -281,4 +700,282 @@ func primaryReclaimSwapInput(t *testing.T, primary, reclaim machine.CPUSet) Phas
 		},
 		Budget: NewBudgetTracker(ConvergenceBudget{}),
 	}
+}
+
+func loadOverlapChurnReplayInput(t *testing.T) (PhasePlanInput, overlapChurnReplayFixture) {
+	t.Helper()
+
+	data, err := os.ReadFile(filepath.Join("testdata", "overlap_churn_deadlock_snapshot.json"))
+	if err != nil {
+		t.Fatalf("read overlap-churn replay fixture: %v", err)
+	}
+	var fixture overlapChurnReplayFixture
+	if err := json.Unmarshal(data, &fixture); err != nil {
+		t.Fatalf("decode overlap-churn replay fixture: %v", err)
+	}
+	if fixture.CPUCount != 96 {
+		t.Fatalf("fixture cpu_count = %d, want 96", fixture.CPUCount)
+	}
+
+	input := buildScaledOverlapChurnInput(t, fixture.CPUCount, fixture.ProtectedRelCount)
+	input.Budget = NewBudgetTracker(ConvergenceBudget{
+		MaxDeadlockProbeOperations: fixture.DeadlockProbeBudget,
+	})
+	return input, fixture
+}
+
+func buildScaledOverlapChurnInput(t *testing.T, cpuCount, protectedRelCount int) PhasePlanInput {
+	t.Helper()
+	if cpuCount <= 0 || cpuCount%2 != 0 {
+		t.Fatalf("cpuCount = %d, want positive even number", cpuCount)
+	}
+	primaryCurrent := replayCPUSet([2]int{0, cpuCount/2 - 1})
+	reclaimCurrent := replayCPUSet([2]int{cpuCount / 2, cpuCount - 1})
+	primaryDesired := reclaimCurrent
+	reclaimDesired := primaryCurrent
+	dag := mustPlanDAG(t, []NodeSpec{
+		{Rel: "kubepods", Role: TopoNodeRolePrimary, Domain: DomainPrimary, CPUs: primaryDesired, TrustAnchor: true},
+		{Rel: "kubesandbox", Role: TopoNodeRoleReclaim, Domain: DomainReclaim, CPUs: reclaimDesired, TrustAnchor: true},
+	})
+	snapshot := planSnapshot(map[string]EntryState{
+		"kubepods":    {Rel: "kubepods", Identity: CgroupIdentity{Inode: 1}, CPUs: primaryCurrent},
+		"kubesandbox": {Rel: "kubesandbox", Identity: CgroupIdentity{Inode: 2}, CPUs: reclaimCurrent},
+	}, map[DomainID]machine.CPUSet{
+		DomainPrimary: primaryCurrent,
+		DomainReclaim: reclaimCurrent,
+	})
+	snapshot.DomainByRel = map[string]DomainID{
+		"kubepods": DomainPrimary, "kubesandbox": DomainReclaim,
+	}
+	protectedByRel := make(map[string]machine.CPUSet, protectedRelCount)
+	for i := 0; i < cpuCount; i++ {
+		name := fmt.Sprintf("pod-pending-%02d", i)
+		parent := "kubepods"
+		domain := DomainPrimary
+		cpu := i
+		if i >= cpuCount/2 {
+			parent = "kubesandbox"
+			domain = DomainReclaim
+		}
+		rel := filepath.Join(parent, name)
+		cpus := machine.NewCPUSet(cpu)
+		identity := CgroupIdentity{Inode: uint64(i + 3)}
+		snapshot.Entries[rel] = EntryState{Rel: rel, Identity: identity, CPUs: cpus}
+		snapshot.Children[parent] = append(snapshot.Children[parent], ChildRef{Name: name, Identity: identity})
+		snapshot.DomainByRel[rel] = domain
+		if i < protectedRelCount {
+			protectedByRel[rel] = cpus
+		}
+	}
+	snapshot.ID = fingerprintSnapshot(snapshot)
+
+	return PhasePlanInput{
+		Context: context.Background(), Kind: PhaseDrain, DAG: dag, Snapshot: snapshot,
+		DesiredByRel: map[string]machine.CPUSet{
+			"kubepods": primaryDesired, "kubesandbox": reclaimDesired,
+		},
+		AllowedCPUs:    replayCPUSet([2]int{0, cpuCount - 1}),
+		ProtectedByRel: protectedByRel,
+		Selection: DrainSelectionPolicy{
+			RequirePairedSwapProgress: true,
+		},
+		Budget: NewBudgetTracker(DefaultConvergenceBudget()),
+	}
+}
+
+func buildE2EShapeDeadlockInput(t *testing.T) PhasePlanInput {
+	t.Helper()
+	input := buildScaledOverlapChurnInput(t, 96, 2)
+	primaryDesired := replayCPUSet([2]int{0, 37}).Union(replayCPUSet([2]int{48, 57}))
+	reclaimDesired := replayCPUSet([2]int{38, 47}).Union(replayCPUSet([2]int{58, 95}))
+	input.DesiredByRel["kubepods"] = primaryDesired
+	input.DesiredByRel["kubesandbox"] = reclaimDesired
+	input.ProtectedPending = replayCPUSet([2]int{0, 11})
+	if input.Snapshot.DomainByRel == nil {
+		input.Snapshot.DomainByRel = make(map[string]DomainID)
+	}
+	if input.DynamicByRel == nil {
+		input.DynamicByRel = make(map[string]machine.CPUSet)
+	}
+
+	allCPUs := replayCPUSet([2]int{0, 95})
+	childIndex := 0
+	for rootIndex := 0; rootIndex < 11; rootIndex++ {
+		root := fmt.Sprintf("noise-%02d", rootIndex)
+		input.Snapshot.Entries[root] = EntryState{CPUs: allCPUs}
+		input.Snapshot.DomainByRel[root] = DomainPrimary
+		input.DynamicByRel[root] = allCPUs
+		childCount := 11
+		if rootIndex < 2 {
+			childCount = 12
+		}
+		for i := 0; i < childCount; i++ {
+			name := fmt.Sprintf("child-%03d", childIndex)
+			rel := filepath.Join(root, name)
+			input.Snapshot.Entries[rel] = EntryState{CPUs: allCPUs}
+			input.Snapshot.DomainByRel[rel] = DomainPrimary
+			input.Snapshot.Children[root] = append(
+				input.Snapshot.Children[root], ChildRef{Name: name})
+			input.DynamicByRel[rel] = allCPUs
+			childIndex++
+		}
+	}
+	if childIndex != 123 {
+		t.Fatalf("noise child count = %d, want 123", childIndex)
+	}
+	input.Snapshot.ID = fingerprintSnapshot(input.Snapshot)
+	return input
+}
+
+func buildUnprotectedABCE2EInput(t *testing.T) PhasePlanInput {
+	t.Helper()
+	reserve := machine.NewCPUSet(0, 24)
+	reclaimB := machine.MustParse("9-13,20-21,36,39-40,42,57,59-60,68,84,87-88,90")
+	reclaimC := machine.MustParse("13-18,20-21,35-40,42,62-66,68,83-88,90")
+	machineCPUs := replayCPUSet([2]int{0, 95})
+	primaryB := machineCPUs.Difference(reserve).Difference(reclaimB)
+	primaryC := machineCPUs.Difference(reserve).Difference(reclaimC)
+	transferCPUs := reclaimB.Difference(reclaimC).Union(reclaimC.Difference(reclaimB))
+	if transferCPUs.Size() != 23 {
+		t.Fatalf("B-C transfer CPUs = %s size=%d, want 23", transferCPUs, transferCPUs.Size())
+	}
+
+	dag := mustPlanDAG(t, []NodeSpec{
+		{Rel: "kubepods", Role: TopoNodeRolePrimary, Domain: DomainPrimary, CPUs: primaryC, TrustAnchor: true},
+		{Rel: "kubesandbox", Role: TopoNodeRoleReclaim, Domain: DomainReclaim, CPUs: reclaimC, TrustAnchor: true},
+	})
+	entries := map[string]EntryState{
+		"kubepods":    {Rel: "kubepods", Identity: CgroupIdentity{Inode: 1}, CPUs: primaryB},
+		"kubesandbox": {Rel: "kubesandbox", Identity: CgroupIdentity{Inode: 2}, CPUs: reclaimB},
+	}
+	snapshot := planSnapshot(entries, map[DomainID]machine.CPUSet{
+		DomainPrimary: primaryB,
+		DomainReclaim: reclaimB,
+	})
+	snapshot.DomainByRel = map[string]DomainID{
+		"kubepods": DomainPrimary, "kubesandbox": DomainReclaim,
+	}
+	inode := uint64(3)
+	for _, cpu := range primaryB.ToSliceInt() {
+		name := fmt.Sprintf("primary-leaf-%02d", cpu)
+		rel := filepath.Join("kubepods", name)
+		identity := CgroupIdentity{Inode: inode}
+		inode++
+		snapshot.Entries[rel] = EntryState{Rel: rel, Identity: identity, CPUs: machine.NewCPUSet(cpu)}
+		snapshot.Children["kubepods"] = append(snapshot.Children["kubepods"], ChildRef{Name: name, Identity: identity})
+		snapshot.DomainByRel[rel] = DomainPrimary
+	}
+	for _, cpu := range reclaimB.ToSliceInt() {
+		name := fmt.Sprintf("reclaim-leaf-%02d", cpu)
+		rel := filepath.Join("kubesandbox", name)
+		identity := CgroupIdentity{Inode: inode}
+		inode++
+		snapshot.Entries[rel] = EntryState{Rel: rel, Identity: identity, CPUs: machine.NewCPUSet(cpu)}
+		snapshot.Children["kubesandbox"] = append(snapshot.Children["kubesandbox"], ChildRef{Name: name, Identity: identity})
+		snapshot.DomainByRel[rel] = DomainReclaim
+	}
+	childIndex := 0
+	for rootIndex := 0; rootIndex < 11; rootIndex++ {
+		root := fmt.Sprintf("dynamic-noise-%02d", rootIndex)
+		snapshot.Entries[root] = EntryState{Rel: root, Identity: CgroupIdentity{Inode: inode}, CPUs: transferCPUs}
+		inode++
+		snapshot.DomainByRel[root] = DomainPrimary
+		childCount := 14
+		if rootIndex == 0 {
+			childCount = 15
+		}
+		for i := 0; i < childCount; i++ {
+			name := fmt.Sprintf("child-%03d", childIndex)
+			rel := filepath.Join(root, name)
+			identity := CgroupIdentity{Inode: inode}
+			inode++
+			snapshot.Entries[rel] = EntryState{Rel: rel, Identity: identity, CPUs: transferCPUs}
+			snapshot.Children[root] = append(snapshot.Children[root], ChildRef{Name: name, Identity: identity})
+			snapshot.DomainByRel[rel] = DomainPrimary
+			childIndex++
+		}
+	}
+	if len(snapshot.Entries) != 262 || snapshotChildEdgeCount(snapshot) != 249 || childIndex != 155 {
+		t.Fatalf("fixture shape entries=%d edges=%d noise_children=%d, want 262/249/155",
+			len(snapshot.Entries), snapshotChildEdgeCount(snapshot), childIndex)
+	}
+	snapshot.ID = fingerprintSnapshot(snapshot)
+	return PhasePlanInput{
+		Context: context.Background(), Kind: PhaseDrain, DAG: dag, Snapshot: snapshot,
+		DesiredByRel: map[string]machine.CPUSet{
+			"kubepods": primaryC, "kubesandbox": reclaimC,
+		},
+		AllowedCPUs: machineCPUs,
+		Selection: DrainSelectionPolicy{
+			RequirePairedSwapProgress: true,
+		},
+		Budget: NewBudgetTracker(DefaultConvergenceBudget()),
+	}
+}
+
+func contextPhaseOperationTotal(stats DeadlockProbeStats) int {
+	return stats.BaseOperations +
+		stats.ProtectedOperations +
+		stats.RelIndexOperations +
+		stats.ChildIndexOps +
+		stats.FrontierIndexOps +
+		stats.AncestorClosureOps
+}
+
+func measureLegacyDeadlockProbeOperations(t *testing.T, in PhasePlanInput) int {
+	t.Helper()
+
+	desiredByDomain := desiredDomainUnions(in.DAG, in.DesiredByRel)
+	domains := sortedDomains(in.Snapshot.DomainUnion, desiredByDomain)
+	graph := buildTransferGraph(domains, in.Snapshot.DomainUnion, desiredByDomain, nil)
+	protectedByDomain := protectedCPUSetByDomain(in.ProtectedByRel, in.ProtectedPending, in.DAG)
+	depthByRel := buildSnapshotDepthByRel(in.Snapshot, nil)
+	domainByRel, parentByRel := buildPlannerRelations(in.Snapshot, in.DAG, depthByRel, nil)
+	leavingByDomain := make(map[DomainID]machine.CPUSet, len(domains))
+	for _, domain := range domains {
+		leavingByDomain[domain] = in.Snapshot.DomainUnion[domain].Difference(desiredByDomain[domain])
+	}
+	budget := NewBudgetTracker(ConvergenceBudget{MaxDeadlockProbeOperations: 1_000_000})
+	for _, source := range []DomainID{DomainPrimary, DomainReclaim} {
+		destinations := make([]DomainID, 0, len(graph[source]))
+		for destination := range graph[source] {
+			destinations = append(destinations, destination)
+		}
+		sort.Slice(destinations, func(i, j int) bool { return destinations[i] < destinations[j] })
+		for _, destination := range destinations {
+			for _, cpu := range graph[source][destination].ToSliceInt() {
+				atomCPUs := machine.NewCPUSet(cpu)
+				if !atomCPUs.Intersection(protectedByDomain[source]).IsEmpty() {
+					continue
+				}
+				_, err := projectDrainTargets(DrainProjectionInput{
+					PlanInput: in,
+					DrainBatch: map[DomainID]machine.CPUSet{
+						DomainPrimary: machine.NewCPUSet(),
+						DomainReclaim: machine.NewCPUSet(),
+						source:        atomCPUs,
+					},
+					LeavingByDomain: leavingByDomain,
+					DomainByRel:     domainByRel,
+					ParentByRel:     parentByRel,
+					DepthByRel:      depthByRel,
+					ProbeContext:    context.Background(),
+					ProbeBudget:     budget,
+				})
+				if err != nil {
+					t.Fatalf("legacy projection source=%s destination=%s cpu=%d: %v",
+						source, destination, cpu, err)
+				}
+			}
+		}
+	}
+	return budget.Usage().DeadlockProbeOperations
+}
+
+func replayCPUSet(bounds [2]int) machine.CPUSet {
+	cpus := make([]int, 0, bounds[1]-bounds[0]+1)
+	for cpu := bounds[0]; cpu <= bounds[1]; cpu++ {
+		cpus = append(cpus, cpu)
+	}
+	return machine.NewCPUSet(cpus...)
 }
