@@ -66,6 +66,12 @@ func (f *fakeState) GetAllowSharedCoresOverlapReclaimedCores() bool {
 	return f.allowOverlap
 }
 
+func (f *fakeState) GetDisableDedicatedCoresOverlapReclaimedCores() bool {
+	return false
+}
+
+func (f *fakeState) SetDisableDedicatedCoresOverlapReclaimedCores(_, _ bool) {}
+
 func (f *fakeState) SetMachineState(numaNodeMap state.NUMANodeMap, _ bool) {
 	f.machineState = numaNodeMap
 }
@@ -93,7 +99,7 @@ func (f *fakeState) SetAllowSharedCoresOverlapReclaimedCores(allowSharedCoresOve
 func (f *fakeState) CommitAdvisorState(
 	podEntries state.PodEntries,
 	machineState state.NUMANodeMap,
-	allowSharedCoresOverlapReclaimedCores, _ bool,
+	allowSharedCoresOverlapReclaimedCores, _, _ bool,
 ) error {
 	f.podEntries = podEntries
 	f.machineState = machineState

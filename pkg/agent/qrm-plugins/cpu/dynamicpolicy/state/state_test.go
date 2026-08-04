@@ -100,7 +100,7 @@ func TestCPUPluginStateCommitAdvisorStateIsAtomic(t *testing.T) {
 	}
 
 	entries, machineState, allowOverlap := makeVersion(0)
-	require.NoError(t, s.CommitAdvisorState(entries, machineState, allowOverlap, false))
+	require.NoError(t, s.CommitAdvisorState(entries, machineState, allowOverlap, false, false))
 
 	const iterations = 1000
 	var wg sync.WaitGroup
@@ -110,7 +110,7 @@ func TestCPUPluginStateCommitAdvisorStateIsAtomic(t *testing.T) {
 		defer wg.Done()
 		for i := 1; i <= iterations; i++ {
 			entries, machineState, allowOverlap := makeVersion(i)
-			if err := s.CommitAdvisorState(entries, machineState, allowOverlap, false); err != nil {
+			if err := s.CommitAdvisorState(entries, machineState, allowOverlap, false, false); err != nil {
 				errCh <- err
 				return
 			}
@@ -162,7 +162,7 @@ func TestCheckpointStateCommitAdvisorState(t *testing.T) {
 			emitter:           metrics.DummyMetrics{},
 		}
 
-		require.NoError(t, sc.CommitAdvisorState(newEntries, newMachineState, true, true))
+		require.NoError(t, sc.CommitAdvisorState(newEntries, newMachineState, true, false, true))
 		require.Equal(t, 1, manager.calls())
 		require.True(t, sc.GetAllocationInfo("new", "main").AllocationResult.Equals(machine.NewCPUSet(1)))
 		require.True(t, sc.GetMachineState()[0].AllocatedCPUSet.Equals(machine.NewCPUSet(1)))
@@ -178,7 +178,7 @@ func TestCheckpointStateCommitAdvisorState(t *testing.T) {
 			emitter:           metrics.DummyMetrics{},
 		}
 
-		require.NoError(t, sc.CommitAdvisorState(newEntries, newMachineState, true, false))
+		require.NoError(t, sc.CommitAdvisorState(newEntries, newMachineState, true, false, false))
 		require.Equal(t, 0, manager.calls())
 	})
 
@@ -194,7 +194,7 @@ func TestCheckpointStateCommitAdvisorState(t *testing.T) {
 		oldMachineState := sc.GetMachineState()
 		oldAllowOverlap := sc.GetAllowSharedCoresOverlapReclaimedCores()
 
-		err := sc.CommitAdvisorState(newEntries, newMachineState, true, true)
+		err := sc.CommitAdvisorState(newEntries, newMachineState, true, false, true)
 		require.EqualError(t, err, "store failed")
 		require.Equal(t, 1, manager.calls())
 		require.Equal(t, oldEntries, sc.GetPodEntries())
@@ -759,7 +759,7 @@ func TestNewCheckpointState(t *testing.T) {
 			}
 		}
 	},
-	"checksum": 4188873110
+	"checksum": 992404000
 }`,
 			"",
 			&cpuPluginState{
