@@ -355,6 +355,44 @@ func TestTopologyCoordinatorPublishFailureRetriesWithoutWrites(t *testing.T) {
 	}
 }
 
+func TestTopologyCoordinatorReplansStalePublishWithinInvocation(t *testing.T) {
+	dag, cg, driver := newCoordinatorSnapshotTestFixture(t)
+	publishCalls := 0
+
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
+		DAG: dag, Cgroup: cg, CPUDetails: machine.CPUDetails{0: {}},
+		PublishFinalSnapshot: func(snapshot *CompleteSnapshot) error {
+			publishCalls++
+			if publishCalls == 1 {
+				return &PlanStaleError{
+					Rel:       "primary/container",
+					Direction: WriteDirection("publish"),
+					Resource:  "container_cpuset",
+					Current:   "0",
+					Target:    "1",
+					Err:       errors.New("container leaf changed before publication"),
+				}
+			}
+			if snapshot == nil {
+				return errors.New("nil final snapshot")
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Converge after stale publication: %v", err)
+	}
+	if !res.Converged || !res.FinalSnapshotCurrent {
+		t.Fatalf("result = %+v, want converged current snapshot", res)
+	}
+	if publishCalls != 2 {
+		t.Fatalf("publish calls = %d, want 2", publishCalls)
+	}
+	if len(driver.writes) != 0 {
+		t.Fatalf("stale zero-write publication retry wrote hierarchy: %#v", driver.writes)
+	}
+}
+
 func TestTopologyCoordinatorPersistentStaleSnapshotStopsAfterBoundedRetryWithoutPublishing(t *testing.T) {
 	dag, cg, driver := newCoordinatorSnapshotTestFixture(t)
 	driver.beforeCall = func(op HierarchyOperation, rel string) error {

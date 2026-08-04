@@ -644,7 +644,6 @@ func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t
 		{
 			name:        "pending leaf materializes with inherited parent cpuset",
 			desiredLeaf: machine.NewCPUSet(0),
-			wantErr:     true,
 		},
 		{
 			name:        "materialized leaf matches final snapshot",
@@ -718,8 +717,8 @@ func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t
 			if result.AppliedView == nil {
 				t.Fatal("matching final snapshot leaf should publish AppliedView")
 			}
-			if got := result.AppliedView.ContainerCPUSetByPod[podUID]["main"].String(); got != "0-1" {
-				t.Fatalf("published container cpuset = %q, want final snapshot value 0-1", got)
+			if got := result.AppliedView.ContainerCPUSetByPod[podUID]["main"]; !got.Equals(tt.desiredLeaf) {
+				t.Fatalf("published container cpuset = %q, want final snapshot value %s", got.String(), tt.desiredLeaf.String())
 			}
 		})
 	}
