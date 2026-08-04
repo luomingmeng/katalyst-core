@@ -59,10 +59,11 @@ func (p *DynamicPolicy) RegisterCPUSetAdjustmentHandler(name string, handler cpu
 }
 
 type cpuSetAdjustmentStateSnapshot struct {
-	machineState state.NUMANodeMap
-	numaHeadroom map[int]float64
-	podEntries   state.PodEntries
-	allowOverlap bool
+	machineState     state.NUMANodeMap
+	numaHeadroom     map[int]float64
+	podEntries       state.PodEntries
+	allowOverlap     bool
+	disableDedicated bool
 }
 
 func newCPUSetAdjustmentStateSnapshot(source state.ReadonlyState) *cpuSetAdjustmentStateSnapshot {
@@ -70,10 +71,11 @@ func newCPUSetAdjustmentStateSnapshot(source state.ReadonlyState) *cpuSetAdjustm
 		return nil
 	}
 	return &cpuSetAdjustmentStateSnapshot{
-		machineState: source.GetMachineState(),
-		numaHeadroom: source.GetNUMAHeadroom(),
-		podEntries:   source.GetPodEntries(),
-		allowOverlap: source.GetAllowSharedCoresOverlapReclaimedCores(),
+		machineState:     source.GetMachineState(),
+		numaHeadroom:     source.GetNUMAHeadroom(),
+		podEntries:       source.GetPodEntries(),
+		allowOverlap:     source.GetAllowSharedCoresOverlapReclaimedCores(),
+		disableDedicated: source.GetDisableDedicatedCoresOverlapReclaimedCores(),
 	}
 }
 
@@ -82,6 +84,7 @@ func (s *cpuSetAdjustmentStateSnapshot) matches(source state.ReadonlyState) bool
 		return s == nil && source == nil
 	}
 	return s.allowOverlap == source.GetAllowSharedCoresOverlapReclaimedCores() &&
+		s.disableDedicated == source.GetDisableDedicatedCoresOverlapReclaimedCores() &&
 		reflect.DeepEqual(s.machineState, source.GetMachineState()) &&
 		reflect.DeepEqual(s.numaHeadroom, source.GetNUMAHeadroom()) &&
 		reflect.DeepEqual(s.podEntries, source.GetPodEntries())
@@ -112,6 +115,10 @@ func (s *cpuSetAdjustmentStateSnapshot) GetAllocationInfo(podUID, containerName 
 
 func (s *cpuSetAdjustmentStateSnapshot) GetAllowSharedCoresOverlapReclaimedCores() bool {
 	return s.allowOverlap
+}
+
+func (s *cpuSetAdjustmentStateSnapshot) GetDisableDedicatedCoresOverlapReclaimedCores() bool {
+	return s.disableDedicated
 }
 
 func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context) error {

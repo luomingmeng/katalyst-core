@@ -1616,6 +1616,11 @@ func (p *DynamicPolicy) applyBlocks(
 		Difference(dedicatedCPUSet).
 		Difference(sharedBindingNUMACPUs).
 		Difference(notAllocatablePoolsCPUs)
+	rampUpReclaimFloor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), false)
+	if err != nil {
+		return fmt.Errorf("derive reclaim floor for advisor ramp-up failed: %w", err)
+	}
+	rampUpCPUs = rampUpCPUs.Difference(rampUpReclaimFloor)
 
 	rampUpCPUsTopologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, rampUpCPUs)
 	if err != nil {
@@ -1739,6 +1744,7 @@ func (p *DynamicPolicy) applyBlocks(
 	if err := p.validateAdvisorPartitionBeforeCommit(
 		newEntries,
 		allowSharedCoresOverlapReclaimedCores,
+		resp.DisableDedicatedCoresOverlapReclaimedCores,
 	); err != nil {
 		return err
 	}
@@ -1746,6 +1752,7 @@ func (p *DynamicPolicy) applyBlocks(
 		newEntries,
 		newMachineState,
 		allowSharedCoresOverlapReclaimedCores,
+		resp.DisableDedicatedCoresOverlapReclaimedCores,
 		true,
 	)
 }
@@ -1753,6 +1760,7 @@ func (p *DynamicPolicy) applyBlocks(
 func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommit(
 	newEntries state.PodEntries,
 	allowSharedCoresOverlapReclaimedCores bool,
+	disableDedicatedCoresOverlapReclaimedCores bool,
 ) error {
 	if p == nil || p.state == nil || p.machineInfo == nil || p.machineInfo.CPUTopology == nil {
 		return nil
@@ -1774,6 +1782,26 @@ func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommit(
 		if !reclaimInNUMA.IsSubsetOf(numaCPUs) {
 			return fmt.Errorf("reclaim pool assignment crosses NUMA: numa=%d cpus=%s allowed=%s",
 				numaID, reclaimInNUMA.String(), numaCPUs.String())
+		}
+	}
+
+	// When DisableDedicatedCoresOverlapReclaimedCores is enabled, dedicated_cores
+	// containers must not share any cpu with the reclaim pool, regardless of the
+	// allowSharedCoresOverlapReclaimedCores switch.
+	if disableDedicatedCoresOverlapReclaimedCores {
+		for _, containerEntries := range newEntries {
+			if containerEntries == nil || containerEntries.IsPoolEntry() {
+				continue
+			}
+			for _, ai := range containerEntries {
+				if ai == nil || !ai.CheckDedicated() {
+					continue
+				}
+				if overlap := reclaimPool.AllocationResult.Intersection(ai.AllocationResult); !overlap.IsEmpty() {
+					return fmt.Errorf("dedicated_cores pod: %s/%s container: %s overlaps reclaim pool while DisableDedicatedCoresOverlapReclaimedCores enabled: %s",
+						ai.PodNamespace, ai.PodName, ai.ContainerName, overlap.String())
+				}
+			}
 		}
 	}
 

@@ -163,11 +163,22 @@ func (s *cpuPluginState) SetAllowSharedCoresOverlapReclaimedCores(allowSharedCor
 	s.allowSharedCoresOverlapReclaimedCores = allowSharedCoresOverlapReclaimedCores
 }
 
+func (s *cpuPluginState) SetDisableDedicatedCoresOverlapReclaimedCores(disableDedicatedCoresOverlapReclaimedCores bool) {
+	s.Lock()
+	defer s.Unlock()
+
+	klog.InfoS("[cpu_plugin] Updated disableDedicatedCoresOverlapReclaimedCores",
+		"disableDedicatedCoresOverlapReclaimedCores", disableDedicatedCoresOverlapReclaimedCores)
+
+	s.disableDedicatedCoresOverlapReclaimedCores = disableDedicatedCoresOverlapReclaimedCores
+}
+
 // CommitAdvisorState atomically replaces the state fields produced by one advisor response.
 func (s *cpuPluginState) CommitAdvisorState(
 	podEntries PodEntries,
 	machineState NUMANodeMap,
 	allowSharedCoresOverlapReclaimedCores bool,
+	disableDedicatedCoresOverlapReclaimedCores bool,
 	_ bool,
 ) error {
 	s.Lock()
@@ -176,6 +187,7 @@ func (s *cpuPluginState) CommitAdvisorState(
 	s.podEntries = podEntries.Clone()
 	s.machineState = machineState.Clone()
 	s.allowSharedCoresOverlapReclaimedCores = allowSharedCoresOverlapReclaimedCores
+	s.disableDedicatedCoresOverlapReclaimedCores = disableDedicatedCoresOverlapReclaimedCores
 	return nil
 }
 
@@ -184,6 +196,13 @@ func (s *cpuPluginState) GetAllowSharedCoresOverlapReclaimedCores() bool {
 	defer s.RUnlock()
 
 	return s.cpuPluginStateData.GetAllowSharedCoresOverlapReclaimedCores()
+}
+
+func (s *cpuPluginState) GetDisableDedicatedCoresOverlapReclaimedCores() bool {
+	s.RLock()
+	defer s.RUnlock()
+
+	return s.cpuPluginStateData.GetDisableDedicatedCoresOverlapReclaimedCores()
 }
 
 func (s *cpuPluginState) Delete(podUID string, containerName string) {

@@ -110,6 +110,7 @@ func (sc *stateCheckpoint) RestoreState(cp checkpointmanager.Checkpoint) (bool, 
 	sc.cache.SetPodEntries(checkpoint.PodEntries)
 	sc.cache.SetNUMAHeadroom(checkpoint.NUMAHeadroom)
 	sc.cache.SetAllowSharedCoresOverlapReclaimedCores(checkpoint.AllowSharedCoresOverlapReclaimedCores)
+	sc.cache.SetDisableDedicatedCoresOverlapReclaimedCores(checkpoint.DisableDedicatedCoresOverlapReclaimedCores)
 
 	if !reflect.DeepEqual(generatedMachineState, checkpoint.MachineState) {
 		klog.Warningf("[cpu_plugin] machine state changed: generatedMachineState: %s; checkpointMachineState: %s",
@@ -157,6 +158,7 @@ func (sc *stateCheckpoint) InitNewCheckpoint(empty bool) checkpointmanager.Check
 	checkpoint.NUMAHeadroom = sc.cache.GetNUMAHeadroom()
 	checkpoint.PodEntries = sc.cache.GetPodEntries()
 	checkpoint.AllowSharedCoresOverlapReclaimedCores = sc.cache.GetAllowSharedCoresOverlapReclaimedCores()
+	checkpoint.DisableDedicatedCoresOverlapReclaimedCores = sc.cache.GetDisableDedicatedCoresOverlapReclaimedCores()
 	return checkpoint
 }
 
@@ -255,11 +257,25 @@ func (sc *stateCheckpoint) SetAllowSharedCoresOverlapReclaimedCores(allowSharedC
 	}
 }
 
+func (sc *stateCheckpoint) SetDisableDedicatedCoresOverlapReclaimedCores(disableDedicatedCoresOverlapReclaimedCores, persist bool) {
+	sc.Lock()
+	defer sc.Unlock()
+
+	sc.cache.SetDisableDedicatedCoresOverlapReclaimedCores(disableDedicatedCoresOverlapReclaimedCores)
+	if persist {
+		err := sc.storeState()
+		if err != nil {
+			klog.ErrorS(err, "[cpu_plugin] store disableDedicatedCoresOverlapReclaimedCores to checkpoint error")
+		}
+	}
+}
+
 // CommitAdvisorState atomically updates all state derived from one advisor response.
 func (sc *stateCheckpoint) CommitAdvisorState(
 	podEntries PodEntries,
 	machineState NUMANodeMap,
 	allowSharedCoresOverlapReclaimedCores bool,
+	disableDedicatedCoresOverlapReclaimedCores bool,
 	persist bool,
 ) error {
 	sc.Lock()
@@ -268,11 +284,13 @@ func (sc *stateCheckpoint) CommitAdvisorState(
 	oldPodEntries := sc.cache.GetPodEntries()
 	oldMachineState := sc.cache.GetMachineState()
 	oldAllowOverlap := sc.cache.GetAllowSharedCoresOverlapReclaimedCores()
+	oldDisableDedicatedOverlap := sc.cache.GetDisableDedicatedCoresOverlapReclaimedCores()
 
 	if err := sc.cache.CommitAdvisorState(
 		podEntries,
 		machineState,
 		allowSharedCoresOverlapReclaimedCores,
+		disableDedicatedCoresOverlapReclaimedCores,
 		false,
 	); err != nil {
 		return err
@@ -281,7 +299,7 @@ func (sc *stateCheckpoint) CommitAdvisorState(
 		return nil
 	}
 	if err := sc.storeState(); err != nil {
-		_ = sc.cache.CommitAdvisorState(oldPodEntries, oldMachineState, oldAllowOverlap, false)
+		_ = sc.cache.CommitAdvisorState(oldPodEntries, oldMachineState, oldAllowOverlap, oldDisableDedicatedOverlap, false)
 		return err
 	}
 	return nil
@@ -292,6 +310,13 @@ func (sc *stateCheckpoint) GetAllowSharedCoresOverlapReclaimedCores() bool {
 	defer sc.RUnlock()
 
 	return sc.cache.GetAllowSharedCoresOverlapReclaimedCores()
+}
+
+func (sc *stateCheckpoint) GetDisableDedicatedCoresOverlapReclaimedCores() bool {
+	sc.RLock()
+	defer sc.RUnlock()
+
+	return sc.cache.GetDisableDedicatedCoresOverlapReclaimedCores()
 }
 
 func (sc *stateCheckpoint) Delete(podUID string, containerName string, persist bool) {

@@ -1093,6 +1093,10 @@ func (p *DynamicPolicy) Allocate(ctx context.Context,
 
 	startTime := time.Now()
 	p.Lock()
+	rollbackPodEntries := p.state.GetPodEntries()
+	rollbackMachineState := p.state.GetMachineState()
+	rollbackAllowOverlap := p.state.GetAllowSharedCoresOverlapReclaimedCores()
+	rollbackDisableDedicatedOverlap := p.state.GetDisableDedicatedCoresOverlapReclaimedCores()
 	defer func() {
 		// calls sys-advisor to inform the latest container
 		if p.enableCPUAdvisor && respErr == nil && req.ContainerType != pluginapi.ContainerType_INIT {
@@ -1113,12 +1117,18 @@ func (p *DynamicPolicy) Allocate(ctx context.Context,
 			if err != nil {
 				resp = nil
 				respErr = fmt.Errorf("add container to qos aware server failed with error: %v", err)
-				_ = p.removeContainer(req.PodUid, req.ContainerName, false)
 			}
-		} else if respErr != nil {
+		}
+		if respErr != nil {
 			inplaceUpdateResizing := util.PodInplaceUpdateResizing(req)
-			if !inplaceUpdateResizing {
-				_ = p.removeContainer(req.PodUid, req.ContainerName, false)
+			if err := p.state.CommitAdvisorState(
+				rollbackPodEntries,
+				rollbackMachineState,
+				rollbackAllowOverlap,
+				rollbackDisableDedicatedOverlap,
+				false,
+			); err != nil {
+				respErr = fmt.Errorf("%w; restore allocation state failed: %v", respErr, err)
 			}
 
 			metricTags := []metrics.MetricTag{

@@ -59,13 +59,14 @@ func (s *advisorCommitRecordingState) CommitAdvisorState(
 	entries state.PodEntries,
 	machineState state.NUMANodeMap,
 	allowOverlap bool,
+	disableDedicatedOverlap bool,
 	persist bool,
 ) error {
 	s.calls++
 	if s.err != nil {
 		return s.err
 	}
-	return s.State.CommitAdvisorState(entries, machineState, allowOverlap, persist)
+	return s.State.CommitAdvisorState(entries, machineState, allowOverlap, disableDedicatedOverlap, persist)
 }
 
 func TestDynamicPolicy_checkAndApplyIfCgroupV1(t *testing.T) {
@@ -928,7 +929,7 @@ func TestDynamicPolicyValidateAdvisorPartitionBeforeCommitRejectsReclaimNonRecla
 				},
 			}
 
-			err = policy.validateAdvisorPartitionBeforeCommit(newEntries, false)
+			err = policy.validateAdvisorPartitionBeforeCommit(newEntries, false, false)
 			require.Error(t, err)
 			require.Contains(t, err.Error(), "overlaps non-reclaim")
 		})
@@ -959,7 +960,7 @@ func TestDynamicPolicyValidateAdvisorPartitionBeforeCommitChecksPhysicalNUMAWhen
 		},
 	}
 
-	err = policy.validateAdvisorPartitionBeforeCommit(newEntries, true)
+	err = policy.validateAdvisorPartitionBeforeCommit(newEntries, true, false)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "reclaim pool assignment crosses NUMA")
 }
