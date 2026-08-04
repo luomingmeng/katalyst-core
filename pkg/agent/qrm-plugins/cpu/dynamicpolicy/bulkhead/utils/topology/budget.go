@@ -55,6 +55,9 @@ type ConvergenceBudget struct {
 	MaxTransferEdges           int
 	MaxPlanOperations          int
 	MaxDeadlockProbeOperations int
+	// AutoDeadlockProbeOperations allows one invocation to raise the default
+	// probe limit from the observed snapshot and transfer-atom shape.
+	AutoDeadlockProbeOperations bool
 	// DeadlineDuration bounds one invocation when the caller does not provide a
 	// tighter context deadline. It is converted to an absolute Deadline when a
 	// coordinator invocation starts.
@@ -80,15 +83,16 @@ const defaultConvergenceDeadlineDuration = 10 * time.Second
 // round, hierarchy-I/O, and plan limits are derived after the first snapshot.
 func DefaultConvergenceBudget() ConvergenceBudget {
 	return ConvergenceBudget{
-		MaxRounds:                  0,
-		MaxHierarchyIOOperations:   0,
-		MaxSnapshotNodes:           defaultApplyMaxSnapshotNodes,
-		MaxSnapshotDepth:           defaultApplyMaxSnapshotDepth,
-		MaxDomains:                 256,
-		MaxTransferEdges:           4096,
-		MaxPlanOperations:          0,
-		MaxDeadlockProbeOperations: defaultDeadlockProbeBudget,
-		DeadlineDuration:           defaultConvergenceDeadlineDuration,
+		MaxRounds:                   0,
+		MaxHierarchyIOOperations:    0,
+		MaxSnapshotNodes:            defaultApplyMaxSnapshotNodes,
+		MaxSnapshotDepth:            defaultApplyMaxSnapshotDepth,
+		MaxDomains:                  256,
+		MaxTransferEdges:            4096,
+		MaxPlanOperations:           0,
+		MaxDeadlockProbeOperations:  defaultDeadlockProbeBudget,
+		AutoDeadlockProbeOperations: true,
+		DeadlineDuration:            defaultConvergenceDeadlineDuration,
 	}
 }
 
@@ -108,6 +112,7 @@ func NormalizeConvergenceBudget(in ConvergenceBudget) ConvergenceBudget {
 	}
 	if in.MaxDeadlockProbeOperations == 0 {
 		in.MaxDeadlockProbeOperations = defaults.MaxDeadlockProbeOperations
+		in.AutoDeadlockProbeOperations = true
 	}
 	if in.DeadlineDuration == 0 {
 		in.DeadlineDuration = defaults.DeadlineDuration
@@ -158,6 +163,30 @@ func NewBudgetTracker(limit ConvergenceBudget) *BudgetTracker {
 		limit:   limit,
 		visited: make(map[budgetNodeKey]struct{}),
 	}
+}
+
+func (b *BudgetTracker) EnsureDeadlockProbeCapacity(required int) {
+	if b == nil || required <= 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.limit.AutoDeadlockProbeOperations {
+		return
+	}
+	target := saturatingAdd(b.usage.DeadlockProbeOperations, required)
+	if target > b.limit.MaxDeadlockProbeOperations {
+		b.limit.MaxDeadlockProbeOperations = target
+	}
+}
+
+func (b *BudgetTracker) DeadlockProbeLimit() int {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.limit.MaxDeadlockProbeOperations
 }
 
 func (b *BudgetTracker) Usage() BudgetUsage {

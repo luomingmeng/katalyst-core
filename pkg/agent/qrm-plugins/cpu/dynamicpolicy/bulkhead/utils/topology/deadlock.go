@@ -58,6 +58,32 @@ type DeadlockAnalysis struct {
 	EmptyBlockers  map[string]machine.CPUSet
 	Protected      machine.CPUSet
 	NonFinalSpare  machine.CPUSet
+	ProbeStats     DeadlockProbeStats
+}
+
+type DeadlockProbeStats struct {
+	Atoms                      int
+	AtomIndex                  int
+	AtomSource                 DomainID
+	AtomDestination            DomainID
+	SnapshotEntries            int
+	SnapshotChildEdges         int
+	ProtectedRels              int
+	ProtectedPendingCPUs       int
+	ProbeOperations            int
+	ProbeLimit                 int
+	ContextOperations          int
+	ContextPhase               string
+	BaseOperations             int
+	ProtectedOperations        int
+	RelIndexOperations         int
+	ChildIndexOps              int
+	ChildMembershipsScanned    int
+	FrontierIndexOps           int
+	FrontierMembershipsScanned int
+	AncestorClosureOps         int
+	AtomOperations             int
+	SnapshotID                 SnapshotID
 }
 
 type StructuralV1NonEmptyDeadlock struct {
@@ -73,10 +99,18 @@ func analyzeV1Deadlock(in PhasePlanInput) (DeadlockAnalysis, error) {
 	analysis := DeadlockAnalysis{
 		Completeness:  ProbeComplete,
 		EmptyBlockers: make(map[string]machine.CPUSet),
+		ProbeStats: DeadlockProbeStats{
+			AtomIndex: -1,
+		},
 	}
 	if in.AllowEmptyTarget || in.Kind != PhaseDrain || in.DAG == nil || in.Snapshot == nil {
 		return analysis, nil
 	}
+	analysis.ProbeStats.SnapshotEntries = len(in.Snapshot.Entries)
+	analysis.ProbeStats.SnapshotChildEdges = snapshotChildEdgeCount(in.Snapshot)
+	analysis.ProbeStats.ProtectedRels = len(in.ProtectedByRel)
+	analysis.ProbeStats.ProtectedPendingCPUs = in.ProtectedPending.Size()
+	analysis.ProbeStats.SnapshotID = in.Snapshot.ID
 	desiredByDomain := desiredDomainUnions(in.DAG, in.DesiredByRel)
 	domains := sortedDomains(in.Snapshot.DomainUnion, desiredByDomain)
 	graph := buildTransferGraph(domains, in.Snapshot.DomainUnion, desiredByDomain, nil)
@@ -103,6 +137,15 @@ func analyzeV1Deadlock(in PhasePlanInput) (DeadlockAnalysis, error) {
 			}
 		}
 	}
+	analysis.ProbeStats.Atoms = len(analysis.Atoms)
+	if in.Budget != nil {
+		in.Budget.EnsureDeadlockProbeCapacity(deadlockProbeCapacityUpperBound(
+			analysis.ProbeStats.SnapshotEntries,
+			analysis.ProbeStats.SnapshotChildEdges,
+			analysis.ProbeStats.Atoms,
+		))
+		analysis.ProbeStats.ProbeLimit = in.Budget.DeadlockProbeLimit()
+	}
 	ctx := in.Context
 	if ctx == nil {
 		ctx = context.Background()
@@ -115,17 +158,59 @@ func analyzeV1Deadlock(in PhasePlanInput) (DeadlockAnalysis, error) {
 	protectedByDomain := protectedCPUSetByDomain(in.ProtectedByRel, in.ProtectedPending, in.DAG)
 	depthByRel := buildSnapshotDepthByRel(in.Snapshot, nil)
 	domainByRel, parentByRel := buildPlannerRelations(in.Snapshot, in.DAG, depthByRel, nil)
+	projectionContext, err := buildDrainProjectionContext(ctx, in.Snapshot, in.ProtectedByRel, in.Budget)
+	if err != nil {
+		if errors.Is(err, ErrDeadlockProbeBudgetExceeded) {
+			analysis.Completeness = ProbeIndeterminate
+			if projectionContext != nil {
+				copyProjectionContextStats(&analysis.ProbeStats, projectionContext)
+			}
+			analysis.ProbeStats.ProbeOperations = deadlockProbeOperations(in.Budget, probeCost)
+			return analysis, wrapDeadlockProbeError(err, analysis.ProbeStats)
+		}
+		return DeadlockAnalysis{}, err
+	}
+	probeCost = projectionContext.cost
+	copyProjectionContextStats(&analysis.ProbeStats, projectionContext)
+	analysis.ProbeStats.ProbeOperations = deadlockProbeOperations(in.Budget, probeCost)
 	leavingByDomain := make(map[DomainID]machine.CPUSet, len(domains))
 	for _, domain := range domains {
 		leavingByDomain[domain] = in.Snapshot.DomainUnion[domain].Difference(desiredByDomain[domain])
 	}
+	transferCPUs := machine.NewCPUSet()
+	for _, atom := range analysis.Atoms {
+		transferCPUs = transferCPUs.Union(atom.CPUs)
+	}
+	projectionInput := DrainProjectionInput{
+		PlanInput: in, LeavingByDomain: leavingByDomain,
+		DomainByRel: domainByRel, ParentByRel: parentByRel, DepthByRel: depthByRel,
+		Context: projectionContext, TransferCPUs: transferCPUs,
+		ProbeContext: ctx, ProbeBudget: in.Budget,
+	}
+	if err := prepareIncrementalDrainProjectionContext(projectionInput, projectionContext); err != nil {
+		if errors.Is(err, ErrDeadlockProbeBudgetExceeded) {
+			analysis.Completeness = ProbeIndeterminate
+			copyProjectionContextStats(&analysis.ProbeStats, projectionContext)
+			analysis.ProbeStats.ProbeOperations = deadlockProbeOperations(in.Budget, projectionContext.cost)
+			return analysis, wrapDeadlockProbeError(err, analysis.ProbeStats)
+		}
+		return DeadlockAnalysis{}, err
+	}
+	probeCost = projectionContext.cost
+	copyProjectionContextStats(&analysis.ProbeStats, projectionContext)
+	analysis.ProbeStats.ProbeOperations = deadlockProbeOperations(in.Budget, probeCost)
 	for i := range analysis.Atoms {
+		atom := analysis.Atoms[i]
+		analysis.ProbeStats.AtomIndex = i
+		analysis.ProbeStats.AtomSource = atom.Source
+		analysis.ProbeStats.AtomDestination = atom.Destination
+		analysis.ProbeStats.ProbeOperations = deadlockProbeOperations(in.Budget, probeCost)
 		if limit > 0 && probeCost >= limit {
 			analysis.Completeness = ProbeIndeterminate
-			return analysis, fmt.Errorf("%w: limit=%d used=%d",
+			err := fmt.Errorf("%w: limit=%d used=%d",
 				ErrDeadlockProbeBudgetExceeded, limit, probeCost)
+			return analysis, wrapDeadlockProbeError(err, analysis.ProbeStats)
 		}
-		atom := analysis.Atoms[i]
 		if !atom.CPUs.Intersection(protectedByDomain[atom.Source]).IsEmpty() {
 			analysis.Protected = analysis.Protected.Union(atom.CPUs)
 			analysis.AtomClasses = append(analysis.AtomClasses, DrainAtomClassProtected)
@@ -136,25 +221,28 @@ func analyzeV1Deadlock(in PhasePlanInput) (DeadlockAnalysis, error) {
 			DomainReclaim: machine.NewCPUSet(),
 			atom.Source:   atom.CPUs,
 		}
-		projection, err := projectDrainTargets(DrainProjectionInput{
-			PlanInput: in, DrainBatch: drainBatch, LeavingByDomain: leavingByDomain,
-			DomainByRel: domainByRel, ParentByRel: parentByRel, DepthByRel: depthByRel,
-			ProbeContext: ctx, ProbeBudget: in.Budget,
-		})
+		atomInput := projectionInput
+		atomInput.DrainBatch = drainBatch
+		projection, err := projectSingleAtomIncremental(atomInput, atom)
 		if err != nil {
 			if errors.Is(err, ErrDeadlockProbeBudgetExceeded) {
 				analysis.Completeness = ProbeIndeterminate
-				return analysis, err
+				analysis.ProbeStats.ProbeOperations = deadlockProbeOperations(in.Budget, probeCost)
+				return analysis, wrapDeadlockProbeError(err, analysis.ProbeStats)
 			}
 			return DeadlockAnalysis{}, err
 		}
 		projectionCost := projection.Cost.Total()
 		if limit > 0 && projectionCost > limit-probeCost {
 			analysis.Completeness = ProbeIndeterminate
-			return analysis, fmt.Errorf("%w: limit=%d used=%d requested=%d",
+			err := fmt.Errorf("%w: limit=%d used=%d requested=%d",
 				ErrDeadlockProbeBudgetExceeded, limit, probeCost, projectionCost)
+			analysis.ProbeStats.ProbeOperations = deadlockProbeOperations(in.Budget, probeCost)
+			return analysis, wrapDeadlockProbeError(err, analysis.ProbeStats)
 		}
 		probeCost += projectionCost
+		analysis.ProbeStats.AtomOperations += projectionCost
+		analysis.ProbeStats.ProbeOperations = deadlockProbeOperations(in.Budget, probeCost)
 		for rel, cpus := range projection.EmptyBlockers {
 			analysis.EmptyBlockers[rel] = analysis.EmptyBlockers[rel].Union(cpus)
 		}
@@ -177,6 +265,87 @@ func analyzeV1Deadlock(in PhasePlanInput) (DeadlockAnalysis, error) {
 	desiredAll := desiredByDomain[DomainPrimary].Union(desiredByDomain[DomainReclaim])
 	analysis.NonFinalSpare = in.AllowedCPUs.Difference(desiredAll)
 	return analysis, nil
+}
+
+func snapshotChildEdgeCount(snapshot *CompleteSnapshot) int {
+	if snapshot == nil {
+		return 0
+	}
+	count := 0
+	for _, children := range snapshot.Children {
+		count += len(children)
+	}
+	return count
+}
+
+func deadlockProbeOperations(budget *BudgetTracker, fallback int) int {
+	if budget == nil {
+		return fallback
+	}
+	return budget.Usage().DeadlockProbeOperations
+}
+
+func deadlockProbeCapacityUpperBound(entries, childEdges, atoms int) int {
+	snapshotWork := saturatingAdd(entries, childEdges)
+	contextWork := saturatingMultiply(snapshotWork, 3)
+	perAtomWork := saturatingAdd(snapshotWork, 1)
+	return saturatingAdd(
+		defaultDeadlockProbeBudget,
+		saturatingAdd(contextWork, saturatingMultiply(atoms, perAtomWork)),
+	)
+}
+
+func copyProjectionContextStats(stats *DeadlockProbeStats, projectionContext *drainProjectionContext) {
+	if stats == nil || projectionContext == nil {
+		return
+	}
+	stats.ContextOperations = projectionContext.cost
+	stats.ContextPhase = projectionContext.phase
+	stats.BaseOperations = projectionContext.baseCost
+	stats.ProtectedOperations = projectionContext.protectedOperations
+	stats.RelIndexOperations = projectionContext.relIndexOperations
+	stats.ChildIndexOps = projectionContext.childIndexOperations
+	stats.ChildMembershipsScanned = projectionContext.childMembershipsScanned
+	stats.FrontierIndexOps = projectionContext.frontierIndexOperations
+	stats.FrontierMembershipsScanned = projectionContext.frontierMembershipsScanned
+	stats.AncestorClosureOps = projectionContext.ancestorClosureOperations
+}
+
+func wrapDeadlockProbeError(err error, stats DeadlockProbeStats) error {
+	return fmt.Errorf(
+		"%w: atoms=%d atom_index=%d atom_source=%s atom_destination=%s "+
+			"snapshot_entries=%d snapshot_child_edges=%d protected_rels=%d "+
+			"protected_pending_cpus=%d probe_operations=%d probe_limit=%d context_operations=%d "+
+			"context_phase=%s base_operations=%d protected_operations=%d "+
+			"rel_index_operations=%d child_index_operations=%d "+
+			"child_memberships_scanned=%d "+
+			"frontier_index_operations=%d frontier_memberships_scanned=%d "+
+			"ancestor_closure_operations=%d "+
+			"atom_operations=%d snapshot_id=%x",
+		err,
+		stats.Atoms,
+		stats.AtomIndex,
+		stats.AtomSource,
+		stats.AtomDestination,
+		stats.SnapshotEntries,
+		stats.SnapshotChildEdges,
+		stats.ProtectedRels,
+		stats.ProtectedPendingCPUs,
+		stats.ProbeOperations,
+		stats.ProbeLimit,
+		stats.ContextOperations,
+		stats.ContextPhase,
+		stats.BaseOperations,
+		stats.ProtectedOperations,
+		stats.RelIndexOperations,
+		stats.ChildIndexOps,
+		stats.ChildMembershipsScanned,
+		stats.FrontierIndexOps,
+		stats.FrontierMembershipsScanned,
+		stats.AncestorClosureOps,
+		stats.AtomOperations,
+		stats.SnapshotID,
+	)
 }
 
 func verifiedUnownedFinalCPUs(
