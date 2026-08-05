@@ -147,8 +147,13 @@ func (r *recordingExternalManager) InitRDT() error                 { return nil 
 func (r *recordingExternalManager) ApplyTasks(string, []string) error {
 	return nil
 }
-func (r *recordingExternalManager) ApplyCAT(string, map[int]int) error { return nil }
+func (r *recordingExternalManager) ApplyCAT(string, map[int]uint64) error { return nil }
 func (r *recordingExternalManager) ApplyMBA(string, map[int]int) error { return nil }
+func (r *recordingExternalManager) RunClosResourceUpdate(_ string, update func() (bool, error)) error {
+	_, err := update()
+	return err
+}
+func (r *recordingExternalManager) InvalidateClos(string)              {}
 func (r *recordingExternalManager) Run(context.Context)                {}
 
 type recordingCgroupIDManager struct {
