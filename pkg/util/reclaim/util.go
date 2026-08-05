@@ -124,3 +124,16 @@ func GetReclaimedPercentage(d *dynamic.Configuration, name string) float64 {
 	}
 	return percentageFromDynamic(d, name)
 }
+
+// GetSummedReclaimedPercentage returns the configured percentage for all
+// registered consumers, capped at 100.
+func GetSummedReclaimedPercentage(d *dynamic.Configuration, names []string) float64 {
+	var percentage float64
+	for _, name := range names {
+		percentage += GetReclaimedPercentage(d, name)
+	}
+	if percentage > 100 {
+		return 100
+	}
+	return percentage
+}

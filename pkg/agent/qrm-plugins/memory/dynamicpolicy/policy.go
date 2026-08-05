@@ -975,31 +975,27 @@ func (p *DynamicPolicy) addReclaimedMemoryAllocatable(
 		return
 	}
 
-	var summedPct float64
-	for _, name := range consumerNames {
-		pct := reclaim.GetReclaimedPercentage(p.dynamicConf.GetDynamicConfiguration(), name)
-		summedPct += pct
-	}
-	if summedPct > 100 {
-		summedPct = 100
-	}
-
 	numaHeadroom := p.state.GetNUMAHeadroom()
+	numaHeadroomValues := make(map[int]float64, len(numaHeadroom))
+	for numaNode, headroom := range numaHeadroom {
+		numaHeadroomValues[numaNode] = float64(headroom)
+	}
+	reclaimedNUMAHeadroom := reclaim.GetReclaimedNUMAHeadroom(
+		numaHeadroomValues, p.dynamicConf.GetDynamicConfiguration(), consumerNames...)
 
 	topologyAwareList := make([]*pluginapi.TopologyAwareQuantity, 0, len(numaNodes))
 	for _, numaNode := range numaNodes {
-		scaled := float64(numaHeadroom[numaNode]) * summedPct / 100
 		topologyAwareList = append(topologyAwareList, &pluginapi.TopologyAwareQuantity{
-			ResourceValue: scaled,
+			ResourceValue: reclaimedNUMAHeadroom[numaNode],
 			Node:          uint64(numaNode),
 		})
 	}
 
-	var totalHeadroom int64
-	for _, v := range numaHeadroom {
-		totalHeadroom += v
+	var totalReclaimedHeadroom float64
+	for _, v := range reclaimedNUMAHeadroom {
+		totalReclaimedHeadroom += v
 	}
-	aggregated := float64(totalHeadroom) * summedPct / 100
+	aggregated := totalReclaimedHeadroom
 
 	allocatableResources[string(apiconsts.ReclaimedResourceMemory)] = &pluginapi.AllocatableTopologyAwareResource{
 		IsNodeResource:                       false,

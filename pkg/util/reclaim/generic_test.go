@@ -84,6 +84,23 @@ func TestRegisterConsumerAndGetReclaimedPercentage(t *testing.T) {
 	}
 }
 
+func TestGetSummedReclaimedPercentageCapsConfiguredConsumers(t *testing.T) {
+	lockGlobalRegistry(t)
+	resetRegistry()
+	for _, name := range []string{"consumer-a", "consumer-b"} {
+		if err := registerConsumer(name, NewGenericConsumer(newTestConf("/x"), nil)); err != nil {
+			t.Fatalf("registerConsumer(%q): %v", name, err)
+		}
+	}
+	got := GetSummedReclaimedPercentage(newDynamicWithPercentages(map[string]int{
+		"consumer-a": 60,
+		"consumer-b": 60,
+	}), []string{"consumer-a", "unknown", "consumer-b"})
+	if got != 100 {
+		t.Fatalf("GetSummedReclaimedPercentage = %v, want 100", got)
+	}
+}
+
 func TestRegisterNamedGenericConsumer(t *testing.T) {
 	t.Parallel()
 	lockGlobalRegistry(t)
