@@ -20,8 +20,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
+	"time"
 
+	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -57,7 +60,6 @@ type DeadlockAnalysis struct {
 	SafeGrowAnchor machine.CPUSet
 	EmptyBlockers  map[string]machine.CPUSet
 	Protected      machine.CPUSet
-	NonFinalSpare  machine.CPUSet
 	ProbeStats     DeadlockProbeStats
 }
 
@@ -72,6 +74,7 @@ type DeadlockProbeStats struct {
 	ProtectedPendingCPUs       int
 	ProbeOperations            int
 	ProbeLimit                 int
+	AutoBudget                 bool
 	ContextOperations          int
 	ContextPhase               string
 	BaseOperations             int
@@ -95,8 +98,17 @@ func (e *StructuralV1NonEmptyDeadlock) Error() string {
 		len(e.Analysis.Atoms), len(e.Analysis.EmptyBlockers))
 }
 
-func analyzeV1Deadlock(in PhasePlanInput) (DeadlockAnalysis, error) {
-	analysis := DeadlockAnalysis{
+func analyzeV1Deadlock(in PhasePlanInput) (analysis DeadlockAnalysis, err error) {
+	start := time.Now()
+	defer func() {
+		stats := analysis.ProbeStats
+		general.Infof("cpuset_topology: deadlock probe finished duration=%s err=%v completeness=%s atoms=%d blockers=%d snapshot_entries=%d snapshot_child_edges=%d protected_rels=%d protected_pending_cpus=%d probe_operations=%d probe_limit=%d auto_budget=%t context_phase=%s atom_index=%d",
+			time.Since(start), err, analysis.Completeness, len(analysis.Atoms), len(analysis.EmptyBlockers),
+			stats.SnapshotEntries, stats.SnapshotChildEdges, stats.ProtectedRels, stats.ProtectedPendingCPUs,
+			stats.ProbeOperations, stats.ProbeLimit, stats.AutoBudget, stats.ContextPhase, stats.AtomIndex)
+	}()
+
+	analysis = DeadlockAnalysis{
 		Completeness:  ProbeComplete,
 		EmptyBlockers: make(map[string]machine.CPUSet),
 		ProbeStats: DeadlockProbeStats{
@@ -139,10 +151,14 @@ func analyzeV1Deadlock(in PhasePlanInput) (DeadlockAnalysis, error) {
 	}
 	analysis.ProbeStats.Atoms = len(analysis.Atoms)
 	if in.Budget != nil {
+		analysis.ProbeStats.AutoBudget = in.Budget.AutoDeadlockProbeOperations()
+		protectedPreaggregationOperations := protectedAncestorPreaggregationOperations(in.Snapshot, in.ProtectedByRel)
 		in.Budget.EnsureDeadlockProbeCapacity(deadlockProbeCapacityUpperBound(
 			analysis.ProbeStats.SnapshotEntries,
 			analysis.ProbeStats.SnapshotChildEdges,
 			analysis.ProbeStats.Atoms,
+			analysis.ProbeStats.ProtectedPendingCPUs,
+			protectedPreaggregationOperations,
 		))
 		analysis.ProbeStats.ProbeLimit = in.Budget.DeadlockProbeLimit()
 	}
@@ -262,8 +278,6 @@ func analyzeV1Deadlock(in PhasePlanInput) (DeadlockAnalysis, error) {
 			analysis.AtomClasses = append(analysis.AtomClasses, DrainAtomClassHeld)
 		}
 	}
-	desiredAll := desiredByDomain[DomainPrimary].Union(desiredByDomain[DomainReclaim])
-	analysis.NonFinalSpare = in.AllowedCPUs.Difference(desiredAll)
 	return analysis, nil
 }
 
@@ -285,14 +299,37 @@ func deadlockProbeOperations(budget *BudgetTracker, fallback int) int {
 	return budget.Usage().DeadlockProbeOperations
 }
 
-func deadlockProbeCapacityUpperBound(entries, childEdges, atoms int) int {
+func deadlockProbeCapacityUpperBound(entries, childEdges, atoms, protectedPendingCPUs, protectedPreaggregationOperations int) int {
 	snapshotWork := saturatingAdd(entries, childEdges)
 	contextWork := saturatingMultiply(snapshotWork, 3)
+	pendingWork := saturatingMultiply(protectedPendingCPUs, snapshotWork)
 	perAtomWork := saturatingAdd(snapshotWork, 1)
 	return saturatingAdd(
 		defaultDeadlockProbeBudget,
-		saturatingAdd(contextWork, saturatingMultiply(atoms, perAtomWork)),
+		saturatingAdd(
+			saturatingAdd(saturatingAdd(contextWork, pendingWork), protectedPreaggregationOperations),
+			saturatingMultiply(atoms, perAtomWork),
+		),
 	)
+}
+
+// protectedAncestorPreaggregationOperations returns the exact number of
+// budgeted iterations required to preaggregate protected CPUs into each
+// materialized ancestor in the snapshot.
+func protectedAncestorPreaggregationOperations(snapshot *CompleteSnapshot, protectedByRel map[string]machine.CPUSet) int {
+	if snapshot == nil || len(protectedByRel) == 0 {
+		return 0
+	}
+
+	operations := 0
+	for originalRel := range protectedByRel {
+		for rel := filepath.Clean(originalRel); rel != "." && rel != ""; rel = filepath.Dir(rel) {
+			if _, ok := snapshot.Entries[rel]; ok {
+				operations = saturatingAdd(operations, 1)
+			}
+		}
+	}
+	return operations
 }
 
 func copyProjectionContextStats(stats *DeadlockProbeStats, projectionContext *drainProjectionContext) {
@@ -315,7 +352,7 @@ func wrapDeadlockProbeError(err error, stats DeadlockProbeStats) error {
 	return fmt.Errorf(
 		"%w: atoms=%d atom_index=%d atom_source=%s atom_destination=%s "+
 			"snapshot_entries=%d snapshot_child_edges=%d protected_rels=%d "+
-			"protected_pending_cpus=%d probe_operations=%d probe_limit=%d context_operations=%d "+
+			"protected_pending_cpus=%d probe_operations=%d probe_limit=%d auto_budget=%t context_operations=%d "+
 			"context_phase=%s base_operations=%d protected_operations=%d "+
 			"rel_index_operations=%d child_index_operations=%d "+
 			"child_memberships_scanned=%d "+
@@ -333,6 +370,7 @@ func wrapDeadlockProbeError(err error, stats DeadlockProbeStats) error {
 		stats.ProtectedPendingCPUs,
 		stats.ProbeOperations,
 		stats.ProbeLimit,
+		stats.AutoBudget,
 		stats.ContextOperations,
 		stats.ContextPhase,
 		stats.BaseOperations,
