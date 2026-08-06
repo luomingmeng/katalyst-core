@@ -315,6 +315,8 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 	if err != nil {
 		return *res, err
 	}
+	effectiveTargets = normalizeV1NonEmptyReclaimDesiredTargets(in.DAG, initialSnapshot, effectiveTargets, allowEmptyTarget)
+	round.targetByRel = effectiveTargets
 	round.maxRounds = coordinatorMaxRoundsForPlanInput(PhasePlanInput{
 		Kind: PhaseDrain, DAG: in.DAG, Snapshot: initialSnapshot,
 		DesiredByRel: effectiveTargets, AllowedCPUs: round.allowedCPUs(),
@@ -1141,6 +1143,12 @@ func rebaseDrainPlan(plan PhasePlan, fresh *CompleteSnapshot, dag *TopoDAG, budg
 	postProcessPhaseOperationTargets(plan.Kind, plan.AllowEmptyTarget, plan.Capabilities, targets, fresh)
 	if err := propagatePhaseTargetEnvelope(targets, parentByRel, depthByRel); err != nil {
 		return PhasePlan{}, err
+	}
+	if !plan.AllowEmptyTarget {
+		if err := propagateControlledPhaseTargetEnvelope(targets, dag); err != nil {
+			return PhasePlan{}, err
+		}
+		clampReclaimNUMABucketPhaseMems(targets, dag, nil)
 	}
 	operationCount, err := countPlanOperations(PhaseDrain, plan.Capabilities, targets, fresh, dag, nil)
 	if err != nil {

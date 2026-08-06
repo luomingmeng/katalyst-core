@@ -1921,6 +1921,156 @@ func TestDrainPlanConfinesFullResetBucketToNUMAUpperBound(t *testing.T) {
 	}
 }
 
+func TestV1PlannerPreservesNonEmptyReclaimBucketWhenDesiredIsEmpty(t *testing.T) {
+	t.Parallel()
+
+	allCPUs := machine.NewCPUSet(0, 1, 2, 3)
+	bucket0 := machine.NewCPUSet(0, 1)
+	bucket1 := machine.NewCPUSet(2, 3)
+	currentBucket0 := machine.NewCPUSet(0)
+	dag := mustPlanDAG(t, []NodeSpec{
+		{Rel: "kubepods", Domain: DomainPrimary, Role: TopoNodeRolePrimary, CPUs: allCPUs, Mems: "0-1", TrustAnchor: true},
+		{Rel: "kubesandbox", Domain: DomainReclaim, Role: TopoNodeRoleReclaimSibling, CPUs: allCPUs, Mems: "0-1", TrustAnchor: true},
+		{
+			Rel: "kubesandbox/reclaimed-0", ParentRel: "kubesandbox", Domain: DomainReclaim,
+			Role: TopoNodeRoleReclaimNUMABucket, CPUs: bucket0, Mems: "0",
+			Constraint: TopologyConstraint{
+				CPUUpperBound: bucket0, MemUpperBound: machine.NewCPUSet(0), Scope: TopologyScopeNUMANode,
+			},
+		},
+		{
+			Rel: "kubesandbox/reclaimed-1", ParentRel: "kubesandbox", Domain: DomainReclaim,
+			Role: TopoNodeRoleReclaimNUMABucket, CPUs: bucket1, Mems: "1",
+			Constraint: TopologyConstraint{
+				CPUUpperBound: bucket1, MemUpperBound: machine.NewCPUSet(1), Scope: TopologyScopeNUMANode,
+			},
+		},
+	})
+	snapshot := planSnapshot(map[string]EntryState{
+		"kubepods":                {Identity: CgroupIdentity{Inode: 1}, CPUs: machine.NewCPUSet(2, 3), Mems: "0-1"},
+		"kubesandbox":             {Identity: CgroupIdentity{Inode: 2}, CPUs: allCPUs, Mems: "0-1"},
+		"kubesandbox/reclaimed-0": {Identity: CgroupIdentity{Inode: 3}, CPUs: currentBucket0, Mems: "0"},
+		"kubesandbox/reclaimed-1": {Identity: CgroupIdentity{Inode: 4}, CPUs: bucket1, Mems: "1"},
+	}, map[DomainID]machine.CPUSet{
+		DomainPrimary: machine.NewCPUSet(2, 3),
+		DomainReclaim: allCPUs,
+	})
+
+	plan, err := BuildPhasePlan(PhasePlanInput{
+		Kind: PhaseDrain, DAG: dag, Snapshot: snapshot,
+		DesiredByRel: map[string]machine.CPUSet{
+			"kubepods":                allCPUs,
+			"kubesandbox":             bucket1,
+			"kubesandbox/reclaimed-0": machine.NewCPUSet(),
+			"kubesandbox/reclaimed-1": bucket1,
+		},
+		DesiredMemsByRel: map[string]string{
+			"kubepods": "0-1", "kubesandbox": "0-1",
+			"kubesandbox/reclaimed-0": "0", "kubesandbox/reclaimed-1": "1",
+		},
+		AllowedCPUs: allCPUs,
+		Budget:      NewBudgetTracker(ConvergenceBudget{}),
+	})
+	if err != nil {
+		t.Fatalf("BuildPhasePlan returned error for v1 empty reclaim bucket desired target: %v", err)
+	}
+	if got := plan.TargetByRel["kubesandbox/reclaimed-0"].CPUs; got.IsEmpty() || !got.Equals(currentBucket0) {
+		t.Fatalf("reclaimed-0 target = %s, want preserved current non-empty %s", got.String(), currentBucket0.String())
+	}
+	if got := plan.TargetByRel["kubesandbox"].CPUs; !currentBucket0.IsSubsetOf(got) {
+		t.Fatalf("kubesandbox target = %s, want it to cover preserved reclaimed-0 target %s", got.String(), currentBucket0.String())
+	}
+}
+
+func TestV1PlannerClampsReclaimBucketPhaseMemsToNUMABound(t *testing.T) {
+	t.Parallel()
+
+	allCPUs := machine.NewCPUSet(0, 1, 2, 3)
+	bucket0 := machine.NewCPUSet(0, 1)
+	bucket1 := machine.NewCPUSet(2, 3)
+	dag := mustPlanDAG(t, []NodeSpec{
+		{Rel: "kubepods", Domain: DomainPrimary, Role: TopoNodeRolePrimary, CPUs: allCPUs, Mems: "0-1", TrustAnchor: true},
+		{Rel: "kubesandbox", Domain: DomainReclaim, Role: TopoNodeRoleReclaimSibling, CPUs: allCPUs, Mems: "0-1", TrustAnchor: true},
+		{
+			Rel: "kubesandbox/reclaimed-0", ParentRel: "kubesandbox", Domain: DomainReclaim,
+			Role: TopoNodeRoleReclaimNUMABucket, CPUs: bucket0, Mems: "0",
+			Constraint: TopologyConstraint{
+				CPUUpperBound: bucket0, MemUpperBound: machine.NewCPUSet(0), Scope: TopologyScopeNUMANode,
+			},
+		},
+		{
+			Rel: "kubesandbox/reclaimed-1", ParentRel: "kubesandbox", Domain: DomainReclaim,
+			Role: TopoNodeRoleReclaimNUMABucket, CPUs: bucket1, Mems: "1",
+			Constraint: TopologyConstraint{
+				CPUUpperBound: bucket1, MemUpperBound: machine.NewCPUSet(1), Scope: TopologyScopeNUMANode,
+			},
+		},
+	})
+	snapshot := planSnapshot(map[string]EntryState{
+		"kubepods":                {Identity: CgroupIdentity{Inode: 1}, CPUs: bucket1, Mems: "0-1"},
+		"kubesandbox":             {Identity: CgroupIdentity{Inode: 2}, CPUs: allCPUs, Mems: "0-1"},
+		"kubesandbox/reclaimed-0": {Identity: CgroupIdentity{Inode: 3}, CPUs: bucket0, Mems: "0"},
+		"kubesandbox/reclaimed-1": {Identity: CgroupIdentity{Inode: 4}, CPUs: bucket1, Mems: "0-1"},
+	}, map[DomainID]machine.CPUSet{
+		DomainPrimary: bucket1,
+		DomainReclaim: allCPUs,
+	})
+
+	plan, err := BuildPhasePlan(PhasePlanInput{
+		Kind: PhaseExpand, DAG: dag, Snapshot: snapshot,
+		DesiredByRel: map[string]machine.CPUSet{
+			"kubepods":                bucket1,
+			"kubesandbox":             allCPUs,
+			"kubesandbox/reclaimed-0": bucket0,
+			"kubesandbox/reclaimed-1": bucket1,
+		},
+		DesiredMemsByRel: map[string]string{
+			"kubepods": "0-1", "kubesandbox": "0-1",
+			"kubesandbox/reclaimed-0": "0", "kubesandbox/reclaimed-1": "1",
+		},
+		AllowedCPUs: allCPUs,
+		Budget:      NewBudgetTracker(ConvergenceBudget{}),
+	})
+	if err != nil {
+		t.Fatalf("BuildPhasePlan: %v", err)
+	}
+	if got := plan.TargetByRel["kubesandbox/reclaimed-1"].Mems; got != "1" {
+		t.Fatalf("reclaimed-1 phase target mems = %q, want NUMA-bound mems %q", got, "1")
+	}
+}
+
+func TestControlledPhaseEnvelopeDoesNotWidenNUMABucketMems(t *testing.T) {
+	t.Parallel()
+
+	dag := mustPlanDAG(t, []NodeSpec{
+		{
+			Rel: "kubesandbox", Domain: DomainReclaim, Role: TopoNodeRoleReclaimSibling,
+			CPUs: machine.NewCPUSet(0, 1), Mems: "0-1", TrustAnchor: true,
+		},
+		{
+			Rel: "kubesandbox/reclaimed-1", ParentRel: "kubesandbox", Domain: DomainReclaim,
+			Role: TopoNodeRoleReclaimNUMABucket, CPUs: machine.NewCPUSet(1), Mems: "1",
+			Constraint: TopologyConstraint{
+				CPUUpperBound: machine.NewCPUSet(1), MemUpperBound: machine.NewCPUSet(1), Scope: TopologyScopeNUMANode,
+			},
+		},
+	})
+	targets := map[string]CPUSetTarget{
+		"kubesandbox":             {CPUs: machine.NewCPUSet(0), Mems: "0-1"},
+		"kubesandbox/reclaimed-1": {CPUs: machine.NewCPUSet(1), Mems: "1"},
+	}
+
+	if err := propagateControlledPhaseTargetEnvelope(targets, dag); err != nil {
+		t.Fatalf("propagateControlledPhaseTargetEnvelope: %v", err)
+	}
+	if got := targets["kubesandbox/reclaimed-1"].Mems; got != "1" {
+		t.Fatalf("reclaimed-1 target mems = %q, want unchanged NUMA-bound mems %q", got, "1")
+	}
+	if got := targets["kubesandbox"].CPUs; !got.Equals(machine.NewCPUSet(0, 1)) {
+		t.Fatalf("kubesandbox target cpus = %s, want CPU envelope 0-1", got.String())
+	}
+}
+
 func TestDrainPlanPropagatesNearestBucketCPUUpperBoundToDynamicDescendants(t *testing.T) {
 	t.Parallel()
 

@@ -270,11 +270,18 @@ func buildPhasePlanWithStats(in PhasePlanInput, stats *plannerBuildStats) (Phase
 			return PhasePlan{}, err
 		}
 	}
-	if err := validatePhaseTargets(in, plan.TargetByRel); err != nil {
+	postProcessPhaseOperationTargets(in.Kind, in.AllowEmptyTarget, in.Capabilities, plan.TargetByRel, in.Snapshot)
+	applyV1NonEmptyReclaimFallbackTargets(in, plan.TargetByRel, domainByRel)
+	if err := propagatePhaseTargetEnvelope(plan.TargetByRel, parentByRel, depthByRel); err != nil {
 		return PhasePlan{}, err
 	}
-	postProcessPhaseOperationTargets(in.Kind, in.AllowEmptyTarget, in.Capabilities, plan.TargetByRel, in.Snapshot)
-	if err := propagatePhaseTargetEnvelope(plan.TargetByRel, parentByRel, depthByRel); err != nil {
+	if !in.AllowEmptyTarget {
+		if err := propagateControlledPhaseTargetEnvelope(plan.TargetByRel, in.DAG); err != nil {
+			return PhasePlan{}, err
+		}
+		clampReclaimNUMABucketPhaseMems(plan.TargetByRel, in.DAG, in.DesiredMemsByRel)
+	}
+	if err := validatePhaseTargets(in, plan.TargetByRel); err != nil {
 		return PhasePlan{}, err
 	}
 	operationCount, err := countPlanOperations(in.Kind, in.Capabilities, plan.TargetByRel, in.Snapshot, in.DAG, stats)
@@ -1340,7 +1347,8 @@ func postProcessPhaseOperationTargets(
 		if !ok {
 			continue
 		}
-		targets[rel] = phaseOperationTarget(
+		originalCPUs := target.CPUs.Clone()
+		adjusted := phaseOperationTarget(
 			kind,
 			allowEmptyTarget,
 			CPUSetTarget{
@@ -1349,6 +1357,11 @@ func postProcessPhaseOperationTargets(
 			},
 			target,
 		)
+		if allowEmptyTarget && capabilities.EmptyConfiguredCPUSet &&
+			entry.ConfiguredCPUs.IsEmpty() && originalCPUs.Equals(entry.CPUs) {
+			adjusted.CPUs = machine.NewCPUSet()
+		}
+		targets[rel] = adjusted
 	}
 }
 
@@ -1387,6 +1400,78 @@ func propagatePhaseTargetEnvelope(
 		targets[parentRel] = parent
 	}
 	return nil
+}
+
+func clampReclaimNUMABucketPhaseMems(
+	targets map[string]CPUSetTarget,
+	dag *TopoDAG,
+	desiredMemsByRel map[string]string,
+) {
+	if dag == nil {
+		return
+	}
+	for _, node := range dag.Nodes() {
+		if node == nil || node.Role != TopoNodeRoleReclaimNUMABucket {
+			continue
+		}
+		target, ok := targets[node.Rel]
+		if !ok {
+			continue
+		}
+		mems := desiredMemsByRel[node.Rel]
+		if mems == "" {
+			mems = node.Mems
+		}
+		if mems == "" || node.Constraint.MemUpperBound.IsEmpty() {
+			continue
+		}
+		parsed, err := machine.Parse(mems)
+		if err != nil || !parsed.IsSubsetOf(node.Constraint.MemUpperBound) {
+			continue
+		}
+		target.Mems = mems
+		targets[node.Rel] = target
+	}
+}
+
+func propagateControlledPhaseTargetEnvelope(targets map[string]CPUSetTarget, dag *TopoDAG) error {
+	if dag == nil {
+		return nil
+	}
+	nodes := dag.Nodes()
+	sort.Slice(nodes, func(i, j int) bool {
+		if topoNodeDepth(nodes[i]) != topoNodeDepth(nodes[j]) {
+			return topoNodeDepth(nodes[i]) > topoNodeDepth(nodes[j])
+		}
+		return nodes[i].Rel < nodes[j].Rel
+	})
+	for _, node := range nodes {
+		if node == nil || node.parent == nil {
+			continue
+		}
+		parent, ok := targets[node.parent.Rel]
+		if !ok {
+			continue
+		}
+		child := targets[node.Rel]
+		parent.CPUs = parent.CPUs.Union(child.CPUs)
+		mems, err := unionPhaseMemsEnvelope(parent.Mems, child.Mems)
+		if err != nil {
+			return fmt.Errorf("propagate controlled phase mems envelope from %q toward %q: %w",
+				node.Rel, node.parent.Rel, err)
+		}
+		parent.Mems = mems
+		targets[node.parent.Rel] = parent
+	}
+	return nil
+}
+
+func topoNodeDepth(node *TopoNode) int {
+	depth := 0
+	for current := node; current != nil && current.parent != nil; current = current.parent {
+		depth++
+	}
+	return depth
 }
 
 func unionPhaseMemsEnvelope(parent, child string) (string, error) {
@@ -1466,13 +1551,114 @@ func validateExecutableEmptyTargets(in PhasePlanInput) error {
 				Rel: rel, Source: EmptyTargetSourceExplicitDynamic, Current: current.CPUs.Clone(),
 			}
 		}
-		if in.DAG != nil && in.DAG.index[rel] != nil && in.DesiredByRel[rel].IsEmpty() {
+		if in.DAG != nil && in.DAG.index[rel] != nil && in.DesiredByRel[rel].IsEmpty() &&
+			!allowV1NonEmptyReclaimTargetFallback(in.DAG.index[rel]) {
 			return &UnsupportedEmptyTargetError{
 				Rel: rel, Source: EmptyTargetSourceControlled, Current: current.CPUs.Clone(),
 			}
 		}
 	}
 	return nil
+}
+
+func applyV1NonEmptyReclaimFallbackTargets(
+	in PhasePlanInput,
+	targets map[string]CPUSetTarget,
+	domainByRel map[string]DomainID,
+) {
+	if in.AllowEmptyTarget || in.DAG == nil || in.Snapshot == nil {
+		return
+	}
+	preserved := machine.NewCPUSet()
+	for _, node := range in.DAG.Nodes() {
+		if !allowV1NonEmptyReclaimTargetFallback(node) || !in.DesiredByRel[node.Rel].IsEmpty() {
+			continue
+		}
+		current := in.Snapshot.Entries[node.Rel].CPUs
+		if current.IsEmpty() {
+			continue
+		}
+		if target, ok := targets[node.Rel]; ok && !target.CPUs.IsEmpty() {
+			preserved = preserved.Union(target.CPUs)
+		}
+	}
+	if preserved.IsEmpty() {
+		return
+	}
+	for rel, target := range targets {
+		if phaseTargetDomain(rel, in.DAG, domainByRel) == DomainReclaim {
+			continue
+		}
+		target.CPUs = target.CPUs.Difference(preserved)
+		targets[rel] = target
+	}
+}
+
+func normalizeV1NonEmptyReclaimDesiredTargets(
+	dag *TopoDAG,
+	snapshot *CompleteSnapshot,
+	desired map[string]machine.CPUSet,
+	allowEmptyTarget bool,
+) map[string]machine.CPUSet {
+	out := cloneCPUSetMap(desired)
+	if allowEmptyTarget || dag == nil || snapshot == nil {
+		return out
+	}
+	preserved := machine.NewCPUSet()
+	for _, node := range dag.Nodes() {
+		if !allowV1NonEmptyReclaimTargetFallback(node) || !out[node.Rel].IsEmpty() {
+			continue
+		}
+		current := snapshot.Entries[node.Rel].CPUs
+		if current.IsEmpty() {
+			continue
+		}
+		out[node.Rel] = current.Clone()
+		preserved = preserved.Union(current)
+	}
+	if preserved.IsEmpty() {
+		return out
+	}
+	for _, node := range dag.Nodes() {
+		if node.Domain == DomainReclaim {
+			continue
+		}
+		out[node.Rel] = out[node.Rel].Difference(preserved)
+	}
+	propagateControlledDesiredCPUEnvelope(out, dag)
+	return out
+}
+
+func propagateControlledDesiredCPUEnvelope(targets map[string]machine.CPUSet, dag *TopoDAG) {
+	if dag == nil {
+		return
+	}
+	nodes := dag.Nodes()
+	sort.Slice(nodes, func(i, j int) bool {
+		if topoNodeDepth(nodes[i]) != topoNodeDepth(nodes[j]) {
+			return topoNodeDepth(nodes[i]) > topoNodeDepth(nodes[j])
+		}
+		return nodes[i].Rel < nodes[j].Rel
+	})
+	for _, node := range nodes {
+		if node == nil || node.parent == nil {
+			continue
+		}
+		targets[node.parent.Rel] = targets[node.parent.Rel].Union(targets[node.Rel])
+	}
+}
+
+func phaseTargetDomain(rel string, dag *TopoDAG, domainByRel map[string]DomainID) DomainID {
+	if dag != nil {
+		if node := dag.index[rel]; node != nil {
+			return node.Domain
+		}
+	}
+	return domainByRel[rel]
+}
+
+func allowV1NonEmptyReclaimTargetFallback(node *TopoNode) bool {
+	return node != nil && node.Domain == DomainReclaim
 }
 
 func buildPlannerRelations(

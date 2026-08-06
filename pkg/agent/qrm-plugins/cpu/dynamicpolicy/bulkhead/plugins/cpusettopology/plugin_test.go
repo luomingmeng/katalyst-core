@@ -1023,16 +1023,14 @@ func TestCPUSetTopologyPluginHandlesConfiguredNUMABucketTransitionToEmpty(t *tes
 			})
 
 			if tc.version == cgroupclient.CgroupVersionV1 {
-				var targetErr *topology.UnsupportedEmptyTargetError
-				if !errors.As(err, &targetErr) || targetErr.Rel != bucket1 ||
-					targetErr.Source != topology.EmptyTargetSourceControlled {
-					t.Fatalf("CPUSetAdjustmentHandler error = %T %v, want controlled UnsupportedEmptyTargetError for %q", err, err, bucket1)
+				if err != nil {
+					t.Fatalf("CPUSetAdjustmentHandler: %v", err)
 				}
-				if result.AppliedView != nil {
-					t.Fatalf("v1 unsupported empty target published AppliedView: %+v", result.AppliedView)
+				if got := cg.cpus[bucket1]; got.IsEmpty() || !got.Equals(machine.NewCPUSet(3)) {
+					t.Fatalf("v1 bucket %q cpuset = %s, want preserved non-empty current 3", bucket1, got.String())
 				}
-				if cg.cpus[bucket1].IsEmpty() {
-					t.Fatalf("v1 unsupported empty target cleared configured bucket %q", bucket1)
+				if got := cg.cpus[reclaim]; !got.Equals(machine.NewCPUSet(2, 3)) {
+					t.Fatalf("v1 parent reclaim cpuset = %s, want it to cover preserved bucket %q", got.String(), bucket1)
 				}
 				return
 			}
