@@ -55,9 +55,11 @@ func TestNewBulkheadConfigurationDefaultsConvergenceBudgetAndDrainSelection(t *t
 	if budget.MaxSnapshotNodes <= 0 ||
 		budget.MaxSnapshotDepth <= 0 ||
 		budget.MaxDomains <= 0 ||
-		budget.MaxTransferEdges <= 0 ||
-		budget.MaxDeadlockProbeOperations <= 0 {
+		budget.MaxTransferEdges <= 0 {
 		t.Fatalf("budget defaults must be non-zero defensive limits: %+v", budget)
+	}
+	if budget.MaxDeadlockProbeOperations != 0 {
+		t.Fatalf("deadlock probe budget default = %d, want 0/auto", budget.MaxDeadlockProbeOperations)
 	}
 	if budget.DeadlineDuration != DefaultTopologyConvergenceDeadline {
 		t.Fatalf("deadline default = %s, want %s", budget.DeadlineDuration, DefaultTopologyConvergenceDeadline)
@@ -71,6 +73,15 @@ func TestNewBulkheadConfigurationDefaultsConvergenceBudgetAndDrainSelection(t *t
 	}
 	if selection.GroupByNUMA || !selection.RequirePairedSwapProgress {
 		t.Fatalf("selection defaults must use full-drain with paired progress and no small-step topology grouping: %+v", selection)
+	}
+	if !cfg.EnableAdmissionLeafDefer {
+		t.Fatal("admission leaf defer must be enabled by default")
+	}
+	if cfg.AdmissionMaxRequiredWrites != 0 {
+		t.Fatalf("admission required write budget = %d, want 0/auto", cfg.AdmissionMaxRequiredWrites)
+	}
+	if cfg.AdmissionSafeDuration != 5*time.Second {
+		t.Fatalf("admission safe duration = %s, want 5s", cfg.AdmissionSafeDuration)
 	}
 }
 

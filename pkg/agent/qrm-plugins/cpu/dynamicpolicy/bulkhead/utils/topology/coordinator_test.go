@@ -88,6 +88,103 @@ func TestCoordinatorHierarchyDriverSelectsVersionPolicyAndPreservesSnapshotHook(
 	}
 }
 
+func TestCoordinatorRoundAdmissionBudgetStopsBeforeSafetyClosure(t *testing.T) {
+	round := &coordinatorRound{
+		objective:       ConvergenceObjectiveParentSafe,
+		admissionBudget: &AdmissionConvergenceBudget{MaxRequiredWrites: 2},
+	}
+	closure := PhasePlan{Operations: []PlanOperation{{Rel: "a"}, {Rel: "b"}}}
+	res := &ConvergenceResult{Applied: 1}
+
+	err := round.checkAdmissionExecutionBudget(closure, res)
+	if err == nil {
+		t.Fatal("checkAdmissionExecutionBudget() error = nil, want fail-closed before partial safety-closure execution")
+	}
+	if res.Applied != 1 {
+		t.Fatalf("applied = %d, want budget check to have no side effects", res.Applied)
+	}
+}
+
+func TestCoordinatorRoundAdmissionSafetyCPUSetOnlyCoversPendingAllocation(t *testing.T) {
+	round := &coordinatorRound{
+		protectedPending: machine.NewCPUSet(1),
+		dynamicByRel: map[string]machine.CPUSet{
+			"primary/existing/container": machine.NewCPUSet(2),
+		},
+		deferredByRel: map[string]machine.CPUSet{
+			"primary/deferred/container": machine.NewCPUSet(3),
+		},
+	}
+
+	got := round.admissionSafetyCPUSet()
+	if !got.Equals(machine.NewCPUSet(1)) {
+		t.Fatalf("admissionSafetyCPUSet() = %s, want only pending allocation CPU 1", got.String())
+	}
+}
+
+func TestTopologyCoordinatorAdmissionDeadlineCoversFreshProofAndFailsClosed(t *testing.T) {
+	dag, cg, driver := newCoordinatorSnapshotTestFixture(t)
+	primaryScans := 0
+	driver.beforeCall = func(op HierarchyOperation, rel string) error {
+		if op != HierarchyOperationStat || rel != "primary" {
+			return nil
+		}
+		primaryScans++
+		// A no-op converged round takes three snapshots before the independent
+		// fresh publish proof. Delay that proof beyond the admission deadline.
+		if primaryScans == 4 {
+			time.Sleep(30 * time.Millisecond)
+		}
+		return nil
+	}
+	published := false
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	result, err := (TopologyCoordinator{}).Converge(ctx, CoordinatorInput{
+		DAG: dag, Cgroup: cg, Objective: ConvergenceObjectiveParentSafe,
+		CPUDetails: machine.CPUDetails{
+			0: {NUMANodeID: 0},
+		},
+		PublishFinalSnapshot: func(*CompleteSnapshot) error {
+			published = true
+			return nil
+		},
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Converge() error = %v, want admission deadline exceeded", err)
+	}
+	if result.ParentSafe || result.Converged || result.FinalSnapshotCurrent || result.FinalSnapshot != nil {
+		t.Fatalf("timed-out result = %+v, want fail-closed without parent-safe/final proof", result)
+	}
+	if published {
+		t.Fatal("timed-out fresh proof must not publish a final snapshot")
+	}
+}
+
+func TestTopologyCoordinatorPreservesPublishedSuccessfulProofWhenContextExpiresAtReturn(t *testing.T) {
+	dag, cg, _ := newCoordinatorSnapshotTestFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	result, err := (TopologyCoordinator{}).Converge(ctx, CoordinatorInput{
+		DAG: dag, Cgroup: cg, Objective: ConvergenceObjectiveParentSafe,
+		CPUDetails: machine.CPUDetails{
+			0: {NUMANodeID: 0},
+		},
+		PublishFinalSnapshot: func(*CompleteSnapshot) error {
+			cancel()
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Converge() error = %v, want already-published proof preserved", err)
+	}
+	if (!result.ParentSafe && !result.Converged) || !result.FinalSnapshotCurrent || result.FinalSnapshot == nil {
+		t.Fatalf("result = %+v, want published successful final proof preserved", result)
+	}
+}
+
 func TestTopologyCoordinatorV2DisabledResetConvergesOnEmptyConfiguredCPUs(t *testing.T) {
 	dag, err := BuildDAG([]NodeSpec{{
 		Rel: "primary", Domain: DomainPrimary, Role: TopoNodeRolePrimary,
@@ -390,6 +487,26 @@ func TestTopologyCoordinatorReplansStalePublishWithinInvocation(t *testing.T) {
 	}
 	if len(driver.writes) != 0 {
 		t.Fatalf("stale zero-write publication retry wrote hierarchy: %#v", driver.writes)
+	}
+}
+
+func TestTopologyCoordinatorPrioritizesStalePlanOverBudget(t *testing.T) {
+	stale := &PlanStaleError{
+		Rel:       "kubepods/stale",
+		Direction: WriteDirection("shrink"),
+		Resource:  "snapshot",
+		Current:   "missing",
+		Target:    "0-1",
+		Err:       syscall.ENOENT,
+	}
+	err := prioritizeRoundStalePlanError(RoundOutcome{Status: RoundStatusStale, Blocker: stale},
+		fmt.Errorf("%w: limit=62288 used=62288", ErrHierarchyIOOperationBudgetExceeded))
+	var staleErr *PlanStaleError
+	if !errors.As(err, &staleErr) {
+		t.Fatalf("prioritized error = %T %v, want PlanStaleError before budget", err, err)
+	}
+	if errors.Is(err, ErrHierarchyIOOperationBudgetExceeded) {
+		t.Fatalf("prioritized error = %v, should not prioritize hierarchy budget over stale plan", err)
 	}
 }
 

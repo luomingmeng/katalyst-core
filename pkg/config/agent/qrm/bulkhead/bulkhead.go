@@ -77,14 +77,20 @@ type BulkheadConfiguration struct {
 	// kthreads (migration/N, ksoftirqd/N) — they cannot be moved.
 	BulkheadSystemKThreadCommSubstrs []string
 
-	TopologyConvergenceBudget ConvergenceBudget
-	TopologyDrainSelection    DrainSelectionPolicy
+	TopologyConvergenceBudget  ConvergenceBudget
+	TopologyDrainSelection     DrainSelectionPolicy
+	EnableAdmissionLeafDefer   bool
+	AdmissionMaxRequiredWrites int
+	AdmissionSafeDuration      time.Duration
 }
 
 func NewBulkheadConfiguration() *BulkheadConfiguration {
 	return &BulkheadConfiguration{
-		TopologyConvergenceBudget: DefaultConvergenceBudget(),
-		TopologyDrainSelection:    DefaultDrainSelectionPolicy(),
+		TopologyConvergenceBudget:  DefaultConvergenceBudget(),
+		TopologyDrainSelection:     DefaultDrainSelectionPolicy(),
+		EnableAdmissionLeafDefer:   true,
+		AdmissionMaxRequiredWrites: 0,
+		AdmissionSafeDuration:      5 * time.Second,
 	}
 }
 
@@ -97,7 +103,7 @@ func DefaultConvergenceBudget() ConvergenceBudget {
 		MaxDomains:                 256,
 		MaxTransferEdges:           4096,
 		MaxPlanOperations:          0,
-		MaxDeadlockProbeOperations: DefaultDeadlockProbeOperations,
+		MaxDeadlockProbeOperations: 0,
 		DeadlineDuration:           DefaultTopologyConvergenceDeadline,
 	}
 }

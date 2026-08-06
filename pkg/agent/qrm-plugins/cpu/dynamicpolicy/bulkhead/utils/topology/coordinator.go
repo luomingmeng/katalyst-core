@@ -177,10 +177,29 @@ func (g *ModeGate) exit(mode CoordinatorMode) {
 type ConvergenceState string
 
 const (
-	ConvergenceStateConverged    ConvergenceState = "converged"
-	ConvergenceStateNonConverged ConvergenceState = "non_converged"
-	ConvergenceStateBlocked      ConvergenceState = "blocked"
+	ConvergenceStateConverged              ConvergenceState = "converged"
+	ConvergenceStateParentSafeLeafDeferred ConvergenceState = "parent_safe_leaf_deferred"
+	ConvergenceStateNonConverged           ConvergenceState = "non_converged"
+	ConvergenceStateBlocked                ConvergenceState = "blocked"
 )
+
+type ConvergenceObjective string
+
+const (
+	ConvergenceObjectiveFull       ConvergenceObjective = "full"
+	ConvergenceObjectiveParentSafe ConvergenceObjective = "parent_safe"
+)
+
+func (o ConvergenceObjective) orFullDefault() ConvergenceObjective {
+	if o == "" {
+		return ConvergenceObjectiveFull
+	}
+	return o
+}
+
+type AdmissionConvergenceBudget struct {
+	MaxRequiredWrites int
+}
 
 type ConvergenceResult struct {
 	Attempted int
@@ -201,6 +220,9 @@ type ConvergenceResult struct {
 	// FinalSnapshotCurrent is true only when FinalSnapshot is the snapshot used
 	// for the successful convergence decision and no later hierarchy write ran.
 	FinalSnapshotCurrent bool
+	ParentSafe           bool
+	DeferredLeafCount    int
+	DeferredCPUCount     int
 }
 
 func (r ConvergenceResult) FirstBlocker() string {
@@ -227,9 +249,6 @@ type CoordinatorInput struct {
 	CPUDetails          machine.CPUDetails
 	ReservedCPUSet      machine.CPUSet
 	ExpectedCPUSetByRel map[string]machine.CPUSet
-	// KubeManagedRelPrefix scopes Kubernetes-managed subtree handling to the
-	// configured primary rel path. Empty prefix falls back to the DAG primary rel.
-	KubeManagedRelPrefix string
 	// ProtectedPendingCPUSet is the union of container allocations that already
 	// exist in QRM state but whose cgroup leaf has not been created yet (pod
 	// admit window). These have no resolvable rel, so the writer folds them into
@@ -239,6 +258,9 @@ type CoordinatorInput struct {
 	// ProtectedCPUSetByRel records cgroup rels whose current/pending cpuset must
 	// stay covered during a short runtime creation window.
 	ProtectedCPUSetByRel map[string]machine.CPUSet
+	Objective            ConvergenceObjective
+	DeferredCPUSetByRel  map[string]machine.CPUSet
+	AdmissionBudget      *AdmissionConvergenceBudget
 
 	Budget         ConvergenceBudget
 	DrainSelection DrainSelectionPolicy
@@ -247,6 +269,9 @@ type CoordinatorInput struct {
 	// after a fresh complete snapshot has the same publish-relevant controlled
 	// and explicit-leaf state as the snapshot that proved convergence.
 	PublishFinalSnapshot func(*CompleteSnapshot) error
+	// PublishParentSafeSnapshot publishes a partition-safe view while exact
+	// cleanup for the supplied rels remains deferred.
+	PublishParentSafeSnapshot func(*CompleteSnapshot, map[string]struct{}) error
 }
 
 type TopologyCoordinator struct{}
@@ -262,12 +287,17 @@ func (c TopologyCoordinator) Converge(ctx context.Context, in CoordinatorInput) 
 	if err := in.Mode.validate(); err != nil {
 		return res, err
 	}
+	switch in.Objective.orFullDefault() {
+	case ConvergenceObjectiveFull, ConvergenceObjectiveParentSafe:
+	default:
+		return res, fmt.Errorf("unsupported convergence objective %q", in.Objective)
+	}
 	token, err := in.Mode.TryEnter()
 	if err != nil {
 		return res, err
 	}
 	defer token.Exit()
-	budgetLimit := BudgetWithInvocationDeadline(ctx, in.Budget, coordinatorNow())
+	budgetLimit := BudgetWithInvocationDeadline(ctx, in.Budget, time.Now())
 	budget := NewBudgetTracker(budgetLimit)
 	var result ConvergenceResult
 	switch in.Mode.modeOrDefault() {
@@ -277,6 +307,20 @@ func (c TopologyCoordinator) Converge(ctx context.Context, in CoordinatorInput) 
 		result, err = c.convergeNormal(ctx, in, &res, budget)
 	default:
 		return res, fmt.Errorf("unsupported coordinator mode %q", in.Mode.modeOrDefault())
+	}
+	successfulCurrentProof := result.FinalSnapshotCurrent &&
+		result.FinalSnapshot != nil &&
+		(result.Converged || result.ParentSafe)
+	if deadlineErr := ctx.Err(); deadlineErr != nil &&
+		in.Objective.orFullDefault() == ConvergenceObjectiveParentSafe &&
+		!successfulCurrentProof {
+		deadlineSummary := formatParentSafetyDeadlineSummary(result.ConvergenceReport)
+		result.Converged = false
+		result.ParentSafe = false
+		result.FinalSnapshot = nil
+		result.FinalSnapshotCurrent = false
+		result.State = ConvergenceStateNonConverged
+		return result, fmt.Errorf("admission parent-safe deadline exceeded: %w; last_report=%s", deadlineErr, deadlineSummary)
 	}
 	var snapshotErr *SnapshotError
 	if errors.As(err, &snapshotErr) && snapshotErr.Class == HierarchyErrorStale {
@@ -288,7 +332,28 @@ func (c TopologyCoordinator) Converge(ctx context.Context, in CoordinatorInput) 
 	return result, err
 }
 
-var coordinatorNow = func() time.Time { return time.Now() }
+func formatParentSafetyDeadlineSummary(report ConvergenceReport) string {
+	parts := []string{
+		fmt.Sprintf("fully_converged=%v", report.FullyConverged),
+		fmt.Sprintf("pending_to_primary=%s", report.PendingToPrimary.String()),
+		fmt.Sprintf("pending_to_reclaim=%s", report.PendingToReclaim.String()),
+		fmt.Sprintf("cleanup_pending_primary=%s", report.CleanupPendingPrimary.String()),
+		fmt.Sprintf("cleanup_pending_reclaim=%s", report.CleanupPendingReclaim.String()),
+		fmt.Sprintf("non_converged_count=%d", len(report.NonConvergedTargets)),
+	}
+	if len(report.NonConvergedTargets) > 0 {
+		limit := len(report.NonConvergedTargets)
+		if limit > 5 {
+			limit = 5
+		}
+		for i := 0; i < limit; i++ {
+			item := report.NonConvergedTargets[i]
+			parts = append(parts, fmt.Sprintf("non_converged[%d]=rel:%s reason:%s observed:%s target:%s observed_mems:%s target_mems:%s",
+				i, item.Rel, item.Reason, item.Observed.String(), item.Target.String(), item.ObservedMems, item.TargetMems))
+		}
+	}
+	return strings.Join(parts, ",")
+}
 
 func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorInput, res *ConvergenceResult, budget *BudgetTracker) (ConvergenceResult, error) {
 	if len(in.CPUDetails) == 0 {
@@ -306,6 +371,9 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 	defer snapshotDriver.Close()
 	round := newCoordinatorRoundWithBudget(in.DAG, in.Cgroup, effectiveTargets, in.CPUDetails, in.ReservedCPUSet, in.DrainSelection, budget)
 	round.dynamicByRel = cloneCPUSetMap(in.ExpectedCPUSetByRel)
+	round.objective = in.Objective.orFullDefault()
+	round.deferredByRel = cloneCPUSetMap(in.DeferredCPUSetByRel)
+	round.admissionBudget = in.AdmissionBudget
 	round.allowEmptyTarget = allowEmptyTarget
 	round.protectedPending = in.ProtectedPendingCPUSet.Clone()
 	round.protectedByRel = cloneCPUSetMap(in.ProtectedCPUSetByRel)
@@ -348,6 +416,7 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 	for {
 		outcome, err := round.executeFixedPointRound(ctx, in.Mems, res)
 		if err != nil {
+			err = prioritizeRoundStalePlanError(outcome, err)
 			if replanRequired(err) {
 				res.Rounds = append(res.Rounds, outcome)
 				if replanBlocked(outcome) {
@@ -364,23 +433,33 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 		if snapshot == nil {
 			return *res, errors.New("TopologyCoordinator.Converge: fixed-point round completed without final snapshot")
 		}
-		report, err := buildConvergenceReport(
+		evaluation, err := evaluateCoordinatorSnapshot(
 			snapshot, in.DAG, effectiveTargets, round.desiredMemsByRel(),
-			round.desiredDomainUnion(), round.allowedCPUs(), snapshotDriver.Capabilities(), allowEmptyTarget,
+			round.desiredDomainUnion(), round.allowedCPUs(),
+			in.ExpectedCPUSetByRel, in.DeferredCPUSetByRel,
+			round.deferredCleanupRels,
+			round.admissionSafetyCPUSet(), snapshotDriver.Capabilities(), allowEmptyTarget,
 		)
 		if err != nil {
 			return *res, err
 		}
-		includeMaterializedDynamicConvergence(
-			&report, snapshot, in.ExpectedCPUSetByRel, snapshotDriver.Capabilities(),
-		)
-		res.ConvergenceReport = report
-		if report.FullyConverged {
+		res.ConvergenceReport = evaluation.Report
+		admissionBudgetExceeded := false
+		if in.Objective.orFullDefault() == ConvergenceObjectiveParentSafe && in.AdmissionBudget != nil {
+			admissionBudgetExceeded = round.admissionBudgetReached(res)
+			if admissionBudgetExceeded && !evaluation.ParentSafety.Safe {
+				return *res, fmt.Errorf("admission convergence budget exhausted before parent-safe proof")
+			}
+		}
+		parentSafeDeferred := in.Objective.orFullDefault() == ConvergenceObjectiveParentSafe &&
+			evaluation.ParentSafety.Safe && !evaluation.Report.FullyConverged
+		if evaluation.Report.FullyConverged || parentSafeDeferred {
 			fresh, err := round.nextSnapshot(ctx)
 			if err != nil {
 				return *res, err
 			}
-			if !publishRelevantSnapshotsEqual(in.DAG, in.ExpectedCPUSetByRel, snapshot, fresh) {
+			publishExpected := mergeCPUSetMaps(in.ExpectedCPUSetByRel, in.DeferredCPUSetByRel)
+			if !publishRelevantSnapshotsEqual(in.DAG, publishExpected, snapshot, fresh) {
 				staleErr := &PlanStaleError{
 					Rel: "controlled", Direction: WriteDirection("publish"), Resource: "final_snapshot",
 					Current: snapshotLogicalState(fresh), Target: snapshotLogicalState(snapshot),
@@ -398,34 +477,94 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 				res.State = ConvergenceStateNonConverged
 				continue
 			}
+			freshEvaluation, err := evaluateCoordinatorSnapshot(
+				fresh, in.DAG, effectiveTargets, round.desiredMemsByRel(),
+				round.desiredDomainUnion(), round.allowedCPUs(),
+				in.ExpectedCPUSetByRel, in.DeferredCPUSetByRel,
+				round.deferredCleanupRels,
+				round.admissionSafetyCPUSet(), snapshotDriver.Capabilities(), allowEmptyTarget,
+			)
+			if err != nil {
+				return *res, err
+			}
+			res.ConvergenceReport = freshEvaluation.Report
+			admissionBudgetExceeded = round.admissionBudgetReached(res)
+			if admissionBudgetExceeded && !freshEvaluation.ParentSafety.Safe {
+				return *res, fmt.Errorf("admission convergence budget exhausted before fresh parent-safe proof")
+			}
+			parentSafeDeferred = in.Objective.orFullDefault() == ConvergenceObjectiveParentSafe &&
+				freshEvaluation.ParentSafety.Safe &&
+				!freshEvaluation.Report.FullyConverged
+			if !freshEvaluation.Report.FullyConverged && !parentSafeDeferred {
+				staleErr := &PlanStaleError{
+					Rel: "controlled", Direction: WriteDirection("publish"), Resource: "fresh_convergence_proof",
+					Current: snapshotLogicalState(fresh), Target: snapshotLogicalState(snapshot),
+					Err: fmt.Errorf("fresh snapshot no longer satisfies the convergence objective"),
+				}
+				outcome.Status = RoundStatusStale
+				outcome.Snapshot = fresh
+				outcome.Blocker = staleErr
+				res.Rounds[len(res.Rounds)-1] = outcome
+				round.pendingSnapshot = fresh
+				if replanBlocked(outcome) {
+					res.State = ConvergenceStateBlocked
+					return *res, &CoordinatorBlockedError{Blocker: staleErr}
+				}
+				res.State = ConvergenceStateNonConverged
+				continue
+			}
+			if err := ctx.Err(); err != nil {
+				return *res, err
+			}
 			res.Converged = true
 			res.State = ConvergenceStateConverged
+			if parentSafeDeferred {
+				res.Converged = false
+				res.ParentSafe = true
+				res.State = ConvergenceStateParentSafeLeafDeferred
+				res.DeferredLeafCount = len(in.DeferredCPUSetByRel)
+				for _, cpus := range in.DeferredCPUSetByRel {
+					res.DeferredCPUCount += cpus.Size()
+				}
+			}
 			outcome.Status = RoundStatusConverged
 			outcome.Snapshot = fresh
 			res.Rounds[len(res.Rounds)-1] = outcome
 			res.FinalSnapshot = fresh
 			res.FinalSnapshotCurrent = true
-			if in.PublishFinalSnapshot != nil {
-				if err := in.PublishFinalSnapshot(fresh); err != nil {
-					res.FinalSnapshotCurrent = false
-					res.FinalSnapshot = nil
-					res.Converged = false
-					if replanRequired(err) {
-						outcome.Status = RoundStatusStale
-						outcome.Snapshot = fresh
-						outcome.Blocker = err
-						res.Rounds[len(res.Rounds)-1] = outcome
-						round.pendingSnapshot = fresh
-						round.dynamicByRel = cloneCPUSetMap(in.ExpectedCPUSetByRel)
-						if replanBlocked(outcome) {
-							res.State = ConvergenceStateBlocked
-							return *res, &CoordinatorBlockedError{Blocker: err}
-						}
-						res.State = ConvergenceStateNonConverged
-						continue
+			publish := func() error {
+				if parentSafeDeferred && in.PublishParentSafeSnapshot != nil {
+					deferredCleanupRels := make(map[string]struct{}, len(round.deferredCleanupRels))
+					for rel := range round.deferredCleanupRels {
+						deferredCleanupRels[rel] = struct{}{}
 					}
-					return *res, err
+					return in.PublishParentSafeSnapshot(fresh, deferredCleanupRels)
 				}
+				if in.PublishFinalSnapshot != nil {
+					return in.PublishFinalSnapshot(fresh)
+				}
+				return nil
+			}
+			if err := publish(); err != nil {
+				res.FinalSnapshotCurrent = false
+				res.FinalSnapshot = nil
+				res.Converged = false
+				res.ParentSafe = false
+				if replanRequired(err) {
+					outcome.Status = RoundStatusStale
+					outcome.Snapshot = fresh
+					outcome.Blocker = err
+					res.Rounds[len(res.Rounds)-1] = outcome
+					round.pendingSnapshot = fresh
+					round.dynamicByRel = cloneCPUSetMap(in.ExpectedCPUSetByRel)
+					if replanBlocked(outcome) {
+						res.State = ConvergenceStateBlocked
+						return *res, &CoordinatorBlockedError{Blocker: err}
+					}
+					res.State = ConvergenceStateNonConverged
+					continue
+				}
+				return *res, err
 			}
 			return *res, nil
 		}
@@ -436,7 +575,7 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 				res.State = ConvergenceStateBlocked
 				return *res, nil
 			}
-			signature := noWriteBlockedSignature(snapshot, outcome.Witnesses, report)
+			signature := noWriteBlockedSignature(snapshot, outcome.Witnesses, evaluation.Report)
 			if signature == lastNoProgressSignature {
 				repeatedNoProgress++
 			} else {
@@ -455,6 +594,16 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 		res.State = ConvergenceStateNonConverged
 		continue
 	}
+}
+
+func prioritizeRoundStalePlanError(outcome RoundOutcome, err error) error {
+	if err == nil || outcome.Blocker == nil || !replanRequired(outcome.Blocker) {
+		return err
+	}
+	if errors.Is(err, ErrHierarchyIOOperationBudgetExceeded) {
+		return outcome.Blocker
+	}
+	return err
 }
 
 func includeMaterializedDynamicConvergence(
@@ -684,25 +833,28 @@ func newCoordinatorHierarchyDriver(
 }
 
 type coordinatorRound struct {
-	dag              *TopoDAG
-	targetByRel      map[string]machine.CPUSet
-	dynamicByRel     map[string]machine.CPUSet
-	allowEmptyTarget bool
-	protectedPending machine.CPUSet
-	protectedByRel   map[string]machine.CPUSet
-	cpuDetails       machine.CPUDetails
-	reservedCPUs     machine.CPUSet
-	selection        DrainSelectionPolicy
-	snapshotSource   func(context.Context) (*CompleteSnapshot, error)
-	driver           HierarchyDriver
-	budget           *BudgetTracker
-	planID           string
-	witnesses        []ReleaseWitness
-	blocked          map[DomainID]machine.CPUSet
-	finalSnapshot    *CompleteSnapshot
-	pendingSnapshot  *CompleteSnapshot
-	round            int
-	maxRounds        int
+	dag                 *TopoDAG
+	targetByRel         map[string]machine.CPUSet
+	dynamicByRel        map[string]machine.CPUSet
+	deferredByRel       map[string]machine.CPUSet
+	deferredCleanupRels map[string]struct{}
+	objective           ConvergenceObjective
+	admissionBudget     *AdmissionConvergenceBudget
+	allowEmptyTarget    bool
+	protectedPending    machine.CPUSet
+	protectedByRel      map[string]machine.CPUSet
+	cpuDetails          machine.CPUDetails
+	reservedCPUs        machine.CPUSet
+	selection           DrainSelectionPolicy
+	snapshotSource      func(context.Context) (*CompleteSnapshot, error)
+	driver              HierarchyDriver
+	budget              *BudgetTracker
+	planID              string
+	witnesses           []ReleaseWitness
+	blocked             map[DomainID]machine.CPUSet
+	pendingSnapshot     *CompleteSnapshot
+	round               int
+	maxRounds           int
 }
 
 func newCoordinatorRoundWithBudget(
@@ -850,10 +1002,27 @@ func (r *coordinatorRound) buildPlan(ctx context.Context, kind PhaseKind, snapsh
 		ProtectedByRel: r.protectedByRel, CPUDetails: r.cpuDetails,
 		Selection: r.selection, Budget: r.budget,
 	})
+	if err == nil && r.objective == ConvergenceObjectiveParentSafe {
+		required, deferred, splitErr := SplitPlanForAdmission(&plan, AdmissionSafetyInput{
+			ProtectedPendingCPUSet: r.admissionSafetyCPUSet(),
+			DeferredCPUSetByRel:    r.deferredByRel,
+		})
+		if splitErr != nil {
+			return PhasePlan{}, splitErr
+		}
+		for _, operation := range deferred.Operations {
+			r.deferredCleanupRels[operation.Rel] = struct{}{}
+		}
+		plan = *required
+	}
 	if err == nil {
 		r.planID = plan.PlanID
 	}
 	return plan, err
+}
+
+func (r *coordinatorRound) admissionSafetyCPUSet() machine.CPUSet {
+	return r.protectedPending.Clone()
 }
 
 func (r *coordinatorRound) executePlan(ctx context.Context, plan PhasePlan, res *ConvergenceResult) error {
@@ -866,10 +1035,41 @@ func (r *coordinatorRound) executePlan(ctx context.Context, plan PhasePlan, res 
 	if r.budget == nil {
 		return fmt.Errorf("phase writer requires convergence budget")
 	}
+	if err := r.checkAdmissionExecutionBudget(plan, res); err != nil {
+		return err
+	}
 	if err := r.revalidateGrowAuthorization(ctx, plan); err != nil {
 		return err
 	}
 	return newSafeCPUSetWriter(r.driver, r.budget, res).execute(ctx, plan)
+}
+
+func (r *coordinatorRound) admissionBudgetReached(res *ConvergenceResult) bool {
+	if r == nil || r.objective != ConvergenceObjectiveParentSafe || r.admissionBudget == nil {
+		return false
+	}
+	if r.admissionBudget.MaxRequiredWrites > 0 && res != nil &&
+		res.Applied >= r.admissionBudget.MaxRequiredWrites {
+		return true
+	}
+	return false
+}
+
+func (r *coordinatorRound) checkAdmissionExecutionBudget(plan PhasePlan, res *ConvergenceResult) error {
+	if r == nil || r.objective != ConvergenceObjectiveParentSafe ||
+		r.admissionBudget == nil || len(plan.Operations) == 0 {
+		return nil
+	}
+	applied := 0
+	if res != nil {
+		applied = res.Applied
+	}
+	if limit := r.admissionBudget.MaxRequiredWrites; limit > 0 &&
+		applied+len(plan.Operations) > limit {
+		return fmt.Errorf("admission convergence write budget exhausted before safety closure: limit=%d applied=%d required=%d",
+			limit, applied, len(plan.Operations))
+	}
+	return nil
 }
 
 func (r *coordinatorRound) revalidateGrowAuthorization(ctx context.Context, plan PhasePlan) error {
@@ -894,6 +1094,10 @@ func (r *coordinatorRound) revalidateGrowAuthorization(ctx context.Context, plan
 		if err != nil {
 			return err
 		}
+		staleWithFresh := func(stale *PlanStaleError) error {
+			r.pendingSnapshot = fresh
+			return stale
+		}
 		gate, err := NewDomainGate(plan.ConvergenceID, fresh, r.desiredDomainUnion(), r.allowedCPUs(), plan.Witnesses)
 		if err != nil {
 			return err
@@ -902,38 +1106,38 @@ func (r *coordinatorRound) revalidateGrowAuthorization(ctx context.Context, plan
 		for _, operation := range operationsByDomain[domain] {
 			current, ok := fresh.Entries[operation.Rel]
 			if !ok {
-				return &PlanStaleError{
+				return staleWithFresh(&PlanStaleError{
 					Rel: operation.Rel, Direction: operation.Direction, Resource: "authorization",
 					Current: "missing", Target: operation.Target.CPUs.String(),
-				}
+				})
 			}
 			delta := operation.Target.CPUs.Difference(current.CPUs)
 			authorized := fresh.DomainUnion[domain].Union(gate.AllowedEntering(domain))
 			if !delta.IsSubsetOf(authorized) {
-				return &PlanStaleError{
+				return staleWithFresh(&PlanStaleError{
 					Rel: operation.Rel, Direction: operation.Direction, Resource: "authorization",
 					Current: current.CPUs.String(), Target: operation.Target.CPUs.String(),
 					Err: fmt.Errorf("fresh grow delta %s is not authorized for domain %q", delta.String(), domain),
-				}
+				})
 			}
 			if operation.ParentRel != "" {
 				parent, ok := fresh.Entries[operation.ParentRel]
 				if !ok {
-					return &PlanStaleError{
+					return staleWithFresh(&PlanStaleError{
 						Rel: operation.Rel, Direction: operation.Direction, Resource: "parent_cpuset",
 						Current: "missing", Target: operation.Target.CPUs.String(),
-					}
+					})
 				}
 				parentCovers := operation.Target.CPUs.IsSubsetOf(parent.CPUs)
 				if plannedParent, planned := priorGrowTargetByRel[operation.ParentRel]; planned {
 					parentCovers = parentCovers || operation.Target.CPUs.IsSubsetOf(plannedParent)
 				}
 				if !parentCovers {
-					return &PlanStaleError{
+					return staleWithFresh(&PlanStaleError{
 						Rel: operation.Rel, Direction: operation.Direction, Resource: "parent_cpuset",
 						Current: parent.CPUs.String(), Target: operation.Target.CPUs.String(),
 						Err: fmt.Errorf("fresh parent %q cpuset does not cover grow target", operation.ParentRel),
-					}
+					})
 				}
 			}
 			priorGrowTargetByRel[operation.Rel] = operation.Target.CPUs.Clone()
@@ -959,6 +1163,7 @@ func (r *coordinatorRound) executeFixedPointRound(ctx context.Context, defaultMe
 		return RoundOutcome{}, err
 	}
 	r.round++
+	r.deferredCleanupRels = make(map[string]struct{})
 	journalBefore := len(res.Journal)
 	var progressBase, progressSnapshot *CompleteSnapshot
 	var changedRels []string
@@ -1023,7 +1228,6 @@ func (r *coordinatorRound) executeFixedPointRound(ctx context.Context, defaultMe
 	if err != nil {
 		return staleOutcome(err), err
 	}
-	r.finalSnapshot = final
 	r.recomputeBlocked(final)
 	status := RoundStatusProgress
 	if res.Applied == appliedBefore {
@@ -1076,6 +1280,16 @@ func (r *coordinatorRound) executeDrainBatches(
 		plan, err = rebaseDrainPlan(plan, fresh, r.dag, r.budget)
 		if err != nil {
 			return fresh, released, err
+		}
+		if r.objective == ConvergenceObjectiveParentSafe {
+			required, _, splitErr := SplitPlanForAdmission(&plan, AdmissionSafetyInput{
+				ProtectedPendingCPUSet: r.admissionSafetyCPUSet(),
+				DeferredCPUSetByRel:    r.deferredByRel,
+			})
+			if splitErr != nil {
+				return fresh, released, splitErr
+			}
+			plan = *required
 		}
 	}
 	return fresh, released, nil

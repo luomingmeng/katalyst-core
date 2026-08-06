@@ -45,15 +45,25 @@ type HandlerContext struct {
 // manager. AppliedView is publishable only when convergence was verified
 // against the coordinator's still-current final snapshot.
 type TopologyResult struct {
+	Attempted            int
+	Applied              int
+	Skipped              int
+	Failed               int
+	Deferred             int
 	Converged            bool
+	ParentSafe           bool
+	LeafDeferred         bool
+	DeferredLeafCount    int
+	DeferredCPUCount     int
 	FinalSnapshotCurrent bool
+	ConvergenceReport    topology.ConvergenceReport
 	AppliedView          *model.AppliedView
 }
 
 // DAGApplyResult is the Bulkhead-layer result returned by the topology owner.
-// AppliedView is valid only when FullyConverged and FinalSnapshotCurrent are
-// both true. It is derived directly from the coordinator's final snapshot and
-// is the canonical handoff to the manager.
+// AppliedView is valid only when (FullyConverged or ParentSafe) and
+// FinalSnapshotCurrent are both true. It is derived directly from the
+// coordinator's final snapshot and is the canonical handoff to the manager.
 type DAGApplyResult struct {
 	Attempted            int
 	Applied              int
@@ -61,6 +71,9 @@ type DAGApplyResult struct {
 	Failed               int
 	Deferred             int
 	FullyConverged       bool
+	ParentSafe           bool
+	DeferredLeafCount    int
+	DeferredCPUCount     int
 	FinalSnapshotCurrent bool
 	ConvergenceReport    topology.ConvergenceReport
 	AppliedView          *model.AppliedView

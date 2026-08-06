@@ -96,6 +96,51 @@ func TestBulkheadOptionsExposeConvergenceDeadlineAndDeadlockProbeBudget(t *testi
 	require.Equal(t, 123, conf.TopologyConvergenceBudget.MaxDeadlockProbeOperations)
 }
 
+func TestBulkheadOptionsExposeAdmissionBudget(t *testing.T) {
+	t.Parallel()
+
+	options := NewBulkheadOptions()
+	fss := &cliflag.NamedFlagSets{}
+	options.AddFlags(fss)
+	fs := fss.FlagSet("cpu_resource_plugin")
+
+	require.NotNil(t, fs.Lookup("qrm-cpu-bulkhead-admission-leaf-defer"))
+	require.NotNil(t, fs.Lookup("qrm-cpu-bulkhead-admission-max-required-writes"))
+	require.NotNil(t, fs.Lookup("qrm-cpu-bulkhead-admission-safe-duration"))
+	require.NoError(t, fs.Set("qrm-cpu-bulkhead-admission-leaf-defer", "false"))
+	require.NoError(t, fs.Set("qrm-cpu-bulkhead-admission-max-required-writes", "64"))
+	require.NoError(t, fs.Set("qrm-cpu-bulkhead-admission-safe-duration", "750ms"))
+
+	conf := bulkheadconfig.NewBulkheadConfiguration()
+	require.NoError(t, options.ApplyTo(conf))
+	require.False(t, conf.EnableAdmissionLeafDefer)
+	require.Equal(t, 64, conf.AdmissionMaxRequiredWrites)
+	require.Equal(t, 750*time.Millisecond, conf.AdmissionSafeDuration)
+}
+
+func TestBulkheadOptionsRejectInvalidAdmissionBudget(t *testing.T) {
+	t.Parallel()
+
+	options := NewBulkheadOptions()
+	options.AdmissionMaxRequiredWrites = -1
+	require.Error(t, options.ApplyTo(bulkheadconfig.NewBulkheadConfiguration()))
+
+	options = NewBulkheadOptions()
+	options.AdmissionSafeDuration = 0
+	require.Error(t, options.ApplyTo(bulkheadconfig.NewBulkheadConfiguration()))
+}
+
+func TestBulkheadOptionsDefaultDeadlockProbeBudgetUsesAuto(t *testing.T) {
+	t.Parallel()
+
+	options := NewBulkheadOptions()
+	require.Equal(t, 0, options.MaxDeadlockProbeOperations)
+
+	conf := bulkheadconfig.NewBulkheadConfiguration()
+	require.NoError(t, options.ApplyTo(conf))
+	require.Equal(t, 0, conf.TopologyConvergenceBudget.MaxDeadlockProbeOperations)
+}
+
 func TestBulkheadOptionsRejectInvalidConvergenceDeadlineAndProbeBudget(t *testing.T) {
 	t.Parallel()
 
@@ -106,7 +151,6 @@ func TestBulkheadOptionsRejectInvalidConvergenceDeadlineAndProbeBudget(t *testin
 	}{
 		{name: "zero_deadline", deadline: 0, probe: 1},
 		{name: "negative_deadline", deadline: -time.Second, probe: 1},
-		{name: "zero_probe", deadline: time.Second, probe: 0},
 		{name: "negative_probe", deadline: time.Second, probe: -1},
 	} {
 		tc := tc
