@@ -189,6 +189,15 @@ func (b *BudgetTracker) DeadlockProbeLimit() int {
 	return b.limit.MaxDeadlockProbeOperations
 }
 
+func (b *BudgetTracker) AutoDeadlockProbeOperations() bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.limit.AutoDeadlockProbeOperations
+}
+
 func (b *BudgetTracker) Usage() BudgetUsage {
 	b.mu.Lock()
 	defer b.mu.Unlock()

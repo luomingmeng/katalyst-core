@@ -328,6 +328,42 @@ func TestDeadlockAnalysisUnprotectedABCE2EShapeCompletesWithinDefaultBudget(t *t
 	t.Logf("probe stats: %+v", analysis.ProbeStats)
 }
 
+func TestDeadlockAnalysisAutoBudgetAccountsProtectedPendingCPUs(t *testing.T) {
+	baseInput := buildE2EShapeDeadlockInput(t)
+	baseInput.Budget = NewBudgetTracker(DefaultConvergenceBudget())
+	baseAnalysis, err := analyzeV1Deadlock(baseInput)
+	if err != nil {
+		t.Fatalf("analyzeV1Deadlock base pending CPUs: %v", err)
+	}
+
+	input := buildE2EShapeDeadlockInput(t)
+	input.ProtectedPending = replayCPUSet([2]int{0, 38})
+	input.Budget = NewBudgetTracker(DefaultConvergenceBudget())
+
+	analysis, err := analyzeV1Deadlock(input)
+	if err != nil {
+		t.Fatalf("analyzeV1Deadlock with SNB-sized pending CPUs: %v", err)
+	}
+	if analysis.Completeness != ProbeComplete {
+		t.Fatalf("analysis completeness = %s, want %s", analysis.Completeness, ProbeComplete)
+	}
+	if analysis.ProbeStats.ProtectedPendingCPUs != 39 {
+		t.Fatalf("protected pending CPUs = %d, want 39", analysis.ProbeStats.ProtectedPendingCPUs)
+	}
+	if analysis.ProbeStats.ProbeLimit <= 4096 {
+		t.Fatalf("auto probe limit = %d, want greater than fixed default 4096 for pending CPUs",
+			analysis.ProbeStats.ProbeLimit)
+	}
+	if analysis.ProbeStats.ProbeLimit <= baseAnalysis.ProbeStats.ProbeLimit {
+		t.Fatalf("auto probe limit with 39 pending CPUs = %d, want greater than base pending limit %d",
+			analysis.ProbeStats.ProbeLimit, baseAnalysis.ProbeStats.ProbeLimit)
+	}
+	if analysis.ProbeStats.ProbeLimit < analysis.ProbeStats.ProbeOperations {
+		t.Fatalf("auto probe limit = %d below actual operations %d: %+v",
+			analysis.ProbeStats.ProbeLimit, analysis.ProbeStats.ProbeOperations, analysis.ProbeStats)
+	}
+}
+
 func TestDeadlockAnalysisAutoBudgetSupportsMultipleRoundsOnSharedTracker(t *testing.T) {
 	tracker := NewBudgetTracker(DefaultConvergenceBudget())
 	for round := 1; round <= 2; round++ {
@@ -365,6 +401,12 @@ func TestDeadlockAnalysisContextBudgetErrorReportsPhase(t *testing.T) {
 		t.Fatalf("error %q does not contain context phase %q",
 			err, analysis.ProbeStats.ContextPhase)
 	}
+	if !strings.Contains(err.Error(), "protected_pending_cpus=") {
+		t.Fatalf("error %q does not contain protected pending CPU diagnostics", err)
+	}
+	if !strings.Contains(err.Error(), "auto_budget=") {
+		t.Fatalf("error %q does not contain auto budget diagnostics", err)
+	}
 }
 
 func TestDeadlockAnalysisProtectedPreaggregationBudgetErrorReportsPhase(t *testing.T) {
@@ -381,6 +423,36 @@ func TestDeadlockAnalysisProtectedPreaggregationBudgetErrorReportsPhase(t *testi
 	}
 	if analysis.ProbeStats.ContextOperations != 1 {
 		t.Fatalf("context operations = %d, want 1", analysis.ProbeStats.ContextOperations)
+	}
+}
+
+func TestDeadlockProbeCapacityUpperBoundIncludesProtectedAncestorPreaggregation(t *testing.T) {
+	const protectedLeafCount = 4080
+
+	entries := make(map[string]EntryState, protectedLeafCount+16)
+	rel := "root"
+	entries[rel] = EntryState{}
+	for depth := 0; depth < 15; depth++ {
+		rel = filepath.Join(rel, fmt.Sprintf("level-%02d", depth))
+		entries[rel] = EntryState{}
+	}
+	protectedByRel := make(map[string]machine.CPUSet, protectedLeafCount)
+	for leaf := 0; leaf < protectedLeafCount; leaf++ {
+		leafRel := filepath.Join(rel, fmt.Sprintf("leaf-%04d", leaf))
+		entries[leafRel] = EntryState{}
+		protectedByRel[leafRel] = machine.NewCPUSet(0)
+	}
+	snapshot := planSnapshot(entries, map[DomainID]machine.CPUSet{})
+
+	protectedOperations := protectedAncestorPreaggregationOperations(snapshot, protectedByRel)
+	if protectedOperations <= 60_000 {
+		t.Fatalf("protected preaggregation operations = %d, want a large shared-chain workload", protectedOperations)
+	}
+	upperBound := deadlockProbeCapacityUpperBound(
+		len(snapshot.Entries), len(snapshot.Entries)-1, 2, 0, protectedOperations)
+	if upperBound < protectedOperations {
+		t.Fatalf("auto probe capacity = %d, below protected preaggregation operations %d",
+			upperBound, protectedOperations)
 	}
 }
 
