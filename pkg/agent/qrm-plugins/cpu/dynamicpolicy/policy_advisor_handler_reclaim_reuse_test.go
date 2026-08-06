@@ -26,6 +26,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -73,6 +74,160 @@ func newReclaimReuseTestPolicy(t *testing.T) (*DynamicPolicy, func()) {
 		require.NoError(t, err)
 	}
 	return p, func() { _ = os.RemoveAll(tmpDir) }
+}
+
+func TestSyncReclaimPoolWithAdjustmentCommitOverride(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	newEntries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult:                 machine.NewCPUSet(0, 1),
+				OriginalAllocationResult:         machine.NewCPUSet(0, 1),
+				TopologyAwareAssignments:         map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1)},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1)},
+			},
+		},
+	}
+	override := &cpusetutil.CPUSetAdjustmentCommitOverride{
+		ReclaimEffective: machine.NewCPUSet(2, 3),
+		Source:           "cpuset_topology",
+	}
+
+	err := p.syncReclaimPoolWithAdjustmentCommitOverride(newEntries, override)
+	require.NoError(t, err)
+
+	got := newEntries[commonstate.PoolNameReclaim][commonstate.FakedContainerName]
+	require.True(t, got.AllocationResult.Equals(machine.NewCPUSet(2, 3)))
+	require.True(t, got.OriginalAllocationResult.Equals(machine.NewCPUSet(2, 3)))
+	require.NotEmpty(t, got.TopologyAwareAssignments)
+	require.NotEmpty(t, got.OriginalTopologyAwareAssignments)
+}
+
+func TestSyncReclaimPoolWithAdjustmentCommitOverrideNoopWhenEmpty(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	newEntries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult:         machine.NewCPUSet(0, 1),
+				OriginalAllocationResult: machine.NewCPUSet(0, 1),
+			},
+		},
+	}
+
+	err := p.syncReclaimPoolWithAdjustmentCommitOverride(newEntries, &cpusetutil.CPUSetAdjustmentCommitOverride{})
+	require.NoError(t, err)
+
+	got := newEntries[commonstate.PoolNameReclaim][commonstate.FakedContainerName]
+	require.True(t, got.AllocationResult.Equals(machine.NewCPUSet(0, 1)))
+	require.True(t, got.OriginalAllocationResult.Equals(machine.NewCPUSet(0, 1)))
+}
+
+func TestBuildAdjustmentCommitOverrideFromPodEntriesRemovesReclaimNonReclaimOverlap(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	newEntries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult:         machine.NewCPUSet(0, 1, 2, 3),
+				OriginalAllocationResult: machine.NewCPUSet(0, 1, 2, 3),
+			},
+		},
+		commonstate.PoolNameShare: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+				AllocationResult:         machine.NewCPUSet(0, 1),
+				OriginalAllocationResult: machine.NewCPUSet(0, 1),
+			},
+		},
+	}
+
+	override, err := p.buildAdjustmentCommitOverrideFromPodEntries(newEntries, false)
+	require.NoError(t, err)
+	require.Equal(t, "advisor_pending_entries", override.Source)
+	require.True(t, override.ReclaimEffective.Equals(machine.NewCPUSet(2, 3)))
+}
+
+func TestBuildAdjustmentCommitOverrideFromPodEntriesSkipsWhenResponseAllowsOverlap(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+
+	newEntries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult:         machine.NewCPUSet(0, 1, 2, 3),
+				OriginalAllocationResult: machine.NewCPUSet(0, 1, 2, 3),
+			},
+		},
+		commonstate.PoolNameShare: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+				AllocationResult:         machine.NewCPUSet(0, 1),
+				OriginalAllocationResult: machine.NewCPUSet(0, 1),
+			},
+		},
+	}
+
+	// The advisor response mode is the source of truth for the pending
+	// transaction. A stale checkpoint value must not clip reclaim in overlap
+	// mode before CommitAdvisorState persists the new mode.
+	override, err := p.buildAdjustmentCommitOverrideFromPodEntries(newEntries, true)
+	require.NoError(t, err)
+	require.Nil(t, override)
+}
+
+func TestBuildAdjustmentCommitOverrideFromPodEntriesHandlesDirectContainerOverlap(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	newEntries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult:         machine.NewCPUSet(0, 1, 2, 3),
+				OriginalAllocationResult: machine.NewCPUSet(0, 1, 2, 3),
+			},
+		},
+		"pod-dedicated": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-dedicated",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameDedicated,
+					QoSLevel:      "dedicated_cores",
+				},
+				AllocationResult: machine.NewCPUSet(0, 1),
+			},
+		},
+	}
+
+	// A pending non-overlap transaction may contain stale reclaim raw CPUs that
+	// overlap newly allocated non-reclaim containers. The commit override must
+	// use the same pending partition view to make reclaim consistent before
+	// pre-commit validation runs.
+	override, err := p.buildAdjustmentCommitOverrideFromPodEntries(newEntries, false)
+	require.NoError(t, err)
+	require.Equal(t, "advisor_pending_entries", override.Source)
+	require.True(t, override.ReclaimEffective.Equals(machine.NewCPUSet(2, 3)))
 }
 
 // TestGenerateReclaimBlockCPUSet_InPlaceReuse verifies that when the previous

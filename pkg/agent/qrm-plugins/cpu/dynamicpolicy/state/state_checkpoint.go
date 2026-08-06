@@ -190,6 +190,13 @@ func (sc *stateCheckpoint) GetPodEntries() PodEntries {
 	return sc.cache.GetPodEntries()
 }
 
+func (sc *stateCheckpoint) GetRevision() uint64 {
+	sc.RLock()
+	defer sc.RUnlock()
+
+	return sc.cache.GetRevision()
+}
+
 func (sc *stateCheckpoint) SetMachineState(numaNodeMap NUMANodeMap, persist bool) {
 	sc.Lock()
 	defer sc.Unlock()

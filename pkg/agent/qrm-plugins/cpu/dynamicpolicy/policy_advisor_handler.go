@@ -42,9 +42,11 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/advisorsvc"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
+	bulkheadutils "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/calculator"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	cpuutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/util"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation"
@@ -1735,6 +1737,13 @@ func (p *DynamicPolicy) applyBlocks(
 	if err := p.invokeAllocationHooksForPodEntries(curEntries, newEntries); err != nil {
 		return err
 	}
+	commitOverride, err := p.buildAdjustmentCommitOverrideFromPodEntries(newEntries, allowSharedCoresOverlapReclaimedCores)
+	if err != nil {
+		return fmt.Errorf("build adjustment commit override from pod entries failed with error: %w", err)
+	}
+	if err := p.syncReclaimPoolWithAdjustmentCommitOverride(newEntries, commitOverride); err != nil {
+		return fmt.Errorf("sync reclaim pool with adjustment commit override failed with error: %w", err)
+	}
 
 	// use pod entries generated above to generate machine state info, and store in local state
 	newMachineState, err := generateMachineStateFromPodEntries(p.machineInfo.CPUTopology, newEntries, p.state.GetMachineState())
@@ -1755,6 +1764,83 @@ func (p *DynamicPolicy) applyBlocks(
 		resp.DisableDedicatedCoresOverlapReclaimedCores,
 		true,
 	)
+}
+
+func (p *DynamicPolicy) syncReclaimPoolWithBulkheadAppliedView(newEntries state.PodEntries, previous machine.CPUSet) error {
+	if p.bulkheadManager == nil {
+		return nil
+	}
+	reclaim := p.bulkheadManager.LatestAppliedReclaim()
+	if reclaim.IsEmpty() || reclaim.Equals(previous) {
+		return nil
+	}
+	reclaimEntry, ok := newEntries[commonstate.PoolNameReclaim][commonstate.FakedContainerName]
+	if !ok || reclaimEntry == nil {
+		return nil
+	}
+	assignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, reclaim)
+	if err != nil {
+		return err
+	}
+	reclaimEntry.AllocationResult = reclaim.Clone()
+	reclaimEntry.OriginalAllocationResult = reclaim.Clone()
+	reclaimEntry.TopologyAwareAssignments = assignments
+	reclaimEntry.OriginalTopologyAwareAssignments = machine.DeepcopyCPUAssignment(assignments)
+	return nil
+}
+
+func (p *DynamicPolicy) buildAdjustmentCommitOverrideFromPodEntries(
+	newEntries state.PodEntries,
+	allowSharedCoresOverlapReclaimedCores bool,
+) (*cpusetutil.CPUSetAdjustmentCommitOverride, error) {
+	if p == nil || p.machineInfo == nil || p.machineInfo.CPUTopology == nil || len(newEntries) == 0 {
+		return nil, nil
+	}
+	if allowSharedCoresOverlapReclaimedCores {
+		return nil, nil
+	}
+	snapshot := newCPUSetAdjustmentStateSnapshot(p.state)
+	if snapshot == nil {
+		return nil, nil
+	}
+	snapshot.podEntries = newEntries.Clone()
+	// The advisor response mode is the pending transaction's source of truth.
+	// The checkpoint may still hold the previous mode until CommitAdvisorState
+	// persists pod entries, machine state, and the mode atomically.
+	snapshot.allowOverlap = allowSharedCoresOverlapReclaimedCores
+	view, err := bulkheadutils.BuildValidatedCPUSetPartitionView(snapshot, p.machineInfo.CPUTopology, bulkheadutils.CPUSetPartitionViewOptions{})
+	if err != nil {
+		return nil, err
+	}
+	if view == nil || view.ReclaimEffective.IsEmpty() {
+		return nil, nil
+	}
+	return &cpusetutil.CPUSetAdjustmentCommitOverride{
+		ReclaimEffective: view.ReclaimEffective.Clone(),
+		Source:           "advisor_pending_entries",
+	}, nil
+}
+
+func (p *DynamicPolicy) syncReclaimPoolWithAdjustmentCommitOverride(newEntries state.PodEntries, override *cpusetutil.CPUSetAdjustmentCommitOverride) error {
+	if override == nil || override.ReclaimEffective.IsEmpty() {
+		return nil
+	}
+	reclaimEntry, ok := newEntries[commonstate.PoolNameReclaim][commonstate.FakedContainerName]
+	if !ok || reclaimEntry == nil {
+		return nil
+	}
+	assignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, override.ReclaimEffective)
+	if err != nil {
+		return err
+	}
+	reclaim := override.ReclaimEffective.Clone()
+	reclaimEntry.AllocationResult = reclaim
+	reclaimEntry.OriginalAllocationResult = reclaim.Clone()
+	reclaimEntry.TopologyAwareAssignments = assignments
+	reclaimEntry.OriginalTopologyAwareAssignments = machine.DeepcopyCPUAssignment(assignments)
+	general.Infof("bulkhead: synced reclaim pool with adjustment commit override, source=%s reclaim=%s",
+		override.Source, reclaim.String())
+	return nil
 }
 
 func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommit(

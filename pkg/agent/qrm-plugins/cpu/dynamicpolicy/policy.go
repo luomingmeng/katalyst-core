@@ -61,6 +61,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic/crd"
 	"github.com/kubewharf/katalyst-core/pkg/config/generic"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
+	podmeta "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/resourcepackage"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
@@ -117,14 +118,22 @@ type DynamicPolicy struct {
 	advisorMonitor     *timemonitor.TimeMonitor
 	featureGateManager featuregatenegotiation.FeatureGateManager
 
-	state                       state.State
-	residualHitMap              map[string]int64
-	allocationHandlers          map[string]util.AllocationHandler
-	hintHandlers                map[string]util.HintHandler
-	allocationHooks             []AllocationHook
-	cpuSetAdjustmentHandlers    map[string]cpusetutil.CPUSetAdjustmentHandler
-	cpuSetAdjustmentExecutionMu sync.Mutex
-	cpuSetAdjustmentGeneration  uint64
+	state                         state.State
+	residualHitMap                map[string]int64
+	allocationHandlers            map[string]util.AllocationHandler
+	hintHandlers                  map[string]util.HintHandler
+	allocationHooks               []AllocationHook
+	cpuSetAdjustmentHandlers      map[string]cpusetutil.CPUSetAdjustmentHandler
+	cpuSetAdjustmentExecution     chan struct{}
+	cpuSetAdjustmentRetryMu       sync.Mutex
+	cpuSetAdjustmentRetryQueued   bool
+	cpuSetAdjustmentRetryAgain    bool
+	cpuSetAdjustmentRetryDirty    bool
+	cpuSetAdjustmentRetryReasons  map[cpusetutil.CPUSetAdjustmentRetryReason]struct{}
+	cpuSetAdjustmentRetryStopCh   <-chan struct{}
+	cpuSetAdjustmentRetryStopping bool
+	cpuSetAdjustmentRetryWG       sync.WaitGroup
+	cpuSetAdjustmentGeneration    uint64
 
 	cpuPressureEviction       agent.Component
 	cpuPressureEvictionCancel context.CancelFunc
@@ -375,6 +384,38 @@ func (p *DynamicPolicy) ResourceName() string {
 	return string(v1.ResourceCPU)
 }
 
+func (p *DynamicPolicy) startKubeletPodCacheSyncDrivenCPUSetRetry() {
+	if p.metaServer == nil || p.metaServer.MetaAgent == nil {
+		return
+	}
+	registrar, ok := p.metaServer.PodFetcher.(podmeta.KubeletPodCacheSyncEventRegistrar)
+	if !ok {
+		return
+	}
+	events, unregister := registrar.RegisterKubeletPodCacheSyncListener("dynamic-policy-cpuset-adjustment")
+	if events == nil {
+		unregister()
+		return
+	}
+	stopCh := p.stopCh
+	go func(stop <-chan struct{}) {
+		defer unregister()
+		for {
+			select {
+			case event, ok := <-events:
+				if !ok {
+					return
+				}
+				if event.CgroupCreated {
+					p.handleCgroupCreateEvent()
+				}
+			case <-stop:
+				return
+			}
+		}
+	}(stopCh)
+}
+
 func (p *DynamicPolicy) Start() (err error) {
 	general.Infof("called")
 
@@ -386,6 +427,10 @@ func (p *DynamicPolicy) Start() (err error) {
 	}
 	p.started = true
 	p.stopCh = make(chan struct{})
+	p.cpuSetAdjustmentRetryMu.Lock()
+	p.cpuSetAdjustmentRetryStopCh = p.stopCh
+	p.cpuSetAdjustmentRetryStopping = false
+	p.cpuSetAdjustmentRetryMu.Unlock()
 	p.Unlock()
 
 	defer func() {
@@ -402,6 +447,7 @@ func (p *DynamicPolicy) Start() (err error) {
 	if p.irqTuner != nil {
 		go p.irqTuner.Run(p.stopCh)
 	}
+	p.startKubeletPodCacheSyncDrivenCPUSetRetry()
 
 	go wait.Until(func() {
 		_ = p.emitter.StoreInt64(util.MetricNameHeartBeat, 1, metrics.MetricTypeNameRaw)
@@ -426,7 +472,7 @@ func (p *DynamicPolicy) Start() (err error) {
 	}
 
 	err = periodicalhandler.RegisterPeriodicalHandlerWithHealthz(cpuconsts.SyncBulkhead, general.HealthzCheckStateNotReady,
-		qrm.QRMCPUPluginPeriodicalHandlerGroupName, p.bulkheadManager.RunPeriodicalHandlers, syncBulkheadPeriod, healthCheckTolerationTimes)
+		qrm.QRMCPUPluginPeriodicalHandlerGroupName, p.runBulkheadPeriodicalHandlers, syncBulkheadPeriod, healthCheckTolerationTimes)
 	if err != nil {
 		general.Errorf("start %v failed,err:%v", cpuconsts.SyncBulkhead, err)
 	}
@@ -572,18 +618,20 @@ func (p *DynamicPolicy) Start() (err error) {
 
 func (p *DynamicPolicy) Stop() error {
 	p.Lock()
-	defer func() {
-		p.started = false
-		p.Unlock()
-		general.Infof("stopped")
-	}()
-
 	if !p.started {
 		general.Warningf("already stopped")
+		p.Unlock()
 		return nil
 	}
 
-	close(p.stopCh)
+	p.started = false
+	stopCh := p.stopCh
+	p.cpuSetAdjustmentRetryMu.Lock()
+	p.cpuSetAdjustmentRetryStopping = true
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	close(stopCh)
+	p.Unlock()
+	p.cpuSetAdjustmentRetryWG.Wait()
 
 	if p.cpuPressureEvictionCancel != nil {
 		p.cpuPressureEvictionCancel()
@@ -592,9 +640,12 @@ func (p *DynamicPolicy) Stop() error {
 	periodicalhandler.StopHandlersByGroup(qrm.QRMCPUPluginPeriodicalHandlerGroupName)
 
 	if p.advisorConn != nil {
-		return p.advisorConn.Close()
+		if err := p.advisorConn.Close(); err != nil {
+			return err
+		}
 	}
 
+	general.Infof("stopped")
 	return nil
 }
 
