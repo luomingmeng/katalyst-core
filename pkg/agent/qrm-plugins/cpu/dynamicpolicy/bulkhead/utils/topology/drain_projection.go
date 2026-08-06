@@ -74,10 +74,8 @@ type drainProjectionContext struct {
 	baseChildUnionByRel map[string]machine.CPUSet
 	baseChildCountByRel map[string]map[int]int
 	bucketUpperByRel    map[string]machine.CPUSet
-	finalByRel          map[string]machine.CPUSet
 	affectedRelsByCPU   map[int][]string
 	parentByRel         map[string]string
-	depthByRel          map[string]int
 	ready               bool
 }
 
@@ -116,8 +114,7 @@ func buildDrainProjectionContext(
 			}
 			out.cost++
 			out.protectedOperations++
-			out.protectedDescendantUnionByRel[rel] =
-				out.protectedDescendantUnionByRel[rel].Union(cpus)
+			out.protectedDescendantUnionByRel[rel] = out.protectedDescendantUnionByRel[rel].Union(cpus)
 		}
 	}
 	return out, nil
@@ -174,10 +171,8 @@ func prepareIncrementalDrainProjectionContext(
 	out.baseChildUnionByRel = make(map[string]machine.CPUSet, len(in.Snapshot.Entries))
 	out.baseChildCountByRel = make(map[string]map[int]int, len(in.Snapshot.Entries))
 	out.bucketUpperByRel = make(map[string]machine.CPUSet, len(in.Snapshot.Entries))
-	out.finalByRel = make(map[string]machine.CPUSet, len(in.Snapshot.Entries))
 	out.affectedRelsByCPU = make(map[int][]string)
 	out.parentByRel = input.ParentByRel
-	out.depthByRel = input.DepthByRel
 
 	rels := sortedSnapshotRels(in.Snapshot, input.DepthByRel)
 	frontierRelsByCPU := make(map[int][]string)
@@ -200,8 +195,6 @@ func prepareIncrementalDrainProjectionContext(
 		required = required.Union(out.protectedDescendantUnionByRel[rel])
 		out.staticRequiredByRel[rel] = required
 		relevantTransferCPUs := transferCPUs.Difference(required)
-		out.finalByRel[rel] = finalCPUSetForRel(
-			rel, in.DAG, input.ParentByRel, in.DynamicByRel, in.DesiredByRel)
 		if node != nil && node.Role == TopoNodeRoleReclaimNUMABucket &&
 			!node.Constraint.CPUUpperBound.IsEmpty() {
 			out.bucketUpperByRel[rel] = node.Constraint.CPUUpperBound

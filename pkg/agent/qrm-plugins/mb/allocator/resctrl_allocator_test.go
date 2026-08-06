@@ -46,6 +46,7 @@ func (f *fakeRDTManager) ApplyMBA(clos string, mba map[int]int) error {
 	f.mbaCalls[clos] = mba
 	return f.mbaErr
 }
+
 func (f *fakeRDTManager) RunClosResourceUpdate(_ string, update func() (bool, error)) error {
 	_, err := update()
 	return err
