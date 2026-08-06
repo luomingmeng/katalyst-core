@@ -17,6 +17,7 @@ limitations under the License.
 package utils
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -54,10 +55,32 @@ func (e *ContainerRelPathResolveError) Unwrap() error {
 }
 
 func ResolveContainerRelPath(metaServer *metaserver.MetaServer, podUID, containerName string) (string, error) {
+	return ResolveContainerRelPathWithContext(context.Background(), metaServer, podUID, containerName)
+}
+
+func ResolveContainerRelPathWithContext(
+	ctx context.Context,
+	metaServer *metaserver.MetaServer,
+	podUID, containerName string,
+) (string, error) {
 	if metaServer == nil {
 		return "", fmt.Errorf("nil metaServer")
 	}
-	containerID, err := metaServer.GetContainerID(podUID, containerName)
+	if metaServer.MetaAgent == nil || metaServer.PodFetcher == nil {
+		return "", fmt.Errorf("nil pod fetcher")
+	}
+
+	var (
+		containerID string
+		err         error
+	)
+	if fetcher, ok := metaServer.PodFetcher.(interface {
+		GetContainerIDWithContext(context.Context, string, string) (string, error)
+	}); ok {
+		containerID, err = fetcher.GetContainerIDWithContext(ctx, podUID, containerName)
+	} else {
+		containerID, err = metaServer.GetContainerID(podUID, containerName)
+	}
 	if err != nil {
 		return "", &ContainerRelPathResolveError{Stage: ContainerRelPathResolveStageContainerID, Err: err}
 	}

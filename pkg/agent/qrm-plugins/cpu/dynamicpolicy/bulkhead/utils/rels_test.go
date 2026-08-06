@@ -17,6 +17,7 @@ limitations under the License.
 package utils
 
 import (
+	"context"
 	"errors"
 	"os"
 	"testing"
@@ -24,8 +25,40 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology"
 	bulkheadconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/bulkhead"
+	"github.com/kubewharf/katalyst-core/pkg/metaserver"
+	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent"
+	metapod "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
+
+type contextAwareContainerIDFetcher struct {
+	metapod.PodFetcherStub
+	observed context.Context
+}
+
+func (f *contextAwareContainerIDFetcher) GetContainerIDWithContext(
+	ctx context.Context, _, _ string,
+) (string, error) {
+	f.observed = ctx
+	return "", ctx.Err()
+}
+
+func TestResolveContainerRelPathWithContextPropagatesCancellation(t *testing.T) {
+	t.Parallel()
+
+	fetcher := &contextAwareContainerIDFetcher{}
+	metaServer := &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: fetcher}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := ResolveContainerRelPathWithContext(ctx, metaServer, "pod", "container")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ResolveContainerRelPathWithContext() error = %v, want context canceled", err)
+	}
+	if fetcher.observed != ctx {
+		t.Fatal("ResolveContainerRelPathWithContext() did not pass the caller context to GetContainerIDWithContext")
+	}
+}
 
 func TestCollectActiveRelsIncludesRootPartitionsSiblingsAndPerNUMA(t *testing.T) {
 	t.Parallel()

@@ -51,6 +51,7 @@ func (m *mockResctrlManager) Create(podUID, closID string, createMonGroup bool) 
 	m.createCalls++
 	return m.createErr
 }
+
 func (m *mockResctrlManager) ReconcileClos(state resctrl.ClosReconcileState) error {
 	m.reconcileState = state
 	return nil

@@ -19,6 +19,7 @@ package cpusettopology
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -43,6 +44,62 @@ import (
 	cgcommon "github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
+
+func TestTopologyResultAndDAGApplyResultPreserveExecutionStatistics(t *testing.T) {
+	convergence := topology.ConvergenceResult{
+		Attempted:            11,
+		Applied:              7,
+		Skipped:              2,
+		Failed:               1,
+		Deferred:             1,
+		ParentSafe:           true,
+		DeferredLeafCount:    3,
+		DeferredCPUCount:     5,
+		FinalSnapshotCurrent: true,
+		ConvergenceReport: topology.ConvergenceReport{
+			FullyConverged: false,
+		},
+	}
+	applied := &model.AppliedView{}
+
+	topologyResult := topologyResultFromFinalConvergence(convergence, applied)
+	if topologyResult.Attempted != 11 || topologyResult.Applied != 7 ||
+		topologyResult.Skipped != 2 || topologyResult.Failed != 1 ||
+		topologyResult.Deferred != 1 || topologyResult.DeferredCPUCount != 5 {
+		t.Fatalf("topology result lost execution statistics: %+v", topologyResult)
+	}
+
+	dagResult := dagApplyResultFromTopologyResult(topologyResult)
+	if dagResult.Attempted != 11 || dagResult.Applied != 7 ||
+		dagResult.Skipped != 2 || dagResult.Failed != 1 ||
+		dagResult.Deferred != 1 || dagResult.DeferredCPUCount != 5 ||
+		dagResult.ConvergenceReport.FullyConverged {
+		t.Fatalf("DAG apply result lost execution statistics: %+v", dagResult)
+	}
+}
+
+func TestHandleDeferredLeafRetryByAdjustmentMode(t *testing.T) {
+	t.Parallel()
+
+	scheduled := 0
+	schedule := func(cpusetutil.CPUSetAdjustmentRetryReason) {
+		scheduled++
+	}
+	if err := handleDeferredLeafRetry(cpusetutil.CPUSetAdjustmentModeAdmission, schedule); err != nil {
+		t.Fatalf("admission deferred leaf returned error: %v", err)
+	}
+	if scheduled != 1 {
+		t.Fatalf("admission scheduled retries = %d, want 1", scheduled)
+	}
+
+	scheduled = 0
+	if err := handleDeferredLeafRetry(cpusetutil.CPUSetAdjustmentModeRetry, schedule); err == nil {
+		t.Fatal("retry deferred leaf returned nil, want pending error")
+	}
+	if scheduled != 0 {
+		t.Fatalf("retry mode self-scheduled %d retries, want 0", scheduled)
+	}
+}
 
 func TestAppliedViewFromFinalSnapshotUsesPerRelV2TargetProof(t *testing.T) {
 	dag, err := topology.BuildDAG([]topology.NodeSpec{
@@ -276,6 +333,7 @@ type fakeCgroupClient struct {
 	partitionWrites   map[string]cgcommon.CPUSetPartitionFlag
 	partitionErrByRel map[string]error
 	listErr           error
+	listChildrenHook  func(context.Context, string) ([]string, error)
 	afterApply        func(rel string, data *cgcommon.CPUSetData)
 	readOverride      func(rel string) (machine.CPUSet, bool)
 }
@@ -385,6 +443,206 @@ func (f *fakeCgroupClient) ReadCPUSet(_ context.Context, rel string) (machine.CP
 	return machine.NewCPUSet(), nil
 }
 
+func TestPendingProtectedCPUSetByRelAggregatesAllContainersByPod(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID = "pending-multi-container-pod"
+		podRel = "kubepods/burstable/pod-pending-multi-container"
+	)
+	now := time.Date(2026, time.August, 5, 10, 0, 0, 0, time.UTC)
+	p := &CPUSetTopologyPlugin{
+		cgroup: &fakeCgroupClient{cpus: map[string]machine.CPUSet{
+			podRel: machine.NewCPUSet(0, 1, 2, 3),
+		}},
+		now: func() time.Time { return now },
+		pendingProtections: map[string]pendingPodProtection{
+			podUID: {
+				rel:          podRel,
+				protectUntil: now.Add(defaultPendingPodProtectionTTL),
+			},
+		},
+	}
+
+	got := p.pendingProtectedCPUSetByRel(context.Background(), []pendingContainerCPUSet{
+		{PodUID: podUID, ContainerName: "main", CPUs: machine.NewCPUSet(0, 1)},
+		{PodUID: podUID, ContainerName: "sidecar", CPUs: machine.NewCPUSet(2, 3)},
+	})
+	if protected := got[podRel]; !protected.Equals(machine.NewCPUSet(0, 1, 2, 3)) {
+		t.Fatalf("protected cpuset = %s, want union 0-3", protected.String())
+	}
+}
+
+func TestPendingProtectedCPUSetByRelRenewsExpiredActiveProtection(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID = "pending-after-ttl-pod"
+		podRel = "kubepods/burstable/pod-pending-after-ttl"
+	)
+	now := time.Date(2026, time.August, 5, 10, 0, 0, 0, time.UTC)
+	p := &CPUSetTopologyPlugin{
+		cgroup: &fakeCgroupClient{cpus: map[string]machine.CPUSet{
+			podRel: machine.NewCPUSet(4, 5),
+		}},
+		now: func() time.Time { return now },
+		pendingProtections: map[string]pendingPodProtection{
+			podUID: {
+				rel:          podRel,
+				protectUntil: now,
+			},
+		},
+	}
+
+	got := p.pendingProtectedCPUSetByRel(context.Background(), []pendingContainerCPUSet{
+		{PodUID: podUID, ContainerName: "main", CPUs: machine.NewCPUSet(4, 5)},
+	})
+	if protected := got[podRel]; !protected.Equals(machine.NewCPUSet(4, 5)) {
+		t.Fatalf("protected cpuset after TTL = %s, want 4-5", protected.String())
+	}
+	protection, ok := p.pendingProtections[podUID]
+	if !ok {
+		t.Fatal("active pending pod protection was removed after TTL")
+	}
+	if want := now.Add(defaultPendingPodProtectionTTL); !protection.protectUntil.Equal(want) {
+		t.Fatalf("renewed protectUntil = %s, want %s", protection.protectUntil, want)
+	}
+}
+
+func TestPendingProtectedCPUSetByRelClearsPodNoLongerPending(t *testing.T) {
+	t.Parallel()
+
+	const podUID = "completed-pending-pod"
+	p := &CPUSetTopologyPlugin{
+		pendingProtections: map[string]pendingPodProtection{
+			podUID: {rel: "kubepods/burstable/pod-completed"},
+		},
+	}
+
+	got := p.pendingProtectedCPUSetByRel(context.Background(), nil)
+	if len(got) != 0 {
+		t.Fatalf("protected cpus = %#v, want none", got)
+	}
+	if len(p.pendingProtections) != 0 {
+		t.Fatalf("pending protections = %#v, want cleared", p.pendingProtections)
+	}
+}
+
+func TestDeferredLeafDrainWritesSafeLeafDespiteGlobalMismatch(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 5, 13, 30, 0, 0, time.UTC)
+	const rel = "kubepods/pod-a/container-a"
+	cg := &fakeCgroupClient{cpus: map[string]machine.CPUSet{
+		"kubepods":                machine.NewCPUSet(0, 1, 2, 3),
+		"kubesandbox":             machine.NewCPUSet(4, 5, 6, 7),
+		"kubesandbox/reclaimed-0": machine.NewCPUSet(4, 5),
+		"system":                  machine.NewCPUSet(0, 1, 2, 3, 4, 5), // unrelated global mismatch
+		"kubepods/pod-a":          machine.NewCPUSet(0, 1, 2, 3),
+		rel:                       machine.NewCPUSet(0, 1, 2, 3),
+	}}
+	p := &CPUSetTopologyPlugin{
+		cgroup: cg,
+		now:    func() time.Time { return now },
+		deferredLeafDrains: map[string]deferredLeafDrain{
+			rel: {
+				target:       machine.NewCPUSet(0, 1),
+				firstSeen:    now,
+				lastSeen:     now,
+				protectUntil: now.Add(time.Minute),
+			},
+		},
+	}
+	view := model.NewDesiredView()
+	view.DesiredReclaimEffective = machine.NewCPUSet(4, 5)
+	dag := mustBuildDrainTestDAG(t)
+
+	p.drainSafeDeferredLeaves(context.Background(), view, dag)
+
+	if got := cg.cpus[rel]; !got.Equals(machine.NewCPUSet(0, 1)) {
+		t.Fatalf("leaf cpuset = %s, want exact target 0-1", got.String())
+	}
+	if _, ok := p.deferredLeafDrains[rel]; ok {
+		t.Fatalf("safe leaf drain was not cleared after successful write")
+	}
+}
+
+func TestDeferredLeafDrainSkipsTargetOverlappingActualReclaim(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 5, 13, 30, 0, 0, time.UTC)
+	const rel = "kubepods/pod-a/container-a"
+	cg := &fakeCgroupClient{cpus: map[string]machine.CPUSet{
+		"kubepods":                machine.NewCPUSet(0, 1, 2, 3),
+		"kubepods/pod-a":          machine.NewCPUSet(0, 1, 2, 3),
+		"kubesandbox":             machine.NewCPUSet(1, 4, 5),
+		"kubesandbox/reclaimed-0": machine.NewCPUSet(1, 4, 5),
+		rel:                       machine.NewCPUSet(0, 1, 2, 3),
+	}}
+	p := &CPUSetTopologyPlugin{
+		cgroup: cg,
+		now:    func() time.Time { return now },
+		deferredLeafDrains: map[string]deferredLeafDrain{
+			rel: {
+				target:       machine.NewCPUSet(0, 1),
+				firstSeen:    now,
+				lastSeen:     now,
+				protectUntil: now.Add(time.Minute),
+			},
+		},
+	}
+	view := model.NewDesiredView()
+	view.DesiredReclaimEffective = machine.NewCPUSet(4, 5)
+	dag := mustBuildDrainTestDAG(t)
+
+	p.drainSafeDeferredLeaves(context.Background(), view, dag)
+
+	if got := cg.cpus[rel]; !got.Equals(machine.NewCPUSet(0, 1, 2, 3)) {
+		t.Fatalf("unsafe leaf cpuset was written as %s, want unchanged 0-3", got.String())
+	}
+	if _, ok := p.deferredLeafDrains[rel]; !ok {
+		t.Fatalf("unsafe leaf drain was cleared despite actual reclaim overlap")
+	}
+}
+
+func mustBuildDrainTestDAG(t *testing.T) *topology.TopoDAG {
+	t.Helper()
+	dag, err := topology.BuildDAG([]topology.NodeSpec{
+		{
+			Rel:            "kubepods",
+			Role:           topology.TopoNodeRolePrimary,
+			Domain:         topology.DomainPrimary,
+			CPUs:           machine.NewCPUSet(0, 1, 2, 3),
+			ControlledRoot: true,
+			TrustAnchor:    true,
+		},
+		{
+			Rel:            "kubesandbox",
+			Role:           topology.TopoNodeRoleReclaim,
+			Domain:         topology.DomainReclaim,
+			CPUs:           machine.NewCPUSet(4, 5),
+			ControlledRoot: true,
+			TrustAnchor:    true,
+		},
+		{
+			Rel:       "kubesandbox/reclaimed-0",
+			ParentRel: "kubesandbox",
+			Role:      topology.TopoNodeRoleReclaimNUMABucket,
+			Domain:    topology.DomainReclaim,
+			CPUs:      machine.NewCPUSet(4, 5),
+			Constraint: topology.TopologyConstraint{
+				CPUUpperBound: machine.NewCPUSet(4, 5),
+				Scope:         topology.TopologyScopeNUMANode,
+			},
+			TrustAnchor: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildDAG() error = %v", err)
+	}
+	return dag
+}
+
 func (f *fakeCgroupClient) ApplyCPUSet(_ context.Context, rel string, data *cgcommon.CPUSetData) error {
 	if f.writes == nil {
 		f.writes = map[string]string{}
@@ -420,7 +678,10 @@ func (f *fakeCgroupClient) Prune(active map[string]struct{}) {
 	f.pruned = active
 }
 
-func (f *fakeCgroupClient) ListChildren(_ context.Context, rel string) ([]string, error) {
+func (f *fakeCgroupClient) ListChildren(ctx context.Context, rel string) ([]string, error) {
+	if f.listChildrenHook != nil {
+		return f.listChildrenHook(ctx, rel)
+	}
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
@@ -620,6 +881,26 @@ func TestCPUSetTopologyPluginReportsAppliedViewFromFinalSnapshot(t *testing.T) {
 	}
 }
 
+func TestTopologyResultFromFinalConvergenceDeterminesAppliedViewLevel(t *testing.T) {
+	applied := &model.AppliedView{
+		Level:               model.AppliedViewLevelParentSafe,
+		CPUSetPartitionView: model.NewCPUSetPartitionView(),
+	}
+	result := topologyResultFromFinalConvergence(topology.ConvergenceResult{
+		Converged:            true,
+		ParentSafe:           false,
+		DeferredLeafCount:    0,
+		FinalSnapshotCurrent: true,
+	}, applied)
+
+	if !result.Converged || result.ParentSafe || result.LeafDeferred {
+		t.Fatalf("topology result = %+v, want final fully-converged result to override admission intent", result)
+	}
+	if result.AppliedView == nil || result.AppliedView.Level != model.AppliedViewLevelFull {
+		t.Fatalf("applied view = %+v, want level %q from final convergence", result.AppliedView, model.AppliedViewLevelFull)
+	}
+}
+
 func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t *testing.T) {
 	const (
 		podUID       = "pod-materialized-during-convergence"
@@ -694,6 +975,9 @@ func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t
 				DesiredView: &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
 					NonReclaimPool:   machine.NewCPUSet(0, 1),
 					ReclaimEffective: machine.NewCPUSet(2, 3),
+					ReclaimEffectivePerNUMA: map[int]machine.CPUSet{
+						0: machine.NewCPUSet(2, 3),
+					},
 					ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
 						podUID: {"main": tt.desiredLeaf},
 					},
@@ -1125,6 +1409,91 @@ func TestCPUSetTopologyPluginReturnsSiblingDiscoveryError(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatalf("expected sibling discovery error")
+	}
+}
+
+func TestCPUSetTopologyPluginAdmissionDeadlineStartsBeforeSiblingDiscovery(t *testing.T) {
+	t.Parallel()
+
+	const safeDuration = 250 * time.Millisecond
+	deadlineObserved := false
+	cg := &fakeCgroupClient{
+		existing: map[string]bool{"primary": true, "reclaim": true},
+		listChildrenHook: func(ctx context.Context, _ string) ([]string, error) {
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				return nil, errors.New("admission context has no deadline")
+			}
+			remaining := time.Until(deadline)
+			if remaining <= 0 || remaining > safeDuration {
+				return nil, fmt.Errorf("admission deadline remaining = %s, want within (0, %s]", remaining, safeDuration)
+			}
+			deadlineObserved = true
+			return nil, errors.New("stop after observing admission deadline")
+		},
+	}
+	p := &CPUSetTopologyPlugin{
+		cfg: bulkheadconfig.BulkheadConfiguration{
+			BulkheadPrimaryRelPath:        "primary",
+			BulkheadReclaimRelPaths:       []string{"reclaim"},
+			EnableBulkheadReclaimSiblings: true,
+			EnableAdmissionLeafDefer:      true,
+			AdmissionSafeDuration:         safeDuration,
+		},
+		cgroup: cg,
+	}
+
+	err := p.CPUSetAdjustmentHandler(context.Background(), bulkheadapi.HandlerContext{
+		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+			Mode: cpusetutil.CPUSetAdjustmentModeAdmission,
+		},
+		DesiredView: &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+			NonReclaimPool:   machine.NewCPUSet(0, 1),
+			ReclaimEffective: machine.NewCPUSet(2, 3),
+		}},
+	})
+	if err == nil {
+		t.Fatal("CPUSetAdjustmentHandler() error = nil, want sibling discovery sentinel")
+	}
+	if !deadlineObserved {
+		t.Fatalf("sibling discovery did not receive admission deadline: %v", err)
+	}
+}
+
+func TestCPUSetTopologyPluginAdmissionDeadlineWinsAfterPreCoordinatorStage(t *testing.T) {
+	t.Parallel()
+
+	const safeDuration = 20 * time.Millisecond
+	stageErr := errors.New("late sibling discovery result")
+	cg := &fakeCgroupClient{
+		existing: map[string]bool{"primary": true, "reclaim": true},
+		listChildrenHook: func(ctx context.Context, _ string) ([]string, error) {
+			<-ctx.Done()
+			return nil, stageErr
+		},
+	}
+	p := &CPUSetTopologyPlugin{
+		cfg: bulkheadconfig.BulkheadConfiguration{
+			BulkheadPrimaryRelPath:        "primary",
+			BulkheadReclaimRelPaths:       []string{"reclaim"},
+			EnableBulkheadReclaimSiblings: true,
+			EnableAdmissionLeafDefer:      true,
+			AdmissionSafeDuration:         safeDuration,
+		},
+		cgroup: cg,
+	}
+
+	err := p.CPUSetAdjustmentHandler(context.Background(), bulkheadapi.HandlerContext{
+		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+			Mode: cpusetutil.CPUSetAdjustmentModeAdmission,
+		},
+		DesiredView: &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+			NonReclaimPool:   machine.NewCPUSet(0, 1),
+			ReclaimEffective: machine.NewCPUSet(2, 3),
+		}},
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("CPUSetAdjustmentHandler() error = %v, want admission deadline instead of late stage error %v", err, stageErr)
 	}
 }
 
@@ -1632,6 +2001,92 @@ func TestCPUSetTopologyPluginSkipsExpectedCPUSetForMissingPod(t *testing.T) {
 	}
 }
 
+type admissionContextKey struct{}
+
+type admissionContextContainerIDFetcher struct {
+	metapod.PodFetcherStub
+	wantValue string
+	calls     int
+}
+
+func (f *admissionContextContainerIDFetcher) GetContainerIDWithContext(
+	ctx context.Context, _, _ string,
+) (string, error) {
+	if got := ctx.Value(admissionContextKey{}); got != f.wantValue {
+		return "", fmt.Errorf("container ID lookup context value = %v, want %q", got, f.wantValue)
+	}
+	f.calls++
+	return "context-aware-container", nil
+}
+
+type failingAdmissionContainerIDFetcher struct {
+	metapod.PodFetcherStub
+	err error
+}
+
+func (f *failingAdmissionContainerIDFetcher) GetContainerIDWithContext(
+	context.Context, string, string,
+) (string, error) {
+	return "", f.err
+}
+
+func TestCPUSetTopologyExpectedBuildAndFinalPublishUseAdmissionContext(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID        = "context-aware-pod"
+		containerName = "main"
+		containerRel  = "kubepods/context-aware-pod/context-aware-container"
+		contextValue  = "admission"
+	)
+	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+		Name: "cpuset-topology-admission-context",
+		Handler: func(gotPodUID, gotContainerID string) (string, error) {
+			if gotPodUID == podUID && gotContainerID == "context-aware-container" {
+				return containerRel, nil
+			}
+			return "", errors.New("not the admission context test container")
+		},
+	})
+	fetcher := &admissionContextContainerIDFetcher{wantValue: contextValue}
+	metaServer := &metaserver.MetaServer{
+		MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
+	}
+	desired := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+			podUID: {containerName: machine.NewCPUSet(0, 1)},
+		},
+	}}
+	ctx := context.WithValue(context.Background(), admissionContextKey{}, contextValue)
+
+	p := &CPUSetTopologyPlugin{}
+	expected, err := p.buildExpectedCPUSetByRel(ctx, bulkheadapi.HandlerContext{
+		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{MetaServer: metaServer},
+		DesiredView:                desired,
+	})
+	if err != nil {
+		t.Fatalf("buildExpectedCPUSetByRel() error = %v", err)
+	}
+	if got := expected.ExpectedByRel[containerRel].String(); got != "0-1" {
+		t.Fatalf("expected cpuset = %q, want 0-1", got)
+	}
+
+	snapshot := &topology.CompleteSnapshot{Entries: map[string]topology.EntryState{
+		containerRel: {Identity: topology.CgroupIdentity{Inode: 1}, CPUs: machine.NewCPUSet(0, 1)},
+	}}
+	published, err := containerCPUSetByPodFromFinalSnapshotWithContext(
+		ctx, metaServer, desired, snapshot, expected.ExpectedByRel)
+	if err != nil {
+		t.Fatalf("containerCPUSetByPodFromFinalSnapshotWithContext() error = %v", err)
+	}
+	if got := published[podUID][containerName].String(); got != "0-1" {
+		t.Fatalf("published cpuset = %q, want 0-1", got)
+	}
+	if fetcher.calls != 2 {
+		t.Fatalf("context-aware container ID lookup calls = %d, want 2", fetcher.calls)
+	}
+}
+
 func TestCPUSetTopologyPluginSkipsExpectedCPUSetForMissingContainer(t *testing.T) {
 	t.Parallel()
 
@@ -1665,6 +2120,32 @@ func TestCPUSetTopologyPluginSkipsExpectedCPUSetForMissingContainer(t *testing.T
 	}
 	if len(res.PendingByPod) != 1 {
 		t.Fatalf("expected one protected-pending entry, got %#v", res.PendingByPod)
+	}
+}
+
+func TestCPUSetTopologyPluginFailsExpectedCPUSetForContainerIDDeadline(t *testing.T) {
+	t.Parallel()
+
+	p := &CPUSetTopologyPlugin{}
+	metaServer := &metaserver.MetaServer{
+		MetaAgent: &agent.MetaAgent{
+			PodFetcher: &failingAdmissionContainerIDFetcher{err: context.DeadlineExceeded},
+		},
+	}
+	view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+			"pod-1": {
+				"main": machine.NewCPUSet(0, 1),
+			},
+		},
+	}}
+
+	res, err := p.buildExpectedCPUSetByRel(context.Background(), bulkheadapi.HandlerContext{
+		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{MetaServer: metaServer},
+		DesiredView:                view,
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("container ID deadline must fail-closed, got res=%#v err=%v", res, err)
 	}
 }
 

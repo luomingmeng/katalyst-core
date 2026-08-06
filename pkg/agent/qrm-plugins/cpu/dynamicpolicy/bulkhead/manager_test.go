@@ -248,6 +248,42 @@ func TestManagerApplyRequiresFullyConvergedTopologyBeforeDependents(t *testing.T
 	}
 }
 
+func TestManagerApplyAcceptsParentSafeTopologyWithoutRunningDependents(t *testing.T) {
+	t.Parallel()
+
+	applied := &model.AppliedView{
+		Level: model.AppliedViewLevelParentSafe,
+		CPUSetPartitionView: model.CPUSetPartitionView{
+			ReclaimEffective: machine.NewCPUSet(2, 3),
+		},
+	}
+	topologyPlugin := &fakeTopologyPlugin{
+		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
+		result: bulkheadapi.DAGApplyResult{
+			ParentSafe:           true,
+			DeferredLeafCount:    1,
+			FinalSnapshotCurrent: true,
+			AppliedView:          applied,
+		},
+	}
+	dependent := &fakePlugin{name: "workqueue", enabled: true}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, dependent}}
+
+	got, err := m.Apply(context.Background(), enabledCPUSetAdjustmentCtx())
+	if err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if !got.Equals(machine.NewCPUSet(2, 3)) {
+		t.Fatalf("Apply() reclaim = %s, want 2-3", got.String())
+	}
+	if len(dependent.adjustViews) != 0 {
+		t.Fatalf("dependent calls = %d, want none for parent-safe view", len(dependent.adjustViews))
+	}
+	if m.appliedViewValidForPeriodical {
+		t.Fatal("parent-safe view must not authorize periodical leaf-dependent plugins")
+	}
+}
+
 func TestManagerApplyAcceptsExactEmptyNUMABucketBeforePluginWrites(t *testing.T) {
 	t.Parallel()
 

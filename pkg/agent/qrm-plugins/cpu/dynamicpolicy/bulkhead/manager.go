@@ -128,7 +128,16 @@ func (m *Manager) RunCPUSetAdjustmentHandlers(ctx context.Context, in cpusetutil
 
 // Apply converges topology before running partition-dependent plugins and
 // returns the reclaim CPUSet verified by the topology layer's final snapshot.
-func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) (machine.CPUSet, error) {
+func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) (out machine.CPUSet, err error) {
+	start := time.Now()
+	var topologyAppliedLog bool
+	var topologyPublishedLog bool
+	var anyAdjustedLog bool
+	defer func() {
+		general.Infof("bulkhead: manager apply finished duration=%s err=%v any_adjusted=%t topology_applied=%t topology_published=%t generation=%d",
+			time.Since(start), err, anyAdjustedLog, topologyAppliedLog, topologyPublishedLog, in.Generation)
+	}()
+
 	if err := m.mu.Lock(ctx); err != nil {
 		return machine.NewCPUSet(), fmt.Errorf("acquire bulkhead manager lock: %w", err)
 	}
@@ -223,7 +232,8 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 				emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", p.Name(), "failed", err.Error())
 				return empty, fmt.Errorf("bulkhead plugin %q cpuset adjustment failed: %w", p.Name(), err)
 			}
-			if !result.FullyConverged || !result.FinalSnapshotCurrent || result.AppliedView == nil {
+			successfulTopology := result.FullyConverged || result.ParentSafe
+			if !successfulTopology || !result.FinalSnapshotCurrent || result.AppliedView == nil {
 				nonConverged := &NonConvergedError{Result: result}
 				emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", p.Name(), "failed", nonConverged.Error())
 				return empty, nonConverged
@@ -258,6 +268,11 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 			topologyPublished = true
 			anyAdjusted = true
 			emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", p.Name(), "success", "")
+			if result.ParentSafe {
+				// A parent-safe view proves partition/reclaim safety only. Do not
+				// authorize dependent plugins that may require exact leaf state.
+				topologyStopped = true
+			}
 			continue
 		}
 		err := p.CPUSetAdjustmentHandler(ctx, handlerCtx)
@@ -281,7 +296,7 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 		if !commitIfGenerationCurrent(in, func() {
 			m.appliedView = handlerCtx.AppliedView.DeepCopy()
 			m.appliedViewRevision = handlerCtx.AppliedViewRevision
-			m.appliedViewValidForPeriodical = true
+			m.appliedViewValidForPeriodical = topologyResult.FullyConverged
 			m.publishLatestAppliedReclaim(verifiedReclaim)
 			m.lastCPUSetAdjustmentEnabled = currentEnabled
 		}) {
@@ -300,11 +315,24 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 	}
 	emitBulkheadViewChanged(handlerCtx.Emitter, anyAdjusted)
 	if topologyApplied {
+		if handlerCtx.CommitOverride != nil && !verifiedReclaim.IsEmpty() {
+			handlerCtx.CommitOverride.ReclaimEffective = verifiedReclaim.Clone()
+			handlerCtx.CommitOverride.Source = "cpuset_topology"
+		}
+		topologyAppliedLog = true
+		topologyPublishedLog = topologyPublished
+		anyAdjustedLog = anyAdjusted
 		return verifiedReclaim.Clone(), nil
 	}
 	if topologyPublished && m.appliedView != nil {
+		topologyAppliedLog = topologyApplied
+		topologyPublishedLog = topologyPublished
+		anyAdjustedLog = anyAdjusted
 		return m.appliedView.ReclaimEffective.Clone(), nil
 	}
+	topologyAppliedLog = topologyApplied
+	topologyPublishedLog = topologyPublished
+	anyAdjustedLog = anyAdjusted
 	return empty, nil
 }
 
