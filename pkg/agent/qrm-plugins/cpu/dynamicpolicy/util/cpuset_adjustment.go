@@ -29,6 +29,30 @@ import (
 
 type CPUSetAdjustmentHandler func(context.Context, CPUSetAdjustmentHandlerCtx) error
 
+type CPUSetAdjustmentMode string
+
+const (
+	CPUSetAdjustmentModeAdmission CPUSetAdjustmentMode = "admission"
+	CPUSetAdjustmentModePeriodic  CPUSetAdjustmentMode = "periodic"
+	CPUSetAdjustmentModeRetry     CPUSetAdjustmentMode = "retry"
+)
+
+type CPUSetAdjustmentRetryReason string
+
+const (
+	RetryReasonStaleState    CPUSetAdjustmentRetryReason = "stale_state"
+	RetryReasonDeferredLeaf  CPUSetAdjustmentRetryReason = "deferred_leaf"
+	RetryReasonOwnershipLost CPUSetAdjustmentRetryReason = "ownership_lost"
+	RetryReasonRestoreFailed CPUSetAdjustmentRetryReason = "restore_failed"
+)
+
+func (m CPUSetAdjustmentMode) OrFullDefault() CPUSetAdjustmentMode {
+	if m == "" {
+		return CPUSetAdjustmentModePeriodic
+	}
+	return m
+}
+
 type CPUSetAdjustmentHandlerCtx struct {
 	CoreConf                  *config.Configuration
 	DynamicConf               *dynamicconfig.Configuration
@@ -38,4 +62,16 @@ type CPUSetAdjustmentHandlerCtx struct {
 	Topology                  *machine.CPUTopology
 	Generation                uint64
 	CommitIfGenerationCurrent func(generation uint64, commit func()) bool
+	// Mode is fail-safe: an unset mode is interpreted as Periodic/full
+	// convergence by consumers and never enables admission-only relaxation.
+	Mode              CPUSetAdjustmentMode
+	ScheduleFullRetry func(CPUSetAdjustmentRetryReason)
+	// CommitOverride carries topology-safe commit inputs produced by adjustment handlers.
+	// Callers consume it before committing advisor state.
+	CommitOverride *CPUSetAdjustmentCommitOverride
+}
+
+type CPUSetAdjustmentCommitOverride struct {
+	ReclaimEffective machine.CPUSet
+	Source           string
 }

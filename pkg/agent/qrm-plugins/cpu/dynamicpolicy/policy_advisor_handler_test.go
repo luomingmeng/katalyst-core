@@ -601,7 +601,7 @@ func TestDynamicPolicy_checkAndApplySubCgroupPath(t *testing.T) {
 	})
 }
 
-func TestDynamicPolicyApplyBlocksRejectsReclaimDedicatedOverlapBeforeCommit(t *testing.T) {
+func TestDynamicPolicyApplyBlocksOverridesReclaimDedicatedOverlapBeforeCommit(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
@@ -672,15 +672,14 @@ func TestDynamicPolicyApplyBlocksRejectsReclaimDedicatedOverlapBeforeCommit(t *t
 	}
 
 	err = policy.applyBlocks(blockCPUSet, resp, resp.AllowSharedCoresOverlapReclaimedCores)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "overlap")
+	require.NoError(t, err)
 
-	unchanged := policy.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
-	require.NotNil(t, unchanged)
-	require.True(t, unchanged.AllocationResult.Equals(machine.NewCPUSet(3, 6)),
-		"applyBlocks must keep old state when pre-commit partition validation fails")
-	require.True(t, policy.state.GetAllowSharedCoresOverlapReclaimedCores(),
-		"applyBlocks must keep the old overlap mode when pre-commit validation fails")
+	reclaimPool := policy.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	require.NotNil(t, reclaimPool)
+	require.True(t, reclaimPool.AllocationResult.Equals(machine.NewCPUSet(0)),
+		"applyBlocks must commit the pending non-overlap reclaim effective set")
+	require.False(t, policy.state.GetAllowSharedCoresOverlapReclaimedCores(),
+		"applyBlocks must commit the pending overlap mode with pod and machine state")
 
 	policy.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
 	resp.AllowSharedCoresOverlapReclaimedCores = true

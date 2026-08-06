@@ -774,6 +774,7 @@ type cpuPluginStateData struct {
 	numaHeadroom                               map[int]float64
 	allowSharedCoresOverlapReclaimedCores      bool
 	disableDedicatedCoresOverlapReclaimedCores bool
+	revision                                   uint64
 }
 
 // Clone deep-copies every field of cpuPluginStateData. The caller receives a
@@ -789,6 +790,7 @@ func (d *cpuPluginStateData) Clone() cpuPluginStateData {
 		numaHeadroom:                          general.DeepCopyIntToFloat64Map(d.numaHeadroom),
 		allowSharedCoresOverlapReclaimedCores: d.allowSharedCoresOverlapReclaimedCores,
 		disableDedicatedCoresOverlapReclaimedCores: d.disableDedicatedCoresOverlapReclaimedCores,
+		revision: d.revision,
 	}
 }
 
@@ -843,6 +845,13 @@ func (d *cpuPluginStateData) GetDisableDedicatedCoresOverlapReclaimedCores() boo
 		return false
 	}
 	return d.disableDedicatedCoresOverlapReclaimedCores
+}
+
+func (d *cpuPluginStateData) GetRevision() uint64 {
+	if d == nil {
+		return 0
+	}
+	return d.revision
 }
 
 // reader is used to get information from local states
