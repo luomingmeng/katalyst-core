@@ -77,6 +77,7 @@ func (*fakeRDTManager) RunClosResourceUpdate(_ string, update func() (bool, erro
 	_, err := update()
 	return err
 }
+
 func (m *fakeRDTManager) InvalidateClos(clos string) {
 	m.invalidated = append(m.invalidated, clos)
 }

@@ -167,8 +167,10 @@ func (f *fakeCgroup) ReadCPUSet(_ context.Context, rel string) (machine.CPUSet, 
 // rootProcsPath is the cpuset controller root cgroup.procs path the test
 // plugin is wired to; tests seed fakeFS.reads[rootProcsPath] with the
 // whitespace-separated PID list the plugin should classify.
-const rootProcsPath = "/sys/fs/cgroup/cpuset/cgroup.procs"
-const rootTasksPath = "/sys/fs/cgroup/cpuset/tasks"
+const (
+	rootProcsPath = "/sys/fs/cgroup/cpuset/cgroup.procs"
+	rootTasksPath = "/sys/fs/cgroup/cpuset/tasks"
+)
 
 func seedRootPIDs(fFS *fakeFS, pids ...int) {
 	var b strings.Builder

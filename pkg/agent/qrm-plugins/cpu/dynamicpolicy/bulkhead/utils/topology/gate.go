@@ -154,10 +154,9 @@ func (g *DomainGate) Revalidate(convergenceID string, snapshot *CompleteSnapshot
 				heldOutsideDestination = heldOutsideDestination.Union(cpus)
 			}
 		}
-		g.allowedEntering[witness.Destination] =
-			g.allowedEntering[witness.Destination].Union(
-				witness.CPUs.Difference(heldOutsideDestination).
-					Intersection(desired[witness.Destination]).Intersection(g.allowedCPUs))
+		g.allowedEntering[witness.Destination] = g.allowedEntering[witness.Destination].Union(
+			witness.CPUs.Difference(heldOutsideDestination).
+				Intersection(desired[witness.Destination]).Intersection(g.allowedCPUs))
 	}
 	g.recomputePending(snapshot, desired)
 }
