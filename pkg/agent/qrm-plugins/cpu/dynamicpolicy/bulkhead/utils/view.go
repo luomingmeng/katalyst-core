@@ -56,6 +56,10 @@ func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CP
 		for _, allocation := range containerEntries {
 			if allocation != nil {
 				recordContainerCPUSet(allocation.PodUid, allocation.ContainerName, allocation.AllocationResult)
+				if allocation.RampUp && allocation.CheckSharedNUMABinding() {
+					view.SharePool = view.SharePool.Union(allocation.AllocationResult)
+					view.SharePoolMap[commonstate.PoolNameShare] = view.SharePoolMap[commonstate.PoolNameShare].Union(allocation.AllocationResult)
+				}
 			}
 		}
 	}
@@ -171,8 +175,7 @@ func BuildCPUSetPartitionViewFromTarget(
 	available := topology.CPUDetails.CPUs().Difference(view.Reserve)
 	view.NonReclaimPool = available.Difference(view.ReclaimEffective)
 	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceNoSortInt() {
-		view.ReclaimEffectivePerNUMA[numaID] =
-			view.ReclaimEffective.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
+		view.ReclaimEffectivePerNUMA[numaID] = view.ReclaimEffective.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
 	}
 	return &view
 }

@@ -190,6 +190,44 @@ func TestBuildCPUSetPartitionViewAndDeepCopy(t *testing.T) {
 	assertCPUSet(t, "original share pool map unchanged", view.SharePoolMap["share-NUMA0"], "6")
 }
 
+func TestBuildCPUSetPartitionViewIncludesSNBRampUpInSharePool(t *testing.T) {
+	t.Parallel()
+
+	state := cpustate.NewCPUPluginState(nil)
+	state.SetAllowSharedCoresOverlapReclaimedCores(false)
+	state.SetAllocationInfo(commonstate.PoolNameReserve, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReserve),
+		AllocationResult: machine.NewCPUSet(0),
+	})
+	state.SetAllocationInfo(commonstate.PoolNameShare, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+		AllocationResult: machine.NewCPUSet(1),
+	})
+	state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+		AllocationResult: machine.NewCPUSet(2, 3),
+	})
+	state.SetAllocationInfo("snb-pod", "main", &cpustate.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        "snb-pod",
+			ContainerName: "main",
+			QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+			Annotations: map[string]string{
+				apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			},
+		},
+		RampUp:           true,
+		AllocationResult: machine.NewCPUSet(2),
+	})
+
+	view := BuildCPUSetPartitionView(state, testTwoNUMATopology(), CPUSetPartitionViewOptions{})
+
+	assertCPUSet(t, "snb container", view.ContainerCPUSetByPod["snb-pod"]["main"], "2")
+	assertCPUSet(t, "share includes snb ramp-up", view.SharePool, "1-2")
+	assertCPUSet(t, "non reclaim protects snb ramp-up", view.NonReclaimPool, "1-2,4-7")
+	assertCPUSet(t, "reclaim excludes snb ramp-up", view.ReclaimEffective, "3")
+}
+
 func TestBuildCPUSetPartitionViewPreservesTwoReservedCPUs(t *testing.T) {
 	t.Parallel()
 

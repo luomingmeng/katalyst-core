@@ -26,11 +26,14 @@ import (
 
 	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	rputil "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 )
@@ -272,7 +275,7 @@ func TestAllocateSharedNumaBindingCPUs(t *testing.T) {
 		policy.state.SetAllocationInfo(podUID, containerName, originAllocationInfo, false)
 
 		req := createReq(4, true)
-		_, err = policy.allocateSharedNumaBindingCPUs(req, req.Hint, false)
+		_, err = policy.allocateSharedNumaBindingCPUs(context.Background(), req, req.Hint, false)
 		as.Error(err)
 		as.Contains(err.Error(), "cannot change from non-snb to snb during inplace update")
 	})
@@ -310,7 +313,7 @@ func TestAllocateSharedNumaBindingCPUs(t *testing.T) {
 		policy.state.SetAllocationInfo(podUID, containerName, originAllocationInfo, false)
 
 		req := createReq(4, true)
-		_, err = policy.allocateSharedNumaBindingCPUs(req, req.Hint, false)
+		_, err = policy.allocateSharedNumaBindingCPUs(context.Background(), req, req.Hint, false)
 		if err != nil {
 			as.NotContains(err.Error(), "cannot change from non-snb to snb during inplace update")
 		}
@@ -330,7 +333,7 @@ func TestAllocateSharedNumaBindingCPUs(t *testing.T) {
 		// Clean up previous state
 		policy.state.Delete(podUID, containerName, false)
 
-		_, err = policy.allocateSharedNumaBindingCPUs(req, req.Hint, false)
+		_, err = policy.allocateSharedNumaBindingCPUs(context.Background(), req, req.Hint, false)
 		// This might fail due to pool issues but it covers the else branch
 		// We expect it NOT to fail with the inplace update error
 		if err != nil {
@@ -351,29 +354,171 @@ func TestAllocateSharedNumaBindingCPUs(t *testing.T) {
 		req := createReq(2, false)
 
 		// Nil req
-		_, err = policy.allocateSharedNumaBindingCPUs(nil, req.Hint, false)
+		_, err = policy.allocateSharedNumaBindingCPUs(context.Background(), nil, req.Hint, false)
 		as.Error(err)
 		as.Contains(err.Error(), "nil req")
 
 		// Nil hint
-		_, err = policy.allocateSharedNumaBindingCPUs(req, nil, false)
+		_, err = policy.allocateSharedNumaBindingCPUs(context.Background(), req, nil, false)
 		as.Error(err)
 		as.Contains(err.Error(), "hint is nil")
 
 		// Empty hint
 		emptyHintReq := createReq(2, false)
 		emptyHintReq.Hint = &pluginapi.TopologyHint{Nodes: []uint64{}}
-		_, err = policy.allocateSharedNumaBindingCPUs(req, emptyHintReq.Hint, false)
+		_, err = policy.allocateSharedNumaBindingCPUs(context.Background(), req, emptyHintReq.Hint, false)
 		as.Error(err)
 		as.Contains(err.Error(), "hint is empty")
 
 		// Hint with multiple nodes
 		multiNodeHintReq := createReq(2, false)
 		multiNodeHintReq.Hint = &pluginapi.TopologyHint{Nodes: []uint64{0, 1}}
-		_, err = policy.allocateSharedNumaBindingCPUs(req, multiNodeHintReq.Hint, false)
+		_, err = policy.allocateSharedNumaBindingCPUs(context.Background(), req, multiNodeHintReq.Hint, false)
 		as.Error(err)
 		as.Contains(err.Error(), "larger than 1 NUMA")
 	})
+}
+
+func TestAllocateSharedNumaBindingCPUsMarksColdStartRampUp(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	require.NoError(t, err)
+
+	policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = false
+	policy.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       types.UID("snb-ramp-up"),
+			Namespace: "default",
+			Name:      "snb-ramp-up",
+		},
+		Status: v1.PodStatus{Phase: v1.PodPending},
+	}}}
+
+	req := &pluginapi.ResourceRequest{
+		PodUid:        "snb-ramp-up",
+		PodNamespace:  "default",
+		PodName:       "snb-ramp-up",
+		ContainerName: "main",
+		ResourceName:  string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{
+			string(v1.ResourceCPU): 2,
+		},
+		Annotations: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey:                  apiconsts.PodAnnotationQoSLevelSharedCores,
+			apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+		},
+		Hint: &pluginapi.TopologyHint{
+			Nodes:     []uint64{0},
+			Preferred: true,
+		},
+	}
+
+	allocation, err := policy.allocateSharedNumaBindingCPUs(context.Background(), req, req.Hint, false)
+	require.NoError(t, err)
+	require.NotNil(t, allocation)
+	require.True(t, allocation.CheckSharedNUMABinding())
+	require.True(t, allocation.RampUp)
+}
+
+func TestSharedNUMABindingRampUpStaysWithinHintedNUMA(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	require.NoError(t, err)
+
+	policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	policy.reservedCPUs = machine.NewCPUSet()
+	policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = false
+	policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	policy.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.25
+	policy.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+
+	allocation := &state.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        "snb-ramp-up-numa-scoped",
+			PodNamespace:  "default",
+			PodName:       "snb-ramp-up-numa-scoped",
+			ContainerName: "main",
+			QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+			Annotations: map[string]string{
+				apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			},
+		},
+		RampUp:          true,
+		RequestQuantity: 2,
+	}
+	allocation.SetSpecifiedNUMABindingNUMAID([]uint64{0})
+	policy.state.SetAllocationInfo(allocation.PodUid, allocation.ContainerName, allocation, false)
+
+	err = policy.adjustAllocationEntriesWithRampUpFloor(
+		policy.state.GetPodEntries(),
+		policy.state.GetMachineState(),
+		false,
+		machine.NewCPUSet(1),
+		false,
+	)
+	require.NoError(t, err)
+
+	updated := policy.state.GetAllocationInfo(allocation.PodUid, allocation.ContainerName)
+	require.NotNil(t, updated)
+	require.True(t, updated.RampUp)
+	require.True(t, updated.CheckSharedNUMABinding())
+
+	hintedNUMACPUSet := policy.machineInfo.CPUDetails.CPUsInNUMANodes(0)
+	require.False(t, updated.AllocationResult.IsEmpty())
+	require.True(t, updated.AllocationResult.IsSubsetOf(hintedNUMACPUSet),
+		"SNB ramp-up allocation=%s must stay within hinted NUMA0=%s", updated.AllocationResult, hintedNUMACPUSet)
+	for numaID := range updated.TopologyAwareAssignments {
+		require.Equal(t, 0, numaID, "SNB ramp-up assignment escaped hinted NUMA")
+	}
+}
+
+func TestNonSNBRampUpRemainsNodeWide(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	require.NoError(t, err)
+
+	policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	policy.reservedCPUs = machine.NewCPUSet()
+	policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = false
+	policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	policy.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.25
+	policy.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+
+	allocation := &state.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        "non-snb-ramp-up",
+			PodNamespace:  "default",
+			PodName:       "non-snb-ramp-up",
+			ContainerName: "main",
+			QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+		},
+		RampUp:          true,
+		RequestQuantity: 1,
+	}
+	policy.state.SetAllocationInfo(allocation.PodUid, allocation.ContainerName, allocation, false)
+
+	err = policy.adjustAllocationEntriesWithRampUpFloor(
+		policy.state.GetPodEntries(),
+		policy.state.GetMachineState(),
+		false,
+		machine.NewCPUSet(1),
+		false,
+	)
+	require.NoError(t, err)
+
+	updated := policy.state.GetAllocationInfo(allocation.PodUid, allocation.ContainerName)
+	require.NotNil(t, updated)
+	require.True(t, updated.RampUp)
+	require.False(t, updated.CheckSharedNUMABinding())
+	require.Greater(t, len(updated.TopologyAwareAssignments), 1,
+		"non-SNB ramp-up should remain node-wide, got %+v", updated.TopologyAwareAssignments)
 }
 
 func TestDynamicPolicy_allocateNumaBindingCPUs(t *testing.T) {
