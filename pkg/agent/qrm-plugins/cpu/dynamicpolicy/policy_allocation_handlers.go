@@ -18,8 +18,10 @@ package dynamicpolicy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,6 +47,34 @@ import (
 	qosutil "github.com/kubewharf/katalyst-core/pkg/util/qos"
 	rputil "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 )
+
+type requestStateCompensatedError struct {
+	err error
+}
+
+func (e *requestStateCompensatedError) Error() string {
+	return e.err.Error()
+}
+
+func (e *requestStateCompensatedError) Unwrap() error {
+	return e.err
+}
+
+type requestStateOwnershipLostError struct {
+	err error
+}
+
+func (e *requestStateOwnershipLostError) Error() string {
+	return e.err.Error()
+}
+
+func (e *requestStateOwnershipLostError) Unwrap() error {
+	return e.err
+}
+
+func (e *requestStateOwnershipLostError) OwnershipLost() bool {
+	return true
+}
 
 func (p *DynamicPolicy) sharedCoresAllocationHandler(ctx context.Context,
 	req *pluginapi.ResourceRequest,
@@ -461,8 +491,6 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 		return p.allocationSidecarHandler(ctx, req, apiconsts.PodAnnotationQoSLevelDedicatedCores, persistCheckpoint)
 	}
 
-	previousPodEntries := p.state.GetPodEntries()
-	previousMachineState := p.state.GetMachineState()
 	basePodEntries := p.state.GetPodEntries()
 	baseMachineState := p.state.GetMachineState()
 	oldAllocationInfo := p.state.GetAllocationInfo(req.PodUid, req.ContainerName)
@@ -666,28 +694,95 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 		return nil, fmt.Errorf("commit DNB allocation and reclaim floor atomically failed: %w", err)
 	}
 	adjustCtx, cancel := context.WithTimeout(context.Background(), cpuSetAdjustmentHandlerTimeout(p.conf))
-	adjustErr := p.runCPUSetAdjustmentHandlers(adjustCtx)
+	adjustErr := p.runCPUSetAdjustmentHandlers(adjustCtx, dynamicpolicyutil.CPUSetAdjustmentModeAdmission)
 	cancel()
 	if adjustErr != nil {
-		rollbackErr := p.state.CommitAdvisorState(
-			previousPodEntries,
-			previousMachineState,
-			p.state.GetAllowSharedCoresOverlapReclaimedCores(),
-			p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
-			persistCheckpoint,
-		)
+		rollbackErr := p.rollbackFailedDNBAllocation(
+			req.PodUid, req.ContainerName, oldAllocationInfo, allocationInfo, persistCheckpoint)
 		var restoreErr error
 		if rollbackErr == nil {
 			restoreCtx, restoreCancel := context.WithTimeout(context.Background(), cpuSetAdjustmentHandlerTimeout(p.conf))
-			restoreErr = p.runCPUSetAdjustmentHandlers(restoreCtx)
+			restoreErr = p.runCPUSetAdjustmentHandlers(restoreCtx, dynamicpolicyutil.CPUSetAdjustmentModeRetry)
 			restoreCancel()
+			if restoreErr != nil {
+				p.scheduleCPUSetAdjustmentRetry(dynamicpolicyutil.RetryReasonRestoreFailed)
+			}
 		}
-		return nil, fmt.Errorf("apply DNB allocation and reclaim floor failed: %v; state rollback error: %v; machine restore error: %v",
+		var ownershipLost *requestStateOwnershipLostError
+		if errors.As(rollbackErr, &ownershipLost) {
+			p.scheduleCPUSetAdjustmentRetry(dynamicpolicyutil.RetryReasonOwnershipLost)
+			err := fmt.Errorf("apply DNB allocation and reclaim floor failed: %v; state rollback error: %w; machine restore error: %v",
+				adjustErr, rollbackErr, restoreErr)
+			return nil, &requestStateCompensatedError{err: err}
+		}
+		err := fmt.Errorf("apply DNB allocation and reclaim floor failed: %v; state rollback error: %v; machine restore error: %v",
 			adjustErr, rollbackErr, restoreErr)
+		if rollbackErr == nil {
+			return nil, &requestStateCompensatedError{err: err}
+		}
+		return nil, err
 	}
 	p.clearCPUSetInAllocationResponseIfNeeded(resp, allocationInfo)
 
 	return resp, nil
+}
+
+// rollbackFailedDNBAllocation removes only the failed request's committed delta
+// from the latest state. It replans pools and the ramp-up reclaim floor from
+// that latest view so unrelated allocations committed while adjustment ran are
+// preserved and cannot be replaced by a stale whole-state snapshot.
+func (p *DynamicPolicy) rollbackFailedDNBAllocation(
+	podUID, containerName string,
+	previous, failedCandidate *state.AllocationInfo,
+	persistCheckpoint bool,
+) error {
+	latestEntries := p.state.GetPodEntries()
+	latestCandidate := latestEntries[podUID][containerName]
+	if latestCandidate == nil {
+		return nil
+	}
+	if !reflect.DeepEqual(latestCandidate, failedCandidate) {
+		return &requestStateOwnershipLostError{err: fmt.Errorf(
+			"allocation %s/%s ownership lost: allocation advanced after failed candidate; skip stale candidate rollback",
+			podUID, containerName)}
+	}
+
+	if previous != nil {
+		latestEntries[podUID][containerName] = previous.Clone()
+	} else {
+		delete(latestEntries[podUID], containerName)
+		if len(latestEntries[podUID]) == 0 {
+			delete(latestEntries, podUID)
+		}
+	}
+
+	latestMachineState, err := generateMachineStateFromPodEntries(
+		p.machineInfo.CPUTopology, latestEntries, p.state.GetMachineState())
+	if err != nil {
+		return fmt.Errorf("recompute machine state without failed DNB allocation: %w", err)
+	}
+	planningState := state.NewTransientState(p.machineInfo.CPUTopology)
+	if err := planningState.CommitAdvisorState(
+		latestEntries,
+		latestMachineState,
+		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+		false,
+	); err != nil {
+		return fmt.Errorf("initialize failed DNB rollback state: %w", err)
+	}
+	planningPolicy := p.newRampUpPlanningPolicy(planningState)
+	if err := planningPolicy.adjustAllocationEntriesWithRampUpFloor(
+		latestEntries, latestMachineState, false, machine.NewCPUSet(), false); err != nil {
+		return fmt.Errorf("recompute pools and reclaim floor without failed DNB allocation: %w", err)
+	}
+	return p.state.CommitAdvisorState(
+		planningState.GetPodEntries(),
+		planningState.GetMachineState(),
+		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+		persistCheckpoint,
+	)
 }
 
 // newRampUpPlanningPolicy creates an isolated policy view for speculative

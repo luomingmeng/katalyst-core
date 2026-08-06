@@ -23,6 +23,7 @@ import (
 	"os"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
@@ -33,6 +34,7 @@ import (
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	dynamicpolicyutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	rputil "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
@@ -1344,6 +1346,25 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorCoversAllNUMAs(t *testing.T) {
 	require.True(t, activeFloor.Equals(machine.NewCPUSet(14, 38, 62, 86)))
 }
 
+func TestDynamicPolicyDeriveRampUpReclaimFloorAllowsFullNonExclusiveRatio(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.reservedReclaimedCPUSet = machine.NewCPUSet()
+	p.reservedReclaimedCPUsSize = 0
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 1
+
+	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), true)
+	require.NoError(t, err)
+	require.True(t, floor.Equals(machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)),
+		"floor=%s, want every eligible CPU", floor)
+}
+
 func TestDedicatedNUMAExclusiveRampUpCommitsAllocationAndReclaimAtomically(t *testing.T) {
 	t.Parallel()
 
@@ -1398,6 +1419,236 @@ func TestDedicatedNUMAExclusiveRampUpCommitsAllocationAndReclaimAtomically(t *te
 		"allocation=%s reclaim=%s", allocation.AllocationResult, reclaim.AllocationResult)
 	require.True(t, allocation.AllocationResult.Union(reclaim.AllocationResult).Equals(available),
 		"allocation=%s reclaim=%s available=%s", allocation.AllocationResult, reclaim.AllocationResult, available)
+}
+
+func TestAllocateDedicatedNUMAExclusiveAdjustmentFailureDoesNotRollbackNewerState(t *testing.T) {
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.reservedReclaimedCPUSet = machine.NewCPUSet()
+	p.reservedReclaimedCPUsSize = 0
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.25
+
+	const failedPodUID = "exclusive-dnb-adjustment-failure"
+	adjustmentStarted := make(chan struct{})
+	releaseAdjustment := make(chan struct{})
+	adjustmentCalls := 0
+	failedCandidateCPUs := machine.NewCPUSet()
+	p.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+		"failing": func(_ context.Context, in dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
+			adjustmentCalls++
+			if adjustmentCalls == 1 {
+				failedCandidate := in.State.GetAllocationInfo(failedPodUID, "main")
+				if failedCandidate != nil {
+					failedCandidateCPUs = failedCandidate.AllocationResult.Clone()
+				}
+				close(adjustmentStarted)
+				<-releaseAdjustment
+			}
+			return errors.New("injected adjustment failure")
+		},
+	}
+	req := &pluginapi.ResourceRequest{
+		PodUid: failedPodUID, PodNamespace: "default",
+		PodName: "exclusive-dnb-adjustment-failure", ContainerName: "main",
+		ContainerType: pluginapi.ContainerType_MAIN, ResourceName: string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{string(v1.ResourceCPU): 2},
+		Labels: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+		},
+		Annotations: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey:          apiconsts.PodAnnotationQoSLevelDedicatedCores,
+			apiconsts.PodAnnotationMemoryEnhancementKey: `{"numa_binding":"true","numa_exclusive":"true"}`,
+		},
+		Hint: &pluginapi.TopologyHint{Nodes: []uint64{0}},
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := p.Allocate(context.Background(), req)
+		result <- err
+	}()
+	<-adjustmentStarted
+
+	const newerPodUID = "newer-concurrent-submission"
+	p.Lock()
+	p.state.SetAllocationInfo(newerPodUID, "main", &state.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid: newerPodUID, ContainerName: "main",
+			OwnerPoolName: commonstate.PoolNameDedicated,
+			QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+		},
+		AllocationResult:         machine.NewCPUSet(7),
+		OriginalAllocationResult: machine.NewCPUSet(7),
+	}, false)
+	p.Unlock()
+	close(releaseAdjustment)
+
+	adjustmentErr := <-result
+	require.ErrorContains(t, adjustmentErr, "injected adjustment failure")
+	require.NotNil(t, p.state.GetAllocationInfo(newerPodUID, "main"),
+		"failed older adjustment rollback overwrote a newer concurrent state submission")
+	require.Nil(t, p.state.GetAllocationInfo(req.PodUid, req.ContainerName),
+		"failed request left a ghost allocation in the latest pod entries")
+	require.False(t, failedCandidateCPUs.IsEmpty())
+	require.True(t, p.state.GetMachineState()[0].AllocatedCPUSet.Intersection(failedCandidateCPUs).IsEmpty(),
+		"failed request left ghost CPUs %s in machine state %s",
+		failedCandidateCPUs, p.state.GetMachineState()[0].AllocatedCPUSet)
+	reclaim := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	require.NotNil(t, reclaim)
+	require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6)),
+		"reclaim floor/pool was not recomputed from latest state: %s", reclaim.AllocationResult)
+}
+
+func TestAllocateDedicatedNUMAExclusiveAdjustmentFailureReportsOwnershipLostAndReconcilesLatestState(t *testing.T) {
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.reservedReclaimedCPUSet = machine.NewCPUSet()
+	p.reservedReclaimedCPUsSize = 0
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.25
+
+	const podUID = "exclusive-dnb-ownership-lost"
+	adjustmentStarted := make(chan struct{})
+	releaseAdjustment := make(chan struct{})
+	latestStateReconciled := make(chan struct{}, 1)
+	p.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+		"failing": func(_ context.Context, in dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
+			if in.Mode == dynamicpolicyutil.CPUSetAdjustmentModeAdmission {
+				close(adjustmentStarted)
+				<-releaseAdjustment
+				return errors.New("injected adjustment failure")
+			}
+			latestStateReconciled <- struct{}{}
+			return nil
+		},
+	}
+	req := &pluginapi.ResourceRequest{
+		PodUid: podUID, PodNamespace: "default", PodName: podUID, ContainerName: "main",
+		ContainerType: pluginapi.ContainerType_MAIN, ResourceName: string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{string(v1.ResourceCPU): 2},
+		Labels: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+		},
+		Annotations: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey:          apiconsts.PodAnnotationQoSLevelDedicatedCores,
+			apiconsts.PodAnnotationMemoryEnhancementKey: `{"numa_binding":"true","numa_exclusive":"true"}`,
+		},
+		Hint: &pluginapi.TopologyHint{Nodes: []uint64{0}},
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := p.Allocate(context.Background(), req)
+		result <- err
+	}()
+	<-adjustmentStarted
+
+	advanced := &state.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid: podUID, ContainerName: "main",
+			OwnerPoolName: commonstate.PoolNameDedicated,
+			QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+		},
+		AllocationResult:         machine.NewCPUSet(6, 7),
+		OriginalAllocationResult: machine.NewCPUSet(6, 7),
+	}
+	p.Lock()
+	p.state.SetAllocationInfo(podUID, "main", advanced, false)
+	p.Unlock()
+	close(releaseAdjustment)
+
+	allocationErr := <-result
+	require.Error(t, allocationErr)
+	var compensated *requestStateCompensatedError
+	require.ErrorAs(t, allocationErr, &compensated)
+	var ownershipLost interface{ OwnershipLost() bool }
+	require.ErrorAs(t, allocationErr, &ownershipLost)
+	require.True(t, ownershipLost.OwnershipLost())
+	require.ErrorContains(t, allocationErr, "ownership lost")
+	require.True(t, p.state.GetAllocationInfo(podUID, "main").AllocationResult.Equals(advanced.AllocationResult),
+		"outer stale snapshot rollback overwrote the advanced allocation")
+	select {
+	case <-latestStateReconciled:
+	case <-time.After(time.Second):
+		t.Fatal("ownership loss did not schedule a latest-state reconciliation")
+	}
+}
+
+func TestAllocateDedicatedNUMAExclusiveRestoreFailureMarksDirtyAndSchedulesBoundedFullRetry(t *testing.T) {
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.reservedReclaimedCPUSet = machine.NewCPUSet()
+	p.reservedReclaimedCPUsSize = 0
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.25
+
+	retryAttempts := make(chan struct{}, cpuSetAdjustmentRetryMaxAttempts+1)
+	p.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+		"failing": func(_ context.Context, in dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
+			if in.Mode == dynamicpolicyutil.CPUSetAdjustmentModeAdmission {
+				return errors.New("injected admission adjustment failure")
+			}
+			retryAttempts <- struct{}{}
+			return errors.New("injected restore failure")
+		},
+	}
+	req := &pluginapi.ResourceRequest{
+		PodUid: "exclusive-dnb-restore-failure", PodNamespace: "default",
+		PodName: "exclusive-dnb-restore-failure", ContainerName: "main",
+		ContainerType: pluginapi.ContainerType_MAIN, ResourceName: string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{string(v1.ResourceCPU): 2},
+		Labels: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+		},
+		Annotations: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey:          apiconsts.PodAnnotationQoSLevelDedicatedCores,
+			apiconsts.PodAnnotationMemoryEnhancementKey: `{"numa_binding":"true","numa_exclusive":"true"}`,
+		},
+		Hint: &pluginapi.TopologyHint{Nodes: []uint64{0}},
+	}
+
+	_, allocationErr := p.Allocate(context.Background(), req)
+	require.ErrorContains(t, allocationErr, "injected restore failure")
+	var compensated *requestStateCompensatedError
+	require.ErrorAs(t, allocationErr, &compensated)
+	require.Nil(t, p.state.GetAllocationInfo(req.PodUid, req.ContainerName),
+		"state compensation did not remove the failed allocation")
+
+	deadline := time.After(2 * time.Second)
+	for i := 0; i < cpuSetAdjustmentRetryMaxAttempts+1; i++ {
+		select {
+		case <-retryAttempts:
+		case <-deadline:
+			t.Fatalf("restore/full retry attempts = %d, want synchronous restore plus %d bounded retries",
+				i, cpuSetAdjustmentRetryMaxAttempts)
+		}
+	}
+	for {
+		p.cpuSetAdjustmentRetryMu.Lock()
+		queued := p.cpuSetAdjustmentRetryQueued
+		dirty := p.cpuSetAdjustmentRetryDirty
+		p.cpuSetAdjustmentRetryMu.Unlock()
+		if !queued {
+			require.True(t, dirty, "bounded full retry exhaustion must leave latest-state reconciliation dirty")
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("latest-state full retry did not stop within the bounded retry window")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
 }
 
 func TestDedicatedNUMAExclusiveRampUpCommitFailureKeepsPreviousState(t *testing.T) {
