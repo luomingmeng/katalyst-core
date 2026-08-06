@@ -62,7 +62,7 @@ func (p *DynamicPolicy) sharedCoresAllocationHandler(ctx context.Context,
 	}
 }
 
-func (p *DynamicPolicy) sharedCoresWithoutNUMABindingAllocationHandler(_ context.Context,
+func (p *DynamicPolicy) sharedCoresWithoutNUMABindingAllocationHandler(ctx context.Context,
 	req *pluginapi.ResourceRequest, persistCheckpoint bool,
 ) (*pluginapi.ResourceAllocationResponse, error) {
 	if req == nil {
@@ -124,7 +124,7 @@ func (p *DynamicPolicy) sharedCoresWithoutNUMABindingAllocationHandler(_ context
 		general.Infof("pod: %s/%s, container: %s is met firstly, do ramp up with pooled cpus: %s",
 			req.PodNamespace, req.PodName, req.ContainerName, pooledCPUs.String())
 
-		shouldRampUp := p.shouldSharedCoresRampUp(req.PodUid)
+		shouldRampUp := p.shouldSharedCoresRampUp(ctx, req.PodUid)
 		if shouldRampUp {
 			if err := excludeRampUpReclaimFloor(); err != nil {
 				return nil, err
@@ -785,7 +785,7 @@ func (p *DynamicPolicy) sharedCoresWithNUMABindingAllocationHandler(ctx context.
 
 	// there is no need to delete old allocationInfo for the container if it exists,
 	// allocateSharedNumaBindingCPUs will re-calculate pool size and avoid counting same entry twice
-	allocationInfo, err := p.allocateSharedNumaBindingCPUs(req, req.Hint, persistCheckpoint)
+	allocationInfo, err := p.allocateSharedNumaBindingCPUs(ctx, req, req.Hint, persistCheckpoint)
 	if err != nil || allocationInfo == nil {
 		general.ErrorS(err, "unable to allocate CPUs",
 			"podNamespace", req.PodNamespace,
@@ -1055,7 +1055,7 @@ func (p *DynamicPolicy) takeByTopologyPreferring(
 	return takenPreferred.Union(takenRemaining), nil
 }
 
-func (p *DynamicPolicy) allocateSharedNumaBindingCPUs(req *pluginapi.ResourceRequest,
+func (p *DynamicPolicy) allocateSharedNumaBindingCPUs(ctx context.Context, req *pluginapi.ResourceRequest,
 	hint *pluginapi.TopologyHint, persistCheckpoint bool,
 ) (*state.AllocationInfo, error) {
 	if req == nil {
@@ -1115,6 +1115,7 @@ func (p *DynamicPolicy) allocateSharedNumaBindingCPUs(req *pluginapi.ResourceReq
 		}
 		return checkedAllocationInfo, nil
 	} else {
+		allocationInfo.RampUp = p.shouldSharedCoresRampUp(ctx, req.PodUid)
 		if err := p.updateAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, nil, allocationInfo, persistCheckpoint); err != nil {
 			return nil, err
 		}
@@ -1144,7 +1145,25 @@ func (p *DynamicPolicy) putAllocationsAndAdjustAllocationEntriesResizeAware(
 	incrByReq,
 	podInplaceUpdateResizing,
 	persistCheckpoint bool,
-) error {
+) (err error) {
+	start := time.Now()
+	podUID, podName, podNamespace, containerName := "", "", "", ""
+	rampUp := false
+	allocationSize := 0
+	qosLevel := ""
+	if len(allocationInfos) > 0 && allocationInfos[0] != nil {
+		ai := allocationInfos[0]
+		podUID, podName, podNamespace, containerName = ai.PodUid, ai.PodName, ai.PodNamespace, ai.ContainerName
+		rampUp = ai.RampUp
+		allocationSize = ai.AllocationResult.Size()
+		qosLevel = ai.QoSLevel
+	}
+	defer func() {
+		general.Infof("cpu allocation: put allocations and adjust entries finished duration=%s err=%v pod=%s/%s uid=%s container=%s qos=%s ramp_up=%t allocation_size=%d allocation_count=%d incr_by_req=%t resizing=%t persist_checkpoint=%t",
+			time.Since(start), err, podNamespace, podName, podUID, containerName, qosLevel, rampUp, allocationSize,
+			len(allocationInfos), incrByReq, podInplaceUpdateResizing, persistCheckpoint)
+	}()
+
 	if len(allocationInfos) == 0 {
 		return nil
 	}
@@ -1234,7 +1253,7 @@ func (p *DynamicPolicy) putAllocationsAndAdjustAllocationEntriesResizeAware(
 	}
 
 	isolatedQuantityMap := state.GetIsolatedQuantityMapFromPodEntries(entries, allocationInfos, p.getContainerRequestedCores)
-	err := p.adjustPoolsAndIsolatedEntries(poolsQuantityMap, isolatedQuantityMap,
+	err = p.adjustPoolsAndIsolatedEntries(poolsQuantityMap, isolatedQuantityMap,
 		entries, machineState, persistCheckpoint)
 	if err != nil {
 		return fmt.Errorf("adjustPoolsAndIsolatedEntries failed with error: %v", err)
@@ -1452,7 +1471,7 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloor(
 	if runCPUSetHandlers {
 		ctx, cancel := context.WithTimeout(context.Background(), cpuSetAdjustmentHandlerTimeout(p.conf))
 		defer cancel()
-		if err := p.runCPUSetAdjustmentHandlers(ctx); err != nil {
+		if err := p.runCPUSetAdjustmentHandlers(ctx, dynamicpolicyutil.CPUSetAdjustmentModeAdmission); err != nil {
 			return fmt.Errorf("runCPUSetAdjustmentHandlers failed with error: %v", err)
 		}
 	}
@@ -1645,8 +1664,7 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 		}
 	}
 	if !rampUpReclaimFloor.IsEmpty() {
-		poolsCPUSet[commonstate.PoolNameReclaim] =
-			poolsCPUSet[commonstate.PoolNameReclaim].Union(rampUpReclaimFloor)
+		poolsCPUSet[commonstate.PoolNameReclaim] = poolsCPUSet[commonstate.PoolNameReclaim].Union(rampUpReclaimFloor)
 	}
 	if poolsCPUSet[commonstate.PoolNameReclaim].IsEmpty() {
 		return fmt.Errorf("entry: %s is empty", commonstate.PoolNameReclaim)
@@ -1816,15 +1834,32 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 				}
 
 				if allocationInfo.RampUp {
-					general.Infof("pod: %s/%s container: %s is in ramp up, set its allocation result from %s to rampUpCPUs :%s",
-						allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName,
-						allocationInfo.AllocationResult.String(), rampUpCPUs.String())
+					if allocationInfo.CheckSharedNUMABinding() {
+						snbRampUpCPUs, snbRampUpCPUsTopologyAwareAssignments, err := p.getSharedNUMABindingRampUpCPUSet(
+							allocationInfo, machineState, unionDedicatedIsolatedCPUSet, notAllocatablePoolsCPUs, rampUpReclaimFloor)
+						if err != nil {
+							return err
+						}
+						general.Infof("pod: %s/%s container: %s is in SNB ramp up, set its allocation result from %s to SNB rampUpCPUs: %s",
+							allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName,
+							allocationInfo.AllocationResult.String(), snbRampUpCPUs.String())
 
-					newPodEntries[podUID][containerName].OwnerPoolName = commonstate.EmptyOwnerPoolName
-					newPodEntries[podUID][containerName].AllocationResult = rampUpCPUs.Clone()
-					newPodEntries[podUID][containerName].OriginalAllocationResult = rampUpCPUs.Clone()
-					newPodEntries[podUID][containerName].TopologyAwareAssignments = machine.DeepcopyCPUAssignment(rampUpCPUsTopologyAwareAssignments)
-					newPodEntries[podUID][containerName].OriginalTopologyAwareAssignments = machine.DeepcopyCPUAssignment(rampUpCPUsTopologyAwareAssignments)
+						newPodEntries[podUID][containerName].OwnerPoolName = commonstate.EmptyOwnerPoolName
+						newPodEntries[podUID][containerName].AllocationResult = snbRampUpCPUs.Clone()
+						newPodEntries[podUID][containerName].OriginalAllocationResult = snbRampUpCPUs.Clone()
+						newPodEntries[podUID][containerName].TopologyAwareAssignments = machine.DeepcopyCPUAssignment(snbRampUpCPUsTopologyAwareAssignments)
+						newPodEntries[podUID][containerName].OriginalTopologyAwareAssignments = machine.DeepcopyCPUAssignment(snbRampUpCPUsTopologyAwareAssignments)
+					} else {
+						general.Infof("pod: %s/%s container: %s is in ramp up, set its allocation result from %s to rampUpCPUs: %s",
+							allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName,
+							allocationInfo.AllocationResult.String(), rampUpCPUs.String())
+
+						newPodEntries[podUID][containerName].OwnerPoolName = commonstate.EmptyOwnerPoolName
+						newPodEntries[podUID][containerName].AllocationResult = rampUpCPUs.Clone()
+						newPodEntries[podUID][containerName].OriginalAllocationResult = rampUpCPUs.Clone()
+						newPodEntries[podUID][containerName].TopologyAwareAssignments = machine.DeepcopyCPUAssignment(rampUpCPUsTopologyAwareAssignments)
+						newPodEntries[podUID][containerName].OriginalTopologyAwareAssignments = machine.DeepcopyCPUAssignment(rampUpCPUsTopologyAwareAssignments)
+					}
 				} else {
 					poolEntry, err := p.getAllocationPoolEntry(allocationInfo, ownerPoolName, newPodEntries)
 					if err != nil {
@@ -1887,6 +1922,54 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 	}
 
 	return nil
+}
+
+func (p *DynamicPolicy) getSharedNUMABindingRampUpCPUSet(
+	allocationInfo *state.AllocationInfo,
+	machineState state.NUMANodeMap,
+	unionDedicatedIsolatedCPUSet machine.CPUSet,
+	notAllocatablePoolsCPUs machine.CPUSet,
+	rampUpReclaimFloor machine.CPUSet,
+) (machine.CPUSet, map[int]machine.CPUSet, error) {
+	if allocationInfo == nil {
+		return machine.NewCPUSet(), nil, fmt.Errorf("nil allocationInfo")
+	}
+	numaHintStr := allocationInfo.Annotations[cpuconsts.CPUStateAnnotationKeyNUMAHint]
+	numaSet, err := machine.Parse(numaHintStr)
+	if err != nil {
+		return machine.NewCPUSet(), nil, fmt.Errorf("parse SNB numa hint %q failed: %w", numaHintStr, err)
+	}
+	if numaSet.Size() != 1 {
+		return machine.NewCPUSet(), nil, fmt.Errorf("SNB ramp-up requires exactly one NUMA hint, got %s", numaSet.String())
+	}
+
+	numaID := numaSet.ToSliceNoSortInt()[0]
+	numaState := machineState[numaID]
+	if numaState == nil {
+		return machine.NewCPUSet(), nil, fmt.Errorf("SNB ramp-up missing machine state for NUMA %d", numaID)
+	}
+
+	snbRampUpCPUs := numaState.GetAvailableCPUSet(p.reservedCPUs).
+		Difference(unionDedicatedIsolatedCPUSet).
+		Difference(notAllocatablePoolsCPUs).
+		Difference(rampUpReclaimFloor)
+	if snbRampUpCPUs.IsEmpty() {
+		return machine.NewCPUSet(), nil, fmt.Errorf("SNB ramp-up CPUs are empty for NUMA %d", numaID)
+	}
+
+	assignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, snbRampUpCPUs)
+	if err != nil {
+		return machine.NewCPUSet(), nil, fmt.Errorf("calculate SNB ramp-up assignments for NUMA %d CPUs %s failed: %w",
+			numaID, snbRampUpCPUs.String(), err)
+	}
+	if len(assignments) != 1 {
+		return machine.NewCPUSet(), nil, fmt.Errorf("SNB ramp-up assignments crossed NUMA: %+v", assignments)
+	}
+	if _, ok := assignments[numaID]; !ok {
+		return machine.NewCPUSet(), nil, fmt.Errorf("SNB ramp-up assignments %+v do not match hinted NUMA %d", assignments, numaID)
+	}
+
+	return snbRampUpCPUs, assignments, nil
 }
 
 func (p *DynamicPolicy) generateNUMABindingPoolsCPUSetInPlace(poolsCPUSet map[string]machine.CPUSet,
@@ -2411,22 +2494,22 @@ func (p *DynamicPolicy) takeCPUsForContainers(containersQuantityMap map[string]m
 	return containersCPUSet, availableCPUs, nil
 }
 
-func (p *DynamicPolicy) shouldSharedCoresRampUp(podUID string) bool {
+func (p *DynamicPolicy) shouldSharedCoresRampUp(ctx context.Context, podUID string) bool {
 	if p.isSharedCoresRampUpDisabled() {
 		general.Infof("shared cores ramp up is disabled by dynamic config, podUID: %s", podUID)
 		return false
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
 	pod, err := p.metaServer.GetPod(ctx, podUID)
 
 	if err != nil {
-		general.Errorf("get pod failed with error: %v, try to ramp up it", err)
+		general.Errorf("get pod: %s failed with error: %v during admission, try to ramp up it", podUID, err)
 		return true
 	} else if pod == nil {
-		general.Infof("can't get pod: %s from metaServer, try to ramp up it", podUID)
-		return true
+		general.Infof("can't get pod: %s from metaServer, not try to ramp up it", podUID)
+		return false
 	} else if !native.PodIsPending(pod) {
 		general.Infof("pod: %s/%s isn't pending(not admit firstly), not try to ramp up it", pod.Namespace, pod.Name)
 		return false
@@ -2820,7 +2903,7 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloor(machineState state.NUMANodeMap,
 		}
 		reservedFloor := p.reservedReclaimedCPUSet.Intersection(eligible)
 		target, err := dynamicpolicyutil.CalculateRampUpReclaimTarget(
-			eligible.Size(), reservedFloor.Size(), eligible.Size()-1, ratio, false)
+			eligible.Size(), reservedFloor.Size(), eligible.Size(), ratio, false)
 		if err != nil {
 			return machine.NewCPUSet(), fmt.Errorf("derive ramp-up reclaim floor for NUMA %d failed: %w", numaID, err)
 		}

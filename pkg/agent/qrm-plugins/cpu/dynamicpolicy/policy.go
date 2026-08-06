@@ -670,11 +670,6 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 			return ai.CheckDedicated() || ai.CheckSharedNUMABinding()
 		},
 		state.WrapAllocationMetaFilter((*commonstate.AllocationMeta).CheckDedicatedNUMABinding))
-	rumpUpPooledCPUsTopologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, rumpUpPooledCPUs)
-	if err != nil {
-		return nil, fmt.Errorf("GetNumaAwareAssignments err: %v", err)
-	}
-
 	var allocationInfosJustFinishRampUp []*state.AllocationInfo
 	needUpdateMachineState := false
 	for podUID, containerEntries := range podEntries {
@@ -711,8 +706,16 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 					general.Errorf("pod: %s/%s, container: %s init timestamp parsed failed with error: %v, re-ramp-up it",
 						allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName, tsErr)
 
-					clonedPooledCPUs := rumpUpPooledCPUs.Clone()
-					clonedPooledCPUsTopologyAwareAssignments := machine.DeepcopyCPUAssignment(rumpUpPooledCPUsTopologyAwareAssignments)
+					rampUpReclaimFloor, err := p.deriveRampUpReclaimFloor(machineState, true)
+					if err != nil {
+						return nil, fmt.Errorf("derive reclaim floor for legacy re-ramp-up failed: %w", err)
+					}
+					clonedPooledCPUs := rumpUpPooledCPUs.Difference(rampUpReclaimFloor)
+					clonedPooledCPUsTopologyAwareAssignments, err := machine.GetNumaAwareAssignments(
+						p.machineInfo.CPUTopology, clonedPooledCPUs)
+					if err != nil {
+						return nil, fmt.Errorf("get NUMA assignments for legacy re-ramp-up failed: %w", err)
+					}
 
 					allocationInfo.AllocationResult = clonedPooledCPUs
 					allocationInfo.OriginalAllocationResult = clonedPooledCPUs
@@ -746,7 +749,7 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 	}
 
 	if len(allocationInfosJustFinishRampUp) > 0 {
-		if err = p.putAllocationsAndAdjustAllocationEntries(allocationInfosJustFinishRampUp, true, true); err != nil {
+		if err := p.putAllocationsAndAdjustAllocationEntries(allocationInfosJustFinishRampUp, true, true); err != nil {
 			// not influencing return response to kubelet when putAllocationsAndAdjustAllocationEntries failed
 			general.Errorf("putAllocationsAndAdjustAllocationEntries failed with error: %v", err)
 		}

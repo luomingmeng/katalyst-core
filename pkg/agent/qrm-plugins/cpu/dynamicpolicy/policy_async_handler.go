@@ -244,11 +244,22 @@ func (p *DynamicPolicy) buildCPUSetPodStateMap(ctx context.Context, podEntries s
 		for _, podUID := range cs.podUIDs.List() {
 			pod, err := p.metaServer.GetPod(ctx, podUID)
 			if err != nil {
+				if isPodFetcherPodNotFoundError(err) {
+					general.Infof("pod: %s is already gone, skip cpuset async check", podUID)
+					cs.podUIDs.Delete(podUID)
+					continue
+				}
 				general.Errorf("get pod: %s failed with error: %v", podUID, err)
+				continue
+			}
+			if pod == nil {
+				general.Infof("pod: %s is nil, skip cpuset async check", podUID)
+				cs.podUIDs.Delete(podUID)
 				continue
 			}
 
 			if !native.PodIsActive(pod) {
+				cs.podUIDs.Delete(podUID)
 				continue
 			}
 

@@ -56,6 +56,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/hintoptimizer"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/hintoptimizer/policy/canonical"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	dynamicpolicyutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/validator"
 	cpuutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/util"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
@@ -276,6 +277,51 @@ func TestGetResourcesAllocationSkipsNilAllocationInfo(t *testing.T) {
 	as.NotNil(resp)
 	as.Contains(resp.PodResources, "pod-with-nil-entry")
 	as.Empty(resp.PodResources["pod-with-nil-entry"].ContainerResources)
+}
+
+func TestGetResourcesAllocationLegacyRampUpExcludesReclaimFloor(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.reservedReclaimedCPUSet = machine.NewCPUSet(0, 1)
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0
+	p.state.SetPodEntries(state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: {
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(0, 1),
+			},
+		},
+		"legacy-shared": {
+			"main": {
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid: "legacy-shared", PodNamespace: "default", PodName: "legacy-shared",
+					ContainerName: "main", ContainerType: pluginapi.ContainerType_MAIN.String(),
+					Labels: map[string]string{
+						consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+					},
+					Annotations: map[string]string{
+						consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+					},
+					QoSLevel: consts.PodAnnotationQoSLevelSharedCores,
+				},
+				AllocationResult: machine.NewCPUSet(2),
+			},
+		},
+	}, false)
+
+	_, err = p.GetResourcesAllocation(context.Background(), &pluginapi.GetResourcesAllocationRequest{})
+	require.NoError(t, err)
+	allocation := p.state.GetAllocationInfo("legacy-shared", "main")
+	require.NotNil(t, allocation)
+	require.True(t, allocation.RampUp)
+	require.Empty(t, allocation.AllocationResult.Intersection(machine.NewCPUSet(0, 1)).ToSliceInt(),
+		"legacy re-ramp-up allocation overlaps the hard reclaim floor: %s", allocation.AllocationResult)
 }
 
 func TestSystemExclusivePoolSkipsNilAllocationInfo(t *testing.T) {
@@ -1013,10 +1059,10 @@ func TestAllocate(t *testing.T) {
 							OciPropertyName:   util.OCIPropertyNameCPUSetCPUs,
 							IsNodeResource:    false,
 							IsScalarResource:  true,
-							AllocatedQuantity: 1,
-							AllocationResult:  machine.NewCPUSet(1).String(),
+							AllocatedQuantity: 3,
+							AllocationResult:  machine.NewCPUSet(1, 8, 9).String(),
 							TopologyAssignments: map[uint64]uint64{
-								0: 1,
+								0: 3,
 							},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{
@@ -6179,6 +6225,40 @@ func TestGetResourcesAllocation(t *testing.T) {
 	as.Equal(6, reclaimEntry.AllocationResult.Size()) // ceil("14 * (4 / 10)") == 6
 }
 
+type contextCapturingPodFetcher struct {
+	*pod.PodFetcherStub
+	contexts chan context.Context
+}
+
+func (f *contextCapturingPodFetcher) GetPod(ctx context.Context, podUID string) (*v1.Pod, error) {
+	f.contexts <- ctx
+	return f.PodFetcherStub.GetPod(ctx, podUID)
+}
+
+func TestShouldSharedCoresRampUpUsesCallerContext(t *testing.T) {
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	fetcher := &contextCapturingPodFetcher{
+		PodFetcherStub: &pod.PodFetcherStub{},
+		contexts:       make(chan context.Context, 1),
+	}
+	policy.metaServer.MetaAgent.PodFetcher = fetcher
+
+	type contextKey string
+	const key contextKey = "caller"
+	callerCtx := context.WithValue(context.Background(), key, "preserved")
+	policy.shouldSharedCoresRampUp(callerCtx, "missing-pod")
+
+	select {
+	case got := <-fetcher.contexts:
+		require.Equal(t, "preserved", got.Value(key))
+	case <-time.After(time.Second):
+		t.Fatal("pod fetch did not receive a context")
+	}
+}
+
 func TestShouldSharedCoresRampUpDisabledByDynamicConfig(t *testing.T) {
 	t.Parallel()
 
@@ -6200,7 +6280,16 @@ func TestShouldSharedCoresRampUpDisabledByDynamicConfig(t *testing.T) {
 				Status:     v1.PodStatus{Phase: v1.PodPending},
 			},
 		}}
-		assert.True(t, policy.shouldSharedCoresRampUp(pendingPodUID))
+		assert.True(t, policy.shouldSharedCoresRampUp(context.Background(), pendingPodUID))
+	})
+
+	t.Run("default config treats missing pod as admission ramp up", func(t *testing.T) {
+		t.Parallel()
+		as := require.New(t)
+		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+		as.Nil(err)
+		policy.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: nil}
+		assert.True(t, policy.shouldSharedCoresRampUp(context.Background(), "missing-pod"))
 	})
 
 	t.Run("default config skips active pod ramp up", func(t *testing.T) {
@@ -6214,7 +6303,7 @@ func TestShouldSharedCoresRampUpDisabledByDynamicConfig(t *testing.T) {
 				Status:     v1.PodStatus{Phase: v1.PodRunning},
 			},
 		}}
-		assert.False(t, policy.shouldSharedCoresRampUp(activePodUID))
+		assert.False(t, policy.shouldSharedCoresRampUp(context.Background(), activePodUID))
 	})
 
 	t.Run("disabled config skips pending pod ramp up", func(t *testing.T) {
@@ -6229,7 +6318,7 @@ func TestShouldSharedCoresRampUpDisabledByDynamicConfig(t *testing.T) {
 				Status:     v1.PodStatus{Phase: v1.PodPending},
 			},
 		}}
-		assert.False(t, policy.shouldSharedCoresRampUp(pendingPodUID))
+		assert.False(t, policy.shouldSharedCoresRampUp(context.Background(), pendingPodUID))
 	})
 
 	t.Run("disabled config skips ramp up before pod fetch", func(t *testing.T) {
@@ -6238,7 +6327,7 @@ func TestShouldSharedCoresRampUpDisabledByDynamicConfig(t *testing.T) {
 		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 		as.Nil(err)
 		policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
-		assert.False(t, policy.shouldSharedCoresRampUp("missing-pod"))
+		assert.False(t, policy.shouldSharedCoresRampUp(context.Background(), "missing-pod"))
 	})
 }
 
@@ -8225,7 +8314,17 @@ func TestCheckCPUSet(t *testing.T) {
 	dynamicPolicy, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	as.Nil(err)
 
+	adjustmentCalls := 0
+	dynamicPolicy.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+		"must-not-run-from-check": func(context.Context, dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
+			adjustmentCalls++
+			return nil
+		},
+	}
+	dynamicPolicy.cpuSetAdjustmentRetryDirty = true
 	dynamicPolicy.checkCPUSet(nil, nil, nil, nil, nil)
+	as.Zero(adjustmentCalls)
+	as.True(dynamicPolicy.cpuSetAdjustmentRetryDirty)
 }
 
 func TestSchedIdle(t *testing.T) {
