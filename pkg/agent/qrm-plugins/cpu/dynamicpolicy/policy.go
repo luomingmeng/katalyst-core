@@ -18,6 +18,7 @@ package dynamicpolicy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"sync"
@@ -1175,14 +1176,17 @@ func (p *DynamicPolicy) Allocate(ctx context.Context,
 		}
 		if respErr != nil {
 			inplaceUpdateResizing := util.PodInplaceUpdateResizing(req)
-			if err := p.state.CommitAdvisorState(
-				rollbackPodEntries,
-				rollbackMachineState,
-				rollbackAllowOverlap,
-				rollbackDisableDedicatedOverlap,
-				false,
-			); err != nil {
-				respErr = fmt.Errorf("%w; restore allocation state failed: %v", respErr, err)
+			var compensated *requestStateCompensatedError
+			if !errors.As(respErr, &compensated) {
+				if err := p.state.CommitAdvisorState(
+					rollbackPodEntries,
+					rollbackMachineState,
+					rollbackAllowOverlap,
+					rollbackDisableDedicatedOverlap,
+					false,
+				); err != nil {
+					respErr = fmt.Errorf("%w; restore allocation state failed: %v", respErr, err)
+				}
 			}
 
 			metricTags := []metrics.MetricTag{
