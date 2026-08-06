@@ -70,6 +70,68 @@ func TestGetContainerAbsCgroupPath(t *testing.T) {
 	as.NotNil(err)
 }
 
+func TestGetContainerAbsCgroupPathSkipsHandlers(t *testing.T) {
+	as := require.New(t)
+
+	absoluteCgroupPathHandlerLock.Lock()
+	oldHandlers := absoluteCgroupPathHandlerList
+	absoluteCgroupPathHandlerList = []AbsoluteCgroupPathHandler{
+		{
+			Name: "skip",
+			Handler: func(subsys, podUID, containerId string) (string, bool, error) {
+				return "", true, nil
+			},
+		},
+		{
+			Name: "success",
+			Handler: func(subsys, podUID, containerId string) (string, bool, error) {
+				return "/sys/fs/cgroup/cpu/pod/container", false, nil
+			},
+		},
+	}
+	absoluteCgroupPathHandlerLock.Unlock()
+	defer func() {
+		absoluteCgroupPathHandlerLock.Lock()
+		absoluteCgroupPathHandlerList = oldHandlers
+		absoluteCgroupPathHandlerLock.Unlock()
+	}()
+
+	cgroupPath, err := GetContainerAbsCgroupPath("cpu", "pod", "container")
+	as.NoError(err)
+	as.Equal("/sys/fs/cgroup/cpu/pod/container", cgroupPath)
+}
+
+func TestGetContainerRelativeCgroupPathSkipsHandlers(t *testing.T) {
+	as := require.New(t)
+
+	relativeCgroupPathHandlerLock.Lock()
+	oldHandlers := relativeCgroupPathHandlerList
+	relativeCgroupPathHandlerList = []RelativeCgroupPathHandler{
+		{
+			Name: "skip",
+			Handler: func(podUID, containerId string) (string, bool, error) {
+				return "", true, nil
+			},
+		},
+		{
+			Name: "success",
+			Handler: func(podUID, containerId string) (string, bool, error) {
+				return "/kubepods/pod/container", false, nil
+			},
+		},
+	}
+	relativeCgroupPathHandlerLock.Unlock()
+	defer func() {
+		relativeCgroupPathHandlerLock.Lock()
+		relativeCgroupPathHandlerList = oldHandlers
+		relativeCgroupPathHandlerLock.Unlock()
+	}()
+
+	cgroupPath, err := GetContainerRelativeCgroupPath("pod", "container")
+	as.NoError(err)
+	as.Equal("/kubepods/pod/container", cgroupPath)
+}
+
 func TestIsContainerCgroupExist(t *testing.T) {
 	t.Parallel()
 
