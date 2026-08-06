@@ -40,8 +40,16 @@ type DesiredView struct {
 	CPUSetPartitionView
 }
 
+type AppliedViewLevel string
+
+const (
+	AppliedViewLevelParentSafe AppliedViewLevel = "parent_safe"
+	AppliedViewLevelFull       AppliedViewLevel = "full"
+)
+
 type AppliedView struct {
 	CPUSetPartitionView
+	Level AppliedViewLevel
 	// CPUSetByRel is the final-snapshot proof for each controlled topology rel.
 	// Consumers that act on a specific cgroup must authorize against this map
 	// instead of inferring ownership from an aggregate partition union.
@@ -95,6 +103,7 @@ func (v *DesiredView) ToAppliedView() *AppliedView {
 	}
 	return &AppliedView{
 		CPUSetPartitionView: *v.CPUSetPartitionView.DeepCopy(),
+		Level:               AppliedViewLevelFull,
 		CPUSetByRel:         map[string]machine.CPUSet{},
 		RelProofByRel:       map[string]CgroupRelProof{},
 	}
@@ -106,6 +115,7 @@ func (v *AppliedView) DeepCopy() *AppliedView {
 	}
 	return &AppliedView{
 		CPUSetPartitionView: *v.CPUSetPartitionView.DeepCopy(),
+		Level:               v.Level,
 		CPUSetByRel:         cloneCPUSetMap(v.CPUSetByRel),
 		RelProofByRel:       cloneCgroupRelProofMap(v.RelProofByRel),
 	}
@@ -165,7 +175,8 @@ func EqualAppliedView(a, b *AppliedView) bool {
 		return a == b
 	}
 	return equalCPUSetMap(a.CPUSetByRel, b.CPUSetByRel) &&
-		equalCgroupRelProofMap(a.RelProofByRel, b.RelProofByRel)
+		equalCgroupRelProofMap(a.RelProofByRel, b.RelProofByRel) &&
+		a.Level == b.Level
 }
 
 func cpuSetPartitionViewFromDesired(v *DesiredView) *CPUSetPartitionView {

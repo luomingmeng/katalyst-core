@@ -849,6 +849,9 @@ func TestRevalidateGrowAuthorizationRejectsChildGrowOutsideFreshParent(t *testin
 	if stale.Rel != "tiger/http2p.agent.service" || stale.Resource != "parent_cpuset" {
 		t.Fatalf("stale error = %+v, want child parent_cpuset stale", stale)
 	}
+	if round.pendingSnapshot != fresh {
+		t.Fatalf("pending snapshot = %p, want stale-triggering fresh snapshot %p", round.pendingSnapshot, fresh)
+	}
 }
 
 func TestTopologyCoordinatorConvergeResetModeDeadlineDurationExpiresBeforeWrite_BitsUT(t *testing.T) {
@@ -861,17 +864,13 @@ func TestTopologyCoordinatorConvergeResetModeDeadlineDurationExpiresBeforeWrite_
 	cg := newTopologyFakeCgroup()
 	cg.cpus["primary"] = machine.NewCPUSet(0, 1)
 
-	oldNow := coordinatorNow
-	coordinatorNow = func() time.Time { return time.Now().Add(-time.Second) }
-	defer func() { coordinatorNow = oldNow }()
-
 	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:    dag,
 		Cgroup: cg,
 		Mems:   "0",
 		Mode:   ResetModeGuard(),
 		Budget: ConvergenceBudget{
-			DeadlineDuration: time.Nanosecond,
+			Deadline: time.Now().Add(-time.Second),
 		},
 	})
 	if !errors.Is(err, ErrConvergenceDeadlineExceeded) {
@@ -1022,11 +1021,10 @@ func TestTopologyCoordinatorConvergeShrinksIntersectionBeforeExpandingOverlapRep
 	cg.cpus["primary"] = machine.NewCPUSet(0, 1, 2)
 
 	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
-		DAG:                  dag,
-		Cgroup:               cg,
-		CPUDetails:           testCPUDetails(),
-		Mems:                 "0",
-		KubeManagedRelPrefix: "kubepods",
+		DAG:        dag,
+		Cgroup:     cg,
+		CPUDetails: testCPUDetails(),
+		Mems:       "0",
 	})
 	if err != nil {
 		t.Fatalf("TopologyCoordinatorConverge: %v", err)

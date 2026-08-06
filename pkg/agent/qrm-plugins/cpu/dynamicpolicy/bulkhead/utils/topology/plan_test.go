@@ -27,6 +27,256 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
+func TestSplitPlanForAdmissionClassifiesRequiredAndDeferredWithoutLoss(t *testing.T) {
+	t.Parallel()
+
+	plan := &PhasePlan{
+		Kind: PhaseExpand,
+		Operations: []PlanOperation{
+			{Rel: "reclaim/source", Direction: WriteShrink, ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(1, 2)}, Target: CPUSetTarget{CPUs: machine.NewCPUSet(2)}},
+			{Rel: "primary/pod", Direction: WriteGrow, ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(0)}, Target: CPUSetTarget{CPUs: machine.NewCPUSet(0, 1)}},
+			{Rel: "primary/pod/container", Direction: WriteShrink, ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(0, 1, 2)}, Target: CPUSetTarget{CPUs: machine.NewCPUSet(0, 1)}},
+		},
+	}
+	required, deferred, err := SplitPlanForAdmission(plan, AdmissionSafetyInput{
+		ProtectedPendingCPUSet: machine.NewCPUSet(1),
+		DeferredCPUSetByRel: map[string]machine.CPUSet{
+			"primary/pod/container": machine.NewCPUSet(0, 1),
+		},
+	})
+	if err != nil {
+		t.Fatalf("SplitPlanForAdmission() error = %v", err)
+	}
+	if len(required.Operations) != 2 || len(deferred.Operations) != 1 {
+		t.Fatalf("split counts required=%d deferred=%d, want 2/1", len(required.Operations), len(deferred.Operations))
+	}
+	if required.Operations[0].Requirement != OperationAdmissionSourceDrain {
+		t.Fatalf("source requirement = %q", required.Operations[0].Requirement)
+	}
+	if required.Operations[1].Requirement != OperationAdmissionAncestorGrow {
+		t.Fatalf("ancestor requirement = %q", required.Operations[1].Requirement)
+	}
+	if deferred.Operations[0].Requirement != OperationDeferredLeafExact {
+		t.Fatalf("leaf requirement = %q", deferred.Operations[0].Requirement)
+	}
+
+	for _, tc := range []struct {
+		name        string
+		source      DomainID
+		destination DomainID
+		sourceRel   string
+	}{
+		{name: "PrimaryToReclaim", source: DomainPrimary, destination: DomainReclaim, sourceRel: "primary/source-owner"},
+		{name: "ReclaimToPrimary", source: DomainReclaim, destination: DomainPrimary, sourceRel: "reclaim/source-owner"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			sourcePlan := &PhasePlan{
+				Kind: PhaseDrain,
+				Base: &CompleteSnapshot{
+					DomainByRel: map[string]DomainID{tc.sourceRel: tc.source},
+				},
+				TransferGraph: map[DomainID]map[DomainID]machine.CPUSet{
+					tc.source: {
+						tc.destination: machine.NewCPUSet(2),
+					},
+				},
+				Operations: []PlanOperation{{
+					Rel:             tc.sourceRel,
+					Direction:       WriteShrink,
+					ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(2, 3)},
+					Target:          CPUSetTarget{CPUs: machine.NewCPUSet(3)},
+				}},
+			}
+
+			required, deferred, err := SplitPlanForAdmission(sourcePlan, AdmissionSafetyInput{})
+			if err != nil {
+				t.Fatalf("SplitPlanForAdmission() error = %v", err)
+			}
+			if len(required.Operations) != 1 || len(deferred.Operations) != 0 {
+				t.Fatalf("split counts required=%d deferred=%d, want %s source owner required",
+					len(required.Operations), len(deferred.Operations), tc.source)
+			}
+			if got := required.Operations[0].Requirement; got != OperationAdmissionSourceDrain {
+				t.Fatalf("%s source owner requirement = %q, want %q",
+					tc.source, got, OperationAdmissionSourceDrain)
+			}
+		})
+	}
+}
+
+func TestSplitPlanForAdmissionRequiresIncomingTransferGrowAndDefersUnrelatedGrow(t *testing.T) {
+	t.Parallel()
+
+	plan := &PhasePlan{
+		Base: &CompleteSnapshot{DomainByRel: map[string]DomainID{
+			"reclaim/required": DomainReclaim,
+			"primary/history":  DomainPrimary,
+		}},
+		TransferGraph: map[DomainID]map[DomainID]machine.CPUSet{
+			DomainPrimary: {DomainReclaim: machine.NewCPUSet(2)},
+		},
+		Operations: []PlanOperation{
+			{
+				Rel:             "reclaim/required",
+				Direction:       WriteGrow,
+				ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(3)},
+				Target:          CPUSetTarget{CPUs: machine.NewCPUSet(2, 3)},
+			},
+			{
+				Rel:             "primary/history",
+				Direction:       WriteGrow,
+				ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(4)},
+				Target:          CPUSetTarget{CPUs: machine.NewCPUSet(4, 5)},
+			},
+		},
+	}
+
+	required, deferred, err := SplitPlanForAdmission(plan, AdmissionSafetyInput{})
+	if err != nil {
+		t.Fatalf("SplitPlanForAdmission() error = %v", err)
+	}
+	if len(required.Operations) != 1 || required.Operations[0].Rel != "reclaim/required" {
+		t.Fatalf("required operations = %+v, want only incoming transfer grow", required.Operations)
+	}
+	if len(deferred.Operations) != 1 || deferred.Operations[0].Rel != "primary/history" {
+		t.Fatalf("deferred operations = %+v, want only unrelated grow", deferred.Operations)
+	}
+}
+
+func TestSplitPlanForAdmissionPromotesAncestorGrowRequiredByChild(t *testing.T) {
+	t.Parallel()
+
+	plan := &PhasePlan{
+		Base: &CompleteSnapshot{
+			Entries: map[string]EntryState{
+				"primary":           {CPUs: machine.NewCPUSet(2, 3)},
+				"primary/container": {CPUs: machine.NewCPUSet(2, 3)},
+			},
+			DomainByRel: map[string]DomainID{
+				"primary":           DomainPrimary,
+				"primary/container": DomainReclaim,
+			},
+		},
+		TransferGraph: map[DomainID]map[DomainID]machine.CPUSet{
+			DomainPrimary: {DomainReclaim: machine.NewCPUSet(1)},
+		},
+		Operations: []PlanOperation{
+			{
+				Rel:             "primary",
+				Direction:       WriteGrow,
+				ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(2, 3)},
+				Target:          CPUSetTarget{CPUs: machine.NewCPUSet(1, 2, 3)},
+			},
+			{
+				Rel:             "primary/container",
+				ParentRel:       "primary",
+				Direction:       WriteGrow,
+				ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(2, 3)},
+				Target:          CPUSetTarget{CPUs: machine.NewCPUSet(1, 2, 3)},
+			},
+		},
+	}
+
+	required, deferred, err := SplitPlanForAdmission(plan, AdmissionSafetyInput{})
+	if err != nil {
+		t.Fatalf("SplitPlanForAdmission() error = %v", err)
+	}
+	if len(required.Operations) != 2 || len(deferred.Operations) != 0 {
+		t.Fatalf("split counts required=%d deferred=%d, want 2/0",
+			len(required.Operations), len(deferred.Operations))
+	}
+	if got := required.Operations[0]; got.Rel != "primary" ||
+		got.Requirement != OperationAdmissionAncestorGrow {
+		t.Fatalf("first required operation = %+v, want promoted parent grow", got)
+	}
+	if got := required.Operations[1].Rel; got != "primary/container" {
+		t.Fatalf("second required operation = %q, want child grow", got)
+	}
+}
+
+func TestSplitPlanForAdmissionRejectsChildGrowNotCoveredByParent(t *testing.T) {
+	t.Parallel()
+
+	plan := &PhasePlan{
+		Base: &CompleteSnapshot{
+			Entries: map[string]EntryState{
+				"primary":           {CPUs: machine.NewCPUSet(2, 3)},
+				"primary/container": {CPUs: machine.NewCPUSet(2, 3)},
+			},
+			DomainByRel: map[string]DomainID{
+				"primary/container": DomainReclaim,
+			},
+		},
+		TransferGraph: map[DomainID]map[DomainID]machine.CPUSet{
+			DomainPrimary: {DomainReclaim: machine.NewCPUSet(1)},
+		},
+		Operations: []PlanOperation{{
+			Rel:             "primary/container",
+			ParentRel:       "primary",
+			Direction:       WriteGrow,
+			ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(2, 3)},
+			Target:          CPUSetTarget{CPUs: machine.NewCPUSet(1, 2, 3)},
+		}},
+	}
+
+	_, _, err := SplitPlanForAdmission(plan, AdmissionSafetyInput{})
+	if err == nil {
+		t.Fatal("SplitPlanForAdmission() error = nil, want uncovered parent rejection")
+	}
+}
+
+func TestSplitPlanForAdmissionPromotesReplacementShrinkRequiredByGrow(t *testing.T) {
+	t.Parallel()
+
+	plan := &PhasePlan{
+		Base: &CompleteSnapshot{
+			Entries: map[string]EntryState{
+				"primary":           {CPUs: machine.NewCPUSet(0, 1, 2, 3)},
+				"primary/container": {CPUs: machine.NewCPUSet(1, 2)},
+			},
+			DomainByRel: map[string]DomainID{
+				"primary/container": DomainReclaim,
+			},
+		},
+		TransferGraph: map[DomainID]map[DomainID]machine.CPUSet{
+			DomainPrimary: {DomainReclaim: machine.NewCPUSet(3)},
+		},
+		Operations: []PlanOperation{
+			{
+				Rel:             "primary/container",
+				ParentRel:       "primary",
+				Direction:       WriteShrink,
+				ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(1, 2)},
+				Target:          CPUSetTarget{CPUs: machine.NewCPUSet(2)},
+			},
+			{
+				Rel:             "primary/container",
+				ParentRel:       "primary",
+				Direction:       WriteGrow,
+				ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(2)},
+				Target:          CPUSetTarget{CPUs: machine.NewCPUSet(2, 3)},
+			},
+		},
+	}
+
+	required, deferred, err := SplitPlanForAdmission(plan, AdmissionSafetyInput{})
+	if err != nil {
+		t.Fatalf("SplitPlanForAdmission() error = %v", err)
+	}
+	if len(required.Operations) != 2 || len(deferred.Operations) != 0 {
+		t.Fatalf("split counts required=%d deferred=%d, want replacement 2/0",
+			len(required.Operations), len(deferred.Operations))
+	}
+	if got := required.Operations[0]; got.Direction != WriteShrink ||
+		got.Requirement != OperationAdmissionSafetyRepair {
+		t.Fatalf("first required operation = %+v, want replacement shrink prerequisite", got)
+	}
+	if got := required.Operations[1].Direction; got != WriteGrow {
+		t.Fatalf("second required direction = %q, want grow", got)
+	}
+}
+
 func TestTransferGraphSupportsThreeDomainCycleAndDrainsBeforeExpand(t *testing.T) {
 	t.Parallel()
 
@@ -44,7 +294,7 @@ func TestTransferGraphSupportsThreeDomainCycleAndDrainsBeforeExpand(t *testing.T
 	})
 
 	plan, err := BuildPhasePlan(PhasePlanInput{
-		Kind: PhaseDrain, DAG: dag, Snapshot: snapshot,
+		Kind: PhaseExpand, DAG: dag, Snapshot: snapshot,
 		DesiredByRel: map[string]machine.CPUSet{
 			"a": machine.NewCPUSet(2), "b": machine.NewCPUSet(0), "c": machine.NewCPUSet(1),
 		},
@@ -128,7 +378,7 @@ func TestV2PlannerEmptyTargetNormalConvergenceUsesConfiguredCPUs(t *testing.T) {
 		},
 	}, map[DomainID]machine.CPUSet{DomainPrimary: machine.MustParse("0-3")})
 	plan, err := BuildPhasePlan(PhasePlanInput{
-		Kind: PhaseDrain, DAG: dag, Snapshot: snapshot,
+		Kind: PhaseExpand, DAG: dag, Snapshot: snapshot,
 		DesiredByRel: map[string]machine.CPUSet{"primary": machine.NewCPUSet()},
 		AllowedCPUs:  machine.MustParse("0-3"), AllowEmptyTarget: true,
 		Capabilities: cgroupV2Policy.capabilities(true),
@@ -611,7 +861,6 @@ func TestPairedCycleKeepsRelProtectedEdgesPendingWithEmptyDrainBatch(t *testing.
 			t.Fatalf("protected blocked SCC generated operations: %#v", plan.Operations)
 		}
 	})
-
 }
 
 func TestPhasePlanDoesNotApplyPrimaryProtectionToReclaimDrain(t *testing.T) {
@@ -902,12 +1151,16 @@ func TestPlannerGeneratesStableConvergenceIDFromIntent(t *testing.T) {
 	build := func(t *testing.T, mutate func(*PhasePlanInput, *TopoDAG, *CompleteSnapshot)) string {
 		t.Helper()
 		dag := mustPlanDAG(t, []NodeSpec{
-			{Rel: "root", Role: TopoNodeRoleReclaim, Domain: "a", CPUs: machine.NewCPUSet(0, 1), Mems: "0",
+			{
+				Rel: "root", Role: TopoNodeRoleReclaim, Domain: "a", CPUs: machine.NewCPUSet(0, 1), Mems: "0",
 				ControlledRoot: true, TrustAnchor: true, Constraint: TopologyConstraint{
 					CPUUpperBound: machine.NewCPUSet(0, 1, 2), MemUpperBound: machine.NewCPUSet(0, 1),
-				}},
-			{Rel: "root/child", ParentRel: "root", Role: TopoNodeRoleReclaimSibling, Domain: "a",
-				CPUs: machine.NewCPUSet(0), Mems: "0"},
+				},
+			},
+			{
+				Rel: "root/child", ParentRel: "root", Role: TopoNodeRoleReclaimSibling, Domain: "a",
+				CPUs: machine.NewCPUSet(0), Mems: "0",
+			},
 		})
 		snapshot := planSnapshot(map[string]EntryState{
 			"root":       {Identity: CgroupIdentity{Device: 1, Inode: 1}, CPUs: machine.NewCPUSet(0, 1), Mems: "0"},
@@ -1752,10 +2005,12 @@ func TestPhasePlanRejectsBucketOutsideDomainParentAndMemsEnvelopes(t *testing.T)
 
 	dag := mustPlanDAG(t, []NodeSpec{
 		{Rel: "reclaim", Domain: DomainReclaim, CPUs: machine.NewCPUSet(0), Mems: "0"},
-		{Rel: "reclaim/bucket", ParentRel: "reclaim", Domain: DomainReclaim, Role: TopoNodeRoleReclaimNUMABucket,
+		{
+			Rel: "reclaim/bucket", ParentRel: "reclaim", Domain: DomainReclaim, Role: TopoNodeRoleReclaimNUMABucket,
 			CPUs: machine.NewCPUSet(0, 1), Mems: "0-1", Constraint: TopologyConstraint{
 				CPUUpperBound: machine.NewCPUSet(0, 1), MemUpperBound: machine.NewCPUSet(0, 1), Scope: TopologyScopeNUMANode,
-			}},
+			},
+		},
 	})
 	snapshot := planSnapshot(map[string]EntryState{
 		"reclaim":        {Identity: CgroupIdentity{Inode: 1}, CPUs: machine.NewCPUSet(0), Mems: "0"},
@@ -1783,8 +2038,10 @@ func TestPhasePlanRejectsCPUAndMemsClosureForEveryControlledParentChild(t *testi
 		t.Run(field, func(t *testing.T) {
 			dag := mustPlanDAG(t, []NodeSpec{
 				{Rel: "root", Role: TopoNodeRolePrimary, Domain: "a", CPUs: machine.NewCPUSet(0), Mems: "0"},
-				{Rel: "root/child", ParentRel: "root", Role: TopoNodeRoleReclaimSibling, Domain: "a",
-					CPUs: machine.NewCPUSet(0), Mems: "0"},
+				{
+					Rel: "root/child", ParentRel: "root", Role: TopoNodeRoleReclaimSibling, Domain: "a",
+					CPUs: machine.NewCPUSet(0), Mems: "0",
+				},
 			})
 			snapshot := planSnapshot(map[string]EntryState{
 				"root":       {Identity: CgroupIdentity{Inode: 1}, CPUs: machine.NewCPUSet(0), Mems: "0"},
@@ -1817,13 +2074,15 @@ func TestNUMABucketStacksConstraintParentAndDomainUpperBounds(t *testing.T) {
 		dag := mustPlanDAG(t, []NodeSpec{
 			{Rel: "domain", Domain: DomainReclaim, CPUs: machine.NewCPUSet(0, 1), Mems: "0-1"},
 			{Rel: "domain/parent", ParentRel: "domain", Domain: DomainReclaim, CPUs: machine.NewCPUSet(0), Mems: "0"},
-			{Rel: "domain/parent/bucket", ParentRel: "domain/parent", Domain: DomainReclaim,
+			{
+				Rel: "domain/parent/bucket", ParentRel: "domain/parent", Domain: DomainReclaim,
 				Role: TopoNodeRoleReclaimNUMABucket, CPUs: bucketCPUs, Mems: bucketMems,
 				Constraint: TopologyConstraint{
 					CPUUpperBound: machine.NewCPUSet(0, 2),
 					MemUpperBound: machine.NewCPUSet(0, 2),
 					Scope:         TopologyScopeNUMANode,
-				}},
+				},
+			},
 		})
 		snapshot := planSnapshot(map[string]EntryState{
 			"domain":               {Identity: CgroupIdentity{Inode: 1}, CPUs: machine.NewCPUSet(0), Mems: "0"},
@@ -1874,16 +2133,20 @@ func TestDrainPlanConfinesFullResetBucketToNUMAUpperBound(t *testing.T) {
 	dag := mustPlanDAG(t, []NodeSpec{
 		{Rel: "kubepods", Domain: DomainPrimary, Role: TopoNodeRolePrimary, CPUs: allCPUs, Mems: "0-1", TrustAnchor: true},
 		{Rel: "kubesandbox", Domain: DomainReclaim, Role: TopoNodeRoleReclaimSibling, CPUs: allCPUs, Mems: "0-1", TrustAnchor: true},
-		{Rel: "kubesandbox/reclaimed-0", ParentRel: "kubesandbox", Domain: DomainReclaim,
+		{
+			Rel: "kubesandbox/reclaimed-0", ParentRel: "kubesandbox", Domain: DomainReclaim,
 			Role: TopoNodeRoleReclaimNUMABucket, CPUs: bucket0, Mems: "0",
 			Constraint: TopologyConstraint{
 				CPUUpperBound: bucket0, MemUpperBound: machine.NewCPUSet(0), Scope: TopologyScopeNUMANode,
-			}},
-		{Rel: "kubesandbox/reclaimed-1", ParentRel: "kubesandbox", Domain: DomainReclaim,
+			},
+		},
+		{
+			Rel: "kubesandbox/reclaimed-1", ParentRel: "kubesandbox", Domain: DomainReclaim,
 			Role: TopoNodeRoleReclaimNUMABucket, CPUs: bucket1, Mems: "1",
 			Constraint: TopologyConstraint{
 				CPUUpperBound: bucket1, MemUpperBound: machine.NewCPUSet(1), Scope: TopologyScopeNUMANode,
-			}},
+			},
+		},
 	})
 	snapshot := planSnapshot(map[string]EntryState{
 		"kubepods":                {Identity: CgroupIdentity{Inode: 1}, CPUs: allCPUs, Mems: "0-1"},
@@ -2079,11 +2342,13 @@ func TestDrainPlanPropagatesNearestBucketCPUUpperBoundToDynamicDescendants(t *te
 	dag := mustPlanDAG(t, []NodeSpec{
 		{Rel: "primary", Domain: DomainPrimary, Role: TopoNodeRolePrimary, CPUs: allCPUs, Mems: "0-1", TrustAnchor: true},
 		{Rel: "reclaim", Domain: DomainReclaim, Role: TopoNodeRoleReclaimSibling, CPUs: bucketCPUs, Mems: "0", TrustAnchor: true},
-		{Rel: "reclaim/bucket-0", ParentRel: "reclaim", Domain: DomainReclaim,
+		{
+			Rel: "reclaim/bucket-0", ParentRel: "reclaim", Domain: DomainReclaim,
 			Role: TopoNodeRoleReclaimNUMABucket, CPUs: bucketCPUs, Mems: "0",
 			Constraint: TopologyConstraint{
 				CPUUpperBound: bucketCPUs, MemUpperBound: machine.NewCPUSet(0), Scope: TopologyScopeNUMANode,
-			}},
+			},
+		},
 	})
 	snapshot := planSnapshot(map[string]EntryState{
 		"primary":                          {Identity: CgroupIdentity{Inode: 1}, CPUs: allCPUs, Mems: "0-1"},
@@ -2158,11 +2423,13 @@ func TestDrainPlanBuildsBottomUpRequiredEnvelopeForResetFullDynamicTree(t *testi
 	dag := mustPlanDAG(t, []NodeSpec{
 		{Rel: "kubepods", Domain: DomainPrimary, Role: TopoNodeRolePrimary, CPUs: allCPUs, Mems: "0", TrustAnchor: true},
 		{Rel: "kubesandbox", Domain: DomainReclaim, Role: TopoNodeRoleReclaimSibling, CPUs: allCPUs, Mems: "0", TrustAnchor: true},
-		{Rel: "kubesandbox/reclaimed-0", ParentRel: "kubesandbox", Domain: DomainReclaim,
+		{
+			Rel: "kubesandbox/reclaimed-0", ParentRel: "kubesandbox", Domain: DomainReclaim,
 			Role: TopoNodeRoleReclaimNUMABucket, CPUs: bucketCPUs, Mems: "0",
 			Constraint: TopologyConstraint{
 				CPUUpperBound: bucketCPUs, MemUpperBound: machine.NewCPUSet(0), Scope: TopologyScopeNUMANode,
-			}},
+			},
+		},
 	})
 	snapshot := planSnapshot(map[string]EntryState{
 		"kubepods":                              {Identity: CgroupIdentity{Inode: 1}, CPUs: allCPUs, Mems: "0"},

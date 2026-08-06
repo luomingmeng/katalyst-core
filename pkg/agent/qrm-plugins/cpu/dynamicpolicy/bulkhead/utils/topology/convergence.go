@@ -36,6 +36,130 @@ type RelConvergence struct {
 	Reason       string
 }
 
+type ParentSafetyReport struct {
+	Safe                   bool
+	PendingOutsidePrimary  machine.CPUSet
+	PendingInsideReclaim   machine.CPUSet
+	PrimaryReclaimOverlap  machine.CPUSet
+	UnsafeRequiredRels     []RelConvergence
+	DeferredLeafMismatches []RelConvergence
+}
+
+type coordinatorSnapshotEvaluation struct {
+	Report       ConvergenceReport
+	ParentSafety ParentSafetyReport
+}
+
+func evaluateCoordinatorSnapshot(
+	snapshot *CompleteSnapshot,
+	dag *TopoDAG,
+	targetByRel map[string]machine.CPUSet,
+	targetMemsByRel map[string]string,
+	desired map[DomainID]machine.CPUSet,
+	allowedCPUs machine.CPUSet,
+	expectedByRel map[string]machine.CPUSet,
+	deferredByRel map[string]machine.CPUSet,
+	deferredMismatchRels map[string]struct{},
+	protectedPending machine.CPUSet,
+	capabilities HierarchyCapabilities,
+	allowEmptyTarget bool,
+) (coordinatorSnapshotEvaluation, error) {
+	report, err := buildConvergenceReport(
+		snapshot, dag, targetByRel, targetMemsByRel, desired,
+		allowedCPUs, capabilities, allowEmptyTarget,
+	)
+	if err != nil {
+		return coordinatorSnapshotEvaluation{}, err
+	}
+	includeMaterializedDynamicConvergence(&report, snapshot, expectedByRel, capabilities)
+	includeMaterializedDynamicConvergence(&report, snapshot, deferredByRel, capabilities)
+	return coordinatorSnapshotEvaluation{
+		Report: report,
+		ParentSafety: buildParentSafetyReport(
+			snapshot, dag, targetByRel, report, protectedPending,
+			deferredByRel, deferredMismatchRels, capabilities,
+		),
+	}, nil
+}
+
+func buildParentSafetyReport(
+	snapshot *CompleteSnapshot,
+	dag *TopoDAG,
+	_ map[string]machine.CPUSet,
+	convergence ConvergenceReport,
+	protectedPending machine.CPUSet,
+	deferredByRel map[string]machine.CPUSet,
+	deferredMismatchRels map[string]struct{},
+	capabilities HierarchyCapabilities,
+) ParentSafetyReport {
+	report := ParentSafetyReport{
+		PendingOutsidePrimary: protectedPending.Clone(),
+	}
+	if snapshot == nil || dag == nil {
+		return report
+	}
+	primary := snapshot.DomainUnion[DomainPrimary]
+	reclaim := snapshot.DomainUnion[DomainReclaim]
+	report.PendingOutsidePrimary = protectedPending.Difference(primary)
+	report.PendingInsideReclaim = protectedPending.Intersection(reclaim)
+	report.PrimaryReclaimOverlap = primary.Intersection(reclaim)
+	for _, mismatch := range convergence.NonConvergedTargets {
+		_, deferredLeaf := deferredByRel[mismatch.Rel]
+		_, deferredCleanup := deferredMismatchRels[mismatch.Rel]
+		if deferredLeaf || deferredCleanup {
+			report.DeferredLeafMismatches = append(report.DeferredLeafMismatches, mismatch)
+			continue
+		}
+		report.UnsafeRequiredRels = append(report.UnsafeRequiredRels, mismatch)
+	}
+	for rel, expected := range deferredByRel {
+		entry, ok := snapshot.Entries[rel]
+		if !ok {
+			report.UnsafeRequiredRels = append(report.UnsafeRequiredRels, RelConvergence{
+				Rel: rel, Target: expected.Clone(), Reason: convergenceReasonReadError,
+			})
+			continue
+		}
+		observed := observedCPUsForTargetProof(entry, expected, capabilities)
+		if !observed.Intersection(reclaim).IsEmpty() || !expected.Intersection(reclaim).IsEmpty() {
+			report.UnsafeRequiredRels = append(report.UnsafeRequiredRels, RelConvergence{
+				Rel: rel, Observed: observed.Clone(), Target: expected.Clone(), Reason: "unsafe_deferred_leaf",
+			})
+		}
+	}
+	for parentRel, children := range snapshot.Children {
+		parent, ok := snapshot.Entries[parentRel]
+		if !ok {
+			continue
+		}
+		for _, child := range children {
+			childRel := child.Name
+			if parentRel != "" {
+				childRel = parentRel + "/" + child.Name
+			}
+			childEntry, exists := snapshot.Entries[childRel]
+			if exists && !childEntry.CPUs.IsSubsetOf(parent.CPUs) {
+				report.UnsafeRequiredRels = append(report.UnsafeRequiredRels, RelConvergence{
+					Rel: childRel, Observed: childEntry.CPUs.Clone(), Target: parent.CPUs.Clone(), Reason: "parent_not_containing_child",
+				})
+			}
+		}
+	}
+	report.Safe = report.PendingOutsidePrimary.IsEmpty() &&
+		report.PendingInsideReclaim.IsEmpty() &&
+		report.PrimaryReclaimOverlap.IsEmpty() &&
+		len(report.UnsafeRequiredRels) == 0
+	return report
+}
+
+func mergeCPUSetMaps(left, right map[string]machine.CPUSet) map[string]machine.CPUSet {
+	out := cloneCPUSetMap(left)
+	for rel, cpus := range right {
+		out[rel] = cpus.Clone()
+	}
+	return out
+}
+
 const (
 	convergenceReasonTargetMismatch = "target_mismatch"
 	convergenceReasonReadError      = "read_error"

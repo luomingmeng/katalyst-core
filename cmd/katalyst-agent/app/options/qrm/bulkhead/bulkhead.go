@@ -45,6 +45,9 @@ type BulkheadOptions struct {
 	MaxCPUsDrainRatio           float64
 	TopologyConvergenceDeadline time.Duration
 	MaxDeadlockProbeOperations  int
+	EnableAdmissionLeafDefer    bool
+	AdmissionMaxRequiredWrites  int
+	AdmissionSafeDuration       time.Duration
 }
 
 func NewBulkheadOptions() BulkheadOptions {
@@ -63,7 +66,10 @@ func NewBulkheadOptions() BulkheadOptions {
 		// they are not migratable.
 		BulkheadSystemKThreadCommSubstrs: []string{"kswapd", "kcompactd"},
 		TopologyConvergenceDeadline:      bulkheadconfig.DefaultTopologyConvergenceDeadline,
-		MaxDeadlockProbeOperations:       bulkheadconfig.DefaultDeadlockProbeOperations,
+		MaxDeadlockProbeOperations:       0,
+		EnableAdmissionLeafDefer:         true,
+		AdmissionMaxRequiredWrites:       0,
+		AdmissionSafeDuration:            5 * time.Second,
 	}
 }
 
@@ -96,7 +102,13 @@ func (o *BulkheadOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 	fs.DurationVar(&o.TopologyConvergenceDeadline, "qrm-cpu-bulkhead-topology-convergence-deadline",
 		o.TopologyConvergenceDeadline, "The deadline for one cpu bulkhead topology convergence invocation.")
 	fs.IntVar(&o.MaxDeadlockProbeOperations, "qrm-cpu-bulkhead-deadlock-probe-operations",
-		o.MaxDeadlockProbeOperations, "The maximum projected operations used by one cpu bulkhead deadlock probe.")
+		o.MaxDeadlockProbeOperations, "The maximum projected operations used by one cpu bulkhead deadlock probe; 0 means auto-sized by topology shape.")
+	fs.BoolVar(&o.EnableAdmissionLeafDefer, "qrm-cpu-bulkhead-admission-leaf-defer",
+		o.EnableAdmissionLeafDefer, "Allow admission to return after parent-safe convergence and defer exact leaf convergence.")
+	fs.IntVar(&o.AdmissionMaxRequiredWrites, "qrm-cpu-bulkhead-admission-max-required-writes",
+		o.AdmissionMaxRequiredWrites, "Maximum required cgroup writes in one parent-safe admission; 0 disables the fixed write cap and relies on the admission duration deadline.")
+	fs.DurationVar(&o.AdmissionSafeDuration, "qrm-cpu-bulkhead-admission-safe-duration",
+		o.AdmissionSafeDuration, "Maximum duration spent proving parent-safe admission.")
 }
 
 func (o *BulkheadOptions) ApplyTo(conf *bulkheadconfig.BulkheadConfiguration) error {
@@ -109,8 +121,14 @@ func (o *BulkheadOptions) ApplyTo(conf *bulkheadconfig.BulkheadConfiguration) er
 	if o.TopologyConvergenceDeadline <= 0 {
 		return fmt.Errorf("qrm-cpu-bulkhead-topology-convergence-deadline must be positive, got %s", o.TopologyConvergenceDeadline)
 	}
-	if o.MaxDeadlockProbeOperations <= 0 {
-		return fmt.Errorf("qrm-cpu-bulkhead-deadlock-probe-operations must be positive, got %d", o.MaxDeadlockProbeOperations)
+	if o.MaxDeadlockProbeOperations < 0 {
+		return fmt.Errorf("qrm-cpu-bulkhead-deadlock-probe-operations must be non-negative, got %d", o.MaxDeadlockProbeOperations)
+	}
+	if o.AdmissionMaxRequiredWrites < 0 {
+		return fmt.Errorf("qrm-cpu-bulkhead-admission-max-required-writes must be non-negative, got %d", o.AdmissionMaxRequiredWrites)
+	}
+	if o.AdmissionSafeDuration <= 0 {
+		return fmt.Errorf("qrm-cpu-bulkhead-admission-safe-duration must be positive, got %s", o.AdmissionSafeDuration)
 	}
 	conf.BulkheadPrimaryRelPath = normalizeRel(o.BulkheadPrimaryRelPath)
 	conf.BulkheadReclaimRelPaths = normalizeRelSlice(o.BulkheadReclaimRelPaths)
@@ -126,6 +144,9 @@ func (o *BulkheadOptions) ApplyTo(conf *bulkheadconfig.BulkheadConfiguration) er
 	conf.TopologyDrainSelection.MaxCPUsDrainRatio = o.MaxCPUsDrainRatio
 	conf.TopologyConvergenceBudget.DeadlineDuration = o.TopologyConvergenceDeadline
 	conf.TopologyConvergenceBudget.MaxDeadlockProbeOperations = o.MaxDeadlockProbeOperations
+	conf.EnableAdmissionLeafDefer = o.EnableAdmissionLeafDefer
+	conf.AdmissionMaxRequiredWrites = o.AdmissionMaxRequiredWrites
+	conf.AdmissionSafeDuration = o.AdmissionSafeDuration
 	if len(conf.BulkheadReclaimNumaPrefixes) > len(conf.BulkheadReclaimRelPaths) {
 		return fmt.Errorf("qrm cpu bulkhead reclaim numa prefixes count %d exceeds reclaim rel paths count %d",
 			len(conf.BulkheadReclaimNumaPrefixes), len(conf.BulkheadReclaimRelPaths))

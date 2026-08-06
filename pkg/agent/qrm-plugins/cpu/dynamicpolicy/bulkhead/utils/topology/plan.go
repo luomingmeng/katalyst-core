@@ -95,6 +95,16 @@ type CPUSetTarget struct {
 	Mems string
 }
 
+type OperationRequirement string
+
+const (
+	OperationAdmissionSourceDrain  OperationRequirement = "admission_source_drain"
+	OperationAdmissionAncestorGrow OperationRequirement = "admission_ancestor_grow"
+	OperationAdmissionSafetyRepair OperationRequirement = "admission_safety_repair"
+	OperationDeferredLeafExact     OperationRequirement = "deferred_leaf_exact"
+	OperationDeferredCleanup       OperationRequirement = "deferred_cleanup"
+)
+
 type PlanOperation struct {
 	PlanID                 string
 	Rel                    string
@@ -108,6 +118,209 @@ type PlanOperation struct {
 	Direction              WriteDirection
 	OwnsMems               bool
 	WriteMems              bool
+	Requirement            OperationRequirement
+}
+
+type AdmissionSafetyInput struct {
+	ProtectedPendingCPUSet machine.CPUSet
+	DeferredCPUSetByRel    map[string]machine.CPUSet
+}
+
+// SplitPlanForAdmission returns an executable safety closure and a summary-only
+// deferred plan. Callers must never persist or replay the deferred operations;
+// retry/periodic rounds rebuild a full plan from a fresh snapshot.
+func SplitPlanForAdmission(plan *PhasePlan, in AdmissionSafetyInput) (required, deferred *PhasePlan, err error) {
+	if plan == nil {
+		return nil, nil, errors.New("cannot split nil admission plan")
+	}
+	requiredPlan, deferredPlan := *plan, *plan
+	requiredPlan.Operations = nil
+	deferredPlan.Operations = nil
+	type operationClass struct {
+		required    bool
+		requirement OperationRequirement
+	}
+	classes := make([]operationClass, len(plan.Operations))
+	outgoingCPUsBySource := make(map[DomainID]machine.CPUSet, len(plan.TransferGraph))
+	incomingCPUsByDestination := make(map[DomainID]machine.CPUSet, len(plan.TransferGraph))
+	for source, destinations := range plan.TransferGraph {
+		for destination, cpus := range destinations {
+			outgoingCPUsBySource[source] = outgoingCPUsBySource[source].Union(cpus)
+			incomingCPUsByDestination[destination] = incomingCPUsByDestination[destination].Union(cpus)
+		}
+	}
+	for i, operation := range plan.Operations {
+		deferredTarget, explicitlyDeferred := in.DeferredCPUSetByRel[operation.Rel]
+		removedCPUs := operation.ExpectedCurrent.CPUs.Difference(operation.Target.CPUs)
+		addedCPUs := operation.Target.CPUs.Difference(operation.ExpectedCurrent.CPUs)
+		operationDomain := DomainID("")
+		if plan.Base != nil {
+			operationDomain = plan.Base.DomainByRel[operation.Rel]
+		}
+		switch {
+		case operation.Direction == WriteShrink &&
+			!operation.ExpectedCurrent.CPUs.Intersection(in.ProtectedPendingCPUSet).IsEmpty() &&
+			operation.Target.CPUs.Intersection(in.ProtectedPendingCPUSet).IsEmpty():
+			classes[i] = operationClass{required: true, requirement: OperationAdmissionSourceDrain}
+		case operation.Direction == WriteShrink &&
+			!removedCPUs.Intersection(outgoingCPUsBySource[operationDomain]).IsEmpty():
+			classes[i] = operationClass{required: true, requirement: OperationAdmissionSourceDrain}
+		case operation.Direction == WriteGrow &&
+			!operation.Target.CPUs.Difference(operation.ExpectedCurrent.CPUs).
+				Intersection(in.ProtectedPendingCPUSet).IsEmpty():
+			classes[i] = operationClass{required: true, requirement: OperationAdmissionAncestorGrow}
+		case operation.Direction == WriteGrow &&
+			!addedCPUs.Intersection(incomingCPUsByDestination[operationDomain]).IsEmpty():
+			classes[i] = operationClass{required: true, requirement: OperationAdmissionSafetyRepair}
+		case explicitlyDeferred &&
+			operation.Direction == WriteShrink &&
+			operation.Target.CPUs.Equals(deferredTarget) &&
+			deferredTarget.IsSubsetOf(operation.ExpectedCurrent.CPUs):
+			classes[i] = operationClass{requirement: OperationDeferredLeafExact}
+		case operation.Direction == WriteShrink || operation.Direction == WriteGrow:
+			classes[i] = operationClass{requirement: OperationDeferredCleanup}
+		default:
+			classes[i] = operationClass{required: true, requirement: OperationAdmissionSafetyRepair}
+		}
+	}
+
+	growOperationByRel := make(map[string]int, len(plan.Operations))
+	for i, operation := range plan.Operations {
+		if operation.Direction == WriteGrow {
+			growOperationByRel[operation.Rel] = i
+		}
+	}
+	for i, operation := range plan.Operations {
+		if !classes[i].required || operation.Direction != WriteGrow {
+			continue
+		}
+		requiredTarget := operation.Target.CPUs
+		parentRel := operation.ParentRel
+		for parentRel != "" {
+			if parentIndex, ok := growOperationByRel[parentRel]; ok {
+				parentOperation := plan.Operations[parentIndex]
+				if !requiredTarget.IsSubsetOf(parentOperation.Target.CPUs) {
+					return nil, nil, fmt.Errorf(
+						"admission child grow target %q for %q is not covered by planned parent target %q for %q",
+						requiredTarget.String(), operation.Rel,
+						parentOperation.Target.CPUs.String(), parentRel)
+				}
+				if !classes[parentIndex].required {
+					classes[parentIndex] = operationClass{
+						required:    true,
+						requirement: OperationAdmissionAncestorGrow,
+					}
+				}
+				requiredTarget = parentOperation.Target.CPUs
+				parentRel = parentOperation.ParentRel
+				continue
+			}
+			if plan.Base == nil {
+				return nil, nil, fmt.Errorf(
+					"admission child grow %q requires parent %q but plan has no base snapshot",
+					operation.Rel, parentRel)
+			}
+			parentEntry, ok := plan.Base.Entries[parentRel]
+			if !ok {
+				return nil, nil, fmt.Errorf(
+					"admission child grow %q requires missing parent %q",
+					operation.Rel, parentRel)
+			}
+			if !requiredTarget.IsSubsetOf(parentEntry.CPUs) {
+				return nil, nil, fmt.Errorf(
+					"admission child grow target %q for %q is not covered by current parent %q target %q",
+					requiredTarget.String(), operation.Rel, parentRel, parentEntry.CPUs.String())
+			}
+			break
+		}
+	}
+
+	for growIndex, growOperation := range plan.Operations {
+		if !classes[growIndex].required || growOperation.Direction != WriteGrow {
+			continue
+		}
+		for shrinkIndex := growIndex - 1; shrinkIndex >= 0; shrinkIndex-- {
+			shrinkOperation := plan.Operations[shrinkIndex]
+			if shrinkOperation.Rel != growOperation.Rel {
+				continue
+			}
+			if shrinkOperation.Direction != WriteShrink ||
+				!shrinkOperation.Target.CPUs.Equals(growOperation.ExpectedCurrent.CPUs) ||
+				shrinkOperation.Target.Mems != growOperation.ExpectedCurrent.Mems {
+				break
+			}
+			if !classes[shrinkIndex].required {
+				classes[shrinkIndex] = operationClass{
+					required:    true,
+					requirement: OperationAdmissionSafetyRepair,
+				}
+			}
+			break
+		}
+	}
+
+	for i, operation := range plan.Operations {
+		operation.Requirement = classes[i].requirement
+		if classes[i].required {
+			requiredPlan.Operations = append(requiredPlan.Operations, operation)
+		} else {
+			deferredPlan.Operations = append(deferredPlan.Operations, operation)
+		}
+	}
+	if err := validateAdmissionGrowAncestorClosure(&requiredPlan); err != nil {
+		return nil, nil, err
+	}
+	finalizeSplitPlan := func(split *PhasePlan) {
+		split.CostUpperBound.Operations = len(split.Operations)
+		split.PlanID = canonicalExecutionPlanID(*split)
+		for i := range split.Operations {
+			split.Operations[i].PlanID = split.PlanID
+		}
+	}
+	finalizeSplitPlan(&requiredPlan)
+	finalizeSplitPlan(&deferredPlan)
+	return &requiredPlan, &deferredPlan, nil
+}
+
+func validateAdmissionGrowAncestorClosure(plan *PhasePlan) error {
+	if plan == nil {
+		return errors.New("cannot validate nil admission plan")
+	}
+	requiredGrowByRel := make(map[string]PlanOperation, len(plan.Operations))
+	for _, operation := range plan.Operations {
+		if operation.Direction == WriteGrow {
+			requiredGrowByRel[operation.Rel] = operation
+		}
+	}
+	for _, operation := range plan.Operations {
+		if operation.Direction != WriteGrow || operation.ParentRel == "" {
+			continue
+		}
+		var parentTarget machine.CPUSet
+		if parentOperation, ok := requiredGrowByRel[operation.ParentRel]; ok {
+			parentTarget = parentOperation.Target.CPUs
+		} else {
+			if plan.Base == nil {
+				return fmt.Errorf(
+					"admission grow closure for %q requires parent %q but plan has no base snapshot",
+					operation.Rel, operation.ParentRel)
+			}
+			parentEntry, ok := plan.Base.Entries[operation.ParentRel]
+			if !ok {
+				return fmt.Errorf(
+					"admission grow closure for %q requires missing parent %q",
+					operation.Rel, operation.ParentRel)
+			}
+			parentTarget = parentEntry.CPUs
+		}
+		if !operation.Target.CPUs.IsSubsetOf(parentTarget) {
+			return fmt.Errorf(
+				"admission grow closure violated: parent %q target %q does not cover child %q target %q",
+				operation.ParentRel, parentTarget.String(),
+				operation.Rel, operation.Target.CPUs.String())
+		}
+	}
+	return nil
 }
 
 type DrainSelectionPolicy struct {
@@ -149,19 +362,16 @@ type RoundOutcome struct {
 	Journal     []AppliedPlanOperation
 	ChangedRels []string
 	Progress    ProgressMeasure
-	StaleRels   []string
-	BlockedRels []string
 	Cost        BudgetUsage
 }
 
 type ProgressMeasure struct {
 	DrainChangedRels int
 	VerifiedWrites   int
-	ReleasedCPUs     int
 }
 
 func (m ProgressMeasure) MadeProgress() bool {
-	return m.DrainChangedRels > 0 || m.VerifiedWrites > 0 || m.ReleasedCPUs > 0
+	return m.DrainChangedRels > 0 || m.VerifiedWrites > 0
 }
 
 type PhasePlanInput struct {
