@@ -44,8 +44,10 @@ func TestConfiguredClosManagerReturnsOnlyExplicitlyOwnedClos(t *testing.T) {
 		CPUSetPoolToSharedSubgroup: map[string]int{"batch": 3},
 		OwnershipCheckpointPath:    checkpointPath,
 	}, &fakeCPUListManager{clos: []qrmresctrlmanager.CPUListClos{
-		{ID: "dedicated", Epoch: 1}, {ID: "share-03", Epoch: 2},
-		{ID: "shared-foreign", Epoch: 3}, {ID: "external", Epoch: 4},
+		{ID: "dedicated", Epoch: 1},
+		{ID: "share-03", Epoch: 2},
+		{ID: "shared-foreign", Epoch: 3},
+		{ID: "external", Epoch: 4},
 	}})
 
 	clos, err := manager.ListCATManagedClos(context.Background())

@@ -75,7 +75,8 @@ func TestAppliedViewDeepCopyIsolation_BitsUT(t *testing.T) {
 					"container": machine.NewCPUSet(3),
 				},
 			},
-		}}
+		},
+	}
 
 	copied := applied.DeepCopy()
 	copied.ReclaimEffective.Add(99)
