@@ -22,6 +22,7 @@ package cgroupid
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -164,6 +165,11 @@ func (m *cgroupIDManagerImpl) getAbsentContainers(podList []*v1.Pod) map[string]
 		for _, container := range pod.Spec.Containers {
 			containerId, err := m.GetContainerID(podUID, container.Name)
 			if err != nil {
+				if isPodOrContainerMissingInKubeletCache(err) {
+					klog.V(4).Infof("[cgroupIDManagerImpl.addNewCgroupIDsToCache] skip cgroup id cache fill for pod: %s, container: %s, err: %v",
+						podUID, container.Name, err)
+					continue
+				}
 				klog.Errorf("[cgroupIDManagerImpl.addNewCgroupIDsToCache] get container id failed, pod: %s, container: %s, err: %v",
 					podUID, container.Name, err)
 				continue
@@ -178,6 +184,14 @@ func (m *cgroupIDManagerImpl) getAbsentContainers(podList []*v1.Pod) map[string]
 	}
 
 	return absentContainersMap
+}
+
+func isPodOrContainerMissingInKubeletCache(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "container id not found") || strings.Contains(msg, "isn't found")
 }
 
 // clearResidualPodsInCache cleans residual pods in podCgroupIDCache.
