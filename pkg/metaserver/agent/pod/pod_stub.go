@@ -65,11 +65,16 @@ func (p *PodFetcherStub) GetContainerID(podUID, containerName string) (string, e
 
 	for _, pod := range p.PodList {
 		if string(pod.UID) == podUID {
-			return native.GetContainerID(pod, containerName)
+			containerID, err := native.GetContainerID(pod, containerName)
+			if err != nil {
+				return "", fmt.Errorf("%w: pod=%s container=%s: %v",
+					ErrContainerNotFound, podUID, containerName, err)
+			}
+			return containerID, nil
 		}
 	}
 
-	return "", fmt.Errorf("container: %s isn't found in pod: %s status", containerName, podUID)
+	return "", fmt.Errorf("%w: pod=%s container=%s", ErrPodNotFound, podUID, containerName)
 }
 
 func (p *PodFetcherStub) GetContainerSpec(podUID, containerName string) (*v1.Container, error) {

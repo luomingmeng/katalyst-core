@@ -18,6 +18,7 @@ package pod
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -27,6 +28,7 @@ import (
 
 	"golang.org/x/time/rate"
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	metaserverconf "github.com/kubewharf/katalyst-core/pkg/config/agent/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
@@ -69,6 +71,200 @@ func (f *countingKubeletPodFetcher) GetPodList(_ context.Context, _ func(*v1.Pod
 	return []*v1.Pod{{}}, nil
 }
 
+type delayedVisibilityKubeletPodFetcher struct {
+	callCount int32
+}
+
+func (f *delayedVisibilityKubeletPodFetcher) GetPodList(
+	_ context.Context, _ func(*v1.Pod) bool,
+) ([]*v1.Pod, error) {
+	call := atomic.AddInt32(&f.callCount, 1)
+	version := "stale"
+	if call >= 3 {
+		version = "fresh"
+	}
+	return []*v1.Pod{{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:         "pod",
+			Annotations: map[string]string{"version": version},
+		},
+	}}, nil
+}
+
+func TestKubeletPodCacheSyncListenerRegistration(t *testing.T) {
+	t.Parallel()
+
+	pf := &podFetcherImpl{}
+	first, unregisterFirst := pf.RegisterKubeletPodCacheSyncListener("first")
+	second, unregisterSecond := pf.RegisterKubeletPodCacheSyncListener("second")
+	defer unregisterSecond()
+
+	pf.publishKubeletPodCacheSyncEvent(KubeletPodCacheSyncEvent{CgroupCreated: true, Revision: 1})
+	pf.publishKubeletPodCacheSyncEvent(KubeletPodCacheSyncEvent{CgroupCreated: true, Revision: 2})
+
+	for name, events := range map[string]<-chan KubeletPodCacheSyncEvent{
+		"first": first, "second": second,
+	} {
+		select {
+		case event := <-events:
+			if event.Revision != 2 || !event.CgroupCreated {
+				t.Fatalf("%s listener event = %+v, want latest create revision 2", name, event)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s listener did not receive cache sync event", name)
+		}
+	}
+
+	unregisterFirst()
+	pf.publishKubeletPodCacheSyncEvent(KubeletPodCacheSyncEvent{CgroupCreated: true, Revision: 3})
+	if _, ok := <-first; ok {
+		t.Fatal("unregistered listener channel is still open")
+	}
+}
+
+func TestCgroupCreateRunsBoundedCacheResync(t *testing.T) {
+	t.Parallel()
+
+	rootDir := t.TempDir()
+	fetcher := &delayedVisibilityKubeletPodFetcher{}
+	pf := &podFetcherImpl{
+		kubeletPodFetcher: fetcher,
+		emitter:           metrics.DummyMetrics{},
+		podConf: &metaserverconf.PodConfiguration{
+			KubeletPodCacheSyncPeriod:    time.Hour,
+			KubeletPodCacheSyncMaxRate:   rate.Limit(1000),
+			KubeletPodCacheSyncBurstBulk: 10,
+		},
+		cgroupRootPaths:              []string{rootDir},
+		kubeletPodCacheSyncListeners: make(map[string]chan KubeletPodCacheSyncEvent),
+		cgroupCreateResyncDelays:     []time.Duration{0, 10 * time.Millisecond, 20 * time.Millisecond},
+	}
+	events, unregister := pf.RegisterKubeletPodCacheSyncListener("bounded-resync")
+	defer unregister()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pf.startSyncKubeletPods(ctx)
+	time.Sleep(100 * time.Millisecond)
+
+	if err := os.Mkdir(filepath.Join(rootDir, "pod-new"), 0o755); err != nil {
+		t.Fatalf("create pod cgroup: %v", err)
+	}
+	var revisions []uint64
+	deadline := time.After(2 * time.Second)
+	for len(revisions) < 3 {
+		select {
+		case event := <-events:
+			revisions = append(revisions, event.Revision)
+		case <-deadline:
+			t.Fatalf("cache sync revisions = %v, want three bounded resync notifications", revisions)
+		}
+	}
+	pod, err := pf.GetPod(context.Background(), "pod")
+	if err != nil {
+		t.Fatalf("GetPod() error = %v", err)
+	}
+	if got := pod.Annotations["version"]; got != "fresh" {
+		t.Fatalf("cache version = %q, want fresh after bounded resync", got)
+	}
+}
+
+type contextBlockingKubeletPodFetcher struct{}
+
+func (contextBlockingKubeletPodFetcher) GetPodList(ctx context.Context, _ func(*v1.Pod) bool) ([]*v1.Pod, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+type gatedKubeletPodFetcher struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (f gatedKubeletPodFetcher) GetPodList(context.Context, func(*v1.Pod) bool) ([]*v1.Pod, error) {
+	close(f.entered)
+	<-f.release
+	return []*v1.Pod{{}}, nil
+}
+
+func TestGetContainerIDWithContextInterruptsCacheSync(t *testing.T) {
+	t.Parallel()
+
+	pf := &podFetcherImpl{
+		kubeletPodFetcher: contextBlockingKubeletPodFetcher{},
+		emitter:           metrics.DummyMetrics{},
+		podConf:           &metaserverconf.PodConfiguration{},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	_, err := pf.GetContainerIDWithContext(ctx, "pod", "container")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("GetContainerIDWithContext() error = %v, want context deadline exceeded", err)
+	}
+}
+
+func TestGetKubeletPodsCacheInterruptsLockWait(t *testing.T) {
+	t.Parallel()
+
+	pf := &podFetcherImpl{
+		kubeletPodsCache: map[string]*v1.Pod{"pod": {}},
+	}
+	pf.kubeletPodsCacheLock.Lock()
+	defer pf.kubeletPodsCacheLock.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := pf.getKubeletPodsCache(ctx)
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("getKubeletPodsCache() error = %v, want context deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("getKubeletPodsCache() did not stop waiting for the cache lock")
+	}
+}
+
+func TestGetContainerIDWithContextInterruptsCacheWriteLockWait(t *testing.T) {
+	t.Parallel()
+
+	fetcher := gatedKubeletPodFetcher{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	pf := &podFetcherImpl{
+		kubeletPodFetcher: fetcher,
+		emitter:           metrics.DummyMetrics{},
+		podConf:           &metaserverconf.PodConfiguration{},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := pf.GetContainerIDWithContext(ctx, "pod", "container")
+		result <- err
+	}()
+
+	<-fetcher.entered
+	pf.kubeletPodsCacheLock.Lock()
+	defer pf.kubeletPodsCacheLock.Unlock()
+	close(fetcher.release)
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("GetContainerIDWithContext() error = %v, want context deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("GetContainerIDWithContext() did not stop waiting for the cache write lock")
+	}
+}
+
 func waitForCondition(t *testing.T, condition func() bool, msg string) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
@@ -96,16 +292,29 @@ func TestStartSyncKubeletPods(t *testing.T) {
 		emitter:           metrics.DummyMetrics{},
 		podConf: &metaserverconf.PodConfiguration{
 			KubeletPodCacheSyncPeriod:    time.Hour,
-			KubeletPodCacheSyncMaxRate:   rate.Limit(100),
-			KubeletPodCacheSyncBurstBulk: 100,
+			KubeletPodCacheSyncMaxRate:   rate.Limit(5),
+			KubeletPodCacheSyncBurstBulk: 1,
 		},
-		cgroupRootPaths: []string{rootDir},
+		cgroupRootPaths:              []string{rootDir},
+		kubeletPodCacheSyncListeners: make(map[string]chan KubeletPodCacheSyncEvent),
+		cgroupCreateResyncDelays:     []time.Duration{0},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pf.startSyncKubeletPods(ctx)
+	createEvents, unregister := pf.RegisterKubeletPodCacheSyncListener("test")
+	defer unregister()
 
+	time.Sleep(200 * time.Millisecond)
+	for {
+		select {
+		case <-createEvents:
+		default:
+			goto initialized
+		}
+	}
+initialized:
 	initialCount := atomic.LoadInt32(&fetcher.callCount)
 
 	if err := os.WriteFile(filepath.Join(rootDir, "root-file"), []byte("test"), 0o644); err != nil {
@@ -122,6 +331,11 @@ func TestStartSyncKubeletPods(t *testing.T) {
 	waitForCondition(t, func() bool {
 		return atomic.LoadInt32(&fetcher.callCount) >= initialCount+1
 	}, "existing pod dir removal should trigger sync")
+	select {
+	case <-createEvents:
+		t.Fatal("pod cgroup removal should not publish a create event")
+	case <-time.After(100 * time.Millisecond):
+	}
 
 	afterRemoveCount := atomic.LoadInt32(&fetcher.callCount)
 	newPodDir := filepath.Join(rootDir, "pod-new")
@@ -131,14 +345,43 @@ func TestStartSyncKubeletPods(t *testing.T) {
 	waitForCondition(t, func() bool {
 		return atomic.LoadInt32(&fetcher.callCount) >= afterRemoveCount+1
 	}, "new pod dir creation should trigger sync")
+	select {
+	case <-createEvents:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pod cgroup creation should publish an event after cache sync")
+	}
 
 	afterCreateCount := atomic.LoadInt32(&fetcher.callCount)
 	containerDir := filepath.Join(newPodDir, "container-new")
 	if err := os.Mkdir(containerDir, 0o755); err != nil {
 		t.Fatalf("create container dir failed: %v", err)
 	}
-	time.Sleep(200 * time.Millisecond)
-	if got := atomic.LoadInt32(&fetcher.callCount); got != afterCreateCount {
-		t.Fatalf("container dir creation should not trigger sync, got call count %d want %d", got, afterCreateCount)
+	waitForCondition(t, func() bool {
+		return atomic.LoadInt32(&fetcher.callCount) >= afterCreateCount+1
+	}, "container dir creation should trigger sync")
+	select {
+	case <-createEvents:
+	case <-time.After(2 * time.Second):
+		t.Fatal("container cgroup creation should publish an event after cache sync")
+	}
+}
+
+func TestResetTimerDropsExpiredTick(t *testing.T) {
+	t.Parallel()
+
+	timer := time.NewTimer(time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
+	resetTimer(timer, 50*time.Millisecond)
+
+	select {
+	case <-timer.C:
+		t.Fatal("reset timer delivered an expired tick")
+	case <-time.After(20 * time.Millisecond):
+	}
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
 	}
 }
