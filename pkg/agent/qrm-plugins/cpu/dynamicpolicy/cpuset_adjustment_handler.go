@@ -18,6 +18,7 @@ package dynamicpolicy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -145,6 +146,10 @@ func (s *cpuSetAdjustmentStateSnapshot) GetDisableDedicatedCoresOverlapReclaimed
 	return s.disableDedicated
 }
 
+func (s *cpuSetAdjustmentStateSnapshot) GetRevision() uint64 {
+	return s.revision
+}
+
 func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes ...cpusetutil.CPUSetAdjustmentMode) error {
 	if len(p.cpuSetAdjustmentHandlers) == 0 {
 		return nil
@@ -184,6 +189,10 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 		var dynamicConf *dynamicconfig.Configuration
 		if p.dynamicConfig != nil {
 			dynamicConf = p.dynamicConfig.GetDynamicConfiguration()
+		}
+		stateRevision := uint64(0)
+		if p.state != nil {
+			stateRevision = p.state.GetRevision()
 		}
 		stateSnapshot := newCPUSetAdjustmentStateSnapshot(p.state)
 		commitOverride := &cpusetutil.CPUSetAdjustmentCommitOverride{}
@@ -256,13 +265,17 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 					p.machineInfo.CPUTopology, newEntries, p.state.GetMachineState())
 				if err != nil {
 					roundErr = fmt.Errorf("generate machine state from cpuset adjustment override: %w", err)
-				} else if err := p.state.CommitAdvisorState(
+				} else if err := p.state.CommitAdvisorStateIfRevision(
+					stateRevision,
 					newEntries,
 					newMachineState,
 					p.state.GetAllowSharedCoresOverlapReclaimedCores(),
 					p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
 					true,
 				); err != nil {
+					if errors.Is(err, state.ErrStaleStateRevision) {
+						p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonStaleState)
+					}
 					roundErr = fmt.Errorf("commit cpuset adjustment override: %w", err)
 				}
 			}

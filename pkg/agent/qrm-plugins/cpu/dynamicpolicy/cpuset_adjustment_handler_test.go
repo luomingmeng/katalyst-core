@@ -25,7 +25,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	commonstate "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	bulkheadconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/bulkhead"
@@ -39,6 +40,38 @@ type cacheSyncRegistrarPodFetcher struct {
 	*podmeta.PodFetcherStub
 	events       chan podmeta.KubeletPodCacheSyncEvent
 	unregistered chan struct{}
+}
+
+type cpusetOverrideCommitGuardState struct {
+	state.State
+	unconditionalCommitCalls int
+	conditionalCommitCalls   int
+	conditionalRevision      uint64
+}
+
+func (s *cpusetOverrideCommitGuardState) CommitAdvisorState(
+	state.PodEntries,
+	state.NUMANodeMap,
+	bool,
+	bool,
+	bool,
+) error {
+	s.unconditionalCommitCalls++
+	return fmt.Errorf("cpuset adjustment override must use CommitAdvisorStateIfRevision")
+}
+
+func (s *cpusetOverrideCommitGuardState) CommitAdvisorStateIfRevision(
+	expectedRevision uint64,
+	podEntries state.PodEntries,
+	machineState state.NUMANodeMap,
+	allowOverlap bool,
+	disableDedicatedOverlap bool,
+	persist bool,
+) error {
+	s.conditionalCommitCalls++
+	s.conditionalRevision = expectedRevision
+	return s.State.CommitAdvisorStateIfRevision(
+		expectedRevision, podEntries, machineState, allowOverlap, disableDedicatedOverlap, persist)
 }
 
 func (f *cacheSyncRegistrarPodFetcher) RegisterKubeletPodCacheSyncListener(string) (
@@ -311,6 +344,39 @@ func TestCPUSetAdjustmentCommitsTopologyReclaimOverride(t *testing.T) {
 	err := p.runCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentModePeriodic)
 	p.Unlock()
 	require.NoError(t, err)
+
+	reclaim := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	require.NotNil(t, reclaim)
+	require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(2, 3)),
+		"reclaim allocation=%s, want topology verified override 2-3", reclaim.AllocationResult)
+}
+
+func TestCPUSetAdjustmentCommitOverrideUsesRevisionGuard(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	setReclaimPoolCPUSet(t, p, machine.NewCPUSet(0, 1))
+	guardState := &cpusetOverrideCommitGuardState{State: p.state}
+	p.state = guardState
+	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"topology-override": func(_ context.Context, handlerCtx cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			if handlerCtx.CommitOverride == nil {
+				t.Fatal("CPUSet adjustment runner did not provide a commit override")
+			}
+			handlerCtx.CommitOverride.ReclaimEffective = machine.NewCPUSet(2, 3)
+			handlerCtx.CommitOverride.Source = "cpuset_topology"
+			return nil
+		},
+	}
+
+	p.Lock()
+	err := p.runCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentModePeriodic)
+	p.Unlock()
+	require.NoError(t, err)
+	require.Equal(t, 0, guardState.unconditionalCommitCalls)
+	require.Equal(t, 1, guardState.conditionalCommitCalls)
+	require.NotZero(t, guardState.conditionalRevision)
 
 	reclaim := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
 	require.NotNil(t, reclaim)

@@ -55,6 +55,13 @@ type advisorCommitRecordingState struct {
 	err   error
 }
 
+type advisorCommitGuardState struct {
+	state.State
+	unconditionalCommitCalls int
+	conditionalCommitCalls   int
+	conditionalRevision      uint64
+}
+
 func (s *advisorCommitRecordingState) CommitAdvisorState(
 	entries state.PodEntries,
 	machineState state.NUMANodeMap,
@@ -67,6 +74,45 @@ func (s *advisorCommitRecordingState) CommitAdvisorState(
 		return s.err
 	}
 	return s.State.CommitAdvisorState(entries, machineState, allowOverlap, disableDedicatedOverlap, persist)
+}
+
+func (s *advisorCommitRecordingState) CommitAdvisorStateIfRevision(
+	expectedRevision uint64,
+	entries state.PodEntries,
+	machineState state.NUMANodeMap,
+	allowOverlap bool,
+	disableDedicatedOverlap bool,
+	persist bool,
+) error {
+	s.calls++
+	if s.err != nil {
+		return s.err
+	}
+	return s.State.CommitAdvisorStateIfRevision(expectedRevision, entries, machineState, allowOverlap, disableDedicatedOverlap, persist)
+}
+
+func (s *advisorCommitGuardState) CommitAdvisorState(
+	state.PodEntries,
+	state.NUMANodeMap,
+	bool,
+	bool,
+	bool,
+) error {
+	s.unconditionalCommitCalls++
+	return fmt.Errorf("advisor applyBlocks must use CommitAdvisorStateIfRevision")
+}
+
+func (s *advisorCommitGuardState) CommitAdvisorStateIfRevision(
+	expectedRevision uint64,
+	entries state.PodEntries,
+	machineState state.NUMANodeMap,
+	allowOverlap bool,
+	disableDedicatedOverlap bool,
+	persist bool,
+) error {
+	s.conditionalCommitCalls++
+	s.conditionalRevision = expectedRevision
+	return s.State.CommitAdvisorStateIfRevision(expectedRevision, entries, machineState, allowOverlap, disableDedicatedOverlap, persist)
 }
 
 func TestDynamicPolicy_checkAndApplyIfCgroupV1(t *testing.T) {
@@ -780,6 +826,89 @@ func TestDynamicPolicyApplyBlocksUsesResponseModeWhenDisablingOverlap(t *testing
 	require.NoError(t, policy.applyBlocks(blockCPUSet, resp, resp.AllowSharedCoresOverlapReclaimedCores))
 	require.Equal(t, 2, recordingState.calls)
 	require.False(t, policy.state.GetAllowSharedCoresOverlapReclaimedCores())
+	reclaimPool := policy.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	require.NotNil(t, reclaimPool)
+	require.True(t, reclaimPool.AllocationResult.Equals(machine.NewCPUSet(0)))
+}
+
+func TestDynamicPolicyApplyBlocksUsesRevisionGuard(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	tmpDir, err := os.MkdirTemp("", "checkpoint-applyblocks-revision-guard")
+	require.NoError(t, err)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, tmpDir)
+	require.NoError(t, err)
+	policy.reservedReclaimedCPUSet = machine.NewCPUSet(0, 2)
+	policy.reservedReclaimedTopologyAwareAssignments = map[int]machine.CPUSet{
+		0: machine.NewCPUSet(0),
+		1: machine.NewCPUSet(2),
+	}
+	policy.state.SetPodEntries(state.PodEntries{
+		"pod-dedicated": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-dedicated",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameDedicated,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+				},
+				AllocationResult: machine.NewCPUSet(2),
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					1: machine.NewCPUSet(2),
+				},
+			},
+		},
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(0, 2),
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: machine.NewCPUSet(0),
+					1: machine.NewCPUSet(2),
+				},
+			},
+		},
+	}, false)
+
+	resp := &advisorapi.ListAndWatchResponse{
+		Entries: map[string]*advisorapi.CalculationEntries{
+			"pod-dedicated": {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					"main": {
+						OwnerPoolName: commonstate.PoolNameDedicated,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							1: {Blocks: []*advisorapi.Block{{BlockId: "dedicated-block", Result: 1}}},
+						},
+					},
+				},
+			},
+			commonstate.PoolNameReclaim: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameReclaim,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							0: {Blocks: []*advisorapi.Block{{BlockId: "reclaim-block", Result: 1}}},
+						},
+					},
+				},
+			},
+		},
+	}
+	blockCPUSet := advisorapi.BlockCPUSet{
+		"dedicated-block": machine.NewCPUSet(2),
+		"reclaim-block":   machine.NewCPUSet(0),
+	}
+	guardState := &advisorCommitGuardState{State: policy.state}
+	policy.state = guardState
+
+	require.NoError(t, policy.applyBlocks(blockCPUSet, resp, resp.AllowSharedCoresOverlapReclaimedCores))
+	require.Equal(t, 0, guardState.unconditionalCommitCalls)
+	require.Equal(t, 1, guardState.conditionalCommitCalls)
+	require.NotZero(t, guardState.conditionalRevision)
 	reclaimPool := policy.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
 	require.NotNil(t, reclaimPool)
 	require.True(t, reclaimPool.AllocationResult.Equals(machine.NewCPUSet(0)))

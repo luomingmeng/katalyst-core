@@ -1473,6 +1473,7 @@ func (p *DynamicPolicy) applyBlocks(
 		return fmt.Errorf("applyBlocks got nil resp")
 	}
 
+	stateRevision := p.state.GetRevision()
 	curEntries := p.state.GetPodEntries()
 	newEntries := make(state.PodEntries)
 	dedicatedCPUSet := machine.NewCPUSet()
@@ -1757,7 +1758,8 @@ func (p *DynamicPolicy) applyBlocks(
 	); err != nil {
 		return err
 	}
-	return p.state.CommitAdvisorState(
+	return p.state.CommitAdvisorStateIfRevision(
+		stateRevision,
 		newEntries,
 		newMachineState,
 		allowSharedCoresOverlapReclaimedCores,
