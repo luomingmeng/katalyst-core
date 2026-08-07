@@ -174,6 +174,40 @@ func TestConvertInternalCPUResultToListAndWatchResponsePropagatesDedicatedReclai
 	require.True(t, resp.DisableDedicatedCoresOverlapReclaimedCores)
 }
 
+func TestCPUServerGetAndPushAdviceRejectsDedicatedReclaimDisjoint(t *testing.T) {
+	t.Parallel()
+
+	advisor := &mockCPUResourceAdvisor{
+		provision: &types.InternalCPUCalculationResult{
+			PoolEntries:                 map[string]map[int]types.CPUResource{},
+			PoolOverlapInfo:             map[string]map[int]map[string]int{},
+			PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{},
+			DisableDedicatedCoresOverlapReclaimedCores: true,
+		},
+	}
+	cs := newTestCPUServer(t, advisor, nil)
+
+	client := &mockCPUPluginClient{
+		checkpoint: &cpuadvisor.GetCheckpointResponse{
+			Entries: map[string]*cpuadvisor.AllocationEntries{
+				commonstate.PoolNameReserve: {
+					Entries: map[string]*cpuadvisor.AllocationInfo{
+						commonstate.FakedContainerName: {
+							OwnerPoolName: commonstate.PoolNameReserve,
+						},
+					},
+				},
+			},
+		},
+	}
+	stream := &recordingCPUListAndWatchServer{}
+
+	err := cs.getAndPushAdvice(client, stream)
+
+	require.EqualError(t, err, "list and watch does not support dedicated reclaim disjoint partition")
+	require.Zero(t, stream.sendCalls)
+}
+
 func TestAssemblePoolEntriesKeepsRampUpHardReclaimMinimum(t *testing.T) {
 	t.Parallel()
 
@@ -418,6 +452,29 @@ func (m *mockCPUResourceAdvisor) UpdateAndGetAdvice(_ context.Context) (interfac
 		m.onUpdate()
 	}
 	return m.provision, m.err
+}
+
+type mockCPUPluginClient struct {
+	checkpoint *cpuadvisor.GetCheckpointResponse
+	err        error
+}
+
+func (m *mockCPUPluginClient) GetCheckpoint(_ context.Context, _ *cpuadvisor.GetCheckpointRequest, _ ...grpc.CallOption) (*cpuadvisor.GetCheckpointResponse, error) {
+	return m.checkpoint, m.err
+}
+
+type recordingCPUListAndWatchServer struct {
+	grpc.ServerStream
+	sendCalls int
+}
+
+func (s *recordingCPUListAndWatchServer) Send(_ *cpuadvisor.ListAndWatchResponse) error {
+	s.sendCalls++
+	return nil
+}
+
+func (s *recordingCPUListAndWatchServer) Context() context.Context {
+	return context.Background()
 }
 
 type mockCPUServerService_ListAndWatchServer struct {
