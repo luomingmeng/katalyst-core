@@ -6763,6 +6763,49 @@ func TestSharedCoresRampUpDisabledAllocation(t *testing.T) {
 		assert.Equal(t, allocationInfo.AllocationResult.String(), poolInfo.AllocationResult.String())
 	})
 
+	t.Run("cold-start seeds specified seedpool", func(t *testing.T) {
+		t.Parallel()
+		as := require.New(t)
+		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+		as.Nil(err)
+		policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
+
+		const specifiedPool = "seedpool-stable-2"
+		req := newSharedCoresReq("shared-custom-seedpool")
+		req.Annotations[consts.PodAnnotationCPUEnhancementCPUSet] = specifiedPool
+
+		resp, err := policy.sharedCoresWithoutNUMABindingAllocationHandler(context.Background(), req, false)
+		as.Nil(err)
+		as.NotNil(resp)
+
+		allocationInfo := policy.state.GetAllocationInfo(req.PodUid, req.ContainerName)
+		as.NotNil(allocationInfo)
+		assert.False(t, allocationInfo.RampUp)
+		assert.Equal(t, specifiedPool, allocationInfo.OwnerPoolName)
+		assert.False(t, allocationInfo.AllocationResult.IsEmpty())
+
+		poolInfo := policy.state.GetAllocationInfo(specifiedPool, commonstate.FakedContainerName)
+		as.NotNil(poolInfo)
+		assert.Equal(t, specifiedPool, poolInfo.OwnerPoolName)
+		assert.Equal(t, allocationInfo.AllocationResult.String(), poolInfo.AllocationResult.String())
+		assert.Equal(t, allocationInfo.OriginalAllocationResult.String(), poolInfo.OriginalAllocationResult.String())
+		assert.Equal(t, allocationInfo.TopologyAwareAssignments, poolInfo.TopologyAwareAssignments)
+
+		machineState := policy.state.GetMachineState()
+		foundPod := false
+		for _, numaState := range machineState {
+			if numaState == nil {
+				continue
+			}
+			for _, allocation := range numaState.PodEntries[req.PodUid] {
+				if allocation != nil && allocation.ContainerName == req.ContainerName {
+					foundPod = true
+				}
+			}
+		}
+		assert.True(t, foundPod)
+	})
+
 	t.Run("cold-start seed overlap-false excludes reclaim pool", func(t *testing.T) {
 		t.Parallel()
 		as := require.New(t)
