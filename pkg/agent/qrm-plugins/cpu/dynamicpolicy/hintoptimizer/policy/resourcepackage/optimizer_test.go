@@ -59,6 +59,7 @@ func (m *MockState) GetAllocationInfo(podUID string, containerName string) *stat
 }
 func (m *MockState) GetAllowSharedCoresOverlapReclaimedCores() bool               { return false }
 func (m *MockState) GetDisableDedicatedCoresOverlapReclaimedCores() bool          { return false }
+func (m *MockState) GetRevision() uint64                                          { return 0 }
 func (m *MockState) SetDisableDedicatedCoresOverlapReclaimedCores(_, _ bool)      {}
 func (m *MockState) SetMachineState(numaNodeMap state.NUMANodeMap, persist bool)  {}
 func (m *MockState) SetNUMAHeadroom(numaHeadroom map[int]float64, persist bool)   {}
@@ -75,6 +76,16 @@ func (m *MockState) CommitAdvisorState(
 	allowSharedCoresOverlapReclaimedCores, disableDedicatedCoresOverlapReclaimedCores, persist bool,
 ) error {
 	return nil
+}
+
+func (m *MockState) CommitAdvisorStateIfRevision(
+	_ uint64,
+	podEntries state.PodEntries,
+	machineState state.NUMANodeMap,
+	allowSharedCoresOverlapReclaimedCores, disableDedicatedCoresOverlapReclaimedCores, persist bool,
+) error {
+	return m.CommitAdvisorState(
+		podEntries, machineState, allowSharedCoresOverlapReclaimedCores, disableDedicatedCoresOverlapReclaimedCores, persist)
 }
 func (m *MockState) Delete(podUID string, containerName string, persist bool) {}
 func (m *MockState) ClearState()                                              {}

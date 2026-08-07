@@ -17,6 +17,7 @@ limitations under the License.
 package state
 
 import (
+	"fmt"
 	"sync"
 
 	"k8s.io/klog/v2"
@@ -189,6 +190,31 @@ func (s *cpuPluginState) CommitAdvisorState(
 ) error {
 	s.Lock()
 	defer s.Unlock()
+
+	s.podEntries = podEntries.Clone()
+	s.machineState = machineState.Clone()
+	s.allowSharedCoresOverlapReclaimedCores = allowSharedCoresOverlapReclaimedCores
+	s.disableDedicatedCoresOverlapReclaimedCores = disableDedicatedCoresOverlapReclaimedCores
+	s.revision++
+	return nil
+}
+
+// CommitAdvisorStateIfRevision atomically replaces advisor-derived state only
+// when the caller's snapshot revision still matches current state.
+func (s *cpuPluginState) CommitAdvisorStateIfRevision(
+	expectedRevision uint64,
+	podEntries PodEntries,
+	machineState NUMANodeMap,
+	allowSharedCoresOverlapReclaimedCores bool,
+	disableDedicatedCoresOverlapReclaimedCores bool,
+	_ bool,
+) error {
+	s.Lock()
+	defer s.Unlock()
+
+	if s.revision != expectedRevision {
+		return fmt.Errorf("%w: expected=%d actual=%d", ErrStaleStateRevision, expectedRevision, s.revision)
+	}
 
 	s.podEntries = podEntries.Clone()
 	s.machineState = machineState.Clone()

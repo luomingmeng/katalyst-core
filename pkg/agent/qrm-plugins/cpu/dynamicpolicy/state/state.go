@@ -18,6 +18,7 @@ package state
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -862,6 +863,7 @@ type reader interface {
 	GetAllocationInfo(podUID string, containerName string) *AllocationInfo
 	GetAllowSharedCoresOverlapReclaimedCores() bool
 	GetDisableDedicatedCoresOverlapReclaimedCores() bool
+	GetRevision() uint64
 }
 
 // writer is used to store information into local states,
@@ -874,6 +876,7 @@ type writer interface {
 	SetAllowSharedCoresOverlapReclaimedCores(allowSharedCoresOverlapReclaimedCores, persist bool)
 	SetDisableDedicatedCoresOverlapReclaimedCores(disableDedicatedCoresOverlapReclaimedCores, persist bool)
 	CommitAdvisorState(podEntries PodEntries, machineState NUMANodeMap, allowSharedCoresOverlapReclaimedCores, disableDedicatedCoresOverlapReclaimedCores, persist bool) error
+	CommitAdvisorStateIfRevision(expectedRevision uint64, podEntries PodEntries, machineState NUMANodeMap, allowSharedCoresOverlapReclaimedCores, disableDedicatedCoresOverlapReclaimedCores, persist bool) error
 
 	Delete(podUID string, containerName string, persist bool)
 	ClearState()
@@ -894,6 +897,8 @@ type ReadonlyState interface {
 type GenerateMachineStateFromPodEntriesFunc func(topology *machine.CPUTopology, podEntries PodEntries, originMachineState NUMANodeMap) (NUMANodeMap, error)
 
 var (
+	ErrStaleStateRevision = errors.New("stale cpu plugin state revision")
+
 	readonlyStateLock sync.RWMutex
 	readonlyState     ReadonlyState
 )

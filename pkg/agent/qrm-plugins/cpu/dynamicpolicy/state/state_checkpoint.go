@@ -312,6 +312,42 @@ func (sc *stateCheckpoint) CommitAdvisorState(
 	return nil
 }
 
+func (sc *stateCheckpoint) CommitAdvisorStateIfRevision(
+	expectedRevision uint64,
+	podEntries PodEntries,
+	machineState NUMANodeMap,
+	allowSharedCoresOverlapReclaimedCores bool,
+	disableDedicatedCoresOverlapReclaimedCores bool,
+	persist bool,
+) error {
+	sc.Lock()
+	defer sc.Unlock()
+
+	oldPodEntries := sc.cache.GetPodEntries()
+	oldMachineState := sc.cache.GetMachineState()
+	oldAllowOverlap := sc.cache.GetAllowSharedCoresOverlapReclaimedCores()
+	oldDisableDedicatedOverlap := sc.cache.GetDisableDedicatedCoresOverlapReclaimedCores()
+
+	if err := sc.cache.CommitAdvisorStateIfRevision(
+		expectedRevision,
+		podEntries,
+		machineState,
+		allowSharedCoresOverlapReclaimedCores,
+		disableDedicatedCoresOverlapReclaimedCores,
+		false,
+	); err != nil {
+		return err
+	}
+	if !persist {
+		return nil
+	}
+	if err := sc.storeState(); err != nil {
+		_ = sc.cache.CommitAdvisorState(oldPodEntries, oldMachineState, oldAllowOverlap, oldDisableDedicatedOverlap, false)
+		return err
+	}
+	return nil
+}
+
 func (sc *stateCheckpoint) GetAllowSharedCoresOverlapReclaimedCores() bool {
 	sc.RLock()
 	defer sc.RUnlock()

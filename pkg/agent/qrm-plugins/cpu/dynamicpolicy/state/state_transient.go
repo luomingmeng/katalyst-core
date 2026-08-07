@@ -61,6 +61,16 @@ func (s *transientState) CommitAdvisorState(
 		podEntries, machineState, allowOverlap, disableDedicatedOverlap, false)
 }
 
+func (s *transientState) CommitAdvisorStateIfRevision(
+	expectedRevision uint64,
+	podEntries PodEntries,
+	machineState NUMANodeMap,
+	allowOverlap, disableDedicatedOverlap, _ bool,
+) error {
+	return s.cpuPluginState.CommitAdvisorStateIfRevision(
+		expectedRevision, podEntries, machineState, allowOverlap, disableDedicatedOverlap, false)
+}
+
 func (s *transientState) Delete(podUID, containerName string, _ bool) {
 	s.cpuPluginState.Delete(podUID, containerName)
 }
