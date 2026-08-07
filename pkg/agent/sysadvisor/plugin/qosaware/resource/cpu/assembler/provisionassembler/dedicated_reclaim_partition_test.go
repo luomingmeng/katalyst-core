@@ -17,6 +17,7 @@ limitations under the License.
 package provisionassembler
 
 import (
+	"math"
 	"strings"
 	"testing"
 
@@ -229,6 +230,10 @@ func TestCalculateReclaimQuotaLimit(t *testing.T) {
 		{name: "quota above target is capped", physicalTarget: 6, quotaKnob: 8, want: 6},
 		{name: "ratio cap also caps quota", physicalTarget: 8, quotaKnob: 7, ratioCap: 4, want: 4},
 		{name: "negative physical target caps quota at zero", physicalTarget: -1, quotaKnob: 2, want: 0},
+		{name: "NaN quota is unlimited", physicalTarget: 6, quotaKnob: math.NaN(), want: -1},
+		{name: "negative infinity quota is unlimited", physicalTarget: 6, quotaKnob: math.Inf(-1), want: -1},
+		{name: "positive infinity quota is capped by physical target", physicalTarget: 6, quotaKnob: math.Inf(1), want: 6},
+		{name: "positive infinity quota is also capped by ratio", physicalTarget: 8, quotaKnob: math.Inf(1), ratioCap: 4, want: 4},
 	}
 
 	for _, tt := range tests {

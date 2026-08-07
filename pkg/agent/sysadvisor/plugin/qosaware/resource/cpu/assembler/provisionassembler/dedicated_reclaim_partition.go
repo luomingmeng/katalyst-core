@@ -18,6 +18,7 @@ package provisionassembler
 
 import (
 	"fmt"
+	"math"
 
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 )
@@ -72,7 +73,7 @@ func calculateReclaimQuotaLimit(
 	quotaKnob float64,
 	ratioCap int,
 ) float64 {
-	if quotaKnob < 0 {
+	if math.IsNaN(quotaKnob) || quotaKnob < 0 {
 		return -1
 	}
 
