@@ -51,6 +51,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation"
 	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation/finders"
+	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation/finders/feature_cpu"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 	cgroupmgr "github.com/kubewharf/katalyst-core/pkg/util/cgroup/manager"
@@ -383,11 +384,7 @@ func (p *DynamicPolicy) getAdviceFromAdvisor(ctx context.Context) (isImplemented
 		}
 	}
 
-	err = p.allocateByCPUAdvisor(request, &advisorapi.ListAndWatchResponse{
-		Entries:                               resp.Entries,
-		AllowSharedCoresOverlapReclaimedCores: resp.AllowSharedCoresOverlapReclaimedCores,
-		ExtraEntries:                          resp.ExtraEntries,
-	}, resp.SupportedFeatureGates)
+	err = p.allocateByCPUAdvisor(request, convertGetAdviceResponse(resp), resp.SupportedFeatureGates)
 	if err != nil {
 		return true, fmt.Errorf("allocate by GetAdvice response failed with error: %w", err)
 	}
@@ -398,6 +395,37 @@ func (p *DynamicPolicy) getAdviceFromAdvisor(ctx context.Context) (isImplemented
 	}
 
 	return true, nil
+}
+
+func convertGetAdviceResponse(resp *advisorapi.GetAdviceResponse) *advisorapi.ListAndWatchResponse {
+	if resp == nil {
+		return nil
+	}
+
+	return &advisorapi.ListAndWatchResponse{
+		Entries:                               resp.Entries,
+		AllowSharedCoresOverlapReclaimedCores: resp.AllowSharedCoresOverlapReclaimedCores,
+		ExtraEntries:                          resp.ExtraEntries,
+		DisableDedicatedCoresOverlapReclaimedCores: resp.DisableDedicatedCoresOverlapReclaimedCores,
+	}
+}
+
+func validateDedicatedReclaimDisjointTransport(
+	req *advisorapi.GetAdviceRequest,
+	resp *advisorapi.ListAndWatchResponse,
+	featureGates map[string]*advisorsvc.FeatureGate,
+) error {
+	if resp == nil || !resp.DisableDedicatedCoresOverlapReclaimedCores {
+		return nil
+	}
+	if req == nil {
+		return fmt.Errorf("dedicated reclaim disjoint partition requires negotiated GetAdvice")
+	}
+	if featureGates[feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition] == nil {
+		return fmt.Errorf("feature gate %s is required for dedicated reclaim disjoint partition",
+			feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition)
+	}
+	return nil
 }
 
 // getAdviceFromAdvisorLoop gets advice from cpu-advisor periodically.
@@ -493,6 +521,9 @@ func (p *DynamicPolicy) allocateByCPUAdvisor(
 ) (err error) {
 	if resp == nil {
 		return fmt.Errorf("allocateByCPUAdvisor got nil qos aware lw response")
+	}
+	if err := validateDedicatedReclaimDisjointTransport(req, resp, featureGates); err != nil {
+		return err
 	}
 
 	startTime := time.Now()

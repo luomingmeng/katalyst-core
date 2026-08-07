@@ -36,6 +36,8 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation/finders"
+	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation/finders/feature_cpu"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/statedirectory"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent"
@@ -48,6 +50,40 @@ import (
 )
 
 var advisorTestMutex = &sync.Mutex{}
+
+func TestConvertGetAdviceResponsePropagatesDedicatedReclaimDisjoint(t *testing.T) {
+	t.Parallel()
+
+	unified := convertGetAdviceResponse(&advisorapi.GetAdviceResponse{
+		DisableDedicatedCoresOverlapReclaimedCores: true,
+	})
+
+	require.True(t, unified.DisableDedicatedCoresOverlapReclaimedCores)
+}
+
+func TestValidateDedicatedReclaimDisjointTransport(t *testing.T) {
+	t.Parallel()
+
+	resp := &advisorapi.ListAndWatchResponse{
+		DisableDedicatedCoresOverlapReclaimedCores: true,
+	}
+	req := &advisorapi.GetAdviceRequest{}
+
+	err := validateDedicatedReclaimDisjointTransport(req, resp, nil)
+	require.ErrorContains(t, err, feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition)
+
+	err = validateDedicatedReclaimDisjointTransport(nil, resp, nil)
+	require.ErrorContains(t, err, "requires negotiated GetAdvice")
+
+	featureGates := map[string]*advisorsvc.FeatureGate{
+		feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition: {
+			Name:                  feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
+			Type:                  finders.FeatureGateTypeCPU,
+			MustMutuallySupported: true,
+		},
+	}
+	require.NoError(t, validateDedicatedReclaimDisjointTransport(req, resp, featureGates))
+}
 
 type advisorCommitRecordingState struct {
 	state.State

@@ -39,12 +39,13 @@ import (
 )
 
 type ProvisionAssemblerCommon struct {
-	conf                                  *config.Configuration
-	regionMap                             *map[string]region.QoSRegion
-	reservedForReclaim                    *map[int]int
-	numaAvailable                         *map[int]int
-	nonBindingNumas                       *machine.CPUSet
-	allowSharedCoresOverlapReclaimedCores *bool
+	conf                                       *config.Configuration
+	regionMap                                  *map[string]region.QoSRegion
+	reservedForReclaim                         *map[int]int
+	numaAvailable                              *map[int]int
+	nonBindingNumas                            *machine.CPUSet
+	allowSharedCoresOverlapReclaimedCores      *bool
+	disableDedicatedCoresOverlapReclaimedCores *bool
 
 	metaReader metacache.MetaReader
 	metaServer *metaserver.MetaServer
@@ -52,7 +53,8 @@ type ProvisionAssemblerCommon struct {
 }
 
 func NewProvisionAssemblerCommon(conf *config.Configuration, _ interface{}, regionMap *map[string]region.QoSRegion,
-	reservedForReclaim *map[int]int, numaAvailable *map[int]int, nonBindingNumas *machine.CPUSet, allowSharedCoresOverlapReclaimedCores *bool,
+	reservedForReclaim *map[int]int, numaAvailable *map[int]int, nonBindingNumas *machine.CPUSet,
+	allowSharedCoresOverlapReclaimedCores *bool, disableDedicatedCoresOverlapReclaimedCores *bool,
 	metaReader metacache.MetaReader, metaServer *metaserver.MetaServer, emitter metrics.MetricEmitter,
 ) ProvisionAssembler {
 	return &ProvisionAssemblerCommon{
@@ -62,6 +64,7 @@ func NewProvisionAssemblerCommon(conf *config.Configuration, _ interface{}, regi
 		numaAvailable:                         numaAvailable,
 		nonBindingNumas:                       nonBindingNumas,
 		allowSharedCoresOverlapReclaimedCores: allowSharedCoresOverlapReclaimedCores,
+		disableDedicatedCoresOverlapReclaimedCores: disableDedicatedCoresOverlapReclaimedCores,
 
 		metaReader: metaReader,
 		metaServer: metaServer,
@@ -185,11 +188,12 @@ func (pa *ProvisionAssemblerCommon) assembleReserve(result *types.InternalCPUCal
 
 func (pa *ProvisionAssemblerCommon) AssembleProvision() (types.InternalCPUCalculationResult, error) {
 	calculationResult := types.InternalCPUCalculationResult{
-		PoolEntries:                           make(map[string]map[int]types.CPUResource),
-		PoolOverlapInfo:                       map[string]map[int]map[string]int{},
-		PoolOverlapPodContainerInfo:           map[string]map[int]map[string]map[string]int{},
-		TimeStamp:                             time.Now(),
-		AllowSharedCoresOverlapReclaimedCores: *pa.allowSharedCoresOverlapReclaimedCores,
+		PoolEntries:                                make(map[string]map[int]types.CPUResource),
+		PoolOverlapInfo:                            map[string]map[int]map[string]int{},
+		PoolOverlapPodContainerInfo:                map[string]map[int]map[string]map[string]int{},
+		TimeStamp:                                  time.Now(),
+		AllowSharedCoresOverlapReclaimedCores:      *pa.allowSharedCoresOverlapReclaimedCores,
+		DisableDedicatedCoresOverlapReclaimedCores: *pa.disableDedicatedCoresOverlapReclaimedCores,
 	}
 
 	pa.assembleReserve(&calculationResult)

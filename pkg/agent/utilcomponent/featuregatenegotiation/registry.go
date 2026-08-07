@@ -29,6 +29,7 @@ import (
 func init() {
 	RegisterNegotiationTypeFeatureGatesFinder(feature_cpu.NegotiationFeatureGateQuotaCtrlKnob, &feature_cpu.QuotaCtrlKnob{})
 	RegisterNegotiationTypeFeatureGatesFinder(feature_cpu.NegotiationFeatureGateCPUHeadroomReporting, &feature_cpu.CPUHeadroomReporting{})
+	RegisterNegotiationTypeFeatureGatesFinder(feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition, &feature_cpu.DedicatedReclaimDisjointPartition{})
 	RegisterNegotiationTypeFeatureGatesFinder(feature_memory.NegotiationFeatureGateMemoryHeadroomReporting, &feature_memory.MemoryHeadroomReporting{})
 }
 

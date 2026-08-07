@@ -42,6 +42,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
 	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation"
 	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation/finders"
+	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation/finders/feature_cpu"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
@@ -137,11 +138,17 @@ func (cs *cpuServer) GetAdvice(ctx context.Context, request *cpuadvisor.GetAdvic
 		general.Errorf("update advisor failed: %v", err)
 		return nil, fmt.Errorf("update advisor failed: %w", err)
 	}
+	if result.DisableDedicatedCoresOverlapReclaimedCores &&
+		supportedWantedFeatureGates[feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition] == nil {
+		return nil, fmt.Errorf("feature gate %s is required for dedicated reclaim disjoint partition",
+			feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition)
+	}
 	resp := &cpuadvisor.GetAdviceResponse{
 		Entries:                               result.Entries,
 		AllowSharedCoresOverlapReclaimedCores: result.AllowSharedCoresOverlapReclaimedCores,
 		ExtraEntries:                          result.ExtraEntries,
 		SupportedFeatureGates:                 supportedWantedFeatureGates,
+		DisableDedicatedCoresOverlapReclaimedCores: result.DisableDedicatedCoresOverlapReclaimedCores,
 	}
 	general.Infof("get advice response: %v", general.ToString(resp))
 	general.InfoS("get advice", "duration", time.Since(startTime))
@@ -257,11 +264,7 @@ func (cs *cpuServer) getAndPushAdvice(client cpuadvisor.CPUPluginClient, server 
 	if err != nil {
 		return err
 	}
-	lwResp := &cpuadvisor.ListAndWatchResponse{
-		Entries:                               result.Entries,
-		AllowSharedCoresOverlapReclaimedCores: result.AllowSharedCoresOverlapReclaimedCores,
-		ExtraEntries:                          result.ExtraEntries,
-	}
+	lwResp := convertInternalCPUResultToListAndWatchResponse(result)
 	if err := server.Send(lwResp); err != nil {
 		_ = cs.emitter.StoreInt64(cs.genMetricsName(metricServerLWSendResponseFailed), int64(cs.period.Seconds()), metrics.MetricTypeNameCount)
 		return fmt.Errorf("send listWatch response failed: %w", err)
@@ -301,9 +304,23 @@ func (cs *cpuServer) updateAdvisor(ctx context.Context, featureGates map[string]
 }
 
 type cpuInternalResult struct {
-	Entries                               map[string]*cpuadvisor.CalculationEntries
-	AllowSharedCoresOverlapReclaimedCores bool
-	ExtraEntries                          []*advisorsvc.CalculationInfo
+	Entries                                    map[string]*cpuadvisor.CalculationEntries
+	AllowSharedCoresOverlapReclaimedCores      bool
+	DisableDedicatedCoresOverlapReclaimedCores bool
+	ExtraEntries                               []*advisorsvc.CalculationInfo
+}
+
+func convertInternalCPUResultToListAndWatchResponse(result *cpuInternalResult) *cpuadvisor.ListAndWatchResponse {
+	if result == nil {
+		return nil
+	}
+
+	return &cpuadvisor.ListAndWatchResponse{
+		Entries:                               result.Entries,
+		AllowSharedCoresOverlapReclaimedCores: result.AllowSharedCoresOverlapReclaimedCores,
+		ExtraEntries:                          result.ExtraEntries,
+		DisableDedicatedCoresOverlapReclaimedCores: result.DisableDedicatedCoresOverlapReclaimedCores,
+	}
 }
 
 func (cs *cpuServer) assembleResponse(advisorResp *types.InternalCPUCalculationResult) *cpuInternalResult {
@@ -345,6 +362,7 @@ func (cs *cpuServer) assembleResponse(advisorResp *types.InternalCPUCalculationR
 		Entries:                               calculationEntriesMap,
 		ExtraEntries:                          extraEntries,
 		AllowSharedCoresOverlapReclaimedCores: advisorResp.AllowSharedCoresOverlapReclaimedCores,
+		DisableDedicatedCoresOverlapReclaimedCores: advisorResp.DisableDedicatedCoresOverlapReclaimedCores,
 	}
 
 	return resp
