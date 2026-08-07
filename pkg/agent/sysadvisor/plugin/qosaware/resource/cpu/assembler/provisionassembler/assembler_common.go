@@ -112,6 +112,115 @@ func clampByReclaimedCPUMaxRatio(
 }
 
 func (pa *ProvisionAssemblerCommon) assembleDedicatedNUMAExclusiveRegion(r region.QoSRegion, result *types.InternalCPUCalculationResult) error {
+	if !result.DisableDedicatedCoresOverlapReclaimedCores {
+		return pa.assembleLegacyDedicatedNUMAExclusiveRegion(r, result)
+	}
+
+	controlKnob, err := r.GetProvision()
+	if err != nil {
+		return err
+	}
+
+	regionNuma := r.GetBindingNumas().ToSliceInt()[0] // always one binding numa for this type of region
+	reservedForReclaim := getNUMAsResource(*pa.reservedForReclaim, r.GetBindingNumas())
+	available := getNUMAsResource(*pa.numaAvailable, r.GetBindingNumas())
+	partitionCapacity, dedicatedCapacity, reclaimCapacity, err := pa.getExclusivePartitionCapacities(r, regionNuma, available)
+	if err != nil {
+		return err
+	}
+
+	ratioPhysicalCap := 0
+	if ratio := pa.conf.GetDynamicConfiguration().ReclaimedCPUMaxRatio; ratio > 0 {
+		if cpuCount := pa.cpuCountInNUMAs(r.GetBindingNumas()); cpuCount > 0 {
+			ratioPhysicalCap = int(math.Floor(ratio * float64(cpuCount)))
+			ratioPhysicalCap -= ratioPhysicalCap % 2
+			ratioPhysicalCap = general.Max(ratioPhysicalCap, reservedForReclaim)
+		}
+	}
+
+	nonReclaimed := int(controlKnob[configapi.ControlKnobNonReclaimedCPURequirement].Value)
+	dedicatedTarget, reclaimTarget, err := calculateExclusiveDisjointTargets(exclusivePartitionInput{
+		PartitionCapacity: partitionCapacity,
+		DedicatedCapacity: dedicatedCapacity,
+		ReclaimCapacity:   reclaimCapacity,
+		Reserved:          reservedForReclaim,
+		NonReclaimed:      nonReclaimed,
+		EnableReclaim:     r.EnableReclaim(),
+		RatioPhysicalCap:  ratioPhysicalCap,
+	})
+	if err != nil {
+		return fmt.Errorf("calculate disjoint targets for exclusive region %q: %w", r.Name(), err)
+	}
+
+	reclaimQuotaLimit := float64(-1)
+	quotaCtrlKnobEnabled, err := metacache.IsQuotaCtrlKnobEnabled(pa.metaReader)
+	if err != nil {
+		return err
+	}
+	if quotaCtrlKnobEnabled {
+		if quota, ok := controlKnob[configapi.ControlKnobReclaimedCoresCPUQuota]; ok {
+			reclaimQuotaLimit = calculateReclaimQuotaLimit(reclaimTarget, quota.Value, ratioPhysicalCap)
+		}
+	}
+
+	for podUID := range r.GetPods() {
+		result.SetPoolEntry(podUID, regionNuma, dedicatedTarget, -1)
+	}
+	result.SetPoolEntry(commonstate.PoolNameReclaim, regionNuma, reclaimTarget, reclaimQuotaLimit)
+
+	klog.InfoS("assemble disjoint dedicated NUMA-exclusive region",
+		"regionName", r.Name(),
+		"partitionCapacity", partitionCapacity,
+		"dedicatedCapacity", dedicatedCapacity,
+		"reclaimCapacity", reclaimCapacity,
+		"dedicatedTarget", dedicatedTarget,
+		"reclaimTarget", reclaimTarget,
+		"reclaimQuotaLimit", reclaimQuotaLimit,
+		"reservedForReclaim", reservedForReclaim,
+		"ratioPhysicalCap", ratioPhysicalCap)
+	return nil
+}
+
+func (pa *ProvisionAssemblerCommon) getExclusivePartitionCapacities(
+	r region.QoSRegion,
+	regionNuma, available int,
+) (partition, dedicated, reclaim int, err error) {
+	cfg := pa.metaReader.GetResourcePackageConfig()
+	pkgMap := cfg[regionNuma]
+	allPinned := machine.NewCPUSet()
+	for _, state := range pkgMap {
+		if state != nil {
+			allPinned = allPinned.Union(state.PinnedCPUSet)
+		}
+	}
+
+	disableReclaimSelector, err := general.ParseSelector(
+		pa.conf.GetDynamicConfiguration().DisableReclaimPinnedCPUSetResourcePackageSelector,
+	)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	nonReclaimablePackages := resourcepackage.GetMatchedPackages(pkgMap, disableReclaimSelector)
+	nonReclaimablePinned := resourcepackage.GetMatchedPinnedCPUSet(pkgMap, disableReclaimSelector)
+
+	pkgName := r.GetResourcePackageName()
+	dedicatedReclaimIntersection := 0
+	if pkgName == "" {
+		dedicated = general.Max(available-allPinned.Size(), 0)
+		dedicatedReclaimIntersection = dedicated
+	} else if state, ok := pkgMap[pkgName]; ok && state != nil {
+		dedicated = general.Min(state.PinnedCPUSet.Size(), available)
+		if !nonReclaimablePackages.Has(pkgName) {
+			dedicatedReclaimIntersection = dedicated
+		}
+	}
+
+	reclaim = general.Max(available-general.Min(nonReclaimablePinned.Size(), available), 0)
+	partition = general.Min(dedicated+reclaim-dedicatedReclaimIntersection, available)
+	return partition, dedicated, reclaim, nil
+}
+
+func (pa *ProvisionAssemblerCommon) assembleLegacyDedicatedNUMAExclusiveRegion(r region.QoSRegion, result *types.InternalCPUCalculationResult) error {
 	controlKnob, err := r.GetProvision()
 	if err != nil {
 		return err
