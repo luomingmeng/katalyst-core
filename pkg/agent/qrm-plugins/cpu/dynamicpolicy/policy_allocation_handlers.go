@@ -2639,7 +2639,9 @@ func (p *DynamicPolicy) doAndCheckPutAllocationInfoPodResizingAware(originAlloca
 	if checkedAllocationInfo == nil {
 		general.Errorf("pod: %s/%s, container: %s get nil allocationInfo after putAllocationsAndAdjustAllocationEntries",
 			allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName)
-		return nil, fmt.Errorf("putAllocationsAndAdjustAllocationEntries failed with error: %v", err)
+		return nil, fmt.Errorf("allocationInfo missing after putAllocationsAndAdjustAllocationEntries: pod=%s/%s uid=%s container=%s ownerPool=%s specifiedPool=%s stateRevision=%d",
+			allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.PodUid, allocationInfo.ContainerName,
+			allocationInfo.OwnerPoolName, allocationInfo.GetSpecifiedPoolName(), p.state.GetRevision())
 	}
 
 	return checkedAllocationInfo, nil

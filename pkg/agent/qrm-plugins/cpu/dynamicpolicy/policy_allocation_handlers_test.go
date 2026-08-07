@@ -48,6 +48,19 @@ type atomicCommitTrackingState struct {
 	storeCalls  int
 }
 
+type missingAllocationInfoState struct {
+	state.State
+	missingPodUID        string
+	missingContainerName string
+}
+
+func (s *missingAllocationInfoState) GetAllocationInfo(podUID string, containerName string) *state.AllocationInfo {
+	if podUID == s.missingPodUID && containerName == s.missingContainerName {
+		return nil
+	}
+	return s.State.GetAllocationInfo(podUID, containerName)
+}
+
 func (s *atomicCommitTrackingState) CommitAdvisorState(
 	podEntries state.PodEntries,
 	machineState state.NUMANodeMap,
@@ -1295,6 +1308,53 @@ func TestDynamicPolicy_generatePoolsAndIsolation_preservesAdvisorReclaimForSeedP
 		poolsCPUSet[commonstate.PoolNameReclaim].String(), wantReclaim.String())
 	require.True(t, poolsCPUSet["seedpool-stable-0"].Equals(machine.NewCPUSet(1)),
 		"seed pool should take the first available cpu, got %s", poolsCPUSet["seedpool-stable-0"].String())
+}
+
+func TestDynamicPolicyDoAndCheckPutAllocationInfoReportsMissingAllocationInfo(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 2)
+	require.NoError(t, err)
+
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+
+	allocationInfo := &state.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        "missing-after-put",
+			PodNamespace:  "default",
+			PodName:       "missing-after-put",
+			ContainerName: "main",
+			Annotations: map[string]string{
+				apiconsts.PodAnnotationQoSLevelKey:          apiconsts.PodAnnotationQoSLevelSharedCores,
+				apiconsts.PodAnnotationCPUEnhancementCPUSet: "seedpool-missing-after-put",
+			},
+			Labels: map[string]string{
+				apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelSharedCores,
+			},
+			QoSLevel: apiconsts.PodAnnotationQoSLevelSharedCores,
+		},
+		AllocationResult: machine.NewCPUSet(1, 2, 3),
+		TopologyAwareAssignments: map[int]machine.CPUSet{
+			0: machine.NewCPUSet(1, 2),
+			1: machine.NewCPUSet(3),
+		},
+		RequestQuantity: 1,
+	}
+	allocationInfo.OriginalAllocationResult = allocationInfo.AllocationResult.Clone()
+	allocationInfo.OriginalTopologyAwareAssignments = machine.DeepcopyCPUAssignment(allocationInfo.TopologyAwareAssignments)
+
+	p.state.SetAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, allocationInfo, false)
+	p.state = &missingAllocationInfoState{
+		State:                p.state,
+		missingPodUID:        allocationInfo.PodUid,
+		missingContainerName: allocationInfo.ContainerName,
+	}
+
+	_, err = p.doAndCheckPutAllocationInfoPodResizingAware(nil, allocationInfo, true, false, false)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "allocationInfo missing after putAllocationsAndAdjustAllocationEntries")
+	require.NotContains(t, err.Error(), "<nil>")
 }
 
 func TestDynamicPolicyDeriveRampUpReclaimFloorCoversAllNUMAs(t *testing.T) {
