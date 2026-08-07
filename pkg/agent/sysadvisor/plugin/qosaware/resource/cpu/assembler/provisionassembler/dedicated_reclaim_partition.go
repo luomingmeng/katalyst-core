@@ -35,6 +35,10 @@ type exclusivePartitionInput struct {
 func calculateExclusiveDisjointTargets(
 	in exclusivePartitionInput,
 ) (dedicated, reclaim int, err error) {
+	if in.PartitionCapacity < 0 || in.DedicatedCapacity < 0 || in.ReclaimCapacity < 0 {
+		return 0, 0, fmt.Errorf("exclusive partition capacities must be non-negative")
+	}
+
 	capacity := general.Max(in.PartitionCapacity, 0)
 	dedicatedCapacity := general.Max(in.DedicatedCapacity, 0)
 	reclaimCapacity := general.Max(in.ReclaimCapacity, 0)
