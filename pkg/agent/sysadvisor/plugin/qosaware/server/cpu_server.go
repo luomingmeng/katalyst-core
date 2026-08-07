@@ -264,6 +264,9 @@ func (cs *cpuServer) getAndPushAdvice(client cpuadvisor.CPUPluginClient, server 
 	if err != nil {
 		return err
 	}
+	if result.DisableDedicatedCoresOverlapReclaimedCores {
+		return fmt.Errorf("list and watch does not support dedicated reclaim disjoint partition")
+	}
 	lwResp := convertInternalCPUResultToListAndWatchResponse(result)
 	if err := server.Send(lwResp); err != nil {
 		_ = cs.emitter.StoreInt64(cs.genMetricsName(metricServerLWSendResponseFailed), int64(cs.period.Seconds()), metrics.MetricTypeNameCount)
