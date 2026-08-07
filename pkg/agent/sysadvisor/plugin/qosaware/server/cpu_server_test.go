@@ -48,6 +48,8 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/metacache"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/plugin/qosaware/reporter"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
+	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation/finders"
+	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation/finders/feature_cpu"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent"
@@ -130,6 +132,46 @@ func TestCPUServerStartAndStop(t *testing.T) {
 
 	err = cs.Stop()
 	assert.NoError(t, err)
+}
+
+func TestCPUServerGetAdvicePropagatesDedicatedReclaimDisjoint(t *testing.T) {
+	t.Parallel()
+
+	advisor := &mockCPUResourceAdvisor{
+		provision: &types.InternalCPUCalculationResult{
+			PoolEntries:                 map[string]map[int]types.CPUResource{},
+			PoolOverlapInfo:             map[string]map[int]map[string]int{},
+			PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{},
+			DisableDedicatedCoresOverlapReclaimedCores: true,
+		},
+	}
+	cs := newTestCPUServer(t, advisor, nil)
+
+	resp, err := cs.GetAdvice(context.Background(), &cpuadvisor.GetAdviceRequest{
+		WantedFeatureGates: map[string]*advisorsvc.FeatureGate{
+			feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition: {
+				Name:                  feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
+				Type:                  finders.FeatureGateTypeCPU,
+				MustMutuallySupported: true,
+			},
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, resp.DisableDedicatedCoresOverlapReclaimedCores)
+	require.Contains(t, resp.SupportedFeatureGates, feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition)
+
+	_, err = cs.GetAdvice(context.Background(), &cpuadvisor.GetAdviceRequest{})
+	require.ErrorContains(t, err, feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition)
+}
+
+func TestConvertInternalCPUResultToListAndWatchResponsePropagatesDedicatedReclaimDisjoint(t *testing.T) {
+	t.Parallel()
+
+	resp := convertInternalCPUResultToListAndWatchResponse(&cpuInternalResult{
+		DisableDedicatedCoresOverlapReclaimedCores: true,
+	})
+
+	require.True(t, resp.DisableDedicatedCoresOverlapReclaimedCores)
 }
 
 func TestAssemblePoolEntriesKeepsRampUpHardReclaimMinimum(t *testing.T) {

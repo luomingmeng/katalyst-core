@@ -272,21 +272,23 @@ func TestAssembleProvision(t *testing.T) {
 		},
 	}
 	tests := []struct {
-		name                                  string
-		enableReclaimed                       bool
-		allowSharedCoresOverlapReclaimedCores bool
-		disableReclaimSelector                string
-		resourcePackageConfig                 types.ResourcePackageConfig
-		poolInfos                             []testCasePoolConfig
-		wantErr                               bool
-		expectPoolEntries                     map[string]map[int]types.CPUResource
-		expectPoolOverlapInfo                 map[string]map[int]map[string]int
+		name                                       string
+		enableReclaimed                            bool
+		allowSharedCoresOverlapReclaimedCores      bool
+		disableDedicatedCoresOverlapReclaimedCores bool
+		disableReclaimSelector                     string
+		resourcePackageConfig                      types.ResourcePackageConfig
+		poolInfos                                  []testCasePoolConfig
+		wantErr                                    bool
+		expectPoolEntries                          map[string]map[int]types.CPUResource
+		expectPoolOverlapInfo                      map[string]map[int]map[string]int
 	}{
 		{
 			name:                                  "test-disable-reclaim-pkg-complex",
 			enableReclaimed:                       true,
 			disableReclaimSelector:                "disable-reclaim=true",
 			allowSharedCoresOverlapReclaimedCores: true,
+			disableDedicatedCoresOverlapReclaimedCores: true,
 			resourcePackageConfig: types.ResourcePackageConfig{
 				0: map[string]*types.ResourcePackageState{
 					"pkg1": {
@@ -1161,7 +1163,6 @@ func TestAssembleProvision(t *testing.T) {
 			t.Parallel()
 
 			conf := generateTestConf(t, tt.enableReclaimed, tt.disableReclaimSelector)
-
 			genericCtx, err := katalyst_base.GenerateFakeGenericContext([]runtime.Object{})
 			require.NoError(t, err)
 
@@ -1203,7 +1204,9 @@ func TestAssembleProvision(t *testing.T) {
 				}
 			}
 
-			common := NewProvisionAssemblerCommon(conf, nil, &regionMap, &reservedForReclaim, &numaAvailable, &nonBindingNumas, &tt.allowSharedCoresOverlapReclaimedCores, metaCache, metaServer, metrics.DummyMetrics{})
+			common := NewProvisionAssemblerCommon(conf, nil, &regionMap, &reservedForReclaim, &numaAvailable,
+				&nonBindingNumas, &tt.allowSharedCoresOverlapReclaimedCores,
+				&tt.disableDedicatedCoresOverlapReclaimedCores, metaCache, metaServer, metrics.DummyMetrics{})
 			result, err := common.AssembleProvision()
 			if tt.wantErr {
 				require.Error(t, err)
@@ -1211,6 +1214,8 @@ func TestAssembleProvision(t *testing.T) {
 			}
 			require.NoErrorf(t, err, "failed to AssembleProvision: %s", err)
 			require.NotNil(t, result, "invalid assembler result")
+			require.Equal(t, tt.disableDedicatedCoresOverlapReclaimedCores,
+				result.DisableDedicatedCoresOverlapReclaimedCores)
 			t.Logf("%v", result)
 			require.Equal(t, tt.expectPoolEntries, result.PoolEntries, "unexpected result")
 			if len(tt.expectPoolOverlapInfo) > 0 {
@@ -1420,6 +1425,7 @@ func TestAssembleProvisionUsesReservedWhenEvenRatioCapIsLower(t *testing.T) {
 		reservedForReclaim := map[int]int{0: 2}
 		numaAvailable := map[int]int{0: 8}
 		allowOverlap := true
+		disableDedicatedOverlap := false
 		return NewProvisionAssemblerCommon(
 			conf,
 			nil,
@@ -1428,6 +1434,7 @@ func TestAssembleProvisionUsesReservedWhenEvenRatioCapIsLower(t *testing.T) {
 			&numaAvailable,
 			&nonBindingNUMAs,
 			&allowOverlap,
+			&disableDedicatedOverlap,
 			metaReader,
 			metaServer,
 			metrics.DummyMetrics{},

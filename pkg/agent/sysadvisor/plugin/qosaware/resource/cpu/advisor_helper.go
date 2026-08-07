@@ -137,7 +137,9 @@ func (cra *cpuResourceAdvisor) initializeProvisionAssembler() error {
 	if !ok {
 		return fmt.Errorf("unsupported provision assembler %v", assemblerName)
 	}
-	cra.provisionAssembler = initializer(cra.conf, cra.extraConf, &cra.regionMap, &cra.reservedForReclaim, &cra.numaAvailable, &cra.nonBindingNumas, &cra.allowSharedCoresOverlapReclaimedCores, cra.metaCache, cra.metaServer, cra.emitter)
+	cra.provisionAssembler = initializer(cra.conf, cra.extraConf, &cra.regionMap, &cra.reservedForReclaim,
+		&cra.numaAvailable, &cra.nonBindingNumas, &cra.allowSharedCoresOverlapReclaimedCores,
+		&cra.disableDedicatedCoresOverlapReclaimedCores, cra.metaCache, cra.metaServer, cra.emitter)
 
 	return nil
 }
