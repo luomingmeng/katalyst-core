@@ -29,10 +29,13 @@ import (
 	"github.com/kubewharf/katalyst-api/pkg/consts"
 	katalyst_base "github.com/kubewharf/katalyst-core/cmd/base"
 	"github.com/kubewharf/katalyst-core/cmd/katalyst-agent/app/options"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/advisorsvc"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/metacache"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/plugin/qosaware/resource/cpu/region"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
+	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation/finders"
+	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation/finders/feature_cpu"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	metaagent "github.com/kubewharf/katalyst-core/pkg/metaserver/agent"
@@ -50,6 +53,7 @@ type FakeRegion struct {
 	bindingNumas               machine.CPUSet
 	isNumaBinding              bool
 	isNumaExclusive            bool
+	enableReclaim              bool
 	podSets                    types.PodSet
 	controlKnob                types.ControlKnob
 	headroom                   float64
@@ -67,6 +71,7 @@ func NewFakeRegion(name string, regionType configapi.QoSRegionType, ownerPoolNam
 		name:          name,
 		regionType:    regionType,
 		ownerPoolName: ownerPoolName,
+		enableReclaim: true,
 	}
 }
 
@@ -128,7 +133,7 @@ func (fake *FakeRegion) IsNumaBinding() bool {
 }
 func (fake *FakeRegion) IsNumaExclusive() bool                      { return fake.isNumaExclusive }
 func (fake *FakeRegion) SetThrottled(throttled bool)                { fake.throttled = throttled }
-func (fake *FakeRegion) EnableReclaim() bool                        { return true }
+func (fake *FakeRegion) EnableReclaim() bool                        { return fake.enableReclaim }
 func (fake *FakeRegion) AddContainer(ci *types.ContainerInfo) error { return nil }
 func (fake *FakeRegion) TryUpdateProvision()                        {}
 func (fake *FakeRegion) TryUpdateHeadroom()                         {}
@@ -1470,4 +1475,223 @@ func TestAssembleProvisionUsesReservedWhenEvenRatioCapIsLower(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 2, result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["pod"]["container"])
 	})
+}
+
+func newExclusiveAssemblerFixture(
+	t *testing.T,
+	capacity, reserved int,
+	enableReclaim, disableDedicatedOverlap bool,
+) (*ProvisionAssemblerCommon, *FakeRegion, *types.InternalCPUCalculationResult, *metacache.MetaCacheImp) {
+	t.Helper()
+
+	conf, err := options.NewOptions().Config()
+	require.NoError(t, err)
+
+	cpuDetails := machine.CPUDetails{}
+	for cpuID := 0; cpuID < capacity; cpuID++ {
+		cpuDetails[cpuID] = machine.CPUTopoInfo{NUMANodeID: 0}
+	}
+	metaServer := &metaserver.MetaServer{
+		MetaAgent: &metaagent.MetaAgent{
+			KatalystMachineInfo: &machine.KatalystMachineInfo{
+				CPUTopology: &machine.CPUTopology{
+					NumCPUs:      capacity,
+					NumCores:     capacity,
+					NumSockets:   1,
+					NumNUMANodes: 1,
+					CPUDetails:   cpuDetails,
+				},
+			},
+		},
+	}
+	metaReader := metacache.NewDummyMetaCacheImp()
+	require.NoError(t, metaReader.SetResourcePackageConfig(types.ResourcePackageConfig{}))
+
+	exclusiveRegion := NewFakeRegion(
+		"dedicated-exclusive",
+		configapi.QoSRegionTypeDedicated,
+		"dedicated-exclusive",
+	)
+	exclusiveRegion.SetBindingNumas(machine.NewCPUSet(0))
+	exclusiveRegion.SetIsNumaBinding(true)
+	exclusiveRegion.isNumaExclusive = true
+	exclusiveRegion.enableReclaim = enableReclaim
+	exclusiveRegion.SetPods(types.PodSet{
+		"pod":       sets.NewString("main", "sidecar"),
+		"other-pod": sets.NewString("main"),
+	})
+
+	regionMap := map[string]region.QoSRegion{exclusiveRegion.Name(): exclusiveRegion}
+	reservedForReclaim := map[int]int{0: reserved}
+	numaAvailable := map[int]int{0: capacity}
+	nonBindingNUMAs := machine.NewCPUSet()
+	allowSharedOverlap := true
+	pa := NewProvisionAssemblerCommon(
+		conf,
+		nil,
+		&regionMap,
+		&reservedForReclaim,
+		&numaAvailable,
+		&nonBindingNUMAs,
+		&allowSharedOverlap,
+		&disableDedicatedOverlap,
+		metaReader,
+		metaServer,
+		metrics.DummyMetrics{},
+	).(*ProvisionAssemblerCommon)
+
+	result := &types.InternalCPUCalculationResult{
+		PoolEntries:                 map[string]map[int]types.CPUResource{},
+		PoolOverlapInfo:             map[string]map[int]map[string]int{},
+		PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{},
+		DisableDedicatedCoresOverlapReclaimedCores: disableDedicatedOverlap,
+	}
+	return pa, exclusiveRegion, result, metaReader
+}
+
+func TestAssembleDedicatedNUMAExclusiveRegionDisjoint(t *testing.T) {
+	t.Run("enable reclaim emits one dedicated entry per pod and standalone reclaim", func(t *testing.T) {
+		pa, exclusiveRegion, result, _ := newExclusiveAssemblerFixture(t, 16, 4, true, true)
+		exclusiveRegion.SetProvision(types.ControlKnob{
+			configapi.ControlKnobNonReclaimedCPURequirement: {Value: 10},
+		})
+
+		require.NoError(t, pa.assembleDedicatedNUMAExclusiveRegion(exclusiveRegion, result))
+		require.Equal(t, types.CPUResource{Size: 10, Quota: -1}, result.PoolEntries["pod"][0])
+		require.Equal(t, types.CPUResource{Size: 10, Quota: -1}, result.PoolEntries["other-pod"][0])
+		require.Equal(t, types.CPUResource{Size: 6, Quota: -1},
+			result.PoolEntries[commonstate.PoolNameReclaim][0])
+		require.Empty(t, result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0])
+	})
+
+	t.Run("disable reclaim retains only reserve", func(t *testing.T) {
+		pa, exclusiveRegion, result, _ := newExclusiveAssemblerFixture(t, 16, 4, false, true)
+		exclusiveRegion.SetProvision(types.ControlKnob{
+			configapi.ControlKnobNonReclaimedCPURequirement: {Value: 10},
+		})
+
+		require.NoError(t, pa.assembleDedicatedNUMAExclusiveRegion(exclusiveRegion, result))
+		require.Equal(t, types.CPUResource{Size: 12, Quota: -1}, result.PoolEntries["pod"][0])
+		require.Equal(t, types.CPUResource{Size: 4, Quota: -1},
+			result.PoolEntries[commonstate.PoolNameReclaim][0])
+	})
+
+	t.Run("quota limits only reclaim block", func(t *testing.T) {
+		pa, exclusiveRegion, result, metaReader := newExclusiveAssemblerFixture(t, 16, 4, true, true)
+		require.NoError(t, metaReader.SetSupportedWantedFeatureGates(
+			finders.FeatureGateTypeCPU,
+			map[string]*advisorsvc.FeatureGate{
+				feature_cpu.NegotiationFeatureGateQuotaCtrlKnob: {
+					Name: feature_cpu.NegotiationFeatureGateQuotaCtrlKnob,
+					Type: finders.FeatureGateTypeCPU,
+				},
+			},
+		))
+		exclusiveRegion.SetProvision(types.ControlKnob{
+			configapi.ControlKnobNonReclaimedCPURequirement: {Value: 10},
+			configapi.ControlKnobReclaimedCoresCPUQuota:     {Value: 0},
+		})
+
+		require.NoError(t, pa.assembleDedicatedNUMAExclusiveRegion(exclusiveRegion, result))
+		require.Equal(t, types.CPUResource{Size: 10, Quota: -1}, result.PoolEntries["pod"][0])
+		require.Equal(t, types.CPUResource{Size: 6, Quota: 0},
+			result.PoolEntries[commonstate.PoolNameReclaim][0])
+	})
+
+	t.Run("ratio clamps physical reclaim target", func(t *testing.T) {
+		pa, exclusiveRegion, result, _ := newExclusiveAssemblerFixture(t, 16, 4, true, true)
+		pa.conf.GetDynamicConfiguration().ReclaimedCPUMaxRatio = 0.25
+		exclusiveRegion.SetProvision(types.ControlKnob{
+			configapi.ControlKnobNonReclaimedCPURequirement: {Value: 10},
+		})
+
+		require.NoError(t, pa.assembleDedicatedNUMAExclusiveRegion(exclusiveRegion, result))
+		require.Equal(t, types.CPUResource{Size: 12, Quota: -1}, result.PoolEntries["pod"][0])
+		require.Equal(t, types.CPUResource{Size: 4, Quota: -1},
+			result.PoolEntries[commonstate.PoolNameReclaim][0])
+	})
+
+	t.Run("empty dedicated target is rejected", func(t *testing.T) {
+		pa, exclusiveRegion, result, _ := newExclusiveAssemblerFixture(t, 16, 4, true, true)
+		exclusiveRegion.SetProvision(types.ControlKnob{
+			configapi.ControlKnobNonReclaimedCPURequirement: {Value: 0},
+		})
+
+		require.Error(t, pa.assembleDedicatedNUMAExclusiveRegion(exclusiveRegion, result))
+		require.Empty(t, result.PoolEntries)
+	})
+
+	t.Run("ratio below resource package eligibility is rejected", func(t *testing.T) {
+		pa, exclusiveRegion, result, metaReader := newExclusiveAssemblerFixture(t, 16, 4, true, true)
+		pa.conf.GetDynamicConfiguration().ReclaimedCPUMaxRatio = 0.25
+		exclusiveRegion.ownerPoolName = "dedicated-pkg/dedicated-exclusive"
+		require.NoError(t, metaReader.SetResourcePackageConfig(types.ResourcePackageConfig{
+			0: {
+				"dedicated-pkg": {
+					PinnedCPUSet: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
+				},
+			},
+		}))
+		exclusiveRegion.SetProvision(types.ControlKnob{
+			configapi.ControlKnobNonReclaimedCPURequirement: {Value: 8},
+		})
+
+		require.Error(t, pa.assembleDedicatedNUMAExclusiveRegion(exclusiveRegion, result))
+		require.Empty(t, result.PoolEntries)
+	})
+
+	t.Run("resource package dedicated capacity below target is rejected", func(t *testing.T) {
+		pa, exclusiveRegion, result, metaReader := newExclusiveAssemblerFixture(t, 16, 4, false, true)
+		exclusiveRegion.ownerPoolName = "dedicated-pkg/dedicated-exclusive"
+		require.NoError(t, metaReader.SetResourcePackageConfig(types.ResourcePackageConfig{
+			0: {
+				"dedicated-pkg": {
+					PinnedCPUSet: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
+				},
+			},
+		}))
+		exclusiveRegion.SetProvision(types.ControlKnob{
+			configapi.ControlKnobNonReclaimedCPURequirement: {Value: 8},
+		})
+
+		require.Error(t, pa.assembleDedicatedNUMAExclusiveRegion(exclusiveRegion, result))
+		require.Empty(t, result.PoolEntries)
+	})
+
+	t.Run("non reclaimable pinned CPUs are excluded from partition eligibility", func(t *testing.T) {
+		pa, exclusiveRegion, result, metaReader := newExclusiveAssemblerFixture(t, 16, 4, true, true)
+		pa.conf.GetDynamicConfiguration().DisableReclaimPinnedCPUSetResourcePackageSelector = "disable-reclaim=true"
+		require.NoError(t, metaReader.SetResourcePackageConfig(types.ResourcePackageConfig{
+			0: {
+				"protected": {
+					Attributes:   map[string]string{"disable-reclaim": "true"},
+					PinnedCPUSet: machine.NewCPUSet(0, 1, 2, 3),
+				},
+			},
+		}))
+		exclusiveRegion.SetProvision(types.ControlKnob{
+			configapi.ControlKnobNonReclaimedCPURequirement: {Value: 8},
+		})
+
+		require.NoError(t, pa.assembleDedicatedNUMAExclusiveRegion(exclusiveRegion, result))
+		require.Equal(t, types.CPUResource{Size: 8, Quota: -1}, result.PoolEntries["pod"][0])
+		require.Equal(t, types.CPUResource{Size: 4, Quota: -1},
+			result.PoolEntries[commonstate.PoolNameReclaim][0])
+	})
+}
+
+func TestAssembleDedicatedNUMAExclusiveRegionLegacyGolden(t *testing.T) {
+	pa, exclusiveRegion, result, _ := newExclusiveAssemblerFixture(t, 16, 4, true, false)
+	exclusiveRegion.SetProvision(types.ControlKnob{
+		configapi.ControlKnobNonReclaimedCPURequirement: {Value: 10},
+	})
+
+	require.NoError(t, pa.assembleDedicatedNUMAExclusiveRegion(exclusiveRegion, result))
+	require.NotContains(t, result.PoolEntries, "pod")
+	require.Equal(t, types.CPUResource{Size: 0, Quota: -1},
+		result.PoolEntries[commonstate.PoolNameReclaim][0])
+	require.Equal(t, 6,
+		result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["pod"]["main"])
+	require.Equal(t, 6,
+		result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["pod"]["sidecar"])
 }
