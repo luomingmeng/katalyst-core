@@ -89,11 +89,61 @@ const (
 
 var policyTestMutex = advisorTestMutex
 
+type storeFailureState struct {
+	state.State
+	err error
+}
+
+func (s *storeFailureState) StoreState() error {
+	return s.err
+}
+
 type cpuTestCase struct {
 	cpuNum      int
 	socketNum   int
 	numaNum     int
 	fakeNUMANum int
+}
+
+func TestAllocationRequestLockSerializesOnlySameContainer(t *testing.T) {
+	t.Parallel()
+
+	p := &DynamicPolicy{}
+	unlockFirst := p.lockAllocationRequest("pod", "main")
+
+	sameContainerAcquired := make(chan func(), 1)
+	go func() {
+		sameContainerAcquired <- p.lockAllocationRequest("pod", "main")
+	}()
+	select {
+	case unlock := <-sameContainerAcquired:
+		unlock()
+		t.Fatal("same-container request acquired the lock before its predecessor released it")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	otherContainerAcquired := make(chan func(), 1)
+	go func() {
+		otherContainerAcquired <- p.lockAllocationRequest("pod", "sidecar")
+	}()
+	select {
+	case unlock := <-otherContainerAcquired:
+		unlock()
+	case <-time.After(time.Second):
+		t.Fatal("different-container request was blocked by an unrelated allocation lock")
+	}
+
+	unlockFirst()
+	select {
+	case unlock := <-sameContainerAcquired:
+		unlock()
+	case <-time.After(time.Second):
+		t.Fatal("same-container waiter did not acquire the released allocation lock")
+	}
+
+	p.allocationRequestLocksMu.Lock()
+	defer p.allocationRequestLocksMu.Unlock()
+	require.Empty(t, p.allocationRequestLocks)
 }
 
 func generateSharedNumaBindingPoolAllocationMeta(poolName string) commonstate.AllocationMeta {
@@ -1839,6 +1889,283 @@ func TestAllocate(t *testing.T) {
 			_ = os.RemoveAll(tmpDir)
 		})
 	}
+}
+
+func TestAllocateFailureRollbackDoesNotOverwriteNewerState(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+
+	const failedPodUID = "failed-allocate-rollback"
+	const newerPodUID = "newer-allocate-submission"
+	originalReclaim := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	require.NotNil(t, originalReclaim)
+	originalAllocation := &state.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        failedPodUID,
+			PodNamespace:  "default",
+			PodName:       failedPodUID,
+			ContainerName: "main",
+			OwnerPoolName: commonstate.PoolNameDedicated,
+			QoSLevel:      consts.PodAnnotationQoSLevelDedicatedCores,
+		},
+		AllocationResult:         machine.NewCPUSet(6),
+		OriginalAllocationResult: machine.NewCPUSet(6),
+	}
+	p.state.SetAllocationInfo(failedPodUID, "main", originalAllocation, false)
+	p.allocationHandlers[consts.PodAnnotationQoSLevelSharedCores] = func(_ context.Context, req *pluginapi.ResourceRequest, _ bool) (*pluginapi.ResourceAllocationResponse, error) {
+		p.state.SetAllocationInfo(req.PodUid, req.ContainerName, &state.AllocationInfo{
+			AllocationMeta: commonstate.AllocationMeta{
+				PodUid:        req.PodUid,
+				PodNamespace:  req.PodNamespace,
+				PodName:       req.PodName,
+				ContainerName: req.ContainerName,
+				QoSLevel:      consts.PodAnnotationQoSLevelSharedCores,
+			},
+			AllocationResult:         machine.NewCPUSet(1),
+			OriginalAllocationResult: machine.NewCPUSet(1),
+		}, false)
+		failedReclaim := originalReclaim.Clone()
+		failedReclaim.AllocationResult = machine.NewCPUSet(7)
+		failedReclaim.OriginalAllocationResult = machine.NewCPUSet(7)
+		p.state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, failedReclaim, false)
+
+		p.Unlock()
+		p.state.SetAllocationInfo(newerPodUID, "main", &state.AllocationInfo{
+			AllocationMeta: commonstate.AllocationMeta{
+				PodUid:        newerPodUID,
+				PodNamespace:  "default",
+				PodName:       newerPodUID,
+				ContainerName: "main",
+				OwnerPoolName: commonstate.PoolNameDedicated,
+				QoSLevel:      consts.PodAnnotationQoSLevelDedicatedCores,
+			},
+			AllocationResult:         machine.NewCPUSet(7),
+			OriginalAllocationResult: machine.NewCPUSet(7),
+		}, false)
+		p.Lock()
+
+		return nil, fmt.Errorf("injected allocation failure")
+	}
+
+	req := &pluginapi.ResourceRequest{
+		PodUid:        failedPodUID,
+		PodNamespace:  "default",
+		PodName:       failedPodUID,
+		ContainerName: "main",
+		ContainerType: pluginapi.ContainerType_MAIN,
+		ResourceName:  string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{
+			string(v1.ResourceCPU): 2,
+		},
+		Labels: map[string]string{
+			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+		},
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+		},
+	}
+
+	_, err = p.Allocate(context.Background(), req)
+	require.ErrorContains(t, err, "injected allocation failure")
+	require.NotNil(t, p.state.GetAllocationInfo(newerPodUID, "main"),
+		"failed allocation rollback must not overwrite newer state")
+	restored := p.state.GetAllocationInfo(failedPodUID, "main")
+	require.NotNil(t, restored, "failed reallocation must restore the previous allocation")
+	require.True(t, restored.AllocationResult.Equals(originalAllocation.AllocationResult),
+		"restored allocation=%s, want %s", restored.AllocationResult, originalAllocation.AllocationResult)
+	reclaim := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	require.NotNil(t, reclaim)
+	require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(2, 3, 4, 5)),
+		"reclaim allocation=%s, want latest-state replan 2-5", reclaim.AllocationResult)
+}
+
+func TestAllocateFailureRollbackDoesNotOverwriteNewerSameContainerState(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+
+	const podUID = "same-container-rollback"
+	originalAllocation := &state.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        podUID,
+			PodNamespace:  "default",
+			PodName:       "original",
+			ContainerName: "main",
+			QoSLevel:      consts.PodAnnotationQoSLevelSharedCores,
+		},
+		AllocationResult:         machine.NewCPUSet(0),
+		OriginalAllocationResult: machine.NewCPUSet(0),
+	}
+	p.state.SetAllocationInfo(podUID, "main", originalAllocation, false)
+
+	olderStarted := make(chan struct{})
+	releaseOlder := make(chan struct{})
+	p.allocationHandlers[consts.PodAnnotationQoSLevelSharedCores] = func(
+		_ context.Context,
+		req *pluginapi.ResourceRequest,
+		_ bool,
+	) (*pluginapi.ResourceAllocationResponse, error) {
+		if req.PodName == "older" {
+			p.state.SetAllocationInfo(req.PodUid, req.ContainerName, &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        req.PodUid,
+					PodNamespace:  req.PodNamespace,
+					PodName:       req.PodName,
+					ContainerName: req.ContainerName,
+					QoSLevel:      consts.PodAnnotationQoSLevelSharedCores,
+				},
+				AllocationResult:         machine.NewCPUSet(1),
+				OriginalAllocationResult: machine.NewCPUSet(1),
+			}, false)
+			close(olderStarted)
+			p.Unlock()
+			<-releaseOlder
+			p.Lock()
+			return nil, fmt.Errorf("injected older allocation failure")
+		}
+
+		p.state.SetAllocationInfo(req.PodUid, req.ContainerName, &state.AllocationInfo{
+			AllocationMeta: commonstate.AllocationMeta{
+				PodUid:        req.PodUid,
+				PodNamespace:  req.PodNamespace,
+				PodName:       req.PodName,
+				ContainerName: req.ContainerName,
+				QoSLevel:      consts.PodAnnotationQoSLevelSharedCores,
+			},
+			AllocationResult:         machine.NewCPUSet(2, 3, 4),
+			OriginalAllocationResult: machine.NewCPUSet(2, 3, 4),
+		}, false)
+		return &pluginapi.ResourceAllocationResponse{
+			PodUid:        req.PodUid,
+			PodName:       req.PodName,
+			ContainerName: req.ContainerName,
+			ResourceName:  req.ResourceName,
+		}, nil
+	}
+
+	newRequest := func(podName string, quantity float64) *pluginapi.ResourceRequest {
+		return &pluginapi.ResourceRequest{
+			PodUid:        podUID,
+			PodNamespace:  "default",
+			PodName:       podName,
+			ContainerName: "main",
+			ContainerType: pluginapi.ContainerType_MAIN,
+			ResourceName:  string(v1.ResourceCPU),
+			ResourceRequests: map[string]float64{
+				string(v1.ResourceCPU): quantity,
+			},
+			Labels: map[string]string{
+				consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+			},
+			Annotations: map[string]string{
+				consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+			},
+		}
+	}
+
+	olderResult := make(chan error, 1)
+	go func() {
+		_, err := p.Allocate(context.Background(), newRequest("older", 2))
+		olderResult <- err
+	}()
+	<-olderStarted
+
+	type allocationResult struct {
+		resp *pluginapi.ResourceAllocationResponse
+		err  error
+	}
+	newerResult := make(chan allocationResult, 1)
+	go func() {
+		resp, err := p.Allocate(context.Background(), newRequest("newer", 3))
+		newerResult <- allocationResult{resp: resp, err: err}
+	}()
+	select {
+	case result := <-newerResult:
+		t.Fatalf("newer same-container allocation completed before the older request released ownership: resp=%v err=%v",
+			result.resp, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseOlder)
+	require.ErrorContains(t, <-olderResult, "injected older allocation failure")
+	result := <-newerResult
+	require.NoError(t, result.err)
+	require.NotNil(t, result.resp)
+
+	latest := p.state.GetAllocationInfo(podUID, "main")
+	require.NotNil(t, latest)
+	require.Equal(t, "newer", latest.PodName)
+	require.True(t, latest.AllocationResult.Equals(machine.NewCPUSet(2, 3, 4)),
+		"latest allocation=%s, want 2-4", latest.AllocationResult)
+}
+
+func TestAllocateReturnsCheckpointFailure(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+
+	p.state = &storeFailureState{
+		State: p.state,
+		err:   fmt.Errorf("injected checkpoint failure"),
+	}
+	p.allocationHandlers[consts.PodAnnotationQoSLevelSharedCores] = func(
+		_ context.Context,
+		req *pluginapi.ResourceRequest,
+		_ bool,
+	) (*pluginapi.ResourceAllocationResponse, error) {
+		p.state.SetAllocationInfo(req.PodUid, req.ContainerName, &state.AllocationInfo{
+			AllocationMeta: commonstate.AllocationMeta{
+				PodUid:        req.PodUid,
+				PodNamespace:  req.PodNamespace,
+				PodName:       req.PodName,
+				ContainerName: req.ContainerName,
+				OwnerPoolName: commonstate.PoolNameDedicated,
+				QoSLevel:      consts.PodAnnotationQoSLevelDedicatedCores,
+			},
+			AllocationResult:         machine.NewCPUSet(7),
+			OriginalAllocationResult: machine.NewCPUSet(7),
+		}, false)
+		return &pluginapi.ResourceAllocationResponse{
+			PodUid:        req.PodUid,
+			ContainerName: req.ContainerName,
+			ResourceName:  req.ResourceName,
+		}, nil
+	}
+
+	req := &pluginapi.ResourceRequest{
+		PodUid:        "checkpoint-failure",
+		PodNamespace:  "default",
+		PodName:       "checkpoint-failure",
+		ContainerName: "main",
+		ContainerType: pluginapi.ContainerType_MAIN,
+		ResourceName:  string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{
+			string(v1.ResourceCPU): 1,
+		},
+		Labels: map[string]string{
+			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+		},
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+		},
+	}
+
+	resp, err := p.Allocate(context.Background(), req)
+	require.Nil(t, resp)
+	require.ErrorContains(t, err, "store allocation state")
+	require.ErrorContains(t, err, "injected checkpoint failure")
+	require.Nil(t, p.state.GetAllocationInfo(req.PodUid, req.ContainerName),
+		"checkpoint failure must roll back the in-memory allocation")
 }
 
 func TestAllocateForPod(t *testing.T) {
