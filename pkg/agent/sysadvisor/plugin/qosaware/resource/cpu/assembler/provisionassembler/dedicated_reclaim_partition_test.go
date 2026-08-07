@@ -124,13 +124,34 @@ func TestCalculateExclusiveDisjointTargets(t *testing.T) {
 			wantReclaim:   13,
 		},
 		{
-			name: "negative capacities have no feasible partition",
+			name: "negative partition capacity is rejected",
 			in: exclusivePartitionInput{
 				PartitionCapacity: -1,
+				DedicatedCapacity: 16,
+				ReclaimCapacity:   16,
+				NonReclaimed:      16,
+				EnableReclaim:     true,
+			},
+			wantErr: true,
+		},
+		{
+			name: "negative dedicated capacity is rejected",
+			in: exclusivePartitionInput{
+				PartitionCapacity: 16,
 				DedicatedCapacity: -1,
+				ReclaimCapacity:   16,
+				NonReclaimed:      16,
+				EnableReclaim:     true,
+			},
+			wantErr: true,
+		},
+		{
+			name: "negative reclaim capacity is rejected",
+			in: exclusivePartitionInput{
+				PartitionCapacity: 16,
+				DedicatedCapacity: 16,
 				ReclaimCapacity:   -1,
-				Reserved:          -1,
-				NonReclaimed:      -1,
+				NonReclaimed:      16,
 				EnableReclaim:     true,
 			},
 			wantErr: true,
