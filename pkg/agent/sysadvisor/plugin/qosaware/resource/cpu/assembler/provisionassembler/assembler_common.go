@@ -27,6 +27,7 @@ import (
 
 	configapi "github.com/kubewharf/katalyst-api/pkg/apis/config/v1alpha1"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	qrmstate "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/metacache"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/plugin/qosaware/resource/cpu/region"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
@@ -185,6 +186,27 @@ func (pa *ProvisionAssemblerCommon) getExclusivePartitionCapacities(
 	r region.QoSRegion,
 	regionNuma, available int,
 ) (partition, dedicated, reclaim int, err error) {
+	if pa.metaServer == nil || pa.metaServer.CPUDetails == nil {
+		return 0, 0, 0, fmt.Errorf("CPU topology is unavailable for NUMA %d", regionNuma)
+	}
+
+	availableCPUSet := pa.metaServer.CPUDetails.CPUsInNUMANodes(regionNuma)
+	if reservePool, ok := pa.metaReader.GetPoolInfo(commonstate.PoolNameReserve); ok && reservePool != nil {
+		availableCPUSet = availableCPUSet.Difference(reservePool.TopologyAwareAssignments[regionNuma])
+	}
+	pa.metaReader.RangePool(func(poolName string, poolInfo *types.PoolInfo) bool {
+		if poolInfo != nil && qrmstate.ForbiddenPools.Has(poolName) {
+			availableCPUSet = availableCPUSet.Difference(poolInfo.TopologyAwareAssignments[regionNuma])
+		}
+		return true
+	})
+	if availableCPUSet.Size() != available {
+		return 0, 0, 0, fmt.Errorf(
+			"available CPUSet size %d for NUMA %d does not match numaAvailable %d",
+			availableCPUSet.Size(), regionNuma, available,
+		)
+	}
+
 	cfg := pa.metaReader.GetResourcePackageConfig()
 	pkgMap := cfg[regionNuma]
 	allPinned := machine.NewCPUSet()
@@ -200,24 +222,19 @@ func (pa *ProvisionAssemblerCommon) getExclusivePartitionCapacities(
 	if err != nil {
 		return 0, 0, 0, err
 	}
-	nonReclaimablePackages := resourcepackage.GetMatchedPackages(pkgMap, disableReclaimSelector)
 	nonReclaimablePinned := resourcepackage.GetMatchedPinnedCPUSet(pkgMap, disableReclaimSelector)
 
 	pkgName := r.GetResourcePackageName()
-	dedicatedReclaimIntersection := 0
+	dedicatedCPUSet := machine.NewCPUSet()
 	if pkgName == "" {
-		dedicated = general.Max(available-allPinned.Size(), 0)
-		dedicatedReclaimIntersection = dedicated
+		dedicatedCPUSet = availableCPUSet.Difference(allPinned)
 	} else if state, ok := pkgMap[pkgName]; ok && state != nil {
-		dedicated = general.Min(state.PinnedCPUSet.Size(), available)
-		if !nonReclaimablePackages.Has(pkgName) {
-			dedicatedReclaimIntersection = dedicated
-		}
+		dedicatedCPUSet = availableCPUSet.Intersection(state.PinnedCPUSet)
 	}
 
-	reclaim = general.Max(available-general.Min(nonReclaimablePinned.Size(), available), 0)
-	partition = general.Min(dedicated+reclaim-dedicatedReclaimIntersection, available)
-	return partition, dedicated, reclaim, nil
+	reclaimCPUSet := availableCPUSet.Difference(nonReclaimablePinned)
+	partitionCPUSet := dedicatedCPUSet.Union(reclaimCPUSet)
+	return partitionCPUSet.Size(), dedicatedCPUSet.Size(), reclaimCPUSet.Size(), nil
 }
 
 func (pa *ProvisionAssemblerCommon) assembleLegacyDedicatedNUMAExclusiveRegion(r region.QoSRegion, result *types.InternalCPUCalculationResult) error {

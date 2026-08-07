@@ -1549,6 +1549,104 @@ func newExclusiveAssemblerFixture(
 	return pa, exclusiveRegion, result, metaReader
 }
 
+func TestGetExclusivePartitionCapacitiesUsesActualAvailableCPUSet(t *testing.T) {
+	tests := []struct {
+		name                   string
+		ownerPackage           string
+		disableReclaimSelector string
+		packages               map[string]*types.ResourcePackageState
+		wantPartition          int
+		wantDedicated          int
+		wantReclaim            int
+	}{
+		{
+			name:         "pinned owner partially overlaps reserve and forbidden pools",
+			ownerPackage: "pinned",
+			packages: map[string]*types.ResourcePackageState{
+				"pinned": {PinnedCPUSet: machine.MustParse("0-7")},
+			},
+			wantPartition: 12,
+			wantDedicated: 4,
+			wantReclaim:   12,
+		},
+		{
+			name: "unpinned owner excludes only available pinned CPUs",
+			packages: map[string]*types.ResourcePackageState{
+				"pinned": {PinnedCPUSet: machine.MustParse("0-7")},
+			},
+			wantPartition: 12,
+			wantDedicated: 8,
+			wantReclaim:   12,
+		},
+		{
+			name:                   "non reclaimable pinned CPUs are intersected with availability",
+			ownerPackage:           "protected",
+			disableReclaimSelector: "disable-reclaim=true",
+			packages: map[string]*types.ResourcePackageState{
+				"protected": {
+					Attributes:   map[string]string{"disable-reclaim": "true"},
+					PinnedCPUSet: machine.MustParse("0-7"),
+				},
+			},
+			wantPartition: 12,
+			wantDedicated: 4,
+			wantReclaim:   8,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			pa, exclusiveRegion, _, metaReader := newExclusiveAssemblerFixture(t, 16, 0, true, true)
+			pa.conf.GetDynamicConfiguration().DisableReclaimPinnedCPUSetResourcePackageSelector = tt.disableReclaimSelector
+			(*pa.numaAvailable)[0] = 12
+			exclusiveRegion.ownerPoolName = "dedicated-exclusive"
+			if tt.ownerPackage != "" {
+				exclusiveRegion.ownerPoolName = tt.ownerPackage + "/dedicated-exclusive"
+			}
+
+			require.NoError(t, metaReader.SetPoolInfo(commonstate.PoolNameReserve, &types.PoolInfo{
+				PoolName: commonstate.PoolNameReserve,
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: machine.MustParse("0-1"),
+				},
+			}))
+			require.NoError(t, metaReader.SetPoolInfo(commonstate.PoolNameInterrupt, &types.PoolInfo{
+				PoolName: commonstate.PoolNameInterrupt,
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: machine.MustParse("2-3"),
+				},
+			}))
+			require.NoError(t, metaReader.SetResourcePackageConfig(types.ResourcePackageConfig{0: tt.packages}))
+
+			partition, dedicated, reclaim, err := pa.getExclusivePartitionCapacities(exclusiveRegion, 0, 12)
+			require.NoError(t, err)
+			require.Equal(t, tt.wantPartition, partition)
+			require.Equal(t, tt.wantDedicated, dedicated)
+			require.Equal(t, tt.wantReclaim, reclaim)
+		})
+	}
+
+	t.Run("available CPUSet size must match numaAvailable", func(t *testing.T) {
+		pa, exclusiveRegion, _, metaReader := newExclusiveAssemblerFixture(t, 16, 0, true, true)
+		require.NoError(t, metaReader.SetPoolInfo(commonstate.PoolNameReserve, &types.PoolInfo{
+			PoolName: commonstate.PoolNameReserve,
+			TopologyAwareAssignments: map[int]machine.CPUSet{
+				0: machine.MustParse("0-1"),
+			},
+		}))
+		require.NoError(t, metaReader.SetPoolInfo(commonstate.PoolNameInterrupt, &types.PoolInfo{
+			PoolName: commonstate.PoolNameInterrupt,
+			TopologyAwareAssignments: map[int]machine.CPUSet{
+				0: machine.MustParse("2-3"),
+			},
+		}))
+
+		_, _, _, err := pa.getExclusivePartitionCapacities(exclusiveRegion, 0, 11)
+		require.ErrorContains(t, err, "does not match numaAvailable")
+	})
+}
+
 func TestAssembleDedicatedNUMAExclusiveRegionDisjoint(t *testing.T) {
 	t.Run("enable reclaim emits one dedicated entry per pod and standalone reclaim", func(t *testing.T) {
 		pa, exclusiveRegion, result, _ := newExclusiveAssemblerFixture(t, 16, 4, true, true)
