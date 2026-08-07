@@ -56,6 +56,7 @@ type FakeRegion struct {
 	enableReclaim              bool
 	podSets                    types.PodSet
 	controlKnob                types.ControlKnob
+	podsRequest                float64
 	headroom                   float64
 	throttled                  bool
 	provisionCurrentPolicyName types.CPUProvisionPolicyName
@@ -113,7 +114,7 @@ func (fake *FakeRegion) GetPods() types.PodSet {
 }
 
 func (fake *FakeRegion) GetPodsRequest() float64 {
-	return 0
+	return fake.podsRequest
 }
 
 func (fake *FakeRegion) SetBindingNumas(bindingNumas machine.CPUSet) {
@@ -1303,6 +1304,203 @@ func TestClampReclaimOverlapMetadataClearsZeroBudget(t *testing.T) {
 	require.Zero(t, got)
 	require.Empty(t, result.PoolOverlapInfo[commonstate.PoolNameReclaim][0])
 	require.Empty(t, result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0])
+}
+
+func TestClampReclaimOverlapMetadataKeepsContainerAliases(t *testing.T) {
+	t.Parallel()
+
+	result := &types.InternalCPUCalculationResult{
+		PoolOverlapInfo: map[string]map[int]map[string]int{},
+		PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{
+			commonstate.PoolNameReclaim: {
+				0: {
+					"pod": {
+						"main":    4,
+						"sidecar": 4,
+					},
+				},
+			},
+		},
+	}
+
+	got := clampReclaimOverlapMetadata(result, 0, 4)
+
+	require.Equal(t, 4, got)
+	require.Equal(t, map[string]int{"main": 4, "sidecar": 4},
+		result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["pod"])
+}
+
+func TestAssembleWithoutNUMAExclusivePoolOverlapPolicyMatrix(t *testing.T) {
+	tests := []struct {
+		name                    string
+		allowSharedOverlap      bool
+		disableDedicatedOverlap bool
+		sharedEnableReclaim     bool
+		dedicatedEnableReclaim  bool
+		wantDedicatedSize       int
+		wantSharedOverlap       bool
+		wantDedicatedOverlap    bool
+	}{
+		{name: "AS0_DD0_SE0_DE0", wantDedicatedSize: 8},
+		{name: "AS0_DD0_SE0_DE1", dedicatedEnableReclaim: true, wantDedicatedSize: 8, wantDedicatedOverlap: true},
+		{name: "AS0_DD0_SE1_DE0", sharedEnableReclaim: true, wantDedicatedSize: 8},
+		{name: "AS0_DD0_SE1_DE1", sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantDedicatedSize: 8, wantDedicatedOverlap: true},
+		{name: "AS0_DD1_SE0_DE0", disableDedicatedOverlap: true, wantDedicatedSize: 8},
+		{name: "AS0_DD1_SE0_DE1", disableDedicatedOverlap: true, dedicatedEnableReclaim: true, wantDedicatedSize: 6},
+		{name: "AS0_DD1_SE1_DE0", disableDedicatedOverlap: true, sharedEnableReclaim: true, wantDedicatedSize: 8},
+		{name: "AS0_DD1_SE1_DE1", disableDedicatedOverlap: true, sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantDedicatedSize: 6},
+		{name: "AS1_DD0_SE0_DE0", allowSharedOverlap: true, wantDedicatedSize: 8},
+		{name: "AS1_DD0_SE0_DE1", allowSharedOverlap: true, dedicatedEnableReclaim: true, wantDedicatedSize: 8, wantDedicatedOverlap: true},
+		{name: "AS1_DD0_SE1_DE0", allowSharedOverlap: true, sharedEnableReclaim: true, wantDedicatedSize: 8, wantSharedOverlap: true},
+		{name: "AS1_DD0_SE1_DE1", allowSharedOverlap: true, sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantDedicatedSize: 8, wantSharedOverlap: true, wantDedicatedOverlap: true},
+		{name: "AS1_DD1_SE0_DE0", allowSharedOverlap: true, disableDedicatedOverlap: true, wantDedicatedSize: 8},
+		{name: "AS1_DD1_SE0_DE1", allowSharedOverlap: true, disableDedicatedOverlap: true, dedicatedEnableReclaim: true, wantDedicatedSize: 6},
+		{name: "AS1_DD1_SE1_DE0", allowSharedOverlap: true, disableDedicatedOverlap: true, sharedEnableReclaim: true, wantDedicatedSize: 8, wantSharedOverlap: true},
+		{name: "AS1_DD1_SE1_DE1", allowSharedOverlap: true, disableDedicatedOverlap: true, sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantDedicatedSize: 6, wantSharedOverlap: true},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := runOrdinaryOverlapAssemblerCase(t, ordinaryOverlapAssemblerCase{
+				capacity:                20,
+				reserved:                4,
+				allowSharedOverlap:      tt.allowSharedOverlap,
+				disableDedicatedOverlap: tt.disableDedicatedOverlap,
+				sharedEnableReclaim:     tt.sharedEnableReclaim,
+				dedicatedEnableReclaim:  tt.dedicatedEnableReclaim,
+				sharedRequest:           8,
+				sharedRequirement:       4,
+				dedicatedRequest:        8,
+				dedicatedRequirement:    6,
+			})
+			require.NoError(t, err)
+			require.Equal(t, tt.wantDedicatedSize, result.PoolEntries["dedicated-pod"][0].Size)
+			_, hasSharedOverlap := result.PoolOverlapInfo[commonstate.PoolNameReclaim][0]["share"]
+			require.Equal(t, tt.wantSharedOverlap, hasSharedOverlap)
+			require.Equal(t, tt.wantDedicatedOverlap,
+				len(result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]) > 0)
+		})
+	}
+}
+
+func TestAssembleWithoutNUMAExclusivePoolDisjointDedicatedCapacityPressure(t *testing.T) {
+	t.Run("reserve remains available alongside shared overlap", func(t *testing.T) {
+		result, err := runOrdinaryOverlapAssemblerCase(t, ordinaryOverlapAssemblerCase{
+			capacity:                20,
+			reserved:                4,
+			allowSharedOverlap:      true,
+			disableDedicatedOverlap: true,
+			sharedEnableReclaim:     true,
+			dedicatedEnableReclaim:  true,
+			sharedRequest:           8,
+			sharedRequirement:       4,
+			dedicatedRequest:        8,
+			dedicatedRequirement:    6,
+		})
+		require.NoError(t, err)
+		require.Equal(t, 4, result.PoolEntries[commonstate.PoolNameReclaim][0].Size)
+		require.Equal(t, 6, result.PoolOverlapInfo[commonstate.PoolNameReclaim][0]["share"])
+		require.Empty(t, result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0])
+	})
+
+	t.Run("reserve is retained and dedicated uses regulated physical size", func(t *testing.T) {
+		result, err := runOrdinaryOverlapAssemblerCase(t, ordinaryOverlapAssemblerCase{
+			capacity:                5,
+			reserved:                4,
+			disableDedicatedOverlap: true,
+			dedicatedEnableReclaim:  true,
+			dedicatedRequest:        8,
+			dedicatedRequirement:    6,
+		})
+		require.NoError(t, err)
+		require.Equal(t, 1, result.PoolEntries["dedicated-pod"][0].Size)
+		require.Equal(t, 4, result.PoolEntries[commonstate.PoolNameReclaim][0].Size)
+		require.Empty(t, result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0])
+	})
+
+	t.Run("active dedicated pool cannot be regulated to zero", func(t *testing.T) {
+		_, err := runOrdinaryOverlapAssemblerCase(t, ordinaryOverlapAssemblerCase{
+			capacity:                4,
+			reserved:                4,
+			disableDedicatedOverlap: true,
+			dedicatedEnableReclaim:  true,
+			dedicatedRequest:        8,
+			dedicatedRequirement:    6,
+		})
+		require.ErrorContains(t, err, "active dedicated pool")
+	})
+}
+
+type ordinaryOverlapAssemblerCase struct {
+	capacity                int
+	reserved                int
+	allowSharedOverlap      bool
+	disableDedicatedOverlap bool
+	sharedEnableReclaim     bool
+	dedicatedEnableReclaim  bool
+	sharedRequest           int
+	sharedRequirement       int
+	dedicatedRequest        int
+	dedicatedRequirement    int
+}
+
+func runOrdinaryOverlapAssemblerCase(
+	t *testing.T,
+	tc ordinaryOverlapAssemblerCase,
+) (*types.InternalCPUCalculationResult, error) {
+	t.Helper()
+
+	conf, err := options.NewOptions().Config()
+	require.NoError(t, err)
+	conf.GetDynamicConfiguration().EnableReclaim = true
+
+	regionMap := map[string]region.QoSRegion{}
+	if tc.sharedRequest > 0 {
+		shared := NewFakeRegion("share", configapi.QoSRegionTypeShare, "share")
+		shared.SetBindingNumas(machine.NewCPUSet(0))
+		shared.SetIsNumaBinding(true)
+		shared.enableReclaim = tc.sharedEnableReclaim
+		shared.podsRequest = float64(tc.sharedRequest)
+		shared.SetProvision(types.ControlKnob{
+			configapi.ControlKnobNonReclaimedCPURequirement: {Value: float64(tc.sharedRequirement)},
+		})
+		regionMap[shared.Name()] = shared
+	}
+	if tc.dedicatedRequest > 0 {
+		dedicated := NewFakeRegion("dedicated", configapi.QoSRegionTypeDedicated, "dedicated")
+		dedicated.SetBindingNumas(machine.NewCPUSet(0))
+		dedicated.SetIsNumaBinding(true)
+		dedicated.enableReclaim = tc.dedicatedEnableReclaim
+		dedicated.podsRequest = float64(tc.dedicatedRequest)
+		dedicated.SetPods(types.PodSet{
+			"dedicated-pod": sets.NewString("main", "sidecar"),
+		})
+		dedicated.SetProvision(types.ControlKnob{
+			configapi.ControlKnobNonReclaimedCPURequirement: {Value: float64(tc.dedicatedRequirement)},
+		})
+		regionMap[dedicated.Name()] = dedicated
+	}
+
+	reservedForReclaim := map[int]int{0: tc.reserved}
+	numaAvailable := map[int]int{0: tc.capacity}
+	nonBindingNUMAs := machine.NewCPUSet()
+	metaReader := metacache.NewDummyMetaCacheImp()
+	require.NoError(t, metaReader.SetResourcePackageConfig(types.ResourcePackageConfig{}))
+	pa := NewProvisionAssemblerCommon(
+		conf, nil, &regionMap, &reservedForReclaim, &numaAvailable, &nonBindingNUMAs,
+		&tc.allowSharedOverlap, &tc.disableDedicatedOverlap, metaReader, nil, metrics.DummyMetrics{},
+	).(*ProvisionAssemblerCommon)
+	result := &types.InternalCPUCalculationResult{
+		PoolEntries:                                map[string]map[int]types.CPUResource{},
+		PoolOverlapInfo:                            map[string]map[int]map[string]int{},
+		PoolOverlapPodContainerInfo:                map[string]map[int]map[string]map[string]int{},
+		AllowSharedCoresOverlapReclaimedCores:      tc.allowSharedOverlap,
+		DisableDedicatedCoresOverlapReclaimedCores: tc.disableDedicatedOverlap,
+	}
+
+	err = pa.assembleWithoutNUMAExclusivePool(NewRegionMapHelper(regionMap), 0, result)
+	return result, err
 }
 
 func TestClampByReclaimedCPUMaxRatio(t *testing.T) {

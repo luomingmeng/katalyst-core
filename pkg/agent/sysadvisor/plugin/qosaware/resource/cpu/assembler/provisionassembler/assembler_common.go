@@ -434,7 +434,9 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 
 	reservedForReclaim := getNUMAsResource(*pa.reservedForReclaim, numaSet)
 	shareAndIsolatedDedicatedPoolAvailable := getNUMAsResource(*pa.numaAvailable, numaSet)
-	if !*pa.allowSharedCoresOverlapReclaimedCores {
+	reserveExcludedFromPoolCapacity := !*pa.allowSharedCoresOverlapReclaimedCores ||
+		(result.DisableDedicatedCoresOverlapReclaimedCores && len(dedicatedRegions) > 0)
+	if reserveExcludedFromPoolCapacity {
 		shareAndIsolatedDedicatedPoolAvailable -= reservedForReclaim
 	}
 
@@ -456,12 +458,21 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 
 		allowExpand := !nodeEnableReclaim || *pa.allowSharedCoresOverlapReclaimedCores
 		var regulateSharePoolSizes map[string]int
-		if allowExpand {
+		if !nodeEnableReclaim || *pa.allowSharedCoresOverlapReclaimedCores {
 			regulateSharePoolSizes = shareRegionInfo.requests
 		} else {
 			regulateSharePoolSizes = sharePoolSizeRequirements
 		}
-		unexpandableRequirements := general.MergeMapInt(isolationPoolSizes, dedicatedRegionInfo.requests)
+		dedicatedPhysicalSizes := make(map[string]int, len(dedicatedRegionInfo.requests))
+		for poolName, request := range dedicatedRegionInfo.requests {
+			dedicatedPhysicalSizes[poolName] = desiredDedicatedPhysical(
+				request,
+				dedicatedRegionInfo.requirements[poolName],
+				dedicatedRegionInfo.reclaimEnable[poolName],
+				result.DisableDedicatedCoresOverlapReclaimedCores,
+			)
+		}
+		unexpandableRequirements := general.MergeMapInt(isolationPoolSizes, dedicatedPhysicalSizes)
 
 		general.InfoS("getShareAndIsolateDedicatedPoolSizesFunc pre regulatePoolSizes",
 			"shareAndIsolatedDedicatedPoolAvailable", shareAndIsolatedDedicatedPoolAvailable,
@@ -561,6 +572,17 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 	dedicatedPoolAvailable := general.SumUpMapValues(dedicatedPoolSizes)
 	dedicatedPoolSizeRequirements := getPoolSizeRequirements(dedicatedInfo)
 	dedicatedReclaimCoresSize := dedicatedPoolAvailable - general.SumUpMapValues(dedicatedPoolSizeRequirements)
+	if result.DisableDedicatedCoresOverlapReclaimedCores {
+		dedicatedReclaimCoresSize = general.Max(dedicatedReclaimCoresSize, 0)
+	}
+
+	if result.DisableDedicatedCoresOverlapReclaimedCores {
+		for poolName, podSet := range dedicatedInfo.podSet {
+			if len(podSet) > 0 && shareAndIsolateDedicatedPoolSizes[poolName] <= 0 {
+				return fmt.Errorf("active dedicated pool %q was regulated to zero", poolName)
+			}
+		}
+	}
 
 	general.InfoS("pool info",
 		"numaID", numaID,
@@ -609,9 +631,14 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		nodeEnableReclaim:                      nodeEnableReclaim,
 		numaID:                                 numaID,
 		totalUnusedNonReclaimablePinnedCPUSize: totalUnusedNonReclaimablePinnedCPUSize,
+		reserveExcludedFromPoolCapacity:        reserveExcludedFromPoolCapacity,
 	}
 
-	reclaimedCoresSize, _, reclaimedCoresQuota, err := pa.calculateReclaimPool(reclaimPoolData, result)
+	policy := reclaimPoolCalculationPolicy{
+		allowSharedOverlap:    *pa.allowSharedCoresOverlapReclaimedCores,
+		allowDedicatedOverlap: !result.DisableDedicatedCoresOverlapReclaimedCores,
+	}
+	reclaimedCoresSize, _, reclaimedCoresQuota, err := pa.calculateReclaimPool(reclaimPoolData, policy, result)
 	if err != nil {
 		return err
 	}
@@ -628,7 +655,12 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		}
 	}
 
-	overlapReclaimedCoresSize := clampReclaimOverlapMetadata(result, numaID, reclaimedCoresSize)
+	overlapReclaimedCoresSize := clampReclaimOverlapMetadata(
+		result,
+		numaID,
+		reclaimedCoresSize,
+		reclaimPoolData.overlapAtoms...,
+	)
 	nonOverlapReclaimedCoresSize := general.Max(reclaimedCoresSize-overlapReclaimedCoresSize, 0)
 	result.SetPoolEntry(commonstate.PoolNameReclaim, numaID, nonOverlapReclaimedCoresSize, reclaimedCoresQuota)
 
@@ -647,7 +679,23 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 // aggregate reclaim budget. calculateReclaimPool builds the overlap metadata
 // before ratio-based clamping may shrink the aggregate size; this keeps both
 // outputs from describing conflicting reclaim capacity.
-func clampReclaimOverlapMetadata(result *types.InternalCPUCalculationResult, numaID, budget int) int {
+type podContainerAlias struct {
+	podUID        string
+	containerName string
+}
+
+type overlapAtom struct {
+	key            string
+	size           int
+	poolAlias      string
+	containerAlias []podContainerAlias
+}
+
+func clampReclaimOverlapMetadata(
+	result *types.InternalCPUCalculationResult,
+	numaID, budget int,
+	atoms ...overlapAtom,
+) int {
 	if result == nil {
 		return 0
 	}
@@ -661,65 +709,75 @@ func clampReclaimOverlapMetadata(result *types.InternalCPUCalculationResult, num
 		return 0
 	}
 
-	remaining := budget
-	actual := 0
+	if len(atoms) == 0 {
+		atoms = overlapAtomsFromMetadata(result, numaID)
+	}
+	sort.Slice(atoms, func(i, j int) bool {
+		return atoms[i].key < atoms[j].key
+	})
+
 	if byNUMA := result.PoolOverlapInfo[commonstate.PoolNameReclaim]; byNUMA != nil {
-		if overlaps := byNUMA[numaID]; overlaps != nil {
-			names := make([]string, 0, len(overlaps))
-			for name := range overlaps {
-				names = append(names, name)
-			}
-			sort.Strings(names)
-			for _, name := range names {
-				size := overlaps[name]
-				if size <= 0 || remaining == 0 {
-					delete(overlaps, name)
-					continue
-				}
-				if size > remaining {
-					size = remaining
-					overlaps[name] = size
-				}
-				remaining -= size
-				actual += size
-			}
-		}
+		delete(byNUMA, numaID)
+	}
+	if byNUMA := result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim]; byNUMA != nil {
+		delete(byNUMA, numaID)
 	}
 
-	if byNUMA := result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim]; byNUMA != nil {
-		if pods := byNUMA[numaID]; pods != nil {
-			podUIDs := make([]string, 0, len(pods))
-			for podUID := range pods {
-				podUIDs = append(podUIDs, podUID)
-			}
-			sort.Strings(podUIDs)
-			for _, podUID := range podUIDs {
-				containers := pods[podUID]
-				containerNames := make([]string, 0, len(containers))
-				for containerName := range containers {
-					containerNames = append(containerNames, containerName)
-				}
-				sort.Strings(containerNames)
-				for _, containerName := range containerNames {
-					size := containers[containerName]
-					if size <= 0 || remaining == 0 {
-						delete(containers, containerName)
-						continue
-					}
-					if size > remaining {
-						size = remaining
-						containers[containerName] = size
-					}
-					remaining -= size
-					actual += size
-				}
-				if len(containers) == 0 {
-					delete(pods, podUID)
-				}
-			}
+	remaining := budget
+	actual := 0
+	for _, atom := range atoms {
+		if atom.size <= 0 || remaining == 0 {
+			continue
+		}
+		size := general.Min(atom.size, remaining)
+		remaining -= size
+		actual += size
+		if atom.poolAlias != "" {
+			result.SetPoolOverlapInfo(commonstate.PoolNameReclaim, numaID, atom.poolAlias, size)
+		}
+		for _, alias := range atom.containerAlias {
+			result.SetPoolOverlapPodContainerInfo(
+				commonstate.PoolNameReclaim,
+				numaID,
+				alias.podUID,
+				alias.containerName,
+				size,
+			)
 		}
 	}
 	return actual
+}
+
+func overlapAtomsFromMetadata(result *types.InternalCPUCalculationResult, numaID int) []overlapAtom {
+	atoms := make([]overlapAtom, 0)
+	if byNUMA := result.PoolOverlapInfo[commonstate.PoolNameReclaim]; byNUMA != nil {
+		for poolName, size := range byNUMA[numaID] {
+			atoms = append(atoms, overlapAtom{
+				key:       "0/pool/" + poolName,
+				size:      size,
+				poolAlias: poolName,
+			})
+		}
+	}
+	if byNUMA := result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim]; byNUMA != nil {
+		for podUID, containers := range byNUMA[numaID] {
+			atom := overlapAtom{key: "1/pod/" + podUID}
+			for containerName, size := range containers {
+				if atom.size == 0 || size < atom.size {
+					atom.size = size
+				}
+				atom.containerAlias = append(atom.containerAlias, podContainerAlias{
+					podUID:        podUID,
+					containerName: containerName,
+				})
+			}
+			sort.Slice(atom.containerAlias, func(i, j int) bool {
+				return atom.containerAlias[i].containerName < atom.containerAlias[j].containerName
+			})
+			atoms = append(atoms, atom)
+		}
+	}
+	return atoms
 }
 
 type reclaimPoolCalculationData struct {
@@ -734,20 +792,29 @@ type reclaimPoolCalculationData struct {
 	nodeEnableReclaim                      bool
 	numaID                                 int
 	totalUnusedNonReclaimablePinnedCPUSize int
+	reserveExcludedFromPoolCapacity        bool
+	overlapAtoms                           []overlapAtom
+}
+
+type reclaimPoolCalculationPolicy struct {
+	allowSharedOverlap    bool
+	allowDedicatedOverlap bool
 }
 
 func (pa *ProvisionAssemblerCommon) calculateReclaimPool(
 	data *reclaimPoolCalculationData,
+	policy reclaimPoolCalculationPolicy,
 	result *types.InternalCPUCalculationResult,
 ) (int, int, float64, error) {
-	if *pa.allowSharedCoresOverlapReclaimedCores {
-		return pa.calculateOverlapReclaimPool(data, result)
+	if policy.allowSharedOverlap {
+		return pa.calculateOverlapReclaimPool(data, policy, result)
 	}
-	return pa.calculateNonOverlapReclaimPool(data, result)
+	return pa.calculateNonOverlapReclaimPool(data, policy, result)
 }
 
 func (pa *ProvisionAssemblerCommon) calculateOverlapReclaimPool(
 	data *reclaimPoolCalculationData,
+	policy reclaimPoolCalculationPolicy,
 	result *types.InternalCPUCalculationResult,
 ) (int, int, float64, error) {
 	var reclaimedCoresSize, overlapReclaimedCoresSize int
@@ -782,7 +849,7 @@ func (pa *ProvisionAssemblerCommon) calculateOverlapReclaimPool(
 
 		_, ok = data.dedicatedInfo.requests[poolName]
 		if ok {
-			if data.dedicatedInfo.reclaimEnable[poolName] {
+			if policy.allowDedicatedOverlap && data.dedicatedInfo.reclaimEnable[poolName] {
 				reclaimablePoolSizes[poolName] = size
 				reclaimableRequirements[poolName] = data.dedicatedInfo.requirements[poolName]
 			}
@@ -799,13 +866,20 @@ func (pa *ProvisionAssemblerCommon) calculateOverlapReclaimPool(
 
 	if data.nodeEnableReclaim {
 		reclaimedCoresSize = shareReclaimCoresSize + data.dedicatedReclaimCoresSize
+		if data.reserveExcludedFromPoolCapacity {
+			reclaimedCoresSize += data.reservedForReclaim
+		}
 		if reclaimedCoresSize < data.reservedForReclaim {
 			reclaimedCoresSize = data.reservedForReclaim
-			regulatedOverlapReclaimPoolSize, err := regulateOverlapReclaimPoolSize(poolSizes, reclaimedCoresSize)
-			if err != nil {
-				return 0, 0, 0, fmt.Errorf("failed to regulateOverlapReclaimPoolSize for NUMAs reserved for reclaim: %w", err)
+			overlapCandidates := reclaimablePoolSizes
+			if len(overlapCandidates) > 0 {
+				overlapTarget := general.Min(reclaimedCoresSize, general.SumUpMapValues(overlapCandidates))
+				regulatedOverlapReclaimPoolSize, err := regulateOverlapReclaimPoolSize(overlapCandidates, overlapTarget)
+				if err != nil {
+					return 0, 0, 0, fmt.Errorf("failed to regulateOverlapReclaimPoolSize for NUMAs reserved for reclaim: %w", err)
+				}
+				overlapReclaimSize = regulatedOverlapReclaimPoolSize
 			}
-			overlapReclaimSize = regulatedOverlapReclaimPoolSize
 		} else {
 			for poolName, size := range reclaimablePoolSizes {
 				requirement, ok := reclaimableRequirements[poolName]
@@ -872,18 +946,33 @@ func (pa *ProvisionAssemblerCommon) calculateOverlapReclaimPool(
 
 	for overlapPoolName, reclaimSize := range overlapReclaimSize {
 		if _, ok := data.shareInfo.requests[overlapPoolName]; ok {
+			if !policy.allowSharedOverlap {
+				continue
+			}
 			general.InfoS("set pool overlap info",
 				"poolName", commonstate.PoolNameReclaim,
 				"numaID", data.numaID,
 				"poolName", overlapPoolName,
 				"reclaimSize", reclaimSize)
 			result.SetPoolOverlapInfo(commonstate.PoolNameReclaim, data.numaID, overlapPoolName, reclaimSize)
+			data.overlapAtoms = append(data.overlapAtoms, overlapAtom{
+				key:       "0/pool/" + overlapPoolName,
+				size:      reclaimSize,
+				poolAlias: overlapPoolName,
+			})
 			overlapReclaimedCoresSize += reclaimSize
 			continue
 		}
 
 		if podSet, ok := data.dedicatedInfo.podSet[overlapPoolName]; ok {
+			if !policy.allowDedicatedOverlap {
+				continue
+			}
 			// set pool overlap info for dedicated pool
+			atom := overlapAtom{
+				key:  "1/dedicated/" + overlapPoolName,
+				size: reclaimSize,
+			}
 			for podUID, containerSet := range podSet {
 				for containerName := range containerSet {
 					general.InfoS("set pool overlap pod container info",
@@ -893,8 +982,13 @@ func (pa *ProvisionAssemblerCommon) calculateOverlapReclaimPool(
 						"containerName", containerName,
 						"reclaimSize", reclaimSize)
 					result.SetPoolOverlapPodContainerInfo(commonstate.PoolNameReclaim, data.numaID, podUID, containerName, reclaimSize)
+					atom.containerAlias = append(atom.containerAlias, podContainerAlias{
+						podUID:        podUID,
+						containerName: containerName,
+					})
 				}
 			}
+			data.overlapAtoms = append(data.overlapAtoms, atom)
 			overlapReclaimedCoresSize += reclaimSize
 			continue
 		}
@@ -905,32 +999,44 @@ func (pa *ProvisionAssemblerCommon) calculateOverlapReclaimPool(
 
 func (pa *ProvisionAssemblerCommon) calculateNonOverlapReclaimPool(
 	data *reclaimPoolCalculationData,
+	policy reclaimPoolCalculationPolicy,
 	result *types.InternalCPUCalculationResult,
 ) (int, int, float64, error) {
 	var reclaimedCoresSize, overlapReclaimedCoresSize int
 	reclaimedCoresQuota := float64(-1)
 
 	if data.nodeEnableReclaim {
-		for poolName, size := range data.dedicatedInfo.requests {
-			if data.dedicatedInfo.reclaimEnable[poolName] {
-				reclaimSize := size - data.dedicatedInfo.requirements[poolName]
-				if reclaimSize <= 0 {
-					continue
-				}
-				if podSet, ok := data.dedicatedInfo.podSet[poolName]; ok {
-					for podUID, containerSet := range podSet {
-						for containerName := range containerSet {
-							general.InfoS("set pool overlap pod container info",
-								"poolName", commonstate.PoolNameReclaim,
-								"numaID", data.numaID,
-								"podUID", podUID,
-								"containerName", containerName,
-								"reclaimSize", reclaimSize)
-							result.SetPoolOverlapPodContainerInfo(commonstate.PoolNameReclaim, data.numaID, podUID, containerName, reclaimSize)
-						}
+		if policy.allowDedicatedOverlap {
+			for poolName, size := range data.dedicatedInfo.requests {
+				if data.dedicatedInfo.reclaimEnable[poolName] {
+					reclaimSize := size - data.dedicatedInfo.requirements[poolName]
+					if reclaimSize <= 0 {
+						continue
 					}
-					overlapReclaimedCoresSize += reclaimSize
-					continue
+					if podSet, ok := data.dedicatedInfo.podSet[poolName]; ok {
+						atom := overlapAtom{
+							key:  "1/dedicated/" + poolName,
+							size: reclaimSize,
+						}
+						for podUID, containerSet := range podSet {
+							for containerName := range containerSet {
+								general.InfoS("set pool overlap pod container info",
+									"poolName", commonstate.PoolNameReclaim,
+									"numaID", data.numaID,
+									"podUID", podUID,
+									"containerName", containerName,
+									"reclaimSize", reclaimSize)
+								result.SetPoolOverlapPodContainerInfo(commonstate.PoolNameReclaim, data.numaID, podUID, containerName, reclaimSize)
+								atom.containerAlias = append(atom.containerAlias, podContainerAlias{
+									podUID:        podUID,
+									containerName: containerName,
+								})
+							}
+						}
+						data.overlapAtoms = append(data.overlapAtoms, atom)
+						overlapReclaimedCoresSize += reclaimSize
+						continue
+					}
 				}
 			}
 		}
