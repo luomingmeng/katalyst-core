@@ -140,6 +140,36 @@ func TestCPUPluginStateCommitAdvisorStateIsAtomic(t *testing.T) {
 	}
 }
 
+func TestCPUPluginStateCommitAdvisorStateIfRevisionRejectsStaleSnapshot(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
+	require.NoError(t, err)
+	s := NewCPUPluginState(topology)
+
+	baseEntries := PodEntries{
+		"old-pod": {
+			"main": &AllocationInfo{AllocationResult: machine.NewCPUSet(0)},
+		},
+	}
+	baseMachineState := NUMANodeMap{
+		0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(0)},
+	}
+	require.NoError(t, s.CommitAdvisorState(baseEntries, baseMachineState, false, false, false))
+
+	staleRevision := s.GetRevision()
+	staleEntries := s.GetPodEntries()
+	staleMachineState := s.GetMachineState()
+
+	s.SetAllocationInfo("new-pod", "main", &AllocationInfo{
+		AllocationResult: machine.NewCPUSet(1),
+	})
+	require.NotNil(t, s.GetAllocationInfo("new-pod", "main"))
+
+	err = s.CommitAdvisorStateIfRevision(staleRevision, staleEntries, staleMachineState, false, false, false)
+	require.Error(t, err)
+	require.True(t, stderrors.Is(err, ErrStaleStateRevision), "err=%v", err)
+	require.NotNil(t, s.GetAllocationInfo("new-pod", "main"), "stale commit must not drop newer pod entry")
+}
+
 func TestCheckpointStateCommitAdvisorState(t *testing.T) {
 	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
 	require.NoError(t, err)
