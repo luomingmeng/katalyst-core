@@ -1627,6 +1627,23 @@ func TestGetExclusivePartitionCapacitiesUsesActualAvailableCPUSet(t *testing.T) 
 		})
 	}
 
+	t.Run("system pool is excluded from available CPUSet", func(t *testing.T) {
+		pa, exclusiveRegion, _, metaReader := newExclusiveAssemblerFixture(t, 16, 0, true, true)
+		(*pa.numaAvailable)[0] = 12
+		require.NoError(t, metaReader.SetPoolInfo("system-test", &types.PoolInfo{
+			PoolName: "system-test",
+			TopologyAwareAssignments: map[int]machine.CPUSet{
+				0: machine.MustParse("0-3"),
+			},
+		}))
+
+		partition, dedicated, reclaim, err := pa.getExclusivePartitionCapacities(exclusiveRegion, 0, 12)
+		require.NoError(t, err)
+		require.Equal(t, 12, partition)
+		require.Equal(t, 12, dedicated)
+		require.Equal(t, 12, reclaim)
+	})
+
 	t.Run("available CPUSet size must match numaAvailable", func(t *testing.T) {
 		pa, exclusiveRegion, _, metaReader := newExclusiveAssemblerFixture(t, 16, 0, true, true)
 		require.NoError(t, metaReader.SetPoolInfo(commonstate.PoolNameReserve, &types.PoolInfo{
