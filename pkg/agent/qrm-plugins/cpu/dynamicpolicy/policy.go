@@ -97,6 +97,24 @@ var AccompanyResourceRegistry = accompanyresource.NewRegistry()
 // (e.g., NUMA topology information) based on the differences between old and new allocation info.
 type AllocationHook func(oldAllocationInfo, newAllocationInfo *state.AllocationInfo) error
 
+type allocationRequestKey struct {
+	podUID        string
+	containerName string
+}
+
+type allocationRequestLock struct {
+	sync.Mutex
+	refCount int
+}
+
+type allocationRollbackSnapshot struct {
+	revision                uint64
+	podEntries              state.PodEntries
+	machineState            state.NUMANodeMap
+	allowOverlap            bool
+	disableDedicatedOverlap bool
+}
+
 // DynamicPolicy is the policy that's used by default;
 // it will consider the dynamic running information to calculate
 // and adjust resource requirements and configurations
@@ -124,6 +142,8 @@ type DynamicPolicy struct {
 	allocationHandlers            map[string]util.AllocationHandler
 	hintHandlers                  map[string]util.HintHandler
 	allocationHooks               []AllocationHook
+	allocationRequestLocksMu      sync.Mutex
+	allocationRequestLocks        map[allocationRequestKey]*allocationRequestLock
 	cpuSetAdjustmentHandlers      map[string]cpusetutil.CPUSetAdjustmentHandler
 	cpuSetAdjustmentExecution     chan struct{}
 	cpuSetAdjustmentRetryMu       sync.Mutex
@@ -179,6 +199,114 @@ type DynamicPolicy struct {
 	dedicatedCoresNUMABindingHintOptimizer hintoptimizer.HintOptimizer
 
 	reclaimConsumersForKCNR []string
+}
+
+func (p *DynamicPolicy) lockAllocationRequest(podUID, containerName string) func() {
+	key := allocationRequestKey{podUID: podUID, containerName: containerName}
+
+	p.allocationRequestLocksMu.Lock()
+	if p.allocationRequestLocks == nil {
+		p.allocationRequestLocks = make(map[allocationRequestKey]*allocationRequestLock)
+	}
+	requestLock := p.allocationRequestLocks[key]
+	if requestLock == nil {
+		requestLock = &allocationRequestLock{}
+		p.allocationRequestLocks[key] = requestLock
+	}
+	requestLock.refCount++
+	p.allocationRequestLocksMu.Unlock()
+
+	requestLock.Lock()
+	return func() {
+		requestLock.Unlock()
+
+		p.allocationRequestLocksMu.Lock()
+		requestLock.refCount--
+		if requestLock.refCount == 0 && p.allocationRequestLocks[key] == requestLock {
+			delete(p.allocationRequestLocks, key)
+		}
+		p.allocationRequestLocksMu.Unlock()
+	}
+}
+
+func (p *DynamicPolicy) rollbackAllocationState(
+	req *pluginapi.ResourceRequest,
+	snapshot allocationRollbackSnapshot,
+) error {
+	err := p.state.CommitAdvisorStateIfRevision(
+		snapshot.revision,
+		snapshot.podEntries,
+		snapshot.machineState,
+		snapshot.allowOverlap,
+		snapshot.disableDedicatedOverlap,
+		false,
+	)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, state.ErrStaleStateRevision) {
+		return fmt.Errorf("restore allocation state: %w", err)
+	}
+
+	currentRevision := p.state.GetRevision()
+	currentPodEntries := p.state.GetPodEntries()
+	rollbackAllocationInfo := snapshot.podEntries[req.PodUid][req.ContainerName]
+	if rollbackAllocationInfo != nil {
+		if currentPodEntries[req.PodUid] == nil {
+			currentPodEntries[req.PodUid] = make(state.ContainerEntries)
+		}
+		currentPodEntries[req.PodUid][req.ContainerName] = rollbackAllocationInfo.Clone()
+	} else if currentPodEntries[req.PodUid] != nil {
+		delete(currentPodEntries[req.PodUid], req.ContainerName)
+		if len(currentPodEntries[req.PodUid]) == 0 {
+			delete(currentPodEntries, req.PodUid)
+		}
+	}
+
+	currentMachineState, err := generateMachineStateFromPodEntries(
+		p.machineInfo.CPUTopology,
+		currentPodEntries,
+		p.state.GetMachineState(),
+	)
+	if err != nil {
+		return fmt.Errorf("generate machine state for stale allocation rollback: %w", err)
+	}
+
+	allowOverlap := p.state.GetAllowSharedCoresOverlapReclaimedCores()
+	disableDedicatedOverlap := p.state.GetDisableDedicatedCoresOverlapReclaimedCores()
+	planningState := state.NewTransientState(p.machineInfo.CPUTopology)
+	if err := planningState.CommitAdvisorState(
+		currentPodEntries,
+		currentMachineState,
+		allowOverlap,
+		disableDedicatedOverlap,
+		false,
+	); err != nil {
+		return fmt.Errorf("initialize stale allocation rollback planning state: %w", err)
+	}
+
+	planningPolicy := p.newRampUpPlanningPolicy(planningState)
+	if err := planningPolicy.adjustAllocationEntriesWithRampUpFloor(
+		currentPodEntries,
+		currentMachineState,
+		false,
+		machine.NewCPUSet(),
+		false,
+	); err != nil {
+		return fmt.Errorf("replan pools for stale allocation rollback: %w", err)
+	}
+
+	if err := p.state.CommitAdvisorStateIfRevision(
+		currentRevision,
+		planningState.GetPodEntries(),
+		planningState.GetMachineState(),
+		allowOverlap,
+		disableDedicatedOverlap,
+		false,
+	); err != nil {
+		return fmt.Errorf("commit stale allocation rollback: %w", err)
+	}
+	return nil
 }
 
 func NewDynamicPolicy(agentCtx *agent.GenericContext, conf *config.Configuration,
@@ -1147,11 +1275,16 @@ func (p *DynamicPolicy) Allocate(ctx context.Context,
 	}
 
 	startTime := time.Now()
+	unlockAllocationRequest := p.lockAllocationRequest(req.PodUid, req.ContainerName)
+	defer unlockAllocationRequest()
 	p.Lock()
-	rollbackPodEntries := p.state.GetPodEntries()
-	rollbackMachineState := p.state.GetMachineState()
-	rollbackAllowOverlap := p.state.GetAllowSharedCoresOverlapReclaimedCores()
-	rollbackDisableDedicatedOverlap := p.state.GetDisableDedicatedCoresOverlapReclaimedCores()
+	rollbackSnapshot := allocationRollbackSnapshot{
+		revision:                p.state.GetRevision(),
+		podEntries:              p.state.GetPodEntries(),
+		machineState:            p.state.GetMachineState(),
+		allowOverlap:            p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+		disableDedicatedOverlap: p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+	}
 	defer func() {
 		// calls sys-advisor to inform the latest container
 		if p.enableCPUAdvisor && respErr == nil && req.ContainerType != pluginapi.ContainerType_INIT {
@@ -1178,14 +1311,8 @@ func (p *DynamicPolicy) Allocate(ctx context.Context,
 			inplaceUpdateResizing := util.PodInplaceUpdateResizing(req)
 			var compensated *requestStateCompensatedError
 			if !errors.As(respErr, &compensated) {
-				if err := p.state.CommitAdvisorState(
-					rollbackPodEntries,
-					rollbackMachineState,
-					rollbackAllowOverlap,
-					rollbackDisableDedicatedOverlap,
-					false,
-				); err != nil {
-					respErr = fmt.Errorf("%w; restore allocation state failed: %v", respErr, err)
+				if err := p.rollbackAllocationState(req, rollbackSnapshot); err != nil {
+					respErr = fmt.Errorf("%w; allocation rollback failed: %v", respErr, err)
 				}
 			}
 
@@ -1200,6 +1327,15 @@ func (p *DynamicPolicy) Allocate(ctx context.Context,
 		}
 		if err := p.state.StoreState(); err != nil {
 			general.ErrorS(err, "store state failed", "podName", req.PodName, "containerName", req.ContainerName)
+			resp = nil
+			if respErr == nil {
+				respErr = fmt.Errorf("store allocation state failed: %w", err)
+				if rollbackErr := p.rollbackAllocationState(req, rollbackSnapshot); rollbackErr != nil {
+					respErr = fmt.Errorf("%w; allocation rollback failed: %v", respErr, rollbackErr)
+				}
+			} else {
+				respErr = fmt.Errorf("%w; store allocation state failed: %v", respErr, err)
+			}
 		}
 
 		p.Unlock()
