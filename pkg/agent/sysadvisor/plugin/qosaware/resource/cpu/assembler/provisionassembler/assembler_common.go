@@ -195,7 +195,7 @@ func (pa *ProvisionAssemblerCommon) getExclusivePartitionCapacities(
 		availableCPUSet = availableCPUSet.Difference(reservePool.TopologyAwareAssignments[regionNuma])
 	}
 	pa.metaReader.RangePool(func(poolName string, poolInfo *types.PoolInfo) bool {
-		if poolInfo != nil && qrmstate.ForbiddenPools.Has(poolName) {
+		if poolInfo != nil && (qrmstate.ForbiddenPools.Has(poolName) || commonstate.IsSystemPool(poolName)) {
 			availableCPUSet = availableCPUSet.Difference(poolInfo.TopologyAwareAssignments[regionNuma])
 		}
 		return true
