@@ -137,25 +137,26 @@ type DynamicPolicy struct {
 	advisorMonitor     *timemonitor.TimeMonitor
 	featureGateManager featuregatenegotiation.FeatureGateManager
 
-	state                         state.State
-	residualHitMap                map[string]int64
-	allocationHandlers            map[string]util.AllocationHandler
-	hintHandlers                  map[string]util.HintHandler
-	allocationHooks               []AllocationHook
-	allocationRequestLocksMu      sync.Mutex
-	allocationRequestLocks        map[allocationRequestKey]*allocationRequestLock
-	cpuSetAdjustmentHandlers      map[string]cpusetutil.CPUSetAdjustmentHandler
-	cpuSetAdjustmentExecution     chan struct{}
-	cpuSetAdjustmentRetryMu       sync.Mutex
-	cpuSetAdjustmentRetryQueued   bool
-	cpuSetAdjustmentRetryAgain    bool
-	cpuSetAdjustmentRetryDirty    bool
-	cpuSetAdjustmentRetryReasons  map[cpusetutil.CPUSetAdjustmentRetryReason]struct{}
-	cpuSetAdjustmentRetryStopCh   <-chan struct{}
-	cpuSetAdjustmentRetryStopping bool
-	cpuSetAdjustmentRetryWG       sync.WaitGroup
-	advisorPostCommitTarget       *advisorPostCommitTarget
-	cpuSetAdjustmentGeneration    uint64
+	state                          state.State
+	residualHitMap                 map[string]int64
+	allocationHandlers             map[string]util.AllocationHandler
+	hintHandlers                   map[string]util.HintHandler
+	allocationHooks                []AllocationHook
+	allocationRequestLocksMu       sync.Mutex
+	allocationRequestLocks         map[allocationRequestKey]*allocationRequestLock
+	cpuSetAdjustmentHandlers       map[string]cpusetutil.CPUSetAdjustmentHandler
+	cpuSetAdjustmentExecution      chan struct{}
+	cpuSetAdjustmentRetryMu        sync.Mutex
+	cpuSetAdjustmentRetryQueued    bool
+	cpuSetAdjustmentRetryAgain     bool
+	cpuSetAdjustmentRetryDirty     bool
+	cpuSetAdjustmentRetryReasons   map[cpusetutil.CPUSetAdjustmentRetryReason]struct{}
+	cpuSetAdjustmentRetryStopCh    <-chan struct{}
+	cpuSetAdjustmentRetryStopping  bool
+	cpuSetAdjustmentRetryWG        sync.WaitGroup
+	advisorPostCommitTarget        *advisorPostCommitTarget
+	advisorPostCommitCheckpointDir string
+	cpuSetAdjustmentGeneration     uint64
 
 	cpuPressureEviction       agent.Component
 	cpuPressureEvictionCancel context.CancelFunc
@@ -400,6 +401,8 @@ func NewDynamicPolicy(agentCtx *agent.GenericContext, conf *config.Configuration
 		reservedReclaimedCPUsSize:       general.Max(reservedReclaimedCPUsSize, agentCtx.KatalystMachineInfo.NumNUMANodes),
 		reclaimConsumersForKCNR:         conf.ReclaimConsumersForKCNR,
 	}
+	policyImplement.advisorPostCommitCheckpointDir, _ =
+		conf.StateDirectoryConfiguration.GetCurrentAndPreviousStateFileDirectory()
 
 	policyImplement.RegisterAllocationHook(policyImplement.topologyAllocationHook)
 
@@ -573,6 +576,13 @@ func (p *DynamicPolicy) Start() (err error) {
 			p.Unlock()
 		}
 	}()
+
+	if err = p.prepareAdvisorPostCommitTargetOnStart(); err != nil {
+		return fmt.Errorf("prepare pending advisor post-commit target: %w", err)
+	}
+	if p.hasAnyPendingAdvisorPostCommitTarget() {
+		p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonApplyFailed)
+	}
 
 	if p.irqTuner != nil {
 		go p.irqTuner.Run(p.stopCh)

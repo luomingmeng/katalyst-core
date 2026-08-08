@@ -20,10 +20,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/bytedance/mockey"
+	"github.com/gogo/protobuf/proto"
 	"github.com/stretchr/testify/require"
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/advisorsvc"
@@ -618,10 +621,12 @@ func TestAdvisorPostCommitNewRevisionSupersedesStaleTarget(t *testing.T) {
 
 		oldTarget := p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{
 			ExtraEntries: []*advisorsvc.CalculationInfo{{CgroupPath: "/old"}},
-		}, 7)
+		}, p.state.GetRevision())
+		p.state.SetAllowSharedCoresOverlapReclaimedCores(
+			!p.state.GetAllowSharedCoresOverlapReclaimedCores(), false)
 		newTarget := p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{
 			ExtraEntries: []*advisorsvc.CalculationInfo{{CgroupPath: "/new"}},
-		}, 8)
+		}, p.state.GetRevision())
 
 		p.Lock()
 		require.NoError(t, p.reconcileAdvisorPostCommitTarget(context.Background(), oldTarget))
@@ -629,8 +634,203 @@ func TestAdvisorPostCommitNewRevisionSupersedesStaleTarget(t *testing.T) {
 		p.Unlock()
 
 		require.Equal(t, []string{"/new"}, paths)
-		require.False(t, p.hasPendingAdvisorPostCommitTarget(8))
+		require.False(t, p.hasAnyPendingAdvisorPostCommitTarget())
 	})
+}
+
+func TestAdvisorPostCommitTargetChecksRevisionBeforeEveryExternalStage(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		advanceAfter string
+		wantCalls    []string
+	}{
+		{name: "before headroom", advanceAfter: "publish"},
+		{name: "before cgroup", advanceAfter: "headroom", wantCalls: []string{"headroom"}},
+		{name: "before cpuset", advanceAfter: "cgroup", wantCalls: []string{"headroom", "cgroup"}},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			p, cleanup := newReclaimReuseTestPolicy(t)
+			defer cleanup()
+			var calls []string
+
+			mockey.PatchConvey(tc.name, t, func() {
+				advanceRevision := func() {
+					p.state.SetAllowSharedCoresOverlapReclaimedCores(
+						!p.state.GetAllowSharedCoresOverlapReclaimedCores(), false)
+				}
+				mockey.Mock((*DynamicPolicy).applyHeadroom).IncludeCurrentGoRoutine().
+					To(func(_ *DynamicPolicy, _ *advisorapi.ListAndWatchResponse) error {
+						calls = append(calls, "headroom")
+						if tc.advanceAfter == "headroom" {
+							advanceRevision()
+						}
+						return nil
+					}).Build()
+				mockey.Mock((*DynamicPolicy).applyCgroupConfigs).IncludeCurrentGoRoutine().
+					To(func(_ *DynamicPolicy, _ *advisorapi.ListAndWatchResponse) error {
+						calls = append(calls, "cgroup")
+						if tc.advanceAfter == "cgroup" {
+							advanceRevision()
+						}
+						return nil
+					}).Build()
+				mockey.Mock((*DynamicPolicy).runCPUSetAdjustmentHandlers).IncludeCurrentGoRoutine().
+					To(func(_ *DynamicPolicy, _ context.Context, _ ...cpusetutil.CPUSetAdjustmentMode) error {
+						calls = append(calls, "cpuset")
+						return nil
+					}).Build()
+
+				target := p.publishAdvisorPostCommitTarget(
+					&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+				if tc.advanceAfter == "publish" {
+					advanceRevision()
+				}
+				p.Lock()
+				require.NoError(t, p.reconcileAdvisorPostCommitTarget(context.Background(), target))
+				p.Unlock()
+
+				require.Equal(t, tc.wantCalls, calls)
+				require.False(t, p.hasAnyPendingAdvisorPostCommitTarget(),
+					"stale target must be discarded")
+			})
+		})
+	}
+}
+
+func TestAdvisorPostCommitTargetChecksCurrentPointerBetweenStages(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	var calls []string
+
+	mockey.PatchConvey("superseded between stages", t, func() {
+		mockey.Mock((*DynamicPolicy).applyHeadroom).IncludeCurrentGoRoutine().
+			To(func(_ *DynamicPolicy, _ *advisorapi.ListAndWatchResponse) error {
+				calls = append(calls, "old-headroom")
+				p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{
+					ExtraEntries: []*advisorsvc.CalculationInfo{{CgroupPath: "/new"}},
+				}, p.state.GetRevision())
+				return nil
+			}).Build()
+		mockey.Mock((*DynamicPolicy).applyCgroupConfigs).IncludeCurrentGoRoutine().
+			To(func(_ *DynamicPolicy, _ *advisorapi.ListAndWatchResponse) error {
+				calls = append(calls, "old-cgroup")
+				return nil
+			}).Build()
+		mockey.Mock((*DynamicPolicy).runCPUSetAdjustmentHandlers).IncludeCurrentGoRoutine().
+			To(func(_ *DynamicPolicy, _ context.Context, _ ...cpusetutil.CPUSetAdjustmentMode) error {
+				calls = append(calls, "old-cpuset")
+				return nil
+			}).Build()
+
+		old := p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{
+			ExtraEntries: []*advisorsvc.CalculationInfo{{CgroupPath: "/old"}},
+		}, p.state.GetRevision())
+		p.Lock()
+		require.NoError(t, p.reconcileAdvisorPostCommitTarget(context.Background(), old))
+		p.Unlock()
+
+		require.Equal(t, []string{"old-headroom"}, calls)
+		require.True(t, p.hasAnyPendingAdvisorPostCommitTarget(),
+			"superseding target must remain pending")
+	})
+}
+
+func TestAdvisorPostCommitCheckpointCrashRecoveryAndSuccessfulCleanup(t *testing.T) {
+	dir := t.TempDir()
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	p.advisorPostCommitCheckpointDir = dir
+	revision := p.state.GetRevision()
+	resp := &advisorapi.ListAndWatchResponse{
+		Entries: map[string]*advisorapi.CalculationEntries{
+			"pool": {Entries: map[string]*advisorapi.CalculationInfo{
+				"block": {OwnerPoolName: "persisted-pool"},
+			}},
+		},
+		ExtraEntries: []*advisorsvc.CalculationInfo{{CgroupPath: "/persisted"}},
+	}
+
+	target := p.publishAdvisorPostCommitTarget(resp, revision)
+	require.FileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName))
+
+	restarted := &DynamicPolicy{
+		state:                          p.state,
+		advisorPostCommitCheckpointDir: dir,
+		cpuSetAdjustmentHandlers:       map[string]cpusetutil.CPUSetAdjustmentHandler{},
+	}
+	require.NoError(t, restarted.restoreAdvisorPostCommitTarget())
+	restored := restarted.currentAdvisorPostCommitTarget()
+	require.NotNil(t, restored)
+	require.Equal(t, revision, restored.revision)
+	require.True(t, proto.Equal(target.response, restored.response),
+		"checkpoint must retain the complete proto response")
+
+	restarted.Lock()
+	require.NoError(t, restarted.reconcileAdvisorPostCommitTarget(context.Background(), restored))
+	restarted.Unlock()
+	require.NoFileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName))
+}
+
+func TestAdvisorPostCommitCheckpointStopStartRequeuesPendingTarget(t *testing.T) {
+	dir := t.TempDir()
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	p.advisorPostCommitCheckpointDir = dir
+	target := p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{ExtraEntries: []*advisorsvc.CalculationInfo{{CgroupPath: "/pending"}}},
+		p.state.GetRevision())
+
+	p.cpuSetAdjustmentRetryMu.Lock()
+	p.cpuSetAdjustmentRetryStopping = true
+	p.cpuSetAdjustmentRetryDirty = false
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	require.NoError(t, p.prepareAdvisorPostCommitTargetOnStart())
+
+	require.Same(t, target, p.currentAdvisorPostCommitTarget())
+	p.cpuSetAdjustmentRetryMu.Lock()
+	require.True(t, p.cpuSetAdjustmentRetryDirty)
+	require.Contains(t, p.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	require.FileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName),
+		"Stop/Start must retain the pending checkpoint")
+}
+
+func TestAdvisorPostCommitCheckpointRevisionMismatchAndCorruptionAreCleaned(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		prepare func(t *testing.T, p *DynamicPolicy, dir string)
+	}{
+		{
+			name: "revision mismatch",
+			prepare: func(t *testing.T, p *DynamicPolicy, _ string) {
+				p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+				p.state.SetAllowSharedCoresOverlapReclaimedCores(
+					!p.state.GetAllowSharedCoresOverlapReclaimedCores(), false)
+			},
+		},
+		{
+			name: "corrupted checkpoint",
+			prepare: func(t *testing.T, _ *DynamicPolicy, dir string) {
+				require.NoError(t, os.WriteFile(
+					filepath.Join(dir, advisorPostCommitCheckpointName), []byte("{broken"), 0o600))
+			},
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			p, cleanup := newReclaimReuseTestPolicy(t)
+			defer cleanup()
+			p.advisorPostCommitCheckpointDir = dir
+			tc.prepare(t, p, dir)
+			p.advisorPostCommitTarget = nil
+
+			require.NoError(t, p.restoreAdvisorPostCommitTarget())
+			require.Nil(t, p.currentAdvisorPostCommitTarget())
+			require.NoFileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName))
+		})
+	}
 }
 
 func TestCgroupCreateRetriesOnlyDeferredLeafDirtyAdjustment(t *testing.T) {
