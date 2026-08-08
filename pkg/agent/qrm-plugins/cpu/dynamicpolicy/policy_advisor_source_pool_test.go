@@ -993,6 +993,91 @@ func TestAdvisorSourceIsolationComponentsScopeSourceByNUMAAndResourcePackage(t *
 	require.ElementsMatch(t, []string{"source-a1", "isolation-a1"}, advisorDescriptorBlockIDs(members["source-a1"]))
 }
 
+func TestPlanDisjointAdvisorBlocksRejectsConflictingSourceDomainRegardlessOfMapOrder(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+
+	sourceEntry := func(blockID string) *advisorapi.CalculationEntries {
+		return &advisorapi.CalculationEntries{Entries: map[string]*advisorapi.CalculationInfo{
+			commonstate.FakedContainerName: {
+				OwnerPoolName: "source-pool",
+				CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+					0: {Blocks: []*advisorapi.Block{{BlockId: blockID, Result: 2}}},
+				},
+			},
+		}}
+	}
+	for _, tc := range []struct {
+		name       string
+		entryOrder []string
+		blockIDs   map[string]string
+	}{
+		{
+			name:       "source-a-map-entry-first",
+			entryOrder: []string{"entry-a", "entry-b"},
+			blockIDs:   map[string]string{"entry-a": "source-a", "entry-b": "source-b"},
+		},
+		{
+			name:       "source-b-map-entry-first",
+			entryOrder: []string{"entry-b", "entry-a"},
+			blockIDs:   map[string]string{"entry-a": "source-b", "entry-b": "source-a"},
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			entries := make(map[string]*advisorapi.CalculationEntries, len(tc.entryOrder))
+			for _, entryName := range tc.entryOrder {
+				entries[entryName] = sourceEntry(tc.blockIDs[entryName])
+			}
+			resp := &advisorapi.ListAndWatchResponse{
+				DisableDedicatedCoresOverlapReclaimedCores: true,
+				Entries: entries,
+			}
+
+			got, err := p.planDisjointAdvisorBlocks(resp)
+			require.EqualError(t, err,
+				`source domain pool "source-pool" resource package "" numa 0 has conflicting descriptors "source-a" and "source-b"`)
+			require.Nil(t, got, "fail-closed errors must not expose partial block results")
+		})
+	}
+}
+
+func TestPlanDisjointAdvisorBlocksAllowsRepeatedSourceBlockIDAfterNormalization(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+
+	sourceEntry := func() *advisorapi.CalculationEntries {
+		return &advisorapi.CalculationEntries{Entries: map[string]*advisorapi.CalculationInfo{
+			commonstate.FakedContainerName: {
+				OwnerPoolName: "source-pool",
+				CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+					0: {Blocks: []*advisorapi.Block{{BlockId: "source", Result: 2}}},
+				},
+			},
+		}}
+	}
+	resp := &advisorapi.ListAndWatchResponse{
+		DisableDedicatedCoresOverlapReclaimedCores: true,
+		Entries: map[string]*advisorapi.CalculationEntries{
+			"entry-a": sourceEntry(),
+			"entry-b": sourceEntry(),
+		},
+	}
+
+	got, err := p.planDisjointAdvisorBlocks(resp)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, 2, got["source"].Size())
+}
+
 func TestAdvisorSourceIsolationComponentsRejectsConflictingAliasSourcesRegardlessOfOwnerOrder(t *testing.T) {
 	t.Parallel()
 
