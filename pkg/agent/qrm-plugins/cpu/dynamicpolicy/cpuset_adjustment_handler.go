@@ -292,6 +292,18 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 	}
 }
 
+// runCPUSetAdjustmentHandlersAfterAdvisorCommit reconciles cgroups from the
+// already checkpointed desired state. A transient apply failure must not roll
+// desired state back; queueing a latest-state retry keeps publication and
+// physical convergence as separate failure domains.
+func (p *DynamicPolicy) runCPUSetAdjustmentHandlersAfterAdvisorCommit(ctx context.Context) error {
+	err := p.runCPUSetAdjustmentHandlers(ctx)
+	if err != nil {
+		p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonApplyFailed)
+	}
+	return err
+}
+
 func (p *DynamicPolicy) scheduleCPUSetAdjustmentRetry(reason cpusetutil.CPUSetAdjustmentRetryReason) {
 	p.cpuSetAdjustmentRetryMu.Lock()
 	if p.cpuSetAdjustmentRetryStopping {

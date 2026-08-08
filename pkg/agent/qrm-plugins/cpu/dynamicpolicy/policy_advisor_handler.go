@@ -578,7 +578,7 @@ func (p *DynamicPolicy) allocateByCPUAdvisor(
 
 	ctx, cancel := context.WithTimeout(context.Background(), cpuSetAdjustmentHandlerTimeout(p.conf))
 	defer cancel()
-	if err := p.runCPUSetAdjustmentHandlers(ctx); err != nil {
+	if err := p.runCPUSetAdjustmentHandlersAfterAdvisorCommit(ctx); err != nil {
 		return fmt.Errorf("runCPUSetAdjustmentHandlers failed with error: %v", err)
 	}
 
@@ -1644,16 +1644,24 @@ func (p *DynamicPolicy) applyBlocks(
 		}
 	}
 
-	// revise reclaim pool size to avoid reclaimed_cores and numa_binding dedicated_cores containers
-	// in NUMAs without cpuset actual binding
-	err := p.reviseReclaimPool(
-		newEntries,
-		nonReclaimActualBindingNUMAs,
-		pooledUnionDedicatedCPUSet,
-		allowSharedCoresOverlapReclaimedCores,
-	)
-	if err != nil {
-		return err
+	if resp.DisableDedicatedCoresOverlapReclaimedCores {
+		// In disjoint mode the planner owns the complete reclaim target. Do not
+		// revise or fallback-expand it after planning.
+		if newEntries.CheckPoolEmpty(commonstate.PoolNameReclaim) {
+			return fmt.Errorf("disjoint advisor response has no reclaim partition")
+		}
+	} else {
+		// Legacy mode keeps the historical fallback behavior for NUMAs without
+		// actual reclaimed NUMA binding.
+		err := p.reviseReclaimPool(
+			newEntries,
+			nonReclaimActualBindingNUMAs,
+			pooledUnionDedicatedCPUSet,
+			allowSharedCoresOverlapReclaimedCores,
+		)
+		if err != nil {
+			return err
+		}
 	}
 
 	// calculate rampUpCPUs
@@ -1788,7 +1796,11 @@ func (p *DynamicPolicy) applyBlocks(
 	if err := p.invokeAllocationHooksForPodEntries(curEntries, newEntries); err != nil {
 		return err
 	}
-	commitOverride, err := p.buildAdjustmentCommitOverrideFromPodEntries(newEntries, allowSharedCoresOverlapReclaimedCores)
+	commitOverride, err := p.buildAdjustmentCommitOverrideFromPodEntries(
+		newEntries,
+		allowSharedCoresOverlapReclaimedCores,
+		resp.DisableDedicatedCoresOverlapReclaimedCores,
+	)
 	if err != nil {
 		return fmt.Errorf("build adjustment commit override from pod entries failed with error: %w", err)
 	}
@@ -1844,12 +1856,34 @@ func (p *DynamicPolicy) syncReclaimPoolWithBulkheadAppliedView(newEntries state.
 func (p *DynamicPolicy) buildAdjustmentCommitOverrideFromPodEntries(
 	newEntries state.PodEntries,
 	allowSharedCoresOverlapReclaimedCores bool,
+	disableDedicatedCoresOverlapReclaimedCores bool,
 ) (*cpusetutil.CPUSetAdjustmentCommitOverride, error) {
 	if p == nil || p.machineInfo == nil || p.machineInfo.CPUTopology == nil || len(newEntries) == 0 {
 		return nil, nil
 	}
-	if allowSharedCoresOverlapReclaimedCores {
+	if allowSharedCoresOverlapReclaimedCores && !disableDedicatedCoresOverlapReclaimedCores {
 		return nil, nil
+	}
+	if allowSharedCoresOverlapReclaimedCores && disableDedicatedCoresOverlapReclaimedCores {
+		reclaimEntry := newEntries[commonstate.PoolNameReclaim][commonstate.FakedContainerName]
+		if reclaimEntry == nil || reclaimEntry.AllocationResult.IsEmpty() {
+			return nil, nil
+		}
+		dedicated := machine.NewCPUSet()
+		for _, containerEntries := range newEntries {
+			if containerEntries == nil || containerEntries.IsPoolEntry() {
+				continue
+			}
+			for _, allocation := range containerEntries {
+				if allocation != nil && allocation.CheckDedicated() {
+					dedicated = dedicated.Union(allocation.AllocationResult)
+				}
+			}
+		}
+		return &cpusetutil.CPUSetAdjustmentCommitOverride{
+			ReclaimEffective: reclaimEntry.AllocationResult.Difference(dedicated),
+			Source:           "advisor_pending_entries",
+		}, nil
 	}
 	snapshot := newCPUSetAdjustmentStateSnapshot(p.state)
 	if snapshot == nil {
@@ -1860,6 +1894,7 @@ func (p *DynamicPolicy) buildAdjustmentCommitOverrideFromPodEntries(
 	// The checkpoint may still hold the previous mode until CommitAdvisorState
 	// persists pod entries, machine state, and the mode atomically.
 	snapshot.allowOverlap = allowSharedCoresOverlapReclaimedCores
+	snapshot.disableDedicated = disableDedicatedCoresOverlapReclaimedCores
 	view, err := bulkheadutils.BuildValidatedCPUSetPartitionView(snapshot, p.machineInfo.CPUTopology, bulkheadutils.CPUSetPartitionViewOptions{})
 	if err != nil {
 		return nil, err
@@ -1927,6 +1962,11 @@ func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommit(
 	// containers must not share any cpu with the reclaim pool, regardless of the
 	// allowSharedCoresOverlapReclaimedCores switch.
 	if disableDedicatedCoresOverlapReclaimedCores {
+		notAllocatablePoolsCPUs := state.GetUnitedPoolsCPUs(
+			newEntries,
+			state.IsForbiddenPool,
+			commonstate.IsSystemPool,
+		)
 		for _, containerEntries := range newEntries {
 			if containerEntries == nil || containerEntries.IsPoolEntry() {
 				continue
@@ -1938,6 +1978,24 @@ func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommit(
 				if overlap := reclaimPool.AllocationResult.Intersection(ai.AllocationResult); !overlap.IsEmpty() {
 					return fmt.Errorf("dedicated_cores pod: %s/%s container: %s overlaps reclaim pool while DisableDedicatedCoresOverlapReclaimedCores enabled: %s",
 						ai.PodNamespace, ai.PodName, ai.ContainerName, overlap.String())
+				}
+				if !ai.CheckDedicatedNUMABindingNUMAExclusive() {
+					continue
+				}
+				for numaID := range ai.OriginalTopologyAwareAssignments {
+					eligible := p.machineInfo.CPUDetails.CPUsInNUMANodes(numaID).
+						Difference(p.reservedCPUs).
+						Difference(notAllocatablePoolsCPUs)
+					covered := ai.AllocationResult.Intersection(eligible).
+						Union(reclaimPool.AllocationResult.Intersection(eligible))
+					if !covered.Equals(eligible) {
+						return fmt.Errorf("exclusive dedicated/reclaim partition does not cover eligible NUMA: pod=%s/%s container=%s numa=%d dedicated=%s reclaim=%s eligible=%s missing=%s",
+							ai.PodNamespace, ai.PodName, ai.ContainerName, numaID,
+							ai.AllocationResult.Intersection(eligible).String(),
+							reclaimPool.AllocationResult.Intersection(eligible).String(),
+							eligible.String(),
+							eligible.Difference(covered).String())
+					}
 				}
 			}
 		}

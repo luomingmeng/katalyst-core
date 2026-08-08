@@ -384,6 +384,42 @@ func TestCPUSetAdjustmentCommitOverrideUsesRevisionGuard(t *testing.T) {
 		"reclaim allocation=%s, want topology verified override 2-3", reclaim.AllocationResult)
 }
 
+func TestAdvisorCPUSetAdjustmentFailureRetainsDesiredStateAndRetries(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	desired := machine.NewCPUSet(0, 1)
+	setReclaimPoolCPUSet(t, p, desired)
+
+	retried := make(chan machine.CPUSet, 1)
+	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"transient-cgroup-failure": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			reclaim := in.State.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+			if in.Mode == cpusetutil.CPUSetAdjustmentModeRetry {
+				retried <- reclaim.AllocationResult.Clone()
+				return nil
+			}
+			return errors.New("transient cgroup write failure")
+		},
+	}
+
+	p.Lock()
+	err := p.runCPUSetAdjustmentHandlersAfterAdvisorCommit(context.Background())
+	p.Unlock()
+	require.ErrorContains(t, err, "transient cgroup write failure")
+	require.True(t, p.state.GetAllocationInfo(
+		commonstate.PoolNameReclaim, commonstate.FakedContainerName).AllocationResult.Equals(desired),
+		"failed cgroup apply must retain committed desired state")
+
+	select {
+	case got := <-retried:
+		require.True(t, got.Equals(desired), "retry must consume retained desired state, got %s", got)
+	case <-time.After(time.Second):
+		t.Fatal("failed advisor cgroup apply was not retried")
+	}
+}
+
 func TestCgroupCreateRetriesOnlyDeferredLeafDirtyAdjustment(t *testing.T) {
 	t.Parallel()
 
