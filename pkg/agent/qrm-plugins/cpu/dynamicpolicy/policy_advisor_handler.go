@@ -549,7 +549,7 @@ func (p *DynamicPolicy) allocateByCPUAdvisor(
 		return fmt.Errorf("ValidateCPUAdvisorResp failed with error: %v", vErr)
 	}
 
-	blockToCPUSet, aErr := p.generateBlockCPUSet(resp)
+	blockToCPUSet, aErr := p.generateBlockCPUSet(resp, featureGates)
 	if aErr != nil {
 		return fmt.Errorf("generateBlockCPUSet failed with error: %v", aErr)
 	}
@@ -1340,10 +1340,29 @@ func (p *DynamicPolicy) generateReclaimBlockCPUSet(
 	return nil
 }
 
-// generateBlockCPUSet computes the CPUSet allocation for all requested blocks using a two-phase allocation process.
+// generateBlockCPUSet keeps legacy allocation completely isolated from the negotiated
+// dedicated/reclaim disjoint planner.
+func (p *DynamicPolicy) generateBlockCPUSet(
+	resp *advisorapi.ListAndWatchResponse,
+	featureGates map[string]*advisorsvc.FeatureGate,
+) (advisorapi.BlockCPUSet, error) {
+	if resp == nil {
+		return nil, fmt.Errorf("got nil resp")
+	}
+	if !resp.DisableDedicatedCoresOverlapReclaimedCores {
+		return p.generateLegacyBlockCPUSet(resp)
+	}
+
+	if featureGates[feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition] == nil {
+		return nil, fmt.Errorf("dedicated reclaim disjoint partition capability is not negotiated")
+	}
+	return p.planDisjointAdvisorBlocks(resp)
+}
+
+// generateLegacyBlockCPUSet computes the CPUSet allocation for all requested blocks using a two-phase allocation process.
 // Phase 1 (High Priority): Allocates Dedicated and Share blocks, resolving NUMA boundaries and updating available CPUs.
 // Phase 2 (Low Priority): Allocates Reclaim blocks, ensuring they don't use non-reclaimable pinned CPUs or CPUs already taken.
-func (p *DynamicPolicy) generateBlockCPUSet(resp *advisorapi.ListAndWatchResponse) (advisorapi.BlockCPUSet, error) {
+func (p *DynamicPolicy) generateLegacyBlockCPUSet(resp *advisorapi.ListAndWatchResponse) (advisorapi.BlockCPUSet, error) {
 	if resp == nil {
 		return nil, fmt.Errorf("got nil resp")
 	}

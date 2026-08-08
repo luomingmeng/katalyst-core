@@ -47,6 +47,7 @@ import (
 	cgroupmgr "github.com/kubewharf/katalyst-core/pkg/util/cgroup/manager"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	"github.com/kubewharf/katalyst-core/pkg/util/native"
+	resourcepackage "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 )
 
 var advisorTestMutex = &sync.Mutex{}
@@ -83,6 +84,140 @@ func TestValidateDedicatedReclaimDisjointTransport(t *testing.T) {
 		},
 	}
 	require.NoError(t, validateDedicatedReclaimDisjointTransport(req, resp, featureGates))
+}
+
+func TestGenerateBlockCPUSetDisjointPlannerRequiresCapability(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	tmpDir := t.TempDir()
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, tmpDir)
+	require.NoError(t, err)
+
+	resp := &advisorapi.ListAndWatchResponse{
+		DisableDedicatedCoresOverlapReclaimedCores: true,
+		Entries: map[string]*advisorapi.CalculationEntries{},
+	}
+	_, err = policy.generateBlockCPUSet(resp, nil)
+	require.ErrorContains(t, err, "dedicated reclaim disjoint partition capability is not negotiated")
+
+	featureGates := map[string]*advisorsvc.FeatureGate{
+		feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition: {
+			Name: feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
+		},
+	}
+	got, err := policy.generateBlockCPUSet(resp, featureGates)
+	require.NoError(t, err)
+	require.Empty(t, got)
+}
+
+func TestGenerateBlockCPUSetDisjointPlannerUsesJointRPEligibility(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	legacyOverlap := machine.NewCPUSet(0, 1)
+	policy.state.SetPodEntries(state.PodEntries{
+		"pod-dedicated": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-dedicated",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameDedicated,
+				},
+				AllocationResult: legacyOverlap,
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: legacyOverlap,
+				},
+			},
+		},
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: legacyOverlap,
+			},
+		},
+	}, false)
+	machineState := policy.state.GetMachineState()
+	machineState[0].ResourcePackageStates = map[string]*state.ResourcePackageState{
+		"rp-a": {PinnedCPUSet: legacyOverlap},
+	}
+	policy.state.SetMachineState(machineState, false)
+
+	resp := &advisorapi.ListAndWatchResponse{
+		DisableDedicatedCoresOverlapReclaimedCores: true,
+		Entries: map[string]*advisorapi.CalculationEntries{
+			"pod-dedicated": {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					"main": {
+						OwnerPoolName: resourcepackage.WrapOwnerPoolName(commonstate.PoolNameDedicated, "rp-a"),
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							0: {Blocks: []*advisorapi.Block{{BlockId: "dedicated-rotated", Result: 2}}},
+						},
+					},
+				},
+			},
+			commonstate.PoolNameReclaim: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameReclaim,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							0: {Blocks: []*advisorapi.Block{{BlockId: "reclaim-rotated", Result: 2}}},
+						},
+					},
+				},
+			},
+		},
+	}
+	featureGates := map[string]*advisorsvc.FeatureGate{
+		feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition: {
+			Name: feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
+		},
+	}
+
+	got, err := policy.generateBlockCPUSet(resp, featureGates)
+	require.NoError(t, err)
+	require.Equal(t, legacyOverlap, got["dedicated-rotated"])
+	require.True(t, got["dedicated-rotated"].Intersection(got["reclaim-rotated"]).IsEmpty())
+	require.True(t, got["reclaim-rotated"].IsSubsetOf(topology.CPUDetails.CPUsInNUMANodes(0)))
+	require.True(t, got["reclaim-rotated"].Intersection(legacyOverlap).IsEmpty())
+
+	resp.Entries["pod-dedicated"].Entries["main"].
+		CalculationResultsByNumas[0].Blocks[0].Result = 1
+	shrunk, err := policy.generateBlockCPUSet(resp, featureGates)
+	require.NoError(t, err)
+	require.True(t, shrunk["dedicated-rotated"].IsSubsetOf(got["dedicated-rotated"]))
+	require.Equal(t, 1, got["dedicated-rotated"].Difference(shrunk["dedicated-rotated"]).
+		Union(shrunk["dedicated-rotated"].Difference(got["dedicated-rotated"])).Size())
+}
+
+func TestGenerateBlockCPUSetLegacyIgnoresNegotiatedDisjointPlanner(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	resp := &advisorapi.ListAndWatchResponse{
+		Entries: map[string]*advisorapi.CalculationEntries{
+			"ignored-by-legacy": {
+				Entries: map[string]*advisorapi.CalculationInfo{"nil": nil},
+			},
+		},
+	}
+	featureGates := map[string]*advisorsvc.FeatureGate{
+		feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition: {
+			Name: feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
+		},
+	}
+
+	got, err := policy.generateBlockCPUSet(resp, featureGates)
+	require.NoError(t, err)
+	require.Empty(t, got)
 }
 
 type advisorCommitRecordingState struct {
@@ -1705,7 +1840,7 @@ func TestDynamicPolicy_generateBlockCPUSet(t *testing.T) {
 				conf:  conf,
 			}
 
-			blockCPUSet, err := policy.generateBlockCPUSet(tc.advisorResponse)
+			blockCPUSet, err := policy.generateBlockCPUSet(tc.advisorResponse, nil)
 			if tc.expectedError {
 				as.Error(err)
 				if tc.expectedErrorStr != "" {

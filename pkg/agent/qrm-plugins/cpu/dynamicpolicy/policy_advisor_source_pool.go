@@ -18,11 +18,14 @@ package dynamicpolicy
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/calculator"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	cpuutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/util"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
@@ -256,4 +259,287 @@ func (p *DynamicPolicy) tryCarveAdvisorBlockFromSource(
 		"taken", taken.String(),
 		"remainingCandidates", remainingCandidates.String())
 	return true, nil
+}
+
+// planDisjointAdvisorBlocks materializes the negotiated descriptor plan in strict
+// phase order. Every dynamic phase receives descriptors sorted by stable owner
+// identity, and no partial result escapes on an infeasible phase.
+func (p *DynamicPolicy) planDisjointAdvisorBlocks(
+	resp *advisorapi.ListAndWatchResponse,
+) (advisorapi.BlockCPUSet, error) {
+	topology := p.machineInfo.CPUTopology
+	allCPUs := topology.CPUDetails.CPUs()
+	machineState := p.state.GetMachineState()
+	rpPinnedCPUSet := machineState.GetResourcePackagePinnedCPUSet()
+
+	selectorText := p.conf.GetDynamicConfiguration().DisableReclaimPinnedCPUSetResourcePackageSelector
+	disableReclaimSelector, err := general.ParseSelector(selectorText)
+	if err != nil {
+		return nil, err
+	}
+	nonReclaimableCPUSet := cpuutil.GetAggResourcePackagePinnedCPUSet(disableReclaimSelector, machineState)
+	descriptors, err := buildAdvisorBlockDescriptors(
+		resp, topology.CPUDetails, p.state.GetPodEntries(), rpPinnedCPUSet, nonReclaimableCPUSet,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	result := advisorapi.NewBlockCPUSet()
+	available, err := p.allocateStaticAndForbiddenPools(resp, result, allCPUs)
+	if err != nil {
+		return nil, err
+	}
+	if err := allocateAdvisorStaticDescriptors(descriptors, result); err != nil {
+		return nil, err
+	}
+
+	core := filterAdvisorDescriptors(descriptors, func(descriptor advisorBlockDescriptor) bool {
+		return descriptor.Class == advisorBlockClassDedicated ||
+			descriptor.Class == advisorBlockClassMandatoryReclaim
+	})
+	available, err = p.solveAdvisorDescriptorPhase(core, available, result, true)
+	if err != nil {
+		return nil, fmt.Errorf("solve dedicated and mandatory reclaim: %w", err)
+	}
+
+	numaToBlocks, err := resp.GetBlocks()
+	if err != nil {
+		return nil, err
+	}
+	blockByID := advisorBlockInfoByID(numaToBlocks)
+	sourceComponents, componentMembers := p.advisorSourceIsolationComponents(descriptors, blockByID)
+	for _, sourceBlockID := range sourceComponents {
+		available, err = p.solveAdvisorDescriptorPhase(componentMembers[sourceBlockID], available, result, false)
+		if err != nil {
+			return nil, fmt.Errorf("solve source/isolation component %q: %w", sourceBlockID, err)
+		}
+	}
+
+	remainingShared := filterAdvisorDescriptors(descriptors, func(descriptor advisorBlockDescriptor) bool {
+		_, allocated := result[descriptor.BlockID]
+		return descriptor.Class == advisorBlockClassShared && !allocated
+	})
+	available, err = p.allocateStableAdvisorDescriptors(remainingShared, available, result)
+	if err != nil {
+		return nil, fmt.Errorf("allocate remaining shared blocks: %w", err)
+	}
+
+	protected := advisorDescriptorClassUnion(
+		descriptors, result,
+		advisorBlockClassStatic, advisorBlockClassDedicated, advisorBlockClassMandatoryReclaim,
+	)
+	overlapCandidates := allCPUs.Difference(protected)
+	overlap := filterAdvisorDescriptors(descriptors, func(descriptor advisorBlockDescriptor) bool {
+		return descriptor.Class == advisorBlockClassReclaimOverlap
+	})
+	if _, err := p.allocateStableAdvisorDescriptors(overlap, overlapCandidates, result); err != nil {
+		return nil, fmt.Errorf("allocate overlap reclaim blocks: %w", err)
+	}
+
+	if err := validateAdvisorDescriptorPlan(descriptors, result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func allocateAdvisorStaticDescriptors(
+	descriptors []advisorBlockDescriptor,
+	result advisorapi.BlockCPUSet,
+) error {
+	for _, descriptor := range descriptors {
+		if descriptor.Class != advisorBlockClassStatic {
+			continue
+		}
+		if cpus, found := result[descriptor.BlockID]; found {
+			if cpus.Size() != descriptor.Quantity || !cpus.IsSubsetOf(descriptor.Eligible) {
+				return fmt.Errorf("static block %q does not satisfy descriptor", descriptor.BlockID)
+			}
+			continue
+		}
+		cpus := descriptor.OldPreferred.Intersection(descriptor.Eligible)
+		if cpus.Size() != descriptor.Quantity {
+			return fmt.Errorf("static block %q has no stable allocation", descriptor.BlockID)
+		}
+		result[descriptor.BlockID] = cpus
+	}
+	return nil
+}
+
+func (p *DynamicPolicy) solveAdvisorDescriptorPhase(
+	descriptors []advisorBlockDescriptor,
+	available machine.CPUSet,
+	result advisorapi.BlockCPUSet,
+	preserveClass bool,
+) (machine.CPUSet, error) {
+	if len(descriptors) == 0 {
+		return available, nil
+	}
+	demands := make([]partitionDemand, 0, len(descriptors))
+	for _, descriptor := range descriptors {
+		class := descriptor.Class
+		if !preserveClass {
+			class = advisorBlockClassDedicated
+		}
+		demands = append(demands, partitionDemand{
+			key:       descriptor.BlockID,
+			quantity:  descriptor.Quantity,
+			eligible:  descriptor.Eligible.Intersection(available),
+			preferred: descriptor.OldPreferred,
+			class:     class,
+		})
+	}
+	assignments, err := solveDisjointPartitions(demands, p.machineInfo.CPUTopology)
+	if err != nil {
+		return available, err
+	}
+	used := machine.NewCPUSet()
+	for blockID, cpus := range assignments {
+		result[blockID] = cpus
+		used = used.Union(cpus)
+	}
+	return available.Difference(used), nil
+}
+
+func (p *DynamicPolicy) allocateStableAdvisorDescriptors(
+	descriptors []advisorBlockDescriptor,
+	available machine.CPUSet,
+	result advisorapi.BlockCPUSet,
+) (machine.CPUSet, error) {
+	for _, descriptor := range descriptors {
+		candidates := available.Intersection(descriptor.Eligible)
+		cpus, remaining, err := p.takeByTieredPreferredCPUs(
+			candidates, []machine.CPUSet{descriptor.OldPreferred}, descriptor.Quantity,
+		)
+		if err != nil {
+			return available, fmt.Errorf("allocate block %q: %w", descriptor.BlockID, err)
+		}
+		result[descriptor.BlockID] = cpus
+		available = available.Difference(candidates).Union(remaining)
+	}
+	return available, nil
+}
+
+func (p *DynamicPolicy) advisorSourceIsolationComponents(
+	descriptors []advisorBlockDescriptor,
+	blockByID map[string]*advisorapi.BlockInfo,
+) ([]string, map[string][]advisorBlockDescriptor) {
+	sourceByPool := make(map[string]advisorBlockDescriptor)
+	for _, descriptor := range descriptors {
+		if descriptor.Class != advisorBlockClassShared || advisorDescriptorIsIsolation(descriptor) {
+			continue
+		}
+		for _, poolName := range advisorDescriptorPoolNames(descriptor) {
+			sourceByPool[poolName] = descriptor
+		}
+	}
+
+	members := make(map[string][]advisorBlockDescriptor)
+	for _, descriptor := range descriptors {
+		if descriptor.Class != advisorBlockClassShared || !advisorDescriptorIsIsolation(descriptor) {
+			continue
+		}
+		sourcePool, ok := deriveAdvisorIsolationSourcePool(blockByID[descriptor.BlockID], p.state.GetPodEntries())
+		if !ok {
+			continue
+		}
+		source, ok := sourceByPool[sourcePool]
+		if !ok {
+			continue
+		}
+		if len(members[source.BlockID]) == 0 {
+			members[source.BlockID] = append(members[source.BlockID], source)
+		}
+		members[source.BlockID] = append(members[source.BlockID], descriptor)
+	}
+
+	keys := make([]string, 0, len(members))
+	for key := range members {
+		keys = append(keys, key)
+		sort.Slice(members[key], func(i, j int) bool {
+			return advisorBlockDescriptorLess(members[key][i], members[key][j])
+		})
+	}
+	sort.Strings(keys)
+	return keys, members
+}
+
+func advisorBlockInfoByID(numaToBlocks map[int][]*advisorapi.BlockInfo) map[string]*advisorapi.BlockInfo {
+	result := make(map[string]*advisorapi.BlockInfo)
+	for _, blocks := range numaToBlocks {
+		for _, block := range blocks {
+			if block != nil {
+				result[block.BlockId] = block
+			}
+		}
+	}
+	return result
+}
+
+func filterAdvisorDescriptors(
+	descriptors []advisorBlockDescriptor,
+	keep func(advisorBlockDescriptor) bool,
+) []advisorBlockDescriptor {
+	result := make([]advisorBlockDescriptor, 0, len(descriptors))
+	for _, descriptor := range descriptors {
+		if keep(descriptor) {
+			result = append(result, descriptor)
+		}
+	}
+	return result
+}
+
+func advisorDescriptorPoolNames(descriptor advisorBlockDescriptor) []string {
+	pools := make([]string, 0, len(descriptor.Owners))
+	for _, owner := range descriptor.Owners {
+		pools = append(pools, strings.SplitN(owner, "\x00", 2)[0])
+	}
+	return pools
+}
+
+func advisorDescriptorIsIsolation(descriptor advisorBlockDescriptor) bool {
+	for _, poolName := range advisorDescriptorPoolNames(descriptor) {
+		if commonstate.IsIsolationPool(poolName) || commonstate.IsShareNUMABindingPool(poolName) {
+			return true
+		}
+	}
+	return false
+}
+
+func advisorDescriptorClassUnion(
+	descriptors []advisorBlockDescriptor,
+	result advisorapi.BlockCPUSet,
+	classes ...advisorBlockClass,
+) machine.CPUSet {
+	wanted := make(map[advisorBlockClass]struct{}, len(classes))
+	for _, class := range classes {
+		wanted[class] = struct{}{}
+	}
+	union := machine.NewCPUSet()
+	for _, descriptor := range descriptors {
+		if _, ok := wanted[descriptor.Class]; ok {
+			union = union.Union(result[descriptor.BlockID])
+		}
+	}
+	return union
+}
+
+func validateAdvisorDescriptorPlan(
+	descriptors []advisorBlockDescriptor,
+	result advisorapi.BlockCPUSet,
+) error {
+	for _, descriptor := range descriptors {
+		cpus, found := result[descriptor.BlockID]
+		if !found {
+			return fmt.Errorf("block %q has no planned cpuset", descriptor.BlockID)
+		}
+		if cpus.Size() != descriptor.Quantity {
+			return fmt.Errorf("block %q planned quantity %d does not match %d",
+				descriptor.BlockID, cpus.Size(), descriptor.Quantity)
+		}
+		if !cpus.IsSubsetOf(descriptor.Eligible) {
+			return fmt.Errorf("block %q planned cpuset violates eligibility", descriptor.BlockID)
+		}
+	}
+	return nil
 }
