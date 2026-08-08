@@ -1448,6 +1448,58 @@ func TestAllocatePoolSizesByPriorityIsMapOrderIndependent(t *testing.T) {
 	require.Equal(t, 12, general.SumUpMapValues(first))
 }
 
+func TestPriorityAllocationAndDedicatedAtomPressure(t *testing.T) {
+	t.Parallel()
+
+	for i := 0; i < 256; i++ {
+		dedicated := make(map[string]int)
+		isolation := make(map[string]int)
+		shared := make(map[string]int)
+		if i%2 == 0 {
+			dedicated["dedicated-b"], dedicated["dedicated-a"] = 3, 3
+			isolation["isolation-b"], isolation["isolation-a"] = 2, 2
+			shared["share-b"], shared["share-a"] = 2, 2
+		} else {
+			dedicated["dedicated-a"], dedicated["dedicated-b"] = 3, 3
+			isolation["isolation-a"], isolation["isolation-b"] = 2, 2
+			shared["share-a"], shared["share-b"] = 2, 2
+		}
+		got, throttled := allocatePoolSizesByPriority(9, dedicated, isolation, shared, nil)
+		require.True(t, throttled || general.SumUpMapValues(got) == 9)
+		require.Equal(t, map[string]int{
+			"dedicated-a": 3,
+			"dedicated-b": 3,
+			"isolation-a": 2,
+			"isolation-b": 1,
+		}, got)
+
+		result := &types.InternalCPUCalculationResult{
+			PoolOverlapInfo:             map[string]map[int]map[string]int{},
+			PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{},
+		}
+		atoms := []overlapAtom{
+			{
+				key:            "dedicated/block-b",
+				size:           4,
+				containerAlias: []podContainerAlias{{podUID: "pod-b", containerName: "main"}},
+			},
+			{
+				key:            "dedicated/block-a",
+				size:           3,
+				containerAlias: []podContainerAlias{{podUID: "pod-a", containerName: "main"}},
+			},
+		}
+		if i%2 != 0 {
+			atoms[0], atoms[1] = atoms[1], atoms[0]
+		}
+		require.Equal(t, 5, clampReclaimOverlapMetadata(result, 0, 5, atoms...))
+		require.Equal(t, 3,
+			result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["pod-a"]["main"])
+		require.Equal(t, 2,
+			result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["pod-b"]["main"])
+	}
+}
+
 func TestAssembleWithoutNUMAExclusivePoolOverlapPolicyMatrix(t *testing.T) {
 	tests := []struct {
 		name                    string
