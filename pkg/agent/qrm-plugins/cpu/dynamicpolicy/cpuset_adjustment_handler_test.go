@@ -775,6 +775,91 @@ func TestAdvisorPostCommitCheckpointCrashRecoveryAndSuccessfulCleanup(t *testing
 	require.NoFileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName))
 }
 
+func TestAdvisorCheckpointNewProcessRestoresDisjointPartitionAndPendingReconcile(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	dir := t.TempDir()
+	stateConfig := &statedirectory.StateDirectoryConfiguration{StateFileDirectory: dir}
+	firstState, err := state.NewCheckpointState(
+		stateConfig, "cpu_plugin_state", "dynamic", topology, false,
+		generateMachineStateFromPodEntries, metrics.DummyMetrics{})
+	require.NoError(t, err)
+
+	dedicated := machine.NewCPUSet(0, 1, 2, 3)
+	reclaim := machine.NewCPUSet(4, 5, 6, 7)
+	entries := state.PodEntries{
+		"pod-dedicated": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-dedicated",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameDedicated,
+				},
+				AllocationResult:         dedicated,
+				OriginalAllocationResult: dedicated,
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: dedicated,
+				},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{
+					0: dedicated,
+				},
+			},
+		},
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult:         reclaim,
+				OriginalAllocationResult: reclaim,
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: reclaim,
+				},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{
+					0: reclaim,
+				},
+			},
+		},
+	}
+	machineState, err := generateMachineStateFromPodEntries(
+		topology, entries, firstState.GetMachineState())
+	require.NoError(t, err)
+	require.NoError(t, firstState.CommitAdvisorStateIfRevision(
+		firstState.GetRevision(), entries, machineState, false, true, true))
+
+	first := &DynamicPolicy{
+		state:                          firstState,
+		advisorPostCommitCheckpointDir: dir,
+	}
+	target := first.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{
+		DisableDedicatedCoresOverlapReclaimedCores: true,
+	}, firstState.GetRevision())
+	require.NotNil(t, target)
+	require.FileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName))
+
+	restartedState, err := state.NewCheckpointState(
+		stateConfig, "cpu_plugin_state", "dynamic", topology, false,
+		generateMachineStateFromPodEntries, metrics.DummyMetrics{})
+	require.NoError(t, err)
+	restarted := &DynamicPolicy{
+		state:                          restartedState,
+		advisorPostCommitCheckpointDir: dir,
+		cpuSetAdjustmentHandlers:       map[string]cpusetutil.CPUSetAdjustmentHandler{},
+	}
+	require.NoError(t, restarted.prepareAdvisorPostCommitTargetOnStart())
+
+	restoredDedicated := restartedState.GetAllocationInfo("pod-dedicated", "main").AllocationResult
+	restoredReclaim := restartedState.GetAllocationInfo(
+		commonstate.PoolNameReclaim, commonstate.FakedContainerName).AllocationResult
+	require.Equal(t, dedicated, restoredDedicated)
+	require.Equal(t, reclaim, restoredReclaim)
+	require.True(t, restoredDedicated.Intersection(restoredReclaim).IsEmpty())
+	require.True(t, restartedState.GetDisableDedicatedCoresOverlapReclaimedCores())
+	require.True(t, restarted.hasPendingAdvisorPostCommitTarget(restartedState.GetRevision()))
+	restarted.cpuSetAdjustmentRetryMu.Lock()
+	require.True(t, restarted.cpuSetAdjustmentRetryDirty)
+	require.Contains(t, restarted.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
+	restarted.cpuSetAdjustmentRetryMu.Unlock()
+}
+
 func TestAdvisorWriteAheadTargetRejectsRevisionOverflow(t *testing.T) {
 	_, err := nextAdvisorRevision(math.MaxUint64)
 	require.ErrorContains(t, err, "revision overflow")

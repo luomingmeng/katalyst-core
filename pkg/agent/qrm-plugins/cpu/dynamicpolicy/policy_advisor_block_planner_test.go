@@ -17,15 +17,18 @@ limitations under the License.
 package dynamicpolicy
 
 import (
+	"fmt"
 	"math/rand"
 	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/advisorsvc"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation/finders/feature_cpu"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	resourcepackage "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 )
@@ -116,6 +119,87 @@ func TestBuildAdvisorBlockDescriptors_StableAcrossMapOrderAndBlockIDRotation(t *
 		} else {
 			require.Equal(t, stableDescriptors, descriptors)
 		}
+	}
+}
+
+func TestGenerateBlockCPUSetOwnerUnionsStableAcrossRandomMapOrderAndBlockIDRotation(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	p.state.SetPodEntries(state.PodEntries{
+		"pod-a": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-a",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameDedicated,
+				},
+				AllocationResult: machine.NewCPUSet(0, 1),
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: machine.NewCPUSet(0, 1),
+				},
+			},
+		},
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(2, 3),
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: machine.NewCPUSet(2, 3),
+				},
+			},
+		},
+	}, false)
+
+	featureGates := map[string]*advisorsvc.FeatureGate{
+		feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition: {
+			Name: feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
+		},
+	}
+	ownerUnions := func(t *testing.T, resp *advisorapi.ListAndWatchResponse, blocks advisorapi.BlockCPUSet) map[string]machine.CPUSet {
+		t.Helper()
+		got := make(map[string]machine.CPUSet)
+		for entryName, entries := range resp.Entries {
+			for subEntryName, info := range entries.Entries {
+				cpus, err := info.GetCPUSet(entryName, subEntryName, blocks)
+				require.NoError(t, err)
+				owner := canonicalAdvisorBlockOwner(info.OwnerPoolName, entryName, subEntryName, "")
+				got[owner] = got[owner].Union(cpus)
+			}
+		}
+		return got
+	}
+
+	var baseline map[string]machine.CPUSet
+	for seed := int64(0); seed < 1000; seed++ {
+		aliases := []advisorBlockTestAlias{
+			{
+				entry: "pod-a", subEntry: "main", owner: commonstate.PoolNameDedicated,
+				numaID: 0, blockID: fmt.Sprintf("dedicated-a-%d", seed), quantity: 1,
+			},
+			{
+				entry: "pod-a", subEntry: "main", owner: commonstate.PoolNameDedicated,
+				numaID: 0, blockID: fmt.Sprintf("dedicated-b-%d", seed), quantity: 1,
+			},
+			{
+				entry: commonstate.PoolNameReclaim, subEntry: commonstate.FakedContainerName,
+				owner: commonstate.PoolNameReclaim, numaID: 0,
+				blockID: fmt.Sprintf("reclaim-%d", seed), quantity: 2,
+			},
+		}
+		resp := advisorBlockTestResponse(aliases, rand.New(rand.NewSource(seed)))
+		resp.DisableDedicatedCoresOverlapReclaimedCores = true
+
+		blocks, err := p.generateBlockCPUSet(resp, featureGates)
+		require.NoError(t, err, "seed %d", seed)
+		got := ownerUnions(t, resp, blocks)
+		if seed == 0 {
+			baseline = got
+			continue
+		}
+		require.Equal(t, baseline, got, "seed %d", seed)
 	}
 }
 
