@@ -272,6 +272,7 @@ func TestCheckpointStateCommitAdvisorState(t *testing.T) {
 		oldEntries := sc.GetPodEntries()
 		oldMachineState := sc.GetMachineState()
 		oldAllowOverlap := sc.GetAllowSharedCoresOverlapReclaimedCores()
+		oldRevision := sc.GetRevision()
 
 		err := sc.CommitAdvisorState(newEntries, newMachineState, true, false, true)
 		require.EqualError(t, err, "store failed")
@@ -279,7 +280,47 @@ func TestCheckpointStateCommitAdvisorState(t *testing.T) {
 		require.Equal(t, oldEntries, sc.GetPodEntries())
 		require.Equal(t, oldMachineState, sc.GetMachineState())
 		require.Equal(t, oldAllowOverlap, sc.GetAllowSharedCoresOverlapReclaimedCores())
+		require.Equal(t, oldRevision, sc.GetRevision(),
+			"failed durable commit must restore the exact pre-commit revision")
 	})
+}
+
+func TestCPUPluginStateRejectsRevisionOverflowWithoutMutation(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
+	require.NoError(t, err)
+	s := NewCPUPluginState(topology)
+	s.revision = math.MaxUint64
+	oldEntries := s.GetPodEntries()
+	oldMachineState := s.GetMachineState()
+
+	err = s.CommitAdvisorStateIfRevision(
+		math.MaxUint64,
+		PodEntries{"new": {"main": &AllocationInfo{AllocationResult: machine.NewCPUSet(1)}}},
+		NUMANodeMap{0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(1)}},
+		true,
+		false,
+		false,
+	)
+	require.ErrorContains(t, err, "revision overflow")
+	require.Equal(t, uint64(math.MaxUint64), s.GetRevision())
+	require.Equal(t, oldEntries, s.GetPodEntries())
+	require.Equal(t, oldMachineState, s.GetMachineState())
+}
+
+func TestCPUPluginStateVoidMutationDoesNotWrapRevision(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
+	require.NoError(t, err)
+	s := NewCPUPluginState(topology)
+	s.revision = math.MaxUint64
+	oldMachineState := s.GetMachineState()
+
+	s.SetMachineState(NUMANodeMap{
+		0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(1)},
+	})
+
+	require.Equal(t, uint64(math.MaxUint64), s.GetRevision())
+	require.Equal(t, oldMachineState, s.GetMachineState(),
+		"a void mutator must reject mutation rather than wrap the revision")
 }
 
 func TestStateSkipsNilAllocationInfo(t *testing.T) {
