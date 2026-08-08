@@ -27,6 +27,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
+	resourcepackage "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 )
 
 type cpuAdvisorValidationFunc func(resp *advisorapi.ListAndWatchResponse) error
@@ -99,6 +100,8 @@ func (c *CPUAdvisorValidator) Validate(resp *advisorapi.ListAndWatchResponse) er
 		c.validateEntries,
 		c.validateStaticPools,
 		c.validateForbiddenPools,
+		c.validateOverlapPolicy,
+		c.validateResourcePackageOwners,
 		c.validateBlocks,
 	} {
 		errList = append(errList, validator(resp))
@@ -153,9 +156,16 @@ func (c *CPUAdvisorValidator) validateEntries(resp *advisorapi.ListAndWatchRespo
 						err, podUID, containerName)
 				}
 
-				// currently, we don't support strategy to adjust cpuset of dedicated_cores containers.
-				// for stability if the dedicated_cores container calculation result and allocation result, we will return error.
-				if calculationQuantity != allocationInfo.AllocationResult.Size() {
+				if resp.DisableDedicatedCoresOverlapReclaimedCores && calculationQuantity == 0 {
+					return fmt.Errorf("pod: %s container: %s has zero dedicated calculation result in disjoint mode",
+						podUID, containerName)
+				}
+
+				// NUMA-binding dedicated allocations may shrink when the incoming
+				// response carries a disjoint dedicated/reclaim partition. Legacy
+				// mode retains the exact-size contract.
+				if (!resp.DisableDedicatedCoresOverlapReclaimedCores || !allocationInfo.CheckDedicatedNUMABinding()) &&
+					calculationQuantity != allocationInfo.AllocationResult.Size() {
 					return fmt.Errorf("pod: %s container: %s calculation result: %d and allocation result: %d mismatch",
 						podUID, containerName, calculationQuantity, allocationInfo.AllocationResult.Size())
 				}
@@ -247,6 +257,96 @@ func (c *CPUAdvisorValidator) validateForbiddenPools(resp *advisorapi.ListAndWat
 		if nilStateEntry != nilRespEntry {
 			return fmt.Errorf("pool: %s nilStateEntry: %v and nilRespEntry: %v mismatch",
 				poolName, nilStateEntry, nilRespEntry)
+		}
+	}
+	return nil
+}
+
+type blockOwnerPolicy struct {
+	hasDedicated bool
+	hasShared    bool
+	hasReclaim   bool
+}
+
+func (c *CPUAdvisorValidator) validateOverlapPolicy(resp *advisorapi.ListAndWatchResponse) error {
+	blockPolicies := make(map[string]*blockOwnerPolicy)
+	err := visitAdvisorBlocks(resp, func(ownerPoolName string, block *advisorapi.Block) error {
+		ownerPoolName, _ = resourcepackage.UnwrapOwnerPoolName(ownerPoolName)
+		policy := blockPolicies[block.BlockId]
+		if policy == nil {
+			policy = &blockOwnerPolicy{}
+			blockPolicies[block.BlockId] = policy
+		}
+		switch commonstate.GetPoolType(ownerPoolName) {
+		case commonstate.PoolNameDedicated:
+			policy.hasDedicated = true
+		case commonstate.PoolNameReclaim:
+			policy.hasReclaim = true
+		default:
+			policy.hasShared = true
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for blockID, policy := range blockPolicies {
+		if resp.DisableDedicatedCoresOverlapReclaimedCores && policy.hasDedicated && policy.hasReclaim {
+			return fmt.Errorf("dedicated and reclaim share block %s while overlap is disabled", blockID)
+		}
+		if !resp.AllowSharedCoresOverlapReclaimedCores && policy.hasShared && policy.hasReclaim {
+			return fmt.Errorf("shared and reclaim share block %s while overlap is disabled", blockID)
+		}
+	}
+	return nil
+}
+
+func (c *CPUAdvisorValidator) validateResourcePackageOwners(resp *advisorapi.ListAndWatchResponse) error {
+	blockPackages := make(map[string]string)
+	blockPackageSet := make(map[string]bool)
+	return visitAdvisorBlocks(resp, func(ownerPoolName string, block *advisorapi.Block) error {
+		poolName, packageName := resourcepackage.UnwrapOwnerPoolName(ownerPoolName)
+		if commonstate.GetPoolType(poolName) == commonstate.PoolNameReclaim && packageName == "" {
+			return nil
+		}
+		if blockPackageSet[block.BlockId] && blockPackages[block.BlockId] != packageName {
+			return fmt.Errorf("block %s aliases have incompatible resource packages", block.BlockId)
+		}
+		blockPackages[block.BlockId] = packageName
+		blockPackageSet[block.BlockId] = true
+		return nil
+	})
+}
+
+func visitAdvisorBlocks(
+	resp *advisorapi.ListAndWatchResponse,
+	visit func(ownerPoolName string, block *advisorapi.Block) error,
+) error {
+	if resp == nil {
+		return fmt.Errorf("got nil cpu advisor resp")
+	}
+	for entryName, entries := range resp.Entries {
+		if entries == nil {
+			continue
+		}
+		for subEntryName, info := range entries.Entries {
+			if info == nil {
+				continue
+			}
+			for numaID, result := range info.CalculationResultsByNumas {
+				if result == nil {
+					continue
+				}
+				for _, block := range result.Blocks {
+					if block == nil {
+						continue
+					}
+					if err := visit(info.OwnerPoolName, block); err != nil {
+						return fmt.Errorf("entry %s sub-entry %s NUMA %d: %w",
+							entryName, subEntryName, numaID, err)
+					}
+				}
+			}
 		}
 	}
 	return nil
