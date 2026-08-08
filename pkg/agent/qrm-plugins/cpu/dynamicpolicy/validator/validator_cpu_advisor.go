@@ -164,10 +164,13 @@ func (c *CPUAdvisorValidator) validateEntries(resp *advisorapi.ListAndWatchRespo
 				// NUMA-binding dedicated allocations may shrink when the incoming
 				// response carries a disjoint dedicated/reclaim partition. Legacy
 				// mode retains the exact-size contract.
-				if (!resp.DisableDedicatedCoresOverlapReclaimedCores || !allocationInfo.CheckDedicatedNUMABinding()) &&
-					calculationQuantity != allocationInfo.AllocationResult.Size() {
+				allocationQuantity := allocationInfo.AllocationResult.Size()
+				if calculationQuantity != allocationQuantity &&
+					(!resp.DisableDedicatedCoresOverlapReclaimedCores ||
+						!allocationInfo.CheckDedicatedNUMABinding() ||
+						calculationQuantity > allocationQuantity) {
 					return fmt.Errorf("pod: %s container: %s calculation result: %d and allocation result: %d mismatch",
-						podUID, containerName, calculationQuantity, allocationInfo.AllocationResult.Size())
+						podUID, containerName, calculationQuantity, allocationQuantity)
 				}
 			}
 		}

@@ -106,7 +106,7 @@ func TestCPUAdvisorValidatorRejectsIncompatibleResourcePackageAliases(t *testing
 	require.NoError(t, v.validateResourcePackageOwners(resp))
 }
 
-func TestCPUAdvisorValidatorAllowsNUMABindingDedicatedShrinkOnlyInDisjointMode(t *testing.T) {
+func TestCPUAdvisorValidatorValidatesNUMABindingDedicatedQuantityInDisjointMode(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
@@ -123,37 +123,69 @@ func TestCPUAdvisorValidatorAllowsNUMABindingDedicatedShrinkOnlyInDisjointMode(t
 						consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
 					},
 				},
-				AllocationResult: machine.NewCPUSet(0, 1, 2, 3),
+				AllocationResult: machine.NewCPUSet(0, 1),
 				TopologyAwareAssignments: map[int]machine.CPUSet{
-					0: machine.NewCPUSet(0, 1, 2, 3),
+					0: machine.NewCPUSet(0, 1),
 				},
 			},
 		},
 	})
 	v := NewCPUAdvisorValidator(currentState, &machine.KatalystMachineInfo{CPUTopology: topology})
 
-	for _, dd := range []bool{false, true} {
+	for _, tc := range []struct {
+		name     string
+		quantity uint64
+		wantErr  string
+	}{
+		{name: "shrink passes", quantity: 1},
+		{name: "zero rejects", quantity: 0, wantErr: "zero dedicated calculation result"},
+		{name: "grow rejects", quantity: 3, wantErr: "calculation result: 3 and allocation result: 2 mismatch"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			resp := &advisorapi.ListAndWatchResponse{
+				DisableDedicatedCoresOverlapReclaimedCores: true,
+				Entries: map[string]*advisorapi.CalculationEntries{
+					"pod": {
+						Entries: map[string]*advisorapi.CalculationInfo{
+							"container": {
+								OwnerPoolName: commonstate.PoolNameDedicated,
+								CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+									0: {Blocks: []*advisorapi.Block{{BlockId: "dedicated", Result: tc.quantity}}},
+								},
+							},
+						},
+					},
+				},
+			}
+			err := v.Validate(resp)
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+
+	t.Run("legacy mode rejects shrink", func(t *testing.T) {
+		t.Parallel()
 		resp := &advisorapi.ListAndWatchResponse{
-			DisableDedicatedCoresOverlapReclaimedCores: dd,
 			Entries: map[string]*advisorapi.CalculationEntries{
 				"pod": {
 					Entries: map[string]*advisorapi.CalculationInfo{
 						"container": {
 							OwnerPoolName: commonstate.PoolNameDedicated,
 							CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
-								0: {Blocks: []*advisorapi.Block{{BlockId: "dedicated", Result: 2}}},
+								0: {Blocks: []*advisorapi.Block{{BlockId: "dedicated", Result: 1}}},
 							},
 						},
 					},
 				},
 			},
 		}
-		if dd {
-			require.NoError(t, v.Validate(resp))
-		} else {
-			require.ErrorContains(t, v.Validate(resp), "calculation result: 2 and allocation result: 4 mismatch")
-		}
-	}
+		require.ErrorContains(t, v.Validate(resp), "calculation result: 1 and allocation result: 2 mismatch")
+	})
 }
 
 func advisorAliasResponse(blockID string, owners ...string) *advisorapi.ListAndWatchResponse {
