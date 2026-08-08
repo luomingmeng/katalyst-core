@@ -308,6 +308,7 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocks(
 	if err != nil {
 		return nil, err
 	}
+	baseAllocatable := available.Clone()
 	if err := allocateAdvisorStaticDescriptors(descriptors, result); err != nil {
 		return nil, err
 	}
@@ -345,7 +346,7 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocks(
 		descriptors, result,
 		advisorBlockClassStatic, advisorBlockClassDedicated, advisorBlockClassMandatoryReclaim,
 	)
-	overlapCandidates := allCPUs.Difference(protected)
+	overlapCandidates := baseAllocatable.Difference(protected)
 	overlap := filterAdvisorDescriptors(descriptors, func(descriptor advisorBlockDescriptor) bool {
 		return descriptor.Class == advisorBlockClassReclaimOverlap
 	})

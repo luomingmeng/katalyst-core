@@ -1181,6 +1181,65 @@ func TestSolveAdvisorDescriptorPhaseBlockIDRotationPreservesGrowOwnerUnion(t *te
 	require.Equal(t, solve("z-rotated-a", "a-rotated-b"), solve("a-next-a", "z-next-b"))
 }
 
+func TestPlanDisjointAdvisorBlocksOverlapNeverReintroducesStateForbiddenOrSystemCPUs(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+
+	systemPool := commonstate.GetSystemPoolName("latency")
+	notAllocatable := machine.NewCPUSet(0, 1, 2, 3)
+	p.state.SetPodEntries(state.PodEntries{
+		commonstate.PoolNameInterrupt: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameInterrupt),
+				AllocationResult: machine.NewCPUSet(0, 1),
+			},
+		},
+		systemPool: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(systemPool),
+				AllocationResult: machine.NewCPUSet(2, 3),
+			},
+		},
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: notAllocatable,
+			},
+		},
+	}, false)
+
+	resp := &advisorapi.ListAndWatchResponse{
+		DisableDedicatedCoresOverlapReclaimedCores: true,
+		Entries: map[string]*advisorapi.CalculationEntries{
+			commonstate.PoolNameReclaim: {Entries: map[string]*advisorapi.CalculationInfo{
+				commonstate.FakedContainerName: {
+					OwnerPoolName: commonstate.PoolNameReclaim,
+					CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+						commonstate.FakedNUMAID: {Blocks: []*advisorapi.Block{{
+							BlockId: "overlap-reclaim",
+							Result:  4,
+							OverlapTargets: []*advisorapi.OverlapTarget{{
+								OverlapTargetPoolName: commonstate.PoolNameShare,
+								OverlapType:           advisorapi.OverlapType_OverlapWithPool,
+							}},
+						}}},
+					},
+				},
+			}},
+		},
+	}
+
+	got, err := p.planDisjointAdvisorBlocks(resp)
+	require.NoError(t, err)
+	require.True(t, got["overlap-reclaim"].Intersection(notAllocatable).IsEmpty(),
+		"overlap reclaim must not reintroduce forbidden/system CPUs: got=%s forbidden=%s",
+		got["overlap-reclaim"].String(), notAllocatable.String())
+}
+
 func advisorDescriptorBlockIDs(descriptors []advisorBlockDescriptor) []string {
 	result := make([]string, 0, len(descriptors))
 	for _, descriptor := range descriptors {
