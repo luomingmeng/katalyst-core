@@ -19,6 +19,7 @@ package provisionassembler
 import (
 	"fmt"
 	"math"
+	"sort"
 
 	configapi "github.com/kubewharf/katalyst-api/pkg/apis/config/v1alpha1"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
@@ -64,6 +65,130 @@ func regulateOverlapReclaimPoolSize(sharePoolSizes map[string]int, overlapReclai
 	}
 
 	return sharedOverlapReclaimSize, nil
+}
+
+// allocatePoolSizesByPriority allocates physical capacity without mixing
+// guarantees from different classes in one proportional normalization. The
+// order is dedicated requirement, isolation lower bound, shared minimum, then
+// all optional expansion.
+func allocatePoolSizesByPriority(
+	available int,
+	dedicatedRequirements,
+	isolationLowerSizes,
+	shareMinimums,
+	expansionTargets map[string]int,
+) (map[string]int, bool) {
+	result := make(map[string]int)
+	remaining := general.Max(available, 0)
+	for _, tier := range []map[string]int{
+		dedicatedRequirements,
+		isolationLowerSizes,
+		shareMinimums,
+		expansionTargets,
+	} {
+		increments := make(map[string]int)
+		for name, target := range tier {
+			if delta := general.Max(target, 0) - result[name]; delta > 0 {
+				increments[name] = delta
+			}
+		}
+		allocated := allocateProportionally(increments, remaining)
+		for name, size := range allocated {
+			result[name] += size
+			remaining -= size
+		}
+		if remaining == 0 {
+			break
+		}
+	}
+
+	throttled := false
+	for name, target := range expansionTargets {
+		if result[name] < general.Max(target, 0) {
+			throttled = true
+			break
+		}
+	}
+	return result, throttled
+}
+
+func expandSharePoolsToCapacity(poolSizes, shareWeights map[string]int, available int) {
+	remaining := general.Max(available-general.SumUpMapValues(poolSizes), 0)
+	if remaining == 0 || len(shareWeights) == 0 {
+		return
+	}
+
+	shareTarget := remaining
+	active := general.DeepCopyIntMap(shareWeights)
+	for name := range shareWeights {
+		shareTarget += poolSizes[name]
+	}
+	fixed := make(map[string]int)
+	for len(active) > 0 {
+		fixedSum := general.SumUpMapValues(fixed)
+		desired := allocateByWeight(active, general.Max(shareTarget-fixedSum, 0))
+		changed := false
+		for name := range active {
+			if desired[name] < poolSizes[name] {
+				fixed[name] = poolSizes[name]
+				delete(active, name)
+				changed = true
+			}
+		}
+		if changed {
+			continue
+		}
+		for name, size := range desired {
+			poolSizes[name] = size
+		}
+		break
+	}
+}
+
+func allocateProportionally(requirements map[string]int, available int) map[string]int {
+	result := make(map[string]int)
+	total := general.SumUpMapValues(requirements)
+	if available <= 0 || total <= 0 {
+		return result
+	}
+	if total <= available {
+		return general.DeepCopyIntMap(requirements)
+	}
+	return allocateByWeight(requirements, available)
+}
+
+func allocateByWeight(weights map[string]int, amount int) map[string]int {
+	result := make(map[string]int)
+	total := general.SumUpMapValues(weights)
+	if amount <= 0 || total <= 0 {
+		return result
+	}
+	type fractionalRemainder struct {
+		name      string
+		remainder int
+	}
+	remainders := make([]fractionalRemainder, 0, len(weights))
+	allocated := 0
+	for name, weight := range weights {
+		if weight <= 0 {
+			continue
+		}
+		numerator := weight * amount
+		result[name] = numerator / total
+		allocated += result[name]
+		remainders = append(remainders, fractionalRemainder{name: name, remainder: numerator % total})
+	}
+	sort.Slice(remainders, func(i, j int) bool {
+		if remainders[i].remainder != remainders[j].remainder {
+			return remainders[i].remainder > remainders[j].remainder
+		}
+		return remainders[i].name < remainders[j].name
+	})
+	for i := 0; allocated < amount && i < len(remainders); i++ {
+		result[remainders[i].name]++
+		allocated++
+	}
+	return result
 }
 
 // regulatePoolSizes modifies pool size map to legal values, taking total available
