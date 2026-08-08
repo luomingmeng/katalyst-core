@@ -24,6 +24,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -776,32 +778,78 @@ func TestAdvisorPostCommitCheckpointCrashRecoveryAndSuccessfulCleanup(t *testing
 	require.NoFileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName))
 }
 
+const (
+	advisorCheckpointSubprocessRoleEnv = "KATALYST_ADVISOR_CHECKPOINT_SUBPROCESS_ROLE"
+	advisorCheckpointSubprocessDirEnv  = "KATALYST_ADVISOR_CHECKPOINT_SUBPROCESS_DIR"
+	advisorCheckpointSubprocessTimeout = 10 * time.Second
+)
+
 func TestAdvisorCheckpointSubprocessRestoresDisjointPartitionRevisionPendingAndRetry(t *testing.T) {
-	const (
-		roleEnv = "KATALYST_ADVISOR_CHECKPOINT_SUBPROCESS_ROLE"
-		dirEnv  = "KATALYST_ADVISOR_CHECKPOINT_SUBPROCESS_DIR"
-	)
-	switch os.Getenv(roleEnv) {
+	switch os.Getenv(advisorCheckpointSubprocessRoleEnv) {
 	case "writer":
-		runAdvisorCheckpointWriter(t, os.Getenv(dirEnv))
+		runAdvisorCheckpointWriter(t, os.Getenv(advisorCheckpointSubprocessDirEnv))
 		return
 	case "reader":
-		runAdvisorCheckpointReader(t, os.Getenv(dirEnv))
+		runAdvisorCheckpointReader(t, os.Getenv(advisorCheckpointSubprocessDirEnv))
+		return
+	case "timeout-probe":
+		fmt.Fprintln(os.Stderr, "advisor checkpoint timeout probe started")
+		select {}
 		return
 	}
 
 	dir := t.TempDir()
 	run := func(role string) {
 		t.Helper()
-		cmd := exec.Command(os.Args[0],
-			"-test.run=^TestAdvisorCheckpointSubprocessRestoresDisjointPartitionRevisionPendingAndRetry$")
-		cmd.Env = append(os.Environ(), roleEnv+"="+role, dirEnv+"="+dir)
-		output, err := cmd.CombinedOutput()
-		require.NoErrorf(t, err, "%s subprocess failed:\n%s", role, output)
+		_, err := runAdvisorCheckpointSubprocess(role, dir, advisorCheckpointSubprocessTimeout)
+		require.NoError(t, err)
 	}
 	run("writer")
 	require.FileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName))
 	run("reader")
+}
+
+func TestAdvisorCheckpointSubprocessTimeoutKillsChild(t *testing.T) {
+	output, err := runAdvisorCheckpointSubprocess("timeout-probe", t.TempDir(), time.Second)
+	require.Error(t, err)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.ErrorContains(t, err, "timeout-probe subprocess timed out after 1s and was killed")
+	require.Contains(t, string(output), "advisor checkpoint timeout probe started")
+}
+
+func runAdvisorCheckpointSubprocess(role, dir string, timeout time.Duration) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	childTestTimeout := timeout + 5*time.Second
+	cmd := exec.CommandContext(ctx, os.Args[0],
+		"-test.run=^TestAdvisorCheckpointSubprocessRestoresDisjointPartitionRevisionPendingAndRetry$",
+		"-test.timeout="+childTestTimeout.String())
+	cmd.Env = advisorCheckpointSubprocessEnv(role, dir)
+	output, err := cmd.CombinedOutput()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return output, fmt.Errorf(
+			"%s subprocess timed out after %s and was killed: %w\ncaptured output:\n%s",
+			role, timeout, ctxErr, output)
+	}
+	if err != nil {
+		return output, fmt.Errorf("%s subprocess failed: %w\ncaptured output:\n%s", role, err, output)
+	}
+	return output, nil
+}
+
+func advisorCheckpointSubprocessEnv(role, dir string) []string {
+	env := make([]string, 0, len(os.Environ())+2)
+	for _, entry := range os.Environ() {
+		if strings.HasPrefix(entry, advisorCheckpointSubprocessRoleEnv+"=") ||
+			strings.HasPrefix(entry, advisorCheckpointSubprocessDirEnv+"=") {
+			continue
+		}
+		env = append(env, entry)
+	}
+	return append(env,
+		advisorCheckpointSubprocessRoleEnv+"="+role,
+		advisorCheckpointSubprocessDirEnv+"="+dir)
 }
 
 func runAdvisorCheckpointWriter(t *testing.T, dir string) {
@@ -844,14 +892,29 @@ func runAdvisorCheckpointReader(t *testing.T, dir string) {
 	p, err := getTestDynamicPolicyWithoutInitialization(topology, dir)
 	require.NoError(t, err)
 	p.advisorPostCommitCheckpointDir = dir
+	retryCalls := make(chan cpusetutil.CPUSetAdjustmentHandlerCtx, 1)
+	var retryCallCount atomic.Int32
 	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
-		"keep-pending": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+		"keep-pending": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			retryCallCount.Add(1)
+			select {
+			case retryCalls <- in:
+			default:
+			}
 			return errors.New("keep recovered target pending")
 		},
 	}
 
 	require.NoError(t, p.Start())
 	defer func() { require.NoError(t, p.Stop()) }()
+
+	select {
+	case call := <-retryCalls:
+		require.Equal(t, cpusetutil.CPUSetAdjustmentModeRetry, call.Mode)
+	case <-time.After(2 * time.Second):
+		t.Fatalf("retry handler was not called after Start; calls=%d", retryCallCount.Load())
+	}
+	require.GreaterOrEqual(t, retryCallCount.Load(), int32(1))
 
 	dedicated := p.state.GetAllocationInfo("pod-dedicated", "main").AllocationResult
 	reclaim := p.state.GetAllocationInfo(
@@ -868,9 +931,11 @@ func runAdvisorCheckpointReader(t *testing.T, dir string) {
 	require.Greater(t, target.revision, uint64(0))
 	require.True(t, p.hasPendingAdvisorPostCommitTarget(p.state.GetRevision()))
 	p.cpuSetAdjustmentRetryMu.Lock()
-	require.True(t, p.cpuSetAdjustmentRetryDirty)
-	require.Contains(t, p.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
+	dirty := p.cpuSetAdjustmentRetryDirty
+	_, hasApplyFailedReason := p.cpuSetAdjustmentRetryReasons[cpusetutil.RetryReasonApplyFailed]
 	p.cpuSetAdjustmentRetryMu.Unlock()
+	require.True(t, dirty)
+	require.True(t, hasApplyFailedReason)
 }
 
 func advisorCheckpointPartitionEntries(dedicated, reclaim machine.CPUSet) state.PodEntries {
