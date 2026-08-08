@@ -172,7 +172,16 @@ func TestGenerateBlockCPUSetOwnerUnionsStableAcrossRandomMapOrderAndBlockIDRotat
 		return got
 	}
 
-	var baseline map[string]machine.CPUSet
+	dedicatedOwner := canonicalAdvisorBlockOwner(
+		commonstate.PoolNameDedicated, "pod-a", "main", "")
+	reclaimOwner := canonicalAdvisorBlockOwner(
+		commonstate.PoolNameReclaim, commonstate.PoolNameReclaim,
+		commonstate.FakedContainerName, "")
+	wantOwners := map[string]machine.CPUSet{
+		dedicatedOwner: machine.NewCPUSet(0, 1),
+		reclaimOwner:   machine.NewCPUSet(2, 3),
+	}
+	wantUnion := machine.NewCPUSet(0, 1, 2, 3)
 	for seed := int64(0); seed < 1000; seed++ {
 		aliases := []advisorBlockTestAlias{
 			{
@@ -195,11 +204,11 @@ func TestGenerateBlockCPUSetOwnerUnionsStableAcrossRandomMapOrderAndBlockIDRotat
 		blocks, err := p.generateBlockCPUSet(resp, featureGates)
 		require.NoError(t, err, "seed %d", seed)
 		got := ownerUnions(t, resp, blocks)
-		if seed == 0 {
-			baseline = got
-			continue
-		}
-		require.Equal(t, baseline, got, "seed %d", seed)
+		require.Equal(t, wantOwners, got, "seed %d owner keys or assignments", seed)
+		require.True(t, got[dedicatedOwner].Intersection(got[reclaimOwner]).IsEmpty(),
+			"seed %d dedicated and reclaim owners overlap", seed)
+		require.Equal(t, wantUnion, got[dedicatedOwner].Union(got[reclaimOwner]),
+			"seed %d owner union does not cover the complete partition", seed)
 	}
 }
 

@@ -17,6 +17,7 @@ limitations under the License.
 package dynamicpolicy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -36,6 +37,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation/finders"
 	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation/finders/feature_cpu"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/statedirectory"
@@ -225,10 +227,14 @@ func TestExclusiveDisjointPartitionLifecycleAndFlagTransitions(t *testing.T) {
 
 	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
 	require.NoError(t, err)
-	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	checkpointDir := t.TempDir()
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, checkpointDir)
 	require.NoError(t, err)
+	policy.advisorPostCommitCheckpointDir = checkpointDir
 
 	wholeNUMA := topology.CPUDetails.CPUsInNUMANodes(0)
+	wholeNUMACPUs := wholeNUMA.ToSliceInt()
+	initialDedicated := machine.NewCPUSet(wholeNUMACPUs[:wholeNUMA.Size()/2]...)
 	policy.state.SetPodEntries(state.PodEntries{
 		"pod-dedicated": {
 			"main": &state.AllocationInfo{
@@ -238,9 +244,9 @@ func TestExclusiveDisjointPartitionLifecycleAndFlagTransitions(t *testing.T) {
 					OwnerPoolName: commonstate.PoolNameDedicated,
 					QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
 				},
-				AllocationResult: wholeNUMA.Clone(),
+				AllocationResult: initialDedicated,
 				TopologyAwareAssignments: map[int]machine.CPUSet{
-					0: wholeNUMA.Clone(),
+					0: initialDedicated,
 				},
 				RampUp: true,
 			},
@@ -299,23 +305,51 @@ func TestExclusiveDisjointPartitionLifecycleAndFlagTransitions(t *testing.T) {
 			Name: feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
 		},
 	}
-	applyFrame := func(resp *advisorapi.ListAndWatchResponse) advisorapi.BlockCPUSet {
+	var reconciling *advisorapi.ListAndWatchResponse
+	appliedFrames := 0
+	policy.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"observe-pending": func(_ context.Context, _ cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			target := policy.currentAdvisorPostCommitTarget()
+			require.NotNil(t, target, "target must remain pending while reconcile is running")
+			require.Equal(t, policy.state.GetRevision(), target.revision)
+			require.Equal(t, reconciling, target.response)
+			require.FileExists(t, filepath.Join(checkpointDir, advisorPostCommitCheckpointName),
+				"WAL must remain durable until reconcile is applied")
+			appliedFrames++
+			return nil
+		},
+	}
+	applyFrame := func(
+		req *advisorapi.GetAdviceRequest,
+		resp *advisorapi.ListAndWatchResponse,
+		gates map[string]*advisorsvc.FeatureGate,
+	) advisorapi.BlockCPUSet {
 		t.Helper()
-		blocks, generateErr := policy.generateBlockCPUSet(resp, featureGates)
+		reconciling = resp
+		revision := policy.state.GetRevision()
+		require.NoError(t, policy.allocateByCPUAdvisor(req, resp, gates))
+		require.Equal(t, revision+1, policy.state.GetRevision(),
+			"each frame must CAS-commit desired state exactly once")
+		require.False(t, policy.hasAnyPendingAdvisorPostCommitTarget(),
+			"successfully applied frame must clear pending target")
+		require.NoFileExists(t, filepath.Join(checkpointDir, advisorPostCommitCheckpointName),
+			"successfully applied frame must remove WAL")
+		blocks, generateErr := policy.generateBlockCPUSet(resp, gates)
 		require.NoError(t, generateErr)
-		require.NoError(t, policy.applyBlocks(
-			blocks, resp, resp.AllowSharedCoresOverlapReclaimedCores))
 		return blocks
 	}
 
 	first := disjointResponse("first", false)
 	revisionBeforeNegotiation := policy.state.GetRevision()
-	_, err = policy.generateBlockCPUSet(first, nil)
-	require.ErrorContains(t, err, "capability is not negotiated")
+	err = policy.allocateByCPUAdvisor(&advisorapi.GetAdviceRequest{}, first, nil)
+	require.ErrorContains(t, err,
+		feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition)
 	require.Equal(t, revisionBeforeNegotiation, policy.state.GetRevision(),
 		"an unnegotiated DD frame must not change desired state")
+	require.False(t, policy.hasAnyPendingAdvisorPostCommitTarget())
+	require.NoFileExists(t, filepath.Join(checkpointDir, advisorPostCommitCheckpointName))
 
-	firstBlocks := applyFrame(first)
+	firstBlocks := applyFrame(&advisorapi.GetAdviceRequest{}, first, featureGates)
 	firstDedicated := firstBlocks["dedicated-first"]
 	firstReclaim := firstBlocks["reclaim-first"]
 	require.False(t, policy.state.GetAllocationInfo("pod-dedicated", "main").RampUp)
@@ -325,7 +359,7 @@ func TestExclusiveDisjointPartitionLifecycleAndFlagTransitions(t *testing.T) {
 	require.False(t, policy.state.GetAllowSharedCoresOverlapReclaimedCores())
 
 	second := disjointResponse("second", true)
-	secondBlocks := applyFrame(second)
+	secondBlocks := applyFrame(&advisorapi.GetAdviceRequest{}, second, featureGates)
 	require.Equal(t, firstDedicated, secondBlocks["dedicated-second"],
 		"clearing RampUp must not move the dedicated partition on the second advice")
 	require.Equal(t, firstReclaim, secondBlocks["reclaim-second"],
@@ -342,7 +376,10 @@ func TestExclusiveDisjointPartitionLifecycleAndFlagTransitions(t *testing.T) {
 					"main": {
 						OwnerPoolName: commonstate.PoolNameDedicated,
 						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
-							0: {Blocks: []*advisorapi.Block{{BlockId: "legacy-dedicated", Result: 4}}},
+							0: {Blocks: []*advisorapi.Block{{
+								BlockId: "legacy-dedicated",
+								Result:  uint64(wholeNUMA.Size() / 2),
+							}}},
 						},
 					},
 				},
@@ -352,23 +389,28 @@ func TestExclusiveDisjointPartitionLifecycleAndFlagTransitions(t *testing.T) {
 					commonstate.FakedContainerName: {
 						OwnerPoolName: commonstate.PoolNameReclaim,
 						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
-							0: {Blocks: []*advisorapi.Block{{BlockId: "legacy-reclaim", Result: 4}}},
+							0: {Blocks: []*advisorapi.Block{{
+								BlockId: "legacy-reclaim",
+								Result:  uint64(wholeNUMA.Size() / 2),
+							}}},
 						},
 					},
 				},
 			},
 		},
 	}
-	require.NoError(t, policy.applyBlocks(advisorapi.BlockCPUSet{
-		"legacy-dedicated": machine.NewCPUSet(0, 1, 2, 3),
-		"legacy-reclaim":   machine.NewCPUSet(0, 1, 2, 3),
-	}, legacy, true))
+	legacyBlocks := applyFrame(nil, legacy, map[string]*advisorsvc.FeatureGate{})
 	require.False(t, policy.state.GetDisableDedicatedCoresOverlapReclaimedCores())
-	legacyDedicated := policy.state.GetAllocationInfo("pod-dedicated", "main").AllocationResult
-	legacyReclaim := policy.state.GetAllocationInfo(
-		commonstate.PoolNameReclaim, commonstate.FakedContainerName).AllocationResult
-	require.False(t, legacyDedicated.Intersection(legacyReclaim).IsEmpty(),
-		"DD true-to-false must restore legacy dedicated/reclaim overlap")
+	legacyDedicated := legacyBlocks["legacy-dedicated"]
+	legacyReclaim := legacyBlocks["legacy-reclaim"]
+	require.Equal(t, legacyDedicated,
+		policy.state.GetAllocationInfo("pod-dedicated", "main").AllocationResult)
+	require.Equal(t, legacyReclaim, policy.state.GetAllocationInfo(
+		commonstate.PoolNameReclaim, commonstate.FakedContainerName).AllocationResult)
+	require.True(t, policy.state.GetAllowSharedCoresOverlapReclaimedCores(),
+		"legacy transition must preserve the independent AS flag")
+	require.Equal(t, 3, appliedFrames,
+		"both DD frames and the legacy transition must reach post-commit apply")
 }
 
 type advisorCommitRecordingState struct {
