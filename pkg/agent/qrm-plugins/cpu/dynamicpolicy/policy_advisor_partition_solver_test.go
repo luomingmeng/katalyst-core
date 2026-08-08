@@ -17,8 +17,10 @@ limitations under the License.
 package dynamicpolicy
 
 import (
+	"fmt"
 	"math/rand"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -271,6 +273,86 @@ func TestPartitionCostWeightsBoundary(t *testing.T) {
 	require.Zero(t, oldWeight)
 	require.Zero(t, reclaimWeight)
 	require.Zero(t, topologyWeight)
+}
+
+func TestSolveDisjointPartitionsCostOverflowFailsClosed(t *testing.T) {
+	demands, topology := densePartitionSolverFixture(8192, 682)
+	for i := range demands {
+		demands[i].quantity = 12
+		if i < 8 {
+			demands[i].quantity++
+		}
+	}
+
+	got, err := solveDisjointPartitions(demands, topology)
+
+	require.ErrorContains(t, err, "partition cost overflow")
+	require.Nil(t, got)
+}
+
+func TestSolveDisjointPartitionsDense1024CompletesQuickly(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping dense performance probe in short mode")
+	}
+
+	demands, topology := densePartitionSolverFixture(1024, 1024)
+	started := time.Now()
+	got, err := solveDisjointPartitions(demands, topology)
+	elapsed := time.Since(started)
+
+	require.NoError(t, err)
+	require.Len(t, got, len(demands))
+	require.Less(t, elapsed, 2*time.Second, "dense solver probe took %s", elapsed)
+}
+
+func TestSolveDisjointPartitionsFailsFastAtEdgeBudget(t *testing.T) {
+	demands, topology := densePartitionSolverFixture(1024, 1025)
+	demands[len(demands)-1].quantity = 0
+
+	got, err := solveDisjointPartitions(demands, topology)
+
+	require.ErrorContains(t, err, "partition graph edge budget exceeded")
+	require.Nil(t, got)
+}
+
+func BenchmarkSolveDisjointPartitionsDense1024(b *testing.B) {
+	demands, topology := densePartitionSolverFixture(1024, 1024)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		got, err := solveDisjointPartitions(demands, topology)
+		require.NoError(b, err)
+		require.Len(b, got, len(demands))
+	}
+}
+
+func densePartitionSolverFixture(cpuCount, demandCount int) ([]partitionDemand, *machine.CPUTopology) {
+	cpus := make([]int, cpuCount)
+	details := make(machine.CPUDetails, cpuCount)
+	for cpu := range cpus {
+		cpus[cpu] = cpu
+		details[cpu] = machine.CPUTopoInfo{
+			NUMANodeID: cpu / 64,
+			SocketID:   cpu / 512,
+			CoreID:     cpu / 2,
+		}
+	}
+	eligible := machine.NewCPUSet(cpus...)
+	demands := make([]partitionDemand, demandCount)
+	for i := range demands {
+		demands[i] = partitionDemand{
+			key:      fmt.Sprintf("demand-%04d", i),
+			quantity: 1,
+			eligible: eligible,
+			class:    advisorBlockClassDedicated,
+		}
+	}
+	return demands, &machine.CPUTopology{
+		NumCPUs:      cpuCount,
+		NumCores:     (cpuCount + 1) / 2,
+		NumSockets:   (cpuCount + 511) / 512,
+		NumNUMANodes: (cpuCount + 63) / 64,
+		CPUDetails:   details,
+	}
 }
 
 func partitionSolverFixtureTopology() *machine.CPUTopology {
