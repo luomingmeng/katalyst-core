@@ -18,6 +18,7 @@ package state
 
 import (
 	"fmt"
+	"math"
 	"path"
 	"reflect"
 	"sync"
@@ -99,6 +100,9 @@ func (sc *stateCheckpoint) RestoreState(cp checkpointmanager.Checkpoint) (bool, 
 
 	if sc.policyName != checkpoint.PolicyName && !sc.skipStateCorruption {
 		return false, fmt.Errorf("[cpu_plugin] configured policy %q differs from state checkpoint policy %q", sc.policyName, checkpoint.PolicyName)
+	}
+	if checkpoint.Revision == math.MaxUint64 {
+		return false, fmt.Errorf("%w: checkpoint revision=%d", ErrStateRevisionOverflow, checkpoint.Revision)
 	}
 
 	generatedMachineState, err := sc.GenerateMachineStateFromPodEntries(sc.topology, checkpoint.PodEntries, checkpoint.MachineState)

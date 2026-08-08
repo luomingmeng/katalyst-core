@@ -307,20 +307,94 @@ func TestCPUPluginStateRejectsRevisionOverflowWithoutMutation(t *testing.T) {
 	require.Equal(t, oldMachineState, s.GetMachineState())
 }
 
-func TestCPUPluginStateVoidMutationDoesNotWrapRevision(t *testing.T) {
+func TestCPUPluginStateVoidMutationsFailStopWhenRevisionIsExhausted(t *testing.T) {
 	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
 	require.NoError(t, err)
-	s := NewCPUPluginState(topology)
-	s.revision = math.MaxUint64
-	oldMachineState := s.GetMachineState()
 
-	s.SetMachineState(NUMANodeMap{
-		0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(1)},
-	})
+	for _, tc := range []struct {
+		name   string
+		mutate func(*cpuPluginState)
+	}{
+		{
+			name: "machine state",
+			mutate: func(s *cpuPluginState) {
+				s.SetMachineState(NUMANodeMap{
+					0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(1)},
+				})
+			},
+		},
+		{
+			name:   "numa headroom",
+			mutate: func(s *cpuPluginState) { s.SetNUMAHeadroom(map[int]float64{0: 1}) },
+		},
+		{
+			name: "allocation info",
+			mutate: func(s *cpuPluginState) {
+				s.SetAllocationInfo("new-pod", "main", &AllocationInfo{
+					AllocationResult: machine.NewCPUSet(1),
+				})
+			},
+		},
+		{
+			name:   "pod entries",
+			mutate: func(s *cpuPluginState) { s.SetPodEntries(PodEntries{}) },
+		},
+		{
+			name: "allow overlap",
+			mutate: func(s *cpuPluginState) {
+				s.SetAllowSharedCoresOverlapReclaimedCores(true)
+			},
+		},
+		{
+			name: "disable dedicated overlap",
+			mutate: func(s *cpuPluginState) {
+				s.SetDisableDedicatedCoresOverlapReclaimedCores(true)
+			},
+		},
+		{
+			name:   "delete",
+			mutate: func(s *cpuPluginState) { s.Delete("pod", "main") },
+		},
+		{
+			name:   "clear",
+			mutate: func(s *cpuPluginState) { s.ClearState() },
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewCPUPluginState(topology)
+			s.podEntries = PodEntries{
+				"pod": {"main": &AllocationInfo{AllocationResult: machine.NewCPUSet(0)}},
+			}
+			s.revision = math.MaxUint64
 
-	require.Equal(t, uint64(math.MaxUint64), s.GetRevision())
-	require.Equal(t, oldMachineState, s.GetMachineState(),
-		"a void mutator must reject mutation rather than wrap the revision")
+			require.PanicsWithError(t, ErrStateRevisionOverflow.Error(), func() {
+				tc.mutate(s)
+			})
+			require.Equal(t, uint64(math.MaxUint64), s.GetRevision())
+			require.NotNil(t, s.GetAllocationInfo("pod", "main"))
+		})
+	}
+}
+
+func TestCheckpointStateRejectsExhaustedRevisionDuringRestore(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
+	require.NoError(t, err)
+	sc := &stateCheckpoint{
+		cache:                              NewCPUPluginState(topology),
+		policyName:                         "dynamic",
+		topology:                           topology,
+		GenerateMachineStateFromPodEntries: GenerateMachineStateFromPodEntries,
+	}
+	checkpoint := NewCPUPluginCheckpoint()
+	checkpoint.PolicyName = "dynamic"
+	checkpoint.MachineState = GetDefaultMachineState(topology)
+	checkpoint.Revision = math.MaxUint64
+
+	changed, err := sc.RestoreState(checkpoint)
+	require.False(t, changed)
+	require.ErrorIs(t, err, ErrStateRevisionOverflow)
+	require.Zero(t, sc.GetRevision())
 }
 
 func TestStateSkipsNilAllocationInfo(t *testing.T) {
