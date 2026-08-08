@@ -315,10 +315,9 @@ func (p *DynamicPolicy) publishAdvisorPostCommitTarget(
 	resp *advisorapi.ListAndWatchResponse,
 	revision uint64,
 ) *advisorPostCommitTarget {
-	target, err := p.prepareAdvisorPostCommitTarget(resp, revision)
-	if err != nil {
+	target := cloneAdvisorPostCommitTarget(resp, revision)
+	if err := p.storeAdvisorPostCommitTarget(target, p.advisorPostCommitCheckpointPath()); err != nil {
 		general.Errorf("persist advisor post-commit target for revision %d failed: %v", revision, err)
-		target = cloneAdvisorPostCommitTarget(resp, revision)
 	}
 	p.publishPreparedAdvisorPostCommitTarget(target)
 	return target
@@ -347,7 +346,7 @@ func (p *DynamicPolicy) prepareAdvisorPostCommitTarget(
 	postCommitRevision uint64,
 ) (*advisorPostCommitTarget, error) {
 	target := cloneAdvisorPostCommitTarget(resp, postCommitRevision)
-	if err := p.storeAdvisorPostCommitTarget(target); err != nil {
+	if err := p.storeAdvisorPostCommitTarget(target, p.advisorPostCommitStagingPath()); err != nil {
 		return nil, err
 	}
 	return target, nil
@@ -373,7 +372,7 @@ func (p *DynamicPolicy) commitAdvisorResponseWithWriteAhead(
 		return nil, fmt.Errorf("persist advisor post-commit target: %w", err)
 	}
 	if err := commitDesired(); err != nil {
-		if removeErr := p.removeAdvisorPostCommitCheckpoint(); removeErr != nil {
+		if removeErr := p.removeAdvisorPostCommitStaging(); removeErr != nil {
 			return nil, fmt.Errorf("%w; remove uncommitted advisor target: %v", err, removeErr)
 		}
 		return nil, err
@@ -383,12 +382,15 @@ func (p *DynamicPolicy) commitAdvisorResponseWithWriteAhead(
 		if p.state != nil {
 			actualRevision = p.state.GetRevision()
 		}
-		if removeErr := p.removeAdvisorPostCommitCheckpoint(); removeErr != nil {
+		if removeErr := p.removeAdvisorPostCommitStaging(); removeErr != nil {
 			return nil, fmt.Errorf("advisor desired commit revision mismatch: expected=%d actual=%d; remove target: %v",
 				postCommitRevision, actualRevision, removeErr)
 		}
 		return nil, fmt.Errorf("advisor desired commit revision mismatch: expected=%d actual=%d",
 			postCommitRevision, actualRevision)
+	}
+	if err := p.promoteAdvisorPostCommitStaging(); err != nil {
+		return nil, fmt.Errorf("promote advisor post-commit target: %w", err)
 	}
 	p.publishPreparedAdvisorPostCommitTarget(target)
 	return target, nil
@@ -401,8 +403,15 @@ func (p *DynamicPolicy) advisorPostCommitCheckpointPath() string {
 	return filepath.Join(p.advisorPostCommitCheckpointDir, advisorPostCommitCheckpointName)
 }
 
-func (p *DynamicPolicy) storeAdvisorPostCommitTarget(target *advisorPostCommitTarget) error {
+func (p *DynamicPolicy) advisorPostCommitStagingPath() string {
 	path := p.advisorPostCommitCheckpointPath()
+	if path == "" {
+		return ""
+	}
+	return path + ".staging"
+}
+
+func (p *DynamicPolicy) storeAdvisorPostCommitTarget(target *advisorPostCommitTarget, path string) error {
 	if path == "" || target == nil {
 		return nil
 	}
@@ -455,55 +464,105 @@ func (p *DynamicPolicy) storeAdvisorPostCommitTarget(target *advisorPostCommitTa
 	return nil
 }
 
-func (p *DynamicPolicy) removeAdvisorPostCommitCheckpoint() error {
-	path := p.advisorPostCommitCheckpointPath()
+func syncAdvisorPostCommitDirectory(path string) error {
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return fmt.Errorf("open advisor checkpoint directory: %w", err)
+	}
+	defer dir.Close()
+	if err := dir.Sync(); err != nil {
+		return fmt.Errorf("sync advisor checkpoint directory: %w", err)
+	}
+	return nil
+}
+
+func removeAdvisorPostCommitPath(path string) error {
 	if path == "" {
 		return nil
 	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove advisor checkpoint: %w", err)
 	}
-	dir, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return fmt.Errorf("open advisor checkpoint directory after remove: %w", err)
-	}
-	defer dir.Close()
-	if err := dir.Sync(); err != nil {
-		return fmt.Errorf("sync advisor checkpoint directory after remove: %w", err)
-	}
-	return nil
+	return syncAdvisorPostCommitDirectory(path)
 }
 
-func (p *DynamicPolicy) restoreAdvisorPostCommitTarget() error {
-	path := p.advisorPostCommitCheckpointPath()
-	if path == "" {
+func (p *DynamicPolicy) removeAdvisorPostCommitCheckpoint() error {
+	return removeAdvisorPostCommitPath(p.advisorPostCommitCheckpointPath())
+}
+
+func (p *DynamicPolicy) removeAdvisorPostCommitStaging() error {
+	return removeAdvisorPostCommitPath(p.advisorPostCommitStagingPath())
+}
+
+func (p *DynamicPolicy) promoteAdvisorPostCommitStaging() error {
+	stagingPath := p.advisorPostCommitStagingPath()
+	activePath := p.advisorPostCommitCheckpointPath()
+	if stagingPath == "" {
 		return nil
 	}
+	if err := os.Rename(stagingPath, activePath); err != nil {
+		return fmt.Errorf("rename staging checkpoint: %w", err)
+	}
+	return syncAdvisorPostCommitDirectory(activePath)
+}
+
+func loadAdvisorPostCommitTarget(path string) (*advisorPostCommitTarget, error) {
 	data, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return nil
-	}
 	if err != nil {
-		return fmt.Errorf("read advisor checkpoint: %w", err)
+		return nil, err
 	}
 	var checkpoint advisorPostCommitCheckpoint
 	if err := json.Unmarshal(data, &checkpoint); err != nil {
-		general.Errorf("discard corrupted advisor post-commit checkpoint: %v", err)
-		return p.removeAdvisorPostCommitCheckpoint()
+		return nil, err
 	}
 	response := &advisorapi.ListAndWatchResponse{}
 	if err := proto.Unmarshal(checkpoint.Response, response); err != nil {
-		general.Errorf("discard corrupted advisor post-commit response: %v", err)
-		return p.removeAdvisorPostCommitCheckpoint()
+		return nil, err
 	}
-	if p.state == nil || checkpoint.Revision != p.state.GetRevision() {
-		return p.removeAdvisorPostCommitCheckpoint()
+	return &advisorPostCommitTarget{revision: checkpoint.Revision, response: response}, nil
+}
+
+func (p *DynamicPolicy) restoreAdvisorPostCommitTarget() error {
+	activePath := p.advisorPostCommitCheckpointPath()
+	if activePath == "" {
+		return nil
+	}
+	stagingPath := p.advisorPostCommitStagingPath()
+	mainRevision := uint64(0)
+	if p.state != nil {
+		mainRevision = p.state.GetRevision()
+	}
+	active, activeErr := loadAdvisorPostCommitTarget(activePath)
+	staging, stagingErr := loadAdvisorPostCommitTarget(stagingPath)
+	if activeErr != nil && !os.IsNotExist(activeErr) {
+		general.Errorf("discard corrupted active advisor post-commit checkpoint: %v", activeErr)
+	}
+	if stagingErr != nil && !os.IsNotExist(stagingErr) {
+		general.Errorf("discard corrupted staging advisor post-commit checkpoint: %v", stagingErr)
+	}
+
+	var selected *advisorPostCommitTarget
+	if stagingErr == nil && staging.revision == mainRevision {
+		selected = staging
+		if err := p.promoteAdvisorPostCommitStaging(); err != nil {
+			return err
+		}
+	} else if activeErr == nil && active.revision == mainRevision {
+		selected = active
+		if err := p.removeAdvisorPostCommitStaging(); err != nil {
+			return err
+		}
+	} else {
+		if err := p.removeAdvisorPostCommitCheckpoint(); err != nil {
+			return err
+		}
+		if err := p.removeAdvisorPostCommitStaging(); err != nil {
+			return err
+		}
+		return nil
 	}
 	p.cpuSetAdjustmentRetryMu.Lock()
-	p.advisorPostCommitTarget = &advisorPostCommitTarget{
-		revision: checkpoint.Revision,
-		response: response,
-	}
+	p.advisorPostCommitTarget = selected
 	p.cpuSetAdjustmentRetryMu.Unlock()
 	return nil
 }
