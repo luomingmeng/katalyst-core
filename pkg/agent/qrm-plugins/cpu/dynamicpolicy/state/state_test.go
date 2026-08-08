@@ -170,6 +170,55 @@ func TestCPUPluginStateCommitAdvisorStateIfRevisionRejectsStaleSnapshot(t *testi
 	require.NotNil(t, s.GetAllocationInfo("new-pod", "main"), "stale commit must not drop newer pod entry")
 }
 
+func TestNUMAHeadroomDoesNotAdvanceAllocationRevisionOrBreakCASIsolation(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
+	require.NoError(t, err)
+	s := NewCPUPluginState(topology)
+
+	revision := s.GetRevision()
+	s.SetNUMAHeadroom(map[int]float64{0: 1.5})
+	require.Equal(t, revision, s.GetRevision(),
+		"headroom is outside pod/machine allocation revision")
+
+	entries := PodEntries{
+		"pod": {
+			"main": &AllocationInfo{AllocationResult: machine.NewCPUSet(1)},
+		},
+	}
+	machineState := NUMANodeMap{
+		0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(1)},
+	}
+	require.NoError(t, s.CommitAdvisorStateIfRevision(
+		revision, entries, machineState, true, false, false))
+	require.Equal(t, map[int]float64{0: 1.5}, s.GetNUMAHeadroom(),
+		"allocation CAS must not overwrite independently updated headroom")
+}
+
+func TestCheckpointStateRestoresPersistedRevisionIntoFreshState(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
+	require.NoError(t, err)
+	stateDir := t.TempDir()
+	config := &statedirectory.StateDirectoryConfiguration{StateFileDirectory: stateDir}
+
+	first, err := NewCheckpointState(
+		config, cpuPluginStateFileName, policyName, topology, false,
+		GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
+	require.NoError(t, err)
+	first.SetAllocationInfo("pod", "main", &AllocationInfo{
+		AllocationResult: machine.NewCPUSet(0),
+	}, true)
+	first.SetPodEntries(first.GetPodEntries(), true)
+	wantRevision := first.GetRevision()
+	require.Greater(t, wantRevision, uint64(1))
+
+	restarted, err := NewCheckpointState(
+		config, cpuPluginStateFileName, policyName, topology, false,
+		GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
+	require.NoError(t, err)
+	require.Equal(t, wantRevision, restarted.GetRevision(),
+		"a fresh state must restore the exact durable revision")
+}
+
 func TestCheckpointStateCommitAdvisorState(t *testing.T) {
 	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
 	require.NoError(t, err)

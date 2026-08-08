@@ -122,7 +122,6 @@ func (s *cpuPluginState) SetNUMAHeadroom(numaHeadroom map[int]float64) {
 	defer s.Unlock()
 
 	s.numaHeadroom = general.DeepCopyIntToFloat64Map(numaHeadroom)
-	s.revision++
 	klog.InfoS("[cpu_plugin] Updated cpu plugin numa headroom", "numaHeadroom", numaHeadroom)
 }
 
