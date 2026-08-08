@@ -465,9 +465,20 @@ func (p *DynamicPolicy) advisorSourceIsolationComponents(
 			if !ok {
 				continue
 			}
-			sourceByDomain[sourceDomain{
+			domain := sourceDomain{
 				poolName: poolName, resourcePackageName: resourcePackageName, numaID: descriptor.NUMAID,
-			}] = descriptor
+			}
+			if source, found := sourceByDomain[domain]; found && source.BlockID != descriptor.BlockID {
+				firstBlockID, secondBlockID := source.BlockID, descriptor.BlockID
+				if secondBlockID < firstBlockID {
+					firstBlockID, secondBlockID = secondBlockID, firstBlockID
+				}
+				return nil, nil, fmt.Errorf(
+					"source domain pool %q resource package %q numa %d has conflicting descriptors %q and %q",
+					poolName, resourcePackageName, descriptor.NUMAID, firstBlockID, secondBlockID,
+				)
+			}
+			sourceByDomain[domain] = descriptor
 		}
 	}
 
