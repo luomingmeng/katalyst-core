@@ -18,6 +18,7 @@ package state
 
 import (
 	"fmt"
+	"math"
 	"sync"
 
 	"k8s.io/klog/v2"
@@ -106,10 +107,21 @@ func (s *cpuPluginState) GetPodEntries() PodEntries {
 	return s.cpuPluginStateData.GetPodEntries().Clone()
 }
 
+func (s *cpuPluginState) revisionExhaustedLocked(operation string) bool {
+	if s.revision != math.MaxUint64 {
+		return false
+	}
+	general.Errorf("reject %s: %v", operation, ErrStateRevisionOverflow)
+	return true
+}
+
 func (s *cpuPluginState) SetMachineState(numaNodeMap NUMANodeMap) {
 	s.Lock()
 	defer s.Unlock()
 
+	if s.revisionExhaustedLocked("SetMachineState") {
+		return
+	}
 	s.machineState = numaNodeMap.Clone()
 	s.revision++
 	if klog.V(6).Enabled() {
@@ -132,6 +144,9 @@ func (s *cpuPluginState) SetAllocationInfo(podUID string, containerName string, 
 		general.Warningf("skip setting nil allocation info for pod %s container %s", podUID, containerName)
 		return
 	}
+	if s.revisionExhaustedLocked("SetAllocationInfo") {
+		return
+	}
 
 	if _, ok := s.podEntries[podUID]; !ok {
 		s.podEntries[podUID] = make(ContainerEntries)
@@ -149,6 +164,9 @@ func (s *cpuPluginState) SetPodEntries(podEntries PodEntries) {
 	s.Lock()
 	defer s.Unlock()
 
+	if s.revisionExhaustedLocked("SetPodEntries") {
+		return
+	}
 	s.podEntries = podEntries.Clone()
 	s.revision++
 	if klog.V(6).Enabled() {
@@ -161,6 +179,9 @@ func (s *cpuPluginState) SetAllowSharedCoresOverlapReclaimedCores(allowSharedCor
 	s.Lock()
 	defer s.Unlock()
 
+	if s.revisionExhaustedLocked("SetAllowSharedCoresOverlapReclaimedCores") {
+		return
+	}
 	klog.InfoS("[cpu_plugin] Updated allowSharedCoresOverlapReclaimedCores",
 		"allowSharedCoresOverlapReclaimedCores", allowSharedCoresOverlapReclaimedCores)
 
@@ -172,6 +193,9 @@ func (s *cpuPluginState) SetDisableDedicatedCoresOverlapReclaimedCores(disableDe
 	s.Lock()
 	defer s.Unlock()
 
+	if s.revisionExhaustedLocked("SetDisableDedicatedCoresOverlapReclaimedCores") {
+		return
+	}
 	klog.InfoS("[cpu_plugin] Updated disableDedicatedCoresOverlapReclaimedCores",
 		"disableDedicatedCoresOverlapReclaimedCores", disableDedicatedCoresOverlapReclaimedCores)
 
@@ -190,6 +214,9 @@ func (s *cpuPluginState) CommitAdvisorState(
 	s.Lock()
 	defer s.Unlock()
 
+	if s.revision == math.MaxUint64 {
+		return fmt.Errorf("%w: current=%d", ErrStateRevisionOverflow, s.revision)
+	}
 	s.podEntries = podEntries.Clone()
 	s.machineState = machineState.Clone()
 	s.allowSharedCoresOverlapReclaimedCores = allowSharedCoresOverlapReclaimedCores
@@ -214,6 +241,9 @@ func (s *cpuPluginState) CommitAdvisorStateIfRevision(
 	if s.revision != expectedRevision {
 		return fmt.Errorf("%w: expected=%d actual=%d", ErrStaleStateRevision, expectedRevision, s.revision)
 	}
+	if s.revision == math.MaxUint64 {
+		return fmt.Errorf("%w: current=%d", ErrStateRevisionOverflow, s.revision)
+	}
 
 	s.podEntries = podEntries.Clone()
 	s.machineState = machineState.Clone()
@@ -221,6 +251,23 @@ func (s *cpuPluginState) CommitAdvisorStateIfRevision(
 	s.disableDedicatedCoresOverlapReclaimedCores = disableDedicatedCoresOverlapReclaimedCores
 	s.revision++
 	return nil
+}
+
+func (s *cpuPluginState) restoreAdvisorState(
+	podEntries PodEntries,
+	machineState NUMANodeMap,
+	allowSharedCoresOverlapReclaimedCores bool,
+	disableDedicatedCoresOverlapReclaimedCores bool,
+	revision uint64,
+) {
+	s.Lock()
+	defer s.Unlock()
+
+	s.podEntries = podEntries.Clone()
+	s.machineState = machineState.Clone()
+	s.allowSharedCoresOverlapReclaimedCores = allowSharedCoresOverlapReclaimedCores
+	s.disableDedicatedCoresOverlapReclaimedCores = disableDedicatedCoresOverlapReclaimedCores
+	s.revision = revision
 }
 
 func (s *cpuPluginState) GetAllowSharedCoresOverlapReclaimedCores() bool {
@@ -251,6 +298,9 @@ func (s *cpuPluginState) Delete(podUID string, containerName string) {
 	if _, ok := s.podEntries[podUID]; !ok {
 		return
 	}
+	if s.revisionExhaustedLocked("Delete") {
+		return
+	}
 
 	delete(s.podEntries[podUID], containerName)
 	if len(s.podEntries[podUID]) == 0 {
@@ -266,6 +316,9 @@ func (s *cpuPluginState) ClearState() {
 	s.Lock()
 	defer s.Unlock()
 
+	if s.revisionExhaustedLocked("ClearState") {
+		return
+	}
 	s.machineState = GetDefaultMachineState(s.cpuTopology)
 	s.socketTopology = s.cpuTopology.GetSocketTopology()
 	s.podEntries = make(PodEntries)

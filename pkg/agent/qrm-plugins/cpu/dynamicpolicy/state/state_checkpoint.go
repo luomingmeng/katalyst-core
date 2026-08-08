@@ -296,6 +296,7 @@ func (sc *stateCheckpoint) CommitAdvisorState(
 	oldMachineState := sc.cache.GetMachineState()
 	oldAllowOverlap := sc.cache.GetAllowSharedCoresOverlapReclaimedCores()
 	oldDisableDedicatedOverlap := sc.cache.GetDisableDedicatedCoresOverlapReclaimedCores()
+	oldRevision := sc.cache.GetRevision()
 
 	if err := sc.cache.CommitAdvisorState(
 		podEntries,
@@ -310,7 +311,8 @@ func (sc *stateCheckpoint) CommitAdvisorState(
 		return nil
 	}
 	if err := sc.storeState(); err != nil {
-		_ = sc.cache.CommitAdvisorState(oldPodEntries, oldMachineState, oldAllowOverlap, oldDisableDedicatedOverlap, false)
+		sc.cache.restoreAdvisorState(
+			oldPodEntries, oldMachineState, oldAllowOverlap, oldDisableDedicatedOverlap, oldRevision)
 		return err
 	}
 	return nil
@@ -331,6 +333,7 @@ func (sc *stateCheckpoint) CommitAdvisorStateIfRevision(
 	oldMachineState := sc.cache.GetMachineState()
 	oldAllowOverlap := sc.cache.GetAllowSharedCoresOverlapReclaimedCores()
 	oldDisableDedicatedOverlap := sc.cache.GetDisableDedicatedCoresOverlapReclaimedCores()
+	oldRevision := sc.cache.GetRevision()
 
 	if err := sc.cache.CommitAdvisorStateIfRevision(
 		expectedRevision,
@@ -346,7 +349,8 @@ func (sc *stateCheckpoint) CommitAdvisorStateIfRevision(
 		return nil
 	}
 	if err := sc.storeState(); err != nil {
-		_ = sc.cache.CommitAdvisorState(oldPodEntries, oldMachineState, oldAllowOverlap, oldDisableDedicatedOverlap, false)
+		sc.cache.restoreAdvisorState(
+			oldPodEntries, oldMachineState, oldAllowOverlap, oldDisableDedicatedOverlap, oldRevision)
 		return err
 	}
 	return nil

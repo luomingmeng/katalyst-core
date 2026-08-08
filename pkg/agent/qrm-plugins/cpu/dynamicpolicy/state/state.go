@@ -897,7 +897,8 @@ type ReadonlyState interface {
 type GenerateMachineStateFromPodEntriesFunc func(topology *machine.CPUTopology, podEntries PodEntries, originMachineState NUMANodeMap) (NUMANodeMap, error)
 
 var (
-	ErrStaleStateRevision = errors.New("stale cpu plugin state revision")
+	ErrStaleStateRevision    = errors.New("stale cpu plugin state revision")
+	ErrStateRevisionOverflow = errors.New("cpu plugin state revision overflow")
 
 	readonlyStateLock sync.RWMutex
 	readonlyState     ReadonlyState
