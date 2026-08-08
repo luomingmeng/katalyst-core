@@ -30,6 +30,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation/finders/feature_cpu"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
+	resourcepackage "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 )
 
 func TestDeriveAdvisorIsolationSourcePool(t *testing.T) {
@@ -836,4 +837,175 @@ func TestGenerateBlockCPUSetDisjointPlannerKeepsSourceAndIsolationTogether(t *te
 	require.Equal(t, 1, oldSource.Difference(shrunk["rotated-source"]).
 		Union(shrunk["rotated-source"].Difference(oldSource)).Size())
 	require.Equal(t, oldIsolation, shrunk["rotated-isolation"])
+}
+
+func TestAdvisorSourceIsolationComponentsScopeSourceByNUMAAndResourcePackage(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+
+	const isolationPool = "isolation-workload"
+	p.state.SetPodEntries(state.PodEntries{
+		"pod-a0": {"main": &state.AllocationInfo{AllocationMeta: commonstate.AllocationMeta{
+			QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+			OwnerPoolName: resourcepackage.WrapOwnerPoolName(isolationPool, "rp-a"),
+			Annotations:   map[string]string{apiconsts.PodAnnotationCPUEnhancementCPUSet: "source"},
+		}}},
+		"pod-a1": {"main": &state.AllocationInfo{AllocationMeta: commonstate.AllocationMeta{
+			QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+			OwnerPoolName: resourcepackage.WrapOwnerPoolName(isolationPool, "rp-a"),
+			Annotations:   map[string]string{apiconsts.PodAnnotationCPUEnhancementCPUSet: "source"},
+		}}},
+		"pod-b0": {"main": &state.AllocationInfo{AllocationMeta: commonstate.AllocationMeta{
+			QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+			OwnerPoolName: resourcepackage.WrapOwnerPoolName(isolationPool, "rp-b"),
+			Annotations:   map[string]string{apiconsts.PodAnnotationCPUEnhancementCPUSet: "source"},
+		}}},
+	}, false)
+
+	owner := func(pool, entry, rp string) string {
+		return canonicalAdvisorBlockOwner(pool, entry, "main", rp)
+	}
+	descriptors := []advisorBlockDescriptor{
+		{BlockID: "source-a0", Class: advisorBlockClassShared, NUMAID: 0, Owners: []string{owner("source", "source-a0", "rp-a")}, ComponentKey: "source-a0"},
+		{BlockID: "isolation-a0", Class: advisorBlockClassShared, NUMAID: 0, Owners: []string{owner(isolationPool, "pod-a0", "rp-a")}, ComponentKey: "isolation-a0"},
+		{BlockID: "source-b0", Class: advisorBlockClassShared, NUMAID: 0, Owners: []string{owner("source", "source-b0", "rp-b")}, ComponentKey: "source-b0"},
+		{BlockID: "isolation-b0", Class: advisorBlockClassShared, NUMAID: 0, Owners: []string{owner(isolationPool, "pod-b0", "rp-b")}, ComponentKey: "isolation-b0"},
+		{BlockID: "source-a1", Class: advisorBlockClassShared, NUMAID: 1, Owners: []string{owner("source", "source-a1", "rp-a")}, ComponentKey: "source-a1"},
+		{BlockID: "isolation-a1", Class: advisorBlockClassShared, NUMAID: 1, Owners: []string{owner(isolationPool, "pod-a1", "rp-a")}, ComponentKey: "isolation-a1"},
+	}
+	blockByID := map[string]*advisorapi.BlockInfo{
+		"isolation-a0": {OwnerPoolEntryMap: map[string]advisorapi.BlockEntry{
+			resourcepackage.WrapOwnerPoolName(isolationPool, "rp-a"): {EntryName: "pod-a0", SubEntryName: "main"},
+		}},
+		"isolation-a1": {OwnerPoolEntryMap: map[string]advisorapi.BlockEntry{
+			resourcepackage.WrapOwnerPoolName(isolationPool, "rp-a"): {EntryName: "pod-a1", SubEntryName: "main"},
+		}},
+		"isolation-b0": {OwnerPoolEntryMap: map[string]advisorapi.BlockEntry{
+			resourcepackage.WrapOwnerPoolName(isolationPool, "rp-b"): {EntryName: "pod-b0", SubEntryName: "main"},
+		}},
+	}
+
+	keys, members := p.advisorSourceIsolationComponents(descriptors, blockByID)
+	require.Equal(t, []string{"source-a0", "source-b0", "source-a1"}, keys)
+	require.ElementsMatch(t, []string{"source-a0", "isolation-a0"}, advisorDescriptorBlockIDs(members["source-a0"]))
+	require.ElementsMatch(t, []string{"source-b0", "isolation-b0"}, advisorDescriptorBlockIDs(members["source-b0"]))
+	require.ElementsMatch(t, []string{"source-a1", "isolation-a1"}, advisorDescriptorBlockIDs(members["source-a1"]))
+}
+
+func TestGenerateBlockCPUSetDisjointPlannerAllocatesRealNUMAComponentBeforeFake(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	p.state.SetPodEntries(state.PodEntries{
+		"pod-real": {"main": &state.AllocationInfo{AllocationMeta: commonstate.AllocationMeta{
+			QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+			OwnerPoolName: "isolation-real",
+			Annotations:   map[string]string{apiconsts.PodAnnotationCPUEnhancementCPUSet: "source-real"},
+		}}},
+		"pod-fake": {"main": &state.AllocationInfo{AllocationMeta: commonstate.AllocationMeta{
+			QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+			OwnerPoolName: "isolation-fake",
+			Annotations:   map[string]string{apiconsts.PodAnnotationCPUEnhancementCPUSet: "source-fake"},
+		}}},
+	}, false)
+
+	resp := advisorSourceIsolationTestResponse(map[string]struct {
+		sourcePool     string
+		isolationPool  string
+		pod            string
+		numaID         int64
+		sourceBlock    string
+		isolationBlock string
+	}{
+		"real": {"source-real", "isolation-real", "pod-real", 0, "z-real-source", "z-real-isolation"},
+		"fake": {"source-fake", "isolation-fake", "pod-fake", commonstate.FakedNUMAID, "a-fake-source", "a-fake-isolation"},
+	})
+	featureGates := map[string]*advisorsvc.FeatureGate{
+		feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition: {
+			Name: feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
+		},
+	}
+
+	got, err := p.generateBlockCPUSet(resp, featureGates)
+	require.NoError(t, err)
+	realUnion := got["z-real-source"].Union(got["z-real-isolation"])
+	fakeUnion := got["a-fake-source"].Union(got["a-fake-isolation"])
+	require.Equal(t, cpuTopology.CPUDetails.CPUsInNUMANodes(0), realUnion)
+	require.Equal(t, cpuTopology.CPUDetails.CPUsInNUMANodes(1), fakeUnion)
+}
+
+func TestSolveAdvisorDescriptorPhaseBlockIDRotationPreservesGrowOwnerUnion(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	allCPUs := cpuTopology.CPUDetails.CPUs()
+
+	solve := func(firstID, secondID string) map[string]machine.CPUSet {
+		descriptors := []advisorBlockDescriptor{
+			{BlockID: firstID, Owners: []string{"owner-a"}, Class: advisorBlockClassShared, NUMAID: commonstate.FakedNUMAID,
+				Quantity: 4, ComponentKey: "component-a", Eligible: allCPUs, OldPreferred: machine.NewCPUSet(0)},
+			{BlockID: secondID, Owners: []string{"owner-b"}, Class: advisorBlockClassShared, NUMAID: commonstate.FakedNUMAID,
+				Quantity: 4, ComponentKey: "component-b", Eligible: allCPUs, OldPreferred: machine.NewCPUSet(1)},
+		}
+		result := advisorapi.NewBlockCPUSet()
+		_, err := p.solveAdvisorDescriptorPhase(descriptors, allCPUs, result, false)
+		require.NoError(t, err)
+		return map[string]machine.CPUSet{
+			"owner-a": result[firstID],
+			"owner-b": result[secondID],
+		}
+	}
+
+	require.Equal(t, solve("z-rotated-a", "a-rotated-b"), solve("a-next-a", "z-next-b"))
+}
+
+func advisorDescriptorBlockIDs(descriptors []advisorBlockDescriptor) []string {
+	result := make([]string, 0, len(descriptors))
+	for _, descriptor := range descriptors {
+		result = append(result, descriptor.BlockID)
+	}
+	return result
+}
+
+func advisorSourceIsolationTestResponse(components map[string]struct {
+	sourcePool     string
+	isolationPool  string
+	pod            string
+	numaID         int64
+	sourceBlock    string
+	isolationBlock string
+}) *advisorapi.ListAndWatchResponse {
+	resp := &advisorapi.ListAndWatchResponse{
+		DisableDedicatedCoresOverlapReclaimedCores: true,
+		Entries: make(map[string]*advisorapi.CalculationEntries),
+	}
+	for _, component := range components {
+		resp.Entries[component.sourcePool] = &advisorapi.CalculationEntries{Entries: map[string]*advisorapi.CalculationInfo{
+			commonstate.FakedContainerName: {
+				OwnerPoolName: component.sourcePool,
+				CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+					component.numaID: {Blocks: []*advisorapi.Block{{BlockId: component.sourceBlock, Result: 4}}},
+				},
+			},
+		}}
+		resp.Entries[component.pod] = &advisorapi.CalculationEntries{Entries: map[string]*advisorapi.CalculationInfo{
+			"main": {
+				OwnerPoolName: component.isolationPool,
+				CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+					component.numaID: {Blocks: []*advisorapi.Block{{BlockId: component.isolationBlock, Result: 4}}},
+				},
+			},
+		}}
+	}
+	return resp
 }

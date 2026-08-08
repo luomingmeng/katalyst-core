@@ -28,23 +28,34 @@ import (
 	cpuutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/util"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
+	resourcepackage "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 )
 
 // deriveAdvisorIsolationSourcePool derives the source share pool for a shared_cores
 // isolation block from the advisor block owner entries and the current state. It returns
 // false on derivation failure so callers can preserve the legacy allocation path.
 func deriveAdvisorIsolationSourcePool(block *advisorapi.BlockInfo, entries state.PodEntries) (string, bool) {
+	sourcePool, _, ok := deriveAdvisorIsolationSourceDomain(block, entries)
+	return sourcePool, ok
+}
+
+func deriveAdvisorIsolationSourceDomain(
+	block *advisorapi.BlockInfo,
+	entries state.PodEntries,
+) (string, string, bool) {
 	if block == nil {
-		return "", false
+		return "", "", false
 	}
 
 	for ownerPoolName, entry := range block.OwnerPoolEntryMap {
-		if !commonstate.IsIsolationPool(ownerPoolName) {
+		poolName, resourcePackageName := resourcepackage.UnwrapOwnerPoolName(ownerPoolName)
+		if !commonstate.IsIsolationPool(poolName) && !commonstate.IsShareNUMABindingPool(poolName) {
 			continue
 		}
 
 		if allocationInfo := entries[entry.EntryName][entry.SubEntryName]; allocationInfo != nil {
-			return deriveIsolationSourceSharePool(allocationInfo)
+			sourcePool, ok := deriveIsolationSourceSharePool(allocationInfo)
+			return sourcePool, resourcePackageName, ok
 		}
 
 		for _, containerEntries := range entries {
@@ -52,15 +63,22 @@ func deriveAdvisorIsolationSourcePool(block *advisorapi.BlockInfo, entries state
 				continue
 			}
 			for _, allocationInfo := range containerEntries {
-				if allocationInfo == nil || allocationInfo.GetOwnerPoolName() != ownerPoolName {
+				if allocationInfo == nil {
 					continue
 				}
-				return deriveIsolationSourceSharePool(allocationInfo)
+				allocationPool, allocationResourcePackage := resourcepackage.UnwrapOwnerPoolName(
+					allocationInfo.GetOwnerPoolName(),
+				)
+				if allocationPool != poolName || allocationResourcePackage != resourcePackageName {
+					continue
+				}
+				sourcePool, ok := deriveIsolationSourceSharePool(allocationInfo)
+				return sourcePool, resourcePackageName, ok
 			}
 		}
 	}
 
-	return "", false
+	return "", "", false
 }
 
 // buildAdvisorSourceBlockByPool builds a source pool -> blockID mapping. dedicated,
@@ -376,25 +394,34 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhase(
 		return available, nil
 	}
 	demands := make([]partitionDemand, 0, len(descriptors))
+	blockIDByDemandKey := make(map[string]string, len(descriptors))
+	ordinalByStableKey := make(map[string]int, len(descriptors))
 	for _, descriptor := range descriptors {
 		class := descriptor.Class
 		if !preserveClass {
 			class = advisorBlockClassDedicated
 		}
+		stableKey := fmt.Sprintf("%s\x00%d\x00%s",
+			descriptor.ComponentKey, descriptor.Quantity, strings.Join(descriptor.Owners, "\x1f"))
+		ordinal := ordinalByStableKey[stableKey]
+		ordinalByStableKey[stableKey] = ordinal + 1
+		demandKey := fmt.Sprintf("%s\x00%d", stableKey, ordinal)
 		demands = append(demands, partitionDemand{
-			key:       descriptor.BlockID,
+			key:       demandKey,
 			quantity:  descriptor.Quantity,
 			eligible:  descriptor.Eligible.Intersection(available),
 			preferred: descriptor.OldPreferred,
 			class:     class,
 		})
+		blockIDByDemandKey[demandKey] = descriptor.BlockID
 	}
 	assignments, err := solveDisjointPartitions(demands, p.machineInfo.CPUTopology)
 	if err != nil {
 		return available, err
 	}
 	used := machine.NewCPUSet()
-	for blockID, cpus := range assignments {
+	for demandKey, cpus := range assignments {
+		blockID := blockIDByDemandKey[demandKey]
 		result[blockID] = cpus
 		used = used.Union(cpus)
 	}
@@ -424,13 +451,25 @@ func (p *DynamicPolicy) advisorSourceIsolationComponents(
 	descriptors []advisorBlockDescriptor,
 	blockByID map[string]*advisorapi.BlockInfo,
 ) ([]string, map[string][]advisorBlockDescriptor) {
-	sourceByPool := make(map[string]advisorBlockDescriptor)
+	type sourceDomain struct {
+		poolName            string
+		resourcePackageName string
+		numaID              int
+	}
+
+	sourceByDomain := make(map[sourceDomain]advisorBlockDescriptor)
 	for _, descriptor := range descriptors {
 		if descriptor.Class != advisorBlockClassShared || advisorDescriptorIsIsolation(descriptor) {
 			continue
 		}
-		for _, poolName := range advisorDescriptorPoolNames(descriptor) {
-			sourceByPool[poolName] = descriptor
+		for _, owner := range descriptor.Owners {
+			poolName, resourcePackageName, ok := advisorDescriptorOwnerDomain(owner)
+			if !ok {
+				continue
+			}
+			sourceByDomain[sourceDomain{
+				poolName: poolName, resourcePackageName: resourcePackageName, numaID: descriptor.NUMAID,
+			}] = descriptor
 		}
 	}
 
@@ -439,11 +478,15 @@ func (p *DynamicPolicy) advisorSourceIsolationComponents(
 		if descriptor.Class != advisorBlockClassShared || !advisorDescriptorIsIsolation(descriptor) {
 			continue
 		}
-		sourcePool, ok := deriveAdvisorIsolationSourcePool(blockByID[descriptor.BlockID], p.state.GetPodEntries())
+		sourcePool, resourcePackageName, ok := deriveAdvisorIsolationSourceDomain(
+			blockByID[descriptor.BlockID], p.state.GetPodEntries(),
+		)
 		if !ok {
 			continue
 		}
-		source, ok := sourceByPool[sourcePool]
+		source, ok := sourceByDomain[sourceDomain{
+			poolName: sourcePool, resourcePackageName: resourcePackageName, numaID: descriptor.NUMAID,
+		}]
 		if !ok {
 			continue
 		}
@@ -454,13 +497,15 @@ func (p *DynamicPolicy) advisorSourceIsolationComponents(
 	}
 
 	keys := make([]string, 0, len(members))
-	for key := range members {
-		keys = append(keys, key)
-		sort.Slice(members[key], func(i, j int) bool {
-			return advisorBlockDescriptorLess(members[key][i], members[key][j])
+	for _, descriptor := range descriptors {
+		if _, found := members[descriptor.BlockID]; !found {
+			continue
+		}
+		keys = append(keys, descriptor.BlockID)
+		sort.Slice(members[descriptor.BlockID], func(i, j int) bool {
+			return advisorBlockDescriptorLess(members[descriptor.BlockID][i], members[descriptor.BlockID][j])
 		})
 	}
-	sort.Strings(keys)
 	return keys, members
 }
 
@@ -492,9 +537,20 @@ func filterAdvisorDescriptors(
 func advisorDescriptorPoolNames(descriptor advisorBlockDescriptor) []string {
 	pools := make([]string, 0, len(descriptor.Owners))
 	for _, owner := range descriptor.Owners {
-		pools = append(pools, strings.SplitN(owner, "\x00", 2)[0])
+		poolName, _, ok := advisorDescriptorOwnerDomain(owner)
+		if ok {
+			pools = append(pools, poolName)
+		}
 	}
 	return pools
+}
+
+func advisorDescriptorOwnerDomain(owner string) (string, string, bool) {
+	parts := strings.Split(owner, "\x00")
+	if len(parts) != 4 {
+		return "", "", false
+	}
+	return parts[0], parts[3], true
 }
 
 func advisorDescriptorIsIsolation(descriptor advisorBlockDescriptor) bool {
