@@ -31,9 +31,11 @@ import (
 type advisorBlockClass string
 
 const (
-	advisorBlockClassDedicated advisorBlockClass = "dedicated"
-	advisorBlockClassShared    advisorBlockClass = "shared"
-	advisorBlockClassReclaim   advisorBlockClass = "reclaim"
+	advisorBlockClassStatic           advisorBlockClass = "static"
+	advisorBlockClassMandatoryReclaim advisorBlockClass = "mandatory-reclaim"
+	advisorBlockClassDedicated        advisorBlockClass = "dedicated"
+	advisorBlockClassShared           advisorBlockClass = "shared"
+	advisorBlockClassReclaimOverlap   advisorBlockClass = "reclaim-overlap"
 )
 
 type advisorBlockDescriptor struct {
@@ -49,8 +51,7 @@ type advisorBlockDescriptor struct {
 
 type advisorBlockDescriptorBuilder struct {
 	advisorBlockDescriptor
-	ownerSeen       map[string]struct{}
-	resourcePackage string
+	ownerSeen map[string]struct{}
 }
 
 func buildAdvisorBlockDescriptors(
@@ -80,8 +81,8 @@ func buildAdvisorBlockDescriptors(
 				return nil, fmt.Errorf("entry %q sub-entry %q has nil calculation info", entryName, subEntryName)
 			}
 
-			ownerClass, ownerResourcePackage := classifyAdvisorBlockOwner(calculationInfo.OwnerPoolName)
-			ownerKey := canonicalAdvisorBlockOwner(calculationInfo.OwnerPoolName, entryName, subEntryName)
+			ownerPoolName, ownerResourcePackage := resourcepackage.UnwrapOwnerPoolName(calculationInfo.OwnerPoolName)
+			ownerKey := canonicalAdvisorBlockOwner(ownerPoolName, entryName, subEntryName, ownerResourcePackage)
 			for numaID64, result := range calculationInfo.CalculationResultsByNumas {
 				if result == nil {
 					return nil, fmt.Errorf("entry %q sub-entry %q NUMA %d has nil result", entryName, subEntryName, numaID64)
@@ -95,15 +96,6 @@ func buildAdvisorBlockDescriptors(
 				if err != nil {
 					return nil, err
 				}
-				ownerEligible := advisorBlockOwnerEligible(
-					ownerClass,
-					ownerResourcePackage,
-					numaCPUs,
-					allPinnedCPUs,
-					rpPinnedCPUSet,
-					nonReclaimableCPUSet,
-				)
-
 				for _, block := range result.Blocks {
 					if block == nil {
 						return nil, fmt.Errorf("entry %q sub-entry %q NUMA %d has nil block", entryName, subEntryName, numaID)
@@ -115,6 +107,18 @@ func buildAdvisorBlockDescriptors(
 					if err != nil {
 						return nil, fmt.Errorf("block %q: %w", block.BlockId, err)
 					}
+					ownerClass, err := classifyAdvisorBlockOwner(ownerPoolName, block.OverlapTargets)
+					if err != nil {
+						return nil, fmt.Errorf("block %q: %w", block.BlockId, err)
+					}
+					ownerEligible := advisorBlockOwnerEligible(
+						ownerClass,
+						ownerResourcePackage,
+						numaCPUs,
+						allPinnedCPUs,
+						rpPinnedCPUSet,
+						nonReclaimableCPUSet,
+					)
 
 					builder, found := builders[block.BlockId]
 					if !found {
@@ -127,8 +131,7 @@ func buildAdvisorBlockDescriptors(
 								Eligible:     ownerEligible.Clone(),
 								OldPreferred: machine.NewCPUSet(),
 							},
-							ownerSeen:       make(map[string]struct{}),
-							resourcePackage: ownerResourcePackage,
+							ownerSeen: make(map[string]struct{}),
 						}
 						builders[block.BlockId] = builder
 					} else {
@@ -137,14 +140,6 @@ func buildAdvisorBlockDescriptors(
 						}
 						if builder.Class != ownerClass {
 							return nil, fmt.Errorf("block %q aliases have incompatible owner classes", block.BlockId)
-						}
-						if builder.resourcePackage != "" && ownerResourcePackage != "" &&
-							builder.resourcePackage != ownerResourcePackage {
-							return nil, fmt.Errorf("block %q aliases use incompatible resource packages %q and %q",
-								block.BlockId, builder.resourcePackage, ownerResourcePackage)
-						}
-						if builder.resourcePackage == "" {
-							builder.resourcePackage = ownerResourcePackage
 						}
 						builder.Eligible = builder.Eligible.Intersection(ownerEligible)
 					}
@@ -164,8 +159,8 @@ func buildAdvisorBlockDescriptors(
 	descriptors := make([]advisorBlockDescriptor, 0, len(builders))
 	for _, builder := range builders {
 		sort.Strings(builder.Owners)
-		builder.ComponentKey = fmt.Sprintf("%s|%s|%d|%d",
-			builder.Class, strings.Join(builder.Owners, "\x1f"), builder.NUMAID, builder.Quantity)
+		builder.ComponentKey = fmt.Sprintf("%s|%s|%d",
+			builder.Class, strings.Join(builder.Owners, "\x1f"), builder.NUMAID)
 		if builder.Eligible.Size() < builder.Quantity {
 			return nil, fmt.Errorf("block %q eligible capacity %d is smaller than quantity %d",
 				builder.BlockID, builder.Eligible.Size(), builder.Quantity)
@@ -175,42 +170,69 @@ func buildAdvisorBlockDescriptors(
 	}
 
 	sort.Slice(descriptors, func(i, j int) bool {
-		left, right := descriptors[i], descriptors[j]
-		leftOwners, rightOwners := strings.Join(left.Owners, "\x1f"), strings.Join(right.Owners, "\x1f")
-		if leftOwners != rightOwners {
-			return leftOwners < rightOwners
-		}
-		if left.Class != right.Class {
-			return advisorBlockClassRank(left.Class) < advisorBlockClassRank(right.Class)
-		}
-		if left.NUMAID != right.NUMAID {
-			return left.NUMAID < right.NUMAID
-		}
-		if left.Quantity != right.Quantity {
-			return left.Quantity < right.Quantity
-		}
-		if left.ComponentKey != right.ComponentKey {
-			return left.ComponentKey < right.ComponentKey
-		}
-		return left.BlockID < right.BlockID
+		return advisorBlockDescriptorLess(descriptors[i], descriptors[j])
 	})
 	return descriptors, nil
 }
 
-func classifyAdvisorBlockOwner(ownerPoolName string) (advisorBlockClass, string) {
-	poolName, packageName := resourcepackage.UnwrapOwnerPoolName(ownerPoolName)
-	switch poolName {
+func advisorBlockDescriptorLess(left, right advisorBlockDescriptor) bool {
+	if left.NUMAID != right.NUMAID {
+		return left.NUMAID < right.NUMAID
+	}
+	if left.Class != right.Class {
+		return advisorBlockClassRank(left.Class) < advisorBlockClassRank(right.Class)
+	}
+	if left.ComponentKey != right.ComponentKey {
+		return left.ComponentKey < right.ComponentKey
+	}
+	if left.Quantity != right.Quantity {
+		return left.Quantity < right.Quantity
+	}
+	leftAliases, rightAliases := strings.Join(left.Owners, "\x1f"), strings.Join(right.Owners, "\x1f")
+	if leftAliases != rightAliases {
+		return leftAliases < rightAliases
+	}
+	return left.BlockID < right.BlockID
+}
+
+func classifyAdvisorBlockOwner(
+	poolName string,
+	overlapTargets []*advisorapi.OverlapTarget,
+) (advisorBlockClass, error) {
+	if poolName == "" {
+		return "", fmt.Errorf("cannot classify empty owner pool")
+	}
+	for _, target := range overlapTargets {
+		if target == nil {
+			return "", fmt.Errorf("cannot classify nil overlap target")
+		}
+	}
+
+	poolType := commonstate.GetPoolType(poolName)
+	switch poolType {
+	case commonstate.PoolNameReserve, commonstate.PoolNamePrefixSystem,
+		commonstate.PoolNameInterrupt, commonstate.PoolNameFallback:
+		if len(overlapTargets) != 0 {
+			return "", fmt.Errorf("cannot classify static owner pool %q with overlap targets", poolName)
+		}
+		return advisorBlockClassStatic, nil
 	case commonstate.PoolNameDedicated:
-		return advisorBlockClassDedicated, packageName
+		return advisorBlockClassDedicated, nil
 	case commonstate.PoolNameReclaim:
-		return advisorBlockClassReclaim, packageName
+		if len(overlapTargets) == 0 {
+			return advisorBlockClassMandatoryReclaim, nil
+		}
+		return advisorBlockClassReclaimOverlap, nil
 	default:
-		return advisorBlockClassShared, packageName
+		if len(overlapTargets) != 0 {
+			return advisorBlockClassReclaimOverlap, nil
+		}
+		return advisorBlockClassShared, nil
 	}
 }
 
-func canonicalAdvisorBlockOwner(ownerPoolName, entryName, subEntryName string) string {
-	return ownerPoolName + "\x00" + entryName + "\x00" + subEntryName
+func canonicalAdvisorBlockOwner(poolName, entryName, subEntryName, resourcePackageName string) string {
+	return poolName + "\x00" + entryName + "\x00" + subEntryName + "\x00" + resourcePackageName
 }
 
 func advisorBlockNUMACPUSet(allCPUs machine.CPUSet, cpuDetails machine.CPUDetails, numaID int) (machine.CPUSet, error) {
@@ -232,7 +254,7 @@ func advisorBlockOwnerEligible(
 	rpPinnedCPUSet map[string]machine.CPUSet,
 	nonReclaimableCPUSet machine.CPUSet,
 ) machine.CPUSet {
-	if class == advisorBlockClassReclaim {
+	if class == advisorBlockClassMandatoryReclaim || class == advisorBlockClassReclaimOverlap {
 		return numaCPUs.Difference(nonReclaimableCPUSet)
 	}
 	if resourcePackageName != "" && !rpPinnedCPUSet[resourcePackageName].IsEmpty() {
@@ -272,13 +294,17 @@ func uint64ToAdvisorBlockQuantity(quantity uint64) (int, error) {
 
 func advisorBlockClassRank(class advisorBlockClass) int {
 	switch class {
-	case advisorBlockClassDedicated:
+	case advisorBlockClassStatic:
 		return 0
-	case advisorBlockClassShared:
+	case advisorBlockClassMandatoryReclaim:
 		return 1
-	case advisorBlockClassReclaim:
+	case advisorBlockClassDedicated:
 		return 2
-	default:
+	case advisorBlockClassShared:
 		return 3
+	case advisorBlockClassReclaimOverlap:
+		return 4
+	default:
+		return 5
 	}
 }
