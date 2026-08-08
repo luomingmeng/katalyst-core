@@ -610,6 +610,57 @@ flowchart TD
 - `cpuset.mems` 可独立 reconcile，但不能改变 CPU ownership phase；
 - 每个插件分别读 cgroup 会重新引入多个 applied-state owner，因此禁止。
 
+## CPU Advisor disjoint partition 升级与回滚
+
+Dedicated/Reclaim disjoint partition 使用协商能力
+`DedicatedReclaimDisjointPartition`（wire name：
+`feature_gate_dedicated_reclaim_disjoint_partition`）。普通 proto3 `bool` 不能区分旧端未发送与明确
+`false`，因此 `DD=true` 不能只依赖 response bool，必须同时满足同步 `GetAdvice` 请求/响应完成能力协商。
+`AllowSharedCoresOverlapReclaimedCores`（AS）与 DD 是独立开关，任一开关切换都不得覆盖另一个开关的
+desired mode。
+
+升级顺序固定为：
+
+1. 先升级 Sysadvisor，使其在 QRM 未请求 capability 时继续输出 `DD=false` legacy advice。
+2. 再升级 QRM，使其请求并校验 capability；此时保持 DD 配置为 `false`。
+3. 确认双端 mutually supported 后再逐步启用 DD；首个 `DD=true` frame 由新 planner 生成完整
+   dedicated/reclaim partition。
+4. 观察 checkpoint、pending reconcile、stale revision 和 cgroup apply 指标后再扩大范围。
+
+回滚按相反的语义顺序执行：先把 DD 置为 `false`，确认 QRM 已提交 legacy frame，再回滚任一端。
+`DD=true -> false` 恢复 whole-NUMA dedicated/reclaim overlap、旧 quantity validator、旧 quota 和
+overlap metadata；无需 capability。`DD=false -> true` 时若 capability 缺失、frame 来自 legacy
+ListAndWatch 或 negotiated mode 已变化，整帧 fail-closed，保留上一个 desired state 并重试。
+
+### Desired、WAL 与 applied 边界
+
+CPU plugin checkpoint 中的 PodEntries、MachineState、AS/DD mode 和 revision 是 **desired state**。
+cgroup 文件和 Bulkhead `AppliedView` 是 **applied state**。Advisor frame 的 durable 顺序为：
+
+```text
+validate frame and negotiated mode
+-> write WAL staging target for revision N+1
+-> CAS commit desired state/checkpoint at revision N+1
+-> promote/publish WAL target
+-> apply headroom, cgroup config and cpuset handlers
+-> verify applied state
+-> remove WAL target
+```
+
+WAL 保存完整 Advisor response 和目标 revision。进程在 desired commit 前退出时，staging target
+不匹配主 checkpoint revision，启动恢复时必须丢弃；进程在 desired commit 后、applied 完成前退出时，
+staging/active target 与主 checkpoint revision 匹配，启动后恢复为 pending reconcile。恢复过程同时
+保留已提交的 dedicated/reclaim partition，不重新运行 planner，也不根据 BlockId 或 map 遍历顺序换核。
+
+cgroup apply 失败不回滚 durable desired state：保留 WAL、标记 pending reconcile，并基于最新 revision
+重试。只有 applied 成功且 fresh snapshot 与 desired 收敛后才发布新 `AppliedView` 并清理 WAL。
+checkpoint/WAL 写失败、revision CAS 失败、stale frame、capability 缺失或 partition 校验失败时，
+不得提交部分 desired state，也不得推进 applied state。旧 revision 的 retry 发现更新 target 后立即停止，
+避免 stale frame 覆盖新 desired state。
+
+`DD=false` 始终走 legacy planner/apply 路径；该路径是兼容契约而不是 disjoint planner 的降级分支。
+禁止在 `DD=true` 失败后静默缩小 reclaim reserve、临时恢复 overlap 或把新 response 当 legacy 接受。
+
 ## 已实现组件
 
 当前实现按以下依赖链组织：
