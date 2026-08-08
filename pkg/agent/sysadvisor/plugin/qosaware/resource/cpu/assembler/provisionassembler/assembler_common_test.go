@@ -1755,6 +1755,94 @@ func runOrdinaryOverlapAssemblerCase(
 	return result, err
 }
 
+func TestAssembleProvisionMultiDedicatedDomainsIsDeterministic(t *testing.T) {
+	t.Parallel()
+
+	type regionSpec struct {
+		name, owner, pod string
+		numa             *int
+	}
+	realNUMA := 0
+	specs := []regionSpec{
+		{name: "real-pinned", owner: "rp-real/dedicated", pod: "pod-real-pinned", numa: &realNUMA},
+		{name: "real-unpinned", owner: "dedicated-real", pod: "pod-real-unpinned", numa: &realNUMA},
+		{name: "fake-rp-a", owner: "rp-a/dedicated", pod: "pod-fake-rp-a"},
+		{name: "fake-rp-b", owner: "rp-b/dedicated", pod: "pod-fake-rp-b"},
+		{name: "fake-unpinned-a", owner: "dedicated-fake-a", pod: "pod-fake-unpinned-a"},
+		{name: "fake-unpinned-b", owner: "dedicated-fake-b", pod: "pod-fake-unpinned-b"},
+	}
+	wantEntries := map[string]map[int]types.CPUResource{
+		commonstate.PoolNameReserve: {commonstate.FakedNUMAID: {Size: 5, Quota: -1}},
+		commonstate.PoolNameReclaim: {
+			0:                       {Size: 4, Quota: -1},
+			commonstate.FakedNUMAID: {Size: 5, Quota: -1},
+		},
+		"pod-real-pinned":     {0: {Size: 4, Quota: -1}},
+		"pod-real-unpinned":   {0: {Size: 4, Quota: -1}},
+		"pod-fake-rp-a":       {commonstate.FakedNUMAID: {Size: 4, Quota: -1}},
+		"pod-fake-rp-b":       {commonstate.FakedNUMAID: {Size: 4, Quota: -1}},
+		"pod-fake-unpinned-a": {commonstate.FakedNUMAID: {Size: 3, Quota: -1}},
+		"pod-fake-unpinned-b": {commonstate.FakedNUMAID: {Size: 2, Quota: -1}},
+	}
+
+	for iteration := 0; iteration < 128; iteration++ {
+		regionMap := make(map[string]region.QoSRegion, len(specs))
+		for offset := range specs {
+			index := offset
+			if iteration%2 == 1 {
+				index = len(specs) - 1 - offset
+			}
+			spec := specs[index]
+			r := NewFakeRegion(spec.name, configapi.QoSRegionTypeDedicated, spec.owner)
+			if spec.numa != nil {
+				r.SetBindingNumas(machine.NewCPUSet(*spec.numa))
+				r.SetIsNumaBinding(true)
+			}
+			r.enableReclaim = true
+			r.podsRequest = 8
+			r.SetPods(types.PodSet{spec.pod: sets.NewString("main", "sidecar")})
+			r.SetProvision(types.ControlKnob{
+				configapi.ControlKnobNonReclaimedCPURequirement: {Value: 4},
+			})
+			regionMap[r.Name()] = r
+		}
+
+		conf := generateTestConf(t, true, "")
+		metaReader := metacache.NewDummyMetaCacheImp()
+		require.NoError(t, metaReader.SetResourcePackageConfig(types.ResourcePackageConfig{
+			0: {
+				"rp-real": {PinnedCPUSet: machine.MustParse("0-5")},
+			},
+			1: {
+				"rp-a": {PinnedCPUSet: machine.MustParse("12-17")},
+				"rp-b": {PinnedCPUSet: machine.MustParse("18-23")},
+			},
+		}))
+		require.NoError(t, metaReader.SetPoolInfo(commonstate.PoolNameReserve, &types.PoolInfo{
+			PoolName: commonstate.PoolNameReserve,
+			TopologyAwareAssignments: map[int]machine.CPUSet{
+				0: machine.MustParse("0,6"),
+				1: machine.MustParse("12,18,24"),
+			},
+		}))
+		reservedForReclaim := map[int]int{0: 2, 1: 3}
+		numaAvailable := map[int]int{0: 12, 1: 18}
+		nonBindingNUMAs := machine.NewCPUSet(1)
+		allowSharedOverlap := false
+		disableDedicatedOverlap := true
+		assembler := NewProvisionAssemblerCommon(
+			conf, nil, &regionMap, &reservedForReclaim, &numaAvailable, &nonBindingNUMAs,
+			&allowSharedOverlap, &disableDedicatedOverlap, metaReader, nil, metrics.DummyMetrics{},
+		)
+
+		result, err := assembler.AssembleProvision()
+		require.NoError(t, err, "iteration %d", iteration)
+		require.Equal(t, wantEntries, result.PoolEntries, "iteration %d", iteration)
+		require.Empty(t, result.PoolOverlapInfo, "iteration %d", iteration)
+		require.Empty(t, result.PoolOverlapPodContainerInfo, "iteration %d", iteration)
+	}
+}
+
 func TestClampByReclaimedCPUMaxRatio(t *testing.T) {
 	t.Parallel()
 
