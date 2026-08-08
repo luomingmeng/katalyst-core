@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -314,18 +315,83 @@ func (p *DynamicPolicy) publishAdvisorPostCommitTarget(
 	resp *advisorapi.ListAndWatchResponse,
 	revision uint64,
 ) *advisorPostCommitTarget {
+	target, err := p.prepareAdvisorPostCommitTarget(resp, revision)
+	if err != nil {
+		general.Errorf("persist advisor post-commit target for revision %d failed: %v", revision, err)
+		target = cloneAdvisorPostCommitTarget(resp, revision)
+	}
+	p.publishPreparedAdvisorPostCommitTarget(target)
+	return target
+}
+
+func cloneAdvisorPostCommitTarget(
+	resp *advisorapi.ListAndWatchResponse,
+	revision uint64,
+) *advisorPostCommitTarget {
 	cloned := &advisorapi.ListAndWatchResponse{}
 	if resp != nil {
 		cloned = proto.Clone(resp).(*advisorapi.ListAndWatchResponse)
 	}
-	target := &advisorPostCommitTarget{revision: revision, response: cloned}
-	p.cpuSetAdjustmentRetryMu.Lock()
-	if err := p.storeAdvisorPostCommitTarget(target); err != nil {
-		general.Errorf("persist advisor post-commit target for revision %d failed: %v", revision, err)
+	return &advisorPostCommitTarget{revision: revision, response: cloned}
+}
+
+func nextAdvisorRevision(revision uint64) (uint64, error) {
+	if revision == math.MaxUint64 {
+		return 0, fmt.Errorf("state revision overflow at %d", revision)
 	}
+	return revision + 1, nil
+}
+
+func (p *DynamicPolicy) prepareAdvisorPostCommitTarget(
+	resp *advisorapi.ListAndWatchResponse,
+	postCommitRevision uint64,
+) (*advisorPostCommitTarget, error) {
+	target := cloneAdvisorPostCommitTarget(resp, postCommitRevision)
+	if err := p.storeAdvisorPostCommitTarget(target); err != nil {
+		return nil, err
+	}
+	return target, nil
+}
+
+func (p *DynamicPolicy) publishPreparedAdvisorPostCommitTarget(target *advisorPostCommitTarget) {
+	p.cpuSetAdjustmentRetryMu.Lock()
 	p.advisorPostCommitTarget = target
 	p.cpuSetAdjustmentRetryMu.Unlock()
-	return target
+}
+
+func (p *DynamicPolicy) commitAdvisorResponseWithWriteAhead(
+	resp *advisorapi.ListAndWatchResponse,
+	preCommitRevision uint64,
+	commitDesired func() error,
+) (*advisorPostCommitTarget, error) {
+	postCommitRevision, err := nextAdvisorRevision(preCommitRevision)
+	if err != nil {
+		return nil, err
+	}
+	target, err := p.prepareAdvisorPostCommitTarget(resp, postCommitRevision)
+	if err != nil {
+		return nil, fmt.Errorf("persist advisor post-commit target: %w", err)
+	}
+	if err := commitDesired(); err != nil {
+		if removeErr := p.removeAdvisorPostCommitCheckpoint(); removeErr != nil {
+			return nil, fmt.Errorf("%w; remove uncommitted advisor target: %v", err, removeErr)
+		}
+		return nil, err
+	}
+	if p.state == nil || p.state.GetRevision() != postCommitRevision {
+		actualRevision := uint64(0)
+		if p.state != nil {
+			actualRevision = p.state.GetRevision()
+		}
+		if removeErr := p.removeAdvisorPostCommitCheckpoint(); removeErr != nil {
+			return nil, fmt.Errorf("advisor desired commit revision mismatch: expected=%d actual=%d; remove target: %v",
+				postCommitRevision, actualRevision, removeErr)
+		}
+		return nil, fmt.Errorf("advisor desired commit revision mismatch: expected=%d actual=%d",
+			postCommitRevision, actualRevision)
+	}
+	p.publishPreparedAdvisorPostCommitTarget(target)
+	return target, nil
 }
 
 func (p *DynamicPolicy) advisorPostCommitCheckpointPath() string {
@@ -396,6 +462,14 @@ func (p *DynamicPolicy) removeAdvisorPostCommitCheckpoint() error {
 	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove advisor checkpoint: %w", err)
+	}
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return fmt.Errorf("open advisor checkpoint directory after remove: %w", err)
+	}
+	defer dir.Close()
+	if err := dir.Sync(); err != nil {
+		return fmt.Errorf("sync advisor checkpoint directory after remove: %w", err)
 	}
 	return nil
 }

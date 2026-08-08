@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -36,9 +37,11 @@ import (
 	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	bulkheadconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/bulkhead"
+	"github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/statedirectory"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent"
 	podmeta "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
+	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -770,6 +773,117 @@ func TestAdvisorPostCommitCheckpointCrashRecoveryAndSuccessfulCleanup(t *testing
 	require.NoError(t, restarted.reconcileAdvisorPostCommitTarget(context.Background(), restored))
 	restarted.Unlock()
 	require.NoFileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName))
+}
+
+func TestAdvisorWriteAheadTargetRejectsRevisionOverflow(t *testing.T) {
+	_, err := nextAdvisorRevision(math.MaxUint64)
+	require.ErrorContains(t, err, "revision overflow")
+}
+
+func TestAdvisorWriteAheadTargetFailureDoesNotCommitDesired(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	blockingFile := filepath.Join(t.TempDir(), "not-a-directory")
+	require.NoError(t, os.WriteFile(blockingFile, []byte("x"), 0o600))
+	p.advisorPostCommitCheckpointDir = blockingFile
+
+	committed := false
+	_, err := p.commitAdvisorResponseWithWriteAhead(
+		&advisorapi.ListAndWatchResponse{}, p.state.GetRevision(), func() error {
+			committed = true
+			return nil
+		})
+	require.Error(t, err)
+	require.False(t, committed, "desired state must not commit when WAL target persistence fails")
+	require.Nil(t, p.currentAdvisorPostCommitTarget())
+}
+
+func TestAdvisorWriteAheadTargetIsRemovedWhenDesiredCommitFails(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	dir := t.TempDir()
+	p.advisorPostCommitCheckpointDir = dir
+
+	_, err := p.commitAdvisorResponseWithWriteAhead(
+		&advisorapi.ListAndWatchResponse{}, p.state.GetRevision(), func() error {
+			require.FileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName),
+				"target must be durable before applyBlocks commits desired state")
+			require.Nil(t, p.currentAdvisorPostCommitTarget(),
+				"future target must not be published in memory before desired commit")
+			return errors.New("applyBlocks failed")
+		})
+	require.ErrorContains(t, err, "applyBlocks failed")
+	require.NoFileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName))
+	require.Nil(t, p.currentAdvisorPostCommitTarget())
+}
+
+func TestAdvisorWriteAheadTargetRealRestartAtCommitCrashPoints(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		commitDesired bool
+		publishTarget bool
+		wantRecovered bool
+	}{
+		{name: "after target before desired commit", wantRecovered: false},
+		{name: "after desired commit before memory publish", commitDesired: true, wantRecovered: true},
+		{name: "after memory publish before reconcile", commitDesired: true, publishTarget: true, wantRecovered: true},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
+			require.NoError(t, err)
+			dir := t.TempDir()
+			config := &statedirectory.StateDirectoryConfiguration{StateFileDirectory: dir}
+			firstState, err := state.NewCheckpointState(
+				config, "cpu_plugin_state", "dynamic", topology, false,
+				generateMachineStateFromPodEntries, metrics.DummyMetrics{})
+			require.NoError(t, err)
+			first := &DynamicPolicy{
+				state:                          firstState,
+				advisorPostCommitCheckpointDir: dir,
+			}
+			postCommitRevision, err := nextAdvisorRevision(firstState.GetRevision())
+			require.NoError(t, err)
+			target, err := first.prepareAdvisorPostCommitTarget(
+				&advisorapi.ListAndWatchResponse{ExtraEntries: []*advisorsvc.CalculationInfo{{CgroupPath: "/durable"}}},
+				postCommitRevision)
+			require.NoError(t, err)
+			require.NotNil(t, target)
+
+			if tc.commitDesired {
+				require.NoError(t, firstState.CommitAdvisorStateIfRevision(
+					firstState.GetRevision(),
+					firstState.GetPodEntries(),
+					firstState.GetMachineState(),
+					firstState.GetAllowSharedCoresOverlapReclaimedCores(),
+					firstState.GetDisableDedicatedCoresOverlapReclaimedCores(),
+					true))
+				require.Equal(t, postCommitRevision, firstState.GetRevision())
+			}
+			if tc.publishTarget {
+				first.publishPreparedAdvisorPostCommitTarget(target)
+				require.Same(t, target, first.currentAdvisorPostCommitTarget())
+			}
+
+			restartedState, err := state.NewCheckpointState(
+				config, "cpu_plugin_state", "dynamic", topology, false,
+				generateMachineStateFromPodEntries, metrics.DummyMetrics{})
+			require.NoError(t, err)
+			restarted := &DynamicPolicy{
+				state:                          restartedState,
+				advisorPostCommitCheckpointDir: dir,
+			}
+			require.NoError(t, restarted.restoreAdvisorPostCommitTarget())
+			if tc.wantRecovered {
+				require.NotNil(t, restarted.currentAdvisorPostCommitTarget())
+				require.Equal(t, postCommitRevision, restarted.currentAdvisorPostCommitTarget().revision)
+				require.FileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName))
+			} else {
+				require.Nil(t, restarted.currentAdvisorPostCommitTarget())
+				require.NoFileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName))
+			}
+		})
+	}
 }
 
 func TestAdvisorPostCommitCheckpointStopStartRequeuesPendingTarget(t *testing.T) {
