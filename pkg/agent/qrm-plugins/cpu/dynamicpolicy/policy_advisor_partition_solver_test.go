@@ -156,6 +156,99 @@ func TestSolveDisjointPartitionsIsIndependentOfDemandOrder(t *testing.T) {
 	}
 }
 
+func TestSolveDisjointPartitionsKeepsComponentUnionAcrossResponseKeyRotation(t *testing.T) {
+	type componentDemand struct {
+		component string
+		demand    partitionDemand
+	}
+
+	solveComponentUnions := func(frame []componentDemand) map[string]machine.CPUSet {
+		demands := make([]partitionDemand, 0, len(frame))
+		componentsByKey := make(map[string]string, len(frame))
+		for _, item := range frame {
+			demands = append(demands, item.demand)
+			componentsByKey[item.demand.key] = item.component
+		}
+
+		assignments, err := solveDisjointPartitions(demands, partitionSolverFixtureTopology())
+		require.NoError(t, err)
+
+		unions := make(map[string]machine.CPUSet)
+		for key, cpus := range assignments {
+			component := componentsByKey[key]
+			unions[component] = unions[component].Union(cpus)
+		}
+		return unions
+	}
+
+	firstFrame := []componentDemand{
+		{
+			component: "owner-a/component-a",
+			demand: partitionDemand{
+				key:       "response-key-1",
+				quantity:  1,
+				eligible:  machine.NewCPUSet(0, 1, 2),
+				preferred: machine.NewCPUSet(0),
+				class:     advisorBlockClassDedicated,
+			},
+		},
+		{
+			component: "owner-a/component-a",
+			demand: partitionDemand{
+				key:       "response-key-2",
+				quantity:  1,
+				eligible:  machine.NewCPUSet(0, 1, 2),
+				preferred: machine.NewCPUSet(1),
+				class:     advisorBlockClassDedicated,
+			},
+		},
+		{
+			component: "owner-b/component-b",
+			demand: partitionDemand{
+				key:       "response-key-3",
+				quantity:  1,
+				eligible:  machine.NewCPUSet(1, 2, 3),
+				preferred: machine.NewCPUSet(2),
+				class:     advisorBlockClassMandatoryReclaim,
+			},
+		},
+	}
+	secondFrame := []componentDemand{
+		{
+			component: "owner-a/component-a",
+			demand: partitionDemand{
+				key:       "response-key-2",
+				quantity:  1,
+				eligible:  machine.NewCPUSet(0, 1, 2),
+				preferred: machine.NewCPUSet(0),
+				class:     advisorBlockClassDedicated,
+			},
+		},
+		{
+			component: "owner-a/component-a",
+			demand: partitionDemand{
+				key:       "response-key-1",
+				quantity:  1,
+				eligible:  machine.NewCPUSet(0, 1, 2),
+				preferred: machine.NewCPUSet(1),
+				class:     advisorBlockClassDedicated,
+			},
+		},
+		{
+			component: "owner-b/component-b",
+			demand: partitionDemand{
+				key:       "response-key-3",
+				quantity:  1,
+				eligible:  machine.NewCPUSet(1, 2, 3),
+				preferred: machine.NewCPUSet(2),
+				class:     advisorBlockClassMandatoryReclaim,
+			},
+		},
+	}
+
+	require.Equal(t, solveComponentUnions(firstFrame), solveComponentUnions(secondFrame))
+}
+
 func TestSolveDisjointPartitionsFailsClosed(t *testing.T) {
 	got, err := solveDisjointPartitions([]partitionDemand{
 		{key: "dedicated", quantity: 2, eligible: machine.NewCPUSet(0, 1), class: advisorBlockClassDedicated},
