@@ -951,25 +951,37 @@ func (p *DynamicPolicy) allocateNumaBindingCPUs(numCPUs int, hint *pluginapi.Top
 	alignedAvailableCPUsPerNUMA := make(map[uint64]machine.CPUSet)
 	hintNodes := hint.Nodes
 	pkgName := rputil.GetResourcePackageName(reqAnnotations)
+	disableDedicatedOverlap := p.state.GetDisableDedicatedCoresOverlapReclaimedCores()
 	numaRPPinnedCPUSet := machineState.GetNUMAResourcePackagePinnedCPUSet()
+	dedicatedEligiblePerNUMA, reclaimEligiblePerNUMA, err := p.numaBindingPartitionEligibility(machineState, pkgName)
+	if err != nil {
+		return machine.NewCPUSet(), machine.NewCPUSet(), err
+	}
+	dedicatedEligible := machine.NewCPUSet()
+	reclaimEligible := machine.NewCPUSet()
 
 	for _, numaNode := range hintNodes {
+		if machineState[int(numaNode)] == nil {
+			return machine.NewCPUSet(), machine.NewCPUSet(),
+				fmt.Errorf("missing machine state for hinted NUMA %d", numaNode)
+		}
 		availableCPUs := machineState[int(numaNode)].GetAvailableCPUSet(p.reservedCPUs)
-
-		// Filter available CPUs based on Resource Package (RP) pinning rules:
-		// 1. If the current RP has pinned CPUs, restrict allocation strictly to those CPUs.
-		// 2. Otherwise (no RP specified or RP has no pinned CPUs), exclude all CPUs pinned by other RPs.
-		pinnedCPUSetsInNUMA := numaRPPinnedCPUSet[int(numaNode)]
-		if pkgName != "" && !pinnedCPUSetsInNUMA[pkgName].IsEmpty() {
-			availableCPUs = availableCPUs.Intersection(pinnedCPUSetsInNUMA[pkgName])
-		} else if len(pinnedCPUSetsInNUMA) > 0 {
-			for _, pinnedCPUs := range pinnedCPUSetsInNUMA {
-				availableCPUs = availableCPUs.Difference(pinnedCPUs)
+		if numaExclusive && disableDedicatedOverlap {
+			availableCPUs = dedicatedEligiblePerNUMA[int(numaNode)]
+		} else {
+			pinnedCPUSetsInNUMA := numaRPPinnedCPUSet[int(numaNode)]
+			if pkgName != "" && !pinnedCPUSetsInNUMA[pkgName].IsEmpty() {
+				availableCPUs = availableCPUs.Intersection(pinnedCPUSetsInNUMA[pkgName])
+			} else {
+				for _, pinnedCPUs := range pinnedCPUSetsInNUMA {
+					availableCPUs = availableCPUs.Difference(pinnedCPUs)
+				}
 			}
 		}
-
 		alignedAvailableCPUsPerNUMA[numaNode] = availableCPUs
 		alignedAvailableCPUs = alignedAvailableCPUs.Union(availableCPUs)
+		dedicatedEligible = dedicatedEligible.Union(availableCPUs)
+		reclaimEligible = reclaimEligible.Union(reclaimEligiblePerNUMA[int(numaNode)])
 	}
 
 	// The node-level floor covers every reclaim NUMA and is shared by all
@@ -980,6 +992,18 @@ func (p *DynamicPolicy) allocateNumaBindingCPUs(numCPUs int, hint *pluginapi.Top
 	if err != nil {
 		return machine.NewCPUSet(), machine.NewCPUSet(),
 			fmt.Errorf("derive node-level ramp-up reclaim floor failed: %w", err)
+	}
+	hardReclaimCPUs, err = p.selectNumaBindingReclaimPartition(
+		hardReclaimCPUs,
+		dedicatedEligiblePerNUMA,
+		reclaimEligiblePerNUMA,
+		hintNodes,
+		podReclaimEnabled,
+		numaExclusive && disableDedicatedOverlap,
+	)
+	if err != nil {
+		return machine.NewCPUSet(), machine.NewCPUSet(),
+			fmt.Errorf("select NUMA binding reclaim partition failed: %w", err)
 	}
 	if !hardReclaimCPUs.IsEmpty() {
 		for numaNode, availableInNUMA := range alignedAvailableCPUsPerNUMA {
@@ -1063,8 +1087,22 @@ func (p *DynamicPolicy) allocateNumaBindingCPUs(numCPUs int, hint *pluginapi.Top
 	// currently, result equals to alignedCPUs,
 	// maybe extend cpus not aligned to meet requirement later
 	result = result.Union(alignedCPUs)
-	leftNumCPUs := numCPUs - result.Size()
-	if leftNumCPUs > 0 {
+	if numaExclusive && disableDedicatedOverlap {
+		reclaimInHint := hardReclaimCPUs.Intersection(reclaimEligible)
+		partitionEligible := dedicatedEligible.Union(reclaimEligible)
+		if result.IsEmpty() {
+			return machine.NewCPUSet(), machine.NewCPUSet(),
+				fmt.Errorf("exclusive disjoint dedicated result is empty")
+		}
+		if !result.Intersection(hardReclaimCPUs).IsEmpty() {
+			return machine.NewCPUSet(), machine.NewCPUSet(),
+				fmt.Errorf("exclusive dedicated result overlaps reclaim partition")
+		}
+		if !result.Union(reclaimInHint).Equals(partitionEligible) {
+			return machine.NewCPUSet(), machine.NewCPUSet(),
+				fmt.Errorf("exclusive dedicated and reclaim do not cover eligible partition")
+		}
+	} else if result.Size() < numCPUs {
 		general.Errorf("result cpus: %s in hint NUMA nodes: %d with size: %d can't meet cpus request: %d",
 			result.String(), hintNodes, result.Size(), numCPUs)
 
@@ -3024,6 +3062,119 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloor(machineState state.NUMANodeMap,
 		floor = floor.Union(floorInNUMA)
 	}
 	return floor, nil
+}
+
+// numaBindingPartitionEligibility applies the same resource-package owner rules
+// as the advisor block planner to every NUMA's currently available CPUs.
+func (p *DynamicPolicy) numaBindingPartitionEligibility(
+	machineState state.NUMANodeMap,
+	resourcePackageName string,
+) (map[int]machine.CPUSet, map[int]machine.CPUSet, error) {
+	rpPinnedCPUSet := machineState.GetResourcePackagePinnedCPUSet()
+	allPinnedCPUs := machine.NewCPUSet()
+	for _, pinnedCPUs := range rpPinnedCPUSet {
+		allPinnedCPUs = allPinnedCPUs.Union(pinnedCPUs)
+	}
+
+	selectorText := p.dynamicConfig.GetDynamicConfiguration().DisableReclaimPinnedCPUSetResourcePackageSelector
+	disableReclaimSelector, err := general.ParseSelector(selectorText)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse disable-reclaim resource package selector: %w", err)
+	}
+	nonReclaimableCPUSet := cpuutil.GetAggResourcePackagePinnedCPUSet(disableReclaimSelector, machineState)
+
+	dedicatedEligiblePerNUMA := make(map[int]machine.CPUSet, len(machineState))
+	reclaimEligiblePerNUMA := make(map[int]machine.CPUSet, len(machineState))
+	for numaID, numaState := range machineState {
+		if numaState == nil {
+			return nil, nil, fmt.Errorf("missing machine state for NUMA %d", numaID)
+		}
+		scope := numaState.GetAvailableCPUSet(p.reservedCPUs)
+		dedicatedEligiblePerNUMA[numaID] = advisorBlockOwnerEligible(
+			advisorBlockClassDedicated,
+			resourcePackageName,
+			scope,
+			allPinnedCPUs,
+			rpPinnedCPUSet,
+			nonReclaimableCPUSet,
+		)
+		reclaimEligiblePerNUMA[numaID] = advisorBlockOwnerEligible(
+			advisorBlockClassMandatoryReclaim,
+			"",
+			scope,
+			allPinnedCPUs,
+			rpPinnedCPUSet,
+			nonReclaimableCPUSet,
+		)
+	}
+	return dedicatedEligiblePerNUMA, reclaimEligiblePerNUMA, nil
+}
+
+// selectNumaBindingReclaimPartition preserves the mandatory reserve even when
+// Pod EnableReclaim is false, while optional ratio capacity is retained only
+// for reclaim-enabled Pods. Selection first consumes reclaim-only eligibility
+// (G-D), then the dedicated/reclaim intersection, and never leaves the planner's
+// reclaim eligibility (which excludes non-reclaimable pinned packages).
+func (p *DynamicPolicy) selectNumaBindingReclaimPartition(
+	derivedFloor machine.CPUSet,
+	dedicatedEligiblePerNUMA, reclaimEligiblePerNUMA map[int]machine.CPUSet,
+	hintNodes []uint64,
+	podReclaimEnabled, coverExclusivePartition bool,
+) (machine.CPUSet, error) {
+	if !p.isRampUpReclaimHardPartitionEnabled() {
+		return derivedFloor, nil
+	}
+
+	hinted := make(map[int]struct{}, len(hintNodes))
+	for _, numaID := range hintNodes {
+		hinted[int(numaID)] = struct{}{}
+	}
+
+	selected := machine.NewCPUSet()
+	for numaID, reclaimEligible := range reclaimEligiblePerNUMA {
+		dedicatedEligible := dedicatedEligiblePerNUMA[numaID]
+		reclaimOnly := reclaimEligible.Difference(dedicatedEligible)
+		base := machine.NewCPUSet()
+		if _, ok := hinted[numaID]; ok && coverExclusivePartition {
+			base = reclaimOnly
+		}
+
+		derivedInNUMA := derivedFloor.Intersection(
+			p.machineInfo.CPUDetails.CPUsInNUMANodes(numaID),
+		)
+		reserveTarget := p.reservedReclaimedCPUSet.Intersection(derivedInNUMA).Size()
+		target := reserveTarget
+		if podReclaimEnabled || !coverExclusivePartition {
+			target = general.Max(target, derivedInNUMA.Size())
+		}
+		target = general.Max(target, base.Size())
+		// Legacy checkpoints/tests may not carry an identity-bearing reserve.
+		// Exclusive disjoint admission still needs a non-empty reclaim side;
+		// retain the previously derived floor in that compatibility case.
+		if coverExclusivePartition && target == 0 && !derivedInNUMA.IsEmpty() {
+			target = derivedInNUMA.Size()
+		}
+		if target > reclaimEligible.Size() {
+			return machine.NewCPUSet(), fmt.Errorf(
+				"NUMA %d reclaim eligibility %d is smaller than required reserve %d",
+				numaID, reclaimEligible.Size(), target)
+		}
+
+		selectedInNUMA := base
+		remaining := target - selectedInNUMA.Size()
+		if remaining > 0 {
+			intersection := reclaimEligible.Intersection(dedicatedEligible).Difference(selectedInNUMA)
+			preferred := derivedFloor.Union(p.reservedReclaimedCPUSet).Intersection(intersection)
+			supplement, err := p.takeByTopologyPreferring(intersection, preferred, remaining)
+			if err != nil {
+				return machine.NewCPUSet(), fmt.Errorf(
+					"select NUMA %d reclaim reserve from shared eligibility: %w", numaID, err)
+			}
+			selectedInNUMA = selectedInNUMA.Union(supplement)
+		}
+		selected = selected.Union(selectedInNUMA)
+	}
+	return selected, nil
 }
 
 // podEnableReclaim resolves the effective reclaim switch for a single pod,

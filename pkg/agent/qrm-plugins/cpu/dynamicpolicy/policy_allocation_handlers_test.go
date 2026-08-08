@@ -1026,6 +1026,142 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_fullReclaimFallsBackToAvailable(t
 	require.True(t, got.IsSubsetOf(available), "got=%s available=%s", got.String(), available.String())
 }
 
+func TestDynamicPolicy_allocateNumaBindingCPUs_exclusiveDisjointPartition(t *testing.T) {
+	t.Parallel()
+
+	exclusiveAnnotations := func(resourcePackage string) map[string]string {
+		annotations := map[string]string{
+			apiconsts.PodAnnotationMemoryEnhancementNumaBinding:   apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
+		}
+		if resourcePackage != "" {
+			annotations[apiconsts.PodAnnotationResourcePackageKey] = resourcePackage
+		}
+		return annotations
+	}
+	newPolicy := func(t *testing.T) *DynamicPolicy {
+		topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+		require.NoError(t, err)
+		p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+		require.NoError(t, err)
+		p.reservedCPUs = machine.NewCPUSet()
+		p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+		p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0
+		p.dynamicConfig.GetDynamicConfiguration().DisableReclaimPinnedCPUSetResourcePackageSelector = "disable-reclaim=true"
+		p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
+		return p
+	}
+	call := func(p *DynamicPolicy, machineState state.NUMANodeMap, annotations map[string]string, podReclaimEnabled bool) (machine.CPUSet, machine.CPUSet, error) {
+		return p.allocateNumaBindingCPUs(
+			8,
+			&pluginapi.TopologyHint{Nodes: []uint64{0}},
+			machineState,
+			annotations,
+			podReclaimEnabled,
+		)
+	}
+
+	t.Run("pinned package reserves from reclaim-only eligibility even when pod reclaim is disabled", func(t *testing.T) {
+		p := newPolicy(t)
+		p.reservedReclaimedCPUSet = machine.NewCPUSet(0, 1)
+		p.reservedReclaimedCPUsSize = 2
+		machineState := state.NUMANodeMap{
+			0: {
+				DefaultCPUSet: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
+				ResourcePackageStates: map[string]*state.ResourcePackageState{
+					"work": {
+						PinnedCPUSet: machine.NewCPUSet(0, 1, 2, 3),
+					},
+					"protected": {
+						Attributes:   map[string]string{"disable-reclaim": "true"},
+						PinnedCPUSet: machine.NewCPUSet(6, 7),
+					},
+				},
+			},
+		}
+
+		result, reclaim, err := call(p, machineState, exclusiveAnnotations("work"), false)
+		require.NoError(t, err)
+		require.True(t, result.Equals(machine.NewCPUSet(0, 1, 2, 3)), "result=%s", result)
+		require.True(t, reclaim.Equals(machine.NewCPUSet(4, 5)), "reclaim=%s", reclaim)
+		require.True(t, result.Intersection(reclaim).IsEmpty())
+		require.True(t, result.Union(reclaim).Equals(machine.NewCPUSet(0, 1, 2, 3, 4, 5)))
+		require.True(t, reclaim.Intersection(machine.NewCPUSet(6, 7)).IsEmpty())
+	})
+
+	t.Run("unpinned package excludes pinned dedicated CPUs and reserves outside dedicated first", func(t *testing.T) {
+		p := newPolicy(t)
+		p.reservedReclaimedCPUSet = machine.NewCPUSet(4, 5)
+		p.reservedReclaimedCPUsSize = 2
+		machineState := state.NUMANodeMap{
+			0: {
+				DefaultCPUSet: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
+				ResourcePackageStates: map[string]*state.ResourcePackageState{
+					"other": {
+						PinnedCPUSet: machine.NewCPUSet(0, 1),
+					},
+					"protected": {
+						Attributes:   map[string]string{"disable-reclaim": "true"},
+						PinnedCPUSet: machine.NewCPUSet(6, 7),
+					},
+				},
+			},
+		}
+
+		result, reclaim, err := call(p, machineState, exclusiveAnnotations(""), true)
+		require.NoError(t, err)
+		require.True(t, result.Equals(machine.NewCPUSet(2, 3, 4, 5)), "result=%s", result)
+		require.True(t, reclaim.Equals(machine.NewCPUSet(0, 1)), "reclaim=%s", reclaim)
+		require.True(t, result.Intersection(reclaim).IsEmpty())
+		require.True(t, result.Union(reclaim).Equals(machine.NewCPUSet(0, 1, 2, 3, 4, 5)))
+	})
+
+	t.Run("rejects empty dedicated partition", func(t *testing.T) {
+		p := newPolicy(t)
+		p.reservedReclaimedCPUSet = machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)
+		p.reservedReclaimedCPUsSize = 8
+		machineState := state.NUMANodeMap{
+			0: {DefaultCPUSet: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)},
+		}
+
+		_, _, err := call(p, machineState, exclusiveAnnotations(""), true)
+		require.ErrorContains(t, err, "dedicated result is empty")
+	})
+
+	t.Run("rejects reserve when reclaim eligibility is insufficient", func(t *testing.T) {
+		p := newPolicy(t)
+		p.reservedReclaimedCPUSet = machine.NewCPUSet(0, 1)
+		p.reservedReclaimedCPUsSize = 2
+		machineState := state.NUMANodeMap{
+			0: {
+				DefaultCPUSet: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
+				ResourcePackageStates: map[string]*state.ResourcePackageState{
+					"protected": {
+						Attributes:   map[string]string{"disable-reclaim": "true"},
+						PinnedCPUSet: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
+					},
+				},
+			},
+		}
+
+		_, _, err := call(p, machineState, exclusiveAnnotations(""), false)
+		require.Error(t, err)
+	})
+
+	t.Run("legacy overlap mode still requires request size", func(t *testing.T) {
+		p := newPolicy(t)
+		p.state.SetDisableDedicatedCoresOverlapReclaimedCores(false, false)
+		p.reservedReclaimedCPUSet = machine.NewCPUSet(0, 1)
+		p.reservedReclaimedCPUsSize = 2
+		machineState := state.NUMANodeMap{
+			0: {DefaultCPUSet: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)},
+		}
+
+		_, _, err := call(p, machineState, exclusiveAnnotations(""), true)
+		require.ErrorContains(t, err, "results can't meet cpus request")
+	})
+}
+
 // TestDynamicPolicy_generateNUMABindingPoolsCPUSetInPlace verifies the logic of generating CPU sets for NUMA-binding pools.
 // It simulates a scenario with specific CPU topology and available CPUs, checking if the allocation strategies (like packing full cores) work as expected.
 // Topology Assumption for mustGenerateDummyCPUTopology(16, 2, 2):
