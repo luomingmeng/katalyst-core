@@ -18,6 +18,7 @@ package dynamicpolicy
 
 import (
 	"math/rand"
+	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -185,7 +186,7 @@ func TestBuildAdvisorBlockDescriptors_IntersectsAliasEligibilityAndAggregatesOld
 	require.Equal(t, machine.NewCPUSet(1, 2, 3), descriptors[0].OldPreferred)
 }
 
-func TestBuildAdvisorBlockDescriptors_IntersectsDifferentAliasRPEligibility(t *testing.T) {
+func TestBuildAdvisorBlockDescriptors_FailsClosedForDifferentAliasResourcePackages(t *testing.T) {
 	t.Parallel()
 
 	p, cleanup := newReclaimReuseTestPolicy(t)
@@ -196,7 +197,7 @@ func TestBuildAdvisorBlockDescriptors_IntersectsDifferentAliasRPEligibility(t *t
 		{entry: "pod-a", subEntry: "container-a", owner: resourcepackage.WrapOwnerPoolName("pool-a", "rp-a"), numaID: 0, blockID: "alias", quantity: 2},
 	}, rand.New(rand.NewSource(2)))
 
-	descriptors, err := buildAdvisorBlockDescriptors(
+	_, err := buildAdvisorBlockDescriptors(
 		resp,
 		p.machineInfo.CPUDetails,
 		nil,
@@ -206,23 +207,72 @@ func TestBuildAdvisorBlockDescriptors_IntersectsDifferentAliasRPEligibility(t *t
 		},
 		machine.NewCPUSet(),
 	)
-	require.NoError(t, err)
-	require.Equal(t, []advisorBlockDescriptor{{
-		BlockID: "alias",
-		Owners: []string{
-			"pool-a\x00pod-a\x00container-a\x00rp-a",
-			"pool-a\x00pod-b\x00container-b\x00rp-b",
-		},
-		Class:        advisorBlockClassShared,
-		NUMAID:       0,
-		Quantity:     2,
-		ComponentKey: "shared|pool-a\x00pod-a\x00container-a\x00rp-a\x1fpool-a\x00pod-b\x00container-b\x00rp-b|0",
-		Eligible:     machine.NewCPUSet(1, 2),
-		OldPreferred: machine.NewCPUSet(),
-	}}, descriptors)
+	require.ErrorContains(t, err, `block "alias" aliases have incompatible resource packages`)
 }
 
-func TestBuildAdvisorBlockDescriptors_FailsClosedWhenAliasEligibilityIntersectionIsInsufficient(t *testing.T) {
+func TestBuildAdvisorBlockDescriptors_EnforcesAliasResourcePackageCompatibility(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	tests := []struct {
+		name      string
+		aliases   []advisorBlockTestAlias
+		wantError bool
+	}{
+		{
+			name: "same non-empty resource package",
+			aliases: []advisorBlockTestAlias{
+				{entry: "pod-a", subEntry: "container-a", owner: resourcepackage.WrapOwnerPoolName("pool-a", "rp-a"), numaID: 0, blockID: "alias", quantity: 2},
+				{entry: "pod-b", subEntry: "container-b", owner: resourcepackage.WrapOwnerPoolName("pool-a", "rp-a"), numaID: 0, blockID: "alias", quantity: 2},
+			},
+		},
+		{
+			name: "all unpinned",
+			aliases: []advisorBlockTestAlias{
+				{entry: "pod-a", subEntry: "container-a", owner: "pool-a", numaID: 0, blockID: "alias", quantity: 2},
+				{entry: "pod-b", subEntry: "container-b", owner: "pool-a", numaID: 0, blockID: "alias", quantity: 2},
+			},
+		},
+		{
+			name: "pinned and unpinned",
+			aliases: []advisorBlockTestAlias{
+				{entry: "pod-a", subEntry: "container-a", owner: resourcepackage.WrapOwnerPoolName("pool-a", "rp-a"), numaID: 0, blockID: "alias", quantity: 2},
+				{entry: "pod-b", subEntry: "container-b", owner: "pool-a", numaID: 0, blockID: "alias", quantity: 2},
+			},
+			wantError: true,
+		},
+		{
+			name: "empty resource package reclaim owner does not conflict",
+			aliases: []advisorBlockTestAlias{
+				{entry: "pod-a", subEntry: "container-a", owner: resourcepackage.WrapOwnerPoolName("pool-a", "rp-a"), numaID: 0, blockID: "alias", quantity: 2, overlap: true},
+				{entry: "reclaim", subEntry: commonstate.FakedContainerName, owner: commonstate.PoolNameReclaim, numaID: 0, blockID: "alias", quantity: 2, overlap: true},
+			},
+		},
+	}
+
+	for i, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			resp := advisorBlockTestResponse(tt.aliases, rand.New(rand.NewSource(int64(i))))
+			_, err := buildAdvisorBlockDescriptors(
+				resp,
+				p.machineInfo.CPUDetails,
+				nil,
+				map[string]machine.CPUSet{"rp-a": machine.NewCPUSet(0, 1, 2)},
+				machine.NewCPUSet(),
+			)
+			if tt.wantError {
+				require.ErrorContains(t, err, `block "alias" aliases have incompatible resource packages`)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestBuildAdvisorBlockDescriptors_RejectsDifferentResourcePackagesBeforeCapacityCheck(t *testing.T) {
 	t.Parallel()
 
 	p, cleanup := newReclaimReuseTestPolicy(t)
@@ -243,7 +293,7 @@ func TestBuildAdvisorBlockDescriptors_FailsClosedWhenAliasEligibilityIntersectio
 		},
 		machine.NewCPUSet(),
 	)
-	require.ErrorContains(t, err, "eligible capacity 1 is smaller than quantity 2")
+	require.ErrorContains(t, err, `block "alias" aliases have incompatible resource packages`)
 }
 
 func TestBuildAdvisorBlockDescriptors_ClassifiesAllBlockClasses(t *testing.T) {
@@ -326,6 +376,16 @@ func TestAdvisorBlockDescriptorLess_UsesCanonicalKeyOrder(t *testing.T) {
 			right: advisorBlockDescriptor{NUMAID: 1, Class: advisorBlockClassStatic},
 		},
 		{
+			name:  "real NUMA zero precedes fake NUMA",
+			left:  advisorBlockDescriptor{NUMAID: 0},
+			right: advisorBlockDescriptor{NUMAID: commonstate.FakedNUMAID},
+		},
+		{
+			name:  "real NUMA one precedes fake NUMA",
+			left:  advisorBlockDescriptor{NUMAID: 1},
+			right: advisorBlockDescriptor{NUMAID: commonstate.FakedNUMAID},
+		},
+		{
 			name: "class precedes component key",
 			left: func() advisorBlockDescriptor {
 				d := base
@@ -394,6 +454,31 @@ func TestAdvisorBlockDescriptorLess_UsesCanonicalKeyOrder(t *testing.T) {
 			t.Parallel()
 			require.True(t, advisorBlockDescriptorLess(tt.left, tt.right))
 			require.False(t, advisorBlockDescriptorLess(tt.right, tt.left))
+		})
+	}
+}
+
+func TestAdvisorBlockDescriptorLess_SortsRealNUMAsAscendingAndFakeNUMALast(t *testing.T) {
+	t.Parallel()
+
+	const iterations = 100
+	for seed := int64(0); seed < iterations; seed++ {
+		descriptors := []advisorBlockDescriptor{
+			{BlockID: "fake", NUMAID: commonstate.FakedNUMAID},
+			{BlockID: "one", NUMAID: 1},
+			{BlockID: "zero", NUMAID: 0},
+		}
+		r := rand.New(rand.NewSource(seed))
+		r.Shuffle(len(descriptors), func(i, j int) {
+			descriptors[i], descriptors[j] = descriptors[j], descriptors[i]
+		})
+		sort.Slice(descriptors, func(i, j int) bool {
+			return advisorBlockDescriptorLess(descriptors[i], descriptors[j])
+		})
+		require.Equal(t, []int{0, 1, commonstate.FakedNUMAID}, []int{
+			descriptors[0].NUMAID,
+			descriptors[1].NUMAID,
+			descriptors[2].NUMAID,
 		})
 	}
 }

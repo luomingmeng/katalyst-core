@@ -51,7 +51,9 @@ type advisorBlockDescriptor struct {
 
 type advisorBlockDescriptorBuilder struct {
 	advisorBlockDescriptor
-	ownerSeen map[string]struct{}
+	ownerSeen          map[string]struct{}
+	resourcePackage    string
+	resourcePackageSet bool
 }
 
 func buildAdvisorBlockDescriptors(
@@ -119,6 +121,9 @@ func buildAdvisorBlockDescriptors(
 						rpPinnedCPUSet,
 						nonReclaimableCPUSet,
 					)
+					ownerResourcePackage, ownerResourcePackageApplies := advisorBlockOwnerResourcePackageDomain(
+						ownerPoolName, ownerResourcePackage,
+					)
 
 					builder, found := builders[block.BlockId]
 					if !found {
@@ -133,6 +138,10 @@ func buildAdvisorBlockDescriptors(
 							},
 							ownerSeen: make(map[string]struct{}),
 						}
+						if ownerResourcePackageApplies {
+							builder.resourcePackage = ownerResourcePackage
+							builder.resourcePackageSet = true
+						}
 						builders[block.BlockId] = builder
 					} else {
 						if builder.NUMAID != numaID || builder.Quantity != quantity {
@@ -140,6 +149,13 @@ func buildAdvisorBlockDescriptors(
 						}
 						if builder.Class != ownerClass {
 							return nil, fmt.Errorf("block %q aliases have incompatible owner classes", block.BlockId)
+						}
+						if ownerResourcePackageApplies {
+							if builder.resourcePackageSet && builder.resourcePackage != ownerResourcePackage {
+								return nil, fmt.Errorf("block %q aliases have incompatible resource packages", block.BlockId)
+							}
+							builder.resourcePackage = ownerResourcePackage
+							builder.resourcePackageSet = true
 						}
 						builder.Eligible = builder.Eligible.Intersection(ownerEligible)
 					}
@@ -177,6 +193,12 @@ func buildAdvisorBlockDescriptors(
 
 func advisorBlockDescriptorLess(left, right advisorBlockDescriptor) bool {
 	if left.NUMAID != right.NUMAID {
+		if left.NUMAID == commonstate.FakedNUMAID {
+			return false
+		}
+		if right.NUMAID == commonstate.FakedNUMAID {
+			return true
+		}
 		return left.NUMAID < right.NUMAID
 	}
 	if left.Class != right.Class {
@@ -233,6 +255,13 @@ func classifyAdvisorBlockOwner(
 
 func canonicalAdvisorBlockOwner(poolName, entryName, subEntryName, resourcePackageName string) string {
 	return poolName + "\x00" + entryName + "\x00" + subEntryName + "\x00" + resourcePackageName
+}
+
+func advisorBlockOwnerResourcePackageDomain(poolName, resourcePackageName string) (string, bool) {
+	if commonstate.GetPoolType(poolName) == commonstate.PoolNameReclaim && resourcePackageName == "" {
+		return "", false
+	}
+	return resourcePackageName, true
 }
 
 func advisorBlockNUMACPUSet(allCPUs machine.CPUSet, cpuDetails machine.CPUDetails, numaID int) (machine.CPUSet, error) {
