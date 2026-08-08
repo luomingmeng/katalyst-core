@@ -3150,7 +3150,7 @@ func (p *DynamicPolicy) numaBindingPartitionEligibility(
 		}
 		scope := numaState.GetAvailableCPUSet(p.reservedCPUs)
 		dedicatedEligiblePerNUMA[numaID] = advisorBlockOwnerEligible(
-			advisorBlockClassDedicated,
+			commonstate.PoolNameDedicated,
 			resourcePackageName,
 			scope,
 			allPinnedCPUs,
@@ -3158,7 +3158,7 @@ func (p *DynamicPolicy) numaBindingPartitionEligibility(
 			nonReclaimableCPUSet,
 		)
 		reclaimEligiblePerNUMA[numaID] = advisorBlockOwnerEligible(
-			advisorBlockClassMandatoryReclaim,
+			commonstate.PoolNameReclaim,
 			"",
 			scope,
 			allPinnedCPUs,
