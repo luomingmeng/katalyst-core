@@ -112,7 +112,7 @@ func (s *cpuPluginState) revisionExhaustedLocked(operation string) bool {
 		return false
 	}
 	general.Errorf("reject %s: %v", operation, ErrStateRevisionOverflow)
-	return true
+	panic(ErrStateRevisionOverflow)
 }
 
 func (s *cpuPluginState) SetMachineState(numaNodeMap NUMANodeMap) {
@@ -133,6 +133,9 @@ func (s *cpuPluginState) SetNUMAHeadroom(numaHeadroom map[int]float64) {
 	s.Lock()
 	defer s.Unlock()
 
+	if s.revisionExhaustedLocked("SetNUMAHeadroom") {
+		return
+	}
 	s.numaHeadroom = general.DeepCopyIntToFloat64Map(numaHeadroom)
 	klog.InfoS("[cpu_plugin] Updated cpu plugin numa headroom", "numaHeadroom", numaHeadroom)
 }
