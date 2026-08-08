@@ -524,7 +524,8 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 
 	podReclaimEnabled := p.podEnableReclaimOrFallback(ctx, req.PodUid, "allocateNumaBindingCPUs")
 
-	result, hardReclaimCPUs, err := p.allocateNumaBindingCPUs(podAggregatedRequest, req.Hint, machineState, req.Annotations, podReclaimEnabled)
+	result, hardReclaimCPUs, eligibility, err := p.allocateNumaBindingCPUsWithEligibility(
+		podAggregatedRequest, req.Hint, machineState, req.Annotations, podReclaimEnabled)
 	if err != nil {
 		general.ErrorS(err, "unable to allocate CPUs",
 			"podNamespace", req.PodNamespace,
@@ -577,8 +578,12 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 				return nil, fmt.Errorf("NUMA-exclusive DNB ramp-up missing machine state for NUMA %d", numaID)
 			}
 			availableInNUMA := numaState.GetAvailableCPUSet(p.reservedCPUs)
-			floorInNUMA := hardReclaimCPUs.Intersection(availableInNUMA)
-			allocationInNUMA := result.Intersection(availableInNUMA)
+			coverageTarget := availableInNUMA
+			if eligibility != nil {
+				coverageTarget = eligibility.partitionEligiblePerNUMA[int(numaID)]
+			}
+			floorInNUMA := hardReclaimCPUs.Intersection(coverageTarget)
+			allocationInNUMA := result.Intersection(coverageTarget)
 			if floorInNUMA.IsEmpty() {
 				return nil, fmt.Errorf("NUMA-exclusive DNB ramp-up requires non-empty reclaim floor on NUMA %d", numaID)
 			}
@@ -586,9 +591,9 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 				return nil, fmt.Errorf("NUMA-exclusive DNB allocation overlaps reclaim floor on NUMA %d: overlap=%s",
 					numaID, overlap.String())
 			}
-			if covered := allocationInNUMA.Union(floorInNUMA); !covered.Equals(availableInNUMA) {
-				return nil, fmt.Errorf("NUMA-exclusive DNB allocation and reclaim floor do not cover NUMA %d: allocation=%s floor=%s available=%s",
-					numaID, allocationInNUMA.String(), floorInNUMA.String(), availableInNUMA.String())
+			if covered := allocationInNUMA.Union(floorInNUMA); !covered.Equals(coverageTarget) {
+				return nil, fmt.Errorf("NUMA-exclusive DNB allocation and reclaim floor do not cover NUMA %d: allocation=%s floor=%s eligible=%s",
+					numaID, allocationInNUMA.String(), floorInNUMA.String(), coverageTarget.String())
 			}
 		}
 	}
@@ -915,6 +920,10 @@ func (p *DynamicPolicy) sharedCoresWithNUMABindingAllocationHandler(ctx context.
 	return resp, nil
 }
 
+type numaBindingPartitionEligibilitySnapshot struct {
+	partitionEligiblePerNUMA map[int]machine.CPUSet
+}
+
 // allocateNumaBindingCPUs allocates CPUs for NUMA binding containers.
 // It considers NUMA affinity, exclusive requirements, and resource package pinning.
 // Steps:
@@ -926,26 +935,34 @@ func (p *DynamicPolicy) sharedCoresWithNUMABindingAllocationHandler(ctx context.
 func (p *DynamicPolicy) allocateNumaBindingCPUs(numCPUs int, hint *pluginapi.TopologyHint,
 	machineState state.NUMANodeMap, reqAnnotations map[string]string, podReclaimEnabled bool,
 ) (machine.CPUSet, machine.CPUSet, error) {
+	result, hardReclaimCPUs, _, err := p.allocateNumaBindingCPUsWithEligibility(
+		numCPUs, hint, machineState, reqAnnotations, podReclaimEnabled)
+	return result, hardReclaimCPUs, err
+}
+
+func (p *DynamicPolicy) allocateNumaBindingCPUsWithEligibility(numCPUs int, hint *pluginapi.TopologyHint,
+	machineState state.NUMANodeMap, reqAnnotations map[string]string, podReclaimEnabled bool,
+) (machine.CPUSet, machine.CPUSet, *numaBindingPartitionEligibilitySnapshot, error) {
 	distributeEvenlyAcrossNuma := qosutil.AnnotationsIndicateDistributeEvenlyAcrossNuma(reqAnnotations)
 	fullPCPUsPairing := qosutil.AnnotationsIndicateFullPCPUsPairing(reqAnnotations)
 	numaExclusive := qosutil.AnnotationsIndicateNUMAExclusive(reqAnnotations)
 	numaNumber, err := qosutil.AnnotationsGetNUMANumber(reqAnnotations, len(machineState), p.numaNumberAnnotationKey)
 	if err != nil {
-		return machine.NewCPUSet(), machine.NewCPUSet(), fmt.Errorf("get numa number failed with error: %v", err)
+		return machine.NewCPUSet(), machine.NewCPUSet(), nil, fmt.Errorf("get numa number failed with error: %v", err)
 	}
 
 	if hint == nil {
-		return machine.NewCPUSet(), machine.NewCPUSet(), fmt.Errorf("hint is nil")
+		return machine.NewCPUSet(), machine.NewCPUSet(), nil, fmt.Errorf("hint is nil")
 	} else if len(hint.Nodes) == 0 {
-		return machine.NewCPUSet(), machine.NewCPUSet(), fmt.Errorf("hint is empty")
+		return machine.NewCPUSet(), machine.NewCPUSet(), nil, fmt.Errorf("hint is empty")
 	} else if !qosutil.AnnotationsIndicateNUMABinding(reqAnnotations) {
-		return machine.NewCPUSet(), machine.NewCPUSet(), fmt.Errorf("request is not NUMA binding, which is unexpected")
+		return machine.NewCPUSet(), machine.NewCPUSet(), nil, fmt.Errorf("request is not NUMA binding, which is unexpected")
 	} else if !numaExclusive && numaNumber <= 1 && len(hint.Nodes) > 1 {
-		return machine.NewCPUSet(), machine.NewCPUSet(), fmt.Errorf("NUMA not exclusive binding container has request larger than 1 NUMA")
+		return machine.NewCPUSet(), machine.NewCPUSet(), nil, fmt.Errorf("NUMA not exclusive binding container has request larger than 1 NUMA")
 	} else if numaExclusive && fullPCPUsPairing {
-		return machine.NewCPUSet(), machine.NewCPUSet(), fmt.Errorf("NUMA exclusive and full pcpus pairing not supported at the same time")
+		return machine.NewCPUSet(), machine.NewCPUSet(), nil, fmt.Errorf("NUMA exclusive and full pcpus pairing not supported at the same time")
 	} else if numaExclusive && distributeEvenlyAcrossNuma {
-		return machine.NewCPUSet(), machine.NewCPUSet(), fmt.Errorf("NUMA exclusive and distribute evenly across numa not supported at the same time")
+		return machine.NewCPUSet(), machine.NewCPUSet(), nil, fmt.Errorf("NUMA exclusive and distribute evenly across numa not supported at the same time")
 	}
 
 	result := machine.NewCPUSet()
@@ -956,13 +973,21 @@ func (p *DynamicPolicy) allocateNumaBindingCPUs(numCPUs int, hint *pluginapi.Top
 	disableDedicatedOverlap := p.state.GetDisableDedicatedCoresOverlapReclaimedCores()
 	coverExclusivePartition := p.isRampUpReclaimHardPartitionEnabled() &&
 		numaExclusive && disableDedicatedOverlap
+	var eligibility *numaBindingPartitionEligibilitySnapshot
 	dedicatedEligiblePerNUMA := make(map[int]machine.CPUSet)
 	reclaimEligiblePerNUMA := make(map[int]machine.CPUSet)
 	if coverExclusivePartition {
 		dedicatedEligiblePerNUMA, reclaimEligiblePerNUMA, err =
 			p.numaBindingPartitionEligibility(machineState, pkgName, hintNodes)
 		if err != nil {
-			return machine.NewCPUSet(), machine.NewCPUSet(), err
+			return machine.NewCPUSet(), machine.NewCPUSet(), nil, err
+		}
+		eligibility = &numaBindingPartitionEligibilitySnapshot{
+			partitionEligiblePerNUMA: make(map[int]machine.CPUSet, len(hintNodes)),
+		}
+		for _, numaID := range hintNodes {
+			eligibility.partitionEligiblePerNUMA[int(numaID)] =
+				dedicatedEligiblePerNUMA[int(numaID)].Union(reclaimEligiblePerNUMA[int(numaID)])
 		}
 	}
 	dedicatedEligible := machine.NewCPUSet()
@@ -970,7 +995,7 @@ func (p *DynamicPolicy) allocateNumaBindingCPUs(numCPUs int, hint *pluginapi.Top
 
 	for _, numaNode := range hintNodes {
 		if machineState[int(numaNode)] == nil {
-			return machine.NewCPUSet(), machine.NewCPUSet(),
+			return machine.NewCPUSet(), machine.NewCPUSet(), nil,
 				fmt.Errorf("missing machine state for hinted NUMA %d", numaNode)
 		}
 		availableCPUs := machineState[int(numaNode)].GetAvailableCPUSet(p.reservedCPUs)
@@ -1005,7 +1030,7 @@ func (p *DynamicPolicy) allocateNumaBindingCPUs(numCPUs int, hint *pluginapi.Top
 	// ramp-up and the bulkhead reclaim partition.
 	hardReclaimCPUs, err := p.deriveRampUpReclaimFloor(machineState, true)
 	if err != nil {
-		return machine.NewCPUSet(), machine.NewCPUSet(),
+		return machine.NewCPUSet(), machine.NewCPUSet(), nil,
 			fmt.Errorf("derive node-level ramp-up reclaim floor failed: %w", err)
 	}
 	hardReclaimCPUs, err = p.selectNumaBindingReclaimPartition(
@@ -1017,7 +1042,7 @@ func (p *DynamicPolicy) allocateNumaBindingCPUs(numCPUs int, hint *pluginapi.Top
 		coverExclusivePartition,
 	)
 	if err != nil {
-		return machine.NewCPUSet(), machine.NewCPUSet(),
+		return machine.NewCPUSet(), machine.NewCPUSet(), nil,
 			fmt.Errorf("select NUMA binding reclaim partition failed: %w", err)
 	}
 	if !hardReclaimCPUs.IsEmpty() {
@@ -1079,7 +1104,7 @@ func (p *DynamicPolicy) allocateNumaBindingCPUs(numCPUs int, hint *pluginapi.Top
 		if distributeEvenlyAcrossNuma {
 			alignedCPUs, err = p.allocateEvenlyAcrossNUMAs(numCPUs, hintNodes, alignedAvailableCPUsPerNUMA, preferredAvailableCPUsPerNUMA)
 			if err != nil {
-				return machine.NewCPUSet(), machine.NewCPUSet(), fmt.Errorf("allocateEvenlyAcrossNUMA failed with error: %v", err)
+				return machine.NewCPUSet(), machine.NewCPUSet(), nil, fmt.Errorf("allocateEvenlyAcrossNUMA failed with error: %v", err)
 			}
 		} else {
 			alignedCPUs, err = p.takeByTopologyPreferring(alignedAvailableCPUs, preferredAvailableCPUs, numCPUs)
@@ -1088,7 +1113,7 @@ func (p *DynamicPolicy) allocateNumaBindingCPUs(numCPUs int, hint *pluginapi.Top
 					"hints", hintNodes,
 					"alignedAvailableCPUs", alignedAvailableCPUs.String())
 
-				return machine.NewCPUSet(), machine.NewCPUSet(),
+				return machine.NewCPUSet(), machine.NewCPUSet(), nil,
 					fmt.Errorf("take cpu for NUMA not exclusive binding container failed with err: %v", err)
 			}
 		}
@@ -1106,31 +1131,31 @@ func (p *DynamicPolicy) allocateNumaBindingCPUs(numCPUs int, hint *pluginapi.Top
 		reclaimInHint := hardReclaimCPUs.Intersection(reclaimEligible)
 		partitionEligible := dedicatedEligible.Union(reclaimEligible)
 		if result.IsEmpty() {
-			return machine.NewCPUSet(), machine.NewCPUSet(),
+			return machine.NewCPUSet(), machine.NewCPUSet(), nil,
 				fmt.Errorf("exclusive disjoint dedicated result is empty")
 		}
 		if !result.Intersection(hardReclaimCPUs).IsEmpty() {
-			return machine.NewCPUSet(), machine.NewCPUSet(),
+			return machine.NewCPUSet(), machine.NewCPUSet(), nil,
 				fmt.Errorf("exclusive dedicated result overlaps reclaim partition")
 		}
 		if !result.Union(reclaimInHint).Equals(partitionEligible) {
-			return machine.NewCPUSet(), machine.NewCPUSet(),
+			return machine.NewCPUSet(), machine.NewCPUSet(), nil,
 				fmt.Errorf("exclusive dedicated and reclaim do not cover eligible partition")
 		}
 	} else if result.Size() < numCPUs {
 		general.Errorf("result cpus: %s in hint NUMA nodes: %d with size: %d can't meet cpus request: %d",
 			result.String(), hintNodes, result.Size(), numCPUs)
 
-		return machine.NewCPUSet(), machine.NewCPUSet(), fmt.Errorf("results can't meet cpus request")
+		return machine.NewCPUSet(), machine.NewCPUSet(), nil, fmt.Errorf("results can't meet cpus request")
 	}
 
 	// Invariant: the reclaim floor must never leak into the dedicated_cores result.
 	if !hardReclaimCPUs.IsEmpty() && !result.Intersection(hardReclaimCPUs).IsEmpty() {
-		return machine.NewCPUSet(), machine.NewCPUSet(),
+		return machine.NewCPUSet(), machine.NewCPUSet(), nil,
 			fmt.Errorf("ramp-up reclaim hard partition invariant violated: dedicated result %s overlaps reclaim floor %s",
 				result.String(), hardReclaimCPUs.String())
 	}
-	return result, hardReclaimCPUs, nil
+	return result, hardReclaimCPUs, eligibility, nil
 }
 
 // allocateEvenlyAcrossNUMAs distributes the cpu request evenly across NUMA nodes.
