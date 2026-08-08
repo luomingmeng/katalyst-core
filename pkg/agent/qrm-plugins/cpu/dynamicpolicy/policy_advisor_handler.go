@@ -566,14 +566,10 @@ func (p *DynamicPolicy) allocateByCPUAdvisor(
 		return fmt.Errorf("applyBlocks failed with error: %v", applyErr)
 	}
 
-	applyErr = p.applyHeadroom(resp)
-	if applyErr != nil {
-		return fmt.Errorf("applyHeadroom failed with error: %v", applyErr)
-	}
-
+	target := p.publishAdvisorPostCommitTarget(resp, p.state.GetRevision())
 	ctx, cancel := context.WithTimeout(context.Background(), cpuSetAdjustmentHandlerTimeout(p.conf))
 	defer cancel()
-	if err := p.applyPostAdvisorCommit(ctx, resp, p.state.GetRevision()); err != nil {
+	if err := p.reconcileAdvisorPostCommitTarget(ctx, target); err != nil {
 		return err
 	}
 

@@ -26,6 +26,7 @@ import (
 	"github.com/bytedance/mockey"
 	"github.com/stretchr/testify/require"
 
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/advisorsvc"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
@@ -407,7 +408,8 @@ func TestAdvisorCPUSetAdjustmentFailureRetainsDesiredStateAndRetries(t *testing.
 	}
 
 	p.Lock()
-	err := p.runCPUSetAdjustmentHandlersAfterAdvisorCommit(context.Background())
+	target := p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+	err := p.reconcileAdvisorPostCommitTarget(context.Background(), target)
 	p.Unlock()
 	require.ErrorContains(t, err, "transient cgroup write failure")
 	require.True(t, p.state.GetAllocationInfo(
@@ -425,10 +427,16 @@ func TestAdvisorCPUSetAdjustmentFailureRetainsDesiredStateAndRetries(t *testing.
 func TestPostAdvisorCommitApplyFailureRunsInOrderAndMarksRevisionOnce(t *testing.T) {
 	for _, tc := range []struct {
 		name           string
+		headroomErr    error
 		cgroupErr      error
 		adjustmentErr  error
 		wantErrStrings []string
 	}{
+		{
+			name:           "headroom failure",
+			headroomErr:    errors.New("headroom failure"),
+			wantErrStrings: []string{"headroom failure"},
+		},
 		{
 			name:           "cgroup config failure",
 			cgroupErr:      errors.New("cgroup config failure"),
@@ -440,10 +448,29 @@ func TestPostAdvisorCommitApplyFailureRunsInOrderAndMarksRevisionOnce(t *testing
 			wantErrStrings: []string{"cpuset adjustment failure"},
 		},
 		{
-			name:           "both apply stages fail",
+			name:           "headroom and cgroup failures",
+			headroomErr:    errors.New("headroom failure"),
+			cgroupErr:      errors.New("cgroup config failure"),
+			wantErrStrings: []string{"headroom failure", "cgroup config failure"},
+		},
+		{
+			name:           "headroom and cpuset failures",
+			headroomErr:    errors.New("headroom failure"),
+			adjustmentErr:  errors.New("cpuset adjustment failure"),
+			wantErrStrings: []string{"headroom failure", "cpuset adjustment failure"},
+		},
+		{
+			name:           "cgroup and cpuset failures",
 			cgroupErr:      errors.New("cgroup config failure"),
 			adjustmentErr:  errors.New("cpuset adjustment failure"),
 			wantErrStrings: []string{"cgroup config failure", "cpuset adjustment failure"},
+		},
+		{
+			name:           "all apply stages fail",
+			headroomErr:    errors.New("headroom failure"),
+			cgroupErr:      errors.New("cgroup config failure"),
+			adjustmentErr:  errors.New("cpuset adjustment failure"),
+			wantErrStrings: []string{"headroom failure", "cgroup config failure", "cpuset adjustment failure"},
 		},
 	} {
 		tc := tc
@@ -456,6 +483,11 @@ func TestPostAdvisorCommitApplyFailureRunsInOrderAndMarksRevisionOnce(t *testing
 
 			var calls []string
 			mockey.PatchConvey(tc.name, t, func() {
+				mockey.Mock((*DynamicPolicy).applyHeadroom).IncludeCurrentGoRoutine().
+					To(func(_ *DynamicPolicy, _ *advisorapi.ListAndWatchResponse) error {
+						calls = append(calls, "apply-headroom")
+						return tc.headroomErr
+					}).Build()
 				mockey.Mock((*DynamicPolicy).applyCgroupConfigs).IncludeCurrentGoRoutine().
 					To(func(_ *DynamicPolicy, _ *advisorapi.ListAndWatchResponse) error {
 						calls = append(calls, "apply-cgroup-configs")
@@ -473,19 +505,132 @@ func TestPostAdvisorCommitApplyFailureRunsInOrderAndMarksRevisionOnce(t *testing
 					}).Build()
 
 				p.Lock()
-				err := p.applyPostAdvisorCommit(context.Background(), &advisorapi.ListAndWatchResponse{}, revision)
+				target := p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, revision)
+				err := p.reconcileAdvisorPostCommitTarget(context.Background(), target)
 				p.Unlock()
 
 				for _, wantErr := range tc.wantErrStrings {
 					require.ErrorContains(t, err, wantErr)
 				}
-				require.Equal(t, []string{"apply-cgroup-configs", "adjust-cpuset", "mark-apply-failed"}, calls)
+				require.Equal(t, []string{"apply-headroom", "apply-cgroup-configs", "adjust-cpuset", "mark-apply-failed"}, calls)
 				require.True(t, p.state.GetAllocationInfo(
 					commonstate.PoolNameReclaim, commonstate.FakedContainerName).AllocationResult.Equals(desired),
 					"post-commit apply failures must not roll desired state back")
 			})
 		})
 	}
+}
+
+func TestAdvisorPostCommitTargetClonesResponseExtraEntries(t *testing.T) {
+	t.Parallel()
+
+	p := &DynamicPolicy{}
+	resp := &advisorapi.ListAndWatchResponse{
+		ExtraEntries: []*advisorsvc.CalculationInfo{{
+			CgroupPath: "/old",
+			CalculationResult: &advisorsvc.CalculationResult{
+				Values: map[string]string{"key": "old"},
+			},
+		}},
+	}
+
+	target := p.publishAdvisorPostCommitTarget(resp, 7)
+	resp.ExtraEntries[0].CgroupPath = "/mutated"
+	resp.ExtraEntries[0].CalculationResult.Values["key"] = "mutated"
+	resp.ExtraEntries = nil
+
+	require.Equal(t, uint64(7), target.revision)
+	require.Len(t, target.response.ExtraEntries, 1)
+	require.Equal(t, "/old", target.response.ExtraEntries[0].CgroupPath)
+	require.Equal(t, "old", target.response.ExtraEntries[0].CalculationResult.Values["key"])
+}
+
+func TestAdvisorPostCommitRetryReplaysAllStagesUntilConverged(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	var calls []string
+	attempt := 0
+	mockey.PatchConvey("retry replays every stage", t, func() {
+		mockey.Mock((*DynamicPolicy).applyHeadroom).IncludeCurrentGoRoutine().
+			To(func(_ *DynamicPolicy, _ *advisorapi.ListAndWatchResponse) error {
+				calls = append(calls, "headroom")
+				return nil
+			}).Build()
+		mockey.Mock((*DynamicPolicy).applyCgroupConfigs).IncludeCurrentGoRoutine().
+			To(func(_ *DynamicPolicy, _ *advisorapi.ListAndWatchResponse) error {
+				calls = append(calls, "cgroup")
+				if attempt == 0 {
+					return errors.New("transient cgroup failure")
+				}
+				return nil
+			}).Build()
+		mockey.Mock((*DynamicPolicy).runCPUSetAdjustmentHandlers).IncludeCurrentGoRoutine().
+			To(func(_ *DynamicPolicy, _ context.Context, _ ...cpusetutil.CPUSetAdjustmentMode) error {
+				calls = append(calls, "cpuset")
+				attempt++
+				return nil
+			}).Build()
+		mockey.Mock((*DynamicPolicy).markAdvisorApplyFailed).IncludeCurrentGoRoutine().
+			To(func(_ *DynamicPolicy, _ uint64) {}).Build()
+
+		p.Lock()
+		target := p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+		err := p.reconcileAdvisorPostCommitTarget(context.Background(), target)
+		p.Unlock()
+		require.ErrorContains(t, err, "transient cgroup failure")
+		require.Equal(t, []string{"headroom", "cgroup", "cpuset"}, calls)
+		require.True(t, p.hasPendingAdvisorPostCommitTarget(target.revision))
+		p.cpuSetAdjustmentRetryMu.Lock()
+		p.cpuSetAdjustmentRetryDirty = true
+		p.cpuSetAdjustmentRetryReasons = map[cpusetutil.CPUSetAdjustmentRetryReason]struct{}{
+			cpusetutil.RetryReasonApplyFailed: {},
+		}
+		p.cpuSetAdjustmentRetryMu.Unlock()
+
+		p.Lock()
+		err = p.reconcileAdvisorPostCommitTarget(context.Background(), target)
+		p.Unlock()
+		require.NoError(t, err)
+		require.Equal(t, []string{"headroom", "cgroup", "cpuset", "headroom", "cgroup", "cpuset"}, calls)
+		require.False(t, p.hasPendingAdvisorPostCommitTarget(target.revision))
+		p.cpuSetAdjustmentRetryMu.Lock()
+		require.False(t, p.cpuSetAdjustmentRetryDirty)
+		p.cpuSetAdjustmentRetryMu.Unlock()
+	})
+}
+
+func TestAdvisorPostCommitNewRevisionSupersedesStaleTarget(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	var paths []string
+	mockey.PatchConvey("stale target is not replayed", t, func() {
+		mockey.Mock((*DynamicPolicy).applyHeadroom).IncludeCurrentGoRoutine().
+			To(func(_ *DynamicPolicy, resp *advisorapi.ListAndWatchResponse) error {
+				paths = append(paths, resp.ExtraEntries[0].CgroupPath)
+				return nil
+			}).Build()
+		mockey.Mock((*DynamicPolicy).applyCgroupConfigs).IncludeCurrentGoRoutine().
+			To(func(_ *DynamicPolicy, _ *advisorapi.ListAndWatchResponse) error { return nil }).Build()
+		mockey.Mock((*DynamicPolicy).runCPUSetAdjustmentHandlers).IncludeCurrentGoRoutine().
+			To(func(_ *DynamicPolicy, _ context.Context, _ ...cpusetutil.CPUSetAdjustmentMode) error { return nil }).Build()
+
+		oldTarget := p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{
+			ExtraEntries: []*advisorsvc.CalculationInfo{{CgroupPath: "/old"}},
+		}, 7)
+		newTarget := p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{
+			ExtraEntries: []*advisorsvc.CalculationInfo{{CgroupPath: "/new"}},
+		}, 8)
+
+		p.Lock()
+		require.NoError(t, p.reconcileAdvisorPostCommitTarget(context.Background(), oldTarget))
+		require.NoError(t, p.reconcileAdvisorPostCommitTarget(context.Background(), newTarget))
+		p.Unlock()
+
+		require.Equal(t, []string{"/new"}, paths)
+		require.False(t, p.hasPendingAdvisorPostCommitTarget(8))
+	})
 }
 
 func TestCgroupCreateRetriesOnlyDeferredLeafDirtyAdjustment(t *testing.T) {
