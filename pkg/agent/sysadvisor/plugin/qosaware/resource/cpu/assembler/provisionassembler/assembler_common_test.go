@@ -19,6 +19,7 @@ package provisionassembler
 import (
 	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -1502,34 +1503,251 @@ func TestPriorityAllocationAndDedicatedAtomPressure(t *testing.T) {
 
 func TestAssembleWithoutNUMAExclusivePoolOverlapPolicyMatrix(t *testing.T) {
 	tests := []struct {
-		name                    string
-		allowSharedOverlap      bool
-		disableDedicatedOverlap bool
-		sharedEnableReclaim     bool
-		dedicatedEnableReclaim  bool
-		wantSharedSize          int
-		wantDedicatedSize       int
-		wantStandaloneReclaim   int
-		wantSharedOverlap       int
-		wantDedicatedAliases    map[string]int
-		wantAggregateReclaim    int
+		name                   string
+		sharedEnableReclaim    bool
+		dedicatedEnableReclaim bool
+		want                   types.InternalCPUCalculationResult
 	}{
-		{name: "AS0_DD0_SE0_DE0", wantSharedSize: 8, wantDedicatedSize: 8, wantStandaloneReclaim: 4, wantAggregateReclaim: 4},
-		{name: "AS0_DD0_SE0_DE1", dedicatedEnableReclaim: true, wantSharedSize: 8, wantDedicatedSize: 8, wantStandaloneReclaim: 4, wantDedicatedAliases: map[string]int{"main": 2, "sidecar": 2}, wantAggregateReclaim: 6},
-		{name: "AS0_DD0_SE1_DE0", sharedEnableReclaim: true, wantSharedSize: 4, wantDedicatedSize: 8, wantStandaloneReclaim: 8, wantAggregateReclaim: 8},
-		{name: "AS0_DD0_SE1_DE1", sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantSharedSize: 4, wantDedicatedSize: 8, wantStandaloneReclaim: 8, wantDedicatedAliases: map[string]int{"main": 2, "sidecar": 2}, wantAggregateReclaim: 10},
-		{name: "AS0_DD1_SE0_DE0", disableDedicatedOverlap: true, wantSharedSize: 8, wantDedicatedSize: 8, wantStandaloneReclaim: 4, wantAggregateReclaim: 4},
-		{name: "AS0_DD1_SE0_DE1", disableDedicatedOverlap: true, dedicatedEnableReclaim: true, wantSharedSize: 8, wantDedicatedSize: 6, wantStandaloneReclaim: 6, wantAggregateReclaim: 6},
-		{name: "AS0_DD1_SE1_DE0", disableDedicatedOverlap: true, sharedEnableReclaim: true, wantSharedSize: 4, wantDedicatedSize: 8, wantStandaloneReclaim: 8, wantAggregateReclaim: 8},
-		{name: "AS0_DD1_SE1_DE1", disableDedicatedOverlap: true, sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantSharedSize: 4, wantDedicatedSize: 6, wantStandaloneReclaim: 10, wantAggregateReclaim: 10},
-		{name: "AS1_DD0_SE0_DE0", allowSharedOverlap: true, wantSharedSize: 12, wantDedicatedSize: 8, wantStandaloneReclaim: 4, wantAggregateReclaim: 4},
-		{name: "AS1_DD0_SE0_DE1", allowSharedOverlap: true, dedicatedEnableReclaim: true, wantSharedSize: 12, wantDedicatedSize: 8, wantStandaloneReclaim: 2, wantDedicatedAliases: map[string]int{"main": 2, "sidecar": 2}, wantAggregateReclaim: 4},
-		{name: "AS1_DD0_SE1_DE0", allowSharedOverlap: true, sharedEnableReclaim: true, wantSharedSize: 12, wantDedicatedSize: 8, wantSharedOverlap: 8, wantAggregateReclaim: 8},
-		{name: "AS1_DD0_SE1_DE1", allowSharedOverlap: true, sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantSharedSize: 12, wantDedicatedSize: 8, wantSharedOverlap: 8, wantDedicatedAliases: map[string]int{"main": 2, "sidecar": 2}, wantAggregateReclaim: 10},
-		{name: "AS1_DD1_SE0_DE0", allowSharedOverlap: true, disableDedicatedOverlap: true, wantSharedSize: 12, wantDedicatedSize: 8, wantStandaloneReclaim: 4, wantAggregateReclaim: 4},
-		{name: "AS1_DD1_SE0_DE1", allowSharedOverlap: true, disableDedicatedOverlap: true, dedicatedEnableReclaim: true, wantSharedSize: 14, wantDedicatedSize: 6, wantStandaloneReclaim: 4, wantAggregateReclaim: 4},
-		{name: "AS1_DD1_SE1_DE0", allowSharedOverlap: true, disableDedicatedOverlap: true, sharedEnableReclaim: true, wantSharedSize: 12, wantDedicatedSize: 8, wantSharedOverlap: 8, wantAggregateReclaim: 8},
-		{name: "AS1_DD1_SE1_DE1", allowSharedOverlap: true, disableDedicatedOverlap: true, sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantSharedSize: 14, wantDedicatedSize: 6, wantSharedOverlap: 10, wantAggregateReclaim: 10},
+		{
+			name: "AS0_DD0_SE0_DE0",
+			want: types.InternalCPUCalculationResult{
+				PoolEntries: map[string]map[int]types.CPUResource{
+					"share": {0: {Size: 8, Quota: -1}}, "dedicated-pod": {0: {Size: 8, Quota: -1}},
+					commonstate.PoolNameReclaim: {0: {Size: 4, Quota: -1}},
+				},
+				PoolOverlapInfo:             map[string]map[int]map[string]int{},
+				PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{},
+				TimeStamp:                   time.Time{},
+			},
+		},
+		{
+			name:                   "AS0_DD0_SE0_DE1",
+			dedicatedEnableReclaim: true,
+			want: types.InternalCPUCalculationResult{
+				PoolEntries: map[string]map[int]types.CPUResource{
+					"share": {0: {Size: 8, Quota: -1}}, "dedicated-pod": {0: {Size: 8, Quota: -1}},
+					commonstate.PoolNameReclaim: {0: {Size: 4, Quota: -1}},
+				},
+				PoolOverlapInfo: map[string]map[int]map[string]int{},
+				PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{
+					commonstate.PoolNameReclaim: {0: {"dedicated-pod": {"main": 2, "sidecar": 2}}},
+				},
+				TimeStamp: time.Time{},
+			},
+		},
+		{
+			name:                "AS0_DD0_SE1_DE0",
+			sharedEnableReclaim: true,
+			want: types.InternalCPUCalculationResult{
+				PoolEntries: map[string]map[int]types.CPUResource{
+					"share": {0: {Size: 4, Quota: -1}}, "dedicated-pod": {0: {Size: 8, Quota: -1}},
+					commonstate.PoolNameReclaim: {0: {Size: 8, Quota: -1}},
+				},
+				PoolOverlapInfo:             map[string]map[int]map[string]int{},
+				PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{},
+				TimeStamp:                   time.Time{},
+			},
+		},
+		{
+			name:                   "AS0_DD0_SE1_DE1",
+			sharedEnableReclaim:    true,
+			dedicatedEnableReclaim: true,
+			want: types.InternalCPUCalculationResult{
+				PoolEntries: map[string]map[int]types.CPUResource{
+					"share": {0: {Size: 4, Quota: -1}}, "dedicated-pod": {0: {Size: 8, Quota: -1}},
+					commonstate.PoolNameReclaim: {0: {Size: 8, Quota: -1}},
+				},
+				PoolOverlapInfo: map[string]map[int]map[string]int{},
+				PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{
+					commonstate.PoolNameReclaim: {0: {"dedicated-pod": {"main": 2, "sidecar": 2}}},
+				},
+				TimeStamp: time.Time{},
+			},
+		},
+		{
+			name: "AS0_DD1_SE0_DE0",
+			want: types.InternalCPUCalculationResult{
+				PoolEntries: map[string]map[int]types.CPUResource{
+					"share": {0: {Size: 8, Quota: -1}}, "dedicated-pod": {0: {Size: 8, Quota: -1}},
+					commonstate.PoolNameReclaim: {0: {Size: 4, Quota: -1}},
+				},
+				PoolOverlapInfo:             map[string]map[int]map[string]int{},
+				PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{},
+				TimeStamp:                   time.Time{},
+				DisableDedicatedCoresOverlapReclaimedCores: true,
+			},
+		},
+		{
+			name:                   "AS0_DD1_SE0_DE1",
+			dedicatedEnableReclaim: true,
+			want: types.InternalCPUCalculationResult{
+				PoolEntries: map[string]map[int]types.CPUResource{
+					"share": {0: {Size: 8, Quota: -1}}, "dedicated-pod": {0: {Size: 6, Quota: -1}},
+					commonstate.PoolNameReclaim: {0: {Size: 6, Quota: -1}},
+				},
+				PoolOverlapInfo:             map[string]map[int]map[string]int{},
+				PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{},
+				TimeStamp:                   time.Time{},
+				DisableDedicatedCoresOverlapReclaimedCores: true,
+			},
+		},
+		{
+			name:                "AS0_DD1_SE1_DE0",
+			sharedEnableReclaim: true,
+			want: types.InternalCPUCalculationResult{
+				PoolEntries: map[string]map[int]types.CPUResource{
+					"share": {0: {Size: 4, Quota: -1}}, "dedicated-pod": {0: {Size: 8, Quota: -1}},
+					commonstate.PoolNameReclaim: {0: {Size: 8, Quota: -1}},
+				},
+				PoolOverlapInfo:             map[string]map[int]map[string]int{},
+				PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{},
+				TimeStamp:                   time.Time{},
+				DisableDedicatedCoresOverlapReclaimedCores: true,
+			},
+		},
+		{
+			name:                   "AS0_DD1_SE1_DE1",
+			sharedEnableReclaim:    true,
+			dedicatedEnableReclaim: true,
+			want: types.InternalCPUCalculationResult{
+				PoolEntries: map[string]map[int]types.CPUResource{
+					"share": {0: {Size: 4, Quota: -1}}, "dedicated-pod": {0: {Size: 6, Quota: -1}},
+					commonstate.PoolNameReclaim: {0: {Size: 10, Quota: -1}},
+				},
+				PoolOverlapInfo:             map[string]map[int]map[string]int{},
+				PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{},
+				TimeStamp:                   time.Time{},
+				DisableDedicatedCoresOverlapReclaimedCores: true,
+			},
+		},
+		{
+			name: "AS1_DD0_SE0_DE0",
+			want: types.InternalCPUCalculationResult{
+				PoolEntries: map[string]map[int]types.CPUResource{
+					"share": {0: {Size: 12, Quota: -1}}, "dedicated-pod": {0: {Size: 8, Quota: -1}},
+					commonstate.PoolNameReclaim: {0: {Size: 4, Quota: -1}},
+				},
+				PoolOverlapInfo:                       map[string]map[int]map[string]int{},
+				PoolOverlapPodContainerInfo:           map[string]map[int]map[string]map[string]int{},
+				TimeStamp:                             time.Time{},
+				AllowSharedCoresOverlapReclaimedCores: true,
+			},
+		},
+		{
+			name:                   "AS1_DD0_SE0_DE1",
+			dedicatedEnableReclaim: true,
+			want: types.InternalCPUCalculationResult{
+				PoolEntries: map[string]map[int]types.CPUResource{
+					"share": {0: {Size: 12, Quota: -1}}, "dedicated-pod": {0: {Size: 8, Quota: -1}},
+					commonstate.PoolNameReclaim: {0: {Size: 2, Quota: -1}},
+				},
+				PoolOverlapInfo: map[string]map[int]map[string]int{},
+				PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{
+					commonstate.PoolNameReclaim: {0: {"dedicated-pod": {"main": 2, "sidecar": 2}}},
+				},
+				TimeStamp:                             time.Time{},
+				AllowSharedCoresOverlapReclaimedCores: true,
+			},
+		},
+		{
+			name:                "AS1_DD0_SE1_DE0",
+			sharedEnableReclaim: true,
+			want: types.InternalCPUCalculationResult{
+				PoolEntries: map[string]map[int]types.CPUResource{
+					"share": {0: {Size: 12, Quota: -1}}, "dedicated-pod": {0: {Size: 8, Quota: -1}},
+					commonstate.PoolNameReclaim: {0: {Size: 0, Quota: -1}},
+				},
+				PoolOverlapInfo: map[string]map[int]map[string]int{
+					commonstate.PoolNameReclaim: {0: {"share": 8}},
+				},
+				PoolOverlapPodContainerInfo:           map[string]map[int]map[string]map[string]int{},
+				TimeStamp:                             time.Time{},
+				AllowSharedCoresOverlapReclaimedCores: true,
+			},
+		},
+		{
+			name:                   "AS1_DD0_SE1_DE1",
+			sharedEnableReclaim:    true,
+			dedicatedEnableReclaim: true,
+			want: types.InternalCPUCalculationResult{
+				PoolEntries: map[string]map[int]types.CPUResource{
+					"share": {0: {Size: 12, Quota: -1}}, "dedicated-pod": {0: {Size: 8, Quota: -1}},
+					commonstate.PoolNameReclaim: {0: {Size: 0, Quota: -1}},
+				},
+				PoolOverlapInfo: map[string]map[int]map[string]int{
+					commonstate.PoolNameReclaim: {0: {"share": 8}},
+				},
+				PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{
+					commonstate.PoolNameReclaim: {0: {"dedicated-pod": {"main": 2, "sidecar": 2}}},
+				},
+				TimeStamp:                             time.Time{},
+				AllowSharedCoresOverlapReclaimedCores: true,
+			},
+		},
+		{
+			name: "AS1_DD1_SE0_DE0",
+			want: types.InternalCPUCalculationResult{
+				PoolEntries: map[string]map[int]types.CPUResource{
+					"share": {0: {Size: 12, Quota: -1}}, "dedicated-pod": {0: {Size: 8, Quota: -1}},
+					commonstate.PoolNameReclaim: {0: {Size: 4, Quota: -1}},
+				},
+				PoolOverlapInfo:                            map[string]map[int]map[string]int{},
+				PoolOverlapPodContainerInfo:                map[string]map[int]map[string]map[string]int{},
+				TimeStamp:                                  time.Time{},
+				AllowSharedCoresOverlapReclaimedCores:      true,
+				DisableDedicatedCoresOverlapReclaimedCores: true,
+			},
+		},
+		{
+			name:                   "AS1_DD1_SE0_DE1",
+			dedicatedEnableReclaim: true,
+			want: types.InternalCPUCalculationResult{
+				PoolEntries: map[string]map[int]types.CPUResource{
+					"share": {0: {Size: 14, Quota: -1}}, "dedicated-pod": {0: {Size: 6, Quota: -1}},
+					commonstate.PoolNameReclaim: {0: {Size: 4, Quota: -1}},
+				},
+				PoolOverlapInfo:                            map[string]map[int]map[string]int{},
+				PoolOverlapPodContainerInfo:                map[string]map[int]map[string]map[string]int{},
+				TimeStamp:                                  time.Time{},
+				AllowSharedCoresOverlapReclaimedCores:      true,
+				DisableDedicatedCoresOverlapReclaimedCores: true,
+			},
+		},
+		{
+			name:                "AS1_DD1_SE1_DE0",
+			sharedEnableReclaim: true,
+			want: types.InternalCPUCalculationResult{
+				PoolEntries: map[string]map[int]types.CPUResource{
+					"share": {0: {Size: 12, Quota: -1}}, "dedicated-pod": {0: {Size: 8, Quota: -1}},
+					commonstate.PoolNameReclaim: {0: {Size: 0, Quota: -1}},
+				},
+				PoolOverlapInfo: map[string]map[int]map[string]int{
+					commonstate.PoolNameReclaim: {0: {"share": 8}},
+				},
+				PoolOverlapPodContainerInfo:                map[string]map[int]map[string]map[string]int{},
+				TimeStamp:                                  time.Time{},
+				AllowSharedCoresOverlapReclaimedCores:      true,
+				DisableDedicatedCoresOverlapReclaimedCores: true,
+			},
+		},
+		{
+			name:                   "AS1_DD1_SE1_DE1",
+			sharedEnableReclaim:    true,
+			dedicatedEnableReclaim: true,
+			want: types.InternalCPUCalculationResult{
+				PoolEntries: map[string]map[int]types.CPUResource{
+					"share": {0: {Size: 14, Quota: -1}}, "dedicated-pod": {0: {Size: 6, Quota: -1}},
+					commonstate.PoolNameReclaim: {0: {Size: 0, Quota: -1}},
+				},
+				PoolOverlapInfo: map[string]map[int]map[string]int{
+					commonstate.PoolNameReclaim: {0: {"share": 10}},
+				},
+				PoolOverlapPodContainerInfo:                map[string]map[int]map[string]map[string]int{},
+				TimeStamp:                                  time.Time{},
+				AllowSharedCoresOverlapReclaimedCores:      true,
+				DisableDedicatedCoresOverlapReclaimedCores: true,
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -1538,8 +1756,8 @@ func TestAssembleWithoutNUMAExclusivePoolOverlapPolicyMatrix(t *testing.T) {
 			result, err := runOrdinaryOverlapAssemblerCase(t, ordinaryOverlapAssemblerCase{
 				capacity:                20,
 				reserved:                4,
-				allowSharedOverlap:      tt.allowSharedOverlap,
-				disableDedicatedOverlap: tt.disableDedicatedOverlap,
+				allowSharedOverlap:      tt.want.AllowSharedCoresOverlapReclaimedCores,
+				disableDedicatedOverlap: tt.want.DisableDedicatedCoresOverlapReclaimedCores,
 				sharedEnableReclaim:     tt.sharedEnableReclaim,
 				dedicatedEnableReclaim:  tt.dedicatedEnableReclaim,
 				sharedRequest:           8,
@@ -1548,27 +1766,7 @@ func TestAssembleWithoutNUMAExclusivePoolOverlapPolicyMatrix(t *testing.T) {
 				dedicatedRequirement:    6,
 			})
 			require.NoError(t, err)
-			require.Equal(t, map[string]map[int]types.CPUResource{
-				"share":                     {0: {Size: tt.wantSharedSize, Quota: -1}},
-				"dedicated-pod":             {0: {Size: tt.wantDedicatedSize, Quota: -1}},
-				commonstate.PoolNameReclaim: {0: {Size: tt.wantStandaloneReclaim, Quota: -1}},
-			}, result.PoolEntries)
-			if tt.wantSharedOverlap == 0 {
-				require.Empty(t, result.PoolOverlapInfo[commonstate.PoolNameReclaim][0])
-			} else {
-				require.Equal(t, map[string]int{"share": tt.wantSharedOverlap},
-					result.PoolOverlapInfo[commonstate.PoolNameReclaim][0])
-			}
-			require.Equal(t, tt.wantDedicatedAliases,
-				result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["dedicated-pod"])
-			actualDedicatedOverlap := 0
-			if aliases := result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["dedicated-pod"]; len(aliases) > 0 {
-				actualDedicatedOverlap = aliases["main"]
-			}
-			require.Equal(t, tt.wantAggregateReclaim,
-				result.PoolEntries[commonstate.PoolNameReclaim][0].Size+
-					result.PoolOverlapInfo[commonstate.PoolNameReclaim][0]["share"]+
-					actualDedicatedOverlap)
+			require.Equal(t, tt.want, *result)
 		})
 	}
 }
