@@ -571,15 +571,10 @@ func (p *DynamicPolicy) allocateByCPUAdvisor(
 		return fmt.Errorf("applyHeadroom failed with error: %v", applyErr)
 	}
 
-	applyErr = p.applyCgroupConfigs(resp)
-	if applyErr != nil {
-		return fmt.Errorf("applyCgroupConfigs failed with error: %v", applyErr)
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), cpuSetAdjustmentHandlerTimeout(p.conf))
 	defer cancel()
-	if err := p.runCPUSetAdjustmentHandlersAfterAdvisorCommit(ctx); err != nil {
-		return fmt.Errorf("runCPUSetAdjustmentHandlers failed with error: %v", err)
+	if err := p.applyPostAdvisorCommit(ctx, resp, p.state.GetRevision()); err != nil {
+		return err
 	}
 
 	return nil

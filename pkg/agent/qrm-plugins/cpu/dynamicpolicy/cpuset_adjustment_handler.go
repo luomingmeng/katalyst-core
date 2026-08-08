@@ -26,6 +26,7 @@ import (
 	"time"
 
 	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
+	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	"github.com/kubewharf/katalyst-core/pkg/config"
@@ -299,9 +300,36 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 func (p *DynamicPolicy) runCPUSetAdjustmentHandlersAfterAdvisorCommit(ctx context.Context) error {
 	err := p.runCPUSetAdjustmentHandlers(ctx)
 	if err != nil {
-		p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonApplyFailed)
+		p.markAdvisorApplyFailed(p.state.GetRevision())
 	}
 	return err
+}
+
+func (p *DynamicPolicy) applyPostAdvisorCommit(
+	ctx context.Context,
+	resp *advisorapi.ListAndWatchResponse,
+	revision uint64,
+) error {
+	cgroupErr := p.applyCgroupConfigs(resp)
+	adjustmentErr := p.runCPUSetAdjustmentHandlers(ctx)
+	if cgroupErr == nil && adjustmentErr == nil {
+		return nil
+	}
+
+	p.markAdvisorApplyFailed(revision)
+	if cgroupErr != nil && adjustmentErr != nil {
+		return fmt.Errorf("applyCgroupConfigs failed with error: %v; runCPUSetAdjustmentHandlers failed with error: %v",
+			cgroupErr, adjustmentErr)
+	}
+	if cgroupErr != nil {
+		return fmt.Errorf("applyCgroupConfigs failed with error: %v", cgroupErr)
+	}
+	return fmt.Errorf("runCPUSetAdjustmentHandlers failed with error: %v", adjustmentErr)
+}
+
+func (p *DynamicPolicy) markAdvisorApplyFailed(revision uint64) {
+	general.Errorf("post-advisor-commit apply failed for state revision %d; scheduling latest-state retry", revision)
+	p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonApplyFailed)
 }
 
 func (p *DynamicPolicy) scheduleCPUSetAdjustmentRetry(reason cpusetutil.CPUSetAdjustmentRetryReason) {
