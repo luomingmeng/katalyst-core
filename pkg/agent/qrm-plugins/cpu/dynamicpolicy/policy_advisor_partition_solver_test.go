@@ -259,6 +259,20 @@ func TestSolveDisjointPartitionsFailsClosed(t *testing.T) {
 	require.Nil(t, got)
 }
 
+func TestPartitionCostWeightsBoundary(t *testing.T) {
+	oldWeight, reclaimWeight, topologyWeight, err := partitionCostWeights(8192, 8192, 681)
+	require.NoError(t, err)
+	require.Greater(t, topologyWeight, int64(0))
+	require.Greater(t, reclaimWeight, topologyWeight)
+	require.Greater(t, oldWeight, reclaimWeight)
+
+	oldWeight, reclaimWeight, topologyWeight, err = partitionCostWeights(8192, 8192, 682)
+	require.ErrorContains(t, err, "partition cost overflow")
+	require.Zero(t, oldWeight)
+	require.Zero(t, reclaimWeight)
+	require.Zero(t, topologyWeight)
+}
+
 func partitionSolverFixtureTopology() *machine.CPUTopology {
 	return &machine.CPUTopology{
 		NumCPUs:      8,

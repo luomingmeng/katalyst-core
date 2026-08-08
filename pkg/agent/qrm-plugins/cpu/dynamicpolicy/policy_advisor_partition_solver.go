@@ -74,7 +74,10 @@ func solveDisjointPartitions(
 			dedicatedEligible = dedicatedEligible.Union(demand.eligible)
 		}
 	}
-	oldWeight, reclaimWeight, topologyWeight := partitionCostWeights(total, len(cpus), len(sortedDemands))
+	oldWeight, reclaimWeight, topologyWeight, err := partitionCostWeights(total, len(cpus), len(sortedDemands))
+	if err != nil {
+		return nil, err
+	}
 
 	for cpuIndex, cpu := range cpus {
 		cpuNode := cpuBase + cpuIndex
@@ -83,10 +86,13 @@ func solveDisjointPartitions(
 			if !demand.eligible.Contains(cpu) {
 				continue
 			}
-			cost := partitionEdgeCost(
+			cost, costErr := partitionEdgeCost(
 				cpu, cpuIndex, demandIndex, demand, dedicatedEligible, topology,
 				oldWeight, reclaimWeight, topologyWeight, len(sortedDemands),
 			)
+			if costErr != nil {
+				return nil, costErr
+			}
 			edgeIndex := len(graph[cpuNode])
 			addPartitionFlowEdge(graph, cpuNode, demandBase+demandIndex, 1, cost)
 			assignmentEdges[cpuIndex] = append(assignmentEdges[cpuIndex], partitionAssignmentEdge{
@@ -164,13 +170,60 @@ func validatePartitionDemands(
 	return sortedDemands, allEligible.ToSliceInt(), total, nil
 }
 
-func partitionCostWeights(total, cpuCount, demandCount int) (int64, int64, int64) {
-	maxTiePerEdge := int64(cpuCount*(demandCount+1) + demandCount + 1)
-	maxTieTotal := int64(total) * maxTiePerEdge
-	topologyWeight := maxTieTotal + 1
-	reclaimWeight := int64(total)*3*topologyWeight + maxTieTotal + 1
-	oldWeight := int64(total)*reclaimWeight + int64(total)*3*topologyWeight + maxTieTotal + 1
-	return oldWeight, reclaimWeight, topologyWeight
+func partitionCostWeights(total, cpuCount, demandCount int) (int64, int64, int64, error) {
+	demandBase, err := checkedPartitionCostAdd(int64(demandCount), 1)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	maxTiePerEdge, err := checkedPartitionCostMul(int64(cpuCount), demandBase)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	maxTiePerEdge, err = checkedPartitionCostAdd(maxTiePerEdge, demandBase)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	maxTieTotal, err := checkedPartitionCostMul(int64(total), maxTiePerEdge)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	topologyWeight, err := checkedPartitionCostAdd(maxTieTotal, 1)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	maxTopologyTotal, err := checkedPartitionCostMul(int64(total), 3)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	maxTopologyTotal, err = checkedPartitionCostMul(maxTopologyTotal, topologyWeight)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	reclaimWeight, err := checkedPartitionCostAdd(maxTopologyTotal, maxTieTotal)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	reclaimWeight, err = checkedPartitionCostAdd(reclaimWeight, 1)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	maxReclaimTotal, err := checkedPartitionCostMul(int64(total), reclaimWeight)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	oldWeight, err := checkedPartitionCostAdd(maxReclaimTotal, maxTopologyTotal)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	oldWeight, err = checkedPartitionCostAdd(oldWeight, maxTieTotal)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	oldWeight, err = checkedPartitionCostAdd(oldWeight, 1)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return oldWeight, reclaimWeight, topologyWeight, nil
 }
 
 func partitionEdgeCost(
@@ -180,17 +233,70 @@ func partitionEdgeCost(
 	topology *machine.CPUTopology,
 	oldWeight, reclaimWeight, topologyWeight int64,
 	demandCount int,
-) int64 {
+) (int64, error) {
 	var cost int64
+	var err error
 	if !demand.preferred.Contains(cpu) {
-		cost += oldWeight
+		cost, err = checkedPartitionCostAdd(cost, oldWeight)
+		if err != nil {
+			return 0, err
+		}
 	}
 	if demand.class == advisorBlockClassMandatoryReclaim && dedicatedEligible.Contains(cpu) {
-		cost += reclaimWeight
+		cost, err = checkedPartitionCostAdd(cost, reclaimWeight)
+		if err != nil {
+			return 0, err
+		}
 	}
-	cost += int64(partitionTopologyDistance(cpu, demand.preferred, topology)) * topologyWeight
-	cost += int64(cpuRank*(demandCount+1) + demandRank + 1)
-	return cost
+	topologyCost, err := checkedPartitionCostMul(
+		int64(partitionTopologyDistance(cpu, demand.preferred, topology)),
+		topologyWeight,
+	)
+	if err != nil {
+		return 0, err
+	}
+	cost, err = checkedPartitionCostAdd(cost, topologyCost)
+	if err != nil {
+		return 0, err
+	}
+	demandBase, err := checkedPartitionCostAdd(int64(demandCount), 1)
+	if err != nil {
+		return 0, err
+	}
+	tieCost, err := checkedPartitionCostMul(int64(cpuRank), demandBase)
+	if err != nil {
+		return 0, err
+	}
+	demandTie, err := checkedPartitionCostAdd(int64(demandRank), 1)
+	if err != nil {
+		return 0, err
+	}
+	tieCost, err = checkedPartitionCostAdd(tieCost, demandTie)
+	if err != nil {
+		return 0, err
+	}
+	return checkedPartitionCostAdd(cost, tieCost)
+}
+
+func checkedPartitionCostAdd(left, right int64) (int64, error) {
+	if (right > 0 && left > math.MaxInt64-right) || (right < 0 && left < math.MinInt64-right) {
+		return 0, fmt.Errorf("partition cost overflow")
+	}
+	return left + right, nil
+}
+
+func checkedPartitionCostMul(left, right int64) (int64, error) {
+	if left == 0 || right == 0 {
+		return 0, nil
+	}
+	if (left == math.MinInt64 && right == -1) || (right == math.MinInt64 && left == -1) {
+		return 0, fmt.Errorf("partition cost overflow")
+	}
+	product := left * right
+	if product/right != left {
+		return 0, fmt.Errorf("partition cost overflow")
+	}
+	return product, nil
 }
 
 func partitionTopologyDistance(cpu int, preferred machine.CPUSet, topology *machine.CPUTopology) int {
