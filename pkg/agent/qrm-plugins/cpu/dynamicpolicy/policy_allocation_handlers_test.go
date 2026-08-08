@@ -2090,6 +2090,87 @@ func TestDedicatedNUMAExclusiveRampUpRejectsEmptyReclaimFloor(t *testing.T) {
 	require.Nil(t, p.state.GetAllocationInfo(req.PodUid, req.ContainerName))
 }
 
+func TestDedicatedNUMAExclusiveRampUpValidatesPartitionEligibleCoverage(t *testing.T) {
+	t.Parallel()
+
+	newFixture := func(t *testing.T) (*DynamicPolicy, *pluginapi.ResourceRequest) {
+		cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+		require.NoError(t, err)
+		p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+		require.NoError(t, err)
+		p.reservedCPUs = machine.NewCPUSet()
+		p.reservedReclaimedCPUSet = machine.NewCPUSet(2)
+		p.reservedReclaimedCPUsSize = 1
+		p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+		p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0
+		p.dynamicConfig.GetDynamicConfiguration().DisableReclaimPinnedCPUSetResourcePackageSelector = "disable-reclaim=true"
+		p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
+		p.state.SetMachineState(state.NUMANodeMap{
+			0: {
+				DefaultCPUSet: cpuTopology.CPUDetails.CPUsInNUMANodes(0),
+				ResourcePackageStates: map[string]*state.ResourcePackageState{
+					"work": {
+						PinnedCPUSet: machine.NewCPUSet(0, 1),
+					},
+					"protected": {
+						Attributes:   map[string]string{"disable-reclaim": "true"},
+						PinnedCPUSet: machine.NewCPUSet(7),
+					},
+				},
+			},
+		}, false)
+
+		return p, &pluginapi.ResourceRequest{
+			PodUid: "exclusive-dnb-partition-coverage", PodNamespace: "default",
+			PodName: "exclusive-dnb-partition-coverage", ContainerName: "main",
+			ContainerType: pluginapi.ContainerType_MAIN, ResourceName: string(v1.ResourceCPU),
+			ResourceRequests: map[string]float64{string(v1.ResourceCPU): 2},
+			Labels: map[string]string{
+				apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+			},
+			Annotations: map[string]string{
+				apiconsts.PodAnnotationQoSLevelKey:                    apiconsts.PodAnnotationQoSLevelDedicatedCores,
+				apiconsts.PodAnnotationMemoryEnhancementNumaBinding:   apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+				apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
+				apiconsts.PodAnnotationResourcePackageKey:             "work",
+			},
+			Hint: &pluginapi.TopologyHint{Nodes: []uint64{0}},
+		}
+	}
+
+	t.Run("disable-reclaim pinned CPU outside dedicated and reclaim eligibility is legal", func(t *testing.T) {
+		p, req := newFixture(t)
+
+		resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(context.Background(), req, true)
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+
+		allocation := p.state.GetAllocationInfo(req.PodUid, req.ContainerName)
+		reclaim := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+		require.NotNil(t, allocation)
+		require.NotNil(t, reclaim)
+		require.True(t, allocation.AllocationResult.Union(reclaim.AllocationResult).Equals(machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6)))
+		require.False(t, allocation.AllocationResult.Contains(7))
+		require.False(t, reclaim.AllocationResult.Contains(7))
+	})
+
+	t.Run("incorrect dedicated and reclaim union is rejected", func(t *testing.T) {
+		p, req := newFixture(t)
+		p.state.SetAllocationInfo(commonstate.PoolNameInterrupt, commonstate.FakedContainerName, &state.AllocationInfo{
+			AllocationMeta: commonstate.AllocationMeta{
+				PodUid:        commonstate.PoolNameInterrupt,
+				ContainerName: commonstate.FakedContainerName,
+			},
+			AllocationResult: machine.NewCPUSet(1),
+		}, false)
+
+		resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(context.Background(), req, true)
+		require.Nil(t, resp)
+		require.ErrorContains(t, err, "do not cover NUMA 0")
+		require.Nil(t, p.state.GetAllocationInfo(req.PodUid, req.ContainerName))
+	})
+}
+
 func TestAllocateRestoresPreviousDNBWhenAtomicCommitFails(t *testing.T) {
 	t.Parallel()
 
