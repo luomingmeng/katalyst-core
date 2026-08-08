@@ -271,6 +271,34 @@ func TestAssemblePoolEntriesDoesNotKeepRampUpHardReclaimMinimumWhenDisabled(t *t
 	require.Equal(t, uint64(1), reclaimResult.Blocks[0].Result)
 }
 
+func TestAssemblePoolEntriesKeepsAssemblerStandaloneReclaimWithinCapacity(t *testing.T) {
+	t.Parallel()
+
+	cs := newTestCPUServer(t, &mockCPUResourceAdvisor{}, nil)
+	entries := make(map[string]*cpuadvisor.CalculationEntries)
+	bs := NewBlockSet()
+	cs.assemblePoolEntries(&types.InternalCPUCalculationResult{
+		PoolEntries: map[string]map[int]types.CPUResource{
+			"share": {
+				0: {Size: 8, Quota: -1},
+			},
+			"dedicated-pod": {
+				0: {Size: 8, Quota: -1},
+			},
+			commonstate.PoolNameReclaim: {
+				0: {Size: 4, Quota: -1},
+			},
+		},
+	}, entries, bs)
+
+	var physicalBlockTotal uint64
+	for _, blocks := range bs {
+		require.NotEmpty(t, blocks)
+		physicalBlockTotal += blocks[0].Block.Result
+	}
+	require.Equal(t, uint64(20), physicalBlockTotal)
+}
+
 func TestCPUServerAddContainer(t *testing.T) {
 	t.Parallel()
 

@@ -486,41 +486,73 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 			"sharePoolSizeRequirements", sharePoolSizeRequirements,
 			"expansionTargets", expansionTargets)
 
-		sharedAvailable := shareAndIsolatedDedicatedPoolAvailable
-		if !legacySharedOnly && !*pa.allowSharedCoresOverlapReclaimedCores {
-			sharedAvailable = general.Max(sharedAvailable-reserveInDomain, 0)
+		allocateAtCapacity := func(capacity int) (map[string]int, bool) {
+			sharedAvailable := capacity
+			if !legacySharedOnly && !*pa.allowSharedCoresOverlapReclaimedCores {
+				sharedAvailable = general.Max(sharedAvailable-reserveInDomain, 0)
+			}
+			dedicatedAvailable := capacity
+			if result.DisableDedicatedCoresOverlapReclaimedCores {
+				dedicatedAvailable = general.Max(dedicatedAvailable-reserveInDomain, 0)
+			}
+
+			var poolSizes map[string]int
+			var throttled bool
+			if legacySharedOnly {
+				poolSizes, throttled = allocatePoolSizesByPriority(
+					capacity,
+					dedicatedMinimums,
+					isolationRegionInfo.isolationLowerSizes,
+					sharePoolSizeRequirements,
+					expansionTargets,
+				)
+			} else {
+				poolSizes, throttled = allocatePoolSizesByWorkloadPriority(
+					capacity,
+					dedicatedAvailable,
+					sharedAvailable,
+					dedicatedMinimums,
+					isolationRegionInfo.isolationLowerSizes,
+					sharePoolSizeRequirements,
+					expansionTargets,
+				)
+			}
+			if allowExpand {
+				expandSharePoolsToCapacity(poolSizes, shareRegionInfo.requests, sharedAvailable)
+			}
+			return poolSizes, throttled
 		}
-		dedicatedAvailable := shareAndIsolatedDedicatedPoolAvailable
-		if result.DisableDedicatedCoresOverlapReclaimedCores {
-			dedicatedAvailable = general.Max(dedicatedAvailable-reserveInDomain, 0)
-		}
-		var shareAndIsolateDedicatedPoolSizes map[string]int
-		var poolThrottled bool
-		if legacySharedOnly {
-			shareAndIsolateDedicatedPoolSizes, poolThrottled = allocatePoolSizesByPriority(
-				shareAndIsolatedDedicatedPoolAvailable,
-				dedicatedMinimums,
-				isolationRegionInfo.isolationLowerSizes,
-				sharePoolSizeRequirements,
-				expansionTargets,
-			)
-		} else {
-			shareAndIsolateDedicatedPoolSizes, poolThrottled = allocatePoolSizesByWorkloadPriority(
-				shareAndIsolatedDedicatedPoolAvailable,
-				dedicatedAvailable,
-				sharedAvailable,
-				dedicatedMinimums,
-				isolationRegionInfo.isolationLowerSizes,
-				sharePoolSizeRequirements,
-				expansionTargets,
-			)
-		}
-		if allowExpand {
-			expandSharePoolsToCapacity(
-				shareAndIsolateDedicatedPoolSizes,
-				shareRegionInfo.requests,
-				sharedAvailable,
-			)
+
+		allocationCapacity := shareAndIsolatedDedicatedPoolAvailable
+		shareAndIsolateDedicatedPoolSizes, poolThrottled := allocateAtCapacity(allocationCapacity)
+		if nodeEnableReclaim && !legacySharedOnly {
+			for {
+				overlapCapacity := 0
+				if *pa.allowSharedCoresOverlapReclaimedCores {
+					for poolName, requirement := range shareRegionInfo.requirements {
+						if shareRegionInfo.reclaimEnable[poolName] {
+							overlapCapacity += general.Max(shareAndIsolateDedicatedPoolSizes[poolName]-requirement, 0)
+						}
+					}
+				}
+				if !result.DisableDedicatedCoresOverlapReclaimedCores {
+					for poolName, requirement := range dedicatedRegionInfo.requirements {
+						if dedicatedRegionInfo.reclaimEnable[poolName] {
+							overlapCapacity += general.Max(shareAndIsolateDedicatedPoolSizes[poolName]-requirement, 0)
+						}
+					}
+				}
+				freeCapacity := general.Max(
+					shareAndIsolatedDedicatedPoolAvailable-general.SumUpMapValues(shareAndIsolateDedicatedPoolSizes),
+					0,
+				)
+				deficit := general.Max(reserveInDomain-freeCapacity-overlapCapacity, 0)
+				if deficit == 0 || allocationCapacity == 0 {
+					break
+				}
+				allocationCapacity = general.Max(allocationCapacity-deficit, 0)
+				shareAndIsolateDedicatedPoolSizes, poolThrottled = allocateAtCapacity(allocationCapacity)
+			}
 		}
 
 		general.InfoS("getShareAndIsolateDedicatedPoolSizesFunc post priority allocation",
@@ -896,7 +928,7 @@ func (pa *ProvisionAssemblerCommon) calculateEnabledReclaimPool(
 		data.shareAndIsolatedDedicatedPoolAvailable-physicalUsage-data.totalUnusedNonReclaimablePinnedCPUSize,
 		0,
 	)
-	reclaimedCoresSize := general.Max(data.reservedForReclaim, freeStandalone+overlapSize)
+	reclaimedCoresSize := freeStandalone + overlapSize
 	reclaimedCoresQuota := float64(-1)
 
 	quotaCtrlKnobEnabled, err := metacache.IsQuotaCtrlKnobEnabled(pa.metaReader)
