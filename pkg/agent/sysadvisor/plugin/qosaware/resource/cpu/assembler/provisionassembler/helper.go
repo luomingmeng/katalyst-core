@@ -112,6 +112,72 @@ func allocatePoolSizesByPriority(
 	return result, throttled
 }
 
+func allocatePoolSizesByWorkloadPriority(
+	available, dedicatedAvailable, sharedAvailable int,
+	dedicatedRequirements,
+	isolationLowerSizes,
+	shareMinimums,
+	expansionTargets map[string]int,
+) (map[string]int, bool) {
+	result := make(map[string]int)
+	remaining := general.Max(available, 0)
+
+	allocateTier := func(targets map[string]int, limit int) {
+		increments := make(map[string]int)
+		for name, target := range targets {
+			if delta := general.Max(target, 0) - result[name]; delta > 0 {
+				increments[name] = delta
+			}
+		}
+		budget := general.Min(remaining, general.Max(limit, 0))
+		allocated := allocateProportionally(increments, budget)
+		for name, size := range allocated {
+			result[name] += size
+			remaining -= size
+		}
+	}
+
+	allocateTier(dedicatedRequirements, dedicatedAvailable)
+	allocateTier(isolationLowerSizes, remaining)
+	allocateTier(shareMinimums, sharedAvailable)
+
+	dedicatedExpansion := make(map[string]int)
+	isolationExpansion := make(map[string]int)
+	sharedExpansion := make(map[string]int)
+	for name, target := range expansionTargets {
+		switch {
+		case dedicatedRequirements[name] > 0:
+			dedicatedExpansion[name] = target
+		case isolationLowerSizes[name] > 0:
+			isolationExpansion[name] = target
+		default:
+			sharedExpansion[name] = target
+		}
+	}
+	allocateTier(dedicatedExpansion,
+		general.Max(dedicatedAvailable-general.SumUpMapValues(filterPoolSizes(result, dedicatedRequirements)), 0))
+	allocateTier(isolationExpansion, remaining)
+	allocateTier(sharedExpansion,
+		general.Max(sharedAvailable-general.SumUpMapValues(filterPoolSizes(result, shareMinimums)), 0))
+
+	throttled := false
+	for name, target := range expansionTargets {
+		if result[name] < general.Max(target, 0) {
+			throttled = true
+			break
+		}
+	}
+	return result, throttled
+}
+
+func filterPoolSizes(poolSizes, names map[string]int) map[string]int {
+	result := make(map[string]int)
+	for name := range names {
+		result[name] = poolSizes[name]
+	}
+	return result
+}
+
 func expandSharePoolsToCapacity(poolSizes, shareWeights map[string]int, available int) {
 	remaining := general.Max(available-general.SumUpMapValues(poolSizes), 0)
 	if remaining == 0 || len(shareWeights) == 0 {

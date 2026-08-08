@@ -434,25 +434,30 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 
 	reservedForReclaim := getNUMAsResource(*pa.reservedForReclaim, numaSet)
 	poolAvailableBeforeReserve := getNUMAsResource(*pa.numaAvailable, numaSet)
-	reserveExcludedFromPoolCapacity := !*pa.allowSharedCoresOverlapReclaimedCores ||
-		(result.DisableDedicatedCoresOverlapReclaimedCores && len(dedicatedRegions) > 0)
-	pinnedPoolAvailableByPkg, unpinnedShareAndIsolatedDedicatedPoolAvailable :=
+	pinnedPoolAvailableByPkg, pinnedReserveByPkg,
+		unpinnedShareAndIsolatedDedicatedPoolAvailable, unpinnedReserve :=
 		getEligibilityDomainCapacities(
 			numaSet,
 			cfg,
 			pinnedCPUSizeByPkg,
 			poolAvailableBeforeReserve,
 			reservedForReclaim,
-			reserveExcludedFromPoolCapacity,
 			pa.metaReader,
 		)
 	shareAndIsolatedDedicatedPoolAvailable := poolAvailableBeforeReserve
-	if reserveExcludedFromPoolCapacity {
-		shareAndIsolatedDedicatedPoolAvailable -= reservedForReclaim
+	legacySharedOnly := len(dedicatedRegions) == 0
+	if legacySharedOnly && !*pa.allowSharedCoresOverlapReclaimedCores {
+		for pkgName, reserve := range pinnedReserveByPkg {
+			pinnedPoolAvailableByPkg[pkgName] = general.Max(pinnedPoolAvailableByPkg[pkgName]-reserve, 0)
+		}
+		unpinnedShareAndIsolatedDedicatedPoolAvailable =
+			general.Max(unpinnedShareAndIsolatedDedicatedPoolAvailable-unpinnedReserve, 0)
+		shareAndIsolatedDedicatedPoolAvailable =
+			general.Max(shareAndIsolatedDedicatedPoolAvailable-reservedForReclaim, 0)
 	}
 
 	getShareAndIsolateDedicatedPoolSizesFunc := func(
-		shareAndIsolatedDedicatedPoolAvailable int,
+		shareAndIsolatedDedicatedPoolAvailable, reserveInDomain int,
 		shareRegionInfo, dedicatedRegionInfo regionInfo,
 		isolationRegionInfo isolationRegionInfo,
 	) map[string]int {
@@ -481,18 +486,40 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 			"sharePoolSizeRequirements", sharePoolSizeRequirements,
 			"expansionTargets", expansionTargets)
 
-		shareAndIsolateDedicatedPoolSizes, poolThrottled := allocatePoolSizesByPriority(
-			shareAndIsolatedDedicatedPoolAvailable,
-			dedicatedMinimums,
-			isolationRegionInfo.isolationLowerSizes,
-			sharePoolSizeRequirements,
-			expansionTargets,
-		)
+		sharedAvailable := shareAndIsolatedDedicatedPoolAvailable
+		if !legacySharedOnly && !*pa.allowSharedCoresOverlapReclaimedCores {
+			sharedAvailable = general.Max(sharedAvailable-reserveInDomain, 0)
+		}
+		dedicatedAvailable := shareAndIsolatedDedicatedPoolAvailable
+		if result.DisableDedicatedCoresOverlapReclaimedCores {
+			dedicatedAvailable = general.Max(dedicatedAvailable-reserveInDomain, 0)
+		}
+		var shareAndIsolateDedicatedPoolSizes map[string]int
+		var poolThrottled bool
+		if legacySharedOnly {
+			shareAndIsolateDedicatedPoolSizes, poolThrottled = allocatePoolSizesByPriority(
+				shareAndIsolatedDedicatedPoolAvailable,
+				dedicatedMinimums,
+				isolationRegionInfo.isolationLowerSizes,
+				sharePoolSizeRequirements,
+				expansionTargets,
+			)
+		} else {
+			shareAndIsolateDedicatedPoolSizes, poolThrottled = allocatePoolSizesByWorkloadPriority(
+				shareAndIsolatedDedicatedPoolAvailable,
+				dedicatedAvailable,
+				sharedAvailable,
+				dedicatedMinimums,
+				isolationRegionInfo.isolationLowerSizes,
+				sharePoolSizeRequirements,
+				expansionTargets,
+			)
+		}
 		if allowExpand {
 			expandSharePoolsToCapacity(
 				shareAndIsolateDedicatedPoolSizes,
 				shareRegionInfo.requests,
-				shareAndIsolatedDedicatedPoolAvailable,
+				sharedAvailable,
 			)
 		}
 
@@ -534,7 +561,13 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 			continue
 		}
 
-		poolSizes := getShareAndIsolateDedicatedPoolSizesFunc(pinnedPoolAvailable, allInfo.shareRegionInfo, allInfo.dedicatedRegionInfos, allInfo.isolationRegionInfo)
+		poolSizes := getShareAndIsolateDedicatedPoolSizesFunc(
+			pinnedPoolAvailable,
+			pinnedReserveByPkg[pkgName],
+			allInfo.shareRegionInfo,
+			allInfo.dedicatedRegionInfos,
+			allInfo.isolationRegionInfo,
+		)
 
 		allocatedForPkg := general.SumUpMapValues(poolSizes)
 		unusedForPkg := pinnedPoolAvailable - allocatedForPkg
@@ -561,7 +594,13 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 			"poolSizes", poolSizes)
 	}
 
-	unpinnedPoolSizes := getShareAndIsolateDedicatedPoolSizesFunc(unpinnedShareAndIsolatedDedicatedPoolAvailable, unpinnedShareRegionInfo, unpinnedDedicatedInfo, unpinnedIsolationInfo)
+	unpinnedPoolSizes := getShareAndIsolateDedicatedPoolSizesFunc(
+		unpinnedShareAndIsolatedDedicatedPoolAvailable,
+		unpinnedReserve,
+		unpinnedShareRegionInfo,
+		unpinnedDedicatedInfo,
+		unpinnedIsolationInfo,
+	)
 	for poolName, size := range unpinnedPoolSizes {
 		shareAndIsolateDedicatedPoolSizes[poolName] = size
 	}
@@ -591,11 +630,9 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		dedicatedReclaimCoresSize = general.Max(dedicatedReclaimCoresSize, 0)
 	}
 
-	if result.DisableDedicatedCoresOverlapReclaimedCores {
-		for poolName, podSet := range dedicatedInfo.podSet {
-			if len(podSet) > 0 && shareAndIsolateDedicatedPoolSizes[poolName] <= 0 {
-				return fmt.Errorf("active dedicated pool %q was regulated to zero", poolName)
-			}
+	for poolName, podSet := range dedicatedInfo.podSet {
+		if len(podSet) > 0 && shareAndIsolateDedicatedPoolSizes[poolName] <= 0 {
+			return fmt.Errorf("active dedicated pool %q was regulated to zero", poolName)
 		}
 	}
 
@@ -646,7 +683,6 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		nodeEnableReclaim:                      nodeEnableReclaim,
 		numaID:                                 numaID,
 		totalUnusedNonReclaimablePinnedCPUSize: totalUnusedNonReclaimablePinnedCPUSize,
-		reserveExcludedFromPoolCapacity:        reserveExcludedFromPoolCapacity,
 	}
 
 	policy := reclaimPoolCalculationPolicy{
@@ -781,7 +817,6 @@ type reclaimPoolCalculationData struct {
 	nodeEnableReclaim                      bool
 	numaID                                 int
 	totalUnusedNonReclaimablePinnedCPUSize int
-	reserveExcludedFromPoolCapacity        bool
 	overlapAtoms                           []overlapAtom
 }
 
@@ -795,10 +830,92 @@ func (pa *ProvisionAssemblerCommon) calculateReclaimPool(
 	policy reclaimPoolCalculationPolicy,
 	result *types.InternalCPUCalculationResult,
 ) (int, int, float64, error) {
+	if data.nodeEnableReclaim && len(data.dedicatedInfo.requests) > 0 {
+		return pa.calculateEnabledReclaimPool(data, policy)
+	}
 	if policy.allowSharedOverlap {
 		return pa.calculateOverlapReclaimPool(data, policy, result)
 	}
 	return pa.calculateNonOverlapReclaimPool(data, policy, result)
+}
+
+func (pa *ProvisionAssemblerCommon) calculateEnabledReclaimPool(
+	data *reclaimPoolCalculationData,
+	policy reclaimPoolCalculationPolicy,
+) (int, int, float64, error) {
+	overlapSize := 0
+	if policy.allowSharedOverlap {
+		for poolName, requirement := range data.shareInfo.requirements {
+			if !data.shareInfo.reclaimEnable[poolName] {
+				continue
+			}
+			size := data.shareAndIsolateDedicatedPoolSizes[poolName] - requirement
+			if size <= 0 {
+				continue
+			}
+			data.overlapAtoms = append(data.overlapAtoms, overlapAtom{
+				key:       "0/pool/" + poolName,
+				size:      size,
+				poolAlias: poolName,
+			})
+			overlapSize += size
+		}
+	}
+	if policy.allowDedicatedOverlap {
+		for poolName, requirement := range data.dedicatedInfo.requirements {
+			if !data.dedicatedInfo.reclaimEnable[poolName] {
+				continue
+			}
+			size := data.dedicatedPoolSizes[poolName] - requirement
+			if size <= 0 {
+				continue
+			}
+			podSet := data.dedicatedInfo.podSet[poolName]
+			if len(podSet) == 0 {
+				continue
+			}
+			atom := overlapAtom{
+				key:  "1/dedicated/" + poolName,
+				size: size,
+			}
+			for podUID, containerSet := range podSet {
+				for containerName := range containerSet {
+					atom.containerAlias = append(atom.containerAlias, podContainerAlias{
+						podUID:        podUID,
+						containerName: containerName,
+					})
+				}
+			}
+			data.overlapAtoms = append(data.overlapAtoms, atom)
+			overlapSize += size
+		}
+	}
+
+	physicalUsage := general.SumUpMapValues(data.shareAndIsolateDedicatedPoolSizes)
+	freeStandalone := general.Max(
+		data.shareAndIsolatedDedicatedPoolAvailable-physicalUsage-data.totalUnusedNonReclaimablePinnedCPUSize,
+		0,
+	)
+	reclaimedCoresSize := general.Max(data.reservedForReclaim, freeStandalone+overlapSize)
+	reclaimedCoresQuota := float64(-1)
+
+	quotaCtrlKnobEnabled, err := metacache.IsQuotaCtrlKnobEnabled(pa.metaReader)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	if quotaCtrlKnobEnabled && data.numaID != commonstate.FakedNUMAID && physicalUsage > 0 {
+		reclaimedCoresQuota = float64(reclaimedCoresSize)
+		for _, quota := range []float64{
+			data.shareInfo.minReclaimedCoresCPUQuota,
+			data.dedicatedInfo.minReclaimedCoresCPUQuota,
+		} {
+			if quota >= 0 {
+				reclaimedCoresQuota = general.MinFloat64(reclaimedCoresQuota, quota)
+			}
+		}
+		reclaimedCoresQuota = general.MaxFloat64(reclaimedCoresQuota, float64(data.reservedForReclaim))
+	}
+	return reclaimedCoresSize, overlapSize, reclaimedCoresQuota, nil
 }
 
 func (pa *ProvisionAssemblerCommon) calculateOverlapReclaimPool(
@@ -855,9 +972,6 @@ func (pa *ProvisionAssemblerCommon) calculateOverlapReclaimPool(
 
 	if data.nodeEnableReclaim {
 		reclaimedCoresSize = shareReclaimCoresSize + data.dedicatedReclaimCoresSize
-		if data.reserveExcludedFromPoolCapacity {
-			reclaimedCoresSize += data.reservedForReclaim
-		}
 		if reclaimedCoresSize < data.reservedForReclaim {
 			reclaimedCoresSize = data.reservedForReclaim
 			overlapCandidates := reclaimablePoolSizes
@@ -1121,14 +1235,11 @@ func getEligibilityDomainCapacities(
 	pinnedCPUSizeByPkg map[string]int,
 	availableBeforeReserve,
 	reservedForReclaim int,
-	excludeReserve bool,
 	metaReader metacache.MetaReader,
-) (map[string]int, int) {
+) (map[string]int, map[string]int, int, int) {
 	capacityByPkg := general.DeepCopyIntMap(pinnedCPUSizeByPkg)
 	totalPinned := general.SumUpMapValues(pinnedCPUSizeByPkg)
-	if !excludeReserve {
-		return capacityByPkg, general.Max(availableBeforeReserve-totalPinned, 0)
-	}
+	reserveByPkg := make(map[string]int)
 
 	reserveCPUSet := machine.NewCPUSet()
 	if reservePool, ok := metaReader.GetPoolInfo(commonstate.PoolNameReserve); ok && reservePool != nil {
@@ -1146,12 +1257,15 @@ func getEligibilityDomainCapacities(
 			}
 		}
 		reserveInPkg := reserveCPUSet.Intersection(pkgCPUSet)
-		capacityByPkg[pkgName] = general.Max(capacityByPkg[pkgName]-reserveInPkg.Size(), 0)
+		reserveByPkg[pkgName] = reserveInPkg.Size()
 		reservePinnedCPUSet = reservePinnedCPUSet.Union(reserveInPkg)
 	}
 
 	unpinnedReserve := general.Max(reservedForReclaim-reservePinnedCPUSet.Size(), 0)
-	return capacityByPkg, general.Max(availableBeforeReserve-totalPinned-unpinnedReserve, 0)
+	return capacityByPkg,
+		reserveByPkg,
+		general.Max(availableBeforeReserve-totalPinned, 0),
+		unpinnedReserve
 }
 
 func extractShareRegionInfo(shareRegions []region.QoSRegion, pinnedCPUSizeByPkg map[string]int, nonReclaimablePackages sets.String) (regionInfo, map[string]*regionInfo, error) {

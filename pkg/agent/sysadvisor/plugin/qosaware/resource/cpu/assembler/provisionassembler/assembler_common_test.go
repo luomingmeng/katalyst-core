@@ -1507,27 +1507,29 @@ func TestAssembleWithoutNUMAExclusivePoolOverlapPolicyMatrix(t *testing.T) {
 		disableDedicatedOverlap bool
 		sharedEnableReclaim     bool
 		dedicatedEnableReclaim  bool
+		wantSharedSize          int
 		wantDedicatedSize       int
-		wantReclaimSize         int
+		wantStandaloneReclaim   int
 		wantSharedOverlap       int
 		wantDedicatedAliases    map[string]int
+		wantAggregateReclaim    int
 	}{
-		{name: "AS0_DD0_SE0_DE0", wantDedicatedSize: 8, wantReclaimSize: 4},
-		{name: "AS0_DD0_SE0_DE1", dedicatedEnableReclaim: true, wantDedicatedSize: 8, wantReclaimSize: 4, wantDedicatedAliases: map[string]int{"main": 2, "sidecar": 2}},
-		{name: "AS0_DD0_SE1_DE0", sharedEnableReclaim: true, wantDedicatedSize: 8, wantReclaimSize: 8},
-		{name: "AS0_DD0_SE1_DE1", sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantDedicatedSize: 8, wantReclaimSize: 8, wantDedicatedAliases: map[string]int{"main": 2, "sidecar": 2}},
-		{name: "AS0_DD1_SE0_DE0", disableDedicatedOverlap: true, wantDedicatedSize: 8, wantReclaimSize: 4},
-		{name: "AS0_DD1_SE0_DE1", disableDedicatedOverlap: true, dedicatedEnableReclaim: true, wantDedicatedSize: 6, wantReclaimSize: 6},
-		{name: "AS0_DD1_SE1_DE0", disableDedicatedOverlap: true, sharedEnableReclaim: true, wantDedicatedSize: 8, wantReclaimSize: 8},
-		{name: "AS0_DD1_SE1_DE1", disableDedicatedOverlap: true, sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantDedicatedSize: 6, wantReclaimSize: 10},
-		{name: "AS1_DD0_SE0_DE0", allowSharedOverlap: true, wantDedicatedSize: 8, wantReclaimSize: 4},
-		{name: "AS1_DD0_SE0_DE1", allowSharedOverlap: true, dedicatedEnableReclaim: true, wantDedicatedSize: 8, wantDedicatedAliases: map[string]int{"main": 4, "sidecar": 4}},
-		{name: "AS1_DD0_SE1_DE0", allowSharedOverlap: true, sharedEnableReclaim: true, wantDedicatedSize: 8, wantSharedOverlap: 8},
-		{name: "AS1_DD0_SE1_DE1", allowSharedOverlap: true, sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantDedicatedSize: 8, wantSharedOverlap: 8, wantDedicatedAliases: map[string]int{"main": 2, "sidecar": 2}},
-		{name: "AS1_DD1_SE0_DE0", allowSharedOverlap: true, disableDedicatedOverlap: true, wantDedicatedSize: 8, wantReclaimSize: 4},
-		{name: "AS1_DD1_SE0_DE1", allowSharedOverlap: true, disableDedicatedOverlap: true, dedicatedEnableReclaim: true, wantDedicatedSize: 6, wantReclaimSize: 4},
-		{name: "AS1_DD1_SE1_DE0", allowSharedOverlap: true, disableDedicatedOverlap: true, sharedEnableReclaim: true, wantDedicatedSize: 8, wantReclaimSize: 4, wantSharedOverlap: 4},
-		{name: "AS1_DD1_SE1_DE1", allowSharedOverlap: true, disableDedicatedOverlap: true, sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantDedicatedSize: 6, wantReclaimSize: 4, wantSharedOverlap: 6},
+		{name: "AS0_DD0_SE0_DE0", wantSharedSize: 8, wantDedicatedSize: 8, wantStandaloneReclaim: 4, wantAggregateReclaim: 4},
+		{name: "AS0_DD0_SE0_DE1", dedicatedEnableReclaim: true, wantSharedSize: 8, wantDedicatedSize: 8, wantStandaloneReclaim: 4, wantDedicatedAliases: map[string]int{"main": 2, "sidecar": 2}, wantAggregateReclaim: 6},
+		{name: "AS0_DD0_SE1_DE0", sharedEnableReclaim: true, wantSharedSize: 4, wantDedicatedSize: 8, wantStandaloneReclaim: 8, wantAggregateReclaim: 8},
+		{name: "AS0_DD0_SE1_DE1", sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantSharedSize: 4, wantDedicatedSize: 8, wantStandaloneReclaim: 8, wantDedicatedAliases: map[string]int{"main": 2, "sidecar": 2}, wantAggregateReclaim: 10},
+		{name: "AS0_DD1_SE0_DE0", disableDedicatedOverlap: true, wantSharedSize: 8, wantDedicatedSize: 8, wantStandaloneReclaim: 4, wantAggregateReclaim: 4},
+		{name: "AS0_DD1_SE0_DE1", disableDedicatedOverlap: true, dedicatedEnableReclaim: true, wantSharedSize: 8, wantDedicatedSize: 6, wantStandaloneReclaim: 6, wantAggregateReclaim: 6},
+		{name: "AS0_DD1_SE1_DE0", disableDedicatedOverlap: true, sharedEnableReclaim: true, wantSharedSize: 4, wantDedicatedSize: 8, wantStandaloneReclaim: 8, wantAggregateReclaim: 8},
+		{name: "AS0_DD1_SE1_DE1", disableDedicatedOverlap: true, sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantSharedSize: 4, wantDedicatedSize: 6, wantStandaloneReclaim: 10, wantAggregateReclaim: 10},
+		{name: "AS1_DD0_SE0_DE0", allowSharedOverlap: true, wantSharedSize: 12, wantDedicatedSize: 8, wantStandaloneReclaim: 4, wantAggregateReclaim: 4},
+		{name: "AS1_DD0_SE0_DE1", allowSharedOverlap: true, dedicatedEnableReclaim: true, wantSharedSize: 12, wantDedicatedSize: 8, wantStandaloneReclaim: 2, wantDedicatedAliases: map[string]int{"main": 2, "sidecar": 2}, wantAggregateReclaim: 4},
+		{name: "AS1_DD0_SE1_DE0", allowSharedOverlap: true, sharedEnableReclaim: true, wantSharedSize: 12, wantDedicatedSize: 8, wantSharedOverlap: 8, wantAggregateReclaim: 8},
+		{name: "AS1_DD0_SE1_DE1", allowSharedOverlap: true, sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantSharedSize: 12, wantDedicatedSize: 8, wantSharedOverlap: 8, wantDedicatedAliases: map[string]int{"main": 2, "sidecar": 2}, wantAggregateReclaim: 10},
+		{name: "AS1_DD1_SE0_DE0", allowSharedOverlap: true, disableDedicatedOverlap: true, wantSharedSize: 12, wantDedicatedSize: 8, wantStandaloneReclaim: 4, wantAggregateReclaim: 4},
+		{name: "AS1_DD1_SE0_DE1", allowSharedOverlap: true, disableDedicatedOverlap: true, dedicatedEnableReclaim: true, wantSharedSize: 14, wantDedicatedSize: 6, wantStandaloneReclaim: 4, wantAggregateReclaim: 4},
+		{name: "AS1_DD1_SE1_DE0", allowSharedOverlap: true, disableDedicatedOverlap: true, sharedEnableReclaim: true, wantSharedSize: 12, wantDedicatedSize: 8, wantSharedOverlap: 8, wantAggregateReclaim: 8},
+		{name: "AS1_DD1_SE1_DE1", allowSharedOverlap: true, disableDedicatedOverlap: true, sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantSharedSize: 14, wantDedicatedSize: 6, wantSharedOverlap: 10, wantAggregateReclaim: 10},
 	}
 
 	for _, tt := range tests {
@@ -1546,17 +1548,48 @@ func TestAssembleWithoutNUMAExclusivePoolOverlapPolicyMatrix(t *testing.T) {
 				dedicatedRequirement:    6,
 			})
 			require.NoError(t, err)
-			require.Equal(t, tt.wantDedicatedSize, result.PoolEntries["dedicated-pod"][0].Size)
-			require.Equal(t, tt.wantReclaimSize, result.PoolEntries[commonstate.PoolNameReclaim][0].Size)
-			require.Equal(t, tt.wantSharedOverlap,
-				result.PoolOverlapInfo[commonstate.PoolNameReclaim][0]["share"])
+			require.Equal(t, map[string]map[int]types.CPUResource{
+				"share":                     {0: {Size: tt.wantSharedSize, Quota: -1}},
+				"dedicated-pod":             {0: {Size: tt.wantDedicatedSize, Quota: -1}},
+				commonstate.PoolNameReclaim: {0: {Size: tt.wantStandaloneReclaim, Quota: -1}},
+			}, result.PoolEntries)
+			if tt.wantSharedOverlap == 0 {
+				require.Empty(t, result.PoolOverlapInfo[commonstate.PoolNameReclaim][0])
+			} else {
+				require.Equal(t, map[string]int{"share": tt.wantSharedOverlap},
+					result.PoolOverlapInfo[commonstate.PoolNameReclaim][0])
+			}
 			require.Equal(t, tt.wantDedicatedAliases,
 				result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["dedicated-pod"])
+			actualDedicatedOverlap := 0
+			if aliases := result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["dedicated-pod"]; len(aliases) > 0 {
+				actualDedicatedOverlap = aliases["main"]
+			}
+			require.Equal(t, tt.wantAggregateReclaim,
+				result.PoolEntries[commonstate.PoolNameReclaim][0].Size+
+					result.PoolOverlapInfo[commonstate.PoolNameReclaim][0]["share"]+
+					actualDedicatedOverlap)
 		})
 	}
 }
 
 func TestAssembleWithoutNUMAExclusivePoolDisjointDedicatedCapacityPressure(t *testing.T) {
+	t.Run("AS false does not remove reserve from DD false dedicated candidate", func(t *testing.T) {
+		result, err := runOrdinaryOverlapAssemblerCase(t, ordinaryOverlapAssemblerCase{
+			capacity:                5,
+			reserved:                4,
+			allowSharedOverlap:      false,
+			disableDedicatedOverlap: false,
+			dedicatedEnableReclaim:  true,
+			dedicatedRequest:        8,
+			dedicatedRequirement:    6,
+		})
+		require.NoError(t, err)
+		require.Equal(t, 5, result.PoolEntries["dedicated-pod"][0].Size)
+		require.Equal(t, 4, result.PoolEntries[commonstate.PoolNameReclaim][0].Size)
+		require.Empty(t, result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0])
+	})
+
 	t.Run("reserve remains available alongside shared overlap", func(t *testing.T) {
 		result, err := runOrdinaryOverlapAssemblerCase(t, ordinaryOverlapAssemblerCase{
 			capacity:                20,
@@ -1571,8 +1604,8 @@ func TestAssembleWithoutNUMAExclusivePoolDisjointDedicatedCapacityPressure(t *te
 			dedicatedRequirement:    6,
 		})
 		require.NoError(t, err)
-		require.Equal(t, 4, result.PoolEntries[commonstate.PoolNameReclaim][0].Size)
-		require.Equal(t, 6, result.PoolOverlapInfo[commonstate.PoolNameReclaim][0]["share"])
+		require.Zero(t, result.PoolEntries[commonstate.PoolNameReclaim][0].Size)
+		require.Equal(t, 10, result.PoolOverlapInfo[commonstate.PoolNameReclaim][0]["share"])
 		require.Empty(t, result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0])
 	})
 
@@ -1591,16 +1624,22 @@ func TestAssembleWithoutNUMAExclusivePoolDisjointDedicatedCapacityPressure(t *te
 		require.Empty(t, result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0])
 	})
 
-	t.Run("active dedicated pool cannot be regulated to zero", func(t *testing.T) {
-		_, err := runOrdinaryOverlapAssemblerCase(t, ordinaryOverlapAssemblerCase{
-			capacity:                4,
-			reserved:                4,
-			disableDedicatedOverlap: true,
-			dedicatedEnableReclaim:  true,
-			dedicatedRequest:        8,
-			dedicatedRequirement:    6,
-		})
-		require.ErrorContains(t, err, "active dedicated pool")
+	t.Run("active dedicated pool cannot be regulated to zero in any policy mode", func(t *testing.T) {
+		for _, allowSharedOverlap := range []bool{false, true} {
+			for _, disableDedicatedOverlap := range []bool{false, true} {
+				_, err := runOrdinaryOverlapAssemblerCase(t, ordinaryOverlapAssemblerCase{
+					capacity:                0,
+					reserved:                0,
+					allowSharedOverlap:      allowSharedOverlap,
+					disableDedicatedOverlap: disableDedicatedOverlap,
+					dedicatedEnableReclaim:  true,
+					dedicatedRequest:        8,
+					dedicatedRequirement:    6,
+				})
+				require.ErrorContains(t, err, "active dedicated pool",
+					"AS=%t DD=%t", allowSharedOverlap, disableDedicatedOverlap)
+			}
+		}
 	})
 }
 
