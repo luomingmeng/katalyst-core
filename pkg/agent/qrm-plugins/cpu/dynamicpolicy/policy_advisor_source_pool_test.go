@@ -24,9 +24,11 @@ import (
 	"github.com/stretchr/testify/require"
 
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/advisorsvc"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation/finders/feature_cpu"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -726,7 +728,7 @@ func TestDynamicPolicy_generateBlockCPUSet_combinedCarvesIsolationFromNormalShar
 		},
 	}
 
-	blockCPUSet, err := p.generateBlockCPUSet(resp)
+	blockCPUSet, err := p.generateBlockCPUSet(resp, nil)
 	require.NoError(t, err)
 
 	share := blockCPUSet["block-share"]
@@ -740,4 +742,98 @@ func TestDynamicPolicy_generateBlockCPUSet_combinedCarvesIsolationFromNormalShar
 	require.True(t, isolation.Intersection(reclaim).IsEmpty())
 	require.Equal(t, 6, share.Union(isolation).Size(),
 		"share + isolation should be split from a combined source candidate before reclaim")
+}
+
+func TestGenerateBlockCPUSetDisjointPlannerKeepsSourceAndIsolationTogether(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+
+	oldSource := machine.NewCPUSet(0, 1, 2, 3)
+	oldIsolation := machine.NewCPUSet(8, 9)
+	p.state.SetPodEntries(state.PodEntries{
+		commonstate.PoolNameShare: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+				AllocationResult:         oldSource,
+				OriginalAllocationResult: oldSource,
+			},
+		},
+		"pod-isolation": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-isolation",
+					ContainerName: "main",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+					OwnerPoolName: commonstate.PoolNamePrefixIsolation + "-pod-isolation",
+					Annotations:   map[string]string{},
+				},
+				AllocationResult:         oldIsolation,
+				OriginalAllocationResult: oldIsolation,
+			},
+		},
+	}, false)
+
+	resp := &advisorapi.ListAndWatchResponse{
+		DisableDedicatedCoresOverlapReclaimedCores: true,
+		Entries: map[string]*advisorapi.CalculationEntries{
+			commonstate.PoolNameShare: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameShare,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "rotated-source", Result: 4}},
+							},
+						},
+					},
+				},
+			},
+			"pod-isolation": {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					"main": {
+						OwnerPoolName: commonstate.PoolNamePrefixIsolation + "-pod-isolation",
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "rotated-isolation", Result: 2}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	featureGates := map[string]*advisorsvc.FeatureGate{
+		feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition: {
+			Name: feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
+		},
+	}
+
+	got, err := p.generateBlockCPUSet(resp, featureGates)
+	require.NoError(t, err)
+	require.Equal(t, oldSource, got["rotated-source"])
+	require.Equal(t, oldIsolation, got["rotated-isolation"])
+	require.Equal(t, oldSource.Union(oldIsolation),
+		got["rotated-source"].Union(got["rotated-isolation"]))
+
+	sourceBlock := resp.Entries[commonstate.PoolNameShare].Entries[commonstate.FakedContainerName].
+		CalculationResultsByNumas[commonstate.FakedNUMAID].Blocks[0]
+	sourceBlock.Result = 5
+	grown, err := p.generateBlockCPUSet(resp, featureGates)
+	require.NoError(t, err)
+	require.True(t, oldSource.IsSubsetOf(grown["rotated-source"]))
+	require.Equal(t, 1, oldSource.Difference(grown["rotated-source"]).
+		Union(grown["rotated-source"].Difference(oldSource)).Size())
+	require.Equal(t, oldIsolation, grown["rotated-isolation"])
+
+	sourceBlock.Result = 3
+	shrunk, err := p.generateBlockCPUSet(resp, featureGates)
+	require.NoError(t, err)
+	require.True(t, shrunk["rotated-source"].IsSubsetOf(oldSource))
+	require.Equal(t, 1, oldSource.Difference(shrunk["rotated-source"]).
+		Union(shrunk["rotated-source"].Difference(oldSource)).Size())
+	require.Equal(t, oldIsolation, shrunk["rotated-isolation"])
 }
