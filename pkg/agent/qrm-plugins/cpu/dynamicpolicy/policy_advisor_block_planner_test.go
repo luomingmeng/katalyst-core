@@ -611,6 +611,72 @@ func TestBuildAdvisorBlockDescriptors_EnforcesRPAndReclaimBoundaries(t *testing.
 	require.True(t, pinned.IsSubsetOf(byID["reclaim"].Eligible))
 }
 
+func TestBuildAdvisorBlockDescriptors_AppliesEligibilityByOwnerPoolSemantics(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	numa0 := p.machineInfo.CPUDetails.CPUsInNUMANodes(0)
+	numa0CPUs := numa0.ToSliceInt()
+	require.GreaterOrEqual(t, len(numa0CPUs), 4)
+	pinned := machine.NewCPUSet(numa0CPUs[0], numa0CPUs[1])
+	nonReclaimable := machine.NewCPUSet(numa0CPUs[len(numa0CPUs)-1])
+	rpPinnedCPUSet := map[string]machine.CPUSet{"rp-a": pinned}
+
+	t.Run("pinned shared and reclaim aliases intersect owner eligibility", func(t *testing.T) {
+		resp := advisorBlockTestResponse([]advisorBlockTestAlias{
+			{
+				entry: "pod-a", subEntry: "container-a",
+				owner:  resourcepackage.WrapOwnerPoolName(commonstate.PoolNameShare, "rp-a"),
+				numaID: 0, blockID: "shared-reclaim", quantity: 1, overlap: true,
+			},
+			{
+				entry: commonstate.PoolNameReclaim, subEntry: commonstate.FakedContainerName,
+				owner:  commonstate.PoolNameReclaim,
+				numaID: 0, blockID: "shared-reclaim", quantity: 1, overlap: true,
+			},
+		}, rand.New(rand.NewSource(10)))
+
+		descriptors, err := buildAdvisorBlockDescriptors(
+			resp, p.machineInfo.CPUDetails, nil, rpPinnedCPUSet, nonReclaimable,
+		)
+		require.NoError(t, err)
+		require.Len(t, descriptors, 1)
+		require.Equal(t, pinned, descriptors[0].Eligible)
+	})
+
+	t.Run("unpinned shared overlap excludes every pinned resource package", func(t *testing.T) {
+		resp := advisorBlockTestResponse([]advisorBlockTestAlias{{
+			entry: "pod-b", subEntry: "container-b", owner: commonstate.PoolNameShare,
+			numaID: 0, blockID: "unpinned-shared", quantity: 1, overlap: true,
+		}}, rand.New(rand.NewSource(11)))
+
+		descriptors, err := buildAdvisorBlockDescriptors(
+			resp, p.machineInfo.CPUDetails, nil, rpPinnedCPUSet, nonReclaimable,
+		)
+		require.NoError(t, err)
+		require.Len(t, descriptors, 1)
+		require.Equal(t, numa0.Difference(pinned), descriptors[0].Eligible)
+	})
+
+	t.Run("mandatory reclaim keeps excluding only non-reclaimable CPUs", func(t *testing.T) {
+		resp := advisorBlockTestResponse([]advisorBlockTestAlias{{
+			entry: commonstate.PoolNameReclaim, subEntry: commonstate.FakedContainerName,
+			owner:  commonstate.PoolNameReclaim,
+			numaID: 0, blockID: "mandatory-reclaim", quantity: 1,
+		}}, rand.New(rand.NewSource(12)))
+
+		descriptors, err := buildAdvisorBlockDescriptors(
+			resp, p.machineInfo.CPUDetails, nil, rpPinnedCPUSet, nonReclaimable,
+		)
+		require.NoError(t, err)
+		require.Len(t, descriptors, 1)
+		require.Equal(t, numa0.Difference(nonReclaimable), descriptors[0].Eligible)
+		require.True(t, pinned.IsSubsetOf(descriptors[0].Eligible))
+	})
+}
+
 func TestBuildAdvisorBlockDescriptors_FailsClosedWhenEligibleCapacityIsInsufficient(t *testing.T) {
 	t.Parallel()
 

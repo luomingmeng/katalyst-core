@@ -114,7 +114,7 @@ func buildAdvisorBlockDescriptors(
 						return nil, fmt.Errorf("block %q: %w", block.BlockId, err)
 					}
 					ownerEligible := advisorBlockOwnerEligible(
-						ownerClass,
+						ownerPoolName,
 						ownerResourcePackage,
 						numaCPUs,
 						allPinnedCPUs,
@@ -276,14 +276,14 @@ func advisorBlockNUMACPUSet(allCPUs machine.CPUSet, cpuDetails machine.CPUDetail
 }
 
 func advisorBlockOwnerEligible(
-	class advisorBlockClass,
+	ownerPoolName string,
 	resourcePackageName string,
 	numaCPUs machine.CPUSet,
 	allPinnedCPUs machine.CPUSet,
 	rpPinnedCPUSet map[string]machine.CPUSet,
 	nonReclaimableCPUSet machine.CPUSet,
 ) machine.CPUSet {
-	if class == advisorBlockClassMandatoryReclaim || class == advisorBlockClassReclaimOverlap {
+	if commonstate.GetPoolType(ownerPoolName) == commonstate.PoolNameReclaim {
 		return numaCPUs.Difference(nonReclaimableCPUSet)
 	}
 	if resourcePackageName != "" && !rpPinnedCPUSet[resourcePackageName].IsEmpty() {
