@@ -1624,7 +1624,7 @@ func TestAssembleWithoutNUMAExclusivePoolOverlapPolicyMatrix(t *testing.T) {
 			name: "AS1_DD0_SE0_DE0",
 			want: types.InternalCPUCalculationResult{
 				PoolEntries: map[string]map[int]types.CPUResource{
-					"share": {0: {Size: 12, Quota: -1}}, "dedicated-pod": {0: {Size: 8, Quota: -1}},
+					"share": {0: {Size: 8, Quota: -1}}, "dedicated-pod": {0: {Size: 8, Quota: -1}},
 					commonstate.PoolNameReclaim: {0: {Size: 4, Quota: -1}},
 				},
 				PoolOverlapInfo:                       map[string]map[int]map[string]int{},
@@ -1638,7 +1638,7 @@ func TestAssembleWithoutNUMAExclusivePoolOverlapPolicyMatrix(t *testing.T) {
 			dedicatedEnableReclaim: true,
 			want: types.InternalCPUCalculationResult{
 				PoolEntries: map[string]map[int]types.CPUResource{
-					"share": {0: {Size: 12, Quota: -1}}, "dedicated-pod": {0: {Size: 8, Quota: -1}},
+					"share": {0: {Size: 10, Quota: -1}}, "dedicated-pod": {0: {Size: 8, Quota: -1}},
 					commonstate.PoolNameReclaim: {0: {Size: 2, Quota: -1}},
 				},
 				PoolOverlapInfo: map[string]map[int]map[string]int{},
@@ -1688,7 +1688,7 @@ func TestAssembleWithoutNUMAExclusivePoolOverlapPolicyMatrix(t *testing.T) {
 			name: "AS1_DD1_SE0_DE0",
 			want: types.InternalCPUCalculationResult{
 				PoolEntries: map[string]map[int]types.CPUResource{
-					"share": {0: {Size: 12, Quota: -1}}, "dedicated-pod": {0: {Size: 8, Quota: -1}},
+					"share": {0: {Size: 8, Quota: -1}}, "dedicated-pod": {0: {Size: 8, Quota: -1}},
 					commonstate.PoolNameReclaim: {0: {Size: 4, Quota: -1}},
 				},
 				PoolOverlapInfo:                            map[string]map[int]map[string]int{},
@@ -1703,7 +1703,7 @@ func TestAssembleWithoutNUMAExclusivePoolOverlapPolicyMatrix(t *testing.T) {
 			dedicatedEnableReclaim: true,
 			want: types.InternalCPUCalculationResult{
 				PoolEntries: map[string]map[int]types.CPUResource{
-					"share": {0: {Size: 14, Quota: -1}}, "dedicated-pod": {0: {Size: 6, Quota: -1}},
+					"share": {0: {Size: 10, Quota: -1}}, "dedicated-pod": {0: {Size: 6, Quota: -1}},
 					commonstate.PoolNameReclaim: {0: {Size: 4, Quota: -1}},
 				},
 				PoolOverlapInfo:                            map[string]map[int]map[string]int{},
@@ -1772,7 +1772,7 @@ func TestAssembleWithoutNUMAExclusivePoolOverlapPolicyMatrix(t *testing.T) {
 }
 
 func TestAssembleWithoutNUMAExclusivePoolDisjointDedicatedCapacityPressure(t *testing.T) {
-	t.Run("AS false does not remove reserve from DD false dedicated candidate", func(t *testing.T) {
+	t.Run("unsupported reserve compresses dedicated candidate", func(t *testing.T) {
 		result, err := runOrdinaryOverlapAssemblerCase(t, ordinaryOverlapAssemblerCase{
 			capacity:                5,
 			reserved:                4,
@@ -1783,7 +1783,7 @@ func TestAssembleWithoutNUMAExclusivePoolDisjointDedicatedCapacityPressure(t *te
 			dedicatedRequirement:    6,
 		})
 		require.NoError(t, err)
-		require.Equal(t, 5, result.PoolEntries["dedicated-pod"][0].Size)
+		require.Equal(t, 1, result.PoolEntries["dedicated-pod"][0].Size)
 		require.Equal(t, 4, result.PoolEntries[commonstate.PoolNameReclaim][0].Size)
 		require.Empty(t, result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0])
 	})
