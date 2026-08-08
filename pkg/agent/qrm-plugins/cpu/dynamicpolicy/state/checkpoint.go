@@ -32,6 +32,7 @@ type CPUPluginCheckpoint struct {
 	PodEntries                                 PodEntries        `json:"pod_entries"`
 	AllowSharedCoresOverlapReclaimedCores      bool              `json:"allow_shared_cores_overlap_reclaimed_cores"`
 	DisableDedicatedCoresOverlapReclaimedCores bool              `json:"disable_dedicated_cores_overlap_reclaimed_cores"`
+	Revision                                   uint64            `json:"revision"`
 	Checksum                                   checksum.Checksum `json:"checksum"`
 }
 
