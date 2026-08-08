@@ -1834,9 +1834,43 @@ func TestAssembleWithoutNUMAExclusivePoolDisjointDedicatedCapacityPressure(t *te
 					dedicatedRequest:        8,
 					dedicatedRequirement:    6,
 				})
-				require.ErrorContains(t, err, "active dedicated pool",
+				require.EqualError(t, err, `active dedicated pool "dedicated" was regulated to zero`,
 					"AS=%t DD=%t", allowSharedOverlap, disableDedicatedOverlap)
 			}
+		}
+	})
+
+	t.Run("active shared and isolation pools cannot be regulated to zero", func(t *testing.T) {
+		tests := []struct {
+			name    string
+			tc      ordinaryOverlapAssemblerCase
+			wantErr string
+		}{
+			{
+				name: "shared",
+				tc: ordinaryOverlapAssemblerCase{
+					capacity:          0,
+					sharedRequest:     8,
+					sharedRequirement: 4,
+				},
+				wantErr: `active shared pool "share" was regulated to zero`,
+			},
+			{
+				name: "isolation",
+				tc: ordinaryOverlapAssemblerCase{
+					capacity:       0,
+					isolationUpper: 8,
+					isolationLower: 4,
+				},
+				wantErr: `active isolation pool "isolation" was regulated to zero`,
+			},
+		}
+		for _, tt := range tests {
+			tt := tt
+			t.Run(tt.name, func(t *testing.T) {
+				_, err := runOrdinaryOverlapAssemblerCase(t, tt.tc)
+				require.EqualError(t, err, tt.wantErr)
+			})
 		}
 	})
 }
@@ -1870,6 +1904,8 @@ type ordinaryOverlapAssemblerCase struct {
 	dedicatedEnableReclaim  bool
 	sharedRequest           int
 	sharedRequirement       int
+	isolationUpper          int
+	isolationLower          int
 	dedicatedRequest        int
 	dedicatedRequirement    int
 	dedicatedPackage        string
@@ -1898,6 +1934,16 @@ func runOrdinaryOverlapAssemblerCase(
 			configapi.ControlKnobNonReclaimedCPURequirement: {Value: float64(tc.sharedRequirement)},
 		})
 		regionMap[shared.Name()] = shared
+	}
+	if tc.isolationUpper > 0 {
+		isolation := NewFakeRegion("isolation", configapi.QoSRegionTypeIsolation, "isolation")
+		isolation.SetBindingNumas(machine.NewCPUSet(0))
+		isolation.SetIsNumaBinding(true)
+		isolation.SetProvision(types.ControlKnob{
+			configapi.ControlKnobNonIsolatedUpperCPUSize: {Value: float64(tc.isolationUpper)},
+			configapi.ControlKnobNonIsolatedLowerCPUSize: {Value: float64(tc.isolationLower)},
+		})
+		regionMap[isolation.Name()] = isolation
 	}
 	if tc.dedicatedRequest > 0 {
 		ownerPoolName := "dedicated"

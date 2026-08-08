@@ -667,6 +667,16 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 			return fmt.Errorf("active dedicated pool %q was regulated to zero", poolName)
 		}
 	}
+	for poolName := range isolationInfo.isolationUpperSizes {
+		if shareAndIsolateDedicatedPoolSizes[poolName] <= 0 {
+			return fmt.Errorf("active isolation pool %q was regulated to zero", poolName)
+		}
+	}
+	for poolName := range shareInfo.regionMap {
+		if shareAndIsolateDedicatedPoolSizes[poolName] <= 0 {
+			return fmt.Errorf("active shared pool %q was regulated to zero", poolName)
+		}
+	}
 
 	general.InfoS("pool info",
 		"numaID", numaID,
