@@ -42,6 +42,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	metricspool "github.com/kubewharf/katalyst-core/pkg/metrics/metrics-pool"
+	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	resourcepackage "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 )
@@ -649,10 +650,10 @@ func TestAssembleProvision(t *testing.T) {
 					-1: types.CPUResource{Size: 20, Quota: -1},
 				},
 				"share-NUMA1": {
-					1: types.CPUResource{Size: 16, Quota: -1},
+					1: types.CPUResource{Size: 15, Quota: -1},
 				},
 				"isolation-NUMA1": {
-					1: types.CPUResource{Size: 4, Quota: -1},
+					1: types.CPUResource{Size: 5, Quota: -1},
 				},
 				"reserve": {
 					-1: types.CPUResource{Size: 0, Quota: -1},
@@ -704,14 +705,14 @@ func TestAssembleProvision(t *testing.T) {
 					1: types.CPUResource{Size: 15, Quota: -1},
 				},
 				"isolation-NUMA1": {
-					1: types.CPUResource{Size: 4, Quota: -1},
+					1: types.CPUResource{Size: 5, Quota: -1},
 				},
 				"reserve": {
 					-1: types.CPUResource{Size: 0, Quota: -1},
 				},
 				"reclaim": {
 					-1: types.CPUResource{Size: 18, Quota: -1},
-					1:  types.CPUResource{Size: 5, Quota: -1},
+					1:  types.CPUResource{Size: 4, Quota: -1},
 				},
 			},
 		},
@@ -831,17 +832,17 @@ func TestAssembleProvision(t *testing.T) {
 					1: types.CPUResource{Size: 8, Quota: -1},
 				},
 				"isolation-NUMA1": {
-					1: types.CPUResource{Size: 4, Quota: -1},
+					1: types.CPUResource{Size: 6, Quota: -1},
 				},
 				"isolation-NUMA1-pod2": {
-					1: types.CPUResource{Size: 4, Quota: -1},
+					1: types.CPUResource{Size: 6, Quota: -1},
 				},
 				"reserve": {
 					-1: types.CPUResource{Size: 0, Quota: -1},
 				},
 				"reclaim": {
 					-1: types.CPUResource{Size: 18, Quota: -1},
-					1:  types.CPUResource{Size: 8, Quota: -1},
+					1:  types.CPUResource{Size: 4, Quota: -1},
 				},
 			},
 		},
@@ -893,13 +894,13 @@ func TestAssembleProvision(t *testing.T) {
 					-1: types.CPUResource{Size: 20, Quota: -1},
 				},
 				"share-NUMA1": {
-					1: types.CPUResource{Size: 12, Quota: -1},
+					1: types.CPUResource{Size: 8, Quota: -1},
 				},
 				"isolation-NUMA1": {
-					1: types.CPUResource{Size: 4, Quota: -1},
+					1: types.CPUResource{Size: 6, Quota: -1},
 				},
 				"isolation-NUMA1-pod2": {
-					1: types.CPUResource{Size: 4, Quota: -1},
+					1: types.CPUResource{Size: 6, Quota: -1},
 				},
 				"reserve": {
 					-1: types.CPUResource{Size: 0, Quota: -1},
@@ -1276,7 +1277,15 @@ func TestClampReclaimOverlapMetadata(t *testing.T) {
 		},
 	}
 
-	got := clampReclaimOverlapMetadata(result, 0, 3)
+	got := clampReclaimOverlapMetadata(result, 0, 3,
+		overlapAtom{key: "0/pool/share-a", size: 5, poolAlias: "share-a"},
+		overlapAtom{key: "0/pool/share-b", size: 3, poolAlias: "share-b"},
+		overlapAtom{
+			key:            "1/dedicated/block-a",
+			size:           4,
+			containerAlias: []podContainerAlias{{podUID: "pod-a", containerName: "main"}},
+		},
+	)
 
 	require.Equal(t, 3, got)
 	require.Equal(t, map[string]int{"share-a": 3}, result.PoolOverlapInfo[commonstate.PoolNameReclaim][0])
@@ -1323,11 +1332,120 @@ func TestClampReclaimOverlapMetadataKeepsContainerAliases(t *testing.T) {
 		},
 	}
 
-	got := clampReclaimOverlapMetadata(result, 0, 4)
+	got := clampReclaimOverlapMetadata(result, 0, 4, overlapAtom{
+		key:  "dedicated/block-a",
+		size: 4,
+		containerAlias: []podContainerAlias{
+			{podUID: "pod", containerName: "main"},
+			{podUID: "pod", containerName: "sidecar"},
+		},
+	})
 
 	require.Equal(t, 4, got)
 	require.Equal(t, map[string]int{"main": 4, "sidecar": 4},
 		result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["pod"])
+}
+
+func TestClampReclaimOverlapMetadataRejectsImplicitPodUIDGrouping(t *testing.T) {
+	t.Parallel()
+
+	result := &types.InternalCPUCalculationResult{
+		PoolOverlapInfo: map[string]map[int]map[string]int{},
+		PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{
+			commonstate.PoolNameReclaim: {
+				0: {
+					"pod": {
+						"main":    4,
+						"sidecar": 2,
+					},
+				},
+			},
+		},
+	}
+
+	got := clampReclaimOverlapMetadata(result, 0, 4)
+
+	require.Zero(t, got)
+	require.Empty(t, result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0])
+}
+
+func TestClampReclaimOverlapMetadataMultipleDedicatedBlocks(t *testing.T) {
+	t.Parallel()
+
+	result := &types.InternalCPUCalculationResult{
+		PoolOverlapInfo:             map[string]map[int]map[string]int{},
+		PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{},
+	}
+	got := clampReclaimOverlapMetadata(result, 0, 5,
+		overlapAtom{
+			key:  "dedicated/block-a",
+			size: 3,
+			containerAlias: []podContainerAlias{
+				{podUID: "pod-a", containerName: "main"},
+				{podUID: "pod-a", containerName: "sidecar"},
+			},
+		},
+		overlapAtom{
+			key:  "dedicated/block-b",
+			size: 4,
+			containerAlias: []podContainerAlias{
+				{podUID: "pod-b", containerName: "main"},
+				{podUID: "pod-b", containerName: "sidecar"},
+			},
+		},
+	)
+
+	require.Equal(t, 5, got)
+	require.Equal(t, map[string]int{"main": 3, "sidecar": 3},
+		result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["pod-a"])
+	require.Equal(t, map[string]int{"main": 2, "sidecar": 2},
+		result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["pod-b"])
+}
+
+func TestAllocatePoolSizesByPriority(t *testing.T) {
+	t.Parallel()
+
+	got, throttled := allocatePoolSizesByPriority(
+		9,
+		map[string]int{"dedicated": 4},
+		map[string]int{"isolation": 3},
+		map[string]int{"share": 2},
+		map[string]int{
+			"dedicated": 6,
+			"isolation": 5,
+			"share":     6,
+		},
+	)
+
+	require.True(t, throttled)
+	require.Equal(t, map[string]int{
+		"dedicated": 4,
+		"isolation": 3,
+		"share":     2,
+	}, got)
+}
+
+func TestAllocatePoolSizesByPriorityIsMapOrderIndependent(t *testing.T) {
+	t.Parallel()
+
+	first, firstThrottled := allocatePoolSizesByPriority(
+		12,
+		map[string]int{"dedicated-b": 3, "dedicated-a": 3},
+		map[string]int{"isolation-b": 2, "isolation-a": 2},
+		map[string]int{"share-b": 2, "share-a": 2},
+		map[string]int{"share-a": 4, "share-b": 4},
+	)
+	second, secondThrottled := allocatePoolSizesByPriority(
+		12,
+		map[string]int{"dedicated-a": 3, "dedicated-b": 3},
+		map[string]int{"isolation-a": 2, "isolation-b": 2},
+		map[string]int{"share-a": 2, "share-b": 2},
+		map[string]int{"share-b": 4, "share-a": 4},
+	)
+
+	require.Equal(t, firstThrottled, secondThrottled)
+	require.Equal(t, first, second)
+	require.Equal(t, 12, general.SumUpMapValues(first))
 }
 
 func TestAssembleWithoutNUMAExclusivePoolOverlapPolicyMatrix(t *testing.T) {
@@ -1338,25 +1456,26 @@ func TestAssembleWithoutNUMAExclusivePoolOverlapPolicyMatrix(t *testing.T) {
 		sharedEnableReclaim     bool
 		dedicatedEnableReclaim  bool
 		wantDedicatedSize       int
-		wantSharedOverlap       bool
-		wantDedicatedOverlap    bool
+		wantReclaimSize         int
+		wantSharedOverlap       int
+		wantDedicatedAliases    map[string]int
 	}{
-		{name: "AS0_DD0_SE0_DE0", wantDedicatedSize: 8},
-		{name: "AS0_DD0_SE0_DE1", dedicatedEnableReclaim: true, wantDedicatedSize: 8, wantDedicatedOverlap: true},
-		{name: "AS0_DD0_SE1_DE0", sharedEnableReclaim: true, wantDedicatedSize: 8},
-		{name: "AS0_DD0_SE1_DE1", sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantDedicatedSize: 8, wantDedicatedOverlap: true},
-		{name: "AS0_DD1_SE0_DE0", disableDedicatedOverlap: true, wantDedicatedSize: 8},
-		{name: "AS0_DD1_SE0_DE1", disableDedicatedOverlap: true, dedicatedEnableReclaim: true, wantDedicatedSize: 6},
-		{name: "AS0_DD1_SE1_DE0", disableDedicatedOverlap: true, sharedEnableReclaim: true, wantDedicatedSize: 8},
-		{name: "AS0_DD1_SE1_DE1", disableDedicatedOverlap: true, sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantDedicatedSize: 6},
-		{name: "AS1_DD0_SE0_DE0", allowSharedOverlap: true, wantDedicatedSize: 8},
-		{name: "AS1_DD0_SE0_DE1", allowSharedOverlap: true, dedicatedEnableReclaim: true, wantDedicatedSize: 8, wantDedicatedOverlap: true},
-		{name: "AS1_DD0_SE1_DE0", allowSharedOverlap: true, sharedEnableReclaim: true, wantDedicatedSize: 8, wantSharedOverlap: true},
-		{name: "AS1_DD0_SE1_DE1", allowSharedOverlap: true, sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantDedicatedSize: 8, wantSharedOverlap: true, wantDedicatedOverlap: true},
-		{name: "AS1_DD1_SE0_DE0", allowSharedOverlap: true, disableDedicatedOverlap: true, wantDedicatedSize: 8},
-		{name: "AS1_DD1_SE0_DE1", allowSharedOverlap: true, disableDedicatedOverlap: true, dedicatedEnableReclaim: true, wantDedicatedSize: 6},
-		{name: "AS1_DD1_SE1_DE0", allowSharedOverlap: true, disableDedicatedOverlap: true, sharedEnableReclaim: true, wantDedicatedSize: 8, wantSharedOverlap: true},
-		{name: "AS1_DD1_SE1_DE1", allowSharedOverlap: true, disableDedicatedOverlap: true, sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantDedicatedSize: 6, wantSharedOverlap: true},
+		{name: "AS0_DD0_SE0_DE0", wantDedicatedSize: 8, wantReclaimSize: 4},
+		{name: "AS0_DD0_SE0_DE1", dedicatedEnableReclaim: true, wantDedicatedSize: 8, wantReclaimSize: 4, wantDedicatedAliases: map[string]int{"main": 2, "sidecar": 2}},
+		{name: "AS0_DD0_SE1_DE0", sharedEnableReclaim: true, wantDedicatedSize: 8, wantReclaimSize: 8},
+		{name: "AS0_DD0_SE1_DE1", sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantDedicatedSize: 8, wantReclaimSize: 8, wantDedicatedAliases: map[string]int{"main": 2, "sidecar": 2}},
+		{name: "AS0_DD1_SE0_DE0", disableDedicatedOverlap: true, wantDedicatedSize: 8, wantReclaimSize: 4},
+		{name: "AS0_DD1_SE0_DE1", disableDedicatedOverlap: true, dedicatedEnableReclaim: true, wantDedicatedSize: 6, wantReclaimSize: 6},
+		{name: "AS0_DD1_SE1_DE0", disableDedicatedOverlap: true, sharedEnableReclaim: true, wantDedicatedSize: 8, wantReclaimSize: 8},
+		{name: "AS0_DD1_SE1_DE1", disableDedicatedOverlap: true, sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantDedicatedSize: 6, wantReclaimSize: 10},
+		{name: "AS1_DD0_SE0_DE0", allowSharedOverlap: true, wantDedicatedSize: 8, wantReclaimSize: 4},
+		{name: "AS1_DD0_SE0_DE1", allowSharedOverlap: true, dedicatedEnableReclaim: true, wantDedicatedSize: 8, wantDedicatedAliases: map[string]int{"main": 4, "sidecar": 4}},
+		{name: "AS1_DD0_SE1_DE0", allowSharedOverlap: true, sharedEnableReclaim: true, wantDedicatedSize: 8, wantSharedOverlap: 8},
+		{name: "AS1_DD0_SE1_DE1", allowSharedOverlap: true, sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantDedicatedSize: 8, wantSharedOverlap: 8, wantDedicatedAliases: map[string]int{"main": 2, "sidecar": 2}},
+		{name: "AS1_DD1_SE0_DE0", allowSharedOverlap: true, disableDedicatedOverlap: true, wantDedicatedSize: 8, wantReclaimSize: 4},
+		{name: "AS1_DD1_SE0_DE1", allowSharedOverlap: true, disableDedicatedOverlap: true, dedicatedEnableReclaim: true, wantDedicatedSize: 6, wantReclaimSize: 4},
+		{name: "AS1_DD1_SE1_DE0", allowSharedOverlap: true, disableDedicatedOverlap: true, sharedEnableReclaim: true, wantDedicatedSize: 8, wantReclaimSize: 4, wantSharedOverlap: 4},
+		{name: "AS1_DD1_SE1_DE1", allowSharedOverlap: true, disableDedicatedOverlap: true, sharedEnableReclaim: true, dedicatedEnableReclaim: true, wantDedicatedSize: 6, wantReclaimSize: 4, wantSharedOverlap: 6},
 	}
 
 	for _, tt := range tests {
@@ -1376,10 +1495,11 @@ func TestAssembleWithoutNUMAExclusivePoolOverlapPolicyMatrix(t *testing.T) {
 			})
 			require.NoError(t, err)
 			require.Equal(t, tt.wantDedicatedSize, result.PoolEntries["dedicated-pod"][0].Size)
-			_, hasSharedOverlap := result.PoolOverlapInfo[commonstate.PoolNameReclaim][0]["share"]
-			require.Equal(t, tt.wantSharedOverlap, hasSharedOverlap)
-			require.Equal(t, tt.wantDedicatedOverlap,
-				len(result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]) > 0)
+			require.Equal(t, tt.wantReclaimSize, result.PoolEntries[commonstate.PoolNameReclaim][0].Size)
+			require.Equal(t, tt.wantSharedOverlap,
+				result.PoolOverlapInfo[commonstate.PoolNameReclaim][0]["share"])
+			require.Equal(t, tt.wantDedicatedAliases,
+				result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["dedicated-pod"])
 		})
 	}
 }
@@ -1432,6 +1552,26 @@ func TestAssembleWithoutNUMAExclusivePoolDisjointDedicatedCapacityPressure(t *te
 	})
 }
 
+func TestAssembleWithoutNUMAExclusivePoolDeductsReserveFromPinnedEligibilityDomain(t *testing.T) {
+	result, err := runOrdinaryOverlapAssemblerCase(t, ordinaryOverlapAssemblerCase{
+		capacity:                16,
+		reserved:                4,
+		disableDedicatedOverlap: true,
+		sharedRequest:           8,
+		sharedRequirement:       8,
+		dedicatedEnableReclaim:  true,
+		dedicatedRequest:        8,
+		dedicatedRequirement:    6,
+		dedicatedPackage:        "rp-a",
+		pinnedCPUSet:            machine.MustParse("0-7"),
+		reserveCPUSet:           machine.MustParse("0-3"),
+	})
+	require.NoError(t, err)
+	require.Equal(t, 4, result.PoolEntries["dedicated-pod"][0].Size)
+	require.Equal(t, 8, result.PoolEntries["share"][0].Size)
+	require.Equal(t, 4, result.PoolEntries[commonstate.PoolNameReclaim][0].Size)
+}
+
 type ordinaryOverlapAssemblerCase struct {
 	capacity                int
 	reserved                int
@@ -1443,6 +1583,9 @@ type ordinaryOverlapAssemblerCase struct {
 	sharedRequirement       int
 	dedicatedRequest        int
 	dedicatedRequirement    int
+	dedicatedPackage        string
+	pinnedCPUSet            machine.CPUSet
+	reserveCPUSet           machine.CPUSet
 }
 
 func runOrdinaryOverlapAssemblerCase(
@@ -1468,7 +1611,11 @@ func runOrdinaryOverlapAssemblerCase(
 		regionMap[shared.Name()] = shared
 	}
 	if tc.dedicatedRequest > 0 {
-		dedicated := NewFakeRegion("dedicated", configapi.QoSRegionTypeDedicated, "dedicated")
+		ownerPoolName := "dedicated"
+		if tc.dedicatedPackage != "" {
+			ownerPoolName = tc.dedicatedPackage + "/dedicated"
+		}
+		dedicated := NewFakeRegion("dedicated", configapi.QoSRegionTypeDedicated, ownerPoolName)
 		dedicated.SetBindingNumas(machine.NewCPUSet(0))
 		dedicated.SetIsNumaBinding(true)
 		dedicated.enableReclaim = tc.dedicatedEnableReclaim
@@ -1486,7 +1633,21 @@ func runOrdinaryOverlapAssemblerCase(
 	numaAvailable := map[int]int{0: tc.capacity}
 	nonBindingNUMAs := machine.NewCPUSet()
 	metaReader := metacache.NewDummyMetaCacheImp()
-	require.NoError(t, metaReader.SetResourcePackageConfig(types.ResourcePackageConfig{}))
+	resourcePackageConfig := types.ResourcePackageConfig{}
+	if tc.dedicatedPackage != "" {
+		resourcePackageConfig[0] = map[string]*types.ResourcePackageState{
+			tc.dedicatedPackage: {PinnedCPUSet: tc.pinnedCPUSet},
+		}
+	}
+	require.NoError(t, metaReader.SetResourcePackageConfig(resourcePackageConfig))
+	if !tc.reserveCPUSet.IsEmpty() {
+		require.NoError(t, metaReader.SetPoolInfo(commonstate.PoolNameReserve, &types.PoolInfo{
+			PoolName: commonstate.PoolNameReserve,
+			TopologyAwareAssignments: map[int]machine.CPUSet{
+				0: tc.reserveCPUSet,
+			},
+		}))
+	}
 	pa := NewProvisionAssemblerCommon(
 		conf, nil, &regionMap, &reservedForReclaim, &numaAvailable, &nonBindingNUMAs,
 		&tc.allowSharedOverlap, &tc.disableDedicatedOverlap, metaReader, nil, metrics.DummyMetrics{},
