@@ -23,9 +23,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bytedance/mockey"
 	"github.com/stretchr/testify/require"
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	"github.com/kubewharf/katalyst-core/pkg/config"
@@ -417,6 +419,72 @@ func TestAdvisorCPUSetAdjustmentFailureRetainsDesiredStateAndRetries(t *testing.
 		require.True(t, got.Equals(desired), "retry must consume retained desired state, got %s", got)
 	case <-time.After(time.Second):
 		t.Fatal("failed advisor cgroup apply was not retried")
+	}
+}
+
+func TestPostAdvisorCommitApplyFailureRunsInOrderAndMarksRevisionOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		cgroupErr      error
+		adjustmentErr  error
+		wantErrStrings []string
+	}{
+		{
+			name:           "cgroup config failure",
+			cgroupErr:      errors.New("cgroup config failure"),
+			wantErrStrings: []string{"cgroup config failure"},
+		},
+		{
+			name:           "cpuset adjustment failure",
+			adjustmentErr:  errors.New("cpuset adjustment failure"),
+			wantErrStrings: []string{"cpuset adjustment failure"},
+		},
+		{
+			name:           "both apply stages fail",
+			cgroupErr:      errors.New("cgroup config failure"),
+			adjustmentErr:  errors.New("cpuset adjustment failure"),
+			wantErrStrings: []string{"cgroup config failure", "cpuset adjustment failure"},
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			p, cleanup := newReclaimReuseTestPolicy(t)
+			defer cleanup()
+			desired := machine.NewCPUSet(0, 1)
+			setReclaimPoolCPUSet(t, p, desired)
+			revision := p.state.GetRevision()
+
+			var calls []string
+			mockey.PatchConvey(tc.name, t, func() {
+				mockey.Mock((*DynamicPolicy).applyCgroupConfigs).IncludeCurrentGoRoutine().
+					To(func(_ *DynamicPolicy, _ *advisorapi.ListAndWatchResponse) error {
+						calls = append(calls, "apply-cgroup-configs")
+						return tc.cgroupErr
+					}).Build()
+				mockey.Mock((*DynamicPolicy).runCPUSetAdjustmentHandlers).IncludeCurrentGoRoutine().
+					To(func(_ *DynamicPolicy, _ context.Context, _ ...cpusetutil.CPUSetAdjustmentMode) error {
+						calls = append(calls, "adjust-cpuset")
+						return tc.adjustmentErr
+					}).Build()
+				mockey.Mock((*DynamicPolicy).markAdvisorApplyFailed).IncludeCurrentGoRoutine().
+					To(func(_ *DynamicPolicy, gotRevision uint64) {
+						require.Equal(t, revision, gotRevision)
+						calls = append(calls, "mark-apply-failed")
+					}).Build()
+
+				p.Lock()
+				err := p.applyPostAdvisorCommit(context.Background(), &advisorapi.ListAndWatchResponse{}, revision)
+				p.Unlock()
+
+				for _, wantErr := range tc.wantErrStrings {
+					require.ErrorContains(t, err, wantErr)
+				}
+				require.Equal(t, []string{"apply-cgroup-configs", "adjust-cpuset", "mark-apply-failed"}, calls)
+				require.True(t, p.state.GetAllocationInfo(
+					commonstate.PoolNameReclaim, commonstate.FakedContainerName).AllocationResult.Equals(desired),
+					"post-commit apply failures must not roll desired state back")
+			})
+		})
 	}
 }
 
