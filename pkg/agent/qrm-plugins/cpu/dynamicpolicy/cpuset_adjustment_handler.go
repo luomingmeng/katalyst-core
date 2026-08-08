@@ -25,6 +25,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gogo/protobuf/proto"
+
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/advisorsvc"
 	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
@@ -46,6 +49,11 @@ const (
 
 type cpuSetAdjustmentRevisionedState interface {
 	GetRevision() uint64
+}
+
+type advisorPostCommitTarget struct {
+	revision uint64
+	response *advisorapi.ListAndWatchResponse
 }
 
 func cpuSetAdjustmentHandlerTimeout(conf *config.Configuration) time.Duration {
@@ -281,7 +289,8 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 				}
 			}
 		}
-		if roundErr == nil && mode == cpusetutil.CPUSetAdjustmentModePeriodic {
+		if roundErr == nil && mode == cpusetutil.CPUSetAdjustmentModePeriodic &&
+			!p.hasAnyPendingAdvisorPostCommitTarget() {
 			p.cpuSetAdjustmentRetryMu.Lock()
 			if !p.cpuSetAdjustmentRetryQueued && !p.cpuSetAdjustmentRetryAgain {
 				p.cpuSetAdjustmentRetryDirty = false
@@ -293,38 +302,94 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 	}
 }
 
-// runCPUSetAdjustmentHandlersAfterAdvisorCommit reconciles cgroups from the
-// already checkpointed desired state. A transient apply failure must not roll
-// desired state back; queueing a latest-state retry keeps publication and
-// physical convergence as separate failure domains.
-func (p *DynamicPolicy) runCPUSetAdjustmentHandlersAfterAdvisorCommit(ctx context.Context) error {
-	err := p.runCPUSetAdjustmentHandlers(ctx)
-	if err != nil {
-		p.markAdvisorApplyFailed(p.state.GetRevision())
-	}
-	return err
-}
-
-func (p *DynamicPolicy) applyPostAdvisorCommit(
-	ctx context.Context,
+func (p *DynamicPolicy) publishAdvisorPostCommitTarget(
 	resp *advisorapi.ListAndWatchResponse,
 	revision uint64,
+) *advisorPostCommitTarget {
+	cloned := &advisorapi.ListAndWatchResponse{}
+	if resp != nil {
+		cloned.ExtraEntries = make([]*advisorsvc.CalculationInfo, len(resp.ExtraEntries))
+		for i, entry := range resp.ExtraEntries {
+			if entry != nil {
+				cloned.ExtraEntries[i] = proto.Clone(entry).(*advisorsvc.CalculationInfo)
+			}
+		}
+	}
+	target := &advisorPostCommitTarget{revision: revision, response: cloned}
+	p.cpuSetAdjustmentRetryMu.Lock()
+	p.advisorPostCommitTarget = target
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	return target
+}
+
+func (p *DynamicPolicy) hasAnyPendingAdvisorPostCommitTarget() bool {
+	p.cpuSetAdjustmentRetryMu.Lock()
+	defer p.cpuSetAdjustmentRetryMu.Unlock()
+	return p.advisorPostCommitTarget != nil
+}
+
+func (p *DynamicPolicy) hasPendingAdvisorPostCommitTarget(revision uint64) bool {
+	p.cpuSetAdjustmentRetryMu.Lock()
+	defer p.cpuSetAdjustmentRetryMu.Unlock()
+	return p.advisorPostCommitTarget != nil && p.advisorPostCommitTarget.revision == revision
+}
+
+func (p *DynamicPolicy) currentAdvisorPostCommitTarget() *advisorPostCommitTarget {
+	p.cpuSetAdjustmentRetryMu.Lock()
+	defer p.cpuSetAdjustmentRetryMu.Unlock()
+	return p.advisorPostCommitTarget
+}
+
+func (p *DynamicPolicy) reconcileAdvisorPostCommitTarget(
+	ctx context.Context,
+	target *advisorPostCommitTarget,
+	modes ...cpusetutil.CPUSetAdjustmentMode,
 ) error {
-	cgroupErr := p.applyCgroupConfigs(resp)
-	adjustmentErr := p.runCPUSetAdjustmentHandlers(ctx)
-	if cgroupErr == nil && adjustmentErr == nil {
+	if target == nil {
+		return nil
+	}
+	p.cpuSetAdjustmentRetryMu.Lock()
+	current := p.advisorPostCommitTarget
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	if current != target {
 		return nil
 	}
 
-	p.markAdvisorApplyFailed(revision)
-	if cgroupErr != nil && adjustmentErr != nil {
-		return fmt.Errorf("applyCgroupConfigs failed with error: %v; runCPUSetAdjustmentHandlers failed with error: %v",
-			cgroupErr, adjustmentErr)
+	mode := cpusetutil.CPUSetAdjustmentModePeriodic
+	if len(modes) > 0 {
+		mode = modes[0].OrFullDefault()
+	}
+	headroomErr := p.applyHeadroom(target.response)
+	cgroupErr := p.applyCgroupConfigs(target.response)
+	adjustmentErr := p.runCPUSetAdjustmentHandlers(ctx, mode)
+	if headroomErr == nil && cgroupErr == nil && adjustmentErr == nil {
+		p.cpuSetAdjustmentRetryMu.Lock()
+		if p.advisorPostCommitTarget == target {
+			p.advisorPostCommitTarget = nil
+			delete(p.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
+			if len(p.cpuSetAdjustmentRetryReasons) == 0 {
+				p.cpuSetAdjustmentRetryDirty = false
+				p.cpuSetAdjustmentRetryReasons = nil
+			}
+		}
+		p.cpuSetAdjustmentRetryMu.Unlock()
+		return nil
+	}
+
+	if mode != cpusetutil.CPUSetAdjustmentModeRetry {
+		p.markAdvisorApplyFailed(target.revision)
+	}
+	var stageErrors []string
+	if headroomErr != nil {
+		stageErrors = append(stageErrors, fmt.Sprintf("applyHeadroom failed with error: %v", headroomErr))
 	}
 	if cgroupErr != nil {
-		return fmt.Errorf("applyCgroupConfigs failed with error: %v", cgroupErr)
+		stageErrors = append(stageErrors, fmt.Sprintf("applyCgroupConfigs failed with error: %v", cgroupErr))
 	}
-	return fmt.Errorf("runCPUSetAdjustmentHandlers failed with error: %v", adjustmentErr)
+	if adjustmentErr != nil {
+		stageErrors = append(stageErrors, fmt.Sprintf("runCPUSetAdjustmentHandlers failed with error: %v", adjustmentErr))
+	}
+	return errors.New(strings.Join(stageErrors, "; "))
 }
 
 func (p *DynamicPolicy) markAdvisorApplyFailed(revision uint64) {
@@ -379,7 +444,12 @@ func (p *DynamicPolicy) scheduleCPUSetAdjustmentRetry(reason cpusetutil.CPUSetAd
 					}
 				}()
 			}
-			err := p.runCPUSetAdjustmentHandlers(ctx, cpusetutil.CPUSetAdjustmentModeRetry)
+			var err error
+			if target := p.currentAdvisorPostCommitTarget(); target != nil {
+				err = p.reconcileAdvisorPostCommitTarget(ctx, target, cpusetutil.CPUSetAdjustmentModeRetry)
+			} else {
+				err = p.runCPUSetAdjustmentHandlers(ctx, cpusetutil.CPUSetAdjustmentModeRetry)
+			}
 			cancel()
 			p.Unlock()
 			if err != nil {
@@ -413,7 +483,7 @@ func (p *DynamicPolicy) scheduleCPUSetAdjustmentRetry(reason cpusetutil.CPUSetAd
 				attempt = 0
 				continue
 			}
-			if err == nil {
+			if err == nil && p.advisorPostCommitTarget == nil {
 				p.cpuSetAdjustmentRetryDirty = false
 				p.cpuSetAdjustmentRetryReasons = nil
 			} else {
@@ -446,11 +516,23 @@ func (p *DynamicPolicy) reconcileDirtyCPUSetAdjustment() error {
 
 	p.Lock()
 	ctx, cancel := context.WithTimeout(context.Background(), cpuSetAdjustmentHandlerTimeout(p.conf))
-	err := p.runCPUSetAdjustmentHandlers(ctx, cpusetutil.CPUSetAdjustmentModePeriodic)
+	var err error
+	if target := p.currentAdvisorPostCommitTarget(); target != nil {
+		err = p.reconcileAdvisorPostCommitTarget(ctx, target, cpusetutil.CPUSetAdjustmentModePeriodic)
+	} else {
+		err = p.runCPUSetAdjustmentHandlers(ctx, cpusetutil.CPUSetAdjustmentModePeriodic)
+	}
 	cancel()
 	p.Unlock()
 	if err != nil {
 		general.Errorf("periodic latest-state cpuset adjustment reconcile failed: %v", err)
+	} else {
+		p.cpuSetAdjustmentRetryMu.Lock()
+		if p.advisorPostCommitTarget == nil && !p.cpuSetAdjustmentRetryQueued && !p.cpuSetAdjustmentRetryAgain {
+			p.cpuSetAdjustmentRetryDirty = false
+			p.cpuSetAdjustmentRetryReasons = nil
+		}
+		p.cpuSetAdjustmentRetryMu.Unlock()
 	}
 	return err
 }

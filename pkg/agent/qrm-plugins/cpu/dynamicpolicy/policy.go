@@ -154,6 +154,7 @@ type DynamicPolicy struct {
 	cpuSetAdjustmentRetryStopCh   <-chan struct{}
 	cpuSetAdjustmentRetryStopping bool
 	cpuSetAdjustmentRetryWG       sync.WaitGroup
+	advisorPostCommitTarget       *advisorPostCommitTarget
 	cpuSetAdjustmentGeneration    uint64
 
 	cpuPressureEviction       agent.Component
