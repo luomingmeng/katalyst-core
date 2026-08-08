@@ -561,12 +561,14 @@ func (p *DynamicPolicy) allocateByCPUAdvisor(
 	}
 
 	responseAllowOverlap := resp.AllowSharedCoresOverlapReclaimedCores
-	applyErr := p.applyBlocks(blockToCPUSet, resp, responseAllowOverlap)
+	preCommitRevision := p.state.GetRevision()
+	target, applyErr := p.commitAdvisorResponseWithWriteAhead(resp, preCommitRevision, func() error {
+		return p.applyBlocks(blockToCPUSet, resp, responseAllowOverlap)
+	})
 	if applyErr != nil {
-		return fmt.Errorf("applyBlocks failed with error: %v", applyErr)
+		return fmt.Errorf("applyBlocks failed with error: %w", applyErr)
 	}
 
-	target := p.publishAdvisorPostCommitTarget(resp, p.state.GetRevision())
 	ctx, cancel := context.WithTimeout(context.Background(), cpuSetAdjustmentHandlerTimeout(p.conf))
 	defer cancel()
 	if err := p.reconcileAdvisorPostCommitTarget(ctx, target); err != nil {
