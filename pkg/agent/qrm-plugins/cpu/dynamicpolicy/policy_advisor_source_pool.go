@@ -321,12 +321,10 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocks(
 		return nil, fmt.Errorf("solve dedicated and mandatory reclaim: %w", err)
 	}
 
-	numaToBlocks, err := resp.GetBlocks()
+	sourceComponents, componentMembers, err := p.advisorSourceIsolationComponents(descriptors)
 	if err != nil {
 		return nil, err
 	}
-	blockByID := advisorBlockInfoByID(numaToBlocks)
-	sourceComponents, componentMembers := p.advisorSourceIsolationComponents(descriptors, blockByID)
 	for _, sourceBlockID := range sourceComponents {
 		available, err = p.solveAdvisorDescriptorPhase(componentMembers[sourceBlockID], available, result, false)
 		if err != nil {
@@ -449,8 +447,7 @@ func (p *DynamicPolicy) allocateStableAdvisorDescriptors(
 
 func (p *DynamicPolicy) advisorSourceIsolationComponents(
 	descriptors []advisorBlockDescriptor,
-	blockByID map[string]*advisorapi.BlockInfo,
-) ([]string, map[string][]advisorBlockDescriptor) {
+) ([]string, map[string][]advisorBlockDescriptor, error) {
 	type sourceDomain struct {
 		poolName            string
 		resourcePackageName string
@@ -478,15 +475,11 @@ func (p *DynamicPolicy) advisorSourceIsolationComponents(
 		if descriptor.Class != advisorBlockClassShared || !advisorDescriptorIsIsolation(descriptor) {
 			continue
 		}
-		sourcePool, resourcePackageName, ok := deriveAdvisorIsolationSourceDomain(
-			blockByID[descriptor.BlockID], p.state.GetPodEntries(),
-		)
-		if !ok {
-			continue
+		domain, err := advisorIsolationDescriptorSourceDomain(descriptor, p.state.GetPodEntries())
+		if err != nil {
+			return nil, nil, fmt.Errorf("derive isolation block %q source domain: %w", descriptor.BlockID, err)
 		}
-		source, ok := sourceByDomain[sourceDomain{
-			poolName: sourcePool, resourcePackageName: resourcePackageName, numaID: descriptor.NUMAID,
-		}]
+		source, ok := sourceByDomain[domain]
 		if !ok {
 			continue
 		}
@@ -506,19 +499,62 @@ func (p *DynamicPolicy) advisorSourceIsolationComponents(
 			return advisorBlockDescriptorLess(members[descriptor.BlockID][i], members[descriptor.BlockID][j])
 		})
 	}
-	return keys, members
+	return keys, members, nil
 }
 
-func advisorBlockInfoByID(numaToBlocks map[int][]*advisorapi.BlockInfo) map[string]*advisorapi.BlockInfo {
-	result := make(map[string]*advisorapi.BlockInfo)
-	for _, blocks := range numaToBlocks {
-		for _, block := range blocks {
-			if block != nil {
-				result[block.BlockId] = block
-			}
-		}
+func advisorIsolationDescriptorSourceDomain(
+	descriptor advisorBlockDescriptor,
+	entries state.PodEntries,
+) (struct {
+	poolName            string
+	resourcePackageName string
+	numaID              int
+}, error) {
+	var resolved struct {
+		poolName            string
+		resourcePackageName string
+		numaID              int
 	}
-	return result
+	resolvedSet := false
+	for _, owner := range descriptor.Owners {
+		poolName, entryName, subEntryName, resourcePackageName, ok := advisorDescriptorOwner(owner)
+		if !ok {
+			return resolved, fmt.Errorf("owner %q is malformed", owner)
+		}
+		if !commonstate.IsIsolationPool(poolName) {
+			continue
+		}
+		allocationInfo := entries[entryName][subEntryName]
+		if allocationInfo == nil {
+			return resolved, fmt.Errorf("owner %q has no state allocation", owner)
+		}
+		allocationPool, allocationResourcePackage := resourcepackage.UnwrapOwnerPoolName(
+			allocationInfo.GetOwnerPoolName())
+		if allocationPool != poolName || allocationResourcePackage != resourcePackageName {
+			return resolved, fmt.Errorf("owner %q disagrees with state owner domain", owner)
+		}
+		sourcePool, ok := deriveIsolationSourceSharePool(allocationInfo)
+		if !ok {
+			return resolved, fmt.Errorf("owner %q has no source pool", owner)
+		}
+		sourcePool, _ = resourcepackage.UnwrapOwnerPoolName(sourcePool)
+		current := struct {
+			poolName            string
+			resourcePackageName string
+			numaID              int
+		}{
+			poolName: sourcePool, resourcePackageName: resourcePackageName, numaID: descriptor.NUMAID,
+		}
+		if resolvedSet && resolved != current {
+			return resolved, fmt.Errorf("aliases resolve to different source domains")
+		}
+		resolved = current
+		resolvedSet = true
+	}
+	if !resolvedSet {
+		return resolved, fmt.Errorf("descriptor has no resolvable isolation owners")
+	}
+	return resolved, nil
 }
 
 func filterAdvisorDescriptors(
@@ -546,11 +582,16 @@ func advisorDescriptorPoolNames(descriptor advisorBlockDescriptor) []string {
 }
 
 func advisorDescriptorOwnerDomain(owner string) (string, string, bool) {
+	poolName, _, _, resourcePackageName, ok := advisorDescriptorOwner(owner)
+	return poolName, resourcePackageName, ok
+}
+
+func advisorDescriptorOwner(owner string) (string, string, string, string, bool) {
 	parts := strings.Split(owner, "\x00")
 	if len(parts) != 4 {
-		return "", "", false
+		return "", "", "", "", false
 	}
-	return parts[0], parts[3], true
+	return parts[0], parts[1], parts[2], parts[3], true
 }
 
 func advisorDescriptorIsIsolation(descriptor advisorBlockDescriptor) bool {
