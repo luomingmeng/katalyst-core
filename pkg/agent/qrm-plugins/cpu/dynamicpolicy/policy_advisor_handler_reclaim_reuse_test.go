@@ -155,7 +155,7 @@ func TestBuildAdjustmentCommitOverrideFromPodEntriesRemovesReclaimNonReclaimOver
 		},
 	}
 
-	override, err := p.buildAdjustmentCommitOverrideFromPodEntries(newEntries, false)
+	override, err := p.buildAdjustmentCommitOverrideFromPodEntries(newEntries, false, false)
 	require.NoError(t, err)
 	require.Equal(t, "advisor_pending_entries", override.Source)
 	require.True(t, override.ReclaimEffective.Equals(machine.NewCPUSet(2, 3)))
@@ -188,9 +188,50 @@ func TestBuildAdjustmentCommitOverrideFromPodEntriesSkipsWhenResponseAllowsOverl
 	// The advisor response mode is the source of truth for the pending
 	// transaction. A stale checkpoint value must not clip reclaim in overlap
 	// mode before CommitAdvisorState persists the new mode.
-	override, err := p.buildAdjustmentCommitOverrideFromPodEntries(newEntries, true)
+	override, err := p.buildAdjustmentCommitOverrideFromPodEntries(newEntries, true, false)
 	require.NoError(t, err)
 	require.Nil(t, override)
+}
+
+func TestBuildAdjustmentCommitOverrideFromPodEntriesProtectsDedicatedWhenSharedOverlapAllowed(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	newEntries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult:         machine.NewCPUSet(0, 1, 2, 3),
+				OriginalAllocationResult: machine.NewCPUSet(0, 1, 2, 3),
+			},
+		},
+		commonstate.PoolNameShare: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+				AllocationResult:         machine.NewCPUSet(0, 1),
+				OriginalAllocationResult: machine.NewCPUSet(0, 1),
+			},
+		},
+		"pod-dedicated": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-dedicated",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameDedicated,
+					QoSLevel:      "dedicated_cores",
+				},
+				AllocationResult: machine.NewCPUSet(2),
+			},
+		},
+	}
+
+	override, err := p.buildAdjustmentCommitOverrideFromPodEntries(newEntries, true, true)
+	require.NoError(t, err)
+	require.NotNil(t, override)
+	require.True(t, override.ReclaimEffective.Equals(machine.NewCPUSet(0, 1, 3)),
+		"shared overlap must remain while dedicated overlap is removed, got %s", override.ReclaimEffective)
 }
 
 func TestBuildAdjustmentCommitOverrideFromPodEntriesHandlesDirectContainerOverlap(t *testing.T) {
@@ -224,7 +265,7 @@ func TestBuildAdjustmentCommitOverrideFromPodEntriesHandlesDirectContainerOverla
 	// overlap newly allocated non-reclaim containers. The commit override must
 	// use the same pending partition view to make reclaim consistent before
 	// pre-commit validation runs.
-	override, err := p.buildAdjustmentCommitOverrideFromPodEntries(newEntries, false)
+	override, err := p.buildAdjustmentCommitOverrideFromPodEntries(newEntries, false, false)
 	require.NoError(t, err)
 	require.Equal(t, "advisor_pending_entries", override.Source)
 	require.True(t, override.ReclaimEffective.Equals(machine.NewCPUSet(2, 3)))
