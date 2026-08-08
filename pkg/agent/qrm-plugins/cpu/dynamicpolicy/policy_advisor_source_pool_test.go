@@ -26,6 +26,7 @@ import (
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/advisorsvc"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation/finders/feature_cpu"
@@ -837,6 +838,114 @@ func TestGenerateBlockCPUSetDisjointPlannerKeepsSourceAndIsolationTogether(t *te
 	require.Equal(t, 1, oldSource.Difference(shrunk["rotated-source"]).
 		Union(shrunk["rotated-source"].Difference(oldSource)).Size())
 	require.Equal(t, oldIsolation, shrunk["rotated-isolation"])
+}
+
+func TestGenerateBlockCPUSetDisjointPlannerIndexesShareNUMASourceWithRPIsolation(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+
+	const resourcePackageName = "rp-a"
+	sourcePool := commonstate.PoolNameShare + commonstate.NUMAPoolInfix + "0"
+	wrappedSourcePool := resourcepackage.WrapOwnerPoolName(sourcePool, resourcePackageName)
+	isolationPool := commonstate.PoolNamePrefixIsolation + "-pod-numa0"
+	wrappedIsolationPool := resourcepackage.WrapOwnerPoolName(isolationPool, resourcePackageName)
+	numa0CPUs := cpuTopology.CPUDetails.CPUsInNUMANodes(0)
+	oldSource := machine.NewCPUSet(0, 1, 2, 3)
+	oldIsolation := machine.NewCPUSet(8, 9)
+
+	machineState := p.state.GetMachineState()
+	machineState[0].ResourcePackageStates = map[string]*state.ResourcePackageState{
+		resourcePackageName: {PinnedCPUSet: numa0CPUs},
+	}
+	p.state.SetMachineState(machineState, false)
+	p.state.SetPodEntries(state.PodEntries{
+		wrappedSourcePool: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(wrappedSourcePool),
+				AllocationResult:         oldSource,
+				OriginalAllocationResult: oldSource,
+			},
+		},
+		"pod-numa0": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-numa0",
+					ContainerName: "main",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+					OwnerPoolName: wrappedIsolationPool,
+					Annotations: map[string]string{
+						apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+						cpuconsts.CPUStateAnnotationKeyNUMAHint:             "0",
+					},
+				},
+				AllocationResult:         oldIsolation,
+				OriginalAllocationResult: oldIsolation,
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: oldIsolation,
+				},
+			},
+		},
+	}, false)
+
+	resp := &advisorapi.ListAndWatchResponse{
+		DisableDedicatedCoresOverlapReclaimedCores: true,
+		Entries: map[string]*advisorapi.CalculationEntries{
+			wrappedSourcePool: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: wrappedSourcePool,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							0: {Blocks: []*advisorapi.Block{{BlockId: "rotated-numa-source", Result: 4}}},
+						},
+					},
+				},
+			},
+			"pod-numa0": {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					"main": {
+						OwnerPoolName: wrappedIsolationPool,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							0: {Blocks: []*advisorapi.Block{{BlockId: "rotated-numa-isolation", Result: 2}}},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	descriptors, err := buildAdvisorBlockDescriptors(
+		resp,
+		cpuTopology.CPUDetails,
+		p.state.GetPodEntries(),
+		map[string]machine.CPUSet{resourcePackageName: numa0CPUs},
+		machine.NewCPUSet(),
+	)
+	require.NoError(t, err)
+	numaToBlocks, err := resp.GetBlocks()
+	require.NoError(t, err)
+	keys, members := p.advisorSourceIsolationComponents(descriptors, advisorBlockInfoByID(numaToBlocks))
+	require.Equal(t, []string{"rotated-numa-source"}, keys,
+		"share-NUMA0 source descriptor must enter the source domain index")
+	require.ElementsMatch(t,
+		[]string{"rotated-numa-source", "rotated-numa-isolation"},
+		advisorDescriptorBlockIDs(members["rotated-numa-source"]),
+	)
+
+	featureGates := map[string]*advisorsvc.FeatureGate{
+		feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition: {
+			Name: feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
+		},
+	}
+	got, err := p.generateBlockCPUSet(resp, featureGates)
+	require.NoError(t, err)
+	require.Equal(t, oldSource, got["rotated-numa-source"])
+	require.Equal(t, oldIsolation, got["rotated-numa-isolation"])
+	require.Equal(t, oldSource.Union(oldIsolation),
+		got["rotated-numa-source"].Union(got["rotated-numa-isolation"]))
 }
 
 func TestAdvisorSourceIsolationComponentsScopeSourceByNUMAAndResourcePackage(t *testing.T) {

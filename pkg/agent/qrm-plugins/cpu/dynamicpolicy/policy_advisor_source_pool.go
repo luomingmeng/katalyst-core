@@ -555,7 +555,8 @@ func advisorDescriptorOwnerDomain(owner string) (string, string, bool) {
 
 func advisorDescriptorIsIsolation(descriptor advisorBlockDescriptor) bool {
 	for _, poolName := range advisorDescriptorPoolNames(descriptor) {
-		if commonstate.IsIsolationPool(poolName) || commonstate.IsShareNUMABindingPool(poolName) {
+		unwrappedPoolName, _ := resourcepackage.UnwrapOwnerPoolName(poolName)
+		if commonstate.IsIsolationPool(unwrappedPoolName) {
 			return true
 		}
 	}
