@@ -235,6 +235,10 @@ func (p *DynamicPolicy) rollbackAllocationState(
 	req *pluginapi.ResourceRequest,
 	snapshot allocationRollbackSnapshot,
 ) error {
+	if p.state.GetRevision() == snapshot.revision {
+		return nil
+	}
+
 	err := p.state.CommitAdvisorStateIfRevision(
 		snapshot.revision,
 		snapshot.podEntries,

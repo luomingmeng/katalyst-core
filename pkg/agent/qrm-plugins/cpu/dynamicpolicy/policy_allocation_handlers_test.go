@@ -1928,6 +1928,57 @@ func TestAdjustAllocationEntriesWithRampUpFloorKeepsHardFloorCapacityErrorLowerc
 	require.Equal(t, strings.ToLower(err.Error()), err.Error())
 }
 
+func TestAllocateSharedNUMABindingRampUpRejectsLateHardFloorAtomically(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0).ToSliceInt()
+	numa1 := topology.CPUDetails.CPUsInNUMANodes(1).ToSliceInt()
+	eligible := machine.NewCPUSet(append(numa0[:2], numa1[:2]...)...)
+	p.reservedCPUs = topology.CPUDetails.CPUs().Difference(eligible)
+	p.reservedReclaimedCPUSet = machine.NewCPUSet()
+	p.reservedReclaimedCPUsSize = 0
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0
+	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+	p.podAnnotationKeptKeys = []string{apiconsts.PodAnnotationMemoryEnhancementNumaBinding}
+
+	initialEntries := p.state.GetPodEntries()
+	initialMachineState := p.state.GetMachineState()
+	initialRevision := p.state.GetRevision()
+	req := &pluginapi.ResourceRequest{
+		PodUid:         "snb-late-hard-floor",
+		PodNamespace:   "default",
+		PodName:        "snb-late-hard-floor",
+		ContainerName:  "main",
+		ContainerType:  pluginapi.ContainerType_MAIN,
+		ContainerIndex: 0,
+		ResourceName:   string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{
+			string(v1.ResourceCPU): 2,
+		},
+		Labels: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelSharedCores,
+		},
+		Annotations: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey:                  apiconsts.PodAnnotationQoSLevelSharedCores,
+			apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+		},
+		Hint: &pluginapi.TopologyHint{Nodes: []uint64{1}},
+	}
+
+	resp, err := p.Allocate(context.Background(), req)
+	require.Nil(t, resp)
+	require.ErrorContains(t, err,
+		`insufficient capacity for owned pool "share-NUMA1" in numa 1: requested 4 cpus, allocated 0`)
+	require.Equal(t, initialEntries, p.state.GetPodEntries())
+	require.Equal(t, initialMachineState, p.state.GetMachineState())
+	require.Equal(t, initialRevision, p.state.GetRevision())
+}
+
 func TestDynamicPolicyDeriveRampUpReclaimFloorAllowsFullNonExclusiveRatio(t *testing.T) {
 	t.Parallel()
 

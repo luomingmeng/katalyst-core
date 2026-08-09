@@ -1289,9 +1289,6 @@ func (p *DynamicPolicy) allocateSharedNumaBindingCPUs(ctx context.Context, req *
 		return checkedAllocationInfo, nil
 	} else {
 		allocationInfo.RampUp = p.shouldSharedCoresRampUp(ctx, req.PodUid)
-		if err := p.updateAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, nil, allocationInfo, persistCheckpoint); err != nil {
-			return nil, err
-		}
 		checkedAllocationInfo, err := p.doAndCheckPutAllocationInfo(allocationInfo, true, persistCheckpoint)
 		if err != nil {
 			return nil, fmt.Errorf("doAndCheckPutAllocationInfo failed with error: %v", err)
@@ -1355,8 +1352,10 @@ func (p *DynamicPolicy) putAllocationsAndAdjustAllocationEntriesResizeAware(
 		} else if !allocationInfo.CheckShared() {
 			return fmt.Errorf("put container with invalid qos level: %s into pool", allocationInfo.QoSLevel)
 		} else if entries[allocationInfo.PodUid][allocationInfo.ContainerName] == nil {
-			return fmt.Errorf("entry %s/%s, %s isn't found in state",
-				allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName)
+			if entries[allocationInfo.PodUid] == nil {
+				entries[allocationInfo.PodUid] = make(state.ContainerEntries)
+			}
+			entries[allocationInfo.PodUid][allocationInfo.ContainerName] = allocationInfo.Clone()
 		}
 
 		poolName := allocationInfo.GetSpecifiedPoolName()
@@ -1600,6 +1599,32 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloor(
 	explicitRampUpFloor machine.CPUSet,
 	runCPUSetHandlers bool,
 ) error {
+	rampUpReclaimFloor := explicitRampUpFloor.Clone()
+	if p.isRampUpReclaimHardPartitionEnabled() && rampUpReclaimFloor.IsEmpty() {
+		hasRampUp := false
+		for _, containerEntries := range entries {
+			if containerEntries.IsPoolEntry() {
+				continue
+			}
+			for _, allocationInfo := range containerEntries {
+				if allocationInfo != nil && allocationInfo.RampUp {
+					hasRampUp = true
+					break
+				}
+			}
+			if hasRampUp {
+				break
+			}
+		}
+		if hasRampUp {
+			var err error
+			rampUpReclaimFloor, err = p.deriveRampUpReclaimFloor(machineState, true)
+			if err != nil {
+				return fmt.Errorf("derive reclaim floor before allocating pools failed: %w", err)
+			}
+		}
+	}
+
 	availableCPUs := machineState.GetFilteredAvailableCPUSet(p.reservedCPUs, nil,
 		state.WrapAllocationMetaFilter((*commonstate.AllocationMeta).CheckDedicatedNUMABindingNUMAExclusive))
 
@@ -1609,9 +1634,9 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloor(
 	// deduct the cpus that are not allocatable by user containers.
 	notAllocatablePoolCPUs := state.GetUnitedPoolsCPUs(entries, state.IsForbiddenPool, commonstate.IsSystemPool)
 	availableCPUs = availableCPUs.Difference(notAllocatablePoolCPUs)
-	hardPartitionWithExplicitFloor := p.isRampUpReclaimHardPartitionEnabled() && !explicitRampUpFloor.IsEmpty()
+	hardPartitionWithExplicitFloor := p.isRampUpReclaimHardPartitionEnabled() && !rampUpReclaimFloor.IsEmpty()
 	if hardPartitionWithExplicitFloor {
-		availableCPUs = availableCPUs.Difference(explicitRampUpFloor)
+		availableCPUs = availableCPUs.Difference(rampUpReclaimFloor)
 	}
 
 	reclaimOverlapShareRatio, err := p.getReclaimOverlapShareRatio(entries)
@@ -1640,7 +1665,7 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloor(
 	}
 
 	err = p.applyPoolsAndIsolatedInfo(poolsCPUSet, isolatedCPUSet, entries,
-		machineState, state.GetSharedBindingNUMAsFromQuantityMap(poolsQuantityMap), persistCheckpoint, explicitRampUpFloor)
+		machineState, state.GetSharedBindingNUMAsFromQuantityMap(poolsQuantityMap), persistCheckpoint, rampUpReclaimFloor)
 	if err != nil {
 		return fmt.Errorf("applyPoolsAndIsolatedInfo failed with error: %v", err)
 	}
@@ -1672,10 +1697,20 @@ func (p *DynamicPolicy) validateOwnedPoolsQuantity(
 			continue
 		}
 		for _, allocationInfo := range containerEntries {
-			if allocationInfo == nil || allocationInfo.OwnerPoolName == commonstate.EmptyOwnerPoolName {
+			if allocationInfo == nil {
 				continue
 			}
-			ownedPools[allocationInfo.OwnerPoolName] = struct{}{}
+			poolName := allocationInfo.OwnerPoolName
+			if poolName == commonstate.EmptyOwnerPoolName && allocationInfo.CheckSharedNUMABinding() {
+				var err error
+				poolName, err = allocationInfo.GetSpecifiedNUMABindingPoolName()
+				if err != nil {
+					continue
+				}
+			}
+			if poolName != commonstate.EmptyOwnerPoolName {
+				ownedPools[poolName] = struct{}{}
+			}
 		}
 	}
 
@@ -1695,10 +1730,6 @@ func (p *DynamicPolicy) validateOwnedPoolsQuantity(
 		}
 
 		allocated := poolsCPUSet[poolName]
-		if allocated.Size() < requested {
-			return fmt.Errorf("insufficient capacity for owned pool %q: requested %d cpus, allocated %d",
-				poolName, requested, allocated.Size())
-		}
 		for numaID, quantity := range numaQuantities {
 			if numaID == commonstate.FakedNUMAID || quantity <= 0 {
 				continue
@@ -1708,6 +1739,10 @@ func (p *DynamicPolicy) validateOwnedPoolsQuantity(
 				return fmt.Errorf("insufficient capacity for owned pool %q in numa %d: requested %d cpus, allocated %d",
 					poolName, numaID, quantity, numaAllocated)
 			}
+		}
+		if allocated.Size() < requested {
+			return fmt.Errorf("insufficient capacity for owned pool %q: requested %d cpus, allocated %d",
+				poolName, requested, allocated.Size())
 		}
 	}
 	return nil
@@ -1890,13 +1925,6 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 
 	// 2. construct entries for all pools
 	rampUpReclaimFloor := explicitRampUpFloor.Clone()
-	if rampUpReclaimFloor.IsEmpty() {
-		var err error
-		rampUpReclaimFloor, err = p.deriveRampUpReclaimFloor(machineState, false)
-		if err != nil {
-			return fmt.Errorf("derive reclaim floor before applying pools failed: %w", err)
-		}
-	}
 	if !rampUpReclaimFloor.IsEmpty() {
 		poolsCPUSet[commonstate.PoolNameReclaim] = poolsCPUSet[commonstate.PoolNameReclaim].Union(rampUpReclaimFloor)
 	}
