@@ -173,6 +173,85 @@ func makeContainerInfo(podUID, namespace, podName, containerName, qoSLevel, owne
 	}
 }
 
+func TestAdvisorUpdateHardPartitionNUMAAvailability(t *testing.T) {
+	advisorGlobalRegistryMu.Lock()
+	defer advisorGlobalRegistryMu.Unlock()
+
+	tests := []struct {
+		name            string
+		hardPartition   bool
+		numaAvailable   map[int]int
+		wantErr         string
+		wantReservedMap map[int]int
+	}{
+		{
+			name:          "hard partition rejects one empty NUMA",
+			hardPartition: true,
+			numaAvailable: map[int]int{0: 0, 1: 8},
+			wantErr:       "NUMA 0 has 0 available CPUs, requires at least 2",
+		},
+		{
+			name:          "hard partition rejects negative availability",
+			hardPartition: true,
+			numaAvailable: map[int]int{0: -1, 1: 8},
+			wantErr:       "NUMA 0 has -1 available CPUs, requires at least 2",
+		},
+		{
+			name:            "hard partition reserves two CPUs on every NUMA",
+			hardPartition:   true,
+			numaAvailable:   map[int]int{0: 2, 1: 2},
+			wantReservedMap: map[int]int{0: 2, 1: 2},
+		},
+		{
+			name:            "soft partition preserves legacy behavior",
+			hardPartition:   false,
+			numaAvailable:   map[int]int{0: 0, 1: 8},
+			wantReservedMap: map[int]int{0: 2, 1: 2},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			conf := generateTestConfiguration(t, t.TempDir(), t.TempDir())
+			dynamicConf := conf.GetDynamicConfiguration()
+			dynamicConf.EnableRampUpReclaimHardPartition = tt.hardPartition
+			dynamicConf.InitialRampUpReclaimCPUSetRatio = 0
+
+			mf := metric.NewFakeMetricsFetcher(metrics.DummyMetrics{}).(*metric.FakeMetricsFetcher)
+			advisor, metaCache := newTestCPUResourceAdvisor(t, nil, conf, mf, nil)
+
+			assignments := make(map[int]machine.CPUSet, len(tt.numaAvailable))
+			for numaID, available := range tt.numaAvailable {
+				numaCPUs := advisor.metaServer.NUMAToCPUs[numaID].ToSliceInt()
+				reservedCount := len(numaCPUs) - available
+				reservedCPUs := append([]int(nil), numaCPUs...)
+				if reservedCount > len(reservedCPUs) {
+					otherNUMA := (numaID + 1) % advisor.metaServer.NumNUMANodes
+					reservedCPUs = append(reservedCPUs, advisor.metaServer.NUMAToCPUs[otherNUMA].ToSliceInt()...)
+				}
+				assignments[numaID] = machine.NewCPUSet(reservedCPUs[:reservedCount]...)
+			}
+			require.NoError(t, metaCache.SetPoolInfo(commonstate.PoolNameReserve, &types.PoolInfo{
+				PoolName:                 commonstate.PoolNameReserve,
+				TopologyAwareAssignments: assignments,
+			}))
+
+			result, err := advisor.UpdateAndGetAdvice(context.Background())
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				assert.Nil(t, result)
+				assert.Empty(t, advisor.reservedForReclaim)
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.Equal(t, tt.wantReservedMap, advisor.reservedForReclaim)
+		})
+	}
+}
+
 func TestAdvisorUpdate(t *testing.T) {
 	t.Parallel()
 
