@@ -220,9 +220,14 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimHardPartitionCapacity(t *test
 			wantReserved: map[int]int{0: 4, 1: 4},
 		},
 		{
+			name:         "candidate remainder preserves global target",
+			ratio:        0.5625,
+			wantReserved: map[int]int{0: 4, 1: 5},
+		},
+		{
 			name:    "candidate exceeds one NUMA",
 			ratio:   0.75,
-			wantErr: "NUMA 0 reclaim reservation exceeds capacity: required 6, available 4",
+			wantErr: "cannot distribute target 12 within NUMA capacities while keeping counts balanced",
 		},
 	}
 

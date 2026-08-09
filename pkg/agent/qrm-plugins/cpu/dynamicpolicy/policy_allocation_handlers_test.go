@@ -1723,6 +1723,86 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorAllowsFullNonExclusiveRatio(t *tes
 		"floor=%s, want every eligible CPU", floor)
 }
 
+func TestDynamicPolicyDeriveRampUpReclaimFloorBalancesGlobalTargetAcrossUnevenNUMAs(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		hardEnabled  bool
+		withReserved bool
+		ratio        float64
+		wantPerNUMA  map[int]int
+		wantErr      string
+	}{
+		{
+			name:         "half ratio is balanced four and four",
+			hardEnabled:  true,
+			withReserved: true,
+			ratio:        0.5,
+			wantPerNUMA:  map[int]int{0: 4, 1: 4},
+		},
+		{
+			name:         "three quarter ratio exceeds balanced capacity",
+			hardEnabled:  true,
+			withReserved: true,
+			ratio:        0.75,
+			wantErr:      "cannot distribute target 12 within NUMA capacities while keeping counts balanced",
+		},
+		{
+			name:        "zero ratio still keeps two per NUMA",
+			hardEnabled: true,
+			ratio:       0,
+			wantPerNUMA: map[int]int{0: 2, 1: 2},
+		},
+		{
+			name:         "disabled hard partition remains empty",
+			hardEnabled:  false,
+			withReserved: true,
+			ratio:        0.75,
+			wantPerNUMA:  map[int]int{0: 0, 1: 0},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cpuTopology, err := machine.GenerateDummyCPUTopology(32, 2, 2)
+			require.NoError(t, err)
+			p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+			require.NoError(t, err)
+
+			numa0CPUs := p.machineInfo.CPUDetails.CPUsInNUMANodes(0).ToSliceInt()
+			numa1CPUs := p.machineInfo.CPUDetails.CPUsInNUMANodes(1).ToSliceInt()
+			eligible := machine.NewCPUSet(append(numa0CPUs[:4], numa1CPUs[:12]...)...)
+			p.reservedCPUs = p.machineInfo.CPUDetails.CPUs().Difference(eligible)
+			if tt.withReserved {
+				p.reservedReclaimedCPUSet = machine.NewCPUSet(numa0CPUs[0], numa0CPUs[1], numa1CPUs[0], numa1CPUs[1])
+				p.reservedReclaimedCPUsSize = 4
+			} else {
+				p.reservedReclaimedCPUSet = machine.NewCPUSet()
+				p.reservedReclaimedCPUsSize = 0
+			}
+			p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = tt.hardEnabled
+			p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = tt.ratio
+
+			floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), true)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			if tt.hardEnabled && tt.withReserved {
+				require.True(t, p.reservedReclaimedCPUSet.IsSubsetOf(floor), "reserved reclaim CPUs must remain preferred")
+			}
+			for numaID, want := range tt.wantPerNUMA {
+				require.Equal(t, want, floor.Intersection(p.machineInfo.CPUDetails.CPUsInNUMANodes(numaID)).Size())
+			}
+		})
+	}
+}
+
 func TestDedicatedNUMAExclusiveRampUpCommitsAllocationAndReclaimAtomically(t *testing.T) {
 	t.Parallel()
 
