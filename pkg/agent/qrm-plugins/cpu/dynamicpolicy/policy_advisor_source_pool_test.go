@@ -1388,6 +1388,27 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 		require.Equal(t, 2, got.Intersection(numa1).Size())
 	})
 
+	t.Run("real NUMA reclaim seeds fake NUMA water filling", func(t *testing.T) {
+		p := newPolicy(t, true)
+		result := advisorapi.NewBlockCPUSet()
+		_, err := p.solveAdvisorDescriptorPhase([]advisorBlockDescriptor{
+			{
+				BlockID: "real-0", Class: advisorBlockClassMandatoryReclaim, NUMAID: 0,
+				Quantity: 2, ComponentKey: "real-0", Eligible: numa0,
+			},
+			{
+				BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
+				Quantity: 4, ComponentKey: "fake", Eligible: allCPUs,
+			},
+		}, allCPUs, result, true)
+		require.NoError(t, err)
+		require.Equal(t, 2, result["real-0"].Intersection(numa0).Size())
+		require.Equal(t, 1, result["fake"].Intersection(numa0).Size())
+		require.Equal(t, 3, result["fake"].Intersection(numa1).Size())
+		require.Equal(t, 3, result["real-0"].Union(result["fake"]).Intersection(numa0).Size())
+		require.Equal(t, 3, result["real-0"].Union(result["fake"]).Intersection(numa1).Size())
+	})
+
 	t.Run("quantity below hard minimum fails", func(t *testing.T) {
 		got, err := solve(t, newPolicy(t, true), 3, allCPUs, machine.NewCPUSet())
 		require.ErrorContains(t, err, "smaller than required minimum")

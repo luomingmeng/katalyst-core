@@ -340,96 +340,163 @@ func advisorBlockClassRank(class advisorBlockClass) int {
 	}
 }
 
-func balancedHardReclaimQuotas(
-	quantity int,
-	capacities map[int]int,
-	minimumPerNUMA int,
-) (map[int]int, error) {
-	if len(capacities) == 0 {
-		return nil, fmt.Errorf("hard reclaim has no eligible NUMA")
-	}
-
-	numaIDs := make([]int, 0, len(capacities))
-	for numaID := range capacities {
-		numaIDs = append(numaIDs, numaID)
-	}
-	sort.Ints(numaIDs)
-
-	requiredMinimum := minimumPerNUMA * len(numaIDs)
-	if quantity < requiredMinimum {
-		return nil, fmt.Errorf("hard reclaim quantity %d is smaller than required minimum %d",
-			quantity, requiredMinimum)
-	}
-
-	base, remainder := quantity/len(numaIDs), quantity%len(numaIDs)
-	quotas := make(map[int]int, len(numaIDs))
-	for _, numaID := range numaIDs {
-		if capacities[numaID] < base {
-			return nil, fmt.Errorf("hard reclaim NUMA %d eligible capacity %d is smaller than base quota %d",
-				numaID, capacities[numaID], base)
-		}
-		quotas[numaID] = base
-	}
-	for _, numaID := range numaIDs {
-		if remainder == 0 {
-			break
-		}
-		if capacities[numaID] >= base+1 {
-			quotas[numaID]++
-			remainder--
-		}
-	}
-	if remainder != 0 {
-		return nil, fmt.Errorf("hard reclaim eligible capacities cannot satisfy quantity %d", quantity)
-	}
-	return quotas, nil
-}
-
-func expandHardPartitionReclaimDemands(
-	descriptor advisorBlockDescriptor,
+func expandHardPartitionReclaimPhase(
+	descriptors []advisorBlockDescriptor,
 	available machine.CPUSet,
 	topology *machine.CPUTopology,
-) ([]partitionDemand, error) {
-	finalEligible := descriptor.Eligible.Intersection(available)
-	singleDemand := []partitionDemand{{
-		key:       descriptor.ComponentKey,
-		quantity:  descriptor.Quantity,
-		eligible:  finalEligible,
-		preferred: descriptor.OldPreferred.Intersection(finalEligible),
-		class:     descriptor.Class,
-	}}
-	if descriptor.Class != advisorBlockClassMandatoryReclaim ||
-		descriptor.NUMAID != commonstate.FakedNUMAID {
-		return singleDemand, nil
-	}
+) ([]partitionDemand, map[string]string, error) {
 	if topology == nil {
-		return nil, fmt.Errorf("cannot expand hard reclaim with nil CPU topology")
+		return nil, nil, fmt.Errorf("cannot expand hard reclaim phase with nil CPU topology")
 	}
 
-	eligibleNUMAs := topology.CPUDetails.KeepOnly(descriptor.Eligible).NUMANodes().ToSliceInt()
-	capacities := make(map[int]int, len(eligibleNUMAs))
-	for _, numaID := range eligibleNUMAs {
-		numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
-		capacities[numaID] = finalEligible.Intersection(numaCPUs).Size()
-	}
-	quotas, err := balancedHardReclaimQuotas(
-		descriptor.Quantity, capacities, minimumHardReclaimCPUsPerNUMA)
-	if err != nil {
-		return nil, err
+	mandatory := filterAdvisorDescriptors(descriptors, func(descriptor advisorBlockDescriptor) bool {
+		return descriptor.Class == advisorBlockClassMandatoryReclaim
+	})
+	sort.Slice(mandatory, func(i, j int) bool {
+		return advisorBlockDescriptorLess(mandatory[i], mandatory[j])
+	})
+	if len(mandatory) == 0 {
+		return nil, map[string]string{}, nil
 	}
 
-	demands := make([]partitionDemand, 0, len(eligibleNUMAs))
-	for _, numaID := range eligibleNUMAs {
-		numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
+	demands := make([]partitionDemand, 0, len(mandatory))
+	blockIDByDemandKey := make(map[string]string, len(mandatory))
+	finalByNUMA := make(map[int]int)
+	capacityByNUMA := make(map[int]int)
+	eligibleNUMAs := make(map[int]struct{})
+	fakeDescriptors := make([]advisorBlockDescriptor, 0, len(mandatory))
+	totalQuantity := 0
+
+	for _, descriptor := range mandatory {
+		totalQuantity += descriptor.Quantity
+		finalEligible := descriptor.Eligible.Intersection(available)
+		if descriptor.NUMAID == commonstate.FakedNUMAID {
+			fakeDescriptors = append(fakeDescriptors, descriptor)
+			for _, numaID := range topology.CPUDetails.KeepOnly(finalEligible).NUMANodes().ToSliceInt() {
+				eligibleNUMAs[numaID] = struct{}{}
+				capacityByNUMA[numaID] = available.Intersection(
+					topology.CPUDetails.CPUsInNUMANodes(numaID)).Size()
+			}
+			continue
+		}
+
+		numaCPUs := topology.CPUDetails.CPUsInNUMANodes(descriptor.NUMAID)
 		eligible := finalEligible.Intersection(numaCPUs)
-		quota := quotas[numaID]
+		if eligible.Size() < descriptor.Quantity {
+			return nil, nil, fmt.Errorf(
+				"hard reclaim block %q NUMA %d eligible capacity %d is smaller than quantity %d",
+				descriptor.BlockID, descriptor.NUMAID, eligible.Size(), descriptor.Quantity)
+		}
+		eligibleNUMAs[descriptor.NUMAID] = struct{}{}
+		capacityByNUMA[descriptor.NUMAID] = available.Intersection(numaCPUs).Size()
+		finalByNUMA[descriptor.NUMAID] += descriptor.Quantity
+		key := hardReclaimPhaseDemandKey(descriptor, descriptor.NUMAID)
 		demands = append(demands, partitionDemand{
-			key:       fmt.Sprintf("%s\x00block\x00%s\x00numa\x00%d", descriptor.ComponentKey, descriptor.BlockID, numaID),
-			quantity:  quota,
+			key:       key,
+			quantity:  descriptor.Quantity,
 			eligible:  eligible,
 			preferred: descriptor.OldPreferred.Intersection(eligible),
 			class:     advisorBlockClassMandatoryReclaim,
 		})
+		blockIDByDemandKey[key] = descriptor.BlockID
 	}
-	return demands, nil
+
+	if len(fakeDescriptors) == 0 {
+		return demands, blockIDByDemandKey, nil
+	}
+	requiredMinimum := minimumHardReclaimCPUsPerNUMA * len(eligibleNUMAs)
+	if totalQuantity < requiredMinimum {
+		return nil, nil, fmt.Errorf(
+			"hard reclaim quantity %d is smaller than required minimum %d",
+			totalQuantity, requiredMinimum)
+	}
+
+	for numaID, quantity := range finalByNUMA {
+		if quantity > capacityByNUMA[numaID] {
+			return nil, nil, fmt.Errorf(
+				"hard reclaim NUMA %d initial quantity %d exceeds capacity %d",
+				numaID, quantity, capacityByNUMA[numaID])
+		}
+	}
+
+	for _, descriptor := range fakeDescriptors {
+		finalEligible := descriptor.Eligible.Intersection(available)
+		descriptorCapacity := make(map[int]int)
+		for _, numaID := range topology.CPUDetails.KeepOnly(finalEligible).NUMANodes().ToSliceInt() {
+			descriptorCapacity[numaID] = finalEligible.Intersection(
+				topology.CPUDetails.CPUsInNUMANodes(numaID)).Size()
+		}
+
+		quotas := make(map[int]int)
+		for allocated := 0; allocated < descriptor.Quantity; allocated++ {
+			selectedNUMA := 0
+			selected := false
+			for numaID, capacity := range descriptorCapacity {
+				if quotas[numaID] >= capacity || finalByNUMA[numaID] >= capacityByNUMA[numaID] {
+					continue
+				}
+				if !selected || finalByNUMA[numaID] < finalByNUMA[selectedNUMA] ||
+					(finalByNUMA[numaID] == finalByNUMA[selectedNUMA] && numaID < selectedNUMA) {
+					selectedNUMA = numaID
+					selected = true
+				}
+			}
+			if !selected {
+				return nil, nil, fmt.Errorf(
+					"hard reclaim block %q has insufficient aggregate capacity for quantity %d",
+					descriptor.BlockID, descriptor.Quantity)
+			}
+			quotas[selectedNUMA]++
+			finalByNUMA[selectedNUMA]++
+		}
+
+		numaIDs := make([]int, 0, len(quotas))
+		for numaID := range quotas {
+			numaIDs = append(numaIDs, numaID)
+		}
+		sort.Ints(numaIDs)
+		for _, numaID := range numaIDs {
+			numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
+			eligible := finalEligible.Intersection(numaCPUs)
+			key := hardReclaimPhaseDemandKey(descriptor, numaID)
+			demands = append(demands, partitionDemand{
+				key:       key,
+				quantity:  quotas[numaID],
+				eligible:  eligible,
+				preferred: descriptor.OldPreferred.Intersection(eligible),
+				class:     advisorBlockClassMandatoryReclaim,
+			})
+			blockIDByDemandKey[key] = descriptor.BlockID
+		}
+	}
+
+	numaIDs := make([]int, 0, len(eligibleNUMAs))
+	for numaID := range eligibleNUMAs {
+		numaIDs = append(numaIDs, numaID)
+	}
+	sort.Ints(numaIDs)
+	minimum, maximum := finalByNUMA[numaIDs[0]], finalByNUMA[numaIDs[0]]
+	for _, numaID := range numaIDs {
+		if finalByNUMA[numaID] < minimumHardReclaimCPUsPerNUMA {
+			return nil, nil, fmt.Errorf(
+				"hard reclaim NUMA %d final quantity %d is smaller than minimum %d",
+				numaID, finalByNUMA[numaID], minimumHardReclaimCPUsPerNUMA)
+		}
+		if finalByNUMA[numaID] < minimum {
+			minimum = finalByNUMA[numaID]
+		}
+		if finalByNUMA[numaID] > maximum {
+			maximum = finalByNUMA[numaID]
+		}
+	}
+	if maximum-minimum > 1 {
+		return nil, nil, fmt.Errorf(
+			"hard reclaim final NUMA quantities are imbalanced: min %d max %d", minimum, maximum)
+	}
+	return demands, blockIDByDemandKey, nil
+}
+
+func hardReclaimPhaseDemandKey(descriptor advisorBlockDescriptor, numaID int) string {
+	return fmt.Sprintf("%s\x00block\x00%s\x00numa\x00%d",
+		descriptor.ComponentKey, descriptor.BlockID, numaID)
 }
