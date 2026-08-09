@@ -1409,7 +1409,7 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 		require.Equal(t, 3, result["real-0"].Union(result["fake"]).Intersection(numa1).Size())
 	})
 
-	t.Run("jointly assigns fake blocks with different NUMA eligibility", func(t *testing.T) {
+	t.Run("multiple fake blocks fail closed as a protocol error", func(t *testing.T) {
 		p := newPolicy(t, true)
 		numa0CPUs, numa1CPUs := numa0.ToSliceInt(), numa1.ToSliceInt()
 		available := machine.NewCPUSet(
@@ -1426,18 +1426,11 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 				Quantity: 2, ComponentKey: "fake-b", Eligible: available.Intersection(numa0),
 			},
 		}
-		for _, input := range [][]advisorBlockDescriptor{
-			descriptors,
-			{descriptors[1], descriptors[0]},
-		} {
-			result := advisorapi.NewBlockCPUSet()
-			_, err := p.solveAdvisorDescriptorPhase(input, available, result, true)
-			require.NoError(t, err)
-			require.Equal(t, available.Intersection(numa1), result["fake-a"])
-			require.Equal(t, available.Intersection(numa0), result["fake-b"])
-			require.Equal(t, 2, result["fake-a"].Union(result["fake-b"]).Intersection(numa0).Size())
-			require.Equal(t, 2, result["fake-a"].Union(result["fake-b"]).Intersection(numa1).Size())
-		}
+		result := advisorapi.NewBlockCPUSet()
+		_, err := p.solveAdvisorDescriptorPhase(descriptors, available, result, true)
+		require.ErrorContains(t, err,
+			"hard reclaim protocol error: expected at most one fake-NUMA mandatory reclaim block, got 2")
+		require.Empty(t, result)
 	})
 
 	t.Run("real NUMA dedicated load constrains fake reclaim water filling", func(t *testing.T) {
