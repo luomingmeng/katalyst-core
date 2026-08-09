@@ -1329,6 +1329,75 @@ func TestDynamicPolicyApplyBlocksOverridesReclaimDedicatedOverlapBeforeCommit(t 
 		"advisor overlap mode must be committed in the same checkpoint transaction as pod and machine state")
 }
 
+func TestDynamicPolicyApplyBlocksRejectsHardPartitionInvalidatedByBulkheadPaddingAtomically(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	dynamicConf := policy.dynamicConfig.GetDynamicConfiguration()
+	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.EnableRampUpReclaimHardPartition = true
+	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.Enable = true
+	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.NonReclaimPoolMinSize = 4
+
+	policy.state.SetPodEntries(state.PodEntries{
+		commonstate.PoolNameReserve: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReserve),
+				AllocationResult: machine.NewCPUSet(0, 4),
+			},
+		},
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(3, 7),
+			},
+		},
+	}, false)
+	initialEntries := policy.state.GetPodEntries()
+	initialRevision := policy.state.GetRevision()
+	initialMachineState := policy.state.GetMachineState()
+
+	resp := &advisorapi.ListAndWatchResponse{
+		Entries: map[string]*advisorapi.CalculationEntries{
+			commonstate.PoolNameReserve: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameReserve,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							0: {Blocks: []*advisorapi.Block{{BlockId: "reserve", Result: 2}}},
+						},
+					},
+				},
+			},
+			commonstate.PoolNameReclaim: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameReclaim,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							0: {Blocks: []*advisorapi.Block{{BlockId: "reclaim-0", Result: 2}}},
+							1: {Blocks: []*advisorapi.Block{{BlockId: "reclaim-1", Result: 2}}},
+						},
+					},
+				},
+			},
+		},
+	}
+	blockCPUSet := advisorapi.BlockCPUSet{
+		"reserve":   machine.NewCPUSet(0, 4),
+		"reclaim-0": machine.NewCPUSet(1, 5),
+		"reclaim-1": machine.NewCPUSet(2, 6),
+	}
+
+	err = policy.applyBlocks(blockCPUSet, resp, false)
+	require.ErrorContains(t, err, "hard-partition reclaim NUMA 0 has 0 CPUs")
+	require.Equal(t, initialRevision, policy.state.GetRevision())
+	require.Equal(t, initialEntries, policy.state.GetPodEntries())
+	require.Equal(t, initialMachineState, policy.state.GetMachineState())
+}
+
 func TestDynamicPolicyApplyBlocksPreservesExplicitDisjointReclaim(t *testing.T) {
 	t.Parallel()
 
@@ -1831,7 +1900,7 @@ func TestDynamicPolicyValidateAdvisorPartitionBeforeCommitRejectsReclaimNonRecla
 				},
 			}
 
-			err = policy.validateAdvisorPartitionBeforeCommit(newEntries, false, false)
+			err = policy.validateAdvisorPartitionBeforeCommit(newEntries, policy.state.GetMachineState(), false, false)
 			require.Error(t, err)
 			require.Contains(t, err.Error(), "overlaps non-reclaim")
 		})
@@ -1862,7 +1931,7 @@ func TestDynamicPolicyValidateAdvisorPartitionBeforeCommitChecksPhysicalNUMAWhen
 		},
 	}
 
-	err = policy.validateAdvisorPartitionBeforeCommit(newEntries, true, false)
+	err = policy.validateAdvisorPartitionBeforeCommit(newEntries, policy.state.GetMachineState(), true, false)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "reclaim pool assignment crosses NUMA")
 }
@@ -1914,12 +1983,12 @@ func TestDynamicPolicyValidateAdvisorPartitionBeforeCommitRequiresExclusiveNUMAC
 		},
 	}
 
-	require.ErrorContains(t, policy.validateAdvisorPartitionBeforeCommit(newEntries, true, true),
+	require.ErrorContains(t, policy.validateAdvisorPartitionBeforeCommit(newEntries, policy.state.GetMachineState(), true, true),
 		"exclusive dedicated/reclaim partition does not cover eligible NUMA")
 	reclaim = eligible.Difference(dedicated)
 	newEntries[commonstate.PoolNameReclaim][commonstate.FakedContainerName].AllocationResult = reclaim
 	newEntries[commonstate.PoolNameReclaim][commonstate.FakedContainerName].TopologyAwareAssignments[0] = reclaim
-	require.NoError(t, policy.validateAdvisorPartitionBeforeCommit(newEntries, true, true))
+	require.NoError(t, policy.validateAdvisorPartitionBeforeCommit(newEntries, policy.state.GetMachineState(), true, true))
 }
 
 // TestDynamicPolicy_generateBlockCPUSet verifies the block CPUSet generation logic.

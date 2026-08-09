@@ -22,6 +22,8 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	cpustate "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	"github.com/kubewharf/katalyst-core/pkg/config"
+	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -30,6 +32,39 @@ type CPUSetPartitionViewOptions struct {
 	ReserveCPUReversely          bool
 	TransientProtectedNonReclaim machine.CPUSet
 	HardPartitionEnabled         bool
+}
+
+func NewCPUSetPartitionViewOptions(
+	coreConf *config.Configuration,
+	dynamicConf *dynamicconfig.Configuration,
+) CPUSetPartitionViewOptions {
+	nonReclaimPoolMinSize := configuredNonReclaimPoolMinSize(dynamicConf)
+	if nonReclaimPoolMinSize <= 0 && coreConf != nil && coreConf.DynamicAgentConfiguration != nil {
+		nonReclaimPoolMinSize = configuredNonReclaimPoolMinSize(coreConf.DynamicAgentConfiguration.GetDynamicConfiguration())
+	}
+
+	opts := CPUSetPartitionViewOptions{
+		NonReclaimPoolMinSize: nonReclaimPoolMinSize,
+		HardPartitionEnabled:  hardPartitionEnabled(dynamicConf),
+	}
+	if coreConf != nil {
+		opts.ReserveCPUReversely = coreConf.EnableReserveCPUReversely
+	}
+	return opts
+}
+
+func configuredNonReclaimPoolMinSize(conf *dynamicconfig.Configuration) int64 {
+	if conf == nil || conf.AdminQoSConfiguration == nil || conf.AdminQoSConfiguration.CPUPluginConfiguration == nil {
+		return 0
+	}
+	return conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.NonReclaimPoolMinSize
+}
+
+func hardPartitionEnabled(conf *dynamicconfig.Configuration) bool {
+	if conf == nil || conf.AdminQoSConfiguration == nil || conf.AdminQoSConfiguration.CPUPluginConfiguration == nil {
+		return false
+	}
+	return conf.AdminQoSConfiguration.CPUPluginConfiguration.EnableRampUpReclaimHardPartition
 }
 
 func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CPUTopology, opts CPUSetPartitionViewOptions) *model.DesiredView {
