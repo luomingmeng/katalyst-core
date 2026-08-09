@@ -18,11 +18,64 @@ package machine
 
 import (
 	"fmt"
+	"sort"
 )
 
 const (
 	LargeNUMAsPoint = 16
 )
+
+// DistributeNUMATarget distributes a global target across NUMA nodes while
+// respecting per-NUMA capacity and minimum constraints. The returned counts
+// sum to target and differ by at most one. Remainders are assigned by ascending
+// NUMA ID among nodes with sufficient capacity, making the result stable.
+func DistributeNUMATarget(available map[int]int, target, minPerNUMA int) (map[int]int, error) {
+	if len(available) == 0 {
+		return nil, fmt.Errorf("cannot distribute target %d across no NUMA nodes", target)
+	}
+	if minPerNUMA < 0 {
+		return nil, fmt.Errorf("per-NUMA minimum must be non-negative, got %d", minPerNUMA)
+	}
+
+	numaIDs := make([]int, 0, len(available))
+	for numaID := range available {
+		numaIDs = append(numaIDs, numaID)
+	}
+	sort.Ints(numaIDs)
+	for _, numaID := range numaIDs {
+		capacity := available[numaID]
+		if capacity < minPerNUMA {
+			return nil, fmt.Errorf("NUMA %d capacity %d is below minimum %d", numaID, capacity, minPerNUMA)
+		}
+	}
+
+	minTotal := len(available) * minPerNUMA
+	if target < minTotal {
+		return nil, fmt.Errorf("target %d is below per-NUMA minimum total %d", target, minTotal)
+	}
+
+	base := target / len(available)
+	remainder := target % len(available)
+	result := make(map[int]int, len(available))
+	capableForRemainder := make([]int, 0, len(available))
+	for _, numaID := range numaIDs {
+		capacity := available[numaID]
+		if capacity < base {
+			return nil, fmt.Errorf("cannot distribute target %d within NUMA capacities while keeping counts balanced", target)
+		}
+		result[numaID] = base
+		if capacity > base {
+			capableForRemainder = append(capableForRemainder, numaID)
+		}
+	}
+	if len(capableForRemainder) < remainder {
+		return nil, fmt.Errorf("cannot distribute target %d within NUMA capacities while keeping counts balanced", target)
+	}
+	for _, numaID := range capableForRemainder[:remainder] {
+		result[numaID]++
+	}
+	return result, nil
+}
 
 // TransformCPUAssignmentFormat transforms cpu assignment string format to cpuset format
 func TransformCPUAssignmentFormat(assignment map[uint64]string) map[int]CPUSet {

@@ -3033,9 +3033,9 @@ func (p *DynamicPolicy) isReclaimEnabled() bool {
 // every ramp-up QoS path. enteringRampUp is true while admitting a new ramp-up
 // allocation; otherwise at least one checkpointed RampUp allocation must
 // exist. The floor covers all machine NUMAs rather than the current Pod's
-// topology hint. A zero ratio preserves only reservedReclaimedCPUSet; a
-// positive ratio may expand that floor. CPUs already owned by the live reclaim
-// pool are preferred to keep the result deterministic across recalculations.
+// topology hint and keeps at least two CPUs on each NUMA. Configured reclaim
+// CPUs are preserved, and CPUs already owned by the live reclaim pool are
+// preferred to keep the result deterministic across recalculations.
 func (p *DynamicPolicy) deriveRampUpReclaimFloor(machineState state.NUMANodeMap, enteringRampUp bool) (machine.CPUSet, error) {
 	floor := machine.NewCPUSet()
 	if !p.isRampUpReclaimHardPartitionEnabled() || p.machineInfo == nil {
@@ -3066,28 +3066,54 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloor(machineState state.NUMANodeMap,
 	if reclaimInfo := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName); reclaimInfo != nil {
 		currentReclaim = reclaimInfo.AllocationResult
 	}
+
 	ratio := p.getInitialRampUpReclaimCPUSetRatio()
-	for _, numaID := range p.machineInfo.CPUDetails.NUMANodes().ToSliceInt() {
+	numaIDs := p.machineInfo.CPUDetails.NUMANodes().ToSliceInt()
+	eligibleByNUMA := make(map[int]machine.CPUSet, len(numaIDs))
+	availableByNUMA := make(map[int]int, len(numaIDs))
+	reservedFloorByNUMA := make(map[int]machine.CPUSet, len(numaIDs))
+	totalEligible := 0
+	totalReservedFloor := 0
+	for _, numaID := range numaIDs {
 		numaState := machineState[numaID]
 		if numaState == nil {
 			return machine.NewCPUSet(), fmt.Errorf("derive ramp-up reclaim floor: missing machine state for NUMA %d", numaID)
 		}
 		eligible := numaState.GetAvailableCPUSet(p.reservedCPUs)
-		if eligible.IsEmpty() {
-			continue
-		}
 		reservedFloor := p.reservedReclaimedCPUSet.Intersection(eligible)
-		target, err := dynamicpolicyutil.CalculateRampUpReclaimTarget(
-			eligible.Size(), reservedFloor.Size(), eligible.Size(), ratio, false)
-		if err != nil {
-			return machine.NewCPUSet(), fmt.Errorf("derive ramp-up reclaim floor for NUMA %d failed: %w", numaID, err)
-		}
-		if target == 0 {
-			continue
-		}
+		eligibleByNUMA[numaID] = eligible
+		availableByNUMA[numaID] = eligible.Size()
+		reservedFloorByNUMA[numaID] = reservedFloor
+		totalEligible += eligible.Size()
+		totalReservedFloor += reservedFloor.Size()
+	}
+
+	minTotal := len(numaIDs) * 2
+	if totalReservedFloor < minTotal {
+		totalReservedFloor = minTotal
+	}
+	globalTarget, err := dynamicpolicyutil.CalculateRampUpReclaimTarget(
+		totalEligible, totalReservedFloor, totalEligible, ratio, false)
+	if err != nil {
+		return machine.NewCPUSet(), fmt.Errorf("derive global ramp-up reclaim floor failed: %w", err)
+	}
+	targetByNUMA, err := machine.DistributeNUMATarget(availableByNUMA, globalTarget, 2)
+	if err != nil {
+		return machine.NewCPUSet(), fmt.Errorf("derive ramp-up reclaim floor failed: %w", err)
+	}
+
+	for _, numaID := range numaIDs {
+		eligible := eligibleByNUMA[numaID]
+		reservedFloor := reservedFloorByNUMA[numaID]
+		target := targetByNUMA[numaID]
 		// reservedReclaimedCPUSet is identity-bearing configuration, not merely
 		// a target count. Preserve those exact CPUs first; a positive ratio may
 		// add CPUs while preferring the live reclaim set.
+		if reservedFloor.Size() > target {
+			return machine.NewCPUSet(), fmt.Errorf(
+				"derive ramp-up reclaim floor for NUMA %d: reserved floor %d exceeds balanced target %d",
+				numaID, reservedFloor.Size(), target)
+		}
 		floorInNUMA := reservedFloor
 		additional := target - floorInNUMA.Size()
 		if additional > 0 {
