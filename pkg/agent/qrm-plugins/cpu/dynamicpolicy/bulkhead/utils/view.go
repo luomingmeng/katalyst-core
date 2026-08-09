@@ -29,6 +29,7 @@ type CPUSetPartitionViewOptions struct {
 	NonReclaimPoolMinSize        int64
 	ReserveCPUReversely          bool
 	TransientProtectedNonReclaim machine.CPUSet
+	HardPartitionEnabled         bool
 }
 
 func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CPUTopology, opts CPUSetPartitionViewOptions) *model.DesiredView {
@@ -149,7 +150,39 @@ func BuildValidatedCPUSetPartitionView(state cpustate.ReadonlyState, topology *m
 	if err := ValidateCPUSetPartitionView(view, topology); err != nil {
 		return nil, err
 	}
+	if opts.HardPartitionEnabled {
+		if err := validateHardPartitionReclaimPerNUMA(view.ReclaimEffectivePerNUMA, topology); err != nil {
+			return nil, err
+		}
+	}
 	return view, nil
+}
+
+func validateHardPartitionReclaimPerNUMA(
+	reclaimPerNUMA map[int]machine.CPUSet,
+	topology *machine.CPUTopology,
+) error {
+	if topology == nil {
+		return nil
+	}
+
+	minimum, maximum := 0, 0
+	for i, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
+		count := reclaimPerNUMA[numaID].Size()
+		if count < 2 {
+			return fmt.Errorf("bulkhead hard-partition reclaim NUMA %d has %d CPUs, minimum is 2", numaID, count)
+		}
+		if i == 0 || count < minimum {
+			minimum = count
+		}
+		if i == 0 || count > maximum {
+			maximum = count
+		}
+	}
+	if maximum-minimum > 1 {
+		return fmt.Errorf("bulkhead hard-partition reclaim is imbalanced across physical NUMAs: max=%d min=%d", maximum, minimum)
+	}
+	return nil
 }
 
 // BuildCPUSetPartitionViewFromTarget creates an owned partition view whose

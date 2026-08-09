@@ -451,6 +451,73 @@ func TestBuildCPUSetPartitionViewCapsPaddingToCandidates(t *testing.T) {
 	assertCPUSet(t, "reclaim effective exhausted", view.ReclaimEffective, "")
 }
 
+func TestBuildCPUSetPartitionViewValidatesHardPartitionDistribution(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name                 string
+		reclaim              machine.CPUSet
+		hardPartitionEnabled bool
+		wantErr              string
+	}{
+		{
+			name:                 "balanced two per NUMA",
+			reclaim:              machine.NewCPUSet(0, 1, 4, 5),
+			hardPartitionEnabled: true,
+		},
+		{
+			name:                 "balanced three and two",
+			reclaim:              machine.NewCPUSet(0, 1, 2, 4, 5),
+			hardPartitionEnabled: true,
+		},
+		{
+			name:                 "hard partition rejects four and zero",
+			reclaim:              machine.NewCPUSet(0, 1, 2, 3),
+			hardPartitionEnabled: true,
+			wantErr:              "NUMA 1 has 0 CPUs, minimum is 2",
+		},
+		{
+			name:                 "hard partition rejects three and one",
+			reclaim:              machine.NewCPUSet(0, 1, 2, 4),
+			hardPartitionEnabled: true,
+			wantErr:              "NUMA 1 has 1 CPUs, minimum is 2",
+		},
+		{
+			name:                 "disabled skips validation",
+			reclaim:              machine.NewCPUSet(0, 1, 2, 3),
+			hardPartitionEnabled: false,
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			state := cpustate.NewCPUPluginState(nil)
+			state.SetAllowSharedCoresOverlapReclaimedCores(true)
+			state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: tc.reclaim,
+			})
+
+			view, err := BuildValidatedCPUSetPartitionView(state, testTwoNUMATopology(), CPUSetPartitionViewOptions{
+				HardPartitionEnabled: tc.hardPartitionEnabled,
+			})
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("BuildValidatedCPUSetPartitionView() error = %v", err)
+				}
+				if view == nil {
+					t.Fatal("BuildValidatedCPUSetPartitionView() returned nil view")
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("BuildValidatedCPUSetPartitionView() error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func testTwoNUMATopology() *machine.CPUTopology {
 	return &machine.CPUTopology{
 		NumCPUs:      8,
