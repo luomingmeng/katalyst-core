@@ -1609,6 +1609,10 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloor(
 	// deduct the cpus that are not allocatable by user containers.
 	notAllocatablePoolCPUs := state.GetUnitedPoolsCPUs(entries, state.IsForbiddenPool, commonstate.IsSystemPool)
 	availableCPUs = availableCPUs.Difference(notAllocatablePoolCPUs)
+	hardPartitionWithExplicitFloor := p.isRampUpReclaimHardPartitionEnabled() && !explicitRampUpFloor.IsEmpty()
+	if hardPartitionWithExplicitFloor {
+		availableCPUs = availableCPUs.Difference(explicitRampUpFloor)
+	}
 
 	reclaimOverlapShareRatio, err := p.getReclaimOverlapShareRatio(entries)
 	if err != nil {
@@ -1621,6 +1625,11 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloor(
 	poolsCPUSet, isolatedCPUSet, err := p.groupAndAllocatePools(poolsQuantityMap, isolatedQuantityMap, availableCPUs, rpPinnedCPUSet, reclaimOverlapShareRatio)
 	if err != nil {
 		return fmt.Errorf("groupAndAllocatePools failed with error: %v", err)
+	}
+	if hardPartitionWithExplicitFloor {
+		if err := p.validateOwnedPoolsQuantity(poolsQuantityMap, poolsCPUSet, entries); err != nil {
+			return err
+		}
 	}
 
 	general.Infof("poolsCPUSet: %v, isolatedCPUSet: %v", poolsCPUSet, isolatedCPUSet)
@@ -1649,6 +1658,58 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloor(
 		}
 	}
 
+	return nil
+}
+
+func (p *DynamicPolicy) validateOwnedPoolsQuantity(
+	poolsQuantityMap map[string]map[int]int,
+	poolsCPUSet map[string]machine.CPUSet,
+	entries state.PodEntries,
+) error {
+	ownedPools := make(map[string]struct{})
+	for _, containerEntries := range entries {
+		if containerEntries.IsPoolEntry() {
+			continue
+		}
+		for _, allocationInfo := range containerEntries {
+			if allocationInfo == nil || allocationInfo.OwnerPoolName == commonstate.EmptyOwnerPoolName {
+				continue
+			}
+			ownedPools[allocationInfo.OwnerPoolName] = struct{}{}
+		}
+	}
+
+	for poolName, numaQuantities := range poolsQuantityMap {
+		if _, ok := ownedPools[poolName]; !ok {
+			continue
+		}
+
+		requested := 0
+		for _, quantity := range numaQuantities {
+			if quantity > 0 {
+				requested += quantity
+			}
+		}
+		if requested == 0 {
+			continue
+		}
+
+		allocated := poolsCPUSet[poolName]
+		if allocated.Size() < requested {
+			return fmt.Errorf("insufficient capacity for owned pool %q: requested %d cpus, allocated %d",
+				poolName, requested, allocated.Size())
+		}
+		for numaID, quantity := range numaQuantities {
+			if numaID == commonstate.FakedNUMAID || quantity <= 0 {
+				continue
+			}
+			numaAllocated := allocated.Intersection(p.machineInfo.CPUDetails.CPUsInNUMANodes(numaID)).Size()
+			if numaAllocated < quantity {
+				return fmt.Errorf("insufficient capacity for owned pool %q in numa %d: requested %d cpus, allocated %d",
+					poolName, numaID, quantity, numaAllocated)
+			}
+		}
+	}
 	return nil
 }
 
@@ -1834,14 +1895,6 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 		rampUpReclaimFloor, err = p.deriveRampUpReclaimFloor(machineState, false)
 		if err != nil {
 			return fmt.Errorf("derive reclaim floor before applying pools failed: %w", err)
-		}
-	}
-	if !explicitRampUpFloor.IsEmpty() {
-		for poolName, cset := range poolsCPUSet {
-			switch commonstate.GetPoolType(poolName) {
-			case commonstate.PoolNameShare, commonstate.PoolNamePrefixIsolation:
-				poolsCPUSet[poolName] = cset.Difference(explicitRampUpFloor)
-			}
 		}
 	}
 	if !rampUpReclaimFloor.IsEmpty() {
