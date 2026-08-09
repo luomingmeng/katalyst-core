@@ -1973,10 +1973,68 @@ func TestAllocateSharedNUMABindingRampUpRejectsLateHardFloorAtomically(t *testin
 	resp, err := p.Allocate(context.Background(), req)
 	require.Nil(t, resp)
 	require.ErrorContains(t, err,
-		`insufficient capacity for owned pool "share-NUMA1" in numa 1: requested 4 cpus, allocated 0`)
+		`insufficient capacity for owned pool "share-numa1" in numa 1: requested 4 cpus, allocated 0`)
+	require.Equal(t, strings.ToLower(err.Error()), err.Error())
 	require.Equal(t, initialEntries, p.state.GetPodEntries())
 	require.Equal(t, initialMachineState, p.state.GetMachineState())
 	require.Equal(t, initialRevision, p.state.GetRevision())
+}
+
+func TestAllocateSharedNUMABindingWithoutHardPartitionPreservesLegacyWriteAndHookOrder(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = false
+	p.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = false
+
+	req := &pluginapi.ResourceRequest{
+		PodUid:         "snb-soft-partition",
+		PodNamespace:   "default",
+		PodName:        "snb-soft-partition",
+		ContainerName:  "main",
+		ContainerType:  pluginapi.ContainerType_MAIN,
+		ContainerIndex: 0,
+		ResourceName:   string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{
+			string(v1.ResourceCPU): 2,
+		},
+		Labels: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelSharedCores,
+		},
+		Annotations: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey:                  apiconsts.PodAnnotationQoSLevelSharedCores,
+			apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+		},
+		Hint: &pluginapi.TopologyHint{Nodes: []uint64{0}},
+	}
+
+	initialRevision := p.state.GetRevision()
+	var hookRevisions []uint64
+	var hookAllocationSizes [][2]int
+	p.RegisterAllocationHook(func(oldInfo, newInfo *state.AllocationInfo) error {
+		oldSize := -1
+		if oldInfo != nil {
+			oldSize = oldInfo.AllocationResult.Size()
+		}
+		newSize := -1
+		if newInfo != nil {
+			newSize = newInfo.AllocationResult.Size()
+		}
+		hookRevisions = append(hookRevisions, p.state.GetRevision())
+		hookAllocationSizes = append(hookAllocationSizes, [2]int{oldSize, newSize})
+		return nil
+	})
+
+	allocation, err := p.allocateSharedNumaBindingCPUs(context.Background(), req, req.Hint, false)
+	require.NoError(t, err)
+	require.NotNil(t, allocation)
+	require.Equal(t, initialRevision+5, p.state.GetRevision())
+	require.Equal(t, []uint64{initialRevision, initialRevision + 1}, hookRevisions)
+	require.Equal(t, [][2]int{{-1, 0}, {0, allocation.AllocationResult.Size()}}, hookAllocationSizes)
 }
 
 func TestDynamicPolicyDeriveRampUpReclaimFloorAllowsFullNonExclusiveRatio(t *testing.T) {

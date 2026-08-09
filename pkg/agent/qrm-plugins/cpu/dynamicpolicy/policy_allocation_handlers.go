@@ -1289,9 +1289,14 @@ func (p *DynamicPolicy) allocateSharedNumaBindingCPUs(ctx context.Context, req *
 		return checkedAllocationInfo, nil
 	} else {
 		allocationInfo.RampUp = p.shouldSharedCoresRampUp(ctx, req.PodUid)
+		if !p.isRampUpReclaimHardPartitionEnabled() {
+			if err := p.updateAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, nil, allocationInfo, persistCheckpoint); err != nil {
+				return nil, err
+			}
+		}
 		checkedAllocationInfo, err := p.doAndCheckPutAllocationInfo(allocationInfo, true, persistCheckpoint)
 		if err != nil {
-			return nil, fmt.Errorf("doAndCheckPutAllocationInfo failed with error: %v", err)
+			return nil, fmt.Errorf("doandcheckputallocationinfo failed with error: %s", strings.ToLower(err.Error()))
 		}
 		return checkedAllocationInfo, nil
 	}
@@ -1428,7 +1433,7 @@ func (p *DynamicPolicy) putAllocationsAndAdjustAllocationEntriesResizeAware(
 	err = p.adjustPoolsAndIsolatedEntries(poolsQuantityMap, isolatedQuantityMap,
 		entries, machineState, persistCheckpoint)
 	if err != nil {
-		return fmt.Errorf("adjustPoolsAndIsolatedEntries failed with error: %v", err)
+		return fmt.Errorf("adjustpoolsandisolatedentries failed with error: %s", strings.ToLower(err.Error()))
 	}
 
 	return nil
@@ -2799,7 +2804,7 @@ func (p *DynamicPolicy) doAndCheckPutAllocationInfoPodResizingAware(originAlloca
 	if err != nil {
 		general.Errorf("pod: %s/%s, container: %s putAllocationsAndAdjustAllocationEntriesResizeAware failed with error: %v",
 			allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName, err)
-		return nil, fmt.Errorf("putAllocationsAndAdjustAllocationEntries failed with error: %v", err)
+		return nil, fmt.Errorf("putallocationsandadjustallocationentries failed with error: %s", strings.ToLower(err.Error()))
 	}
 
 	checkedAllocationInfo := p.state.GetAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName)
