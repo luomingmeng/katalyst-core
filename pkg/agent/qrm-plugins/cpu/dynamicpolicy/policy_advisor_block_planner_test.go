@@ -701,35 +701,41 @@ func TestBalancedHardReclaimQuotas(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name          string
-		quantity      int
-		eligibleNUMAs []int
-		want          map[int]int
-		wantError     string
+		name       string
+		quantity   int
+		capacities map[int]int
+		want       map[int]int
+		wantError  string
 	}{
 		{
-			name:          "four over two",
-			quantity:      4,
-			eligibleNUMAs: []int{0, 1},
-			want:          map[int]int{0: 2, 1: 2},
+			name:       "four over two",
+			quantity:   4,
+			capacities: map[int]int{0: 4, 1: 4},
+			want:       map[int]int{0: 2, 1: 2},
 		},
 		{
-			name:          "five over two",
-			quantity:      5,
-			eligibleNUMAs: []int{0, 1},
-			want:          map[int]int{0: 3, 1: 2},
+			name:       "five over two with both NUMAs sufficient",
+			quantity:   5,
+			capacities: map[int]int{0: 3, 1: 3},
+			want:       map[int]int{0: 3, 1: 2},
 		},
 		{
-			name:          "eight over four",
-			quantity:      8,
-			eligibleNUMAs: []int{0, 1, 2, 3},
-			want:          map[int]int{0: 2, 1: 2, 2: 2, 3: 2},
+			name:       "five over capacities two and three",
+			quantity:   5,
+			capacities: map[int]int{0: 2, 1: 3},
+			want:       map[int]int{0: 2, 1: 3},
 		},
 		{
-			name:          "quantity below minimum",
-			quantity:      3,
-			eligibleNUMAs: []int{0, 1},
-			wantError:     "smaller than required minimum",
+			name:       "eight over four",
+			quantity:   8,
+			capacities: map[int]int{0: 2, 1: 2, 2: 2, 3: 2},
+			want:       map[int]int{0: 2, 1: 2, 2: 2, 3: 2},
+		},
+		{
+			name:       "quantity below minimum",
+			quantity:   3,
+			capacities: map[int]int{0: 2, 1: 2},
+			wantError:  "smaller than required minimum",
 		},
 		{
 			name:      "no eligible NUMA",
@@ -737,10 +743,16 @@ func TestBalancedHardReclaimQuotas(t *testing.T) {
 			wantError: "no eligible NUMA",
 		},
 		{
-			name:          "unordered and duplicate NUMAs are deterministic",
-			quantity:      4,
-			eligibleNUMAs: []int{1, 0, 1},
-			want:          map[int]int{0: 2, 1: 2},
+			name:       "infeasible base quota",
+			quantity:   5,
+			capacities: map[int]int{0: 1, 1: 4},
+			wantError:  "NUMA 0 eligible capacity 1 is smaller than base quota 2",
+		},
+		{
+			name:       "infeasible remainder",
+			quantity:   5,
+			capacities: map[int]int{0: 2, 1: 2},
+			wantError:  "eligible capacities cannot satisfy quantity 5",
 		},
 	}
 
@@ -749,7 +761,7 @@ func TestBalancedHardReclaimQuotas(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := balancedHardReclaimQuotas(tt.quantity, tt.eligibleNUMAs, 2)
+			got, err := balancedHardReclaimQuotas(tt.quantity, tt.capacities, 2)
 			if tt.wantError != "" {
 				require.ErrorContains(t, err, tt.wantError)
 				return
@@ -784,14 +796,14 @@ func TestExpandHardPartitionReclaimDemands(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, []partitionDemand{
 			{
-				key:       "mandatory-reclaim|owner|-1\x00numa\x000",
+				key:       "mandatory-reclaim|owner|-1\x00block\x00reclaim\x00numa\x000",
 				quantity:  2,
 				eligible:  numa0,
 				preferred: descriptor.OldPreferred.Intersection(numa0),
 				class:     advisorBlockClassMandatoryReclaim,
 			},
 			{
-				key:       "mandatory-reclaim|owner|-1\x00numa\x001",
+				key:       "mandatory-reclaim|owner|-1\x00block\x00reclaim\x00numa\x001",
 				quantity:  2,
 				eligible:  numa1,
 				preferred: descriptor.OldPreferred.Intersection(numa1),
@@ -801,6 +813,7 @@ func TestExpandHardPartitionReclaimDemands(t *testing.T) {
 	})
 
 	t.Run("real NUMA mandatory reclaim remains one demand", func(t *testing.T) {
+		numa1CPUs := numa1.ToSliceInt()
 		descriptor := advisorBlockDescriptor{
 			Class:        advisorBlockClassMandatoryReclaim,
 			NUMAID:       1,
@@ -809,14 +822,15 @@ func TestExpandHardPartitionReclaimDemands(t *testing.T) {
 			Eligible:     numa1,
 			OldPreferred: numa1,
 		}
+		constrainedAvailable := machine.NewCPUSet(numa1CPUs[0], numa1CPUs[1])
 
-		got, err := expandHardPartitionReclaimDemands(descriptor, available, topology)
+		got, err := expandHardPartitionReclaimDemands(descriptor, constrainedAvailable, topology)
 		require.NoError(t, err)
 		require.Equal(t, []partitionDemand{{
 			key:       descriptor.ComponentKey,
 			quantity:  descriptor.Quantity,
-			eligible:  descriptor.Eligible,
-			preferred: descriptor.OldPreferred,
+			eligible:  constrainedAvailable,
+			preferred: constrainedAvailable,
 			class:     descriptor.Class,
 		}}, got)
 	})
@@ -863,9 +877,54 @@ func TestExpandHardPartitionReclaimDemands(t *testing.T) {
 		got, err := expandHardPartitionReclaimDemands(descriptor, constrainedAvailable, topology)
 		require.NoError(t, err)
 		require.Equal(t, machine.NewCPUSet(numa0CPUs[0], numa0CPUs[1]), got[0].eligible)
-		require.Equal(t, numa0, got[0].preferred)
+		require.Equal(t, got[0].eligible, got[0].preferred)
 		require.Equal(t, machine.NewCPUSet(numa1CPUs[1], numa1CPUs[2]), got[1].eligible)
-		require.Equal(t, numa1, got[1].preferred)
+		require.Equal(t, got[1].eligible, got[1].preferred)
+	})
+
+	t.Run("remainder skips NUMA without base plus one capacity", func(t *testing.T) {
+		numa0CPUs, numa1CPUs := numa0.ToSliceInt(), numa1.ToSliceInt()
+		descriptor := advisorBlockDescriptor{
+			BlockID:      "capacity-aware",
+			Class:        advisorBlockClassMandatoryReclaim,
+			NUMAID:       commonstate.FakedNUMAID,
+			Quantity:     5,
+			ComponentKey: "capacity-aware-component",
+			Eligible:     available,
+		}
+		constrainedAvailable := machine.NewCPUSet(
+			numa0CPUs[0], numa0CPUs[1],
+			numa1CPUs[0], numa1CPUs[1], numa1CPUs[2],
+		)
+
+		got, err := expandHardPartitionReclaimDemands(descriptor, constrainedAvailable, topology)
+		require.NoError(t, err)
+		require.Equal(t, 2, got[0].quantity)
+		require.Equal(t, 3, got[1].quantity)
+	})
+
+	t.Run("expanded keys distinguish blocks with the same component key", func(t *testing.T) {
+		first := advisorBlockDescriptor{
+			BlockID:      "block-a",
+			Class:        advisorBlockClassMandatoryReclaim,
+			NUMAID:       commonstate.FakedNUMAID,
+			Quantity:     4,
+			ComponentKey: "same-component",
+			Eligible:     available,
+		}
+		second := first
+		second.BlockID = "block-b"
+
+		firstDemands, err := expandHardPartitionReclaimDemands(first, available, topology)
+		require.NoError(t, err)
+		secondDemands, err := expandHardPartitionReclaimDemands(second, available, topology)
+		require.NoError(t, err)
+
+		keys := make(map[string]struct{})
+		for _, demand := range append(firstDemands, secondDemands...) {
+			keys[demand.key] = struct{}{}
+		}
+		require.Len(t, keys, len(firstDemands)+len(secondDemands))
 	})
 
 	t.Run("insufficient per NUMA capacity returns an error", func(t *testing.T) {
@@ -882,6 +941,6 @@ func TestExpandHardPartitionReclaimDemands(t *testing.T) {
 		}
 
 		_, err := expandHardPartitionReclaimDemands(descriptor, available, topology)
-		require.ErrorContains(t, err, "NUMA 1 eligible capacity 1 is smaller than quota 2")
+		require.ErrorContains(t, err, "NUMA 1 eligible capacity 1 is smaller than base quota 2")
 	})
 }
