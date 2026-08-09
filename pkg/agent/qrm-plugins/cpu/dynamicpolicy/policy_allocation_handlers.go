@@ -3086,9 +3086,17 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloor(machineState state.NUMANodeMap,
 		totalEligible += eligible.Size()
 	}
 
+	configuredFloor := p.reservedReclaimedCPUsSize
+	if p.conf != nil {
+		if dynamicConf := p.conf.GetDynamicConfiguration(); dynamicConf != nil {
+			if quantity, ok := dynamicConf.MinReclaimedResourceForAllocate[v1.ResourceCPU]; ok {
+				configuredFloor = int(quantity.Value())
+			}
+		}
+	}
 	minimum := len(numaIDs) * 2
-	if p.reservedReclaimedCPUsSize > minimum {
-		minimum = p.reservedReclaimedCPUsSize
+	if configuredFloor > minimum {
+		minimum = configuredFloor
 	}
 	globalTarget := machine.CalculateGlobalRampUpReclaimTarget(totalEligible, ratio, minimum)
 	targetByNUMA, err := machine.DistributeNUMATarget(availableByNUMA, globalTarget, 2)

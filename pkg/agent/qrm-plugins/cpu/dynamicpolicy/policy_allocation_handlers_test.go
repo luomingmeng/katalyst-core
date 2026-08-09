@@ -27,6 +27,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
@@ -1045,6 +1046,7 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_exclusiveDisjointPartition(t *tes
 		p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
 		require.NoError(t, err)
 		p.reservedCPUs = machine.NewCPUSet()
+		p.conf.SetDynamicConfiguration(nil)
 		p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
 		p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0
 		p.dynamicConfig.GetDynamicConfiguration().DisableReclaimPinnedCPUSetResourcePackageSelector = "disable-reclaim=true"
@@ -1214,7 +1216,9 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_partitionEligibilityGate(t *testi
 			2, &pluginapi.TopologyHint{Nodes: []uint64{0}}, completeState, annotations, false)
 		require.NoError(t, err)
 		require.Equal(t, 2, result.Size())
-		require.True(t, reclaim.Equals(machine.NewCPUSet(0)), "reclaim=%s", reclaim)
+		require.Equal(t, 4, reclaim.Size())
+		require.Equal(t, 2, reclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(0)).Size())
+		require.Equal(t, 2, reclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(1)).Size())
 	})
 
 	t.Run("DD false uses legacy path before selector", func(t *testing.T) {
@@ -1227,9 +1231,11 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_partitionEligibilityGate(t *testi
 		}
 
 		result, reclaim, err := p.allocateNumaBindingCPUs(
-			3, &pluginapi.TopologyHint{Nodes: []uint64{0}}, completeState, exclusive, false)
+			2, &pluginapi.TopologyHint{Nodes: []uint64{0}}, completeState, exclusive, false)
 		require.NoError(t, err)
-		require.True(t, reclaim.Equals(machine.NewCPUSet(0)), "reclaim=%s", reclaim)
+		require.Equal(t, 4, reclaim.Size())
+		require.Equal(t, 2, reclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(0)).Size())
+		require.Equal(t, 2, reclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(1)).Size())
 		require.True(t, result.Equals(completeState[0].DefaultCPUSet.Difference(reclaim)), "result=%s", result)
 	})
 }
@@ -1300,6 +1306,7 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_preservesReserveOnPodLookupFailur
 			p.reservedCPUs = machine.NewCPUSet()
 			p.reservedReclaimedCPUSet = tc.reserved
 			p.reservedReclaimedCPUsSize = tc.reserved.Size()
+			p.conf.SetDynamicConfiguration(nil)
 			p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
 			p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = tc.ratio
 			p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
@@ -1723,6 +1730,71 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorAllowsFullNonExclusiveRatio(t *tes
 		"floor=%s, want every eligible CPU", floor)
 }
 
+func TestDynamicPolicyDeriveRampUpReclaimFloorUsesDynamicConfiguredMinimum(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		dynamicFloor  *v1.ResourceList
+		wantFloorSize int
+	}{
+		{
+			name: "dynamic floor overrides initialized fallback",
+			dynamicFloor: &v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("8"),
+			},
+			wantFloorSize: 8,
+		},
+		{
+			name: "odd dynamic floor is preserved",
+			dynamicFloor: &v1.ResourceList{
+				v1.ResourceCPU: resource.MustParse("5"),
+			},
+			wantFloorSize: 5,
+		},
+		{
+			name:          "nil dynamic configuration falls back",
+			dynamicFloor:  nil,
+			wantFloorSize: 4,
+		},
+		{
+			name:          "missing CPU key falls back",
+			dynamicFloor:  &v1.ResourceList{},
+			wantFloorSize: 4,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 2)
+			require.NoError(t, err)
+			p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+			require.NoError(t, err)
+
+			p.reservedCPUs = machine.NewCPUSet()
+			p.reservedReclaimedCPUSet = machine.NewCPUSet()
+			p.reservedReclaimedCPUsSize = 4
+			p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+			p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0
+			if tt.dynamicFloor == nil {
+				p.conf.SetDynamicConfiguration(nil)
+			} else {
+				p.conf.GetDynamicConfiguration().MinReclaimedResourceForAllocate = *tt.dynamicFloor
+			}
+
+			floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), true)
+			require.NoError(t, err)
+			require.Equal(t, tt.wantFloorSize, floor.Size())
+			require.Equal(t, tt.wantFloorSize, machine.CalculateGlobalRampUpReclaimTarget(
+				cpuTopology.NumCPUs, 0, tt.wantFloorSize),
+				"QRM and Sysadvisor must derive the same global target")
+		})
+	}
+}
+
 func TestDynamicPolicyDeriveRampUpReclaimFloorBalancesGlobalTargetAcrossUnevenNUMAs(t *testing.T) {
 	t.Parallel()
 
@@ -1805,6 +1877,11 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorBalancesGlobalTargetAcrossUnevenNU
 			}
 			p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = tt.hardEnabled
 			p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = tt.ratio
+			if tt.configuredReserve > 0 {
+				p.conf.GetDynamicConfiguration().MinReclaimedResourceForAllocate = v1.ResourceList{
+					v1.ResourceCPU: *resource.NewQuantity(int64(tt.configuredReserve), resource.DecimalSI),
+				}
+			}
 
 			floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), true)
 			if tt.wantErr != "" {
@@ -2154,7 +2231,7 @@ func TestDedicatedNUMAExclusiveRampUpCommitFailureKeepsPreviousState(t *testing.
 	require.True(t, reflect.DeepEqual(beforeMachine, p.state.GetMachineState()))
 }
 
-func TestDedicatedNUMAExclusiveRampUpRejectsEmptyReclaimFloor(t *testing.T) {
+func TestDedicatedNUMAExclusiveRampUpKeepsMinimumReclaimFloor(t *testing.T) {
 	t.Parallel()
 
 	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
@@ -2184,9 +2261,11 @@ func TestDedicatedNUMAExclusiveRampUpRejectsEmptyReclaimFloor(t *testing.T) {
 	}
 
 	resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(context.Background(), req, true)
-	require.Nil(t, resp)
-	require.ErrorContains(t, err, "requires non-empty reclaim floor on NUMA 0")
-	require.Nil(t, p.state.GetAllocationInfo(req.PodUid, req.ContainerName))
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	reclaimInfo := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	require.NotNil(t, reclaimInfo)
+	require.GreaterOrEqual(t, reclaimInfo.AllocationResult.Size(), 2)
 }
 
 func TestDedicatedNUMAExclusiveRampUpValidatesPartitionEligibleCoverage(t *testing.T) {
