@@ -395,20 +395,20 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhase(
 	demands := make([]partitionDemand, 0, len(descriptors))
 	blockIDByDemandKey := make(map[string]string, len(descriptors))
 	ordinalByStableKey := make(map[string]int, len(descriptors))
+	expandHardReclaimPhase := preserveClass && p.isRampUpReclaimHardPartitionEnabled()
+	if expandHardReclaimPhase {
+		expanded, expandedBlockIDs, err := expandHardPartitionReclaimPhase(
+			descriptors, available, p.machineInfo.CPUTopology)
+		if err != nil {
+			return available, fmt.Errorf("expand hard reclaim phase: %w", err)
+		}
+		demands = append(demands, expanded...)
+		for demandKey, blockID := range expandedBlockIDs {
+			blockIDByDemandKey[demandKey] = blockID
+		}
+	}
 	for _, descriptor := range descriptors {
-		if preserveClass &&
-			p.isRampUpReclaimHardPartitionEnabled() &&
-			descriptor.Class == advisorBlockClassMandatoryReclaim &&
-			descriptor.NUMAID == commonstate.FakedNUMAID {
-			expanded, err := expandHardPartitionReclaimDemands(
-				descriptor, available, p.machineInfo.CPUTopology)
-			if err != nil {
-				return available, fmt.Errorf("expand hard reclaim block %q: %w", descriptor.BlockID, err)
-			}
-			for _, demand := range expanded {
-				demands = append(demands, demand)
-				blockIDByDemandKey[demand.key] = descriptor.BlockID
-			}
+		if expandHardReclaimPhase && descriptor.Class == advisorBlockClassMandatoryReclaim {
 			continue
 		}
 
