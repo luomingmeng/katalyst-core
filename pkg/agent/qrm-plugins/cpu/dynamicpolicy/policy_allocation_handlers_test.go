@@ -2041,6 +2041,79 @@ func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorRejectsBareOwnedPinnedSNBPo
 	assert.Equal(t, initialRevision, p.state.GetRevision())
 }
 
+func TestValidateOwnedPoolsQuantityRejectsMalformedSharedNUMABindingEntriesAtomically(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		assignments map[int]machine.CPUSet
+	}{
+		{
+			name:        "empty topology assignments",
+			assignments: nil,
+		},
+		{
+			name: "cross numa topology assignments",
+			assignments: map[int]machine.CPUSet{
+				0: machine.NewCPUSet(0),
+				1: machine.NewCPUSet(4),
+			},
+		},
+		{
+			name: "invalid topology assignments",
+			assignments: map[int]machine.CPUSet{
+				-1: machine.NewCPUSet(0),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+			require.NoError(t, err)
+			p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+			require.NoError(t, err)
+
+			allocation := &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "malformed-snb",
+					PodNamespace:  "default",
+					PodName:       "malformed-snb",
+					ContainerName: "main",
+					OwnerPoolName: "share-NUMA0",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+					Annotations: map[string]string{
+						apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+					},
+				},
+				AllocationResult:         machine.NewCPUSet(0),
+				TopologyAwareAssignments: tt.assignments,
+			}
+			p.state.SetAllocationInfo(allocation.PodUid, allocation.ContainerName, allocation, false)
+
+			initialEntries := p.state.GetPodEntries()
+			initialMachineState := p.state.GetMachineState()
+			initialRevision := p.state.GetRevision()
+			err = p.validateOwnedPoolsQuantity(
+				map[string]map[int]int{allocation.OwnerPoolName: {0: 1}},
+				map[string]machine.CPUSet{allocation.OwnerPoolName: machine.NewCPUSet(0)},
+				initialEntries,
+				initialMachineState.GetNUMAResourcePackagePinnedCPUSet(),
+			)
+
+			require.ErrorContains(t, err,
+				"get canonical shared numa-binding pool key for default/malformed-snb/main failed")
+			require.Equal(t, strings.ToLower(err.Error()), err.Error())
+			require.Equal(t, initialEntries, p.state.GetPodEntries())
+			require.Equal(t, initialMachineState, p.state.GetMachineState())
+			require.Equal(t, initialRevision, p.state.GetRevision())
+		})
+	}
+}
+
 func TestAdjustAllocationEntriesWithRampUpFloorKeepsHardFloorCapacityErrorLowercase(t *testing.T) {
 	t.Parallel()
 
