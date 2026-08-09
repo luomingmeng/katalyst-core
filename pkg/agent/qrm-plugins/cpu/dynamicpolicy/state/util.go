@@ -380,6 +380,60 @@ func GetSharedBindingNUMAsFromQuantityMap(poolsQuantityMap map[string]map[int]in
 	return res
 }
 
+func GetCanonicalSharedNUMABindingPoolKey(
+	numaResourcePackagePinnedCPUSet map[int]map[string]machine.CPUSet,
+	allocationInfo *AllocationInfo,
+) (string, int, error) {
+	poolName := allocationInfo.GetOwnerPoolName()
+	var numaSet machine.CPUSet
+
+	if poolName == commonstate.EmptyOwnerPoolName {
+		var err error
+		poolName, err = allocationInfo.GetSpecifiedNUMABindingPoolName()
+		if err != nil {
+			return "", 0, fmt.Errorf("GetSpecifiedNUMABindingPoolName for %s/%s/%s failed with error: %v",
+				allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName, err)
+		}
+
+		numaSet, err = machine.Parse(allocationInfo.Annotations[cpuconsts.CPUStateAnnotationKeyNUMAHint])
+		if err != nil {
+			return "", 0, fmt.Errorf("parse numaHintStr: %s failed with error: %v",
+				allocationInfo.Annotations[cpuconsts.CPUStateAnnotationKeyNUMAHint], err)
+		}
+
+		general.Infof(" %s/%s/%s count to specified NUMA binding pool name: %s, numaSet: %s",
+			allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName, poolName, numaSet.String())
+	} else {
+		numaSet = allocationInfo.GetAllocationResultNUMASet()
+
+		general.Infof(" %s/%s/%s count to non-empty owner pool name: %s, numaSet: %s",
+			allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName, poolName, numaSet.String())
+	}
+
+	if numaSet.Size() != 1 {
+		return "", 0, fmt.Errorf("numaHintStr: %s indicates invalid numaSet size for numa_binding shared_cores",
+			allocationInfo.Annotations[cpuconsts.CPUStateAnnotationKeyNUMAHint])
+	}
+
+	targetNUMAID := numaSet.ToSliceNoSortInt()[0]
+	if targetNUMAID < 0 {
+		return "", 0, fmt.Errorf("numaHintStr: %s indicates invalid numaSet numa_binding shared_cores",
+			allocationInfo.Annotations[cpuconsts.CPUStateAnnotationKeyNUMAHint])
+	}
+
+	pkgName := allocationInfo.GetResourcePackageName()
+	_, wrappedPkgName := rputil.UnwrapOwnerPoolName(poolName)
+	if pkgName != "" && wrappedPkgName == "" {
+		if pinnedSets, ok := numaResourcePackagePinnedCPUSet[targetNUMAID]; ok {
+			if cpuSet, exists := pinnedSets[pkgName]; exists && !cpuSet.IsEmpty() {
+				poolName = rputil.WrapOwnerPoolName(poolName, pkgName)
+			}
+		}
+	}
+
+	return poolName, targetNUMAID, nil
+}
+
 func CountAllocationInfosToPoolsQuantityMap(
 	numaResourcePackagePinnedCPUSet map[int]map[string]machine.CPUSet,
 	allocationInfos []*AllocationInfo,
@@ -403,52 +457,11 @@ func CountAllocationInfosToPoolsQuantityMap(
 		var poolName string
 
 		if allocationInfo.CheckSharedNUMABinding() {
-			var numaSet machine.CPUSet
-			poolName = allocationInfo.GetOwnerPoolName()
-
-			if poolName == commonstate.EmptyOwnerPoolName {
-				var pErr error
-				poolName, pErr = allocationInfo.GetSpecifiedNUMABindingPoolName()
-				if pErr != nil {
-					return fmt.Errorf("GetSpecifiedNUMABindingPoolName for %s/%s/%s failed with error: %v",
-						allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName, pErr)
-				}
-
-				numaSet, pErr = machine.Parse(allocationInfo.Annotations[cpuconsts.CPUStateAnnotationKeyNUMAHint])
-				if pErr != nil {
-					return fmt.Errorf("parse numaHintStr: %s failed with error: %v",
-						allocationInfo.Annotations[cpuconsts.CPUStateAnnotationKeyNUMAHint], pErr)
-				}
-
-				general.Infof(" %s/%s/%s count to specified NUMA binding pool name: %s, numaSet: %s",
-					allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName, poolName, numaSet.String())
-			} else {
-				// already in a valid pool (numa aware pool or isolation pool)
-				numaSet = allocationInfo.GetAllocationResultNUMASet()
-
-				general.Infof(" %s/%s/%s count to non-empty owner pool name: %s, numaSet: %s",
-					allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName, poolName, numaSet.String())
-			}
-
-			if numaSet.Size() != 1 {
-				return fmt.Errorf("numaHintStr: %s indicates invalid numaSet size for numa_binding shared_cores",
-					allocationInfo.Annotations[cpuconsts.CPUStateAnnotationKeyNUMAHint])
-			}
-
-			targetNUMAID = numaSet.ToSliceNoSortInt()[0]
-
-			if targetNUMAID < 0 {
-				return fmt.Errorf("numaHintStr: %s indicates invalid numaSet numa_binding shared_cores",
-					allocationInfo.Annotations[cpuconsts.CPUStateAnnotationKeyNUMAHint])
-			}
-
-			pkgName := allocationInfo.GetResourcePackageName()
-			if pkgName != "" && poolName != commonstate.EmptyOwnerPoolName {
-				if pinnedSets, ok := numaResourcePackagePinnedCPUSet[targetNUMAID]; ok {
-					if cpuSet, exists := pinnedSets[pkgName]; exists && cpuSet.Size() > 0 {
-						poolName = rputil.WrapOwnerPoolName(poolName, pkgName)
-					}
-				}
+			var err error
+			poolName, targetNUMAID, err = GetCanonicalSharedNUMABindingPoolKey(
+				numaResourcePackagePinnedCPUSet, allocationInfo)
+			if err != nil {
+				return err
 			}
 		} else {
 			targetNUMAID = commonstate.FakedNUMAID
