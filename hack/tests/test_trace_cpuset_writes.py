@@ -52,7 +52,8 @@ class HelperTests(unittest.TestCase):
                 "tgid": 12,
                 "tid": 13,
                 "comm": "agent",
-                "dev": 2049,
+                "dev_major": 8,
+                "dev_minor": 1,
                 "inode": 99,
             },
             path="/a/cpuset.cpus",
@@ -73,7 +74,8 @@ class HelperTests(unittest.TestCase):
                 "tid": 13,
                 "comm": "agent",
                 "fd": -1,
-                "dev": 2049,
+                "dev_major": 8,
+                "dev_minor": 1,
                 "inode": 99,
                 "path": "/a/cpuset.cpus",
                 "observed_fd_path": "/a/cpuset.cpus",
@@ -198,8 +200,12 @@ class BPFSourceContractTests(unittest.TestCase):
         self.assertIn("inode->i_ino", source)
         self.assertIn("inode->i_sb", source)
         self.assertIn("sb->s_dev", source)
-        self.assertIn("u64 dev;", source)
-        self.assertIn("event->dev", source)
+        self.assertIn("#include <linux/kdev_t.h>", source)
+        self.assertIn("u32 dev_major;", source)
+        self.assertIn("u32 dev_minor;", source)
+        self.assertIn("event->dev_major = MAJOR(dev);", source)
+        self.assertIn("event->dev_minor = MINOR(dev);", source)
+        self.assertNotIn("u64 dev;", source)
         self.assertIn("event->inode", source)
         self.assertNotIn("BPF_F_REUSE_STACKID", source)
         self.assertIn("stack_traces.get_stackid(ctx, 0)", source)
@@ -405,7 +411,8 @@ class EventConsumerTests(unittest.TestCase):
         tgid = 12
         tid = 13
         fd = 9
-        dev = 2049
+        dev_major = 8
+        dev_minor = 1
         inode = 99
         kernel_stack_id = 1
         user_stack_id = 2
@@ -428,7 +435,8 @@ class EventConsumerTests(unittest.TestCase):
             bpf,
             args,
             writer,
-            target_dev=None if args.all_cpuset else 2049,
+            target_dev_major=None if args.all_cpuset else 8,
+            target_dev_minor=None if args.all_cpuset else 1,
             target_inode=None if args.all_cpuset else 99,
             target_path=None if args.all_cpuset else DEFAULT_TARGET_PATH,
             readlink=mock.Mock(return_value=DEFAULT_TARGET_PATH),
@@ -448,7 +456,8 @@ class EventConsumerTests(unittest.TestCase):
         self.assertEqual(DEFAULT_TARGET_PATH, record["path"])
         self.assertEqual(DEFAULT_TARGET_PATH, record["observed_fd_path"])
         self.assertTrue(record["observed_fd_path_matches"])
-        self.assertEqual(2049, record["dev"])
+        self.assertEqual(8, record["dev_major"])
+        self.assertEqual(1, record["dev_minor"])
         self.assertEqual(99, record["inode"])
         self.assertEqual("1-3", record["user_buffer"])
         self.assertEqual(["k1"], record["kernel_stack"])
@@ -458,7 +467,8 @@ class EventConsumerTests(unittest.TestCase):
         cases = [
             {"pid": 99},
             {"comm": "other"},
-            {"dev": 2050},
+            {"dev_major": 9},
+            {"dev_minor": 2},
             {"inode": 100},
         ]
         for case in cases:
@@ -466,12 +476,14 @@ class EventConsumerTests(unittest.TestCase):
                 overrides = {
                     key: value
                     for key, value in case.items()
-                    if key not in ("dev", "inode")
+                    if key not in ("dev_major", "dev_minor", "inode")
                 }
                 consumer, bpf, writer = self.make_consumer(**overrides)
                 event = self.Event()
-                if "dev" in case:
-                    event.dev = case["dev"]
+                if "dev_major" in case:
+                    event.dev_major = case["dev_major"]
+                if "dev_minor" in case:
+                    event.dev_minor = case["dev_minor"]
                 if "inode" in case:
                     event.inode = case["inode"]
                 bpf["events"].event.return_value = event
@@ -531,10 +543,11 @@ class EventConsumerTests(unittest.TestCase):
 
 
 class TracerLifecycleTests(unittest.TestCase):
-    def test_stats_realpath_target_device_and_inode_at_startup(self):
+    def test_stats_realpath_target_device_components_and_inode_at_startup(self):
         args = create_argument_parser().parse_args(["--duration", "0"])
-        stat_result = mock.Mock(st_dev=2049, st_ino=12345)
+        stat_result = mock.Mock(st_dev=os.makedev(8, 1), st_ino=12345)
         stat_func = mock.Mock(return_value=stat_result)
+        bpf = mock.MagicMock()
 
         with mock.patch(
             "hack.trace_cpuset_writes.os.path.realpath",
@@ -542,12 +555,49 @@ class TracerLifecycleTests(unittest.TestCase):
         ):
             run_tracer(
                 args,
-                bpf_class=mock.Mock(return_value=mock.MagicMock()),
+                bpf_class=mock.Mock(return_value=bpf),
                 writer=mock.Mock(),
                 stat_func=stat_func,
             )
 
         stat_func.assert_called_once_with("/real/cpuset.cpus")
+        consumer = bpf["events"].open_perf_buffer.call_args[0][0].__self__
+        self.assertEqual(8, consumer.target_dev_major)
+        self.assertEqual(1, consumer.target_dev_minor)
+        self.assertEqual(12345, consumer.target_inode)
+
+    def test_matches_device_components_when_raw_encodings_would_differ(self):
+        args = create_argument_parser().parse_args([])
+        bpf = mock.MagicMock()
+        writer = mock.Mock()
+        raw_userspace_dev = os.makedev(8, 1)
+        raw_kernel_dev = (8 << 20) | 1
+        self.assertNotEqual(raw_userspace_dev, raw_kernel_dev)
+        consumer = EventConsumer(
+            bpf,
+            args,
+            writer,
+            target_dev_major=os.major(raw_userspace_dev),
+            target_dev_minor=os.minor(raw_userspace_dev),
+            target_inode=99,
+            target_path=DEFAULT_TARGET_PATH,
+            readlink=mock.Mock(return_value=DEFAULT_TARGET_PATH),
+            clock=mock.Mock(return_value="now"),
+        )
+        event = EventConsumerTests.Event()
+        event.dev_major = 8
+        event.dev_minor = 1
+        bpf["events"].event.return_value = event
+        bpf["stack_traces"].walk.side_effect = lambda stack_id: [stack_id]
+        bpf.ksym.side_effect = lambda address: ("k%d" % address).encode()
+        bpf.sym.side_effect = lambda address, tgid: (
+            "u%d:%d" % (address, tgid)
+        ).encode()
+
+        consumer.handle_event(0, object(), 0)
+
+        self.assertEqual(8, writer.write.call_args[0][0]["dev_major"])
+        self.assertEqual(1, writer.write.call_args[0][0]["dev_minor"])
 
     def test_attaches_entry_return_opens_perf_and_closes_in_finally(self):
         args = create_argument_parser().parse_args(

@@ -123,6 +123,7 @@ def build_bpf_source(tgid=None):
     source = r"""
 #include <uapi/linux/ptrace.h>
 #include <linux/fs.h>
+#include <linux/kdev_t.h>
 #include <linux/kernfs.h>
 #include <linux/sched.h>
 
@@ -141,9 +142,10 @@ struct write_ctx_t {
 struct event_t {
     u64 monotonic_ns;
     u64 requested_bytes;
-    u64 dev;
     u64 inode;
     s64 return_value;
+    u32 dev_major;
+    u32 dev_minor;
     u32 tgid;
     u32 tid;
     s32 fd;
@@ -213,7 +215,8 @@ int trace_cpuset_entry(struct pt_regs *ctx)
 
     event->monotonic_ns = write_ctx->timestamp_ns;
     event->requested_bytes = write_ctx->requested_bytes;
-    event->dev = 0;
+    event->dev_major = 0;
+    event->dev_minor = 0;
     event->inode = 0;
     event->return_value = 0;
     event->tgid = write_ctx->tgid;
@@ -254,7 +257,8 @@ int trace_cpuset_entry(struct pt_regs *ctx)
     if (sb) {
         dev_t dev = 0;
         bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
-        event->dev = (u64)dev;
+        event->dev_major = MAJOR(dev);
+        event->dev_minor = MINOR(dev);
     }
 
     const char *kernel_buffer = (const char *)PT_REGS_PARM2(ctx);
@@ -356,7 +360,8 @@ def event_to_dict(
         "tid": int(_event_field(event, "tid")),
         "comm": _decode_text(_event_field(event, "comm")),
         "fd": int(_event_field(event, "fd", -1)),
-        "dev": int(_event_field(event, "dev", 0)),
+        "dev_major": int(_event_field(event, "dev_major", 0)),
+        "dev_minor": int(_event_field(event, "dev_minor", 0)),
         "inode": int(_event_field(event, "inode", 0)),
         "path": path,
         "observed_fd_path": observed_fd_path,
@@ -430,7 +435,8 @@ class EventConsumer:
         bpf,
         args,
         writer,
-        target_dev=None,
+        target_dev_major=None,
+        target_dev_minor=None,
         target_inode=None,
         target_path=None,
         readlink=os.readlink,
@@ -439,7 +445,8 @@ class EventConsumer:
         self.bpf = bpf
         self.args = args
         self.writer = writer
-        self.target_dev = target_dev
+        self.target_dev_major = target_dev_major
+        self.target_dev_minor = target_dev_minor
         self.target_inode = target_inode
         self.target_path = target_path
         self.readlink = readlink
@@ -465,10 +472,17 @@ class EventConsumer:
 
         observed_fd_path = self._resolve_path(event)
         if not self.args.all_cpuset:
-            if (
-                int(event.dev) != self.target_dev
-                or int(event.inode) != self.target_inode
-            ):
+            event_key = (
+                int(event.dev_major),
+                int(event.dev_minor),
+                int(event.inode),
+            )
+            target_key = (
+                self.target_dev_major,
+                self.target_dev_minor,
+                self.target_inode,
+            )
+            if event_key != target_key:
                 return
             path = self.target_path
             observed_fd_path_matches = (
@@ -531,7 +545,8 @@ def run_tracer(
     return_attached = False
     old_handlers = {}
     stopped = [False]
-    target_dev = None
+    target_dev_major = None
+    target_dev_minor = None
     target_inode = None
     target_path = None
 
@@ -543,7 +558,8 @@ def run_tracer(
         if not args.all_cpuset:
             target_path = os.path.realpath(args.path)
             target_stat = stat_func(target_path)
-            target_dev = int(target_stat.st_dev)
+            target_dev_major = os.major(target_stat.st_dev)
+            target_dev_minor = os.minor(target_stat.st_dev)
             target_inode = int(target_stat.st_ino)
 
         for signum in (signal.SIGINT, signal.SIGTERM):
@@ -565,7 +581,8 @@ def run_tracer(
             bpf,
             args,
             writer,
-            target_dev=target_dev,
+            target_dev_major=target_dev_major,
+            target_dev_minor=target_dev_minor,
             target_inode=target_inode,
             target_path=target_path,
         )
