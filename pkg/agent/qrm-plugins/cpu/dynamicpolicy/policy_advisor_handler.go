@@ -1374,13 +1374,12 @@ func (p *DynamicPolicy) validateHardPartitionBlockPlan(
 		return err
 	}
 	nonReclaimableCPUSet := cpuutil.GetAggResourcePackagePinnedCPUSet(disableReclaimSelector, machineState)
-	descriptors, err := buildAdvisorBlockDescriptors(
-		resp,
-		p.machineInfo.CPUDetails,
-		p.state.GetPodEntries(),
-		rpPinnedCPUSet,
-		nonReclaimableCPUSet,
-	)
+	buildDescriptors := buildAdvisorBlockDescriptors
+	if !resp.DisableDedicatedCoresOverlapReclaimedCores {
+		buildDescriptors = buildLegacyMandatoryReclaimDescriptors
+	}
+	descriptors, err := buildDescriptors(resp, p.machineInfo.CPUDetails, p.state.GetPodEntries(),
+		rpPinnedCPUSet, nonReclaimableCPUSet)
 	if err != nil {
 		return err
 	}
@@ -1607,7 +1606,7 @@ func (p *DynamicPolicy) preallocateLegacyHardReclaim(
 	nonReclaimableCPUSet machine.CPUSet,
 	blockCPUSet advisorapi.BlockCPUSet,
 ) (machine.CPUSet, error) {
-	descriptors, err := buildAdvisorBlockDescriptors(
+	mandatory, err := buildLegacyMandatoryReclaimDescriptors(
 		resp,
 		p.machineInfo.CPUDetails,
 		p.state.GetPodEntries(),
@@ -1617,9 +1616,6 @@ func (p *DynamicPolicy) preallocateLegacyHardReclaim(
 	if err != nil {
 		return machine.NewCPUSet(), err
 	}
-	mandatory := filterAdvisorDescriptors(descriptors, func(descriptor advisorBlockDescriptor) bool {
-		return descriptor.Class == advisorBlockClassMandatoryReclaim
-	})
 	demands, blockIDByDemandKey, err := expandHardPartitionReclaimPhase(
 		mandatory, available, p.machineInfo.CPUTopology)
 	if err != nil {
@@ -1637,6 +1633,65 @@ func (p *DynamicPolicy) preallocateLegacyHardReclaim(
 		reserved = reserved.Union(cpus)
 	}
 	return reserved, nil
+}
+
+func buildLegacyMandatoryReclaimDescriptors(
+	resp *advisorapi.ListAndWatchResponse,
+	cpuDetails machine.CPUDetails,
+	podEntries state.PodEntries,
+	rpPinnedCPUSet map[string]machine.CPUSet,
+	nonReclaimableCPUSet machine.CPUSet,
+) ([]advisorBlockDescriptor, error) {
+	if resp == nil {
+		return nil, fmt.Errorf("got nil advisor response")
+	}
+
+	mandatoryResp := &advisorapi.ListAndWatchResponse{
+		Entries: make(map[string]*advisorapi.CalculationEntries),
+	}
+	for entryName, calculationEntries := range resp.Entries {
+		if calculationEntries == nil {
+			continue
+		}
+		calculationInfo := calculationEntries.Entries[commonstate.FakedContainerName]
+		if calculationInfo == nil {
+			continue
+		}
+		ownerPoolName, _ := resourcepackage.UnwrapOwnerPoolName(calculationInfo.OwnerPoolName)
+		if commonstate.GetPoolType(ownerPoolName) != commonstate.PoolNameReclaim {
+			continue
+		}
+
+		mandatoryResults := make(map[int64]*advisorapi.NumaCalculationResult)
+		for numaID, result := range calculationInfo.CalculationResultsByNumas {
+			if result == nil {
+				continue
+			}
+			mandatoryBlocks := make([]*advisorapi.Block, 0, len(result.Blocks))
+			for _, block := range result.Blocks {
+				if block != nil && len(block.OverlapTargets) == 0 {
+					mandatoryBlocks = append(mandatoryBlocks, block)
+				}
+			}
+			if len(mandatoryBlocks) != 0 {
+				mandatoryResults[numaID] = &advisorapi.NumaCalculationResult{Blocks: mandatoryBlocks}
+			}
+		}
+		if len(mandatoryResults) == 0 {
+			continue
+		}
+		mandatoryResp.Entries[entryName] = &advisorapi.CalculationEntries{
+			Entries: map[string]*advisorapi.CalculationInfo{
+				commonstate.FakedContainerName: {
+					OwnerPoolName:             calculationInfo.OwnerPoolName,
+					CalculationResultsByNumas: mandatoryResults,
+				},
+			},
+		}
+	}
+
+	return buildAdvisorBlockDescriptors(
+		mandatoryResp, cpuDetails, podEntries, rpPinnedCPUSet, nonReclaimableCPUSet)
 }
 
 // applyBlocks allocate based on BlockCPUSet
