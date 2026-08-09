@@ -426,46 +426,36 @@ func expandHardPartitionReclaimPhase(
 		}
 	}
 
+	numaIDs := make([]int, 0, len(eligibleNUMAs))
+	for numaID := range eligibleNUMAs {
+		numaIDs = append(numaIDs, numaID)
+	}
+	sort.Ints(numaIDs)
+	fakeQuotas, ok := solveHardReclaimFakeQuotas(
+		fakeDescriptors,
+		descriptors,
+		demands,
+		available,
+		topology,
+		numaIDs,
+		finalByNUMA,
+		fixedDedicatedByNUMA,
+		capacityByNUMA,
+		totalQuantity,
+	)
+	if !ok {
+		return nil, nil, fmt.Errorf(
+			"hard reclaim fake blocks have insufficient aggregate capacity for balanced assignment")
+	}
+
 	for _, descriptor := range fakeDescriptors {
-		finalEligible := descriptor.Eligible.Intersection(available)
-		descriptorCapacity := make(map[int]int)
-		for _, numaID := range topology.CPUDetails.KeepOnly(finalEligible).NUMANodes().ToSliceInt() {
-			descriptorCapacity[numaID] = finalEligible.Intersection(
-				topology.CPUDetails.CPUsInNUMANodes(numaID)).Size()
-		}
-
-		quotas := make(map[int]int)
-		for allocated := 0; allocated < descriptor.Quantity; allocated++ {
-			selectedNUMA := 0
-			selected := false
-			for numaID, capacity := range descriptorCapacity {
-				if quotas[numaID] >= capacity ||
-					fixedDedicatedByNUMA[numaID]+finalByNUMA[numaID]+1 > capacityByNUMA[numaID] {
-					continue
-				}
-				if !selected || finalByNUMA[numaID] < finalByNUMA[selectedNUMA] ||
-					(finalByNUMA[numaID] == finalByNUMA[selectedNUMA] && numaID < selectedNUMA) {
-					selectedNUMA = numaID
-					selected = true
-				}
-			}
-			if !selected {
-				return nil, nil, fmt.Errorf(
-					"hard reclaim block %q has insufficient aggregate capacity for quantity %d",
-					descriptor.BlockID, descriptor.Quantity)
-			}
-			quotas[selectedNUMA]++
-			finalByNUMA[selectedNUMA]++
-		}
-
-		numaIDs := make([]int, 0, len(quotas))
-		for numaID := range quotas {
-			numaIDs = append(numaIDs, numaID)
-		}
-		sort.Ints(numaIDs)
+		quotas := fakeQuotas[descriptor.BlockID]
 		for _, numaID := range numaIDs {
+			if quotas[numaID] == 0 {
+				continue
+			}
 			numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
-			eligible := finalEligible.Intersection(numaCPUs)
+			eligible := descriptor.Eligible.Intersection(available).Intersection(numaCPUs)
 			key := hardReclaimPhaseDemandKey(descriptor, numaID)
 			demands = append(demands, partitionDemand{
 				key:       key,
@@ -475,14 +465,10 @@ func expandHardPartitionReclaimPhase(
 				class:     advisorBlockClassMandatoryReclaim,
 			})
 			blockIDByDemandKey[key] = descriptor.BlockID
+			finalByNUMA[numaID] += quotas[numaID]
 		}
 	}
 
-	numaIDs := make([]int, 0, len(eligibleNUMAs))
-	for numaID := range eligibleNUMAs {
-		numaIDs = append(numaIDs, numaID)
-	}
-	sort.Ints(numaIDs)
 	minimum, maximum := finalByNUMA[numaIDs[0]], finalByNUMA[numaIDs[0]]
 	for _, numaID := range numaIDs {
 		if finalByNUMA[numaID] < minimumHardReclaimCPUsPerNUMA {
@@ -502,6 +488,183 @@ func expandHardPartitionReclaimPhase(
 			"hard reclaim final NUMA quantities are imbalanced: min %d max %d", minimum, maximum)
 	}
 	return demands, blockIDByDemandKey, nil
+}
+
+func solveHardReclaimFakeQuotas(
+	fakeDescriptors, descriptors []advisorBlockDescriptor,
+	realDemands []partitionDemand,
+	available machine.CPUSet,
+	topology *machine.CPUTopology,
+	numaIDs []int,
+	realByNUMA, fixedDedicatedByNUMA, capacityByNUMA map[int]int,
+	totalQuantity int,
+) (map[string]map[int]int, bool) {
+	sortedFake := append([]advisorBlockDescriptor(nil), fakeDescriptors...)
+	sort.Slice(sortedFake, func(i, j int) bool {
+		leftNUMAs := topology.CPUDetails.KeepOnly(
+			sortedFake[i].Eligible.Intersection(available)).NUMANodes().Size()
+		rightNUMAs := topology.CPUDetails.KeepOnly(
+			sortedFake[j].Eligible.Intersection(available)).NUMANodes().Size()
+		if leftNUMAs != rightNUMAs {
+			return leftNUMAs < rightNUMAs
+		}
+		return advisorBlockDescriptorLess(sortedFake[i], sortedFake[j])
+	})
+
+	baseTarget := totalQuantity / len(numaIDs)
+	highTargetCount := totalQuantity % len(numaIDs)
+	targetByNUMA := make(map[int]int, len(numaIDs))
+	var solveTargets func(index, highsLeft int) (map[string]map[int]int, bool)
+	solveTargets = func(index, highsLeft int) (map[string]map[int]int, bool) {
+		if index == len(numaIDs) {
+			if highsLeft != 0 {
+				return nil, false
+			}
+			return solveHardReclaimQuotasForTargets(
+				sortedFake, descriptors, realDemands, available, topology,
+				numaIDs, targetByNUMA, realByNUMA)
+		}
+
+		numaID := numaIDs[index]
+		targets := []int{baseTarget}
+		if highsLeft > 0 {
+			targets = append(targets, baseTarget+1)
+		}
+		for _, target := range targets {
+			isHigh := 0
+			if target == baseTarget+1 {
+				isHigh = 1
+			}
+			remainingHighs := highsLeft - isHigh
+			remainingNUMAs := len(numaIDs) - index - 1
+			if remainingHighs < 0 || remainingHighs > remainingNUMAs ||
+				target < minimumHardReclaimCPUsPerNUMA ||
+				target < realByNUMA[numaID] ||
+				fixedDedicatedByNUMA[numaID]+target > capacityByNUMA[numaID] {
+				continue
+			}
+			targetByNUMA[numaID] = target
+			if quotas, ok := solveTargets(index+1, remainingHighs); ok {
+				return quotas, true
+			}
+		}
+		delete(targetByNUMA, numaID)
+		return nil, false
+	}
+	return solveTargets(0, highTargetCount)
+}
+
+func solveHardReclaimQuotasForTargets(
+	fakeDescriptors, descriptors []advisorBlockDescriptor,
+	realDemands []partitionDemand,
+	available machine.CPUSet,
+	topology *machine.CPUTopology,
+	numaIDs []int,
+	targetByNUMA, realByNUMA map[int]int,
+) (map[string]map[int]int, bool) {
+	remainingByNUMA := make(map[int]int, len(numaIDs))
+	for _, numaID := range numaIDs {
+		remainingByNUMA[numaID] = targetByNUMA[numaID] - realByNUMA[numaID]
+	}
+	quotas := make(map[string]map[int]int, len(fakeDescriptors))
+
+	var assignDescriptor func(index int) bool
+	assignDescriptor = func(index int) bool {
+		if index == len(fakeDescriptors) {
+			for _, remaining := range remainingByNUMA {
+				if remaining != 0 {
+					return false
+				}
+			}
+			return hardReclaimQuotasHaveFeasibleCPUAssignment(
+				fakeDescriptors, descriptors, realDemands, quotas, available, topology)
+		}
+
+		descriptor := fakeDescriptors[index]
+		finalEligible := descriptor.Eligible.Intersection(available)
+		descriptorQuotas := make(map[int]int)
+		var distribute func(numaIndex, quantityLeft int) bool
+		distribute = func(numaIndex, quantityLeft int) bool {
+			if numaIndex == len(numaIDs) {
+				if quantityLeft != 0 {
+					return false
+				}
+				quotas[descriptor.BlockID] = descriptorQuotas
+				if assignDescriptor(index + 1) {
+					return true
+				}
+				delete(quotas, descriptor.BlockID)
+				return false
+			}
+
+			numaID := numaIDs[numaIndex]
+			eligibleCapacity := finalEligible.Intersection(
+				topology.CPUDetails.CPUsInNUMANodes(numaID)).Size()
+			maximum := quantityLeft
+			if maximum > remainingByNUMA[numaID] {
+				maximum = remainingByNUMA[numaID]
+			}
+			if maximum > eligibleCapacity {
+				maximum = eligibleCapacity
+			}
+			for quantity := 0; quantity <= maximum; quantity++ {
+				descriptorQuotas[numaID] = quantity
+				remainingByNUMA[numaID] -= quantity
+				if distribute(numaIndex+1, quantityLeft-quantity) {
+					return true
+				}
+				remainingByNUMA[numaID] += quantity
+			}
+			delete(descriptorQuotas, numaID)
+			return false
+		}
+		return distribute(0, descriptor.Quantity)
+	}
+
+	if !assignDescriptor(0) {
+		return nil, false
+	}
+	return quotas, true
+}
+
+func hardReclaimQuotasHaveFeasibleCPUAssignment(
+	fakeDescriptors, descriptors []advisorBlockDescriptor,
+	realDemands []partitionDemand,
+	quotas map[string]map[int]int,
+	available machine.CPUSet,
+	topology *machine.CPUTopology,
+) bool {
+	demands := append([]partitionDemand(nil), realDemands...)
+	for _, descriptor := range fakeDescriptors {
+		for numaID, quantity := range quotas[descriptor.BlockID] {
+			if quantity == 0 {
+				continue
+			}
+			eligible := descriptor.Eligible.Intersection(available).Intersection(
+				topology.CPUDetails.CPUsInNUMANodes(numaID))
+			demands = append(demands, partitionDemand{
+				key:       hardReclaimPhaseDemandKey(descriptor, numaID),
+				quantity:  quantity,
+				eligible:  eligible,
+				preferred: descriptor.OldPreferred.Intersection(eligible),
+				class:     advisorBlockClassMandatoryReclaim,
+			})
+		}
+	}
+	for index, descriptor := range descriptors {
+		if descriptor.Class != advisorBlockClassDedicated {
+			continue
+		}
+		demands = append(demands, partitionDemand{
+			key:       fmt.Sprintf("\xffhard-reclaim-dedicated\x00%d\x00%s", index, descriptor.BlockID),
+			quantity:  descriptor.Quantity,
+			eligible:  descriptor.Eligible.Intersection(available),
+			preferred: descriptor.OldPreferred.Intersection(available),
+			class:     advisorBlockClassDedicated,
+		})
+	}
+	_, err := solveDisjointPartitions(demands, topology)
+	return err == nil
 }
 
 func hardReclaimPhaseDemandKey(descriptor advisorBlockDescriptor, numaID int) string {
