@@ -204,11 +204,11 @@ func (cra *cpuResourceAdvisor) updateNumasAvailableResource() error {
 	return cra.updateReservedForReclaim()
 }
 
-func hardPartitionReservedReclaimCores(ratioReserved, numaCount int) int {
+func hardPartitionMinimumReclaimCores(configuredReserve, numaCount int) int {
 	if numaCount <= 0 {
-		return ratioReserved
+		return configuredReserve
 	}
-	return general.Max(ratioReserved, numaCount*2)
+	return general.Max(configuredReserve, numaCount*2)
 }
 
 func (cra *cpuResourceAdvisor) updateReservedForReclaim() error {
@@ -228,15 +228,18 @@ func (cra *cpuResourceAdvisor) updateReservedForReclaim() error {
 			}
 			totalAvailable += available
 		}
-		ratioReserved := int(float64(totalAvailable) * dynamicConf.InitialRampUpReclaimCPUSetRatio)
-		numReservedCores := hardPartitionReservedReclaimCores(ratioReserved, len(cra.numaAvailable))
+		configuredReserveQuantity := dynamicConf.MinReclaimedResourceForAllocate[v1.ResourceCPU]
+		configuredReserve := int(configuredReserveQuantity.Value())
+		minimum := hardPartitionMinimumReclaimCores(configuredReserve, len(cra.numaAvailable))
+		numReservedCores := machine.CalculateGlobalRampUpReclaimTarget(
+			totalAvailable, dynamicConf.InitialRampUpReclaimCPUSetRatio, minimum)
 		candidateReserved, err := machine.DistributeNUMATarget(cra.numaAvailable, numReservedCores, 2)
 		if err != nil {
 			cra.reservedForReclaim = nil
 			return err
 		}
 		cra.reservedForReclaim = candidateReserved
-		general.Infof("reservedForReclaim: %v, ratioReserved %v", candidateReserved, ratioReserved)
+		general.Infof("reservedForReclaim: %v, globalTarget %v", candidateReserved, numReservedCores)
 		return nil
 	}
 

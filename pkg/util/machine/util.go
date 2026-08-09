@@ -18,12 +18,25 @@ package machine
 
 import (
 	"fmt"
+	"math"
 	"sort"
 )
 
 const (
 	LargeNUMAsPoint = 16
 )
+
+// CalculateGlobalRampUpReclaimTarget applies the QRM ramp-up ratio semantics
+// to a node-level CPU count: floor the ratio result, align it down to an even
+// number, then preserve the configured minimum.
+func CalculateGlobalRampUpReclaimTarget(total int, ratio float64, minimum int) int {
+	target := int(math.Floor(float64(total) * ratio))
+	target -= target % 2
+	if target < minimum {
+		return minimum
+	}
+	return target
+}
 
 // DistributeNUMATarget distributes a global target across NUMA nodes while
 // respecting per-NUMA capacity and minimum constraints. The returned counts

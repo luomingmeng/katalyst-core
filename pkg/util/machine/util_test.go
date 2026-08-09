@@ -55,6 +55,48 @@ func TestMaskToUInt64Array(t *testing.T) {
 	assert.Equal(t, []uint64{0, 1, 2, 3}, MaskToUInt64Array(mask))
 }
 
+func TestCalculateGlobalRampUpReclaimTarget(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		total   int
+		ratio   float64
+		minimum int
+		want    int
+	}{
+		{
+			name:    "fractional target is floored then aligned down to even",
+			total:   16,
+			ratio:   0.5625,
+			minimum: 4,
+			want:    8,
+		},
+		{
+			name:    "minimum wins after ratio alignment",
+			total:   16,
+			ratio:   0.1,
+			minimum: 4,
+			want:    4,
+		},
+		{
+			name:    "configured reserve floor can exceed NUMA minimum",
+			total:   16,
+			ratio:   0.25,
+			minimum: 6,
+			want:    6,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, CalculateGlobalRampUpReclaimTarget(tt.total, tt.ratio, tt.minimum))
+		})
+	}
+}
+
 func TestDistributeNUMATarget(t *testing.T) {
 	t.Parallel()
 

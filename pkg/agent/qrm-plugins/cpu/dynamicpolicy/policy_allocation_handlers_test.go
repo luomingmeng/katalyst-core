@@ -1727,26 +1727,45 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorBalancesGlobalTargetAcrossUnevenNU
 	t.Parallel()
 
 	tests := []struct {
-		name         string
-		hardEnabled  bool
-		withReserved bool
-		ratio        float64
-		wantPerNUMA  map[int]int
-		wantErr      string
+		name              string
+		hardEnabled       bool
+		withReserved      bool
+		configuredReserve int
+		ratio             float64
+		wantPerNUMA       map[int]int
+		wantErr           string
 	}{
 		{
-			name:         "half ratio is balanced four and four",
-			hardEnabled:  true,
-			withReserved: true,
-			ratio:        0.5,
-			wantPerNUMA:  map[int]int{0: 4, 1: 4},
+			name:              "half ratio is balanced four and four",
+			hardEnabled:       true,
+			withReserved:      true,
+			configuredReserve: 4,
+			ratio:             0.5,
+			wantPerNUMA:       map[int]int{0: 4, 1: 4},
 		},
 		{
-			name:         "three quarter ratio exceeds balanced capacity",
-			hardEnabled:  true,
-			withReserved: true,
-			ratio:        0.75,
-			wantErr:      "cannot distribute target 12 within NUMA capacities while keeping counts balanced",
+			name:              "fractional ratio is floored and aligned to same target as Sysadvisor",
+			hardEnabled:       true,
+			withReserved:      true,
+			configuredReserve: 4,
+			ratio:             0.5625,
+			wantPerNUMA:       map[int]int{0: 4, 1: 4},
+		},
+		{
+			name:              "configured reserve floor wins",
+			hardEnabled:       true,
+			withReserved:      true,
+			configuredReserve: 8,
+			ratio:             0.25,
+			wantPerNUMA:       map[int]int{0: 4, 1: 4},
+		},
+		{
+			name:              "three quarter ratio exceeds balanced capacity",
+			hardEnabled:       true,
+			withReserved:      true,
+			configuredReserve: 4,
+			ratio:             0.75,
+			wantErr:           "cannot distribute target 12 within NUMA capacities while keeping counts balanced",
 		},
 		{
 			name:        "zero ratio still keeps two per NUMA",
@@ -1779,7 +1798,7 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorBalancesGlobalTargetAcrossUnevenNU
 			p.reservedCPUs = p.machineInfo.CPUDetails.CPUs().Difference(eligible)
 			if tt.withReserved {
 				p.reservedReclaimedCPUSet = machine.NewCPUSet(numa0CPUs[0], numa0CPUs[1], numa1CPUs[0], numa1CPUs[1])
-				p.reservedReclaimedCPUsSize = 4
+				p.reservedReclaimedCPUsSize = tt.configuredReserve
 			} else {
 				p.reservedReclaimedCPUSet = machine.NewCPUSet()
 				p.reservedReclaimedCPUsSize = 0

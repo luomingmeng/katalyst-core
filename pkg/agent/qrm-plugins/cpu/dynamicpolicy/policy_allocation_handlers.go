@@ -3073,7 +3073,6 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloor(machineState state.NUMANodeMap,
 	availableByNUMA := make(map[int]int, len(numaIDs))
 	reservedFloorByNUMA := make(map[int]machine.CPUSet, len(numaIDs))
 	totalEligible := 0
-	totalReservedFloor := 0
 	for _, numaID := range numaIDs {
 		numaState := machineState[numaID]
 		if numaState == nil {
@@ -3085,18 +3084,13 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloor(machineState state.NUMANodeMap,
 		availableByNUMA[numaID] = eligible.Size()
 		reservedFloorByNUMA[numaID] = reservedFloor
 		totalEligible += eligible.Size()
-		totalReservedFloor += reservedFloor.Size()
 	}
 
-	minTotal := len(numaIDs) * 2
-	if totalReservedFloor < minTotal {
-		totalReservedFloor = minTotal
+	minimum := len(numaIDs) * 2
+	if p.reservedReclaimedCPUsSize > minimum {
+		minimum = p.reservedReclaimedCPUsSize
 	}
-	globalTarget, err := dynamicpolicyutil.CalculateRampUpReclaimTarget(
-		totalEligible, totalReservedFloor, totalEligible, ratio, false)
-	if err != nil {
-		return machine.NewCPUSet(), fmt.Errorf("derive global ramp-up reclaim floor failed: %w", err)
-	}
+	globalTarget := machine.CalculateGlobalRampUpReclaimTarget(totalEligible, ratio, minimum)
 	targetByNUMA, err := machine.DistributeNUMATarget(availableByNUMA, globalTarget, 2)
 	if err != nil {
 		return machine.NewCPUSet(), fmt.Errorf("derive ramp-up reclaim floor failed: %w", err)

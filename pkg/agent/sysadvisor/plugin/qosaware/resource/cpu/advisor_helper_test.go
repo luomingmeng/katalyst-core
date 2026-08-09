@@ -155,44 +155,44 @@ func Test_cpuResourceAdvisor_updateReservedForReclaim(t *testing.T) {
 	}
 }
 
-func TestHardPartitionReservedReclaimCores(t *testing.T) {
+func TestHardPartitionMinimumReclaimCores(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name          string
-		ratioReserved int
-		numaCount     int
-		want          int
+		name              string
+		configuredReserve int
+		numaCount         int
+		want              int
 	}{
 		{
-			name:          "zero ratio across two NUMAs",
-			ratioReserved: 0,
-			numaCount:     2,
-			want:          4,
+			name:              "empty configured reserve across two NUMAs",
+			configuredReserve: 0,
+			numaCount:         2,
+			want:              4,
 		},
 		{
-			name:          "hard floor wins across two NUMAs",
-			ratioReserved: 3,
-			numaCount:     2,
-			want:          4,
+			name:              "hard floor wins across two NUMAs",
+			configuredReserve: 3,
+			numaCount:         2,
+			want:              4,
 		},
 		{
-			name:          "ratio wins across two NUMAs",
-			ratioReserved: 8,
-			numaCount:     2,
-			want:          8,
+			name:              "configured reserve wins across two NUMAs",
+			configuredReserve: 8,
+			numaCount:         2,
+			want:              8,
 		},
 		{
-			name:          "hard floor wins across four NUMAs",
-			ratioReserved: 2,
-			numaCount:     4,
-			want:          8,
+			name:              "hard floor wins across four NUMAs",
+			configuredReserve: 2,
+			numaCount:         4,
+			want:              8,
 		},
 		{
-			name:          "no NUMA preserves ratio reserve",
-			ratioReserved: 3,
-			numaCount:     0,
-			want:          3,
+			name:              "no NUMA preserves configured reserve",
+			configuredReserve: 3,
+			numaCount:         0,
+			want:              3,
 		},
 	}
 
@@ -200,7 +200,7 @@ func TestHardPartitionReservedReclaimCores(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			assert.Equal(t, tt.want, hardPartitionReservedReclaimCores(tt.ratioReserved, tt.numaCount))
+			assert.Equal(t, tt.want, hardPartitionMinimumReclaimCores(tt.configuredReserve, tt.numaCount))
 		})
 	}
 }
@@ -209,25 +209,35 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimHardPartitionCapacity(t *test
 	t.Parallel()
 
 	tests := []struct {
-		name         string
-		ratio        float64
-		wantReserved map[int]int
-		wantErr      string
+		name              string
+		ratio             float64
+		configuredReserve int64
+		wantReserved      map[int]int
+		wantErr           string
 	}{
 		{
-			name:         "candidate fits every NUMA",
-			ratio:        0.5,
-			wantReserved: map[int]int{0: 4, 1: 4},
+			name:              "half ratio is balanced four and four",
+			ratio:             0.5,
+			configuredReserve: 4,
+			wantReserved:      map[int]int{0: 4, 1: 4},
 		},
 		{
-			name:         "candidate remainder preserves global target",
-			ratio:        0.5625,
-			wantReserved: map[int]int{0: 4, 1: 5},
+			name:              "fractional ratio uses QRM even alignment",
+			ratio:             0.5625,
+			configuredReserve: 4,
+			wantReserved:      map[int]int{0: 4, 1: 4},
 		},
 		{
-			name:    "candidate exceeds one NUMA",
-			ratio:   0.75,
-			wantErr: "cannot distribute target 12 within NUMA capacities while keeping counts balanced",
+			name:              "configured reserve floor wins",
+			ratio:             0.25,
+			configuredReserve: 8,
+			wantReserved:      map[int]int{0: 4, 1: 4},
+		},
+		{
+			name:              "three quarter ratio exceeds balanced capacity",
+			ratio:             0.75,
+			configuredReserve: 4,
+			wantErr:           "cannot distribute target 12 within NUMA capacities while keeping counts balanced",
 		},
 	}
 
@@ -240,6 +250,9 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimHardPartitionCapacity(t *test
 			dynamicConf := conf.GetDynamicConfiguration()
 			dynamicConf.EnableRampUpReclaimHardPartition = true
 			dynamicConf.InitialRampUpReclaimCPUSetRatio = tt.ratio
+			dynamicConf.MinReclaimedResourceForAllocate = v1.ResourceList{
+				v1.ResourceCPU: *resource.NewQuantity(tt.configuredReserve, resource.DecimalSI),
+			}
 
 			cra := &cpuResourceAdvisor{
 				conf: conf,
