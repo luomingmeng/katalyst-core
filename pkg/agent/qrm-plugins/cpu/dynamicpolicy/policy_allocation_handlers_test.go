@@ -1875,6 +1875,59 @@ func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorPreservesOwnedPoolQuantity(
 	})
 }
 
+func TestAdjustAllocationEntriesWithRampUpFloorKeepsHardFloorCapacityErrorLowercase(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.5
+	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+	p.state.SetAllocationInfo("owned-share-pod", "main", &state.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        "owned-share-pod",
+			PodNamespace:  "default",
+			PodName:       "owned-share-pod",
+			ContainerName: "main",
+			ContainerType: pluginapi.ContainerType_MAIN.String(),
+			OwnerPoolName: commonstate.PoolNameShare,
+			QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+		},
+		AllocationResult: machine.NewCPUSet(0, 1, 2, 3),
+		RequestQuantity:  4,
+	}, false)
+
+	req := &pluginapi.ResourceRequest{
+		PodUid:         "exclusive-dnb-hard-floor-capacity",
+		PodNamespace:   "default",
+		PodName:        "exclusive-dnb-hard-floor-capacity",
+		ContainerName:  "main",
+		ContainerType:  pluginapi.ContainerType_MAIN,
+		ContainerIndex: 0,
+		ResourceName:   string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{
+			string(v1.ResourceCPU): 4,
+		},
+		Labels: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+		},
+		Annotations: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey:                    apiconsts.PodAnnotationQoSLevelDedicatedCores,
+			apiconsts.PodAnnotationMemoryEnhancementNumaBinding:   apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
+		},
+		Hint: &pluginapi.TopologyHint{Nodes: []uint64{0}},
+	}
+
+	_, err = p.dedicatedCoresWithNUMABindingAllocationHandler(context.Background(), req, false)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "adjustallocationentries failed with error: adjustpoolsandisolatedentries failed with error: insufficient capacity")
+	require.Equal(t, strings.ToLower(err.Error()), err.Error())
+}
+
 func TestDynamicPolicyDeriveRampUpReclaimFloorAllowsFullNonExclusiveRatio(t *testing.T) {
 	t.Parallel()
 
