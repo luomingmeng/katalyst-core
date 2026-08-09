@@ -1717,7 +1717,11 @@ func (p *DynamicPolicy) validateOwnedPoolsQuantity(
 				poolName, _, err = state.GetCanonicalSharedNUMABindingPoolKey(
 					numaResourcePackagePinnedCPUSet, allocationInfo)
 				if err != nil {
-					continue
+					return fmt.Errorf("get canonical shared numa-binding pool key for %s/%s/%s failed: %s",
+						strings.ToLower(allocationInfo.PodNamespace),
+						strings.ToLower(allocationInfo.PodName),
+						strings.ToLower(allocationInfo.ContainerName),
+						strings.ToLower(err.Error()))
 				}
 			}
 			if poolName != commonstate.EmptyOwnerPoolName {
