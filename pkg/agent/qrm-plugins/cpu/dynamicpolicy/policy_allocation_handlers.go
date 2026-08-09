@@ -1657,7 +1657,12 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloor(
 		return fmt.Errorf("groupAndAllocatePools failed with error: %v", err)
 	}
 	if hardPartitionWithExplicitFloor {
-		if err := p.validateOwnedPoolsQuantity(poolsQuantityMap, poolsCPUSet, entries); err != nil {
+		if err := p.validateOwnedPoolsQuantity(
+			poolsQuantityMap,
+			poolsCPUSet,
+			entries,
+			machineState.GetNUMAResourcePackagePinnedCPUSet(),
+		); err != nil {
 			return err
 		}
 	}
@@ -1695,6 +1700,7 @@ func (p *DynamicPolicy) validateOwnedPoolsQuantity(
 	poolsQuantityMap map[string]map[int]int,
 	poolsCPUSet map[string]machine.CPUSet,
 	entries state.PodEntries,
+	numaResourcePackagePinnedCPUSet map[int]map[string]machine.CPUSet,
 ) error {
 	ownedPools := make(map[string]struct{})
 	for _, containerEntries := range entries {
@@ -1711,6 +1717,17 @@ func (p *DynamicPolicy) validateOwnedPoolsQuantity(
 				poolName, err = allocationInfo.GetSpecifiedNUMABindingPoolName()
 				if err != nil {
 					continue
+				}
+
+				pkgName := allocationInfo.GetResourcePackageName()
+				if pkgName != "" {
+					numaID, err := allocationInfo.GetSpecifiedNUMABindingNUMAID()
+					if err != nil {
+						continue
+					}
+					if !numaResourcePackagePinnedCPUSet[numaID][pkgName].IsEmpty() {
+						poolName = rputil.WrapOwnerPoolName(poolName, pkgName)
+					}
 				}
 			}
 			if poolName != commonstate.EmptyOwnerPoolName {
@@ -1742,12 +1759,12 @@ func (p *DynamicPolicy) validateOwnedPoolsQuantity(
 			numaAllocated := allocated.Intersection(p.machineInfo.CPUDetails.CPUsInNUMANodes(numaID)).Size()
 			if numaAllocated < quantity {
 				return fmt.Errorf("insufficient capacity for owned pool %q in numa %d: requested %d cpus, allocated %d",
-					poolName, numaID, quantity, numaAllocated)
+					strings.ToLower(poolName), numaID, quantity, numaAllocated)
 			}
 		}
 		if allocated.Size() < requested {
 			return fmt.Errorf("insufficient capacity for owned pool %q: requested %d cpus, allocated %d",
-				poolName, requested, allocated.Size())
+				strings.ToLower(poolName), requested, allocated.Size())
 		}
 	}
 	return nil
