@@ -657,7 +657,7 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 	if err != nil {
 		general.Errorf("pod: %s/%s, container: %s putContainersAndAdjustAllocationEntriesWithoutAllocation failed with error: %v",
 			req.PodNamespace, req.PodName, req.ContainerName, err)
-		return nil, fmt.Errorf("adjustAllocationEntries failed with error: %v", err)
+		return nil, fmt.Errorf("adjustallocationentries failed with error: %v", err)
 	}
 	finalPodEntries := planningState.GetPodEntries()
 	finalMachineState := planningState.GetMachineState()
@@ -1569,7 +1569,7 @@ func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloor(
 		poolsQuantityMap, isolatedQuantityMap, entries, machineState, persistCheckpoint,
 		explicitRampUpFloor, runCPUSetHandlers)
 	if err != nil {
-		return fmt.Errorf("adjustPoolsAndIsolatedEntries failed with error: %v", err)
+		return fmt.Errorf("adjustpoolsandisolatedentries failed with error: %v", err)
 	}
 
 	return nil
