@@ -1836,6 +1836,14 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 			return fmt.Errorf("derive reclaim floor before applying pools failed: %w", err)
 		}
 	}
+	if !explicitRampUpFloor.IsEmpty() {
+		for poolName, cset := range poolsCPUSet {
+			switch commonstate.GetPoolType(poolName) {
+			case commonstate.PoolNameShare, commonstate.PoolNamePrefixIsolation:
+				poolsCPUSet[poolName] = cset.Difference(explicitRampUpFloor)
+			}
+		}
+	}
 	if !rampUpReclaimFloor.IsEmpty() {
 		poolsCPUSet[commonstate.PoolNameReclaim] = poolsCPUSet[commonstate.PoolNameReclaim].Union(rampUpReclaimFloor)
 	}

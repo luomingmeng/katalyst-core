@@ -30,10 +30,12 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	bulkheadutils "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	dynamicpolicyutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
@@ -1709,6 +1711,79 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorCoversAllNUMAs(t *testing.T) {
 	activeFloor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), false)
 	require.NoError(t, err)
 	require.True(t, activeFloor.Equals(machine.NewCPUSet(14, 38, 62, 86)))
+}
+
+func TestApplyPoolsAndIsolatedInfoCarvesExplicitHardFloorFromNonReclaimPools(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(16, 2, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0).ToSliceInt()
+	numa1 := topology.CPUDetails.CPUsInNUMANodes(1).ToSliceInt()
+	require.GreaterOrEqual(t, len(numa0), 8)
+	require.GreaterOrEqual(t, len(numa1), 8)
+
+	floor := machine.NewCPUSet(numa0[0], numa0[1], numa1[0], numa1[1])
+	numa1Floor := machine.NewCPUSet(numa1[0], numa1[1])
+	shareBefore := numa1Floor.Union(machine.NewCPUSet(numa0[2], numa1[2]))
+	isolationBefore := numa1Floor.Union(machine.NewCPUSet(numa0[3], numa1[3]))
+	customBefore := numa1Floor.Union(machine.NewCPUSet(numa0[4], numa1[4]))
+	reserveBefore := machine.NewCPUSet(numa0[5], numa1[5])
+	dedicatedBefore := machine.NewCPUSet(numa0[6], numa1[6])
+	reclaimBefore := machine.NewCPUSet(numa0[7], numa1[7])
+
+	poolsCPUSet := map[string]machine.CPUSet{
+		commonstate.PoolNameShare:     shareBefore.Clone(),
+		"isolation-regression":        isolationBefore.Clone(),
+		"custom-regression":           customBefore.Clone(),
+		commonstate.PoolNameReserve:   reserveBefore.Clone(),
+		commonstate.PoolNameDedicated: dedicatedBefore.Clone(),
+		commonstate.PoolNameReclaim:   reclaimBefore.Clone(),
+	}
+	curEntries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(),
+			},
+		},
+	}
+
+	err = p.applyPoolsAndIsolatedInfo(
+		poolsCPUSet,
+		map[string]map[string]machine.CPUSet{},
+		curEntries,
+		p.state.GetMachineState(),
+		sets.NewInt(),
+		false,
+		floor,
+	)
+	require.NoError(t, err)
+
+	entries := p.state.GetPodEntries()
+	reclaim := entries[commonstate.PoolNameReclaim][commonstate.FakedContainerName].AllocationResult
+	require.True(t, reclaim.Equals(reclaimBefore.Union(floor)), "reclaim=%s floor=%s", reclaim, floor)
+
+	view, err := bulkheadutils.BuildValidatedCPUSetPartitionView(
+		p.state,
+		topology,
+		bulkheadutils.CPUSetPartitionViewOptions{HardPartitionEnabled: true},
+	)
+	require.NoError(t, err)
+	for _, numaID := range []int{0, 1} {
+		require.GreaterOrEqual(t, view.ReclaimEffectivePerNUMA[numaID].Size(), 2)
+	}
+
+	require.True(t, entries[commonstate.PoolNameShare][commonstate.FakedContainerName].AllocationResult.Equals(shareBefore.Difference(floor)))
+	require.True(t, entries["isolation-regression"][commonstate.FakedContainerName].AllocationResult.Equals(isolationBefore.Difference(floor)))
+	require.True(t, entries["custom-regression"][commonstate.FakedContainerName].AllocationResult.Equals(customBefore.Difference(floor)))
+	require.True(t, entries[commonstate.PoolNameReserve][commonstate.FakedContainerName].AllocationResult.Equals(reserveBefore))
+	require.True(t, entries[commonstate.PoolNameDedicated][commonstate.FakedContainerName].AllocationResult.Equals(dedicatedBefore))
 }
 
 func TestDynamicPolicyDeriveRampUpReclaimFloorAllowsFullNonExclusiveRatio(t *testing.T) {
