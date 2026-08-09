@@ -38,9 +38,6 @@ const (
 	advisorBlockClassReclaimOverlap   advisorBlockClass = "reclaim-overlap"
 
 	minimumHardReclaimCPUsPerNUMA = 2
-
-	hardReclaimTargetCombinationBudget  = 4096
-	hardReclaimQuotaFlowOperationBudget = 1_000_000
 )
 
 type advisorBlockDescriptor struct {
@@ -361,6 +358,14 @@ func expandHardPartitionReclaimPhase(
 	if len(mandatory) == 0 {
 		return nil, map[string]string{}, nil
 	}
+	fakeDescriptors := filterAdvisorDescriptors(mandatory, func(descriptor advisorBlockDescriptor) bool {
+		return descriptor.NUMAID == commonstate.FakedNUMAID
+	})
+	if len(fakeDescriptors) > 1 {
+		return nil, nil, fmt.Errorf(
+			"hard reclaim protocol error: expected at most one fake-NUMA mandatory reclaim block, got %d",
+			len(fakeDescriptors))
+	}
 
 	demands := make([]partitionDemand, 0, len(mandatory))
 	blockIDByDemandKey := make(map[string]string, len(mandatory))
@@ -368,7 +373,6 @@ func expandHardPartitionReclaimPhase(
 	fixedDedicatedByNUMA := make(map[int]int)
 	capacityByNUMA := make(map[int]int)
 	eligibleNUMAs := make(map[int]struct{})
-	fakeDescriptors := make([]advisorBlockDescriptor, 0, len(mandatory))
 	totalQuantity := 0
 
 	for _, descriptor := range descriptors {
@@ -381,13 +385,11 @@ func expandHardPartitionReclaimPhase(
 		totalQuantity += descriptor.Quantity
 		finalEligible := descriptor.Eligible.Intersection(available)
 		if descriptor.NUMAID == commonstate.FakedNUMAID {
-			if descriptor.Quantity > 0 &&
-				topology.CPUDetails.KeepOnly(finalEligible).NUMANodes().IsEmpty() {
+			if topology.CPUDetails.KeepOnly(finalEligible).NUMANodes().IsEmpty() {
 				return nil, nil, fmt.Errorf(
-					"hard reclaim fake block %q has positive quantity %d but no eligible NUMA",
+					"hard reclaim fake block %q has quantity %d but no eligible NUMA",
 					descriptor.BlockID, descriptor.Quantity)
 			}
-			fakeDescriptors = append(fakeDescriptors, descriptor)
 			for _, numaID := range topology.CPUDetails.KeepOnly(finalEligible).NUMANodes().ToSliceInt() {
 				eligibleNUMAs[numaID] = struct{}{}
 				capacityByNUMA[numaID] = available.Intersection(
@@ -443,45 +445,49 @@ func expandHardPartitionReclaimPhase(
 		numaIDs = append(numaIDs, numaID)
 	}
 	sort.Ints(numaIDs)
-	fakeQuotas, err := solveHardReclaimFakeQuotas(
-		fakeDescriptors,
-		descriptors,
-		demands,
-		available,
-		topology,
-		numaIDs,
-		finalByNUMA,
-		fixedDedicatedByNUMA,
-		capacityByNUMA,
-		totalQuantity,
-	)
-	if err != nil {
-		return nil, nil, err
+	fake := fakeDescriptors[0]
+	finalEligible := fake.Eligible.Intersection(available)
+	eligibleCapacityByNUMA := make(map[int]int, len(numaIDs))
+	for _, numaID := range numaIDs {
+		eligibleCapacityByNUMA[numaID] = finalEligible.Intersection(
+			topology.CPUDetails.CPUsInNUMANodes(numaID)).Size()
 	}
-	if fakeQuotas == nil {
-		return nil, nil, fmt.Errorf(
-			"hard reclaim fake blocks have insufficient aggregate capacity for balanced assignment")
-	}
-
-	for _, descriptor := range fakeDescriptors {
-		quotas := fakeQuotas[descriptor.BlockID]
+	quotas := make(map[int]int, len(numaIDs))
+	for allocated := 0; allocated < fake.Quantity; allocated++ {
+		selectedNUMA := 0
+		selected := false
 		for _, numaID := range numaIDs {
-			if quotas[numaID] == 0 {
+			if quotas[numaID] >= eligibleCapacityByNUMA[numaID] ||
+				fixedDedicatedByNUMA[numaID]+finalByNUMA[numaID]+1 > capacityByNUMA[numaID] {
 				continue
 			}
-			numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
-			eligible := descriptor.Eligible.Intersection(available).Intersection(numaCPUs)
-			key := hardReclaimPhaseDemandKey(descriptor, numaID)
-			demands = append(demands, partitionDemand{
-				key:       key,
-				quantity:  quotas[numaID],
-				eligible:  eligible,
-				preferred: descriptor.OldPreferred.Intersection(eligible),
-				class:     advisorBlockClassMandatoryReclaim,
-			})
-			blockIDByDemandKey[key] = descriptor.BlockID
-			finalByNUMA[numaID] += quotas[numaID]
+			if !selected || finalByNUMA[numaID] < finalByNUMA[selectedNUMA] {
+				selectedNUMA = numaID
+				selected = true
+			}
 		}
+		if !selected {
+			return nil, nil, fmt.Errorf(
+				"hard reclaim fake block %q has insufficient aggregate capacity for quantity %d",
+				fake.BlockID, fake.Quantity)
+		}
+		quotas[selectedNUMA]++
+		finalByNUMA[selectedNUMA]++
+	}
+	for _, numaID := range numaIDs {
+		if quotas[numaID] == 0 {
+			continue
+		}
+		eligible := finalEligible.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
+		key := hardReclaimPhaseDemandKey(fake, numaID)
+		demands = append(demands, partitionDemand{
+			key:       key,
+			quantity:  quotas[numaID],
+			eligible:  eligible,
+			preferred: fake.OldPreferred.Intersection(eligible),
+			class:     advisorBlockClassMandatoryReclaim,
+		})
+		blockIDByDemandKey[key] = fake.BlockID
 	}
 
 	minimum, maximum := finalByNUMA[numaIDs[0]], finalByNUMA[numaIDs[0]]
@@ -503,355 +509,6 @@ func expandHardPartitionReclaimPhase(
 			"hard reclaim final NUMA quantities are imbalanced: min %d max %d", minimum, maximum)
 	}
 	return demands, blockIDByDemandKey, nil
-}
-
-func solveHardReclaimFakeQuotas(
-	fakeDescriptors, descriptors []advisorBlockDescriptor,
-	realDemands []partitionDemand,
-	available machine.CPUSet,
-	topology *machine.CPUTopology,
-	numaIDs []int,
-	realByNUMA, fixedDedicatedByNUMA, capacityByNUMA map[int]int,
-	totalQuantity int,
-) (map[string]map[int]int, error) {
-	budget := &hardReclaimSolveBudget{
-		combinationsRemaining: hardReclaimTargetCombinationBudget,
-		operationsRemaining:   hardReclaimQuotaFlowOperationBudget,
-	}
-	return solveHardReclaimFakeQuotasWithBudget(
-		fakeDescriptors, descriptors, realDemands, available, topology, numaIDs,
-		realByNUMA, fixedDedicatedByNUMA, capacityByNUMA, totalQuantity, budget)
-}
-
-type hardReclaimSolveBudget struct {
-	combinationsRemaining int
-	operationsRemaining   int
-}
-
-func (b *hardReclaimSolveBudget) consumeCombination() error {
-	if b.combinationsRemaining <= 0 {
-		return fmt.Errorf("hard reclaim solver budget exhausted: target combination budget %d",
-			hardReclaimTargetCombinationBudget)
-	}
-	b.combinationsRemaining--
-	return nil
-}
-
-func (b *hardReclaimSolveBudget) consumeOperation() error {
-	if b.operationsRemaining <= 0 {
-		return fmt.Errorf("hard reclaim solver budget exhausted: quota flow operation budget %d",
-			hardReclaimQuotaFlowOperationBudget)
-	}
-	b.operationsRemaining--
-	return nil
-}
-
-func solveHardReclaimFakeQuotasWithBudget(
-	fakeDescriptors, descriptors []advisorBlockDescriptor,
-	realDemands []partitionDemand,
-	available machine.CPUSet,
-	topology *machine.CPUTopology,
-	numaIDs []int,
-	realByNUMA, fixedDedicatedByNUMA, capacityByNUMA map[int]int,
-	totalQuantity int,
-	budget *hardReclaimSolveBudget,
-) (map[string]map[int]int, error) {
-	if len(numaIDs) == 0 {
-		return nil, fmt.Errorf("hard reclaim fake blocks have positive demand but no eligible NUMA")
-	}
-	sortedFake := append([]advisorBlockDescriptor(nil), fakeDescriptors...)
-	sort.Slice(sortedFake, func(i, j int) bool {
-		leftNUMAs := topology.CPUDetails.KeepOnly(
-			sortedFake[i].Eligible.Intersection(available)).NUMANodes().Size()
-		rightNUMAs := topology.CPUDetails.KeepOnly(
-			sortedFake[j].Eligible.Intersection(available)).NUMANodes().Size()
-		if leftNUMAs != rightNUMAs {
-			return leftNUMAs < rightNUMAs
-		}
-		return advisorBlockDescriptorLess(sortedFake[i], sortedFake[j])
-	})
-
-	baseTarget := totalQuantity / len(numaIDs)
-	highTargetCount := totalQuantity % len(numaIDs)
-	targetByNUMA := make(map[int]int, len(numaIDs))
-	var solveTargets func(index, highsLeft int) (map[string]map[int]int, error)
-	solveTargets = func(index, highsLeft int) (map[string]map[int]int, error) {
-		if index == len(numaIDs) {
-			if highsLeft != 0 {
-				return nil, nil
-			}
-			if err := budget.consumeCombination(); err != nil {
-				return nil, err
-			}
-			for _, numaID := range numaIDs {
-				target := targetByNUMA[numaID]
-				if target < minimumHardReclaimCPUsPerNUMA ||
-					target < realByNUMA[numaID] ||
-					fixedDedicatedByNUMA[numaID]+target > capacityByNUMA[numaID] {
-					return nil, nil
-				}
-			}
-			quotas, err := solveHardReclaimQuotasForTargets(
-				sortedFake, available, topology, numaIDs, targetByNUMA, realByNUMA, budget)
-			if err != nil || quotas == nil {
-				return nil, err
-			}
-			err = hardReclaimQuotasHaveFeasibleCPUAssignment(
-				sortedFake, descriptors, realDemands, quotas, available, topology)
-			if err == nil {
-				return quotas, nil
-			}
-			if strings.Contains(err.Error(), "budget exceeded") {
-				return nil, fmt.Errorf(
-					"hard reclaim solver budget exhausted during CPU flow validation: %w", err)
-			}
-			return nil, nil
-		}
-
-		numaID := numaIDs[index]
-		targets := []int{baseTarget}
-		if highsLeft > 0 {
-			targets = append(targets, baseTarget+1)
-		}
-		for _, target := range targets {
-			isHigh := 0
-			if target == baseTarget+1 {
-				isHigh = 1
-			}
-			remainingHighs := highsLeft - isHigh
-			remainingNUMAs := len(numaIDs) - index - 1
-			if remainingHighs < 0 || remainingHighs > remainingNUMAs {
-				continue
-			}
-			targetByNUMA[numaID] = target
-			quotas, err := solveTargets(index+1, remainingHighs)
-			if err != nil || quotas != nil {
-				return quotas, err
-			}
-		}
-		delete(targetByNUMA, numaID)
-		return nil, nil
-	}
-	return solveTargets(0, highTargetCount)
-}
-
-type hardReclaimQuotaEdge struct {
-	to      int
-	reverse int
-	cap     int
-	initial int
-}
-
-func solveHardReclaimQuotasForTargets(
-	fakeDescriptors []advisorBlockDescriptor,
-	available machine.CPUSet,
-	topology *machine.CPUTopology,
-	numaIDs []int,
-	targetByNUMA, realByNUMA map[int]int,
-	budget *hardReclaimSolveBudget,
-) (map[string]map[int]int, error) {
-	source := 0
-	blockBase := 1
-	numaBase := blockBase + len(fakeDescriptors)
-	sink := numaBase + len(numaIDs)
-	graph := make([][]hardReclaimQuotaEdge, sink+1)
-	blockNUMAEdges := make([][]int, len(fakeDescriptors))
-	totalFake := 0
-
-	for blockIndex, descriptor := range fakeDescriptors {
-		totalFake += descriptor.Quantity
-		if err := budget.consumeOperation(); err != nil {
-			return nil, err
-		}
-		addHardReclaimQuotaEdge(graph, source, blockBase+blockIndex, descriptor.Quantity)
-		finalEligible := descriptor.Eligible.Intersection(available)
-		blockNUMAEdges[blockIndex] = make([]int, len(numaIDs))
-		// Add higher NUMA IDs first to preserve the previous stable tie-break:
-		// earlier descriptors consume as little low-NUMA quota as possible.
-		for numaIndex := len(numaIDs) - 1; numaIndex >= 0; numaIndex-- {
-			numaID := numaIDs[numaIndex]
-			capacity := finalEligible.Intersection(
-				topology.CPUDetails.CPUsInNUMANodes(numaID)).Size()
-			if err := budget.consumeOperation(); err != nil {
-				return nil, err
-			}
-			blockNUMAEdges[blockIndex][numaIndex] = len(graph[blockBase+blockIndex])
-			addHardReclaimQuotaEdge(graph, blockBase+blockIndex, numaBase+numaIndex, capacity)
-		}
-	}
-	totalRemaining := 0
-	for numaIndex, numaID := range numaIDs {
-		remaining := targetByNUMA[numaID] - realByNUMA[numaID]
-		if remaining < 0 {
-			return nil, nil
-		}
-		totalRemaining += remaining
-		if err := budget.consumeOperation(); err != nil {
-			return nil, err
-		}
-		addHardReclaimQuotaEdge(graph, numaBase+numaIndex, sink, remaining)
-	}
-	if totalRemaining != totalFake {
-		return nil, nil
-	}
-
-	flow, err := hardReclaimQuotaMaxFlow(graph, source, sink, totalFake, budget)
-	if err != nil {
-		return nil, err
-	}
-	if flow != totalFake {
-		return nil, nil
-	}
-	quotas := make(map[string]map[int]int, len(fakeDescriptors))
-	for blockIndex, descriptor := range fakeDescriptors {
-		quotas[descriptor.BlockID] = make(map[int]int)
-		blockNode := blockBase + blockIndex
-		for numaIndex, numaID := range numaIDs {
-			edge := graph[blockNode][blockNUMAEdges[blockIndex][numaIndex]]
-			if used := edge.initial - edge.cap; used > 0 {
-				quotas[descriptor.BlockID][numaID] = used
-			}
-		}
-	}
-	return quotas, nil
-}
-
-func addHardReclaimQuotaEdge(graph [][]hardReclaimQuotaEdge, from, to, capacity int) {
-	forward := hardReclaimQuotaEdge{to: to, reverse: len(graph[to]), cap: capacity, initial: capacity}
-	reverse := hardReclaimQuotaEdge{to: from, reverse: len(graph[from])}
-	graph[from] = append(graph[from], forward)
-	graph[to] = append(graph[to], reverse)
-}
-
-func hardReclaimQuotaMaxFlow(
-	graph [][]hardReclaimQuotaEdge,
-	source, sink, target int,
-	budget *hardReclaimSolveBudget,
-) (int, error) {
-	flow := 0
-	level := make([]int, len(graph))
-	next := make([]int, len(graph))
-	var buildLevels func() (bool, error)
-	buildLevels = func() (bool, error) {
-		for i := range level {
-			level[i] = -1
-		}
-		level[source] = 0
-		queue := []int{source}
-		for len(queue) > 0 {
-			node := queue[0]
-			queue = queue[1:]
-			for edgeIndex := range graph[node] {
-				if err := budget.consumeOperation(); err != nil {
-					return false, err
-				}
-				edge := graph[node][edgeIndex]
-				if edge.cap == 0 || level[edge.to] >= 0 {
-					continue
-				}
-				level[edge.to] = level[node] + 1
-				queue = append(queue, edge.to)
-			}
-		}
-		return level[sink] >= 0, nil
-	}
-	var send func(node, amount int) (int, error)
-	send = func(node, amount int) (int, error) {
-		if node == sink {
-			return amount, nil
-		}
-		for next[node] < len(graph[node]) {
-			edgeIndex := next[node]
-			if err := budget.consumeOperation(); err != nil {
-				return 0, err
-			}
-			edge := &graph[node][edgeIndex]
-			if edge.cap > 0 && level[edge.to] == level[node]+1 {
-				pushed, err := send(edge.to, minInt(amount, edge.cap))
-				if err != nil {
-					return 0, err
-				}
-				if pushed > 0 {
-					edge.cap -= pushed
-					graph[edge.to][edge.reverse].cap += pushed
-					return pushed, nil
-				}
-			}
-			next[node]++
-		}
-		return 0, nil
-	}
-
-	for flow < target {
-		reachable, err := buildLevels()
-		if err != nil {
-			return 0, err
-		}
-		if !reachable {
-			break
-		}
-		for i := range next {
-			next[i] = 0
-		}
-		for flow < target {
-			pushed, err := send(source, target-flow)
-			if err != nil {
-				return 0, err
-			}
-			if pushed == 0 {
-				break
-			}
-			flow += pushed
-		}
-	}
-	return flow, nil
-}
-
-func minInt(left, right int) int {
-	if left < right {
-		return left
-	}
-	return right
-}
-
-func hardReclaimQuotasHaveFeasibleCPUAssignment(
-	fakeDescriptors, descriptors []advisorBlockDescriptor,
-	realDemands []partitionDemand,
-	quotas map[string]map[int]int,
-	available machine.CPUSet,
-	topology *machine.CPUTopology,
-) error {
-	demands := append([]partitionDemand(nil), realDemands...)
-	for _, descriptor := range fakeDescriptors {
-		for numaID, quantity := range quotas[descriptor.BlockID] {
-			if quantity == 0 {
-				continue
-			}
-			eligible := descriptor.Eligible.Intersection(available).Intersection(
-				topology.CPUDetails.CPUsInNUMANodes(numaID))
-			demands = append(demands, partitionDemand{
-				key:       hardReclaimPhaseDemandKey(descriptor, numaID),
-				quantity:  quantity,
-				eligible:  eligible,
-				preferred: descriptor.OldPreferred.Intersection(eligible),
-				class:     advisorBlockClassMandatoryReclaim,
-			})
-		}
-	}
-	for index, descriptor := range descriptors {
-		if descriptor.Class != advisorBlockClassDedicated {
-			continue
-		}
-		demands = append(demands, partitionDemand{
-			key:       fmt.Sprintf("\xffhard-reclaim-dedicated\x00%d\x00%s", index, descriptor.BlockID),
-			quantity:  descriptor.Quantity,
-			eligible:  descriptor.Eligible.Intersection(available),
-			preferred: descriptor.OldPreferred.Intersection(available),
-			class:     advisorBlockClassDedicated,
-		})
-	}
-	_, err := solveDisjointPartitions(demands, topology)
-	return err
 }
 
 func hardReclaimPhaseDemandKey(descriptor advisorBlockDescriptor, numaID int) string {
