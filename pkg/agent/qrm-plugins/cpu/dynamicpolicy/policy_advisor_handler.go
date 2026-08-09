@@ -567,9 +567,12 @@ func (p *DynamicPolicy) allocateByCPUAdvisor(
 	}
 
 	responseAllowOverlap := resp.AllowSharedCoresOverlapReclaimedCores
-	preCommitRevision := p.state.GetRevision()
-	target, applyErr := p.commitAdvisorResponseWithWriteAhead(resp, preCommitRevision, func() error {
-		return p.applyBlocks(blockToCPUSet, resp, responseAllowOverlap)
+	pending, applyErr := p.applyBlocks(blockToCPUSet, resp, responseAllowOverlap)
+	if applyErr != nil {
+		return fmt.Errorf("prepare applyBlocks failed with error: %w", applyErr)
+	}
+	target, applyErr := p.commitAdvisorResponseWithWriteAhead(resp, pending.preCommitRevision, func() error {
+		return p.commitPendingAdvisorState(pending)
 	})
 	if applyErr != nil {
 		return fmt.Errorf("applyBlocks failed with error: %w", applyErr)
@@ -1697,7 +1700,17 @@ func buildLegacyMandatoryReclaimDescriptors(
 		mandatoryResp, cpuDetails, podEntries, rpPinnedCPUSet, nonReclaimableCPUSet)
 }
 
-// applyBlocks allocate based on BlockCPUSet
+type pendingAdvisorState struct {
+	preCommitRevision uint64
+	currentEntries    state.PodEntries
+	entries           state.PodEntries
+	machineState      state.NUMANodeMap
+	allowOverlap      bool
+	disableDedicated  bool
+}
+
+// applyBlocks prepares and validates an advisor state transition without
+// invoking allocation hooks, writing checkpoints, or mutating plugin state.
 // and the logic contains three main steps
 // 1. construct entries for dedicated containers and pools
 // 2. ensure reclaimed pool exists
@@ -1706,9 +1719,9 @@ func (p *DynamicPolicy) applyBlocks(
 	blockCPUSet advisorapi.BlockCPUSet,
 	resp *advisorapi.ListAndWatchResponse,
 	allowSharedCoresOverlapReclaimedCores bool,
-) error {
+) (*pendingAdvisorState, error) {
 	if resp == nil {
-		return fmt.Errorf("applyBlocks got nil resp")
+		return nil, fmt.Errorf("applyBlocks got nil resp")
 	}
 
 	stateRevision := p.state.GetRevision()
@@ -1737,13 +1750,13 @@ func (p *DynamicPolicy) applyBlocks(
 			// construct cpuset for this entry by union all blocks for it
 			entryCPUSet, err := calculationInfo.GetCPUSet(entryName, subEntryName, blockCPUSet)
 			if err != nil {
-				return err
+				return nil, err
 			}
 
 			// transform cpuset into topologyAwareAssignments
 			topologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, entryCPUSet)
 			if err != nil {
-				return fmt.Errorf("unable to calculate topologyAwareAssignments for entry: %s, subEntry: %s, entry cpuset: %s, error: %v",
+				return nil, fmt.Errorf("unable to calculate topologyAwareAssignments for entry: %s, subEntry: %s, entry cpuset: %s, error: %v",
 					entryName, subEntryName, entryCPUSet.String(), err)
 			}
 
@@ -1753,9 +1766,9 @@ func (p *DynamicPolicy) applyBlocks(
 				// currently, cpu advisor can only create new pools,
 				// all container entries or entries with owner pool name dedicated can't be created by cpu advisor
 				if calculationInfo.OwnerPoolName == commonstate.PoolNameDedicated || subEntryName != commonstate.FakedContainerName {
-					return fmt.Errorf("no-pool entry isn't found in plugin cache, entry: %s, subEntry: %s", entryName, subEntryName)
+					return nil, fmt.Errorf("no-pool entry isn't found in plugin cache, entry: %s, subEntry: %s", entryName, subEntryName)
 				} else if entryName != calculationInfo.OwnerPoolName {
-					return fmt.Errorf("pool entryName: %s and OwnerPoolName: %s mismatch", entryName, calculationInfo.OwnerPoolName)
+					return nil, fmt.Errorf("pool entryName: %s and OwnerPoolName: %s mismatch", entryName, calculationInfo.OwnerPoolName)
 				}
 
 				general.Infof("create new pool: %s cpuset result %s", entryName, entryCPUSet.String())
@@ -1824,7 +1837,7 @@ func (p *DynamicPolicy) applyBlocks(
 			continue
 		}
 		if _, exists := newEntries[name]; exists {
-			return fmt.Errorf("system pool %s already exists", name)
+			return nil, fmt.Errorf("system pool %s already exists", name)
 		}
 		newEntries[name] = make(state.ContainerEntries)
 		if ai, ok := subEntry[commonstate.FakedContainerName]; ok && ai != nil {
@@ -1836,7 +1849,7 @@ func (p *DynamicPolicy) applyBlocks(
 		// In disjoint mode the planner owns the complete reclaim target. Do not
 		// revise or fallback-expand it after planning.
 		if newEntries.CheckPoolEmpty(commonstate.PoolNameReclaim) {
-			return fmt.Errorf("disjoint advisor response has no reclaim partition")
+			return nil, fmt.Errorf("disjoint advisor response has no reclaim partition")
 		}
 	} else {
 		// Legacy mode keeps the historical fallback behavior for NUMAs without
@@ -1848,14 +1861,14 @@ func (p *DynamicPolicy) applyBlocks(
 			allowSharedCoresOverlapReclaimedCores,
 		)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
 	// calculate rampUpCPUs
 	sharedBindingNUMAs, err := resp.GetSharedBindingNUMAs()
 	if err != nil {
-		return fmt.Errorf("GetSharedBindingNUMAs failed with error: %v", err)
+		return nil, fmt.Errorf("GetSharedBindingNUMAs failed with error: %v", err)
 	}
 	sharedBindingNUMACPUs := p.machineInfo.CPUDetails.CPUsInNUMANodes(sharedBindingNUMAs.UnsortedList()...)
 	notAllocatablePoolsCPUs := state.GetUnitedPoolsCPUs(p.state.GetPodEntries(), state.IsForbiddenPool, commonstate.IsSystemPool)
@@ -1867,13 +1880,13 @@ func (p *DynamicPolicy) applyBlocks(
 		Difference(notAllocatablePoolsCPUs)
 	rampUpReclaimFloor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), false)
 	if err != nil {
-		return fmt.Errorf("derive reclaim floor for advisor ramp-up failed: %w", err)
+		return nil, fmt.Errorf("derive reclaim floor for advisor ramp-up failed: %w", err)
 	}
 	rampUpCPUs = rampUpCPUs.Difference(rampUpReclaimFloor)
 
 	rampUpCPUsTopologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, rampUpCPUs)
 	if err != nil {
-		return fmt.Errorf("unable to calculate topologyAwareAssignments for rampUpCPUs, result cpuset: %s, error: %v",
+		return nil, fmt.Errorf("unable to calculate topologyAwareAssignments for rampUpCPUs, result cpuset: %s, error: %v",
 			rampUpCPUs.String(), err)
 	}
 
@@ -1906,11 +1919,11 @@ func (p *DynamicPolicy) applyBlocks(
 				errMsg := fmt.Sprintf("dedicated_cores blocks aren't applied, pod: %s/%s, container: %s",
 					allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName)
 				general.Errorf(errMsg)
-				return fmt.Errorf(errMsg)
+				return nil, fmt.Errorf(errMsg)
 			case consts.PodAnnotationQoSLevelSystemCores:
 				poolCPUSet, topologyAwareAssignments, err := p.getSystemPoolCPUSetAndNumaAwareAssignments(newEntries, allocationInfo)
 				if err != nil {
-					return fmt.Errorf("pod: %s/%s, container: %s is system_cores, "+
+					return nil, fmt.Errorf("pod: %s/%s, container: %s is system_cores, "+
 						"getSystemPoolCPUSetAndNumaAwareAssignments failed with error: %v",
 						allocationInfo.PodNamespace, allocationInfo.PodName,
 						allocationInfo.ContainerName, err)
@@ -1940,7 +1953,7 @@ func (p *DynamicPolicy) applyBlocks(
 				} else {
 					poolEntry, err := p.getAllocationPoolEntry(allocationInfo, ownerPoolName, newEntries)
 					if err != nil {
-						return err
+						return nil, err
 					}
 
 					if allocationInfo.CheckSharedNUMABinding() {
@@ -1965,41 +1978,37 @@ func (p *DynamicPolicy) applyBlocks(
 				ownerPoolName := p.getOwnerPoolNameFromAdvisor(allocationInfo, resp)
 				poolEntry, err := p.getAllocationPoolEntry(allocationInfo, ownerPoolName, newEntries)
 				if err != nil {
-					return err
+					return nil, err
 				}
 
 				err = p.updateReclaimAllocationResultByPoolEntry(newEntries[podUID][containerName], poolEntry, nonReclaimActualBindingNUMAs)
 				if err != nil {
-					return err
+					return nil, err
 				}
 			default:
-				return fmt.Errorf("invalid qosLevel: %s for pod: %s/%s container: %s",
+				return nil, fmt.Errorf("invalid qosLevel: %s for pod: %s/%s container: %s",
 					allocationInfo.QoSLevel, allocationInfo.PodNamespace,
 					allocationInfo.PodName, allocationInfo.ContainerName)
 			}
 		}
 	}
 
-	// trigger allocation hooks for non-pool containers before committing to state.
-	if err := p.invokeAllocationHooksForPodEntries(curEntries, newEntries); err != nil {
-		return err
-	}
 	commitOverride, err := p.buildAdjustmentCommitOverrideFromPodEntries(
 		newEntries,
 		allowSharedCoresOverlapReclaimedCores,
 		resp.DisableDedicatedCoresOverlapReclaimedCores,
 	)
 	if err != nil {
-		return fmt.Errorf("build adjustment commit override from pod entries failed with error: %w", err)
+		return nil, fmt.Errorf("build adjustment commit override from pod entries failed with error: %w", err)
 	}
 	if err := p.syncReclaimPoolWithAdjustmentCommitOverride(newEntries, commitOverride); err != nil {
-		return fmt.Errorf("sync reclaim pool with adjustment commit override failed with error: %w", err)
+		return nil, fmt.Errorf("sync reclaim pool with adjustment commit override failed with error: %w", err)
 	}
 
 	// use pod entries generated above to generate machine state info, and store in local state
 	newMachineState, err := generateMachineStateFromPodEntries(p.machineInfo.CPUTopology, newEntries, p.state.GetMachineState())
 	if err != nil {
-		return fmt.Errorf("calculate machineState by newPodEntries failed with error: %v", err)
+		return nil, fmt.Errorf("calculate machineState by newPodEntries failed with error: %v", err)
 	}
 	if err := p.validateAdvisorPartitionBeforeCommit(
 		newEntries,
@@ -2007,14 +2016,31 @@ func (p *DynamicPolicy) applyBlocks(
 		allowSharedCoresOverlapReclaimedCores,
 		resp.DisableDedicatedCoresOverlapReclaimedCores,
 	); err != nil {
+		return nil, err
+	}
+	return &pendingAdvisorState{
+		preCommitRevision: stateRevision,
+		currentEntries:    curEntries,
+		entries:           newEntries,
+		machineState:      newMachineState,
+		allowOverlap:      allowSharedCoresOverlapReclaimedCores,
+		disableDedicated:  resp.DisableDedicatedCoresOverlapReclaimedCores,
+	}, nil
+}
+
+func (p *DynamicPolicy) commitPendingAdvisorState(pending *pendingAdvisorState) error {
+	if pending == nil {
+		return fmt.Errorf("pending advisor state is nil")
+	}
+	if err := p.invokeAllocationHooksForPodEntries(pending.currentEntries, pending.entries); err != nil {
 		return err
 	}
 	return p.state.CommitAdvisorStateIfRevision(
-		stateRevision,
-		newEntries,
-		newMachineState,
-		allowSharedCoresOverlapReclaimedCores,
-		resp.DisableDedicatedCoresOverlapReclaimedCores,
+		pending.preCommitRevision,
+		pending.entries,
+		pending.machineState,
+		pending.allowOverlap,
+		pending.disableDedicated,
 		true,
 	)
 }
