@@ -2,6 +2,7 @@ import argparse
 import ctypes
 import datetime
 import json
+import math
 import os
 import signal
 import sys
@@ -25,7 +26,7 @@ def _non_negative_float(value):
         parsed = float(value)
     except ValueError:
         raise argparse.ArgumentTypeError("must be a number")
-    if parsed < 0:
+    if not math.isfinite(parsed) or parsed < 0:
         raise argparse.ArgumentTypeError("must be non-negative")
     return parsed
 
