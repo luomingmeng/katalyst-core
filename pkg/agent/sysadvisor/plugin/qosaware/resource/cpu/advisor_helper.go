@@ -230,8 +230,16 @@ func (cra *cpuResourceAdvisor) updateReservedForReclaim() error {
 		}
 		ratioReserved := int(float64(totalAvailable) * dynamicConf.InitialRampUpReclaimCPUSetRatio)
 		numReservedCores := hardPartitionReservedReclaimCores(ratioReserved, len(cra.numaAvailable))
-		cra.reservedForReclaim = machine.GetCoreNumReservedForReclaim(numReservedCores, len(cra.numaAvailable))
-		general.Infof("reservedForReclaim: %v, ratioReserved %v", cra.reservedForReclaim, ratioReserved)
+		candidateReserved := machine.GetCoreNumReservedForReclaim(numReservedCores, len(cra.numaAvailable))
+		for id := 0; id < cra.metaServer.NumNUMANodes; id++ {
+			if candidateReserved[id] > cra.numaAvailable[id] {
+				cra.reservedForReclaim = nil
+				return fmt.Errorf("NUMA %d reclaim reservation exceeds capacity: required %d, available %d",
+					id, candidateReserved[id], cra.numaAvailable[id])
+			}
+		}
+		cra.reservedForReclaim = candidateReserved
+		general.Infof("reservedForReclaim: %v, ratioReserved %v", candidateReserved, ratioReserved)
 		return nil
 	}
 
