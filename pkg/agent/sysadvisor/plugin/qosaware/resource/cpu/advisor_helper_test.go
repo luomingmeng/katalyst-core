@@ -204,3 +204,61 @@ func TestHardPartitionReservedReclaimCores(t *testing.T) {
 		})
 	}
 }
+
+func TestCPUResourceAdvisorUpdateReservedForReclaimHardPartitionCapacity(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		ratio        float64
+		wantReserved map[int]int
+		wantErr      string
+	}{
+		{
+			name:         "candidate fits every NUMA",
+			ratio:        0.5,
+			wantReserved: map[int]int{0: 4, 1: 4},
+		},
+		{
+			name:    "candidate exceeds one NUMA",
+			ratio:   0.75,
+			wantErr: "NUMA 0 reclaim reservation exceeds capacity: required 6, available 4",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			conf := generateTestConfiguration(t, t.TempDir(), t.TempDir())
+			dynamicConf := conf.GetDynamicConfiguration()
+			dynamicConf.EnableRampUpReclaimHardPartition = true
+			dynamicConf.InitialRampUpReclaimCPUSetRatio = tt.ratio
+
+			cra := &cpuResourceAdvisor{
+				conf: conf,
+				metaServer: &metaserver.MetaServer{
+					MetaAgent: &agent.MetaAgent{
+						KatalystMachineInfo: &machine.KatalystMachineInfo{
+							CPUTopology: &machine.CPUTopology{
+								NumNUMANodes: 2,
+							},
+						},
+					},
+				},
+				numaAvailable: map[int]int{0: 4, 1: 12},
+			}
+
+			err := cra.updateReservedForReclaim()
+			if tt.wantErr != "" {
+				require.EqualError(t, err, tt.wantErr)
+				assert.Nil(t, cra.reservedForReclaim)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantReserved, cra.reservedForReclaim)
+		})
+	}
+}
