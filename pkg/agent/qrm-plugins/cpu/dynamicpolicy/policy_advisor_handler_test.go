@@ -640,6 +640,19 @@ type staleAdvisorCommitState struct {
 	injected bool
 }
 
+func prepareAndCommitAdvisorBlocks(
+	policy *DynamicPolicy,
+	blockCPUSet advisorapi.BlockCPUSet,
+	resp *advisorapi.ListAndWatchResponse,
+	allowOverlap bool,
+) error {
+	pending, err := policy.applyBlocks(blockCPUSet, resp, allowOverlap)
+	if err != nil {
+		return err
+	}
+	return policy.commitPendingAdvisorState(pending)
+}
+
 func (s *advisorCommitRecordingState) CommitAdvisorState(
 	entries state.PodEntries,
 	machineState state.NUMANodeMap,
@@ -1312,7 +1325,7 @@ func TestDynamicPolicyApplyBlocksOverridesReclaimDedicatedOverlapBeforeCommit(t 
 		"reclaim-1":       machine.NewCPUSet(2),
 	}
 
-	err = policy.applyBlocks(blockCPUSet, resp, resp.AllowSharedCoresOverlapReclaimedCores)
+	err = prepareAndCommitAdvisorBlocks(policy, blockCPUSet, resp, resp.AllowSharedCoresOverlapReclaimedCores)
 	require.NoError(t, err)
 
 	reclaimPool := policy.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
@@ -1324,7 +1337,7 @@ func TestDynamicPolicyApplyBlocksOverridesReclaimDedicatedOverlapBeforeCommit(t 
 
 	policy.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
 	resp.AllowSharedCoresOverlapReclaimedCores = true
-	require.NoError(t, policy.applyBlocks(blockCPUSet, resp, resp.AllowSharedCoresOverlapReclaimedCores))
+	require.NoError(t, prepareAndCommitAdvisorBlocks(policy, blockCPUSet, resp, resp.AllowSharedCoresOverlapReclaimedCores))
 	require.True(t, policy.state.GetAllowSharedCoresOverlapReclaimedCores(),
 		"advisor overlap mode must be committed in the same checkpoint transaction as pod and machine state")
 }
@@ -1391,11 +1404,123 @@ func TestDynamicPolicyApplyBlocksRejectsHardPartitionInvalidatedByBulkheadPaddin
 		"reclaim-1": machine.NewCPUSet(2, 6),
 	}
 
-	err = policy.applyBlocks(blockCPUSet, resp, false)
+	_, err = policy.applyBlocks(blockCPUSet, resp, false)
 	require.ErrorContains(t, err, "hard-partition reclaim NUMA 0 has 0 CPUs")
 	require.Equal(t, initialRevision, policy.state.GetRevision())
 	require.Equal(t, initialEntries, policy.state.GetPodEntries())
 	require.Equal(t, initialMachineState, policy.state.GetMachineState())
+}
+
+func TestAllocateByCPUAdvisorValidatesProspectiveHardPartitionBeforeSideEffects(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name         string
+		minSize      int64
+		wantErr      bool
+		wantHookCall int
+	}{
+		{name: "raw 2/2 padding 0", minSize: 2, wantHookCall: 1},
+		{name: "raw 2/2 padding 2", minSize: 4, wantErr: true},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+			require.NoError(t, err)
+			checkpointDir := t.TempDir()
+			policy, err := getTestDynamicPolicyWithoutInitialization(topology, checkpointDir)
+			require.NoError(t, err)
+			policy.advisorPostCommitCheckpointDir = checkpointDir
+
+			dynamicConf := policy.dynamicConfig.GetDynamicConfiguration()
+			dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.EnableRampUpReclaimHardPartition = true
+			dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.Enable = true
+			dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.NonReclaimPoolMinSize = tc.minSize
+
+			policy.state.SetPodEntries(state.PodEntries{
+				"reclaimed-pod": {
+					"main": &state.AllocationInfo{
+						AllocationMeta: commonstate.AllocationMeta{
+							PodUid:        "reclaimed-pod",
+							ContainerName: "main",
+							OwnerPoolName: commonstate.PoolNameReclaim,
+							QoSLevel:      apiconsts.PodAnnotationQoSLevelReclaimedCores,
+						},
+						AllocationResult: machine.NewCPUSet(3, 7),
+					},
+				},
+				commonstate.PoolNameReserve: {
+					commonstate.FakedContainerName: &state.AllocationInfo{
+						AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReserve),
+						AllocationResult: machine.NewCPUSet(0, 4),
+					},
+				},
+				commonstate.PoolNameReclaim: {
+					commonstate.FakedContainerName: &state.AllocationInfo{
+						AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+						AllocationResult: machine.NewCPUSet(3, 7),
+					},
+				},
+			}, false)
+			initialEntries := policy.state.GetPodEntries()
+			initialMachineState := policy.state.GetMachineState()
+			initialRevision := policy.state.GetRevision()
+			hookCalls := 0
+			policy.RegisterAllocationHook(func(_, _ *state.AllocationInfo) error {
+				hookCalls++
+				return nil
+			})
+
+			resp := &advisorapi.ListAndWatchResponse{
+				Entries: map[string]*advisorapi.CalculationEntries{
+					commonstate.PoolNameReserve: {
+						Entries: map[string]*advisorapi.CalculationInfo{
+							commonstate.FakedContainerName: {
+								OwnerPoolName: commonstate.PoolNameReserve,
+								CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+									commonstate.FakedNUMAID: {Blocks: []*advisorapi.Block{{BlockId: "reserve", Result: 2}}},
+								},
+							},
+						},
+					},
+					commonstate.PoolNameReclaim: {
+						Entries: map[string]*advisorapi.CalculationInfo{
+							commonstate.FakedContainerName: {
+								OwnerPoolName: commonstate.PoolNameReclaim,
+								CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+									0: {Blocks: []*advisorapi.Block{{BlockId: "reclaim-0", Result: 2}}},
+									1: {Blocks: []*advisorapi.Block{{BlockId: "reclaim-1", Result: 2}}},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			err = policy.allocateByCPUAdvisor(nil, resp, map[string]*advisorsvc.FeatureGate{})
+			if !tc.wantErr {
+				require.NoError(t, err)
+				require.Equal(t, tc.wantHookCall, hookCalls)
+				reclaim := policy.state.GetAllocationInfo(
+					commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+				require.NotNil(t, reclaim)
+				require.Len(t, reclaim.TopologyAwareAssignments, 2)
+				require.Equal(t, 2, reclaim.TopologyAwareAssignments[0].Size())
+				require.Equal(t, 2, reclaim.TopologyAwareAssignments[1].Size())
+				return
+			}
+
+			require.ErrorContains(t, err, "bulkhead hard-partition reclaim NUMA 0 has 0 CPUs")
+			require.Equal(t, tc.wantHookCall, hookCalls)
+			require.Equal(t, initialRevision, policy.state.GetRevision())
+			require.Equal(t, initialEntries, policy.state.GetPodEntries())
+			require.Equal(t, initialMachineState, policy.state.GetMachineState())
+			require.NoFileExists(t, filepath.Join(checkpointDir, advisorPostCommitCheckpointName))
+			require.NoFileExists(t, filepath.Join(checkpointDir, advisorPostCommitCheckpointName+".staging"))
+		})
+	}
 }
 
 func TestDynamicPolicyApplyBlocksPreservesExplicitDisjointReclaim(t *testing.T) {
@@ -1468,7 +1593,7 @@ func TestDynamicPolicyApplyBlocksPreservesExplicitDisjointReclaim(t *testing.T) 
 		"reclaim":   machine.NewCPUSet(0),
 	}
 
-	require.NoError(t, policy.applyBlocks(blocks, resp, true))
+	require.NoError(t, prepareAndCommitAdvisorBlocks(policy, blocks, resp, true))
 	reclaim := policy.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
 	require.NotNil(t, reclaim)
 	require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(0)),
@@ -1490,7 +1615,8 @@ func TestDynamicPolicyApplyBlocksRejectsMissingDisjointReclaim(t *testing.T) {
 		DisableDedicatedCoresOverlapReclaimedCores: true,
 		Entries: map[string]*advisorapi.CalculationEntries{},
 	}
-	require.ErrorContains(t, policy.applyBlocks(advisorapi.BlockCPUSet{}, resp, false),
+	_, err = policy.applyBlocks(advisorapi.BlockCPUSet{}, resp, false)
+	require.ErrorContains(t, err,
 		"disjoint advisor response has no reclaim partition")
 }
 
@@ -1574,7 +1700,7 @@ func TestDynamicPolicyApplyBlocksUsesResponseModeWhenDisablingOverlap(t *testing
 	}
 	policy.state = recordingState
 
-	err = policy.applyBlocks(blockCPUSet, resp, resp.AllowSharedCoresOverlapReclaimedCores)
+	err = prepareAndCommitAdvisorBlocks(policy, blockCPUSet, resp, resp.AllowSharedCoresOverlapReclaimedCores)
 	require.EqualError(t, err, "commit failed")
 	require.Equal(t, 1, recordingState.calls)
 	require.True(t, policy.state.GetAllowSharedCoresOverlapReclaimedCores())
@@ -1583,7 +1709,7 @@ func TestDynamicPolicyApplyBlocksUsesResponseModeWhenDisablingOverlap(t *testing
 	require.True(t, unchangedReclaimPool.AllocationResult.Equals(machine.NewCPUSet(0, 2)))
 
 	recordingState.err = nil
-	require.NoError(t, policy.applyBlocks(blockCPUSet, resp, resp.AllowSharedCoresOverlapReclaimedCores))
+	require.NoError(t, prepareAndCommitAdvisorBlocks(policy, blockCPUSet, resp, resp.AllowSharedCoresOverlapReclaimedCores))
 	require.Equal(t, 2, recordingState.calls)
 	require.False(t, policy.state.GetAllowSharedCoresOverlapReclaimedCores())
 	reclaimPool := policy.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
@@ -1665,7 +1791,7 @@ func TestDynamicPolicyApplyBlocksUsesRevisionGuard(t *testing.T) {
 	guardState := &advisorCommitGuardState{State: policy.state}
 	policy.state = guardState
 
-	require.NoError(t, policy.applyBlocks(blockCPUSet, resp, resp.AllowSharedCoresOverlapReclaimedCores))
+	require.NoError(t, prepareAndCommitAdvisorBlocks(policy, blockCPUSet, resp, resp.AllowSharedCoresOverlapReclaimedCores))
 	require.Equal(t, 0, guardState.unconditionalCommitCalls)
 	require.Equal(t, 1, guardState.conditionalCommitCalls)
 	require.NotZero(t, guardState.conditionalRevision)
@@ -1742,7 +1868,7 @@ func TestDynamicPolicyApplyBlocksRejectsStaleFrameWithoutOverwritingDesiredState
 	}
 	policy.state = &staleAdvisorCommitState{State: policy.state}
 
-	err = policy.applyBlocks(advisorapi.BlockCPUSet{
+	err = prepareAndCommitAdvisorBlocks(policy, advisorapi.BlockCPUSet{
 		"new-dedicated": oldReclaim,
 		"new-reclaim":   oldDedicated,
 	}, resp, false)
