@@ -1423,9 +1423,8 @@ func validateHardPartitionReclaimDistribution(
 		return fmt.Errorf("hard-partition reclaim outside eligible CPUs: %s", outside.String())
 	}
 
-	eligibleNUMAs := topology.CPUDetails.KeepOnly(eligible.Intersection(machineCPUs)).NUMANodes().ToSliceInt()
 	minimum, maximum := 0, 0
-	for i, numaID := range eligibleNUMAs {
+	for i, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
 		count := reclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID)).Size()
 		if count < minimumPerNUMA {
 			return fmt.Errorf("hard-partition reclaim NUMA %d has %d CPUs, minimum is %d",
@@ -1439,7 +1438,7 @@ func validateHardPartitionReclaimDistribution(
 		}
 	}
 	if maximum-minimum > 1 {
-		return fmt.Errorf("hard-partition reclaim is imbalanced across eligible NUMAs: max=%d min=%d", maximum, minimum)
+		return fmt.Errorf("hard-partition reclaim is imbalanced across physical NUMAs: max=%d min=%d", maximum, minimum)
 	}
 	return nil
 }

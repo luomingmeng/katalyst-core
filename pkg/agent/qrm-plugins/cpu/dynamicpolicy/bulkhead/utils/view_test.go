@@ -477,6 +477,12 @@ func TestBuildCPUSetPartitionViewValidatesHardPartitionDistribution(t *testing.T
 			wantErr:              "NUMA 1 has 0 CPUs, minimum is 2",
 		},
 		{
+			name:                 "hard partition rejects reclaim only on NUMA zero",
+			reclaim:              machine.NewCPUSet(0, 1),
+			hardPartitionEnabled: true,
+			wantErr:              "NUMA 1 has 0 CPUs, minimum is 2",
+		},
+		{
 			name:                 "hard partition rejects three and one",
 			reclaim:              machine.NewCPUSet(0, 1, 2, 4),
 			hardPartitionEnabled: true,
