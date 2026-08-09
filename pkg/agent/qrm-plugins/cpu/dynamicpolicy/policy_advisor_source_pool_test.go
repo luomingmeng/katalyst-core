@@ -1409,6 +1409,42 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 		require.Equal(t, 3, result["real-0"].Union(result["fake"]).Intersection(numa1).Size())
 	})
 
+	t.Run("real NUMA dedicated load constrains fake reclaim water filling", func(t *testing.T) {
+		p := newPolicy(t, true)
+		result := advisorapi.NewBlockCPUSet()
+		_, err := p.solveAdvisorDescriptorPhase([]advisorBlockDescriptor{
+			{
+				BlockID: "dedicated-0", Class: advisorBlockClassDedicated, NUMAID: 0,
+				Quantity: 2, ComponentKey: "dedicated-0", Eligible: numa0,
+			},
+			{
+				BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
+				Quantity: 5, ComponentKey: "fake", Eligible: allCPUs,
+			},
+		}, allCPUs, result, true)
+		require.NoError(t, err)
+		require.Equal(t, 2, result["dedicated-0"].Intersection(numa0).Size())
+		require.Equal(t, 2, result["fake"].Intersection(numa0).Size())
+		require.Equal(t, 3, result["fake"].Intersection(numa1).Size())
+	})
+
+	t.Run("real NUMA dedicated load rejects insufficient reclaim capacity", func(t *testing.T) {
+		p := newPolicy(t, true)
+		result := advisorapi.NewBlockCPUSet()
+		_, err := p.solveAdvisorDescriptorPhase([]advisorBlockDescriptor{
+			{
+				BlockID: "dedicated-0", Class: advisorBlockClassDedicated, NUMAID: 0,
+				Quantity: 2, ComponentKey: "dedicated-0", Eligible: numa0,
+			},
+			{
+				BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
+				Quantity: 7, ComponentKey: "fake", Eligible: allCPUs,
+			},
+		}, allCPUs, result, true)
+		require.ErrorContains(t, err, "insufficient aggregate capacity")
+		require.Empty(t, result)
+	})
+
 	t.Run("quantity below hard minimum fails", func(t *testing.T) {
 		got, err := solve(t, newPolicy(t, true), 3, allCPUs, machine.NewCPUSet())
 		require.ErrorContains(t, err, "smaller than required minimum")
