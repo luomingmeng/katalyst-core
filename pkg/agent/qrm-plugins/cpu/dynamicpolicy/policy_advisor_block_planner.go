@@ -362,10 +362,17 @@ func expandHardPartitionReclaimPhase(
 	demands := make([]partitionDemand, 0, len(mandatory))
 	blockIDByDemandKey := make(map[string]string, len(mandatory))
 	finalByNUMA := make(map[int]int)
+	fixedDedicatedByNUMA := make(map[int]int)
 	capacityByNUMA := make(map[int]int)
 	eligibleNUMAs := make(map[int]struct{})
 	fakeDescriptors := make([]advisorBlockDescriptor, 0, len(mandatory))
 	totalQuantity := 0
+
+	for _, descriptor := range descriptors {
+		if descriptor.Class == advisorBlockClassDedicated && descriptor.NUMAID != commonstate.FakedNUMAID {
+			fixedDedicatedByNUMA[descriptor.NUMAID] += descriptor.Quantity
+		}
+	}
 
 	for _, descriptor := range mandatory {
 		totalQuantity += descriptor.Quantity
@@ -412,10 +419,10 @@ func expandHardPartitionReclaimPhase(
 	}
 
 	for numaID, quantity := range finalByNUMA {
-		if quantity > capacityByNUMA[numaID] {
+		if fixedDedicatedByNUMA[numaID]+quantity > capacityByNUMA[numaID] {
 			return nil, nil, fmt.Errorf(
-				"hard reclaim NUMA %d initial quantity %d exceeds capacity %d",
-				numaID, quantity, capacityByNUMA[numaID])
+				"hard reclaim NUMA %d initial quantity %d with fixed dedicated load %d exceeds capacity %d",
+				numaID, quantity, fixedDedicatedByNUMA[numaID], capacityByNUMA[numaID])
 		}
 	}
 
@@ -432,7 +439,8 @@ func expandHardPartitionReclaimPhase(
 			selectedNUMA := 0
 			selected := false
 			for numaID, capacity := range descriptorCapacity {
-				if quotas[numaID] >= capacity || finalByNUMA[numaID] >= capacityByNUMA[numaID] {
+				if quotas[numaID] >= capacity ||
+					fixedDedicatedByNUMA[numaID]+finalByNUMA[numaID]+1 > capacityByNUMA[numaID] {
 					continue
 				}
 				if !selected || finalByNUMA[numaID] < finalByNUMA[selectedNUMA] ||
