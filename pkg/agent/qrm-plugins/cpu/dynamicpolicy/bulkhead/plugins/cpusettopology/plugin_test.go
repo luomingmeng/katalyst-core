@@ -909,11 +909,11 @@ func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t
 	)
 	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
 		Name: "bulkhead-final-snapshot-container-proof",
-		Handler: func(gotPodUID, gotContainerID string) (string, error) {
+		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 			if gotPodUID == podUID && gotContainerID == containerID {
-				return containerRel, nil
+				return containerRel, false, nil
 			}
-			return "", errors.New("not the final-snapshot container proof fixture")
+			return "", false, errors.New("not the final-snapshot container proof fixture")
 		},
 	})
 
@@ -1735,11 +1735,11 @@ func newDisabledTransitionTestPlugin(
 	containerRel := "primary/burstable/pod-a/container-a"
 	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
 		Name: "bulkhead-disabled-" + podUID,
-		Handler: func(gotPodUID, gotContainerID string) (string, error) {
+		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 			if gotPodUID == podUID && gotContainerID == containerID {
-				return containerRel, nil
+				return containerRel, false, nil
 			}
-			return "", errors.New("not a bulkhead disabled transition test container")
+			return "", false, errors.New("not a bulkhead disabled transition test container")
 		},
 	})
 
@@ -2041,11 +2041,11 @@ func TestCPUSetTopologyExpectedBuildAndFinalPublishUseAdmissionContext(t *testin
 	)
 	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
 		Name: "cpuset-topology-admission-context",
-		Handler: func(gotPodUID, gotContainerID string) (string, error) {
+		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 			if gotPodUID == podUID && gotContainerID == "context-aware-container" {
-				return containerRel, nil
+				return containerRel, false, nil
 			}
-			return "", errors.New("not the admission context test container")
+			return "", false, errors.New("not the admission context test container")
 		},
 	})
 	fetcher := &admissionContextContainerIDFetcher{wantValue: contextValue}
@@ -2204,11 +2204,11 @@ func TestCPUSetTopologyPluginBuildExpectedCPUSetByRelTrimsLeadingSlash(t *testin
 
 	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
 		Name: "bulkhead-build-expected-trim-" + podUID,
-		Handler: func(gotPodUID, gotContainerID string) (string, error) {
+		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 			if gotPodUID == podUID && gotContainerID == containerID {
-				return prefixedRel, nil
+				return prefixedRel, false, nil
 			}
-			return "", errors.New("not a build-expected-trim test container")
+			return "", false, errors.New("not a build-expected-trim test container")
 		},
 	})
 

@@ -20,12 +20,15 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 )
 
 var (
-	testKataJsonInfo    = `{"sandboxID": "12345678", "pid": 1234, "runtimeType": "io.containerd.kata.v2"}`
-	testInvalidJsonInfo = `{"pid: 2345"}` // no sandbox id field
-	testNonKataJsonInfo = `{"sandboxID": "234567890", "pid": "2345", "runtimeType": "docker"}`
+	testKataJsonInfo       = `{"sandboxID": "12345678", "pid": 1234, "runtimeType": "io.containerd.kata.v2"}`
+	testInvalidJsonInfo    = `{"pid: 2345"}` // no sandbox id field
+	testMissingRuntimeInfo = `{"sandboxID": "12345678", "pid": 2345}`
+	testNonKataJsonInfo    = `{"sandboxID": "234567890", "pid": "2345", "runtimeType": "docker"}`
 )
 
 func TestKataContainerFetcher_getKataCgroupPathSuffix(t *testing.T) {
@@ -41,6 +44,7 @@ func TestKataContainerFetcher_getKataCgroupPathSuffix(t *testing.T) {
 		name                 string
 		fields               fields
 		wantCgroupPathSuffix string
+		wantSkip             bool
 		wantErr              bool
 	}{
 		{
@@ -55,6 +59,7 @@ func TestKataContainerFetcher_getKataCgroupPathSuffix(t *testing.T) {
 				},
 			},
 			wantCgroupPathSuffix: "",
+			wantSkip:             false,
 			wantErr:              true,
 		},
 		{
@@ -69,6 +74,7 @@ func TestKataContainerFetcher_getKataCgroupPathSuffix(t *testing.T) {
 				},
 			},
 			wantCgroupPathSuffix: "",
+			wantSkip:             false,
 			wantErr:              true,
 		},
 		{
@@ -83,6 +89,7 @@ func TestKataContainerFetcher_getKataCgroupPathSuffix(t *testing.T) {
 				},
 			},
 			wantCgroupPathSuffix: "",
+			wantSkip:             false,
 			wantErr:              true,
 		},
 		{
@@ -97,6 +104,22 @@ func TestKataContainerFetcher_getKataCgroupPathSuffix(t *testing.T) {
 				},
 			},
 			wantCgroupPathSuffix: "",
+			wantSkip:             true,
+			wantErr:              false,
+		},
+		{
+			name: "Missing runtime type",
+			fields: fields{
+				podUid:      "12345678",
+				containerId: "container1234",
+				containerIdToInfo: map[string]map[string]string{
+					"container1234": {
+						"info": testMissingRuntimeInfo,
+					},
+				},
+			},
+			wantCgroupPathSuffix: "",
+			wantSkip:             false,
 			wantErr:              true,
 		},
 		{
@@ -111,6 +134,7 @@ func TestKataContainerFetcher_getKataCgroupPathSuffix(t *testing.T) {
 				},
 			},
 			wantCgroupPathSuffix: "pod12345678/kata_12345678",
+			wantSkip:             false,
 			wantErr:              false,
 		},
 	}
@@ -123,16 +147,63 @@ func TestKataContainerFetcher_getKataCgroupPathSuffix(t *testing.T) {
 					containerIdToInfo: tt.fields.containerIdToInfo,
 				},
 			}
-			pathSuffix, err := kataContainerFetcher.getKataCgroupPathSuffix(tt.fields.podUid, tt.fields.containerId)
+			pathSuffix, skip, err := kataContainerFetcher.getKataCgroupPathSuffix(tt.fields.podUid, tt.fields.containerId)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("getKataCgroupPathSuffix() error = %v, wantErr %v", err, tt.wantErr)
 				return
+			}
+			if skip != tt.wantSkip {
+				t.Errorf("getKataCgroupPathSuffix() skip = %v, want %v", skip, tt.wantSkip)
 			}
 			if pathSuffix != tt.wantCgroupPathSuffix {
 				t.Errorf("getKataCgroupPathSuffix() pathSuffix = %v, want %v", pathSuffix, tt.wantCgroupPathSuffix)
 			}
 		})
 	}
+}
+
+func TestKataContainerFetcher_getKataCgroupPathSuffixReturnsErrorForNilRuntimePodFetcher(t *testing.T) {
+	kataContainerFetcher := &KataContainerFetcher{}
+
+	pathSuffix, skip, err := kataContainerFetcher.getKataCgroupPathSuffix("pod", "container")
+
+	assert.Empty(t, pathSuffix)
+	assert.False(t, skip)
+	assert.EqualError(t, err, "runtime pod fetcher is nil")
+}
+
+func TestKataContainerFetcher_DefaultMissFallsBackToKataWithNilRuntimePodFetcher(t *testing.T) {
+	RegisterKataContainerFetcher(nil)
+
+	cgroupPath, err := common.GetContainerAbsCgroupPath("cpu", "missing-pod", "missing-container")
+
+	assert.Empty(t, cgroupPath)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "runtime pod fetcher is nil")
+}
+
+func TestKataContainerFetcher_getKataContainerCgroupPathSkipsNonKataRuntime(t *testing.T) {
+	t.Parallel()
+
+	kataContainerFetcher := &KataContainerFetcher{
+		runtimePodFetcher: &runtimePodFetcherStub{
+			containerIdToInfo: map[string]map[string]string{
+				"container1234": {
+					"info": testNonKataJsonInfo,
+				},
+			},
+		},
+	}
+
+	absPath, skip, err := kataContainerFetcher.getKataContainerAbsoluteCgroupPath("cpu", "12345", "container1234")
+	assert.Empty(t, absPath)
+	assert.True(t, skip)
+	assert.NoError(t, err)
+
+	relPath, skip, err := kataContainerFetcher.getKataContainerRelativeCgroupPath("12345", "container1234")
+	assert.Empty(t, relPath)
+	assert.True(t, skip)
+	assert.NoError(t, err)
 }
 
 func TestKataContainerFetcher_getKataContainerAbsoluteCgroupPath(t *testing.T) {
@@ -150,8 +221,9 @@ func TestKataContainerFetcher_getKataContainerAbsoluteCgroupPath(t *testing.T) {
 		},
 	}
 
-	absPath, err := kataContainerFetcher.getKataContainerAbsoluteCgroupPath("cpu", "12345", "123456")
+	absPath, skip, err := kataContainerFetcher.getKataContainerAbsoluteCgroupPath("cpu", "12345", "123456")
 	assert.Equal(t, absPath, "")
+	assert.False(t, skip)
 	assert.NotNil(t, err)
 }
 
@@ -170,7 +242,8 @@ func TestKataContainerFetcher_getKataContainerRelativeCgroupPath(t *testing.T) {
 		},
 	}
 
-	absPath, err := kataContainerFetcher.getKataContainerRelativeCgroupPath("12345", "123456")
+	absPath, skip, err := kataContainerFetcher.getKataContainerRelativeCgroupPath("12345", "123456")
 	assert.Equal(t, absPath, "")
+	assert.False(t, skip)
 	assert.NotNil(t, err)
 }
