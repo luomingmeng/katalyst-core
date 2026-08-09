@@ -141,6 +141,7 @@ struct write_ctx_t {
 struct event_t {
     u64 monotonic_ns;
     u64 requested_bytes;
+    u64 dev;
     u64 inode;
     s64 return_value;
     u32 tgid;
@@ -212,6 +213,7 @@ int trace_cpuset_entry(struct pt_regs *ctx)
 
     event->monotonic_ns = write_ctx->timestamp_ns;
     event->requested_bytes = write_ctx->requested_bytes;
+    event->dev = 0;
     event->inode = 0;
     event->return_value = 0;
     event->tgid = write_ctx->tgid;
@@ -236,6 +238,7 @@ int trace_cpuset_entry(struct pt_regs *ctx)
         (struct kernfs_open_file *)PT_REGS_PARM1(ctx);
     struct file *file = NULL;
     struct inode *inode = NULL;
+    struct super_block *sb = NULL;
     bpf_probe_read_kernel(&file, sizeof(file), &of->file);
     if (file) {
         bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
@@ -246,6 +249,12 @@ int trace_cpuset_entry(struct pt_regs *ctx)
             sizeof(event->inode),
             &inode->i_ino
         );
+        bpf_probe_read_kernel(&sb, sizeof(sb), &inode->i_sb);
+    }
+    if (sb) {
+        dev_t dev = 0;
+        bpf_probe_read_kernel(&dev, sizeof(dev), &sb->s_dev);
+        event->dev = (u64)dev;
     }
 
     const char *kernel_buffer = (const char *)PT_REGS_PARM2(ctx);
@@ -332,6 +341,8 @@ def event_to_dict(
     timestamp,
     event,
     path,
+    observed_fd_path,
+    observed_fd_path_matches,
     user_buffer,
     kernel_buffer,
     return_value,
@@ -345,8 +356,11 @@ def event_to_dict(
         "tid": int(_event_field(event, "tid")),
         "comm": _decode_text(_event_field(event, "comm")),
         "fd": int(_event_field(event, "fd", -1)),
+        "dev": int(_event_field(event, "dev", 0)),
         "inode": int(_event_field(event, "inode", 0)),
         "path": path,
+        "observed_fd_path": observed_fd_path,
+        "observed_fd_path_matches": observed_fd_path_matches,
         "requested_bytes": int(_event_field(event, "requested_bytes", 0)),
         "user_buffer": user_buffer,
         "kernel_buffer": kernel_buffer,
@@ -416,14 +430,18 @@ class EventConsumer:
         bpf,
         args,
         writer,
+        target_dev=None,
         target_inode=None,
+        target_path=None,
         readlink=os.readlink,
         clock=_wall_clock_timestamp,
     ):
         self.bpf = bpf
         self.args = args
         self.writer = writer
+        self.target_dev = target_dev
         self.target_inode = target_inode
+        self.target_path = target_path
         self.readlink = readlink
         self.clock = clock
 
@@ -445,10 +463,21 @@ class EventConsumer:
         if self.args.comm is not None and comm != self.args.comm:
             return
 
-        path = self._resolve_path(event)
+        observed_fd_path = self._resolve_path(event)
         if not self.args.all_cpuset:
-            if int(event.inode) != self.target_inode:
+            if (
+                int(event.dev) != self.target_dev
+                or int(event.inode) != self.target_inode
+            ):
                 return
+            path = self.target_path
+            observed_fd_path_matches = (
+                observed_fd_path is not None
+                and path_matches(observed_fd_path, self.target_path)
+            )
+        else:
+            path = observed_fd_path
+            observed_fd_path_matches = None
 
         stack_table = self.bpf["stack_traces"]
         kernel_stack = symbolize_stack(
@@ -465,6 +494,8 @@ class EventConsumer:
             timestamp=self.clock(),
             event=event,
             path=path,
+            observed_fd_path=observed_fd_path,
+            observed_fd_path_matches=observed_fd_path_matches,
             user_buffer=decode_c_buffer(event.user_buffer),
             kernel_buffer=decode_c_buffer(event.kernel_buffer),
             return_value=event.return_value,
@@ -500,7 +531,9 @@ def run_tracer(
     return_attached = False
     old_handlers = {}
     stopped = [False]
+    target_dev = None
     target_inode = None
+    target_path = None
 
     def stop(signum, frame):
         del signum, frame
@@ -508,7 +541,10 @@ def run_tracer(
 
     try:
         if not args.all_cpuset:
-            target_inode = int(stat_func(args.path).st_ino)
+            target_path = os.path.realpath(args.path)
+            target_stat = stat_func(target_path)
+            target_dev = int(target_stat.st_dev)
+            target_inode = int(target_stat.st_ino)
 
         for signum in (signal.SIGINT, signal.SIGTERM):
             old_handlers[signum] = signal.signal(signum, stop)
@@ -529,7 +565,9 @@ def run_tracer(
             bpf,
             args,
             writer,
+            target_dev=target_dev,
             target_inode=target_inode,
+            target_path=target_path,
         )
         bpf["events"].open_perf_buffer(
             consumer.handle_event,

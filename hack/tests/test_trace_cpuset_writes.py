@@ -48,8 +48,16 @@ class HelperTests(unittest.TestCase):
     def test_event_to_dict_preserves_unresolved_frames(self):
         data = event_to_dict(
             timestamp="2026-08-09T16:00:00+08:00",
-            event={"tgid": 12, "tid": 13, "comm": "agent", "inode": 99},
+            event={
+                "tgid": 12,
+                "tid": 13,
+                "comm": "agent",
+                "dev": 2049,
+                "inode": 99,
+            },
             path="/a/cpuset.cpus",
+            observed_fd_path="/a/cpuset.cpus",
+            observed_fd_path_matches=True,
             user_buffer="1-3",
             kernel_buffer="1-3",
             return_value=4,
@@ -65,8 +73,11 @@ class HelperTests(unittest.TestCase):
                 "tid": 13,
                 "comm": "agent",
                 "fd": -1,
+                "dev": 2049,
                 "inode": 99,
                 "path": "/a/cpuset.cpus",
+                "observed_fd_path": "/a/cpuset.cpus",
+                "observed_fd_path_matches": True,
                 "requested_bytes": 0,
                 "user_buffer": "1-3",
                 "kernel_buffer": "1-3",
@@ -100,6 +111,8 @@ class HelperTests(unittest.TestCase):
             timestamp="2026-08-09T16:00:00+08:00",
             event=event,
             path="/a/cpuset.cpus",
+            observed_fd_path=None,
+            observed_fd_path_matches=False,
             user_buffer="1-3",
             kernel_buffer="1-3",
             return_value=ctypes.c_long(4),
@@ -126,6 +139,8 @@ class HelperTests(unittest.TestCase):
                 "requested_bytes": ctypes.c_size_t(8),
             },
             path="/a/cpuset.cpus",
+            observed_fd_path=None,
+            observed_fd_path_matches=False,
             user_buffer="1-3",
             kernel_buffer="1-3",
             return_value=ctypes.c_long(-1),
@@ -181,6 +196,10 @@ class BPFSourceContractTests(unittest.TestCase):
         self.assertIn("of->file", source)
         self.assertIn("file->f_inode", source)
         self.assertIn("inode->i_ino", source)
+        self.assertIn("inode->i_sb", source)
+        self.assertIn("sb->s_dev", source)
+        self.assertIn("u64 dev;", source)
+        self.assertIn("event->dev", source)
         self.assertIn("event->inode", source)
         self.assertNotIn("BPF_F_REUSE_STACKID", source)
         self.assertIn("stack_traces.get_stackid(ctx, 0)", source)
@@ -386,6 +405,7 @@ class EventConsumerTests(unittest.TestCase):
         tgid = 12
         tid = 13
         fd = 9
+        dev = 2049
         inode = 99
         kernel_stack_id = 1
         user_stack_id = 2
@@ -408,7 +428,9 @@ class EventConsumerTests(unittest.TestCase):
             bpf,
             args,
             writer,
+            target_dev=None if args.all_cpuset else 2049,
             target_inode=None if args.all_cpuset else 99,
+            target_path=None if args.all_cpuset else DEFAULT_TARGET_PATH,
             readlink=mock.Mock(return_value=DEFAULT_TARGET_PATH),
             clock=mock.Mock(return_value="now"),
         )
@@ -424,24 +446,32 @@ class EventConsumerTests(unittest.TestCase):
         consumer.readlink.assert_called_once_with("/proc/12/fd/9")
         record = writer.write.call_args[0][0]
         self.assertEqual(DEFAULT_TARGET_PATH, record["path"])
+        self.assertEqual(DEFAULT_TARGET_PATH, record["observed_fd_path"])
+        self.assertTrue(record["observed_fd_path_matches"])
+        self.assertEqual(2049, record["dev"])
         self.assertEqual(99, record["inode"])
         self.assertEqual("1-3", record["user_buffer"])
         self.assertEqual(["k1"], record["kernel_stack"])
         self.assertEqual(["u2:12"], record["user_stack"])
 
-    def test_applies_pid_comm_and_inode_filters(self):
+    def test_applies_pid_comm_and_device_inode_filters(self):
         cases = [
             {"pid": 99},
             {"comm": "other"},
+            {"dev": 2050},
             {"inode": 100},
         ]
         for case in cases:
             with self.subTest(case=case):
                 overrides = {
-                    key: value for key, value in case.items() if key != "inode"
+                    key: value
+                    for key, value in case.items()
+                    if key not in ("dev", "inode")
                 }
                 consumer, bpf, writer = self.make_consumer(**overrides)
                 event = self.Event()
+                if "dev" in case:
+                    event.dev = case["dev"]
                 if "inode" in case:
                     event.inode = case["inode"]
                 bpf["events"].event.return_value = event
@@ -450,7 +480,7 @@ class EventConsumerTests(unittest.TestCase):
 
                 writer.write.assert_not_called()
 
-    def test_matching_inode_is_authoritative_when_proc_fd_is_reused(self):
+    def test_exact_mode_path_is_authoritative_when_proc_fd_is_reused(self):
         consumer, bpf, writer = self.make_consumer()
         consumer.readlink.return_value = "/other/reused-file"
         bpf["events"].event.return_value = self.Event()
@@ -458,8 +488,11 @@ class EventConsumerTests(unittest.TestCase):
         consumer.handle_event(0, object(), 0)
 
         self.assertEqual(
-            "/other/reused-file", writer.write.call_args[0][0]["path"]
+            DEFAULT_TARGET_PATH, writer.write.call_args[0][0]["path"]
         )
+        record = writer.write.call_args[0][0]
+        self.assertEqual("/other/reused-file", record["observed_fd_path"])
+        self.assertFalse(record["observed_fd_path_matches"])
 
     def test_all_cpuset_emits_when_proc_fd_disappeared(self):
         consumer, bpf, writer = self.make_consumer(all_cpuset=True)
@@ -469,6 +502,12 @@ class EventConsumerTests(unittest.TestCase):
         consumer.handle_event(0, object(), 0)
 
         self.assertIsNone(writer.write.call_args[0][0]["path"])
+        self.assertIsNone(
+            writer.write.call_args[0][0]["observed_fd_path"]
+        )
+        self.assertIsNone(
+            writer.write.call_args[0][0]["observed_fd_path_matches"]
+        )
 
     def test_lost_events_accept_bcc_011_single_argument_callback(self):
         consumer, _, writer = self.make_consumer()
@@ -492,19 +531,23 @@ class EventConsumerTests(unittest.TestCase):
 
 
 class TracerLifecycleTests(unittest.TestCase):
-    def test_stats_target_inode_at_startup(self):
+    def test_stats_realpath_target_device_and_inode_at_startup(self):
         args = create_argument_parser().parse_args(["--duration", "0"])
-        stat_result = mock.Mock(st_ino=12345)
+        stat_result = mock.Mock(st_dev=2049, st_ino=12345)
         stat_func = mock.Mock(return_value=stat_result)
 
-        run_tracer(
-            args,
-            bpf_class=mock.Mock(return_value=mock.MagicMock()),
-            writer=mock.Mock(),
-            stat_func=stat_func,
-        )
+        with mock.patch(
+            "hack.trace_cpuset_writes.os.path.realpath",
+            return_value="/real/cpuset.cpus",
+        ):
+            run_tracer(
+                args,
+                bpf_class=mock.Mock(return_value=mock.MagicMock()),
+                writer=mock.Mock(),
+                stat_func=stat_func,
+            )
 
-        stat_func.assert_called_once_with(DEFAULT_TARGET_PATH)
+        stat_func.assert_called_once_with("/real/cpuset.cpus")
 
     def test_attaches_entry_return_opens_perf_and_closes_in_finally(self):
         args = create_argument_parser().parse_args(
