@@ -48,7 +48,7 @@ class HelperTests(unittest.TestCase):
     def test_event_to_dict_preserves_unresolved_frames(self):
         data = event_to_dict(
             timestamp="2026-08-09T16:00:00+08:00",
-            event={"tgid": 12, "tid": 13, "comm": "agent"},
+            event={"tgid": 12, "tid": 13, "comm": "agent", "inode": 99},
             path="/a/cpuset.cpus",
             user_buffer="1-3",
             kernel_buffer="1-3",
@@ -65,6 +65,7 @@ class HelperTests(unittest.TestCase):
                 "tid": 13,
                 "comm": "agent",
                 "fd": -1,
+                "inode": 99,
                 "path": "/a/cpuset.cpus",
                 "requested_bytes": 0,
                 "user_buffer": "1-3",
@@ -176,6 +177,11 @@ class BPFSourceContractTests(unittest.TestCase):
         self.assertIn("bpf_probe_read_user", source)
         self.assertIn("bpf_probe_read_kernel", source)
         self.assertIn("bpf_get_current_comm", source)
+        self.assertIn("struct kernfs_open_file *of", source)
+        self.assertIn("of->file", source)
+        self.assertIn("file->f_inode", source)
+        self.assertIn("inode->i_ino", source)
+        self.assertIn("event->inode", source)
         self.assertNotIn("BPF_F_REUSE_STACKID", source)
         self.assertIn("stack_traces.get_stackid(ctx, 0)", source)
         self.assertRegex(
@@ -345,6 +351,17 @@ class StackSymbolizationTests(unittest.TestCase):
             symbolize_stack(stack_table, 7, resolve),
         )
 
+    def test_bcc_unknown_symbols_fall_back_to_hex_address(self):
+        for unknown in (b"[unknown]", "[unknown]"):
+            with self.subTest(unknown=unknown):
+                stack_table = mock.Mock()
+                stack_table.walk.return_value = [0x1234]
+
+                self.assertEqual(
+                    ["0x1234"],
+                    symbolize_stack(stack_table, 7, lambda address: unknown),
+                )
+
 
 class JsonlWriterTests(unittest.TestCase):
     def test_writes_compact_sorted_json_to_stdout_and_file(self):
@@ -369,6 +386,7 @@ class EventConsumerTests(unittest.TestCase):
         tgid = 12
         tid = 13
         fd = 9
+        inode = 99
         kernel_stack_id = 1
         user_stack_id = 2
         comm = b"agent"
@@ -390,6 +408,7 @@ class EventConsumerTests(unittest.TestCase):
             bpf,
             args,
             writer,
+            target_inode=None if args.all_cpuset else 99,
             readlink=mock.Mock(return_value=DEFAULT_TARGET_PATH),
             clock=mock.Mock(return_value="now"),
         )
@@ -405,29 +424,42 @@ class EventConsumerTests(unittest.TestCase):
         consumer.readlink.assert_called_once_with("/proc/12/fd/9")
         record = writer.write.call_args[0][0]
         self.assertEqual(DEFAULT_TARGET_PATH, record["path"])
+        self.assertEqual(99, record["inode"])
         self.assertEqual("1-3", record["user_buffer"])
         self.assertEqual(["k1"], record["kernel_stack"])
         self.assertEqual(["u2:12"], record["user_stack"])
 
-    def test_applies_pid_comm_and_exact_path_filters(self):
+    def test_applies_pid_comm_and_inode_filters(self):
         cases = [
             {"pid": 99},
             {"comm": "other"},
-            {"readlink": "/other/cpuset.cpus"},
+            {"inode": 100},
         ]
         for case in cases:
             with self.subTest(case=case):
                 overrides = {
-                    key: value for key, value in case.items() if key != "readlink"
+                    key: value for key, value in case.items() if key != "inode"
                 }
                 consumer, bpf, writer = self.make_consumer(**overrides)
-                if "readlink" in case:
-                    consumer.readlink.return_value = case["readlink"]
-                bpf["events"].event.return_value = self.Event()
+                event = self.Event()
+                if "inode" in case:
+                    event.inode = case["inode"]
+                bpf["events"].event.return_value = event
 
                 consumer.handle_event(0, object(), 0)
 
                 writer.write.assert_not_called()
+
+    def test_matching_inode_is_authoritative_when_proc_fd_is_reused(self):
+        consumer, bpf, writer = self.make_consumer()
+        consumer.readlink.return_value = "/other/reused-file"
+        bpf["events"].event.return_value = self.Event()
+
+        consumer.handle_event(0, object(), 0)
+
+        self.assertEqual(
+            "/other/reused-file", writer.write.call_args[0][0]["path"]
+        )
 
     def test_all_cpuset_emits_when_proc_fd_disappeared(self):
         consumer, bpf, writer = self.make_consumer(all_cpuset=True)
@@ -438,7 +470,17 @@ class EventConsumerTests(unittest.TestCase):
 
         self.assertIsNone(writer.write.call_args[0][0]["path"])
 
-    def test_lost_events_are_json_records(self):
+    def test_lost_events_accept_bcc_011_single_argument_callback(self):
+        consumer, _, writer = self.make_consumer()
+
+        consumer.handle_lost(17)
+
+        self.assertEqual(
+            {"event_type": "lost", "lost": 17},
+            writer.write.call_args[0][0],
+        )
+
+    def test_lost_events_accept_new_bcc_two_argument_callback(self):
         consumer, _, writer = self.make_consumer()
 
         consumer.handle_lost(3, 17)
@@ -450,8 +492,24 @@ class EventConsumerTests(unittest.TestCase):
 
 
 class TracerLifecycleTests(unittest.TestCase):
-    def test_attaches_entry_return_opens_perf_and_closes_in_finally(self):
+    def test_stats_target_inode_at_startup(self):
         args = create_argument_parser().parse_args(["--duration", "0"])
+        stat_result = mock.Mock(st_ino=12345)
+        stat_func = mock.Mock(return_value=stat_result)
+
+        run_tracer(
+            args,
+            bpf_class=mock.Mock(return_value=mock.MagicMock()),
+            writer=mock.Mock(),
+            stat_func=stat_func,
+        )
+
+        stat_func.assert_called_once_with(DEFAULT_TARGET_PATH)
+
+    def test_attaches_entry_return_opens_perf_and_closes_in_finally(self):
+        args = create_argument_parser().parse_args(
+            ["--duration", "0", "--all-cpuset"]
+        )
         bpf = mock.MagicMock()
         bpf_class = mock.Mock(return_value=bpf)
         writer = mock.Mock()
@@ -473,7 +531,9 @@ class TracerLifecycleTests(unittest.TestCase):
         writer.close.assert_called_once_with()
 
     def test_poll_failure_still_closes_writer_and_detaches(self):
-        args = create_argument_parser().parse_args(["--duration", "1"])
+        args = create_argument_parser().parse_args(
+            ["--duration", "1", "--all-cpuset"]
+        )
         bpf = mock.MagicMock()
         bpf.perf_buffer_poll.side_effect = RuntimeError("poll failed")
         writer = mock.Mock()
@@ -490,8 +550,27 @@ class TracerLifecycleTests(unittest.TestCase):
         bpf.detach_kprobe.assert_called_once()
         writer.close.assert_called_once_with()
 
+    def test_large_finite_duration_clamps_before_millisecond_conversion(self):
+        args = create_argument_parser().parse_args(
+            ["--duration", "1e307", "--all-cpuset"]
+        )
+        bpf = mock.MagicMock()
+        bpf.perf_buffer_poll.side_effect = RuntimeError("stop")
+
+        with self.assertRaisesRegex(RuntimeError, "stop"):
+            run_tracer(
+                args,
+                bpf_class=mock.Mock(return_value=bpf),
+                writer=mock.Mock(),
+                monotonic=mock.Mock(side_effect=[0.0, 0.0]),
+            )
+
+        bpf.perf_buffer_poll.assert_called_once_with(timeout=100)
+
     def test_detach_failure_still_closes_writer(self):
-        args = create_argument_parser().parse_args(["--duration", "0"])
+        args = create_argument_parser().parse_args(
+            ["--duration", "0", "--all-cpuset"]
+        )
         bpf = mock.MagicMock()
         bpf.detach_kretprobe.side_effect = RuntimeError("detach failed")
         writer = mock.Mock()
@@ -506,7 +585,9 @@ class TracerLifecycleTests(unittest.TestCase):
         writer.close.assert_called_once_with()
 
     def test_installs_sigint_and_sigterm_handlers(self):
-        args = create_argument_parser().parse_args(["--duration", "0"])
+        args = create_argument_parser().parse_args(
+            ["--duration", "0", "--all-cpuset"]
+        )
         with mock.patch(
             "hack.trace_cpuset_writes.signal.signal"
         ) as install_signal:

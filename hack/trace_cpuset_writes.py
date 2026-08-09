@@ -122,6 +122,8 @@ def build_bpf_source(tgid=None):
 
     source = r"""
 #include <uapi/linux/ptrace.h>
+#include <linux/fs.h>
+#include <linux/kernfs.h>
 #include <linux/sched.h>
 
 #define MAX_CAPTURE 256
@@ -139,6 +141,7 @@ struct write_ctx_t {
 struct event_t {
     u64 monotonic_ns;
     u64 requested_bytes;
+    u64 inode;
     s64 return_value;
     u32 tgid;
     u32 tid;
@@ -209,6 +212,7 @@ int trace_cpuset_entry(struct pt_regs *ctx)
 
     event->monotonic_ns = write_ctx->timestamp_ns;
     event->requested_bytes = write_ctx->requested_bytes;
+    event->inode = 0;
     event->return_value = 0;
     event->tgid = write_ctx->tgid;
     event->tid = write_ctx->tid;
@@ -227,6 +231,22 @@ int trace_cpuset_entry(struct pt_regs *ctx)
         sizeof(event->user_buffer)
     );
     __builtin_memset(event->kernel_buffer, 0, sizeof(event->kernel_buffer));
+
+    struct kernfs_open_file *of =
+        (struct kernfs_open_file *)PT_REGS_PARM1(ctx);
+    struct file *file = NULL;
+    struct inode *inode = NULL;
+    bpf_probe_read_kernel(&file, sizeof(file), &of->file);
+    if (file) {
+        bpf_probe_read_kernel(&inode, sizeof(inode), &file->f_inode);
+    }
+    if (inode) {
+        bpf_probe_read_kernel(
+            &event->inode,
+            sizeof(event->inode),
+            &inode->i_ino
+        );
+    }
 
     const char *kernel_buffer = (const char *)PT_REGS_PARM2(ctx);
     u64 kernel_size = (u64)PT_REGS_PARM3(ctx);
@@ -325,6 +345,7 @@ def event_to_dict(
         "tid": int(_event_field(event, "tid")),
         "comm": _decode_text(_event_field(event, "comm")),
         "fd": int(_event_field(event, "fd", -1)),
+        "inode": int(_event_field(event, "inode", 0)),
         "path": path,
         "requested_bytes": int(_event_field(event, "requested_bytes", 0)),
         "user_buffer": user_buffer,
@@ -345,7 +366,7 @@ def symbolize_stack(stack_table, stack_id, resolver):
         addresses = stack_table.walk(stack_id)
         for address in addresses:
             symbol = resolver(address)
-            if symbol:
+            if symbol and _decode_text(symbol) != "[unknown]":
                 frames.append(_decode_text(symbol))
             else:
                 frames.append("0x%x" % address)
@@ -395,12 +416,14 @@ class EventConsumer:
         bpf,
         args,
         writer,
+        target_inode=None,
         readlink=os.readlink,
         clock=_wall_clock_timestamp,
     ):
         self.bpf = bpf
         self.args = args
         self.writer = writer
+        self.target_inode = target_inode
         self.readlink = readlink
         self.clock = clock
 
@@ -424,7 +447,7 @@ class EventConsumer:
 
         path = self._resolve_path(event)
         if not self.args.all_cpuset:
-            if path is None or not path_matches(path, self.args.path):
+            if int(event.inode) != self.target_inode:
                 return
 
         stack_table = self.bpf["stack_traces"]
@@ -450,14 +473,14 @@ class EventConsumer:
         )
         self.writer.write(record)
 
-    def handle_lost(self, cpu, lost):
-        self.writer.write(
-            {
-                "event_type": "lost",
-                "cpu": int(cpu),
-                "lost": int(lost),
-            }
-        )
+    def handle_lost(self, *args):
+        record = {
+            "event_type": "lost",
+            "lost": int(args[-1]),
+        }
+        if len(args) > 1:
+            record["cpu"] = int(args[-2])
+        self.writer.write(record)
 
 
 def run_tracer(
@@ -465,6 +488,7 @@ def run_tracer(
     bpf_class=None,
     writer=None,
     monotonic=time.monotonic,
+    stat_func=os.stat,
 ):
     if bpf_class is None:
         bpf_class = _load_bpf_class()
@@ -476,12 +500,16 @@ def run_tracer(
     return_attached = False
     old_handlers = {}
     stopped = [False]
+    target_inode = None
 
     def stop(signum, frame):
         del signum, frame
         stopped[0] = True
 
     try:
+        if not args.all_cpuset:
+            target_inode = int(stat_func(args.path).st_ino)
+
         for signum in (signal.SIGINT, signal.SIGTERM):
             old_handlers[signum] = signal.signal(signum, stop)
 
@@ -497,7 +525,12 @@ def run_tracer(
         )
         return_attached = True
 
-        consumer = EventConsumer(bpf, args, writer)
+        consumer = EventConsumer(
+            bpf,
+            args,
+            writer,
+            target_inode=target_inode,
+        )
         bpf["events"].open_perf_buffer(
             consumer.handle_event,
             lost_cb=consumer.handle_lost,
@@ -508,8 +541,9 @@ def run_tracer(
             now = monotonic()
             if now >= deadline:
                 break
-            remaining_ms = max(1, int((deadline - now) * 1000))
-            bpf.perf_buffer_poll(timeout=min(100, remaining_ms))
+            remaining = min(0.1, deadline - now)
+            remaining_ms = max(1, int(remaining * 1000))
+            bpf.perf_buffer_poll(timeout=remaining_ms)
     finally:
         try:
             try:
