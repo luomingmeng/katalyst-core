@@ -1712,22 +1712,12 @@ func (p *DynamicPolicy) validateOwnedPoolsQuantity(
 				continue
 			}
 			poolName := allocationInfo.OwnerPoolName
-			if poolName == commonstate.EmptyOwnerPoolName && allocationInfo.CheckSharedNUMABinding() {
+			if allocationInfo.CheckSharedNUMABinding() {
 				var err error
-				poolName, err = allocationInfo.GetSpecifiedNUMABindingPoolName()
+				poolName, _, err = state.GetCanonicalSharedNUMABindingPoolKey(
+					numaResourcePackagePinnedCPUSet, allocationInfo)
 				if err != nil {
 					continue
-				}
-
-				pkgName := allocationInfo.GetResourcePackageName()
-				if pkgName != "" {
-					numaID, err := allocationInfo.GetSpecifiedNUMABindingNUMAID()
-					if err != nil {
-						continue
-					}
-					if !numaResourcePackagePinnedCPUSet[numaID][pkgName].IsEmpty() {
-						poolName = rputil.WrapOwnerPoolName(poolName, pkgName)
-					}
 				}
 			}
 			if poolName != commonstate.EmptyOwnerPoolName {

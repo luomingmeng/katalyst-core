@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -1928,6 +1929,21 @@ func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorRejectsPinnedSNBPoolShrinkA
 		pinnedPoolName: {0: 4},
 	}, quantities)
 
+	alreadyWrapped := allocation.Clone()
+	alreadyWrapped.OwnerPoolName = pinnedPoolName
+	alreadyWrapped.AllocationResult = pinnedCPUs.Clone()
+	alreadyWrapped.TopologyAwareAssignments = map[int]machine.CPUSet{0: pinnedCPUs.Clone()}
+	alreadyWrappedQuantities := make(map[string]map[int]int)
+	require.NoError(t, state.CountAllocationInfosToPoolsQuantityMap(
+		machineState.GetNUMAResourcePackagePinnedCPUSet(),
+		[]*state.AllocationInfo{alreadyWrapped},
+		alreadyWrappedQuantities,
+		p.getContainerRequestedCores,
+	))
+	require.Equal(t, map[string]map[int]int{
+		pinnedPoolName: {0: 4},
+	}, alreadyWrappedQuantities)
+
 	initialEntries := p.state.GetPodEntries()
 	initialMachineState := p.state.GetMachineState()
 	initialRevision := p.state.GetRevision()
@@ -1948,6 +1964,81 @@ func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorRejectsPinnedSNBPoolShrinkA
 	require.Equal(t, initialEntries, p.state.GetPodEntries())
 	require.Equal(t, initialMachineState, p.state.GetMachineState())
 	require.Equal(t, initialRevision, p.state.GetRevision())
+}
+
+func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorRejectsBareOwnedPinnedSNBPoolShrinkAtomically(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+
+	const resourcePackageName = "pinned-package"
+	numaCPUs := topology.CPUDetails.CPUsInNUMANodes(0).ToSliceInt()
+	require.Len(t, numaCPUs, 8)
+	pinnedCPUs := machine.NewCPUSet(numaCPUs[:4]...)
+	machineState := p.state.GetMachineState()
+	machineState[0].ResourcePackageStates = map[string]*state.ResourcePackageState{
+		resourcePackageName: {PinnedCPUSet: pinnedCPUs},
+	}
+	p.state.SetMachineState(machineState, false)
+
+	allocation := &state.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        "bare-owned-pinned-snb-ramp-up",
+			PodNamespace:  "default",
+			PodName:       "bare-owned-pinned-snb-ramp-up",
+			ContainerName: "main",
+			OwnerPoolName: "share-NUMA0",
+			QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+			Annotations: map[string]string{
+				apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+				apiconsts.PodAnnotationResourcePackageKey:           resourcePackageName,
+			},
+		},
+		RampUp:                   true,
+		RequestQuantity:          2,
+		AllocationResult:         pinnedCPUs.Clone(),
+		TopologyAwareAssignments: map[int]machine.CPUSet{0: pinnedCPUs.Clone()},
+	}
+	allocation.SetSpecifiedNUMABindingNUMAID([]uint64{0})
+	p.state.SetAllocationInfo(allocation.PodUid, allocation.ContainerName, allocation, false)
+
+	quantities := make(map[string]map[int]int)
+	require.NoError(t, state.CountAllocationInfosToPoolsQuantityMap(
+		machineState.GetNUMAResourcePackagePinnedCPUSet(),
+		[]*state.AllocationInfo{allocation},
+		quantities,
+		p.getContainerRequestedCores,
+	))
+	pinnedPoolName := rputil.WrapOwnerPoolName(allocation.OwnerPoolName, resourcePackageName)
+	require.Equal(t, map[string]map[int]int{
+		pinnedPoolName: {0: 4},
+	}, quantities)
+
+	initialEntries := p.state.GetPodEntries()
+	initialMachineState := p.state.GetMachineState()
+	initialRevision := p.state.GetRevision()
+	floor := machine.NewCPUSet(numaCPUs[:2]...)
+
+	err = p.adjustPoolsAndIsolatedEntriesWithRampUpFloor(
+		quantities,
+		nil,
+		initialEntries,
+		initialMachineState,
+		false,
+		floor,
+		false,
+	)
+	assert.ErrorContains(t, err,
+		`insufficient capacity for owned pool "`+strings.ToLower(pinnedPoolName)+`" in numa 0: requested 4 cpus, allocated 2`)
+	assert.Equal(t, initialEntries, p.state.GetPodEntries())
+	assert.Equal(t, initialMachineState, p.state.GetMachineState())
+	assert.Equal(t, initialRevision, p.state.GetRevision())
 }
 
 func TestAdjustAllocationEntriesWithRampUpFloorKeepsHardFloorCapacityErrorLowercase(t *testing.T) {
