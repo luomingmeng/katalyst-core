@@ -114,6 +114,23 @@ func TestGenerateBlockCPUSetDisjointPlannerRequiresCapability(t *testing.T) {
 	require.Empty(t, got)
 }
 
+func TestGenerateBlockCPUSetHardPartitionRejectsLegacyResponse(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+
+	got, err := policy.generateBlockCPUSet(&advisorapi.ListAndWatchResponse{
+		DisableDedicatedCoresOverlapReclaimedCores: false,
+		Entries: map[string]*advisorapi.CalculationEntries{},
+	}, nil)
+	require.Nil(t, got)
+	require.EqualError(t, err, "hard-partition reclaim requires negotiated disjoint advisor planning")
+}
+
 func TestGenerateBlockCPUSetDisjointPlannerUsesJointRPEligibility(t *testing.T) {
 	t.Parallel()
 

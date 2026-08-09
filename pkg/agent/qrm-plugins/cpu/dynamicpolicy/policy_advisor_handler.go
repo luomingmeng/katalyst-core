@@ -1343,6 +1343,9 @@ func (p *DynamicPolicy) generateBlockCPUSet(
 		return nil, fmt.Errorf("got nil resp")
 	}
 	if !resp.DisableDedicatedCoresOverlapReclaimedCores {
+		if p.isRampUpReclaimHardPartitionEnabled() {
+			return nil, fmt.Errorf("hard-partition reclaim requires negotiated disjoint advisor planning")
+		}
 		return p.generateLegacyBlockCPUSet(resp)
 	}
 
