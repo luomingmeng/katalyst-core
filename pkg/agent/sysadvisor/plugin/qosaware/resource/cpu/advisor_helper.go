@@ -211,9 +211,17 @@ func hardPartitionMinimumReclaimCores(configuredReserve, numaCount int) int {
 	return general.Max(configuredReserve, numaCount*2)
 }
 
+// Keep this fallback aligned with QRM's default reservedReclaimedCPUsSize.
+const defaultReservedReclaimedCPUsSize = 4
+
 func (cra *cpuResourceAdvisor) updateReservedForReclaim() error {
 	dynamicConf := cra.conf.GetDynamicConfiguration()
-	if dynamicConf != nil && dynamicConf.EnableRampUpReclaimHardPartition {
+	if dynamicConf == nil {
+		cra.reservedForReclaim = nil
+		return fmt.Errorf("dynamic configuration is nil")
+	}
+
+	if dynamicConf.EnableRampUpReclaimHardPartition {
 		if len(cra.numaAvailable) != cra.metaServer.NumNUMANodes {
 			cra.reservedForReclaim = nil
 			return fmt.Errorf("NUMA availability is incomplete: got %d entries, want %d", len(cra.numaAvailable), cra.metaServer.NumNUMANodes)
@@ -228,8 +236,10 @@ func (cra *cpuResourceAdvisor) updateReservedForReclaim() error {
 			}
 			totalAvailable += available
 		}
-		configuredReserveQuantity := dynamicConf.MinReclaimedResourceForAllocate[v1.ResourceCPU]
-		configuredReserve := int(configuredReserveQuantity.Value())
+		configuredReserve := defaultReservedReclaimedCPUsSize
+		if configuredReserveQuantity, ok := dynamicConf.MinReclaimedResourceForAllocate[v1.ResourceCPU]; ok {
+			configuredReserve = int(configuredReserveQuantity.Value())
+		}
 		minimum := hardPartitionMinimumReclaimCores(configuredReserve, len(cra.numaAvailable))
 		numReservedCores := machine.CalculateGlobalRampUpReclaimTarget(
 			totalAvailable, dynamicConf.InitialRampUpReclaimCPUSetRatio, minimum)
@@ -243,14 +253,14 @@ func (cra *cpuResourceAdvisor) updateReservedForReclaim() error {
 		return nil
 	}
 
-	numaReservedRatio := cra.conf.GetDynamicConfiguration().NumaMinReclaimedResourceRatioForAllocate[v1.ResourceCPU]
+	numaReservedRatio := dynamicConf.NumaMinReclaimedResourceRatioForAllocate[v1.ResourceCPU]
 	if numaReservedRatio.Value() != 0 {
-		numaReserved := cra.conf.GetDynamicConfiguration().NumaMinReclaimedResourceForAllocate[v1.ResourceCPU]
+		numaReserved := dynamicConf.NumaMinReclaimedResourceForAllocate[v1.ResourceCPU]
 		cra.updateReservedForReclaimByNuma(numaReservedRatio, numaReserved)
 		return nil
 	}
 
-	coreNumReservedForReclaim := cra.conf.GetDynamicConfiguration().MinReclaimedResourceForAllocate[v1.ResourceCPU]
+	coreNumReservedForReclaim := dynamicConf.MinReclaimedResourceForAllocate[v1.ResourceCPU]
 	if coreNumReservedForReclaim.Value() > int64(cra.metaServer.NumCPUs) {
 		coreNumReservedForReclaim.Set(int64(cra.metaServer.NumCPUs))
 	}
