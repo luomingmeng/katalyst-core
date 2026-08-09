@@ -169,6 +169,18 @@ func TestValidateHardPartitionReclaimDistribution(t *testing.T) {
 			wantErr:  "NUMA 1 has 1 CPUs, minimum is 2",
 		},
 		{
+			name:     "eligible missing physical NUMA",
+			reclaim:  machine.NewCPUSet(0, 1),
+			eligible: machine.NewCPUSet(0, 1, 2, 3),
+			wantErr:  "NUMA 1 has 0 CPUs, minimum is 2",
+		},
+		{
+			name:     "empty eligible",
+			reclaim:  machine.NewCPUSet(),
+			eligible: machine.NewCPUSet(),
+			wantErr:  "NUMA 0 has 0 CPUs, minimum is 2",
+		},
+		{
 			name:     "outside eligible",
 			reclaim:  machine.NewCPUSet(0, 1, 3, 4, 5),
 			eligible: machine.NewCPUSet(0, 1, 2, 4, 5, 6, 7),
