@@ -159,8 +159,8 @@ func (cra *cpuResourceAdvisor) initializeHeadroomAssembler() error {
 
 // updateNumasAvailableResource updates available resource of all numa nodes.
 // available = total - reserved pool - forbidden pool
-func (cra *cpuResourceAdvisor) updateNumasAvailableResource() {
-	cra.numaAvailable = make(map[int]int)
+func (cra *cpuResourceAdvisor) updateNumasAvailableResource() error {
+	numaAvailable := make(map[int]int)
 	reservePoolInfo, _ := cra.metaCache.GetPoolInfo(commonstate.PoolNameReserve)
 
 	forbiddenCPUsMap := make(map[int]int)
@@ -177,8 +177,6 @@ func (cra *cpuResourceAdvisor) updateNumasAvailableResource() {
 		return true
 	})
 
-	cra.updateReservedForReclaim()
-
 	for id := 0; id < cra.metaServer.NumNUMANodes; id++ {
 		reservePoolNuma := 0
 		if cpuset, ok := reservePoolInfo.TopologyAwareAssignments[id]; ok {
@@ -188,13 +186,22 @@ func (cra *cpuResourceAdvisor) updateNumasAvailableResource() {
 		if v, ok := forbiddenCPUsMap[id]; ok {
 			forbiddenPoolNuma = v
 		}
-		cra.numaAvailable[id] = cra.metaServer.NUMAToCPUs.CPUSizeInNUMAs(id) - reservePoolNuma - forbiddenPoolNuma
+		numaAvailable[id] = cra.metaServer.NUMAToCPUs.CPUSizeInNUMAs(id) - reservePoolNuma - forbiddenPoolNuma
 	}
 
 	dynamicConf := cra.conf.GetDynamicConfiguration()
 	if dynamicConf != nil && dynamicConf.EnableRampUpReclaimHardPartition {
-		cra.updateReservedForReclaim()
+		for id := 0; id < cra.metaServer.NumNUMANodes; id++ {
+			if numaAvailable[id] < 2 {
+				cra.numaAvailable = numaAvailable
+				cra.reservedForReclaim = nil
+				return fmt.Errorf("NUMA %d has %d available CPUs, requires at least 2", id, numaAvailable[id])
+			}
+		}
 	}
+
+	cra.numaAvailable = numaAvailable
+	return cra.updateReservedForReclaim()
 }
 
 func hardPartitionReservedReclaimCores(ratioReserved, numaCount int) int {
@@ -204,25 +211,35 @@ func hardPartitionReservedReclaimCores(ratioReserved, numaCount int) int {
 	return general.Max(ratioReserved, numaCount*2)
 }
 
-func (cra *cpuResourceAdvisor) updateReservedForReclaim() {
+func (cra *cpuResourceAdvisor) updateReservedForReclaim() error {
 	dynamicConf := cra.conf.GetDynamicConfiguration()
-	if dynamicConf != nil && dynamicConf.EnableRampUpReclaimHardPartition && len(cra.numaAvailable) > 0 {
+	if dynamicConf != nil && dynamicConf.EnableRampUpReclaimHardPartition {
+		if len(cra.numaAvailable) != cra.metaServer.NumNUMANodes {
+			cra.reservedForReclaim = nil
+			return fmt.Errorf("NUMA availability is incomplete: got %d entries, want %d", len(cra.numaAvailable), cra.metaServer.NumNUMANodes)
+		}
+
 		totalAvailable := 0
-		for _, available := range cra.numaAvailable {
+		for id := 0; id < cra.metaServer.NumNUMANodes; id++ {
+			available := cra.numaAvailable[id]
+			if available < 2 {
+				cra.reservedForReclaim = nil
+				return fmt.Errorf("NUMA %d has %d available CPUs, requires at least 2", id, available)
+			}
 			totalAvailable += available
 		}
 		ratioReserved := int(float64(totalAvailable) * dynamicConf.InitialRampUpReclaimCPUSetRatio)
 		numReservedCores := hardPartitionReservedReclaimCores(ratioReserved, len(cra.numaAvailable))
 		cra.reservedForReclaim = machine.GetCoreNumReservedForReclaim(numReservedCores, len(cra.numaAvailable))
 		general.Infof("reservedForReclaim: %v, ratioReserved %v", cra.reservedForReclaim, ratioReserved)
-		return
+		return nil
 	}
 
 	numaReservedRatio := cra.conf.GetDynamicConfiguration().NumaMinReclaimedResourceRatioForAllocate[v1.ResourceCPU]
 	if numaReservedRatio.Value() != 0 {
 		numaReserved := cra.conf.GetDynamicConfiguration().NumaMinReclaimedResourceForAllocate[v1.ResourceCPU]
 		cra.updateReservedForReclaimByNuma(numaReservedRatio, numaReserved)
-		return
+		return nil
 	}
 
 	coreNumReservedForReclaim := cra.conf.GetDynamicConfiguration().MinReclaimedResourceForAllocate[v1.ResourceCPU]
@@ -236,6 +253,7 @@ func (cra *cpuResourceAdvisor) updateReservedForReclaim() {
 	}
 	cra.reservedForReclaim = machine.GetCoreNumReservedForReclaim(int(coreNumReservedForReclaim.Value()), cra.metaServer.NumNUMANodes)
 	general.Infof("reservedForReclaim: %v, coreNumReservedForReclaim %v", cra.reservedForReclaim, coreNumReservedForReclaim.Value())
+	return nil
 }
 
 func (cra *cpuResourceAdvisor) updateReservedForReclaimByNuma(numaReservedRatio resource.Quantity,

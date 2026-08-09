@@ -139,7 +139,12 @@ func NewCPUResourceAdvisor(conf *config.Configuration, extraConf interface{}, me
 		emitter:    emitter,
 	}
 
-	cra.updateReservedForReclaim()
+	dynamicConf := conf.GetDynamicConfiguration()
+	if dynamicConf == nil || !dynamicConf.EnableRampUpReclaimHardPartition {
+		if err := cra.updateReservedForReclaim(); err != nil {
+			klog.Errorf("[qosaware-cpu] initialize reserved resource for reclaim failed: %v", err)
+		}
+	}
 
 	if err := cra.initializeProvisionAssembler(); err != nil {
 		klog.Errorf("[qosaware-cpu] initialize provision assembler failed: %v", err)
@@ -234,7 +239,10 @@ func (cra *cpuResourceAdvisor) updateWithIsolationGuardian(tryIsolation bool) (
 		return nil, fmt.Errorf("reserve pool does not exist")
 	}
 
-	cra.updateNumasAvailableResource()
+	if err := cra.updateNumasAvailableResource(); err != nil {
+		klog.Errorf("[qosaware-cpu] update NUMA available resource failed: %v", err)
+		return nil, fmt.Errorf("failed to update NUMA available resource: %w", err)
+	}
 	isolationExists := cra.setIsolatedContainers(tryIsolation)
 
 	// assign containers to regions
