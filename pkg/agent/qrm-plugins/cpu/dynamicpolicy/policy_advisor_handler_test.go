@@ -88,6 +88,131 @@ func TestValidateDedicatedReclaimDisjointTransport(t *testing.T) {
 	require.NoError(t, validateDedicatedReclaimDisjointTransport(req, resp, featureGates))
 }
 
+func TestAllocateByCPUAdvisorLegacyHardReclaimAliases(t *testing.T) {
+	t.Parallel()
+
+	newPolicyAndResponse := func(t *testing.T, includeMandatory bool) (*DynamicPolicy, *advisorapi.ListAndWatchResponse) {
+		t.Helper()
+
+		topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+		require.NoError(t, err)
+		policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+		require.NoError(t, err)
+		policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+
+		numa0CPU := topology.CPUDetails.CPUsInNUMANodes(0).ToSliceInt()[0]
+		numa1CPU := topology.CPUDetails.CPUsInNUMANodes(1).ToSliceInt()[0]
+		policy.state.SetPodEntries(state.PodEntries{
+			"dedicated-0": {
+				"main": &state.AllocationInfo{
+					AllocationMeta: commonstate.AllocationMeta{
+						PodUid:        "dedicated-0",
+						ContainerName: "main",
+						OwnerPoolName: commonstate.PoolNameDedicated,
+						QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+					},
+					AllocationResult: machine.NewCPUSet(numa0CPU),
+					TopologyAwareAssignments: map[int]machine.CPUSet{
+						0: machine.NewCPUSet(numa0CPU),
+					},
+				},
+			},
+			"dedicated-1": {
+				"main": &state.AllocationInfo{
+					AllocationMeta: commonstate.AllocationMeta{
+						PodUid:        "dedicated-1",
+						ContainerName: "main",
+						OwnerPoolName: commonstate.PoolNameDedicated,
+						QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+					},
+					AllocationResult: machine.NewCPUSet(numa1CPU),
+					TopologyAwareAssignments: map[int]machine.CPUSet{
+						1: machine.NewCPUSet(numa1CPU),
+					},
+				},
+			},
+		}, false)
+		machineState, err := state.GenerateMachineStateFromPodEntries(
+			topology, policy.state.GetPodEntries(), policy.state.GetMachineState())
+		require.NoError(t, err)
+		policy.state.SetMachineState(machineState, false)
+
+		overlapTarget := []*advisorapi.OverlapTarget{{
+			OverlapTargetPoolName: commonstate.PoolNameDedicated,
+			OverlapType:           advisorapi.OverlapType_OverlapWithPool,
+		}}
+		reclaimResults := map[int64]*advisorapi.NumaCalculationResult{
+			0: {Blocks: []*advisorapi.Block{{
+				BlockId: "legacy-alias-0", Result: 1, OverlapTargets: overlapTarget,
+			}}},
+			1: {Blocks: []*advisorapi.Block{{
+				BlockId: "legacy-alias-1", Result: 1, OverlapTargets: overlapTarget,
+			}}},
+		}
+		if includeMandatory {
+			reclaimResults[commonstate.FakedNUMAID] = &advisorapi.NumaCalculationResult{
+				Blocks: []*advisorapi.Block{{BlockId: "mandatory-reclaim", Result: 4}},
+			}
+		}
+
+		return policy, &advisorapi.ListAndWatchResponse{
+			AllowSharedCoresOverlapReclaimedCores:      true,
+			DisableDedicatedCoresOverlapReclaimedCores: false,
+			Entries: map[string]*advisorapi.CalculationEntries{
+				"dedicated-0": {
+					Entries: map[string]*advisorapi.CalculationInfo{
+						"main": {
+							OwnerPoolName: commonstate.PoolNameDedicated,
+							CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+								0: {Blocks: []*advisorapi.Block{{BlockId: "legacy-alias-0", Result: 1}}},
+							},
+						},
+					},
+				},
+				"dedicated-1": {
+					Entries: map[string]*advisorapi.CalculationInfo{
+						"main": {
+							OwnerPoolName: commonstate.PoolNameDedicated,
+							CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+								1: {Blocks: []*advisorapi.Block{{BlockId: "legacy-alias-1", Result: 1}}},
+							},
+						},
+					},
+				},
+				commonstate.PoolNameReclaim: {
+					Entries: map[string]*advisorapi.CalculationInfo{
+						commonstate.FakedContainerName: {
+							OwnerPoolName:             commonstate.PoolNameReclaim,
+							CalculationResultsByNumas: reclaimResults,
+						},
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("mandatory reclaim ignores legal overlap aliases and stays balanced", func(t *testing.T) {
+		policy, resp := newPolicyAndResponse(t, true)
+		require.NoError(t, policy.allocateByCPUAdvisor(nil, resp, nil))
+
+		reclaim := policy.state.GetAllocationInfo(
+			commonstate.PoolNameReclaim, commonstate.FakedContainerName).AllocationResult
+		for numaID := 0; numaID < 2; numaID++ {
+			require.Equal(t, 3, reclaim.Intersection(
+				policy.machineInfo.CPUDetails.CPUsInNUMANodes(numaID)).Size())
+		}
+	})
+
+	t.Run("overlap only fails closed without mandatory reclaim", func(t *testing.T) {
+		policy, resp := newPolicyAndResponse(t, false)
+		revision := policy.state.GetRevision()
+
+		err := policy.allocateByCPUAdvisor(nil, resp, nil)
+		require.ErrorContains(t, err, "hard-partition reclaim NUMA 0 has 0 CPUs, minimum is 2")
+		require.Equal(t, revision, policy.state.GetRevision())
+	})
+}
+
 func TestGenerateBlockCPUSetDisjointPlannerRequiresCapability(t *testing.T) {
 	t.Parallel()
 
