@@ -286,3 +286,93 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimHardPartitionCapacity(t *test
 		})
 	}
 }
+
+func TestCPUResourceAdvisorUpdateReservedForReclaimFallbacks(t *testing.T) {
+	t.Parallel()
+
+	t.Run("hard partition single NUMA missing CPU key uses QRM default", func(t *testing.T) {
+		t.Parallel()
+
+		conf := generateTestConfiguration(t, t.TempDir(), t.TempDir())
+		dynamicConf := conf.GetDynamicConfiguration()
+		dynamicConf.EnableRampUpReclaimHardPartition = true
+		dynamicConf.MinReclaimedResourceForAllocate = v1.ResourceList{}
+
+		cra := &cpuResourceAdvisor{
+			conf: conf,
+			metaServer: &metaserver.MetaServer{
+				MetaAgent: &agent.MetaAgent{
+					KatalystMachineInfo: &machine.KatalystMachineInfo{
+						CPUTopology: &machine.CPUTopology{NumNUMANodes: 1},
+					},
+				},
+			},
+			numaAvailable: map[int]int{0: 8},
+		}
+
+		require.NoError(t, cra.updateReservedForReclaim())
+		assert.Equal(t, map[int]int{0: 4}, cra.reservedForReclaim)
+	})
+
+	t.Run("hard partition two NUMAs missing CPU key uses QRM default", func(t *testing.T) {
+		t.Parallel()
+
+		conf := generateTestConfiguration(t, t.TempDir(), t.TempDir())
+		dynamicConf := conf.GetDynamicConfiguration()
+		dynamicConf.EnableRampUpReclaimHardPartition = true
+		dynamicConf.MinReclaimedResourceForAllocate = v1.ResourceList{}
+
+		cra := &cpuResourceAdvisor{
+			conf: conf,
+			metaServer: &metaserver.MetaServer{
+				MetaAgent: &agent.MetaAgent{
+					KatalystMachineInfo: &machine.KatalystMachineInfo{
+						CPUTopology: &machine.CPUTopology{NumNUMANodes: 2},
+					},
+				},
+			},
+			numaAvailable: map[int]int{0: 4, 1: 12},
+		}
+
+		require.NoError(t, cra.updateReservedForReclaim())
+		assert.Equal(t, map[int]int{0: 2, 1: 2}, cra.reservedForReclaim)
+	})
+
+	t.Run("nil dynamic configuration returns error and clears reservation", func(t *testing.T) {
+		t.Parallel()
+
+		conf := generateTestConfiguration(t, t.TempDir(), t.TempDir())
+		conf.SetDynamicConfiguration(nil)
+		cra := &cpuResourceAdvisor{
+			conf:               conf,
+			reservedForReclaim: map[int]int{0: 4},
+		}
+
+		require.EqualError(t, cra.updateReservedForReclaim(), "dynamic configuration is nil")
+		assert.Nil(t, cra.reservedForReclaim)
+	})
+
+	t.Run("non-hard partition keeps configured reservation", func(t *testing.T) {
+		t.Parallel()
+
+		conf := generateTestConfiguration(t, t.TempDir(), t.TempDir())
+		dynamicConf := conf.GetDynamicConfiguration()
+		dynamicConf.EnableRampUpReclaimHardPartition = false
+		dynamicConf.MinReclaimedResourceForAllocate = v1.ResourceList{
+			v1.ResourceCPU: resource.MustParse("6"),
+		}
+		cpuTopology, err := machine.GenerateDummyCPUTopology(16, 1, 2)
+		require.NoError(t, err)
+		cra := &cpuResourceAdvisor{
+			conf: conf,
+			metaServer: &metaserver.MetaServer{
+				MetaAgent: &agent.MetaAgent{
+					KatalystMachineInfo: &machine.KatalystMachineInfo{CPUTopology: cpuTopology},
+				},
+			},
+		}
+
+		require.NoError(t, cra.updateReservedForReclaim())
+		assert.Equal(t, map[int]int{0: 3, 1: 3}, cra.reservedForReclaim)
+	})
+}
