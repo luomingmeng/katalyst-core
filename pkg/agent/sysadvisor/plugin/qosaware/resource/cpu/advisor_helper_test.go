@@ -234,6 +234,12 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimHardPartitionCapacity(t *test
 			wantReserved:      map[int]int{0: 4, 1: 4},
 		},
 		{
+			name:              "odd configured reserve floor is preserved",
+			ratio:             0,
+			configuredReserve: 5,
+			wantReserved:      map[int]int{0: 3, 1: 2},
+		},
+		{
 			name:              "three quarter ratio exceeds balanced capacity",
 			ratio:             0.75,
 			configuredReserve: 4,
