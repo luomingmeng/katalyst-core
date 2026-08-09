@@ -250,6 +250,12 @@ class CLIParserTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.parser.parse_args(["--duration", "-0.1"])
 
+    def test_rejects_non_finite_duration(self):
+        for value in ("nan", "inf", "-inf"):
+            with self.subTest(value=value):
+                with self.assertRaises(SystemExit):
+                    self.parser.parse_args([f"--duration={value}"])
+
     def test_rejects_non_positive_pid(self):
         for value in ("0", "-1"):
             with self.subTest(value=value):
