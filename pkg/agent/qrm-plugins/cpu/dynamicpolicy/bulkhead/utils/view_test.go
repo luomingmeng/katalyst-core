@@ -24,8 +24,34 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	cpustate "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	"github.com/kubewharf/katalyst-core/pkg/config"
+	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
+
+func TestNewCPUSetPartitionViewOptionsUsesProductionConfigurationConsistently(t *testing.T) {
+	t.Parallel()
+
+	defaultDynamic := dynamicconfig.NewDynamicAgentConfiguration()
+	defaultDynamic.GetDynamicConfiguration().AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.NonReclaimPoolMinSize = 7
+	coreConf := config.NewConfiguration()
+	coreConf.EnableReserveCPUReversely = true
+	coreConf.DynamicAgentConfiguration = defaultDynamic
+	currentDynamic := dynamicconfig.NewDynamicAgentConfiguration().GetDynamicConfiguration()
+	currentDynamic.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.NonReclaimPoolMinSize = 5
+	currentDynamic.AdminQoSConfiguration.CPUPluginConfiguration.EnableRampUpReclaimHardPartition = true
+
+	opts := NewCPUSetPartitionViewOptions(coreConf, currentDynamic)
+	if opts.NonReclaimPoolMinSize != 5 || !opts.ReserveCPUReversely || !opts.HardPartitionEnabled {
+		t.Fatalf("unexpected current options: %+v", opts)
+	}
+
+	currentDynamic.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.NonReclaimPoolMinSize = 0
+	opts = NewCPUSetPartitionViewOptions(coreConf, currentDynamic)
+	if opts.NonReclaimPoolMinSize != 7 {
+		t.Fatalf("fallback NonReclaimPoolMinSize = %d, want 7", opts.NonReclaimPoolMinSize)
+	}
+}
 
 func TestValidateCPUSetPartitionViewRequiresExactNUMABucketProjection(t *testing.T) {
 	t.Parallel()

@@ -389,16 +389,9 @@ func staleGenerationError() *NonConvergedError {
 }
 
 func (m *Manager) cpuSetPartitionViewOptions(in cpusetutil.CPUSetAdjustmentHandlerCtx) bulkheadutils.CPUSetPartitionViewOptions {
-	nonReclaimPoolMinSize := bulkheadNonReclaimPoolMinSize(in.DynamicConf)
-	if nonReclaimPoolMinSize <= 0 {
-		nonReclaimPoolMinSize = m.defaultNonReclaimPoolMinSize
-	}
-	opts := bulkheadutils.CPUSetPartitionViewOptions{
-		NonReclaimPoolMinSize: nonReclaimPoolMinSize,
-		HardPartitionEnabled:  hardPartitionEnabled(in.DynamicConf),
-	}
-	if in.CoreConf != nil {
-		opts.ReserveCPUReversely = in.CoreConf.EnableReserveCPUReversely
+	opts := bulkheadutils.NewCPUSetPartitionViewOptions(in.CoreConf, in.DynamicConf)
+	if opts.NonReclaimPoolMinSize <= 0 {
+		opts.NonReclaimPoolMinSize = m.defaultNonReclaimPoolMinSize
 	}
 	return opts
 }
@@ -423,13 +416,6 @@ func bulkheadEnabled(conf *dynamicconfig.Configuration) bool {
 		return false
 	}
 	return conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.Enable
-}
-
-func hardPartitionEnabled(conf *dynamicconfig.Configuration) bool {
-	if conf == nil || conf.AdminQoSConfiguration == nil || conf.AdminQoSConfiguration.CPUPluginConfiguration == nil {
-		return false
-	}
-	return conf.AdminQoSConfiguration.CPUPluginConfiguration.EnableRampUpReclaimHardPartition
 }
 
 func bulkheadNonReclaimPoolMinSize(conf *dynamicconfig.Configuration) int64 {

@@ -42,6 +42,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/advisorsvc"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
+	bulkheadmodel "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	bulkheadutils "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/calculator"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
@@ -52,6 +53,8 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation"
 	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation/finders"
 	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation/finders/feature_cpu"
+	"github.com/kubewharf/katalyst-core/pkg/config"
+	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 	cgroupmgr "github.com/kubewharf/katalyst-core/pkg/util/cgroup/manager"
@@ -2000,6 +2003,7 @@ func (p *DynamicPolicy) applyBlocks(
 	}
 	if err := p.validateAdvisorPartitionBeforeCommit(
 		newEntries,
+		newMachineState,
 		allowSharedCoresOverlapReclaimedCores,
 		resp.DisableDedicatedCoresOverlapReclaimedCores,
 	); err != nil {
@@ -2080,9 +2084,19 @@ func (p *DynamicPolicy) buildAdjustmentCommitOverrideFromPodEntries(
 	// persists pod entries, machine state, and the mode atomically.
 	snapshot.allowOverlap = allowSharedCoresOverlapReclaimedCores
 	snapshot.disableDedicated = disableDedicatedCoresOverlapReclaimedCores
-	view, err := bulkheadutils.BuildValidatedCPUSetPartitionView(snapshot, p.machineInfo.CPUTopology, bulkheadutils.CPUSetPartitionViewOptions{})
-	if err != nil {
-		return nil, err
+	var view *bulkheadmodel.DesiredView
+	if p.hardBulkheadPartitionValidationEnabled() {
+		view = bulkheadutils.BuildCPUSetPartitionView(snapshot, p.machineInfo.CPUTopology, p.cpuSetPartitionViewOptions())
+	} else {
+		var err error
+		view, err = bulkheadutils.BuildValidatedCPUSetPartitionView(
+			snapshot,
+			p.machineInfo.CPUTopology,
+			bulkheadutils.CPUSetPartitionViewOptions{},
+		)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if view == nil || view.ReclaimEffective.IsEmpty() {
 		return nil, nil
@@ -2117,6 +2131,7 @@ func (p *DynamicPolicy) syncReclaimPoolWithAdjustmentCommitOverride(newEntries s
 
 func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommit(
 	newEntries state.PodEntries,
+	newMachineState state.NUMANodeMap,
 	allowSharedCoresOverlapReclaimedCores bool,
 	disableDedicatedCoresOverlapReclaimedCores bool,
 ) error {
@@ -2187,7 +2202,12 @@ func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommit(
 	}
 
 	if allowSharedCoresOverlapReclaimedCores {
-		return nil
+		return p.validatePendingAdvisorPartitionView(
+			newEntries,
+			newMachineState,
+			allowSharedCoresOverlapReclaimedCores,
+			disableDedicatedCoresOverlapReclaimedCores,
+		)
 	}
 
 	nonReclaim := machine.NewCPUSet()
@@ -2216,7 +2236,61 @@ func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommit(
 	if overlap := reclaimPool.AllocationResult.Intersection(nonReclaim); !overlap.IsEmpty() {
 		return fmt.Errorf("reclaim pool overlaps non-reclaim partition before commit: %s", overlap.String())
 	}
+	return p.validatePendingAdvisorPartitionView(
+		newEntries,
+		newMachineState,
+		allowSharedCoresOverlapReclaimedCores,
+		disableDedicatedCoresOverlapReclaimedCores,
+	)
+}
+
+func (p *DynamicPolicy) validatePendingAdvisorPartitionView(
+	newEntries state.PodEntries,
+	newMachineState state.NUMANodeMap,
+	allowSharedCoresOverlapReclaimedCores bool,
+	disableDedicatedCoresOverlapReclaimedCores bool,
+) error {
+	if !p.hardBulkheadPartitionValidationEnabled() {
+		return nil
+	}
+	snapshot := newCPUSetAdjustmentStateSnapshot(p.state)
+	snapshot.podEntries = newEntries.Clone()
+	snapshot.machineState = newMachineState.Clone()
+	snapshot.allowOverlap = allowSharedCoresOverlapReclaimedCores
+	snapshot.disableDedicated = disableDedicatedCoresOverlapReclaimedCores
+	if _, err := bulkheadutils.BuildValidatedCPUSetPartitionView(
+		snapshot,
+		p.machineInfo.CPUTopology,
+		p.cpuSetPartitionViewOptions(),
+	); err != nil {
+		return fmt.Errorf("validate pending advisor partition view before commit: %w", err)
+	}
 	return nil
+}
+
+func (p *DynamicPolicy) cpuSetPartitionViewOptions() bulkheadutils.CPUSetPartitionViewOptions {
+	var dynamicConf *dynamicconfig.Configuration
+	if p != nil && p.dynamicConfig != nil {
+		dynamicConf = p.dynamicConfig.GetDynamicConfiguration()
+	}
+	var coreConf *config.Configuration
+	if p != nil {
+		coreConf = p.conf
+	}
+	return bulkheadutils.NewCPUSetPartitionViewOptions(coreConf, dynamicConf)
+}
+
+func (p *DynamicPolicy) hardBulkheadPartitionValidationEnabled() bool {
+	if p == nil || p.dynamicConfig == nil {
+		return false
+	}
+	dynamicConf := p.dynamicConfig.GetDynamicConfiguration()
+	if dynamicConf == nil || dynamicConf.AdminQoSConfiguration == nil ||
+		dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration == nil {
+		return false
+	}
+	cpuConf := dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration
+	return cpuConf.BulkheadConfig.Enable && cpuConf.EnableRampUpReclaimHardPartition
 }
 
 func (p *DynamicPolicy) getOwnerPoolNameFromAdvisor(allocationInfo *state.AllocationInfo, resp *advisorapi.ListAndWatchResponse) string {
