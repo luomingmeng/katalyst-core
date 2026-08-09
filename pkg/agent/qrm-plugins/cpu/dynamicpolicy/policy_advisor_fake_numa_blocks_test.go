@@ -147,3 +147,166 @@ func TestGenerateBlockCPUSet_FakeNUMANormalShareDoesNotConsumePreviousReclaim(t 
 	require.Equal(t, shareCPUSet, blockCPUSet["new-share-block"])
 	require.Equal(t, reclaimCPUSet, blockCPUSet["new-reclaim-block"])
 }
+
+func TestGenerateLegacyBlockCPUSet_HardPartitionBalancesFakeReclaim(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name        string
+		quantity    uint64
+		wantPerNUMA []int
+	}{
+		{name: "four CPUs", quantity: 4, wantPerNUMA: []int{2, 2}},
+		{name: "five CPUs", quantity: 5, wantPerNUMA: []int{3, 2}},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			policy := newLegacyHardPartitionTestPolicy(t)
+			blockCPUSet, err := policy.generateBlockCPUSet(
+				legacyFakeReclaimResponse(tc.quantity, false), nil)
+			require.NoError(t, err)
+
+			reclaim := blockCPUSet["reclaim"]
+			require.Equal(t, int(tc.quantity), reclaim.Size())
+			for numaID, want := range tc.wantPerNUMA {
+				require.Equal(t, want, reclaim.Intersection(
+					policy.machineInfo.CPUDetails.CPUsInNUMANodes(numaID)).Size())
+			}
+		})
+	}
+}
+
+func TestGenerateLegacyBlockCPUSet_HardPartitionRebalancesPreviousFakeReclaim(t *testing.T) {
+	t.Parallel()
+
+	policy := newLegacyHardPartitionTestPolicy(t)
+	policy.state.SetPodEntries(state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(0, 1, 2, 3),
+			},
+		},
+	}, false)
+
+	blockCPUSet, err := policy.generateBlockCPUSet(legacyFakeReclaimResponse(4, false), nil)
+	require.NoError(t, err)
+	reclaim := blockCPUSet["reclaim"]
+	require.Equal(t, 2, reclaim.Intersection(policy.machineInfo.CPUDetails.CPUsInNUMANodes(0)).Size())
+	require.Equal(t, 2, reclaim.Intersection(policy.machineInfo.CPUDetails.CPUsInNUMANodes(1)).Size())
+}
+
+func TestGenerateLegacyBlockCPUSet_HardPartitionReservesBeforeNormalShare(t *testing.T) {
+	t.Parallel()
+
+	policy := newLegacyHardPartitionTestPolicy(t)
+	resp := legacyFakeReclaimResponse(4, false)
+	resp.Entries["share"] = &advisorapi.CalculationEntries{
+		Entries: map[string]*advisorapi.CalculationInfo{
+			commonstate.FakedContainerName: {
+				OwnerPoolName: "share",
+				CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+					commonstate.FakedNUMAID: {
+						Blocks: []*advisorapi.Block{{BlockId: "share", Result: 5}},
+					},
+				},
+			},
+		},
+	}
+
+	got, err := policy.generateBlockCPUSet(resp, nil)
+	require.Nil(t, got)
+	require.ErrorContains(t, err, "allocate normal share block")
+}
+
+func TestGenerateLegacyBlockCPUSet_HardPartitionRejectsInsufficientCapacity(t *testing.T) {
+	t.Parallel()
+
+	policy := newLegacyHardPartitionTestPolicy(t)
+	got, err := policy.generateBlockCPUSet(legacyFakeReclaimResponse(9, false), nil)
+	require.Nil(t, got)
+	require.ErrorContains(t, err, "eligible capacity 8 is smaller than quantity 9")
+}
+
+func TestGenerateLegacyBlockCPUSet_HardPartitionKeepsOverlapReclaimLegacy(t *testing.T) {
+	t.Parallel()
+
+	policy := newLegacyHardPartitionTestPolicy(t)
+	previous := machine.NewCPUSet(0, 1, 2, 3)
+	policy.state.SetPodEntries(state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: previous,
+			},
+		},
+	}, false)
+
+	blockCPUSet, err := policy.generateBlockCPUSet(legacyFakeReclaimResponse(4, true), nil)
+	require.NoError(t, err)
+	require.Equal(t, previous, blockCPUSet["reclaim"])
+}
+
+func TestGenerateLegacyBlockCPUSet_HardPartitionDisabledKeepsLegacyPlacement(t *testing.T) {
+	t.Parallel()
+
+	policy := newLegacyHardPartitionTestPolicy(t)
+	policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = false
+	previous := machine.NewCPUSet(0, 1, 2, 3)
+	policy.state.SetPodEntries(state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: previous,
+			},
+		},
+	}, false)
+
+	blockCPUSet, err := policy.generateBlockCPUSet(legacyFakeReclaimResponse(4, false), nil)
+	require.NoError(t, err)
+	require.Equal(t, previous, blockCPUSet["reclaim"])
+}
+
+func newLegacyHardPartitionTestPolicy(t *testing.T) *DynamicPolicy {
+	t.Helper()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	return policy
+}
+
+func legacyFakeReclaimResponse(quantity uint64, overlap bool) *advisorapi.ListAndWatchResponse {
+	var overlapTargets []*advisorapi.OverlapTarget
+	if overlap {
+		overlapTargets = []*advisorapi.OverlapTarget{{
+			OverlapTargetPoolName: commonstate.PoolNameShare,
+			OverlapType:           advisorapi.OverlapType_OverlapWithPool,
+		}}
+	}
+	return &advisorapi.ListAndWatchResponse{
+		DisableDedicatedCoresOverlapReclaimedCores: false,
+		Entries: map[string]*advisorapi.CalculationEntries{
+			commonstate.PoolNameReclaim: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameReclaim,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{
+									BlockId:        "reclaim",
+									Result:         quantity,
+									OverlapTargets: overlapTargets,
+								}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}

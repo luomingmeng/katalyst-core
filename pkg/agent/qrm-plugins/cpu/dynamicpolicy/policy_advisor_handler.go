@@ -1346,9 +1346,6 @@ func (p *DynamicPolicy) generateBlockCPUSet(
 		return nil, fmt.Errorf("got nil resp")
 	}
 	if !resp.DisableDedicatedCoresOverlapReclaimedCores {
-		if p.isRampUpReclaimHardPartitionEnabled() {
-			return nil, fmt.Errorf("hard-partition reclaim requires negotiated disjoint advisor planning")
-		}
 		return p.generateLegacyBlockCPUSet(resp)
 	}
 
@@ -1546,6 +1543,16 @@ func (p *DynamicPolicy) generateLegacyBlockCPUSet(resp *advisorapi.ListAndWatchR
 			"availableCPUs", availableCPUs.String())
 	}
 
+	if p.isRampUpReclaimHardPartitionEnabled() {
+		reserved, err := p.preallocateLegacyHardReclaim(
+			resp, nodeRemainingCPUs, rpPinnedCPUSet, globalNonReclaimableCPUSet, blockCPUSet)
+		if err != nil {
+			return nil, fmt.Errorf("preallocate legacy hard reclaim: %w", err)
+		}
+		nodeRemainingCPUs = nodeRemainingCPUs.Difference(reserved)
+		availableCPUs = availableCPUs.Difference(reserved)
+	}
+
 	// Phase 2 for FakedNUMAID
 	if blocks, ok := numaToBlocks[commonstate.FakedNUMAID]; ok {
 		var normalShareBlocks, isolationBlocks, reclaimBlocks []*advisorapi.BlockInfo
@@ -1591,6 +1598,45 @@ func (p *DynamicPolicy) generateLegacyBlockCPUSet(resp *advisorapi.ListAndWatchR
 	}
 
 	return blockCPUSet, nil
+}
+
+func (p *DynamicPolicy) preallocateLegacyHardReclaim(
+	resp *advisorapi.ListAndWatchResponse,
+	available machine.CPUSet,
+	rpPinnedCPUSet map[string]machine.CPUSet,
+	nonReclaimableCPUSet machine.CPUSet,
+	blockCPUSet advisorapi.BlockCPUSet,
+) (machine.CPUSet, error) {
+	descriptors, err := buildAdvisorBlockDescriptors(
+		resp,
+		p.machineInfo.CPUDetails,
+		p.state.GetPodEntries(),
+		rpPinnedCPUSet,
+		nonReclaimableCPUSet,
+	)
+	if err != nil {
+		return machine.NewCPUSet(), err
+	}
+	mandatory := filterAdvisorDescriptors(descriptors, func(descriptor advisorBlockDescriptor) bool {
+		return descriptor.Class == advisorBlockClassMandatoryReclaim
+	})
+	demands, blockIDByDemandKey, err := expandHardPartitionReclaimPhase(
+		mandatory, available, p.machineInfo.CPUTopology)
+	if err != nil {
+		return machine.NewCPUSet(), err
+	}
+	assignments, err := solveDisjointPartitions(demands, p.machineInfo.CPUTopology)
+	if err != nil {
+		return machine.NewCPUSet(), err
+	}
+
+	reserved := machine.NewCPUSet()
+	for demandKey, cpus := range assignments {
+		blockID := blockIDByDemandKey[demandKey]
+		blockCPUSet[blockID] = blockCPUSet[blockID].Union(cpus)
+		reserved = reserved.Union(cpus)
+	}
+	return reserved, nil
 }
 
 // applyBlocks allocate based on BlockCPUSet
