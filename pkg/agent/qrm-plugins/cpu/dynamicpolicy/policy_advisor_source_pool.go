@@ -396,6 +396,22 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhase(
 	blockIDByDemandKey := make(map[string]string, len(descriptors))
 	ordinalByStableKey := make(map[string]int, len(descriptors))
 	for _, descriptor := range descriptors {
+		if preserveClass &&
+			p.isRampUpReclaimHardPartitionEnabled() &&
+			descriptor.Class == advisorBlockClassMandatoryReclaim &&
+			descriptor.NUMAID == commonstate.FakedNUMAID {
+			expanded, err := expandHardPartitionReclaimDemands(
+				descriptor, available, p.machineInfo.CPUTopology)
+			if err != nil {
+				return available, fmt.Errorf("expand hard reclaim block %q: %w", descriptor.BlockID, err)
+			}
+			for _, demand := range expanded {
+				demands = append(demands, demand)
+				blockIDByDemandKey[demand.key] = descriptor.BlockID
+			}
+			continue
+		}
+
 		class := descriptor.Class
 		if !preserveClass {
 			class = advisorBlockClassDedicated
@@ -421,7 +437,7 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhase(
 	used := machine.NewCPUSet()
 	for demandKey, cpus := range assignments {
 		blockID := blockIDByDemandKey[demandKey]
-		result[blockID] = cpus
+		result[blockID] = result[blockID].Union(cpus)
 		used = used.Union(cpus)
 	}
 	return available.Difference(used), nil

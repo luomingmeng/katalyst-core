@@ -1325,6 +1325,82 @@ func TestPlanDisjointAdvisorBlocksOverlapNeverReintroducesStateForbiddenOrSystem
 		got["overlap-reclaim"].String(), notAllocatable.String())
 }
 
+func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	numa1 := topology.CPUDetails.CPUsInNUMANodes(1)
+	allCPUs := numa0.Union(numa1)
+
+	newPolicy := func(t *testing.T, hardPartition bool) *DynamicPolicy {
+		t.Helper()
+		p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+		require.NoError(t, err)
+		p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = hardPartition
+		return p
+	}
+	solve := func(
+		t *testing.T,
+		p *DynamicPolicy,
+		quantity int,
+		available, oldPreferred machine.CPUSet,
+	) (machine.CPUSet, error) {
+		t.Helper()
+		result := advisorapi.NewBlockCPUSet()
+		_, err := p.solveAdvisorDescriptorPhase([]advisorBlockDescriptor{{
+			BlockID:      "reclaim",
+			Owners:       []string{"reclaim-owner"},
+			Class:        advisorBlockClassMandatoryReclaim,
+			NUMAID:       commonstate.FakedNUMAID,
+			Quantity:     quantity,
+			ComponentKey: "mandatory-reclaim|reclaim-owner|-1",
+			Eligible:     allCPUs,
+			OldPreferred: oldPreferred,
+		}}, available, result, true)
+		return result["reclaim"], err
+	}
+
+	t.Run("four CPUs are split two per NUMA", func(t *testing.T) {
+		got, err := solve(t, newPolicy(t, true), 4, allCPUs, machine.NewCPUSet())
+		require.NoError(t, err)
+		require.Equal(t, 2, got.Intersection(numa0).Size())
+		require.Equal(t, 2, got.Intersection(numa1).Size())
+	})
+
+	t.Run("five CPUs use capacity-aware balanced quotas", func(t *testing.T) {
+		numa0CPUs, numa1CPUs := numa0.ToSliceInt(), numa1.ToSliceInt()
+		available := machine.NewCPUSet(
+			numa0CPUs[0], numa0CPUs[1],
+			numa1CPUs[0], numa1CPUs[1], numa1CPUs[2],
+		)
+		got, err := solve(t, newPolicy(t, true), 5, available, machine.NewCPUSet())
+		require.NoError(t, err)
+		require.Equal(t, 2, got.Intersection(numa0).Size())
+		require.Equal(t, 3, got.Intersection(numa1).Size())
+	})
+
+	t.Run("old reclaim concentrated on one NUMA is rebalanced", func(t *testing.T) {
+		got, err := solve(t, newPolicy(t, true), 4, allCPUs, numa1)
+		require.NoError(t, err)
+		require.Equal(t, 2, got.Intersection(numa0).Size())
+		require.Equal(t, 2, got.Intersection(numa1).Size())
+	})
+
+	t.Run("quantity below hard minimum fails", func(t *testing.T) {
+		got, err := solve(t, newPolicy(t, true), 3, allCPUs, machine.NewCPUSet())
+		require.ErrorContains(t, err, "smaller than required minimum")
+		require.True(t, got.IsEmpty())
+	})
+
+	t.Run("hard partition disabled preserves global reclaim allocation", func(t *testing.T) {
+		got, err := solve(t, newPolicy(t, false), 4, allCPUs, numa1)
+		require.NoError(t, err)
+		require.Equal(t, numa1, got)
+	})
+}
+
 func advisorDescriptorBlockIDs(descriptors []advisorBlockDescriptor) []string {
 	result := make([]string, 0, len(descriptors))
 	for _, descriptor := range descriptors {
