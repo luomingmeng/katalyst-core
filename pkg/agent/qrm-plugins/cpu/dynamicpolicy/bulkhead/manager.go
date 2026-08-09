@@ -395,6 +395,7 @@ func (m *Manager) cpuSetPartitionViewOptions(in cpusetutil.CPUSetAdjustmentHandl
 	}
 	opts := bulkheadutils.CPUSetPartitionViewOptions{
 		NonReclaimPoolMinSize: nonReclaimPoolMinSize,
+		HardPartitionEnabled:  hardPartitionEnabled(in.DynamicConf),
 	}
 	if in.CoreConf != nil {
 		opts.ReserveCPUReversely = in.CoreConf.EnableReserveCPUReversely
@@ -422,6 +423,13 @@ func bulkheadEnabled(conf *dynamicconfig.Configuration) bool {
 		return false
 	}
 	return conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.Enable
+}
+
+func hardPartitionEnabled(conf *dynamicconfig.Configuration) bool {
+	if conf == nil || conf.AdminQoSConfiguration == nil || conf.AdminQoSConfiguration.CPUPluginConfiguration == nil {
+		return false
+	}
+	return conf.AdminQoSConfiguration.CPUPluginConfiguration.EnableRampUpReclaimHardPartition
 }
 
 func bulkheadNonReclaimPoolMinSize(conf *dynamicconfig.Configuration) int64 {

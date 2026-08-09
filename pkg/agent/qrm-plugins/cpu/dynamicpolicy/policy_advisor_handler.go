@@ -553,6 +553,9 @@ func (p *DynamicPolicy) allocateByCPUAdvisor(
 	if aErr != nil {
 		return fmt.Errorf("generateBlockCPUSet failed with error: %v", aErr)
 	}
+	if err := p.validateHardPartitionBlockPlan(resp, blockToCPUSet); err != nil {
+		return fmt.Errorf("validate hard-partition reclaim block plan failed: %w", err)
+	}
 
 	curAllowSharedCoresOverlapReclaimedCores := p.state.GetAllowSharedCoresOverlapReclaimedCores()
 	if curAllowSharedCoresOverlapReclaimedCores != resp.AllowSharedCoresOverlapReclaimedCores {
@@ -1353,6 +1356,92 @@ func (p *DynamicPolicy) generateBlockCPUSet(
 		return nil, fmt.Errorf("dedicated reclaim disjoint partition capability is not negotiated")
 	}
 	return p.planDisjointAdvisorBlocks(resp)
+}
+
+func (p *DynamicPolicy) validateHardPartitionBlockPlan(
+	resp *advisorapi.ListAndWatchResponse,
+	blockCPUSet advisorapi.BlockCPUSet,
+) error {
+	if p == nil || !p.isRampUpReclaimHardPartitionEnabled() {
+		return nil
+	}
+	if resp == nil || p.machineInfo == nil || p.machineInfo.CPUTopology == nil {
+		return fmt.Errorf("hard-partition reclaim validation requires advisor response and CPU topology")
+	}
+
+	machineState := p.state.GetMachineState()
+	rpPinnedCPUSet := machineState.GetResourcePackagePinnedCPUSet()
+	selectorText := p.conf.GetDynamicConfiguration().DisableReclaimPinnedCPUSetResourcePackageSelector
+	disableReclaimSelector, err := general.ParseSelector(selectorText)
+	if err != nil {
+		return err
+	}
+	nonReclaimableCPUSet := cpuutil.GetAggResourcePackagePinnedCPUSet(disableReclaimSelector, machineState)
+	descriptors, err := buildAdvisorBlockDescriptors(
+		resp,
+		p.machineInfo.CPUDetails,
+		p.state.GetPodEntries(),
+		rpPinnedCPUSet,
+		nonReclaimableCPUSet,
+	)
+	if err != nil {
+		return err
+	}
+	available, err := p.allocateStaticAndForbiddenPools(
+		resp, advisorapi.NewBlockCPUSet(), p.machineInfo.CPUDetails.CPUs())
+	if err != nil {
+		return err
+	}
+
+	reclaim := machine.NewCPUSet()
+	eligible := machine.NewCPUSet()
+	for _, descriptor := range descriptors {
+		if descriptor.Class != advisorBlockClassMandatoryReclaim {
+			continue
+		}
+		reclaim = reclaim.Union(blockCPUSet[descriptor.BlockID])
+		eligible = eligible.Union(descriptor.Eligible.Intersection(available))
+	}
+	return validateHardPartitionReclaimDistribution(
+		reclaim, eligible, p.machineInfo.CPUTopology, minimumHardReclaimCPUsPerNUMA)
+}
+
+func validateHardPartitionReclaimDistribution(
+	reclaim machine.CPUSet,
+	eligible machine.CPUSet,
+	topology *machine.CPUTopology,
+	minimumPerNUMA int,
+) error {
+	if topology == nil {
+		return fmt.Errorf("hard-partition reclaim validation requires CPU topology")
+	}
+	machineCPUs := topology.CPUDetails.CPUs()
+	if outside := reclaim.Difference(machineCPUs); !outside.IsEmpty() {
+		return fmt.Errorf("hard-partition reclaim outside machine topology: %s", outside.String())
+	}
+	if outside := reclaim.Difference(eligible); !outside.IsEmpty() {
+		return fmt.Errorf("hard-partition reclaim outside eligible CPUs: %s", outside.String())
+	}
+
+	eligibleNUMAs := topology.CPUDetails.KeepOnly(eligible.Intersection(machineCPUs)).NUMANodes().ToSliceInt()
+	minimum, maximum := 0, 0
+	for i, numaID := range eligibleNUMAs {
+		count := reclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID)).Size()
+		if count < minimumPerNUMA {
+			return fmt.Errorf("hard-partition reclaim NUMA %d has %d CPUs, minimum is %d",
+				numaID, count, minimumPerNUMA)
+		}
+		if i == 0 || count < minimum {
+			minimum = count
+		}
+		if i == 0 || count > maximum {
+			maximum = count
+		}
+	}
+	if maximum-minimum > 1 {
+		return fmt.Errorf("hard-partition reclaim is imbalanced across eligible NUMAs: max=%d min=%d", maximum, minimum)
+	}
+	return nil
 }
 
 // generateLegacyBlockCPUSet computes the CPUSet allocation for all requested blocks using a two-phase allocation process.

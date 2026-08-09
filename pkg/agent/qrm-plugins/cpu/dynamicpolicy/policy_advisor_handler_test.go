@@ -131,6 +131,78 @@ func TestGenerateBlockCPUSetHardPartitionRejectsLegacyResponse(t *testing.T) {
 	require.EqualError(t, err, "hard-partition reclaim requires negotiated disjoint advisor planning")
 }
 
+func TestValidateHardPartitionReclaimDistribution(t *testing.T) {
+	t.Parallel()
+
+	topology := &machine.CPUTopology{CPUDetails: machine.CPUDetails{
+		0: {NUMANodeID: 0}, 1: {NUMANodeID: 0}, 2: {NUMANodeID: 0}, 3: {NUMANodeID: 0},
+		4: {NUMANodeID: 1}, 5: {NUMANodeID: 1}, 6: {NUMANodeID: 1}, 7: {NUMANodeID: 1},
+	}}
+	allCPUs := topology.CPUDetails.CPUs()
+
+	for _, tc := range []struct {
+		name     string
+		reclaim  machine.CPUSet
+		eligible machine.CPUSet
+		wantErr  string
+	}{
+		{
+			name:     "two per NUMA",
+			reclaim:  machine.NewCPUSet(0, 1, 4, 5),
+			eligible: allCPUs,
+		},
+		{
+			name:     "three and two",
+			reclaim:  machine.NewCPUSet(0, 1, 2, 4, 5),
+			eligible: allCPUs,
+		},
+		{
+			name:     "four and zero",
+			reclaim:  machine.NewCPUSet(0, 1, 2, 3),
+			eligible: allCPUs,
+			wantErr:  "NUMA 1 has 0 CPUs, minimum is 2",
+		},
+		{
+			name:     "three and one",
+			reclaim:  machine.NewCPUSet(0, 1, 2, 4),
+			eligible: allCPUs,
+			wantErr:  "NUMA 1 has 1 CPUs, minimum is 2",
+		},
+		{
+			name:     "outside eligible",
+			reclaim:  machine.NewCPUSet(0, 1, 3, 4, 5),
+			eligible: machine.NewCPUSet(0, 1, 2, 4, 5, 6, 7),
+			wantErr:  "outside eligible CPUs: 3",
+		},
+		{
+			name:     "outside machine",
+			reclaim:  machine.NewCPUSet(0, 1, 4, 5, 8),
+			eligible: machine.NewCPUSet(0, 1, 4, 5, 8),
+			wantErr:  "outside machine topology: 8",
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := validateHardPartitionReclaimDistribution(
+				tc.reclaim, tc.eligible, topology, minimumHardReclaimCPUsPerNUMA)
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.EqualError(t, err, "hard-partition reclaim "+tc.wantErr)
+		})
+	}
+}
+
+func TestValidateHardPartitionBlockPlanSkipsWhenDisabled(t *testing.T) {
+	t.Parallel()
+
+	policy := &DynamicPolicy{}
+	require.NoError(t, policy.validateHardPartitionBlockPlan(nil, nil))
+}
+
 func TestGenerateBlockCPUSetDisjointPlannerUsesJointRPEligibility(t *testing.T) {
 	t.Parallel()
 
