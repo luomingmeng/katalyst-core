@@ -1777,7 +1777,7 @@ func TestApplyPoolsAndIsolatedInfoAddsExplicitHardFloorToReclaim(t *testing.T) {
 	require.True(t, entries[commonstate.PoolNameDedicated][commonstate.FakedContainerName].AllocationResult.Equals(dedicatedBefore))
 }
 
-func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorPreservesOwnedPoolQuantity(t *testing.T) {
+func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorAllowsNonBindingSharedPoolShrink(t *testing.T) {
 	t.Parallel()
 
 	newPolicy := func(t *testing.T) *DynamicPolicy {
@@ -1842,7 +1842,7 @@ func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorPreservesOwnedPoolQuantity(
 		require.True(t, owner.AllocationResult.Equals(share))
 	})
 
-	t.Run("rejects insufficient capacity without changing state", func(t *testing.T) {
+	t.Run("proportionally shrinks global share pool", func(t *testing.T) {
 		p := newPolicy(t)
 		quantities := map[string]map[int]int{
 			commonstate.PoolNameShare: {commonstate.FakedNUMAID: 4},
@@ -1853,26 +1853,24 @@ func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorPreservesOwnedPoolQuantity(
 		cpus := p.machineInfo.CPUDetails.CPUs().ToSliceInt()
 		require.Len(t, cpus, 8)
 		floor := machine.NewCPUSet(cpus[:5]...)
-		initialEntries := p.state.GetPodEntries()
-		initialMachineState := p.state.GetMachineState()
-		initialRevision := p.state.GetRevision()
 
 		err := p.adjustPoolsAndIsolatedEntriesWithRampUpFloor(
 			quantities,
 			nil,
-			initialEntries,
-			initialMachineState,
+			p.state.GetPodEntries(),
+			p.state.GetMachineState(),
 			false,
 			floor,
 			false,
 		)
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "insufficient capacity")
-		require.Equal(t, strings.ToLower(err.Error()), err.Error())
+		require.NoError(t, err)
 		require.Equal(t, expectedQuantities, quantities)
-		require.Equal(t, initialEntries, p.state.GetPodEntries())
-		require.Equal(t, initialMachineState, p.state.GetMachineState())
-		require.Equal(t, initialRevision, p.state.GetRevision())
+		share, err := p.state.GetPodEntries().GetCPUSetForPool(commonstate.PoolNameShare)
+		require.NoError(t, err)
+		require.Equal(t, 3, share.Size())
+		owner := p.state.GetAllocationInfo("owned-share-pod", "main")
+		require.NotNil(t, owner)
+		require.True(t, owner.AllocationResult.Equals(share))
 	})
 }
 
@@ -2114,7 +2112,7 @@ func TestValidateOwnedPoolsQuantityRejectsMalformedSharedNUMABindingEntriesAtomi
 	}
 }
 
-func TestAdjustAllocationEntriesWithRampUpFloorKeepsHardFloorCapacityErrorLowercase(t *testing.T) {
+func TestAdjustAllocationEntriesWithRampUpFloorKeepsCanonicalSNBCapacityErrorLowercase(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
@@ -2125,18 +2123,22 @@ func TestAdjustAllocationEntriesWithRampUpFloorKeepsHardFloorCapacityErrorLowerc
 	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
 	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.5
 	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
-	p.state.SetAllocationInfo("owned-share-pod", "main", &state.AllocationInfo{
+	p.state.SetAllocationInfo("owned-snb-pod", "main", &state.AllocationInfo{
 		AllocationMeta: commonstate.AllocationMeta{
-			PodUid:        "owned-share-pod",
+			PodUid:        "owned-snb-pod",
 			PodNamespace:  "default",
-			PodName:       "owned-share-pod",
+			PodName:       "owned-snb-pod",
 			ContainerName: "main",
 			ContainerType: pluginapi.ContainerType_MAIN.String(),
-			OwnerPoolName: commonstate.PoolNameShare,
+			OwnerPoolName: "share-NUMA0",
 			QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+			Annotations: map[string]string{
+				apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			},
 		},
-		AllocationResult: machine.NewCPUSet(0, 1, 2, 3),
-		RequestQuantity:  4,
+		AllocationResult:         machine.NewCPUSet(0, 1, 2, 3),
+		TopologyAwareAssignments: map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1, 2, 3)},
+		RequestQuantity:          4,
 	}, false)
 
 	req := &pluginapi.ResourceRequest{

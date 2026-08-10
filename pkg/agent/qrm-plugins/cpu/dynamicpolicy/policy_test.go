@@ -94,6 +94,24 @@ type storeFailureState struct {
 	err error
 }
 
+type advisorPoolTestClient struct{}
+
+func (*advisorPoolTestClient) AddContainer(context.Context, *advisorsvc.ContainerMetadata, ...grpc.CallOption) (*advisorsvc.AddContainerResponse, error) {
+	return &advisorsvc.AddContainerResponse{}, nil
+}
+
+func (*advisorPoolTestClient) RemovePod(context.Context, *advisorsvc.RemovePodRequest, ...grpc.CallOption) (*advisorsvc.RemovePodResponse, error) {
+	return &advisorsvc.RemovePodResponse{}, nil
+}
+
+func (*advisorPoolTestClient) ListAndWatch(context.Context, *advisorsvc.Empty, ...grpc.CallOption) (advisorapi.CPUAdvisor_ListAndWatchClient, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+func (*advisorPoolTestClient) GetAdvice(context.Context, *advisorapi.GetAdviceRequest, ...grpc.CallOption) (*advisorapi.GetAdviceResponse, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
 func (s *storeFailureState) StoreState() error {
 	return s.err
 }
@@ -7024,6 +7042,111 @@ func TestSharedCoresRampUpAllocationExcludesAllNUMAReclaimFloor(t *testing.T) {
 	as.NotNil(replayed)
 	as.True(replayed.AllocationResult.Intersection(floor).IsEmpty(),
 		"replayed ramp-up allocation %s contains reclaim floor %s", replayed.AllocationResult, floor)
+}
+
+func TestAllocateSNBRampUpAllowsGlobalSharePoolToShrink(t *testing.T) {
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0
+	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+	p.enableCPUAdvisor = true
+	p.advisorClient = &advisorPoolTestClient{}
+
+	allocationCPUs := p.machineInfo.CPUDetails.CPUs().Difference(p.reservedCPUs)
+	assignments, err := machine.GetNumaAwareAssignments(cpuTopology, allocationCPUs)
+	require.NoError(t, err)
+	p.state.SetAllocationInfo(commonstate.PoolNameShare, commonstate.FakedContainerName, &state.AllocationInfo{
+		AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+		AllocationResult:                 allocationCPUs.Clone(),
+		OriginalAllocationResult:         allocationCPUs.Clone(),
+		TopologyAwareAssignments:         machine.DeepcopyCPUAssignment(assignments),
+		OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(assignments),
+	}, false)
+	p.state.SetAllocationInfo("ordinary-shared", "main", &state.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        "ordinary-shared",
+			PodNamespace:  "default",
+			PodName:       "ordinary-shared",
+			ContainerName: "main",
+			ContainerType: pluginapi.ContainerType_MAIN.String(),
+			OwnerPoolName: commonstate.PoolNameShare,
+			QoSLevel:      consts.PodAnnotationQoSLevelSharedCores,
+		},
+		AllocationResult:                 allocationCPUs.Clone(),
+		OriginalAllocationResult:         allocationCPUs.Clone(),
+		TopologyAwareAssignments:         machine.DeepcopyCPUAssignment(assignments),
+		OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(assignments),
+		RequestQuantity:                  1,
+	}, false)
+
+	numa0 := p.machineInfo.CPUDetails.CPUsInNUMANodes(0).Difference(p.reservedCPUs).ToSliceInt()
+	numa1 := p.machineInfo.CPUDetails.CPUsInNUMANodes(1).Difference(p.reservedCPUs).ToSliceInt()
+	require.GreaterOrEqual(t, len(numa0), 2)
+	require.GreaterOrEqual(t, len(numa1), 2)
+	floor := machine.NewCPUSet(numa0[0], numa0[1], numa1[0], numa1[1])
+	p.reservedReclaimedCPUSet = floor
+	p.reservedReclaimedCPUsSize = floor.Size()
+	p.state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &state.AllocationInfo{
+		AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+		AllocationResult:                 floor.Clone(),
+		OriginalAllocationResult:         floor.Clone(),
+		TopologyAwareAssignments:         map[int]machine.CPUSet{0: floor.Intersection(p.machineInfo.CPUDetails.CPUsInNUMANodes(0)), 1: floor.Intersection(p.machineInfo.CPUDetails.CPUsInNUMANodes(1))},
+		OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: floor.Intersection(p.machineInfo.CPUDetails.CPUsInNUMANodes(0)), 1: floor.Intersection(p.machineInfo.CPUDetails.CPUsInNUMANodes(1))},
+	}, false)
+	entries := p.state.GetPodEntries()
+	machineState, err := generateMachineStateFromPodEntries(cpuTopology, entries, p.state.GetMachineState())
+	require.NoError(t, err)
+	p.state.SetMachineState(machineState, false)
+
+	const podUID = "snb-ramp-up"
+	p.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{
+		{
+			ObjectMeta: metav1.ObjectMeta{UID: types.UID("ordinary-shared"), Namespace: "default", Name: "ordinary-shared"},
+			Spec: v1.PodSpec{Containers: []v1.Container{{
+				Name: "main",
+				Resources: v1.ResourceRequirements{Requests: v1.ResourceList{
+					v1.ResourceCPU: resource.MustParse("1"),
+				}},
+			}}},
+			Status: v1.PodStatus{Phase: v1.PodRunning},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID), Namespace: "default", Name: podUID},
+			Spec: v1.PodSpec{Containers: []v1.Container{{
+				Name: "main",
+				Resources: v1.ResourceRequirements{Requests: v1.ResourceList{
+					v1.ResourceCPU: resource.MustParse("1"),
+				}},
+			}}},
+			Status: v1.PodStatus{Phase: v1.PodPending},
+		},
+	}}
+	req := &pluginapi.ResourceRequest{
+		PodUid: podUID, PodNamespace: "default", PodName: podUID,
+		ContainerName: "main", ContainerType: pluginapi.ContainerType_MAIN,
+		ResourceName:     string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{string(v1.ResourceCPU): 1},
+		Labels:           map[string]string{consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores},
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey:          consts.PodAnnotationQoSLevelSharedCores,
+			consts.PodAnnotationMemoryEnhancementKey: `{"numa_binding":"true"}`,
+		},
+		Hint: &pluginapi.TopologyHint{Nodes: []uint64{0}, Preferred: true},
+	}
+
+	resp, err := p.Allocate(context.Background(), req)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	snb := p.state.GetAllocationInfo(podUID, "main")
+	require.NotNil(t, snb)
+	require.True(t, snb.RampUp)
+	require.True(t, snb.CheckSharedNUMABinding())
+	share := p.state.GetAllocationInfo(commonstate.PoolNameShare, commonstate.FakedContainerName)
+	require.NotNil(t, share)
+	require.Less(t, share.AllocationResult.Size(), allocationCPUs.Size())
 }
 
 func TestAllocateByQoSAwareServerListAndWatchResp(t *testing.T) {
