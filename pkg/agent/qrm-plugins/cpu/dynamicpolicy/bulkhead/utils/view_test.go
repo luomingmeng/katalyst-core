@@ -550,6 +550,98 @@ func TestBuildCPUSetPartitionViewValidatesHardPartitionDistribution(t *testing.T
 	}
 }
 
+// TestBuildValidatedCPUSetPartitionViewHardPartitionEliminatesRawSlack drives
+// the real DNB entry (BuildValidatedCPUSetPartitionView) with a reclaim pool
+// whose per-NUMA sizes mix the balanced mandatory ramp-up floor (28/28) with
+// asymmetric advisor raw slack (+5 on NUMA0). Before the source fix this pool
+// reaches the hard-partition validator as 33/28 and is rejected with
+// "imbalanced across physical NUMAs: max=33 min=28". After the fix, hard=true
+// must distribute the effective reclaim by the global target and drop the raw
+// slack so the mandatory floor is strictly 28/28 (diff<=1). hard=false keeps
+// the raw 33/28 shape untouched.
+func TestBuildValidatedCPUSetPartitionViewHardPartitionEliminatesRawSlack(t *testing.T) {
+	t.Parallel()
+
+	const perNUMA = 96
+	topology := testTwoNUMATopologyN(perNUMA)
+
+	// NUMA0: cpus 0..32 (33 = 28 floor + 5 raw slack); NUMA1: cpus 96..123 (28 floor).
+	reclaimCPUs := make([]int, 0, 61)
+	for cpu := 0; cpu <= 32; cpu++ {
+		reclaimCPUs = append(reclaimCPUs, cpu)
+	}
+	for cpu := perNUMA; cpu <= perNUMA+27; cpu++ {
+		reclaimCPUs = append(reclaimCPUs, cpu)
+	}
+	reclaim := machine.NewCPUSet(reclaimCPUs...)
+
+	newReclaimState := func() cpustate.ReadonlyState {
+		state := cpustate.NewCPUPluginState(nil)
+		// Production hard-partition path runs with advisor overlap disabled.
+		state.SetAllowSharedCoresOverlapReclaimedCores(false)
+		state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+			AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+			AllocationResult: reclaim,
+		})
+		return state
+	}
+
+	// hard=true: raw slack must be eliminated and the mandatory floor balanced 28/28.
+	view, err := BuildValidatedCPUSetPartitionView(newReclaimState(), topology, CPUSetPartitionViewOptions{
+		HardPartitionEnabled: true,
+	})
+	if err != nil {
+		t.Fatalf("BuildValidatedCPUSetPartitionView(hard=true) error = %v, want balanced 28/28", err)
+	}
+	if view == nil {
+		t.Fatal("BuildValidatedCPUSetPartitionView(hard=true) returned nil view")
+	}
+	numa0 := view.ReclaimEffectivePerNUMA[0].Size()
+	numa1 := view.ReclaimEffectivePerNUMA[1].Size()
+	if numa0 != 28 || numa1 != 28 {
+		t.Fatalf("hard=true reclaim effective per NUMA = %d/%d, want 28/28", numa0, numa1)
+	}
+	if diff := numa0 - numa1; diff > 1 || diff < -1 {
+		t.Fatalf("hard=true reclaim effective imbalanced: numa0=%d numa1=%d", numa0, numa1)
+	}
+	// Slack CPUs must move to the non-reclaim domain, not vanish or overlap.
+	if overlap := view.NonReclaimPool.Intersection(view.ReclaimEffective); !overlap.IsEmpty() {
+		t.Fatalf("hard=true produced non-reclaim/reclaim overlap: %s", overlap.String())
+	}
+	if desired0 := view.DesiredReclaimEffectivePerNUMA[0].Size(); desired0 != 28 {
+		t.Fatalf("hard=true desired reclaim NUMA0 = %d, want 28", desired0)
+	}
+
+	// hard=false: behavior unchanged, raw slack shape (33/28) preserved.
+	softView := BuildCPUSetPartitionView(newReclaimState(), topology, CPUSetPartitionViewOptions{
+		HardPartitionEnabled: false,
+	})
+	if softView == nil {
+		t.Fatal("BuildCPUSetPartitionView(hard=false) returned nil view")
+	}
+	if got0, got1 := softView.ReclaimEffectivePerNUMA[0].Size(), softView.ReclaimEffectivePerNUMA[1].Size(); got0 != 33 || got1 != 28 {
+		t.Fatalf("hard=false reclaim effective per NUMA = %d/%d, want unchanged 33/28", got0, got1)
+	}
+}
+
+func testTwoNUMATopologyN(perNUMA int) *machine.CPUTopology {
+	details := machine.CPUDetails{}
+	for cpu := 0; cpu < perNUMA; cpu++ {
+		details[cpu] = machine.CPUTopoInfo{NUMANodeID: 0, SocketID: 0, CoreID: cpu}
+	}
+	for i := 0; i < perNUMA; i++ {
+		cpu := perNUMA + i
+		details[cpu] = machine.CPUTopoInfo{NUMANodeID: 1, SocketID: 1, CoreID: cpu}
+	}
+	return &machine.CPUTopology{
+		NumCPUs:      2 * perNUMA,
+		NumCores:     2 * perNUMA,
+		NumSockets:   2,
+		NumNUMANodes: 2,
+		CPUDetails:   details,
+	}
+}
+
 func testTwoNUMATopology() *machine.CPUTopology {
 	return &machine.CPUTopology{
 		NumCPUs:      8,
