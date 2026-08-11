@@ -77,7 +77,7 @@ require (
 	sigs.k8s.io/descheduler v0.24.0
 )
 
-replace github.com/kubewharf/katalyst-api => /Users/bytedance/go/src/github.com/kubewharf/katalyst-api-rdt-rampup-merge
+replace github.com/kubewharf/katalyst-api => github.com/luomingmeng/katalyst-api v0.0.0-20260803121402-8e0b42862c8c
 
 require (
 	github.com/Azure/go-ansiterm v0.0.0-20210617225240-d185dfc1b5a1 // indirect
