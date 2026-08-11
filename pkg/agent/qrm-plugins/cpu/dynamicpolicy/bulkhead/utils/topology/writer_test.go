@@ -273,6 +273,74 @@ func TestVerifyResetConvergenceUsesConfiguredCPUsOnlyForV2EmptyTarget(t *testing
 	}
 }
 
+func TestResetWriterSkipsUncontrolledDynamicDescendantWithoutCpusetController(t *testing.T) {
+	dag, err := BuildDAG([]NodeSpec{{
+		Rel: "primary", Domain: DomainPrimary, Role: TopoNodeRolePrimary,
+		CPUs: machine.NewCPUSet(), TrustAnchor: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fake := newFakeHierarchyDriver()
+	fake.capabilities.EmptyConfiguredCPUSet = true
+	fake.capabilities.EffectiveCPUSet = true
+	fake.add("primary", CgroupIdentity{Device: 1, Inode: 1}, "0-3", "0")
+	fake.add("primary/pod-a", CgroupIdentity{Device: 1, Inode: 2}, "0-3", "0")
+	fake.add("primary/pod-a/init.scope", CgroupIdentity{Device: 1, Inode: 3}, "0-3", "0")
+	fake.beforeCall = func(op HierarchyOperation, rel string) error {
+		if rel == "primary/pod-a/init.scope" &&
+			(op == HierarchyOperationRead || op == HierarchyOperationWriteCPUs || op == HierarchyOperationWriteMems) {
+			return ErrCgroupControllerUnavailable
+		}
+		return nil
+	}
+
+	res := &ConvergenceResult{}
+	writer := newResetCoordinatorWriter(fake, NewBudgetTracker(ConvergenceBudget{}), "", res)
+	err = writer.execute(context.Background(), dag, map[string]machine.CPUSet{
+		"primary": machine.NewCPUSet(),
+	}, true, nil)
+	if err != nil {
+		t.Fatalf("reset writer error = %v", err)
+	}
+	for _, write := range fake.writes {
+		if write.rel == "primary/pod-a/init.scope" {
+			t.Fatalf("reset writer wrote skipped dynamic descendant: %#v", write)
+		}
+	}
+}
+
+func TestResetWriterRejectsControlledNodeWithoutCpusetController(t *testing.T) {
+	dag, err := BuildDAG([]NodeSpec{{
+		Rel: "primary", Domain: DomainPrimary, Role: TopoNodeRolePrimary,
+		CPUs: machine.NewCPUSet(), TrustAnchor: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fake := newFakeHierarchyDriver()
+	fake.capabilities.EmptyConfiguredCPUSet = true
+	fake.capabilities.EffectiveCPUSet = true
+	fake.add("primary", CgroupIdentity{Device: 1, Inode: 1}, "0-3", "0")
+	fake.beforeCall = func(op HierarchyOperation, rel string) error {
+		if op == HierarchyOperationRead && rel == "primary" {
+			return ErrCgroupControllerUnavailable
+		}
+		return nil
+	}
+
+	res := &ConvergenceResult{}
+	writer := newResetCoordinatorWriter(fake, NewBudgetTracker(ConvergenceBudget{}), "", res)
+	err = writer.execute(context.Background(), dag, map[string]machine.CPUSet{
+		"primary": machine.NewCPUSet(),
+	}, true, nil)
+	if !errors.Is(err, ErrCgroupControllerUnavailable) {
+		t.Fatalf("reset writer error = %v, want ErrCgroupControllerUnavailable", err)
+	}
+}
+
 func TestVerifyResetConvergenceKeepsEffectiveCPUsForNonEmptyTarget(t *testing.T) {
 	dag, err := BuildDAG([]NodeSpec{{
 		Rel: "primary", Domain: DomainPrimary, Role: TopoNodeRolePrimary,

@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -198,6 +199,9 @@ func (b *snapshotBuilder) scan(rel string, domain DomainID, depth int, expected 
 	}
 	entry, err := b.driver.ReadEntry(b.ctx, rel)
 	if err != nil {
+		if b.shouldSkipUnavailableController(rel, depth, err) {
+			return nil
+		}
 		return b.fail(HierarchyOperationRead, rel, before, err)
 	}
 	after, err := b.driver.StatIdentity(b.ctx, rel)
@@ -249,6 +253,22 @@ func (b *snapshotBuilder) scan(rel string, domain DomainID, depth int, expected 
 	}
 	sort.Strings(b.snapshot.ScanBoundary.ExpandedRels)
 	return nil
+}
+
+func (b *snapshotBuilder) shouldSkipUnavailableController(rel string, depth int, err error) bool {
+	if !errors.Is(err, ErrCgroupControllerUnavailable) {
+		return false
+	}
+	if !b.snapshot.Capabilities.EffectiveCPUSet {
+		return false
+	}
+	if depth <= 1 {
+		return false
+	}
+	if _, controlled := b.controlled[rel]; controlled {
+		return false
+	}
+	return true
 }
 
 func (b *snapshotBuilder) fail(op HierarchyOperation, rel string, identity CgroupIdentity, err error) error {

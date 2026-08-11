@@ -180,6 +180,34 @@ func TestCgroupV2DriverReadsConfiguredAndEffectiveStateFromOneDirectoryFD(t *tes
 	}
 }
 
+func TestCgroupV2DriverClassifiesMissingCpusetControllerInterface(t *testing.T) {
+	root := resolvedPath(t, t.TempDir())
+	podDir := filepath.Join(root, "pod")
+	if err := os.MkdirAll(podDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(podDir, "cpuset.cpus"), []byte("0-3"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(podDir, "cpuset.mems"), []byte("0"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	hierarchyDriver, err := NewCgroupV2Driver(root, nil)
+	if err != nil {
+		t.Fatalf("NewCgroupV2Driver() error = %v", err)
+	}
+	defer hierarchyDriver.Close()
+
+	_, err = hierarchyDriver.ReadEntry(context.Background(), "pod")
+	if !errors.Is(err, ErrCgroupControllerUnavailable) {
+		t.Fatalf("ReadEntry() error = %v, want ErrCgroupControllerUnavailable", err)
+	}
+	if got := hierarchyDriver.Classify(err, HierarchyOperationRead); got != HierarchyErrorStale {
+		t.Fatalf("Classify() = %s, want %s", got, HierarchyErrorStale)
+	}
+}
+
 func TestCgroupV2DriverEmptyWriteStaysBoundToOpenedGeneration(t *testing.T) {
 	parent := resolvedPath(t, t.TempDir())
 	root := filepath.Join(parent, "root")

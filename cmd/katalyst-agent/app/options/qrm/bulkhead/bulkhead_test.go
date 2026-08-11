@@ -43,6 +43,32 @@ func TestBulkheadOptionsAddFlagsMaxCPUsDrainRatio(t *testing.T) {
 	require.Equal(t, 0.25, options.MaxCPUsDrainRatio)
 }
 
+func TestBulkheadOptionsDefaultDisablesPartitionRelPaths(t *testing.T) {
+	t.Parallel()
+
+	options := NewBulkheadOptions()
+	require.Empty(t, options.BulkheadPartitionRelPaths)
+
+	conf := bulkheadconfig.NewBulkheadConfiguration()
+	require.NoError(t, options.ApplyTo(conf))
+	require.Empty(t, conf.BulkheadPartitionRelPaths)
+}
+
+func TestBulkheadOptionsCanExplicitlyEnablePartitionRelPaths(t *testing.T) {
+	t.Parallel()
+
+	options := NewBulkheadOptions()
+	fss := &cliflag.NamedFlagSets{}
+	options.AddFlags(fss)
+
+	fs := fss.FlagSet("cpu_resource_plugin")
+	require.NoError(t, fs.Set("qrm-cpu-bulkhead-partition-rel-paths", "kubepods,system"))
+
+	conf := bulkheadconfig.NewBulkheadConfiguration()
+	require.NoError(t, options.ApplyTo(conf))
+	require.Equal(t, []string{"kubepods", "system"}, conf.BulkheadPartitionRelPaths)
+}
+
 func TestBulkheadOptionsApplyToValidatesMaxCPUsDrainRatio(t *testing.T) {
 	t.Parallel()
 

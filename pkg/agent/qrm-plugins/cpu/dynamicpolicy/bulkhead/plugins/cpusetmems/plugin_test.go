@@ -394,6 +394,64 @@ func TestCPUSetMemsPluginNonBusyErrorReturned(t *testing.T) {
 	}
 }
 
+func TestCPUSetMemsPluginSkipsV2DynamicDescendantWithoutCpusetController(t *testing.T) {
+	t.Parallel()
+
+	missingCpusetErr := &os.PathError{Op: "write", Path: "cpuset.mems", Err: syscall.ENOENT}
+	cg := &fakeCgroupClient{
+		version: cgroupclient.CgroupVersionV2,
+		existing: map[string]bool{
+			"reclaim/reclaim-0": true,
+		},
+		children: map[string][]string{
+			"reclaim/reclaim-0":       {"pod-a"},
+			"reclaim/reclaim-0/pod-a": {"init.scope"},
+		},
+		applyErr: map[string]error{
+			"reclaim/reclaim-0/pod-a/init.scope": missingCpusetErr,
+		},
+	}
+	p := &CPUSetMemsPlugin{cfg: bulkheadconfig.BulkheadConfiguration{
+		BulkheadReclaimRelPaths:     []string{"reclaim"},
+		BulkheadReclaimNumaPrefixes: []string{"reclaim/reclaim-"},
+	}, cgroup: cg}
+
+	if err := p.PeriodicalHandler(context.Background(), periodicalCtx(true)); err != nil {
+		t.Fatalf("PeriodicalHandler: %v", err)
+	}
+	if _, ok := cg.cpusetWrites["reclaim/reclaim-0"]; !ok {
+		t.Fatalf("controlled reclaim rel was not written")
+	}
+	if _, ok := cg.cpusetWrites["reclaim/reclaim-0/pod-a"]; !ok {
+		t.Fatalf("dynamic parent with cpuset controller was not written")
+	}
+	if _, ok := cg.cpusetWrites["reclaim/reclaim-0/pod-a/init.scope"]; ok {
+		t.Fatalf("dynamic descendant without cpuset controller was written")
+	}
+}
+
+func TestCPUSetMemsPluginRejectsV2ControlledRelWithoutCpusetController(t *testing.T) {
+	t.Parallel()
+
+	cg := &fakeCgroupClient{
+		version: cgroupclient.CgroupVersionV2,
+		existing: map[string]bool{
+			"reclaim/reclaim-0": true,
+		},
+		applyErr: map[string]error{
+			"reclaim/reclaim-0": &os.PathError{Op: "write", Path: "cpuset.mems", Err: syscall.ENOENT},
+		},
+	}
+	p := &CPUSetMemsPlugin{cfg: bulkheadconfig.BulkheadConfiguration{
+		BulkheadReclaimRelPaths:     []string{"reclaim"},
+		BulkheadReclaimNumaPrefixes: []string{"reclaim/reclaim-"},
+	}, cgroup: cg}
+
+	if err := p.PeriodicalHandler(context.Background(), periodicalCtx(true)); err == nil {
+		t.Fatalf("PeriodicalHandler returned nil for controlled rel without cpuset controller, want error")
+	}
+}
+
 func TestCPUSetMemsPluginSkipsMissingRel(t *testing.T) {
 	t.Parallel()
 

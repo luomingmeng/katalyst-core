@@ -18,6 +18,7 @@ package topology
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 
@@ -187,11 +188,29 @@ func (w resetCoordinatorWriter) propagateResetTarget(ctx context.Context, parent
 			mems = memsForNode(parentNode, w.defaultMems)
 		}
 		if err := w.writeResetRel(ctx, childRel, parentRel, target, mems); err != nil {
+			if w.shouldSkipDynamicUnavailableController(err, hasExpected) {
+				w.markDynamicResetSkip()
+				continue
+			}
 			if *firstErr == nil {
 				*firstErr = err
 			}
 			continue
 		}
 		w.propagateResetTarget(ctx, childRel, target, controlled, expected, firstErr, depth+1)
+	}
+}
+
+func (w resetCoordinatorWriter) shouldSkipDynamicUnavailableController(err error, hasExpected bool) bool {
+	return !hasExpected && errors.Is(err, ErrCgroupControllerUnavailable)
+}
+
+func (w resetCoordinatorWriter) markDynamicResetSkip() {
+	if w.res == nil {
+		return
+	}
+	w.res.Skipped++
+	if w.res.Failed > 0 {
+		w.res.Failed--
 	}
 }

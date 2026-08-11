@@ -52,7 +52,6 @@ func NewBulkheadOptions() BulkheadOptions {
 		BulkheadPrimaryRelPath:          "kubepods",
 		BulkheadReclaimRelPaths:         []string{"reclaimed"},
 		BulkheadReclaimNumaPrefixes:     []string{"reclaimed/reclaimed-"},
-		BulkheadPartitionRelPaths:       []string{"kubepods"},
 		EnableBulkheadReclaimSiblings:   true,
 		BulkheadWorkqueueSysfsDir:       "/sys/devices/virtual/workqueue",
 		BulkheadSystemRelPath:           "system",
