@@ -1753,3 +1753,73 @@ func TestGetIsolatedContainerRegions(t *testing.T) {
 	assert.ElementsMatch(t, []string{}, f(c3_1))
 	assert.ElementsMatch(t, []string{}, f(c3_2))
 }
+
+// recordingMetricEmitter records the latest int64 value stored per metric name
+// so the metrics helper can be asserted directly in unit tests.
+type recordingMetricEmitter struct {
+	metrics.DummyMetrics
+	int64Values map[string]int64
+}
+
+func newRecordingMetricEmitter() *recordingMetricEmitter {
+	return &recordingMetricEmitter{int64Values: make(map[string]int64)}
+}
+
+func (r *recordingMetricEmitter) StoreInt64(name string, value int64, _ metrics.MetricTypeName, _ ...metrics.MetricTag) error {
+	r.int64Values[name] = value
+	return nil
+}
+
+func (r *recordingMetricEmitter) Int64Values() map[string]int64 {
+	out := make(map[string]int64, len(r.int64Values))
+	for name, value := range r.int64Values {
+		out[name] = value
+	}
+	return out
+}
+
+func TestEmitDefaultShareBackfillMetrics(t *testing.T) {
+	t.Run("enabled emits all", func(t *testing.T) {
+		emitter := newRecordingMetricEmitter()
+		diagnostics := types.DefaultShareBackfillDiagnostics{
+			Enabled: true, AllocatableBudget: 190, ReserveSize: 2, FixedPoolSize: 8,
+			RawReclaimSize: 186, FinalReclaimSize: 56, ReleasedReclaimSize: 130,
+			DedicatedSize: 0, IsolationSize: 0, CustomSharedSize: 0, SNBSize: 0,
+			ExclusiveNUMASize: 0, PinnedCPUSize: 0,
+			DefaultShareBeforeBackfill: 4, DefaultShareBackfilled: 130,
+			DefaultShareFinal: 134, UnassignedNonReclaimSize: 0,
+		}
+		emitDefaultShareBackfillMetrics(emitter, diagnostics)
+		expected := map[string]int64{
+			"cpu_advisor_machine_allocatable":           190,
+			"cpu_advisor_reserve_size":                  2,
+			"cpu_advisor_fixed_pool_size":               8,
+			"cpu_advisor_raw_reclaim_size":              186,
+			"cpu_advisor_final_reclaim_size":            56,
+			"cpu_advisor_reclaim_clamped_size":          130,
+			"cpu_advisor_dedicated_size":                0,
+			"cpu_advisor_isolation_size":                0,
+			"cpu_advisor_custom_shared_size":            0,
+			"cpu_advisor_snb_size":                      0,
+			"cpu_advisor_exclusive_numa_size":           0,
+			"cpu_advisor_pinned_cpu_size":               0,
+			"cpu_advisor_default_share_before_backfill": 4,
+			"cpu_advisor_default_share_backfilled":      130,
+			"cpu_advisor_default_share_final":           134,
+			"cpu_advisor_unassigned_non_reclaim_size":   0,
+		}
+		require.Equal(t, expected, emitter.Int64Values())
+	})
+
+	t.Run("disabled no-op", func(t *testing.T) {
+		emitter := newRecordingMetricEmitter()
+		diagnostics := types.DefaultShareBackfillDiagnostics{
+			Enabled: false, AllocatableBudget: 190, ReserveSize: 2, FixedPoolSize: 8,
+			RawReclaimSize: 186, FinalReclaimSize: 56, ReleasedReclaimSize: 130,
+			DefaultShareBeforeBackfill: 4, DefaultShareBackfilled: 130,
+			DefaultShareFinal: 134,
+		}
+		emitDefaultShareBackfillMetrics(emitter, diagnostics)
+		require.Len(t, emitter.Int64Values(), 0)
+	})
+}

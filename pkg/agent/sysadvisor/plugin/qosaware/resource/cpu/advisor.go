@@ -60,6 +60,23 @@ const (
 	metricRegionIndicatorCurrentPrefix = "region_indicator_current_"
 	metricRegionIndicatorErrorPrefix   = "region_indicator_error_"
 
+	metricCPUAdvisorMachineAllocatable       = "cpu_advisor_machine_allocatable"
+	metricCPUAdvisorReserveSize              = "cpu_advisor_reserve_size"
+	metricCPUAdvisorFixedPoolSize            = "cpu_advisor_fixed_pool_size"
+	metricCPUAdvisorRawReclaimSize           = "cpu_advisor_raw_reclaim_size"
+	metricCPUAdvisorFinalReclaimSize         = "cpu_advisor_final_reclaim_size"
+	metricCPUAdvisorReclaimClampedSize       = "cpu_advisor_reclaim_clamped_size"
+	metricCPUAdvisorDedicatedSize            = "cpu_advisor_dedicated_size"
+	metricCPUAdvisorIsolationSize            = "cpu_advisor_isolation_size"
+	metricCPUAdvisorCustomSharedSize         = "cpu_advisor_custom_shared_size"
+	metricCPUAdvisorSNBSize                  = "cpu_advisor_snb_size"
+	metricCPUAdvisorExclusiveNUMASize        = "cpu_advisor_exclusive_numa_size"
+	metricCPUAdvisorPinnedCPUSize            = "cpu_advisor_pinned_cpu_size"
+	metricCPUAdvisorDefaultShareBefore       = "cpu_advisor_default_share_before_backfill"
+	metricCPUAdvisorDefaultShareBackfilled   = "cpu_advisor_default_share_backfilled"
+	metricCPUAdvisorDefaultShareFinal        = "cpu_advisor_default_share_final"
+	metricCPUAdvisorUnassignedNonReclaimSize = "cpu_advisor_unassigned_non_reclaim_size"
+
 	cpuAdvisorHealthCheckName     = "cpu_advisor_update"
 	healthCheckTolerationDuration = 30 * time.Second
 )
@@ -582,8 +599,7 @@ func (cra *cpuResourceAdvisor) gcRegionMap() {
 func (cra *cpuResourceAdvisor) updateAdvisorEssentials() {
 	cra.nonBindingNumas = cra.metaServer.CPUDetails.NUMANodes()
 	cra.allowSharedCoresOverlapReclaimedCores = cra.conf.GetDynamicConfiguration().AllowSharedCoresOverlapReclaimedCores
-	cra.disableDedicatedCoresOverlapReclaimedCores =
-		cra.conf.GetDynamicConfiguration().DisableDedicatedCoresOverlapReclaimedCores
+	cra.disableDedicatedCoresOverlapReclaimedCores = cra.conf.GetDynamicConfiguration().DisableDedicatedCoresOverlapReclaimedCores
 
 	// update non-binding numas
 	for _, r := range cra.regionMap {
@@ -681,5 +697,38 @@ func (cra *cpuResourceAdvisor) emitMetrics(calculationResult types.InternalCPUCa
 				}
 			}
 		}
+	}
+
+	emitDefaultShareBackfillMetrics(cra.emitter, calculationResult.DefaultShareBackfill)
+}
+
+// emitDefaultShareBackfillMetrics reports the structured diagnostics of the
+// default share residual backfill as raw int64 metrics. It is a no-op when the
+// backfill feature is disabled so that clusters without the feature do not emit
+// misleading zero-valued series.
+func emitDefaultShareBackfillMetrics(emitter metrics.MetricEmitter, diagnostics types.DefaultShareBackfillDiagnostics) {
+	if !diagnostics.Enabled {
+		return
+	}
+	values := map[string]int{
+		metricCPUAdvisorMachineAllocatable:       diagnostics.AllocatableBudget,
+		metricCPUAdvisorReserveSize:              diagnostics.ReserveSize,
+		metricCPUAdvisorFixedPoolSize:            diagnostics.FixedPoolSize,
+		metricCPUAdvisorRawReclaimSize:           diagnostics.RawReclaimSize,
+		metricCPUAdvisorFinalReclaimSize:         diagnostics.FinalReclaimSize,
+		metricCPUAdvisorReclaimClampedSize:       diagnostics.ReleasedReclaimSize,
+		metricCPUAdvisorDedicatedSize:            diagnostics.DedicatedSize,
+		metricCPUAdvisorIsolationSize:            diagnostics.IsolationSize,
+		metricCPUAdvisorCustomSharedSize:         diagnostics.CustomSharedSize,
+		metricCPUAdvisorSNBSize:                  diagnostics.SNBSize,
+		metricCPUAdvisorExclusiveNUMASize:        diagnostics.ExclusiveNUMASize,
+		metricCPUAdvisorPinnedCPUSize:            diagnostics.PinnedCPUSize,
+		metricCPUAdvisorDefaultShareBefore:       diagnostics.DefaultShareBeforeBackfill,
+		metricCPUAdvisorDefaultShareBackfilled:   diagnostics.DefaultShareBackfilled,
+		metricCPUAdvisorDefaultShareFinal:        diagnostics.DefaultShareFinal,
+		metricCPUAdvisorUnassignedNonReclaimSize: diagnostics.UnassignedNonReclaimSize,
+	}
+	for name, value := range values {
+		_ = emitter.StoreInt64(name, int64(value), metrics.MetricTypeNameRaw)
 	}
 }

@@ -149,6 +149,7 @@ func (cs *cpuServer) GetAdvice(ctx context.Context, request *cpuadvisor.GetAdvic
 		ExtraEntries:                          result.ExtraEntries,
 		SupportedFeatureGates:                 supportedWantedFeatureGates,
 		DisableDedicatedCoresOverlapReclaimedCores: result.DisableDedicatedCoresOverlapReclaimedCores,
+		FillDefaultSharePoolWithNonReclaimCpus:     result.FillDefaultSharePoolWithNonReclaimCPUs,
 	}
 	general.Infof("get advice response: %v", general.ToString(resp))
 	general.InfoS("get advice", "duration", time.Since(startTime))
@@ -300,6 +301,15 @@ func (cs *cpuServer) updateAdvisor(ctx context.Context, featureGates map[string]
 		_ = cs.emitter.StoreInt64(cs.genMetricsName(metricServerAdvisorUpdateFailed), int64(cs.period.Seconds()), metrics.MetricTypeNameCount)
 		return nil, fmt.Errorf("get advice failed: invalid type: %T", advisorRespRaw)
 	}
+	if advisorResp.DefaultShareBackfill.Enabled {
+		shareEntry, ok := advisorResp.PoolEntries[commonstate.PoolNameShare]
+		if !ok {
+			return nil, fmt.Errorf("default share quantity is missing")
+		}
+		if _, ok := shareEntry[commonstate.FakedNUMAID]; !ok {
+			return nil, fmt.Errorf("default share quantity is missing")
+		}
+	}
 
 	klog.Infof("[qosaware-server-cpu] get advisor update: %+v", general.ToString(advisorResp))
 
@@ -310,6 +320,7 @@ type cpuInternalResult struct {
 	Entries                                    map[string]*cpuadvisor.CalculationEntries
 	AllowSharedCoresOverlapReclaimedCores      bool
 	DisableDedicatedCoresOverlapReclaimedCores bool
+	FillDefaultSharePoolWithNonReclaimCPUs     bool
 	ExtraEntries                               []*advisorsvc.CalculationInfo
 }
 
@@ -323,6 +334,7 @@ func convertInternalCPUResultToListAndWatchResponse(result *cpuInternalResult) *
 		AllowSharedCoresOverlapReclaimedCores: result.AllowSharedCoresOverlapReclaimedCores,
 		ExtraEntries:                          result.ExtraEntries,
 		DisableDedicatedCoresOverlapReclaimedCores: result.DisableDedicatedCoresOverlapReclaimedCores,
+		FillDefaultSharePoolWithNonReclaimCpus:     result.FillDefaultSharePoolWithNonReclaimCPUs,
 	}
 }
 
@@ -366,6 +378,7 @@ func (cs *cpuServer) assembleResponse(advisorResp *types.InternalCPUCalculationR
 		ExtraEntries:                          extraEntries,
 		AllowSharedCoresOverlapReclaimedCores: advisorResp.AllowSharedCoresOverlapReclaimedCores,
 		DisableDedicatedCoresOverlapReclaimedCores: advisorResp.DisableDedicatedCoresOverlapReclaimedCores,
+		FillDefaultSharePoolWithNonReclaimCPUs:     advisorResp.DefaultShareBackfill.Enabled,
 	}
 
 	return resp

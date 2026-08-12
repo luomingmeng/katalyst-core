@@ -1766,6 +1766,9 @@ func TestAssembleWithoutNUMAExclusivePoolOverlapPolicyMatrix(t *testing.T) {
 				dedicatedRequirement:    6,
 			})
 			require.NoError(t, err)
+			// This matrix validates overlap policy outputs. Reclaim diagnostics
+			// are covered separately, including the ratio-disabled path.
+			tt.want.DefaultShareBackfill = result.DefaultShareBackfill
 			require.Equal(t, tt.want, *result)
 		})
 	}
@@ -2177,6 +2180,140 @@ func TestClampByReclaimedCPUMaxRatio(t *testing.T) {
 			require.Equal(t, tt.wantLimit, gotLimit)
 		})
 	}
+}
+
+func TestClampByReclaimedCPUMaxRatioWithDiagnostics(t *testing.T) {
+	tests := []struct {
+		name               string
+		size               int
+		limit              float64
+		ratio              float64
+		cpuCount           int
+		reservedForReclaim int
+		want               reclaimClampResult
+	}{
+		{
+			name: "size is capped and aligned to even cores",
+			size: 186, limit: -1, ratio: 0.3, cpuCount: 192, reservedForReclaim: 38,
+			want: reclaimClampResult{RawSize: 186, FinalSize: 56, ReleasedSize: 130, FinalLimit: -1},
+		},
+		{
+			name: "quota and size are both capped by existing helper",
+			size: 186, limit: 120, ratio: 0.3, cpuCount: 192, reservedForReclaim: 38,
+			want: reclaimClampResult{RawSize: 186, FinalSize: 56, ReleasedSize: 130, FinalLimit: 56},
+		},
+		{
+			name: "ratio zero keeps no-cap semantics",
+			size: 186, limit: -1, ratio: 0, cpuCount: 192, reservedForReclaim: 38,
+			want: reclaimClampResult{RawSize: 186, FinalSize: 186, ReleasedSize: 0, FinalLimit: -1},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := clampByReclaimedCPUMaxRatioWithDiagnostics(tc.size, tc.limit, tc.ratio, tc.cpuCount, tc.reservedForReclaim)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestDefaultShareBackfillDiagnosticsWhenRatioDisabled(t *testing.T) {
+	t.Parallel()
+
+	pa := newDefaultShareAssembler(t, map[int]int{0: 20}, machine.NewCPUSet(0), nil,
+		map[int]int{0: 2}, false, true, nil)
+	pa.conf.GetDynamicConfiguration().EnableReclaim = true
+	pa.conf.GetDynamicConfiguration().ReclaimedCPUMaxRatio = 0
+	result := newDefaultShareResult(true)
+	result.DisableDedicatedCoresOverlapReclaimedCores = true
+
+	err := pa.assembleWithoutNUMAExclusivePool(
+		NewRegionMapHelper(*pa.regionMap),
+		commonstate.FakedNUMAID,
+		result,
+	)
+	require.NoError(t, err)
+	require.Equal(t, 20, result.DefaultShareBackfill.RawReclaimSize)
+	require.Equal(t, 20, result.DefaultShareBackfill.FinalReclaimSize)
+	require.Zero(t, result.DefaultShareBackfill.ReleasedReclaimSize)
+}
+
+func TestDefaultShareBackfillReleasedAccumulatesAcrossScopes(t *testing.T) {
+	t.Parallel()
+
+	// Build a non-exclusive assembler whose reclaim pool is larger than the
+	// ratio cap, so each pass through assembleWithoutNUMAExclusivePool releases
+	// cores that must be backfilled into the default share diagnostics.
+	//
+	// With EnableReclaim and no regions, calculateReclaimPool yields
+	// reclaimedCoresSize == available (20). The ratio cap is
+	// floor(0.5*20)=10 (even, above reserved=2), so each pass raw=20,
+	// final=10, released=10. Driving the real production accumulation twice
+	// (two non-exclusive scopes) must add up across scopes rather than
+	// overwrite; this fails if the three "+=" writes in
+	// assembleWithoutNUMAExclusivePool are removed.
+	conf, err := options.NewOptions().Config()
+	require.NoError(t, err)
+	conf.GetDynamicConfiguration().EnableReclaim = true
+	conf.GetDynamicConfiguration().ReclaimedCPUMaxRatio = 0.5
+
+	const cpuCount = 20
+	cpuDetails := machine.CPUDetails{}
+	for cpuID := 0; cpuID < cpuCount; cpuID++ {
+		cpuDetails[cpuID] = machine.CPUTopoInfo{NUMANodeID: 0}
+	}
+	metaServer := &metaserver.MetaServer{
+		MetaAgent: &metaagent.MetaAgent{
+			KatalystMachineInfo: &machine.KatalystMachineInfo{
+				CPUTopology: &machine.CPUTopology{
+					NumCPUs:      cpuCount,
+					NumCores:     cpuCount,
+					NumSockets:   1,
+					NumNUMANodes: 1,
+					CPUDetails:   cpuDetails,
+				},
+			},
+		},
+	}
+	metaReader := metacache.NewDummyMetaCacheImp()
+
+	regionMap := map[string]region.QoSRegion{}
+	reservedForReclaim := map[int]int{0: 2}
+	numaAvailable := map[int]int{0: cpuCount}
+	nonBindingNUMAs := machine.NewCPUSet(0)
+	allowOverlap := true
+	disableDedicatedOverlap := false
+	pa := NewProvisionAssemblerCommon(
+		conf,
+		nil,
+		&regionMap,
+		&reservedForReclaim,
+		&numaAvailable,
+		&nonBindingNUMAs,
+		&allowOverlap,
+		&disableDedicatedOverlap,
+		metaReader,
+		metaServer,
+		metrics.DummyMetrics{},
+	).(*ProvisionAssemblerCommon)
+
+	result := &types.InternalCPUCalculationResult{
+		PoolEntries:                 map[string]map[int]types.CPUResource{},
+		PoolOverlapInfo:             map[string]map[int]map[string]int{},
+		PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{},
+	}
+	regionHelper := NewRegionMapHelper(regionMap)
+
+	// first non-exclusive scope
+	require.NoError(t, pa.assembleWithoutNUMAExclusivePool(regionHelper, commonstate.FakedNUMAID, result))
+	require.Equal(t, 20, result.DefaultShareBackfill.RawReclaimSize)
+	require.Equal(t, 10, result.DefaultShareBackfill.FinalReclaimSize)
+	require.Equal(t, 10, result.DefaultShareBackfill.ReleasedReclaimSize)
+
+	// second non-exclusive scope must accumulate on top of the first
+	require.NoError(t, pa.assembleWithoutNUMAExclusivePool(regionHelper, commonstate.FakedNUMAID, result))
+	require.Equal(t, 40, result.DefaultShareBackfill.RawReclaimSize)
+	require.Equal(t, 20, result.DefaultShareBackfill.FinalReclaimSize)
+	require.Equal(t, 20, result.DefaultShareBackfill.ReleasedReclaimSize)
 }
 
 func TestAssembleProvisionUsesReservedWhenEvenRatioCapIsLower(t *testing.T) {
@@ -2591,4 +2728,649 @@ func TestAssembleDedicatedNUMAExclusiveRegionLegacyGolden(t *testing.T) {
 		result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["pod"]["main"])
 	require.Equal(t, 6,
 		result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["pod"]["sidecar"])
+}
+
+func TestCalculateDefaultShareTargetSize(t *testing.T) {
+	tests := []struct {
+		name    string
+		budget  map[int]defaultShareNUMABudget
+		want    int
+		wantErr string
+	}{
+		{
+			name: "current 192 cpu node",
+			budget: map[int]defaultShareNUMABudget{
+				0: {UnpinnedAllocatableSize: 95, FinalUnpinnedReclaimSize: 28},
+				1: {UnpinnedAllocatableSize: 95, FinalUnpinnedReclaimSize: 28},
+			},
+			want: 134,
+		},
+		{
+			name: "fixed pools and pinned cpus are deducted",
+			budget: map[int]defaultShareNUMABudget{
+				0: {UnpinnedAllocatableSize: 91, FinalUnpinnedReclaimSize: 28, FixedUnpinnedPoolSize: 10},
+				1: {UnpinnedAllocatableSize: 91, FinalUnpinnedReclaimSize: 28, FixedUnpinnedPoolSize: 10},
+			},
+			want: 106,
+		},
+		{
+			name: "exclusive numa ignores nested reclaim and pinned quantities",
+			budget: map[int]defaultShareNUMABudget{
+				0: {UnpinnedAllocatableSize: 95, FinalUnpinnedReclaimSize: 28},
+				1: {UnpinnedAllocatableSize: 80, FinalUnpinnedReclaimSize: 20, FixedUnpinnedPoolSize: 8, Exclusive: true},
+			},
+			want: 67,
+		},
+		{
+			name: "fixed pools cannot exceed allocatable budget",
+			budget: map[int]defaultShareNUMABudget{
+				0: {UnpinnedAllocatableSize: 16, FinalUnpinnedReclaimSize: 8, FixedUnpinnedPoolSize: 10},
+			},
+			wantErr: "default share residual is negative",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := calculateDefaultShareTargetSize(tc.budget)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// newDefaultShareAssembler builds a ProvisionAssemblerCommon suitable for
+// exercising the default share backfill helpers with directly constructed
+// pool entries. The topology has a single socket with one CPU per NUMA slot so
+// cpuCountInNUMAs reflects numaAvailable when every NUMA is fully available.
+func newDefaultShareAssembler(
+	t *testing.T,
+	numaAvailable map[int]int,
+	nonBinding machine.CPUSet,
+	regionMap map[string]region.QoSRegion,
+	reserved map[int]int,
+	allowShared, disableDedicated bool,
+	cfg types.ResourcePackageConfig,
+) *ProvisionAssemblerCommon {
+	t.Helper()
+
+	conf, err := options.NewOptions().Config()
+	require.NoError(t, err)
+
+	totalCPUs := 0
+	for _, v := range numaAvailable {
+		totalCPUs += v
+	}
+	cpuDetails := machine.CPUDetails{}
+	cpuID := 0
+	for numaID, size := range numaAvailable {
+		for i := 0; i < size; i++ {
+			cpuDetails[cpuID] = machine.CPUTopoInfo{NUMANodeID: numaID}
+			cpuID++
+		}
+	}
+	metaServer := &metaserver.MetaServer{
+		MetaAgent: &metaagent.MetaAgent{
+			KatalystMachineInfo: &machine.KatalystMachineInfo{
+				CPUTopology: &machine.CPUTopology{
+					NumCPUs:      totalCPUs,
+					NumCores:     totalCPUs,
+					NumSockets:   1,
+					NumNUMANodes: len(numaAvailable),
+					CPUDetails:   cpuDetails,
+				},
+			},
+		},
+	}
+
+	metaReader := metacache.NewDummyMetaCacheImp()
+	if cfg != nil {
+		require.NoError(t, metaReader.SetResourcePackageConfig(cfg))
+	}
+
+	numaAvailableCopy := map[int]int{}
+	for k, v := range numaAvailable {
+		numaAvailableCopy[k] = v
+	}
+	reservedCopy := map[int]int{}
+	for k, v := range reserved {
+		reservedCopy[k] = v
+	}
+	if regionMap == nil {
+		regionMap = map[string]region.QoSRegion{}
+	}
+
+	return NewProvisionAssemblerCommon(
+		conf,
+		nil,
+		&regionMap,
+		&reservedCopy,
+		&numaAvailableCopy,
+		&nonBinding,
+		&allowShared,
+		&disableDedicated,
+		metaReader,
+		metaServer,
+		metrics.DummyMetrics{},
+	).(*ProvisionAssemblerCommon)
+}
+
+func newDefaultShareResult(enabled bool) *types.InternalCPUCalculationResult {
+	result := &types.InternalCPUCalculationResult{
+		PoolEntries:                 map[string]map[int]types.CPUResource{},
+		PoolOverlapInfo:             map[string]map[int]map[string]int{},
+		PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{},
+	}
+	result.DefaultShareBackfill.Enabled = enabled
+	return result
+}
+
+// TestValidateDefaultShareBackfillConfig covers the gate-compatibility rule from
+// Step 4/5: backfill requires shared and dedicated reclaim overlap disabled.
+func TestValidateDefaultShareBackfillConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name             string
+		fill             bool
+		allowShared      bool
+		disableDedicated bool
+		wantErr          string
+	}{
+		{name: "gate disabled is always valid", fill: false, allowShared: true, disableDedicated: false},
+		{name: "gate enabled with overlap disabled is valid", fill: true, allowShared: false, disableDedicated: true},
+		{
+			name: "shared overlap enabled is rejected", fill: true, allowShared: true, disableDedicated: true,
+			wantErr: "fill default share pool requires shared and dedicated reclaim overlap disabled",
+		},
+		{
+			name: "dedicated overlap enabled is rejected", fill: true, allowShared: false, disableDedicated: false,
+			wantErr: "fill default share pool requires shared and dedicated reclaim overlap disabled",
+		},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pa := newDefaultShareAssembler(t, map[int]int{0: 8}, machine.NewCPUSet(0), nil,
+				map[int]int{0: 2}, tc.allowShared, tc.disableDedicated, nil)
+			pa.conf.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = tc.fill
+			err := pa.validateDefaultShareBackfillConfig()
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+// TestAssembleProvisionRejectsIncompatibleBackfillConfig verifies AssembleProvision
+// returns an empty result together with the gate error.
+func TestAssembleProvisionRejectsIncompatibleBackfillConfig(t *testing.T) {
+	t.Parallel()
+
+	pa := newDefaultShareAssembler(t, map[int]int{0: 8}, machine.NewCPUSet(0), nil,
+		map[int]int{0: 2}, true /*allowShared*/, true, nil)
+	pa.conf.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+
+	result, err := pa.AssembleProvision()
+	require.ErrorContains(t, err, "fill default share pool requires shared and dedicated reclaim overlap disabled")
+	require.Nil(t, result.PoolEntries)
+}
+
+// TestBuildDefaultShareBudgetRules covers Step 6: each classification rule of
+// the canonical budget builder is asserted in isolation.
+func TestBuildDefaultShareBudgetRules(t *testing.T) {
+	t.Parallel()
+
+	t.Run("faked numa share entry does not double count real numa", func(t *testing.T) {
+		t.Parallel()
+		// binding NUMAs 0 and 1, reclaim keyed per real NUMA, share at FakedNUMAID.
+		pa := newDefaultShareAssembler(t, map[int]int{0: 95, 1: 95}, machine.NewCPUSet(), nil,
+			map[int]int{0: 0, 1: 0}, false, true, nil)
+		result := newDefaultShareResult(true)
+		result.SetPoolEntry(commonstate.PoolNameReclaim, 0, 28, -1)
+		result.SetPoolEntry(commonstate.PoolNameReclaim, 1, 28, -1)
+		result.SetPoolEntry(commonstate.PoolNameShare, commonstate.FakedNUMAID, 4, -1)
+
+		budget, summary, err := pa.buildDefaultShareBudget(NewRegionMapHelper(*pa.regionMap), result)
+		require.NoError(t, err)
+		require.Equal(t, 95, budget[0].UnpinnedAllocatableSize)
+		require.Equal(t, 28, budget[0].FinalUnpinnedReclaimSize)
+		require.Equal(t, 95, budget[1].UnpinnedAllocatableSize)
+		require.Equal(t, 190, summary.AllocatableSize)
+		// the FakedNUMAID share entry must not create a phantom bucket.
+		_, hasFaked := budget[commonstate.FakedNUMAID]
+		require.False(t, hasFaked)
+
+		target, err := calculateDefaultShareTargetSize(budget)
+		require.NoError(t, err)
+		require.Equal(t, 134, target)
+	})
+
+	t.Run("unused pinned cpu is deducted from allocatable", func(t *testing.T) {
+		t.Parallel()
+		cfg := types.ResourcePackageConfig{
+			0: {"pkg": {PinnedCPUSet: machine.MustParse("0-9")}},
+		}
+		pa := newDefaultShareAssembler(t, map[int]int{0: 95}, machine.NewCPUSet(), nil,
+			map[int]int{0: 0}, false, true, cfg)
+		result := newDefaultShareResult(true)
+		result.SetPoolEntry(commonstate.PoolNameReclaim, 0, 28, -1)
+
+		budget, summary, err := pa.buildDefaultShareBudget(NewRegionMapHelper(*pa.regionMap), result)
+		require.NoError(t, err)
+		// even though the pinned CPUs are unused, they are removed from the
+		// unpinned allocatable budget.
+		require.Equal(t, 85, budget[0].UnpinnedAllocatableSize)
+		require.Equal(t, 10, summary.PinnedCPUSize)
+
+		target, err := calculateDefaultShareTargetSize(budget)
+		require.NoError(t, err)
+		require.Equal(t, 57, target)
+	})
+
+	t.Run("exclusive numa ignores nested reclaim pinned dedicated", func(t *testing.T) {
+		t.Parallel()
+		exclusive := NewFakeRegion("dedicated-exclusive", configapi.QoSRegionTypeDedicated, "dedicated-exclusive")
+		exclusive.SetBindingNumas(machine.NewCPUSet(1))
+		exclusive.SetIsNumaBinding(true)
+		exclusive.isNumaExclusive = true
+		exclusive.SetPods(types.PodSet{"ded-pod": sets.NewString("main")})
+		regionMap := map[string]region.QoSRegion{exclusive.Name(): exclusive}
+
+		// pinned CPUs live inside the exclusive NUMA 1.
+		cfg := types.ResourcePackageConfig{
+			1: {"pkg": {PinnedCPUSet: machine.MustParse("0-7")}},
+		}
+		pa := newDefaultShareAssembler(t, map[int]int{0: 95, 1: 80}, machine.NewCPUSet(), regionMap,
+			map[int]int{0: 0, 1: 0}, false, true, cfg)
+		result := newDefaultShareResult(true)
+		result.SetPoolEntry(commonstate.PoolNameReclaim, 0, 28, -1)
+		// nested reclaim and dedicated entries inside the exclusive NUMA must be
+		// ignored entirely.
+		result.SetPoolEntry(commonstate.PoolNameReclaim, 1, 20, -1)
+		result.SetPoolEntry("ded-pod", 1, 60, -1)
+
+		budget, summary, err := pa.buildDefaultShareBudget(NewRegionMapHelper(*pa.regionMap), result)
+		require.NoError(t, err)
+		require.True(t, budget[1].Exclusive)
+		require.Equal(t, 0, budget[1].FinalUnpinnedReclaimSize)
+		require.Equal(t, 0, budget[1].FixedUnpinnedPoolSize)
+		// the whole exclusive NUMA (72 unpinned after 8 pinned) counts as
+		// exclusive size, not as residual.
+		require.Equal(t, 72, summary.ExclusiveNUMASize)
+		require.Equal(t, 0, summary.DedicatedSize, "dedicated inside exclusive numa must not be classified")
+
+		target, err := calculateDefaultShareTargetSize(budget)
+		require.NoError(t, err)
+		// only NUMA 0 contributes: 95 - 28 = 67.
+		require.Equal(t, 67, target)
+	})
+
+	t.Run("fixed pools deducted and classified", func(t *testing.T) {
+		t.Parallel()
+		dedicated := NewFakeRegion("ded-region", configapi.QoSRegionTypeDedicated, "ded-region")
+		dedicated.SetBindingNumas(machine.NewCPUSet(0))
+		dedicated.SetIsNumaBinding(true)
+		dedicated.SetPods(types.PodSet{"ded-pod": sets.NewString("main")})
+		regionMap := map[string]region.QoSRegion{dedicated.Name(): dedicated}
+
+		pa := newDefaultShareAssembler(t, map[int]int{0: 95}, machine.NewCPUSet(), regionMap,
+			map[int]int{0: 0}, false, true, nil)
+		result := newDefaultShareResult(true)
+		result.SetPoolEntry(commonstate.PoolNameReclaim, 0, 28, -1)
+		result.SetPoolEntry("ded-pod", 0, 20, -1)                            // dedicated (pod-uid keyed)
+		result.SetPoolEntry("isolation-x", 0, 6, -1)                         // isolation
+		result.SetPoolEntry("batch"+commonstate.NUMAPoolInfix+"0", 0, 8, -1) // SNB
+		result.SetPoolEntry("custom-shared", 0, 5, -1)                       // custom shared
+
+		budget, summary, err := pa.buildDefaultShareBudget(NewRegionMapHelper(*pa.regionMap), result)
+		require.NoError(t, err)
+		require.Equal(t, 39, budget[0].FixedUnpinnedPoolSize) // 20+6+8+5
+		require.Equal(t, 20, summary.DedicatedSize)
+		require.Equal(t, 6, summary.IsolationSize)
+		require.Equal(t, 8, summary.SNBSize)
+		require.Equal(t, 5, summary.CustomSharedSize)
+
+		target, err := calculateDefaultShareTargetSize(budget)
+		require.NoError(t, err)
+		require.Equal(t, 28, target) // 95 - 28 - 39
+	})
+
+	t.Run("dedicated pool with multiple pods is deducted once", func(t *testing.T) {
+		t.Parallel()
+		dedicated := NewFakeRegion("ded-region", configapi.QoSRegionTypeDedicated, "ded-region")
+		dedicated.SetBindingNumas(machine.NewCPUSet(0))
+		dedicated.SetIsNumaBinding(true)
+		dedicated.SetPods(types.PodSet{
+			"ded-pod-a": sets.NewString("main"),
+			"ded-pod-b": sets.NewString("main"),
+		})
+		regionMap := map[string]region.QoSRegion{dedicated.Name(): dedicated}
+
+		pa := newDefaultShareAssembler(t, map[int]int{0: 40}, machine.NewCPUSet(), regionMap,
+			map[int]int{0: 0}, false, true, nil)
+		result := newDefaultShareResult(true)
+		result.SetPoolEntry("ded-pod-a", 0, 20, -1)
+		result.SetPoolEntry("ded-pod-b", 0, 20, -1)
+
+		budget, summary, err := pa.buildDefaultShareBudget(NewRegionMapHelper(*pa.regionMap), result)
+		require.NoError(t, err)
+		require.Equal(t, 20, budget[0].FixedUnpinnedPoolSize)
+		require.Equal(t, 20, summary.DedicatedSize)
+
+		target, err := calculateDefaultShareTargetSize(budget)
+		require.NoError(t, err)
+		require.Equal(t, 20, target)
+	})
+
+	t.Run("fully pinned dedicated pool contributes no fixed size", func(t *testing.T) {
+		t.Parallel()
+		dedicated := NewFakeRegion(
+			"ded-region",
+			configapi.QoSRegionTypeDedicated,
+			resourcepackage.WrapOwnerPoolName("dedicated", "pkg"),
+		)
+		dedicated.SetBindingNumas(machine.NewCPUSet(0))
+		dedicated.SetIsNumaBinding(true)
+		dedicated.SetPods(types.PodSet{"ded-pod": sets.NewString("main")})
+		regionMap := map[string]region.QoSRegion{dedicated.Name(): dedicated}
+		cfg := types.ResourcePackageConfig{
+			0: {"pkg": {PinnedCPUSet: machine.MustParse("0-9")}},
+		}
+
+		pa := newDefaultShareAssembler(t, map[int]int{0: 20}, machine.NewCPUSet(), regionMap,
+			map[int]int{0: 0}, false, true, cfg)
+		result := newDefaultShareResult(true)
+		result.SetPoolEntry("ded-pod", 0, 10, -1)
+
+		budget, summary, err := pa.buildDefaultShareBudget(NewRegionMapHelper(*pa.regionMap), result)
+		require.NoError(t, err)
+		require.Equal(t, 10, budget[0].UnpinnedAllocatableSize)
+		require.Zero(t, budget[0].FixedUnpinnedPoolSize)
+		require.Zero(t, summary.DedicatedSize)
+
+		target, err := calculateDefaultShareTargetSize(budget)
+		require.NoError(t, err)
+		require.Equal(t, 10, target)
+	})
+
+	t.Run("partially pinned dedicated pool contributes only unpinned remainder", func(t *testing.T) {
+		t.Parallel()
+		dedicated := NewFakeRegion(
+			"ded-region",
+			configapi.QoSRegionTypeDedicated,
+			resourcepackage.WrapOwnerPoolName("dedicated", "pkg"),
+		)
+		dedicated.SetBindingNumas(machine.NewCPUSet(0))
+		dedicated.SetIsNumaBinding(true)
+		dedicated.SetPods(types.PodSet{"ded-pod": sets.NewString("main")})
+		regionMap := map[string]region.QoSRegion{dedicated.Name(): dedicated}
+		cfg := types.ResourcePackageConfig{
+			0: {"pkg": {PinnedCPUSet: machine.MustParse("0-3")}},
+		}
+
+		pa := newDefaultShareAssembler(t, map[int]int{0: 20}, machine.NewCPUSet(), regionMap,
+			map[int]int{0: 0}, false, true, cfg)
+		result := newDefaultShareResult(true)
+		result.SetPoolEntry("ded-pod", 0, 10, -1)
+
+		budget, summary, err := pa.buildDefaultShareBudget(NewRegionMapHelper(*pa.regionMap), result)
+		require.NoError(t, err)
+		require.Equal(t, 16, budget[0].UnpinnedAllocatableSize)
+		require.Equal(t, 6, budget[0].FixedUnpinnedPoolSize)
+		require.Equal(t, 6, summary.DedicatedSize)
+
+		target, err := calculateDefaultShareTargetSize(budget)
+		require.NoError(t, err)
+		require.Equal(t, 10, target)
+	})
+
+	for _, tc := range []struct {
+		name       string
+		cfg        types.ResourcePackageConfig
+		wantTarget int
+	}{
+		{
+			name:       "dedicated owner package missing from config is fully fixed",
+			cfg:        types.ResourcePackageConfig{},
+			wantTarget: 30,
+		},
+		{
+			name: "dedicated owner package pinned only in another numa is fully fixed in this bucket",
+			cfg: types.ResourcePackageConfig{
+				1: {"pkg": {PinnedCPUSet: machine.MustParse("20-29")}},
+			},
+			wantTarget: 20,
+		},
+		{
+			name: "dedicated owner package with empty pinned cpu set is fully fixed",
+			cfg: types.ResourcePackageConfig{
+				0: {"pkg": {PinnedCPUSet: machine.NewCPUSet()}},
+			},
+			wantTarget: 30,
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dedicated := NewFakeRegion(
+				"ded-region",
+				configapi.QoSRegionTypeDedicated,
+				resourcepackage.WrapOwnerPoolName("dedicated", "pkg"),
+			)
+			dedicated.SetBindingNumas(machine.NewCPUSet(0))
+			dedicated.SetIsNumaBinding(true)
+			dedicated.SetPods(types.PodSet{"ded-pod": sets.NewString("main")})
+			regionMap := map[string]region.QoSRegion{dedicated.Name(): dedicated}
+
+			pa := newDefaultShareAssembler(t, map[int]int{0: 20, 1: 20}, machine.NewCPUSet(), regionMap,
+				map[int]int{0: 0, 1: 0}, false, true, tc.cfg)
+			result := newDefaultShareResult(true)
+			result.SetPoolEntry("ded-pod", 0, 10, -1)
+
+			budget, summary, err := pa.buildDefaultShareBudget(NewRegionMapHelper(*pa.regionMap), result)
+			require.NoError(t, err)
+			require.Equal(t, 10, budget[0].FixedUnpinnedPoolSize)
+			require.Equal(t, 10, summary.DedicatedSize)
+
+			target, err := calculateDefaultShareTargetSize(budget)
+			require.NoError(t, err)
+			require.Equal(t, tc.wantTarget, target)
+		})
+	}
+
+	t.Run("pod uid mapped to different dedicated regions is rejected", func(t *testing.T) {
+		t.Parallel()
+		first := NewFakeRegion("ded-region-a", configapi.QoSRegionTypeDedicated, "dedicated-a")
+		first.SetBindingNumas(machine.NewCPUSet(0))
+		first.SetIsNumaBinding(true)
+		first.SetPods(types.PodSet{"duplicate-pod": sets.NewString("main")})
+		second := NewFakeRegion("ded-region-b", configapi.QoSRegionTypeDedicated, "dedicated-b")
+		second.SetBindingNumas(machine.NewCPUSet(1))
+		second.SetIsNumaBinding(true)
+		second.SetPods(types.PodSet{"duplicate-pod": sets.NewString("main")})
+		regionMap := map[string]region.QoSRegion{
+			first.Name():  first,
+			second.Name(): second,
+		}
+
+		pa := newDefaultShareAssembler(t, map[int]int{0: 20, 1: 20}, machine.NewCPUSet(), regionMap,
+			map[int]int{0: 0, 1: 0}, false, true, nil)
+		result := newDefaultShareResult(true)
+		result.SetPoolEntry("duplicate-pod", 0, 10, -1)
+
+		_, _, err := pa.buildDefaultShareBudget(NewRegionMapHelper(*pa.regionMap), result)
+		require.EqualError(t, err,
+			`pod uid "duplicate-pod" maps to multiple dedicated regions "ded-region-a" and "ded-region-b"`)
+	})
+}
+
+// TestFinalizeDefaultShareBackfillMatrix covers Step 8 quantity matrix via the
+// production write path finalizeDefaultShareBackfill.
+func TestFinalizeDefaultShareBackfillMatrix(t *testing.T) {
+	t.Parallel()
+
+	type entry struct {
+		pool   string
+		numaID int
+		size   int
+	}
+	tests := []struct {
+		name          string
+		numaAvailable map[int]int
+		nonBinding    machine.CPUSet
+		regionMap     map[string]region.QoSRegion
+		cfg           types.ResourcePackageConfig
+		entries       []entry
+		enabled       bool
+		wantShare     int
+		wantErr       string
+		// wantAllocatable/wantReclaim/wantFixed are independent per-case
+		// constants (derived by hand from the entries above, not from a call to
+		// buildDefaultShareBudget). They let the aggregate invariant compare the
+		// production budget fields against fixed references instead of comparing
+		// values that all originate from the same rebuild.
+		wantAllocatable int
+		wantReclaim     int
+		wantFixed       int
+	}{
+		{
+			name:            "no cap uses full residual after final reclaim",
+			numaAvailable:   map[int]int{0: 95, 1: 95},
+			nonBinding:      machine.NewCPUSet(),
+			entries:         []entry{{commonstate.PoolNameReclaim, 0, 28}, {commonstate.PoolNameReclaim, 1, 28}, {commonstate.PoolNameShare, commonstate.FakedNUMAID, 4}},
+			enabled:         true,
+			wantShare:       134,
+			wantAllocatable: 190,
+			wantReclaim:     56,
+			wantFixed:       0,
+		},
+		{
+			name:            "reclaim disabled still fills residual after fixed pools",
+			numaAvailable:   map[int]int{0: 95},
+			nonBinding:      machine.NewCPUSet(),
+			entries:         []entry{{commonstate.PoolNameReclaim, 0, 0}, {"custom-shared", 0, 10}, {commonstate.PoolNameShare, commonstate.FakedNUMAID, 8}},
+			enabled:         true,
+			wantShare:       85,
+			wantAllocatable: 95,
+			wantReclaim:     0,
+			wantFixed:       10,
+		},
+		{
+			name:            "share can be zero when reclaim takes all residual",
+			numaAvailable:   map[int]int{0: 20},
+			nonBinding:      machine.NewCPUSet(0),
+			entries:         []entry{{commonstate.PoolNameReclaim, commonstate.FakedNUMAID, 20}, {commonstate.PoolNameShare, commonstate.FakedNUMAID, 4}},
+			enabled:         true,
+			wantShare:       0,
+			wantAllocatable: 20,
+			wantReclaim:     20,
+			wantFixed:       0,
+		},
+		{
+			name:          "fixed pools exceeding budget returns error",
+			numaAvailable: map[int]int{0: 16},
+			nonBinding:    machine.NewCPUSet(),
+			entries:       []entry{{commonstate.PoolNameReclaim, 0, 8}, {"custom-shared", 0, 10}},
+			enabled:       true,
+			wantErr:       "default share residual is negative",
+		},
+		{
+			name:          "gate disabled preserves existing share entry",
+			numaAvailable: map[int]int{0: 95, 1: 95},
+			nonBinding:    machine.NewCPUSet(),
+			entries:       []entry{{commonstate.PoolNameReclaim, 0, 28}, {commonstate.PoolNameReclaim, 1, 28}, {commonstate.PoolNameShare, commonstate.FakedNUMAID, 4}},
+			enabled:       false,
+			wantShare:     4,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			reserved := map[int]int{}
+			for numaID := range tc.numaAvailable {
+				reserved[numaID] = 0
+			}
+			pa := newDefaultShareAssembler(t, tc.numaAvailable, tc.nonBinding, tc.regionMap,
+				reserved, false, true, tc.cfg)
+			result := newDefaultShareResult(tc.enabled)
+			for _, e := range tc.entries {
+				result.SetPoolEntry(e.pool, e.numaID, e.size, -1)
+			}
+
+			err := pa.finalizeDefaultShareBackfill(NewRegionMapHelper(*pa.regionMap), result)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.wantShare,
+				result.PoolEntries[commonstate.PoolNameShare][commonstate.FakedNUMAID].Size)
+
+			if !tc.enabled {
+				return
+			}
+			require.Equal(t, tc.wantAllocatable, result.DefaultShareBackfill.AllocatableBudget)
+			require.Equal(t, tc.wantShare, result.DefaultShareBackfill.DefaultShareFinal)
+
+			// aggregate invariant: share + final reclaim + fixed = allocatable
+			// (summed over non-exclusive NUMAs). To avoid a near-tautology, the
+			// production budget aggregates are first pinned against independent
+			// per-case constants (wantAllocatable/wantReclaim/wantFixed derived
+			// by hand from the entries), and only then combined with the
+			// production-computed wantShare in the balance check. If the
+			// residual math in buildDefaultShareBudget or
+			// calculateDefaultShareTargetSize regresses, either these field-level
+			// checks or the wantShare check above will fail.
+			budget, summary, err := pa.buildDefaultShareBudget(NewRegionMapHelper(*pa.regionMap), result)
+			require.NoError(t, err)
+			totalReclaim, totalFixed, totalNonExclusiveAlloc := 0, 0, 0
+			for _, b := range budget {
+				if b.Exclusive {
+					continue
+				}
+				totalReclaim += b.FinalUnpinnedReclaimSize
+				totalFixed += b.FixedUnpinnedPoolSize
+				totalNonExclusiveAlloc += b.UnpinnedAllocatableSize
+			}
+			require.Equal(t, tc.wantAllocatable, totalNonExclusiveAlloc)
+			require.Equal(t, tc.wantReclaim, totalReclaim)
+			require.Equal(t, tc.wantFixed, totalFixed)
+			require.Equal(t, tc.wantAllocatable, tc.wantShare+tc.wantReclaim+tc.wantFixed)
+			require.Equal(t, summary.FixedCommonPoolSize, totalFixed)
+		})
+	}
+}
+
+// TestAssembleProvisionBackfillEndToEnd drives the full AssembleProvision path
+// with the backfill gate enabled on a no-region single NUMA node, confirming the
+// default share pool absorbs all residual non-reclaim CPUs.
+func TestAssembleProvisionBackfillEndToEnd(t *testing.T) {
+	t.Parallel()
+
+	pa := newDefaultShareAssembler(t, map[int]int{0: 20}, machine.NewCPUSet(0), nil,
+		map[int]int{0: 2}, false /*allowShared*/, true /*disableDedicated*/, nil)
+	pa.conf.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+	pa.conf.GetDynamicConfiguration().EnableReclaim = true
+	pa.conf.GetDynamicConfiguration().ReclaimedCPUMaxRatio = 0.3
+
+	result, err := pa.AssembleProvision()
+	require.NoError(t, err)
+	require.True(t, result.DefaultShareBackfill.Enabled)
+
+	reclaim := result.PoolEntries[commonstate.PoolNameReclaim][commonstate.FakedNUMAID].Size
+	share := result.PoolEntries[commonstate.PoolNameShare][commonstate.FakedNUMAID].Size
+	// the default share pool plus the final reclaim pool consume all available
+	// non-reserve CPUs on the node.
+	require.Equal(t, 20, share+reclaim)
+	require.Equal(t, 20-reclaim, share)
+	require.Equal(t, share, result.DefaultShareBackfill.DefaultShareFinal)
 }

@@ -178,6 +178,30 @@ type HeadroomInfo struct {
 	TotalHeadroom float64         `json:"total_headroom"`
 }
 
+// DefaultShareBackfillDiagnostics captures the structured diagnostics of the
+// reclaim max-ratio clamp so that the default share pool can later backfill the
+// residual non-reclaim CPU. It is an internal, in-process only view and is never
+// propagated to the advisor proto.
+type DefaultShareBackfillDiagnostics struct {
+	Enabled                    bool
+	AllocatableBudget          int
+	RawReclaimSize             int
+	FinalReclaimSize           int
+	ReleasedReclaimSize        int
+	FixedPoolSize              int
+	ReserveSize                int
+	DedicatedSize              int
+	IsolationSize              int
+	CustomSharedSize           int
+	SNBSize                    int
+	PinnedCPUSize              int
+	ExclusiveNUMASize          int
+	DefaultShareBeforeBackfill int
+	DefaultShareBackfilled     int
+	DefaultShareFinal          int
+	UnassignedNonReclaimSize   int
+}
+
 // InternalCPUCalculationResult conveys minimal information to cpu server for composing
 // calculation result
 type InternalCPUCalculationResult struct {
@@ -187,6 +211,10 @@ type InternalCPUCalculationResult struct {
 	TimeStamp                                  time.Time
 	AllowSharedCoresOverlapReclaimedCores      bool
 	DisableDedicatedCoresOverlapReclaimedCores bool
+
+	// DefaultShareBackfill holds in-process only diagnostics for the default
+	// share pool residual backfill; it does not enter the advisor proto.
+	DefaultShareBackfill DefaultShareBackfillDiagnostics
 }
 
 type CPUResource struct {
