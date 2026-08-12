@@ -21,12 +21,14 @@ import "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic/crd"
 type MemoryGuardConfiguration struct {
 	Enable                       bool
 	CriticalWatermarkScaleFactor float64
+	CriticalWatermarkSource      string
 }
 
 func NewMemoryGuardConfiguration() *MemoryGuardConfiguration {
 	return &MemoryGuardConfiguration{
 		Enable:                       true,
 		CriticalWatermarkScaleFactor: 1.0,
+		CriticalWatermarkSource:      "low",
 	}
 }
 
@@ -41,6 +43,9 @@ func (c *MemoryGuardConfiguration) ApplyConfiguration(conf *crd.DynamicConfigCRD
 		}
 		if config.CriticalWatermarkScaleFactor != nil {
 			c.CriticalWatermarkScaleFactor = *config.CriticalWatermarkScaleFactor
+		}
+		if config.CriticalWatermarkSource != nil {
+			c.CriticalWatermarkSource = string(*config.CriticalWatermarkSource)
 		}
 	}
 }

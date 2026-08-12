@@ -18,13 +18,24 @@ package plugin
 
 import (
 	"math"
+	"sync"
 	"testing"
+	"time"
 
+	cadvisorinfo "github.com/google/cadvisor/info/v1"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
 
 	"github.com/kubewharf/katalyst-core/pkg/config"
+	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
+	"github.com/kubewharf/katalyst-core/pkg/consts"
+	"github.com/kubewharf/katalyst-core/pkg/metaserver"
+	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent"
+	agentmetric "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric"
+	metrictypes "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric/types"
+	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
+	"github.com/kubewharf/katalyst-core/pkg/util/metric"
 	"github.com/kubewharf/katalyst-core/pkg/util/reclaim"
 )
 
@@ -81,17 +92,12 @@ func newGuardConf(cgroupPath string) *config.Configuration {
 	return c
 }
 
-func TestCalculateReclaimedMemoryLimitFor_WatermarkSource(t *testing.T) {
+func TestGetCriticalWatermarkPages(t *testing.T) {
 	t.Parallel()
-	zoneLow := uint64(100)
-	zoneHigh := uint64(250)
 
-	pickWatermark := func(source string) uint64 {
-		w := zoneLow
-		if source == "high" {
-			w = zoneHigh
-		}
-		return w
+	zoneInfo := &machine.NormalZoneInfo{
+		Low:  10,
+		High: 20,
 	}
 
 	cases := []struct {
@@ -99,17 +105,88 @@ func TestCalculateReclaimedMemoryLimitFor_WatermarkSource(t *testing.T) {
 		source string
 		want   uint64
 	}{
-		{name: "default empty -> low", source: "", want: zoneLow},
-		{name: "explicit low", source: "low", want: zoneLow},
-		{name: "explicit high", source: "high", want: zoneHigh},
+		{name: "low", source: "low", want: 10},
+		{name: "high", source: "high", want: 20},
 	}
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			require.Equal(t, tc.want, pickWatermark(tc.source))
+			require.Equal(t, tc.want, getCriticalWatermarkPages(zoneInfo, tc.source))
 		})
 	}
+}
+
+type switchingMetricsFetcher struct {
+	metrictypes.MetricsFetcher
+	once     sync.Once
+	onSwitch func()
+}
+
+func (f *switchingMetricsFetcher) GetNodeMetric(metricName string) (metric.MetricData, error) {
+	data, err := f.MetricsFetcher.GetNodeMetric(metricName)
+	f.once.Do(f.onSwitch)
+	return data, err
+}
+
+func TestUpdateActualNUMABindingReclaimMemoryLimitUsesOneDynamicConfigSnapshot(t *testing.T) {
+	t.Parallel()
+
+	conf := config.NewConfiguration()
+	snapshot := dynamicconfig.NewConfiguration()
+	snapshot.CriticalWatermarkSource = "low"
+	conf.SetDynamicConfiguration(snapshot)
+
+	replacement := dynamicconfig.NewConfiguration()
+	replacement.CriticalWatermarkSource = "high"
+
+	now := time.Now()
+	fakeFetcher := agentmetric.NewFakeMetricsFetcher(metrics.DummyMetrics{}).(*agentmetric.FakeMetricsFetcher)
+	fakeFetcher.SetNodeMetric(consts.MetricMemScaleFactorSystem, metric.MetricData{Value: 0, Time: &now})
+	for _, numaID := range []int{0, 1} {
+		fakeFetcher.SetNumaMetric(numaID, consts.MetricMemTotalNuma, metric.MetricData{Value: 1000, Time: &now})
+		fakeFetcher.SetNumaMetric(numaID, consts.MetricMemFreeNuma, metric.MetricData{Value: 1000, Time: &now})
+		fakeFetcher.SetCgroupNumaMetric("/reclaimed", numaID, consts.MetricsMemTotalPerNumaCgroup, metric.MetricData{Value: 0, Time: &now})
+	}
+
+	switchingFetcher := &switchingMetricsFetcher{
+		MetricsFetcher: fakeFetcher,
+		onSwitch: func() {
+			conf.SetDynamicConfiguration(replacement)
+		},
+	}
+	metaServer := &metaserver.MetaServer{
+		MetaAgent: &agent.MetaAgent{
+			MetricsFetcher: switchingFetcher,
+			KatalystMachineInfo: &machine.KatalystMachineInfo{
+				MachineInfo: &cadvisorinfo.MachineInfo{},
+				CPUTopology: &machine.CPUTopology{
+					CPUDetails: machine.CPUDetails{
+						0: {NUMANodeID: 0},
+						1: {NUMANodeID: 1},
+					},
+				},
+				MemoryTopology: &machine.MemoryTopology{PageSize: 1},
+			},
+		},
+	}
+	mg := &memoryGuard{
+		metaServer: metaServer,
+		numaBindingRelativeRootCgroupPaths: map[int][]string{
+			0: {"/reclaimed"},
+			1: {"/reclaimed"},
+		},
+		numaBindingReclaimMemoryLimit: &atomic.Value{},
+		conf:                          conf,
+	}
+	zoneInfos := []machine.NormalZoneInfo{
+		{Node: 0, Free: 1000, Low: 100, High: 400},
+		{Node: 1, Free: 1000, Low: 100, High: 400},
+	}
+
+	require.NoError(t, mg.updateActualNUMABindingReclaimMemoryLimit(snapshot, zoneInfos))
+	require.Same(t, replacement, conf.GetDynamicConfiguration())
+	require.Equal(t, map[int]int64{0: 900, 1: 900}, mg.numaBindingReclaimMemoryLimit.Load())
 }
 
 func TestCalculateReclaimedMemoryLimitFor_MaxRatioClamp(t *testing.T) {

@@ -230,7 +230,7 @@ func TestMemoryGuardOptionsApplyTo(t *testing.T) {
 	}{
 		{name: "low", source: "low", want: "low"},
 		{name: "high", source: "high", want: "high"},
-		{name: "empty", source: "", wantErr: true},
+		{name: "empty", source: "", want: "low"},
 		{name: "invalid", source: "critical", wantErr: true},
 	}
 	// Construct options and MemoryGuardConfiguration for each case.
@@ -278,6 +278,8 @@ to `low`, register the unchanged flag name, and validate in `ApplyTo`:
 
 ```go
 switch o.CriticalWatermarkSource {
+case "":
+	c.CriticalWatermarkSource = "low"
 case "low", "high":
 	c.CriticalWatermarkSource = o.CriticalWatermarkSource
 default:

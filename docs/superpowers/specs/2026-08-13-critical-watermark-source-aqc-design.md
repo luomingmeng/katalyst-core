@@ -95,9 +95,10 @@ only when the API pointer is non-nil.
 
 Move the existing flag field and validation into the dynamic Memory Guard
 options path while preserving the public flag name
-`memory-advisor-critical-watermark-source`. `ApplyTo` validates that the
-startup value is `low` or `high` and writes it into the default dynamic Memory
-Guard configuration. Validation errors remain lowercase.
+`memory-advisor-critical-watermark-source`. `ApplyTo` normalizes an explicit
+empty value to `low` for backward compatibility, accepts `low` or `high`, and
+writes the result into the default dynamic Memory Guard configuration.
+Validation errors remain lowercase.
 
 `memory_guard.go` reads one dynamic configuration snapshot and uses its
 `CriticalWatermarkSource` to select `zoneInfo.Low` or `zoneInfo.High`. The same
@@ -135,7 +136,8 @@ startup flag
 ## Validation and Failure Behavior
 
 - API admission rejects values outside `low` and `high`.
-- Startup option validation rejects invalid flag values before agent startup.
+- Startup option validation normalizes an explicit empty value to `low` and
+  rejects other invalid flag values before agent startup.
 - Dynamic configuration projection relies on the validated API contract. It
   does not widen the existing no-error `ApplyConfiguration` interface solely
   for this field.
@@ -151,6 +153,7 @@ startup flag
 ### Core options and configuration
 
 - Constructor default is `low`.
+- Explicit empty startup flag values normalize to `low`.
 - Startup flag `high` becomes the dynamic default.
 - Invalid startup values return an error.
 - AQC `high` overrides startup `low`.

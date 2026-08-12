@@ -461,6 +461,41 @@ func Test_applyDynamicConfig(t *testing.T) {
 	}
 }
 
+func TestApplyDynamicConfigRestoresCriticalWatermarkSourceDefault(t *testing.T) {
+	t.Parallel()
+
+	defaultConfig := dynamic.NewConfiguration()
+	defaultConfig.CriticalWatermarkSource = "high"
+	require.Equal(t, "high", defaultConfig.CriticalWatermarkSource)
+
+	low := v1alpha1.CriticalWatermarkSourceLow
+	withAQCOverride := deepCopy(defaultConfig)
+	applyDynamicConfig(withAQCOverride, newCriticalWatermarkSourceDynamicConfig(&low))
+	require.Equal(t, "low", withAQCOverride.CriticalWatermarkSource)
+
+	withoutAQCOverride := deepCopy(defaultConfig)
+	applyDynamicConfig(withoutAQCOverride, newCriticalWatermarkSourceDynamicConfig(nil))
+	require.Equal(t, "high", withoutAQCOverride.CriticalWatermarkSource)
+}
+
+func newCriticalWatermarkSourceDynamicConfig(source *v1alpha1.CriticalWatermarkSource) *crd.DynamicConfigCRD {
+	return &crd.DynamicConfigCRD{
+		AdminQoSConfiguration: &v1alpha1.AdminQoSConfiguration{
+			Spec: v1alpha1.AdminQoSConfigurationSpec{
+				Config: v1alpha1.AdminQoSConfig{
+					AdvisorConfig: &v1alpha1.AdvisorConfig{
+						MemoryAdvisorConfig: &v1alpha1.MemoryAdvisorConfig{
+							MemoryGuardConfig: &v1alpha1.MemoryGuardConfig{
+								CriticalWatermarkSource: source,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
 func Test_getGVRToKindMap(t *testing.T) {
 	t.Parallel()
 
