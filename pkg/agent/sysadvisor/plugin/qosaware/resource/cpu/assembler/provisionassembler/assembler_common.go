@@ -112,6 +112,375 @@ func clampByReclaimedCPUMaxRatio(
 	return size, limit
 }
 
+// reclaimClampResult carries the structured diagnostics of a single reclaim
+// max-ratio clamp: the raw size before clamping, the final size and limit after
+// clamping, and the amount of reclaim cores released by the clamp. It exposes
+// the released residual so callers can later backfill the default share pool.
+type reclaimClampResult struct {
+	RawSize      int
+	FinalSize    int
+	ReleasedSize int
+	FinalLimit   float64
+}
+
+// clampByReclaimedCPUMaxRatioWithDiagnostics wraps clampByReclaimedCPUMaxRatio
+// without changing its clamp semantics; it only augments the return value with
+// diagnostics (raw size and released cores). It does not write into
+// InternalCPUCalculationResult and does not perform any accumulation.
+func clampByReclaimedCPUMaxRatioWithDiagnostics(size int, limit float64, ratio float64, cpuCount int, reservedForReclaim int) reclaimClampResult {
+	finalSize, finalLimit := clampByReclaimedCPUMaxRatio(size, limit, ratio, cpuCount, reservedForReclaim)
+	return reclaimClampResult{
+		RawSize:      size,
+		FinalSize:    finalSize,
+		ReleasedSize: general.Max(0, size-finalSize),
+		FinalLimit:   finalLimit,
+	}
+}
+
+// defaultShareNUMABudget captures the per-NUMA canonical quantity budget used to
+// compute the default share pool residual. All fields are expressed in unpinned
+// CPU quantities (i.e. after excluding pinned resource-package CPUs).
+type defaultShareNUMABudget struct {
+	// UnpinnedAllocatableSize is numaAvailable[numaID] - pinnedCPUSizeInNUMA;
+	// numaAvailable already excludes reserve and forbidden/system pools.
+	UnpinnedAllocatableSize int
+	// FinalUnpinnedReclaimSize is the post-clamp reclaim quantity that lives in
+	// the unpinned eligibility domain of this NUMA.
+	FinalUnpinnedReclaimSize int
+	// FixedUnpinnedPoolSize is the sum of non-default, non-reclaim, non-reserve,
+	// non-pinned, non-exclusive fixed pool quantities on this NUMA.
+	FixedUnpinnedPoolSize int
+	// Exclusive marks a NUMA that is owned by a NUMA-exclusive region; such a
+	// NUMA contributes zero default share residual and its nested
+	// reclaim/pinned/dedicated quantities are not deducted again.
+	Exclusive bool
+}
+
+// defaultShareBudgetSummary carries classified quantities purely for diagnostics
+// and metrics. It never participates in the residual computation.
+type defaultShareBudgetSummary struct {
+	AllocatableSize     int
+	FixedCommonPoolSize int
+	ReserveSize         int
+	DedicatedSize       int
+	IsolationSize       int
+	CustomSharedSize    int
+	SNBSize             int
+	PinnedCPUSize       int
+	ExclusiveNUMASize   int
+}
+
+// calculateDefaultShareTargetSize computes the default share pool target size as
+// the sum over non-exclusive NUMAs of (unpinned allocatable - final unpinned
+// reclaim - fixed unpinned pools). Exclusive NUMAs contribute zero. A negative
+// per-NUMA residual is an invariant violation and surfaces as an error.
+func calculateDefaultShareTargetSize(budgetByNUMA map[int]defaultShareNUMABudget) (int, error) {
+	target := 0
+	for numaID, budget := range budgetByNUMA {
+		if budget.Exclusive {
+			continue
+		}
+		numaTarget := budget.UnpinnedAllocatableSize - budget.FinalUnpinnedReclaimSize - budget.FixedUnpinnedPoolSize
+		if numaTarget < 0 {
+			return 0, fmt.Errorf("default share residual is negative in numa %d: unpinned=%d reclaim=%d fixed=%d",
+				numaID, budget.UnpinnedAllocatableSize, budget.FinalUnpinnedReclaimSize, budget.FixedUnpinnedPoolSize)
+		}
+		target += numaTarget
+	}
+	return target, nil
+}
+
+// buildDefaultShareBudget collects the canonical per-NUMA quantity budget that
+// drives the default share pool residual backfill. It reads only the already
+// assembled result.PoolEntries plus the region topology; it never mutates the
+// result.
+//
+// Accounting model (see rule set in the design doc):
+//   - Each real NUMA yields UnpinnedAllocatableSize = numaAvailable[numaID] -
+//     pinnedCPUSizeInNUMA. numaAvailable already excludes reserve and
+//     forbidden/system pools, so only resource-package pinned CPUs are removed
+//     here.
+//   - A NUMA owned by a NUMA-exclusive dedicated region is marked Exclusive and
+//     contributes zero residual; its nested reclaim/pinned/fixed quantities are
+//     NOT deducted again to avoid double counting.
+//   - Non-binding NUMAs are folded into a single combined bucket keyed by
+//     FakedNUMAID, because the default share pool and its sibling non-binding
+//     pools live at FakedNUMAID and collectively span the non-binding NUMAs.
+//   - FinalUnpinnedReclaimSize only counts the unpinned reclaim entries (the
+//     reclaim entry written per scope); resource-package reclaim is already
+//     excluded through the pinned budget.
+//   - FixedUnpinnedPoolSize only counts non-default, non-reclaim, non-reserve,
+//     non-pinned, non-exclusive pool quantities.
+//
+// Assumption: dedicated pool entries are keyed by pod UID (not by a name that
+// GetPoolType can classify), so we identify them authoritatively via the
+// dedicated regions in regionHelper. Pinned (resource-package) pools are
+// identified by the package prefix in their wrapped owner pool name.
+func (pa *ProvisionAssemblerCommon) buildDefaultShareBudget(
+	regionHelper *RegionMapHelper,
+	result *types.InternalCPUCalculationResult,
+) (map[int]defaultShareNUMABudget, defaultShareBudgetSummary, error) {
+	var summary defaultShareBudgetSummary
+
+	numaAvailable := *pa.numaAvailable
+	nonBinding := *pa.nonBindingNumas
+	cfg := pa.metaReader.GetResourcePackageConfig()
+
+	// collect exclusive NUMAs and map dedicated pod UIDs back to their regions.
+	// Dedicated pool entries are keyed by pod UID, while the region retains both
+	// the physical pool identity and its resource-package owner.
+	exclusiveNUMAs := sets.NewInt()
+	dedicatedRegionByPodUID := make(map[string]region.QoSRegion)
+	recordDedicatedRegion := func(podUID string, r region.QoSRegion) error {
+		if existing := dedicatedRegionByPodUID[podUID]; existing != nil && existing.Name() != r.Name() {
+			regionNames := []string{existing.Name(), r.Name()}
+			sort.Strings(regionNames)
+			return fmt.Errorf("pod uid %q maps to multiple dedicated regions %q and %q",
+				podUID, regionNames[0], regionNames[1])
+		}
+		dedicatedRegionByPodUID[podUID] = r
+		return nil
+	}
+	for numaID := range numaAvailable {
+		for _, r := range regionHelper.GetRegions(numaID, configapi.QoSRegionTypeDedicated) {
+			if r.IsNumaBinding() && r.IsNumaExclusive() {
+				for _, bindingNUMA := range r.GetBindingNumas().ToSliceInt() {
+					exclusiveNUMAs.Insert(bindingNUMA)
+				}
+			}
+			for podUID := range r.GetPods() {
+				if err := recordDedicatedRegion(podUID, r); err != nil {
+					return nil, summary, err
+				}
+			}
+		}
+	}
+	// non-binding dedicated regions live at FakedNUMAID scope.
+	for _, r := range regionHelper.GetRegions(commonstate.FakedNUMAID, configapi.QoSRegionTypeDedicated) {
+		for podUID := range r.GetPods() {
+			if err := recordDedicatedRegion(podUID, r); err != nil {
+				return nil, summary, err
+			}
+		}
+	}
+
+	// effectiveBucket folds non-binding real NUMAs into the FakedNUMAID bucket.
+	effectiveBucket := func(numaID int) int {
+		if numaID == commonstate.FakedNUMAID || nonBinding.Contains(numaID) {
+			return commonstate.FakedNUMAID
+		}
+		return numaID
+	}
+
+	// seed per-NUMA allocatable budgets.
+	budgetByNUMA := make(map[int]defaultShareNUMABudget)
+	pinnedCPUSizeByPackageByBucket := make(map[int]map[string]int)
+	combined := defaultShareNUMABudget{}
+	hasCombined := false
+	for numaID := range numaAvailable {
+		pinnedCPUSizeByPackage := pa.getPinnedCPUSizeByPackage(machine.NewCPUSet(numaID), cfg)
+		bucket := effectiveBucket(numaID)
+		if pinnedCPUSizeByPackageByBucket[bucket] == nil {
+			pinnedCPUSizeByPackageByBucket[bucket] = make(map[string]int)
+		}
+		for pkgName, size := range pinnedCPUSizeByPackage {
+			pinnedCPUSizeByPackageByBucket[bucket][pkgName] += size
+		}
+		pinned := general.SumUpMapValues(pinnedCPUSizeByPackage)
+		alloc := numaAvailable[numaID] - pinned
+		summary.PinnedCPUSize += pinned
+		summary.AllocatableSize += alloc
+
+		if exclusiveNUMAs.Has(numaID) {
+			budgetByNUMA[numaID] = defaultShareNUMABudget{UnpinnedAllocatableSize: alloc, Exclusive: true}
+			summary.ExclusiveNUMASize += alloc
+			continue
+		}
+		if nonBinding.Contains(numaID) {
+			combined.UnpinnedAllocatableSize += alloc
+			hasCombined = true
+		} else {
+			budgetByNUMA[numaID] = defaultShareNUMABudget{UnpinnedAllocatableSize: alloc}
+		}
+	}
+
+	// accumulate reclaim and fixed pool quantities per effective bucket.
+	fixedByBucket := make(map[int]int)
+	reclaimByBucket := make(map[int]int)
+	countedDedicatedRegionsByBucket := make(map[int]sets.String)
+	for poolName, byNUMA := range result.PoolEntries {
+		if poolName == commonstate.PoolNameReserve {
+			for _, res := range byNUMA {
+				summary.ReserveSize += res.Size
+			}
+			continue
+		}
+		ownerPoolName := poolName
+		dedicatedRegion := dedicatedRegionByPodUID[poolName]
+		if dedicatedRegion != nil {
+			ownerPoolName = dedicatedRegion.OwnerPoolName()
+		}
+		_, pkgName := resourcepackage.UnwrapOwnerPoolName(ownerPoolName)
+		for numaID, res := range byNUMA {
+			// nested quantities inside exclusive NUMAs are ignored.
+			if exclusiveNUMAs.Has(numaID) {
+				continue
+			}
+			bucket := effectiveBucket(numaID)
+			if poolName == commonstate.PoolNameReclaim {
+				reclaimByBucket[bucket] += res.Size
+				if bucket == commonstate.FakedNUMAID {
+					hasCombined = true
+				}
+				continue
+			}
+			// the default share pool is exactly what we are computing; skip it.
+			//
+			// Precondition: the default share pool only ever exists at
+			// FakedNUMAID, while share NUMA-binding (SNB) pools carry a
+			// "-NUMA" suffix and live on real numaIDs. If upstream ever emits a
+			// plain PoolNameShare entry on a real numaID, it would fall through
+			// to the fixed-pool branch below and be counted into
+			// FixedUnpinnedPoolSize, inflating the fixed budget and lowering the
+			// computed target. This is a known precondition/constraint rather
+			// than a case handled here.
+			if numaID == commonstate.FakedNUMAID && poolName == commonstate.PoolNameShare {
+				continue
+			}
+			if dedicatedRegion != nil {
+				if countedDedicatedRegionsByBucket[bucket] == nil {
+					countedDedicatedRegionsByBucket[bucket] = sets.NewString()
+				}
+				if countedDedicatedRegionsByBucket[bucket].Has(dedicatedRegion.Name()) {
+					continue
+				}
+				countedDedicatedRegionsByBucket[bucket].Insert(dedicatedRegion.Name())
+			}
+			fixedSize := res.Size
+			if pkgName != "" {
+				pinnedSizeInBucket := pinnedCPUSizeByPackageByBucket[bucket][pkgName]
+				if dedicatedRegion != nil {
+					fixedSize = general.Max(res.Size-pinnedSizeInBucket, 0)
+					if fixedSize == 0 {
+						continue
+					}
+				} else if pinnedSizeInBucket > 0 {
+					// Non-dedicated resource-package pools are already excluded
+					// via the pinned budget deducted from UnpinnedAllocatableSize.
+					continue
+				}
+			}
+			// classify the fixed unpinned pool for diagnostics only.
+			//
+			// This classification (in particular the IsShareNUMABindingPool /
+			// "-NUMA" suffix check for SNB) feeds only summary/metrics and does
+			// not participate in the target computation. A custom shared pool
+			// whose name happens to contain "-NUMA" may be misclassified as SNB
+			// here; that is an accepted metrics-bucketing approximation and has
+			// no effect on the residual result.
+			switch {
+			case commonstate.IsIsolationPool(poolName):
+				summary.IsolationSize += fixedSize
+			case dedicatedRegion != nil:
+				summary.DedicatedSize += fixedSize
+			case commonstate.IsShareNUMABindingPool(poolName):
+				summary.SNBSize += fixedSize
+			default:
+				summary.CustomSharedSize += fixedSize
+			}
+			fixedByBucket[bucket] += fixedSize
+			if bucket == commonstate.FakedNUMAID {
+				hasCombined = true
+			}
+		}
+	}
+
+	// attach the combined non-binding bucket.
+	//
+	// Precondition on upstream assemble behavior: when there are no non-binding
+	// NUMAs, the FakedNUMAID scope is expected to carry neither available
+	// capacity (combined.UnpinnedAllocatableSize stays 0) nor reclaim/fixed
+	// entries. If that assumption is violated (e.g. a reclaim entry exists at
+	// FakedNUMAID while nonBinding is empty), the combined bucket ends up with
+	// alloc=0 but reclaim>0, so calculateDefaultShareTargetSize reports a
+	// negative residual and the whole provision fails. This fail-closed outcome
+	// is intentional: it surfaces the upstream inconsistency instead of silently
+	// producing an incorrect default share target.
+	if hasCombined {
+		combined.FixedUnpinnedPoolSize = fixedByBucket[commonstate.FakedNUMAID]
+		combined.FinalUnpinnedReclaimSize = reclaimByBucket[commonstate.FakedNUMAID]
+		budgetByNUMA[commonstate.FakedNUMAID] = combined
+	}
+	// fill fixed/reclaim into the binding real-NUMA budgets.
+	for numaID, budget := range budgetByNUMA {
+		if numaID == commonstate.FakedNUMAID || budget.Exclusive {
+			continue
+		}
+		budget.FixedUnpinnedPoolSize = fixedByBucket[numaID]
+		budget.FinalUnpinnedReclaimSize = reclaimByBucket[numaID]
+		budgetByNUMA[numaID] = budget
+	}
+
+	summary.FixedCommonPoolSize = 0
+	for _, size := range fixedByBucket {
+		summary.FixedCommonPoolSize += size
+	}
+
+	return budgetByNUMA, summary, nil
+}
+
+// finalizeDefaultShareBackfill overrides the default share pool quantity with the
+// canonical residual budget once every scope has been assembled. It is a no-op
+// when the backfill feature is disabled. On success it also records the
+// structured diagnostics for metrics.
+func (pa *ProvisionAssemblerCommon) finalizeDefaultShareBackfill(
+	regionHelper *RegionMapHelper,
+	result *types.InternalCPUCalculationResult,
+) error {
+	if !result.DefaultShareBackfill.Enabled {
+		return nil
+	}
+	budgetByNUMA, summary, err := pa.buildDefaultShareBudget(regionHelper, result)
+	if err != nil {
+		return err
+	}
+	target, err := calculateDefaultShareTargetSize(budgetByNUMA)
+	if err != nil {
+		return err
+	}
+	before := 0
+	if byNUMA := result.PoolEntries[commonstate.PoolNameShare]; byNUMA != nil {
+		before = byNUMA[commonstate.FakedNUMAID].Size
+	}
+	result.SetPoolEntry(commonstate.PoolNameShare, commonstate.FakedNUMAID, target, -1)
+	result.DefaultShareBackfill.AllocatableBudget = summary.AllocatableSize
+	result.DefaultShareBackfill.FixedPoolSize = summary.FixedCommonPoolSize
+	result.DefaultShareBackfill.ReserveSize = summary.ReserveSize
+	result.DefaultShareBackfill.DedicatedSize = summary.DedicatedSize
+	result.DefaultShareBackfill.IsolationSize = summary.IsolationSize
+	result.DefaultShareBackfill.CustomSharedSize = summary.CustomSharedSize
+	result.DefaultShareBackfill.SNBSize = summary.SNBSize
+	result.DefaultShareBackfill.PinnedCPUSize = summary.PinnedCPUSize
+	result.DefaultShareBackfill.ExclusiveNUMASize = summary.ExclusiveNUMASize
+	result.DefaultShareBackfill.DefaultShareBeforeBackfill = before
+	result.DefaultShareBackfill.DefaultShareBackfilled = target - before
+	result.DefaultShareBackfill.DefaultShareFinal = target
+	general.InfoS("default share residual backfill",
+		"allocatableBudget", result.DefaultShareBackfill.AllocatableBudget,
+		"reserveSize", result.DefaultShareBackfill.ReserveSize,
+		"rawReclaimSize", result.DefaultShareBackfill.RawReclaimSize,
+		"finalReclaimSize", result.DefaultShareBackfill.FinalReclaimSize,
+		"releasedReclaimSize", result.DefaultShareBackfill.ReleasedReclaimSize,
+		"fixedPoolSize", result.DefaultShareBackfill.FixedPoolSize,
+		"pinnedCPUSize", result.DefaultShareBackfill.PinnedCPUSize,
+		"exclusiveNUMASize", result.DefaultShareBackfill.ExclusiveNUMASize,
+		"defaultShareBefore", result.DefaultShareBackfill.DefaultShareBeforeBackfill,
+		"defaultShareAfter", result.DefaultShareBackfill.DefaultShareFinal,
+		"unassignedNonReclaimSize", result.DefaultShareBackfill.UnassignedNonReclaimSize,
+	)
+	return nil
+}
+
 func (pa *ProvisionAssemblerCommon) assembleDedicatedNUMAExclusiveRegion(r region.QoSRegion, result *types.InternalCPUCalculationResult) error {
 	if !result.DisableDedicatedCoresOverlapReclaimedCores {
 		return pa.assembleLegacyDedicatedNUMAExclusiveRegion(r, result)
@@ -312,7 +681,27 @@ func (pa *ProvisionAssemblerCommon) assembleReserve(result *types.InternalCPUCal
 	result.SetPoolEntry(commonstate.PoolNameReserve, commonstate.FakedNUMAID, reservePoolSize, -1)
 }
 
+// validateDefaultShareBackfillConfig rejects incompatible feature combinations:
+// backfilling the default share pool with all residual non-reclaim CPUs only
+// makes sense when neither shared nor dedicated cores overlap reclaimed cores,
+// otherwise the residual accounting would double-count overlapped CPUs.
+func (pa *ProvisionAssemblerCommon) validateDefaultShareBackfillConfig() error {
+	conf := pa.conf.GetDynamicConfiguration()
+	if !conf.FillDefaultSharePoolWithNonReclaimCPUs {
+		return nil
+	}
+	if *pa.allowSharedCoresOverlapReclaimedCores || !*pa.disableDedicatedCoresOverlapReclaimedCores {
+		return fmt.Errorf("fill default share pool requires shared and dedicated reclaim overlap disabled")
+	}
+	return nil
+}
+
 func (pa *ProvisionAssemblerCommon) AssembleProvision() (types.InternalCPUCalculationResult, error) {
+	if err := pa.validateDefaultShareBackfillConfig(); err != nil {
+		general.Errorf("validateDefaultShareBackfillConfig failed with error: %v", err)
+		return types.InternalCPUCalculationResult{}, err
+	}
+
 	calculationResult := types.InternalCPUCalculationResult{
 		PoolEntries:                                make(map[string]map[int]types.CPUResource),
 		PoolOverlapInfo:                            map[string]map[int]map[string]int{},
@@ -321,6 +710,9 @@ func (pa *ProvisionAssemblerCommon) AssembleProvision() (types.InternalCPUCalcul
 		AllowSharedCoresOverlapReclaimedCores:      *pa.allowSharedCoresOverlapReclaimedCores,
 		DisableDedicatedCoresOverlapReclaimedCores: *pa.disableDedicatedCoresOverlapReclaimedCores,
 	}
+	// mark the backfill enabled once so downstream finalize can decide whether to
+	// override the default share pool quantity with the residual target.
+	calculationResult.DefaultShareBackfill.Enabled = pa.conf.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs
 
 	pa.assembleReserve(&calculationResult)
 
@@ -341,6 +733,13 @@ func (pa *ProvisionAssemblerCommon) AssembleProvision() (types.InternalCPUCalcul
 	err = pa.assembleNUMABindingNUMAExclusive(regionHelper, &calculationResult)
 	if err != nil {
 		general.Errorf("assembleNUMABindingNUMAExclusive failed with error: %v", err)
+		return types.InternalCPUCalculationResult{}, err
+	}
+
+	// after every scope is assembled, override the default share pool quantity
+	// with the canonical residual budget when the backfill is enabled.
+	if err = pa.finalizeDefaultShareBackfill(regionHelper, &calculationResult); err != nil {
+		general.Errorf("finalizeDefaultShareBackfill failed with error: %v", err)
 		return types.InternalCPUCalculationResult{}, err
 	}
 
@@ -435,25 +834,22 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 	reservedForReclaim := getNUMAsResource(*pa.reservedForReclaim, numaSet)
 	poolAvailableBeforeReserve := getNUMAsResource(*pa.numaAvailable, numaSet)
 	pinnedPoolAvailableByPkg, pinnedReserveByPkg,
-		unpinnedShareAndIsolatedDedicatedPoolAvailable, unpinnedReserve :=
-		getEligibilityDomainCapacities(
-			numaSet,
-			cfg,
-			pinnedCPUSizeByPkg,
-			poolAvailableBeforeReserve,
-			reservedForReclaim,
-			pa.metaReader,
-		)
+		unpinnedShareAndIsolatedDedicatedPoolAvailable, unpinnedReserve := getEligibilityDomainCapacities(
+		numaSet,
+		cfg,
+		pinnedCPUSizeByPkg,
+		poolAvailableBeforeReserve,
+		reservedForReclaim,
+		pa.metaReader,
+	)
 	shareAndIsolatedDedicatedPoolAvailable := poolAvailableBeforeReserve
 	legacySharedOnly := len(dedicatedRegions) == 0
 	if legacySharedOnly && !*pa.allowSharedCoresOverlapReclaimedCores {
 		for pkgName, reserve := range pinnedReserveByPkg {
 			pinnedPoolAvailableByPkg[pkgName] = general.Max(pinnedPoolAvailableByPkg[pkgName]-reserve, 0)
 		}
-		unpinnedShareAndIsolatedDedicatedPoolAvailable =
-			general.Max(unpinnedShareAndIsolatedDedicatedPoolAvailable-unpinnedReserve, 0)
-		shareAndIsolatedDedicatedPoolAvailable =
-			general.Max(shareAndIsolatedDedicatedPoolAvailable-reservedForReclaim, 0)
+		unpinnedShareAndIsolatedDedicatedPoolAvailable = general.Max(unpinnedShareAndIsolatedDedicatedPoolAvailable-unpinnedReserve, 0)
+		shareAndIsolatedDedicatedPoolAvailable = general.Max(shareAndIsolatedDedicatedPoolAvailable-reservedForReclaim, 0)
 	}
 
 	getShareAndIsolateDedicatedPoolSizesFunc := func(
@@ -736,16 +1132,29 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		return err
 	}
 
-	if ratio := pa.conf.GetDynamicConfiguration().ReclaimedCPUMaxRatio; ratio > 0 {
-		if cpuCount := pa.cpuCountInNUMAs(numaSet); cpuCount > 0 {
-			reclaimedCoresSize, reclaimedCoresQuota = clampByReclaimedCPUMaxRatio(
-				reclaimedCoresSize,
-				reclaimedCoresQuota,
-				ratio,
-				cpuCount,
-				reservedForReclaim,
-			)
-		}
+	ratio := pa.conf.GetDynamicConfiguration().ReclaimedCPUMaxRatio
+	cpuCount := 0
+	if ratio > 0 {
+		cpuCount = pa.cpuCountInNUMAs(numaSet)
+	}
+	if ratio <= 0 || cpuCount > 0 {
+		clamp := clampByReclaimedCPUMaxRatioWithDiagnostics(
+			reclaimedCoresSize,
+			reclaimedCoresQuota,
+			ratio,
+			cpuCount,
+			reservedForReclaim,
+		)
+		// preserve the original write semantics: the final reclaim size and
+		// quota are exactly what the underlying helper returns.
+		reclaimedCoresSize = clamp.FinalSize
+		reclaimedCoresQuota = clamp.FinalLimit
+		// accumulate the default share backfill diagnostics for this scope
+		// once; released cores from exclusive NUMA scopes are intentionally
+		// excluded and must not be counted here.
+		result.DefaultShareBackfill.RawReclaimSize += clamp.RawSize
+		result.DefaultShareBackfill.FinalReclaimSize += clamp.FinalSize
+		result.DefaultShareBackfill.ReleasedReclaimSize += clamp.ReleasedSize
 	}
 
 	overlapReclaimedCoresSize := clampReclaimOverlapMetadata(

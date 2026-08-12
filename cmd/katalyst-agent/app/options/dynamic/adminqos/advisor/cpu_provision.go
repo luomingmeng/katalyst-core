@@ -38,6 +38,7 @@ type CPUProvisionOptions struct {
 	IndicatorTargetDefaultGetter                string
 	IndicatorTargetMetricThresholdExpandFactors map[string]string
 	ReclaimedCPUMaxRatio                        float64
+	FillDefaultSharePoolWithNonReclaimCPUs      bool
 }
 
 func NewCPUProvisionOptions() *CPUProvisionOptions {
@@ -57,6 +58,7 @@ func (o *CPUProvisionOptions) ApplyTo(c *advisor.CPUProvisionConfiguration) erro
 	c.AllowSharedCoresOverlapReclaimedCores = o.AllowSharedCoresOverlapReclaimedCores
 	c.DisableDedicatedCoresOverlapReclaimedCores = o.DisableDedicatedCoresOverlapReclaimedCores
 	c.ReclaimedCPUMaxRatio = o.ReclaimedCPUMaxRatio
+	c.FillDefaultSharePoolWithNonReclaimCPUs = o.FillDefaultSharePoolWithNonReclaimCPUs
 
 	for regionType, targets := range o.RegionIndicatorTargetOptions {
 		regionIndicatorTarget := make([]v1alpha1.IndicatorTargetConfiguration, 0)
@@ -115,4 +117,6 @@ func (o *CPUProvisionOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 		"indicator target expand factor, in format like cpu_usage_ratio=1.1,cpi=1.2")
 	fs.Float64Var(&o.ReclaimedCPUMaxRatio, "reclaimed-cpu-max-ratio", o.ReclaimedCPUMaxRatio,
 		"the maximum ratio of whole-machine/NUMA CPUs that can be assigned to reclaimed_cores, 0 means no limit")
+	fs.BoolVar(&o.FillDefaultSharePoolWithNonReclaimCPUs, "fill-default-share-pool-with-non-reclaim-cpus", o.FillDefaultSharePoolWithNonReclaimCPUs,
+		"make the default share pool consume all residual non-reclaim cpus")
 }

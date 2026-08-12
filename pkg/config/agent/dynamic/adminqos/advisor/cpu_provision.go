@@ -52,6 +52,9 @@ type CPUProvisionConfiguration struct {
 	// ReclaimedCPUMaxRatio is the ratio (in [0, 1]) of the maximum amount of CPUs
 	// that can be reclaimed at any time. 0 means no limit.
 	ReclaimedCPUMaxRatio float64
+	// FillDefaultSharePoolWithNonReclaimCPUs makes the default non-NUMA-binding
+	// share pool consume all residual non-reclaim CPUs.
+	FillDefaultSharePoolWithNonReclaimCPUs bool
 }
 
 func NewCPUProvisionConfiguration() *CPUProvisionConfiguration {
@@ -100,6 +103,9 @@ func (c *CPUProvisionConfiguration) ApplyConfiguration(conf *crd.DynamicConfigCR
 			}
 			if cfg := aqc.Spec.Config.AdvisorConfig.CPUAdvisorConfig.CPUProvisionConfig; cfg.ReclaimedCPUMaxRatio != nil {
 				c.ReclaimedCPUMaxRatio = clampReclaimedMaxRatio("ReclaimedCPUMaxRatio", *cfg.ReclaimedCPUMaxRatio)
+			}
+			if cfg := aqc.Spec.Config.AdvisorConfig.CPUAdvisorConfig.CPUProvisionConfig; cfg.FillDefaultSharePoolWithNonReclaimCPUs != nil {
+				c.FillDefaultSharePoolWithNonReclaimCPUs = *cfg.FillDefaultSharePoolWithNonReclaimCPUs
 			}
 		}
 		if aqc.Spec.Config.AdvisorConfig.CPUAdvisorConfig.AllowSharedCoresOverlapReclaimedCores != nil {
