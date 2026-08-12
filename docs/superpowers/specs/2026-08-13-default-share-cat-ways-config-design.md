@@ -38,7 +38,7 @@ typed values into `DynamicBulkheadRDTConfiguration`.
 
 Validation rejects:
 
-- non-positive `DefaultCATWays` when explicitly configured;
+- negative `DefaultCATWays`; zero means the startup value is not configured;
 - empty CLOS names;
 - non-integer CLOS way counts;
 - non-positive CLOS way counts.
