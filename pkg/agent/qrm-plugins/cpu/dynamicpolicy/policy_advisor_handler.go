@@ -410,6 +410,7 @@ func convertGetAdviceResponse(resp *advisorapi.GetAdviceResponse) *advisorapi.Li
 		AllowSharedCoresOverlapReclaimedCores: resp.AllowSharedCoresOverlapReclaimedCores,
 		ExtraEntries:                          resp.ExtraEntries,
 		DisableDedicatedCoresOverlapReclaimedCores: resp.DisableDedicatedCoresOverlapReclaimedCores,
+		FillDefaultSharePoolWithNonReclaimCpus:     resp.FillDefaultSharePoolWithNonReclaimCpus,
 	}
 }
 
@@ -1716,6 +1717,39 @@ type pendingAdvisorState struct {
 // 1. construct entries for dedicated containers and pools
 // 2. ensure reclaimed pool exists
 // 3. construct entries for shared and reclaimed containers
+func defaultShareQuantityFromAdvisorResponse(resp *advisorapi.ListAndWatchResponse) (int, error) {
+	if resp == nil {
+		return 0, fmt.Errorf("default share advice response is nil")
+	}
+	entries, ok := resp.Entries[commonstate.PoolNameShare]
+	if !ok || entries == nil || len(entries.Entries) != 1 {
+		return 0, fmt.Errorf("default share advice must contain exactly one pool entry")
+	}
+	calculationInfo, ok := entries.Entries[commonstate.FakedContainerName]
+	if !ok || calculationInfo == nil || calculationInfo.OwnerPoolName != commonstate.PoolNameShare {
+		return 0, fmt.Errorf("default share advice must contain exactly one share pool entry")
+	}
+	if len(calculationInfo.CalculationResultsByNumas) != 1 {
+		return 0, fmt.Errorf("default share advice must contain only faked numa id")
+	}
+	numaResult, ok := calculationInfo.CalculationResultsByNumas[commonstate.FakedNUMAID]
+	if !ok || numaResult == nil {
+		return 0, fmt.Errorf("default share advice must contain only faked numa id")
+	}
+
+	var quantity uint64
+	for _, block := range numaResult.Blocks {
+		if block != nil {
+			quantity += block.Result
+		}
+	}
+	q, err := general.CovertUInt64ToInt(quantity)
+	if err != nil {
+		return 0, fmt.Errorf("convert default share quantity %d to int: %w", quantity, err)
+	}
+	return q, nil
+}
+
 func (p *DynamicPolicy) applyBlocks(
 	blockCPUSet advisorapi.BlockCPUSet,
 	resp *advisorapi.ListAndWatchResponse,
@@ -1730,6 +1764,15 @@ func (p *DynamicPolicy) applyBlocks(
 	newEntries := make(state.PodEntries)
 	dedicatedCPUSet := machine.NewCPUSet()
 	pooledUnionDedicatedCPUSet := machine.NewCPUSet()
+	defaultSharePlan := defaultShareMaterializationPlan{}
+	if resp.GetFillDefaultSharePoolWithNonReclaimCpus() {
+		defaultSharePlan.enabled = true
+		var err error
+		defaultSharePlan.advisedQuantity, err = defaultShareQuantityFromAdvisorResponse(resp)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	// calculate NUMAs without actual numa_binding reclaimed pods
 	nonReclaimActualBindingNUMAs := p.state.GetMachineState().GetFilteredNUMASet(state.WrapAllocationMetaFilter((*commonstate.AllocationMeta).CheckReclaimedActualNUMABinding))
@@ -1737,6 +1780,9 @@ func (p *DynamicPolicy) applyBlocks(
 	// deal with blocks of dedicated_cores and pools
 	for entryName, entry := range resp.Entries {
 		if entryName == commonstate.PoolNameInterrupt {
+			continue
+		}
+		if defaultSharePlan.enabled && entryName == commonstate.PoolNameShare {
 			continue
 		}
 
@@ -1866,6 +1912,21 @@ func (p *DynamicPolicy) applyBlocks(
 		}
 	}
 
+	currentMachineState := p.state.GetMachineState()
+	rampUpReclaimFloor, err := p.deriveRampUpReclaimFloor(currentMachineState, false)
+	if err != nil {
+		return nil, fmt.Errorf("derive reclaim floor for advisor ramp-up failed: %w", err)
+	}
+	if defaultSharePlan.enabled {
+		defaultSharePlan.eligibleCPUSet = p.buildDefaultShareEligibleCPUSet(
+			newEntries, currentMachineState, rampUpReclaimFloor)
+		if err := p.finalizeDefaultShareEntry(
+			newEntries, defaultSharePlan.advisedQuantity, defaultSharePlan.eligibleCPUSet,
+		); err != nil {
+			return nil, err
+		}
+	}
+
 	// calculate rampUpCPUs
 	sharedBindingNUMAs, err := resp.GetSharedBindingNUMAs()
 	if err != nil {
@@ -1879,10 +1940,6 @@ func (p *DynamicPolicy) applyBlocks(
 		Difference(dedicatedCPUSet).
 		Difference(sharedBindingNUMACPUs).
 		Difference(notAllocatablePoolsCPUs)
-	rampUpReclaimFloor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), false)
-	if err != nil {
-		return nil, fmt.Errorf("derive reclaim floor for advisor ramp-up failed: %w", err)
-	}
 	rampUpCPUs = rampUpCPUs.Difference(rampUpReclaimFloor)
 
 	rampUpCPUsTopologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, rampUpCPUs)
@@ -2026,7 +2083,7 @@ func (p *DynamicPolicy) applyBlocks(
 		machineState:                     newMachineState,
 		allowOverlap:                     allowSharedCoresOverlapReclaimedCores,
 		disableDedicated:                 resp.DisableDedicatedCoresOverlapReclaimedCores,
-		defaultShareMaterializationState: p.state.GetDefaultShareMaterializationState(),
+		defaultShareMaterializationState: defaultSharePlan.materializationState(state.DefaultShareMaterializationState{}),
 	}, nil
 }
 

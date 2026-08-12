@@ -409,8 +409,7 @@ func NewDynamicPolicy(agentCtx *agent.GenericContext, conf *config.Configuration
 		reservedReclaimedCPUsSize:       general.Max(reservedReclaimedCPUsSize, agentCtx.KatalystMachineInfo.NumNUMANodes),
 		reclaimConsumersForKCNR:         conf.ReclaimConsumersForKCNR,
 	}
-	policyImplement.advisorPostCommitCheckpointDir, _ =
-		conf.StateDirectoryConfiguration.GetCurrentAndPreviousStateFileDirectory()
+	policyImplement.advisorPostCommitCheckpointDir, _ = conf.StateDirectoryConfiguration.GetCurrentAndPreviousStateFileDirectory()
 
 	policyImplement.RegisterAllocationHook(policyImplement.topologyAllocationHook)
 
@@ -1467,7 +1466,10 @@ func (p *DynamicPolicy) RemovePod(ctx context.Context,
 		return nil, fmt.Errorf("failed to release accompany resource %v", err)
 	}
 
-	aErr := p.adjustAllocationEntries(podEntries, p.state.GetMachineState(), false)
+	expectedRevision := p.state.GetRevision()
+	machineState := p.state.GetMachineState()
+	aErr := p.adjustAllocationEntriesAtRevision(
+		podEntries, machineState, false, expectedRevision)
 	if aErr != nil {
 		general.ErrorS(aErr, "adjustAllocationEntries failed", "podUID", req.PodUid)
 	}
@@ -1599,12 +1601,24 @@ func (p *DynamicPolicy) cleanPools() error {
 		}
 	}
 
+	// when default share materialization was enabled by persisted advisor state,
+	// the share pool is synthesized without any owning container, so it must be
+	// retained here.
+	keepSyntheticDefaultShare := p.state.GetDefaultShareMaterializationState().Enabled
+
 	// if pool exists in entries, but has no corresponding container, we need to delete it
 	poolsToDelete := sets.NewString()
 	for poolName, entries := range podEntries {
 		if entries.IsPoolEntry() {
 			// system pool is managed separately, should skip it
 			if commonstate.IsSystemPool(poolName) {
+				continue
+			}
+			// when default share residual backfill is enabled, the share pool is
+			// synthesized without any owning container, so retain it here instead of
+			// unconditionally adding share to state.ResidentPools (which would change
+			// the legacy behavior when the gate is disabled).
+			if keepSyntheticDefaultShare && poolName == commonstate.PoolNameShare {
 				continue
 			}
 			if !remainPools[poolName] && !state.ResidentPools.Has(poolName) {

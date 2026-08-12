@@ -386,6 +386,7 @@ func (p *DynamicPolicy) clearResidualState(_ *coreconfig.Configuration,
 		p.residualHitMap = make(map[string]int64)
 	}
 
+	expectedRevision := p.state.GetRevision()
 	podEntries := p.state.GetPodEntries()
 	for podUID, containerEntries := range podEntries {
 		if containerEntries.IsPoolEntry() {
@@ -445,7 +446,8 @@ func (p *DynamicPolicy) clearResidualState(_ *coreconfig.Configuration,
 			return
 		}
 
-		err = p.adjustAllocationEntries(podEntries, updatedMachineState, false)
+		err = p.adjustAllocationEntriesAtRevision(
+			podEntries, updatedMachineState, false, expectedRevision)
 		if err != nil {
 			general.ErrorS(err, "adjustAllocationEntries failed")
 		}
