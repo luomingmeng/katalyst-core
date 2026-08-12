@@ -59,12 +59,20 @@ Add the following optional field to
 `config/v1alpha1.MemoryGuardConfig`:
 
 ```go
+type CriticalWatermarkSource string
+
+const (
+	CriticalWatermarkSourceLow  CriticalWatermarkSource = "low"
+	CriticalWatermarkSourceHigh CriticalWatermarkSource = "high"
+)
+
 // +kubebuilder:validation:Enum=low;high
 // +optional
-CriticalWatermarkSource *string `json:"criticalWatermarkSource,omitempty"`
+CriticalWatermarkSource *CriticalWatermarkSource `json:"criticalWatermarkSource,omitempty"`
 ```
 
-The pointer preserves the required three states:
+The named type establishes a stable Go API contract and reusable values. The
+pointer preserves the required three states:
 
 - `nil`: use the startup default.
 - `low`: explicitly select the low watermark.
