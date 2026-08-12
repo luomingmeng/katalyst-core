@@ -213,6 +213,7 @@ func (s *cpuPluginState) CommitAdvisorState(
 	allowSharedCoresOverlapReclaimedCores bool,
 	disableDedicatedCoresOverlapReclaimedCores bool,
 	_ bool,
+	defaultShareMaterializationState DefaultShareMaterializationState,
 ) error {
 	s.Lock()
 	defer s.Unlock()
@@ -224,6 +225,7 @@ func (s *cpuPluginState) CommitAdvisorState(
 	s.machineState = machineState.Clone()
 	s.allowSharedCoresOverlapReclaimedCores = allowSharedCoresOverlapReclaimedCores
 	s.disableDedicatedCoresOverlapReclaimedCores = disableDedicatedCoresOverlapReclaimedCores
+	s.defaultShareMaterializationState = defaultShareMaterializationState
 	s.revision++
 	return nil
 }
@@ -237,6 +239,7 @@ func (s *cpuPluginState) CommitAdvisorStateIfRevision(
 	allowSharedCoresOverlapReclaimedCores bool,
 	disableDedicatedCoresOverlapReclaimedCores bool,
 	_ bool,
+	defaultShareMaterializationState DefaultShareMaterializationState,
 ) error {
 	s.Lock()
 	defer s.Unlock()
@@ -252,6 +255,7 @@ func (s *cpuPluginState) CommitAdvisorStateIfRevision(
 	s.machineState = machineState.Clone()
 	s.allowSharedCoresOverlapReclaimedCores = allowSharedCoresOverlapReclaimedCores
 	s.disableDedicatedCoresOverlapReclaimedCores = disableDedicatedCoresOverlapReclaimedCores
+	s.defaultShareMaterializationState = defaultShareMaterializationState
 	s.revision++
 	return nil
 }
@@ -261,6 +265,7 @@ func (s *cpuPluginState) restoreAdvisorState(
 	machineState NUMANodeMap,
 	allowSharedCoresOverlapReclaimedCores bool,
 	disableDedicatedCoresOverlapReclaimedCores bool,
+	defaultShareMaterializationState DefaultShareMaterializationState,
 	revision uint64,
 ) {
 	s.Lock()
@@ -270,6 +275,7 @@ func (s *cpuPluginState) restoreAdvisorState(
 	s.machineState = machineState.Clone()
 	s.allowSharedCoresOverlapReclaimedCores = allowSharedCoresOverlapReclaimedCores
 	s.disableDedicatedCoresOverlapReclaimedCores = disableDedicatedCoresOverlapReclaimedCores
+	s.defaultShareMaterializationState = defaultShareMaterializationState
 	s.revision = revision
 }
 
@@ -285,6 +291,13 @@ func (s *cpuPluginState) GetDisableDedicatedCoresOverlapReclaimedCores() bool {
 	defer s.RUnlock()
 
 	return s.cpuPluginStateData.GetDisableDedicatedCoresOverlapReclaimedCores()
+}
+
+func (s *cpuPluginState) GetDefaultShareMaterializationState() DefaultShareMaterializationState {
+	s.RLock()
+	defer s.RUnlock()
+
+	return s.cpuPluginStateData.GetDefaultShareMaterializationState()
 }
 
 func (s *cpuPluginState) GetRevision() uint64 {

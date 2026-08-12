@@ -57,8 +57,11 @@ func (m *MockState) GetPodEntries() state.PodEntries  { return nil }
 func (m *MockState) GetAllocationInfo(podUID string, containerName string) *state.AllocationInfo {
 	return nil
 }
-func (m *MockState) GetAllowSharedCoresOverlapReclaimedCores() bool               { return false }
-func (m *MockState) GetDisableDedicatedCoresOverlapReclaimedCores() bool          { return false }
+func (m *MockState) GetAllowSharedCoresOverlapReclaimedCores() bool      { return false }
+func (m *MockState) GetDisableDedicatedCoresOverlapReclaimedCores() bool { return false }
+func (m *MockState) GetDefaultShareMaterializationState() state.DefaultShareMaterializationState {
+	return state.DefaultShareMaterializationState{}
+}
 func (m *MockState) GetRevision() uint64                                          { return 0 }
 func (m *MockState) SetDisableDedicatedCoresOverlapReclaimedCores(_, _ bool)      {}
 func (m *MockState) SetMachineState(numaNodeMap state.NUMANodeMap, persist bool)  {}
@@ -74,6 +77,7 @@ func (m *MockState) CommitAdvisorState(
 	podEntries state.PodEntries,
 	machineState state.NUMANodeMap,
 	allowSharedCoresOverlapReclaimedCores, disableDedicatedCoresOverlapReclaimedCores, persist bool,
+	defaultShareMaterializationState state.DefaultShareMaterializationState,
 ) error {
 	return nil
 }
@@ -83,9 +87,10 @@ func (m *MockState) CommitAdvisorStateIfRevision(
 	podEntries state.PodEntries,
 	machineState state.NUMANodeMap,
 	allowSharedCoresOverlapReclaimedCores, disableDedicatedCoresOverlapReclaimedCores, persist bool,
+	defaultShareMaterializationState state.DefaultShareMaterializationState,
 ) error {
 	return m.CommitAdvisorState(
-		podEntries, machineState, allowSharedCoresOverlapReclaimedCores, disableDedicatedCoresOverlapReclaimedCores, persist)
+		podEntries, machineState, allowSharedCoresOverlapReclaimedCores, disableDedicatedCoresOverlapReclaimedCores, persist, defaultShareMaterializationState)
 }
 func (m *MockState) Delete(podUID string, containerName string, persist bool) {}
 func (m *MockState) ClearState()                                              {}

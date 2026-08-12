@@ -69,12 +69,14 @@ func (s *atomicCommitTrackingState) CommitAdvisorState(
 	podEntries state.PodEntries,
 	machineState state.NUMANodeMap,
 	allowOverlap, disableDedicatedOverlap, persist bool,
+	defaultShareMaterializationState state.DefaultShareMaterializationState,
 ) error {
 	s.commitCalls++
 	if s.commitErr != nil && (s.failCommits < 0 || s.commitCalls <= s.failCommits) {
 		return s.commitErr
 	}
-	return s.State.CommitAdvisorState(podEntries, machineState, allowOverlap, disableDedicatedOverlap, persist)
+	return s.State.CommitAdvisorState(
+		podEntries, machineState, allowOverlap, disableDedicatedOverlap, persist, defaultShareMaterializationState)
 }
 
 func (s *atomicCommitTrackingState) StoreState() error {

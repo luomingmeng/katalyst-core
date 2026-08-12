@@ -108,11 +108,12 @@ type allocationRequestLock struct {
 }
 
 type allocationRollbackSnapshot struct {
-	revision                uint64
-	podEntries              state.PodEntries
-	machineState            state.NUMANodeMap
-	allowOverlap            bool
-	disableDedicatedOverlap bool
+	revision                         uint64
+	podEntries                       state.PodEntries
+	machineState                     state.NUMANodeMap
+	allowOverlap                     bool
+	disableDedicatedOverlap          bool
+	defaultShareMaterializationState state.DefaultShareMaterializationState
 }
 
 // DynamicPolicy is the policy that's used by default;
@@ -246,6 +247,7 @@ func (p *DynamicPolicy) rollbackAllocationState(
 		snapshot.allowOverlap,
 		snapshot.disableDedicatedOverlap,
 		false,
+		snapshot.defaultShareMaterializationState,
 	)
 	if err == nil {
 		return nil
@@ -287,6 +289,7 @@ func (p *DynamicPolicy) rollbackAllocationState(
 		allowOverlap,
 		disableDedicatedOverlap,
 		false,
+		p.state.GetDefaultShareMaterializationState(),
 	); err != nil {
 		return fmt.Errorf("initialize stale allocation rollback planning state: %w", err)
 	}
@@ -309,6 +312,7 @@ func (p *DynamicPolicy) rollbackAllocationState(
 		allowOverlap,
 		disableDedicatedOverlap,
 		false,
+		planningState.GetDefaultShareMaterializationState(),
 	); err != nil {
 		return fmt.Errorf("commit stale allocation rollback: %w", err)
 	}
@@ -1294,11 +1298,12 @@ func (p *DynamicPolicy) Allocate(ctx context.Context,
 	defer unlockAllocationRequest()
 	p.Lock()
 	rollbackSnapshot := allocationRollbackSnapshot{
-		revision:                p.state.GetRevision(),
-		podEntries:              p.state.GetPodEntries(),
-		machineState:            p.state.GetMachineState(),
-		allowOverlap:            p.state.GetAllowSharedCoresOverlapReclaimedCores(),
-		disableDedicatedOverlap: p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+		revision:                         p.state.GetRevision(),
+		podEntries:                       p.state.GetPodEntries(),
+		machineState:                     p.state.GetMachineState(),
+		allowOverlap:                     p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+		disableDedicatedOverlap:          p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+		defaultShareMaterializationState: p.state.GetDefaultShareMaterializationState(),
 	}
 	defer func() {
 		// calls sys-advisor to inform the latest container

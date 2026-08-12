@@ -1701,12 +1701,13 @@ func buildLegacyMandatoryReclaimDescriptors(
 }
 
 type pendingAdvisorState struct {
-	preCommitRevision uint64
-	currentEntries    state.PodEntries
-	entries           state.PodEntries
-	machineState      state.NUMANodeMap
-	allowOverlap      bool
-	disableDedicated  bool
+	preCommitRevision                uint64
+	currentEntries                   state.PodEntries
+	entries                          state.PodEntries
+	machineState                     state.NUMANodeMap
+	allowOverlap                     bool
+	disableDedicated                 bool
+	defaultShareMaterializationState state.DefaultShareMaterializationState
 }
 
 // applyBlocks prepares and validates an advisor state transition without
@@ -2019,12 +2020,13 @@ func (p *DynamicPolicy) applyBlocks(
 		return nil, err
 	}
 	return &pendingAdvisorState{
-		preCommitRevision: stateRevision,
-		currentEntries:    curEntries,
-		entries:           newEntries,
-		machineState:      newMachineState,
-		allowOverlap:      allowSharedCoresOverlapReclaimedCores,
-		disableDedicated:  resp.DisableDedicatedCoresOverlapReclaimedCores,
+		preCommitRevision:                stateRevision,
+		currentEntries:                   curEntries,
+		entries:                          newEntries,
+		machineState:                     newMachineState,
+		allowOverlap:                     allowSharedCoresOverlapReclaimedCores,
+		disableDedicated:                 resp.DisableDedicatedCoresOverlapReclaimedCores,
+		defaultShareMaterializationState: p.state.GetDefaultShareMaterializationState(),
 	}, nil
 }
 
@@ -2042,6 +2044,7 @@ func (p *DynamicPolicy) commitPendingAdvisorState(pending *pendingAdvisorState) 
 		pending.allowOverlap,
 		pending.disableDedicated,
 		true,
+		pending.defaultShareMaterializationState,
 	)
 }
 

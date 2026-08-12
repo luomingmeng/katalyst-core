@@ -55,20 +55,26 @@ func (s *transientState) SetDisableDedicatedCoresOverlapReclaimedCores(v bool, _
 func (s *transientState) CommitAdvisorState(
 	podEntries PodEntries,
 	machineState NUMANodeMap,
-	allowOverlap, disableDedicatedOverlap, _ bool,
+	allowOverlap, disableDedicatedOverlap bool,
+	_ bool,
+	defaultShareMaterializationState DefaultShareMaterializationState,
 ) error {
 	return s.cpuPluginState.CommitAdvisorState(
-		podEntries, machineState, allowOverlap, disableDedicatedOverlap, false)
+		podEntries, machineState, allowOverlap, disableDedicatedOverlap, false,
+		defaultShareMaterializationState)
 }
 
 func (s *transientState) CommitAdvisorStateIfRevision(
 	expectedRevision uint64,
 	podEntries PodEntries,
 	machineState NUMANodeMap,
-	allowOverlap, disableDedicatedOverlap, _ bool,
+	allowOverlap, disableDedicatedOverlap bool,
+	_ bool,
+	defaultShareMaterializationState DefaultShareMaterializationState,
 ) error {
 	return s.cpuPluginState.CommitAdvisorStateIfRevision(
-		expectedRevision, podEntries, machineState, allowOverlap, disableDedicatedOverlap, false)
+		expectedRevision, podEntries, machineState, allowOverlap, disableDedicatedOverlap, false,
+		defaultShareMaterializationState)
 }
 
 func (s *transientState) Delete(podUID, containerName string, _ bool) {
