@@ -4,7 +4,7 @@
 
 **Goal:** Expose bulkhead default and per-CLOS CAT way counts through core flags and adapter environment variables.
 
-**Architecture:** `CPUPluginOptions` owns startup values and converts Kubernetes StringToString input into the typed dynamic QRM configuration. katalyst-adapter only maps environment variable names to core flag names; existing dynamic AdminQoSConfiguration application remains the later override.
+**Architecture:** `CPUPluginOptions` owns startup values, tracks whether the scalar CAT flag was explicitly set, and converts Kubernetes StringToString input into the typed dynamic QRM configuration. katalyst-adapter only maps environment variable names to core flag names; existing dynamic AdminQoSConfiguration application remains the later override.
 
 **Tech Stack:** Go, pflag through Kubernetes `NamedFlagSets`, Bash, Go tests.
 
@@ -301,3 +301,48 @@ git log -3 --oneline --decorate
 ```
 
 Expected: clean worktrees on the two requested feature branches.
+
+### Task 5: Review P1 — distinguish omitted default CAT ways from explicit zero
+
+**Files:**
+- Modify: `cmd/katalyst-agent/app/options/dynamic/adminqos/qrm/qrm_base_test.go`
+- Modify: `cmd/katalyst-agent/app/options/dynamic/adminqos/qrm/cpu_plugin.go`
+- Modify: `docs/superpowers/specs/2026-08-13-default-share-cat-ways-config-design.md`
+- Modify: `docs/superpowers/plans/2026-08-13-default-share-cat-ways-config.md`
+
+- [x] **Step 1: Write the failing real-parse regression test**
+
+Parse `--bulkhead-default-cat-ways=0` through the registered
+`qrm-cpu-plugin` flag set, call `ApplyTo`, and require a lower-case
+`bulkhead-default-cat-ways must be positive` error.
+
+- [x] **Step 2: Run the test and verify RED**
+
+Run:
+
+```bash
+go test ./cmd/katalyst-agent/app/options/dynamic/adminqos/qrm \
+  -run '^TestQRMPluginOptions_ParseExplicitZeroBulkheadDefaultCATWays$' -count=1
+```
+
+Observed: FAIL with `ApplyTo succeeded, want error`.
+
+- [x] **Step 3: Add minimal explicit-set state**
+
+Keep `BulkheadDefaultCATWays int64`, add one private boolean set bit, and
+register a small `pflag.Value` that parses with `strconv.ParseInt` and marks
+the bit only after successful parsing. In `ApplyTo`, reject a negative value
+as before and reject zero only when the set bit is true.
+
+- [x] **Step 4: Run the regression test and verify GREEN**
+
+Run the Step 2 command again.
+
+Observed: PASS.
+
+- [x] **Step 5: Run final verification and commit atomically**
+
+Run focused tests, the focused package with `-race`, focused `go vet`, gofmt,
+and `git diff --check`; inspect the final diff before committing the test,
+minimal implementation, design, and plan together without squashing prior
+history.

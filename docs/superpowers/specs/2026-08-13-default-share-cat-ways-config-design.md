@@ -32,13 +32,16 @@ For example, `reclaim=2,shared=4` becomes
 ## Core Design
 
 `CPUPluginOptions` owns startup defaults. It stores `DefaultCATWays` as
-`int64` and receives `ClosCATWays` through a `map[string]string` flag value.
-`ApplyTo` validates and converts every CLOS value to `int64`, then writes the
-typed values into `DynamicBulkheadRDTConfiguration`.
+`int64` plus a private explicit-set bit maintained by a `pflag.Value`, and
+receives `ClosCATWays` through a `map[string]string` flag value. The set bit
+distinguishes an omitted flag's compatible zero value from an explicitly
+configured zero. `ApplyTo` validates and converts every CLOS value to `int64`,
+then writes the typed values into `DynamicBulkheadRDTConfiguration`.
 
 Validation rejects:
 
-- negative `DefaultCATWays`; zero means the startup value is not configured;
+- non-positive explicitly configured `DefaultCATWays`; an omitted flag keeps
+  the compatible zero value;
 - empty CLOS names;
 - non-integer CLOS way counts;
 - non-positive CLOS way counts.
@@ -70,6 +73,8 @@ Core tests cover:
 - valid scalar and StringToString values reach the typed configuration;
 - malformed and empty-key values are rejected, and per-CLOS ways reject zero
   and negative values;
+- a real parse of `--bulkhead-default-cat-ways=0` succeeds at flag parsing but
+  is rejected by `ApplyTo` with a lower-case error;
 - omitted flags preserve zero-value behavior.
 
 Adapter verification covers:
