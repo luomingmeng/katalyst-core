@@ -21,6 +21,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/pflag"
 	cliflag "k8s.io/component-base/cli/flag"
 
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic/adminqos/qrm"
@@ -199,6 +200,61 @@ func TestQRMPluginOptions_ParseExplicitZeroBulkheadDefaultCATWays(t *testing.T) 
 	}
 	if err.Error() != strings.ToLower(err.Error()) {
 		t.Fatalf("ApplyTo error = %q, want lower-case error", err)
+	}
+}
+
+func TestExplicitInt64Value_RepeatedParseMatchesPflagInt64Value(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name         string
+		raw          string
+		wantApplyErr bool
+	}{
+		{name: "invalid", raw: "invalid", wantApplyErr: true},
+		{name: "overflow", raw: "9223372036854775808"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var pflagValue int64
+			pflagSet := pflag.NewFlagSet("pflag", pflag.ContinueOnError)
+			pflagSet.Int64Var(&pflagValue, "value", 0, "")
+
+			options := NewCPUPluginOptions()
+			value := &explicitInt64Value{
+				value: &options.BulkheadDefaultCATWays,
+				set:   &options.bulkheadDefaultCATWaysSet,
+			}
+
+			if err := pflagSet.Set("value", "7"); err != nil {
+				t.Fatalf("pflag initial Set failed: %v", err)
+			}
+			if err := value.Set("7"); err != nil {
+				t.Fatalf("explicitInt64Value initial Set failed: %v", err)
+			}
+			if err := pflagSet.Set("value", tc.raw); err == nil {
+				t.Fatal("pflag repeated Set succeeded, want error")
+			}
+			if err := value.Set(tc.raw); err == nil {
+				t.Fatal("explicitInt64Value repeated Set succeeded, want error")
+			}
+			if options.BulkheadDefaultCATWays != pflagValue {
+				t.Fatalf("explicitInt64Value = %d, pflag Int64Value = %d", options.BulkheadDefaultCATWays, pflagValue)
+			}
+			if !options.bulkheadDefaultCATWaysSet {
+				t.Fatal("explicitInt64Value set marker = false after successful initial Set")
+			}
+
+			err := options.ApplyTo(qrm.NewCPUPluginConfiguration())
+			if tc.wantApplyErr && err == nil {
+				t.Fatal("ApplyTo succeeded after ignored parse error, want error")
+			}
+			if !tc.wantApplyErr && err != nil {
+				t.Fatalf("ApplyTo failed after ignored parse error: %v", err)
+			}
+		})
 	}
 }
 

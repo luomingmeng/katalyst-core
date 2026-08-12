@@ -50,12 +50,11 @@ type explicitInt64Value struct {
 
 func (v *explicitInt64Value) Set(raw string) error {
 	value, err := strconv.ParseInt(raw, 0, 64)
-	if err != nil {
-		return err
-	}
 	*v.value = value
-	*v.set = true
-	return nil
+	if err == nil {
+		*v.set = true
+	}
+	return err
 }
 
 func (v *explicitInt64Value) String() string {
