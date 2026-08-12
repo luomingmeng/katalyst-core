@@ -17,6 +17,8 @@ limitations under the License.
 package qrm
 
 import (
+	"reflect"
+	"strings"
 	"testing"
 
 	cliflag "k8s.io/component-base/cli/flag"
@@ -57,6 +59,8 @@ func TestQRMPluginOptions_AddFlags(t *testing.T) {
 		"enable-bulkhead-system-service",
 		"bind-irq-to-reclaimed-pool",
 		"bulkhead-non-reclaim-pool-min-size",
+		"bulkhead-default-cat-ways",
+		"bulkhead-clos-cat-ways",
 	} {
 		if cpuPluginFlagSet.Lookup(name) == nil {
 			t.Errorf("qrm-cpu-plugin flag %q not found", name)
@@ -145,4 +149,86 @@ func TestQRMPluginOptions_ParseBulkheadNonReclaimPoolMinSize(t *testing.T) {
 	if config.CPUPluginConfiguration.BulkheadConfig.NonReclaimPoolMinSize != 4 {
 		t.Fatalf("NonReclaimPoolMinSize = %d, want 4", config.CPUPluginConfiguration.BulkheadConfig.NonReclaimPoolMinSize)
 	}
+}
+
+func TestQRMPluginOptions_ParseBulkheadCATWays(t *testing.T) {
+	t.Parallel()
+
+	options := NewQRMPluginOptions()
+	fss := &cliflag.NamedFlagSets{}
+	options.AddFlags(fss)
+
+	if err := fss.FlagSet("qrm-cpu-plugin").Parse([]string{
+		"--bulkhead-default-cat-ways=4",
+		"--bulkhead-clos-cat-ways=reclaim=2,shared=3",
+	}); err != nil {
+		t.Fatalf("failed to parse flags: %v", err)
+	}
+
+	config := qrm.NewQRMPluginConfiguration()
+	if err := options.ApplyTo(config); err != nil {
+		t.Fatalf("ApplyTo failed: %v", err)
+	}
+	rdt := config.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig
+	if rdt.DefaultCATWays != 4 {
+		t.Fatalf("DefaultCATWays = %d, want 4", rdt.DefaultCATWays)
+	}
+	wantClosCATWays := map[string]int64{"reclaim": 2, "shared": 3}
+	if !reflect.DeepEqual(rdt.ClosCATWays, wantClosCATWays) {
+		t.Fatalf("ClosCATWays = %v, want %v", rdt.ClosCATWays, wantClosCATWays)
+	}
+}
+
+func TestQRMPluginOptions_ValidateBulkheadCATWays(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name            string
+		defaultCATWays  int64
+		closCATWays     map[string]string
+		wantErrContains string
+	}{
+		{name: "negative default", defaultCATWays: -1, wantErrContains: "bulkhead-default-cat-ways must be positive"},
+		{name: "empty clos", closCATWays: map[string]string{"": "2"}, wantErrContains: "bulkhead-clos-cat-ways contains an empty clos"},
+		{name: "non integer", closCATWays: map[string]string{"reclaim": "x"}, wantErrContains: "invalid bulkhead-clos-cat-ways value"},
+		{name: "zero ways", closCATWays: map[string]string{"reclaim": "0"}, wantErrContains: "bulkhead-clos-cat-ways value must be positive"},
+		{name: "negative ways", closCATWays: map[string]string{"reclaim": "-1"}, wantErrContains: "bulkhead-clos-cat-ways value must be positive"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			options := NewQRMPluginOptions()
+			options.BulkheadDefaultCATWays = tc.defaultCATWays
+			options.BulkheadClosCATWays = tc.closCATWays
+
+			err := options.ApplyTo(qrm.NewQRMPluginConfiguration())
+			if err == nil {
+				t.Fatal("ApplyTo succeeded, want error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErrContains) {
+				t.Fatalf("ApplyTo error = %q, want substring %q", err, tc.wantErrContains)
+			}
+			if err.Error() != strings.ToLower(err.Error()) {
+				t.Fatalf("ApplyTo error = %q, want lower-case error", err)
+			}
+		})
+	}
+
+	t.Run("zero values preserve compatibility", func(t *testing.T) {
+		t.Parallel()
+
+		options := NewQRMPluginOptions()
+		config := qrm.NewQRMPluginConfiguration()
+		if err := options.ApplyTo(config); err != nil {
+			t.Fatalf("ApplyTo failed: %v", err)
+		}
+		rdt := config.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig
+		if rdt.DefaultCATWays != 0 {
+			t.Fatalf("DefaultCATWays = %d, want 0", rdt.DefaultCATWays)
+		}
+		if rdt.ClosCATWays != nil {
+			t.Fatalf("ClosCATWays = %v, want nil", rdt.ClosCATWays)
+		}
+	})
 }
