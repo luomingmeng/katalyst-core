@@ -58,6 +58,9 @@ SysAdvisor remains the owner of dynamic configuration.
 The adapter only extends `param_map` in
 `build/katalyst-agent/bytedance_run.sh`. It does not parse or validate CAT
 values; core remains the single owner of type conversion and validation.
+The adapter must also lock its katalyst-core replacement to the core commit
+that registers these flags; publishing the core branch precedes adapter
+dependency resolution and build verification.
 
 ## Testing
 
@@ -65,12 +68,14 @@ Core tests cover:
 
 - both flags are registered;
 - valid scalar and StringToString values reach the typed configuration;
-- malformed, empty-key, zero, and negative values are rejected;
+- malformed and empty-key values are rejected, and per-CLOS ways reject zero
+  and negative values;
 - omitted flags preserve zero-value behavior.
 
 Adapter verification covers:
 
 - both environment variables map to the expected flag names;
+- the locked core revision contains both mapped flags;
 - the startup script passes `bash -n`.
 
 ## Scope

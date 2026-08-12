@@ -193,6 +193,7 @@ git commit -m "feat(qrm): configure bulkhead CAT ways from flags"
 
 **Files:**
 - Modify: adapter `build/katalyst-agent/bytedance_run.sh`
+- Modify: adapter `go.mod`
 
 - [ ] **Step 1: Verify the mapping contract is initially absent**
 
@@ -236,6 +237,21 @@ git add build/katalyst-agent/bytedance_run.sh
 git commit -m "feat(agent): map bulkhead CAT ways parameters"
 ```
 
+- [ ] **Step 5: Lock adapter to the implementing core commit**
+
+After committing the core implementation, compute its pseudo-version from the
+UTC commit timestamp and 12-character commit prefix. Update the existing
+`github.com/kubewharf/katalyst-core` replacement in adapter `go.mod`, then
+commit it separately:
+
+```bash
+git add go.mod
+git commit -m "build(agent): update katalyst-core revision"
+```
+
+The core feature branch must be pushed before resolving this dependency. Do
+not use a local filesystem replacement or commit a local path.
+
 ### Task 4: Final verification
 
 **Files:**
@@ -268,10 +284,12 @@ Run:
 
 ```bash
 bash -n build/katalyst-agent/bytedance_run.sh
+go list -m -json -mod=readonly github.com/kubewharf/katalyst-core
 ```
 
-Expected: PASS. Record the pre-existing inaccessible Go replacement revision if
-`go mod download` remains blocked.
+Expected: PASS after the core feature branch is reachable from the replacement
+repository. If it has not been published yet, record dependency resolution as
+the sole external blocker instead of weakening the dependency contract.
 
 - [ ] **Step 4: Inspect final branch state**
 
