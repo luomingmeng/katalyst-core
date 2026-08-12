@@ -648,6 +648,7 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
 		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
 		false,
+		p.state.GetDefaultShareMaterializationState(),
 	); err != nil {
 		return nil, fmt.Errorf("initialize DNB ramp-up target state failed: %w", err)
 	}
@@ -697,6 +698,7 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
 		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
 		persistCheckpoint,
+		p.state.GetDefaultShareMaterializationState(),
 	); err != nil {
 		return nil, fmt.Errorf("commit DNB allocation and reclaim floor atomically failed: %w", err)
 	}
@@ -775,6 +777,7 @@ func (p *DynamicPolicy) rollbackFailedDNBAllocation(
 		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
 		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
 		false,
+		p.state.GetDefaultShareMaterializationState(),
 	); err != nil {
 		return fmt.Errorf("initialize failed DNB rollback state: %w", err)
 	}
@@ -789,6 +792,7 @@ func (p *DynamicPolicy) rollbackFailedDNBAllocation(
 		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
 		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
 		persistCheckpoint,
+		p.state.GetDefaultShareMaterializationState(),
 	)
 }
 

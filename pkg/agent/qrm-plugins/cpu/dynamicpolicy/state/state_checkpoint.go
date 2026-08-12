@@ -116,6 +116,7 @@ func (sc *stateCheckpoint) RestoreState(cp checkpointmanager.Checkpoint) (bool, 
 	sc.cache.numaHeadroom = general.DeepCopyIntToFloat64Map(checkpoint.NUMAHeadroom)
 	sc.cache.allowSharedCoresOverlapReclaimedCores = checkpoint.AllowSharedCoresOverlapReclaimedCores
 	sc.cache.disableDedicatedCoresOverlapReclaimedCores = checkpoint.DisableDedicatedCoresOverlapReclaimedCores
+	sc.cache.defaultShareMaterializationState = checkpoint.DefaultShareMaterializationState
 	sc.cache.revision = checkpoint.Revision
 	sc.cache.Unlock()
 
@@ -166,6 +167,7 @@ func (sc *stateCheckpoint) InitNewCheckpoint(empty bool) checkpointmanager.Check
 	checkpoint.PodEntries = sc.cache.GetPodEntries()
 	checkpoint.AllowSharedCoresOverlapReclaimedCores = sc.cache.GetAllowSharedCoresOverlapReclaimedCores()
 	checkpoint.DisableDedicatedCoresOverlapReclaimedCores = sc.cache.GetDisableDedicatedCoresOverlapReclaimedCores()
+	checkpoint.DefaultShareMaterializationState = sc.cache.GetDefaultShareMaterializationState()
 	checkpoint.Revision = sc.cache.GetRevision()
 	return checkpoint
 }
@@ -292,6 +294,7 @@ func (sc *stateCheckpoint) CommitAdvisorState(
 	allowSharedCoresOverlapReclaimedCores bool,
 	disableDedicatedCoresOverlapReclaimedCores bool,
 	persist bool,
+	defaultShareMaterializationState DefaultShareMaterializationState,
 ) error {
 	sc.Lock()
 	defer sc.Unlock()
@@ -300,6 +303,7 @@ func (sc *stateCheckpoint) CommitAdvisorState(
 	oldMachineState := sc.cache.GetMachineState()
 	oldAllowOverlap := sc.cache.GetAllowSharedCoresOverlapReclaimedCores()
 	oldDisableDedicatedOverlap := sc.cache.GetDisableDedicatedCoresOverlapReclaimedCores()
+	oldDefaultShareMaterializationState := sc.cache.GetDefaultShareMaterializationState()
 	oldRevision := sc.cache.GetRevision()
 
 	if err := sc.cache.CommitAdvisorState(
@@ -308,6 +312,7 @@ func (sc *stateCheckpoint) CommitAdvisorState(
 		allowSharedCoresOverlapReclaimedCores,
 		disableDedicatedCoresOverlapReclaimedCores,
 		false,
+		defaultShareMaterializationState,
 	); err != nil {
 		return err
 	}
@@ -316,7 +321,8 @@ func (sc *stateCheckpoint) CommitAdvisorState(
 	}
 	if err := sc.storeState(); err != nil {
 		sc.cache.restoreAdvisorState(
-			oldPodEntries, oldMachineState, oldAllowOverlap, oldDisableDedicatedOverlap, oldRevision)
+			oldPodEntries, oldMachineState, oldAllowOverlap, oldDisableDedicatedOverlap,
+			oldDefaultShareMaterializationState, oldRevision)
 		return err
 	}
 	return nil
@@ -329,6 +335,7 @@ func (sc *stateCheckpoint) CommitAdvisorStateIfRevision(
 	allowSharedCoresOverlapReclaimedCores bool,
 	disableDedicatedCoresOverlapReclaimedCores bool,
 	persist bool,
+	defaultShareMaterializationState DefaultShareMaterializationState,
 ) error {
 	sc.Lock()
 	defer sc.Unlock()
@@ -337,6 +344,7 @@ func (sc *stateCheckpoint) CommitAdvisorStateIfRevision(
 	oldMachineState := sc.cache.GetMachineState()
 	oldAllowOverlap := sc.cache.GetAllowSharedCoresOverlapReclaimedCores()
 	oldDisableDedicatedOverlap := sc.cache.GetDisableDedicatedCoresOverlapReclaimedCores()
+	oldDefaultShareMaterializationState := sc.cache.GetDefaultShareMaterializationState()
 	oldRevision := sc.cache.GetRevision()
 
 	if err := sc.cache.CommitAdvisorStateIfRevision(
@@ -346,6 +354,7 @@ func (sc *stateCheckpoint) CommitAdvisorStateIfRevision(
 		allowSharedCoresOverlapReclaimedCores,
 		disableDedicatedCoresOverlapReclaimedCores,
 		false,
+		defaultShareMaterializationState,
 	); err != nil {
 		return err
 	}
@@ -354,7 +363,8 @@ func (sc *stateCheckpoint) CommitAdvisorStateIfRevision(
 	}
 	if err := sc.storeState(); err != nil {
 		sc.cache.restoreAdvisorState(
-			oldPodEntries, oldMachineState, oldAllowOverlap, oldDisableDedicatedOverlap, oldRevision)
+			oldPodEntries, oldMachineState, oldAllowOverlap, oldDisableDedicatedOverlap,
+			oldDefaultShareMaterializationState, oldRevision)
 		return err
 	}
 	return nil
@@ -372,6 +382,13 @@ func (sc *stateCheckpoint) GetDisableDedicatedCoresOverlapReclaimedCores() bool 
 	defer sc.RUnlock()
 
 	return sc.cache.GetDisableDedicatedCoresOverlapReclaimedCores()
+}
+
+func (sc *stateCheckpoint) GetDefaultShareMaterializationState() DefaultShareMaterializationState {
+	sc.RLock()
+	defer sc.RUnlock()
+
+	return sc.cache.GetDefaultShareMaterializationState()
 }
 
 func (sc *stateCheckpoint) Delete(podUID string, containerName string, persist bool) {

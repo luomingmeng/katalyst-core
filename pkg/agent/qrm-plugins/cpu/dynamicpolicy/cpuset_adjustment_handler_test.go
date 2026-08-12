@@ -67,6 +67,7 @@ func (s *cpusetOverrideCommitGuardState) CommitAdvisorState(
 	bool,
 	bool,
 	bool,
+	state.DefaultShareMaterializationState,
 ) error {
 	s.unconditionalCommitCalls++
 	return fmt.Errorf("cpuset adjustment override must use CommitAdvisorStateIfRevision")
@@ -79,11 +80,12 @@ func (s *cpusetOverrideCommitGuardState) CommitAdvisorStateIfRevision(
 	allowOverlap bool,
 	disableDedicatedOverlap bool,
 	persist bool,
+	defaultShareMaterializationState state.DefaultShareMaterializationState,
 ) error {
 	s.conditionalCommitCalls++
 	s.conditionalRevision = expectedRevision
 	return s.State.CommitAdvisorStateIfRevision(
-		expectedRevision, podEntries, machineState, allowOverlap, disableDedicatedOverlap, persist)
+		expectedRevision, podEntries, machineState, allowOverlap, disableDedicatedOverlap, persist, defaultShareMaterializationState)
 }
 
 func (f *cacheSyncRegistrarPodFetcher) RegisterKubeletPodCacheSyncListener(string) (
@@ -875,7 +877,7 @@ func runAdvisorCheckpointWriter(t *testing.T, dir string) {
 		preCommitRevision,
 		func() error {
 			return p.state.CommitAdvisorStateIfRevision(
-				preCommitRevision, entries, machineState, false, true, true)
+				preCommitRevision, entries, machineState, false, true, true, p.state.GetDefaultShareMaterializationState())
 		},
 	)
 	require.NoError(t, err)
@@ -1090,6 +1092,7 @@ func TestAdvisorWriteAheadRecoverySelectsMainRevisionAndCleansOtherSlot(t *testi
 					firstState.GetAllowSharedCoresOverlapReclaimedCores(),
 					firstState.GetDisableDedicatedCoresOverlapReclaimedCores(),
 					true,
+					firstState.GetDefaultShareMaterializationState(),
 				))
 			}
 
@@ -1151,7 +1154,8 @@ func TestAdvisorWriteAheadTargetRealRestartAtCommitCrashPoints(t *testing.T) {
 					firstState.GetMachineState(),
 					firstState.GetAllowSharedCoresOverlapReclaimedCores(),
 					firstState.GetDisableDedicatedCoresOverlapReclaimedCores(),
-					true))
+					true,
+					firstState.GetDefaultShareMaterializationState()))
 				require.Equal(t, postCommitRevision, firstState.GetRevision())
 			}
 			if tc.publishTarget {

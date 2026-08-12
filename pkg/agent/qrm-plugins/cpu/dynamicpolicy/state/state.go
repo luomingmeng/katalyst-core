@@ -775,7 +775,13 @@ type cpuPluginStateData struct {
 	numaHeadroom                               map[int]float64
 	allowSharedCoresOverlapReclaimedCores      bool
 	disableDedicatedCoresOverlapReclaimedCores bool
+	defaultShareMaterializationState           DefaultShareMaterializationState
 	revision                                   uint64
+}
+
+type DefaultShareMaterializationState struct {
+	Enabled         bool `json:"enabled"`
+	AdvisedQuantity int  `json:"advised_quantity"`
 }
 
 // Clone deep-copies every field of cpuPluginStateData. The caller receives a
@@ -791,7 +797,8 @@ func (d *cpuPluginStateData) Clone() cpuPluginStateData {
 		numaHeadroom:                          general.DeepCopyIntToFloat64Map(d.numaHeadroom),
 		allowSharedCoresOverlapReclaimedCores: d.allowSharedCoresOverlapReclaimedCores,
 		disableDedicatedCoresOverlapReclaimedCores: d.disableDedicatedCoresOverlapReclaimedCores,
-		revision: d.revision,
+		defaultShareMaterializationState:           d.defaultShareMaterializationState,
+		revision:                                   d.revision,
 	}
 }
 
@@ -848,6 +855,13 @@ func (d *cpuPluginStateData) GetDisableDedicatedCoresOverlapReclaimedCores() boo
 	return d.disableDedicatedCoresOverlapReclaimedCores
 }
 
+func (d *cpuPluginStateData) GetDefaultShareMaterializationState() DefaultShareMaterializationState {
+	if d == nil {
+		return DefaultShareMaterializationState{}
+	}
+	return d.defaultShareMaterializationState
+}
+
 func (d *cpuPluginStateData) GetRevision() uint64 {
 	if d == nil {
 		return 0
@@ -863,6 +877,7 @@ type reader interface {
 	GetAllocationInfo(podUID string, containerName string) *AllocationInfo
 	GetAllowSharedCoresOverlapReclaimedCores() bool
 	GetDisableDedicatedCoresOverlapReclaimedCores() bool
+	GetDefaultShareMaterializationState() DefaultShareMaterializationState
 	GetRevision() uint64
 }
 
@@ -875,8 +890,8 @@ type writer interface {
 	SetAllocationInfo(podUID string, containerName string, allocationInfo *AllocationInfo, persist bool)
 	SetAllowSharedCoresOverlapReclaimedCores(allowSharedCoresOverlapReclaimedCores, persist bool)
 	SetDisableDedicatedCoresOverlapReclaimedCores(disableDedicatedCoresOverlapReclaimedCores, persist bool)
-	CommitAdvisorState(podEntries PodEntries, machineState NUMANodeMap, allowSharedCoresOverlapReclaimedCores, disableDedicatedCoresOverlapReclaimedCores, persist bool) error
-	CommitAdvisorStateIfRevision(expectedRevision uint64, podEntries PodEntries, machineState NUMANodeMap, allowSharedCoresOverlapReclaimedCores, disableDedicatedCoresOverlapReclaimedCores, persist bool) error
+	CommitAdvisorState(podEntries PodEntries, machineState NUMANodeMap, allowSharedCoresOverlapReclaimedCores, disableDedicatedCoresOverlapReclaimedCores, persist bool, defaultShareMaterializationState DefaultShareMaterializationState) error
+	CommitAdvisorStateIfRevision(expectedRevision uint64, podEntries PodEntries, machineState NUMANodeMap, allowSharedCoresOverlapReclaimedCores, disableDedicatedCoresOverlapReclaimedCores, persist bool, defaultShareMaterializationState DefaultShareMaterializationState) error
 
 	Delete(podUID string, containerName string, persist bool)
 	ClearState()

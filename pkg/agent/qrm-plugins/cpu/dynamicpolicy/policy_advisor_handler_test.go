@@ -659,12 +659,13 @@ func (s *advisorCommitRecordingState) CommitAdvisorState(
 	allowOverlap bool,
 	disableDedicatedOverlap bool,
 	persist bool,
+	defaultShareMaterializationState state.DefaultShareMaterializationState,
 ) error {
 	s.calls++
 	if s.err != nil {
 		return s.err
 	}
-	return s.State.CommitAdvisorState(entries, machineState, allowOverlap, disableDedicatedOverlap, persist)
+	return s.State.CommitAdvisorState(entries, machineState, allowOverlap, disableDedicatedOverlap, persist, defaultShareMaterializationState)
 }
 
 func (s *advisorCommitRecordingState) CommitAdvisorStateIfRevision(
@@ -674,12 +675,13 @@ func (s *advisorCommitRecordingState) CommitAdvisorStateIfRevision(
 	allowOverlap bool,
 	disableDedicatedOverlap bool,
 	persist bool,
+	defaultShareMaterializationState state.DefaultShareMaterializationState,
 ) error {
 	s.calls++
 	if s.err != nil {
 		return s.err
 	}
-	return s.State.CommitAdvisorStateIfRevision(expectedRevision, entries, machineState, allowOverlap, disableDedicatedOverlap, persist)
+	return s.State.CommitAdvisorStateIfRevision(expectedRevision, entries, machineState, allowOverlap, disableDedicatedOverlap, persist, defaultShareMaterializationState)
 }
 
 func (s *advisorCommitGuardState) CommitAdvisorState(
@@ -688,6 +690,7 @@ func (s *advisorCommitGuardState) CommitAdvisorState(
 	bool,
 	bool,
 	bool,
+	state.DefaultShareMaterializationState,
 ) error {
 	s.unconditionalCommitCalls++
 	return fmt.Errorf("advisor applyBlocks must use CommitAdvisorStateIfRevision")
@@ -700,10 +703,11 @@ func (s *advisorCommitGuardState) CommitAdvisorStateIfRevision(
 	allowOverlap bool,
 	disableDedicatedOverlap bool,
 	persist bool,
+	defaultShareMaterializationState state.DefaultShareMaterializationState,
 ) error {
 	s.conditionalCommitCalls++
 	s.conditionalRevision = expectedRevision
-	return s.State.CommitAdvisorStateIfRevision(expectedRevision, entries, machineState, allowOverlap, disableDedicatedOverlap, persist)
+	return s.State.CommitAdvisorStateIfRevision(expectedRevision, entries, machineState, allowOverlap, disableDedicatedOverlap, persist, defaultShareMaterializationState)
 }
 
 func (s *staleAdvisorCommitState) CommitAdvisorStateIfRevision(
@@ -713,6 +717,7 @@ func (s *staleAdvisorCommitState) CommitAdvisorStateIfRevision(
 	allowOverlap bool,
 	disableDedicatedOverlap bool,
 	persist bool,
+	defaultShareMaterializationState state.DefaultShareMaterializationState,
 ) error {
 	if !s.injected {
 		s.injected = true
@@ -720,7 +725,7 @@ func (s *staleAdvisorCommitState) CommitAdvisorStateIfRevision(
 			!s.State.GetAllowSharedCoresOverlapReclaimedCores(), false)
 	}
 	return s.State.CommitAdvisorStateIfRevision(
-		expectedRevision, entries, machineState, allowOverlap, disableDedicatedOverlap, persist)
+		expectedRevision, entries, machineState, allowOverlap, disableDedicatedOverlap, persist, defaultShareMaterializationState)
 }
 
 func TestDynamicPolicy_checkAndApplyIfCgroupV1(t *testing.T) {

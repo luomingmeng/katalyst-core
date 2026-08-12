@@ -30,6 +30,18 @@ import (
 var _ checkpointmanager.Checkpoint = &CPUPluginCheckpoint{}
 
 type CPUPluginCheckpoint struct {
+	PolicyName                                 string                           `json:"policyName"`
+	MachineState                               NUMANodeMap                      `json:"machineState"`
+	NUMAHeadroom                               map[int]float64                  `json:"numa_headroom"`
+	PodEntries                                 PodEntries                       `json:"pod_entries"`
+	AllowSharedCoresOverlapReclaimedCores      bool                             `json:"allow_shared_cores_overlap_reclaimed_cores"`
+	DisableDedicatedCoresOverlapReclaimedCores bool                             `json:"disable_dedicated_cores_overlap_reclaimed_cores"`
+	DefaultShareMaterializationState           DefaultShareMaterializationState `json:"default_share_materialization_state"`
+	Revision                                   uint64                           `json:"revision"`
+	Checksum                                   checksum.Checksum                `json:"checksum"`
+}
+
+type cpuPluginCheckpointWithoutDefaultShareMaterializationState struct {
 	PolicyName                                 string            `json:"policyName"`
 	MachineState                               NUMANodeMap       `json:"machineState"`
 	NUMAHeadroom                               map[int]float64   `json:"numa_headroom"`
@@ -80,7 +92,19 @@ func (cp *CPUPluginCheckpoint) VerifyChecksum() error {
 	if err == nil {
 		return nil
 	}
-	legacy := &cpuPluginCheckpointWithoutRevision{
+	legacyWithRevision := &cpuPluginCheckpointWithoutDefaultShareMaterializationState{
+		PolicyName:                            cp.PolicyName,
+		MachineState:                          cp.MachineState,
+		NUMAHeadroom:                          cp.NUMAHeadroom,
+		PodEntries:                            cp.PodEntries,
+		AllowSharedCoresOverlapReclaimedCores: cp.AllowSharedCoresOverlapReclaimedCores,
+		DisableDedicatedCoresOverlapReclaimedCores: cp.DisableDedicatedCoresOverlapReclaimedCores,
+		Revision: cp.Revision,
+	}
+	if verifyLegacyCPUPluginChecksum(ck, legacyWithRevision, "cpuPluginCheckpointWithoutDefaultShareMaterializationState") {
+		return nil
+	}
+	legacyWithoutRevision := &cpuPluginCheckpointWithoutRevision{
 		PolicyName:                            cp.PolicyName,
 		MachineState:                          cp.MachineState,
 		NUMAHeadroom:                          cp.NUMAHeadroom,
@@ -88,9 +112,16 @@ func (cp *CPUPluginCheckpoint) VerifyChecksum() error {
 		AllowSharedCoresOverlapReclaimedCores: cp.AllowSharedCoresOverlapReclaimedCores,
 		DisableDedicatedCoresOverlapReclaimedCores: cp.DisableDedicatedCoresOverlapReclaimedCores,
 	}
+	if verifyLegacyCPUPluginChecksum(ck, legacyWithoutRevision, "cpuPluginCheckpointWithoutRevision") {
+		return nil
+	}
+	return err
+}
+
+func verifyLegacyCPUPluginChecksum(ck checksum.Checksum, legacy interface{}, typeName string) bool {
 	// DeepHashObject includes the concrete top-level type name. Reproduce the
-	// former CPUPluginCheckpoint spelling so checkpoints written before the
-	// Revision field was introduced remain valid during rolling upgrades.
+	// former CPUPluginCheckpoint spelling so checkpoints written before newly
+	// added fields remain valid during rolling upgrades.
 	var serialized bytes.Buffer
 	printer := spew.ConfigState{
 		Indent:         " ",
@@ -100,11 +131,8 @@ func (cp *CPUPluginCheckpoint) VerifyChecksum() error {
 	}
 	printer.Fprintf(&serialized, "%#v", legacy)
 	legacyBytes := strings.Replace(
-		serialized.String(), "cpuPluginCheckpointWithoutRevision", "CPUPluginCheckpoint", 1)
+		serialized.String(), typeName, "CPUPluginCheckpoint", 1)
 	hash := fnv.New32a()
 	_, _ = hash.Write([]byte(legacyBytes))
-	if ck == checksum.Checksum(hash.Sum32()) {
-		return nil
-	}
-	return err
+	return ck == checksum.Checksum(hash.Sum32())
 }
