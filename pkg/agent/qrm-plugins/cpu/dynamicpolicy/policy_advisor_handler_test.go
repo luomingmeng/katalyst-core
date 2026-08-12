@@ -59,9 +59,11 @@ func TestConvertGetAdviceResponsePropagatesDedicatedReclaimDisjoint(t *testing.T
 
 	unified := convertGetAdviceResponse(&advisorapi.GetAdviceResponse{
 		DisableDedicatedCoresOverlapReclaimedCores: true,
+		FillDefaultSharePoolWithNonReclaimCpus:     true,
 	})
 
 	require.True(t, unified.DisableDedicatedCoresOverlapReclaimedCores)
+	require.True(t, unified.FillDefaultSharePoolWithNonReclaimCpus)
 }
 
 func TestValidateDedicatedReclaimDisjointTransport(t *testing.T) {
@@ -651,6 +653,294 @@ func prepareAndCommitAdvisorBlocks(
 		return err
 	}
 	return policy.commitPendingAdvisorState(pending)
+}
+
+func TestDynamicPolicyApplyBlocksMaterializesDefaultShareFromResidual(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	policy.state.SetPodEntries(state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(0),
+			},
+		},
+		"custom": {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta("custom"),
+				AllocationResult: machine.NewCPUSet(1),
+			},
+		},
+	}, false)
+
+	resp := &advisorapi.ListAndWatchResponse{
+		FillDefaultSharePoolWithNonReclaimCpus: true,
+		Entries: map[string]*advisorapi.CalculationEntries{
+			commonstate.PoolNameShare: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameShare,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "share", Result: 7}},
+							},
+						},
+					},
+				},
+			},
+			commonstate.PoolNameReclaim: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameReclaim,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "reclaim", Result: 1}},
+							},
+						},
+					},
+				},
+			},
+			"custom": {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: "custom",
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "custom", Result: 1}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	blockCPUSet := advisorapi.BlockCPUSet{
+		"share":   machine.NewCPUSet(1, 2, 3, 4, 5, 6, 7),
+		"reclaim": machine.NewCPUSet(0),
+		"custom":  machine.NewCPUSet(1),
+	}
+
+	pending, err := policy.applyBlocks(blockCPUSet, resp, false)
+	require.NoError(t, err)
+	require.Equal(t, state.DefaultShareMaterializationState{Enabled: true, AdvisedQuantity: 7},
+		pending.defaultShareMaterializationState)
+	share := pending.entries[commonstate.PoolNameShare][commonstate.FakedContainerName].AllocationResult
+	require.True(t, share.Equals(machine.NewCPUSet(2, 3, 4, 5, 6, 7)),
+		"actual residual may be smaller than advisor quantity and must replace the block cpuset, got %s", share)
+}
+
+func TestDynamicPolicyApplyBlocksClearsDefaultShareStateWhenAdviceDisabled(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	entries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(0, 1),
+			},
+		},
+	}
+	machineState, err := generateMachineStateFromPodEntries(policy.machineInfo.CPUTopology, entries, policy.state.GetMachineState())
+	require.NoError(t, err)
+	require.NoError(t, policy.state.CommitAdvisorState(
+		entries,
+		machineState,
+		false,
+		false,
+		false,
+		state.DefaultShareMaterializationState{Enabled: true, AdvisedQuantity: 6},
+	))
+
+	resp := &advisorapi.ListAndWatchResponse{
+		Entries: map[string]*advisorapi.CalculationEntries{
+			commonstate.PoolNameReclaim: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameReclaim,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "reclaim", Result: 2}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	pending, err := policy.applyBlocks(advisorapi.BlockCPUSet{
+		"reclaim": machine.NewCPUSet(0, 1),
+	}, resp, false)
+	require.NoError(t, err)
+	require.Equal(t, state.DefaultShareMaterializationState{}, pending.defaultShareMaterializationState)
+}
+
+func TestDynamicPolicyApplyBlocksRejectsDefaultShareResidualLargerThanAdviceAtomically(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	policy.state.SetPodEntries(state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(0, 1),
+			},
+		},
+	}, false)
+	initialEntries := policy.state.GetPodEntries()
+	initialMachineState := policy.state.GetMachineState()
+	initialRevision := policy.state.GetRevision()
+
+	resp := &advisorapi.ListAndWatchResponse{
+		FillDefaultSharePoolWithNonReclaimCpus: true,
+		Entries: map[string]*advisorapi.CalculationEntries{
+			commonstate.PoolNameShare: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameShare,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "share", Result: 5}},
+							},
+						},
+					},
+				},
+			},
+			commonstate.PoolNameReclaim: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameReclaim,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "reclaim", Result: 2}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	err = prepareAndCommitAdvisorBlocks(policy, advisorapi.BlockCPUSet{
+		"share":   machine.NewCPUSet(2, 3, 4, 5, 6),
+		"reclaim": machine.NewCPUSet(0, 1),
+	}, resp, false)
+	require.ErrorContains(t, err, "default share quantity 5 is smaller than residual cpuset size 6")
+	require.Equal(t, initialRevision, policy.state.GetRevision())
+	require.Equal(t, initialEntries, policy.state.GetPodEntries())
+	require.Equal(t, initialMachineState, policy.state.GetMachineState())
+}
+
+func TestDefaultShareQuantityFromAdvisorResponseRequiresUniqueFakedNUMAAdvice(t *testing.T) {
+	t.Parallel()
+
+	valid := func() *advisorapi.ListAndWatchResponse {
+		return &advisorapi.ListAndWatchResponse{
+			Entries: map[string]*advisorapi.CalculationEntries{
+				commonstate.PoolNameShare: {
+					Entries: map[string]*advisorapi.CalculationInfo{
+						commonstate.FakedContainerName: {
+							OwnerPoolName: commonstate.PoolNameShare,
+							CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+								commonstate.FakedNUMAID: {
+									Blocks: []*advisorapi.Block{
+										{BlockId: "share-0", Result: 3},
+										{BlockId: "share-1", Result: 4},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	resp := valid()
+	got, err := defaultShareQuantityFromAdvisorResponse(resp)
+	require.NoError(t, err)
+	require.Equal(t, 7, got)
+
+	resp = valid()
+	resp.Entries[commonstate.PoolNameShare].Entries["duplicate"] = &advisorapi.CalculationInfo{
+		OwnerPoolName: commonstate.PoolNameShare,
+	}
+	_, err = defaultShareQuantityFromAdvisorResponse(resp)
+	require.ErrorContains(t, err, "exactly one pool entry")
+
+	resp = valid()
+	resp.Entries[commonstate.PoolNameShare].Entries[commonstate.FakedContainerName].
+		CalculationResultsByNumas[0] = &advisorapi.NumaCalculationResult{}
+	_, err = defaultShareQuantityFromAdvisorResponse(resp)
+	require.ErrorContains(t, err, "only faked numa id")
+}
+
+func TestDefaultShareEligibleCPUSetUsesCurrentMachineStateGuards(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	policy.reservedCPUs = machine.NewCPUSet(0)
+	policy.reservedReclaimedCPUSet = machine.NewCPUSet(4, 5)
+	policy.reservedReclaimedCPUsSize = 2
+	policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+
+	entries := state.PodEntries{
+		commonstate.PoolNameInterrupt: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameInterrupt),
+				AllocationResult: machine.NewCPUSet(1),
+			},
+		},
+		"system-test": {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta("system-test"),
+				AllocationResult: machine.NewCPUSet(2),
+			},
+		},
+		"ramp-pod": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "ramp-pod",
+					ContainerName: "main",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+				},
+				RampUp: true,
+			},
+		},
+	}
+	policy.state.SetPodEntries(entries, false)
+	policy.state.SetMachineState(state.NUMANodeMap{
+		0: {
+			DefaultCPUSet: topology.CPUDetails.CPUs(),
+			ResourcePackageStates: map[string]*state.ResourcePackageState{
+				"pinned": {PinnedCPUSet: machine.NewCPUSet(3)},
+			},
+			PodEntries: entries,
+		},
+	}, false)
+
+	machineState := policy.state.GetMachineState()
+	rampFloor, err := policy.deriveRampUpReclaimFloor(machineState, false)
+	require.NoError(t, err)
+	got := policy.buildDefaultShareEligibleCPUSet(entries, machineState, rampFloor)
+	require.True(t, got.Equals(machine.NewCPUSet(7)),
+		"eligible must exclude reserved, forbidden, system, pinned, and ramp-floor CPUs, got %s", got)
 }
 
 func (s *advisorCommitRecordingState) CommitAdvisorState(

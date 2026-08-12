@@ -653,8 +653,9 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 		return nil, fmt.Errorf("initialize DNB ramp-up target state failed: %w", err)
 	}
 	planningPolicy := p.newRampUpPlanningPolicy(planningState)
-	err = planningPolicy.adjustAllocationEntriesWithRampUpFloor(
-		basePodEntries, updatedMachineState, false, hardReclaimCPUs, false)
+	planningRevision := planningState.GetRevision()
+	err = planningPolicy.adjustAllocationEntriesWithRampUpFloorAtRevision(
+		basePodEntries, updatedMachineState, false, hardReclaimCPUs, false, planningRevision)
 	if err != nil {
 		general.Errorf("pod: %s/%s, container: %s putContainersAndAdjustAllocationEntriesWithoutAllocation failed with error: %v",
 			req.PodNamespace, req.PodName, req.ContainerName, err)
@@ -698,7 +699,7 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
 		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
 		persistCheckpoint,
-		p.state.GetDefaultShareMaterializationState(),
+		planningState.GetDefaultShareMaterializationState(),
 	); err != nil {
 		return nil, fmt.Errorf("commit DNB allocation and reclaim floor atomically failed: %w", err)
 	}
@@ -782,8 +783,9 @@ func (p *DynamicPolicy) rollbackFailedDNBAllocation(
 		return fmt.Errorf("initialize failed DNB rollback state: %w", err)
 	}
 	planningPolicy := p.newRampUpPlanningPolicy(planningState)
-	if err := planningPolicy.adjustAllocationEntriesWithRampUpFloor(
-		latestEntries, latestMachineState, false, machine.NewCPUSet(), false); err != nil {
+	planningRevision := planningState.GetRevision()
+	if err := planningPolicy.adjustAllocationEntriesWithRampUpFloorAtRevision(
+		latestEntries, latestMachineState, false, machine.NewCPUSet(), false, planningRevision); err != nil {
 		return fmt.Errorf("recompute pools and reclaim floor without failed DNB allocation: %w", err)
 	}
 	return p.state.CommitAdvisorState(
@@ -792,7 +794,7 @@ func (p *DynamicPolicy) rollbackFailedDNBAllocation(
 		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
 		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
 		persistCheckpoint,
-		p.state.GetDefaultShareMaterializationState(),
+		planningState.GetDefaultShareMaterializationState(),
 	)
 }
 
@@ -807,6 +809,8 @@ func (p *DynamicPolicy) newRampUpPlanningPolicy(planningState state.State) *Dyna
 		state:                           planningState,
 		enableReclaimNUMABinding:        p.enableReclaimNUMABinding,
 		enableSNBHighNumaPreference:     p.enableSNBHighNumaPreference,
+		enableCPUAdvisor:                p.enableCPUAdvisor,
+		advisorMonitor:                  p.advisorMonitor,
 		qosConfig:                       p.qosConfig,
 		dynamicConfig:                   p.dynamicConfig,
 		conf:                            p.conf,
@@ -981,8 +985,7 @@ func (p *DynamicPolicy) allocateNumaBindingCPUsWithEligibility(numCPUs int, hint
 	dedicatedEligiblePerNUMA := make(map[int]machine.CPUSet)
 	reclaimEligiblePerNUMA := make(map[int]machine.CPUSet)
 	if coverExclusivePartition {
-		dedicatedEligiblePerNUMA, reclaimEligiblePerNUMA, err =
-			p.numaBindingPartitionEligibility(machineState, pkgName, hintNodes)
+		dedicatedEligiblePerNUMA, reclaimEligiblePerNUMA, err = p.numaBindingPartitionEligibility(machineState, pkgName, hintNodes)
 		if err != nil {
 			return machine.NewCPUSet(), machine.NewCPUSet(), nil, err
 		}
@@ -990,8 +993,7 @@ func (p *DynamicPolicy) allocateNumaBindingCPUsWithEligibility(numCPUs int, hint
 			partitionEligiblePerNUMA: make(map[int]machine.CPUSet, len(hintNodes)),
 		}
 		for _, numaID := range hintNodes {
-			eligibility.partitionEligiblePerNUMA[int(numaID)] =
-				dedicatedEligiblePerNUMA[int(numaID)].Union(reclaimEligiblePerNUMA[int(numaID)])
+			eligibility.partitionEligiblePerNUMA[int(numaID)] = dedicatedEligiblePerNUMA[int(numaID)].Union(reclaimEligiblePerNUMA[int(numaID)])
 		}
 	}
 	dedicatedEligible := machine.NewCPUSet()
@@ -1537,7 +1539,18 @@ func (p *DynamicPolicy) adjustAllocationEntries(
 	machineState state.NUMANodeMap,
 	persistCheckpoint bool,
 ) error {
-	return p.adjustAllocationEntriesWithRampUpFloor(entries, machineState, persistCheckpoint, machine.NewCPUSet(), true)
+	return p.adjustAllocationEntriesAtRevision(
+		entries, machineState, persistCheckpoint, p.state.GetRevision())
+}
+
+func (p *DynamicPolicy) adjustAllocationEntriesAtRevision(
+	entries state.PodEntries,
+	machineState state.NUMANodeMap,
+	persistCheckpoint bool,
+	expectedRevision uint64,
+) error {
+	return p.adjustAllocationEntriesWithRampUpFloorAtRevision(
+		entries, machineState, persistCheckpoint, machine.NewCPUSet(), true, expectedRevision)
 }
 
 func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloor(
@@ -1546,6 +1559,19 @@ func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloor(
 	persistCheckpoint bool,
 	explicitRampUpFloor machine.CPUSet,
 	runCPUSetHandlers bool,
+) error {
+	return p.adjustAllocationEntriesWithRampUpFloorAtRevision(
+		entries, machineState, persistCheckpoint, explicitRampUpFloor,
+		runCPUSetHandlers, p.state.GetRevision())
+}
+
+func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloorAtRevision(
+	entries state.PodEntries,
+	machineState state.NUMANodeMap,
+	persistCheckpoint bool,
+	explicitRampUpFloor machine.CPUSet,
+	runCPUSetHandlers bool,
+	expectedRevision uint64,
 ) error {
 	startTime := time.Now()
 	general.Infof("called")
@@ -1557,8 +1583,10 @@ func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloor(
 	// if sys advisor is enabled, we believe the pools' ratio that sys advisor indicates,
 	// else we do sum(containers req) for each pool to get pools ratio
 	var poolsQuantityMap map[string]map[int]int
-	if p.enableCPUAdvisor &&
-		!cpuutil.AdvisorDegradation(p.advisorMonitor.GetHealthy(), p.dynamicConfig.GetDynamicConfiguration().EnableReclaim) {
+	dynamicConfig := p.dynamicConfig.GetDynamicConfiguration()
+	advisorHealthy := p.enableCPUAdvisor && p.advisorMonitor != nil &&
+		!cpuutil.AdvisorDegradation(p.advisorMonitor.GetHealthy(), dynamicConfig.EnableReclaim)
+	if advisorHealthy {
 		poolsCPUSetMap, err := entries.GetFilteredPoolsCPUSetMap(state.IsResidentPool, commonstate.IsSystemPool)
 		if err != nil {
 			return fmt.Errorf("GetFilteredPoolsCPUSetMap failed with error: %v", err)
@@ -1573,11 +1601,11 @@ func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloor(
 	}
 	isolatedQuantityMap := state.GetIsolatedQuantityMapFromPodEntries(entries, nil, p.getContainerRequestedCores)
 
-	err := p.adjustPoolsAndIsolatedEntriesWithRampUpFloor(
+	err := p.adjustPoolsAndIsolatedEntriesWithRampUpFloorAtRevision(
 		poolsQuantityMap, isolatedQuantityMap, entries, machineState, persistCheckpoint,
-		explicitRampUpFloor, runCPUSetHandlers)
+		explicitRampUpFloor, runCPUSetHandlers, expectedRevision)
 	if err != nil {
-		return fmt.Errorf("adjustpoolsandisolatedentries failed with error: %v", err)
+		return fmt.Errorf("adjustpoolsandisolatedentries failed with error: %w", err)
 	}
 
 	return nil
@@ -1595,8 +1623,9 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntries(
 	machineState state.NUMANodeMap,
 	persistCheckpoint bool,
 ) error {
-	return p.adjustPoolsAndIsolatedEntriesWithRampUpFloor(
-		poolsQuantityMap, isolatedQuantityMap, entries, machineState, persistCheckpoint, machine.NewCPUSet(), true)
+	return p.adjustPoolsAndIsolatedEntriesWithRampUpFloorAtRevision(
+		poolsQuantityMap, isolatedQuantityMap, entries, machineState, persistCheckpoint,
+		machine.NewCPUSet(), true, p.state.GetRevision())
 }
 
 func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloor(
@@ -1607,6 +1636,21 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloor(
 	persistCheckpoint bool,
 	explicitRampUpFloor machine.CPUSet,
 	runCPUSetHandlers bool,
+) error {
+	return p.adjustPoolsAndIsolatedEntriesWithRampUpFloorAtRevision(
+		poolsQuantityMap, isolatedQuantityMap, entries, machineState, persistCheckpoint,
+		explicitRampUpFloor, runCPUSetHandlers, p.state.GetRevision())
+}
+
+func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloorAtRevision(
+	poolsQuantityMap map[string]map[int]int,
+	isolatedQuantityMap map[string]map[string]int,
+	entries state.PodEntries,
+	machineState state.NUMANodeMap,
+	persistCheckpoint bool,
+	explicitRampUpFloor machine.CPUSet,
+	runCPUSetHandlers bool,
+	expectedRevision uint64,
 ) error {
 	rampUpReclaimFloor := explicitRampUpFloor.Clone()
 	if p.isRampUpReclaimHardPartitionEnabled() && rampUpReclaimFloor.IsEmpty() {
@@ -1640,8 +1684,9 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloor(
 	// rpPinnedCPUSet contains the pinned CPU sets for resource packages
 	rpPinnedCPUSet := machineState.GetResourcePackagePinnedCPUSet()
 
-	// deduct the cpus that are not allocatable by user containers.
-	notAllocatablePoolCPUs := state.GetUnitedPoolsCPUs(entries, state.IsForbiddenPool, commonstate.IsSystemPool)
+	// 扣除不可被用户容器分配的 CPU。这里同时看本轮 entries 和 canonical state，
+	// 避免本轮快照缺失 system/forbidden pool 时，default share residual 与 advisor quantity 口径漂移。
+	notAllocatablePoolCPUs := p.getNotAllocatablePoolCPUs(entries)
 	availableCPUs = availableCPUs.Difference(notAllocatablePoolCPUs)
 	hardPartitionWithExplicitFloor := p.isRampUpReclaimHardPartitionEnabled() && !rampUpReclaimFloor.IsEmpty()
 	if hardPartitionWithExplicitFloor {
@@ -1656,7 +1701,18 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloor(
 	general.Infof("poolsQuantityMap: %#v, isolatedQuantityMap: %#v, rpPinnedCPUSet: %v, availableCPUs: %v, reclaimOverlapShareRatio: %#v",
 		poolsQuantityMap, isolatedQuantityMap, rpPinnedCPUSet, availableCPUs, reclaimOverlapShareRatio)
 
-	poolsCPUSet, isolatedCPUSet, err := p.groupAndAllocatePools(poolsQuantityMap, isolatedQuantityMap, availableCPUs, rpPinnedCPUSet, reclaimOverlapShareRatio)
+	// When advisor advice has enabled default-share materialization, the default
+	// non-NUMA-binding share pool must not participate in the normal pool
+	// allocation path. The persisted advisor state, not dynamic config nor the
+	// current/request cpuset, is the source of truth for local replans.
+	fixedPoolsQuantityMap := copyPoolQuantityMap(poolsQuantityMap)
+	defaultSharePlan := defaultShareMaterializationPlanFromState(
+		p.state.GetDefaultShareMaterializationState())
+	if defaultSharePlan.enabled {
+		delete(fixedPoolsQuantityMap, commonstate.PoolNameShare)
+	}
+
+	poolsCPUSet, isolatedCPUSet, err := p.groupAndAllocatePools(fixedPoolsQuantityMap, isolatedQuantityMap, availableCPUs, rpPinnedCPUSet, reclaimOverlapShareRatio)
 	if err != nil {
 		return fmt.Errorf("groupAndAllocatePools failed with error: %v", err)
 	}
@@ -1679,9 +1735,10 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloor(
 	}
 
 	err = p.applyPoolsAndIsolatedInfo(poolsCPUSet, isolatedCPUSet, entries,
-		machineState, state.GetSharedBindingNUMAsFromQuantityMap(poolsQuantityMap), persistCheckpoint, rampUpReclaimFloor)
+		machineState, state.GetSharedBindingNUMAsFromQuantityMap(poolsQuantityMap), persistCheckpoint, rampUpReclaimFloor,
+		defaultSharePlan, expectedRevision)
 	if err != nil {
-		return fmt.Errorf("applyPoolsAndIsolatedInfo failed with error: %v", err)
+		return fmt.Errorf("applyPoolsAndIsolatedInfo failed with error: %w", err)
 	}
 
 	err = p.cleanPools()
@@ -1765,6 +1822,17 @@ func (p *DynamicPolicy) validateOwnedPoolsQuantity(
 		}
 	}
 	return nil
+}
+
+func (p *DynamicPolicy) getNotAllocatablePoolCPUs(entries state.PodEntries) machine.CPUSet {
+	notAllocatablePoolCPUs := state.GetUnitedPoolsCPUs(entries, state.IsForbiddenPool, commonstate.IsSystemPool)
+	if p == nil || p.state == nil {
+		return notAllocatablePoolCPUs
+	}
+
+	return notAllocatablePoolCPUs.Union(
+		state.GetUnitedPoolsCPUs(p.state.GetPodEntries(), state.IsForbiddenPool, commonstate.IsSystemPool),
+	)
 }
 
 func (p *DynamicPolicy) groupAndAllocatePools(
@@ -1883,6 +1951,218 @@ func (p *DynamicPolicy) reclaimOverlapNUMABinding(poolsCPUSet map[string]machine
 	return nil
 }
 
+// copyPoolQuantityMap deep-copies the pools quantity map so that the caller's
+// map is never mutated (e.g. when we delete the default share pool for the
+// residual-backfill path).
+func copyPoolQuantityMap(in map[string]map[int]int) map[string]map[int]int {
+	out := make(map[string]map[int]int, len(in))
+	for poolName, byNUMA := range in {
+		copied := make(map[int]int, len(byNUMA))
+		for numaID, quantity := range byNUMA {
+			copied[numaID] = quantity
+		}
+		out[poolName] = copied
+	}
+	return out
+}
+
+type defaultShareMaterializationPlan struct {
+	enabled         bool
+	advisedQuantity int
+	eligibleCPUSet  machine.CPUSet
+}
+
+func defaultShareMaterializationPlanFromState(
+	materializationState state.DefaultShareMaterializationState,
+) defaultShareMaterializationPlan {
+	if !materializationState.Enabled {
+		return defaultShareMaterializationPlan{}
+	}
+	return defaultShareMaterializationPlan{
+		enabled:         true,
+		advisedQuantity: materializationState.AdvisedQuantity,
+	}
+}
+
+func (p defaultShareMaterializationPlan) materializationState(fallback state.DefaultShareMaterializationState) state.DefaultShareMaterializationState {
+	if !p.enabled {
+		return fallback
+	}
+	return state.DefaultShareMaterializationState{
+		Enabled:         true,
+		AdvisedQuantity: p.advisedQuantity,
+	}
+}
+
+// buildDefaultShareEligibleCPUSet derives the default-share source of truth
+// from the complete physical topology and the entries being finalized. It must
+// not start from NUMANodeState.DefaultCPUSet: that field can still describe the
+// old placement while an exclusive DNB container is migrating between NUMAs.
+func (p *DynamicPolicy) buildDefaultShareEligibleCPUSet(
+	finalizedEntries state.PodEntries,
+	machineState state.NUMANodeMap,
+	rampUpReclaimFloor machine.CPUSet,
+) machine.CPUSet {
+	eligible := p.machineInfo.CPUDetails.CPUs().Difference(p.reservedCPUs)
+
+	exclusiveNUMAs := sets.NewInt()
+	for _, containerEntries := range finalizedEntries {
+		if containerEntries.IsPoolEntry() {
+			continue
+		}
+		for _, allocationInfo := range containerEntries {
+			if allocationInfo == nil || !allocationInfo.CheckDedicatedNUMABindingNUMAExclusive() {
+				continue
+			}
+			for numaID := range allocationInfo.TopologyAwareAssignments {
+				exclusiveNUMAs.Insert(numaID)
+			}
+			if len(allocationInfo.TopologyAwareAssignments) == 0 {
+				for _, numaID := range p.machineInfo.CPUDetails.NUMANodes().ToSliceNoSortInt() {
+					if !allocationInfo.AllocationResult.Intersection(
+						p.machineInfo.CPUDetails.CPUsInNUMANodes(numaID)).IsEmpty() {
+						exclusiveNUMAs.Insert(numaID)
+					}
+				}
+			}
+		}
+	}
+	eligible = eligible.Difference(
+		p.machineInfo.CPUDetails.CPUsInNUMANodes(exclusiveNUMAs.UnsortedList()...))
+	eligible = eligible.Difference(
+		state.GetUnitedPoolsCPUs(finalizedEntries, state.IsForbiddenPool, commonstate.IsSystemPool))
+	for _, pinned := range machineState.GetResourcePackagePinnedCPUSet() {
+		eligible = eligible.Difference(pinned)
+	}
+	return eligible.Difference(rampUpReclaimFloor)
+}
+
+// unionPoolCPUSet unions all pool cpusets except the excluded pool.
+func unionPoolCPUSet(pools map[string]machine.CPUSet, excludedPool string) machine.CPUSet {
+	result := machine.NewCPUSet()
+	for poolName, cpus := range pools {
+		if poolName == excludedPool {
+			continue
+		}
+		result = result.Union(cpus)
+	}
+	return result
+}
+
+// unionIsolatedCPUSet unions all isolated container cpusets.
+func unionIsolatedCPUSet(isolated map[string]map[string]machine.CPUSet) machine.CPUSet {
+	result := machine.NewCPUSet()
+	for _, containers := range isolated {
+		for _, cpus := range containers {
+			result = result.Union(cpus)
+		}
+	}
+	return result
+}
+
+func isolatedCPUSetFromPodEntries(entries state.PodEntries) map[string]map[string]machine.CPUSet {
+	isolated := make(map[string]map[string]machine.CPUSet)
+	for podUID, containers := range entries {
+		if containers.IsPoolEntry() {
+			continue
+		}
+		for containerName, allocationInfo := range containers {
+			if allocationInfo == nil || allocationInfo.CheckDedicatedNUMABinding() || !allocationInfo.CheckDedicated() {
+				continue
+			}
+			if isolated[podUID] == nil {
+				isolated[podUID] = make(map[string]machine.CPUSet)
+			}
+			isolated[podUID][containerName] = allocationInfo.AllocationResult.Clone()
+		}
+	}
+	return isolated
+}
+
+// materializeDefaultShareCPUSet computes the residual cpuset for the default
+// share pool by subtracting every fixed pool (except the default share pool
+// itself) and every isolated container cpuset from availableCPUs, then fails
+// closed when the expected quantity produced by SysAdvisor is smaller than the
+// residual size.
+//
+// Mutual-exclusion premise: this residual backfill relies on advisor-side
+// default-share materialization and AllowSharedCoresOverlapReclaimedCores being
+// mutually exclusive. That mutual exclusion is enforced on the SysAdvisor side by
+// validateDefaultShareBackfillConfig (assembler_common.go) at the quantity
+// layer: when the gate is enabled but overlap is allowed it errors out and no
+// default share quantity is produced. Therefore we deliberately do NOT
+// re-validate the overlap flag here. Even if both flags were mis-enabled
+// together, the residual size could exceed the expected quantity and the check
+// below makes QRM fail closed (reject the allocation) rather than silently
+// produce a wrong cpuset. A larger expected quantity is accepted because QRM may
+// observe a newly allocated fixed pool before SysAdvisor shrinks the default
+// share quantity; in that case the residual cpuset is the fresher CPUSet-level
+// source of truth.
+func materializeDefaultShareCPUSet(expectedQuantity int, availableCPUs machine.CPUSet,
+	pools map[string]machine.CPUSet, isolated map[string]map[string]machine.CPUSet,
+) (machine.CPUSet, error) {
+	fixed := unionPoolCPUSet(pools, commonstate.PoolNameShare).Union(unionIsolatedCPUSet(isolated))
+	residual := availableCPUs.Difference(fixed)
+	if residual.Size() > expectedQuantity {
+		return machine.NewCPUSet(), fmt.Errorf(
+			"default share quantity %d is smaller than residual cpuset size %d, available: %s, fixed: %s, residual: %s",
+			expectedQuantity, residual.Size(), availableCPUs.String(), fixed.String(), residual.String())
+	}
+	if residual.Size() < expectedQuantity {
+		general.InfoS("default share residual cpuset shrank before advisor quantity",
+			"expectedQuantity", expectedQuantity,
+			"actualSize", residual.Size(),
+			"availableCPUs", availableCPUs.String(),
+			"fixedCPUs", fixed.String(),
+			"residualCPUs", residual.String(),
+		)
+	}
+	general.InfoS("default share residual cpuset allocated",
+		"expectedQuantity", expectedQuantity,
+		"actualSize", residual.Size(),
+	)
+	return residual, nil
+}
+
+// finalizeDefaultShareEntry re-derives the default share pool cpuset from the
+// post-overlap / post-revise pool entries and installs it into newPodEntries.
+// It reads each non-share pool's AllocationResult directly from newPodEntries
+// so that any adjustment made by reclaimOverlapNUMABinding / reviseReclaimPool /
+// explicitRampUpFloor is naturally reflected in the residual. If QRM observes a
+// newly allocated fixed pool before SysAdvisor shrinks the default share
+// quantity, the computed residual still replaces the old default share entry.
+func (p *DynamicPolicy) finalizeDefaultShareEntry(
+	newPodEntries state.PodEntries,
+	expectedQuantity int, candidate machine.CPUSet,
+) error {
+	finalPools := make(map[string]machine.CPUSet)
+	for poolName, entries := range newPodEntries {
+		if !entries.IsPoolEntry() || poolName == commonstate.PoolNameShare {
+			continue
+		}
+		finalPools[poolName] = entries[commonstate.FakedContainerName].AllocationResult
+	}
+	share, err := materializeDefaultShareCPUSet(
+		expectedQuantity, candidate, finalPools, isolatedCPUSetFromPodEntries(newPodEntries))
+	if err != nil {
+		return err
+	}
+	topologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, share)
+	if err != nil {
+		return fmt.Errorf("calculate default share topology assignments: %w", err)
+	}
+	newPodEntries[commonstate.PoolNameShare] = state.ContainerEntries{
+		commonstate.FakedContainerName: {
+			AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+			AllocationResult:                 share.Clone(),
+			OriginalAllocationResult:         share.Clone(),
+			TopologyAwareAssignments:         topologyAwareAssignments,
+			OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(topologyAwareAssignments),
+		},
+	}
+	return nil
+}
+
 // applyPoolsAndIsolatedInfo generates the latest checkpoint by pools and isolated cpusets calculation results.
 // 1. construct entries for isolated containers (probably be dedicated_cores not numa_binding )
 // 2. construct entries for all pools
@@ -1891,7 +2171,11 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 	isolatedCPUSet map[string]map[string]machine.CPUSet, curEntries state.PodEntries,
 	machineState state.NUMANodeMap, sharedBindingNUMAs sets.Int, persistCheckpoint bool,
 	explicitRampUpFloor machine.CPUSet,
+	defaultSharePlan defaultShareMaterializationPlan,
+	stateRevision uint64,
 ) error {
+	allowSharedCoresOverlapReclaimedCores := p.state.GetAllowSharedCoresOverlapReclaimedCores()
+	disableDedicatedCoresOverlapReclaimedCores := p.state.GetDisableDedicatedCoresOverlapReclaimedCores()
 	newPodEntries := make(state.PodEntries)
 	unionDedicatedIsolatedCPUSet := machine.NewCPUSet()
 
@@ -1991,10 +2275,35 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 		newPodEntries,
 		nonReclaimActualBindingNUMAs,
 		unionDedicatedIsolatedCPUSet,
-		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+		allowSharedCoresOverlapReclaimedCores,
 	)
 	if err != nil {
 		return err
+	}
+
+	// backfill the default non-NUMA-binding share pool with residual CPUs
+	// after every fixed pool has been settled (post reclaimOverlapNUMABinding,
+	// post reviseReclaimPool, post explicitRampUpFloor merge). This must happen
+	// before rampUpCPUs computation and before any SetPodEntries/StoreState so
+	// that a quantity mismatch fails closed without persisting a partial
+	// checkpoint.
+	if defaultSharePlan.enabled {
+		eligibilityEntries := make(state.PodEntries, len(newPodEntries)+len(curEntries))
+		for podUID, containerEntries := range newPodEntries {
+			eligibilityEntries[podUID] = containerEntries
+		}
+		for podUID, containerEntries := range curEntries {
+			if !containerEntries.IsPoolEntry() {
+				eligibilityEntries[podUID] = containerEntries
+			}
+		}
+		defaultSharePlan.eligibleCPUSet = p.buildDefaultShareEligibleCPUSet(
+			eligibilityEntries, machineState, rampUpReclaimFloor)
+		if err := p.finalizeDefaultShareEntry(
+			newPodEntries, defaultSharePlan.advisedQuantity, defaultSharePlan.eligibleCPUSet,
+		); err != nil {
+			return err
+		}
 	}
 
 	sharedBindingNUMACPUs := p.machineInfo.CPUDetails.CPUsInNUMANodes(sharedBindingNUMAs.UnsortedList()...)
@@ -2194,15 +2503,15 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 	if err != nil {
 		return fmt.Errorf("calculate machineState by newPodEntries failed with error: %v", err)
 	}
-	p.state.SetPodEntries(newPodEntries, false)
-	p.state.SetMachineState(machineState, false)
-	if persistCheckpoint {
-		if err = p.state.StoreState(); err != nil {
-			general.ErrorS(err, "store state failed")
-		}
-	}
-
-	return nil
+	return p.state.CommitAdvisorStateIfRevision(
+		stateRevision,
+		newPodEntries,
+		machineState,
+		allowSharedCoresOverlapReclaimedCores,
+		disableDedicatedCoresOverlapReclaimedCores,
+		persistCheckpoint,
+		defaultSharePlan.materializationState(p.state.GetDefaultShareMaterializationState()),
+	)
 }
 
 func (p *DynamicPolicy) getSharedNUMABindingRampUpCPUSet(

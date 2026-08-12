@@ -62,6 +62,7 @@ func (p *DynamicPolicy) syncResourcePackagePinnedCPUSet() {
 		return
 	}
 
+	expectedRevision := p.state.GetRevision()
 	interruptAllocationInfo := p.state.GetAllocationInfo(commonstate.PoolNameInterrupt, commonstate.FakedContainerName)
 
 	machineState := p.state.GetMachineState()
@@ -102,7 +103,8 @@ func (p *DynamicPolicy) syncResourcePackagePinnedCPUSet() {
 			}
 		}
 
-		err = p.adjustAllocationEntries(podEntries, machineState, true)
+		err = p.adjustAllocationEntriesAtRevision(
+			podEntries, machineState, true, expectedRevision)
 		if err != nil {
 			general.Errorf("adjustAllocationEntries failed: %v", err)
 			return

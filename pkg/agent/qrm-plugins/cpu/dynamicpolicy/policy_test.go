@@ -318,6 +318,89 @@ func TestCleanPoolsSkipsNilAllocationInfo(t *testing.T) {
 	as.Nil(err)
 }
 
+func TestCleanPoolsKeepsSyntheticDefaultShareWhenBackfillEnabled(t *testing.T) {
+	t.Parallel()
+
+	policy := newTestDynamicPolicy(t, "keep-synthetic-share")
+	entries := state.PodEntries{
+		commonstate.PoolNameShare: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta: commonstate.GenerateGenericPoolAllocationMeta(
+					commonstate.PoolNameShare),
+				AllocationResult: machine.NewCPUSet(1, 2, 3),
+			},
+		},
+	}
+	machineState, err := generateMachineStateFromPodEntries(
+		policy.machineInfo.CPUTopology, entries, policy.state.GetMachineState())
+	require.NoError(t, err)
+	require.NoError(t, policy.state.CommitAdvisorState(
+		entries,
+		machineState,
+		false,
+		false,
+		false,
+		state.DefaultShareMaterializationState{Enabled: true, AdvisedQuantity: 3},
+	))
+
+	require.NoError(t, policy.cleanPools())
+	require.False(t,
+		policy.state.GetPodEntries().
+			CheckPoolEmpty(commonstate.PoolNameShare))
+}
+
+func TestCleanPoolsDeletesSyntheticDefaultShareWhenBackfillDisabled(t *testing.T) {
+	t.Parallel()
+
+	policy := newTestDynamicPolicy(t, "delete-synthetic-share-gate-off")
+	// gate never enabled, keep the legacy cleanup behavior.
+	policy.state.SetPodEntries(state.PodEntries{
+		commonstate.PoolNameShare: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta: commonstate.GenerateGenericPoolAllocationMeta(
+					commonstate.PoolNameShare),
+				AllocationResult: machine.NewCPUSet(1, 2, 3),
+			},
+		},
+	}, false)
+
+	require.NoError(t, policy.cleanPools())
+	require.True(t,
+		policy.state.GetPodEntries().
+			CheckPoolEmpty(commonstate.PoolNameShare))
+}
+
+func TestCleanPoolsDeletesDefaultShareAfterBackfillFlippedOff(t *testing.T) {
+	t.Parallel()
+
+	policy := newTestDynamicPolicy(t, "delete-synthetic-share-gate-flip")
+	entries := state.PodEntries{
+		commonstate.PoolNameShare: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta: commonstate.GenerateGenericPoolAllocationMeta(
+					commonstate.PoolNameShare),
+				AllocationResult: machine.NewCPUSet(1, 2, 3),
+			},
+		},
+	}
+	machineState, err := generateMachineStateFromPodEntries(
+		policy.machineInfo.CPUTopology, entries, policy.state.GetMachineState())
+	require.NoError(t, err)
+	require.NoError(t, policy.state.CommitAdvisorState(
+		entries,
+		machineState,
+		false,
+		false,
+		false,
+		state.DefaultShareMaterializationState{},
+	))
+
+	require.NoError(t, policy.cleanPools())
+	require.True(t,
+		policy.state.GetPodEntries().
+			CheckPoolEmpty(commonstate.PoolNameShare))
+}
+
 func TestGetResourcesAllocationSkipsNilAllocationInfo(t *testing.T) {
 	t.Parallel()
 
