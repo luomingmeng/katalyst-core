@@ -24,6 +24,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	resourcepackage "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 )
@@ -190,6 +191,19 @@ func buildAdvisorBlockDescriptors(
 	sort.Slice(descriptors, func(i, j int) bool {
 		return advisorBlockDescriptorLess(descriptors[i], descriptors[j])
 	})
+	for _, descriptor := range descriptors {
+		general.InfoS("advisor block descriptor built",
+			"blockID", descriptor.BlockID,
+			"class", descriptor.Class,
+			"numaID", descriptor.NUMAID,
+			"quantity", descriptor.Quantity,
+			"componentKey", descriptor.ComponentKey,
+			"owners", descriptor.Owners,
+			"eligibleSize", descriptor.Eligible.Size(),
+			"eligible", descriptor.Eligible.String(),
+			"oldPreferredSize", descriptor.OldPreferred.Size(),
+			"oldPreferred", descriptor.OldPreferred.String())
+	}
 	return descriptors, nil
 }
 
@@ -380,10 +394,26 @@ func expandHardPartitionReclaimPhase(
 			fixedDedicatedByNUMA[descriptor.NUMAID] += descriptor.Quantity
 		}
 	}
+	general.InfoS("hard reclaim phase input",
+		"availableSize", available.Size(),
+		"available", available.String(),
+		"descriptorCount", len(descriptors),
+		"mandatoryCount", len(mandatory),
+		"fakeMandatoryCount", len(fakeDescriptors),
+		"fixedDedicatedByNUMA", fixedDedicatedByNUMA)
 
 	for _, descriptor := range mandatory {
 		totalQuantity += descriptor.Quantity
 		finalEligible := descriptor.Eligible.Intersection(available)
+		general.InfoS("hard reclaim mandatory descriptor",
+			"blockID", descriptor.BlockID,
+			"numaID", descriptor.NUMAID,
+			"quantity", descriptor.Quantity,
+			"componentKey", descriptor.ComponentKey,
+			"eligibleSize", descriptor.Eligible.Size(),
+			"eligible", descriptor.Eligible.String(),
+			"finalEligibleSize", finalEligible.Size(),
+			"finalEligible", finalEligible.String())
 		if descriptor.NUMAID == commonstate.FakedNUMAID {
 			if topology.CPUDetails.KeepOnly(finalEligible).NUMANodes().IsEmpty() {
 				return nil, nil, fmt.Errorf(
@@ -418,6 +448,12 @@ func expandHardPartitionReclaimPhase(
 		})
 		blockIDByDemandKey[key] = descriptor.BlockID
 	}
+	general.InfoS("hard reclaim phase seeded real mandatory",
+		"totalQuantity", totalQuantity,
+		"eligibleNUMAs", sortedIntKeys(eligibleNUMAs),
+		"capacityByNUMA", capacityByNUMA,
+		"finalByNUMA", finalByNUMA,
+		"fixedDedicatedByNUMA", fixedDedicatedByNUMA)
 
 	if len(fakeDescriptors) == 0 {
 		return demands, blockIDByDemandKey, nil
@@ -452,6 +488,15 @@ func expandHardPartitionReclaimPhase(
 		eligibleCapacityByNUMA[numaID] = finalEligible.Intersection(
 			topology.CPUDetails.CPUsInNUMANodes(numaID)).Size()
 	}
+	general.InfoS("hard reclaim fake mandatory water-filling input",
+		"blockID", fake.BlockID,
+		"quantity", fake.Quantity,
+		"componentKey", fake.ComponentKey,
+		"eligibleNUMAs", numaIDs,
+		"eligibleCapacityByNUMA", eligibleCapacityByNUMA,
+		"capacityByNUMA", capacityByNUMA,
+		"fixedDedicatedByNUMA", fixedDedicatedByNUMA,
+		"finalByNUMABeforeFake", finalByNUMA)
 	quotas := make(map[int]int, len(numaIDs))
 	for allocated := 0; allocated < fake.Quantity; allocated++ {
 		selectedNUMA := 0
@@ -474,6 +519,10 @@ func expandHardPartitionReclaimPhase(
 		quotas[selectedNUMA]++
 		finalByNUMA[selectedNUMA]++
 	}
+	general.InfoS("hard reclaim fake mandatory water-filling result",
+		"blockID", fake.BlockID,
+		"quotas", quotas,
+		"finalByNUMAAfterFake", finalByNUMA)
 	for _, numaID := range numaIDs {
 		if quotas[numaID] == 0 {
 			continue
@@ -505,10 +554,26 @@ func expandHardPartitionReclaimPhase(
 		}
 	}
 	if maximum-minimum > 1 {
+		general.InfoS("hard reclaim final NUMA quantities imbalanced",
+			"minimum", minimum,
+			"maximum", maximum,
+			"finalByNUMA", finalByNUMA,
+			"capacityByNUMA", capacityByNUMA,
+			"fixedDedicatedByNUMA", fixedDedicatedByNUMA,
+			"fakeQuotas", quotas)
 		return nil, nil, fmt.Errorf(
 			"hard reclaim final NUMA quantities are imbalanced: min %d max %d", minimum, maximum)
 	}
 	return demands, blockIDByDemandKey, nil
+}
+
+func sortedIntKeys(keys map[int]struct{}) []int {
+	result := make([]int, 0, len(keys))
+	for key := range keys {
+		result = append(result, key)
+	}
+	sort.Ints(result)
+	return result
 }
 
 func hardReclaimPhaseDemandKey(descriptor advisorBlockDescriptor, numaID int) string {

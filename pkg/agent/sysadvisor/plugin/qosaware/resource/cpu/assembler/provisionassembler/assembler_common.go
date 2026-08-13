@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -1130,6 +1131,21 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		allowSharedOverlap:    *pa.allowSharedCoresOverlapReclaimedCores,
 		allowDedicatedOverlap: !result.DisableDedicatedCoresOverlapReclaimedCores,
 	}
+	general.InfoS("reclaim pool calculation input",
+		"numaID", numaID,
+		"nodeEnableReclaim", nodeEnableReclaim,
+		"policy", policy,
+		"reservedForReclaim", reservedForReclaim,
+		"shareAndIsolatedDedicatedPoolAvailable", shareAndIsolatedDedicatedPoolAvailable,
+		"shareAndIsolateDedicatedPoolSizes", shareAndIsolateDedicatedPoolSizes,
+		"dedicatedPoolSizes", dedicatedPoolSizes,
+		"dedicatedPoolSizeRequirements", dedicatedPoolSizeRequirements,
+		"dedicatedReclaimCoresSize", dedicatedReclaimCoresSize,
+		"totalUnusedNonReclaimablePinnedCPUSize", totalUnusedNonReclaimablePinnedCPUSize,
+		"shareRequirements", shareInfo.requirements,
+		"shareReclaimEnable", shareInfo.reclaimEnable,
+		"dedicatedRequirements", dedicatedInfo.requirements,
+		"dedicatedReclaimEnable", dedicatedInfo.reclaimEnable)
 	reclaimedCoresSize, _, reclaimedCoresQuota, err := pa.calculateReclaimPool(reclaimPoolData, policy, result)
 	if err != nil {
 		return err
@@ -1167,6 +1183,18 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		reclaimPoolData.overlapAtoms...,
 	)
 	nonOverlapReclaimedCoresSize := general.Max(reclaimedCoresSize-overlapReclaimedCoresSize, 0)
+	general.InfoS("reclaim pool calculation output",
+		"numaID", numaID,
+		"nodeEnableReclaim", nodeEnableReclaim,
+		"policy", policy,
+		"ratio", ratio,
+		"cpuCount", cpuCount,
+		"reservedForReclaim", reservedForReclaim,
+		"reclaimedCoresSize", reclaimedCoresSize,
+		"overlapReclaimedCoresSize", overlapReclaimedCoresSize,
+		"nonOverlapReclaimedCoresSize", nonOverlapReclaimedCoresSize,
+		"reclaimedCoresQuota", reclaimedCoresQuota,
+		"overlapAtoms", summarizeOverlapAtoms(reclaimPoolData.overlapAtoms))
 	result.SetPoolEntry(commonstate.PoolNameReclaim, numaID, nonOverlapReclaimedCoresSize, reclaimedCoresQuota)
 
 	general.InfoS("assemble reclaim pool entry",
@@ -1194,6 +1222,26 @@ type overlapAtom struct {
 	size           int
 	poolAlias      string
 	containerAlias []podContainerAlias
+}
+
+func summarizeOverlapAtoms(atoms []overlapAtom) []string {
+	if len(atoms) == 0 {
+		return nil
+	}
+	result := make([]string, 0, len(atoms))
+	for _, atom := range atoms {
+		aliases := make([]string, 0, len(atom.containerAlias))
+		for _, alias := range atom.containerAlias {
+			aliases = append(aliases, alias.podUID+"/"+alias.containerName)
+		}
+		sort.Strings(aliases)
+		result = append(result, fmt.Sprintf(
+			"key=%s,size=%d,pool=%s,containers=%s",
+			atom.key, atom.size, atom.poolAlias, strings.Join(aliases, "|"),
+		))
+	}
+	sort.Strings(result)
+	return result
 }
 
 func clampReclaimOverlapMetadata(
@@ -1352,6 +1400,20 @@ func (pa *ProvisionAssemblerCommon) calculateEnabledReclaimPool(
 	)
 	reclaimedCoresSize := freeStandalone + overlapSize
 	reclaimedCoresQuota := float64(-1)
+	general.InfoS("enabled reclaim pool calculation",
+		"numaID", data.numaID,
+		"policy", policy,
+		"physicalUsage", physicalUsage,
+		"freeStandalone", freeStandalone,
+		"overlapSize", overlapSize,
+		"reclaimedCoresSizeBeforeQuota", reclaimedCoresSize,
+		"shareAndIsolatedDedicatedPoolAvailable", data.shareAndIsolatedDedicatedPoolAvailable,
+		"totalUnusedNonReclaimablePinnedCPUSize", data.totalUnusedNonReclaimablePinnedCPUSize,
+		"shareAndIsolateDedicatedPoolSizes", data.shareAndIsolateDedicatedPoolSizes,
+		"dedicatedPoolSizes", data.dedicatedPoolSizes,
+		"dedicatedReclaimCoresSize", data.dedicatedReclaimCoresSize,
+		"reservedForReclaim", data.reservedForReclaim,
+		"overlapAtoms", summarizeOverlapAtoms(data.overlapAtoms))
 
 	quotaCtrlKnobEnabled, err := metacache.IsQuotaCtrlKnobEnabled(pa.metaReader)
 	if err != nil {
@@ -1369,6 +1431,13 @@ func (pa *ProvisionAssemblerCommon) calculateEnabledReclaimPool(
 		}
 		reclaimedCoresQuota = general.MaxFloat64(reclaimedCoresQuota, float64(data.reservedForReclaim))
 	}
+	general.InfoS("enabled reclaim pool calculation result",
+		"numaID", data.numaID,
+		"reclaimedCoresSize", reclaimedCoresSize,
+		"overlapSize", overlapSize,
+		"reclaimedCoresQuota", reclaimedCoresQuota,
+		"quotaCtrlKnobEnabled", quotaCtrlKnobEnabled,
+		"overlapAtoms", summarizeOverlapAtoms(data.overlapAtoms))
 	return reclaimedCoresSize, overlapSize, reclaimedCoresQuota, nil
 }
 
@@ -1606,6 +1675,19 @@ func (pa *ProvisionAssemblerCommon) calculateNonOverlapReclaimPool(
 		reclaimedCoresSize = data.reservedForReclaim
 	}
 
+	general.InfoS("non-overlap reclaim pool calculation result",
+		"numaID", data.numaID,
+		"policy", policy,
+		"nodeEnableReclaim", data.nodeEnableReclaim,
+		"reclaimedCoresSize", reclaimedCoresSize,
+		"overlapReclaimedCoresSize", overlapReclaimedCoresSize,
+		"reclaimedCoresQuota", reclaimedCoresQuota,
+		"shareAndIsolatedDedicatedPoolAvailable", data.shareAndIsolatedDedicatedPoolAvailable,
+		"shareAndIsolateDedicatedPoolSizes", data.shareAndIsolateDedicatedPoolSizes,
+		"dedicatedReclaimCoresSize", data.dedicatedReclaimCoresSize,
+		"reservedForReclaim", data.reservedForReclaim,
+		"totalUnusedNonReclaimablePinnedCPUSize", data.totalUnusedNonReclaimablePinnedCPUSize,
+		"overlapAtoms", summarizeOverlapAtoms(data.overlapAtoms))
 	return reclaimedCoresSize, overlapReclaimedCoresSize, reclaimedCoresQuota, nil
 }
 
