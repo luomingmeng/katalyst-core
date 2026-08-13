@@ -364,6 +364,7 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 	if err != nil {
 		return *res, err
 	}
+	parentSafetyTargets := desiredTargets(in.DAG)
 	snapshotDriver, err := snapshotDriverForCoordinator(ctx, in.Cgroup)
 	if err != nil {
 		return *res, err
@@ -434,7 +435,7 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 			return *res, errors.New("TopologyCoordinator.Converge: fixed-point round completed without final snapshot")
 		}
 		evaluation, err := evaluateCoordinatorSnapshot(
-			snapshot, in.DAG, effectiveTargets, round.desiredMemsByRel(),
+			snapshot, in.DAG, effectiveTargets, parentSafetyTargets, round.desiredMemsByRel(),
 			round.desiredDomainUnion(), round.allowedCPUs(),
 			in.ExpectedCPUSetByRel, in.DeferredCPUSetByRel,
 			round.deferredCleanupRels,
@@ -478,7 +479,7 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 				continue
 			}
 			freshEvaluation, err := evaluateCoordinatorSnapshot(
-				fresh, in.DAG, effectiveTargets, round.desiredMemsByRel(),
+				fresh, in.DAG, effectiveTargets, parentSafetyTargets, round.desiredMemsByRel(),
 				round.desiredDomainUnion(), round.allowedCPUs(),
 				in.ExpectedCPUSetByRel, in.DeferredCPUSetByRel,
 				round.deferredCleanupRels,

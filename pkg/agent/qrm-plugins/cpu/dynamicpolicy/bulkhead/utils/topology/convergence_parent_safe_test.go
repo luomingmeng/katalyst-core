@@ -64,7 +64,7 @@ func TestBuildParentSafetyReportAllowsOnlySafeDeferredLeafSuperset(t *testing.T)
 	snapshot.DomainUnion[DomainReclaim] = machine.NewCPUSet(1, 2, 3)
 	got = buildParentSafetyReport(
 		snapshot, dag,
-		map[string]machine.CPUSet{"primary": machine.NewCPUSet(0, 1), "reclaim": machine.NewCPUSet(2, 3)},
+		map[string]machine.CPUSet{"primary": machine.NewCPUSet(0), "reclaim": machine.NewCPUSet(1, 2, 3)},
 		report, machine.NewCPUSet(1),
 		map[string]machine.CPUSet{"primary/pod/container": machine.NewCPUSet(1)},
 		nil,
@@ -77,7 +77,8 @@ func TestBuildParentSafetyReportAllowsOnlySafeDeferredLeafSuperset(t *testing.T)
 	freshProof, err := evaluateCoordinatorSnapshot(
 		snapshot,
 		dag,
-		map[string]machine.CPUSet{"primary": machine.NewCPUSet(0, 1), "reclaim": machine.NewCPUSet(2, 3)},
+		map[string]machine.CPUSet{"primary": machine.NewCPUSet(0), "reclaim": machine.NewCPUSet(1, 2, 3)},
+		map[string]machine.CPUSet{"primary": machine.NewCPUSet(0), "reclaim": machine.NewCPUSet(1, 2, 3)},
 		nil,
 		map[DomainID]machine.CPUSet{
 			DomainPrimary: machine.NewCPUSet(0, 1),
@@ -174,5 +175,54 @@ func TestParentSafetyAllowsDeferredLeafRelocationInsidePrimary(t *testing.T) {
 	)
 	if got.Safe {
 		t.Fatalf("parent safety report = %+v, want target reclaim overlap rejected", got)
+	}
+}
+
+func TestParentSafetyTargetCompilationNoneUsesEmptyLogicalReclaim(t *testing.T) {
+	t.Parallel()
+
+	dag := mustPlanDAG(t, []NodeSpec{
+		{Rel: "primary", Domain: DomainPrimary, CPUs: machine.NewCPUSet(0, 1, 2, 3), TrustAnchor: true},
+		{Rel: "reclaim", Domain: DomainReclaim, CPUs: machine.NewCPUSet(0, 1, 2, 3), TrustAnchor: true},
+	})
+	snapshot := planSnapshot(map[string]EntryState{
+		"primary":               {Identity: CgroupIdentity{Inode: 1}, CPUs: machine.NewCPUSet(0, 1, 2, 3)},
+		"primary/pod/container": {Identity: CgroupIdentity{Inode: 2}, CPUs: machine.NewCPUSet(0)},
+		"reclaim":               {Identity: CgroupIdentity{Inode: 3}, CPUs: machine.NewCPUSet(0, 1, 2, 3)},
+	}, map[DomainID]machine.CPUSet{
+		DomainPrimary: machine.NewCPUSet(0, 1, 2, 3),
+		DomainReclaim: machine.NewCPUSet(0, 1, 2, 3),
+	})
+	report := ConvergenceReport{NonConvergedTargets: []RelConvergence{{
+		Rel: "primary/pod/container", Observed: machine.NewCPUSet(0),
+		Target: machine.NewCPUSet(2), Reason: convergenceReasonTargetMismatch,
+	}}}
+
+	got := buildParentSafetyReport(
+		snapshot, dag, map[string]machine.CPUSet{
+			"primary": machine.NewCPUSet(0, 1, 2, 3),
+			"reclaim": machine.NewCPUSet(),
+		}, report, machine.NewCPUSet(),
+		map[string]machine.CPUSet{"primary/pod/container": machine.NewCPUSet(2)},
+		nil, HierarchyCapabilities{},
+	)
+	if !got.Safe ||
+		!got.PendingInsideReclaim.IsEmpty() ||
+		!got.PrimaryReclaimOverlap.IsEmpty() ||
+		len(got.DeferredLeafMismatches) != 1 ||
+		len(got.UnsafeRequiredRels) != 0 {
+		t.Fatalf("parent safety report = %+v, want ownership-none leaf defer", got)
+	}
+
+	got = buildParentSafetyReport(
+		snapshot, dag, map[string]machine.CPUSet{
+			"primary": machine.NewCPUSet(0, 1, 2, 3),
+			"reclaim": machine.NewCPUSet(0, 1, 2, 3),
+		}, report, machine.NewCPUSet(),
+		map[string]machine.CPUSet{"primary/pod/container": machine.NewCPUSet(2)},
+		nil, HierarchyCapabilities{},
+	)
+	if got.Safe || !got.PrimaryReclaimOverlap.Equals(machine.NewCPUSet(0, 1, 2, 3)) {
+		t.Fatalf("parent safety report = %+v, want hard reclaim ownership preserved", got)
 	}
 }
