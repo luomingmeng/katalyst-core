@@ -41,6 +41,28 @@ const (
 
 var _ pflag.Value = &ReservedMemoryVar{}
 
+type ExplicitValue[T any] struct {
+	Value T
+	flags []*pflag.Flag
+}
+
+func (v *ExplicitValue[T]) TrackFlag(fs *pflag.FlagSet, name string) {
+	flag := fs.Lookup(name)
+	if flag == nil {
+		panic(fmt.Sprintf("flag %q is not registered", name))
+	}
+	v.flags = append(v.flags, flag)
+}
+
+func (v *ExplicitValue[T]) Changed() bool {
+	for _, flag := range v.flags {
+		if flag.Changed {
+			return true
+		}
+	}
+	return false
+}
+
 // ReservedMemoryVar is used for validating a command line option that represents a reserved memory. It implements the pflag.Value interface
 type ReservedMemoryVar struct {
 	Value       *[]native.MemoryReservation
