@@ -190,17 +190,28 @@ func TestQRMPluginOptions_ParseBulkheadCATWays(t *testing.T) {
 func TestQRMPluginOptions_ParseInvalidBulkheadClosCATWays(t *testing.T) {
 	t.Parallel()
 
-	options := NewQRMPluginOptions()
-	fss := &cliflag.NamedFlagSets{}
-	options.AddFlags(fss)
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{name: "non-integer ways", value: "reclaim=invalid"},
+		{name: "missing equals", value: "reclaim"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	fs := fss.FlagSet("qrm-cpu-plugin")
-	fs.Init("qrm-cpu-plugin", pflag.ContinueOnError)
-	err := fs.Parse(
-		[]string{"--bulkhead-clos-cat-ways=reclaim=invalid"},
-	)
-	if err == nil {
-		t.Fatal("Parse succeeded, want non-integer error")
+			options := NewQRMPluginOptions()
+			fss := &cliflag.NamedFlagSets{}
+			options.AddFlags(fss)
+
+			fs := fss.FlagSet("qrm-cpu-plugin")
+			fs.Init("qrm-cpu-plugin", pflag.ContinueOnError)
+			err := fs.Parse([]string{"--bulkhead-clos-cat-ways=" + tc.value})
+			if err == nil {
+				t.Fatalf("Parse(%q) succeeded, want pflag error", tc.value)
+			}
+		})
 	}
 }
 

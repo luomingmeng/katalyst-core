@@ -4,7 +4,7 @@
 
 **Goal:** Expose bulkhead default and per-CLOS CAT way counts through core flags and adapter environment variables.
 
-**Architecture:** `CPUPluginOptions` owns startup values, tracks whether the scalar CAT flag was explicitly set, and converts Kubernetes StringToString input into the typed dynamic QRM configuration. katalyst-adapter only maps environment variable names to core flag names; existing dynamic AdminQoSConfiguration application remains the later override.
+**Architecture:** `CPUPluginOptions` owns startup values, tracks whether the scalar CAT flag was explicitly set, and uses pflag's native `StringToInt64Var` to produce `map[string]int64` during flag parsing. katalyst-adapter only maps environment variable names to core flag names; existing dynamic AdminQoSConfiguration application remains the later override.
 
 **Tech Stack:** Go, pflag through Kubernetes `NamedFlagSets`, Bash, Go tests.
 
