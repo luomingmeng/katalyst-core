@@ -159,11 +159,13 @@ func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CP
 	defaultShareBaseline := topology.CPUDetails.CPUs().Difference(view.Reserve)
 	if !allowOverlap && opts.HardPartitionEnabled && !view.ReclaimRaw.IsEmpty() && view.SharePool.Equals(defaultShareBaseline) {
 		// A reset default-share entry can still cover every non-reserved CPU.
-		// In hard-partition mode reclaim raw owns its CPUs, while real shared
-		// NUMA-binding ramp-up allocations remain explicit non-reclaim owners.
-		view.SharePool = view.SharePool.Difference(view.ReclaimRaw).Union(sharedRampUp)
+		// In hard-partition mode reclaim raw, dedicated, and isolation owners must
+		// be removed from shared targets, while real shared NUMA-binding ramp-up
+		// allocations remain explicit non-reclaim owners.
+		fixedNonShare := view.ReclaimRaw.Union(view.Dedicated).Union(view.Isolation)
+		view.SharePool = view.SharePool.Difference(fixedNonShare).Union(sharedRampUp)
 		for poolName, cpus := range view.SharePoolMap {
-			view.SharePoolMap[poolName] = cpus.Difference(view.ReclaimRaw)
+			view.SharePoolMap[poolName] = cpus.Difference(fixedNonShare)
 		}
 		for poolName, cpus := range sharedRampUpByPool {
 			view.SharePoolMap[poolName] = view.SharePoolMap[poolName].Union(cpus)
