@@ -346,3 +346,137 @@ Run focused tests, the focused package with `-race`, focused `go vet`, gofmt,
 and `git diff --check`; inspect the final diff before committing the test,
 minimal implementation, design, and plan together without squashing prior
 history.
+
+### Task 6: Replace custom flag values with native pflag state
+
+**Files:**
+- Modify: `cmd/katalyst-agent/app/options/dynamic/adminqos/qrm/qrm_base_test.go`
+- Modify: `cmd/katalyst-agent/app/options/dynamic/adminqos/qrm/cpu_plugin.go`
+- Modify: `docs/superpowers/plans/2026-08-13-default-share-cat-ways-config.md`
+
+- [ ] **Step 1: Write failing native-type tests**
+
+Update the valid parsing assertion to require:
+
+```go
+if !reflect.DeepEqual(options.BulkheadClosCATWays, map[string]int64{"reclaim": 2, "shared": 3}) {
+	t.Fatalf("BulkheadClosCATWays = %v, want typed map", options.BulkheadClosCATWays)
+}
+```
+
+Add a parse-time failure test:
+
+```go
+err := fss.FlagSet("qrm-cpu-plugin").Parse(
+	[]string{"--bulkhead-clos-cat-ways=reclaim=invalid"},
+)
+if err == nil {
+	t.Fatal("Parse succeeded, want non-integer error")
+}
+```
+
+Keep the existing real-parse test proving that an omitted scalar accepts the
+compatible zero value while explicit `--bulkhead-default-cat-ways=0` fails in
+`ApplyTo`.
+
+- [ ] **Step 2: Run tests and verify RED**
+
+Run:
+
+```bash
+go test ./cmd/katalyst-agent/app/options/dynamic/adminqos/qrm \
+  -run 'TestQRMPluginOptions_(ParseBulkheadCATWays|ParseInvalidBulkheadClosCATWays|ParseExplicitZeroBulkheadDefaultCATWays)' \
+  -count=1
+```
+
+Expected: FAIL because `BulkheadClosCATWays` is still `map[string]string` and
+non-integer values currently fail in `ApplyTo` instead of flag parsing.
+
+- [ ] **Step 3: Use native pflag registrations**
+
+Change the option fields to:
+
+```go
+BulkheadDefaultCATWays     int64
+bulkheadDefaultCATWaysFlag *pflag.Flag
+BulkheadClosCATWays        map[string]int64
+```
+
+Register the flags with native pflag values:
+
+```go
+fs.Int64Var(&o.BulkheadDefaultCATWays, "bulkhead-default-cat-ways", o.BulkheadDefaultCATWays,
+	"default CAT way count for non-root bulkhead CLOS groups.")
+o.bulkheadDefaultCATWaysFlag = fs.Lookup("bulkhead-default-cat-ways")
+fs.StringToInt64Var(&o.BulkheadClosCATWays, "bulkhead-clos-cat-ways", o.BulkheadClosCATWays,
+	"per-CLOS CAT way counts in clos=ways format.")
+```
+
+Delete `explicitInt64Value`, its parse-compatibility tests, and the no-longer
+needed `strconv` import.
+
+- [ ] **Step 4: Simplify `ApplyTo`**
+
+Use pflag's explicit-set state:
+
+```go
+defaultCATWaysChanged := o.bulkheadDefaultCATWaysFlag != nil &&
+	o.bulkheadDefaultCATWaysFlag.Changed
+if o.BulkheadDefaultCATWays < 0 ||
+	(defaultCATWaysChanged && o.BulkheadDefaultCATWays == 0) {
+	return fmt.Errorf("bulkhead-default-cat-ways must be positive when configured, got %d",
+		o.BulkheadDefaultCATWays)
+}
+```
+
+Validate the typed CLOS map directly:
+
+```go
+var closCATWays map[string]int64
+if o.BulkheadClosCATWays != nil {
+	closCATWays = make(map[string]int64, len(o.BulkheadClosCATWays))
+}
+for clos, ways := range o.BulkheadClosCATWays {
+	if clos == "" {
+		return fmt.Errorf("bulkhead-clos-cat-ways contains an empty clos")
+	}
+	if ways <= 0 {
+		return fmt.Errorf("bulkhead-clos-cat-ways value must be positive for clos %q, got %d",
+			clos, ways)
+	}
+	closCATWays[clos] = ways
+}
+```
+
+Assign the copied `closCATWays` map to the dynamic configuration. This removes
+string parsing while preserving the existing no-alias boundary between
+options and runtime configuration.
+
+- [ ] **Step 5: Run tests and verify GREEN**
+
+Run:
+
+```bash
+go test ./cmd/katalyst-agent/app/options/dynamic/adminqos/qrm -count=1
+go test ./pkg/config/agent/dynamic/adminqos/qrm -count=1
+go test ./pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/plugins/rdt/cat -count=1
+go test -race ./cmd/katalyst-agent/app/options/dynamic/adminqos/qrm -count=1
+go vet ./cmd/katalyst-agent/app/options/dynamic/adminqos/qrm
+```
+
+Expected: PASS.
+
+- [ ] **Step 6: Format, inspect, and commit**
+
+Run:
+
+```bash
+gofmt -w cmd/katalyst-agent/app/options/dynamic/adminqos/qrm/cpu_plugin.go \
+  cmd/katalyst-agent/app/options/dynamic/adminqos/qrm/qrm_base_test.go
+git diff --check
+git diff
+git add cmd/katalyst-agent/app/options/dynamic/adminqos/qrm/cpu_plugin.go \
+  cmd/katalyst-agent/app/options/dynamic/adminqos/qrm/qrm_base_test.go \
+  docs/superpowers/plans/2026-08-13-default-share-cat-ways-config.md
+git commit -m "refactor(qrm): use native pflag CAT ways values"
+```
