@@ -25,25 +25,30 @@ katalyst-adapter maps the following environment variables:
 - `QRMCPUPluginBulkheadDefaultCATWays` to `bulkhead-default-cat-ways`
 - `QRMCPUPluginBulkheadClosCATWays` to `bulkhead-clos-cat-ways`
 
-`bulkhead-clos-cat-ways` uses the Kubernetes `StringToString` input format.
+`bulkhead-clos-cat-ways` uses pflag's `StringToInt64` value with the same
+Kubernetes key-value input format.
 For example, `reclaim=2,shared=4` becomes
 `map[string]int64{"reclaim": 2, "shared": 4}`.
 
 ## Core Design
 
-`CPUPluginOptions` owns startup defaults. It stores `DefaultCATWays` as
-`int64` plus a private explicit-set bit maintained by a `pflag.Value`, and
-receives `ClosCATWays` through a `map[string]string` flag value. The set bit
-distinguishes an omitted flag's compatible zero value from an explicitly
-configured zero. `ApplyTo` validates and converts every CLOS value to `int64`,
-then writes the typed values into `DynamicBulkheadRDTConfiguration`.
+`CPUPluginOptions` owns startup defaults. It registers `DefaultCATWays` with
+pflag's native `Int64Var` and retains the registered `*pflag.Flag` so
+`ApplyTo` can inspect `Flag.Changed`. This distinguishes an omitted flag's
+compatible zero value from an explicitly configured zero without a custom
+`pflag.Value`.
+
+`ClosCATWays` is stored directly as `map[string]int64` and registered with
+`StringToInt64Var`. Numeric conversion and malformed value rejection happen
+during flag parsing; `ApplyTo` only enforces domain validation and writes the
+typed map into `DynamicBulkheadRDTConfiguration`.
 
 Validation rejects:
 
 - non-positive explicitly configured `DefaultCATWays`; an omitted flag keeps
   the compatible zero value;
 - empty CLOS names;
-- non-integer CLOS way counts;
+- non-integer CLOS way counts during flag parsing;
 - non-positive CLOS way counts.
 
 The zero-value startup configuration remains valid and preserves existing
@@ -70,7 +75,8 @@ dependency resolution and build verification.
 Core tests cover:
 
 - both flags are registered;
-- valid scalar and StringToString values reach the typed configuration;
+- valid scalar and StringToInt64 values reach the typed configuration;
+- malformed or non-integer CLOS values fail during flag parsing;
 - malformed and empty-key values are rejected, and per-CLOS ways reject zero
   and negative values;
 - a real parse of `--bulkhead-default-cat-ways=0` succeeds at flag parsing but
