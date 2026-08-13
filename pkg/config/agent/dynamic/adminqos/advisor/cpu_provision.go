@@ -17,13 +17,12 @@ limitations under the License.
 package advisor
 
 import (
-	"k8s.io/klog/v2"
-
 	"github.com/kubewharf/katalyst-api/pkg/apis/config/v1alpha1"
 	workloadv1alpha1 "github.com/kubewharf/katalyst-api/pkg/apis/workload/v1alpha1"
 	"github.com/kubewharf/katalyst-api/pkg/utils"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic/crd"
 	"github.com/kubewharf/katalyst-core/pkg/consts"
+	"github.com/kubewharf/katalyst-core/pkg/util/general"
 )
 
 // clampReclaimedMaxRatio bounds a reclaimed-resource max ratio into [0, 1]. A
@@ -32,23 +31,25 @@ import (
 // warning so a misconfigured CRD/flag cannot silently take effect.
 func clampReclaimedMaxRatio(name string, ratio float64) float64 {
 	if ratio < 0 {
-		klog.Warningf("%s=%.4f is out of range [0,1], clamping to 0", name, ratio)
+		general.Warningf("%s=%.4f is out of range [0,1], clamping to 0", name, ratio)
 		return 0
 	}
 	if ratio > 1 {
-		klog.Warningf("%s=%.4f is out of range [0,1], clamping to 1", name, ratio)
+		general.Warningf("%s=%.4f is out of range [0,1], clamping to 1", name, ratio)
 		return 1
 	}
 	return ratio
 }
 
 type CPUProvisionConfiguration struct {
-	AllowSharedCoresOverlapReclaimedCores       bool
-	DisableDedicatedCoresOverlapReclaimedCores  bool
-	RegionIndicatorTargetConfiguration          map[v1alpha1.QoSRegionType][]v1alpha1.IndicatorTargetConfiguration
-	IndicatorTargetGetters                      map[string]string
-	IndicatorTargetDefaultGetter                string
-	IndicatorTargetMetricThresholdExpandFactors map[string]float64
+	AllowSharedCoresOverlapReclaimedCores               bool
+	DisableDedicatedCoresOverlapReclaimedCores          bool
+	RequestedAllowSharedCoresOverlapReclaimedCores      bool
+	RequestedDisableDedicatedCoresOverlapReclaimedCores bool
+	RegionIndicatorTargetConfiguration                  map[v1alpha1.QoSRegionType][]v1alpha1.IndicatorTargetConfiguration
+	IndicatorTargetGetters                              map[string]string
+	IndicatorTargetDefaultGetter                        string
+	IndicatorTargetMetricThresholdExpandFactors         map[string]float64
 	// ReclaimedCPUMaxRatio is the ratio (in [0, 1]) of the maximum amount of CPUs
 	// that can be reclaimed at any time. 0 means no limit.
 	ReclaimedCPUMaxRatio float64
@@ -94,6 +95,8 @@ func NewCPUProvisionConfiguration() *CPUProvisionConfiguration {
 }
 
 func (c *CPUProvisionConfiguration) ApplyConfiguration(conf *crd.DynamicConfigCRD) {
+	allowSharedCoresOverlapReclaimedCores := c.RequestedAllowSharedCoresOverlapReclaimedCores
+	disableDedicatedCoresOverlapReclaimedCores := c.RequestedDisableDedicatedCoresOverlapReclaimedCores
 	if aqc := conf.AdminQoSConfiguration; aqc != nil &&
 		aqc.Spec.Config.AdvisorConfig != nil &&
 		aqc.Spec.Config.AdvisorConfig.CPUAdvisorConfig != nil {
@@ -109,10 +112,35 @@ func (c *CPUProvisionConfiguration) ApplyConfiguration(conf *crd.DynamicConfigCR
 			}
 		}
 		if aqc.Spec.Config.AdvisorConfig.CPUAdvisorConfig.AllowSharedCoresOverlapReclaimedCores != nil {
-			c.AllowSharedCoresOverlapReclaimedCores = *aqc.Spec.Config.AdvisorConfig.CPUAdvisorConfig.AllowSharedCoresOverlapReclaimedCores
+			allowSharedCoresOverlapReclaimedCores = *aqc.Spec.Config.AdvisorConfig.CPUAdvisorConfig.AllowSharedCoresOverlapReclaimedCores
 		}
 		if aqc.Spec.Config.AdvisorConfig.CPUAdvisorConfig.DisableDedicatedCoresOverlapReclaimedCores != nil {
-			c.DisableDedicatedCoresOverlapReclaimedCores = *aqc.Spec.Config.AdvisorConfig.CPUAdvisorConfig.DisableDedicatedCoresOverlapReclaimedCores
+			disableDedicatedCoresOverlapReclaimedCores = *aqc.Spec.Config.AdvisorConfig.CPUAdvisorConfig.DisableDedicatedCoresOverlapReclaimedCores
 		}
+	}
+	c.SetRequestedOverlapPolicy(allowSharedCoresOverlapReclaimedCores, disableDedicatedCoresOverlapReclaimedCores)
+}
+
+// SetRequestedOverlapPolicy records the requested policy before deriving its effective values.
+func (c *CPUProvisionConfiguration) SetRequestedOverlapPolicy(allowSharedCoresOverlapReclaimedCores, disableDedicatedCoresOverlapReclaimedCores bool) {
+	c.RequestedAllowSharedCoresOverlapReclaimedCores = allowSharedCoresOverlapReclaimedCores
+	c.RequestedDisableDedicatedCoresOverlapReclaimedCores = disableDedicatedCoresOverlapReclaimedCores
+	c.NormalizeOverlapPolicy()
+}
+
+// NormalizeOverlapPolicy keeps CPU pool overlap flags in a supported policy combination.
+func (c *CPUProvisionConfiguration) NormalizeOverlapPolicy() {
+	c.AllowSharedCoresOverlapReclaimedCores = c.RequestedAllowSharedCoresOverlapReclaimedCores
+	c.DisableDedicatedCoresOverlapReclaimedCores = c.RequestedDisableDedicatedCoresOverlapReclaimedCores
+	if !c.FillDefaultSharePoolWithNonReclaimCPUs {
+		return
+	}
+	if c.AllowSharedCoresOverlapReclaimedCores {
+		general.Warningf("fill default share pool with non-reclaim cpus requires disallowing shared cores overlap reclaimed cores, overriding to false")
+		c.AllowSharedCoresOverlapReclaimedCores = false
+	}
+	if !c.DisableDedicatedCoresOverlapReclaimedCores {
+		general.Warningf("fill default share pool with non-reclaim cpus requires disabling dedicated cores overlap reclaimed cores, overriding to true")
+		c.DisableDedicatedCoresOverlapReclaimedCores = true
 	}
 }

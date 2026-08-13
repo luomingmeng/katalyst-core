@@ -59,3 +59,57 @@ func TestCPUProvisionConfigurationFillDefaultSharePool(t *testing.T) {
 		require.True(t, conf.FillDefaultSharePoolWithNonReclaimCPUs)
 	})
 }
+
+func TestCPUProvisionConfigurationPreservesSharedReclaimOverlapWhenFillDefaultShareDisabled(t *testing.T) {
+	t.Parallel()
+
+	enabled := true
+	disabled := false
+	conf := NewCPUProvisionConfiguration()
+	conf.ApplyConfiguration(&crd.DynamicConfigCRD{
+		AdminQoSConfiguration: &configapi.AdminQoSConfiguration{
+			Spec: configapi.AdminQoSConfigurationSpec{
+				Config: configapi.AdminQoSConfig{
+					AdvisorConfig: &configapi.AdvisorConfig{
+						CPUAdvisorConfig: &configapi.CPUAdvisorConfig{
+							AllowSharedCoresOverlapReclaimedCores: &enabled,
+							CPUProvisionConfig: &configapi.CPUProvisionConfig{
+								FillDefaultSharePoolWithNonReclaimCPUs: &disabled,
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+
+	require.False(t, conf.FillDefaultSharePoolWithNonReclaimCPUs)
+	require.True(t, conf.AllowSharedCoresOverlapReclaimedCores)
+}
+
+func TestCPUProvisionConfigurationFillDefaultShareDisallowsSharedReclaimOverlap(t *testing.T) {
+	t.Parallel()
+
+	enabled := true
+	conf := NewCPUProvisionConfiguration()
+	conf.ApplyConfiguration(&crd.DynamicConfigCRD{
+		AdminQoSConfiguration: &configapi.AdminQoSConfiguration{
+			Spec: configapi.AdminQoSConfigurationSpec{
+				Config: configapi.AdminQoSConfig{
+					AdvisorConfig: &configapi.AdvisorConfig{
+						CPUAdvisorConfig: &configapi.CPUAdvisorConfig{
+							AllowSharedCoresOverlapReclaimedCores: &enabled,
+							CPUProvisionConfig: &configapi.CPUProvisionConfig{
+								FillDefaultSharePoolWithNonReclaimCPUs: &enabled,
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+
+	require.True(t, conf.FillDefaultSharePoolWithNonReclaimCPUs)
+	require.False(t, conf.AllowSharedCoresOverlapReclaimedCores)
+	require.True(t, conf.DisableDedicatedCoresOverlapReclaimedCores)
+}

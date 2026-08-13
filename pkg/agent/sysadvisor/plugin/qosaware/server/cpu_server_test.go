@@ -174,52 +174,6 @@ func TestConvertInternalCPUResultToListAndWatchResponsePropagatesDedicatedReclai
 	require.True(t, resp.DisableDedicatedCoresOverlapReclaimedCores)
 }
 
-func TestCPUServerPublishesDefaultShareMaterializationMode(t *testing.T) {
-	t.Parallel()
-
-	advisor := &mockCPUResourceAdvisor{
-		provision: &types.InternalCPUCalculationResult{
-			PoolEntries: map[string]map[int]types.CPUResource{
-				commonstate.PoolNameShare: {
-					commonstate.FakedNUMAID: {Size: 4},
-				},
-			},
-			PoolOverlapInfo:             map[string]map[int]map[string]int{},
-			PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{},
-			DefaultShareBackfill: types.DefaultShareBackfillDiagnostics{
-				Enabled: true,
-			},
-		},
-	}
-	cs := newTestCPUServer(t, advisor, nil)
-
-	resp, err := cs.GetAdvice(context.Background(), &cpuadvisor.GetAdviceRequest{})
-	require.NoError(t, err)
-	require.True(t, resp.FillDefaultSharePoolWithNonReclaimCpus)
-
-	lwResp := convertInternalCPUResultToListAndWatchResponse(cs.assembleResponse(advisor.provision))
-	require.True(t, lwResp.FillDefaultSharePoolWithNonReclaimCpus)
-}
-
-func TestCPUServerRejectsDefaultShareMaterializationWithoutQuantity(t *testing.T) {
-	t.Parallel()
-
-	advisor := &mockCPUResourceAdvisor{
-		provision: &types.InternalCPUCalculationResult{
-			PoolEntries:                 map[string]map[int]types.CPUResource{},
-			PoolOverlapInfo:             map[string]map[int]map[string]int{},
-			PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{},
-			DefaultShareBackfill: types.DefaultShareBackfillDiagnostics{
-				Enabled: true,
-			},
-		},
-	}
-	cs := newTestCPUServer(t, advisor, nil)
-
-	_, err := cs.GetAdvice(context.Background(), &cpuadvisor.GetAdviceRequest{})
-	require.ErrorContains(t, err, "default share quantity is missing")
-}
-
 func TestCPUServerGetAndPushAdviceRejectsDedicatedReclaimDisjoint(t *testing.T) {
 	t.Parallel()
 

@@ -55,10 +55,12 @@ func NewCPUProvisionOptions() *CPUProvisionOptions {
 // ApplyTo fills up config with options
 func (o *CPUProvisionOptions) ApplyTo(c *advisor.CPUProvisionConfiguration) error {
 	var errList []error
-	c.AllowSharedCoresOverlapReclaimedCores = o.AllowSharedCoresOverlapReclaimedCores
-	c.DisableDedicatedCoresOverlapReclaimedCores = o.DisableDedicatedCoresOverlapReclaimedCores
 	c.ReclaimedCPUMaxRatio = o.ReclaimedCPUMaxRatio
 	c.FillDefaultSharePoolWithNonReclaimCPUs = o.FillDefaultSharePoolWithNonReclaimCPUs
+	c.SetRequestedOverlapPolicy(
+		o.AllowSharedCoresOverlapReclaimedCores,
+		o.DisableDedicatedCoresOverlapReclaimedCores,
+	)
 
 	for regionType, targets := range o.RegionIndicatorTargetOptions {
 		regionIndicatorTarget := make([]v1alpha1.IndicatorTargetConfiguration, 0)

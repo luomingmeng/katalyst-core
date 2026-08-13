@@ -205,45 +205,44 @@ func TestHardPartitionMinimumReclaimCores(t *testing.T) {
 	}
 }
 
-func TestCPUResourceAdvisorUpdateReservedForReclaimHardPartitionCapacity(t *testing.T) {
+func TestCPUResourceAdvisorUpdateReservedForReclaimIgnoresHardPartitionRatio(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name              string
 		ratio             float64
-		configuredReserve int64
+		configuredReserve resource.Quantity
 		wantReserved      map[int]int
-		wantErr           string
 	}{
 		{
-			name:              "half ratio is balanced four and four",
+			name:              "half ratio keeps static reserve",
 			ratio:             0.5,
-			configuredReserve: 4,
-			wantReserved:      map[int]int{0: 4, 1: 4},
+			configuredReserve: resource.MustParse("4"),
+			wantReserved:      map[int]int{0: 2, 1: 2},
 		},
 		{
-			name:              "fractional ratio uses QRM even alignment",
+			name:              "fractional ratio keeps static reserve",
 			ratio:             0.5625,
-			configuredReserve: 4,
-			wantReserved:      map[int]int{0: 4, 1: 4},
+			configuredReserve: resource.MustParse("4"),
+			wantReserved:      map[int]int{0: 2, 1: 2},
 		},
 		{
-			name:              "configured reserve floor wins",
+			name:              "larger configured reserve is statically balanced",
 			ratio:             0.25,
-			configuredReserve: 8,
+			configuredReserve: resource.MustParse("8"),
 			wantReserved:      map[int]int{0: 4, 1: 4},
 		},
 		{
-			name:              "odd configured reserve floor is preserved",
+			name:              "odd configured reserve follows static distribution",
 			ratio:             0,
-			configuredReserve: 5,
-			wantReserved:      map[int]int{0: 3, 1: 2},
+			configuredReserve: resource.MustParse("5"),
+			wantReserved:      map[int]int{0: 2, 1: 2},
 		},
 		{
-			name:              "three quarter ratio exceeds balanced capacity",
+			name:              "oversized ratio does not affect static reserve",
 			ratio:             0.75,
-			configuredReserve: 4,
-			wantErr:           "cannot distribute target 12 within NUMA capacities while keeping counts balanced",
+			configuredReserve: resource.MustParse("4"),
+			wantReserved:      map[int]int{0: 2, 1: 2},
 		},
 	}
 
@@ -254,33 +253,29 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimHardPartitionCapacity(t *test
 
 			conf := generateTestConfiguration(t, t.TempDir(), t.TempDir())
 			dynamicConf := conf.GetDynamicConfiguration()
+			dynamicConf.EnableStrategyGroup = true
+			dynamicConf.EnableReclaim = true
 			dynamicConf.EnableRampUpReclaimHardPartition = true
 			dynamicConf.InitialRampUpReclaimCPUSetRatio = tt.ratio
 			dynamicConf.MinReclaimedResourceForAllocate = v1.ResourceList{
-				v1.ResourceCPU: *resource.NewQuantity(tt.configuredReserve, resource.DecimalSI),
+				v1.ResourceCPU: tt.configuredReserve,
 			}
+			cpuTopology, err := machine.GenerateDummyCPUTopology(16, 1, 2)
+			require.NoError(t, err)
 
 			cra := &cpuResourceAdvisor{
 				conf: conf,
 				metaServer: &metaserver.MetaServer{
 					MetaAgent: &agent.MetaAgent{
 						KatalystMachineInfo: &machine.KatalystMachineInfo{
-							CPUTopology: &machine.CPUTopology{
-								NumNUMANodes: 2,
-							},
+							CPUTopology: cpuTopology,
 						},
 					},
 				},
 				numaAvailable: map[int]int{0: 4, 1: 12},
 			}
 
-			err := cra.updateReservedForReclaim()
-			if tt.wantErr != "" {
-				require.EqualError(t, err, tt.wantErr)
-				assert.Nil(t, cra.reservedForReclaim)
-				return
-			}
-
+			err = cra.updateReservedForReclaim()
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantReserved, cra.reservedForReclaim)
 		})
@@ -290,11 +285,12 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimHardPartitionCapacity(t *test
 func TestCPUResourceAdvisorUpdateReservedForReclaimFallbacks(t *testing.T) {
 	t.Parallel()
 
-	t.Run("hard partition single NUMA missing CPU key uses QRM default", func(t *testing.T) {
+	t.Run("hard partition single NUMA missing CPU key uses static minimum", func(t *testing.T) {
 		t.Parallel()
 
 		conf := generateTestConfiguration(t, t.TempDir(), t.TempDir())
 		dynamicConf := conf.GetDynamicConfiguration()
+		dynamicConf.EnableReclaim = true
 		dynamicConf.EnableRampUpReclaimHardPartition = true
 		dynamicConf.MinReclaimedResourceForAllocate = v1.ResourceList{}
 
@@ -311,14 +307,15 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimFallbacks(t *testing.T) {
 		}
 
 		require.NoError(t, cra.updateReservedForReclaim())
-		assert.Equal(t, map[int]int{0: 4}, cra.reservedForReclaim)
+		assert.Equal(t, map[int]int{0: 1}, cra.reservedForReclaim)
 	})
 
-	t.Run("hard partition two NUMAs missing CPU key uses QRM default", func(t *testing.T) {
+	t.Run("hard partition two NUMAs missing CPU key uses static minimum", func(t *testing.T) {
 		t.Parallel()
 
 		conf := generateTestConfiguration(t, t.TempDir(), t.TempDir())
 		dynamicConf := conf.GetDynamicConfiguration()
+		dynamicConf.EnableReclaim = true
 		dynamicConf.EnableRampUpReclaimHardPartition = true
 		dynamicConf.MinReclaimedResourceForAllocate = v1.ResourceList{}
 
@@ -335,7 +332,34 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimFallbacks(t *testing.T) {
 		}
 
 		require.NoError(t, cra.updateReservedForReclaim())
-		assert.Equal(t, map[int]int{0: 2, 1: 2}, cra.reservedForReclaim)
+		assert.Equal(t, map[int]int{0: 1, 1: 1}, cra.reservedForReclaim)
+	})
+
+	t.Run("hard partition is bypassed when reclaim is disabled", func(t *testing.T) {
+		t.Parallel()
+
+		conf := generateTestConfiguration(t, t.TempDir(), t.TempDir())
+		dynamicConf := conf.GetDynamicConfiguration()
+		dynamicConf.EnableReclaim = false
+		dynamicConf.EnableRampUpReclaimHardPartition = true
+		dynamicConf.InitialRampUpReclaimCPUSetRatio = 0.5
+		dynamicConf.MinReclaimedResourceForAllocate = v1.ResourceList{
+			v1.ResourceCPU: resource.MustParse("6"),
+		}
+		cpuTopology, err := machine.GenerateDummyCPUTopology(16, 1, 2)
+		require.NoError(t, err)
+		cra := &cpuResourceAdvisor{
+			conf: conf,
+			metaServer: &metaserver.MetaServer{
+				MetaAgent: &agent.MetaAgent{
+					KatalystMachineInfo: &machine.KatalystMachineInfo{CPUTopology: cpuTopology},
+				},
+			},
+			numaAvailable: map[int]int{0: 4, 1: 12},
+		}
+
+		require.NoError(t, cra.updateReservedForReclaim())
+		assert.Equal(t, map[int]int{0: 3, 1: 3}, cra.reservedForReclaim)
 	})
 
 	t.Run("nil dynamic configuration returns error and clears reservation", func(t *testing.T) {
