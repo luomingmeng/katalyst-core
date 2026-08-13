@@ -32,12 +32,27 @@ For example, `reclaim=2,shared=4` becomes
 
 ## Core Design
 
-`CPUPluginOptions` owns startup defaults. It registers `DefaultCATWays` with
-pflag's native `Int64Var` and retains every registered `*pflag.Flag` across
-all `NamedFlagSets`. `ApplyTo` treats the option as explicitly configured when
-any retained flag has `Flag.Changed`. This distinguishes an omitted flag's
-compatible zero value from an explicitly configured zero without a custom
-`pflag.Value`, even when one `CPUPluginOptions` is registered more than once.
+`pkg/util/flags` provides a reusable generic explicit-value container:
+
+```go
+type ExplicitValue[T any] struct {
+	Value T
+	flags []*pflag.Flag
+}
+```
+
+`TrackFlag(*pflag.FlagSet, string)` retains the named flag from each
+registration, and `Changed()` returns true when any retained flag was
+explicitly set. Tracking an unknown flag panics because it indicates a
+programming error in flag registration; silently ignoring it could bypass
+validation. The zero value is usable without a constructor.
+
+`CPUPluginOptions` owns startup defaults through
+`ExplicitValue[int64]`. It registers the embedded value with pflag's native
+`Int64Var`, then tracks the registered flag. `ApplyTo` uses `Changed()` to
+distinguish an omitted flag's compatible zero value from an explicitly
+configured zero, including when one options object is registered into
+multiple `NamedFlagSets`.
 
 `ClosCATWays` is stored directly as `map[string]int64` and registered with
 `StringToInt64Var`. Numeric conversion and malformed value rejection happen
@@ -75,6 +90,9 @@ dependency resolution and build verification.
 
 Core tests cover:
 
+- `ExplicitValue[T]` zero-registration, single-registration, and
+  multi-registration semantics;
+- unknown flag tracking panics;
 - both flags are registered;
 - valid scalar and StringToInt64 values reach the typed configuration;
 - malformed or non-integer CLOS values fail during flag parsing;
