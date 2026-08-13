@@ -240,7 +240,7 @@ func TestAssemblePoolEntriesKeepsRampUpHardReclaimMinimum(t *testing.T) {
 	require.Equal(t, uint64(2), reclaimResult.Blocks[0].Result)
 }
 
-func TestAssemblePoolEntriesDoesNotKeepRampUpHardReclaimMinimumWhenDisabled(t *testing.T) {
+func TestAssemblePoolEntriesUsesRampUpReclaimPoolSizeFromStateWhenHardPartitionDisabled(t *testing.T) {
 	t.Parallel()
 
 	cs := newTestCPUServer(t, &mockCPUResourceAdvisor{}, nil)
@@ -268,7 +268,7 @@ func TestAssemblePoolEntriesDoesNotKeepRampUpHardReclaimMinimumWhenDisabled(t *t
 
 	reclaimResult := entries[commonstate.PoolNameReclaim].Entries[commonstate.FakedContainerName].CalculationResultsByNumas[0]
 	require.Len(t, reclaimResult.Blocks, 1)
-	require.Equal(t, uint64(1), reclaimResult.Blocks[0].Result)
+	require.Equal(t, uint64(2), reclaimResult.Blocks[0].Result)
 }
 
 // TestAssemblePoolEntriesIncludesSyntheticDefaultShare pins the existing wire

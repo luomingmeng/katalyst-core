@@ -96,7 +96,6 @@ type cpuSetAdjustmentStateSnapshot struct {
 	podEntries       state.PodEntries
 	allowOverlap     bool
 	disableDedicated bool
-	defaultShare     state.DefaultShareMaterializationState
 	revision         uint64
 	hasRevision      bool
 }
@@ -111,7 +110,6 @@ func newCPUSetAdjustmentStateSnapshot(source state.ReadonlyState) *cpuSetAdjustm
 		podEntries:       source.GetPodEntries(),
 		allowOverlap:     source.GetAllowSharedCoresOverlapReclaimedCores(),
 		disableDedicated: source.GetDisableDedicatedCoresOverlapReclaimedCores(),
-		defaultShare:     source.GetDefaultShareMaterializationState(),
 	}
 	if revisioned, ok := source.(cpuSetAdjustmentRevisionedState); ok {
 		snapshot.revision = revisioned.GetRevision()
@@ -130,7 +128,6 @@ func (s *cpuSetAdjustmentStateSnapshot) matches(source state.ReadonlyState) bool
 	}
 	return s.allowOverlap == source.GetAllowSharedCoresOverlapReclaimedCores() &&
 		s.disableDedicated == source.GetDisableDedicatedCoresOverlapReclaimedCores() &&
-		s.defaultShare == source.GetDefaultShareMaterializationState() &&
 		reflect.DeepEqual(s.machineState, source.GetMachineState()) &&
 		reflect.DeepEqual(s.numaHeadroom, source.GetNUMAHeadroom()) &&
 		reflect.DeepEqual(s.podEntries, source.GetPodEntries())
@@ -165,10 +162,6 @@ func (s *cpuSetAdjustmentStateSnapshot) GetAllowSharedCoresOverlapReclaimedCores
 
 func (s *cpuSetAdjustmentStateSnapshot) GetDisableDedicatedCoresOverlapReclaimedCores() bool {
 	return s.disableDedicated
-}
-
-func (s *cpuSetAdjustmentStateSnapshot) GetDefaultShareMaterializationState() state.DefaultShareMaterializationState {
-	return s.defaultShare
 }
 
 func (s *cpuSetAdjustmentStateSnapshot) GetRevision() uint64 {
@@ -297,7 +290,6 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 					p.state.GetAllowSharedCoresOverlapReclaimedCores(),
 					p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
 					true,
-					p.state.GetDefaultShareMaterializationState(),
 				); err != nil {
 					if errors.Is(err, state.ErrStaleStateRevision) {
 						p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonStaleState)

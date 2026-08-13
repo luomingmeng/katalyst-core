@@ -100,7 +100,7 @@ func TestCPUPluginStateCommitAdvisorStateIsAtomic(t *testing.T) {
 	}
 
 	entries, machineState, allowOverlap := makeVersion(0)
-	require.NoError(t, s.CommitAdvisorState(entries, machineState, allowOverlap, false, false, DefaultShareMaterializationState{}))
+	require.NoError(t, s.CommitAdvisorState(entries, machineState, allowOverlap, false, false))
 
 	const iterations = 1000
 	var wg sync.WaitGroup
@@ -110,7 +110,7 @@ func TestCPUPluginStateCommitAdvisorStateIsAtomic(t *testing.T) {
 		defer wg.Done()
 		for i := 1; i <= iterations; i++ {
 			entries, machineState, allowOverlap := makeVersion(i)
-			if err := s.CommitAdvisorState(entries, machineState, allowOverlap, false, false, DefaultShareMaterializationState{}); err != nil {
+			if err := s.CommitAdvisorState(entries, machineState, allowOverlap, false, false); err != nil {
 				errCh <- err
 				return
 			}
@@ -153,7 +153,7 @@ func TestCPUPluginStateCommitAdvisorStateIfRevisionRejectsStaleSnapshot(t *testi
 	baseMachineState := NUMANodeMap{
 		0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(0)},
 	}
-	require.NoError(t, s.CommitAdvisorState(baseEntries, baseMachineState, false, false, false, DefaultShareMaterializationState{}))
+	require.NoError(t, s.CommitAdvisorState(baseEntries, baseMachineState, false, false, false))
 
 	staleRevision := s.GetRevision()
 	staleEntries := s.GetPodEntries()
@@ -164,7 +164,7 @@ func TestCPUPluginStateCommitAdvisorStateIfRevisionRejectsStaleSnapshot(t *testi
 	})
 	require.NotNil(t, s.GetAllocationInfo("new-pod", "main"))
 
-	err = s.CommitAdvisorStateIfRevision(staleRevision, staleEntries, staleMachineState, false, false, false, DefaultShareMaterializationState{})
+	err = s.CommitAdvisorStateIfRevision(staleRevision, staleEntries, staleMachineState, false, false, false)
 	require.Error(t, err)
 	require.True(t, stderrors.Is(err, ErrStaleStateRevision), "err=%v", err)
 	require.NotNil(t, s.GetAllocationInfo("new-pod", "main"), "stale commit must not drop newer pod entry")
@@ -189,7 +189,7 @@ func TestNUMAHeadroomDoesNotAdvanceAllocationRevisionOrBreakCASIsolation(t *test
 		0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(1)},
 	}
 	require.NoError(t, s.CommitAdvisorStateIfRevision(
-		revision, entries, machineState, true, false, false, DefaultShareMaterializationState{}))
+		revision, entries, machineState, true, false, false))
 	require.Equal(t, map[int]float64{0: 1.5}, s.GetNUMAHeadroom(),
 		"allocation CAS must not overwrite independently updated headroom")
 }
@@ -241,7 +241,7 @@ func TestCheckpointStateCommitAdvisorState(t *testing.T) {
 			emitter:           metrics.DummyMetrics{},
 		}
 
-		require.NoError(t, sc.CommitAdvisorState(newEntries, newMachineState, true, false, true, DefaultShareMaterializationState{}))
+		require.NoError(t, sc.CommitAdvisorState(newEntries, newMachineState, true, false, true))
 		require.Equal(t, 1, manager.calls())
 		require.True(t, sc.GetAllocationInfo("new", "main").AllocationResult.Equals(machine.NewCPUSet(1)))
 		require.True(t, sc.GetMachineState()[0].AllocatedCPUSet.Equals(machine.NewCPUSet(1)))
@@ -257,7 +257,7 @@ func TestCheckpointStateCommitAdvisorState(t *testing.T) {
 			emitter:           metrics.DummyMetrics{},
 		}
 
-		require.NoError(t, sc.CommitAdvisorState(newEntries, newMachineState, true, false, false, DefaultShareMaterializationState{}))
+		require.NoError(t, sc.CommitAdvisorState(newEntries, newMachineState, true, false, false))
 		require.Equal(t, 0, manager.calls())
 	})
 
@@ -274,7 +274,7 @@ func TestCheckpointStateCommitAdvisorState(t *testing.T) {
 		oldAllowOverlap := sc.GetAllowSharedCoresOverlapReclaimedCores()
 		oldRevision := sc.GetRevision()
 
-		err := sc.CommitAdvisorState(newEntries, newMachineState, true, false, true, DefaultShareMaterializationState{})
+		err := sc.CommitAdvisorState(newEntries, newMachineState, true, false, true)
 		require.EqualError(t, err, "store failed")
 		require.Equal(t, 1, manager.calls())
 		require.Equal(t, oldEntries, sc.GetPodEntries())
@@ -283,71 +283,8 @@ func TestCheckpointStateCommitAdvisorState(t *testing.T) {
 		require.Equal(t, oldRevision, sc.GetRevision(),
 			"failed durable commit must restore the exact pre-commit revision")
 	})
-}
 
-func TestCPUPluginStateCommitAdvisorStatePersistsDefaultShareMaterializationState(t *testing.T) {
-	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
-	require.NoError(t, err)
-	s := NewCPUPluginState(topology)
-
-	advice := DefaultShareMaterializationState{Enabled: true, AdvisedQuantity: 0}
-	require.NoError(t, s.CommitAdvisorState(
-		PodEntries{"default-share": {"main": &AllocationInfo{AllocationResult: machine.NewCPUSet(0)}}},
-		NUMANodeMap{0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(0)}},
-		true,
-		false,
-		false,
-		advice,
-	))
-
-	require.Equal(t, advice, s.GetDefaultShareMaterializationState())
-}
-
-func TestCPUPluginStateCommitAdvisorStateIfRevisionKeepsDefaultShareMaterializationStateOnStale(t *testing.T) {
-	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
-	require.NoError(t, err)
-	s := NewCPUPluginState(topology)
-
-	originalAdvice := DefaultShareMaterializationState{Enabled: true, AdvisedQuantity: 2}
-	require.NoError(t, s.CommitAdvisorState(
-		PodEntries{"old": {"main": &AllocationInfo{AllocationResult: machine.NewCPUSet(0)}}},
-		NUMANodeMap{0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(0)}},
-		false,
-		false,
-		false,
-		originalAdvice,
-	))
-	staleRevision := s.GetRevision()
-	staleEntries := s.GetPodEntries()
-	staleMachineState := s.GetMachineState()
-
-	s.SetAllocationInfo("newer", "main", &AllocationInfo{AllocationResult: machine.NewCPUSet(1)})
-	err = s.CommitAdvisorStateIfRevision(
-		staleRevision,
-		staleEntries,
-		staleMachineState,
-		false,
-		false,
-		false,
-		DefaultShareMaterializationState{Enabled: true, AdvisedQuantity: 0},
-	)
-	require.ErrorIs(t, err, ErrStaleStateRevision)
-	require.Equal(t, originalAdvice, s.GetDefaultShareMaterializationState())
-}
-
-func TestCheckpointStateDefaultShareMaterializationState(t *testing.T) {
-	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
-	require.NoError(t, err)
-	newEntries := PodEntries{
-		"new": {
-			"main": &AllocationInfo{AllocationResult: machine.NewCPUSet(1)},
-		},
-	}
-	newMachineState := NUMANodeMap{
-		0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(1)},
-	}
-
-	t.Run("rolls back when checkpoint persistence fails", func(t *testing.T) {
+	t.Run("conditional commit restores memory when persistence fails", func(t *testing.T) {
 		manager := &advisorCommitCheckpointManager{createErr: stderrors.New("store failed")}
 		sc := &stateCheckpoint{
 			cache:             NewCPUPluginState(topology),
@@ -355,78 +292,22 @@ func TestCheckpointStateDefaultShareMaterializationState(t *testing.T) {
 			checkpointName:    cpuPluginStateFileName,
 			emitter:           metrics.DummyMetrics{},
 		}
-		oldAdvice := sc.GetDefaultShareMaterializationState()
+		oldEntries := sc.GetPodEntries()
+		oldMachineState := sc.GetMachineState()
+		oldAllowOverlap := sc.GetAllowSharedCoresOverlapReclaimedCores()
+		oldDisableDedicatedOverlap := sc.GetDisableDedicatedCoresOverlapReclaimedCores()
+		oldRevision := sc.GetRevision()
 
-		err := sc.CommitAdvisorState(
-			newEntries,
-			newMachineState,
-			true,
-			false,
-			true,
-			DefaultShareMaterializationState{Enabled: true, AdvisedQuantity: 0},
-		)
+		err := sc.CommitAdvisorStateIfRevision(
+			oldRevision, newEntries, newMachineState, true, true, true)
 		require.EqualError(t, err, "store failed")
-		require.Equal(t, oldAdvice, sc.GetDefaultShareMaterializationState())
+		require.Equal(t, 1, manager.calls())
+		require.Equal(t, oldEntries, sc.GetPodEntries())
+		require.Equal(t, oldMachineState, sc.GetMachineState())
+		require.Equal(t, oldAllowOverlap, sc.GetAllowSharedCoresOverlapReclaimedCores())
+		require.Equal(t, oldDisableDedicatedOverlap, sc.GetDisableDedicatedCoresOverlapReclaimedCores())
+		require.Equal(t, oldRevision, sc.GetRevision())
 	})
-
-	t.Run("round trips enabled with zero advised quantity", func(t *testing.T) {
-		stateDir := t.TempDir()
-		config := &statedirectory.StateDirectoryConfiguration{StateFileDirectory: stateDir}
-		first, err := NewCheckpointState(
-			config, cpuPluginStateFileName, policyName, topology, false,
-			GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
-		require.NoError(t, err)
-
-		advice := DefaultShareMaterializationState{Enabled: true, AdvisedQuantity: 0}
-		require.NoError(t, first.CommitAdvisorState(
-			newEntries,
-			newMachineState,
-			true,
-			false,
-			true,
-			advice,
-		))
-
-		restarted, err := NewCheckpointState(
-			config, cpuPluginStateFileName, policyName, topology, false,
-			GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
-		require.NoError(t, err)
-		require.Equal(t, advice, restarted.GetDefaultShareMaterializationState())
-	})
-
-	t.Run("restores legacy checkpoint as disabled", func(t *testing.T) {
-		sc := &stateCheckpoint{
-			cache:                              NewCPUPluginState(topology),
-			policyName:                         policyName,
-			topology:                           topology,
-			GenerateMachineStateFromPodEntries: GenerateMachineStateFromPodEntries,
-		}
-		checkpoint := NewCPUPluginCheckpoint()
-		checkpoint.PolicyName = policyName
-		checkpoint.MachineState = GetDefaultMachineState(topology)
-		checkpoint.Revision = 1
-
-		_, err := sc.RestoreState(checkpoint)
-		require.NoError(t, err)
-		require.Equal(t, DefaultShareMaterializationState{}, sc.GetDefaultShareMaterializationState())
-	})
-}
-
-func TestTransientStateDefaultShareMaterializationState(t *testing.T) {
-	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
-	require.NoError(t, err)
-	s := NewTransientState(topology)
-
-	advice := DefaultShareMaterializationState{Enabled: true, AdvisedQuantity: 0}
-	require.NoError(t, s.CommitAdvisorState(
-		PodEntries{"default-share": {"main": &AllocationInfo{AllocationResult: machine.NewCPUSet(0)}}},
-		NUMANodeMap{0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(0)}},
-		false,
-		false,
-		true,
-		advice,
-	))
-	require.Equal(t, advice, s.GetDefaultShareMaterializationState())
 }
 
 func TestCPUPluginStateRejectsRevisionOverflowWithoutMutation(t *testing.T) {
@@ -444,7 +325,6 @@ func TestCPUPluginStateRejectsRevisionOverflowWithoutMutation(t *testing.T) {
 		true,
 		false,
 		false,
-		DefaultShareMaterializationState{},
 	)
 	require.ErrorContains(t, err, "revision overflow")
 	require.Equal(t, uint64(math.MaxUint64), s.GetRevision())
@@ -617,8 +497,6 @@ func assertStateEqual(t *testing.T, restoredState, expectedState State) {
 	expectedPodEntries := expectedState.GetPodEntries()
 	restoredPodEntries := restoredState.GetPodEntries()
 	as.Equalf(expectedPodEntries, restoredPodEntries, "podEntries mismatch")
-	as.Equalf(expectedState.GetDefaultShareMaterializationState(), restoredState.GetDefaultShareMaterializationState(),
-		"defaultShareMaterializationState mismatch")
 }
 
 // generateSharedNumaBindingPoolAllocationMeta generates a generic allocation metadata for a pool.

@@ -410,7 +410,6 @@ func convertGetAdviceResponse(resp *advisorapi.GetAdviceResponse) *advisorapi.Li
 		AllowSharedCoresOverlapReclaimedCores: resp.AllowSharedCoresOverlapReclaimedCores,
 		ExtraEntries:                          resp.ExtraEntries,
 		DisableDedicatedCoresOverlapReclaimedCores: resp.DisableDedicatedCoresOverlapReclaimedCores,
-		FillDefaultSharePoolWithNonReclaimCpus:     resp.FillDefaultSharePoolWithNonReclaimCpus,
 	}
 }
 
@@ -1702,13 +1701,12 @@ func buildLegacyMandatoryReclaimDescriptors(
 }
 
 type pendingAdvisorState struct {
-	preCommitRevision                uint64
-	currentEntries                   state.PodEntries
-	entries                          state.PodEntries
-	machineState                     state.NUMANodeMap
-	allowOverlap                     bool
-	disableDedicated                 bool
-	defaultShareMaterializationState state.DefaultShareMaterializationState
+	preCommitRevision uint64
+	currentEntries    state.PodEntries
+	entries           state.PodEntries
+	machineState      state.NUMANodeMap
+	allowOverlap      bool
+	disableDedicated  bool
 }
 
 // applyBlocks prepares and validates an advisor state transition without
@@ -1765,7 +1763,7 @@ func (p *DynamicPolicy) applyBlocks(
 	dedicatedCPUSet := machine.NewCPUSet()
 	pooledUnionDedicatedCPUSet := machine.NewCPUSet()
 	defaultSharePlan := defaultShareMaterializationPlan{}
-	if resp.GetFillDefaultSharePoolWithNonReclaimCpus() {
+	if p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs {
 		defaultSharePlan.enabled = true
 		var err error
 		defaultSharePlan.advisedQuantity, err = defaultShareQuantityFromAdvisorResponse(resp)
@@ -1998,6 +1996,14 @@ func (p *DynamicPolicy) applyBlocks(
 						allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName, allocationInfo.AllocationResult.String(), rampUpCPUs.String())
 
 					if rampUpCPUs.IsEmpty() {
+						if err := validateEmptyRampUpCPUReuse(
+							p.isRampUpReclaimHardPartitionEnabled(),
+							allocationInfo.AllocationResult,
+							rampUpReclaimFloor,
+						); err != nil {
+							return nil, fmt.Errorf("pod: %s/%s container: %s %w",
+								allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName, err)
+						}
 						general.Warningf("rampUpCPUs is empty. pod: %s/%s container: %s reuses its allocation result: %s",
 							allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName, allocationInfo.AllocationResult.String())
 						continue containerLoop
@@ -2077,14 +2083,25 @@ func (p *DynamicPolicy) applyBlocks(
 		return nil, err
 	}
 	return &pendingAdvisorState{
-		preCommitRevision:                stateRevision,
-		currentEntries:                   curEntries,
-		entries:                          newEntries,
-		machineState:                     newMachineState,
-		allowOverlap:                     allowSharedCoresOverlapReclaimedCores,
-		disableDedicated:                 resp.DisableDedicatedCoresOverlapReclaimedCores,
-		defaultShareMaterializationState: defaultSharePlan.materializationState(state.DefaultShareMaterializationState{}),
+		preCommitRevision: stateRevision,
+		currentEntries:    curEntries,
+		entries:           newEntries,
+		machineState:      newMachineState,
+		allowOverlap:      allowSharedCoresOverlapReclaimedCores,
+		disableDedicated:  resp.DisableDedicatedCoresOverlapReclaimedCores,
 	}, nil
+}
+
+func validateEmptyRampUpCPUReuse(hardPartitionEnabled bool, oldAllocation, reclaimFloor machine.CPUSet) error {
+	if !hardPartitionEnabled {
+		return nil
+	}
+	overlap := oldAllocation.Intersection(reclaimFloor)
+	if overlap.IsEmpty() {
+		return nil
+	}
+	return fmt.Errorf("ramp-up allocation %s overlaps reclaim hard floor %s when recomputed rampUpCPUs is empty",
+		oldAllocation.String(), reclaimFloor.String())
 }
 
 func (p *DynamicPolicy) commitPendingAdvisorState(pending *pendingAdvisorState) error {
@@ -2101,7 +2118,6 @@ func (p *DynamicPolicy) commitPendingAdvisorState(pending *pendingAdvisorState) 
 		pending.allowOverlap,
 		pending.disableDedicated,
 		true,
-		pending.defaultShareMaterializationState,
 	)
 }
 

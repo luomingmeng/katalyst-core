@@ -18,6 +18,7 @@ package dynamicpolicy
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"math"
 	"sort"
@@ -25,7 +26,7 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/util/errors"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/kubewharf/katalyst-api/pkg/consts"
@@ -74,7 +75,7 @@ func (p *DynamicPolicy) checkCPUSet(_ *coreconfig.Configuration,
 
 	defer func() {
 		if len(errList) > 0 {
-			_ = general.UpdateHealthzStateByError(cpuconsts.CheckCPUSet, errors.NewAggregate(errList))
+			_ = general.UpdateHealthzStateByError(cpuconsts.CheckCPUSet, utilerrors.NewAggregate(errList))
 		} else if invalidCPUSet {
 			_ = general.UpdateHealthzState(cpuconsts.CheckCPUSet, general.HealthzCheckStateNotReady, "invalid cpuset exists")
 		} else if cpuSetOverlap {
@@ -450,11 +451,50 @@ func (p *DynamicPolicy) clearResidualState(_ *coreconfig.Configuration,
 			podEntries, updatedMachineState, false, expectedRevision)
 		if err != nil {
 			general.ErrorS(err, "adjustAllocationEntries failed")
+			err = p.persistPodDeletionAfterAdjustFailure(
+				err, podEntries, updatedMachineState, expectedRevision)
+			if err != nil {
+				general.ErrorS(err, "persist residual pod deletion after adjust failure failed")
+			}
+			return
 		}
 		if err := p.state.StoreState(); err != nil {
 			general.ErrorS(err, "store state failed")
 		}
 	}
+}
+
+func (p *DynamicPolicy) persistPodDeletionAfterAdjustFailure(
+	adjustErr error,
+	podEntries state.PodEntries,
+	updatedMachineState state.NUMANodeMap,
+	expectedRevision uint64,
+) error {
+	if adjustErr == nil {
+		return nil
+	}
+
+	if !isDefaultShareResidualQuantityGateError(adjustErr) {
+		return adjustErr
+	}
+
+	general.Warningf("bypass default share residual quantity gate for durable pod deletion: %v", adjustErr)
+	return p.state.CommitAdvisorStateIfRevision(
+		expectedRevision,
+		podEntries,
+		updatedMachineState,
+		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+		true,
+	)
+}
+
+func isDefaultShareResidualQuantityGateError(err error) bool {
+	if stderrors.Is(err, ErrDefaultShareResidualQuantityMismatch) {
+		return true
+	}
+	var quantityErr *DefaultShareResidualQuantityError
+	return stderrors.As(err, &quantityErr)
 }
 
 // syncCPUIdle is used to set cpu idle for reclaimed cores

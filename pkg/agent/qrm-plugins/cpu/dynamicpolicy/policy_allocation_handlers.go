@@ -48,6 +48,26 @@ import (
 	rputil "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 )
 
+var ErrDefaultShareResidualQuantityMismatch = errors.New("default share residual quantity exceeds advised quantity")
+
+type DefaultShareResidualQuantityError struct {
+	AdvisedQuantity int
+	ResidualSize    int
+	AvailableCPUs   machine.CPUSet
+	FixedCPUs       machine.CPUSet
+	ResidualCPUs    machine.CPUSet
+}
+
+func (e *DefaultShareResidualQuantityError) Error() string {
+	return fmt.Sprintf(
+		"default share quantity %d is smaller than residual cpuset size %d, available: %s, fixed: %s, residual: %s",
+		e.AdvisedQuantity, e.ResidualSize, e.AvailableCPUs.String(), e.FixedCPUs.String(), e.ResidualCPUs.String())
+}
+
+func (e *DefaultShareResidualQuantityError) Unwrap() error {
+	return ErrDefaultShareResidualQuantityMismatch
+}
+
 type requestStateCompensatedError struct {
 	err error
 }
@@ -522,7 +542,10 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 		return nil, fmt.Errorf("getReqQuantityFromResourceReq failed with error: %v", err)
 	}
 
-	podReclaimEnabled := p.podEnableReclaimOrFallback(ctx, req.PodUid, "allocateNumaBindingCPUs")
+	podReclaimEnabled, err := p.podEnableReclaimForNumaBindingAllocation(ctx, req.PodUid, req.Annotations)
+	if err != nil {
+		return nil, err
+	}
 
 	result, hardReclaimCPUs, eligibility, err := p.allocateNumaBindingCPUsWithEligibility(
 		podAggregatedRequest, req.Hint, machineState, req.Annotations, podReclaimEnabled)
@@ -648,7 +671,6 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
 		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
 		false,
-		p.state.GetDefaultShareMaterializationState(),
 	); err != nil {
 		return nil, fmt.Errorf("initialize DNB ramp-up target state failed: %w", err)
 	}
@@ -699,7 +721,6 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
 		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
 		persistCheckpoint,
-		planningState.GetDefaultShareMaterializationState(),
 	); err != nil {
 		return nil, fmt.Errorf("commit DNB allocation and reclaim floor atomically failed: %w", err)
 	}
@@ -778,7 +799,6 @@ func (p *DynamicPolicy) rollbackFailedDNBAllocation(
 		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
 		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
 		false,
-		p.state.GetDefaultShareMaterializationState(),
 	); err != nil {
 		return fmt.Errorf("initialize failed DNB rollback state: %w", err)
 	}
@@ -794,7 +814,6 @@ func (p *DynamicPolicy) rollbackFailedDNBAllocation(
 		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
 		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
 		persistCheckpoint,
-		planningState.GetDefaultShareMaterializationState(),
 	)
 }
 
@@ -1586,6 +1605,9 @@ func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloorAtRevision(
 	dynamicConfig := p.dynamicConfig.GetDynamicConfiguration()
 	advisorHealthy := p.enableCPUAdvisor && p.advisorMonitor != nil &&
 		!cpuutil.AdvisorDegradation(p.advisorMonitor.GetHealthy(), dynamicConfig.EnableReclaim)
+	if dynamicConfig.FillDefaultSharePoolWithNonReclaimCPUs && !advisorHealthy {
+		return fmt.Errorf("default share residual quantity requires a healthy cpu advisor")
+	}
 	if advisorHealthy {
 		poolsCPUSetMap, err := entries.GetFilteredPoolsCPUSetMap(state.IsResidentPool, commonstate.IsSystemPool)
 		if err != nil {
@@ -1701,15 +1723,30 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloorAtRevision(
 	general.Infof("poolsQuantityMap: %#v, isolatedQuantityMap: %#v, rpPinnedCPUSet: %v, availableCPUs: %v, reclaimOverlapShareRatio: %#v",
 		poolsQuantityMap, isolatedQuantityMap, rpPinnedCPUSet, availableCPUs, reclaimOverlapShareRatio)
 
-	// When advisor advice has enabled default-share materialization, the default
+	// When FillDefaultSharePoolWithNonReclaimCPUs is enabled, the default
 	// non-NUMA-binding share pool must not participate in the normal pool
-	// allocation path. The persisted advisor state, not dynamic config nor the
-	// current/request cpuset, is the source of truth for local replans.
+	// allocation path. Instead we move it out of the quantity map (on a deep
+	// copy so the caller's map is untouched), allocate every other fixed pool
+	// first, and later materialize the default share pool with residual CPUs in
+	// applyPoolsAndIsolatedInfo.
 	fixedPoolsQuantityMap := copyPoolQuantityMap(poolsQuantityMap)
-	defaultSharePlan := defaultShareMaterializationPlanFromState(
-		p.state.GetDefaultShareMaterializationState())
-	if defaultSharePlan.enabled {
+	defaultSharePlan := defaultShareMaterializationPlan{}
+	if p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs {
+		quantityByNUMA, ok := fixedPoolsQuantityMap[commonstate.PoolNameShare]
+		if !ok {
+			return fmt.Errorf("default share quantity is missing")
+		}
+		if len(quantityByNUMA) != 1 {
+			return fmt.Errorf("default share quantity map must contain only faked numa id")
+		}
+		quantity, ok := quantityByNUMA[commonstate.FakedNUMAID]
+		if !ok {
+			return fmt.Errorf("default share quantity map must contain only faked numa id")
+		}
+		defaultSharePlan.enabled = true
+		defaultSharePlan.advisedQuantity = quantity
 		delete(fixedPoolsQuantityMap, commonstate.PoolNameShare)
+
 	}
 
 	poolsCPUSet, isolatedCPUSet, err := p.groupAndAllocatePools(fixedPoolsQuantityMap, isolatedQuantityMap, availableCPUs, rpPinnedCPUSet, reclaimOverlapShareRatio)
@@ -1972,28 +2009,6 @@ type defaultShareMaterializationPlan struct {
 	eligibleCPUSet  machine.CPUSet
 }
 
-func defaultShareMaterializationPlanFromState(
-	materializationState state.DefaultShareMaterializationState,
-) defaultShareMaterializationPlan {
-	if !materializationState.Enabled {
-		return defaultShareMaterializationPlan{}
-	}
-	return defaultShareMaterializationPlan{
-		enabled:         true,
-		advisedQuantity: materializationState.AdvisedQuantity,
-	}
-}
-
-func (p defaultShareMaterializationPlan) materializationState(fallback state.DefaultShareMaterializationState) state.DefaultShareMaterializationState {
-	if !p.enabled {
-		return fallback
-	}
-	return state.DefaultShareMaterializationState{
-		Enabled:         true,
-		AdvisedQuantity: p.advisedQuantity,
-	}
-}
-
 // buildDefaultShareEligibleCPUSet derives the default-share source of truth
 // from the complete physical topology and the entries being finalized. It must
 // not start from NUMANodeState.DefaultCPUSet: that field can still describe the
@@ -2085,9 +2100,10 @@ func isolatedCPUSetFromPodEntries(entries state.PodEntries) map[string]map[strin
 // closed when the expected quantity produced by SysAdvisor is smaller than the
 // residual size.
 //
-// Mutual-exclusion premise: this residual backfill relies on advisor-side
-// default-share materialization and AllowSharedCoresOverlapReclaimedCores being
-// mutually exclusive. That mutual exclusion is enforced on the SysAdvisor side by
+// Mutual-exclusion premise: this residual backfill relies on
+// FillDefaultSharePoolWithNonReclaimCPUs (the backfill gate) and
+// AllowSharedCoresOverlapReclaimedCores being mutually exclusive. That
+// mutual exclusion is enforced on the SysAdvisor side by
 // validateDefaultShareBackfillConfig (assembler_common.go) at the quantity
 // layer: when the gate is enabled but overlap is allowed it errors out and no
 // default share quantity is produced. Therefore we deliberately do NOT
@@ -2104,9 +2120,13 @@ func materializeDefaultShareCPUSet(expectedQuantity int, availableCPUs machine.C
 	fixed := unionPoolCPUSet(pools, commonstate.PoolNameShare).Union(unionIsolatedCPUSet(isolated))
 	residual := availableCPUs.Difference(fixed)
 	if residual.Size() > expectedQuantity {
-		return machine.NewCPUSet(), fmt.Errorf(
-			"default share quantity %d is smaller than residual cpuset size %d, available: %s, fixed: %s, residual: %s",
-			expectedQuantity, residual.Size(), availableCPUs.String(), fixed.String(), residual.String())
+		return machine.NewCPUSet(), &DefaultShareResidualQuantityError{
+			AdvisedQuantity: expectedQuantity,
+			ResidualSize:    residual.Size(),
+			AvailableCPUs:   availableCPUs,
+			FixedCPUs:       fixed,
+			ResidualCPUs:    residual,
+		}
 	}
 	if residual.Size() < expectedQuantity {
 		general.InfoS("default share residual cpuset shrank before advisor quantity",
@@ -2146,6 +2166,9 @@ func (p *DynamicPolicy) finalizeDefaultShareEntry(
 		expectedQuantity, candidate, finalPools, isolatedCPUSetFromPodEntries(newPodEntries))
 	if err != nil {
 		return err
+	}
+	if share.IsEmpty() {
+		return fmt.Errorf("default share residual is empty")
 	}
 	topologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, share)
 	if err != nil {
@@ -2510,7 +2533,6 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 		allowSharedCoresOverlapReclaimedCores,
 		disableDedicatedCoresOverlapReclaimedCores,
 		persistCheckpoint,
-		defaultSharePlan.materializationState(p.state.GetDefaultShareMaterializationState()),
 	)
 }
 
@@ -3434,7 +3456,7 @@ func (p *DynamicPolicy) isRampUpReclaimHardPartitionEnabled() bool {
 		return false
 	}
 	dyn := p.dynamicConfig.GetDynamicConfiguration()
-	return dyn != nil && dyn.EnableRampUpReclaimHardPartition
+	return dyn != nil && dyn.EnableReclaim && dyn.EnableRampUpReclaimHardPartition
 }
 
 // isReclaimEnabled reports the node-level reclaim switch from dynamic config.
@@ -3681,6 +3703,23 @@ func (p *DynamicPolicy) selectNumaBindingReclaimPartition(
 // falling back to the node-level switch when the pod carries no override.
 func (p *DynamicPolicy) podEnableReclaim(ctx context.Context, podUID string) (bool, error) {
 	return resourcehelper.PodEnableReclaim(ctx, p.metaServer, podUID, p.isReclaimEnabled())
+}
+
+func (p *DynamicPolicy) podEnableReclaimForNumaBindingAllocation(ctx context.Context, podUID string, reqAnnotations map[string]string) (bool, error) {
+	if p.isRampUpReclaimHardPartitionEnabled() &&
+		qosutil.AnnotationsIndicateNUMAExclusive(reqAnnotations) &&
+		p.state.GetDisableDedicatedCoresOverlapReclaimedCores() {
+		return p.podEnableReclaimStrict(ctx, podUID, "exclusive dnb ramp-up")
+	}
+	return p.podEnableReclaimOrFallback(ctx, podUID, "allocateNumaBindingCPUs"), nil
+}
+
+func (p *DynamicPolicy) podEnableReclaimStrict(ctx context.Context, podUID, operation string) (bool, error) {
+	podReclaimEnabled, err := p.podEnableReclaim(ctx, podUID)
+	if err != nil {
+		return false, fmt.Errorf("%s: check pod enable reclaim for pod %s failed: %w", operation, podUID, err)
+	}
+	return podReclaimEnabled, nil
 }
 
 // podEnableReclaimOrFallback is the error-swallowing convenience wrapper used on

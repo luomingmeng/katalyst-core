@@ -22,6 +22,7 @@ import (
 
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	cpustate "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/config"
@@ -252,6 +253,83 @@ func TestBuildCPUSetPartitionViewIncludesSNBRampUpInSharePool(t *testing.T) {
 	assertCPUSet(t, "share includes snb ramp-up", view.SharePool, "1-2")
 	assertCPUSet(t, "non reclaim protects snb ramp-up", view.NonReclaimPool, "1-2,4-7")
 	assertCPUSet(t, "reclaim excludes snb ramp-up", view.ReclaimEffective, "3")
+}
+
+func TestGateAHardPartitionDefaultShareBaselineDoesNotSwallowReclaim(t *testing.T) {
+	t.Parallel()
+
+	state := cpustate.NewCPUPluginState(nil)
+	state.SetAllowSharedCoresOverlapReclaimedCores(false)
+	state.SetAllocationInfo(commonstate.PoolNameReserve, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReserve),
+		AllocationResult: machine.NewCPUSet(0, 4),
+	})
+	state.SetAllocationInfo(commonstate.PoolNameShare, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+		AllocationResult: machine.NewCPUSet(1, 2, 3, 5, 6, 7),
+	})
+	state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+		AllocationResult: machine.NewCPUSet(2, 3, 6, 7),
+	})
+
+	view, err := BuildValidatedCPUSetPartitionView(state, testTwoNUMATopology(), CPUSetPartitionViewOptions{
+		HardPartitionEnabled: true,
+	})
+	if err != nil {
+		t.Fatalf("BuildValidatedCPUSetPartitionView() error = %v", err)
+	}
+
+	assertCPUSet(t, "default share residual", view.SharePool, "1,5")
+	assertCPUSet(t, "default share map residual", view.SharePoolMap[commonstate.PoolNameShare], "1,5")
+	assertCPUSet(t, "non reclaim residual", view.NonReclaimPool, "1,5")
+	assertCPUSet(t, "reclaim effective", view.ReclaimEffective, "2-3,6-7")
+	assertCPUSet(t, "reclaim numa 0", view.ReclaimEffectivePerNUMA[0], "2-3")
+	assertCPUSet(t, "reclaim numa 1", view.ReclaimEffectivePerNUMA[1], "6-7")
+}
+
+func TestGateBSNBRampUpUsesDeclaredShareNUMAPoolForRDT(t *testing.T) {
+	t.Parallel()
+
+	state := cpustate.NewCPUPluginState(nil)
+	state.SetAllowSharedCoresOverlapReclaimedCores(false)
+	state.SetAllocationInfo(commonstate.PoolNameReserve, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReserve),
+		AllocationResult: machine.NewCPUSet(0, 4),
+	})
+	state.SetAllocationInfo(commonstate.PoolNameShare, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+		AllocationResult: machine.NewCPUSet(1, 5),
+	})
+	state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+		AllocationResult: machine.NewCPUSet(2, 3, 6, 7),
+	})
+	state.SetAllocationInfo("snb-ramp-up", "main", &cpustate.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        "snb-ramp-up",
+			ContainerName: "main",
+			OwnerPoolName: "isolation-snb-ramp-up",
+			QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+			Annotations: map[string]string{
+				apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+				cpuconsts.CPUStateAnnotationKeyNUMAHint:             "0",
+			},
+		},
+		RampUp:           true,
+		AllocationResult: machine.NewCPUSet(2),
+	})
+
+	view := BuildCPUSetPartitionView(state, testTwoNUMATopology(), CPUSetPartitionViewOptions{
+		HardPartitionEnabled: true,
+	})
+
+	assertCPUSet(t, "aggregate share protects SNB ramp-up", view.SharePool, "1-2,5")
+	assertCPUSet(t, "default share RDT target", view.SharePoolMap[commonstate.PoolNameShare], "1,5")
+	assertCPUSet(t, "declared share-NUMA0 RDT target", view.SharePoolMap["share-NUMA0"], "2")
+	if _, ok := view.SharePoolMap["isolation-snb-ramp-up"]; ok {
+		t.Fatal("SharePoolMap contains isolation owner instead of declared share-NUMA0 pool")
+	}
 }
 
 func TestBuildCPUSetPartitionViewPreservesTwoReservedCPUs(t *testing.T) {

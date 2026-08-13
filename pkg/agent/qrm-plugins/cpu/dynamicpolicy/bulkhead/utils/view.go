@@ -25,6 +25,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
+	resourcepackage "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 )
 
 type CPUSetPartitionViewOptions struct {
@@ -86,6 +87,8 @@ func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CP
 		}
 		view.ContainerCPUSetByPod[podUID][containerName] = cpus.Clone()
 	}
+	sharedRampUp := machine.NewCPUSet()
+	sharedRampUpByPool := map[string]machine.CPUSet{}
 
 	for _, containerEntries := range podEntries {
 		if containerEntries.IsPoolEntry() {
@@ -96,7 +99,14 @@ func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CP
 				recordContainerCPUSet(allocation.PodUid, allocation.ContainerName, allocation.AllocationResult)
 				if allocation.RampUp && allocation.CheckSharedNUMABinding() {
 					view.SharePool = view.SharePool.Union(allocation.AllocationResult)
-					view.SharePoolMap[commonstate.PoolNameShare] = view.SharePoolMap[commonstate.PoolNameShare].Union(allocation.AllocationResult)
+					sharedRampUp = sharedRampUp.Union(allocation.AllocationResult)
+					poolName, err := allocation.GetSpecifiedNUMABindingPoolName()
+					if err != nil {
+						poolName = commonstate.PoolNameShare
+					}
+					packageName := allocation.GetResourcePackageName()
+					poolName = resourcepackage.WrapOwnerPoolName(poolName, packageName)
+					sharedRampUpByPool[poolName] = sharedRampUpByPool[poolName].Union(allocation.AllocationResult)
 				}
 			}
 		}
@@ -120,6 +130,9 @@ func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CP
 			view.Isolation = view.Isolation.Union(entry.AllocationResult)
 		}
 	}
+	for poolName, cpus := range sharedRampUpByPool {
+		view.SharePoolMap[poolName] = view.SharePoolMap[poolName].Union(cpus)
+	}
 
 	for _, containerEntries := range podEntries {
 		if containerEntries.IsPoolEntry() {
@@ -141,6 +154,19 @@ func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CP
 		view.SharePool = view.SharePool.Difference(view.ReclaimRaw)
 		for poolName, cpus := range view.SharePoolMap {
 			view.SharePoolMap[poolName] = cpus.Difference(view.ReclaimRaw)
+		}
+	}
+	defaultShareBaseline := topology.CPUDetails.CPUs().Difference(view.Reserve)
+	if !allowOverlap && opts.HardPartitionEnabled && !view.ReclaimRaw.IsEmpty() && view.SharePool.Equals(defaultShareBaseline) {
+		// A reset default-share entry can still cover every non-reserved CPU.
+		// In hard-partition mode reclaim raw owns its CPUs, while real shared
+		// NUMA-binding ramp-up allocations remain explicit non-reclaim owners.
+		view.SharePool = view.SharePool.Difference(view.ReclaimRaw).Union(sharedRampUp)
+		for poolName, cpus := range view.SharePoolMap {
+			view.SharePoolMap[poolName] = cpus.Difference(view.ReclaimRaw)
+		}
+		for poolName, cpus := range sharedRampUpByPool {
+			view.SharePoolMap[poolName] = view.SharePoolMap[poolName].Union(cpus)
 		}
 	}
 	view.NonReclaimPool = view.SharePool.Union(view.Dedicated).Union(view.Isolation)

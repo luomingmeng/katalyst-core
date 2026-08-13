@@ -59,11 +59,9 @@ func TestConvertGetAdviceResponsePropagatesDedicatedReclaimDisjoint(t *testing.T
 
 	unified := convertGetAdviceResponse(&advisorapi.GetAdviceResponse{
 		DisableDedicatedCoresOverlapReclaimedCores: true,
-		FillDefaultSharePoolWithNonReclaimCpus:     true,
 	})
 
 	require.True(t, unified.DisableDedicatedCoresOverlapReclaimedCores)
-	require.True(t, unified.FillDefaultSharePoolWithNonReclaimCpus)
 }
 
 func TestValidateDedicatedReclaimDisjointTransport(t *testing.T) {
@@ -100,6 +98,7 @@ func TestAllocateByCPUAdvisorLegacyHardReclaimAliases(t *testing.T) {
 		require.NoError(t, err)
 		policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 		require.NoError(t, err)
+		policy.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 		policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
 
 		numa0CPU := topology.CPUDetails.CPUsInNUMANodes(0).ToSliceInt()[0]
@@ -662,6 +661,7 @@ func TestDynamicPolicyApplyBlocksMaterializesDefaultShareFromResidual(t *testing
 	require.NoError(t, err)
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 	require.NoError(t, err)
+	policy.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
 
 	policy.state.SetPodEntries(state.PodEntries{
 		commonstate.PoolNameReclaim: {
@@ -679,7 +679,6 @@ func TestDynamicPolicyApplyBlocksMaterializesDefaultShareFromResidual(t *testing
 	}, false)
 
 	resp := &advisorapi.ListAndWatchResponse{
-		FillDefaultSharePoolWithNonReclaimCpus: true,
 		Entries: map[string]*advisorapi.CalculationEntries{
 			commonstate.PoolNameShare: {
 				Entries: map[string]*advisorapi.CalculationInfo{
@@ -727,49 +726,161 @@ func TestDynamicPolicyApplyBlocksMaterializesDefaultShareFromResidual(t *testing
 
 	pending, err := policy.applyBlocks(blockCPUSet, resp, false)
 	require.NoError(t, err)
-	require.Equal(t, state.DefaultShareMaterializationState{Enabled: true, AdvisedQuantity: 7},
-		pending.defaultShareMaterializationState)
 	share := pending.entries[commonstate.PoolNameShare][commonstate.FakedContainerName].AllocationResult
 	require.True(t, share.Equals(machine.NewCPUSet(2, 3, 4, 5, 6, 7)),
 		"actual residual may be smaller than advisor quantity and must replace the block cpuset, got %s", share)
 }
 
-func TestDynamicPolicyApplyBlocksClearsDefaultShareStateWhenAdviceDisabled(t *testing.T) {
+func TestDynamicPolicyApplyBlocksRejectsEmptyDefaultShareResidual(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
 	require.NoError(t, err)
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 	require.NoError(t, err)
+	policy.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
 
-	entries := state.PodEntries{
+	previousShare := machine.NewCPUSet(2, 3)
+	policy.state.SetPodEntries(state.PodEntries{
+		commonstate.PoolNameShare: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+				AllocationResult: previousShare.Clone(),
+			},
+		},
 		commonstate.PoolNameReclaim: {
 			commonstate.FakedContainerName: &state.AllocationInfo{
 				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
-				AllocationResult: machine.NewCPUSet(0, 1),
+				AllocationResult: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
 			},
 		},
-	}
-	machineState, err := generateMachineStateFromPodEntries(policy.machineInfo.CPUTopology, entries, policy.state.GetMachineState())
-	require.NoError(t, err)
-	require.NoError(t, policy.state.CommitAdvisorState(
-		entries,
-		machineState,
-		false,
-		false,
-		false,
-		state.DefaultShareMaterializationState{Enabled: true, AdvisedQuantity: 6},
-	))
+	}, false)
 
 	resp := &advisorapi.ListAndWatchResponse{
 		Entries: map[string]*advisorapi.CalculationEntries{
+			commonstate.PoolNameShare: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameShare,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "share", Result: 1}},
+							},
+						},
+					},
+				},
+			},
 			commonstate.PoolNameReclaim: {
 				Entries: map[string]*advisorapi.CalculationInfo{
 					commonstate.FakedContainerName: {
 						OwnerPoolName: commonstate.PoolNameReclaim,
 						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
 							commonstate.FakedNUMAID: {
-								Blocks: []*advisorapi.Block{{BlockId: "reclaim", Result: 2}},
+								Blocks: []*advisorapi.Block{{BlockId: "reclaim", Result: 8}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	blockCPUSet := advisorapi.BlockCPUSet{
+		"share":   machine.NewCPUSet(0),
+		"reclaim": machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
+	}
+
+	pending, err := policy.applyBlocks(blockCPUSet, resp, false)
+	require.Nil(t, pending)
+	require.ErrorContains(t, err, "default share residual is empty")
+	currentShare := policy.state.GetPodEntries()[commonstate.PoolNameShare][commonstate.FakedContainerName].AllocationResult
+	require.True(t, currentShare.Equals(previousShare), "rejected update changed current share, got %s", currentShare.String())
+}
+
+func TestValidateEmptyRampUpCPUReuseRejectsOverlapWithHardReclaimFloor(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                 string
+		hardPartitionEnabled bool
+		oldAllocation        machine.CPUSet
+		reclaimFloor         machine.CPUSet
+		wantErr              string
+	}{
+		{
+			name:                 "hard partition disabled allows legacy reuse",
+			hardPartitionEnabled: false,
+			oldAllocation:        machine.NewCPUSet(1, 2),
+			reclaimFloor:         machine.NewCPUSet(2, 3),
+		},
+		{
+			name:                 "hard partition enabled allows disjoint reuse",
+			hardPartitionEnabled: true,
+			oldAllocation:        machine.NewCPUSet(1, 2),
+			reclaimFloor:         machine.NewCPUSet(3, 4),
+		},
+		{
+			name:                 "hard partition enabled rejects overlapping reuse",
+			hardPartitionEnabled: true,
+			oldAllocation:        machine.NewCPUSet(1, 2),
+			reclaimFloor:         machine.NewCPUSet(2, 3),
+			wantErr:              "overlaps reclaim hard floor",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := validateEmptyRampUpCPUReuse(tt.hardPartitionEnabled, tt.oldAllocation, tt.reclaimFloor)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestDynamicPolicyApplyBlocksRejectsEmptyDefaultShareWithoutPreviousPool(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	policy.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+
+	policy.state.SetPodEntries(state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
+			},
+		},
+	}, false)
+
+	resp := &advisorapi.ListAndWatchResponse{
+		Entries: map[string]*advisorapi.CalculationEntries{
+			commonstate.PoolNameShare: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameShare,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "share", Result: 1}},
+							},
+						},
+					},
+				},
+			},
+			commonstate.PoolNameReclaim: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameReclaim,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "reclaim", Result: 8}},
 							},
 						},
 					},
@@ -778,11 +889,11 @@ func TestDynamicPolicyApplyBlocksClearsDefaultShareStateWhenAdviceDisabled(t *te
 		},
 	}
 
-	pending, err := policy.applyBlocks(advisorapi.BlockCPUSet{
-		"reclaim": machine.NewCPUSet(0, 1),
+	_, err = policy.applyBlocks(advisorapi.BlockCPUSet{
+		"share":   machine.NewCPUSet(0),
+		"reclaim": machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
 	}, resp, false)
-	require.NoError(t, err)
-	require.Equal(t, state.DefaultShareMaterializationState{}, pending.defaultShareMaterializationState)
+	require.ErrorContains(t, err, "default share residual is empty")
 }
 
 func TestDynamicPolicyApplyBlocksRejectsDefaultShareResidualLargerThanAdviceAtomically(t *testing.T) {
@@ -792,6 +903,7 @@ func TestDynamicPolicyApplyBlocksRejectsDefaultShareResidualLargerThanAdviceAtom
 	require.NoError(t, err)
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 	require.NoError(t, err)
+	policy.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
 
 	policy.state.SetPodEntries(state.PodEntries{
 		commonstate.PoolNameReclaim: {
@@ -806,7 +918,6 @@ func TestDynamicPolicyApplyBlocksRejectsDefaultShareResidualLargerThanAdviceAtom
 	initialRevision := policy.state.GetRevision()
 
 	resp := &advisorapi.ListAndWatchResponse{
-		FillDefaultSharePoolWithNonReclaimCpus: true,
 		Entries: map[string]*advisorapi.CalculationEntries{
 			commonstate.PoolNameShare: {
 				Entries: map[string]*advisorapi.CalculationInfo{
@@ -898,6 +1009,7 @@ func TestDefaultShareEligibleCPUSetUsesCurrentMachineStateGuards(t *testing.T) {
 	policy.reservedCPUs = machine.NewCPUSet(0)
 	policy.reservedReclaimedCPUSet = machine.NewCPUSet(4, 5)
 	policy.reservedReclaimedCPUsSize = 2
+	policy.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
 
 	entries := state.PodEntries{
@@ -949,13 +1061,12 @@ func (s *advisorCommitRecordingState) CommitAdvisorState(
 	allowOverlap bool,
 	disableDedicatedOverlap bool,
 	persist bool,
-	defaultShareMaterializationState state.DefaultShareMaterializationState,
 ) error {
 	s.calls++
 	if s.err != nil {
 		return s.err
 	}
-	return s.State.CommitAdvisorState(entries, machineState, allowOverlap, disableDedicatedOverlap, persist, defaultShareMaterializationState)
+	return s.State.CommitAdvisorState(entries, machineState, allowOverlap, disableDedicatedOverlap, persist)
 }
 
 func (s *advisorCommitRecordingState) CommitAdvisorStateIfRevision(
@@ -965,13 +1076,12 @@ func (s *advisorCommitRecordingState) CommitAdvisorStateIfRevision(
 	allowOverlap bool,
 	disableDedicatedOverlap bool,
 	persist bool,
-	defaultShareMaterializationState state.DefaultShareMaterializationState,
 ) error {
 	s.calls++
 	if s.err != nil {
 		return s.err
 	}
-	return s.State.CommitAdvisorStateIfRevision(expectedRevision, entries, machineState, allowOverlap, disableDedicatedOverlap, persist, defaultShareMaterializationState)
+	return s.State.CommitAdvisorStateIfRevision(expectedRevision, entries, machineState, allowOverlap, disableDedicatedOverlap, persist)
 }
 
 func (s *advisorCommitGuardState) CommitAdvisorState(
@@ -980,7 +1090,6 @@ func (s *advisorCommitGuardState) CommitAdvisorState(
 	bool,
 	bool,
 	bool,
-	state.DefaultShareMaterializationState,
 ) error {
 	s.unconditionalCommitCalls++
 	return fmt.Errorf("advisor applyBlocks must use CommitAdvisorStateIfRevision")
@@ -993,11 +1102,10 @@ func (s *advisorCommitGuardState) CommitAdvisorStateIfRevision(
 	allowOverlap bool,
 	disableDedicatedOverlap bool,
 	persist bool,
-	defaultShareMaterializationState state.DefaultShareMaterializationState,
 ) error {
 	s.conditionalCommitCalls++
 	s.conditionalRevision = expectedRevision
-	return s.State.CommitAdvisorStateIfRevision(expectedRevision, entries, machineState, allowOverlap, disableDedicatedOverlap, persist, defaultShareMaterializationState)
+	return s.State.CommitAdvisorStateIfRevision(expectedRevision, entries, machineState, allowOverlap, disableDedicatedOverlap, persist)
 }
 
 func (s *staleAdvisorCommitState) CommitAdvisorStateIfRevision(
@@ -1007,7 +1115,6 @@ func (s *staleAdvisorCommitState) CommitAdvisorStateIfRevision(
 	allowOverlap bool,
 	disableDedicatedOverlap bool,
 	persist bool,
-	defaultShareMaterializationState state.DefaultShareMaterializationState,
 ) error {
 	if !s.injected {
 		s.injected = true
@@ -1015,7 +1122,7 @@ func (s *staleAdvisorCommitState) CommitAdvisorStateIfRevision(
 			!s.State.GetAllowSharedCoresOverlapReclaimedCores(), false)
 	}
 	return s.State.CommitAdvisorStateIfRevision(
-		expectedRevision, entries, machineState, allowOverlap, disableDedicatedOverlap, persist, defaultShareMaterializationState)
+		expectedRevision, entries, machineState, allowOverlap, disableDedicatedOverlap, persist)
 }
 
 func TestDynamicPolicy_checkAndApplyIfCgroupV1(t *testing.T) {
@@ -1646,6 +1753,7 @@ func TestDynamicPolicyApplyBlocksRejectsHardPartitionInvalidatedByBulkheadPaddin
 	require.NoError(t, err)
 
 	dynamicConf := policy.dynamicConfig.GetDynamicConfiguration()
+	dynamicConf.EnableReclaim = true
 	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.EnableRampUpReclaimHardPartition = true
 	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.Enable = true
 	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.NonReclaimPoolMinSize = 4
@@ -1730,6 +1838,7 @@ func TestAllocateByCPUAdvisorValidatesProspectiveHardPartitionBeforeSideEffects(
 			policy.advisorPostCommitCheckpointDir = checkpointDir
 
 			dynamicConf := policy.dynamicConfig.GetDynamicConfiguration()
+			dynamicConf.EnableReclaim = true
 			dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.EnableRampUpReclaimHardPartition = true
 			dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.Enable = true
 			dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.NonReclaimPoolMinSize = tc.minSize
