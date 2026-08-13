@@ -36,6 +36,7 @@ For example, `reclaim=2,shared=4` becomes
 
 ```go
 type ExplicitValue[T any] struct {
+	noCopy noCopy
 	Value T
 	flags []*pflag.Flag
 }
@@ -45,7 +46,11 @@ type ExplicitValue[T any] struct {
 registration, and `Changed()` returns true when any retained flag was
 explicitly set. Tracking an unknown flag panics because it indicates a
 programming error in flag registration; silently ignoring it could bypass
-validation. The zero value is usable without a constructor.
+validation. The zero value is usable without a constructor. The embedded
+standard `noCopy` marker lets `go vet` reject accidental value copies:
+`ExplicitValue[T]` must not be copied after the first `TrackFlag` call because
+the copy would retain flag pointers while its exported `Value` could diverge
+from the storage registered with pflag.
 
 `CPUPluginOptions` owns startup defaults through
 `ExplicitValue[int64]`. It registers the embedded value with pflag's native
@@ -92,6 +97,8 @@ Core tests cover:
 
 - `ExplicitValue[T]` zero-registration, single-registration, and
   multi-registration semantics;
+- a temporary vet probe demonstrates that copying after `TrackFlag` is
+  reported by the `copylocks` analyzer; the probe is not retained;
 - unknown flag tracking panics;
 - both flags are registered;
 - valid scalar and StringToInt64 values reach the typed configuration;

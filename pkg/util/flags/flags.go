@@ -41,11 +41,26 @@ const (
 
 var _ pflag.Value = &ReservedMemoryVar{}
 
+// noCopy may be embedded into structs which must not be copied after first use.
+// See https://golang.org/issues/8005#issuecomment-190753527.
+type noCopy struct{}
+
+// Lock is a no-op used by go vet's copylocks checker.
+func (*noCopy) Lock() {}
+
+// Unlock is a no-op used by go vet's copylocks checker.
+func (*noCopy) Unlock() {}
+
+// ExplicitValue retains native pflag registrations to report whether its value
+// was explicitly configured. It must not be copied after TrackFlag is called.
 type ExplicitValue[T any] struct {
-	Value T
-	flags []*pflag.Flag
+	noCopy noCopy
+	Value  T
+	flags  []*pflag.Flag
 }
 
+// TrackFlag retains a native pflag registration. The receiver must not be
+// copied after this method is called.
 func (v *ExplicitValue[T]) TrackFlag(fs *pflag.FlagSet, name string) {
 	flag := fs.Lookup(name)
 	if flag == nil {

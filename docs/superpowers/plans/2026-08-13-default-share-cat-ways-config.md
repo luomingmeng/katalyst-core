@@ -728,3 +728,46 @@ without amending prior history.
 
 Observed before commit: all commands passed, gofmt produced no diff, and
 self-review found no P0-P2 defects.
+
+### Task 9: Review P2 — prevent copying tracked explicit values
+
+**Files:**
+- Modify: `pkg/util/flags/flags.go`
+- Modify: `docs/superpowers/specs/2026-08-13-default-share-cat-ways-config-design.md`
+- Modify: `docs/superpowers/plans/2026-08-13-default-share-cat-ways-config.md`
+
+- [x] **Step 1: Add a temporary vet probe and verify the gap**
+
+Create a temporary test file that registers an `ExplicitValue[int64]`, calls
+`TrackFlag`, and then copies the value. Run:
+
+```bash
+go vet ./pkg/util/flags
+```
+
+Observed before the fix: PASS with no diagnostics, proving that vet did not
+detect copying an already tracked value.
+
+- [x] **Step 2: Add the standard noCopy marker and document the contract**
+
+Embed a local `noCopy` marker with no-op `Lock` and `Unlock` methods in
+`ExplicitValue[T]`. Document on both `ExplicitValue` and `TrackFlag` that the
+value must not be copied after `TrackFlag` is called.
+
+- [x] **Step 3: Re-run the unchanged probe and verify copylocks**
+
+Run the Step 1 command again before deleting the temporary file.
+
+Observed after the fix: FAIL with `assignment copies lock value` diagnostics
+from the `copylocks` analyzer for the copied `ExplicitValue[int64]`. Delete the
+probe after recording the result.
+
+- [x] **Step 4: Verify, self-review, and commit atomically**
+
+Run the utility and QRM tests, focused race test, focused vet, gofmt, and
+`git diff --check`; inspect the final diff, then create a new atomic commit
+without amending prior history.
+
+Observed before commit: utility and QRM tests, focused race test, focused vet,
+gofmt, and `git diff --check` all passed. The temporary probe was absent from
+the final diff, and self-review found no additional P0-P2 defects.
