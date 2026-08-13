@@ -165,6 +165,10 @@ func TestQRMPluginOptions_ParseBulkheadCATWays(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("failed to parse flags: %v", err)
 	}
+	wantClosCATWays := map[string]int64{"reclaim": 2, "shared": 3}
+	if !reflect.DeepEqual(options.BulkheadClosCATWays, wantClosCATWays) {
+		t.Fatalf("BulkheadClosCATWays = %v, want %v", options.BulkheadClosCATWays, wantClosCATWays)
+	}
 
 	config := qrm.NewQRMPluginConfiguration()
 	if err := options.ApplyTo(config); err != nil {
@@ -174,9 +178,29 @@ func TestQRMPluginOptions_ParseBulkheadCATWays(t *testing.T) {
 	if rdt.DefaultCATWays != 4 {
 		t.Fatalf("DefaultCATWays = %d, want 4", rdt.DefaultCATWays)
 	}
-	wantClosCATWays := map[string]int64{"reclaim": 2, "shared": 3}
 	if !reflect.DeepEqual(rdt.ClosCATWays, wantClosCATWays) {
 		t.Fatalf("ClosCATWays = %v, want %v", rdt.ClosCATWays, wantClosCATWays)
+	}
+	options.BulkheadClosCATWays["reclaim"] = 9
+	if rdt.ClosCATWays["reclaim"] != 2 {
+		t.Fatalf("ClosCATWays aliases options map: reclaim = %d, want 2", rdt.ClosCATWays["reclaim"])
+	}
+}
+
+func TestQRMPluginOptions_ParseInvalidBulkheadClosCATWays(t *testing.T) {
+	t.Parallel()
+
+	options := NewQRMPluginOptions()
+	fss := &cliflag.NamedFlagSets{}
+	options.AddFlags(fss)
+
+	fs := fss.FlagSet("qrm-cpu-plugin")
+	fs.Init("qrm-cpu-plugin", pflag.ContinueOnError)
+	err := fs.Parse(
+		[]string{"--bulkhead-clos-cat-ways=reclaim=invalid"},
+	)
+	if err == nil {
+		t.Fatal("Parse succeeded, want non-integer error")
 	}
 }
 
@@ -203,75 +227,19 @@ func TestQRMPluginOptions_ParseExplicitZeroBulkheadDefaultCATWays(t *testing.T) 
 	}
 }
 
-func TestExplicitInt64Value_RepeatedParseMatchesPflagInt64Value(t *testing.T) {
-	t.Parallel()
-
-	for _, tc := range []struct {
-		name         string
-		raw          string
-		wantApplyErr bool
-	}{
-		{name: "invalid", raw: "invalid", wantApplyErr: true},
-		{name: "overflow", raw: "9223372036854775808"},
-	} {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			var pflagValue int64
-			pflagSet := pflag.NewFlagSet("pflag", pflag.ContinueOnError)
-			pflagSet.Int64Var(&pflagValue, "value", 0, "")
-
-			options := NewCPUPluginOptions()
-			value := &explicitInt64Value{
-				value: &options.BulkheadDefaultCATWays,
-				set:   &options.bulkheadDefaultCATWaysSet,
-			}
-
-			if err := pflagSet.Set("value", "7"); err != nil {
-				t.Fatalf("pflag initial Set failed: %v", err)
-			}
-			if err := value.Set("7"); err != nil {
-				t.Fatalf("explicitInt64Value initial Set failed: %v", err)
-			}
-			if err := pflagSet.Set("value", tc.raw); err == nil {
-				t.Fatal("pflag repeated Set succeeded, want error")
-			}
-			if err := value.Set(tc.raw); err == nil {
-				t.Fatal("explicitInt64Value repeated Set succeeded, want error")
-			}
-			if options.BulkheadDefaultCATWays != pflagValue {
-				t.Fatalf("explicitInt64Value = %d, pflag Int64Value = %d", options.BulkheadDefaultCATWays, pflagValue)
-			}
-			if !options.bulkheadDefaultCATWaysSet {
-				t.Fatal("explicitInt64Value set marker = false after successful initial Set")
-			}
-
-			err := options.ApplyTo(qrm.NewCPUPluginConfiguration())
-			if tc.wantApplyErr && err == nil {
-				t.Fatal("ApplyTo succeeded after ignored parse error, want error")
-			}
-			if !tc.wantApplyErr && err != nil {
-				t.Fatalf("ApplyTo failed after ignored parse error: %v", err)
-			}
-		})
-	}
-}
-
 func TestQRMPluginOptions_ValidateBulkheadCATWays(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
 		name            string
 		defaultCATWays  int64
-		closCATWays     map[string]string
+		closCATWays     map[string]int64
 		wantErrContains string
 	}{
 		{name: "negative default", defaultCATWays: -1, wantErrContains: "bulkhead-default-cat-ways must be positive"},
-		{name: "empty clos", closCATWays: map[string]string{"": "2"}, wantErrContains: "bulkhead-clos-cat-ways contains an empty clos"},
-		{name: "non integer", closCATWays: map[string]string{"reclaim": "x"}, wantErrContains: "invalid bulkhead-clos-cat-ways value"},
-		{name: "zero ways", closCATWays: map[string]string{"reclaim": "0"}, wantErrContains: "bulkhead-clos-cat-ways value must be positive"},
-		{name: "negative ways", closCATWays: map[string]string{"reclaim": "-1"}, wantErrContains: "bulkhead-clos-cat-ways value must be positive"},
+		{name: "empty clos", closCATWays: map[string]int64{"": 2}, wantErrContains: "bulkhead-clos-cat-ways contains an empty clos"},
+		{name: "zero ways", closCATWays: map[string]int64{"reclaim": 0}, wantErrContains: "bulkhead-clos-cat-ways value must be positive"},
+		{name: "negative ways", closCATWays: map[string]int64{"reclaim": -1}, wantErrContains: "bulkhead-clos-cat-ways value must be positive"},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {

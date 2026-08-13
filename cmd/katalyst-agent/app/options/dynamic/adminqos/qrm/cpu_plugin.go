@@ -18,8 +18,8 @@ package qrm
 
 import (
 	"fmt"
-	"strconv"
 
+	"github.com/spf13/pflag"
 	cliflag "k8s.io/component-base/cli/flag"
 
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic/adminqos/qrm"
@@ -38,31 +38,9 @@ type CPUPluginOptions struct {
 	EnableBulkheadSystemService      bool
 	BulkheadNonReclaimPoolMinSize    int64
 	BulkheadDefaultCATWays           int64
-	bulkheadDefaultCATWaysSet        bool
-	BulkheadClosCATWays              map[string]string
+	bulkheadDefaultCATWaysFlag       *pflag.Flag
+	BulkheadClosCATWays              map[string]int64
 	BindIRQToReclaimedPool           bool
-}
-
-type explicitInt64Value struct {
-	value *int64
-	set   *bool
-}
-
-func (v *explicitInt64Value) Set(raw string) error {
-	value, err := strconv.ParseInt(raw, 0, 64)
-	*v.value = value
-	if err == nil {
-		*v.set = true
-	}
-	return err
-}
-
-func (v *explicitInt64Value) String() string {
-	return strconv.FormatInt(*v.value, 10)
-}
-
-func (v *explicitInt64Value) Type() string {
-	return "int64"
 }
 
 func NewCPUPluginOptions() *CPUPluginOptions {
@@ -97,9 +75,10 @@ func (o *CPUPluginOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 		"if true, enable bulkhead system_service plugin.")
 	fs.Int64Var(&o.BulkheadNonReclaimPoolMinSize, "bulkhead-non-reclaim-pool-min-size", o.BulkheadNonReclaimPoolMinSize,
 		"minimum CPU count kept in the non-reclaim pool for bulkhead cpuset topology.")
-	fs.Var(&explicitInt64Value{value: &o.BulkheadDefaultCATWays, set: &o.bulkheadDefaultCATWaysSet}, "bulkhead-default-cat-ways",
+	fs.Int64Var(&o.BulkheadDefaultCATWays, "bulkhead-default-cat-ways", o.BulkheadDefaultCATWays,
 		"default CAT way count for non-root bulkhead CLOS groups.")
-	fs.StringToStringVar(&o.BulkheadClosCATWays, "bulkhead-clos-cat-ways", o.BulkheadClosCATWays,
+	o.bulkheadDefaultCATWaysFlag = fs.Lookup("bulkhead-default-cat-ways")
+	fs.StringToInt64Var(&o.BulkheadClosCATWays, "bulkhead-clos-cat-ways", o.BulkheadClosCATWays,
 		"per-CLOS CAT way counts in clos=ways format.")
 	fs.BoolVar(&o.BindIRQToReclaimedPool, "bind-irq-to-reclaimed-pool", o.BindIRQToReclaimedPool,
 		"if true and the reclaimed pool is present and non-empty, GetIRQForbiddenCores expands its result to "+
@@ -110,26 +89,24 @@ func (o *CPUPluginOptions) ApplyTo(c *qrm.CPUPluginConfiguration) error {
 	if o.InitialRampUpReclaimCPUSetRatio < 0 || o.InitialRampUpReclaimCPUSetRatio > 1 {
 		return fmt.Errorf("initial-ramp-up-reclaim-cpuset-ratio must be in [0,1], got %f", o.InitialRampUpReclaimCPUSetRatio)
 	}
-	if o.BulkheadDefaultCATWays < 0 || (o.bulkheadDefaultCATWaysSet && o.BulkheadDefaultCATWays == 0) {
+	defaultCATWaysChanged := o.bulkheadDefaultCATWaysFlag != nil &&
+		o.bulkheadDefaultCATWaysFlag.Changed
+	if o.BulkheadDefaultCATWays < 0 || (defaultCATWaysChanged && o.BulkheadDefaultCATWays == 0) {
 		return fmt.Errorf("bulkhead-default-cat-ways must be positive when configured, got %d", o.BulkheadDefaultCATWays)
 	}
 
 	var closCATWays map[string]int64
 	if o.BulkheadClosCATWays != nil {
 		closCATWays = make(map[string]int64, len(o.BulkheadClosCATWays))
-		for clos, rawWays := range o.BulkheadClosCATWays {
-			if clos == "" {
-				return fmt.Errorf("bulkhead-clos-cat-ways contains an empty clos")
-			}
-			ways, err := strconv.ParseInt(rawWays, 10, 64)
-			if err != nil {
-				return fmt.Errorf("invalid bulkhead-clos-cat-ways value %q for clos %q: must be an integer", rawWays, clos)
-			}
-			if ways <= 0 {
-				return fmt.Errorf("bulkhead-clos-cat-ways value must be positive for clos %q, got %d", clos, ways)
-			}
-			closCATWays[clos] = ways
+	}
+	for clos, ways := range o.BulkheadClosCATWays {
+		if clos == "" {
+			return fmt.Errorf("bulkhead-clos-cat-ways contains an empty clos")
 		}
+		if ways <= 0 {
+			return fmt.Errorf("bulkhead-clos-cat-ways value must be positive for clos %q, got %d", clos, ways)
+		}
+		closCATWays[clos] = ways
 	}
 
 	c.PreferUseExistNUMAHintResult = o.PreferUseExistNUMAHintResult

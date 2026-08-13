@@ -354,7 +354,7 @@ history.
 - Modify: `cmd/katalyst-agent/app/options/dynamic/adminqos/qrm/cpu_plugin.go`
 - Modify: `docs/superpowers/plans/2026-08-13-default-share-cat-ways-config.md`
 
-- [ ] **Step 1: Write failing native-type tests**
+- [x] **Step 1: Write failing native-type tests**
 
 Update the valid parsing assertion to require:
 
@@ -379,7 +379,7 @@ Keep the existing real-parse test proving that an omitted scalar accepts the
 compatible zero value while explicit `--bulkhead-default-cat-ways=0` fails in
 `ApplyTo`.
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run:
 
@@ -392,7 +392,7 @@ go test ./cmd/katalyst-agent/app/options/dynamic/adminqos/qrm \
 Expected: FAIL because `BulkheadClosCATWays` is still `map[string]string` and
 non-integer values currently fail in `ApplyTo` instead of flag parsing.
 
-- [ ] **Step 3: Use native pflag registrations**
+- [x] **Step 3: Use native pflag registrations**
 
 Change the option fields to:
 
@@ -415,7 +415,7 @@ fs.StringToInt64Var(&o.BulkheadClosCATWays, "bulkhead-clos-cat-ways", o.Bulkhead
 Delete `explicitInt64Value`, its parse-compatibility tests, and the no-longer
 needed `strconv` import.
 
-- [ ] **Step 4: Simplify `ApplyTo`**
+- [x] **Step 4: Simplify `ApplyTo`**
 
 Use pflag's explicit-set state:
 
@@ -452,7 +452,7 @@ Assign the copied `closCATWays` map to the dynamic configuration. This removes
 string parsing while preserving the existing no-alias boundary between
 options and runtime configuration.
 
-- [ ] **Step 5: Run tests and verify GREEN**
+- [x] **Step 5: Run tests and verify GREEN**
 
 Run:
 
@@ -466,7 +466,7 @@ go vet ./cmd/katalyst-agent/app/options/dynamic/adminqos/qrm
 
 Expected: PASS.
 
-- [ ] **Step 6: Format, inspect, and commit**
+- [x] **Step 6: Format, inspect, and commit**
 
 Run:
 
