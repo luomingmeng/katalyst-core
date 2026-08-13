@@ -1706,8 +1706,10 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloorAtRevision(
 	// rpPinnedCPUSet contains the pinned CPU sets for resource packages
 	rpPinnedCPUSet := machineState.GetResourcePackagePinnedCPUSet()
 
-	// 扣除不可被用户容器分配的 CPU。这里同时看本轮 entries 和 canonical state，
-	// 避免本轮快照缺失 system/forbidden pool 时，default share residual 与 advisor quantity 口径漂移。
+	// Subtract CPUs that cannot be assigned to user containers. Check both the
+	// current entries and canonical state so default-share residual accounting
+	// stays aligned with the advisor quantity when this snapshot misses system
+	// or forbidden pools.
 	notAllocatablePoolCPUs := p.getNotAllocatablePoolCPUs(entries)
 	availableCPUs = availableCPUs.Difference(notAllocatablePoolCPUs)
 	hardPartitionWithExplicitFloor := p.isRampUpReclaimHardPartitionEnabled() && !rampUpReclaimFloor.IsEmpty()

@@ -288,6 +288,51 @@ func TestGateAHardPartitionDefaultShareBaselineDoesNotSwallowReclaim(t *testing.
 	assertCPUSet(t, "reclaim numa 1", view.ReclaimEffectivePerNUMA[1], "6-7")
 }
 
+func TestGateAHardPartitionDefaultShareBaselineExcludesFixedOwners(t *testing.T) {
+	t.Parallel()
+
+	state := cpustate.NewCPUPluginState(nil)
+	state.SetAllowSharedCoresOverlapReclaimedCores(false)
+	state.SetAllocationInfo(commonstate.PoolNameReserve, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReserve),
+		AllocationResult: machine.NewCPUSet(0),
+	})
+	state.SetAllocationInfo(commonstate.PoolNameShare, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+		AllocationResult: machine.NewCPUSet(1, 2, 3, 4, 5, 6, 7),
+	})
+	state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+		AllocationResult: machine.NewCPUSet(2, 3, 6, 7),
+	})
+	state.SetAllocationInfo("isolation-0", commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta("isolation-0"),
+		AllocationResult: machine.NewCPUSet(4),
+	})
+	state.SetAllocationInfo("dedicated-pod", "main", &cpustate.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        "dedicated-pod",
+			ContainerName: "main",
+			OwnerPoolName: commonstate.PoolNameDedicated,
+			QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+		},
+		AllocationResult: machine.NewCPUSet(5),
+	})
+
+	view, err := BuildValidatedCPUSetPartitionView(state, testTwoNUMATopology(), CPUSetPartitionViewOptions{
+		HardPartitionEnabled: true,
+	})
+	if err != nil {
+		t.Fatalf("BuildValidatedCPUSetPartitionView() error = %v", err)
+	}
+
+	assertCPUSet(t, "default share excludes fixed owners", view.SharePool, "1")
+	assertCPUSet(t, "default share map excludes fixed owners", view.SharePoolMap[commonstate.PoolNameShare], "1")
+	assertCPUSet(t, "dedicated remains dedicated", view.Dedicated, "5")
+	assertCPUSet(t, "isolation remains isolated", view.Isolation, "4")
+	assertCPUSet(t, "reclaim effective", view.ReclaimEffective, "2-3,6-7")
+}
+
 func TestGateBSNBRampUpUsesDeclaredShareNUMAPoolForRDT(t *testing.T) {
 	t.Parallel()
 
