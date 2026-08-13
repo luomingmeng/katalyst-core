@@ -17,8 +17,6 @@ limitations under the License.
 package memory
 
 import (
-	"fmt"
-
 	"github.com/spf13/pflag"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/errors"
@@ -33,9 +31,8 @@ import (
 type MemoryAdvisorOptions struct {
 	MemoryHeadroomPolicyPriority []string
 	*headroom.MemoryHeadroomPolicyOptions
-	MemoryAdvisorPlugins    []string
-	MinCriticalWatermark    resource.QuantityValue
-	CriticalWatermarkSource string
+	MemoryAdvisorPlugins []string
+	MinCriticalWatermark resource.QuantityValue
 	*plugins.MemoryAdvisorPluginsOptions
 }
 
@@ -46,7 +43,6 @@ func NewMemoryAdvisorOptions() *MemoryAdvisorOptions {
 		MemoryHeadroomPolicyOptions:  headroom.NewMemoryHeadroomPolicyOptions(),
 		MemoryAdvisorPlugins:         []string{},
 		MinCriticalWatermark:         resource.QuantityValue{Quantity: resource.MustParse("4Gi")},
-		CriticalWatermarkSource:      "low",
 		MemoryAdvisorPluginsOptions:  plugins.NewMemoryAdvisorPluginsOptions(),
 	}
 }
@@ -59,9 +55,6 @@ func (o *MemoryAdvisorOptions) AddFlags(fs *pflag.FlagSet) {
 	fs.StringSliceVar(&o.MemoryAdvisorPlugins, "memory-advisor-plugins", o.MemoryAdvisorPlugins,
 		"memory advisor plugins to use.")
 	fs.Var(&o.MinCriticalWatermark, "memory-advisor-min-critical-watermark", "min watermark to trigger reclaim")
-	fs.StringVar(&o.CriticalWatermarkSource, "memory-advisor-critical-watermark-source",
-		o.CriticalWatermarkSource,
-		`which zoneinfo watermark memoryGuard uses as the per-NUMA critical baseline. One of "low", "high".`)
 	o.MemoryAdvisorPluginsOptions.AddFlags(fs)
 }
 
@@ -74,13 +67,6 @@ func (o *MemoryAdvisorOptions) ApplyTo(c *memory.MemoryAdvisorConfiguration) err
 		c.MemoryAdvisorPlugins = append(c.MemoryAdvisorPlugins, types.MemoryAdvisorPluginName(plugin))
 	}
 	c.MinCriticalWatermark = o.MinCriticalWatermark.Value()
-
-	switch o.CriticalWatermarkSource {
-	case "", "low", "high":
-		c.CriticalWatermarkSource = o.CriticalWatermarkSource
-	default:
-		return fmt.Errorf("invalid --memory-advisor-critical-watermark-source %q, want \"low\" or \"high\"", o.CriticalWatermarkSource)
-	}
 
 	var errList []error
 	errList = append(errList, o.MemoryHeadroomPolicyOptions.ApplyTo(c.MemoryHeadroomPolicyConfiguration))

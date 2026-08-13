@@ -22,11 +22,13 @@ import (
 
 	"go.uber.org/atomic"
 
+	configv1alpha1 "github.com/kubewharf/katalyst-api/pkg/apis/config/v1alpha1"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/memory/dynamicpolicy/memoryadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/metacache"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/plugin/qosaware/resource/helper"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
 	"github.com/kubewharf/katalyst-core/pkg/config"
+	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
@@ -90,13 +92,13 @@ func (mg *memoryGuard) Reconcile(status *types.MemoryPressureStatus) error {
 
 	zoneInfos := machine.GetNormalZoneInfo(defaultProcZoneInfoFile)
 
-	err := mg.updateNonActualNUMABindingReclaimMemoryLimit(zoneInfos)
+	err := mg.updateNonActualNUMABindingReclaimMemoryLimit(dynamicConfig, zoneInfos)
 	if err != nil {
 		general.ErrorS(err, "Update non-actual numa binding reclaim memory limit failed")
 		return err
 	}
 
-	err = mg.updateActualNUMABindingReclaimMemoryLimit(zoneInfos)
+	err = mg.updateActualNUMABindingReclaimMemoryLimit(dynamicConfig, zoneInfos)
 	if err != nil {
 		general.ErrorS(err, "Update actual numa binding reclaim memory limit failed")
 		return err
@@ -164,7 +166,7 @@ func (mg *memoryGuard) GetAdvices() types.InternalMemoryCalculationResult {
 	return result
 }
 
-func (mg *memoryGuard) calculateReclaimedMemoryLimitFor(numaID int, reclaimedCgroupPaths []string, zoneInfos []machine.NormalZoneInfo) (float64, error) {
+func (mg *memoryGuard) calculateReclaimedMemoryLimitFor(dynamicConfig *dynamicconfig.Configuration, numaID int, reclaimedCgroupPaths []string, zoneInfos []machine.NormalZoneInfo) (float64, error) {
 	watermarkScaleFactor, err := mg.metaServer.GetNodeMetric(consts.MetricMemScaleFactorSystem)
 	if err != nil {
 		general.ErrorS(err, "Can not get system watermark scale factor")
@@ -205,15 +207,11 @@ func (mg *memoryGuard) calculateReclaimedMemoryLimitFor(numaID int, reclaimedCgr
 	}
 	if found {
 		numaFree = float64(zoneInfo.Free) * float64(mg.metaServer.KatalystMachineInfo.PageSize)
-		// watermark pages can either be taken from low or high depending on the config
-		watermarkPages := zoneInfo.Low
-		if mg.conf.CriticalWatermarkSource == "high" {
-			watermarkPages = zoneInfo.High
-		}
+		watermarkPages := getCriticalWatermarkPages(&zoneInfo, dynamicConfig.CriticalWatermarkSource)
 		criticalWatermark = float64(watermarkPages) * float64(mg.metaServer.KatalystMachineInfo.PageSize)
 	}
 
-	criticalWatermarkScaleFactor := mg.conf.GetDynamicConfiguration().CriticalWatermarkScaleFactor
+	criticalWatermarkScaleFactor := dynamicConfig.CriticalWatermarkScaleFactor
 	criticalWatermark *= criticalWatermarkScaleFactor
 
 	criticalWatermark = math.Max(float64(mg.minCriticalWatermark), criticalWatermark)
@@ -221,7 +219,7 @@ func (mg *memoryGuard) calculateReclaimedMemoryLimitFor(numaID int, reclaimedCgr
 		math.Max(numaFree-criticalWatermark, 0)
 
 	// clamp the reclaimMemory limit to the max ratio of total memory in this NUMA
-	reclaimedMemoryMaxRatio := mg.conf.GetDynamicConfiguration().ReclaimedMemoryMaxRatio
+	reclaimedMemoryMaxRatio := dynamicConfig.ReclaimedMemoryMaxRatio
 	if reclaimedMemoryMaxRatio > 0 {
 		reclaimMemoryLimit = math.Min(reclaimMemoryLimit, reclaimedMemoryMaxRatio*numaTotal)
 	}
@@ -237,7 +235,14 @@ func (mg *memoryGuard) calculateReclaimedMemoryLimitFor(numaID int, reclaimedCgr
 	return reclaimMemoryLimit, nil
 }
 
-func (mg *memoryGuard) updateNonActualNUMABindingReclaimMemoryLimit(zoneInfos []machine.NormalZoneInfo) error {
+func getCriticalWatermarkPages(zoneInfo *machine.NormalZoneInfo, source configv1alpha1.CriticalWatermarkSource) uint64 {
+	if source == configv1alpha1.CriticalWatermarkSourceHigh {
+		return zoneInfo.High
+	}
+	return zoneInfo.Low
+}
+
+func (mg *memoryGuard) updateNonActualNUMABindingReclaimMemoryLimit(dynamicConfig *dynamicconfig.Configuration, zoneInfos []machine.NormalZoneInfo) error {
 	reclaimMemoryLimit := .0
 	availNUMAs, _, err := helper.GetAvailableNUMAsAndReclaimedCores(mg.conf, mg.metaReader, mg.metaServer)
 	if err != nil {
@@ -253,7 +258,7 @@ func (mg *memoryGuard) updateNonActualNUMABindingReclaimMemoryLimit(zoneInfos []
 	// cgroup on this NUMA; the NUMA-level free-memory cushion is shared
 	// across parents and counted once per NUMA by the helper.
 	for _, numaID := range availNUMAs.Difference(actualNUMABindingNUMAs).ToSliceInt() {
-		limit, err := mg.calculateReclaimedMemoryLimitFor(numaID, mg.reclaimRelativeRootCgroupPaths, zoneInfos)
+		limit, err := mg.calculateReclaimedMemoryLimitFor(dynamicConfig, numaID, mg.reclaimRelativeRootCgroupPaths, zoneInfos)
 		if err != nil {
 			return err
 		}
@@ -265,7 +270,7 @@ func (mg *memoryGuard) updateNonActualNUMABindingReclaimMemoryLimit(zoneInfos []
 	return nil
 }
 
-func (mg *memoryGuard) updateActualNUMABindingReclaimMemoryLimit(zoneInfos []machine.NormalZoneInfo) error {
+func (mg *memoryGuard) updateActualNUMABindingReclaimMemoryLimit(dynamicConfig *dynamicconfig.Configuration, zoneInfos []machine.NormalZoneInfo) error {
 	limits := make(map[int]int64, len(mg.metaServer.Topology))
 
 	for _, numaID := range mg.metaServer.CPUDetails.NUMANodes().ToSliceNoSortInt() {
@@ -274,7 +279,7 @@ func (mg *memoryGuard) updateActualNUMABindingReclaimMemoryLimit(zoneInfos []mac
 			continue
 		}
 
-		limit, err := mg.calculateReclaimedMemoryLimitFor(numaID, cgroupPaths, zoneInfos)
+		limit, err := mg.calculateReclaimedMemoryLimitFor(dynamicConfig, numaID, cgroupPaths, zoneInfos)
 		if err != nil {
 			return err
 		}

@@ -28,10 +28,6 @@ type MemoryAdvisorConfiguration struct {
 	*headroom.MemoryHeadroomPolicyConfiguration
 	MemoryAdvisorPlugins []types.MemoryAdvisorPluginName
 	MinCriticalWatermark int64
-	// CriticalWatermarkSource selects which /proc/zoneinfo watermark
-	// memoryGuard uses as the per-NUMA critical watermark baseline.
-	// Valid values: "low" (default), "high".
-	CriticalWatermarkSource string
 	*plugins.MemoryAdvisorPluginsConfiguration
 }
 
