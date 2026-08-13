@@ -481,6 +481,205 @@ git add cmd/katalyst-agent/app/options/dynamic/adminqos/qrm/cpu_plugin.go \
 git commit -m "refactor(qrm): use native pflag CAT ways values"
 ```
 
+### Task 7: Add generic explicit-value flag tracking
+
+**Files:**
+- Modify: `pkg/util/flags/flags.go`
+- Modify: `pkg/util/flags/flags_test.go`
+
+- [ ] **Step 1: Write failing generic utility tests**
+
+Add tests for the zero value, a single registration, multiple registrations,
+generic string usage, and missing flag panic:
+
+```go
+func TestExplicitValue(t *testing.T) {
+	t.Run("zero value", func(t *testing.T) {
+		var value ExplicitValue[int64]
+		if value.Value != 0 || value.Changed() {
+			t.Fatalf("zero ExplicitValue = (%d, %v), want (0, false)",
+				value.Value, value.Changed())
+		}
+	})
+
+	t.Run("multiple registrations", func(t *testing.T) {
+		var value ExplicitValue[int64]
+		first := pflag.NewFlagSet("first", pflag.ContinueOnError)
+		second := pflag.NewFlagSet("second", pflag.ContinueOnError)
+		first.Int64Var(&value.Value, "value", value.Value, "")
+		value.TrackFlag(first, "value")
+		second.Int64Var(&value.Value, "value", value.Value, "")
+		value.TrackFlag(second, "value")
+		if err := first.Parse([]string{"--value=7"}); err != nil {
+			t.Fatalf("Parse failed: %v", err)
+		}
+		if !value.Changed() || value.Value != 7 {
+			t.Fatalf("ExplicitValue = (%d, %v), want (7, true)",
+				value.Value, value.Changed())
+		}
+	})
+}
+```
+
+Use `ExplicitValue[string]` in a separate subtest to prove the helper is not
+numeric-specific. Add a panic assertion for
+`value.TrackFlag(fs, "missing")`.
+
+- [ ] **Step 2: Run tests and verify RED**
+
+Run:
+
+```bash
+go test ./pkg/util/flags -run TestExplicitValue -count=1
+```
+
+Expected: FAIL because `ExplicitValue` is undefined.
+
+- [ ] **Step 3: Implement the minimal generic utility**
+
+Add:
+
+```go
+type ExplicitValue[T any] struct {
+	Value T
+	flags []*pflag.Flag
+}
+
+func (v *ExplicitValue[T]) TrackFlag(fs *pflag.FlagSet, name string) {
+	flag := fs.Lookup(name)
+	if flag == nil {
+		panic(fmt.Sprintf("flag %q is not registered", name))
+	}
+	v.flags = append(v.flags, flag)
+}
+
+func (v *ExplicitValue[T]) Changed() bool {
+	for _, flag := range v.flags {
+		if flag.Changed {
+			return true
+		}
+	}
+	return false
+}
+```
+
+The panic message remains lower-case and the zero value needs no constructor.
+
+- [ ] **Step 4: Run utility tests and verify GREEN**
+
+Run:
+
+```bash
+go test ./pkg/util/flags -count=1
+go test -race ./pkg/util/flags -count=1
+go vet ./pkg/util/flags
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Format and commit the utility**
+
+Run:
+
+```bash
+gofmt -w pkg/util/flags/flags.go pkg/util/flags/flags_test.go
+git diff --check
+git add pkg/util/flags/flags.go pkg/util/flags/flags_test.go
+git commit -m "feat(flags): add generic explicit values"
+```
+
+### Task 8: Use ExplicitValue for default CAT ways
+
+**Files:**
+- Modify: `cmd/katalyst-agent/app/options/dynamic/adminqos/qrm/cpu_plugin.go`
+- Modify: `cmd/katalyst-agent/app/options/dynamic/adminqos/qrm/qrm_base_test.go`
+- Modify: `docs/superpowers/plans/2026-08-13-default-share-cat-ways-config.md`
+
+- [ ] **Step 1: Write the failing QRM integration change**
+
+Change test assignments and assertions to use:
+
+```go
+options.BulkheadDefaultCATWays.Value = tc.defaultCATWays
+```
+
+Keep the existing omitted-zero, explicit-zero, positive parsing, and multiple
+`NamedFlagSets` tests. Run them before changing the implementation.
+
+- [ ] **Step 2: Run tests and verify RED**
+
+Run:
+
+```bash
+go test ./cmd/katalyst-agent/app/options/dynamic/adminqos/qrm \
+  -run 'TestQRMPluginOptions_(ParseBulkheadCATWays|ParseExplicitZeroBulkheadDefaultCATWays|ValidateBulkheadCATWays)' \
+  -count=1
+```
+
+Expected: FAIL because `BulkheadDefaultCATWays` is still `int64` and has no
+`Value` field.
+
+- [ ] **Step 3: Replace the local tracking fields**
+
+Change:
+
+```go
+BulkheadDefaultCATWays      utilflag.ExplicitValue[int64]
+```
+
+Register and track:
+
+```go
+fs.Int64Var(&o.BulkheadDefaultCATWays.Value, "bulkhead-default-cat-ways",
+	o.BulkheadDefaultCATWays.Value,
+	"default CAT way count for non-root bulkhead CLOS groups.")
+o.BulkheadDefaultCATWays.TrackFlag(fs, "bulkhead-default-cat-ways")
+```
+
+Delete `bulkheadDefaultCATWaysFlags` and the local loop over `*pflag.Flag`.
+Use:
+
+```go
+defaultCATWays := o.BulkheadDefaultCATWays.Value
+if defaultCATWays < 0 ||
+	(o.BulkheadDefaultCATWays.Changed() && defaultCATWays == 0) {
+	return fmt.Errorf("bulkhead-default-cat-ways must be positive when configured, got %d",
+		defaultCATWays)
+}
+```
+
+Write `defaultCATWays` to the runtime configuration.
+
+- [ ] **Step 4: Run integration and regression tests**
+
+Run:
+
+```bash
+go test ./cmd/katalyst-agent/app/options/dynamic/adminqos/qrm -count=1
+go test ./pkg/util/flags -count=1
+go test ./pkg/config/agent/dynamic/adminqos/qrm -count=1
+go test ./pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/plugins/rdt/cat -count=1
+go test -race ./cmd/katalyst-agent/app/options/dynamic/adminqos/qrm ./pkg/util/flags -count=1
+go vet ./cmd/katalyst-agent/app/options/dynamic/adminqos/qrm ./pkg/util/flags
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Format, inspect, and commit**
+
+Run:
+
+```bash
+gofmt -w cmd/katalyst-agent/app/options/dynamic/adminqos/qrm/cpu_plugin.go \
+  cmd/katalyst-agent/app/options/dynamic/adminqos/qrm/qrm_base_test.go
+git diff --check
+git diff
+git add cmd/katalyst-agent/app/options/dynamic/adminqos/qrm/cpu_plugin.go \
+  cmd/katalyst-agent/app/options/dynamic/adminqos/qrm/qrm_base_test.go \
+  docs/superpowers/plans/2026-08-13-default-share-cat-ways-config.md
+git commit -m "refactor(qrm): reuse explicit flag values"
+```
+
 ### Task 7: Review P2 — preserve explicit state across repeated registration
 
 **Files:**
