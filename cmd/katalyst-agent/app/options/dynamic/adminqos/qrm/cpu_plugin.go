@@ -38,7 +38,7 @@ type CPUPluginOptions struct {
 	EnableBulkheadSystemService      bool
 	BulkheadNonReclaimPoolMinSize    int64
 	BulkheadDefaultCATWays           int64
-	bulkheadDefaultCATWaysFlag       *pflag.Flag
+	bulkheadDefaultCATWaysFlags      []*pflag.Flag
 	BulkheadClosCATWays              map[string]int64
 	BindIRQToReclaimedPool           bool
 }
@@ -77,7 +77,7 @@ func (o *CPUPluginOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 		"minimum CPU count kept in the non-reclaim pool for bulkhead cpuset topology.")
 	fs.Int64Var(&o.BulkheadDefaultCATWays, "bulkhead-default-cat-ways", o.BulkheadDefaultCATWays,
 		"default CAT way count for non-root bulkhead CLOS groups.")
-	o.bulkheadDefaultCATWaysFlag = fs.Lookup("bulkhead-default-cat-ways")
+	o.bulkheadDefaultCATWaysFlags = append(o.bulkheadDefaultCATWaysFlags, fs.Lookup("bulkhead-default-cat-ways"))
 	fs.StringToInt64Var(&o.BulkheadClosCATWays, "bulkhead-clos-cat-ways", o.BulkheadClosCATWays,
 		"per-CLOS CAT way counts in clos=ways format.")
 	fs.BoolVar(&o.BindIRQToReclaimedPool, "bind-irq-to-reclaimed-pool", o.BindIRQToReclaimedPool,
@@ -89,8 +89,13 @@ func (o *CPUPluginOptions) ApplyTo(c *qrm.CPUPluginConfiguration) error {
 	if o.InitialRampUpReclaimCPUSetRatio < 0 || o.InitialRampUpReclaimCPUSetRatio > 1 {
 		return fmt.Errorf("initial-ramp-up-reclaim-cpuset-ratio must be in [0,1], got %f", o.InitialRampUpReclaimCPUSetRatio)
 	}
-	defaultCATWaysChanged := o.bulkheadDefaultCATWaysFlag != nil &&
-		o.bulkheadDefaultCATWaysFlag.Changed
+	defaultCATWaysChanged := false
+	for _, flag := range o.bulkheadDefaultCATWaysFlags {
+		if flag.Changed {
+			defaultCATWaysChanged = true
+			break
+		}
+	}
 	if o.BulkheadDefaultCATWays < 0 || (defaultCATWaysChanged && o.BulkheadDefaultCATWays == 0) {
 		return fmt.Errorf("bulkhead-default-cat-ways must be positive when configured, got %d", o.BulkheadDefaultCATWays)
 	}

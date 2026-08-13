@@ -227,6 +227,28 @@ func TestQRMPluginOptions_ParseExplicitZeroBulkheadDefaultCATWays(t *testing.T) 
 	}
 }
 
+func TestCPUPluginOptions_ParseExplicitZeroFromFirstNamedFlagSets(t *testing.T) {
+	t.Parallel()
+
+	options := NewCPUPluginOptions()
+	firstFSS := &cliflag.NamedFlagSets{}
+	secondFSS := &cliflag.NamedFlagSets{}
+	options.AddFlags(firstFSS)
+	options.AddFlags(secondFSS)
+
+	if err := firstFSS.FlagSet("qrm-cpu-plugin").Parse([]string{"--bulkhead-default-cat-ways=0"}); err != nil {
+		t.Fatalf("failed to parse flag from first NamedFlagSets: %v", err)
+	}
+
+	err := options.ApplyTo(qrm.NewCPUPluginConfiguration())
+	if err == nil {
+		t.Fatal("ApplyTo succeeded, want error")
+	}
+	if !strings.Contains(err.Error(), "bulkhead-default-cat-ways must be positive") {
+		t.Fatalf("ApplyTo error = %q, want positive-value error", err)
+	}
+}
+
 func TestQRMPluginOptions_ValidateBulkheadCATWays(t *testing.T) {
 	t.Parallel()
 

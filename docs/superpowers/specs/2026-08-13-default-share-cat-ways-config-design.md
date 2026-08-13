@@ -33,10 +33,11 @@ For example, `reclaim=2,shared=4` becomes
 ## Core Design
 
 `CPUPluginOptions` owns startup defaults. It registers `DefaultCATWays` with
-pflag's native `Int64Var` and retains the registered `*pflag.Flag` so
-`ApplyTo` can inspect `Flag.Changed`. This distinguishes an omitted flag's
+pflag's native `Int64Var` and retains every registered `*pflag.Flag` across
+all `NamedFlagSets`. `ApplyTo` treats the option as explicitly configured when
+any retained flag has `Flag.Changed`. This distinguishes an omitted flag's
 compatible zero value from an explicitly configured zero without a custom
-`pflag.Value`.
+`pflag.Value`, even when one `CPUPluginOptions` is registered more than once.
 
 `ClosCATWays` is stored directly as `map[string]int64` and registered with
 `StringToInt64Var`. Numeric conversion and malformed value rejection happen
@@ -81,6 +82,8 @@ Core tests cover:
   and negative values;
 - a real parse of `--bulkhead-default-cat-ways=0` succeeds at flag parsing but
   is rejected by `ApplyTo` with a lower-case error;
+- when one `CPUPluginOptions` is registered into two `NamedFlagSets`, parsing
+  explicit zero through the first registration is still rejected by `ApplyTo`;
 - omitted flags preserve zero-value behavior.
 
 Adapter verification covers:

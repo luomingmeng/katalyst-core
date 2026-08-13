@@ -480,3 +480,49 @@ git add cmd/katalyst-agent/app/options/dynamic/adminqos/qrm/cpu_plugin.go \
   docs/superpowers/plans/2026-08-13-default-share-cat-ways-config.md
 git commit -m "refactor(qrm): use native pflag CAT ways values"
 ```
+
+### Task 7: Review P2 — preserve explicit state across repeated registration
+
+**Files:**
+- Modify: `cmd/katalyst-agent/app/options/dynamic/adminqos/qrm/qrm_base_test.go`
+- Modify: `cmd/katalyst-agent/app/options/dynamic/adminqos/qrm/cpu_plugin.go`
+- Modify: `docs/superpowers/specs/2026-08-13-default-share-cat-ways-config-design.md`
+- Modify: `docs/superpowers/plans/2026-08-13-default-share-cat-ways-config.md`
+
+- [x] **Step 1: Write the failing repeated-registration regression test**
+
+Register the same `CPUPluginOptions` into two separate `NamedFlagSets`, parse
+`--bulkhead-default-cat-ways=0` through the first flag set, and require
+`ApplyTo` to reject the explicit zero.
+
+- [x] **Step 2: Run the focused test and verify RED**
+
+Run:
+
+```bash
+go test ./cmd/katalyst-agent/app/options/dynamic/adminqos/qrm \
+  -run '^TestCPUPluginOptions_ParseExplicitZeroFromFirstNamedFlagSets$' -count=1
+```
+
+Observed: FAIL with `ApplyTo succeeded, want error`.
+
+- [x] **Step 3: Retain every native pflag registration**
+
+Store every registered `*pflag.Flag` in `CPUPluginOptions`. In `ApplyTo`, treat
+the scalar as explicitly configured when any retained flag has `Changed=true`.
+Keep native `Int64Var`; do not restore a custom `pflag.Value`.
+
+- [x] **Step 4: Run the focused test and verify GREEN**
+
+Run the Step 2 command again.
+
+Observed: PASS.
+
+- [x] **Step 5: Verify, self-review, and commit atomically**
+
+Run the focused package tests, focused race test, focused vet, gofmt, and
+`git diff --check`; inspect the final diff, then create a new atomic commit
+without amending prior history.
+
+Observed before commit: all commands passed, gofmt produced no diff, and
+self-review found no P0-P2 defects.
