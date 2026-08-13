@@ -54,6 +54,7 @@ func evaluateCoordinatorSnapshot(
 	snapshot *CompleteSnapshot,
 	dag *TopoDAG,
 	targetByRel map[string]machine.CPUSet,
+	parentSafetyTargetByRel map[string]machine.CPUSet,
 	targetMemsByRel map[string]string,
 	desired map[DomainID]machine.CPUSet,
 	allowedCPUs machine.CPUSet,
@@ -76,7 +77,7 @@ func evaluateCoordinatorSnapshot(
 	return coordinatorSnapshotEvaluation{
 		Report: report,
 		ParentSafety: buildParentSafetyReport(
-			snapshot, dag, targetByRel, report, protectedPending,
+			snapshot, dag, parentSafetyTargetByRel, report, protectedPending,
 			deferredByRel, deferredMismatchRels, capabilities,
 		),
 	}, nil
@@ -85,7 +86,7 @@ func evaluateCoordinatorSnapshot(
 func buildParentSafetyReport(
 	snapshot *CompleteSnapshot,
 	dag *TopoDAG,
-	_ map[string]machine.CPUSet,
+	targetByRel map[string]machine.CPUSet,
 	convergence ConvergenceReport,
 	protectedPending machine.CPUSet,
 	deferredByRel map[string]machine.CPUSet,
@@ -100,6 +101,11 @@ func buildParentSafetyReport(
 	}
 	primary := snapshot.DomainUnion[DomainPrimary]
 	reclaim := snapshot.DomainUnion[DomainReclaim]
+	if targetByRel != nil {
+		desiredByDomain := desiredDomainUnions(dag, targetByRel)
+		primary = desiredByDomain[DomainPrimary]
+		reclaim = desiredByDomain[DomainReclaim]
+	}
 	report.PendingOutsidePrimary = protectedPending.Difference(primary)
 	report.PendingInsideReclaim = protectedPending.Intersection(reclaim)
 	report.PrimaryReclaimOverlap = primary.Intersection(reclaim)
