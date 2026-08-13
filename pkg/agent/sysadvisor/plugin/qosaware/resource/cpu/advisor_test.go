@@ -181,20 +181,19 @@ func TestAdvisorUpdateHardPartitionNUMAAvailability(t *testing.T) {
 		name            string
 		hardPartition   bool
 		numaAvailable   map[int]int
-		wantErr         string
 		wantReservedMap map[int]int
 	}{
 		{
-			name:          "hard partition rejects one empty NUMA",
-			hardPartition: true,
-			numaAvailable: map[int]int{0: 0, 1: 8},
-			wantErr:       "NUMA 0 has 0 available CPUs, requires at least 2",
+			name:            "hard partition does not make sysadvisor reject one empty NUMA",
+			hardPartition:   true,
+			numaAvailable:   map[int]int{0: 0, 1: 8},
+			wantReservedMap: map[int]int{0: 2, 1: 2},
 		},
 		{
-			name:          "hard partition rejects negative availability",
-			hardPartition: true,
-			numaAvailable: map[int]int{0: -1, 1: 8},
-			wantErr:       "NUMA 0 has -1 available CPUs, requires at least 2",
+			name:            "hard partition does not make sysadvisor reject negative availability",
+			hardPartition:   true,
+			numaAvailable:   map[int]int{0: -1, 1: 8},
+			wantReservedMap: map[int]int{0: 2, 1: 2},
 		},
 		{
 			name:            "hard partition reserves two CPUs on every NUMA",
@@ -238,13 +237,6 @@ func TestAdvisorUpdateHardPartitionNUMAAvailability(t *testing.T) {
 			}))
 
 			result, err := advisor.UpdateAndGetAdvice(context.Background())
-			if tt.wantErr != "" {
-				require.ErrorContains(t, err, tt.wantErr)
-				assert.Nil(t, result)
-				assert.Empty(t, advisor.reservedForReclaim)
-				return
-			}
-
 			require.NoError(t, err)
 			require.NotNil(t, result)
 			assert.Equal(t, tt.wantReservedMap, advisor.reservedForReclaim)

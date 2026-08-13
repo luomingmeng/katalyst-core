@@ -448,6 +448,9 @@ func (pa *ProvisionAssemblerCommon) finalizeDefaultShareBackfill(
 	if err != nil {
 		return err
 	}
+	if target == 0 {
+		return fmt.Errorf("default share target is zero before sysadvisor publish")
+	}
 	before := 0
 	if byNUMA := result.PoolEntries[commonstate.PoolNameShare]; byNUMA != nil {
 		before = byNUMA[commonstate.FakedNUMAID].Size

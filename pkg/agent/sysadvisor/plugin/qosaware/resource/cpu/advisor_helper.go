@@ -193,9 +193,8 @@ func (cra *cpuResourceAdvisor) updateNumasAvailableResource() error {
 	if dynamicConf != nil && dynamicConf.EnableRampUpReclaimHardPartition {
 		for id := 0; id < cra.metaServer.NumNUMANodes; id++ {
 			if numaAvailable[id] < 2 {
-				cra.numaAvailable = numaAvailable
-				cra.reservedForReclaim = nil
-				return fmt.Errorf("NUMA %d has %d available CPUs, requires at least 2", id, numaAvailable[id])
+				general.Warningf("NUMA %d has %d available CPUs; QRM ramp-up reclaim hard partition may reject admission",
+					id, numaAvailable[id])
 			}
 		}
 	}
@@ -219,38 +218,6 @@ func (cra *cpuResourceAdvisor) updateReservedForReclaim() error {
 	if dynamicConf == nil {
 		cra.reservedForReclaim = nil
 		return fmt.Errorf("dynamic configuration is nil")
-	}
-
-	if dynamicConf.EnableRampUpReclaimHardPartition {
-		if len(cra.numaAvailable) != cra.metaServer.NumNUMANodes {
-			cra.reservedForReclaim = nil
-			return fmt.Errorf("NUMA availability is incomplete: got %d entries, want %d", len(cra.numaAvailable), cra.metaServer.NumNUMANodes)
-		}
-
-		totalAvailable := 0
-		for id := 0; id < cra.metaServer.NumNUMANodes; id++ {
-			available := cra.numaAvailable[id]
-			if available < 2 {
-				cra.reservedForReclaim = nil
-				return fmt.Errorf("NUMA %d has %d available CPUs, requires at least 2", id, available)
-			}
-			totalAvailable += available
-		}
-		configuredReserve := defaultReservedReclaimedCPUsSize
-		if configuredReserveQuantity, ok := dynamicConf.MinReclaimedResourceForAllocate[v1.ResourceCPU]; ok {
-			configuredReserve = int(configuredReserveQuantity.Value())
-		}
-		minimum := hardPartitionMinimumReclaimCores(configuredReserve, len(cra.numaAvailable))
-		numReservedCores := machine.CalculateGlobalRampUpReclaimTarget(
-			totalAvailable, dynamicConf.InitialRampUpReclaimCPUSetRatio, minimum)
-		candidateReserved, err := machine.DistributeNUMATarget(cra.numaAvailable, numReservedCores, 2)
-		if err != nil {
-			cra.reservedForReclaim = nil
-			return err
-		}
-		cra.reservedForReclaim = candidateReserved
-		general.Infof("reservedForReclaim: %v, globalTarget %v", candidateReserved, numReservedCores)
-		return nil
 	}
 
 	numaReservedRatio := dynamicConf.NumaMinReclaimedResourceRatioForAllocate[v1.ResourceCPU]
