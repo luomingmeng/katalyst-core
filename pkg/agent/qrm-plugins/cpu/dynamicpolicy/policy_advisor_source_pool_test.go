@@ -1338,6 +1338,7 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 		t.Helper()
 		p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 		require.NoError(t, err)
+		p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = hardPartition
 		p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = hardPartition
 		return p
 	}

@@ -70,10 +70,6 @@ func (f *fakeState) GetDisableDedicatedCoresOverlapReclaimedCores() bool {
 	return false
 }
 
-func (f *fakeState) GetDefaultShareMaterializationState() state.DefaultShareMaterializationState {
-	return state.DefaultShareMaterializationState{}
-}
-
 func (f *fakeState) GetRevision() uint64 {
 	return 0
 }
@@ -108,7 +104,6 @@ func (f *fakeState) CommitAdvisorState(
 	podEntries state.PodEntries,
 	machineState state.NUMANodeMap,
 	allowSharedCoresOverlapReclaimedCores, _, _ bool,
-	_ state.DefaultShareMaterializationState,
 ) error {
 	f.podEntries = podEntries
 	f.machineState = machineState
@@ -121,10 +116,9 @@ func (f *fakeState) CommitAdvisorStateIfRevision(
 	podEntries state.PodEntries,
 	machineState state.NUMANodeMap,
 	allowSharedCoresOverlapReclaimedCores, disableDedicatedCoresOverlapReclaimedCores, persist bool,
-	defaultShareMaterializationState state.DefaultShareMaterializationState,
 ) error {
 	return f.CommitAdvisorState(
-		podEntries, machineState, allowSharedCoresOverlapReclaimedCores, disableDedicatedCoresOverlapReclaimedCores, persist, defaultShareMaterializationState)
+		podEntries, machineState, allowSharedCoresOverlapReclaimedCores, disableDedicatedCoresOverlapReclaimedCores, persist)
 }
 
 func (f *fakeState) Delete(podUID string, containerName string, _ bool) {

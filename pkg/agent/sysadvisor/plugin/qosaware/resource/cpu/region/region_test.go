@@ -395,3 +395,165 @@ func TestGetEffectiveReclaimResource(t *testing.T) {
 		})
 	}
 }
+
+func TestQoSRegionShareBootstrapEffectiveControlKnobWhenDefaultShareBackfillEnabled(t *testing.T) {
+	t.Parallel()
+
+	conf, err := options.NewOptions().Config()
+	require.NoError(t, err)
+	dynamicConf := conf.GetDynamicConfiguration()
+	dynamicConf.EnableReclaim = true
+	dynamicConf.FillDefaultSharePoolWithNonReclaimCPUs = true
+	dynamicConf.AllowSharedCoresOverlapReclaimedCores = false
+	dynamicConf.DisableDedicatedCoresOverlapReclaimedCores = true
+
+	metaCache := metacache.NewDummyMetaCacheImp()
+	require.NoError(t, metaCache.SetPoolInfo(commonstate.PoolNameShare, &types.PoolInfo{
+		PoolName: commonstate.PoolNameShare,
+		TopologyAwareAssignments: types.TopologyAwareAssignment{
+			0: machine.NewCPUSet(),
+		},
+	}))
+	require.NoError(t, metaCache.SetPoolInfo(commonstate.PoolNameReserve, &types.PoolInfo{
+		PoolName: commonstate.PoolNameReserve,
+		TopologyAwareAssignments: types.TopologyAwareAssignment{
+			0: machine.NewCPUSet(0),
+		},
+	}))
+	require.NoError(t, metaCache.SetPoolInfo(commonstate.PoolNameReclaim, &types.PoolInfo{
+		PoolName: commonstate.PoolNameReclaim,
+		TopologyAwareAssignments: types.TopologyAwareAssignment{
+			0: machine.NewCPUSet(1, 2),
+		},
+	}))
+
+	share := &QoSRegionShare{
+		QoSRegionBase: &QoSRegionBase{
+			ownerPoolName: commonstate.PoolNameShare,
+			conf:          conf,
+			metaReader:    metaCache,
+			isQuotaCtrlKnobEnabled: func(metacache.MetaReader) (bool, error) {
+				return false, nil
+			},
+			ResourceEssentials: types.ResourceEssentials{
+				ResourceUpperBound: 5,
+			},
+		},
+	}
+
+	controlKnobs := share.getEffectiveControlKnobs()
+	require.NotNil(t, controlKnobs)
+	require.Contains(t, controlKnobs, configapi.ControlKnobNonReclaimedCPURequirement)
+	require.Equal(t, float64(5), controlKnobs[configapi.ControlKnobNonReclaimedCPURequirement].Value)
+}
+
+func TestQoSRegionShareBootstrapUsesStaticReclaimReserveWhenReclaimDisabled(t *testing.T) {
+	t.Parallel()
+
+	conf, err := options.NewOptions().Config()
+	require.NoError(t, err)
+	dynamicConf := conf.GetDynamicConfiguration()
+	dynamicConf.EnableReclaim = false
+	dynamicConf.FillDefaultSharePoolWithNonReclaimCPUs = true
+	dynamicConf.AllowSharedCoresOverlapReclaimedCores = false
+	dynamicConf.DisableDedicatedCoresOverlapReclaimedCores = true
+
+	metaCache := metacache.NewDummyMetaCacheImp()
+	require.NoError(t, metaCache.SetPoolInfo(commonstate.PoolNameShare, &types.PoolInfo{
+		PoolName: commonstate.PoolNameShare,
+		TopologyAwareAssignments: types.TopologyAwareAssignment{
+			0: machine.NewCPUSet(),
+		},
+	}))
+	require.NoError(t, metaCache.SetPoolInfo(commonstate.PoolNameReserve, &types.PoolInfo{
+		PoolName: commonstate.PoolNameReserve,
+		TopologyAwareAssignments: types.TopologyAwareAssignment{
+			0: machine.NewCPUSet(0),
+		},
+	}))
+	require.NoError(t, metaCache.SetPoolInfo(commonstate.PoolNameReclaim, &types.PoolInfo{
+		PoolName: commonstate.PoolNameReclaim,
+		TopologyAwareAssignments: types.TopologyAwareAssignment{
+			0: machine.NewCPUSet(1, 2, 3, 4, 5, 6),
+		},
+	}))
+
+	share := &QoSRegionShare{
+		QoSRegionBase: &QoSRegionBase{
+			ownerPoolName: commonstate.PoolNameShare,
+			conf:          conf,
+			metaReader:    metaCache,
+			isQuotaCtrlKnobEnabled: func(metacache.MetaReader) (bool, error) {
+				return false, nil
+			},
+			ResourceEssentials: types.ResourceEssentials{
+				ResourceUpperBound: 5,
+				ReservedForReclaim: 2,
+			},
+		},
+	}
+
+	controlKnobs := share.getEffectiveControlKnobs()
+	require.NotNil(t, controlKnobs)
+	require.Contains(t, controlKnobs, configapi.ControlKnobNonReclaimedCPURequirement)
+	require.Equal(t, float64(5), controlKnobs[configapi.ControlKnobNonReclaimedCPURequirement].Value)
+}
+
+func TestQoSRegionShareDoesNotBootstrapNonDefaultSharePools(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		ownerPoolName string
+		isNumaBinding bool
+	}{
+		{
+			name:          "custom share",
+			ownerPoolName: "custom-share",
+		},
+		{
+			name:          "share numa binding",
+			ownerPoolName: commonstate.PoolNameShare + commonstate.NUMAPoolInfix + "0",
+			isNumaBinding: true,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			conf, err := options.NewOptions().Config()
+			require.NoError(t, err)
+			dynamicConf := conf.GetDynamicConfiguration()
+			dynamicConf.FillDefaultSharePoolWithNonReclaimCPUs = true
+			dynamicConf.AllowSharedCoresOverlapReclaimedCores = false
+
+			metaCache := metacache.NewDummyMetaCacheImp()
+			require.NoError(t, metaCache.SetPoolInfo(tt.ownerPoolName, &types.PoolInfo{
+				PoolName: tt.ownerPoolName,
+				TopologyAwareAssignments: types.TopologyAwareAssignment{
+					0: machine.NewCPUSet(),
+				},
+			}))
+
+			share := &QoSRegionShare{
+				QoSRegionBase: &QoSRegionBase{
+					ownerPoolName: tt.ownerPoolName,
+					conf:          conf,
+					metaReader:    metaCache,
+					isNumaBinding: tt.isNumaBinding,
+					bindingNumas:  machine.NewCPUSet(0),
+					isQuotaCtrlKnobEnabled: func(metacache.MetaReader) (bool, error) {
+						return false, nil
+					},
+					ResourceEssentials: types.ResourceEssentials{
+						ResourceUpperBound: 5,
+					},
+				},
+			}
+
+			require.Nil(t, share.getEffectiveControlKnobs())
+		})
+	}
+}

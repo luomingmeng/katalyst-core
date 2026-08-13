@@ -21,9 +21,7 @@ import (
 	context "context"
 	"testing"
 
-	"github.com/gogo/protobuf/proto"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/advisorsvc"
-	"github.com/stretchr/testify/require"
 	grpc "google.golang.org/grpc"
 )
 
@@ -218,49 +216,6 @@ func TestCPUPB(t *testing.T) {
 	ai.XXX_Unmarshal(nil)
 	ai.XXX_Marshal(nil, false)
 	ai.XXX_DiscardUnknown()
-}
-
-func TestDefaultShareMaterializationModeRoundTrip(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		src  proto.Message
-		dst  proto.Message
-	}{
-		{
-			name: "list and watch",
-			src: &ListAndWatchResponse{
-				FillDefaultSharePoolWithNonReclaimCpus: true,
-			},
-			dst: &ListAndWatchResponse{},
-		},
-		{
-			name: "get advice",
-			src: &GetAdviceResponse{
-				FillDefaultSharePoolWithNonReclaimCpus: true,
-			},
-			dst: &GetAdviceResponse{},
-		},
-	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			data, err := proto.Marshal(tt.src)
-			require.NoError(t, err)
-			require.NoError(t, proto.Unmarshal(data, tt.dst))
-
-			switch dst := tt.dst.(type) {
-			case *ListAndWatchResponse:
-				require.True(t, dst.GetFillDefaultSharePoolWithNonReclaimCpus())
-			case *GetAdviceResponse:
-				require.True(t, dst.GetFillDefaultSharePoolWithNonReclaimCpus())
-			default:
-				t.Fatalf("unexpected response type %T", tt.dst)
-			}
-		})
-	}
 }
 
 func TestAddContainer(t *testing.T) {

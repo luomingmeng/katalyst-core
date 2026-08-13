@@ -108,12 +108,11 @@ type allocationRequestLock struct {
 }
 
 type allocationRollbackSnapshot struct {
-	revision                         uint64
-	podEntries                       state.PodEntries
-	machineState                     state.NUMANodeMap
-	allowOverlap                     bool
-	disableDedicatedOverlap          bool
-	defaultShareMaterializationState state.DefaultShareMaterializationState
+	revision                uint64
+	podEntries              state.PodEntries
+	machineState            state.NUMANodeMap
+	allowOverlap            bool
+	disableDedicatedOverlap bool
 }
 
 // DynamicPolicy is the policy that's used by default;
@@ -247,7 +246,6 @@ func (p *DynamicPolicy) rollbackAllocationState(
 		snapshot.allowOverlap,
 		snapshot.disableDedicatedOverlap,
 		false,
-		snapshot.defaultShareMaterializationState,
 	)
 	if err == nil {
 		return nil
@@ -289,7 +287,6 @@ func (p *DynamicPolicy) rollbackAllocationState(
 		allowOverlap,
 		disableDedicatedOverlap,
 		false,
-		p.state.GetDefaultShareMaterializationState(),
 	); err != nil {
 		return fmt.Errorf("initialize stale allocation rollback planning state: %w", err)
 	}
@@ -312,7 +309,6 @@ func (p *DynamicPolicy) rollbackAllocationState(
 		allowOverlap,
 		disableDedicatedOverlap,
 		false,
-		planningState.GetDefaultShareMaterializationState(),
 	); err != nil {
 		return fmt.Errorf("commit stale allocation rollback: %w", err)
 	}
@@ -1297,12 +1293,11 @@ func (p *DynamicPolicy) Allocate(ctx context.Context,
 	defer unlockAllocationRequest()
 	p.Lock()
 	rollbackSnapshot := allocationRollbackSnapshot{
-		revision:                         p.state.GetRevision(),
-		podEntries:                       p.state.GetPodEntries(),
-		machineState:                     p.state.GetMachineState(),
-		allowOverlap:                     p.state.GetAllowSharedCoresOverlapReclaimedCores(),
-		disableDedicatedOverlap:          p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
-		defaultShareMaterializationState: p.state.GetDefaultShareMaterializationState(),
+		revision:                p.state.GetRevision(),
+		podEntries:              p.state.GetPodEntries(),
+		machineState:            p.state.GetMachineState(),
+		allowOverlap:            p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+		disableDedicatedOverlap: p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
 	}
 	defer func() {
 		// calls sys-advisor to inform the latest container
@@ -1440,8 +1435,12 @@ func (p *DynamicPolicy) RemovePod(ctx context.Context,
 		general.InfoS("finished", "duration", time.Since(startTime).String(), "podUID", req.PodUid)
 	}()
 
-	podEntries := p.state.GetPodEntries()
-	if len(podEntries[req.PodUid]) == 0 {
+	currentPodEntries := p.state.GetPodEntries()
+	if len(currentPodEntries[req.PodUid]) == 0 {
+		if err := AccompanyResourceRegistry.ReleaseAccompanyResource(req); err != nil {
+			general.ErrorS(err, "failed to release accompany resource", "podUID", req.PodUid)
+			return nil, fmt.Errorf("failed to release accompany resource: %w", err)
+		}
 		return &pluginapi.RemovePodResponse{}, nil
 	}
 
@@ -1455,26 +1454,29 @@ func (p *DynamicPolicy) RemovePod(ctx context.Context,
 		}
 	}
 
-	err = p.removePod(req.PodUid, podEntries, false)
+	expectedRevision := p.state.GetRevision()
+	podEntries := currentPodEntries.Clone()
+	delete(podEntries, req.PodUid)
+	machineState, err := generateMachineStateFromPodEntries(
+		p.machineInfo.CPUTopology, podEntries, p.state.GetMachineState())
 	if err != nil {
-		general.ErrorS(err, "remove pod failed with error", "podUID", req.PodUid)
-		return nil, err
+		return nil, fmt.Errorf("GenerateMachineStateFromPodEntries failed with error: %v", err)
+	}
+
+	err = p.adjustAllocationEntriesAtRevision(
+		podEntries, machineState, true, expectedRevision)
+	if err != nil {
+		general.ErrorS(err, "adjustAllocationEntries failed", "podUID", req.PodUid)
+		err = p.persistPodDeletionAfterAdjustFailure(
+			err, podEntries, machineState, expectedRevision)
+		if err != nil {
+			return nil, fmt.Errorf("commit pod removal failed: %w", err)
+		}
 	}
 
 	if err := AccompanyResourceRegistry.ReleaseAccompanyResource(req); err != nil {
 		general.ErrorS(err, "failed to release accompany resource", "podUID", req.PodUid)
-		return nil, fmt.Errorf("failed to release accompany resource %v", err)
-	}
-
-	expectedRevision := p.state.GetRevision()
-	machineState := p.state.GetMachineState()
-	aErr := p.adjustAllocationEntriesAtRevision(
-		podEntries, machineState, false, expectedRevision)
-	if aErr != nil {
-		general.ErrorS(aErr, "adjustAllocationEntries failed", "podUID", req.PodUid)
-	}
-	if err := p.state.StoreState(); err != nil {
-		general.ErrorS(err, "store state failed", "podUID", req.PodUid)
+		return nil, fmt.Errorf("failed to release accompany resource: %w", err)
 	}
 
 	return &pluginapi.RemovePodResponse{}, nil
@@ -1601,10 +1603,9 @@ func (p *DynamicPolicy) cleanPools() error {
 		}
 	}
 
-	// when default share materialization was enabled by persisted advisor state,
-	// the share pool is synthesized without any owning container, so it must be
-	// retained here.
-	keepSyntheticDefaultShare := p.state.GetDefaultShareMaterializationState().Enabled
+	// when default share residual backfill is enabled, the share pool is
+	// synthesized without any owning container, so it must be retained here.
+	keepSyntheticDefaultShare := p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs
 
 	// if pool exists in entries, but has no corresponding container, we need to delete it
 	poolsToDelete := sets.NewString()

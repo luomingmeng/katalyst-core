@@ -157,8 +157,12 @@ func (r *QoSRegionShare) getEffectiveControlKnobs() types.ControlKnob {
 		}
 	}
 	if requirement <= 0 {
-		klog.Errorf("[qosaware-cpu] pool %v of non positive requirement", r.ownerPoolName)
-		return nil
+		if bootstrapRequirement, ok := r.bootstrapDefaultShareRequirement(); ok {
+			requirement = bootstrapRequirement
+		} else {
+			klog.Errorf("[qosaware-cpu] pool %v of non positive requirement", r.ownerPoolName)
+			return nil
+		}
 	}
 
 	return types.ControlKnob{
@@ -167,6 +171,24 @@ func (r *QoSRegionShare) getEffectiveControlKnobs() types.ControlKnob {
 			Action: types.ControlKnobActionNone,
 		},
 	}
+}
+
+func (r *QoSRegionShare) bootstrapDefaultShareRequirement() (int, bool) {
+	if r.ownerPoolName != commonstate.PoolNameShare ||
+		!r.conf.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs {
+		return 0, false
+	}
+
+	upperBound := int(math.Floor(r.ResourceEssentials.ResourceUpperBound))
+	if upperBound <= 0 {
+		return 0, false
+	}
+
+	general.InfoS("bootstrap default share requirement from resource upper bound",
+		"poolName", r.ownerPoolName,
+		"resourceUpperBound", upperBound,
+	)
+	return upperBound, true
 }
 
 func (r *QoSRegionShare) getPoolCPUSchedWait() (float64, error) {

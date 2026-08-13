@@ -18,15 +18,18 @@ package dynamicpolicy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/bytedance/mockey"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -47,6 +50,7 @@ import (
 	katalystbase "github.com/kubewharf/katalyst-core/cmd/base"
 	componentagent "github.com/kubewharf/katalyst-core/cmd/katalyst-agent/app/agent"
 	"github.com/kubewharf/katalyst-core/cmd/katalyst-agent/app/options"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/accompanyresource"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/advisorsvc"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
@@ -94,6 +98,37 @@ type storeFailureState struct {
 	err error
 }
 
+type releaseTrackingAccompanyPlugin struct {
+	releaseCount int
+	releaseErrs  []error
+}
+
+func (*releaseTrackingAccompanyPlugin) ResourceName() string {
+	return "release-tracking"
+}
+
+func (*releaseTrackingAccompanyPlugin) GetAccompanyResourceTopologyHints(
+	_ *pluginapi.ResourceRequest,
+	_ *pluginapi.ListOfTopologyHints,
+) error {
+	return nil
+}
+
+func (*releaseTrackingAccompanyPlugin) AllocateAccompanyResource(
+	_ *pluginapi.ResourceRequest,
+	_ *pluginapi.ResourceAllocationResponse,
+) error {
+	return nil
+}
+
+func (p *releaseTrackingAccompanyPlugin) ReleaseAccompanyResource(_ *pluginapi.RemovePodRequest) error {
+	p.releaseCount++
+	if len(p.releaseErrs) >= p.releaseCount {
+		return p.releaseErrs[p.releaseCount-1]
+	}
+	return nil
+}
+
 type advisorPoolTestClient struct{}
 
 func (*advisorPoolTestClient) AddContainer(context.Context, *advisorsvc.ContainerMetadata, ...grpc.CallOption) (*advisorsvc.AddContainerResponse, error) {
@@ -110,6 +145,20 @@ func (*advisorPoolTestClient) ListAndWatch(context.Context, *advisorsvc.Empty, .
 
 func (*advisorPoolTestClient) GetAdvice(context.Context, *advisorapi.GetAdviceRequest, ...grpc.CallOption) (*advisorapi.GetAdviceResponse, error) {
 	return nil, fmt.Errorf("not implemented")
+}
+
+type removePodTrackingAdvisorClient struct {
+	advisorPoolTestClient
+	removePodCount int
+}
+
+func (c *removePodTrackingAdvisorClient) RemovePod(
+	context.Context,
+	*advisorsvc.RemovePodRequest,
+	...grpc.CallOption,
+) (*advisorsvc.RemovePodResponse, error) {
+	c.removePodCount++
+	return &advisorsvc.RemovePodResponse{}, nil
 }
 
 func (s *storeFailureState) StoreState() error {
@@ -322,7 +371,9 @@ func TestCleanPoolsKeepsSyntheticDefaultShareWhenBackfillEnabled(t *testing.T) {
 	t.Parallel()
 
 	policy := newTestDynamicPolicy(t, "keep-synthetic-share")
-	entries := state.PodEntries{
+	policy.dynamicConfig.GetDynamicConfiguration().
+		FillDefaultSharePoolWithNonReclaimCPUs = true
+	policy.state.SetPodEntries(state.PodEntries{
 		commonstate.PoolNameShare: {
 			commonstate.FakedContainerName: &state.AllocationInfo{
 				AllocationMeta: commonstate.GenerateGenericPoolAllocationMeta(
@@ -330,18 +381,7 @@ func TestCleanPoolsKeepsSyntheticDefaultShareWhenBackfillEnabled(t *testing.T) {
 				AllocationResult: machine.NewCPUSet(1, 2, 3),
 			},
 		},
-	}
-	machineState, err := generateMachineStateFromPodEntries(
-		policy.machineInfo.CPUTopology, entries, policy.state.GetMachineState())
-	require.NoError(t, err)
-	require.NoError(t, policy.state.CommitAdvisorState(
-		entries,
-		machineState,
-		false,
-		false,
-		false,
-		state.DefaultShareMaterializationState{Enabled: true, AdvisedQuantity: 3},
-	))
+	}, false)
 
 	require.NoError(t, policy.cleanPools())
 	require.False(t,
@@ -374,7 +414,10 @@ func TestCleanPoolsDeletesDefaultShareAfterBackfillFlippedOff(t *testing.T) {
 	t.Parallel()
 
 	policy := newTestDynamicPolicy(t, "delete-synthetic-share-gate-flip")
-	entries := state.PodEntries{
+	// open the gate first so the synthetic share pool would be retained.
+	policy.dynamicConfig.GetDynamicConfiguration().
+		FillDefaultSharePoolWithNonReclaimCPUs = true
+	policy.state.SetPodEntries(state.PodEntries{
 		commonstate.PoolNameShare: {
 			commonstate.FakedContainerName: &state.AllocationInfo{
 				AllocationMeta: commonstate.GenerateGenericPoolAllocationMeta(
@@ -382,18 +425,12 @@ func TestCleanPoolsDeletesDefaultShareAfterBackfillFlippedOff(t *testing.T) {
 				AllocationResult: machine.NewCPUSet(1, 2, 3),
 			},
 		},
-	}
-	machineState, err := generateMachineStateFromPodEntries(
-		policy.machineInfo.CPUTopology, entries, policy.state.GetMachineState())
-	require.NoError(t, err)
-	require.NoError(t, policy.state.CommitAdvisorState(
-		entries,
-		machineState,
-		false,
-		false,
-		false,
-		state.DefaultShareMaterializationState{},
-	))
+	}, false)
+
+	// dynamically flip the gate back to false; cleanPools should now follow the
+	// legacy rules and delete the no-owner share pool.
+	policy.dynamicConfig.GetDynamicConfiguration().
+		FillDefaultSharePoolWithNonReclaimCPUs = false
 
 	require.NoError(t, policy.cleanPools())
 	require.True(t,
@@ -439,6 +476,7 @@ func TestGetResourcesAllocationLegacyRampUpExcludesReclaimFloor(t *testing.T) {
 	require.NoError(t, err)
 	p.reservedCPUs = machine.NewCPUSet()
 	p.reservedReclaimedCPUSet = machine.NewCPUSet(0, 1)
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
 	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0
 	p.state.SetPodEntries(state.PodEntries{
@@ -609,6 +647,150 @@ func TestRemovePod(t *testing.T) {
 	})
 	as.NotNil(err)
 	as.True(strings.Contains(err.Error(), "is not show up in cpu plugin state"))
+}
+
+func TestRemovePodCommitsCanonicalStateAtomically(t *testing.T) {
+	policyTestMutex.Lock()
+	defer policyTestMutex.Unlock()
+
+	const podUID = "remove-pod-atomic"
+	gateErr := fmt.Errorf("adjust failed: %w", &DefaultShareResidualQuantityError{
+		AdvisedQuantity: 1,
+		ResidualSize:    2,
+	})
+	nonGateErr := errors.New("unrelated adjustment failure")
+
+	newPolicy := func(t *testing.T) (*DynamicPolicy, string, uint64, state.NUMANodeMap) {
+		t.Helper()
+		topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+		require.NoError(t, err)
+		stateDir := t.TempDir()
+		policy, err := getTestDynamicPolicyWithoutInitialization(topology, stateDir)
+		require.NoError(t, err)
+		entries := state.PodEntries{
+			podUID: {
+				"main": &state.AllocationInfo{
+					AllocationMeta: commonstate.AllocationMeta{
+						PodUid:        podUID,
+						ContainerName: "main",
+						QoSLevel:      consts.PodAnnotationQoSLevelSharedCores,
+					},
+					AllocationResult: machine.NewCPUSet(1, 2),
+				},
+			},
+		}
+		machineState, err := generateMachineStateFromPodEntries(
+			topology, entries, policy.state.GetMachineState())
+		require.NoError(t, err)
+		require.NoError(t, policy.state.CommitAdvisorState(entries, machineState, false, false, true))
+		return policy, stateDir, policy.state.GetRevision(), machineState
+	}
+
+	newRegistry := func(t *testing.T) *releaseTrackingAccompanyPlugin {
+		t.Helper()
+		oldRegistry := AccompanyResourceRegistry
+		AccompanyResourceRegistry = accompanyresource.NewRegistry()
+		t.Cleanup(func() {
+			AccompanyResourceRegistry = oldRegistry
+		})
+		plugin := &releaseTrackingAccompanyPlugin{}
+		require.NoError(t, AccompanyResourceRegistry.RegisterPlugin(plugin))
+		return plugin
+	}
+
+	t.Run("quantity gate bypass persists deletion before accompany release", func(t *testing.T) {
+		defer mockey.UnPatchAll()
+		policy, stateDir, initialRevision, _ := newPolicy(t)
+		releasePlugin := newRegistry(t)
+		var (
+			gotPersist  bool
+			gotRevision uint64
+		)
+		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAtRevision).
+			To(func(_ *DynamicPolicy, entries state.PodEntries, machineState state.NUMANodeMap,
+				persist bool, expectedRevision uint64,
+			) error {
+				require.NotContains(t, entries, podUID)
+				require.NotNil(t, machineState)
+				require.Equal(t, 0, releasePlugin.releaseCount)
+				gotPersist = persist
+				gotRevision = expectedRevision
+				return gateErr
+			}).Build()
+
+		_, err := policy.RemovePod(context.Background(), &pluginapi.RemovePodRequest{PodUid: podUID})
+		require.NoError(t, err)
+		require.True(t, gotPersist)
+		require.Equal(t, initialRevision, gotRevision)
+		require.NotContains(t, policy.state.GetPodEntries(), podUID)
+		require.Equal(t, initialRevision+1, policy.state.GetRevision())
+		require.Equal(t, 1, releasePlugin.releaseCount)
+
+		restarted, err := state.NewCheckpointState(
+			&statedirectory.StateDirectoryConfiguration{StateFileDirectory: stateDir},
+			cpuPluginStateFileName, cpuconsts.CPUResourcePluginPolicyNameDynamic,
+			policy.machineInfo.CPUTopology, false,
+			state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
+		require.NoError(t, err)
+		require.NotContains(t, restarted.GetPodEntries(), podUID)
+	})
+
+	t.Run("non gate error preserves canonical state and accompany resource", func(t *testing.T) {
+		defer mockey.UnPatchAll()
+		policy, _, initialRevision, initialMachineState := newPolicy(t)
+		releasePlugin := newRegistry(t)
+		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAtRevision).
+			Return(nonGateErr).Build()
+
+		_, err := policy.RemovePod(context.Background(), &pluginapi.RemovePodRequest{PodUid: podUID})
+		require.ErrorIs(t, err, nonGateErr)
+		require.Contains(t, policy.state.GetPodEntries(), podUID)
+		require.True(t, reflect.DeepEqual(policy.state.GetMachineState(), initialMachineState))
+		require.Equal(t, initialRevision, policy.state.GetRevision())
+		require.Equal(t, 0, releasePlugin.releaseCount)
+	})
+
+	t.Run("checkpoint failure rolls canonical state back and preserves accompany resource", func(t *testing.T) {
+		defer mockey.UnPatchAll()
+		policy, stateDir, initialRevision, initialMachineState := newPolicy(t)
+		releasePlugin := newRegistry(t)
+		require.NoError(t, os.RemoveAll(stateDir))
+		require.NoError(t, os.WriteFile(stateDir, []byte("block checkpoint directory"), 0o600))
+		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAtRevision).
+			Return(gateErr).Build()
+
+		_, err := policy.RemovePod(context.Background(), &pluginapi.RemovePodRequest{PodUid: podUID})
+		require.Error(t, err)
+		require.Contains(t, policy.state.GetPodEntries(), podUID)
+		require.True(t, reflect.DeepEqual(policy.state.GetMachineState(), initialMachineState))
+		require.Equal(t, initialRevision, policy.state.GetRevision())
+		require.Equal(t, 0, releasePlugin.releaseCount)
+	})
+
+	t.Run("release failure retries without repeating state or advisor transaction", func(t *testing.T) {
+		policy, _, initialRevision, _ := newPolicy(t)
+		releasePlugin := newRegistry(t)
+		releasePlugin.releaseErrs = []error{errors.New("release failed")}
+		advisorClient := &removePodTrackingAdvisorClient{}
+		policy.enableCPUAdvisor = true
+		policy.advisorClient = advisorClient
+
+		req := &pluginapi.RemovePodRequest{PodUid: podUID}
+		_, err := policy.RemovePod(context.Background(), req)
+		require.Error(t, err)
+		require.True(t, strings.HasPrefix(err.Error(), "failed to release accompany resource"))
+		require.NotContains(t, policy.state.GetPodEntries(), podUID)
+		require.Equal(t, initialRevision+1, policy.state.GetRevision())
+		require.Equal(t, 1, releasePlugin.releaseCount)
+		require.Equal(t, 1, advisorClient.removePodCount)
+
+		committedRevision := policy.state.GetRevision()
+		_, err = policy.RemovePod(context.Background(), req)
+		require.NoError(t, err)
+		require.Equal(t, committedRevision, policy.state.GetRevision())
+		require.Equal(t, 2, releasePlugin.releaseCount)
+		require.Equal(t, 1, advisorClient.removePodCount)
+	})
 }
 
 func TestAllocate(t *testing.T) {
@@ -7076,6 +7258,7 @@ func TestSharedCoresRampUpAllocationExcludesAllNUMAReclaimFloor(t *testing.T) {
 	policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 	as.NoError(err)
 	policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = false
+	policy.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
 	policy.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0
 
@@ -7132,6 +7315,7 @@ func TestAllocateSNBRampUpAllowsGlobalSharePoolToShrink(t *testing.T) {
 	require.NoError(t, err)
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 	require.NoError(t, err)
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
 	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0
 	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
@@ -8834,6 +9018,123 @@ func TestClearResidualStateTreatsFailedPodAsResidual(t *testing.T) {
 	dynamicPolicy.clearResidualState(nil, nil, nil, nil, nil)
 
 	as.Equal(int64(1), dynamicPolicy.residualHitMap[podUID])
+}
+
+func TestPersistResidualPodDeletionAfterAdjustFailure(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	require.NoError(t, err)
+
+	const stalePodUID = "stale-pod-uid"
+	initialPodEntries := state.PodEntries{
+		stalePodUID: {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        stalePodUID,
+					PodNamespace:  "platform",
+					PodName:       "stale-pod",
+					ContainerName: "main",
+					QoSLevel:      consts.PodAnnotationQoSLevelSharedCores,
+				},
+				AllocationResult: machine.NewCPUSet(1, 2),
+			},
+		},
+	}
+	seed, err := state.NewCheckpointState(
+		&statedirectory.StateDirectoryConfiguration{StateFileDirectory: t.TempDir()},
+		"residual-cleanup-seed", "test", cpuTopology, false,
+		state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
+	require.NoError(t, err)
+	initialMachineState, err := generateMachineStateFromPodEntries(
+		cpuTopology, initialPodEntries, seed.GetMachineState())
+	require.NoError(t, err)
+	cleanedPodEntries := initialPodEntries.Clone()
+	delete(cleanedPodEntries, stalePodUID)
+	cleanedMachineState, err := generateMachineStateFromPodEntries(
+		cpuTopology, cleanedPodEntries, initialMachineState)
+	require.NoError(t, err)
+	gateErr := fmt.Errorf("adjust failed: %w", &DefaultShareResidualQuantityError{
+		AdvisedQuantity: 19,
+		ResidualSize:    80,
+	})
+
+	t.Run("durable cleanup survives restart and preserves overlap flags", func(t *testing.T) {
+		stateDir := t.TempDir()
+		stateConfig := &statedirectory.StateDirectoryConfiguration{StateFileDirectory: stateDir}
+		first, err := state.NewCheckpointState(
+			stateConfig, "residual-cleanup", "test", cpuTopology, false,
+			state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
+		require.NoError(t, err)
+		require.NoError(t, first.CommitAdvisorState(
+			initialPodEntries, initialMachineState, true, true, true))
+		expectedRevision := first.GetRevision()
+
+		dynamicPolicy := &DynamicPolicy{state: first}
+		require.NoError(t, dynamicPolicy.persistPodDeletionAfterAdjustFailure(
+			gateErr, cleanedPodEntries, cleanedMachineState, expectedRevision))
+
+		restarted, err := state.NewCheckpointState(
+			stateConfig, "residual-cleanup", "test", cpuTopology, false,
+			state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
+		require.NoError(t, err)
+		require.NotContains(t, restarted.GetPodEntries(), stalePodUID)
+		require.True(t, restarted.GetAllowSharedCoresOverlapReclaimedCores())
+		require.True(t, restarted.GetDisableDedicatedCoresOverlapReclaimedCores())
+	})
+
+	t.Run("stale revision does not overwrite newer state", func(t *testing.T) {
+		current, err := state.NewCheckpointState(
+			&statedirectory.StateDirectoryConfiguration{StateFileDirectory: t.TempDir()},
+			"residual-cleanup-stale", "test", cpuTopology, false,
+			state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
+		require.NoError(t, err)
+		require.NoError(t, current.CommitAdvisorState(
+			initialPodEntries, initialMachineState, false, true, false))
+		expectedRevision := current.GetRevision()
+		current.SetAllocationInfo("newer-pod", "main", &state.AllocationInfo{
+			AllocationResult: machine.NewCPUSet(3),
+		}, false)
+
+		dynamicPolicy := &DynamicPolicy{state: current}
+		err = dynamicPolicy.persistPodDeletionAfterAdjustFailure(
+			gateErr, cleanedPodEntries, cleanedMachineState, expectedRevision)
+		require.ErrorIs(t, err, state.ErrStaleStateRevision)
+		require.NotNil(t, current.GetAllocationInfo("newer-pod", "main"))
+		require.Contains(t, current.GetPodEntries(), stalePodUID)
+		require.True(t, current.GetDisableDedicatedCoresOverlapReclaimedCores())
+	})
+
+	t.Run("non-target error does not commit cleanup", func(t *testing.T) {
+		current, err := state.NewCheckpointState(
+			&statedirectory.StateDirectoryConfiguration{StateFileDirectory: t.TempDir()},
+			"residual-cleanup-non-target", "test", cpuTopology, false,
+			state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
+		require.NoError(t, err)
+		require.NoError(t, current.CommitAdvisorState(
+			initialPodEntries, initialMachineState, true, false, false))
+		expectedRevision := current.GetRevision()
+		nonTargetErr := errors.New("unrelated adjustment failure")
+
+		dynamicPolicy := &DynamicPolicy{state: current}
+		err = dynamicPolicy.persistPodDeletionAfterAdjustFailure(
+			nonTargetErr, cleanedPodEntries, cleanedMachineState, expectedRevision)
+		require.ErrorIs(t, err, nonTargetErr)
+		require.Equal(t, expectedRevision, current.GetRevision())
+		require.Contains(t, current.GetPodEntries(), stalePodUID)
+		require.True(t, current.GetAllowSharedCoresOverlapReclaimedCores())
+		require.False(t, current.GetDisableDedicatedCoresOverlapReclaimedCores())
+	})
+
+	t.Run("error recognition does not depend on text", func(t *testing.T) {
+		require.True(t, errors.Is(gateErr, ErrDefaultShareResidualQuantityMismatch))
+		var typedErr *DefaultShareResidualQuantityError
+		require.True(t, errors.As(gateErr, &typedErr))
+		require.Equal(t, 19, typedErr.AdvisedQuantity)
+		require.Equal(t, 80, typedErr.ResidualSize)
+		require.False(t, isDefaultShareResidualQuantityGateError(
+			errors.New("default share quantity 19 is smaller than residual cpuset size 80")))
+	})
 }
 
 func TestStart(t *testing.T) {

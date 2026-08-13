@@ -24,13 +24,19 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/util/sets"
 
+	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
 	bulkheadapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
+	bulkheadutils "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils"
+	cpustate "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	qrmresctrl "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/resctrl"
 	"github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
+	resourcepackage "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 )
 
 type fakeCPUListManager struct {
@@ -88,6 +94,137 @@ func TestCPUListPluginSharedPoolsUnionForSameClos(t *testing.T) {
 
 	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(view)))
 	require.Equal(t, []cpuListWrite{{closID: "share-03", target: "1-4"}}, manager.writes)
+}
+
+func TestGateBSNBRampUpWritesDeclaredShareNUMAClos(t *testing.T) {
+	state := cpustate.NewCPUPluginState(nil)
+	state.SetAllowSharedCoresOverlapReclaimedCores(false)
+	state.SetAllocationInfo(commonstate.PoolNameReserve, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReserve),
+		AllocationResult: machine.NewCPUSet(0, 4),
+	})
+	state.SetAllocationInfo(commonstate.PoolNameShare, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+		AllocationResult: machine.NewCPUSet(1, 5),
+	})
+	state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+		AllocationResult: machine.NewCPUSet(2, 3, 6, 7),
+	})
+	state.SetAllocationInfo("snb-ramp-up", "main", &cpustate.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        "snb-ramp-up",
+			ContainerName: "main",
+			OwnerPoolName: "isolation-snb-ramp-up",
+			QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+			Annotations: map[string]string{
+				apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+				cpuconsts.CPUStateAnnotationKeyNUMAHint:             "0",
+			},
+		},
+		RampUp:           true,
+		AllocationResult: machine.NewCPUSet(2),
+	})
+	topology := &machine.CPUTopology{CPUDetails: machine.CPUDetails{
+		0: {NUMANodeID: 0}, 1: {NUMANodeID: 0}, 2: {NUMANodeID: 0}, 3: {NUMANodeID: 0},
+		4: {NUMANodeID: 1}, 5: {NUMANodeID: 1}, 6: {NUMANodeID: 1}, 7: {NUMANodeID: 1},
+	}}
+	view := bulkheadutils.BuildCPUSetPartitionView(state, topology, bulkheadutils.CPUSetPartitionViewOptions{
+		HardPartitionEnabled: true,
+	})
+
+	manager := &fakeCPUListManager{clos: []Clos{
+		{ID: "share-03", Epoch: 1},
+		{ID: "share-05", Epoch: 1},
+		{ID: "share-07", Epoch: 1},
+	}}
+	plugin := NewCPUListPluginWithManager(&qrmresctrl.ResctrlConfig{
+		CPUSetPoolToSharedSubgroup: map[string]int{
+			"share-NUMA0":           3,
+			"isolation-snb-ramp-up": 7,
+		},
+		DefaultSharedSubgroup: 5,
+	}, manager)
+
+	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(&view.CPUSetPartitionView)))
+	require.Equal(t, []cpuListWrite{
+		{closID: "share-03", target: "2"},
+		{closID: "share-05", target: "1,5"},
+		{closID: "share-07", target: ""},
+	}, manager.writes)
+	require.NotContains(t, manager.writes[1].target, "2", "default CLOS must not contain ramp-up CPU")
+}
+
+func TestGateBSNBRampUpAdjustmentStateWritesWrappedResourcePackageSourcePoolClos(t *testing.T) {
+	state := cpustate.NewCPUPluginState(nil)
+	state.SetAllowSharedCoresOverlapReclaimedCores(false)
+	state.SetAllocationInfo(commonstate.PoolNameReserve, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReserve),
+		AllocationResult: machine.NewCPUSet(0, 4),
+	})
+	state.SetAllocationInfo(commonstate.PoolNameShare, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+		AllocationResult: machine.NewCPUSet(1, 5),
+	})
+	state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+		AllocationResult: machine.NewCPUSet(2, 3, 6, 7),
+	})
+
+	const (
+		packageName   = "package-a"
+		sourcePool    = "share-NUMA0"
+		isolationPool = "isolation-snb-ramp-up"
+	)
+	wrappedSourcePool := resourcepackage.WrapOwnerPoolName(sourcePool, packageName)
+	wrappedIsolationPool := resourcepackage.WrapOwnerPoolName(isolationPool, packageName)
+	state.SetAllocationInfo("snb-ramp-up", "main", &cpustate.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        "snb-ramp-up",
+			ContainerName: "main",
+			OwnerPoolName: commonstate.EmptyOwnerPoolName,
+			QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+			Annotations: map[string]string{
+				apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+				cpuconsts.CPUStateAnnotationKeyNUMAHint:             "0",
+				apiconsts.PodAnnotationResourcePackageKey:           packageName,
+			},
+		},
+		RampUp:           true,
+		AllocationResult: machine.NewCPUSet(2),
+	})
+	topology := &machine.CPUTopology{CPUDetails: machine.CPUDetails{
+		0: {NUMANodeID: 0}, 1: {NUMANodeID: 0}, 2: {NUMANodeID: 0}, 3: {NUMANodeID: 0},
+		4: {NUMANodeID: 1}, 5: {NUMANodeID: 1}, 6: {NUMANodeID: 1}, 7: {NUMANodeID: 1},
+	}}
+	view := bulkheadutils.BuildCPUSetPartitionView(state, topology, bulkheadutils.CPUSetPartitionViewOptions{
+		HardPartitionEnabled: true,
+	})
+	require.Equal(t, machine.NewCPUSet(2), view.SharePoolMap[wrappedSourcePool])
+	require.NotContains(t, view.SharePoolMap, sourcePool)
+
+	manager := &fakeCPUListManager{clos: []Clos{
+		{ID: "share-03", Epoch: 1},
+		{ID: "share-05", Epoch: 1},
+		{ID: "share-07", Epoch: 1},
+		{ID: "share-09", Epoch: 1},
+	}}
+	plugin := NewCPUListPluginWithManager(&qrmresctrl.ResctrlConfig{
+		CPUSetPoolToSharedSubgroup: map[string]int{
+			wrappedSourcePool:    3,
+			sourcePool:           7,
+			wrappedIsolationPool: 9,
+		},
+		DefaultSharedSubgroup: 5,
+	}, manager)
+
+	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(&view.CPUSetPartitionView)))
+	require.Equal(t, []cpuListWrite{
+		{closID: "share-03", target: "2"},
+		{closID: "share-05", target: "1,5"},
+		{closID: "share-07", target: ""},
+		{closID: "share-09", target: ""},
+	}, manager.writes)
 }
 
 func TestCPUListPluginDisabledByTopLevelDisableRDT(t *testing.T) {

@@ -276,6 +276,7 @@ func newLegacyHardPartitionTestPolicy(t *testing.T) *DynamicPolicy {
 	require.NoError(t, err)
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 	require.NoError(t, err)
+	policy.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
 	return policy
 }
