@@ -1765,7 +1765,7 @@ func TestSafeWriterGrowStillRejectsChangedOperationIdentity(t *testing.T) {
 
 	err := newSafeCPUSetWriter(driver, NewBudgetTracker(ConvergenceBudget{}), nil).
 		execute(context.Background(), plan)
-	if err == nil || !strings.Contains(err.Error(), "canonical PlanID") {
+	if err == nil || !strings.Contains(err.Error(), "canonical plan id") {
 		t.Fatalf("execute error = %v, want changed operation identity rejection", err)
 	}
 	if len(driver.writes) != 0 {

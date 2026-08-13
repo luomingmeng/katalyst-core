@@ -18,6 +18,7 @@ package topology
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 
@@ -50,11 +51,11 @@ func newSafeCPUSetWriter(driver HierarchyDriver, budget *BudgetTracker, res *Con
 
 func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 	if plan.PlanID == "" || canonicalExecutionPlanID(plan) != plan.PlanID {
-		return fmt.Errorf("phase writer requires canonical PlanID")
+		return fmt.Errorf("phase writer requires canonical plan id")
 	}
 	for _, operation := range plan.Operations {
 		if operation.PlanID != plan.PlanID {
-			return fmt.Errorf("phase writer rejected operation %q owned by PlanID %q, current %q",
+			return fmt.Errorf("phase writer rejected operation %q owned by plan id %q, current %q",
 				operation.Rel, operation.PlanID, plan.PlanID)
 		}
 		if operation.WriteMems && !operation.OwnsMems {
@@ -67,7 +68,9 @@ func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 	if w.budget == nil {
 		return fmt.Errorf("phase writer requires convergence budget")
 	}
-	stableChildUnion, err := w.scanStableShrinkChildren(ctx, plan.Operations, plan.Capabilities)
+	failClosedRels := safeWriterFailClosedRels(plan)
+	stableChildUnion, err := w.scanStableShrinkChildren(
+		ctx, plan.Operations, plan.Capabilities, failClosedRels)
 	if err != nil {
 		return err
 	}
@@ -82,7 +85,9 @@ func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 		}
 		if operation.Direction == WriteShrink && operation.WriteMems {
 			children := stableChildUnion[operation.Rel]
-			ioOperations += 2 + len(children.refs) // Re-prove live child mems before writing.
+			// Re-prove live child mems before writing. A missing v2 cpuset interface
+			// needs one identity stat before an uncontrolled child can be skipped.
+			ioOperations += 2 + 2*len(children.refs)
 		}
 		ioOperations++ // CPU write
 		ioOperations++ // post-write read/journal
@@ -94,7 +99,7 @@ func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 	w.driver = driver
 	for _, operation := range plan.Operations {
 		if operation.Direction == WriteShrink && operation.WriteMems {
-			children, err := scanLiveChildrenOnce(ctx, w.driver, operation)
+			children, err := scanLiveChildrenOnce(ctx, w.driver, operation, failClosedRels)
 			if err != nil {
 				return err
 			}
@@ -187,6 +192,7 @@ func (w safeCPSetWriter) scanStableShrinkChildren(
 	ctx context.Context,
 	operations []PlanOperation,
 	capabilities HierarchyCapabilities,
+	failClosedRels map[string]struct{},
 ) (map[string]stableLiveChildren, error) {
 	driver := w.driver
 	if wrapped, ok := driver.(*budgetedHierarchyDriver); !ok || wrapped.budget != w.budget {
@@ -202,7 +208,8 @@ func (w safeCPSetWriter) scanStableShrinkChildren(
 		if skipCPUCheck && !checkMems {
 			continue
 		}
-		children, err := scanStableLiveChildren(ctx, driver, operation.Rel, checkMems)
+		children, err := scanStableLiveChildren(
+			ctx, driver, operation.Rel, checkMems, failClosedRels)
 		if err != nil {
 			return nil, err
 		}
@@ -223,6 +230,7 @@ func scanStableLiveChildren(
 	driver HierarchyDriver,
 	rel string,
 	readMems bool,
+	failClosedRels map[string]struct{},
 ) (stableLiveChildren, error) {
 	for {
 		before, err := driver.ListChildren(ctx, rel)
@@ -239,6 +247,14 @@ func scanStableLiveChildren(
 			childRel := filepath.Join(rel, child.Name)
 			entry, readErr := driver.ReadEntry(ctx, childRel)
 			if readErr != nil {
+				skip, proofErr := proveSafeUnavailableChildSkip(
+					ctx, driver, childRel, child.Identity, readErr, failClosedRels)
+				if proofErr != nil {
+					return stableLiveChildren{}, proofErr
+				}
+				if skip {
+					continue
+				}
 				if driver.Classify(readErr, HierarchyOperationRead) == HierarchyErrorStale {
 					stale = true
 					break
@@ -281,6 +297,7 @@ func scanLiveChildrenOnce(
 	ctx context.Context,
 	driver HierarchyDriver,
 	operation PlanOperation,
+	failClosedRels map[string]struct{},
 ) (stableLiveChildren, error) {
 	before, err := driver.ListChildren(ctx, operation.Rel)
 	if err != nil {
@@ -295,6 +312,14 @@ func scanLiveChildrenOnce(
 		childRel := filepath.Join(operation.Rel, child.Name)
 		entry, readErr := driver.ReadEntry(ctx, childRel)
 		if readErr != nil {
+			skip, proofErr := proveSafeUnavailableChildSkip(
+				ctx, driver, childRel, child.Identity, readErr, failClosedRels)
+			if proofErr != nil {
+				return stableLiveChildren{}, proofErr
+			}
+			if skip {
+				continue
+			}
 			return stableLiveChildren{}, readErr
 		}
 		if entry.Identity != child.Identity {
@@ -324,6 +349,48 @@ func scanLiveChildrenOnce(
 		}
 	}
 	return children, nil
+}
+
+func safeWriterFailClosedRels(plan PhasePlan) map[string]struct{} {
+	rels := make(map[string]struct{}, len(plan.Operations)+len(plan.ControlledRels))
+	for _, rel := range plan.ControlledRels {
+		rels[rel] = struct{}{}
+	}
+	for _, operation := range plan.Operations {
+		rels[operation.Rel] = struct{}{}
+	}
+	for _, rel := range plan.FailClosedRoots {
+		rels[rel] = struct{}{}
+	}
+	return rels
+}
+
+func proveSafeUnavailableChildSkip(
+	ctx context.Context,
+	driver HierarchyDriver,
+	rel string,
+	expectedIdentity CgroupIdentity,
+	readErr error,
+	failClosedRels map[string]struct{},
+) (bool, error) {
+	if !errors.Is(readErr, ErrCgroupControllerUnavailable) {
+		return false, nil
+	}
+	if !driver.Capabilities().EffectiveCPUSet {
+		return false, readErr
+	}
+	if _, failClosed := failClosedRels[rel]; failClosed {
+		return false, readErr
+	}
+	currentIdentity, err := driver.StatIdentity(ctx, rel)
+	if err != nil {
+		return false, err
+	}
+	if currentIdentity != expectedIdentity {
+		return false, fmt.Errorf("%w: child rel=%q listed=%v current=%v",
+			ErrCgroupIdentityChanged, rel, expectedIdentity, currentIdentity)
+	}
+	return true, nil
 }
 
 func (w safeCPSetWriter) precheckOperation(

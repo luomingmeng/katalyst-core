@@ -138,7 +138,7 @@ func (p *CPUSetMemsPlugin) reconcileNUMAMems(ctx context.Context, version cgroup
 				continue
 			}
 			targetMems := strconv.Itoa(numaID)
-			if err := p.applyMemsRecursive(ctx, rel, cgcommon.CPUSetData{Mems: targetMems}, memsPostOrder); err != nil {
+			if err := p.applyMemsRecursive(ctx, version, rel, cgcommon.CPUSetData{Mems: targetMems}, memsPostOrder); err != nil {
 				errs = append(errs, err)
 			}
 		}
@@ -169,7 +169,7 @@ func (p *CPUSetMemsPlugin) rollbackNUMAMems(ctx context.Context, version cgroupc
 				general.InfofV(4, "bulkhead cpuset_mems: rollback rel path does not exist, skipping, version=%s rel=%q err=%v", version, rel, err)
 				continue
 			}
-			if err := p.applyMemsRecursive(ctx, rel, data, memsPreOrder); err != nil {
+			if err := p.applyMemsRecursive(ctx, version, rel, data, memsPreOrder); err != nil {
 				errs = append(errs, err)
 			}
 		}
@@ -177,10 +177,10 @@ func (p *CPUSetMemsPlugin) rollbackNUMAMems(ctx context.Context, version cgroupc
 	return apierrors.NewAggregate(errs)
 }
 
-func (p *CPUSetMemsPlugin) applyMemsRecursive(ctx context.Context, rel string, data cgcommon.CPUSetData, order memsApplyOrder) error {
+func (p *CPUSetMemsPlugin) applyMemsRecursive(ctx context.Context, version cgroupclient.CgroupVersion, rel string, data cgcommon.CPUSetData, order memsApplyOrder) error {
 	var lastErr error
 	for attempt := 1; attempt <= memsApplyMaxAttempts; attempt++ {
-		err := p.applyMemsRecursiveOnce(ctx, rel, data, order)
+		err := p.applyMemsRecursiveOnce(ctx, version, rel, data, order, true)
 		if err == nil {
 			return nil
 		}
@@ -196,10 +196,13 @@ func (p *CPUSetMemsPlugin) applyMemsRecursive(ctx context.Context, rel string, d
 	return nil
 }
 
-func (p *CPUSetMemsPlugin) applyMemsRecursiveOnce(ctx context.Context, rel string, data cgcommon.CPUSetData, order memsApplyOrder) error {
+func (p *CPUSetMemsPlugin) applyMemsRecursiveOnce(ctx context.Context, version cgroupclient.CgroupVersion, rel string, data cgcommon.CPUSetData, order memsApplyOrder, controlledRoot bool) error {
 	var errs []error
 	if order == memsPreOrder {
 		if err := p.applyMems(ctx, rel, data); err != nil {
+			if shouldSkipDynamicMemsControllerUnavailable(version, controlledRoot, err) {
+				return nil
+			}
 			errs = append(errs, err)
 		}
 	}
@@ -213,7 +216,7 @@ func (p *CPUSetMemsPlugin) applyMemsRecursiveOnce(ctx context.Context, rel strin
 		sort.Strings(children)
 		for _, child := range children {
 			childRel := filepath.Join(rel, child)
-			if childErr := p.applyMemsRecursiveOnce(ctx, childRel, data, order); childErr != nil {
+			if childErr := p.applyMemsRecursiveOnce(ctx, version, childRel, data, order, false); childErr != nil {
 				errs = append(errs, childErr)
 			}
 		}
@@ -221,10 +224,17 @@ func (p *CPUSetMemsPlugin) applyMemsRecursiveOnce(ctx context.Context, rel strin
 
 	if order == memsPostOrder {
 		if err := p.applyMems(ctx, rel, data); err != nil {
+			if shouldSkipDynamicMemsControllerUnavailable(version, controlledRoot, err) {
+				return nil
+			}
 			errs = append(errs, err)
 		}
 	}
 	return apierrors.NewAggregate(errs)
+}
+
+func shouldSkipDynamicMemsControllerUnavailable(version cgroupclient.CgroupVersion, controlledRoot bool, err error) bool {
+	return version == cgroupclient.CgroupVersionV2 && !controlledRoot && isCPUSetControllerUnavailable(err)
 }
 
 func (p *CPUSetMemsPlugin) applyMems(ctx context.Context, rel string, data cgcommon.CPUSetData) error {
@@ -255,6 +265,16 @@ func isCPUSetMemsBusy(err error) bool {
 		return true
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "device or resource busy")
+}
+
+func isCPUSetControllerUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOENT) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "no such file or directory")
 }
 
 func joinNUMAIDs(numaIDs []int) string {

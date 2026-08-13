@@ -333,9 +333,11 @@ type PhasePlan struct {
 	ConvergenceID    string
 	PlanID           string
 	Base             *CompleteSnapshot
+	FailClosedRoots  []string
 	Kind             PhaseKind
 	AllowEmptyTarget bool
 	Capabilities     HierarchyCapabilities
+	ControlledRels   []string
 	Witnesses        []ReleaseWitness
 	TransferGraph    map[DomainID]map[DomainID]machine.CPUSet
 	TargetByRel      map[string]CPUSetTarget
@@ -450,13 +452,19 @@ func buildPhasePlanWithStats(in PhasePlanInput, stats *plannerBuildStats) (Phase
 		return PhasePlan{}, err
 	}
 	graph := buildTransferGraph(domains, in.Snapshot.DomainUnion, desiredByDomain, stats)
+	controlledRels := make([]string, 0, len(in.DAG.index))
+	for _, node := range in.DAG.Nodes() {
+		controlledRels = append(controlledRels, node.Rel)
+	}
 
 	plan := PhasePlan{
 		ConvergenceID:    canonicalConvergenceID(in),
 		Base:             in.Snapshot,
+		FailClosedRoots:  normalizeRels(in.Snapshot.ScanBoundary.Roots),
 		Kind:             in.Kind,
 		AllowEmptyTarget: in.AllowEmptyTarget,
 		Capabilities:     in.Capabilities,
+		ControlledRels:   controlledRels,
 		Witnesses:        append([]ReleaseWitness(nil), in.Witnesses...),
 		TransferGraph:    graph,
 		TargetByRel:      make(map[string]CPUSetTarget, len(in.Snapshot.Entries)),
@@ -626,6 +634,11 @@ func canonicalExecutionPlanID(plan PhasePlan) string {
 	} else {
 		_, _ = hash.Write(make([]byte, len(SnapshotID{})))
 	}
+	failClosedRoots := normalizeRels(plan.FailClosedRoots)
+	writeHashUint64(hash, uint64(len(failClosedRoots)))
+	for _, rel := range failClosedRoots {
+		writeHashString(hash, rel)
+	}
 
 	witnesses := append([]ReleaseWitness(nil), plan.Witnesses...)
 	sort.Slice(witnesses, func(i, j int) bool {
@@ -657,6 +670,13 @@ func canonicalExecutionPlanID(plan PhasePlan) string {
 		writeHashString(hash, witness.SourceBoundaryFingerprint)
 	}
 
+	controlledRels := append([]string(nil), plan.ControlledRels...)
+	sort.Strings(controlledRels)
+	writeHashUint64(hash, uint64(len(controlledRels)))
+	for _, rel := range controlledRels {
+		writeHashString(hash, rel)
+	}
+
 	writeHashUint64(hash, uint64(len(plan.Operations)))
 	for _, operation := range plan.Operations {
 		writeHashString(hash, operation.Rel)
@@ -676,6 +696,18 @@ func canonicalExecutionPlanID(plan PhasePlan) string {
 		writeHashUint64(hash, boolUint64(operation.WriteMems))
 	}
 	return fmt.Sprintf("%x", hash.Sum(nil))
+}
+
+func normalizeRels(rels []string) []string {
+	normalized := append([]string(nil), rels...)
+	sort.Strings(normalized)
+	out := normalized[:0]
+	for _, rel := range normalized {
+		if len(out) == 0 || out[len(out)-1] != rel {
+			out = append(out, rel)
+		}
+	}
+	return out
 }
 
 func writeHierarchyCapabilitiesHash(hash hash.Hash, capabilities HierarchyCapabilities) {

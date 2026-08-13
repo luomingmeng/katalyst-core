@@ -273,6 +273,74 @@ func TestVerifyResetConvergenceUsesConfiguredCPUsOnlyForV2EmptyTarget(t *testing
 	}
 }
 
+func TestResetWriterSkipsUncontrolledDynamicDescendantWithoutCpusetController(t *testing.T) {
+	dag, err := BuildDAG([]NodeSpec{{
+		Rel: "primary", Domain: DomainPrimary, Role: TopoNodeRolePrimary,
+		CPUs: machine.NewCPUSet(), TrustAnchor: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fake := newFakeHierarchyDriver()
+	fake.capabilities.EmptyConfiguredCPUSet = true
+	fake.capabilities.EffectiveCPUSet = true
+	fake.add("primary", CgroupIdentity{Device: 1, Inode: 1}, "0-3", "0")
+	fake.add("primary/pod-a", CgroupIdentity{Device: 1, Inode: 2}, "0-3", "0")
+	fake.add("primary/pod-a/init.scope", CgroupIdentity{Device: 1, Inode: 3}, "0-3", "0")
+	fake.beforeCall = func(op HierarchyOperation, rel string) error {
+		if rel == "primary/pod-a/init.scope" &&
+			(op == HierarchyOperationRead || op == HierarchyOperationWriteCPUs || op == HierarchyOperationWriteMems) {
+			return ErrCgroupControllerUnavailable
+		}
+		return nil
+	}
+
+	res := &ConvergenceResult{}
+	writer := newResetCoordinatorWriter(fake, NewBudgetTracker(ConvergenceBudget{}), "", res)
+	err = writer.execute(context.Background(), dag, map[string]machine.CPUSet{
+		"primary": machine.NewCPUSet(),
+	}, true, nil)
+	if err != nil {
+		t.Fatalf("reset writer error = %v", err)
+	}
+	for _, write := range fake.writes {
+		if write.rel == "primary/pod-a/init.scope" {
+			t.Fatalf("reset writer wrote skipped dynamic descendant: %#v", write)
+		}
+	}
+}
+
+func TestResetWriterRejectsControlledNodeWithoutCpusetController(t *testing.T) {
+	dag, err := BuildDAG([]NodeSpec{{
+		Rel: "primary", Domain: DomainPrimary, Role: TopoNodeRolePrimary,
+		CPUs: machine.NewCPUSet(), TrustAnchor: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fake := newFakeHierarchyDriver()
+	fake.capabilities.EmptyConfiguredCPUSet = true
+	fake.capabilities.EffectiveCPUSet = true
+	fake.add("primary", CgroupIdentity{Device: 1, Inode: 1}, "0-3", "0")
+	fake.beforeCall = func(op HierarchyOperation, rel string) error {
+		if op == HierarchyOperationRead && rel == "primary" {
+			return ErrCgroupControllerUnavailable
+		}
+		return nil
+	}
+
+	res := &ConvergenceResult{}
+	writer := newResetCoordinatorWriter(fake, NewBudgetTracker(ConvergenceBudget{}), "", res)
+	err = writer.execute(context.Background(), dag, map[string]machine.CPUSet{
+		"primary": machine.NewCPUSet(),
+	}, true, nil)
+	if !errors.Is(err, ErrCgroupControllerUnavailable) {
+		t.Fatalf("reset writer error = %v, want ErrCgroupControllerUnavailable", err)
+	}
+}
+
 func TestVerifyResetConvergenceKeepsEffectiveCPUsForNonEmptyTarget(t *testing.T) {
 	dag, err := BuildDAG([]NodeSpec{{
 		Rel: "primary", Domain: DomainPrimary, Role: TopoNodeRolePrimary,
@@ -609,6 +677,171 @@ func TestSafeWriterV2ConfiguredClearWithMemsShrinkRejectsMalformedLiveChildMems(
 	if got := driver.states["primary"].Mems; got != "0-1" {
 		t.Fatalf("parent mems = %q, want fail-closed before write", got)
 	}
+}
+
+func TestSafeWriterSkipsStableUncontrolledV2ChildWithoutCpusetController(t *testing.T) {
+	driver, plan, childIdentity := safeWriterUnavailableChildFixture()
+	driver.capabilities.EffectiveCPUSet = true
+	driver.beforeCall = func(op HierarchyOperation, rel string) error {
+		if op == HierarchyOperationRead && rel == "root/dynamic" {
+			return ErrCgroupControllerUnavailable
+		}
+		return nil
+	}
+
+	if err := newSafeCPUSetWriter(driver, NewBudgetTracker(ConvergenceBudget{}), nil).
+		execute(context.Background(), plan); err != nil {
+		t.Fatalf("execute() error = %v, want stable uncontrolled child skipped", err)
+	}
+	if got := driver.nodes["root"].cpus.String(); got != "0-2" {
+		t.Fatalf("root cpus = %q, want 0-2", got)
+	}
+	if got, err := driver.StatIdentity(context.Background(), "root/dynamic"); err != nil || got != childIdentity {
+		t.Fatalf("dynamic child identity = %v, %v; want %v", got, err, childIdentity)
+	}
+}
+
+func TestScanLiveChildrenOnceFailsClosedWithoutSkipProof(t *testing.T) {
+	tests := []struct {
+		name            string
+		controlled      bool
+		anchor          bool
+		cgroupV1        bool
+		identityChanged bool
+		wantErr         error
+	}{
+		{name: "controlled", controlled: true, wantErr: ErrCgroupControllerUnavailable},
+		{name: "anchor", anchor: true, wantErr: ErrCgroupControllerUnavailable},
+		{name: "cgroup v1", cgroupV1: true, wantErr: ErrCgroupControllerUnavailable},
+		{name: "identity changed", identityChanged: true, wantErr: ErrCgroupIdentityChanged},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			driver, plan, _ := safeWriterUnavailableChildFixture()
+			driver.capabilities.EffectiveCPUSet = !tc.cgroupV1
+			if tc.controlled {
+				plan.ControlledRels = append(plan.ControlledRels, "root/dynamic")
+			}
+			if tc.anchor {
+				plan.FailClosedRoots = append(plan.FailClosedRoots, "root/dynamic")
+			}
+			driver.beforeCall = func(op HierarchyOperation, rel string) error {
+				if op != HierarchyOperationRead || rel != "root/dynamic" {
+					return nil
+				}
+				if tc.identityChanged {
+					driver.bumpIdentity(rel)
+				}
+				return ErrCgroupControllerUnavailable
+			}
+
+			_, err := scanLiveChildrenOnce(
+				context.Background(), driver, plan.Operations[0], safeWriterFailClosedRels(plan))
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("scanLiveChildrenOnce() error = %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestSafeWriterFailClosedRootsDoNotFollowBaseMutation(t *testing.T) {
+	driver, plan, _ := safeWriterUnavailableChildFixture()
+	driver.capabilities.EffectiveCPUSet = true
+	plan.FailClosedRoots = []string{"root/dynamic"}
+	plan.Base.ScanBoundary.Roots = []string{"root/dynamic"}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	plan.Operations[0].PlanID = plan.PlanID
+	originalPlanID := plan.PlanID
+
+	plan.Base.ScanBoundary.Roots[0] = "other"
+	if got := canonicalExecutionPlanID(plan); got != originalPlanID {
+		t.Fatalf("base roots mutation changed canonical PlanID: got %q, want %q", got, originalPlanID)
+	}
+	driver.beforeCall = func(op HierarchyOperation, rel string) error {
+		if op == HierarchyOperationRead && rel == "root/dynamic" {
+			return ErrCgroupControllerUnavailable
+		}
+		return nil
+	}
+
+	err := newSafeCPUSetWriter(driver, NewBudgetTracker(ConvergenceBudget{}), nil).
+		execute(context.Background(), plan)
+	if !errors.Is(err, ErrCgroupControllerUnavailable) {
+		t.Fatalf("execute() error = %v, want fail-closed root error", err)
+	}
+	if len(driver.writes) != 0 {
+		t.Fatalf("base roots mutation allowed writes: %#v", driver.writes)
+	}
+}
+
+func TestSafeWriterFailClosedRootsRaceWithBaseMutation(t *testing.T) {
+	_, plan, _ := safeWriterUnavailableChildFixture()
+	plan.FailClosedRoots = []string{"root/dynamic"}
+	plan.Base.ScanBoundary.Roots = []string{"root/dynamic"}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				plan.Base.ScanBoundary.Roots[0] = "other"
+				plan.Base.ScanBoundary.Roots[0] = "root/dynamic"
+			}
+		}
+	}()
+	for i := 0; i < 1000; i++ {
+		if _, ok := safeWriterFailClosedRels(plan)["root/dynamic"]; !ok {
+			t.Fatal("planned fail-closed root disappeared")
+		}
+		if got := canonicalExecutionPlanID(plan); got != plan.PlanID {
+			t.Fatalf("canonical PlanID changed during base mutation: got %q, want %q", got, plan.PlanID)
+		}
+	}
+	close(stop)
+	<-done
+}
+
+func safeWriterUnavailableChildFixture() (*fakeHierarchyDriver, PhasePlan, CgroupIdentity) {
+	rootIdentity := CgroupIdentity{Device: 1, Inode: 1}
+	childIdentity := CgroupIdentity{Device: 1, Inode: 2}
+	driver := newFakeHierarchyDriver()
+	driver.add("root", rootIdentity, "0-3", "0")
+	driver.add("root/dynamic", childIdentity, "0", "0")
+	base := planSnapshot(map[string]EntryState{
+		"root": {
+			Rel: "root", Identity: rootIdentity, CPUs: machine.NewCPUSet(0, 1, 2, 3), Mems: "0",
+		},
+		"root/dynamic": {
+			Rel: "root/dynamic", Identity: childIdentity, CPUs: machine.NewCPUSet(0), Mems: "0",
+		},
+	}, map[DomainID]machine.CPUSet{DomainPrimary: machine.NewCPUSet(0, 1, 2, 3)})
+	base.ScanBoundary.Roots = []string{"root"}
+	plan := PhasePlan{
+		ConvergenceID:   "v2-unavailable-dynamic-child",
+		Kind:            PhaseDrain,
+		Base:            base,
+		FailClosedRoots: []string{"root"},
+		Capabilities:    cgroupV2Policy.capabilities(true),
+		Operations: []PlanOperation{{
+			Rel: "root", ExpectedIdentity: rootIdentity,
+			ExpectedChildren:   ChildrenFingerprint([]ChildRef{{Name: "dynamic", Identity: childIdentity}}),
+			ExpectedChildUnion: machine.NewCPUSet(0),
+			ExpectedCurrent:    CPUSetTarget{CPUs: machine.NewCPUSet(0, 1, 2, 3), Mems: "0"},
+			Target:             CPUSetTarget{CPUs: machine.NewCPUSet(0, 1, 2), Mems: "0"},
+			Direction:          WriteShrink,
+			OwnsMems:           true,
+			WriteMems:          true,
+		}},
+	}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	plan.Operations[0].PlanID = plan.PlanID
+	return driver, plan, childIdentity
 }
 
 func testCPUDetails() machine.CPUDetails {
