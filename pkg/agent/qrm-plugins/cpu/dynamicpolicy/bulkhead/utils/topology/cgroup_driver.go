@@ -35,9 +35,10 @@ import (
 )
 
 var (
-	ErrEmptyCPUSetUnsupported = errors.New("empty configured cpuset is unsupported")
-	ErrFDBindingUnsupported   = errors.New("file-descriptor-bound cgroup write is unsupported")
-	ErrCgroupCrossDevice      = errors.New("cgroup path crosses root device")
+	ErrEmptyCPUSetUnsupported      = errors.New("empty configured cpuset is unsupported")
+	ErrFDBindingUnsupported        = errors.New("file-descriptor-bound cgroup write is unsupported")
+	ErrCgroupCrossDevice           = errors.New("cgroup path crosses root device")
+	ErrCgroupControllerUnavailable = errors.New("cgroup controller interface is unavailable")
 )
 
 const listChildrenBatchSize = 32
@@ -177,7 +178,7 @@ func (d *cgroupFSDriver) ReadEntry(ctx context.Context, rel string) (EntryState,
 	// keeping the snapshot generation-safe if the path is replaced.
 	rawCPUs, err := d.readFileAt(dirFD, d.policy.observedCPUsFile())
 	if err != nil {
-		return EntryState{}, fmt.Errorf("read %s %q: %w", d.policy.observedCPUsFile(), rel, err)
+		return EntryState{}, d.wrapReadEntryFileError(rel, d.policy.observedCPUsFile(), err)
 	}
 	cpus, err := machine.Parse(strings.TrimSpace(string(rawCPUs)))
 	if err != nil {
@@ -185,14 +186,14 @@ func (d *cgroupFSDriver) ReadEntry(ctx context.Context, rel string) (EntryState,
 	}
 	rawMems, err := d.readFileAt(dirFD, d.policy.observedMemsFile())
 	if err != nil {
-		return EntryState{}, fmt.Errorf("read %s %q: %w", d.policy.observedMemsFile(), rel, err)
+		return EntryState{}, d.wrapReadEntryFileError(rel, d.policy.observedMemsFile(), err)
 	}
 	configuredCPUs := cpus.Clone()
 	configuredMems := strings.TrimSpace(string(rawMems))
 	if d.policy.configuredCPUsFile() != d.policy.observedCPUsFile() {
 		rawConfiguredCPUs, readErr := d.readFileAt(dirFD, d.policy.configuredCPUsFile())
 		if readErr != nil {
-			return EntryState{}, fmt.Errorf("read %s %q: %w", d.policy.configuredCPUsFile(), rel, readErr)
+			return EntryState{}, d.wrapReadEntryFileError(rel, d.policy.configuredCPUsFile(), readErr)
 		}
 		configuredCPUs, err = machine.Parse(strings.TrimSpace(string(rawConfiguredCPUs)))
 		if err != nil {
@@ -202,7 +203,7 @@ func (d *cgroupFSDriver) ReadEntry(ctx context.Context, rel string) (EntryState,
 	if d.policy.configuredMemsFile() != d.policy.observedMemsFile() {
 		rawConfiguredMems, readErr := d.readFileAt(dirFD, d.policy.configuredMemsFile())
 		if readErr != nil {
-			return EntryState{}, fmt.Errorf("read %s %q: %w", d.policy.configuredMemsFile(), rel, readErr)
+			return EntryState{}, d.wrapReadEntryFileError(rel, d.policy.configuredMemsFile(), readErr)
 		}
 		configuredMems = strings.TrimSpace(string(rawConfiguredMems))
 	}
@@ -222,6 +223,13 @@ func (d *cgroupFSDriver) ReadEntry(ctx context.Context, rel string) (EntryState,
 		ConfiguredCPUs: configuredCPUs,
 		ConfiguredMems: configuredMems,
 	}, nil
+}
+
+func (d *cgroupFSDriver) wrapReadEntryFileError(rel, file string, err error) error {
+	if d.policy == cgroupV2Policy && errors.Is(err, syscall.ENOENT) && strings.HasPrefix(file, "cpuset.") {
+		return fmt.Errorf("read %s %q: %w: %v", file, rel, ErrCgroupControllerUnavailable, err)
+	}
+	return fmt.Errorf("read %s %q: %w", file, rel, err)
 }
 
 func (d *cgroupFSDriver) ListChildren(ctx context.Context, rel string) ([]ChildRef, error) {
@@ -398,7 +406,8 @@ func (d *cgroupFSDriver) Classify(err error, _ HierarchyOperation) HierarchyErro
 	switch {
 	case err == nil:
 		return HierarchyErrorNone
-	case errors.Is(err, ErrCgroupIdentityChanged),
+	case errors.Is(err, ErrCgroupControllerUnavailable),
+		errors.Is(err, ErrCgroupIdentityChanged),
 		errors.Is(err, syscall.ENOENT),
 		errors.Is(err, syscall.ENOTDIR),
 		errors.Is(err, syscall.ENODEV),

@@ -129,6 +129,81 @@ func TestSnapshotRejectsReadCPUSetReadMemsAndListChildrenFailure(t *testing.T) {
 	}
 }
 
+func TestSnapshotSkipsUncontrolledCgroupV2DescendantWithoutCpusetController(t *testing.T) {
+	fake := buildSnapshotTestHierarchy()
+	fake.capabilities.EffectiveCPUSet = true
+	fake.beforeCall = func(op HierarchyOperation, rel string) error {
+		if op == HierarchyOperationRead && rel == "primary/pod-a/container-a" {
+			return ErrCgroupControllerUnavailable
+		}
+		return nil
+	}
+
+	snapshot, err := BuildCompleteSnapshot(context.Background(), fake, buildSnapshotTestDAG(t), SnapshotRequest{
+		Purpose:      ScanForPlan,
+		AffectedRels: []string{"primary"},
+	}, NewBudgetTracker(ConvergenceBudget{}))
+	if err != nil {
+		t.Fatalf("BuildCompleteSnapshot() error = %v", err)
+	}
+	if _, ok := snapshot.Entries["primary"]; !ok {
+		t.Fatalf("snapshot missing controlled root")
+	}
+	if _, ok := snapshot.Entries["primary/pod-a"]; !ok {
+		t.Fatalf("snapshot missing dynamic parent with cpuset controller")
+	}
+	if _, ok := snapshot.Entries["primary/pod-a/container-a"]; ok {
+		t.Fatalf("snapshot included uncontrolled descendant without cpuset controller")
+	}
+	if got := snapshot.DomainUnion[DomainPrimary].String(); got != "0-1" {
+		t.Fatalf("primary domain union = %q, want 0-1", got)
+	}
+}
+
+func TestSnapshotRejectsControlledCgroupV2NodeWithoutCpusetController(t *testing.T) {
+	fake := buildSnapshotTestHierarchy()
+	fake.capabilities.EffectiveCPUSet = true
+	fake.beforeCall = func(op HierarchyOperation, rel string) error {
+		if op == HierarchyOperationRead && rel == "reclaim/bucket-0" {
+			return ErrCgroupControllerUnavailable
+		}
+		return nil
+	}
+
+	snapshot, err := BuildCompleteSnapshot(context.Background(), fake, buildSnapshotTestDAG(t), SnapshotRequest{
+		Purpose:      ScanForPlan,
+		AffectedRels: []string{"reclaim/bucket-0"},
+	}, NewBudgetTracker(ConvergenceBudget{}))
+	if snapshot != nil {
+		t.Fatalf("snapshot = %#v, want nil", snapshot)
+	}
+	if !errors.Is(err, ErrCgroupControllerUnavailable) {
+		t.Fatalf("error = %v, want ErrCgroupControllerUnavailable", err)
+	}
+}
+
+func TestSnapshotDoesNotSkipUnavailableControllerOnCgroupV1(t *testing.T) {
+	fake := buildSnapshotTestHierarchy()
+	fake.capabilities.EffectiveCPUSet = false
+	fake.beforeCall = func(op HierarchyOperation, rel string) error {
+		if op == HierarchyOperationRead && rel == "primary/pod-a/container-a" {
+			return ErrCgroupControllerUnavailable
+		}
+		return nil
+	}
+
+	snapshot, err := BuildCompleteSnapshot(context.Background(), fake, buildSnapshotTestDAG(t), SnapshotRequest{
+		Purpose:      ScanForPlan,
+		AffectedRels: []string{"primary"},
+	}, NewBudgetTracker(ConvergenceBudget{}))
+	if snapshot != nil {
+		t.Fatalf("snapshot = %#v, want nil", snapshot)
+	}
+	if !errors.Is(err, ErrCgroupControllerUnavailable) {
+		t.Fatalf("error = %v, want ErrCgroupControllerUnavailable", err)
+	}
+}
+
 func TestSnapshotRejectsIdentityChangeAndListStatDeleteRace(t *testing.T) {
 	t.Run("identity changes around read", func(t *testing.T) {
 		fake := buildSnapshotTestHierarchy()

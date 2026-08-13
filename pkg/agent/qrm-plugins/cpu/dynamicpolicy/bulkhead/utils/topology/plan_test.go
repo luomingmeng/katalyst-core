@@ -1350,6 +1350,44 @@ func TestPlanIDBindsKindFreshSnapshotWitnessesAndFinalOperations(t *testing.T) {
 	}
 }
 
+func TestPhasePlanNormalizesAndBindsFailClosedRoots(t *testing.T) {
+	t.Parallel()
+
+	dag := mustPlanDAG(t, []NodeSpec{
+		{Rel: "a", Domain: "a", CPUs: machine.NewCPUSet(0), TrustAnchor: true},
+		{Rel: "b", Domain: "b", CPUs: machine.NewCPUSet(1), TrustAnchor: true},
+	})
+	base := planSnapshot(map[string]EntryState{
+		"a": {Identity: CgroupIdentity{Inode: 1}, CPUs: machine.NewCPUSet(0)},
+		"b": {Identity: CgroupIdentity{Inode: 2}, CPUs: machine.NewCPUSet(1)},
+	}, map[DomainID]machine.CPUSet{"a": machine.NewCPUSet(0), "b": machine.NewCPUSet(1)})
+	base.ScanBoundary.Roots = []string{"b", "a", "b"}
+	base.ID = fingerprintSnapshot(base)
+
+	plan, err := BuildPhasePlan(PhasePlanInput{
+		Kind: PhaseDrain, DAG: dag, Snapshot: base,
+		DesiredByRel: map[string]machine.CPUSet{
+			"a": machine.NewCPUSet(0),
+			"b": machine.NewCPUSet(1),
+		},
+		AllowedCPUs: machine.NewCPUSet(0, 1),
+		Budget:      NewBudgetTracker(ConvergenceBudget{}),
+	})
+	if err != nil {
+		t.Fatalf("BuildPhasePlan: %v", err)
+	}
+	if want := []string{"a", "b"}; !reflect.DeepEqual(plan.FailClosedRoots, want) {
+		t.Fatalf("FailClosedRoots = %#v, want %#v", plan.FailClosedRoots, want)
+	}
+
+	changedRoots := plan
+	changedRoots.FailClosedRoots = append([]string(nil), plan.FailClosedRoots...)
+	changedRoots.FailClosedRoots[0] = "other"
+	if canonicalExecutionPlanID(changedRoots) == plan.PlanID {
+		t.Fatal("canonical PlanID did not bind fail-closed roots")
+	}
+}
+
 func TestExpandPreservesObservedCPUsAfterRatioDrain(t *testing.T) {
 	t.Parallel()
 
