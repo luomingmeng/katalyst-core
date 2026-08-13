@@ -279,7 +279,7 @@ func TestQRMPluginOptions_ValidateBulkheadCATWays(t *testing.T) {
 			t.Parallel()
 
 			options := NewQRMPluginOptions()
-			options.BulkheadDefaultCATWays = tc.defaultCATWays
+			options.BulkheadDefaultCATWays.Value = tc.defaultCATWays
 			options.BulkheadClosCATWays = tc.closCATWays
 
 			err := options.ApplyTo(qrm.NewQRMPluginConfiguration())

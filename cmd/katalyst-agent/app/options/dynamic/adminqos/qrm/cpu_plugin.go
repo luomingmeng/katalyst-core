@@ -19,10 +19,10 @@ package qrm
 import (
 	"fmt"
 
-	"github.com/spf13/pflag"
 	cliflag "k8s.io/component-base/cli/flag"
 
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic/adminqos/qrm"
+	utilflag "github.com/kubewharf/katalyst-core/pkg/util/flags"
 )
 
 type CPUPluginOptions struct {
@@ -37,8 +37,7 @@ type CPUPluginOptions struct {
 	EnableBulkheadWorkqueue          bool
 	EnableBulkheadSystemService      bool
 	BulkheadNonReclaimPoolMinSize    int64
-	BulkheadDefaultCATWays           int64
-	bulkheadDefaultCATWaysFlags      []*pflag.Flag
+	BulkheadDefaultCATWays           utilflag.ExplicitValue[int64]
 	BulkheadClosCATWays              map[string]int64
 	BindIRQToReclaimedPool           bool
 }
@@ -75,9 +74,9 @@ func (o *CPUPluginOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 		"if true, enable bulkhead system_service plugin.")
 	fs.Int64Var(&o.BulkheadNonReclaimPoolMinSize, "bulkhead-non-reclaim-pool-min-size", o.BulkheadNonReclaimPoolMinSize,
 		"minimum CPU count kept in the non-reclaim pool for bulkhead cpuset topology.")
-	fs.Int64Var(&o.BulkheadDefaultCATWays, "bulkhead-default-cat-ways", o.BulkheadDefaultCATWays,
+	fs.Int64Var(&o.BulkheadDefaultCATWays.Value, "bulkhead-default-cat-ways", o.BulkheadDefaultCATWays.Value,
 		"default CAT way count for non-root bulkhead CLOS groups.")
-	o.bulkheadDefaultCATWaysFlags = append(o.bulkheadDefaultCATWaysFlags, fs.Lookup("bulkhead-default-cat-ways"))
+	o.BulkheadDefaultCATWays.TrackFlag(fs, "bulkhead-default-cat-ways")
 	fs.StringToInt64Var(&o.BulkheadClosCATWays, "bulkhead-clos-cat-ways", o.BulkheadClosCATWays,
 		"per-CLOS CAT way counts in clos=ways format.")
 	fs.BoolVar(&o.BindIRQToReclaimedPool, "bind-irq-to-reclaimed-pool", o.BindIRQToReclaimedPool,
@@ -89,15 +88,9 @@ func (o *CPUPluginOptions) ApplyTo(c *qrm.CPUPluginConfiguration) error {
 	if o.InitialRampUpReclaimCPUSetRatio < 0 || o.InitialRampUpReclaimCPUSetRatio > 1 {
 		return fmt.Errorf("initial-ramp-up-reclaim-cpuset-ratio must be in [0,1], got %f", o.InitialRampUpReclaimCPUSetRatio)
 	}
-	defaultCATWaysChanged := false
-	for _, flag := range o.bulkheadDefaultCATWaysFlags {
-		if flag.Changed {
-			defaultCATWaysChanged = true
-			break
-		}
-	}
-	if o.BulkheadDefaultCATWays < 0 || (defaultCATWaysChanged && o.BulkheadDefaultCATWays == 0) {
-		return fmt.Errorf("bulkhead-default-cat-ways must be positive when configured, got %d", o.BulkheadDefaultCATWays)
+	defaultCATWays := o.BulkheadDefaultCATWays.Value
+	if defaultCATWays < 0 || (o.BulkheadDefaultCATWays.Changed() && defaultCATWays == 0) {
+		return fmt.Errorf("bulkhead-default-cat-ways must be positive when configured, got %d", defaultCATWays)
 	}
 
 	var closCATWays map[string]int64
@@ -125,7 +118,7 @@ func (o *CPUPluginOptions) ApplyTo(c *qrm.CPUPluginConfiguration) error {
 	c.BulkheadConfig.EnableBulkheadWorkqueue = o.EnableBulkheadWorkqueue
 	c.BulkheadConfig.EnableBulkheadSystemService = o.EnableBulkheadSystemService
 	c.BulkheadConfig.NonReclaimPoolMinSize = o.BulkheadNonReclaimPoolMinSize
-	c.BulkheadConfig.BulkheadRDTConfig.DefaultCATWays = o.BulkheadDefaultCATWays
+	c.BulkheadConfig.BulkheadRDTConfig.DefaultCATWays = defaultCATWays
 	c.BulkheadConfig.BulkheadRDTConfig.ClosCATWays = closCATWays
 	c.BindIRQToReclaimedPool = o.BindIRQToReclaimedPool
 

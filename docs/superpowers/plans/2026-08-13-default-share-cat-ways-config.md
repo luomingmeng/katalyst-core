@@ -595,7 +595,7 @@ git commit -m "feat(flags): add generic explicit values"
 - Modify: `cmd/katalyst-agent/app/options/dynamic/adminqos/qrm/qrm_base_test.go`
 - Modify: `docs/superpowers/plans/2026-08-13-default-share-cat-ways-config.md`
 
-- [ ] **Step 1: Write the failing QRM integration change**
+- [x] **Step 1: Write the failing QRM integration change**
 
 Change test assignments and assertions to use:
 
@@ -606,7 +606,7 @@ options.BulkheadDefaultCATWays.Value = tc.defaultCATWays
 Keep the existing omitted-zero, explicit-zero, positive parsing, and multiple
 `NamedFlagSets` tests. Run them before changing the implementation.
 
-- [ ] **Step 2: Run tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
 Run:
 
@@ -619,7 +619,10 @@ go test ./cmd/katalyst-agent/app/options/dynamic/adminqos/qrm \
 Expected: FAIL because `BulkheadDefaultCATWays` is still `int64` and has no
 `Value` field.
 
-- [ ] **Step 3: Replace the local tracking fields**
+Observed: FAIL with `options.BulkheadDefaultCATWays.Value undefined (type int64
+has no field or method Value)`.
+
+- [x] **Step 3: Replace the local tracking fields**
 
 Change:
 
@@ -650,7 +653,7 @@ if defaultCATWays < 0 ||
 
 Write `defaultCATWays` to the runtime configuration.
 
-- [ ] **Step 4: Run integration and regression tests**
+- [x] **Step 4: Run integration and regression tests**
 
 Run:
 
@@ -665,7 +668,7 @@ go vet ./cmd/katalyst-agent/app/options/dynamic/adminqos/qrm ./pkg/util/flags
 
 Expected: PASS.
 
-- [ ] **Step 5: Format, inspect, and commit**
+- [x] **Step 5: Format, inspect, and commit**
 
 Run:
 
