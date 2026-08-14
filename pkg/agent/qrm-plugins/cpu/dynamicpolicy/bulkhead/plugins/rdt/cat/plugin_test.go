@@ -26,27 +26,17 @@ import (
 	bulkheadapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api"
 	qrmresctrlmanager "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/resctrl"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
+	qrmconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic/adminqos/qrm"
 	qrmresctrl "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/resctrl"
 	"github.com/kubewharf/katalyst-core/pkg/util/external/rdt"
 )
 
 type fakeClosManager struct {
-	clos    []qrmresctrlmanager.CPUListClos
-	managed map[string]struct{}
+	clos []qrmresctrlmanager.CPUListClos
 }
 
-func (m *fakeClosManager) ListCATManagedClos(context.Context) ([]qrmresctrlmanager.CPUListClos, error) {
-	clos := make([]qrmresctrlmanager.CPUListClos, 0, len(m.clos))
-	for _, current := range m.clos {
-		if m.managed == nil {
-			clos = append(clos, current)
-			continue
-		}
-		if _, ok := m.managed[current.ID]; ok {
-			clos = append(clos, current)
-		}
-	}
-	return clos, nil
+func (m *fakeClosManager) ListManagedClos(context.Context) ([]qrmresctrlmanager.CPUListClos, error) {
+	return append([]qrmresctrlmanager.CPUListClos(nil), m.clos...), nil
 }
 
 type catWrite struct {
@@ -95,27 +85,185 @@ func periodicalContext(conf *dynamicconfig.Configuration) bulkheadapi.Periodical
 	return bulkheadapi.PeriodicalHandlerContext{DynamicConf: conf}
 }
 
+func catExpr(raw string) qrmconfig.CATWaysExpression {
+	expr, err := qrmconfig.ParseCATWaysExpression(raw)
+	if err != nil {
+		panic(err)
+	}
+	return expr
+}
+
 func TestCATPluginBuildsSymmetricDomainMasksAndPrefersDirectClosOverride(t *testing.T) {
 	manager := &fakeRDTManager{}
 	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{
 		CPUSetPoolToSharedSubgroup: map[string]int{"batch": 3},
 	}, &fakeClosManager{clos: []qrmresctrlmanager.CPUListClos{
 		{ID: "dedicated"}, {ID: "share-03"}, {ID: "external"},
-	}, managed: map[string]struct{}{"dedicated": {}, "share-03": {}}}, manager, fakeCapabilityProvider{capabilities: map[int]rdt.CATCapability{
+	}}, manager, fakeCapabilityProvider{capabilities: map[int]rdt.CATCapability{
 		0: {CBMMask: 0xf0, MinCBMBits: 2},
 		1: {CBMMask: 0x0f, MinCBMBits: 2},
 	}})
 
-	_, err := plugin.reconcile(context.Background(), 2, map[string]int64{
-		"batch":    3,
-		"share-03": 4,
+	_, err := plugin.reconcileConfig(context.Background(), qrmconfig.DynamicBulkheadRDTConfiguration{
+		DefaultCATWays: catExpr("2"),
+		ClosCATWays: map[string]qrmconfig.CATWaysExpression{
+			"batch":    catExpr("3"),
+			"share-03": catExpr("4"),
+		},
 	})
 
 	require.NoError(t, err)
 	require.Equal(t, []catWrite{
 		{clos: "dedicated", mask: map[int]uint64{0: 0x30, 1: 0x03}},
+		{clos: "external", mask: map[int]uint64{0: 0x30, 1: 0x03}},
 		{clos: "share-03", mask: map[int]uint64{0: 0xf0, 1: 0x0f}},
 	}, manager.writes)
+}
+
+func TestCATPluginBuildsExpressionTargets(t *testing.T) {
+	manager := &fakeRDTManager{}
+	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{
+		clos: []qrmresctrlmanager.CPUListClos{{ID: "share-01"}, {ID: "share-00"}},
+	}, manager, fakeCapabilityProvider{capabilities: map[int]rdt.CATCapability{
+		0: {CBMMask: 0x7ff, MinCBMBits: 2},
+		1: {CBMMask: 0xff, MinCBMBits: 2},
+	}})
+
+	applied, err := plugin.reconcileConfig(context.Background(), qrmconfig.DynamicBulkheadRDTConfiguration{
+		DefaultCATWays: catExpr("MaxCATWays"),
+		ClosCATWays: map[string]qrmconfig.CATWaysExpression{
+			"share-00": catExpr("MinCATWays"),
+			"share-01": catExpr("MaxCATWays-2"),
+		},
+	})
+
+	require.NoError(t, err)
+	require.True(t, applied)
+	require.Equal(t, []catWrite{
+		{clos: "share-00", mask: map[int]uint64{0: 0x003, 1: 0x03}},
+		{clos: "share-01", mask: map[int]uint64{0: 0x1ff, 1: 0x3f}},
+	}, manager.writes)
+}
+
+func TestCATPluginExclusiveClosIDsReserveNonOverlappingWays(t *testing.T) {
+	manager := &fakeRDTManager{}
+	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{
+		clos: []qrmresctrlmanager.CPUListClos{{ID: "peer-b"}, {ID: "peer-c"}, {ID: "clos-a"}},
+	}, manager, fakeCapabilityProvider{capabilities: map[int]rdt.CATCapability{
+		0: {CBMMask: 0xff, MinCBMBits: 2},
+	}})
+	exclusiveClosIDs := []string{"clos-a"}
+	conf := qrmconfig.DynamicBulkheadRDTConfiguration{
+		DefaultCATWays: catExpr("MinCATWays"),
+		CATPolicy: qrmconfig.CATPolicy{
+			ExclusiveClosIDs: exclusiveClosIDs,
+		},
+	}
+
+	applied, err := plugin.reconcileConfig(context.Background(), conf)
+	require.NoError(t, err)
+	require.True(t, applied)
+
+	require.Equal(t, []catWrite{
+		{clos: "clos-a", mask: map[int]uint64{0: 0x03}},
+		{clos: "peer-b", mask: map[int]uint64{0: 0x0c}},
+		{clos: "peer-c", mask: map[int]uint64{0: 0x0c}},
+	}, manager.writes)
+}
+
+func TestCATPluginExclusiveClosIDsRespectPlacement(t *testing.T) {
+	manager := &fakeRDTManager{}
+	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{
+		clos: []qrmresctrlmanager.CPUListClos{{ID: "clos-a"}, {ID: "peer-b"}},
+	}, manager, fakeCapabilityProvider{capabilities: map[int]rdt.CATCapability{
+		0: {CBMMask: 0xff, MinCBMBits: 2, BitUsageByType: map[string]uint64{"S": 0x0f, "X": 0xf0}},
+	}})
+	exclusiveClosIDs := []string{"clos-a"}
+
+	applied, err := plugin.reconcileConfig(context.Background(), qrmconfig.DynamicBulkheadRDTConfiguration{
+		DefaultCATWays: catExpr("MinCATWays"),
+		CATPolicy: qrmconfig.CATPolicy{
+			ExclusiveClosIDs: exclusiveClosIDs,
+			ClosPlacements: map[string]qrmconfig.CATPlacementPolicy{
+				"clos-a": {
+					AllowedBitUsages: []qrmconfig.CATBitUsage{qrmconfig.CATBitUsageSoftware, qrmconfig.CATBitUsageExclusive},
+					Direction:        qrmconfig.CATAllocationDirectionHigh,
+				},
+			},
+		},
+	})
+
+	require.NoError(t, err)
+	require.True(t, applied)
+	require.Equal(t, []catWrite{
+		{clos: "clos-a", mask: map[int]uint64{0: 0xc0}},
+		{clos: "peer-b", mask: map[int]uint64{0: 0x03}},
+	}, manager.writes)
+	require.Zero(t, manager.writes[0].mask[0]&manager.writes[1].mask[0])
+}
+
+func TestCATPluginAllowedBitUsageAllUsesCBMMask(t *testing.T) {
+	manager := &fakeRDTManager{}
+	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{
+		clos: []qrmresctrlmanager.CPUListClos{{ID: "clos-a"}},
+	}, manager, fakeCapabilityProvider{capabilities: map[int]rdt.CATCapability{
+		0: {CBMMask: 0xff, MinCBMBits: 2, BitUsageByType: map[string]uint64{"S": 0x0f}},
+	}})
+
+	applied, err := plugin.reconcileConfig(context.Background(), qrmconfig.DynamicBulkheadRDTConfiguration{
+		DefaultCATWays: catExpr("MaxCATWays"),
+		CATPolicy: qrmconfig.CATPolicy{
+			DefaultPlacement: &qrmconfig.CATPlacementPolicy{
+				AllowedBitUsages: []qrmconfig.CATBitUsage{qrmconfig.CATBitUsageAll},
+			},
+		},
+	})
+
+	require.NoError(t, err)
+	require.True(t, applied)
+	require.Equal(t, []catWrite{
+		{clos: "clos-a", mask: map[int]uint64{0: 0xff}},
+	}, manager.writes)
+}
+
+func TestCATPluginExclusiveClosIDsRejectUnmanagedCLOS(t *testing.T) {
+	manager := &fakeRDTManager{}
+	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{
+		clos: []qrmresctrlmanager.CPUListClos{{ID: "clos-a"}},
+	}, manager, fakeCapabilityProvider{capabilities: map[int]rdt.CATCapability{
+		0: {CBMMask: 0xff, MinCBMBits: 2, BitUsageByType: map[string]uint64{"S": 0x0f, "X": 0xf0}},
+	}})
+	exclusiveClosIDs := []string{"peer-b"}
+
+	_, err := plugin.reconcileConfig(context.Background(), qrmconfig.DynamicBulkheadRDTConfiguration{
+		DefaultCATWays: catExpr("MinCATWays"),
+		CATPolicy: qrmconfig.CATPolicy{
+			ExclusiveClosIDs: exclusiveClosIDs,
+		},
+	})
+
+	require.ErrorContains(t, err, "is not configured")
+	require.Empty(t, manager.writes)
+}
+
+func TestCATPluginExclusiveClosIDsRejectDuplicateCLOS(t *testing.T) {
+	manager := &fakeRDTManager{}
+	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{
+		clos: []qrmresctrlmanager.CPUListClos{{ID: "clos-a"}},
+	}, manager, fakeCapabilityProvider{capabilities: map[int]rdt.CATCapability{
+		0: {CBMMask: 0xff, MinCBMBits: 2, BitUsageByType: map[string]uint64{"S": 0x0f, "X": 0xf0}},
+	}})
+	exclusiveClosIDs := []string{"clos-a", "clos-a"}
+
+	_, err := plugin.reconcileConfig(context.Background(), qrmconfig.DynamicBulkheadRDTConfiguration{
+		DefaultCATWays: catExpr("MinCATWays"),
+		CATPolicy: qrmconfig.CATPolicy{
+			ExclusiveClosIDs: exclusiveClosIDs,
+		},
+	})
+
+	require.ErrorContains(t, err, "duplicate exclusive CLOS ID")
+	require.Empty(t, manager.writes)
 }
 
 func TestCATPluginRejectsAllWritesWhenAnyDomainCannotSatisfyWays(t *testing.T) {
@@ -127,7 +275,9 @@ func TestCATPluginRejectsAllWritesWhenAnyDomainCannotSatisfyWays(t *testing.T) {
 		1: {CBMMask: 0x03, MinCBMBits: 2},
 	}})
 
-	_, err := plugin.reconcile(context.Background(), 3, nil)
+	_, err := plugin.reconcileConfig(context.Background(), qrmconfig.DynamicBulkheadRDTConfiguration{
+		DefaultCATWays: catExpr("3"),
+	})
 
 	require.Error(t, err)
 	require.Empty(t, manager.writes)
@@ -136,14 +286,13 @@ func TestCATPluginRejectsAllWritesWhenAnyDomainCannotSatisfyWays(t *testing.T) {
 func TestCATPluginDisabledRestoresRootAndManagedClosOnly(t *testing.T) {
 	manager := &fakeRDTManager{}
 	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{
-		clos:    []qrmresctrlmanager.CPUListClos{{ID: "dedicated"}, {ID: "external"}},
-		managed: map[string]struct{}{"dedicated": {}},
+		clos: []qrmresctrlmanager.CPUListClos{{ID: "dedicated"}, {ID: "external"}},
 	}, manager, fakeCapabilityProvider{capabilities: map[int]rdt.CATCapability{
 		0: {CBMMask: 0xff, MinCBMBits: 1},
 	}})
 
 	conf := dynamicconfig.NewConfiguration()
-	conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.DefaultCATWays = 2
+	conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.DefaultCATWays = catExpr("2")
 	handlerCtx := periodicalContext(conf)
 	conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.EnableCAT = true
 	require.NoError(t, plugin.PeriodicalHandler(context.Background(), handlerCtx))
@@ -152,6 +301,7 @@ func TestCATPluginDisabledRestoresRootAndManagedClosOnly(t *testing.T) {
 	require.NoError(t, plugin.PeriodicalHandler(context.Background(), handlerCtx))
 	require.Equal(t, []catWrite{
 		{clos: "dedicated", mask: map[int]uint64{0: 0x03}},
+		{clos: "external", mask: map[int]uint64{0: 0x03}},
 	}, manager.writes)
 }
 
@@ -163,7 +313,13 @@ func TestCATPluginPartialFailureRollsBackEveryManagedClos(t *testing.T) {
 		0: {CBMMask: 0xff, MinCBMBits: 1},
 	}})
 
-	_, err := plugin.reconcile(context.Background(), 2, map[string]int64{"dedicated": 4, "share-03": 4})
+	_, err := plugin.reconcileConfig(context.Background(), qrmconfig.DynamicBulkheadRDTConfiguration{
+		DefaultCATWays: catExpr("2"),
+		ClosCATWays: map[string]qrmconfig.CATWaysExpression{
+			"dedicated": catExpr("4"),
+			"share-03":  catExpr("4"),
+		},
+	})
 
 	require.ErrorContains(t, err, "apply CAT")
 	require.Equal(t, []catWrite{
@@ -182,9 +338,11 @@ func TestCATPluginPartialFailureWithZeroDefaultRollsBackCapabilityBaseline(t *te
 		0: {CBMMask: 0xff, MinCBMBits: 1},
 	}})
 
-	_, err := plugin.reconcile(context.Background(), 0, map[string]int64{
-		"dedicated": 4,
-		"share-03":  4,
+	_, err := plugin.reconcileConfig(context.Background(), qrmconfig.DynamicBulkheadRDTConfiguration{
+		ClosCATWays: map[string]qrmconfig.CATWaysExpression{
+			"dedicated": catExpr("4"),
+			"share-03":  catExpr("4"),
+		},
 	})
 
 	require.ErrorContains(t, err, "apply CAT")
@@ -204,7 +362,7 @@ func TestCATPluginRestartedDisabledStateIdempotentlyRollsBack(t *testing.T) {
 		0: {CBMMask: 0xff, MinCBMBits: 1},
 	}})
 	conf := dynamicconfig.NewConfiguration()
-	conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.DefaultCATWays = 2
+	conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.DefaultCATWays = catExpr("2")
 
 	require.NoError(t, plugin.PeriodicalHandler(context.Background(), periodicalContext(conf)))
 	require.NoError(t, plugin.PeriodicalHandler(context.Background(), periodicalContext(conf)))
@@ -232,7 +390,10 @@ func TestCATPluginRestartedDisabledWithZeroDefaultRestoresCapabilityBaseline(t *
 }
 
 func TestCATPluginDisabledByTopLevelDisableRDT(t *testing.T) {
-	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{}, &fakeRDTManager{},
+	manager := &fakeRDTManager{}
+	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{
+		clos: []qrmresctrlmanager.CPUListClos{{ID: "dedicated"}},
+	}, manager,
 		fakeCapabilityProvider{capabilities: map[int]rdt.CATCapability{
 			0: {CBMMask: 0xff, MinCBMBits: 1},
 		}})
@@ -241,7 +402,24 @@ func TestCATPluginDisabledByTopLevelDisableRDT(t *testing.T) {
 	conf.AdminQoSConfiguration.QRMPluginConfiguration.RDTConfig.DisableRDT = true
 
 	require.NoError(t, plugin.PeriodicalHandler(context.Background(), periodicalContext(conf)))
-	require.Empty(t, plugin.rdtManager.(*fakeRDTManager).writes)
+	require.Empty(t, manager.writes)
+}
+
+func TestCATPluginRejectsInvalidCATConfigurationBeforeWriting(t *testing.T) {
+	manager := &fakeRDTManager{}
+	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{
+		clos: []qrmresctrlmanager.CPUListClos{{ID: "dedicated"}},
+	}, manager, fakeCapabilityProvider{capabilities: map[int]rdt.CATCapability{
+		0: {CBMMask: 0xff, MinCBMBits: 1},
+	}})
+	conf := dynamicconfig.NewConfiguration()
+	conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.EnableCAT = true
+	conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.CATConfigError = "invalid cat ways for clos \"share-00\""
+
+	err := plugin.PeriodicalHandler(context.Background(), periodicalContext(conf))
+
+	require.ErrorContains(t, err, "invalid cat configuration")
+	require.Empty(t, manager.writes)
 }
 
 func TestCATPluginDisabledWithoutPriorTakeoverIsNoop(t *testing.T) {
@@ -265,7 +443,12 @@ func TestCATPluginValidatesEveryManagedTargetBeforeApplyingAny(t *testing.T) {
 		0: {CBMMask: 0x0f, MinCBMBits: 1},
 	}})
 
-	_, err := plugin.reconcile(context.Background(), 2, map[string]int64{"share-03": 5})
+	_, err := plugin.reconcileConfig(context.Background(), qrmconfig.DynamicBulkheadRDTConfiguration{
+		DefaultCATWays: catExpr("2"),
+		ClosCATWays: map[string]qrmconfig.CATWaysExpression{
+			"share-03": catExpr("5"),
+		},
+	})
 
 	require.Error(t, err)
 	require.Empty(t, manager.writes)
@@ -280,45 +463,50 @@ func TestCATPluginRollbackValidatesEveryTargetBeforeRestoringRoot(t *testing.T) 
 	}})
 	enabled := dynamicconfig.NewConfiguration()
 	enabled.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.EnableCAT = true
-	enabled.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.DefaultCATWays = 2
+	enabled.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.DefaultCATWays = catExpr("2")
 	require.NoError(t, plugin.PeriodicalHandler(context.Background(), periodicalContext(enabled)))
 	manager.writes = nil
 
 	disabled := dynamicconfig.NewConfiguration()
-	disabled.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.DefaultCATWays = 5
+	disabled.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.DefaultCATWays = catExpr("5")
 	err := plugin.PeriodicalHandler(context.Background(), periodicalContext(disabled))
 
 	require.Error(t, err)
 	require.Empty(t, manager.writes)
 }
 
-func TestCATPluginDoesNotTreatForeignSharedPrefixAsOwned(t *testing.T) {
+func TestCATPluginKeepsPhysicalClosIDsDistinct(t *testing.T) {
 	manager := &fakeRDTManager{}
 	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{
 		CPUSetPoolToSharedSubgroup: map[string]int{"batch": 3},
 	}, &fakeClosManager{clos: []qrmresctrlmanager.CPUListClos{
 		{ID: "share-03"}, {ID: "shared-foreign"},
-	}, managed: map[string]struct{}{"share-03": {}}}, manager, fakeCapabilityProvider{capabilities: map[int]rdt.CATCapability{
+	}}, manager, fakeCapabilityProvider{capabilities: map[int]rdt.CATCapability{
 		0: {CBMMask: 0x0f, MinCBMBits: 1},
 	}})
 
-	_, err := plugin.reconcile(context.Background(), 2, nil)
+	_, err := plugin.reconcileConfig(context.Background(), qrmconfig.DynamicBulkheadRDTConfiguration{
+		DefaultCATWays: catExpr("2"),
+	})
 	require.NoError(t, err)
-	require.Equal(t, []catWrite{{clos: "share-03", mask: map[int]uint64{0: 0x03}}}, manager.writes)
+	require.Equal(t, []catWrite{
+		{clos: "share-03", mask: map[int]uint64{0: 0x03}},
+		{clos: "shared-foreign", mask: map[int]uint64{0: 0x03}},
+	}, manager.writes)
 }
 
-func TestCATPluginNormalizesLegacySharedOverride(t *testing.T) {
+func TestCATPluginNormalizesSharedExpressionOverride(t *testing.T) {
 	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{
 		CPUSetPoolToSharedSubgroup: map[string]int{"batch": 3},
 	}, &fakeClosManager{}, &fakeRDTManager{}, fakeCapabilityProvider{})
 
-	resolved, err := plugin.resolveOverrides(map[string]int64{
-		"batch":     3,
-		"shared-03": 4,
+	resolved, err := plugin.resolveExpressionOverrides(map[string]qrmconfig.CATWaysExpression{
+		"batch":     catExpr("3"),
+		"shared-03": catExpr("4"),
 	})
 
 	require.NoError(t, err)
-	require.Equal(t, map[string]int64{"share-03": 4}, resolved)
+	require.Equal(t, map[string]qrmconfig.CATWaysExpression{"share-03": catExpr("4")}, resolved)
 }
 
 func TestCATPluginTreatsUnsupportedCapabilityAsNoop(t *testing.T) {
@@ -328,14 +516,13 @@ func TestCATPluginTreatsUnsupportedCapabilityAsNoop(t *testing.T) {
 	}, manager, fakeCapabilityProvider{err: rdt.ErrCATUnsupported})
 	conf := dynamicconfig.NewConfiguration()
 	conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.EnableCAT = true
-	conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.DefaultCATWays = 2
+	conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.DefaultCATWays = catExpr("2")
 
 	require.NoError(t, plugin.PeriodicalHandler(context.Background(), periodicalContext(conf)))
 	conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.EnableCAT = false
 	require.NoError(t, plugin.PeriodicalHandler(context.Background(), periodicalContext(conf)))
 	require.Empty(t, manager.writes)
 	require.Empty(t, manager.invalidated)
-	require.False(t, plugin.active)
 }
 
 func TestCATPluginCPUSetAdjustmentHandlersAreNoop(t *testing.T) {
@@ -347,7 +534,7 @@ func TestCATPluginCPUSetAdjustmentHandlersAreNoop(t *testing.T) {
 	}})
 	conf := dynamicconfig.NewConfiguration()
 	conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.EnableCAT = true
-	conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.DefaultCATWays = 2
+	conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.DefaultCATWays = catExpr("2")
 
 	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), bulkheadapi.HandlerContext{}))
 	require.NoError(t, plugin.CPUSetAdjustmentDisabledHandler(context.Background(), bulkheadapi.HandlerContext{}))

@@ -17,11 +17,9 @@ limitations under the License.
 package qrm
 
 import (
-	"reflect"
 	"strings"
 	"testing"
 
-	"github.com/spf13/pflag"
 	cliflag "k8s.io/component-base/cli/flag"
 
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic/adminqos/qrm"
@@ -37,6 +35,9 @@ func TestNewQRMPluginOptions(t *testing.T) {
 	}
 	if !options.EnableBulkheadCpusetMems {
 		t.Errorf("EnableBulkheadCpusetMems default = false, want true")
+	}
+	if options.BulkheadCATDefaultAllowedBitUsages != "*" {
+		t.Errorf("BulkheadCATDefaultAllowedBitUsages default = %q, want *", options.BulkheadCATDefaultAllowedBitUsages)
 	}
 }
 
@@ -62,6 +63,7 @@ func TestQRMPluginOptions_AddFlags(t *testing.T) {
 		"bulkhead-non-reclaim-pool-min-size",
 		"bulkhead-default-cat-ways",
 		"bulkhead-clos-cat-ways",
+		"bulkhead-cat-default-allowed-bit-usages",
 	} {
 		if cpuPluginFlagSet.Lookup(name) == nil {
 			t.Errorf("qrm-cpu-plugin flag %q not found", name)
@@ -160,14 +162,19 @@ func TestQRMPluginOptions_ParseBulkheadCATWays(t *testing.T) {
 	options.AddFlags(fss)
 
 	if err := fss.FlagSet("qrm-cpu-plugin").Parse([]string{
-		"--bulkhead-default-cat-ways=4",
-		"--bulkhead-clos-cat-ways=reclaim=2,shared=3",
+		"--bulkhead-default-cat-ways=MaxCATWays",
+		"--bulkhead-clos-cat-ways=share-00=MaxCATWays-MinCATWays,share-01=2",
 	}); err != nil {
 		t.Fatalf("failed to parse flags: %v", err)
 	}
-	wantClosCATWays := map[string]int64{"reclaim": 2, "shared": 3}
-	if !reflect.DeepEqual(options.BulkheadClosCATWays, wantClosCATWays) {
-		t.Fatalf("BulkheadClosCATWays = %v, want %v", options.BulkheadClosCATWays, wantClosCATWays)
+	if got := options.BulkheadDefaultCATWays.Value; got != "MaxCATWays" {
+		t.Fatalf("BulkheadDefaultCATWays = %q, want MaxCATWays", got)
+	}
+	if got := options.BulkheadClosCATWays["share-00"]; got != "MaxCATWays-MinCATWays" {
+		t.Fatalf("BulkheadClosCATWays[share-00] = %q, want MaxCATWays-MinCATWays", got)
+	}
+	if got := options.BulkheadClosCATWays["share-01"]; got != "2" {
+		t.Fatalf("BulkheadClosCATWays[share-01] = %q, want 2", got)
 	}
 
 	config := qrm.NewQRMPluginConfiguration()
@@ -175,15 +182,124 @@ func TestQRMPluginOptions_ParseBulkheadCATWays(t *testing.T) {
 		t.Fatalf("ApplyTo failed: %v", err)
 	}
 	rdt := config.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig
-	if rdt.DefaultCATWays != 4 {
-		t.Fatalf("DefaultCATWays = %d, want 4", rdt.DefaultCATWays)
+	if got := rdt.DefaultCATWays.String(); got != "MaxCATWays" {
+		t.Fatalf("DefaultCATWays = %s, want MaxCATWays", got)
 	}
-	if !reflect.DeepEqual(rdt.ClosCATWays, wantClosCATWays) {
-		t.Fatalf("ClosCATWays = %v, want %v", rdt.ClosCATWays, wantClosCATWays)
+	if got := rdt.ClosCATWays["share-00"].String(); got != "MaxCATWays-MinCATWays" {
+		t.Fatalf("ClosCATWays[share-00] = %s, want MaxCATWays-MinCATWays", got)
 	}
-	options.BulkheadClosCATWays["reclaim"] = 9
-	if rdt.ClosCATWays["reclaim"] != 2 {
-		t.Fatalf("ClosCATWays aliases options map: reclaim = %d, want 2", rdt.ClosCATWays["reclaim"])
+	if got := rdt.ClosCATWays["share-01"].String(); got != "2" {
+		t.Fatalf("ClosCATWays[share-01] = %s, want 2", got)
+	}
+	if got := rdt.CATPolicy.DefaultPlacement.AllowedBitUsages; len(got) != 1 || got[0] != qrm.CATBitUsageAll {
+		t.Fatalf("DefaultPlacement.AllowedBitUsages = %#v, want *", got)
+	}
+	options.BulkheadClosCATWays["share-01"] = "9"
+	if got := rdt.ClosCATWays["share-01"].String(); got != "2" {
+		t.Fatalf("ClosCATWays aliases options map: share-01 = %s, want 2", got)
+	}
+}
+
+func TestQRMPluginOptions_ParseBulkheadCATDefaultAllowedBitUsages(t *testing.T) {
+	t.Parallel()
+
+	options := NewQRMPluginOptions()
+	fss := &cliflag.NamedFlagSets{}
+	options.AddFlags(fss)
+
+	if err := fss.FlagSet("qrm-cpu-plugin").Parse([]string{"--bulkhead-cat-default-allowed-bit-usages=*"}); err != nil {
+		t.Fatalf("failed to parse flags: %v", err)
+	}
+	config := qrm.NewQRMPluginConfiguration()
+	if err := options.ApplyTo(config); err != nil {
+		t.Fatalf("ApplyTo failed: %v", err)
+	}
+	got := config.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.CATPolicy.DefaultPlacement.AllowedBitUsages
+	if len(got) != 1 || got[0] != qrm.CATBitUsageAll {
+		t.Fatalf("DefaultPlacement.AllowedBitUsages = %#v, want *", got)
+	}
+}
+
+func TestQRMPluginOptions_RejectInvalidBulkheadCATDefaultAllowedBitUsages(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name            string
+		value           string
+		wantErrContains string
+	}{
+		{name: "unknown", value: "Q", wantErrContains: `unsupported cat bit usage "q"`},
+		{name: "combined wildcard", value: "*,S", wantErrContains: `cat bit usage "*" must not be combined`},
+		{name: "duplicate", value: "S,S", wantErrContains: `duplicate cat bit usage "s"`},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			options := NewQRMPluginOptions()
+			fss := &cliflag.NamedFlagSets{}
+			options.AddFlags(fss)
+			if err := fss.FlagSet("qrm-cpu-plugin").Parse([]string{"--bulkhead-cat-default-allowed-bit-usages=" + tc.value}); err != nil {
+				t.Fatalf("failed to parse flags: %v", err)
+			}
+
+			err := options.ApplyTo(qrm.NewQRMPluginConfiguration())
+			if err == nil {
+				t.Fatal("ApplyTo succeeded, want error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErrContains) {
+				t.Fatalf("ApplyTo error = %q, want substring %q", err, tc.wantErrContains)
+			}
+			if err.Error() != strings.ToLower(err.Error()) {
+				t.Fatalf("ApplyTo error = %q, want lower-case error", err)
+			}
+		})
+	}
+}
+
+func TestQRMPluginOptions_ApplyToRejectsLegacyCATWaysTokens(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name            string
+		args            []string
+		wantErrContains string
+	}{
+		{
+			name:            "legacy CBMMask token",
+			args:            []string{"--bulkhead-default-cat-ways=CBMMask"},
+			wantErrContains: `cat ways expression operand "CBMMask" is invalid`,
+		},
+		{
+			name:            "legacy MinCBMBits token",
+			args:            []string{"--bulkhead-clos-cat-ways=share-00=MinCBMBits"},
+			wantErrContains: `cat ways expression operand "MinCBMBits" is invalid`,
+		},
+		{
+			name:            "legacy combined tokens",
+			args:            []string{"--bulkhead-clos-cat-ways=share-00=CBMMask-MinCBMBits"},
+			wantErrContains: `cat ways expression operand "CBMMask" is invalid`,
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			options := NewQRMPluginOptions()
+			fss := &cliflag.NamedFlagSets{}
+			options.AddFlags(fss)
+			if err := fss.FlagSet("qrm-cpu-plugin").Parse(tc.args); err != nil {
+				t.Fatalf("failed to parse flags: %v", err)
+			}
+
+			err := options.ApplyTo(qrm.NewQRMPluginConfiguration())
+			if err == nil {
+				t.Fatal("ApplyTo succeeded, want error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErrContains) {
+				t.Fatalf("ApplyTo error = %q, want substring %q", err, tc.wantErrContains)
+			}
+		})
 	}
 }
 
@@ -191,11 +307,12 @@ func TestQRMPluginOptions_ParseInvalidBulkheadClosCATWays(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
-		name  string
-		value string
+		name            string
+		value           string
+		wantErrContains string
 	}{
-		{name: "non-integer ways", value: "reclaim=invalid"},
-		{name: "missing equals", value: "reclaim"},
+		{name: "invalid expression", value: "reclaim=invalid", wantErrContains: "invalid bulkhead-clos-cat-ways for clos"},
+		{name: "zero ways", value: "reclaim=0", wantErrContains: "cat ways expression operand"},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
@@ -206,10 +323,15 @@ func TestQRMPluginOptions_ParseInvalidBulkheadClosCATWays(t *testing.T) {
 			options.AddFlags(fss)
 
 			fs := fss.FlagSet("qrm-cpu-plugin")
-			fs.Init("qrm-cpu-plugin", pflag.ContinueOnError)
-			err := fs.Parse([]string{"--bulkhead-clos-cat-ways=" + tc.value})
+			if err := fs.Parse([]string{"--bulkhead-clos-cat-ways=" + tc.value}); err != nil {
+				t.Fatalf("failed to parse flag: %v", err)
+			}
+			err := options.ApplyTo(qrm.NewQRMPluginConfiguration())
 			if err == nil {
-				t.Fatalf("Parse(%q) succeeded, want pflag error", tc.value)
+				t.Fatal("ApplyTo succeeded, want error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErrContains) {
+				t.Fatalf("ApplyTo error = %q, want substring %q", err, tc.wantErrContains)
 			}
 		})
 	}
@@ -230,7 +352,7 @@ func TestQRMPluginOptions_ParseExplicitZeroBulkheadDefaultCATWays(t *testing.T) 
 	if err == nil {
 		t.Fatal("ApplyTo succeeded, want error")
 	}
-	if !strings.Contains(err.Error(), "bulkhead-default-cat-ways must be positive") {
+	if !strings.Contains(err.Error(), "cat ways expression operand") {
 		t.Fatalf("ApplyTo error = %q, want positive-value error", err)
 	}
 	if err.Error() != strings.ToLower(err.Error()) {
@@ -255,7 +377,7 @@ func TestCPUPluginOptions_ParseExplicitZeroFromFirstNamedFlagSets(t *testing.T) 
 	if err == nil {
 		t.Fatal("ApplyTo succeeded, want error")
 	}
-	if !strings.Contains(err.Error(), "bulkhead-default-cat-ways must be positive") {
+	if !strings.Contains(err.Error(), "cat ways expression operand") {
 		t.Fatalf("ApplyTo error = %q, want positive-value error", err)
 	}
 }
@@ -265,14 +387,14 @@ func TestQRMPluginOptions_ValidateBulkheadCATWays(t *testing.T) {
 
 	for _, tc := range []struct {
 		name            string
-		defaultCATWays  int64
-		closCATWays     map[string]int64
+		defaultCATWays  string
+		closCATWays     map[string]string
 		wantErrContains string
 	}{
-		{name: "negative default", defaultCATWays: -1, wantErrContains: "bulkhead-default-cat-ways must be positive"},
-		{name: "empty clos", closCATWays: map[string]int64{"": 2}, wantErrContains: "bulkhead-clos-cat-ways contains an empty clos"},
-		{name: "zero ways", closCATWays: map[string]int64{"reclaim": 0}, wantErrContains: "bulkhead-clos-cat-ways value must be positive"},
-		{name: "negative ways", closCATWays: map[string]int64{"reclaim": -1}, wantErrContains: "bulkhead-clos-cat-ways value must be positive"},
+		{name: "negative default", defaultCATWays: "-1", wantErrContains: "invalid bulkhead-default-cat-ways"},
+		{name: "empty clos", closCATWays: map[string]string{"": "2"}, wantErrContains: "bulkhead-clos-cat-ways contains an empty clos"},
+		{name: "zero ways", closCATWays: map[string]string{"reclaim": "0"}, wantErrContains: "invalid bulkhead-clos-cat-ways for clos"},
+		{name: "negative ways", closCATWays: map[string]string{"reclaim": "-1"}, wantErrContains: "invalid bulkhead-clos-cat-ways for clos"},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
@@ -304,8 +426,8 @@ func TestQRMPluginOptions_ValidateBulkheadCATWays(t *testing.T) {
 			t.Fatalf("ApplyTo failed: %v", err)
 		}
 		rdt := config.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig
-		if rdt.DefaultCATWays != 0 {
-			t.Fatalf("DefaultCATWays = %d, want 0", rdt.DefaultCATWays)
+		if rdt.DefaultCATWays.Configured() {
+			t.Fatalf("DefaultCATWays = %s, want unconfigured", rdt.DefaultCATWays.String())
 		}
 		if rdt.ClosCATWays != nil {
 			t.Fatalf("ClosCATWays = %v, want nil", rdt.ClosCATWays)
