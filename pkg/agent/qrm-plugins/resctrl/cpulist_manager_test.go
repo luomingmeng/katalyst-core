@@ -18,7 +18,6 @@ package resctrl
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"sync"
@@ -30,13 +29,11 @@ import (
 
 func TestCPUListManagerApplyCPUListWritesResctrlMask(t *testing.T) {
 	root := t.TempDir()
-	checkpointPath := filepath.Join(t.TempDir(), "ownership.json")
 	require.NoError(t, os.WriteFile(filepath.Join(root, cpus), []byte("ffffffff,ffffffff,ffffffff\n"), 0o644))
 	require.NoError(t, os.Mkdir(filepath.Join(root, "dedicated"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(root, "dedicated", cpus), []byte("ffffffff,ffffffff,ffffffff\n"), 0o644))
-	require.NoError(t, os.WriteFile(checkpointPath, []byte(`{"version":3,"clos_ids":["dedicated"]}`), 0o644))
 
-	manager := newCPUListManagerWithOwnership(root, nil, checkpointPath)
+	manager := newCPUListManagerWithUpdater(root, nil)
 	require.NoError(t, manager.ApplyCPUList(context.Background(), "dedicated", "1-7,25,49"))
 
 	content, err := os.ReadFile(filepath.Join(root, "dedicated", cpus))
@@ -46,13 +43,11 @@ func TestCPUListManagerApplyCPUListWritesResctrlMask(t *testing.T) {
 
 func TestCPUListManagerApplyCPUListWritesZeroMaskForEmptyTarget(t *testing.T) {
 	root := t.TempDir()
-	checkpointPath := filepath.Join(t.TempDir(), "ownership.json")
 	require.NoError(t, os.WriteFile(filepath.Join(root, cpus), []byte("ffffffff,ffffffff,ffffffff\n"), 0o644))
 	require.NoError(t, os.Mkdir(filepath.Join(root, "reclaim"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(root, "reclaim", cpus), []byte("ffffffff,ffffffff,ffffffff\n"), 0o644))
-	require.NoError(t, os.WriteFile(checkpointPath, []byte(`{"version":3,"clos_ids":["reclaim"]}`), 0o644))
 
-	manager := newCPUListManagerWithOwnership(root, nil, checkpointPath)
+	manager := newCPUListManagerWithUpdater(root, nil)
 	require.NoError(t, manager.ApplyCPUList(context.Background(), "reclaim", ""))
 
 	content, err := os.ReadFile(filepath.Join(root, "reclaim", cpus))
@@ -60,121 +55,36 @@ func TestCPUListManagerApplyCPUListWritesZeroMaskForEmptyTarget(t *testing.T) {
 	require.Equal(t, "00000000,00000000,00000000", string(content))
 }
 
-func TestCPUListManagerApplyCPUListPreservesExternalCanonicalClos(t *testing.T) {
+func TestCPUListManagerApplyCPUListWritesExistingClos(t *testing.T) {
 	root := t.TempDir()
-	checkpointPath := filepath.Join(t.TempDir(), "ownership.json")
 	require.NoError(t, os.WriteFile(filepath.Join(root, cpus), []byte("ffffffff\n"), 0o644))
 	for _, closID := range []string{"dedicated", "reclaim"} {
 		require.NoError(t, os.Mkdir(filepath.Join(root, closID), 0o755))
 		require.NoError(t, os.WriteFile(filepath.Join(root, closID, cpus), []byte("ffffffff\n"), 0o644))
 	}
 
-	manager := newCPUListManagerWithOwnership(root, nil, checkpointPath)
+	manager := newCPUListManagerWithUpdater(root, nil)
 	require.NoError(t, manager.ApplyCPUList(context.Background(), "dedicated", "1"))
 	require.NoError(t, manager.ApplyCPUList(context.Background(), "reclaim", ""))
 
-	for _, closID := range []string{"dedicated", "reclaim"} {
-		content, err := os.ReadFile(filepath.Join(root, closID, cpus))
-		require.NoError(t, err)
-		require.Equal(t, "ffffffff\n", string(content))
-	}
-	owned, err := NewClosOwnershipStore(checkpointPath).Load()
+	content, err := os.ReadFile(filepath.Join(root, "dedicated", cpus))
 	require.NoError(t, err)
-	require.Empty(t, owned)
+	require.Equal(t, "00000002", string(content))
+	content, err = os.ReadFile(filepath.Join(root, "reclaim", cpus))
+	require.NoError(t, err)
+	require.Equal(t, "00000000", string(content))
 }
 
 func TestCPUListManagerApplyCPUListCreatesMissingClosBeforeWrite(t *testing.T) {
 	root := t.TempDir()
-	checkpointPath := filepath.Join(t.TempDir(), "ownership.json")
 	require.NoError(t, os.WriteFile(filepath.Join(root, cpus), []byte("ffffffff\n"), 0o644))
 
-	manager := newCPUListManagerWithOwnership(root, nil, checkpointPath)
+	manager := newCPUListManagerWithUpdater(root, nil)
 	require.NoError(t, manager.ApplyCPUList(context.Background(), "dedicated", "1"))
 
 	content, err := os.ReadFile(filepath.Join(root, "dedicated", cpus))
 	require.NoError(t, err)
 	require.Equal(t, "00000002", string(content))
-}
-
-func TestCPUListManagerRegistersOwnershipBeforeCreatingClos(t *testing.T) {
-	root := t.TempDir()
-	checkpointPath := filepath.Join(t.TempDir(), "ownership.json")
-	require.NoError(t, os.WriteFile(filepath.Join(root, cpus), []byte("ffffffff\n"), 0o644))
-
-	manager := newCPUListManagerWithOwnership(root, nil, checkpointPath)
-	require.NoError(t, manager.ApplyCPUList(context.Background(), "dedicated", "1"))
-
-	content, err := os.ReadFile(checkpointPath)
-	require.NoError(t, err)
-	var checkpoint struct {
-		ClosIDs []string `json:"clos_ids"`
-	}
-	require.NoError(t, json.Unmarshal(content, &checkpoint))
-	require.Equal(t, []string{"dedicated"}, checkpoint.ClosIDs)
-	require.DirExists(t, filepath.Join(root, "dedicated"))
-}
-
-func TestClosOwnershipStoreTracksPendingCreateUntilFinished(t *testing.T) {
-	store := NewClosOwnershipStore(filepath.Join(t.TempDir(), "ownership.json"))
-
-	require.NoError(t, store.BeginCreate("dedicated"))
-	owned, err := store.Load()
-	require.NoError(t, err)
-	require.False(t, owned.Has("dedicated"))
-	pending, err := store.PendingCreates()
-	require.NoError(t, err)
-	require.True(t, pending.Has("dedicated"))
-
-	require.NoError(t, store.FinishCreate("dedicated"))
-	owned, err = store.Load()
-	require.NoError(t, err)
-	require.True(t, owned.Has("dedicated"))
-	pending, err = store.PendingCreates()
-	require.NoError(t, err)
-	require.False(t, pending.Has("dedicated"))
-}
-
-func TestCPUListManagerPendingCreatePreservesLaterExternalClos(t *testing.T) {
-	root := t.TempDir()
-	checkpointPath := filepath.Join(t.TempDir(), "ownership.json")
-	store := NewClosOwnershipStore(checkpointPath)
-	require.NoError(t, os.WriteFile(filepath.Join(root, cpus), []byte("ffffffff\n"), 0o644))
-	require.NoError(t, store.BeginCreate("dedicated"))
-	require.NoError(t, os.Mkdir(filepath.Join(root, "dedicated"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(root, "dedicated", cpus), []byte("ffffffff\n"), 0o644))
-
-	manager := newCPUListManagerWithOwnership(root, nil, checkpointPath)
-	require.NoError(t, manager.ApplyCPUList(context.Background(), "dedicated", "1"))
-
-	content, err := os.ReadFile(filepath.Join(root, "dedicated", cpus))
-	require.NoError(t, err)
-	require.Equal(t, "ffffffff\n", string(content))
-	pending, err := store.PendingCreates()
-	require.NoError(t, err)
-	require.False(t, pending.Has("dedicated"))
-	owned, err := store.Load()
-	require.NoError(t, err)
-	require.False(t, owned.Has("dedicated"))
-}
-
-func TestCPUListManagerClearRecoversUnprovenPendingCreate(t *testing.T) {
-	root := t.TempDir()
-	checkpointPath := filepath.Join(t.TempDir(), "ownership.json")
-	store := NewClosOwnershipStore(checkpointPath)
-	require.NoError(t, os.WriteFile(filepath.Join(root, cpus), []byte("ffffffff\n"), 0o644))
-	require.NoError(t, store.BeginCreate("dedicated"))
-	require.NoError(t, os.Mkdir(filepath.Join(root, "dedicated"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(root, "dedicated", cpus), []byte("ffffffff\n"), 0o644))
-
-	manager := newCPUListManagerWithOwnership(root, nil, checkpointPath)
-	require.NoError(t, manager.ApplyCPUList(context.Background(), "dedicated", ""))
-
-	content, err := os.ReadFile(filepath.Join(root, "dedicated", cpus))
-	require.NoError(t, err)
-	require.Equal(t, "ffffffff\n", string(content))
-	pending, err := store.PendingCreates()
-	require.NoError(t, err)
-	require.False(t, pending.Has("dedicated"))
 }
 
 func TestCPUListManagerApplyCPUListSkipsMissingClosForEmptyTarget(t *testing.T) {
@@ -215,14 +125,12 @@ func TestCPUListManagerCPUListMatchesObservesLiveMask(t *testing.T) {
 
 func TestCPUListManagerWritesExistingClosAndBumpsEpochAfterRecreate(t *testing.T) {
 	root := t.TempDir()
-	checkpointPath := filepath.Join(t.TempDir(), "ownership.json")
 	require.NoError(t, os.WriteFile(filepath.Join(root, cpus), []byte("ffffffff\n"), 0o644))
 	closPath := filepath.Join(root, "dedicated")
 	require.NoError(t, os.Mkdir(closPath, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(closPath, cpus), nil, 0o644))
-	require.NoError(t, os.WriteFile(checkpointPath, []byte(`{"version":3,"clos_ids":["dedicated"]}`), 0o644))
 
-	manager := newCPUListManagerWithOwnership(root, nil, checkpointPath)
+	manager := newCPUListManagerWithUpdater(root, nil)
 	clos, err := manager.ListManagedClos(context.Background())
 	require.NoError(t, err)
 	require.Len(t, clos, 1)
@@ -242,14 +150,12 @@ func TestCPUListManagerWritesExistingClosAndBumpsEpochAfterRecreate(t *testing.T
 
 func TestCPUListManagerApplyCPUListWaitsForClosLifecycleUpdate(t *testing.T) {
 	root := t.TempDir()
-	checkpointPath := filepath.Join(t.TempDir(), "ownership.json")
 	require.NoError(t, os.WriteFile(filepath.Join(root, cpus), []byte("ffffffff\n"), 0o644))
 	require.NoError(t, os.Mkdir(filepath.Join(root, "dedicated"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(root, "dedicated", cpus), []byte("ffffffff\n"), 0o644))
-	require.NoError(t, os.WriteFile(checkpointPath, []byte(`{"version":3,"clos_ids":["dedicated"]}`), 0o644))
 
 	coordinator := newTestClosResourceCoordinator()
-	manager := newCPUListManagerWithOwnership(root, coordinator, checkpointPath)
+	manager := newCPUListManagerWithUpdater(root, coordinator)
 	lifecycleStarted := make(chan struct{})
 	releaseLifecycle := make(chan struct{})
 	lifecycleDone := make(chan struct{})

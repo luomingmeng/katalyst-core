@@ -17,6 +17,7 @@ limitations under the License.
 package resctrl
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -72,34 +73,24 @@ type ClosReconcileState struct {
 }
 
 type managerImpl struct {
-	config                  *qrmresctrl.ResctrlConfig
-	enabled                 atomic.Bool
-	root                    string
-	disableRDT              bool
-	lifecycleManagedClosIDs sets.String
-	ownershipCheckpointPath string
-	ownershipStore          *qrmresctrlmanager.ClosOwnershipStore
-	ownershipLoadErr        error
-	removeAll               func(string) error
-	mkdir                   func(string, os.FileMode) error
-	readFile                func(string) ([]byte, error)
-	invalidator             ClosInvalidator
+	config      *qrmresctrl.ResctrlConfig
+	enabled     atomic.Bool
+	root        string
+	disableRDT  bool
+	removeAll   func(string) error
+	mkdir       func(string, os.FileMode) error
+	readFile    func(string) ([]byte, error)
+	invalidator ClosInvalidator
 	sync.RWMutex
 }
 
 func NewManager(config *qrmresctrl.ResctrlConfig, invalidators ...ClosInvalidator) Manager {
 	manager := &managerImpl{
-		config:                  config,
-		lifecycleManagedClosIDs: sets.NewString(),
-		removeAll:               os.RemoveAll,
-		mkdir:                   os.Mkdir,
-		readFile:                os.ReadFile,
+		config:    config,
+		removeAll: os.RemoveAll,
+		mkdir:     os.Mkdir,
+		readFile:  os.ReadFile,
 	}
-	if config != nil {
-		manager.ownershipCheckpointPath = config.OwnershipCheckpointPath
-	}
-	manager.ownershipStore = qrmresctrlmanager.NewClosOwnershipStore(manager.ownershipCheckpointPath)
-	manager.ownershipLoadErr = manager.loadOwnershipCheckpoint()
 	if len(invalidators) > 0 {
 		manager.invalidator = invalidators[0]
 	}
@@ -125,22 +116,13 @@ func (m *managerImpl) Run(stopCh <-chan struct{}) {
 func (m *managerImpl) Create(podUID, closID string, createMonGroup bool) error {
 	m.Lock()
 	defer m.Unlock()
-	if m.ownershipLoadErr != nil {
-		return m.ownershipLoadErr
-	}
 	if m.disableRDT {
 		return ErrRDTDisabled
 	}
 	if !m.enabled.Load() || m.root == "" {
 		return ErrRDTUnavailable
 	}
-	if err := m.recoverPendingCreatesLocked(); err != nil {
-		return err
-	}
-	if err := m.recoverPendingDeletesLocked(); err != nil {
-		return err
-	}
-	if err := m.refreshOwnershipLocked(); err != nil {
+	if err := m.closLifecycleLocked().Recover(context.Background()); err != nil {
 		return err
 	}
 
@@ -163,20 +145,11 @@ func (m *managerImpl) Create(podUID, closID string, createMonGroup bool) error {
 func (m *managerImpl) ReconcileClos(state ClosReconcileState) error {
 	m.Lock()
 	defer m.Unlock()
-	if m.ownershipLoadErr != nil {
-		return m.ownershipLoadErr
-	}
 	m.disableRDT = state.DisableRDT
 	if !m.enabled.Load() || m.root == "" {
 		return nil
 	}
-	if err := m.recoverPendingCreatesLocked(); err != nil {
-		return err
-	}
-	if err := m.recoverPendingDeletesLocked(); err != nil {
-		return err
-	}
-	if err := m.refreshOwnershipLocked(); err != nil {
+	if err := m.closLifecycleLocked().Recover(context.Background()); err != nil {
 		return err
 	}
 
@@ -193,10 +166,6 @@ func (m *managerImpl) ReconcileClos(state ClosReconcileState) error {
 	if state.DisableRDT {
 		for _, entry := range entries {
 			if !isClosDir(entry) || skipClosIDs.Has(entry.Name()) {
-				continue
-			}
-			if !m.isLifecycleManagedClosLocked(entry.Name()) {
-				general.Infof("resctrl: preserve external CLOS %s while RDT is disabled", entry.Name())
 				continue
 			}
 			if err := m.removeClosLocked(entry.Name(), filepath.Join(m.root, entry.Name())); err != nil {
@@ -227,10 +196,6 @@ func (m *managerImpl) ReconcileClos(state ClosReconcileState) error {
 			continue
 		}
 		path := filepath.Join(m.root, entry.Name())
-		if !m.isLifecycleManagedClosLocked(entry.Name()) {
-			general.Infof("resctrl: skip external CLOS %s during regular cleanup", entry.Name())
-			continue
-		}
 		if !m.isClosEmptyLocked(path) {
 			continue
 		}
@@ -241,17 +206,12 @@ func (m *managerImpl) ReconcileClos(state ClosReconcileState) error {
 	return nil
 }
 
-func (m *managerImpl) isLifecycleManagedClosLocked(closID string) bool {
-	return m.lifecycleManagedClosIDs.Has(closID)
-}
-
 func (m *managerImpl) cleanupInactiveMonGroupsLocked(skipClosIDs, activePodUIDs sets.String) {
 	if activePodUIDs == nil {
 		return
 	}
 	walkMonGroupsDirs(m.root, skipClosIDs, func(uid, closID, path string) {
-		if !m.isLifecycleManagedClosLocked(closID) ||
-			activePodUIDs.Has(uid) || !m.isFileEmpty(path, tasks) {
+		if activePodUIDs.Has(uid) || !m.isFileEmpty(path, tasks) {
 			return
 		}
 		general.Infof("resctrl: remove pod %s mon_groups dir %s", uid, path)
@@ -309,46 +269,17 @@ func isClosDir(entry os.DirEntry) bool {
 func (m *managerImpl) createClosLocked(closID string) (string, error) {
 	closIDPath := filepath.Join(m.root, closID)
 	err := m.runClosLifecycleLocked(closID, func() (bool, error) {
-		if _, err := os.Stat(closIDPath); err == nil {
-			return false, nil
-		} else if !os.IsNotExist(err) {
-			return false, fmt.Errorf("stat clos_id dir %s failed: %w", closIDPath, err)
+		existed := true
+		if _, statErr := os.Stat(closIDPath); os.IsNotExist(statErr) {
+			existed = false
+		} else if statErr != nil {
+			return false, fmt.Errorf("stat clos_id dir %s failed: %w", closIDPath, statErr)
 		}
-		if m.ownershipCheckpointPath != "" {
-			if err := m.ownershipStore.BeginCreate(closID); err != nil {
-				return false, fmt.Errorf("checkpoint pending CLOS %q creation: %w", closID, err)
-			}
+		_, err := m.closLifecycleLocked().EnsurePendingCLOS(context.Background(), closID, closID)
+		if err != nil {
+			return false, err
 		}
-		mkdir := m.mkdir
-		if mkdir == nil {
-			mkdir = os.Mkdir
-		}
-		if err := mkdir(closIDPath, 0o755); err != nil {
-			if m.ownershipCheckpointPath != "" {
-				_ = m.ownershipStore.AbortCreate(closID)
-			}
-			if os.IsExist(err) {
-				return false, nil
-			}
-			return false, fmt.Errorf("create clos_id dir %s failed: %w", closIDPath, err)
-		}
-		if m.ownershipCheckpointPath != "" {
-			identity, err := qrmresctrlmanager.DirectoryIdentityForPath(closIDPath)
-			if err != nil {
-				return false, fmt.Errorf("identify created CLOS %q: %w", closID, err)
-			}
-			if err := m.ownershipStore.BindCreate(closID, identity); err != nil {
-				return false, fmt.Errorf("bind pending CLOS %q creation: %w", closID, err)
-			}
-			if err := m.ownershipStore.FinishCreate(closID); err != nil {
-				return false, fmt.Errorf("checkpoint CLOS %q ownership: %w", closID, err)
-			}
-		}
-		if m.lifecycleManagedClosIDs == nil {
-			m.lifecycleManagedClosIDs = sets.NewString()
-		}
-		m.lifecycleManagedClosIDs.Insert(closID)
-		return true, nil
+		return !existed, nil
 	})
 	return closIDPath, err
 }
@@ -363,119 +294,17 @@ func (m *managerImpl) isClosEmptyLocked(path string) bool {
 
 func (m *managerImpl) removeClosLocked(closID, path string) error {
 	return m.runClosLifecycleLocked(closID, func() (bool, error) {
-		wasManaged := m.lifecycleManagedClosIDs.Has(closID)
-		if wasManaged && m.ownershipCheckpointPath != "" {
-			identity, err := qrmresctrlmanager.DirectoryIdentityForPath(path)
-			if err != nil {
-				return false, fmt.Errorf("identify CLOS %q before deletion: %w", closID, err)
-			}
-			if err := m.ownershipStore.BeginDelete(closID, identity); err != nil {
-				return false, err
-			}
-		}
 		if err := m.remove(path); err != nil {
 			return false, err
-		}
-		if wasManaged {
-			if m.ownershipCheckpointPath != "" {
-				if err := m.ownershipStore.FinishDelete(closID); err != nil {
-					return false, err
-				}
-				m.lifecycleManagedClosIDs.Delete(closID)
-			} else if err := m.unmarkLifecycleManagedClosLocked(closID); err != nil {
-				return false, err
-			}
 		}
 		return true, nil
 	})
 }
 
-func (m *managerImpl) recoverPendingDeletesLocked() error {
-	if m.ownershipCheckpointPath == "" {
-		return nil
-	}
-	pending, err := m.ownershipStore.PendingDeleteTransactions()
-	if err != nil {
-		return err
-	}
-	for closID, transaction := range pending {
-		path := filepath.Join(m.root, closID)
-		if err := m.runClosLifecycleLocked(closID, func() (bool, error) {
-			if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
-				if err := m.ownershipStore.FinishDelete(closID); err != nil {
-					return false, err
-				}
-				m.lifecycleManagedClosIDs.Delete(closID)
-				return false, nil
-			} else if statErr != nil {
-				return false, statErr
-			}
-			matches, err := qrmresctrlmanager.SameDirectoryIdentity(path, transaction.Identity)
-			if err != nil {
-				return false, err
-			}
-			if matches {
-				if err := m.remove(path); err != nil {
-					return false, err
-				}
-			} else {
-				general.Warningf("resctrl: preserve CLOS %q while recovering unproven pending delete generation %d",
-					closID, transaction.Generation)
-			}
-			if err := m.ownershipStore.FinishDelete(closID); err != nil {
-				return false, err
-			}
-			m.lifecycleManagedClosIDs.Delete(closID)
-			return matches, nil
-		}); err != nil {
-			return fmt.Errorf("recover pending deletion of CLOS %q: %w", closID, err)
-		}
-	}
-	return nil
-}
-
-func (m *managerImpl) recoverPendingCreatesLocked() error {
-	if m.ownershipCheckpointPath == "" {
-		return nil
-	}
-	pending, err := m.ownershipStore.PendingCreateTransactions()
-	if err != nil {
-		return err
-	}
-	for closID, transaction := range pending {
-		path := filepath.Join(m.root, closID)
-		if err := m.runClosLifecycleLocked(closID, func() (bool, error) {
-			_, statErr := os.Stat(path)
-			existed := statErr == nil
-			if statErr != nil && !os.IsNotExist(statErr) {
-				return false, statErr
-			}
-			removed := false
-			if existed {
-				matches, err := qrmresctrlmanager.SameDirectoryIdentity(path, transaction.Identity)
-				if err != nil {
-					return false, err
-				}
-				if matches {
-					if err := m.remove(path); err != nil {
-						return false, err
-					}
-					removed = true
-				} else {
-					general.Warningf("resctrl: preserve CLOS %q while recovering unproven pending create generation %d",
-						closID, transaction.Generation)
-				}
-			}
-			if err := m.ownershipStore.AbortCreate(closID); err != nil {
-				return false, err
-			}
-			m.lifecycleManagedClosIDs.Delete(closID)
-			return removed, nil
-		}); err != nil {
-			return fmt.Errorf("recover pending creation of CLOS %q: %w", closID, err)
-		}
-	}
-	return nil
+func (m *managerImpl) closLifecycleLocked() qrmresctrlmanager.CLOSLifecycleService {
+	return qrmresctrlmanager.NewCLOSLifecycleServiceWithOperations(
+		m.root, m.mkdir, m.remove,
+	)
 }
 
 func (m *managerImpl) remove(path string) error {
@@ -483,35 +312,6 @@ func (m *managerImpl) remove(path string) error {
 		return m.removeAll(path)
 	}
 	return os.RemoveAll(path)
-}
-
-func (m *managerImpl) unmarkLifecycleManagedClosLocked(closID string) error {
-	if m.lifecycleManagedClosIDs == nil || !m.lifecycleManagedClosIDs.Has(closID) {
-		return nil
-	}
-	if m.ownershipCheckpointPath != "" {
-		if err := m.ownershipStore.Unregister(closID); err != nil {
-			return err
-		}
-	}
-	m.lifecycleManagedClosIDs.Delete(closID)
-	return nil
-}
-
-func (m *managerImpl) loadOwnershipCheckpoint() error {
-	return m.refreshOwnershipLocked()
-}
-
-func (m *managerImpl) refreshOwnershipLocked() error {
-	if m.ownershipCheckpointPath == "" {
-		return nil
-	}
-	owned, err := m.ownershipStore.Load()
-	if err != nil {
-		return err
-	}
-	m.lifecycleManagedClosIDs = owned
-	return nil
 }
 
 func (m *managerImpl) invalidateClosLocked(closID string) {

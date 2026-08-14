@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -217,20 +216,6 @@ func NewDynamicPolicy(agentCtx *agent.GenericContext, conf *config.Configuration
 	state.SetReadonlyState(stateImpl)
 	state.SetReadWriteState(stateImpl)
 
-	resctrlOwnershipCheckpointPath := ""
-	if conf.AgentConfiguration != nil &&
-		conf.AgentConfiguration.GenericAgentConfiguration != nil &&
-		conf.AgentConfiguration.GenericAgentConfiguration.GenericQRMPluginConfiguration != nil &&
-		conf.AgentConfiguration.GenericAgentConfiguration.GenericQRMPluginConfiguration.
-			StateDirectoryConfiguration != nil &&
-		conf.AgentConfiguration.GenericAgentConfiguration.GenericQRMPluginConfiguration.
-			StateDirectoryConfiguration.StateFileDirectory != "" {
-		resctrlOwnershipCheckpointPath = filepath.Join(
-			conf.AgentConfiguration.GenericAgentConfiguration.GenericQRMPluginConfiguration.
-				StateDirectoryConfiguration.StateFileDirectory,
-			"resctrl-clos-ownership.json",
-		)
-	}
 	policyImplement := &DynamicPolicy{
 		topology:                    agentCtx.CPUTopology,
 		dynamicConf:                 conf.DynamicAgentConfiguration,
@@ -270,7 +255,6 @@ func NewDynamicPolicy(agentCtx *agent.GenericContext, conf *config.Configuration
 			conf.DynamicAgentConfiguration,
 			wrappedEmitter,
 			stateImpl,
-			resctrlOwnershipCheckpointPath,
 		),
 		enableNonBindingShareCoresMemoryResourceCheck: conf.EnableNonBindingShareCoresMemoryResourceCheck,
 		numaBindResultResourceAllocationAnnotationKey: conf.NUMABindResultResourceAllocationAnnotationKey,
