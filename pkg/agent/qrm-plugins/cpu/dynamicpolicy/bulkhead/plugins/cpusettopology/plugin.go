@@ -659,6 +659,10 @@ func (p *CPUSetTopologyPlugin) buildDisabledResetDAG(
 	if err != nil {
 		return nil, fmt.Errorf("build disabled reset topology inputs: %w", err)
 	}
+	specs, err = p.filterExistingDisabledResetSpecs(ctx, specs)
+	if err != nil {
+		return nil, err
+	}
 	if len(specs) == 0 {
 		return nil, nil
 	}
@@ -672,6 +676,29 @@ func (p *CPUSetTopologyPlugin) buildDisabledResetDAG(
 		return nil, fmt.Errorf("build disabled reset topology dag: %w", err)
 	}
 	return dag, nil
+}
+
+func (p *CPUSetTopologyPlugin) filterExistingDisabledResetSpecs(ctx context.Context, specs []topology.NodeSpec) ([]topology.NodeSpec, error) {
+	if len(specs) == 0 {
+		return nil, nil
+	}
+	out := specs[:0]
+	for _, spec := range specs {
+		rel := strings.Trim(spec.Rel, "/")
+		if rel == "" {
+			continue
+		}
+		if _, err := p.cgroup.StatDir(ctx, rel); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				general.InfofV(4, "cpuset_topology: disabled reset rel path does not exist, skipping, rel=%q err=%v", rel, err)
+				continue
+			}
+			return nil, fmt.Errorf("stat disabled reset rel path %q: %w", rel, err)
+		}
+		spec.Rel = rel
+		out = append(out, spec)
+	}
+	return out, nil
 }
 
 func (p *CPUSetTopologyPlugin) resetCPUSetTopology(ctx context.Context, in bulkheadapi.HandlerContext) error {
