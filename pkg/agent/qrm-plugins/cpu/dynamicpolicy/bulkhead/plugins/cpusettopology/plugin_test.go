@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -336,6 +337,7 @@ type fakeCgroupClient struct {
 	listChildrenHook  func(context.Context, string) ([]string, error)
 	afterApply        func(rel string, data *cgcommon.CPUSetData)
 	readOverride      func(rel string) (machine.CPUSet, bool)
+	readErrByRel      map[string]error
 }
 
 type fakeSnapshotDriver struct {
@@ -432,6 +434,9 @@ func (f *fakeCgroupClient) Version(context.Context) cgroupclient.CgroupVersion {
 }
 
 func (f *fakeCgroupClient) ReadCPUSet(_ context.Context, rel string) (machine.CPUSet, error) {
+	if err := f.readErrByRel[rel]; err != nil {
+		return machine.NewCPUSet(), err
+	}
 	if f.readOverride != nil {
 		if cpus, ok := f.readOverride(rel); ok {
 			return cpus.Clone(), nil
@@ -1613,6 +1618,28 @@ func TestCPUSetTopologyPluginDisabledTransitionV2EmptyResetWritesEmptyCPUs(t *te
 		if write.CPUs != "" || !write.WriteEmptyCPUs {
 			t.Fatalf("v2 cpuset write @ %s = %+v, want empty CPUSetData with WriteEmptyCPUs", rel, write)
 		}
+	}
+}
+
+func TestCPUSetTopologyPluginDisabledTransitionSkipsMissingResetRel(t *testing.T) {
+	t.Parallel()
+
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV1,
+		"bulkhead-disabled-missing-sandbox-pod",
+		"bulkhead-disabled-missing-sandbox-container",
+	)
+	missingRel := "sandboxes"
+	p.cfg.BulkheadReclaimRelPaths = append(p.cfg.BulkheadReclaimRelPaths, missingRel)
+	cg.statErrors = map[string]error{missingRel: os.ErrNotExist}
+	cg.readErrByRel = map[string]error{missingRel: os.ErrNotExist}
+
+	if err := p.CPUSetAdjustmentDisabledHandler(context.Background(), in); err != nil {
+		t.Fatalf("CPUSetAdjustmentDisabledHandler: %v", err)
+	}
+	if _, ok := cg.writes[missingRel]; ok {
+		t.Fatalf("missing reset rel %q received write; writes=%#v", missingRel, cg.writes)
 	}
 }
 
