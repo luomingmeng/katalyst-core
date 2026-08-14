@@ -587,6 +587,12 @@ github.com/logrusorgru/aurora v0.0.0-20181002194514-a7b3b318ed4e/go.mod h1:7rIyQ
 github.com/lpabon/godbc v0.1.1/go.mod h1:Jo9QV0cf3U6jZABgiJ2skINAXb9j8m51r07g4KI92ZA=
 github.com/luomingmeng/katalyst-api v0.0.0-20260812190403-7d370cb759c6 h1:A4xkttHZkj5jITkr9T9wU/MwXZMMM80vjHoa0DDiSTM=
 github.com/luomingmeng/katalyst-api v0.0.0-20260812190403-7d370cb759c6/go.mod h1:zPTihN6wCNf7cz/EWqbUbCmL4UyucQPUG1shqgYZuUo=
+github.com/luomingmeng/katalyst-api v0.0.0-20260813162452-3c2208c27f7a h1:DmwE7wQ8fwO4vXst0aTtl38uVs2bR8sfXBllEoZ8n+g=
+github.com/luomingmeng/katalyst-api v0.0.0-20260813162452-3c2208c27f7a/go.mod h1:zPTihN6wCNf7cz/EWqbUbCmL4UyucQPUG1shqgYZuUo=
+github.com/luomingmeng/katalyst-api v0.0.0-20260813184631-fd8edbbf6f0f h1:GhGyORhGxh2b2WfGpRN8ibFHJNT0IbrvuTuI0XSNgKA=
+github.com/luomingmeng/katalyst-api v0.0.0-20260813184631-fd8edbbf6f0f/go.mod h1:zPTihN6wCNf7cz/EWqbUbCmL4UyucQPUG1shqgYZuUo=
+github.com/luomingmeng/katalyst-api v0.0.0-20260814060521-516889dcffd5 h1:3HpQDBKRXbnIb/YVuRNfsnEwFaLuZ1/UbT9rlbBZb7A=
+github.com/luomingmeng/katalyst-api v0.0.0-20260814060521-516889dcffd5/go.mod h1:zPTihN6wCNf7cz/EWqbUbCmL4UyucQPUG1shqgYZuUo=
 github.com/lyft/protoc-gen-validate v0.0.13/go.mod h1:XbGvPuh87YZc5TdIa2/I4pLk0QoUACkjt2znoq26NVQ=
 github.com/magiconair/properties v1.8.0/go.mod h1:PppfXfuXeibc/6YijjN8zIbojt8czPbwD3XqdrwzmxQ=
 github.com/magiconair/properties v1.8.1/go.mod h1:PppfXfuXeibc/6YijjN8zIbojt8czPbwD3XqdrwzmxQ=

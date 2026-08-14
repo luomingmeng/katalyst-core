@@ -58,6 +58,52 @@ func TestCATCapabilityProviderReadsIndentedL3Schemata(t *testing.T) {
 	}, capabilities)
 }
 
+func TestCATCapabilityProviderReadsBitUsageRightmostCharacterAsLowestBit(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "info", "L3"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "info", "L3", "cbm_mask"), []byte("f\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "info", "L3", "min_cbm_bits"), []byte("1\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "info", "L3", "bit_usage"), []byte("0=XXSS;1=SSXX\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "schemata"), []byte("L3:0=f;1=f;\n"), 0o644))
+
+	capabilities, err := newCATCapabilityProvider(root).GetCATCapabilities()
+
+	require.NoError(t, err)
+	require.Equal(t, map[int]CATCapability{
+		0: {CBMMask: 0xf, MinCBMBits: 1, BitUsageByType: map[string]uint64{"S": 0x3, "X": 0xc}},
+		1: {CBMMask: 0xf, MinCBMBits: 1, BitUsageByType: map[string]uint64{"S": 0xc, "X": 0x3}},
+	}, capabilities)
+}
+
+func TestCATCapabilityProviderIgnoresMissingBitUsage(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "info", "L3"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "info", "L3", "cbm_mask"), []byte("f\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "info", "L3", "min_cbm_bits"), []byte("1\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "schemata"), []byte("L3:0=f;\n"), 0o644))
+
+	capabilities, err := newCATCapabilityProvider(root).GetCATCapabilities()
+
+	require.NoError(t, err)
+	require.Equal(t, map[int]CATCapability{
+		0: {CBMMask: 0xf, MinCBMBits: 1},
+	}, capabilities)
+}
+
+func TestCATCapabilityProviderRejectsMalformedBitUsage(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "info", "L3"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "info", "L3", "cbm_mask"), []byte("f\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "info", "L3", "min_cbm_bits"), []byte("1\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "info", "L3", "bit_usage"), []byte("0XXSS\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "schemata"), []byte("L3:0=f;\n"), 0o644))
+
+	_, err := newCATCapabilityProvider(root).GetCATCapabilities()
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "bit_usage")
+}
+
 func TestCATCapabilityProviderRejectsMalformedDomain(t *testing.T) {
 	root := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(root, "info", "L3"), 0o755))

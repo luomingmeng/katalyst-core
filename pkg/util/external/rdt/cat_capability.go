@@ -29,8 +29,9 @@ import (
 // CATCapability describes the L3 cache bit mask capability of one resctrl
 // cache domain.
 type CATCapability struct {
-	CBMMask    uint64
-	MinCBMBits int
+	CBMMask        uint64
+	MinCBMBits     int
+	BitUsageByType map[string]uint64
 }
 
 // CATCapabilityProvider reads the L3 CAT capabilities used to construct a
@@ -90,11 +91,78 @@ func (p *catCapabilityProvider) GetCATCapabilities() (map[int]CATCapability, err
 	if err != nil {
 		return nil, err
 	}
+	bitUsageByDomain, err := p.readBitUsageByDomain()
+	if err != nil {
+		return nil, err
+	}
 	capabilities := make(map[int]CATCapability, len(domains))
 	for _, domain := range domains {
-		capabilities[domain] = CATCapability{CBMMask: mask, MinCBMBits: minBits}
+		capabilities[domain] = CATCapability{
+			CBMMask:        mask,
+			MinCBMBits:     minBits,
+			BitUsageByType: bitUsageByDomain[domain],
+		}
 	}
 	return capabilities, nil
+}
+
+func (p *catCapabilityProvider) readBitUsageByDomain() (map[int]map[string]uint64, error) {
+	data, err := p.readFile(filepath.Join(p.root, "info", "L3", "bit_usage"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read L3 bit_usage: %w", err)
+	}
+
+	return parseBitUsageByDomain(string(data))
+}
+
+func parseBitUsageByDomain(raw string) (map[int]map[string]uint64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, fmt.Errorf("parse L3 bit_usage: empty content")
+	}
+
+	result := map[int]map[string]uint64{}
+	for _, entry := range strings.Split(raw, ";") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		domain, usage, found := strings.Cut(entry, "=")
+		if !found {
+			return nil, fmt.Errorf("parse L3 bit_usage: invalid domain entry %q", entry)
+		}
+		id, err := strconv.Atoi(domain)
+		if err != nil || id < 0 {
+			return nil, fmt.Errorf("parse L3 bit_usage: invalid domain %q", domain)
+		}
+		if usage == "" {
+			return nil, fmt.Errorf("parse L3 bit_usage: empty usage for domain %d", id)
+		}
+
+		masks := map[string]uint64{}
+		for offsetFromRight, usageType := range reverseStringRunes(usage) {
+			if offsetFromRight >= 64 {
+				return nil, fmt.Errorf("parse L3 bit_usage: usage for domain %d is too wide", id)
+			}
+			masks[string(usageType)] |= uint64(1) << offsetFromRight
+		}
+		result[id] = masks
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("parse L3 bit_usage: no domains")
+	}
+	return result, nil
+}
+
+func reverseStringRunes(value string) []rune {
+	runes := []rune(value)
+	for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
+		runes[i], runes[j] = runes[j], runes[i]
+	}
+	return runes
 }
 
 func isCDPEnabled(root string) bool {

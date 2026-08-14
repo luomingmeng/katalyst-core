@@ -17,7 +17,10 @@ limitations under the License.
 package qrm
 
 import (
+	"fmt"
+
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic/crd"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 type CPUPluginConfiguration struct {
@@ -63,8 +66,10 @@ type DynamicBulkheadConfiguration struct {
 type DynamicBulkheadRDTConfiguration struct {
 	EnableCPUList  bool
 	EnableCAT      bool
-	DefaultCATWays int64
-	ClosCATWays    map[string]int64
+	DefaultCATWays CATWaysExpression
+	ClosCATWays    map[string]CATWaysExpression
+	CATPolicy      CATPolicy
+	CATConfigError string
 }
 
 func NewCPUPluginConfiguration() *CPUPluginConfiguration {
@@ -106,6 +111,7 @@ func (c *CPUPluginConfiguration) ApplyConfiguration(conf *crd.DynamicConfigCRD) 
 			}
 			if config.BulkheadConfig.BulkheadRDTConfig != nil {
 				bulkheadRDTConfig := config.BulkheadConfig.BulkheadRDTConfig
+				c.BulkheadConfig.BulkheadRDTConfig.CATConfigError = ""
 				if bulkheadRDTConfig.EnableCPUList != nil {
 					c.BulkheadConfig.BulkheadRDTConfig.EnableCPUList = *bulkheadRDTConfig.EnableCPUList
 				}
@@ -113,10 +119,23 @@ func (c *CPUPluginConfiguration) ApplyConfiguration(conf *crd.DynamicConfigCRD) 
 					c.BulkheadConfig.BulkheadRDTConfig.EnableCAT = *bulkheadRDTConfig.EnableCAT
 				}
 				if bulkheadRDTConfig.DefaultCATWays != nil {
-					c.BulkheadConfig.BulkheadRDTConfig.DefaultCATWays = *bulkheadRDTConfig.DefaultCATWays
+					if err := applyCATWaysExpression(&c.BulkheadConfig.BulkheadRDTConfig.DefaultCATWays, *bulkheadRDTConfig.DefaultCATWays); err != nil {
+						c.BulkheadConfig.BulkheadRDTConfig.CATConfigError = err.Error()
+					}
 				}
 				if bulkheadRDTConfig.ClosCATWays != nil {
-					c.BulkheadConfig.BulkheadRDTConfig.ClosCATWays = bulkheadRDTConfig.ClosCATWays
+					closCATWays, err := parseCATWaysExpressionMap(bulkheadRDTConfig.ClosCATWays)
+					if err != nil {
+						c.BulkheadConfig.BulkheadRDTConfig.CATConfigError = err.Error()
+					} else {
+						c.BulkheadConfig.BulkheadRDTConfig.ClosCATWays = closCATWays
+					}
+				}
+				if bulkheadRDTConfig.CATPolicy != nil {
+					c.BulkheadConfig.BulkheadRDTConfig.CATPolicy = mergeCATPolicyFromAPI(
+						c.BulkheadConfig.BulkheadRDTConfig.CATPolicy,
+						bulkheadRDTConfig.CATPolicy,
+					)
 				}
 			}
 		}
@@ -137,4 +156,29 @@ func (c *CPUPluginConfiguration) ApplyConfiguration(conf *crd.DynamicConfigCRD) 
 			c.BindIRQToReclaimedPool = *config.BindIRQToReclaimedPool
 		}
 	}
+}
+
+func applyCATWaysExpression(dst *CATWaysExpression, value intstr.IntOrString) error {
+	expr, err := ParseCATWaysExpressionFromIntOrString(value)
+	if err != nil {
+		return fmt.Errorf("invalid default cat ways: %w", err)
+	}
+	*dst = expr
+	return nil
+}
+
+func parseCATWaysExpressionMap(values map[string]intstr.IntOrString) (map[string]CATWaysExpression, error) {
+	if values == nil {
+		return nil, nil
+	}
+
+	result := make(map[string]CATWaysExpression, len(values))
+	for key, value := range values {
+		expr, err := ParseCATWaysExpressionFromIntOrString(value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid cat ways for clos %q: %w", key, err)
+		}
+		result[key] = expr
+	}
+	return result, nil
 }

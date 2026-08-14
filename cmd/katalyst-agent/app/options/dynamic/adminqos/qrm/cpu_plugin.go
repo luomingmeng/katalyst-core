@@ -18,6 +18,7 @@ package qrm
 
 import (
 	"fmt"
+	"strings"
 
 	cliflag "k8s.io/component-base/cli/flag"
 
@@ -26,26 +27,28 @@ import (
 )
 
 type CPUPluginOptions struct {
-	PreferUseExistNUMAHintResult     bool
-	EnableBypassCPUSetAdjustment     bool
-	DisableSharedCoresRampUp         bool
-	EnableRampUpReclaimHardPartition bool
-	InitialRampUpReclaimCPUSetRatio  float64
-	EnableBulkhead                   bool
-	EnableBulkheadCpusetTopology     bool
-	EnableBulkheadCpusetMems         bool
-	EnableBulkheadWorkqueue          bool
-	EnableBulkheadSystemService      bool
-	BulkheadNonReclaimPoolMinSize    int64
-	BulkheadDefaultCATWays           utilflag.ExplicitValue[int64]
-	BulkheadClosCATWays              map[string]int64
-	BindIRQToReclaimedPool           bool
+	PreferUseExistNUMAHintResult       bool
+	EnableBypassCPUSetAdjustment       bool
+	DisableSharedCoresRampUp           bool
+	EnableRampUpReclaimHardPartition   bool
+	InitialRampUpReclaimCPUSetRatio    float64
+	EnableBulkhead                     bool
+	EnableBulkheadCpusetTopology       bool
+	EnableBulkheadCpusetMems           bool
+	EnableBulkheadWorkqueue            bool
+	EnableBulkheadSystemService        bool
+	BulkheadNonReclaimPoolMinSize      int64
+	BulkheadDefaultCATWays             utilflag.ExplicitValue[string]
+	BulkheadClosCATWays                map[string]string
+	BulkheadCATDefaultAllowedBitUsages string
+	BindIRQToReclaimedPool             bool
 }
 
 func NewCPUPluginOptions() *CPUPluginOptions {
 	return &CPUPluginOptions{
-		BulkheadNonReclaimPoolMinSize: 16,
-		EnableBulkheadCpusetMems:      true,
+		BulkheadNonReclaimPoolMinSize:      16,
+		EnableBulkheadCpusetMems:           true,
+		BulkheadCATDefaultAllowedBitUsages: string(qrm.CATBitUsageAll),
 	}
 }
 
@@ -74,11 +77,13 @@ func (o *CPUPluginOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 		"if true, enable bulkhead system_service plugin.")
 	fs.Int64Var(&o.BulkheadNonReclaimPoolMinSize, "bulkhead-non-reclaim-pool-min-size", o.BulkheadNonReclaimPoolMinSize,
 		"minimum CPU count kept in the non-reclaim pool for bulkhead cpuset topology.")
-	fs.Int64Var(&o.BulkheadDefaultCATWays.Value, "bulkhead-default-cat-ways", o.BulkheadDefaultCATWays.Value,
-		"default CAT way count for non-root bulkhead CLOS groups.")
+	fs.StringVar(&o.BulkheadDefaultCATWays.Value, "bulkhead-default-cat-ways", o.BulkheadDefaultCATWays.Value,
+		"default CAT way count expression for non-root bulkhead CLOS groups.")
 	o.BulkheadDefaultCATWays.TrackFlag(fs, "bulkhead-default-cat-ways")
-	fs.StringToInt64Var(&o.BulkheadClosCATWays, "bulkhead-clos-cat-ways", o.BulkheadClosCATWays,
-		"per-CLOS CAT way counts in clos=ways format.")
+	fs.StringToStringVar(&o.BulkheadClosCATWays, "bulkhead-clos-cat-ways", o.BulkheadClosCATWays,
+		"per-CLOS CAT way count expressions in clos=expression format.")
+	fs.StringVar(&o.BulkheadCATDefaultAllowedBitUsages, "bulkhead-cat-default-allowed-bit-usages", o.BulkheadCATDefaultAllowedBitUsages,
+		"default allowed resctrl L3 bit_usage classes for CAT placement, comma-separated; use * to allow all ways.")
 	fs.BoolVar(&o.BindIRQToReclaimedPool, "bind-irq-to-reclaimed-pool", o.BindIRQToReclaimedPool,
 		"if true and the reclaimed pool is present and non-empty, GetIRQForbiddenCores expands its result to "+
 			"(machine cpuset - reclaimed pool cpuset), effectively pinning network IRQs into the reclaimed pool.")
@@ -88,23 +93,32 @@ func (o *CPUPluginOptions) ApplyTo(c *qrm.CPUPluginConfiguration) error {
 	if o.InitialRampUpReclaimCPUSetRatio < 0 || o.InitialRampUpReclaimCPUSetRatio > 1 {
 		return fmt.Errorf("initial-ramp-up-reclaim-cpuset-ratio must be in [0,1], got %f", o.InitialRampUpReclaimCPUSetRatio)
 	}
-	defaultCATWays := o.BulkheadDefaultCATWays.Value
-	if defaultCATWays < 0 || (o.BulkheadDefaultCATWays.Changed() && defaultCATWays == 0) {
-		return fmt.Errorf("bulkhead-default-cat-ways must be positive when configured, got %d", defaultCATWays)
+	var defaultCATWays qrm.CATWaysExpression
+	if o.BulkheadDefaultCATWays.Value != "" {
+		expr, err := qrm.ParseCATWaysExpression(o.BulkheadDefaultCATWays.Value)
+		if err != nil {
+			return fmt.Errorf("invalid bulkhead-default-cat-ways: %w", err)
+		}
+		defaultCATWays = expr
 	}
 
-	var closCATWays map[string]int64
+	var closCATWays map[string]qrm.CATWaysExpression
 	if o.BulkheadClosCATWays != nil {
-		closCATWays = make(map[string]int64, len(o.BulkheadClosCATWays))
+		closCATWays = make(map[string]qrm.CATWaysExpression, len(o.BulkheadClosCATWays))
 	}
-	for clos, ways := range o.BulkheadClosCATWays {
+	for clos, raw := range o.BulkheadClosCATWays {
 		if clos == "" {
 			return fmt.Errorf("bulkhead-clos-cat-ways contains an empty clos")
 		}
-		if ways <= 0 {
-			return fmt.Errorf("bulkhead-clos-cat-ways value must be positive for clos %q, got %d", clos, ways)
+		expr, err := qrm.ParseCATWaysExpression(raw)
+		if err != nil {
+			return fmt.Errorf("invalid bulkhead-clos-cat-ways for clos %q: %w", clos, err)
 		}
-		closCATWays[clos] = ways
+		closCATWays[clos] = expr
+	}
+	defaultAllowedBitUsages, err := parseCATAllowedBitUsages(o.BulkheadCATDefaultAllowedBitUsages)
+	if err != nil {
+		return fmt.Errorf("invalid bulkhead-cat-default-allowed-bit-usages: %w", err)
 	}
 
 	c.PreferUseExistNUMAHintResult = o.PreferUseExistNUMAHintResult
@@ -120,7 +134,37 @@ func (o *CPUPluginOptions) ApplyTo(c *qrm.CPUPluginConfiguration) error {
 	c.BulkheadConfig.NonReclaimPoolMinSize = o.BulkheadNonReclaimPoolMinSize
 	c.BulkheadConfig.BulkheadRDTConfig.DefaultCATWays = defaultCATWays
 	c.BulkheadConfig.BulkheadRDTConfig.ClosCATWays = closCATWays
+	c.BulkheadConfig.BulkheadRDTConfig.CATPolicy.DefaultPlacement = &qrm.CATPlacementPolicy{
+		AllowedBitUsages: defaultAllowedBitUsages,
+		Direction:        qrm.CATAllocationDirectionLow,
+	}
 	c.BindIRQToReclaimedPool = o.BindIRQToReclaimedPool
 
 	return nil
+}
+
+func parseCATAllowedBitUsages(raw string) ([]qrm.CATBitUsage, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	usages := make([]qrm.CATBitUsage, 0, len(parts))
+	seen := make(map[qrm.CATBitUsage]struct{}, len(parts))
+	for _, part := range parts {
+		usage := qrm.CATBitUsage(strings.TrimSpace(part))
+		switch usage {
+		case qrm.CATBitUsageAll, qrm.CATBitUsageSoftware, qrm.CATBitUsageHardware, qrm.CATBitUsageExclusive:
+		default:
+			return nil, fmt.Errorf("unsupported cat bit usage %q", strings.ToLower(string(usage)))
+		}
+		if usage == qrm.CATBitUsageAll && len(parts) > 1 {
+			return nil, fmt.Errorf("cat bit usage %q must not be combined with specific usages", usage)
+		}
+		if _, ok := seen[usage]; ok {
+			return nil, fmt.Errorf("duplicate cat bit usage %q", strings.ToLower(string(usage)))
+		}
+		seen[usage] = struct{}{}
+		usages = append(usages, usage)
+	}
+	return usages, nil
 }
