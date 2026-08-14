@@ -31,7 +31,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/util/sets"
 
-	qrmresctrlmanager "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/resctrl"
 	qrmresctrl "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/resctrl"
 )
 
@@ -100,13 +99,11 @@ func TestManagerRunsCreateAndRemoveInsideClosLifecycle(t *testing.T) {
 
 	lifecycle.afterUpdate = func() {
 		require.DirExists(t, filepath.Join(root, "shared"))
-		require.True(t, manager.lifecycleManagedClosIDs.Has("shared"))
 	}
 	require.NoError(t, manager.Create("", "shared", false))
 
 	lifecycle.afterUpdate = func() {
 		require.NoDirExists(t, filepath.Join(root, "shared"))
-		require.False(t, manager.lifecycleManagedClosIDs.Has("shared"))
 	}
 	manager.Lock()
 	err := manager.removeClosLocked("shared", filepath.Join(root, "shared"))
@@ -131,7 +128,6 @@ func TestManagerLifecycleErrorDoesNotBumpEpochOrInvalidate(t *testing.T) {
 	err := manager.removeClosLocked("shared", filepath.Join(root, "shared"))
 	manager.Unlock()
 	require.ErrorIs(t, err, removeErr)
-	require.False(t, manager.lifecycleManagedClosIDs.Has("shared"))
 	require.Empty(t, lifecycle.closIDs)
 }
 
@@ -167,16 +163,12 @@ func TestManagerExistingClosDoesNotBumpEpochOrInvalidate(t *testing.T) {
 	manager.enabled.Store(true)
 
 	require.NoError(t, manager.Create("", "shared", false))
-	require.False(t, manager.lifecycleManagedClosIDs.Has("shared"))
 	require.Empty(t, lifecycle.closIDs)
 }
 
-func TestManagerCreateDoesNotClaimExternalClosThatWinsCreateRace(t *testing.T) {
+func TestManagerCreateAcceptsExistingClosThatWinsCreateRace(t *testing.T) {
 	root := t.TempDir()
-	checkpointPath := filepath.Join(t.TempDir(), "resctrl-clos-ownership.json")
-	manager := NewManager(&qrmresctrl.ResctrlConfig{
-		OwnershipCheckpointPath: checkpointPath,
-	}).(*managerImpl)
+	manager := NewManager(&qrmresctrl.ResctrlConfig{}).(*managerImpl)
 	manager.root = root
 	manager.enabled.Store(true)
 	manager.mkdir = func(path string, mode os.FileMode) error {
@@ -186,10 +178,6 @@ func TestManagerCreateDoesNotClaimExternalClosThatWinsCreateRace(t *testing.T) {
 
 	require.NoError(t, manager.Create("", "shared", false))
 
-	owned, err := qrmresctrlmanager.NewClosOwnershipStore(checkpointPath).Load()
-	require.NoError(t, err)
-	require.False(t, owned.Has("shared"))
-	require.False(t, manager.lifecycleManagedClosIDs.Has("shared"))
 	require.DirExists(t, filepath.Join(root, "shared"))
 }
 
@@ -388,7 +376,7 @@ func TestManagerImpl_ReconcileClosCleansInactivePodsAndStaleClos(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-func TestManagerImpl_ReconcileClosPreservesUncheckpointedMonGroup(t *testing.T) {
+func TestManagerImpl_ReconcileClosRemovesInactiveMonGroup(t *testing.T) {
 	t.Parallel()
 	tmpDir, err := os.MkdirTemp("", "resctrl_cleanup_disabled_test")
 	assert.NoError(t, err)
@@ -412,7 +400,7 @@ func TestManagerImpl_ReconcileClosPreservesUncheckpointedMonGroup(t *testing.T) 
 	err = m.ReconcileClos(ClosReconcileState{ActivePodUIDs: activeUIDs})
 	assert.NoError(t, err)
 
-	assert.DirExists(t, inactivePath)
+	assert.NoDirExists(t, inactivePath)
 }
 
 func TestManagerImpl_ReconcileClosSkipsConfiguredClosIDs(t *testing.T) {
@@ -547,7 +535,7 @@ func TestManagerImpl_ReconcileClosReadFailureProtectsDirectory(t *testing.T) {
 	assert.DirExists(t, monGroupPath)
 }
 
-func TestManagerImpl_ReconcileClosPreservesDefaultClosOnly(t *testing.T) {
+func TestManagerImpl_ReconcileClosKeepsDefaultClosOnly(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	for _, closID := range []string{"reclaim", "share"} {
@@ -564,10 +552,10 @@ func TestManagerImpl_ReconcileClosPreservesDefaultClosOnly(t *testing.T) {
 
 	require.NoError(t, m.ReconcileClos(ClosReconcileState{ActivePodUIDs: sets.NewString()}))
 	assert.DirExists(t, filepath.Join(root, "reclaim"))
-	assert.DirExists(t, filepath.Join(root, "share"))
+	assert.NoDirExists(t, filepath.Join(root, "share"))
 }
 
-func TestManagerImpl_ReconcileClosPreservesUncheckpointedDefaultClosMonGroup(t *testing.T) {
+func TestManagerImpl_ReconcileClosRemovesInactiveDefaultClosMonGroup(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	closPath := filepath.Join(root, "reclaim")
@@ -584,7 +572,7 @@ func TestManagerImpl_ReconcileClosPreservesUncheckpointedDefaultClosMonGroup(t *
 
 	require.NoError(t, m.ReconcileClos(ClosReconcileState{ActivePodUIDs: sets.NewString()}))
 	assert.DirExists(t, closPath)
-	assert.DirExists(t, monGroupPath)
+	assert.NoDirExists(t, monGroupPath)
 }
 
 func TestManagerImpl_GetMonGroupsCount(t *testing.T) {
@@ -644,7 +632,7 @@ func TestManagerImpl_ReconcileClos(t *testing.T) {
 			wantExists: []string{"shared-01"},
 		},
 		{
-			name: "preserve external unknown clos with empty tasks mon groups and cpus",
+			name: "remove unknown clos with empty tasks mon groups and cpus",
 			config: &qrmresctrl.ResctrlConfig{
 				EnableResctrlGroupLifecycleManagement: true,
 			},
@@ -654,8 +642,8 @@ func TestManagerImpl_ReconcileClos(t *testing.T) {
 				assert.NoError(t, os.WriteFile(filepath.Join(closPath, tasks), nil, 0o644))
 				assert.NoError(t, os.WriteFile(filepath.Join(closPath, cpus), nil, 0o644))
 			},
-			state:      ClosReconcileState{},
-			wantExists: []string{"stale"},
+			state:         ClosReconcileState{},
+			wantNotExists: []string{"stale"},
 		},
 		{
 			name: "skip cleanup clos remains protected",
@@ -689,7 +677,7 @@ func TestManagerImpl_ReconcileClos(t *testing.T) {
 			wantExists: []string{"reclaim"},
 		},
 		{
-			name: "disable rdt preserves external non skip nonempty clos",
+			name: "disable rdt removes non skip nonempty clos",
 			config: &qrmresctrl.ResctrlConfig{
 				EnableResctrlGroupLifecycleManagement: true,
 				SkipCleanupClosIDs:                    sets.NewString("protected"),
@@ -700,11 +688,11 @@ func TestManagerImpl_ReconcileClos(t *testing.T) {
 				assert.NoError(t, os.WriteFile(filepath.Join(closPath, tasks), []byte("occupied"), 0o644))
 				assert.NoError(t, os.WriteFile(filepath.Join(closPath, cpus), []byte("1"), 0o644))
 			},
-			state:      ClosReconcileState{DisableRDT: true},
-			wantExists: []string{"stale"},
+			state:         ClosReconcileState{DisableRDT: true},
+			wantNotExists: []string{"stale"},
 		},
 		{
-			name: "disable rdt preserves external default-named clos",
+			name: "disable rdt removes default-named clos",
 			config: &qrmresctrl.ResctrlConfig{
 				EnableResctrlGroupLifecycleManagement: false,
 				DefaultClosIDs:                        []string{"reclaim"},
@@ -715,8 +703,8 @@ func TestManagerImpl_ReconcileClos(t *testing.T) {
 				assert.NoError(t, os.WriteFile(filepath.Join(closPath, tasks), []byte("occupied"), 0o644))
 				assert.NoError(t, os.WriteFile(filepath.Join(closPath, cpus), []byte("1"), 0o644))
 			},
-			state:      ClosReconcileState{DisableRDT: true},
-			wantExists: []string{"reclaim"},
+			state:         ClosReconcileState{DisableRDT: true},
+			wantNotExists: []string{"reclaim"},
 		},
 	}
 
@@ -750,7 +738,6 @@ func TestManagerImpl_ReconcileClos_DisableRDTDeleteFailure(t *testing.T) {
 	m := newEnabledManager(root, &qrmresctrl.ResctrlConfig{
 		EnableResctrlGroupLifecycleManagement: true,
 	})
-	m.lifecycleManagedClosIDs = sets.NewString("reclaim")
 	m.removeAll = func(string) error {
 		return errors.New("remove failed")
 	}
@@ -822,149 +809,7 @@ func TestManagerImpl_CreateAndReconcileClosInvalidateLifecycleTransitions(t *tes
 	assert.Equal(t, []string{"shared-01", "shared-01"}, invalidator.closIDs)
 }
 
-func TestManagerRestoresClosOwnershipFromCheckpointBeforeCleanup(t *testing.T) {
-	root := t.TempDir()
-	checkpointPath := filepath.Join(t.TempDir(), "resctrl-clos-ownership.json")
-	config := &qrmresctrl.ResctrlConfig{OwnershipCheckpointPath: checkpointPath}
-
-	first := NewManager(config).(*managerImpl)
-	first.root = root
-	first.enabled.Store(true)
-	require.NoError(t, first.Create("", "custom-owned", false))
-	require.NoError(t, os.WriteFile(filepath.Join(root, "custom-owned", tasks), nil, 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(root, "custom-owned", cpus), nil, 0o644))
-
-	restarted := NewManager(config).(*managerImpl)
-	restarted.root = root
-	restarted.enabled.Store(true)
-	require.NoError(t, restarted.ReconcileClos(ClosReconcileState{}))
-
-	require.NoDirExists(t, filepath.Join(root, "custom-owned"))
-}
-
-func TestManagerRefreshesOwnershipRegisteredByCPUList(t *testing.T) {
-	root := t.TempDir()
-	checkpointPath := filepath.Join(t.TempDir(), "resctrl-clos-ownership.json")
-	manager := NewManager(&qrmresctrl.ResctrlConfig{
-		OwnershipCheckpointPath: checkpointPath,
-	}).(*managerImpl)
-	manager.root = root
-	manager.enabled.Store(true)
-	require.NoError(t, os.Mkdir(filepath.Join(root, "dedicated"), 0o755))
-	require.NoError(t, qrmresctrlmanager.NewClosOwnershipStore(checkpointPath).Register("dedicated"))
-
-	require.NoError(t, manager.ReconcileClos(ClosReconcileState{DisableRDT: true}))
-
-	require.NoDirExists(t, filepath.Join(root, "dedicated"))
-}
-
-func TestManagerRecoversPendingClosDeletionAfterRestart(t *testing.T) {
-	root := t.TempDir()
-	checkpointPath := filepath.Join(t.TempDir(), "resctrl-clos-ownership.json")
-	store := qrmresctrlmanager.NewClosOwnershipStore(checkpointPath)
-	require.NoError(t, store.Register("dedicated"))
-	require.NoError(t, os.Mkdir(filepath.Join(root, "dedicated"), 0o755))
-	identity, err := qrmresctrlmanager.DirectoryIdentityForPath(filepath.Join(root, "dedicated"))
-	require.NoError(t, err)
-	require.NoError(t, store.BeginDelete("dedicated", identity))
-
-	restarted := NewManager(&qrmresctrl.ResctrlConfig{
-		OwnershipCheckpointPath: checkpointPath,
-	}).(*managerImpl)
-	restarted.root = root
-	restarted.enabled.Store(true)
-
-	require.NoError(t, restarted.ReconcileClos(ClosReconcileState{}))
-	require.NoDirExists(t, filepath.Join(root, "dedicated"))
-	owned, err := store.Load()
-	require.NoError(t, err)
-	require.False(t, owned.Has("dedicated"))
-	pending, err := store.PendingDeletes()
-	require.NoError(t, err)
-	require.False(t, pending.Has("dedicated"))
-}
-
-func TestManagerPendingDeletePreservesReplacementWithDifferentIdentity(t *testing.T) {
-	root := t.TempDir()
-	checkpointPath := filepath.Join(t.TempDir(), "resctrl-clos-ownership.json")
-	config := &qrmresctrl.ResctrlConfig{OwnershipCheckpointPath: checkpointPath}
-	first := NewManager(config).(*managerImpl)
-	first.root = root
-	first.enabled.Store(true)
-	require.NoError(t, first.Create("", "dedicated", false))
-	require.NoError(t, os.WriteFile(filepath.Join(root, "dedicated", tasks), nil, 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(root, "dedicated", cpus), nil, 0o644))
-	first.removeAll = func(string) error { return errors.New("injected delete failure") }
-	require.ErrorContains(t, first.ReconcileClos(ClosReconcileState{}), "injected delete failure")
-
-	require.NoError(t, os.RemoveAll(filepath.Join(root, "dedicated")))
-	require.NoError(t, os.Mkdir(filepath.Join(root, "dedicated"), 0o755))
-	replacementMarker := filepath.Join(root, "dedicated", "external")
-	require.NoError(t, os.WriteFile(replacementMarker, []byte("keep"), 0o644))
-
-	restarted := NewManager(config).(*managerImpl)
-	restarted.root = root
-	restarted.enabled.Store(true)
-	require.NoError(t, restarted.ReconcileClos(ClosReconcileState{}))
-
-	require.FileExists(t, replacementMarker)
-	pending, err := qrmresctrlmanager.NewClosOwnershipStore(checkpointPath).PendingDeletes()
-	require.NoError(t, err)
-	require.False(t, pending.Has("dedicated"))
-}
-
-func TestManagerRecoversPendingCreateWithoutClaimingLaterExternalClos(t *testing.T) {
-	root := t.TempDir()
-	checkpointPath := filepath.Join(t.TempDir(), "resctrl-clos-ownership.json")
-	store := qrmresctrlmanager.NewClosOwnershipStore(checkpointPath)
-	require.NoError(t, store.BeginCreate("dedicated"))
-
-	restarted := NewManager(&qrmresctrl.ResctrlConfig{
-		OwnershipCheckpointPath: checkpointPath,
-	}).(*managerImpl)
-	restarted.root = root
-	restarted.enabled.Store(true)
-
-	require.NoError(t, restarted.ReconcileClos(ClosReconcileState{}))
-	pending, err := store.PendingCreates()
-	require.NoError(t, err)
-	require.False(t, pending.Has("dedicated"))
-	owned, err := store.Load()
-	require.NoError(t, err)
-	require.False(t, owned.Has("dedicated"))
-
-	require.NoError(t, os.Mkdir(filepath.Join(root, "dedicated"), 0o755))
-	require.NoError(t, restarted.ReconcileClos(ClosReconcileState{DisableRDT: true}))
-	require.DirExists(t, filepath.Join(root, "dedicated"))
-}
-
-func TestManagerCreateRecoversPendingDeletionBeforeConfirmingClos(t *testing.T) {
-	root := t.TempDir()
-	checkpointPath := filepath.Join(t.TempDir(), "resctrl-clos-ownership.json")
-	store := qrmresctrlmanager.NewClosOwnershipStore(checkpointPath)
-	require.NoError(t, store.Register("dedicated"))
-	require.NoError(t, os.Mkdir(filepath.Join(root, "dedicated"), 0o755))
-	identity, err := qrmresctrlmanager.DirectoryIdentityForPath(filepath.Join(root, "dedicated"))
-	require.NoError(t, err)
-	require.NoError(t, store.BeginDelete("dedicated", identity))
-
-	restarted := NewManager(&qrmresctrl.ResctrlConfig{
-		OwnershipCheckpointPath: checkpointPath,
-	}).(*managerImpl)
-	restarted.root = root
-	restarted.enabled.Store(true)
-
-	require.NoError(t, restarted.Create("", "dedicated", false))
-	require.DirExists(t, filepath.Join(root, "dedicated"))
-	owned, err := store.Load()
-	require.NoError(t, err)
-	require.True(t, owned.Has("dedicated"))
-	pending, err := store.PendingDeletes()
-	require.NoError(t, err)
-	require.False(t, pending.Has("dedicated"))
-}
-
-func TestManagerDisableRDTPreservesExternalClosEvenWithManagedName(t *testing.T) {
+func TestManagerDisableRDTRemovesAllNonSkippedClos(t *testing.T) {
 	root := t.TempDir()
 	for _, closID := range []string{"dedicated", "external"} {
 		require.NoError(t, os.Mkdir(filepath.Join(root, closID), 0o755))
@@ -972,9 +817,7 @@ func TestManagerDisableRDTPreservesExternalClosEvenWithManagedName(t *testing.T)
 	externalMonGroup := filepath.Join(root, "dedicated", MonGroupsDir, PodDirPrefix+"external-pod")
 	require.NoError(t, os.MkdirAll(externalMonGroup, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(externalMonGroup, tasks), nil, 0o644))
-	manager := NewManager(&qrmresctrl.ResctrlConfig{
-		OwnershipCheckpointPath: filepath.Join(t.TempDir(), "resctrl-clos-ownership.json"),
-	}).(*managerImpl)
+	manager := NewManager(&qrmresctrl.ResctrlConfig{}).(*managerImpl)
 	manager.root = root
 	manager.enabled.Store(true)
 
@@ -983,23 +826,9 @@ func TestManagerDisableRDTPreservesExternalClosEvenWithManagedName(t *testing.T)
 		ActivePodUIDs: sets.NewString(),
 	}))
 
-	require.DirExists(t, filepath.Join(root, "dedicated"))
-	require.DirExists(t, filepath.Join(root, "external"))
-	require.DirExists(t, externalMonGroup)
-}
-
-func TestManagerCheckpointsOwnershipBeforeCreatingClos(t *testing.T) {
-	root := t.TempDir()
-	checkpointParent := filepath.Join(t.TempDir(), "not-a-directory")
-	require.NoError(t, os.WriteFile(checkpointParent, []byte("block mkdir"), 0o644))
-	manager := NewManager(&qrmresctrl.ResctrlConfig{
-		OwnershipCheckpointPath: filepath.Join(checkpointParent, "ownership.json"),
-	}).(*managerImpl)
-	manager.root = root
-	manager.enabled.Store(true)
-
-	require.Error(t, manager.Create("", "custom-owned", false))
-	require.NoDirExists(t, filepath.Join(root, "custom-owned"))
+	require.NoDirExists(t, filepath.Join(root, "dedicated"))
+	require.NoDirExists(t, filepath.Join(root, "external"))
+	require.NoDirExists(t, externalMonGroup)
 }
 
 func TestManagerImpl_SkipFilesystemAccessWhenResctrlUnavailable(t *testing.T) {

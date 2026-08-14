@@ -67,7 +67,7 @@ func NewCPUListPlugin(conf *config.Configuration) bulkheadapi.Plugin {
 	}
 	return NewCPUListPluginWithManager(
 		resctrlConfig,
-		qrmresctrlmanager.NewCPUListManager(qrmresctrlmanager.OwnershipCheckpointPath(conf)),
+		qrmresctrlmanager.NewCPUListManager(),
 	)
 }
 

@@ -249,13 +249,8 @@ func (r *resctrlHinter) expectedClosIDs() sets.String {
 }
 
 func newResctrlHinter(config *qrmresctrl.ResctrlConfig, dynamicConf *dynamicconfig.DynamicAgentConfiguration,
-	emitter metrics.MetricEmitter, state state.ReadonlyState, ownershipCheckpointPath ...string,
+	emitter metrics.MetricEmitter, state state.ReadonlyState,
 ) ResctrlHinter {
-	if config != nil && len(ownershipCheckpointPath) > 0 && ownershipCheckpointPath[0] != "" {
-		configCopy := *config
-		configCopy.OwnershipCheckpointPath = ownershipCheckpointPath[0]
-		config = &configCopy
-	}
 	r := &resctrlHinter{
 		emitter:     emitter,
 		config:      config,

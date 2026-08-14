@@ -40,9 +40,6 @@ type ResctrlConfig struct {
 	DefaultClosIDs []string
 	// SkipCleanupClosIDs is a list of resctrl closID directories to skip cleaning.
 	SkipCleanupClosIDs sets.String
-	// OwnershipCheckpointPath persists the exact CLOS IDs created by Katalyst.
-	// Empty disables persistence and is intended only for tests.
-	OwnershipCheckpointPath string
 }
 
 func NewResctrlConfig() *ResctrlConfig {
