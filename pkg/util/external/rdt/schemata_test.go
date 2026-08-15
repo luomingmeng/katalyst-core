@@ -66,6 +66,17 @@ func TestSchemataCoordinatorPreservesHighBitCATMask(t *testing.T) {
 	require.Equal(t, "L3:0=8000000000000000;\nMB:0=100;\n", readSchemata(t, root, "clos"))
 }
 
+func TestSchemataCoordinatorWritesZeroCATMask(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeSchemata(t, root, "clos", "L3:0=ffff;1=ffff;\nMB:0=100;1=100;\n")
+	coordinator := newSchemataCoordinator(root)
+
+	require.NoError(t, coordinator.ApplyL3("clos", map[int]uint64{0: 0, 1: 0}))
+	require.Equal(t, "L3:0=0;1=0;\nMB:0=100;1=100;\n", readSchemata(t, root, "clos"))
+}
+
 func TestSchemataCoordinatorSerializesReadModifyWritePerClos(t *testing.T) {
 	root := t.TempDir()
 	writeSchemata(t, root, "clos", "L3:0=ff;\nMB:0=100;\n")
