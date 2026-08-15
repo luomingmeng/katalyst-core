@@ -105,6 +105,7 @@ func TestCATWaysExpressionEvaluate(t *testing.T) {
 		{name: "literal", raw: "4", maxCATWays: 11, minCATWays: 2, want: 4},
 		{name: "max cat ways", raw: "MaxCATWays", maxCATWays: 11, minCATWays: 2, want: 11},
 		{name: "min cat ways", raw: "MinCATWays", maxCATWays: 11, minCATWays: 2, want: 2},
+		{name: "zero min cat ways", raw: "MinCATWays", maxCATWays: 16, minCATWays: 0, want: 0},
 		{name: "subtract variable", raw: "MaxCATWays-MinCATWays", maxCATWays: 11, minCATWays: 2, want: 9},
 		{name: "subtract literal", raw: "MaxCATWays-2", maxCATWays: 11, minCATWays: 2, want: 9},
 		{name: "add literal", raw: "MinCATWays+1", maxCATWays: 11, minCATWays: 2, want: 3},
