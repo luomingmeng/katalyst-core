@@ -171,6 +171,32 @@ func TestCATPluginExclusiveClosIDsReserveNonOverlappingWays(t *testing.T) {
 	}, manager.writes)
 }
 
+func TestCATPluginExclusiveZeroTargetPreservesRemainingWays(t *testing.T) {
+	manager := &fakeRDTManager{}
+	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{
+		clos: []qrmresctrlmanager.CPUListClos{{ID: "clos-a"}, {ID: "peer-b"}},
+	}, manager, fakeCapabilityProvider{capabilities: map[int]rdt.CATCapability{
+		0: {CBMMask: 0xffff, MinCBMBits: 0},
+	}})
+
+	_, err := plugin.reconcileConfig(context.Background(), qrmconfig.DynamicBulkheadRDTConfiguration{
+		DefaultCATWays: catExpr("MaxCATWays-MinCATWays"),
+		ClosCATWays: map[string]qrmconfig.CATWaysExpression{
+			"clos-a": catExpr("MinCATWays"),
+		},
+		CATPolicy: qrmconfig.CATPolicy{
+			ExclusiveClosIDs: []string{"clos-a"},
+		},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, []catWrite{
+		{clos: "clos-a", mask: map[int]uint64{0: 0}},
+		{clos: "peer-b", mask: map[int]uint64{0: 0xffff}},
+	}, manager.writes)
+	require.Zero(t, manager.writes[0].mask[0]&manager.writes[1].mask[0])
+}
+
 func TestCATPluginExclusiveClosIDsRespectPlacement(t *testing.T) {
 	manager := &fakeRDTManager{}
 	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{
@@ -452,6 +478,41 @@ func TestCATPluginValidatesEveryManagedTargetBeforeApplyingAny(t *testing.T) {
 
 	require.Error(t, err)
 	require.Empty(t, manager.writes)
+}
+
+func TestCATPluginBuildsZeroTargetForZeroMinimum(t *testing.T) {
+	manager := &fakeRDTManager{}
+	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{
+		clos: []qrmresctrlmanager.CPUListClos{{ID: "clos-a"}},
+	}, manager, fakeCapabilityProvider{capabilities: map[int]rdt.CATCapability{
+		0: {CBMMask: 0xffff, MinCBMBits: 0},
+		1: {CBMMask: 0xffff, MinCBMBits: 0},
+	}})
+
+	_, err := plugin.reconcileConfig(context.Background(), qrmconfig.DynamicBulkheadRDTConfiguration{
+		DefaultCATWays: catExpr("MaxCATWays-MinCATWays"),
+		ClosCATWays: map[string]qrmconfig.CATWaysExpression{
+			"clos-a": catExpr("MinCATWays"),
+		},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, []catWrite{{
+		clos: "clos-a",
+		mask: map[int]uint64{0: 0, 1: 0},
+	}}, manager.writes)
+}
+
+func TestCATPluginRejectsZeroTargetForPositiveMinimum(t *testing.T) {
+	_, err := targetForAvailable(
+		0,
+		rdt.CATCapability{CBMMask: 0x3, MinCBMBits: 2},
+		catExpr("MaxCATWays-MinCATWays"),
+		qrmconfig.CATAllocationDirectionLow,
+		0x3,
+	)
+
+	require.ErrorContains(t, err, "domain 0 does not support zero CAT ways")
 }
 
 func TestCATPluginRollbackValidatesEveryTargetBeforeRestoringRoot(t *testing.T) {

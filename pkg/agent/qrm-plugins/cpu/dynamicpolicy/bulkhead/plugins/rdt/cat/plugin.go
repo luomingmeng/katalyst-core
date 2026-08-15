@@ -311,8 +311,14 @@ func targetForAvailable(domain int, capability rdt.CATCapability, expr qrmconfig
 	if err != nil {
 		return 0, fmt.Errorf("domain %d cannot evaluate CAT ways expression %q: %w", domain, expr.String(), err)
 	}
-	if ways <= 0 {
-		return 0, fmt.Errorf("CAT ways must be positive, got %d", ways)
+	if ways < 0 {
+		return 0, fmt.Errorf("CAT ways must be non-negative, got %d", ways)
+	}
+	if ways == 0 {
+		if capability.MinCBMBits != 0 {
+			return 0, fmt.Errorf("domain %d does not support zero CAT ways", domain)
+		}
+		return 0, nil
 	}
 	if ways < int64(capability.MinCBMBits) || ways > int64(bits.OnesCount64(available)) {
 		return 0, fmt.Errorf("domain %d cannot satisfy %d CAT ways", domain, ways)
