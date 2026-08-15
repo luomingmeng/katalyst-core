@@ -438,6 +438,122 @@ func TestCleanPoolsDeletesDefaultShareAfterBackfillFlippedOff(t *testing.T) {
 			CheckPoolEmpty(commonstate.PoolNameShare))
 }
 
+func TestCleanPoolsFromPodEntries(t *testing.T) {
+	t.Parallel()
+
+	policy := newTestDynamicPolicy(t, "clean-pools-from-entries")
+	policy.dynamicConfig.GetDynamicConfiguration().
+		FillDefaultSharePoolWithNonReclaimCPUs = true
+
+	newPoolEntry := func(poolName string) state.ContainerEntries {
+		return state.ContainerEntries{
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta: commonstate.GenerateGenericPoolAllocationMeta(poolName),
+			},
+		}
+	}
+
+	entries := state.PodEntries{
+		"share-NUMA0":               newPoolEntry("share-NUMA0"),
+		"share-NUMA1":               newPoolEntry("share-NUMA1"),
+		commonstate.PoolNameShare:   newPoolEntry(commonstate.PoolNameShare),
+		commonstate.PoolNameReserve: newPoolEntry(commonstate.PoolNameReserve),
+		"system-service":            newPoolEntry("system-service"),
+		"peer-b": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "peer-b",
+					ContainerName: "main",
+					OwnerPoolName: "share-NUMA1",
+				},
+			},
+		},
+	}
+
+	deletedPools := policy.cleanPoolsFromPodEntries(entries)
+
+	require.Equal(t, []string{"share-NUMA0"}, deletedPools.List())
+	require.NotContains(t, entries, "share-NUMA0")
+	require.Contains(t, entries, "share-NUMA1")
+	require.Contains(t, entries, commonstate.PoolNameShare)
+	require.Contains(t, entries, commonstate.PoolNameReserve)
+	require.Contains(t, entries, "system-service")
+}
+
+func TestPodDeletionCleansUnownedPoolsBeforeAdjustment(t *testing.T) {
+	policyTestMutex.Lock()
+	defer policyTestMutex.Unlock()
+	defer mockey.UnPatchAll()
+
+	const (
+		podUID   = "clos-a"
+		poolName = "share-NUMA0"
+	)
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	entries := state.PodEntries{
+		poolName: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta: commonstate.GenerateGenericPoolAllocationMeta(poolName),
+			},
+		},
+		podUID: {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        podUID,
+					ContainerName: "main",
+					OwnerPoolName: poolName,
+				},
+			},
+		},
+	}
+	machineState, err := generateMachineStateFromPodEntries(
+		topology, entries, policy.state.GetMachineState())
+	require.NoError(t, err)
+	require.NoError(t, policy.state.CommitAdvisorState(entries, machineState, false, false, true))
+
+	assertCleaned := func(entries state.PodEntries) {
+		require.NotContains(t, entries, podUID)
+		require.NotContains(t, entries, poolName)
+	}
+
+	t.Run("explicit remove", func(t *testing.T) {
+		adjustErr := errors.New("stop after validating target entries")
+		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAtRevision).
+			To(func(_ *DynamicPolicy, entries state.PodEntries, _ state.NUMANodeMap,
+				_ bool, _ uint64,
+			) error {
+				assertCleaned(entries)
+				return adjustErr
+			}).Build()
+
+		_, err := policy.RemovePod(context.Background(), &pluginapi.RemovePodRequest{PodUid: podUID})
+		require.ErrorIs(t, err, adjustErr)
+		mockey.UnPatchAll()
+	})
+
+	t.Run("residual cleanup", func(t *testing.T) {
+		called := false
+		policy.residualHitMap = make(map[string]int64)
+		policy.residualHitMap[podUID] = maxResidualTime.Nanoseconds()/stateCheckPeriod.Nanoseconds() - 1
+		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAtRevision).
+			To(func(_ *DynamicPolicy, entries state.PodEntries, _ state.NUMANodeMap,
+				_ bool, _ uint64,
+			) error {
+				called = true
+				assertCleaned(entries)
+				return errors.New("stop after validating target entries")
+			}).Build()
+
+		policy.clearResidualState(nil, nil, nil, nil, nil)
+		require.True(t, called)
+	})
+}
+
 func TestGetResourcesAllocationSkipsNilAllocationInfo(t *testing.T) {
 	t.Parallel()
 
