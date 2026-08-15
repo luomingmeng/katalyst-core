@@ -440,6 +440,7 @@ func (p *DynamicPolicy) clearResidualState(_ *coreconfig.Configuration,
 			delete(podEntries, podUID)
 		}
 
+		p.cleanPoolsFromPodEntries(podEntries)
 		var updatedMachineState state.NUMANodeMap
 		updatedMachineState, err = generateMachineStateFromPodEntries(p.machineInfo.CPUTopology, podEntries, p.state.GetMachineState())
 		if err != nil {

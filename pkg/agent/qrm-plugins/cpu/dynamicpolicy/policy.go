@@ -1449,6 +1449,7 @@ func (p *DynamicPolicy) RemovePod(ctx context.Context,
 	expectedRevision := p.state.GetRevision()
 	podEntries := currentPodEntries.Clone()
 	delete(podEntries, req.PodUid)
+	p.cleanPoolsFromPodEntries(podEntries)
 	machineState, err := generateMachineStateFromPodEntries(
 		p.machineInfo.CPUTopology, podEntries, p.state.GetMachineState())
 	if err != nil {
@@ -1574,18 +1575,39 @@ func (p *DynamicPolicy) generateHintOptimizerFactoryOptions() policy.HintOptimiz
 
 // cleanPools is used to clean pools-related data in local state
 func (p *DynamicPolicy) cleanPools() error {
+	podEntries := p.state.GetPodEntries()
+	poolsToDelete := p.cleanPoolsFromPodEntries(podEntries)
+	if poolsToDelete.Len() == 0 {
+		general.Infof("there is no pool to delete")
+		return nil
+	}
+
+	general.Infof("pools to delete: %v", poolsToDelete.UnsortedList())
+	machineState, err := generateMachineStateFromPodEntries(p.machineInfo.CPUTopology, podEntries, p.state.GetMachineState())
+	if err != nil {
+		return fmt.Errorf("calculate machineState by podEntries failed with error: %v", err)
+	}
+
+	p.state.SetPodEntries(podEntries, false)
+	p.state.SetMachineState(machineState, false)
+	if err := p.state.StoreState(); err != nil {
+		general.ErrorS(err, "store state failed")
+	}
+	return nil
+}
+
+func (p *DynamicPolicy) cleanPoolsFromPodEntries(podEntries state.PodEntries) sets.String {
 	remainPools := make(map[string]bool)
 
 	// walk through pod entries to put them into specified pool maps
-	podEntries := p.state.GetPodEntries()
-	for _, entries := range podEntries {
+	for podUID, entries := range podEntries {
 		if entries.IsPoolEntry() {
 			continue
 		}
 
 		for containerName, allocationInfo := range entries {
 			if allocationInfo == nil {
-				general.Warningf("container %s allocation info is nil during cleanPools, skip it", containerName)
+				general.Warningf("pod %s container %s allocation info is nil during cleanPools, skip it", podUID, containerName)
 				continue
 			}
 			ownerPool := allocationInfo.GetOwnerPoolName()
@@ -1620,27 +1642,10 @@ func (p *DynamicPolicy) cleanPools() error {
 		}
 	}
 
-	if poolsToDelete.Len() > 0 {
-		general.Infof("pools to delete: %v", poolsToDelete.UnsortedList())
-		for _, poolName := range poolsToDelete.UnsortedList() {
-			delete(podEntries, poolName)
-		}
-
-		machineState, err := generateMachineStateFromPodEntries(p.machineInfo.CPUTopology, podEntries, p.state.GetMachineState())
-		if err != nil {
-			return fmt.Errorf("calculate machineState by podEntries failed with error: %v", err)
-		}
-
-		p.state.SetPodEntries(podEntries, false)
-		p.state.SetMachineState(machineState, false)
-		if err := p.state.StoreState(); err != nil {
-			general.ErrorS(err, "store state failed")
-		}
-	} else {
-		general.Infof("there is no pool to delete")
+	for _, poolName := range poolsToDelete.UnsortedList() {
+		delete(podEntries, poolName)
 	}
-
-	return nil
+	return poolsToDelete
 }
 
 // initReservePool initializes reserve pool for system cores workload
