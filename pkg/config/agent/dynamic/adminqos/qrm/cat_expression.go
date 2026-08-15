@@ -57,6 +57,11 @@ type CATWaysExpression struct {
 	right      catWaysOperand
 }
 
+// DeepCopy preserves the parsed expression across reflective configuration copies.
+func (e CATWaysExpression) DeepCopy() interface{} {
+	return e
+}
+
 // ParseCATWaysExpression parses a CAT way count expression.
 func ParseCATWaysExpression(raw string) (CATWaysExpression, error) {
 	normalized := strings.TrimSpace(raw)

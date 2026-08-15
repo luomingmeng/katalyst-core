@@ -37,6 +37,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/config/agent"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	evictionconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic/adminqos/eviction"
+	qrmconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic/adminqos/qrm"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic/crd"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/cnc"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
@@ -476,6 +477,27 @@ func TestApplyDynamicConfigRestoresCriticalWatermarkSourceDefault(t *testing.T) 
 	withoutAQCOverride := deepCopy(defaultConfig)
 	applyDynamicConfig(withoutAQCOverride, newCriticalWatermarkSourceDynamicConfig(nil))
 	require.Equal(t, v1alpha1.CriticalWatermarkSourceHigh, withoutAQCOverride.CriticalWatermarkSource)
+}
+
+func TestDeepCopyPreservesCATWaysExpressions(t *testing.T) {
+	t.Parallel()
+
+	defaultCATWays, err := qrmconfig.ParseCATWaysExpression("MaxCATWays-MinCATWays")
+	require.NoError(t, err)
+	sandboxCATWays, err := qrmconfig.ParseCATWaysExpression("MinCATWays")
+	require.NoError(t, err)
+
+	defaultConfig := dynamic.NewConfiguration()
+	rdt := &defaultConfig.BulkheadConfig.BulkheadRDTConfig
+	rdt.DefaultCATWays = defaultCATWays
+	rdt.ClosCATWays = map[string]qrmconfig.CATWaysExpression{
+		"sandbox": sandboxCATWays,
+	}
+
+	copied := deepCopy(defaultConfig)
+	copiedRDT := copied.BulkheadConfig.BulkheadRDTConfig
+	require.Equal(t, "MaxCATWays-MinCATWays", copiedRDT.DefaultCATWays.String())
+	require.Equal(t, "MinCATWays", copiedRDT.ClosCATWays["sandbox"].String())
 }
 
 func newCriticalWatermarkSourceDynamicConfig(source *v1alpha1.CriticalWatermarkSource) *crd.DynamicConfigCRD {
