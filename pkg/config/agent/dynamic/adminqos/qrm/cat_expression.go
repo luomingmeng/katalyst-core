@@ -180,8 +180,8 @@ func (e CATWaysExpression) Evaluate(maxCATWays int64, minCATWays int64) (int64, 
 		return 0, fmt.Errorf("cat ways expression %q has unknown operator %q", e.String(), e.operator)
 	}
 
-	if result <= 0 {
-		return 0, fmt.Errorf("cat ways expression %q evaluated to %d, must be positive", e.String(), result)
+	if result < 0 {
+		return 0, fmt.Errorf("cat ways expression %q evaluated to %d, must be non-negative", e.String(), result)
 	}
 	return result, nil
 }
