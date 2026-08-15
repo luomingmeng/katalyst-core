@@ -76,7 +76,7 @@ func (p *catCapabilityProvider) GetCATCapabilities() (map[int]CATCapability, err
 		}
 		return nil, fmt.Errorf("read L3 min_cbm_bits: %w", err)
 	}
-	if mask == 0 || minBits <= 0 {
+	if mask == 0 || minBits < 0 {
 		return nil, fmt.Errorf("invalid L3 capability cbm_mask=%x min_cbm_bits=%d", mask, minBits)
 	}
 

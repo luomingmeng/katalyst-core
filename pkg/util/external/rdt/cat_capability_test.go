@@ -58,6 +58,22 @@ func TestCATCapabilityProviderReadsIndentedL3Schemata(t *testing.T) {
 	}, capabilities)
 }
 
+func TestCATCapabilityProviderAcceptsZeroMinCBMBits(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "info", "L3"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "info", "L3", "cbm_mask"), []byte("ffff\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "info", "L3", "min_cbm_bits"), []byte("0\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "schemata"), []byte("L3:0=ffff;1=ffff;\n"), 0o644))
+
+	capabilities, err := newCATCapabilityProvider(root).GetCATCapabilities()
+
+	require.NoError(t, err)
+	require.Equal(t, map[int]CATCapability{
+		0: {CBMMask: 0xffff, MinCBMBits: 0},
+		1: {CBMMask: 0xffff, MinCBMBits: 0},
+	}, capabilities)
+}
+
 func TestCATCapabilityProviderReadsBitUsageRightmostCharacterAsLowestBit(t *testing.T) {
 	root := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(root, "info", "L3"), 0o755))
