@@ -96,7 +96,11 @@ func (p *CPUListPlugin) CPUSetAdjustmentHandler(ctx context.Context, in bulkhead
 	if err != nil {
 		return fmt.Errorf("list managed CLOS: %w", err)
 	}
-	targets := p.buildTargets(in.View)
+	targetCPUSets := p.buildTargetCPUSets(in.View)
+	if err := validateDisjointCPUListTargets(targetCPUSets); err != nil {
+		return err
+	}
+	targets := formatCPUListTargets(targetCPUSets)
 	active := make(map[Clos]struct{}, len(clos))
 	existing := make(map[string]struct{}, len(clos))
 	for _, current := range clos {
@@ -154,10 +158,10 @@ func (p *CPUListPlugin) PeriodicalHandler(context.Context, bulkheadapi.Periodica
 	return nil
 }
 
-func (p *CPUListPlugin) buildTargets(view *model.CPUSetPartitionView) map[string]string {
+func (p *CPUListPlugin) buildTargetCPUSets(view *model.CPUSetPartitionView) map[string]machine.CPUSet {
 	cpuSets := make(map[string]machine.CPUSet)
 	if view == nil {
-		return map[string]string{}
+		return cpuSets
 	}
 	for pool, cpus := range view.SharePoolMap {
 		if cpus.IsEmpty() {
@@ -169,11 +173,42 @@ func (p *CPUListPlugin) buildTargets(view *model.CPUSetPartitionView) map[string
 	if !view.Dedicated.IsEmpty() {
 		cpuSets[consts.ResctrlGroupDedicated] = view.Dedicated
 	}
+	return cpuSets
+}
+
+func validateDisjointCPUListTargets(targets map[string]machine.CPUSet) error {
+	closIDs := make([]string, 0, len(targets))
+	for closID, cpus := range targets {
+		if !cpus.IsEmpty() {
+			closIDs = append(closIDs, closID)
+		}
+	}
+	sort.Strings(closIDs)
+	// Validate after pools have been grouped by CLOS. Overlap within one CLOS is
+	// an intentional union, while overlap across final CLOS targets violates the
+	// expected CPU ownership invariant.
+	for i, leftID := range closIDs {
+		for _, rightID := range closIDs[i+1:] {
+			overlap := targets[leftID].Intersection(targets[rightID])
+			if !overlap.IsEmpty() {
+				return fmt.Errorf("cpu list targets for clos %q and %q overlap on cpus %q",
+					leftID, rightID, overlap.String())
+			}
+		}
+	}
+	return nil
+}
+
+func formatCPUListTargets(cpuSets map[string]machine.CPUSet) map[string]string {
 	targets := make(map[string]string, len(cpuSets))
 	for closID, cpus := range cpuSets {
 		targets[closID] = cpus.String()
 	}
 	return targets
+}
+
+func (p *CPUListPlugin) buildTargets(view *model.CPUSetPartitionView) map[string]string {
+	return formatCPUListTargets(p.buildTargetCPUSets(view))
 }
 
 func sortedTargetClosIDs(targets map[string]string) []string {

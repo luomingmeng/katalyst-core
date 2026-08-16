@@ -1,5 +1,14 @@
 # CAT 受限前缀选择器、独占 CLOS 与安全事务设计
 
+> **Superseded notice（2026-08-16）**
+>
+> 本文关于 shared CLOS naming、canonical/physical 双层 binding、canonical
+> collision，以及 CPUList 不管理 shared physical CLOS 的契约，已由
+> `2026-08-16-rdt-clos-grouping-optimization-design.md` 取代。新的默认 share
+> 物理 CLOS 为 `shared-50`，非默认 pool 的显式 subgroup 使用 `share-<id>`；
+> `shared-50` 与 `share-50` 是可同时存在的独立物理 CLOS。本文其他 CAT policy
+> 内容仍作为历史设计背景保留。
+
 ## 文档状态
 
 - 状态：设计已确认，待实施

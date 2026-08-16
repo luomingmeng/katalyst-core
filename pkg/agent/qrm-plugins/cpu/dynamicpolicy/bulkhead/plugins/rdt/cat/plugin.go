@@ -224,14 +224,14 @@ func (p *CATPlugin) resolveExpressionOverrides(overrides map[string]qrmconfig.CA
 	resolved := make(map[string]qrmconfig.CATWaysExpression, len(overrides))
 	directClosIDs := make(map[string]struct{}, len(overrides))
 	for key := range overrides {
-		if _, ok := p.config.CPUSetPoolToSharedSubgroup[key]; ok {
+		if resctrlutil.IsExplicitSharedPoolMapping(key, p.config) {
 			continue
 		}
 		directClosIDs[resctrlutil.ResolveCATWayKey(key, p.config)] = struct{}{}
 	}
 	for key, expr := range overrides {
 		closID := resctrlutil.ResolveCATWayKey(key, p.config)
-		if _, ok := p.config.CPUSetPoolToSharedSubgroup[key]; ok {
+		if resctrlutil.IsExplicitSharedPoolMapping(key, p.config) {
 			if _, direct := directClosIDs[closID]; direct {
 				continue
 			}

@@ -25,10 +25,9 @@ type ResctrlConfig struct {
 	// Resctrl CLOS lifecycle is controlled by dynamic RDTConfig.DisableRDT.
 	EnableResctrlGroupLifecycleManagement bool
 
-	// CPUSetPoolToSharedSubgroup specifies, if present, the subgroup id for shared-core QoS pod
-	// based on its cpu set pool annotation.
+	// CPUSetPoolToSharedSubgroup maps non-default shared-core pools to explicit
+	// "share-<id>" CLOS groups. The default "share" pool always uses "shared-50".
 	CPUSetPoolToSharedSubgroup map[string]int
-	DefaultSharedSubgroup      int
 	EnabledQoS                 []string
 
 	// MonGroupEnabledClosIDs is about mon_group layout hint policy.
@@ -45,7 +44,6 @@ type ResctrlConfig struct {
 func NewResctrlConfig() *ResctrlConfig {
 	return &ResctrlConfig{
 		CPUSetPoolToSharedSubgroup: make(map[string]int),
-		DefaultSharedSubgroup:      -1,
 		SkipCleanupClosIDs:         sets.NewString(),
 	}
 }

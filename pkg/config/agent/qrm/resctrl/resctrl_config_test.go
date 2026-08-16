@@ -27,7 +27,6 @@ func TestNewResctrlConfigInitializesContainersOnly(t *testing.T) {
 
 	config := NewResctrlConfig()
 	require.Empty(t, config.DefaultClosIDs)
-	require.Equal(t, -1, config.DefaultSharedSubgroup)
 	require.NotNil(t, config.CPUSetPoolToSharedSubgroup)
 	require.NotNil(t, config.SkipCleanupClosIDs)
 }
