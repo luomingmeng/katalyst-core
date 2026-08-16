@@ -18,6 +18,7 @@ package resctrl
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -31,7 +32,10 @@ type ClosAssignmentMeta struct {
 	OwnerPool string
 }
 
-// SharedSubgroupClosID returns the CLOS ID for a shared subgroup.
+var numericSharedClosPattern = regexp.MustCompile(`^shared?-\d+$`)
+
+// SharedSubgroupClosID returns the physical CLOS for an explicitly configured
+// subgroup of a non-default shared-core pool.
 func SharedSubgroupClosID(subgroup int) string {
 	if subgroup < 0 {
 		return consts.ResctrlGroupShare
@@ -40,6 +44,11 @@ func SharedSubgroupClosID(subgroup int) string {
 }
 
 func NormalizeClosID(closID string) string {
+	// "shared-50" is the canonical physical CLOS of the default share pool.
+	// Other "shared-*" names are legacy aliases for explicit "share-*" subgroups.
+	if closID == consts.ResctrlGroupDefaultShare {
+		return closID
+	}
 	if strings.HasPrefix(closID, consts.ResctrlObsoleteSharedSubgroupPrefix) {
 		return consts.ResctrlShareSubgroupPrefix + strings.TrimPrefix(closID, consts.ResctrlObsoleteSharedSubgroupPrefix)
 	}
@@ -47,13 +56,11 @@ func NormalizeClosID(closID string) string {
 }
 
 func ResolveSharedPoolClosID(poolName string, config *qrmresctrl.ResctrlConfig) string {
-	if config != nil {
-		if subgroup, ok := config.CPUSetPoolToSharedSubgroup[poolName]; ok {
-			return SharedSubgroupClosID(subgroup)
-		}
-		return SharedSubgroupClosID(config.DefaultSharedSubgroup)
+	if IsExplicitSharedPoolMapping(poolName, config) {
+		return SharedSubgroupClosID(config.CPUSetPoolToSharedSubgroup[poolName])
 	}
-	return SharedSubgroupClosID(-1)
+	// Unmapped shared-core pools intentionally join the default shared CLOS.
+	return consts.ResctrlGroupDefaultShare
 }
 
 func ResolvePoolClosID(meta ClosAssignmentMeta, config *qrmresctrl.ResctrlConfig) (string, error) {
@@ -102,31 +109,58 @@ func BuildExpectedClosPools(metas []ClosAssignmentMeta, config *qrmresctrl.Resct
 }
 
 func ResolveCATWayKey(key string, config *qrmresctrl.ResctrlConfig) string {
-	if config != nil {
-		if subgroup, ok := config.CPUSetPoolToSharedSubgroup[key]; ok {
-			return SharedSubgroupClosID(subgroup)
-		}
+	// "share" is a logical CAT key for the fixed default shared CLOS.
+	// "share-50" remains a distinct explicit subgroup CLOS.
+	if key == consts.ResctrlGroupShare {
+		return consts.ResctrlGroupDefaultShare
+	}
+	if IsReservedPhysicalClosID(key) {
+		return NormalizeClosID(key)
+	}
+	if IsExplicitSharedPoolMapping(key, config) {
+		return SharedSubgroupClosID(config.CPUSetPoolToSharedSubgroup[key])
 	}
 	return NormalizeClosID(key)
+}
+
+func IsReservedPhysicalClosID(key string) bool {
+	switch key {
+	case consts.ResctrlGroupDedicated, consts.ResctrlGroupReclaim, consts.ResctrlGroupSystem,
+		consts.ResctrlGroupDefaultShare:
+		return true
+	default:
+		return numericSharedClosPattern.MatchString(key)
+	}
+}
+
+func IsExplicitSharedPoolMapping(poolName string, config *qrmresctrl.ResctrlConfig) bool {
+	if config == nil || poolName == consts.ResctrlGroupShare || IsReservedPhysicalClosID(poolName) {
+		return false
+	}
+	subgroup, ok := config.CPUSetPoolToSharedSubgroup[poolName]
+	return ok && subgroup >= 0
 }
 
 func IsManagedClosID(closID string, config *qrmresctrl.ResctrlConfig) bool {
 	closID = NormalizeClosID(closID)
 	managed := map[string]struct{}{
-		consts.ResctrlGroupDedicated: {},
-		consts.ResctrlGroupReclaim:   {},
-		consts.ResctrlGroupSystem:    {},
-		consts.ResctrlGroupShare:     {},
+		consts.ResctrlGroupDedicated:    {},
+		consts.ResctrlGroupReclaim:      {},
+		consts.ResctrlGroupSystem:       {},
+		consts.ResctrlGroupDefaultShare: {},
 	}
 	if config != nil {
 		for _, defaultClosID := range config.DefaultClosIDs {
 			managed[NormalizeClosID(defaultClosID)] = struct{}{}
 		}
-		for _, subgroup := range config.CPUSetPoolToSharedSubgroup {
+		for poolName, subgroup := range config.CPUSetPoolToSharedSubgroup {
+			// Ignore invalid explicit mappings defensively. Static option validation rejects
+			// the default share pool and negative subgroup IDs during normal startup, while
+			// direct config construction must not add unreachable CLOS groups.
+			if !IsExplicitSharedPoolMapping(poolName, config) {
+				continue
+			}
 			managed[SharedSubgroupClosID(subgroup)] = struct{}{}
-		}
-		if config.DefaultSharedSubgroup >= 0 {
-			managed[SharedSubgroupClosID(config.DefaultSharedSubgroup)] = struct{}{}
 		}
 	}
 	_, ok := managed[closID]
@@ -135,19 +169,19 @@ func IsManagedClosID(closID string, config *qrmresctrl.ResctrlConfig) bool {
 
 func IsCPUListManagedClosID(closID string, config *qrmresctrl.ResctrlConfig) bool {
 	closID = NormalizeClosID(closID)
-	if closID == consts.ResctrlGroupDedicated || closID == consts.ResctrlGroupShare {
+	if closID == consts.ResctrlGroupDedicated || closID == consts.ResctrlGroupDefaultShare {
 		return true
 	}
 	if config == nil {
 		return false
 	}
-	for _, subgroup := range config.CPUSetPoolToSharedSubgroup {
+	for poolName, subgroup := range config.CPUSetPoolToSharedSubgroup {
+		if !IsExplicitSharedPoolMapping(poolName, config) {
+			continue
+		}
 		if closID == SharedSubgroupClosID(subgroup) {
 			return true
 		}
-	}
-	if config.DefaultSharedSubgroup >= 0 && closID == SharedSubgroupClosID(config.DefaultSharedSubgroup) {
-		return true
 	}
 	return false
 }

@@ -29,11 +29,10 @@ const (
 )
 
 type ResolvedCLOS struct {
-	CanonicalID string
-	PhysicalID  string
-	Identity    DirectoryIdentity
-	Generation  uint64
-	Phase       ActivationPhase
+	ID         string
+	Identity   DirectoryIdentity
+	Generation uint64
+	Phase      ActivationPhase
 }
 
 // DirectoryIdentity identifies one concrete incarnation of a CLOS directory.

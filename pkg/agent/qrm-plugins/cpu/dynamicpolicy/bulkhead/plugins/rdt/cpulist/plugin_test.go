@@ -74,7 +74,6 @@ func newTestPlugin(manager *fakeCPUListManager) *CPUListPlugin {
 			"share-a": 3,
 			"share-b": 3,
 		},
-		DefaultSharedSubgroup: -1,
 	}, manager)
 }
 
@@ -94,6 +93,38 @@ func TestCPUListPluginSharedPoolsUnionForSameClos(t *testing.T) {
 
 	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(view)))
 	require.Equal(t, []cpuListWrite{{closID: "share-03", target: "1-4"}}, manager.writes)
+}
+
+func TestCPUListPluginRejectsOverlapAcrossFinalClosTargetsBeforeWriting(t *testing.T) {
+	manager := &fakeCPUListManager{clos: []Clos{
+		{ID: consts.ResctrlGroupDedicated, Epoch: 1},
+		{ID: consts.ResctrlGroupDefaultShare, Epoch: 1},
+	}}
+	plugin := newTestPlugin(manager)
+	view := &model.CPUSetPartitionView{
+		Dedicated: machine.NewCPUSet(2, 3),
+		SharePoolMap: map[string]machine.CPUSet{
+			consts.ResctrlGroupShare: machine.NewCPUSet(1, 2),
+		},
+	}
+
+	err := plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(view))
+
+	require.EqualError(t, err, `cpu list targets for clos "dedicated" and "shared-50" overlap on cpus "2"`)
+	require.Empty(t, manager.writes)
+	require.Empty(t, plugin.applied)
+}
+
+func TestCPUListPluginAllowsOverlapWithinPoolsGroupedIntoSameClos(t *testing.T) {
+	manager := &fakeCPUListManager{clos: []Clos{{ID: "share-03", Epoch: 1}}}
+	plugin := newTestPlugin(manager)
+	view := &model.CPUSetPartitionView{SharePoolMap: map[string]machine.CPUSet{
+		"share-a": machine.NewCPUSet(1, 2),
+		"share-b": machine.NewCPUSet(2, 3),
+	}}
+
+	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(view)))
+	require.Equal(t, []cpuListWrite{{closID: "share-03", target: "1-3"}}, manager.writes)
 }
 
 func TestGateBSNBRampUpWritesDeclaredShareNUMAClos(t *testing.T) {
@@ -135,22 +166,21 @@ func TestGateBSNBRampUpWritesDeclaredShareNUMAClos(t *testing.T) {
 
 	manager := &fakeCPUListManager{clos: []Clos{
 		{ID: "share-03", Epoch: 1},
-		{ID: "share-05", Epoch: 1},
 		{ID: "share-07", Epoch: 1},
+		{ID: "shared-50", Epoch: 1},
 	}}
 	plugin := NewCPUListPluginWithManager(&qrmresctrl.ResctrlConfig{
 		CPUSetPoolToSharedSubgroup: map[string]int{
 			"share-NUMA0":           3,
 			"isolation-snb-ramp-up": 7,
 		},
-		DefaultSharedSubgroup: 5,
 	}, manager)
 
 	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(&view.CPUSetPartitionView)))
 	require.Equal(t, []cpuListWrite{
 		{closID: "share-03", target: "2"},
-		{closID: "share-05", target: "1,5"},
 		{closID: "share-07", target: ""},
+		{closID: "shared-50", target: "1,5"},
 	}, manager.writes)
 	require.NotContains(t, manager.writes[1].target, "2", "default CLOS must not contain ramp-up CPU")
 }
@@ -205,9 +235,9 @@ func TestGateBSNBRampUpAdjustmentStateWritesWrappedResourcePackageSourcePoolClos
 
 	manager := &fakeCPUListManager{clos: []Clos{
 		{ID: "share-03", Epoch: 1},
-		{ID: "share-05", Epoch: 1},
 		{ID: "share-07", Epoch: 1},
 		{ID: "share-09", Epoch: 1},
+		{ID: "shared-50", Epoch: 1},
 	}}
 	plugin := NewCPUListPluginWithManager(&qrmresctrl.ResctrlConfig{
 		CPUSetPoolToSharedSubgroup: map[string]int{
@@ -215,15 +245,14 @@ func TestGateBSNBRampUpAdjustmentStateWritesWrappedResourcePackageSourcePoolClos
 			sourcePool:           7,
 			wrappedIsolationPool: 9,
 		},
-		DefaultSharedSubgroup: 5,
 	}, manager)
 
 	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(&view.CPUSetPartitionView)))
 	require.Equal(t, []cpuListWrite{
 		{closID: "share-03", target: "2"},
-		{closID: "share-05", target: "1,5"},
 		{closID: "share-07", target: ""},
 		{closID: "share-09", target: ""},
+		{closID: "shared-50", target: "1,5"},
 	}, manager.writes)
 }
 
@@ -387,6 +416,7 @@ func TestCPUListPluginScopesSharedClosToConfiguredSubgroups(t *testing.T) {
 		{ID: consts.ResctrlGroupReclaim, Epoch: 1},
 		{ID: consts.ResctrlGroupSystem, Epoch: 1},
 		{ID: consts.ResctrlGroupShare, Epoch: 1},
+		{ID: consts.ResctrlGroupDefaultShare, Epoch: 1},
 		{ID: "custom-default", Epoch: 1},
 		{ID: "share-03", Epoch: 1},
 		{ID: "share-05", Epoch: 1},
@@ -396,7 +426,6 @@ func TestCPUListPluginScopesSharedClosToConfiguredSubgroups(t *testing.T) {
 	}
 	config := &qrmresctrl.ResctrlConfig{
 		CPUSetPoolToSharedSubgroup: map[string]int{"share-a": 3},
-		DefaultSharedSubgroup:      5,
 		DefaultClosIDs:             []string{"custom-default"},
 	}
 
@@ -415,9 +444,8 @@ func TestCPUListPluginScopesSharedClosToConfiguredSubgroups(t *testing.T) {
 		)))
 		require.Equal(t, []cpuListWrite{
 			{closID: consts.ResctrlGroupDedicated, target: "1"},
-			{closID: consts.ResctrlGroupShare, target: ""},
+			{closID: consts.ResctrlGroupDefaultShare, target: "3"},
 			{closID: "share-03", target: "2"},
-			{closID: "share-05", target: "3"},
 		}, manager.writes)
 	})
 
@@ -428,9 +456,8 @@ func TestCPUListPluginScopesSharedClosToConfiguredSubgroups(t *testing.T) {
 		require.NoError(t, plugin.CPUSetAdjustmentDisabledHandler(context.Background(), handlerContext(nil)))
 		require.Equal(t, []cpuListWrite{
 			{closID: consts.ResctrlGroupDedicated, target: ""},
-			{closID: consts.ResctrlGroupShare, target: ""},
+			{closID: consts.ResctrlGroupDefaultShare, target: ""},
 			{closID: "share-03", target: ""},
-			{closID: "share-05", target: ""},
 		}, manager.writes)
 	})
 }

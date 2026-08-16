@@ -570,6 +570,35 @@ func TestCATPluginNormalizesSharedExpressionOverride(t *testing.T) {
 	require.Equal(t, map[string]qrmconfig.CATWaysExpression{"share-03": catExpr("4")}, resolved)
 }
 
+func TestCATPluginKeepsDefaultShareAliasDistinctFromExplicitSubgroup(t *testing.T) {
+	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{}, &fakeRDTManager{}, fakeCapabilityProvider{})
+
+	resolved, err := plugin.resolveExpressionOverrides(map[string]qrmconfig.CATWaysExpression{
+		"share":     catExpr("4"),
+		"shared-50": catExpr("4"),
+		"share-50":  catExpr("2"),
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, map[string]qrmconfig.CATWaysExpression{
+		"shared-50": catExpr("4"),
+		"share-50":  catExpr("2"),
+	}, resolved)
+}
+
+func TestCATPluginRejectsConflictingDefaultShareAliases(t *testing.T) {
+	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{
+		CPUSetPoolToSharedSubgroup: map[string]int{"share": 30},
+	}, &fakeClosManager{}, &fakeRDTManager{}, fakeCapabilityProvider{})
+
+	_, err := plugin.resolveExpressionOverrides(map[string]qrmconfig.CATWaysExpression{
+		"share":     catExpr("4"),
+		"shared-50": catExpr("2"),
+	})
+
+	require.EqualError(t, err, `conflicting CAT way configuration for CLOS "shared-50"`)
+}
+
 func TestCATPluginTreatsUnsupportedCapabilityAsNoop(t *testing.T) {
 	manager := &fakeRDTManager{}
 	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{

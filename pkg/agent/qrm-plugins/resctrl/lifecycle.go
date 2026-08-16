@@ -26,8 +26,8 @@ import (
 )
 
 type CLOSLifecycleService interface {
-	EnsurePendingCLOS(ctx context.Context, canonicalID, preferredPhysicalID string) (ResolvedCLOS, error)
-	DeleteCLOS(ctx context.Context, canonicalID string) error
+	EnsurePendingCLOS(ctx context.Context, closID string) (ResolvedCLOS, error)
+	DeleteCLOS(ctx context.Context, closID string) error
 	Recover(ctx context.Context) error
 }
 
@@ -64,20 +64,20 @@ func newCLOSLifecycleService(root string, mu *sync.Mutex,
 	return &closLifecycleService{root: root, mu: mu, mkdir: mkdir, remove: remove}
 }
 
-func (s *closLifecycleService) EnsurePendingCLOS(_ context.Context, canonicalID, preferredPhysicalID string) (ResolvedCLOS, error) {
-	if canonicalID == "" || preferredPhysicalID == "" {
-		return ResolvedCLOS{}, fmt.Errorf("canonical and physical CLOS IDs must be non-empty")
+func (s *closLifecycleService) EnsurePendingCLOS(_ context.Context, closID string) (ResolvedCLOS, error) {
+	if err := validateCLOSID(closID); err != nil {
+		return ResolvedCLOS{}, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	path := filepath.Join(s.root, preferredPhysicalID)
+	path := filepath.Join(s.root, closID)
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		if err := s.mkdir(path, 0o755); err != nil && !os.IsExist(err) {
-			return ResolvedCLOS{}, fmt.Errorf("create CLOS %q: %w", preferredPhysicalID, err)
+			return ResolvedCLOS{}, fmt.Errorf("create CLOS %q: %w", closID, err)
 		}
 	} else if err != nil {
-		return ResolvedCLOS{}, fmt.Errorf("inspect CLOS %q: %w", preferredPhysicalID, err)
+		return ResolvedCLOS{}, fmt.Errorf("inspect CLOS %q: %w", closID, err)
 	}
 
 	identity, err := DirectoryIdentityForPath(path)
@@ -85,19 +85,21 @@ func (s *closLifecycleService) EnsurePendingCLOS(_ context.Context, canonicalID,
 		return ResolvedCLOS{}, err
 	}
 	return ResolvedCLOS{
-		CanonicalID: canonicalID,
-		PhysicalID:  preferredPhysicalID,
-		Identity:    identity,
-		Generation:  1,
-		Phase:       ActivationActive,
+		ID:         closID,
+		Identity:   identity,
+		Generation: 1,
+		Phase:      ActivationActive,
 	}, nil
 }
 
-func (s *closLifecycleService) DeleteCLOS(_ context.Context, canonicalID string) error {
+func (s *closLifecycleService) DeleteCLOS(_ context.Context, closID string) error {
+	if err := validateCLOSID(closID); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	path := filepath.Join(s.root, canonicalID)
+	path := filepath.Join(s.root, closID)
 	empty, err := closDirectoryEmpty(path)
 	if os.IsNotExist(err) {
 		return nil
@@ -106,12 +108,20 @@ func (s *closLifecycleService) DeleteCLOS(_ context.Context, canonicalID string)
 		return err
 	}
 	if !empty {
-		return fmt.Errorf("refuse to delete non-empty CLOS %q", canonicalID)
+		return fmt.Errorf("refuse to delete non-empty CLOS %q", closID)
 	}
 	return s.remove(path)
 }
 
 func (s *closLifecycleService) Recover(_ context.Context) error {
+	return nil
+}
+
+func validateCLOSID(closID string) error {
+	if closID == "" || closID == "." || closID == ".." ||
+		filepath.IsAbs(closID) || strings.ContainsAny(closID, `/\`) {
+		return fmt.Errorf("invalid clos id %q", closID)
+	}
 	return nil
 }
 

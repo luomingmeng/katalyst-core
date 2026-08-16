@@ -275,7 +275,7 @@ func (m *managerImpl) createClosLocked(closID string) (string, error) {
 		} else if statErr != nil {
 			return false, fmt.Errorf("stat clos_id dir %s failed: %w", closIDPath, statErr)
 		}
-		_, err := m.closLifecycleLocked().EnsurePendingCLOS(context.Background(), closID, closID)
+		_, err := m.closLifecycleLocked().EnsurePendingCLOS(context.Background(), closID)
 		if err != nil {
 			return false, err
 		}

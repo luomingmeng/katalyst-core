@@ -198,7 +198,6 @@ func TestResctrlHinterReconcileClosBuildsExpectedClosIDsFromState(t *testing.T) 
 	hinter := &resctrlHinter{
 		config: &qrmresctrl.ResctrlConfig{
 			CPUSetPoolToSharedSubgroup: map[string]int{"batch": 3},
-			DefaultSharedSubgroup:      1,
 		},
 		manager: manager,
 		state:   memoryState,
@@ -267,7 +266,6 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 				config: &qrmresctrl.ResctrlConfig{
 					EnableResctrlHint:          false,
 					CPUSetPoolToSharedSubgroup: map[string]int{"batch": 30},
-					DefaultSharedSubgroup:      50,
 					EnabledQoS:                 []string{"shared_cores"},
 				},
 			},
@@ -358,7 +356,6 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 			fields: fields{
 				config: &qrmresctrl.ResctrlConfig{
 					EnableResctrlHint:     true,
-					DefaultSharedSubgroup: 50,
 					EnabledQoS:            []string{"shared_cores"},
 					MonGroupMaxCountRatio: 0.6, // monGroupsMaxCount = 3
 				},
@@ -366,8 +363,8 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 					numRmids: "5",
 					dirs: []string{
 						"info",
-						"share-50/mon_groups/pod1",
-						"share-50/mon_groups/pod2",
+						"shared-50/mon_groups/pod1",
+						"shared-50/mon_groups/pod2",
 					},
 				},
 				isAllocate: true,
@@ -383,7 +380,7 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 						"memory": {
 							Annotations: map[string]string{
 								"test-key":                             "test-value",
-								"rdt.resources.beta.kubernetes.io/pod": "share-50",
+								"rdt.resources.beta.kubernetes.io/pod": "shared-50",
 							},
 						},
 					},
@@ -395,7 +392,6 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 			fields: fields{
 				config: &qrmresctrl.ResctrlConfig{
 					EnableResctrlHint:     true,
-					DefaultSharedSubgroup: 50,
 					EnabledQoS:            []string{"shared_cores"},
 					MonGroupMaxCountRatio: 0.6, // monGroupsMaxCount = 3
 				},
@@ -403,9 +399,9 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 					numRmids: "5",
 					dirs: []string{
 						"info",
-						"share-50/mon_groups/pod1",
-						"share-50/mon_groups/pod2",
-						"share-50/mon_groups/pod3",
+						"shared-50/mon_groups/pod1",
+						"shared-50/mon_groups/pod2",
+						"shared-50/mon_groups/pod3",
 					},
 				},
 				isAllocate: true,
@@ -421,7 +417,7 @@ func TestResctrlProcessor_HintResp(t *testing.T) {
 						"memory": {
 							Annotations: map[string]string{
 								"test-key":                             "test-value",
-								"rdt.resources.beta.kubernetes.io/pod": "share-50",
+								"rdt.resources.beta.kubernetes.io/pod": "shared-50",
 								"rdt.resources.beta.kubernetes.io/need-mon-groups": "false",
 							},
 						},
