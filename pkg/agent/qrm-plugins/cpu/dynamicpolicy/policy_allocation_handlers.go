@@ -511,6 +511,7 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 		return p.allocationSidecarHandler(ctx, req, apiconsts.PodAnnotationQoSLevelDedicatedCores, persistCheckpoint)
 	}
 
+	preCommitRevision := p.state.GetRevision()
 	basePodEntries := p.state.GetPodEntries()
 	baseMachineState := p.state.GetMachineState()
 	oldAllocationInfo := p.state.GetAllocationInfo(req.PodUid, req.ContainerName)
@@ -646,11 +647,6 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 		allocationInfo.SetSpecifiedNUMABindingNUMAID(req.Hint.Nodes)
 	}
 
-	if len(p.allocationHooks) > 0 {
-		if err := p.invokeAllocationHooks(oldAllocationInfo, allocationInfo); err != nil {
-			return nil, err
-		}
-	}
 	if basePodEntries[allocationInfo.PodUid] == nil {
 		basePodEntries[allocationInfo.PodUid] = make(state.ContainerEntries)
 	}
@@ -703,16 +699,21 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 		return nil, fmt.Errorf("planned DNB allocation overlaps ramp-up floor: allocation=%s floor=%s overlap=%s",
 			allocationInfo.AllocationResult.String(), hardReclaimCPUs.String(), overlap.String())
 	}
-	if err := p.validatePendingAdvisorPartitionView(
-		finalPodEntries,
-		finalMachineState,
-		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
-		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
-	); err != nil {
-		return nil, fmt.Errorf("validate DNB ramp-up target state before commit: %w", err)
+	prepared, err := p.preparePendingCPUPartition(pendingCPUPartition{
+		expectedRevision: preCommitRevision,
+		entries:          finalPodEntries,
+		baseMachineState: finalMachineState,
+		allowOverlap:     p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+		disableDedicated: p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+		persist:          persistCheckpoint,
+		source:           "DNB admission",
+		validate:         p.validatePendingAdvisorPartitionView,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("prepare DNB allocation and reclaim floor atomically failed: %w", err)
 	}
-
-	resp, err := cpuutil.PackAllocationResponse(allocationInfo, string(v1.ResourceCPU),
+	allocationInfo = prepared.entries[req.PodUid][req.ContainerName]
+	resp, err := packAllocationResponse(allocationInfo, string(v1.ResourceCPU),
 		util.OCIPropertyNameCPUSetCPUs, false, true, req, allocationInfo.Annotations)
 	if err != nil {
 		general.Errorf("pod: %s/%s, container: %s PackResourceAllocationResponseByAllocationInfo failed with error: %v",
@@ -723,13 +724,7 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 	if err := AccompanyResourceRegistry.AllocateAccompanyResource(req, resp); err != nil {
 		return nil, fmt.Errorf("accompany resource AugmentAllocationResult failed with error: %v", err)
 	}
-	if err := p.state.CommitAdvisorState(
-		finalPodEntries,
-		finalMachineState,
-		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
-		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
-		persistCheckpoint,
-	); err != nil {
+	if err := p.commitPreparedCPUPartition(prepared); err != nil {
 		return nil, fmt.Errorf("commit DNB allocation and reclaim floor atomically failed: %w", err)
 	}
 	adjustCtx, cancel := context.WithTimeout(context.Background(), cpuSetAdjustmentHandlerTimeout(p.conf))
@@ -775,6 +770,7 @@ func (p *DynamicPolicy) rollbackFailedDNBAllocation(
 	previous, failedCandidate *state.AllocationInfo,
 	persistCheckpoint bool,
 ) error {
+	latestRevision := p.state.GetRevision()
 	latestEntries := p.state.GetPodEntries()
 	latestCandidate := latestEntries[podUID][containerName]
 	if latestCandidate == nil {
@@ -816,13 +812,17 @@ func (p *DynamicPolicy) rollbackFailedDNBAllocation(
 		latestEntries, latestMachineState, false, machine.NewCPUSet(), false, planningRevision); err != nil {
 		return fmt.Errorf("recompute pools and reclaim floor without failed DNB allocation: %w", err)
 	}
-	return p.state.CommitAdvisorState(
-		planningState.GetPodEntries(),
-		planningState.GetMachineState(),
-		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
-		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
-		persistCheckpoint,
-	)
+	_, _, err = p.commitPendingCPUPartition(pendingCPUPartition{
+		expectedRevision: latestRevision,
+		entries:          planningState.GetPodEntries(),
+		baseMachineState: planningState.GetMachineState(),
+		allowOverlap:     p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+		disableDedicated: p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+		persist:          persistCheckpoint,
+		source:           "DNB rollback",
+		validate:         p.validatePendingAdvisorPartitionView,
+	})
+	return err
 }
 
 // newRampUpPlanningPolicy creates an isolated policy view for speculative
@@ -2509,32 +2509,17 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 		}
 	}
 
-	// trigger allocation hooks for non-pool containers before committing to state.
-	if err := p.invokeAllocationHooksForPodEntries(curEntries, newPodEntries); err != nil {
-		return err
-	}
-
-	// use pod entries generated above to generate machine state info, and store in local state
-	machineState, err = generateMachineStateFromPodEntries(p.machineInfo.CPUTopology, newPodEntries, machineState)
-	if err != nil {
-		return fmt.Errorf("calculate machineState by newPodEntries failed with error: %v", err)
-	}
-	if err := p.validatePendingAdvisorPartitionView(
-		newPodEntries,
-		machineState,
-		allowSharedCoresOverlapReclaimedCores,
-		disableDedicatedCoresOverlapReclaimedCores,
-	); err != nil {
-		return fmt.Errorf("validate pool target state before commit: %w", err)
-	}
-	return p.state.CommitAdvisorStateIfRevision(
-		stateRevision,
-		newPodEntries,
-		machineState,
-		allowSharedCoresOverlapReclaimedCores,
-		disableDedicatedCoresOverlapReclaimedCores,
-		persistCheckpoint,
-	)
+	_, _, err = p.commitPendingCPUPartition(pendingCPUPartition{
+		expectedRevision: stateRevision,
+		entries:          newPodEntries,
+		baseMachineState: machineState,
+		allowOverlap:     allowSharedCoresOverlapReclaimedCores,
+		disableDedicated: disableDedicatedCoresOverlapReclaimedCores,
+		persist:          persistCheckpoint,
+		source:           "pool adjustment",
+		validate:         p.validatePendingAdvisorPartitionView,
+	})
+	return err
 }
 
 func (p *DynamicPolicy) getSharedNUMABindingRampUpCPUSet(

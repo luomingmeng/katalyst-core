@@ -1702,14 +1702,12 @@ func buildLegacyMandatoryReclaimDescriptors(
 
 type pendingAdvisorState struct {
 	preCommitRevision uint64
-	currentEntries    state.PodEntries
 	entries           state.PodEntries
-	machineState      state.NUMANodeMap
 	allowOverlap      bool
 	disableDedicated  bool
 }
 
-// applyBlocks prepares and validates an advisor state transition without
+// applyBlocks prepares an advisor state transition without
 // invoking allocation hooks, writing checkpoints, or mutating plugin state.
 // and the logic contains three main steps
 // 1. construct entries for dedicated containers and pools
@@ -2079,24 +2077,9 @@ func (p *DynamicPolicy) applyBlocks(
 		return nil, fmt.Errorf("sync reclaim pool with adjustment commit override failed with error: %w", err)
 	}
 
-	// use pod entries generated above to generate machine state info, and store in local state
-	newMachineState, err := generateMachineStateFromPodEntries(p.machineInfo.CPUTopology, newEntries, p.state.GetMachineState())
-	if err != nil {
-		return nil, fmt.Errorf("calculate machineState by newPodEntries failed with error: %v", err)
-	}
-	if err := p.validateAdvisorPartitionBeforeCommit(
-		newEntries,
-		newMachineState,
-		allowSharedCoresOverlapReclaimedCores,
-		resp.DisableDedicatedCoresOverlapReclaimedCores,
-	); err != nil {
-		return nil, err
-	}
 	return &pendingAdvisorState{
 		preCommitRevision: stateRevision,
-		currentEntries:    curEntries,
 		entries:           newEntries,
-		machineState:      newMachineState,
 		allowOverlap:      allowSharedCoresOverlapReclaimedCores,
 		disableDedicated:  resp.DisableDedicatedCoresOverlapReclaimedCores,
 	}, nil
@@ -2118,17 +2101,18 @@ func (p *DynamicPolicy) commitPendingAdvisorState(pending *pendingAdvisorState) 
 	if pending == nil {
 		return fmt.Errorf("pending advisor state is nil")
 	}
-	if err := p.invokeAllocationHooksForPodEntries(pending.currentEntries, pending.entries); err != nil {
-		return err
+	entries, _, err := p.commitPendingCPUPartition(pendingCPUPartition{
+		expectedRevision: pending.preCommitRevision,
+		entries:          pending.entries,
+		allowOverlap:     pending.allowOverlap,
+		disableDedicated: pending.disableDedicated,
+		persist:          true,
+		source:           "advisor apply",
+	})
+	if err == nil {
+		pending.entries = entries
 	}
-	return p.state.CommitAdvisorStateIfRevision(
-		pending.preCommitRevision,
-		pending.entries,
-		pending.machineState,
-		pending.allowOverlap,
-		pending.disableDedicated,
-		true,
-	)
+	return err
 }
 
 func (p *DynamicPolicy) syncReclaimPoolWithBulkheadAppliedView(newEntries state.PodEntries, previous machine.CPUSet) error {

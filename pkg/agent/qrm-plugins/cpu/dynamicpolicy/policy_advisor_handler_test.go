@@ -1878,7 +1878,9 @@ func TestDynamicPolicyApplyBlocksRejectsHardPartitionInvalidatedByBulkheadPaddin
 		"reclaim-1": machine.NewCPUSet(2, 6),
 	}
 
-	_, err = policy.applyBlocks(blockCPUSet, resp, false)
+	pending, err := policy.applyBlocks(blockCPUSet, resp, false)
+	require.NoError(t, err, "pure advisor preparation must defer validation until after precommit hooks")
+	err = policy.commitPendingAdvisorState(pending)
 	require.ErrorContains(t, err, "hard-partition reclaim NUMA 0 has 0 CPUs")
 	require.Equal(t, initialRevision, policy.state.GetRevision())
 	require.Equal(t, initialEntries, policy.state.GetPodEntries())
@@ -1895,7 +1897,7 @@ func TestAllocateByCPUAdvisorValidatesProspectiveHardPartitionBeforeSideEffects(
 		wantHookCall int
 	}{
 		{name: "raw 2/2 padding 0", minSize: 2, wantHookCall: 1},
-		{name: "raw 2/2 padding 2", minSize: 4, wantErr: true},
+		{name: "raw 2/2 padding 2", minSize: 4, wantErr: true, wantHookCall: 1},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
