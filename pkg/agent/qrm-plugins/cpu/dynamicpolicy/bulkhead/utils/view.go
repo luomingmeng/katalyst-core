@@ -19,8 +19,6 @@ package utils
 import (
 	"fmt"
 
-	v1 "k8s.io/api/core/v1"
-
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	cpustate "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
@@ -39,8 +37,6 @@ type CPUSetPartitionViewOptions struct {
 	TransientProtectedNonReclaim      machine.CPUSet
 }
 
-const minimumHardPartitionReclaimCPUsPerNUMA = 2
-
 func NewCPUSetPartitionViewOptions(
 	coreConf *config.Configuration,
 	dynamicConf *dynamicconfig.Configuration,
@@ -57,38 +53,11 @@ func NewCPUSetPartitionViewOptions(
 		HardPartitionReclaimTargetPerNUMA: map[int]int{},
 	}
 	if opts.HardPartitionEnabled && topology != nil {
-		ratio := dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.InitialRampUpReclaimCPUSetRatio
-		numaIDs := topology.CPUDetails.NUMANodes().ToSliceInt()
-		configuredFloor := 0
-		if quantity, ok := dynamicConf.MinReclaimedResourceForAllocate[v1.ResourceCPU]; ok {
-			configuredFloor = int(quantity.Value())
-		}
-		capacityByNUMA := make(map[int]int, len(numaIDs))
-		baselineByNUMA := make(map[int]int, len(numaIDs))
-		for _, numaID := range numaIDs {
-			capacity := topology.CPUDetails.CPUsInNUMANodes(numaID).Size()
-			capacityByNUMA[numaID] = capacity
-			target, err := machine.CalculatePerNUMAHardReclaimTarget(
-				capacity,
-				ratio,
-				minimumHardPartitionReclaimCPUsPerNUMA,
-				0,
-			)
-			if err != nil {
-				opts.HardPartitionTargetError = fmt.Errorf(
-					"calculate hard-partition reclaim target for NUMA %d: %w", numaID, err)
-				break
-			}
-			baselineByNUMA[numaID] = target
-		}
-		if opts.HardPartitionTargetError == nil {
-			targets, err := machine.DistributeConfiguredHardReclaimFloor(
-				capacityByNUMA, baselineByNUMA, configuredFloor)
-			if err != nil {
-				opts.HardPartitionTargetError = fmt.Errorf("distribute configured hard-partition reclaim target: %w", err)
-			} else {
-				opts.HardPartitionReclaimTargetPerNUMA = targets
-			}
+		targets, err := machine.ResolveHardPartitionReclaimTargets(dynamicConf, topology, 0, nil)
+		if err != nil {
+			opts.HardPartitionTargetError = err
+		} else {
+			opts.HardPartitionReclaimTargetPerNUMA = targets
 		}
 	}
 	if coreConf != nil {
