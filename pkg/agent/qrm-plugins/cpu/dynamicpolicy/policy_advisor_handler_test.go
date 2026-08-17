@@ -2492,6 +2492,53 @@ func TestDynamicPolicyValidateAdvisorPartitionBeforeCommitRejectsReclaimNonRecla
 	}
 }
 
+// system_cores containers may legally overlap the reclaim pool: they are never
+// part of the non-reclaim partition. When their specified pool is missing they
+// fall back to the whole machine cpuset, which must not trip the reclaim/non-
+// reclaim overlap guard regardless of the bulkhead hard-partition switch.
+func TestDynamicPolicyValidateAdvisorPartitionBeforeCommitAllowsSystemCoresReclaimOverlap(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	tmpDir, err := os.MkdirTemp("", "checkpoint-validate-system-overlap")
+	require.NoError(t, err)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, tmpDir)
+	require.NoError(t, err)
+
+	// system_cores container whose specified pool is absent falls back to the
+	// whole machine cpuset (0-7), fully covering the reclaim pool below.
+	newEntries := state.PodEntries{
+		"pod-system": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-system",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameShare,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSystemCores,
+				},
+				AllocationResult: topology.CPUDetails.CPUs(),
+			},
+		},
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(0, 2),
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: machine.NewCPUSet(0),
+					1: machine.NewCPUSet(2),
+				},
+			},
+		},
+	}
+
+	// bulkhead hard-partition disabled (allow=false, disableDedicated=false):
+	// the overlap must be tolerated, not rejected.
+	err = policy.validateAdvisorPartitionBeforeCommit(newEntries, policy.state.GetMachineState(), false, false)
+	require.NoError(t, err)
+}
+
 func TestDynamicPolicyValidateAdvisorPartitionBeforeCommitChecksPhysicalNUMAWhenOverlapEnabled(t *testing.T) {
 	t.Parallel()
 
