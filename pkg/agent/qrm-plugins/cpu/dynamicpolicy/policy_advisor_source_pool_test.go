@@ -1483,6 +1483,59 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 	})
 }
 
+func TestPlanDisjointAdvisorBlocksPreservesCeiledOwnerRequestWhenDonating(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(12, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+
+	allCPUs := topology.CPUDetails.CPUs().ToSliceInt()
+	p.state.SetPodEntries(state.PodEntries{
+		"dedicated-pod": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "dedicated-pod",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameDedicated,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+				},
+				AllocationResult: machine.NewCPUSet(allCPUs[:8]...),
+				RequestQuantity:  6.2,
+			},
+		},
+	}, false)
+
+	resp := &advisorapi.ListAndWatchResponse{
+		DisableDedicatedCoresOverlapReclaimedCores: true,
+		Entries: map[string]*advisorapi.CalculationEntries{
+			"dedicated-pod": {Entries: map[string]*advisorapi.CalculationInfo{
+				"main": {
+					OwnerPoolName: commonstate.PoolNameDedicated,
+					CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+						0: {Blocks: []*advisorapi.Block{{BlockId: "dedicated", Result: 6}}},
+					},
+				},
+			}},
+			commonstate.PoolNameReclaim: {Entries: map[string]*advisorapi.CalculationInfo{
+				commonstate.FakedContainerName: {
+					OwnerPoolName: commonstate.PoolNameReclaim,
+					CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+						0: {Blocks: []*advisorapi.Block{{BlockId: "reclaim", Result: 6}}},
+					},
+				},
+			}},
+		},
+	}
+
+	result, err := p.planDisjointAdvisorBlocks(resp)
+	require.ErrorContains(t, err, "NUMA 0 needs 1 more reclaim CPUs")
+	require.Empty(t, result)
+}
+
 func advisorDescriptorBlockIDs(descriptors []advisorBlockDescriptor) []string {
 	result := make([]string, 0, len(descriptors))
 	for _, descriptor := range descriptors {

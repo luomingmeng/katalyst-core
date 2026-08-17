@@ -1911,9 +1911,19 @@ func (p *DynamicPolicy) applyBlocks(
 	}
 
 	currentMachineState := p.state.GetMachineState()
-	rampUpReclaimFloor, err := p.deriveRampUpReclaimFloor(currentMachineState, false)
-	if err != nil {
-		return nil, fmt.Errorf("derive reclaim floor for advisor ramp-up failed: %w", err)
+	rampUpReclaimFloor := machine.NewCPUSet()
+	if resp.DisableDedicatedCoresOverlapReclaimedCores && p.isRampUpReclaimHardPartitionEnabled() {
+		reclaimInfo := newEntries[commonstate.PoolNameReclaim][commonstate.FakedContainerName]
+		if reclaimInfo == nil {
+			return nil, fmt.Errorf("negotiated disjoint advisor result has no reclaim floor")
+		}
+		rampUpReclaimFloor = reclaimInfo.AllocationResult.Clone()
+	} else {
+		legacyFloor, err := p.deriveRampUpReclaimFloorForMode(currentMachineState, false, false)
+		if err != nil {
+			return nil, fmt.Errorf("derive reclaim floor for advisor ramp-up failed: %w", err)
+		}
+		rampUpReclaimFloor = legacyFloor
 	}
 	if defaultSharePlan.enabled {
 		defaultSharePlan.eligibleCPUSet = p.buildDefaultShareEligibleCPUSet(

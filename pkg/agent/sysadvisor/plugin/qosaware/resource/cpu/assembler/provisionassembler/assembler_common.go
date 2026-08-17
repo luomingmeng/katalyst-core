@@ -828,12 +828,26 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		return err
 	}
 
-	// skip empty numa binding region
+	dynamicConf := pa.conf.GetDynamicConfiguration()
+	effectiveHard := dynamicConf.EnableReclaim && dynamicConf.EnableRampUpReclaimHardPartition
+
+	// A hard partition is a persistent per-physical-NUMA ownership invariant.
+	// Publish the canonical floor even when this NUMA has no workload region;
+	// otherwise QRM cannot distinguish an intentionally empty scope from a
+	// missing reclaim target.
 	if len(shareRegions) == 0 && len(isolationRegions) == 0 && len(dedicatedRegions) == 0 && numaID != commonstate.FakedNUMAID {
+		if effectiveHard {
+			result.SetPoolEntry(
+				commonstate.PoolNameReclaim,
+				numaID,
+				getNUMAsResource(*pa.reservedForReclaim, numaSet),
+				-1,
+			)
+		}
 		return nil
 	}
 
-	nodeEnableReclaim := pa.conf.GetDynamicConfiguration().EnableReclaim
+	nodeEnableReclaim := dynamicConf.EnableReclaim
 
 	reservedForReclaim := getNUMAsResource(*pa.reservedForReclaim, numaSet)
 	poolAvailableBeforeReserve := getNUMAsResource(*pa.numaAvailable, numaSet)
@@ -848,7 +862,8 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 	)
 	shareAndIsolatedDedicatedPoolAvailable := poolAvailableBeforeReserve
 	legacySharedOnly := len(dedicatedRegions) == 0
-	if legacySharedOnly && !*pa.allowSharedCoresOverlapReclaimedCores {
+	reserveHeldOutsidePools := effectiveHard
+	if reserveHeldOutsidePools || (legacySharedOnly && !*pa.allowSharedCoresOverlapReclaimedCores) {
 		for pkgName, reserve := range pinnedReserveByPkg {
 			pinnedPoolAvailableByPkg[pkgName] = general.Max(pinnedPoolAvailableByPkg[pkgName]-reserve, 0)
 		}
@@ -888,11 +903,11 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 
 		allocateAtCapacity := func(capacity int) (map[string]int, bool) {
 			sharedAvailable := capacity
-			if !legacySharedOnly && !*pa.allowSharedCoresOverlapReclaimedCores {
+			if !reserveHeldOutsidePools && !legacySharedOnly && !*pa.allowSharedCoresOverlapReclaimedCores {
 				sharedAvailable = general.Max(sharedAvailable-reserveInDomain, 0)
 			}
 			dedicatedAvailable := capacity
-			if result.DisableDedicatedCoresOverlapReclaimedCores {
+			if !reserveHeldOutsidePools && result.DisableDedicatedCoresOverlapReclaimedCores {
 				dedicatedAvailable = general.Max(dedicatedAvailable-reserveInDomain, 0)
 			}
 
@@ -925,7 +940,7 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 
 		allocationCapacity := shareAndIsolatedDedicatedPoolAvailable
 		shareAndIsolateDedicatedPoolSizes, poolThrottled := allocateAtCapacity(allocationCapacity)
-		if nodeEnableReclaim && !legacySharedOnly {
+		if nodeEnableReclaim && !legacySharedOnly && !reserveHeldOutsidePools {
 			for {
 				overlapCapacity := 0
 				if *pa.allowSharedCoresOverlapReclaimedCores {
@@ -1125,6 +1140,7 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		nodeEnableReclaim:                      nodeEnableReclaim,
 		numaID:                                 numaID,
 		totalUnusedNonReclaimablePinnedCPUSize: totalUnusedNonReclaimablePinnedCPUSize,
+		reserveHeldOutsidePools:                reserveHeldOutsidePools,
 	}
 
 	policy := reclaimPoolCalculationPolicy{
@@ -1176,10 +1192,14 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		result.DefaultShareBackfill.ReleasedReclaimSize += clamp.ReleasedSize
 	}
 
+	overlapBudget := reclaimedCoresSize
+	if effectiveHard {
+		overlapBudget = general.Max(overlapBudget-reservedForReclaim, 0)
+	}
 	overlapReclaimedCoresSize := clampReclaimOverlapMetadata(
 		result,
 		numaID,
-		reclaimedCoresSize,
+		overlapBudget,
 		reclaimPoolData.overlapAtoms...,
 	)
 	nonOverlapReclaimedCoresSize := general.Max(reclaimedCoresSize-overlapReclaimedCoresSize, 0)
@@ -1319,6 +1339,7 @@ type reclaimPoolCalculationData struct {
 	nodeEnableReclaim                      bool
 	numaID                                 int
 	totalUnusedNonReclaimablePinnedCPUSize int
+	reserveHeldOutsidePools                bool
 	overlapAtoms                           []overlapAtom
 }
 
@@ -1399,6 +1420,9 @@ func (pa *ProvisionAssemblerCommon) calculateEnabledReclaimPool(
 		0,
 	)
 	reclaimedCoresSize := freeStandalone + overlapSize
+	if data.reserveHeldOutsidePools {
+		reclaimedCoresSize += data.reservedForReclaim
+	}
 	reclaimedCoresQuota := float64(-1)
 	general.InfoS("enabled reclaim pool calculation",
 		"numaID", data.numaID,
@@ -1495,6 +1519,9 @@ func (pa *ProvisionAssemblerCommon) calculateOverlapReclaimPool(
 
 	if data.nodeEnableReclaim {
 		reclaimedCoresSize = shareReclaimCoresSize + data.dedicatedReclaimCoresSize
+		if data.reserveHeldOutsidePools {
+			reclaimedCoresSize += data.reservedForReclaim
+		}
 		if reclaimedCoresSize < data.reservedForReclaim {
 			reclaimedCoresSize = data.reservedForReclaim
 			overlapCandidates := reclaimablePoolSizes

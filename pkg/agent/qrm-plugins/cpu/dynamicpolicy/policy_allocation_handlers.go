@@ -703,6 +703,14 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 		return nil, fmt.Errorf("planned DNB allocation overlaps ramp-up floor: allocation=%s floor=%s overlap=%s",
 			allocationInfo.AllocationResult.String(), hardReclaimCPUs.String(), overlap.String())
 	}
+	if err := p.validatePendingAdvisorPartitionView(
+		finalPodEntries,
+		finalMachineState,
+		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+	); err != nil {
+		return nil, fmt.Errorf("validate DNB ramp-up target state before commit: %w", err)
+	}
 
 	resp, err := cpuutil.PackAllocationResponse(allocationInfo, string(v1.ResourceCPU),
 		util.OCIPropertyNameCPUSetCPUs, false, true, req, allocationInfo.Annotations)
@@ -1676,27 +1684,10 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloorAtRevision(
 ) error {
 	rampUpReclaimFloor := explicitRampUpFloor.Clone()
 	if p.isRampUpReclaimHardPartitionEnabled() && rampUpReclaimFloor.IsEmpty() {
-		hasRampUp := false
-		for _, containerEntries := range entries {
-			if containerEntries.IsPoolEntry() {
-				continue
-			}
-			for _, allocationInfo := range containerEntries {
-				if allocationInfo != nil && allocationInfo.RampUp {
-					hasRampUp = true
-					break
-				}
-			}
-			if hasRampUp {
-				break
-			}
-		}
-		if hasRampUp {
-			var err error
-			rampUpReclaimFloor, err = p.deriveRampUpReclaimFloor(machineState, true)
-			if err != nil {
-				return fmt.Errorf("derive reclaim floor before allocating pools failed: %w", err)
-			}
+		var err error
+		rampUpReclaimFloor, err = p.deriveRampUpReclaimFloor(machineState, true)
+		if err != nil {
+			return fmt.Errorf("derive reclaim floor before allocating pools failed: %w", err)
 		}
 	}
 
@@ -2527,6 +2518,14 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 	machineState, err = generateMachineStateFromPodEntries(p.machineInfo.CPUTopology, newPodEntries, machineState)
 	if err != nil {
 		return fmt.Errorf("calculate machineState by newPodEntries failed with error: %v", err)
+	}
+	if err := p.validatePendingAdvisorPartitionView(
+		newPodEntries,
+		machineState,
+		allowSharedCoresOverlapReclaimedCores,
+		disableDedicatedCoresOverlapReclaimedCores,
+	); err != nil {
+		return fmt.Errorf("validate pool target state before commit: %w", err)
 	}
 	return p.state.CommitAdvisorStateIfRevision(
 		stateRevision,
@@ -3470,37 +3469,28 @@ func (p *DynamicPolicy) isReclaimEnabled() bool {
 	return dyn != nil && dyn.EnableReclaim
 }
 
-// deriveRampUpReclaimFloor derives one node-level hard reclaim floor shared by
-// every ramp-up QoS path. enteringRampUp is true while admitting a new ramp-up
-// allocation; otherwise at least one checkpointed RampUp allocation must
-// exist. The floor covers all machine NUMAs rather than the current Pod's
-// topology hint and keeps at least two CPUs on each NUMA. Configured reclaim
-// CPUs are preserved, and CPUs already owned by the live reclaim pool are
-// preferred to keep the result deterministic across recalculations.
-func (p *DynamicPolicy) deriveRampUpReclaimFloor(machineState state.NUMANodeMap, enteringRampUp bool) (machine.CPUSet, error) {
+// deriveRampUpReclaimFloor selects immutable per-NUMA targets only after
+// dedicated/reclaim disjoint mode has been negotiated. Legacy overlap keeps
+// the historical available-capacity-based target calculation.
+func (p *DynamicPolicy) deriveRampUpReclaimFloor(
+	machineState state.NUMANodeMap,
+	enteringRampUp bool,
+) (machine.CPUSet, error) {
+	return p.deriveRampUpReclaimFloorForMode(
+		machineState,
+		enteringRampUp,
+		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+	)
+}
+
+func (p *DynamicPolicy) deriveRampUpReclaimFloorForMode(
+	machineState state.NUMANodeMap,
+	_ bool,
+	immutablePerNUMA bool,
+) (machine.CPUSet, error) {
 	floor := machine.NewCPUSet()
 	if !p.isRampUpReclaimHardPartitionEnabled() || p.machineInfo == nil {
 		return floor, nil
-	}
-	if !enteringRampUp {
-		hasActiveRampUp := false
-		for _, containerEntries := range p.state.GetPodEntries() {
-			if containerEntries.IsPoolEntry() {
-				continue
-			}
-			for _, allocation := range containerEntries {
-				if allocation != nil && allocation.RampUp {
-					hasActiveRampUp = true
-					break
-				}
-			}
-			if hasActiveRampUp {
-				break
-			}
-		}
-		if !hasActiveRampUp {
-			return floor, nil
-		}
 	}
 
 	currentReclaim := machine.NewCPUSet()
@@ -3535,20 +3525,55 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloor(machineState state.NUMANodeMap,
 			}
 		}
 	}
-	minimum := len(numaIDs) * 2
-	if configuredFloor > minimum {
-		minimum = configuredFloor
-	}
-	globalTarget := machine.CalculateGlobalRampUpReclaimTarget(totalEligible, ratio, minimum)
-	targetByNUMA, err := machine.DistributeNUMATarget(availableByNUMA, globalTarget, 2)
-	if err != nil {
-		return machine.NewCPUSet(), fmt.Errorf("derive ramp-up reclaim floor failed: %w", err)
+
+	targetByNUMA := make(map[int]int, len(numaIDs))
+	if immutablePerNUMA {
+		configuredReserveByNUMA := make(map[int]int, len(numaIDs))
+		totalConfiguredBaseline := 0
+		for _, numaID := range numaIDs {
+			configuredReserveByNUMA[numaID] = general.Max(
+				reservedFloorByNUMA[numaID].Size(), minimumHardReclaimCPUsPerNUMA)
+			totalConfiguredBaseline += configuredReserveByNUMA[numaID]
+		}
+		for remaining, index := configuredFloor-totalConfiguredBaseline, 0; remaining > 0 && len(numaIDs) > 0; remaining, index = remaining-1, index+1 {
+			configuredReserveByNUMA[numaIDs[index%len(numaIDs)]]++
+		}
+		for _, numaID := range numaIDs {
+			immutableCapacity := p.machineInfo.CPUDetails.CPUsInNUMANodes(numaID).Size()
+			target, err := machine.CalculatePerNUMAHardReclaimTarget(
+				immutableCapacity, ratio, minimumHardReclaimCPUsPerNUMA, configuredReserveByNUMA[numaID])
+			if err != nil {
+				return machine.NewCPUSet(), fmt.Errorf("derive ramp-up reclaim floor for NUMA %d: %w", numaID, err)
+			}
+			targetByNUMA[numaID] = target
+		}
+	} else {
+		minimum := minimumHardReclaimCPUsPerNUMA * len(numaIDs)
+		if configuredFloor > minimum {
+			minimum = configuredFloor
+		}
+		globalTarget := machine.CalculateGlobalRampUpReclaimTarget(totalEligible, ratio, minimum)
+		var err error
+		targetByNUMA, err = machine.DistributeNUMATarget(
+			availableByNUMA, globalTarget, minimumHardReclaimCPUsPerNUMA)
+		if err != nil {
+			return machine.NewCPUSet(), fmt.Errorf("derive ramp-up reclaim floor failed: %w", err)
+		}
 	}
 
 	for _, numaID := range numaIDs {
 		eligible := eligibleByNUMA[numaID]
 		reservedFloor := reservedFloorByNUMA[numaID]
 		target := targetByNUMA[numaID]
+		if eligible.Size() < target {
+			targetKind := "available"
+			if immutablePerNUMA {
+				targetKind = "immutable"
+			}
+			return machine.NewCPUSet(), fmt.Errorf(
+				"derive ramp-up reclaim floor for NUMA %d: eligible capacity %d is smaller than %s target %d",
+				numaID, eligible.Size(), targetKind, target)
+		}
 		// reservedReclaimedCPUSet is identity-bearing configuration, not merely
 		// a target count. Preserve those exact CPUs first; a positive ratio may
 		// add CPUs while preferring the live reclaim set.
@@ -3638,16 +3663,16 @@ func (p *DynamicPolicy) numaBindingPartitionEligibility(
 	return dedicatedEligiblePerNUMA, reclaimEligiblePerNUMA, nil
 }
 
-// selectNumaBindingReclaimPartition preserves the mandatory reserve even when
-// Pod EnableReclaim is false, while optional ratio capacity is retained only
-// for reclaim-enabled Pods. Selection first consumes reclaim-only eligibility
-// (G-D), then the dedicated/reclaim intersection, and never leaves the planner's
-// reclaim eligibility (which excludes non-reclaimable pinned packages).
+// selectNumaBindingReclaimPartition preserves the complete hard floor
+// independently of Pod EnableReclaim. Selection first consumes reclaim-only
+// eligibility (G-D), then the dedicated/reclaim intersection, and never leaves
+// the planner's reclaim eligibility (which excludes non-reclaimable pinned
+// packages).
 func (p *DynamicPolicy) selectNumaBindingReclaimPartition(
 	derivedFloor machine.CPUSet,
 	dedicatedEligiblePerNUMA, reclaimEligiblePerNUMA map[int]machine.CPUSet,
 	hintNodes []uint64,
-	podReclaimEnabled, coverExclusivePartition bool,
+	_ bool, coverExclusivePartition bool,
 ) (machine.CPUSet, error) {
 	if !p.isRampUpReclaimHardPartitionEnabled() || !coverExclusivePartition {
 		return derivedFloor, nil
@@ -3667,10 +3692,7 @@ func (p *DynamicPolicy) selectNumaBindingReclaimPartition(
 			p.machineInfo.CPUDetails.CPUsInNUMANodes(numaID),
 		)
 		reserveTarget := p.reservedReclaimedCPUSet.Intersection(derivedInNUMA).Size()
-		target := reserveTarget
-		if podReclaimEnabled {
-			target = general.Max(target, derivedInNUMA.Size())
-		}
+		target := general.Max(reserveTarget, derivedInNUMA.Size())
 		target = general.Max(target, base.Size())
 		// Legacy checkpoints/tests may not carry an identity-bearing reserve.
 		// Exclusive disjoint admission still needs a non-empty reclaim side;
@@ -3711,17 +3733,13 @@ func (p *DynamicPolicy) podEnableReclaimForNumaBindingAllocation(ctx context.Con
 	if p.isRampUpReclaimHardPartitionEnabled() &&
 		qosutil.AnnotationsIndicateNUMAExclusive(reqAnnotations) &&
 		p.state.GetDisableDedicatedCoresOverlapReclaimedCores() {
-		return p.podEnableReclaimStrict(ctx, podUID, "exclusive dnb ramp-up")
+		// The always-on hard floor no longer depends on Pod EnableReclaim.
+		// Avoid rejecting exclusive DNB admission while the Pod informer cache
+		// is still converging; the conservative false value cannot shrink the
+		// floor and is only retained for the existing allocation API.
+		return false, nil
 	}
 	return p.podEnableReclaimOrFallback(ctx, podUID, "allocateNumaBindingCPUs"), nil
-}
-
-func (p *DynamicPolicy) podEnableReclaimStrict(ctx context.Context, podUID, operation string) (bool, error) {
-	podReclaimEnabled, err := p.podEnableReclaim(ctx, podUID)
-	if err != nil {
-		return false, fmt.Errorf("%s: check pod enable reclaim for pod %s failed: %w", operation, podUID, err)
-	}
-	return podReclaimEnabled, nil
 }
 
 // podEnableReclaimOrFallback is the error-swallowing convenience wrapper used on

@@ -867,7 +867,11 @@ func (cs *cpuServer) assemblePoolEntries(advisorResp *types.InternalCPUCalculati
 
 	if reclaimEntries, ok := advisorResp.PoolEntries[commonstate.PoolNameReclaim]; ok {
 		poolEntry := NewPoolCalculationEntries(commonstate.PoolNameReclaim)
-		hardReclaimByNUMA := cs.getRampUpHardReclaimSizeByNUMA()
+		var liveReclaimByNUMA map[int]int
+		dynamicConf := cs.conf.GetDynamicConfiguration()
+		if !dynamicConf.EnableReclaim || !dynamicConf.EnableRampUpReclaimHardPartition {
+			liveReclaimByNUMA = cs.getRampUpHardReclaimSizeByNUMA()
+		}
 		for numaID, reclaimCPU := range reclaimEntries {
 			reclaimNUMACalculationResult, ok := poolEntry.Entries[commonstate.FakedContainerName].CalculationResultsByNumas[int64(numaID)]
 			if !ok {
@@ -876,8 +880,8 @@ func (cs *cpuServer) assemblePoolEntries(advisorResp *types.InternalCPUCalculati
 			}
 
 			// first init reclaim pool if reclaim size is greater than 0
-			if hardSize, ok := hardReclaimByNUMA[numaID]; ok && reclaimCPU.Size < hardSize {
-				reclaimCPU.Size = hardSize
+			if liveSize, ok := liveReclaimByNUMA[numaID]; ok && reclaimCPU.Size < liveSize {
+				reclaimCPU.Size = liveSize
 			}
 			if reclaimCPU.Size > 0 {
 				block := NewBlock(uint64(reclaimCPU.Size), "")

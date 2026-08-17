@@ -421,14 +421,26 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhase(
 		ordinal := ordinalByStableKey[stableKey]
 		ordinalByStableKey[stableKey] = ordinal + 1
 		demandKey := fmt.Sprintf("%s\x00%d", stableKey, ordinal)
+		requestQuantity := float64(descriptor.Quantity)
+		if class == advisorBlockClassDedicated {
+			requestQuantity = p.advisorDescriptorRequestQuantity(descriptor)
+		}
 		demands = append(demands, partitionDemand{
-			key:       demandKey,
-			quantity:  descriptor.Quantity,
-			eligible:  descriptor.Eligible.Intersection(available),
-			preferred: descriptor.OldPreferred,
-			class:     class,
+			key:             demandKey,
+			quantity:        descriptor.Quantity,
+			requestQuantity: requestQuantity,
+			eligible:        descriptor.Eligible.Intersection(available),
+			preferred:       descriptor.OldPreferred,
+			class:           class,
 		})
 		blockIDByDemandKey[demandKey] = descriptor.BlockID
+	}
+	if expandHardReclaimPhase {
+		pinnedDemands, err := pinHardReclaimPartitionDemands(demands, available, p.machineInfo.CPUTopology)
+		if err != nil {
+			return available, fmt.Errorf("plan hard reclaim partition: %w", err)
+		}
+		demands = pinnedDemands
 	}
 	assignments, err := solveDisjointPartitions(demands, p.machineInfo.CPUTopology)
 	if err != nil {
@@ -441,6 +453,21 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhase(
 		used = used.Union(cpus)
 	}
 	return available.Difference(used), nil
+}
+
+func (p *DynamicPolicy) advisorDescriptorRequestQuantity(descriptor advisorBlockDescriptor) float64 {
+	requestQuantity := float64(descriptor.Quantity)
+	for _, owner := range descriptor.Owners {
+		_, entryName, subEntryName, _, ok := advisorDescriptorOwner(owner)
+		if !ok {
+			continue
+		}
+		allocationInfo := p.state.GetAllocationInfo(entryName, subEntryName)
+		if allocationInfo != nil && allocationInfo.RequestQuantity > requestQuantity {
+			requestQuantity = allocationInfo.RequestQuantity
+		}
+	}
+	return requestQuantity
 }
 
 func (p *DynamicPolicy) allocateStableAdvisorDescriptors(
