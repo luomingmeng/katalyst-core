@@ -21,6 +21,8 @@ import (
 	"testing"
 
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
@@ -40,17 +42,43 @@ func TestNewCPUSetPartitionViewOptionsUsesProductionConfigurationConsistently(t 
 	coreConf.DynamicAgentConfiguration = defaultDynamic
 	currentDynamic := dynamicconfig.NewDynamicAgentConfiguration().GetDynamicConfiguration()
 	currentDynamic.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.NonReclaimPoolMinSize = 5
+	currentDynamic.EnableReclaim = true
 	currentDynamic.AdminQoSConfiguration.CPUPluginConfiguration.EnableRampUpReclaimHardPartition = true
+	currentDynamic.AdminQoSConfiguration.CPUPluginConfiguration.InitialRampUpReclaimCPUSetRatio = 0.2
+	topology := testTwoNUMATopologyN(32)
 
-	opts := NewCPUSetPartitionViewOptions(coreConf, currentDynamic)
+	opts := NewCPUSetPartitionViewOptions(coreConf, currentDynamic, topology)
 	if opts.NonReclaimPoolMinSize != 5 || !opts.ReserveCPUReversely || !opts.HardPartitionEnabled {
 		t.Fatalf("unexpected current options: %+v", opts)
 	}
+	if got := opts.HardPartitionReclaimTargetPerNUMA[0]; got != 6 {
+		t.Fatalf("NUMA 0 immutable reclaim target = %d, want 6 for 32 CPUs at ratio 0.2", got)
+	}
+	if got := opts.HardPartitionReclaimTargetPerNUMA[1]; got != 6 {
+		t.Fatalf("NUMA 1 immutable reclaim target = %d, want 6 for 32 CPUs at ratio 0.2", got)
+	}
+
+	currentDynamic.MinReclaimedResourceForAllocate = v1.ResourceList{
+		v1.ResourceCPU: resource.MustParse("16"),
+	}
+	opts = NewCPUSetPartitionViewOptions(coreConf, currentDynamic, topology)
+	if got := opts.HardPartitionReclaimTargetPerNUMA[0]; got != 8 {
+		t.Fatalf("NUMA 0 configured reclaim target = %d, want 8", got)
+	}
+	if got := opts.HardPartitionReclaimTargetPerNUMA[1]; got != 8 {
+		t.Fatalf("NUMA 1 configured reclaim target = %d, want 8", got)
+	}
 
 	currentDynamic.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.NonReclaimPoolMinSize = 0
-	opts = NewCPUSetPartitionViewOptions(coreConf, currentDynamic)
+	opts = NewCPUSetPartitionViewOptions(coreConf, currentDynamic, topology)
 	if opts.NonReclaimPoolMinSize != 7 {
 		t.Fatalf("fallback NonReclaimPoolMinSize = %d, want 7", opts.NonReclaimPoolMinSize)
+	}
+
+	currentDynamic.EnableReclaim = false
+	opts = NewCPUSetPartitionViewOptions(coreConf, currentDynamic, topology)
+	if opts.HardPartitionEnabled {
+		t.Fatal("hard partition must be ineffective when reclaim is disabled")
 	}
 }
 
@@ -274,7 +302,8 @@ func TestGateAHardPartitionDefaultShareBaselineDoesNotSwallowReclaim(t *testing.
 	})
 
 	view, err := BuildValidatedCPUSetPartitionView(state, testTwoNUMATopology(), CPUSetPartitionViewOptions{
-		HardPartitionEnabled: true,
+		HardPartitionEnabled:              true,
+		HardPartitionReclaimTargetPerNUMA: map[int]int{0: 2, 1: 2},
 	})
 	if err != nil {
 		t.Fatalf("BuildValidatedCPUSetPartitionView() error = %v", err)
@@ -320,7 +349,8 @@ func TestGateAHardPartitionDefaultShareBaselineExcludesFixedOwners(t *testing.T)
 	})
 
 	view, err := BuildValidatedCPUSetPartitionView(state, testTwoNUMATopology(), CPUSetPartitionViewOptions{
-		HardPartitionEnabled: true,
+		HardPartitionEnabled:              true,
+		HardPartitionReclaimTargetPerNUMA: map[int]int{0: 2, 1: 2},
 	})
 	if err != nil {
 		t.Fatalf("BuildValidatedCPUSetPartitionView() error = %v", err)
@@ -607,40 +637,40 @@ func TestBuildCPUSetPartitionViewValidatesHardPartitionDistribution(t *testing.T
 		name                 string
 		reclaim              machine.CPUSet
 		hardPartitionEnabled bool
+		targetPerNUMA        map[int]int
 		wantErr              string
 	}{
 		{
 			name:                 "balanced two per NUMA",
 			reclaim:              machine.NewCPUSet(0, 1, 4, 5),
 			hardPartitionEnabled: true,
+			targetPerNUMA:        map[int]int{0: 2, 1: 2},
 		},
 		{
-			name:                 "balanced three and two",
-			reclaim:              machine.NewCPUSet(0, 1, 2, 4, 5),
+			name:                 "asymmetric reclaim above immutable targets",
+			reclaim:              machine.NewCPUSet(0, 1, 2, 3, 4, 5),
 			hardPartitionEnabled: true,
+			targetPerNUMA:        map[int]int{0: 2, 1: 2},
 		},
 		{
 			name:                 "hard partition rejects four and zero",
 			reclaim:              machine.NewCPUSet(0, 1, 2, 3),
 			hardPartitionEnabled: true,
-			wantErr:              "NUMA 1 has 0 CPUs, minimum is 2",
+			targetPerNUMA:        map[int]int{0: 2, 1: 2},
+			wantErr:              "NUMA 1 has 0 CPUs, target is 2",
 		},
 		{
-			name:                 "hard partition rejects reclaim only on NUMA zero",
-			reclaim:              machine.NewCPUSet(0, 1),
+			name:                 "hard partition rejects reclaim below configured target",
+			reclaim:              machine.NewCPUSet(0, 1, 2, 4, 5),
 			hardPartitionEnabled: true,
-			wantErr:              "NUMA 1 has 0 CPUs, minimum is 2",
-		},
-		{
-			name:                 "hard partition rejects three and one",
-			reclaim:              machine.NewCPUSet(0, 1, 2, 4),
-			hardPartitionEnabled: true,
-			wantErr:              "NUMA 1 has 1 CPUs, minimum is 2",
+			targetPerNUMA:        map[int]int{0: 3, 1: 3},
+			wantErr:              "NUMA 1 has 2 CPUs, target is 3",
 		},
 		{
 			name:                 "disabled skips validation",
 			reclaim:              machine.NewCPUSet(0, 1, 2, 3),
 			hardPartitionEnabled: false,
+			targetPerNUMA:        map[int]int{0: 2, 1: 2},
 		},
 	} {
 		tc := tc
@@ -655,7 +685,8 @@ func TestBuildCPUSetPartitionViewValidatesHardPartitionDistribution(t *testing.T
 			})
 
 			view, err := BuildValidatedCPUSetPartitionView(state, testTwoNUMATopology(), CPUSetPartitionViewOptions{
-				HardPartitionEnabled: tc.hardPartitionEnabled,
+				HardPartitionEnabled:              tc.hardPartitionEnabled,
+				HardPartitionReclaimTargetPerNUMA: tc.targetPerNUMA,
 			})
 			if tc.wantErr == "" {
 				if err != nil {
@@ -673,16 +704,7 @@ func TestBuildCPUSetPartitionViewValidatesHardPartitionDistribution(t *testing.T
 	}
 }
 
-// TestBuildValidatedCPUSetPartitionViewHardPartitionEliminatesRawSlack drives
-// the real DNB entry (BuildValidatedCPUSetPartitionView) with a reclaim pool
-// whose per-NUMA sizes mix the balanced mandatory ramp-up floor (28/28) with
-// asymmetric advisor raw slack (+5 on NUMA0). Before the source fix this pool
-// reaches the hard-partition validator as 33/28 and is rejected with
-// "imbalanced across physical NUMAs: max=33 min=28". After the fix, hard=true
-// must distribute the effective reclaim by the global target and drop the raw
-// slack so the mandatory floor is strictly 28/28 (diff<=1). hard=false keeps
-// the raw 33/28 shape untouched.
-func TestBuildValidatedCPUSetPartitionViewHardPartitionEliminatesRawSlack(t *testing.T) {
+func TestBuildValidatedCPUSetPartitionViewHardPartitionPreservesLegalReclaim(t *testing.T) {
 	t.Parallel()
 
 	const perNUMA = 96
@@ -709,30 +731,29 @@ func TestBuildValidatedCPUSetPartitionViewHardPartitionEliminatesRawSlack(t *tes
 		return state
 	}
 
-	// hard=true: raw slack must be eliminated and the mandatory floor balanced 28/28.
+	// Bulkhead projects the already materialized partition. It must not trim
+	// legal reclaim merely because the per-NUMA quantities are asymmetric.
 	view, err := BuildValidatedCPUSetPartitionView(newReclaimState(), topology, CPUSetPartitionViewOptions{
-		HardPartitionEnabled: true,
+		HardPartitionEnabled:              true,
+		HardPartitionReclaimTargetPerNUMA: map[int]int{0: 28, 1: 28},
 	})
 	if err != nil {
-		t.Fatalf("BuildValidatedCPUSetPartitionView(hard=true) error = %v, want balanced 28/28", err)
+		t.Fatalf("BuildValidatedCPUSetPartitionView(hard=true) error = %v, want legal 33/28 projection", err)
 	}
 	if view == nil {
 		t.Fatal("BuildValidatedCPUSetPartitionView(hard=true) returned nil view")
 	}
 	numa0 := view.ReclaimEffectivePerNUMA[0].Size()
 	numa1 := view.ReclaimEffectivePerNUMA[1].Size()
-	if numa0 != 28 || numa1 != 28 {
-		t.Fatalf("hard=true reclaim effective per NUMA = %d/%d, want 28/28", numa0, numa1)
+	if numa0 != 33 || numa1 != 28 {
+		t.Fatalf("hard=true reclaim effective per NUMA = %d/%d, want unchanged 33/28", numa0, numa1)
 	}
-	if diff := numa0 - numa1; diff > 1 || diff < -1 {
-		t.Fatalf("hard=true reclaim effective imbalanced: numa0=%d numa1=%d", numa0, numa1)
-	}
-	// Slack CPUs must move to the non-reclaim domain, not vanish or overlap.
+	// Projection must preserve the existing disjoint partition.
 	if overlap := view.NonReclaimPool.Intersection(view.ReclaimEffective); !overlap.IsEmpty() {
 		t.Fatalf("hard=true produced non-reclaim/reclaim overlap: %s", overlap.String())
 	}
-	if desired0 := view.DesiredReclaimEffectivePerNUMA[0].Size(); desired0 != 28 {
-		t.Fatalf("hard=true desired reclaim NUMA0 = %d, want 28", desired0)
+	if desired0 := view.DesiredReclaimEffectivePerNUMA[0].Size(); desired0 != 33 {
+		t.Fatalf("hard=true desired reclaim NUMA0 = %d, want 33", desired0)
 	}
 
 	// hard=false: behavior unchanged, raw slack shape (33/28) preserved.

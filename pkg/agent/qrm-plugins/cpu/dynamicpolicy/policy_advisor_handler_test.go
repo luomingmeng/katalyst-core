@@ -1815,7 +1815,7 @@ func TestDynamicPolicyApplyBlocksOverridesReclaimDedicatedOverlapBeforeCommit(t 
 		"advisor overlap mode must be committed in the same checkpoint transaction as pod and machine state")
 }
 
-func TestDynamicPolicyApplyBlocksRejectsHardPartitionInvalidatedByBulkheadPaddingAtomically(t *testing.T) {
+func TestDynamicPolicyApplyBlocksPreservesLegalHardPartitionDespiteBulkheadPadding(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
@@ -1843,10 +1843,6 @@ func TestDynamicPolicyApplyBlocksRejectsHardPartitionInvalidatedByBulkheadPaddin
 			},
 		},
 	}, false)
-	initialEntries := policy.state.GetPodEntries()
-	initialRevision := policy.state.GetRevision()
-	initialMachineState := policy.state.GetMachineState()
-
 	resp := &advisorapi.ListAndWatchResponse{
 		Entries: map[string]*advisorapi.CalculationEntries{
 			commonstate.PoolNameReserve: {
@@ -1879,25 +1875,24 @@ func TestDynamicPolicyApplyBlocksRejectsHardPartitionInvalidatedByBulkheadPaddin
 	}
 
 	pending, err := policy.applyBlocks(blockCPUSet, resp, false)
-	require.NoError(t, err, "pure advisor preparation must defer validation until after precommit hooks")
-	err = policy.commitPendingAdvisorState(pending)
-	require.ErrorContains(t, err, "hard-partition reclaim NUMA 0 has 0 CPUs")
-	require.Equal(t, initialRevision, policy.state.GetRevision())
-	require.Equal(t, initialEntries, policy.state.GetPodEntries())
-	require.Equal(t, initialMachineState, policy.state.GetMachineState())
+	require.NoError(t, err)
+	require.NotNil(t, pending)
+	reclaim := pending.entries[commonstate.PoolNameReclaim][commonstate.FakedContainerName]
+	require.NotNil(t, reclaim)
+	require.Equal(t, 2, reclaim.TopologyAwareAssignments[0].Size())
+	require.Equal(t, 2, reclaim.TopologyAwareAssignments[1].Size())
 }
 
-func TestAllocateByCPUAdvisorValidatesProspectiveHardPartitionBeforeSideEffects(t *testing.T) {
+func TestAllocateByCPUAdvisorPreservesLegalHardPartitionDespiteBulkheadPadding(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
 		name         string
 		minSize      int64
-		wantErr      bool
 		wantHookCall int
 	}{
 		{name: "raw 2/2 padding 0", minSize: 2, wantHookCall: 1},
-		{name: "raw 2/2 padding 2", minSize: 4, wantErr: true, wantHookCall: 1},
+		{name: "raw 2/2 padding 2", minSize: 4, wantHookCall: 1},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
@@ -1941,9 +1936,6 @@ func TestAllocateByCPUAdvisorValidatesProspectiveHardPartitionBeforeSideEffects(
 					},
 				},
 			}, false)
-			initialEntries := policy.state.GetPodEntries()
-			initialMachineState := policy.state.GetMachineState()
-			initialRevision := policy.state.GetRevision()
 			hookCalls := 0
 			policy.RegisterAllocationHook(func(_, _ *state.AllocationInfo) error {
 				hookCalls++
@@ -1977,25 +1969,14 @@ func TestAllocateByCPUAdvisorValidatesProspectiveHardPartitionBeforeSideEffects(
 			}
 
 			err = policy.allocateByCPUAdvisor(nil, resp, map[string]*advisorsvc.FeatureGate{})
-			if !tc.wantErr {
-				require.NoError(t, err)
-				require.Equal(t, tc.wantHookCall, hookCalls)
-				reclaim := policy.state.GetAllocationInfo(
-					commonstate.PoolNameReclaim, commonstate.FakedContainerName)
-				require.NotNil(t, reclaim)
-				require.Len(t, reclaim.TopologyAwareAssignments, 2)
-				require.Equal(t, 2, reclaim.TopologyAwareAssignments[0].Size())
-				require.Equal(t, 2, reclaim.TopologyAwareAssignments[1].Size())
-				return
-			}
-
-			require.ErrorContains(t, err, "bulkhead hard-partition reclaim NUMA 0 has 0 CPUs")
+			require.NoError(t, err)
 			require.Equal(t, tc.wantHookCall, hookCalls)
-			require.Equal(t, initialRevision, policy.state.GetRevision())
-			require.Equal(t, initialEntries, policy.state.GetPodEntries())
-			require.Equal(t, initialMachineState, policy.state.GetMachineState())
-			require.NoFileExists(t, filepath.Join(checkpointDir, advisorPostCommitCheckpointName))
-			require.NoFileExists(t, filepath.Join(checkpointDir, advisorPostCommitCheckpointName+".staging"))
+			reclaim := policy.state.GetAllocationInfo(
+				commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+			require.NotNil(t, reclaim)
+			require.Len(t, reclaim.TopologyAwareAssignments, 2)
+			require.Equal(t, 2, reclaim.TopologyAwareAssignments[0].Size())
+			require.Equal(t, 2, reclaim.TopologyAwareAssignments[1].Size())
 		})
 	}
 }
