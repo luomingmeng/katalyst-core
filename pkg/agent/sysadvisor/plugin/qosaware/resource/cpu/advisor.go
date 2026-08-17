@@ -478,6 +478,12 @@ func (cra *cpuResourceAdvisor) assignToRegions(ci *types.ContainerInfo) ([]regio
 }
 
 func (cra *cpuResourceAdvisor) assignShareContainerToRegions(ci *types.ContainerInfo) ([]region.QoSRegion, error) {
+	// Ramp-up containers have no stable owner pool yet. This applies equally
+	// to NUMA-binding and non-NUMA-binding shared containers.
+	if ci.RampUp {
+		return nil, nil
+	}
+
 	numaID := commonstate.FakedNUMAID
 	if cra.conf.GenericSysAdvisorConfiguration.EnableShareCoresNumaBinding && ci.IsNumaBinding() {
 		if ci.OwnerPoolName == "" {
@@ -492,11 +498,6 @@ func (cra *cpuResourceAdvisor) assignShareContainerToRegions(ci *types.Container
 			numaID = key
 		}
 	} else {
-		// do not assign shared container to region when ramping up because its owner pool name is empty
-		if ci.RampUp {
-			return nil, nil
-		}
-
 		// ignore the share pods without requests info
 		if ci.OwnerPoolName == "" && math.Abs(ci.CPURequest) < 1e9 {
 			return nil, nil

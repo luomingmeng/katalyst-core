@@ -86,6 +86,7 @@ const (
 	syncSystemExclusivePoolPeriod = 10 * time.Second
 	syncCPUWeightPeriod           = 10 * time.Second
 	syncBulkheadPeriod            = 30 * time.Second
+	rampUpTransitionPeriod        = 30 * time.Second
 
 	healthCheckTolerationTimes = 3
 )
@@ -94,6 +95,10 @@ var (
 	AccompanyResourceRegistry = accompanyresource.NewRegistry()
 	packAllocationResponse    = cpuutil.PackAllocationResponse
 )
+
+func rampUpDeadlineReached(initTime time.Time, transitionPeriod time.Duration, now time.Time) bool {
+	return !now.Before(initTime.Add(transitionPeriod))
+}
 
 // AllocationHook is a hook function which can be registered and called when allocationInfo changes.
 // It is designed to intercept state updates and perform actions like injecting or updating annotations
@@ -404,7 +409,7 @@ func NewDynamicPolicy(agentCtx *agent.GenericContext, conf *config.Configuration
 		numaNumberAnnotationKey:         conf.NUMANumberAnnotationKey,
 		numaIDsAnnotationKey:            conf.NUMAIDsAnnotationKey,
 		topologyAllocationAnnotationKey: conf.TopologyAllocationAnnotationKey,
-		transitionPeriod:                30 * time.Second,
+		transitionPeriod:                rampUpTransitionPeriod,
 		reservedReclaimedCPUsSize:       general.Max(reservedReclaimedCPUsSize, agentCtx.KatalystMachineInfo.NumNUMANodes),
 		reclaimConsumersForKCNR:         conf.ReclaimConsumersForKCNR,
 	}
@@ -877,7 +882,7 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 					general.Errorf("updateAllocationInfo failed for pod: %s/%s, container: %s: %v",
 						allocationInfo.PodNamespace, allocationInfo.PodName, containerName, err)
 				}
-			} else if allocationInfo.RampUp && time.Now().After(initTs.Add(p.transitionPeriod)) {
+			} else if allocationInfo.RampUp && rampUpDeadlineReached(initTs, p.transitionPeriod, time.Now()) {
 				general.Infof("pod: %s/%s, container: %s ramp up finished", allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName)
 				allocationInfo.RampUp = false
 				if err := p.updateAllocationInfo(podUID, containerName, originAllocationInfo, allocationInfo, true); err != nil {

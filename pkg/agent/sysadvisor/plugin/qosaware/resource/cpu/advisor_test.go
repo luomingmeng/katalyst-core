@@ -1746,6 +1746,31 @@ func TestGetIsolatedContainerRegions(t *testing.T) {
 	assert.ElementsMatch(t, []string{}, f(c3_2))
 }
 
+func TestAssignShareContainerToRegionsSkipsNUMABindingRampUpWithoutOwner(t *testing.T) {
+	t.Parallel()
+
+	conf := generateTestConfiguration(t, t.TempDir(), t.TempDir())
+	conf.GenericSysAdvisorConfiguration.EnableShareCoresNumaBinding = true
+	advisor := &cpuResourceAdvisor{conf: conf}
+	container := &types.ContainerInfo{
+		PodUID:        "snb-ramp-up",
+		ContainerName: "main",
+		QoSLevel:      consts.PodAnnotationQoSLevelSharedCores,
+		RampUp:        true,
+		Annotations: map[string]string{
+			consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+		},
+		TopologyAwareAssignments: map[int]machine.CPUSet{
+			0: machine.NewCPUSet(0, 1),
+		},
+	}
+
+	regions, err := advisor.assignShareContainerToRegions(container)
+
+	require.NoError(t, err)
+	require.Nil(t, regions)
+}
+
 // recordingMetricEmitter records the latest int64 value stored per metric name
 // so the metrics helper can be asserted directly in unit tests.
 type recordingMetricEmitter struct {
