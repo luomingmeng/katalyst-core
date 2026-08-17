@@ -480,14 +480,17 @@ func (p *DynamicPolicy) persistPodDeletionAfterAdjustFailure(
 	}
 
 	general.Warningf("bypass default share residual quantity gate for durable pod deletion: %v", adjustErr)
-	return p.state.CommitAdvisorStateIfRevision(
-		expectedRevision,
-		podEntries,
-		updatedMachineState,
-		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
-		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
-		true,
-	)
+	_, _, err := p.commitPendingCPUPartition(pendingCPUPartition{
+		expectedRevision: expectedRevision,
+		entries:          podEntries,
+		baseMachineState: updatedMachineState,
+		allowOverlap:     p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+		disableDedicated: p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+		persist:          true,
+		source:           "deletion fallback",
+		validate:         p.validatePendingAdvisorPartitionView,
+	})
+	return err
 }
 
 func isDefaultShareResidualQuantityGateError(err error) bool {

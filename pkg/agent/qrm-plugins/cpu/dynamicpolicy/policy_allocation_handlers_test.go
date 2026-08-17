@@ -36,6 +36,7 @@ import (
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/accompanyresource"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	dynamicpolicyutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
@@ -46,6 +47,32 @@ import (
 	rputil "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 	"github.com/kubewharf/katalyst-core/pkg/util/timemonitor"
 )
+
+type failingAllocateAccompanyPlugin struct {
+	err error
+}
+
+func (*failingAllocateAccompanyPlugin) ResourceName() string {
+	return "failing-allocate"
+}
+
+func (*failingAllocateAccompanyPlugin) GetAccompanyResourceTopologyHints(
+	_ *pluginapi.ResourceRequest,
+	_ *pluginapi.ListOfTopologyHints,
+) error {
+	return nil
+}
+
+func (p *failingAllocateAccompanyPlugin) AllocateAccompanyResource(
+	_ *pluginapi.ResourceRequest,
+	_ *pluginapi.ResourceAllocationResponse,
+) error {
+	return p.err
+}
+
+func (*failingAllocateAccompanyPlugin) ReleaseAccompanyResource(_ *pluginapi.RemovePodRequest) error {
+	return nil
+}
 
 type atomicCommitTrackingState struct {
 	state.State
@@ -106,6 +133,20 @@ func (s *atomicCommitTrackingState) CommitAdvisorState(
 		return s.commitErr
 	}
 	return s.State.CommitAdvisorState(podEntries, machineState, allowOverlap, disableDedicatedOverlap, persist)
+}
+
+func (s *atomicCommitTrackingState) CommitAdvisorStateIfRevision(
+	expectedRevision uint64,
+	podEntries state.PodEntries,
+	machineState state.NUMANodeMap,
+	allowOverlap, disableDedicatedOverlap, persist bool,
+) error {
+	s.commitCalls++
+	if s.commitErr != nil && (s.failCommits < 0 || s.commitCalls <= s.failCommits) {
+		return s.commitErr
+	}
+	return s.State.CommitAdvisorStateIfRevision(
+		expectedRevision, podEntries, machineState, allowOverlap, disableDedicatedOverlap, persist)
 }
 
 func (s *atomicCommitTrackingState) StoreState() error {
@@ -2896,6 +2937,104 @@ func TestDedicatedNUMAExclusiveRampUpCommitsAllocationAndReclaimAtomically(t *te
 		"allocation=%s reclaim=%s", allocation.AllocationResult, reclaim.AllocationResult)
 	require.True(t, allocation.AllocationResult.Union(reclaim.AllocationResult).Equals(available),
 		"allocation=%s reclaim=%s available=%s", allocation.AllocationResult, reclaim.AllocationResult, available)
+}
+
+func TestDedicatedNUMAExclusivePackResponseFailureKeepsAllStateUnchanged(t *testing.T) {
+	p, req := newDedicatedNUMAExclusiveFailureFixture(t, "exclusive-dnb-pack-failure")
+	policyTestMutex.Lock()
+	defer policyTestMutex.Unlock()
+	beforeEntries := p.state.GetPodEntries()
+	beforeMachine := p.state.GetMachineState()
+	beforeAllowOverlap := p.state.GetAllowSharedCoresOverlapReclaimedCores()
+	beforeDisableDedicated := p.state.GetDisableDedicatedCoresOverlapReclaimedCores()
+	beforeRevision := p.state.GetRevision()
+
+	originalPack := packAllocationResponse
+	packAllocationResponse = func(
+		_ *state.AllocationInfo, _, _ string, _, _ bool, _ *pluginapi.ResourceRequest, _ ...map[string]string,
+	) (*pluginapi.ResourceAllocationResponse, error) {
+		return nil, errors.New("injected pack allocation response failure")
+	}
+	defer func() {
+		packAllocationResponse = originalPack
+	}()
+
+	resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(context.Background(), req, true)
+	require.Nil(t, resp)
+	require.ErrorContains(t, err, "injected pack allocation response failure")
+	require.Equal(t, beforeEntries, p.state.GetPodEntries())
+	require.Equal(t, beforeMachine, p.state.GetMachineState())
+	require.Equal(t, beforeAllowOverlap, p.state.GetAllowSharedCoresOverlapReclaimedCores())
+	require.Equal(t, beforeDisableDedicated, p.state.GetDisableDedicatedCoresOverlapReclaimedCores())
+	require.Equal(t, beforeRevision, p.state.GetRevision())
+}
+
+func TestDedicatedNUMAExclusiveAccompanyFailureKeepsAllStateUnchanged(t *testing.T) {
+	p, req := newDedicatedNUMAExclusiveFailureFixture(t, "exclusive-dnb-accompany-failure")
+	policyTestMutex.Lock()
+	defer policyTestMutex.Unlock()
+	beforeEntries := p.state.GetPodEntries()
+	beforeMachine := p.state.GetMachineState()
+	beforeAllowOverlap := p.state.GetAllowSharedCoresOverlapReclaimedCores()
+	beforeDisableDedicated := p.state.GetDisableDedicatedCoresOverlapReclaimedCores()
+	beforeRevision := p.state.GetRevision()
+
+	originalRegistry := AccompanyResourceRegistry
+	AccompanyResourceRegistry = accompanyresource.NewRegistry()
+	require.NoError(t, AccompanyResourceRegistry.RegisterPlugin(&failingAllocateAccompanyPlugin{
+		err: errors.New("injected accompany allocation failure"),
+	}))
+	defer func() {
+		AccompanyResourceRegistry = originalRegistry
+	}()
+
+	resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(context.Background(), req, true)
+	require.Nil(t, resp)
+	require.ErrorContains(t, err, "injected accompany allocation failure")
+	require.Equal(t, beforeEntries, p.state.GetPodEntries())
+	require.Equal(t, beforeMachine, p.state.GetMachineState())
+	require.Equal(t, beforeAllowOverlap, p.state.GetAllowSharedCoresOverlapReclaimedCores())
+	require.Equal(t, beforeDisableDedicated, p.state.GetDisableDedicatedCoresOverlapReclaimedCores())
+	require.Equal(t, beforeRevision, p.state.GetRevision())
+}
+
+func newDedicatedNUMAExclusiveFailureFixture(
+	t *testing.T,
+	podUID string,
+) (*DynamicPolicy, *pluginapi.ResourceRequest) {
+	t.Helper()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.reservedReclaimedCPUSet = machine.NewCPUSet()
+	p.reservedReclaimedCPUsSize = 0
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.25
+
+	req := &pluginapi.ResourceRequest{
+		PodUid: podUID, PodNamespace: "default", PodName: podUID, ContainerName: "main",
+		ContainerType: pluginapi.ContainerType_MAIN, ResourceName: string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{string(v1.ResourceCPU): 2},
+		Labels: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+		},
+		Annotations: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey:                    apiconsts.PodAnnotationQoSLevelDedicatedCores,
+			apiconsts.PodAnnotationMemoryEnhancementNumaBinding:   apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
+		},
+		Hint: &pluginapi.TopologyHint{Nodes: []uint64{0}},
+	}
+	p.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{{
+		ObjectMeta: metav1.ObjectMeta{
+			UID: types.UID(req.PodUid), Namespace: req.PodNamespace, Name: req.PodName,
+		},
+	}}}
+	return p, req
 }
 
 func TestAllocateDedicatedNUMAExclusiveAdjustmentFailureDoesNotRollbackNewerState(t *testing.T) {

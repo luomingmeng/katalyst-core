@@ -90,7 +90,10 @@ const (
 	healthCheckTolerationTimes = 3
 )
 
-var AccompanyResourceRegistry = accompanyresource.NewRegistry()
+var (
+	AccompanyResourceRegistry = accompanyresource.NewRegistry()
+	packAllocationResponse    = cpuutil.PackAllocationResponse
+)
 
 // AllocationHook is a hook function which can be registered and called when allocationInfo changes.
 // It is designed to intercept state updates and perform actions like injecting or updating annotations

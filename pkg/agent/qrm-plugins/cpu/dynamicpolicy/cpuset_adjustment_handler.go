@@ -279,18 +279,16 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 			if err := p.syncReclaimPoolWithAdjustmentCommitOverride(newEntries, commitOverride); err != nil {
 				roundErr = fmt.Errorf("sync reclaim pool from cpuset adjustment override: %w", err)
 			} else {
-				newMachineState, err := generateMachineStateFromPodEntries(
-					p.machineInfo.CPUTopology, newEntries, p.state.GetMachineState())
+				_, _, err := p.commitPendingCPUPartition(pendingCPUPartition{
+					expectedRevision: stateRevision,
+					entries:          newEntries,
+					allowOverlap:     p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+					disableDedicated: p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+					persist:          true,
+					source:           "cpuset override",
+					validate:         p.validatePendingAdvisorPartitionView,
+				})
 				if err != nil {
-					roundErr = fmt.Errorf("generate machine state from cpuset adjustment override: %w", err)
-				} else if err := p.state.CommitAdvisorStateIfRevision(
-					stateRevision,
-					newEntries,
-					newMachineState,
-					p.state.GetAllowSharedCoresOverlapReclaimedCores(),
-					p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
-					true,
-				); err != nil {
 					if errors.Is(err, state.ErrStaleStateRevision) {
 						p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonStaleState)
 					}
