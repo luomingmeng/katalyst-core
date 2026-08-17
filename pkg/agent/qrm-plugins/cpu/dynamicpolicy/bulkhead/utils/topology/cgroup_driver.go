@@ -84,15 +84,6 @@ func newCgroupDriver(rootPath string, configuredRoots []string, policy cgroupVer
 	return driver, nil
 }
 
-func newCgroupV1Driver(
-	rootPath string,
-	configuredRoots []string,
-	fstat func(int, *unix.Stat_t) error,
-	stable bool,
-) *cgroupFSDriver {
-	return newCgroupFSDriver(rootPath, configuredRoots, cgroupV1Policy, fstat, stable)
-}
-
 func newCgroupFSDriver(
 	rootPath string,
 	configuredRoots []string,

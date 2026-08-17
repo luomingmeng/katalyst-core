@@ -2001,17 +2001,6 @@ func buildSnapshotDepthByRel(snapshot *CompleteSnapshot, stats *depthBuildStats)
 	return depthByRel
 }
 
-func parentRelInSnapshot(rel string, snapshot *CompleteSnapshot) string {
-	parent := filepath.Dir(rel)
-	for parent != "." && parent != "" {
-		if _, ok := snapshot.Entries[parent]; ok {
-			return parent
-		}
-		parent = filepath.Dir(parent)
-	}
-	return ""
-}
-
 func validateTopologyConstraints(in PhasePlanInput) error {
 	for _, node := range in.DAG.Nodes() {
 		constraint := node.Constraint

@@ -70,10 +70,6 @@ func NewCPUListManager() CPUListManager {
 	return newCPUListManagerWithUpdater(consts.DefaultResctrlRootDir, rdt.NewDefaultManager())
 }
 
-func newCPUListManager(root string) *cpuListManager {
-	return newCPUListManagerWithUpdater(root, nil)
-}
-
 func newCPUListManagerWithUpdater(root string, updater closResourceUpdater) *cpuListManager {
 	return &cpuListManager{
 		root:     root,

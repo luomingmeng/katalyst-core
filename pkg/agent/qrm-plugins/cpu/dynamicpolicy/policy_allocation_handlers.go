@@ -1659,20 +1659,6 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntries(
 		machine.NewCPUSet(), true, p.state.GetRevision())
 }
 
-func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloor(
-	poolsQuantityMap map[string]map[int]int,
-	isolatedQuantityMap map[string]map[string]int,
-	entries state.PodEntries,
-	machineState state.NUMANodeMap,
-	persistCheckpoint bool,
-	explicitRampUpFloor machine.CPUSet,
-	runCPUSetHandlers bool,
-) error {
-	return p.adjustPoolsAndIsolatedEntriesWithRampUpFloorAtRevision(
-		poolsQuantityMap, isolatedQuantityMap, entries, machineState, persistCheckpoint,
-		explicitRampUpFloor, runCPUSetHandlers, p.state.GetRevision())
-}
-
 func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloorAtRevision(
 	poolsQuantityMap map[string]map[int]int,
 	isolatedQuantityMap map[string]map[string]int,
