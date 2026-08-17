@@ -6951,6 +6951,18 @@ func TestGetResourcesAllocation(t *testing.T) {
 	as.Equal(6, reclaimEntry.AllocationResult.Size()) // ceil("14 * (4 / 10)") == 6
 }
 
+func TestRampUpDeadlineIsSharedBySNBAndNonSNB(t *testing.T) {
+	t.Parallel()
+
+	initTime := time.Unix(100, 0)
+	for _, qos := range []string{"snb", "non-snb"} {
+		t.Run(qos, func(t *testing.T) {
+			require.False(t, rampUpDeadlineReached(initTime, 30*time.Second, initTime.Add(29*time.Second)))
+			require.True(t, rampUpDeadlineReached(initTime, 30*time.Second, initTime.Add(30*time.Second)))
+		})
+	}
+}
+
 type contextCapturingPodFetcher struct {
 	*pod.PodFetcherStub
 	contexts chan context.Context

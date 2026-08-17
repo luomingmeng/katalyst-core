@@ -562,7 +562,8 @@ func TestExclusiveDisjointPartitionLifecycleAndFlagTransitions(t *testing.T) {
 	firstBlocks := applyFrame(&advisorapi.GetAdviceRequest{}, first, featureGates)
 	firstDedicated := firstBlocks["dedicated-first"]
 	firstReclaim := firstBlocks["reclaim-first"]
-	require.False(t, policy.state.GetAllocationInfo("pod-dedicated", "main").RampUp)
+	require.True(t, policy.state.GetAllocationInfo("pod-dedicated", "main").RampUp,
+		"dedicated ramp-up must remain active until the shared transition period expires")
 	require.True(t, firstDedicated.Intersection(firstReclaim).IsEmpty())
 	require.Equal(t, wholeNUMA, firstDedicated.Union(firstReclaim))
 	require.True(t, policy.state.GetDisableDedicatedCoresOverlapReclaimedCores())

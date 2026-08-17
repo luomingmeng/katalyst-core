@@ -1844,16 +1844,10 @@ func (p *DynamicPolicy) applyBlocks(
 			newEntries[entryName][subEntryName] = allocationInfo
 			pooledUnionDedicatedCPUSet = pooledUnionDedicatedCPUSet.Union(allocationInfo.AllocationResult)
 
-			// ramp-up finishes immediately for dedicated
 			if allocationInfo.OwnerPoolName == commonstate.PoolNameDedicated {
 				dedicatedCPUSet = dedicatedCPUSet.Union(allocationInfo.AllocationResult)
 				general.Infof("try to apply dedicated_cores: %s/%s %s: %s",
 					allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName, allocationInfo.AllocationResult.String())
-
-				if allocationInfo.RampUp {
-					allocationInfo.RampUp = false
-					general.Infof("pod: %s/%s, container: %s ramp up finished", allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName)
-				}
 			} else {
 				for numaID, cpus := range allocationInfo.TopologyAwareAssignments {
 					_ = p.emitter.StoreInt64(util.MetricNamePoolSize, int64(cpus.Size()),
