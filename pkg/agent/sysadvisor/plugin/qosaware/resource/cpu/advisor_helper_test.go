@@ -155,56 +155,6 @@ func Test_cpuResourceAdvisor_updateReservedForReclaim(t *testing.T) {
 	}
 }
 
-func TestHardPartitionMinimumReclaimCores(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name              string
-		configuredReserve int
-		numaCount         int
-		want              int
-	}{
-		{
-			name:              "empty configured reserve across two NUMAs",
-			configuredReserve: 0,
-			numaCount:         2,
-			want:              4,
-		},
-		{
-			name:              "hard floor wins across two NUMAs",
-			configuredReserve: 3,
-			numaCount:         2,
-			want:              4,
-		},
-		{
-			name:              "configured reserve wins across two NUMAs",
-			configuredReserve: 8,
-			numaCount:         2,
-			want:              8,
-		},
-		{
-			name:              "hard floor wins across four NUMAs",
-			configuredReserve: 2,
-			numaCount:         4,
-			want:              8,
-		},
-		{
-			name:              "no NUMA preserves configured reserve",
-			configuredReserve: 3,
-			numaCount:         0,
-			want:              3,
-		},
-	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			assert.Equal(t, tt.want, hardPartitionMinimumReclaimCores(tt.configuredReserve, tt.numaCount))
-		})
-	}
-}
-
 func TestCPUResourceAdvisorUpdateReservedForReclaimUsesHardPartitionRatio(t *testing.T) {
 	t.Parallel()
 
@@ -327,11 +277,14 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimUsesImmutableNUMACapacity(t *
 		0: machine.NewCPUSet(),
 		1: machine.NewCPUSet(),
 	}
+	cpuDetails := machine.CPUDetails{}
 	for cpuID := 0; cpuID < 24; cpuID++ {
 		numaToCPUs[0].Add(cpuID)
+		cpuDetails[cpuID] = machine.CPUTopoInfo{NUMANodeID: 0}
 	}
 	for cpuID := 24; cpuID < 56; cpuID++ {
 		numaToCPUs[1].Add(cpuID)
+		cpuDetails[cpuID] = machine.CPUTopoInfo{NUMANodeID: 1}
 	}
 	cra := &cpuResourceAdvisor{
 		conf: conf,
@@ -342,6 +295,7 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimUsesImmutableNUMACapacity(t *
 						NumCPUs:      56,
 						NumNUMANodes: 2,
 						NUMAToCPUs:   numaToCPUs,
+						CPUDetails:   cpuDetails,
 					},
 				},
 			},

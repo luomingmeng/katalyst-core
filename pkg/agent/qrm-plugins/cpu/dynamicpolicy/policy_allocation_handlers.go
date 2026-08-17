@@ -40,6 +40,7 @@ import (
 	cpuutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/util"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	resourcehelper "github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/plugin/qosaware/resource/helper"
+	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
@@ -3502,32 +3503,41 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloorForMode(
 		totalEligible += eligible.Size()
 	}
 
-	configuredFloor := p.reservedReclaimedCPUsSize
+	// floorConf carries the reclaim floor scalar (MinReclaimedResourceForAllocate);
+	// it is sourced separately from p.conf and may be nil, in which case the reclaim
+	// utils fall back to the static reserve. ratioConf carries the ramp-up ratio,
+	// NUMA knobs and enablement gate, sourced from the canonical p.dynamicConfig so
+	// this path stays consistent with isRampUpReclaimHardPartitionEnabled and
+	// getInitialRampUpReclaimCPUSetRatio. in production both resolve to the same
+	// dynamic configuration object.
+	var floorConf *dynamicconfig.Configuration
 	if p.conf != nil {
-		if dynamicConf := p.conf.GetDynamicConfiguration(); dynamicConf != nil {
-			if quantity, ok := dynamicConf.MinReclaimedResourceForAllocate[v1.ResourceCPU]; ok {
-				configuredFloor = int(quantity.Value())
-			}
-		}
+		floorConf = p.conf.GetDynamicConfiguration()
 	}
+	var ratioConf *dynamicconfig.Configuration
+	if p.dynamicConfig != nil {
+		ratioConf = p.dynamicConfig.GetDynamicConfiguration()
+	}
+
+	// preserve p.reservedReclaimedCPUsSize as the fallback floor when the global
+	// scalar is unset, matching the pre-unification default. the config-aware
+	// scalar util keeps the three-state override semantics aligned with the
+	// per-NUMA reclaim targets derived below.
+	configuredFloor := machine.ResolveConfiguredReclaimFloorFromConfig(
+		floorConf, p.machineInfo.CPUTopology, p.reservedReclaimedCPUsSize)
 
 	targetByNUMA := make(map[int]int, len(numaIDs))
 	if immutablePerNUMA {
-		capacityByNUMA := make(map[int]int, len(numaIDs))
-		baselineByNUMA := make(map[int]int, len(numaIDs))
-		for _, numaID := range numaIDs {
-			immutableCapacity := p.machineInfo.CPUDetails.CPUsInNUMANodes(numaID).Size()
-			capacityByNUMA[numaID] = immutableCapacity
-			target, err := machine.CalculatePerNUMAHardReclaimTarget(
-				immutableCapacity, ratio, minimumHardReclaimCPUsPerNUMA, reservedFloorByNUMA[numaID].Size())
-			if err != nil {
-				return machine.NewCPUSet(), fmt.Errorf("derive ramp-up reclaim floor for NUMA %d: %w", numaID, err)
-			}
-			baselineByNUMA[numaID] = target
-		}
 		var err error
-		targetByNUMA, err = machine.DistributeConfiguredHardReclaimFloor(
-			capacityByNUMA, baselineByNUMA, configuredFloor)
+		// feed the resolved floor as the fallback so the util derives per-NUMA
+		// targets from the canonical ratio config while honoring the reclaim floor
+		// scalar owned by floorConf.
+		targetByNUMA, err = machine.ResolveHardPartitionReclaimTargets(
+			ratioConf,
+			p.machineInfo.CPUTopology,
+			configuredFloor,
+			func(numaID int) int { return reservedFloorByNUMA[numaID].Size() },
+		)
 		if err != nil {
 			return machine.NewCPUSet(), fmt.Errorf("distribute configured ramp-up reclaim floor: %w", err)
 		}

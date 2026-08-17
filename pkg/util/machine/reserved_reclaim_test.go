@@ -1,0 +1,370 @@
+/*
+Copyright 2026 The Katalyst Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package machine
+
+import (
+	"reflect"
+	"testing"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+
+	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
+)
+
+func evenCapacity(size int) func(int) int {
+	return func(int) int { return size }
+}
+
+func TestResolvePerNUMAReservedForReclaim(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		conf      *dynamicconfig.Configuration
+		cpuNum    int
+		socketNum int
+		numaNum   int
+		want      map[int]int
+	}{
+		{
+			// ratio takes priority: per-NUMA ceil(ratio*size), floor applied.
+			// ceil(0.1*10)=1, max(floor 1, 1)=1; global scalar ignored.
+			name:      "ratio priority over global",
+			conf:      newReclaimTestConfig(0, "100", "0.1", "1"),
+			cpuNum:    40,
+			socketNum: 1,
+			numaNum:   4,
+			want:      map[int]int{0: 1, 1: 1, 2: 1, 3: 1},
+		},
+		{
+			// ratio computes above the floor: ceil(0.5*10)=5 wins over floor 2.
+			name:      "ratio above floor",
+			conf:      newReclaimTestConfig(0, "", "0.5", "2"),
+			cpuNum:    40,
+			socketNum: 1,
+			numaNum:   4,
+			want:      map[int]int{0: 5, 1: 5, 2: 5, 3: 5},
+		},
+		{
+			// floor dominates when ratio result is smaller: ceil(0.1*10)=1 < floor 3.
+			name:      "floor dominates ratio",
+			conf:      newReclaimTestConfig(0, "", "0.1", "3"),
+			cpuNum:    40,
+			socketNum: 1,
+			numaNum:   4,
+			want:      map[int]int{0: 3, 1: 3, 2: 3, 3: 3},
+		},
+		{
+			// ratio zero: fall back to global cores distributed evenly.
+			// 8 cores over 4 NUMA -> 2 per NUMA; per-NUMA floor ignored on fallback.
+			name:      "global fallback even",
+			conf:      newReclaimTestConfig(0, "8", "", "5"),
+			cpuNum:    40,
+			socketNum: 1,
+			numaNum:   4,
+			want:      map[int]int{0: 2, 1: 2, 2: 2, 3: 2},
+		},
+		{
+			// global fallback clamps to numCPUs before even distribution.
+			// 999 clamped to 8 CPUs over 4 NUMA -> 2 per NUMA.
+			name:      "global fallback clamps to numCPUs",
+			conf:      newReclaimTestConfig(0, "999", "", ""),
+			cpuNum:    8,
+			socketNum: 1,
+			numaNum:   4,
+			want:      map[int]int{0: 2, 1: 2, 2: 2, 3: 2},
+		},
+		{
+			// global fallback lifts below-NUMA-count reserve to one per NUMA.
+			name:      "global fallback lifts to numNUMANodes",
+			conf:      newReclaimTestConfig(0, "1", "", ""),
+			cpuNum:    40,
+			socketNum: 1,
+			numaNum:   4,
+			want:      map[int]int{0: 1, 1: 1, 2: 1, 3: 1},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			topology, err := GenerateDummyCPUTopology(tt.cpuNum, tt.socketNum, tt.numaNum)
+			if err != nil {
+				t.Fatalf("generate dummy topology: %v", err)
+			}
+			got := ResolvePerNUMAReservedForReclaim(tt.conf, topology)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("ResolvePerNUMAReservedForReclaim() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolvePerNUMAReservedForReclaimNilInputs(t *testing.T) {
+	t.Parallel()
+
+	topology, err := GenerateDummyCPUTopology(16, 1, 2)
+	if err != nil {
+		t.Fatalf("generate dummy topology: %v", err)
+	}
+
+	// nil topology yields an empty map; the caller never dereferences a nil map.
+	if got := ResolvePerNUMAReservedForReclaim(newReclaimTestConfig(0, "4", "", ""), nil); len(got) != 0 {
+		t.Fatalf("ResolvePerNUMAReservedForReclaim(nil topology) = %v, want empty", got)
+	}
+
+	// nil config falls back to zero reserve, lifted to one core per NUMA node.
+	got := ResolvePerNUMAReservedForReclaim(nil, topology)
+	want := map[int]int{0: 1, 1: 1}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ResolvePerNUMAReservedForReclaim(nil config) = %v, want %v", got, want)
+	}
+}
+
+func TestResolveConfiguredReclaimFloor(t *testing.T) {
+	t.Parallel()
+
+	type args struct {
+		numaReservedRatio   float64
+		numaReservedFloor   int
+		globalReservedCores int
+		numNUMANodes        int
+		numaCPUSize         func(int) int
+	}
+	tests := []struct {
+		name string
+		args args
+		want int
+	}{
+		{
+			// ratio takes priority and sums per-NUMA ceil(ratio*size):
+			// ceil(0.1*32)=4 per NUMA, ×2 = 8; the global scalar is ignored.
+			name: "ratio priority sums per numa",
+			args: args{
+				numaReservedRatio:   0.1,
+				numaReservedFloor:   2,
+				globalReservedCores: 100,
+				numNUMANodes:        2,
+				numaCPUSize:         evenCapacity(32),
+			},
+			want: 8,
+		},
+		{
+			// floor dominates when ratio result is smaller:
+			// ceil(0.1*10)=1 < floor 3, so 3 per NUMA, ×2 = 6.
+			name: "floor dominates ratio",
+			args: args{
+				numaReservedRatio:   0.1,
+				numaReservedFloor:   3,
+				globalReservedCores: 0,
+				numNUMANodes:        2,
+				numaCPUSize:         evenCapacity(10),
+			},
+			want: 6,
+		},
+		{
+			// ratio zero: fall back to the raw global reserved cores.
+			name: "global fallback",
+			args: args{
+				numaReservedRatio:   0,
+				numaReservedFloor:   5,
+				globalReservedCores: 16,
+				numNUMANodes:        2,
+				numaCPUSize:         evenCapacity(32),
+			},
+			want: 16,
+		},
+		{
+			// ratio zero and no global reserve: no configured floor.
+			name: "global fallback zero",
+			args: args{
+				numaReservedRatio:   0,
+				numaReservedFloor:   0,
+				globalReservedCores: 0,
+				numNUMANodes:        2,
+				numaCPUSize:         evenCapacity(32),
+			},
+			want: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := ResolveConfiguredReclaimFloor(
+				tt.args.numaReservedRatio,
+				tt.args.numaReservedFloor,
+				tt.args.globalReservedCores,
+				tt.args.numNUMANodes,
+				tt.args.numaCPUSize,
+			)
+			if got != tt.want {
+				t.Fatalf("ResolveConfiguredReclaimFloor() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func newReclaimTestConfig(
+	ratioForRampUp float64,
+	globalReserve string,
+	numaReservedRatio string,
+	numaReserved string,
+) *dynamicconfig.Configuration {
+	conf := dynamicconfig.NewConfiguration()
+	conf.InitialRampUpReclaimCPUSetRatio = ratioForRampUp
+	if globalReserve != "" {
+		conf.MinReclaimedResourceForAllocate = v1.ResourceList{v1.ResourceCPU: resource.MustParse(globalReserve)}
+	}
+	if numaReservedRatio != "" {
+		conf.NumaMinReclaimedResourceRatioForAllocate = v1.ResourceList{v1.ResourceCPU: resource.MustParse(numaReservedRatio)}
+	}
+	if numaReserved != "" {
+		conf.NumaMinReclaimedResourceForAllocate = v1.ResourceList{v1.ResourceCPU: resource.MustParse(numaReserved)}
+	}
+	return conf
+}
+
+func TestResolveConfiguredReclaimFloorFromConfig(t *testing.T) {
+	t.Parallel()
+
+	// 2 NUMA nodes, 8 CPUs each.
+	topology, err := GenerateDummyCPUTopology(16, 1, 2)
+	if err != nil {
+		t.Fatalf("generate dummy topology: %v", err)
+	}
+
+	tests := []struct {
+		name                   string
+		conf                   *dynamicconfig.Configuration
+		globalReservedFallback int
+		want                   int
+	}{
+		{
+			// global scalar drives the floor when NUMA ratio is unset.
+			name:                   "global scalar",
+			conf:                   newReclaimTestConfig(0, "6", "", ""),
+			globalReservedFallback: 0,
+			want:                   6,
+		},
+		{
+			// global key missing: fall back to the caller-provided default.
+			name:                   "global fallback default",
+			conf:                   newReclaimTestConfig(0, "", "", ""),
+			globalReservedFallback: 4,
+			want:                   4,
+		},
+		{
+			// NUMA ratio takes priority: ceil(0.25*8)=2 per NUMA, ×2 = 4.
+			name:                   "numa ratio priority",
+			conf:                   newReclaimTestConfig(0, "100", "0.25", "1"),
+			globalReservedFallback: 0,
+			want:                   4,
+		},
+		{
+			// nil config returns the fallback untouched.
+			name:                   "nil config",
+			conf:                   nil,
+			globalReservedFallback: 7,
+			want:                   7,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := ResolveConfiguredReclaimFloorFromConfig(tt.conf, topology, tt.globalReservedFallback)
+			if got != tt.want {
+				t.Fatalf("ResolveConfiguredReclaimFloorFromConfig() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveHardPartitionReclaimTargets(t *testing.T) {
+	t.Parallel()
+
+	// 2 NUMA nodes, 8 CPUs each.
+	topology, err := GenerateDummyCPUTopology(16, 1, 2)
+	if err != nil {
+		t.Fatalf("generate dummy topology: %v", err)
+	}
+
+	tests := []struct {
+		name                   string
+		conf                   *dynamicconfig.Configuration
+		globalReservedFallback int
+		perNUMAReservedFloor   func(int) int
+		want                   map[int]int
+	}{
+		{
+			// ramp-up ratio 0, minimum 2 per NUMA drives the baseline (total 4);
+			// global floor 4 does not raise it. targets {0:2,1:2}.
+			name:                   "minimum baseline dominates",
+			conf:                   newReclaimTestConfig(0, "4", "", ""),
+			globalReservedFallback: 0,
+			want:                   map[int]int{0: 2, 1: 2},
+		},
+		{
+			// ramp-up ratio 0.5: floor(0.5*8)=4 per NUMA, total 8; floor 4 ignored.
+			name:                   "rampup ratio baseline",
+			conf:                   newReclaimTestConfig(0.5, "4", "", ""),
+			globalReservedFallback: 0,
+			want:                   map[int]int{0: 4, 1: 4},
+		},
+		{
+			// global floor 10 exceeds baseline total 4, distributed evenly: {0:5,1:5}.
+			name:                   "global floor raises evenly",
+			conf:                   newReclaimTestConfig(0, "10", "", ""),
+			globalReservedFallback: 0,
+			want:                   map[int]int{0: 5, 1: 5},
+		},
+		{
+			// per-NUMA reserved floor lifts baseline on NUMA 0 to 3 (odd allowed via
+			// configuredReserve), NUMA 1 stays at minimum 2. total baseline 5.
+			name:                   "per numa reserved floor",
+			conf:                   newReclaimTestConfig(0, "0", "", ""),
+			globalReservedFallback: 0,
+			perNUMAReservedFloor: func(numaID int) int {
+				if numaID == 0 {
+					return 3
+				}
+				return 0
+			},
+			want: map[int]int{0: 3, 1: 2},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := ResolveHardPartitionReclaimTargets(
+				tt.conf, topology, tt.globalReservedFallback, tt.perNUMAReservedFloor)
+			if err != nil {
+				t.Fatalf("ResolveHardPartitionReclaimTargets() error = %v", err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("ResolveHardPartitionReclaimTargets() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

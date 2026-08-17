@@ -18,10 +18,8 @@ package cpu
 
 import (
 	"fmt"
-	"math"
 
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	"k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
@@ -203,13 +201,6 @@ func (cra *cpuResourceAdvisor) updateNumasAvailableResource() error {
 	return cra.updateReservedForReclaim()
 }
 
-func hardPartitionMinimumReclaimCores(configuredReserve, numaCount int) int {
-	if numaCount <= 0 {
-		return configuredReserve
-	}
-	return general.Max(configuredReserve, numaCount*2)
-}
-
 // Keep this fallback aligned with QRM's default reservedReclaimedCPUsSize.
 const defaultReservedReclaimedCPUsSize = 4
 
@@ -221,70 +212,27 @@ func (cra *cpuResourceAdvisor) updateReservedForReclaim() error {
 	}
 
 	if dynamicConf.EnableReclaim && dynamicConf.EnableRampUpReclaimHardPartition {
-		configuredReserveQuantity := dynamicConf.MinReclaimedResourceForAllocate[v1.ResourceCPU]
-		configuredReserve := int(configuredReserveQuantity.Value())
-		configuredReserve = hardPartitionMinimumReclaimCores(configuredReserve, cra.metaServer.NumNUMANodes)
-
-		capacityByNUMA := make(map[int]int, cra.metaServer.NumNUMANodes)
-		baselineByNUMA := make(map[int]int, cra.metaServer.NumNUMANodes)
-		for numaID := 0; numaID < cra.metaServer.NumNUMANodes; numaID++ {
-			capacity := cra.metaServer.NUMAToCPUs.CPUSizeInNUMAs(numaID)
-			capacityByNUMA[numaID] = capacity
-			target, err := machine.CalculatePerNUMAHardReclaimTarget(
-				capacity,
-				dynamicConf.InitialRampUpReclaimCPUSetRatio,
-				2,
-				0,
-			)
-			if err != nil {
-				return fmt.Errorf("calculate hard reclaim target for NUMA %d: %w", numaID, err)
-			}
-			baselineByNUMA[numaID] = target
-		}
-		reservedForReclaim, err := machine.DistributeConfiguredHardReclaimFloor(
-			capacityByNUMA, baselineByNUMA, configuredReserve)
+		reservedForReclaim, err := machine.ResolveHardPartitionReclaimTargets(
+			dynamicConf, cra.metaServer.CPUTopology, 0, nil)
 		if err != nil {
-			return fmt.Errorf("distribute configured hard reclaim floor: %w", err)
+			return fmt.Errorf("resolve hard partition reclaim targets: %w", err)
 		}
 		cra.reservedForReclaim = reservedForReclaim
-		general.Infof("reservedForReclaim: %v, hard partition ratio %v, configured reserve %v",
-			reservedForReclaim, dynamicConf.InitialRampUpReclaimCPUSetRatio, configuredReserve)
+		general.Infof("reservedForReclaim: %v, hard partition ratio %v",
+			reservedForReclaim, dynamicConf.InitialRampUpReclaimCPUSetRatio)
 		return nil
 	}
 
+	cra.reservedForReclaim = machine.ResolvePerNUMAReservedForReclaim(dynamicConf, cra.metaServer.CPUTopology)
 	numaReservedRatio := dynamicConf.NumaMinReclaimedResourceRatioForAllocate[v1.ResourceCPU]
-	if numaReservedRatio.Value() != 0 {
-		numaReserved := dynamicConf.NumaMinReclaimedResourceForAllocate[v1.ResourceCPU]
-		cra.updateReservedForReclaimByNuma(numaReservedRatio, numaReserved)
-		return nil
-	}
-
-	coreNumReservedForReclaim := dynamicConf.MinReclaimedResourceForAllocate[v1.ResourceCPU]
-	if coreNumReservedForReclaim.Value() > int64(cra.metaServer.NumCPUs) {
-		coreNumReservedForReclaim.Set(int64(cra.metaServer.NumCPUs))
-	}
-
-	// make sure coreNumReservedForReclaim >= NumNUMANodes
-	if coreNumReservedForReclaim.Value() < int64(cra.metaServer.NumNUMANodes) {
-		coreNumReservedForReclaim.Set(int64(cra.metaServer.NumNUMANodes))
-	}
-	cra.reservedForReclaim = machine.GetCoreNumReservedForReclaim(int(coreNumReservedForReclaim.Value()), cra.metaServer.NumNUMANodes)
-	general.Infof("reservedForReclaim: %v, coreNumReservedForReclaim %v", cra.reservedForReclaim, coreNumReservedForReclaim.Value())
+	numaReserved := dynamicConf.NumaMinReclaimedResourceForAllocate[v1.ResourceCPU]
+	globalReserved := dynamicConf.MinReclaimedResourceForAllocate[v1.ResourceCPU]
+	general.Infof("reservedForReclaim: %v, numaReservedRatio %v, numaReserved %v, globalReserved %v",
+		cra.reservedForReclaim,
+		numaReservedRatio.AsApproximateFloat64(),
+		numaReserved.AsApproximateFloat64(),
+		globalReserved.Value())
 	return nil
-}
-
-func (cra *cpuResourceAdvisor) updateReservedForReclaimByNuma(numaReservedRatio resource.Quantity,
-	numaReserved resource.Quantity,
-) {
-	reservedForReclaim := make(map[int]int)
-	for id := 0; id < cra.metaServer.NumNUMANodes; id++ {
-		size := cra.metaServer.NUMAToCPUs.CPUSizeInNUMAs(id)
-		reserved := math.Ceil(numaReservedRatio.AsApproximateFloat64() * float64(size))
-		reservedForReclaim[id] = int(math.Max(numaReserved.AsApproximateFloat64(), reserved))
-	}
-	cra.reservedForReclaim = reservedForReclaim
-	general.Infof("reservedForReclaim: %v, numaReservedRatio %v, numaReserved %v",
-		reservedForReclaim, numaReservedRatio.AsApproximateFloat64(), numaReserved.AsApproximateFloat64())
 }
 
 func (cra *cpuResourceAdvisor) getNumasReservedForAllocate(numas machine.CPUSet) float64 {
