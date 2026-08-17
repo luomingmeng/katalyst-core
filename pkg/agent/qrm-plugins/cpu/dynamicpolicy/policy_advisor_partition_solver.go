@@ -26,11 +26,12 @@ import (
 )
 
 type partitionDemand struct {
-	key       string
-	quantity  int
-	eligible  machine.CPUSet
-	preferred machine.CPUSet
-	class     advisorBlockClass
+	key             string
+	quantity        int
+	requestQuantity float64
+	eligible        machine.CPUSet
+	preferred       machine.CPUSet
+	class           advisorBlockClass
 }
 
 type partitionFlowEdge struct {

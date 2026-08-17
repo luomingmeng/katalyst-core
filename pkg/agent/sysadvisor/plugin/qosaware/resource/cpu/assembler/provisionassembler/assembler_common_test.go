@@ -1898,9 +1898,125 @@ func TestAssembleWithoutNUMAExclusivePoolDeductsReserveFromPinnedEligibilityDoma
 	require.Equal(t, 4, result.PoolEntries[commonstate.PoolNameReclaim][0].Size)
 }
 
+func TestAssembleProvisionPublishesHardReclaimFloorForEveryPhysicalNUMAWithoutRegions(t *testing.T) {
+	t.Parallel()
+
+	conf := generateTestConf(t, true, "")
+	conf.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	regionMap := map[string]region.QoSRegion{}
+	reservedForReclaim := map[int]int{0: 4, 1: 6}
+	numaAvailable := map[int]int{0: 24, 1: 32}
+	nonBindingNUMAs := machine.NewCPUSet()
+	allowSharedOverlap := false
+	disableDedicatedOverlap := true
+	metaReader := metacache.NewDummyMetaCacheImp()
+	require.NoError(t, metaReader.SetResourcePackageConfig(types.ResourcePackageConfig{}))
+
+	assembler := NewProvisionAssemblerCommon(
+		conf, nil, &regionMap, &reservedForReclaim, &numaAvailable, &nonBindingNUMAs,
+		&allowSharedOverlap, &disableDedicatedOverlap, metaReader, nil, metrics.DummyMetrics{},
+	)
+	result, err := assembler.AssembleProvision()
+	require.NoError(t, err)
+	require.Equal(t, types.CPUResource{Size: 4, Quota: -1}, result.PoolEntries[commonstate.PoolNameReclaim][0])
+	require.Equal(t, types.CPUResource{Size: 6, Quota: -1}, result.PoolEntries[commonstate.PoolNameReclaim][1])
+}
+
+func TestAssembleWithoutNUMAExclusivePoolAddsDedicatedExcessAboveHardReclaimFloor(t *testing.T) {
+	t.Parallel()
+
+	result, err := runOrdinaryOverlapAssemblerCase(t, ordinaryOverlapAssemblerCase{
+		capacity:                16,
+		reserved:                4,
+		hardPartition:           true,
+		disableDedicatedOverlap: true,
+		dedicatedEnableReclaim:  true,
+		dedicatedRequest:        12,
+		dedicatedRequirement:    8,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 8, result.PoolEntries["dedicated-pod"][0].Size)
+	require.Equal(t, 8, result.PoolEntries[commonstate.PoolNameReclaim][0].Size)
+}
+
+func TestAssembleWithoutNUMAExclusivePoolKeepsHardReclaimFloorAcrossOverlapPolicies(t *testing.T) {
+	t.Parallel()
+
+	for _, allowSharedOverlap := range []bool{false, true} {
+		for _, disableDedicatedOverlap := range []bool{false, true} {
+			result, err := runOrdinaryOverlapAssemblerCase(t, ordinaryOverlapAssemblerCase{
+				capacity:                20,
+				reserved:                4,
+				hardPartition:           true,
+				allowSharedOverlap:      allowSharedOverlap,
+				disableDedicatedOverlap: disableDedicatedOverlap,
+				sharedEnableReclaim:     true,
+				dedicatedEnableReclaim:  true,
+				sharedRequest:           8,
+				sharedRequirement:       4,
+				dedicatedRequest:        8,
+				dedicatedRequirement:    6,
+			})
+			require.NoError(t, err)
+			require.GreaterOrEqual(t, result.PoolEntries[commonstate.PoolNameReclaim][0].Size, 4,
+				"allowSharedOverlap=%t disableDedicatedOverlap=%t",
+				allowSharedOverlap, disableDedicatedOverlap)
+		}
+	}
+}
+
+func TestAssembleWithoutNUMAExclusivePoolReservesHardReclaimFloorFromSaturatedNUMACapacity(t *testing.T) {
+	t.Parallel()
+
+	for _, allowSharedOverlap := range []bool{false, true} {
+		for _, disableDedicatedOverlap := range []bool{false, true} {
+			result, err := runOrdinaryOverlapAssemblerCase(t, ordinaryOverlapAssemblerCase{
+				capacity:                20,
+				reserved:                4,
+				hardPartition:           true,
+				allowSharedOverlap:      allowSharedOverlap,
+				disableDedicatedOverlap: disableDedicatedOverlap,
+				sharedEnableReclaim:     true,
+				dedicatedEnableReclaim:  true,
+				sharedRequest:           12,
+				sharedRequirement:       12,
+				dedicatedRequest:        8,
+				dedicatedRequirement:    6,
+			})
+			require.NoError(t, err)
+			require.Equal(t, 16,
+				result.PoolEntries["share"][0].Size+result.PoolEntries["dedicated-pod"][0].Size,
+				"allowSharedOverlap=%t disableDedicatedOverlap=%t",
+				allowSharedOverlap, disableDedicatedOverlap)
+			require.GreaterOrEqual(t, result.PoolEntries[commonstate.PoolNameReclaim][0].Size, 4,
+				"allowSharedOverlap=%t disableDedicatedOverlap=%t",
+				allowSharedOverlap, disableDedicatedOverlap)
+		}
+	}
+}
+
+func TestAssembleWithoutNUMAExclusivePoolAddsReservedFloorBackForSharedOnlyNUMA(t *testing.T) {
+	t.Parallel()
+
+	result, err := runOrdinaryOverlapAssemblerCase(t, ordinaryOverlapAssemblerCase{
+		capacity:            20,
+		reserved:            4,
+		hardPartition:       true,
+		allowSharedOverlap:  true,
+		sharedEnableReclaim: true,
+		sharedRequest:       8,
+		sharedRequirement:   4,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 16, result.PoolEntries["share"][0].Size)
+	require.Equal(t, 4, result.PoolEntries[commonstate.PoolNameReclaim][0].Size)
+	require.Equal(t, map[string]int{"share": 12}, result.PoolOverlapInfo[commonstate.PoolNameReclaim][0])
+}
+
 type ordinaryOverlapAssemblerCase struct {
 	capacity                int
 	reserved                int
+	hardPartition           bool
 	allowSharedOverlap      bool
 	disableDedicatedOverlap bool
 	sharedEnableReclaim     bool
@@ -1925,6 +2041,7 @@ func runOrdinaryOverlapAssemblerCase(
 	conf, err := options.NewOptions().Config()
 	require.NoError(t, err)
 	conf.GetDynamicConfiguration().EnableReclaim = true
+	conf.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = tc.hardPartition
 
 	regionMap := map[string]region.QoSRegion{}
 	if tc.sharedRequest > 0 {

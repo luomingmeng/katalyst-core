@@ -205,7 +205,7 @@ func TestHardPartitionMinimumReclaimCores(t *testing.T) {
 	}
 }
 
-func TestCPUResourceAdvisorUpdateReservedForReclaimIgnoresHardPartitionRatio(t *testing.T) {
+func TestCPUResourceAdvisorUpdateReservedForReclaimUsesHardPartitionRatio(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -215,16 +215,16 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimIgnoresHardPartitionRatio(t *
 		wantReserved      map[int]int
 	}{
 		{
-			name:              "half ratio keeps static reserve",
+			name:              "half ratio derives per NUMA reserve",
 			ratio:             0.5,
 			configuredReserve: resource.MustParse("4"),
-			wantReserved:      map[int]int{0: 2, 1: 2},
+			wantReserved:      map[int]int{0: 4, 1: 4},
 		},
 		{
-			name:              "fractional ratio keeps static reserve",
+			name:              "fractional ratio rounds down to even",
 			ratio:             0.5625,
 			configuredReserve: resource.MustParse("4"),
-			wantReserved:      map[int]int{0: 2, 1: 2},
+			wantReserved:      map[int]int{0: 4, 1: 4},
 		},
 		{
 			name:              "larger configured reserve is statically balanced",
@@ -239,10 +239,10 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimIgnoresHardPartitionRatio(t *
 			wantReserved:      map[int]int{0: 2, 1: 2},
 		},
 		{
-			name:              "oversized ratio does not affect static reserve",
+			name:              "larger ratio wins over static reserve",
 			ratio:             0.75,
 			configuredReserve: resource.MustParse("4"),
-			wantReserved:      map[int]int{0: 2, 1: 2},
+			wantReserved:      map[int]int{0: 6, 1: 6},
 		},
 	}
 
@@ -282,6 +282,48 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimIgnoresHardPartitionRatio(t *
 	}
 }
 
+func TestCPUResourceAdvisorUpdateReservedForReclaimUsesImmutableNUMACapacity(t *testing.T) {
+	t.Parallel()
+
+	conf := generateTestConfiguration(t, t.TempDir(), t.TempDir())
+	dynamicConf := conf.GetDynamicConfiguration()
+	dynamicConf.EnableReclaim = true
+	dynamicConf.EnableRampUpReclaimHardPartition = true
+	dynamicConf.InitialRampUpReclaimCPUSetRatio = 0.2
+	dynamicConf.MinReclaimedResourceForAllocate = v1.ResourceList{
+		v1.ResourceCPU: resource.MustParse("4"),
+	}
+
+	numaToCPUs := machine.NUMANodeInfo{
+		0: machine.NewCPUSet(),
+		1: machine.NewCPUSet(),
+	}
+	for cpuID := 0; cpuID < 24; cpuID++ {
+		numaToCPUs[0].Add(cpuID)
+	}
+	for cpuID := 24; cpuID < 56; cpuID++ {
+		numaToCPUs[1].Add(cpuID)
+	}
+	cra := &cpuResourceAdvisor{
+		conf: conf,
+		metaServer: &metaserver.MetaServer{
+			MetaAgent: &agent.MetaAgent{
+				KatalystMachineInfo: &machine.KatalystMachineInfo{
+					CPUTopology: &machine.CPUTopology{
+						NumCPUs:      56,
+						NumNUMANodes: 2,
+						NUMAToCPUs:   numaToCPUs,
+					},
+				},
+			},
+		},
+		numaAvailable: map[int]int{0: 2, 1: 30},
+	}
+
+	require.NoError(t, cra.updateReservedForReclaim())
+	assert.Equal(t, map[int]int{0: 4, 1: 6}, cra.reservedForReclaim)
+}
+
 func TestCPUResourceAdvisorUpdateReservedForReclaimFallbacks(t *testing.T) {
 	t.Parallel()
 
@@ -294,12 +336,14 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimFallbacks(t *testing.T) {
 		dynamicConf.EnableRampUpReclaimHardPartition = true
 		dynamicConf.MinReclaimedResourceForAllocate = v1.ResourceList{}
 
+		cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+		require.NoError(t, err)
 		cra := &cpuResourceAdvisor{
 			conf: conf,
 			metaServer: &metaserver.MetaServer{
 				MetaAgent: &agent.MetaAgent{
 					KatalystMachineInfo: &machine.KatalystMachineInfo{
-						CPUTopology: &machine.CPUTopology{NumNUMANodes: 1},
+						CPUTopology: cpuTopology,
 					},
 				},
 			},
@@ -307,7 +351,7 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimFallbacks(t *testing.T) {
 		}
 
 		require.NoError(t, cra.updateReservedForReclaim())
-		assert.Equal(t, map[int]int{0: 1}, cra.reservedForReclaim)
+		assert.Equal(t, map[int]int{0: 2}, cra.reservedForReclaim)
 	})
 
 	t.Run("hard partition two NUMAs missing CPU key uses static minimum", func(t *testing.T) {
@@ -319,12 +363,14 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimFallbacks(t *testing.T) {
 		dynamicConf.EnableRampUpReclaimHardPartition = true
 		dynamicConf.MinReclaimedResourceForAllocate = v1.ResourceList{}
 
+		cpuTopology, err := machine.GenerateDummyCPUTopology(16, 1, 2)
+		require.NoError(t, err)
 		cra := &cpuResourceAdvisor{
 			conf: conf,
 			metaServer: &metaserver.MetaServer{
 				MetaAgent: &agent.MetaAgent{
 					KatalystMachineInfo: &machine.KatalystMachineInfo{
-						CPUTopology: &machine.CPUTopology{NumNUMANodes: 2},
+						CPUTopology: cpuTopology,
 					},
 				},
 			},
@@ -332,7 +378,7 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimFallbacks(t *testing.T) {
 		}
 
 		require.NoError(t, cra.updateReservedForReclaim())
-		assert.Equal(t, map[int]int{0: 1, 1: 1}, cra.reservedForReclaim)
+		assert.Equal(t, map[int]int{0: 2, 1: 2}, cra.reservedForReclaim)
 	})
 
 	t.Run("hard partition is bypassed when reclaim is disabled", func(t *testing.T) {

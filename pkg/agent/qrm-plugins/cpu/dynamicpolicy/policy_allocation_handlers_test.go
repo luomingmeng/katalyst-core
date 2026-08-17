@@ -1280,7 +1280,7 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_exclusiveDisjointPartition(t *tes
 	})
 }
 
-func TestDynamicPolicyPodEnableReclaimForNumaBindingAllocationStrictExclusivePartition(t *testing.T) {
+func TestDynamicPolicyPodEnableReclaimForNumaBindingAllocationDoesNotBlockExclusivePartition(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
@@ -1297,7 +1297,7 @@ func TestDynamicPolicyPodEnableReclaimForNumaBindingAllocationStrictExclusivePar
 		apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
 	}
 	got, err := p.podEnableReclaimForNumaBindingAllocation(context.Background(), "pod-missing", exclusive)
-	require.ErrorContains(t, err, "exclusive dnb ramp-up")
+	require.NoError(t, err)
 	require.False(t, got)
 
 	nonExclusive := map[string]string{
@@ -1478,7 +1478,7 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_preservesReserveOnPodLookupFailur
 	}
 }
 
-func TestDynamicPolicy_selectNumaBindingReclaimPartitionRespectsPodReclaimSwitch(t *testing.T) {
+func TestDynamicPolicy_selectNumaBindingReclaimPartitionPreservesHardFloor(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
@@ -1509,9 +1509,9 @@ func TestDynamicPolicy_selectNumaBindingReclaimPartitionRespectsPodReclaimSwitch
 			want:              machine.NewCPUSet(0, 1, 2, 3),
 		},
 		{
-			name:              "pod reclaim false keeps mandatory reserve only",
+			name:              "pod reclaim false keeps complete hard floor",
 			podReclaimEnabled: false,
-			want:              machine.NewCPUSet(0, 1),
+			want:              machine.NewCPUSet(0, 1, 2, 3),
 		},
 	} {
 		tc := tc
@@ -1897,7 +1897,8 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorCoversAllNUMAs(t *testing.T) {
 
 	inactiveFloor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), false)
 	require.NoError(t, err)
-	require.True(t, inactiveFloor.IsEmpty(), "floor must not reserve capacity without an active ramp-up workload")
+	require.True(t, inactiveFloor.Equals(machine.NewCPUSet(14, 38, 62, 86)),
+		"hard floor must remain active without a ramp-up workload")
 
 	p.state.SetAllocationInfo("ramp-up-pod", "main", &state.AllocationInfo{
 		AllocationMeta: commonstate.AllocationMeta{
@@ -2126,6 +2127,34 @@ func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorAllowsNonBindingSharedPoolS
 		require.NotNil(t, owner)
 		require.Equal(t, 4, owner.AllocationResult.Size())
 		require.True(t, owner.AllocationResult.Equals(share))
+	})
+
+	t.Run("derives hard floor without active ramp-up allocation", func(t *testing.T) {
+		p := newPolicy(t)
+		p.reservedReclaimedCPUSet = machine.NewCPUSet(0, 1)
+		p.reservedReclaimedCPUsSize = 2
+		quantities := map[string]map[int]int{
+			commonstate.PoolNameShare: {commonstate.FakedNUMAID: 4},
+		}
+
+		err := p.adjustPoolsAndIsolatedEntriesWithRampUpFloor(
+			quantities,
+			nil,
+			p.state.GetPodEntries(),
+			p.state.GetMachineState(),
+			false,
+			machine.NewCPUSet(),
+			false,
+		)
+		require.NoError(t, err)
+
+		entries := p.state.GetPodEntries()
+		reclaim, err := entries.GetCPUSetForPool(commonstate.PoolNameReclaim)
+		require.NoError(t, err)
+		require.True(t, machine.NewCPUSet(0, 1).IsSubsetOf(reclaim), "reclaim=%s", reclaim)
+		share, err := entries.GetCPUSetForPool(commonstate.PoolNameShare)
+		require.NoError(t, err)
+		require.True(t, share.Intersection(machine.NewCPUSet(0, 1)).IsEmpty(), "share=%s", share)
 	})
 
 	t.Run("proportionally shrinks global share pool", func(t *testing.T) {
@@ -2588,6 +2617,55 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorAllowsFullNonExclusiveRatio(t *tes
 		"floor=%s, want every eligible CPU", floor)
 }
 
+func TestDynamicPolicyDeriveRampUpReclaimFloorUsesImmutablePerNUMACapacity(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(64, 2, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.reservedReclaimedCPUSet = machine.NewCPUSet()
+	p.reservedReclaimedCPUsSize = 0
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.2
+	p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
+
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	numa1 := topology.CPUDetails.CPUsInNUMANodes(1)
+	p.state.SetMachineState(state.NUMANodeMap{
+		0: {DefaultCPUSet: machine.NewCPUSet(numa0.ToSliceInt()[:8]...)},
+		1: {DefaultCPUSet: machine.NewCPUSet(numa1.ToSliceInt()[:8]...)},
+	}, false)
+
+	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), true)
+	require.NoError(t, err)
+	require.Equal(t, 6, floor.Intersection(numa0).Size())
+	require.Equal(t, 6, floor.Intersection(numa1).Size())
+}
+
+func TestDynamicPolicyDeriveRampUpReclaimFloorPreservesLegacyOverlapAlgorithm(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(32, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	allCPUs := topology.CPUDetails.CPUs().ToSliceInt()
+	p.reservedCPUs = machine.NewCPUSet(allCPUs[8:]...)
+	p.reservedReclaimedCPUSet = machine.NewCPUSet()
+	p.reservedReclaimedCPUsSize = 0
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.5
+	p.state.SetDisableDedicatedCoresOverlapReclaimedCores(false, false)
+
+	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), true)
+	require.NoError(t, err)
+	require.Equal(t, 4, floor.Size())
+}
+
 func TestDynamicPolicyDeriveRampUpReclaimFloorUsesDynamicConfiguredMinimum(t *testing.T) {
 	t.Parallel()
 
@@ -2667,20 +2745,20 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorBalancesGlobalTargetAcrossUnevenNU
 		wantErr           string
 	}{
 		{
-			name:              "half ratio is balanced four and four",
+			name:              "half ratio uses immutable capacity",
 			hardEnabled:       true,
 			withReserved:      true,
 			configuredReserve: 4,
 			ratio:             0.5,
-			wantPerNUMA:       map[int]int{0: 4, 1: 4},
+			wantErr:           "eligible capacity 4 is smaller than immutable target 8",
 		},
 		{
-			name:              "fractional ratio is floored and aligned to same target as Sysadvisor",
+			name:              "fractional ratio is floored and aligned from immutable capacity",
 			hardEnabled:       true,
 			withReserved:      true,
 			configuredReserve: 4,
 			ratio:             0.5625,
-			wantPerNUMA:       map[int]int{0: 4, 1: 4},
+			wantErr:           "eligible capacity 4 is smaller than immutable target 8",
 		},
 		{
 			name:              "configured reserve floor wins",
@@ -2691,12 +2769,12 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorBalancesGlobalTargetAcrossUnevenNU
 			wantPerNUMA:       map[int]int{0: 4, 1: 4},
 		},
 		{
-			name:              "three quarter ratio exceeds balanced capacity",
+			name:              "three quarter ratio exceeds current eligible capacity",
 			hardEnabled:       true,
 			withReserved:      true,
 			configuredReserve: 4,
 			ratio:             0.75,
-			wantErr:           "cannot distribute target 12 within NUMA capacities while keeping counts balanced",
+			wantErr:           "eligible capacity 4 is smaller than immutable target 12",
 		},
 		{
 			name:        "zero ratio still keeps two per NUMA",
@@ -2737,6 +2815,7 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorBalancesGlobalTargetAcrossUnevenNU
 			p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = tt.hardEnabled
 			p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = tt.hardEnabled
 			p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = tt.ratio
+			p.state.SetDisableDedicatedCoresOverlapReclaimedCores(tt.hardEnabled, false)
 			if tt.configuredReserve > 0 {
 				p.conf.GetDynamicConfiguration().MinReclaimedResourceForAllocate = v1.ResourceList{
 					v1.ResourceCPU: *resource.NewQuantity(int64(tt.configuredReserve), resource.DecimalSI),

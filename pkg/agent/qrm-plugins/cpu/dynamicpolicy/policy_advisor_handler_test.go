@@ -654,6 +654,77 @@ func prepareAndCommitAdvisorBlocks(
 	return policy.commitPendingAdvisorState(pending)
 }
 
+func TestDynamicPolicyApplyBlocksUsesNegotiatedReclaimPlanWhenFreeCPUsCannotMeetFloor(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	policy.reservedCPUs = machine.NewCPUSet()
+	policy.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	policy.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.25
+
+	entries := state.PodEntries{
+		"dedicated-pod": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "dedicated-pod",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameDedicated,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+				},
+				AllocationResult: machine.NewCPUSet(1, 2, 3, 4, 5, 6, 7),
+				RequestQuantity:  6,
+			},
+		},
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(0),
+			},
+		},
+	}
+	policy.state.SetPodEntries(entries, false)
+	policy.state.SetMachineState(state.NUMANodeMap{
+		0: {
+			DefaultCPUSet: machine.NewCPUSet(0),
+			PodEntries:    entries,
+		},
+	}, false)
+
+	resp := &advisorapi.ListAndWatchResponse{
+		DisableDedicatedCoresOverlapReclaimedCores: true,
+		Entries: map[string]*advisorapi.CalculationEntries{
+			"dedicated-pod": {Entries: map[string]*advisorapi.CalculationInfo{
+				"main": {
+					OwnerPoolName: commonstate.PoolNameDedicated,
+					CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+						0: {Blocks: []*advisorapi.Block{{BlockId: "dedicated", Result: 6}}},
+					},
+				},
+			}},
+			commonstate.PoolNameReclaim: {Entries: map[string]*advisorapi.CalculationInfo{
+				commonstate.FakedContainerName: {
+					OwnerPoolName: commonstate.PoolNameReclaim,
+					CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+						0: {Blocks: []*advisorapi.Block{{BlockId: "reclaim", Result: 2}}},
+					},
+				},
+			}},
+		},
+	}
+
+	pending, err := policy.applyBlocks(advisorapi.BlockCPUSet{
+		"dedicated": machine.NewCPUSet(1, 2, 3, 4, 5, 6),
+		"reclaim":   machine.NewCPUSet(0, 7),
+	}, resp, false)
+	require.NoError(t, err)
+	require.True(t, pending.entries[commonstate.PoolNameReclaim][commonstate.FakedContainerName].
+		AllocationResult.Equals(machine.NewCPUSet(0, 7)))
+}
+
 func TestDynamicPolicyApplyBlocksMaterializesDefaultShareFromResidual(t *testing.T) {
 	t.Parallel()
 
