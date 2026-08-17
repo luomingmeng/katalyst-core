@@ -309,18 +309,6 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 	}
 }
 
-func (p *DynamicPolicy) publishAdvisorPostCommitTarget(
-	resp *advisorapi.ListAndWatchResponse,
-	revision uint64,
-) *advisorPostCommitTarget {
-	target := cloneAdvisorPostCommitTarget(resp, revision)
-	if err := p.storeAdvisorPostCommitTarget(target, p.advisorPostCommitCheckpointPath()); err != nil {
-		general.Errorf("persist advisor post-commit target for revision %d failed: %v", revision, err)
-	}
-	p.publishPreparedAdvisorPostCommitTarget(target)
-	return target
-}
-
 func cloneAdvisorPostCommitTarget(
 	resp *advisorapi.ListAndWatchResponse,
 	revision uint64,
@@ -596,12 +584,6 @@ func (p *DynamicPolicy) hasAnyPendingAdvisorPostCommitTarget() bool {
 	p.cpuSetAdjustmentRetryMu.Lock()
 	defer p.cpuSetAdjustmentRetryMu.Unlock()
 	return p.advisorPostCommitTarget != nil
-}
-
-func (p *DynamicPolicy) hasPendingAdvisorPostCommitTarget(revision uint64) bool {
-	p.cpuSetAdjustmentRetryMu.Lock()
-	defer p.cpuSetAdjustmentRetryMu.Unlock()
-	return p.advisorPostCommitTarget != nil && p.advisorPostCommitTarget.revision == revision
 }
 
 func (p *DynamicPolicy) currentAdvisorPostCommitTarget() *advisorPostCommitTarget {

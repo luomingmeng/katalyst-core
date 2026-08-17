@@ -433,17 +433,6 @@ func admissionStageDeadlineError(ctx context.Context, stage string) error {
 	return nil
 }
 
-func appliedViewFromFinalSnapshot(
-	metaServer *metaserver.MetaServer,
-	desired *model.DesiredView,
-	dag *topology.TopoDAG,
-	snapshot *topology.CompleteSnapshot,
-	expectedCPUSetByRel ...map[string]machine.CPUSet,
-) (*model.AppliedView, error) {
-	return appliedViewFromFinalSnapshotWithContext(
-		context.Background(), metaServer, desired, dag, snapshot, expectedCPUSetByRel...)
-}
-
 func appliedViewFromFinalSnapshotWithContext(
 	ctx context.Context,
 	metaServer *metaserver.MetaServer,
@@ -527,22 +516,6 @@ func appliedViewFromFinalSnapshotWithDeferredCleanup(
 	}
 	applied.ContainerCPUSetByPod = containerCPUSetByPod
 	return applied, nil
-}
-
-func containerCPUSetByPodFromFinalSnapshotWithContext(
-	ctx context.Context,
-	metaServer *metaserver.MetaServer,
-	desired *model.DesiredView,
-	snapshot *topology.CompleteSnapshot,
-	expectedCPUSetByRel map[string]machine.CPUSet,
-	deferredCPUSetMaps ...map[string]machine.CPUSet,
-) (map[string]map[string]machine.CPUSet, error) {
-	var deferredCPUSetByRel map[string]machine.CPUSet
-	if len(deferredCPUSetMaps) > 0 {
-		deferredCPUSetByRel = deferredCPUSetMaps[0]
-	}
-	return containerCPUSetByPodFromFinalSnapshotWithDeferredCleanup(
-		ctx, metaServer, desired, snapshot, expectedCPUSetByRel, deferredCPUSetByRel, nil)
 }
 
 func containerCPUSetByPodFromFinalSnapshotWithDeferredCleanup(

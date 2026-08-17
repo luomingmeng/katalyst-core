@@ -207,10 +207,6 @@ func formatCPUListTargets(cpuSets map[string]machine.CPUSet) map[string]string {
 	return targets
 }
 
-func (p *CPUListPlugin) buildTargets(view *model.CPUSetPartitionView) map[string]string {
-	return formatCPUListTargets(p.buildTargetCPUSets(view))
-}
-
 func sortedTargetClosIDs(targets map[string]string) []string {
 	closIDs := make([]string, 0, len(targets))
 	for closID := range targets {
