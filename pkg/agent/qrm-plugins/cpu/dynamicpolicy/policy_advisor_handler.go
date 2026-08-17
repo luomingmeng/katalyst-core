@@ -2109,29 +2109,6 @@ func (p *DynamicPolicy) commitPendingAdvisorState(pending *pendingAdvisorState) 
 	return err
 }
 
-func (p *DynamicPolicy) syncReclaimPoolWithBulkheadAppliedView(newEntries state.PodEntries, previous machine.CPUSet) error {
-	if p.bulkheadManager == nil {
-		return nil
-	}
-	reclaim := p.bulkheadManager.LatestAppliedReclaim()
-	if reclaim.IsEmpty() || reclaim.Equals(previous) {
-		return nil
-	}
-	reclaimEntry, ok := newEntries[commonstate.PoolNameReclaim][commonstate.FakedContainerName]
-	if !ok || reclaimEntry == nil {
-		return nil
-	}
-	assignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, reclaim)
-	if err != nil {
-		return err
-	}
-	reclaimEntry.AllocationResult = reclaim.Clone()
-	reclaimEntry.OriginalAllocationResult = reclaim.Clone()
-	reclaimEntry.TopologyAwareAssignments = assignments
-	reclaimEntry.OriginalTopologyAwareAssignments = machine.DeepcopyCPUAssignment(assignments)
-	return nil
-}
-
 func (p *DynamicPolicy) buildAdjustmentCommitOverrideFromPodEntries(
 	newEntries state.PodEntries,
 	allowSharedCoresOverlapReclaimedCores bool,
