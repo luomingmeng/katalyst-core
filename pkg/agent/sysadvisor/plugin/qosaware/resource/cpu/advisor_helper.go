@@ -201,9 +201,6 @@ func (cra *cpuResourceAdvisor) updateNumasAvailableResource() error {
 	return cra.updateReservedForReclaim()
 }
 
-// Keep this fallback aligned with QRM's default reservedReclaimedCPUsSize.
-const defaultReservedReclaimedCPUsSize = 4
-
 func (cra *cpuResourceAdvisor) updateReservedForReclaim() error {
 	dynamicConf := cra.conf.GetDynamicConfiguration()
 	if dynamicConf == nil {

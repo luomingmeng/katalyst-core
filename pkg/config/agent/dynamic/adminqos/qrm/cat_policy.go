@@ -45,14 +45,6 @@ const (
 	CATAllocationDirectionHigh CATAllocationDirection = "high"
 )
 
-func convertCATPolicyFromAPI(in *configv1alpha1.CATPolicy) CATPolicy {
-	if in == nil {
-		return CATPolicy{}
-	}
-
-	return mergeCATPolicyFromAPI(CATPolicy{}, in)
-}
-
 func mergeCATPolicyFromAPI(base CATPolicy, in *configv1alpha1.CATPolicy) CATPolicy {
 	if in == nil {
 		return base
