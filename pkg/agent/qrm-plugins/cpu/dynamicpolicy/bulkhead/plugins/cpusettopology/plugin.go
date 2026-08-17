@@ -468,8 +468,13 @@ func appliedViewFromFinalSnapshotWithDeferredCleanup(
 	if desired == nil || dag == nil || snapshot == nil {
 		return nil, fmt.Errorf("desired view, topology dag and final snapshot are required")
 	}
+	partition := model.NewCPUSetPartitionView()
+	partition.Dedicated = desired.Dedicated.Clone()
+	for poolName, cpus := range desired.SharePoolMap {
+		partition.SharePoolMap[poolName] = cpus.Clone()
+	}
 	applied := &model.AppliedView{
-		CPUSetPartitionView: model.NewCPUSetPartitionView(),
+		CPUSetPartitionView: partition,
 		CPUSetByRel:         make(map[string]machine.CPUSet, len(dag.Nodes())),
 		RelProofByRel:       make(map[string]model.CgroupRelProof, len(dag.Nodes())),
 	}

@@ -168,6 +168,66 @@ func TestAppliedViewFromFinalSnapshotUsesPerRelV2TargetProof(t *testing.T) {
 	}
 }
 
+func TestAppliedViewFromFinalSnapshotPreservesCPUOwnership(t *testing.T) {
+	primaryCPUs := machine.NewCPUSet(0, 1, 2, 3, 4, 5)
+	dag, err := topology.BuildDAG([]topology.NodeSpec{
+		{
+			Rel: "primary", Role: topology.TopoNodeRolePrimary, Domain: topology.DomainPrimary,
+			CPUs: primaryCPUs, ControlledRoot: true, TrustAnchor: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildDAG() error = %v", err)
+	}
+	snapshot := &topology.CompleteSnapshot{
+		Capabilities: topology.HierarchyCapabilities{
+			StableIdentity: true, EmptyConfiguredCPUSet: true, EffectiveCPUSet: true,
+		},
+		Entries: map[string]topology.EntryState{
+			"primary": {
+				Rel: "primary", Identity: topology.CgroupIdentity{Device: 7, Inode: 10},
+				CPUs: primaryCPUs, ConfiguredCPUs: primaryCPUs,
+			},
+		},
+	}
+	desired := model.NewDesiredView()
+	desired.SharePoolMap["share"] = machine.NewCPUSet(0, 1)
+	desired.SharePoolMap["latency"] = machine.NewCPUSet(2, 3)
+	desired.Dedicated = machine.NewCPUSet(4, 5)
+
+	applied, err := appliedViewFromFinalSnapshot(nil, desired, dag, snapshot)
+	if err != nil {
+		t.Fatalf("appliedViewFromFinalSnapshot() error = %v", err)
+	}
+	if got := applied.SharePoolMap["share"]; !got.Equals(machine.NewCPUSet(0, 1)) {
+		t.Fatalf("applied share pool = %s, want 0-1", got.String())
+	}
+	if got := applied.SharePoolMap["latency"]; !got.Equals(machine.NewCPUSet(2, 3)) {
+		t.Fatalf("applied latency pool = %s, want 2-3", got.String())
+	}
+	if got := applied.Dedicated; !got.Equals(machine.NewCPUSet(4, 5)) {
+		t.Fatalf("applied dedicated = %s, want 4-5", got.String())
+	}
+
+	desired.SharePoolMap["share"].Add(6)
+	desired.Dedicated.Add(7)
+	if got := applied.SharePoolMap["share"]; !got.Equals(machine.NewCPUSet(0, 1)) {
+		t.Fatalf("applied share pool changed with desired view mutation: %s", got.String())
+	}
+	if got := applied.Dedicated; !got.Equals(machine.NewCPUSet(4, 5)) {
+		t.Fatalf("applied dedicated changed with desired view mutation: %s", got.String())
+	}
+
+	applied.SharePoolMap["latency"].Add(8)
+	applied.Dedicated.Add(8)
+	if got := desired.SharePoolMap["latency"]; !got.Equals(machine.NewCPUSet(2, 3)) {
+		t.Fatalf("desired latency pool changed with applied view mutation: %s", got.String())
+	}
+	if got := desired.Dedicated; !got.Equals(machine.NewCPUSet(4, 5, 7)) {
+		t.Fatalf("desired dedicated changed with applied view mutation: %s", got.String())
+	}
+}
+
 func TestAppliedViewFromFinalSnapshotRejectsNUMATargetProofOutsideUpperBound(t *testing.T) {
 	dag, err := topology.BuildDAG([]topology.NodeSpec{
 		{
