@@ -2370,10 +2370,14 @@ func (p *DynamicPolicy) cpuSetPartitionViewOptions() bulkheadutils.CPUSetPartiti
 		dynamicConf = p.dynamicConfig.GetDynamicConfiguration()
 	}
 	var coreConf *config.Configuration
+	var topology *machine.CPUTopology
 	if p != nil {
 		coreConf = p.conf
+		if p.machineInfo != nil {
+			topology = p.machineInfo.CPUTopology
+		}
 	}
-	return bulkheadutils.NewCPUSetPartitionViewOptions(coreConf, dynamicConf)
+	return bulkheadutils.NewCPUSetPartitionViewOptions(coreConf, dynamicConf, topology)
 }
 
 func (p *DynamicPolicy) hardBulkheadPartitionValidationEnabled() bool {
@@ -2386,7 +2390,9 @@ func (p *DynamicPolicy) hardBulkheadPartitionValidationEnabled() bool {
 		return false
 	}
 	cpuConf := dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration
-	return cpuConf.BulkheadConfig.Enable && cpuConf.EnableRampUpReclaimHardPartition
+	return cpuConf.BulkheadConfig.Enable &&
+		dynamicConf.EnableReclaim &&
+		cpuConf.EnableRampUpReclaimHardPartition
 }
 
 func (p *DynamicPolicy) getOwnerPoolNameFromAdvisor(allocationInfo *state.AllocationInfo, resp *advisorapi.ListAndWatchResponse) string {

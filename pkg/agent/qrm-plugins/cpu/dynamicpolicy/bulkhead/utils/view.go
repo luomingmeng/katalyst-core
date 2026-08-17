@@ -19,6 +19,8 @@ package utils
 import (
 	"fmt"
 
+	v1 "k8s.io/api/core/v1"
+
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	cpustate "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
@@ -29,10 +31,12 @@ import (
 )
 
 type CPUSetPartitionViewOptions struct {
-	NonReclaimPoolMinSize        int64
-	HardPartitionEnabled         bool
-	ReserveCPUReversely          bool
-	TransientProtectedNonReclaim machine.CPUSet
+	NonReclaimPoolMinSize             int64
+	HardPartitionEnabled              bool
+	HardPartitionReclaimTargetPerNUMA map[int]int
+	HardPartitionTargetError          error
+	ReserveCPUReversely               bool
+	TransientProtectedNonReclaim      machine.CPUSet
 }
 
 const minimumHardPartitionReclaimCPUsPerNUMA = 2
@@ -40,6 +44,7 @@ const minimumHardPartitionReclaimCPUsPerNUMA = 2
 func NewCPUSetPartitionViewOptions(
 	coreConf *config.Configuration,
 	dynamicConf *dynamicconfig.Configuration,
+	topology *machine.CPUTopology,
 ) CPUSetPartitionViewOptions {
 	nonReclaimPoolMinSize := configuredNonReclaimPoolMinSize(dynamicConf)
 	if nonReclaimPoolMinSize <= 0 && coreConf != nil && coreConf.DynamicAgentConfiguration != nil {
@@ -47,8 +52,41 @@ func NewCPUSetPartitionViewOptions(
 	}
 
 	opts := CPUSetPartitionViewOptions{
-		NonReclaimPoolMinSize: nonReclaimPoolMinSize,
-		HardPartitionEnabled:  hardPartitionEnabled(dynamicConf),
+		NonReclaimPoolMinSize:             nonReclaimPoolMinSize,
+		HardPartitionEnabled:              hardPartitionEnabled(dynamicConf),
+		HardPartitionReclaimTargetPerNUMA: map[int]int{},
+	}
+	if opts.HardPartitionEnabled && topology != nil {
+		ratio := dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.InitialRampUpReclaimCPUSetRatio
+		numaIDs := topology.CPUDetails.NUMANodes().ToSliceInt()
+		configuredFloor := 0
+		if quantity, ok := dynamicConf.MinReclaimedResourceForAllocate[v1.ResourceCPU]; ok {
+			configuredFloor = int(quantity.Value())
+		}
+		configuredReserveByNUMA := make(map[int]int, len(numaIDs))
+		totalConfiguredBaseline := 0
+		for _, numaID := range numaIDs {
+			configuredReserveByNUMA[numaID] = minimumHardPartitionReclaimCPUsPerNUMA
+			totalConfiguredBaseline += minimumHardPartitionReclaimCPUsPerNUMA
+		}
+		for remaining, index := configuredFloor-totalConfiguredBaseline, 0; remaining > 0 && len(numaIDs) > 0; remaining, index = remaining-1, index+1 {
+			configuredReserveByNUMA[numaIDs[index%len(numaIDs)]]++
+		}
+		for _, numaID := range numaIDs {
+			capacity := topology.CPUDetails.CPUsInNUMANodes(numaID).Size()
+			target, err := machine.CalculatePerNUMAHardReclaimTarget(
+				capacity,
+				ratio,
+				minimumHardPartitionReclaimCPUsPerNUMA,
+				configuredReserveByNUMA[numaID],
+			)
+			if err != nil {
+				opts.HardPartitionTargetError = fmt.Errorf(
+					"calculate hard-partition reclaim target for NUMA %d: %w", numaID, err)
+				break
+			}
+			opts.HardPartitionReclaimTargetPerNUMA[numaID] = target
+		}
 	}
 	if coreConf != nil {
 		opts.ReserveCPUReversely = coreConf.EnableReserveCPUReversely
@@ -67,7 +105,8 @@ func hardPartitionEnabled(conf *dynamicconfig.Configuration) bool {
 	if conf == nil || conf.AdminQoSConfiguration == nil || conf.AdminQoSConfiguration.CPUPluginConfiguration == nil {
 		return false
 	}
-	return conf.AdminQoSConfiguration.CPUPluginConfiguration.EnableRampUpReclaimHardPartition
+	return conf.EnableReclaim &&
+		conf.AdminQoSConfiguration.CPUPluginConfiguration.EnableRampUpReclaimHardPartition
 }
 
 func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CPUTopology, opts CPUSetPartitionViewOptions) *model.DesiredView {
@@ -200,15 +239,12 @@ func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CP
 				view.SharePoolMap[commonstate.PoolNameShare] = spareShare.Clone()
 			}
 		}
-		padNonReclaimPoolToMinSize(view, topology, opts)
-	}
-	// Under a hard partition the mandatory ramp-up floor is balanced across
-	// NUMAs, so any asymmetric excess carried by the reclaim pool is stale
-	// advisor raw slack that must not be reclaimed. Eliminate it at the source,
-	// before the desired snapshot is frozen, so both the commit-override path
-	// and the pre-commit validation observe a strictly balanced reclaim domain.
-	if opts.HardPartitionEnabled {
-		rebalanceHardPartitionReclaimEffective(view, topology)
+		// Hard-partition reclaim is already materialized and validated by QRM.
+		// Bulkhead only projects that ownership; it must not trim legal reclaim
+		// to satisfy its independent non-reclaim padding preference.
+		if !opts.HardPartitionEnabled {
+			padNonReclaimPoolToMinSize(view, topology, opts)
+		}
 	}
 	view.DesiredNonReclaimPool = view.NonReclaimPool.Clone()
 	view.DesiredReclaimEffective = view.ReclaimEffective.Clone()
@@ -219,12 +255,16 @@ func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CP
 }
 
 func BuildValidatedCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CPUTopology, opts CPUSetPartitionViewOptions) (*model.DesiredView, error) {
+	if opts.HardPartitionTargetError != nil {
+		return nil, opts.HardPartitionTargetError
+	}
 	view := BuildCPUSetPartitionView(state, topology, opts)
 	if err := ValidateCPUSetPartitionView(view, topology); err != nil {
 		return nil, err
 	}
 	if opts.HardPartitionEnabled {
-		if err := validateHardPartitionReclaimPerNUMA(view.ReclaimEffectivePerNUMA, topology); err != nil {
+		if err := validateHardPartitionReclaimPerNUMA(
+			view.ReclaimEffectivePerNUMA, opts.HardPartitionReclaimTargetPerNUMA, topology); err != nil {
 			return nil, err
 		}
 	}
@@ -233,27 +273,22 @@ func BuildValidatedCPUSetPartitionView(state cpustate.ReadonlyState, topology *m
 
 func validateHardPartitionReclaimPerNUMA(
 	reclaimPerNUMA map[int]machine.CPUSet,
+	targetPerNUMA map[int]int,
 	topology *machine.CPUTopology,
 ) error {
 	if topology == nil {
 		return nil
 	}
 
-	minimum, maximum := 0, 0
-	for i, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
+	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
+		target, ok := targetPerNUMA[numaID]
+		if !ok {
+			return fmt.Errorf("bulkhead hard-partition reclaim target missing for NUMA %d", numaID)
+		}
 		count := reclaimPerNUMA[numaID].Size()
-		if count < minimumHardPartitionReclaimCPUsPerNUMA {
-			return fmt.Errorf("bulkhead hard-partition reclaim NUMA %d has %d CPUs, minimum is %d", numaID, count, minimumHardPartitionReclaimCPUsPerNUMA)
+		if count < target {
+			return fmt.Errorf("bulkhead hard-partition reclaim NUMA %d has %d CPUs, target is %d", numaID, count, target)
 		}
-		if i == 0 || count < minimum {
-			minimum = count
-		}
-		if i == 0 || count > maximum {
-			maximum = count
-		}
-	}
-	if maximum-minimum > 1 {
-		return fmt.Errorf("bulkhead hard-partition reclaim is imbalanced across physical NUMAs: max=%d min=%d", maximum, minimum)
 	}
 	return nil
 }
@@ -429,68 +464,6 @@ func takeCPUsByNUMABalanceWithSeed(topology *machine.CPUTopology, candidates, se
 		currentCountByNUMA[selectedNUMA]++
 	}
 	return result
-}
-
-// rebalanceHardPartitionReclaimEffective removes asymmetric advisor raw slack
-// from the effective reclaim domain so hard-partition reclaim stays balanced
-// across physical NUMAs. The mandatory ramp-up floor is distributed evenly by
-// the global target, therefore any NUMA carrying more than the global minimum
-// per-NUMA count is holding stale raw slack. Those extra (highest-ID) CPUs are
-// moved back to the non-reclaim domain, which both eliminates the slack and
-// keeps the two domains mutually exclusive. NUMAs that already sit at or below
-// the minimum are never shrunk, so a structurally under-provisioned NUMA is
-// still surfaced by validateHardPartitionReclaimPerNUMA rather than masked.
-func rebalanceHardPartitionReclaimEffective(view *model.DesiredView, topology *machine.CPUTopology) {
-	if view == nil || topology == nil {
-		return
-	}
-	numaIDs := topology.CPUDetails.NUMANodes().ToSliceInt()
-	if len(numaIDs) == 0 {
-		return
-	}
-
-	minCount := -1
-	countByNUMA := make(map[int]int, len(numaIDs))
-	for _, numaID := range numaIDs {
-		count := view.ReclaimEffective.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID)).Size()
-		countByNUMA[numaID] = count
-		if minCount == -1 || count < minCount {
-			minCount = count
-		}
-	}
-	if minCount <= 0 {
-		return
-	}
-	// A minimum below the hard floor means the partition is structurally
-	// under-provisioned, not merely carrying slack. Trimming toward a broken
-	// minimum would destroy valid reclaim CPUs and mask the real defect, so
-	// leave the raw shape untouched and let validateHardPartitionReclaimPerNUMA
-	// report the offending NUMA with its stable per-NUMA diagnostic.
-	if minCount < minimumHardPartitionReclaimCPUsPerNUMA {
-		return
-	}
-
-	trimmed := machine.NewCPUSet()
-	for _, numaID := range numaIDs {
-		excess := countByNUMA[numaID] - minCount
-		if excess <= 0 {
-			continue
-		}
-		numaReclaim := view.ReclaimEffective.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
-		// Trim the highest-ID CPUs first so the retained floor is deterministic
-		// and matches the ascending selection used elsewhere in the view.
-		for _, cpu := range numaReclaim.ToSliceIntReversely()[:excess] {
-			trimmed.Add(cpu)
-		}
-	}
-	if trimmed.IsEmpty() {
-		return
-	}
-
-	view.ReclaimEffective = view.ReclaimEffective.Difference(trimmed)
-	available := topology.CPUDetails.CPUs().Difference(view.Reserve)
-	view.NonReclaimPool = available.Difference(view.ReclaimEffective)
-	rebuildReclaimEffectivePerNUMA(view, topology)
 }
 
 func rebuildReclaimEffectivePerNUMA(view *model.DesiredView, topology *machine.CPUTopology) {

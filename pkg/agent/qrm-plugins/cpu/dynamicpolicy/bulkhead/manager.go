@@ -389,7 +389,7 @@ func staleGenerationError() *NonConvergedError {
 }
 
 func (m *Manager) cpuSetPartitionViewOptions(in cpusetutil.CPUSetAdjustmentHandlerCtx) bulkheadutils.CPUSetPartitionViewOptions {
-	opts := bulkheadutils.NewCPUSetPartitionViewOptions(in.CoreConf, in.DynamicConf)
+	opts := bulkheadutils.NewCPUSetPartitionViewOptions(in.CoreConf, in.DynamicConf, in.Topology)
 	if opts.NonReclaimPoolMinSize <= 0 {
 		opts.NonReclaimPoolMinSize = m.defaultNonReclaimPoolMinSize
 	}
