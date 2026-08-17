@@ -2318,7 +2318,13 @@ func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommit(
 			if ai == nil {
 				continue
 			}
-			if !ai.CheckReclaimed() {
+			// system_cores containers are never part of the non-reclaim
+			// partition: bulkhead's BuildCPUSetPartitionView never folds them
+			// into NonReclaimPool, so they may legally overlap the reclaim pool
+			// (e.g. when a missing specified pool triggers whole-machine
+			// fallback). Exclude them here to keep this always-on invariant
+			// consistent with the bulkhead partition view.
+			if !ai.CheckReclaimed() && !ai.CheckSystem() {
 				nonReclaim = nonReclaim.Union(ai.AllocationResult)
 			}
 		}
