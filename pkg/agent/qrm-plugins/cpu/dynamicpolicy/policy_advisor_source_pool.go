@@ -422,11 +422,16 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhase(
 		ordinalByStableKey[stableKey] = ordinal + 1
 		demandKey := fmt.Sprintf("%s\x00%d", stableKey, ordinal)
 		requestQuantity := float64(descriptor.Quantity)
+		requestGroupKey := demandKey
 		if class == advisorBlockClassDedicated {
 			requestQuantity = p.advisorDescriptorRequestQuantity(descriptor)
+			owners := append([]string(nil), descriptor.Owners...)
+			sort.Strings(owners)
+			requestGroupKey = strings.Join(owners, "\x1f")
 		}
 		demands = append(demands, partitionDemand{
 			key:             demandKey,
+			requestGroupKey: requestGroupKey,
 			quantity:        descriptor.Quantity,
 			requestQuantity: requestQuantity,
 			eligible:        descriptor.Eligible.Intersection(available),

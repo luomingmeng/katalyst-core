@@ -19,6 +19,7 @@ package machine
 import (
 	"fmt"
 	"math"
+	"sort"
 )
 
 // CalculatePerNUMAHardReclaimTarget derives a stable reclaim target from the
@@ -43,4 +44,45 @@ func CalculatePerNUMAHardReclaimTarget(capacity int, ratio float64, minimum, con
 		return 0, fmt.Errorf("hard reclaim target %d exceeds NUMA capacity %d", target, capacity)
 	}
 	return target, nil
+}
+
+// DistributeConfiguredHardReclaimFloor raises per-NUMA baseline targets until
+// the configured global floor is met, without exceeding any NUMA capacity.
+func DistributeConfiguredHardReclaimFloor(
+	capacityByNUMA, baselineByNUMA map[int]int,
+	configuredFloor int,
+) (map[int]int, error) {
+	numaIDs := make([]int, 0, len(capacityByNUMA))
+	targets := make(map[int]int, len(capacityByNUMA))
+	totalTarget, totalCapacity := 0, 0
+	for numaID, capacity := range capacityByNUMA {
+		if capacity < 0 {
+			return nil, fmt.Errorf("NUMA %d has negative capacity %d", numaID, capacity)
+		}
+		baseline := baselineByNUMA[numaID]
+		if baseline < 0 || baseline > capacity {
+			return nil, fmt.Errorf("NUMA %d hard reclaim baseline %d exceeds capacity %d", numaID, baseline, capacity)
+		}
+		numaIDs = append(numaIDs, numaID)
+		targets[numaID] = baseline
+		totalTarget += baseline
+		totalCapacity += capacity
+	}
+	sort.Ints(numaIDs)
+	required := configuredFloor
+	if required < totalTarget {
+		required = totalTarget
+	}
+	if required > totalCapacity {
+		return nil, fmt.Errorf("configured hard reclaim floor %d exceeds total NUMA capacity %d", required, totalCapacity)
+	}
+	for remaining, index := required-totalTarget, 0; remaining > 0; index++ {
+		numaID := numaIDs[index%len(numaIDs)]
+		if targets[numaID] >= capacityByNUMA[numaID] {
+			continue
+		}
+		targets[numaID]++
+		remaining--
+	}
+	return targets, nil
 }

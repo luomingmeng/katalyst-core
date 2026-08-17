@@ -100,6 +100,21 @@ func rampUpDeadlineReached(initTime time.Time, transitionPeriod time.Duration, n
 	return !now.Before(initTime.Add(transitionPeriod))
 }
 
+func shouldAllocationFinishRampUp(
+	allocationInfo *state.AllocationInfo,
+	transitionPeriod time.Duration,
+	now time.Time,
+) (bool, error) {
+	if allocationInfo == nil || !allocationInfo.RampUp {
+		return false, nil
+	}
+	initTime, err := time.Parse(util.QRMTimeFormat, allocationInfo.InitTimestamp)
+	if err != nil {
+		return false, err
+	}
+	return rampUpDeadlineReached(initTime, transitionPeriod, now), nil
+}
+
 // AllocationHook is a hook function which can be registered and called when allocationInfo changes.
 // It is designed to intercept state updates and perform actions like injecting or updating annotations
 // (e.g., NUMA topology information) based on the differences between old and new allocation info.
@@ -851,7 +866,7 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 				}
 			}
 
-			initTs, tsErr := time.Parse(util.QRMTimeFormat, allocationInfo.InitTimestamp)
+			_, tsErr := time.Parse(util.QRMTimeFormat, allocationInfo.InitTimestamp)
 			if tsErr != nil {
 				if allocationInfo.CheckShared() && !allocationInfo.CheckNUMABinding() {
 					general.Errorf("pod: %s/%s, container: %s init timestamp parsed failed with error: %v, re-ramp-up it",
@@ -882,17 +897,18 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 					general.Errorf("updateAllocationInfo failed for pod: %s/%s, container: %s: %v",
 						allocationInfo.PodNamespace, allocationInfo.PodName, containerName, err)
 				}
-			} else if allocationInfo.RampUp && rampUpDeadlineReached(initTs, p.transitionPeriod, time.Now()) {
+			} else if finishRampUp, _ := shouldAllocationFinishRampUp(allocationInfo, p.transitionPeriod, time.Now()); finishRampUp {
 				general.Infof("pod: %s/%s, container: %s ramp up finished", allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName)
 				allocationInfo.RampUp = false
+				if allocationInfo.CheckShared() {
+					p.state.SetAllocationInfo(podUID, containerName, allocationInfo, false)
+					allocationInfosJustFinishRampUp = append(allocationInfosJustFinishRampUp, allocationInfo)
+					continue
+				}
 				if err := p.updateAllocationInfo(podUID, containerName, originAllocationInfo, allocationInfo, true); err != nil {
 					general.Errorf("updateAllocationInfo failed for pod: %s/%s, container: %s: %v",
 						allocationInfo.PodNamespace, allocationInfo.PodName, containerName, err)
 					continue
-				}
-
-				if allocationInfo.CheckShared() {
-					allocationInfosJustFinishRampUp = append(allocationInfosJustFinishRampUp, allocationInfo)
 				}
 			}
 
@@ -901,6 +917,16 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 
 	if len(allocationInfosJustFinishRampUp) > 0 {
 		if err := p.putAllocationsAndAdjustAllocationEntries(allocationInfosJustFinishRampUp, true, true); err != nil {
+			for _, allocationInfo := range allocationInfosJustFinishRampUp {
+				current := p.state.GetAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName)
+				if current != nil && !current.RampUp &&
+					current.OwnerPoolName != commonstate.EmptyOwnerPoolName {
+					continue
+				}
+				allocationInfo = allocationInfo.Clone()
+				allocationInfo.RampUp = true
+				p.state.SetAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, allocationInfo, false)
+			}
 			// not influencing return response to kubelet when putAllocationsAndAdjustAllocationEntries failed
 			general.Errorf("putAllocationsAndAdjustAllocationEntries failed with error: %v", err)
 		}

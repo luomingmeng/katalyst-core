@@ -27,6 +27,7 @@ import (
 
 type partitionDemand struct {
 	key             string
+	requestGroupKey string
 	quantity        int
 	requestQuantity float64
 	eligible        machine.CPUSet

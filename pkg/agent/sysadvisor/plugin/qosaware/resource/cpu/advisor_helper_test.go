@@ -233,10 +233,10 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimUsesHardPartitionRatio(t *tes
 			wantReserved:      map[int]int{0: 4, 1: 4},
 		},
 		{
-			name:              "odd configured reserve follows static distribution",
+			name:              "odd configured reserve preserves the full configured floor",
 			ratio:             0,
 			configuredReserve: resource.MustParse("5"),
-			wantReserved:      map[int]int{0: 2, 1: 2},
+			wantReserved:      map[int]int{0: 3, 1: 2},
 		},
 		{
 			name:              "larger ratio wins over static reserve",
@@ -280,6 +280,35 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimUsesHardPartitionRatio(t *tes
 			assert.Equal(t, tt.wantReserved, cra.reservedForReclaim)
 		})
 	}
+}
+
+func TestCPUResourceAdvisorUpdateReservedForReclaimRejectsConfiguredFloorAboveCapacity(t *testing.T) {
+	t.Parallel()
+
+	conf := generateTestConfiguration(t, t.TempDir(), t.TempDir())
+	dynamicConf := conf.GetDynamicConfiguration()
+	dynamicConf.EnableReclaim = true
+	dynamicConf.EnableRampUpReclaimHardPartition = true
+	dynamicConf.InitialRampUpReclaimCPUSetRatio = 0.2
+	dynamicConf.MinReclaimedResourceForAllocate = v1.ResourceList{
+		v1.ResourceCPU: resource.MustParse("17"),
+	}
+	topology, err := machine.GenerateDummyCPUTopology(16, 1, 2)
+	require.NoError(t, err)
+	advisor := &cpuResourceAdvisor{
+		conf: conf,
+		metaServer: &metaserver.MetaServer{
+			MetaAgent: &agent.MetaAgent{
+				KatalystMachineInfo: &machine.KatalystMachineInfo{
+					CPUTopology: topology,
+				},
+			},
+		},
+	}
+
+	err = advisor.updateReservedForReclaim()
+
+	require.ErrorContains(t, err, "configured hard reclaim floor 17 exceeds total NUMA capacity 16")
 }
 
 func TestCPUResourceAdvisorUpdateReservedForReclaimUsesImmutableNUMACapacity(t *testing.T) {

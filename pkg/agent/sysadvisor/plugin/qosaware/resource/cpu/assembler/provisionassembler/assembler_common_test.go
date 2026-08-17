@@ -1922,6 +1922,33 @@ func TestAssembleProvisionPublishesHardReclaimFloorForEveryPhysicalNUMAWithoutRe
 	require.Equal(t, types.CPUResource{Size: 6, Quota: -1}, result.PoolEntries[commonstate.PoolNameReclaim][1])
 }
 
+func TestAssembleProvisionDoesNotRepublishPhysicalHardReclaimFloorsAtFakedNUMA(t *testing.T) {
+	t.Parallel()
+
+	conf := generateTestConf(t, true, "")
+	conf.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	regionMap := map[string]region.QoSRegion{}
+	reservedForReclaim := map[int]int{0: 4, 1: 6}
+	numaAvailable := map[int]int{0: 24, 1: 32}
+	nonBindingNUMAs := machine.NewCPUSet(0, 1)
+	allowSharedOverlap := false
+	disableDedicatedOverlap := true
+	metaReader := metacache.NewDummyMetaCacheImp()
+	require.NoError(t, metaReader.SetResourcePackageConfig(types.ResourcePackageConfig{}))
+
+	assembler := NewProvisionAssemblerCommon(
+		conf, nil, &regionMap, &reservedForReclaim, &numaAvailable, &nonBindingNUMAs,
+		&allowSharedOverlap, &disableDedicatedOverlap, metaReader, nil, metrics.DummyMetrics{},
+	)
+	result, err := assembler.AssembleProvision()
+	require.NoError(t, err)
+	require.Equal(t, map[int]types.CPUResource{
+		commonstate.FakedNUMAID: {Size: 46, Quota: -1},
+		0:                       {Size: 4, Quota: -1},
+		1:                       {Size: 6, Quota: -1},
+	}, result.PoolEntries[commonstate.PoolNameReclaim])
+}
+
 func TestAssembleWithoutNUMAExclusivePoolAddsDedicatedExcessAboveHardReclaimFloor(t *testing.T) {
 	t.Parallel()
 

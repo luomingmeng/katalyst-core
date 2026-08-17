@@ -21,11 +21,13 @@ import (
 	"math"
 	"sort"
 
+	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
 type hardReclaimPartitionDonor struct {
 	key             string
+	groupKey        string
 	cpus            machine.CPUSet
 	requestQuantity float64
 }
@@ -55,6 +57,9 @@ func planHardReclaimPartition(in hardReclaimPartitionInput) (*hardReclaimPartiti
 	}
 	donorByKey := make(map[string]hardReclaimPartitionDonor, len(in.donors))
 	donorKeys := make([]string, 0, len(in.donors))
+	donorGroupByKey := make(map[string]string, len(in.donors))
+	groupMinimum := make(map[string]int)
+	groupDonorKeys := make(map[string][]string)
 	allDonorCPUs := machine.NewCPUSet()
 	for _, donor := range in.donors {
 		if donor.key == "" {
@@ -67,7 +72,14 @@ func planHardReclaimPartition(in hardReclaimPartitionInput) (*hardReclaimPartiti
 			return nil, fmt.Errorf("hard reclaim partition donor %q has invalid request quantity %v",
 				donor.key, donor.requestQuantity)
 		}
+		groupKey := donor.groupKey
+		if groupKey == "" {
+			groupKey = donor.key
+		}
 		donorByKey[donor.key] = donor
+		donorGroupByKey[donor.key] = groupKey
+		groupDonorKeys[groupKey] = append(groupDonorKeys[groupKey], donor.key)
+		groupMinimum[groupKey] = general.Max(groupMinimum[groupKey], int(math.Ceil(donor.requestQuantity)))
 		donorKeys = append(donorKeys, donor.key)
 		plan.donorCPUs[donor.key] = donor.cpus.Clone()
 		allDonorCPUs = allDonorCPUs.Union(donor.cpus)
@@ -111,10 +123,13 @@ func planHardReclaimPartition(in hardReclaimPartitionInput) (*hardReclaimPartiti
 			if need == 0 {
 				break
 			}
-			donor := donorByKey[key]
 			remainingDonor := plan.donorCPUs[key]
-			minimum := int(math.Ceil(donor.requestQuantity))
-			excess := remainingDonor.Size() - minimum
+			groupKey := donorGroupByKey[key]
+			groupRemaining := 0
+			for _, groupDonorKey := range groupDonorKeys[groupKey] {
+				groupRemaining += plan.donorCPUs[groupDonorKey].Size()
+			}
+			excess := groupRemaining - groupMinimum[groupKey]
 			if excess <= 0 {
 				continue
 			}
@@ -172,6 +187,7 @@ func pinHardReclaimPartitionDemands(
 			}
 			donors = append(donors, hardReclaimPartitionDonor{
 				key:             demand.key,
+				groupKey:        demand.requestGroupKey,
 				cpus:            demand.preferred,
 				requestQuantity: requestQuantity,
 			})
