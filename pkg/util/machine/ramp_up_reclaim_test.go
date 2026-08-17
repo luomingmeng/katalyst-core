@@ -132,3 +132,18 @@ func TestCalculatePerNUMAHardReclaimTarget(t *testing.T) {
 		})
 	}
 }
+
+func TestDistributeConfiguredHardReclaimFloorRespectsNUMACapacity(t *testing.T) {
+	t.Parallel()
+
+	got, err := DistributeConfiguredHardReclaimFloor(
+		map[int]int{0: 24, 1: 32},
+		map[int]int{0: 2, 1: 2},
+		50,
+	)
+	require.NoError(t, err)
+	require.Equal(t, 50, got[0]+got[1])
+	require.LessOrEqual(t, got[0], 24)
+	require.LessOrEqual(t, got[1], 32)
+	require.Equal(t, map[int]int{0: 24, 1: 26}, got)
+}

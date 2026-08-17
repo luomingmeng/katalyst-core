@@ -182,3 +182,29 @@ func TestPlanHardReclaimPartitionChecksRequestFloorForLegacyOverlappingReclaim(t
 
 	require.ErrorContains(t, err, "NUMA 0 needs 1 more reclaim CPUs")
 }
+
+func TestPlanHardReclaimPartitionSharesRequestFloorAcrossNUMADonors(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(64, 1, 2)
+	require.NoError(t, err)
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	numa1 := topology.CPUDetails.CPUsInNUMANodes(1)
+	donor0 := machine.NewCPUSet(numa0.ToSliceInt()[:6]...)
+	donor1 := machine.NewCPUSet(numa1.ToSliceInt()[:6]...)
+
+	plan, err := planHardReclaimPartition(hardReclaimPartitionInput{
+		topology:        topology,
+		targetByNUMA:    map[int]int{0: 2, 1: 2},
+		reclaimEligible: numa0.Union(numa1),
+		donors: []hardReclaimPartitionDonor{
+			{key: "dnb-numa0", groupKey: "pod/main", cpus: donor0, requestQuantity: 8},
+			{key: "dnb-numa1", groupKey: "pod/main", cpus: donor1, requestQuantity: 8},
+		},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, 2, plan.reclaim.Intersection(numa0).Size())
+	require.Equal(t, 2, plan.reclaim.Intersection(numa1).Size())
+	require.Equal(t, 8, plan.donorCPUs["dnb-numa0"].Size()+plan.donorCPUs["dnb-numa1"].Size())
+}

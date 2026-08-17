@@ -6951,14 +6951,48 @@ func TestGetResourcesAllocation(t *testing.T) {
 	as.Equal(6, reclaimEntry.AllocationResult.Size()) // ceil("14 * (4 / 10)") == 6
 }
 
-func TestRampUpDeadlineIsSharedBySNBAndNonSNB(t *testing.T) {
+func TestRampUpDeadlineIsSharedByAllQoSPaths(t *testing.T) {
 	t.Parallel()
 
 	initTime := time.Unix(100, 0)
-	for _, qos := range []string{"snb", "non-snb"} {
-		t.Run(qos, func(t *testing.T) {
-			require.False(t, rampUpDeadlineReached(initTime, 30*time.Second, initTime.Add(29*time.Second)))
-			require.True(t, rampUpDeadlineReached(initTime, 30*time.Second, initTime.Add(30*time.Second)))
+	for _, tc := range []struct {
+		name string
+		info *state.AllocationInfo
+	}{
+		{
+			name: "non-snb",
+			info: &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{QoSLevel: consts.PodAnnotationQoSLevelSharedCores},
+			},
+		},
+		{
+			name: "snb",
+			info: &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					QoSLevel: consts.PodAnnotationQoSLevelSharedCores,
+					Annotations: map[string]string{
+						consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+					},
+				},
+			},
+		},
+		{
+			name: "dedicated",
+			info: &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{QoSLevel: consts.PodAnnotationQoSLevelDedicatedCores},
+			},
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			tc.info.RampUp = true
+			tc.info.InitTimestamp = initTime.Format(util.QRMTimeFormat)
+			finished, err := shouldAllocationFinishRampUp(tc.info, rampUpTransitionPeriod, initTime.Add(29*time.Second))
+			require.NoError(t, err)
+			require.False(t, finished)
+			finished, err = shouldAllocationFinishRampUp(tc.info, rampUpTransitionPeriod, initTime.Add(30*time.Second))
+			require.NoError(t, err)
+			require.True(t, finished)
 		})
 	}
 }
@@ -7542,6 +7576,78 @@ func TestAllocateSNBRampUpAllowsGlobalSharePoolToShrink(t *testing.T) {
 	share := p.state.GetAllocationInfo(commonstate.PoolNameShare, commonstate.FakedContainerName)
 	require.NotNil(t, share)
 	require.Less(t, share.AllocationResult.Size(), allocationCPUs.Size())
+}
+
+func TestGetResourcesAllocationRetriesFailedRampUpCompletion(t *testing.T) {
+	as := require.New(t)
+	tmpDir, err := ioutil.TempDir("", "checkpoint-TestGetResourcesAllocationRetriesFailedRampUpCompletion")
+	as.NoError(err)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	as.NoError(err)
+	dynamicPolicy, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
+	as.NoError(err)
+	dynamicPolicy.transitionPeriod = 30 * time.Second
+
+	req := &pluginapi.ResourceRequest{
+		PodUid:         string(uuid.NewUUID()),
+		PodNamespace:   "test",
+		PodName:        "test",
+		ContainerName:  "test",
+		ContainerType:  pluginapi.ContainerType_MAIN,
+		ContainerIndex: 0,
+		ResourceName:   string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{
+			string(v1.ResourceCPU): 2,
+		},
+		Labels: map[string]string{
+			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+		},
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+		},
+	}
+	_, err = dynamicPolicy.Allocate(context.Background(), req)
+	as.NoError(err)
+
+	allocationInfo := dynamicPolicy.state.GetAllocationInfo(req.PodUid, req.ContainerName)
+	as.True(allocationInfo.RampUp)
+	allocationInfo.InitTimestamp = time.Now().Add(-31 * time.Second).Format(util.QRMTimeFormat)
+	dynamicPolicy.state.SetAllocationInfo(req.PodUid, req.ContainerName, allocationInfo, true)
+
+	dynamicPolicy.allocationHooks = []AllocationHook{
+		func(_, newAllocationInfo *state.AllocationInfo) error {
+			if newAllocationInfo != nil && !newAllocationInfo.RampUp &&
+				newAllocationInfo.OwnerPoolName != commonstate.EmptyOwnerPoolName {
+				return fmt.Errorf("force allocation adjustment failure")
+			}
+			return nil
+		},
+	}
+	_, err = dynamicPolicy.GetResourcesAllocation(context.Background(), &pluginapi.GetResourcesAllocationRequest{})
+	as.NoError(err)
+	as.True(dynamicPolicy.state.GetAllocationInfo(req.PodUid, req.ContainerName).RampUp)
+	restartedPolicy, err := getTestDynamicPolicyWithoutInitialization(cpuTopology, tmpDir)
+	as.NoError(err)
+	as.True(restartedPolicy.state.GetAllocationInfo(req.PodUid, req.ContainerName).RampUp)
+	state.SetReadonlyState(dynamicPolicy.state)
+	state.SetReadWriteState(dynamicPolicy.state)
+
+	dynamicPolicy.allocationHooks = nil
+	dynamicPolicy.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+		"failing": func(context.Context, dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
+			return fmt.Errorf("force post-commit adjustment failure")
+		},
+	}
+	_, err = dynamicPolicy.GetResourcesAllocation(context.Background(), &pluginapi.GetResourcesAllocationRequest{})
+	as.NoError(err)
+	as.False(dynamicPolicy.state.GetAllocationInfo(req.PodUid, req.ContainerName).RampUp)
+	restartedPolicy, err = getTestDynamicPolicyWithoutInitialization(cpuTopology, tmpDir)
+	as.NoError(err)
+	as.False(restartedPolicy.state.GetAllocationInfo(req.PodUid, req.ContainerName).RampUp)
+	state.SetReadonlyState(dynamicPolicy.state)
+	state.SetReadWriteState(dynamicPolicy.state)
 }
 
 func TestAllocateByQoSAwareServerListAndWatchResp(t *testing.T) {

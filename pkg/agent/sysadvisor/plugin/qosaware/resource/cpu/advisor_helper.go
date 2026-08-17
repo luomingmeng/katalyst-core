@@ -223,23 +223,28 @@ func (cra *cpuResourceAdvisor) updateReservedForReclaim() error {
 	if dynamicConf.EnableReclaim && dynamicConf.EnableRampUpReclaimHardPartition {
 		configuredReserveQuantity := dynamicConf.MinReclaimedResourceForAllocate[v1.ResourceCPU]
 		configuredReserve := int(configuredReserveQuantity.Value())
-		configuredReserve = general.Min(configuredReserve, cra.metaServer.NumCPUs)
 		configuredReserve = hardPartitionMinimumReclaimCores(configuredReserve, cra.metaServer.NumNUMANodes)
-		configuredByNUMA := machine.GetCoreNumReservedForReclaim(configuredReserve, cra.metaServer.NumNUMANodes)
 
-		reservedForReclaim := make(map[int]int, cra.metaServer.NumNUMANodes)
+		capacityByNUMA := make(map[int]int, cra.metaServer.NumNUMANodes)
+		baselineByNUMA := make(map[int]int, cra.metaServer.NumNUMANodes)
 		for numaID := 0; numaID < cra.metaServer.NumNUMANodes; numaID++ {
 			capacity := cra.metaServer.NUMAToCPUs.CPUSizeInNUMAs(numaID)
+			capacityByNUMA[numaID] = capacity
 			target, err := machine.CalculatePerNUMAHardReclaimTarget(
 				capacity,
 				dynamicConf.InitialRampUpReclaimCPUSetRatio,
 				2,
-				configuredByNUMA[numaID],
+				0,
 			)
 			if err != nil {
 				return fmt.Errorf("calculate hard reclaim target for NUMA %d: %w", numaID, err)
 			}
-			reservedForReclaim[numaID] = target
+			baselineByNUMA[numaID] = target
+		}
+		reservedForReclaim, err := machine.DistributeConfiguredHardReclaimFloor(
+			capacityByNUMA, baselineByNUMA, configuredReserve)
+		if err != nil {
+			return fmt.Errorf("distribute configured hard reclaim floor: %w", err)
 		}
 		cra.reservedForReclaim = reservedForReclaim
 		general.Infof("reservedForReclaim: %v, hard partition ratio %v, configured reserve %v",

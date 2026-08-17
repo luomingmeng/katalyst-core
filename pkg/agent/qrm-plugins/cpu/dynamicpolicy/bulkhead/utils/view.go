@@ -63,29 +63,32 @@ func NewCPUSetPartitionViewOptions(
 		if quantity, ok := dynamicConf.MinReclaimedResourceForAllocate[v1.ResourceCPU]; ok {
 			configuredFloor = int(quantity.Value())
 		}
-		configuredReserveByNUMA := make(map[int]int, len(numaIDs))
-		totalConfiguredBaseline := 0
-		for _, numaID := range numaIDs {
-			configuredReserveByNUMA[numaID] = minimumHardPartitionReclaimCPUsPerNUMA
-			totalConfiguredBaseline += minimumHardPartitionReclaimCPUsPerNUMA
-		}
-		for remaining, index := configuredFloor-totalConfiguredBaseline, 0; remaining > 0 && len(numaIDs) > 0; remaining, index = remaining-1, index+1 {
-			configuredReserveByNUMA[numaIDs[index%len(numaIDs)]]++
-		}
+		capacityByNUMA := make(map[int]int, len(numaIDs))
+		baselineByNUMA := make(map[int]int, len(numaIDs))
 		for _, numaID := range numaIDs {
 			capacity := topology.CPUDetails.CPUsInNUMANodes(numaID).Size()
+			capacityByNUMA[numaID] = capacity
 			target, err := machine.CalculatePerNUMAHardReclaimTarget(
 				capacity,
 				ratio,
 				minimumHardPartitionReclaimCPUsPerNUMA,
-				configuredReserveByNUMA[numaID],
+				0,
 			)
 			if err != nil {
 				opts.HardPartitionTargetError = fmt.Errorf(
 					"calculate hard-partition reclaim target for NUMA %d: %w", numaID, err)
 				break
 			}
-			opts.HardPartitionReclaimTargetPerNUMA[numaID] = target
+			baselineByNUMA[numaID] = target
+		}
+		if opts.HardPartitionTargetError == nil {
+			targets, err := machine.DistributeConfiguredHardReclaimFloor(
+				capacityByNUMA, baselineByNUMA, configuredFloor)
+			if err != nil {
+				opts.HardPartitionTargetError = fmt.Errorf("distribute configured hard-partition reclaim target: %w", err)
+			} else {
+				opts.HardPartitionReclaimTargetPerNUMA = targets
+			}
 		}
 	}
 	if coreConf != nil {

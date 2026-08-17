@@ -3513,24 +3513,23 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloorForMode(
 
 	targetByNUMA := make(map[int]int, len(numaIDs))
 	if immutablePerNUMA {
-		configuredReserveByNUMA := make(map[int]int, len(numaIDs))
-		totalConfiguredBaseline := 0
-		for _, numaID := range numaIDs {
-			configuredReserveByNUMA[numaID] = general.Max(
-				reservedFloorByNUMA[numaID].Size(), minimumHardReclaimCPUsPerNUMA)
-			totalConfiguredBaseline += configuredReserveByNUMA[numaID]
-		}
-		for remaining, index := configuredFloor-totalConfiguredBaseline, 0; remaining > 0 && len(numaIDs) > 0; remaining, index = remaining-1, index+1 {
-			configuredReserveByNUMA[numaIDs[index%len(numaIDs)]]++
-		}
+		capacityByNUMA := make(map[int]int, len(numaIDs))
+		baselineByNUMA := make(map[int]int, len(numaIDs))
 		for _, numaID := range numaIDs {
 			immutableCapacity := p.machineInfo.CPUDetails.CPUsInNUMANodes(numaID).Size()
+			capacityByNUMA[numaID] = immutableCapacity
 			target, err := machine.CalculatePerNUMAHardReclaimTarget(
-				immutableCapacity, ratio, minimumHardReclaimCPUsPerNUMA, configuredReserveByNUMA[numaID])
+				immutableCapacity, ratio, minimumHardReclaimCPUsPerNUMA, reservedFloorByNUMA[numaID].Size())
 			if err != nil {
 				return machine.NewCPUSet(), fmt.Errorf("derive ramp-up reclaim floor for NUMA %d: %w", numaID, err)
 			}
-			targetByNUMA[numaID] = target
+			baselineByNUMA[numaID] = target
+		}
+		var err error
+		targetByNUMA, err = machine.DistributeConfiguredHardReclaimFloor(
+			capacityByNUMA, baselineByNUMA, configuredFloor)
+		if err != nil {
+			return machine.NewCPUSet(), fmt.Errorf("distribute configured ramp-up reclaim floor: %w", err)
 		}
 	} else {
 		minimum := minimumHardReclaimCPUsPerNUMA * len(numaIDs)

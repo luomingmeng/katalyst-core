@@ -1203,6 +1203,9 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		reclaimPoolData.overlapAtoms...,
 	)
 	nonOverlapReclaimedCoresSize := general.Max(reclaimedCoresSize-overlapReclaimedCoresSize, 0)
+	if effectiveHard && numaID == commonstate.FakedNUMAID {
+		nonOverlapReclaimedCoresSize = general.Max(nonOverlapReclaimedCoresSize-reservedForReclaim, 0)
+	}
 	general.InfoS("reclaim pool calculation output",
 		"numaID", numaID,
 		"nodeEnableReclaim", nodeEnableReclaim,
