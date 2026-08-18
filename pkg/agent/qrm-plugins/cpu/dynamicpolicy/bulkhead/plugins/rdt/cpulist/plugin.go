@@ -18,6 +18,7 @@ package cpulist
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -28,6 +29,7 @@ import (
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	qrmresctrl "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/resctrl"
 	"github.com/kubewharf/katalyst-core/pkg/consts"
+	"github.com/kubewharf/katalyst-core/pkg/util/external/rdt"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	resctrlutil "github.com/kubewharf/katalyst-core/pkg/util/resctrl"
 )
@@ -55,9 +57,10 @@ type appliedTarget struct {
 }
 
 type CPUListPlugin struct {
-	config  *qrmresctrl.ResctrlConfig
-	manager CPUListManager
-	applied map[Clos]appliedTarget
+	config             *qrmresctrl.ResctrlConfig
+	manager            CPUListManager
+	capabilityProvider rdt.CATCapabilityProvider
+	applied            map[Clos]appliedTarget
 }
 
 func NewCPUListPlugin(conf *config.Configuration) bulkheadapi.Plugin {
@@ -68,17 +71,23 @@ func NewCPUListPlugin(conf *config.Configuration) bulkheadapi.Plugin {
 	return NewCPUListPluginWithManager(
 		resctrlConfig,
 		qrmresctrlmanager.NewCPUListManager(),
+		rdt.NewCATCapabilityProvider(),
 	)
 }
 
-func NewCPUListPluginWithManager(config *qrmresctrl.ResctrlConfig, manager CPUListManager) *CPUListPlugin {
+func NewCPUListPluginWithManager(config *qrmresctrl.ResctrlConfig, manager CPUListManager, providers ...rdt.CATCapabilityProvider) *CPUListPlugin {
 	if config == nil {
 		config = qrmresctrl.NewResctrlConfig()
 	}
+	capabilityProvider := rdt.NewCATCapabilityProvider()
+	if len(providers) > 0 {
+		capabilityProvider = providers[0]
+	}
 	return &CPUListPlugin{
-		config:  config,
-		manager: manager,
-		applied: make(map[Clos]appliedTarget),
+		config:             config,
+		manager:            manager,
+		capabilityProvider: capabilityProvider,
+		applied:            make(map[Clos]appliedTarget),
 	}
 }
 
@@ -89,6 +98,9 @@ func (p *CPUListPlugin) Enable(in bulkheadapi.HandlerContext) bool {
 }
 
 func (p *CPUListPlugin) CPUSetAdjustmentHandler(ctx context.Context, in bulkheadapi.HandlerContext) error {
+	if !catSupported(p.capabilityProvider) {
+		return nil
+	}
 	if p.manager == nil {
 		return nil
 	}
@@ -131,6 +143,9 @@ func (p *CPUListPlugin) CPUSetAdjustmentHandler(ctx context.Context, in bulkhead
 }
 
 func (p *CPUListPlugin) CPUSetAdjustmentDisabledHandler(ctx context.Context, _ bulkheadapi.HandlerContext) error {
+	if !catSupported(p.capabilityProvider) {
+		return nil
+	}
 	if p.manager == nil {
 		return nil
 	}
@@ -258,4 +273,15 @@ func enableCPUList(conf *dynamicconfig.Configuration) bool {
 		return false
 	}
 	return conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.EnableCPUList
+}
+
+func catSupported(capabilityProvider rdt.CATCapabilityProvider) bool {
+	if capabilityProvider == nil {
+		return false
+	}
+	capabilities, err := capabilityProvider.GetCATCapabilities()
+	if err != nil {
+		return !errors.Is(err, rdt.ErrCATUnsupported)
+	}
+	return len(capabilities) > 0
 }
