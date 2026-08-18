@@ -65,6 +65,233 @@ func TestDeriveAdvisorIsolationSourcePool(t *testing.T) {
 	require.Equal(t, commonstate.PoolNameShare, source)
 }
 
+func TestAdvisorIsolationDescriptorSourceDomain_PoolStyleOwnerFallsBackToPodEntry(t *testing.T) {
+	t.Parallel()
+
+	const isolationPool = commonstate.PoolNamePrefixIsolation + "-clos-a"
+
+	// isolation pools are never materialized as pool entries in QRM state; the
+	// real allocation lives under its owning pod UID / container, whose
+	// (unwrapped) owner pool name equals the isolation pool name.
+	entries := state.PodEntries{
+		"pod-a": state.ContainerEntries{
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-a",
+					ContainerName: "main",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+					OwnerPoolName: isolationPool,
+					Annotations:   map[string]string{},
+				},
+			},
+		},
+	}
+
+	// pool-style owner: poolName == entryName == isolation pool, subEntryName empty.
+	descriptor := advisorBlockDescriptor{
+		BlockID: "block-isolation",
+		Class:   advisorBlockClassShared,
+		NUMAID:  commonstate.FakedNUMAID,
+		Owners:  []string{canonicalAdvisorBlockOwner(isolationPool, isolationPool, "", "")},
+	}
+
+	domain, resolved, err := advisorIsolationDescriptorSourceDomain(descriptor, entries)
+	require.NoError(t, err)
+	require.True(t, resolved)
+	require.Equal(t, commonstate.PoolNameShare, domain.poolName)
+	require.Equal(t, "", domain.resourcePackageName)
+	require.Equal(t, commonstate.FakedNUMAID, domain.numaID)
+}
+
+// TestAdvisorIsolationDescriptorSourceDomain_OrphanOwnerSoftDegrades pins that an
+// isolation owner whose backing pod is no longer present in QRM state must not
+// hard-fail the whole advisor cycle. such orphan descriptors appear when a pod is
+// deleted but the advisor response still references its isolation block; neither
+// the direct pool-entry lookup nor the pod-style fallback finds a state allocation.
+// the legacy deriveAdvisorIsolationSourceDomain path soft-degrades these owners
+// (returns ok=false, skipped by the caller), so the descriptor path must align:
+// return resolved=false with no error so the caller skips the block instead of
+// aborting the entire getAdviceFromAdvisor loop.
+func TestAdvisorIsolationDescriptorSourceDomain_OrphanOwnerSoftDegrades(t *testing.T) {
+	t.Parallel()
+
+	const isolationPool = commonstate.PoolNamePrefixIsolation + "-clos-a"
+
+	// no state entry backs this isolation owner: the only container entry belongs
+	// to an unrelated share pod, so both the direct lookup and the pod-style
+	// fallback miss.
+	entries := state.PodEntries{
+		"pod-b": state.ContainerEntries{
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-b",
+					ContainerName: "main",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+					OwnerPoolName: commonstate.PoolNameShare,
+					Annotations:   map[string]string{},
+				},
+			},
+		},
+	}
+
+	descriptor := advisorBlockDescriptor{
+		BlockID: "block-orphan-isolation",
+		Class:   advisorBlockClassShared,
+		NUMAID:  commonstate.FakedNUMAID,
+		Owners:  []string{canonicalAdvisorBlockOwner(isolationPool, isolationPool, "", "")},
+	}
+
+	_, resolved, err := advisorIsolationDescriptorSourceDomain(descriptor, entries)
+	require.NoError(t, err)
+	require.False(t, resolved)
+}
+
+// TestAdvisorIsolationDescriptorSourceDomain_NoSourcePoolSoftDegrades pins that a
+// resolvable isolation owner whose backing allocation yields no derivable source
+// share pool must soft-degrade rather than hard-fail. this happens when the
+// resolved allocation is not a shared_cores pod (e.g. it flipped to dedicated_cores)
+// or its cpuset_pool enhancement maps to the empty pool, so deriveIsolationSource
+// SharePool returns ok=false. the legacy deriveAdvisorIsolationSourceDomain path
+// propagates that ok=false and the caller (allocateAdvisorSourceBlocksForCarve)
+// skips it via `if !ok { continue }`; the descriptor path must match by returning
+// resolved=false with no error, not by aborting the whole advisor cycle with a
+// "has no source pool" error.
+func TestAdvisorIsolationDescriptorSourceDomain_NoSourcePoolSoftDegrades(t *testing.T) {
+	t.Parallel()
+
+	const isolationPool = commonstate.PoolNamePrefixIsolation + "-clos-a"
+
+	// the isolation owner resolves to this pod entry (unwrapped owner pool ==
+	// isolationPool), but its QoSLevel is dedicated_cores, so phase-1
+	// deriveIsolationSourceSharePool returns ok=false (no source share pool).
+	entries := state.PodEntries{
+		"pod-a": state.ContainerEntries{
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-a",
+					ContainerName: "main",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+					OwnerPoolName: isolationPool,
+					Annotations:   map[string]string{},
+				},
+			},
+		},
+	}
+
+	descriptor := advisorBlockDescriptor{
+		BlockID: "block-no-source-pool",
+		Class:   advisorBlockClassShared,
+		NUMAID:  commonstate.FakedNUMAID,
+		Owners:  []string{canonicalAdvisorBlockOwner(isolationPool, isolationPool, "", "")},
+	}
+
+	_, resolved, err := advisorIsolationDescriptorSourceDomain(descriptor, entries)
+	require.NoError(t, err)
+	require.False(t, resolved)
+}
+
+// TestAdvisorIsolationDescriptorSourceDomain_MalformedOwnerHardFails pins that a
+// malformed owner string (a genuine encoding/logic bug, not an orphan) still
+// hard-fails, keeping the always-on invariant that we never silently swallow a
+// structurally broken descriptor.
+func TestAdvisorIsolationDescriptorSourceDomain_MalformedOwnerHardFails(t *testing.T) {
+	t.Parallel()
+
+	descriptor := advisorBlockDescriptor{
+		BlockID: "block-malformed",
+		Class:   advisorBlockClassShared,
+		NUMAID:  commonstate.FakedNUMAID,
+		Owners:  []string{"this-owner-has-no-null-separators"},
+	}
+
+	_, resolved, err := advisorIsolationDescriptorSourceDomain(descriptor, state.PodEntries{})
+	require.Error(t, err)
+	require.False(t, resolved)
+}
+
+// TestDeriveAdvisorIsolationSourcePool_PoolStyleOwnerFallsBackToPodEntry pins the
+// legacy fallback traversal: when the block owner entry is pool-style (EntryName is
+// the isolation pool itself, SubEntryName empty) the direct entries[EntryName]
+// [SubEntryName] lookup misses, and the source must still be resolved by scanning
+// pod-style container entries whose (unwrapped) owner pool matches. This branch is
+// the shared surface being extracted into resolveIsolationOwnerAllocation.
+func TestDeriveAdvisorIsolationSourcePool_PoolStyleOwnerFallsBackToPodEntry(t *testing.T) {
+	t.Parallel()
+
+	const isolationPool = commonstate.PoolNamePrefixIsolation + "-clos-a"
+
+	entries := state.PodEntries{
+		"pod-a": state.ContainerEntries{
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-a",
+					ContainerName: "main",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+					OwnerPoolName: isolationPool,
+					Annotations:   map[string]string{},
+				},
+			},
+		},
+	}
+	// pool-style block entry: EntryName == isolation pool, SubEntryName empty, so
+	// the direct lookup entries[isolationPool][""] misses and forces the fallback.
+	block := &advisorapi.BlockInfo{
+		Block: advisorapi.Block{BlockId: "block-isolation", Result: 2},
+		OwnerPoolEntryMap: map[string]advisorapi.BlockEntry{
+			isolationPool: {
+				EntryName:    isolationPool,
+				SubEntryName: commonstate.FakedContainerName,
+			},
+		},
+	}
+
+	source, ok := deriveAdvisorIsolationSourcePool(block, entries)
+	require.True(t, ok)
+	require.Equal(t, commonstate.PoolNameShare, source)
+}
+
+// TestDeriveAdvisorIsolationSourceDomain_ShareNUMABindingOwner pins the
+// share-numa-binding gating that only the legacy derivation carries: a
+// share-numa-binding owner pool must also resolve its backing allocation and derive
+// the numa-binding source pool. The refactor must preserve this legacy-only branch.
+func TestDeriveAdvisorIsolationSourceDomain_ShareNUMABindingOwner(t *testing.T) {
+	t.Parallel()
+
+	const numaID = 1
+	shareNUMABindingPool := commonstate.GetNUMAPoolName(commonstate.PoolNameShare, numaID)
+
+	entries := state.PodEntries{
+		"pod-a": state.ContainerEntries{
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-a",
+					ContainerName: "main",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+					OwnerPoolName: shareNUMABindingPool,
+					Annotations: map[string]string{
+						apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+						cpuconsts.CPUStateAnnotationKeyNUMAHint:             "1",
+					},
+				},
+			},
+		},
+	}
+	block := &advisorapi.BlockInfo{
+		Block: advisorapi.Block{BlockId: "block-share-numa", Result: 2},
+		OwnerPoolEntryMap: map[string]advisorapi.BlockEntry{
+			shareNUMABindingPool: {
+				EntryName:    "pod-a",
+				SubEntryName: "main",
+			},
+		},
+	}
+
+	source, resourcePackageName, ok := deriveAdvisorIsolationSourceDomain(block, entries)
+	require.True(t, ok)
+	require.Equal(t, shareNUMABindingPool, source)
+	require.Equal(t, "", resourcePackageName)
+}
+
 func TestDynamicPolicy_tryCarveAdvisorBlockFromSource(t *testing.T) {
 	t.Parallel()
 
