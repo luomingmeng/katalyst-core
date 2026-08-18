@@ -63,7 +63,7 @@ type fakePlugin struct {
 
 type capturedMetric struct {
 	key      string
-	val      int64
+	val      float64
 	emitType metrics.MetricTypeName
 	tags     []metrics.MetricTag
 }
@@ -75,14 +75,20 @@ type capturingEmitter struct {
 func (e *capturingEmitter) StoreInt64(key string, val int64, emitType metrics.MetricTypeName, tags ...metrics.MetricTag) error {
 	e.records = append(e.records, capturedMetric{
 		key:      key,
-		val:      val,
+		val:      float64(val),
 		emitType: emitType,
 		tags:     append([]metrics.MetricTag(nil), tags...),
 	})
 	return nil
 }
 
-func (e *capturingEmitter) StoreFloat64(string, float64, metrics.MetricTypeName, ...metrics.MetricTag) error {
+func (e *capturingEmitter) StoreFloat64(key string, val float64, emitType metrics.MetricTypeName, tags ...metrics.MetricTag) error {
+	e.records = append(e.records, capturedMetric{
+		key:      key,
+		val:      val,
+		emitType: emitType,
+		tags:     append([]metrics.MetricTag(nil), tags...),
+	})
 	return nil
 }
 
@@ -125,10 +131,11 @@ func (p *fakePlugin) CPUSetAdjustmentHandler(ctx context.Context, in bulkheadapi
 
 type fakeTopologyPlugin struct {
 	*fakePlugin
-	result       bulkheadapi.DAGApplyResult
-	err          error
-	reportLegacy bool
-	afterApply   func()
+	result        bulkheadapi.DAGApplyResult
+	err           error
+	reportLegacy  bool
+	afterApply    func()
+	mutateDesired func(*model.DesiredView)
 }
 
 func (p *fakeTopologyPlugin) Apply(_ context.Context, in bulkheadapi.HandlerContext) (bulkheadapi.DAGApplyResult, error) {
@@ -138,6 +145,9 @@ func (p *fakeTopologyPlugin) Apply(_ context.Context, in bulkheadapi.HandlerCont
 			FinalSnapshotCurrent: p.result.FinalSnapshotCurrent,
 			AppliedView:          p.result.AppliedView.DeepCopy(),
 		})
+	}
+	if p.mutateDesired != nil {
+		p.mutateDesired(in.DesiredView)
 	}
 	if p.afterApply != nil {
 		p.afterApply()
@@ -379,6 +389,141 @@ func TestManagerApplyPassesOwnedVerifiedViewToDependentsAndReturnsReclaim(t *tes
 	}
 }
 
+func TestManagerApplyPublishesPartitionMetricsAfterAppliedViewCommit(t *testing.T) {
+	t.Parallel()
+
+	state, topology := testBulkheadStateAndTopology()
+	applied := model.NewDesiredView().ToAppliedView()
+	applied.Reserve = machine.NewCPUSet(0)
+	applied.ReclaimEffective = machine.NewCPUSet(1, 2, 3)
+	applied.NonReclaimPool = machine.NewCPUSet(0)
+	applied.SharePoolMap[commonstate.PoolNameShare] = machine.NewCPUSet()
+	topologyPlugin := &fakeTopologyPlugin{
+		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
+		result: bulkheadapi.DAGApplyResult{
+			FullyConverged:       true,
+			FinalSnapshotCurrent: true,
+			AppliedView:          applied,
+		},
+	}
+	emitter := &capturingEmitter{}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin}}
+	in := enabledCPUSetAdjustmentCtx()
+	in.DynamicConf.FillDefaultSharePoolWithNonReclaimCPUs = true
+	in.State = state
+	in.Topology = topology
+	in.Emitter = emitter
+
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("Apply() error: %v", err)
+	}
+	for _, viewName := range []string{"desired", "applied"} {
+		if !hasMetricTags(emitter.records, metricBulkheadPartitionCPUCores, "view", viewName) {
+			t.Fatalf("partition metrics missing view=%s: %#v", viewName, emitter.records)
+		}
+		if !hasMetricTags(emitter.records, metricBulkheadDefaultShareResidualCPUCores, "view", viewName) {
+			t.Fatalf("default-share residual metric missing view=%s: %#v", viewName, emitter.records)
+		}
+	}
+	if !hasMetric(emitter.records, metricBulkheadPartitionCPUDiffCores) {
+		t.Fatalf("partition diff metrics missing after committed applied view: %#v", emitter.records)
+	}
+}
+
+func TestManagerApplyPartitionMetricsUsePostTopologyDesiredView(t *testing.T) {
+	t.Parallel()
+
+	state, topology := testBulkheadStateAndTopology()
+	applied := model.NewDesiredView().ToAppliedView()
+	applied.Reserve = machine.NewCPUSet(0)
+	applied.ReclaimEffective = machine.NewCPUSet(1, 2)
+	applied.NonReclaimPool = machine.NewCPUSet(3)
+	topologyPlugin := &fakeTopologyPlugin{
+		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
+		result: bulkheadapi.DAGApplyResult{
+			FullyConverged:       true,
+			FinalSnapshotCurrent: true,
+			AppliedView:          applied,
+		},
+		mutateDesired: func(desired *model.DesiredView) {
+			desired.ReclaimEffective = machine.NewCPUSet(1, 2)
+			desired.NonReclaimPool = machine.NewCPUSet(3)
+		},
+	}
+	emitter := &capturingEmitter{}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin}}
+	in := enabledCPUSetAdjustmentCtx()
+	in.State = state
+	in.Topology = topology
+	in.Emitter = emitter
+
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("Apply() error: %v", err)
+	}
+	want := map[string]float64{
+		metricKey(metricBulkheadPartitionCPUCores, "view", "desired", "partition", "reclaim"):               2,
+		metricKey(metricBulkheadPartitionCPUDiffCores, "partition", "reclaim", "direction", "desired_only"): 0,
+		metricKey(metricBulkheadPartitionCPUDiffCores, "partition", "reclaim", "direction", "applied_only"): 0,
+	}
+	assertMetricValues(t, emitter.records, want)
+}
+
+func TestManagerApplyDoesNotPublishResidualMetricWhenBackfillDisabled(t *testing.T) {
+	t.Parallel()
+
+	state, topology := testBulkheadStateAndTopology()
+	emitter := &capturingEmitter{}
+	m := &Manager{plugins: []bulkheadapi.Plugin{
+		&fakePlugin{name: "writer", enabled: true},
+	}}
+	in := enabledCPUSetAdjustmentCtx()
+	in.State = state
+	in.Topology = topology
+	in.Emitter = emitter
+
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("Apply() error: %v", err)
+	}
+	if hasMetric(emitter.records, metricBulkheadDefaultShareResidualCPUCores) {
+		t.Fatalf("disabled backfill published residual metrics: %#v", emitter.records)
+	}
+	if !hasMetricTags(emitter.records, metricBulkheadPartitionCPUCores, "view", "desired", "partition", "default_share") {
+		t.Fatalf("disabled backfill must retain generic default-share partition metric: %#v", emitter.records)
+	}
+}
+
+func TestManagerApplyDoesNotPublishAppliedPartitionMetricsWhenTopologyDoesNotConverge(t *testing.T) {
+	t.Parallel()
+
+	state, topology := testBulkheadStateAndTopology()
+	topologyPlugin := &fakeTopologyPlugin{
+		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
+		result: bulkheadapi.DAGApplyResult{
+			FinalSnapshotCurrent: true,
+			AppliedView:          model.NewDesiredView().ToAppliedView(),
+		},
+	}
+	emitter := &capturingEmitter{}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin}}
+	in := enabledCPUSetAdjustmentCtx()
+	in.State = state
+	in.Topology = topology
+	in.Emitter = emitter
+
+	if _, err := m.Apply(context.Background(), in); err == nil {
+		t.Fatal("Apply() error = nil, want non-converged result rejected")
+	}
+	if !hasMetricTags(emitter.records, metricBulkheadPartitionCPUCores, "view", "desired") {
+		t.Fatalf("desired partition metrics missing: %#v", emitter.records)
+	}
+	if hasMetricTags(emitter.records, metricBulkheadPartitionCPUCores, "view", "applied") {
+		t.Fatalf("non-converged result published applied partition metrics: %#v", emitter.records)
+	}
+	if hasMetric(emitter.records, metricBulkheadPartitionCPUDiffCores) {
+		t.Fatalf("non-converged result published diff metrics: %#v", emitter.records)
+	}
+}
+
 func TestManagerLatestAppliedReclaimPublishesAndReturnsClones(t *testing.T) {
 	t.Parallel()
 
@@ -460,11 +605,13 @@ func TestManagerApplyRejectsStaleGenerationBeforeDependentSideEffects(t *testing
 	m.publishLatestAppliedReclaim(oldApplied.ReclaimEffective)
 	state, topology := testBulkheadStateAndTopology()
 	fenceCalls := 0
+	emitter := &capturingEmitter{}
 
 	_, err := m.Apply(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
 		DynamicConf: dynamicBulkheadConf(true),
 		State:       state,
 		Topology:    topology,
+		Emitter:     emitter,
 		Generation:  11,
 		CommitIfGenerationCurrent: func(generation uint64, commit func()) bool {
 			if generation != 11 {
@@ -492,6 +639,12 @@ func TestManagerApplyRejectsStaleGenerationBeforeDependentSideEffects(t *testing
 	assertCPUSet(t, "retained latest reclaim", m.LatestAppliedReclaim(), "3")
 	if m.appliedViewValidForPeriodical {
 		t.Fatal("stale generation must not authorize periodical handlers")
+	}
+	if hasMetricTags(emitter.records, metricBulkheadPartitionCPUCores, "view", "applied") {
+		t.Fatalf("stale generation published applied partition metrics: %#v", emitter.records)
+	}
+	if hasMetric(emitter.records, metricBulkheadPartitionCPUDiffCores) {
+		t.Fatalf("stale generation published partition diff metrics: %#v", emitter.records)
 	}
 }
 
@@ -1489,6 +1642,134 @@ func TestEmitBulkheadPluginResultFormatsReasonTag(t *testing.T) {
 	if gotReason != wantReason {
 		t.Fatalf("reason tag = %q, want formatted %q", gotReason, wantReason)
 	}
+}
+
+func TestEmitBulkheadDesiredViewMetrics(t *testing.T) {
+	t.Parallel()
+
+	emitter := &capturingEmitter{}
+	desired := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+		Reserve:          machine.NewCPUSet(0),
+		Dedicated:        machine.NewCPUSet(1, 2),
+		SharePool:        machine.NewCPUSet(3, 4, 5),
+		ReclaimEffective: machine.NewCPUSet(6, 7),
+		NonReclaimPool:   machine.NewCPUSet(0, 1, 2, 3, 4, 5),
+		Isolation:        machine.NewCPUSet(2),
+		SharePoolMap: map[string]machine.CPUSet{
+			commonstate.PoolNameShare: machine.NewCPUSet(4, 5),
+		},
+	}}
+
+	emitBulkheadPartitionViewMetrics(emitter, "desired", &desired.CPUSetPartitionView)
+	emitBulkheadDefaultShareResidualMetric(emitter, "desired", &desired.CPUSetPartitionView)
+
+	want := map[string]float64{
+		metricKey(metricBulkheadPartitionCPUCores, "view", "desired", "partition", "reserve"):       1,
+		metricKey(metricBulkheadPartitionCPUCores, "view", "desired", "partition", "dedicated"):     2,
+		metricKey(metricBulkheadPartitionCPUCores, "view", "desired", "partition", "share"):         3,
+		metricKey(metricBulkheadPartitionCPUCores, "view", "desired", "partition", "reclaim"):       2,
+		metricKey(metricBulkheadPartitionCPUCores, "view", "desired", "partition", "non_reclaim"):   6,
+		metricKey(metricBulkheadPartitionCPUCores, "view", "desired", "partition", "isolation"):     1,
+		metricKey(metricBulkheadPartitionCPUCores, "view", "desired", "partition", "default_share"): 2,
+		metricKey(metricBulkheadDefaultShareResidualCPUCores, "view", "desired"):                    2,
+	}
+	assertMetricValues(t, emitter.records, want)
+}
+
+func TestEmitBulkheadAppliedViewMetrics(t *testing.T) {
+	t.Parallel()
+
+	emitter := &capturingEmitter{}
+	desired := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ReclaimEffective: machine.NewCPUSet(6, 7),
+		NonReclaimPool:   machine.NewCPUSet(0, 1, 2, 3, 4, 5),
+		SharePoolMap: map[string]machine.CPUSet{
+			commonstate.PoolNameShare: machine.NewCPUSet(4, 5),
+		},
+	}}
+	applied := &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ReclaimEffective: machine.NewCPUSet(7, 8),
+		NonReclaimPool:   machine.NewCPUSet(0, 1, 2, 3, 4, 8),
+		SharePoolMap: map[string]machine.CPUSet{
+			commonstate.PoolNameShare: machine.NewCPUSet(4, 8),
+		},
+	}}
+
+	emitBulkheadPartitionViewMetrics(emitter, "applied", &applied.CPUSetPartitionView)
+	emitBulkheadDefaultShareResidualMetric(emitter, "applied", &applied.CPUSetPartitionView)
+	emitBulkheadPartitionDiffMetrics(emitter, desired, applied)
+
+	want := map[string]float64{
+		metricKey(metricBulkheadPartitionCPUCores, "view", "applied", "partition", "reclaim"):       2,
+		metricKey(metricBulkheadPartitionCPUCores, "view", "applied", "partition", "non_reclaim"):   6,
+		metricKey(metricBulkheadPartitionCPUCores, "view", "applied", "partition", "default_share"): 2,
+		metricKey(metricBulkheadDefaultShareResidualCPUCores, "view", "applied"):                    2,
+	}
+	for _, partition := range []string{"reclaim", "non_reclaim", "default_share"} {
+		want[metricKey(metricBulkheadPartitionCPUDiffCores, "partition", partition, "direction", "desired_only")] = 1
+		want[metricKey(metricBulkheadPartitionCPUDiffCores, "partition", partition, "direction", "applied_only")] = 1
+	}
+	assertMetricValues(t, emitter.records, want)
+}
+
+func metricKey(name string, tags ...string) string {
+	parts := []string{name}
+	for i := 0; i < len(tags); i += 2 {
+		parts = append(parts, tags[i]+"="+tags[i+1])
+	}
+	return strings.Join(parts, ",")
+}
+
+func assertMetricValues(t *testing.T, records []capturedMetric, want map[string]float64) {
+	t.Helper()
+	got := make(map[string]float64, len(records))
+	for _, record := range records {
+		tags := make([]string, 0, len(record.tags)*2)
+		for _, tag := range record.tags {
+			tags = append(tags, tag.Key, tag.Val)
+		}
+		got[metricKey(record.key, tags...)] = record.val
+	}
+	for key, wantValue := range want {
+		if gotValue, ok := got[key]; !ok || gotValue != wantValue {
+			t.Fatalf("metric %q = %v, present=%t, want %v; all metrics: %#v", key, gotValue, ok, wantValue, got)
+		}
+	}
+}
+
+func hasMetric(records []capturedMetric, key string) bool {
+	for _, record := range records {
+		if record.key == key {
+			return true
+		}
+	}
+	return false
+}
+
+func hasMetricTags(records []capturedMetric, key string, tags ...string) bool {
+	for _, record := range records {
+		if record.key != key {
+			continue
+		}
+		matched := true
+		for i := 0; i < len(tags); i += 2 {
+			found := false
+			for _, tag := range record.tags {
+				if tag.Key == tags[i] && tag.Val == tags[i+1] {
+					found = true
+					break
+				}
+			}
+			if !found {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
 }
 
 func TestBulkheadSlowHandlerThreshold(t *testing.T) {

@@ -25,6 +25,7 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/util/errors"
 
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
 	bulkheadapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
@@ -100,10 +101,31 @@ func (e *NonConvergedError) Error() string {
 }
 
 const (
-	metricBulkheadHandlerResult  = "bulkhead_handler_result"
-	metricBulkheadViewChanged    = "bulkhead_view_changed"
-	bulkheadSlowHandlerThreshold = 500 * time.Millisecond
+	metricBulkheadHandlerResult                = "bulkhead_handler_result"
+	metricBulkheadViewChanged                  = "bulkhead_view_changed"
+	metricBulkheadPartitionCPUCores            = "bulkhead_partition_cpu_cores"
+	metricBulkheadPartitionCPUDiffCores        = "bulkhead_partition_cpu_diff_cores"
+	metricBulkheadDefaultShareResidualCPUCores = "bulkhead_default_share_residual_cpu_cores"
+	bulkheadSlowHandlerThreshold               = 500 * time.Millisecond
 )
+
+type bulkheadPartitionMetricDescriptor struct {
+	name     string
+	cpuSet   func(*model.CPUSetPartitionView) machine.CPUSet
+	emitDiff bool
+}
+
+var bulkheadPartitionMetricDescriptors = []bulkheadPartitionMetricDescriptor{
+	{name: "reserve", cpuSet: func(view *model.CPUSetPartitionView) machine.CPUSet { return view.Reserve }},
+	{name: "dedicated", cpuSet: func(view *model.CPUSetPartitionView) machine.CPUSet { return view.Dedicated }},
+	{name: "share", cpuSet: func(view *model.CPUSetPartitionView) machine.CPUSet { return view.SharePool }},
+	{name: "reclaim", cpuSet: func(view *model.CPUSetPartitionView) machine.CPUSet { return view.ReclaimEffective }, emitDiff: true},
+	{name: "non_reclaim", cpuSet: func(view *model.CPUSetPartitionView) machine.CPUSet { return view.NonReclaimPool }, emitDiff: true},
+	{name: "isolation", cpuSet: func(view *model.CPUSetPartitionView) machine.CPUSet { return view.Isolation }},
+	{name: "default_share", cpuSet: func(view *model.CPUSetPartitionView) machine.CPUSet {
+		return view.SharePoolMap[commonstate.PoolNameShare]
+	}, emitDiff: true},
+}
 
 func NewManager(conf *config.Configuration) (*Manager, error) {
 	plugins, err := registry.NewDefaultPlugins(conf)
@@ -175,6 +197,12 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 		}
 		handlerCtx.DesiredView = desiredView
 		handlerCtx.View = desiredView.CPUSetPartitionView.DeepCopy()
+		defer func() {
+			emitBulkheadPartitionViewMetrics(handlerCtx.Emitter, "desired", &handlerCtx.DesiredView.CPUSetPartitionView)
+			if defaultShareResidualEnabled(in.DynamicConf) {
+				emitBulkheadDefaultShareResidualMetric(handlerCtx.Emitter, "desired", &handlerCtx.DesiredView.CPUSetPartitionView)
+			}
+		}()
 	}
 	currentEnabled := m.buildPluginEnabledState(handlerCtx)
 	anyAdjusted := false
@@ -305,6 +333,11 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 			nonConverged.Result = topologyResult
 			emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", "generation_fence", "failed", nonConverged.Error())
 			return empty, nonConverged
+		}
+		emitBulkheadPartitionViewMetrics(handlerCtx.Emitter, "applied", &handlerCtx.AppliedView.CPUSetPartitionView)
+		emitBulkheadPartitionDiffMetrics(handlerCtx.Emitter, handlerCtx.DesiredView, handlerCtx.AppliedView)
+		if defaultShareResidualEnabled(in.DynamicConf) {
+			emitBulkheadDefaultShareResidualMetric(handlerCtx.Emitter, "applied", &handlerCtx.AppliedView.CPUSetPartitionView)
 		}
 	} else {
 		if !commitIfGenerationCurrent(in, func() {
@@ -531,4 +564,65 @@ func emitBulkheadViewChanged(emitter metrics.MetricEmitter, changed bool) {
 	_ = emitter.StoreInt64(metricBulkheadViewChanged, 1, metrics.MetricTypeNameCount,
 		metrics.MetricTag{Key: "changed", Val: strconv.FormatBool(changed)},
 	)
+}
+
+func emitBulkheadPartitionViewMetrics(
+	emitter metrics.MetricEmitter,
+	viewName string,
+	view *model.CPUSetPartitionView,
+) {
+	if emitter == nil || view == nil {
+		return
+	}
+	for _, descriptor := range bulkheadPartitionMetricDescriptors {
+		_ = emitter.StoreInt64(metricBulkheadPartitionCPUCores, int64(descriptor.cpuSet(view).Size()), metrics.MetricTypeNameRaw,
+			metrics.MetricTag{Key: "view", Val: viewName},
+			metrics.MetricTag{Key: "partition", Val: descriptor.name},
+		)
+	}
+}
+
+func emitBulkheadDefaultShareResidualMetric(
+	emitter metrics.MetricEmitter,
+	viewName string,
+	view *model.CPUSetPartitionView,
+) {
+	if emitter == nil || view == nil {
+		return
+	}
+	_ = emitter.StoreInt64(metricBulkheadDefaultShareResidualCPUCores,
+		int64(view.SharePoolMap[commonstate.PoolNameShare].Size()), metrics.MetricTypeNameRaw,
+		metrics.MetricTag{Key: "view", Val: viewName},
+	)
+}
+
+func defaultShareResidualEnabled(conf *dynamicconfig.Configuration) bool {
+	return conf != nil && conf.FillDefaultSharePoolWithNonReclaimCPUs
+}
+
+func emitBulkheadPartitionDiffMetrics(
+	emitter metrics.MetricEmitter,
+	desired *model.DesiredView,
+	applied *model.AppliedView,
+) {
+	if emitter == nil || desired == nil || applied == nil {
+		return
+	}
+	for _, descriptor := range bulkheadPartitionMetricDescriptors {
+		if !descriptor.emitDiff {
+			continue
+		}
+		desiredCPUSet := descriptor.cpuSet(&desired.CPUSetPartitionView)
+		appliedCPUSet := descriptor.cpuSet(&applied.CPUSetPartitionView)
+		_ = emitter.StoreInt64(metricBulkheadPartitionCPUDiffCores,
+			int64(desiredCPUSet.Difference(appliedCPUSet).Size()), metrics.MetricTypeNameRaw,
+			metrics.MetricTag{Key: "partition", Val: descriptor.name},
+			metrics.MetricTag{Key: "direction", Val: "desired_only"},
+		)
+		_ = emitter.StoreInt64(metricBulkheadPartitionCPUDiffCores,
+			int64(appliedCPUSet.Difference(desiredCPUSet).Size()), metrics.MetricTypeNameRaw,
+			metrics.MetricTag{Key: "partition", Val: descriptor.name},
+			metrics.MetricTag{Key: "direction", Val: "applied_only"},
+		)
+	}
 }
