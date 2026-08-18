@@ -53,29 +53,13 @@ func deriveAdvisorIsolationSourceDomain(
 			continue
 		}
 
-		if allocationInfo := entries[entry.EntryName][entry.SubEntryName]; allocationInfo != nil {
-			sourcePool, ok := deriveIsolationSourceSharePool(allocationInfo)
-			return sourcePool, resourcePackageName, ok
+		allocationInfo := resolveIsolationOwnerAllocation(
+			entries, entry.EntryName, entry.SubEntryName, poolName, resourcePackageName)
+		if allocationInfo == nil {
+			continue
 		}
-
-		for _, containerEntries := range entries {
-			if containerEntries.IsPoolEntry() {
-				continue
-			}
-			for _, allocationInfo := range containerEntries {
-				if allocationInfo == nil {
-					continue
-				}
-				allocationPool, allocationResourcePackage := resourcepackage.UnwrapOwnerPoolName(
-					allocationInfo.GetOwnerPoolName(),
-				)
-				if allocationPool != poolName || allocationResourcePackage != resourcePackageName {
-					continue
-				}
-				sourcePool, ok := deriveIsolationSourceSharePool(allocationInfo)
-				return sourcePool, resourcePackageName, ok
-			}
-		}
+		sourcePool, ok := deriveIsolationSourceSharePool(allocationInfo)
+		return sourcePool, resourcePackageName, ok
 	}
 
 	return "", "", false
@@ -535,9 +519,17 @@ func (p *DynamicPolicy) advisorSourceIsolationComponents(
 		if descriptor.Class != advisorBlockClassShared || !advisorDescriptorIsIsolation(descriptor) {
 			continue
 		}
-		domain, err := advisorIsolationDescriptorSourceDomain(descriptor, p.state.GetPodEntries())
+		domain, resolved, err := advisorIsolationDescriptorSourceDomain(descriptor, p.state.GetPodEntries())
 		if err != nil {
 			return nil, nil, fmt.Errorf("derive isolation block %q source domain: %w", descriptor.BlockID, err)
+		}
+		if !resolved {
+			// orphan isolation descriptor: the advisor still references an
+			// isolation block whose backing pod is gone from QRM state, so no
+			// state allocation resolves its source domain. this is a soft
+			// degradation (aligned with the legacy deriveAdvisorIsolationSourceDomain
+			// path); skip the block instead of aborting the whole advisor cycle.
+			continue
 		}
 		source, ok := sourceByDomain[domain]
 		if !ok {
@@ -569,7 +561,7 @@ func advisorIsolationDescriptorSourceDomain(
 	poolName            string
 	resourcePackageName string
 	numaID              int
-}, error) {
+}, bool, error) {
 	var resolved struct {
 		poolName            string
 		resourcePackageName string
@@ -579,23 +571,34 @@ func advisorIsolationDescriptorSourceDomain(
 	for _, owner := range descriptor.Owners {
 		poolName, entryName, subEntryName, resourcePackageName, ok := advisorDescriptorOwner(owner)
 		if !ok {
-			return resolved, fmt.Errorf("owner %q is malformed", owner)
+			return resolved, false, fmt.Errorf("owner %q is malformed", owner)
 		}
 		if !commonstate.IsIsolationPool(poolName) {
 			continue
 		}
-		allocationInfo := entries[entryName][subEntryName]
+		allocationInfo := resolveIsolationOwnerAllocation(entries, entryName, subEntryName, poolName, resourcePackageName)
 		if allocationInfo == nil {
-			return resolved, fmt.Errorf("owner %q has no state allocation", owner)
+			// orphan owner: the backing pod no longer exists in QRM state, so
+			// neither the direct pool-entry lookup nor the pod-style fallback
+			// resolves an allocation. soft-degrade this owner (aligned with the
+			// legacy deriveAdvisorIsolationSourceDomain path) rather than
+			// hard-failing and aborting the whole advisor cycle.
+			continue
 		}
 		allocationPool, allocationResourcePackage := resourcepackage.UnwrapOwnerPoolName(
 			allocationInfo.GetOwnerPoolName())
 		if allocationPool != poolName || allocationResourcePackage != resourcePackageName {
-			return resolved, fmt.Errorf("owner %q disagrees with state owner domain", owner)
+			return resolved, false, fmt.Errorf("owner %q disagrees with state owner domain", owner)
 		}
 		sourcePool, ok := deriveIsolationSourceSharePool(allocationInfo)
 		if !ok {
-			return resolved, fmt.Errorf("owner %q has no source pool", owner)
+			// the resolved allocation yields no derivable source share pool (e.g.
+			// it is no longer a shared_cores pod, or its cpuset_pool enhancement
+			// maps to the empty pool). the legacy deriveAdvisorIsolationSourceDomain
+			// path propagates this as ok=false and its caller skips the block, so
+			// soft-degrade this owner here rather than hard-failing and aborting
+			// the whole advisor cycle.
+			continue
 		}
 		sourcePool, _ = resourcepackage.UnwrapOwnerPoolName(sourcePool)
 		current := struct {
@@ -606,15 +609,52 @@ func advisorIsolationDescriptorSourceDomain(
 			poolName: sourcePool, resourcePackageName: resourcePackageName, numaID: descriptor.NUMAID,
 		}
 		if resolvedSet && resolved != current {
-			return resolved, fmt.Errorf("aliases resolve to different source domains")
+			return resolved, false, fmt.Errorf("aliases resolve to different source domains")
 		}
 		resolved = current
 		resolvedSet = true
 	}
 	if !resolvedSet {
-		return resolved, fmt.Errorf("descriptor has no resolvable isolation owners")
+		// every isolation owner soft-degraded (orphaned) or the descriptor had no
+		// isolation owner at all; report unresolved so the caller skips the block.
+		return resolved, false, nil
 	}
-	return resolved, nil
+	return resolved, true, nil
+}
+
+// resolveIsolationOwnerAllocation resolves the state allocation backing an
+// isolation owner. isolation pools are never materialized as pool entries in
+// the QRM state, so a pool-style owner (poolName == entryName, empty
+// subEntryName) never hits the direct entryName/subEntryName lookup. in that
+// case we fall back to scanning pod-style container entries and matching the
+// (unwrapped) owner pool name plus resource package. it is the single shared
+// resolver for both the descriptor-based advisorIsolationDescriptorSourceDomain
+// and the legacy deriveAdvisorIsolationSourceDomain path.
+func resolveIsolationOwnerAllocation(
+	entries state.PodEntries,
+	entryName, subEntryName, poolName, resourcePackageName string,
+) *state.AllocationInfo {
+	if allocationInfo := entries[entryName][subEntryName]; allocationInfo != nil {
+		return allocationInfo
+	}
+
+	for _, containerEntries := range entries {
+		if containerEntries.IsPoolEntry() {
+			continue
+		}
+		for _, allocationInfo := range containerEntries {
+			if allocationInfo == nil {
+				continue
+			}
+			allocationPool, allocationResourcePackage := resourcepackage.UnwrapOwnerPoolName(
+				allocationInfo.GetOwnerPoolName())
+			if allocationPool != poolName || allocationResourcePackage != resourcePackageName {
+				continue
+			}
+			return allocationInfo
+		}
+	}
+	return nil
 }
 
 func filterAdvisorDescriptors(
