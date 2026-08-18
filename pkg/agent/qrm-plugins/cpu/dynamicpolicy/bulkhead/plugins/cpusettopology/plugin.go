@@ -259,7 +259,7 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 		// internal error) reach here. Pending containers (admit window, no
 		// container id yet) are classified as protected-pending and do NOT
 		// produce an error, so a normal new-pod admit is never rejected.
-		emitBulkheadPruneResult(in.Emitter, "skipped", 0, "container_error")
+		emitBulkheadPruneResult(in.Emitter, "skipped", "container_error")
 		return fmt.Errorf("build expected container cpuset: %w", err)
 	}
 	protectedByRel := p.pendingProtectedCPUSetByRel(ctx, expectedRes.PendingByPod)
@@ -280,7 +280,7 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 			in.DesiredView.ReclaimEffective.String(), formatCPUSetByNUMA(in.DesiredView.ReclaimEffectivePerNUMA),
 			in.DesiredView.NonReclaimPool.String())
 		if err := bulkheadutils.ValidateCPUSetPartitionView(in.DesiredView, in.Topology); err != nil {
-			emitBulkheadPruneResult(in.Emitter, "skipped", 0, "view_error")
+			emitBulkheadPruneResult(in.Emitter, "skipped", "view_error")
 			return fmt.Errorf("validate bulkhead desired view after transient pending protection: %w", err)
 		}
 		if p.cfg.EnableAdmissionLeafDefer && in.Mode.OrFullDefault() == cpusetutil.CPUSetAdjustmentModeAdmission {
@@ -293,7 +293,7 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 		return deadlineErr
 	}
 	if err != nil {
-		emitBulkheadPruneResult(in.Emitter, "skipped", 0, "discover_error")
+		emitBulkheadPruneResult(in.Emitter, "skipped", "discover_error")
 		return fmt.Errorf("discover bulkhead reclaim siblings: %w", err)
 	}
 	var cpuDetails machine.CPUDetails
@@ -312,7 +312,7 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 		return deadlineErr
 	}
 	if err != nil {
-		emitBulkheadPruneResult(in.Emitter, "skipped", 0, "dag_error")
+		emitBulkheadPruneResult(in.Emitter, "skipped", "dag_error")
 		return fmt.Errorf("build bulkhead topology dag: %w", err)
 	}
 	p.drainSafeDeferredLeaves(ctx, in.DesiredView, dag)
@@ -377,7 +377,7 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 		expectedRes.PendingCPUSetUnion().Size(), len(protectedByRel), len(specs), len(siblings))
 	if err != nil {
 		emitBulkheadTopologySummary(in.Emitter, "normal", res, err)
-		emitBulkheadPruneResult(in.Emitter, "skipped", 0, "dag_error")
+		emitBulkheadPruneResult(in.Emitter, "skipped", "dag_error")
 		return fmt.Errorf("apply bulkhead topology dag: %w", err)
 	}
 	if (res.Converged || res.ParentSafe) && res.FinalSnapshotCurrent {
@@ -398,7 +398,7 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 		if res.Deferred > 0 {
 			reason = "deferred_convergence"
 		}
-		emitBulkheadPruneResult(in.Emitter, "skipped", 0, reason)
+		emitBulkheadPruneResult(in.Emitter, "skipped", reason)
 		return &topologyApplyNonConvergedError{result: res}
 	}
 	if res.ParentSafe {
@@ -409,7 +409,8 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 
 	activeRels := bulkheadutils.CollectActiveRels(p.cfg, desiredCPUSetPartitionView(in.DesiredView), in.MetaServer, siblings, relExists)
 	p.cgroup.Prune(activeRels)
-	emitBulkheadPruneResult(in.Emitter, "success", len(activeRels), "")
+	emitBulkheadPruneResult(in.Emitter, "success", "")
+	emitBulkheadPruneActiveRels(in.Emitter, len(activeRels), "success", "")
 	return nil
 }
 
@@ -682,7 +683,7 @@ func (p *CPUSetTopologyPlugin) filterExistingDisabledResetSpecs(ctx context.Cont
 func (p *CPUSetTopologyPlugin) resetCPUSetTopology(ctx context.Context, in bulkheadapi.HandlerContext) error {
 	target, err := p.disabledResetCPUSet(ctx, in)
 	if err != nil {
-		emitBulkheadPruneResult(in.Emitter, "skipped", 0, "reset_target_error")
+		emitBulkheadPruneResult(in.Emitter, "skipped", "reset_target_error")
 		return err
 	}
 
@@ -701,11 +702,11 @@ func (p *CPUSetTopologyPlugin) resetCPUSetTopology(ctx context.Context, in bulkh
 
 	dag, err := p.buildDisabledResetDAG(ctx, in, target)
 	if err != nil {
-		emitBulkheadPruneResult(in.Emitter, "skipped", 0, "dag_error")
+		emitBulkheadPruneResult(in.Emitter, "skipped", "dag_error")
 		return err
 	}
 	if dag == nil {
-		emitBulkheadPruneResult(in.Emitter, "success", 0, "")
+		emitBulkheadPruneResult(in.Emitter, "success", "")
 		return nil
 	}
 
@@ -718,14 +719,14 @@ func (p *CPUSetTopologyPlugin) resetCPUSetTopology(ctx context.Context, in bulkh
 		DrainSelection:      topologyDrainSelectionFromConfig(p.cfg.TopologyDrainSelection),
 	})
 	if err != nil {
-		emitBulkheadPruneResult(in.Emitter, "skipped", res.Applied, "dag_error")
+		emitBulkheadPruneResult(in.Emitter, "skipped", "dag_error")
 		emitBulkheadTopologySummary(in.Emitter, "reset", res, err)
 		return fmt.Errorf("apply disabled reset topology dag: %w", err)
 	}
 	emitBulkheadTopologySummary(in.Emitter, "reset", res, nil)
 	if !res.Converged {
 		general.InfofV(4, "cpuset_topology: disabled reset not fully converged, report=%+v", res.ConvergenceReport)
-		emitBulkheadPruneResult(in.Emitter, "skipped", res.Applied, "reset_not_converged")
+		emitBulkheadPruneResult(in.Emitter, "skipped", "reset_not_converged")
 		return &disabledResetNotConvergedError{
 			state:   res.State,
 			applied: res.Applied,
@@ -733,7 +734,7 @@ func (p *CPUSetTopologyPlugin) resetCPUSetTopology(ctx context.Context, in bulkh
 		}
 	}
 
-	emitBulkheadPruneResult(in.Emitter, "success", res.Applied, "")
+	emitBulkheadPruneResult(in.Emitter, "success", "")
 	return nil
 }
 
@@ -1315,15 +1316,15 @@ func topologyDrainSelectionFromConfig(in bulkheadconfig.DrainSelectionPolicy) to
 }
 
 const (
-	metricBulkheadPruneResult                   = "bulkhead_prune_result"
-	metricBulkheadTopologyRoundTotal            = "bulkhead_topology_round_total"
-	metricBulkheadTopologyRoundsPerApply        = "bulkhead_topology_rounds_per_apply"
-	metricBulkheadTopologyBudgetExhaustedTotal  = "bulkhead_topology_budget_exhausted_total"
-	metricBulkheadTopologyScanNodes             = "bulkhead_topology_scan_nodes"
-	metricBulkheadTopologyScanDepth             = "bulkhead_topology_scan_depth"
-	metricBulkheadTopologyDrainBatch            = "bulkhead_topology_drain_batch"
-	metricBulkheadTopologyIdentityChangedTotal  = "bulkhead_topology_identity_changed_total"
-	metricBulkheadTopologyHandoffLatencySeconds = "bulkhead_topology_handoff_latency_seconds"
+	metricBulkheadPruneResult                  = "bulkhead_prune_result"
+	metricBulkheadPruneActiveRels              = "bulkhead_prune_active_rels"
+	metricBulkheadTopologyRoundTotal           = "bulkhead_topology_round_total"
+	metricBulkheadTopologyRoundsPerApply       = "bulkhead_topology_rounds_per_apply"
+	metricBulkheadTopologyBudgetExhaustedTotal = "bulkhead_topology_budget_exhausted_total"
+	metricBulkheadTopologyScanNodes            = "bulkhead_topology_scan_nodes"
+	metricBulkheadTopologyScanDepth            = "bulkhead_topology_scan_depth"
+	metricBulkheadTopologyDrainBatch           = "bulkhead_topology_drain_batch"
+	metricBulkheadTopologyIdentityChangedTotal = "bulkhead_topology_identity_changed_total"
 )
 
 var (
@@ -1331,6 +1332,12 @@ var (
 	allowedTopologyMetricStatuses    = map[string]struct{}{"progress": {}, "stale": {}, "blocked": {}, "converged": {}, "error": {}}
 	allowedTopologyMetricReasons     = map[string]struct{}{"none": {}, "stale": {}, "blocked": {}, "budget": {}, "identity_changed": {}, "external_write": {}, "invalid": {}}
 	allowedTopologyMetricDomainRoles = map[string]struct{}{"primary": {}, "reclaim": {}, "reclaim_numa": {}, "dynamic": {}, "unknown": {}}
+	allowedPruneMetricStatuses       = map[string]struct{}{"success": {}, "skipped": {}}
+	allowedPruneMetricReasons        = map[string]struct{}{
+		"none": {}, "container_error": {}, "view_error": {}, "discover_error": {},
+		"dag_error": {}, "not_converged": {}, "deferred_convergence": {},
+		"reset_target_error": {}, "reset_not_converged": {}, "invalid": {},
+	}
 )
 
 func emitBulkheadTopologySummary(emitter metrics.MetricEmitter, phase string, res topology.ConvergenceResult, err error) {
@@ -1392,10 +1399,6 @@ func emitBulkheadTopologySummary(emitter metrics.MetricEmitter, phase string, re
 	if reason == "identity_changed" {
 		_ = emitter.StoreInt64(metricBulkheadTopologyIdentityChangedTotal, 1, metrics.MetricTypeNameCount)
 	}
-	_ = emitter.StoreFloat64(metricBulkheadTopologyHandoffLatencySeconds, 0, metrics.MetricTypeNameRaw,
-		metrics.MetricTag{Key: "phase", Val: phase},
-		metrics.MetricTag{Key: "status", Val: status},
-	)
 }
 
 func topologyStateReason(state topology.ConvergenceState) string {
@@ -1473,13 +1476,36 @@ func boundedTopologyLabel(value string, allowed map[string]struct{}, fallback st
 	return fallback
 }
 
-func emitBulkheadPruneResult(emitter metrics.MetricEmitter, status string, activeRelsCount int, reason string) {
+func normalizePruneMetricLabels(status, reason string) (string, string) {
+	status = boundedTopologyLabel(status, allowedPruneMetricStatuses, "skipped")
+	if reason == "" {
+		reason = "none"
+	}
+	return status, boundedTopologyLabel(reason, allowedPruneMetricReasons, "invalid")
+}
+
+func emitBulkheadPruneResult(emitter metrics.MetricEmitter, status, reason string) {
 	if emitter == nil {
 		return
 	}
+	status, reason = normalizePruneMetricLabels(status, reason)
 	_ = emitter.StoreInt64(metricBulkheadPruneResult, 1, metrics.MetricTypeNameCount,
 		metrics.MetricTag{Key: "status", Val: status},
-		metrics.MetricTag{Key: "active_rels_count", Val: strconv.Itoa(activeRelsCount)},
+		metrics.MetricTag{Key: "reason", Val: reason},
+	)
+}
+
+func emitBulkheadPruneActiveRels(
+	emitter metrics.MetricEmitter,
+	activeRelsCount int,
+	status, reason string,
+) {
+	if emitter == nil {
+		return
+	}
+	status, reason = normalizePruneMetricLabels(status, reason)
+	_ = emitter.StoreInt64(metricBulkheadPruneActiveRels, int64(activeRelsCount), metrics.MetricTypeNameRaw,
+		metrics.MetricTag{Key: "status", Val: status},
 		metrics.MetricTag{Key: "reason", Val: reason},
 	)
 }

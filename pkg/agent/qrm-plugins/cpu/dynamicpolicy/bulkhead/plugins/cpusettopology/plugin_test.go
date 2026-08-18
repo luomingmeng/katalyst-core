@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -262,6 +263,7 @@ func TestAppliedViewFromFinalSnapshotRejectsNUMATargetProofOutsideUpperBound(t *
 
 type capturedMetric struct {
 	key  string
+	val  float64
 	tags []metrics.MetricTag
 }
 
@@ -282,13 +284,13 @@ func TestTopologyDrainSelectionFromConfigPassesRatio(t *testing.T) {
 	}
 }
 
-func (e *captureMetricEmitter) StoreInt64(key string, _ int64, _ metrics.MetricTypeName, tags ...metrics.MetricTag) error {
-	e.metrics = append(e.metrics, capturedMetric{key: key, tags: append([]metrics.MetricTag(nil), tags...)})
+func (e *captureMetricEmitter) StoreInt64(key string, val int64, _ metrics.MetricTypeName, tags ...metrics.MetricTag) error {
+	e.metrics = append(e.metrics, capturedMetric{key: key, val: float64(val), tags: append([]metrics.MetricTag(nil), tags...)})
 	return nil
 }
 
-func (e *captureMetricEmitter) StoreFloat64(key string, _ float64, _ metrics.MetricTypeName, tags ...metrics.MetricTag) error {
-	e.metrics = append(e.metrics, capturedMetric{key: key, tags: append([]metrics.MetricTag(nil), tags...)})
+func (e *captureMetricEmitter) StoreFloat64(key string, val float64, _ metrics.MetricTypeName, tags ...metrics.MetricTag) error {
+	e.metrics = append(e.metrics, capturedMetric{key: key, val: val, tags: append([]metrics.MetricTag(nil), tags...)})
 	return nil
 }
 
@@ -367,6 +369,64 @@ func TestTopologyMetricLabelsAreBoundedEnums(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestEmitBulkheadTopologySummaryDoesNotEmitSyntheticHandoffLatency(t *testing.T) {
+	t.Parallel()
+
+	emitter := &captureMetricEmitter{}
+	emitBulkheadTopologySummary(emitter, "normal", topology.ConvergenceResult{
+		Converged: true,
+		State:     topology.ConvergenceStateConverged,
+	}, nil)
+	emitBulkheadTopologySummary(emitter, "normal", topology.ConvergenceResult{}, topology.ErrNodeBudgetExceeded)
+
+	for _, item := range emitter.metrics {
+		if item.key == "bulkhead_topology_handoff_latency_seconds" {
+			t.Fatalf("synthetic handoff latency metric must not be emitted: %#v", emitter.metrics)
+		}
+	}
+}
+
+func TestEmitBulkheadPruneResultBoundsLabels(t *testing.T) {
+	t.Parallel()
+
+	emitter := &captureMetricEmitter{}
+	emitBulkheadPruneResult(emitter, "unexpected/status", "/kubepods/pod-a")
+	emitBulkheadPruneActiveRels(emitter, 3, "unexpected/status", "/kubepods/pod-a")
+
+	if len(emitter.metrics) != 2 {
+		t.Fatalf("metrics = %d, want 2", len(emitter.metrics))
+	}
+	var resultMetric, activeRelsMetric *capturedMetric
+	for i := range emitter.metrics {
+		switch emitter.metrics[i].key {
+		case metricBulkheadPruneResult:
+			resultMetric = &emitter.metrics[i]
+		case "bulkhead_prune_active_rels":
+			activeRelsMetric = &emitter.metrics[i]
+		}
+	}
+	if resultMetric == nil || activeRelsMetric == nil {
+		t.Fatalf("prune metrics missing: %#v", emitter.metrics)
+	}
+	got := map[string]string{}
+	for _, tag := range resultMetric.tags {
+		got[tag.Key] = tag.Val
+	}
+	want := map[string]string{
+		"status": "skipped",
+		"reason": "invalid",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("prune metric tags = %#v, want %#v", got, want)
+	}
+	if activeRelsMetric.val != 3 {
+		t.Fatalf("active rels metric = %v, want 3", activeRelsMetric.val)
+	}
+	if len(activeRelsMetric.tags) != 2 {
+		t.Fatalf("active rels metric tags = %#v, want bounded status/reason only", activeRelsMetric.tags)
 	}
 }
 
