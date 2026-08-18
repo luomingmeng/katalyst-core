@@ -35,6 +35,7 @@ import (
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	qrmresctrl "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/resctrl"
 	"github.com/kubewharf/katalyst-core/pkg/consts"
+	"github.com/kubewharf/katalyst-core/pkg/util/external/rdt"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	resourcepackage "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 )
@@ -50,9 +51,24 @@ type cpuListWrite struct {
 	target string
 }
 
+type fakeCATCapabilityProvider struct {
+	capabilities map[int]rdt.CATCapability
+	err          error
+}
+
 type driftCPUListManager struct {
 	*fakeCPUListManager
 	matches bool
+}
+
+func (p fakeCATCapabilityProvider) GetCATCapabilities() (map[int]rdt.CATCapability, error) {
+	return p.capabilities, p.err
+}
+
+func supportedCATCapabilityProvider() fakeCATCapabilityProvider {
+	return fakeCATCapabilityProvider{capabilities: map[int]rdt.CATCapability{
+		0: {CBMMask: 0xffff, MinCBMBits: 1},
+	}}
 }
 
 func (m *driftCPUListManager) CPUListMatches(context.Context, string, string) (bool, error) {
@@ -74,7 +90,7 @@ func newTestPlugin(manager *fakeCPUListManager) *CPUListPlugin {
 			"share-a": 3,
 			"share-b": 3,
 		},
-	}, manager)
+	}, manager, supportedCATCapabilityProvider())
 }
 
 func handlerContext(view *model.CPUSetPartitionView) bulkheadapi.HandlerContext {
@@ -174,7 +190,7 @@ func TestGateBSNBRampUpWritesDeclaredShareNUMAClos(t *testing.T) {
 			"share-NUMA0":           3,
 			"isolation-snb-ramp-up": 7,
 		},
-	}, manager)
+	}, manager, supportedCATCapabilityProvider())
 
 	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(&view.CPUSetPartitionView)))
 	require.Equal(t, []cpuListWrite{
@@ -245,7 +261,7 @@ func TestGateBSNBRampUpAdjustmentStateWritesWrappedResourcePackageSourcePoolClos
 			sourcePool:           7,
 			wrappedIsolationPool: 9,
 		},
-	}, manager)
+	}, manager, supportedCATCapabilityProvider())
 
 	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(&view.CPUSetPartitionView)))
 	require.Equal(t, []cpuListWrite{
@@ -263,6 +279,48 @@ func TestCPUListPluginDisabledByTopLevelDisableRDT(t *testing.T) {
 	conf.AdminQoSConfiguration.QRMPluginConfiguration.RDTConfig.DisableRDT = true
 
 	require.False(t, plugin.Enable(bulkheadapi.HandlerContext{
+		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{DynamicConf: conf},
+	}))
+}
+
+func TestCPUListPluginEnableIgnoresCATUnsupported(t *testing.T) {
+	plugin := NewCPUListPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeCPUListManager{},
+		fakeCATCapabilityProvider{err: rdt.ErrCATUnsupported})
+	conf := dynamicconfig.NewConfiguration()
+	conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.EnableCPUList = true
+
+	require.True(t, plugin.Enable(bulkheadapi.HandlerContext{
+		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{DynamicConf: conf},
+	}))
+}
+
+func TestCPUListPluginHandlerNoopsWhenCATUnsupported(t *testing.T) {
+	manager := &fakeCPUListManager{clos: []Clos{{ID: "dedicated", Epoch: 1}}}
+	plugin := NewCPUListPluginWithManager(&qrmresctrl.ResctrlConfig{}, manager,
+		fakeCATCapabilityProvider{err: rdt.ErrCATUnsupported})
+
+	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(
+		&model.CPUSetPartitionView{Dedicated: machine.NewCPUSet(1)},
+	)))
+	require.Empty(t, manager.writes)
+}
+
+func TestCPUListPluginDisabledHandlerNoopsWhenCATUnsupported(t *testing.T) {
+	manager := &fakeCPUListManager{clos: []Clos{{ID: "dedicated", Epoch: 1}}}
+	plugin := NewCPUListPluginWithManager(&qrmresctrl.ResctrlConfig{}, manager,
+		fakeCATCapabilityProvider{err: rdt.ErrCATUnsupported})
+
+	require.NoError(t, plugin.CPUSetAdjustmentDisabledHandler(context.Background(), bulkheadapi.HandlerContext{}))
+	require.Empty(t, manager.writes)
+}
+
+func TestCPUListPluginRemainsEnabledOnCATCapabilityReadError(t *testing.T) {
+	plugin := NewCPUListPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeCPUListManager{},
+		fakeCATCapabilityProvider{err: errors.New("read L3 cbm_mask: permission denied")})
+	conf := dynamicconfig.NewConfiguration()
+	conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.EnableCPUList = true
+
+	require.True(t, plugin.Enable(bulkheadapi.HandlerContext{
 		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{DynamicConf: conf},
 	}))
 }
@@ -374,7 +432,7 @@ func TestCPUListPluginDisabledTransitionClearsManagedClos(t *testing.T) {
 		{ID: consts.ResctrlGroupDedicated, Epoch: 1},
 		{ID: consts.ResctrlGroupReclaim, Epoch: 1},
 	}}
-	plugin := NewCPUListPluginWithManager(&qrmresctrl.ResctrlConfig{}, manager)
+	plugin := NewCPUListPluginWithManager(&qrmresctrl.ResctrlConfig{}, manager, supportedCATCapabilityProvider())
 
 	require.NoError(t, plugin.CPUSetAdjustmentDisabledHandler(context.Background(), handlerContext(nil)))
 	require.Equal(t, []cpuListWrite{
@@ -387,7 +445,7 @@ func TestCPUListPluginDisabledTransitionPreservesExternalClosWithoutExplicitSkip
 		{ID: "external", Epoch: 1},
 		{ID: "custom", Epoch: 1},
 	}}
-	plugin := NewCPUListPluginWithManager(&qrmresctrl.ResctrlConfig{}, manager)
+	plugin := NewCPUListPluginWithManager(&qrmresctrl.ResctrlConfig{}, manager, supportedCATCapabilityProvider())
 
 	require.NoError(t, plugin.CPUSetAdjustmentDisabledHandler(context.Background(), handlerContext(nil)))
 	require.Empty(t, manager.writes)
@@ -401,7 +459,7 @@ func TestCPUListPluginDisabledTransitionDoesNotUseSkipCleanupAsWriteProtection(t
 	plugin := NewCPUListPluginWithManager(&qrmresctrl.ResctrlConfig{
 		CPUSetPoolToSharedSubgroup: map[string]int{"share-a": 3},
 		SkipCleanupClosIDs:         sets.NewString("share-03"),
-	}, manager)
+	}, manager, supportedCATCapabilityProvider())
 
 	require.NoError(t, plugin.CPUSetAdjustmentDisabledHandler(context.Background(), handlerContext(nil)))
 	require.Equal(t, []cpuListWrite{
@@ -431,7 +489,7 @@ func TestCPUListPluginScopesSharedClosToConfiguredSubgroups(t *testing.T) {
 
 	t.Run("normal reconcile", func(t *testing.T) {
 		manager := &fakeCPUListManager{clos: clos}
-		plugin := NewCPUListPluginWithManager(config, manager)
+		plugin := NewCPUListPluginWithManager(config, manager, supportedCATCapabilityProvider())
 
 		require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), handlerContext(
 			&model.CPUSetPartitionView{
@@ -451,7 +509,7 @@ func TestCPUListPluginScopesSharedClosToConfiguredSubgroups(t *testing.T) {
 
 	t.Run("disabled transition", func(t *testing.T) {
 		manager := &fakeCPUListManager{clos: clos}
-		plugin := NewCPUListPluginWithManager(config, manager)
+		plugin := NewCPUListPluginWithManager(config, manager, supportedCATCapabilityProvider())
 
 		require.NoError(t, plugin.CPUSetAdjustmentDisabledHandler(context.Background(), handlerContext(nil)))
 		require.Equal(t, []cpuListWrite{
