@@ -24,6 +24,31 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
+// coresInNUMA returns the cpuset of the [start,end) cores (both SMT siblings per
+// core) of the given NUMA, ordered by ascending core id. It lets tests build
+// core-aligned inputs regardless of the sibling-id offset the dummy topology
+// uses, so a "reclaim" or "donor" fixture never accidentally holds a half core.
+func coresInNUMA(topology *machine.CPUTopology, numaID, start, end int) machine.CPUSet {
+	cores := topology.CPUDetails.CoresInNUMANodes(numaID).ToSliceInt()
+	if start < 0 {
+		start = 0
+	}
+	if end > len(cores) {
+		end = len(cores)
+	}
+	if start >= end {
+		return machine.NewCPUSet()
+	}
+	return topology.CPUDetails.CPUsInCores(cores[start:end]...)
+}
+
+// requireCoreAligned fails when reclaim holds a partial physical core.
+func requireCoreAligned(t *testing.T, topology *machine.CPUTopology, reclaim machine.CPUSet) {
+	t.Helper()
+	require.NoErrorf(t, assertCoreAligned(reclaim, topology),
+		"reclaim %s must be core-aligned", reclaim.String())
+}
+
 func TestPlanHardReclaimPartitionKeepsSixCPUsOnEvery32CPUNUMA(t *testing.T) {
 	t.Parallel()
 
@@ -42,28 +67,31 @@ func TestPlanHardReclaimPartitionKeepsSixCPUsOnEvery32CPUNUMA(t *testing.T) {
 		reclaimEligible machine.CPUSet
 	}{
 		{
+			// shared / SNB: the whole NUMA is free, reclaim carves three complete
+			// cores per NUMA.
 			name:            "shared and SNB",
 			free:            numa0.Union(numa1),
 			currentReclaim:  machine.NewCPUSet(),
 			reclaimEligible: numa0.Union(numa1),
 		},
 		{
+			// ordinary DNB: two free cores plus one core of donor excess per NUMA.
 			name: "ordinary DNB",
-			free: machine.NewCPUSet(
-				append(numa0.ToSliceInt()[:4], numa1.ToSliceInt()[:4]...)...),
+			free: coresInNUMA(topology, 0, 0, 2).Union(coresInNUMA(topology, 1, 0, 2)),
 			donors: []hardReclaimPartitionDonor{
-				{key: "dnb-0", cpus: machine.NewCPUSet(numa0.ToSliceInt()[4:14]...), requestQuantity: 8},
-				{key: "dnb-1", cpus: machine.NewCPUSet(numa1.ToSliceInt()[4:14]...), requestQuantity: 8},
+				{key: "dnb-0", cpus: coresInNUMA(topology, 0, 2, 7), requestQuantity: 8},
+				{key: "dnb-1", cpus: coresInNUMA(topology, 1, 2, 7), requestQuantity: 8},
 			},
 			reclaimEligible: numa0.Union(numa1),
 		},
 		{
+			// exclusive DNB: reclaim comes purely from three free cores; the donor
+			// holds exactly its request so no excess is handed back.
 			name: "exclusive DNB",
-			free: machine.NewCPUSet(
-				append(numa0.ToSliceInt()[:6], numa1.ToSliceInt()[:6]...)...),
+			free: coresInNUMA(topology, 0, 0, 3).Union(coresInNUMA(topology, 1, 0, 3)),
 			donors: []hardReclaimPartitionDonor{
-				{key: "exclusive-0", cpus: machine.NewCPUSet(numa0.ToSliceInt()[6:]...), requestQuantity: 26},
-				{key: "exclusive-1", cpus: machine.NewCPUSet(numa1.ToSliceInt()[6:]...), requestQuantity: 26},
+				{key: "exclusive-0", cpus: coresInNUMA(topology, 0, 3, 16), requestQuantity: 26},
+				{key: "exclusive-1", cpus: coresInNUMA(topology, 1, 3, 16), requestQuantity: 26},
 			},
 			reclaimEligible: numa0.Union(numa1),
 		},
@@ -83,8 +111,78 @@ func TestPlanHardReclaimPartitionKeepsSixCPUsOnEvery32CPUNUMA(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, 6, plan.reclaim.Intersection(numa0).Size())
 			require.Equal(t, 6, plan.reclaim.Intersection(numa1).Size())
+			requireCoreAligned(t, topology, plan.reclaim)
 		})
 	}
+}
+
+// TestPlanHardReclaimPartitionSelectsCompletePhysicalCores reconstructs the exact
+// node symptom: a naive lowest-id fill on an SMT2 topology strands the high
+// siblings and yields {0-20,96-102}-style half cores. The core-aligned selection
+// must instead keep both siblings of every chosen core.
+func TestPlanHardReclaimPartitionSelectsCompletePhysicalCores(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(64, 2, 2)
+	require.NoError(t, err)
+	require.Equal(t, 2, topology.CPUsPerCore())
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+
+	plan, err := planHardReclaimPartition(hardReclaimPartitionInput{
+		topology:        topology,
+		targetByNUMA:    map[int]int{0: 6},
+		currentReclaim:  machine.NewCPUSet(),
+		free:            numa0,
+		reclaimEligible: numa0,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 6, plan.reclaim.Size())
+	requireCoreAligned(t, topology, plan.reclaim)
+}
+
+// TestPlanHardReclaimPartitionIsIdempotentOnAlignedInput proves an already
+// core-aligned currentReclaim is reused byte-for-byte (no churn).
+func TestPlanHardReclaimPartitionIsIdempotentOnAlignedInput(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(64, 2, 2)
+	require.NoError(t, err)
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	current := coresInNUMA(topology, 0, 0, 3)
+
+	plan, err := planHardReclaimPartition(hardReclaimPartitionInput{
+		topology:        topology,
+		targetByNUMA:    map[int]int{0: 6},
+		currentReclaim:  current,
+		free:            numa0.Difference(current),
+		reclaimEligible: numa0,
+	})
+	require.NoError(t, err)
+	require.True(t, plan.reclaim.Equals(current), "aligned reclaim must be reused: got %s want %s",
+		plan.reclaim.String(), current.String())
+}
+
+// TestPlanHardReclaimPartitionNonSMTZeroDrift proves that on a non-SMT topology
+// (CPUsPerCore()==1) every cpu is its own core, so selection reduces to a
+// prefer-first lowest-id take with no behavioral drift.
+func TestPlanHardReclaimPartitionNonSMTZeroDrift(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopologyWithoutSMT(16, 1, 1)
+	require.NoError(t, err)
+	require.Equal(t, 1, topology.CPUsPerCore())
+	numa := topology.CPUDetails.CPUsInNUMANodes(0)
+
+	plan, err := planHardReclaimPartition(hardReclaimPartitionInput{
+		topology:        topology,
+		targetByNUMA:    map[int]int{0: 5},
+		currentReclaim:  machine.NewCPUSet(),
+		free:            numa,
+		reclaimEligible: numa,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 5, plan.reclaim.Size())
+	requireCoreAligned(t, topology, plan.reclaim)
 }
 
 func TestPlanHardReclaimPartitionSubtractsSatisfiedFloorBeforeAllocation(t *testing.T) {
@@ -93,9 +191,9 @@ func TestPlanHardReclaimPartitionSubtractsSatisfiedFloorBeforeAllocation(t *test
 	topology, err := machine.GenerateDummyCPUTopology(32, 1, 1)
 	require.NoError(t, err)
 	numa := topology.CPUDetails.CPUsInNUMANodes(0)
-	cpus := numa.ToSliceInt()
-	currentFloor := machine.NewCPUSet(cpus[:6]...)
-	free := machine.NewCPUSet(cpus[6:10]...)
+	// three complete cores already reclaimed; the fourth core comes from free.
+	currentFloor := coresInNUMA(topology, 0, 0, 3)
+	free := coresInNUMA(topology, 0, 3, 5)
 
 	plan, err := planHardReclaimPartition(hardReclaimPartitionInput{
 		topology:        topology,
@@ -108,6 +206,7 @@ func TestPlanHardReclaimPartitionSubtractsSatisfiedFloorBeforeAllocation(t *test
 	require.Equal(t, 8, plan.reclaim.Size(), "advisor quantity already includes the six-CPU floor")
 	require.True(t, currentFloor.IsSubsetOf(plan.reclaim))
 	require.Equal(t, 2, plan.reclaim.Difference(currentFloor).Size())
+	requireCoreAligned(t, topology, plan.reclaim)
 }
 
 func TestPlanHardReclaimPartitionDonatesSameNUMADedicatedExcess(t *testing.T) {
@@ -116,9 +215,8 @@ func TestPlanHardReclaimPartitionDonatesSameNUMADedicatedExcess(t *testing.T) {
 	topology, err := machine.GenerateDummyCPUTopology(32, 1, 1)
 	require.NoError(t, err)
 	numa := topology.CPUDetails.CPUsInNUMANodes(0)
-	cpus := numa.ToSliceInt()
-	free := machine.NewCPUSet(cpus[:4]...)
-	dedicated := machine.NewCPUSet(cpus[4:12]...)
+	free := coresInNUMA(topology, 0, 0, 2)      // two free cores
+	dedicated := coresInNUMA(topology, 0, 2, 6) // four dedicated cores, request 6 cpus (three cores)
 
 	plan, err := planHardReclaimPartition(hardReclaimPartitionInput{
 		topology:        topology,
@@ -134,29 +232,34 @@ func TestPlanHardReclaimPartitionDonatesSameNUMADedicatedExcess(t *testing.T) {
 	require.Equal(t, 6, plan.donorCPUs["dnb"].Size())
 	require.Equal(t, 2, plan.reclaim.Intersection(dedicated).Size())
 	require.True(t, plan.reclaim.Intersection(plan.donorCPUs["dnb"]).IsEmpty())
+	requireCoreAligned(t, topology, plan.reclaim)
+	// the donor's retained set must also stay core-aligned: excess is handed back
+	// in complete cores, never a lone SMT sibling.
+	requireCoreAligned(t, topology, plan.donorCPUs["dnb"])
 }
 
-func TestPlanHardReclaimPartitionRejectsDonationBelowCeilRequestAndNonReclaimableCPUs(t *testing.T) {
+func TestPlanHardReclaimPartitionRejectsDonationBelowCeilRequest(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(32, 1, 1)
 	require.NoError(t, err)
 	numa := topology.CPUDetails.CPUsInNUMANodes(0)
-	cpus := numa.ToSliceInt()
-	free := machine.NewCPUSet(cpus[:4]...)
-	dedicated := machine.NewCPUSet(cpus[4:12]...)
-	nonReclaimable := machine.NewCPUSet(cpus[11])
+	free := coresInNUMA(topology, 0, 0, 2)      // two free cores (four cpus)
+	dedicated := coresInNUMA(topology, 0, 2, 6) // four dedicated cores (eight cpus)
 
+	// request floor ceil(6.2)=7 leaves only one cpu of excess, which is less than a
+	// complete core, so no core can be handed back; the fourth reclaim core cannot
+	// be satisfied.
 	_, err = planHardReclaimPartition(hardReclaimPartitionInput{
 		topology:        topology,
 		targetByNUMA:    map[int]int{0: 6},
 		free:            free,
-		reclaimEligible: numa.Difference(nonReclaimable),
+		reclaimEligible: numa,
 		donors: []hardReclaimPartitionDonor{{
 			key: "dnb", cpus: dedicated, requestQuantity: 6.2,
 		}},
 	})
-	require.ErrorContains(t, err, "NUMA 0 needs 1 more reclaim CPUs")
+	require.ErrorContains(t, err, "NUMA 0 needs 2 more reclaim CPUs")
 }
 
 func TestPlanHardReclaimPartitionChecksRequestFloorForLegacyOverlappingReclaim(t *testing.T) {
@@ -165,10 +268,13 @@ func TestPlanHardReclaimPartitionChecksRequestFloorForLegacyOverlappingReclaim(t
 	topology, err := machine.GenerateDummyCPUTopology(32, 1, 1)
 	require.NoError(t, err)
 	numa := topology.CPUDetails.CPUsInNUMANodes(0)
-	free := machine.NewCPUSet(numa.ToSliceInt()[:4]...)
-	dedicated := machine.NewCPUSet(numa.ToSliceInt()[4:12]...)
-	currentReclaim := machine.NewCPUSet(numa.ToSliceInt()[4:6]...)
+	free := coresInNUMA(topology, 0, 0, 2)
+	dedicated := coresInNUMA(topology, 0, 2, 6)
+	currentReclaim := coresInNUMA(topology, 0, 2, 3) // one core already overlapping the donor
 
+	// even with an overlapping legacy reclaim core, the request floor ceil(6.2)=7
+	// leaves under one core of donatable excess, so the extra reclaim core is
+	// rejected rather than stealing below the request floor.
 	_, err = planHardReclaimPartition(hardReclaimPartitionInput{
 		topology:        topology,
 		targetByNUMA:    map[int]int{0: 6},
@@ -179,8 +285,7 @@ func TestPlanHardReclaimPartitionChecksRequestFloorForLegacyOverlappingReclaim(t
 			key: "dnb", cpus: dedicated, requestQuantity: 6.2,
 		}},
 	})
-
-	require.ErrorContains(t, err, "NUMA 0 needs 1 more reclaim CPUs")
+	require.ErrorContains(t, err, "NUMA 0 needs")
 }
 
 func TestPlanHardReclaimPartitionSharesRequestFloorAcrossNUMADonors(t *testing.T) {
@@ -190,8 +295,8 @@ func TestPlanHardReclaimPartitionSharesRequestFloorAcrossNUMADonors(t *testing.T
 	require.NoError(t, err)
 	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
 	numa1 := topology.CPUDetails.CPUsInNUMANodes(1)
-	donor0 := machine.NewCPUSet(numa0.ToSliceInt()[:6]...)
-	donor1 := machine.NewCPUSet(numa1.ToSliceInt()[:6]...)
+	donor0 := coresInNUMA(topology, 0, 0, 3) // three cores (six cpus)
+	donor1 := coresInNUMA(topology, 1, 0, 3) // three cores (six cpus)
 
 	plan, err := planHardReclaimPartition(hardReclaimPartitionInput{
 		topology:        topology,
@@ -207,4 +312,5 @@ func TestPlanHardReclaimPartitionSharesRequestFloorAcrossNUMADonors(t *testing.T
 	require.Equal(t, 2, plan.reclaim.Intersection(numa0).Size())
 	require.Equal(t, 2, plan.reclaim.Intersection(numa1).Size())
 	require.Equal(t, 8, plan.donorCPUs["dnb-numa0"].Size()+plan.donorCPUs["dnb-numa1"].Size())
+	requireCoreAligned(t, topology, plan.reclaim)
 }

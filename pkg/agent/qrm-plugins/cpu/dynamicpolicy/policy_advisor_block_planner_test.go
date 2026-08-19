@@ -729,9 +729,51 @@ func TestExpandHardPartitionReclaimPhase_MixedRealAndFakeWaterFilling(t *testing
 	require.NoError(t, err)
 	require.Equal(t, map[string]map[int]int{
 		"real-0": {0: 2},
-		"fake":   {0: 1, 1: 3},
+		"fake":   {0: 2, 1: 2},
 	}, hardReclaimDemandQuotasByBlock(t, demands, topology))
 	requireHardReclaimFinalBalance(t, demands, topology, []int{0, 1})
+}
+
+func TestExpandHardPartitionReclaimPhase_WaterFillsCompleteCores(t *testing.T) {
+	t.Parallel()
+
+	// SMT2 topology: NUMA0 CPUs {0,1,4,5} (cores 0,1), NUMA1 CPUs {2,3,6,7} (cores 2,3).
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	cpusPerCore := topology.CPUsPerCore()
+	require.Equal(t, 2, cpusPerCore)
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	numa1 := topology.CPUDetails.CPUsInNUMANodes(1)
+	available := numa0.Union(numa1)
+	// real-0 pins 2 cpus (1 core) on NUMA0; the fake block spreads 4 more cpus (2 cores).
+	// CPU-granular water-filling would balance to {0:1,1:3}, giving NUMA0 a 3-cpu (1.5-core)
+	// total and NUMA1 a 3-cpu (1.5-core) total: two orphan half-cores. Core-granular
+	// water-filling must instead keep every per-NUMA total on a whole-core boundary.
+	descriptors := []advisorBlockDescriptor{
+		{
+			BlockID: "real-0", Class: advisorBlockClassMandatoryReclaim, NUMAID: 0,
+			Quantity: 2, ComponentKey: "real-0", Eligible: numa0,
+		},
+		{
+			BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
+			Quantity: 4, ComponentKey: "fake", Eligible: available,
+		},
+	}
+
+	demands, _, err := expandHardPartitionReclaimPhase(descriptors, available, topology)
+	require.NoError(t, err)
+
+	final := make(map[int]int)
+	for _, demand := range demands {
+		numaIDs := topology.CPUDetails.KeepOnly(demand.eligible).NUMANodes().ToSliceInt()
+		require.Len(t, numaIDs, 1)
+		final[numaIDs[0]] += demand.quantity
+	}
+	for numaID, quantity := range final {
+		require.Zerof(t, quantity%cpusPerCore,
+			"NUMA %d hard reclaim total %d must be a whole-core multiple of %d",
+			numaID, quantity, cpusPerCore)
+	}
 }
 
 func TestExpandHardPartitionReclaimPhase_MultipleFakeBlocksFailClosed(t *testing.T) {
@@ -842,8 +884,9 @@ func requireHardReclaimFinalBalance(
 		final[numaIDs[0]] += demand.quantity
 	}
 	minimum, maximum := final[eligibleNUMAs[0]], final[eligibleNUMAs[0]]
+	cpusPerCore := topology.CPUsPerCore()
 	for _, numaID := range eligibleNUMAs {
-		require.GreaterOrEqual(t, final[numaID], minimumHardReclaimCPUsPerNUMA)
+		require.GreaterOrEqual(t, final[numaID], minimumHardReclaimCoresPerNUMA*cpusPerCore)
 		if final[numaID] < minimum {
 			minimum = final[numaID]
 		}
@@ -851,5 +894,5 @@ func requireHardReclaimFinalBalance(
 			maximum = final[numaID]
 		}
 	}
-	require.LessOrEqual(t, maximum-minimum, 1)
+	require.LessOrEqual(t, maximum-minimum, cpusPerCore)
 }

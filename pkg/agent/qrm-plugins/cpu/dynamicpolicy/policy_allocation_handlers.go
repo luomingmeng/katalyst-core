@@ -3528,14 +3528,15 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloorForMode(
 			return machine.NewCPUSet(), fmt.Errorf("distribute configured ramp-up reclaim floor: %w", err)
 		}
 	} else {
-		minimum := minimumHardReclaimCPUsPerNUMA * len(numaIDs)
+		minimumPerNUMA := minimumHardReclaimCoresPerNUMA * p.machineInfo.CPUTopology.CPUsPerCore()
+		minimum := minimumPerNUMA * len(numaIDs)
 		if configuredFloor > minimum {
 			minimum = configuredFloor
 		}
 		globalTarget := machine.CalculateGlobalRampUpReclaimTarget(totalEligible, ratio, minimum)
 		var err error
 		targetByNUMA, err = machine.DistributeNUMATarget(
-			availableByNUMA, globalTarget, minimumHardReclaimCPUsPerNUMA)
+			availableByNUMA, globalTarget, minimumPerNUMA)
 		if err != nil {
 			return machine.NewCPUSet(), fmt.Errorf("derive ramp-up reclaim floor failed: %w", err)
 		}

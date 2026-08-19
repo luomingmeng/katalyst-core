@@ -107,17 +107,20 @@ func planHardReclaimPartition(in hardReclaimPartitionInput) (*hardReclaimPartiti
 				numaID, eligible.Size(), target)
 		}
 
+		// fill from the non-donor pool first (currently pinned reclaim + free
+		// cpus), selecting complete physical cores only. stable and free are
+		// merged into one candidate universe so a core whose siblings are split
+		// across the two (one sibling already reclaimed, the other still free)
+		// is still selectable as a whole core; `currentReclaim` is passed as the
+		// preference so stable cores are consumed before fresh ones (minimizing
+		// churn) — invariant B.
 		stableReclaim := in.currentReclaim.Intersection(eligible).Difference(allDonorCPUs)
-		selected := takeLowestCPUSet(stableReclaim, target)
+		free := in.free.Intersection(eligible).
+			Difference(in.currentReclaim).
+			Difference(allDonorCPUs)
+		nonDonorPool := stableReclaim.Union(free)
+		selected := takeCoreAlignedCPUSet(in.topology, nonDonorPool, in.currentReclaim, target)
 		need := target - selected.Size()
-		if need > 0 {
-			free := in.free.Intersection(eligible).
-				Difference(in.currentReclaim).
-				Difference(allDonorCPUs)
-			taken := takeLowestCPUSet(free, need)
-			selected = selected.Union(taken)
-			need -= taken.Size()
-		}
 
 		for _, key := range donorKeys {
 			if need == 0 {
@@ -138,14 +141,11 @@ func planHardReclaimPartition(in hardReclaimPartitionInput) (*hardReclaimPartiti
 			if excess < limit {
 				limit = excess
 			}
-			overlappingReclaim := candidates.Intersection(in.currentReclaim)
-			taken := takeLowestCPUSet(overlappingReclaim, limit)
-			if taken.Size() < limit {
-				taken = taken.Union(takeLowestCPUSet(
-					candidates.Difference(overlappingReclaim),
-					limit-taken.Size(),
-				))
-			}
+			// hand donor excess back in complete cores only: preferring the cores
+			// that already overlap the current reclaim set keeps churn low, and
+			// takeCoreAlignedCPUSet crops `limit` down to a whole-core multiple so
+			// the donor never loses (nor reclaim gains) a lone SMT sibling.
+			taken := takeCoreAlignedCPUSet(in.topology, candidates, in.currentReclaim, limit)
 			selected = selected.Union(taken)
 			plan.donorCPUs[key] = remainingDonor.Difference(taken)
 			need -= taken.Size()
@@ -154,6 +154,10 @@ func planHardReclaimPartition(in hardReclaimPartitionInput) (*hardReclaimPartiti
 			return nil, fmt.Errorf("NUMA %d needs %d more reclaim CPUs", numaID, need)
 		}
 		plan.reclaim = plan.reclaim.Union(selected)
+	}
+
+	if err := assertCoreAligned(plan.reclaim, in.topology); err != nil {
+		return nil, fmt.Errorf("hard reclaim partition plan violated core alignment: %w", err)
 	}
 	return plan, nil
 }
@@ -221,15 +225,4 @@ func pinHardReclaimPartitionDemands(
 		}
 	}
 	return pinned, nil
-}
-
-func takeLowestCPUSet(cpus machine.CPUSet, quantity int) machine.CPUSet {
-	if quantity <= 0 || cpus.IsEmpty() {
-		return machine.NewCPUSet()
-	}
-	ordered := cpus.ToSliceInt()
-	if quantity < len(ordered) {
-		ordered = ordered[:quantity]
-	}
-	return machine.NewCPUSet(ordered...)
 }
