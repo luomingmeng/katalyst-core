@@ -18,6 +18,7 @@ package plugin
 
 import (
 	"math"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -27,6 +28,8 @@ import (
 	"go.uber.org/atomic"
 
 	configv1alpha1 "github.com/kubewharf/katalyst-api/pkg/apis/config/v1alpha1"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/memory/dynamicpolicy/memoryadvisor"
+	types "github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/consts"
@@ -87,10 +90,78 @@ func TestGetAdvices_MultiPath(t *testing.T) {
 	require.Contains(t, paths, "/parentPath/childPath-0")
 }
 
+func TestGetAdvices_ScalesConsumerLimitsByConfiguredPercentage(t *testing.T) {
+	t.Parallel()
+
+	machineInfo := &machine.KatalystMachineInfo{
+		CPUTopology: &machine.CPUTopology{
+			CPUDetails: machine.CPUDetails{
+				0: machine.CPUTopoInfo{NUMANodeID: 0},
+				1: machine.CPUTopoInfo{NUMANodeID: 1},
+			},
+		},
+	}
+	require.NoError(t, reclaim.RegisterNamedGenericConsumer(reclaim.GenericConsumerName, newGuardConf("/group-a"), machineInfo))
+	require.NoError(t, reclaim.RegisterNamedGenericConsumer("consumer-b", newGuardConf("/group-b"), machineInfo))
+	t.Cleanup(func() {
+		reclaim.UnregisterConsumer(reclaim.GenericConsumerName)
+		reclaim.UnregisterConsumer("consumer-b")
+	})
+
+	dynamicConf := dynamicconfig.NewConfiguration()
+	dynamicConf.ReclaimedPercentageByConsumer = map[string]int{
+		reclaim.GenericConsumerName: 0,
+		"consumer-b":                100,
+	}
+	conf := config.NewConfiguration()
+	conf.SetDynamicConfiguration(dynamicConf)
+
+	mg := &memoryGuard{
+		reclaimRelativeRootCgroupPaths: []string{"/group-a", "/group-b"},
+		numaBindingRelativeRootCgroupPaths: map[int][]string{
+			0: {"/group-a-0", "/group-b-0"},
+			1: {"/group-a-1", "/group-b-1"},
+		},
+		reclaimMemoryLimit:            atomic.NewInt64(1024),
+		numaBindingReclaimMemoryLimit: &atomic.Value{},
+		reconcileStatus:               atomic.NewString(reconcileStatusSucceeded),
+		conf:                          conf,
+	}
+	mg.numaBindingReclaimMemoryLimit.Store(map[int]int64{
+		0: 512,
+		1: 256,
+	})
+
+	got := mg.GetAdvices()
+
+	require.Equal(t, int64(0), memoryLimitAdvice(t, got, "/group-a"))
+	require.Equal(t, int64(1024), memoryLimitAdvice(t, got, "/group-b"))
+	require.Equal(t, int64(0), memoryLimitAdvice(t, got, "/group-a-0"))
+	require.Equal(t, int64(512), memoryLimitAdvice(t, got, "/group-b-0"))
+	require.Equal(t, int64(0), memoryLimitAdvice(t, got, "/group-a-1"))
+	require.Equal(t, int64(256), memoryLimitAdvice(t, got, "/group-b-1"))
+}
+
 func newGuardConf(cgroupPath string) *config.Configuration {
 	c := config.NewConfiguration()
 	c.BaseConfiguration.ReclaimRelativeRootCgroupPath = cgroupPath
 	return c
+}
+
+func memoryLimitAdvice(t *testing.T, result types.InternalMemoryCalculationResult, cgroupPath string) int64 {
+	t.Helper()
+	for _, entry := range result.ExtraEntries {
+		if entry.CgroupPath != cgroupPath {
+			continue
+		}
+		value, ok := entry.Values[string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes)]
+		require.True(t, ok)
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		require.NoError(t, err)
+		return parsed
+	}
+	require.Failf(t, "missing memory limit advice", "cgroup path %s", cgroupPath)
+	return 0
 }
 
 func TestGetCriticalWatermarkPages(t *testing.T) {
