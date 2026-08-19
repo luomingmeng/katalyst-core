@@ -119,7 +119,24 @@ func NewCPUSetTopologyPlugin(conf *config.Configuration) bulkheadapi.Plugin {
 func (p *CPUSetTopologyPlugin) Name() string { return CPUSetTopologyPluginName }
 
 func (p *CPUSetTopologyPlugin) Enable(in bulkheadapi.HandlerContext) bool {
+	if p.disabledOnCgroupV2(context.Background()) {
+		return false
+	}
 	return enableBulkheadCpusetTopology(in)
+}
+
+// disabledOnCgroupV2 reports whether the cpuset_topology plugin must stay inert
+// on the current host. On cgroup v2 the plugin runs only when explicitly opted
+// in via EnableBulkheadCpusetTopologyOnCgroupV2; cgroup v1 is never gated. This
+// gate is applied at every mutation entry point (Enable, the disabled reset
+// handler, and the periodical handler) so a cgroup v2 host is never touched
+// when the opt-in is off, even though the manager may still invoke the disabled
+// reset handler after a previously-enabled round.
+func (p *CPUSetTopologyPlugin) disabledOnCgroupV2(ctx context.Context) bool {
+	if p.cfg.EnableBulkheadCpusetTopologyOnCgroupV2 {
+		return false
+	}
+	return p.cgroup.Version(ctx) == cgroupclient.CgroupVersionV2
 }
 
 func (p *CPUSetTopologyPlugin) Apply(
@@ -597,6 +614,9 @@ func containerCPUSetByPodFromFinalSnapshotWithDeferredCleanup(
 }
 
 func (p *CPUSetTopologyPlugin) CPUSetAdjustmentDisabledHandler(ctx context.Context, in bulkheadapi.HandlerContext) error {
+	if p.disabledOnCgroupV2(ctx) {
+		return nil
+	}
 	p.pendingProtections = map[string]pendingPodProtection{}
 	return p.resetCPUSetTopology(ctx, in)
 }
@@ -751,6 +771,9 @@ func (p *CPUSetTopologyPlugin) PeriodicalHandler(
 	ctx context.Context,
 	in bulkheadapi.PeriodicalHandlerContext,
 ) error {
+	if p.disabledOnCgroupV2(ctx) {
+		return nil
+	}
 	enabled := enableBulkheadCpusetTopologyByDynamicConf(in.DynamicConf)
 	if in.EffectiveEnabled != nil {
 		enabled = *in.EffectiveEnabled

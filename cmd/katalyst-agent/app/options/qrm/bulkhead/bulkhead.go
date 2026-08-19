@@ -34,6 +34,8 @@ type BulkheadOptions struct {
 	BulkheadPartitionRelPaths     []string
 	EnableBulkheadReclaimSiblings bool
 
+	EnableBulkheadCpusetTopologyOnCgroupV2 bool
+
 	BulkheadWorkqueueSysfsDir string
 	BulkheadWorkqueueNames    []string
 
@@ -84,6 +86,8 @@ func (o *BulkheadOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 		o.BulkheadPartitionRelPaths, "The cgroup relative paths whose cpuset partition should be root.")
 	fs.BoolVar(&o.EnableBulkheadReclaimSiblings, "qrm-cpu-enable-bulkhead-reclaim-siblings",
 		o.EnableBulkheadReclaimSiblings, "Whether cpu bulkhead should discover reclaim sibling cgroups.")
+	fs.BoolVar(&o.EnableBulkheadCpusetTopologyOnCgroupV2, "qrm-cpu-enable-bulkhead-cpuset-topology-on-cgroupv2",
+		o.EnableBulkheadCpusetTopologyOnCgroupV2, "Whether the cpu bulkhead cpuset_topology plugin runs on cgroup v2 hosts; when false the plugin is inert on cgroup v2 and only runs on cgroup v1.")
 	fs.StringVar(&o.BulkheadWorkqueueSysfsDir, "qrm-cpu-bulkhead-workqueue-sysfs-dir",
 		o.BulkheadWorkqueueSysfsDir, "The workqueue sysfs directory for cpu bulkhead.")
 	fs.StringSliceVar(&o.BulkheadWorkqueueNames, "qrm-cpu-bulkhead-workqueue-names",
@@ -134,6 +138,7 @@ func (o *BulkheadOptions) ApplyTo(conf *bulkheadconfig.BulkheadConfiguration) er
 	conf.BulkheadReclaimNumaPrefixes = normalizeRelSlice(o.BulkheadReclaimNumaPrefixes)
 	conf.BulkheadPartitionRelPaths = normalizeRelSlice(o.BulkheadPartitionRelPaths)
 	conf.EnableBulkheadReclaimSiblings = o.EnableBulkheadReclaimSiblings
+	conf.EnableBulkheadCpusetTopologyOnCgroupV2 = o.EnableBulkheadCpusetTopologyOnCgroupV2
 	conf.BulkheadWorkqueueSysfsDir = strings.TrimSpace(o.BulkheadWorkqueueSysfsDir)
 	conf.BulkheadWorkqueueNames = trimStringSlice(o.BulkheadWorkqueueNames)
 	conf.BulkheadSystemRelPath = normalizeRel(o.BulkheadSystemRelPath)
