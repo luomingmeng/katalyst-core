@@ -435,7 +435,7 @@ func SetExtraCGMemLimitWithTimeoutAndRelCGPath(ctx context.Context, relCgroupPat
 }
 
 func SetExtraCGMemLimitWithTimeoutAndAbsCGPath(timeoutSecs int, absCgroupPath string, nbytes int64) error {
-	if nbytes == 0 {
+	if nbytes < 0 {
 		return fmt.Errorf("invalid memory limit nbytes: %d", nbytes)
 	}
 
@@ -445,10 +445,6 @@ func SetExtraCGMemLimitWithTimeoutAndAbsCGPath(timeoutSecs int, absCgroupPath st
 	)
 
 	if common.CheckCgroup2UnifiedMode() {
-		if nbytes == 0 {
-			general.Infof("[SetExtraCGMemLimitWithTimeoutAndAbsCGPath] skip drop cache on %s since nbytes is zero", absCgroupPath)
-			return nil
-		}
 		// cgv2
 		cgroupFile = "memory.max"
 	} else {
