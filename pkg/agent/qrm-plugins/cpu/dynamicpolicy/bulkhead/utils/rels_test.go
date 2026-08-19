@@ -317,7 +317,7 @@ func TestBuildTopologyNodeSpecsFromViewRejectsCrossNUMADesiredCPU(t *testing.T) 
 	}
 }
 
-func TestBuildTopologyNodeSpecsFromViewDoesNotPublishMemsTargets(t *testing.T) {
+func TestBuildTopologyNodeSpecsFromViewDoesNotPublishMemsTargetsOrConstraints(t *testing.T) {
 	t.Parallel()
 
 	cfg := bulkheadconfig.BulkheadConfiguration{
@@ -344,6 +344,15 @@ func TestBuildTopologyNodeSpecsFromViewDoesNotPublishMemsTargets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildDAG: %v", err)
 	}
+	for _, spec := range specs {
+		if spec.Role != topology.TopoNodeRoleReclaimNUMABucket {
+			continue
+		}
+		if !spec.Constraint.MemUpperBound.IsEmpty() {
+			t.Fatalf("spec %q mem upper bound = %s, want empty; cpuset_mems plugin owns cpuset.mems",
+				spec.Rel, spec.Constraint.MemUpperBound.String())
+		}
+	}
 
 	plan, err := topology.BuildPhasePlan(topology.PhasePlanInput{
 		Kind: topology.PhaseDrain,
@@ -352,7 +361,7 @@ func TestBuildTopologyNodeSpecsFromViewDoesNotPublishMemsTargets(t *testing.T) {
 			Entries: map[string]topology.EntryState{
 				"kubepods":                {Identity: topology.CgroupIdentity{Inode: 1}, CPUs: machine.NewCPUSet(0, 1, 2, 3), Mems: "0-1"},
 				"kubesandbox":             {Identity: topology.CgroupIdentity{Inode: 2}, CPUs: machine.NewCPUSet(0, 1, 2, 3), Mems: "0-1"},
-				"kubesandbox/reclaimed-0": {Identity: topology.CgroupIdentity{Inode: 3}, CPUs: machine.NewCPUSet(0, 1, 2, 3), Mems: "0"},
+				"kubesandbox/reclaimed-0": {Identity: topology.CgroupIdentity{Inode: 3}, CPUs: machine.NewCPUSet(0, 1, 2, 3), Mems: "0-1"},
 			},
 			DomainUnion: map[topology.DomainID]machine.CPUSet{
 				topology.DomainPrimary: machine.NewCPUSet(0, 1, 2, 3),
