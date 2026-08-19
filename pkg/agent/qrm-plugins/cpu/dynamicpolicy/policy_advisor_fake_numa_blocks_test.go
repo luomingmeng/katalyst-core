@@ -157,7 +157,11 @@ func TestGenerateLegacyBlockCPUSet_HardPartitionBalancesFakeReclaim(t *testing.T
 		wantPerNUMA []int
 	}{
 		{name: "four CPUs", quantity: 4, wantPerNUMA: []int{2, 2}},
-		{name: "five CPUs", quantity: 5, wantPerNUMA: []int{3, 2}},
+		// whole-core water-filling on cpusPerCore==2: 6 CPUs are handed out one
+		// complete core at a time to the least-loaded NUMA (NUMA0<-2, NUMA1<-2,
+		// NUMA0<-2), so NUMA0 ends with 4 and NUMA1 with 2. an odd quantity is
+		// rejected upstream because it cannot be a whole-core multiple.
+		{name: "six CPUs", quantity: 6, wantPerNUMA: []int{4, 2}},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {

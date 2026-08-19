@@ -2680,10 +2680,15 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorUsesImmutablePerNUMACapacity(t *te
 		1: {DefaultCPUSet: machine.NewCPUSet(numa1.ToSliceInt()[:8]...)},
 	}, false)
 
+	// cpusPerCore==2, 32 CPUs (16 cores) per NUMA. ratio 0.2 yields
+	// floor(16*0.2)=3 cores, rounded down to an even number of donated cores
+	// (2 cores) => 4 CPUs per NUMA. the immutable per-NUMA capacity drives the
+	// target regardless of the smaller live DefaultCPUSet, and the result is
+	// always a whole-core multiple.
 	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), true)
 	require.NoError(t, err)
-	require.Equal(t, 6, floor.Intersection(numa0).Size())
-	require.Equal(t, 6, floor.Intersection(numa1).Size())
+	require.Equal(t, 4, floor.Intersection(numa0).Size())
+	require.Equal(t, 4, floor.Intersection(numa1).Size())
 }
 
 func TestDynamicPolicyDeriveRampUpReclaimFloorPreservesLegacyOverlapAlgorithm(t *testing.T) {
@@ -4009,6 +4014,96 @@ func TestMaterializeDefaultShareCPUSetScenarios(t *testing.T) {
 	}
 }
 
+// TestMaterializeDefaultShareResidualIsCoreAlignedUnderComplementClosure covers
+// the FillDefaultSharePoolWithNonReclaimCPUs=true third path (R12 / Task 4A). In
+// that mode the default share pool is NOT sized from a tier layer; it is the
+// residual complement `available - (fixed pools ∪ isolation)`. This test builds a
+// mixed SMT2 node — SNB + exclusive-DNB(reclaim overlap) + isolation + reclaim —
+// where every subtracted set is core-aligned, and proves complement closure: the
+// residual share pool is itself core-aligned, and materializeDefaultShareCPUSet is
+// left unmodified (no floor/crop), so its residual.Size()==expectedQuantity
+// fail-closed contract still holds.
+func TestMaterializeDefaultShareResidualIsCoreAlignedUnderComplementClosure(t *testing.T) {
+	t.Parallel()
+
+	// two-NUMA SMT2 host, 16 cpus / 8 cores each.
+	topology, err := machine.GenerateDummyCPUTopology(32, 1, 2)
+	require.NoError(t, err)
+	require.Equal(t, 2, topology.CPUsPerCore())
+
+	// core-aligned fixed consumers, disjoint per core:
+	//   reclaim   : 2 cores/NUMA (subtracted as a non-share pool, mirrors rampUpReclaimFloor)
+	//   snb       : 1 core on NUMA0
+	//   exclusive : 2 cores on NUMA1 (the DNB donor's retained set)
+	//   isolation : 1 core on NUMA0
+	reclaim := coresInNUMA(topology, 0, 0, 2).Union(coresInNUMA(topology, 1, 0, 2))
+	snb := coresInNUMA(topology, 0, 2, 3)
+	exclusive := coresInNUMA(topology, 1, 2, 4)
+	isolation := coresInNUMA(topology, 0, 3, 4)
+	requireCoreAligned(t, topology, reclaim)
+	requireCoreAligned(t, topology, snb)
+	requireCoreAligned(t, topology, exclusive)
+	requireCoreAligned(t, topology, isolation)
+
+	available := topology.CPUDetails.CPUs()
+	pools := map[string]machine.CPUSet{
+		commonstate.PoolNameReclaim: reclaim,
+		"snb-NUMA0":                 snb,
+		"exclusive-NUMA1":           exclusive,
+	}
+	isolated := map[string]map[string]machine.CPUSet{
+		"pod-iso": {"container-iso": isolation},
+	}
+
+	// expectedQuantity is the exact residual size: complement closure means it is
+	// the sum of complete cores left over, so it is core-aligned by construction.
+	fixed := reclaim.Union(snb).Union(exclusive).Union(isolation)
+	expected := available.Difference(fixed).Size()
+	require.Equal(t, 0, expected%topology.CPUsPerCore(),
+		"complement of core-aligned sets must itself be a whole-core multiple")
+
+	share, err := materializeDefaultShareCPUSet(expected, available, pools, isolated)
+	require.NoError(t, err)
+	require.Equal(t, expected, share.Size(),
+		"residual.Size() must equal expectedQuantity (fail-closed contract intact)")
+	require.True(t, share.Intersection(fixed).IsEmpty(),
+		"share residual must not overlap any fixed consumer")
+	requireCoreAligned(t, topology, share)
+	// reclaim buckets themselves stay untouched by the fill path and core-aligned.
+	requireCoreAligned(t, topology, share.Intersection(topology.CPUDetails.CPUsInNUMANodes(0)))
+	requireCoreAligned(t, topology, share.Intersection(topology.CPUDetails.CPUsInNUMANodes(1)))
+}
+
+// TestMaterializeDefaultShareResidualComplementClosureNonSMTZeroDrift is the
+// CPUsPerCore()==1 variant: with SMT disabled every cpu is its own core, so the
+// residual complement is trivially "core-aligned" and behavior is identical to
+// the pre-alignment code — proving the fill=true path carries zero drift on
+// non-SMT hosts.
+func TestMaterializeDefaultShareResidualComplementClosureNonSMTZeroDrift(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopologyWithoutSMT(16, 1, 1)
+	require.NoError(t, err)
+	require.Equal(t, 1, topology.CPUsPerCore())
+
+	available := topology.CPUDetails.CPUs()
+	reclaim := machine.NewCPUSet(0, 1, 2)
+	snb := machine.NewCPUSet(3)
+	pools := map[string]machine.CPUSet{
+		commonstate.PoolNameReclaim: reclaim,
+		"snb-NUMA0":                 snb,
+	}
+	fixed := reclaim.Union(snb)
+	expected := available.Difference(fixed).Size()
+
+	share, err := materializeDefaultShareCPUSet(expected, available, pools, nil)
+	require.NoError(t, err)
+	require.Equal(t, expected, share.Size())
+	require.True(t, share.Equals(available.Difference(fixed)),
+		"non-smt residual must be the plain complement, got %s", share.String())
+	requireCoreAligned(t, topology, share)
+}
+
 // TestFinalizeDefaultShareEntryReadsPostReviseState verifies finalizeDefaultShareEntry
 // derives the default share cpuset from the live newPodEntries pool allocation
 // results (i.e. post reclaimOverlapNUMABinding / post reviseReclaimPool), so a
@@ -4131,16 +4226,19 @@ func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorBackfillsDefaultShareResidu
 	p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
 
 	// seed a historical reclaim pool so takeCPUsForPoolsInPlaceWithPreferred pins the
-	// reclaim pool to {0,1} deterministically, plus a non-binding shared_cores container
-	// that owns the default share pool so cleanPools keeps the backfilled entry.
+	// reclaim pool to one complete core deterministically, plus a non-binding
+	// shared_cores container that owns the default share pool so cleanPools keeps the
+	// backfilled entry. the seed is core-aligned (one whole core) because the tier
+	// layer now forces whole-core reclaim selection (invariant B').
+	reclaimSeed := coresInNUMA(topology, 0, 0, 1)
 	seedEntries := state.PodEntries{
 		commonstate.PoolNameReclaim: {
 			commonstate.FakedContainerName: &state.AllocationInfo{
 				AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
-				AllocationResult:                 machine.NewCPUSet(0, 1),
-				OriginalAllocationResult:         machine.NewCPUSet(0, 1),
-				TopologyAwareAssignments:         map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1)},
-				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1)},
+				AllocationResult:                 reclaimSeed.Clone(),
+				OriginalAllocationResult:         reclaimSeed.Clone(),
+				TopologyAwareAssignments:         map[int]machine.CPUSet{0: reclaimSeed.Clone()},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: reclaimSeed.Clone()},
 			},
 		},
 		"share-pod": {
@@ -4182,16 +4280,19 @@ func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorBackfillsDefaultShareResidu
 
 	updatedEntries := p.state.GetPodEntries()
 
-	// reclaim pool stays pinned to its historical {0,1}.
+	// reclaim pool stays pinned to its historical whole core.
 	reclaim, err := updatedEntries.GetCPUSetForPool(commonstate.PoolNameReclaim)
 	require.NoError(t, err)
-	require.True(t, reclaim.Equals(machine.NewCPUSet(0, 1)), "reclaim=%s", reclaim)
+	require.True(t, reclaim.Equals(reclaimSeed), "reclaim=%s want=%s", reclaim, reclaimSeed)
+	requireCoreAligned(t, topology, reclaim)
 
 	// the default share pool entry is the backfilled residual = candidate - reclaim.
+	wantShare := topology.CPUDetails.CPUs().Difference(reclaimSeed)
 	share, err := updatedEntries.GetCPUSetForPool(commonstate.PoolNameShare)
 	require.NoError(t, err)
-	require.True(t, share.Equals(machine.NewCPUSet(2, 3, 4, 5, 6, 7)),
-		"share=%s want=2-7", share)
+	require.True(t, share.Equals(wantShare),
+		"share=%s want=%s", share, wantShare)
+	requireCoreAligned(t, topology, share)
 
 	// the owning shared_cores container inherits the backfilled share cpuset.
 	owner := updatedEntries["share-pod"]["container"]
