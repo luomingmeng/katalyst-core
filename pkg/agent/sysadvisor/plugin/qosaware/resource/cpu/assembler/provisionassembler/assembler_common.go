@@ -84,33 +84,61 @@ func (pa *ProvisionAssemblerCommon) cpuCountInNUMAs(numas machine.CPUSet) int {
 	return pa.metaServer.CPUDetails.CPUsInNUMANodes(numas.ToSliceInt()...).Size()
 }
 
+func (pa *ProvisionAssemblerCommon) reclaimRatioCPUsPerCore() (int, error) {
+	dynamicConf := pa.conf.GetDynamicConfiguration()
+	if !dynamicConf.EnableReclaim || !dynamicConf.EnableRampUpReclaimHardPartition {
+		return 1, nil
+	}
+	if pa.metaServer == nil || pa.metaServer.CPUTopology == nil {
+		return 0, fmt.Errorf("cpu topology is unavailable for hard reclaim ratio cap")
+	}
+	cpusPerCore := pa.metaServer.CPUTopology.CPUsPerCore()
+	if cpusPerCore <= 0 {
+		return 0, fmt.Errorf("invalid cpus per core %d for hard reclaim ratio cap", cpusPerCore)
+	}
+	return cpusPerCore, nil
+}
+
 // clampByReclaimedCPUMaxRatio caps the reclaim pool size (and quota when it is
 // not the -1 sentinel) by ratio*cpuCount. When ratio<=0 it disables clamping and
 // returns the inputs unchanged; a negative limit (e.g. the -1 "no quota limit"
 // sentinel) is preserved as-is.
 //
-// The cap is rounded down to the nearest even number, then raised to the
-// reclaim reservation in the same CPU scope when necessary.
+// In legacy mode the cap is rounded down to an even logical CPU count. In hard
+// partition mode the ratio is applied to physical cores, rounded down to an
+// even core count, and converted back to logical CPUs. The reclaim reservation
+// remains a floor in both modes.
 func clampByReclaimedCPUMaxRatio(
 	size int,
 	limit float64,
 	ratio float64,
 	cpuCount int,
 	reservedForReclaim int,
-) (int, float64) {
+	cpusPerCore int,
+) (int, float64, error) {
 	if ratio <= 0 {
-		return size, limit
+		return size, limit, nil
 	}
-	capCores := int(math.Floor(ratio * float64(cpuCount)))
-	capCores -= capCores % 2
-	capCores = general.Max(capCores, reservedForReclaim)
-	if size > capCores {
-		size = capCores
+	capCPUs, err := calculateReclaimRatioCap(cpuCount, ratio, reservedForReclaim, cpusPerCore)
+	if err != nil {
+		return 0, 0, err
 	}
-	if limit >= 0 && limit > float64(capCores) {
-		limit = float64(capCores)
+	if size > capCPUs {
+		size = capCPUs
 	}
-	return size, limit
+	if limit >= 0 && limit > float64(capCPUs) {
+		limit = float64(capCPUs)
+	}
+	return size, limit, nil
+}
+
+func calculateReclaimRatioCap(cpuCount int, ratio float64, reservedForReclaim, cpusPerCore int) (int, error) {
+	if cpusPerCore <= 1 {
+		capCPUs := int(math.Floor(ratio * float64(cpuCount)))
+		capCPUs -= capCPUs % 2
+		return general.Max(capCPUs, reservedForReclaim), nil
+	}
+	return machine.CalculatePerNUMAHardReclaimTarget(cpuCount, ratio, 0, reservedForReclaim, cpusPerCore)
 }
 
 // reclaimClampResult carries the structured diagnostics of a single reclaim
@@ -128,14 +156,20 @@ type reclaimClampResult struct {
 // without changing its clamp semantics; it only augments the return value with
 // diagnostics (raw size and released cores). It does not write into
 // InternalCPUCalculationResult and does not perform any accumulation.
-func clampByReclaimedCPUMaxRatioWithDiagnostics(size int, limit float64, ratio float64, cpuCount int, reservedForReclaim int) reclaimClampResult {
-	finalSize, finalLimit := clampByReclaimedCPUMaxRatio(size, limit, ratio, cpuCount, reservedForReclaim)
+func clampByReclaimedCPUMaxRatioWithDiagnostics(size int, limit float64, ratio float64,
+	cpuCount int, reservedForReclaim int, cpusPerCore int,
+) (reclaimClampResult, error) {
+	finalSize, finalLimit, err := clampByReclaimedCPUMaxRatio(
+		size, limit, ratio, cpuCount, reservedForReclaim, cpusPerCore)
+	if err != nil {
+		return reclaimClampResult{}, err
+	}
 	return reclaimClampResult{
 		RawSize:      size,
 		FinalSize:    finalSize,
 		ReleasedSize: general.Max(0, size-finalSize),
 		FinalLimit:   finalLimit,
-	}
+	}, nil
 }
 
 // defaultShareNUMABudget captures the per-NUMA canonical quantity budget used to
@@ -149,7 +183,9 @@ type defaultShareNUMABudget struct {
 	// the unpinned eligibility domain of this NUMA.
 	FinalUnpinnedReclaimSize int
 	// FixedUnpinnedPoolSize is the sum of non-default, non-reclaim, non-reserve,
-	// non-pinned, non-exclusive fixed pool quantities on this NUMA.
+	// non-pinned, non-exclusive fixed pool quantities on this NUMA. The sum may
+	// exceed the remaining capacity because QRM proportionally shrinks or
+	// overlaps fixed pools when their requested quantities cannot fit.
 	FixedUnpinnedPoolSize int
 	// Exclusive marks a NUMA that is owned by a NUMA-exclusive region; such a
 	// NUMA contributes zero default share residual and its nested
@@ -173,18 +209,25 @@ type defaultShareBudgetSummary struct {
 
 // calculateDefaultShareTargetSize computes the default share pool target size as
 // the sum over non-exclusive NUMAs of (unpinned allocatable - final unpinned
-// reclaim - fixed unpinned pools). Exclusive NUMAs contribute zero. A negative
-// per-NUMA residual is an invariant violation and surfaces as an error.
+// reclaim - materialized fixed unpinned pools). Exclusive NUMAs contribute
+// zero. Reclaim exceeding allocatable capacity is an invariant violation.
+// Fixed-pool quantity overcommit instead saturates the residual at zero because
+// QRM proportionally shrinks or overlaps those pools within the same capacity.
 func calculateDefaultShareTargetSize(budgetByNUMA map[int]defaultShareNUMABudget) (int, error) {
 	target := 0
 	for numaID, budget := range budgetByNUMA {
 		if budget.Exclusive {
 			continue
 		}
-		numaTarget := budget.UnpinnedAllocatableSize - budget.FinalUnpinnedReclaimSize - budget.FixedUnpinnedPoolSize
+		numaTarget := budget.UnpinnedAllocatableSize - budget.FinalUnpinnedReclaimSize
 		if numaTarget < 0 {
-			return 0, fmt.Errorf("default share residual is negative in numa %d: unpinned=%d reclaim=%d fixed=%d",
-				numaID, budget.UnpinnedAllocatableSize, budget.FinalUnpinnedReclaimSize, budget.FixedUnpinnedPoolSize)
+			return 0, fmt.Errorf("default share reclaim exceeds unpinned allocatable in numa %d: unpinned=%d reclaim=%d",
+				numaID, budget.UnpinnedAllocatableSize, budget.FinalUnpinnedReclaimSize)
+		}
+		if budget.FixedUnpinnedPoolSize >= numaTarget {
+			numaTarget = 0
+		} else {
+			numaTarget -= budget.FixedUnpinnedPoolSize
 		}
 		target += numaTarget
 	}
@@ -403,8 +446,8 @@ func (pa *ProvisionAssemblerCommon) buildDefaultShareBudget(
 	// capacity (combined.UnpinnedAllocatableSize stays 0) nor reclaim/fixed
 	// entries. If that assumption is violated (e.g. a reclaim entry exists at
 	// FakedNUMAID while nonBinding is empty), the combined bucket ends up with
-	// alloc=0 but reclaim>0, so calculateDefaultShareTargetSize reports a
-	// negative residual and the whole provision fails. This fail-closed outcome
+	// alloc=0 but reclaim>0, so calculateDefaultShareTargetSize reports reclaim
+	// exceeding allocatable and the whole provision fails. This fail-closed outcome
 	// is intentional: it surfaces the upstream inconsistency instead of silently
 	// producing an incorrect default share target.
 	if hasCombined {
@@ -506,9 +549,15 @@ func (pa *ProvisionAssemblerCommon) assembleDedicatedNUMAExclusiveRegion(r regio
 	ratioPhysicalCap := 0
 	if ratio := pa.conf.GetDynamicConfiguration().ReclaimedCPUMaxRatio; ratio > 0 {
 		if cpuCount := pa.cpuCountInNUMAs(r.GetBindingNumas()); cpuCount > 0 {
-			ratioPhysicalCap = int(math.Floor(ratio * float64(cpuCount)))
-			ratioPhysicalCap -= ratioPhysicalCap % 2
-			ratioPhysicalCap = general.Max(ratioPhysicalCap, reservedForReclaim)
+			cpusPerCore, err := pa.reclaimRatioCPUsPerCore()
+			if err != nil {
+				return err
+			}
+			ratioPhysicalCap, err = calculateReclaimRatioCap(
+				cpuCount, ratio, reservedForReclaim, cpusPerCore)
+			if err != nil {
+				return fmt.Errorf("calculate reclaim ratio cap: %w", err)
+			}
 		}
 	}
 
@@ -646,13 +695,21 @@ func (pa *ProvisionAssemblerCommon) assembleLegacyDedicatedNUMAExclusiveRegion(r
 
 	if ratio := pa.conf.GetDynamicConfiguration().ReclaimedCPUMaxRatio; ratio > 0 {
 		if cpuCount := pa.cpuCountInNUMAs(r.GetBindingNumas()); cpuCount > 0 {
-			reclaimedCoresSize, reclaimedCoresLimit = clampByReclaimedCPUMaxRatio(
+			cpusPerCore, err := pa.reclaimRatioCPUsPerCore()
+			if err != nil {
+				return err
+			}
+			reclaimedCoresSize, reclaimedCoresLimit, err = clampByReclaimedCPUMaxRatio(
 				reclaimedCoresSize,
 				reclaimedCoresLimit,
 				ratio,
 				cpuCount,
 				reservedForReclaim,
+				cpusPerCore,
 			)
+			if err != nil {
+				return fmt.Errorf("clamp reclaim by max ratio: %w", err)
+			}
 		}
 	}
 
@@ -1173,13 +1230,21 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		cpuCount = pa.cpuCountInNUMAs(numaSet)
 	}
 	if ratio <= 0 || cpuCount > 0 {
-		clamp := clampByReclaimedCPUMaxRatioWithDiagnostics(
+		cpusPerCore, err := pa.reclaimRatioCPUsPerCore()
+		if err != nil {
+			return err
+		}
+		clamp, err := clampByReclaimedCPUMaxRatioWithDiagnostics(
 			reclaimedCoresSize,
 			reclaimedCoresQuota,
 			ratio,
 			cpuCount,
 			reservedForReclaim,
+			cpusPerCore,
 		)
+		if err != nil {
+			return fmt.Errorf("clamp reclaim by max ratio: %w", err)
+		}
 		// preserve the original write semantics: the final reclaim size and
 		// quota are exactly what the underlying helper returns.
 		reclaimedCoresSize = clamp.FinalSize

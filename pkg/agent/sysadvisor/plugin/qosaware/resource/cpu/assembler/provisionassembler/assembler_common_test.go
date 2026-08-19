@@ -1911,10 +1911,11 @@ func TestAssembleProvisionPublishesHardReclaimFloorForEveryPhysicalNUMAWithoutRe
 	disableDedicatedOverlap := true
 	metaReader := metacache.NewDummyMetaCacheImp()
 	require.NoError(t, metaReader.SetResourcePackageConfig(types.ResourcePackageConfig{}))
+	metaServer := newTestMetaServer(numaAvailable, 1)
 
 	assembler := NewProvisionAssemblerCommon(
 		conf, nil, &regionMap, &reservedForReclaim, &numaAvailable, &nonBindingNUMAs,
-		&allowSharedOverlap, &disableDedicatedOverlap, metaReader, nil, metrics.DummyMetrics{},
+		&allowSharedOverlap, &disableDedicatedOverlap, metaReader, metaServer, metrics.DummyMetrics{},
 	)
 	result, err := assembler.AssembleProvision()
 	require.NoError(t, err)
@@ -1935,10 +1936,11 @@ func TestAssembleProvisionDoesNotRepublishPhysicalHardReclaimFloorsAtFakedNUMA(t
 	disableDedicatedOverlap := true
 	metaReader := metacache.NewDummyMetaCacheImp()
 	require.NoError(t, metaReader.SetResourcePackageConfig(types.ResourcePackageConfig{}))
+	metaServer := newTestMetaServer(numaAvailable, 1)
 
 	assembler := NewProvisionAssemblerCommon(
 		conf, nil, &regionMap, &reservedForReclaim, &numaAvailable, &nonBindingNUMAs,
-		&allowSharedOverlap, &disableDedicatedOverlap, metaReader, nil, metrics.DummyMetrics{},
+		&allowSharedOverlap, &disableDedicatedOverlap, metaReader, metaServer, metrics.DummyMetrics{},
 	)
 	result, err := assembler.AssembleProvision()
 	require.NoError(t, err)
@@ -2132,7 +2134,8 @@ func runOrdinaryOverlapAssemblerCase(
 	}
 	pa := NewProvisionAssemblerCommon(
 		conf, nil, &regionMap, &reservedForReclaim, &numaAvailable, &nonBindingNUMAs,
-		&tc.allowSharedOverlap, &tc.disableDedicatedOverlap, metaReader, nil, metrics.DummyMetrics{},
+		&tc.allowSharedOverlap, &tc.disableDedicatedOverlap, metaReader,
+		newTestMetaServer(numaAvailable, 1), metrics.DummyMetrics{},
 	).(*ProvisionAssemblerCommon)
 	result := &types.InternalCPUCalculationResult{
 		PoolEntries:                                map[string]map[int]types.CPUResource{},
@@ -2244,6 +2247,7 @@ func TestClampByReclaimedCPUMaxRatio(t *testing.T) {
 		ratio              float64
 		cpuCount           int
 		reservedForReclaim int
+		cpusPerCore        int
 		wantSize           int
 		wantLimit          float64
 	}{
@@ -2313,13 +2317,15 @@ func TestClampByReclaimedCPUMaxRatio(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			gotSize, gotLimit := clampByReclaimedCPUMaxRatio(
+			gotSize, gotLimit, err := clampByReclaimedCPUMaxRatio(
 				tt.size,
 				tt.limit,
 				tt.ratio,
 				tt.cpuCount,
 				tt.reservedForReclaim,
+				general.Max(tt.cpusPerCore, 1),
 			)
+			require.NoError(t, err)
 			require.Equal(t, tt.wantSize, gotSize)
 			require.Equal(t, tt.wantLimit, gotLimit)
 		})
@@ -2334,6 +2340,7 @@ func TestClampByReclaimedCPUMaxRatioWithDiagnostics(t *testing.T) {
 		ratio              float64
 		cpuCount           int
 		reservedForReclaim int
+		cpusPerCore        int
 		want               reclaimClampResult
 	}{
 		{
@@ -2351,10 +2358,19 @@ func TestClampByReclaimedCPUMaxRatioWithDiagnostics(t *testing.T) {
 			size: 186, limit: -1, ratio: 0, cpuCount: 192, reservedForReclaim: 38,
 			want: reclaimClampResult{RawSize: 186, FinalSize: 186, ReleasedSize: 0, FinalLimit: -1},
 		},
+		{
+			name: "hard reclaim cap aligns ratio by physical cores",
+			size: 96, limit: 96, ratio: 0.2, cpuCount: 96, reservedForReclaim: 16, cpusPerCore: 2,
+			want: reclaimClampResult{RawSize: 96, FinalSize: 16, ReleasedSize: 80, FinalLimit: 16},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := clampByReclaimedCPUMaxRatioWithDiagnostics(tc.size, tc.limit, tc.ratio, tc.cpuCount, tc.reservedForReclaim)
+			got, err := clampByReclaimedCPUMaxRatioWithDiagnostics(
+				tc.size, tc.limit, tc.ratio, tc.cpuCount, tc.reservedForReclaim,
+				general.Max(tc.cpusPerCore, 1),
+			)
+			require.NoError(t, err)
 			require.Equal(t, tc.want, got)
 		})
 	}
@@ -2379,6 +2395,27 @@ func TestDefaultShareBackfillDiagnosticsWhenRatioDisabled(t *testing.T) {
 	require.Equal(t, 20, result.DefaultShareBackfill.RawReclaimSize)
 	require.Equal(t, 20, result.DefaultShareBackfill.FinalReclaimSize)
 	require.Zero(t, result.DefaultShareBackfill.ReleasedReclaimSize)
+}
+
+func TestDefaultShareBackfillHardRatioMatchesPhysicalCoreTarget(t *testing.T) {
+	t.Parallel()
+
+	pa := newDefaultShareAssembler(t, map[int]int{0: 96}, machine.NewCPUSet(0), nil,
+		map[int]int{0: 16}, false, true, nil)
+	pa.metaServer.CPUTopology.NumCores = 48
+	dynamicConf := pa.conf.GetDynamicConfiguration()
+	dynamicConf.EnableReclaim = true
+	dynamicConf.EnableRampUpReclaimHardPartition = true
+	dynamicConf.ReclaimedCPUMaxRatio = 0.2
+	dynamicConf.FillDefaultSharePoolWithNonReclaimCPUs = true
+
+	result, err := pa.AssembleProvision()
+	require.NoError(t, err)
+	require.Equal(t, 96, result.DefaultShareBackfill.RawReclaimSize)
+	require.Equal(t, 16, result.DefaultShareBackfill.FinalReclaimSize)
+	require.Equal(t, 80, result.DefaultShareBackfill.ReleasedReclaimSize)
+	require.Equal(t, types.CPUResource{Size: 80, Quota: -1},
+		result.PoolEntries[commonstate.PoolNameShare][commonstate.FakedNUMAID])
 }
 
 func TestDefaultShareBackfillReleasedAccumulatesAcrossScopes(t *testing.T) {
@@ -2789,6 +2826,22 @@ func TestAssembleDedicatedNUMAExclusiveRegionDisjoint(t *testing.T) {
 			result.PoolEntries[commonstate.PoolNameReclaim][0])
 	})
 
+	t.Run("ratio clamp uses physical core granularity", func(t *testing.T) {
+		pa, exclusiveRegion, result, _ := newExclusiveAssemblerFixture(t, 96, 16, true, true)
+		pa.metaServer.CPUTopology.NumCores = 48
+		pa.conf.GetDynamicConfiguration().EnableReclaim = true
+		pa.conf.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+		pa.conf.GetDynamicConfiguration().ReclaimedCPUMaxRatio = 0.2
+		exclusiveRegion.SetProvision(types.ControlKnob{
+			configapi.ControlKnobNonReclaimedCPURequirement: {Value: 60},
+		})
+
+		require.NoError(t, pa.assembleDedicatedNUMAExclusiveRegion(exclusiveRegion, result))
+		require.Equal(t, types.CPUResource{Size: 16, Quota: -1},
+			result.PoolEntries[commonstate.PoolNameReclaim][0])
+		require.Equal(t, types.CPUResource{Size: 80, Quota: -1}, result.PoolEntries["pod"][0])
+	})
+
 	t.Run("empty dedicated target is rejected", func(t *testing.T) {
 		pa, exclusiveRegion, result, _ := newExclusiveAssemblerFixture(t, 16, 4, true, true)
 		exclusiveRegion.SetProvision(types.ControlKnob{
@@ -2906,11 +2959,19 @@ func TestCalculateDefaultShareTargetSize(t *testing.T) {
 			want: 67,
 		},
 		{
-			name: "fixed pools cannot exceed allocatable budget",
+			name: "fixed pool overcommit saturates numa residual",
 			budget: map[int]defaultShareNUMABudget{
-				0: {UnpinnedAllocatableSize: 16, FinalUnpinnedReclaimSize: 8, FixedUnpinnedPoolSize: 10},
+				0: {UnpinnedAllocatableSize: 30, FinalUnpinnedReclaimSize: 28, FixedUnpinnedPoolSize: 8},
+				1: {UnpinnedAllocatableSize: 86, FinalUnpinnedReclaimSize: 28},
 			},
-			wantErr: "default share residual is negative",
+			want: 58,
+		},
+		{
+			name: "reclaim cannot exceed allocatable budget",
+			budget: map[int]defaultShareNUMABudget{
+				0: {UnpinnedAllocatableSize: 16, FinalUnpinnedReclaimSize: 18, FixedUnpinnedPoolSize: 1},
+			},
+			wantErr: "default share reclaim exceeds unpinned allocatable",
 		},
 	}
 	for _, tc := range tests {
@@ -2944,31 +3005,7 @@ func newDefaultShareAssembler(
 	conf, err := options.NewOptions().Config()
 	require.NoError(t, err)
 
-	totalCPUs := 0
-	for _, v := range numaAvailable {
-		totalCPUs += v
-	}
-	cpuDetails := machine.CPUDetails{}
-	cpuID := 0
-	for numaID, size := range numaAvailable {
-		for i := 0; i < size; i++ {
-			cpuDetails[cpuID] = machine.CPUTopoInfo{NUMANodeID: numaID}
-			cpuID++
-		}
-	}
-	metaServer := &metaserver.MetaServer{
-		MetaAgent: &metaagent.MetaAgent{
-			KatalystMachineInfo: &machine.KatalystMachineInfo{
-				CPUTopology: &machine.CPUTopology{
-					NumCPUs:      totalCPUs,
-					NumCores:     totalCPUs,
-					NumSockets:   1,
-					NumNUMANodes: len(numaAvailable),
-					CPUDetails:   cpuDetails,
-				},
-			},
-		},
-	}
+	metaServer := newTestMetaServer(numaAvailable, 1)
 
 	metaReader := metacache.NewDummyMetaCacheImp()
 	if cfg != nil {
@@ -3000,6 +3037,36 @@ func newDefaultShareAssembler(
 		metaServer,
 		metrics.DummyMetrics{},
 	).(*ProvisionAssemblerCommon)
+}
+
+func newTestMetaServer(numaAvailable map[int]int, cpusPerCore int) *metaserver.MetaServer {
+	totalCPUs := 0
+	cpuDetails := machine.CPUDetails{}
+	cpuID := 0
+	for numaID, size := range numaAvailable {
+		totalCPUs += size
+		for i := 0; i < size; i++ {
+			cpuDetails[cpuID] = machine.CPUTopoInfo{
+				NUMANodeID: numaID,
+				CoreID:     cpuID / cpusPerCore,
+			}
+			cpuID++
+		}
+	}
+
+	return &metaserver.MetaServer{
+		MetaAgent: &metaagent.MetaAgent{
+			KatalystMachineInfo: &machine.KatalystMachineInfo{
+				CPUTopology: &machine.CPUTopology{
+					NumCPUs:      totalCPUs,
+					NumCores:     totalCPUs / cpusPerCore,
+					NumSockets:   1,
+					NumNUMANodes: len(numaAvailable),
+					CPUDetails:   cpuDetails,
+				},
+			},
+		},
+	}
 }
 
 func newDefaultShareResult(enabled bool) *types.InternalCPUCalculationResult {
@@ -3415,12 +3482,12 @@ func TestFinalizeDefaultShareBackfillMatrix(t *testing.T) {
 			wantErr:       "default share target is zero before sysadvisor publish",
 		},
 		{
-			name:          "fixed pools exceeding budget returns error",
+			name:          "fixed pool overcommit saturates to zero target",
 			numaAvailable: map[int]int{0: 16},
 			nonBinding:    machine.NewCPUSet(),
 			entries:       []entry{{commonstate.PoolNameReclaim, 0, 8}, {"custom-shared", 0, 10}},
 			enabled:       true,
-			wantErr:       "default share residual is negative",
+			wantErr:       "default share target is zero before sysadvisor publish",
 		},
 		{
 			name:          "gate disabled preserves existing share entry",
