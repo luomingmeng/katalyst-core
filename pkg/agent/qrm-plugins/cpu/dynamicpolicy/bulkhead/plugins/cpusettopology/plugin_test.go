@@ -1924,6 +1924,9 @@ func newDisabledTransitionTestPlugin(
 			BulkheadReclaimNumaPrefixes:   []string{"reclaim/reclaim-"},
 			BulkheadPartitionRelPaths:     []string{"partition"},
 			EnableBulkheadReclaimSiblings: true,
+			// Opt in so the cgroup v2 disabled-reset logic under test is not
+			// short-circuited by the cgroup v2 gate. cgroup v1 is unaffected.
+			EnableBulkheadCpusetTopologyOnCgroupV2: true,
 		},
 		cgroup: cg,
 	}
@@ -2006,7 +2009,8 @@ func TestCPUSetTopologyPluginPeriodicalHandlerResetsPartitionWhenDisabledV2(t *t
 	}
 	p := &CPUSetTopologyPlugin{
 		cfg: bulkheadconfig.BulkheadConfiguration{
-			BulkheadPartitionRelPaths: []string{"partition"},
+			BulkheadPartitionRelPaths:              []string{"partition"},
+			EnableBulkheadCpusetTopologyOnCgroupV2: true,
 		},
 		cgroup: cg,
 	}
@@ -2029,7 +2033,8 @@ func TestCPUSetTopologyPluginPeriodicalHandlerAppliesPartitionRootWhenEnabledV2(
 	}
 	p := &CPUSetTopologyPlugin{
 		cfg: bulkheadconfig.BulkheadConfiguration{
-			BulkheadPartitionRelPaths: []string{"partition"},
+			BulkheadPartitionRelPaths:              []string{"partition"},
+			EnableBulkheadCpusetTopologyOnCgroupV2: true,
 		},
 		cgroup: cg,
 	}
@@ -2042,6 +2047,91 @@ func TestCPUSetTopologyPluginPeriodicalHandlerAppliesPartitionRootWhenEnabledV2(
 	}
 	if got := cg.partitionWrites["partition"]; got != cgcommon.CPUSetPartitionFlagRoot {
 		t.Fatalf("partition flag = %s, want %s", got, cgcommon.CPUSetPartitionFlagRoot)
+	}
+}
+
+func TestCPUSetTopologyPluginEnableGatedOnCgroupV2(t *testing.T) {
+	t.Parallel()
+
+	enabledConf := bulkheadapi.HandlerContext{
+		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+			DynamicConf: enabledBulkheadCpusetTopologyDynamicConf(),
+		},
+	}
+
+	tests := []struct {
+		name      string
+		version   cgroupclient.CgroupVersion
+		optInOnV2 bool
+		want      bool
+	}{
+		{name: "v2 opt-out is inert", version: cgroupclient.CgroupVersionV2, optInOnV2: false, want: false},
+		{name: "v2 opt-in delegates", version: cgroupclient.CgroupVersionV2, optInOnV2: true, want: true},
+		{name: "v1 opt-out delegates", version: cgroupclient.CgroupVersionV1, optInOnV2: false, want: true},
+		{name: "v1 opt-in delegates", version: cgroupclient.CgroupVersionV1, optInOnV2: true, want: true},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			p := &CPUSetTopologyPlugin{
+				cfg: bulkheadconfig.BulkheadConfiguration{
+					EnableBulkheadCpusetTopologyOnCgroupV2: tt.optInOnV2,
+				},
+				cgroup: &fakeCgroupClient{version: tt.version},
+			}
+			if got := p.Enable(enabledConf); got != tt.want {
+				t.Fatalf("Enable() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCPUSetTopologyPluginDisabledHandlerInertOnCgroupV2OptOut(t *testing.T) {
+	t.Parallel()
+
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV2,
+		"bulkhead-disabled-v2-gated-pod",
+		"bulkhead-disabled-v2-gated-container",
+	)
+	// Flip the helper's opt-in back off to exercise the gate.
+	p.cfg.EnableBulkheadCpusetTopologyOnCgroupV2 = false
+
+	if err := p.CPUSetAdjustmentDisabledHandler(context.Background(), in); err != nil {
+		t.Fatalf("CPUSetAdjustmentDisabledHandler: %v", err)
+	}
+	if len(cg.writes) != 0 {
+		t.Fatalf("cgroup v2 opt-out disabled handler must not write, got %#v", cg.writes)
+	}
+	if len(cg.cpusetWrites) != 0 {
+		t.Fatalf("cgroup v2 opt-out disabled handler must not write cpuset, got %#v", cg.cpusetWrites)
+	}
+}
+
+func TestCPUSetTopologyPluginPeriodicalHandlerInertOnCgroupV2OptOut(t *testing.T) {
+	t.Parallel()
+
+	cg := &fakeCgroupClient{
+		version:  cgroupclient.CgroupVersionV2,
+		existing: map[string]bool{"partition": true},
+	}
+	p := &CPUSetTopologyPlugin{
+		cfg: bulkheadconfig.BulkheadConfiguration{
+			BulkheadPartitionRelPaths: []string{"partition"},
+		},
+		cgroup: cg,
+	}
+
+	if err := p.PeriodicalHandler(context.Background(), bulkheadapi.PeriodicalHandlerContext{
+		DynamicConf: enabledBulkheadCpusetTopologyDynamicConf(),
+	}); err != nil {
+		t.Fatalf("PeriodicalHandler: %v", err)
+	}
+	if len(cg.partitionWrites) != 0 {
+		t.Fatalf("cgroup v2 opt-out periodical handler must not write partition, got %#v", cg.partitionWrites)
 	}
 }
 

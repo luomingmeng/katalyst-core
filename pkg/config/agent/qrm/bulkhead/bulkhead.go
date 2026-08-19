@@ -59,6 +59,13 @@ type BulkheadConfiguration struct {
 	BulkheadPartitionRelPaths     []string
 	EnableBulkheadReclaimSiblings bool
 
+	// EnableBulkheadCpusetTopologyOnCgroupV2 gates the cpuset_topology plugin on
+	// cgroup v2 hosts. When false (default) the plugin is inert on cgroup v2:
+	// Enable returns false and its adjustment-disabled and periodical handlers
+	// become no-ops, so cgroup v2 hosts are never touched. cgroup v1 behavior is
+	// unaffected. When true the plugin also runs on cgroup v2.
+	EnableBulkheadCpusetTopologyOnCgroupV2 bool
+
 	BulkheadWorkqueueSysfsDir string
 	BulkheadWorkqueueNames    []string
 
