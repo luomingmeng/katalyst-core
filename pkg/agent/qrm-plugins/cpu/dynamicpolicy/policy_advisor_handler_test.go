@@ -243,9 +243,11 @@ func TestGenerateBlockCPUSetDisjointPlannerRequiresCapability(t *testing.T) {
 func TestValidateHardPartitionReclaimDistribution(t *testing.T) {
 	t.Parallel()
 
-	topology := &machine.CPUTopology{CPUDetails: machine.CPUDetails{
-		0: {NUMANodeID: 0}, 1: {NUMANodeID: 0}, 2: {NUMANodeID: 0}, 3: {NUMANodeID: 0},
-		4: {NUMANodeID: 1}, 5: {NUMANodeID: 1}, 6: {NUMANodeID: 1}, 7: {NUMANodeID: 1},
+	topology := &machine.CPUTopology{NumCPUs: 8, NumCores: 4, CPUDetails: machine.CPUDetails{
+		0: {NUMANodeID: 0, CoreID: 0}, 1: {NUMANodeID: 0, CoreID: 1},
+		2: {NUMANodeID: 0, CoreID: 2}, 3: {NUMANodeID: 0, CoreID: 3},
+		4: {NUMANodeID: 1, CoreID: 0}, 5: {NUMANodeID: 1, CoreID: 1},
+		6: {NUMANodeID: 1, CoreID: 2}, 7: {NUMANodeID: 1, CoreID: 3},
 	}}
 	allCPUs := topology.CPUDetails.CPUs()
 
@@ -307,7 +309,8 @@ func TestValidateHardPartitionReclaimDistribution(t *testing.T) {
 			t.Parallel()
 
 			err := validateHardPartitionReclaimDistribution(
-				tc.reclaim, tc.eligible, topology, minimumHardReclaimCPUsPerNUMA)
+				tc.reclaim, tc.eligible, topology,
+				minimumHardReclaimCoresPerNUMA*topology.CPUsPerCore())
 			if tc.wantErr == "" {
 				require.NoError(t, err)
 				return

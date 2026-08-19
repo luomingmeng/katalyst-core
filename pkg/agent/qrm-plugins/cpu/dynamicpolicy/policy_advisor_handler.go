@@ -1404,8 +1404,9 @@ func (p *DynamicPolicy) validateHardPartitionBlockPlan(
 		reclaim = reclaim.Union(blockCPUSet[descriptor.BlockID])
 		eligible = eligible.Union(descriptor.Eligible.Intersection(available))
 	}
+	cpusPerCore := p.machineInfo.CPUTopology.CPUsPerCore()
 	return validateHardPartitionReclaimDistribution(
-		reclaim, eligible, p.machineInfo.CPUTopology, minimumHardReclaimCPUsPerNUMA)
+		reclaim, eligible, p.machineInfo.CPUTopology, minimumHardReclaimCoresPerNUMA*cpusPerCore)
 }
 
 func validateHardPartitionReclaimDistribution(
@@ -1416,6 +1417,10 @@ func validateHardPartitionReclaimDistribution(
 ) error {
 	if topology == nil {
 		return fmt.Errorf("hard-partition reclaim validation requires CPU topology")
+	}
+	cpusPerCore := topology.CPUsPerCore()
+	if cpusPerCore <= 0 {
+		return fmt.Errorf("hard-partition reclaim validation requires positive cpus per core, got %d", cpusPerCore)
 	}
 	machineCPUs := topology.CPUDetails.CPUs()
 	if outside := reclaim.Difference(machineCPUs); !outside.IsEmpty() {
@@ -1439,7 +1444,9 @@ func validateHardPartitionReclaimDistribution(
 			maximum = count
 		}
 	}
-	if maximum-minimum > 1 {
+	// imbalance tolerance is one complete core, matching the core-granular
+	// water-filling in expandHardPartitionReclaimPhase.
+	if maximum-minimum > cpusPerCore {
 		return fmt.Errorf("hard-partition reclaim is imbalanced across physical NUMAs: max=%d min=%d", maximum, minimum)
 	}
 	return nil

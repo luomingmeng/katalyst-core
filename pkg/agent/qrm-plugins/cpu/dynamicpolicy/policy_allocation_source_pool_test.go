@@ -43,62 +43,182 @@ func TestDynamicPolicy_takeByTieredPreferredCPUs(t *testing.T) {
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	require.NoError(t, err)
 
+	// GenerateDummyCPUTopology(16,2,2) pairs siblings at +8, so a complete physical
+	// core is {x, x+8}. NUMA0 cores: {0,8},{1,9},{2,10},{3,11}; NUMA1 cores:
+	// {4,12},{5,13},{6,14},{7,15}. Core-aligned cases below use complete cores
+	// so they can verify the prefer-whole behavior independently from the
+	// per-CPU fallback exercised by the fragmented-input cases.
+
 	t.Run("prefers the first tier before falling back to available", func(t *testing.T) {
 		t.Parallel()
 
-		available := machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)
-		// first tier is fully within available; request fits entirely in tier 1
+		// two whole cores per NUMA available; tier1 is one whole core.
+		available := machine.NewCPUSet(0, 8, 1, 9, 4, 12, 5, 13)
 		taken, remaining, err := p.takeByTieredPreferredCPUs(available,
-			[]machine.CPUSet{machine.NewCPUSet(4, 5), machine.NewCPUSet(6, 7)}, 2)
+			[]machine.CPUSet{machine.NewCPUSet(0, 8), machine.NewCPUSet(1, 9)}, 2)
 		require.NoError(t, err)
-		require.True(t, taken.Equals(machine.NewCPUSet(4, 5)), "taken=%s", taken.String())
-		require.True(t, remaining.Equals(machine.NewCPUSet(0, 1, 2, 3, 6, 7)), "remaining=%s", remaining.String())
+		require.True(t, taken.Equals(machine.NewCPUSet(0, 8)), "taken=%s", taken.String())
+		require.True(t, remaining.Equals(available.Difference(machine.NewCPUSet(0, 8))),
+			"remaining=%s", remaining.String())
 	})
 
 	t.Run("spills from tier1 to tier2 then to remaining available", func(t *testing.T) {
 		t.Parallel()
 
-		available := machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)
-		// tier1 has 2 cpus, tier2 has 1 cpu, need 5 -> 2 from tier1, 1 from tier2, 2 from remaining
+		// three whole cores per NUMA; need 6 CPUs (3 cores): one core from tier1,
+		// one from tier2, one whole core spilled NUMA-balanced from remaining.
+		available := machine.NewCPUSet(0, 8, 1, 9, 2, 10, 4, 12, 5, 13, 6, 14)
 		taken, remaining, err := p.takeByTieredPreferredCPUs(available,
-			[]machine.CPUSet{machine.NewCPUSet(4, 5), machine.NewCPUSet(6)}, 5)
+			[]machine.CPUSet{machine.NewCPUSet(0, 8), machine.NewCPUSet(1, 9)}, 6)
 		require.NoError(t, err)
-		require.Equal(t, 5, taken.Size(), "taken=%s", taken.String())
-		require.True(t, taken.Contains(4) && taken.Contains(5) && taken.Contains(6),
-			"tiered cpus must be taken first, taken=%s", taken.String())
-		require.Equal(t, 3, remaining.Size(), "remaining=%s", remaining.String())
+		require.Equal(t, 6, taken.Size(), "taken=%s", taken.String())
+		// the two preferred whole cores are consumed first.
+		require.True(t, taken.Contains(0) && taken.Contains(8) &&
+			taken.Contains(1) && taken.Contains(9),
+			"tiered whole cores must be taken first, taken=%s", taken.String())
+		assertTieredTakenCoreAligned(t, cpuTopology, taken)
+		require.Equal(t, 6, remaining.Size(), "remaining=%s", remaining.String())
 		require.True(t, taken.Union(remaining).Equals(available))
 	})
 
 	t.Run("ignores preferred cpus outside available", func(t *testing.T) {
 		t.Parallel()
 
-		available := machine.NewCPUSet(0, 1, 2, 3)
-		// preferred references cpus that are no longer available; must fall back gracefully
+		// one whole core available; preferred references cpus no longer available,
+		// so the fallback core-aligned take must still return that whole core.
+		available := machine.NewCPUSet(0, 8, 1, 9)
 		taken, remaining, err := p.takeByTieredPreferredCPUs(available,
-			[]machine.CPUSet{machine.NewCPUSet(8, 9)}, 2)
+			[]machine.CPUSet{machine.NewCPUSet(4, 12)}, 2)
 		require.NoError(t, err)
 		require.Equal(t, 2, taken.Size())
+		assertTieredTakenCoreAligned(t, cpuTopology, taken)
 		require.True(t, taken.Union(remaining).Equals(available))
 	})
 
 	t.Run("zero request returns empty taken", func(t *testing.T) {
 		t.Parallel()
 
-		available := machine.NewCPUSet(0, 1, 2, 3)
+		available := machine.NewCPUSet(0, 8, 1, 9)
 		taken, remaining, err := p.takeByTieredPreferredCPUs(available, nil, 0)
 		require.NoError(t, err)
 		require.True(t, taken.IsEmpty())
 		require.True(t, remaining.Equals(available))
 	})
 
-	t.Run("insufficient available returns error", func(t *testing.T) {
+	t.Run("prefers whole cores then fills the sub-core tail per-cpu", func(t *testing.T) {
 		t.Parallel()
 
-		available := machine.NewCPUSet(0, 1)
-		_, _, err := p.takeByTieredPreferredCPUs(available, []machine.CPUSet{machine.NewCPUSet(0)}, 5)
-		require.Error(t, err)
+		// non-reclaim source pools prefer whole cores but must never starve: a
+		// request of 3 CPUs (not a whole-core multiple on SMT2) takes the whole
+		// preferred core {0,8} first, then fills the remaining 1 CPU per-cpu from
+		// the leftover sibling. hard core-aligned cropping is reserved for the
+		// reclaim pool (planHardReclaimPartition), not the tier layer.
+		available := machine.NewCPUSet(0, 8, 1, 9)
+		taken, remaining, err := p.takeByTieredPreferredCPUs(available,
+			[]machine.CPUSet{machine.NewCPUSet(0, 8)}, 3)
+		require.NoError(t, err)
+		require.Equal(t, 3, taken.Size(), "prefer-whole-then-fill, taken=%s", taken.String())
+		require.True(t, taken.Contains(0) && taken.Contains(8),
+			"preferred whole core must be taken first, taken=%s", taken.String())
+		require.True(t, taken.Union(remaining).Equals(available))
+		require.True(t, taken.Intersection(remaining).IsEmpty())
 	})
+
+	t.Run("fills orphan half cores only after whole cores are exhausted", func(t *testing.T) {
+		t.Parallel()
+
+		// only one complete core {0,8} exists; 1 and 4 are orphan half cores
+		// (their siblings 9 and 12 are gone). A request of 4 takes the whole core
+		// first, then falls back to filling the two orphans per-cpu — the tier
+		// layer never starves a non-reclaim pool for lack of whole cores.
+		available := machine.NewCPUSet(0, 8, 1, 4)
+		taken, remaining, err := p.takeByTieredPreferredCPUs(available, nil, 4)
+		require.NoError(t, err)
+		require.Equal(t, 4, taken.Size(), "prefer-whole-then-fill, taken=%s", taken.String())
+		require.True(t, taken.Contains(0) && taken.Contains(8),
+			"whole core must be taken before orphans, taken=%s", taken.String())
+		require.True(t, taken.Union(remaining).Equals(available))
+		require.True(t, taken.Intersection(remaining).IsEmpty())
+	})
+
+	t.Run("does not take a preferred orphan before an available whole core", func(t *testing.T) {
+		t.Parallel()
+
+		available := machine.NewCPUSet(0, 8, 1, 9)
+		taken, remaining, err := p.takeByTieredPreferredCPUs(
+			available, []machine.CPUSet{machine.NewCPUSet(0)}, 2)
+		require.NoError(t, err)
+		require.Equal(t, 2, taken.Size(), "taken=%s", taken.String())
+		assertTieredTakenCoreAligned(t, cpuTopology, taken)
+		require.True(t, taken.Union(remaining).Equals(available))
+		require.True(t, taken.Intersection(remaining).IsEmpty())
+	})
+
+	t.Run("completes a preferred orphan before taking an unrelated whole core", func(t *testing.T) {
+		t.Parallel()
+
+		available := machine.NewCPUSet(0, 8, 2, 10)
+		taken, remaining, err := p.takeByTieredPreferredCPUs(
+			available, []machine.CPUSet{machine.NewCPUSet(2)}, 2)
+		require.NoError(t, err)
+		require.True(t, taken.Equals(machine.NewCPUSet(2, 10)), "taken=%s", taken.String())
+		require.True(t, taken.Union(remaining).Equals(available))
+		require.True(t, taken.Intersection(remaining).IsEmpty())
+	})
+
+	t.Run("balances fallback against cores already taken from a preferred tier", func(t *testing.T) {
+		t.Parallel()
+
+		available := machine.NewCPUSet(0, 8, 1, 9, 4, 12)
+		taken, remaining, err := p.takeByTieredPreferredCPUs(
+			available, []machine.CPUSet{machine.NewCPUSet(0, 8)}, 4)
+		require.NoError(t, err)
+		require.True(t, taken.Contains(0) && taken.Contains(8), "taken=%s", taken.String())
+		require.Equal(t, 2, taken.Intersection(cpuTopology.CPUDetails.CPUsInNUMANodes(0)).Size())
+		require.Equal(t, 2, taken.Intersection(cpuTopology.CPUDetails.CPUsInNUMANodes(1)).Size())
+		require.True(t, taken.Union(remaining).Equals(available))
+	})
+
+	t.Run("prefers a fully reused core over a lower-id partial hit in the same tier", func(t *testing.T) {
+		t.Parallel()
+
+		available := machine.NewCPUSet(0, 8, 2, 10)
+		taken, remaining, err := p.takeByTieredPreferredCPUs(
+			available, []machine.CPUSet{machine.NewCPUSet(0, 2, 10)}, 2)
+		require.NoError(t, err)
+		require.True(t, taken.Equals(machine.NewCPUSet(2, 10)), "taken=%s", taken.String())
+		require.True(t, taken.Union(remaining).Equals(available))
+	})
+
+	t.Run("does not borrow siblings when the preferred orphan domain is sufficient", func(t *testing.T) {
+		t.Parallel()
+
+		available := machine.NewCPUSet(0, 8, 1, 9, 2, 10)
+		preferred := machine.NewCPUSet(0, 1, 2)
+		taken, remaining, err := p.takeByTieredPreferredCPUs(
+			available, []machine.CPUSet{preferred}, 2)
+		require.NoError(t, err)
+		require.True(t, taken.IsSubsetOf(preferred), "taken=%s preferred=%s", taken.String(), preferred.String())
+		require.True(t, taken.Union(remaining).Equals(available))
+		require.True(t, taken.Intersection(remaining).IsEmpty())
+	})
+}
+
+// assertTieredTakenCoreAligned fails when a core-aligned test case returns a
+// partial physical core.
+func assertTieredTakenCoreAligned(t *testing.T, topology *machine.CPUTopology, taken machine.CPUSet) {
+	t.Helper()
+	cpusPerCore := topology.CPUsPerCore()
+	byCore := make(map[int]int)
+	for _, cpu := range taken.ToSliceInt() {
+		byCore[topology.CPUDetails[cpu].CoreID]++
+	}
+	for core, cnt := range byCore {
+		if cnt != cpusPerCore {
+			t.Fatalf("core %d has %d/%d siblings in taken %s (half core)",
+				core, cnt, cpusPerCore, taken.String())
+		}
+	}
 }
 
 func TestBuildIsolationSourcePreferredCPUs(t *testing.T) {
@@ -244,13 +364,14 @@ func TestDynamicPolicy_takeCPUsForPoolsInPlaceWithPreferred(t *testing.T) {
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	require.NoError(t, err)
 
-	t.Run("source share pool reclaims its historical isolation cpus first", func(t *testing.T) {
+	t.Run("source share pool prefers cores containing historical isolation cpus", func(t *testing.T) {
 		t.Parallel()
 
 		poolsCPUSet := make(map[string]machine.CPUSet)
 		available := machine.NewCPUSet(0, 1, 2, 3, 8, 9, 10, 11)
 		poolsQuantityMap := map[string]int{commonstate.PoolNameShare: 4}
-		// historically isolation carved 8,9,10 from the share pool; on shrink they should come back
+		// Historical isolation carved 8,9,10 from three different physical cores.
+		// A 4-CPU pool can reuse at most two of them while staying core-aligned.
 		preferred := map[string]machine.CPUSet{commonstate.PoolNameShare: machine.NewCPUSet(8, 9, 10)}
 
 		remaining, err := p.takeCPUsForPoolsInPlaceWithPreferred(
@@ -259,8 +380,9 @@ func TestDynamicPolicy_takeCPUsForPoolsInPlaceWithPreferred(t *testing.T) {
 
 		share := poolsCPUSet[commonstate.PoolNameShare]
 		require.Equal(t, 4, share.Size())
-		require.True(t, share.Contains(8) && share.Contains(9) && share.Contains(10),
-			"share pool should reclaim preferred cpus first, got %s", share.String())
+		assertTieredTakenCoreAligned(t, cpuTopology, share)
+		require.Equal(t, 2, share.Intersection(preferred[commonstate.PoolNameShare]).Size(),
+			"share pool should maximize historical CPU reuse within complete cores, got %s", share.String())
 		require.True(t, share.Union(remaining).Equals(available))
 		require.True(t, share.Intersection(remaining).IsEmpty())
 	})
@@ -433,10 +555,10 @@ func TestDeriveIsolationSourceSharePool(t *testing.T) {
 	}
 }
 
-// TestDynamicPolicy_generatePoolsAndIsolation_reclaimsIsolationCPUs verifies the end-to-end
-// behavior: when a shared_cores isolation container already exists in state and its source
-// share pool is regenerated, the share pool preferentially reclaims exactly the cpus that
-// the isolation historically borrowed, keeping cpuset churn minimal.
+// TestDynamicPolicy_generatePoolsAndIsolation_reclaimsIsolationCPUs verifies the
+// end-to-end behavior: when a shared_cores isolation container already exists in
+// state and its source share pool is regenerated, the share pool prefers complete
+// cores containing CPUs that the isolation historically borrowed.
 func TestDynamicPolicy_generatePoolsAndIsolation_reclaimsIsolationCPUs(t *testing.T) {
 	t.Parallel()
 
@@ -483,8 +605,9 @@ func TestDynamicPolicy_generatePoolsAndIsolation_reclaimsIsolationCPUs(t *testin
 
 	share := poolsCPUSet[commonstate.PoolNameShare]
 	require.Equal(t, 4, share.Size(), "share=%s", share.String())
-	require.True(t, share.Contains(8) && share.Contains(9) && share.Contains(10),
-		"share pool should reclaim the historical isolation cpus 8,9,10 first, got %s", share.String())
+	assertTieredTakenCoreAligned(t, cpuTopology, share)
+	require.Equal(t, 2, share.Intersection(machine.NewCPUSet(8, 9, 10)).Size(),
+		"two complete cores can preserve at most two historical orphan CPUs, got %s", share.String())
 }
 
 func TestDynamicPolicy_generatePoolsAndIsolation_overlapReclaimsIsolationCPUs(t *testing.T) {

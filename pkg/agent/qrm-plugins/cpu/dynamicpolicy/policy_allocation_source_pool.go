@@ -22,7 +22,6 @@ import (
 
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
-	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/calculator"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
@@ -64,12 +63,12 @@ func deriveIsolationSourceSharePool(allocationInfo *state.AllocationInfo) (strin
 	return sourcePool, true
 }
 
-// takeByTieredPreferredCPUs allocates cpuRequirement cpus from availableCPUs, preferring
-// cpus from the ordered preferred tiers first (each intersected with availableCPUs), and
-// only spilling to the remaining availableCPUs (via NUMA-balanced take) when the tiers are
-// exhausted. It returns the taken set and the remaining available set. This is the shared
-// building block that lets isolation cpusets be carved from their source share pool region
-// and recycled back to it across recomputes.
+// takeByTieredPreferredCPUs allocates exactly cpuRequirement cpus from
+// availableCPUs. It prefers complete physical cores before any sub-core tail;
+// within each phase, ordered preferred tiers are consumed before the remaining
+// available CPUs. It returns the taken set and the remaining available set.
+// This is the shared building block that lets isolation cpusets be carved from
+// their source share pool region and recycled back to it across recomputes.
 func (p *DynamicPolicy) takeByTieredPreferredCPUs(
 	availableCPUs machine.CPUSet,
 	preferredTiers []machine.CPUSet,
@@ -82,43 +81,148 @@ func (p *DynamicPolicy) takeByTieredPreferredCPUs(
 		return taken, remaining, nil
 	}
 
-	// consume the preferred tiers in order, only counting cpus still available.
-	for _, tier := range preferredTiers {
-		if taken.Size() >= cpuRequirement {
-			break
-		}
-		candidate := tier.Intersection(remaining)
-		if candidate.IsEmpty() {
-			continue
-		}
-
-		need := cpuRequirement - taken.Size()
-		var pick machine.CPUSet
-		if candidate.Size() <= need {
-			pick = candidate
-		} else {
-			var err error
-			pick, _, err = calculator.TakeByNUMABalance(p.machineInfo, candidate, need)
-			if err != nil {
-				return machine.NewCPUSet(), availableCPUs, fmt.Errorf(
-					"take preferred cpus failed with error: %v", err)
-			}
-		}
-
-		taken = taken.Union(pick)
-		remaining = remaining.Difference(pick)
+	topology := p.machineInfo.CPUTopology
+	cpusPerCore := topology.CPUsPerCore()
+	if cpusPerCore <= 0 {
+		return machine.NewCPUSet(), availableCPUs, fmt.Errorf(
+			"take tiered preferred cpus failed: invalid cpus per core %d", cpusPerCore)
 	}
 
-	// spill to the remaining available cpus if the preferred tiers were insufficient.
-	if taken.Size() < cpuRequirement {
-		need := cpuRequirement - taken.Size()
-		pick, rest, err := calculator.TakeByNUMABalance(p.machineInfo, remaining, need)
-		if err != nil {
-			return machine.NewCPUSet(), availableCPUs, fmt.Errorf(
-				"take fallback cpus of req: %d failed with error: %v", need, err)
+	// Preserve an exact historical placement byte-for-byte. This keeps the
+	// non-hard-partition reclaim path stable when its previous cpuset already
+	// satisfies the complete request; prefer-whole applies when allocation must
+	// combine or trim candidates.
+	for _, tier := range preferredTiers {
+		candidate := tier.Intersection(remaining)
+		if candidate.Size() == cpuRequirement {
+			return candidate, remaining.Difference(candidate), nil
 		}
-		taken = taken.Union(pick)
-		remaining = rest
+	}
+
+	// Keep allocation inside the preferred source domain when that domain can
+	// satisfy the request by itself. Only an insufficient preferred domain may
+	// borrow sibling or tail CPUs from the rest of availableCPUs.
+	preferredDomain := machine.NewCPUSet()
+	for _, tier := range preferredTiers {
+		preferredDomain = preferredDomain.Union(tier.Intersection(remaining))
+	}
+	selectable := remaining.Clone()
+	if preferredDomain.Size() >= cpuRequirement {
+		selectable = preferredDomain
+	}
+
+	preference := func(candidate machine.CPUSet) (int, int) {
+		for rank, tier := range preferredTiers {
+			if hits := candidate.Intersection(tier).Size(); hits > 0 {
+				return rank, hits
+			}
+		}
+		return len(preferredTiers), 0
+	}
+
+	type rankedCandidate struct {
+		cpus   machine.CPUSet
+		numaID int
+		rank   int
+		hits   int
+		id     int
+	}
+
+	// Build every complete core once. Preferred orphan siblings contribute their
+	// tier rank and are completed from selectable when the source domain allows it.
+	cpusByCore := make(map[int]machine.CPUSet)
+	for _, cpu := range selectable.ToSliceInt() {
+		info, ok := topology.CPUDetails[cpu]
+		if !ok {
+			continue
+		}
+		coreCPUs := cpusByCore[info.CoreID]
+		if !coreCPUs.Initialed {
+			coreCPUs = machine.NewCPUSet()
+		}
+		coreCPUs.Add(cpu)
+		cpusByCore[info.CoreID] = coreCPUs
+	}
+
+	coreCandidates := make([]rankedCandidate, 0, len(cpusByCore))
+	for coreID, coreCPUs := range cpusByCore {
+		if coreCPUs.Size() != cpusPerCore {
+			continue
+		}
+		firstCPU := coreCPUs.ToSliceInt()[0]
+		rank, hits := preference(coreCPUs)
+		coreCandidates = append(coreCandidates, rankedCandidate{
+			cpus: coreCPUs, numaID: topology.CPUDetails[firstCPU].NUMANodeID,
+			rank: rank, hits: hits, id: coreID,
+		})
+	}
+
+	numaLoad := make(map[int]int)
+	better := func(left, right rankedCandidate) bool {
+		if numaLoad[left.numaID] != numaLoad[right.numaID] {
+			return numaLoad[left.numaID] < numaLoad[right.numaID]
+		}
+		if left.rank != right.rank {
+			return left.rank < right.rank
+		}
+		if left.hits != right.hits {
+			return left.hits > right.hits
+		}
+		return left.id < right.id
+	}
+
+	coresWanted := cpuRequirement / cpusPerCore
+	for coresWanted > 0 && len(coreCandidates) > 0 {
+		best := 0
+		for i := 1; i < len(coreCandidates); i++ {
+			if better(coreCandidates[i], coreCandidates[best]) {
+				best = i
+			}
+		}
+		selected := coreCandidates[best]
+		taken = taken.Union(selected.cpus)
+		remaining = remaining.Difference(selected.cpus)
+		selectable = selectable.Difference(selected.cpus)
+		numaLoad[selected.numaID] += selected.cpus.Size()
+		coreCandidates = append(coreCandidates[:best], coreCandidates[best+1:]...)
+		coresWanted--
+	}
+
+	// Fill the exact sub-core tail with the same cumulative NUMA load. NUMA
+	// balance is primary; tier order and logical CPU ID break equal-load ties.
+	for taken.Size() < cpuRequirement && !selectable.IsEmpty() {
+		cpuCandidates := make([]rankedCandidate, 0, selectable.Size())
+		for _, cpu := range selectable.ToSliceInt() {
+			info, ok := topology.CPUDetails[cpu]
+			if !ok {
+				continue
+			}
+			cpuSet := machine.NewCPUSet(cpu)
+			rank, hits := preference(cpuSet)
+			cpuCandidates = append(cpuCandidates, rankedCandidate{
+				cpus: cpuSet, numaID: info.NUMANodeID, rank: rank, hits: hits, id: cpu,
+			})
+		}
+		if len(cpuCandidates) == 0 {
+			break
+		}
+
+		best := 0
+		for i := 1; i < len(cpuCandidates); i++ {
+			if better(cpuCandidates[i], cpuCandidates[best]) {
+				best = i
+			}
+		}
+		selected := cpuCandidates[best]
+		taken = taken.Union(selected.cpus)
+		remaining = remaining.Difference(selected.cpus)
+		selectable = selectable.Difference(selected.cpus)
+		numaLoad[selected.numaID]++
+	}
+
+	if taken.Size() < cpuRequirement {
+		return machine.NewCPUSet(), availableCPUs, fmt.Errorf(
+			"take tiered preferred cpus failed: not enough cpus available to satisfy request")
 	}
 
 	return taken, remaining, nil

@@ -38,7 +38,11 @@ const (
 	advisorBlockClassShared           advisorBlockClass = "shared"
 	advisorBlockClassReclaimOverlap   advisorBlockClass = "reclaim-overlap"
 
-	minimumHardReclaimCPUsPerNUMA = 2
+	// minimumHardReclaimCoresPerNUMA is the immutable minimum reclaim floor a
+	// single eligible NUMA always keeps on the hard-partition path, expressed in
+	// complete physical cores. The CPU magnitude is derived from CPUsPerCore() so
+	// the guard is core-granular on any topology (no hard-coded SMT factor).
+	minimumHardReclaimCoresPerNUMA = 1
 )
 
 type advisorBlockDescriptor struct {
@@ -362,6 +366,11 @@ func expandHardPartitionReclaimPhase(
 	if topology == nil {
 		return nil, nil, fmt.Errorf("cannot expand hard reclaim phase with nil CPU topology")
 	}
+	cpusPerCore := topology.CPUsPerCore()
+	if cpusPerCore <= 0 {
+		return nil, nil, fmt.Errorf(
+			"cannot expand hard reclaim phase with non-positive cpus per core %d", cpusPerCore)
+	}
 
 	mandatory := filterAdvisorDescriptors(descriptors, func(descriptor advisorBlockDescriptor) bool {
 		return descriptor.Class == advisorBlockClassMandatoryReclaim
@@ -461,7 +470,7 @@ func expandHardPartitionReclaimPhase(
 	if len(eligibleNUMAs) == 0 {
 		return demands, blockIDByDemandKey, nil
 	}
-	requiredMinimum := minimumHardReclaimCPUsPerNUMA * len(eligibleNUMAs)
+	requiredMinimum := minimumHardReclaimCoresPerNUMA * cpusPerCore * len(eligibleNUMAs)
 	if totalQuantity < requiredMinimum {
 		return nil, nil, fmt.Errorf(
 			"hard reclaim quantity %d is smaller than required minimum %d",
@@ -498,12 +507,21 @@ func expandHardPartitionReclaimPhase(
 		"fixedDedicatedByNUMA", fixedDedicatedByNUMA,
 		"finalByNUMABeforeFake", finalByNUMA)
 	quotas := make(map[int]int, len(numaIDs))
-	for allocated := 0; allocated < fake.Quantity; allocated++ {
+	if fake.Quantity%cpusPerCore != 0 {
+		return nil, nil, fmt.Errorf(
+			"hard reclaim fake block %q quantity %d is not a whole-core multiple of %d",
+			fake.BlockID, fake.Quantity, cpusPerCore)
+	}
+	// water-fill complete physical cores round-robin: every step grants a full core
+	// (cpusPerCore cpus) to the currently least-loaded eligible NUMA, so a balanced
+	// result never strands a lone SMT sibling. On non-SMT topologies cpusPerCore==1
+	// and this reduces byte-for-byte to the historical single-CPU water-filling.
+	for allocated := 0; allocated < fake.Quantity; allocated += cpusPerCore {
 		selectedNUMA := 0
 		selected := false
 		for _, numaID := range numaIDs {
-			if quotas[numaID] >= eligibleCapacityByNUMA[numaID] ||
-				fixedDedicatedByNUMA[numaID]+finalByNUMA[numaID]+1 > capacityByNUMA[numaID] {
+			if quotas[numaID]+cpusPerCore > eligibleCapacityByNUMA[numaID] ||
+				fixedDedicatedByNUMA[numaID]+finalByNUMA[numaID]+cpusPerCore > capacityByNUMA[numaID] {
 				continue
 			}
 			if !selected || finalByNUMA[numaID] < finalByNUMA[selectedNUMA] {
@@ -516,8 +534,8 @@ func expandHardPartitionReclaimPhase(
 				"hard reclaim fake block %q has insufficient aggregate capacity for quantity %d",
 				fake.BlockID, fake.Quantity)
 		}
-		quotas[selectedNUMA]++
-		finalByNUMA[selectedNUMA]++
+		quotas[selectedNUMA] += cpusPerCore
+		finalByNUMA[selectedNUMA] += cpusPerCore
 	}
 	general.InfoS("hard reclaim fake mandatory water-filling result",
 		"blockID", fake.BlockID,
@@ -540,11 +558,12 @@ func expandHardPartitionReclaimPhase(
 	}
 
 	minimum, maximum := finalByNUMA[numaIDs[0]], finalByNUMA[numaIDs[0]]
+	perNUMAMinimum := minimumHardReclaimCoresPerNUMA * cpusPerCore
 	for _, numaID := range numaIDs {
-		if finalByNUMA[numaID] < minimumHardReclaimCPUsPerNUMA {
+		if finalByNUMA[numaID] < perNUMAMinimum {
 			return nil, nil, fmt.Errorf(
 				"hard reclaim NUMA %d final quantity %d is smaller than minimum %d",
-				numaID, finalByNUMA[numaID], minimumHardReclaimCPUsPerNUMA)
+				numaID, finalByNUMA[numaID], perNUMAMinimum)
 		}
 		if finalByNUMA[numaID] < minimum {
 			minimum = finalByNUMA[numaID]
@@ -553,7 +572,9 @@ func expandHardPartitionReclaimPhase(
 			maximum = finalByNUMA[numaID]
 		}
 	}
-	if maximum-minimum > 1 {
+	// imbalance tolerance is one complete core: core-granular water-filling can leave
+	// at most one NUMA a single core ahead, never a fractional-core skew.
+	if maximum-minimum > cpusPerCore {
 		general.InfoS("hard reclaim final NUMA quantities imbalanced",
 			"minimum", minimum,
 			"maximum", maximum,

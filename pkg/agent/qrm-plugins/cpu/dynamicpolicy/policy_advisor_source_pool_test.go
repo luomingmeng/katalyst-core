@@ -1597,16 +1597,18 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 		require.Equal(t, 2, got.Intersection(numa1).Size())
 	})
 
-	t.Run("five CPUs use capacity-aware balanced quotas", func(t *testing.T) {
-		numa0CPUs, numa1CPUs := numa0.ToSliceInt(), numa1.ToSliceInt()
-		available := machine.NewCPUSet(
-			numa0CPUs[0], numa0CPUs[1],
-			numa1CPUs[0], numa1CPUs[1], numa1CPUs[2],
-		)
-		got, err := solve(t, newPolicy(t, true), 5, available, machine.NewCPUSet())
+	t.Run("capacity-aware balanced quotas honor whole cores", func(t *testing.T) {
+		// numa0 exposes a single complete core, numa1 both of its cores; a
+		// six-CPU (three-core) reclaim demand must water-fill core-by-core into
+		// the capacity each NUMA actually offers rather than stranding a lone
+		// SMT sibling.
+		numa0Core := coresInNUMA(topology, 0, 0, 1)
+		available := numa0Core.Union(numa1)
+		got, err := solve(t, newPolicy(t, true), 6, available, machine.NewCPUSet())
 		require.NoError(t, err)
 		require.Equal(t, 2, got.Intersection(numa0).Size())
-		require.Equal(t, 3, got.Intersection(numa1).Size())
+		require.Equal(t, 4, got.Intersection(numa1).Size())
+		requireCoreAligned(t, topology, got)
 	})
 
 	t.Run("old reclaim concentrated on one NUMA is rebalanced", func(t *testing.T) {
@@ -1631,10 +1633,13 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 		}, allCPUs, result, true)
 		require.NoError(t, err)
 		require.Equal(t, 2, result["real-0"].Intersection(numa0).Size())
-		require.Equal(t, 1, result["fake"].Intersection(numa0).Size())
-		require.Equal(t, 3, result["fake"].Intersection(numa1).Size())
-		require.Equal(t, 3, result["real-0"].Union(result["fake"]).Intersection(numa0).Size())
-		require.Equal(t, 3, result["real-0"].Union(result["fake"]).Intersection(numa1).Size())
+		// fake=4 is two whole cores: one core water-fills the empty numa1, the
+		// next lands back on numa0, so both NUMAs stay core-aligned.
+		require.Equal(t, 2, result["fake"].Intersection(numa0).Size())
+		require.Equal(t, 2, result["fake"].Intersection(numa1).Size())
+		require.Equal(t, 4, result["real-0"].Union(result["fake"]).Intersection(numa0).Size())
+		require.Equal(t, 2, result["real-0"].Union(result["fake"]).Intersection(numa1).Size())
+		requireCoreAligned(t, topology, result["real-0"].Union(result["fake"]))
 	})
 
 	t.Run("multiple fake blocks fail closed as a protocol error", func(t *testing.T) {
@@ -1671,13 +1676,16 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 			},
 			{
 				BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
-				Quantity: 5, ComponentKey: "fake", Eligible: allCPUs,
+				Quantity: 4, ComponentKey: "fake", Eligible: allCPUs,
 			},
 		}, allCPUs, result, true)
 		require.NoError(t, err)
 		require.Equal(t, 2, result["dedicated-0"].Intersection(numa0).Size())
+		// numa0 only has one core left after the dedicated core, so the second
+		// reclaim core spills to numa1; both NUMAs stay core-aligned.
 		require.Equal(t, 2, result["fake"].Intersection(numa0).Size())
-		require.Equal(t, 3, result["fake"].Intersection(numa1).Size())
+		require.Equal(t, 2, result["fake"].Intersection(numa1).Size())
+		requireCoreAligned(t, topology, result["fake"])
 	})
 
 	t.Run("real NUMA dedicated load rejects insufficient reclaim capacity", func(t *testing.T) {
@@ -1690,7 +1698,7 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 			},
 			{
 				BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
-				Quantity: 7, ComponentKey: "fake", Eligible: allCPUs,
+				Quantity: 8, ComponentKey: "fake", Eligible: allCPUs,
 			},
 		}, allCPUs, result, true)
 		require.ErrorContains(t, err, "insufficient aggregate capacity")
