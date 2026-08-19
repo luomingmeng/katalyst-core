@@ -111,7 +111,6 @@ func BuildTopologyNodeSpecsFromView(
 				TrustAnchor: true,
 				Constraint: topology.TopologyConstraint{
 					CPUUpperBound: physicalNUMACPUs,
-					MemUpperBound: machine.NewCPUSet(numaID),
 					Scope:         topology.TopologyScopeNUMANode,
 				},
 				Metadata: map[string]string{
