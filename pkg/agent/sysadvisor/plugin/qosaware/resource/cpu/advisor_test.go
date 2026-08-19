@@ -58,7 +58,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/spd"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	metricspool "github.com/kubewharf/katalyst-core/pkg/metrics/metrics-pool"
-	"github.com/kubewharf/katalyst-core/pkg/util/general"
+	cgroupcommon "github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	utilmetric "github.com/kubewharf/katalyst-core/pkg/util/metric"
 	"github.com/kubewharf/katalyst-core/pkg/util/reclaim"
@@ -1521,12 +1521,12 @@ func TestAdvisorUpdate(t *testing.T) {
 		},
 	}
 
-	// The production headroom assembler now filters reclaim cgroup paths
-	// through general.GetExistingPaths, which returns an empty slice for the
-	// fake paths used in tests and causes GetReclaimMetricsMulti to error.
+	// The production headroom assembler filters reclaim cgroup paths through
+	// cgroupcommon.GetExistingRelativeCgroupPaths, which returns an empty slice
+	// for the fake paths used in tests and causes GetReclaimMetricsMulti to error.
 	// Install a single function-level pass-through patch so all parallel
 	// subtests see it; per-subtest teardown would race with siblings.
-	existingPathsPatches := gomonkey.ApplyFunc(general.GetExistingPaths, func(paths []string) []string {
+	existingPathsPatches := gomonkey.ApplyFunc(cgroupcommon.GetExistingRelativeCgroupPaths, func(paths ...string) []string {
 		return paths
 	})
 	defer t.Cleanup(func() {

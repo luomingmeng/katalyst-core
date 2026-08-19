@@ -288,6 +288,63 @@ func TestPlanHardReclaimPartitionChecksRequestFloorForLegacyOverlappingReclaim(t
 	require.ErrorContains(t, err, "NUMA 0 needs")
 }
 
+// TestPlanHardReclaimPartitionStaysCoreAlignedWithIsolationShrinkingEligible
+// proves an isolation pool (which is never a donor and never reclaim, it only
+// consumes cpus and so shrinks reclaimEligible) cannot perturb reclaim core
+// alignment: reclaim still carves complete cores out of whatever residual the
+// NUMA offers.
+func TestPlanHardReclaimPartitionStaysCoreAlignedWithIsolationShrinkingEligible(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(32, 1, 1)
+	require.NoError(t, err)
+	numa := topology.CPUDetails.CPUsInNUMANodes(0)
+	// isolation holds two complete cores; reclaim is only eligible on the rest.
+	isolation := coresInNUMA(topology, 0, 0, 2)
+	eligible := numa.Difference(isolation)
+
+	plan, err := planHardReclaimPartition(hardReclaimPartitionInput{
+		topology:        topology,
+		targetByNUMA:    map[int]int{0: 6},
+		free:            eligible,
+		reclaimEligible: eligible,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 6, plan.reclaim.Size())
+	require.True(t, plan.reclaim.Intersection(isolation).IsEmpty(),
+		"reclaim must not overlap isolation %s", isolation.String())
+	requireCoreAligned(t, topology, plan.reclaim)
+}
+
+// TestPlanHardReclaimPartitionNeverSelectsAHalfCoreFromEligible proves that when
+// the eligible residual contains a lone SMT sibling (its peer was consumed by
+// some non-reclaim pool), a core-aligned target selects only the complete cores
+// and leaves the orphan sibling untouched — no half core is ever emitted.
+func TestPlanHardReclaimPartitionNeverSelectsAHalfCoreFromEligible(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(32, 1, 1)
+	require.NoError(t, err)
+	require.Equal(t, 2, topology.CPUsPerCore())
+	// two complete cores plus a single stranded sibling => five eligible cpus.
+	twoCores := coresInNUMA(topology, 0, 0, 2)
+	strandedCore := coresInNUMA(topology, 0, 2, 3).ToSliceInt()
+	eligible := twoCores.Union(machine.NewCPUSet(strandedCore[0]))
+	require.Equal(t, 5, eligible.Size())
+
+	plan, err := planHardReclaimPartition(hardReclaimPartitionInput{
+		topology:        topology,
+		targetByNUMA:    map[int]int{0: 4}, // core-aligned demand over an odd residual
+		free:            eligible,
+		reclaimEligible: eligible,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 4, plan.reclaim.Size())
+	require.True(t, plan.reclaim.Equals(twoCores),
+		"reclaim must be the two complete cores %s, got %s", twoCores.String(), plan.reclaim.String())
+	requireCoreAligned(t, topology, plan.reclaim)
+}
+
 func TestPlanHardReclaimPartitionSharesRequestFloorAcrossNUMADonors(t *testing.T) {
 	t.Parallel()
 

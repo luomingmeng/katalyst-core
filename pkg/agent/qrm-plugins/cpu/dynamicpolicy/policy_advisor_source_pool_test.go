@@ -1767,7 +1767,13 @@ func TestPlanDisjointAdvisorBlocksPreservesCeiledOwnerRequestWhenDonating(t *tes
 	}
 
 	result, err := p.planDisjointAdvisorBlocks(resp)
-	require.ErrorContains(t, err, "NUMA 0 needs 1 more reclaim CPUs")
+	// 12 CPUs / 6 cores, cpusPerCore==2, cores paired (k, k+6). the dedicated
+	// pod owns {0..7}, so the free pool {8,9,10,11} are all orphan half cores
+	// (siblings 2,3,4,5 are owned). the ceiled owner request is 7, leaving only
+	// a 1-CPU donor excess. under the core-aligned invariant neither the orphan
+	// half cores nor a lone 1-CPU excess can form a whole core, so reclaim can
+	// take nothing and the planner fails loud for the full core-aligned target.
+	require.ErrorContains(t, err, "NUMA 0 needs 6 more reclaim CPUs")
 	require.Empty(t, result)
 }
 

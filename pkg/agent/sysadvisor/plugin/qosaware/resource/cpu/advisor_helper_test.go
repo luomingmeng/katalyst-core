@@ -85,15 +85,18 @@ func Test_cpuResourceAdvisor_updateReservedForReclaim(t *testing.T) {
 					v1.ResourceCPU: resource.MustParse("4"),
 				},
 			},
+			// cpusPerCore==2: the per-NUMA reserve is rounded up to a complete
+			// physical core, so the historical 1-CPU-per-NUMA split becomes one
+			// whole core (2 CPUs) per NUMA under the core-aligned invariant.
 			wantReservedForReclaim: map[int]int{
-				0: 1,
-				1: 1,
-				2: 1,
-				3: 1,
-				4: 1,
-				5: 1,
-				6: 1,
-				7: 1,
+				0: 2,
+				1: 2,
+				2: 2,
+				3: 2,
+				4: 2,
+				5: 2,
+				6: 2,
+				7: 2,
 			},
 		},
 		{
@@ -183,16 +186,23 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimUsesHardPartitionRatio(t *tes
 			wantReserved:      map[int]int{0: 4, 1: 4},
 		},
 		{
+			// ratio 0 keeps only the 1-core baseline (2 CPUs) per NUMA; the odd
+			// configured floor of 5 lifts one whole core onto the least-loaded
+			// NUMA (NUMA0: 2->4), leaving NUMA1 at its 2-CPU baseline. a reserve
+			// can only ever be raised a complete core at a time.
 			name:              "odd configured reserve preserves the full configured floor",
 			ratio:             0,
 			configuredReserve: resource.MustParse("5"),
-			wantReserved:      map[int]int{0: 3, 1: 2},
+			wantReserved:      map[int]int{0: 4, 1: 2},
 		},
 		{
+			// ratio 0.75 on 4 cores/NUMA yields floor(3)=3 donated cores, rounded
+			// DOWN to an even 2 cores => 4 CPUs per NUMA. the core-aligned ratio
+			// dominates the smaller 4-CPU static reserve.
 			name:              "larger ratio wins over static reserve",
 			ratio:             0.75,
 			configuredReserve: resource.MustParse("4"),
-			wantReserved:      map[int]int{0: 6, 1: 6},
+			wantReserved:      map[int]int{0: 4, 1: 4},
 		},
 	}
 
@@ -258,7 +268,7 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimRejectsConfiguredFloorAboveCa
 
 	err = advisor.updateReservedForReclaim()
 
-	require.ErrorContains(t, err, "configured hard reclaim floor 17 exceeds total NUMA capacity 16")
+	require.ErrorContains(t, err, "configured hard reclaim floor 17 exceeds total core-aligned NUMA capacity 16")
 }
 
 func TestCPUResourceAdvisorUpdateReservedForReclaimUsesImmutableNUMACapacity(t *testing.T) {
@@ -293,6 +303,7 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimUsesImmutableNUMACapacity(t *
 				KatalystMachineInfo: &machine.KatalystMachineInfo{
 					CPUTopology: &machine.CPUTopology{
 						NumCPUs:      56,
+						NumCores:     28,
 						NumNUMANodes: 2,
 						NUMAToCPUs:   numaToCPUs,
 						CPUDetails:   cpuDetails,
@@ -304,7 +315,13 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimUsesImmutableNUMACapacity(t *
 	}
 
 	require.NoError(t, cra.updateReservedForReclaim())
-	assert.Equal(t, map[int]int{0: 4, 1: 6}, cra.reservedForReclaim)
+	// capacities: NUMA0 24 CPUs (12 cores), NUMA1 32 CPUs (16 cores),
+	// cpusPerCore==2, ratio 0.2. donated cores = floor(cores*0.2) rounded DOWN
+	// to an even count: NUMA0 floor(2.4)=2->2 cores=4 CPUs, NUMA1 floor(3.2)=3->2
+	// cores=4 CPUs. the configured floor of 4 is already met by the 8-CPU
+	// baseline sum, so nothing is lifted. targets follow the immutable topology
+	// capacity, not the smaller live numaAvailable, and stay whole-core.
+	assert.Equal(t, map[int]int{0: 4, 1: 4}, cra.reservedForReclaim)
 }
 
 func TestCPUResourceAdvisorUpdateReservedForReclaimFallbacks(t *testing.T) {
@@ -388,7 +405,10 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimFallbacks(t *testing.T) {
 		}
 
 		require.NoError(t, cra.updateReservedForReclaim())
-		assert.Equal(t, map[int]int{0: 3, 1: 3}, cra.reservedForReclaim)
+		// reclaim disabled => non-hard-partition path. the configured 6-CPU
+		// global reserve spreads to 3 CPUs/NUMA, each rounded up to a complete
+		// physical core (cpusPerCore==2) => 4 CPUs per NUMA.
+		assert.Equal(t, map[int]int{0: 4, 1: 4}, cra.reservedForReclaim)
 	})
 
 	t.Run("nil dynamic configuration returns error and clears reservation", func(t *testing.T) {
@@ -426,6 +446,8 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimFallbacks(t *testing.T) {
 		}
 
 		require.NoError(t, cra.updateReservedForReclaim())
-		assert.Equal(t, map[int]int{0: 3, 1: 3}, cra.reservedForReclaim)
+		// non-hard-partition path: the configured 6-CPU global reserve spreads to
+		// 3 CPUs/NUMA, each rounded up to a complete physical core => 4 per NUMA.
+		assert.Equal(t, map[int]int{0: 4, 1: 4}, cra.reservedForReclaim)
 	})
 }
