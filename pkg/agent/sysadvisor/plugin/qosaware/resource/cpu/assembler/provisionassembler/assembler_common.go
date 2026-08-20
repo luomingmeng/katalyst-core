@@ -44,6 +44,7 @@ type ProvisionAssemblerCommon struct {
 	conf                                       *config.Configuration
 	regionMap                                  *map[string]region.QoSRegion
 	reservedForReclaim                         *map[int]int
+	rampUpReclaimCPUSetCap                     *map[int]int
 	numaAvailable                              *map[int]int
 	nonBindingNumas                            *machine.CPUSet
 	allowSharedCoresOverlapReclaimedCores      *bool
@@ -55,7 +56,7 @@ type ProvisionAssemblerCommon struct {
 }
 
 func NewProvisionAssemblerCommon(conf *config.Configuration, _ interface{}, regionMap *map[string]region.QoSRegion,
-	reservedForReclaim *map[int]int, numaAvailable *map[int]int, nonBindingNumas *machine.CPUSet,
+	reservedForReclaim *map[int]int, rampUpReclaimCPUSetCap *map[int]int, numaAvailable *map[int]int, nonBindingNumas *machine.CPUSet,
 	allowSharedCoresOverlapReclaimedCores *bool, disableDedicatedCoresOverlapReclaimedCores *bool,
 	metaReader metacache.MetaReader, metaServer *metaserver.MetaServer, emitter metrics.MetricEmitter,
 ) ProvisionAssembler {
@@ -63,6 +64,7 @@ func NewProvisionAssemblerCommon(conf *config.Configuration, _ interface{}, regi
 		conf:                                  conf,
 		regionMap:                             regionMap,
 		reservedForReclaim:                    reservedForReclaim,
+		rampUpReclaimCPUSetCap:                rampUpReclaimCPUSetCap,
 		numaAvailable:                         numaAvailable,
 		nonBindingNumas:                       nonBindingNumas,
 		allowSharedCoresOverlapReclaimedCores: allowSharedCoresOverlapReclaimedCores,
@@ -99,15 +101,43 @@ func (pa *ProvisionAssemblerCommon) reclaimRatioCPUsPerCore() (int, error) {
 	return cpusPerCore, nil
 }
 
+func (pa *ProvisionAssemblerCommon) applyRampUpReclaimCap(
+	size int,
+	limit float64,
+	numas machine.CPUSet,
+	reservedForReclaim int,
+) (int, float64) {
+	if pa.rampUpReclaimCPUSetCap == nil || numas.IsEmpty() {
+		return size, limit
+	}
+
+	capTotal := 0
+	for _, numaID := range numas.ToSliceInt() {
+		c, ok := (*pa.rampUpReclaimCPUSetCap)[numaID]
+		if !ok || c <= 0 {
+			return size, limit
+		}
+		capTotal += c
+	}
+	capTotal = general.Max(capTotal, reservedForReclaim)
+	if size > capTotal {
+		size = capTotal
+	}
+	if limit >= 0 && limit > float64(size) {
+		limit = float64(size)
+	}
+	return size, limit
+}
+
 // clampByReclaimedCPUMaxRatio caps the reclaim pool size (and quota when it is
 // not the -1 sentinel) by ratio*cpuCount. When ratio<=0 it disables clamping and
 // returns the inputs unchanged; a negative limit (e.g. the -1 "no quota limit"
 // sentinel) is preserved as-is.
 //
 // In legacy mode the cap is rounded down to an even logical CPU count. In hard
-// partition mode the ratio is applied to physical cores, rounded down to an
-// even core count, and converted back to logical CPUs. The reclaim reservation
-// remains a floor in both modes.
+// partition mode the ratio is applied to physical cores, rounded down to a
+// complete physical core count, and converted back to logical CPUs. The reclaim
+// reservation remains a floor in both modes.
 func clampByReclaimedCPUMaxRatio(
 	size int,
 	limit float64,
@@ -581,6 +611,33 @@ func (pa *ProvisionAssemblerCommon) assembleDedicatedNUMAExclusiveRegion(r regio
 			reclaimQuotaLimit = calculateReclaimQuotaLimit(reclaimTarget, quota.Value, ratioPhysicalCap)
 		}
 	}
+	originalReclaimTarget := reclaimTarget
+	reclaimTarget, reclaimQuotaLimit = pa.applyRampUpReclaimCap(
+		reclaimTarget,
+		reclaimQuotaLimit,
+		r.GetBindingNumas(),
+		reservedForReclaim,
+	)
+	if reclaimTarget > reclaimCapacity {
+		return fmt.Errorf(
+			"ramp-up reclaim target %d exceeds reclaim capacity %d for exclusive region %q",
+			reclaimTarget,
+			reclaimCapacity,
+			r.Name(),
+		)
+	}
+	if reclaimTarget != originalReclaimTarget {
+		nextDedicatedTarget := partitionCapacity - reclaimTarget
+		if nextDedicatedTarget > dedicatedCapacity {
+			return fmt.Errorf(
+				"dedicated target %d exceeds dedicated capacity %d after ramp-up reclaim cap for exclusive region %q",
+				nextDedicatedTarget,
+				dedicatedCapacity,
+				r.Name(),
+			)
+		}
+		dedicatedTarget = nextDedicatedTarget
+	}
 
 	for podUID := range r.GetPods() {
 		result.SetPoolEntry(podUID, regionNuma, dedicatedTarget, -1)
@@ -708,6 +765,12 @@ func (pa *ProvisionAssemblerCommon) assembleLegacyDedicatedNUMAExclusiveRegion(r
 			}
 		}
 	}
+	reclaimedCoresSize, reclaimedCoresLimit = pa.applyRampUpReclaimCap(
+		reclaimedCoresSize,
+		reclaimedCoresLimit,
+		r.GetBindingNumas(),
+		reservedForReclaim,
+	)
 
 	klog.InfoS("assembleDedicatedNUMAExclusive info", "regionName", r.Name(), "reclaimedCoresSize", reclaimedCoresSize,
 		"reclaimedCoresLimit", reclaimedCoresLimit,
@@ -1225,12 +1288,17 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 	if ratio > 0 {
 		cpuCount = pa.cpuCountInNUMAs(numaSet)
 	}
+	clamp := reclaimClampResult{
+		RawSize:    reclaimedCoresSize,
+		FinalSize:  reclaimedCoresSize,
+		FinalLimit: reclaimedCoresQuota,
+	}
 	if ratio <= 0 || cpuCount > 0 {
 		cpusPerCore, err := pa.reclaimRatioCPUsPerCore()
 		if err != nil {
 			return err
 		}
-		clamp, err := clampByReclaimedCPUMaxRatioWithDiagnostics(
+		clamp, err = clampByReclaimedCPUMaxRatioWithDiagnostics(
 			reclaimedCoresSize,
 			reclaimedCoresQuota,
 			ratio,
@@ -1245,13 +1313,22 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		// quota are exactly what the underlying helper returns.
 		reclaimedCoresSize = clamp.FinalSize
 		reclaimedCoresQuota = clamp.FinalLimit
-		// accumulate the default share backfill diagnostics for this scope
-		// once; released cores from exclusive NUMA scopes are intentionally
-		// excluded and must not be counted here.
-		result.DefaultShareBackfill.RawReclaimSize += clamp.RawSize
-		result.DefaultShareBackfill.FinalReclaimSize += clamp.FinalSize
-		result.DefaultShareBackfill.ReleasedReclaimSize += clamp.ReleasedSize
 	}
+	reclaimedCoresSize, reclaimedCoresQuota = pa.applyRampUpReclaimCap(
+		reclaimedCoresSize,
+		reclaimedCoresQuota,
+		numaSet,
+		reservedForReclaim,
+	)
+	clamp.FinalSize = reclaimedCoresSize
+	clamp.FinalLimit = reclaimedCoresQuota
+	clamp.ReleasedSize = general.Max(0, clamp.RawSize-clamp.FinalSize)
+	// accumulate the default share backfill diagnostics for this scope
+	// once; released cores from exclusive NUMA scopes are intentionally
+	// excluded and must not be counted here.
+	result.DefaultShareBackfill.RawReclaimSize += clamp.RawSize
+	result.DefaultShareBackfill.FinalReclaimSize += clamp.FinalSize
+	result.DefaultShareBackfill.ReleasedReclaimSize += clamp.ReleasedSize
 
 	overlapBudget := reclaimedCoresSize
 	if effectiveHard {
@@ -1273,6 +1350,7 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		"policy", policy,
 		"ratio", ratio,
 		"cpuCount", cpuCount,
+		"rampUpReclaimCPUSetCap", pa.rampUpReclaimCPUSetCap,
 		"reservedForReclaim", reservedForReclaim,
 		"reclaimedCoresSize", reclaimedCoresSize,
 		"overlapReclaimedCoresSize", overlapReclaimedCoresSize,
