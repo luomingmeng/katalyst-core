@@ -6708,15 +6708,15 @@ func TestGetTopologyAwareResources(t *testing.T) {
 					AggregatedQuantity:         10,
 					OriginalAggregatedQuantity: 10,
 					TopologyAwareQuantityList: []*pluginapi.TopologyAwareQuantity{
-						{ResourceValue: 3, Node: 0},
-						{ResourceValue: 3, Node: 1},
-						{ResourceValue: 2, Node: 2},
+						{ResourceValue: 2, Node: 0},
+						{ResourceValue: 2, Node: 1},
+						{ResourceValue: 4, Node: 2},
 						{ResourceValue: 2, Node: 3},
 					},
 					OriginalTopologyAwareQuantityList: []*pluginapi.TopologyAwareQuantity{
-						{ResourceValue: 3, Node: 0},
-						{ResourceValue: 3, Node: 1},
-						{ResourceValue: 2, Node: 2},
+						{ResourceValue: 2, Node: 0},
+						{ResourceValue: 2, Node: 1},
+						{ResourceValue: 4, Node: 2},
 						{ResourceValue: 2, Node: 3},
 					},
 				},
@@ -6786,10 +6786,12 @@ func TestGetResourcesAllocation(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 10,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
+		// whole-core apportion balances lent cores across NUMAs, shifting the
+		// per-NUMA share split while the aggregate stays 10.
 		TopologyAssignments: map[uint64]uint64{
-			0: 3,
-			1: 3,
-			2: 2,
+			0: 2,
+			1: 2,
+			2: 4,
 			3: 2,
 		},
 		Annotations: map[string]string{
@@ -6818,11 +6820,11 @@ func TestGetResourcesAllocation(t *testing.T) {
 		IsNodeResource:    false,
 		IsScalarResource:  true,
 		AllocatedQuantity: 10,
-		AllocationResult:  machine.NewCPUSet(1, 3, 4, 5, 6, 7, 8, 9, 10, 11).String(),
+		AllocationResult:  machine.NewCPUSet(1, 3, 4, 5, 6, 9, 11, 12, 13, 14).String(),
 		TopologyAssignments: map[uint64]uint64{
-			0: 3,
-			1: 3,
-			2: 2,
+			0: 2,
+			1: 2,
+			2: 4,
 			3: 2,
 		},
 		Annotations: map[string]string{
@@ -6864,9 +6866,10 @@ func TestGetResourcesAllocation(t *testing.T) {
 		IsNodeResource:    false,
 		IsScalarResource:  true,
 		AllocatedQuantity: 4,
-		AllocationResult:  machine.NewCPUSet(12, 13, 14, 15).String(),
+		AllocationResult:  machine.NewCPUSet(7, 8, 10, 15).String(),
 		TopologyAssignments: map[uint64]uint64{
-			uint64(2): 2,
+			uint64(0): 1,
+			uint64(1): 1,
 			uint64(3): 2,
 		},
 		Annotations: map[string]string{
