@@ -18,6 +18,7 @@ package provisionassembler
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -1212,7 +1213,8 @@ func TestAssembleProvision(t *testing.T) {
 				}
 			}
 
-			common := NewProvisionAssemblerCommon(conf, nil, &regionMap, &reservedForReclaim, &numaAvailable,
+			rampUpReclaimCPUSetCap := map[int]int{}
+			common := NewProvisionAssemblerCommon(conf, nil, &regionMap, &reservedForReclaim, &rampUpReclaimCPUSetCap, &numaAvailable,
 				&nonBindingNumas, &tt.allowSharedCoresOverlapReclaimedCores,
 				&tt.disableDedicatedCoresOverlapReclaimedCores, metaCache, metaServer, metrics.DummyMetrics{})
 			result, err := common.AssembleProvision()
@@ -1905,6 +1907,7 @@ func TestAssembleProvisionPublishesHardReclaimFloorForEveryPhysicalNUMAWithoutRe
 	conf.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
 	regionMap := map[string]region.QoSRegion{}
 	reservedForReclaim := map[int]int{0: 4, 1: 6}
+	rampUpReclaimCPUSetCap := map[int]int{}
 	numaAvailable := map[int]int{0: 24, 1: 32}
 	nonBindingNUMAs := machine.NewCPUSet()
 	allowSharedOverlap := false
@@ -1914,7 +1917,7 @@ func TestAssembleProvisionPublishesHardReclaimFloorForEveryPhysicalNUMAWithoutRe
 	metaServer := newTestMetaServer(numaAvailable, 1)
 
 	assembler := NewProvisionAssemblerCommon(
-		conf, nil, &regionMap, &reservedForReclaim, &numaAvailable, &nonBindingNUMAs,
+		conf, nil, &regionMap, &reservedForReclaim, &rampUpReclaimCPUSetCap, &numaAvailable, &nonBindingNUMAs,
 		&allowSharedOverlap, &disableDedicatedOverlap, metaReader, metaServer, metrics.DummyMetrics{},
 	)
 	result, err := assembler.AssembleProvision()
@@ -1930,6 +1933,7 @@ func TestAssembleProvisionDoesNotRepublishPhysicalHardReclaimFloorsAtFakedNUMA(t
 	conf.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
 	regionMap := map[string]region.QoSRegion{}
 	reservedForReclaim := map[int]int{0: 4, 1: 6}
+	rampUpReclaimCPUSetCap := map[int]int{}
 	numaAvailable := map[int]int{0: 24, 1: 32}
 	nonBindingNUMAs := machine.NewCPUSet(0, 1)
 	allowSharedOverlap := false
@@ -1939,7 +1943,7 @@ func TestAssembleProvisionDoesNotRepublishPhysicalHardReclaimFloorsAtFakedNUMA(t
 	metaServer := newTestMetaServer(numaAvailable, 1)
 
 	assembler := NewProvisionAssemblerCommon(
-		conf, nil, &regionMap, &reservedForReclaim, &numaAvailable, &nonBindingNUMAs,
+		conf, nil, &regionMap, &reservedForReclaim, &rampUpReclaimCPUSetCap, &numaAvailable, &nonBindingNUMAs,
 		&allowSharedOverlap, &disableDedicatedOverlap, metaReader, metaServer, metrics.DummyMetrics{},
 	)
 	result, err := assembler.AssembleProvision()
@@ -2114,6 +2118,7 @@ func runOrdinaryOverlapAssemblerCase(
 	}
 
 	reservedForReclaim := map[int]int{0: tc.reserved}
+	rampUpReclaimCPUSetCap := map[int]int{}
 	numaAvailable := map[int]int{0: tc.capacity}
 	nonBindingNUMAs := machine.NewCPUSet()
 	metaReader := metacache.NewDummyMetaCacheImp()
@@ -2133,7 +2138,7 @@ func runOrdinaryOverlapAssemblerCase(
 		}))
 	}
 	pa := NewProvisionAssemblerCommon(
-		conf, nil, &regionMap, &reservedForReclaim, &numaAvailable, &nonBindingNUMAs,
+		conf, nil, &regionMap, &reservedForReclaim, &rampUpReclaimCPUSetCap, &numaAvailable, &nonBindingNUMAs,
 		&tc.allowSharedOverlap, &tc.disableDedicatedOverlap, metaReader,
 		newTestMetaServer(numaAvailable, 1), metrics.DummyMetrics{},
 	).(*ProvisionAssemblerCommon)
@@ -2220,12 +2225,13 @@ func TestAssembleProvisionMultiDedicatedDomainsIsDeterministic(t *testing.T) {
 			},
 		}))
 		reservedForReclaim := map[int]int{0: 2, 1: 3}
+		rampUpReclaimCPUSetCap := map[int]int{}
 		numaAvailable := map[int]int{0: 12, 1: 18}
 		nonBindingNUMAs := machine.NewCPUSet(1)
 		allowSharedOverlap := false
 		disableDedicatedOverlap := true
 		assembler := NewProvisionAssemblerCommon(
-			conf, nil, &regionMap, &reservedForReclaim, &numaAvailable, &nonBindingNUMAs,
+			conf, nil, &regionMap, &reservedForReclaim, &rampUpReclaimCPUSetCap, &numaAvailable, &nonBindingNUMAs,
 			&allowSharedOverlap, &disableDedicatedOverlap, metaReader, nil, metrics.DummyMetrics{},
 		)
 
@@ -2359,9 +2365,9 @@ func TestClampByReclaimedCPUMaxRatioWithDiagnostics(t *testing.T) {
 			want: reclaimClampResult{RawSize: 186, FinalSize: 186, ReleasedSize: 0, FinalLimit: -1},
 		},
 		{
-			name: "hard reclaim cap aligns ratio by physical cores",
+			name: "hard reclaim cap derives complete physical core target",
 			size: 96, limit: 96, ratio: 0.2, cpuCount: 96, reservedForReclaim: 16, cpusPerCore: 2,
-			want: reclaimClampResult{RawSize: 96, FinalSize: 16, ReleasedSize: 80, FinalLimit: 16},
+			want: reclaimClampResult{RawSize: 96, FinalSize: 18, ReleasedSize: 78, FinalLimit: 18},
 		},
 	}
 	for _, tc := range tests {
@@ -2372,6 +2378,110 @@ func TestClampByReclaimedCPUMaxRatioWithDiagnostics(t *testing.T) {
 			)
 			require.NoError(t, err)
 			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestReclaimPoolRampUpCapAppliedAsUpperBound(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name               string
+		capByNUMA          map[int]int
+		numas              machine.CPUSet
+		size               int
+		limit              float64
+		reservedForReclaim int
+		wantSize           int
+		wantLimit          float64
+	}{
+		{
+			name:               "caps size above configured per-numa upper bound",
+			capByNUMA:          map[int]int{0: 12},
+			numas:              machine.NewCPUSet(0),
+			size:               20,
+			limit:              20,
+			reservedForReclaim: 8,
+			wantSize:           12,
+			wantLimit:          12,
+		},
+		{
+			name:               "zero cap keeps original size and quota",
+			capByNUMA:          map[int]int{0: 0},
+			numas:              machine.NewCPUSet(0),
+			size:               20,
+			limit:              20,
+			reservedForReclaim: 8,
+			wantSize:           20,
+			wantLimit:          20,
+		},
+		{
+			name:               "missing cap keeps original size and quota",
+			capByNUMA:          map[int]int{},
+			numas:              machine.NewCPUSet(0),
+			size:               20,
+			limit:              20,
+			reservedForReclaim: 8,
+			wantSize:           20,
+			wantLimit:          20,
+		},
+		{
+			name:               "global scope uses sum only when every spanned numa has cap",
+			capByNUMA:          map[int]int{0: 12, 1: 10},
+			numas:              machine.NewCPUSet(0, 1),
+			size:               30,
+			limit:              25,
+			reservedForReclaim: 8,
+			wantSize:           22,
+			wantLimit:          22,
+		},
+		{
+			name:               "global scope ignores cap when any spanned numa is missing",
+			capByNUMA:          map[int]int{0: 12},
+			numas:              machine.NewCPUSet(0, 1),
+			size:               30,
+			limit:              25,
+			reservedForReclaim: 8,
+			wantSize:           30,
+			wantLimit:          25,
+		},
+		{
+			name:               "reserved floor wins over lower cap",
+			capByNUMA:          map[int]int{0: 12},
+			numas:              machine.NewCPUSet(0),
+			size:               20,
+			limit:              20,
+			reservedForReclaim: 14,
+			wantSize:           14,
+			wantLimit:          14,
+		},
+		{
+			name:               "negative quota sentinel is preserved",
+			capByNUMA:          map[int]int{0: 12},
+			numas:              machine.NewCPUSet(0),
+			size:               20,
+			limit:              -1,
+			reservedForReclaim: 8,
+			wantSize:           12,
+			wantLimit:          -1,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pa := &ProvisionAssemblerCommon{
+				rampUpReclaimCPUSetCap: &tc.capByNUMA,
+			}
+			gotSize, gotLimit := pa.applyRampUpReclaimCap(
+				tc.size,
+				tc.limit,
+				tc.numas,
+				tc.reservedForReclaim,
+			)
+			require.Equal(t, tc.wantSize, gotSize)
+			require.Equal(t, tc.wantLimit, gotLimit)
 		})
 	}
 }
@@ -2397,7 +2507,7 @@ func TestDefaultShareBackfillDiagnosticsWhenRatioDisabled(t *testing.T) {
 	require.Zero(t, result.DefaultShareBackfill.ReleasedReclaimSize)
 }
 
-func TestDefaultShareBackfillHardRatioMatchesPhysicalCoreTarget(t *testing.T) {
+func TestDefaultShareBackfillHardRatioMatchesCompletePhysicalCoreTarget(t *testing.T) {
 	t.Parallel()
 
 	pa := newDefaultShareAssembler(t, map[int]int{0: 96}, machine.NewCPUSet(0), nil,
@@ -2412,8 +2522,8 @@ func TestDefaultShareBackfillHardRatioMatchesPhysicalCoreTarget(t *testing.T) {
 	result, err := pa.AssembleProvision()
 	require.NoError(t, err)
 	require.Equal(t, 96, result.DefaultShareBackfill.RawReclaimSize)
-	require.Equal(t, 16, result.DefaultShareBackfill.FinalReclaimSize)
-	require.Equal(t, 80, result.DefaultShareBackfill.ReleasedReclaimSize)
+	require.Equal(t, 18, result.DefaultShareBackfill.FinalReclaimSize)
+	require.Equal(t, 78, result.DefaultShareBackfill.ReleasedReclaimSize)
 	require.Equal(t, types.CPUResource{Size: 96, Quota: -1},
 		result.PoolEntries[commonstate.PoolNameShare][commonstate.FakedNUMAID])
 }
@@ -2459,6 +2569,7 @@ func TestDefaultShareBackfillReleasedAccumulatesAcrossScopes(t *testing.T) {
 
 	regionMap := map[string]region.QoSRegion{}
 	reservedForReclaim := map[int]int{0: 2}
+	rampUpReclaimCPUSetCap := map[int]int{}
 	numaAvailable := map[int]int{0: cpuCount}
 	nonBindingNUMAs := machine.NewCPUSet(0)
 	allowOverlap := true
@@ -2468,6 +2579,7 @@ func TestDefaultShareBackfillReleasedAccumulatesAcrossScopes(t *testing.T) {
 		nil,
 		&regionMap,
 		&reservedForReclaim,
+		&rampUpReclaimCPUSetCap,
 		&numaAvailable,
 		&nonBindingNUMAs,
 		&allowOverlap,
@@ -2528,6 +2640,7 @@ func TestAssembleProvisionUsesReservedWhenEvenRatioCapIsLower(t *testing.T) {
 		metaReader := metacache.NewDummyMetaCacheImp()
 
 		reservedForReclaim := map[int]int{0: 2}
+		rampUpReclaimCPUSetCap := map[int]int{}
 		numaAvailable := map[int]int{0: 8}
 		allowOverlap := true
 		disableDedicatedOverlap := false
@@ -2536,6 +2649,7 @@ func TestAssembleProvisionUsesReservedWhenEvenRatioCapIsLower(t *testing.T) {
 			nil,
 			&regionMap,
 			&reservedForReclaim,
+			&rampUpReclaimCPUSetCap,
 			&numaAvailable,
 			&nonBindingNUMAs,
 			&allowOverlap,
@@ -2623,6 +2737,7 @@ func newExclusiveAssemblerFixture(
 
 	regionMap := map[string]region.QoSRegion{exclusiveRegion.Name(): exclusiveRegion}
 	reservedForReclaim := map[int]int{0: reserved}
+	rampUpReclaimCPUSetCap := map[int]int{}
 	numaAvailable := map[int]int{0: capacity}
 	nonBindingNUMAs := machine.NewCPUSet()
 	allowSharedOverlap := true
@@ -2631,6 +2746,7 @@ func newExclusiveAssemblerFixture(
 		nil,
 		&regionMap,
 		&reservedForReclaim,
+		&rampUpReclaimCPUSetCap,
 		&numaAvailable,
 		&nonBindingNUMAs,
 		&allowSharedOverlap,
@@ -2813,6 +2929,53 @@ func TestAssembleDedicatedNUMAExclusiveRegionDisjoint(t *testing.T) {
 			result.PoolEntries[commonstate.PoolNameReclaim][0])
 	})
 
+	t.Run("ramp up cap limits reclaim block and quota", func(t *testing.T) {
+		pa, exclusiveRegion, result, metaReader := newExclusiveAssemblerFixture(t, 16, 4, true, true)
+		(*pa.rampUpReclaimCPUSetCap)[0] = 5
+		require.NoError(t, metaReader.SetSupportedWantedFeatureGates(
+			finders.FeatureGateTypeCPU,
+			map[string]*advisorsvc.FeatureGate{
+				feature_cpu.NegotiationFeatureGateQuotaCtrlKnob: {
+					Name: feature_cpu.NegotiationFeatureGateQuotaCtrlKnob,
+					Type: finders.FeatureGateTypeCPU,
+				},
+			},
+		))
+		exclusiveRegion.SetProvision(types.ControlKnob{
+			configapi.ControlKnobNonReclaimedCPURequirement: {Value: 10},
+			configapi.ControlKnobReclaimedCoresCPUQuota:     {Value: 6},
+		})
+
+		require.NoError(t, pa.assembleDedicatedNUMAExclusiveRegion(exclusiveRegion, result))
+		require.Equal(t, types.CPUResource{Size: 11, Quota: -1}, result.PoolEntries["pod"][0])
+		require.Equal(t, types.CPUResource{Size: 11, Quota: -1}, result.PoolEntries["other-pod"][0])
+		require.Equal(t, types.CPUResource{Size: 5, Quota: 5},
+			result.PoolEntries[commonstate.PoolNameReclaim][0])
+		require.Equal(t, 16, result.PoolEntries["pod"][0].Size+result.PoolEntries[commonstate.PoolNameReclaim][0].Size)
+	})
+
+	t.Run("ramp up cap requiring dedicated beyond package capacity is rejected", func(t *testing.T) {
+		pa, exclusiveRegion, result, metaReader := newExclusiveAssemblerFixture(t, 16, 4, true, true)
+		(*pa.rampUpReclaimCPUSetCap)[0] = 5
+		exclusiveRegion.ownerPoolName = "dedicated-pkg/dedicated-exclusive"
+		require.NoError(t, metaReader.SetResourcePackageConfig(types.ResourcePackageConfig{
+			0: {
+				"dedicated-pkg": {
+					PinnedCPUSet: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7, 8, 9),
+				},
+			},
+		}))
+		exclusiveRegion.SetProvision(types.ControlKnob{
+			configapi.ControlKnobNonReclaimedCPURequirement: {Value: 10},
+		})
+
+		err := pa.assembleDedicatedNUMAExclusiveRegion(exclusiveRegion, result)
+		require.Error(t, err)
+		require.Equal(t, strings.ToLower(err.Error()), err.Error())
+		require.ErrorContains(t, err, "dedicated target")
+		require.Empty(t, result.PoolEntries)
+	})
+
 	t.Run("ratio clamps physical reclaim target", func(t *testing.T) {
 		pa, exclusiveRegion, result, _ := newExclusiveAssemblerFixture(t, 16, 4, true, true)
 		pa.conf.GetDynamicConfiguration().ReclaimedCPUMaxRatio = 0.25
@@ -2826,7 +2989,7 @@ func TestAssembleDedicatedNUMAExclusiveRegionDisjoint(t *testing.T) {
 			result.PoolEntries[commonstate.PoolNameReclaim][0])
 	})
 
-	t.Run("ratio clamp uses physical core granularity", func(t *testing.T) {
+	t.Run("ratio clamp derives complete physical core target", func(t *testing.T) {
 		pa, exclusiveRegion, result, _ := newExclusiveAssemblerFixture(t, 96, 16, true, true)
 		pa.metaServer.CPUTopology.NumCores = 48
 		pa.conf.GetDynamicConfiguration().EnableReclaim = true
@@ -2837,9 +3000,9 @@ func TestAssembleDedicatedNUMAExclusiveRegionDisjoint(t *testing.T) {
 		})
 
 		require.NoError(t, pa.assembleDedicatedNUMAExclusiveRegion(exclusiveRegion, result))
-		require.Equal(t, types.CPUResource{Size: 16, Quota: -1},
+		require.Equal(t, types.CPUResource{Size: 18, Quota: -1},
 			result.PoolEntries[commonstate.PoolNameReclaim][0])
-		require.Equal(t, types.CPUResource{Size: 80, Quota: -1}, result.PoolEntries["pod"][0])
+		require.Equal(t, types.CPUResource{Size: 78, Quota: -1}, result.PoolEntries["pod"][0])
 	})
 
 	t.Run("empty dedicated target is rejected", func(t *testing.T) {
@@ -2924,6 +3087,32 @@ func TestAssembleDedicatedNUMAExclusiveRegionLegacyGolden(t *testing.T) {
 	require.Equal(t, 6,
 		result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["pod"]["main"])
 	require.Equal(t, 6,
+		result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["pod"]["sidecar"])
+}
+
+func TestAssembleDedicatedNUMAExclusiveRegionLegacyRampUpCap(t *testing.T) {
+	pa, exclusiveRegion, result, metaReader := newExclusiveAssemblerFixture(t, 16, 4, true, false)
+	(*pa.rampUpReclaimCPUSetCap)[0] = 5
+	require.NoError(t, metaReader.SetSupportedWantedFeatureGates(
+		finders.FeatureGateTypeCPU,
+		map[string]*advisorsvc.FeatureGate{
+			feature_cpu.NegotiationFeatureGateQuotaCtrlKnob: {
+				Name: feature_cpu.NegotiationFeatureGateQuotaCtrlKnob,
+				Type: finders.FeatureGateTypeCPU,
+			},
+		},
+	))
+	exclusiveRegion.SetProvision(types.ControlKnob{
+		configapi.ControlKnobNonReclaimedCPURequirement: {Value: 10},
+		configapi.ControlKnobReclaimedCoresCPUQuota:     {Value: 6},
+	})
+
+	require.NoError(t, pa.assembleDedicatedNUMAExclusiveRegion(exclusiveRegion, result))
+	require.Equal(t, types.CPUResource{Size: 0, Quota: 5},
+		result.PoolEntries[commonstate.PoolNameReclaim][0])
+	require.Equal(t, 5,
+		result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["pod"]["main"])
+	require.Equal(t, 5,
 		result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["pod"]["sidecar"])
 }
 
@@ -3020,6 +3209,7 @@ func newDefaultShareAssembler(
 	for k, v := range reserved {
 		reservedCopy[k] = v
 	}
+	rampUpReclaimCPUSetCap := map[int]int{}
 	if regionMap == nil {
 		regionMap = map[string]region.QoSRegion{}
 	}
@@ -3029,6 +3219,7 @@ func newDefaultShareAssembler(
 		nil,
 		&regionMap,
 		&reservedCopy,
+		&rampUpReclaimCPUSetCap,
 		&numaAvailableCopy,
 		&nonBinding,
 		&allowShared,

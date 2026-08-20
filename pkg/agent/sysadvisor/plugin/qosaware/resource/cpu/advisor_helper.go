@@ -136,7 +136,7 @@ func (cra *cpuResourceAdvisor) initializeProvisionAssembler() error {
 		return fmt.Errorf("unsupported provision assembler %v", assemblerName)
 	}
 	cra.provisionAssembler = initializer(cra.conf, cra.extraConf, &cra.regionMap, &cra.reservedForReclaim,
-		&cra.numaAvailable, &cra.nonBindingNumas, &cra.allowSharedCoresOverlapReclaimedCores,
+		&cra.rampUpReclaimCPUSetCap, &cra.numaAvailable, &cra.nonBindingNumas, &cra.allowSharedCoresOverlapReclaimedCores,
 		&cra.disableDedicatedCoresOverlapReclaimedCores, cra.metaCache, cra.metaServer, cra.emitter)
 
 	return nil
@@ -198,7 +198,9 @@ func (cra *cpuResourceAdvisor) updateNumasAvailableResource() error {
 	}
 
 	cra.numaAvailable = numaAvailable
-	return cra.updateReservedForReclaim()
+	err := cra.updateReservedForReclaim()
+	cra.updateRampUpReclaimCPUSetCap()
+	return err
 }
 
 func (cra *cpuResourceAdvisor) updateReservedForReclaim() error {
@@ -230,6 +232,42 @@ func (cra *cpuResourceAdvisor) updateReservedForReclaim() error {
 		numaReserved.AsApproximateFloat64(),
 		globalReserved.Value())
 	return nil
+}
+
+func (cra *cpuResourceAdvisor) updateRampUpReclaimCPUSetCap() {
+	cap := make(map[int]int)
+	dynamicConf := cra.conf.GetDynamicConfiguration()
+	if dynamicConf == nil || !dynamicConf.EnableReclaim || !dynamicConf.EnableRampUpReclaimHardPartition {
+		cra.rampUpReclaimCPUSetCap = cap
+		return
+	}
+
+	topo := cra.metaServer.CPUTopology
+	cpusPerCore := topo.CPUsPerCore()
+	ratio := dynamicConf.InitialRampUpReclaimCPUSetRatio
+
+	rampUpNUMAs := make(map[int]bool)
+	cra.metaCache.RangeContainer(func(_, _ string, ci *types.ContainerInfo) bool {
+		if ci == nil || !ci.RampUp {
+			return true
+		}
+		for numaID := range ci.TopologyAwareAssignments {
+			rampUpNUMAs[numaID] = true
+		}
+		return true
+	})
+
+	for numaID := range rampUpNUMAs {
+		cpuCount := topo.CPUDetails.CPUsInNUMANodes(numaID).Size()
+		target, err := machine.CalculatePerNUMAHardReclaimTarget(cpuCount, ratio, 0, 0, cpusPerCore)
+		if err != nil {
+			general.Errorf("ramp-up reclaim cap for numa %d: %v", numaID, err)
+			continue
+		}
+		cap[numaID] = target
+	}
+	cra.rampUpReclaimCPUSetCap = cap
+	general.Infof("rampUpReclaimCPUSetCap: %v, ratio %v", cap, ratio)
 }
 
 func (cra *cpuResourceAdvisor) getNumasReservedForAllocate(numas machine.CPUSet) float64 {

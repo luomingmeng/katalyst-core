@@ -111,11 +111,12 @@ type cpuResourceAdvisor struct {
 
 	advisorUpdated bool
 
-	regionMap          map[string]region.QoSRegion // map[regionName]region
-	reservedForReclaim map[int]int                 // map[numaID]reservedForReclaim
-	numaAvailable      map[int]int                 // map[numaID]availableResource
-	numRegionsPerNuma  map[int]int                 // map[numaID]regionQuantity
-	nonBindingNumas    machine.CPUSet              // numas without numa binding pods
+	regionMap              map[string]region.QoSRegion // map[regionName]region
+	reservedForReclaim     map[int]int                 // map[numaID]reservedForReclaim
+	rampUpReclaimCPUSetCap map[int]int                 // map[numaID]rampUpReclaimCPUSetCap
+	numaAvailable          map[int]int                 // map[numaID]availableResource
+	numRegionsPerNuma      map[int]int                 // map[numaID]regionQuantity
+	nonBindingNumas        machine.CPUSet              // numas without numa binding pods
 
 	allowSharedCoresOverlapReclaimedCores      bool
 	disableDedicatedCoresOverlapReclaimedCores bool
@@ -143,11 +144,12 @@ func NewCPUResourceAdvisor(conf *config.Configuration, extraConf interface{}, me
 
 		advisorUpdated: false,
 
-		regionMap:          make(map[string]region.QoSRegion),
-		reservedForReclaim: make(map[int]int),
-		numaAvailable:      make(map[int]int),
-		numRegionsPerNuma:  make(map[int]int),
-		nonBindingNumas:    machine.NewCPUSet(),
+		regionMap:              make(map[string]region.QoSRegion),
+		reservedForReclaim:     make(map[int]int),
+		rampUpReclaimCPUSetCap: make(map[int]int),
+		numaAvailable:          make(map[int]int),
+		numRegionsPerNuma:      make(map[int]int),
+		nonBindingNumas:        machine.NewCPUSet(),
 
 		isolator: isolation.NewLoadIsolator(conf, extraConf, emitter, metaCache, metaServer),
 

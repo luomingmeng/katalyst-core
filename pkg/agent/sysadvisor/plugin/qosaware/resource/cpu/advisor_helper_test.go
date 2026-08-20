@@ -26,6 +26,8 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 
+	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/metacache"
+	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
@@ -174,7 +176,7 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimUsesHardPartitionRatio(t *tes
 			wantReserved:      map[int]int{0: 4, 1: 4},
 		},
 		{
-			name:              "fractional ratio rounds down to even",
+			name:              "fractional ratio rounds down to complete cores",
 			ratio:             0.5625,
 			configuredReserve: resource.MustParse("4"),
 			wantReserved:      map[int]int{0: 4, 1: 4},
@@ -196,13 +198,13 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimUsesHardPartitionRatio(t *tes
 			wantReserved:      map[int]int{0: 4, 1: 2},
 		},
 		{
-			// ratio 0.75 on 4 cores/NUMA yields floor(3)=3 donated cores, rounded
-			// DOWN to an even 2 cores => 4 CPUs per NUMA. the core-aligned ratio
+			// ratio 0.75 on 4 cores/NUMA yields floor(3)=3 donated complete cores
+			// => 6 CPUs per NUMA with CPUsPerCore()==2. the core-aligned ratio
 			// dominates the smaller 4-CPU static reserve.
 			name:              "larger ratio wins over static reserve",
 			ratio:             0.75,
 			configuredReserve: resource.MustParse("4"),
-			wantReserved:      map[int]int{0: 4, 1: 4},
+			wantReserved:      map[int]int{0: 6, 1: 6},
 		},
 	}
 
@@ -316,12 +318,12 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimUsesImmutableNUMACapacity(t *
 
 	require.NoError(t, cra.updateReservedForReclaim())
 	// capacities: NUMA0 24 CPUs (12 cores), NUMA1 32 CPUs (16 cores),
-	// cpusPerCore==2, ratio 0.2. donated cores = floor(cores*0.2) rounded DOWN
-	// to an even count: NUMA0 floor(2.4)=2->2 cores=4 CPUs, NUMA1 floor(3.2)=3->2
-	// cores=4 CPUs. the configured floor of 4 is already met by the 8-CPU
+	// cpusPerCore==2, ratio 0.2. donated cores = floor(cores*0.2) complete
+	// cores: NUMA0 floor(2.4)=2 cores=4 CPUs, NUMA1 floor(3.2)=3 cores=6
+	// CPUs. the configured floor of 4 is already met by the 10-CPU
 	// baseline sum, so nothing is lifted. targets follow the immutable topology
 	// capacity, not the smaller live numaAvailable, and stay whole-core.
-	assert.Equal(t, map[int]int{0: 4, 1: 4}, cra.reservedForReclaim)
+	assert.Equal(t, map[int]int{0: 4, 1: 6}, cra.reservedForReclaim)
 }
 
 func TestCPUResourceAdvisorUpdateReservedForReclaimFallbacks(t *testing.T) {
@@ -450,4 +452,79 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimFallbacks(t *testing.T) {
 		// 3 CPUs/NUMA, each rounded up to a complete physical core => 4 per NUMA.
 		assert.Equal(t, map[int]int{0: 4, 1: 4}, cra.reservedForReclaim)
 	})
+}
+
+func TestUpdateRampUpReclaimCPUSetCap(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(96, 1, 2)
+	require.NoError(t, err)
+	cpusPerCore := topology.CPUsPerCore()
+	expectedTarget, err := machine.CalculatePerNUMAHardReclaimTarget(48, 0.25, 0, 0, cpusPerCore)
+	require.NoError(t, err)
+	require.Zero(t, expectedTarget%cpusPerCore)
+
+	tests := []struct {
+		name        string
+		enable      bool
+		assignments map[int]machine.CPUSet
+		wantCap     map[int]int
+	}{
+		{
+			name:        "disabled",
+			enable:      false,
+			assignments: map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1)},
+			wantCap:     map[int]int{},
+		},
+		{
+			name:        "enabled with ramp-up container on NUMA 0 only",
+			enable:      true,
+			assignments: map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1)},
+			wantCap:     map[int]int{0: expectedTarget},
+		},
+		{
+			name:   "enabled with ramp-up container on NUMA 0 and 1",
+			enable: true,
+			assignments: map[int]machine.CPUSet{
+				0: machine.NewCPUSet(0, 1),
+				1: machine.NewCPUSet(48, 49),
+			},
+			wantCap: map[int]int{0: expectedTarget, 1: expectedTarget},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			conf := generateTestConfiguration(t, t.TempDir(), t.TempDir())
+			dynamicConf := conf.GetDynamicConfiguration()
+			dynamicConf.EnableReclaim = true
+			dynamicConf.EnableRampUpReclaimHardPartition = tt.enable
+			dynamicConf.InitialRampUpReclaimCPUSetRatio = 0.25
+
+			metaCache := metacache.NewDummyMetaCacheImp()
+			require.NoError(t, metaCache.AddContainer("pod-0", "container-0", &types.ContainerInfo{
+				RampUp:                   true,
+				TopologyAwareAssignments: tt.assignments,
+			}))
+
+			cra := &cpuResourceAdvisor{
+				conf:      conf,
+				metaCache: metaCache,
+				metaServer: &metaserver.MetaServer{
+					MetaAgent: &agent.MetaAgent{
+						KatalystMachineInfo: &machine.KatalystMachineInfo{
+							CPUTopology: topology,
+						},
+					},
+				},
+			}
+
+			cra.updateRampUpReclaimCPUSetCap()
+
+			assert.Equal(t, tt.wantCap, cra.rampUpReclaimCPUSetCap)
+		})
+	}
 }
