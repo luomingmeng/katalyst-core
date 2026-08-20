@@ -36,43 +36,67 @@ func TestGetCoreNumReservedForReclaim(t *testing.T) {
 		name             string
 		numReservedCores int
 		numNumaNodes     int
+		cpusPerCore      int
 		want             map[int]int
 	}{
 		{
 			name:             "reserve 4",
 			numReservedCores: 4,
 			numNumaNodes:     4,
+			cpusPerCore:      1,
 			want:             map[int]int{0: 1, 1: 1, 2: 1, 3: 1},
 		},
 		{
 			name:             "reserve 2",
 			numReservedCores: 2,
 			numNumaNodes:     4,
+			cpusPerCore:      1,
 			want:             map[int]int{0: 1, 1: 1, 2: 1, 3: 1},
 		},
 		{
 			name:             "reserve 3",
 			numReservedCores: 3,
 			numNumaNodes:     4,
+			cpusPerCore:      1,
 			want:             map[int]int{0: 1, 1: 1, 2: 1, 3: 1},
 		},
 		{
 			name:             "reserve 0",
 			numReservedCores: 0,
 			numNumaNodes:     4,
+			cpusPerCore:      1,
 			want:             map[int]int{0: 1, 1: 1, 2: 1, 3: 1},
 		},
 		{
 			name:             "reserve 1",
 			numReservedCores: 1,
 			numNumaNodes:     4,
+			cpusPerCore:      1,
 			want:             map[int]int{0: 1, 1: 1, 2: 1, 3: 1},
 		},
 		{
 			name:             "reserve 8",
 			numReservedCores: 8,
 			numNumaNodes:     4,
+			cpusPerCore:      1,
 			want:             map[int]int{0: 2, 1: 2, 2: 2, 3: 2},
+		},
+		{
+			// SMT2: a per-NUMA magnitude of 1 CPU rounds UP to a complete core
+			// (2 CPUs) so no reserve seeds a half core.
+			name:             "smt2 rounds per numa up to core",
+			numReservedCores: 4,
+			numNumaNodes:     4,
+			cpusPerCore:      2,
+			want:             map[int]int{0: 2, 1: 2, 2: 2, 3: 2},
+		},
+		{
+			// SMT2: 12 over 4 NUMA -> 3 CPUs each rounds UP to 4 (2 cores).
+			name:             "smt2 rounds odd per numa up to core",
+			numReservedCores: 12,
+			numNumaNodes:     4,
+			cpusPerCore:      2,
+			want:             map[int]int{0: 4, 1: 4, 2: 4, 3: 4},
 		},
 	}
 
@@ -81,7 +105,7 @@ func TestGetCoreNumReservedForReclaim(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			r := GetCoreNumReservedForReclaim(tt.numReservedCores, tt.numNumaNodes)
+			r := GetCoreNumReservedForReclaim(tt.numReservedCores, tt.numNumaNodes, tt.cpusPerCore)
 			assert.Equal(t, tt.want, r)
 		})
 	}
