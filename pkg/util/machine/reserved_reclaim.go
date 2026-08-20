@@ -87,6 +87,7 @@ func ResolvePerNUMAReservedForReclaim(
 	numaReservedRatio, numaReservedFloor, globalReservedCores := extractReclaimReservationKnobs(conf, 0)
 	numCPUs := topology.NumCPUs
 	numNUMANodes := topology.NumNUMANodes
+	cpusPerCore := topology.CPUsPerCore()
 	numaCPUSize := func(numaID int) int { return topology.NUMAToCPUs.CPUSizeInNUMAs(numaID) }
 
 	if numaReservedRatio > 0 {
@@ -97,7 +98,8 @@ func ResolvePerNUMAReservedForReclaim(
 				size = numaCPUSize(id)
 			}
 			reserved := math.Ceil(numaReservedRatio * float64(size))
-			reservedForReclaim[id] = int(math.Max(float64(numaReservedFloor), reserved))
+			floor := int(math.Max(float64(numaReservedFloor), reserved))
+			reservedForReclaim[id] = roundUpToCoreAligned(floor, cpusPerCore)
 		}
 		return reservedForReclaim
 	}
@@ -109,7 +111,7 @@ func ResolvePerNUMAReservedForReclaim(
 	if coreNumReservedForReclaim < numNUMANodes {
 		coreNumReservedForReclaim = numNUMANodes
 	}
-	return GetCoreNumReservedForReclaim(coreNumReservedForReclaim, numNUMANodes)
+	return GetCoreNumReservedForReclaim(coreNumReservedForReclaim, numNUMANodes, cpusPerCore)
 }
 
 // ResolveConfiguredReclaimFloor resolves the scalar total reserved-for-reclaim
@@ -131,6 +133,7 @@ func ResolveConfiguredReclaimFloor(
 	numaReservedFloor int,
 	globalReservedCores int,
 	numNUMANodes int,
+	cpusPerCore int,
 	numaCPUSize func(numaID int) int,
 ) int {
 	if numaReservedRatio > 0 {
@@ -141,7 +144,8 @@ func ResolveConfiguredReclaimFloor(
 				size = numaCPUSize(id)
 			}
 			reserved := math.Ceil(numaReservedRatio * float64(size))
-			total += int(math.Max(float64(numaReservedFloor), reserved))
+			floor := int(math.Max(float64(numaReservedFloor), reserved))
+			total += roundUpToCoreAligned(floor, cpusPerCore)
 		}
 		return total
 	}
@@ -149,9 +153,10 @@ func ResolveConfiguredReclaimFloor(
 	return globalReservedCores
 }
 
-// hardPartitionReclaimBaselinePerNUMA is the immutable minimum reclaim floor a
-// single NUMA node always keeps on the hard-partition path.
-const hardPartitionReclaimBaselinePerNUMA = 2
+// hardPartitionReclaimBaselineCoresPerNUMA is the immutable minimum reclaim
+// floor a single NUMA node always keeps on the hard-partition path, expressed in
+// complete physical cores (the CPU magnitude is derived from CPUsPerCore()).
+const hardPartitionReclaimBaselineCoresPerNUMA = 1
 
 // ResolveConfiguredReclaimFloorFromConfig resolves the scalar total
 // reserved-for-reclaim floor consumed by the hard-partition path directly from
@@ -179,6 +184,7 @@ func ResolveConfiguredReclaimFloorFromConfig(
 		numaReservedFloor,
 		globalReserved,
 		len(numaIDs),
+		topology.CPUsPerCore(),
 		func(numaID int) int { return topology.CPUDetails.CPUsInNUMANodes(numaID).Size() },
 	)
 }
@@ -217,6 +223,7 @@ func ResolveHardPartitionReclaimTargets(
 	configuredFloor := ResolveConfiguredReclaimFloorFromConfig(conf, topology, globalReservedFallback)
 
 	numaIDs := topology.CPUDetails.NUMANodes().ToSliceInt()
+	cpusPerCore := topology.CPUsPerCore()
 	capacityByNUMA := make(map[int]int, len(numaIDs))
 	baselineByNUMA := make(map[int]int, len(numaIDs))
 	for _, numaID := range numaIDs {
@@ -227,14 +234,14 @@ func ResolveHardPartitionReclaimTargets(
 			reservedFloor = perNUMAReservedFloor(numaID)
 		}
 		target, err := CalculatePerNUMAHardReclaimTarget(
-			capacity, ratio, hardPartitionReclaimBaselinePerNUMA, reservedFloor)
+			capacity, ratio, hardPartitionReclaimBaselineCoresPerNUMA, reservedFloor, cpusPerCore)
 		if err != nil {
 			return nil, fmt.Errorf("calculate hard-partition reclaim target for NUMA %d: %w", numaID, err)
 		}
 		baselineByNUMA[numaID] = target
 	}
 
-	targets, err := DistributeConfiguredHardReclaimFloor(capacityByNUMA, baselineByNUMA, configuredFloor)
+	targets, err := DistributeConfiguredHardReclaimFloor(capacityByNUMA, baselineByNUMA, configuredFloor, cpusPerCore)
 	if err != nil {
 		return nil, fmt.Errorf("distribute configured hard-partition reclaim floor: %w", err)
 	}

@@ -42,36 +42,40 @@ func TestResolvePerNUMAReservedForReclaim(t *testing.T) {
 		want      map[int]int
 	}{
 		{
-			// ratio takes priority: per-NUMA ceil(ratio*size), floor applied.
-			// ceil(0.1*10)=1, max(floor 1, 1)=1; global scalar ignored.
+			// SMT2 dummy topology (cpusPerCore=2): ratio takes priority, then the
+			// per-NUMA magnitude rounds UP to a complete core. ceil(0.1*10)=1,
+			// max(floor 1,1)=1, rounded up to 2 CPUs (1 core).
 			name:      "ratio priority over global",
 			conf:      newReclaimTestConfig(0, "100", "0.1", "1"),
 			cpuNum:    40,
 			socketNum: 1,
 			numaNum:   4,
-			want:      map[int]int{0: 1, 1: 1, 2: 1, 3: 1},
+			want:      map[int]int{0: 2, 1: 2, 2: 2, 3: 2},
 		},
 		{
-			// ratio computes above the floor: ceil(0.5*10)=5 wins over floor 2.
+			// ratio computes above the floor: ceil(0.5*10)=5 wins over floor 2,
+			// rounded UP to 6 CPUs (3 cores) on SMT2.
 			name:      "ratio above floor",
 			conf:      newReclaimTestConfig(0, "", "0.5", "2"),
 			cpuNum:    40,
 			socketNum: 1,
 			numaNum:   4,
-			want:      map[int]int{0: 5, 1: 5, 2: 5, 3: 5},
+			want:      map[int]int{0: 6, 1: 6, 2: 6, 3: 6},
 		},
 		{
-			// floor dominates when ratio result is smaller: ceil(0.1*10)=1 < floor 3.
+			// floor dominates when ratio result is smaller: ceil(0.1*10)=1 < floor
+			// 3, so 3, rounded UP to 4 CPUs (2 cores) on SMT2.
 			name:      "floor dominates ratio",
 			conf:      newReclaimTestConfig(0, "", "0.1", "3"),
 			cpuNum:    40,
 			socketNum: 1,
 			numaNum:   4,
-			want:      map[int]int{0: 3, 1: 3, 2: 3, 3: 3},
+			want:      map[int]int{0: 4, 1: 4, 2: 4, 3: 4},
 		},
 		{
 			// ratio zero: fall back to global cores distributed evenly.
-			// 8 cores over 4 NUMA -> 2 per NUMA; per-NUMA floor ignored on fallback.
+			// 8 cores over 4 NUMA -> 2 per NUMA (already one core on SMT2);
+			// per-NUMA floor ignored on fallback.
 			name:      "global fallback even",
 			conf:      newReclaimTestConfig(0, "8", "", "5"),
 			cpuNum:    40,
@@ -81,7 +85,7 @@ func TestResolvePerNUMAReservedForReclaim(t *testing.T) {
 		},
 		{
 			// global fallback clamps to numCPUs before even distribution.
-			// 999 clamped to 8 CPUs over 4 NUMA -> 2 per NUMA.
+			// 999 clamped to 8 CPUs over 4 NUMA -> 2 per NUMA (one core on SMT2).
 			name:      "global fallback clamps to numCPUs",
 			conf:      newReclaimTestConfig(0, "999", "", ""),
 			cpuNum:    8,
@@ -90,13 +94,14 @@ func TestResolvePerNUMAReservedForReclaim(t *testing.T) {
 			want:      map[int]int{0: 2, 1: 2, 2: 2, 3: 2},
 		},
 		{
-			// global fallback lifts below-NUMA-count reserve to one per NUMA.
+			// global fallback lifts below-NUMA-count reserve to one per NUMA, then
+			// rounds each up to a complete core: 1 CPU -> 2 CPUs on SMT2.
 			name:      "global fallback lifts to numNUMANodes",
 			conf:      newReclaimTestConfig(0, "1", "", ""),
 			cpuNum:    40,
 			socketNum: 1,
 			numaNum:   4,
-			want:      map[int]int{0: 1, 1: 1, 2: 1, 3: 1},
+			want:      map[int]int{0: 2, 1: 2, 2: 2, 3: 2},
 		},
 	}
 
@@ -129,9 +134,10 @@ func TestResolvePerNUMAReservedForReclaimNilInputs(t *testing.T) {
 		t.Fatalf("ResolvePerNUMAReservedForReclaim(nil topology) = %v, want empty", got)
 	}
 
-	// nil config falls back to zero reserve, lifted to one core per NUMA node.
+	// nil config falls back to zero reserve, lifted to one core per NUMA node and
+	// rounded up to a complete core (2 CPUs on the SMT2 dummy topology).
 	got := ResolvePerNUMAReservedForReclaim(nil, topology)
-	want := map[int]int{0: 1, 1: 1}
+	want := map[int]int{0: 2, 1: 2}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ResolvePerNUMAReservedForReclaim(nil config) = %v, want %v", got, want)
 	}
@@ -145,6 +151,7 @@ func TestResolveConfiguredReclaimFloor(t *testing.T) {
 		numaReservedFloor   int
 		globalReservedCores int
 		numNUMANodes        int
+		cpusPerCore         int
 		numaCPUSize         func(int) int
 	}
 	tests := []struct {
@@ -155,37 +162,56 @@ func TestResolveConfiguredReclaimFloor(t *testing.T) {
 		{
 			// ratio takes priority and sums per-NUMA ceil(ratio*size):
 			// ceil(0.1*32)=4 per NUMA, ×2 = 8; the global scalar is ignored.
+			// 4 is already core-aligned on SMT2 so no drift.
 			name: "ratio priority sums per numa",
 			args: args{
 				numaReservedRatio:   0.1,
 				numaReservedFloor:   2,
 				globalReservedCores: 100,
 				numNUMANodes:        2,
+				cpusPerCore:         2,
 				numaCPUSize:         evenCapacity(32),
 			},
 			want: 8,
 		},
 		{
-			// floor dominates when ratio result is smaller:
+			// floor dominates when ratio result is smaller, non-SMT zero drift:
 			// ceil(0.1*10)=1 < floor 3, so 3 per NUMA, ×2 = 6.
-			name: "floor dominates ratio",
+			name: "floor dominates ratio non smt",
 			args: args{
 				numaReservedRatio:   0.1,
 				numaReservedFloor:   3,
 				globalReservedCores: 0,
 				numNUMANodes:        2,
+				cpusPerCore:         1,
 				numaCPUSize:         evenCapacity(10),
 			},
 			want: 6,
 		},
 		{
-			// ratio zero: fall back to the raw global reserved cores.
+			// SMT2: the per-NUMA floor 3 rounds UP to a complete core (4 CPUs)
+			// before summing, so the scalar floor is itself core-aligned: 4×2 = 8.
+			name: "smt2 rounds per numa floor up to core",
+			args: args{
+				numaReservedRatio:   0.1,
+				numaReservedFloor:   3,
+				globalReservedCores: 0,
+				numNUMANodes:        2,
+				cpusPerCore:         2,
+				numaCPUSize:         evenCapacity(10),
+			},
+			want: 8,
+		},
+		{
+			// ratio zero: fall back to the raw global reserved cores (unrounded;
+			// the hard-partition distributor core-aligns the global floor later).
 			name: "global fallback",
 			args: args{
 				numaReservedRatio:   0,
 				numaReservedFloor:   5,
 				globalReservedCores: 16,
 				numNUMANodes:        2,
+				cpusPerCore:         2,
 				numaCPUSize:         evenCapacity(32),
 			},
 			want: 16,
@@ -198,6 +224,7 @@ func TestResolveConfiguredReclaimFloor(t *testing.T) {
 				numaReservedFloor:   0,
 				globalReservedCores: 0,
 				numNUMANodes:        2,
+				cpusPerCore:         2,
 				numaCPUSize:         evenCapacity(32),
 			},
 			want: 0,
@@ -213,6 +240,7 @@ func TestResolveConfiguredReclaimFloor(t *testing.T) {
 				tt.args.numaReservedFloor,
 				tt.args.globalReservedCores,
 				tt.args.numNUMANodes,
+				tt.args.cpusPerCore,
 				tt.args.numaCPUSize,
 			)
 			if got != tt.want {
@@ -331,16 +359,19 @@ func TestResolveHardPartitionReclaimTargets(t *testing.T) {
 			want:                   map[int]int{0: 4, 1: 4},
 		},
 		{
-			// global floor 10 exceeds baseline total 4, distributed evenly: {0:5,1:5}.
-			name:                   "global floor raises evenly",
+			// global floor 10 exceeds baseline total 4; the lift adds one complete
+			// core (cpusPerCore=2) at a time round-robin from {2,2}, landing on
+			// {0:6,1:4} — every target whole-core, never the half-core {5,5}.
+			name:                   "global floor raises by complete cores",
 			conf:                   newReclaimTestConfig(0, "10", "", ""),
 			globalReservedFallback: 0,
-			want:                   map[int]int{0: 5, 1: 5},
+			want:                   map[int]int{0: 6, 1: 4},
 		},
 		{
-			// per-NUMA reserved floor lifts baseline on NUMA 0 to 3 (odd allowed via
-			// configuredReserve), NUMA 1 stays at minimum 2. total baseline 5.
-			name:                   "per numa reserved floor",
+			// per-NUMA reserved floor 3 rounds UP to a complete core on SMT2
+			// (2 cores => 4 CPUs) so no half core seeds the reclaim pool; NUMA 1
+			// stays at the minimum one-core baseline (2). total baseline 6.
+			name:                   "per numa reserved floor rounds up to core",
 			conf:                   newReclaimTestConfig(0, "0", "", ""),
 			globalReservedFallback: 0,
 			perNUMAReservedFloor: func(numaID int) int {
@@ -349,7 +380,7 @@ func TestResolveHardPartitionReclaimTargets(t *testing.T) {
 				}
 				return 0
 			},
-			want: map[int]int{0: 3, 1: 2},
+			want: map[int]int{0: 4, 1: 2},
 		},
 	}
 
@@ -366,5 +397,36 @@ func TestResolveHardPartitionReclaimTargets(t *testing.T) {
 				t.Fatalf("ResolveHardPartitionReclaimTargets() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestResolveHardPartitionReclaimTargetsCoreAligned(t *testing.T) {
+	t.Parallel()
+
+	// SMT2 dummy topology: every per-NUMA target the resolver produces must be a
+	// multiple of CPUsPerCore() across ratio, global-floor and reserved-floor
+	// shapes, so a reclaim pool can always be built from complete cores.
+	topology, err := GenerateDummyCPUTopology(192, 2, 4)
+	if err != nil {
+		t.Fatalf("generate dummy topology: %v", err)
+	}
+	cpusPerCore := topology.CPUsPerCore()
+
+	confs := []*dynamicconfig.Configuration{
+		newReclaimTestConfig(0.2, "0", "", ""),
+		newReclaimTestConfig(0, "37", "", ""),
+		newReclaimTestConfig(0, "0", "0.13", "3"),
+	}
+	for i, conf := range confs {
+		got, err := ResolveHardPartitionReclaimTargets(conf, topology, 0, nil)
+		if err != nil {
+			t.Fatalf("case %d: ResolveHardPartitionReclaimTargets() error = %v", i, err)
+		}
+		for numaID, target := range got {
+			if target%cpusPerCore != 0 {
+				t.Fatalf("case %d: NUMA %d target %d not a multiple of cpusPerCore %d",
+					i, numaID, target, cpusPerCore)
+			}
+		}
 	}
 }
