@@ -109,6 +109,18 @@ func (c *cachedCgroupClient) ListChildren(ctx context.Context, rel string) ([]st
 	return c.inner.ListChildren(ctx, rel)
 }
 
+func (c *cachedCgroupClient) EnsureDir(ctx context.Context, rel string) error {
+	if err := c.inner.EnsureDir(ctx, rel); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.invalidateLocked(rel, "cpuset.cpus")
+	c.invalidateLocked(rel, "cpuset.mems")
+	c.invalidateLocked(rel, "cpuset.cpus.partition")
+	return nil
+}
+
 func (c *cachedCgroupClient) StatDir(ctx context.Context, rel string) (time.Time, error) {
 	return c.inner.StatDir(ctx, rel)
 }

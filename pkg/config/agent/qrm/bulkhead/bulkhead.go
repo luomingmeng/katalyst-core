@@ -53,11 +53,15 @@ type DrainSelectionPolicy struct {
 }
 
 type BulkheadConfiguration struct {
-	BulkheadPrimaryRelPath        string
-	BulkheadReclaimRelPaths       []string
-	BulkheadReclaimNumaPrefixes   []string
-	BulkheadPartitionRelPaths     []string
-	EnableBulkheadReclaimSiblings bool
+	BulkheadPrimaryRelPath      string
+	BulkheadReclaimRelPaths     []string
+	BulkheadReclaimNumaPrefixes []string
+	BulkheadPartitionRelPaths   []string
+	// BulkheadReclaimSiblingRelPaths lists reclaim-domain sibling cpuset
+	// cgroups explicitly materialized by cpuset_topology. These rel paths are
+	// managed as reclaim siblings, not primary reclaim roots.
+	BulkheadReclaimSiblingRelPaths []string
+	EnableBulkheadReclaimSiblings  bool
 
 	// EnableBulkheadCpusetTopologyOnCgroupV2 gates the cpuset_topology plugin on
 	// cgroup v2 hosts. When false (default) the plugin is inert on cgroup v2:

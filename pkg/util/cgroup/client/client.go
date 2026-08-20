@@ -72,6 +72,8 @@ type CgroupClient interface {
 	ListRootChildren(ctx context.Context) ([]string, error)
 	// ListChildren returns direct child directory names under rel.
 	ListChildren(ctx context.Context, rel string) ([]string, error)
+	// EnsureDir creates the cpuset cgroup directory at rel when it is missing.
+	EnsureDir(ctx context.Context, rel string) error
 	// StatDir returns the mtime of the cgroup directory at rel.
 	StatDir(ctx context.Context, rel string) (mtime time.Time, err error)
 	// Prune drops cached state whose rel is not active.
@@ -255,6 +257,47 @@ func (coreCgroupClient) ListChildren(_ context.Context, rel string) ([]string, e
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+func (coreCgroupClient) EnsureDir(_ context.Context, rel string) error {
+	abs := cgcommon.GetKubernetesAbsCgroupPath(cgcommon.CgroupSubsysCPUSet, rel)
+	if err := os.MkdirAll(abs, 0o755); err != nil {
+		return fmt.Errorf("mkdir cpuset cgroup @ %s: %w", rel, err)
+	}
+	if err := initializeCPUSetMemsFromParent(abs, rel); err != nil {
+		return err
+	}
+	return nil
+}
+
+func initializeCPUSetMemsFromParent(abs, rel string) error {
+	memsPath := filepath.Join(abs, "cpuset.mems")
+	current, err := os.ReadFile(memsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read cpuset.mems @ %s: %w", rel, err)
+	}
+	if strings.TrimSpace(string(current)) != "" {
+		return nil
+	}
+	parent := filepath.Dir(abs)
+	if parent == abs || parent == "." || parent == string(filepath.Separator) {
+		return nil
+	}
+	parentMems, err := os.ReadFile(filepath.Join(parent, "cpuset.mems"))
+	if err != nil {
+		return fmt.Errorf("read parent cpuset.mems @ %s: %w", rel, err)
+	}
+	value := strings.TrimSpace(string(parentMems))
+	if value == "" {
+		return nil
+	}
+	if err := os.WriteFile(memsPath, []byte(value), 0o644); err != nil {
+		return fmt.Errorf("initialize cpuset.mems @ %s: %w", rel, err)
+	}
+	return nil
 }
 
 func (coreCgroupClient) StatDir(_ context.Context, rel string) (time.Time, error) {

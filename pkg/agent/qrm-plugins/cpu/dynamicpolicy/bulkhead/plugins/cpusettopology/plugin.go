@@ -305,13 +305,21 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 		}
 	}
 	p.recordDeferredLeafDrains(expectedRes.DeferredLeafByRel)
-	siblings, err := p.discoverBulkheadReclaimSiblings(ctx, in.DesiredView)
+	discoveredSiblings, err := p.discoverBulkheadReclaimSiblings(ctx, in.DesiredView)
 	if deadlineErr := admissionStageDeadlineError(ctx, "discover bulkhead reclaim siblings"); deadlineErr != nil {
 		return deadlineErr
 	}
 	if err != nil {
 		emitBulkheadPruneResult(in.Emitter, "skipped", "discover_error")
 		return fmt.Errorf("discover bulkhead reclaim siblings: %w", err)
+	}
+	siblings := p.mergeBulkheadReclaimSiblings(
+		discoveredSiblings,
+		p.configuredBulkheadReclaimSiblings(),
+		desiredCPUSetPartitionView(in.DesiredView),
+	)
+	if err := p.ensureBulkheadReclaimSiblingDirs(ctx, siblings); err != nil {
+		return fmt.Errorf("ensure bulkhead reclaim sibling cgroups: %w", err)
 	}
 	var cpuDetails machine.CPUDetails
 	if in.Topology != nil {
@@ -428,6 +436,19 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 	p.cgroup.Prune(activeRels)
 	emitBulkheadPruneResult(in.Emitter, "success", "")
 	emitBulkheadPruneActiveRels(in.Emitter, len(activeRels), "success", "")
+	return nil
+}
+
+func (p *CPUSetTopologyPlugin) ensureBulkheadReclaimSiblingDirs(ctx context.Context, siblings []string) error {
+	for _, rel := range siblings {
+		rel = strings.Trim(rel, "/")
+		if rel == "" {
+			continue
+		}
+		if err := p.cgroup.EnsureDir(ctx, rel); err != nil {
+			return fmt.Errorf("ensure reclaim sibling rel path %q: %w", rel, err)
+		}
+	}
 	return nil
 }
 
@@ -645,9 +666,17 @@ func (p *CPUSetTopologyPlugin) buildDisabledResetDAG(
 		return err
 	}
 
-	siblings, err := p.discoverBulkheadReclaimSiblings(ctx, in.DesiredView)
+	discoveredSiblings, err := p.discoverBulkheadReclaimSiblings(ctx, in.DesiredView)
 	if err != nil {
 		return nil, fmt.Errorf("discover bulkhead reclaim siblings: %w", err)
+	}
+	siblings := p.mergeBulkheadReclaimSiblings(
+		discoveredSiblings,
+		p.configuredBulkheadReclaimSiblings(),
+		desiredCPUSetPartitionView(in.DesiredView),
+	)
+	if err := p.ensureBulkheadReclaimSiblingDirs(ctx, siblings); err != nil {
+		return nil, fmt.Errorf("ensure bulkhead reclaim sibling cgroups: %w", err)
 	}
 
 	var cpuDetails machine.CPUDetails
@@ -1275,6 +1304,75 @@ func (p *CPUSetTopologyPlugin) discoverBulkheadReclaimSiblings(ctx context.Conte
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+func (p *CPUSetTopologyPlugin) configuredBulkheadReclaimSiblings() []string {
+	out := make([]string, 0, len(p.cfg.BulkheadReclaimSiblingRelPaths))
+	for _, rel := range p.cfg.BulkheadReclaimSiblingRelPaths {
+		rel = strings.Trim(rel, "/")
+		if rel == "" {
+			continue
+		}
+		out = append(out, rel)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (p *CPUSetTopologyPlugin) mergeBulkheadReclaimSiblings(
+	discovered []string,
+	configured []string,
+	view *model.CPUSetPartitionView,
+) []string {
+	excluded := map[string]struct{}{}
+	addExcluded := func(rel string) {
+		rel = strings.Trim(rel, "/")
+		if rel != "" {
+			excluded[rel] = struct{}{}
+		}
+	}
+	addExcluded(p.cfg.BulkheadPrimaryRelPath)
+	for _, rel := range p.cfg.BulkheadReclaimRelPaths {
+		addExcluded(rel)
+	}
+	for _, rel := range p.cfg.BulkheadPartitionRelPaths {
+		addExcluded(rel)
+	}
+	if view != nil {
+		for reclaimIdx := range p.cfg.BulkheadReclaimRelPaths {
+			for numaID := range view.ReclaimEffectivePerNUMA {
+				addExcluded(p.cfg.ReclaimPerNUMA(reclaimIdx, numaID))
+			}
+		}
+	}
+
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(discovered)+len(configured))
+	add := func(rel string) {
+		rel = strings.Trim(rel, "/")
+		if rel == "" {
+			return
+		}
+		if _, skip := excluded[rel]; skip {
+			return
+		}
+		if p.isConfiguredReclaimNUMARel(rel) {
+			return
+		}
+		if _, ok := seen[rel]; ok {
+			return
+		}
+		seen[rel] = struct{}{}
+		out = append(out, rel)
+	}
+	for _, rel := range discovered {
+		add(rel)
+	}
+	for _, rel := range configured {
+		add(rel)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func desiredCPUSetPartitionView(view *model.DesiredView) *model.CPUSetPartitionView {

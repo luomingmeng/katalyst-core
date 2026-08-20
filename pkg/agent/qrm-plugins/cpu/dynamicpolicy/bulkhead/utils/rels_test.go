@@ -116,6 +116,25 @@ func TestBuildTopologyNodeSpecsFromViewUsesBulkheadConfig(t *testing.T) {
 			t.Fatalf("expected rel %q in specs %#v", rel, specs)
 		}
 	}
+	for _, spec := range specs {
+		if spec.Rel != "sibling" {
+			continue
+		}
+		if spec.Role != topology.TopoNodeRoleReclaimSibling {
+			t.Fatalf("sibling role = %q, want %q", spec.Role, topology.TopoNodeRoleReclaimSibling)
+		}
+		if spec.Domain != topology.DomainReclaim {
+			t.Fatalf("sibling domain = %q, want %q", spec.Domain, topology.DomainReclaim)
+		}
+		if !spec.ControlledRoot || !spec.TrustAnchor {
+			t.Fatalf("sibling control flags = controlled_root=%t trust_anchor=%t, want both true", spec.ControlledRoot, spec.TrustAnchor)
+		}
+		if !spec.CPUs.Equals(view.ReclaimEffective) {
+			t.Fatalf("sibling cpuset = %s, want %s", spec.CPUs.String(), view.ReclaimEffective.String())
+		}
+		return
+	}
+	t.Fatalf("expected sibling spec in %#v", specs)
 }
 
 func TestBuildTopologyNodeSpecsFromViewRetainsEmptyPhysicalNUMABucket(t *testing.T) {

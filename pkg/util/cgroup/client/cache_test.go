@@ -84,6 +84,10 @@ func (fakeCgroupClient) ListChildren(context.Context, string) ([]string, error) 
 	return nil, nil
 }
 
+func (fakeCgroupClient) EnsureDir(context.Context, string) error {
+	return nil
+}
+
 func (fakeCgroupClient) StatDir(context.Context, string) (time.Time, error) {
 	return time.Time{}, nil
 }

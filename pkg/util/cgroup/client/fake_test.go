@@ -18,6 +18,8 @@ package client
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	cgcommon "github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
@@ -29,6 +31,34 @@ func TestFakeCgroupClientSatisfiesInterface(t *testing.T) {
 	t.Parallel()
 
 	var _ CgroupClient = FakeCgroupClient{}
+}
+
+func TestInitializeCPUSetMemsFromParentCopiesNonEmptyParentMems(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	parent := filepath.Join(root, "parent")
+	child := filepath.Join(parent, "system")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "cpuset.mems"), []byte("0-1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(child, "cpuset.mems"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := initializeCPUSetMemsFromParent(child, "parent/system"); err != nil {
+		t.Fatalf("initializeCPUSetMemsFromParent() error = %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(child, "cpuset.mems"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(raw); got != "0-1" {
+		t.Fatalf("child cpuset.mems = %q, want parent mems 0-1", got)
+	}
 }
 
 // TestFakeCgroupClientDefaults documents the safe-default policy of the
