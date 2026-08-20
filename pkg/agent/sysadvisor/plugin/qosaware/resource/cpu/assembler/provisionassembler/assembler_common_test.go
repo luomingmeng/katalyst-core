@@ -2414,7 +2414,7 @@ func TestDefaultShareBackfillHardRatioMatchesPhysicalCoreTarget(t *testing.T) {
 	require.Equal(t, 96, result.DefaultShareBackfill.RawReclaimSize)
 	require.Equal(t, 16, result.DefaultShareBackfill.FinalReclaimSize)
 	require.Equal(t, 80, result.DefaultShareBackfill.ReleasedReclaimSize)
-	require.Equal(t, types.CPUResource{Size: 80, Quota: -1},
+	require.Equal(t, types.CPUResource{Size: 96, Quota: -1},
 		result.PoolEntries[commonstate.PoolNameShare][commonstate.FakedNUMAID])
 }
 
@@ -2935,20 +2935,20 @@ func TestCalculateDefaultShareTargetSize(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name: "current 192 cpu node",
+			name: "reclaim quantity does not lower qrm residual upper bound",
 			budget: map[int]defaultShareNUMABudget{
 				0: {UnpinnedAllocatableSize: 95, FinalUnpinnedReclaimSize: 28},
 				1: {UnpinnedAllocatableSize: 95, FinalUnpinnedReclaimSize: 28},
 			},
-			want: 134,
+			want: 190,
 		},
 		{
-			name: "fixed pools and pinned cpus are deducted",
+			name: "fixed pools do not lower qrm residual upper bound",
 			budget: map[int]defaultShareNUMABudget{
 				0: {UnpinnedAllocatableSize: 91, FinalUnpinnedReclaimSize: 28, FixedUnpinnedPoolSize: 10},
 				1: {UnpinnedAllocatableSize: 91, FinalUnpinnedReclaimSize: 28, FixedUnpinnedPoolSize: 10},
 			},
-			want: 106,
+			want: 182,
 		},
 		{
 			name: "exclusive numa ignores nested reclaim and pinned quantities",
@@ -2956,15 +2956,15 @@ func TestCalculateDefaultShareTargetSize(t *testing.T) {
 				0: {UnpinnedAllocatableSize: 95, FinalUnpinnedReclaimSize: 28},
 				1: {UnpinnedAllocatableSize: 80, FinalUnpinnedReclaimSize: 20, FixedUnpinnedPoolSize: 8, Exclusive: true},
 			},
-			want: 67,
+			want: 95,
 		},
 		{
-			name: "fixed pool overcommit saturates numa residual",
+			name: "fixed pool overcommit does not lower qrm residual upper bound",
 			budget: map[int]defaultShareNUMABudget{
 				0: {UnpinnedAllocatableSize: 30, FinalUnpinnedReclaimSize: 28, FixedUnpinnedPoolSize: 8},
 				1: {UnpinnedAllocatableSize: 86, FinalUnpinnedReclaimSize: 28},
 			},
-			want: 58,
+			want: 116,
 		},
 		{
 			name: "reclaim cannot exceed allocatable budget",
@@ -3160,7 +3160,7 @@ func TestBuildDefaultShareBudgetRules(t *testing.T) {
 
 		target, err := calculateDefaultShareTargetSize(budget)
 		require.NoError(t, err)
-		require.Equal(t, 134, target)
+		require.Equal(t, 190, target)
 	})
 
 	t.Run("unused pinned cpu is deducted from allocatable", func(t *testing.T) {
@@ -3182,7 +3182,7 @@ func TestBuildDefaultShareBudgetRules(t *testing.T) {
 
 		target, err := calculateDefaultShareTargetSize(budget)
 		require.NoError(t, err)
-		require.Equal(t, 57, target)
+		require.Equal(t, 85, target)
 	})
 
 	t.Run("exclusive numa ignores nested reclaim pinned dedicated", func(t *testing.T) {
@@ -3219,11 +3219,11 @@ func TestBuildDefaultShareBudgetRules(t *testing.T) {
 
 		target, err := calculateDefaultShareTargetSize(budget)
 		require.NoError(t, err)
-		// only NUMA 0 contributes: 95 - 28 = 67.
-		require.Equal(t, 67, target)
+		// only NUMA 0 contributes its full unpinned allocatable upper bound.
+		require.Equal(t, 95, target)
 	})
 
-	t.Run("fixed pools deducted and classified", func(t *testing.T) {
+	t.Run("fixed pools classified without lowering upper bound", func(t *testing.T) {
 		t.Parallel()
 		dedicated := NewFakeRegion("ded-region", configapi.QoSRegionTypeDedicated, "ded-region")
 		dedicated.SetBindingNumas(machine.NewCPUSet(0))
@@ -3250,10 +3250,10 @@ func TestBuildDefaultShareBudgetRules(t *testing.T) {
 
 		target, err := calculateDefaultShareTargetSize(budget)
 		require.NoError(t, err)
-		require.Equal(t, 28, target) // 95 - 28 - 39
+		require.Equal(t, 95, target) // reclaim and fixed pools are diagnostics-only
 	})
 
-	t.Run("dedicated pool with multiple pods is deducted once", func(t *testing.T) {
+	t.Run("dedicated pool with multiple pods is classified once", func(t *testing.T) {
 		t.Parallel()
 		dedicated := NewFakeRegion("ded-region", configapi.QoSRegionTypeDedicated, "ded-region")
 		dedicated.SetBindingNumas(machine.NewCPUSet(0))
@@ -3277,7 +3277,7 @@ func TestBuildDefaultShareBudgetRules(t *testing.T) {
 
 		target, err := calculateDefaultShareTargetSize(budget)
 		require.NoError(t, err)
-		require.Equal(t, 20, target)
+		require.Equal(t, 40, target)
 	})
 
 	t.Run("fully pinned dedicated pool contributes no fixed size", func(t *testing.T) {
@@ -3339,7 +3339,7 @@ func TestBuildDefaultShareBudgetRules(t *testing.T) {
 
 		target, err := calculateDefaultShareTargetSize(budget)
 		require.NoError(t, err)
-		require.Equal(t, 10, target)
+		require.Equal(t, 16, target)
 	})
 
 	for _, tc := range []struct {
@@ -3350,21 +3350,21 @@ func TestBuildDefaultShareBudgetRules(t *testing.T) {
 		{
 			name:       "dedicated owner package missing from config is fully fixed",
 			cfg:        types.ResourcePackageConfig{},
-			wantTarget: 30,
+			wantTarget: 40,
 		},
 		{
 			name: "dedicated owner package pinned only in another numa is fully fixed in this bucket",
 			cfg: types.ResourcePackageConfig{
 				1: {"pkg": {PinnedCPUSet: machine.MustParse("20-29")}},
 			},
-			wantTarget: 20,
+			wantTarget: 30,
 		},
 		{
 			name: "dedicated owner package with empty pinned cpu set is fully fixed",
 			cfg: types.ResourcePackageConfig{
 				0: {"pkg": {PinnedCPUSet: machine.NewCPUSet()}},
 			},
-			wantTarget: 30,
+			wantTarget: 40,
 		},
 	} {
 		tc := tc
@@ -3452,42 +3452,48 @@ func TestFinalizeDefaultShareBackfillMatrix(t *testing.T) {
 		wantFixed       int
 	}{
 		{
-			name:            "no cap uses full residual after final reclaim",
+			name:            "reclaim advice does not lower qrm residual upper bound",
 			numaAvailable:   map[int]int{0: 95, 1: 95},
 			nonBinding:      machine.NewCPUSet(),
 			entries:         []entry{{commonstate.PoolNameReclaim, 0, 28}, {commonstate.PoolNameReclaim, 1, 28}, {commonstate.PoolNameShare, commonstate.FakedNUMAID, 4}},
 			enabled:         true,
-			wantShare:       134,
+			wantShare:       190,
 			wantAllocatable: 190,
 			wantReclaim:     56,
 			wantFixed:       0,
 		},
 		{
-			name:            "reclaim disabled still fills residual after fixed pools",
+			name:            "reclaim disabled publishes full qrm residual upper bound",
 			numaAvailable:   map[int]int{0: 95},
 			nonBinding:      machine.NewCPUSet(),
 			entries:         []entry{{commonstate.PoolNameReclaim, 0, 0}, {"custom-shared", 0, 10}, {commonstate.PoolNameShare, commonstate.FakedNUMAID, 8}},
 			enabled:         true,
-			wantShare:       85,
+			wantShare:       95,
 			wantAllocatable: 95,
 			wantReclaim:     0,
 			wantFixed:       10,
 		},
 		{
-			name:          "zero target is rejected before sysadvisor publish",
-			numaAvailable: map[int]int{0: 20},
-			nonBinding:    machine.NewCPUSet(0),
-			entries:       []entry{{commonstate.PoolNameReclaim, commonstate.FakedNUMAID, 20}, {commonstate.PoolNameShare, commonstate.FakedNUMAID, 4}},
-			enabled:       true,
-			wantErr:       "default share target is zero before sysadvisor publish",
+			name:            "full reclaim advice still publishes allocatable upper bound",
+			numaAvailable:   map[int]int{0: 20},
+			nonBinding:      machine.NewCPUSet(0),
+			entries:         []entry{{commonstate.PoolNameReclaim, commonstate.FakedNUMAID, 20}, {commonstate.PoolNameShare, commonstate.FakedNUMAID, 4}},
+			enabled:         true,
+			wantShare:       20,
+			wantAllocatable: 20,
+			wantReclaim:     20,
+			wantFixed:       0,
 		},
 		{
-			name:          "fixed pool overcommit saturates to zero target",
-			numaAvailable: map[int]int{0: 16},
-			nonBinding:    machine.NewCPUSet(),
-			entries:       []entry{{commonstate.PoolNameReclaim, 0, 8}, {"custom-shared", 0, 10}},
-			enabled:       true,
-			wantErr:       "default share target is zero before sysadvisor publish",
+			name:            "pool overcommit keeps allocatable upper bound",
+			numaAvailable:   map[int]int{0: 16},
+			nonBinding:      machine.NewCPUSet(),
+			entries:         []entry{{commonstate.PoolNameReclaim, 0, 8}, {"custom-shared", 0, 10}},
+			enabled:         true,
+			wantShare:       16,
+			wantAllocatable: 16,
+			wantReclaim:     8,
+			wantFixed:       10,
 		},
 		{
 			name:          "gate disabled preserves existing share entry",
@@ -3529,8 +3535,10 @@ func TestFinalizeDefaultShareBackfillMatrix(t *testing.T) {
 			require.Equal(t, tc.wantAllocatable, result.DefaultShareBackfill.AllocatableBudget)
 			require.Equal(t, tc.wantShare, result.DefaultShareBackfill.DefaultShareFinal)
 
-			// aggregate invariant: share + final reclaim + fixed = allocatable
-			// (summed over non-exclusive NUMAs). To avoid a near-tautology, the
+			// upper-bound invariant: share = allocatable (summed over
+			// non-exclusive NUMAs). Reclaim and fixed quantities remain
+			// diagnostics because QRM materializes their CPUSet-level union.
+			// To avoid a near-tautology, the
 			// production budget aggregates are first pinned against independent
 			// per-case constants (wantAllocatable/wantReclaim/wantFixed derived
 			// by hand from the entries), and only then combined with the
@@ -3552,7 +3560,7 @@ func TestFinalizeDefaultShareBackfillMatrix(t *testing.T) {
 			require.Equal(t, tc.wantAllocatable, totalNonExclusiveAlloc)
 			require.Equal(t, tc.wantReclaim, totalReclaim)
 			require.Equal(t, tc.wantFixed, totalFixed)
-			require.Equal(t, tc.wantAllocatable, tc.wantShare+tc.wantReclaim+tc.wantFixed)
+			require.Equal(t, tc.wantAllocatable, tc.wantShare)
 			require.Equal(t, summary.FixedCommonPoolSize, totalFixed)
 		})
 	}
@@ -3576,9 +3584,9 @@ func TestAssembleProvisionBackfillEndToEnd(t *testing.T) {
 
 	reclaim := result.PoolEntries[commonstate.PoolNameReclaim][commonstate.FakedNUMAID].Size
 	share := result.PoolEntries[commonstate.PoolNameShare][commonstate.FakedNUMAID].Size
-	// the default share pool plus the final reclaim pool consume all available
-	// non-reserve CPUs on the node.
-	require.Equal(t, 20, share+reclaim)
-	require.Equal(t, 20-reclaim, share)
+	require.Positive(t, reclaim)
+	// SysAdvisor publishes the allocatable upper bound; QRM subtracts the current
+	// reclaim and fixed CPUSet union when materializing the actual share CPUSet.
+	require.Equal(t, 20, share)
 	require.Equal(t, share, result.DefaultShareBackfill.DefaultShareFinal)
 }

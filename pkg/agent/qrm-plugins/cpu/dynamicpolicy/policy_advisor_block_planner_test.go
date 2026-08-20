@@ -213,6 +213,45 @@ func TestGenerateBlockCPUSetOwnerUnionsStableAcrossRandomMapOrderAndBlockIDRotat
 	}
 }
 
+func TestGenerateBlockCPUSetSkipsDefaultShareUpperBound(t *testing.T) {
+	t.Parallel()
+
+	for _, disjoint := range []bool{false, true} {
+		disjoint := disjoint
+		t.Run(fmt.Sprintf("disjoint=%t", disjoint), func(t *testing.T) {
+			t.Parallel()
+
+			p, cleanup := newReclaimReuseTestPolicy(t)
+			defer cleanup()
+			p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+
+			resp := advisorBlockTestResponse([]advisorBlockTestAlias{
+				{
+					entry: commonstate.PoolNameShare, subEntry: commonstate.FakedContainerName,
+					owner: commonstate.PoolNameShare, numaID: commonstate.FakedNUMAID,
+					blockID: "share-upper-bound", quantity: 96,
+				},
+				{
+					entry: commonstate.PoolNameReclaim, subEntry: commonstate.FakedContainerName,
+					owner: commonstate.PoolNameReclaim, numaID: commonstate.FakedNUMAID,
+					blockID: "reclaim", quantity: 4,
+				},
+			}, rand.New(rand.NewSource(1)))
+			resp.DisableDedicatedCoresOverlapReclaimedCores = disjoint
+
+			featureGates := map[string]*advisorsvc.FeatureGate{
+				feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition: {
+					Name: feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
+				},
+			}
+			blocks, err := p.generateBlockCPUSet(resp, featureGates)
+			require.NoError(t, err)
+			require.NotContains(t, blocks, "share-upper-bound")
+			require.Equal(t, 4, blocks["reclaim"].Size())
+		})
+	}
+}
+
 func TestBuildAdvisorBlockDescriptors_BlockIDIsOnlyFinalTieBreak(t *testing.T) {
 	t.Parallel()
 

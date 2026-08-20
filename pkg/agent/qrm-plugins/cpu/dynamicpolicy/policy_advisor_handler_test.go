@@ -761,7 +761,7 @@ func TestDynamicPolicyApplyBlocksMaterializesDefaultShareFromResidual(t *testing
 						OwnerPoolName: commonstate.PoolNameShare,
 						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
 							commonstate.FakedNUMAID: {
-								Blocks: []*advisorapi.Block{{BlockId: "share", Result: 7}},
+								Blocks: []*advisorapi.Block{{BlockId: "share", Result: 8}},
 							},
 						},
 					},
@@ -794,7 +794,6 @@ func TestDynamicPolicyApplyBlocksMaterializesDefaultShareFromResidual(t *testing
 		},
 	}
 	blockCPUSet := advisorapi.BlockCPUSet{
-		"share":   machine.NewCPUSet(1, 2, 3, 4, 5, 6, 7),
 		"reclaim": machine.NewCPUSet(0),
 		"custom":  machine.NewCPUSet(1),
 	}
@@ -804,6 +803,61 @@ func TestDynamicPolicyApplyBlocksMaterializesDefaultShareFromResidual(t *testing
 	share := pending.entries[commonstate.PoolNameShare][commonstate.FakedContainerName].AllocationResult
 	require.True(t, share.Equals(machine.NewCPUSet(2, 3, 4, 5, 6, 7)),
 		"actual residual may be smaller than advisor quantity and must replace the block cpuset, got %s", share)
+}
+
+func TestDynamicPolicyValidatesDefaultShareAsUpperBoundWhenBackfillEnabled(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	policy.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+	policy.state.SetPodEntries(state.PodEntries{
+		commonstate.PoolNameShare: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+				AllocationResult: machine.NewCPUSet(0, 1, 2, 3),
+			},
+		},
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(4, 5, 6, 7),
+			},
+		},
+	}, false)
+
+	resp := &advisorapi.ListAndWatchResponse{
+		Entries: map[string]*advisorapi.CalculationEntries{
+			commonstate.PoolNameShare: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameShare,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "share-upper-bound", Result: 6}},
+							},
+						},
+					},
+				},
+			},
+			commonstate.PoolNameReclaim: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameReclaim,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "reclaim", Result: 4}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	require.NoError(t, policy.validateAdvisorResponse(resp))
 }
 
 func TestDynamicPolicyApplyBlocksRejectsEmptyDefaultShareResidual(t *testing.T) {

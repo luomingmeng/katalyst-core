@@ -173,22 +173,24 @@ func clampByReclaimedCPUMaxRatioWithDiagnostics(size int, limit float64, ratio f
 }
 
 // defaultShareNUMABudget captures the per-NUMA canonical quantity budget used to
-// compute the default share pool residual. All fields are expressed in unpinned
-// CPU quantities (i.e. after excluding pinned resource-package CPUs).
+// compute the default share pool upper bound. All fields are expressed in
+// unpinned CPU quantities (i.e. after excluding pinned resource-package CPUs).
 type defaultShareNUMABudget struct {
 	// UnpinnedAllocatableSize is numaAvailable[numaID] - pinnedCPUSizeInNUMA;
 	// numaAvailable already excludes reserve and forbidden/system pools.
 	UnpinnedAllocatableSize int
 	// FinalUnpinnedReclaimSize is the post-clamp reclaim quantity that lives in
-	// the unpinned eligibility domain of this NUMA.
+	// the unpinned eligibility domain of this NUMA. It is diagnostics-only for
+	// the published upper bound because QRM's reclaim CPUSet snapshot may lag or
+	// lead this quantity view.
 	FinalUnpinnedReclaimSize int
 	// FixedUnpinnedPoolSize is the sum of non-default, non-reclaim, non-reserve,
-	// non-pinned, non-exclusive fixed pool quantities on this NUMA. The sum may
-	// exceed the remaining capacity because QRM proportionally shrinks or
-	// overlaps fixed pools when their requested quantities cannot fit.
+	// non-pinned, non-exclusive fixed pool quantities on this NUMA. It is
+	// diagnostics-only: QRM materializes the exact fixed-pool CPUSet union from
+	// its current allocation snapshot, which may lag or lead this quantity view.
 	FixedUnpinnedPoolSize int
 	// Exclusive marks a NUMA that is owned by a NUMA-exclusive region; such a
-	// NUMA contributes zero default share residual and its nested
+	// NUMA contributes zero default share capacity and its nested
 	// reclaim/pinned/dedicated quantities are not deducted again.
 	Exclusive bool
 }
@@ -207,35 +209,29 @@ type defaultShareBudgetSummary struct {
 	ExclusiveNUMASize   int
 }
 
-// calculateDefaultShareTargetSize computes the default share pool target size as
-// the sum over non-exclusive NUMAs of (unpinned allocatable - final unpinned
-// reclaim - materialized fixed unpinned pools). Exclusive NUMAs contribute
-// zero. Reclaim exceeding allocatable capacity is an invariant violation.
-// Fixed-pool quantity overcommit instead saturates the residual at zero because
-// QRM proportionally shrinks or overlaps those pools within the same capacity.
+// calculateDefaultShareTargetSize computes the allocatable upper bound that
+// SysAdvisor publishes for the default share pool. Exclusive NUMAs contribute
+// zero. Reclaim and fixed pool quantities intentionally do not lower this bound:
+// QRM owns the exact CPUSet-level pool union and materializes the current
+// residual. Reclaim exceeding allocatable capacity remains an invariant
+// violation.
 func calculateDefaultShareTargetSize(budgetByNUMA map[int]defaultShareNUMABudget) (int, error) {
 	target := 0
 	for numaID, budget := range budgetByNUMA {
 		if budget.Exclusive {
 			continue
 		}
-		numaTarget := budget.UnpinnedAllocatableSize - budget.FinalUnpinnedReclaimSize
-		if numaTarget < 0 {
+		if budget.FinalUnpinnedReclaimSize > budget.UnpinnedAllocatableSize {
 			return 0, fmt.Errorf("default share reclaim exceeds unpinned allocatable in numa %d: unpinned=%d reclaim=%d",
 				numaID, budget.UnpinnedAllocatableSize, budget.FinalUnpinnedReclaimSize)
 		}
-		if budget.FixedUnpinnedPoolSize >= numaTarget {
-			numaTarget = 0
-		} else {
-			numaTarget -= budget.FixedUnpinnedPoolSize
-		}
-		target += numaTarget
+		target += budget.UnpinnedAllocatableSize
 	}
 	return target, nil
 }
 
 // buildDefaultShareBudget collects the canonical per-NUMA quantity budget that
-// drives the default share pool residual backfill. It reads only the already
+// drives the default share pool upper-bound backfill. It reads only the already
 // assembled result.PoolEntries plus the region topology; it never mutates the
 // result.
 //
@@ -385,9 +381,8 @@ func (pa *ProvisionAssemblerCommon) buildDefaultShareBudget(
 			// "-NUMA" suffix and live on real numaIDs. If upstream ever emits a
 			// plain PoolNameShare entry on a real numaID, it would fall through
 			// to the fixed-pool branch below and be counted into
-			// FixedUnpinnedPoolSize, inflating the fixed budget and lowering the
-			// computed target. This is a known precondition/constraint rather
-			// than a case handled here.
+			// FixedUnpinnedPoolSize, corrupting fixed-pool diagnostics. This is
+			// a known precondition/constraint rather than a case handled here.
 			if numaID == commonstate.FakedNUMAID && poolName == commonstate.PoolNameShare {
 				continue
 			}
@@ -473,10 +468,11 @@ func (pa *ProvisionAssemblerCommon) buildDefaultShareBudget(
 	return budgetByNUMA, summary, nil
 }
 
-// finalizeDefaultShareBackfill overrides the default share pool quantity with the
-// canonical residual budget once every scope has been assembled. It is a no-op
-// when the backfill feature is disabled. On success it also records the
-// structured diagnostics for metrics.
+// finalizeDefaultShareBackfill overrides the default share pool quantity with
+// the canonical allocatable upper bound once every scope has been assembled.
+// QRM then materializes the exact residual from its current CPUSet allocation
+// snapshot. It is a no-op when the backfill feature is disabled. On success it
+// also records the structured diagnostics for metrics.
 func (pa *ProvisionAssemblerCommon) finalizeDefaultShareBackfill(
 	regionHelper *RegionMapHelper,
 	result *types.InternalCPUCalculationResult,
@@ -512,7 +508,7 @@ func (pa *ProvisionAssemblerCommon) finalizeDefaultShareBackfill(
 	result.DefaultShareBackfill.DefaultShareBeforeBackfill = before
 	result.DefaultShareBackfill.DefaultShareBackfilled = target - before
 	result.DefaultShareBackfill.DefaultShareFinal = target
-	general.InfoS("default share residual backfill",
+	general.InfoS("default share upper-bound backfill",
 		"allocatableBudget", result.DefaultShareBackfill.AllocatableBudget,
 		"reserveSize", result.DefaultShareBackfill.ReserveSize,
 		"rawReclaimSize", result.DefaultShareBackfill.RawReclaimSize,
@@ -772,7 +768,7 @@ func (pa *ProvisionAssemblerCommon) AssembleProvision() (types.InternalCPUCalcul
 		DisableDedicatedCoresOverlapReclaimedCores: *pa.disableDedicatedCoresOverlapReclaimedCores,
 	}
 	// mark the backfill enabled once so downstream finalize can decide whether to
-	// override the default share pool quantity with the residual target.
+	// override the default share pool quantity with the allocatable upper bound.
 	calculationResult.DefaultShareBackfill.Enabled = pa.conf.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs
 
 	pa.assembleReserve(&calculationResult)
