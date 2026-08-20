@@ -54,6 +54,19 @@ func TestBulkheadOptionsDefaultDisablesPartitionRelPaths(t *testing.T) {
 	require.Empty(t, conf.BulkheadPartitionRelPaths)
 }
 
+func TestBulkheadOptionsDefaultsReclaimSiblingSystem(t *testing.T) {
+	t.Parallel()
+
+	options := NewBulkheadOptions()
+	require.Equal(t, []string{"system"}, options.BulkheadReclaimSiblingRelPaths)
+	require.True(t, options.EnableBulkheadReclaimSiblings)
+	require.Equal(t, "system", options.BulkheadSystemRelPath)
+
+	conf := bulkheadconfig.NewBulkheadConfiguration()
+	require.NoError(t, options.ApplyTo(conf))
+	require.Equal(t, []string{"system"}, conf.BulkheadReclaimSiblingRelPaths)
+}
+
 func TestBulkheadOptionsCanExplicitlyEnablePartitionRelPaths(t *testing.T) {
 	t.Parallel()
 

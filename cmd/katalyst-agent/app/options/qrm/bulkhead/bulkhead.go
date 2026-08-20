@@ -28,11 +28,12 @@ import (
 )
 
 type BulkheadOptions struct {
-	BulkheadPrimaryRelPath        string
-	BulkheadReclaimRelPaths       []string
-	BulkheadReclaimNumaPrefixes   []string
-	BulkheadPartitionRelPaths     []string
-	EnableBulkheadReclaimSiblings bool
+	BulkheadPrimaryRelPath         string
+	BulkheadReclaimRelPaths        []string
+	BulkheadReclaimNumaPrefixes    []string
+	BulkheadPartitionRelPaths      []string
+	BulkheadReclaimSiblingRelPaths []string
+	EnableBulkheadReclaimSiblings  bool
 
 	EnableBulkheadCpusetTopologyOnCgroupV2 bool
 
@@ -57,6 +58,7 @@ func NewBulkheadOptions() BulkheadOptions {
 		BulkheadPrimaryRelPath:          "kubepods",
 		BulkheadReclaimRelPaths:         []string{"reclaimed"},
 		BulkheadReclaimNumaPrefixes:     []string{"reclaimed/reclaimed-"},
+		BulkheadReclaimSiblingRelPaths:  []string{"system"},
 		EnableBulkheadReclaimSiblings:   true,
 		BulkheadWorkqueueSysfsDir:       "/sys/devices/virtual/workqueue",
 		BulkheadSystemRelPath:           "system",
@@ -84,6 +86,8 @@ func (o *BulkheadOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 		o.BulkheadReclaimNumaPrefixes, "The reclaim per-NUMA cgroup relative path prefixes managed by cpu bulkhead.")
 	fs.StringSliceVar(&o.BulkheadPartitionRelPaths, "qrm-cpu-bulkhead-partition-rel-paths",
 		o.BulkheadPartitionRelPaths, "The cgroup relative paths whose cpuset partition should be root.")
+	fs.StringSliceVar(&o.BulkheadReclaimSiblingRelPaths, "qrm-cpu-bulkhead-reclaim-sibling-rel-paths",
+		o.BulkheadReclaimSiblingRelPaths, "The reclaim sibling cgroup relative paths explicitly managed by cpu bulkhead.")
 	fs.BoolVar(&o.EnableBulkheadReclaimSiblings, "qrm-cpu-enable-bulkhead-reclaim-siblings",
 		o.EnableBulkheadReclaimSiblings, "Whether cpu bulkhead should discover reclaim sibling cgroups.")
 	fs.BoolVar(&o.EnableBulkheadCpusetTopologyOnCgroupV2, "qrm-cpu-enable-bulkhead-cpuset-topology-on-cgroupv2",
@@ -137,6 +141,7 @@ func (o *BulkheadOptions) ApplyTo(conf *bulkheadconfig.BulkheadConfiguration) er
 	conf.BulkheadReclaimRelPaths = normalizeRelSlice(o.BulkheadReclaimRelPaths)
 	conf.BulkheadReclaimNumaPrefixes = normalizeRelSlice(o.BulkheadReclaimNumaPrefixes)
 	conf.BulkheadPartitionRelPaths = normalizeRelSlice(o.BulkheadPartitionRelPaths)
+	conf.BulkheadReclaimSiblingRelPaths = normalizeRelSlice(o.BulkheadReclaimSiblingRelPaths)
 	conf.EnableBulkheadReclaimSiblings = o.EnableBulkheadReclaimSiblings
 	conf.EnableBulkheadCpusetTopologyOnCgroupV2 = o.EnableBulkheadCpusetTopologyOnCgroupV2
 	conf.BulkheadWorkqueueSysfsDir = strings.TrimSpace(o.BulkheadWorkqueueSysfsDir)

@@ -440,24 +440,25 @@ func assertMetricEnum(t *testing.T, key string, tag metrics.MetricTag, allowed m
 type fakeCgroupClient struct {
 	cgroupclient.FakeCgroupClient
 
-	version           cgroupclient.CgroupVersion
-	existing          map[string]bool
-	cpus              map[string]machine.CPUSet
-	mems              map[string]string
-	children          map[string][]string
-	statErrors        map[string]error
-	writes            map[string]string
-	applyCounts       map[string]int
-	cpusetWrites      map[string]cgcommon.CPUSetData
-	pruned            map[string]struct{}
-	schedLoadBalance  map[string]bool
-	partitionWrites   map[string]cgcommon.CPUSetPartitionFlag
-	partitionErrByRel map[string]error
-	listErr           error
-	listChildrenHook  func(context.Context, string) ([]string, error)
-	afterApply        func(rel string, data *cgcommon.CPUSetData)
-	readOverride      func(rel string) (machine.CPUSet, bool)
-	readErrByRel      map[string]error
+	version                 cgroupclient.CgroupVersion
+	existing                map[string]bool
+	cpus                    map[string]machine.CPUSet
+	mems                    map[string]string
+	children                map[string][]string
+	statErrors              map[string]error
+	requireExistingForApply bool
+	writes                  map[string]string
+	applyCounts             map[string]int
+	cpusetWrites            map[string]cgcommon.CPUSetData
+	pruned                  map[string]struct{}
+	schedLoadBalance        map[string]bool
+	partitionWrites         map[string]cgcommon.CPUSetPartitionFlag
+	partitionErrByRel       map[string]error
+	listErr                 error
+	listChildrenHook        func(context.Context, string) ([]string, error)
+	afterApply              func(rel string, data *cgcommon.CPUSetData)
+	readOverride            func(rel string) (machine.CPUSet, bool)
+	readErrByRel            map[string]error
 }
 
 type fakeSnapshotDriver struct {
@@ -769,6 +770,9 @@ func mustBuildDrainTestDAG(t *testing.T) *topology.TopoDAG {
 }
 
 func (f *fakeCgroupClient) ApplyCPUSet(_ context.Context, rel string, data *cgcommon.CPUSetData) error {
+	if f.requireExistingForApply && !f.existing[rel] {
+		return fmt.Errorf("apply cpuset @ %s: %w", rel, os.ErrNotExist)
+	}
 	if f.writes == nil {
 		f.writes = map[string]string{}
 	}
@@ -811,6 +815,48 @@ func (f *fakeCgroupClient) ListChildren(ctx context.Context, rel string) ([]stri
 		return nil, f.listErr
 	}
 	return append([]string(nil), f.children[rel]...), nil
+}
+
+func (f *fakeCgroupClient) EnsureDir(_ context.Context, rel string) error {
+	rel = strings.Trim(rel, "/")
+	if rel == "" {
+		return nil
+	}
+	if f.existing == nil {
+		f.existing = map[string]bool{}
+	}
+	f.existing[rel] = true
+	if f.statErrors != nil {
+		delete(f.statErrors, rel)
+	}
+	if f.children == nil {
+		f.children = map[string][]string{}
+	}
+	if f.mems == nil {
+		f.mems = map[string]string{}
+	}
+	parent, name := splitRelParent(rel)
+	if f.mems[rel] == "" {
+		parentMems := f.mems[parent]
+		if parentMems == "" {
+			parentMems = "0"
+		}
+		f.mems[rel] = parentMems
+	}
+	for _, child := range f.children[parent] {
+		if child == name {
+			return nil
+		}
+	}
+	f.children[parent] = append(f.children[parent], name)
+	return nil
+}
+
+func splitRelParent(rel string) (string, string) {
+	if idx := strings.LastIndex(rel, "/"); idx >= 0 {
+		return rel[:idx], rel[idx+1:]
+	}
+	return "", rel
 }
 
 func (f *fakeCgroupClient) ApplySchedLoadBalance(_ context.Context, rel string, enabled bool) error {
@@ -1534,6 +1580,138 @@ func TestCPUSetTopologyPluginReturnsSiblingDiscoveryError(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatalf("expected sibling discovery error")
+	}
+}
+
+func TestCPUSetTopologyPluginMaterializesConfiguredReclaimSiblingWhenMissing(t *testing.T) {
+	t.Parallel()
+
+	cg := &fakeCgroupClient{
+		existing: map[string]bool{"primary": true, "reclaim": true},
+		cpus: map[string]machine.CPUSet{
+			"primary": machine.NewCPUSet(0, 1),
+			"reclaim": machine.NewCPUSet(2, 3),
+		},
+		children:                map[string][]string{"": {"primary", "reclaim"}},
+		statErrors:              map[string]error{"system": os.ErrNotExist},
+		requireExistingForApply: true,
+	}
+	p := &CPUSetTopologyPlugin{
+		cfg: bulkheadconfig.BulkheadConfiguration{
+			BulkheadPrimaryRelPath:                 "primary",
+			BulkheadReclaimRelPaths:                []string{"reclaim"},
+			BulkheadReclaimSiblingRelPaths:         []string{"system"},
+			EnableBulkheadReclaimSiblings:          true,
+			TopologyConvergenceBudget:              bulkheadconfig.DefaultConvergenceBudget(),
+			TopologyDrainSelection:                 bulkheadconfig.DefaultDrainSelectionPolicy(),
+			EnableAdmissionLeafDefer:               true,
+			AdmissionSafeDuration:                  5 * time.Second,
+			AdmissionMaxRequiredWrites:             0,
+			EnableBulkheadCpusetTopologyOnCgroupV2: false,
+		},
+		cgroup: cg,
+	}
+	var result bulkheadapi.TopologyResult
+
+	_, err := p.Apply(context.Background(), bulkheadapi.HandlerContext{
+		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+			Topology: &machine.CPUTopology{CPUDetails: machine.CPUDetails{
+				0: {}, 1: {}, 2: {}, 3: {},
+			}},
+		},
+		DesiredView: &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+			NonReclaimPool:   machine.NewCPUSet(0, 1),
+			ReclaimEffective: machine.NewCPUSet(2, 3),
+		}},
+		ReportTopologyResult: func(got bulkheadapi.TopologyResult) {
+			result = got
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if got := cg.writes["system"]; got != "2-3" {
+		t.Fatalf("system cpuset = %q, want 2-3; writes=%#v", got, cg.writes)
+	}
+	if !cg.existing["system"] {
+		t.Fatalf("system cgroup was not materialized before write")
+	}
+	if got := cg.mems["system"]; got != "0" {
+		t.Fatalf("system cpuset.mems = %q, want initialized parent mems 0", got)
+	}
+	if result.AppliedView == nil {
+		t.Fatalf("applied view is nil")
+	}
+	if got := result.AppliedView.CPUSetByRel["system"].String(); got != "2-3" {
+		t.Fatalf("applied system cpuset = %q, want 2-3", got)
+	}
+	proof := result.AppliedView.RelProofByRel["system"]
+	if proof.Device == 0 || proof.Inode == 0 || !proof.CPUSet.Equals(machine.NewCPUSet(2, 3)) {
+		t.Fatalf("system proof = %+v, want non-empty identity proof for 2-3", proof)
+	}
+}
+
+func TestCPUSetTopologyPluginConfiguredSiblingDedupesDiscoveredSibling(t *testing.T) {
+	t.Parallel()
+
+	p := &CPUSetTopologyPlugin{
+		cfg: bulkheadconfig.BulkheadConfiguration{
+			BulkheadPrimaryRelPath:         "primary",
+			BulkheadReclaimRelPaths:        []string{"reclaim"},
+			BulkheadReclaimSiblingRelPaths: []string{"system"},
+		},
+	}
+	got := p.mergeBulkheadReclaimSiblings(
+		[]string{"system"},
+		p.configuredBulkheadReclaimSiblings(),
+		&model.CPUSetPartitionView{},
+	)
+	if len(got) != 1 || got[0] != "system" {
+		t.Fatalf("merged siblings = %#v, want [system]", got)
+	}
+}
+
+func TestCPUSetTopologyPluginConfiguredSiblingSkipsPrimaryReclaimPartitionAndNUMABuckets(t *testing.T) {
+	t.Parallel()
+
+	p := &CPUSetTopologyPlugin{
+		cfg: bulkheadconfig.BulkheadConfiguration{
+			BulkheadPrimaryRelPath:         "primary",
+			BulkheadReclaimRelPaths:        []string{"reclaim"},
+			BulkheadReclaimNumaPrefixes:    []string{"reclaim/reclaimed-"},
+			BulkheadPartitionRelPaths:      []string{"partition"},
+			BulkheadReclaimSiblingRelPaths: []string{"primary", "reclaim", "partition", "reclaim/reclaimed-0", "system"},
+		},
+	}
+	got := p.mergeBulkheadReclaimSiblings(
+		nil,
+		p.configuredBulkheadReclaimSiblings(),
+		&model.CPUSetPartitionView{ReclaimEffectivePerNUMA: map[int]machine.CPUSet{
+			0: machine.NewCPUSet(2, 3),
+		}},
+	)
+	if len(got) != 1 || got[0] != "system" {
+		t.Fatalf("merged siblings = %#v, want [system]", got)
+	}
+}
+
+func TestCPUSetTopologyPluginNoConfiguredSiblingWhenListEmpty(t *testing.T) {
+	t.Parallel()
+
+	p := &CPUSetTopologyPlugin{
+		cfg: bulkheadconfig.BulkheadConfiguration{
+			BulkheadPrimaryRelPath:         "primary",
+			BulkheadReclaimRelPaths:        []string{"reclaim"},
+			BulkheadReclaimSiblingRelPaths: nil,
+		},
+	}
+	got := p.mergeBulkheadReclaimSiblings(
+		nil,
+		p.configuredBulkheadReclaimSiblings(),
+		&model.CPUSetPartitionView{},
+	)
+	if len(got) != 0 {
+		t.Fatalf("merged siblings = %#v, want empty", got)
 	}
 }
 
