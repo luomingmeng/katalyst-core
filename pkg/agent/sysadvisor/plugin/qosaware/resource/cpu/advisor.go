@@ -704,9 +704,9 @@ func (cra *cpuResourceAdvisor) emitMetrics(calculationResult types.InternalCPUCa
 }
 
 // emitDefaultShareBackfillMetrics reports the structured diagnostics of the
-// default share residual backfill as raw int64 metrics. It is a no-op when the
-// backfill feature is disabled so that clusters without the feature do not emit
-// misleading zero-valued series.
+// default share upper-bound backfill as raw int64 metrics. It is a no-op when
+// the backfill feature is disabled so that clusters without the feature do not
+// emit misleading zero-valued series.
 func emitDefaultShareBackfillMetrics(emitter metrics.MetricEmitter, diagnostics types.DefaultShareBackfillDiagnostics) {
 	if !diagnostics.Enabled {
 		return

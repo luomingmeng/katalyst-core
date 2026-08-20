@@ -91,22 +91,80 @@ func (c *CPUAdvisorValidator) ValidateRequest(req *advisorapi.GetAdviceRequest) 
 }
 
 func (c *CPUAdvisorValidator) Validate(resp *advisorapi.ListAndWatchResponse) error {
+	return c.validate(resp, false)
+}
+
+func (c *CPUAdvisorValidator) ValidateWithDefaultShareUpperBound(resp *advisorapi.ListAndWatchResponse) error {
+	return c.validate(resp, true)
+}
+
+func (c *CPUAdvisorValidator) validate(resp *advisorapi.ListAndWatchResponse, defaultShareUpperBound bool) error {
 	if resp == nil {
 		return fmt.Errorf("got nil cpu advisor resp")
+	}
+
+	blockResp := resp
+	var defaultShareUpperBoundErr error
+	if defaultShareUpperBound {
+		defaultShareUpperBoundErr = c.validateDefaultShareUpperBound(resp)
+		filtered := *resp
+		filtered.Entries = make(map[string]*advisorapi.CalculationEntries, len(resp.Entries))
+		for entryName, entries := range resp.Entries {
+			if entryName != commonstate.PoolNameShare {
+				filtered.Entries[entryName] = entries
+			}
+		}
+		blockResp = &filtered
 	}
 
 	var errList []error
 	for _, validator := range []cpuAdvisorValidationFunc{
 		c.validateEntries,
-		c.validateStaticPools,
 		c.validateForbiddenPools,
-		c.validateOverlapPolicy,
-		c.validateResourcePackageOwners,
-		c.validateBlocks,
 	} {
 		errList = append(errList, validator(resp))
 	}
+	errList = append(errList,
+		defaultShareUpperBoundErr,
+		c.validateStaticPools(resp),
+		c.validateOverlapPolicy(blockResp),
+		c.validateResourcePackageOwners(blockResp),
+		c.validateBlocks(blockResp),
+	)
 	return errors.NewAggregate(errList)
+}
+
+func (c *CPUAdvisorValidator) validateDefaultShareUpperBound(resp *advisorapi.ListAndWatchResponse) error {
+	calculationEntries := resp.Entries[commonstate.PoolNameShare]
+	if calculationEntries == nil {
+		return fmt.Errorf("default share upper bound is missing")
+	}
+	calculationInfo := calculationEntries.Entries[commonstate.FakedContainerName]
+	if calculationInfo == nil {
+		return fmt.Errorf("default share upper bound is missing")
+	}
+	if calculationInfo.OwnerPoolName != commonstate.PoolNameShare {
+		return fmt.Errorf("default share has invalid owner pool name: %s", calculationInfo.OwnerPoolName)
+	}
+	if len(calculationInfo.CalculationResultsByNumas) != 1 {
+		return fmt.Errorf("default share upper bound must contain only faked numa id")
+	}
+	result := calculationInfo.CalculationResultsByNumas[commonstate.FakedNUMAID]
+	if result == nil || len(result.Blocks) != 1 || result.Blocks[0] == nil {
+		return fmt.Errorf("default share upper bound must contain exactly one block")
+	}
+	quantity, err := general.CovertUInt64ToInt(result.Blocks[0].Result)
+	if err != nil {
+		return fmt.Errorf("convert default share upper bound failed: %v", err)
+	}
+	if c.machineInfo == nil || c.machineInfo.CPUTopology == nil {
+		return fmt.Errorf("validate default share upper bound got nil topology")
+	}
+	if quantity > c.machineInfo.CPUTopology.NumCPUs {
+		return fmt.Errorf("default share upper bound %d exceeds total capacity %d",
+			quantity, c.machineInfo.CPUTopology.NumCPUs)
+	}
+	return nil
 }
 
 func (c *CPUAdvisorValidator) validateEntries(resp *advisorapi.ListAndWatchResponse) error {

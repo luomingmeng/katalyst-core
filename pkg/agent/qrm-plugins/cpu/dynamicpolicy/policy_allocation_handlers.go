@@ -1725,6 +1725,7 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloorAtRevision(
 		}
 		defaultSharePlan.enabled = true
 		defaultSharePlan.advisedQuantity = quantity
+		defaultSharePlan.deriveUpperBoundFromEligible = true
 		delete(fixedPoolsQuantityMap, commonstate.PoolNameShare)
 
 	}
@@ -1984,9 +1985,10 @@ func copyPoolQuantityMap(in map[string]map[int]int) map[string]map[int]int {
 }
 
 type defaultShareMaterializationPlan struct {
-	enabled         bool
-	advisedQuantity int
-	eligibleCPUSet  machine.CPUSet
+	enabled                      bool
+	advisedQuantity              int
+	deriveUpperBoundFromEligible bool
+	eligibleCPUSet               machine.CPUSet
 }
 
 // buildDefaultShareEligibleCPUSet derives the default-share source of truth
@@ -2090,10 +2092,10 @@ func isolatedCPUSetFromPodEntries(entries state.PodEntries) map[string]map[strin
 // re-validate the overlap flag here. Even if both flags were mis-enabled
 // together, the residual size could exceed the expected quantity and the check
 // below makes QRM fail closed (reject the allocation) rather than silently
-// produce a wrong cpuset. A larger expected quantity is accepted because QRM may
-// observe a newly allocated fixed pool before SysAdvisor shrinks the default
-// share quantity; in that case the residual cpuset is the fresher CPUSet-level
-// source of truth.
+// produce a wrong cpuset. A larger expected quantity is accepted because
+// SysAdvisor publishes the allocatable upper bound while QRM materializes the
+// exact current reclaim/fixed/isolated CPUSet union; the residual cpuset is the
+// CPUSet-level source of truth.
 func materializeDefaultShareCPUSet(expectedQuantity int, availableCPUs machine.CPUSet,
 	pools map[string]machine.CPUSet, isolated map[string]map[string]machine.CPUSet,
 ) (machine.CPUSet, error) {
@@ -2302,6 +2304,9 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 		}
 		defaultSharePlan.eligibleCPUSet = p.buildDefaultShareEligibleCPUSet(
 			eligibilityEntries, machineState, rampUpReclaimFloor)
+		if defaultSharePlan.deriveUpperBoundFromEligible {
+			defaultSharePlan.advisedQuantity = defaultSharePlan.eligibleCPUSet.Size()
+		}
 		if err := p.finalizeDefaultShareEntry(
 			newPodEntries, defaultSharePlan.advisedQuantity, defaultSharePlan.eligibleCPUSet,
 		); err != nil {

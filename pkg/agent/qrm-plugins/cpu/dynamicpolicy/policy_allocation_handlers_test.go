@@ -4197,17 +4197,16 @@ func TestFinalizeDefaultShareEntryAllowsAdvisorShrinkLag(t *testing.T) {
 // TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorBackfillsDefaultShareResidual is an
 // entry-level integration test for the residual-backfill gate. It exercises the whole
 // adjustPoolsAndIsolatedEntriesWithRampUpFloor entry segment with
-// FillDefaultSharePoolWithNonReclaimCPUs enabled and a share quantity that exactly matches
-// the residual, covering the chain:
+// FillDefaultSharePoolWithNonReclaimCPUs enabled and a stale materialized share
+// quantity, covering the chain:
 //
 //	copyPoolQuantityMap -> gate branch extracts+deletes the default share quantity ->
 //	constructs the default share materialization plan -> groupAndAllocatePools (share pool absent) ->
 //	applyPoolsAndIsolatedInfo backfills newPodEntries[share] with the residual cpuset.
 //
-// It asserts the final default share pool entry equals the expected residual, i.e. the
-// candidate minus every fixed pool. Fixtures reuse getTestDynamicPolicyWithInitialization
-// and the same seeding style as TestDynamicPolicy_adjustPoolsAndIsolatedEntries_Pinned.
-func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorBackfillsDefaultShareResidual(t *testing.T) {
+// It asserts the local rebuild derives the upper bound from the current eligible
+// CPUSet instead of treating the stale checkpoint share size as advisor advice.
+func TestAdjustPoolsAndIsolatedEntriesUsesEligibleDefaultShareUpperBound(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
@@ -4257,10 +4256,11 @@ func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorBackfillsDefaultShareResidu
 	}
 	p.state.SetPodEntries(seedEntries, false)
 
-	// share quantity 6 must match the residual: candidate {0..7} minus reclaim {0,1} = 6 cpus.
+	// The checkpoint share quantity is stale and smaller than the current
+	// residual: candidate {0..7} minus reclaim {0,1} = 6 cpus.
 	poolsQuantityMap := map[string]map[int]int{
 		commonstate.PoolNameShare: {
-			commonstate.FakedNUMAID: 6,
+			commonstate.FakedNUMAID: 1,
 		},
 		commonstate.PoolNameReclaim: {
 			commonstate.FakedNUMAID: 2,

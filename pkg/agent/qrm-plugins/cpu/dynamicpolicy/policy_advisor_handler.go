@@ -547,7 +547,7 @@ func (p *DynamicPolicy) allocateByCPUAdvisor(
 			return fmt.Errorf("ValidateCPUAdvisorReq failed with error: %v", vErr)
 		}
 	}
-	vErr := p.advisorValidator.Validate(resp)
+	vErr := p.validateAdvisorResponse(resp)
 	if vErr != nil {
 		return fmt.Errorf("ValidateCPUAdvisorResp failed with error: %v", vErr)
 	}
@@ -585,6 +585,14 @@ func (p *DynamicPolicy) allocateByCPUAdvisor(
 	}
 
 	return nil
+}
+
+func (p *DynamicPolicy) validateAdvisorResponse(resp *advisorapi.ListAndWatchResponse) error {
+	if p.dynamicConfig != nil &&
+		p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs {
+		return p.advisorValidator.ValidateWithDefaultShareUpperBound(resp)
+	}
+	return p.advisorValidator.Validate(resp)
 }
 
 func (p *DynamicPolicy) applyCgroupConfigs(resp *advisorapi.ListAndWatchResponse) error {
@@ -1342,6 +1350,21 @@ func (p *DynamicPolicy) generateReclaimBlockCPUSet(
 	return nil
 }
 
+func withoutDefaultShareAdvice(resp *advisorapi.ListAndWatchResponse) *advisorapi.ListAndWatchResponse {
+	if resp == nil {
+		return nil
+	}
+	filtered := *resp
+	filtered.Entries = make(map[string]*advisorapi.CalculationEntries, len(resp.Entries))
+	for entryName, entries := range resp.Entries {
+		if entryName == commonstate.PoolNameShare {
+			continue
+		}
+		filtered.Entries[entryName] = entries
+	}
+	return &filtered
+}
+
 // generateBlockCPUSet keeps legacy allocation completely isolated from the negotiated
 // dedicated/reclaim disjoint planner.
 func (p *DynamicPolicy) generateBlockCPUSet(
@@ -1351,14 +1374,22 @@ func (p *DynamicPolicy) generateBlockCPUSet(
 	if resp == nil {
 		return nil, fmt.Errorf("got nil resp")
 	}
-	if !resp.DisableDedicatedCoresOverlapReclaimedCores {
-		return p.generateLegacyBlockCPUSet(resp)
+	planningResp := resp
+	if p.dynamicConfig != nil &&
+		p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs {
+		// Default share is a synthetic upper-bound block. Preserve it in the
+		// original response for applyBlocks, but never allocate it as an exact
+		// descriptor before QRM materializes the residual.
+		planningResp = withoutDefaultShareAdvice(resp)
+	}
+	if !planningResp.DisableDedicatedCoresOverlapReclaimedCores {
+		return p.generateLegacyBlockCPUSet(planningResp)
 	}
 
 	if featureGates[feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition] == nil {
 		return nil, fmt.Errorf("dedicated reclaim disjoint partition capability is not negotiated")
 	}
-	return p.planDisjointAdvisorBlocks(resp)
+	return p.planDisjointAdvisorBlocks(planningResp)
 }
 
 func (p *DynamicPolicy) validateHardPartitionBlockPlan(

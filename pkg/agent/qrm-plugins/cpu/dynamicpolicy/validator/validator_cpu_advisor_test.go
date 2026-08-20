@@ -188,6 +188,67 @@ func TestCPUAdvisorValidatorValidatesNUMABindingDedicatedQuantityInDisjointMode(
 	})
 }
 
+func TestCPUAdvisorValidatorValidatesDefaultShareUpperBound(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	currentState := cpustate.NewCPUPluginState(nil)
+	currentState.SetPodEntries(cpustate.PodEntries{
+		commonstate.PoolNameShare: {
+			commonstate.FakedContainerName: &cpustate.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+				AllocationResult: machine.NewCPUSet(0, 1, 2, 3),
+			},
+		},
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &cpustate.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(4, 5, 6, 7),
+			},
+		},
+	})
+	v := NewCPUAdvisorValidator(currentState, &machine.KatalystMachineInfo{CPUTopology: topology})
+
+	response := func(defaultShareQuantity uint64) *advisorapi.ListAndWatchResponse {
+		return &advisorapi.ListAndWatchResponse{
+			Entries: map[string]*advisorapi.CalculationEntries{
+				commonstate.PoolNameShare: {
+					Entries: map[string]*advisorapi.CalculationInfo{
+						commonstate.FakedContainerName: {
+							OwnerPoolName: commonstate.PoolNameShare,
+							CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+								commonstate.FakedNUMAID: {
+									Blocks: []*advisorapi.Block{{BlockId: "share-upper-bound", Result: defaultShareQuantity}},
+								},
+							},
+						},
+					},
+				},
+				commonstate.PoolNameReclaim: {
+					Entries: map[string]*advisorapi.CalculationInfo{
+						commonstate.FakedContainerName: {
+							OwnerPoolName: commonstate.PoolNameReclaim,
+							CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+								commonstate.FakedNUMAID: {
+									Blocks: []*advisorapi.Block{{BlockId: "reclaim", Result: 4}},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	require.Error(t, v.Validate(response(6)), "legacy validation must retain exact-block capacity semantics")
+	require.NoError(t, v.ValidateWithDefaultShareUpperBound(response(6)))
+	require.NoError(t, v.ValidateWithDefaultShareUpperBound(response(3)),
+		"a stale current share must not override the post-plan residual fail-closed check")
+	require.ErrorContains(t, v.ValidateWithDefaultShareUpperBound(response(9)),
+		"default share upper bound 9 exceeds total capacity 8")
+}
+
 func advisorAliasResponse(blockID string, owners ...string) *advisorapi.ListAndWatchResponse {
 	resp := &advisorapi.ListAndWatchResponse{Entries: make(map[string]*advisorapi.CalculationEntries)}
 	for i, owner := range owners {
