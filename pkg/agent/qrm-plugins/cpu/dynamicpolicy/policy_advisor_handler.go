@@ -1350,21 +1350,6 @@ func (p *DynamicPolicy) generateReclaimBlockCPUSet(
 	return nil
 }
 
-func withoutDefaultShareAdvice(resp *advisorapi.ListAndWatchResponse) *advisorapi.ListAndWatchResponse {
-	if resp == nil {
-		return nil
-	}
-	filtered := *resp
-	filtered.Entries = make(map[string]*advisorapi.CalculationEntries, len(resp.Entries))
-	for entryName, entries := range resp.Entries {
-		if entryName == commonstate.PoolNameShare {
-			continue
-		}
-		filtered.Entries[entryName] = entries
-	}
-	return &filtered
-}
-
 // generateBlockCPUSet keeps legacy allocation completely isolated from the negotiated
 // dedicated/reclaim disjoint planner.
 func (p *DynamicPolicy) generateBlockCPUSet(
@@ -1380,7 +1365,7 @@ func (p *DynamicPolicy) generateBlockCPUSet(
 		// Default share is a synthetic upper-bound block. Preserve it in the
 		// original response for applyBlocks, but never allocate it as an exact
 		// descriptor before QRM materializes the residual.
-		planningResp = withoutDefaultShareAdvice(resp)
+		planningResp = resp.WithoutDefaultShareEntry()
 	}
 	if !planningResp.DisableDedicatedCoresOverlapReclaimedCores {
 		return p.generateLegacyBlockCPUSet(planningResp)
