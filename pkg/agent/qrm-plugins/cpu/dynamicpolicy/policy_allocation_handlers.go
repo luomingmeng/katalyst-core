@@ -2984,12 +2984,28 @@ func (p *DynamicPolicy) apportionReclaimedPool(poolsCPUSet map[string]machine.CP
 
 		proportionalSize := general.Max(getProportionalSize(poolCPUs.Size(), totalSize, availableSize, false /*ceil*/), 1)
 
+		// lend whole physical cores only, so the reclaim residual (and the
+		// borrowing primary pool) never keeps a lone SMT sibling of a reclaim
+		// core. crop the proportional demand DOWN to a whole-core multiple: a
+		// sub-core demand lends nothing and keeps the intact core in reclaim,
+		// preserving primary/reclaim physical-core isolation.
+		coreAlignedSize := proportionalSize
+		if cpusPerCore := p.machineInfo.CPUTopology.CPUsPerCore(); cpusPerCore > 1 {
+			coreAlignedSize = (proportionalSize / cpusPerCore) * cpusPerCore
+		}
+		if coreAlignedSize <= 0 {
+			continue
+		}
+
 		var err error
 		var cpuset machine.CPUSet
-		cpuset, reclaimedCPUs, err = calculator.TakeHTByNUMABalance(p.machineInfo, reclaimedCPUs, proportionalSize)
+		// TakeByNUMABalance grabs complete cores balanced across NUMAs (it only
+		// falls back to per-cpu when the demand is not a whole-core multiple,
+		// which the crop above rules out on a core-aligned reclaim input).
+		cpuset, reclaimedCPUs, err = calculator.TakeByNUMABalance(p.machineInfo, reclaimedCPUs, coreAlignedSize)
 		if err != nil {
 			general.Errorf("take %d cpus from reclaimedCPUs: %s, size: %d failed with error: %v",
-				proportionalSize, reclaimedCPUs.String(), reclaimedCPUs.Size(), err)
+				coreAlignedSize, reclaimedCPUs.String(), reclaimedCPUs.Size(), err)
 			return reclaimedCPUs
 		}
 
@@ -2999,6 +3015,13 @@ func (p *DynamicPolicy) apportionReclaimedPool(poolsCPUSet map[string]machine.CP
 		if reclaimedCPUs.Size() <= p.reservedReclaimedCPUsSize {
 			break
 		}
+	}
+
+	// fail-loud net: the reclaim residual must never hold a partial physical
+	// core. a violation signals a broken upstream invariant (non-core-aligned
+	// reclaim input) that must be surfaced, not masked.
+	if err := assertCoreAligned(reclaimedCPUs, p.machineInfo.CPUTopology); err != nil {
+		general.Errorf("apportionReclaimedPool reclaim residual not core-aligned: %v", err)
 	}
 
 	return reclaimedCPUs

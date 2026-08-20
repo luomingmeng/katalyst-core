@@ -268,6 +268,9 @@ func NewQoSRegionBase(name string, ownerPoolName string, resourcePackageName str
 					!conf.GetDynamicConfiguration().AllowSharedCoresOverlapReclaimedCores &&
 					regionType == v1alpha1.QoSRegionTypeShare
 			},
+			CPUsPerCore: func() int {
+				return metaServer.CPUTopology.CPUsPerCore()
+			},
 		},
 
 		ctrlKnobsNeedPolicyRestrict: map[v1alpha1.ControlKnobName]bool{configapi.ControlKnobReclaimedCoresCPUQuota: true},
