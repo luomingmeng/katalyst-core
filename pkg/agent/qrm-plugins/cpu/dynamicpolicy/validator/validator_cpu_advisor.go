@@ -107,14 +107,7 @@ func (c *CPUAdvisorValidator) validate(resp *advisorapi.ListAndWatchResponse, de
 	var defaultShareUpperBoundErr error
 	if defaultShareUpperBound {
 		defaultShareUpperBoundErr = c.validateDefaultShareUpperBound(resp)
-		filtered := *resp
-		filtered.Entries = make(map[string]*advisorapi.CalculationEntries, len(resp.Entries))
-		for entryName, entries := range resp.Entries {
-			if entryName != commonstate.PoolNameShare {
-				filtered.Entries[entryName] = entries
-			}
-		}
-		blockResp = &filtered
+		blockResp = resp.WithoutDefaultShareEntry()
 	}
 
 	var errList []error
