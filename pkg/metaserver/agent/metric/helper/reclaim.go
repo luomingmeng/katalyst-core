@@ -33,15 +33,22 @@ type ReclaimMetrics struct {
 	ReclaimedCoresSupply float64
 }
 
-// GetReclaimMetrics returns the reclaim CPU metrics for the given cpus and cgroupPath.
-// It is a thin wrapper around GetReclaimMetricsMulti with a single-element slice.
-func GetReclaimMetrics(cpus machine.CPUSet, cgroupPath string, metricsFetcher types.MetricsFetcher) (*ReclaimMetrics, error) {
-	return GetReclaimMetricsMulti(cpus, []string{cgroupPath}, metricsFetcher)
-}
-
 // GetReclaimMetricsMulti aggregates reclaim CPU metrics across one or more
 // sibling reclaim cgroup paths that share the same reclaim CPU pool (cpus).
-func GetReclaimMetricsMulti(cpus machine.CPUSet, siblingCgroupPaths []string, metricsFetcher types.MetricsFetcher) (*ReclaimMetrics, error) {
+//
+// overlapReclaim describes how the reclaim cpuset relates to the share pool:
+//   - true: reclaimed_cores overlaps (shares cores with) the share pool. The
+//     supply is the pool's spare capacity (cpuset size minus the current
+//     per-core utilization of the shared pool) plus what reclaim already uses,
+//     because non-reclaim workloads compete for the same cores.
+//   - false: the reclaim cpuset is exclusive to reclaimed_cores, so nothing
+//     else competes for those cores and the supply equals the cpuset size
+//     directly. Subtracting per-core utilization here would understate the
+//     per-numa supply below the cpuset size.
+//
+// In both branches the supply is clamped to the aggregated CFS quota when every
+// sibling path is quota-limited.
+func GetReclaimMetricsMulti(cpus machine.CPUSet, siblingCgroupPaths []string, metricsFetcher types.MetricsFetcher, overlapReclaim bool) (*ReclaimMetrics, error) {
 	if len(siblingCgroupPaths) == 0 {
 		return nil, fmt.Errorf("no reclaim cgroup paths provided")
 	}
@@ -79,8 +86,13 @@ func GetReclaimMetricsMulti(cpus machine.CPUSet, siblingCgroupPaths []string, me
 
 	// the pool's spare (unused) capacity is a property of the shared pool, so it
 	// is measured once rather than per sibling path.
-	poolCPUUsage := metricsFetcher.AggregateCoreMetric(cpus, pkgconsts.MetricCPUUsageRatio, metric.AggregatorSum).Value
-	reclaimedCoresSupply := general.MaxFloat64(float64(cpus.Size())-poolCPUUsage, 0) + totalCgroupCPUUsage
+	var reclaimedCoresSupply float64
+	if overlapReclaim {
+		poolCPUUsage := metricsFetcher.AggregateCoreMetric(cpus, pkgconsts.MetricCPUUsageRatio, metric.AggregatorSum).Value
+		reclaimedCoresSupply = general.MaxFloat64(float64(cpus.Size())-poolCPUUsage, 0) + totalCgroupCPUUsage
+	} else {
+		reclaimedCoresSupply = float64(cpus.Size())
+	}
 	// only clamp to the quota when every path has a quota
 	if !unlimited && totalCfsQuota > 0 {
 		reclaimedCoresSupply = general.MinFloat64(reclaimedCoresSupply, totalCfsQuota)

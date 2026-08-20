@@ -76,7 +76,21 @@ func (ha *HeadroomAssemblerCommon) getLastReclaimedCPUPerNUMA() (map[int]float64
 	return util.GetReclaimedCPUPerNUMA(cnr.Status.TopologyZone), nil
 }
 
-func (ha *HeadroomAssemblerCommon) getReclaimNUMABindingTopo(reclaimPool *types.PoolInfo) (bindingNUMAs, nonBindingNumas []int, err error) {
+// resolveOverlapReclaim decides the overlapReclaim flag passed to
+// GetReclaimMetricsMulti for a given NUMA:
+//   - dedicated-bound NUMA => !DisableDedicatedCoresOverlapReclaimedCores:
+//     dedicated and reclaimed cores overlap unless dedicated overlap is disabled.
+//   - share/global NUMA => AllowSharedCoresOverlapReclaimedCores: reclaimed
+//     cores may share cores with the shared pool, so the subtract-usage supply
+//     formula applies only when overlap is enabled.
+func (ha *HeadroomAssemblerCommon) resolveOverlapReclaim(numaID int, dedicatedNUMAs map[int]bool) bool {
+	if dedicatedNUMAs[numaID] {
+		return !ha.conf.GetDynamicConfiguration().DisableDedicatedCoresOverlapReclaimedCores
+	}
+	return ha.conf.GetDynamicConfiguration().AllowSharedCoresOverlapReclaimedCores
+}
+
+func (ha *HeadroomAssemblerCommon) getReclaimNUMABindingTopo(reclaimPool *types.PoolInfo) (bindingNUMAs, nonBindingNumas []int, dedicatedNUMAs map[int]bool, err error) {
 	if ha.metaServer == nil {
 		err = fmt.Errorf("invalid metaserver")
 		return
@@ -99,6 +113,7 @@ func (ha *HeadroomAssemblerCommon) getReclaimNUMABindingTopo(reclaimPool *types.
 	}
 
 	numaMap := make(map[int]bool)
+	dedicatedNUMAs = make(map[int]bool)
 	for numaID := range reclaimPool.TopologyAwareAssignments {
 		if !availNUMAs.Contains(numaID) {
 			continue
@@ -162,6 +177,7 @@ func (ha *HeadroomAssemblerCommon) getReclaimNUMABindingTopo(reclaimPool *types.
 						continue
 					}
 					numaMap[numaID] = true
+					dedicatedNUMAs[numaID] = true
 				}
 			}
 		}

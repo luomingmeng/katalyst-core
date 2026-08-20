@@ -81,6 +81,57 @@ func TestNewCPUPressureSuppressionEviction(t *testing.T) {
 	as.NotNil(plugin)
 }
 
+func TestCPUPressureSuppressionResolveActualNUMABindingOverlapReclaim(t *testing.T) {
+	t.Parallel()
+
+	as := require.New(t)
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	as.Nil(err)
+
+	stateImpl, err := makeState(cpuTopology)
+	as.Nil(err)
+	stateImpl.SetMachineState(qrmstate.NUMANodeMap{
+		0: &qrmstate.NUMANodeState{
+			PodEntries: qrmstate.PodEntries{
+				"dedicated-pod": qrmstate.ContainerEntries{
+					"main": &qrmstate.AllocationInfo{
+						AllocationMeta: commonstate.AllocationMeta{
+							QoSLevel: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+						},
+					},
+				},
+			},
+		},
+		1: &qrmstate.NUMANodeState{},
+	}, false)
+
+	plugin := &CPUPressureSuppression{state: stateImpl}
+
+	// dedicated-bound NUMA follows DisableDedicatedCoresOverlapReclaimedCores,
+	// independent from the shared-overlap flag.
+	stateImpl.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+	stateImpl.SetDisableDedicatedCoresOverlapReclaimedCores(false, false)
+	assert.True(t, plugin.resolveActualNUMABindingOverlapReclaim(0, stateImpl.GetMachineState(),
+		stateImpl.GetAllowSharedCoresOverlapReclaimedCores(), stateImpl.GetDisableDedicatedCoresOverlapReclaimedCores()))
+
+	stateImpl.SetAllowSharedCoresOverlapReclaimedCores(true, false)
+	stateImpl.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
+	assert.False(t, plugin.resolveActualNUMABindingOverlapReclaim(0, stateImpl.GetMachineState(),
+		stateImpl.GetAllowSharedCoresOverlapReclaimedCores(), stateImpl.GetDisableDedicatedCoresOverlapReclaimedCores()))
+
+	// non-dedicated NUMA follows AllowSharedCoresOverlapReclaimedCores,
+	// independent from the dedicated-overlap flag.
+	stateImpl.SetAllowSharedCoresOverlapReclaimedCores(true, false)
+	stateImpl.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
+	assert.True(t, plugin.resolveActualNUMABindingOverlapReclaim(1, stateImpl.GetMachineState(),
+		stateImpl.GetAllowSharedCoresOverlapReclaimedCores(), stateImpl.GetDisableDedicatedCoresOverlapReclaimedCores()))
+
+	stateImpl.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+	stateImpl.SetDisableDedicatedCoresOverlapReclaimedCores(false, false)
+	assert.False(t, plugin.resolveActualNUMABindingOverlapReclaim(1, stateImpl.GetMachineState(),
+		stateImpl.GetAllowSharedCoresOverlapReclaimedCores(), stateImpl.GetDisableDedicatedCoresOverlapReclaimedCores()))
+}
+
 func TestCPUPressureSuppression_GetEvictPods(t *testing.T) {
 	t.Parallel()
 
@@ -404,6 +455,93 @@ func TestCPUPressureSuppression_GetEvictPods(t *testing.T) {
 
 				store.SetCgroupMetric("test", pkgconsts.MetricCPUUsageCgroup, utilmetric.MetricData{Value: 55, Time: &now})
 				store.SetCgroupMetric("test", pkgconsts.MetricCPUQuotaCgroup, utilmetric.MetricData{Value: 5000, Time: &now})
+				store.SetCgroupMetric("test", pkgconsts.MetricCPUPeriodCgroup, utilmetric.MetricData{Value: 1000, Time: &now})
+			},
+		},
+		{
+			// reclaim does NOT overlap the share pool (AllowSharedCoresOverlapReclaimedCores
+			// defaults to false), so the supply must equal the reclaim cpuset size directly.
+			// The reclaim cpuset "1,3-6,9,11-14" has 10 cores and every core is fully busy
+			// (utilization sum = 10). The old overlap formula would compute
+			// supply = max(10-10, 0) + cgroupUsage(0) = 0, blowing poolSuppressionRate up to
+			// +Inf and over-suppressing the pod. With the corrected non-overlap supply = 10,
+			// poolSuppressionRate = 11 / 10 = 1.1 < tolerance 1.2, so no pod is evicted.
+			name: "non-overlap reclaim uses cpuset size as supply, no over-suppression",
+			podEntries: qrmstate.PodEntries{
+				pod1UID: qrmstate.ContainerEntries{
+					pod1Name: &qrmstate.AllocationInfo{
+						AllocationMeta: commonstate.AllocationMeta{
+							PodUid:         pod1UID,
+							PodNamespace:   pod1Name,
+							PodName:        pod1Name,
+							ContainerName:  pod1Name,
+							ContainerType:  pluginapi.ContainerType_MAIN.String(),
+							ContainerIndex: 0,
+							OwnerPoolName:  commonstate.PoolNameReclaim,
+							Labels: map[string]string{
+								apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelReclaimedCores,
+							},
+							Annotations: map[string]string{
+								apiconsts.PodAnnotationQoSLevelKey:       apiconsts.PodAnnotationQoSLevelReclaimedCores,
+								apiconsts.PodAnnotationCPUEnhancementKey: `{"suppression_tolerance_rate": "1.2"}`,
+							},
+							QoSLevel: apiconsts.PodAnnotationQoSLevelReclaimedCores,
+						},
+						RampUp:                   false,
+						AllocationResult:         machine.MustParse("1,3-6,9,11-14"),
+						OriginalAllocationResult: machine.MustParse("1,3-6,9,11-14"),
+						TopologyAwareAssignments: map[int]machine.CPUSet{
+							0: machine.NewCPUSet(1, 9),
+							1: machine.NewCPUSet(3, 11),
+							2: machine.NewCPUSet(4, 5, 11, 12),
+							3: machine.NewCPUSet(6, 14),
+						},
+						OriginalTopologyAwareAssignments: map[int]machine.CPUSet{
+							0: machine.NewCPUSet(1, 9),
+							1: machine.NewCPUSet(3, 11),
+							2: machine.NewCPUSet(4, 5, 11, 12),
+							3: machine.NewCPUSet(6, 14),
+						},
+						RequestQuantity: 11,
+					},
+				},
+				commonstate.PoolNameReclaim: qrmstate.ContainerEntries{
+					"": &qrmstate.AllocationInfo{
+						AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+						AllocationResult:         machine.MustParse("1,3-6,9,11-14"),
+						OriginalAllocationResult: machine.MustParse("1,3-6,9,11-14"),
+						TopologyAwareAssignments: map[int]machine.CPUSet{
+							0: machine.NewCPUSet(1, 9),
+							1: machine.NewCPUSet(3, 11),
+							2: machine.NewCPUSet(4, 5, 11, 12),
+							3: machine.NewCPUSet(6, 14),
+						},
+						OriginalTopologyAwareAssignments: map[int]machine.CPUSet{
+							0: machine.NewCPUSet(1, 9),
+							1: machine.NewCPUSet(3, 11),
+							2: machine.NewCPUSet(4, 5, 11, 12),
+							3: machine.NewCPUSet(6, 14),
+						},
+					},
+				},
+			},
+			wantEvictPodUIDSet: sets.NewString(),
+			setFakeMetric: func(store *metric.FakeMetricsFetcher) {
+				// every reclaim-pool core is fully busy (utilization = 1.0 each)
+				store.SetCPUMetric(1, pkgconsts.MetricCPUUsageRatio, utilmetric.MetricData{Value: 1.0, Time: &now})
+				store.SetCPUMetric(3, pkgconsts.MetricCPUUsageRatio, utilmetric.MetricData{Value: 1.0, Time: &now})
+				store.SetCPUMetric(4, pkgconsts.MetricCPUUsageRatio, utilmetric.MetricData{Value: 1.0, Time: &now})
+				store.SetCPUMetric(5, pkgconsts.MetricCPUUsageRatio, utilmetric.MetricData{Value: 1.0, Time: &now})
+				store.SetCPUMetric(6, pkgconsts.MetricCPUUsageRatio, utilmetric.MetricData{Value: 1.0, Time: &now})
+				store.SetCPUMetric(9, pkgconsts.MetricCPUUsageRatio, utilmetric.MetricData{Value: 1.0, Time: &now})
+				store.SetCPUMetric(11, pkgconsts.MetricCPUUsageRatio, utilmetric.MetricData{Value: 1.0, Time: &now})
+				store.SetCPUMetric(12, pkgconsts.MetricCPUUsageRatio, utilmetric.MetricData{Value: 1.0, Time: &now})
+				store.SetCPUMetric(13, pkgconsts.MetricCPUUsageRatio, utilmetric.MetricData{Value: 1.0, Time: &now})
+				store.SetCPUMetric(14, pkgconsts.MetricCPUUsageRatio, utilmetric.MetricData{Value: 1.0, Time: &now})
+
+				// no reclaim cgroup usage and unlimited quota, so the supply is not clamped
+				store.SetCgroupMetric("test", pkgconsts.MetricCPUUsageCgroup, utilmetric.MetricData{Value: 0, Time: &now})
+				store.SetCgroupMetric("test", pkgconsts.MetricCPUQuotaCgroup, utilmetric.MetricData{Value: -1, Time: &now})
 				store.SetCgroupMetric("test", pkgconsts.MetricCPUPeriodCgroup, utilmetric.MetricData{Value: 1000, Time: &now})
 			},
 		},

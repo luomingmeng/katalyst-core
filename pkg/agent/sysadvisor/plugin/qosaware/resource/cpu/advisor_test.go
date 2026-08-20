@@ -825,7 +825,10 @@ func TestAdvisorUpdate(t *testing.T) {
 					},
 				},
 			},
-			wantHeadroom: *resource.NewQuantity(4, resource.DecimalSI),
+			// NUMA 0 is dedicated-bound, leaving only NUMA 1 in the global
+			// non-binding reclaim branch. With non-overlap reclaim supply, headroom
+			// uses the exclusive reclaim cpuset size (94-95) directly.
+			wantHeadroom: *resource.NewQuantity(2, resource.DecimalSI),
 			cgroupMetricItems: []cgroupMetricItem{
 				{
 					cgroupPath: "/kubepods/besteffort",

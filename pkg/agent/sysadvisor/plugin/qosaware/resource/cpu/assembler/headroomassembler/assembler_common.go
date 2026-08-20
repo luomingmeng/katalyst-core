@@ -120,7 +120,7 @@ func (ha *HeadroomAssemblerCommon) getHeadroomDefault() (resource.Quantity, map[
 		return resource.Quantity{}, nil, fmt.Errorf("get headroom failed: reclaim pool not found")
 	}
 
-	bindingNUMAs, nonBindingNUMAs, err := ha.getReclaimNUMABindingTopo(reclaimPoolInfo)
+	bindingNUMAs, nonBindingNUMAs, dedicatedNUMAs, err := ha.getReclaimNUMABindingTopo(reclaimPoolInfo)
 	if err != nil {
 		general.Errorf("getReclaimNUMABindingTop failed: %v", err)
 		return resource.Quantity{}, nil, err
@@ -141,7 +141,7 @@ func (ha *HeadroomAssemblerCommon) getHeadroomDefault() (resource.Quantity, map[
 		reclaimPaths := ha.numaBindingRelativeRootCgroupPaths[numaID]
 		resolvedPaths := ha.existingRelativeCgroupPaths(reclaimPaths...)
 		ha.logReclaimPathResolution("numa", numaID, cpuSet, reclaimPaths, resolvedPaths)
-		reclaimMetrics, err := metricHelper.GetReclaimMetricsMulti(cpuSet, resolvedPaths, ha.metaServer.MetricsFetcher)
+		reclaimMetrics, err := metricHelper.GetReclaimMetricsMulti(cpuSet, resolvedPaths, ha.metaServer.MetricsFetcher, ha.resolveOverlapReclaim(numaID, dedicatedNUMAs))
 		if err != nil {
 			return resource.Quantity{}, nil, fmt.Errorf("get reclaim Metrics failed with numa %d: %v", numaID, err)
 		}
@@ -165,7 +165,9 @@ func (ha *HeadroomAssemblerCommon) getHeadroomDefault() (resource.Quantity, map[
 
 		resolvedPaths := ha.existingRelativeCgroupPaths(ha.reclaimRelativeRootCgroupPaths...)
 		ha.logReclaimPathResolution("global", -1, cpuSets, ha.reclaimRelativeRootCgroupPaths, resolvedPaths)
-		reclaimMetrics, err := metricHelper.GetReclaimMetricsMulti(cpuSets, resolvedPaths, ha.metaServer.MetricsFetcher)
+		// non-binding NUMAs are share/global and never dedicated, so the overlap
+		// flag follows AllowSharedCoresOverlapReclaimedCores directly.
+		reclaimMetrics, err := metricHelper.GetReclaimMetricsMulti(cpuSets, resolvedPaths, ha.metaServer.MetricsFetcher, ha.conf.GetDynamicConfiguration().AllowSharedCoresOverlapReclaimedCores)
 		if err != nil {
 			return resource.Quantity{}, nil, fmt.Errorf("get reclaim Metrics failed: %v", err)
 		}
@@ -206,7 +208,7 @@ func (ha *HeadroomAssemblerCommon) getHeadroomByUtil() (resource.Quantity, map[i
 		return resource.Quantity{}, nil, fmt.Errorf("get headroom by util failed: reclaim pool not found")
 	}
 
-	bindingNUMAs, nonBindingNUMAs, err := ha.getReclaimNUMABindingTopo(reclaimPoolInfo)
+	bindingNUMAs, nonBindingNUMAs, dedicatedNUMAs, err := ha.getReclaimNUMABindingTopo(reclaimPoolInfo)
 	if err != nil {
 		general.Errorf("getReclaimNUMABindingTop failed: %v", err)
 		return resource.Quantity{}, nil, err
@@ -232,7 +234,7 @@ func (ha *HeadroomAssemblerCommon) getHeadroomByUtil() (resource.Quantity, map[i
 		reclaimPaths := ha.numaBindingRelativeRootCgroupPaths[numaID]
 		resolvedPaths := ha.existingRelativeCgroupPaths(reclaimPaths...)
 		ha.logReclaimPathResolution("numa", numaID, cpuSet, reclaimPaths, resolvedPaths)
-		reclaimMetrics, err := metricHelper.GetReclaimMetricsMulti(cpuSet, resolvedPaths, ha.metaServer.MetricsFetcher)
+		reclaimMetrics, err := metricHelper.GetReclaimMetricsMulti(cpuSet, resolvedPaths, ha.metaServer.MetricsFetcher, ha.resolveOverlapReclaim(numaID, dedicatedNUMAs))
 		if err != nil {
 			return resource.Quantity{}, nil, fmt.Errorf("get reclaim Metrics failed with numa %d: %v", numaID, err)
 		}
@@ -265,7 +267,9 @@ func (ha *HeadroomAssemblerCommon) getHeadroomByUtil() (resource.Quantity, map[i
 
 		resolvedPaths := ha.existingRelativeCgroupPaths(ha.reclaimRelativeRootCgroupPaths...)
 		ha.logReclaimPathResolution("global", -1, cpusets, ha.reclaimRelativeRootCgroupPaths, resolvedPaths)
-		reclaimMetrics, err := metricHelper.GetReclaimMetricsMulti(cpusets, resolvedPaths, ha.metaServer.MetricsFetcher)
+		// non-binding NUMAs are share/global and never dedicated, so the overlap
+		// flag follows AllowSharedCoresOverlapReclaimedCores directly.
+		reclaimMetrics, err := metricHelper.GetReclaimMetricsMulti(cpusets, resolvedPaths, ha.metaServer.MetricsFetcher, ha.conf.GetDynamicConfiguration().AllowSharedCoresOverlapReclaimedCores)
 		if err != nil {
 			return resource.Quantity{}, nil, fmt.Errorf("get reclaim Metrics failed: %v", err)
 		}

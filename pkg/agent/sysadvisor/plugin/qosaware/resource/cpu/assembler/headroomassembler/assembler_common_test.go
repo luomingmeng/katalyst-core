@@ -822,7 +822,7 @@ func TestHeadroomAssemblerCommon_GetHeadroom(t *testing.T) {
 					require.NoError(t, err)
 				},
 			},
-			want: *resource.NewQuantity(68, resource.DecimalSI),
+			want: *resource.NewQuantity(58, resource.DecimalSI),
 		},
 		{
 			name: "numa-exclusive region headroom util",
@@ -879,7 +879,7 @@ func TestHeadroomAssemblerCommon_GetHeadroom(t *testing.T) {
 					require.NoError(t, err)
 				},
 			},
-			want: *resource.NewQuantity(70, resource.DecimalSI),
+			want: *resource.NewQuantity(58, resource.DecimalSI),
 		},
 		{
 			name: "filters non-existing reclaim cgroup paths",
