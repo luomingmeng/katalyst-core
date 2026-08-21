@@ -28,6 +28,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/metacache"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/plugin/qosaware/resource/cpu/region"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/plugin/qosaware/resource/helper"
+	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	metricHelper "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric/helper"
@@ -55,6 +56,12 @@ type HeadroomAssemblerCommon struct {
 
 	pathWarningOnce sync.Map
 }
+
+const (
+	metricHeadroomApportionRequested     = "headroom_apportion_requested"
+	metricHeadroomApportionEffective     = "headroom_apportion_effective"
+	metricHeadroomApportionAlignmentLoss = "headroom_apportion_alignment_loss"
+)
 
 func (ha *HeadroomAssemblerCommon) logReclaimPathResolution(scope string, numaID int, cpuSet machine.CPUSet, inputPaths, resolvedPaths []string) {
 	if len(inputPaths) > 0 && len(resolvedPaths) == 0 {
@@ -129,7 +136,11 @@ func (ha *HeadroomAssemblerCommon) getHeadroomDefault() (resource.Quantity, map[
 	general.Infof("RNB NUMA topo: %v, %v", bindingNUMAs, nonBindingNUMAs)
 
 	numaHeadroom := make(map[int]resource.Quantity, ha.metaServer.NumNUMANodes)
-	totalHeadroom := resource.Quantity{}
+	cpusPerCore, err := ha.cpusPerCore()
+	if err != nil {
+		return resource.Quantity{}, nil, err
+	}
+	var requestedHeadroom int64
 
 	// get headroom per NUMA
 	for _, numaID := range bindingNUMAs {
@@ -147,8 +158,8 @@ func (ha *HeadroomAssemblerCommon) getHeadroomDefault() (resource.Quantity, map[
 		}
 
 		headroom := *resource.NewQuantity(int64(math.Ceil(reclaimMetrics.ReclaimedCoresSupply)), resource.DecimalSI)
-		numaHeadroom[numaID] = headroom
-		totalHeadroom.Add(headroom)
+		requestedHeadroom += wholeCPUValue(headroom)
+		numaHeadroom[numaID] = alignBindingNUMAHeadroom(headroom, cpuSet, cpusPerCore)
 	}
 
 	// get global reclaim headroom
@@ -172,18 +183,17 @@ func (ha *HeadroomAssemblerCommon) getHeadroomDefault() (resource.Quantity, map[
 			return resource.Quantity{}, nil, fmt.Errorf("get reclaim Metrics failed: %v", err)
 		}
 
-		headroomPerNUMA := reclaimMetrics.ReclaimedCoresSupply / float64(len(nonBindingNUMAs))
-		for _, numaID := range nonBindingNUMAs {
-			q := *resource.NewQuantity(int64(headroomPerNUMA), resource.DecimalSI)
-			numaHeadroom[numaID] = q
-			totalHeadroom.Add(q)
+		headroom := *resource.NewQuantity(int64(math.Ceil(reclaimMetrics.ReclaimedCoresSupply)), resource.DecimalSI)
+		requestedHeadroom += wholeCPUValue(headroom)
+		allocations, err := ha.apportionNonBindingHeadroom(headroom, nonBindingNUMAs, reclaimPoolInfo, cpusPerCore)
+		if err != nil {
+			return resource.Quantity{}, nil, fmt.Errorf("apportion non-binding headroom failed: %v", err)
+		}
+		for numaID, allocation := range allocations {
+			numaHeadroom[numaID] = allocation
 		}
 	}
 
-	general.InfoS("[qosaware-cpu] get headroom ret", "total", totalHeadroom.Value())
-	for numaID, headroom := range numaHeadroom {
-		general.InfoS("[qosaware-cpu] get headroom per numa", "NUMA-ID", numaID, "headroom", headroom.Value())
-	}
 	allNUMAs := ha.metaServer.CPUDetails.NUMANodes()
 	for _, numaID := range allNUMAs.ToSliceInt() {
 		if _, ok := numaHeadroom[numaID]; !ok {
@@ -191,6 +201,12 @@ func (ha *HeadroomAssemblerCommon) getHeadroomDefault() (resource.Quantity, map[
 			numaHeadroom[numaID] = *resource.NewQuantity(0, resource.BinarySI)
 		}
 	}
+	totalHeadroom := totalNUMAHeadroom(numaHeadroom)
+	general.InfoS("[qosaware-cpu] get headroom ret", "total", totalHeadroom.Value())
+	for numaID, headroom := range numaHeadroom {
+		general.InfoS("[qosaware-cpu] get headroom per numa", "NUMA-ID", numaID, "headroom", headroom.Value())
+	}
+	ha.emitApportionmentMetrics(requestedHeadroom, totalHeadroom.Value())
 	klog.V(4).InfoS("headroom_computed",
 		"component", "headroom_assembler",
 		"policy", "common",
@@ -216,8 +232,12 @@ func (ha *HeadroomAssemblerCommon) getHeadroomByUtil() (resource.Quantity, map[i
 	general.Infof("RNB NUMA topo: %v, %v", bindingNUMAs, nonBindingNUMAs)
 
 	numaHeadroom := make(map[int]resource.Quantity, ha.metaServer.NumNUMANodes)
-	totalHeadroom := resource.Quantity{}
 	dynamicConfig := ha.conf.GetDynamicConfiguration()
+	cpusPerCore, err := ha.cpusPerCore()
+	if err != nil {
+		return resource.Quantity{}, nil, err
+	}
+	var requestedHeadroom int64
 	reclaimedCPUs, err := ha.getLastReclaimedCPUPerNUMA()
 	if err != nil {
 		general.Errorf("getLastReclaimedCPUPerNUMA failed: %v", err)
@@ -247,8 +267,8 @@ func (ha *HeadroomAssemblerCommon) getHeadroomByUtil() (resource.Quantity, map[i
 			return resource.Quantity{}, nil, fmt.Errorf("get util-based headroom failed with numa %d: %v", numaID, err)
 		}
 
-		numaHeadroom[numaID] = headroom
-		totalHeadroom.Add(headroom)
+		requestedHeadroom += wholeCPUValue(headroom)
+		numaHeadroom[numaID] = alignBindingNUMAHeadroom(headroom, cpuSet, cpusPerCore)
 	}
 
 	// get global reclaim headroom
@@ -285,19 +305,16 @@ func (ha *HeadroomAssemblerCommon) getHeadroomByUtil() (resource.Quantity, map[i
 			return resource.Quantity{}, nil, fmt.Errorf("get util-based headroom failed: %v", err)
 		}
 
-		for _, numaID := range nonBindingNUMAs {
-			numaCPUSize := ha.metaServer.NUMAToCPUs.CPUSizeInNUMAs(numaID)
-			headroomForNUMA := float64(headroom.Value()) * float64(numaCPUSize) / float64(totalCPUSize)
-			q := *resource.NewQuantity(int64(headroomForNUMA), resource.DecimalSI)
-			numaHeadroom[numaID] = q
-			totalHeadroom.Add(q)
+		requestedHeadroom += wholeCPUValue(headroom)
+		allocations, err := ha.apportionNonBindingHeadroom(headroom, nonBindingNUMAs, reclaimPoolInfo, cpusPerCore)
+		if err != nil {
+			return resource.Quantity{}, nil, fmt.Errorf("apportion non-binding headroom failed: %v", err)
+		}
+		for numaID, allocation := range allocations {
+			numaHeadroom[numaID] = allocation
 		}
 	}
 
-	general.InfoS("[qosaware-cpu] headroom by utilization", "total", totalHeadroom.Value())
-	for numaID, headroom := range numaHeadroom {
-		general.InfoS("[qosaware-cpu] NUMA headroom by utilization", "NUMA-ID", numaID, "headroom", headroom.Value())
-	}
 	allNUMAs := ha.metaServer.CPUDetails.NUMANodes()
 	for _, numaID := range allNUMAs.ToSliceInt() {
 		if _, ok := numaHeadroom[numaID]; !ok {
@@ -305,6 +322,12 @@ func (ha *HeadroomAssemblerCommon) getHeadroomByUtil() (resource.Quantity, map[i
 			numaHeadroom[numaID] = *resource.NewQuantity(0, resource.BinarySI)
 		}
 	}
+	totalHeadroom := totalNUMAHeadroom(numaHeadroom)
+	general.InfoS("[qosaware-cpu] headroom by utilization", "total", totalHeadroom.Value())
+	for numaID, headroom := range numaHeadroom {
+		general.InfoS("[qosaware-cpu] NUMA headroom by utilization", "NUMA-ID", numaID, "headroom", headroom.Value())
+	}
+	ha.emitApportionmentMetrics(requestedHeadroom, totalHeadroom.Value())
 	klog.V(4).InfoS("headroom_computed",
 		"component", "headroom_assembler",
 		"policy", "common",
@@ -313,6 +336,96 @@ func (ha *HeadroomAssemblerCommon) getHeadroomByUtil() (resource.Quantity, map[i
 		"output_value", totalHeadroom.Value(),
 		"numa_output", headroomValues(numaHeadroom))
 	return totalHeadroom, numaHeadroom, nil
+}
+
+func (ha *HeadroomAssemblerCommon) cpusPerCore() (int, error) {
+	if ha.metaServer == nil || ha.metaServer.CPUTopology == nil {
+		return 0, fmt.Errorf("cpu topology is unavailable")
+	}
+	cpusPerCore := ha.metaServer.CPUTopology.CPUsPerCore()
+	if cpusPerCore <= 0 {
+		return 0, fmt.Errorf("cpus per core must be positive")
+	}
+	return cpusPerCore, nil
+}
+
+func wholeCPUValue(q resource.Quantity) int64 {
+	return q.MilliValue() / 1000
+}
+
+func alignBindingNUMAHeadroom(headroom resource.Quantity, cpuSet machine.CPUSet, cpusPerCore int) resource.Quantity {
+	target := wholeCPUValue(headroom)
+	limit := int64(cpuSet.Size())
+	if target > limit {
+		target = limit
+	}
+	quantum := int64(cpusPerCore)
+	target = target / quantum * quantum
+	return *resource.NewQuantity(target, resource.DecimalSI)
+}
+
+func (ha *HeadroomAssemblerCommon) apportionNonBindingHeadroom(
+	headroom resource.Quantity,
+	nonBindingNUMAs []int,
+	reclaimPool *types.PoolInfo,
+	cpusPerCore int,
+) (map[int]resource.Quantity, error) {
+	weights := make(map[int]int64, len(nonBindingNUMAs))
+	limits := make(map[int]int64, len(nonBindingNUMAs))
+	for _, numaID := range nonBindingNUMAs {
+		cpuSet, ok := reclaimPool.TopologyAwareAssignments[numaID]
+		if !ok {
+			return nil, fmt.Errorf("reclaim pool NOT found TopologyAwareAssignments with numaID: %v", numaID)
+		}
+		weights[numaID] = int64(ha.metaServer.NUMAToCPUs.CPUSizeInNUMAs(numaID))
+		limits[numaID] = int64(cpuSet.Size())
+	}
+
+	allocations, effective, err := machine.ApportionNUMACPU(
+		wholeCPUValue(headroom), weights, limits, cpusPerCore)
+	if err != nil {
+		return nil, err
+	}
+
+	klog.V(4).InfoS("headroom_apportioned",
+		"component", "assembler",
+		"resource", "cpu",
+		"requested", wholeCPUValue(headroom),
+		"effective", effective,
+		"weights", weights,
+		"limits", limits,
+		"allocations", allocations)
+
+	result := make(map[int]resource.Quantity, len(allocations))
+	for numaID, allocation := range allocations {
+		result[numaID] = *resource.NewQuantity(allocation, resource.DecimalSI)
+	}
+	return result, nil
+}
+
+func totalNUMAHeadroom(numaHeadroom map[int]resource.Quantity) resource.Quantity {
+	total := resource.Quantity{}
+	for _, headroom := range numaHeadroom {
+		total.Add(headroom)
+	}
+	return total
+}
+
+func (ha *HeadroomAssemblerCommon) emitApportionmentMetrics(requested, effective int64) {
+	if ha.emitter == nil {
+		return
+	}
+	loss := requested - effective
+	if loss < 0 {
+		loss = 0
+	}
+	tags := []metrics.MetricTag{
+		{Key: "component", Val: "assembler"},
+		{Key: "resource", Val: "cpu"},
+	}
+	_ = ha.emitter.StoreInt64(metricHeadroomApportionRequested, requested, metrics.MetricTypeNameRaw, tags...)
+	_ = ha.emitter.StoreInt64(metricHeadroomApportionEffective, effective, metrics.MetricTypeNameRaw, tags...)
+	_ = ha.emitter.StoreInt64(metricHeadroomApportionAlignmentLoss, loss, metrics.MetricTypeNameRaw, tags...)
 }
 
 func headroomValues(numaHeadroom map[int]resource.Quantity) map[int]int64 {
