@@ -70,6 +70,18 @@ import (
 // registered" errors when the intervening subtest re-populates the entry.
 var hRegistryMu sync.Mutex
 
+type headroomMetricEmitter struct {
+	metrics.DummyMetrics
+	values map[string]int64
+	tags   map[string][]metrics.MetricTag
+}
+
+func (e *headroomMetricEmitter) StoreInt64(name string, value int64, _ metrics.MetricTypeName, tags ...metrics.MetricTag) error {
+	e.values[name] = value
+	e.tags[name] = append([]metrics.MetricTag(nil), tags...)
+	return nil
+}
+
 func generateTestConfiguration(t *testing.T, checkpointDir, stateFileDir string) *config.Configuration {
 	conf, err := options.NewOptions().Config()
 	require.NoError(t, err)
@@ -286,7 +298,7 @@ func TestHeadroomAssemblerCommon_GetHeadroom(t *testing.T) {
 					require.NoError(t, err)
 				},
 			},
-			want: *resource.NewMilliQuantity(13000, resource.DecimalSI),
+			want: *resource.NewQuantity(10, resource.DecimalSI),
 		},
 		{
 			name: "limited by quota",
@@ -357,7 +369,7 @@ func TestHeadroomAssemblerCommon_GetHeadroom(t *testing.T) {
 					require.NoError(t, err)
 				},
 			},
-			want: *resource.NewQuantity(8, resource.DecimalSI),
+			want: *resource.NewQuantity(6, resource.DecimalSI),
 		},
 		{
 			name: "allow shared cores overlap reclaimed cores",
@@ -440,7 +452,7 @@ func TestHeadroomAssemblerCommon_GetHeadroom(t *testing.T) {
 					require.NoError(t, err)
 				},
 			},
-			want: *resource.NewQuantity(5, resource.DecimalSI),
+			want: *resource.NewQuantity(4, resource.DecimalSI),
 		},
 		{
 			name: "disable util based",
@@ -560,7 +572,7 @@ func TestHeadroomAssemblerCommon_GetHeadroom(t *testing.T) {
 					require.NoError(t, err)
 				},
 			},
-			want: *resource.NewQuantity(12, resource.DecimalSI),
+			want: *resource.NewQuantity(10, resource.DecimalSI),
 		},
 		{
 			name: "over maximum core utilization",
@@ -627,7 +639,7 @@ func TestHeadroomAssemblerCommon_GetHeadroom(t *testing.T) {
 					require.NoError(t, err)
 				},
 			},
-			want: *resource.NewQuantity(14, resource.DecimalSI),
+			want: *resource.NewQuantity(10, resource.DecimalSI),
 		},
 		{
 			name: "limited by capacity",
@@ -706,7 +718,7 @@ func TestHeadroomAssemblerCommon_GetHeadroom(t *testing.T) {
 					require.NoError(t, err)
 				},
 			},
-			want: *resource.NewQuantity(96, resource.DecimalSI),
+			want: *resource.NewQuantity(80, resource.DecimalSI),
 		},
 		{
 			name: "numa-exclusive region headroom",
@@ -1009,6 +1021,129 @@ func TestHeadroomAssemblerCommon_GetHeadroom(t *testing.T) {
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("GetHeadroom() got = %v, want %v", got, tt.want)
 			}
+		})
+	}
+}
+
+func TestHeadroomAssemblerCommon_PreservesCoreAlignedGlobalHeadroom(t *testing.T) {
+	conf := generateTestConfiguration(t, t.TempDir(), t.TempDir())
+	conf.GetDynamicConfiguration().ReclaimedResourceConfiguration = &reclaimedresource.ReclaimedResourceConfiguration{
+		EnableReclaim: true,
+		CPUHeadroomConfiguration: &cpuheadroom.CPUHeadroomConfiguration{
+			CPUUtilBasedConfiguration: &cpuheadroom.CPUUtilBasedConfiguration{
+				Enable:          false,
+				MaxOversoldRate: 1,
+			},
+		},
+	}
+	conf.GetDynamicConfiguration().AllowSharedCoresOverlapReclaimedCores = false
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(256, 2, 8)
+	require.NoError(t, err)
+	require.Equal(t, 2, cpuTopology.CPUsPerCore())
+
+	metricsFetcher := metric.NewFakeMetricsFetcher(metrics.DummyMetrics{})
+	metaCache, err := metacache.NewMetaCacheImp(conf, metricspool.DummyMetricsEmitterPool{}, metricsFetcher)
+	require.NoError(t, err)
+
+	limits := map[int]int{0: 10, 1: 10, 2: 10, 3: 10, 4: 10, 5: 10, 6: 8, 7: 8}
+	assignments := make(map[int]machine.CPUSet, len(limits))
+	for numaID, limit := range limits {
+		cpus := cpuTopology.NUMAToCPUs[numaID].ToSliceInt()
+		assignments[numaID] = machine.NewCPUSet(cpus[:limit]...)
+	}
+	require.NoError(t, metaCache.SetPoolInfo(commonstate.PoolNameReclaim, &types.PoolInfo{
+		PoolName:                 commonstate.PoolNameReclaim,
+		TopologyAwareAssignments: assignments,
+	}))
+
+	metaServer := generateTestMetaServer(t, nil, nil, metricsFetcher)
+	metaServer.KatalystMachineInfo.CPUTopology = cpuTopology
+	metaServer.KatalystMachineInfo.MachineInfo = &info.MachineInfo{
+		NumCores: 256,
+		Topology: []info.Node{
+			{Id: 0}, {Id: 1}, {Id: 2}, {Id: 3},
+			{Id: 4}, {Id: 5}, {Id: 6}, {Id: 7},
+		},
+	}
+
+	emitter := &headroomMetricEmitter{
+		values: make(map[string]int64),
+		tags:   make(map[string][]metrics.MetricTag),
+	}
+	assembler := NewHeadroomAssemblerCommon(
+		conf, nil, nil, nil, nil, nil, metaCache, metaServer, emitter,
+	).(*HeadroomAssemblerCommon)
+	assembler.reclaimRelativeRootCgroupPaths = []string{"/kubepods/besteffort"}
+	assembler.existingRelativeCgroupPaths = func(paths ...string) []string {
+		return paths
+	}
+	store := metricsFetcher.(*metric.FakeMetricsFetcher)
+	now := time.Now()
+	for _, path := range assembler.reclaimRelativeRootCgroupPaths {
+		store.SetCgroupMetric(path, pkgconsts.MetricCPUUsageCgroup, utilmetric.MetricData{Value: 0, Time: &now})
+		store.SetCgroupMetric(path, pkgconsts.MetricCPUQuotaCgroup, utilmetric.MetricData{Value: -1, Time: &now})
+		store.SetCgroupMetric(path, pkgconsts.MetricCPUPeriodCgroup, utilmetric.MetricData{Value: 100000, Time: &now})
+	}
+
+	total, numa, err := assembler.GetHeadroom()
+	require.NoError(t, err)
+	require.Equal(t, int64(76), total.Value())
+	require.Equal(t, map[int]int64{
+		0: 10, 1: 10, 2: 10, 3: 10,
+		4: 10, 5: 10, 6: 8, 7: 8,
+	}, headroomValues(numa))
+	for numaID, headroom := range numa {
+		require.Zero(t, headroom.Value()%int64(cpuTopology.CPUsPerCore()))
+		require.LessOrEqual(t, headroom.Value(), int64(assignments[numaID].Size()))
+	}
+	require.Equal(t, map[string]int64{
+		metricHeadroomApportionRequested:     76,
+		metricHeadroomApportionEffective:     76,
+		metricHeadroomApportionAlignmentLoss: 0,
+	}, emitter.values)
+	expectedTags := []metrics.MetricTag{
+		{Key: "component", Val: "assembler"},
+		{Key: "resource", Val: "cpu"},
+	}
+	for metricName := range emitter.values {
+		require.Equal(t, expectedTags, emitter.tags[metricName])
+	}
+}
+
+func TestAlignBindingNUMAHeadroom(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		headroom string
+		limit    int
+		want     int64
+	}{
+		{
+			name:     "clamps before aligning",
+			headroom: "13",
+			limit:    10,
+			want:     10,
+		},
+		{
+			name:     "drops only the local remainder",
+			headroom: "9",
+			limit:    10,
+			want:     8,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cpuIDs := make([]int, tt.limit)
+			for cpuID := 0; cpuID < tt.limit; cpuID++ {
+				cpuIDs[cpuID] = cpuID
+			}
+			cpuSet := machine.NewCPUSet(cpuIDs...)
+			got := alignBindingNUMAHeadroom(resource.MustParse(tt.headroom), cpuSet, 2)
+			require.Equal(t, tt.want, got.Value())
 		})
 	}
 }
