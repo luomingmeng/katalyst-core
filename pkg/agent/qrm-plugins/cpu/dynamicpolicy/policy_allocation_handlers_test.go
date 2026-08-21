@@ -2681,14 +2681,13 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorUsesImmutablePerNUMACapacity(t *te
 	}, false)
 
 	// cpusPerCore==2, 32 CPUs (16 cores) per NUMA. ratio 0.2 yields
-	// floor(16*0.2)=3 cores, rounded down to an even number of donated cores
-	// (2 cores) => 4 CPUs per NUMA. the immutable per-NUMA capacity drives the
-	// target regardless of the smaller live DefaultCPUSet, and the result is
-	// always a whole-core multiple.
+	// floor(16*0.2)=3 complete cores => 6 CPUs per NUMA. the immutable
+	// per-NUMA capacity drives the target regardless of the smaller live
+	// DefaultCPUSet, and the result is always a whole-core multiple.
 	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), true)
 	require.NoError(t, err)
-	require.Equal(t, 4, floor.Intersection(numa0).Size())
-	require.Equal(t, 4, floor.Intersection(numa1).Size())
+	require.Equal(t, 6, floor.Intersection(numa0).Size())
+	require.Equal(t, 6, floor.Intersection(numa1).Size())
 }
 
 func TestDynamicPolicyDeriveRampUpReclaimFloorPreservesLegacyOverlapAlgorithm(t *testing.T) {
@@ -4144,7 +4143,7 @@ func TestFinalizeDefaultShareEntryReadsPostReviseState(t *testing.T) {
 	candidate := machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)
 
 	// residual = candidate - reclaim(0,1) - custom(2) - isolated(3) = {4,5,6,7}
-	require.NoError(t, p.finalizeDefaultShareEntry(newPodEntries, 4, candidate))
+	require.NoError(t, p.finalizeDefaultShareEntry(newPodEntries, newPodEntries, 4, candidate))
 	require.True(t, newPodEntries[commonstate.PoolNameShare][commonstate.FakedContainerName].
 		AllocationResult.Equals(machine.NewCPUSet(4, 5, 6, 7)))
 	require.NotEmpty(t, newPodEntries[commonstate.PoolNameShare][commonstate.FakedContainerName].
@@ -4152,12 +4151,55 @@ func TestFinalizeDefaultShareEntryReadsPostReviseState(t *testing.T) {
 
 	// simulate reviseReclaimPool growing the reclaim pool; share must shrink.
 	newPodEntries[commonstate.PoolNameReclaim][commonstate.FakedContainerName].AllocationResult = machine.NewCPUSet(0, 1, 4)
-	require.NoError(t, p.finalizeDefaultShareEntry(newPodEntries, 3, candidate))
+	require.NoError(t, p.finalizeDefaultShareEntry(newPodEntries, newPodEntries, 3, candidate))
 	require.True(t, newPodEntries[commonstate.PoolNameShare][commonstate.FakedContainerName].
 		AllocationResult.Equals(machine.NewCPUSet(5, 6, 7)))
 
 	// fail-closed on quantity mismatch.
-	require.Error(t, p.finalizeDefaultShareEntry(newPodEntries, 2, candidate))
+	require.Error(t, p.finalizeDefaultShareEntry(newPodEntries, newPodEntries, 2, candidate))
+}
+
+func TestDynamicPolicyFinalizeDefaultShareEntryExcludesDNB(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	dnbCPUSet := machine.NewCPUSet(3)
+	newPodEntries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(0, 1),
+			},
+		},
+		"dedicated-pod": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "dedicated-pod",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameDedicated,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+					Annotations: map[string]string{
+						apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+					},
+				},
+				AllocationResult: dnbCPUSet.Clone(),
+			},
+		},
+	}
+
+	require.NoError(t, p.finalizeDefaultShareEntry(
+		newPodEntries,
+		newPodEntries,
+		6,
+		machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
+	))
+	shareCPUSet := newPodEntries[commonstate.PoolNameShare][commonstate.FakedContainerName].AllocationResult
+	require.True(t, shareCPUSet.Equals(machine.NewCPUSet(2, 4, 5, 6, 7)))
+	require.True(t, shareCPUSet.Intersection(dnbCPUSet).IsEmpty())
 }
 
 func TestFinalizeDefaultShareEntryAllowsAdvisorShrinkLag(t *testing.T) {
@@ -4189,7 +4231,8 @@ func TestFinalizeDefaultShareEntryAllowsAdvisorShrinkLag(t *testing.T) {
 		},
 	}
 
-	require.NoError(t, p.finalizeDefaultShareEntry(newPodEntries, 7, machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)))
+	require.NoError(t, p.finalizeDefaultShareEntry(
+		newPodEntries, newPodEntries, 7, machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)))
 	require.True(t, newPodEntries[commonstate.PoolNameShare][commonstate.FakedContainerName].
 		AllocationResult.Equals(machine.NewCPUSet(2, 3, 4, 5, 6, 7)))
 }
@@ -4206,7 +4249,7 @@ func TestFinalizeDefaultShareEntryAllowsAdvisorShrinkLag(t *testing.T) {
 //
 // It asserts the local rebuild derives the upper bound from the current eligible
 // CPUSet instead of treating the stale checkpoint share size as advisor advice.
-func TestAdjustPoolsAndIsolatedEntriesUsesEligibleDefaultShareUpperBound(t *testing.T) {
+func TestAdjustPoolsAndIsolatedEntriesUsesEligibleDefaultShareUpperBoundAndExcludesDNB(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
@@ -4227,9 +4270,11 @@ func TestAdjustPoolsAndIsolatedEntriesUsesEligibleDefaultShareUpperBound(t *test
 	// seed a historical reclaim pool so takeCPUsForPoolsInPlaceWithPreferred pins the
 	// reclaim pool to one complete core deterministically, plus a non-binding
 	// shared_cores container that owns the default share pool so cleanPools keeps the
-	// backfilled entry. the seed is core-aligned (one whole core) because the tier
-	// layer now forces whole-core reclaim selection (invariant B').
+	// backfilled entry, plus a DNB container whose allocation must remain outside the
+	// default-share residual. the seed is core-aligned (one whole core) because the
+	// tier layer now forces whole-core reclaim selection (invariant B').
 	reclaimSeed := coresInNUMA(topology, 0, 0, 1)
+	dnbCPUSet := coresInNUMA(topology, 0, 1, 2)
 	seedEntries := state.PodEntries{
 		commonstate.PoolNameReclaim: {
 			commonstate.FakedContainerName: &state.AllocationInfo{
@@ -4253,11 +4298,31 @@ func TestAdjustPoolsAndIsolatedEntriesUsesEligibleDefaultShareUpperBound(t *test
 				RequestQuantity: 6,
 			},
 		},
+		"dedicated-pod": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "dedicated-pod",
+					PodNamespace:  "default",
+					PodName:       "dedicated-pod",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameDedicated,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+					Annotations: map[string]string{
+						apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+					},
+				},
+				RequestQuantity:                  float64(dnbCPUSet.Size()),
+				AllocationResult:                 dnbCPUSet.Clone(),
+				OriginalAllocationResult:         dnbCPUSet.Clone(),
+				TopologyAwareAssignments:         map[int]machine.CPUSet{0: dnbCPUSet.Clone()},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: dnbCPUSet.Clone()},
+			},
+		},
 	}
 	p.state.SetPodEntries(seedEntries, false)
 
 	// The checkpoint share quantity is stale and smaller than the current
-	// residual: candidate {0..7} minus reclaim {0,1} = 6 cpus.
+	// residual: candidate {0..7} minus reclaim {0,1} and DNB {2} = 5 cpus.
 	poolsQuantityMap := map[string]map[int]int{
 		commonstate.PoolNameShare: {
 			commonstate.FakedNUMAID: 1,
@@ -4286,13 +4351,18 @@ func TestAdjustPoolsAndIsolatedEntriesUsesEligibleDefaultShareUpperBound(t *test
 	require.True(t, reclaim.Equals(reclaimSeed), "reclaim=%s want=%s", reclaim, reclaimSeed)
 	requireCoreAligned(t, topology, reclaim)
 
-	// the default share pool entry is the backfilled residual = candidate - reclaim.
-	wantShare := topology.CPUDetails.CPUs().Difference(reclaimSeed)
+	// the default share pool entry is the backfilled residual = candidate - reclaim - DNB.
+	wantShare := topology.CPUDetails.CPUs().Difference(reclaimSeed).Difference(dnbCPUSet)
 	share, err := updatedEntries.GetCPUSetForPool(commonstate.PoolNameShare)
 	require.NoError(t, err)
 	require.True(t, share.Equals(wantShare),
 		"share=%s want=%s", share, wantShare)
+	require.True(t, share.Intersection(dnbCPUSet).IsEmpty())
 	requireCoreAligned(t, topology, share)
+
+	dnb := updatedEntries["dedicated-pod"]["main"]
+	require.NotNil(t, dnb)
+	require.True(t, dnb.AllocationResult.Equals(dnbCPUSet))
 
 	// the owning shared_cores container inherits the backfilled share cpuset.
 	owner := updatedEntries["share-pod"]["container"]

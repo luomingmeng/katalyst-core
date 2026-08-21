@@ -1944,7 +1944,7 @@ func (p *DynamicPolicy) applyBlocks(
 		defaultSharePlan.eligibleCPUSet = p.buildDefaultShareEligibleCPUSet(
 			newEntries, currentMachineState, rampUpReclaimFloor)
 		if err := p.finalizeDefaultShareEntry(
-			newEntries, defaultSharePlan.advisedQuantity, defaultSharePlan.eligibleCPUSet,
+			newEntries, newEntries, defaultSharePlan.advisedQuantity, defaultSharePlan.eligibleCPUSet,
 		); err != nil {
 			return nil, err
 		}

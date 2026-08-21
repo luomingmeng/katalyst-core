@@ -2057,23 +2057,23 @@ func unionIsolatedCPUSet(isolated map[string]map[string]machine.CPUSet) machine.
 	return result
 }
 
-func isolatedCPUSetFromPodEntries(entries state.PodEntries) map[string]map[string]machine.CPUSet {
-	isolated := make(map[string]map[string]machine.CPUSet)
+func dedicatedCPUSetFromPodEntries(entries state.PodEntries) map[string]map[string]machine.CPUSet {
+	dedicated := make(map[string]map[string]machine.CPUSet)
 	for podUID, containers := range entries {
 		if containers.IsPoolEntry() {
 			continue
 		}
 		for containerName, allocationInfo := range containers {
-			if allocationInfo == nil || allocationInfo.CheckDedicatedNUMABinding() || !allocationInfo.CheckDedicated() {
+			if allocationInfo == nil || !allocationInfo.CheckDedicated() {
 				continue
 			}
-			if isolated[podUID] == nil {
-				isolated[podUID] = make(map[string]machine.CPUSet)
+			if dedicated[podUID] == nil {
+				dedicated[podUID] = make(map[string]machine.CPUSet)
 			}
-			isolated[podUID][containerName] = allocationInfo.AllocationResult.Clone()
+			dedicated[podUID][containerName] = allocationInfo.AllocationResult.Clone()
 		}
 	}
-	return isolated
+	return dedicated
 }
 
 // materializeDefaultShareCPUSet computes the residual cpuset for the default
@@ -2135,6 +2135,7 @@ func materializeDefaultShareCPUSet(expectedQuantity int, availableCPUs machine.C
 // quantity, the computed residual still replaces the old default share entry.
 func (p *DynamicPolicy) finalizeDefaultShareEntry(
 	newPodEntries state.PodEntries,
+	ownershipEntries state.PodEntries,
 	expectedQuantity int, candidate machine.CPUSet,
 ) error {
 	finalPools := make(map[string]machine.CPUSet)
@@ -2145,7 +2146,7 @@ func (p *DynamicPolicy) finalizeDefaultShareEntry(
 		finalPools[poolName] = entries[commonstate.FakedContainerName].AllocationResult
 	}
 	share, err := materializeDefaultShareCPUSet(
-		expectedQuantity, candidate, finalPools, isolatedCPUSetFromPodEntries(newPodEntries))
+		expectedQuantity, candidate, finalPools, dedicatedCPUSetFromPodEntries(ownershipEntries))
 	if err != nil {
 		return err
 	}
@@ -2308,7 +2309,7 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 			defaultSharePlan.advisedQuantity = defaultSharePlan.eligibleCPUSet.Size()
 		}
 		if err := p.finalizeDefaultShareEntry(
-			newPodEntries, defaultSharePlan.advisedQuantity, defaultSharePlan.eligibleCPUSet,
+			newPodEntries, eligibilityEntries, defaultSharePlan.advisedQuantity, defaultSharePlan.eligibleCPUSet,
 		); err != nil {
 			return err
 		}

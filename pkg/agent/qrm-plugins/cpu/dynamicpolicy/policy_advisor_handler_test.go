@@ -805,6 +805,89 @@ func TestDynamicPolicyApplyBlocksMaterializesDefaultShareFromResidual(t *testing
 		"actual residual may be smaller than advisor quantity and must replace the block cpuset, got %s", share)
 }
 
+func TestDynamicPolicyApplyBlocksExcludesDNBFromDefaultShareResidual(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	policy.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+
+	dnbCPUSet := machine.NewCPUSet(2, 6)
+	policy.state.SetPodEntries(state.PodEntries{
+		"dedicated-pod": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "dedicated-pod",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameDedicated,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+					Annotations: map[string]string{
+						apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+					},
+				},
+				AllocationResult: dnbCPUSet.Clone(),
+				RequestQuantity:  float64(dnbCPUSet.Size()),
+			},
+		},
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(0, 4),
+			},
+		},
+	}, false)
+
+	resp := &advisorapi.ListAndWatchResponse{
+		Entries: map[string]*advisorapi.CalculationEntries{
+			"dedicated-pod": {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					"main": {
+						OwnerPoolName: commonstate.PoolNameDedicated,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							0: {Blocks: []*advisorapi.Block{{BlockId: "dedicated", Result: 2}}},
+						},
+					},
+				},
+			},
+			commonstate.PoolNameShare: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameShare,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "share", Result: 8}},
+							},
+						},
+					},
+				},
+			},
+			commonstate.PoolNameReclaim: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameReclaim,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "reclaim", Result: 2}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	pending, err := policy.applyBlocks(advisorapi.BlockCPUSet{
+		"dedicated": dnbCPUSet.Clone(),
+		"reclaim":   machine.NewCPUSet(0, 4),
+	}, resp, false)
+	require.NoError(t, err)
+	shareCPUSet := pending.entries[commonstate.PoolNameShare][commonstate.FakedContainerName].AllocationResult
+	require.True(t, shareCPUSet.Equals(machine.NewCPUSet(3, 5, 7)))
+	require.True(t, shareCPUSet.Intersection(dnbCPUSet).IsEmpty())
+}
+
 func TestDynamicPolicyValidatesDefaultShareAsUpperBoundWhenBackfillEnabled(t *testing.T) {
 	t.Parallel()
 
