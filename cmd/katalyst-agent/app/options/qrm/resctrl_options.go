@@ -30,6 +30,7 @@ import (
 
 type ResctrlOptions struct {
 	EnableResctrlHint                     bool
+	DisableRDT                            bool
 	EnableResctrlGroupLifecycleManagement bool
 	CPUSetPoolToSharedSubgroup            map[string]int
 	EnabledQoS                            []string
@@ -53,6 +54,8 @@ func (o *ResctrlOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 
 	fs.BoolVar(&o.EnableResctrlHint, "pod-admit-resctrl-layout-hint",
 		o.EnableResctrlHint, "if set true, we will enable resctrl hint on pod admission")
+	fs.BoolVar(&o.DisableRDT, "disable-rdt",
+		o.DisableRDT, "if set true, we will disable RDT CLOS injection and lifecycle")
 	fs.BoolVar(&o.EnableResctrlGroupLifecycleManagement, "enable-resctrl-group-lifecycle-management",
 		o.EnableResctrlGroupLifecycleManagement, "deprecated no-op kept for compatibility; resctrl CLOS lifecycle is controlled by dynamic RDTConfig.DisableRDT")
 	fs.StringToIntVar(&o.CPUSetPoolToSharedSubgroup, "resctrl-cpuset-pool-to-shared-subgroup",
@@ -87,6 +90,7 @@ func (o *ResctrlOptions) ApplyTo(conf *qrmconfigresctrl.ResctrlConfig) error {
 		}
 	}
 	conf.EnableResctrlHint = o.EnableResctrlHint
+	conf.DisableRDT = o.DisableRDT
 	conf.EnableResctrlGroupLifecycleManagement = o.EnableResctrlGroupLifecycleManagement
 	conf.CPUSetPoolToSharedSubgroup = o.CPUSetPoolToSharedSubgroup
 	conf.EnabledQoS = o.EnabledQoS

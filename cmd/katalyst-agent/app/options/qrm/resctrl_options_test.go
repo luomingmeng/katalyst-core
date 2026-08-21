@@ -64,3 +64,16 @@ func TestResctrlOptionsDoesNotRegisterRemovedDefaultSharedSubgroupFlag(t *testin
 
 	require.Nil(t, fss.FlagSet("resctrl").Lookup("resctrl-default-shared-subgroup"))
 }
+
+func TestResctrlOptionsSupportsDisableRDTFlag(t *testing.T) {
+	options := NewResctrlOptions()
+
+	fss := cliflag.NamedFlagSets{}
+	options.AddFlags(&fss)
+	require.NotNil(t, fss.FlagSet("resctrl").Lookup("disable-rdt"))
+	require.NoError(t, fss.FlagSet("resctrl").Parse([]string{"--disable-rdt=true"}))
+
+	conf := qrmresctrl.NewResctrlConfig()
+	require.NoError(t, options.ApplyTo(conf))
+	require.True(t, conf.DisableRDT)
+}

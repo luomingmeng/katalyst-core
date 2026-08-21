@@ -21,6 +21,8 @@ import "k8s.io/apimachinery/pkg/util/sets"
 type ResctrlConfig struct {
 	// EnableResctrlHint is the flag that enable/disable resctrl option related pod admission.
 	EnableResctrlHint bool
+	// DisableRDT disables RDT CLOS injection and lifecycle from startup config.
+	DisableRDT bool
 	// EnableResctrlGroupLifecycleManagement is deprecated and kept only for CLI compatibility.
 	// Resctrl CLOS lifecycle is controlled by dynamic RDTConfig.DisableRDT.
 	EnableResctrlGroupLifecycleManagement bool

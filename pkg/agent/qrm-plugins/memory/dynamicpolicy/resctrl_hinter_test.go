@@ -33,6 +33,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/memory/dynamicpolicy/resctrl"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/memory/dynamicpolicy/state"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	qrmresctrl "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/resctrl"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
@@ -101,8 +102,74 @@ func TestResctrlHinterDisableRDTSynchronouslyGatesHintAndAllocate(t *testing.T) 
 			ResourceAllocation: map[string]*pluginapi.ResourceAllocationInfo{},
 		}
 		hinter.hintResourceAllocation(meta, allocation, allocate)
-		require.Empty(t, allocation.ResourceAllocation)
+		require.Equal(t, &pluginapi.ResourceAllocation{
+			ResourceAllocation: map[string]*pluginapi.ResourceAllocationInfo{
+				string(v1.ResourceMemory): {
+					Annotations: map[string]string{
+						util.AnnotationRdtClosID: "",
+					},
+				},
+			},
+		}, allocation)
 	}
+	require.Zero(t, manager.createCalls)
+}
+
+func TestResctrlHinterEnableResctrlHintTakesPrecedenceOverDisableRDT(t *testing.T) {
+	dynamicConf := dynamicconfig.NewDynamicAgentConfiguration()
+	dynamicConf.GetDynamicConfiguration().RDTConfig.DisableRDT = true
+	manager := &mockResctrlManager{}
+	hinter := &resctrlHinter{
+		config: &qrmresctrl.ResctrlConfig{
+			EnableResctrlHint: false,
+			EnabledQoS:        []string{apiconsts.PodAnnotationQoSLevelSharedCores},
+		},
+		enabledQoS:           sets.NewString(apiconsts.PodAnnotationQoSLevelSharedCores),
+		closidEnablingGroups: sets.NewString(),
+		monGroupsMaxCount:    atomic.NewInt64(0),
+		dynamicConf:          dynamicConf,
+		manager:              manager,
+	}
+	allocation := &pluginapi.ResourceAllocation{
+		ResourceAllocation: map[string]*pluginapi.ResourceAllocationInfo{},
+	}
+
+	hinter.HintResourceAllocation(commonstate.AllocationMeta{
+		PodUid:        "pod-a",
+		OwnerPoolName: "share",
+		QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+	}, allocation)
+
+	require.Empty(t, allocation.ResourceAllocation)
+	require.Zero(t, manager.createCalls)
+}
+
+func TestResctrlHinterDisableRDTKeepsEnabledQoSBoundary(t *testing.T) {
+	dynamicConf := dynamicconfig.NewDynamicAgentConfiguration()
+	dynamicConf.GetDynamicConfiguration().RDTConfig.DisableRDT = true
+	manager := &mockResctrlManager{}
+	hinter := &resctrlHinter{
+		config: &qrmresctrl.ResctrlConfig{
+			EnableResctrlHint: true,
+			EnabledQoS:        []string{apiconsts.PodAnnotationQoSLevelSharedCores},
+		},
+		enabledQoS:           sets.NewString(apiconsts.PodAnnotationQoSLevelSharedCores),
+		closidEnablingGroups: sets.NewString(),
+		monGroupsMaxCount:    atomic.NewInt64(0),
+		dynamicConf:          dynamicConf,
+		manager:              manager,
+	}
+	allocation := &pluginapi.ResourceAllocation{
+		ResourceAllocation: map[string]*pluginapi.ResourceAllocationInfo{},
+	}
+
+	hinter.HintResourceAllocation(commonstate.AllocationMeta{
+		PodUid:        "pod-a",
+		OwnerPoolName: "dedicated",
+		QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+	}, allocation)
+
+	require.Empty(t, allocation.ResourceAllocation)
 	require.Zero(t, manager.createCalls)
 }
 

@@ -90,7 +90,15 @@ func isPodLevelSubgroupDisabled(group string, enablingGroups sets.String) bool {
 }
 
 func (r *resctrlHinter) hintResourceAllocation(podMeta commonstate.AllocationMeta, resourceAllocation *pluginapi.ResourceAllocation, isAllocate bool) {
-	if r.config == nil || resourceAllocation == nil || !r.config.EnableResctrlHint || r.isRDTDisabled() {
+	if r.config == nil || resourceAllocation == nil || !r.config.EnableResctrlHint {
+		return
+	}
+	if r.isRDTDisabled() {
+		// An empty CLOS ID is an explicit suppression signal for kubelet-side
+		// default CLOS fallback.
+		if r.enabledQoS.Has(podMeta.QoSLevel) {
+			injectRespAnnotation(resourceAllocation, util.AnnotationRdtClosID, "")
+		}
 		return
 	}
 
