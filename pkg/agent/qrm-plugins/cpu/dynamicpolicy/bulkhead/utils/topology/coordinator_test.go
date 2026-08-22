@@ -463,7 +463,7 @@ func TestTopologyCoordinatorReplansStalePublishWithinInvocation(t *testing.T) {
 			if publishCalls == 1 {
 				return &PlanStaleError{
 					Rel:       "primary/container",
-					Direction: WriteDirection("publish"),
+					Direction: WritePublish,
 					Resource:  "container_cpuset",
 					Current:   "0",
 					Target:    "1",
@@ -493,7 +493,7 @@ func TestTopologyCoordinatorReplansStalePublishWithinInvocation(t *testing.T) {
 func TestTopologyCoordinatorPrioritizesStalePlanOverBudget(t *testing.T) {
 	stale := &PlanStaleError{
 		Rel:       "kubepods/stale",
-		Direction: WriteDirection("shrink"),
+		Direction: WriteShrink,
 		Resource:  "snapshot",
 		Current:   "missing",
 		Target:    "0-1",

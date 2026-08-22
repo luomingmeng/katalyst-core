@@ -462,7 +462,7 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 			publishExpected := mergeCPUSetMaps(in.ExpectedCPUSetByRel, in.DeferredCPUSetByRel)
 			if !publishRelevantSnapshotsEqual(in.DAG, publishExpected, snapshot, fresh) {
 				staleErr := &PlanStaleError{
-					Rel: "controlled", Direction: WriteDirection("publish"), Resource: "final_snapshot",
+					Rel: "controlled", Direction: WritePublish, Resource: "final_snapshot",
 					Current: snapshotLogicalState(fresh), Target: snapshotLogicalState(snapshot),
 					Err: fmt.Errorf("fresh publish-relevant snapshot state differs from convergence snapshot"),
 				}
@@ -498,7 +498,7 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 				!freshEvaluation.Report.FullyConverged
 			if !freshEvaluation.Report.FullyConverged && !parentSafeDeferred {
 				staleErr := &PlanStaleError{
-					Rel: "controlled", Direction: WriteDirection("publish"), Resource: "fresh_convergence_proof",
+					Rel: "controlled", Direction: WritePublish, Resource: "fresh_convergence_proof",
 					Current: snapshotLogicalState(fresh), Target: snapshotLogicalState(snapshot),
 					Err: fmt.Errorf("fresh snapshot no longer satisfies the convergence objective"),
 				}

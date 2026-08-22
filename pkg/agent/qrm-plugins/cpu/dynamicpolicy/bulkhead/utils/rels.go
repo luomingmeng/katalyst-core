@@ -18,12 +18,15 @@ package utils
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	bulkheadconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/bulkhead"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
+	metapod "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
 	cgcommon "github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 )
@@ -34,6 +37,18 @@ const (
 	ContainerRelPathResolveStageContainerID ContainerRelPathResolveStage = "container_id"
 	ContainerRelPathResolveStageCgroupPath  ContainerRelPathResolveStage = "cgroup_path"
 )
+
+// ErrContainerIdentityChanged indicates that the container was recreated while
+// its cgroup path was being resolved.
+var ErrContainerIdentityChanged = errors.New("container identity changed")
+var ErrContainerNotRunning = errors.New("container not running")
+
+type containerIdentityRefreshScopeKey struct{}
+
+type containerIdentityRefreshState struct {
+	once sync.Once
+	err  error
+}
 
 type ContainerRelPathResolveError struct {
 	Stage ContainerRelPathResolveStage
@@ -58,6 +73,103 @@ func ResolveContainerRelPath(metaServer *metaserver.MetaServer, podUID, containe
 	return ResolveContainerRelPathWithContext(context.Background(), metaServer, podUID, containerName)
 }
 
+func getContainerIdentityFetcher(metaServer *metaserver.MetaServer) (metapod.ContainerIdentityFetcher, error) {
+	if metaServer == nil || metaServer.MetaAgent == nil || metaServer.PodFetcher == nil {
+		return nil, fmt.Errorf("nil pod fetcher")
+	}
+	fetcher, ok := metaServer.PodFetcher.(metapod.ContainerIdentityFetcher)
+	if !ok {
+		return nil, fmt.Errorf("pod fetcher does not support container identity operations")
+	}
+	return fetcher, nil
+}
+
+func getContainerIDWithContext(
+	ctx context.Context,
+	metaServer *metaserver.MetaServer,
+	podUID, containerName string,
+) (string, error) {
+	fetcher, err := getContainerIdentityFetcher(metaServer)
+	if err != nil {
+		return "", err
+	}
+	return fetcher.GetContainerIDWithContext(ctx, podUID, containerName)
+}
+
+// WithContainerIdentityRefreshScope limits identity-cache refreshes to one
+// attempt for all container resolutions sharing the returned context.
+func WithContainerIdentityRefreshScope(ctx context.Context) context.Context {
+	if _, ok := ctx.Value(containerIdentityRefreshScopeKey{}).(*containerIdentityRefreshState); ok {
+		return ctx
+	}
+	return context.WithValue(ctx, containerIdentityRefreshScopeKey{}, &containerIdentityRefreshState{})
+}
+
+func refreshContainerIdentityCache(ctx context.Context, metaServer *metaserver.MetaServer) error {
+	fetcher, err := getContainerIdentityFetcher(metaServer)
+	if err != nil {
+		return err
+	}
+	return fetcher.RefreshKubeletPodCache(ctx)
+}
+
+// RefreshContainerIdentityCache refreshes the container identity source. When
+// called with a refresh-scoped context, all callers observe the same result.
+func RefreshContainerIdentityCache(ctx context.Context, metaServer *metaserver.MetaServer) error {
+	if state, ok := ctx.Value(containerIdentityRefreshScopeKey{}).(*containerIdentityRefreshState); ok {
+		state.once.Do(func() {
+			state.err = refreshContainerIdentityCache(ctx, metaServer)
+		})
+		return state.err
+	}
+	return refreshContainerIdentityCache(ctx, metaServer)
+}
+
+func getFreshContainerIDWithContext(
+	ctx context.Context,
+	metaServer *metaserver.MetaServer,
+	podUID, containerName string,
+) (string, error) {
+	if err := RefreshContainerIdentityCache(ctx, metaServer); err != nil {
+		return "", err
+	}
+	return getContainerIDWithContext(ctx, metaServer, podUID, containerName)
+}
+
+func ensureContainerRunning(
+	ctx context.Context,
+	metaServer *metaserver.MetaServer,
+	podUID, containerName, containerID string,
+) error {
+	pod, err := metaServer.GetPod(ctx, podUID)
+	if err != nil {
+		return fmt.Errorf("get refreshed pod status: %w", err)
+	}
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.Name != containerName {
+			continue
+		}
+		if status.State.Running == nil {
+			return fmt.Errorf("%w: pod=%s container=%s", ErrContainerNotRunning, podUID, containerName)
+		}
+		fetcher, err := getContainerIdentityFetcher(metaServer)
+		if err != nil {
+			return err
+		}
+		running, err := fetcher.IsContainerRunningInRuntime(
+			ctx, podUID, containerName, containerID,
+		)
+		if err != nil {
+			return fmt.Errorf("verify runtime container state: %w", err)
+		}
+		if !running {
+			return fmt.Errorf("%w: pod=%s container=%s", ErrContainerNotRunning, podUID, containerName)
+		}
+		return nil
+	}
+	return fmt.Errorf("%w: pod=%s container=%s", metapod.ErrContainerNotFound, podUID, containerName)
+}
+
 func ResolveContainerRelPathWithContext(
 	ctx context.Context,
 	metaServer *metaserver.MetaServer,
@@ -70,22 +182,32 @@ func ResolveContainerRelPathWithContext(
 		return "", fmt.Errorf("nil pod fetcher")
 	}
 
-	var (
-		containerID string
-		err         error
-	)
-	if fetcher, ok := metaServer.PodFetcher.(interface {
-		GetContainerIDWithContext(context.Context, string, string) (string, error)
-	}); ok {
-		containerID, err = fetcher.GetContainerIDWithContext(ctx, podUID, containerName)
-	} else {
-		containerID, err = metaServer.GetContainerID(podUID, containerName)
-	}
+	containerID, err := getContainerIDWithContext(ctx, metaServer, podUID, containerName)
 	if err != nil {
 		return "", &ContainerRelPathResolveError{Stage: ContainerRelPathResolveStageContainerID, Err: err}
 	}
 	rel, err := cgcommon.GetContainerRelativeCgroupPath(podUID, containerID)
 	if err != nil {
+		currentContainerID, confirmErr := getFreshContainerIDWithContext(ctx, metaServer, podUID, containerName)
+		if confirmErr != nil {
+			return "", &ContainerRelPathResolveError{
+				Stage: ContainerRelPathResolveStageContainerID,
+				Err:   fmt.Errorf("confirm container identity after cgroup path failure: %w", confirmErr),
+			}
+		}
+		if currentContainerID != containerID {
+			return "", &ContainerRelPathResolveError{
+				Stage: ContainerRelPathResolveStageCgroupPath,
+				Err: fmt.Errorf("%w: previous=%s current=%s",
+					ErrContainerIdentityChanged, containerID, currentContainerID),
+			}
+		}
+		if runningErr := ensureContainerRunning(ctx, metaServer, podUID, containerName, currentContainerID); runningErr != nil {
+			return "", &ContainerRelPathResolveError{
+				Stage: ContainerRelPathResolveStageContainerID,
+				Err:   runningErr,
+			}
+		}
 		return "", &ContainerRelPathResolveError{Stage: ContainerRelPathResolveStageCgroupPath, Err: err}
 	}
 	return strings.Trim(rel, "/"), nil

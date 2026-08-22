@@ -2424,6 +2424,63 @@ type admissionContextContainerIDFetcher struct {
 	calls     int
 }
 
+type rotatingContainerIDFetcher struct {
+	metapod.PodFetcherStub
+	containerIDs []string
+	calls        int
+}
+
+type disappearingContainerIDFetcher struct {
+	metapod.PodFetcherStub
+	containerID string
+	calls       int
+}
+
+type bypassAwareContainerIDFetcher struct {
+	metapod.PodFetcherStub
+	cachedID   string
+	currentID  string
+	calls      int
+	refreshed  bool
+	refreshErr error
+}
+
+func (f *bypassAwareContainerIDFetcher) GetContainerIDWithContext(
+	ctx context.Context, _, _ string,
+) (string, error) {
+	f.calls++
+	if f.refreshed || ctx.Value(metapod.BypassCacheKey) == metapod.BypassCacheTrue {
+		return f.currentID, nil
+	}
+	return f.cachedID, nil
+}
+
+func (f *bypassAwareContainerIDFetcher) RefreshKubeletPodCache(context.Context) error {
+	if f.refreshErr != nil {
+		return f.refreshErr
+	}
+	f.refreshed = true
+	return nil
+}
+
+func (f *disappearingContainerIDFetcher) GetContainerIDWithContext(
+	context.Context, string, string,
+) (string, error) {
+	f.calls++
+	if f.calls == 1 {
+		return f.containerID, nil
+	}
+	return "", metapod.ErrContainerNotFound
+}
+
+func (f *rotatingContainerIDFetcher) GetContainerIDWithContext(
+	context.Context, string, string,
+) (string, error) {
+	containerID := f.containerIDs[f.calls]
+	f.calls++
+	return containerID, nil
+}
+
 func (f *admissionContextContainerIDFetcher) GetContainerIDWithContext(
 	ctx context.Context, _, _ string,
 ) (string, error) {
@@ -2502,6 +2559,240 @@ func TestCPUSetTopologyExpectedBuildAndFinalPublishUseAdmissionContext(t *testin
 	}
 }
 
+func TestFinalSnapshotRejectsContainerIdentityChangeAsStale(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID        = "pod-final-snapshot-identity-change"
+		containerName = "main"
+		oldContainer  = "container-final-old"
+		newContainer  = "container-final-new"
+		oldRel        = "primary/container-old"
+		newRel        = "primary/container-new"
+	)
+	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+		Name: "final-snapshot-identity-change",
+		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
+			if gotPodUID != podUID {
+				return "", true, nil
+			}
+			switch gotContainerID {
+			case oldContainer:
+				return oldRel, false, nil
+			case newContainer:
+				return newRel, false, nil
+			}
+			return "", true, nil
+		},
+	})
+	fetcher := &bypassAwareContainerIDFetcher{
+		cachedID:  oldContainer,
+		currentID: newContainer,
+	}
+	metaServer := &metaserver.MetaServer{
+		MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
+	}
+	desired := model.NewDesiredView()
+	desired.ContainerCPUSetByPod[podUID] = map[string]machine.CPUSet{
+		containerName: machine.NewCPUSet(0, 1),
+	}
+
+	_, err := containerCPUSetByPodFromFinalSnapshotWithContext(
+		context.Background(),
+		metaServer,
+		desired,
+		&topology.CompleteSnapshot{Entries: map[string]topology.EntryState{
+			oldRel: {Identity: topology.CgroupIdentity{Inode: 1}, CPUs: machine.NewCPUSet(0, 1)},
+		}},
+		nil,
+	)
+	var staleErr *topology.PlanStaleError
+	if !errors.As(err, &staleErr) {
+		t.Fatalf("final snapshot identity change error = %v, want PlanStaleError", err)
+	}
+	if staleErr.Rel != newRel {
+		t.Fatalf("stale rel = %q, want current container rel %q", staleErr.Rel, newRel)
+	}
+}
+
+func TestFinalSnapshotAcceptsCurrentContainerProofAfterIdentityRefresh(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID        = "pod-final-snapshot-current-proof"
+		containerName = "main"
+		oldContainer  = "container-proof-old"
+		newContainer  = "container-proof-new"
+		newRel        = "primary/container-proof-new"
+	)
+	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+		Name: "final-snapshot-current-proof",
+		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
+			if gotPodUID == podUID && gotContainerID == newContainer {
+				return newRel, false, nil
+			}
+			return "", true, nil
+		},
+	})
+	fetcher := &bypassAwareContainerIDFetcher{
+		cachedID:  oldContainer,
+		currentID: newContainer,
+	}
+	metaServer := &metaserver.MetaServer{
+		MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
+	}
+	desired := model.NewDesiredView()
+	desired.ContainerCPUSetByPod[podUID] = map[string]machine.CPUSet{
+		containerName: machine.NewCPUSet(0, 1),
+	}
+
+	published, err := containerCPUSetByPodFromFinalSnapshotWithContext(
+		context.Background(),
+		metaServer,
+		desired,
+		&topology.CompleteSnapshot{Entries: map[string]topology.EntryState{
+			newRel: {Identity: topology.CgroupIdentity{Inode: 2}, CPUs: machine.NewCPUSet(0, 1)},
+		}},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("current container proof must be publishable: %v", err)
+	}
+	if got := published[podUID][containerName]; !got.Equals(machine.NewCPUSet(0, 1)) {
+		t.Fatalf("published current container cpuset = %s, want 0-1", got.String())
+	}
+}
+
+func TestFinalSnapshotFailsClosedWhenIdentityRefreshFails(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID        = "pod-final-snapshot-refresh-failed"
+		containerName = "main"
+	)
+	refreshErr := errors.New("kubelet refresh failed")
+	fetcher := &bypassAwareContainerIDFetcher{
+		cachedID:   "container-old",
+		currentID:  "container-new",
+		refreshErr: refreshErr,
+	}
+	metaServer := &metaserver.MetaServer{
+		MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
+	}
+	desired := model.NewDesiredView()
+	desired.ContainerCPUSetByPod[podUID] = map[string]machine.CPUSet{
+		containerName: machine.NewCPUSet(0, 1),
+	}
+
+	_, err := containerCPUSetByPodFromFinalSnapshotWithContext(
+		context.Background(),
+		metaServer,
+		desired,
+		&topology.CompleteSnapshot{Entries: map[string]topology.EntryState{}},
+		nil,
+	)
+	if !errors.Is(err, refreshErr) {
+		t.Fatalf("final snapshot refresh error = %v, want %v", err, refreshErr)
+	}
+}
+
+func TestCPUSetTopologyPluginTreatsRotatedContainerIdentityAsPending(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID        = "pod-rotated-container"
+		containerName = "main"
+		oldContainer  = "container-old"
+		newContainer  = "container-new"
+	)
+	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+		Name: "rotated-container-identity",
+		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
+			if gotPodUID == podUID && gotContainerID == oldContainer {
+				return "", false, os.ErrNotExist
+			}
+			return "", true, nil
+		},
+	})
+	fetcher := &rotatingContainerIDFetcher{containerIDs: []string{oldContainer, newContainer}}
+	metaServer := &metaserver.MetaServer{
+		MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
+	}
+	view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+			podUID: {containerName: machine.NewCPUSet(0, 1)},
+		},
+	}}
+
+	res, err := (&CPUSetTopologyPlugin{}).buildExpectedCPUSetByRel(
+		context.Background(),
+		bulkheadapi.HandlerContext{
+			CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{MetaServer: metaServer},
+			DesiredView:                view,
+		},
+	)
+	if err != nil {
+		t.Fatalf("rotated container identity must be protected as pending, got %v", err)
+	}
+	if len(res.ExpectedByRel) != 0 {
+		t.Fatalf("expected no resolved leaves, got %#v", res.ExpectedByRel)
+	}
+	if len(res.PendingByPod) != 1 {
+		t.Fatalf("expected one protected-pending entry, got %#v", res.PendingByPod)
+	}
+	if fetcher.calls != 2 {
+		t.Fatalf("container ID lookup calls = %d, want 2", fetcher.calls)
+	}
+}
+
+func TestCPUSetTopologyPluginTreatsDisappearedContainerAsPending(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID        = "pod-disappeared-container"
+		containerName = "main"
+		containerID   = "container-disappeared"
+	)
+	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+		Name: "disappeared-container",
+		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
+			if gotPodUID == podUID && gotContainerID == containerID {
+				return "", false, os.ErrNotExist
+			}
+			return "", true, nil
+		},
+	})
+	fetcher := &disappearingContainerIDFetcher{containerID: containerID}
+	metaServer := &metaserver.MetaServer{
+		MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
+	}
+	view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+			podUID: {containerName: machine.NewCPUSet(0, 1)},
+		},
+	}}
+
+	res, err := (&CPUSetTopologyPlugin{}).buildExpectedCPUSetByRel(
+		context.Background(),
+		bulkheadapi.HandlerContext{
+			CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{MetaServer: metaServer},
+			DesiredView:                view,
+		},
+	)
+	if err != nil {
+		t.Fatalf("disappeared container must be protected as pending, got %v", err)
+	}
+	if len(res.ExpectedByRel) != 0 {
+		t.Fatalf("expected no resolved leaves, got %#v", res.ExpectedByRel)
+	}
+	if len(res.PendingByPod) != 1 {
+		t.Fatalf("expected one protected-pending entry, got %#v", res.PendingByPod)
+	}
+	if fetcher.calls != 2 {
+		t.Fatalf("container ID lookup calls = %d, want 2", fetcher.calls)
+	}
+}
+
 func TestCPUSetTopologyPluginSkipsExpectedCPUSetForMissingContainer(t *testing.T) {
 	t.Parallel()
 
@@ -2575,6 +2866,7 @@ func TestCPUSetTopologyPluginFailsExpectedCPUSetForUnresolvedContainerRel(t *tes
 				Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
 					Name:        "main",
 					ContainerID: "invalid-container-id",
+					State:       v1.ContainerState{Running: &v1.ContainerStateRunning{}},
 				}}},
 			}}},
 		},

@@ -573,6 +573,10 @@ func containerCPUSetByPodFromFinalSnapshotWithDeferredCleanup(
 	if metaServer == nil {
 		return nil, fmt.Errorf("meta server is required to prove container leaves from final snapshot")
 	}
+	ctx = bulkheadutils.WithContainerIdentityRefreshScope(ctx)
+	if err := bulkheadutils.RefreshContainerIdentityCache(ctx, metaServer); err != nil {
+		return nil, fmt.Errorf("refresh container identity cache before publishing final snapshot: %w", err)
+	}
 	for podUID, containers := range desired.ContainerCPUSetByPod {
 		for containerName, desiredCPUs := range containers {
 			if desiredCPUs.IsEmpty() {
@@ -580,7 +584,17 @@ func containerCPUSetByPodFromFinalSnapshotWithDeferredCleanup(
 			}
 			rel, err := bulkheadutils.ResolveContainerRelPathWithContext(ctx, metaServer, podUID, containerName)
 			if err != nil {
-				if isContainerNotCreatedErr(err) {
+				if errors.Is(err, bulkheadutils.ErrContainerIdentityChanged) {
+					return nil, &topology.PlanStaleError{
+						Direction: topology.WritePublish,
+						Resource:  "container_identity",
+						Current:   "<changed>",
+						Target:    "<stable>",
+						Err: fmt.Errorf("container identity changed while publishing final snapshot for pod=%q container=%q: %w",
+							podUID, containerName, err),
+					}
+				}
+				if isContainerAbsentErr(err) {
 					continue
 				}
 				return nil, fmt.Errorf("resolve final container leaf pod=%q container=%q: %w", podUID, containerName, err)
@@ -594,7 +608,7 @@ func containerCPUSetByPodFromFinalSnapshotWithDeferredCleanup(
 					expectedCPUSetByRel[rel] = desiredCPUs.Clone()
 				}
 				return nil, &topology.PlanStaleError{
-					Rel: rel, Direction: topology.WriteDirection("publish"),
+					Rel: rel, Direction: topology.WritePublish,
 					Resource: "container_cpuset", Current: "<missing>", Target: desiredCPUs.String(),
 					Err: fmt.Errorf("final snapshot misses container leaf for pod=%q container=%q", podUID, containerName),
 				}
@@ -619,7 +633,7 @@ func containerCPUSetByPodFromFinalSnapshotWithDeferredCleanup(
 					expectedCPUSetByRel[rel] = desiredCPUs.Clone()
 				}
 				return nil, &topology.PlanStaleError{
-					Rel: rel, Direction: topology.WriteDirection("publish"),
+					Rel: rel, Direction: topology.WritePublish,
 					Resource: "container_cpuset", Current: proof.String(), Target: desiredCPUs.String(),
 					Err: fmt.Errorf("final snapshot container leaf does not match desired for pod=%q container=%q",
 						podUID, containerName),
@@ -887,18 +901,27 @@ func (r *expectedCPUSetBuildResult) PendingCPUSetUnion() machine.CPUSet {
 	return out
 }
 
-// isContainerNotCreatedErr reports whether a ResolveContainerRelPath error means
-// the pod or container is absent during the normal admission creation window.
-// Cache synchronization, kubelet transport, and context errors must fail closed.
-func isContainerNotCreatedErr(err error) bool {
+// isContainerAbsentErr reports whether the pod or container has no active
+// runtime leaf during the normal admission creation or restart window.
+func isContainerAbsentErr(err error) bool {
 	return errors.Is(err, metapod.ErrPodNotFound) ||
-		errors.Is(err, metapod.ErrContainerNotFound)
+		errors.Is(err, metapod.ErrContainerNotFound) ||
+		errors.Is(err, bulkheadutils.ErrContainerNotRunning)
+}
+
+// isContainerPendingErr additionally treats a confirmed identity change as an
+// admission-safe transition. Cache synchronization, kubelet transport, and
+// context errors must fail closed.
+func isContainerPendingErr(err error) bool {
+	return isContainerAbsentErr(err) ||
+		errors.Is(err, bulkheadutils.ErrContainerIdentityChanged)
 }
 
 func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in bulkheadapi.HandlerContext) (*expectedCPUSetBuildResult, error) {
 	if in.MetaServer == nil || in.DesiredView == nil || len(in.DesiredView.ContainerCPUSetByPod) == 0 {
 		return &expectedCPUSetBuildResult{}, nil
 	}
+	ctx = bulkheadutils.WithContainerIdentityRefreshScope(ctx)
 	out := &expectedCPUSetBuildResult{
 		ExpectedByRel:     map[string]machine.CPUSet{},
 		DeferredLeafByRel: map[string]machine.CPUSet{},
@@ -921,7 +944,7 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in 
 			// silently degrade to inheriting the parent pool target.
 			rel, err := bulkheadutils.ResolveContainerRelPathWithContext(ctx, in.MetaServer, podUID, containerName)
 			if err != nil {
-				if isContainerNotCreatedErr(err) {
+				if isContainerPendingErr(err) {
 					// admit-safe pending: state has the allocation but the container
 					// cgroup does not exist yet. Do NOT fail (that would reject pod
 					// admit); record it so the writer keeps the parent a superset.

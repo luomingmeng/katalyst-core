@@ -22,18 +22,75 @@ import (
 	"os"
 	"testing"
 
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology"
 	bulkheadconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/bulkhead"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent"
 	metapod "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
+	cgcommon "github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
 type contextAwareContainerIDFetcher struct {
 	metapod.PodFetcherStub
 	observed context.Context
+}
+
+type containerIDResult struct {
+	id  string
+	err error
+}
+
+type sequenceContainerIDFetcher struct {
+	metapod.PodFetcherStub
+	results        []containerIDResult
+	calls          int
+	runtimeRunning bool
+	runtimeErr     error
+}
+
+type cacheAwareContainerIDFetcher struct {
+	metapod.PodFetcherStub
+	cachedID     string
+	currentID    string
+	calls        int
+	refreshed    bool
+	refreshCalls int
+}
+
+func (f *cacheAwareContainerIDFetcher) GetContainerIDWithContext(
+	ctx context.Context, _, _ string,
+) (string, error) {
+	f.calls++
+	if f.refreshed || ctx.Value(metapod.BypassCacheKey) == metapod.BypassCacheTrue {
+		return f.currentID, nil
+	}
+	return f.cachedID, nil
+}
+
+func (f *cacheAwareContainerIDFetcher) RefreshKubeletPodCache(context.Context) error {
+	f.refreshCalls++
+	f.refreshed = true
+	return nil
+}
+
+func (f *sequenceContainerIDFetcher) GetContainerIDWithContext(
+	context.Context, string, string,
+) (string, error) {
+	result := f.results[f.calls]
+	f.calls++
+	return result.id, result.err
+}
+
+func (f *sequenceContainerIDFetcher) IsContainerRunningInRuntime(
+	context.Context, string, string, string,
+) (bool, error) {
+	return f.runtimeRunning, f.runtimeErr
 }
 
 func (f *contextAwareContainerIDFetcher) GetContainerIDWithContext(
@@ -57,6 +114,248 @@ func TestResolveContainerRelPathWithContextPropagatesCancellation(t *testing.T) 
 	}
 	if fetcher.observed != ctx {
 		t.Fatal("ResolveContainerRelPathWithContext() did not pass the caller context to GetContainerIDWithContext")
+	}
+}
+
+func TestResolveContainerRelPathWithContextDetectsContainerIdentityChange(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID        = "pod-container-identity-change"
+		oldContainer  = "container-old"
+		newContainer  = "container-new"
+		containerName = "main"
+	)
+	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+		Name: "container-identity-change",
+		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
+			if gotPodUID == podUID && gotContainerID == oldContainer {
+				return "", false, os.ErrNotExist
+			}
+			return "", true, nil
+		},
+	})
+	fetcher := &cacheAwareContainerIDFetcher{
+		cachedID:  oldContainer,
+		currentID: newContainer,
+	}
+	metaServer := &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: fetcher}}
+
+	_, err := ResolveContainerRelPathWithContext(context.Background(), metaServer, podUID, containerName)
+	if !errors.Is(err, ErrContainerIdentityChanged) {
+		t.Fatalf("ResolveContainerRelPathWithContext() error = %v, want %v", err, ErrContainerIdentityChanged)
+	}
+	if fetcher.calls != 2 {
+		t.Fatalf("container ID lookup calls = %d, want 2", fetcher.calls)
+	}
+}
+
+func TestContainerIdentityRefreshScopeRefreshesOnlyOnce(t *testing.T) {
+	t.Parallel()
+
+	fetcher := &cacheAwareContainerIDFetcher{
+		cachedID:  "container-old",
+		currentID: "container-new",
+	}
+	metaServer := &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: fetcher}}
+	ctx := WithContainerIdentityRefreshScope(context.Background())
+
+	if err := RefreshContainerIdentityCache(ctx, metaServer); err != nil {
+		t.Fatalf("first RefreshContainerIdentityCache() error = %v", err)
+	}
+	if err := RefreshContainerIdentityCache(ctx, metaServer); err != nil {
+		t.Fatalf("second RefreshContainerIdentityCache() error = %v", err)
+	}
+	if fetcher.refreshCalls != 1 {
+		t.Fatalf("identity cache refresh calls = %d, want 1", fetcher.refreshCalls)
+	}
+}
+
+func TestResolveContainerRelPathWithContextFailsClosedForStableMissingCgroup(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID        = "pod-stable-missing-cgroup"
+		containerID   = "container-stable"
+		containerName = "main"
+	)
+	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+		Name: "stable-missing-cgroup",
+		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
+			if gotPodUID == podUID && gotContainerID == containerID {
+				return "", false, os.ErrNotExist
+			}
+			return "", true, nil
+		},
+	})
+	fetcher := &sequenceContainerIDFetcher{results: []containerIDResult{
+		{id: containerID},
+		{id: containerID},
+	}, runtimeRunning: true}
+	fetcher.PodList = []*v1.Pod{{
+		ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+		Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
+			Name:        containerName,
+			ContainerID: "containerd://" + containerID,
+			State:       v1.ContainerState{Running: &v1.ContainerStateRunning{}},
+		}}},
+	}}
+	metaServer := &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: fetcher}}
+
+	_, err := ResolveContainerRelPathWithContext(context.Background(), metaServer, podUID, containerName)
+	if err == nil {
+		t.Fatal("ResolveContainerRelPathWithContext() error = nil, want fail-closed cgroup path error")
+	}
+	if errors.Is(err, ErrContainerIdentityChanged) {
+		t.Fatalf("stable container identity was misclassified as changed: %v", err)
+	}
+	var resolveErr *ContainerRelPathResolveError
+	if !errors.As(err, &resolveErr) || resolveErr.Stage != ContainerRelPathResolveStageCgroupPath {
+		t.Fatalf("ResolveContainerRelPathWithContext() error = %v, want cgroup_path stage", err)
+	}
+	if fetcher.calls != 2 {
+		t.Fatalf("container ID lookup calls = %d, want 2", fetcher.calls)
+	}
+}
+
+func TestResolveContainerRelPathWithContextTreatsKubeletRunningRuntimeExitedAsNotRunning(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID        = "pod-runtime-exited-container"
+		containerID   = "container-runtime-exited"
+		containerName = "main"
+	)
+	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+		Name: "runtime-exited-container",
+		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
+			if gotPodUID == podUID && gotContainerID == containerID {
+				return "", false, os.ErrNotExist
+			}
+			return "", true, nil
+		},
+	})
+	fetcher := &sequenceContainerIDFetcher{results: []containerIDResult{
+		{id: containerID},
+		{id: containerID},
+	}}
+	fetcher.PodList = []*v1.Pod{{
+		ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+		Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
+			Name:        containerName,
+			ContainerID: "containerd://" + containerID,
+			State:       v1.ContainerState{Running: &v1.ContainerStateRunning{}},
+		}}},
+	}}
+	metaServer := &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: fetcher}}
+
+	_, err := ResolveContainerRelPathWithContext(context.Background(), metaServer, podUID, containerName)
+	if !errors.Is(err, ErrContainerNotRunning) {
+		t.Fatalf("ResolveContainerRelPathWithContext() error = %v, want %v", err, ErrContainerNotRunning)
+	}
+}
+
+func TestResolveContainerRelPathWithContextTreatsTerminatedContainerAsNotRunning(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID        = "pod-terminated-container"
+		containerID   = "container-terminated"
+		containerName = "main"
+	)
+	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+		Name: "terminated-container",
+		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
+			if gotPodUID == podUID && gotContainerID == containerID {
+				return "", false, os.ErrNotExist
+			}
+			return "", true, nil
+		},
+	})
+	fetcher := &sequenceContainerIDFetcher{results: []containerIDResult{
+		{id: containerID},
+		{id: containerID},
+	}}
+	fetcher.PodList = []*v1.Pod{{
+		ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+		Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
+			Name:        containerName,
+			ContainerID: "containerd://" + containerID,
+			State:       v1.ContainerState{Terminated: &v1.ContainerStateTerminated{}},
+		}}},
+	}}
+	metaServer := &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: fetcher}}
+
+	_, err := ResolveContainerRelPathWithContext(context.Background(), metaServer, podUID, containerName)
+	if !errors.Is(err, ErrContainerNotRunning) {
+		t.Fatalf("ResolveContainerRelPathWithContext() error = %v, want %v", err, ErrContainerNotRunning)
+	}
+}
+
+func TestResolveContainerRelPathWithContextDetectsContainerDisappearance(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID        = "pod-container-disappeared"
+		containerID   = "container-disappeared"
+		containerName = "main"
+	)
+	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+		Name: "container-disappeared",
+		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
+			if gotPodUID == podUID && gotContainerID == containerID {
+				return "", false, os.ErrNotExist
+			}
+			return "", true, nil
+		},
+	})
+	fetcher := &sequenceContainerIDFetcher{results: []containerIDResult{
+		{id: containerID},
+		{err: metapod.ErrContainerNotFound},
+	}}
+	metaServer := &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: fetcher}}
+
+	_, err := ResolveContainerRelPathWithContext(context.Background(), metaServer, podUID, containerName)
+	if !errors.Is(err, metapod.ErrContainerNotFound) {
+		t.Fatalf("ResolveContainerRelPathWithContext() error = %v, want %v", err, metapod.ErrContainerNotFound)
+	}
+	if fetcher.calls != 2 {
+		t.Fatalf("container ID lookup calls = %d, want 2", fetcher.calls)
+	}
+}
+
+func TestResolveContainerRelPathWithContextFailsClosedWhenIdentityConfirmationFails(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID        = "pod-identity-confirmation-failed"
+		containerID   = "container-confirmation-failed"
+		containerName = "main"
+	)
+	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+		Name: "identity-confirmation-failed",
+		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
+			if gotPodUID == podUID && gotContainerID == containerID {
+				return "", false, os.ErrNotExist
+			}
+			return "", true, nil
+		},
+	})
+	fetcher := &sequenceContainerIDFetcher{results: []containerIDResult{
+		{id: containerID},
+		{err: context.DeadlineExceeded},
+	}}
+	metaServer := &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: fetcher}}
+
+	_, err := ResolveContainerRelPathWithContext(context.Background(), metaServer, podUID, containerName)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ResolveContainerRelPathWithContext() error = %v, want %v", err, context.DeadlineExceeded)
+	}
+	if errors.Is(err, ErrContainerIdentityChanged) {
+		t.Fatalf("identity confirmation failure was misclassified as changed: %v", err)
+	}
+	if fetcher.calls != 2 {
+		t.Fatalf("container ID lookup calls = %d, want 2", fetcher.calls)
 	}
 }
 

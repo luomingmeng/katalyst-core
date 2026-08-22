@@ -86,8 +86,9 @@ const (
 type WriteDirection string
 
 const (
-	WriteShrink WriteDirection = "shrink"
-	WriteGrow   WriteDirection = "grow"
+	WriteShrink  WriteDirection = "shrink"
+	WriteGrow    WriteDirection = "grow"
+	WritePublish WriteDirection = "publish"
 )
 
 type CPUSetTarget struct {
@@ -1528,7 +1529,7 @@ func combinedWriteDirection(
 	cpuReplacement bool,
 ) (WriteDirection, WriteDirection, error) {
 	cpuDirection, _, _ := classifySetDirection(current.CPUs, target.CPUs)
-	memsDirection := WriteDirection("")
+	var memsDirection WriteDirection
 	if ownsMems && current.Mems != target.Mems {
 		currentMems, currentErr := machine.Parse(current.Mems)
 		targetMems, targetErr := machine.Parse(target.Mems)
