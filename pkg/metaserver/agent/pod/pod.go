@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -76,6 +77,15 @@ type PodFetcher interface {
 	GetPod(ctx context.Context, podUID string) (*v1.Pod, error)
 }
 
+type ContainerIdentityFetcher interface {
+	GetContainerIDWithContext(ctx context.Context, podUID, containerName string) (string, error)
+	RefreshKubeletPodCache(ctx context.Context) error
+	IsContainerRunningInRuntime(
+		ctx context.Context,
+		podUID, containerName, containerID string,
+	) (bool, error)
+}
+
 type KubeletPodCacheSyncEvent struct {
 	CgroupCreated bool
 	Revision      uint64
@@ -98,6 +108,8 @@ type podFetcherImpl struct {
 	kubeletPodsContinuesEmptyCount int
 	kubeletPodsCacheSkipEmptyError bool
 	kubeletPodsCacheLock           sync.RWMutex
+	kubeletPodSyncRequestSequence  uint64
+	kubeletPodSyncCommitSequence   uint64
 
 	runtimePodsCache     map[string]*RuntimePod
 	runtimePodsCacheLock sync.RWMutex
@@ -113,6 +125,8 @@ type podFetcherImpl struct {
 	kubeletPodCacheRevision          uint64
 	cgroupCreateResyncDelays         []time.Duration
 }
+
+var _ ContainerIdentityFetcher = (*podFetcherImpl)(nil)
 
 func NewPodFetcher(
 	baseConf *global.BaseConfiguration, podConf *metaserver.PodConfiguration,
@@ -209,6 +223,46 @@ func (w *podFetcherImpl) GetContainerSpec(podUID, containerName string) (*v1.Con
 
 func (w *podFetcherImpl) GetContainerID(podUID, containerName string) (string, error) {
 	return w.GetContainerIDWithContext(context.Background(), podUID, containerName)
+}
+
+// RefreshKubeletPodCache synchronously refreshes the pod identity source and
+// reports refresh failures instead of falling back to stale cached data.
+func (w *podFetcherImpl) RefreshKubeletPodCache(ctx context.Context) error {
+	if w == nil {
+		return fmt.Errorf("refresh kubelet pod cache from nil pod fetcher")
+	}
+	return w.syncKubeletPodWithContext(ctx)
+}
+
+func (w *podFetcherImpl) IsContainerRunningInRuntime(
+	ctx context.Context,
+	podUID, containerName, containerID string,
+) (bool, error) {
+	if w == nil || w.runtimePodFetcher == nil {
+		return false, fmt.Errorf("runtime pod fetcher is unavailable")
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	pods, err := w.runtimePodFetcher.GetPods(false)
+	if err != nil {
+		return false, fmt.Errorf("list running runtime containers: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	for _, pod := range pods {
+		if pod == nil || string(pod.UID) != podUID {
+			continue
+		}
+		for _, container := range pod.Containers {
+			if container != nil && container.Id == containerID &&
+				container.Metadata != nil && container.Metadata.Name == containerName {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 func (w *podFetcherImpl) GetContainerIDWithContext(ctx context.Context, podUID, containerName string) (string, error) {
@@ -447,6 +501,7 @@ func (w *podFetcherImpl) syncKubeletPod(ctx context.Context) {
 }
 
 func (w *podFetcherImpl) syncKubeletPodWithContext(ctx context.Context) error {
+	requestSequence := atomic.AddUint64(&w.kubeletPodSyncRequestSequence, 1)
 	klog.Infof("sync kubelet pod")
 	kubeletPods, err := w.kubeletPodFetcher.GetPodList(ctx, nil)
 	_ = general.UpdateHealthzStateByError(podFetcherKubeletHealthCheckName, err)
@@ -491,7 +546,12 @@ func (w *podFetcherImpl) syncKubeletPodWithContext(ctx context.Context) error {
 	if err := lockContext(ctx, &w.kubeletPodsCacheLock); err != nil {
 		return err
 	}
+	if requestSequence < w.kubeletPodSyncCommitSequence {
+		w.kubeletPodsCacheLock.Unlock()
+		return nil
+	}
 	w.kubeletPodsCache = kubeletPodsCache
+	w.kubeletPodSyncCommitSequence = requestSequence
 	w.kubeletPodCacheRevision++
 	if len(kubeletPodsCache) == 0 {
 		w.kubeletPodsContinuesEmptyCount++

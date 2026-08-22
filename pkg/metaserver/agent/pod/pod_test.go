@@ -19,6 +19,7 @@ package pod
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -184,6 +185,82 @@ func (f gatedKubeletPodFetcher) GetPodList(context.Context, func(*v1.Pod) bool) 
 	close(f.entered)
 	<-f.release
 	return []*v1.Pod{{}}, nil
+}
+
+type orderedKubeletPodFetcher struct {
+	firstStarted  chan struct{}
+	secondStarted chan struct{}
+	releaseFirst  chan struct{}
+	releaseSecond chan struct{}
+	calls         int32
+}
+
+func (f *orderedKubeletPodFetcher) GetPodList(context.Context, func(*v1.Pod) bool) ([]*v1.Pod, error) {
+	switch atomic.AddInt32(&f.calls, 1) {
+	case 1:
+		close(f.firstStarted)
+		<-f.releaseFirst
+		return []*v1.Pod{{ObjectMeta: metav1.ObjectMeta{UID: "old"}}}, nil
+	case 2:
+		close(f.secondStarted)
+		<-f.releaseSecond
+		return []*v1.Pod{{ObjectMeta: metav1.ObjectMeta{UID: "new"}}}, nil
+	default:
+		return nil, fmt.Errorf("unexpected kubelet pod fetch")
+	}
+}
+
+func TestRefreshKubeletPodCacheDoesNotLetOlderRequestOverwriteNewerResult(t *testing.T) {
+	t.Parallel()
+
+	fetcher := &orderedKubeletPodFetcher{
+		firstStarted:  make(chan struct{}),
+		secondStarted: make(chan struct{}),
+		releaseFirst:  make(chan struct{}),
+		releaseSecond: make(chan struct{}),
+	}
+	pf := &podFetcherImpl{
+		kubeletPodFetcher: fetcher,
+		emitter:           metrics.DummyMetrics{},
+		podConf:           &metaserverconf.PodConfiguration{},
+	}
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+	go func() { firstDone <- pf.RefreshKubeletPodCache(context.Background()) }()
+	<-fetcher.firstStarted
+	go func() { secondDone <- pf.RefreshKubeletPodCache(context.Background()) }()
+	<-fetcher.secondStarted
+
+	close(fetcher.releaseSecond)
+	if err := <-secondDone; err != nil {
+		t.Fatalf("newer refresh failed: %v", err)
+	}
+	close(fetcher.releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("older refresh failed: %v", err)
+	}
+
+	pf.kubeletPodsCacheLock.RLock()
+	defer pf.kubeletPodsCacheLock.RUnlock()
+	if pf.kubeletPodsCache["new"] == nil || pf.kubeletPodsCache["old"] != nil {
+		t.Fatalf("pod cache = %#v, want only newer result", pf.kubeletPodsCache)
+	}
+}
+
+func TestRefreshKubeletPodCachePropagatesRefreshError(t *testing.T) {
+	t.Parallel()
+
+	pf := &podFetcherImpl{
+		kubeletPodFetcher: contextBlockingKubeletPodFetcher{},
+		emitter:           metrics.DummyMetrics{},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := pf.RefreshKubeletPodCache(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RefreshKubeletPodCache() error = %v, want context canceled", err)
+	}
 }
 
 func TestGetContainerIDWithContextInterruptsCacheSync(t *testing.T) {

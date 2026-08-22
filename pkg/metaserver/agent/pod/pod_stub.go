@@ -32,6 +32,31 @@ type PodFetcherStub struct {
 }
 
 var _ PodFetcher = &PodFetcherStub{}
+var _ ContainerIdentityFetcher = &PodFetcherStub{}
+
+func (p *PodFetcherStub) RefreshKubeletPodCache(context.Context) error {
+	return nil
+}
+
+func (p *PodFetcherStub) IsContainerRunningInRuntime(
+	_ context.Context,
+	podUID, containerName, containerID string,
+) (bool, error) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	for _, pod := range p.PodList {
+		if pod == nil || string(pod.UID) != podUID {
+			continue
+		}
+		for _, status := range pod.Status.ContainerStatuses {
+			if status.Name == containerName && status.State.Running != nil &&
+				native.TrimContainerIDPrefix(status.ContainerID) == containerID {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
 
 func (p *PodFetcherStub) GetPodList(_ context.Context, podFilter func(*v1.Pod) bool) ([]*v1.Pod, error) {
 	p.mutex.Lock()
@@ -75,6 +100,16 @@ func (p *PodFetcherStub) GetContainerID(podUID, containerName string) (string, e
 	}
 
 	return "", fmt.Errorf("%w: pod=%s container=%s", ErrPodNotFound, podUID, containerName)
+}
+
+func (p *PodFetcherStub) GetContainerIDWithContext(
+	ctx context.Context,
+	podUID, containerName string,
+) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return p.GetContainerID(podUID, containerName)
 }
 
 func (p *PodFetcherStub) GetContainerSpec(podUID, containerName string) (*v1.Container, error) {
