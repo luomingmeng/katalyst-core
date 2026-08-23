@@ -1093,6 +1093,60 @@ func TestTopologyCoordinatorConvergeContinuesAfterProgressAndConverges(t *testin
 	}
 }
 
+func TestTopologyCoordinatorRevalidatesRequiredIdentityBeforeReplannedWrite(t *testing.T) {
+	t.Parallel()
+
+	rootIdentity := CgroupIdentity{Device: 1, Inode: 1}
+	childIdentity := CgroupIdentity{Device: 1, Inode: 2}
+	dag, err := BuildDAG([]NodeSpec{
+		{
+			Rel: "reclaim", Domain: DomainPrimary, Role: TopoNodeRolePrimary,
+			CPUs: machine.NewCPUSet(0), Mems: "0", TrustAnchor: true,
+		},
+		{
+			Rel: "reclaim/child", ParentRel: "reclaim", Domain: DomainPrimary,
+			Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0), Mems: "0",
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildDAG() error: %v", err)
+	}
+	driver := newFakeHierarchyDriver()
+	driver.add("reclaim", rootIdentity, "0-1", "0")
+	driver.add("reclaim/child", childIdentity, "0-1", "0")
+	driver.writeHook = func(driver *fakeHierarchyDriver, write fakeHierarchyWrite) error {
+		if len(driver.writes) == 0 {
+			driver.bumpIdentity("reclaim")
+		}
+		return nil
+	}
+	cg := newTopologyFakeCgroup()
+	cg.cpus["reclaim"] = machine.NewCPUSet(0, 1)
+	cg.cpus["reclaim/child"] = machine.NewCPUSet(0, 1)
+	provider := &coordinatorSnapshotTestCgroup{topologyFakeCgroup: cg, driver: driver}
+
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
+		DAG:        dag,
+		Cgroup:     provider,
+		CPUDetails: machine.CPUDetails{0: {}, 1: {}},
+		Budget:     ConvergenceBudget{MaxRounds: 1},
+		RequiredIdentityByRel: map[string]CgroupIdentity{
+			"reclaim": rootIdentity,
+		},
+	})
+	if !errors.Is(err, ErrCoordinatorPlanStale) {
+		t.Fatalf("Converge() error = %v, want ErrCoordinatorPlanStale", err)
+	}
+	if errors.Is(err, ErrRoundBudgetExceeded) {
+		t.Fatalf("preflight identity stale was masked by MaxRounds: %v", err)
+	}
+	for _, write := range driver.writes {
+		if write.rel == "reclaim" {
+			t.Fatalf("replanned write reached replaced required rel: %#v", driver.writes)
+		}
+	}
+}
+
 func TestTopologyCoordinatorV1DynamicDescendantWithoutAllocationConvergesAcrossHandoffRounds(t *testing.T) {
 	t.Parallel()
 

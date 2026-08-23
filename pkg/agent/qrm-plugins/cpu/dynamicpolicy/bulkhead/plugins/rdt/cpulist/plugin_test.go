@@ -111,6 +111,36 @@ func TestCPUListPluginSharedPoolsUnionForSameClos(t *testing.T) {
 	require.Equal(t, []cpuListWrite{{closID: "share-03", target: "1-4"}}, manager.writes)
 }
 
+func TestCPUListPluginConsumesLogicalPoolsFromReclaimOnlyAppliedView(t *testing.T) {
+	manager := &fakeCPUListManager{clos: []Clos{
+		{ID: "share-03", Epoch: 1},
+		{ID: consts.ResctrlGroupDedicated, Epoch: 1},
+	}}
+	plugin := newTestPlugin(manager)
+	applied := &model.AppliedView{
+		CPUSetPartitionView: model.CPUSetPartitionView{
+			SharePoolMap: map[string]machine.CPUSet{
+				"share-a": machine.NewCPUSet(0, 1),
+				"share-b": machine.NewCPUSet(2),
+			},
+			Dedicated:        machine.NewCPUSet(3),
+			ReclaimEffective: machine.NewCPUSet(),
+		},
+		Level:         model.AppliedViewLevelReclaimOnly,
+		CPUSetByRel:   map[string]machine.CPUSet{},
+		RelProofByRel: map[string]model.CgroupRelProof{},
+	}
+
+	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), bulkheadapi.HandlerContext{
+		AppliedView: applied,
+		View:        &applied.CPUSetPartitionView,
+	}))
+	require.Equal(t, []cpuListWrite{
+		{closID: "share-03", target: "0-2"},
+		{closID: consts.ResctrlGroupDedicated, target: "3"},
+	}, manager.writes)
+}
+
 func TestCPUListPluginRejectsOverlapAcrossFinalClosTargetsBeforeWriting(t *testing.T) {
 	manager := &fakeCPUListManager{clos: []Clos{
 		{ID: consts.ResctrlGroupDedicated, Epoch: 1},

@@ -54,6 +54,29 @@ func TestBulkheadOptionsDefaultDisablesPartitionRelPaths(t *testing.T) {
 	require.Empty(t, conf.BulkheadPartitionRelPaths)
 }
 
+func TestBulkheadOptionsExposePreserveReclaimCPUSetWhenTopologyDisabled(t *testing.T) {
+	t.Parallel()
+
+	options := NewBulkheadOptions()
+	require.False(t, options.PreserveReclaimCPUSetWhenTopologyDisabled)
+
+	fss := &cliflag.NamedFlagSets{}
+	options.AddFlags(fss)
+	fs := fss.FlagSet("cpu_resource_plugin")
+	flag := fs.Lookup("qrm-cpu-bulkhead-preserve-reclaim-cpuset-when-topology-disabled")
+	require.NotNil(t, flag)
+	require.Equal(t, "false", flag.DefValue)
+
+	require.NoError(t, fs.Set("qrm-cpu-bulkhead-preserve-reclaim-cpuset-when-topology-disabled", "true"))
+	conf := bulkheadconfig.NewBulkheadConfiguration()
+	require.NoError(t, options.ApplyTo(conf))
+	require.True(t, conf.PreserveReclaimCPUSetWhenTopologyDisabled)
+
+	require.NoError(t, fs.Set("qrm-cpu-bulkhead-preserve-reclaim-cpuset-when-topology-disabled", "false"))
+	require.NoError(t, options.ApplyTo(conf))
+	require.False(t, conf.PreserveReclaimCPUSetWhenTopologyDisabled)
+}
+
 func TestBulkheadOptionsDefaultsReclaimSiblingSystem(t *testing.T) {
 	t.Parallel()
 

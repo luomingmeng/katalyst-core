@@ -35,7 +35,8 @@ type BulkheadOptions struct {
 	BulkheadReclaimSiblingRelPaths []string
 	EnableBulkheadReclaimSiblings  bool
 
-	EnableBulkheadCpusetTopologyOnCgroupV2 bool
+	EnableBulkheadCpusetTopologyOnCgroupV2    bool
+	PreserveReclaimCPUSetWhenTopologyDisabled bool
 
 	BulkheadWorkqueueSysfsDir string
 	BulkheadWorkqueueNames    []string
@@ -92,6 +93,8 @@ func (o *BulkheadOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 		o.EnableBulkheadReclaimSiblings, "Whether cpu bulkhead should discover reclaim sibling cgroups.")
 	fs.BoolVar(&o.EnableBulkheadCpusetTopologyOnCgroupV2, "qrm-cpu-enable-bulkhead-cpuset-topology-on-cgroupv2",
 		o.EnableBulkheadCpusetTopologyOnCgroupV2, "Whether the cpu bulkhead cpuset_topology plugin runs on cgroup v2 hosts; when false the plugin is inert on cgroup v2 and only runs on cgroup v1.")
+	fs.BoolVar(&o.PreserveReclaimCPUSetWhenTopologyDisabled, "qrm-cpu-bulkhead-preserve-reclaim-cpuset-when-topology-disabled",
+		o.PreserveReclaimCPUSetWhenTopologyDisabled, "Whether existing reclaim cgroups continue following the desired reclaim CPUSet while full topology management is disabled.")
 	fs.StringVar(&o.BulkheadWorkqueueSysfsDir, "qrm-cpu-bulkhead-workqueue-sysfs-dir",
 		o.BulkheadWorkqueueSysfsDir, "The workqueue sysfs directory for cpu bulkhead.")
 	fs.StringSliceVar(&o.BulkheadWorkqueueNames, "qrm-cpu-bulkhead-workqueue-names",
@@ -144,6 +147,7 @@ func (o *BulkheadOptions) ApplyTo(conf *bulkheadconfig.BulkheadConfiguration) er
 	conf.BulkheadReclaimSiblingRelPaths = normalizeRelSlice(o.BulkheadReclaimSiblingRelPaths)
 	conf.EnableBulkheadReclaimSiblings = o.EnableBulkheadReclaimSiblings
 	conf.EnableBulkheadCpusetTopologyOnCgroupV2 = o.EnableBulkheadCpusetTopologyOnCgroupV2
+	conf.PreserveReclaimCPUSetWhenTopologyDisabled = o.PreserveReclaimCPUSetWhenTopologyDisabled
 	conf.BulkheadWorkqueueSysfsDir = strings.TrimSpace(o.BulkheadWorkqueueSysfsDir)
 	conf.BulkheadWorkqueueNames = trimStringSlice(o.BulkheadWorkqueueNames)
 	conf.BulkheadSystemRelPath = normalizeRel(o.BulkheadSystemRelPath)

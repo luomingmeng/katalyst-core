@@ -448,6 +448,7 @@ type fakeCgroupClient struct {
 	statErrors              map[string]error
 	requireExistingForApply bool
 	writes                  map[string]string
+	writeOrder              []string
 	applyCounts             map[string]int
 	cpusetWrites            map[string]cgcommon.CPUSetData
 	pruned                  map[string]struct{}
@@ -459,6 +460,7 @@ type fakeCgroupClient struct {
 	afterApply              func(rel string, data *cgcommon.CPUSetData)
 	readOverride            func(rel string) (machine.CPUSet, bool)
 	readErrByRel            map[string]error
+	statIdentityHook        func(string) (topology.CgroupIdentity, error)
 }
 
 type fakeSnapshotDriver struct {
@@ -476,6 +478,12 @@ func (d *fakeSnapshotDriver) Roots(context.Context) ([]topology.RootRef, error) 
 }
 
 func (d *fakeSnapshotDriver) StatIdentity(_ context.Context, rel string) (topology.CgroupIdentity, error) {
+	if d.cg.statIdentityHook != nil {
+		return d.cg.statIdentityHook(rel)
+	}
+	if err := d.cg.statErrors[rel]; err != nil {
+		return topology.CgroupIdentity{}, err
+	}
 	return pluginFakeIdentity(rel), nil
 }
 
@@ -790,6 +798,7 @@ func (f *fakeCgroupClient) ApplyCPUSet(_ context.Context, rel string, data *cgco
 	}
 	if data.CPUs != "" || data.WriteEmptyCPUs {
 		f.cpus[rel] = machine.MustParse(data.CPUs)
+		f.writeOrder = append(f.writeOrder, rel)
 	}
 	if data.Mems != "" || data.WriteEmptyMems {
 		if f.mems == nil {
@@ -1843,6 +1852,588 @@ func TestCPUSetTopologyPluginDisabledTransitionUsesTopologySpecsAndDAGExpandV1(t
 	if cg.pruned != nil {
 		t.Fatalf("disabled transition should not prune, got %#v", cg.pruned)
 	}
+}
+
+func TestCPUSetTopologyPluginDisabledReclaimEligibility(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		version    cgroupclient.CgroupVersion
+		preserve   bool
+		v2OptIn    bool
+		dynamic    *dynamicconfig.Configuration
+		wantActive bool
+	}{
+		{name: "v1 active", version: cgroupclient.CgroupVersionV1, preserve: true, wantActive: true},
+		{name: "full topology owns round", version: cgroupclient.CgroupVersionV1, preserve: true, dynamic: enabledBulkheadCpusetTopologyDynamicConf()},
+		{name: "preserve disabled", version: cgroupclient.CgroupVersionV1},
+		{name: "v2 requires opt in", version: cgroupclient.CgroupVersionV2, preserve: true},
+		{name: "v2 opted in", version: cgroupclient.CgroupVersionV2, preserve: true, v2OptIn: true, wantActive: true},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			p := &CPUSetTopologyPlugin{
+				cfg: bulkheadconfig.BulkheadConfiguration{
+					PreserveReclaimCPUSetWhenTopologyDisabled: tt.preserve,
+					EnableBulkheadCpusetTopologyOnCgroupV2:    tt.v2OptIn,
+				},
+				cgroup: &fakeCgroupClient{version: tt.version},
+			}
+			got := p.ShouldReconcileWhenDisabled(context.Background(), bulkheadapi.HandlerContext{
+				CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{DynamicConf: tt.dynamic},
+			})
+			if got != tt.wantActive {
+				t.Fatalf("ShouldReconcileWhenDisabled() = %t, want %t", got, tt.wantActive)
+			}
+		})
+	}
+}
+
+func TestCPUSetTopologyPluginPreserveModeResetExcludesReclaimSubtree(t *testing.T) {
+	t.Parallel()
+
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV1,
+		"bulkhead-preserve-reset-pod",
+		"bulkhead-preserve-reset-container",
+	)
+	p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled = true
+	cg.children["reclaim/reclaim-0"] = []string{"dynamic"}
+	cg.cpus["reclaim/reclaim-0/dynamic"] = machine.NewCPUSet(2)
+
+	if err := p.CPUSetAdjustmentDisabledHandler(context.Background(), in); err != nil {
+		t.Fatalf("CPUSetAdjustmentDisabledHandler() error: %v", err)
+	}
+	for _, rel := range []string{"primary", "sibling", "primary/burstable"} {
+		if got := cg.writes[rel]; got != "0-3" {
+			t.Fatalf("reset cpuset @ %s = %q, want 0-3; writes=%#v", rel, got, cg.writes)
+		}
+	}
+	for _, rel := range []string{"reclaim", "reclaim/reclaim-0", "reclaim/reclaim-0/dynamic"} {
+		if _, ok := cg.writes[rel]; ok {
+			t.Fatalf("reclaim boundary %q received reset write; writes=%#v", rel, cg.writes)
+		}
+	}
+}
+
+func TestCPUSetTopologyPluginPreserveModeResetTreatsAbsentReclaimRootAsTraversalBoundary(t *testing.T) {
+	t.Parallel()
+
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV1,
+		"bulkhead-preserve-absent-boundary-pod",
+		"bulkhead-preserve-absent-boundary-container",
+	)
+	p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled = true
+	cg.statErrors = map[string]error{"reclaim": os.ErrNotExist}
+	cg.readErrByRel = map[string]error{
+		"reclaim":                   errors.New("reset crossed absent reclaim boundary"),
+		"reclaim/reclaim-0":         errors.New("reset descended below absent reclaim boundary"),
+		"reclaim/reclaim-0/dynamic": errors.New("reset reached late-created reclaim descendant"),
+	}
+	cg.children["reclaim/reclaim-0"] = []string{"dynamic"}
+
+	if err := p.CPUSetAdjustmentDisabledHandler(context.Background(), in); err != nil {
+		t.Fatalf("CPUSetAdjustmentDisabledHandler() crossed absent reclaim boundary: %v", err)
+	}
+	for _, rel := range []string{"reclaim", "reclaim/reclaim-0", "reclaim/reclaim-0/dynamic"} {
+		if _, ok := cg.writes[rel]; ok {
+			t.Fatalf("absent reclaim boundary %q received reset write; writes=%#v", rel, cg.writes)
+		}
+	}
+}
+
+func TestCPUSetTopologyPluginReconcileDisabledPublishesReclaimOnlyProof(t *testing.T) {
+	t.Parallel()
+
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV1,
+		"bulkhead-reclaim-only-pod",
+		"bulkhead-reclaim-only-container",
+	)
+	p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled = true
+	cg.cpus["reclaim"] = machine.NewCPUSet(0, 1, 2, 3)
+	cg.cpus["reclaim/reclaim-0"] = machine.NewCPUSet(0, 1, 2, 3)
+	in.DesiredView.Reserve = machine.NewCPUSet(0)
+	in.DesiredView.ReclaimEffective = machine.NewCPUSet(2, 3)
+	in.DesiredView.ReclaimEffectivePerNUMA[0] = machine.NewCPUSet(2, 3)
+
+	result, err := p.ReconcileDisabled(context.Background(), in)
+	if err != nil {
+		t.Fatalf("ReconcileDisabled() error: %v", err)
+	}
+	if !result.FullyConverged || !result.FinalSnapshotCurrent {
+		t.Fatalf("result = %+v, want current full convergence", result)
+	}
+	if result.AppliedView == nil || result.AppliedView.Level != model.AppliedViewLevelReclaimOnly {
+		t.Fatalf("applied view = %+v, want reclaim-only", result.AppliedView)
+	}
+	if !result.AppliedView.ReclaimEffective.Equals(machine.NewCPUSet(2, 3)) {
+		t.Fatalf("applied reclaim = %s, want 2-3", result.AppliedView.ReclaimEffective.String())
+	}
+	if _, ok := result.AppliedView.CPUSetByRel["primary"]; ok {
+		t.Fatalf("reclaim-only proof unexpectedly contains primary: %#v", result.AppliedView.CPUSetByRel)
+	}
+	for _, rel := range []string{"reclaim", "reclaim/reclaim-0"} {
+		if _, ok := result.AppliedView.RelProofByRel[rel]; !ok {
+			t.Fatalf("reclaim-only proof misses %q: %#v", rel, result.AppliedView.RelProofByRel)
+		}
+	}
+	if !result.AppliedView.NonReclaimPool.IsEmpty() || len(result.AppliedView.ContainerCPUSetByPod) != 0 {
+		t.Fatalf("reclaim-only applied fields contain unproved state: %+v", result.AppliedView.CPUSetPartitionView)
+	}
+}
+
+func TestCPUSetTopologyPluginReconcileDisabledEmitsFailureSummary(t *testing.T) {
+	t.Parallel()
+
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV1,
+		"bulkhead-reclaim-only-summary-pod",
+		"bulkhead-reclaim-only-summary-container",
+	)
+	p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled = true
+	readErr := errors.New("reclaim snapshot failed")
+	cg.readErrByRel = map[string]error{"reclaim": readErr}
+	emitter := &captureMetricEmitter{}
+	in.Emitter = emitter
+
+	if _, err := p.ReconcileDisabled(context.Background(), in); !errors.Is(err, readErr) {
+		t.Fatalf("ReconcileDisabled() error = %v, want %v", err, readErr)
+	}
+	for _, metric := range emitter.metrics {
+		if metric.key == metricBulkheadTopologyRoundsPerApply &&
+			hasMetricTag(metric.tags, "phase", "reclaim_only") &&
+			hasMetricTag(metric.tags, "status", "error") {
+			return
+		}
+	}
+	t.Fatalf("reclaim-only failure summary not emitted: %#v", emitter.metrics)
+}
+
+func TestCPUSetTopologyPluginReconcileDisabledFailureSummaryPreservesConvergenceResult(t *testing.T) {
+	t.Parallel()
+
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV1,
+		"bulkhead-reclaim-only-summary-result-pod",
+		"bulkhead-reclaim-only-summary-result-container",
+	)
+	p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled = true
+	cg.cpus["reclaim"] = machine.NewCPUSet(0, 1, 2, 3)
+	cg.cpus["reclaim/reclaim-0"] = machine.NewCPUSet(0, 1, 2, 3)
+	in.DesiredView.ReclaimEffective = machine.NewCPUSet(2, 3)
+	in.DesiredView.ReclaimEffectivePerNUMA[0] = machine.NewCPUSet(2, 3)
+	statErr := errors.New("publish classification failed")
+	var wrote bool
+	var postWriteReclaimStats int
+	cg.afterApply = func(string, *cgcommon.CPUSetData) {
+		wrote = true
+	}
+	cg.statIdentityHook = func(rel string) (topology.CgroupIdentity, error) {
+		if wrote && rel == "reclaim" {
+			postWriteReclaimStats++
+			if postWriteReclaimStats == 13 {
+				return topology.CgroupIdentity{}, statErr
+			}
+		}
+		return pluginFakeIdentity(rel), nil
+	}
+	emitter := &captureMetricEmitter{}
+	in.Emitter = emitter
+
+	if _, err := p.ReconcileDisabled(context.Background(), in); err == nil {
+		t.Fatalf("ReconcileDisabled() error = nil, want final snapshot failure; post-write root stats=%d",
+			postWriteReclaimStats)
+	}
+	for _, metric := range emitter.metrics {
+		if metric.key == metricBulkheadTopologyRoundsPerApply &&
+			hasMetricTag(metric.tags, "phase", "reclaim_only") &&
+			hasMetricTag(metric.tags, "status", "error") {
+			if metric.val == 0 {
+				t.Fatalf("failure summary rounds = %.0f, want real non-zero convergence rounds; post-write root stats=%d",
+					metric.val, postWriteReclaimStats)
+			}
+			return
+		}
+	}
+	t.Fatalf("reclaim-only failure summary not emitted: %#v", emitter.metrics)
+}
+
+func TestCPUSetTopologyPluginReconcileDisabledContextTerminationSummarizesAccumulatedRetriesOnce(t *testing.T) {
+	t.Parallel()
+
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV1,
+		"bulkhead-reclaim-only-canceled-retry-pod",
+		"bulkhead-reclaim-only-canceled-retry-container",
+	)
+	p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled = true
+	cg.cpus["reclaim"] = machine.NewCPUSet(0, 1, 2, 3)
+	cg.cpus["reclaim/reclaim-0"] = machine.NewCPUSet(0, 1, 2, 3)
+	in.DesiredView.ReclaimEffective = machine.NewCPUSet(2, 3)
+	in.DesiredView.ReclaimEffectivePerNUMA[0] = machine.NewCPUSet(2, 3)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wrote bool
+	var postWriteReclaimStats int
+	cg.afterApply = func(string, *cgcommon.CPUSetData) {
+		wrote = true
+	}
+	cg.statIdentityHook = func(rel string) (topology.CgroupIdentity, error) {
+		if wrote && rel == "reclaim" {
+			postWriteReclaimStats++
+			if postWriteReclaimStats == 13 {
+				cancel()
+				return topology.CgroupIdentity{Device: 99, Inode: 100}, nil
+			}
+		}
+		return pluginFakeIdentity(rel), nil
+	}
+	emitter := &captureMetricEmitter{}
+	in.Emitter = emitter
+
+	result, err := p.ReconcileDisabled(ctx, in)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReconcileDisabled() error = %v, want context cancellation", err)
+	}
+	if result.Attempted == 0 || result.Applied == 0 {
+		t.Fatalf("result = %+v, want accumulated work from the completed retry attempt", result)
+	}
+	summaries := 0
+	for _, metric := range emitter.metrics {
+		if metric.key != metricBulkheadTopologyRoundsPerApply ||
+			!hasMetricTag(metric.tags, "phase", "reclaim_only") {
+			continue
+		}
+		summaries++
+		if metric.val == 0 {
+			t.Fatalf("terminal summary rounds = %.0f, want accumulated non-zero rounds", metric.val)
+		}
+		if !hasMetricTag(metric.tags, "status", "error") {
+			t.Fatalf("terminal summary tags = %#v, want error status", metric.tags)
+		}
+	}
+	if summaries != 1 {
+		t.Fatalf("reclaim-only terminal summaries = %d, want exactly 1; metrics=%#v", summaries, emitter.metrics)
+	}
+}
+
+func hasMetricTag(tags []metrics.MetricTag, key, value string) bool {
+	for _, tag := range tags {
+		if tag.Key == key && tag.Val == value {
+			return true
+		}
+	}
+	return false
+}
+
+func TestCPUSetTopologyPluginReconcileDisabledTreatsAllMissingRootsAsEmptySuccess(t *testing.T) {
+	t.Parallel()
+
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV1,
+		"bulkhead-reclaim-only-missing-pod",
+		"bulkhead-reclaim-only-missing-container",
+	)
+	p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled = true
+	cg.statErrors = map[string]error{
+		"reclaim":           os.ErrNotExist,
+		"reclaim/reclaim-0": os.ErrNotExist,
+	}
+	emitter := &captureMetricEmitter{}
+	in.Emitter = emitter
+
+	result, err := p.ReconcileDisabled(context.Background(), in)
+	if err != nil {
+		t.Fatalf("ReconcileDisabled() error: %v", err)
+	}
+	if !result.FullyConverged || !result.FinalSnapshotCurrent || result.AppliedView == nil {
+		t.Fatalf("result = %+v, want current empty success", result)
+	}
+	if !result.AppliedView.ReclaimEffective.IsEmpty() ||
+		len(result.AppliedView.ReclaimEffectivePerNUMA) != 0 ||
+		len(result.AppliedView.CPUSetByRel) != 0 ||
+		len(result.AppliedView.RelProofByRel) != 0 {
+		t.Fatalf("missing reclaim paths published physical proof: %+v", result.AppliedView)
+	}
+	if len(cg.writes) != 0 {
+		t.Fatalf("missing reclaim paths received writes: %#v", cg.writes)
+	}
+	for _, metric := range emitter.metrics {
+		if metric.key == metricBulkheadTopologyRoundsPerApply &&
+			hasMetricTag(metric.tags, "phase", "reclaim_only") &&
+			hasMetricTag(metric.tags, "status", "converged") {
+			if metric.val != 0 {
+				t.Fatalf("empty-path success summary rounds = %.0f, want 0", metric.val)
+			}
+			return
+		}
+	}
+	t.Fatalf("empty-path reclaim-only success summary not emitted: %#v", emitter.metrics)
+}
+
+func TestCPUSetTopologyPluginReconcileDisabledReclassifiesAppearingRoot(t *testing.T) {
+	t.Parallel()
+
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV1,
+		"bulkhead-reclaim-only-race-pod",
+		"bulkhead-reclaim-only-race-container",
+	)
+	p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled = true
+	cg.cpus["reclaim"] = machine.NewCPUSet(2, 3)
+	delete(cg.existing, "reclaim/reclaim-0")
+	var rootStats int
+	cg.statIdentityHook = func(rel string) (topology.CgroupIdentity, error) {
+		if rel == "reclaim" {
+			rootStats++
+			if rootStats == 1 {
+				return topology.CgroupIdentity{}, os.ErrNotExist
+			}
+		}
+		if rel == "reclaim/reclaim-0" {
+			return topology.CgroupIdentity{}, os.ErrNotExist
+		}
+		return pluginFakeIdentity(rel), nil
+	}
+
+	result, err := p.ReconcileDisabled(context.Background(), in)
+	if err != nil {
+		t.Fatalf("ReconcileDisabled() error: %v", err)
+	}
+	if _, ok := result.AppliedView.RelProofByRel["reclaim"]; !ok {
+		t.Fatalf("appearing reclaim root was not reclassified and proved: %#v", result.AppliedView.RelProofByRel)
+	}
+	if rootStats < 3 {
+		t.Fatalf("reclaim root stat count = %d, want preflight, final absence check, and rebuilt classification", rootStats)
+	}
+}
+
+func TestCPUSetTopologyPluginReconcileDisabledSkipsMissingNUMABucket(t *testing.T) {
+	t.Parallel()
+
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV1,
+		"bulkhead-reclaim-only-missing-numa-pod",
+		"bulkhead-reclaim-only-missing-numa-container",
+	)
+	p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled = true
+	cg.statErrors = map[string]error{"reclaim/reclaim-0": os.ErrNotExist}
+
+	result, err := p.ReconcileDisabled(context.Background(), in)
+	if err != nil {
+		t.Fatalf("ReconcileDisabled() error: %v", err)
+	}
+	if _, ok := result.AppliedView.RelProofByRel["reclaim"]; !ok {
+		t.Fatalf("existing root proof missing: %#v", result.AppliedView.RelProofByRel)
+	}
+	if _, ok := result.AppliedView.RelProofByRel["reclaim/reclaim-0"]; ok {
+		t.Fatalf("missing NUMA bucket was proved: %#v", result.AppliedView.RelProofByRel)
+	}
+	if len(result.AppliedView.ReclaimEffectivePerNUMA) != 0 {
+		t.Fatalf("missing NUMA bucket left applied key: %#v", result.AppliedView.ReclaimEffectivePerNUMA)
+	}
+}
+
+func TestCPUSetTopologyPluginReconcileDisabledReclassifiesAppearingNUMABucket(t *testing.T) {
+	t.Parallel()
+
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV1,
+		"bulkhead-reclaim-only-appearing-numa-pod",
+		"bulkhead-reclaim-only-appearing-numa-container",
+	)
+	p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled = true
+	cg.cpus["reclaim"] = machine.NewCPUSet(0, 1, 2, 3)
+	in.DesiredView.ReclaimEffective = machine.NewCPUSet(2, 3)
+	var bucketStats int
+	var writesBeforeReclassification int
+	cg.statIdentityHook = func(rel string) (topology.CgroupIdentity, error) {
+		if rel == "reclaim/reclaim-0" {
+			bucketStats++
+			if bucketStats == 1 {
+				return topology.CgroupIdentity{}, os.ErrNotExist
+			}
+			if bucketStats == 2 {
+				writesBeforeReclassification = len(cg.writeOrder)
+			}
+		}
+		return pluginFakeIdentity(rel), nil
+	}
+
+	result, err := p.ReconcileDisabled(context.Background(), in)
+	if err != nil {
+		t.Fatalf("ReconcileDisabled() error: %v", err)
+	}
+	if _, ok := result.AppliedView.RelProofByRel["reclaim/reclaim-0"]; !ok {
+		t.Fatalf("appearing NUMA bucket was not reclassified: %#v", result.AppliedView.RelProofByRel)
+	}
+	if bucketStats < 2 {
+		t.Fatalf("NUMA bucket stat calls = %d, want reclassification", bucketStats)
+	}
+	if writesBeforeReclassification != 0 {
+		t.Fatalf("writes before appearing NUMA bucket was reclassified = %d, want 0; writes=%v",
+			writesBeforeReclassification, cg.writeOrder)
+	}
+}
+
+func TestCPUSetTopologyPluginReconcileDisabledRetriesReplacedNUMABucketIdentity(t *testing.T) {
+	t.Parallel()
+
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV1,
+		"bulkhead-reclaim-only-replaced-numa-pod",
+		"bulkhead-reclaim-only-replaced-numa-container",
+	)
+	p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled = true
+	oldIdentity := topology.CgroupIdentity{Device: 99, Inode: 100}
+	var bucketStats int
+	cg.statIdentityHook = func(rel string) (topology.CgroupIdentity, error) {
+		if rel == "reclaim/reclaim-0" {
+			bucketStats++
+			if bucketStats == 1 {
+				return oldIdentity, nil
+			}
+		}
+		return pluginFakeIdentity(rel), nil
+	}
+
+	result, err := p.ReconcileDisabled(context.Background(), in)
+	if err != nil {
+		t.Fatalf("ReconcileDisabled() error: %v", err)
+	}
+	proof := result.AppliedView.RelProofByRel["reclaim/reclaim-0"]
+	if proof.Device != pluginFakeIdentity("reclaim/reclaim-0").Device ||
+		proof.Inode != pluginFakeIdentity("reclaim/reclaim-0").Inode {
+		t.Fatalf("published NUMA proof = %+v, want replacement identity", proof)
+	}
+	if bucketStats < 2 {
+		t.Fatalf("NUMA bucket stat calls = %d, want replacement retry", bucketStats)
+	}
+}
+
+func TestCPUSetTopologyPluginReconcileDisabledOrdersGrowAndShrink(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		initial     machine.CPUSet
+		target      machine.CPUSet
+		wantEarlier string
+		wantLater   string
+	}{
+		{
+			name: "grow parent before child", initial: machine.NewCPUSet(2), target: machine.NewCPUSet(2, 3),
+			wantEarlier: "reclaim", wantLater: "reclaim/reclaim-0",
+		},
+		{
+			name: "shrink child before parent", initial: machine.NewCPUSet(0, 1, 2, 3), target: machine.NewCPUSet(2, 3),
+			wantEarlier: "reclaim/reclaim-0", wantLater: "reclaim",
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			p, cg, in, _ := newDisabledTransitionTestPlugin(
+				t,
+				cgroupclient.CgroupVersionV1,
+				"bulkhead-reclaim-order-"+strings.ReplaceAll(tt.name, " ", "-"),
+				"bulkhead-reclaim-order-container-"+strings.ReplaceAll(tt.name, " ", "-"),
+			)
+			p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled = true
+			cg.cpus["reclaim"] = tt.initial.Clone()
+			cg.cpus["reclaim/reclaim-0"] = tt.initial.Clone()
+			in.DesiredView.ReclaimEffective = tt.target.Clone()
+			in.DesiredView.ReclaimEffectivePerNUMA[0] = tt.target.Clone()
+
+			if _, err := p.ReconcileDisabled(context.Background(), in); err != nil {
+				t.Fatalf("ReconcileDisabled() error: %v", err)
+			}
+			earlier := indexOfString(cg.writeOrder, tt.wantEarlier)
+			later := indexOfString(cg.writeOrder, tt.wantLater)
+			if earlier < 0 || later < 0 || earlier >= later {
+				t.Fatalf("write order = %v, want %q before %q", cg.writeOrder, tt.wantEarlier, tt.wantLater)
+			}
+		})
+	}
+}
+
+func TestCPUSetTopologyPluginReconcileDisabledShrinksDynamicDescendantBeforeAncestors(t *testing.T) {
+	t.Parallel()
+
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV1,
+		"bulkhead-reclaim-dynamic-order-pod",
+		"bulkhead-reclaim-dynamic-order-container",
+	)
+	p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled = true
+	cg.children["reclaim/reclaim-0"] = []string{"dynamic"}
+	cg.cpus["reclaim"] = machine.NewCPUSet(0, 1, 2, 3)
+	cg.cpus["reclaim/reclaim-0"] = machine.NewCPUSet(0, 1, 2, 3)
+	cg.cpus["reclaim/reclaim-0/dynamic"] = machine.NewCPUSet(0, 1, 2, 3)
+	in.DesiredView.ReclaimEffective = machine.NewCPUSet(2, 3)
+	in.DesiredView.ReclaimEffectivePerNUMA[0] = machine.NewCPUSet(2, 3)
+
+	if _, err := p.ReconcileDisabled(context.Background(), in); err != nil {
+		t.Fatalf("ReconcileDisabled() error: %v", err)
+	}
+	dynamic := indexOfString(cg.writeOrder, "reclaim/reclaim-0/dynamic")
+	bucket := indexOfString(cg.writeOrder, "reclaim/reclaim-0")
+	root := indexOfString(cg.writeOrder, "reclaim")
+	if dynamic < 0 || bucket < 0 || root < 0 || !(dynamic < bucket && bucket < root) {
+		t.Fatalf("write order = %v, want dynamic descendant, NUMA bucket, reclaim root", cg.writeOrder)
+	}
+}
+
+func TestCPUSetTopologyPluginReconcileDisabledAppliesNUMAMixedReplacement(t *testing.T) {
+	t.Parallel()
+
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV1,
+		"bulkhead-reclaim-numa-mixed-pod",
+		"bulkhead-reclaim-numa-mixed-container",
+	)
+	p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled = true
+	cg.cpus["reclaim"] = machine.NewCPUSet(0, 1, 2, 3)
+	cg.cpus["reclaim/reclaim-0"] = machine.NewCPUSet(0, 1)
+	in.DesiredView.ReclaimEffective = machine.NewCPUSet(2, 3)
+	in.DesiredView.ReclaimEffectivePerNUMA[0] = machine.NewCPUSet(2, 3)
+
+	result, err := p.ReconcileDisabled(context.Background(), in)
+	if err != nil {
+		t.Fatalf("ReconcileDisabled() error: %v", err)
+	}
+	if got := result.AppliedView.ReclaimEffectivePerNUMA[0]; !got.Equals(machine.NewCPUSet(2, 3)) {
+		t.Fatalf("applied NUMA target = %s, want 2-3", got.String())
+	}
+}
+
+func indexOfString(items []string, want string) int {
+	for i, item := range items {
+		if item == want {
+			return i
+		}
+	}
+	return -1
 }
 
 func TestCPUSetTopologyPluginDisabledTransitionUsesTopologySpecsAndDAGExpandV2ToEmpty(t *testing.T) {

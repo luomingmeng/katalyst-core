@@ -26,6 +26,7 @@ import (
 	"sort"
 	"time"
 
+	cgroupclient "github.com/kubewharf/katalyst-core/pkg/util/cgroup/client"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -55,6 +56,45 @@ type SnapshotRequest struct {
 	ParentRel    string
 	SourceDomain DomainID
 	MismatchRels []string
+}
+
+// RelObservation records whether a configured rel exists and, when present,
+// binds that classification to its stable directory identity.
+type RelObservation struct {
+	Exists   bool
+	Identity CgroupIdentity
+}
+
+// ObserveConfiguredRels classifies configured paths through the same
+// identity-aware hierarchy driver used by coordinator snapshots.
+func ObserveConfiguredRels(
+	ctx context.Context,
+	cg cgroupclient.CgroupClient,
+	rels []string,
+) (map[string]RelObservation, error) {
+	if cg == nil {
+		return nil, fmt.Errorf("cgroup client is required")
+	}
+	driver, err := snapshotDriverForCoordinator(ctx, cg)
+	if err != nil {
+		return nil, err
+	}
+	defer driver.Close()
+
+	out := make(map[string]RelObservation, len(rels))
+	for _, rel := range normalizeRels(rels) {
+		identity, err := driver.StatIdentity(ctx, rel)
+		if err == nil {
+			out[rel] = RelObservation{Exists: true, Identity: identity}
+			continue
+		}
+		if isCgroupNotFoundError(err) {
+			out[rel] = RelObservation{}
+			continue
+		}
+		return nil, fmt.Errorf("stat configured rel %q: %w", rel, err)
+	}
+	return out, nil
 }
 
 // CompleteSnapshot is the only ownership evidence accepted by the coordinator.
@@ -94,6 +134,7 @@ type snapshotBuilder struct {
 	budget     *BudgetTracker
 	snapshot   *CompleteSnapshot
 	controlled map[string]*TopoNode
+	boundaries map[string]struct{}
 }
 
 // BuildCompleteSnapshot returns either complete purpose-scoped evidence or a
@@ -104,6 +145,17 @@ func BuildCompleteSnapshot(
 	dag *TopoDAG,
 	request SnapshotRequest,
 	budget *BudgetTracker,
+) (*CompleteSnapshot, error) {
+	return buildCompleteSnapshot(ctx, driver, dag, request, budget, nil)
+}
+
+func buildCompleteSnapshot(
+	ctx context.Context,
+	driver HierarchyDriver,
+	dag *TopoDAG,
+	request SnapshotRequest,
+	budget *BudgetTracker,
+	boundaries map[string]struct{},
 ) (*CompleteSnapshot, error) {
 	if driver == nil || dag == nil || budget == nil {
 		return nil, &SnapshotError{Operation: HierarchyOperationRead, Class: HierarchyErrorInvalid, Err: fmt.Errorf("driver, dag and budget are required")}
@@ -127,6 +179,7 @@ func BuildCompleteSnapshot(
 		driver:     driver,
 		budget:     budget,
 		controlled: make(map[string]*TopoNode, len(dag.index)),
+		boundaries: boundaries,
 		snapshot: &CompleteSnapshot{
 			CapturedAt:   time.Now(),
 			Capabilities: driver.Capabilities(),
@@ -166,7 +219,12 @@ func (s *CompleteSnapshot) TargetProofCPUs(rel string, target machine.CPUSet) (m
 	return observedCPUsForTargetProof(entry, target, s.Capabilities).Clone(), true
 }
 
-func newCompleteSnapshotSource(driver HierarchyDriver, dag *TopoDAG, budget *BudgetTracker) func(context.Context) (*CompleteSnapshot, error) {
+func newCompleteSnapshotSource(
+	driver HierarchyDriver,
+	dag *TopoDAG,
+	budget *BudgetTracker,
+	boundarySets ...map[string]struct{},
+) func(context.Context) (*CompleteSnapshot, error) {
 	affected := make([]string, 0, len(dag.index))
 	for rel, node := range dag.index {
 		if node.Domain == "" {
@@ -175,11 +233,15 @@ func newCompleteSnapshotSource(driver HierarchyDriver, dag *TopoDAG, budget *Bud
 		affected = append(affected, rel)
 	}
 	sort.Strings(affected)
+	var boundaries map[string]struct{}
+	if len(boundarySets) > 0 {
+		boundaries = boundarySets[0]
+	}
 	return func(ctx context.Context) (*CompleteSnapshot, error) {
-		return BuildCompleteSnapshot(ctx, driver, dag, SnapshotRequest{
+		return buildCompleteSnapshot(ctx, driver, dag, SnapshotRequest{
 			Purpose:      ScanForPlan,
 			AffectedRels: affected,
-		}, budget)
+		}, budget, boundaries)
 	}
 }
 
@@ -238,6 +300,9 @@ func (b *snapshotBuilder) scan(rel string, domain DomainID, depth int, expected 
 	b.snapshot.ScanBoundary.ExpandedRels = append(b.snapshot.ScanBoundary.ExpandedRels, rel)
 	for _, child := range children {
 		childRel := filepath.Join(rel, child.Name)
+		if withinTraversalBoundary(childRel, b.boundaries) {
+			continue
+		}
 		childNode, isControlled := b.controlled[childRel]
 		if isControlled && !immediateOnly {
 			continue

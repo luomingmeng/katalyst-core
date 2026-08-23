@@ -68,7 +68,8 @@ type BulkheadConfiguration struct {
 	// Enable returns false and its adjustment-disabled and periodical handlers
 	// become no-ops, so cgroup v2 hosts are never touched. cgroup v1 behavior is
 	// unaffected. When true the plugin also runs on cgroup v2.
-	EnableBulkheadCpusetTopologyOnCgroupV2 bool
+	EnableBulkheadCpusetTopologyOnCgroupV2    bool
+	PreserveReclaimCPUSetWhenTopologyDisabled bool
 
 	BulkheadWorkqueueSysfsDir string
 	BulkheadWorkqueueNames    []string

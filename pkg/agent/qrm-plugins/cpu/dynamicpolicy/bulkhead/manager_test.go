@@ -21,6 +21,7 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -53,12 +54,14 @@ type fakePlugin struct {
 	adjustErr              error
 	periodicErr            error
 	disabledErr            error
+	disabledErrs           []error
 	topologyResult         *bulkheadapi.TopologyResult
 	afterReport            func()
 	adjustStarted          chan struct{}
 	adjustRelease          chan struct{}
 	periodicWaitForContext bool
 	periodicContextErr     error
+	disabledDeadlines      []time.Time
 }
 
 type capturedMetric struct {
@@ -138,6 +141,79 @@ type fakeTopologyPlugin struct {
 	mutateDesired func(*model.DesiredView)
 }
 
+type fakeDisabledTopologyPlugin struct {
+	*fakePlugin
+	shouldReconcile bool
+	reconcileCalls  int
+	results         []bulkheadapi.DAGApplyResult
+	reconcileErrs   []error
+	deadlines       []time.Time
+}
+
+type lockObservedContext struct {
+	context.Context
+	observed chan struct{}
+	once     sync.Once
+}
+
+func (c *lockObservedContext) Done() <-chan struct{} {
+	c.once.Do(func() {
+		close(c.observed)
+	})
+	return c.Context.Done()
+}
+
+type fakeFullAndDisabledTopologyPlugin struct {
+	*fakeDisabledTopologyPlugin
+	applyCalls   int
+	applyResults []bulkheadapi.DAGApplyResult
+	applyErrs    []error
+}
+
+func (p *fakeDisabledTopologyPlugin) ShouldReconcileWhenDisabled(
+	_ context.Context,
+	_ bulkheadapi.HandlerContext,
+) bool {
+	return p.shouldReconcile
+}
+
+func (p *fakeDisabledTopologyPlugin) ReconcileDisabled(
+	ctx context.Context,
+	_ bulkheadapi.HandlerContext,
+) (bulkheadapi.DAGApplyResult, error) {
+	p.reconcileCalls++
+	if deadline, ok := ctx.Deadline(); ok {
+		p.deadlines = append(p.deadlines, deadline)
+	}
+	index := p.reconcileCalls - 1
+	var result bulkheadapi.DAGApplyResult
+	if index < len(p.results) {
+		result = p.results[index]
+	}
+	var err error
+	if index < len(p.reconcileErrs) {
+		err = p.reconcileErrs[index]
+	}
+	return result, err
+}
+
+func (p *fakeFullAndDisabledTopologyPlugin) Apply(
+	_ context.Context,
+	_ bulkheadapi.HandlerContext,
+) (bulkheadapi.DAGApplyResult, error) {
+	p.applyCalls++
+	index := p.applyCalls - 1
+	var result bulkheadapi.DAGApplyResult
+	if index < len(p.applyResults) {
+		result = p.applyResults[index]
+	}
+	var err error
+	if index < len(p.applyErrs) {
+		err = p.applyErrs[index]
+	}
+	return result, err
+}
+
 func (p *fakeTopologyPlugin) Apply(_ context.Context, in bulkheadapi.HandlerContext) (bulkheadapi.DAGApplyResult, error) {
 	if p.reportLegacy && in.ReportTopologyResult != nil {
 		in.ReportTopologyResult(bulkheadapi.TopologyResult{
@@ -153,6 +229,571 @@ func (p *fakeTopologyPlugin) Apply(_ context.Context, in bulkheadapi.HandlerCont
 		p.afterApply()
 	}
 	return p.result, p.err
+}
+
+func reclaimOnlyResult(cpus machine.CPUSet) bulkheadapi.DAGApplyResult {
+	view := &model.AppliedView{
+		CPUSetPartitionView: model.NewCPUSetPartitionView(),
+		Level:               model.AppliedViewLevelReclaimOnly,
+		CPUSetByRel:         map[string]machine.CPUSet{},
+		RelProofByRel:       map[string]model.CgroupRelProof{},
+	}
+	view.ReclaimEffective = cpus.Clone()
+	return bulkheadapi.DAGApplyResult{
+		FullyConverged:       true,
+		FinalSnapshotCurrent: true,
+		AppliedView:          view,
+	}
+}
+
+func TestManagerReconcilesDisabledTopologyEveryRoundAndResetsOnce(t *testing.T) {
+	t.Parallel()
+
+	topologyPlugin := &fakeDisabledTopologyPlugin{
+		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
+		shouldReconcile: true,
+		results: []bulkheadapi.DAGApplyResult{
+			reclaimOnlyResult(machine.NewCPUSet(1, 2)),
+			reclaimOnlyResult(machine.NewCPUSet(2, 3)),
+		},
+	}
+	dependent := &fakePlugin{name: "dependent", enabled: true}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, dependent}}
+	in := enabledCPUSetAdjustmentCtx()
+
+	first, err := m.Apply(context.Background(), in)
+	if err != nil {
+		t.Fatalf("first Apply() error: %v", err)
+	}
+	second, err := m.Apply(context.Background(), in)
+	if err != nil {
+		t.Fatalf("second Apply() error: %v", err)
+	}
+
+	assertCPUSet(t, "first applied reclaim", first, "1-2")
+	assertCPUSet(t, "second applied reclaim", second, "2-3")
+	if topologyPlugin.disabledCalls != 1 {
+		t.Fatalf("disabled reset calls = %d, want 1", topologyPlugin.disabledCalls)
+	}
+	if topologyPlugin.reconcileCalls != 2 {
+		t.Fatalf("disabled reconcile calls = %d, want 2", topologyPlugin.reconcileCalls)
+	}
+	if len(dependent.adjustViews) != 2 {
+		t.Fatalf("dependent adjustment calls = %d, want 2", len(dependent.adjustViews))
+	}
+	if m.appliedView == nil || m.appliedView.Level != model.AppliedViewLevelReclaimOnly {
+		t.Fatalf("published applied view = %+v, want reclaim-only", m.appliedView)
+	}
+	assertCPUSet(t, "latest applied reclaim", m.LatestAppliedReclaim(), "2-3")
+}
+
+func TestManagerRetainsDisabledResetAfterReconcileFailure(t *testing.T) {
+	t.Parallel()
+
+	reconcileErr := errors.New("reconcile failed")
+	topologyPlugin := &fakeDisabledTopologyPlugin{
+		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
+		shouldReconcile: true,
+		results: []bulkheadapi.DAGApplyResult{
+			{},
+			reclaimOnlyResult(machine.NewCPUSet(1)),
+		},
+		reconcileErrs: []error{reconcileErr},
+	}
+	dependent := &fakePlugin{name: "dependent", enabled: true}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, dependent}}
+	in := enabledCPUSetAdjustmentCtx()
+
+	if _, err := m.Apply(context.Background(), in); !errors.Is(err, reconcileErr) {
+		t.Fatalf("first Apply() error = %v, want %v", err, reconcileErr)
+	}
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("second Apply() error: %v", err)
+	}
+
+	if topologyPlugin.disabledCalls != 1 {
+		t.Fatalf("disabled reset calls = %d, want 1 after reconcile retry", topologyPlugin.disabledCalls)
+	}
+	if topologyPlugin.reconcileCalls != 2 {
+		t.Fatalf("disabled reconcile calls = %d, want 2", topologyPlugin.reconcileCalls)
+	}
+	if len(dependent.adjustViews) != 1 {
+		t.Fatalf("dependent adjustment calls = %d, want 1 after successful retry", len(dependent.adjustViews))
+	}
+}
+
+func TestManagerRetriesInitialDisabledResetFailure(t *testing.T) {
+	t.Parallel()
+
+	resetErr := errors.New("initial reset failed")
+	topologyPlugin := &fakeDisabledTopologyPlugin{
+		fakePlugin: &fakePlugin{
+			name:         "cpuset_topology",
+			disabledErrs: []error{resetErr, nil},
+		},
+		shouldReconcile: true,
+		results:         []bulkheadapi.DAGApplyResult{reclaimOnlyResult(machine.NewCPUSet(1))},
+	}
+	dependent := &fakePlugin{name: "dependent", enabled: true}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, dependent}}
+	in := enabledCPUSetAdjustmentCtx()
+
+	if _, err := m.Apply(context.Background(), in); !errors.Is(err, resetErr) {
+		t.Fatalf("first Apply() error = %v, want %v", err, resetErr)
+	}
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("retried Apply() error: %v", err)
+	}
+	if topologyPlugin.disabledCalls != 2 {
+		t.Fatalf("disabled reset calls = %d, want failed reset and retry", topologyPlugin.disabledCalls)
+	}
+	if topologyPlugin.reconcileCalls != 1 || len(dependent.adjustViews) != 1 {
+		t.Fatalf("reconcile calls=%d dependent calls=%d, want one each after successful reset",
+			topologyPlugin.reconcileCalls, len(dependent.adjustViews))
+	}
+}
+
+func TestManagerRetriesPendingResetWhenReclaimOnlyBecomesIneligibleAfterFailure(t *testing.T) {
+	t.Parallel()
+
+	resetErr := errors.New("reclaim-only entry reset failed")
+	topologyPlugin := &fakeDisabledTopologyPlugin{
+		fakePlugin: &fakePlugin{
+			name:         "cpuset_topology",
+			disabledErrs: []error{nil, resetErr, nil},
+		},
+	}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin}}
+	in := enabledCPUSetAdjustmentCtx()
+
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("initial ordinary disabled Apply() error: %v", err)
+	}
+	topologyPlugin.shouldReconcile = true
+	if _, err := m.Apply(context.Background(), in); !errors.Is(err, resetErr) {
+		t.Fatalf("reclaim-only entry Apply() error = %v, want %v", err, resetErr)
+	}
+	topologyPlugin.shouldReconcile = false
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("ordinary disabled Apply() after failed reclaim-only entry error: %v", err)
+	}
+	if topologyPlugin.disabledCalls != 3 {
+		t.Fatalf("disabled reset calls = %d, want initial reset, failed reclaim-only entry, and authoritative retry",
+			topologyPlugin.disabledCalls)
+	}
+}
+
+func TestManagerRetriesPendingResetWhenReclaimOnlyBecomesIneligibleAfterStaleFence(t *testing.T) {
+	t.Parallel()
+
+	topologyPlugin := &fakeDisabledTopologyPlugin{
+		fakePlugin: &fakePlugin{name: "cpuset_topology"},
+	}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin}}
+	in := enabledCPUSetAdjustmentCtx()
+
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("initial ordinary disabled Apply() error: %v", err)
+	}
+	topologyPlugin.shouldReconcile = true
+	staleOnce := true
+	in.CommitIfGenerationCurrent = func(_ uint64, commit func()) bool {
+		if topologyPlugin.disabledCalls == 2 && staleOnce {
+			staleOnce = false
+			return false
+		}
+		commit()
+		return true
+	}
+	var nonConverged *NonConvergedError
+	if _, err := m.Apply(context.Background(), in); !errors.As(err, &nonConverged) {
+		t.Fatalf("stale reclaim-only entry Apply() error = %v, want NonConvergedError", err)
+	}
+	topologyPlugin.shouldReconcile = false
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("ordinary disabled Apply() after stale reclaim-only entry error: %v", err)
+	}
+	if topologyPlugin.disabledCalls != 3 {
+		t.Fatalf("disabled reset calls = %d, want initial reset, stale reclaim-only entry, and authoritative retry",
+			topologyPlugin.disabledCalls)
+	}
+}
+
+func TestManagerRejectsStaleReclaimOnlySnapshotBeforePublishing(t *testing.T) {
+	t.Parallel()
+
+	result := reclaimOnlyResult(machine.NewCPUSet(1))
+	result.FinalSnapshotCurrent = false
+	topologyPlugin := &fakeDisabledTopologyPlugin{
+		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
+		shouldReconcile: true,
+		results:         []bulkheadapi.DAGApplyResult{result},
+	}
+	dependent := &fakePlugin{name: "dependent", enabled: true}
+	old := reclaimOnlyResult(machine.NewCPUSet(3)).AppliedView
+	m := &Manager{
+		plugins:             []bulkheadapi.Plugin{topologyPlugin, dependent},
+		appliedView:         old,
+		appliedViewRevision: 7,
+	}
+	m.publishLatestAppliedReclaim(old.ReclaimEffective)
+
+	_, err := m.Apply(context.Background(), enabledCPUSetAdjustmentCtx())
+	var nonConverged *NonConvergedError
+	if !errors.As(err, &nonConverged) {
+		t.Fatalf("Apply() error = %v, want NonConvergedError", err)
+	}
+	if len(dependent.adjustViews) != 0 {
+		t.Fatalf("dependent calls = %d, want 0", len(dependent.adjustViews))
+	}
+	if m.appliedViewRevision != 7 {
+		t.Fatalf("applied revision = %d, want 7", m.appliedViewRevision)
+	}
+	assertCPUSet(t, "retained latest reclaim", m.LatestAppliedReclaim(), "3")
+}
+
+func TestManagerRetriesDisabledResetAfterStaleGenerationFence(t *testing.T) {
+	t.Parallel()
+
+	topologyPlugin := &fakeDisabledTopologyPlugin{
+		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
+		shouldReconcile: true,
+		results:         []bulkheadapi.DAGApplyResult{reclaimOnlyResult(machine.NewCPUSet(1))},
+	}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin}}
+	in := enabledCPUSetAdjustmentCtx()
+	staleOnce := true
+	in.CommitIfGenerationCurrent = func(_ uint64, commit func()) bool {
+		if topologyPlugin.disabledCalls == 1 && staleOnce {
+			staleOnce = false
+			return false
+		}
+		commit()
+		return true
+	}
+
+	var nonConverged *NonConvergedError
+	if _, err := m.Apply(context.Background(), in); !errors.As(err, &nonConverged) {
+		t.Fatalf("stale reset Apply() error = %v, want NonConvergedError", err)
+	}
+	in.CommitIfGenerationCurrent = nil
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("retried Apply() error: %v", err)
+	}
+	if topologyPlugin.disabledCalls != 2 {
+		t.Fatalf("disabled reset calls = %d, want stale reset retried", topologyPlugin.disabledCalls)
+	}
+}
+
+func TestManagerRejectsStaleGenerationAfterReclaimOnlyConvergence(t *testing.T) {
+	t.Parallel()
+
+	topologyPlugin := &fakeDisabledTopologyPlugin{
+		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
+		shouldReconcile: true,
+		results:         []bulkheadapi.DAGApplyResult{reclaimOnlyResult(machine.NewCPUSet(1))},
+	}
+	dependent := &fakePlugin{name: "dependent", enabled: true}
+	old := reclaimOnlyResult(machine.NewCPUSet(3)).AppliedView
+	m := &Manager{
+		plugins:             []bulkheadapi.Plugin{topologyPlugin, dependent},
+		appliedView:         old,
+		appliedViewRevision: 7,
+	}
+	m.publishLatestAppliedReclaim(old.ReclaimEffective)
+	in := enabledCPUSetAdjustmentCtx()
+	fenceCalls := 0
+	in.CommitIfGenerationCurrent = func(_ uint64, commit func()) bool {
+		fenceCalls++
+		if fenceCalls == 4 {
+			return false
+		}
+		commit()
+		return true
+	}
+
+	var nonConverged *NonConvergedError
+	if _, err := m.Apply(context.Background(), in); !errors.As(err, &nonConverged) {
+		t.Fatalf("Apply() error = %v, want stale generation NonConvergedError", err)
+	}
+	if len(dependent.adjustViews) != 0 {
+		t.Fatalf("dependent calls = %d, want 0 before stale publication", len(dependent.adjustViews))
+	}
+	if m.appliedViewRevision != 7 {
+		t.Fatalf("applied revision = %d, want 7", m.appliedViewRevision)
+	}
+	assertCPUSet(t, "retained latest reclaim", m.LatestAppliedReclaim(), "3")
+}
+
+func TestManagerEmptyReclaimOnlyResultDoesNotWriteCommitOverride(t *testing.T) {
+	t.Parallel()
+
+	topologyPlugin := &fakeDisabledTopologyPlugin{
+		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
+		shouldReconcile: true,
+		results:         []bulkheadapi.DAGApplyResult{reclaimOnlyResult(machine.NewCPUSet())},
+	}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin}}
+	m.publishLatestAppliedReclaim(machine.NewCPUSet(3))
+	override := &cpusetutil.CPUSetAdjustmentCommitOverride{}
+	in := enabledCPUSetAdjustmentCtx()
+	in.CommitOverride = override
+
+	got, err := m.Apply(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Apply() error: %v", err)
+	}
+	if !got.IsEmpty() || !m.LatestAppliedReclaim().IsEmpty() {
+		t.Fatalf("empty reclaim result not published: return=%s latest=%s", got.String(), m.LatestAppliedReclaim().String())
+	}
+	if override.Source != "" || !override.ReclaimEffective.IsEmpty() {
+		t.Fatalf("empty reclaim result wrote commit override: %+v", override)
+	}
+}
+
+func TestManagerRejectsInvalidReclaimOnlyResult(t *testing.T) {
+	t.Parallel()
+
+	result := reclaimOnlyResult(machine.NewCPUSet(1))
+	result.AppliedView.Level = model.AppliedViewLevelParentSafe
+	topologyPlugin := &fakeDisabledTopologyPlugin{
+		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
+		shouldReconcile: true,
+		results:         []bulkheadapi.DAGApplyResult{result},
+	}
+	dependent := &fakePlugin{name: "dependent", enabled: true}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, dependent}}
+
+	_, err := m.Apply(context.Background(), enabledCPUSetAdjustmentCtx())
+	var nonConverged *NonConvergedError
+	if !errors.As(err, &nonConverged) {
+		t.Fatalf("Apply() error = %v, want NonConvergedError", err)
+	}
+	if len(dependent.adjustViews) != 0 {
+		t.Fatalf("dependent adjustment calls = %d, want 0", len(dependent.adjustViews))
+	}
+}
+
+func TestManagerDisabledResetAndReconcileShareDeadline(t *testing.T) {
+	t.Parallel()
+
+	topologyPlugin := &fakeDisabledTopologyPlugin{
+		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
+		shouldReconcile: true,
+		results:         []bulkheadapi.DAGApplyResult{reclaimOnlyResult(machine.NewCPUSet(1))},
+	}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin}}
+	in := enabledCPUSetAdjustmentCtx()
+	in.CoreConf = config.NewConfiguration()
+	in.CoreConf.CPUQRMPluginConfig.BulkheadConfiguration.TopologyConvergenceBudget.DeadlineDuration = time.Second
+
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("Apply() error: %v", err)
+	}
+	if len(topologyPlugin.disabledDeadlines) != 1 || len(topologyPlugin.deadlines) != 1 {
+		t.Fatalf("deadline observations reset=%v reconcile=%v, want one each",
+			topologyPlugin.disabledDeadlines, topologyPlugin.deadlines)
+	}
+	if !topologyPlugin.disabledDeadlines[0].Equal(topologyPlugin.deadlines[0]) {
+		t.Fatalf("reset deadline %s differs from reconcile deadline %s",
+			topologyPlugin.disabledDeadlines[0], topologyPlugin.deadlines[0])
+	}
+}
+
+func TestManagerDisabledDeadlineStartsAfterLockAcquisition(t *testing.T) {
+	const deadlineDuration = 80 * time.Millisecond
+
+	topologyPlugin := &fakeDisabledTopologyPlugin{
+		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
+		shouldReconcile: true,
+		results:         []bulkheadapi.DAGApplyResult{reclaimOnlyResult(machine.NewCPUSet(1))},
+	}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin}}
+	in := enabledCPUSetAdjustmentCtx()
+	in.CoreConf = config.NewConfiguration()
+	in.CoreConf.CPUQRMPluginConfig.BulkheadConfiguration.TopologyConvergenceBudget.DeadlineDuration = deadlineDuration
+
+	if err := m.mu.Lock(context.Background()); err != nil {
+		t.Fatalf("hold manager lock: %v", err)
+	}
+	observed := make(chan struct{})
+	ctx := &lockObservedContext{Context: context.Background(), observed: observed}
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.Apply(ctx, in)
+		done <- err
+	}()
+	<-observed
+	time.Sleep(2 * deadlineDuration)
+	lockReleasedAt := time.Now()
+	m.mu.Unlock()
+
+	if err := <-done; err != nil {
+		t.Fatalf("Apply() error: %v", err)
+	}
+	if len(topologyPlugin.deadlines) != 1 {
+		t.Fatalf("reconcile deadlines = %v, want one", topologyPlugin.deadlines)
+	}
+	if remaining := topologyPlugin.deadlines[0].Sub(lockReleasedAt); remaining < deadlineDuration/2 {
+		t.Fatalf("deadline remaining after lock acquisition = %s, want at least %s",
+			remaining, deadlineDuration/2)
+	}
+}
+
+func TestManagerClearsDisabledResetCompletionAfterEnabledRound(t *testing.T) {
+	t.Parallel()
+
+	topologyPlugin := &fakeDisabledTopologyPlugin{
+		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
+		shouldReconcile: true,
+		results: []bulkheadapi.DAGApplyResult{
+			reclaimOnlyResult(machine.NewCPUSet(1)),
+			reclaimOnlyResult(machine.NewCPUSet(1)),
+		},
+	}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin}}
+	in := enabledCPUSetAdjustmentCtx()
+
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("first disabled Apply() error: %v", err)
+	}
+	topologyPlugin.enabled = true
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("enabled Apply() error: %v", err)
+	}
+	topologyPlugin.enabled = false
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("second disabled Apply() error: %v", err)
+	}
+	if topologyPlugin.disabledCalls != 2 {
+		t.Fatalf("disabled reset calls = %d, want 2 across disabled epochs", topologyPlugin.disabledCalls)
+	}
+}
+
+func TestManagerLeavingDisabledReconcileRunsAuthoritativeDisabledReset(t *testing.T) {
+	t.Parallel()
+
+	topologyPlugin := &fakeDisabledTopologyPlugin{
+		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
+		shouldReconcile: true,
+		results:         []bulkheadapi.DAGApplyResult{reclaimOnlyResult(machine.NewCPUSet(1))},
+	}
+	dependent := &fakePlugin{name: "dependent", enabled: true}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, dependent}}
+	in := enabledCPUSetAdjustmentCtx()
+
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("reclaim-only Apply() error: %v", err)
+	}
+	topologyPlugin.shouldReconcile = false
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("ordinary disabled Apply() error: %v", err)
+	}
+	if topologyPlugin.disabledCalls != 2 {
+		t.Fatalf("disabled reset calls = %d, want reclaim-only transition and authoritative exit reset", topologyPlugin.disabledCalls)
+	}
+	if len(dependent.adjustViews) != 1 {
+		t.Fatalf("dependent adjustment calls = %d, want only reclaim-only round", len(dependent.adjustViews))
+	}
+}
+
+func TestManagerLeavingDisabledReconcileRetriesFailedReset(t *testing.T) {
+	t.Parallel()
+
+	resetErr := errors.New("exit reset failed")
+	topologyPlugin := &fakeDisabledTopologyPlugin{
+		fakePlugin: &fakePlugin{
+			name:         "cpuset_topology",
+			disabledErrs: []error{nil, resetErr, nil},
+		},
+		shouldReconcile: true,
+		results:         []bulkheadapi.DAGApplyResult{reclaimOnlyResult(machine.NewCPUSet(1))},
+	}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin}}
+	in := enabledCPUSetAdjustmentCtx()
+
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("reclaim-only Apply() error: %v", err)
+	}
+	topologyPlugin.shouldReconcile = false
+	if _, err := m.Apply(context.Background(), in); !errors.Is(err, resetErr) {
+		t.Fatalf("failed exit Apply() error = %v, want %v", err, resetErr)
+	}
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("retried exit Apply() error: %v", err)
+	}
+	if topologyPlugin.disabledCalls != 3 {
+		t.Fatalf("disabled reset calls = %d, want transition, failed exit, and retried exit", topologyPlugin.disabledCalls)
+	}
+}
+
+func TestManagerLeavingDisabledReconcileRetriesStaleReset(t *testing.T) {
+	t.Parallel()
+
+	topologyPlugin := &fakeDisabledTopologyPlugin{
+		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
+		shouldReconcile: true,
+		results:         []bulkheadapi.DAGApplyResult{reclaimOnlyResult(machine.NewCPUSet(1))},
+	}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin}}
+	in := enabledCPUSetAdjustmentCtx()
+	staleOnce := true
+	in.CommitIfGenerationCurrent = func(_ uint64, commit func()) bool {
+		if topologyPlugin.disabledCalls == 2 && staleOnce {
+			staleOnce = false
+			return false
+		}
+		commit()
+		return true
+	}
+
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("reclaim-only Apply() error: %v", err)
+	}
+	topologyPlugin.shouldReconcile = false
+	var nonConverged *NonConvergedError
+	if _, err := m.Apply(context.Background(), in); !errors.As(err, &nonConverged) {
+		t.Fatalf("stale exit Apply() error = %v, want NonConvergedError", err)
+	}
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("retried stale exit Apply() error: %v", err)
+	}
+	if topologyPlugin.disabledCalls != 3 {
+		t.Fatalf("disabled reset calls = %d, want transition, stale exit, and retried exit", topologyPlugin.disabledCalls)
+	}
+}
+
+func TestManagerFullTopologyAttemptAfterReclaimOnlyMarksDisabledResetPending(t *testing.T) {
+	t.Parallel()
+
+	applyErr := errors.New("full topology partially wrote before failing")
+	topologyPlugin := &fakeFullAndDisabledTopologyPlugin{
+		fakeDisabledTopologyPlugin: &fakeDisabledTopologyPlugin{
+			fakePlugin:      &fakePlugin{name: "cpuset_topology"},
+			shouldReconcile: true,
+			results:         []bulkheadapi.DAGApplyResult{reclaimOnlyResult(machine.NewCPUSet(1))},
+		},
+		applyErrs: []error{applyErr},
+	}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin}}
+	in := enabledCPUSetAdjustmentCtx()
+
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("reclaim-only Apply() error: %v", err)
+	}
+	topologyPlugin.enabled = true
+	topologyPlugin.shouldReconcile = false
+	if _, err := m.Apply(context.Background(), in); !errors.Is(err, applyErr) {
+		t.Fatalf("full topology Apply() error = %v, want %v", err, applyErr)
+	}
+	topologyPlugin.enabled = false
+	if _, err := m.Apply(context.Background(), in); err != nil {
+		t.Fatalf("disabled Apply() after partial full attempt error: %v", err)
+	}
+	if topologyPlugin.disabledCalls != 2 {
+		t.Fatalf("disabled reset calls = %d, want reclaim-only reset and authoritative reset after full attempt",
+			topologyPlugin.disabledCalls)
+	}
 }
 
 func (p *fakePlugin) PeriodicalHandler(
@@ -176,8 +817,14 @@ func (p *fakePlugin) PeriodicalHandler(
 	return p.periodicErr
 }
 
-func (p *fakePlugin) CPUSetAdjustmentDisabledHandler(_ context.Context, _ bulkheadapi.HandlerContext) error {
+func (p *fakePlugin) CPUSetAdjustmentDisabledHandler(ctx context.Context, _ bulkheadapi.HandlerContext) error {
 	p.disabledCalls++
+	if deadline, ok := ctx.Deadline(); ok {
+		p.disabledDeadlines = append(p.disabledDeadlines, deadline)
+	}
+	if index := p.disabledCalls - 1; index < len(p.disabledErrs) {
+		return p.disabledErrs[index]
+	}
 	return p.disabledErr
 }
 

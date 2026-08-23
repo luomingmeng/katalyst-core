@@ -83,6 +83,9 @@ func TestNewBulkheadConfigurationDefaultsConvergenceBudgetAndDrainSelection(t *t
 	if cfg.AdmissionSafeDuration != 5*time.Second {
 		t.Fatalf("admission safe duration = %s, want 5s", cfg.AdmissionSafeDuration)
 	}
+	if cfg.PreserveReclaimCPUSetWhenTopologyDisabled {
+		t.Fatal("preserve reclaim cpuset while topology is disabled must default to false")
+	}
 }
 
 func TestTopologyHandlerTimeoutSaturatesNearMaxDuration(t *testing.T) {

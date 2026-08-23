@@ -127,3 +127,26 @@ func TestAppliedViewRelProofDeepCopyAndEqual_BitsUT(t *testing.T) {
 		t.Fatalf("EqualAppliedView should compare rel proof identity")
 	}
 }
+
+func TestAppliedViewReclaimOnlyLevelParticipatesInCopyAndEquality_BitsUT(t *testing.T) {
+	t.Parallel()
+
+	applied := &AppliedView{
+		CPUSetPartitionView: NewCPUSetPartitionView(),
+		Level:               AppliedViewLevelReclaimOnly,
+		CPUSetByRel:         map[string]machine.CPUSet{},
+		RelProofByRel:       map[string]CgroupRelProof{},
+	}
+	copied := applied.DeepCopy()
+	if copied.Level != AppliedViewLevelReclaimOnly {
+		t.Fatalf("copied level = %q, want %q", copied.Level, AppliedViewLevelReclaimOnly)
+	}
+	if !EqualAppliedView(applied, copied) {
+		t.Fatal("equal reclaim-only applied views should compare equal")
+	}
+
+	copied.Level = AppliedViewLevelFull
+	if EqualAppliedView(applied, copied) {
+		t.Fatal("applied views with different levels should not compare equal")
+	}
+}

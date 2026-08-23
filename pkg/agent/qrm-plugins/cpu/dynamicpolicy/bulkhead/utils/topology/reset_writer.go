@@ -38,7 +38,14 @@ func newResetCoordinatorWriter(driver HierarchyDriver, budget *BudgetTracker, de
 	return resetCoordinatorWriter{driver: driver, budget: budget, defaultMems: defaultMems, res: res}
 }
 
-func (w resetCoordinatorWriter) execute(ctx context.Context, dag *TopoDAG, targets map[string]machine.CPUSet, allowEmptyTarget bool, expected map[string]machine.CPUSet) error {
+func (w resetCoordinatorWriter) execute(
+	ctx context.Context,
+	dag *TopoDAG,
+	targets map[string]machine.CPUSet,
+	allowEmptyTarget bool,
+	expected map[string]machine.CPUSet,
+	boundarySets ...map[string]struct{},
+) error {
 	if w.driver == nil {
 		return fmt.Errorf("reset writer requires hierarchy driver")
 	}
@@ -48,6 +55,10 @@ func (w resetCoordinatorWriter) execute(ctx context.Context, dag *TopoDAG, targe
 	controlled := map[string]*TopoNode{}
 	for _, n := range dag.Nodes() {
 		controlled[n.Rel] = n
+	}
+	var boundaries map[string]struct{}
+	if len(boundarySets) > 0 {
+		boundaries = boundarySets[0]
 	}
 	var firstErr error
 	_ = dag.ForEachExpand(func(n *TopoNode) error {
@@ -60,7 +71,7 @@ func (w resetCoordinatorWriter) execute(ctx context.Context, dag *TopoDAG, targe
 		}
 		localErr := w.writeResetNode(ctx, n, target)
 		var propagateErr error
-		w.propagateResetTarget(ctx, n.Rel, target, controlled, expected, &propagateErr, 0)
+		w.propagateResetTarget(ctx, n.Rel, target, controlled, expected, boundaries, &propagateErr, 0)
 		if n.Role == TopoNodeRoleReclaimNUMABucket && localErr != nil {
 			if err := w.writeResetNode(ctx, n, target); err == nil {
 				localErr = nil
@@ -153,7 +164,16 @@ func (w resetCoordinatorWriter) writeResetRel(ctx context.Context, rel, parentRe
 	return nil
 }
 
-func (w resetCoordinatorWriter) propagateResetTarget(ctx context.Context, parentRel string, parentTarget machine.CPUSet, controlled map[string]*TopoNode, expected map[string]machine.CPUSet, firstErr *error, depth int) {
+func (w resetCoordinatorWriter) propagateResetTarget(
+	ctx context.Context,
+	parentRel string,
+	parentTarget machine.CPUSet,
+	controlled map[string]*TopoNode,
+	expected map[string]machine.CPUSet,
+	boundaries map[string]struct{},
+	firstErr *error,
+	depth int,
+) {
 	if depth > maxResetEnforceDepth {
 		if w.res != nil {
 			w.res.Skipped++
@@ -176,6 +196,9 @@ func (w resetCoordinatorWriter) propagateResetTarget(ctx context.Context, parent
 	}
 	for _, child := range children {
 		childRel := filepath.Join(parentRel, child.Name)
+		if withinTraversalBoundary(childRel, boundaries) {
+			continue
+		}
 		if _, ok := controlled[childRel]; ok {
 			continue
 		}
@@ -197,8 +220,20 @@ func (w resetCoordinatorWriter) propagateResetTarget(ctx context.Context, parent
 			}
 			continue
 		}
-		w.propagateResetTarget(ctx, childRel, target, controlled, expected, firstErr, depth+1)
+		w.propagateResetTarget(ctx, childRel, target, controlled, expected, boundaries, firstErr, depth+1)
 	}
+}
+
+func withinTraversalBoundary(rel string, boundaries map[string]struct{}) bool {
+	rel = filepath.Clean(rel)
+	for boundary := range boundaries {
+		boundary = filepath.Clean(boundary)
+		if rel == boundary || (boundary != "." && len(rel) > len(boundary) &&
+			rel[:len(boundary)] == boundary && rel[len(boundary)] == filepath.Separator) {
+			return true
+		}
+	}
+	return false
 }
 
 func (w resetCoordinatorWriter) shouldSkipDynamicUnavailableController(err error, hasExpected bool) bool {

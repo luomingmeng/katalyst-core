@@ -258,9 +258,18 @@ type CoordinatorInput struct {
 	// ProtectedCPUSetByRel records cgroup rels whose current/pending cpuset must
 	// stay covered during a short runtime creation window.
 	ProtectedCPUSetByRel map[string]machine.CPUSet
-	Objective            ConvergenceObjective
-	DeferredCPUSetByRel  map[string]machine.CPUSet
-	AdmissionBudget      *AdmissionConvergenceBudget
+	// TraversalBoundaries are normalized cgroup rels that reset propagation
+	// must neither write nor descend into.
+	TraversalBoundaries map[string]struct{}
+	// RequiredIdentityByRel binds preflight classification to every coordinator
+	// snapshot before that snapshot can authorize a hierarchy write or replan.
+	RequiredIdentityByRel map[string]CgroupIdentity
+	// ExpectedAbsentRels binds preflight absence classification to every
+	// coordinator snapshot before that snapshot can authorize a hierarchy write.
+	ExpectedAbsentRels  map[string]struct{}
+	Objective           ConvergenceObjective
+	DeferredCPUSetByRel map[string]machine.CPUSet
+	AdmissionBudget     *AdmissionConvergenceBudget
 
 	Budget         ConvergenceBudget
 	DrainSelection DrainSelectionPolicy
@@ -378,7 +387,9 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 	round.allowEmptyTarget = allowEmptyTarget
 	round.protectedPending = in.ProtectedPendingCPUSet.Clone()
 	round.protectedByRel = cloneCPUSetMap(in.ProtectedCPUSetByRel)
-	round.snapshotSource = newCompleteSnapshotSource(snapshotDriver, in.DAG, budget)
+	round.requiredIdentityByRel = cloneIdentityMap(in.RequiredIdentityByRel)
+	round.expectedAbsentRels = cloneRelSet(in.ExpectedAbsentRels)
+	round.snapshotSource = newCompleteSnapshotSource(snapshotDriver, in.DAG, budget, in.TraversalBoundaries)
 	round.driver = snapshotDriver
 	initialSnapshot, err := round.nextSnapshot(ctx)
 	if err != nil {
@@ -418,6 +429,11 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 		outcome, err := round.executeFixedPointRound(ctx, in.Mems, res)
 		if err != nil {
 			err = prioritizeRoundStalePlanError(outcome, err)
+			if preflightObservationStale(err) {
+				res.Rounds = append(res.Rounds, outcome)
+				res.State = ConvergenceStateNonConverged
+				return *res, err
+			}
 			if replanRequired(err) {
 				res.Rounds = append(res.Rounds, outcome)
 				if replanBlocked(outcome) {
@@ -775,6 +791,11 @@ func replanRequired(err error) bool {
 	return (errors.As(err, &stale) && stale.ReplanRequired()) || errors.Is(err, ErrCgroupIdentityChanged)
 }
 
+func preflightObservationStale(err error) bool {
+	var stale *PlanStaleError
+	return errors.As(err, &stale) && strings.HasPrefix(stale.Resource, "preflight_")
+}
+
 func (c TopologyCoordinator) convergeReset(ctx context.Context, in CoordinatorInput, res *ConvergenceResult, budget *BudgetTracker) (ConvergenceResult, error) {
 	allowEmptyTarget := in.Cgroup.Version(ctx) == cgroupclient.CgroupVersionV2
 	targets := desiredTargets(in.DAG)
@@ -784,7 +805,7 @@ func (c TopologyCoordinator) convergeReset(ctx context.Context, in CoordinatorIn
 	}
 	defer driver.Close()
 	writer := newResetCoordinatorWriter(driver, budget, in.Mems, res)
-	if err := writer.execute(ctx, in.DAG, targets, allowEmptyTarget, in.ExpectedCPUSetByRel); err != nil {
+	if err := writer.execute(ctx, in.DAG, targets, allowEmptyTarget, in.ExpectedCPUSetByRel, in.TraversalBoundaries); err != nil {
 		return *res, err
 	}
 	report, err := verifyResetConvergence(ctx, driver, budget, in.DAG, targets)
@@ -834,28 +855,30 @@ func newCoordinatorHierarchyDriver(
 }
 
 type coordinatorRound struct {
-	dag                 *TopoDAG
-	targetByRel         map[string]machine.CPUSet
-	dynamicByRel        map[string]machine.CPUSet
-	deferredByRel       map[string]machine.CPUSet
-	deferredCleanupRels map[string]struct{}
-	objective           ConvergenceObjective
-	admissionBudget     *AdmissionConvergenceBudget
-	allowEmptyTarget    bool
-	protectedPending    machine.CPUSet
-	protectedByRel      map[string]machine.CPUSet
-	cpuDetails          machine.CPUDetails
-	reservedCPUs        machine.CPUSet
-	selection           DrainSelectionPolicy
-	snapshotSource      func(context.Context) (*CompleteSnapshot, error)
-	driver              HierarchyDriver
-	budget              *BudgetTracker
-	planID              string
-	witnesses           []ReleaseWitness
-	blocked             map[DomainID]machine.CPUSet
-	pendingSnapshot     *CompleteSnapshot
-	round               int
-	maxRounds           int
+	dag                   *TopoDAG
+	targetByRel           map[string]machine.CPUSet
+	dynamicByRel          map[string]machine.CPUSet
+	deferredByRel         map[string]machine.CPUSet
+	deferredCleanupRels   map[string]struct{}
+	objective             ConvergenceObjective
+	admissionBudget       *AdmissionConvergenceBudget
+	allowEmptyTarget      bool
+	protectedPending      machine.CPUSet
+	protectedByRel        map[string]machine.CPUSet
+	requiredIdentityByRel map[string]CgroupIdentity
+	expectedAbsentRels    map[string]struct{}
+	cpuDetails            machine.CPUDetails
+	reservedCPUs          machine.CPUSet
+	selection             DrainSelectionPolicy
+	snapshotSource        func(context.Context) (*CompleteSnapshot, error)
+	driver                HierarchyDriver
+	budget                *BudgetTracker
+	planID                string
+	witnesses             []ReleaseWitness
+	blocked               map[DomainID]machine.CPUSet
+	pendingSnapshot       *CompleteSnapshot
+	round                 int
+	maxRounds             int
 }
 
 func newCoordinatorRoundWithBudget(
@@ -953,7 +976,7 @@ func (r *coordinatorRound) nextSnapshot(ctx context.Context) (*CompleteSnapshot,
 	if r.pendingSnapshot != nil {
 		snapshot := r.pendingSnapshot
 		r.pendingSnapshot = nil
-		return snapshot, nil
+		return snapshot, r.validatePreflightObservations(ctx, snapshot)
 	}
 	if r.snapshotSource == nil {
 		return nil, fmt.Errorf("topology coordinator requires complete snapshot source")
@@ -966,7 +989,7 @@ func (r *coordinatorRound) nextSnapshot(ctx context.Context) (*CompleteSnapshot,
 	for {
 		snapshot, err := r.snapshotSource(ctx)
 		if err == nil {
-			return snapshot, nil
+			return snapshot, r.validatePreflightObservations(ctx, snapshot)
 		}
 		var snapshotErr *SnapshotError
 		if !errors.As(err, &snapshotErr) || snapshotErr.Class != HierarchyErrorStale {
@@ -991,6 +1014,67 @@ func (r *coordinatorRound) nextSnapshot(ctx context.Context) (*CompleteSnapshot,
 			return nil, err
 		}
 	}
+}
+
+func (r *coordinatorRound) validatePreflightObservations(ctx context.Context, snapshot *CompleteSnapshot) error {
+	for rel, required := range r.requiredIdentityByRel {
+		entry, ok := snapshot.Entries[rel]
+		if !ok || entry.Identity != required {
+			current := "missing"
+			if ok {
+				current = fmt.Sprintf("%v", entry.Identity)
+			}
+			return &PlanStaleError{
+				Rel:       rel,
+				Direction: WritePublish,
+				Resource:  "preflight_identity",
+				Current:   current,
+				Target:    fmt.Sprintf("%v", required),
+			}
+		}
+	}
+	driver := r.driver
+	if wrapped, ok := driver.(*budgetedHierarchyDriver); !ok || wrapped.budget != r.budget {
+		driver = NewBudgetedHierarchyDriver(driver, r.budget)
+	}
+	for rel := range r.expectedAbsentRels {
+		identity, err := driver.StatIdentity(ctx, rel)
+		if err == nil {
+			return &PlanStaleError{
+				Rel:       rel,
+				Direction: WritePublish,
+				Resource:  "preflight_absence",
+				Current:   fmt.Sprintf("%v", identity),
+				Target:    "absent",
+			}
+		}
+		if !isCgroupNotFoundError(err) {
+			return fmt.Errorf("validate expected absent rel %q: %w", rel, err)
+		}
+	}
+	return nil
+}
+
+func cloneIdentityMap(in map[string]CgroupIdentity) map[string]CgroupIdentity {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]CgroupIdentity, len(in))
+	for rel, identity := range in {
+		out[rel] = identity
+	}
+	return out
+}
+
+func cloneRelSet(in map[string]struct{}) map[string]struct{} {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]struct{}, len(in))
+	for rel := range in {
+		out[rel] = struct{}{}
+	}
+	return out
 }
 
 func (r *coordinatorRound) buildPlan(ctx context.Context, kind PhaseKind, snapshot *CompleteSnapshot) (PhasePlan, error) {

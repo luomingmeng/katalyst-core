@@ -111,4 +111,11 @@ type TopologyPlugin interface {
 	Apply(context.Context, HandlerContext) (DAGApplyResult, error)
 }
 
+// DisabledTopologyReconciler owns a deliberately limited topology scope while
+// the plugin's full topology mode is disabled.
+type DisabledTopologyReconciler interface {
+	ShouldReconcileWhenDisabled(context.Context, HandlerContext) bool
+	ReconcileDisabled(context.Context, HandlerContext) (DAGApplyResult, error)
+}
+
 type PluginFactory func(conf *config.Configuration) Plugin

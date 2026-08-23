@@ -55,9 +55,12 @@ const (
 )
 
 var (
-	_ bulkheadapi.Plugin         = (*CPUSetTopologyPlugin)(nil)
-	_ bulkheadapi.TopologyPlugin = (*CPUSetTopologyPlugin)(nil)
+	_ bulkheadapi.Plugin                     = (*CPUSetTopologyPlugin)(nil)
+	_ bulkheadapi.TopologyPlugin             = (*CPUSetTopologyPlugin)(nil)
+	_ bulkheadapi.DisabledTopologyReconciler = (*CPUSetTopologyPlugin)(nil)
 )
+
+var errReclaimClassificationChanged = errors.New("reclaim path classification changed")
 
 type CPUSetTopologyPlugin struct {
 	cfg                bulkheadconfig.BulkheadConfiguration
@@ -123,6 +126,18 @@ func (p *CPUSetTopologyPlugin) Enable(in bulkheadapi.HandlerContext) bool {
 		return false
 	}
 	return enableBulkheadCpusetTopology(in)
+}
+
+func (p *CPUSetTopologyPlugin) ShouldReconcileWhenDisabled(
+	ctx context.Context,
+	in bulkheadapi.HandlerContext,
+) bool {
+	if !p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled ||
+		enableBulkheadCpusetTopology(in) ||
+		(in.State != nil && in.State.GetAllowSharedCoresOverlapReclaimedCores()) {
+		return false
+	}
+	return !p.disabledOnCgroupV2(ctx)
 }
 
 // disabledOnCgroupV2 reports whether the cpuset_topology plugin must stay inert
@@ -656,6 +671,351 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentDisabledHandler(ctx context.Conte
 	return p.resetCPUSetTopology(ctx, in)
 }
 
+func (p *CPUSetTopologyPlugin) ReconcileDisabled(
+	ctx context.Context,
+	in bulkheadapi.HandlerContext,
+) (result bulkheadapi.DAGApplyResult, terminalErr error) {
+	if !p.ShouldReconcileWhenDisabled(ctx, in) || in.DesiredView == nil {
+		return bulkheadapi.DAGApplyResult{}, nil
+	}
+	var cumulative topology.ConvergenceResult
+	defer func() {
+		emitBulkheadTopologySummary(in.Emitter, "reclaim_only", cumulative, terminalErr)
+	}()
+	for {
+		if err := ctx.Err(); err != nil {
+			cumulative.Converged = false
+			cumulative.ParentSafe = false
+			cumulative.State = topology.ConvergenceStateNonConverged
+			cumulative.FinalSnapshot = nil
+			cumulative.FinalSnapshotCurrent = false
+			return dagApplyResultFromConvergence(cumulative), err
+		}
+		attemptResult, convergence, err := p.reconcileDisabledOnce(ctx, in)
+		accumulateConvergenceResult(&cumulative, convergence)
+		if !errors.Is(err, errReclaimClassificationChanged) &&
+			!errors.Is(err, topology.ErrCoordinatorPlanStale) {
+			result = dagApplyResultFromConvergence(cumulative)
+			result.AppliedView = attemptResult.AppliedView.DeepCopy()
+			return result, err
+		}
+	}
+}
+
+func accumulateConvergenceResult(total *topology.ConvergenceResult, attempt topology.ConvergenceResult) {
+	if total == nil {
+		return
+	}
+	total.Attempted += attempt.Attempted
+	total.Applied += attempt.Applied
+	total.Skipped += attempt.Skipped
+	total.Failed += attempt.Failed
+	total.Deferred += attempt.Deferred
+	total.Journal = append(total.Journal, attempt.Journal...)
+	total.Rounds = append(total.Rounds, attempt.Rounds...)
+	total.Converged = attempt.Converged
+	total.ParentSafe = attempt.ParentSafe
+	total.State = attempt.State
+	total.ConvergenceReport = attempt.ConvergenceReport
+	total.FinalSnapshot = attempt.FinalSnapshot
+	total.FinalSnapshotCurrent = attempt.FinalSnapshotCurrent
+	total.DeferredLeafCount = attempt.DeferredLeafCount
+	total.DeferredCPUCount = attempt.DeferredCPUCount
+}
+
+func (p *CPUSetTopologyPlugin) reconcileDisabledOnce(
+	ctx context.Context,
+	in bulkheadapi.HandlerContext,
+) (bulkheadapi.DAGApplyResult, topology.ConvergenceResult, error) {
+	configured := p.configuredReclaimRels(in.DesiredView)
+	observed, err := topology.ObserveConfiguredRels(ctx, p.cgroup, configured)
+	if err != nil {
+		return bulkheadapi.DAGApplyResult{}, topology.ConvergenceResult{}, fmt.Errorf("classify reclaim-only rels: %w", err)
+	}
+	specs, activeRoots, err := p.buildReclaimOnlySpecs(in, observed)
+	if err != nil {
+		return bulkheadapi.DAGApplyResult{}, topology.ConvergenceResult{}, err
+	}
+	if len(specs) == 0 {
+		current, err := topology.ObserveConfiguredRels(ctx, p.cgroup, configured)
+		if err != nil {
+			return bulkheadapi.DAGApplyResult{}, topology.ConvergenceResult{}, fmt.Errorf("recheck absent reclaim-only rels: %w", err)
+		}
+		if !equalRelObservations(observed, current) {
+			return bulkheadapi.DAGApplyResult{}, topology.ConvergenceResult{}, errReclaimClassificationChanged
+		}
+		convergence := topology.ConvergenceResult{
+			Converged:            true,
+			State:                topology.ConvergenceStateConverged,
+			FinalSnapshotCurrent: true,
+		}
+		return bulkheadapi.DAGApplyResult{
+			FullyConverged:       true,
+			FinalSnapshotCurrent: true,
+			AppliedView:          reclaimOnlyAppliedView(in.DesiredView, nil, nil),
+		}, convergence, nil
+	}
+
+	dag, err := topology.BuildDAG(specs)
+	if err != nil {
+		return bulkheadapi.DAGApplyResult{}, topology.ConvergenceResult{}, fmt.Errorf("build reclaim-only topology dag: %w", err)
+	}
+	expectedRes, err := p.buildExpectedCPUSetByRel(ctx, in)
+	if err != nil {
+		return bulkheadapi.DAGApplyResult{}, topology.ConvergenceResult{}, fmt.Errorf("build reclaim-only expected container cpuset: %w", err)
+	}
+	expected := filterCPUSetByRoots(expectedRes.ExpectedByRel, activeRoots)
+	deferred := filterCPUSetByRoots(expectedRes.DeferredLeafByRel, activeRoots)
+	protected := filterCPUSetByRoots(p.pendingProtectedCPUSetByRel(ctx, expectedRes.PendingByPod), activeRoots)
+	absentBoundaries := make(map[string]struct{})
+	requiredIdentities := make(map[string]topology.CgroupIdentity)
+	activeRels := make(map[string]struct{}, len(specs))
+	for _, spec := range specs {
+		activeRels[spec.Rel] = struct{}{}
+	}
+	for rel, observation := range observed {
+		if !observation.Exists {
+			absentBoundaries[rel] = struct{}{}
+			continue
+		}
+		if _, ok := activeRels[rel]; ok {
+			requiredIdentities[rel] = observation.Identity
+		}
+	}
+
+	var cpuDetails machine.CPUDetails
+	if in.Topology != nil {
+		cpuDetails = in.Topology.CPUDetails
+	}
+	var finalAppliedView *model.AppliedView
+	res, err := (topology.TopologyCoordinator{}).Converge(ctx, topology.CoordinatorInput{
+		DAG:                    dag,
+		Cgroup:                 p.cgroup,
+		Mode:                   topology.NormalModeGuardWithGate(p.sharedModeGate()),
+		Budget:                 topologyBudgetFromConfig(p.cfg.TopologyConvergenceBudget),
+		DrainSelection:         topologyDrainSelectionFromConfig(p.cfg.TopologyDrainSelection),
+		CPUDetails:             cpuDetails,
+		ReservedCPUSet:         in.DesiredView.Reserve,
+		ExpectedCPUSetByRel:    expected,
+		DeferredCPUSetByRel:    deferred,
+		ProtectedCPUSetByRel:   protected,
+		ProtectedPendingCPUSet: machine.NewCPUSet(),
+		TraversalBoundaries:    absentBoundaries,
+		RequiredIdentityByRel:  requiredIdentities,
+		ExpectedAbsentRels:     absentBoundaries,
+		Objective:              topology.ConvergenceObjectiveFull,
+		PublishFinalSnapshot: func(snapshot *topology.CompleteSnapshot) error {
+			current, err := topology.ObserveConfiguredRels(ctx, p.cgroup, configured)
+			if err != nil {
+				return err
+			}
+			if !equalRelObservations(observed, current) {
+				return errReclaimClassificationChanged
+			}
+			for rel, required := range requiredIdentities {
+				entry, ok := snapshot.Entries[rel]
+				if !ok || entry.Identity != required {
+					return errReclaimClassificationChanged
+				}
+			}
+			finalAppliedView = reclaimOnlyAppliedView(in.DesiredView, dag, snapshot)
+			if finalAppliedView == nil {
+				return fmt.Errorf("derive reclaim-only applied view")
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		return dagApplyResultFromConvergence(res), res, fmt.Errorf("apply reclaim-only topology dag: %w", err)
+	}
+	result := dagApplyResultFromConvergence(res)
+	result.AppliedView = finalAppliedView.DeepCopy()
+	if result.FullyConverged && result.FinalSnapshotCurrent && result.AppliedView == nil {
+		return bulkheadapi.DAGApplyResult{}, res, fmt.Errorf("reclaim-only convergence is missing final-snapshot applied view")
+	}
+	return result, res, nil
+}
+
+func (p *CPUSetTopologyPlugin) configuredReclaimRels(desired *model.DesiredView) []string {
+	rels := make([]string, 0, len(p.cfg.BulkheadReclaimRelPaths))
+	for reclaimIndex, root := range p.cfg.BulkheadReclaimRelPaths {
+		root = strings.Trim(root, "/")
+		if root == "" {
+			continue
+		}
+		rels = append(rels, root)
+		if desired == nil {
+			continue
+		}
+		for numaID := range desired.ReclaimEffectivePerNUMA {
+			if rel := p.cfg.ReclaimPerNUMA(reclaimIndex, numaID); rel != "" {
+				rels = append(rels, strings.Trim(rel, "/"))
+			}
+		}
+	}
+	sort.Strings(rels)
+	return rels
+}
+
+func (p *CPUSetTopologyPlugin) buildReclaimOnlySpecs(
+	in bulkheadapi.HandlerContext,
+	observed map[string]topology.RelObservation,
+) ([]topology.NodeSpec, []string, error) {
+	var cpuDetails machine.CPUDetails
+	if in.Topology != nil {
+		cpuDetails = in.Topology.CPUDetails
+	}
+	all, err := bulkheadutils.BuildTopologyNodeSpecsFromView(
+		p.cfg, desiredCPUSetPartitionView(in.DesiredView), cpuDetails, nil, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build reclaim-only topology inputs: %w", err)
+	}
+	activeRootSet := make(map[string]struct{}, len(p.cfg.BulkheadReclaimRelPaths))
+	rootParent := make(map[string]string, len(p.cfg.BulkheadReclaimRelPaths))
+	for _, spec := range all {
+		if spec.Role != topology.TopoNodeRoleReclaim {
+			continue
+		}
+		rel := strings.Trim(spec.Rel, "/")
+		if observed[rel].Exists {
+			activeRootSet[rel] = struct{}{}
+			rootParent[rel] = strings.Trim(spec.ParentRel, "/")
+		} else if rel != "" {
+			general.InfofV(4, "cpuset_topology: reclaim-only rel path does not exist, skipping, rel=%q", rel)
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for root := range activeRootSet {
+			parent := rootParent[root]
+			if parent == "" {
+				continue
+			}
+			if _, ok := activeRootSet[parent]; ok {
+				continue
+			}
+			delete(activeRootSet, root)
+			changed = true
+		}
+	}
+	activeRoots := make([]string, 0, len(activeRootSet))
+	for root := range activeRootSet {
+		activeRoots = append(activeRoots, root)
+	}
+	sort.Strings(activeRoots)
+	specs := make([]topology.NodeSpec, 0, len(all))
+	for _, spec := range all {
+		rel := strings.Trim(spec.Rel, "/")
+		switch spec.Role {
+		case topology.TopoNodeRoleReclaim:
+			if _, ok := activeRootSet[rel]; !ok {
+				continue
+			}
+		case topology.TopoNodeRoleReclaimNUMABucket:
+			if !observed[rel].Exists || !withinAnyRelRoot(rel, activeRoots) {
+				if rel != "" && !observed[rel].Exists {
+					general.InfofV(4, "cpuset_topology: reclaim-only rel path does not exist, skipping, rel=%q", rel)
+				}
+				continue
+			}
+			if spec.ParentRel != "" {
+				if _, ok := activeRootSet[spec.ParentRel]; !ok {
+					continue
+				}
+			}
+		default:
+			continue
+		}
+		spec.Rel = rel
+		specs = append(specs, spec)
+	}
+	return specs, activeRoots, nil
+}
+
+func reclaimOnlyAppliedView(
+	desired *model.DesiredView,
+	dag *topology.TopoDAG,
+	snapshot *topology.CompleteSnapshot,
+) *model.AppliedView {
+	if desired == nil {
+		return nil
+	}
+	partition := *desired.CPUSetPartitionView.DeepCopy()
+	partition.TransientProtectedNonReclaim = machine.NewCPUSet()
+	partition.TransientProtectedNonReclaimPerNUMA = map[int]machine.CPUSet{}
+	partition.NonReclaimPool = machine.NewCPUSet()
+	partition.ReclaimEffective = machine.NewCPUSet()
+	partition.ReclaimEffectivePerNUMA = map[int]machine.CPUSet{}
+	partition.ContainerCPUSetByPod = map[string]map[string]machine.CPUSet{}
+	applied := &model.AppliedView{
+		CPUSetPartitionView: partition,
+		Level:               model.AppliedViewLevelReclaimOnly,
+		CPUSetByRel:         map[string]machine.CPUSet{},
+		RelProofByRel:       map[string]model.CgroupRelProof{},
+	}
+	if dag == nil || snapshot == nil {
+		return applied
+	}
+	for _, node := range dag.Nodes() {
+		proof, ok := snapshot.TargetProofCPUs(node.Rel, node.CPUs)
+		if !ok {
+			return nil
+		}
+		entry := snapshot.Entries[node.Rel]
+		applied.CPUSetByRel[node.Rel] = proof.Clone()
+		applied.RelProofByRel[node.Rel] = model.CgroupRelProof{
+			Device: entry.Identity.Device,
+			Inode:  entry.Identity.Inode,
+			CPUSet: proof.Clone(),
+		}
+		if node.Role == topology.TopoNodeRoleReclaim {
+			applied.ReclaimEffective = applied.ReclaimEffective.Union(proof)
+		}
+		if node.Role == topology.TopoNodeRoleReclaimNUMABucket {
+			numaID, err := strconv.Atoi(node.Metadata["numa"])
+			if err != nil {
+				return nil
+			}
+			applied.ReclaimEffectivePerNUMA[numaID] =
+				applied.ReclaimEffectivePerNUMA[numaID].Union(proof)
+		}
+	}
+	return applied
+}
+
+func filterCPUSetByRoots(in map[string]machine.CPUSet, roots []string) map[string]machine.CPUSet {
+	out := make(map[string]machine.CPUSet)
+	for rel, cpus := range in {
+		if withinAnyRelRoot(rel, roots) {
+			out[rel] = cpus.Clone()
+		}
+	}
+	return out
+}
+
+func withinAnyRelRoot(rel string, roots []string) bool {
+	rel = strings.Trim(rel, "/")
+	for _, root := range roots {
+		root = strings.Trim(root, "/")
+		if rel == root || strings.HasPrefix(rel, root+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func equalRelObservations(a, b map[string]topology.RelObservation) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for rel, left := range a {
+		if right, ok := b[rel]; !ok || left != right {
+			return false
+		}
+	}
+	return true
+}
+
 func (p *CPUSetTopologyPlugin) disabledResetCPUSet(ctx context.Context, in bulkheadapi.HandlerContext) (machine.CPUSet, error) {
 	if p.cgroup.Version(ctx) == cgroupclient.CgroupVersionV2 {
 		return machine.NewCPUSet(), nil
@@ -700,6 +1060,17 @@ func (p *CPUSetTopologyPlugin) buildDisabledResetDAG(
 	specs, err := bulkheadutils.BuildTopologyNodeSpecsFromView(p.cfg, desiredCPUSetPartitionView(in.DesiredView), cpuDetails, siblings, relExists)
 	if err != nil {
 		return nil, fmt.Errorf("build disabled reset topology inputs: %w", err)
+	}
+	if p.ShouldReconcileWhenDisabled(ctx, in) {
+		reclaimRoots := normalizedReclaimRoots(p.cfg.BulkheadReclaimRelPaths)
+		filtered := specs[:0]
+		for _, spec := range specs {
+			if withinAnyRelRoot(spec.Rel, reclaimRoots) {
+				continue
+			}
+			filtered = append(filtered, spec)
+		}
+		specs = filtered
 	}
 	specs, err = p.filterExistingDisabledResetSpecs(ctx, specs)
 	if err != nil {
@@ -773,11 +1144,16 @@ func (p *CPUSetTopologyPlugin) resetCPUSetTopology(ctx context.Context, in bulkh
 		return nil
 	}
 
+	var traversalBoundaries map[string]struct{}
+	if p.ShouldReconcileWhenDisabled(ctx, in) {
+		traversalBoundaries = reclaimResetBoundaries(p.cfg, in.DesiredView)
+	}
 	res, err := (topology.TopologyCoordinator{}).Converge(ctx, topology.CoordinatorInput{
 		DAG:                 dag,
 		Cgroup:              p.cgroup,
 		Mode:                topology.ResetModeGuardWithGate(p.sharedModeGate()),
 		ExpectedCPUSetByRel: expected,
+		TraversalBoundaries: traversalBoundaries,
 		Budget:              topologyBudgetFromConfig(p.cfg.TopologyConvergenceBudget),
 		DrainSelection:      topologyDrainSelectionFromConfig(p.cfg.TopologyDrainSelection),
 	})
@@ -799,6 +1175,41 @@ func (p *CPUSetTopologyPlugin) resetCPUSetTopology(ctx context.Context, in bulkh
 
 	emitBulkheadPruneResult(in.Emitter, "success", "")
 	return nil
+}
+
+func normalizedReclaimRoots(rels []string) []string {
+	out := make([]string, 0, len(rels))
+	for _, rel := range rels {
+		if rel = strings.Trim(rel, "/"); rel != "" {
+			out = append(out, rel)
+		}
+	}
+	return out
+}
+
+func reclaimResetBoundaries(
+	cfg bulkheadconfig.BulkheadConfiguration,
+	desired *model.DesiredView,
+) map[string]struct{} {
+	if !cfg.PreserveReclaimCPUSetWhenTopologyDisabled {
+		return nil
+	}
+	out := make(map[string]struct{})
+	for reclaimIndex, root := range cfg.BulkheadReclaimRelPaths {
+		if root = strings.Trim(root, "/"); root == "" {
+			continue
+		}
+		out[root] = struct{}{}
+		if desired == nil {
+			continue
+		}
+		for numaID := range desired.ReclaimEffectivePerNUMA {
+			if rel := cfg.ReclaimPerNUMA(reclaimIndex, numaID); rel != "" {
+				out[strings.Trim(rel, "/")] = struct{}{}
+			}
+		}
+	}
+	return out
 }
 
 func (p *CPUSetTopologyPlugin) sharedModeGate() *topology.ModeGate {
@@ -1472,7 +1883,7 @@ const (
 )
 
 var (
-	allowedTopologyMetricPhases      = map[string]struct{}{"normal": {}, "reset": {}}
+	allowedTopologyMetricPhases      = map[string]struct{}{"normal": {}, "reclaim_only": {}, "reset": {}}
 	allowedTopologyMetricStatuses    = map[string]struct{}{"progress": {}, "stale": {}, "blocked": {}, "converged": {}, "error": {}}
 	allowedTopologyMetricReasons     = map[string]struct{}{"none": {}, "stale": {}, "blocked": {}, "budget": {}, "identity_changed": {}, "external_write": {}, "invalid": {}}
 	allowedTopologyMetricDomainRoles = map[string]struct{}{"primary": {}, "reclaim": {}, "reclaim_numa": {}, "dynamic": {}, "unknown": {}}

@@ -43,8 +43,9 @@ type DesiredView struct {
 type AppliedViewLevel string
 
 const (
-	AppliedViewLevelParentSafe AppliedViewLevel = "parent_safe"
-	AppliedViewLevelFull       AppliedViewLevel = "full"
+	AppliedViewLevelParentSafe  AppliedViewLevel = "parent_safe"
+	AppliedViewLevelReclaimOnly AppliedViewLevel = "reclaim_only"
+	AppliedViewLevelFull        AppliedViewLevel = "full"
 )
 
 type AppliedView struct {
