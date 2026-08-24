@@ -154,6 +154,11 @@ func (p *CPUPressureSuppression) evictNonActualNUMABindingPods(now time.Time, fi
 
 	// get reclaim metrics aggregated across every registered reclaim consumer's cgroup subtree
 	existingPaths := p.existingRelativeCgroupPaths(p.reclaimRelativeRootCgroupPaths...)
+	// skip when none of the reclaim cgroup paths exist, consistent with the
+	// numa-binding branch and syncCPUIdle
+	if len(existingPaths) == 0 {
+		return nil, nil
+	}
 	overlapReclaim := p.state.GetAllowSharedCoresOverlapReclaimedCores()
 	reclaimMetrics, err := helper.GetReclaimMetricsMulti(nonActualNUMABindingCPUSet,
 		existingPaths, p.metaServer.MetricsFetcher, overlapReclaim)
