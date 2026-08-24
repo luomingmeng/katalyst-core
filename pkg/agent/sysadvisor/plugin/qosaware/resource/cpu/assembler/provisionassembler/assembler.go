@@ -23,6 +23,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/plugin/qosaware/resource/cpu/region"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
 	"github.com/kubewharf/katalyst-core/pkg/config"
+	"github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
@@ -32,7 +33,20 @@ import (
 // Advisor data elements are shared ONLY by assemblers as pointer to avoid rebuild in advisor,
 // and NOT supposed to be used by other components.
 type ProvisionAssembler interface {
-	AssembleProvision() (types.InternalCPUCalculationResult, error)
+	AssembleProvision(ctx ProvisionContext) (types.InternalCPUCalculationResult, error)
+}
+
+type ReclaimConstraint uint8
+
+const (
+	ReclaimConstraintNone ReclaimConstraint = iota
+	ReclaimConstraintReservedFloor
+)
+
+type ProvisionContext struct {
+	DynamicConfiguration *dynamic.Configuration
+	ReclaimConstraint    ReclaimConstraint
+	ReclaimCeilings      map[ReclaimConstraintScope]int
 }
 
 type InitFunc func(conf *config.Configuration, extraConf interface{}, regionMap *map[string]region.QoSRegion,

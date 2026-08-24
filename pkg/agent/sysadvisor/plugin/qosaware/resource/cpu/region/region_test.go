@@ -436,7 +436,8 @@ func TestQoSRegionShareBootstrapEffectiveControlKnobWhenDefaultShareBackfillEnab
 				return false, nil
 			},
 			ResourceEssentials: types.ResourceEssentials{
-				ResourceUpperBound: 5,
+				DynamicConfiguration: dynamicConf,
+				ResourceUpperBound:   5,
 			},
 		},
 	}
@@ -487,8 +488,9 @@ func TestQoSRegionShareBootstrapUsesStaticReclaimReserveWhenReclaimDisabled(t *t
 				return false, nil
 			},
 			ResourceEssentials: types.ResourceEssentials{
-				ResourceUpperBound: 5,
-				ReservedForReclaim: 2,
+				DynamicConfiguration: dynamicConf,
+				ResourceUpperBound:   5,
+				ReservedForReclaim:   2,
 			},
 		},
 	}
@@ -548,7 +550,8 @@ func TestQoSRegionShareDoesNotBootstrapNonDefaultSharePools(t *testing.T) {
 						return false, nil
 					},
 					ResourceEssentials: types.ResourceEssentials{
-						ResourceUpperBound: 5,
+						DynamicConfiguration: dynamicConf,
+						ResourceUpperBound:   5,
 					},
 				},
 			}

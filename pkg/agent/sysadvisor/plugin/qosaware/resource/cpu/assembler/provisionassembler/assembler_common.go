@@ -49,6 +49,7 @@ type ProvisionAssemblerCommon struct {
 	nonBindingNumas                            *machine.CPUSet
 	allowSharedCoresOverlapReclaimedCores      *bool
 	disableDedicatedCoresOverlapReclaimedCores *bool
+	calculationContext                         ProvisionContext
 
 	metaReader metacache.MetaReader
 	metaServer *metaserver.MetaServer
@@ -69,6 +70,9 @@ func NewProvisionAssemblerCommon(conf *config.Configuration, _ interface{}, regi
 		nonBindingNumas:                       nonBindingNumas,
 		allowSharedCoresOverlapReclaimedCores: allowSharedCoresOverlapReclaimedCores,
 		disableDedicatedCoresOverlapReclaimedCores: disableDedicatedCoresOverlapReclaimedCores,
+		calculationContext: ProvisionContext{
+			DynamicConfiguration: conf.GetDynamicConfiguration(),
+		},
 
 		metaReader: metaReader,
 		metaServer: metaServer,
@@ -87,7 +91,7 @@ func (pa *ProvisionAssemblerCommon) cpuCountInNUMAs(numas machine.CPUSet) int {
 }
 
 func (pa *ProvisionAssemblerCommon) reclaimRatioCPUsPerCore() (int, error) {
-	dynamicConf := pa.conf.GetDynamicConfiguration()
+	dynamicConf := pa.calculationContext.DynamicConfiguration
 	if !dynamicConf.EnableReclaim || !dynamicConf.EnableRampUpReclaimHardPartition {
 		return 1, nil
 	}
@@ -573,7 +577,7 @@ func (pa *ProvisionAssemblerCommon) assembleDedicatedNUMAExclusiveRegion(r regio
 	}
 
 	ratioPhysicalCap := 0
-	if ratio := pa.conf.GetDynamicConfiguration().ReclaimedCPUMaxRatio; ratio > 0 {
+	if ratio := pa.calculationContext.DynamicConfiguration.ReclaimedCPUMaxRatio; ratio > 0 {
 		if cpuCount := pa.cpuCountInNUMAs(r.GetBindingNumas()); cpuCount > 0 {
 			cpusPerCore, err := pa.reclaimRatioCPUsPerCore()
 			if err != nil {
@@ -618,6 +622,19 @@ func (pa *ProvisionAssemblerCommon) assembleDedicatedNUMAExclusiveRegion(r regio
 		r.GetBindingNumas(),
 		reservedForReclaim,
 	)
+	constraintScope := NewExclusiveReclaimConstraintScope(r.Name())
+	desiredReclaimTarget := reclaimTarget
+	var constraintExcess int
+	reclaimTarget, reclaimQuotaLimit, constraintExcess = ApplyReclaimConstraint(
+		constraintScope,
+		reclaimTarget,
+		reclaimQuotaLimit,
+		reservedForReclaim,
+		pa.calculationContext.ReclaimConstraint,
+		pa.calculationContext.ReclaimCeilings,
+	)
+	RecordReclaimConstraintTarget(result, pa.calculationContext.ReclaimConstraint,
+		constraintScope, desiredReclaimTarget, reservedForReclaim, constraintExcess)
 	if reclaimTarget > reclaimCapacity {
 		return fmt.Errorf(
 			"ramp-up reclaim target %d exceeds reclaim capacity %d for exclusive region %q",
@@ -652,6 +669,7 @@ func (pa *ProvisionAssemblerCommon) assembleDedicatedNUMAExclusiveRegion(r regio
 		"dedicatedTarget", dedicatedTarget,
 		"reclaimTarget", reclaimTarget,
 		"reclaimQuotaLimit", reclaimQuotaLimit,
+		"reclaimConstraint", pa.calculationContext.ReclaimConstraint,
 		"reservedForReclaim", reservedForReclaim,
 		"ratioPhysicalCap", ratioPhysicalCap)
 	return nil
@@ -692,7 +710,7 @@ func (pa *ProvisionAssemblerCommon) getExclusivePartitionCapacities(
 	}
 
 	disableReclaimSelector, err := general.ParseSelector(
-		pa.conf.GetDynamicConfiguration().DisableReclaimPinnedCPUSetResourcePackageSelector,
+		pa.calculationContext.DynamicConfiguration.DisableReclaimPinnedCPUSetResourcePackageSelector,
 	)
 	if err != nil {
 		return 0, 0, 0, err
@@ -746,7 +764,7 @@ func (pa *ProvisionAssemblerCommon) assembleLegacyDedicatedNUMAExclusiveRegion(r
 		reclaimedCoresSize = general.Max(reservedForReclaim, available-nonReclaimRequirement)
 	}
 
-	if ratio := pa.conf.GetDynamicConfiguration().ReclaimedCPUMaxRatio; ratio > 0 {
+	if ratio := pa.calculationContext.DynamicConfiguration.ReclaimedCPUMaxRatio; ratio > 0 {
 		if cpuCount := pa.cpuCountInNUMAs(r.GetBindingNumas()); cpuCount > 0 {
 			cpusPerCore, err := pa.reclaimRatioCPUsPerCore()
 			if err != nil {
@@ -771,10 +789,23 @@ func (pa *ProvisionAssemblerCommon) assembleLegacyDedicatedNUMAExclusiveRegion(r
 		r.GetBindingNumas(),
 		reservedForReclaim,
 	)
-
+	constraintScope := NewLegacyExclusiveReclaimConstraintScope(r.Name())
+	desiredReclaimedCoresSize := reclaimedCoresSize
+	var constraintExcess int
+	reclaimedCoresSize, reclaimedCoresLimit, constraintExcess = ApplyReclaimConstraint(
+		constraintScope,
+		reclaimedCoresSize,
+		reclaimedCoresLimit,
+		reservedForReclaim,
+		pa.calculationContext.ReclaimConstraint,
+		pa.calculationContext.ReclaimCeilings,
+	)
+	RecordReclaimConstraintTarget(result, pa.calculationContext.ReclaimConstraint,
+		constraintScope, desiredReclaimedCoresSize, reservedForReclaim, constraintExcess)
 	klog.InfoS("assembleDedicatedNUMAExclusive info", "regionName", r.Name(), "reclaimedCoresSize", reclaimedCoresSize,
 		"reclaimedCoresLimit", reclaimedCoresLimit,
 		"available", available, "nonReclaimRequirement", nonReclaimRequirement,
+		"reclaimConstraint", pa.calculationContext.ReclaimConstraint,
 		"reservedForReclaim", reservedForReclaim, "controlKnob", controlKnob)
 
 	// set pool overlap info for dedicated pool
@@ -806,7 +837,7 @@ func (pa *ProvisionAssemblerCommon) assembleReserve(result *types.InternalCPUCal
 // makes sense when neither shared nor dedicated cores overlap reclaimed cores,
 // otherwise the residual accounting would double-count overlapped CPUs.
 func (pa *ProvisionAssemblerCommon) validateDefaultShareBackfillConfig() error {
-	conf := pa.conf.GetDynamicConfiguration()
+	conf := pa.calculationContext.DynamicConfiguration
 	if !conf.FillDefaultSharePoolWithNonReclaimCPUs {
 		return nil
 	}
@@ -816,7 +847,12 @@ func (pa *ProvisionAssemblerCommon) validateDefaultShareBackfillConfig() error {
 	return nil
 }
 
-func (pa *ProvisionAssemblerCommon) AssembleProvision() (types.InternalCPUCalculationResult, error) {
+func (pa *ProvisionAssemblerCommon) AssembleProvision(ctx ProvisionContext) (types.InternalCPUCalculationResult, error) {
+	if ctx.DynamicConfiguration == nil {
+		return types.InternalCPUCalculationResult{}, fmt.Errorf("dynamic configuration is nil")
+	}
+	pa.calculationContext = ctx
+
 	if err := pa.validateDefaultShareBackfillConfig(); err != nil {
 		general.Errorf("validateDefaultShareBackfillConfig failed with error: %v", err)
 		return types.InternalCPUCalculationResult{}, err
@@ -832,7 +868,7 @@ func (pa *ProvisionAssemblerCommon) AssembleProvision() (types.InternalCPUCalcul
 	}
 	// mark the backfill enabled once so downstream finalize can decide whether to
 	// override the default share pool quantity with the allocatable upper bound.
-	calculationResult.DefaultShareBackfill.Enabled = pa.conf.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs
+	calculationResult.DefaultShareBackfill.Enabled = pa.calculationContext.DynamicConfiguration.FillDefaultSharePoolWithNonReclaimCPUs
 
 	pa.assembleReserve(&calculationResult)
 
@@ -915,7 +951,7 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 	pinnedCPUSizeByPkg := pa.getPinnedCPUSizeByPackage(numaSet, cfg)
 	totalPinnedCPUSize := general.SumUpMapValues(pinnedCPUSizeByPkg)
 
-	disableReclaimSelectorStr := pa.conf.GetDynamicConfiguration().DisableReclaimPinnedCPUSetResourcePackageSelector
+	disableReclaimSelectorStr := pa.calculationContext.DynamicConfiguration.DisableReclaimPinnedCPUSetResourcePackageSelector
 	disableReclaimSelector, err := general.ParseSelector(disableReclaimSelectorStr)
 	if err != nil {
 		return err
@@ -944,7 +980,7 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		return err
 	}
 
-	dynamicConf := pa.conf.GetDynamicConfiguration()
+	dynamicConf := pa.calculationContext.DynamicConfiguration
 	effectiveHard := dynamicConf.EnableReclaim && dynamicConf.EnableRampUpReclaimHardPartition
 
 	// A hard partition is a persistent per-physical-NUMA ownership invariant.
@@ -1283,7 +1319,7 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		return err
 	}
 
-	ratio := pa.conf.GetDynamicConfiguration().ReclaimedCPUMaxRatio
+	ratio := pa.calculationContext.DynamicConfiguration.ReclaimedCPUMaxRatio
 	cpuCount := 0
 	if ratio > 0 {
 		cpuCount = pa.cpuCountInNUMAs(numaSet)
@@ -1320,6 +1356,19 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		numaSet,
 		reservedForReclaim,
 	)
+	constraintScope := NewNonExclusiveReclaimConstraintScope(numaID)
+	desiredReclaimedCoresSize := reclaimedCoresSize
+	var constraintExcess int
+	reclaimedCoresSize, reclaimedCoresQuota, constraintExcess = ApplyReclaimConstraint(
+		constraintScope,
+		reclaimedCoresSize,
+		reclaimedCoresQuota,
+		reservedForReclaim,
+		pa.calculationContext.ReclaimConstraint,
+		pa.calculationContext.ReclaimCeilings,
+	)
+	RecordReclaimConstraintTarget(result, pa.calculationContext.ReclaimConstraint,
+		constraintScope, desiredReclaimedCoresSize, reservedForReclaim, constraintExcess)
 	clamp.FinalSize = reclaimedCoresSize
 	clamp.FinalLimit = reclaimedCoresQuota
 	clamp.ReleasedSize = general.Max(0, clamp.RawSize-clamp.FinalSize)
@@ -1351,6 +1400,7 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		"ratio", ratio,
 		"cpuCount", cpuCount,
 		"rampUpReclaimCPUSetCap", pa.rampUpReclaimCPUSetCap,
+		"reclaimConstraint", pa.calculationContext.ReclaimConstraint,
 		"reservedForReclaim", reservedForReclaim,
 		"reclaimedCoresSize", reclaimedCoresSize,
 		"overlapReclaimedCoresSize", overlapReclaimedCoresSize,

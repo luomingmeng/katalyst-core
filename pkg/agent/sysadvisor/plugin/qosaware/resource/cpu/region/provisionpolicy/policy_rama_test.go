@@ -435,6 +435,7 @@ func TestPolicyRama(t *testing.T) {
 			}
 			policy.metaServer.MetaAgent.SetPodFetcher(constructPodFetcherRama(podNames))
 
+			tt.resourceEssentials.DynamicConfiguration = policy.conf.GetDynamicConfiguration()
 			policy.SetEssentials(tt.resourceEssentials, tt.controlEssentials)
 			_ = policy.Update()
 			controlKnobUpdated, err := policy.GetControlKnobAdjusted()

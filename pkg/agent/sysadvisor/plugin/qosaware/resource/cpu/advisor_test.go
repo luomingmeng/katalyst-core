@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8stypes "k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	"k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
@@ -46,9 +47,11 @@ import (
 	"github.com/kubewharf/katalyst-core/cmd/katalyst-agent/app/options"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/metacache"
+	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/plugin/qosaware/resource/cpu/assembler/provisionassembler"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/plugin/qosaware/resource/cpu/region"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
 	"github.com/kubewharf/katalyst-core/pkg/config"
+	"github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	metric_consts "github.com/kubewharf/katalyst-core/pkg/consts"
 	pkgconsts "github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
@@ -70,6 +73,69 @@ import (
 // Tests hold this lock across their body so parallel subtests can't observe
 // each other's half-registered state or leaked entries.
 var advisorGlobalRegistryMu sync.Mutex
+
+type failingProvisionAssembler struct {
+	advisorUpdatedAtAssembly bool
+	advisor                  *cpuResourceAdvisor
+	err                      error
+	beforeReturn             func()
+}
+
+func (a *failingProvisionAssembler) AssembleProvision(provisionassembler.ProvisionContext) (types.InternalCPUCalculationResult, error) {
+	a.advisorUpdatedAtAssembly = a.advisor.advisorUpdated
+	if a.beforeReturn != nil {
+		a.beforeReturn()
+	}
+	return types.InternalCPUCalculationResult{}, a.err
+}
+
+type concurrentPoolUpdateMetaCache struct {
+	metacache.MetaCache
+	armed    bool
+	poolName string
+	poolInfo *types.PoolInfo
+}
+
+func (m *concurrentPoolUpdateMetaCache) injectConcurrentPoolUpdate() {
+	if !m.armed {
+		return
+	}
+	m.armed = false
+	done := make(chan error, 1)
+	go func() {
+		done <- m.MetaCache.SetPoolInfo(m.poolName, m.poolInfo)
+	}()
+	if err := <-done; err != nil {
+		panic(err)
+	}
+}
+
+func (m *concurrentPoolUpdateMetaCache) RangePool(f func(string, *types.PoolInfo) bool) {
+	m.MetaCache.RangePool(f)
+	m.injectConcurrentPoolUpdate()
+}
+
+func (m *concurrentPoolUpdateMetaCache) RangeAndUpdatePool(f func(string, *types.PoolInfo) bool) error {
+	m.injectConcurrentPoolUpdate()
+	return m.MetaCache.RangeAndUpdatePool(f)
+}
+
+type staticIsolator struct {
+	pods []string
+}
+
+func (i *staticIsolator) GetIsolatedPods() []string {
+	return i.pods
+}
+
+type recordingHeadroomAssembler struct {
+	dynamicConf *dynamic.Configuration
+}
+
+func (a *recordingHeadroomAssembler) GetHeadroom(dynamicConf *dynamic.Configuration) (resource.Quantity, map[int]resource.Quantity, error) {
+	a.dynamicConf = dynamicConf
+	return *resource.NewQuantity(1, resource.DecimalSI), nil, nil
+}
 
 func generateTestConfiguration(t *testing.T, checkpointDir, stateFileDir string) *config.Configuration {
 	conf, err := options.NewOptions().Config()
@@ -1692,6 +1758,119 @@ func TestAdvisorUpdate(t *testing.T) {
 			wg.Wait()
 		})
 	}
+}
+
+func TestAdvisorUpdateFailureRollsBackTentativeMetadata(t *testing.T) {
+	advisorGlobalRegistryMu.Lock()
+	defer advisorGlobalRegistryMu.Unlock()
+
+	conf := generateTestConfiguration(t, t.TempDir(), t.TempDir())
+	mf := metric.NewFakeMetricsFetcher(metrics.DummyMetrics{}).(*metric.FakeMetricsFetcher)
+	advisor, metaCache := newTestCPUResourceAdvisor(t, nil, conf, mf, nil)
+
+	require.NoError(t, metaCache.SetPoolInfo(commonstate.PoolNameReserve, &types.PoolInfo{
+		PoolName: commonstate.PoolNameReserve,
+		TopologyAwareAssignments: map[int]machine.CPUSet{
+			0: machine.MustParse("0"),
+			1: machine.MustParse("24"),
+		},
+	}))
+	require.NoError(t, metaCache.SetPoolInfo(commonstate.PoolNameShare, &types.PoolInfo{
+		PoolName:    commonstate.PoolNameShare,
+		RegionNames: sets.NewString("committed-share-region"),
+	}))
+	require.NoError(t, metaCache.SetContainerInfo("uid1", "c1", makeContainerInfo(
+		"uid1", "default", "pod1", "c1", consts.PodAnnotationQoSLevelSharedCores,
+		commonstate.PoolNameShare, nil, nil, 1, 100,
+	)))
+	require.NoError(t, metaCache.RangeAndUpdateContainer(func(_, _ string, ci *types.ContainerInfo) bool {
+		ci.RegionNames = sets.NewString("committed-share-region")
+		ci.Isolated = false
+		return true
+	}))
+
+	committedConf := conf.GetDynamicConfiguration()
+	advisor.lastCommittedConf = committedConf
+	advisor.advisorUpdated = true
+	advisor.isolator = &staticIsolator{pods: []string{"uid1"}}
+	concurrentPoolInfo := &types.PoolInfo{
+		PoolName: commonstate.PoolNameShare,
+		TopologyAwareAssignments: types.TopologyAwareAssignment{
+			0: machine.MustParse("4-7"),
+		},
+		OriginalTopologyAwareAssignments: types.TopologyAwareAssignment{
+			0: machine.MustParse("4-11"),
+		},
+		RegionNames: sets.NewString("tentative-share-region"),
+	}
+	concurrentMetaCache := &concurrentPoolUpdateMetaCache{
+		MetaCache: metaCache,
+		poolName:  commonstate.PoolNameShare,
+		poolInfo:  concurrentPoolInfo,
+	}
+	advisor.metaCache = concurrentMetaCache
+	failingAssembler := &failingProvisionAssembler{
+		advisor: advisor,
+		err:     assert.AnError,
+		beforeReturn: func() {
+			concurrentMetaCache.armed = true
+		},
+	}
+	advisor.provisionAssembler = failingAssembler
+
+	_, err := advisor.update()
+	require.Error(t, err)
+	require.True(t, failingAssembler.advisorUpdatedAtAssembly,
+		"isolation fallback must not invalidate the previously committed advice before the final failure")
+	require.False(t, advisor.advisorUpdated)
+	require.Same(t, committedConf, advisor.lastCommittedConf)
+	require.Empty(t, advisor.regionMap)
+
+	container, ok := metaCache.GetContainerInfo("uid1", "c1")
+	require.True(t, ok)
+	require.Equal(t, sets.NewString("committed-share-region"), container.RegionNames)
+	require.False(t, container.Isolated)
+
+	pool, ok := metaCache.GetPoolInfo(commonstate.PoolNameShare)
+	require.True(t, ok)
+	require.Equal(t, sets.NewString("committed-share-region"), pool.RegionNames)
+	require.Equal(t, concurrentPoolInfo.TopologyAwareAssignments, pool.TopologyAwareAssignments)
+	require.Equal(t, concurrentPoolInfo.OriginalTopologyAwareAssignments, pool.OriginalTopologyAwareAssignments)
+
+	advisor.isolator = &staticIsolator{}
+	failingAssembler.err = nil
+	nextConf := dynamic.NewConfiguration()
+	conf.SetDynamicConfiguration(nextConf)
+	_, err = advisor.update()
+	require.NoError(t, err)
+	require.Same(t, nextConf, advisor.lastCommittedConf)
+	require.NotEmpty(t, advisor.regionMap)
+	require.NotContains(t, advisor.regionMap, "committed-share-region")
+	container, ok = metaCache.GetContainerInfo("uid1", "c1")
+	require.True(t, ok)
+	require.Len(t, container.RegionNames, 1)
+	for regionName := range container.RegionNames {
+		require.Contains(t, advisor.regionMap, regionName)
+	}
+}
+
+func TestAdvisorGetHeadroomUsesLastSuccessfulDynamicConfiguration(t *testing.T) {
+	committedConf := dynamic.NewConfiguration()
+	currentConf := dynamic.NewConfiguration()
+	assembler := &recordingHeadroomAssembler{}
+	conf, err := options.NewOptions().Config()
+	require.NoError(t, err)
+	conf.SetDynamicConfiguration(currentConf)
+	advisor := &cpuResourceAdvisor{
+		conf:              conf,
+		advisorUpdated:    true,
+		lastCommittedConf: committedConf,
+		headroomAssembler: assembler,
+	}
+
+	_, _, err = advisor.GetHeadroom()
+	require.NoError(t, err)
+	require.Same(t, committedConf, assembler.dynamicConf)
 }
 
 func TestGetIsolatedContainerRegions(t *testing.T) {

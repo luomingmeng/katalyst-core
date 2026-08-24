@@ -153,7 +153,7 @@ func Test_cpuResourceAdvisor_updateReservedForReclaim(t *testing.T) {
 				conf:       conf,
 				metaServer: metaServer,
 			}
-			cra.updateReservedForReclaim()
+			cra.updateReservedForReclaim(cra.conf.GetDynamicConfiguration())
 
 			assert.Equal(t, tt.wantReservedForReclaim, cra.reservedForReclaim)
 		})
@@ -237,7 +237,7 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimUsesHardPartitionRatio(t *tes
 				numaAvailable: map[int]int{0: 4, 1: 12},
 			}
 
-			err = cra.updateReservedForReclaim()
+			err = cra.updateReservedForReclaim(cra.conf.GetDynamicConfiguration())
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantReserved, cra.reservedForReclaim)
 		})
@@ -268,7 +268,7 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimRejectsConfiguredFloorAboveCa
 		},
 	}
 
-	err = advisor.updateReservedForReclaim()
+	err = advisor.updateReservedForReclaim(advisor.conf.GetDynamicConfiguration())
 
 	require.ErrorContains(t, err, "configured hard reclaim floor 17 exceeds total core-aligned NUMA capacity 16")
 }
@@ -316,7 +316,7 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimUsesImmutableNUMACapacity(t *
 		numaAvailable: map[int]int{0: 2, 1: 30},
 	}
 
-	require.NoError(t, cra.updateReservedForReclaim())
+	require.NoError(t, cra.updateReservedForReclaim(cra.conf.GetDynamicConfiguration()))
 	// capacities: NUMA0 24 CPUs (12 cores), NUMA1 32 CPUs (16 cores),
 	// cpusPerCore==2, ratio 0.2. donated cores = floor(cores*0.2) complete
 	// cores: NUMA0 floor(2.4)=2 cores=4 CPUs, NUMA1 floor(3.2)=3 cores=6
@@ -352,7 +352,7 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimFallbacks(t *testing.T) {
 			numaAvailable: map[int]int{0: 8},
 		}
 
-		require.NoError(t, cra.updateReservedForReclaim())
+		require.NoError(t, cra.updateReservedForReclaim(cra.conf.GetDynamicConfiguration()))
 		assert.Equal(t, map[int]int{0: 2}, cra.reservedForReclaim)
 	})
 
@@ -379,7 +379,7 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimFallbacks(t *testing.T) {
 			numaAvailable: map[int]int{0: 4, 1: 12},
 		}
 
-		require.NoError(t, cra.updateReservedForReclaim())
+		require.NoError(t, cra.updateReservedForReclaim(cra.conf.GetDynamicConfiguration()))
 		assert.Equal(t, map[int]int{0: 2, 1: 2}, cra.reservedForReclaim)
 	})
 
@@ -406,7 +406,7 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimFallbacks(t *testing.T) {
 			numaAvailable: map[int]int{0: 4, 1: 12},
 		}
 
-		require.NoError(t, cra.updateReservedForReclaim())
+		require.NoError(t, cra.updateReservedForReclaim(cra.conf.GetDynamicConfiguration()))
 		// reclaim disabled => non-hard-partition path. the configured 6-CPU
 		// global reserve spreads to 3 CPUs/NUMA, each rounded up to a complete
 		// physical core (cpusPerCore==2) => 4 CPUs per NUMA.
@@ -423,7 +423,7 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimFallbacks(t *testing.T) {
 			reservedForReclaim: map[int]int{0: 4},
 		}
 
-		require.EqualError(t, cra.updateReservedForReclaim(), "dynamic configuration is nil")
+		require.EqualError(t, cra.updateReservedForReclaim(nil), "dynamic configuration is nil")
 		assert.Nil(t, cra.reservedForReclaim)
 	})
 
@@ -447,7 +447,7 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimFallbacks(t *testing.T) {
 			},
 		}
 
-		require.NoError(t, cra.updateReservedForReclaim())
+		require.NoError(t, cra.updateReservedForReclaim(cra.conf.GetDynamicConfiguration()))
 		// non-hard-partition path: the configured 6-CPU global reserve spreads to
 		// 3 CPUs/NUMA, each rounded up to a complete physical core => 4 per NUMA.
 		assert.Equal(t, map[int]int{0: 4, 1: 4}, cra.reservedForReclaim)
@@ -522,7 +522,7 @@ func TestUpdateRampUpReclaimCPUSetCap(t *testing.T) {
 				},
 			}
 
-			cra.updateRampUpReclaimCPUSetCap()
+			cra.updateRampUpReclaimCPUSetCap(cra.conf.GetDynamicConfiguration())
 
 			assert.Equal(t, tt.wantCap, cra.rampUpReclaimCPUSetCap)
 		})

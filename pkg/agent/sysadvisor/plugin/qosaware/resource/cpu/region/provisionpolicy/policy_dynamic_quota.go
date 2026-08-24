@@ -132,7 +132,7 @@ func (p *PolicyDynamicQuota) Update() error {
 func (p *PolicyDynamicQuota) sanityCheck() error {
 	var errList []error
 
-	if !p.conf.GetDynamicConfiguration().EnableReclaim {
+	if p.DynamicConfiguration == nil || !p.DynamicConfiguration.EnableReclaim {
 		errList = append(errList, fmt.Errorf("reclaim disabled"))
 	}
 

@@ -147,7 +147,7 @@ func (r *QoSRegionShare) getEffectiveControlKnobs() types.ControlKnob {
 		}
 	}
 	var requirement int
-	if r.conf.GetDynamicConfiguration().AllowSharedCoresOverlapReclaimedCores {
+	if r.DynamicConfiguration.AllowSharedCoresOverlapReclaimedCores {
 		requirement = int(math.Ceil(r.getPodsRequest()))
 	} else {
 		requirement, ok = r.metaReader.GetPoolSize(r.ownerPoolName)
@@ -175,7 +175,7 @@ func (r *QoSRegionShare) getEffectiveControlKnobs() types.ControlKnob {
 
 func (r *QoSRegionShare) bootstrapDefaultShareRequirement() (int, bool) {
 	if r.ownerPoolName != commonstate.PoolNameShare ||
-		!r.conf.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs {
+		!r.DynamicConfiguration.FillDefaultSharePoolWithNonReclaimCPUs {
 		return 0, false
 	}
 
@@ -217,5 +217,5 @@ func (r *QoSRegionShare) getPoolCPUUsageRatio() (float64, error) {
 
 func (r *QoSRegionShare) EnableReclaim() bool {
 	return r.QoSRegionBase.EnableReclaim() &&
-		!sets.NewString(r.conf.GetDynamicConfiguration().DisableReclaimSharePools...).Has(r.configTranslator.Translate(r.ownerPoolName))
+		!sets.NewString(r.DynamicConfiguration.DisableReclaimSharePools...).Has(r.configTranslator.Translate(r.ownerPoolName))
 }

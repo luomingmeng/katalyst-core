@@ -41,6 +41,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/plugin/qosaware/resource/cpu/region/provisionpolicy"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
 	"github.com/kubewharf/katalyst-core/pkg/config"
+	"github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
@@ -109,7 +110,8 @@ type cpuResourceAdvisor struct {
 	extraConf interface{}
 	period    time.Duration
 
-	advisorUpdated bool
+	advisorUpdated    bool
+	lastCommittedConf *dynamic.Configuration
 
 	regionMap              map[string]region.QoSRegion // map[regionName]region
 	reservedForReclaim     map[int]int                 // map[numaID]reservedForReclaim
@@ -120,6 +122,7 @@ type cpuResourceAdvisor struct {
 
 	allowSharedCoresOverlapReclaimedCores      bool
 	disableDedicatedCoresOverlapReclaimedCores bool
+	reclaimConstraintGuard                     reclaimConstraintGuard
 
 	provisionAssembler provisionassembler.ProvisionAssembler
 	headroomAssembler  headroomassembler.HeadroomAssembler
@@ -160,7 +163,7 @@ func NewCPUResourceAdvisor(conf *config.Configuration, extraConf interface{}, me
 
 	dynamicConf := conf.GetDynamicConfiguration()
 	if dynamicConf == nil || !dynamicConf.EnableRampUpReclaimHardPartition {
-		if err := cra.updateReservedForReclaim(); err != nil {
+		if err := cra.updateReservedForReclaim(dynamicConf); err != nil {
 			klog.Errorf("[qosaware-cpu] initialize reserved resource for reclaim failed: %v", err)
 		}
 	}
@@ -200,7 +203,7 @@ func (cra *cpuResourceAdvisor) GetHeadroom() (resource.Quantity, map[int]resourc
 		return resource.Quantity{}, nil, fmt.Errorf("no legal assembler")
 	}
 
-	headroom, numaHeadroom, err := cra.headroomAssembler.GetHeadroom()
+	headroom, numaHeadroom, err := cra.headroomAssembler.GetHeadroom(cra.lastCommittedConf)
 	if err != nil {
 		klog.Errorf("[qosaware-cpu] get headroom failed: %v", err)
 	} else {
@@ -226,21 +229,152 @@ func (cra *cpuResourceAdvisor) update() (*types.InternalCPUCalculationResult, er
 	general.InfoS("acquired lock", "duration", time.Since(startTime))
 	defer cra.mutex.Unlock()
 
-	result, err := cra.updateWithIsolationGuardian(true)
+	metadataSnapshot := cra.snapshotRegionAssignments()
+	updateSucceeded := false
+	defer func() {
+		if updateSucceeded {
+			return
+		}
+		cra.advisorUpdated = false
+		cra.regionMap = make(map[string]region.QoSRegion)
+		cra.restoreRegionAssignments(metadataSnapshot)
+	}()
+
+	dynamicConf := cra.conf.GetDynamicConfiguration()
+	if dynamicConf == nil {
+		return nil, fmt.Errorf("dynamic configuration is nil")
+	}
+	hardEnabled := dynamicConf.EnableReclaim && dynamicConf.EnableRampUpReclaimHardPartition
+	maxRampUpStep := cra.conf.CPUAdvisorConfiguration.MaxRampUpStep
+	observedReclaimTotal, reclaimObserved := cra.observedReclaimTotal()
+	reclaimConstraint, reclaimCeilings := cra.reclaimConstraintGuard.constraint(
+		hardEnabled, observedReclaimTotal, reclaimObserved, maxRampUpStep)
+
+	result, err := cra.updateWithIsolationGuardian(dynamicConf, reclaimConstraint, reclaimCeilings, true)
 	if err != nil {
 		if err == errIsolationSafetyCheckFailed {
 			klog.Warningf("[qosaware-cpu] failed to updateWithIsolationGuardian(true): %q", err)
-			return cra.updateWithIsolationGuardian(false)
+			result, err = cra.updateWithIsolationGuardian(dynamicConf, reclaimConstraint, reclaimCeilings, false)
 		}
-		return nil, err
+		if err != nil {
+			return nil, err
+		}
 	}
+	cra.updateRegionEntries()
+	cra.lastCommittedConf = dynamicConf
+	cra.advisorUpdated = true
+	cra.updateRegionStatus()
+	cra.emitMetrics(*result)
+	cra.reclaimConstraintGuard.commit(
+		hardEnabled,
+		reclaimCeilings,
+		result.ReclaimConstraintTargets,
+		publishedReclaimTotal(result),
+		maxRampUpStep,
+	)
+	updateSucceeded = true
+	general.InfoS("committed cpu reclaim constraint",
+		"constraint", reclaimConstraint,
+		"ceilings", reclaimCeilings,
+		"excess", result.ReclaimConstraintExcess,
+		"hardEnabled", hardEnabled)
 	general.InfoS("finished", "duration", time.Since(startTime))
 	return result, nil
 }
 
+func (cra *cpuResourceAdvisor) observedReclaimTotal() (int, bool) {
+	if cra == nil || cra.metaCache == nil {
+		return 0, false
+	}
+	poolInfo, ok := cra.metaCache.GetPoolInfo(commonstate.PoolNameReclaim)
+	if !ok || poolInfo == nil {
+		return 0, false
+	}
+	return machine.CountCPUAssignmentCPUs(poolInfo.TopologyAwareAssignments), true
+}
+
+func publishedReclaimTotal(result *types.InternalCPUCalculationResult) int {
+	if result == nil {
+		return 0
+	}
+	total := 0
+	for _, entry := range result.PoolEntries[commonstate.PoolNameReclaim] {
+		total += entry.Size
+	}
+	return total
+}
+
+type containerRegionAssignment struct {
+	regionNames sets.String
+	isolated    bool
+}
+
+type regionAssignmentSnapshot struct {
+	containers map[string]map[string]containerRegionAssignment
+	pools      map[string]sets.String
+}
+
+func (cra *cpuResourceAdvisor) snapshotRegionAssignments() regionAssignmentSnapshot {
+	snapshot := regionAssignmentSnapshot{
+		containers: make(map[string]map[string]containerRegionAssignment),
+		pools:      make(map[string]sets.String),
+	}
+	cra.metaCache.RangeContainer(func(podUID, containerName string, ci *types.ContainerInfo) bool {
+		if snapshot.containers[podUID] == nil {
+			snapshot.containers[podUID] = make(map[string]containerRegionAssignment)
+		}
+		snapshot.containers[podUID][containerName] = containerRegionAssignment{
+			regionNames: sets.NewString(ci.RegionNames.List()...),
+			isolated:    ci.Isolated,
+		}
+		return true
+	})
+	cra.metaCache.RangePool(func(poolName string, poolInfo *types.PoolInfo) bool {
+		snapshot.pools[poolName] = sets.NewString(poolInfo.RegionNames.List()...)
+		return true
+	})
+	return snapshot
+}
+
+// restoreRegionAssignments rolls the metadata cache back to the snapshot taken at the start of the cycle.
+//
+// It deliberately restores only the fields that update() mutates while wiring regions to containers and
+// pools: ContainerInfo.RegionNames / ContainerInfo.Isolated and PoolInfo.RegionNames. These are the sole
+// pieces of shared metadata a failed cycle can leave half-written, so reverting them (and rebuilding
+// regionMap from scratch) is enough to guarantee the next cycle starts from a clean, consistent state.
+// Other ContainerInfo / PoolInfo fields (requests, topology-aware assignments, etc.) are owned by other
+// producers and are not touched by region assignment, so restoring them here would risk clobbering
+// legitimately newer values.
+func (cra *cpuResourceAdvisor) restoreRegionAssignments(snapshot regionAssignmentSnapshot) {
+	_ = cra.metaCache.RangeAndUpdateContainer(func(podUID, containerName string, ci *types.ContainerInfo) bool {
+		assignment, ok := snapshot.containers[podUID][containerName]
+		if !ok {
+			ci.RegionNames = sets.NewString()
+			ci.Isolated = false
+			return true
+		}
+		ci.RegionNames = sets.NewString(assignment.regionNames.List()...)
+		ci.Isolated = assignment.isolated
+		return true
+	})
+
+	_ = cra.metaCache.RangeAndUpdatePool(func(poolName string, poolInfo *types.PoolInfo) bool {
+		regionNames, ok := snapshot.pools[poolName]
+		if !ok {
+			regionNames = sets.NewString()
+		}
+		poolInfo.RegionNames = sets.NewString(regionNames.List()...)
+		return true
+	})
+}
+
 // If updateWithIsolationGuardian fails with isolation enabled, we should try again with isolation disabled.
 // todo: we should re-design the mechanism of isolation instead of disabling this functionality
-func (cra *cpuResourceAdvisor) updateWithIsolationGuardian(tryIsolation bool) (
+func (cra *cpuResourceAdvisor) updateWithIsolationGuardian(dynamicConf *dynamic.Configuration,
+	reclaimConstraint provisionassembler.ReclaimConstraint,
+	reclaimCeilings map[provisionassembler.ReclaimConstraintScope]int,
+	tryIsolation bool,
+) (
 	*types.InternalCPUCalculationResult,
 	error,
 ) {
@@ -258,7 +392,7 @@ func (cra *cpuResourceAdvisor) updateWithIsolationGuardian(tryIsolation bool) (
 		return nil, fmt.Errorf("reserve pool does not exist")
 	}
 
-	if err := cra.updateNumasAvailableResource(); err != nil {
+	if err := cra.updateNumasAvailableResource(dynamicConf); err != nil {
 		klog.Errorf("[qosaware-cpu] update NUMA available resource failed: %v", err)
 		return nil, fmt.Errorf("failed to update NUMA available resource: %w", err)
 	}
@@ -271,7 +405,7 @@ func (cra *cpuResourceAdvisor) updateWithIsolationGuardian(tryIsolation bool) (
 	}
 
 	cra.gcRegionMap()
-	cra.updateAdvisorEssentials()
+	cra.updateAdvisorEssentials(dynamicConf)
 	if tryIsolation && isolationExists && !cra.checkIsolationSafety() {
 		klog.Errorf("[qosaware-cpu] failed to check isolation")
 		return nil, errIsolationSafetyCheckFailed
@@ -286,11 +420,12 @@ func (cra *cpuResourceAdvisor) updateWithIsolationGuardian(tryIsolation bool) (
 	// run an episode of provision and headroom policy update for each region
 	for _, r := range cra.regionMap {
 		r.SetEssentials(types.ResourceEssentials{
-			EnableReclaim:       cra.conf.GetDynamicConfiguration().EnableReclaim,
-			ResourceUpperBound:  cra.getRegionMaxRequirement(r, pinnedCPUSizeByNuma, pinnedCPUSizeByPackageByNuma),
-			ResourceLowerBound:  cra.getRegionMinRequirement(r),
-			ReservedForReclaim:  cra.getRegionReservedForReclaim(r),
-			ReservedForAllocate: cra.getRegionReservedForAllocate(r),
+			DynamicConfiguration: dynamicConf,
+			EnableReclaim:        dynamicConf.EnableReclaim,
+			ResourceUpperBound:   cra.getRegionMaxRequirement(r, pinnedCPUSizeByNuma, pinnedCPUSizeByPackageByNuma),
+			ResourceLowerBound:   cra.getRegionMinRequirement(r),
+			ReservedForReclaim:   cra.getRegionReservedForReclaim(r),
+			ReservedForAllocate:  cra.getRegionReservedForAllocate(dynamicConf, r),
 
 			AllowSharedCoresOverlapReclaimedCores:      cra.allowSharedCoresOverlapReclaimedCores,
 			DisableDedicatedCoresOverlapReclaimedCores: cra.disableDedicatedCoresOverlapReclaimedCores,
@@ -299,22 +434,16 @@ func (cra *cpuResourceAdvisor) updateWithIsolationGuardian(tryIsolation bool) (
 		r.TryUpdateProvision()
 		r.TryUpdateHeadroom()
 	}
-	cra.updateRegionEntries()
-
-	cra.advisorUpdated = true
-
 	if klog.V(6).Enabled() {
 		klog.Infof("[qosaware-cpu] region map: %v", general.ToString(cra.regionMap))
 	}
 
 	// assemble provision result from each region
-	calculationResult, err := cra.assembleProvision()
+	calculationResult, err := cra.assembleProvision(dynamicConf, reclaimConstraint, reclaimCeilings)
 	if err != nil {
 		klog.Errorf("[qosaware-cpu] assemble provision failed: %q", err)
 		return nil, fmt.Errorf("failed to assemble provisioner: %q", err)
 	}
-	cra.updateRegionStatus()
-	cra.emitMetrics(calculationResult)
 
 	return &calculationResult, nil
 }
@@ -599,10 +728,10 @@ func (cra *cpuResourceAdvisor) gcRegionMap() {
 // 1. non-binding numas, i.e. numas without numa binding containers
 // 2. binding numas of non numa binding regions
 // 3. region quantity of each numa
-func (cra *cpuResourceAdvisor) updateAdvisorEssentials() {
+func (cra *cpuResourceAdvisor) updateAdvisorEssentials(dynamicConf *dynamic.Configuration) {
 	cra.nonBindingNumas = cra.metaServer.CPUDetails.NUMANodes()
-	cra.allowSharedCoresOverlapReclaimedCores = cra.conf.GetDynamicConfiguration().AllowSharedCoresOverlapReclaimedCores
-	cra.disableDedicatedCoresOverlapReclaimedCores = cra.conf.GetDynamicConfiguration().DisableDedicatedCoresOverlapReclaimedCores
+	cra.allowSharedCoresOverlapReclaimedCores = dynamicConf.AllowSharedCoresOverlapReclaimedCores
+	cra.disableDedicatedCoresOverlapReclaimedCores = dynamicConf.DisableDedicatedCoresOverlapReclaimedCores
 
 	// update non-binding numas
 	for _, r := range cra.regionMap {
@@ -636,12 +765,19 @@ func (cra *cpuResourceAdvisor) updateAdvisorEssentials() {
 // assembleProvision generates internal calculation result.
 // must make sure pool names from cpu provision following qrm definition;
 // numa ID set as -1 means no numa-preference is needed.
-func (cra *cpuResourceAdvisor) assembleProvision() (types.InternalCPUCalculationResult, error) {
+func (cra *cpuResourceAdvisor) assembleProvision(dynamicConf *dynamic.Configuration,
+	reclaimConstraint provisionassembler.ReclaimConstraint,
+	reclaimCeilings map[provisionassembler.ReclaimConstraintScope]int,
+) (types.InternalCPUCalculationResult, error) {
 	if cra.provisionAssembler == nil {
 		return types.InternalCPUCalculationResult{}, fmt.Errorf("no legal provision assembler")
 	}
 
-	return cra.provisionAssembler.AssembleProvision()
+	return cra.provisionAssembler.AssembleProvision(provisionassembler.ProvisionContext{
+		DynamicConfiguration: dynamicConf,
+		ReclaimConstraint:    reclaimConstraint,
+		ReclaimCeilings:      reclaimCeilings,
+	})
 }
 
 func (cra *cpuResourceAdvisor) emitMetrics(calculationResult types.InternalCPUCalculationResult) {

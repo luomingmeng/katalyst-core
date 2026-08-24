@@ -37,25 +37,26 @@ func TestResolveOverlapReclaim(t *testing.T) {
 
 	conf := generateTestConfiguration(t, ckDir, sfDir)
 	ha := &HeadroomAssemblerCommon{conf: conf}
+	dynamicConf := conf.GetDynamicConfiguration()
 
 	dedicatedNUMAs := map[int]bool{0: true}
 
 	// dedicated-bound NUMA => controlled by DisableDedicatedCoresOverlapReclaimedCores.
 	conf.GetDynamicConfiguration().AllowSharedCoresOverlapReclaimedCores = true
 	conf.GetDynamicConfiguration().DisableDedicatedCoresOverlapReclaimedCores = false
-	require.True(t, ha.resolveOverlapReclaim(0, dedicatedNUMAs))
+	require.True(t, ha.resolveOverlapReclaim(dynamicConf, 0, dedicatedNUMAs))
 	conf.GetDynamicConfiguration().DisableDedicatedCoresOverlapReclaimedCores = true
-	require.False(t, ha.resolveOverlapReclaim(0, dedicatedNUMAs))
+	require.False(t, ha.resolveOverlapReclaim(dynamicConf, 0, dedicatedNUMAs))
 	conf.GetDynamicConfiguration().AllowSharedCoresOverlapReclaimedCores = false
 	conf.GetDynamicConfiguration().DisableDedicatedCoresOverlapReclaimedCores = false
-	require.True(t, ha.resolveOverlapReclaim(0, dedicatedNUMAs))
+	require.True(t, ha.resolveOverlapReclaim(dynamicConf, 0, dedicatedNUMAs))
 	conf.GetDynamicConfiguration().DisableDedicatedCoresOverlapReclaimedCores = true
-	require.False(t, ha.resolveOverlapReclaim(0, dedicatedNUMAs))
+	require.False(t, ha.resolveOverlapReclaim(dynamicConf, 0, dedicatedNUMAs))
 
 	// share/global NUMA => equals AllowSharedCoresOverlapReclaimedCores.
 	conf.GetDynamicConfiguration().DisableDedicatedCoresOverlapReclaimedCores = true
 	conf.GetDynamicConfiguration().AllowSharedCoresOverlapReclaimedCores = true
-	require.True(t, ha.resolveOverlapReclaim(1, dedicatedNUMAs))
+	require.True(t, ha.resolveOverlapReclaim(dynamicConf, 1, dedicatedNUMAs))
 	conf.GetDynamicConfiguration().AllowSharedCoresOverlapReclaimedCores = false
-	require.False(t, ha.resolveOverlapReclaim(1, dedicatedNUMAs))
+	require.False(t, ha.resolveOverlapReclaim(dynamicConf, 1, dedicatedNUMAs))
 }

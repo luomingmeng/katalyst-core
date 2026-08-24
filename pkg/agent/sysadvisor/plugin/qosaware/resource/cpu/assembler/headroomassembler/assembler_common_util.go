@@ -29,6 +29,7 @@ import (
 	"github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/plugin/qosaware/resource/helper"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
+	"github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	metaserverHelper "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric/helper"
 	"github.com/kubewharf/katalyst-core/pkg/util"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
@@ -83,14 +84,16 @@ func (ha *HeadroomAssemblerCommon) getLastReclaimedCPUPerNUMA() (map[int]float64
 //   - share/global NUMA => AllowSharedCoresOverlapReclaimedCores: reclaimed
 //     cores may share cores with the shared pool, so the subtract-usage supply
 //     formula applies only when overlap is enabled.
-func (ha *HeadroomAssemblerCommon) resolveOverlapReclaim(numaID int, dedicatedNUMAs map[int]bool) bool {
+func (ha *HeadroomAssemblerCommon) resolveOverlapReclaim(dynamicConf *dynamic.Configuration, numaID int, dedicatedNUMAs map[int]bool) bool {
 	if dedicatedNUMAs[numaID] {
-		return !ha.conf.GetDynamicConfiguration().DisableDedicatedCoresOverlapReclaimedCores
+		return !dynamicConf.DisableDedicatedCoresOverlapReclaimedCores
 	}
-	return ha.conf.GetDynamicConfiguration().AllowSharedCoresOverlapReclaimedCores
+	return dynamicConf.AllowSharedCoresOverlapReclaimedCores
 }
 
-func (ha *HeadroomAssemblerCommon) getReclaimNUMABindingTopo(reclaimPool *types.PoolInfo) (bindingNUMAs, nonBindingNumas []int, dedicatedNUMAs map[int]bool, err error) {
+func (ha *HeadroomAssemblerCommon) getReclaimNUMABindingTopo(dynamicConf *dynamic.Configuration,
+	reclaimPool *types.PoolInfo,
+) (bindingNUMAs, nonBindingNumas []int, dedicatedNUMAs map[int]bool, err error) {
 	if ha.metaServer == nil {
 		err = fmt.Errorf("invalid metaserver")
 		return
@@ -106,7 +109,8 @@ func (ha *HeadroomAssemblerCommon) getReclaimNUMABindingTopo(reclaimPool *types.
 		return
 	}
 
-	availNUMAs, _, e := helper.GetAvailableNUMAsAndReclaimedCores(ha.conf, ha.metaReader, ha.metaServer)
+	availNUMAs, _, e := helper.GetAvailableNUMAsAndReclaimedCoresWithDynamicConfiguration(
+		ha.conf, dynamicConf, ha.metaReader, ha.metaServer)
 	if e != nil {
 		err = fmt.Errorf("get available numa failed: %v", e)
 		return

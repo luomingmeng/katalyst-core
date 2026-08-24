@@ -166,10 +166,8 @@ func (p *PolicyRama) sanityCheck() error {
 		errList []error
 	)
 
-	enableReclaim := p.conf.GetDynamicConfiguration().EnableReclaim
-
 	// 1. check if enable reclaim
-	if !enableReclaim {
+	if p.DynamicConfiguration == nil || !p.DynamicConfiguration.EnableReclaim {
 		errList = append(errList, fmt.Errorf("reclaim disabled"))
 	}
 

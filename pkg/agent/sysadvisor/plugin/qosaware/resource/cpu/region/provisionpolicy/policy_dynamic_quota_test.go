@@ -364,7 +364,10 @@ func TestPolicyDynamicQuota_updateForCPUQuota(t *testing.T) {
 				policy.metaReader.(*metacache.MetaCacheImp).SetPoolInfo(commonstate.PoolNameReclaim, reclaimPoolInfo)
 			}
 
-			policy.SetEssentials(types.ResourceEssentials{}, tt.controlEssentials)
+			policy.SetEssentials(types.ResourceEssentials{
+				DynamicConfiguration: policy.conf.GetDynamicConfiguration(),
+				EnableReclaim:        true,
+			}, tt.controlEssentials)
 			policy.ReservedForReclaim = tt.reservedForReclaim
 
 			if tt.notNUMABinding {
@@ -460,6 +463,10 @@ func TestPolicyDynamicQuota_sanityCheck(t *testing.T) {
 
 	p := newTestPolicyDynamicQuota(t, checkpointDir, stateFileDir,
 		checkpointManagerDir, types.RegionInfo{}, metricFetcher).(*PolicyDynamicQuota)
+	p.SetEssentials(types.ResourceEssentials{
+		DynamicConfiguration: p.conf.GetDynamicConfiguration(),
+		EnableReclaim:        true,
+	}, types.ControlEssentials{})
 
 	// Default EnableReclaim is true from helper
 	err = p.sanityCheck()
@@ -467,6 +474,7 @@ func TestPolicyDynamicQuota_sanityCheck(t *testing.T) {
 
 	// Disable Reclaim
 	p.conf.GetDynamicConfiguration().EnableReclaim = false
+	p.EnableReclaim = false
 	err = p.sanityCheck()
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "reclaim disabled")
@@ -575,7 +583,10 @@ func TestPolicyDynamicQuota_updateForCPUQuota_multiPath(t *testing.T) {
 			}
 			require.NoError(t, policy.metaReader.(*metacache.MetaCacheImp).SetPoolInfo(commonstate.PoolNameReclaim, reclaimPoolInfo))
 
-			policy.SetEssentials(types.ResourceEssentials{}, controlEssentials)
+			policy.SetEssentials(types.ResourceEssentials{
+				DynamicConfiguration: policy.conf.GetDynamicConfiguration(),
+				EnableReclaim:        true,
+			}, controlEssentials)
 			policy.ReservedForReclaim = 1.0
 
 			require.NoError(t, policy.Update())

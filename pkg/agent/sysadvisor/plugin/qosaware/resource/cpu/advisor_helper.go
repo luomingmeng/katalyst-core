@@ -31,6 +31,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/plugin/qosaware/resource/cpu/assembler/provisionassembler"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/plugin/qosaware/resource/cpu/region"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
+	"github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
@@ -157,7 +158,7 @@ func (cra *cpuResourceAdvisor) initializeHeadroomAssembler() error {
 
 // updateNumasAvailableResource updates available resource of all numa nodes.
 // available = total - reserved pool - forbidden pool
-func (cra *cpuResourceAdvisor) updateNumasAvailableResource() error {
+func (cra *cpuResourceAdvisor) updateNumasAvailableResource(dynamicConf *dynamic.Configuration) error {
 	numaAvailable := make(map[int]int)
 	reservePoolInfo, _ := cra.metaCache.GetPoolInfo(commonstate.PoolNameReserve)
 
@@ -187,7 +188,6 @@ func (cra *cpuResourceAdvisor) updateNumasAvailableResource() error {
 		numaAvailable[id] = cra.metaServer.NUMAToCPUs.CPUSizeInNUMAs(id) - reservePoolNuma - forbiddenPoolNuma
 	}
 
-	dynamicConf := cra.conf.GetDynamicConfiguration()
 	if dynamicConf != nil && dynamicConf.EnableRampUpReclaimHardPartition {
 		for id := 0; id < cra.metaServer.NumNUMANodes; id++ {
 			if numaAvailable[id] < 2 {
@@ -198,13 +198,12 @@ func (cra *cpuResourceAdvisor) updateNumasAvailableResource() error {
 	}
 
 	cra.numaAvailable = numaAvailable
-	err := cra.updateReservedForReclaim()
-	cra.updateRampUpReclaimCPUSetCap()
+	err := cra.updateReservedForReclaim(dynamicConf)
+	cra.updateRampUpReclaimCPUSetCap(dynamicConf)
 	return err
 }
 
-func (cra *cpuResourceAdvisor) updateReservedForReclaim() error {
-	dynamicConf := cra.conf.GetDynamicConfiguration()
+func (cra *cpuResourceAdvisor) updateReservedForReclaim(dynamicConf *dynamic.Configuration) error {
 	if dynamicConf == nil {
 		cra.reservedForReclaim = nil
 		return fmt.Errorf("dynamic configuration is nil")
@@ -234,9 +233,8 @@ func (cra *cpuResourceAdvisor) updateReservedForReclaim() error {
 	return nil
 }
 
-func (cra *cpuResourceAdvisor) updateRampUpReclaimCPUSetCap() {
+func (cra *cpuResourceAdvisor) updateRampUpReclaimCPUSetCap(dynamicConf *dynamic.Configuration) {
 	cap := make(map[int]int)
-	dynamicConf := cra.conf.GetDynamicConfiguration()
 	if dynamicConf == nil || !dynamicConf.EnableReclaim || !dynamicConf.EnableRampUpReclaimHardPartition {
 		cra.rampUpReclaimCPUSetCap = cap
 		return
@@ -270,8 +268,8 @@ func (cra *cpuResourceAdvisor) updateRampUpReclaimCPUSetCap() {
 	general.Infof("rampUpReclaimCPUSetCap: %v, ratio %v", cap, ratio)
 }
 
-func (cra *cpuResourceAdvisor) getNumasReservedForAllocate(numas machine.CPUSet) float64 {
-	reserved := cra.conf.GetDynamicConfiguration().ReservedResourceForAllocate[v1.ResourceCPU]
+func (cra *cpuResourceAdvisor) getNumasReservedForAllocate(dynamicConf *dynamic.Configuration, numas machine.CPUSet) float64 {
+	reserved := dynamicConf.ReservedResourceForAllocate[v1.ResourceCPU]
 	return float64(reserved.Value()*int64(numas.Size())) / float64(cra.metaServer.NumNUMANodes)
 }
 
@@ -367,14 +365,14 @@ func (cra *cpuResourceAdvisor) getRegionReservedForReclaim(r region.QoSRegion) f
 	return res
 }
 
-func (cra *cpuResourceAdvisor) getRegionReservedForAllocate(r region.QoSRegion) float64 {
+func (cra *cpuResourceAdvisor) getRegionReservedForAllocate(dynamicConf *dynamic.Configuration, r region.QoSRegion) float64 {
 	res := 0.0
 	for _, numaID := range r.GetBindingNumas().ToSliceInt() {
 		divider := cra.numRegionsPerNuma[numaID]
 		if divider < 1 {
 			divider = 1
 		}
-		res += cra.getNumasReservedForAllocate(machine.NewCPUSet(numaID)) / float64(divider)
+		res += cra.getNumasReservedForAllocate(dynamicConf, machine.NewCPUSet(numaID)) / float64(divider)
 	}
 	return res
 }

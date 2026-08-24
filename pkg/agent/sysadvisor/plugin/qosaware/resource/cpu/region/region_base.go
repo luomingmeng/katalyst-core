@@ -263,11 +263,6 @@ func NewQoSRegionBase(name string, ownerPoolName string, resourcePackageName str
 			MaxRampUpStep:     conf.MaxRampUpStep,
 			MaxRampDownStep:   conf.MaxRampDownStep,
 			MinRampDownPeriod: conf.MinRampDownPeriod,
-			NeedHTAligned: func() bool {
-				return machine.SmtActive() &&
-					!conf.GetDynamicConfiguration().AllowSharedCoresOverlapReclaimedCores &&
-					regionType == v1alpha1.QoSRegionTypeShare
-			},
 			CPUsPerCore: func() int {
 				return metaServer.CPUTopology.CPUsPerCore()
 			},
@@ -287,6 +282,12 @@ func NewQoSRegionBase(name string, ownerPoolName string, resourcePackageName str
 
 		isQuotaCtrlKnobEnabled: metacache.IsQuotaCtrlKnobEnabled,
 		getCPUWithRelativePath: cgroupmgr.GetCPUWithRelativePath,
+	}
+	r.cpuRegulatorOptions.NeedHTAligned = func() bool {
+		return r.DynamicConfiguration != nil &&
+			machine.SmtActive() &&
+			!r.DynamicConfiguration.AllowSharedCoresOverlapReclaimedCores &&
+			regionType == v1alpha1.QoSRegionTypeShare
 	}
 
 	r.initHeadroomPolicy(conf, extraConf, metaReader, metaServer, emitter)
@@ -774,9 +775,14 @@ func (r *QoSRegionBase) regulateProvisionControlKnob(originControlKnob map[types
 	}
 }
 
-// getIndicators returns indicator targets from spd and current by region specific indicator getters
+// getIndicators returns indicator targets from spd and current by region specific indicator getters.
+// It is the single entry point of the indicator subtree (getIndicatorTarget, fetchGetter, expandTarget,
+// getMetricThreshold), so guarding DynamicConfiguration here protects every downstream dereference.
 func (r *QoSRegionBase) getIndicators() (types.Indicator, error) {
-	indicatorTargetConfig, ok := r.conf.GetDynamicConfiguration().RegionIndicatorTargetConfiguration[r.regionType]
+	if r.DynamicConfiguration == nil {
+		return nil, fmt.Errorf("dynamic configuration is nil")
+	}
+	indicatorTargetConfig, ok := r.DynamicConfiguration.RegionIndicatorTargetConfiguration[r.regionType]
 	if !ok {
 		return nil, fmt.Errorf("get %v indicators failed", r.regionType)
 	}
@@ -819,7 +825,7 @@ func (r *QoSRegionBase) getIndicators() (types.Indicator, error) {
 	}
 	if r.conf.PolicyRama.EnableBorwein && r.provisionPolicyNameInUse == types.CPUProvisionPolicyRama {
 		general.Infof("try to update indicators by borwein model")
-		return r.borweinController.GetUpdatedIndicators(indicators, r.podSet), nil
+		return r.borweinController.GetUpdatedIndicators(indicators, r.podSet, r.DynamicConfiguration), nil
 	} else {
 		return indicators, nil
 	}
@@ -1075,7 +1081,7 @@ func (r *QoSRegionBase) restrictProvisionControlKnob(originControlKnob map[types
 }
 
 func (r *QoSRegionBase) expandTarget(target float64, indicatorName workloadv1alpha1.ServiceSystemIndicatorName) float64 {
-	expandFactors := r.conf.GetDynamicConfiguration().IndicatorTargetMetricThresholdExpandFactors
+	expandFactors := r.DynamicConfiguration.IndicatorTargetMetricThresholdExpandFactors
 	factor, ok := expandFactors[string(indicatorName)]
 	if !ok {
 		return target
@@ -1091,20 +1097,18 @@ func (r *QoSRegionBase) getIndicatorTarget(indicatorName workloadv1alpha1.Servic
 }
 
 func (r *QoSRegionBase) fetchGetter(indicatorName workloadv1alpha1.ServiceSystemIndicatorName) (indicatorTargetGetter, string) {
-	defaultGetterName := r.conf.GetDynamicConfiguration().IndicatorTargetDefaultGetter
-	getterName, ok := r.conf.GetDynamicConfiguration().IndicatorTargetGetters[string(indicatorName)]
+	defaultGetterName := r.DynamicConfiguration.IndicatorTargetDefaultGetter
+	getterName, ok := r.DynamicConfiguration.IndicatorTargetGetters[string(indicatorName)]
 	// if not specified, use default
 	if !ok || getterName == "" {
 		getterName = defaultGetterName
 	}
 	if indicatorName == workloadv1alpha1.ServiceSystemIndicatorNameCPUUsageRatio {
-		overrideGetterName, err := strategygroup.StrategyPolicyOverrideForNode(
+		getterName = strategygroup.StrategyPolicyOverrideForNodeWithDynamicConfiguration(
 			map[string]string{coreconsts.StrategyNameMetricThreshold: string(pkgconsts.IndicatorTargetGetterMetricThreshold)},
-			getterName, r.conf)
-		if err != nil {
-			general.Warningf("failed to get strategy policy override for node, err: %v", err)
-		}
-		getterName = overrideGetterName
+			getterName,
+			r.DynamicConfiguration,
+		)
 	}
 	getter, ok := r.indicatorTargetGetters[getterName]
 	if !ok {
@@ -1123,7 +1127,7 @@ func (r *QoSRegionBase) getMetricThreshold(indicatorName workloadv1alpha1.Servic
 	}
 
 	thresholdVal := threshold.GetMetricThreshold(thresholdMetricName, r.metaServer,
-		r.conf.GetDynamicConfiguration().MetricThresholdConfiguration.Threshold)
+		r.DynamicConfiguration.MetricThresholdConfiguration.Threshold)
 
 	if thresholdVal == nil {
 		general.Errorf("got no valid threshold for %v, fallback to default %v", thresholdMetricName, defaultTarget)

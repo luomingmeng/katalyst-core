@@ -30,6 +30,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/plugin/qosaware/resource/helper"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
 	"github.com/kubewharf/katalyst-core/pkg/config"
+	"github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	metricHelper "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric/helper"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
@@ -106,9 +107,10 @@ func NewHeadroomAssemblerCommon(conf *config.Configuration, _ interface{}, regio
 	}
 }
 
-func (ha *HeadroomAssemblerCommon) GetHeadroom() (resource.Quantity, map[int]resource.Quantity, error) {
-	dynamicConfig := ha.conf.GetDynamicConfiguration()
-
+func (ha *HeadroomAssemblerCommon) GetHeadroom(dynamicConfig *dynamic.Configuration) (resource.Quantity, map[int]resource.Quantity, error) {
+	if dynamicConfig == nil {
+		return resource.Quantity{}, nil, fmt.Errorf("dynamic configuration is nil")
+	}
 	// return zero when reclaim is disabled
 	if !dynamicConfig.EnableReclaim {
 		general.Infof("reclaim is NOT enabled")
@@ -116,18 +118,18 @@ func (ha *HeadroomAssemblerCommon) GetHeadroom() (resource.Quantity, map[int]res
 	}
 
 	if dynamicConfig.CPUUtilBasedConfiguration.Enable {
-		return ha.getHeadroomByUtil()
+		return ha.getHeadroomByUtil(dynamicConfig)
 	}
-	return ha.getHeadroomDefault()
+	return ha.getHeadroomDefault(dynamicConfig)
 }
 
-func (ha *HeadroomAssemblerCommon) getHeadroomDefault() (resource.Quantity, map[int]resource.Quantity, error) {
+func (ha *HeadroomAssemblerCommon) getHeadroomDefault(dynamicConfig *dynamic.Configuration) (resource.Quantity, map[int]resource.Quantity, error) {
 	reclaimPoolInfo, reclaimPoolExist := ha.metaReader.GetPoolInfo(commonstate.PoolNameReclaim)
 	if !reclaimPoolExist || reclaimPoolInfo == nil {
 		return resource.Quantity{}, nil, fmt.Errorf("get headroom failed: reclaim pool not found")
 	}
 
-	bindingNUMAs, nonBindingNUMAs, dedicatedNUMAs, err := ha.getReclaimNUMABindingTopo(reclaimPoolInfo)
+	bindingNUMAs, nonBindingNUMAs, dedicatedNUMAs, err := ha.getReclaimNUMABindingTopo(dynamicConfig, reclaimPoolInfo)
 	if err != nil {
 		general.Errorf("getReclaimNUMABindingTop failed: %v", err)
 		return resource.Quantity{}, nil, err
@@ -152,7 +154,8 @@ func (ha *HeadroomAssemblerCommon) getHeadroomDefault() (resource.Quantity, map[
 		reclaimPaths := ha.numaBindingRelativeRootCgroupPaths[numaID]
 		resolvedPaths := ha.existingRelativeCgroupPaths(reclaimPaths...)
 		ha.logReclaimPathResolution("numa", numaID, cpuSet, reclaimPaths, resolvedPaths)
-		reclaimMetrics, err := metricHelper.GetReclaimMetricsMulti(cpuSet, resolvedPaths, ha.metaServer.MetricsFetcher, ha.resolveOverlapReclaim(numaID, dedicatedNUMAs))
+		reclaimMetrics, err := metricHelper.GetReclaimMetricsMulti(cpuSet, resolvedPaths, ha.metaServer.MetricsFetcher,
+			ha.resolveOverlapReclaim(dynamicConfig, numaID, dedicatedNUMAs))
 		if err != nil {
 			return resource.Quantity{}, nil, fmt.Errorf("get reclaim Metrics failed with numa %d: %v", numaID, err)
 		}
@@ -178,7 +181,8 @@ func (ha *HeadroomAssemblerCommon) getHeadroomDefault() (resource.Quantity, map[
 		ha.logReclaimPathResolution("global", -1, cpuSets, ha.reclaimRelativeRootCgroupPaths, resolvedPaths)
 		// non-binding NUMAs are share/global and never dedicated, so the overlap
 		// flag follows AllowSharedCoresOverlapReclaimedCores directly.
-		reclaimMetrics, err := metricHelper.GetReclaimMetricsMulti(cpuSets, resolvedPaths, ha.metaServer.MetricsFetcher, ha.conf.GetDynamicConfiguration().AllowSharedCoresOverlapReclaimedCores)
+		reclaimMetrics, err := metricHelper.GetReclaimMetricsMulti(cpuSets, resolvedPaths, ha.metaServer.MetricsFetcher,
+			dynamicConfig.AllowSharedCoresOverlapReclaimedCores)
 		if err != nil {
 			return resource.Quantity{}, nil, fmt.Errorf("get reclaim Metrics failed: %v", err)
 		}
@@ -218,13 +222,13 @@ func (ha *HeadroomAssemblerCommon) getHeadroomDefault() (resource.Quantity, map[
 	return totalHeadroom, numaHeadroom, nil
 }
 
-func (ha *HeadroomAssemblerCommon) getHeadroomByUtil() (resource.Quantity, map[int]resource.Quantity, error) {
+func (ha *HeadroomAssemblerCommon) getHeadroomByUtil(dynamicConfig *dynamic.Configuration) (resource.Quantity, map[int]resource.Quantity, error) {
 	reclaimPoolInfo, reclaimPoolExist := ha.metaReader.GetPoolInfo(commonstate.PoolNameReclaim)
 	if !reclaimPoolExist || reclaimPoolInfo == nil {
 		return resource.Quantity{}, nil, fmt.Errorf("get headroom by util failed: reclaim pool not found")
 	}
 
-	bindingNUMAs, nonBindingNUMAs, dedicatedNUMAs, err := ha.getReclaimNUMABindingTopo(reclaimPoolInfo)
+	bindingNUMAs, nonBindingNUMAs, dedicatedNUMAs, err := ha.getReclaimNUMABindingTopo(dynamicConfig, reclaimPoolInfo)
 	if err != nil {
 		general.Errorf("getReclaimNUMABindingTop failed: %v", err)
 		return resource.Quantity{}, nil, err
@@ -232,7 +236,6 @@ func (ha *HeadroomAssemblerCommon) getHeadroomByUtil() (resource.Quantity, map[i
 	general.Infof("RNB NUMA topo: %v, %v", bindingNUMAs, nonBindingNUMAs)
 
 	numaHeadroom := make(map[int]resource.Quantity, ha.metaServer.NumNUMANodes)
-	dynamicConfig := ha.conf.GetDynamicConfiguration()
 	cpusPerCore, err := ha.cpusPerCore()
 	if err != nil {
 		return resource.Quantity{}, nil, err
@@ -254,7 +257,8 @@ func (ha *HeadroomAssemblerCommon) getHeadroomByUtil() (resource.Quantity, map[i
 		reclaimPaths := ha.numaBindingRelativeRootCgroupPaths[numaID]
 		resolvedPaths := ha.existingRelativeCgroupPaths(reclaimPaths...)
 		ha.logReclaimPathResolution("numa", numaID, cpuSet, reclaimPaths, resolvedPaths)
-		reclaimMetrics, err := metricHelper.GetReclaimMetricsMulti(cpuSet, resolvedPaths, ha.metaServer.MetricsFetcher, ha.resolveOverlapReclaim(numaID, dedicatedNUMAs))
+		reclaimMetrics, err := metricHelper.GetReclaimMetricsMulti(cpuSet, resolvedPaths, ha.metaServer.MetricsFetcher,
+			ha.resolveOverlapReclaim(dynamicConfig, numaID, dedicatedNUMAs))
 		if err != nil {
 			return resource.Quantity{}, nil, fmt.Errorf("get reclaim Metrics failed with numa %d: %v", numaID, err)
 		}
@@ -289,7 +293,8 @@ func (ha *HeadroomAssemblerCommon) getHeadroomByUtil() (resource.Quantity, map[i
 		ha.logReclaimPathResolution("global", -1, cpusets, ha.reclaimRelativeRootCgroupPaths, resolvedPaths)
 		// non-binding NUMAs are share/global and never dedicated, so the overlap
 		// flag follows AllowSharedCoresOverlapReclaimedCores directly.
-		reclaimMetrics, err := metricHelper.GetReclaimMetricsMulti(cpusets, resolvedPaths, ha.metaServer.MetricsFetcher, ha.conf.GetDynamicConfiguration().AllowSharedCoresOverlapReclaimedCores)
+		reclaimMetrics, err := metricHelper.GetReclaimMetricsMulti(cpusets, resolvedPaths, ha.metaServer.MetricsFetcher,
+			dynamicConfig.AllowSharedCoresOverlapReclaimedCores)
 		if err != nil {
 			return resource.Quantity{}, nil, fmt.Errorf("get reclaim Metrics failed: %v", err)
 		}

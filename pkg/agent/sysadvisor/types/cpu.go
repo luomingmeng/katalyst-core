@@ -211,10 +211,17 @@ type InternalCPUCalculationResult struct {
 	TimeStamp                                  time.Time
 	AllowSharedCoresOverlapReclaimedCores      bool
 	DisableDedicatedCoresOverlapReclaimedCores bool
+	ReclaimConstraintExcess                    int
+	ReclaimConstraintTargets                   map[string]ReclaimConstraintTarget
 
 	// DefaultShareBackfill holds in-process only diagnostics for the default
 	// share pool residual backfill; it does not enter the advisor proto.
 	DefaultShareBackfill DefaultShareBackfillDiagnostics
+}
+
+type ReclaimConstraintTarget struct {
+	Desired int
+	Floor   int
 }
 
 type CPUResource struct {

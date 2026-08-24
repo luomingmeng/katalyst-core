@@ -1013,7 +1013,7 @@ func TestHeadroomAssemblerCommon_GetHeadroom(t *testing.T) {
 			store := metricsFetcher.(*metric.FakeMetricsFetcher)
 			tt.fields.setFakeMetric(store)
 
-			got, _, err := ha.GetHeadroom()
+			got, _, err := ha.GetHeadroom(conf.GetDynamicConfiguration())
 			if (err != nil) != tt.wantErr {
 				t.Errorf("GetHeadroom() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -1086,7 +1086,7 @@ func TestHeadroomAssemblerCommon_PreservesCoreAlignedGlobalHeadroom(t *testing.T
 		store.SetCgroupMetric(path, pkgconsts.MetricCPUPeriodCgroup, utilmetric.MetricData{Value: 100000, Time: &now})
 	}
 
-	total, numa, err := assembler.GetHeadroom()
+	total, numa, err := assembler.GetHeadroom(conf.GetDynamicConfiguration())
 	require.NoError(t, err)
 	require.Equal(t, int64(76), total.Value())
 	require.Equal(t, map[int]int64{

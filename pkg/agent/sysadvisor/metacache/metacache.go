@@ -115,6 +115,11 @@ type MetaWriter interface {
 
 	// SetPoolInfo stores a PoolInfo by pool name
 	SetPoolInfo(poolName string, poolInfo *types.PoolInfo) error
+	// RangeAndUpdatePool applies a function to every poolName, poolInfo set while holding the pool write lock.
+	// If f returns false, range stops the iteration.
+	// It returns error only for signature symmetry with the other RangeAndUpdate* mutators (and to leave room
+	// for future validation); the current implementation always returns nil, so callers may ignore the result.
+	RangeAndUpdatePool(f func(poolName string, poolInfo *types.PoolInfo) bool) error
 	// DeletePool deletes a PoolInfo keyed by pool name
 	DeletePool(poolName string) error
 	// GCPoolEntries deletes GCPoolEntries not existing on node
@@ -535,6 +540,20 @@ func (mc *MetaCacheImp) SetPoolInfo(poolName string, poolInfo *types.PoolInfo) e
 
 	mc.poolEntries[poolName] = poolInfo
 
+	return nil
+}
+
+func (mc *MetaCacheImp) RangeAndUpdatePool(f func(poolName string, poolInfo *types.PoolInfo) bool) error {
+	mc.poolMutex.Lock()
+	defer mc.poolMutex.Unlock()
+
+	for poolName, poolInfo := range mc.poolEntries {
+		if !f(poolName, poolInfo) {
+			break
+		}
+	}
+
+	// always nil today; error is kept in the signature for symmetry with other RangeAndUpdate* mutators.
 	return nil
 }
 
