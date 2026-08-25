@@ -261,6 +261,48 @@ func TestUpdateActualNUMABindingReclaimMemoryLimitUsesOneDynamicConfigSnapshot(t
 	require.Equal(t, map[int]int64{0: 900, 1: 900}, mg.numaBindingReclaimMemoryLimit.Load())
 }
 
+func TestCalculateReclaimedMemoryLimitFor_SkipsMissingCgroupPath(t *testing.T) {
+	t.Parallel()
+
+	conf := config.NewConfiguration()
+	snapshot := dynamicconfig.NewConfiguration()
+	snapshot.CriticalWatermarkSource = configv1alpha1.CriticalWatermarkSourceLow
+	conf.SetDynamicConfiguration(snapshot)
+
+	now := time.Now()
+	fakeFetcher := agentmetric.NewFakeMetricsFetcher(metrics.DummyMetrics{}).(*agentmetric.FakeMetricsFetcher)
+	fakeFetcher.SetNodeMetric(consts.MetricMemScaleFactorSystem, metric.MetricData{Value: 0, Time: &now})
+	fakeFetcher.SetNumaMetric(0, consts.MetricMemTotalNuma, metric.MetricData{Value: 1000, Time: &now})
+	fakeFetcher.SetNumaMetric(0, consts.MetricMemFreeNuma, metric.MetricData{Value: 1000, Time: &now})
+
+	metaServer := &metaserver.MetaServer{
+		MetaAgent: &agent.MetaAgent{
+			MetricsFetcher: fakeFetcher,
+			KatalystMachineInfo: &machine.KatalystMachineInfo{
+				MachineInfo:    &cadvisorinfo.MachineInfo{},
+				MemoryTopology: &machine.MemoryTopology{PageSize: 1},
+			},
+		},
+	}
+	mg := &memoryGuard{
+		metaServer:           metaServer,
+		minCriticalWatermark: 0,
+		conf:                 conf,
+	}
+
+	zoneInfos := []machine.NormalZoneInfo{{Node: 0, Free: 1000, Low: 100, High: 400}}
+
+	// neither reclaimed parent is materialized on the test host, so both are
+	// filtered out before any per-numa metric lookup. the reconcile must not
+	// abort when the metric store has no entry for a missing reclaimed parent.
+	limit, err := mg.calculateReclaimedMemoryLimitFor(snapshot, 0,
+		[]string{"/reclaimed-parent-a", "/reclaimed-parent-b"}, zoneInfos)
+	require.NoError(t, err)
+	// reclaimedMemoryUsed(0, both parents filtered) +
+	// max(numaFree(1000) - criticalWatermark(low 100 * scale 1), 0) = 900
+	require.Equal(t, 900.0, limit)
+}
+
 func TestCalculateReclaimedMemoryLimitFor_MaxRatioClamp(t *testing.T) {
 	t.Parallel()
 

@@ -32,6 +32,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
+	"github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	"github.com/kubewharf/katalyst-core/pkg/util/reclaim"
@@ -173,8 +174,14 @@ func (mg *memoryGuard) calculateReclaimedMemoryLimitFor(dynamicConfig *dynamicco
 		return 0, err
 	}
 
+	// filter out reclaimed cgroup paths that are not materialized on this node.
+	// their per-numa metrics are absent from the store, so keeping them would
+	// abort the whole reconcile; the remaining parents still contribute their
+	// usage baseline.
+	existingCgroupPaths := common.GetExistingRelativeCgroupPaths(reclaimedCgroupPaths...)
+
 	reclaimedMemoryUsed := .0
-	for _, p := range reclaimedCgroupPaths {
+	for _, p := range existingCgroupPaths {
 		m, err := mg.metaServer.GetCgroupNumaMetric(p, numaID, consts.MetricsMemTotalPerNumaCgroup)
 		if err != nil {
 			return 0, err
