@@ -2300,7 +2300,7 @@ func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommit(
 		)
 	}
 
-	nonReclaim := machine.NewCPUSet()
+	disallowedSharedPartition := machine.NewCPUSet()
 	for name, containerEntries := range newEntries {
 		if containerEntries == nil {
 			continue
@@ -2309,8 +2309,15 @@ func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommit(
 			if name == commonstate.PoolNameReclaim {
 				continue
 			}
+			if commonstate.IsSystemPool(name) {
+				continue
+			}
+			if commonstate.GetPoolType(name) == commonstate.PoolNameDedicated &&
+				!disableDedicatedCoresOverlapReclaimedCores {
+				continue
+			}
 			if ai := containerEntries[commonstate.FakedContainerName]; ai != nil {
-				nonReclaim = nonReclaim.Union(ai.AllocationResult)
+				disallowedSharedPartition = disallowedSharedPartition.Union(ai.AllocationResult)
 			}
 			continue
 		}
@@ -2318,19 +2325,23 @@ func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommit(
 			if ai == nil {
 				continue
 			}
-			// system_cores containers are never part of the non-reclaim
+			// system_cores containers are never part of the disallowed shared
 			// partition: bulkhead's BuildCPUSetPartitionView never folds them
 			// into NonReclaimPool, so they may legally overlap the reclaim pool
 			// (e.g. when a missing specified pool triggers whole-machine
 			// fallback). Exclude them here to keep this always-on invariant
 			// consistent with the bulkhead partition view.
-			if !ai.CheckReclaimed() && !ai.CheckSystem() {
-				nonReclaim = nonReclaim.Union(ai.AllocationResult)
+			if ai.CheckReclaimed() || ai.CheckSystem() {
+				continue
 			}
+			if ai.CheckDedicated() && !disableDedicatedCoresOverlapReclaimedCores {
+				continue
+			}
+			disallowedSharedPartition = disallowedSharedPartition.Union(ai.AllocationResult)
 		}
 	}
-	if overlap := reclaimPool.AllocationResult.Intersection(nonReclaim); !overlap.IsEmpty() {
-		return fmt.Errorf("reclaim pool overlaps non-reclaim partition before commit: %s", overlap.String())
+	if overlap := reclaimPool.AllocationResult.Intersection(disallowedSharedPartition); !overlap.IsEmpty() {
+		return fmt.Errorf("reclaim pool overlaps disallowed shared partition before commit: %s", overlap.String())
 	}
 	return p.validatePendingAdvisorPartitionView(
 		newEntries,

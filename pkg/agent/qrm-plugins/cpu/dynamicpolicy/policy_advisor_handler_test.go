@@ -2571,22 +2571,41 @@ func TestDynamicPolicyValidateAdvisorPartitionBeforeCommitRejectsReclaimNonRecla
 	t.Parallel()
 
 	for _, tc := range []struct {
-		name          string
-		podUID        string
-		ownerPoolName string
-		qosLevel      string
+		name             string
+		podUID           string
+		ownerPoolName    string
+		qosLevel         string
+		allowShared      bool
+		disableDedicated bool
+		wantErr          string
 	}{
 		{
-			name:          "dedicated",
+			name:          "dedicated overlap allowed",
 			podUID:        "pod-dedicated",
 			ownerPoolName: commonstate.PoolNameDedicated,
 			qosLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
 		},
 		{
-			name:          "shared",
+			name:             "dedicated overlap disabled",
+			podUID:           "pod-dedicated",
+			ownerPoolName:    commonstate.PoolNameDedicated,
+			qosLevel:         apiconsts.PodAnnotationQoSLevelDedicatedCores,
+			disableDedicated: true,
+			wantErr:          "overlaps reclaim pool",
+		},
+		{
+			name:          "shared overlap rejected",
 			podUID:        "pod-shared",
 			ownerPoolName: commonstate.PoolNameShare,
 			qosLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+			wantErr:       "reclaim pool overlaps disallowed shared partition before commit",
+		},
+		{
+			name:          "shared overlap allowed",
+			podUID:        "pod-shared",
+			ownerPoolName: commonstate.PoolNameShare,
+			qosLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+			allowShared:   true,
 		},
 	} {
 		tc := tc
@@ -2625,9 +2644,17 @@ func TestDynamicPolicyValidateAdvisorPartitionBeforeCommitRejectsReclaimNonRecla
 				},
 			}
 
-			err = policy.validateAdvisorPartitionBeforeCommit(newEntries, policy.state.GetMachineState(), false, false)
-			require.Error(t, err)
-			require.Contains(t, err.Error(), "overlaps non-reclaim")
+			err = policy.validateAdvisorPartitionBeforeCommit(
+				newEntries,
+				policy.state.GetMachineState(),
+				tc.allowShared,
+				tc.disableDedicated,
+			)
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, tc.wantErr)
+			}
 		})
 	}
 }

@@ -116,6 +116,66 @@ func TestCommitPendingCPUPartitionRejectsInvalidOverrideAndDeletionFallback(t *t
 	}
 }
 
+func TestValidateAdvisorPartitionBeforeCommitAllowsDedicatedOverlapWhenEnabled(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	err := p.validateAdvisorPartitionBeforeCommit(
+		precommitPartitionEntries(machine.NewCPUSet(0, 1), machine.NewCPUSet(1, 2)),
+		nil,
+		false,
+		false,
+	)
+	require.NoError(t, err)
+}
+
+func TestValidateAdvisorPartitionBeforeCommitRejectsDedicatedOverlapWhenDisabled(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	err := p.validateAdvisorPartitionBeforeCommit(
+		precommitPartitionEntries(machine.NewCPUSet(0, 1), machine.NewCPUSet(1, 2)),
+		nil,
+		false,
+		true,
+	)
+	require.ErrorContains(t, err, "overlaps reclaim pool")
+}
+
+func TestValidateAdvisorPartitionBeforeCommitRejectsSharedOverlapWhenDisabled(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	err := p.validateAdvisorPartitionBeforeCommit(
+		precommitPartitionEntriesWithShare(
+			machine.NewCPUSet(0, 1),
+			machine.NewCPUSet(2, 3),
+			machine.NewCPUSet(1, 4),
+		),
+		nil,
+		false,
+		false,
+	)
+	require.ErrorContains(t, err, "reclaim pool overlaps disallowed shared partition before commit")
+}
+
+func TestValidateAdvisorPartitionBeforeCommitAllowsSharedOverlapWhenEnabled(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	err := p.validateAdvisorPartitionBeforeCommit(
+		precommitPartitionEntriesWithShare(
+			machine.NewCPUSet(0, 1),
+			machine.NewCPUSet(1, 2),
+			machine.NewCPUSet(0, 3),
+		),
+		nil,
+		true,
+		false,
+	)
+	require.NoError(t, err)
+}
+
 func precommitPartitionEntries(reclaim, dedicated machine.CPUSet) state.PodEntries {
 	return state.PodEntries{
 		commonstate.PoolNameReclaim: {
@@ -138,4 +198,16 @@ func precommitPartitionEntries(reclaim, dedicated machine.CPUSet) state.PodEntri
 			},
 		},
 	}
+}
+
+func precommitPartitionEntriesWithShare(reclaim, dedicated, share machine.CPUSet) state.PodEntries {
+	entries := precommitPartitionEntries(reclaim, dedicated)
+	entries[commonstate.PoolNameShare] = state.ContainerEntries{
+		commonstate.FakedContainerName: &state.AllocationInfo{
+			AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+			AllocationResult:         share.Clone(),
+			OriginalAllocationResult: share.Clone(),
+		},
+	}
+	return entries
 }
