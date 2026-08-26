@@ -7436,8 +7436,10 @@ func TestSharedCoresRampUpAllocationExcludesAllNUMAReclaimFloor(t *testing.T) {
 	policy.reservedReclaimedCPUsSize = floor.Size()
 	policy.state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &state.AllocationInfo{
 		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
-		AllocationResult: floor,
+		AllocationResult: machine.NewCPUSet(),
 	}, false)
+	tracked := &atomicCommitTrackingState{State: policy.state}
+	policy.state = tracked
 
 	const podUID = "shared-ramp-up-all-numa-floor"
 	policy.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{{
@@ -7461,11 +7463,17 @@ func TestSharedCoresRampUpAllocationExcludesAllNUMAReclaimFloor(t *testing.T) {
 
 	_, err = policy.sharedCoresWithoutNUMABindingAllocationHandler(context.Background(), req, false)
 	as.NoError(err)
+	as.Equal(1, tracked.commitCalls)
 	allocation := policy.state.GetAllocationInfo(podUID, "main")
 	as.NotNil(allocation)
 	as.True(allocation.RampUp)
 	as.True(allocation.AllocationResult.Intersection(floor).IsEmpty(),
 		"ramp-up allocation %s contains reclaim floor %s", allocation.AllocationResult, floor)
+	reclaim := policy.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	as.NotNil(reclaim)
+	as.True(floor.IsSubsetOf(reclaim.AllocationResult),
+		"first shared ramp-up must commit reclaim floor atomically: reclaim=%s floor=%s",
+		reclaim.AllocationResult, floor)
 
 	_, err = policy.sharedCoresWithoutNUMABindingAllocationHandler(context.Background(), req, false)
 	as.NoError(err)
@@ -10507,6 +10515,7 @@ func TestDynamicPolicy_AllocationHooks(t *testing.T) {
 						PodName:       "modify-sidecar-pod",
 						ContainerName: "main-c",
 						ContainerType: pluginapi.ContainerType_MAIN.String(),
+						QoSLevel:      consts.PodAnnotationQoSLevelSharedCores,
 					},
 					AllocationResult: machine.NewCPUSet(0, 1),
 				}, false)
@@ -10657,6 +10666,7 @@ func TestDynamicPolicy_AllocationHooks(t *testing.T) {
 						PodName:       "error-sidecar-pod",
 						ContainerName: "main-c",
 						ContainerType: pluginapi.ContainerType_MAIN.String(),
+						QoSLevel:      consts.PodAnnotationQoSLevelSharedCores,
 					},
 					AllocationResult: machine.NewCPUSet(0, 1),
 				}, false)

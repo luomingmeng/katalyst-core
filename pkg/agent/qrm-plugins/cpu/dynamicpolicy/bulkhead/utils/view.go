@@ -41,6 +41,7 @@ func NewCPUSetPartitionViewOptions(
 	coreConf *config.Configuration,
 	dynamicConf *dynamicconfig.Configuration,
 	topology *machine.CPUTopology,
+	hardActive bool,
 ) CPUSetPartitionViewOptions {
 	nonReclaimPoolMinSize := configuredNonReclaimPoolMinSize(dynamicConf)
 	if nonReclaimPoolMinSize <= 0 && coreConf != nil && coreConf.DynamicAgentConfiguration != nil {
@@ -49,7 +50,7 @@ func NewCPUSetPartitionViewOptions(
 
 	opts := CPUSetPartitionViewOptions{
 		NonReclaimPoolMinSize:             nonReclaimPoolMinSize,
-		HardPartitionEnabled:              hardPartitionEnabled(dynamicConf),
+		HardPartitionEnabled:              hardActive && hardPartitionEnabled(dynamicConf),
 		HardPartitionReclaimTargetPerNUMA: map[int]int{},
 	}
 	if opts.HardPartitionEnabled && topology != nil {

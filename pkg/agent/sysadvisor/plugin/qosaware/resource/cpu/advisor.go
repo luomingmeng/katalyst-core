@@ -162,10 +162,8 @@ func NewCPUResourceAdvisor(conf *config.Configuration, extraConf interface{}, me
 	}
 
 	dynamicConf := conf.GetDynamicConfiguration()
-	if dynamicConf == nil || !dynamicConf.EnableRampUpReclaimHardPartition {
-		if err := cra.updateReservedForReclaim(dynamicConf); err != nil {
-			klog.Errorf("[qosaware-cpu] initialize reserved resource for reclaim failed: %v", err)
-		}
+	if err := cra.updateReservedForReclaim(dynamicConf); err != nil {
+		klog.Errorf("[qosaware-cpu] initialize reserved resource for reclaim failed: %v", err)
 	}
 
 	if err := cra.initializeProvisionAssembler(); err != nil {
@@ -244,17 +242,21 @@ func (cra *cpuResourceAdvisor) update() (*types.InternalCPUCalculationResult, er
 	if dynamicConf == nil {
 		return nil, fmt.Errorf("dynamic configuration is nil")
 	}
-	hardEnabled := dynamicConf.EnableReclaim && dynamicConf.EnableRampUpReclaimHardPartition
+	hardEnabled := dynamicConf.EnableReclaim &&
+		dynamicConf.EnableRampUpReclaimHardPartition &&
+		metadataSnapshot.activeRampUp
 	maxRampUpStep := cra.conf.CPUAdvisorConfiguration.MaxRampUpStep
 	observedReclaimTotal, reclaimObserved := cra.observedReclaimTotal()
 	reclaimConstraint, reclaimCeilings := cra.reclaimConstraintGuard.constraint(
 		hardEnabled, observedReclaimTotal, reclaimObserved, maxRampUpStep)
 
-	result, err := cra.updateWithIsolationGuardian(dynamicConf, reclaimConstraint, reclaimCeilings, true)
+	result, err := cra.updateWithIsolationGuardian(
+		dynamicConf, metadataSnapshot.activeRampUp, hardEnabled, reclaimConstraint, reclaimCeilings, true)
 	if err != nil {
 		if err == errIsolationSafetyCheckFailed {
 			klog.Warningf("[qosaware-cpu] failed to updateWithIsolationGuardian(true): %q", err)
-			result, err = cra.updateWithIsolationGuardian(dynamicConf, reclaimConstraint, reclaimCeilings, false)
+			result, err = cra.updateWithIsolationGuardian(
+				dynamicConf, metadataSnapshot.activeRampUp, hardEnabled, reclaimConstraint, reclaimCeilings, false)
 		}
 		if err != nil {
 			return nil, err
@@ -310,8 +312,9 @@ type containerRegionAssignment struct {
 }
 
 type regionAssignmentSnapshot struct {
-	containers map[string]map[string]containerRegionAssignment
-	pools      map[string]sets.String
+	containers   map[string]map[string]containerRegionAssignment
+	pools        map[string]sets.String
+	activeRampUp bool
 }
 
 func (cra *cpuResourceAdvisor) snapshotRegionAssignments() regionAssignmentSnapshot {
@@ -322,6 +325,9 @@ func (cra *cpuResourceAdvisor) snapshotRegionAssignments() regionAssignmentSnaps
 	cra.metaCache.RangeContainer(func(podUID, containerName string, ci *types.ContainerInfo) bool {
 		if snapshot.containers[podUID] == nil {
 			snapshot.containers[podUID] = make(map[string]containerRegionAssignment)
+		}
+		if ci.RampUp {
+			snapshot.activeRampUp = true
 		}
 		snapshot.containers[podUID][containerName] = containerRegionAssignment{
 			regionNames: sets.NewString(ci.RegionNames.List()...),
@@ -371,6 +377,8 @@ func (cra *cpuResourceAdvisor) restoreRegionAssignments(snapshot regionAssignmen
 // If updateWithIsolationGuardian fails with isolation enabled, we should try again with isolation disabled.
 // todo: we should re-design the mechanism of isolation instead of disabling this functionality
 func (cra *cpuResourceAdvisor) updateWithIsolationGuardian(dynamicConf *dynamic.Configuration,
+	rampUpActive bool,
+	hardActive bool,
 	reclaimConstraint provisionassembler.ReclaimConstraint,
 	reclaimCeilings map[provisionassembler.ReclaimConstraintScope]int,
 	tryIsolation bool,
@@ -392,7 +400,7 @@ func (cra *cpuResourceAdvisor) updateWithIsolationGuardian(dynamicConf *dynamic.
 		return nil, fmt.Errorf("reserve pool does not exist")
 	}
 
-	if err := cra.updateNumasAvailableResource(dynamicConf); err != nil {
+	if err := cra.updateNumasAvailableResource(dynamicConf, hardActive); err != nil {
 		klog.Errorf("[qosaware-cpu] update NUMA available resource failed: %v", err)
 		return nil, fmt.Errorf("failed to update NUMA available resource: %w", err)
 	}
@@ -439,7 +447,8 @@ func (cra *cpuResourceAdvisor) updateWithIsolationGuardian(dynamicConf *dynamic.
 	}
 
 	// assemble provision result from each region
-	calculationResult, err := cra.assembleProvision(dynamicConf, reclaimConstraint, reclaimCeilings)
+	calculationResult, err := cra.assembleProvision(
+		dynamicConf, rampUpActive, reclaimConstraint, reclaimCeilings)
 	if err != nil {
 		klog.Errorf("[qosaware-cpu] assemble provision failed: %q", err)
 		return nil, fmt.Errorf("failed to assemble provisioner: %q", err)
@@ -766,6 +775,7 @@ func (cra *cpuResourceAdvisor) updateAdvisorEssentials(dynamicConf *dynamic.Conf
 // must make sure pool names from cpu provision following qrm definition;
 // numa ID set as -1 means no numa-preference is needed.
 func (cra *cpuResourceAdvisor) assembleProvision(dynamicConf *dynamic.Configuration,
+	rampUpActive bool,
 	reclaimConstraint provisionassembler.ReclaimConstraint,
 	reclaimCeilings map[provisionassembler.ReclaimConstraintScope]int,
 ) (types.InternalCPUCalculationResult, error) {
@@ -775,6 +785,7 @@ func (cra *cpuResourceAdvisor) assembleProvision(dynamicConf *dynamic.Configurat
 
 	return cra.provisionAssembler.AssembleProvision(provisionassembler.ProvisionContext{
 		DynamicConfiguration: dynamicConf,
+		RampUpActive:         rampUpActive,
 		ReclaimConstraint:    reclaimConstraint,
 		ReclaimCeilings:      reclaimCeilings,
 	})

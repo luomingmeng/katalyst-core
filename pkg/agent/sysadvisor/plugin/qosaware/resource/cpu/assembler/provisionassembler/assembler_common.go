@@ -91,8 +91,7 @@ func (pa *ProvisionAssemblerCommon) cpuCountInNUMAs(numas machine.CPUSet) int {
 }
 
 func (pa *ProvisionAssemblerCommon) reclaimRatioCPUsPerCore() (int, error) {
-	dynamicConf := pa.calculationContext.DynamicConfiguration
-	if !dynamicConf.EnableReclaim || !dynamicConf.EnableRampUpReclaimHardPartition {
+	if !pa.rampUpHardPartitionActive() {
 		return 1, nil
 	}
 	if pa.metaServer == nil || pa.metaServer.CPUTopology == nil {
@@ -103,6 +102,22 @@ func (pa *ProvisionAssemblerCommon) reclaimRatioCPUsPerCore() (int, error) {
 		return 0, fmt.Errorf("invalid cpus per core %d for hard reclaim ratio cap", cpusPerCore)
 	}
 	return cpusPerCore, nil
+}
+
+func (pa *ProvisionAssemblerCommon) rampUpHardPartitionActive() bool {
+	return pa.rampUpReclaimCPUSetCap != nil && len(*pa.rampUpReclaimCPUSetCap) > 0
+}
+
+func (pa *ProvisionAssemblerCommon) effectiveReservedForReclaim(numas machine.CPUSet) int {
+	reserved := 0
+	for _, numaID := range numas.ToSliceInt() {
+		steady := (*pa.reservedForReclaim)[numaID]
+		if pa.rampUpHardPartitionActive() {
+			steady = general.Max(steady, (*pa.rampUpReclaimCPUSetCap)[numaID])
+		}
+		reserved += steady
+	}
+	return reserved
 }
 
 func (pa *ProvisionAssemblerCommon) applyRampUpReclaimCap(
@@ -569,7 +584,7 @@ func (pa *ProvisionAssemblerCommon) assembleDedicatedNUMAExclusiveRegion(r regio
 	}
 
 	regionNuma := r.GetBindingNumas().ToSliceInt()[0] // always one binding numa for this type of region
-	reservedForReclaim := getNUMAsResource(*pa.reservedForReclaim, r.GetBindingNumas())
+	reservedForReclaim := pa.effectiveReservedForReclaim(r.GetBindingNumas())
 	available := getNUMAsResource(*pa.numaAvailable, r.GetBindingNumas())
 	partitionCapacity, dedicatedCapacity, reclaimCapacity, err := pa.getExclusivePartitionCapacities(r, regionNuma, available)
 	if err != nil {
@@ -737,7 +752,7 @@ func (pa *ProvisionAssemblerCommon) assembleLegacyDedicatedNUMAExclusiveRegion(r
 	}
 
 	regionNuma := r.GetBindingNumas().ToSliceInt()[0] // always one binding numa for this type of region
-	reservedForReclaim := getNUMAsResource(*pa.reservedForReclaim, r.GetBindingNumas())
+	reservedForReclaim := pa.effectiveReservedForReclaim(r.GetBindingNumas())
 	available := getNUMAsResource(*pa.numaAvailable, r.GetBindingNumas())
 	var reclaimedCoresSize int
 	reclaimedCoresLimit := float64(-1)
@@ -865,6 +880,8 @@ func (pa *ProvisionAssemblerCommon) AssembleProvision(ctx ProvisionContext) (typ
 		TimeStamp:                                  time.Now(),
 		AllowSharedCoresOverlapReclaimedCores:      *pa.allowSharedCoresOverlapReclaimedCores,
 		DisableDedicatedCoresOverlapReclaimedCores: *pa.disableDedicatedCoresOverlapReclaimedCores,
+		RampUpActive:                               ctx.RampUpActive,
+		RampUpHardPartitionActive:                  pa.rampUpHardPartitionActive(),
 	}
 	// mark the backfill enabled once so downstream finalize can decide whether to
 	// override the default share pool quantity with the allocatable upper bound.
@@ -981,18 +998,16 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 	}
 
 	dynamicConf := pa.calculationContext.DynamicConfiguration
-	effectiveHard := dynamicConf.EnableReclaim && dynamicConf.EnableRampUpReclaimHardPartition
+	effectiveHard := pa.rampUpHardPartitionActive()
 
-	// A hard partition is a persistent per-physical-NUMA ownership invariant.
-	// Publish the canonical floor even when this NUMA has no workload region;
-	// otherwise QRM cannot distinguish an intentionally empty scope from a
-	// missing reclaim target.
+	// While ramp-up hard partition is active, publish the canonical target even
+	// when this NUMA has no workload region.
 	if len(shareRegions) == 0 && len(isolationRegions) == 0 && len(dedicatedRegions) == 0 && numaID != commonstate.FakedNUMAID {
 		if effectiveHard {
 			result.SetPoolEntry(
 				commonstate.PoolNameReclaim,
 				numaID,
-				getNUMAsResource(*pa.reservedForReclaim, numaSet),
+				getNUMAsResource(*pa.rampUpReclaimCPUSetCap, numaSet),
 				-1,
 			)
 		}
@@ -1001,7 +1016,7 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 
 	nodeEnableReclaim := dynamicConf.EnableReclaim
 
-	reservedForReclaim := getNUMAsResource(*pa.reservedForReclaim, numaSet)
+	reservedForReclaim := pa.effectiveReservedForReclaim(numaSet)
 	poolAvailableBeforeReserve := getNUMAsResource(*pa.numaAvailable, numaSet)
 	pinnedPoolAvailableByPkg, pinnedReserveByPkg,
 		unpinnedShareAndIsolatedDedicatedPoolAvailable, unpinnedReserve := getEligibilityDomainCapacities(

@@ -142,7 +142,7 @@ func TestGenerateBlockCPUSet_FakeNUMANormalShareDoesNotConsumePreviousReclaim(t 
 		},
 	}
 
-	blockCPUSet, err := p.generateBlockCPUSet(resp, nil)
+	blockCPUSet, err := p.generateBlockCPUSet(resp, nil, false)
 	require.NoError(t, err)
 	require.Equal(t, shareCPUSet, blockCPUSet["new-share-block"])
 	require.Equal(t, reclaimCPUSet, blockCPUSet["new-reclaim-block"])
@@ -169,7 +169,7 @@ func TestGenerateLegacyBlockCPUSet_HardPartitionBalancesFakeReclaim(t *testing.T
 
 			policy := newLegacyHardPartitionTestPolicy(t)
 			blockCPUSet, err := policy.generateBlockCPUSet(
-				legacyFakeReclaimResponse(tc.quantity, false), nil)
+				legacyFakeReclaimResponse(tc.quantity, false), nil, false)
 			require.NoError(t, err)
 
 			reclaim := blockCPUSet["reclaim"]
@@ -195,7 +195,7 @@ func TestGenerateLegacyBlockCPUSet_HardPartitionRebalancesPreviousFakeReclaim(t 
 		},
 	}, false)
 
-	blockCPUSet, err := policy.generateBlockCPUSet(legacyFakeReclaimResponse(4, false), nil)
+	blockCPUSet, err := policy.generateBlockCPUSet(legacyFakeReclaimResponse(4, false), nil, true)
 	require.NoError(t, err)
 	reclaim := blockCPUSet["reclaim"]
 	require.Equal(t, 2, reclaim.Intersection(policy.machineInfo.CPUDetails.CPUsInNUMANodes(0)).Size())
@@ -220,7 +220,7 @@ func TestGenerateLegacyBlockCPUSet_HardPartitionReservesBeforeNormalShare(t *tes
 		},
 	}
 
-	got, err := policy.generateBlockCPUSet(resp, nil)
+	got, err := policy.generateBlockCPUSet(resp, nil, true)
 	require.Nil(t, got)
 	require.ErrorContains(t, err, "allocate normal share block")
 }
@@ -229,7 +229,7 @@ func TestGenerateLegacyBlockCPUSet_HardPartitionRejectsInsufficientCapacity(t *t
 	t.Parallel()
 
 	policy := newLegacyHardPartitionTestPolicy(t)
-	got, err := policy.generateBlockCPUSet(legacyFakeReclaimResponse(9, false), nil)
+	got, err := policy.generateBlockCPUSet(legacyFakeReclaimResponse(9, false), nil, true)
 	require.Nil(t, got)
 	require.ErrorContains(t, err, "eligible capacity 8 is smaller than quantity 9")
 }
@@ -248,7 +248,7 @@ func TestGenerateLegacyBlockCPUSet_HardPartitionKeepsOverlapReclaimLegacy(t *tes
 		},
 	}, false)
 
-	blockCPUSet, err := policy.generateBlockCPUSet(legacyFakeReclaimResponse(4, true), nil)
+	blockCPUSet, err := policy.generateBlockCPUSet(legacyFakeReclaimResponse(4, true), nil, true)
 	require.NoError(t, err)
 	require.Equal(t, previous, blockCPUSet["reclaim"])
 }
@@ -268,7 +268,7 @@ func TestGenerateLegacyBlockCPUSet_HardPartitionDisabledKeepsLegacyPlacement(t *
 		},
 	}, false)
 
-	blockCPUSet, err := policy.generateBlockCPUSet(legacyFakeReclaimResponse(4, false), nil)
+	blockCPUSet, err := policy.generateBlockCPUSet(legacyFakeReclaimResponse(4, false), nil, false)
 	require.NoError(t, err)
 	require.Equal(t, previous, blockCPUSet["reclaim"])
 }

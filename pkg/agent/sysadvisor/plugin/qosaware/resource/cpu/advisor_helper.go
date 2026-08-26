@@ -158,7 +158,10 @@ func (cra *cpuResourceAdvisor) initializeHeadroomAssembler() error {
 
 // updateNumasAvailableResource updates available resource of all numa nodes.
 // available = total - reserved pool - forbidden pool
-func (cra *cpuResourceAdvisor) updateNumasAvailableResource(dynamicConf *dynamic.Configuration) error {
+func (cra *cpuResourceAdvisor) updateNumasAvailableResource(
+	dynamicConf *dynamic.Configuration,
+	hardActive bool,
+) error {
 	numaAvailable := make(map[int]int)
 	reservePoolInfo, _ := cra.metaCache.GetPoolInfo(commonstate.PoolNameReserve)
 
@@ -198,27 +201,17 @@ func (cra *cpuResourceAdvisor) updateNumasAvailableResource(dynamicConf *dynamic
 	}
 
 	cra.numaAvailable = numaAvailable
-	err := cra.updateReservedForReclaim(dynamicConf)
-	cra.updateRampUpReclaimCPUSetCap(dynamicConf)
-	return err
+	if err := cra.updateReservedForReclaim(dynamicConf); err != nil {
+		cra.rampUpReclaimCPUSetCap = make(map[int]int)
+		return err
+	}
+	return cra.updateRampUpReclaimCPUSetCap(dynamicConf, hardActive)
 }
 
 func (cra *cpuResourceAdvisor) updateReservedForReclaim(dynamicConf *dynamic.Configuration) error {
 	if dynamicConf == nil {
 		cra.reservedForReclaim = nil
 		return fmt.Errorf("dynamic configuration is nil")
-	}
-
-	if dynamicConf.EnableReclaim && dynamicConf.EnableRampUpReclaimHardPartition {
-		reservedForReclaim, err := machine.ResolveHardPartitionReclaimTargets(
-			dynamicConf, cra.metaServer.CPUTopology, 0, nil)
-		if err != nil {
-			return fmt.Errorf("resolve hard partition reclaim targets: %w", err)
-		}
-		cra.reservedForReclaim = reservedForReclaim
-		general.Infof("reservedForReclaim: %v, hard partition ratio %v",
-			reservedForReclaim, dynamicConf.InitialRampUpReclaimCPUSetRatio)
-		return nil
 	}
 
 	cra.reservedForReclaim = machine.ResolvePerNUMAReservedForReclaim(dynamicConf, cra.metaServer.CPUTopology)
@@ -233,44 +226,45 @@ func (cra *cpuResourceAdvisor) updateReservedForReclaim(dynamicConf *dynamic.Con
 	return nil
 }
 
-func (cra *cpuResourceAdvisor) updateRampUpReclaimCPUSetCap(dynamicConf *dynamic.Configuration) {
-	cap := make(map[int]int)
-	if dynamicConf == nil || !dynamicConf.EnableReclaim || !dynamicConf.EnableRampUpReclaimHardPartition {
-		cra.rampUpReclaimCPUSetCap = cap
-		return
+func (cra *cpuResourceAdvisor) updateRampUpReclaimCPUSetCap(
+	dynamicConf *dynamic.Configuration,
+	hardActive bool,
+) error {
+	targets := make(map[int]int)
+	if dynamicConf == nil || !dynamicConf.EnableReclaim ||
+		!dynamicConf.EnableRampUpReclaimHardPartition || !hardActive {
+		cra.rampUpReclaimCPUSetCap = targets
+		return nil
 	}
 
-	topo := cra.metaServer.CPUTopology
-	cpusPerCore := topo.CPUsPerCore()
-	ratio := dynamicConf.InitialRampUpReclaimCPUSetRatio
-
-	rampUpNUMAs := make(map[int]bool)
-	cra.metaCache.RangeContainer(func(_, _ string, ci *types.ContainerInfo) bool {
-		if ci == nil || !ci.RampUp {
-			return true
-		}
-		for numaID := range ci.TopologyAwareAssignments {
-			rampUpNUMAs[numaID] = true
-		}
-		return true
-	})
-
-	for numaID := range rampUpNUMAs {
-		cpuCount := topo.CPUDetails.CPUsInNUMANodes(numaID).Size()
-		target, err := machine.CalculatePerNUMAHardReclaimTarget(cpuCount, ratio, 0, 0, cpusPerCore)
-		if err != nil {
-			general.Errorf("ramp-up reclaim cap for numa %d: %v", numaID, err)
-			continue
-		}
-		cap[numaID] = target
+	var err error
+	targets, err = machine.ResolveHardPartitionReclaimTargets(
+		dynamicConf,
+		cra.metaServer.CPUTopology,
+		0,
+		func(numaID int) int { return cra.reservedForReclaim[numaID] },
+	)
+	if err != nil {
+		cra.rampUpReclaimCPUSetCap = make(map[int]int)
+		return fmt.Errorf("resolve active ramp-up reclaim targets: %w", err)
 	}
-	cra.rampUpReclaimCPUSetCap = cap
-	general.Infof("rampUpReclaimCPUSetCap: %v, ratio %v", cap, ratio)
+
+	cra.rampUpReclaimCPUSetCap = targets
+	general.Infof("rampUpReclaimCPUSetCap: %v, ratio %v", targets, dynamicConf.InitialRampUpReclaimCPUSetRatio)
+	return nil
 }
 
 func (cra *cpuResourceAdvisor) getNumasReservedForAllocate(dynamicConf *dynamic.Configuration, numas machine.CPUSet) float64 {
 	reserved := dynamicConf.ReservedResourceForAllocate[v1.ResourceCPU]
 	return float64(reserved.Value()*int64(numas.Size())) / float64(cra.metaServer.NumNUMANodes)
+}
+
+func (cra *cpuResourceAdvisor) getEffectiveReservedForReclaim(numaID int) int {
+	steady := cra.reservedForReclaim[numaID]
+	if target, ok := cra.rampUpReclaimCPUSetCap[numaID]; ok {
+		return general.Max(steady, target)
+	}
+	return steady
 }
 
 func (cra *cpuResourceAdvisor) getRegionMaxRequirement(
@@ -294,7 +288,7 @@ func (cra *cpuResourceAdvisor) getRegionMaxRequirement(
 	case configapi.QoSRegionTypeDedicated:
 		if r.IsNumaExclusive() {
 			for _, numaID := range r.GetBindingNumas().ToSliceInt() {
-				res += float64(cra.numaAvailable[numaID] - cra.reservedForReclaim[numaID])
+				res += float64(cra.numaAvailable[numaID] - cra.getEffectiveReservedForReclaim(numaID))
 			}
 		} else {
 			cra.metaCache.RangeContainer(func(podUID string, containerName string, ci *types.ContainerInfo) bool {
@@ -318,9 +312,9 @@ func (cra *cpuResourceAdvisor) getRegionMaxRequirement(
 			}
 
 			if pinnedCPUSize, ok := pinnedCPUSizeByNuma[numaID]; ok {
-				res += float64(cra.numaAvailable[numaID] - pinnedCPUSize - cra.reservedForReclaim[numaID])
+				res += float64(cra.numaAvailable[numaID] - pinnedCPUSize - cra.getEffectiveReservedForReclaim(numaID))
 			} else {
-				res += float64(cra.numaAvailable[numaID] - cra.reservedForReclaim[numaID])
+				res += float64(cra.numaAvailable[numaID] - cra.getEffectiveReservedForReclaim(numaID))
 			}
 		}
 	}
@@ -360,7 +354,7 @@ func (cra *cpuResourceAdvisor) getRegionReservedForReclaim(r region.QoSRegion) f
 		if divider < 1 {
 			divider = 1
 		}
-		res += float64(cra.reservedForReclaim[numaID]) / float64(divider)
+		res += float64(cra.getEffectiveReservedForReclaim(numaID)) / float64(divider)
 	}
 	return res
 }

@@ -202,7 +202,7 @@ func TestGenerateBlockCPUSetOwnerUnionsStableAcrossRandomMapOrderAndBlockIDRotat
 		resp := advisorBlockTestResponse(aliases, rand.New(rand.NewSource(seed)))
 		resp.DisableDedicatedCoresOverlapReclaimedCores = true
 
-		blocks, err := p.generateBlockCPUSet(resp, featureGates)
+		blocks, err := p.generateBlockCPUSet(resp, featureGates, false)
 		require.NoError(t, err, "seed %d", seed)
 		got := ownerUnions(t, resp, blocks)
 		require.Equal(t, wantOwners, got, "seed %d owner keys or assignments", seed)
@@ -244,7 +244,7 @@ func TestGenerateBlockCPUSetSkipsDefaultShareUpperBound(t *testing.T) {
 					Name: feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
 				},
 			}
-			blocks, err := p.generateBlockCPUSet(resp, featureGates)
+			blocks, err := p.generateBlockCPUSet(resp, featureGates, false)
 			require.NoError(t, err)
 			require.NotContains(t, blocks, "share-upper-bound")
 			require.Equal(t, 4, blocks["reclaim"].Size())

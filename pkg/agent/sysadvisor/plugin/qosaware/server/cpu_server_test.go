@@ -208,7 +208,7 @@ func TestCPUServerGetAndPushAdviceRejectsDedicatedReclaimDisjoint(t *testing.T) 
 	require.Zero(t, stream.sendCalls)
 }
 
-func TestAssemblePoolEntriesPublishesAdvisorHardReclaimTargetWithoutActiveRampUp(t *testing.T) {
+func TestAssemblePoolEntriesDoesNotUseLiveReclaimWithoutRampUp(t *testing.T) {
 	t.Parallel()
 
 	cs := newTestCPUServer(t, &mockCPUResourceAdvisor{}, nil)
@@ -236,15 +236,10 @@ func TestAssemblePoolEntriesPublishesAdvisorHardReclaimTargetWithoutActiveRampUp
 	require.Equal(t, uint64(6), reclaimResult.Blocks[0].Result)
 }
 
-func TestAssemblePoolEntriesUsesLiveQRMReclaimSizeWhenHardPartitionDisabled(t *testing.T) {
+func TestAssemblePoolEntriesUsesLiveReclaimOnlyForRampUpWithoutHardPartition(t *testing.T) {
 	t.Parallel()
 
 	cs := newTestCPUServer(t, &mockCPUResourceAdvisor{}, nil)
-	require.NoError(t, cs.metaCache.AddContainer("ramp-up-pod", "main", &types.ContainerInfo{
-		PodUID:        "ramp-up-pod",
-		ContainerName: "main",
-		RampUp:        true,
-	}))
 	require.NoError(t, cs.metaCache.SetPoolInfo(commonstate.PoolNameReclaim, &types.PoolInfo{
 		PoolName: commonstate.PoolNameReclaim,
 		TopologyAwareAssignments: types.TopologyAwareAssignment{
@@ -255,6 +250,7 @@ func TestAssemblePoolEntriesUsesLiveQRMReclaimSizeWhenHardPartitionDisabled(t *t
 	entries := make(map[string]*cpuadvisor.CalculationEntries)
 	bs := NewBlockSet()
 	cs.assemblePoolEntries(&types.InternalCPUCalculationResult{
+		RampUpActive: true,
 		PoolEntries: map[string]map[int]types.CPUResource{
 			commonstate.PoolNameReclaim: {
 				0: {Size: 1, Quota: -1},
@@ -288,6 +284,8 @@ func TestAssemblePoolEntriesDoesNotOverrideAdvisorTargetWithLiveQRMReclaimSizeWh
 	entries := make(map[string]*cpuadvisor.CalculationEntries)
 	bs := NewBlockSet()
 	cs.assemblePoolEntries(&types.InternalCPUCalculationResult{
+		RampUpActive:              true,
+		RampUpHardPartitionActive: true,
 		PoolEntries: map[string]map[int]types.CPUResource{
 			commonstate.PoolNameReclaim: {
 				0: {Size: 1, Quota: -1},

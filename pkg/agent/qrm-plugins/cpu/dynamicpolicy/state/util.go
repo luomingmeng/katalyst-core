@@ -69,6 +69,22 @@ func IsReclaimedPool(name string) bool {
 	return name == commonstate.PoolNameReclaim
 }
 
+// HasActiveRampUp reports whether a real container allocation is in ramp-up.
+// Generic pool entries are aggregate state and must not activate ramp-up behavior.
+func (pe PodEntries) HasActiveRampUp() bool {
+	for _, entries := range pe {
+		if entries.IsPoolEntry() {
+			continue
+		}
+		for _, allocationInfo := range entries {
+			if allocationInfo != nil && allocationInfo.RampUp {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // GetUnitedPoolsCPUs returns the union of the specified pools' cpus.
 // If filters are provided, only pools that pass at least one of the filters will be considered.
 func GetUnitedPoolsCPUs(entries PodEntries, filters ...func(poolName string) bool) machine.CPUSet {

@@ -88,6 +88,101 @@ func TestValidateDedicatedReclaimDisjointTransport(t *testing.T) {
 	require.NoError(t, validateDedicatedReclaimDisjointTransport(req, resp, featureGates))
 }
 
+func TestAdvisorRequestHasActiveRampUp(t *testing.T) {
+	t.Parallel()
+
+	req := &advisorapi.GetAdviceRequest{
+		Entries: map[string]*advisorapi.ContainerAllocationInfoEntries{
+			"pod": {
+				Entries: map[string]*advisorapi.ContainerAllocationInfo{
+					"main": {
+						AllocationInfo: &advisorapi.AllocationInfo{RampUp: true},
+					},
+				},
+			},
+		},
+	}
+	require.True(t, advisorRequestHasActiveRampUp(req))
+	require.False(t, advisorRequestHasActiveRampUp(nil))
+	require.False(t, advisorRequestHasActiveRampUp(&advisorapi.GetAdviceRequest{}))
+
+	req.Entries["pod"].Entries["main"].AllocationInfo.RampUp = false
+	require.False(t, advisorRequestHasActiveRampUp(req))
+
+	req.Entries = map[string]*advisorapi.ContainerAllocationInfoEntries{
+		commonstate.PoolNameShare: {
+			Entries: map[string]*advisorapi.ContainerAllocationInfo{
+				commonstate.FakedContainerName: {
+					AllocationInfo: &advisorapi.AllocationInfo{RampUp: true},
+				},
+			},
+		},
+	}
+	require.False(t, advisorRequestHasActiveRampUp(req))
+}
+
+func TestAllocateByCPUAdvisorRejectsStaleRampUpGeneration(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	req := &advisorapi.GetAdviceRequest{
+		Entries: map[string]*advisorapi.ContainerAllocationInfoEntries{
+			"pod": {
+				Entries: map[string]*advisorapi.ContainerAllocationInfo{
+					"main": {
+						Metadata: &advisorsvc.ContainerMetadata{
+							PodUid:        "pod",
+							ContainerName: "main",
+							QosLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+						},
+						AllocationInfo: &advisorapi.AllocationInfo{RampUp: true},
+					},
+				},
+			},
+		},
+	}
+	revision := policy.state.GetRevision()
+	allowOverlap := policy.state.GetAllowSharedCoresOverlapReclaimedCores()
+
+	err = policy.allocateByCPUAdvisor(req, &advisorapi.ListAndWatchResponse{
+		AllowSharedCoresOverlapReclaimedCores: !allowOverlap,
+	}, nil)
+	require.ErrorContains(t, err, "advisor request ramp-up state is stale")
+	require.Equal(t, revision, policy.state.GetRevision())
+	require.Equal(t, allowOverlap, policy.state.GetAllowSharedCoresOverlapReclaimedCores())
+}
+
+func TestAllocateByCPUAdvisorRejectsStaleRequestRevision(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	requestRevision := policy.state.GetRevision()
+	allowOverlap := policy.state.GetAllowSharedCoresOverlapReclaimedCores()
+	policy.state.SetAllowSharedCoresOverlapReclaimedCores(!allowOverlap, false)
+	currentRevision := policy.state.GetRevision()
+	require.Greater(t, currentRevision, requestRevision)
+
+	err = policy.allocateByCPUAdvisorAtRevision(
+		&advisorapi.GetAdviceRequest{},
+		&advisorapi.ListAndWatchResponse{
+			AllowSharedCoresOverlapReclaimedCores: allowOverlap,
+		},
+		nil,
+		requestRevision,
+	)
+	require.ErrorContains(t, err, "advisor request state revision is stale")
+	require.Equal(t, currentRevision, policy.state.GetRevision())
+	require.Equal(t, !allowOverlap, policy.state.GetAllowSharedCoresOverlapReclaimedCores())
+}
+
 func TestAllocateByCPUAdvisorLegacyHardReclaimAliases(t *testing.T) {
 	t.Parallel()
 
@@ -113,6 +208,7 @@ func TestAllocateByCPUAdvisorLegacyHardReclaimAliases(t *testing.T) {
 						QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
 					},
 					AllocationResult: machine.NewCPUSet(numa0CPU),
+					RampUp:           true,
 					TopologyAwareAssignments: map[int]machine.CPUSet{
 						0: machine.NewCPUSet(numa0CPU),
 					},
@@ -227,7 +323,7 @@ func TestGenerateBlockCPUSetDisjointPlannerRequiresCapability(t *testing.T) {
 		DisableDedicatedCoresOverlapReclaimedCores: true,
 		Entries: map[string]*advisorapi.CalculationEntries{},
 	}
-	_, err = policy.generateBlockCPUSet(resp, nil)
+	_, err = policy.generateBlockCPUSet(resp, nil, false)
 	require.ErrorContains(t, err, "dedicated reclaim disjoint partition capability is not negotiated")
 
 	featureGates := map[string]*advisorsvc.FeatureGate{
@@ -235,7 +331,7 @@ func TestGenerateBlockCPUSetDisjointPlannerRequiresCapability(t *testing.T) {
 			Name: feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
 		},
 	}
-	got, err := policy.generateBlockCPUSet(resp, featureGates)
+	got, err := policy.generateBlockCPUSet(resp, featureGates, false)
 	require.NoError(t, err)
 	require.Empty(t, got)
 }
@@ -324,7 +420,7 @@ func TestValidateHardPartitionBlockPlanSkipsWhenDisabled(t *testing.T) {
 	t.Parallel()
 
 	policy := &DynamicPolicy{}
-	require.NoError(t, policy.validateHardPartitionBlockPlan(nil, nil))
+	require.NoError(t, policy.validateHardPartitionBlockPlan(nil, nil, false))
 }
 
 func TestGenerateBlockCPUSetDisjointPlannerUsesJointRPEligibility(t *testing.T) {
@@ -394,7 +490,7 @@ func TestGenerateBlockCPUSetDisjointPlannerUsesJointRPEligibility(t *testing.T) 
 		},
 	}
 
-	got, err := policy.generateBlockCPUSet(resp, featureGates)
+	got, err := policy.generateBlockCPUSet(resp, featureGates, false)
 	require.NoError(t, err)
 	require.Equal(t, legacyOverlap, got["dedicated-rotated"])
 	require.True(t, got["dedicated-rotated"].Intersection(got["reclaim-rotated"]).IsEmpty())
@@ -403,7 +499,7 @@ func TestGenerateBlockCPUSetDisjointPlannerUsesJointRPEligibility(t *testing.T) 
 
 	resp.Entries["pod-dedicated"].Entries["main"].
 		CalculationResultsByNumas[0].Blocks[0].Result = 1
-	shrunk, err := policy.generateBlockCPUSet(resp, featureGates)
+	shrunk, err := policy.generateBlockCPUSet(resp, featureGates, false)
 	require.NoError(t, err)
 	require.True(t, shrunk["dedicated-rotated"].IsSubsetOf(got["dedicated-rotated"]))
 	require.Equal(t, 1, got["dedicated-rotated"].Difference(shrunk["dedicated-rotated"]).
@@ -430,7 +526,7 @@ func TestGenerateBlockCPUSetLegacyIgnoresNegotiatedDisjointPlanner(t *testing.T)
 		},
 	}
 
-	got, err := policy.generateBlockCPUSet(resp, featureGates)
+	got, err := policy.generateBlockCPUSet(resp, featureGates, false)
 	require.NoError(t, err)
 	require.Empty(t, got)
 }
@@ -532,6 +628,25 @@ func TestExclusiveDisjointPartitionLifecycleAndFlagTransitions(t *testing.T) {
 			return nil
 		},
 	}
+	activeRequest := func() *advisorapi.GetAdviceRequest {
+		rampUp := policy.state.GetAllocationInfo("pod-dedicated", "main").RampUp
+		return &advisorapi.GetAdviceRequest{
+			Entries: map[string]*advisorapi.ContainerAllocationInfoEntries{
+				"pod-dedicated": {
+					Entries: map[string]*advisorapi.ContainerAllocationInfo{
+						"main": {
+							Metadata: &advisorsvc.ContainerMetadata{
+								PodUid:        "pod-dedicated",
+								ContainerName: "main",
+								QosLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+							},
+							AllocationInfo: &advisorapi.AllocationInfo{RampUp: rampUp},
+						},
+					},
+				},
+			},
+		}
+	}
 	applyFrame := func(
 		req *advisorapi.GetAdviceRequest,
 		resp *advisorapi.ListAndWatchResponse,
@@ -539,6 +654,9 @@ func TestExclusiveDisjointPartitionLifecycleAndFlagTransitions(t *testing.T) {
 	) advisorapi.BlockCPUSet {
 		t.Helper()
 		reconciling = resp
+		if req != nil {
+			req = activeRequest()
+		}
 		revision := policy.state.GetRevision()
 		require.NoError(t, policy.allocateByCPUAdvisor(req, resp, gates))
 		require.Equal(t, revision+1, policy.state.GetRevision(),
@@ -547,14 +665,14 @@ func TestExclusiveDisjointPartitionLifecycleAndFlagTransitions(t *testing.T) {
 			"successfully applied frame must clear pending target")
 		require.NoFileExists(t, filepath.Join(checkpointDir, advisorPostCommitCheckpointName),
 			"successfully applied frame must remove WAL")
-		blocks, generateErr := policy.generateBlockCPUSet(resp, gates)
+		blocks, generateErr := policy.generateBlockCPUSet(resp, gates, false)
 		require.NoError(t, generateErr)
 		return blocks
 	}
 
 	first := disjointResponse("first", false)
 	revisionBeforeNegotiation := policy.state.GetRevision()
-	err = policy.allocateByCPUAdvisor(&advisorapi.GetAdviceRequest{}, first, nil)
+	err = policy.allocateByCPUAdvisor(activeRequest(), first, nil)
 	require.ErrorContains(t, err,
 		feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition)
 	require.Equal(t, revisionBeforeNegotiation, policy.state.GetRevision(),
@@ -651,7 +769,7 @@ func prepareAndCommitAdvisorBlocks(
 	resp *advisorapi.ListAndWatchResponse,
 	allowOverlap bool,
 ) error {
-	pending, err := policy.applyBlocks(blockCPUSet, resp, allowOverlap)
+	pending, err := policy.applyBlocks(blockCPUSet, resp, allowOverlap, false)
 	if err != nil {
 		return err
 	}
@@ -723,7 +841,7 @@ func TestDynamicPolicyApplyBlocksUsesNegotiatedReclaimPlanWhenFreeCPUsCannotMeet
 	pending, err := policy.applyBlocks(advisorapi.BlockCPUSet{
 		"dedicated": machine.NewCPUSet(1, 2, 3, 4, 5, 6),
 		"reclaim":   machine.NewCPUSet(0, 7),
-	}, resp, false)
+	}, resp, false, false)
 	require.NoError(t, err)
 	require.True(t, pending.entries[commonstate.PoolNameReclaim][commonstate.FakedContainerName].
 		AllocationResult.Equals(machine.NewCPUSet(0, 7)))
@@ -736,7 +854,11 @@ func TestDynamicPolicyApplyBlocksMaterializesDefaultShareFromResidual(t *testing
 	require.NoError(t, err)
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 	require.NoError(t, err)
-	policy.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+	dynamicConf := policy.dynamicConfig.GetDynamicConfiguration()
+	dynamicConf.FillDefaultSharePoolWithNonReclaimCPUs = true
+	dynamicConf.EnableReclaim = true
+	dynamicConf.EnableRampUpReclaimHardPartition = true
+	dynamicConf.InitialRampUpReclaimCPUSetRatio = 0.5
 
 	policy.state.SetPodEntries(state.PodEntries{
 		commonstate.PoolNameReclaim: {
@@ -749,6 +871,17 @@ func TestDynamicPolicyApplyBlocksMaterializesDefaultShareFromResidual(t *testing
 			commonstate.FakedContainerName: &state.AllocationInfo{
 				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta("custom"),
 				AllocationResult: machine.NewCPUSet(1),
+			},
+		},
+		"ramp-up-pod": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "ramp-up-pod",
+					ContainerName: "main",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+				},
+				RampUp:           true,
+				AllocationResult: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
 			},
 		},
 	}, false)
@@ -798,11 +931,11 @@ func TestDynamicPolicyApplyBlocksMaterializesDefaultShareFromResidual(t *testing
 		"custom":  machine.NewCPUSet(1),
 	}
 
-	pending, err := policy.applyBlocks(blockCPUSet, resp, false)
+	pending, err := policy.applyBlocks(blockCPUSet, resp, false, true)
 	require.NoError(t, err)
 	share := pending.entries[commonstate.PoolNameShare][commonstate.FakedContainerName].AllocationResult
-	require.True(t, share.Equals(machine.NewCPUSet(2, 3, 4, 5, 6, 7)),
-		"actual residual may be smaller than advisor quantity and must replace the block cpuset, got %s", share)
+	require.True(t, share.Equals(machine.NewCPUSet(4, 5)),
+		"frozen hard-active state must keep the legacy reclaim floor while newEntries is incomplete, got %s", share)
 }
 
 func TestDynamicPolicyApplyBlocksExcludesDNBFromDefaultShareResidual(t *testing.T) {
@@ -881,7 +1014,7 @@ func TestDynamicPolicyApplyBlocksExcludesDNBFromDefaultShareResidual(t *testing.
 	pending, err := policy.applyBlocks(advisorapi.BlockCPUSet{
 		"dedicated": dnbCPUSet.Clone(),
 		"reclaim":   machine.NewCPUSet(0, 4),
-	}, resp, false)
+	}, resp, false, false)
 	require.NoError(t, err)
 	shareCPUSet := pending.entries[commonstate.PoolNameShare][commonstate.FakedContainerName].AllocationResult
 	require.True(t, shareCPUSet.Equals(machine.NewCPUSet(3, 5, 7)))
@@ -1001,7 +1134,7 @@ func TestDynamicPolicyApplyBlocksRejectsEmptyDefaultShareResidual(t *testing.T) 
 		"reclaim": machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
 	}
 
-	pending, err := policy.applyBlocks(blockCPUSet, resp, false)
+	pending, err := policy.applyBlocks(blockCPUSet, resp, false, false)
 	require.Nil(t, pending)
 	require.ErrorContains(t, err, "default share residual is empty")
 	currentShare := policy.state.GetPodEntries()[commonstate.PoolNameShare][commonstate.FakedContainerName].AllocationResult
@@ -1104,7 +1237,7 @@ func TestDynamicPolicyApplyBlocksRejectsEmptyDefaultShareWithoutPreviousPool(t *
 	_, err = policy.applyBlocks(advisorapi.BlockCPUSet{
 		"share":   machine.NewCPUSet(0),
 		"reclaim": machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
-	}, resp, false)
+	}, resp, false, false)
 	require.ErrorContains(t, err, "default share residual is empty")
 }
 
@@ -1260,7 +1393,7 @@ func TestDefaultShareEligibleCPUSetUsesCurrentMachineStateGuards(t *testing.T) {
 	}, false)
 
 	machineState := policy.state.GetMachineState()
-	rampFloor, err := policy.deriveRampUpReclaimFloor(machineState, false)
+	rampFloor, err := policy.deriveRampUpReclaimFloor(machineState, policy.state.GetPodEntries(), false)
 	require.NoError(t, err)
 	got := policy.buildDefaultShareEligibleCPUSet(entries, machineState, rampFloor)
 	require.True(t, got.Equals(machine.NewCPUSet(7)),
@@ -1971,6 +2104,18 @@ func TestDynamicPolicyApplyBlocksPreservesLegalHardPartitionDespiteBulkheadPaddi
 	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.NonReclaimPoolMinSize = 4
 
 	policy.state.SetPodEntries(state.PodEntries{
+		"reclaimed-pod": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "reclaimed-pod",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameReclaim,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelReclaimedCores,
+				},
+				AllocationResult: machine.NewCPUSet(3, 7),
+				RampUp:           true,
+			},
+		},
 		commonstate.PoolNameReserve: {
 			commonstate.FakedContainerName: &state.AllocationInfo{
 				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReserve),
@@ -2015,7 +2160,7 @@ func TestDynamicPolicyApplyBlocksPreservesLegalHardPartitionDespiteBulkheadPaddi
 		"reclaim-1": machine.NewCPUSet(2, 6),
 	}
 
-	pending, err := policy.applyBlocks(blockCPUSet, resp, false)
+	pending, err := policy.applyBlocks(blockCPUSet, resp, false, false)
 	require.NoError(t, err)
 	require.NotNil(t, pending)
 	reclaim := pending.entries[commonstate.PoolNameReclaim][commonstate.FakedContainerName]
@@ -2062,6 +2207,7 @@ func TestAllocateByCPUAdvisorPreservesLegalHardPartitionDespiteBulkheadPadding(t
 							QoSLevel:      apiconsts.PodAnnotationQoSLevelReclaimedCores,
 						},
 						AllocationResult: machine.NewCPUSet(3, 7),
+						RampUp:           true,
 					},
 				},
 				commonstate.PoolNameReserve: {
@@ -2214,7 +2360,7 @@ func TestDynamicPolicyApplyBlocksRejectsMissingDisjointReclaim(t *testing.T) {
 		DisableDedicatedCoresOverlapReclaimedCores: true,
 		Entries: map[string]*advisorapi.CalculationEntries{},
 	}
-	_, err = policy.applyBlocks(advisorapi.BlockCPUSet{}, resp, false)
+	_, err = policy.applyBlocks(advisorapi.BlockCPUSet{}, resp, false, false)
 	require.ErrorContains(t, err,
 		"disjoint advisor response has no reclaim partition")
 }
@@ -3366,7 +3512,7 @@ func TestDynamicPolicy_generateBlockCPUSet(t *testing.T) {
 				conf:  conf,
 			}
 
-			blockCPUSet, err := policy.generateBlockCPUSet(tc.advisorResponse, nil)
+			blockCPUSet, err := policy.generateBlockCPUSet(tc.advisorResponse, nil, false)
 			if tc.expectedError {
 				as.Error(err)
 				if tc.expectedErrorStr != "" {

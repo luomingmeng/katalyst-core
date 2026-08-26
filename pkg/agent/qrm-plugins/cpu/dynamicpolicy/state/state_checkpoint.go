@@ -198,6 +198,13 @@ func (sc *stateCheckpoint) GetPodEntries() PodEntries {
 	return sc.cache.GetPodEntries()
 }
 
+func (sc *stateCheckpoint) GetAdvisorStateSnapshot() (PodEntries, NUMANodeMap, uint64) {
+	sc.RLock()
+	defer sc.RUnlock()
+
+	return sc.cache.GetAdvisorStateSnapshot()
+}
+
 func (sc *stateCheckpoint) GetRevision() uint64 {
 	sc.RLock()
 	defer sc.RUnlock()

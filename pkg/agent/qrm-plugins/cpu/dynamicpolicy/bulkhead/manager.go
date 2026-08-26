@@ -186,6 +186,8 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 		AppliedView:                m.appliedView.DeepCopy(),
 		AppliedViewRevision:        m.appliedViewRevision,
 	}
+	hardActive := in.State != nil && in.State.GetPodEntries().HasActiveRampUp()
+	viewOptions := m.cpuSetPartitionViewOptions(in, hardActive)
 	if !bulkheadEnabled(in.DynamicConf) {
 		// The global bulkhead switch is a hard gate: when it is off, do not run
 		// plugin Enable/adjust/disabled handlers. Disabled handlers may write
@@ -202,7 +204,7 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 		return empty, nil
 	}
 	if in.State != nil {
-		desiredView, err := bulkheadutils.BuildValidatedCPUSetPartitionView(in.State, in.Topology, m.cpuSetPartitionViewOptions(in))
+		desiredView, err := bulkheadutils.BuildValidatedCPUSetPartitionView(in.State, in.Topology, viewOptions)
 		if err != nil {
 			return empty, fmt.Errorf("build bulkhead desired view failed: %w", err)
 		}
@@ -277,10 +279,11 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 						return empty, nonConverged
 					}
 					if desiredSnapshot != nil {
+						currentHardActive := in.State != nil && in.State.GetPodEntries().HasActiveRampUp()
 						currentDesired, err := bulkheadutils.BuildValidatedCPUSetPartitionView(
 							in.State,
 							in.Topology,
-							m.cpuSetPartitionViewOptions(in),
+							m.cpuSetPartitionViewOptions(in, currentHardActive),
 						)
 						if err != nil {
 							return empty, fmt.Errorf("rebuild bulkhead desired view after disabled topology reconcile failed: %w", err)
@@ -382,10 +385,11 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 			if desiredSnapshot != nil {
 				// Rebuild desired intent after topology Apply so a result cannot be
 				// accepted, or authorize dependent side effects, after state changed.
+				currentHardActive := in.State != nil && in.State.GetPodEntries().HasActiveRampUp()
 				currentDesired, err := bulkheadutils.BuildValidatedCPUSetPartitionView(
 					in.State,
 					in.Topology,
-					m.cpuSetPartitionViewOptions(in),
+					m.cpuSetPartitionViewOptions(in, currentHardActive),
 				)
 				if err != nil {
 					return empty, fmt.Errorf("rebuild bulkhead desired view after topology apply failed: %w", err)
@@ -461,7 +465,7 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 	}
 	emitBulkheadViewChanged(handlerCtx.Emitter, anyAdjusted)
 	if topologyApplied {
-		if handlerCtx.CommitOverride != nil && !verifiedReclaim.IsEmpty() {
+		if topologyResult.FullyConverged && handlerCtx.CommitOverride != nil && !verifiedReclaim.IsEmpty() {
 			handlerCtx.CommitOverride.ReclaimEffective = verifiedReclaim.Clone()
 			handlerCtx.CommitOverride.Source = "cpuset_topology"
 		}
@@ -503,7 +507,8 @@ func (m *Manager) tryPublishAppliedView(
 		result == nil || !result.Converged || !result.FinalSnapshotCurrent || result.AppliedView == nil {
 		return false
 	}
-	opts := m.cpuSetPartitionViewOptions(in.CPUSetAdjustmentHandlerCtx)
+	hardActive := in.State != nil && in.State.GetPodEntries().HasActiveRampUp()
+	opts := m.cpuSetPartitionViewOptions(in.CPUSetAdjustmentHandlerCtx, hardActive)
 	finalDesired, err := bulkheadutils.BuildValidatedCPUSetPartitionView(in.State, in.Topology, opts)
 	if err != nil {
 		return false
@@ -534,8 +539,11 @@ func staleGenerationError() *NonConvergedError {
 	}}
 }
 
-func (m *Manager) cpuSetPartitionViewOptions(in cpusetutil.CPUSetAdjustmentHandlerCtx) bulkheadutils.CPUSetPartitionViewOptions {
-	opts := bulkheadutils.NewCPUSetPartitionViewOptions(in.CoreConf, in.DynamicConf, in.Topology)
+func (m *Manager) cpuSetPartitionViewOptions(
+	in cpusetutil.CPUSetAdjustmentHandlerCtx,
+	hardActive bool,
+) bulkheadutils.CPUSetPartitionViewOptions {
+	opts := bulkheadutils.NewCPUSetPartitionViewOptions(in.CoreConf, in.DynamicConf, in.Topology, hardActive)
 	if opts.NonReclaimPoolMinSize <= 0 {
 		opts.NonReclaimPoolMinSize = m.defaultNonReclaimPoolMinSize
 	}

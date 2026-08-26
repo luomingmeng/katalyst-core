@@ -89,6 +89,15 @@ func (a *failingProvisionAssembler) AssembleProvision(provisionassembler.Provisi
 	return types.InternalCPUCalculationResult{}, a.err
 }
 
+type recordingProvisionAssembler struct {
+	ctx provisionassembler.ProvisionContext
+}
+
+func (a *recordingProvisionAssembler) AssembleProvision(ctx provisionassembler.ProvisionContext) (types.InternalCPUCalculationResult, error) {
+	a.ctx = ctx
+	return types.InternalCPUCalculationResult{}, nil
+}
+
 type concurrentPoolUpdateMetaCache struct {
 	metacache.MetaCache
 	armed    bool
@@ -237,6 +246,71 @@ func makeContainerInfo(podUID, namespace, podName, containerName, qoSLevel, owne
 		OriginalTopologyAwareAssignments: topologyAwareAssignments,
 		ContainerType:                    v1alpha1.ContainerType_MAIN,
 	}
+}
+
+func TestSnapshotRegionAssignmentsCapturesRampUpAtCycleStart(t *testing.T) {
+	t.Parallel()
+
+	metaCache := metacache.NewDummyMetaCacheImp()
+	require.NoError(t, metaCache.AddContainer("pod", "main", &types.ContainerInfo{
+		PodUID:        "pod",
+		ContainerName: "main",
+		RampUp:        true,
+		RegionNames:   sets.NewString(),
+	}))
+	advisor := &cpuResourceAdvisor{metaCache: metaCache}
+
+	snapshot := advisor.snapshotRegionAssignments()
+	activeField := reflect.ValueOf(snapshot).FieldByName("activeRampUp")
+	require.True(t, activeField.IsValid(), "cycle-start snapshot must carry the RampUp decision")
+	require.True(t, activeField.Bool())
+
+	container, ok := metaCache.GetContainerInfo("pod", "main")
+	require.True(t, ok)
+	container.RampUp = false
+	require.NoError(t, metaCache.SetContainerInfo("pod", "main", container))
+	require.True(t, activeField.Bool(), "cycle-start RampUp decision must be immutable")
+}
+
+func TestAssembleProvisionPassesCycleRampUpSnapshot(t *testing.T) {
+	t.Parallel()
+
+	assembler := &recordingProvisionAssembler{}
+	advisor := &cpuResourceAdvisor{provisionAssembler: assembler}
+	dynamicConf := &dynamic.Configuration{}
+
+	_, err := advisor.assembleProvision(
+		dynamicConf,
+		true,
+		provisionassembler.ReclaimConstraintNone,
+		nil,
+	)
+	require.NoError(t, err)
+	require.True(t, assembler.ctx.RampUpActive)
+}
+
+func TestCPUResourceAdvisorUsesActiveHardTargetForRegionEssentials(t *testing.T) {
+	t.Parallel()
+
+	conf, err := options.NewOptions().Config()
+	require.NoError(t, err)
+	shareRegion := &region.QoSRegionShare{
+		QoSRegionBase: region.NewQoSRegionBase(
+			"share", commonstate.PoolNameShare, "", configapi.QoSRegionTypeShare,
+			conf, struct{}{}, true, false, nil, nil, nil,
+		),
+	}
+	shareRegion.SetBindingNumas(machine.NewCPUSet(0))
+
+	advisor := &cpuResourceAdvisor{
+		numaAvailable:          map[int]int{0: 32},
+		reservedForReclaim:     map[int]int{0: 2},
+		rampUpReclaimCPUSetCap: map[int]int{0: 6},
+		numRegionsPerNuma:      map[int]int{0: 1},
+	}
+
+	require.Equal(t, float64(26), advisor.getRegionMaxRequirement(shareRegion, nil, nil))
+	require.Equal(t, float64(6), advisor.getRegionReservedForReclaim(shareRegion))
 }
 
 func TestAdvisorUpdateHardPartitionNUMAAvailability(t *testing.T) {

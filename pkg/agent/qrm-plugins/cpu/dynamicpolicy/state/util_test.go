@@ -605,6 +605,94 @@ func TestGetUnitedPoolsCPUs(t *testing.T) {
 	}
 }
 
+func TestPodEntriesHasActiveRampUp(t *testing.T) {
+	t.Parallel()
+
+	makeAllocation := func(containerType pluginapi.ContainerType, rampUp bool) *AllocationInfo {
+		return &AllocationInfo{
+			AllocationMeta: commonstate.AllocationMeta{
+				PodUid:        "pod",
+				ContainerName: containerType.String(),
+				ContainerType: containerType.String(),
+			},
+			RampUp: rampUp,
+		}
+	}
+	makePoolEntry := func(rampUp bool) ContainerEntries {
+		return ContainerEntries{
+			commonstate.FakedContainerName: &AllocationInfo{
+				AllocationMeta: commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+				RampUp:         rampUp,
+			},
+		}
+	}
+
+	tests := []struct {
+		name    string
+		entries PodEntries
+		want    bool
+	}{
+		{name: "empty", entries: PodEntries{}, want: false},
+		{
+			name: "pool only is ignored",
+			entries: PodEntries{
+				commonstate.PoolNameShare: makePoolEntry(true),
+			},
+			want: false,
+		},
+		{
+			name: "nil real allocation is ignored",
+			entries: PodEntries{
+				"pod": {"main": nil},
+			},
+			want: false,
+		},
+		{
+			name: "real allocation not in ramp up",
+			entries: PodEntries{
+				"pod": {"main": makeAllocation(pluginapi.ContainerType_MAIN, false)},
+			},
+			want: false,
+		},
+		{
+			name: "real main allocation in ramp up",
+			entries: PodEntries{
+				"pod": {"main": makeAllocation(pluginapi.ContainerType_MAIN, true)},
+			},
+			want: true,
+		},
+		{
+			name: "sidecar activates while main is inactive",
+			entries: PodEntries{
+				"pod": {
+					"main":    makeAllocation(pluginapi.ContainerType_MAIN, false),
+					"sidecar": makeAllocation(pluginapi.ContainerType_SIDECAR, true),
+				},
+			},
+			want: true,
+		},
+		{
+			name: "main activates while sidecar is inactive",
+			entries: PodEntries{
+				"pod": {
+					"main":    makeAllocation(pluginapi.ContainerType_MAIN, true),
+					"sidecar": makeAllocation(pluginapi.ContainerType_SIDECAR, false),
+				},
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tt.want, tt.entries.HasActiveRampUp())
+			require.Equal(t, tt.want, tt.entries.Clone().HasActiveRampUp())
+		})
+	}
+}
+
 func TestCountAllocationInfosToPoolsQuantityMap(t *testing.T) {
 	t.Parallel()
 	testName := "test"

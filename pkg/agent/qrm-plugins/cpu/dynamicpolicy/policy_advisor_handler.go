@@ -239,7 +239,28 @@ func (p *DynamicPolicy) pushCPUAdvisor() error {
 }
 
 func (p *DynamicPolicy) createGetAdviceRequest() (*advisorapi.GetAdviceRequest, error) {
-	stateEntries := p.state.GetPodEntries()
+	req, _, err := p.createGetAdviceRequestAtRevision()
+	return req, err
+}
+
+type advisorStateSnapshotReader interface {
+	GetAdvisorStateSnapshot() (state.PodEntries, state.NUMANodeMap, uint64)
+}
+
+func (p *DynamicPolicy) createGetAdviceRequestAtRevision() (*advisorapi.GetAdviceRequest, uint64, error) {
+	snapshotReader, ok := p.state.(advisorStateSnapshotReader)
+	if !ok {
+		return nil, 0, fmt.Errorf("cpu plugin state does not support advisor snapshots")
+	}
+	stateEntries, machineState, revision := snapshotReader.GetAdvisorStateSnapshot()
+	req, err := p.createGetAdviceRequestFromSnapshot(stateEntries, machineState)
+	return req, revision, err
+}
+
+func (p *DynamicPolicy) createGetAdviceRequestFromSnapshot(
+	stateEntries state.PodEntries,
+	machineState state.NUMANodeMap,
+) (*advisorapi.GetAdviceRequest, error) {
 	chkEntries := make(map[string]*advisorapi.ContainerAllocationInfoEntries)
 	for uid, containerEntries := range stateEntries {
 		if chkEntries[uid] == nil {
@@ -331,7 +352,6 @@ func (p *DynamicPolicy) createGetAdviceRequest() (*advisorapi.GetAdviceRequest, 
 
 	general.InfofV(6, "CPU plugin desire negotiation feature gates: %#v", wantedFeatureGates)
 
-	machineState := p.state.GetMachineState()
 	numaResourcePackageStates := machineState.GetNUMAResourcePackageStates()
 	var resourcePackageConfig *advisorapi.ResourcePackageConfig
 	if len(numaResourcePackageStates) > 0 {
@@ -366,7 +386,7 @@ func (p *DynamicPolicy) getAdviceFromAdvisor(ctx context.Context) (isImplemented
 		general.InfoS("finished", "duration", time.Since(startTime))
 	}()
 
-	request, err := p.createGetAdviceRequest()
+	request, requestRevision, err := p.createGetAdviceRequestAtRevision()
 	if err != nil {
 		return false, fmt.Errorf("create GetAdviceRequest failed with error: %w", err)
 	}
@@ -387,7 +407,8 @@ func (p *DynamicPolicy) getAdviceFromAdvisor(ctx context.Context) (isImplemented
 		}
 	}
 
-	err = p.allocateByCPUAdvisor(request, convertGetAdviceResponse(resp), resp.SupportedFeatureGates)
+	err = p.allocateByCPUAdvisorAtRevision(
+		request, convertGetAdviceResponse(resp), resp.SupportedFeatureGates, requestRevision)
 	if err != nil {
 		return true, fmt.Errorf("allocate by GetAdvice response failed with error: %w", err)
 	}
@@ -515,12 +536,52 @@ func (p *DynamicPolicy) lwCPUAdvisorServer(stopCh <-chan struct{}) error {
 	}
 }
 
+func advisorRequestHasActiveRampUp(req *advisorapi.GetAdviceRequest) bool {
+	if req == nil {
+		return false
+	}
+	for _, containerEntries := range req.Entries {
+		if containerEntries == nil {
+			continue
+		}
+		if len(containerEntries.Entries) == 1 &&
+			containerEntries.Entries[commonstate.FakedContainerName] != nil {
+			continue
+		}
+		for _, containerInfo := range containerEntries.Entries {
+			if containerInfo != nil && containerInfo.AllocationInfo != nil &&
+				containerInfo.AllocationInfo.RampUp {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // allocateByCPUAdvisor perform allocate actions based on allocation response from cpu-advisor.
 // supportedFeatureGates means the feature gates than both qrm wanted and sysadvisor supported
 func (p *DynamicPolicy) allocateByCPUAdvisor(
 	req *advisorapi.GetAdviceRequest,
 	resp *advisorapi.ListAndWatchResponse,
 	featureGates map[string]*advisorsvc.FeatureGate,
+) (err error) {
+	return p.allocateByCPUAdvisorWithRevision(req, resp, featureGates, nil)
+}
+
+func (p *DynamicPolicy) allocateByCPUAdvisorAtRevision(
+	req *advisorapi.GetAdviceRequest,
+	resp *advisorapi.ListAndWatchResponse,
+	featureGates map[string]*advisorsvc.FeatureGate,
+	requestRevision uint64,
+) error {
+	return p.allocateByCPUAdvisorWithRevision(req, resp, featureGates, &requestRevision)
+}
+
+func (p *DynamicPolicy) allocateByCPUAdvisorWithRevision(
+	req *advisorapi.GetAdviceRequest,
+	resp *advisorapi.ListAndWatchResponse,
+	featureGates map[string]*advisorsvc.FeatureGate,
+	requestRevision *uint64,
 ) (err error) {
 	if resp == nil {
 		return fmt.Errorf("allocateByCPUAdvisor got nil qos aware lw response")
@@ -541,7 +602,23 @@ func (p *DynamicPolicy) allocateByCPUAdvisor(
 		general.InfoS("finished", "duration", time.Since(startTime))
 	}()
 
+	// The synchronous response is valid only for the exact state generation
+	// used to build its request. The later precommit CAS protects mutations
+	// during planning; this guard protects the RPC round-trip itself.
+	currentRevision := p.state.GetRevision()
+	if requestRevision != nil && currentRevision != *requestRevision {
+		return fmt.Errorf("advisor request state revision is stale: expected=%d actual=%d",
+			*requestRevision, currentRevision)
+	}
+
+	currentEntries := p.state.GetPodEntries()
+	currentRampUpActive := currentEntries.HasActiveRampUp()
+	requestRampUpActive := currentRampUpActive
 	if req != nil {
+		requestRampUpActive = advisorRequestHasActiveRampUp(req)
+		if requestRampUpActive != currentRampUpActive {
+			return fmt.Errorf("advisor request ramp-up state is stale")
+		}
 		vErr := p.advisorValidator.ValidateRequest(req)
 		if vErr != nil {
 			return fmt.Errorf("ValidateCPUAdvisorReq failed with error: %v", vErr)
@@ -552,11 +629,12 @@ func (p *DynamicPolicy) allocateByCPUAdvisor(
 		return fmt.Errorf("ValidateCPUAdvisorResp failed with error: %v", vErr)
 	}
 
-	blockToCPUSet, aErr := p.generateBlockCPUSet(resp, featureGates)
+	hardActive := p.isRampUpReclaimHardPartitionEnabled() && requestRampUpActive
+	blockToCPUSet, aErr := p.generateBlockCPUSet(resp, featureGates, hardActive)
 	if aErr != nil {
 		return fmt.Errorf("generateBlockCPUSet failed with error: %v", aErr)
 	}
-	if err := p.validateHardPartitionBlockPlan(resp, blockToCPUSet); err != nil {
+	if err := p.validateHardPartitionBlockPlan(resp, blockToCPUSet, hardActive); err != nil {
 		return fmt.Errorf("validate hard-partition reclaim block plan failed: %w", err)
 	}
 
@@ -567,7 +645,7 @@ func (p *DynamicPolicy) allocateByCPUAdvisor(
 	}
 
 	responseAllowOverlap := resp.AllowSharedCoresOverlapReclaimedCores
-	pending, applyErr := p.applyBlocks(blockToCPUSet, resp, responseAllowOverlap)
+	pending, applyErr := p.applyBlocks(blockToCPUSet, resp, responseAllowOverlap, hardActive)
 	if applyErr != nil {
 		return fmt.Errorf("prepare applyBlocks failed with error: %w", applyErr)
 	}
@@ -1355,6 +1433,7 @@ func (p *DynamicPolicy) generateReclaimBlockCPUSet(
 func (p *DynamicPolicy) generateBlockCPUSet(
 	resp *advisorapi.ListAndWatchResponse,
 	featureGates map[string]*advisorsvc.FeatureGate,
+	hardActive bool,
 ) (advisorapi.BlockCPUSet, error) {
 	if resp == nil {
 		return nil, fmt.Errorf("got nil resp")
@@ -1368,20 +1447,21 @@ func (p *DynamicPolicy) generateBlockCPUSet(
 		planningResp = resp.WithoutDefaultShareEntry()
 	}
 	if !planningResp.DisableDedicatedCoresOverlapReclaimedCores {
-		return p.generateLegacyBlockCPUSet(planningResp)
+		return p.generateLegacyBlockCPUSet(planningResp, hardActive)
 	}
 
 	if featureGates[feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition] == nil {
 		return nil, fmt.Errorf("dedicated reclaim disjoint partition capability is not negotiated")
 	}
-	return p.planDisjointAdvisorBlocks(planningResp)
+	return p.planDisjointAdvisorBlocks(planningResp, hardActive)
 }
 
 func (p *DynamicPolicy) validateHardPartitionBlockPlan(
 	resp *advisorapi.ListAndWatchResponse,
 	blockCPUSet advisorapi.BlockCPUSet,
+	hardActive bool,
 ) error {
-	if p == nil || !p.isRampUpReclaimHardPartitionEnabled() {
+	if !hardActive {
 		return nil
 	}
 	if resp == nil || p.machineInfo == nil || p.machineInfo.CPUTopology == nil {
@@ -1471,7 +1551,10 @@ func validateHardPartitionReclaimDistribution(
 // generateLegacyBlockCPUSet computes the CPUSet allocation for all requested blocks using a two-phase allocation process.
 // Phase 1 (High Priority): Allocates Dedicated and Share blocks, resolving NUMA boundaries and updating available CPUs.
 // Phase 2 (Low Priority): Allocates Reclaim blocks, ensuring they don't use non-reclaimable pinned CPUs or CPUs already taken.
-func (p *DynamicPolicy) generateLegacyBlockCPUSet(resp *advisorapi.ListAndWatchResponse) (advisorapi.BlockCPUSet, error) {
+func (p *DynamicPolicy) generateLegacyBlockCPUSet(
+	resp *advisorapi.ListAndWatchResponse,
+	hardActive bool,
+) (advisorapi.BlockCPUSet, error) {
 	if resp == nil {
 		return nil, fmt.Errorf("got nil resp")
 	}
@@ -1571,7 +1654,7 @@ func (p *DynamicPolicy) generateLegacyBlockCPUSet(resp *advisorapi.ListAndWatchR
 			"availableCPUs", availableCPUs.String())
 	}
 
-	if p.isRampUpReclaimHardPartitionEnabled() {
+	if hardActive {
 		reserved, err := p.preallocateLegacyHardReclaim(
 			resp, nodeRemainingCPUs, rpPinnedCPUSet, globalNonReclaimableCPUSet, blockCPUSet)
 		if err != nil {
@@ -1773,6 +1856,7 @@ func (p *DynamicPolicy) applyBlocks(
 	blockCPUSet advisorapi.BlockCPUSet,
 	resp *advisorapi.ListAndWatchResponse,
 	allowSharedCoresOverlapReclaimedCores bool,
+	hardActive bool,
 ) (*pendingAdvisorState, error) {
 	if resp == nil {
 		return nil, fmt.Errorf("applyBlocks got nil resp")
@@ -1927,14 +2011,14 @@ func (p *DynamicPolicy) applyBlocks(
 
 	currentMachineState := p.state.GetMachineState()
 	rampUpReclaimFloor := machine.NewCPUSet()
-	if resp.DisableDedicatedCoresOverlapReclaimedCores && p.isRampUpReclaimHardPartitionEnabled() {
+	if hardActive && resp.DisableDedicatedCoresOverlapReclaimedCores {
 		reclaimInfo := newEntries[commonstate.PoolNameReclaim][commonstate.FakedContainerName]
 		if reclaimInfo == nil {
 			return nil, fmt.Errorf("negotiated disjoint advisor result has no reclaim floor")
 		}
 		rampUpReclaimFloor = reclaimInfo.AllocationResult.Clone()
-	} else {
-		legacyFloor, err := p.deriveRampUpReclaimFloorForMode(currentMachineState, false, false)
+	} else if hardActive {
+		legacyFloor, err := p.deriveRampUpReclaimFloorForMode(currentMachineState, newEntries, hardActive, false)
 		if err != nil {
 			return nil, fmt.Errorf("derive reclaim floor for advisor ramp-up failed: %w", err)
 		}
@@ -2022,7 +2106,7 @@ func (p *DynamicPolicy) applyBlocks(
 
 					if rampUpCPUs.IsEmpty() {
 						if err := validateEmptyRampUpCPUReuse(
-							p.isRampUpReclaimHardPartitionEnabled(),
+							hardActive,
 							allocationInfo.AllocationResult,
 							rampUpReclaimFloor,
 						); err != nil {
@@ -2176,7 +2260,11 @@ func (p *DynamicPolicy) buildAdjustmentCommitOverrideFromPodEntries(
 	snapshot.disableDedicated = disableDedicatedCoresOverlapReclaimedCores
 	var view *bulkheadmodel.DesiredView
 	if p.hardBulkheadPartitionValidationEnabled() {
-		view = bulkheadutils.BuildCPUSetPartitionView(snapshot, p.machineInfo.CPUTopology, p.cpuSetPartitionViewOptions())
+		view = bulkheadutils.BuildCPUSetPartitionView(
+			snapshot,
+			p.machineInfo.CPUTopology,
+			p.cpuSetPartitionViewOptions(snapshot.podEntries.HasActiveRampUp()),
+		)
 	} else {
 		var err error
 		view, err = bulkheadutils.BuildValidatedCPUSetPartitionView(
@@ -2368,14 +2456,14 @@ func (p *DynamicPolicy) validatePendingAdvisorPartitionView(
 	if _, err := bulkheadutils.BuildValidatedCPUSetPartitionView(
 		snapshot,
 		p.machineInfo.CPUTopology,
-		p.cpuSetPartitionViewOptions(),
+		p.cpuSetPartitionViewOptions(newEntries.HasActiveRampUp()),
 	); err != nil {
 		return fmt.Errorf("validate pending advisor partition view before commit: %w", err)
 	}
 	return nil
 }
 
-func (p *DynamicPolicy) cpuSetPartitionViewOptions() bulkheadutils.CPUSetPartitionViewOptions {
+func (p *DynamicPolicy) cpuSetPartitionViewOptions(hardActive bool) bulkheadutils.CPUSetPartitionViewOptions {
 	var dynamicConf *dynamicconfig.Configuration
 	if p != nil && p.dynamicConfig != nil {
 		dynamicConf = p.dynamicConfig.GetDynamicConfiguration()
@@ -2388,7 +2476,7 @@ func (p *DynamicPolicy) cpuSetPartitionViewOptions() bulkheadutils.CPUSetPartiti
 			topology = p.machineInfo.CPUTopology
 		}
 	}
-	return bulkheadutils.NewCPUSetPartitionViewOptions(coreConf, dynamicConf, topology)
+	return bulkheadutils.NewCPUSetPartitionViewOptions(coreConf, dynamicConf, topology, hardActive)
 }
 
 func (p *DynamicPolicy) hardBulkheadPartitionValidationEnabled() bool {

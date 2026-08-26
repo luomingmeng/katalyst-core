@@ -872,7 +872,8 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 					general.Errorf("pod: %s/%s, container: %s init timestamp parsed failed with error: %v, re-ramp-up it",
 						allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName, tsErr)
 
-					rampUpReclaimFloor, err := p.deriveRampUpReclaimFloor(machineState, true)
+					rampUpReclaimFloor, err := p.deriveRampUpReclaimFloor(
+						machineState, p.state.GetPodEntries(), true)
 					if err != nil {
 						return nil, fmt.Errorf("derive reclaim floor for legacy re-ramp-up failed: %w", err)
 					}

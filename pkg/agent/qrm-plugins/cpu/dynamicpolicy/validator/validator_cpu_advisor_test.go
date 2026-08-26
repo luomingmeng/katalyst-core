@@ -133,17 +133,41 @@ func TestCPUAdvisorValidatorValidatesNUMABindingDedicatedQuantityInDisjointMode(
 	v := NewCPUAdvisorValidator(currentState, &machine.KatalystMachineInfo{CPUTopology: topology})
 
 	for _, tc := range []struct {
-		name     string
-		quantity uint64
-		wantErr  string
+		name      string
+		quantity  uint64
+		exclusive bool
+		wantErr   string
 	}{
 		{name: "shrink passes", quantity: 1},
 		{name: "zero rejects", quantity: 0, wantErr: "zero dedicated calculation result"},
 		{name: "grow rejects", quantity: 3, wantErr: "calculation result: 3 and allocation result: 2 mismatch"},
+		{name: "exclusive grow passes", quantity: 3, exclusive: true},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
+			annotations := map[string]string{
+				consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			}
+			if tc.exclusive {
+				annotations[consts.PodAnnotationMemoryEnhancementNumaExclusive] =
+					consts.PodAnnotationMemoryEnhancementNumaExclusiveEnable
+			}
+			currentState.SetPodEntries(cpustate.PodEntries{
+				"pod": {
+					"container": &cpustate.AllocationInfo{
+						AllocationMeta: commonstate.AllocationMeta{
+							PodUid:        "pod",
+							ContainerName: "container",
+							QoSLevel:      consts.PodAnnotationQoSLevelDedicatedCores,
+							Annotations:   annotations,
+						},
+						AllocationResult: machine.NewCPUSet(0, 1),
+						TopologyAwareAssignments: map[int]machine.CPUSet{
+							0: machine.NewCPUSet(0, 1),
+						},
+					},
+				},
+			})
 			resp := &advisorapi.ListAndWatchResponse{
 				DisableDedicatedCoresOverlapReclaimedCores: true,
 				Entries: map[string]*advisorapi.CalculationEntries{
@@ -168,24 +192,33 @@ func TestCPUAdvisorValidatorValidatesNUMABindingDedicatedQuantityInDisjointMode(
 		})
 	}
 
-	t.Run("legacy mode rejects shrink", func(t *testing.T) {
-		t.Parallel()
-		resp := &advisorapi.ListAndWatchResponse{
-			Entries: map[string]*advisorapi.CalculationEntries{
-				"pod": {
-					Entries: map[string]*advisorapi.CalculationInfo{
-						"container": {
-							OwnerPoolName: commonstate.PoolNameDedicated,
-							CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
-								0: {Blocks: []*advisorapi.Block{{BlockId: "dedicated", Result: 1}}},
+	for _, tc := range []struct {
+		name     string
+		quantity uint64
+	}{
+		{name: "legacy mode rejects shrink", quantity: 1},
+		{name: "legacy mode rejects exclusive grow", quantity: 3},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			resp := &advisorapi.ListAndWatchResponse{
+				Entries: map[string]*advisorapi.CalculationEntries{
+					"pod": {
+						Entries: map[string]*advisorapi.CalculationInfo{
+							"container": {
+								OwnerPoolName: commonstate.PoolNameDedicated,
+								CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+									0: {Blocks: []*advisorapi.Block{{BlockId: "dedicated", Result: tc.quantity}}},
+								},
 							},
 						},
 					},
 				},
-			},
-		}
-		require.ErrorContains(t, v.Validate(resp), "calculation result: 1 and allocation result: 2 mismatch")
-	})
+			}
+			require.ErrorContains(t, v.Validate(resp), "calculation result")
+		})
+	}
 }
 
 func TestCPUAdvisorValidatorValidatesDefaultShareUpperBound(t *testing.T) {

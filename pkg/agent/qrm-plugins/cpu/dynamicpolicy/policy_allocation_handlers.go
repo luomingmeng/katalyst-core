@@ -126,11 +126,12 @@ func (p *DynamicPolicy) sharedCoresWithoutNUMABindingAllocationHandler(ctx conte
 	}
 
 	machineState := p.state.GetMachineState()
+	podEntries := p.state.GetPodEntries()
 	pooledCPUs := machineState.GetFilteredAvailableCPUSet(p.reservedCPUs,
 		state.WrapAllocationMetaFilter((*commonstate.AllocationMeta).CheckDedicated),
 		state.WrapAllocationMetaFilter((*commonstate.AllocationMeta).CheckSharedOrDedicatedNUMABinding))
 	// cores that are not allocatable from user binding need to be deducted from the pool.
-	notAllocatablePoolsCPUs := state.GetUnitedPoolsCPUs(p.state.GetPodEntries(), state.IsForbiddenPool, commonstate.IsSystemPool)
+	notAllocatablePoolsCPUs := state.GetUnitedPoolsCPUs(podEntries, state.IsForbiddenPool, commonstate.IsSystemPool)
 	pooledCPUs = pooledCPUs.Difference(notAllocatablePoolsCPUs)
 
 	if pooledCPUs.IsEmpty() {
@@ -145,7 +146,7 @@ func (p *DynamicPolicy) sharedCoresWithoutNUMABindingAllocationHandler(ctx conte
 		return nil, fmt.Errorf("GetTopologyAwareAssignmentsByCPUSet failed with error: %v", err)
 	}
 	excludeRampUpReclaimFloor := func() error {
-		rampUpReclaimFloor, err := p.deriveRampUpReclaimFloor(machineState, true)
+		rampUpReclaimFloor, err := p.deriveRampUpReclaimFloor(machineState, podEntries, true)
 		if err != nil {
 			return fmt.Errorf("derive reclaim floor for shared_cores ramp-up failed: %w", err)
 		}
@@ -194,7 +195,13 @@ func (p *DynamicPolicy) sharedCoresWithoutNUMABindingAllocationHandler(ctx conte
 			RequestQuantity:                  reqFloat64,
 		}
 
-		if !shouldRampUp {
+		if shouldRampUp {
+			allocationInfo, err = p.doAndCheckPutAllocationInfo(allocationInfo, true, persistCheckpoint)
+			if err != nil {
+				return nil, err
+			}
+			needSet = false
+		} else {
 			targetPoolName := allocationInfo.GetSpecifiedPoolName()
 			poolAllocationInfo := p.state.GetAllocationInfo(targetPoolName, commonstate.FakedContainerName)
 
@@ -1062,7 +1069,7 @@ func (p *DynamicPolicy) allocateNumaBindingCPUsWithEligibility(numCPUs int, hint
 	// ramp-up QoS paths. Dedicated selection only subtracts it from the current
 	// hint's available CPUs; CPUs on other NUMAs remain protected for shared
 	// ramp-up and the bulkhead reclaim partition.
-	hardReclaimCPUs, err := p.deriveRampUpReclaimFloor(machineState, true)
+	hardReclaimCPUs, err := p.deriveRampUpReclaimFloor(machineState, p.state.GetPodEntries(), true)
 	if err != nil {
 		return machine.NewCPUSet(), machine.NewCPUSet(), nil,
 			fmt.Errorf("derive node-level ramp-up reclaim floor failed: %w", err)
@@ -1672,7 +1679,7 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloorAtRevision(
 	rampUpReclaimFloor := explicitRampUpFloor.Clone()
 	if p.isRampUpReclaimHardPartitionEnabled() && rampUpReclaimFloor.IsEmpty() {
 		var err error
-		rampUpReclaimFloor, err = p.deriveRampUpReclaimFloor(machineState, true)
+		rampUpReclaimFloor, err = p.deriveRampUpReclaimFloor(machineState, entries, false)
 		if err != nil {
 			return fmt.Errorf("derive reclaim floor before allocating pools failed: %w", err)
 		}
@@ -3475,10 +3482,12 @@ func (p *DynamicPolicy) isReclaimEnabled() bool {
 // the historical available-capacity-based target calculation.
 func (p *DynamicPolicy) deriveRampUpReclaimFloor(
 	machineState state.NUMANodeMap,
+	candidateEntries state.PodEntries,
 	enteringRampUp bool,
 ) (machine.CPUSet, error) {
 	return p.deriveRampUpReclaimFloorForMode(
 		machineState,
+		candidateEntries,
 		enteringRampUp,
 		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
 	)
@@ -3486,11 +3495,14 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloor(
 
 func (p *DynamicPolicy) deriveRampUpReclaimFloorForMode(
 	machineState state.NUMANodeMap,
-	_ bool,
+	candidateEntries state.PodEntries,
+	enteringRampUp bool,
 	immutablePerNUMA bool,
 ) (machine.CPUSet, error) {
 	floor := machine.NewCPUSet()
-	if !p.isRampUpReclaimHardPartitionEnabled() || p.machineInfo == nil {
+	if !p.isRampUpReclaimHardPartitionEnabled() ||
+		(!enteringRampUp && !candidateEntries.HasActiveRampUp()) ||
+		p.machineInfo == nil {
 		return floor, nil
 	}
 

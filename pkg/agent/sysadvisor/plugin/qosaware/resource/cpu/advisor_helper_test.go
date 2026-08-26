@@ -160,7 +160,7 @@ func Test_cpuResourceAdvisor_updateReservedForReclaim(t *testing.T) {
 	}
 }
 
-func TestCPUResourceAdvisorUpdateReservedForReclaimUsesHardPartitionRatio(t *testing.T) {
+func TestCPUResourceAdvisorUpdateReservedForReclaimIgnoresHardPartitionRatio(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -170,16 +170,16 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimUsesHardPartitionRatio(t *tes
 		wantReserved      map[int]int
 	}{
 		{
-			name:              "half ratio derives per NUMA reserve",
+			name:              "half ratio keeps steady reserve",
 			ratio:             0.5,
 			configuredReserve: resource.MustParse("4"),
-			wantReserved:      map[int]int{0: 4, 1: 4},
+			wantReserved:      map[int]int{0: 2, 1: 2},
 		},
 		{
-			name:              "fractional ratio rounds down to complete cores",
+			name:              "fractional ratio keeps steady reserve",
 			ratio:             0.5625,
 			configuredReserve: resource.MustParse("4"),
-			wantReserved:      map[int]int{0: 4, 1: 4},
+			wantReserved:      map[int]int{0: 2, 1: 2},
 		},
 		{
 			name:              "larger configured reserve is statically balanced",
@@ -188,23 +188,16 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimUsesHardPartitionRatio(t *tes
 			wantReserved:      map[int]int{0: 4, 1: 4},
 		},
 		{
-			// ratio 0 keeps only the 1-core baseline (2 CPUs) per NUMA; the odd
-			// configured floor of 5 lifts one whole core onto the least-loaded
-			// NUMA (NUMA0: 2->4), leaving NUMA1 at its 2-CPU baseline. a reserve
-			// can only ever be raised a complete core at a time.
-			name:              "odd configured reserve preserves the full configured floor",
+			name:              "odd configured reserve keeps existing steady split",
 			ratio:             0,
 			configuredReserve: resource.MustParse("5"),
-			wantReserved:      map[int]int{0: 4, 1: 2},
+			wantReserved:      map[int]int{0: 2, 1: 2},
 		},
 		{
-			// ratio 0.75 on 4 cores/NUMA yields floor(3)=3 donated complete cores
-			// => 6 CPUs per NUMA with CPUsPerCore()==2. the core-aligned ratio
-			// dominates the smaller 4-CPU static reserve.
-			name:              "larger ratio wins over static reserve",
+			name:              "larger ratio does not replace static reserve",
 			ratio:             0.75,
 			configuredReserve: resource.MustParse("4"),
-			wantReserved:      map[int]int{0: 6, 1: 6},
+			wantReserved:      map[int]int{0: 2, 1: 2},
 		},
 	}
 
@@ -244,7 +237,7 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimUsesHardPartitionRatio(t *tes
 	}
 }
 
-func TestCPUResourceAdvisorUpdateReservedForReclaimRejectsConfiguredFloorAboveCapacity(t *testing.T) {
+func TestCPUResourceAdvisorUpdateRampUpReclaimRejectsConfiguredFloorAboveCapacity(t *testing.T) {
 	t.Parallel()
 
 	conf := generateTestConfiguration(t, t.TempDir(), t.TempDir())
@@ -258,7 +251,8 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimRejectsConfiguredFloorAboveCa
 	topology, err := machine.GenerateDummyCPUTopology(16, 1, 2)
 	require.NoError(t, err)
 	advisor := &cpuResourceAdvisor{
-		conf: conf,
+		conf:      conf,
+		metaCache: metacache.NewDummyMetaCacheImp(),
 		metaServer: &metaserver.MetaServer{
 			MetaAgent: &agent.MetaAgent{
 				KatalystMachineInfo: &machine.KatalystMachineInfo{
@@ -267,13 +261,15 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimRejectsConfiguredFloorAboveCa
 			},
 		},
 	}
+	require.NoError(t, advisor.metaCache.AddContainer("pod", "main", &types.ContainerInfo{RampUp: true}))
 
-	err = advisor.updateReservedForReclaim(advisor.conf.GetDynamicConfiguration())
+	require.NoError(t, advisor.updateReservedForReclaim(advisor.conf.GetDynamicConfiguration()))
+	err = advisor.updateRampUpReclaimCPUSetCap(advisor.conf.GetDynamicConfiguration(), true)
 
 	require.ErrorContains(t, err, "configured hard reclaim floor 17 exceeds total core-aligned NUMA capacity 16")
 }
 
-func TestCPUResourceAdvisorUpdateReservedForReclaimUsesImmutableNUMACapacity(t *testing.T) {
+func TestCPUResourceAdvisorUpdateRampUpReclaimUsesImmutableNUMACapacity(t *testing.T) {
 	t.Parallel()
 
 	conf := generateTestConfiguration(t, t.TempDir(), t.TempDir())
@@ -299,7 +295,8 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimUsesImmutableNUMACapacity(t *
 		cpuDetails[cpuID] = machine.CPUTopoInfo{NUMANodeID: 1}
 	}
 	cra := &cpuResourceAdvisor{
-		conf: conf,
+		conf:      conf,
+		metaCache: metacache.NewDummyMetaCacheImp(),
 		metaServer: &metaserver.MetaServer{
 			MetaAgent: &agent.MetaAgent{
 				KatalystMachineInfo: &machine.KatalystMachineInfo{
@@ -315,15 +312,18 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimUsesImmutableNUMACapacity(t *
 		},
 		numaAvailable: map[int]int{0: 2, 1: 30},
 	}
+	require.NoError(t, cra.metaCache.AddContainer("pod", "main", &types.ContainerInfo{RampUp: true}))
 
 	require.NoError(t, cra.updateReservedForReclaim(cra.conf.GetDynamicConfiguration()))
+	assert.Equal(t, map[int]int{0: 2, 1: 2}, cra.reservedForReclaim)
+	require.NoError(t, cra.updateRampUpReclaimCPUSetCap(cra.conf.GetDynamicConfiguration(), true))
 	// capacities: NUMA0 24 CPUs (12 cores), NUMA1 32 CPUs (16 cores),
 	// cpusPerCore==2, ratio 0.2. donated cores = floor(cores*0.2) complete
 	// cores: NUMA0 floor(2.4)=2 cores=4 CPUs, NUMA1 floor(3.2)=3 cores=6
 	// CPUs. the configured floor of 4 is already met by the 10-CPU
 	// baseline sum, so nothing is lifted. targets follow the immutable topology
 	// capacity, not the smaller live numaAvailable, and stay whole-core.
-	assert.Equal(t, map[int]int{0: 4, 1: 6}, cra.reservedForReclaim)
+	assert.Equal(t, map[int]int{0: 4, 1: 6}, cra.rampUpReclaimCPUSetCap)
 }
 
 func TestCPUResourceAdvisorUpdateReservedForReclaimFallbacks(t *testing.T) {
@@ -467,24 +467,35 @@ func TestUpdateRampUpReclaimCPUSetCap(t *testing.T) {
 	tests := []struct {
 		name        string
 		enable      bool
+		rampUp      bool
 		assignments map[int]machine.CPUSet
 		wantCap     map[int]int
 	}{
 		{
 			name:        "disabled",
 			enable:      false,
+			rampUp:      true,
 			assignments: map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1)},
 			wantCap:     map[int]int{},
 		},
 		{
-			name:        "enabled with ramp-up container on NUMA 0 only",
+			name:        "enabled without ramp-up container",
 			enable:      true,
+			rampUp:      false,
 			assignments: map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1)},
-			wantCap:     map[int]int{0: expectedTarget},
+			wantCap:     map[int]int{},
 		},
 		{
-			name:   "enabled with ramp-up container on NUMA 0 and 1",
+			name:        "enabled with ramp-up container on NUMA 0 activates every NUMA",
+			enable:      true,
+			rampUp:      true,
+			assignments: map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1)},
+			wantCap:     map[int]int{0: expectedTarget, 1: expectedTarget},
+		},
+		{
+			name:   "enabled with ramp-up container on NUMA 0 and 1 activates every NUMA",
 			enable: true,
+			rampUp: true,
 			assignments: map[int]machine.CPUSet{
 				0: machine.NewCPUSet(0, 1),
 				1: machine.NewCPUSet(48, 49),
@@ -506,7 +517,7 @@ func TestUpdateRampUpReclaimCPUSetCap(t *testing.T) {
 
 			metaCache := metacache.NewDummyMetaCacheImp()
 			require.NoError(t, metaCache.AddContainer("pod-0", "container-0", &types.ContainerInfo{
-				RampUp:                   true,
+				RampUp:                   tt.rampUp,
 				TopologyAwareAssignments: tt.assignments,
 			}))
 
@@ -522,7 +533,8 @@ func TestUpdateRampUpReclaimCPUSetCap(t *testing.T) {
 				},
 			}
 
-			cra.updateRampUpReclaimCPUSetCap(cra.conf.GetDynamicConfiguration())
+			require.NoError(t, cra.updateReservedForReclaim(cra.conf.GetDynamicConfiguration()))
+			require.NoError(t, cra.updateRampUpReclaimCPUSetCap(cra.conf.GetDynamicConfiguration(), tt.rampUp))
 
 			assert.Equal(t, tt.wantCap, cra.rampUpReclaimCPUSetCap)
 		})

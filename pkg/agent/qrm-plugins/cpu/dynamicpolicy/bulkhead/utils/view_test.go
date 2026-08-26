@@ -21,8 +21,6 @@ import (
 	"testing"
 
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
-	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
@@ -30,6 +28,8 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 func TestNewCPUSetPartitionViewOptionsUsesProductionConfigurationConsistently(t *testing.T) {
@@ -47,7 +47,12 @@ func TestNewCPUSetPartitionViewOptionsUsesProductionConfigurationConsistently(t 
 	currentDynamic.AdminQoSConfiguration.CPUPluginConfiguration.InitialRampUpReclaimCPUSetRatio = 0.2
 	topology := testTwoNUMATopologyN(32)
 
-	opts := NewCPUSetPartitionViewOptions(coreConf, currentDynamic, topology)
+	inactiveOpts := NewCPUSetPartitionViewOptions(coreConf, currentDynamic, topology, false)
+	if inactiveOpts.HardPartitionEnabled || len(inactiveOpts.HardPartitionReclaimTargetPerNUMA) != 0 {
+		t.Fatalf("configured inactive hard partition must not resolve targets: %+v", inactiveOpts)
+	}
+
+	opts := NewCPUSetPartitionViewOptions(coreConf, currentDynamic, topology, true)
 	if opts.NonReclaimPoolMinSize != 5 || !opts.ReserveCPUReversely || !opts.HardPartitionEnabled {
 		t.Fatalf("unexpected current options: %+v", opts)
 	}
@@ -61,7 +66,7 @@ func TestNewCPUSetPartitionViewOptionsUsesProductionConfigurationConsistently(t 
 	currentDynamic.MinReclaimedResourceForAllocate = v1.ResourceList{
 		v1.ResourceCPU: resource.MustParse("16"),
 	}
-	opts = NewCPUSetPartitionViewOptions(coreConf, currentDynamic, topology)
+	opts = NewCPUSetPartitionViewOptions(coreConf, currentDynamic, topology, true)
 	if got := opts.HardPartitionReclaimTargetPerNUMA[0]; got != 8 {
 		t.Fatalf("NUMA 0 configured reclaim target = %d, want 8", got)
 	}
@@ -70,13 +75,13 @@ func TestNewCPUSetPartitionViewOptionsUsesProductionConfigurationConsistently(t 
 	}
 
 	currentDynamic.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.NonReclaimPoolMinSize = 0
-	opts = NewCPUSetPartitionViewOptions(coreConf, currentDynamic, topology)
+	opts = NewCPUSetPartitionViewOptions(coreConf, currentDynamic, topology, true)
 	if opts.NonReclaimPoolMinSize != 7 {
 		t.Fatalf("fallback NonReclaimPoolMinSize = %d, want 7", opts.NonReclaimPoolMinSize)
 	}
 
 	currentDynamic.EnableReclaim = false
-	opts = NewCPUSetPartitionViewOptions(coreConf, currentDynamic, topology)
+	opts = NewCPUSetPartitionViewOptions(coreConf, currentDynamic, topology, true)
 	if opts.HardPartitionEnabled {
 		t.Fatal("hard partition must be ineffective when reclaim is disabled")
 	}

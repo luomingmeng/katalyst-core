@@ -211,6 +211,8 @@ type InternalCPUCalculationResult struct {
 	TimeStamp                                  time.Time
 	AllowSharedCoresOverlapReclaimedCores      bool
 	DisableDedicatedCoresOverlapReclaimedCores bool
+	RampUpActive                               bool
+	RampUpHardPartitionActive                  bool
 	ReclaimConstraintExcess                    int
 	ReclaimConstraintTargets                   map[string]ReclaimConstraintTarget
 

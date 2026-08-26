@@ -45,6 +45,7 @@ const (
 
 type ProvisionContext struct {
 	DynamicConfiguration *dynamic.Configuration
+	RampUpActive         bool
 	ReclaimConstraint    ReclaimConstraint
 	ReclaimCeilings      map[ReclaimConstraintScope]int
 }

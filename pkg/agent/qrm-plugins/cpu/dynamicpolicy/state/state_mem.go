@@ -107,6 +107,16 @@ func (s *cpuPluginState) GetPodEntries() PodEntries {
 	return s.cpuPluginStateData.GetPodEntries().Clone()
 }
 
+// GetAdvisorStateSnapshot returns one immutable generation for a synchronous
+// advisor request. Entries, machine state, and revision must be captured under
+// the same read lock so the response can never be committed as a newer state.
+func (s *cpuPluginState) GetAdvisorStateSnapshot() (PodEntries, NUMANodeMap, uint64) {
+	s.RLock()
+	defer s.RUnlock()
+
+	return s.podEntries.Clone(), s.machineState.Clone(), s.revision
+}
+
 func (s *cpuPluginState) revisionExhaustedLocked(operation string) bool {
 	if s.revision != math.MaxUint64 {
 		return false

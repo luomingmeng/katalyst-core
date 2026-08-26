@@ -268,6 +268,7 @@ func (p *DynamicPolicy) tryCarveAdvisorBlockFromSource(
 // identity, and no partial result escapes on an infeasible phase.
 func (p *DynamicPolicy) planDisjointAdvisorBlocks(
 	resp *advisorapi.ListAndWatchResponse,
+	hardActive bool,
 ) (advisorapi.BlockCPUSet, error) {
 	topology := p.machineInfo.CPUTopology
 	allCPUs := topology.CPUDetails.CPUs()
@@ -301,7 +302,7 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocks(
 		return descriptor.Class == advisorBlockClassDedicated ||
 			descriptor.Class == advisorBlockClassMandatoryReclaim
 	})
-	available, err = p.solveAdvisorDescriptorPhase(core, available, result, true)
+	available, err = p.solveAdvisorDescriptorPhase(core, available, result, true, hardActive)
 	if err != nil {
 		return nil, fmt.Errorf("solve dedicated and mandatory reclaim: %w", err)
 	}
@@ -311,7 +312,7 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocks(
 		return nil, err
 	}
 	for _, sourceBlockID := range sourceComponents {
-		available, err = p.solveAdvisorDescriptorPhase(componentMembers[sourceBlockID], available, result, false)
+		available, err = p.solveAdvisorDescriptorPhase(componentMembers[sourceBlockID], available, result, false, hardActive)
 		if err != nil {
 			return nil, fmt.Errorf("solve source/isolation component %q: %w", sourceBlockID, err)
 		}
@@ -372,6 +373,7 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhase(
 	available machine.CPUSet,
 	result advisorapi.BlockCPUSet,
 	preserveClass bool,
+	hardActive bool,
 ) (machine.CPUSet, error) {
 	if len(descriptors) == 0 {
 		return available, nil
@@ -379,7 +381,7 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhase(
 	demands := make([]partitionDemand, 0, len(descriptors))
 	blockIDByDemandKey := make(map[string]string, len(descriptors))
 	ordinalByStableKey := make(map[string]int, len(descriptors))
-	expandHardReclaimPhase := preserveClass && p.isRampUpReclaimHardPartitionEnabled()
+	expandHardReclaimPhase := preserveClass && hardActive
 	if expandHardReclaimPhase {
 		expanded, expandedBlockIDs, err := expandHardPartitionReclaimPhase(
 			descriptors, available, p.machineInfo.CPUTopology)

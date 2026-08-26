@@ -957,7 +957,7 @@ func TestDynamicPolicy_generateBlockCPUSet_combinedCarvesIsolationFromNormalShar
 		},
 	}
 
-	blockCPUSet, err := p.generateBlockCPUSet(resp, nil)
+	blockCPUSet, err := p.generateBlockCPUSet(resp, nil, false)
 	require.NoError(t, err)
 
 	share := blockCPUSet["block-share"]
@@ -1041,7 +1041,7 @@ func TestGenerateBlockCPUSetDisjointPlannerKeepsSourceAndIsolationTogether(t *te
 		},
 	}
 
-	got, err := p.generateBlockCPUSet(resp, featureGates)
+	got, err := p.generateBlockCPUSet(resp, featureGates, false)
 	require.NoError(t, err)
 	require.Equal(t, oldSource, got["rotated-source"])
 	require.Equal(t, oldIsolation, got["rotated-isolation"])
@@ -1051,7 +1051,7 @@ func TestGenerateBlockCPUSetDisjointPlannerKeepsSourceAndIsolationTogether(t *te
 	sourceBlock := resp.Entries[commonstate.PoolNameShare].Entries[commonstate.FakedContainerName].
 		CalculationResultsByNumas[commonstate.FakedNUMAID].Blocks[0]
 	sourceBlock.Result = 5
-	grown, err := p.generateBlockCPUSet(resp, featureGates)
+	grown, err := p.generateBlockCPUSet(resp, featureGates, false)
 	require.NoError(t, err)
 	require.True(t, oldSource.IsSubsetOf(grown["rotated-source"]))
 	require.Equal(t, 1, oldSource.Difference(grown["rotated-source"]).
@@ -1059,7 +1059,7 @@ func TestGenerateBlockCPUSetDisjointPlannerKeepsSourceAndIsolationTogether(t *te
 	require.Equal(t, oldIsolation, grown["rotated-isolation"])
 
 	sourceBlock.Result = 3
-	shrunk, err := p.generateBlockCPUSet(resp, featureGates)
+	shrunk, err := p.generateBlockCPUSet(resp, featureGates, false)
 	require.NoError(t, err)
 	require.True(t, shrunk["rotated-source"].IsSubsetOf(oldSource))
 	require.Equal(t, 1, oldSource.Difference(shrunk["rotated-source"]).
@@ -1166,7 +1166,7 @@ func TestGenerateBlockCPUSetDisjointPlannerIndexesShareNUMASourceWithRPIsolation
 			Name: feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
 		},
 	}
-	got, err := p.generateBlockCPUSet(resp, featureGates)
+	got, err := p.generateBlockCPUSet(resp, featureGates, false)
 	require.NoError(t, err)
 	require.Equal(t, oldSource, got["rotated-numa-source"])
 	require.Equal(t, oldIsolation, got["rotated-numa-isolation"])
@@ -1265,7 +1265,7 @@ func TestPlanDisjointAdvisorBlocksRejectsConflictingSourceDomainRegardlessOfMapO
 				Entries: entries,
 			}
 
-			got, err := p.planDisjointAdvisorBlocks(resp)
+			got, err := p.planDisjointAdvisorBlocks(resp, false)
 			require.EqualError(t, err,
 				`source domain pool "source-pool" resource package "" numa 0 has conflicting descriptors "source-a" and "source-b"`)
 			require.Nil(t, got, "fail-closed errors must not expose partial block results")
@@ -1299,7 +1299,7 @@ func TestPlanDisjointAdvisorBlocksAllowsRepeatedSourceBlockIDAfterNormalization(
 		},
 	}
 
-	got, err := p.planDisjointAdvisorBlocks(resp)
+	got, err := p.planDisjointAdvisorBlocks(resp, false)
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	require.Equal(t, 2, got["source"].Size())
@@ -1457,7 +1457,7 @@ func TestGenerateBlockCPUSetDisjointPlannerAllocatesRealNUMAComponentBeforeFake(
 		},
 	}
 
-	got, err := p.generateBlockCPUSet(resp, featureGates)
+	got, err := p.generateBlockCPUSet(resp, featureGates, false)
 	require.NoError(t, err)
 	realUnion := got["z-real-source"].Union(got["z-real-isolation"])
 	fakeUnion := got["a-fake-source"].Union(got["a-fake-isolation"])
@@ -1482,7 +1482,7 @@ func TestSolveAdvisorDescriptorPhaseBlockIDRotationPreservesGrowOwnerUnion(t *te
 				Quantity: 4, ComponentKey: "component-b", Eligible: allCPUs, OldPreferred: machine.NewCPUSet(1)},
 		}
 		result := advisorapi.NewBlockCPUSet()
-		_, err := p.solveAdvisorDescriptorPhase(descriptors, allCPUs, result, false)
+		_, err := p.solveAdvisorDescriptorPhase(descriptors, allCPUs, result, false, false)
 		require.NoError(t, err)
 		return map[string]machine.CPUSet{
 			"owner-a": result[firstID],
@@ -1545,7 +1545,7 @@ func TestPlanDisjointAdvisorBlocksOverlapNeverReintroducesStateForbiddenOrSystem
 		},
 	}
 
-	got, err := p.planDisjointAdvisorBlocks(resp)
+	got, err := p.planDisjointAdvisorBlocks(resp, false)
 	require.NoError(t, err)
 	require.True(t, got["overlap-reclaim"].Intersection(notAllocatable).IsEmpty(),
 		"overlap reclaim must not reintroduce forbidden/system CPUs: got=%s forbidden=%s",
@@ -1586,7 +1586,7 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 			ComponentKey: "mandatory-reclaim|reclaim-owner|-1",
 			Eligible:     allCPUs,
 			OldPreferred: oldPreferred,
-		}}, available, result, true)
+		}}, available, result, true, p.isRampUpReclaimHardPartitionEnabled())
 		return result["reclaim"], err
 	}
 
@@ -1630,7 +1630,7 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 				BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
 				Quantity: 4, ComponentKey: "fake", Eligible: allCPUs,
 			},
-		}, allCPUs, result, true)
+		}, allCPUs, result, true, true)
 		require.NoError(t, err)
 		require.Equal(t, 2, result["real-0"].Intersection(numa0).Size())
 		// fake=4 is two whole cores: one core water-fills the empty numa1, the
@@ -1660,7 +1660,7 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 			},
 		}
 		result := advisorapi.NewBlockCPUSet()
-		_, err := p.solveAdvisorDescriptorPhase(descriptors, available, result, true)
+		_, err := p.solveAdvisorDescriptorPhase(descriptors, available, result, true, true)
 		require.ErrorContains(t, err,
 			"hard reclaim protocol error: expected at most one fake-NUMA mandatory reclaim block, got 2")
 		require.Empty(t, result)
@@ -1678,7 +1678,7 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 				BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
 				Quantity: 4, ComponentKey: "fake", Eligible: allCPUs,
 			},
-		}, allCPUs, result, true)
+		}, allCPUs, result, true, true)
 		require.NoError(t, err)
 		require.Equal(t, 2, result["dedicated-0"].Intersection(numa0).Size())
 		// numa0 only has one core left after the dedicated core, so the second
@@ -1700,7 +1700,7 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 				BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
 				Quantity: 8, ComponentKey: "fake", Eligible: allCPUs,
 			},
-		}, allCPUs, result, true)
+		}, allCPUs, result, true, true)
 		require.ErrorContains(t, err, "insufficient aggregate capacity")
 		require.Empty(t, result)
 	})
@@ -1740,6 +1740,7 @@ func TestPlanDisjointAdvisorBlocksPreservesCeiledOwnerRequestWhenDonating(t *tes
 				},
 				AllocationResult: machine.NewCPUSet(allCPUs[:8]...),
 				RequestQuantity:  6.2,
+				RampUp:           true,
 			},
 		},
 	}, false)
@@ -1766,7 +1767,7 @@ func TestPlanDisjointAdvisorBlocksPreservesCeiledOwnerRequestWhenDonating(t *tes
 		},
 	}
 
-	result, err := p.planDisjointAdvisorBlocks(resp)
+	result, err := p.planDisjointAdvisorBlocks(resp, true)
 	// 12 CPUs / 6 cores, cpusPerCore==2, cores paired (k, k+6). the dedicated
 	// pod owns {0..7}, so the free pool {8,9,10,11} are all orphan half cores
 	// (siblings 2,3,4,5 are owned). the ceiled owner request is 7, leaving only

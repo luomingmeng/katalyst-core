@@ -868,9 +868,8 @@ func (cs *cpuServer) assemblePoolEntries(advisorResp *types.InternalCPUCalculati
 	if reclaimEntries, ok := advisorResp.PoolEntries[commonstate.PoolNameReclaim]; ok {
 		poolEntry := NewPoolCalculationEntries(commonstate.PoolNameReclaim)
 		var liveReclaimByNUMA map[int]int
-		dynamicConf := cs.conf.GetDynamicConfiguration()
-		if !dynamicConf.EnableReclaim || !dynamicConf.EnableRampUpReclaimHardPartition {
-			liveReclaimByNUMA = cs.getRampUpHardReclaimSizeByNUMA()
+		if advisorResp.RampUpActive && !advisorResp.RampUpHardPartitionActive {
+			liveReclaimByNUMA = cs.getLiveReclaimSizeByNUMA()
 		}
 		for numaID, reclaimCPU := range reclaimEntries {
 			reclaimNUMACalculationResult, ok := poolEntry.Entries[commonstate.FakedContainerName].CalculationResultsByNumas[int64(numaID)]
@@ -932,10 +931,7 @@ func (cs *cpuServer) assemblePoolEntries(advisorResp *types.InternalCPUCalculati
 	}
 }
 
-func (cs *cpuServer) getRampUpHardReclaimSizeByNUMA() map[int]int {
-	if !cs.hasActiveRampUpContainer() {
-		return nil
-	}
+func (cs *cpuServer) getLiveReclaimSizeByNUMA() map[int]int {
 	poolInfo, ok := cs.metaCache.GetPoolInfo(commonstate.PoolNameReclaim)
 	if !ok || poolInfo == nil {
 		return nil
@@ -949,18 +945,6 @@ func (cs *cpuServer) getRampUpHardReclaimSizeByNUMA() map[int]int {
 		result[numaID] = cpuset.Size()
 	}
 	return result
-}
-
-func (cs *cpuServer) hasActiveRampUpContainer() bool {
-	active := false
-	cs.metaCache.RangeContainer(func(_ string, _ string, ci *types.ContainerInfo) bool {
-		if ci != nil && ci.RampUp {
-			active = true
-			return false
-		}
-		return true
-	})
-	return active
 }
 
 // assemblePoolEntries fills up calculationEntriesMap and blockSet based on types.ContainerInfo

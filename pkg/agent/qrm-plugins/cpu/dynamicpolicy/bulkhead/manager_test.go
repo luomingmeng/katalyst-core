@@ -908,6 +908,7 @@ func TestManagerApplyRequiresFullyConvergedTopologyBeforeDependents(t *testing.T
 func TestManagerApplyAcceptsParentSafeTopologyWithoutRunningDependents(t *testing.T) {
 	t.Parallel()
 
+	override := &cpusetutil.CPUSetAdjustmentCommitOverride{}
 	applied := &model.AppliedView{
 		Level: model.AppliedViewLevelParentSafe,
 		CPUSetPartitionView: model.CPUSetPartitionView{
@@ -925,8 +926,10 @@ func TestManagerApplyAcceptsParentSafeTopologyWithoutRunningDependents(t *testin
 	}
 	dependent := &fakePlugin{name: "workqueue", enabled: true}
 	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, dependent}}
+	in := enabledCPUSetAdjustmentCtx()
+	in.CommitOverride = override
 
-	got, err := m.Apply(context.Background(), enabledCPUSetAdjustmentCtx())
+	got, err := m.Apply(context.Background(), in)
 	if err != nil {
 		t.Fatalf("Apply() error = %v", err)
 	}
@@ -938,6 +941,10 @@ func TestManagerApplyAcceptsParentSafeTopologyWithoutRunningDependents(t *testin
 	}
 	if m.appliedViewValidForPeriodical {
 		t.Fatal("parent-safe view must not authorize periodical leaf-dependent plugins")
+	}
+	if !override.ReclaimEffective.IsEmpty() || override.Source != "" {
+		t.Fatalf("parent-safe view published state commit override: reclaim=%s source=%q",
+			override.ReclaimEffective.String(), override.Source)
 	}
 }
 
@@ -986,6 +993,7 @@ func TestManagerApplyPassesOwnedVerifiedViewToDependentsAndReturnsReclaim(t *tes
 	t.Parallel()
 
 	verified := machine.NewCPUSet(2, 3)
+	override := &cpusetutil.CPUSetAdjustmentCommitOverride{}
 	applied := &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
 		NonReclaimPool:   machine.NewCPUSet(0),
 		ReclaimEffective: verified,
@@ -1005,7 +1013,9 @@ func TestManagerApplyPassesOwnedVerifiedViewToDependentsAndReturnsReclaim(t *tes
 	dependent := &fakePlugin{name: "workqueue", enabled: true}
 	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, dependent}}
 
-	got, err := m.Apply(context.Background(), enabledCPUSetAdjustmentCtx())
+	in := enabledCPUSetAdjustmentCtx()
+	in.CommitOverride = override
+	got, err := m.Apply(context.Background(), in)
 	if err != nil {
 		t.Fatalf("Apply() error: %v", err)
 	}
@@ -1029,6 +1039,10 @@ func TestManagerApplyPassesOwnedVerifiedViewToDependentsAndReturnsReclaim(t *tes
 	}
 	if !m.LatestAppliedReclaim().Equals(verified) {
 		t.Fatalf("latest reclaim = %s, want %s", m.LatestAppliedReclaim().String(), verified.String())
+	}
+	if !override.ReclaimEffective.Equals(verified) || override.Source != "cpuset_topology" {
+		t.Fatalf("fully-converged view commit override: reclaim=%s source=%q, want reclaim=%s source=%q",
+			override.ReclaimEffective.String(), override.Source, verified.String(), "cpuset_topology")
 	}
 	applied.NonReclaimPool.Add(1)
 	if dependent.adjustOwnedViews[0].NonReclaimPool.Contains(1) {

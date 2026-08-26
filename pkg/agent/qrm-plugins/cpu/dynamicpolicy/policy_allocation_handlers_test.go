@@ -1929,28 +1929,35 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorCoversAllNUMAs(t *testing.T) {
 		},
 	}, false)
 
-	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), true)
+	committedEntries := p.state.GetPodEntries()
+	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), committedEntries, true)
 	require.NoError(t, err)
 	require.True(t, floor.Equals(machine.NewCPUSet(14, 38, 62, 86)),
 		"floor=%s, want all-NUMA reserved reclaim CPUs", floor)
 	require.Equal(t, 2, floor.Intersection(p.machineInfo.CPUDetails.CPUsInNUMANodes(0)).Size())
 	require.Equal(t, 2, floor.Intersection(p.machineInfo.CPUDetails.CPUsInNUMANodes(1)).Size())
 
-	inactiveFloor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), false)
+	inactiveFloor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), committedEntries, false)
 	require.NoError(t, err)
-	require.True(t, inactiveFloor.Equals(machine.NewCPUSet(14, 38, 62, 86)),
-		"hard floor must remain active without a ramp-up workload")
+	require.True(t, inactiveFloor.IsEmpty(), "inactive candidate must not receive a temporary hard floor")
 
-	p.state.SetAllocationInfo("ramp-up-pod", "main", &state.AllocationInfo{
+	activeCandidate := committedEntries.Clone()
+	activeCandidate["ramp-up-pod"] = state.ContainerEntries{"main": &state.AllocationInfo{
 		AllocationMeta: commonstate.AllocationMeta{
 			PodUid: "ramp-up-pod", ContainerName: "main",
 		},
 		AllocationResult: machine.NewCPUSet(1),
 		RampUp:           true,
-	}, false)
-	activeFloor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), false)
+	}}
+	activeFloor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), activeCandidate, false)
 	require.NoError(t, err)
 	require.True(t, activeFloor.Equals(machine.NewCPUSet(14, 38, 62, 86)))
+
+	p.state.SetPodEntries(activeCandidate, false)
+	finalExitCandidate := committedEntries.Clone()
+	finalExitFloor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), finalExitCandidate, false)
+	require.NoError(t, err)
+	require.True(t, finalExitFloor.IsEmpty(), "candidate final exit must override committed active state")
 }
 
 func TestApplyPoolsAndIsolatedInfoAddsExplicitHardFloorToReclaim(t *testing.T) {
@@ -2170,7 +2177,7 @@ func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorAllowsNonBindingSharedPoolS
 		require.True(t, owner.AllocationResult.Equals(share))
 	})
 
-	t.Run("derives hard floor without active ramp-up allocation", func(t *testing.T) {
+	t.Run("does not derive hard floor without active ramp-up allocation", func(t *testing.T) {
 		p := newPolicy(t)
 		p.reservedReclaimedCPUSet = machine.NewCPUSet(0, 1)
 		p.reservedReclaimedCPUsSize = 2
@@ -2192,10 +2199,10 @@ func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorAllowsNonBindingSharedPoolS
 		entries := p.state.GetPodEntries()
 		reclaim, err := entries.GetCPUSetForPool(commonstate.PoolNameReclaim)
 		require.NoError(t, err)
-		require.True(t, machine.NewCPUSet(0, 1).IsSubsetOf(reclaim), "reclaim=%s", reclaim)
+		require.False(t, machine.NewCPUSet(0, 1).IsSubsetOf(reclaim), "reclaim=%s", reclaim)
 		share, err := entries.GetCPUSetForPool(commonstate.PoolNameShare)
 		require.NoError(t, err)
-		require.True(t, share.Intersection(machine.NewCPUSet(0, 1)).IsEmpty(), "share=%s", share)
+		require.Equal(t, 4, share.Size())
 	})
 
 	t.Run("proportionally shrinks global share pool", func(t *testing.T) {
@@ -2652,7 +2659,7 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorAllowsFullNonExclusiveRatio(t *tes
 	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
 	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 1
 
-	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), true)
+	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), true)
 	require.NoError(t, err)
 	require.True(t, floor.Equals(machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)),
 		"floor=%s, want every eligible CPU", floor)
@@ -2684,7 +2691,7 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorUsesImmutablePerNUMACapacity(t *te
 	// floor(16*0.2)=3 complete cores => 6 CPUs per NUMA. the immutable
 	// per-NUMA capacity drives the target regardless of the smaller live
 	// DefaultCPUSet, and the result is always a whole-core multiple.
-	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), true)
+	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), true)
 	require.NoError(t, err)
 	require.Equal(t, 6, floor.Intersection(numa0).Size())
 	require.Equal(t, 6, floor.Intersection(numa1).Size())
@@ -2706,7 +2713,7 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorPreservesLegacyOverlapAlgorithm(t 
 	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.5
 	p.state.SetDisableDedicatedCoresOverlapReclaimedCores(false, false)
 
-	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), true)
+	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), true)
 	require.NoError(t, err)
 	require.Equal(t, 4, floor.Size())
 }
@@ -2767,7 +2774,7 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorUsesDynamicConfiguredMinimum(t *te
 				p.conf.GetDynamicConfiguration().MinReclaimedResourceForAllocate = *tt.dynamicFloor
 			}
 
-			floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), true)
+			floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), true)
 			require.NoError(t, err)
 			require.Equal(t, tt.wantFloorSize, floor.Size())
 			require.Equal(t, tt.wantFloorSize, machine.CalculateGlobalRampUpReclaimTarget(
@@ -2867,7 +2874,7 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorBalancesGlobalTargetAcrossUnevenNU
 				}
 			}
 
-			floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), true)
+			floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), true)
 			if tt.wantErr != "" {
 				require.ErrorContains(t, err, tt.wantErr)
 				return
