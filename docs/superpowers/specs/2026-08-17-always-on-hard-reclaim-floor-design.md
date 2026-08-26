@@ -1,18 +1,19 @@
 # Always-On Hard Reclaim Floor Design
 
-## Goal
+## Status
 
-When both `EnableReclaim` and `EnableRampUpReclaimHardPartition` are true,
-every physical NUMA must retain at least two reclaim CPUs during every QRM pool
-recalculation, regardless of:
+Superseded by
+`2026-08-26-ramp-up-scoped-hard-reclaim-target-design.md`.
 
-- `DisableSharedCoresRampUp`;
-- whether any allocation currently has `RampUp=true`;
-- which QoS class triggered the recalculation;
-- whether the recalculation is admission-driven, advisor-driven, or periodic.
+This document is retained only as historical incident and design context. Its
+always-on activation rule is not current behavior.
 
-The hard-partition flag represents a persistent ownership invariant, not a
-temporary optimization tied to an active ramp-up Pod.
+## Historical Goal
+
+The superseded proposal treated the hard-partition flag as an always-on
+ownership rule. The replacement design restores `reservedForReclaim` as the
+steady floor and applies the ratio-derived target only while a real workload
+is entering or remains in ramp-up.
 
 ## Incident
 
@@ -74,10 +75,9 @@ The selected CPU IDs remain deterministic:
 The accepted capacity cost is that the floor remains reserved even when no
 allocation is marked as ramp-up.
 
-This design supersedes the active-ramp-up-only scope in
-`2026-08-04-ramp-up-reclaim-floor-all-qos-design.md`. Its selection and
-cross-QoS rules remain valid, but the floor is no longer empty when no active
-ramp-up allocation exists.
+This historical design was replaced because it contradicted the active-ramp-up
+scope in `2026-08-04-ramp-up-reclaim-floor-all-qos-design.md`. The selection
+and cross-QoS rules remain valid only while runtime ramp-up activation is true.
 
 ## Allocation Flow
 
@@ -85,8 +85,9 @@ ramp-up allocation exists.
 floor before allocating any ordinary pool:
 
 1. Clone a caller-provided explicit floor when present.
-2. If hard partition is active and the floor is empty, derive the node-level
-   floor unconditionally.
+2. The historical implementation derived the node-level floor whenever the
+   feature was configured; the replacement design gates this step on runtime
+   ramp-up activation.
 3. Remove the floor from `availableCPUs`.
 4. Allocate dedicated, shared, shared-NUMA-binding, isolation, and system pools
    from the remaining CPUs.
