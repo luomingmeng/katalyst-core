@@ -31,6 +31,7 @@ import (
 	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
 	resource2 "k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/advisorsvc"
@@ -351,6 +352,7 @@ func TestValidateHardPartitionReclaimDistribution(t *testing.T) {
 		name     string
 		reclaim  machine.CPUSet
 		eligible machine.CPUSet
+		skip     sets.Int
 		wantErr  string
 	}{
 		{
@@ -399,13 +401,35 @@ func TestValidateHardPartitionReclaimDistribution(t *testing.T) {
 			eligible: machine.NewCPUSet(0, 1, 4, 5, 8),
 			wantErr:  "outside machine topology: 8",
 		},
+		{
+			// a steady non-reclaim exclusive DNB owns NUMA 1 and keeps only its
+			// finalized reserve there; without the carve-out the imbalance guard
+			// rejects every other ramp-up QoS on the node.
+			name:     "steady exclusive numa skipped avoids minimum",
+			reclaim:  machine.NewCPUSet(0, 1, 2, 3),
+			eligible: allCPUs,
+			skip:     sets.NewInt(1),
+		},
+		{
+			name:     "steady exclusive numa skipped avoids imbalance",
+			reclaim:  machine.NewCPUSet(0, 1, 2, 3, 4, 5),
+			eligible: allCPUs,
+			skip:     sets.NewInt(1),
+		},
+		{
+			name:     "non-skipped numa still enforces minimum",
+			reclaim:  machine.NewCPUSet(0, 1, 2, 3),
+			eligible: allCPUs,
+			skip:     sets.NewInt(0),
+			wantErr:  "NUMA 1 has 0 CPUs, minimum is 2",
+		},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
 			err := validateHardPartitionReclaimDistribution(
-				tc.reclaim, tc.eligible, topology,
+				tc.reclaim, tc.eligible, topology, tc.skip,
 				minimumHardReclaimCoresPerNUMA*topology.CPUsPerCore())
 			if tc.wantErr == "" {
 				require.NoError(t, err)

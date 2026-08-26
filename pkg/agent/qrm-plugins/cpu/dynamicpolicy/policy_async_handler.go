@@ -245,7 +245,7 @@ func (p *DynamicPolicy) buildCPUSetPodStateMap(ctx context.Context, podEntries s
 		for _, podUID := range cs.podUIDs.List() {
 			pod, err := p.metaServer.GetPod(ctx, podUID)
 			if err != nil {
-				if isPodFetcherPodNotFoundError(err) {
+				if metapod.IsPodNotFound(err) {
 					general.Infof("pod: %s is already gone, skip cpuset async check", podUID)
 					cs.podUIDs.Delete(podUID)
 					continue

@@ -32,6 +32,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/status"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 	"k8s.io/kubernetes/pkg/api/v1/resource"
@@ -1501,14 +1502,20 @@ func (p *DynamicPolicy) validateHardPartitionBlockPlan(
 		eligible = eligible.Union(descriptor.Eligible.Intersection(available))
 	}
 	cpusPerCore := p.machineInfo.CPUTopology.CPUsPerCore()
+	// NUMAs already owned by a committed steady exclusive DNB keep only their
+	// finalized reserve once ramp-up ends, regardless of reclaimability; the
+	// node-level imbalance guard must not re-impose the ratio-derived target on
+	// them, otherwise it rejects every other ramp-up QoS on the node.
+	skipNUMAs := p.state.GetPodEntries().SteadyExclusiveNUMAs(p.machineInfo.CPUTopology)
 	return validateHardPartitionReclaimDistribution(
-		reclaim, eligible, p.machineInfo.CPUTopology, minimumHardReclaimCoresPerNUMA*cpusPerCore)
+		reclaim, eligible, p.machineInfo.CPUTopology, skipNUMAs, minimumHardReclaimCoresPerNUMA*cpusPerCore)
 }
 
 func validateHardPartitionReclaimDistribution(
 	reclaim machine.CPUSet,
 	eligible machine.CPUSet,
 	topology *machine.CPUTopology,
+	skipNUMAs sets.Int,
 	minimumPerNUMA int,
 ) error {
 	if topology == nil {
@@ -1527,18 +1534,23 @@ func validateHardPartitionReclaimDistribution(
 	}
 
 	minimum, maximum := 0, 0
-	for i, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
+	seen := false
+	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
+		if skipNUMAs.Has(numaID) {
+			continue
+		}
 		count := reclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID)).Size()
 		if count < minimumPerNUMA {
 			return fmt.Errorf("hard-partition reclaim NUMA %d has %d CPUs, minimum is %d",
 				numaID, count, minimumPerNUMA)
 		}
-		if i == 0 || count < minimum {
+		if !seen || count < minimum {
 			minimum = count
 		}
-		if i == 0 || count > maximum {
+		if !seen || count > maximum {
 			maximum = count
 		}
+		seen = true
 	}
 	// imbalance tolerance is one complete core, matching the core-granular
 	// water-filling in expandHardPartitionReclaimPhase.
@@ -1728,8 +1740,13 @@ func (p *DynamicPolicy) preallocateLegacyHardReclaim(
 	if err != nil {
 		return machine.NewCPUSet(), err
 	}
+	// NUMAs owned by a committed steady exclusive DNB keep only their finalized
+	// reserve once ramp-up ends; the planner must skip them so its per-NUMA
+	// minimum and cross-NUMA imbalance guards do not re-impose the ratio-derived
+	// target and reject every other ramp-up QoS on the node.
+	skipNUMAs := p.state.GetPodEntries().SteadyExclusiveNUMAs(p.machineInfo.CPUTopology)
 	demands, blockIDByDemandKey, err := expandHardPartitionReclaimPhase(
-		mandatory, available, p.machineInfo.CPUTopology)
+		mandatory, available, p.machineInfo.CPUTopology, skipNUMAs)
 	if err != nil {
 		return machine.NewCPUSet(), err
 	}

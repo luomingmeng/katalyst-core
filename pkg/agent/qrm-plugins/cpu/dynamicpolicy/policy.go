@@ -27,6 +27,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
@@ -72,6 +74,28 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/reclaim"
 	"github.com/kubewharf/katalyst-core/pkg/util/timemonitor"
 )
+
+type allocationPodMetaContextKey struct{}
+
+func podMetaFromResourceRequest(req *pluginapi.ResourceRequest) metav1.ObjectMeta {
+	podMeta := (&metav1.ObjectMeta{
+		UID:         types.UID(req.PodUid),
+		Namespace:   req.PodNamespace,
+		Name:        req.PodName,
+		Labels:      req.Labels,
+		Annotations: req.Annotations,
+	}).DeepCopy()
+	return *podMeta
+}
+
+func withAllocationPodMeta(ctx context.Context, req *pluginapi.ResourceRequest) context.Context {
+	return context.WithValue(ctx, allocationPodMetaContextKey{}, podMetaFromResourceRequest(req))
+}
+
+func allocationPodMetaFromContext(ctx context.Context) (metav1.ObjectMeta, bool) {
+	podMeta, ok := ctx.Value(allocationPodMetaContextKey{}).(metav1.ObjectMeta)
+	return podMeta, ok
+}
 
 const (
 	cpuPluginStateFileName = "cpu_plugin_state"
@@ -1240,6 +1264,7 @@ func (p *DynamicPolicy) Allocate(ctx context.Context,
 	if req == nil {
 		return nil, fmt.Errorf("allocate got nil req")
 	}
+	ctx = withAllocationPodMeta(ctx, req)
 
 	// identify if the pod is a debug pod,
 	// if so, apply specific strategy to it.

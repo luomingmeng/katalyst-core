@@ -251,12 +251,14 @@ func (cra *cpuResourceAdvisor) update() (*types.InternalCPUCalculationResult, er
 		hardEnabled, observedReclaimTotal, reclaimObserved, maxRampUpStep)
 
 	result, err := cra.updateWithIsolationGuardian(
-		dynamicConf, metadataSnapshot.activeRampUp, hardEnabled, reclaimConstraint, reclaimCeilings, true)
+		dynamicConf, metadataSnapshot.activeRampUp, hardEnabled, metadataSnapshot.steadyExclusiveNUMAs,
+		reclaimConstraint, reclaimCeilings, true)
 	if err != nil {
 		if err == errIsolationSafetyCheckFailed {
 			klog.Warningf("[qosaware-cpu] failed to updateWithIsolationGuardian(true): %q", err)
 			result, err = cra.updateWithIsolationGuardian(
-				dynamicConf, metadataSnapshot.activeRampUp, hardEnabled, reclaimConstraint, reclaimCeilings, false)
+				dynamicConf, metadataSnapshot.activeRampUp, hardEnabled, metadataSnapshot.steadyExclusiveNUMAs,
+				reclaimConstraint, reclaimCeilings, false)
 		}
 		if err != nil {
 			return nil, err
@@ -312,15 +314,17 @@ type containerRegionAssignment struct {
 }
 
 type regionAssignmentSnapshot struct {
-	containers   map[string]map[string]containerRegionAssignment
-	pools        map[string]sets.String
-	activeRampUp bool
+	containers           map[string]map[string]containerRegionAssignment
+	pools                map[string]sets.String
+	activeRampUp         bool
+	steadyExclusiveNUMAs sets.Int
 }
 
 func (cra *cpuResourceAdvisor) snapshotRegionAssignments() regionAssignmentSnapshot {
 	snapshot := regionAssignmentSnapshot{
-		containers: make(map[string]map[string]containerRegionAssignment),
-		pools:      make(map[string]sets.String),
+		containers:           make(map[string]map[string]containerRegionAssignment),
+		pools:                make(map[string]sets.String),
+		steadyExclusiveNUMAs: sets.NewInt(),
 	}
 	cra.metaCache.RangeContainer(func(podUID, containerName string, ci *types.ContainerInfo) bool {
 		if snapshot.containers[podUID] == nil {
@@ -328,6 +332,13 @@ func (cra *cpuResourceAdvisor) snapshotRegionAssignments() regionAssignmentSnaps
 		}
 		if ci.RampUp {
 			snapshot.activeRampUp = true
+		} else if ci.IsDedicatedNumaExclusive() {
+			// Reclaimability is intentionally irrelevant here. Once an
+			// exclusive DNB is steady, its NUMA keeps the finalized reserve and
+			// must not inherit another NUMA's active ramp-up target.
+			for numaID := range ci.TopologyAwareAssignments {
+				snapshot.steadyExclusiveNUMAs.Insert(numaID)
+			}
 		}
 		snapshot.containers[podUID][containerName] = containerRegionAssignment{
 			regionNames: sets.NewString(ci.RegionNames.List()...),
@@ -379,6 +390,7 @@ func (cra *cpuResourceAdvisor) restoreRegionAssignments(snapshot regionAssignmen
 func (cra *cpuResourceAdvisor) updateWithIsolationGuardian(dynamicConf *dynamic.Configuration,
 	rampUpActive bool,
 	hardActive bool,
+	steadyExclusiveNUMAs sets.Int,
 	reclaimConstraint provisionassembler.ReclaimConstraint,
 	reclaimCeilings map[provisionassembler.ReclaimConstraintScope]int,
 	tryIsolation bool,
@@ -400,7 +412,7 @@ func (cra *cpuResourceAdvisor) updateWithIsolationGuardian(dynamicConf *dynamic.
 		return nil, fmt.Errorf("reserve pool does not exist")
 	}
 
-	if err := cra.updateNumasAvailableResource(dynamicConf, hardActive); err != nil {
+	if err := cra.updateNumasAvailableResource(dynamicConf, hardActive, steadyExclusiveNUMAs); err != nil {
 		klog.Errorf("[qosaware-cpu] update NUMA available resource failed: %v", err)
 		return nil, fmt.Errorf("failed to update NUMA available resource: %w", err)
 	}

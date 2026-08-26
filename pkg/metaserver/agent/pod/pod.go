@@ -18,7 +18,6 @@ package pod
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -57,11 +56,6 @@ const (
 	podFetcherKubeletHealthCheckName = "pod_fetcher_kubelet"
 	podFetcherRuntimeHealthCheckName = "pod_fetcher_runtime"
 	tolerationTurns                  = 3
-)
-
-var (
-	ErrPodNotFound       = errors.New("pod not found")
-	ErrContainerNotFound = errors.New("container not found")
 )
 
 type PodFetcher interface {
@@ -427,7 +421,7 @@ func (w *podFetcherImpl) GetPod(ctx context.Context, podUID string) (*v1.Pod, er
 	if pod, ok := kubeletPodsCache[podUID]; ok {
 		return pod, nil
 	}
-	return nil, fmt.Errorf("failed to find pod by uid %v", podUID)
+	return nil, NewPodNotFoundError(podUID)
 }
 
 func (w *podFetcherImpl) getKubeletPodsCache(ctx context.Context) (map[string]*v1.Pod, error) {

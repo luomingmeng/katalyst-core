@@ -408,6 +408,51 @@ func (pe PodEntries) GetFilteredPodEntries(filter func(ai *AllocationInfo) bool)
 	return filteredEntries
 }
 
+// SteadyExclusiveNUMAs returns the NUMA ids wholly owned by a committed
+// steady-state (RampUp=false) NUMA-exclusive DNB allocation, regardless of the
+// pod's reclaimability. Such a NUMA's partition is already finalized: once a
+// NUMA-exclusive DNB leaves ramp-up its reclaim domain collapses to the steady
+// reserve (ResolvePerNUMAReservedForReclaim, e.g. two CPUs), which is
+// independent of InitialRampUpReclaimCPUSetRatio and therefore smaller than the
+// ratio-derived ramp-up hard-partition target for both reclaimable and
+// non-reclaimable pods. Every hard-partition reclaim enforcement site (ramp-up
+// floor derivation, the bulkhead precommit validator, and the advisor
+// block-plan validator) must skip these NUMAs, otherwise it re-imposes the
+// node-level ramp-up target on the finalized reserve and fails admission closed
+// for every other ramp-up QoS on the node. Reclaimability is deliberately not
+// consulted here: gating on PodEnableReclaim would leave a reclaimable steady
+// exclusive NUMA exposed to the same false minimum/imbalance rejection.
+func (pe PodEntries) SteadyExclusiveNUMAs(topology *machine.CPUTopology) sets.Int {
+	steadyNUMAs := sets.NewInt()
+	if topology == nil {
+		return steadyNUMAs
+	}
+	for _, containerEntries := range pe {
+		if containerEntries.IsPoolEntry() {
+			continue
+		}
+		for _, allocationInfo := range containerEntries {
+			if allocationInfo == nil ||
+				allocationInfo.RampUp ||
+				!allocationInfo.CheckDedicatedNUMABindingNUMAExclusive() {
+				continue
+			}
+			for numaID := range allocationInfo.TopologyAwareAssignments {
+				steadyNUMAs.Insert(numaID)
+			}
+			if len(allocationInfo.TopologyAwareAssignments) == 0 {
+				for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceNoSortInt() {
+					if !allocationInfo.AllocationResult.Intersection(
+						topology.CPUDetails.CPUsInNUMANodes(numaID)).IsEmpty() {
+						steadyNUMAs.Insert(numaID)
+					}
+				}
+			}
+		}
+	}
+	return steadyNUMAs
+}
+
 func (ns *NUMANodeState) Clone() *NUMANodeState {
 	if ns == nil {
 		return nil

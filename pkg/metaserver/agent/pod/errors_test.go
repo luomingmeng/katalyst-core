@@ -1,5 +1,5 @@
 /*
-Copyright 2022 The Katalyst Authors.
+Copyright 2026 The Katalyst Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,12 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package dynamicpolicy
+package pod
 
 import (
-	"strings"
+	"errors"
+	"fmt"
+	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
-func isPodFetcherPodNotFoundError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "failed to find pod by uid")
+func TestPodNotFoundError(t *testing.T) {
+	t.Parallel()
+
+	err := NewPodNotFoundError("pod-uid")
+
+	require.EqualError(t, err, "failed to find pod by uid pod-uid")
+	require.ErrorIs(t, err, ErrPodNotFound)
+	require.True(t, IsPodNotFound(err))
+	require.True(t, IsPodNotFound(fmt.Errorf("get pod: %w", err)))
+	require.False(t, IsPodNotFound(nil))
+	require.False(t, IsPodNotFound(errors.New("failed to find pod by uid pod-uid")))
 }

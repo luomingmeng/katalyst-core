@@ -25,6 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/metacache"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
@@ -264,7 +265,7 @@ func TestCPUResourceAdvisorUpdateRampUpReclaimRejectsConfiguredFloorAboveCapacit
 	require.NoError(t, advisor.metaCache.AddContainer("pod", "main", &types.ContainerInfo{RampUp: true}))
 
 	require.NoError(t, advisor.updateReservedForReclaim(advisor.conf.GetDynamicConfiguration()))
-	err = advisor.updateRampUpReclaimCPUSetCap(advisor.conf.GetDynamicConfiguration(), true)
+	err = advisor.updateRampUpReclaimCPUSetCap(advisor.conf.GetDynamicConfiguration(), true, nil)
 
 	require.ErrorContains(t, err, "configured hard reclaim floor 17 exceeds total core-aligned NUMA capacity 16")
 }
@@ -316,7 +317,7 @@ func TestCPUResourceAdvisorUpdateRampUpReclaimUsesImmutableNUMACapacity(t *testi
 
 	require.NoError(t, cra.updateReservedForReclaim(cra.conf.GetDynamicConfiguration()))
 	assert.Equal(t, map[int]int{0: 2, 1: 2}, cra.reservedForReclaim)
-	require.NoError(t, cra.updateRampUpReclaimCPUSetCap(cra.conf.GetDynamicConfiguration(), true))
+	require.NoError(t, cra.updateRampUpReclaimCPUSetCap(cra.conf.GetDynamicConfiguration(), true, nil))
 	// capacities: NUMA0 24 CPUs (12 cores), NUMA1 32 CPUs (16 cores),
 	// cpusPerCore==2, ratio 0.2. donated cores = floor(cores*0.2) complete
 	// cores: NUMA0 floor(2.4)=2 cores=4 CPUs, NUMA1 floor(3.2)=3 cores=6
@@ -469,6 +470,7 @@ func TestUpdateRampUpReclaimCPUSetCap(t *testing.T) {
 		enable      bool
 		rampUp      bool
 		assignments map[int]machine.CPUSet
+		skipNUMAs   sets.Int
 		wantCap     map[int]int
 	}{
 		{
@@ -502,6 +504,14 @@ func TestUpdateRampUpReclaimCPUSetCap(t *testing.T) {
 			},
 			wantCap: map[int]int{0: expectedTarget, 1: expectedTarget},
 		},
+		{
+			name:        "steady exclusive NUMA keeps steady reserve while another NUMA ramps up",
+			enable:      true,
+			rampUp:      true,
+			assignments: map[int]machine.CPUSet{1: machine.NewCPUSet(48, 49)},
+			skipNUMAs:   sets.NewInt(0),
+			wantCap:     map[int]int{1: expectedTarget},
+		},
 	}
 
 	for _, tt := range tests {
@@ -534,7 +544,8 @@ func TestUpdateRampUpReclaimCPUSetCap(t *testing.T) {
 			}
 
 			require.NoError(t, cra.updateReservedForReclaim(cra.conf.GetDynamicConfiguration()))
-			require.NoError(t, cra.updateRampUpReclaimCPUSetCap(cra.conf.GetDynamicConfiguration(), tt.rampUp))
+			require.NoError(t, cra.updateRampUpReclaimCPUSetCap(
+				cra.conf.GetDynamicConfiguration(), tt.rampUp, tt.skipNUMAs))
 
 			assert.Equal(t, tt.wantCap, cra.rampUpReclaimCPUSetCap)
 		})

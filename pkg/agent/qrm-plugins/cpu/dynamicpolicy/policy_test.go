@@ -2595,6 +2595,70 @@ func TestAllocateForPod(t *testing.T) {
 	_ = os.RemoveAll(tmpDir)
 }
 
+func TestAllocatePreservesOriginalPodMetaForHandler(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	p.podAnnotationKeptKeys = nil
+	p.podLabelKeptKeys = nil
+
+	const (
+		spdLabelKey      = "spd.katalyst.kubewharf.io/workload"
+		enhancementKey   = "enhancement.katalyst.kubewharf.io/custom"
+		originalLabel    = "spd-workload"
+		originalEnhance  = "enabled"
+		mutatedAfterCopy = "mutated"
+	)
+	inputLabels := map[string]string{
+		consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+		spdLabelKey:                     originalLabel,
+	}
+	inputAnnotations := map[string]string{
+		consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+		enhancementKey:                  originalEnhance,
+	}
+	req := &pluginapi.ResourceRequest{
+		PodUid:        "pod-uid",
+		PodNamespace:  "pod-namespace",
+		PodName:       "pod-name",
+		ContainerName: "container-name",
+		ContainerType: pluginapi.ContainerType_MAIN,
+		ResourceName:  string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{
+			string(v1.ResourceCPU): 1,
+		},
+		Labels:      inputLabels,
+		Annotations: inputAnnotations,
+	}
+
+	handlerCalled := false
+	p.allocationHandlers[consts.PodAnnotationQoSLevelSharedCores] = func(
+		ctx context.Context, filteredReq *pluginapi.ResourceRequest, _ bool,
+	) (*pluginapi.ResourceAllocationResponse, error) {
+		handlerCalled = true
+		require.NotContains(t, filteredReq.Labels, spdLabelKey)
+		require.NotContains(t, filteredReq.Annotations, enhancementKey)
+
+		inputLabels[spdLabelKey] = mutatedAfterCopy
+		inputAnnotations[enhancementKey] = mutatedAfterCopy
+		originalPodMeta, ok := allocationPodMetaFromContext(ctx)
+		require.True(t, ok)
+		require.Equal(t, types.UID(req.PodUid), originalPodMeta.UID)
+		require.Equal(t, req.PodNamespace, originalPodMeta.Namespace)
+		require.Equal(t, req.PodName, originalPodMeta.Name)
+		require.Equal(t, originalLabel, originalPodMeta.Labels[spdLabelKey])
+		require.Equal(t, originalEnhance, originalPodMeta.Annotations[enhancementKey])
+		return &pluginapi.ResourceAllocationResponse{}, nil
+	}
+
+	_, err = p.Allocate(context.Background(), req)
+	require.NoError(t, err)
+	require.True(t, handlerCalled)
+}
+
 func TestGetTopologyHints(t *testing.T) {
 	t.Parallel()
 

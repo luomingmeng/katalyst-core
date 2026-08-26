@@ -21,6 +21,8 @@ import (
 	"sort"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/util/sets"
+
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
@@ -362,6 +364,7 @@ func expandHardPartitionReclaimPhase(
 	descriptors []advisorBlockDescriptor,
 	available machine.CPUSet,
 	topology *machine.CPUTopology,
+	skipNUMAs sets.Int,
 ) ([]partitionDemand, map[string]string, error) {
 	if topology == nil {
 		return nil, nil, fmt.Errorf("cannot expand hard reclaim phase with nil CPU topology")
@@ -557,24 +560,34 @@ func expandHardPartitionReclaimPhase(
 		blockIDByDemandKey[key] = fake.BlockID
 	}
 
-	minimum, maximum := finalByNUMA[numaIDs[0]], finalByNUMA[numaIDs[0]]
+	minimum, maximum := 0, 0
+	seen := false
 	perNUMAMinimum := minimumHardReclaimCoresPerNUMA * cpusPerCore
 	for _, numaID := range numaIDs {
+		// NUMAs already owned by a committed steady exclusive DNB keep only their
+		// finalized reserve once ramp-up ends, regardless of reclaimability. The
+		// node-level per-NUMA minimum and cross-NUMA imbalance guards must not
+		// re-impose the ratio-derived target on them, otherwise the planner fails
+		// closed for every other ramp-up QoS on the node.
+		if skipNUMAs.Has(numaID) {
+			continue
+		}
 		if finalByNUMA[numaID] < perNUMAMinimum {
 			return nil, nil, fmt.Errorf(
 				"hard reclaim NUMA %d final quantity %d is smaller than minimum %d",
 				numaID, finalByNUMA[numaID], perNUMAMinimum)
 		}
-		if finalByNUMA[numaID] < minimum {
+		if !seen || finalByNUMA[numaID] < minimum {
 			minimum = finalByNUMA[numaID]
 		}
-		if finalByNUMA[numaID] > maximum {
+		if !seen || finalByNUMA[numaID] > maximum {
 			maximum = finalByNUMA[numaID]
 		}
+		seen = true
 	}
 	// imbalance tolerance is one complete core: core-granular water-filling can leave
 	// at most one NUMA a single core ahead, never a fractional-core skew.
-	if maximum-minimum > cpusPerCore {
+	if seen && maximum-minimum > cpusPerCore {
 		general.InfoS("hard reclaim final NUMA quantities imbalanced",
 			"minimum", minimum,
 			"maximum", maximum,

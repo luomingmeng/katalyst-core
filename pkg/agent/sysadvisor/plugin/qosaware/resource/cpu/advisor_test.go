@@ -272,6 +272,41 @@ func TestSnapshotRegionAssignmentsCapturesRampUpAtCycleStart(t *testing.T) {
 	require.True(t, activeField.Bool(), "cycle-start RampUp decision must be immutable")
 }
 
+func TestSnapshotRegionAssignmentsCapturesSteadyExclusiveNUMAs(t *testing.T) {
+	t.Parallel()
+
+	metaCache := metacache.NewDummyMetaCacheImp()
+	require.NoError(t, metaCache.AddContainer("steady-exclusive", "main", &types.ContainerInfo{
+		PodUID:        "steady-exclusive",
+		ContainerName: "main",
+		QoSLevel:      consts.PodAnnotationQoSLevelDedicatedCores,
+		Annotations: map[string]string{
+			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			consts.PodAnnotationMemoryEnhancementNumaExclusive: consts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
+		},
+		RampUp: false,
+		TopologyAwareAssignments: types.TopologyAwareAssignment{
+			0: machine.NewCPUSet(0, 1),
+		},
+		RegionNames: sets.NewString(),
+	}))
+	require.NoError(t, metaCache.AddContainer("ramp-up", "main", &types.ContainerInfo{
+		PodUID:        "ramp-up",
+		ContainerName: "main",
+		RampUp:        true,
+		RegionNames:   sets.NewString(),
+		TopologyAwareAssignments: types.TopologyAwareAssignment{
+			1: machine.NewCPUSet(2, 3),
+		},
+	}))
+	advisor := &cpuResourceAdvisor{metaCache: metaCache}
+
+	snapshot := advisor.snapshotRegionAssignments()
+
+	require.True(t, snapshot.activeRampUp)
+	require.Equal(t, sets.NewInt(0), snapshot.steadyExclusiveNUMAs)
+}
+
 func TestAssembleProvisionPassesCycleRampUpSnapshot(t *testing.T) {
 	t.Parallel()
 

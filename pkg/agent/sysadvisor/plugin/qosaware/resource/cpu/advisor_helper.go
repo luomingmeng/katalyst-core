@@ -161,6 +161,7 @@ func (cra *cpuResourceAdvisor) initializeHeadroomAssembler() error {
 func (cra *cpuResourceAdvisor) updateNumasAvailableResource(
 	dynamicConf *dynamic.Configuration,
 	hardActive bool,
+	steadyExclusiveNUMAs sets.Int,
 ) error {
 	numaAvailable := make(map[int]int)
 	reservePoolInfo, _ := cra.metaCache.GetPoolInfo(commonstate.PoolNameReserve)
@@ -205,7 +206,7 @@ func (cra *cpuResourceAdvisor) updateNumasAvailableResource(
 		cra.rampUpReclaimCPUSetCap = make(map[int]int)
 		return err
 	}
-	return cra.updateRampUpReclaimCPUSetCap(dynamicConf, hardActive)
+	return cra.updateRampUpReclaimCPUSetCap(dynamicConf, hardActive, steadyExclusiveNUMAs)
 }
 
 func (cra *cpuResourceAdvisor) updateReservedForReclaim(dynamicConf *dynamic.Configuration) error {
@@ -229,6 +230,7 @@ func (cra *cpuResourceAdvisor) updateReservedForReclaim(dynamicConf *dynamic.Con
 func (cra *cpuResourceAdvisor) updateRampUpReclaimCPUSetCap(
 	dynamicConf *dynamic.Configuration,
 	hardActive bool,
+	steadyExclusiveNUMAs sets.Int,
 ) error {
 	targets := make(map[int]int)
 	if dynamicConf == nil || !dynamicConf.EnableReclaim ||
@@ -247,6 +249,12 @@ func (cra *cpuResourceAdvisor) updateRampUpReclaimCPUSetCap(
 	if err != nil {
 		cra.rampUpReclaimCPUSetCap = make(map[int]int)
 		return fmt.Errorf("resolve active ramp-up reclaim targets: %w", err)
+	}
+	// A steady exclusive DNB has already finalized its NUMA partition. Keep
+	// that NUMA at the steady reserve even while another NUMA activates the
+	// node-level ramp-up hard target.
+	for numaID := range steadyExclusiveNUMAs {
+		delete(targets, numaID)
 	}
 
 	cra.rampUpReclaimCPUSetCap = targets

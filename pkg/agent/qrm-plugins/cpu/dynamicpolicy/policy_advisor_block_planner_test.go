@@ -25,6 +25,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"k8s.io/apimachinery/pkg/util/sets"
+
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/advisorsvc"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
@@ -764,7 +766,7 @@ func TestExpandHardPartitionReclaimPhase_MixedRealAndFakeWaterFilling(t *testing
 		},
 	}
 
-	demands, _, err := expandHardPartitionReclaimPhase(descriptors, available, topology)
+	demands, _, err := expandHardPartitionReclaimPhase(descriptors, available, topology, nil)
 	require.NoError(t, err)
 	require.Equal(t, map[string]map[int]int{
 		"real-0": {0: 2},
@@ -799,7 +801,7 @@ func TestExpandHardPartitionReclaimPhase_WaterFillsCompleteCores(t *testing.T) {
 		},
 	}
 
-	demands, _, err := expandHardPartitionReclaimPhase(descriptors, available, topology)
+	demands, _, err := expandHardPartitionReclaimPhase(descriptors, available, topology, nil)
 	require.NoError(t, err)
 
 	final := make(map[int]int)
@@ -832,7 +834,7 @@ func TestExpandHardPartitionReclaimPhase_MultipleFakeBlocksFailClosed(t *testing
 		},
 	}
 
-	_, _, err = expandHardPartitionReclaimPhase(descriptors, available, topology)
+	_, _, err = expandHardPartitionReclaimPhase(descriptors, available, topology, nil)
 	require.ErrorContains(t, err,
 		"hard reclaim protocol error: expected at most one fake-NUMA mandatory reclaim block, got 2")
 }
@@ -856,7 +858,7 @@ func TestExpandHardPartitionReclaimPhase_FailsWhenAggregateCapacityIsInsufficien
 		},
 	}
 
-	_, _, err = expandHardPartitionReclaimPhase(descriptors, available, topology)
+	_, _, err = expandHardPartitionReclaimPhase(descriptors, available, topology, nil)
 	require.ErrorContains(t, err, "insufficient aggregate capacity")
 }
 
@@ -875,9 +877,73 @@ func TestExpandHardPartitionReclaimPhase_FailsWhenPositiveFakeDemandHasNoEligibl
 	}}
 
 	require.NotPanics(t, func() {
-		_, _, err = expandHardPartitionReclaimPhase(descriptors, topology.CPUDetails.CPUs(), topology)
+		_, _, err = expandHardPartitionReclaimPhase(descriptors, topology.CPUDetails.CPUs(), topology, nil)
 	})
 	require.ErrorContains(t, err, `hard reclaim fake block "empty-eligible" has quantity 1 but no eligible NUMA`)
+}
+
+func TestExpandHardPartitionReclaimPhase_SkipsSteadyExclusiveNUMAImbalance(t *testing.T) {
+	t.Parallel()
+
+	// SMT2, two NUMAs. NUMA0 is wholly owned by a committed steady exclusive DNB:
+	// only its 2-cpu steady reclaim reserve remains and is emitted as a real
+	// mandatory block. NUMA1 is ramping up: a 2-cpu seed plus a 4-cpu fake block
+	// water-fill it to its 6-cpu ratio target. Without the steady-exclusive
+	// carve-out the planner compares NUMA0's finalized reserve (2) against NUMA1's
+	// ramp-up target (6) and fails closed on a false cross-NUMA imbalance.
+	topology, err := machine.GenerateDummyCPUTopology(64, 1, 2)
+	require.NoError(t, err)
+	require.Equal(t, 2, topology.CPUsPerCore())
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0).ToSliceInt()
+	numa1 := topology.CPUDetails.CPUsInNUMANodes(1)
+	// NUMA0 only exposes its 2-cpu steady reserve; the other 30 cpus are held by
+	// the steady exclusive DNB and are not reclaim-eligible.
+	numa0Reserve := machine.NewCPUSet(numa0[0], numa0[1])
+	available := numa0Reserve.Union(numa1)
+	descriptors := []advisorBlockDescriptor{
+		{
+			BlockID:      "real-0",
+			Class:        advisorBlockClassMandatoryReclaim,
+			NUMAID:       0,
+			Quantity:     2,
+			ComponentKey: "real-0",
+			Eligible:     numa0Reserve,
+		},
+		{
+			BlockID:      "real-1",
+			Class:        advisorBlockClassMandatoryReclaim,
+			NUMAID:       1,
+			Quantity:     2,
+			ComponentKey: "real-1",
+			Eligible:     numa1,
+		},
+		{
+			BlockID:      "fake",
+			Class:        advisorBlockClassMandatoryReclaim,
+			NUMAID:       commonstate.FakedNUMAID,
+			Quantity:     4,
+			ComponentKey: "fake",
+			Eligible:     available,
+		},
+	}
+
+	// Empty skip set reproduces the false imbalance failure.
+	_, _, err = expandHardPartitionReclaimPhase(descriptors, available, topology, nil)
+	require.ErrorContains(t, err, "imbalanced")
+
+	// Skipping the steady exclusive NUMA lets the finalized reserve coexist with
+	// the ramp-up target on the other NUMA.
+	demands, _, err := expandHardPartitionReclaimPhase(
+		descriptors, available, topology, sets.NewInt(0))
+	require.NoError(t, err)
+	final := make(map[int]int)
+	for _, demand := range demands {
+		numaIDs := topology.CPUDetails.KeepOnly(demand.eligible).NUMANodes().ToSliceInt()
+		require.Len(t, numaIDs, 1)
+		final[numaIDs[0]] += demand.quantity
+	}
+	require.Equal(t, 2, final[0])
+	require.Equal(t, 6, final[1])
 }
 
 func hardReclaimDemandQuotasByBlock(

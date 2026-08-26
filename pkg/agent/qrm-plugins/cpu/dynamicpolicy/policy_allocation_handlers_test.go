@@ -42,11 +42,53 @@ import (
 	dynamicpolicyutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
+	"github.com/kubewharf/katalyst-core/pkg/metaserver/spd"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	rputil "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 	"github.com/kubewharf/katalyst-core/pkg/util/timemonitor"
 )
+
+type getPodErrorPodFetcher struct {
+	*pod.PodFetcherStub
+	err error
+	pod *v1.Pod
+}
+
+type recordingServiceProfilingManager struct {
+	*spd.DummyServiceProfilingManager
+	performanceLevel spd.PerformanceLevel
+	performanceErr   error
+	baseline         bool
+	baselineErr      error
+	baselineCalls    int
+	observedPodMeta  []metav1.ObjectMeta
+}
+
+func (m *recordingServiceProfilingManager) ServiceBusinessPerformanceLevel(
+	ctx context.Context, podMeta metav1.ObjectMeta,
+) (spd.PerformanceLevel, error) {
+	m.observedPodMeta = append(m.observedPodMeta, podMeta)
+	if err := ctx.Err(); err != nil {
+		return spd.PerformanceLevelUnknown, err
+	}
+	return m.performanceLevel, m.performanceErr
+}
+
+func (m *recordingServiceProfilingManager) ServiceBaseline(
+	ctx context.Context, podMeta metav1.ObjectMeta,
+) (bool, error) {
+	m.baselineCalls++
+	m.observedPodMeta = append(m.observedPodMeta, podMeta)
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	return m.baseline, m.baselineErr
+}
+
+func (f *getPodErrorPodFetcher) GetPod(_ context.Context, _ string) (*v1.Pod, error) {
+	return f.pod, f.err
+}
 
 type failingAllocateAccompanyPlugin struct {
 	err error
@@ -1220,20 +1262,20 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_exclusiveDisjointPartition(t *tes
 		)
 	}
 
-	t.Run("pinned package reserves from reclaim-only eligibility even when pod reclaim is disabled", func(t *testing.T) {
+	t.Run("pinned package preserves reserve and reclaim-only eligibility when pod reclaim is disabled", func(t *testing.T) {
 		p := newPolicy(t)
-		p.reservedReclaimedCPUSet = machine.NewCPUSet(0, 1)
+		p.reservedReclaimedCPUSet = machine.NewCPUSet(0, 4)
 		p.reservedReclaimedCPUsSize = 2
 		machineState := state.NUMANodeMap{
 			0: {
 				DefaultCPUSet: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
 				ResourcePackageStates: map[string]*state.ResourcePackageState{
 					"work": {
-						PinnedCPUSet: machine.NewCPUSet(0, 1, 2, 3),
+						PinnedCPUSet: machine.NewCPUSet(0, 1, 4, 5),
 					},
 					"protected": {
 						Attributes:   map[string]string{"disable-reclaim": "true"},
-						PinnedCPUSet: machine.NewCPUSet(6, 7),
+						PinnedCPUSet: machine.NewCPUSet(3, 7),
 					},
 				},
 			},
@@ -1241,27 +1283,27 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_exclusiveDisjointPartition(t *tes
 
 		result, reclaim, err := call(p, machineState, exclusiveAnnotations("work"), false)
 		require.NoError(t, err)
-		require.True(t, result.Equals(machine.NewCPUSet(0, 1, 2, 3)), "result=%s", result)
-		require.True(t, reclaim.Equals(machine.NewCPUSet(4, 5)), "reclaim=%s", reclaim)
+		require.True(t, result.Equals(machine.NewCPUSet(1, 5)), "result=%s", result)
+		require.True(t, reclaim.Equals(machine.NewCPUSet(0, 2, 4, 6)), "reclaim=%s", reclaim)
 		require.True(t, result.Intersection(reclaim).IsEmpty())
-		require.True(t, result.Union(reclaim).Equals(machine.NewCPUSet(0, 1, 2, 3, 4, 5)))
-		require.True(t, reclaim.Intersection(machine.NewCPUSet(6, 7)).IsEmpty())
+		require.True(t, result.Union(reclaim).Equals(machine.NewCPUSet(0, 1, 2, 4, 5, 6)))
+		require.True(t, reclaim.Intersection(machine.NewCPUSet(3, 7)).IsEmpty())
 	})
 
-	t.Run("unpinned package excludes pinned dedicated CPUs and reserves outside dedicated first", func(t *testing.T) {
+	t.Run("unpinned package preserves reserve and reclaim-only eligibility", func(t *testing.T) {
 		p := newPolicy(t)
-		p.reservedReclaimedCPUSet = machine.NewCPUSet(4, 5)
+		p.reservedReclaimedCPUSet = machine.NewCPUSet(2, 6)
 		p.reservedReclaimedCPUsSize = 2
 		machineState := state.NUMANodeMap{
 			0: {
 				DefaultCPUSet: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
 				ResourcePackageStates: map[string]*state.ResourcePackageState{
 					"other": {
-						PinnedCPUSet: machine.NewCPUSet(0, 1),
+						PinnedCPUSet: machine.NewCPUSet(0, 4),
 					},
 					"protected": {
 						Attributes:   map[string]string{"disable-reclaim": "true"},
-						PinnedCPUSet: machine.NewCPUSet(6, 7),
+						PinnedCPUSet: machine.NewCPUSet(3, 7),
 					},
 				},
 			},
@@ -1269,10 +1311,10 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_exclusiveDisjointPartition(t *tes
 
 		result, reclaim, err := call(p, machineState, exclusiveAnnotations(""), true)
 		require.NoError(t, err)
-		require.True(t, result.Equals(machine.NewCPUSet(2, 3, 4, 5)), "result=%s", result)
-		require.True(t, reclaim.Equals(machine.NewCPUSet(0, 1)), "reclaim=%s", reclaim)
+		require.True(t, result.Equals(machine.NewCPUSet(1, 5)), "result=%s", result)
+		require.True(t, reclaim.Equals(machine.NewCPUSet(0, 2, 4, 6)), "reclaim=%s", reclaim)
 		require.True(t, result.Intersection(reclaim).IsEmpty())
-		require.True(t, result.Union(reclaim).Equals(machine.NewCPUSet(0, 1, 2, 3, 4, 5)))
+		require.True(t, result.Union(reclaim).Equals(machine.NewCPUSet(0, 1, 2, 4, 5, 6)))
 	})
 
 	t.Run("rejects empty dedicated partition", func(t *testing.T) {
@@ -1321,32 +1363,179 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_exclusiveDisjointPartition(t *tes
 	})
 }
 
-func TestDynamicPolicyPodEnableReclaimForNumaBindingAllocationDoesNotBlockExclusivePartition(t *testing.T) {
+func TestDynamicPolicyPodEnableReclaimForNumaBindingAllocation(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
 	require.NoError(t, err)
-	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
-	require.NoError(t, err)
-	p.metaServer = nil
-	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
-	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
-	p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
+	podFetcherErr := errors.New("pod fetcher failed")
+	spdErr := errors.New("spd failed")
+	baselineErr := errors.New("baseline failed")
 
-	exclusive := map[string]string{
+	newPolicy := func(t *testing.T, fetchedPod *v1.Pod, getPodErr error, manager *recordingServiceProfilingManager) *DynamicPolicy {
+		p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+		require.NoError(t, err)
+		p.metaServer.MetaAgent.PodFetcher = &getPodErrorPodFetcher{
+			PodFetcherStub: &pod.PodFetcherStub{},
+			err:            getPodErr,
+			pod:            fetchedPod,
+		}
+		p.metaServer.ServiceProfilingManager = manager
+		p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+		p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+		p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
+		return p
+	}
+
+	originalPodMeta := metav1.ObjectMeta{
+		UID:       types.UID("pod-uid"),
+		Namespace: "pod-namespace",
+		Name:      "pod-name",
+		Labels:    map[string]string{"spd-label": "value"},
+		Annotations: map[string]string{
+			apiconsts.PodAnnotationMemoryEnhancementNumaBinding:   apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
+			"spd-annotation": "value",
+		},
+	}
+	filteredExclusive := map[string]string{
 		apiconsts.PodAnnotationMemoryEnhancementNumaBinding:   apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
 		apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
 	}
-	got, err := p.podEnableReclaimForNumaBindingAllocation(context.Background(), "pod-missing", exclusive)
-	require.NoError(t, err)
-	require.False(t, got)
-
-	nonExclusive := map[string]string{
-		apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+	req := &pluginapi.ResourceRequest{
+		PodUid:       "pod-uid",
+		PodNamespace: "pod-namespace",
+		PodName:      "pod-name",
+		Annotations:  filteredExclusive,
 	}
-	got, err = p.podEnableReclaimForNumaBindingAllocation(context.Background(), "pod-missing", nonExclusive)
-	require.NoError(t, err)
-	require.False(t, got)
+	ctx := context.WithValue(context.Background(), allocationPodMetaContextKey{}, originalPodMeta)
+
+	t.Run("poor request metadata disables reclaim", func(t *testing.T) {
+		manager := &recordingServiceProfilingManager{
+			DummyServiceProfilingManager: &spd.DummyServiceProfilingManager{},
+			performanceLevel:             spd.PerformanceLevelPoor,
+		}
+		p := newPolicy(t, nil, podFetcherErr, manager)
+
+		got, err := p.podEnableReclaimForNumaBindingAllocation(ctx, req)
+		require.NoError(t, err)
+		require.False(t, got)
+		require.Equal(t, []metav1.ObjectMeta{originalPodMeta}, manager.observedPodMeta)
+		require.Zero(t, manager.baselineCalls)
+	})
+
+	t.Run("good non-baseline metadata enables reclaim", func(t *testing.T) {
+		manager := &recordingServiceProfilingManager{
+			DummyServiceProfilingManager: &spd.DummyServiceProfilingManager{},
+			performanceLevel:             spd.PerformanceLevelGood,
+		}
+		p := newPolicy(t, nil, pod.NewPodNotFoundError(req.PodUid), manager)
+
+		got, err := p.podEnableReclaimForNumaBindingAllocation(ctx, req)
+		require.NoError(t, err)
+		require.True(t, got)
+		require.Equal(t, []metav1.ObjectMeta{originalPodMeta}, manager.observedPodMeta)
+		require.Zero(t, manager.baselineCalls)
+	})
+
+	t.Run("baseline error propagates", func(t *testing.T) {
+		storedPodMeta := metav1.ObjectMeta{
+			UID:               types.UID(req.PodUid),
+			CreationTimestamp: metav1.Now(),
+		}
+		manager := &recordingServiceProfilingManager{
+			DummyServiceProfilingManager: &spd.DummyServiceProfilingManager{},
+			performanceLevel:             spd.PerformanceLevelGood,
+			baselineErr:                  podFetcherErr,
+		}
+		p := newPolicy(t, &v1.Pod{ObjectMeta: storedPodMeta}, nil, manager)
+
+		got, err := p.podEnableReclaimForNumaBindingAllocation(ctx, req)
+		require.ErrorIs(t, err, podFetcherErr)
+		require.False(t, got)
+		require.Equal(t, []metav1.ObjectMeta{originalPodMeta, storedPodMeta}, manager.observedPodMeta)
+	})
+
+	t.Run("request metadata SPD error propagates", func(t *testing.T) {
+		manager := &recordingServiceProfilingManager{
+			DummyServiceProfilingManager: &spd.DummyServiceProfilingManager{},
+			performanceErr:               spdErr,
+		}
+		p := newPolicy(t, nil, nil, manager)
+
+		got, err := p.podEnableReclaimForNumaBindingAllocation(ctx, req)
+		require.ErrorIs(t, err, spdErr)
+		require.False(t, got)
+		require.Zero(t, manager.baselineCalls)
+	})
+
+	t.Run("good metadata uses full baseline decision", func(t *testing.T) {
+		storedPodMeta := metav1.ObjectMeta{
+			UID:               types.UID(req.PodUid),
+			CreationTimestamp: metav1.Now(),
+		}
+		manager := &recordingServiceProfilingManager{
+			DummyServiceProfilingManager: &spd.DummyServiceProfilingManager{},
+			performanceLevel:             spd.PerformanceLevelGood,
+			baseline:                     true,
+		}
+		p := newPolicy(t, &v1.Pod{ObjectMeta: storedPodMeta}, nil, manager)
+
+		got, err := p.podEnableReclaimForNumaBindingAllocation(ctx, req)
+		require.NoError(t, err)
+		require.False(t, got)
+		require.Equal(t, 1, manager.baselineCalls)
+		require.Equal(t, []metav1.ObjectMeta{originalPodMeta, storedPodMeta}, manager.observedPodMeta)
+	})
+
+	t.Run("baseline error propagates", func(t *testing.T) {
+		storedPodMeta := metav1.ObjectMeta{
+			UID:               types.UID(req.PodUid),
+			CreationTimestamp: metav1.Now(),
+		}
+		manager := &recordingServiceProfilingManager{
+			DummyServiceProfilingManager: &spd.DummyServiceProfilingManager{},
+			performanceLevel:             spd.PerformanceLevelGood,
+			baselineErr:                  baselineErr,
+		}
+		p := newPolicy(t, &v1.Pod{ObjectMeta: storedPodMeta}, nil, manager)
+
+		got, err := p.podEnableReclaimForNumaBindingAllocation(ctx, req)
+		require.ErrorIs(t, err, baselineErr)
+		require.False(t, got)
+		require.Equal(t, 1, manager.baselineCalls)
+	})
+
+	t.Run("context cancellation propagates", func(t *testing.T) {
+		manager := &recordingServiceProfilingManager{
+			DummyServiceProfilingManager: &spd.DummyServiceProfilingManager{},
+			performanceLevel:             spd.PerformanceLevelGood,
+		}
+		p := newPolicy(t, nil, nil, manager)
+		canceledCtx, cancel := context.WithCancel(ctx)
+		cancel()
+
+		got, err := p.podEnableReclaimForNumaBindingAllocation(canceledCtx, req)
+		require.ErrorIs(t, err, context.Canceled)
+		require.False(t, got)
+		require.Zero(t, manager.baselineCalls)
+	})
+
+	t.Run("non-exclusive preserves legacy fetch error fallback", func(t *testing.T) {
+		manager := &recordingServiceProfilingManager{
+			DummyServiceProfilingManager: &spd.DummyServiceProfilingManager{},
+		}
+		p := newPolicy(t, nil, podFetcherErr, manager)
+		nonExclusiveReq := *req
+		nonExclusiveReq.Annotations = map[string]string{
+			apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+		}
+
+		got, err := p.podEnableReclaimForNumaBindingAllocation(context.Background(), &nonExclusiveReq)
+		require.NoError(t, err)
+		require.False(t, got)
+		require.Empty(t, manager.observedPodMeta)
+	})
 }
 
 func TestDynamicPolicy_allocateNumaBindingCPUs_partitionEligibilityGate(t *testing.T) {
@@ -1473,7 +1662,82 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_exclusiveDisjointMultiNUMA(t *tes
 	require.True(t, result.Union(reclaim).Equals(machine.NewCPUSet(0, 1, 2, 3, 4, 6)))
 }
 
-func TestDynamicPolicy_allocateNumaBindingCPUs_preservesReserveOnPodLookupFailureAndIdentitylessFloor(t *testing.T) {
+func TestDynamicPolicy_allocateNumaBindingCPUs_nonReclaimableUsesConfiguredSteadyFloor(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(16, 1, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.reservedReclaimedCPUSet = machine.NewCPUSet(0, 4)
+	p.reservedReclaimedCPUsSize = 2
+	dynamicConf := p.dynamicConfig.GetDynamicConfiguration()
+	dynamicConf.EnableReclaim = true
+	dynamicConf.EnableRampUpReclaimHardPartition = true
+	dynamicConf.InitialRampUpReclaimCPUSetRatio = 0.5
+	dynamicConf.NumaMinReclaimedResourceForAllocate = v1.ResourceList{
+		v1.ResourceCPU: resource.MustParse("2"),
+	}
+	dynamicConf.DisableReclaimPinnedCPUSetResourcePackageSelector = "disable-reclaim=true"
+	p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
+
+	protected := coresInNUMA(topology, 1, 1, 2)
+	machineState := state.NUMANodeMap{
+		0: {DefaultCPUSet: topology.CPUDetails.CPUsInNUMANodes(0)},
+		1: {
+			DefaultCPUSet: topology.CPUDetails.CPUsInNUMANodes(1),
+			ResourcePackageStates: map[string]*state.ResourcePackageState{
+				"protected": {
+					Attributes:   map[string]string{"disable-reclaim": "true"},
+					PinnedCPUSet: protected,
+				},
+			},
+		},
+	}
+	p.state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &state.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+		AllocationResult: p.reservedReclaimedCPUSet.Union(protected),
+	}, false)
+	annotations := map[string]string{
+		apiconsts.PodAnnotationMemoryEnhancementNumaBinding:   apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+		apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
+	}
+
+	result, reclaim, err := p.allocateNumaBindingCPUs(
+		8, &pluginapi.TopologyHint{Nodes: []uint64{0}}, machineState, annotations, false)
+	require.NoError(t, err)
+	require.Equal(t, 6, result.Size(), "result=%s", result)
+	require.Equal(t, 2, reclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(0)).Size(), "reclaim=%s", reclaim)
+	require.Equal(t, 2, reclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(1)).Size(), "reclaim=%s", reclaim)
+	require.True(t, p.reservedReclaimedCPUSet.IsSubsetOf(reclaim), "reserve=%s reclaim=%s", p.reservedReclaimedCPUSet, reclaim)
+	require.True(t, reclaim.Intersection(protected).IsEmpty(), "protected=%s reclaim=%s", protected, reclaim)
+	requireCoreAligned(t, topology, reclaim)
+}
+
+func TestDynamicPolicy_deriveSteadyReclaimFloorRejectsIdentitiesAboveConfiguredTarget(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().NumaMinReclaimedResourceForAllocate = v1.ResourceList{
+		v1.ResourceCPU: resource.MustParse("2"),
+	}
+	p.reservedReclaimedCPUSet = machine.NewCPUSet(0, 1)
+	p.reservedReclaimedCPUsSize = p.reservedReclaimedCPUSet.Size()
+
+	got, err := p.deriveSteadyReclaimFloor(map[int]machine.CPUSet{
+		0: topology.CPUDetails.CPUsInNUMANodes(0),
+	})
+	require.ErrorContains(t, err, "mandatory reserve size 4 exceeds steady target 2")
+	require.True(t, got.IsEmpty(), "got=%s", got)
+}
+
+func TestDynamicPolicy_allocateNumaBindingCPUs_preservesMandatoryOnPodLookupFailure(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
@@ -1482,8 +1746,8 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_preservesReserveOnPodLookupFailur
 		ratio    float64
 		wantSize int
 	}{
-		{name: "pod lookup failure preserves reserve", reserved: machine.NewCPUSet(0, 1), ratio: 0, wantSize: 2},
-		{name: "identity-less checkpoint preserves legacy floor", reserved: machine.NewCPUSet(), ratio: 0.25, wantSize: 2},
+		{name: "pod lookup failure preserves reserve", reserved: machine.NewCPUSet(0, 4), ratio: 0, wantSize: 2},
+		{name: "identity-less checkpoint uses configured steady floor", reserved: machine.NewCPUSet(), ratio: 0.25, wantSize: 2},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
@@ -1507,8 +1771,7 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_preservesReserveOnPodLookupFailur
 				apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
 			}
 
-			podReclaimEnabled := p.podEnableReclaimOrFallback(context.Background(), "missing-pod", tc.name)
-			require.False(t, podReclaimEnabled)
+			podReclaimEnabled := false
 			result, reclaim, err := p.allocateNumaBindingCPUs(
 				8, &pluginapi.TopologyHint{Nodes: []uint64{0}}, machineState, annotations, podReclaimEnabled)
 			require.NoError(t, err)
@@ -1519,7 +1782,7 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_preservesReserveOnPodLookupFailur
 	}
 }
 
-func TestDynamicPolicy_selectNumaBindingReclaimPartitionPreservesHardFloor(t *testing.T) {
+func TestDynamicPolicy_selectNumaBindingReclaimPartitionPreservesSelectedFloor(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
@@ -1528,47 +1791,107 @@ func TestDynamicPolicy_selectNumaBindingReclaimPartitionPreservesHardFloor(t *te
 	require.NoError(t, err)
 	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
-	p.reservedReclaimedCPUSet = machine.NewCPUSet(0, 1)
-	p.reservedReclaimedCPUsSize = 2
+	p.reservedReclaimedCPUSet = coresInNUMA(topology, 0, 0, 1)
+	p.reservedReclaimedCPUsSize = p.reservedReclaimedCPUSet.Size()
 
-	derivedFloor := machine.NewCPUSet(0, 1, 2, 3)
+	derivedFloor := coresInNUMA(topology, 0, 0, 2)
 	dedicatedEligiblePerNUMA := map[int]machine.CPUSet{
-		0: machine.NewCPUSet(0, 1, 2, 3, 4, 5),
+		0: topology.CPUDetails.CPUsInNUMANodes(0),
 	}
 	reclaimEligiblePerNUMA := map[int]machine.CPUSet{
-		0: machine.NewCPUSet(0, 1, 2, 3),
+		0: derivedFloor,
 	}
 
+	got, err := p.selectNumaBindingReclaimPartition(
+		derivedFloor,
+		dedicatedEligiblePerNUMA,
+		reclaimEligiblePerNUMA,
+		[]uint64{0},
+		true,
+	)
+	require.NoError(t, err)
+	require.True(t, derivedFloor.Equals(got), "want=%s got=%s", derivedFloor.String(), got.String())
+}
+
+func TestDynamicPolicy_selectNumaBindingReclaimPartitionPreservesMandatoryIdentities(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+
+	derivedFloor := coresInNUMA(topology, 0, 0, 2)
 	for _, tc := range []struct {
-		name              string
-		podReclaimEnabled bool
-		want              machine.CPUSet
+		name         string
+		mandatory    machine.CPUSet
+		derivedFloor machine.CPUSet
+		wantSize     int
+		wantErr      string
 	}{
 		{
-			name:              "pod reclaim true keeps optional ratio floor",
-			podReclaimEnabled: true,
-			want:              machine.NewCPUSet(0, 1, 2, 3),
+			name:         "supplements mandatory to selected floor",
+			mandatory:    coresInNUMA(topology, 0, 3, 4),
+			derivedFloor: derivedFloor,
+			wantSize:     derivedFloor.Size(),
 		},
 		{
-			name:              "pod reclaim false keeps complete hard floor",
-			podReclaimEnabled: false,
-			want:              machine.NewCPUSet(0, 1, 2, 3),
+			name:         "mandatory identities exceed selected floor",
+			mandatory:    coresInNUMA(topology, 0, 2, 4),
+			derivedFloor: coresInNUMA(topology, 0, 0, 1),
+			wantErr:      "mandatory reclaim CPUs exceed selected floor",
 		},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			p.reservedReclaimedCPUSet = tc.mandatory
+			p.reservedReclaimedCPUsSize = tc.mandatory.Size()
 			got, err := p.selectNumaBindingReclaimPartition(
-				derivedFloor,
-				dedicatedEligiblePerNUMA,
-				reclaimEligiblePerNUMA,
+				tc.derivedFloor,
+				map[int]machine.CPUSet{
+					0: topology.CPUDetails.CPUsInNUMANodes(0),
+				},
+				map[int]machine.CPUSet{
+					0: tc.derivedFloor.Union(tc.mandatory),
+				},
 				[]uint64{0},
-				tc.podReclaimEnabled,
 				true,
 			)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				require.True(t, got.IsEmpty(), "got=%s", got)
+				return
+			}
 			require.NoError(t, err)
-			require.True(t, tc.want.Equals(got), "want=%s got=%s", tc.want.String(), got.String())
+			require.True(t, tc.mandatory.IsSubsetOf(got), "mandatory=%s got=%s", tc.mandatory, got)
+			require.Equal(t, tc.wantSize, got.Size(), "got=%s", got)
 		})
 	}
+}
+
+func TestDynamicPolicy_selectNumaBindingReclaimPartitionRejectsIneligibleMandatoryIdentity(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.reservedReclaimedCPUSet = machine.NewCPUSet(7)
+	p.reservedReclaimedCPUsSize = 1
+
+	got, err := p.selectNumaBindingReclaimPartition(
+		machine.NewCPUSet(0, 1),
+		map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1, 2, 3)},
+		map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1, 2, 3)},
+		[]uint64{0},
+		true,
+	)
+	require.ErrorContains(t, err, "not a subset of reclaim eligibility")
+	require.True(t, got.IsEmpty(), "got=%s", got)
 }
 
 // TestDynamicPolicy_generateNUMABindingPoolsCPUSetInPlace verifies the logic of generating CPU sets for NUMA-binding pools.
@@ -2529,7 +2852,7 @@ func TestAdjustAllocationEntriesWithRampUpFloorKeepsCanonicalSNBCapacityErrorLow
 		Hint: &pluginapi.TopologyHint{Nodes: []uint64{0}},
 	}
 
-	_, err = p.dedicatedCoresWithNUMABindingAllocationHandler(context.Background(), req, false)
+	_, err = p.dedicatedCoresWithNUMABindingAllocationHandler(withAllocationPodMeta(context.Background(), req), req, false)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "adjustallocationentries failed with error: adjustpoolsandisolatedentries failed with error: insufficient capacity")
 	require.Equal(t, strings.ToLower(err.Error()), err.Error())
@@ -2695,6 +3018,60 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorUsesImmutablePerNUMACapacity(t *te
 	require.NoError(t, err)
 	require.Equal(t, 6, floor.Intersection(numa0).Size())
 	require.Equal(t, 6, floor.Intersection(numa1).Size())
+}
+
+func TestDynamicPolicyDeriveRampUpReclaimFloorSkipsSteadyExclusiveNUMA(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(64, 2, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.reservedReclaimedCPUSet = machine.NewCPUSet()
+	p.reservedReclaimedCPUsSize = 0
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.2
+	p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
+
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0).ToSliceInt()
+	numa1 := topology.CPUDetails.CPUsInNUMANodes(1)
+	// NUMA 0 is fully owned by a committed steady (RampUp=false) non-reclaim
+	// exclusive DNB pod: 30 dedicated CPUs leave only a 2-CPU steady reclaim
+	// floor eligible, which is smaller than the ratio-derived immutable target
+	// of 6. A later ramp-up workload on NUMA 1 must not re-impose that target on
+	// NUMA 0, otherwise admission fails closed.
+	steadyReclaimNUMA0 := machine.NewCPUSet(numa0[:2]...)
+	dedicatedNUMA0 := machine.NewCPUSet(numa0[2:]...)
+	p.state.SetMachineState(state.NUMANodeMap{
+		0: {DefaultCPUSet: steadyReclaimNUMA0},
+		1: {DefaultCPUSet: numa1},
+	}, false)
+	candidate := state.PodEntries{
+		"steady-exclusive-dnb": state.ContainerEntries{
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "steady-exclusive-dnb",
+					ContainerName: "main",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+					Annotations: map[string]string{
+						apiconsts.PodAnnotationMemoryEnhancementNumaBinding:   apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+						apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
+					},
+				},
+				RampUp:                   false,
+				AllocationResult:         dedicatedNUMA0,
+				TopologyAwareAssignments: map[int]machine.CPUSet{0: dedicatedNUMA0},
+			},
+		},
+	}
+
+	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), candidate, true)
+	require.NoError(t, err)
+	require.Equal(t, 0, floor.Intersection(topology.CPUDetails.CPUsInNUMANodes(0)).Size(),
+		"steady exclusive NUMA must not receive a ramp-up immutable target, floor=%s", floor)
+	require.Equal(t, 6, floor.Intersection(numa1).Size(), "floor=%s", floor)
 }
 
 func TestDynamicPolicyDeriveRampUpReclaimFloorPreservesLegacyOverlapAlgorithm(t *testing.T) {
@@ -2931,7 +3308,7 @@ func TestDedicatedNUMAExclusiveRampUpCommitsAllocationAndReclaimAtomically(t *te
 		ObjectMeta: metav1.ObjectMeta{UID: types.UID(req.PodUid), Namespace: req.PodNamespace, Name: req.PodName},
 	}}}
 
-	resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(context.Background(), req, true)
+	resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(withAllocationPodMeta(context.Background(), req), req, true)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	require.Equal(t, 1, tracked.commitCalls)
@@ -2948,6 +3325,100 @@ func TestDedicatedNUMAExclusiveRampUpCommitsAllocationAndReclaimAtomically(t *te
 		"allocation=%s reclaim=%s", allocation.AllocationResult, reclaim.AllocationResult)
 	require.True(t, allocation.AllocationResult.Union(reclaim.AllocationResult).Equals(available),
 		"allocation=%s reclaim=%s available=%s", allocation.AllocationResult, reclaim.AllocationResult, available)
+}
+
+func TestDedicatedNUMAExclusiveNonReclaimableStartsSteady(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(32, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.reservedReclaimedCPUSet = machine.NewCPUSet(0)
+	p.reservedReclaimedCPUsSize = 1
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.2
+	p.dynamicConfig.GetDynamicConfiguration().NumaMinReclaimedResourceForAllocate = v1.ResourceList{
+		v1.ResourceCPU: resource.MustParse("2"),
+	}
+	p.dynamicConfig.GetDynamicConfiguration().AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.Enable = true
+	p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
+	p.state.SetMachineState(state.NUMANodeMap{
+		0: {DefaultCPUSet: cpuTopology.CPUDetails.CPUs()},
+	}, false)
+	p.metaServer.ServiceProfilingManager = &recordingServiceProfilingManager{
+		DummyServiceProfilingManager: &spd.DummyServiceProfilingManager{},
+		performanceLevel:             spd.PerformanceLevelPoor,
+	}
+
+	req := &pluginapi.ResourceRequest{
+		PodUid:         "exclusive-dnb-steady",
+		PodNamespace:   "default",
+		PodName:        "exclusive-dnb-steady",
+		ContainerName:  "main",
+		ContainerType:  pluginapi.ContainerType_MAIN,
+		ContainerIndex: 0,
+		ResourceName:   string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{
+			string(v1.ResourceCPU): 30,
+		},
+		Labels: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+		},
+		Annotations: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey:                    apiconsts.PodAnnotationQoSLevelDedicatedCores,
+			apiconsts.PodAnnotationMemoryEnhancementNumaBinding:   apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
+		},
+		Hint: &pluginapi.TopologyHint{Nodes: []uint64{0}},
+	}
+	candidateSeen := false
+	p.allocationHooks = append(p.allocationHooks, func(_, allocation *state.AllocationInfo) error {
+		if allocation.PodUid == req.PodUid && allocation.ContainerName == req.ContainerName {
+			candidateSeen = true
+			require.False(t, allocation.RampUp,
+				"non-reclaimable exclusive DNB must enter precommit in steady state")
+		}
+		return nil
+	})
+
+	resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(withAllocationPodMeta(context.Background(), req), req, false)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.True(t, candidateSeen, "allocation hook did not observe the precommit candidate")
+
+	allocation := p.state.GetAllocationInfo(req.PodUid, req.ContainerName)
+	require.NotNil(t, allocation)
+	require.False(t, allocation.RampUp)
+	require.Equal(t, 30, allocation.AllocationResult.Size())
+	reclaim := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	require.NotNil(t, reclaim)
+	require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(0, 16)),
+		"reclaim=%s", reclaim.AllocationResult)
+}
+
+func TestShouldNumaBindingAllocationRampUpUsesPartitionSnapshot(t *testing.T) {
+	t.Parallel()
+
+	hardPartition := &numaBindingPartitionEligibilitySnapshot{}
+	for _, tc := range []struct {
+		name              string
+		podReclaimEnabled bool
+		eligibility       *numaBindingPartitionEligibilitySnapshot
+		want              bool
+	}{
+		{name: "reclaimable legacy allocation ramps up", podReclaimEnabled: true, want: true},
+		{name: "reclaimable hard partition ramps up", podReclaimEnabled: true, eligibility: hardPartition, want: true},
+		{name: "non-reclaimable legacy allocation ramps up", want: true},
+		{name: "non-reclaimable hard partition starts steady", eligibility: hardPartition, want: false},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, shouldNumaBindingAllocationRampUp(tc.podReclaimEnabled, tc.eligibility))
+		})
+	}
 }
 
 func TestDedicatedNUMAExclusivePackResponseFailureKeepsAllStateUnchanged(t *testing.T) {
@@ -2970,7 +3441,7 @@ func TestDedicatedNUMAExclusivePackResponseFailureKeepsAllStateUnchanged(t *test
 		packAllocationResponse = originalPack
 	}()
 
-	resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(context.Background(), req, true)
+	resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(withAllocationPodMeta(context.Background(), req), req, true)
 	require.Nil(t, resp)
 	require.ErrorContains(t, err, "injected pack allocation response failure")
 	require.Equal(t, beforeEntries, p.state.GetPodEntries())
@@ -2999,7 +3470,7 @@ func TestDedicatedNUMAExclusiveAccompanyFailureKeepsAllStateUnchanged(t *testing
 		AccompanyResourceRegistry = originalRegistry
 	}()
 
-	resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(context.Background(), req, true)
+	resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(withAllocationPodMeta(context.Background(), req), req, true)
 	require.Nil(t, resp)
 	require.ErrorContains(t, err, "injected accompany allocation failure")
 	require.Equal(t, beforeEntries, p.state.GetPodEntries())
@@ -3324,7 +3795,7 @@ func TestDedicatedNUMAExclusiveRampUpCommitFailureKeepsPreviousState(t *testing.
 		ObjectMeta: metav1.ObjectMeta{UID: types.UID(req.PodUid), Namespace: req.PodNamespace, Name: req.PodName},
 	}}}
 
-	resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(context.Background(), req, true)
+	resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(withAllocationPodMeta(context.Background(), req), req, true)
 	require.Nil(t, resp)
 	require.ErrorContains(t, err, "injected atomic commit failure")
 	require.Equal(t, 1, tracked.commitCalls)
@@ -3366,7 +3837,7 @@ func TestDedicatedNUMAExclusiveRampUpKeepsMinimumReclaimFloor(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{UID: types.UID(req.PodUid), Namespace: req.PodNamespace, Name: req.PodName},
 	}}}
 
-	resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(context.Background(), req, true)
+	resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(withAllocationPodMeta(context.Background(), req), req, true)
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	reclaimInfo := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
@@ -3383,8 +3854,8 @@ func TestDedicatedNUMAExclusiveRampUpValidatesPartitionEligibleCoverage(t *testi
 		p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 		require.NoError(t, err)
 		p.reservedCPUs = machine.NewCPUSet()
-		p.reservedReclaimedCPUSet = machine.NewCPUSet(2)
-		p.reservedReclaimedCPUsSize = 1
+		p.reservedReclaimedCPUSet = coresInNUMA(cpuTopology, 0, 2, 3)
+		p.reservedReclaimedCPUsSize = p.reservedReclaimedCPUSet.Size()
 		p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 		p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
 		p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0
@@ -3395,11 +3866,11 @@ func TestDedicatedNUMAExclusiveRampUpValidatesPartitionEligibleCoverage(t *testi
 				DefaultCPUSet: cpuTopology.CPUDetails.CPUsInNUMANodes(0),
 				ResourcePackageStates: map[string]*state.ResourcePackageState{
 					"work": {
-						PinnedCPUSet: machine.NewCPUSet(0, 1),
+						PinnedCPUSet: coresInNUMA(cpuTopology, 0, 0, 1),
 					},
 					"protected": {
 						Attributes:   map[string]string{"disable-reclaim": "true"},
-						PinnedCPUSet: machine.NewCPUSet(7),
+						PinnedCPUSet: coresInNUMA(cpuTopology, 0, 3, 4),
 					},
 				},
 			},
@@ -3430,7 +3901,7 @@ func TestDedicatedNUMAExclusiveRampUpValidatesPartitionEligibleCoverage(t *testi
 	t.Run("disable-reclaim pinned CPU outside dedicated and reclaim eligibility is legal", func(t *testing.T) {
 		p, req := newFixture(t)
 
-		resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(context.Background(), req, true)
+		resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(withAllocationPodMeta(context.Background(), req), req, true)
 		require.NoError(t, err)
 		require.NotNil(t, resp)
 
@@ -3438,9 +3909,12 @@ func TestDedicatedNUMAExclusiveRampUpValidatesPartitionEligibleCoverage(t *testi
 		reclaim := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
 		require.NotNil(t, allocation)
 		require.NotNil(t, reclaim)
-		require.True(t, allocation.AllocationResult.Union(reclaim.AllocationResult).Equals(machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6)))
-		require.False(t, allocation.AllocationResult.Contains(7))
-		require.False(t, reclaim.AllocationResult.Contains(7))
+		protected := coresInNUMA(p.machineInfo.CPUTopology, 0, 3, 4)
+		admissionFloor := coresInNUMA(p.machineInfo.CPUTopology, 0, 1, 3)
+		require.True(t, allocation.AllocationResult.Union(admissionFloor).
+			Equals(p.machineInfo.CPUDetails.CPUs().Difference(protected)))
+		require.True(t, allocation.AllocationResult.Intersection(protected).IsEmpty())
+		require.True(t, admissionFloor.IsSubsetOf(reclaim.AllocationResult))
 	})
 
 	t.Run("incorrect dedicated and reclaim union is rejected", func(t *testing.T) {
@@ -3450,10 +3924,10 @@ func TestDedicatedNUMAExclusiveRampUpValidatesPartitionEligibleCoverage(t *testi
 				PodUid:        commonstate.PoolNameInterrupt,
 				ContainerName: commonstate.FakedContainerName,
 			},
-			AllocationResult: machine.NewCPUSet(1),
+			AllocationResult: coresInNUMA(p.machineInfo.CPUTopology, 0, 0, 1),
 		}, false)
 
-		resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(context.Background(), req, true)
+		resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(withAllocationPodMeta(context.Background(), req), req, true)
 		require.Nil(t, resp)
 		require.ErrorContains(t, err, "do not cover NUMA 0")
 		require.Nil(t, p.state.GetAllocationInfo(req.PodUid, req.ContainerName))

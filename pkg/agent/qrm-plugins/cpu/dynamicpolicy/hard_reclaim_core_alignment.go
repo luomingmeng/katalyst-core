@@ -105,6 +105,26 @@ func takeCoreAlignedCPUSet(
 	return selected
 }
 
+func completeCoresForCPUSet(topology *machine.CPUTopology, cpus machine.CPUSet) (machine.CPUSet, error) {
+	if topology == nil {
+		return machine.NewCPUSet(), fmt.Errorf("cannot complete cores with nil cpu topology")
+	}
+	coreIDs := make([]int, 0, cpus.Size())
+	seen := make(map[int]struct{}, cpus.Size())
+	for _, cpu := range cpus.ToSliceInt() {
+		info, ok := topology.CPUDetails[cpu]
+		if !ok {
+			return machine.NewCPUSet(), fmt.Errorf("cpu %d has no topology metadata", cpu)
+		}
+		if _, ok := seen[info.CoreID]; ok {
+			continue
+		}
+		seen[info.CoreID] = struct{}{}
+		coreIDs = append(coreIDs, info.CoreID)
+	}
+	return topology.CPUDetails.CPUsInCores(coreIDs...), nil
+}
+
 // assertCoreAligned is a fail-loud safety net: it returns a lowercase error when
 // reclaim holds a partial physical core (a CoreID whose sibling count differs
 // from CPUsPerCore()). It never repairs silently; a violation signals an upstream

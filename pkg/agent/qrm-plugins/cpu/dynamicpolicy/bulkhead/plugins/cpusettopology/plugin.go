@@ -1315,7 +1315,7 @@ func (r *expectedCPUSetBuildResult) PendingCPUSetUnion() machine.CPUSet {
 // isContainerAbsentErr reports whether the pod or container has no active
 // runtime leaf during the normal admission creation or restart window.
 func isContainerAbsentErr(err error) bool {
-	return errors.Is(err, metapod.ErrPodNotFound) ||
+	return metapod.IsPodNotFound(err) ||
 		errors.Is(err, metapod.ErrContainerNotFound) ||
 		errors.Is(err, bulkheadutils.ErrContainerNotRunning)
 }

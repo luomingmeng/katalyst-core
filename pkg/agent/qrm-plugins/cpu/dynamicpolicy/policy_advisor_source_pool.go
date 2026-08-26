@@ -383,8 +383,13 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhase(
 	ordinalByStableKey := make(map[string]int, len(descriptors))
 	expandHardReclaimPhase := preserveClass && hardActive
 	if expandHardReclaimPhase {
+		// NUMAs owned by a committed steady exclusive DNB keep only their finalized
+		// reserve once ramp-up ends; the planner must skip them so its per-NUMA
+		// minimum and cross-NUMA imbalance guards do not re-impose the ratio-derived
+		// target and reject every other ramp-up QoS on the node.
+		skipNUMAs := p.state.GetPodEntries().SteadyExclusiveNUMAs(p.machineInfo.CPUTopology)
 		expanded, expandedBlockIDs, err := expandHardPartitionReclaimPhase(
-			descriptors, available, p.machineInfo.CPUTopology)
+			descriptors, available, p.machineInfo.CPUTopology, skipNUMAs)
 		if err != nil {
 			return available, fmt.Errorf("expand hard reclaim phase: %w", err)
 		}

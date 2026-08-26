@@ -27,7 +27,6 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
-	qosutil "github.com/kubewharf/katalyst-core/pkg/util/qos"
 	resourcepackage "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 )
 
@@ -221,7 +220,7 @@ func (c *CPUAdvisorValidator) validateEntries(resp *advisorapi.ListAndWatchRespo
 					(!resp.DisableDedicatedCoresOverlapReclaimedCores ||
 						!allocationInfo.CheckDedicatedNUMABinding() ||
 						(calculationQuantity > allocationQuantity &&
-							!qosutil.AnnotationsIndicateNUMAExclusive(allocationInfo.Annotations))) {
+							!allocationInfo.CheckDedicatedNUMABindingNUMAExclusive())) {
 					return fmt.Errorf("pod: %s container: %s calculation result: %d and allocation result: %d mismatch",
 						podUID, containerName, calculationQuantity, allocationQuantity)
 				}

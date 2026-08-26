@@ -19,6 +19,8 @@ package utils
 import (
 	"fmt"
 
+	"k8s.io/apimachinery/pkg/util/sets"
+
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	cpustate "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
@@ -236,8 +238,14 @@ func BuildValidatedCPUSetPartitionView(state cpustate.ReadonlyState, topology *m
 		return nil, err
 	}
 	if opts.HardPartitionEnabled {
+		// NUMAs owned by a committed steady exclusive DNB keep only their
+		// finalized reserve once ramp-up ends, regardless of reclaimability; the
+		// precommit validator must skip them via the shared state helper,
+		// otherwise it rejects every other ramp-up QoS.
+		skipNUMAs := state.GetPodEntries().SteadyExclusiveNUMAs(topology)
 		if err := validateHardPartitionReclaimPerNUMA(
-			view.ReclaimEffectivePerNUMA, opts.HardPartitionReclaimTargetPerNUMA, topology); err != nil {
+			view.ReclaimEffectivePerNUMA, opts.HardPartitionReclaimTargetPerNUMA,
+			skipNUMAs, topology); err != nil {
 			return nil, err
 		}
 	}
@@ -247,6 +255,7 @@ func BuildValidatedCPUSetPartitionView(state cpustate.ReadonlyState, topology *m
 func validateHardPartitionReclaimPerNUMA(
 	reclaimPerNUMA map[int]machine.CPUSet,
 	targetPerNUMA map[int]int,
+	skipNUMAs sets.Int,
 	topology *machine.CPUTopology,
 ) error {
 	if topology == nil {
@@ -254,6 +263,9 @@ func validateHardPartitionReclaimPerNUMA(
 	}
 
 	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
+		if skipNUMAs.Has(numaID) {
+			continue
+		}
 		target, ok := targetPerNUMA[numaID]
 		if !ok {
 			return fmt.Errorf("bulkhead hard-partition reclaim target missing for NUMA %d", numaID)

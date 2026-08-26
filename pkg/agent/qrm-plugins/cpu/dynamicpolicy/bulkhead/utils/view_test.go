@@ -773,6 +773,66 @@ func TestBuildValidatedCPUSetPartitionViewHardPartitionPreservesLegalReclaim(t *
 	}
 }
 
+func TestBuildValidatedCPUSetPartitionViewSkipsSteadyExclusiveNUMA(t *testing.T) {
+	t.Parallel()
+
+	const perNUMA = 32
+	topology := testTwoNUMATopologyN(perNUMA)
+
+	// NUMA0 is wholly owned by a committed steady (RampUp=false) non-reclaim
+	// exclusive DNB: 30 dedicated CPUs leave only a 2-CPU steady reclaim reserve
+	// ({0,1}). NUMA1 carries the ratio-derived ramp-up reclaim (6 CPUs). The
+	// per-NUMA hard-partition target is 6 for both NUMAs; without the carve-out
+	// NUMA0 fails admission closed (2 < 6) for every other ramp-up QoS.
+	dedicatedNUMA0 := make([]int, 0, perNUMA-2)
+	for cpu := 2; cpu < perNUMA; cpu++ {
+		dedicatedNUMA0 = append(dedicatedNUMA0, cpu)
+	}
+	reclaimCPUs := []int{0, 1}
+	for cpu := perNUMA; cpu < perNUMA+6; cpu++ {
+		reclaimCPUs = append(reclaimCPUs, cpu)
+	}
+
+	state := cpustate.NewCPUPluginState(nil)
+	state.SetAllowSharedCoresOverlapReclaimedCores(false)
+	state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+		AllocationResult: machine.NewCPUSet(reclaimCPUs...),
+	})
+	state.SetAllocationInfo("steady-exclusive-dnb", "main", &cpustate.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        "steady-exclusive-dnb",
+			ContainerName: "main",
+			OwnerPoolName: commonstate.PoolNameDedicated,
+			QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+			Annotations: map[string]string{
+				apiconsts.PodAnnotationMemoryEnhancementNumaBinding:   apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+				apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
+			},
+		},
+		RampUp:                   false,
+		AllocationResult:         machine.NewCPUSet(dedicatedNUMA0...),
+		TopologyAwareAssignments: map[int]machine.CPUSet{0: machine.NewCPUSet(dedicatedNUMA0...)},
+	})
+
+	view, err := BuildValidatedCPUSetPartitionView(state, topology, CPUSetPartitionViewOptions{
+		HardPartitionEnabled:              true,
+		HardPartitionReclaimTargetPerNUMA: map[int]int{0: 6, 1: 6},
+	})
+	if err != nil {
+		t.Fatalf("BuildValidatedCPUSetPartitionView() error = %v, want steady exclusive NUMA0 skipped", err)
+	}
+	if view == nil {
+		t.Fatal("BuildValidatedCPUSetPartitionView() returned nil view")
+	}
+	if got := view.ReclaimEffectivePerNUMA[0].Size(); got != 2 {
+		t.Fatalf("steady exclusive NUMA0 reclaim effective = %d, want unchanged 2", got)
+	}
+	if got := view.ReclaimEffectivePerNUMA[1].Size(); got != 6 {
+		t.Fatalf("ramp-up NUMA1 reclaim effective = %d, want 6", got)
+	}
+}
+
 func testTwoNUMATopologyN(perNUMA int) *machine.CPUTopology {
 	details := machine.CPUDetails{}
 	for cpu := 0; cpu < perNUMA; cpu++ {
