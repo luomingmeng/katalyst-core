@@ -469,6 +469,41 @@ func TestCPUSetMemsPluginSkipsMissingRel(t *testing.T) {
 	}
 }
 
+func TestCPUSetMemsPluginReconcilesWhenRelAppearsWithoutAppliedView(t *testing.T) {
+	t.Parallel()
+
+	cg := &fakeCgroupClient{
+		version:  cgroupclient.CgroupVersionV1,
+		existing: map[string]bool{},
+	}
+	p := &CPUSetMemsPlugin{cfg: testBulkheadConfig(), cgroup: cg}
+	effectiveEnabled := true
+	in := periodicalCtx(true)
+	in.EffectiveEnabled = &effectiveEnabled
+
+	if err := p.PeriodicalHandler(context.Background(), in); err != nil {
+		t.Fatalf("first PeriodicalHandler: %v", err)
+	}
+	if cg.applyCallCount != 0 {
+		t.Fatalf("missing rel apply calls = %d, want 0", cg.applyCallCount)
+	}
+
+	cg.existing["reclaim/reclaim-0"] = true
+	cg.existing["reclaim/reclaim-1"] = true
+	if err := p.PeriodicalHandler(context.Background(), in); err != nil {
+		t.Fatalf("second PeriodicalHandler: %v", err)
+	}
+
+	for rel, wantMems := range map[string]string{
+		"reclaim/reclaim-0": "0",
+		"reclaim/reclaim-1": "1",
+	} {
+		if got := cg.cpusetWrites[rel].Mems; got != wantMems {
+			t.Fatalf("%s cpuset.mems = %q, want %q", rel, got, wantMems)
+		}
+	}
+}
+
 func TestCPUSetMemsPluginRequiresTopology(t *testing.T) {
 	t.Parallel()
 
