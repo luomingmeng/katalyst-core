@@ -142,6 +142,63 @@ func TestGetAdvices_ScalesConsumerLimitsByConfiguredPercentage(t *testing.T) {
 	require.Equal(t, int64(256), memoryLimitAdvice(t, got, "/group-b-1"))
 }
 
+func TestGetAdvices_UsesCgroupUsageAsLimitFloor(t *testing.T) {
+	t.Parallel()
+
+	machineInfo := &machine.KatalystMachineInfo{
+		CPUTopology: &machine.CPUTopology{
+			CPUDetails: machine.CPUDetails{
+				0: machine.CPUTopoInfo{NUMANodeID: 0},
+			},
+		},
+	}
+	require.NoError(t, reclaim.RegisterNamedGenericConsumer("usage-floor-a", newGuardConf("/usage-floor-a"), machineInfo))
+	require.NoError(t, reclaim.RegisterNamedGenericConsumer("usage-floor-b", newGuardConf("/usage-floor-b"), machineInfo))
+	t.Cleanup(func() {
+		reclaim.UnregisterConsumer("usage-floor-a")
+		reclaim.UnregisterConsumer("usage-floor-b")
+	})
+
+	dynamicConf := dynamicconfig.NewConfiguration()
+	dynamicConf.ReclaimedPercentageByConsumer = map[string]int{
+		"usage-floor-a": 0,
+		"usage-floor-b": 100,
+	}
+	conf := config.NewConfiguration()
+	conf.SetDynamicConfiguration(dynamicConf)
+
+	now := time.Now()
+	fakeFetcher := agentmetric.NewFakeMetricsFetcher(metrics.DummyMetrics{}).(*agentmetric.FakeMetricsFetcher)
+	fakeFetcher.SetCgroupMetric("/usage-floor-a", consts.MetricMemUsageCgroup, metric.MetricData{Value: 128, Time: &now})
+	fakeFetcher.SetCgroupMetric("/usage-floor-a-0", consts.MetricMemUsageCgroup, metric.MetricData{Value: 64, Time: &now})
+
+	mg := &memoryGuard{
+		metaServer: &metaserver.MetaServer{
+			MetaAgent: &agent.MetaAgent{
+				MetricsFetcher: fakeFetcher,
+			},
+		},
+		reclaimRelativeRootCgroupPaths: []string{"/usage-floor-a", "/usage-floor-b"},
+		numaBindingRelativeRootCgroupPaths: map[int][]string{
+			0: {"/usage-floor-a-0", "/usage-floor-b-0"},
+		},
+		reclaimMemoryLimit:            atomic.NewInt64(1024),
+		numaBindingReclaimMemoryLimit: &atomic.Value{},
+		reconcileStatus:               atomic.NewString(reconcileStatusSucceeded),
+		conf:                          conf,
+	}
+	mg.numaBindingReclaimMemoryLimit.Store(map[int]int64{
+		0: 512,
+	})
+
+	got := mg.GetAdvices()
+
+	require.Equal(t, int64(128), memoryLimitAdvice(t, got, "/usage-floor-a"))
+	require.Equal(t, int64(896), memoryLimitAdvice(t, got, "/usage-floor-b"))
+	require.Equal(t, int64(64), memoryLimitAdvice(t, got, "/usage-floor-a-0"))
+	require.Equal(t, int64(448), memoryLimitAdvice(t, got, "/usage-floor-b-0"))
+}
+
 func newGuardConf(cgroupPath string) *config.Configuration {
 	c := config.NewConfiguration()
 	c.BaseConfiguration.ReclaimRelativeRootCgroupPath = cgroupPath
