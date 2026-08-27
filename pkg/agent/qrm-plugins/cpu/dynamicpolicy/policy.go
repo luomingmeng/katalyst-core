@@ -641,6 +641,7 @@ func (p *DynamicPolicy) Start() (err error) {
 
 	go wait.Until(func() {
 		_ = p.emitter.StoreInt64(util.MetricNameHeartBeat, 1, metrics.MetricTypeNameRaw)
+		p.emitRuntimeConfigMetrics()
 	}, time.Second*30, p.stopCh)
 
 	err = periodicalhandler.RegisterPeriodicalHandlerWithHealthz(cpuconsts.ClearResidualState, general.HealthzCheckStateNotReady,
@@ -804,6 +805,14 @@ func (p *DynamicPolicy) Start() (err error) {
 	}
 
 	return nil
+}
+
+func (p *DynamicPolicy) emitRuntimeConfigMetrics() {
+	reclaimEnabled := int64(0)
+	if p.isReclaimEnabled() {
+		reclaimEnabled = 1
+	}
+	_ = p.emitter.StoreInt64(util.MetricNameReclaimEnabled, reclaimEnabled, metrics.MetricTypeNameRaw)
 }
 
 func (p *DynamicPolicy) Stop() error {
