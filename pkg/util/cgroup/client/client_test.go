@@ -34,7 +34,7 @@ func TestNewCgroupClient_ReturnsCachedClient(t *testing.T) {
 		t.Fatalf("NewCgroupClient() = nil")
 	}
 	switch c.(type) {
-	case *cachedCgroupClient, *identityBoundCachedCgroupClient:
+	case *cachedCgroupClient, *identityBoundCachedCgroupClient, *identityAndControllerCachedCgroupClient:
 	default:
 		t.Fatalf("NewCgroupClient() type = %T, want a cached cgroup client", c)
 	}

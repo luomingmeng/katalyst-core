@@ -69,6 +69,26 @@ func (FakeCgroupClient) AttachPID(context.Context, string, int) error {
 	return nil
 }
 
+func (FakeCgroupClient) ControllerMount(context.Context, string) (cgcommon.ControllerMount, error) {
+	return cgcommon.ControllerMount{Unified: true}, nil
+}
+
+func (FakeCgroupClient) EnsureControllerDir(context.Context, string, string) error {
+	return nil
+}
+
+func (FakeCgroupClient) ReadControllerFile(context.Context, string, string, string) ([]byte, error) {
+	return nil, nil
+}
+
+func (FakeCgroupClient) AttachPIDToController(context.Context, string, string, int) error {
+	return nil
+}
+
+func (FakeCgroupClient) AttachTIDToController(context.Context, string, string, int) error {
+	return nil
+}
+
 func (FakeCgroupClient) Version(context.Context) CgroupVersion {
 	return CgroupVersionV2
 }

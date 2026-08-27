@@ -95,6 +95,16 @@ type IdentityBoundPIDAttacher interface {
 	AttachPIDWithIdentity(ctx context.Context, rel string, identity CgroupIdentity, pid int) error
 }
 
+// ControllerPIDAttacher is an optional capability for controller-local cgroup
+// discovery, reads, directory creation, and PID/TID attachment.
+type ControllerPIDAttacher interface {
+	ControllerMount(ctx context.Context, subsys string) (cgcommon.ControllerMount, error)
+	EnsureControllerDir(ctx context.Context, subsys, rel string) error
+	ReadControllerFile(ctx context.Context, subsys, rel, file string) ([]byte, error)
+	AttachPIDToController(ctx context.Context, subsys, rel string, pid int) error
+	AttachTIDToController(ctx context.Context, subsys, rel string, tid int) error
+}
+
 type coreCgroupClient struct{}
 
 const slowAttachPIDThreshold = 200 * time.Millisecond

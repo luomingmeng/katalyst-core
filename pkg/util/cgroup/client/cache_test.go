@@ -118,10 +118,44 @@ type identityAttachFake struct {
 	gotPID      int
 }
 
+type controllerAttachFake struct {
+	*countingFake
+	gotSubsys string
+	gotRel    string
+	gotPID    int
+	gotTID    int
+}
+
 func (f *identityAttachFake) AttachPIDWithIdentity(_ context.Context, rel string, identity CgroupIdentity, pid int) error {
 	f.gotRel = rel
 	f.gotIdentity = identity
 	f.gotPID = pid
+	return nil
+}
+
+func (f *controllerAttachFake) ControllerMount(context.Context, string) (cgcommon.ControllerMount, error) {
+	return cgcommon.ControllerMount{Root: "/controller"}, nil
+}
+
+func (f *controllerAttachFake) EnsureControllerDir(context.Context, string, string) error {
+	return nil
+}
+
+func (f *controllerAttachFake) ReadControllerFile(context.Context, string, string, string) ([]byte, error) {
+	return nil, nil
+}
+
+func (f *controllerAttachFake) AttachPIDToController(_ context.Context, subsys, rel string, pid int) error {
+	f.gotSubsys = subsys
+	f.gotRel = rel
+	f.gotPID = pid
+	return nil
+}
+
+func (f *controllerAttachFake) AttachTIDToController(_ context.Context, subsys, rel string, tid int) error {
+	f.gotSubsys = subsys
+	f.gotRel = rel
+	f.gotTID = tid
 	return nil
 }
 
@@ -150,6 +184,29 @@ func TestCachedCgroupClientForwardsIdentityBoundAttach(t *testing.T) {
 	}
 	if inner.gotRel != "system" || inner.gotIdentity != wantIdentity || inner.gotPID != 123 {
 		t.Fatalf("forwarded attach = rel=%q identity=%+v pid=%d", inner.gotRel, inner.gotIdentity, inner.gotPID)
+	}
+}
+
+func TestCachedCgroupClientForwardsControllerAttach(t *testing.T) {
+	t.Parallel()
+
+	inner := &controllerAttachFake{countingFake: newCountingFake()}
+	cached := NewCachedCgroupClient(inner)
+	attacher, ok := cached.(ControllerPIDAttacher)
+	if !ok {
+		t.Fatalf("cached client does not expose controller attach capability")
+	}
+	if err := attacher.AttachPIDToController(context.Background(), cgcommon.CgroupSubsysCPU, "system", 123); err != nil {
+		t.Fatalf("AttachPIDToController() error = %v", err)
+	}
+	if inner.gotSubsys != cgcommon.CgroupSubsysCPU || inner.gotRel != "system" || inner.gotPID != 123 {
+		t.Fatalf("forwarded attach = subsys=%q rel=%q pid=%d", inner.gotSubsys, inner.gotRel, inner.gotPID)
+	}
+	if err := attacher.AttachTIDToController(context.Background(), cgcommon.CgroupSubsysCPUSet, "", 456); err != nil {
+		t.Fatalf("AttachTIDToController() error = %v", err)
+	}
+	if inner.gotSubsys != cgcommon.CgroupSubsysCPUSet || inner.gotRel != "" || inner.gotTID != 456 {
+		t.Fatalf("forwarded task attach = subsys=%q rel=%q tid=%d", inner.gotSubsys, inner.gotRel, inner.gotTID)
 	}
 }
 

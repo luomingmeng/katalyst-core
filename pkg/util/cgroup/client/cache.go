@@ -39,6 +39,16 @@ type identityBoundCachedCgroupClient struct {
 	attacher IdentityBoundPIDAttacher
 }
 
+type controllerCachedCgroupClient struct {
+	*cachedCgroupClient
+	controller ControllerPIDAttacher
+}
+
+type identityAndControllerCachedCgroupClient struct {
+	*identityBoundCachedCgroupClient
+	controller ControllerPIDAttacher
+}
+
 type cacheKey struct {
 	rel  string
 	file string
@@ -59,13 +69,30 @@ func NewCachedCgroupClient(inner CgroupClient) CgroupClient {
 		inner: inner,
 		cache: map[cacheKey]cacheEntry{},
 	}
-	if attacher, ok := inner.(IdentityBoundPIDAttacher); ok {
+	attacher, hasIdentityAttacher := inner.(IdentityBoundPIDAttacher)
+	controller, hasControllerOperations := inner.(ControllerPIDAttacher)
+	switch {
+	case hasIdentityAttacher && hasControllerOperations:
+		return &identityAndControllerCachedCgroupClient{
+			identityBoundCachedCgroupClient: &identityBoundCachedCgroupClient{
+				cachedCgroupClient: cached,
+				attacher:           attacher,
+			},
+			controller: controller,
+		}
+	case hasIdentityAttacher:
 		return &identityBoundCachedCgroupClient{
 			cachedCgroupClient: cached,
 			attacher:           attacher,
 		}
+	case hasControllerOperations:
+		return &controllerCachedCgroupClient{
+			cachedCgroupClient: cached,
+			controller:         controller,
+		}
+	default:
+		return cached
 	}
-	return cached
 }
 
 func (c *identityBoundCachedCgroupClient) AttachPIDWithIdentity(
@@ -75,6 +102,46 @@ func (c *identityBoundCachedCgroupClient) AttachPIDWithIdentity(
 	pid int,
 ) error {
 	return c.attacher.AttachPIDWithIdentity(ctx, rel, identity, pid)
+}
+
+func (c *controllerCachedCgroupClient) ControllerMount(ctx context.Context, subsys string) (cgcommon.ControllerMount, error) {
+	return c.controller.ControllerMount(ctx, subsys)
+}
+
+func (c *controllerCachedCgroupClient) EnsureControllerDir(ctx context.Context, subsys, rel string) error {
+	return c.controller.EnsureControllerDir(ctx, subsys, rel)
+}
+
+func (c *controllerCachedCgroupClient) ReadControllerFile(ctx context.Context, subsys, rel, file string) ([]byte, error) {
+	return c.controller.ReadControllerFile(ctx, subsys, rel, file)
+}
+
+func (c *controllerCachedCgroupClient) AttachPIDToController(ctx context.Context, subsys, rel string, pid int) error {
+	return c.controller.AttachPIDToController(ctx, subsys, rel, pid)
+}
+
+func (c *controllerCachedCgroupClient) AttachTIDToController(ctx context.Context, subsys, rel string, tid int) error {
+	return c.controller.AttachTIDToController(ctx, subsys, rel, tid)
+}
+
+func (c *identityAndControllerCachedCgroupClient) ControllerMount(ctx context.Context, subsys string) (cgcommon.ControllerMount, error) {
+	return c.controller.ControllerMount(ctx, subsys)
+}
+
+func (c *identityAndControllerCachedCgroupClient) EnsureControllerDir(ctx context.Context, subsys, rel string) error {
+	return c.controller.EnsureControllerDir(ctx, subsys, rel)
+}
+
+func (c *identityAndControllerCachedCgroupClient) ReadControllerFile(ctx context.Context, subsys, rel, file string) ([]byte, error) {
+	return c.controller.ReadControllerFile(ctx, subsys, rel, file)
+}
+
+func (c *identityAndControllerCachedCgroupClient) AttachPIDToController(ctx context.Context, subsys, rel string, pid int) error {
+	return c.controller.AttachPIDToController(ctx, subsys, rel, pid)
+}
+
+func (c *identityAndControllerCachedCgroupClient) AttachTIDToController(ctx context.Context, subsys, rel string, tid int) error {
+	return c.controller.AttachTIDToController(ctx, subsys, rel, tid)
 }
 
 func (c *cachedCgroupClient) Version(ctx context.Context) CgroupVersion {
