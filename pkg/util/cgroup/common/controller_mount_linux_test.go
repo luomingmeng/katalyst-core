@@ -4,12 +4,13 @@ package common
 
 import (
 	"errors"
-	"io"
 	"strings"
 	"testing"
 )
 
 func TestParseControllerMounts(t *testing.T) {
+	t.Parallel()
+
 	mounts, err := parseControllerMounts(strings.NewReader(
 		"29 23 0:26 / /sys/fs/cgroup/cpu,cpuacct rw,nosuid,nodev,noexec,relatime - cgroup cgroup rw,cpu,cpuacct\n" +
 			"30 23 0:27 / /sys/fs/cgroup/cpuset rw,nosuid,nodev,noexec,relatime - cgroup cgroup rw,cpuset\n",
@@ -26,18 +27,11 @@ func TestParseControllerMounts(t *testing.T) {
 }
 
 func TestResolveControllerMountV1CombinedCPU(t *testing.T) {
-	oldUnified, oldReader := checkCgroup2UnifiedMode, controllerMountInfoReader
-	defer func() {
-		checkCgroup2UnifiedMode, controllerMountInfoReader = oldUnified, oldReader
-	}()
-	checkCgroup2UnifiedMode = func() bool { return false }
-	controllerMountInfoReader = func() (io.ReadCloser, error) {
-		return io.NopCloser(strings.NewReader(
-			"29 23 0:26 / /sys/fs/cgroup/cpu,cpuacct rw - cgroup cgroup rw,cpu,cpuacct\n",
-		)), nil
-	}
+	t.Parallel()
 
-	got, err := ResolveControllerMount(CgroupSubsysCPU)
+	got, err := resolveControllerMount(CgroupSubsysCPU, false, strings.NewReader(
+		"29 23 0:26 / /sys/fs/cgroup/cpu,cpuacct rw - cgroup cgroup rw,cpu,cpuacct\n",
+	))
 	if err != nil {
 		t.Fatalf("ResolveControllerMount: %v", err)
 	}
@@ -47,18 +41,11 @@ func TestResolveControllerMountV1CombinedCPU(t *testing.T) {
 }
 
 func TestResolveControllerMountUnavailable(t *testing.T) {
-	oldUnified, oldReader := checkCgroup2UnifiedMode, controllerMountInfoReader
-	defer func() {
-		checkCgroup2UnifiedMode, controllerMountInfoReader = oldUnified, oldReader
-	}()
-	checkCgroup2UnifiedMode = func() bool { return false }
-	controllerMountInfoReader = func() (io.ReadCloser, error) {
-		return io.NopCloser(strings.NewReader(
-			"30 23 0:27 / /sys/fs/cgroup/cpuset rw - cgroup cgroup rw,cpuset\n",
-		)), nil
-	}
+	t.Parallel()
 
-	_, err := ResolveControllerMount(CgroupSubsysCPU)
+	_, err := resolveControllerMount(CgroupSubsysCPU, false, strings.NewReader(
+		"30 23 0:27 / /sys/fs/cgroup/cpuset rw - cgroup cgroup rw,cpuset\n",
+	))
 	if !errors.Is(err, ErrControllerMountUnavailable) {
 		t.Fatalf("error = %v, want ErrControllerMountUnavailable", err)
 	}

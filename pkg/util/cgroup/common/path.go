@@ -128,8 +128,6 @@ func GetAbsCgroupPath(subsys, suffix string) string {
 	return filepath.Join(GetCgroupRootPath(subsys), suffix)
 }
 
-var relativeCgroupPathExists = general.IsPathExists
-
 // GetExistingRelativeCgroupPaths returns relative cgroup paths that exist
 // under the default selected subsystem.
 func GetExistingRelativeCgroupPaths(relativePaths ...string) []string {
@@ -139,7 +137,7 @@ func GetExistingRelativeCgroupPaths(relativePaths ...string) []string {
 // GetExistingRelativeCgroupPathsForSubsys returns relative cgroup paths that
 // exist under the given subsystem, preserving input order.
 func GetExistingRelativeCgroupPathsForSubsys(subsys string, relativePaths ...string) []string {
-	return getExistingRelativeCgroupPathsForSubsys(relativeCgroupPathExists, subsys, relativePaths...)
+	return getExistingRelativeCgroupPathsForSubsys(general.IsPathExists, subsys, relativePaths...)
 }
 
 func getExistingRelativeCgroupPathsForSubsys(pathExists func(string) bool, subsys string, relativePaths ...string) []string {

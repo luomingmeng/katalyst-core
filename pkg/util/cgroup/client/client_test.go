@@ -99,7 +99,10 @@ func TestIsSlowAttachPID_Boundary(t *testing.T) {
 		{name: "above threshold", elapsed: slowAttachPIDThreshold + time.Nanosecond, want: true},
 	}
 	for _, tt := range tests {
+		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			if got := isSlowAttachPID(tt.elapsed); got != tt.want {
 				t.Fatalf("isSlowAttachPID(%s) = %t, want %t", tt.elapsed, got, tt.want)
 			}

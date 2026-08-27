@@ -31,9 +31,10 @@ import (
 )
 
 func TestControllerOperationsRejectUnsafeRelativePath(t *testing.T) {
+	t.Parallel()
+
 	root := t.TempDir()
-	withControllerMount(t, root)
-	client := coreCgroupClient{}
+	client := newCoreCgroupClientWithMount(root)
 	for _, rel := range []string{"/target", ".", "..", "target/../escape", "target//child"} {
 		if err := client.EnsureControllerDir(context.Background(), cgcommon.CgroupSubsysCPU, rel); err == nil {
 			t.Errorf("EnsureControllerDir(%q) succeeded, want unsafe path error", rel)
@@ -51,9 +52,10 @@ func TestControllerOperationsRejectUnsafeRelativePath(t *testing.T) {
 }
 
 func TestControllerOperationsCreateAndAttachCPUPath(t *testing.T) {
+	t.Parallel()
+
 	root := t.TempDir()
-	withControllerMount(t, root)
-	client := coreCgroupClient{}
+	client := newCoreCgroupClientWithMount(root)
 	ctx := context.Background()
 
 	if err := client.EnsureControllerDir(ctx, cgcommon.CgroupSubsysCPU, "parent/system"); err != nil {
@@ -76,9 +78,11 @@ func TestControllerOperationsCreateAndAttachCPUPath(t *testing.T) {
 }
 
 func TestAttachPIDToControllerRejectsSymlinkTraversal(t *testing.T) {
+	t.Parallel()
+
 	root := t.TempDir()
 	outside := t.TempDir()
-	withControllerMount(t, root)
+	client := newCoreCgroupClientWithMount(root)
 	if err := os.Mkdir(filepath.Join(outside, "system"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +94,7 @@ func TestAttachPIDToControllerRejectsSymlinkTraversal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := coreCgroupClient{}.AttachPIDToController(
+	err := client.AttachPIDToController(
 		context.Background(), cgcommon.CgroupSubsysCPU, "escape/system", 123,
 	)
 	if err == nil {
@@ -106,13 +110,15 @@ func TestAttachPIDToControllerRejectsSymlinkTraversal(t *testing.T) {
 }
 
 func TestAttachPIDToControllerAcceptsRoot(t *testing.T) {
+	t.Parallel()
+
 	root := t.TempDir()
-	withControllerMount(t, root)
+	client := newCoreCgroupClientWithMount(root)
 	if err := os.WriteFile(filepath.Join(root, "cgroup.procs"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := (coreCgroupClient{}).AttachPIDToController(
+	if err := client.AttachPIDToController(
 		context.Background(), cgcommon.CgroupSubsysCPU, "", 123,
 	); err != nil {
 		t.Fatalf("AttachPIDToController() error = %v", err)
@@ -127,8 +133,10 @@ func TestAttachPIDToControllerAcceptsRoot(t *testing.T) {
 }
 
 func TestAttachTIDToControllerWritesTasksThroughPinnedTarget(t *testing.T) {
+	t.Parallel()
+
 	root := t.TempDir()
-	withControllerMount(t, root)
+	client := newCoreCgroupClientWithMount(root)
 	target := filepath.Join(root, "parent", "system")
 	if err := os.MkdirAll(target, 0o755); err != nil {
 		t.Fatal(err)
@@ -138,7 +146,7 @@ func TestAttachTIDToControllerWritesTasksThroughPinnedTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := (coreCgroupClient{}).AttachTIDToController(
+	if err := client.AttachTIDToController(
 		context.Background(), cgcommon.CgroupSubsysCPU, "parent/system", 456,
 	); err != nil {
 		t.Fatalf("AttachTIDToController() error = %v", err)
@@ -153,6 +161,8 @@ func TestAttachTIDToControllerWritesTasksThroughPinnedTarget(t *testing.T) {
 }
 
 func TestInitializeCPUSetMemsAtFDCopiesParentValue(t *testing.T) {
+	t.Parallel()
+
 	root := t.TempDir()
 	child := filepath.Join(root, "system")
 	if err := os.Mkdir(child, 0o755); err != nil {
@@ -188,13 +198,10 @@ func TestInitializeCPUSetMemsAtFDCopiesParentValue(t *testing.T) {
 	}
 }
 
-func withControllerMount(t *testing.T, root string) {
-	t.Helper()
-	original := resolveControllerMount
-	resolveControllerMount = func(string) (cgcommon.ControllerMount, error) {
-		return cgcommon.ControllerMount{Root: root}, nil
+func newCoreCgroupClientWithMount(root string) coreCgroupClient {
+	return coreCgroupClient{
+		resolveControllerMount: func(string) (cgcommon.ControllerMount, error) {
+			return cgcommon.ControllerMount{Root: root}, nil
+		},
 	}
-	t.Cleanup(func() {
-		resolveControllerMount = original
-	})
 }

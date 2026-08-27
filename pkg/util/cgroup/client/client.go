@@ -105,7 +105,11 @@ type ControllerPIDAttacher interface {
 	AttachTIDToController(ctx context.Context, subsys, rel string, tid int) error
 }
 
-type coreCgroupClient struct{}
+type controllerMountResolver func(subsys string) (cgcommon.ControllerMount, error)
+
+type coreCgroupClient struct {
+	resolveControllerMount controllerMountResolver
+}
 
 const slowAttachPIDThreshold = 200 * time.Millisecond
 

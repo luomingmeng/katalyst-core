@@ -8,27 +8,26 @@ import (
 	"strings"
 )
 
-var (
-	checkCgroup2UnifiedMode   = CheckCgroup2UnifiedMode
-	controllerMountInfoReader = func() (io.ReadCloser, error) {
-		return os.Open("/proc/self/mountinfo")
-	}
-)
-
 // ResolveControllerMount returns the mount root for subsys. On cgroup v2 all
 // controllers use the unified hierarchy; on v1 it reads mountinfo so combined
 // mounts such as cpu,cpuacct are resolved correctly.
 func ResolveControllerMount(subsys string) (ControllerMount, error) {
-	if checkCgroup2UnifiedMode() {
-		return ControllerMount{Root: CgroupFSMountPoint, Unified: true}, nil
+	if CheckCgroup2UnifiedMode() {
+		return resolveControllerMount(subsys, true, nil)
 	}
 
-	reader, err := controllerMountInfoReader()
+	reader, err := os.Open("/proc/self/mountinfo")
 	if err != nil {
 		return ControllerMount{}, fmt.Errorf("open cgroup mountinfo: %w", err)
 	}
 	defer func() { _ = reader.Close() }()
+	return resolveControllerMount(subsys, false, reader)
+}
 
+func resolveControllerMount(subsys string, unified bool, reader io.Reader) (ControllerMount, error) {
+	if unified {
+		return ControllerMount{Root: CgroupFSMountPoint, Unified: true}, nil
+	}
 	mounts, err := parseControllerMounts(reader)
 	if err != nil {
 		return ControllerMount{}, err

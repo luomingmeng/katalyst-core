@@ -23,38 +23,35 @@ import (
 )
 
 func TestGetExistingRelativeCgroupPaths(t *testing.T) {
+	t.Parallel()
+
 	checkedPaths := make([]string, 0)
-	originalPathExists := relativeCgroupPathExists
-	relativeCgroupPathExists = func(path string) bool {
+	pathExists := func(path string) bool {
 		checkedPaths = append(checkedPaths, path)
 		return path == GetAbsCgroupPath(DefaultSelectedSubsys, "/existing")
 	}
-	defer func() {
-		relativeCgroupPathExists = originalPathExists
-	}()
 
-	got := GetExistingRelativeCgroupPaths("/existing", "", "/missing")
+	got := getExistingRelativeCgroupPathsForSubsys(pathExists, DefaultSelectedSubsys, "/existing", "", "/missing")
 
 	require.Equal(t, []string{"/existing"}, got)
 	require.Equal(t, []string{
 		GetAbsCgroupPath(DefaultSelectedSubsys, "/existing"),
 		GetAbsCgroupPath(DefaultSelectedSubsys, "/missing"),
 	}, checkedPaths)
-	require.Nil(t, GetExistingRelativeCgroupPaths())
+	require.Nil(t, getExistingRelativeCgroupPathsForSubsys(pathExists, DefaultSelectedSubsys))
 }
 
 func TestGetExistingRelativeCgroupPathsForSubsys(t *testing.T) {
+	t.Parallel()
+
 	checkedPaths := make([]string, 0)
-	originalPathExists := relativeCgroupPathExists
-	relativeCgroupPathExists = func(path string) bool {
+	pathExists := func(path string) bool {
 		checkedPaths = append(checkedPaths, path)
 		return path == GetAbsCgroupPath(CgroupSubsysMemory, "/existing")
 	}
-	defer func() {
-		relativeCgroupPathExists = originalPathExists
-	}()
 
-	got := GetExistingRelativeCgroupPathsForSubsys(
+	got := getExistingRelativeCgroupPathsForSubsys(
+		pathExists,
 		CgroupSubsysMemory,
 		"/missing",
 		"/existing",

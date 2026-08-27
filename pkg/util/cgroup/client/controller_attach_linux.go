@@ -32,13 +32,15 @@ import (
 	cgcommon "github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 )
 
-var resolveControllerMount = cgcommon.ResolveControllerMount
-
-func (coreCgroupClient) ControllerMount(ctx context.Context, subsys string) (cgcommon.ControllerMount, error) {
+func (c coreCgroupClient) ControllerMount(ctx context.Context, subsys string) (cgcommon.ControllerMount, error) {
 	if err := ctx.Err(); err != nil {
 		return cgcommon.ControllerMount{}, err
 	}
-	return resolveControllerMount(subsys)
+	resolver := c.resolveControllerMount
+	if resolver == nil {
+		resolver = cgcommon.ResolveControllerMount
+	}
+	return resolver(subsys)
 }
 
 func (c coreCgroupClient) EnsureControllerDir(ctx context.Context, subsys, rel string) error {
@@ -153,11 +155,11 @@ func (c coreCgroupClient) openControllerTarget(ctx context.Context, subsys, rel 
 	return targetFD, nil
 }
 
-func (coreCgroupClient) openControllerRoot(ctx context.Context, subsys string) (int, error) {
+func (c coreCgroupClient) openControllerRoot(ctx context.Context, subsys string) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return -1, err
 	}
-	mount, err := resolveControllerMount(subsys)
+	mount, err := c.ControllerMount(ctx, subsys)
 	if err != nil {
 		return -1, fmt.Errorf("resolve controller mount %q: %w", subsys, err)
 	}
