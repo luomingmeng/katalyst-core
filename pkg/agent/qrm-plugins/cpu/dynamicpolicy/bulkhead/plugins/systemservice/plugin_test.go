@@ -23,6 +23,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,7 +35,9 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	bulkheadconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/bulkhead"
+	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	cgroupclient "github.com/kubewharf/katalyst-core/pkg/util/cgroup/client"
+	cgcommon "github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 	utilfs "github.com/kubewharf/katalyst-core/pkg/util/fs"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	procfscommon "github.com/kubewharf/katalyst-core/pkg/util/procfs/common"
@@ -45,17 +48,21 @@ import (
 // ---------------------------------------------------------------------------
 
 type fakeFS struct {
-	reads   map[string]string // path -> file content (e.g. root cgroup.procs)
-	readErr error
+	reads    map[string]string // path -> file content (e.g. root cgroup.procs)
+	readErr  error
+	readErrs map[string]error
 }
 
 func newFakeFS() *fakeFS {
-	return &fakeFS{reads: map[string]string{}}
+	return &fakeFS{reads: map[string]string{}, readErrs: map[string]error{}}
 }
 
 func (f *fakeFS) ReadFile(p string) ([]byte, error) {
 	if f.readErr != nil {
 		return nil, f.readErr
+	}
+	if err := f.readErrs[p]; err != nil {
+		return nil, err
 	}
 	if data, ok := f.reads[p]; ok {
 		return []byte(data), nil
@@ -70,6 +77,27 @@ func (f *fakeFS) Exists(string) bool                    { return false }
 func (f *fakeFS) ReadDir(string) ([]fs.DirEntry, error) { return nil, errors.New("not used") }
 
 var _ utilfs.FS = (*fakeFS)(nil)
+
+type recordingMetricEmitter struct {
+	tags    []metrics.MetricTag
+	records [][]metrics.MetricTag
+}
+
+func (r *recordingMetricEmitter) StoreInt64(_ string, _ int64, _ metrics.MetricTypeName, tags ...metrics.MetricTag) error {
+	r.tags = append([]metrics.MetricTag(nil), tags...)
+	r.records = append(r.records, append([]metrics.MetricTag(nil), tags...))
+	return nil
+}
+
+func (*recordingMetricEmitter) StoreFloat64(string, float64, metrics.MetricTypeName, ...metrics.MetricTag) error {
+	return nil
+}
+
+func (r *recordingMetricEmitter) WithTags(string, ...metrics.MetricTag) metrics.MetricEmitter {
+	return r
+}
+
+func (*recordingMetricEmitter) Run(context.Context) {}
 
 // ---------------------------------------------------------------------------
 // fake CgroupClient: records AttachPID calls and controls StatDir presence
@@ -87,9 +115,20 @@ type fakeCgroup struct {
 	// cgroupFiles simulates reading files like cgroup.procs under a given
 	// rel. Keys: rel -> file basename -> file bytes. The reset path uses
 	// this to enumerate PIDs currently in targetRel/cgroup.procs.
-	cgroupFiles   map[string]map[string][]byte
-	cgroupFileErr error
-	cpuSets       map[string]machine.CPUSet
+	cgroupFiles             map[string]map[string][]byte
+	cgroupFileErr           error
+	cpuSets                 map[string]machine.CPUSet
+	version                 cgroupclient.CgroupVersion
+	mounts                  map[string]cgcommon.ControllerMount
+	mountErrs               map[string]error
+	controllerFiles         map[string]map[string]map[string][]byte
+	controllerAttaches      []controllerAttachCall
+	controllerTaskAttaches  []controllerAttachCall
+	ensures                 []controllerEnsureCall
+	controllerAttachErr     map[string]error
+	controllerTaskAttachErr map[string]error
+	controllerFileErrs      map[string]map[string]error
+	controllerEnsureErr     map[string]error
 }
 
 type attachCall struct {
@@ -103,8 +142,29 @@ type identityAttachCall struct {
 	pid      int
 }
 
+type controllerAttachCall struct {
+	controller string
+	rel        string
+	pid        int
+}
+
+type controllerEnsureCall struct {
+	controller string
+	rel        string
+}
+
 func newFakeCgroup() *fakeCgroup {
-	return &fakeCgroup{existingDirs: map[string]bool{}}
+	return &fakeCgroup{
+		existingDirs:            map[string]bool{},
+		version:                 cgroupclient.CgroupVersionV2,
+		mounts:                  map[string]cgcommon.ControllerMount{},
+		mountErrs:               map[string]error{},
+		controllerFiles:         map[string]map[string]map[string][]byte{},
+		controllerAttachErr:     map[string]error{},
+		controllerTaskAttachErr: map[string]error{},
+		controllerFileErrs:      map[string]map[string]error{},
+		controllerEnsureErr:     map[string]error{},
+	}
 }
 
 func (f *fakeCgroup) StatDir(_ context.Context, rel string) (time.Time, error) {
@@ -162,6 +222,95 @@ func (f *fakeCgroup) ReadCPUSet(_ context.Context, rel string) (machine.CPUSet, 
 		return machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7), nil
 	}
 	return machine.NewCPUSet(), os.ErrNotExist
+}
+
+func (f *fakeCgroup) Version(context.Context) cgroupclient.CgroupVersion {
+	return f.version
+}
+
+func (f *fakeCgroup) ControllerMount(_ context.Context, controller string) (cgcommon.ControllerMount, error) {
+	if err := f.mountErrs[controller]; err != nil {
+		return cgcommon.ControllerMount{}, err
+	}
+	if mount, ok := f.mounts[controller]; ok {
+		return mount, nil
+	}
+	return cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpuset", Unified: f.version == cgroupclient.CgroupVersionV2}, nil
+}
+
+func (f *fakeCgroup) EnsureControllerDir(_ context.Context, controller, rel string) error {
+	f.ensures = append(f.ensures, controllerEnsureCall{controller: controller, rel: rel})
+	return f.controllerEnsureErr[controller]
+}
+
+func (f *fakeCgroup) ReadControllerFile(_ context.Context, controller, rel, file string) ([]byte, error) {
+	if err := f.controllerFileErrs[controller][file]; err != nil {
+		return nil, err
+	}
+	if controllerFiles, ok := f.controllerFiles[controller]; ok {
+		if relFiles, ok := controllerFiles[rel]; ok {
+			if data, ok := relFiles[file]; ok {
+				return data, nil
+			}
+		}
+	}
+	if controller == cgcommon.CgroupSubsysCPUSet {
+		if f.cgroupFileErr != nil {
+			return nil, f.cgroupFileErr
+		}
+		if relFiles, ok := f.cgroupFiles[rel]; ok {
+			if data, ok := relFiles[file]; ok {
+				return data, nil
+			}
+		}
+	}
+	return nil, os.ErrNotExist
+}
+
+func (f *fakeCgroup) AttachPIDToController(_ context.Context, controller, rel string, pid int) error {
+	if err := f.controllerAttachErr[controller]; err != nil {
+		return err
+	}
+	f.controllerAttaches = append(f.controllerAttaches, controllerAttachCall{controller: controller, rel: rel, pid: pid})
+	return nil
+}
+
+func (f *fakeCgroup) AttachTIDToController(_ context.Context, controller, rel string, tid int) error {
+	if err := f.controllerTaskAttachErr[controller]; err != nil {
+		return err
+	}
+	f.controllerTaskAttaches = append(f.controllerTaskAttaches, controllerAttachCall{controller: controller, rel: rel, pid: tid})
+	return nil
+}
+
+func seedControllerPIDs(fCg *fakeCgroup, controller, rel string, pids ...int) {
+	if fCg.controllerFiles[controller] == nil {
+		fCg.controllerFiles[controller] = map[string]map[string][]byte{}
+	}
+	if fCg.controllerFiles[controller][rel] == nil {
+		fCg.controllerFiles[controller][rel] = map[string][]byte{}
+	}
+	var b strings.Builder
+	for _, pid := range pids {
+		b.WriteString(strconv.Itoa(pid))
+		b.WriteByte('\n')
+	}
+	fCg.controllerFiles[controller][rel]["cgroup.procs"] = []byte(b.String())
+}
+
+func seedControllerTasks(fCg *fakeCgroup, controller, rel string, tids ...int) {
+	if fCg.controllerFiles[controller] == nil {
+		fCg.controllerFiles[controller] = map[string]map[string][]byte{}
+	}
+	if fCg.controllerFiles[controller][rel] == nil {
+		fCg.controllerFiles[controller][rel] = map[string][]byte{}
+	}
+	var b strings.Builder
+	for _, tid := range tids {
+		b.WriteString(strconv.Itoa(tid))
+		b.WriteByte('\n')
+	}
+	fCg.controllerFiles[controller][rel]["tasks"] = []byte(b.String())
 }
 
 // rootProcsPath is the cpuset controller root cgroup.procs path the test
@@ -308,18 +457,17 @@ func (r *raceyProcReader) ReadProc(pid int) (procfscommon.ProcInfo, error) {
 // helpers
 // ---------------------------------------------------------------------------
 
-// newTestPlugin builds a plugin with fake fs+proc+cgroup and a fixed
-// rootCgroupProcsPath so tests do not depend on a real cgroup mount.
+// newTestPlugin builds a plugin with fake fs+proc+cgroup so tests do not
+// depend on real cgroup mounts.
 func newTestPlugin(targetRel string, fFS *fakeFS, fProc procfscommon.ProcReader,
 	fCg cgroupclient.CgroupClient, cfg bulkheadconfig.BulkheadConfiguration,
 ) *SystemServicePlugin {
 	return &SystemServicePlugin{
-		cfg:                 cfg,
-		fs:                  fFS,
-		proc:                fProc,
-		cgroup:              fCg,
-		targetRel:           targetRel,
-		rootCgroupProcsPath: rootProcsPath,
+		cfg:       cfg,
+		fs:        fFS,
+		proc:      fProc,
+		cgroup:    fCg,
+		targetRel: targetRel,
 		pinPID: func(int) (io.Closer, error) {
 			return &fakePIDPin{}, nil
 		},
@@ -784,7 +932,8 @@ func TestPeriodicalHandler_DisabledByConfig(t *testing.T) {
 func TestPeriodicalHandler_SkipsWhenTargetMissing(t *testing.T) {
 	t.Parallel()
 	fFS := newFakeFS()
-	fProc := &fakeProc{}
+	seedRootPIDs(fFS, 100)
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{100: {PID: 100, Comm: "crond"}}}
 	fCg := newFakeCgroup() // no existingDirs → StatDir fails
 	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
 	if err := p.PeriodicalHandler(context.Background(), periodCtx(true)); err != nil {
@@ -1343,8 +1492,123 @@ func TestPeriodicalHandler_DisabledResetReadsTargetTasks_BitsUT(t *testing.T) {
 	if err := p.PeriodicalHandler(context.Background(), periodCtx(false)); err != nil {
 		t.Fatalf("disabled reset: %v", err)
 	}
-	if len(fCg.attaches) != 1 || fCg.attaches[0] != (attachCall{rel: "", pid: 400}) {
-		t.Fatalf("target tasks reset attach = %+v, want root/400", fCg.attaches)
+	if len(fCg.attaches) != 0 {
+		t.Fatalf("task-only reset must not write cgroup.procs, got %+v", fCg.attaches)
+	}
+	want := []controllerAttachCall{{controller: cgcommon.CgroupSubsysCPUSet, rel: "", pid: 400}}
+	if !reflect.DeepEqual(fCg.controllerTaskAttaches, want) {
+		t.Fatalf("target tasks reset attach = %+v, want %+v", fCg.controllerTaskAttaches, want)
+	}
+}
+
+func TestListCandidatesTasksOnlyIgnoreENOENT(t *testing.T) {
+	t.Parallel()
+
+	t.Run("root tasks permission error", func(t *testing.T) {
+		fFS := newFakeFS()
+		fFS.reads[rootProcsPath] = ""
+		fFS.readErrs[rootTasksPath] = syscall.EACCES
+		p := newTestPlugin("system", fFS, &fakeProc{}, newFakeCgroup(), bulkheadconfig.BulkheadConfiguration{})
+		_, errs := p.listRootMigrationCandidates([]controllerSource{{
+			name:  cgcommon.CgroupSubsysCPUSet,
+			mount: cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpuset"},
+		}})
+		if len(errs) != 1 || !errors.Is(errs[0], syscall.EACCES) {
+			t.Fatalf("root tasks errors = %v, want EACCES", errs)
+		}
+	})
+
+	t.Run("target tasks permission error", func(t *testing.T) {
+		fCg := newFakeCgroup()
+		seedControllerPIDs(fCg, cgcommon.CgroupSubsysCPU, "system")
+		fCg.controllerFileErrs[cgcommon.CgroupSubsysCPU] = map[string]error{"tasks": syscall.EACCES}
+		p := newTestPlugin("system", newFakeFS(), &fakeProc{}, fCg, bulkheadconfig.BulkheadConfiguration{})
+		_, errs := p.listTargetCgroupCandidates(context.Background(), []controllerSource{{
+			name: cgcommon.CgroupSubsysCPU,
+		}}, fCg)
+		if len(errs) != 1 || !errors.Is(errs[0], syscall.EACCES) {
+			t.Fatalf("target tasks errors = %v, want EACCES", errs)
+		}
+	})
+
+	t.Run("missing tasks", func(t *testing.T) {
+		fFS := newFakeFS()
+		fFS.reads[rootProcsPath] = ""
+		p := newTestPlugin("system", fFS, &fakeProc{}, newFakeCgroup(), bulkheadconfig.BulkheadConfiguration{})
+		_, errs := p.listRootMigrationCandidates([]controllerSource{{
+			name:  cgcommon.CgroupSubsysCPUSet,
+			mount: cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpuset"},
+		}})
+		if len(errs) != 0 {
+			t.Fatalf("missing root tasks errors = %v, want none", errs)
+		}
+	})
+}
+
+func TestPeriodicalHandler_ResetTaskOnlyUsesEachControllerTasks(t *testing.T) {
+	t.Parallel()
+
+	fCg := newFakeCgroup()
+	fCg.version = cgroupclient.CgroupVersionV1
+	fCg.existingDirs["system"] = true
+	seedTargetPIDs(fCg, "system")
+	seedTargetTasks(fCg, "system", 400)
+	seedControllerPIDs(fCg, cgcommon.CgroupSubsysCPU, "system")
+	seedControllerTasks(fCg, cgcommon.CgroupSubsysCPU, "system", 400)
+	p := newTestPlugin("system", newFakeFS(), &fakeProc{}, fCg, bulkheadconfig.BulkheadConfiguration{})
+	enabled := true
+	p.lastPeriodicalEnabled = &enabled
+
+	if err := p.PeriodicalHandler(context.Background(), periodCtx(false)); err != nil {
+		t.Fatalf("disabled reset: %v", err)
+	}
+	want := []controllerAttachCall{
+		{controller: cgcommon.CgroupSubsysCPUSet, rel: "", pid: 400},
+		{controller: cgcommon.CgroupSubsysCPU, rel: "", pid: 400},
+	}
+	if !reflect.DeepEqual(fCg.controllerTaskAttaches, want) {
+		t.Fatalf("task attaches = %+v, want %+v", fCg.controllerTaskAttaches, want)
+	}
+	if len(fCg.attaches) != 0 || len(fCg.controllerAttaches) != 0 {
+		t.Fatalf("task-only reset wrote cgroup.procs: cpuset=%+v cpu=%+v", fCg.attaches, fCg.controllerAttaches)
+	}
+}
+
+func TestBulkheadSystemServiceResultMetricIncludesController(t *testing.T) {
+	t.Parallel()
+
+	emitter := &recordingMetricEmitter{}
+	emitBulkheadSystemServiceResult(emitter, "migrate", "failed", "attach_error", cgcommon.CgroupSubsysCPU)
+	for _, tag := range emitter.tags {
+		if tag.Key == "controller" && tag.Val == cgcommon.CgroupSubsysCPU {
+			return
+		}
+	}
+	t.Fatalf("metric tags = %+v, want controller=cpu", emitter.tags)
+}
+
+func TestBulkheadSystemServiceFailuresDeduplicatesControllerReason(t *testing.T) {
+	t.Parallel()
+
+	emitter := &recordingMetricEmitter{}
+	emitBulkheadSystemServiceFailures(emitter, "migrate", []error{
+		operationError(cgcommon.CgroupSubsysCPU, "attach_error", errors.New("pid 100")),
+		operationError(cgcommon.CgroupSubsysCPU, "attach_error", errors.New("pid 101")),
+		operationError(cgcommon.CgroupSubsysCPUSet, "authorize_error", errors.New("stale proof")),
+	})
+	if len(emitter.records) != 2 {
+		t.Fatalf("metric records = %d, want 2: %+v", len(emitter.records), emitter.records)
+	}
+	got := map[string]bool{}
+	for _, tags := range emitter.records {
+		values := map[string]string{}
+		for _, tag := range tags {
+			values[tag.Key] = tag.Val
+		}
+		got[values["controller"]+"/"+values["reason"]] = true
+	}
+	if !got["cpu/attach_error"] || !got["cpuset/authorize_error"] {
+		t.Fatalf("metric records = %+v", got)
 	}
 }
 
@@ -1541,4 +1805,346 @@ func TestPeriodicalHandler_ResetListError(t *testing.T) {
 	if trackerVal(t, p) != true {
 		t.Fatalf("tracker must remain pending after reset listing error, got &false")
 	}
+}
+
+func TestPeriodicalHandler_CPUOnlyRootDoesNotRequireCPUSetProof(t *testing.T) {
+	t.Parallel()
+
+	fFS := newFakeFS()
+	fFS.reads["/sys/fs/cgroup/cpuset/cgroup.procs"] = ""
+	fFS.reads["/sys/fs/cgroup/cpu/cgroup.procs"] = "100\n"
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		100: {PID: 100, Comm: "crond"},
+	}}
+	fCg := newFakeCgroup()
+	fCg.version = cgroupclient.CgroupVersionV1
+	fCg.mounts[cgcommon.CgroupSubsysCPUSet] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpuset"}
+	fCg.mounts[cgcommon.CgroupSubsysCPU] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpu"}
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+
+	if err := p.PeriodicalHandler(context.Background(), periodCtx(true)); err != nil {
+		t.Fatalf("PeriodicalHandler: %v", err)
+	}
+	if got, want := fCg.ensures, []controllerEnsureCall{{controller: cgcommon.CgroupSubsysCPU, rel: "system"}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cpu target ensure calls = %+v, want %+v", got, want)
+	}
+	if got, want := fCg.controllerAttaches, []controllerAttachCall{{controller: cgcommon.CgroupSubsysCPU, rel: "system", pid: 100}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cpu controller attaches = %+v, want %+v", got, want)
+	}
+	if len(fCg.identityAttaches) != 0 {
+		t.Fatalf("cpu-only candidate must not attach to cpuset, got %+v", fCg.identityAttaches)
+	}
+}
+
+func TestPeriodicalHandler_PreparesTargetsFromCandidateNeeds(t *testing.T) {
+	t.Parallel()
+
+	fFS := newFakeFS()
+	fFS.reads["/sys/fs/cgroup/cpuset/cgroup.procs"] = ""
+	fFS.reads["/sys/fs/cgroup/cpu/cgroup.procs"] = "100\n"
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		100: {PID: 100, Comm: "crond"},
+	}}
+	fCg := newFakeCgroup()
+	fCg.version = cgroupclient.CgroupVersionV1
+	fCg.mounts[cgcommon.CgroupSubsysCPUSet] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpuset"}
+	fCg.mounts[cgcommon.CgroupSubsysCPU] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpu"}
+	fCg.existingDirs["system"] = true
+	fCg.cgroupFileErr = errors.New("cpuset target must not be inspected")
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+
+	if err := p.PeriodicalHandler(context.Background(), appliedPeriodCtx(true, 1, machine.NewCPUSet(0, 1))); err != nil {
+		t.Fatalf("PeriodicalHandler must ignore unused cpuset target: %v", err)
+	}
+	if got, want := fCg.ensures, []controllerEnsureCall{{controller: cgcommon.CgroupSubsysCPU, rel: "system"}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("target ensure calls = %+v, want %+v", got, want)
+	}
+	if got, want := fCg.controllerAttaches, []controllerAttachCall{{
+		controller: cgcommon.CgroupSubsysCPU, rel: "system", pid: 100,
+	}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cpu controller attaches = %+v, want %+v", got, want)
+	}
+	if len(fCg.identityAttaches) != 0 {
+		t.Fatalf("unused cpuset target must not receive attaches, got %+v", fCg.identityAttaches)
+	}
+}
+
+func TestPeriodicalHandler_ResetCPUTargetReturnsOnlyToCPURoot(t *testing.T) {
+	t.Parallel()
+
+	fCg := newFakeCgroup()
+	fCg.version = cgroupclient.CgroupVersionV1
+	fCg.mounts[cgcommon.CgroupSubsysCPUSet] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpuset"}
+	fCg.mounts[cgcommon.CgroupSubsysCPU] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpu"}
+	fCg.existingDirs["system"] = true
+	seedControllerPIDs(fCg, cgcommon.CgroupSubsysCPU, "system", 100)
+	p := newTestPlugin("system", newFakeFS(), &fakeProc{}, fCg, bulkheadconfig.BulkheadConfiguration{})
+	enabled := true
+	p.lastPeriodicalEnabled = &enabled
+
+	if err := p.PeriodicalHandler(context.Background(), periodCtx(false)); err != nil {
+		t.Fatalf("PeriodicalHandler: %v", err)
+	}
+	if got, want := fCg.controllerAttaches, []controllerAttachCall{{controller: cgcommon.CgroupSubsysCPU, rel: "", pid: 100}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cpu reset attaches = %+v, want %+v", got, want)
+	}
+	if len(fCg.attaches) != 0 {
+		t.Fatalf("cpu-only reset must not attach through cpuset, got %+v", fCg.attaches)
+	}
+}
+
+func TestPeriodicalHandler_ResetCPUTargetWhenCPUSetTargetMissing(t *testing.T) {
+	t.Parallel()
+
+	fCg := newFakeCgroup()
+	fCg.version = cgroupclient.CgroupVersionV1
+	fCg.mounts[cgcommon.CgroupSubsysCPUSet] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpuset"}
+	fCg.mounts[cgcommon.CgroupSubsysCPU] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpu"}
+	// The cpuset target is absent while the cpu target still contains a
+	// membership that must be returned to the cpu root.
+	seedControllerPIDs(fCg, cgcommon.CgroupSubsysCPU, "system", 100)
+	p := newTestPlugin("system", newFakeFS(), &fakeProc{}, fCg, bulkheadconfig.BulkheadConfiguration{})
+	enabled := true
+	p.lastPeriodicalEnabled = &enabled
+
+	if err := p.PeriodicalHandler(context.Background(), periodCtx(false)); err != nil {
+		t.Fatalf("PeriodicalHandler: %v", err)
+	}
+	if got, want := fCg.controllerAttaches, []controllerAttachCall{{controller: cgcommon.CgroupSubsysCPU, rel: "", pid: 100}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cpu reset must proceed when cpuset target is absent, got %+v want %+v", got, want)
+	}
+}
+
+func TestPeriodicalHandler_DoesNotAttachCPUTaskOnlyMembershipForCPUSetLeader(t *testing.T) {
+	t.Parallel()
+
+	fFS := newFakeFS()
+	fFS.reads["/sys/fs/cgroup/cpuset/cgroup.procs"] = "100\n"
+	fFS.reads["/sys/fs/cgroup/cpu/cgroup.procs"] = ""
+	fFS.reads["/sys/fs/cgroup/cpu/tasks"] = "100\n"
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		100: {PID: 100, Comm: "crond"},
+	}}
+	fCg := newFakeCgroup()
+	fCg.version = cgroupclient.CgroupVersionV1
+	fCg.mounts[cgcommon.CgroupSubsysCPUSet] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpuset"}
+	fCg.mounts[cgcommon.CgroupSubsysCPU] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpu"}
+	fCg.existingDirs["system"] = true
+	seedTargetEffectiveCPUSet(fCg, "system", "0-1")
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+
+	if err := p.PeriodicalHandler(context.Background(), appliedPeriodCtx(true, 1, machine.NewCPUSet(0, 1))); err != nil {
+		t.Fatalf("PeriodicalHandler: %v", err)
+	}
+	if got, want := fCg.identityAttaches, []identityAttachCall{{
+		rel: "system", identity: cgroupclient.CgroupIdentity{Device: 7, Inode: 11}, pid: 100,
+	}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cpuset leader attach = %+v, want %+v", got, want)
+	}
+	if len(fCg.controllerAttaches) != 0 {
+		t.Fatalf("cpu task-only membership must not receive a cpu cgroup.procs attach, got %+v", fCg.controllerAttaches)
+	}
+}
+
+func TestPeriodicalHandler_ResetDoesNotAttachCPUTaskOnlyMembershipForCPUSetLeader(t *testing.T) {
+	t.Parallel()
+
+	fCg := newFakeCgroup()
+	fCg.version = cgroupclient.CgroupVersionV1
+	fCg.mounts[cgcommon.CgroupSubsysCPUSet] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpuset"}
+	fCg.mounts[cgcommon.CgroupSubsysCPU] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpu"}
+	fCg.existingDirs["system"] = true
+	seedTargetPIDs(fCg, "system", 100)
+	if fCg.controllerFiles[cgcommon.CgroupSubsysCPU] == nil {
+		fCg.controllerFiles[cgcommon.CgroupSubsysCPU] = map[string]map[string][]byte{}
+	}
+	fCg.controllerFiles[cgcommon.CgroupSubsysCPU]["system"] = map[string][]byte{"tasks": []byte("100\n")}
+	p := newTestPlugin("system", newFakeFS(), &fakeProc{}, fCg, bulkheadconfig.BulkheadConfiguration{})
+	enabled := true
+	p.lastPeriodicalEnabled = &enabled
+
+	if err := p.PeriodicalHandler(context.Background(), periodCtx(false)); err != nil {
+		t.Fatalf("PeriodicalHandler: %v", err)
+	}
+	if got, want := fCg.attaches, []attachCall{{rel: "", pid: 100}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cpuset leader reset = %+v, want %+v", got, want)
+	}
+	if len(fCg.controllerAttaches) != 0 {
+		t.Fatalf("cpu task-only reset must not receive a cpu cgroup.procs attach, got %+v", fCg.controllerAttaches)
+	}
+}
+
+func TestPeriodicalHandler_InvalidAppliedViewStillMigratesCPU(t *testing.T) {
+	t.Parallel()
+
+	fFS := newFakeFS()
+	fFS.reads["/sys/fs/cgroup/cpu/cgroup.procs"] = "100\n"
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		100: {PID: 100, Comm: "crond"},
+	}}
+	fCg := newFakeCgroup()
+	fCg.version = cgroupclient.CgroupVersionV1
+	fCg.mountErrs[cgcommon.CgroupSubsysCPUSet] = cgcommon.ErrControllerMountUnavailable
+	fCg.mounts[cgcommon.CgroupSubsysCPU] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpu"}
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+	effectiveEnabled := true
+	in := bulkheadapi.PeriodicalHandlerContext{
+		DynamicConf:      dynConf(true),
+		EffectiveEnabled: &effectiveEnabled,
+	}
+
+	if err := p.PeriodicalHandler(context.Background(), in); err != nil {
+		t.Fatalf("PeriodicalHandler: %v", err)
+	}
+	if got, want := fCg.controllerAttaches, []controllerAttachCall{{
+		controller: cgcommon.CgroupSubsysCPU, rel: "system", pid: 100,
+	}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cpu controller attaches = %+v, want %+v", got, want)
+	}
+	if p.lastMigratedAppliedViewRevision != 0 {
+		t.Fatalf("cpu-only migration must not consume applied-view revision, got %d", p.lastMigratedAppliedViewRevision)
+	}
+}
+
+func TestPeriodicalHandler_MixedCandidateMigratesOnlyCPUWhenCPUSetUnauthorized(t *testing.T) {
+	t.Parallel()
+
+	fFS := newFakeFS()
+	fFS.reads["/sys/fs/cgroup/cpuset/cgroup.procs"] = "100\n"
+	fFS.reads["/sys/fs/cgroup/cpu/cgroup.procs"] = "100\n"
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		100: {PID: 100, Comm: "crond"},
+	}}
+	fCg := newFakeCgroup()
+	fCg.version = cgroupclient.CgroupVersionV1
+	fCg.mounts[cgcommon.CgroupSubsysCPUSet] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpuset"}
+	fCg.mounts[cgcommon.CgroupSubsysCPU] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpu"}
+	fCg.existingDirs["system"] = true
+	seedTargetEffectiveCPUSet(fCg, "system", "0-1")
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+	in := bulkheadapi.PeriodicalHandlerContext{
+		DynamicConf:                   dynConf(true),
+		AppliedView:                   appliedViewWithReclaim(machine.NewCPUSet(2, 3)),
+		AppliedViewRevision:           10,
+		AppliedViewValidForPeriodical: true,
+	}
+
+	if err := p.PeriodicalHandler(context.Background(), in); err != nil {
+		t.Fatalf("PeriodicalHandler: %v", err)
+	}
+	if len(fCg.identityAttaches) != 0 {
+		t.Fatalf("unauthorized cpuset membership must not migrate, got %+v", fCg.identityAttaches)
+	}
+	if got, want := fCg.controllerAttaches, []controllerAttachCall{{
+		controller: cgcommon.CgroupSubsysCPU, rel: "system", pid: 100,
+	}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("cpu controller attaches = %+v, want %+v", got, want)
+	}
+	if p.lastMigratedAppliedViewRevision != 0 {
+		t.Fatalf("cpu-only migration must not consume applied-view revision, got %d", p.lastMigratedAppliedViewRevision)
+	}
+}
+
+func TestPeriodicalHandler_LaterCPUSetAuthorizationDoesNotRepeatCPU(t *testing.T) {
+	t.Parallel()
+
+	fFS := newFakeFS()
+	fFS.reads["/sys/fs/cgroup/cpuset/cgroup.procs"] = "100\n"
+	fFS.reads["/sys/fs/cgroup/cpu/cgroup.procs"] = "100\n"
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		100: {PID: 100, Comm: "crond"},
+	}}
+	fCg := newFakeCgroup()
+	fCg.version = cgroupclient.CgroupVersionV1
+	fCg.mounts[cgcommon.CgroupSubsysCPUSet] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpuset"}
+	fCg.mounts[cgcommon.CgroupSubsysCPU] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpu"}
+	fCg.existingDirs["system"] = true
+	seedTargetEffectiveCPUSet(fCg, "system", "0-1")
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+
+	invalid := bulkheadapi.PeriodicalHandlerContext{DynamicConf: dynConf(true)}
+	if err := p.PeriodicalHandler(context.Background(), invalid); err != nil {
+		t.Fatalf("first PeriodicalHandler: %v", err)
+	}
+	if len(fCg.controllerAttaches) != 1 {
+		t.Fatalf("first sweep must migrate cpu once, got %+v", fCg.controllerAttaches)
+	}
+
+	fFS.reads["/sys/fs/cgroup/cpu/cgroup.procs"] = ""
+	if err := p.PeriodicalHandler(context.Background(), appliedPeriodCtx(true, 11, machine.NewCPUSet(0, 1))); err != nil {
+		t.Fatalf("second PeriodicalHandler: %v", err)
+	}
+	if len(fCg.controllerAttaches) != 1 {
+		t.Fatalf("later cpuset authorization must not repeat cpu migration, got %+v", fCg.controllerAttaches)
+	}
+	if len(fCg.identityAttaches) != 1 || fCg.identityAttaches[0].pid != 100 {
+		t.Fatalf("later valid cpuset proof must migrate cpuset membership, got %+v", fCg.identityAttaches)
+	}
+	if p.lastMigratedAppliedViewRevision != 11 {
+		t.Fatalf("successful cpuset migration must consume revision 11, got %d", p.lastMigratedAppliedViewRevision)
+	}
+}
+
+func TestPeriodicalHandler_PreflightsControllerErrorsOnceWithoutCrossBlocking(t *testing.T) {
+	t.Parallel()
+
+	t.Run("cpuset authorization error does not block cpu", func(t *testing.T) {
+		fFS := newFakeFS()
+		fFS.reads["/sys/fs/cgroup/cpuset/cgroup.procs"] = "100\n101\n"
+		fFS.reads["/sys/fs/cgroup/cpu/cgroup.procs"] = "100\n101\n"
+		fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+			100: {PID: 100, Comm: "crond"},
+			101: {PID: 101, Comm: "rsyslogd"},
+		}}
+		fCg := newFakeCgroup()
+		fCg.version = cgroupclient.CgroupVersionV1
+		fCg.mounts[cgcommon.CgroupSubsysCPUSet] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpuset"}
+		fCg.mounts[cgcommon.CgroupSubsysCPU] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpu"}
+		fCg.existingDirs["system"] = true
+		fCg.cgroupFileErr = errors.New("read cpuset failed")
+		p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+
+		err := p.PeriodicalHandler(context.Background(), appliedPeriodCtx(true, 12, machine.NewCPUSet(0, 1)))
+		if err == nil {
+			t.Fatal("PeriodicalHandler must return the cpuset authorization error")
+		}
+		if got := strings.Count(err.Error(), "authorize cpuset target"); got != 1 {
+			t.Fatalf("cpuset authorization error count = %d, want 1: %v", got, err)
+		}
+		if len(fCg.controllerAttaches) != 2 {
+			t.Fatalf("cpuset authorization error must not block cpu migrations, got %+v", fCg.controllerAttaches)
+		}
+	})
+
+	t.Run("cpu ensure error does not block cpuset", func(t *testing.T) {
+		fFS := newFakeFS()
+		fFS.reads["/sys/fs/cgroup/cpuset/cgroup.procs"] = "100\n101\n"
+		fFS.reads["/sys/fs/cgroup/cpu/cgroup.procs"] = "100\n101\n"
+		fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+			100: {PID: 100, Comm: "crond"},
+			101: {PID: 101, Comm: "rsyslogd"},
+		}}
+		fCg := newFakeCgroup()
+		fCg.version = cgroupclient.CgroupVersionV1
+		fCg.mounts[cgcommon.CgroupSubsysCPUSet] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpuset"}
+		fCg.mounts[cgcommon.CgroupSubsysCPU] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpu"}
+		fCg.existingDirs["system"] = true
+		fCg.controllerEnsureErr[cgcommon.CgroupSubsysCPU] = errors.New("ensure failed")
+		seedTargetEffectiveCPUSet(fCg, "system", "0-1")
+		p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+
+		err := p.PeriodicalHandler(context.Background(), appliedPeriodCtx(true, 13, machine.NewCPUSet(0, 1)))
+		if err == nil {
+			t.Fatal("PeriodicalHandler must return the cpu ensure error")
+		}
+		if got := strings.Count(err.Error(), "ensure cpu target"); got != 1 {
+			t.Fatalf("cpu ensure error count = %d, want 1: %v", got, err)
+		}
+		if len(fCg.ensures) != 1 {
+			t.Fatalf("cpu target must be ensured once per sweep, got %+v", fCg.ensures)
+		}
+		if len(fCg.identityAttaches) != 2 {
+			t.Fatalf("cpu ensure error must not block cpuset migrations, got %+v", fCg.identityAttaches)
+		}
+	})
 }
