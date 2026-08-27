@@ -300,7 +300,8 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocks(
 
 	core := filterAdvisorDescriptors(descriptors, func(descriptor advisorBlockDescriptor) bool {
 		return descriptor.Class == advisorBlockClassDedicated ||
-			descriptor.Class == advisorBlockClassMandatoryReclaim
+			descriptor.Class == advisorBlockClassMandatoryReclaim ||
+			(!hardActive && descriptor.Class == advisorBlockClassShared && descriptor.NUMAID != commonstate.FakedNUMAID)
 	})
 	available, err = p.solveAdvisorDescriptorPhase(core, available, result, true, hardActive)
 	if err != nil {
@@ -312,7 +313,14 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocks(
 		return nil, err
 	}
 	for _, sourceBlockID := range sourceComponents {
-		available, err = p.solveAdvisorDescriptorPhase(componentMembers[sourceBlockID], available, result, false, hardActive)
+		members := componentMembers[sourceBlockID]
+		if !hardActive {
+			members = filterAdvisorDescriptors(members, func(descriptor advisorBlockDescriptor) bool {
+				_, allocated := result[descriptor.BlockID]
+				return !allocated
+			})
+		}
+		available, err = p.solveAdvisorDescriptorPhase(members, available, result, false, hardActive)
 		if err != nil {
 			return nil, fmt.Errorf("solve source/isolation component %q: %w", sourceBlockID, err)
 		}

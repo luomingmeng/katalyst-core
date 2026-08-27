@@ -198,7 +198,8 @@ func validatePartitionDemands(
 			return nil, nil, 0, fmt.Errorf("partition demand %q has negative quantity", demand.key)
 		}
 		if demand.class != advisorBlockClassDedicated &&
-			demand.class != advisorBlockClassMandatoryReclaim {
+			demand.class != advisorBlockClassMandatoryReclaim &&
+			demand.class != advisorBlockClassShared {
 			return nil, nil, 0, fmt.Errorf("partition demand %q has unsupported class %q", demand.key, demand.class)
 		}
 		if demand.eligible.Size() < demand.quantity {

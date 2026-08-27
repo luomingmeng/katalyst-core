@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sync"
@@ -528,6 +529,193 @@ func TestGenerateBlockCPUSetDisjointPlannerUsesJointRPEligibility(t *testing.T) 
 	require.True(t, shrunk["dedicated-rotated"].IsSubsetOf(got["dedicated-rotated"]))
 	require.Equal(t, 1, got["dedicated-rotated"].Difference(shrunk["dedicated-rotated"]).
 		Union(shrunk["dedicated-rotated"].Difference(got["dedicated-rotated"])).Size())
+}
+
+func TestGenerateBlockCPUSetDisjointPlannerJointlySolvesRemainingShared(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(16, 2, 2)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	numa0CPUs := numa0.ToSliceInt()
+	require.Len(t, numa0CPUs, 8)
+	pinned := machine.NewCPUSet(numa0CPUs[:4]...)
+	unpinned := numa0.Difference(pinned)
+	machineState := policy.state.GetMachineState()
+	machineState[0].ResourcePackageStates = map[string]*state.ResourcePackageState{
+		"rp-a": {PinnedCPUSet: pinned},
+	}
+	policy.state.SetMachineState(machineState, false)
+
+	resp := advisorBlockTestResponse([]advisorBlockTestAlias{
+		{
+			entry: "pod-dedicated", subEntry: "main",
+			owner:  resourcepackage.WrapOwnerPoolName(commonstate.PoolNameDedicated, "rp-a"),
+			numaID: 0, blockID: "dedicated", quantity: 2,
+		},
+		{
+			entry: commonstate.PoolNameReclaim, subEntry: commonstate.FakedContainerName,
+			owner:  commonstate.PoolNameReclaim,
+			numaID: 0, blockID: "reclaim", quantity: 2,
+		},
+		{
+			entry: "latency-sensitive-share", subEntry: commonstate.FakedContainerName,
+			owner:  "latency-sensitive-share",
+			numaID: 0, blockID: "remaining-shared", quantity: 4,
+		},
+	}, rand.New(rand.NewSource(13)))
+	resp.DisableDedicatedCoresOverlapReclaimedCores = true
+	featureGates := map[string]*advisorsvc.FeatureGate{
+		feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition: {
+			Name: feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
+		},
+	}
+
+	got, err := policy.generateBlockCPUSet(resp, featureGates, false)
+	require.NoError(t, err)
+	require.Equal(t, unpinned, got["remaining-shared"])
+	require.True(t, got["dedicated"].IsSubsetOf(pinned))
+	require.True(t, got["reclaim"].IsSubsetOf(pinned))
+	require.True(t, got["dedicated"].Intersection(got["reclaim"]).IsEmpty())
+	require.Equal(t, numa0, got["dedicated"].Union(got["reclaim"]).Union(got["remaining-shared"]))
+}
+
+func TestSolveAdvisorDescriptorPhaseDoesNotStarveNarrowShared(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(256, 2, 8)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	allCPUs := topology.CPUDetails.CPUs()
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	numa0CPUs := numa0.ToSliceInt()
+	require.Len(t, numa0CPUs, 32)
+
+	base := []advisorBlockDescriptor{
+		{
+			BlockID: "reclaim-numa0", Owners: []string{"reclaim"},
+			Class: advisorBlockClassMandatoryReclaim, NUMAID: 0, Quantity: 28,
+			ComponentKey: "reclaim-numa0", Eligible: numa0,
+			OldPreferred: machine.NewCPUSet(numa0CPUs[:28]...),
+		},
+		{
+			BlockID: "reclaim-global", Owners: []string{"reclaim"},
+			Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID, Quantity: 220,
+			ComponentKey: "reclaim-global", Eligible: allCPUs,
+			OldPreferred: allCPUs.Difference(machine.NewCPUSet(numa0CPUs[28:]...)),
+		},
+		{
+			BlockID: "shared-numa0", Owners: []string{"shared-numa0"},
+			Class: advisorBlockClassShared, NUMAID: 0, Quantity: 4,
+			ComponentKey: "shared-numa0", Eligible: numa0,
+		},
+	}
+
+	var want advisorapi.BlockCPUSet
+	for seed := int64(0); seed < 20; seed++ {
+		descriptors := append([]advisorBlockDescriptor(nil), base...)
+		rand.New(rand.NewSource(seed)).Shuffle(len(descriptors), func(i, j int) {
+			descriptors[i], descriptors[j] = descriptors[j], descriptors[i]
+		})
+		got := advisorapi.BlockCPUSet{}
+		remaining, solveErr := policy.solveAdvisorDescriptorPhase(descriptors, allCPUs, got, true, false)
+		require.NoError(t, solveErr, "seed %d", seed)
+		require.Equal(t, 28, got["reclaim-numa0"].Size(), "seed %d", seed)
+		require.Equal(t, 220, got["reclaim-global"].Size(), "seed %d", seed)
+		require.Equal(t, 4, got["shared-numa0"].Size(), "seed %d", seed)
+		require.True(t, got["shared-numa0"].IsSubsetOf(numa0), "seed %d", seed)
+		require.Equal(t, 4, remaining.Size(), "seed %d", seed)
+		require.True(t, remaining.Intersection(numa0).IsEmpty(), "seed %d", seed)
+		require.LessOrEqual(t,
+			got["reclaim-numa0"].Union(got["reclaim-global"]).Intersection(numa0).Size(),
+			28,
+			"seed %d", seed)
+		if seed == 0 {
+			want = got
+			continue
+		}
+		require.Equal(t, want, got, "seed %d", seed)
+	}
+}
+
+func TestSolveAdvisorDescriptorPhaseHandles24Plus178Plus4(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(256, 2, 8)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	outside := topology.CPUDetails.CPUs().Difference(numa0).ToSliceInt()
+	available := numa0.Union(machine.NewCPUSet(outside[:176]...))
+	numa0CPUs := numa0.ToSliceInt()
+	descriptors := []advisorBlockDescriptor{
+		{
+			BlockID: "reclaim-numa0", Owners: []string{"reclaim"},
+			Class: advisorBlockClassMandatoryReclaim, NUMAID: 0, Quantity: 24,
+			ComponentKey: "reclaim-numa0", Eligible: numa0,
+			OldPreferred: machine.NewCPUSet(numa0CPUs[:24]...),
+		},
+		{
+			BlockID: "reclaim-global", Owners: []string{"reclaim"},
+			Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID, Quantity: 178,
+			ComponentKey: "reclaim-global", Eligible: available,
+			OldPreferred: available.Difference(machine.NewCPUSet(numa0CPUs[24:]...)),
+		},
+		{
+			BlockID: "shared-numa0", Owners: []string{"shared-numa0"},
+			Class: advisorBlockClassShared, NUMAID: 0, Quantity: 4,
+			ComponentKey: "shared-numa0", Eligible: numa0,
+		},
+	}
+
+	got := advisorapi.BlockCPUSet{}
+	remaining, err := policy.solveAdvisorDescriptorPhase(descriptors, available, got, true, false)
+
+	require.NoError(t, err)
+	require.Equal(t, 24, got["reclaim-numa0"].Size())
+	require.Equal(t, 178, got["reclaim-global"].Size())
+	require.Equal(t, 4, got["shared-numa0"].Size())
+	require.True(t, got["shared-numa0"].IsSubsetOf(numa0))
+	require.Equal(t, 2, remaining.Size())
+}
+
+func TestSolveAdvisorDescriptorPhaseFailureIsAtomic(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(256, 2, 8)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	allCPUs := topology.CPUDetails.CPUs()
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	result := advisorapi.BlockCPUSet{"sentinel": machine.NewCPUSet(255)}
+	before := result["sentinel"].Clone()
+	descriptors := []advisorBlockDescriptor{
+		{
+			BlockID: "reclaim-numa0", Owners: []string{"reclaim"},
+			Class: advisorBlockClassMandatoryReclaim, NUMAID: 0, Quantity: 30,
+			ComponentKey: "reclaim-numa0", Eligible: numa0,
+		},
+		{
+			BlockID: "shared-numa0", Owners: []string{"shared-numa0"},
+			Class: advisorBlockClassShared, NUMAID: 0, Quantity: 4,
+			ComponentKey: "shared-numa0", Eligible: numa0,
+		},
+	}
+
+	remaining, err := policy.solveAdvisorDescriptorPhase(descriptors, allCPUs, result, true, false)
+
+	require.Error(t, err)
+	require.Equal(t, allCPUs, remaining)
+	require.Equal(t, advisorapi.BlockCPUSet{"sentinel": before}, result)
 }
 
 func TestGenerateBlockCPUSetLegacyIgnoresNegotiatedDisjointPlanner(t *testing.T) {
