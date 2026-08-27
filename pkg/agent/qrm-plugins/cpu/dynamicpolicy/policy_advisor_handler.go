@@ -25,7 +25,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"strconv"
 	"time"
 
 	"github.com/samber/lo"
@@ -1974,10 +1973,6 @@ func (p *DynamicPolicy) applyBlocks(
 					allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName, allocationInfo.AllocationResult.String())
 			} else {
 				for numaID, cpus := range allocationInfo.TopologyAwareAssignments {
-					_ = p.emitter.StoreInt64(util.MetricNamePoolSize, int64(cpus.Size()),
-						metrics.MetricTypeNameRaw, metrics.MetricTag{Key: "poolName", Val: allocationInfo.OwnerPoolName},
-						metrics.MetricTag{Key: "pool_type", Val: commonstate.GetPoolType(allocationInfo.OwnerPoolName)},
-						metrics.MetricTag{Key: "numa_id", Val: strconv.Itoa(numaID)})
 					general.Infof("try to apply pool %s numa %d: %s", allocationInfo.OwnerPoolName, numaID, cpus.String())
 				}
 			}

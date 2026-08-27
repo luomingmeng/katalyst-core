@@ -31,6 +31,8 @@ import (
 func TestCommitPendingCPUPartitionRunsHooksBeforeValidation(t *testing.T) {
 	p, cleanup := newReclaimReuseTestPolicy(t)
 	defer cleanup()
+	emitter := &recordingMetricEmitter{}
+	p.emitter = emitter
 
 	candidate := precommitPartitionEntries(machine.NewCPUSet(0, 1), machine.NewCPUSet(2, 3))
 	original := candidate.Clone()
@@ -51,11 +53,14 @@ func TestCommitPendingCPUPartitionRunsHooksBeforeValidation(t *testing.T) {
 	require.Equal(t, original, candidate, "precommit must only mutate its cloned candidate")
 	require.Nil(t, p.state.GetAllocationInfo("dedicated-pod", "main"),
 		"candidate made invalid by a hook must not be committed")
+	require.Empty(t, emitter.records, "failed commit must not emit pool size metrics")
 }
 
 func TestCommitPendingCPUPartitionNormalizesBeforeRebuildingMachineState(t *testing.T) {
 	p, cleanup := newReclaimReuseTestPolicy(t)
 	defer cleanup()
+	emitter := &recordingMetricEmitter{}
+	p.emitter = emitter
 
 	candidate := precommitPartitionEntries(machine.NewCPUSet(0, 1), machine.NewCPUSet(2, 3))
 	dedicated := candidate["dedicated-pod"]["main"]
@@ -72,6 +77,8 @@ func TestCommitPendingCPUPartitionNormalizesBeforeRebuildingMachineState(t *test
 	require.True(t, committed["dedicated-pod"]["main"].TopologyAwareAssignments[0].Equals(machine.NewCPUSet(2, 3)))
 	require.Empty(t, committed["dedicated-pod"]["main"].TopologyAwareAssignments[1])
 	require.True(t, machineState[0].PodEntries["dedicated-pod"]["main"].AllocationResult.Equals(machine.NewCPUSet(2, 3)))
+	require.Len(t, emitter.records, 1)
+	requirePoolSizeMetric(t, emitter.records, commonstate.PoolNameReclaim, 0, 2)
 }
 
 func TestCommitPendingCPUPartitionRejectsRevisionChangedByHook(t *testing.T) {

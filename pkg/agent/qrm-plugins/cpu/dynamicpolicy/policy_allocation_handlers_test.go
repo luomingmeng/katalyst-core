@@ -5084,6 +5084,7 @@ func TestNewRampUpPlanningPolicyPreservesCPUAdvisorState(t *testing.T) {
 
 	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
 	require.NoError(t, err)
+	p.emitter = &recordingMetricEmitter{}
 	p.enableCPUAdvisor = true
 	p.advisorMonitor, err = timemonitor.NewTimeMonitor(
 		"advisor",
@@ -5101,6 +5102,8 @@ func TestNewRampUpPlanningPolicyPreservesCPUAdvisorState(t *testing.T) {
 
 	require.True(t, planningPolicy.enableCPUAdvisor,
 		"planning policy should keep advisor quantity source when outer policy uses advisor")
+	require.IsType(t, metrics.DummyMetrics{}, planningPolicy.emitter,
+		"planning policy must use a no-op metric emitter")
 	require.Same(t, p.advisorMonitor, planningPolicy.advisorMonitor,
 		"planning policy should share advisor health monitor with outer policy")
 }

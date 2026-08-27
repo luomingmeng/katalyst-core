@@ -847,7 +847,7 @@ func (p *DynamicPolicy) rollbackFailedDNBAllocation(
 // runtime handlers, so planning cannot expose transient state or touch cgroups.
 func (p *DynamicPolicy) newRampUpPlanningPolicy(planningState state.State) *DynamicPolicy {
 	return &DynamicPolicy{
-		emitter:                         p.emitter,
+		emitter:                         metrics.DummyMetrics{},
 		metaServer:                      p.metaServer,
 		machineInfo:                     p.machineInfo,
 		state:                           planningState,
@@ -2292,13 +2292,6 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 			OriginalAllocationResult:         cset.Clone(),
 			TopologyAwareAssignments:         topologyAwareAssignments,
 			OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(topologyAwareAssignments),
-		}
-
-		for numaID, cpus := range topologyAwareAssignments {
-			_ = p.emitter.StoreInt64(util.MetricNamePoolSize, int64(cpus.Size()),
-				metrics.MetricTypeNameRaw, metrics.MetricTag{Key: "poolName", Val: poolName},
-				metrics.MetricTag{Key: "pool_type", Val: commonstate.GetPoolType(poolName)},
-				metrics.MetricTag{Key: "numa_id", Val: strconv.Itoa(numaID)})
 		}
 	}
 

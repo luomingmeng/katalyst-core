@@ -878,6 +878,8 @@ func TestDynamicPolicyApplyBlocksMaterializesDefaultShareFromResidual(t *testing
 	require.NoError(t, err)
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 	require.NoError(t, err)
+	emitter := &recordingMetricEmitter{}
+	policy.emitter = emitter
 	dynamicConf := policy.dynamicConfig.GetDynamicConfiguration()
 	dynamicConf.FillDefaultSharePoolWithNonReclaimCPUs = true
 	dynamicConf.EnableReclaim = true
@@ -960,6 +962,8 @@ func TestDynamicPolicyApplyBlocksMaterializesDefaultShareFromResidual(t *testing
 	share := pending.entries[commonstate.PoolNameShare][commonstate.FakedContainerName].AllocationResult
 	require.True(t, share.Equals(machine.NewCPUSet(4, 5)),
 		"frozen hard-active state must keep the legacy reclaim floor while newEntries is incomplete, got %s", share)
+	require.NoError(t, policy.commitPendingAdvisorState(pending))
+	requirePoolSizeMetric(t, emitter.records, commonstate.PoolNameShare, 0, int64(share.Size()))
 }
 
 func TestDynamicPolicyApplyBlocksExcludesDNBFromDefaultShareResidual(t *testing.T) {

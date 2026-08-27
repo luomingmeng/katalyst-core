@@ -110,6 +110,7 @@ func (p *DynamicPolicy) commitPreparedCPUPartition(prepared *preparedCPUPartitio
 	); err != nil {
 		return err
 	}
+	p.emitFinalPoolSizeMetrics(prepared.entries)
 	return nil
 }
 
