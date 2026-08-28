@@ -116,11 +116,10 @@ func (mg *memoryGuard) GetAdvices() types.InternalMemoryCalculationResult {
 		return types.InternalMemoryCalculationResult{}
 	}
 
-	d := mg.conf.GetDynamicConfiguration()
 	result := types.InternalMemoryCalculationResult{}
 
 	memoryMax := mg.reclaimMemoryLimit.Load()
-	memoryLimits := mg.calculateCgroupMemoryLimits(d, mg.reclaimRelativeRootCgroupPaths, memoryMax)
+	memoryLimits := calculateCgroupMemoryLimits(mg.reclaimRelativeRootCgroupPaths, memoryMax)
 	for _, path := range mg.reclaimRelativeRootCgroupPaths {
 		max := memoryLimits[path]
 		high := calculateMemoryHigh(max)
@@ -141,7 +140,7 @@ func (mg *memoryGuard) GetAdvices() types.InternalMemoryCalculationResult {
 			if !ok {
 				continue
 			}
-			numaMemoryLimits := mg.calculateCgroupMemoryLimits(d, paths, numaMemoryMax)
+			numaMemoryLimits := calculateCgroupMemoryLimits(paths, numaMemoryMax)
 			for _, path := range paths {
 				max := numaMemoryLimits[path]
 				high := calculateMemoryHigh(max)
@@ -169,85 +168,20 @@ func calculateMemoryHigh(limit int64) int64 {
 	return int64(float64(limit) * memoryHighScaleFactor)
 }
 
-// calculateCgroupMemoryLimits distributes one memory-guard budget across a
-// homogeneous group of reclaim cgroups. The configured percentage gives each
-// path its preferred share, while current memory usage is treated as an
-// unreducible floor so we never advise a limit below what the cgroup already
-// consumes.
-func (mg *memoryGuard) calculateCgroupMemoryLimits(dynamicConfig *dynamicconfig.Configuration, cgroupPaths []string, totalLimit int64) map[string]int64 {
+// calculateCgroupMemoryLimits applies the same memory-guard budget to every
+// reclaim cgroup path in the group. Consumer percentage is intentionally not
+// applied here; headroom policies account for it when aggregating the advised
+// limits back into a single reclaim headroom cap.
+// TODO: a node can currently safely support only one reclaim consumer. Multiple
+// reclaim consumers may overuse memory because each consumer root receives the
+// full memory-guard budget and there is no shared enforcement boundary.
+func calculateCgroupMemoryLimits(cgroupPaths []string, totalLimit int64) map[string]int64 {
 	limits := make(map[string]int64, len(cgroupPaths))
-	if totalLimit == reclaimMemoryUnlimited {
-		for _, path := range cgroupPaths {
-			limits[path] = reclaimMemoryUnlimited
-		}
-		return limits
-	}
-
-	reducible := make(map[string]int64, len(cgroupPaths))
-	totalAssigned := int64(0)
-	totalReducible := int64(0)
-
 	for _, path := range cgroupPaths {
-		pct := reclaim.GetReclaimedPercentageByPath(dynamicConfig, path)
-		limit := int64(float64(totalLimit) * pct / 100.0)
-		floor := mg.getCgroupMemoryUsageFloor(path)
-		if limit < floor {
-			limit = floor
-		}
-		limits[path] = limit
-		totalAssigned += limit
-
-		if limit > floor {
-			reducible[path] = limit - floor
-			totalReducible += reducible[path]
-		}
-	}
-
-	// If usage floors lift some cgroups above their percentage shares, reclaim
-	// the excess only from the reducible part of other paths. Floor itself is
-	// intentionally not reduced; if floor sum already exceeds totalLimit, the
-	// unavoidable over-budget amount is preserved instead of setting unsafe
-	// limits below current usage.
-	excess := totalAssigned - totalLimit
-	if excess <= 0 || totalReducible <= 0 {
-		return limits
-	}
-
-	remainingExcess := excess
-	remainingReducible := totalReducible
-	for _, path := range cgroupPaths {
-		pathReducible := reducible[path]
-		if pathReducible <= 0 {
-			continue
-		}
-
-		reduction := remainingExcess * pathReducible / remainingReducible
-		if reduction > pathReducible {
-			reduction = pathReducible
-		}
-		limits[path] -= reduction
-		remainingExcess -= reduction
-		remainingReducible -= pathReducible
+		limits[path] = totalLimit
 	}
 
 	return limits
-}
-
-func (mg *memoryGuard) getCgroupMemoryUsageFloor(cgroupPath string) int64 {
-	if mg.metaServer == nil || mg.metaServer.MetricsFetcher == nil {
-		return 0
-	}
-
-	usage, err := mg.metaServer.GetCgroupMetric(cgroupPath, consts.MetricMemUsageCgroup)
-	if err != nil {
-		return 0
-	}
-
-	if usage.Value <= 0 {
-		return 0
-	}
-
-	return int64(usage.Value)
 }
 
 func (mg *memoryGuard) calculateReclaimedMemoryLimitFor(dynamicConfig *dynamicconfig.Configuration, numaID int, reclaimedCgroupPaths []string, zoneInfos []machine.NormalZoneInfo) (float64, error) {

@@ -260,7 +260,10 @@ func (p *PolicyNUMAAware) GetHeadroom() (resource.Quantity, map[int]resource.Qua
 }
 
 // sumCgroupMetric returns the sum of the given metric across the provided
-// cgroup paths. Paths whose metric cannot be read are skipped with an info
+// cgroup paths. Memory limit metrics are weighted by each reclaim consumer's
+// configured percentage because memory-guard writes the full reclaim budget to
+// every consumer root. Other metrics remain plain sums.
+// Paths whose metric cannot be read are skipped with an info
 // log so that a single missing cgroup does not fail the whole query.
 // The bool return is true only when at least one path yielded a value;
 // callers use it to distinguish "aggregate found" from "no data at all".
@@ -273,7 +276,11 @@ func (p *PolicyNUMAAware) sumCgroupMetric(paths []string, metric string) (float6
 			general.Infof("skip missing reclaim cgroup metric for %s: %v", cgroupPath, err)
 			continue
 		}
-		total += data.Value
+		value := data.Value
+		if metric == consts.MetricMemLimitCgroup {
+			value *= reclaim.GetReclaimedPercentageByPath(p.conf.GetDynamicConfiguration(), cgroupPath) / 100
+		}
+		total += value
 		found = true
 	}
 	if !found {

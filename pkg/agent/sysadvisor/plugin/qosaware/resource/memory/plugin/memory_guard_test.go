@@ -47,8 +47,7 @@ func TestGetAdvices_MultiPath(t *testing.T) {
 	t.Parallel()
 
 	// Register two consumers so both parent paths + NUMA-binding paths land
-	// in the reverse index; GetReclaimedPercentageByPath will resolve each
-	// path to its owner.
+	// in the reverse index.
 	machineInfo := &machine.KatalystMachineInfo{
 		CPUTopology: &machine.CPUTopology{
 			CPUDetails: machine.CPUDetails{
@@ -90,7 +89,7 @@ func TestGetAdvices_MultiPath(t *testing.T) {
 	require.Contains(t, paths, "/parentPath/childPath-0")
 }
 
-func TestGetAdvices_ScalesConsumerLimitsByConfiguredPercentage(t *testing.T) {
+func TestGetAdvices_SetsTotalLimitForEveryReclaimPath(t *testing.T) {
 	t.Parallel()
 
 	machineInfo := &machine.KatalystMachineInfo{
@@ -134,15 +133,15 @@ func TestGetAdvices_ScalesConsumerLimitsByConfiguredPercentage(t *testing.T) {
 
 	got := mg.GetAdvices()
 
-	require.Equal(t, int64(0), memoryLimitAdvice(t, got, "/group-a"))
+	require.Equal(t, int64(1024), memoryLimitAdvice(t, got, "/group-a"))
 	require.Equal(t, int64(1024), memoryLimitAdvice(t, got, "/group-b"))
-	require.Equal(t, int64(0), memoryLimitAdvice(t, got, "/group-a-0"))
+	require.Equal(t, int64(512), memoryLimitAdvice(t, got, "/group-a-0"))
 	require.Equal(t, int64(512), memoryLimitAdvice(t, got, "/group-b-0"))
-	require.Equal(t, int64(0), memoryLimitAdvice(t, got, "/group-a-1"))
+	require.Equal(t, int64(256), memoryLimitAdvice(t, got, "/group-a-1"))
 	require.Equal(t, int64(256), memoryLimitAdvice(t, got, "/group-b-1"))
 }
 
-func TestGetAdvices_UsesCgroupUsageAsLimitFloor(t *testing.T) {
+func TestGetAdvices_SetsTotalLimitEvenWhenUsageMetricExists(t *testing.T) {
 	t.Parallel()
 
 	machineInfo := &machine.KatalystMachineInfo{
@@ -169,6 +168,8 @@ func TestGetAdvices_UsesCgroupUsageAsLimitFloor(t *testing.T) {
 
 	now := time.Now()
 	fakeFetcher := agentmetric.NewFakeMetricsFetcher(metrics.DummyMetrics{}).(*agentmetric.FakeMetricsFetcher)
+	// Existing usage no longer participates in per-consumer limit splitting:
+	// memoryGuard writes the total limit to every reclaim path.
 	fakeFetcher.SetCgroupMetric("/usage-floor-a", consts.MetricMemUsageCgroup, metric.MetricData{Value: 128, Time: &now})
 	fakeFetcher.SetCgroupMetric("/usage-floor-a-0", consts.MetricMemUsageCgroup, metric.MetricData{Value: 64, Time: &now})
 
@@ -193,10 +194,10 @@ func TestGetAdvices_UsesCgroupUsageAsLimitFloor(t *testing.T) {
 
 	got := mg.GetAdvices()
 
-	require.Equal(t, int64(128), memoryLimitAdvice(t, got, "/usage-floor-a"))
-	require.Equal(t, int64(896), memoryLimitAdvice(t, got, "/usage-floor-b"))
-	require.Equal(t, int64(64), memoryLimitAdvice(t, got, "/usage-floor-a-0"))
-	require.Equal(t, int64(448), memoryLimitAdvice(t, got, "/usage-floor-b-0"))
+	require.Equal(t, int64(1024), memoryLimitAdvice(t, got, "/usage-floor-a"))
+	require.Equal(t, int64(1024), memoryLimitAdvice(t, got, "/usage-floor-b"))
+	require.Equal(t, int64(512), memoryLimitAdvice(t, got, "/usage-floor-a-0"))
+	require.Equal(t, int64(512), memoryLimitAdvice(t, got, "/usage-floor-b-0"))
 }
 
 func newGuardConf(cgroupPath string) *config.Configuration {
