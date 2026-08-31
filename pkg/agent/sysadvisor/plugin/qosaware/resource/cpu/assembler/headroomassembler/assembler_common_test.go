@@ -369,7 +369,7 @@ func TestHeadroomAssemblerCommon_GetHeadroom(t *testing.T) {
 					require.NoError(t, err)
 				},
 			},
-			want: *resource.NewQuantity(6, resource.DecimalSI),
+			want: *resource.NewQuantity(7, resource.DecimalSI),
 		},
 		{
 			name: "allow shared cores overlap reclaimed cores",
@@ -718,7 +718,7 @@ func TestHeadroomAssemblerCommon_GetHeadroom(t *testing.T) {
 					require.NoError(t, err)
 				},
 			},
-			want: *resource.NewQuantity(80, resource.DecimalSI),
+			want: *resource.NewQuantity(81, resource.DecimalSI),
 		},
 		{
 			name: "numa-exclusive region headroom",
@@ -1025,7 +1025,7 @@ func TestHeadroomAssemblerCommon_GetHeadroom(t *testing.T) {
 	}
 }
 
-func TestHeadroomAssemblerCommon_PreservesCoreAlignedGlobalHeadroom(t *testing.T) {
+func TestHeadroomAssemblerCommon_PreservesGlobalHeadroomAcrossNUMAs(t *testing.T) {
 	conf := generateTestConfiguration(t, t.TempDir(), t.TempDir())
 	conf.GetDynamicConfiguration().ReclaimedResourceConfiguration = &reclaimedresource.ReclaimedResourceConfiguration{
 		EnableReclaim: true,
@@ -1094,7 +1094,6 @@ func TestHeadroomAssemblerCommon_PreservesCoreAlignedGlobalHeadroom(t *testing.T
 		4: 10, 5: 10, 6: 8, 7: 8,
 	}, headroomValues(numa))
 	for numaID, headroom := range numa {
-		require.Zero(t, headroom.Value()%int64(cpuTopology.CPUsPerCore()))
 		require.LessOrEqual(t, headroom.Value(), int64(assignments[numaID].Size()))
 	}
 	require.Equal(t, map[string]int64{
@@ -1111,7 +1110,7 @@ func TestHeadroomAssemblerCommon_PreservesCoreAlignedGlobalHeadroom(t *testing.T
 	}
 }
 
-func TestAlignBindingNUMAHeadroom(t *testing.T) {
+func TestClampBindingNUMAHeadroom(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -1121,16 +1120,22 @@ func TestAlignBindingNUMAHeadroom(t *testing.T) {
 		want     int64
 	}{
 		{
-			name:     "clamps before aligning",
+			name:     "clamps to the numa cpu limit",
 			headroom: "13",
 			limit:    10,
 			want:     10,
 		},
 		{
-			name:     "drops only the local remainder",
+			name:     "keeps the sub-core remainder instead of aligning down",
 			headroom: "9",
 			limit:    10,
-			want:     8,
+			want:     9,
+		},
+		{
+			name:     "negative headroom is floored to zero",
+			headroom: "-3",
+			limit:    10,
+			want:     0,
 		},
 	}
 	for _, tt := range tests {
@@ -1142,7 +1147,7 @@ func TestAlignBindingNUMAHeadroom(t *testing.T) {
 				cpuIDs[cpuID] = cpuID
 			}
 			cpuSet := machine.NewCPUSet(cpuIDs...)
-			got := alignBindingNUMAHeadroom(resource.MustParse(tt.headroom), cpuSet, 2)
+			got := clampBindingNUMAHeadroom(resource.MustParse(tt.headroom), cpuSet)
 			require.Equal(t, tt.want, got.Value())
 		})
 	}

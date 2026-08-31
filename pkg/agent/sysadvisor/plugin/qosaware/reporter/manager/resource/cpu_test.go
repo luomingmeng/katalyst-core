@@ -118,10 +118,16 @@ func TestCPUNUMAResultApportioner(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(64), effective.Value())
 	require.Len(t, allocations, 8)
+	// quantum=1: the target is distributed by largest-remainder without rounding
+	// down to a whole-core multiple, so per-NUMA shares are not uniform.
+	want := map[int]int64{0: 9, 1: 9, 2: 8, 3: 8, 4: 8, 5: 8, 6: 7, 7: 7}
+	var sum int64
 	for numaID := 0; numaID < 8; numaID++ {
 		allocation := allocations[numaID]
-		require.Equal(t, int64(8), allocation.Value(), "numa %d", numaID)
+		require.Equal(t, want[numaID], allocation.Value(), "numa %d", numaID)
+		sum += allocation.Value()
 	}
+	require.Equal(t, int64(64), sum)
 }
 
 func TestCPUReservedHeadroomApportionmentIsAtomic(t *testing.T) {
@@ -172,10 +178,12 @@ func TestCPUReservedHeadroomApportionmentIsAtomic(t *testing.T) {
 	require.NotNil(t, manager.lastReportResult)
 	require.Equal(t, int64(64), manager.lastReportResult.Value())
 	require.Len(t, manager.lastNUMAReportResult, 8)
+	// quantum=1 distribution of target 64 (76 - 12 reserved) by largest-remainder.
+	wantNUMA := map[int]int64{0: 9, 1: 9, 2: 8, 3: 8, 4: 8, 5: 8, 6: 7, 7: 7}
 	var numaSum int64
 	for numaID := 0; numaID < 8; numaID++ {
 		numaValue := manager.lastNUMAReportResult[numaID]
-		require.Equal(t, int64(8), numaValue.Value(), "numa %d", numaID)
+		require.Equal(t, wantNUMA[numaID], numaValue.Value(), "numa %d", numaID)
 		numaSum += numaValue.Value()
 	}
 	require.Equal(t, int64(64), numaSum)
@@ -200,10 +208,10 @@ func TestCPUHeadroomMinimumAndReserveSemantics(t *testing.T) {
 		wantNUMA  map[int]int64
 	}{
 		{
-			name:      "smt2 aligns positive minimum down",
+			name:      "positive minimum is reported without core alignment",
 			minimum:   "5",
-			wantTotal: 4,
-			wantNUMA:  map[int]int64{0: 2, 1: 2},
+			wantTotal: 5,
+			wantNUMA:  map[int]int64{0: 3, 1: 2},
 		},
 		{
 			name:      "zero minimum clamps reserve underflow to zero",
@@ -315,6 +323,6 @@ func TestCPUApportionmentMetrics(t *testing.T) {
 
 	expectedTags := map[string]string{"component": "reporter", "resource": "cpu"}
 	require.Equal(t, metricSample{value: 65, tags: expectedTags}, emitter.samples["headroom_apportion_requested"])
-	require.Equal(t, metricSample{value: 64, tags: expectedTags}, emitter.samples["headroom_apportion_effective"])
-	require.Equal(t, metricSample{value: 1, tags: expectedTags}, emitter.samples["headroom_apportion_alignment_loss"])
+	require.Equal(t, metricSample{value: 65, tags: expectedTags}, emitter.samples["headroom_apportion_effective"])
+	require.Equal(t, metricSample{value: 0, tags: expectedTags}, emitter.samples["headroom_apportion_alignment_loss"])
 }
