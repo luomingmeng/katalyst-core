@@ -20,6 +20,7 @@ import (
 	"fmt"
 
 	bulkheadapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/plugins/cpumetrics"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/plugins/cpusetmems"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/plugins/cpusettopology"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/plugins/rdt/cat"
@@ -36,6 +37,7 @@ var defaultPluginFactories = []bulkheadapi.PluginFactory{
 	systemservice.NewSystemServicePlugin,
 	cpulist.NewCPUListPlugin,
 	cat.NewCATPlugin,
+	cpumetrics.NewCPUMetricsPlugin,
 }
 
 func NewDefaultPlugins(conf *config.Configuration) ([]bulkheadapi.Plugin, error) {
