@@ -22,7 +22,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
+	"github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
@@ -187,4 +189,128 @@ func newDynamicConfigWithEnableReclaim(enabled bool) *dynamicconfig.DynamicAgent
 	dyn.EnableReclaim = enabled
 	conf.SetDynamicConfiguration(dyn)
 	return conf
+}
+
+func dedicatedMainContainerEntry(podUID string, assignments map[int]machine.CPUSet) *state.AllocationInfo {
+	return &state.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        podUID,
+			ContainerType: pluginapi.ContainerType_MAIN.String(),
+			QoSLevel:      consts.PodAnnotationQoSLevelDedicatedCores,
+		},
+		TopologyAwareAssignments: assignments,
+	}
+}
+
+// collectPoolSizeMetrics folds the recorded pool size series into a map keyed by
+// "poolName/pool_type/numa_id" so that both the value and the pool_type label can
+// be asserted deterministically.
+func collectPoolSizeMetrics(t *testing.T, records []metricRecord) map[string]int64 {
+	t.Helper()
+
+	actual := make(map[string]int64)
+	for _, record := range records {
+		require.Equal(t, util.MetricNamePoolSize, record.key)
+		require.Equal(t, metrics.MetricTypeNameRaw, record.emitType)
+
+		tags := make(map[string]string, len(record.tags))
+		for _, tag := range record.tags {
+			tags[tag.Key] = tag.Val
+		}
+		actual[tags["poolName"]+"/"+tags["pool_type"]+"/"+tags["numa_id"]] = record.val
+	}
+	return actual
+}
+
+func TestEmitFinalPoolSizeMetricsWithDedicated(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		entries state.PodEntries
+		want    map[string]int64
+	}{
+		{
+			name: "single dedicated pod single numa",
+			entries: state.PodEntries{
+				commonstate.PoolNameShare: {
+					commonstate.FakedContainerName: {
+						AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+						TopologyAwareAssignments: map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1)},
+					},
+				},
+				"dedicated-pod": {
+					"container": dedicatedMainContainerEntry("dedicated-pod",
+						map[int]machine.CPUSet{0: machine.NewCPUSet(2, 3, 4, 5)}),
+				},
+			},
+			want: map[string]int64{
+				commonstate.PoolNameShare + "/" + commonstate.PoolNameShare + "/0":         2,
+				commonstate.PoolNameDedicated + "/" + commonstate.PoolNameDedicated + "/0": 4,
+			},
+		},
+		{
+			name: "dedicated pod cross numa siblings aggregated per numa",
+			entries: state.PodEntries{
+				"dedicated-pod": {
+					"container": dedicatedMainContainerEntry("dedicated-pod", map[int]machine.CPUSet{
+						2: machine.NewCPUSet(8, 9, 10),
+						3: machine.NewCPUSet(11, 12),
+					}),
+				},
+			},
+			want: map[string]int64{
+				commonstate.PoolNameDedicated + "/" + commonstate.PoolNameDedicated + "/2": 3,
+				commonstate.PoolNameDedicated + "/" + commonstate.PoolNameDedicated + "/3": 2,
+			},
+		},
+		{
+			name: "dedicated coexists with share and reclaim sidecar not double counted",
+			entries: state.PodEntries{
+				commonstate.PoolNameShare: {
+					commonstate.FakedContainerName: {
+						AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+						TopologyAwareAssignments: map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1)},
+					},
+				},
+				commonstate.PoolNameReclaim: {
+					commonstate.FakedContainerName: {
+						AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+						TopologyAwareAssignments: map[int]machine.CPUSet{0: machine.NewCPUSet(2)},
+					},
+				},
+				"dedicated-pod": {
+					"main-container": dedicatedMainContainerEntry("dedicated-pod",
+						map[int]machine.CPUSet{0: machine.NewCPUSet(3, 4, 5)}),
+					"sidecar": {
+						AllocationMeta: commonstate.AllocationMeta{
+							PodUid:        "dedicated-pod",
+							ContainerType: pluginapi.ContainerType_SIDECAR.String(),
+							QoSLevel:      consts.PodAnnotationQoSLevelDedicatedCores,
+						},
+						TopologyAwareAssignments: map[int]machine.CPUSet{0: machine.NewCPUSet(3, 4, 5)},
+					},
+				},
+			},
+			want: map[string]int64{
+				commonstate.PoolNameShare + "/" + commonstate.PoolNameShare + "/0":         2,
+				commonstate.PoolNameReclaim + "/" + commonstate.PoolNameReclaim + "/0":      1,
+				commonstate.PoolNameDedicated + "/" + commonstate.PoolNameDedicated + "/0": 3,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			emitter := &recordingMetricEmitter{}
+			policy := &DynamicPolicy{emitter: emitter}
+
+			policy.emitFinalPoolSizeMetrics(tt.entries)
+
+			require.Equal(t, tt.want, collectPoolSizeMetrics(t, emitter.records))
+		})
+	}
 }
