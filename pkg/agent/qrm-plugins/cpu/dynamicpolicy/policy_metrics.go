@@ -46,4 +46,31 @@ func (p *DynamicPolicy) emitFinalPoolSizeMetrics(entries state.PodEntries) {
 				metrics.MetricTag{Key: "numa_id", Val: strconv.Itoa(numaID)})
 		}
 	}
+
+	// dedicated allocations are stored as pod-uid keyed container entries rather
+	// than pool entries, so they are skipped by the loop above. aggregate the
+	// dedicated main-container cpus per numa and emit them under a synthetic
+	// dedicated pool so that the committed dedicated footprint is observable and
+	// consistent with the share/reclaim pools.
+	dedicatedByNUMA := make(map[int]int)
+	for _, containerEntries := range entries {
+		if containerEntries.IsPoolEntry() {
+			continue
+		}
+		for _, allocationInfo := range containerEntries {
+			if allocationInfo == nil || !allocationInfo.CheckDedicated() || !allocationInfo.CheckMainContainer() {
+				continue
+			}
+			for numaID, cpus := range allocationInfo.TopologyAwareAssignments {
+				dedicatedByNUMA[numaID] += cpus.Size()
+			}
+		}
+	}
+	for numaID, size := range dedicatedByNUMA {
+		_ = p.emitter.StoreInt64(util.MetricNamePoolSize, int64(size),
+			metrics.MetricTypeNameRaw,
+			metrics.MetricTag{Key: "poolName", Val: commonstate.PoolNameDedicated},
+			metrics.MetricTag{Key: "pool_type", Val: commonstate.PoolNameDedicated},
+			metrics.MetricTag{Key: "numa_id", Val: strconv.Itoa(numaID)})
+	}
 }
