@@ -2062,19 +2062,34 @@ func TestAssignShareContainerToRegionsSkipsNUMABindingRampUpWithoutOwner(t *test
 	require.Nil(t, regions)
 }
 
+// recordedInt64Metric captures a single StoreInt64 call together with the tags
+// it was emitted with, so tag-level assertions (e.g. pool_type) are possible.
+type recordedInt64Metric struct {
+	name  string
+	value int64
+	tags  map[string]string
+}
+
 // recordingMetricEmitter records the latest int64 value stored per metric name
-// so the metrics helper can be asserted directly in unit tests.
+// so the metrics helper can be asserted directly in unit tests. It additionally
+// keeps the full per-call history (with tags) for tag-level assertions.
 type recordingMetricEmitter struct {
 	metrics.DummyMetrics
 	int64Values map[string]int64
+	records     []recordedInt64Metric
 }
 
 func newRecordingMetricEmitter() *recordingMetricEmitter {
 	return &recordingMetricEmitter{int64Values: make(map[string]int64)}
 }
 
-func (r *recordingMetricEmitter) StoreInt64(name string, value int64, _ metrics.MetricTypeName, _ ...metrics.MetricTag) error {
+func (r *recordingMetricEmitter) StoreInt64(name string, value int64, _ metrics.MetricTypeName, tags ...metrics.MetricTag) error {
 	r.int64Values[name] = value
+	tagMap := make(map[string]string, len(tags))
+	for _, tag := range tags {
+		tagMap[tag.Key] = tag.Val
+	}
+	r.records = append(r.records, recordedInt64Metric{name: name, value: value, tags: tagMap})
 	return nil
 }
 
@@ -2084,6 +2099,17 @@ func (r *recordingMetricEmitter) Int64Values() map[string]int64 {
 		out[name] = value
 	}
 	return out
+}
+
+// poolTypeByName returns the pool_type tag emitted for the given metric name and
+// name tag value, matching the first record found.
+func (r *recordingMetricEmitter) poolTypeByName(metricName, nameTag string) (string, bool) {
+	for _, rec := range r.records {
+		if rec.name == metricName && rec.tags["name"] == nameTag {
+			return rec.tags["pool_type"], true
+		}
+	}
+	return "", false
 }
 
 func TestEmitDefaultShareBackfillMetrics(t *testing.T) {
@@ -2130,4 +2156,69 @@ func TestEmitDefaultShareBackfillMetrics(t *testing.T) {
 		emitDefaultShareBackfillMetrics(emitter, diagnostics)
 		require.Len(t, emitter.Int64Values(), 0)
 	})
+}
+
+// TestEmitMetricsLabelsDedicatedPoolType verifies that pool entries persisted
+// under a dedicated region's pod uid are labelled pool_type=dedicated in the
+// katalyst.cpu_advisor_pool_size series, while share/reclaim pools keep their
+// canonical pool_type derived from commonstate.GetPoolType.
+func TestEmitMetricsLabelsDedicatedPoolType(t *testing.T) {
+	t.Parallel()
+
+	conf, _ := options.NewOptions().Config()
+
+	const dedicatedPodUID = "dedicated-pod-uid"
+
+	dedicatedRegion := &region.QoSRegionShare{
+		QoSRegionBase: region.NewQoSRegionBase("dedicated-region", "", "", configapi.QoSRegionTypeDedicated,
+			conf, struct{}{}, true, true, nil, nil, nil),
+	}
+	require.NoError(t, dedicatedRegion.AddContainer(&types.ContainerInfo{
+		PodUID:        dedicatedPodUID,
+		ContainerName: "main",
+	}))
+
+	shareRegion := &region.QoSRegionShare{
+		QoSRegionBase: region.NewQoSRegionBase("share-region", commonstate.PoolNameShare, "", configapi.QoSRegionTypeShare,
+			conf, struct{}{}, false, false, nil, nil, nil),
+	}
+
+	emitter := newRecordingMetricEmitter()
+	cra := &cpuResourceAdvisor{
+		emitter: emitter,
+		period:  time.Second,
+		regionMap: map[string]region.QoSRegion{
+			"dedicated-region": dedicatedRegion,
+			"share-region":     shareRegion,
+		},
+	}
+
+	calculationResult := types.InternalCPUCalculationResult{
+		PoolEntries: map[string]map[int]types.CPUResource{
+			// dedicated allocation persisted keyed by pod uid.
+			dedicatedPodUID: {
+				0: {Size: 8, Quota: 8},
+			},
+			commonstate.PoolNameShare: {
+				-1: {Size: 4, Quota: 4},
+			},
+			commonstate.PoolNameReclaim: {
+				-1: {Size: 2, Quota: 2},
+			},
+		},
+	}
+
+	cra.emitMetrics(calculationResult)
+
+	dedicatedType, ok := emitter.poolTypeByName(metricCPUAdvisorPoolSize, dedicatedPodUID)
+	require.True(t, ok, "dedicated pool size metric should be emitted")
+	require.Equal(t, commonstate.PoolNameDedicated, dedicatedType)
+
+	shareType, ok := emitter.poolTypeByName(metricCPUAdvisorPoolSize, commonstate.PoolNameShare)
+	require.True(t, ok, "share pool size metric should be emitted")
+	require.Equal(t, commonstate.PoolNameShare, shareType)
+
+	reclaimType, ok := emitter.poolTypeByName(metricCPUAdvisorPoolSize, commonstate.PoolNameReclaim)
+	require.True(t, ok, "reclaim pool size metric should be emitted")
+	require.Equal(t, commonstate.PoolNameReclaim, reclaimType)
 }
