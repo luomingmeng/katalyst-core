@@ -72,11 +72,14 @@ func newCPUNUMAResultApportioner(metaServer *metaserver.MetaServer) NUMAResultAp
 			limits[numaID] = value
 		}
 
+		// distribute per single logical CPU (quantum=1): reclaim headroom is a
+		// capacity hint and must not be rounded down to a whole-core multiple,
+		// otherwise the sub-core remainder is silently lost on every report.
 		allocations, effective, err := machine.ApportionNUMACPU(
 			target.MilliValue()/1000,
 			weights,
 			limits,
-			metaServer.CPUTopology.CPUsPerCore(),
+			1,
 		)
 		if err != nil {
 			return resource.Quantity{}, nil, err

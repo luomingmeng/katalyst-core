@@ -138,10 +138,6 @@ func (ha *HeadroomAssemblerCommon) getHeadroomDefault(dynamicConfig *dynamic.Con
 	general.Infof("RNB NUMA topo: %v, %v", bindingNUMAs, nonBindingNUMAs)
 
 	numaHeadroom := make(map[int]resource.Quantity, ha.metaServer.NumNUMANodes)
-	cpusPerCore, err := ha.cpusPerCore()
-	if err != nil {
-		return resource.Quantity{}, nil, err
-	}
 	var requestedHeadroom int64
 
 	// get headroom per NUMA
@@ -162,7 +158,7 @@ func (ha *HeadroomAssemblerCommon) getHeadroomDefault(dynamicConfig *dynamic.Con
 
 		headroom := *resource.NewQuantity(int64(math.Ceil(reclaimMetrics.ReclaimedCoresSupply)), resource.DecimalSI)
 		requestedHeadroom += wholeCPUValue(headroom)
-		numaHeadroom[numaID] = alignBindingNUMAHeadroom(headroom, cpuSet, cpusPerCore)
+		numaHeadroom[numaID] = clampBindingNUMAHeadroom(headroom, cpuSet)
 	}
 
 	// get global reclaim headroom
@@ -189,7 +185,7 @@ func (ha *HeadroomAssemblerCommon) getHeadroomDefault(dynamicConfig *dynamic.Con
 
 		headroom := *resource.NewQuantity(int64(math.Ceil(reclaimMetrics.ReclaimedCoresSupply)), resource.DecimalSI)
 		requestedHeadroom += wholeCPUValue(headroom)
-		allocations, err := ha.apportionNonBindingHeadroom(headroom, nonBindingNUMAs, reclaimPoolInfo, cpusPerCore)
+		allocations, err := ha.apportionNonBindingHeadroom(headroom, nonBindingNUMAs, reclaimPoolInfo)
 		if err != nil {
 			return resource.Quantity{}, nil, fmt.Errorf("apportion non-binding headroom failed: %v", err)
 		}
@@ -236,10 +232,6 @@ func (ha *HeadroomAssemblerCommon) getHeadroomByUtil(dynamicConfig *dynamic.Conf
 	general.Infof("RNB NUMA topo: %v, %v", bindingNUMAs, nonBindingNUMAs)
 
 	numaHeadroom := make(map[int]resource.Quantity, ha.metaServer.NumNUMANodes)
-	cpusPerCore, err := ha.cpusPerCore()
-	if err != nil {
-		return resource.Quantity{}, nil, err
-	}
 	var requestedHeadroom int64
 	reclaimedCPUs, err := ha.getLastReclaimedCPUPerNUMA()
 	if err != nil {
@@ -272,7 +264,7 @@ func (ha *HeadroomAssemblerCommon) getHeadroomByUtil(dynamicConfig *dynamic.Conf
 		}
 
 		requestedHeadroom += wholeCPUValue(headroom)
-		numaHeadroom[numaID] = alignBindingNUMAHeadroom(headroom, cpuSet, cpusPerCore)
+		numaHeadroom[numaID] = clampBindingNUMAHeadroom(headroom, cpuSet)
 	}
 
 	// get global reclaim headroom
@@ -311,7 +303,7 @@ func (ha *HeadroomAssemblerCommon) getHeadroomByUtil(dynamicConfig *dynamic.Conf
 		}
 
 		requestedHeadroom += wholeCPUValue(headroom)
-		allocations, err := ha.apportionNonBindingHeadroom(headroom, nonBindingNUMAs, reclaimPoolInfo, cpusPerCore)
+		allocations, err := ha.apportionNonBindingHeadroom(headroom, nonBindingNUMAs, reclaimPoolInfo)
 		if err != nil {
 			return resource.Quantity{}, nil, fmt.Errorf("apportion non-binding headroom failed: %v", err)
 		}
@@ -343,29 +335,24 @@ func (ha *HeadroomAssemblerCommon) getHeadroomByUtil(dynamicConfig *dynamic.Conf
 	return totalHeadroom, numaHeadroom, nil
 }
 
-func (ha *HeadroomAssemblerCommon) cpusPerCore() (int, error) {
-	if ha.metaServer == nil || ha.metaServer.CPUTopology == nil {
-		return 0, fmt.Errorf("cpu topology is unavailable")
-	}
-	cpusPerCore := ha.metaServer.CPUTopology.CPUsPerCore()
-	if cpusPerCore <= 0 {
-		return 0, fmt.Errorf("cpus per core must be positive")
-	}
-	return cpusPerCore, nil
-}
-
 func wholeCPUValue(q resource.Quantity) int64 {
 	return q.MilliValue() / 1000
 }
 
-func alignBindingNUMAHeadroom(headroom resource.Quantity, cpuSet machine.CPUSet, cpusPerCore int) resource.Quantity {
+// clampBindingNUMAHeadroom bounds the per-NUMA reclaim headroom to the CPUs the
+// reclaim pool actually owns on that NUMA. headroom is reported as a reclaim
+// capacity hint and is intentionally NOT rounded down to a whole-core multiple,
+// so the reported value reflects the real reclaimable supply instead of losing
+// the sub-core remainder.
+func clampBindingNUMAHeadroom(headroom resource.Quantity, cpuSet machine.CPUSet) resource.Quantity {
 	target := wholeCPUValue(headroom)
 	limit := int64(cpuSet.Size())
 	if target > limit {
 		target = limit
 	}
-	quantum := int64(cpusPerCore)
-	target = target / quantum * quantum
+	if target < 0 {
+		target = 0
+	}
 	return *resource.NewQuantity(target, resource.DecimalSI)
 }
 
@@ -373,7 +360,6 @@ func (ha *HeadroomAssemblerCommon) apportionNonBindingHeadroom(
 	headroom resource.Quantity,
 	nonBindingNUMAs []int,
 	reclaimPool *types.PoolInfo,
-	cpusPerCore int,
 ) (map[int]resource.Quantity, error) {
 	weights := make(map[int]int64, len(nonBindingNUMAs))
 	limits := make(map[int]int64, len(nonBindingNUMAs))
@@ -386,8 +372,10 @@ func (ha *HeadroomAssemblerCommon) apportionNonBindingHeadroom(
 		limits[numaID] = int64(cpuSet.Size())
 	}
 
+	// distribute per single logical CPU (quantum=1); headroom is a reclaim
+	// capacity hint and must not be rounded down to a whole-core multiple.
 	allocations, effective, err := machine.ApportionNUMACPU(
-		wholeCPUValue(headroom), weights, limits, cpusPerCore)
+		wholeCPUValue(headroom), weights, limits, 1)
 	if err != nil {
 		return nil, err
 	}
