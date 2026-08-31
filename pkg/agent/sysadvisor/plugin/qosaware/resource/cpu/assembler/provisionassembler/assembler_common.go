@@ -279,6 +279,68 @@ func calculateDefaultShareTargetSize(budgetByNUMA map[int]defaultShareNUMABudget
 	return target, nil
 }
 
+// dedicatedTopology captures the dedicated-cores topology needed by the default
+// share budget accounting: the set of NUMAs owned by NUMA-exclusive dedicated
+// regions, and a lookup from dedicated pod uid to its owner pool name.
+//
+// Dedicated pool entries in result.PoolEntries are keyed by pod uid (a single
+// dedicated region owns exactly one pod uid), so the accounting loop only needs
+// to test membership by pod uid rather than reverse-mapping pool entries back
+// to region objects. A numa-binding dedicated pod spanning multiple NUMAs is
+// split into one sibling region per NUMA, but every sibling shares the same pod
+// uid and owner pool name, so folding them into a single per-uid entry is
+// lossless.
+type dedicatedTopology struct {
+	exclusiveNUMAs        sets.Int
+	ownerPoolNameByPodUID map[string]string
+}
+
+// collectDedicatedTopology walks every dedicated region (both the real-NUMA
+// binding regions and the FakedNUMAID non-binding regions) and records the
+// exclusive NUMAs plus the per-pod owner pool name. All sibling regions of the
+// same pod uid share an identical owner pool name, so no representative choice
+// is required.
+func collectDedicatedTopology(regionHelper *RegionMapHelper, numaAvailable map[int]int) (dedicatedTopology, error) {
+	topo := dedicatedTopology{
+		exclusiveNUMAs:        sets.NewInt(),
+		ownerPoolNameByPodUID: make(map[string]string),
+	}
+
+	record := func(r region.QoSRegion) error {
+		if r.IsNumaBinding() && r.IsNumaExclusive() {
+			for _, bindingNUMA := range r.GetBindingNumas().ToSliceInt() {
+				topo.exclusiveNUMAs.Insert(bindingNUMA)
+			}
+		}
+		for podUID := range r.GetPods() {
+			// sibling regions of the same pod share the owner pool name; a
+			// mismatch would mean two unrelated dedicated pods collided on one
+			// pod uid, which must never happen.
+			if existing, ok := topo.ownerPoolNameByPodUID[podUID]; ok && existing != r.OwnerPoolName() {
+				return fmt.Errorf("pod uid %q maps to dedicated regions with conflicting owner pools %q and %q",
+					podUID, existing, r.OwnerPoolName())
+			}
+			topo.ownerPoolNameByPodUID[podUID] = r.OwnerPoolName()
+		}
+		return nil
+	}
+
+	for numaID := range numaAvailable {
+		for _, r := range regionHelper.GetRegions(numaID, configapi.QoSRegionTypeDedicated) {
+			if err := record(r); err != nil {
+				return dedicatedTopology{}, err
+			}
+		}
+	}
+	// non-binding dedicated regions live at FakedNUMAID scope.
+	for _, r := range regionHelper.GetRegions(commonstate.FakedNUMAID, configapi.QoSRegionTypeDedicated) {
+		if err := record(r); err != nil {
+			return dedicatedTopology{}, err
+		}
+	}
+	return topo, nil
+}
+
 // buildDefaultShareBudget collects the canonical per-NUMA quantity budget that
 // drives the default share pool upper-bound backfill. It reads only the already
 // assembled result.PoolEntries plus the region topology; it never mutates the
@@ -303,8 +365,9 @@ func calculateDefaultShareTargetSize(budgetByNUMA map[int]defaultShareNUMABudget
 //
 // Assumption: dedicated pool entries are keyed by pod UID (not by a name that
 // GetPoolType can classify), so we identify them authoritatively via the
-// dedicated regions in regionHelper. Pinned (resource-package) pools are
-// identified by the package prefix in their wrapped owner pool name.
+// dedicated pod uid set collected by collectDedicatedTopology. Pinned
+// (resource-package) pools are identified by the package prefix in their
+// wrapped owner pool name.
 func (pa *ProvisionAssemblerCommon) buildDefaultShareBudget(
 	regionHelper *RegionMapHelper,
 	result *types.InternalCPUCalculationResult,
@@ -315,42 +378,13 @@ func (pa *ProvisionAssemblerCommon) buildDefaultShareBudget(
 	nonBinding := *pa.nonBindingNumas
 	cfg := pa.metaReader.GetResourcePackageConfig()
 
-	// collect exclusive NUMAs and map dedicated pod UIDs back to their regions.
-	// Dedicated pool entries are keyed by pod UID, while the region retains both
-	// the physical pool identity and its resource-package owner.
-	exclusiveNUMAs := sets.NewInt()
-	dedicatedRegionByPodUID := make(map[string]region.QoSRegion)
-	recordDedicatedRegion := func(podUID string, r region.QoSRegion) error {
-		if existing := dedicatedRegionByPodUID[podUID]; existing != nil && existing.Name() != r.Name() {
-			regionNames := []string{existing.Name(), r.Name()}
-			sort.Strings(regionNames)
-			return fmt.Errorf("pod uid %q maps to multiple dedicated regions %q and %q",
-				podUID, regionNames[0], regionNames[1])
-		}
-		dedicatedRegionByPodUID[podUID] = r
-		return nil
-	}
-	for numaID := range numaAvailable {
-		for _, r := range regionHelper.GetRegions(numaID, configapi.QoSRegionTypeDedicated) {
-			if r.IsNumaBinding() && r.IsNumaExclusive() {
-				for _, bindingNUMA := range r.GetBindingNumas().ToSliceInt() {
-					exclusiveNUMAs.Insert(bindingNUMA)
-				}
-			}
-			for podUID := range r.GetPods() {
-				if err := recordDedicatedRegion(podUID, r); err != nil {
-					return nil, summary, err
-				}
-			}
-		}
-	}
-	// non-binding dedicated regions live at FakedNUMAID scope.
-	for _, r := range regionHelper.GetRegions(commonstate.FakedNUMAID, configapi.QoSRegionTypeDedicated) {
-		for podUID := range r.GetPods() {
-			if err := recordDedicatedRegion(podUID, r); err != nil {
-				return nil, summary, err
-			}
-		}
+	// dedicated pool entries are keyed by pod uid; collect the dedicated topology
+	// (exclusive NUMAs and the per-pod owner pool name) up front so the
+	// accounting loop can classify a pool as dedicated by pod uid directly,
+	// instead of reverse-mapping pool entries back to region objects.
+	topo, err := collectDedicatedTopology(regionHelper, numaAvailable)
+	if err != nil {
+		return nil, summary, err
 	}
 
 	// effectiveBucket folds non-binding real NUMAs into the FakedNUMAID bucket.
@@ -380,7 +414,7 @@ func (pa *ProvisionAssemblerCommon) buildDefaultShareBudget(
 		summary.PinnedCPUSize += pinned
 		summary.AllocatableSize += alloc
 
-		if exclusiveNUMAs.Has(numaID) {
+		if topo.exclusiveNUMAs.Has(numaID) {
 			budgetByNUMA[numaID] = defaultShareNUMABudget{UnpinnedAllocatableSize: alloc, Exclusive: true}
 			summary.ExclusiveNUMASize += alloc
 			continue
@@ -396,7 +430,6 @@ func (pa *ProvisionAssemblerCommon) buildDefaultShareBudget(
 	// accumulate reclaim and fixed pool quantities per effective bucket.
 	fixedByBucket := make(map[int]int)
 	reclaimByBucket := make(map[int]int)
-	countedDedicatedRegionsByBucket := make(map[int]sets.String)
 	for poolName, byNUMA := range result.PoolEntries {
 		if poolName == commonstate.PoolNameReserve {
 			for _, res := range byNUMA {
@@ -404,15 +437,21 @@ func (pa *ProvisionAssemblerCommon) buildDefaultShareBudget(
 			}
 			continue
 		}
+		// dedicated pool entries are keyed by pod uid, so classify a pool as
+		// dedicated by looking the pool name up in the dedicated pod uid set
+		// directly. This avoids reverse-mapping the pool entry back to a region
+		// object, which is ambiguous because a numa-binding dedicated pod that
+		// spans several NUMAs is split into one sibling region per NUMA.
 		ownerPoolName := poolName
-		dedicatedRegion := dedicatedRegionByPodUID[poolName]
-		if dedicatedRegion != nil {
-			ownerPoolName = dedicatedRegion.OwnerPoolName()
+		isDedicated := false
+		if opn, ok := topo.ownerPoolNameByPodUID[poolName]; ok {
+			isDedicated = true
+			ownerPoolName = opn
 		}
 		_, pkgName := resourcepackage.UnwrapOwnerPoolName(ownerPoolName)
 		for numaID, res := range byNUMA {
 			// nested quantities inside exclusive NUMAs are ignored.
-			if exclusiveNUMAs.Has(numaID) {
+			if topo.exclusiveNUMAs.Has(numaID) {
 				continue
 			}
 			bucket := effectiveBucket(numaID)
@@ -435,19 +474,14 @@ func (pa *ProvisionAssemblerCommon) buildDefaultShareBudget(
 			if numaID == commonstate.FakedNUMAID && poolName == commonstate.PoolNameShare {
 				continue
 			}
-			if dedicatedRegion != nil {
-				if countedDedicatedRegionsByBucket[bucket] == nil {
-					countedDedicatedRegionsByBucket[bucket] = sets.NewString()
-				}
-				if countedDedicatedRegionsByBucket[bucket].Has(dedicatedRegion.Name()) {
-					continue
-				}
-				countedDedicatedRegionsByBucket[bucket].Insert(dedicatedRegion.Name())
-			}
+			// Each pool entry is keyed by (pool name, numaID) and visited once,
+			// so no dedup is required: a numa-binding dedicated pod split into
+			// per-NUMA siblings writes one entry per real NUMA, and every entry
+			// carries an independent dedicatedTarget that must all be counted.
 			fixedSize := res.Size
 			if pkgName != "" {
 				pinnedSizeInBucket := pinnedCPUSizeByPackageByBucket[bucket][pkgName]
-				if dedicatedRegion != nil {
+				if isDedicated {
 					fixedSize = general.Max(res.Size-pinnedSizeInBucket, 0)
 					if fixedSize == 0 {
 						continue
@@ -469,7 +503,7 @@ func (pa *ProvisionAssemblerCommon) buildDefaultShareBudget(
 			switch {
 			case commonstate.IsIsolationPool(poolName):
 				summary.IsolationSize += fixedSize
-			case dedicatedRegion != nil:
+			case isDedicated:
 				summary.DedicatedSize += fixedSize
 			case commonstate.IsShareNUMABindingPool(poolName):
 				summary.SNBSize += fixedSize
