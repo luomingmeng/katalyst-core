@@ -224,6 +224,9 @@ const (
 	MetricCPUUsageRatio    = "cpu.usage.ratio.cpu"
 	MetricCPUSysUsageRatio = "cpu.sys.usage.ratio.cpu"
 	MetricCPUIOWaitRatio   = "cpu.iowait.ratio.cpu"
+	MetricCPUIrqRatio      = "cpu.irq.ratio.cpu"
+	MetricCPUCPI           = "cpu.cpi.cpu"
+	MetricCPUL3Misses      = "cpu.l3misses.cpu"
 	// MetricCPUCodeName is not normal metric, only used to store cpu code name into metric store
 	MetricCPUCodeName = "cpu.code.name"
 )

@@ -721,8 +721,14 @@ func (m *MalachiteMetricsProvisioner) processSystemCPUComputeData(systemComputeD
 			utilmetric.MetricData{Value: cpu.CPUSchedWait * 1000, Time: &updateTime})
 		m.metricStore.SetCPUMetric(cpuID, consts.MetricCPUIOWaitRatio,
 			utilmetric.MetricData{Value: cpu.CPUIowaitRatio, Time: &updateTime})
+		m.metricStore.SetCPUMetric(cpuID, consts.MetricCPUIrqRatio,
+			utilmetric.MetricData{Value: cpu.CPUIrqRatio, Time: &updateTime})
 
 		if cpu.CpiData != nil {
+			m.metricStore.SetCPUMetric(cpuID, consts.MetricCPUCPI,
+				utilmetric.MetricData{Value: cpu.CpiData.Cpi, Time: &updateTime})
+			m.metricStore.SetCPUMetric(cpuID, consts.MetricCPUL3Misses,
+				utilmetric.MetricData{Value: cpu.CpiData.L3Misses, Time: &updateTime})
 			cpiTotal += cpu.CpiData.Cpi
 			cpiCount += 1
 		}
