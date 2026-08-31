@@ -3660,16 +3660,23 @@ func TestBuildDefaultShareBudgetRules(t *testing.T) {
 		require.Equal(t, 95, target) // reclaim and fixed pools are diagnostics-only
 	})
 
-	t.Run("dedicated pool with multiple pods is classified once", func(t *testing.T) {
+	t.Run("distinct dedicated pod uids are each counted", func(t *testing.T) {
 		t.Parallel()
-		dedicated := NewFakeRegion("ded-region", configapi.QoSRegionTypeDedicated, "ded-region")
-		dedicated.SetBindingNumas(machine.NewCPUSet(0))
-		dedicated.SetIsNumaBinding(true)
-		dedicated.SetPods(types.PodSet{
-			"ded-pod-a": sets.NewString("main"),
-			"ded-pod-b": sets.NewString("main"),
-		})
-		regionMap := map[string]region.QoSRegion{dedicated.Name(): dedicated}
+		// dedicated pool entries are keyed by pod uid; two distinct dedicated
+		// pods on the same NUMA are independent allocations and must both be
+		// counted, regardless of how their regions are grouped.
+		first := NewFakeRegion("ded-region-a", configapi.QoSRegionTypeDedicated, "dedicated")
+		first.SetBindingNumas(machine.NewCPUSet(0))
+		first.SetIsNumaBinding(true)
+		first.SetPods(types.PodSet{"ded-pod-a": sets.NewString("main")})
+		second := NewFakeRegion("ded-region-b", configapi.QoSRegionTypeDedicated, "dedicated")
+		second.SetBindingNumas(machine.NewCPUSet(0))
+		second.SetIsNumaBinding(true)
+		second.SetPods(types.PodSet{"ded-pod-b": sets.NewString("main")})
+		regionMap := map[string]region.QoSRegion{
+			first.Name():  first,
+			second.Name(): second,
+		}
 
 		pa := newDefaultShareAssembler(t, map[int]int{0: 40}, machine.NewCPUSet(), regionMap,
 			map[int]int{0: 0}, false, true, nil)
@@ -3679,8 +3686,8 @@ func TestBuildDefaultShareBudgetRules(t *testing.T) {
 
 		budget, summary, err := pa.buildDefaultShareBudget(NewRegionMapHelper(*pa.regionMap), result)
 		require.NoError(t, err)
-		require.Equal(t, 20, budget[0].FixedUnpinnedPoolSize)
-		require.Equal(t, 20, summary.DedicatedSize)
+		require.Equal(t, 40, budget[0].FixedUnpinnedPoolSize)
+		require.Equal(t, 40, summary.DedicatedSize)
 
 		target, err := calculateDefaultShareTargetSize(budget)
 		require.NoError(t, err)
@@ -3803,13 +3810,136 @@ func TestBuildDefaultShareBudgetRules(t *testing.T) {
 		})
 	}
 
-	t.Run("pod uid mapped to different dedicated regions is rejected", func(t *testing.T) {
+	t.Run("pod uid split across per-numa sibling regions is merged", func(t *testing.T) {
 		t.Parallel()
-		first := NewFakeRegion("ded-region-a", configapi.QoSRegionTypeDedicated, "dedicated-a")
+		// a numa-binding dedicated pod spanning NUMA 0 and NUMA 1 is split into
+		// one sibling region per NUMA; both share the same owner pool and must
+		// be treated as one logical dedicated pod rather than a conflict.
+		first := NewFakeRegion("dedicated-region-a", configapi.QoSRegionTypeDedicated, "dedicated")
+		first.SetBindingNumas(machine.NewCPUSet(0))
+		first.SetIsNumaBinding(true)
+		first.SetPods(types.PodSet{"spanning-pod": sets.NewString("main")})
+		second := NewFakeRegion("dedicated-region-b", configapi.QoSRegionTypeDedicated, "dedicated")
+		second.SetBindingNumas(machine.NewCPUSet(1))
+		second.SetIsNumaBinding(true)
+		second.SetPods(types.PodSet{"spanning-pod": sets.NewString("main")})
+		regionMap := map[string]region.QoSRegion{
+			first.Name():  first,
+			second.Name(): second,
+		}
+
+		pa := newDefaultShareAssembler(t, map[int]int{0: 20, 1: 20}, machine.NewCPUSet(), regionMap,
+			map[int]int{0: 0, 1: 0}, false, true, nil)
+		result := newDefaultShareResult(true)
+		// the dedicated pool entry is keyed by pod uid and carries per-numa sizes.
+		result.SetPoolEntry("spanning-pod", 0, 10, -1)
+		result.SetPoolEntry("spanning-pod", 1, 10, -1)
+
+		budget, summary, err := pa.buildDefaultShareBudget(NewRegionMapHelper(*pa.regionMap), result)
+		require.NoError(t, err)
+		// each NUMA is accounted for exactly once, without double counting the
+		// shared owner pool across the sibling regions.
+		require.Equal(t, 10, budget[0].FixedUnpinnedPoolSize)
+		require.Equal(t, 10, budget[1].FixedUnpinnedPoolSize)
+		require.Equal(t, 20, summary.DedicatedSize)
+	})
+
+	t.Run("pod uid split across non-binding sibling numas folds without dropping any numa", func(t *testing.T) {
+		t.Parallel()
+		// regression for the FakedNUMAID bucket-folding dedup bug: a numa-binding
+		// (non-exclusive) dedicated pod is split into one sibling region per NUMA,
+		// and both bound NUMAs happen to be non-binding, so effectiveBucket folds
+		// them into the shared FakedNUMAID bucket. Since the dedup representative
+		// is a single region name shared by both siblings, keying the dedup set by
+		// region name alone would treat the second NUMA entry as a duplicate and
+		// silently drop it. Keying by "<name>/<numaID>" keeps every real NUMA.
+		first := NewFakeRegion("dedicated-region-a", configapi.QoSRegionTypeDedicated, "dedicated")
+		first.SetBindingNumas(machine.NewCPUSet(0))
+		first.SetIsNumaBinding(true)
+		first.SetPods(types.PodSet{"spanning-pod": sets.NewString("main")})
+		second := NewFakeRegion("dedicated-region-b", configapi.QoSRegionTypeDedicated, "dedicated")
+		second.SetBindingNumas(machine.NewCPUSet(1))
+		second.SetIsNumaBinding(true)
+		second.SetPods(types.PodSet{"spanning-pod": sets.NewString("main")})
+		regionMap := map[string]region.QoSRegion{
+			first.Name():  first,
+			second.Name(): second,
+		}
+
+		// both NUMA 0 and NUMA 1 are non-binding, so they collapse into the
+		// FakedNUMAID bucket.
+		pa := newDefaultShareAssembler(t, map[int]int{0: 20, 1: 20}, machine.NewCPUSet(0, 1), regionMap,
+			map[int]int{0: 0, 1: 0}, false, true, nil)
+		result := newDefaultShareResult(true)
+		result.SetPoolEntry("spanning-pod", 0, 10, -1)
+		result.SetPoolEntry("spanning-pod", 1, 10, -1)
+
+		budget, summary, err := pa.buildDefaultShareBudget(NewRegionMapHelper(*pa.regionMap), result)
+		require.NoError(t, err)
+		// the real NUMAs collapse into a single FakedNUMAID bucket; both binding
+		// NUMAs must be preserved rather than deduped away by region name.
+		_, hasReal0 := budget[0]
+		require.False(t, hasReal0)
+		_, hasReal1 := budget[1]
+		require.False(t, hasReal1)
+		faked := budget[commonstate.FakedNUMAID]
+		require.Equal(t, 40, faked.UnpinnedAllocatableSize)
+		// 10 (numa 0) + 10 (numa 1); the pre-fix code would report only 10.
+		require.Equal(t, 20, faked.FixedUnpinnedPoolSize)
+		require.Equal(t, 20, summary.DedicatedSize)
+
+		target, err := calculateDefaultShareTargetSize(budget)
+		require.NoError(t, err)
+		require.Equal(t, 40, target)
+	})
+
+	t.Run("distinct dedicated pod uids folded into faked bucket are each counted", func(t *testing.T) {
+		t.Parallel()
+		// two distinct dedicated pods bound to the same non-binding NUMA fold
+		// into the FakedNUMAID bucket. They are keyed by distinct pod uids, so
+		// both must be counted; folding into the shared bucket must not collapse
+		// them into one.
+		first := NewFakeRegion("ded-region-a", configapi.QoSRegionTypeDedicated, "dedicated")
+		first.SetBindingNumas(machine.NewCPUSet(0))
+		first.SetIsNumaBinding(true)
+		first.SetPods(types.PodSet{"ded-pod-a": sets.NewString("main")})
+		second := NewFakeRegion("ded-region-b", configapi.QoSRegionTypeDedicated, "dedicated")
+		second.SetBindingNumas(machine.NewCPUSet(0))
+		second.SetIsNumaBinding(true)
+		second.SetPods(types.PodSet{"ded-pod-b": sets.NewString("main")})
+		regionMap := map[string]region.QoSRegion{
+			first.Name():  first,
+			second.Name(): second,
+		}
+
+		pa := newDefaultShareAssembler(t, map[int]int{0: 20, 1: 20}, machine.NewCPUSet(0, 1), regionMap,
+			map[int]int{0: 0, 1: 0}, false, true, nil)
+		result := newDefaultShareResult(true)
+		result.SetPoolEntry("ded-pod-a", 0, 12, -1)
+		result.SetPoolEntry("ded-pod-b", 0, 12, -1)
+
+		budget, summary, err := pa.buildDefaultShareBudget(NewRegionMapHelper(*pa.regionMap), result)
+		require.NoError(t, err)
+		faked := budget[commonstate.FakedNUMAID]
+		require.Equal(t, 40, faked.UnpinnedAllocatableSize)
+		// both distinct pod uids are counted: 12 + 12.
+		require.Equal(t, 24, faked.FixedUnpinnedPoolSize)
+		require.Equal(t, 24, summary.DedicatedSize)
+	})
+
+	t.Run("pod uid mapped to regions with conflicting owner pools is rejected", func(t *testing.T) {
+		t.Parallel()
+		// a single dedicated pod uid must resolve to a single owner pool name so
+		// its pinned resource-package deduction is unambiguous. Two regions that
+		// share a pod uid but disagree on the owner pool signal a genuinely
+		// ambiguous mapping that must be rejected.
+		first := NewFakeRegion("ded-region-a", configapi.QoSRegionTypeDedicated,
+			resourcepackage.WrapOwnerPoolName("dedicated", "pkg-a"))
 		first.SetBindingNumas(machine.NewCPUSet(0))
 		first.SetIsNumaBinding(true)
 		first.SetPods(types.PodSet{"duplicate-pod": sets.NewString("main")})
-		second := NewFakeRegion("ded-region-b", configapi.QoSRegionTypeDedicated, "dedicated-b")
+		second := NewFakeRegion("ded-region-b", configapi.QoSRegionTypeDedicated,
+			resourcepackage.WrapOwnerPoolName("dedicated", "pkg-b"))
 		second.SetBindingNumas(machine.NewCPUSet(1))
 		second.SetIsNumaBinding(true)
 		second.SetPods(types.PodSet{"duplicate-pod": sets.NewString("main")})
@@ -3824,8 +3954,8 @@ func TestBuildDefaultShareBudgetRules(t *testing.T) {
 		result.SetPoolEntry("duplicate-pod", 0, 10, -1)
 
 		_, _, err := pa.buildDefaultShareBudget(NewRegionMapHelper(*pa.regionMap), result)
-		require.EqualError(t, err,
-			`pod uid "duplicate-pod" maps to multiple dedicated regions "ded-region-a" and "ded-region-b"`)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), `pod uid "duplicate-pod" maps to dedicated regions with conflicting owner pools`)
 	})
 }
 
