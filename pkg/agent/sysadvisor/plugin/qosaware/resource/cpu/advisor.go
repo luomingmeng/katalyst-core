@@ -804,6 +804,26 @@ func (cra *cpuResourceAdvisor) assembleProvision(dynamicConf *dynamic.Configurat
 }
 
 func (cra *cpuResourceAdvisor) emitMetrics(calculationResult types.InternalCPUCalculationResult) {
+	// dedicated regions write their pool entries keyed by pod uid rather than a
+	// canonical pool name, so commonstate.GetPoolType would misclassify them as
+	// share. collect the dedicated pod uids up front so the emitted pool_type
+	// label reflects the real dedicated footprint.
+	dedicatedPodUIDs := sets.NewString()
+	for _, r := range cra.regionMap {
+		if r.Type() != configapi.QoSRegionTypeDedicated {
+			continue
+		}
+		for podUID := range r.GetPods() {
+			dedicatedPodUIDs.Insert(podUID)
+		}
+	}
+	poolTypeOf := func(poolName string) string {
+		if dedicatedPodUIDs.Has(poolName) {
+			return commonstate.PoolNameDedicated
+		}
+		return commonstate.GetPoolType(poolName)
+	}
+
 	// emit region indicator related metrics
 	for _, r := range cra.regionMap {
 		tags := region.GetRegionBasicMetricTags(r)
@@ -824,12 +844,12 @@ func (cra *cpuResourceAdvisor) emitMetrics(calculationResult types.InternalCPUCa
 			_ = cra.emitter.StoreInt64(metricCPUAdvisorPoolSize, int64(cpuResource.Size), metrics.MetricTypeNameRaw,
 				metrics.MetricTag{Key: "name", Val: poolName},
 				metrics.MetricTag{Key: "numa_id", Val: strconv.Itoa(numaID)},
-				metrics.MetricTag{Key: "pool_type", Val: commonstate.GetPoolType(poolName)},
+				metrics.MetricTag{Key: "pool_type", Val: poolTypeOf(poolName)},
 				metrics.MetricTag{Key: "overlap", Val: "none"})
 			_ = cra.emitter.StoreFloat64(metricCPUAdvisorPoolQuota, cpuResource.Quota, metrics.MetricTypeNameRaw,
 				metrics.MetricTag{Key: "name", Val: poolName},
 				metrics.MetricTag{Key: "numa_id", Val: strconv.Itoa(numaID)},
-				metrics.MetricTag{Key: "pool_type", Val: commonstate.GetPoolType(poolName)})
+				metrics.MetricTag{Key: "pool_type", Val: poolTypeOf(poolName)})
 		}
 	}
 
@@ -839,7 +859,7 @@ func (cra *cpuResourceAdvisor) emitMetrics(calculationResult types.InternalCPUCa
 				_ = cra.emitter.StoreInt64(metricCPUAdvisorPoolSize, int64(overlap), metrics.MetricTypeNameRaw,
 					metrics.MetricTag{Key: "name", Val: poolName},
 					metrics.MetricTag{Key: "numa_id", Val: strconv.Itoa(numaID)},
-					metrics.MetricTag{Key: "pool_type", Val: commonstate.GetPoolType(poolName)},
+					metrics.MetricTag{Key: "pool_type", Val: poolTypeOf(poolName)},
 					metrics.MetricTag{Key: "overlap", Val: target})
 			}
 		}
@@ -853,7 +873,7 @@ func (cra *cpuResourceAdvisor) emitMetrics(calculationResult types.InternalCPUCa
 					_ = cra.emitter.StoreInt64(metricCPUAdvisorPoolSize, int64(overlap), metrics.MetricTypeNameRaw,
 						metrics.MetricTag{Key: "name", Val: poolName},
 						metrics.MetricTag{Key: "numa_id", Val: strconv.Itoa(numaID)},
-						metrics.MetricTag{Key: "pool_type", Val: commonstate.GetPoolType(poolName)},
+						metrics.MetricTag{Key: "pool_type", Val: poolTypeOf(poolName)},
 						metrics.MetricTag{Key: "overlap", Val: podUID})
 					break
 				}
