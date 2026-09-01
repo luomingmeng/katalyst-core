@@ -140,10 +140,21 @@ func TestCPUMetricsPluginPeriodicalHandler(t *testing.T) {
 		{cpu: 2, metricName: pkgconsts.MetricCPUIrqRatio, value: 0.06},
 		{cpu: 3, metricName: pkgconsts.MetricCPUIrqRatio, value: 0.08},
 
-		{cpu: 0, metricName: pkgconsts.MetricCPUCPI, value: 1.0},
-		{cpu: 1, metricName: pkgconsts.MetricCPUCPI, value: 3.0},
-		{cpu: 2, metricName: pkgconsts.MetricCPUCPI, value: 5.0},
-		{cpu: 3, metricName: pkgconsts.MetricCPUCPI, value: 7.0},
+		// CPI is now a pool-level weighted ratio sum(cycles)/sum(instructions).
+		// Values are chosen so the weighted result differs from the unweighted
+		// mean of per-core cycles/instructions, proving the weighting is real:
+		//   non_reclaim cores 0,1: (300+300)/(300+100) = 600/400 = 1.5
+		//     (per-core CPIs 1.0 and 3.0; unweighted mean would be 2.0)
+		//   reclaim cores 2,3:     (500+700)/(100+100) = 1200/200 = 6.0
+		{cpu: 0, metricName: pkgconsts.MetricCPUCycles, value: 300},
+		{cpu: 1, metricName: pkgconsts.MetricCPUCycles, value: 300},
+		{cpu: 2, metricName: pkgconsts.MetricCPUCycles, value: 500},
+		{cpu: 3, metricName: pkgconsts.MetricCPUCycles, value: 700},
+
+		{cpu: 0, metricName: pkgconsts.MetricCPUInstructions, value: 300},
+		{cpu: 1, metricName: pkgconsts.MetricCPUInstructions, value: 100},
+		{cpu: 2, metricName: pkgconsts.MetricCPUInstructions, value: 100},
+		{cpu: 3, metricName: pkgconsts.MetricCPUInstructions, value: 100},
 
 		{cpu: 0, metricName: pkgconsts.MetricCPUL3Misses, value: 100},
 		{cpu: 1, metricName: pkgconsts.MetricCPUL3Misses, value: 200},
@@ -168,7 +179,7 @@ func TestCPUMetricsPluginPeriodicalHandler(t *testing.T) {
 			},
 			want: []capturedMetric{
 				// non_reclaim: cores 0,1
-				{key: metricBulkheadCoreCPI, val: 2.0, tags: map[string]string{coreTypeTagKey: coreTypeNonReclaim}},
+				{key: metricBulkheadCoreCPI, val: 1.5, tags: map[string]string{coreTypeTagKey: coreTypeNonReclaim}},
 				{key: metricBulkheadCoreIOWaitRatio, val: 0.20, tags: map[string]string{coreTypeTagKey: coreTypeNonReclaim}},
 				{key: metricBulkheadCoreIrqRatio, val: 0.03, tags: map[string]string{coreTypeTagKey: coreTypeNonReclaim}},
 				{key: metricBulkheadCoreL3Misses, val: 300, tags: map[string]string{coreTypeTagKey: coreTypeNonReclaim}},
@@ -192,7 +203,7 @@ func TestCPUMetricsPluginPeriodicalHandler(t *testing.T) {
 				}
 			},
 			want: []capturedMetric{
-				{key: metricBulkheadCoreCPI, val: 2.0, tags: map[string]string{coreTypeTagKey: coreTypeNonReclaim}},
+				{key: metricBulkheadCoreCPI, val: 1.5, tags: map[string]string{coreTypeTagKey: coreTypeNonReclaim}},
 				{key: metricBulkheadCoreIOWaitRatio, val: 0.20, tags: map[string]string{coreTypeTagKey: coreTypeNonReclaim}},
 				{key: metricBulkheadCoreIrqRatio, val: 0.03, tags: map[string]string{coreTypeTagKey: coreTypeNonReclaim}},
 				{key: metricBulkheadCoreL3Misses, val: 300, tags: map[string]string{coreTypeTagKey: coreTypeNonReclaim}},
@@ -278,6 +289,104 @@ func TestCPUMetricsPluginPeriodicalHandler(t *testing.T) {
 				return
 			}
 			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestCPUMetricsPluginCPIRatioEdgeCases pins the ratio-metric boundary
+// behavior for bulkhead_core_cpi: when the summed instruction count is zero
+// (all-zero or missing per-CPU instructions) the ratio is "no signal" and must
+// be skipped rather than emitting a misleading zero or dividing by zero. Other
+// metrics on the same core set are unaffected and still emit.
+func TestCPUMetricsPluginCPIRatioEdgeCases(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		samples     []perCPUMetric
+		wantCPI     bool
+		wantCPIVal  float64
+		wantSchedWt float64
+	}{
+		{
+			name: "zero instruction sum skips cpi but keeps other metrics",
+			samples: []perCPUMetric{
+				{cpu: 0, metricName: pkgconsts.MetricCPUCycles, value: 500},
+				{cpu: 1, metricName: pkgconsts.MetricCPUCycles, value: 700},
+				{cpu: 0, metricName: pkgconsts.MetricCPUInstructions, value: 0},
+				{cpu: 1, metricName: pkgconsts.MetricCPUInstructions, value: 0},
+				{cpu: 0, metricName: pkgconsts.MetricCPUSchedwait, value: 10},
+				{cpu: 1, metricName: pkgconsts.MetricCPUSchedwait, value: 30},
+			},
+			wantCPI:     false,
+			wantSchedWt: 20,
+		},
+		{
+			name: "missing instruction source skips cpi but keeps other metrics",
+			samples: []perCPUMetric{
+				{cpu: 0, metricName: pkgconsts.MetricCPUCycles, value: 500},
+				{cpu: 1, metricName: pkgconsts.MetricCPUCycles, value: 700},
+				{cpu: 0, metricName: pkgconsts.MetricCPUSchedwait, value: 10},
+				{cpu: 1, metricName: pkgconsts.MetricCPUSchedwait, value: 30},
+			},
+			wantCPI:     false,
+			wantSchedWt: 20,
+		},
+		{
+			name: "positive instruction sum emits weighted cpi",
+			samples: []perCPUMetric{
+				{cpu: 0, metricName: pkgconsts.MetricCPUCycles, value: 300},
+				{cpu: 1, metricName: pkgconsts.MetricCPUCycles, value: 300},
+				{cpu: 0, metricName: pkgconsts.MetricCPUInstructions, value: 300},
+				{cpu: 1, metricName: pkgconsts.MetricCPUInstructions, value: 100},
+				{cpu: 0, metricName: pkgconsts.MetricCPUSchedwait, value: 10},
+				{cpu: 1, metricName: pkgconsts.MetricCPUSchedwait, value: 30},
+			},
+			wantCPI:     true,
+			wantCPIVal:  1.5,
+			wantSchedWt: 20,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			plugin := &CPUMetricsPlugin{}
+			fetcher := newFetcherWithMetrics(tt.samples)
+			emitter := &captureEmitter{}
+
+			require.NoError(t, plugin.PeriodicalHandler(context.Background(),
+				bulkheadapi.PeriodicalHandlerContext{
+					Emitter:                       emitter,
+					MetaServer:                    metaServerWith(fetcher),
+					AppliedView:                   appliedView(machine.NewCPUSet(), machine.NewCPUSet(0, 1)),
+					AppliedViewValidForPeriodical: true,
+				}))
+
+			var gotCPI *float64
+			var gotSchedWait *float64
+			for _, m := range emitter.snapshot() {
+				m := m
+				switch m.key {
+				case metricBulkheadCoreCPI:
+					v := m.val
+					gotCPI = &v
+				case metricBulkheadCoreSchedWait:
+					v := m.val
+					gotSchedWait = &v
+				}
+			}
+
+			if tt.wantCPI {
+				require.NotNil(t, gotCPI)
+				require.Equal(t, tt.wantCPIVal, *gotCPI)
+			} else {
+				require.Nil(t, gotCPI)
+			}
+			require.NotNil(t, gotSchedWait)
+			require.Equal(t, tt.wantSchedWt, *gotSchedWait)
 		})
 	}
 }
