@@ -1507,6 +1507,70 @@ func TestPriorityAllocationAndDedicatedAtomPressure(t *testing.T) {
 	}
 }
 
+func TestFinalizeDefaultShareBackfillAllowsFullyExclusiveNode(t *testing.T) {
+	t.Parallel()
+
+	conf := generateTestConf(t, true, "")
+	conf.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+
+	genericCtx, err := katalyst_base.GenerateFakeGenericContext([]runtime.Object{})
+	require.NoError(t, err)
+
+	reclaim.UnregisterConsumer(reclaim.GenericConsumerName)
+	t.Cleanup(func() {
+		reclaim.UnregisterConsumer(reclaim.GenericConsumerName)
+	})
+	metaServer, err := metaserver.NewMetaServer(genericCtx.Client, metrics.DummyMetrics{}, conf)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = os.RemoveAll(conf.GenericSysAdvisorConfiguration.StateFileDirectory)
+		_ = os.RemoveAll(conf.MetaServerConfiguration.CheckpointManagerDir)
+	})
+
+	metaCache, err := metacache.NewMetaCacheImp(conf, metricspool.DummyMetricsEmitterPool{}, metric.NewFakeMetricsFetcher(metrics.DummyMetrics{}))
+	require.NoError(t, err)
+	require.NoError(t, metaCache.SetResourcePackageConfig(types.ResourcePackageConfig{0: map[string]*types.ResourcePackageState{}}))
+
+	region0 := NewFakeRegion("dedicated-numa0", configapi.QoSRegionTypeDedicated, "dedicated-numa0")
+	region0.SetBindingNumas(machine.NewCPUSet(0))
+	region0.SetIsNumaBinding(true)
+	region0.isNumaExclusive = true
+
+	region1 := NewFakeRegion("dedicated-numa1", configapi.QoSRegionTypeDedicated, "dedicated-numa1")
+	region1.SetBindingNumas(machine.NewCPUSet(1))
+	region1.SetIsNumaBinding(true)
+	region1.isNumaExclusive = true
+
+	regionMap := map[string]region.QoSRegion{
+		region0.name: region0,
+		region1.name: region1,
+	}
+	reservedForReclaim := map[int]int{0: 0, 1: 0}
+	rampUpReclaimCPUSetCap := map[int]int{}
+	numaAvailable := map[int]int{0: 8, 1: 8}
+	nonBindingNumas := machine.NewCPUSet()
+	allowSharedOverlap := false
+	disableDedicatedOverlap := true
+
+	common := NewProvisionAssemblerCommon(
+		conf, nil, &regionMap, &reservedForReclaim, &rampUpReclaimCPUSetCap, &numaAvailable, &nonBindingNumas,
+		&allowSharedOverlap, &disableDedicatedOverlap, metaCache, metaServer, metrics.DummyMetrics{},
+	).(*ProvisionAssemblerCommon)
+
+	result := &types.InternalCPUCalculationResult{
+		PoolEntries:                 map[string]map[int]types.CPUResource{},
+		PoolOverlapInfo:             map[string]map[int]map[string]int{},
+		PoolOverlapPodContainerInfo: map[string]map[int]map[string]map[string]int{},
+	}
+	result.DefaultShareBackfill.Enabled = true
+
+	err = common.finalizeDefaultShareBackfill(NewRegionMapHelper(regionMap), result)
+	require.NoError(t, err)
+	require.Contains(t, result.PoolEntries, commonstate.PoolNameShare)
+	require.Equal(t, 0, result.PoolEntries[commonstate.PoolNameShare][commonstate.FakedNUMAID].Size)
+	require.Equal(t, 0, result.DefaultShareBackfill.DefaultShareFinal)
+}
+
 func TestAssembleWithoutNUMAExclusivePoolOverlapPolicyMatrix(t *testing.T) {
 	tests := []struct {
 		name                   string

@@ -279,6 +279,18 @@ func calculateDefaultShareTargetSize(budgetByNUMA map[int]defaultShareNUMABudget
 	return target, nil
 }
 
+func hasEligibleDefaultShareDomain(budgetByNUMA map[int]defaultShareNUMABudget) bool {
+	for _, budget := range budgetByNUMA {
+		if budget.Exclusive {
+			continue
+		}
+		if budget.UnpinnedAllocatableSize > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // dedicatedTopology captures the dedicated-cores topology needed by the default
 // share budget accounting: the set of NUMAs owned by NUMA-exclusive dedicated
 // regions, and a lookup from dedicated pod uid to its owner pool name.
@@ -571,7 +583,7 @@ func (pa *ProvisionAssemblerCommon) finalizeDefaultShareBackfill(
 	if err != nil {
 		return err
 	}
-	if target == 0 {
+	if target == 0 && hasEligibleDefaultShareDomain(budgetByNUMA) {
 		return fmt.Errorf("default share target is zero before sysadvisor publish")
 	}
 	before := 0
