@@ -1778,6 +1778,82 @@ func TestPlanDisjointAdvisorBlocksPreservesCeiledOwnerRequestWhenDonating(t *tes
 	require.Empty(t, result)
 }
 
+func TestGenerateBlockCPUSetDisjointPreservesRequiredReclaimFloor(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopologyWithoutSMT(8, 1, 2)
+	require.NoError(t, err)
+	featureGates := map[string]*advisorsvc.FeatureGate{
+		feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition: {
+			Name: feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
+		},
+	}
+
+	for _, tc := range []struct {
+		name          string
+		numaID        int64
+		requiredFloor machine.CPUSet
+		wantErr       string
+	}{
+		{
+			name:          "fake NUMA block preserves high-numbered floor CPUs",
+			numaID:        commonstate.FakedNUMAID,
+			requiredFloor: machine.NewCPUSet(3, 7),
+		},
+		{
+			name:          "real NUMA block preserves its floor CPU",
+			numaID:        1,
+			requiredFloor: machine.NewCPUSet(7),
+		},
+		{
+			name:          "real NUMA block rejects floor from another NUMA",
+			numaID:        0,
+			requiredFloor: machine.NewCPUSet(7),
+			wantErr:       "required reclaim floor CPUs are not representable by mandatory blocks: 7",
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+			require.NoError(t, err)
+			resp := &advisorapi.ListAndWatchResponse{
+				DisableDedicatedCoresOverlapReclaimedCores: true,
+				Entries: map[string]*advisorapi.CalculationEntries{
+					commonstate.PoolNameReclaim: {
+						Entries: map[string]*advisorapi.CalculationInfo{
+							commonstate.FakedContainerName: {
+								OwnerPoolName: commonstate.PoolNameReclaim,
+								CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+									tc.numaID: {
+										Blocks: []*advisorapi.Block{{
+											BlockId: "reclaim",
+											Result:  uint64(tc.requiredFloor.Size()),
+										}},
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			got, err := policy.generateBlockCPUSetWithRequiredReclaimFloor(
+				resp, featureGates, false, tc.requiredFloor)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				require.Nil(t, got)
+				return
+			}
+			require.NoError(t, err)
+			require.True(t, tc.requiredFloor.IsSubsetOf(got["reclaim"]),
+				"required floor %s must be pinned in reclaim block %s",
+				tc.requiredFloor.String(), got["reclaim"].String())
+		})
+	}
+}
+
 func advisorDescriptorBlockIDs(descriptors []advisorBlockDescriptor) []string {
 	result := make([]string, 0, len(descriptors))
 	for _, descriptor := range descriptors {
