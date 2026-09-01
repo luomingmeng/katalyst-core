@@ -140,7 +140,7 @@ func TestCPUAdvisorValidatorValidatesNUMABindingDedicatedQuantityInDisjointMode(
 	}{
 		{name: "shrink passes", quantity: 1},
 		{name: "zero rejects", quantity: 0, wantErr: "zero dedicated calculation result"},
-		{name: "grow rejects", quantity: 3, wantErr: "calculation result: 3 and allocation result: 2 mismatch"},
+		{name: "non-exclusive grow passes", quantity: 3},
 		{name: "exclusive grow passes", quantity: 3, exclusive: true},
 	} {
 		tc := tc
@@ -219,6 +219,50 @@ func TestCPUAdvisorValidatorValidatesNUMABindingDedicatedQuantityInDisjointMode(
 			require.ErrorContains(t, v.Validate(resp), "calculation result")
 		})
 	}
+
+	// Regression for the production grow-rejection deadlock observed on
+	// node fdbd:dc06:2:b32::53: a non-exclusive DNB container shrank to a
+	// single core and the advisor recomputed a larger target, but the
+	// validator rejected the grow and pinned the pod at 1 core. The grow
+	// target is kept within a single NUMA's capacity so the test isolates
+	// the grow-rejection path (the real node simply had a larger NUMA).
+	t.Run("non-exclusive grow from one core passes", func(t *testing.T) {
+		t.Parallel()
+		currentState.SetPodEntries(cpustate.PodEntries{
+			"pod": {
+				"container": &cpustate.AllocationInfo{
+					AllocationMeta: commonstate.AllocationMeta{
+						PodUid:        "pod",
+						ContainerName: "container",
+						QoSLevel:      consts.PodAnnotationQoSLevelDedicatedCores,
+						Annotations: map[string]string{
+							consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+						},
+					},
+					AllocationResult: machine.NewCPUSet(0),
+					TopologyAwareAssignments: map[int]machine.CPUSet{
+						0: machine.NewCPUSet(0),
+					},
+				},
+			},
+		})
+		resp := &advisorapi.ListAndWatchResponse{
+			DisableDedicatedCoresOverlapReclaimedCores: true,
+			Entries: map[string]*advisorapi.CalculationEntries{
+				"pod": {
+					Entries: map[string]*advisorapi.CalculationInfo{
+						"container": {
+							OwnerPoolName: commonstate.PoolNameDedicated,
+							CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+								0: {Blocks: []*advisorapi.Block{{BlockId: "dedicated", Result: 4}}},
+							},
+						},
+					},
+				},
+			},
+		}
+		require.NoError(t, v.Validate(resp))
+	})
 }
 
 func TestCPUAdvisorValidatorValidatesDefaultShareUpperBound(t *testing.T) {
