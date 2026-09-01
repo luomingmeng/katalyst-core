@@ -727,6 +727,10 @@ func (m *MalachiteMetricsProvisioner) processSystemCPUComputeData(systemComputeD
 		if cpu.CpiData != nil {
 			m.metricStore.SetCPUMetric(cpuID, consts.MetricCPUCPI,
 				utilmetric.MetricData{Value: cpu.CpiData.Cpi, Time: &updateTime})
+			m.metricStore.SetCPUMetric(cpuID, consts.MetricCPUCycles,
+				utilmetric.MetricData{Value: cpu.CpiData.Cycles, Time: &updateTime})
+			m.metricStore.SetCPUMetric(cpuID, consts.MetricCPUInstructions,
+				utilmetric.MetricData{Value: cpu.CpiData.Instructions, Time: &updateTime})
 			m.metricStore.SetCPUMetric(cpuID, consts.MetricCPUL3Misses,
 				utilmetric.MetricData{Value: cpu.CpiData.L3Misses, Time: &updateTime})
 			cpiTotal += cpu.CpiData.Cpi
