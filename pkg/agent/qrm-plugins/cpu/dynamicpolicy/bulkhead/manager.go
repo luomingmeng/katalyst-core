@@ -593,6 +593,14 @@ func bulkheadNonReclaimPoolMinSize(conf *dynamicconfig.Configuration) int64 {
 	return conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.NonReclaimPoolMinSize
 }
 
+func (m *Manager) ResolveNonReclaimPoolMinSize(conf *dynamicconfig.Configuration) int64 {
+	minSize := bulkheadNonReclaimPoolMinSize(conf)
+	if minSize <= 0 && m != nil {
+		minSize = m.defaultNonReclaimPoolMinSize
+	}
+	return minSize
+}
+
 func (m *Manager) RunPeriodicalHandlers(
 	coreConf *config.Configuration,
 	extraConf interface{},

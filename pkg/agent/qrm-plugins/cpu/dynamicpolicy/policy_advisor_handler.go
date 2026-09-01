@@ -630,26 +630,32 @@ func (p *DynamicPolicy) allocateByCPUAdvisorWithRevision(
 	}
 
 	hardActive := p.isRampUpReclaimHardPartitionEnabled() && requestRampUpActive
-	blockToCPUSet, aErr := p.generateBlockCPUSet(resp, featureGates, hardActive)
+	effectiveResp, requiredReclaimFloor, effectiveErr :=
+		p.effectiveAdvisorResponseForBulkhead(resp, hardActive)
+	if effectiveErr != nil {
+		return fmt.Errorf("build effective advisor response: %w", effectiveErr)
+	}
+	blockToCPUSet, aErr := p.generateBlockCPUSetWithRequiredReclaimFloor(
+		effectiveResp, featureGates, hardActive, requiredReclaimFloor)
 	if aErr != nil {
 		return fmt.Errorf("generateBlockCPUSet failed with error: %v", aErr)
 	}
-	if err := p.validateHardPartitionBlockPlan(resp, blockToCPUSet, hardActive); err != nil {
+	if err := p.validateHardPartitionBlockPlan(effectiveResp, blockToCPUSet, hardActive); err != nil {
 		return fmt.Errorf("validate hard-partition reclaim block plan failed: %w", err)
 	}
 
 	curAllowSharedCoresOverlapReclaimedCores := p.state.GetAllowSharedCoresOverlapReclaimedCores()
-	if curAllowSharedCoresOverlapReclaimedCores != resp.AllowSharedCoresOverlapReclaimedCores {
+	if curAllowSharedCoresOverlapReclaimedCores != effectiveResp.AllowSharedCoresOverlapReclaimedCores {
 		general.Infof("set allowSharedCoresOverlapReclaimedCores from %v to %v",
-			curAllowSharedCoresOverlapReclaimedCores, resp.AllowSharedCoresOverlapReclaimedCores)
+			curAllowSharedCoresOverlapReclaimedCores, effectiveResp.AllowSharedCoresOverlapReclaimedCores)
 	}
 
-	responseAllowOverlap := resp.AllowSharedCoresOverlapReclaimedCores
-	pending, applyErr := p.applyBlocks(blockToCPUSet, resp, responseAllowOverlap, hardActive)
+	responseAllowOverlap := effectiveResp.AllowSharedCoresOverlapReclaimedCores
+	pending, applyErr := p.applyBlocks(blockToCPUSet, effectiveResp, responseAllowOverlap, hardActive)
 	if applyErr != nil {
 		return fmt.Errorf("prepare applyBlocks failed with error: %w", applyErr)
 	}
-	target, applyErr := p.commitAdvisorResponseWithWriteAhead(resp, pending.preCommitRevision, func() error {
+	target, applyErr := p.commitAdvisorResponseWithWriteAhead(effectiveResp, pending.preCommitRevision, func() error {
 		return p.commitPendingAdvisorState(pending)
 	})
 	if applyErr != nil {
@@ -671,6 +677,124 @@ func (p *DynamicPolicy) validateAdvisorResponse(resp *advisorapi.ListAndWatchRes
 		return p.advisorValidator.ValidateWithDefaultShareUpperBound(resp)
 	}
 	return p.advisorValidator.Validate(resp)
+}
+
+func (p *DynamicPolicy) effectiveAdvisorResponseForBulkhead(
+	resp *advisorapi.ListAndWatchResponse,
+	hardActive bool,
+) (*advisorapi.ListAndWatchResponse, machine.CPUSet, error) {
+	noRequiredFloor := machine.NewCPUSet()
+	if resp == nil || hardActive || resp.AllowSharedCoresOverlapReclaimedCores ||
+		p.dynamicConfig == nil || p.machineInfo == nil || p.machineInfo.CPUTopology == nil {
+		return resp, noRequiredFloor, nil
+	}
+	dynamicConf := p.dynamicConfig.GetDynamicConfiguration()
+	if dynamicConf == nil || dynamicConf.AdminQoSConfiguration == nil ||
+		dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration == nil {
+		return resp, noRequiredFloor, nil
+	}
+	bulkheadConf := dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig
+	if !bulkheadConf.Enable {
+		return resp, noRequiredFloor, nil
+	}
+	nonReclaimPoolMinSize := bulkheadConf.NonReclaimPoolMinSize
+	if p.bulkheadManager != nil {
+		nonReclaimPoolMinSize = p.bulkheadManager.ResolveNonReclaimPoolMinSize(dynamicConf)
+	}
+	if nonReclaimPoolMinSize <= 0 {
+		return resp, noRequiredFloor, nil
+	}
+
+	advisedTotal, _, err := advisorReclaimPlan(resp, nil)
+	if err != nil {
+		return nil, noRequiredFloor, fmt.Errorf("bulkhead reclaim clamp has invalid reclaim plan: %w", err)
+	}
+	acceptedTotal := p.machineInfo.CPUDetails.CPUs().Size() -
+		p.reservedCPUs.Size() - int(nonReclaimPoolMinSize)
+	if acceptedTotal < 0 {
+		acceptedTotal = 0
+	}
+	fixedReserveByNUMA, steadyExclusiveReclaimByNUMA, reclaimFloor :=
+		p.reclaimHardFloorForBulkhead()
+	requiredReclaimFloor := machine.NewCPUSet()
+	for _, cpus := range fixedReserveByNUMA {
+		requiredReclaimFloor = requiredReclaimFloor.Union(cpus)
+	}
+	for _, cpus := range steadyExclusiveReclaimByNUMA {
+		requiredReclaimFloor = requiredReclaimFloor.Union(cpus)
+	}
+	if advisedTotal < reclaimFloor {
+		return nil, noRequiredFloor, fmt.Errorf(
+			"advisor reclaim target %d is below required floor %d",
+			advisedTotal, reclaimFloor)
+	}
+	if resp.DisableDedicatedCoresOverlapReclaimedCores {
+		cpusPerCore := p.machineInfo.CPUTopology.CPUsPerCore()
+		if cpusPerCore > 1 {
+			acceptedTotal -= acceptedTotal % cpusPerCore
+		}
+	}
+	if acceptedTotal < reclaimFloor {
+		acceptedTotal = reclaimFloor
+	}
+	if acceptedTotal >= advisedTotal {
+		return resp, requiredReclaimFloor, nil
+	}
+	general.InfoS("clamp advisor reclaim target to bulkhead ceiling",
+		"requestedTotal", advisedTotal,
+		"acceptedTotal", acceptedTotal,
+		"nonReclaimPoolMinSize", nonReclaimPoolMinSize,
+		"reclaimFloor", reclaimFloor)
+	effectiveResp, err := effectiveAdvisorResponseForReclaimTarget(resp, reclaimEffectiveTargetPolicy{
+		acceptedTotal:                acceptedTotal,
+		fixedReserveByNUMA:           fixedReserveByNUMA,
+		steadyExclusiveReclaimByNUMA: steadyExclusiveReclaimByNUMA,
+		ignoreDefaultShare:           dynamicConf.FillDefaultSharePoolWithNonReclaimCPUs,
+	})
+	return effectiveResp, requiredReclaimFloor, err
+}
+
+func (p *DynamicPolicy) reclaimHardFloorForBulkhead() (
+	map[int]machine.CPUSet,
+	map[int]machine.CPUSet,
+	int,
+) {
+	fixedReserveByNUMA := make(map[int]machine.CPUSet)
+	for numaID, cpus := range p.reservedReclaimedTopologyAwareAssignments {
+		fixedReserveByNUMA[numaID] = cpus.Clone()
+	}
+	if len(fixedReserveByNUMA) == 0 && !p.reservedReclaimedCPUSet.IsEmpty() {
+		for _, numaID := range p.machineInfo.CPUDetails.NUMANodes().ToSliceInt() {
+			cpus := p.reservedReclaimedCPUSet.Intersection(
+				p.machineInfo.CPUDetails.CPUsInNUMANodes(numaID))
+			if !cpus.IsEmpty() {
+				fixedReserveByNUMA[numaID] = cpus
+			}
+		}
+	}
+
+	steadyExclusiveReclaimByNUMA := make(map[int]machine.CPUSet)
+	currentReclaim := machine.NewCPUSet()
+	if reclaim := p.state.GetAllocationInfo(
+		commonstate.PoolNameReclaim, commonstate.FakedContainerName); reclaim != nil {
+		currentReclaim = reclaim.AllocationResult
+	}
+	for _, numaID := range p.state.GetPodEntries().
+		SteadyExclusiveNUMAs(p.machineInfo.CPUTopology).UnsortedList() {
+		cpus := currentReclaim.Intersection(p.machineInfo.CPUDetails.CPUsInNUMANodes(numaID))
+		if !cpus.IsEmpty() {
+			steadyExclusiveReclaimByNUMA[numaID] = cpus
+		}
+	}
+
+	floor := machine.NewCPUSet()
+	for _, cpus := range fixedReserveByNUMA {
+		floor = floor.Union(cpus)
+	}
+	for _, cpus := range steadyExclusiveReclaimByNUMA {
+		floor = floor.Union(cpus)
+	}
+	return fixedReserveByNUMA, steadyExclusiveReclaimByNUMA, floor.Size()
 }
 
 func (p *DynamicPolicy) applyCgroupConfigs(resp *advisorapi.ListAndWatchResponse) error {
@@ -1303,6 +1427,24 @@ func (p *DynamicPolicy) generateReclaimBlockCPUSet(
 	globalNonReclaimableCPUSet machine.CPUSet,
 	blockCPUSet advisorapi.BlockCPUSet,
 ) error {
+	return p.generateReclaimBlockCPUSetWithRequiredFloor(
+		reclaimBlocksMap,
+		nodeRemainingCPUs,
+		availableCPUs,
+		globalNonReclaimableCPUSet,
+		blockCPUSet,
+		machine.NewCPUSet(),
+	)
+}
+
+func (p *DynamicPolicy) generateReclaimBlockCPUSetWithRequiredFloor(
+	reclaimBlocksMap map[int][]*advisorapi.BlockInfo,
+	nodeRemainingCPUs machine.CPUSet,
+	availableCPUs machine.CPUSet,
+	globalNonReclaimableCPUSet machine.CPUSet,
+	blockCPUSet advisorapi.BlockCPUSet,
+	requiredReclaimFloor machine.CPUSet,
+) error {
 	machineInfo := p.machineInfo
 	topology := machineInfo.CPUTopology
 
@@ -1354,12 +1496,18 @@ func (p *DynamicPolicy) generateReclaimBlockCPUSet(
 			// prior cores were taken by dedicated/share or the requirement grew.
 			// When there is no prior reclaim on this NUMA node, keep the legacy
 			// topology-aware take so first-allocation core shape is unchanged.
-			prevOnNUMA := prevReclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
+			numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
+			requiredOnNUMA := requiredReclaimFloor.Intersection(numaCPUs)
+			prevOnNUMA := prevReclaim.Intersection(numaCPUs)
 			var cpuset machine.CPUSet
-			if prevOnNUMA.IsEmpty() {
+			if requiredOnNUMA.IsEmpty() && prevOnNUMA.IsEmpty() {
 				cpuset, err = calculator.TakeByTopology(machineInfo, currentAvailableCPUs, blockResult, false)
 			} else {
-				cpuset, _, err = p.takeByTieredPreferredCPUs(currentAvailableCPUs, []machine.CPUSet{prevOnNUMA}, blockResult)
+				cpuset, _, err = p.takeByTieredPreferredCPUs(
+					currentAvailableCPUs,
+					[]machine.CPUSet{requiredOnNUMA, prevOnNUMA},
+					blockResult,
+				)
 			}
 			if err != nil {
 				return fmt.Errorf("allocate cpuset for NUMA Aware reclaim block: %s in NUMA: %d failed with error: %v", blockID, numaID, err)
@@ -1408,7 +1556,11 @@ func (p *DynamicPolicy) generateReclaimBlockCPUSet(
 			// Prefer the whole previous reclaim cpuset as the first tier so non-NUMA
 			// reclaim also stays in place across recomputes; spill to NUMA-balanced
 			// fresh cores only when the prior cores are no longer available.
-			cpuset, _, err := p.takeByTieredPreferredCPUs(currentAvailableCPUs, []machine.CPUSet{prevReclaim}, blockResult)
+			cpuset, _, err := p.takeByTieredPreferredCPUs(
+				currentAvailableCPUs,
+				[]machine.CPUSet{requiredReclaimFloor, prevReclaim},
+				blockResult,
+			)
 			if err != nil {
 				return fmt.Errorf("allocate cpuset for non NUMA Aware reclaim block: %s failed with error: %v", blockID, err)
 			}
@@ -1435,6 +1587,16 @@ func (p *DynamicPolicy) generateBlockCPUSet(
 	featureGates map[string]*advisorsvc.FeatureGate,
 	hardActive bool,
 ) (advisorapi.BlockCPUSet, error) {
+	return p.generateBlockCPUSetWithRequiredReclaimFloor(
+		resp, featureGates, hardActive, machine.NewCPUSet())
+}
+
+func (p *DynamicPolicy) generateBlockCPUSetWithRequiredReclaimFloor(
+	resp *advisorapi.ListAndWatchResponse,
+	featureGates map[string]*advisorsvc.FeatureGate,
+	hardActive bool,
+	requiredReclaimFloor machine.CPUSet,
+) (advisorapi.BlockCPUSet, error) {
 	if resp == nil {
 		return nil, fmt.Errorf("got nil resp")
 	}
@@ -1447,13 +1609,22 @@ func (p *DynamicPolicy) generateBlockCPUSet(
 		planningResp = resp.WithoutDefaultShareEntry()
 	}
 	if !planningResp.DisableDedicatedCoresOverlapReclaimedCores {
-		return p.generateLegacyBlockCPUSet(planningResp, hardActive)
+		return p.generateLegacyBlockCPUSet(planningResp, hardActive, requiredReclaimFloor)
 	}
 
 	if featureGates[feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition] == nil {
 		return nil, fmt.Errorf("dedicated reclaim disjoint partition capability is not negotiated")
 	}
-	return p.planDisjointAdvisorBlocks(planningResp, hardActive)
+	blockCPUSet, err := p.planDisjointAdvisorBlocksWithRequiredReclaimFloor(
+		planningResp, hardActive, requiredReclaimFloor)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateRequiredReclaimFloor(
+		planningResp, blockCPUSet, requiredReclaimFloor); err != nil {
+		return nil, err
+	}
+	return blockCPUSet, nil
 }
 
 func (p *DynamicPolicy) validateHardPartitionBlockPlan(
@@ -1565,6 +1736,7 @@ func validateHardPartitionReclaimDistribution(
 func (p *DynamicPolicy) generateLegacyBlockCPUSet(
 	resp *advisorapi.ListAndWatchResponse,
 	hardActive bool,
+	requiredReclaimFloor machine.CPUSet,
 ) (advisorapi.BlockCPUSet, error) {
 	if resp == nil {
 		return nil, fmt.Errorf("got nil resp")
@@ -1714,8 +1886,18 @@ func (p *DynamicPolicy) generateLegacyBlockCPUSet(
 	}
 
 	// Phase 3: Allocate Reclaim blocks
-	err = p.generateReclaimBlockCPUSet(reclaimBlocksMap, nodeRemainingCPUs, availableCPUs, globalNonReclaimableCPUSet, blockCPUSet)
+	err = p.generateReclaimBlockCPUSetWithRequiredFloor(
+		reclaimBlocksMap,
+		nodeRemainingCPUs,
+		availableCPUs,
+		globalNonReclaimableCPUSet,
+		blockCPUSet,
+		requiredReclaimFloor,
+	)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateRequiredReclaimFloor(resp, blockCPUSet, requiredReclaimFloor); err != nil {
 		return nil, err
 	}
 

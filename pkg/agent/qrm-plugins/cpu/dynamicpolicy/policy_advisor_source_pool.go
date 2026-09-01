@@ -270,6 +270,15 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocks(
 	resp *advisorapi.ListAndWatchResponse,
 	hardActive bool,
 ) (advisorapi.BlockCPUSet, error) {
+	return p.planDisjointAdvisorBlocksWithRequiredReclaimFloor(
+		resp, hardActive, machine.NewCPUSet())
+}
+
+func (p *DynamicPolicy) planDisjointAdvisorBlocksWithRequiredReclaimFloor(
+	resp *advisorapi.ListAndWatchResponse,
+	hardActive bool,
+	requiredReclaimFloor machine.CPUSet,
+) (advisorapi.BlockCPUSet, error) {
 	topology := p.machineInfo.CPUTopology
 	allCPUs := topology.CPUDetails.CPUs()
 	machineState := p.state.GetMachineState()
@@ -287,6 +296,8 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocks(
 	if err != nil {
 		return nil, err
 	}
+	originalDescriptors := descriptors
+	descriptors = append([]advisorBlockDescriptor(nil), descriptors...)
 
 	result := advisorapi.NewBlockCPUSet()
 	available, err := p.allocateStaticAndForbiddenPools(resp, result, allCPUs)
@@ -297,11 +308,17 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocks(
 	if err := allocateAdvisorStaticDescriptors(descriptors, result); err != nil {
 		return nil, err
 	}
+	descriptors, available, err = pinRequiredReclaimFloor(
+		descriptors, available, result, requiredReclaimFloor)
+	if err != nil {
+		return nil, err
+	}
 
 	core := filterAdvisorDescriptors(descriptors, func(descriptor advisorBlockDescriptor) bool {
-		return descriptor.Class == advisorBlockClassDedicated ||
+		return descriptor.Quantity > 0 && (descriptor.Class == advisorBlockClassDedicated ||
 			descriptor.Class == advisorBlockClassMandatoryReclaim ||
-			(!hardActive && descriptor.Class == advisorBlockClassShared && descriptor.NUMAID != commonstate.FakedNUMAID)
+			(!hardActive && descriptor.Class == advisorBlockClassShared &&
+				descriptor.NUMAID != commonstate.FakedNUMAID))
 	})
 	available, err = p.solveAdvisorDescriptorPhase(core, available, result, true, hardActive)
 	if err != nil {
@@ -336,7 +353,7 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocks(
 	}
 
 	protected := advisorDescriptorClassUnion(
-		descriptors, result,
+		originalDescriptors, result,
 		advisorBlockClassStatic, advisorBlockClassDedicated, advisorBlockClassMandatoryReclaim,
 	)
 	overlapCandidates := baseAllocatable.Difference(protected)
@@ -347,10 +364,46 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocks(
 		return nil, fmt.Errorf("allocate overlap reclaim blocks: %w", err)
 	}
 
-	if err := validateAdvisorDescriptorPlan(descriptors, result); err != nil {
+	if err := validateAdvisorDescriptorPlan(originalDescriptors, result); err != nil {
 		return nil, err
 	}
 	return result, nil
+}
+
+func pinRequiredReclaimFloor(
+	descriptors []advisorBlockDescriptor,
+	available machine.CPUSet,
+	result advisorapi.BlockCPUSet,
+	requiredFloor machine.CPUSet,
+) ([]advisorBlockDescriptor, machine.CPUSet, error) {
+	remainingFloor := requiredFloor.Clone()
+	for i := range descriptors {
+		descriptor := &descriptors[i]
+		if descriptor.Class != advisorBlockClassMandatoryReclaim || descriptor.Quantity <= 0 {
+			continue
+		}
+		candidates := remainingFloor.Intersection(descriptor.Eligible).Intersection(available)
+		if candidates.IsEmpty() {
+			continue
+		}
+		candidateIDs := candidates.ToSliceInt()
+		if len(candidateIDs) > descriptor.Quantity {
+			candidateIDs = candidateIDs[:descriptor.Quantity]
+		}
+		pinned := machine.NewCPUSet(candidateIDs...)
+		result[descriptor.BlockID] = result[descriptor.BlockID].Union(pinned)
+		descriptor.Quantity -= pinned.Size()
+		descriptor.Eligible = descriptor.Eligible.Difference(pinned)
+		descriptor.OldPreferred = descriptor.OldPreferred.Difference(pinned)
+		available = available.Difference(pinned)
+		remainingFloor = remainingFloor.Difference(pinned)
+	}
+	if !remainingFloor.IsEmpty() {
+		return nil, available, fmt.Errorf(
+			"required reclaim floor CPUs are not representable by mandatory blocks: %s",
+			remainingFloor.String())
+	}
+	return descriptors, available, nil
 }
 
 func allocateAdvisorStaticDescriptors(
