@@ -1739,22 +1739,28 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloorAtRevision(
 	fixedPoolsQuantityMap := copyPoolQuantityMap(poolsQuantityMap)
 	defaultSharePlan := defaultShareMaterializationPlan{}
 	if p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs {
+		defaultSharePlan.enabled = true
 		quantityByNUMA, ok := fixedPoolsQuantityMap[commonstate.PoolNameShare]
 		if !ok {
-			return fmt.Errorf("default share quantity is missing")
+			// A missing default share quantity is a legitimate zero-quantity
+			// end-state: on a fully dedicated numa-exclusive node SysAdvisor
+			// publishes no default share pool. Honor the advisor's zero and let
+			// finalizeDefaultShareEntry prune any stale share entry, keeping
+			// symmetry with the advisor-driven path.
+			defaultSharePlan.advisedQuantity = 0
+			defaultSharePlan.deriveUpperBoundFromEligible = false
+		} else {
+			if len(quantityByNUMA) != 1 {
+				return fmt.Errorf("default share quantity map must contain only faked numa id")
+			}
+			quantity, ok := quantityByNUMA[commonstate.FakedNUMAID]
+			if !ok {
+				return fmt.Errorf("default share quantity map must contain only faked numa id")
+			}
+			defaultSharePlan.advisedQuantity = quantity
+			defaultSharePlan.deriveUpperBoundFromEligible = true
+			delete(fixedPoolsQuantityMap, commonstate.PoolNameShare)
 		}
-		if len(quantityByNUMA) != 1 {
-			return fmt.Errorf("default share quantity map must contain only faked numa id")
-		}
-		quantity, ok := quantityByNUMA[commonstate.FakedNUMAID]
-		if !ok {
-			return fmt.Errorf("default share quantity map must contain only faked numa id")
-		}
-		defaultSharePlan.enabled = true
-		defaultSharePlan.advisedQuantity = quantity
-		defaultSharePlan.deriveUpperBoundFromEligible = true
-		delete(fixedPoolsQuantityMap, commonstate.PoolNameShare)
-
 	}
 
 	poolsCPUSet, isolatedCPUSet, err := p.groupAndAllocatePools(fixedPoolsQuantityMap, isolatedQuantityMap, availableCPUs, rpPinnedCPUSet, reclaimOverlapShareRatio)
@@ -2178,6 +2184,10 @@ func (p *DynamicPolicy) finalizeDefaultShareEntry(
 		return err
 	}
 	if share.IsEmpty() {
+		if expectedQuantity == 0 {
+			delete(newPodEntries, commonstate.PoolNameShare)
+			return nil
+		}
 		return fmt.Errorf("default share residual is empty")
 	}
 	topologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, share)

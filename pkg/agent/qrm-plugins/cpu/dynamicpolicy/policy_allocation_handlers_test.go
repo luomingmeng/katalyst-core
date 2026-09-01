@@ -2283,6 +2283,35 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorCoversAllNUMAs(t *testing.T) {
 	require.True(t, finalExitFloor.IsEmpty(), "candidate final exit must override committed active state")
 }
 
+func TestDynamicPolicyFinalizeDefaultShareEntryPrunesEmptyShareWhenZeroQuantity(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	newPodEntries := state.PodEntries{
+		commonstate.PoolNameShare: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+				AllocationResult: machine.NewCPUSet(0, 1),
+			},
+		},
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(2, 3),
+			},
+		},
+	}
+
+	err = p.finalizeDefaultShareEntry(newPodEntries, state.PodEntries{}, 0, machine.NewCPUSet())
+	require.NoError(t, err)
+	_, exists := newPodEntries[commonstate.PoolNameShare]
+	require.False(t, exists, "zero-quantity empty residual must prune stale default share entry")
+}
+
 func TestApplyPoolsAndIsolatedInfoAddsExplicitHardFloorToReclaim(t *testing.T) {
 	t.Parallel()
 
@@ -5074,6 +5103,334 @@ func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorBackfillsDefaultShareResidu
 	require.True(t, share.Equals(machine.NewCPUSet(3, 4, 5)),
 		"share=%s want=3-5", share)
 	require.False(t, share.Contains(1), "default share must exclude system cpu 1")
+}
+
+// TestAdjustPoolsAndIsolatedEntriesTreatsMissingDefaultShareQuantityAsZero
+// reproduces the fully-exclusive corner case where SysAdvisor legitimately
+// publishes no default share quantity (all NUMAs are dedicated numa-exclusive)
+// and QRM has already pruned the stale default share entry. The fallback/async
+// path must treat the missing quantity as a zero-quantity end-state instead of
+// failing with "default share quantity is missing", keeping symmetry with the
+// advisor-driven finalizeDefaultShareEntry prune behavior.
+func TestAdjustPoolsAndIsolatedEntriesTreatsMissingDefaultShareQuantityAsZero(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+
+	// poolsQuantityMap intentionally omits PoolNameShare, matching a fully
+	// exclusive node where the advisor publishes zero default share quantity.
+	err = p.adjustPoolsAndIsolatedEntriesWithRampUpFloor(
+		map[string]map[int]int{
+			commonstate.PoolNameReclaim: {
+				commonstate.FakedNUMAID: 2,
+			},
+		},
+		nil,
+		p.state.GetPodEntries(),
+		p.state.GetMachineState(),
+		false,
+		machine.NewCPUSet(),
+		false,
+	)
+	require.NoError(t, err)
+
+	_, exists := p.state.GetPodEntries()[commonstate.PoolNameShare]
+	require.False(t, exists,
+		"missing default share quantity must be treated as a pruned zero-share end-state")
+}
+
+// TestAdjustAllocationEntriesAsyncTreatsMissingDefaultShareQuantityAsZero
+// exercises the async residual-backfill path (adjustAllocationEntriesAtRevision
+// with a healthy cpu advisor) on a fully-exclusive node. A single dedicated
+// numa-binding numa-exclusive (DNB) pod owns the only NUMA, so SysAdvisor
+// publishes no default share pool and the advisor-derived poolsQuantityMap
+// legitimately omits PoolNameShare. The async path must treat the missing
+// quantity as a zero-quantity end-state and must not resurrect a default share
+// entry, keeping symmetry with the sync fallback and the advisor-driven prune.
+func TestAdjustAllocationEntriesAsyncTreatsMissingDefaultShareQuantityAsZero(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+
+	// The async residual-backfill path requires a healthy cpu advisor; otherwise
+	// it fails closed (see TestAdjustAllocationEntriesRejectsDefaultShareFallbackWithoutHealthyAdvisor).
+	p.enableCPUAdvisor = true
+	p.advisorMonitor, err = timemonitor.NewTimeMonitor(
+		"advisor",
+		time.Second,
+		time.Minute,
+		time.Minute,
+		"advisor_unhealthy",
+		&metrics.DummyMetrics{},
+		1,
+		true,
+	)
+	require.NoError(t, err)
+
+	// Fully-exclusive node: a single DNB pod owns the only NUMA, so no eligible
+	// (non-exclusive) CPUSet remains for a default share pool.
+	dnbCPUSet := topology.CPUDetails.CPUsInNUMANodes(0)
+	entries := state.PodEntries{
+		"dedicated-pod": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "dedicated-pod",
+					PodNamespace:  "default",
+					PodName:       "dedicated-pod",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameDedicated,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+					Annotations: map[string]string{
+						apiconsts.PodAnnotationMemoryEnhancementNumaBinding:   apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+						apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
+					},
+				},
+				RequestQuantity:                  float64(dnbCPUSet.Size()),
+				AllocationResult:                 dnbCPUSet.Clone(),
+				OriginalAllocationResult:         dnbCPUSet.Clone(),
+				TopologyAwareAssignments:         map[int]machine.CPUSet{0: dnbCPUSet.Clone()},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: dnbCPUSet.Clone()},
+			},
+		},
+	}
+	p.state.SetPodEntries(entries, false)
+
+	err = p.adjustAllocationEntriesAtRevision(
+		p.state.GetPodEntries(),
+		p.state.GetMachineState(),
+		false,
+		p.state.GetRevision(),
+	)
+	require.NoError(t, err)
+
+	_, exists := p.state.GetPodEntries()[commonstate.PoolNameShare]
+	require.False(t, exists,
+		"async path must treat missing default share quantity as a pruned zero-share end-state")
+}
+
+// TestAdjustPoolsAndIsolatedEntriesKeepsDefaultShareAlongsideSNB is a regression
+// guard proving the missing-quantity zero-share branch does NOT misfire when a
+// shared numa-binding (SNB) workload coexists with a non-binding default share
+// pool. The advisor still publishes a positive default share quantity, so the
+// residual must be materialized (excluding the SNB pool) rather than pruned.
+func TestAdjustPoolsAndIsolatedEntriesKeepsDefaultShareAlongsideSNB(t *testing.T) {
+	t.Parallel()
+
+	// two-NUMA host: NUMA0 hosts an SNB pool, NUMA1 backs the non-binding default share.
+	topology, err := machine.GenerateDummyCPUTopology(16, 1, 2)
+	require.NoError(t, err)
+
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+
+	// core-aligned fixed consumers: reclaim {0,1}, SNB pool {2,3}.
+	reclaimSeed := coresInNUMA(topology, 0, 0, 1)
+	snbCPUSet := coresInNUMA(topology, 0, 1, 2)
+	seedEntries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult:                 reclaimSeed.Clone(),
+				OriginalAllocationResult:         reclaimSeed.Clone(),
+				TopologyAwareAssignments:         map[int]machine.CPUSet{0: reclaimSeed.Clone()},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: reclaimSeed.Clone()},
+			},
+		},
+		"snb-NUMA0": {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta("snb-NUMA0"),
+				AllocationResult:                 snbCPUSet.Clone(),
+				OriginalAllocationResult:         snbCPUSet.Clone(),
+				TopologyAwareAssignments:         map[int]machine.CPUSet{0: snbCPUSet.Clone()},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: snbCPUSet.Clone()},
+			},
+		},
+		"snb-pod": {
+			"container": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "snb-pod",
+					PodNamespace:  "default",
+					PodName:       "snb-pod",
+					ContainerName: "container",
+					OwnerPoolName: "snb-NUMA0",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+					Annotations: map[string]string{
+						apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+					},
+				},
+				RequestQuantity:                  float64(snbCPUSet.Size()),
+				AllocationResult:                 snbCPUSet.Clone(),
+				OriginalAllocationResult:         snbCPUSet.Clone(),
+				TopologyAwareAssignments:         map[int]machine.CPUSet{0: snbCPUSet.Clone()},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: snbCPUSet.Clone()},
+			},
+		},
+		"share-pod": {
+			"container": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "share-pod",
+					PodNamespace:  "default",
+					PodName:       "share-pod",
+					ContainerName: "container",
+					OwnerPoolName: commonstate.PoolNameShare,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+				},
+				RequestQuantity: 6,
+			},
+		},
+	}
+	p.state.SetPodEntries(seedEntries, false)
+
+	// advisor still advertises a positive default share quantity (residual after
+	// reclaim {0,1} and SNB {2,3} on the 16-cpu candidate).
+	poolsQuantityMap := map[string]map[int]int{
+		commonstate.PoolNameShare: {
+			commonstate.FakedNUMAID: 12,
+		},
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedNUMAID: 2,
+		},
+		"snb-NUMA0": {
+			0: 2,
+		},
+	}
+
+	err = p.adjustPoolsAndIsolatedEntriesWithRampUpFloor(
+		poolsQuantityMap,
+		map[string]map[string]int{},
+		p.state.GetPodEntries(),
+		p.state.GetMachineState(),
+		false,
+		machine.NewCPUSet(),
+		false,
+	)
+	require.NoError(t, err)
+
+	updatedEntries := p.state.GetPodEntries()
+	share, err := updatedEntries.GetCPUSetForPool(commonstate.PoolNameShare)
+	require.NoError(t, err)
+	require.False(t, share.IsEmpty(),
+		"a positive advisor quantity must keep the default share pool materialized")
+
+	// the allocation regenerates pools deterministically, so compare against the
+	// resulting SNB/reclaim pool cpusets rather than the seed placement.
+	snbPoolCPUSet, err := updatedEntries.GetCPUSetForPool("snb-NUMA0")
+	require.NoError(t, err)
+	reclaimPoolCPUSet, err := updatedEntries.GetCPUSetForPool(commonstate.PoolNameReclaim)
+	require.NoError(t, err)
+	require.True(t, share.Intersection(snbPoolCPUSet).IsEmpty(),
+		"default share residual must exclude the SNB pool cpuset")
+	require.True(t, share.Intersection(reclaimPoolCPUSet).IsEmpty(),
+		"default share residual must exclude the reclaim pool cpuset")
+	requireCoreAligned(t, topology, share)
+
+	// the owning shared_cores container inherits the backfilled share cpuset.
+	owner := updatedEntries["share-pod"]["container"]
+	require.NotNil(t, owner)
+	require.True(t, owner.AllocationResult.Equals(share),
+		"owner=%s share=%s", owner.AllocationResult, share)
+}
+
+// TestAdjustPoolsAndIsolatedEntriesKeepsDefaultShareForNonSNB is a regression
+// guard for the plain non-numa-binding (non-SNB) topology: a node-wide
+// shared_cores workload owns the default share pool with no numa-binding hint.
+// The advisor publishes a positive default share quantity, so the missing-
+// quantity zero-share branch must NOT misfire and the residual must be
+// materialized node-wide, disjoint from reclaim and core-aligned.
+func TestAdjustPoolsAndIsolatedEntriesKeepsDefaultShareForNonSNB(t *testing.T) {
+	t.Parallel()
+
+	// single-NUMA host: no numa-binding pools, a node-wide default share pool
+	// coexists with reclaim.
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+
+	// core-aligned reclaim seed {0,1}; the rest backs the non-binding share pool.
+	reclaimSeed := coresInNUMA(topology, 0, 0, 1)
+	seedEntries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult:                 reclaimSeed.Clone(),
+				OriginalAllocationResult:         reclaimSeed.Clone(),
+				TopologyAwareAssignments:         map[int]machine.CPUSet{0: reclaimSeed.Clone()},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: reclaimSeed.Clone()},
+			},
+		},
+		"share-pod": {
+			"container": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "share-pod",
+					PodNamespace:  "default",
+					PodName:       "share-pod",
+					ContainerName: "container",
+					OwnerPoolName: commonstate.PoolNameShare,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+				},
+				RequestQuantity: 6,
+			},
+		},
+	}
+	p.state.SetPodEntries(seedEntries, false)
+
+	// advisor advertises a positive node-wide default share quantity (residual
+	// after reclaim {0,1} on the 8-cpu candidate).
+	poolsQuantityMap := map[string]map[int]int{
+		commonstate.PoolNameShare: {
+			commonstate.FakedNUMAID: 6,
+		},
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedNUMAID: 2,
+		},
+	}
+
+	err = p.adjustPoolsAndIsolatedEntriesWithRampUpFloor(
+		poolsQuantityMap,
+		map[string]map[string]int{},
+		p.state.GetPodEntries(),
+		p.state.GetMachineState(),
+		false,
+		machine.NewCPUSet(),
+		false,
+	)
+	require.NoError(t, err)
+
+	updatedEntries := p.state.GetPodEntries()
+	share, err := updatedEntries.GetCPUSetForPool(commonstate.PoolNameShare)
+	require.NoError(t, err)
+	require.False(t, share.IsEmpty(),
+		"a positive advisor quantity must keep the non-SNB default share pool materialized")
+
+	reclaimPoolCPUSet, err := updatedEntries.GetCPUSetForPool(commonstate.PoolNameReclaim)
+	require.NoError(t, err)
+	require.True(t, share.Intersection(reclaimPoolCPUSet).IsEmpty(),
+		"default share residual must exclude the reclaim pool cpuset")
+	requireCoreAligned(t, topology, share)
+
+	// the owning non-binding shared_cores container inherits the share cpuset.
+	owner := updatedEntries["share-pod"]["container"]
+	require.NotNil(t, owner)
+	require.True(t, owner.AllocationResult.Equals(share),
+		"owner=%s share=%s", owner.AllocationResult, share)
 }
 
 func TestNewRampUpPlanningPolicyPreservesCPUAdvisorState(t *testing.T) {
