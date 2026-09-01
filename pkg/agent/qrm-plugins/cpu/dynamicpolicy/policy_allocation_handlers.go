@@ -3587,23 +3587,41 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloorForMode(
 			p.machineInfo.CPUTopology,
 			configuredFloor,
 			func(numaID int) int { return reservedFloorByNUMA[numaID].Size() },
-			nil,
+			func(numaID int) int { return availableByNUMA[numaID] },
 		)
 		if err != nil {
 			return machine.NewCPUSet(), fmt.Errorf("distribute configured ramp-up reclaim floor: %w", err)
 		}
 	} else {
 		minimumPerNUMA := minimumHardReclaimCoresPerNUMA * p.machineInfo.CPUTopology.CPUsPerCore()
-		minimum := minimumPerNUMA * len(numaIDs)
+		// a NUMA whose eligible capacity cannot yield a single complete core
+		// (e.g. fully occupied by dedicated / non-exclusive DNB workloads) has no
+		// room for a reclaim reserve; keep its target at 0 and exclude it from the
+		// balanced distribution so DistributeNUMATarget's per-NUMA minimum guard
+		// does not fail admission closed on it. this mirrors the immutable path,
+		// where a zero-core-eligible NUMA also resolves to a zero target.
+		distributableByNUMA := make(map[int]int, len(availableByNUMA))
+		for numaID, avail := range availableByNUMA {
+			if avail < minimumPerNUMA {
+				targetByNUMA[numaID] = 0
+				continue
+			}
+			distributableByNUMA[numaID] = avail
+		}
+		minimum := minimumPerNUMA * len(distributableByNUMA)
 		if configuredFloor > minimum {
 			minimum = configuredFloor
 		}
 		globalTarget := machine.CalculateGlobalRampUpReclaimTarget(totalEligible, ratio, minimum)
-		var err error
-		targetByNUMA, err = machine.DistributeNUMATarget(
-			availableByNUMA, globalTarget, minimumPerNUMA)
-		if err != nil {
-			return machine.NewCPUSet(), fmt.Errorf("derive ramp-up reclaim floor failed: %w", err)
+		if len(distributableByNUMA) > 0 {
+			distributed, err := machine.DistributeNUMATarget(
+				distributableByNUMA, globalTarget, minimumPerNUMA)
+			if err != nil {
+				return machine.NewCPUSet(), fmt.Errorf("derive ramp-up reclaim floor failed: %w", err)
+			}
+			for numaID, target := range distributed {
+				targetByNUMA[numaID] = target
+			}
 		}
 	}
 
