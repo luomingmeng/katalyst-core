@@ -3017,7 +3017,7 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorAllowsFullNonExclusiveRatio(t *tes
 		"floor=%s, want every eligible CPU", floor)
 }
 
-func TestDynamicPolicyDeriveRampUpReclaimFloorUsesImmutablePerNUMACapacity(t *testing.T) {
+func TestDynamicPolicyDeriveRampUpReclaimFloorUsesEligiblePerNUMACapacity(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(64, 2, 2)
@@ -3039,14 +3039,17 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorUsesImmutablePerNUMACapacity(t *te
 		1: {DefaultCPUSet: machine.NewCPUSet(numa1.ToSliceInt()[:8]...)},
 	}, false)
 
-	// cpusPerCore==2, 32 CPUs (16 cores) per NUMA. ratio 0.2 yields
-	// floor(16*0.2)=3 complete cores => 6 CPUs per NUMA. the immutable
-	// per-NUMA capacity drives the target regardless of the smaller live
-	// DefaultCPUSet, and the result is always a whole-core multiple.
+	// cpusPerCore==2. Dedicated / non-exclusive DNB workloads leave only an
+	// 8-CPU (4-core) eligible DefaultCPUSet per NUMA. The ramp-up target must be
+	// derived from that eligible capacity so it shares the same capacity view as
+	// admission validation: floor(4*0.2)=0 complete cores, lifted to the
+	// immutable one-core baseline => 2 CPUs per NUMA. Deriving from the full
+	// 32-CPU capacity (the old behavior) would target 6 CPUs and fail closed
+	// whenever eligible capacity is smaller.
 	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), true)
 	require.NoError(t, err)
-	require.Equal(t, 6, floor.Intersection(numa0).Size())
-	require.Equal(t, 6, floor.Intersection(numa1).Size())
+	require.Equal(t, 2, floor.Intersection(numa0).Size())
+	require.Equal(t, 2, floor.Intersection(numa1).Size())
 }
 
 func TestDynamicPolicyDeriveRampUpReclaimFloorSkipsSteadyExclusiveNUMA(t *testing.T) {
@@ -3101,6 +3104,75 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorSkipsSteadyExclusiveNUMA(t *testin
 	require.Equal(t, 0, floor.Intersection(topology.CPUDetails.CPUsInNUMANodes(0)).Size(),
 		"steady exclusive NUMA must not receive a ramp-up immutable target, floor=%s", floor)
 	require.Equal(t, 6, floor.Intersection(numa1).Size(), "floor=%s", floor)
+}
+
+func TestDynamicPolicyDeriveRampUpReclaimFloorToleratesFullyOccupiedNUMA(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(64, 2, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.reservedReclaimedCPUSet = machine.NewCPUSet()
+	p.reservedReclaimedCPUsSize = 0
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.2
+	// disjoint (immutable per-NUMA) mode.
+	p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
+
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	numa1 := topology.CPUDetails.CPUsInNUMANodes(1)
+	// NUMA 0 is fully occupied by a non-exclusive DNB workload: its eligible
+	// DefaultCPUSet is empty, so no complete core can be kept for reclaim. The
+	// NUMA is NOT numa-exclusive, so it is not skipped as a steady exclusive NUMA
+	// and must be handled by the normal derivation path. Its reclaim floor is
+	// legitimately 0 rather than a fail-closed "target exceeds capacity" error.
+	// NUMA 1 keeps an 8-CPU (4-core) eligible set and absorbs the node-level
+	// configured reclaim floor (4 CPUs) that NUMA 0 cannot hold.
+	p.state.SetMachineState(state.NUMANodeMap{
+		0: {DefaultCPUSet: machine.NewCPUSet()},
+		1: {DefaultCPUSet: machine.NewCPUSet(numa1.ToSliceInt()[:8]...)},
+	}, false)
+
+	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), true)
+	require.NoError(t, err)
+	require.Equal(t, 0, floor.Intersection(numa0).Size(),
+		"fully occupied NUMA must keep a zero reclaim floor, floor=%s", floor)
+	require.Equal(t, 4, floor.Intersection(numa1).Size(), "floor=%s", floor)
+}
+
+func TestDynamicPolicyDeriveRampUpReclaimFloorToleratesFullyOccupiedNUMAOverlap(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(64, 2, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.reservedReclaimedCPUSet = machine.NewCPUSet()
+	p.reservedReclaimedCPUsSize = 0
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.2
+	// legacy overlap (non-immutable) mode: the global target is distributed via
+	// DistributeNUMATarget, whose per-NUMA minimum guard would otherwise reject a
+	// NUMA with zero eligible capacity and fail admission closed.
+	p.state.SetDisableDedicatedCoresOverlapReclaimedCores(false, false)
+
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	numa1 := topology.CPUDetails.CPUsInNUMANodes(1)
+	p.state.SetMachineState(state.NUMANodeMap{
+		0: {DefaultCPUSet: machine.NewCPUSet()},
+		1: {DefaultCPUSet: machine.NewCPUSet(numa1.ToSliceInt()[:8]...)},
+	}, false)
+
+	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), true)
+	require.NoError(t, err)
+	require.Equal(t, 0, floor.Intersection(numa0).Size(),
+		"fully occupied NUMA must be excluded from the global target, floor=%s", floor)
+	require.Equal(t, 4, floor.Intersection(numa1).Size(), "floor=%s", floor)
 }
 
 func TestDynamicPolicyDeriveRampUpReclaimFloorPreservesLegacyOverlapAlgorithm(t *testing.T) {
@@ -3203,20 +3275,27 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorBalancesGlobalTargetAcrossUnevenNU
 		wantErr           string
 	}{
 		{
-			name:              "half ratio uses immutable capacity",
+			// eligible capacity 4 (2 cores) on NUMA 0 drives its target rather
+			// than the full 16-CPU capacity, so the ramp-up target stays within
+			// what admission validates: floor(2*0.5)=1 core => 2 CPUs on NUMA 0,
+			// floor(6*0.5)=3 cores => 6 CPUs on NUMA 1. No more fail-closed.
+			name:              "half ratio uses eligible capacity",
 			hardEnabled:       true,
 			withReserved:      true,
 			configuredReserve: 4,
 			ratio:             0.5,
-			wantErr:           "eligible capacity 4 is smaller than immutable target 8",
+			wantPerNUMA:       map[int]int{0: 2, 1: 6},
 		},
 		{
-			name:              "fractional ratio is floored and aligned from immutable capacity",
+			// fractional ratio is floored on the eligible core count: NUMA 0
+			// floor(2*0.5625)=1 core => 2 CPUs, NUMA 1 floor(6*0.5625)=3 cores
+			// => 6 CPUs, both within eligible capacity.
+			name:              "fractional ratio is floored and aligned from eligible capacity",
 			hardEnabled:       true,
 			withReserved:      true,
 			configuredReserve: 4,
 			ratio:             0.5625,
-			wantErr:           "eligible capacity 4 is smaller than immutable target 8",
+			wantPerNUMA:       map[int]int{0: 2, 1: 6},
 		},
 		{
 			name:              "configured reserve floor wins",
@@ -3227,12 +3306,15 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorBalancesGlobalTargetAcrossUnevenNU
 			wantPerNUMA:       map[int]int{0: 4, 1: 4},
 		},
 		{
-			name:              "three quarter ratio exceeds current eligible capacity",
+			// even a high ratio never exceeds eligible capacity now: NUMA 0
+			// floor(2*0.75)=1 core => 2 CPUs (bounded by its 2-core eligible
+			// view), NUMA 1 floor(6*0.75)=4 cores => 8 CPUs.
+			name:              "three quarter ratio bounded by eligible capacity",
 			hardEnabled:       true,
 			withReserved:      true,
 			configuredReserve: 4,
 			ratio:             0.75,
-			wantErr:           "eligible capacity 4 is smaller than immutable target 12",
+			wantPerNUMA:       map[int]int{0: 2, 1: 8},
 		},
 		{
 			name:        "zero ratio still keeps two per NUMA",
