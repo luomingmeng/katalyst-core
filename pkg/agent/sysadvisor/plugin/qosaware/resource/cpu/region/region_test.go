@@ -150,8 +150,6 @@ func TestGetRegionNameFromMetaCache(t *testing.T) {
 }
 
 func TestIsNumaBinding(t *testing.T) {
-	t.Parallel()
-
 	conf, err := options.NewOptions().Config()
 	require.NoError(t, err)
 	require.NotNil(t, conf)
@@ -166,6 +164,10 @@ func TestIsNumaBinding(t *testing.T) {
 	genericCtx, err := katalyst_base.GenerateFakeGenericContext([]runtime.Object{})
 	require.NoError(t, err)
 
+	reclaim.UnregisterConsumer(reclaim.GenericConsumerName)
+	t.Cleanup(func() {
+		reclaim.UnregisterConsumer(reclaim.GenericConsumerName)
+	})
 	metaServer, err := metaserver.NewMetaServer(genericCtx.Client, metrics.DummyMetrics{}, conf)
 	require.NoError(t, err)
 	defer func() {
@@ -207,8 +209,6 @@ func TestIsNumaBinding(t *testing.T) {
 }
 
 func TestRestrictProvisionControlKnob(t *testing.T) {
-	t.Parallel()
-
 	tests := []struct {
 		name              string
 		originControlKnob map[types.CPUProvisionPolicyName]types.ControlKnob
@@ -229,8 +229,6 @@ func TestRestrictProvisionControlKnob(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
 			conf, err := options.NewOptions().Config()
 			require.NoError(t, err)
 			require.NotNil(t, conf)
@@ -245,6 +243,10 @@ func TestRestrictProvisionControlKnob(t *testing.T) {
 			genericCtx, err := katalyst_base.GenerateFakeGenericContext([]runtime.Object{})
 			require.NoError(t, err)
 
+			reclaim.UnregisterConsumer(reclaim.GenericConsumerName)
+			t.Cleanup(func() {
+				reclaim.UnregisterConsumer(reclaim.GenericConsumerName)
+			})
 			metaServer, err := metaserver.NewMetaServer(genericCtx.Client, metrics.DummyMetrics{}, conf)
 			require.NoError(t, err)
 			defer func() {
@@ -266,10 +268,20 @@ func TestRestrictProvisionControlKnob(t *testing.T) {
 }
 
 func TestGetEffectiveReclaimResource(t *testing.T) {
-	t.Parallel()
+	consumerNames := []string{
+		reclaim.GenericConsumerName,
+		"region-test-a",
+		"region-test-b",
+	}
+	for _, name := range consumerNames {
+		reclaim.UnregisterConsumer(name)
+	}
+	t.Cleanup(func() {
+		for _, name := range consumerNames {
+			reclaim.UnregisterConsumer(name)
+		}
+	})
 
-	reclaim.UnregisterConsumer("region-test-a")
-	reclaim.UnregisterConsumer("region-test-b")
 	machineInfo := &machine.KatalystMachineInfo{
 		CPUTopology: &machine.CPUTopology{
 			CPUDetails: machine.CPUDetails{

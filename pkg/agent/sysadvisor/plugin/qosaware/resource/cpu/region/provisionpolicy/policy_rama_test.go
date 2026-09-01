@@ -445,3 +445,75 @@ func TestPolicyRama(t *testing.T) {
 		})
 	}
 }
+
+func TestPolicyRamaRejectsEmptyIndicators(t *testing.T) {
+	t.Parallel()
+
+	conf := generateRamaTestConfiguration(t, t.TempDir(), t.TempDir(), t.TempDir())
+	policy := NewPolicyRama(
+		"share-empty-indicators",
+		configapi.QoSRegionTypeShare,
+		"",
+		conf,
+		nil,
+		nil,
+		nil,
+		metrics.DummyMetrics{},
+	).(*PolicyRama)
+	policy.SetEssentials(
+		types.ResourceEssentials{
+			DynamicConfiguration: conf.GetDynamicConfiguration(),
+		},
+		types.ControlEssentials{
+			ControlKnobs: types.ControlKnob{
+				configapi.ControlKnobNonReclaimedCPURequirement: {
+					Value: 40,
+				},
+			},
+			Indicators: types.Indicator{},
+		},
+	)
+
+	require.ErrorContains(t, policy.Update(), "illegal indicators")
+}
+
+func TestPolicyRamaHandlesZeroIndicatorCurrent(t *testing.T) {
+	t.Parallel()
+
+	conf := generateRamaTestConfiguration(t, t.TempDir(), t.TempDir(), t.TempDir())
+	policy := NewPolicyRama(
+		"dedicated-zero-sched-wait",
+		configapi.QoSRegionTypeDedicated,
+		"",
+		conf,
+		nil,
+		nil,
+		nil,
+		metrics.DummyMetrics{},
+	).(*PolicyRama)
+	policy.SetEssentials(
+		types.ResourceEssentials{
+			DynamicConfiguration: conf.GetDynamicConfiguration(),
+			ResourceLowerBound:   4,
+			ResourceUpperBound:   90,
+		},
+		types.ControlEssentials{
+			ControlKnobs: types.ControlKnob{
+				configapi.ControlKnobNonReclaimedCPURequirement: {
+					Value: 40,
+				},
+			},
+			Indicators: types.Indicator{
+				string(workloadv1alpha1.ServiceSystemIndicatorNameCPUSchedWait): {
+					Current: 0,
+					Target:  460,
+				},
+			},
+		},
+	)
+
+	require.NoError(t, policy.Update())
+	controlKnobs, err := policy.GetControlKnobAdjusted()
+	require.NoError(t, err)
+	require.Equal(t, 38.0, controlKnobs[configapi.ControlKnobNonReclaimedCPURequirement].Value)
+}

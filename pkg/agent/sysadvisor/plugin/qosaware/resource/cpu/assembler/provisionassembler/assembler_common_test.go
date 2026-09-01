@@ -47,6 +47,7 @@ import (
 	metricspool "github.com/kubewharf/katalyst-core/pkg/metrics/metrics-pool"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
+	"github.com/kubewharf/katalyst-core/pkg/util/reclaim"
 	resourcepackage "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 )
 
@@ -202,8 +203,6 @@ type testCasePoolConfig struct {
 }
 
 func TestAssembleProvision(t *testing.T) {
-	t.Parallel()
-
 	containerInfos := []types.ContainerInfo{
 		{
 			PodUID:              "pod1",
@@ -1170,12 +1169,14 @@ func TestAssembleProvision(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
 			conf := generateTestConf(t, tt.enableReclaimed, tt.disableReclaimSelector)
 			genericCtx, err := katalyst_base.GenerateFakeGenericContext([]runtime.Object{})
 			require.NoError(t, err)
 
+			reclaim.UnregisterConsumer(reclaim.GenericConsumerName)
+			t.Cleanup(func() {
+				reclaim.UnregisterConsumer(reclaim.GenericConsumerName)
+			})
 			metaServer, err := metaserver.NewMetaServer(genericCtx.Client, metrics.DummyMetrics{}, conf)
 			require.NoError(t, err)
 			defer func() {
