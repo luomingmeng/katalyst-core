@@ -407,6 +407,60 @@ func Test_getCPI(t *testing.T) {
 	assert.Equal(t, float64(1), data.Value)
 }
 
+func Test_processSystemCPUComputeData_persistsCyclesAndInstructions(t *testing.T) {
+	t.Parallel()
+
+	store := utilmetric.NewMetricStore()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	assert.Nil(t, err)
+
+	implement := NewMalachiteMetricsProvisioner(&global.BaseConfiguration{
+		ReclaimRelativeRootCgroupPath: "test",
+		MalachiteConfiguration:        &global.MalachiteConfiguration{},
+	}, &metaserver.MetricConfiguration{}, metrics.DummyMetrics{}, &pod.PodFetcherStub{}, store,
+		&machine.KatalystMachineInfo{CPUTopology: cpuTopology})
+
+	// cpu0 carries CpiData so cycles/instructions/cpi must all be persisted;
+	// cpu1 has no CpiData so none of the perf metrics should exist for it.
+	fakeSystemCompute := &malachitetypes.SystemComputeData{
+		CPU: []malachitetypes.CPU{
+			{
+				Name: "cpu0",
+				CpiData: &malachitetypes.CpiData{
+					Cpi:          2.0,
+					Cycles:       200,
+					Instructions: 100,
+					L3Misses:     10,
+				},
+			},
+			{
+				Name: "cpu1",
+			},
+		},
+	}
+
+	implement.(*MalachiteMetricsProvisioner).processSystemCPUComputeData(fakeSystemCompute)
+
+	cycles, err := store.GetCPUMetric(0, consts.MetricCPUCycles)
+	assert.NoError(t, err)
+	assert.Equal(t, float64(200), cycles.Value)
+
+	instructions, err := store.GetCPUMetric(0, consts.MetricCPUInstructions)
+	assert.NoError(t, err)
+	assert.Equal(t, float64(100), instructions.Value)
+
+	cpi, err := store.GetCPUMetric(0, consts.MetricCPUCPI)
+	assert.NoError(t, err)
+	assert.Equal(t, float64(2.0), cpi.Value)
+
+	// cpu1 has no CpiData, so cycles/instructions must be absent.
+	_, err = store.GetCPUMetric(1, consts.MetricCPUCycles)
+	assert.Error(t, err)
+	_, err = store.GetCPUMetric(1, consts.MetricCPUInstructions)
+	assert.Error(t, err)
+}
+
 func Test_setContainerMbmTotalMetric(t *testing.T) {
 	t.Parallel()
 
