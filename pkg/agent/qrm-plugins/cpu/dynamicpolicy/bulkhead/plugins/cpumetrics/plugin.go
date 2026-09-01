@@ -55,22 +55,70 @@ const (
 
 var _ bulkheadapi.Plugin = (*CPUMetricsPlugin)(nil)
 
-// coreMetricDescriptor binds an emitted metric name to the per-CPU source
-// metric and the aggregator used to fold it over a core set. Ratio-like
-// metrics use avg (a per-core intensity), while L3Misses is a count and uses
-// sum (a whole-set volume).
-type coreMetricDescriptor struct {
+// coreMetricEmitter aggregates one logical metric over a core set and emits it
+// tagged by core type. Implementations decide how the per-CPU source metric(s)
+// fold into a single emitted value, so single-source aggregations and derived
+// ratios can coexist in one table without special-casing the plugin loop.
+type coreMetricEmitter interface {
+	emit(emitter metrics.MetricEmitter, fetcher metrictypes.MetricsFetcher, coreType string, cpus machine.CPUSet)
+}
+
+// aggregatedMetric folds a single per-CPU source metric over a core set with
+// one aggregator. Ratio-like metrics use avg (a per-core intensity), while
+// counts like L3Misses use sum (a whole-set volume).
+type aggregatedMetric struct {
 	emitName   string
 	sourceName string
 	agg        utilmetric.Aggregator
 }
 
-var coreMetricDescriptors = []coreMetricDescriptor{
-	{emitName: metricBulkheadCoreIOWaitRatio, sourceName: pkgconsts.MetricCPUIOWaitRatio, agg: utilmetric.AggregatorAvg},
-	{emitName: metricBulkheadCoreSchedWait, sourceName: pkgconsts.MetricCPUSchedwait, agg: utilmetric.AggregatorAvg},
-	{emitName: metricBulkheadCoreIrqRatio, sourceName: pkgconsts.MetricCPUIrqRatio, agg: utilmetric.AggregatorAvg},
-	{emitName: metricBulkheadCoreCPI, sourceName: pkgconsts.MetricCPUCPI, agg: utilmetric.AggregatorAvg},
-	{emitName: metricBulkheadCoreL3Misses, sourceName: pkgconsts.MetricCPUL3Misses, agg: utilmetric.AggregatorSum},
+func (m aggregatedMetric) emit(
+	emitter metrics.MetricEmitter,
+	fetcher metrictypes.MetricsFetcher,
+	coreType string,
+	cpus machine.CPUSet,
+) {
+	data := fetcher.AggregateCoreMetric(cpus, m.sourceName, m.agg)
+	_ = emitter.StoreFloat64(m.emitName, data.Value, metrics.MetricTypeNameRaw,
+		metrics.MetricTag{Key: coreTypeTagKey, Val: coreType},
+	)
+}
+
+// ratioMetric emits a pool-level quotient of two summed per-CPU source metrics,
+// i.e. sum(numerator)/sum(denominator) over the core set. This yields a
+// denominator-weighted ratio (e.g. instruction-weighted CPI) rather than an
+// unweighted mean of per-core ratios. A non-positive denominator sum is treated
+// as "no signal" and skipped so an absent measurement never reports a
+// misleading zero or divides by zero.
+type ratioMetric struct {
+	emitName          string
+	numeratorSource   string
+	denominatorSource string
+}
+
+func (m ratioMetric) emit(
+	emitter metrics.MetricEmitter,
+	fetcher metrictypes.MetricsFetcher,
+	coreType string,
+	cpus machine.CPUSet,
+) {
+	numerator := fetcher.AggregateCoreMetric(cpus, m.numeratorSource, utilmetric.AggregatorSum)
+	denominator := fetcher.AggregateCoreMetric(cpus, m.denominatorSource, utilmetric.AggregatorSum)
+	if denominator.Value <= 0 {
+		general.InfofV(6, "bulkhead cpu_metrics: non-positive denominator for %s core_type=%s, skipping", m.emitName, coreType)
+		return
+	}
+	_ = emitter.StoreFloat64(m.emitName, numerator.Value/denominator.Value, metrics.MetricTypeNameRaw,
+		metrics.MetricTag{Key: coreTypeTagKey, Val: coreType},
+	)
+}
+
+var coreMetricEmitters = []coreMetricEmitter{
+	aggregatedMetric{emitName: metricBulkheadCoreIOWaitRatio, sourceName: pkgconsts.MetricCPUIOWaitRatio, agg: utilmetric.AggregatorAvg},
+	aggregatedMetric{emitName: metricBulkheadCoreSchedWait, sourceName: pkgconsts.MetricCPUSchedwait, agg: utilmetric.AggregatorAvg},
+	aggregatedMetric{emitName: metricBulkheadCoreIrqRatio, sourceName: pkgconsts.MetricCPUIrqRatio, agg: utilmetric.AggregatorAvg},
+	ratioMetric{emitName: metricBulkheadCoreCPI, numeratorSource: pkgconsts.MetricCPUCycles, denominatorSource: pkgconsts.MetricCPUInstructions},
+	aggregatedMetric{emitName: metricBulkheadCoreL3Misses, sourceName: pkgconsts.MetricCPUL3Misses, agg: utilmetric.AggregatorSum},
 }
 
 type CPUMetricsPlugin struct{}
@@ -134,11 +182,8 @@ func (p *CPUMetricsPlugin) emitForCoreSet(
 		general.InfofV(6, "bulkhead cpu_metrics: empty core set core_type=%s, skipping", coreType)
 		return
 	}
-	for _, descriptor := range coreMetricDescriptors {
-		data := fetcher.AggregateCoreMetric(cpus, descriptor.sourceName, descriptor.agg)
-		_ = emitter.StoreFloat64(descriptor.emitName, data.Value, metrics.MetricTypeNameRaw,
-			metrics.MetricTag{Key: coreTypeTagKey, Val: coreType},
-		)
+	for _, m := range coreMetricEmitters {
+		m.emit(emitter, fetcher, coreType, cpus)
 	}
 }
 
