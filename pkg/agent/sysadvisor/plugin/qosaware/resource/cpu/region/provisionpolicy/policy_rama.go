@@ -197,7 +197,7 @@ func (p *PolicyRama) sanityCheck() error {
 	}
 
 	// 4. check indicators legality
-	if p.Indicators == nil {
+	if len(p.Indicators) == 0 {
 		errList = append(errList, fmt.Errorf("illegal indicators"))
 	}
 

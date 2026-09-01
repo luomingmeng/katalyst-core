@@ -18,13 +18,14 @@ package region
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"math"
 	"sync"
 
 	"go.uber.org/atomic"
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/klog/v2"
 
 	"github.com/kubewharf/katalyst-api/pkg/apis/config/v1alpha1"
@@ -790,6 +791,7 @@ func (r *QoSRegionBase) getIndicators() (types.Indicator, error) {
 	general.Infof("indicatorTargetConfig: %v, region %v", indicatorTargetConfig, r.name)
 
 	indicators := make(types.Indicator)
+	unavailableCount := 0
 	for _, indicator := range indicatorTargetConfig {
 		indicatorName := indicator.Name
 		defaultTarget := indicator.Target
@@ -801,7 +803,17 @@ func (r *QoSRegionBase) getIndicators() (types.Indicator, error) {
 
 		current, err := indicatorCurrentGetter()
 		if err != nil {
-			return nil, err
+			if stderrors.Is(err, errIndicatorUnavailable) {
+				unavailableCount++
+				general.Warningf(
+					"skip unavailable indicator %s for region %s: %v",
+					indicatorName,
+					r.name,
+					err,
+				)
+				continue
+			}
+			return nil, fmt.Errorf("get current indicator %s for region %s: %w", indicatorName, r.name, err)
 		}
 
 		target := r.getIndicatorTarget(indicatorName, defaultTarget)
@@ -810,8 +822,12 @@ func (r *QoSRegionBase) getIndicators() (types.Indicator, error) {
 			Current: current,
 			Target:  target,
 		}
-		if indicatorValue.Target <= 0 || indicatorValue.Current <= 0 {
-			klog.ErrorS(nil, "invalid indicator", "indicatorName", indicatorName, "indicatorValue", indicatorValue)
+		if !isIndicatorValueValid(r.regionType, indicatorName, indicatorValue) {
+			klog.ErrorS(nil, "invalid indicator",
+				"regionName", r.name,
+				"indicatorName", indicatorName,
+				"indicatorValue", indicatorValue,
+			)
 			continue
 		}
 
@@ -822,6 +838,13 @@ func (r *QoSRegionBase) getIndicators() (types.Indicator, error) {
 				"indicator_name": string(indicatorName),
 				"binding_numas":  r.bindingNumas.String(),
 			})...)
+	}
+	if len(indicators) == 0 && unavailableCount > 0 {
+		return nil, fmt.Errorf(
+			"%w: no valid configured indicators for region %s",
+			errIndicatorUnavailable,
+			r.name,
+		)
 	}
 	if r.conf.PolicyRama.EnableBorwein && r.provisionPolicyNameInUse == types.CPUProvisionPolicyRama {
 		general.Infof("try to update indicators by borwein model")
@@ -843,7 +866,7 @@ func (r *QoSRegionBase) getPodIndicatorTarget(ctx context.Context, podUID string
 
 	indicatorTarget := defaultTarget
 	servicePerformanceTarget, err := r.metaServer.ServiceSystemPerformanceTarget(ctx, pod.ObjectMeta)
-	if err != nil && !errors.IsNotFound(err) {
+	if err != nil && !apierrors.IsNotFound(err) {
 		return nil, err
 	} else if err != nil {
 		return &indicatorTarget, nil
