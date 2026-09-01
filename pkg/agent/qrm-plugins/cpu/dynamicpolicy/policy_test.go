@@ -522,18 +522,19 @@ func TestPodDeletionCleansUnownedPoolsBeforeAdjustment(t *testing.T) {
 	}
 
 	t.Run("explicit remove", func(t *testing.T) {
+		defer mockey.UnPatchAll()
 		adjustErr := errors.New("stop after validating target entries")
-		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAtRevision).
+		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesWithRampUpFloorAtRevision).
 			To(func(_ *DynamicPolicy, entries state.PodEntries, _ state.NUMANodeMap,
-				_ bool, _ uint64,
+				_ bool, _ machine.CPUSet, runCPUSetHandlers bool, _ uint64,
 			) error {
 				assertCleaned(entries)
+				require.False(t, runCPUSetHandlers)
 				return adjustErr
 			}).Build()
 
 		_, err := policy.RemovePod(context.Background(), &pluginapi.RemovePodRequest{PodUid: podUID})
 		require.ErrorIs(t, err, adjustErr)
-		mockey.UnPatchAll()
 	})
 
 	t.Run("residual cleanup", func(t *testing.T) {
@@ -822,13 +823,14 @@ func TestRemovePodCommitsCanonicalStateAtomically(t *testing.T) {
 			gotPersist  bool
 			gotRevision uint64
 		)
-		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAtRevision).
+		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesWithRampUpFloorAtRevision).
 			To(func(_ *DynamicPolicy, entries state.PodEntries, machineState state.NUMANodeMap,
-				persist bool, expectedRevision uint64,
+				persist bool, _ machine.CPUSet, runCPUSetHandlers bool, expectedRevision uint64,
 			) error {
 				require.NotContains(t, entries, podUID)
 				require.NotNil(t, machineState)
 				require.Equal(t, 0, releasePlugin.releaseCount)
+				require.False(t, runCPUSetHandlers)
 				gotPersist = persist
 				gotRevision = expectedRevision
 				return gateErr
@@ -851,11 +853,47 @@ func TestRemovePodCommitsCanonicalStateAtomically(t *testing.T) {
 		require.NotContains(t, restarted.GetPodEntries(), podUID)
 	})
 
+	t.Run("slow cpuset convergence does not block committed removal", func(t *testing.T) {
+		policy, _, _, _ := newPolicy(t)
+		newRegistry(t)
+		started := make(chan struct{})
+		release := make(chan struct{})
+		policy.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+			"blocking-convergence": func(context.Context, dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
+				close(started)
+				<-release
+				return nil
+			},
+		}
+
+		removeDone := make(chan error, 1)
+		go func() {
+			_, err := policy.RemovePod(context.Background(), &pluginapi.RemovePodRequest{PodUid: podUID})
+			removeDone <- err
+		}()
+
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("asynchronous cpuset convergence did not start")
+		}
+		select {
+		case err := <-removeDone:
+			require.NoError(t, err)
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("RemovePod waited for asynchronous cpuset convergence")
+		}
+		require.NotContains(t, policy.state.GetPodEntries(), podUID)
+
+		close(release)
+		policy.cpuSetAdjustmentRetryWG.Wait()
+	})
+
 	t.Run("non gate error preserves canonical state and accompany resource", func(t *testing.T) {
 		defer mockey.UnPatchAll()
 		policy, _, initialRevision, initialMachineState := newPolicy(t)
 		releasePlugin := newRegistry(t)
-		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAtRevision).
+		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesWithRampUpFloorAtRevision).
 			Return(nonGateErr).Build()
 
 		_, err := policy.RemovePod(context.Background(), &pluginapi.RemovePodRequest{PodUid: podUID})
@@ -872,7 +910,7 @@ func TestRemovePodCommitsCanonicalStateAtomically(t *testing.T) {
 		releasePlugin := newRegistry(t)
 		require.NoError(t, os.RemoveAll(stateDir))
 		require.NoError(t, os.WriteFile(stateDir, []byte("block checkpoint directory"), 0o600))
-		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAtRevision).
+		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesWithRampUpFloorAtRevision).
 			Return(gateErr).Build()
 
 		_, err := policy.RemovePod(context.Background(), &pluginapi.RemovePodRequest{PodUid: podUID})

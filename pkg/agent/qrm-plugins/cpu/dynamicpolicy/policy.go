@@ -1525,8 +1525,8 @@ func (p *DynamicPolicy) RemovePod(ctx context.Context,
 		return nil, fmt.Errorf("GenerateMachineStateFromPodEntries failed with error: %v", err)
 	}
 
-	err = p.adjustAllocationEntriesAtRevision(
-		podEntries, machineState, true, expectedRevision)
+	err = p.adjustAllocationEntriesWithRampUpFloorAtRevision(
+		podEntries, machineState, true, machine.NewCPUSet(), false, expectedRevision)
 	if err != nil {
 		general.ErrorS(err, "adjustAllocationEntries failed", "podUID", req.PodUid)
 		err = p.persistPodDeletionAfterAdjustFailure(
@@ -1535,6 +1535,11 @@ func (p *DynamicPolicy) RemovePod(ctx context.Context,
 			return nil, fmt.Errorf("commit pod removal failed: %w", err)
 		}
 	}
+
+	// The canonical deletion and checkpoint are durable at this point. Keep
+	// topology/cgroup convergence out of the kubelet RemovePod deadline and let
+	// the single-flight latest-state worker coalesce deletion bursts.
+	p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonPodRemoval)
 
 	if err := AccompanyResourceRegistry.ReleaseAccompanyResource(req); err != nil {
 		general.ErrorS(err, "failed to release accompany resource", "podUID", req.PodUid)

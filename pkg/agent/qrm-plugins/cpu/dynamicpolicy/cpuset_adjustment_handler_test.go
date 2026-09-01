@@ -1671,6 +1671,7 @@ func TestQueuedRetryRequestsAlwaysProduceOneTrailingLatestStateRound(t *testing.
 	for _, reason := range []cpusetutil.CPUSetAdjustmentRetryReason{
 		cpusetutil.RetryReasonDeferredLeaf,
 		cpusetutil.RetryReasonStaleState,
+		cpusetutil.RetryReasonPodRemoval,
 	} {
 		reason := reason
 		t.Run(string(reason), func(t *testing.T) {
