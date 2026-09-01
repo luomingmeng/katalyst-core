@@ -212,15 +212,17 @@ func (c *CPUAdvisorValidator) validateEntries(resp *advisorapi.ListAndWatchRespo
 						podUID, containerName)
 				}
 
-				// NUMA-binding dedicated allocations may shrink when the incoming
-				// response carries a disjoint dedicated/reclaim partition. Legacy
-				// mode retains the exact-size contract.
+				// In disjoint mode the dedicated/reclaim partition is
+				// re-driven by the incoming advisor response, so NUMA-binding
+				// dedicated allocations may legitimately shrink or grow (e.g. a
+				// non-exclusive DNB container whose target expands as the
+				// reclaim pool changes). Rejecting such grows would deadlock the
+				// container at its current (possibly minimal) size. Legacy /
+				// overlap mode retains the exact-size contract.
 				allocationQuantity := allocationInfo.AllocationResult.Size()
 				if calculationQuantity != allocationQuantity &&
 					(!resp.DisableDedicatedCoresOverlapReclaimedCores ||
-						!allocationInfo.CheckDedicatedNUMABinding() ||
-						(calculationQuantity > allocationQuantity &&
-							!allocationInfo.CheckDedicatedNUMABindingNUMAExclusive())) {
+						!allocationInfo.CheckDedicatedNUMABinding()) {
 					return fmt.Errorf("pod: %s container: %s calculation result: %d and allocation result: %d mismatch",
 						podUID, containerName, calculationQuantity, allocationQuantity)
 				}
