@@ -109,28 +109,58 @@ func TestCPUAdvisorValidatorRejectsIncompatibleResourcePackageAliases(t *testing
 func TestCPUAdvisorValidatorValidatesNUMABindingDedicatedQuantityInDisjointMode(t *testing.T) {
 	t.Parallel()
 
-	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
-	require.NoError(t, err)
-	currentState := cpustate.NewCPUPluginState(nil)
-	currentState.SetPodEntries(cpustate.PodEntries{
-		"pod": {
-			"container": &cpustate.AllocationInfo{
-				AllocationMeta: commonstate.AllocationMeta{
-					PodUid:        "pod",
-					ContainerName: "container",
-					QoSLevel:      consts.PodAnnotationQoSLevelDedicatedCores,
-					Annotations: map[string]string{
-						consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+	// newValidator builds a fully isolated validator whose backing state owns a
+	// single dedicated NUMA-binding container occupying allocated. Every subtest
+	// constructs its own validator so parallel subtests never share the mutable
+	// currentState; the historical shared state caused "legacy mode rejects
+	// shrink" to observe a concurrent shrink written by "non-exclusive grow from
+	// one core passes" and spuriously pass.
+	newValidator := func(t *testing.T, allocated machine.CPUSet, exclusive bool) *CPUAdvisorValidator {
+		t.Helper()
+		topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+		require.NoError(t, err)
+		annotations := map[string]string{
+			consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+		}
+		if exclusive {
+			annotations[consts.PodAnnotationMemoryEnhancementNumaExclusive] =
+				consts.PodAnnotationMemoryEnhancementNumaExclusiveEnable
+		}
+		st := cpustate.NewCPUPluginState(nil)
+		st.SetPodEntries(cpustate.PodEntries{
+			"pod": {
+				"container": &cpustate.AllocationInfo{
+					AllocationMeta: commonstate.AllocationMeta{
+						PodUid:        "pod",
+						ContainerName: "container",
+						QoSLevel:      consts.PodAnnotationQoSLevelDedicatedCores,
+						Annotations:   annotations,
 					},
-				},
-				AllocationResult: machine.NewCPUSet(0, 1),
-				TopologyAwareAssignments: map[int]machine.CPUSet{
-					0: machine.NewCPUSet(0, 1),
+					AllocationResult:         allocated,
+					TopologyAwareAssignments: map[int]machine.CPUSet{0: allocated},
 				},
 			},
-		},
-	})
-	v := NewCPUAdvisorValidator(currentState, &machine.KatalystMachineInfo{CPUTopology: topology})
+		})
+		return NewCPUAdvisorValidator(st, &machine.KatalystMachineInfo{CPUTopology: topology})
+	}
+
+	dedicatedResp := func(quantity uint64, disjoint bool) *advisorapi.ListAndWatchResponse {
+		return &advisorapi.ListAndWatchResponse{
+			DisableDedicatedCoresOverlapReclaimedCores: disjoint,
+			Entries: map[string]*advisorapi.CalculationEntries{
+				"pod": {
+					Entries: map[string]*advisorapi.CalculationInfo{
+						"container": {
+							OwnerPoolName: commonstate.PoolNameDedicated,
+							CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+								0: {Blocks: []*advisorapi.Block{{BlockId: "dedicated", Result: quantity}}},
+							},
+						},
+					},
+				},
+			},
+		}
+	}
 
 	for _, tc := range []struct {
 		name      string
@@ -145,45 +175,9 @@ func TestCPUAdvisorValidatorValidatesNUMABindingDedicatedQuantityInDisjointMode(
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			annotations := map[string]string{
-				consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
-			}
-			if tc.exclusive {
-				annotations[consts.PodAnnotationMemoryEnhancementNumaExclusive] =
-					consts.PodAnnotationMemoryEnhancementNumaExclusiveEnable
-			}
-			currentState.SetPodEntries(cpustate.PodEntries{
-				"pod": {
-					"container": &cpustate.AllocationInfo{
-						AllocationMeta: commonstate.AllocationMeta{
-							PodUid:        "pod",
-							ContainerName: "container",
-							QoSLevel:      consts.PodAnnotationQoSLevelDedicatedCores,
-							Annotations:   annotations,
-						},
-						AllocationResult: machine.NewCPUSet(0, 1),
-						TopologyAwareAssignments: map[int]machine.CPUSet{
-							0: machine.NewCPUSet(0, 1),
-						},
-					},
-				},
-			})
-			resp := &advisorapi.ListAndWatchResponse{
-				DisableDedicatedCoresOverlapReclaimedCores: true,
-				Entries: map[string]*advisorapi.CalculationEntries{
-					"pod": {
-						Entries: map[string]*advisorapi.CalculationInfo{
-							"container": {
-								OwnerPoolName: commonstate.PoolNameDedicated,
-								CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
-									0: {Blocks: []*advisorapi.Block{{BlockId: "dedicated", Result: tc.quantity}}},
-								},
-							},
-						},
-					},
-				},
-			}
-			err := v.Validate(resp)
+			t.Parallel()
+			v := newValidator(t, machine.NewCPUSet(0, 1), tc.exclusive)
+			err := v.Validate(dedicatedResp(tc.quantity, true))
 			if tc.wantErr == "" {
 				require.NoError(t, err)
 				return
@@ -202,21 +196,8 @@ func TestCPUAdvisorValidatorValidatesNUMABindingDedicatedQuantityInDisjointMode(
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			resp := &advisorapi.ListAndWatchResponse{
-				Entries: map[string]*advisorapi.CalculationEntries{
-					"pod": {
-						Entries: map[string]*advisorapi.CalculationInfo{
-							"container": {
-								OwnerPoolName: commonstate.PoolNameDedicated,
-								CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
-									0: {Blocks: []*advisorapi.Block{{BlockId: "dedicated", Result: tc.quantity}}},
-								},
-							},
-						},
-					},
-				},
-			}
-			require.ErrorContains(t, v.Validate(resp), "calculation result")
+			v := newValidator(t, machine.NewCPUSet(0, 1), false)
+			require.ErrorContains(t, v.Validate(dedicatedResp(tc.quantity, false)), "calculation result")
 		})
 	}
 
@@ -228,40 +209,8 @@ func TestCPUAdvisorValidatorValidatesNUMABindingDedicatedQuantityInDisjointMode(
 	// the grow-rejection path (the real node simply had a larger NUMA).
 	t.Run("non-exclusive grow from one core passes", func(t *testing.T) {
 		t.Parallel()
-		currentState.SetPodEntries(cpustate.PodEntries{
-			"pod": {
-				"container": &cpustate.AllocationInfo{
-					AllocationMeta: commonstate.AllocationMeta{
-						PodUid:        "pod",
-						ContainerName: "container",
-						QoSLevel:      consts.PodAnnotationQoSLevelDedicatedCores,
-						Annotations: map[string]string{
-							consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
-						},
-					},
-					AllocationResult: machine.NewCPUSet(0),
-					TopologyAwareAssignments: map[int]machine.CPUSet{
-						0: machine.NewCPUSet(0),
-					},
-				},
-			},
-		})
-		resp := &advisorapi.ListAndWatchResponse{
-			DisableDedicatedCoresOverlapReclaimedCores: true,
-			Entries: map[string]*advisorapi.CalculationEntries{
-				"pod": {
-					Entries: map[string]*advisorapi.CalculationInfo{
-						"container": {
-							OwnerPoolName: commonstate.PoolNameDedicated,
-							CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
-								0: {Blocks: []*advisorapi.Block{{BlockId: "dedicated", Result: 4}}},
-							},
-						},
-					},
-				},
-			},
-		}
-		require.NoError(t, v.Validate(resp))
+		v := newValidator(t, machine.NewCPUSet(0), false)
+		require.NoError(t, v.Validate(dedicatedResp(4, true)))
 	})
 }
 
