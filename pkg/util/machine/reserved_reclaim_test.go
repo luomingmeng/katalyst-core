@@ -337,11 +337,12 @@ func TestResolveHardPartitionReclaimTargets(t *testing.T) {
 	}
 
 	tests := []struct {
-		name                   string
-		conf                   *dynamicconfig.Configuration
-		globalReservedFallback int
-		perNUMAReservedFloor   func(int) int
-		want                   map[int]int
+		name                    string
+		conf                    *dynamicconfig.Configuration
+		globalReservedFallback  int
+		perNUMAReservedFloor    func(int) int
+		perNUMAEligibleCapacity func(int) int
+		want                    map[int]int
 	}{
 		{
 			// ramp-up ratio 0, minimum 2 per NUMA drives the baseline (total 4);
@@ -382,6 +383,38 @@ func TestResolveHardPartitionReclaimTargets(t *testing.T) {
 			},
 			want: map[int]int{0: 4, 1: 2},
 		},
+		{
+			// eligible capacity is smaller than full capacity because dedicated /
+			// non-exclusive DNB workloads already occupy part of each NUMA. The
+			// ramp-up target must be derived from the eligible core count so it
+			// stays within what admission validates against. full capacity 8
+			// (4 cores) would yield floor(4*0.5)=2 cores=4 CPUs, but eligible
+			// capacity 4 (2 cores) yields floor(2*0.5)=1 core=2 CPUs per NUMA.
+			name:                    "eligible capacity caps rampup target",
+			conf:                    newReclaimTestConfig(0.5, "0", "", ""),
+			globalReservedFallback:  0,
+			perNUMAEligibleCapacity: func(int) int { return 4 },
+			want:                    map[int]int{0: 2, 1: 2},
+		},
+		{
+			// A NUMA fully occupied by non-exclusive DNB (or dedicated) workloads
+			// has zero eligible capacity: physically no free core can be kept for
+			// reclaim, so its hard-partition target is legitimately 0 rather than a
+			// fail-closed error. The always-on one-core minimum baseline must not be
+			// imposed on a NUMA that cannot even yield a single complete core. NUMA 0
+			// has eligible 0 => target 0; NUMA 1 keeps full eligible 8 (4 cores) =>
+			// floor(4*0.5)=2 cores=4 CPUs.
+			name:                   "numa fully occupied yields zero target",
+			conf:                   newReclaimTestConfig(0.5, "0", "", ""),
+			globalReservedFallback: 0,
+			perNUMAEligibleCapacity: func(numaID int) int {
+				if numaID == 0 {
+					return 0
+				}
+				return 8
+			},
+			want: map[int]int{0: 0, 1: 4},
+		},
 	}
 
 	for _, tt := range tests {
@@ -389,7 +422,7 @@ func TestResolveHardPartitionReclaimTargets(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			got, err := ResolveHardPartitionReclaimTargets(
-				tt.conf, topology, tt.globalReservedFallback, tt.perNUMAReservedFloor)
+				tt.conf, topology, tt.globalReservedFallback, tt.perNUMAReservedFloor, tt.perNUMAEligibleCapacity)
 			if err != nil {
 				t.Fatalf("ResolveHardPartitionReclaimTargets() error = %v", err)
 			}
@@ -418,7 +451,7 @@ func TestResolveHardPartitionReclaimTargetsCoreAligned(t *testing.T) {
 		newReclaimTestConfig(0, "0", "0.13", "3"),
 	}
 	for i, conf := range confs {
-		got, err := ResolveHardPartitionReclaimTargets(conf, topology, 0, nil)
+		got, err := ResolveHardPartitionReclaimTargets(conf, topology, 0, nil, nil)
 		if err != nil {
 			t.Fatalf("case %d: ResolveHardPartitionReclaimTargets() error = %v", i, err)
 		}
