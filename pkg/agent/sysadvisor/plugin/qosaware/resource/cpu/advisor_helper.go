@@ -245,6 +245,7 @@ func (cra *cpuResourceAdvisor) updateRampUpReclaimCPUSetCap(
 		cra.metaServer.CPUTopology,
 		0,
 		func(numaID int) int { return cra.reservedForReclaim[numaID] },
+		nil,
 	)
 	if err != nil {
 		cra.rampUpReclaimCPUSetCap = make(map[int]int)

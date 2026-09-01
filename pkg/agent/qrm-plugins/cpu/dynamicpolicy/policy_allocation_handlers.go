@@ -3587,6 +3587,7 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloorForMode(
 			p.machineInfo.CPUTopology,
 			configuredFloor,
 			func(numaID int) int { return reservedFloorByNUMA[numaID].Size() },
+			nil,
 		)
 		if err != nil {
 			return machine.NewCPUSet(), fmt.Errorf("distribute configured ramp-up reclaim floor: %w", err)

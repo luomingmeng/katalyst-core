@@ -206,11 +206,22 @@ func ResolveConfiguredReclaimFloorFromConfig(
 // least numaCount*2" step, which is redundant because the per-NUMA baseline
 // already guarantees a total of at least hardPartitionReclaimBaselinePerNUMA per
 // NUMA and the distribution never lowers it.
+//
+// perNUMAEligibleCapacity is optional; when nil, each NUMA's full CPU capacity
+// is used. QRM passes the per-NUMA eligible capacity (full capacity minus the
+// CPUs already occupied by dedicated / non-exclusive DNB workloads) so the
+// derived target shares the same capacity view as the downstream admission
+// validation (eligible.Size() < target). Deriving the target from full capacity
+// while validating against eligible capacity is exactly what causes the
+// "eligible capacity is smaller than immutable target" allocate failures. The
+// value is clamped to [0, full capacity] so a stale or oversized eligible view
+// can never lift the target above the NUMA's real capacity.
 func ResolveHardPartitionReclaimTargets(
 	conf *dynamicconfig.Configuration,
 	topology *CPUTopology,
 	globalReservedFallback int,
 	perNUMAReservedFloor func(numaID int) int,
+	perNUMAEligibleCapacity func(numaID int) int,
 ) (map[int]int, error) {
 	if topology == nil {
 		return nil, fmt.Errorf("resolve hard-partition reclaim targets: nil topology")
@@ -227,8 +238,35 @@ func ResolveHardPartitionReclaimTargets(
 	capacityByNUMA := make(map[int]int, len(numaIDs))
 	baselineByNUMA := make(map[int]int, len(numaIDs))
 	for _, numaID := range numaIDs {
-		capacity := topology.CPUDetails.CPUsInNUMANodes(numaID).Size()
+		fullCapacity := topology.CPUDetails.CPUsInNUMANodes(numaID).Size()
+		// derive the target from the eligible capacity so it shares the same
+		// capacity view as downstream admission validation; clamp to
+		// [0, fullCapacity] so a stale or oversized eligible view can never lift
+		// the target above the NUMA's real capacity. a nil provider keeps the
+		// historical full-capacity behavior for bulkhead / sysadvisor callers.
+		capacity := fullCapacity
+		if perNUMAEligibleCapacity != nil {
+			capacity = perNUMAEligibleCapacity(numaID)
+			if capacity < 0 {
+				capacity = 0
+			}
+			if capacity > fullCapacity {
+				capacity = fullCapacity
+			}
+		}
 		capacityByNUMA[numaID] = capacity
+		// a NUMA whose eligible capacity cannot yield a single complete core has
+		// physically no room to keep any reclaim reserve (e.g. it is fully
+		// occupied by dedicated / non-exclusive DNB workloads). Its hard-partition
+		// target is legitimately 0; imposing the always-on one-core minimum
+		// baseline here would exceed the eligible capacity and fail admission
+		// closed. Only the eligible-aware callers (perNUMAEligibleCapacity != nil,
+		// i.e. QRM) short-circuit this way; nil-provider callers keep the strict
+		// full-capacity contract where a one-core baseline always fits.
+		if perNUMAEligibleCapacity != nil && capacity/cpusPerCore == 0 {
+			baselineByNUMA[numaID] = 0
+			continue
+		}
 		reservedFloor := 0
 		if perNUMAReservedFloor != nil {
 			reservedFloor = perNUMAReservedFloor(numaID)

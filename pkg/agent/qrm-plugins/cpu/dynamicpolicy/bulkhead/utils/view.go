@@ -56,7 +56,7 @@ func NewCPUSetPartitionViewOptions(
 		HardPartitionReclaimTargetPerNUMA: map[int]int{},
 	}
 	if opts.HardPartitionEnabled && topology != nil {
-		targets, err := machine.ResolveHardPartitionReclaimTargets(dynamicConf, topology, 0, nil)
+		targets, err := machine.ResolveHardPartitionReclaimTargets(dynamicConf, topology, 0, nil, nil)
 		if err != nil {
 			opts.HardPartitionTargetError = err
 		} else {
