@@ -3705,14 +3705,10 @@ func (p *DynamicPolicy) deriveSteadyReclaimFloor(
 
 		reservedIdentities := p.reservedReclaimedCPUSet.Intersection(
 			p.machineInfo.CPUDetails.CPUsInNUMANodes(numaID))
-		floorInNUMA, err := completeCoresForCPUSet(p.machineInfo.CPUTopology, reservedIdentities)
+		floorInNUMA, err := completeEligibleCoresForPreferredCPUSet(
+			p.machineInfo.CPUTopology, eligible, reservedIdentities)
 		if err != nil {
 			return machine.NewCPUSet(), fmt.Errorf("derive steady reclaim floor for NUMA %d: %w", numaID, err)
-		}
-		if !floorInNUMA.IsSubsetOf(eligible) {
-			return machine.NewCPUSet(), fmt.Errorf(
-				"derive steady reclaim floor for NUMA %d: mandatory reserve %s is not a subset of reclaim eligibility %s",
-				numaID, floorInNUMA.String(), eligible.String())
 		}
 		if floorInNUMA.Size() > target {
 			return machine.NewCPUSet(), fmt.Errorf(

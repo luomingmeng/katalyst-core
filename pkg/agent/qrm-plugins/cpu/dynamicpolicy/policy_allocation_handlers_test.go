@@ -1737,6 +1737,43 @@ func TestDynamicPolicy_deriveSteadyReclaimFloorRejectsIdentitiesAboveConfiguredT
 	require.True(t, got.IsEmpty(), "got=%s", got)
 }
 
+func TestDynamicPolicy_deriveSteadyReclaimFloorFallsBackWhenReservedIdentityLeavesEligibility(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(192, 1, 8)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().NumaMinReclaimedResourceForAllocate = v1.ResourceList{
+		v1.ResourceCPU: resource.MustParse("2"),
+	}
+
+	// NUMA 1 mirrors the production failure: the historical reserved core
+	// 12,108 has been consumed by a dedicated pod, while another complete core
+	// 22,118 remains eligible and already backs the current reclaim pool.
+	p.reservedReclaimedCPUSet = machine.NewCPUSet(12)
+	p.reservedReclaimedCPUsSize = p.reservedReclaimedCPUSet.Size()
+	currentNUMA1Reclaim := machine.NewCPUSet(22, 118)
+	p.state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &state.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+		AllocationResult: currentNUMA1Reclaim,
+	}, false)
+
+	reclaimEligiblePerNUMA := make(map[int]machine.CPUSet)
+	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
+		reclaimEligiblePerNUMA[numaID] = topology.CPUDetails.CPUsInNUMANodes(numaID)
+	}
+	reclaimEligiblePerNUMA[1] = currentNUMA1Reclaim
+
+	got, err := p.deriveSteadyReclaimFloor(reclaimEligiblePerNUMA)
+	require.NoError(t, err)
+	require.True(t, currentNUMA1Reclaim.IsSubsetOf(got), "floor=%s", got)
+	require.True(t, got.Intersection(machine.NewCPUSet(12, 108)).IsEmpty(), "floor=%s", got)
+	requireCoreAligned(t, topology, got)
+}
+
 func TestDynamicPolicy_allocateNumaBindingCPUs_preservesMandatoryOnPodLookupFailure(t *testing.T) {
 	t.Parallel()
 

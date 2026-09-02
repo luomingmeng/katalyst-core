@@ -144,6 +144,28 @@ func completeCoresForCPUSet(topology *machine.CPUTopology, cpus machine.CPUSet) 
 	return topology.CPUDetails.CPUsInCores(coreIDs...), nil
 }
 
+func completeEligibleCoresForPreferredCPUSet(
+	topology *machine.CPUTopology,
+	eligible machine.CPUSet,
+	prefer machine.CPUSet,
+) (machine.CPUSet, error) {
+	if topology == nil {
+		return machine.NewCPUSet(), fmt.Errorf("cannot select eligible preferred cores with nil cpu topology")
+	}
+	if topology.CPUsPerCore() <= 0 {
+		return machine.NewCPUSet(), fmt.Errorf("cannot select eligible preferred cores with non-positive cpus per core %d", topology.CPUsPerCore())
+	}
+
+	selected := machine.NewCPUSet()
+	for _, core := range coreAlignedCandidates(topology, eligible, prefer) {
+		if core.preferredHit == 0 {
+			break
+		}
+		selected = selected.Union(core.cpus)
+	}
+	return selected, nil
+}
+
 // assertCoreAligned is a fail-loud safety net: it returns a lowercase error when
 // reclaim holds a partial physical core (a CoreID whose sibling count differs
 // from CPUsPerCore()). It never repairs silently; a violation signals an upstream
