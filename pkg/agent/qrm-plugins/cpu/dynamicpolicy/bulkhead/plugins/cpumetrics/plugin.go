@@ -14,111 +14,96 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package cpumetrics provides a read-only bulkhead plugin that samples per-CPU
-// runtime-quality metrics for the reclaim and non-reclaim core sets and emits
-// them aggregated per core type. It never mutates cgroup or topology state; it
-// only reports the finalized (applied) partitioning, so it is gated on the
-// manager's AppliedView finality signal.
+// Package cpumetrics emits runtime-quality metrics projected from final applied
+// pool ownership. It is read-only and never reconstructs ownership from mutable
+// QRM state.
 package cpumetrics
 
 import (
 	"context"
+	"sort"
+	"strconv"
 
 	bulkheadapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	"github.com/kubewharf/katalyst-core/pkg/config"
-	pkgconsts "github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	metrictypes "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric/types"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
-	utilmetric "github.com/kubewharf/katalyst-core/pkg/util/metric"
 )
 
 const CPUMetricsPluginName = "cpu_metrics"
 
-// emitted metric names; reclaim / non_reclaim are distinguished by the
-// core_type tag rather than by separate metric names, keeping metric
-// cardinality bounded and consistent with the existing bulkhead partition
-// metrics that tag by view/partition.
 const (
-	metricBulkheadCoreIOWaitRatio = "bulkhead_core_iowait_ratio"
-	metricBulkheadCoreSchedWait   = "bulkhead_core_schedwait"
-	metricBulkheadCoreIrqRatio    = "bulkhead_core_irq_ratio"
-	metricBulkheadCoreCPI         = "bulkhead_core_cpi"
-	metricBulkheadCoreL3Misses    = "bulkhead_core_l3misses"
+	metricPoolCPUUsageRatio = "bulkhead_pool_cpu_usage_ratio"
+	metricPoolIOWaitRatio   = "bulkhead_pool_iowait_ratio"
+	metricPoolSchedWait     = "bulkhead_pool_schedwait"
+	metricPoolIRQRatio      = "bulkhead_pool_irq_ratio"
+	metricPoolCPI           = "bulkhead_pool_cpi"
+	metricPoolL3Misses      = "bulkhead_pool_l3misses"
 
-	coreTypeTagKey     = "core_type"
-	coreTypeReclaim    = "reclaim"
-	coreTypeNonReclaim = "non_reclaim"
+	metricPoolNUMACPUUsageRatio = "bulkhead_pool_numa_cpu_usage_ratio"
+	metricPoolNUMAIOWaitRatio   = "bulkhead_pool_numa_iowait_ratio"
+	metricPoolNUMASchedWait     = "bulkhead_pool_numa_schedwait"
+	metricPoolNUMAIRQRatio      = "bulkhead_pool_numa_irq_ratio"
+	metricPoolNUMACPI           = "bulkhead_pool_numa_cpi"
+	metricPoolNUMAL3Misses      = "bulkhead_pool_numa_l3misses"
+
+	metricPoolProjectionCPUCount    = "bulkhead_pool_projection_cpu_count"
+	metricPoolLabelConflictCPUCount = "bulkhead_pool_label_conflict_cpu_count"
+	metricPoolMetricSeriesCount     = "bulkhead_pool_metric_series_count"
+
+	poolNameTagKey = "pool_name"
+	numaIDTagKey   = "numa_id"
+	statusTagKey   = "status"
+	poolKindTagKey = "pool_kind"
+	scopeTagKey    = "scope"
+
+	scopeGlobal = "global"
+	scopeNUMA   = "numa"
 )
 
 var _ bulkheadapi.Plugin = (*CPUMetricsPlugin)(nil)
 
-// coreMetricEmitter aggregates one logical metric over a core set and emits it
-// tagged by core type. Implementations decide how the per-CPU source metric(s)
-// fold into a single emitted value, so single-source aggregations and derived
-// ratios can coexist in one table without special-casing the plugin loop.
-type coreMetricEmitter interface {
-	emit(emitter metrics.MetricEmitter, fetcher metrictypes.MetricsFetcher, coreType string, cpus machine.CPUSet)
+type metricDescriptor struct {
+	globalName string
+	numaName   string
+	value      func(aggregateValues) *float64
 }
 
-// aggregatedMetric folds a single per-CPU source metric over a core set with
-// one aggregator. Ratio-like metrics use avg (a per-core intensity), while
-// counts like L3Misses use sum (a whole-set volume).
-type aggregatedMetric struct {
-	emitName   string
-	sourceName string
-	agg        utilmetric.Aggregator
-}
-
-func (m aggregatedMetric) emit(
-	emitter metrics.MetricEmitter,
-	fetcher metrictypes.MetricsFetcher,
-	coreType string,
-	cpus machine.CPUSet,
-) {
-	data := fetcher.AggregateCoreMetric(cpus, m.sourceName, m.agg)
-	_ = emitter.StoreFloat64(m.emitName, data.Value, metrics.MetricTypeNameRaw,
-		metrics.MetricTag{Key: coreTypeTagKey, Val: coreType},
-	)
-}
-
-// ratioMetric emits a pool-level quotient of two summed per-CPU source metrics,
-// i.e. sum(numerator)/sum(denominator) over the core set. This yields a
-// denominator-weighted ratio (e.g. instruction-weighted CPI) rather than an
-// unweighted mean of per-core ratios. A non-positive denominator sum is treated
-// as "no signal" and skipped so an absent measurement never reports a
-// misleading zero or divides by zero.
-type ratioMetric struct {
-	emitName          string
-	numeratorSource   string
-	denominatorSource string
-}
-
-func (m ratioMetric) emit(
-	emitter metrics.MetricEmitter,
-	fetcher metrictypes.MetricsFetcher,
-	coreType string,
-	cpus machine.CPUSet,
-) {
-	numerator := fetcher.AggregateCoreMetric(cpus, m.numeratorSource, utilmetric.AggregatorSum)
-	denominator := fetcher.AggregateCoreMetric(cpus, m.denominatorSource, utilmetric.AggregatorSum)
-	if denominator.Value <= 0 {
-		general.InfofV(6, "bulkhead cpu_metrics: non-positive denominator for %s core_type=%s, skipping", m.emitName, coreType)
-		return
-	}
-	_ = emitter.StoreFloat64(m.emitName, numerator.Value/denominator.Value, metrics.MetricTypeNameRaw,
-		metrics.MetricTag{Key: coreTypeTagKey, Val: coreType},
-	)
-}
-
-var coreMetricEmitters = []coreMetricEmitter{
-	aggregatedMetric{emitName: metricBulkheadCoreIOWaitRatio, sourceName: pkgconsts.MetricCPUIOWaitRatio, agg: utilmetric.AggregatorAvg},
-	aggregatedMetric{emitName: metricBulkheadCoreSchedWait, sourceName: pkgconsts.MetricCPUSchedwait, agg: utilmetric.AggregatorAvg},
-	aggregatedMetric{emitName: metricBulkheadCoreIrqRatio, sourceName: pkgconsts.MetricCPUIrqRatio, agg: utilmetric.AggregatorAvg},
-	ratioMetric{emitName: metricBulkheadCoreCPI, numeratorSource: pkgconsts.MetricCPUCycles, denominatorSource: pkgconsts.MetricCPUInstructions},
-	aggregatedMetric{emitName: metricBulkheadCoreL3Misses, sourceName: pkgconsts.MetricCPUL3Misses, agg: utilmetric.AggregatorSum},
+var metricDescriptors = []metricDescriptor{
+	{
+		globalName: metricPoolCPUUsageRatio,
+		numaName:   metricPoolNUMACPUUsageRatio,
+		value:      func(values aggregateValues) *float64 { return values.cpuUsageRatio },
+	},
+	{
+		globalName: metricPoolIOWaitRatio,
+		numaName:   metricPoolNUMAIOWaitRatio,
+		value:      func(values aggregateValues) *float64 { return values.ioWaitRatio },
+	},
+	{
+		globalName: metricPoolSchedWait,
+		numaName:   metricPoolNUMASchedWait,
+		value:      func(values aggregateValues) *float64 { return values.schedWait },
+	},
+	{
+		globalName: metricPoolIRQRatio,
+		numaName:   metricPoolNUMAIRQRatio,
+		value:      func(values aggregateValues) *float64 { return values.irqRatio },
+	},
+	{
+		globalName: metricPoolCPI,
+		numaName:   metricPoolNUMACPI,
+		value:      func(values aggregateValues) *float64 { return values.cpi },
+	},
+	{
+		globalName: metricPoolL3Misses,
+		numaName:   metricPoolNUMAL3Misses,
+		value:      func(values aggregateValues) *float64 { return values.l3Misses },
+	},
 }
 
 type CPUMetricsPlugin struct{}
@@ -131,8 +116,6 @@ func (p *CPUMetricsPlugin) Name() string {
 	return CPUMetricsPluginName
 }
 
-// Enable follows the bulkhead global gate; this plugin owns no dynamic switch
-// of its own. Returning true keeps it running whenever bulkhead is enabled.
 func (p *CPUMetricsPlugin) Enable(bulkheadapi.HandlerContext) bool {
 	return true
 }
@@ -145,13 +128,15 @@ func (p *CPUMetricsPlugin) CPUSetAdjustmentDisabledHandler(context.Context, bulk
 	return nil
 }
 
-// PeriodicalHandler samples per-CPU metrics for the reclaim and non-reclaim
-// core sets and emits them aggregated per core type. It reports only the
-// finalized applied partitioning, so it no-ops unless the manager published a
-// valid AppliedView in the latest adjustment round.
 func (p *CPUMetricsPlugin) PeriodicalHandler(_ context.Context, in bulkheadapi.PeriodicalHandlerContext) error {
 	if !in.AppliedViewValidForPeriodical || in.AppliedView == nil {
 		general.InfofV(6, "bulkhead cpu_metrics: applied view not valid for periodical, skipping")
+		return nil
+	}
+	if in.AppliedView.Level != model.AppliedViewLevelFull &&
+		in.AppliedView.Level != model.AppliedViewLevelReclaimOnly {
+		general.InfofV(6, "bulkhead cpu_metrics: applied view level %q is not consumable, skipping",
+			in.AppliedView.Level)
 		return nil
 	}
 	if in.Emitter == nil {
@@ -164,27 +149,146 @@ func (p *CPUMetricsPlugin) PeriodicalHandler(_ context.Context, in bulkheadapi.P
 		return nil
 	}
 
-	p.emitForCoreSet(in.Emitter, fetcher, coreTypeReclaim, in.AppliedView.ReclaimEffective)
-	p.emitForCoreSet(in.Emitter, fetcher, coreTypeNonReclaim, in.AppliedView.NonReclaimPool)
+	projected := projectedPoolsForLevel(in.AppliedView)
+	assignment := assignPoolLabels(projected)
+	if len(assignment.pools) == 0 {
+		p.emitDiagnostics(in.Emitter, in.AppliedView, assignment, 0, 0)
+		return nil
+	}
+
+	union := machine.NewCPUSet()
+	for _, pool := range assignment.pools {
+		if !pool.cpus.IsEmpty() {
+			union = union.Union(pool.cpus)
+		}
+	}
+	if union.IsEmpty() {
+		general.InfofV(6, "bulkhead cpu_metrics: all projected pools are empty, skipping")
+		p.emitDiagnostics(in.Emitter, in.AppliedView, assignment, 0, 0)
+		return nil
+	}
+
+	cache := sampleRun(fetcher, union)
+	globalAttempts := 0
+	numaAttempts := 0
+	numaCPUs := numaBuckets(in.MetaServer, union)
+	for _, pool := range assignment.pools {
+		if pool.cpus.IsEmpty() {
+			continue
+		}
+		globalAttempts += p.emitValues(in.Emitter, aggregateSamples(cache, pool.cpus), false,
+			metrics.MetricTag{Key: poolNameTagKey, Val: pool.label})
+		for _, numaID := range sortedNUMAIDs(numaCPUs) {
+			intersection := pool.cpus.Intersection(numaCPUs[numaID])
+			if intersection.IsEmpty() {
+				continue
+			}
+			numaAttempts += p.emitValues(in.Emitter, aggregateSamples(cache, intersection), true,
+				metrics.MetricTag{Key: poolNameTagKey, Val: pool.label},
+				metrics.MetricTag{Key: numaIDTagKey, Val: strconv.Itoa(numaID)})
+		}
+	}
+	p.emitDiagnostics(in.Emitter, in.AppliedView, assignment, globalAttempts, numaAttempts)
 	return nil
 }
 
-// emitForCoreSet aggregates and emits every descriptor for a single core set.
-// An empty core set is skipped so an absent partition does not report a
-// misleading zero-valued sample.
-func (p *CPUMetricsPlugin) emitForCoreSet(
+func projectedPoolsForLevel(view *model.AppliedView) map[model.CPUSetPoolIdentity]machine.CPUSet {
+	if view.Level != model.AppliedViewLevelReclaimOnly {
+		return view.PoolProjection.CPUSetByIdentity
+	}
+	reclaim := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindReclaim}
+	cpus, ok := view.PoolProjection.CPUSetByIdentity[reclaim]
+	if !ok {
+		return nil
+	}
+	return map[model.CPUSetPoolIdentity]machine.CPUSet{reclaim: cpus}
+}
+
+func (p *CPUMetricsPlugin) emitValues(
 	emitter metrics.MetricEmitter,
-	fetcher metrictypes.MetricsFetcher,
-	coreType string,
-	cpus machine.CPUSet,
+	values aggregateValues,
+	numa bool,
+	tags ...metrics.MetricTag,
+) int {
+	attempted := 0
+	for _, descriptor := range metricDescriptors {
+		value := descriptor.value(values)
+		if value == nil {
+			continue
+		}
+		name := descriptor.globalName
+		if numa {
+			name = descriptor.numaName
+		}
+		attempted++
+		if err := emitter.StoreFloat64(name, *value, metrics.MetricTypeNameRaw, tags...); err != nil {
+			general.Errorf("bulkhead cpu_metrics: emit %s tags=%v failed: %v", name, tags, err)
+		}
+	}
+	return attempted
+}
+
+func (p *CPUMetricsPlugin) emitDiagnostics(
+	emitter metrics.MetricEmitter,
+	view *model.AppliedView,
+	assignment labelAssignment,
+	globalAttempts, numaAttempts int,
 ) {
-	if cpus.IsEmpty() {
-		general.InfofV(6, "bulkhead cpu_metrics: empty core set core_type=%s, skipping", coreType)
-		return
+	if view.Level == model.AppliedViewLevelFull {
+		p.emitInt(emitter, metricPoolProjectionCPUCount, int64(view.PoolProjection.UncoveredCPUs.Size()),
+			metrics.MetricTag{Key: statusTagKey, Val: "uncovered"})
+		p.emitInt(emitter, metricPoolProjectionCPUCount, int64(view.PoolProjection.AmbiguousCPUs.Size()),
+			metrics.MetricTag{Key: statusTagKey, Val: "ambiguous"})
+		for _, kind := range []model.CPUSetPoolKind{
+			model.CPUSetPoolKindShare,
+			model.CPUSetPoolKindDedicated,
+			model.CPUSetPoolKindIsolation,
+		} {
+			p.emitInt(emitter, metricPoolLabelConflictCPUCount, int64(assignment.conflictCPUByKind[kind].Size()),
+				metrics.MetricTag{Key: poolKindTagKey, Val: string(kind)})
+		}
 	}
-	for _, m := range coreMetricEmitters {
-		m.emit(emitter, fetcher, coreType, cpus)
+	p.emitInt(emitter, metricPoolMetricSeriesCount, int64(globalAttempts),
+		metrics.MetricTag{Key: scopeTagKey, Val: scopeGlobal})
+	p.emitInt(emitter, metricPoolMetricSeriesCount, int64(numaAttempts),
+		metrics.MetricTag{Key: scopeTagKey, Val: scopeNUMA})
+}
+
+func (p *CPUMetricsPlugin) emitInt(
+	emitter metrics.MetricEmitter,
+	name string,
+	value int64,
+	tags ...metrics.MetricTag,
+) {
+	if err := emitter.StoreInt64(name, value, metrics.MetricTypeNameRaw, tags...); err != nil {
+		general.Errorf("bulkhead cpu_metrics: emit %s tags=%v failed: %v", name, tags, err)
 	}
+}
+
+func numaBuckets(ms *metaserver.MetaServer, cpus machine.CPUSet) map[int]machine.CPUSet {
+	result := make(map[int]machine.CPUSet)
+	if ms == nil || ms.MetaAgent == nil || ms.KatalystMachineInfo == nil ||
+		ms.CPUTopology == nil || len(ms.CPUDetails) == 0 {
+		general.InfofV(6, "bulkhead cpu_metrics: nil or empty CPU topology, skipping NUMA metrics")
+		return result
+	}
+	for _, cpu := range cpus.ToSliceInt() {
+		detail, ok := ms.CPUDetails[cpu]
+		if !ok {
+			continue
+		}
+		result[detail.NUMANodeID] = result[detail.NUMANodeID].Union(machine.NewCPUSet(cpu))
+	}
+	return result
+}
+
+func sortedNUMAIDs(byNUMA map[int]machine.CPUSet) []int {
+	result := make([]int, 0, len(byNUMA))
+	for numaID := range byNUMA {
+		result = append(result, numaID)
+	}
+	sort.Ints(result)
+	return result
 }
 
 func metricsFetcherFrom(ms *metaserver.MetaServer) metrictypes.MetricsFetcher {

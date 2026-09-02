@@ -36,8 +36,42 @@ type CPUSetPartitionView struct {
 	ContainerCPUSetByPod                map[string]map[string]machine.CPUSet
 }
 
+type CPUSetPoolKind string
+
+const (
+	CPUSetPoolKindReclaim   CPUSetPoolKind = "reclaim"
+	CPUSetPoolKindShare     CPUSetPoolKind = "share"
+	CPUSetPoolKindDedicated CPUSetPoolKind = "dedicated"
+	CPUSetPoolKindIsolation CPUSetPoolKind = "isolation"
+)
+
+type CPUSetPoolIdentity struct {
+	Kind   CPUSetPoolKind
+	Name   string
+	PodUID string
+}
+
+func (i CPUSetPoolIdentity) Valid() bool {
+	switch i.Kind {
+	case CPUSetPoolKindReclaim:
+		return i.Name == "" && i.PodUID == ""
+	case CPUSetPoolKindShare:
+		return i.Name != "" && i.PodUID == ""
+	case CPUSetPoolKindDedicated, CPUSetPoolKindIsolation:
+		return i.Name == "" && i.PodUID != ""
+	default:
+		return false
+	}
+}
+
+type DesiredPoolOwner struct {
+	ExpectedCPUSet        machine.CPUSet
+	ContainerCPUSetByName map[string]machine.CPUSet
+}
+
 type DesiredView struct {
 	CPUSetPartitionView
+	PoolOwners map[CPUSetPoolIdentity]DesiredPoolOwner
 }
 
 type AppliedViewLevel string
@@ -58,6 +92,14 @@ type AppliedView struct {
 	// RelProofByRel binds each final-snapshot CPUSet proof to the stable
 	// device/inode identity of the cgroup directory that was observed.
 	RelProofByRel map[string]CgroupRelProof
+	// PoolProjection is the final-snapshot-authorized pool ownership.
+	PoolProjection AppliedPoolProjection
+}
+
+type AppliedPoolProjection struct {
+	CPUSetByIdentity map[CPUSetPoolIdentity]machine.CPUSet
+	UncoveredCPUs    machine.CPUSet
+	AmbiguousCPUs    machine.CPUSet
 }
 
 // CgroupRelProof binds an observed CPUSet to a stable cgroup directory identity.
@@ -88,14 +130,28 @@ func NewCPUSetPartitionView() CPUSetPartitionView {
 }
 
 func NewDesiredView() *DesiredView {
-	return &DesiredView{CPUSetPartitionView: NewCPUSetPartitionView()}
+	return &DesiredView{
+		CPUSetPartitionView: NewCPUSetPartitionView(),
+		PoolOwners:          map[CPUSetPoolIdentity]DesiredPoolOwner{},
+	}
+}
+
+func NewAppliedPoolProjection() AppliedPoolProjection {
+	return AppliedPoolProjection{
+		CPUSetByIdentity: map[CPUSetPoolIdentity]machine.CPUSet{},
+		UncoveredCPUs:    machine.NewCPUSet(),
+		AmbiguousCPUs:    machine.NewCPUSet(),
+	}
 }
 
 func (v *DesiredView) DeepCopy() *DesiredView {
 	if v == nil {
 		return nil
 	}
-	return &DesiredView{CPUSetPartitionView: *v.CPUSetPartitionView.DeepCopy()}
+	return &DesiredView{
+		CPUSetPartitionView: *v.CPUSetPartitionView.DeepCopy(),
+		PoolOwners:          cloneDesiredPoolOwners(v.PoolOwners),
+	}
 }
 
 func (v *DesiredView) ToAppliedView() *AppliedView {
@@ -107,6 +163,7 @@ func (v *DesiredView) ToAppliedView() *AppliedView {
 		Level:               AppliedViewLevelFull,
 		CPUSetByRel:         map[string]machine.CPUSet{},
 		RelProofByRel:       map[string]CgroupRelProof{},
+		PoolProjection:      NewAppliedPoolProjection(),
 	}
 }
 
@@ -119,6 +176,7 @@ func (v *AppliedView) DeepCopy() *AppliedView {
 		Level:               v.Level,
 		CPUSetByRel:         cloneCPUSetMap(v.CPUSetByRel),
 		RelProofByRel:       cloneCgroupRelProofMap(v.RelProofByRel),
+		PoolProjection:      cloneAppliedPoolProjection(v.PoolProjection),
 	}
 }
 
@@ -165,7 +223,13 @@ func (v *CPUSetPartitionView) DeepCopy() *CPUSetPartitionView {
 }
 
 func EqualDesiredView(a, b *DesiredView) bool {
-	return equalCPUSetPartitionView(cpuSetPartitionViewFromDesired(a), cpuSetPartitionViewFromDesired(b))
+	if !equalCPUSetPartitionView(cpuSetPartitionViewFromDesired(a), cpuSetPartitionViewFromDesired(b)) {
+		return false
+	}
+	if a == nil || b == nil {
+		return a == b
+	}
+	return equalDesiredPoolOwners(a.PoolOwners, b.PoolOwners)
 }
 
 func EqualAppliedView(a, b *AppliedView) bool {
@@ -177,6 +241,7 @@ func EqualAppliedView(a, b *AppliedView) bool {
 	}
 	return equalCPUSetMap(a.CPUSetByRel, b.CPUSetByRel) &&
 		equalCgroupRelProofMap(a.RelProofByRel, b.RelProofByRel) &&
+		equalAppliedPoolProjection(a.PoolProjection, b.PoolProjection) &&
 		a.Level == b.Level
 }
 
@@ -234,6 +299,82 @@ func cloneCPUSetMap(in map[string]machine.CPUSet) map[string]machine.CPUSet {
 		out[key] = cpus.Clone()
 	}
 	return out
+}
+
+func cloneDesiredPoolOwners(in map[CPUSetPoolIdentity]DesiredPoolOwner) map[CPUSetPoolIdentity]DesiredPoolOwner {
+	out := make(map[CPUSetPoolIdentity]DesiredPoolOwner, len(in))
+	for identity, owner := range in {
+		out[identity] = DesiredPoolOwner{
+			ExpectedCPUSet:        cloneOptionalCPUSet(owner.ExpectedCPUSet),
+			ContainerCPUSetByName: cloneOptionalCPUSetMap(owner.ContainerCPUSetByName),
+		}
+	}
+	return out
+}
+
+func equalDesiredPoolOwners(a, b map[CPUSetPoolIdentity]DesiredPoolOwner) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for identity, ownerA := range a {
+		ownerB, ok := b[identity]
+		if !ok ||
+			!ownerA.ExpectedCPUSet.Equals(ownerB.ExpectedCPUSet) ||
+			!equalCPUSetMap(ownerA.ContainerCPUSetByName, ownerB.ContainerCPUSetByName) {
+			return false
+		}
+	}
+	return true
+}
+
+func cloneAppliedPoolProjection(in AppliedPoolProjection) AppliedPoolProjection {
+	return AppliedPoolProjection{
+		CPUSetByIdentity: cloneCPUSetByIdentity(in.CPUSetByIdentity),
+		UncoveredCPUs:    cloneOptionalCPUSet(in.UncoveredCPUs),
+		AmbiguousCPUs:    cloneOptionalCPUSet(in.AmbiguousCPUs),
+	}
+}
+
+func equalAppliedPoolProjection(a, b AppliedPoolProjection) bool {
+	return equalCPUSetByIdentity(a.CPUSetByIdentity, b.CPUSetByIdentity) &&
+		a.UncoveredCPUs.Equals(b.UncoveredCPUs) &&
+		a.AmbiguousCPUs.Equals(b.AmbiguousCPUs)
+}
+
+func cloneCPUSetByIdentity(in map[CPUSetPoolIdentity]machine.CPUSet) map[CPUSetPoolIdentity]machine.CPUSet {
+	out := make(map[CPUSetPoolIdentity]machine.CPUSet, len(in))
+	for identity, cpus := range in {
+		out[identity] = cloneOptionalCPUSet(cpus)
+	}
+	return out
+}
+
+func equalCPUSetByIdentity(a, b map[CPUSetPoolIdentity]machine.CPUSet) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for identity, cpusA := range a {
+		cpusB, ok := b[identity]
+		if !ok || !cpusA.Equals(cpusB) {
+			return false
+		}
+	}
+	return true
+}
+
+func cloneOptionalCPUSetMap(in map[string]machine.CPUSet) map[string]machine.CPUSet {
+	out := make(map[string]machine.CPUSet, len(in))
+	for key, cpus := range in {
+		out[key] = cloneOptionalCPUSet(cpus)
+	}
+	return out
+}
+
+func cloneOptionalCPUSet(in machine.CPUSet) machine.CPUSet {
+	if !in.Initialed {
+		return machine.CPUSet{}
+	}
+	return in.Clone()
 }
 
 func cloneCgroupRelProofMap(in map[string]CgroupRelProof) map[string]CgroupRelProof {

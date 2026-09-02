@@ -518,8 +518,10 @@ func appliedViewFromFinalSnapshotWithDeferredCleanup(
 	}
 	applied := &model.AppliedView{
 		CPUSetPartitionView: partition,
+		Level:               model.AppliedViewLevelFull,
 		CPUSetByRel:         make(map[string]machine.CPUSet, len(dag.Nodes())),
 		RelProofByRel:       make(map[string]model.CgroupRelProof, len(dag.Nodes())),
+		PoolProjection:      model.NewAppliedPoolProjection(),
 	}
 	applied.ReclaimEffectivePerNUMA = map[int]machine.CPUSet{}
 	for _, node := range dag.Nodes() {
@@ -569,6 +571,7 @@ func appliedViewFromFinalSnapshotWithDeferredCleanup(
 		return nil, err
 	}
 	applied.ContainerCPUSetByPod = containerCPUSetByPod
+	applied.PoolProjection = buildAppliedPoolProjection(model.AppliedViewLevelFull, desired, applied)
 	return applied, nil
 }
 
@@ -952,8 +955,10 @@ func reclaimOnlyAppliedView(
 		Level:               model.AppliedViewLevelReclaimOnly,
 		CPUSetByRel:         map[string]machine.CPUSet{},
 		RelProofByRel:       map[string]model.CgroupRelProof{},
+		PoolProjection:      model.NewAppliedPoolProjection(),
 	}
 	if dag == nil || snapshot == nil {
+		applied.PoolProjection = buildAppliedPoolProjection(model.AppliedViewLevelReclaimOnly, desired, applied)
 		return applied
 	}
 	for _, node := range dag.Nodes() {
@@ -980,6 +985,7 @@ func reclaimOnlyAppliedView(
 				applied.ReclaimEffectivePerNUMA[numaID].Union(proof)
 		}
 	}
+	applied.PoolProjection = buildAppliedPoolProjection(model.AppliedViewLevelReclaimOnly, desired, applied)
 	return applied
 }
 

@@ -212,6 +212,13 @@ func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CP
 		}
 		view.ContainerCPUSetByPod[podUID][containerName] = cpus.Clone()
 	}
+	sharedPoolNameForAllocation := func(allocation *cpustate.AllocationInfo) string {
+		poolName, err := allocation.GetSpecifiedNUMABindingPoolName()
+		if err != nil {
+			poolName = commonstate.PoolNameShare
+		}
+		return resourcepackage.WrapOwnerPoolName(poolName, allocation.GetResourcePackageName())
+	}
 	sharedRampUp := machine.NewCPUSet()
 	sharedRampUpByPool := map[string]machine.CPUSet{}
 
@@ -225,12 +232,7 @@ func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CP
 				if allocation.RampUp && allocation.CheckSharedNUMABinding() {
 					view.SharePool = view.SharePool.Union(allocation.AllocationResult)
 					sharedRampUp = sharedRampUp.Union(allocation.AllocationResult)
-					poolName, err := allocation.GetSpecifiedNUMABindingPoolName()
-					if err != nil {
-						poolName = commonstate.PoolNameShare
-					}
-					packageName := allocation.GetResourcePackageName()
-					poolName = resourcepackage.WrapOwnerPoolName(poolName, packageName)
+					poolName := sharedPoolNameForAllocation(allocation)
 					sharedRampUpByPool[poolName] = sharedRampUpByPool[poolName].Union(allocation.AllocationResult)
 				}
 			}
@@ -337,7 +339,94 @@ func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CP
 	rebuildDesiredReclaimEffectivePerNUMA(view, topology)
 	ApplyTransientProtectedNonReclaim(view, topology, opts.TransientProtectedNonReclaim)
 	rebuildReclaimEffectivePerNUMA(view, topology)
+	rebuildDesiredPoolOwners(view, podEntries)
 	return view
+}
+
+func rebuildDesiredPoolOwners(view *model.DesiredView, podEntries cpustate.PodEntries) {
+	view.PoolOwners = map[model.CPUSetPoolIdentity]model.DesiredPoolOwner{}
+	recordDesiredPoolOwner(
+		view.PoolOwners,
+		model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindReclaim},
+		"",
+		view.ReclaimEffective,
+	)
+	for poolName, cpus := range view.SharePoolMap {
+		recordDesiredPoolOwner(
+			view.PoolOwners,
+			model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindShare, Name: poolName},
+			"",
+			cpus,
+		)
+	}
+
+	for _, containerEntries := range podEntries {
+		if containerEntries.IsPoolEntry() {
+			continue
+		}
+		for _, allocation := range containerEntries {
+			identity, ok := poolIdentityForAllocation(allocation)
+			if !ok {
+				continue
+			}
+			containerName := allocation.ContainerName
+			if identity.Kind == model.CPUSetPoolKindShare {
+				containerName = ""
+			}
+			recordDesiredPoolOwner(
+				view.PoolOwners,
+				identity,
+				containerName,
+				allocation.AllocationResult,
+			)
+		}
+	}
+}
+
+func poolIdentityForAllocation(allocation *cpustate.AllocationInfo) (model.CPUSetPoolIdentity, bool) {
+	if allocation == nil {
+		return model.CPUSetPoolIdentity{}, false
+	}
+	if allocation.RampUp && allocation.CheckSharedNUMABinding() {
+		return model.CPUSetPoolIdentity{}, false
+	}
+
+	poolType := commonstate.GetPoolType(
+		commonstate.OwnerPoolNameTranslator.Translate(allocation.OwnerPoolName))
+	if poolType == commonstate.PoolNamePrefixIsolation {
+		return model.CPUSetPoolIdentity{
+			Kind:   model.CPUSetPoolKindIsolation,
+			PodUID: allocation.PodUid,
+		}, true
+	}
+	switch poolType {
+	case commonstate.PoolNameReserve, commonstate.PoolNamePrefixSystem, commonstate.PoolNameReclaim:
+		return model.CPUSetPoolIdentity{}, false
+	}
+	if allocation.CheckDedicated() {
+		return model.CPUSetPoolIdentity{
+			Kind:   model.CPUSetPoolKindDedicated,
+			PodUID: allocation.PodUid,
+		}, true
+	}
+	return model.CPUSetPoolIdentity{}, false
+}
+
+func recordDesiredPoolOwner(
+	owners map[model.CPUSetPoolIdentity]model.DesiredPoolOwner,
+	identity model.CPUSetPoolIdentity,
+	containerName string,
+	cpus machine.CPUSet,
+) {
+	owner := owners[identity]
+	owner.ExpectedCPUSet = owner.ExpectedCPUSet.Union(cpus)
+	if containerName != "" {
+		if owner.ContainerCPUSetByName == nil {
+			owner.ContainerCPUSetByName = map[string]machine.CPUSet{}
+		}
+		owner.ContainerCPUSetByName[containerName] = owner.ContainerCPUSetByName[containerName].Union(cpus)
+	}
+	owners[identity] = owner
 }
 
 func BuildValidatedCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CPUTopology, opts CPUSetPartitionViewOptions) (*model.DesiredView, error) {
