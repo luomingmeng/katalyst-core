@@ -29,11 +29,19 @@ func TestNewDefaultPluginsPreservesOrder(t *testing.T) {
 		t.Fatalf("NewDefaultPlugins failed: %v", err)
 	}
 	got := make([]string, 0, len(plugins))
+	cpuMetricsCount := 0
 	for _, plugin := range plugins {
-		got = append(got, plugin.Name())
+		name := plugin.Name()
+		got = append(got, name)
+		if name == "cpu_metrics" {
+			cpuMetricsCount++
+		}
 	}
 	want := []string{"cpuset_topology", "cpuset_mems", "workqueue", "system_service", "rdt_cpulist", "rdt_cat", "cpu_metrics"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected plugin order, got %v want %v", got, want)
+	}
+	if cpuMetricsCount != 1 {
+		t.Fatalf("cpu_metrics registration count = %d, want exactly 1", cpuMetricsCount)
 	}
 }

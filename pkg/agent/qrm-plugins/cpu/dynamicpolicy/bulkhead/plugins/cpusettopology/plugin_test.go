@@ -1002,10 +1002,17 @@ func TestCPUSetTopologyPluginReportsAppliedViewFromFinalSnapshot(t *testing.T) {
 		},
 		cgroup: cg,
 	}
-	desired := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
-		NonReclaimPool:   machine.NewCPUSet(0, 1),
-		ReclaimEffective: machine.NewCPUSet(2, 3),
-	}}
+	reclaimIdentity := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindReclaim}
+	shareIdentity := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindShare, Name: "share"}
+	desired := model.NewDesiredView()
+	desired.NonReclaimPool = machine.NewCPUSet(0, 1)
+	desired.ReclaimEffective = machine.NewCPUSet(2, 3)
+	desired.PoolOwners[reclaimIdentity] = model.DesiredPoolOwner{
+		ExpectedCPUSet: machine.NewCPUSet(2, 3),
+	}
+	desired.PoolOwners[shareIdentity] = model.DesiredPoolOwner{
+		ExpectedCPUSet: machine.NewCPUSet(0, 1),
+	}
 	var result bulkheadapi.TopologyResult
 
 	dagResult, err := p.Apply(context.Background(), bulkheadapi.HandlerContext{
@@ -1046,6 +1053,14 @@ func TestCPUSetTopologyPluginReportsAppliedViewFromFinalSnapshot(t *testing.T) {
 	if got := dagResult.AppliedView.ReclaimEffective.String(); got != "2-3" {
 		t.Fatalf("DAG applied reclaim = %q, want 2-3", got)
 	}
+	assertProjectedCPUSet(t, result.AppliedView.PoolProjection.CPUSetByIdentity,
+		reclaimIdentity, machine.NewCPUSet(2, 3))
+	assertProjectedCPUSet(t, result.AppliedView.PoolProjection.CPUSetByIdentity,
+		shareIdentity, machine.NewCPUSet(0, 1))
+	if !result.AppliedView.PoolProjection.UncoveredCPUs.IsEmpty() ||
+		!result.AppliedView.PoolProjection.AmbiguousCPUs.IsEmpty() {
+		t.Fatalf("full projection diagnostics = %+v, want empty", result.AppliedView.PoolProjection)
+	}
 
 	desired.ReclaimEffective = machine.NewCPUSet(0, 1, 2, 3)
 	if got := result.AppliedView.ReclaimEffective.String(); got != "2-3" {
@@ -1058,6 +1073,10 @@ func TestCPUSetTopologyPluginReportsAppliedViewFromFinalSnapshot(t *testing.T) {
 	result.AppliedView.CPUSetByRel["reclaim"].Add(0)
 	if dagResult.AppliedView.CPUSetByRel["reclaim"].Contains(0) {
 		t.Fatal("DAGApplyResult AppliedView per-rel proof aliases callback result")
+	}
+	result.AppliedView.PoolProjection.CPUSetByIdentity[reclaimIdentity].Add(0)
+	if dagResult.AppliedView.PoolProjection.CPUSetByIdentity[reclaimIdentity].Contains(0) {
+		t.Fatal("DAGApplyResult AppliedView pool projection aliases callback result")
 	}
 }
 
@@ -1082,6 +1101,8 @@ func TestTopologyResultFromFinalConvergenceDeterminesAppliedViewLevel(t *testing
 }
 
 func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t *testing.T) {
+	t.Parallel()
+
 	const (
 		podUID       = "pod-materialized-during-convergence"
 		containerID  = "container-materialized-during-convergence"
@@ -1111,7 +1132,11 @@ func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t
 			desiredLeaf: machine.NewCPUSet(0, 1),
 		},
 	} {
+		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			desiredLeaf := tt.desiredLeaf.Clone()
 			pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)}}
 			cg := &fakeCgroupClient{
 				existing: map[string]bool{"primary": true, "reclaim": true},
@@ -1142,6 +1167,23 @@ func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t
 				},
 				cgroup: cg,
 			}
+			dedicatedIdentity := model.CPUSetPoolIdentity{
+				Kind:   model.CPUSetPoolKindDedicated,
+				PodUID: podUID,
+			}
+			desired := model.NewDesiredView()
+			desired.NonReclaimPool = machine.NewCPUSet(0, 1)
+			desired.ReclaimEffective = machine.NewCPUSet(2, 3)
+			desired.ReclaimEffectivePerNUMA[0] = machine.NewCPUSet(2, 3)
+			desired.ContainerCPUSetByPod[podUID] = map[string]machine.CPUSet{
+				"main": desiredLeaf.Clone(),
+			}
+			desired.PoolOwners[dedicatedIdentity] = model.DesiredPoolOwner{
+				ExpectedCPUSet: desiredLeaf.Clone(),
+				ContainerCPUSetByName: map[string]machine.CPUSet{
+					"main": desiredLeaf.Clone(),
+				},
+			}
 			var result bulkheadapi.TopologyResult
 			err := p.CPUSetAdjustmentHandler(context.Background(), bulkheadapi.HandlerContext{
 				CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
@@ -1152,16 +1194,7 @@ func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t
 						0: {}, 1: {}, 2: {}, 3: {},
 					}},
 				},
-				DesiredView: &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
-					NonReclaimPool:   machine.NewCPUSet(0, 1),
-					ReclaimEffective: machine.NewCPUSet(2, 3),
-					ReclaimEffectivePerNUMA: map[int]machine.CPUSet{
-						0: machine.NewCPUSet(2, 3),
-					},
-					ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
-						podUID: {"main": tt.desiredLeaf},
-					},
-				}},
+				DesiredView: desired,
 				ReportTopologyResult: func(got bulkheadapi.TopologyResult) {
 					result = got
 				},
@@ -1181,9 +1214,11 @@ func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t
 			if result.AppliedView == nil {
 				t.Fatal("matching final snapshot leaf should publish AppliedView")
 			}
-			if got := result.AppliedView.ContainerCPUSetByPod[podUID]["main"]; !got.Equals(tt.desiredLeaf) {
-				t.Fatalf("published container cpuset = %q, want final snapshot value %s", got.String(), tt.desiredLeaf.String())
+			if got := result.AppliedView.ContainerCPUSetByPod[podUID]["main"]; !got.Equals(desiredLeaf) {
+				t.Fatalf("published container cpuset = %q, want final snapshot value %s", got.String(), desiredLeaf.String())
 			}
+			assertProjectedCPUSet(t, result.AppliedView.PoolProjection.CPUSetByIdentity,
+				dedicatedIdentity, desiredLeaf)
 		})
 	}
 }
@@ -1964,6 +1999,17 @@ func TestCPUSetTopologyPluginReconcileDisabledPublishesReclaimOnlyProof(t *testi
 	in.DesiredView.Reserve = machine.NewCPUSet(0)
 	in.DesiredView.ReclaimEffective = machine.NewCPUSet(2, 3)
 	in.DesiredView.ReclaimEffectivePerNUMA[0] = machine.NewCPUSet(2, 3)
+	in.DesiredView.PoolOwners = map[model.CPUSetPoolIdentity]model.DesiredPoolOwner{
+		{Kind: model.CPUSetPoolKindReclaim}: {
+			ExpectedCPUSet: machine.NewCPUSet(2, 3),
+		},
+		{Kind: model.CPUSetPoolKindShare, Name: "stale-share"}: {
+			ExpectedCPUSet: machine.NewCPUSet(4, 5),
+		},
+		{Kind: model.CPUSetPoolKindDedicated, PodUID: "stale-pod"}: {
+			ExpectedCPUSet: machine.NewCPUSet(6, 7),
+		},
+	}
 
 	result, err := p.ReconcileDisabled(context.Background(), in)
 	if err != nil {
@@ -1988,6 +2034,16 @@ func TestCPUSetTopologyPluginReconcileDisabledPublishesReclaimOnlyProof(t *testi
 	}
 	if !result.AppliedView.NonReclaimPool.IsEmpty() || len(result.AppliedView.ContainerCPUSetByPod) != 0 {
 		t.Fatalf("reclaim-only applied fields contain unproved state: %+v", result.AppliedView.CPUSetPartitionView)
+	}
+	reclaimIdentity := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindReclaim}
+	if len(result.AppliedView.PoolProjection.CPUSetByIdentity) != 1 {
+		t.Fatalf("reclaim-only pool projection = %+v, want exactly reclaim", result.AppliedView.PoolProjection)
+	}
+	assertProjectedCPUSet(t, result.AppliedView.PoolProjection.CPUSetByIdentity,
+		reclaimIdentity, machine.NewCPUSet(2, 3))
+	if !result.AppliedView.PoolProjection.UncoveredCPUs.IsEmpty() ||
+		!result.AppliedView.PoolProjection.AmbiguousCPUs.IsEmpty() {
+		t.Fatalf("reclaim-only diagnostics = %+v, want empty", result.AppliedView.PoolProjection)
 	}
 }
 

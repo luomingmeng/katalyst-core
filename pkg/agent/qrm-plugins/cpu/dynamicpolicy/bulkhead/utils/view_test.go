@@ -492,6 +492,229 @@ func TestBuildCPUSetPartitionViewAndDeepCopy(t *testing.T) {
 	assertCPUSet(t, "original share pool map unchanged", view.SharePoolMap["share-NUMA0"], "6")
 }
 
+func TestBuildCPUSetPartitionViewPoolOwners(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		buildState func() cpustate.ReadonlyState
+		wantOwners map[model.CPUSetPoolIdentity]model.DesiredPoolOwner
+	}{
+		{
+			name: "records final pool owners and excludes non-reportable containers",
+			buildState: func() cpustate.ReadonlyState {
+				state := cpustate.NewCPUPluginState(nil)
+				state.SetAllowSharedCoresOverlapReclaimedCores(false)
+				for poolName, cpus := range map[string]machine.CPUSet{
+					commonstate.PoolNameReserve: machine.NewCPUSet(15),
+					commonstate.PoolNameReclaim: machine.NewCPUSet(6, 7),
+					"rp-a/share-NUMA0":          machine.NewCPUSet(0, 1),
+					"rp-b/share-NUMA1":          machine.NewCPUSet(8, 9),
+					"isolation-final":           machine.NewCPUSet(4, 5, 10),
+					"system-services":           machine.NewCPUSet(11),
+				} {
+					state.SetAllocationInfo(poolName, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+						AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(poolName),
+						AllocationResult: cpus,
+					})
+				}
+
+				state.SetAllocationInfo("snb-ramp-up", "main", &cpustate.AllocationInfo{
+					AllocationMeta: commonstate.AllocationMeta{
+						PodUid:        "snb-ramp-up",
+						ContainerName: "main",
+						OwnerPoolName: "isolation-transient",
+						QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+						Annotations: map[string]string{
+							apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+							apiconsts.PodAnnotationResourcePackageKey:           "rp-c",
+							cpuconsts.CPUStateAnnotationKeyNUMAHint:             "0",
+						},
+					},
+					RampUp:           true,
+					AllocationResult: machine.NewCPUSet(6),
+				})
+				for containerName, cpus := range map[string]machine.CPUSet{
+					"main":    machine.NewCPUSet(2),
+					"sidecar": machine.NewCPUSet(3),
+				} {
+					state.SetAllocationInfo("dedicated-pod", containerName, &cpustate.AllocationInfo{
+						AllocationMeta: commonstate.AllocationMeta{
+							PodUid:        "dedicated-pod",
+							ContainerName: containerName,
+							OwnerPoolName: commonstate.PoolNameDedicated,
+							QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+						},
+						AllocationResult: cpus,
+					})
+				}
+				state.SetAllocationInfo("isolation-pod", "main", &cpustate.AllocationInfo{
+					AllocationMeta: commonstate.AllocationMeta{
+						PodUid:        "isolation-pod",
+						ContainerName: "main",
+						OwnerPoolName: "rp-a/isolation-workload",
+						QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+					},
+					AllocationResult: machine.NewCPUSet(4, 5),
+				})
+				state.SetAllocationInfo("malformed-isolation", "main", &cpustate.AllocationInfo{
+					AllocationMeta: commonstate.AllocationMeta{
+						ContainerName: "main",
+						OwnerPoolName: "rp-a/isolation-malformed",
+						QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+					},
+					AllocationResult: machine.NewCPUSet(10),
+				})
+				for podUID, allocation := range map[string]*cpustate.AllocationInfo{
+					"reserve-container": {
+						AllocationMeta: commonstate.AllocationMeta{
+							PodUid:        "reserve-container",
+							ContainerName: "main",
+							OwnerPoolName: commonstate.PoolNameReserve,
+						},
+						AllocationResult: machine.NewCPUSet(12),
+					},
+					"system-container": {
+						AllocationMeta: commonstate.AllocationMeta{
+							PodUid:        "system-container",
+							ContainerName: "main",
+							OwnerPoolName: "system-services",
+							QoSLevel:      apiconsts.PodAnnotationQoSLevelSystemCores,
+						},
+						AllocationResult: machine.NewCPUSet(11),
+					},
+					"reclaimed-container": {
+						AllocationMeta: commonstate.AllocationMeta{
+							PodUid:        "reclaimed-container",
+							ContainerName: "main",
+							OwnerPoolName: commonstate.PoolNameReclaim,
+							QoSLevel:      apiconsts.PodAnnotationQoSLevelReclaimedCores,
+						},
+						AllocationResult: machine.NewCPUSet(7),
+					},
+					"shared-container": {
+						AllocationMeta: commonstate.AllocationMeta{
+							PodUid:        "shared-container",
+							ContainerName: "main",
+							OwnerPoolName: commonstate.PoolNameShare,
+							QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+						},
+						AllocationResult: machine.NewCPUSet(13),
+					},
+				} {
+					state.SetAllocationInfo(podUID, "main", allocation)
+				}
+				state.SetAllocationInfo("nil-entry", "main", nil)
+				return state
+			},
+			wantOwners: map[model.CPUSetPoolIdentity]model.DesiredPoolOwner{
+				{Kind: model.CPUSetPoolKindReclaim}: {
+					ExpectedCPUSet: machine.NewCPUSet(7),
+				},
+				{Kind: model.CPUSetPoolKindShare, Name: "rp-a/share-NUMA0"}: {
+					ExpectedCPUSet: machine.NewCPUSet(0, 1),
+				},
+				{Kind: model.CPUSetPoolKindShare, Name: "rp-b/share-NUMA1"}: {
+					ExpectedCPUSet: machine.NewCPUSet(8, 9),
+				},
+				{Kind: model.CPUSetPoolKindShare, Name: "rp-c/share-NUMA0"}: {
+					ExpectedCPUSet: machine.NewCPUSet(6),
+				},
+				{Kind: model.CPUSetPoolKindDedicated, PodUID: "dedicated-pod"}: {
+					ExpectedCPUSet: machine.NewCPUSet(2, 3),
+					ContainerCPUSetByName: map[string]machine.CPUSet{
+						"main":    machine.NewCPUSet(2),
+						"sidecar": machine.NewCPUSet(3),
+					},
+				},
+				{Kind: model.CPUSetPoolKindIsolation, PodUID: "isolation-pod"}: {
+					ExpectedCPUSet: machine.NewCPUSet(4, 5),
+					ContainerCPUSetByName: map[string]machine.CPUSet{
+						"main": machine.NewCPUSet(4, 5),
+					},
+				},
+				{Kind: model.CPUSetPoolKindIsolation}: {
+					ExpectedCPUSet: machine.NewCPUSet(10),
+					ContainerCPUSetByName: map[string]machine.CPUSet{
+						"main": machine.NewCPUSet(10),
+					},
+				},
+			},
+		},
+		{
+			name: "shared owner uses final overlap-filtered share pool map",
+			buildState: func() cpustate.ReadonlyState {
+				state := cpustate.NewCPUPluginState(nil)
+				state.SetAllowSharedCoresOverlapReclaimedCores(true)
+				state.SetAllocationInfo("share-NUMA0", commonstate.FakedContainerName, &cpustate.AllocationInfo{
+					AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta("share-NUMA0"),
+					AllocationResult: machine.NewCPUSet(1),
+				})
+				state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+					AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+					AllocationResult: machine.NewCPUSet(2),
+				})
+				state.SetAllocationInfo("snb-ramp-up", "main", &cpustate.AllocationInfo{
+					AllocationMeta: commonstate.AllocationMeta{
+						PodUid:        "snb-ramp-up",
+						ContainerName: "main",
+						QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+						Annotations: map[string]string{
+							apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+							cpuconsts.CPUStateAnnotationKeyNUMAHint:             "0",
+						},
+					},
+					RampUp:           true,
+					AllocationResult: machine.NewCPUSet(2, 3),
+				})
+				return state
+			},
+			wantOwners: map[model.CPUSetPoolIdentity]model.DesiredPoolOwner{
+				{Kind: model.CPUSetPoolKindReclaim}: {
+					ExpectedCPUSet: machine.NewCPUSet(2),
+				},
+				{Kind: model.CPUSetPoolKindShare, Name: "share-NUMA0"}: {
+					ExpectedCPUSet: machine.NewCPUSet(1, 3),
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			view := BuildCPUSetPartitionView(tt.buildState(), testTwoNUMATopologyN(8), CPUSetPartitionViewOptions{})
+			if len(view.PoolOwners) != len(tt.wantOwners) {
+				t.Fatalf("PoolOwners count = %d, want %d: %#v", len(view.PoolOwners), len(tt.wantOwners), view.PoolOwners)
+			}
+			for identity, want := range tt.wantOwners {
+				got, ok := view.PoolOwners[identity]
+				if !ok {
+					t.Errorf("PoolOwners missing identity %+v", identity)
+					continue
+				}
+				if !got.ExpectedCPUSet.Equals(want.ExpectedCPUSet) {
+					t.Errorf("PoolOwners[%+v].ExpectedCPUSet = %s, want %s",
+						identity, got.ExpectedCPUSet.String(), want.ExpectedCPUSet.String())
+				}
+				if len(got.ContainerCPUSetByName) != len(want.ContainerCPUSetByName) {
+					t.Errorf("PoolOwners[%+v] container count = %d, want %d",
+						identity, len(got.ContainerCPUSetByName), len(want.ContainerCPUSetByName))
+					continue
+				}
+				for containerName, wantCPUSet := range want.ContainerCPUSetByName {
+					if gotCPUSet, ok := got.ContainerCPUSetByName[containerName]; !ok || !gotCPUSet.Equals(wantCPUSet) {
+						t.Errorf("PoolOwners[%+v].ContainerCPUSetByName[%q] = %s, want %s",
+							identity, containerName, gotCPUSet.String(), wantCPUSet.String())
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestBuildCPUSetPartitionViewIncludesSNBRampUpInSharePool(t *testing.T) {
 	t.Parallel()
 

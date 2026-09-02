@@ -22,6 +22,163 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
+func TestCPUSetPoolIdentityValid_BitsUT(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		identity CPUSetPoolIdentity
+		want     bool
+	}{
+		{
+			name:     "reclaim",
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindReclaim},
+			want:     true,
+		},
+		{
+			name:     "share",
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindShare, Name: "share-NUMA0"},
+			want:     true,
+		},
+		{
+			name:     "dedicated",
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindDedicated, PodUID: "dedicated-pod"},
+			want:     true,
+		},
+		{
+			name:     "isolation",
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindIsolation, PodUID: "isolation-pod"},
+			want:     true,
+		},
+		{
+			name:     "unknown kind",
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKind("unknown")},
+		},
+		{
+			name:     "reclaim with name",
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindReclaim, Name: "reclaim"},
+		},
+		{
+			name:     "reclaim with pod uid",
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindReclaim, PodUID: "pod"},
+		},
+		{
+			name:     "reclaim with name and pod uid",
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindReclaim, Name: "reclaim", PodUID: "pod"},
+		},
+		{
+			name:     "share without name",
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindShare},
+		},
+		{
+			name:     "share with pod uid",
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindShare, Name: "share", PodUID: "pod"},
+		},
+		{
+			name:     "dedicated without pod uid",
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindDedicated},
+		},
+		{
+			name:     "dedicated with name",
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindDedicated, Name: "dedicated", PodUID: "pod"},
+		},
+		{
+			name:     "isolation without pod uid",
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindIsolation},
+		},
+		{
+			name:     "isolation with name",
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindIsolation, Name: "isolation", PodUID: "pod"},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.identity.Valid(); got != tt.want {
+				t.Fatalf("Valid() = %v, want %v for %#v", got, tt.want, tt.identity)
+			}
+		})
+	}
+}
+
+func TestDesiredViewPoolOwnersConstructorDeepCopyAndEquality_BitsUT(t *testing.T) {
+	t.Parallel()
+
+	share := CPUSetPoolIdentity{Kind: CPUSetPoolKindShare, Name: "share-NUMA0"}
+	desired := NewDesiredView()
+	if desired.PoolOwners == nil {
+		t.Fatal("NewDesiredView should initialize PoolOwners")
+	}
+	desired.PoolOwners[share] = DesiredPoolOwner{
+		ExpectedCPUSet: machine.NewCPUSet(0, 1),
+		ContainerCPUSetByName: map[string]machine.CPUSet{
+			"main": machine.NewCPUSet(0),
+		},
+	}
+
+	copied := desired.DeepCopy()
+	if !EqualDesiredView(desired, copied) {
+		t.Fatal("copied desired pool owners should compare equal")
+	}
+	owner := copied.PoolOwners[share]
+	owner.ExpectedCPUSet.Add(99)
+	copied.PoolOwners[share] = owner
+	if desired.PoolOwners[share].ExpectedCPUSet.Contains(99) {
+		t.Fatal("DesiredView.DeepCopy should isolate owner expected CPU sets")
+	}
+	if EqualDesiredView(desired, copied) {
+		t.Fatal("EqualDesiredView should compare owner expected CPU sets")
+	}
+
+	copied = desired.DeepCopy()
+	owner = copied.PoolOwners[share]
+	owner.ContainerCPUSetByName["main"].Add(99)
+	copied.PoolOwners[share] = owner
+	if desired.PoolOwners[share].ContainerCPUSetByName["main"].Contains(99) {
+		t.Fatal("DesiredView.DeepCopy should isolate owner container CPU sets")
+	}
+	if EqualDesiredView(desired, copied) {
+		t.Fatal("EqualDesiredView should compare owner container CPU sets")
+	}
+
+	copied = desired.DeepCopy()
+	delete(copied.PoolOwners, share)
+	copied.PoolOwners[CPUSetPoolIdentity{Kind: CPUSetPoolKindShare, Name: "share-NUMA1"}] =
+		desired.PoolOwners[share]
+	if EqualDesiredView(desired, copied) {
+		t.Fatal("EqualDesiredView should compare desired owner identities")
+	}
+}
+
+func TestDesiredViewToAppliedViewDoesNotCopyPoolOwners_BitsUT(t *testing.T) {
+	t.Parallel()
+
+	projection := NewAppliedPoolProjection()
+	if projection.CPUSetByIdentity == nil ||
+		!projection.UncoveredCPUs.IsEmpty() ||
+		!projection.AmbiguousCPUs.IsEmpty() {
+		t.Fatal("NewAppliedPoolProjection should initialize empty fields")
+	}
+
+	desired := NewDesiredView()
+	desired.PoolOwners[CPUSetPoolIdentity{Kind: CPUSetPoolKindReclaim}] = DesiredPoolOwner{
+		ExpectedCPUSet: machine.NewCPUSet(0, 1),
+	}
+
+	applied := desired.ToAppliedView()
+	if applied.PoolProjection.CPUSetByIdentity == nil ||
+		len(applied.PoolProjection.CPUSetByIdentity) != 0 ||
+		!applied.PoolProjection.UncoveredCPUs.IsEmpty() ||
+		!applied.PoolProjection.AmbiguousCPUs.IsEmpty() {
+		t.Fatal("ToAppliedView should initialize an empty applied pool projection")
+	}
+	if len(desired.PoolOwners) != 1 {
+		t.Fatal("ToAppliedView should not mutate desired pool owners")
+	}
+}
+
 func TestDesiredViewToAppliedViewDeepCopyIsolation_BitsUT(t *testing.T) {
 	t.Parallel()
 
@@ -57,9 +214,17 @@ func TestDesiredViewToAppliedViewDeepCopyIsolation_BitsUT(t *testing.T) {
 func TestAppliedViewDeepCopyIsolation_BitsUT(t *testing.T) {
 	t.Parallel()
 
+	dedicated := CPUSetPoolIdentity{Kind: CPUSetPoolKindDedicated, PodUID: "abcdef"}
 	applied := &AppliedView{
 		CPUSetByRel: map[string]machine.CPUSet{
 			"system": machine.NewCPUSet(2, 3),
+		},
+		PoolProjection: AppliedPoolProjection{
+			CPUSetByIdentity: map[CPUSetPoolIdentity]machine.CPUSet{
+				dedicated: machine.NewCPUSet(2, 3),
+			},
+			UncoveredCPUs: machine.NewCPUSet(4),
+			AmbiguousCPUs: machine.NewCPUSet(5),
 		},
 		CPUSetPartitionView: CPUSetPartitionView{
 			NonReclaimPool:   machine.NewCPUSet(0, 1),
@@ -84,13 +249,66 @@ func TestAppliedViewDeepCopyIsolation_BitsUT(t *testing.T) {
 	copied.SharePoolMap["share"].Add(99)
 	copied.ContainerCPUSetByPod["pod"]["container"].Add(99)
 	copied.CPUSetByRel["system"].Add(99)
+	copied.PoolProjection.CPUSetByIdentity[dedicated].Add(99)
+	copied.PoolProjection.UncoveredCPUs.Add(99)
+	copied.PoolProjection.AmbiguousCPUs.Add(99)
 
 	if applied.ReclaimEffective.Contains(99) ||
 		applied.ReclaimEffectivePerNUMA[1].Contains(99) ||
 		applied.SharePoolMap["share"].Contains(99) ||
 		applied.ContainerCPUSetByPod["pod"]["container"].Contains(99) ||
-		applied.CPUSetByRel["system"].Contains(99) {
+		applied.CPUSetByRel["system"].Contains(99) ||
+		applied.PoolProjection.CPUSetByIdentity[dedicated].Contains(99) ||
+		applied.PoolProjection.UncoveredCPUs.Contains(99) ||
+		applied.PoolProjection.AmbiguousCPUs.Contains(99) {
 		t.Fatalf("AppliedView.DeepCopy should isolate nested CPUSet fields")
+	}
+}
+
+func TestAppliedViewPoolProjectionEquality_BitsUT(t *testing.T) {
+	t.Parallel()
+
+	dedicated := CPUSetPoolIdentity{Kind: CPUSetPoolKindDedicated, PodUID: "abcdef"}
+	applied := &AppliedView{
+		CPUSetPartitionView: NewCPUSetPartitionView(),
+		PoolProjection: AppliedPoolProjection{
+			CPUSetByIdentity: map[CPUSetPoolIdentity]machine.CPUSet{
+				dedicated: machine.NewCPUSet(2, 3),
+			},
+			UncoveredCPUs: machine.NewCPUSet(4),
+			AmbiguousCPUs: machine.NewCPUSet(5),
+		},
+	}
+
+	copied := applied.DeepCopy()
+	if !EqualAppliedView(applied, copied) {
+		t.Fatal("equal applied pool projections should compare equal")
+	}
+
+	copied.PoolProjection.CPUSetByIdentity[dedicated].Add(99)
+	if EqualAppliedView(applied, copied) {
+		t.Fatal("EqualAppliedView should compare projected pool CPU sets")
+	}
+
+	copied = applied.DeepCopy()
+	delete(copied.PoolProjection.CPUSetByIdentity, dedicated)
+	copied.PoolProjection.CPUSetByIdentity[CPUSetPoolIdentity{
+		Kind: CPUSetPoolKindDedicated, PodUID: "fedcba",
+	}] = machine.NewCPUSet(2, 3)
+	if EqualAppliedView(applied, copied) {
+		t.Fatal("EqualAppliedView should compare projected pool identities")
+	}
+
+	copied = applied.DeepCopy()
+	copied.PoolProjection.UncoveredCPUs.Add(99)
+	if EqualAppliedView(applied, copied) {
+		t.Fatal("EqualAppliedView should compare uncovered CPUs")
+	}
+
+	copied = applied.DeepCopy()
+	copied.PoolProjection.AmbiguousCPUs.Add(99)
+	if EqualAppliedView(applied, copied) {
+		t.Fatal("EqualAppliedView should compare ambiguous CPUs")
 	}
 }
 

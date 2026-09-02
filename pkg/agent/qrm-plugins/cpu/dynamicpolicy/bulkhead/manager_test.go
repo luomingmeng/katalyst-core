@@ -1050,6 +1050,49 @@ func TestManagerApplyPassesOwnedVerifiedViewToDependentsAndReturnsReclaim(t *tes
 	}
 }
 
+func TestManagerPublishedPoolProjectionSurvivesSourceMutation(t *testing.T) {
+	t.Parallel()
+
+	identity := model.CPUSetPoolIdentity{
+		Kind:   model.CPUSetPoolKindDedicated,
+		PodUID: "dedicated-pod",
+	}
+	source := model.NewDesiredView().ToAppliedView()
+	source.Level = model.AppliedViewLevelFull
+	source.PoolProjection.CPUSetByIdentity[identity] = machine.NewCPUSet(1)
+	source.PoolProjection.UncoveredCPUs = machine.NewCPUSet(2)
+	source.PoolProjection.AmbiguousCPUs = machine.NewCPUSet(3)
+
+	topologyPlugin := &fakeTopologyPlugin{
+		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
+		result: bulkheadapi.DAGApplyResult{
+			FullyConverged:       true,
+			FinalSnapshotCurrent: true,
+			AppliedView:          source,
+		},
+	}
+	periodicalConsumer := &fakePlugin{name: "periodical-consumer", enabled: true}
+	manager := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, periodicalConsumer}}
+
+	if _, err := manager.Apply(context.Background(), enabledCPUSetAdjustmentCtx()); err != nil {
+		t.Fatalf("Apply() error: %v", err)
+	}
+
+	source.PoolProjection.CPUSetByIdentity[identity].Add(99)
+	source.PoolProjection.UncoveredCPUs.Add(98)
+	source.PoolProjection.AmbiguousCPUs.Add(97)
+
+	manager.RunPeriodicalHandlers(nil, nil, enabledDynamicAgentConf(), nil, nil)
+	if len(periodicalConsumer.periodicApplied) != 1 || periodicalConsumer.periodicApplied[0] == nil {
+		t.Fatalf("periodical applied views = %#v, want one published view", periodicalConsumer.periodicApplied)
+	}
+
+	published := periodicalConsumer.periodicApplied[0].PoolProjection
+	assertCPUSet(t, "published dedicated pool", published.CPUSetByIdentity[identity], "1")
+	assertCPUSet(t, "published uncovered CPUs", published.UncoveredCPUs, "2")
+	assertCPUSet(t, "published ambiguous CPUs", published.AmbiguousCPUs, "3")
+}
+
 func TestManagerApplyPublishesPartitionMetricsAfterAppliedViewCommit(t *testing.T) {
 	t.Parallel()
 
