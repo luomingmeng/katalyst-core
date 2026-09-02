@@ -215,13 +215,16 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 		stateSnapshot := newCPUSetAdjustmentStateSnapshot(p.state)
 		commitOverride := &cpusetutil.CPUSetAdjustmentCommitOverride{}
 		handlerCtx := cpusetutil.CPUSetAdjustmentHandlerCtx{
-			CoreConf:    p.conf,
-			DynamicConf: dynamicConf,
-			Emitter:     p.emitter,
-			MetaServer:  p.metaServer,
-			State:       stateSnapshot,
-			Topology:    topology,
-			Mode:        mode,
+			CoreConf:                  p.conf,
+			DynamicConf:               dynamicConf,
+			Emitter:                   p.emitter,
+			MetaServer:                p.metaServer,
+			State:                     stateSnapshot,
+			Topology:                  topology,
+			ReservedCPUs:              p.reservedCPUs.Clone(),
+			ReservedReclaimedCPUs:     p.reservedReclaimedCPUSet.Clone(),
+			ReservedReclaimedCPUsSize: p.reservedReclaimedCPUsSize,
+			Mode:                      mode,
 			ScheduleFullRetry: func(reason cpusetutil.CPUSetAdjustmentRetryReason) {
 				p.scheduleCPUSetAdjustmentRetry(reason)
 			},

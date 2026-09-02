@@ -61,6 +61,9 @@ type CPUSetAdjustmentHandlerCtx struct {
 	MetaServer                *metaserver.MetaServer
 	State                     state.ReadonlyState
 	Topology                  *machine.CPUTopology
+	ReservedCPUs              machine.CPUSet
+	ReservedReclaimedCPUs     machine.CPUSet
+	ReservedReclaimedCPUsSize int
 	Generation                uint64
 	CommitIfGenerationCurrent func(generation uint64, commit func()) bool
 	// Mode is fail-safe: an unset mode is interpreted as Periodic/full

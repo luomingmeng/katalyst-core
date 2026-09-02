@@ -39,10 +39,80 @@ type CPUSetPartitionViewOptions struct {
 	TransientProtectedNonReclaim      machine.CPUSet
 }
 
+type CPUSetPartitionViewState struct {
+	State                         cpustate.ReadonlyState
+	ReservedCPUs                  machine.CPUSet
+	ReservedReclaimedCPUs         machine.CPUSet
+	ReservedReclaimedCPUsFallback int
+}
+
 func NewCPUSetPartitionViewOptions(
 	coreConf *config.Configuration,
 	dynamicConf *dynamicconfig.Configuration,
 	topology *machine.CPUTopology,
+	hardActive bool,
+) CPUSetPartitionViewOptions {
+	opts := newCPUSetPartitionViewOptions(coreConf, dynamicConf, hardActive)
+	if !opts.HardPartitionEnabled {
+		return opts
+	}
+	if topology == nil {
+		opts.HardPartitionTargetError = fmt.Errorf(
+			"resolve bulkhead hard-partition reclaim targets: missing topology")
+		return opts
+	}
+
+	targets, err := machine.ResolveHardPartitionReclaimTargets(dynamicConf, topology, 0, nil, nil)
+	if err != nil {
+		opts.HardPartitionTargetError = err
+	} else {
+		opts.HardPartitionReclaimTargetPerNUMA = targets
+	}
+	return opts
+}
+
+func NewCPUSetPartitionViewOptionsWithState(
+	coreConf *config.Configuration,
+	dynamicConf *dynamicconfig.Configuration,
+	topology *machine.CPUTopology,
+	viewState CPUSetPartitionViewState,
+	hardActive bool,
+) CPUSetPartitionViewOptions {
+	opts := newCPUSetPartitionViewOptions(coreConf, dynamicConf, hardActive)
+	if !opts.HardPartitionEnabled {
+		return opts
+	}
+	if topology == nil {
+		opts.HardPartitionTargetError = fmt.Errorf(
+			"resolve bulkhead hard-partition reclaim targets: missing topology")
+		return opts
+	}
+
+	eligibleByNUMA, err := eligibleCPUSetByNUMA(viewState.State, topology, viewState.ReservedCPUs)
+	if err != nil {
+		opts.HardPartitionTargetError = err
+		return opts
+	}
+	targets, err := machine.ResolveHardPartitionReclaimTargets(
+		dynamicConf,
+		topology,
+		viewState.ReservedReclaimedCPUsFallback,
+		func(numaID int) int {
+			return viewState.ReservedReclaimedCPUs.Intersection(eligibleByNUMA[numaID]).Size()
+		},
+		func(numaID int) int { return eligibleByNUMA[numaID].Size() },
+	)
+	if err != nil {
+		opts.HardPartitionTargetError = err
+	} else {
+		opts.HardPartitionReclaimTargetPerNUMA = targets
+	}
+	return opts
+}
+
+func newCPUSetPartitionViewOptions(
+	coreConf *config.Configuration,
+	dynamicConf *dynamicconfig.Configuration,
 	hardActive bool,
 ) CPUSetPartitionViewOptions {
 	nonReclaimPoolMinSize := configuredNonReclaimPoolMinSize(dynamicConf)
@@ -55,18 +125,59 @@ func NewCPUSetPartitionViewOptions(
 		HardPartitionEnabled:              hardActive && hardPartitionEnabled(dynamicConf),
 		HardPartitionReclaimTargetPerNUMA: map[int]int{},
 	}
-	if opts.HardPartitionEnabled && topology != nil {
-		targets, err := machine.ResolveHardPartitionReclaimTargets(dynamicConf, topology, 0, nil, nil)
-		if err != nil {
-			opts.HardPartitionTargetError = err
-		} else {
-			opts.HardPartitionReclaimTargetPerNUMA = targets
-		}
-	}
 	if coreConf != nil {
 		opts.ReserveCPUReversely = coreConf.EnableReserveCPUReversely
 	}
 	return opts
+}
+
+func eligibleCPUSetByNUMA(
+	state cpustate.ReadonlyState,
+	topology *machine.CPUTopology,
+	reservedCPUs machine.CPUSet,
+) (map[int]machine.CPUSet, error) {
+	if state == nil {
+		return nil, fmt.Errorf("resolve bulkhead hard-partition reclaim targets: missing state")
+	}
+
+	machineState := state.GetMachineState()
+	eligibleByNUMA := make(map[int]machine.CPUSet, topology.CPUDetails.NUMANodes().Size())
+	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
+		numaState := machineState[numaID]
+		if numaState == nil {
+			return nil, fmt.Errorf(
+				"resolve bulkhead hard-partition reclaim targets: missing machine state for NUMA %d",
+				numaID,
+			)
+		}
+
+		numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
+		stateCPUs := numaState.DefaultCPUSet.Union(numaState.AllocatedCPUSet)
+		if outside := stateCPUs.Difference(numaCPUs); !outside.IsEmpty() {
+			return nil, fmt.Errorf(
+				"resolve bulkhead hard-partition reclaim targets: machine state for NUMA %d contains CPUs outside NUMA topology: %s",
+				numaID,
+				outside.String(),
+			)
+		}
+		if overlap := numaState.DefaultCPUSet.Intersection(numaState.AllocatedCPUSet); !overlap.IsEmpty() {
+			return nil, fmt.Errorf(
+				"resolve bulkhead hard-partition reclaim targets: machine state for NUMA %d has default/allocated overlap: %s",
+				numaID,
+				overlap.String(),
+			)
+		}
+		if !stateCPUs.Equals(numaCPUs) {
+			return nil, fmt.Errorf(
+				"resolve bulkhead hard-partition reclaim targets: machine state for NUMA %d does not cover NUMA topology: state=%s topology=%s",
+				numaID,
+				stateCPUs.String(),
+				numaCPUs.String(),
+			)
+		}
+		eligibleByNUMA[numaID] = numaState.GetAvailableCPUSet(reservedCPUs)
+	}
+	return eligibleByNUMA, nil
 }
 
 func configuredNonReclaimPoolMinSize(conf *dynamicconfig.Configuration) int64 {
@@ -232,6 +343,9 @@ func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CP
 func BuildValidatedCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CPUTopology, opts CPUSetPartitionViewOptions) (*model.DesiredView, error) {
 	if opts.HardPartitionTargetError != nil {
 		return nil, opts.HardPartitionTargetError
+	}
+	if opts.HardPartitionEnabled && state == nil {
+		return nil, fmt.Errorf("build bulkhead hard-partition view: missing state")
 	}
 	view := BuildCPUSetPartitionView(state, topology, opts)
 	if err := ValidateCPUSetPartitionView(view, topology); err != nil {

@@ -543,7 +543,18 @@ func (m *Manager) cpuSetPartitionViewOptions(
 	in cpusetutil.CPUSetAdjustmentHandlerCtx,
 	hardActive bool,
 ) bulkheadutils.CPUSetPartitionViewOptions {
-	opts := bulkheadutils.NewCPUSetPartitionViewOptions(in.CoreConf, in.DynamicConf, in.Topology, hardActive)
+	opts := bulkheadutils.NewCPUSetPartitionViewOptionsWithState(
+		in.CoreConf,
+		in.DynamicConf,
+		in.Topology,
+		bulkheadutils.CPUSetPartitionViewState{
+			State:                         in.State,
+			ReservedCPUs:                  in.ReservedCPUs,
+			ReservedReclaimedCPUs:         in.ReservedReclaimedCPUs,
+			ReservedReclaimedCPUsFallback: in.ReservedReclaimedCPUsSize,
+		},
+		hardActive,
+	)
 	if opts.NonReclaimPoolMinSize <= 0 {
 		opts.NonReclaimPoolMinSize = m.defaultNonReclaimPoolMinSize
 	}

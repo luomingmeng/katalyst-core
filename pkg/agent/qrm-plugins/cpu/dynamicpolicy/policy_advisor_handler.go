@@ -2275,7 +2275,7 @@ func (p *DynamicPolicy) buildAdjustmentCommitOverrideFromPodEntries(
 		view = bulkheadutils.BuildCPUSetPartitionView(
 			snapshot,
 			p.machineInfo.CPUTopology,
-			p.cpuSetPartitionViewOptions(snapshot.podEntries.HasActiveRampUp()),
+			p.cpuSetPartitionViewOptions(snapshot, snapshot.podEntries.HasActiveRampUp()),
 		)
 	} else {
 		var err error
@@ -2468,14 +2468,17 @@ func (p *DynamicPolicy) validatePendingAdvisorPartitionView(
 	if _, err := bulkheadutils.BuildValidatedCPUSetPartitionView(
 		snapshot,
 		p.machineInfo.CPUTopology,
-		p.cpuSetPartitionViewOptions(newEntries.HasActiveRampUp()),
+		p.cpuSetPartitionViewOptions(snapshot, newEntries.HasActiveRampUp()),
 	); err != nil {
 		return fmt.Errorf("validate pending advisor partition view before commit: %w", err)
 	}
 	return nil
 }
 
-func (p *DynamicPolicy) cpuSetPartitionViewOptions(hardActive bool) bulkheadutils.CPUSetPartitionViewOptions {
+func (p *DynamicPolicy) cpuSetPartitionViewOptions(
+	state state.ReadonlyState,
+	hardActive bool,
+) bulkheadutils.CPUSetPartitionViewOptions {
 	var dynamicConf *dynamicconfig.Configuration
 	if p != nil && p.dynamicConfig != nil {
 		dynamicConf = p.dynamicConfig.GetDynamicConfiguration()
@@ -2488,7 +2491,26 @@ func (p *DynamicPolicy) cpuSetPartitionViewOptions(hardActive bool) bulkheadutil
 			topology = p.machineInfo.CPUTopology
 		}
 	}
-	return bulkheadutils.NewCPUSetPartitionViewOptions(coreConf, dynamicConf, topology, hardActive)
+	reservedCPUs := machine.NewCPUSet()
+	reservedReclaimedCPUs := machine.NewCPUSet()
+	reservedReclaimedCPUsFallback := 0
+	if p != nil {
+		reservedCPUs = p.reservedCPUs.Clone()
+		reservedReclaimedCPUs = p.reservedReclaimedCPUSet.Clone()
+		reservedReclaimedCPUsFallback = p.reservedReclaimedCPUsSize
+	}
+	return bulkheadutils.NewCPUSetPartitionViewOptionsWithState(
+		coreConf,
+		dynamicConf,
+		topology,
+		bulkheadutils.CPUSetPartitionViewState{
+			State:                         state,
+			ReservedCPUs:                  reservedCPUs,
+			ReservedReclaimedCPUs:         reservedReclaimedCPUs,
+			ReservedReclaimedCPUsFallback: reservedReclaimedCPUsFallback,
+		},
+		hardActive,
+	)
 }
 
 func (p *DynamicPolicy) hardBulkheadPartitionValidationEnabled() bool {
