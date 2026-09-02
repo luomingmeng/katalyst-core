@@ -1711,10 +1711,145 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 		require.True(t, got.IsEmpty())
 	})
 
-	t.Run("hard partition disabled preserves global reclaim allocation", func(t *testing.T) {
+	t.Run("steady reclaim is split by complete cores across NUMAs", func(t *testing.T) {
 		got, err := solve(t, newPolicy(t, false), 4, allCPUs, numa1)
 		require.NoError(t, err)
-		require.Equal(t, numa1, got)
+		require.Equal(t, 2, got.Intersection(numa0).Size())
+		require.Equal(t, 2, got.Intersection(numa1).Size())
+		requireCoreAligned(t, topology, got)
+	})
+
+	t.Run("steady reclaim skips NUMA without a complete available core", func(t *testing.T) {
+		numa0CPUs := numa0.ToSliceInt()
+		available := machine.NewCPUSet(numa0CPUs[0]).Union(numa1)
+		got, err := solve(t, newPolicy(t, false), 4, available, machine.NewCPUSet())
+		require.NoError(t, err)
+		require.Equal(t, 4, got.Size())
+		require.LessOrEqual(t, got.Intersection(numa0).Size(), 1)
+		gotOnNUMA1 := got.Intersection(numa1)
+		alignedOnNUMA1 := takeCoreAlignedCPUSet(topology, gotOnNUMA1, gotOnNUMA1, gotOnNUMA1.Size())
+		require.GreaterOrEqual(t, alignedOnNUMA1.Size(), topology.CPUsPerCore(),
+			"the eligible NUMA must receive at least one complete physical core")
+	})
+
+	t.Run("steady reclaim skips steady exclusive NUMA", func(t *testing.T) {
+		p := newPolicy(t, false)
+		p.state.SetPodEntries(state.PodEntries{
+			"steady-exclusive": {
+				"main": &state.AllocationInfo{
+					AllocationMeta: commonstate.AllocationMeta{
+						PodUid:        "steady-exclusive",
+						ContainerName: "main",
+						OwnerPoolName: commonstate.PoolNameDedicated,
+						QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+						Annotations: map[string]string{
+							apiconsts.PodAnnotationMemoryEnhancementNumaBinding:   apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+							apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
+						},
+					},
+					AllocationResult:         numa0,
+					TopologyAwareAssignments: map[int]machine.CPUSet{0: numa0},
+				},
+			},
+		}, false)
+
+		got, err := solve(t, p, 4, allCPUs, machine.NewCPUSet())
+		require.NoError(t, err)
+		require.True(t, got.Intersection(numa0).IsEmpty())
+		require.Equal(t, 4, got.Intersection(numa1).Size())
+		requireCoreAligned(t, topology, got)
+	})
+
+	t.Run("steady reclaim floor does not consume another demand's only core", func(t *testing.T) {
+		p := newPolicy(t, false)
+		numa0Cores := numa0.ToSliceInt()
+		narrowCore := machine.NewCPUSet(numa0Cores[0], numa0Cores[2])
+		otherCore := numa0.Difference(narrowCore)
+		partiallyConstrained := narrowCore.Union(machine.NewCPUSet(numa0Cores[1]))
+		result := advisorapi.NewBlockCPUSet()
+		_, err := p.solveAdvisorDescriptorPhase([]advisorBlockDescriptor{
+			{
+				BlockID: "reclaim", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
+				Quantity: 2, ComponentKey: "reclaim", Eligible: numa0, OldPreferred: narrowCore,
+			},
+			{
+				BlockID: "shared", Class: advisorBlockClassShared, NUMAID: 0,
+				Quantity: 2, ComponentKey: "shared", Eligible: partiallyConstrained,
+			},
+		}, numa0, result, true, false)
+		require.NoError(t, err)
+		require.Equal(t, otherCore, result["reclaim"])
+		require.Equal(t, 2, result["shared"].Size())
+		require.True(t, result["shared"].IsSubsetOf(partiallyConstrained))
+		requireCoreAligned(t, topology, result["reclaim"])
+	})
+
+	t.Run("steady reclaim rejects quantity below all eligible NUMA floors", func(t *testing.T) {
+		_, err := solve(t, newPolicy(t, false), 2, allCPUs, machine.NewCPUSet())
+		require.ErrorContains(t, err, "smaller than required steady minimum")
+	})
+
+	t.Run("steady reclaim floor avoids a real reclaim demand's only CPU", func(t *testing.T) {
+		singleNUMATopology, err := machine.GenerateDummyCPUTopology(6, 1, 1)
+		require.NoError(t, err)
+		p, err := getTestDynamicPolicyWithoutInitialization(singleNUMATopology, t.TempDir())
+		require.NoError(t, err)
+		singleNUMACPUs := singleNUMATopology.CPUDetails.CPUs()
+		cpuIDs := singleNUMACPUs.ToSliceInt()
+		realEligible := machine.NewCPUSet(cpuIDs[0])
+		fakePreferred := coresInNUMA(singleNUMATopology, 0, 0, 1)
+		result := advisorapi.NewBlockCPUSet()
+
+		_, err = p.solveAdvisorDescriptorPhase([]advisorBlockDescriptor{
+			{
+				BlockID: "real", Class: advisorBlockClassMandatoryReclaim, NUMAID: 0,
+				Quantity: 1, ComponentKey: "real", Eligible: realEligible,
+			},
+			{
+				BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
+				Quantity: 2, ComponentKey: "fake", Eligible: singleNUMACPUs, OldPreferred: fakePreferred,
+			},
+		}, singleNUMACPUs, result, true, false)
+		require.NoError(t, err)
+		require.Equal(t, realEligible, result["real"])
+		require.True(t, result["fake"].Intersection(realEligible).IsEmpty())
+		requireCoreAligned(t, singleNUMATopology, result["fake"])
+	})
+
+	t.Run("steady real reclaim quantity must include a complete core", func(t *testing.T) {
+		p := newPolicy(t, false)
+		numa0CPUs := numa0.ToSliceInt()
+		fragmentedPrevious := machine.NewCPUSet(numa0CPUs[0], numa0CPUs[1])
+		result := advisorapi.NewBlockCPUSet()
+
+		_, err := p.solveAdvisorDescriptorPhase([]advisorBlockDescriptor{
+			{
+				BlockID: "real", Class: advisorBlockClassMandatoryReclaim, NUMAID: 0,
+				Quantity: 2, ComponentKey: "real", Eligible: numa0, OldPreferred: fragmentedPrevious,
+			},
+			{
+				BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
+				Quantity: 2, ComponentKey: "fake", Eligible: allCPUs, OldPreferred: numa1,
+			},
+		}, allCPUs, result, true, false)
+		require.NoError(t, err)
+		requireCoreAligned(t, topology, result["real"])
+		requireCoreAligned(t, topology, result["fake"])
+	})
+
+	t.Run("steady residual prefers complete cores over fragmented previous reclaim", func(t *testing.T) {
+		p := newPolicy(t, false)
+		numa0Floor := coresInNUMA(topology, 0, 0, 1)
+		numa1Floor := coresInNUMA(topology, 1, 0, 1)
+		numa0Rest := coresInNUMA(topology, 0, 1, 2).ToSliceInt()
+		numa1Rest := coresInNUMA(topology, 1, 1, 2).ToSliceInt()
+		fragmentedPrevious := numa0Floor.Union(numa1Floor).
+			Union(machine.NewCPUSet(numa0Rest[0], numa1Rest[0]))
+
+		got, err := solve(t, p, 6, allCPUs, fragmentedPrevious)
+		require.NoError(t, err)
+		require.Equal(t, 6, got.Size())
+		requireCoreAligned(t, topology, got)
 	})
 }
 
