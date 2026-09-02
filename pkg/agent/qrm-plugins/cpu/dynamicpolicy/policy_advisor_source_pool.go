@@ -389,17 +389,30 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhase(
 	demands := make([]partitionDemand, 0, len(descriptors))
 	blockIDByDemandKey := make(map[string]string, len(descriptors))
 	ordinalByStableKey := make(map[string]int, len(descriptors))
+	var coreFloors []partitionCoreFloorConstraint
 	expandHardReclaimPhase := preserveClass && hardActive
-	if expandHardReclaimPhase {
+	expandSteadyReclaimPhase := preserveClass && !hardActive &&
+		hasFakeNUMAMandatoryReclaimDescriptor(descriptors)
+	if expandHardReclaimPhase || expandSteadyReclaimPhase {
 		// NUMAs owned by a committed steady exclusive DNB keep only their finalized
 		// reserve once ramp-up ends; the planner must skip them so its per-NUMA
 		// minimum and cross-NUMA imbalance guards do not re-impose the ratio-derived
 		// target and reject every other ramp-up QoS on the node.
 		skipNUMAs := p.state.GetPodEntries().SteadyExclusiveNUMAs(p.machineInfo.CPUTopology)
-		expanded, expandedBlockIDs, err := expandHardPartitionReclaimPhase(
-			descriptors, available, p.machineInfo.CPUTopology, skipNUMAs)
+		var (
+			expanded         []partitionDemand
+			expandedBlockIDs map[string]string
+			err              error
+		)
+		if expandHardReclaimPhase {
+			expanded, expandedBlockIDs, err = expandHardPartitionReclaimPhase(
+				descriptors, available, p.machineInfo.CPUTopology, skipNUMAs)
+		} else {
+			expanded, expandedBlockIDs, coreFloors, err = expandSteadyFakeNUMAReclaimPhase(
+				descriptors, available, p.machineInfo.CPUTopology, skipNUMAs)
+		}
 		if err != nil {
-			return available, fmt.Errorf("expand hard reclaim phase: %w", err)
+			return available, fmt.Errorf("expand reclaim phase: %w", err)
 		}
 		demands = append(demands, expanded...)
 		for demandKey, blockID := range expandedBlockIDs {
@@ -407,7 +420,8 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhase(
 		}
 	}
 	for _, descriptor := range descriptors {
-		if expandHardReclaimPhase && descriptor.Class == advisorBlockClassMandatoryReclaim {
+		if (expandHardReclaimPhase || expandSteadyReclaimPhase) &&
+			descriptor.Class == advisorBlockClassMandatoryReclaim {
 			continue
 		}
 
@@ -446,9 +460,16 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhase(
 		}
 		demands = pinnedDemands
 	}
-	assignments, err := solveDisjointPartitions(demands, p.machineInfo.CPUTopology)
-	if err != nil {
-		return available, err
+	var assignments map[string]machine.CPUSet
+	var solveErr error
+	if len(coreFloors) > 0 {
+		assignments, solveErr = solveDisjointPartitionsWithCoreFloors(
+			demands, coreFloors, p.machineInfo.CPUTopology)
+	} else {
+		assignments, solveErr = solveDisjointPartitions(demands, p.machineInfo.CPUTopology)
+	}
+	if solveErr != nil {
+		return available, solveErr
 	}
 	used := machine.NewCPUSet()
 	for demandKey, cpus := range assignments {

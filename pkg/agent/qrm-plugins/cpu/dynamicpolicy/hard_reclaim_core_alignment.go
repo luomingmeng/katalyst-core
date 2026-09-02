@@ -23,6 +23,12 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
+type coreAlignedCandidate struct {
+	coreID       int
+	cpus         machine.CPUSet
+	preferredHit int
+}
+
 // takeCoreAlignedCPUSet selects cpus from candidates in complete physical cores
 // only. It picks up to quantity cpus, but a core is chosen only when every one
 // of its cpusPerCore siblings is present in candidates, so the returned set is
@@ -54,13 +60,35 @@ func takeCoreAlignedCPUSet(
 		return machine.NewCPUSet()
 	}
 
-	// group candidate cpus by core; keep only cores whose full sibling set is
-	// present in candidates so no half core can ever be emitted.
-	type coreCandidate struct {
-		coreID       int
-		cpus         machine.CPUSet
-		preferredHit int
+	completeCores := coreAlignedCandidates(topology, candidates, prefer)
+	selected := machine.NewCPUSet()
+	for _, core := range completeCores {
+		if coresWanted == 0 {
+			break
+		}
+		selected = selected.Union(core.cpus)
+		coresWanted--
 	}
+	return selected
+}
+
+// coreAlignedCandidates returns complete physical cores in deterministic
+// tiered-preference order: cores with more siblings in prefer come first, then
+// lower core IDs. Callers can use the individual candidates when a full core
+// must be expressed as a solver constraint instead of being selected eagerly.
+func coreAlignedCandidates(
+	topology *machine.CPUTopology,
+	candidates machine.CPUSet,
+	prefer machine.CPUSet,
+) []coreAlignedCandidate {
+	if topology == nil {
+		return nil
+	}
+	cpusPerCore := topology.CPUsPerCore()
+	if cpusPerCore <= 0 {
+		return nil
+	}
+
 	cpusByCore := make(map[int]machine.CPUSet)
 	for _, cpu := range candidates.ToSliceInt() {
 		info, ok := topology.CPUDetails[cpu]
@@ -75,12 +103,12 @@ func takeCoreAlignedCPUSet(
 		cpusByCore[info.CoreID] = set
 	}
 
-	completeCores := make([]coreCandidate, 0, len(cpusByCore))
+	completeCores := make([]coreAlignedCandidate, 0, len(cpusByCore))
 	for coreID, cpus := range cpusByCore {
 		if cpus.Size() != cpusPerCore {
 			continue
 		}
-		completeCores = append(completeCores, coreCandidate{
+		completeCores = append(completeCores, coreAlignedCandidate{
 			coreID:       coreID,
 			cpus:         cpus,
 			preferredHit: cpus.Intersection(prefer).Size(),
@@ -93,16 +121,7 @@ func takeCoreAlignedCPUSet(
 		}
 		return completeCores[i].coreID < completeCores[j].coreID
 	})
-
-	selected := machine.NewCPUSet()
-	for _, core := range completeCores {
-		if coresWanted == 0 {
-			break
-		}
-		selected = selected.Union(core.cpus)
-		coresWanted--
-	}
-	return selected
+	return completeCores
 }
 
 func completeCoresForCPUSet(topology *machine.CPUTopology, cpus machine.CPUSet) (machine.CPUSet, error) {

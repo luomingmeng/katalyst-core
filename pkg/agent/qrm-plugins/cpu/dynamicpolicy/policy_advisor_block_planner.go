@@ -360,6 +360,179 @@ func advisorBlockClassRank(class advisorBlockClass) int {
 	}
 }
 
+func hasFakeNUMAMandatoryReclaimDescriptor(descriptors []advisorBlockDescriptor) bool {
+	for _, descriptor := range descriptors {
+		if descriptor.Class == advisorBlockClassMandatoryReclaim &&
+			descriptor.NUMAID == commonstate.FakedNUMAID {
+			return true
+		}
+	}
+	return false
+}
+
+// expandSteadyFakeNUMAReclaimPhase reserves one complete physical core on each
+// eligible NUMA before leaving the remaining fake-NUMA quantity to the regular
+// joint solver. This preserves the advisor-published total while preventing a
+// stable preferred set from concentrating the whole reclaim pool on a subset of
+// NUMAs. The residual remains global so narrow share and dedicated demands can
+// still participate in the same feasibility solve.
+func expandSteadyFakeNUMAReclaimPhase(
+	descriptors []advisorBlockDescriptor,
+	available machine.CPUSet,
+	topology *machine.CPUTopology,
+	skipNUMAs sets.Int,
+) ([]partitionDemand, map[string]string, []partitionCoreFloorConstraint, error) {
+	if topology == nil {
+		return nil, nil, nil, fmt.Errorf("cannot expand steady reclaim phase with nil CPU topology")
+	}
+	cpusPerCore := topology.CPUsPerCore()
+	if cpusPerCore <= 0 {
+		return nil, nil, nil, fmt.Errorf(
+			"cannot expand steady reclaim phase with non-positive cpus per core %d", cpusPerCore)
+	}
+
+	mandatory := filterAdvisorDescriptors(descriptors, func(descriptor advisorBlockDescriptor) bool {
+		return descriptor.Class == advisorBlockClassMandatoryReclaim
+	})
+	sort.Slice(mandatory, func(i, j int) bool {
+		return advisorBlockDescriptorLess(mandatory[i], mandatory[j])
+	})
+	fakeDescriptors := filterAdvisorDescriptors(mandatory, func(descriptor advisorBlockDescriptor) bool {
+		return descriptor.NUMAID == commonstate.FakedNUMAID
+	})
+	if len(fakeDescriptors) != 1 {
+		return nil, nil, nil, fmt.Errorf(
+			"steady reclaim protocol error: expected exactly one fake-NUMA mandatory reclaim block, got %d",
+			len(fakeDescriptors))
+	}
+
+	demands := make([]partitionDemand, 0, len(mandatory)+topology.NumNUMANodes)
+	blockIDByDemandKey := make(map[string]string, len(mandatory)+topology.NumNUMANodes)
+	floors := make([]partitionCoreFloorConstraint, 0, topology.NumNUMANodes)
+	realCoreFloorByNUMA := make(map[int]bool)
+	for _, descriptor := range mandatory {
+		if descriptor.NUMAID == commonstate.FakedNUMAID {
+			continue
+		}
+		numaCPUs := topology.CPUDetails.CPUsInNUMANodes(descriptor.NUMAID)
+		eligible := descriptor.Eligible.Intersection(available).Intersection(numaCPUs)
+		if eligible.Size() < descriptor.Quantity {
+			return nil, nil, nil, fmt.Errorf(
+				"steady reclaim block %q NUMA %d eligible capacity %d is smaller than quantity %d",
+				descriptor.BlockID, descriptor.NUMAID, eligible.Size(), descriptor.Quantity)
+		}
+		key := hardReclaimPhaseDemandKey(descriptor, descriptor.NUMAID)
+		coreCandidates := coreAlignedCandidates(
+			topology, eligible, descriptor.OldPreferred.Intersection(eligible))
+		if descriptor.Quantity >= cpusPerCore && len(coreCandidates) > 0 {
+			floorEligible := machine.NewCPUSet()
+			for _, candidate := range coreCandidates {
+				floorEligible = floorEligible.Union(candidate.cpus)
+			}
+			demands = append(demands, partitionDemand{
+				key:       key,
+				quantity:  cpusPerCore,
+				eligible:  floorEligible,
+				preferred: descriptor.OldPreferred.Intersection(floorEligible),
+				class:     advisorBlockClassMandatoryReclaim,
+			})
+			blockIDByDemandKey[key] = descriptor.BlockID
+			floors = append(floors, partitionCoreFloorConstraint{demandKey: key})
+			realCoreFloorByNUMA[descriptor.NUMAID] = true
+
+			residual := descriptor.Quantity - cpusPerCore
+			if residual > 0 {
+				residualKey := key + "\x00residual"
+				demands = append(demands, partitionDemand{
+					key:      residualKey,
+					quantity: residual,
+					eligible: eligible,
+					preferred: takeCoreAlignedCPUSet(
+						topology, eligible, descriptor.OldPreferred.Intersection(eligible), residual),
+					class: advisorBlockClassMandatoryReclaim,
+				})
+				blockIDByDemandKey[residualKey] = descriptor.BlockID
+			}
+			continue
+		}
+		demands = append(demands, partitionDemand{
+			key:       key,
+			quantity:  descriptor.Quantity,
+			eligible:  eligible,
+			preferred: descriptor.OldPreferred.Intersection(eligible),
+			class:     advisorBlockClassMandatoryReclaim,
+		})
+		blockIDByDemandKey[key] = descriptor.BlockID
+	}
+
+	fake := fakeDescriptors[0]
+	fakeEligible := fake.Eligible.Intersection(available)
+	numaIDs := topology.CPUDetails.KeepOnly(fakeEligible).NUMANodes().ToSliceInt()
+	sort.Ints(numaIDs)
+	floorEligibleByNUMA := make(map[int]machine.CPUSet, len(numaIDs))
+	requiredFloorQuantity := 0
+	for _, numaID := range numaIDs {
+		if skipNUMAs.Has(numaID) || realCoreFloorByNUMA[numaID] {
+			continue
+		}
+		numaEligible := fakeEligible.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
+		coreCandidates := coreAlignedCandidates(
+			topology, numaEligible, fake.OldPreferred.Intersection(numaEligible))
+		if len(coreCandidates) == 0 {
+			continue
+		}
+		floorEligible := machine.NewCPUSet()
+		for _, candidate := range coreCandidates {
+			floorEligible = floorEligible.Union(candidate.cpus)
+		}
+		floorEligibleByNUMA[numaID] = floorEligible
+		requiredFloorQuantity += cpusPerCore
+	}
+	if fake.Quantity < requiredFloorQuantity {
+		return nil, nil, nil, fmt.Errorf(
+			"steady fake reclaim quantity %d is smaller than required steady minimum %d",
+			fake.Quantity, requiredFloorQuantity)
+	}
+
+	remaining := fake.Quantity
+	for _, numaID := range numaIDs {
+		floorEligible, found := floorEligibleByNUMA[numaID]
+		if !found {
+			continue
+		}
+		key := hardReclaimPhaseDemandKey(fake, numaID)
+		demands = append(demands, partitionDemand{
+			key:       key,
+			quantity:  cpusPerCore,
+			eligible:  floorEligible,
+			preferred: fake.OldPreferred.Intersection(floorEligible),
+			class:     advisorBlockClassMandatoryReclaim,
+		})
+		blockIDByDemandKey[key] = fake.BlockID
+		floors = append(floors, partitionCoreFloorConstraint{demandKey: key})
+		remaining -= cpusPerCore
+	}
+
+	if remaining > 0 {
+		eligible := fakeEligible.Clone()
+		for numaID := range skipNUMAs {
+			eligible = eligible.Difference(topology.CPUDetails.CPUsInNUMANodes(numaID))
+		}
+		preferred := takeCoreAlignedCPUSet(
+			topology, eligible, fake.OldPreferred.Intersection(eligible), remaining)
+		key := hardReclaimPhaseDemandKey(fake, commonstate.FakedNUMAID)
+		demands = append(demands, partitionDemand{
+			key:       key,
+			quantity:  remaining,
+			eligible:  eligible,
+			preferred: preferred,
+			class:     advisorBlockClassMandatoryReclaim,
+		})
+		blockIDByDemandKey[key] = fake.BlockID
+	}
+	return demands, blockIDByDemandKey, floors, nil
+}
+
 func expandHardPartitionReclaimPhase(
 	descriptors []advisorBlockDescriptor,
 	available machine.CPUSet,
