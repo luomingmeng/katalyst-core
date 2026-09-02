@@ -3832,10 +3832,10 @@ func (p *DynamicPolicy) selectNumaBindingReclaimPartition(
 
 		reclaimOnly := reclaimEligible.Difference(dedicatedEligible)
 		steadyReserve := p.reservedReclaimedCPUSet.Intersection(numaCPUs)
-		completedSteadyReserve, err := completeCoresForCPUSet(
-			p.machineInfo.CPUTopology, steadyReserve)
+		completedSteadyReserve, err := completeEligibleCoresForPreferredCPUSet(
+			p.machineInfo.CPUTopology, reclaimEligible, steadyReserve)
 		if err != nil {
-			return machine.NewCPUSet(), fmt.Errorf("complete steady reclaim reserve for NUMA %d: %w", numaID, err)
+			return machine.NewCPUSet(), fmt.Errorf("select eligible steady reclaim reserve for NUMA %d: %w", numaID, err)
 		}
 		if completedSteadyReserve.Size() > derivedInNUMA.Size() {
 			return machine.NewCPUSet(), fmt.Errorf(

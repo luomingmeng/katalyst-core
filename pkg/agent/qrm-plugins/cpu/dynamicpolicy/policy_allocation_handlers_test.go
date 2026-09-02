@@ -1908,7 +1908,7 @@ func TestDynamicPolicy_selectNumaBindingReclaimPartitionPreservesMandatoryIdenti
 	}
 }
 
-func TestDynamicPolicy_selectNumaBindingReclaimPartitionRejectsIneligibleMandatoryIdentity(t *testing.T) {
+func TestDynamicPolicy_selectNumaBindingReclaimPartitionFallsBackWhenMandatoryIdentityLeavesEligibility(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
@@ -1917,18 +1917,22 @@ func TestDynamicPolicy_selectNumaBindingReclaimPartitionRejectsIneligibleMandato
 	require.NoError(t, err)
 	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
-	p.reservedReclaimedCPUSet = machine.NewCPUSet(7)
-	p.reservedReclaimedCPUsSize = 1
+	staleReserve := coresInNUMA(topology, 0, 3, 4)
+	p.reservedReclaimedCPUSet = staleReserve
+	p.reservedReclaimedCPUsSize = staleReserve.Size()
 
+	derivedFloor := coresInNUMA(topology, 0, 0, 1)
+	eligible := coresInNUMA(topology, 0, 0, 2)
 	got, err := p.selectNumaBindingReclaimPartition(
-		machine.NewCPUSet(0, 1),
-		map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1, 2, 3)},
-		map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1, 2, 3)},
+		derivedFloor,
+		map[int]machine.CPUSet{0: eligible},
+		map[int]machine.CPUSet{0: eligible},
 		[]uint64{0},
 		true,
 	)
-	require.ErrorContains(t, err, "not a subset of reclaim eligibility")
-	require.True(t, got.IsEmpty(), "got=%s", got)
+	require.NoError(t, err)
+	require.True(t, derivedFloor.Equals(got), "want=%s got=%s", derivedFloor, got)
+	require.True(t, got.Intersection(staleReserve).IsEmpty(), "got=%s", got)
 }
 
 // TestDynamicPolicy_generateNUMABindingPoolsCPUSetInPlace verifies the logic of generating CPU sets for NUMA-binding pools.
