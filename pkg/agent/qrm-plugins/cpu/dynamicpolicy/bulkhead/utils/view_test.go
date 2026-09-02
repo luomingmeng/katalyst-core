@@ -47,12 +47,15 @@ func TestNewCPUSetPartitionViewOptionsUsesProductionConfigurationConsistently(t 
 	currentDynamic.AdminQoSConfiguration.CPUPluginConfiguration.InitialRampUpReclaimCPUSetRatio = 0.2
 	topology := testTwoNUMATopologyN(32)
 
-	inactiveOpts := NewCPUSetPartitionViewOptions(coreConf, currentDynamic, topology, false)
+	inactiveOpts := NewCPUSetPartitionViewOptionsWithState(
+		coreConf, currentDynamic, topology, CPUSetPartitionViewState{}, false)
 	if inactiveOpts.HardPartitionEnabled || len(inactiveOpts.HardPartitionReclaimTargetPerNUMA) != 0 {
 		t.Fatalf("configured inactive hard partition must not resolve targets: %+v", inactiveOpts)
 	}
 
-	opts := NewCPUSetPartitionViewOptions(coreConf, currentDynamic, topology, true)
+	state := cpustate.NewCPUPluginState(topology)
+	opts := NewCPUSetPartitionViewOptionsWithState(
+		coreConf, currentDynamic, topology, CPUSetPartitionViewState{State: state}, true)
 	if opts.NonReclaimPoolMinSize != 5 || !opts.ReserveCPUReversely || !opts.HardPartitionEnabled {
 		t.Fatalf("unexpected current options: %+v", opts)
 	}
@@ -66,7 +69,8 @@ func TestNewCPUSetPartitionViewOptionsUsesProductionConfigurationConsistently(t 
 	currentDynamic.MinReclaimedResourceForAllocate = v1.ResourceList{
 		v1.ResourceCPU: resource.MustParse("16"),
 	}
-	opts = NewCPUSetPartitionViewOptions(coreConf, currentDynamic, topology, true)
+	opts = NewCPUSetPartitionViewOptionsWithState(
+		coreConf, currentDynamic, topology, CPUSetPartitionViewState{State: state}, true)
 	if got := opts.HardPartitionReclaimTargetPerNUMA[0]; got != 8 {
 		t.Fatalf("NUMA 0 configured reclaim target = %d, want 8", got)
 	}
@@ -75,15 +79,253 @@ func TestNewCPUSetPartitionViewOptionsUsesProductionConfigurationConsistently(t 
 	}
 
 	currentDynamic.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.NonReclaimPoolMinSize = 0
-	opts = NewCPUSetPartitionViewOptions(coreConf, currentDynamic, topology, true)
+	opts = NewCPUSetPartitionViewOptionsWithState(
+		coreConf, currentDynamic, topology, CPUSetPartitionViewState{State: state}, true)
 	if opts.NonReclaimPoolMinSize != 7 {
 		t.Fatalf("fallback NonReclaimPoolMinSize = %d, want 7", opts.NonReclaimPoolMinSize)
 	}
 
 	currentDynamic.EnableReclaim = false
-	opts = NewCPUSetPartitionViewOptions(coreConf, currentDynamic, topology, true)
+	opts = NewCPUSetPartitionViewOptionsWithState(
+		coreConf, currentDynamic, topology, CPUSetPartitionViewState{State: state}, true)
 	if opts.HardPartitionEnabled {
 		t.Fatal("hard partition must be ineffective when reclaim is disabled")
+	}
+}
+
+func TestNewCPUSetPartitionViewOptionsUsesEligibleCapacityFromState(t *testing.T) {
+	t.Parallel()
+
+	topology := testTwoNUMATopologyN(32)
+	dynamicConf := dynamicconfig.NewDynamicAgentConfiguration().GetDynamicConfiguration()
+	dynamicConf.EnableReclaim = true
+	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.EnableRampUpReclaimHardPartition = true
+	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.InitialRampUpReclaimCPUSetRatio = 0.2
+
+	state := cpustate.NewCPUPluginState(topology)
+	machineState := state.GetMachineState()
+	machineState[0].DefaultCPUSet = machine.NewCPUSet()
+	for cpu := 0; cpu < 21; cpu++ {
+		machineState[0].DefaultCPUSet.Add(cpu)
+	}
+	machineState[0].AllocatedCPUSet = machine.NewCPUSet()
+	for cpu := 21; cpu < 32; cpu++ {
+		machineState[0].AllocatedCPUSet.Add(cpu)
+	}
+	state.SetMachineState(machineState)
+
+	opts := NewCPUSetPartitionViewOptionsWithState(
+		nil, dynamicConf, topology, CPUSetPartitionViewState{
+			State:        state,
+			ReservedCPUs: machine.NewCPUSet(0),
+		}, true)
+	if opts.HardPartitionTargetError != nil {
+		t.Fatalf("NewCPUSetPartitionViewOptions() error = %v", opts.HardPartitionTargetError)
+	}
+	if got := opts.HardPartitionReclaimTargetPerNUMA[0]; got != 4 {
+		t.Fatalf("NUMA 0 target = %d, want 4 from 20 eligible CPUs", got)
+	}
+	if got := opts.HardPartitionReclaimTargetPerNUMA[1]; got != 6 {
+		t.Fatalf("NUMA 1 target = %d, want 6 from 32 eligible CPUs", got)
+	}
+}
+
+func TestNewCPUSetPartitionViewOptionsWithStateUsesReservedReclaimFloors(t *testing.T) {
+	t.Parallel()
+
+	topology := testTwoNUMASMTTopology()
+	dynamicConf := dynamicconfig.NewDynamicAgentConfiguration().GetDynamicConfiguration()
+	dynamicConf.EnableReclaim = true
+	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.EnableRampUpReclaimHardPartition = true
+
+	state := cpustate.NewCPUPluginState(topology)
+	opts := NewCPUSetPartitionViewOptionsWithState(
+		nil,
+		dynamicConf,
+		topology,
+		CPUSetPartitionViewState{
+			State:                         state,
+			ReservedCPUs:                  machine.NewCPUSet(),
+			ReservedReclaimedCPUs:         machine.NewCPUSet(0, 1, 2, 3),
+			ReservedReclaimedCPUsFallback: 4,
+		},
+		true,
+	)
+	if opts.HardPartitionTargetError != nil {
+		t.Fatalf("NewCPUSetPartitionViewOptionsWithState() error = %v", opts.HardPartitionTargetError)
+	}
+	if got := opts.HardPartitionReclaimTargetPerNUMA[0]; got != 4 {
+		t.Fatalf("NUMA 0 target = %d, want reserved reclaim floor 4", got)
+	}
+	if got := opts.HardPartitionReclaimTargetPerNUMA[1]; got != 2 {
+		t.Fatalf("NUMA 1 target = %d, want one-core baseline 2", got)
+	}
+}
+
+func TestNewCPUSetPartitionViewOptionsRejectsIncompleteEligibleCapacityState(t *testing.T) {
+	t.Parallel()
+
+	topology := testTwoNUMATopologyN(32)
+	dynamicConf := dynamicconfig.NewDynamicAgentConfiguration().GetDynamicConfiguration()
+	dynamicConf.EnableReclaim = true
+	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.EnableRampUpReclaimHardPartition = true
+
+	tests := []struct {
+		name  string
+		state cpustate.ReadonlyState
+		want  string
+	}{
+		{
+			name: "nil state",
+			want: "missing state",
+		},
+		{
+			name: "missing NUMA state",
+			state: func() cpustate.ReadonlyState {
+				state := cpustate.NewCPUPluginState(topology)
+				machineState := state.GetMachineState()
+				delete(machineState, 1)
+				state.SetMachineState(machineState)
+				return state
+			}(),
+			want: "missing machine state for NUMA 1",
+		},
+		{
+			name: "incomplete NUMA state",
+			state: func() cpustate.ReadonlyState {
+				state := cpustate.NewCPUPluginState(topology)
+				machineState := state.GetMachineState()
+				machineState[0].DefaultCPUSet = machineState[0].DefaultCPUSet.Difference(machine.NewCPUSet(0))
+				state.SetMachineState(machineState)
+				return state
+			}(),
+			want: "does not cover NUMA topology",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			opts := NewCPUSetPartitionViewOptionsWithState(
+				nil, dynamicConf, topology, CPUSetPartitionViewState{State: tt.state}, true)
+			if opts.HardPartitionTargetError == nil ||
+				!strings.Contains(opts.HardPartitionTargetError.Error(), tt.want) {
+				t.Fatalf("error = %v, want substring %q", opts.HardPartitionTargetError, tt.want)
+			}
+		})
+	}
+}
+
+func TestNewCPUSetPartitionViewOptionsHandlesEligibleCapacityCornerCases(t *testing.T) {
+	t.Parallel()
+
+	topology := testTwoNUMASMTTopology()
+	dynamicConf := dynamicconfig.NewDynamicAgentConfiguration().GetDynamicConfiguration()
+	dynamicConf.EnableReclaim = true
+	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.EnableRampUpReclaimHardPartition = true
+	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.InitialRampUpReclaimCPUSetRatio = 0.5
+
+	t.Run("less than one complete core resolves to zero", func(t *testing.T) {
+		t.Parallel()
+		state := cpustate.NewCPUPluginState(topology)
+		machineState := state.GetMachineState()
+		machineState[0].DefaultCPUSet = machine.NewCPUSet(0)
+		machineState[0].AllocatedCPUSet = machine.NewCPUSet(1, 2, 3)
+		state.SetMachineState(machineState)
+
+		opts := NewCPUSetPartitionViewOptionsWithState(
+			nil, dynamicConf, topology, CPUSetPartitionViewState{State: state}, true)
+		if opts.HardPartitionTargetError != nil {
+			t.Fatalf("NewCPUSetPartitionViewOptions() error = %v", opts.HardPartitionTargetError)
+		}
+		if got := opts.HardPartitionReclaimTargetPerNUMA[0]; got != 0 {
+			t.Fatalf("NUMA 0 target = %d, want 0 when only one SMT sibling is eligible", got)
+		}
+		if got := opts.HardPartitionReclaimTargetPerNUMA[1]; got != 2 {
+			t.Fatalf("NUMA 1 target = %d, want one complete physical core", got)
+		}
+	})
+
+	t.Run("reserved CPUs are deducted only when eligible", func(t *testing.T) {
+		t.Parallel()
+		state := cpustate.NewCPUPluginState(topology)
+		opts := NewCPUSetPartitionViewOptionsWithState(
+			nil, dynamicConf, topology, CPUSetPartitionViewState{
+				State:        state,
+				ReservedCPUs: machine.NewCPUSet(0, 4, 99),
+			}, true)
+		if opts.HardPartitionTargetError != nil {
+			t.Fatalf("NewCPUSetPartitionViewOptions() error = %v", opts.HardPartitionTargetError)
+		}
+		if got := opts.HardPartitionReclaimTargetPerNUMA[0]; got != 2 {
+			t.Fatalf("NUMA 0 target = %d, want 2 after deducting one eligible sibling", got)
+		}
+		if got := opts.HardPartitionReclaimTargetPerNUMA[1]; got != 2 {
+			t.Fatalf("NUMA 1 target = %d, want 2 after deducting one eligible sibling", got)
+		}
+	})
+
+	t.Run("cross NUMA machine state is rejected", func(t *testing.T) {
+		t.Parallel()
+		state := cpustate.NewCPUPluginState(topology)
+		machineState := state.GetMachineState()
+		machineState[0].DefaultCPUSet.Add(4)
+		state.SetMachineState(machineState)
+
+		opts := NewCPUSetPartitionViewOptionsWithState(
+			nil, dynamicConf, topology, CPUSetPartitionViewState{State: state}, true)
+		if opts.HardPartitionTargetError == nil ||
+			!strings.Contains(opts.HardPartitionTargetError.Error(), "outside NUMA topology: 4") {
+			t.Fatalf("error = %v, want cross-NUMA machine-state error", opts.HardPartitionTargetError)
+		}
+	})
+}
+
+func TestNewCPUSetPartitionViewOptionsDoesNotRequireStateWhenHardPartitionInactive(t *testing.T) {
+	t.Parallel()
+
+	topology := testTwoNUMATopology()
+	dynamicConf := dynamicconfig.NewDynamicAgentConfiguration().GetDynamicConfiguration()
+	dynamicConf.EnableReclaim = true
+	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.EnableRampUpReclaimHardPartition = true
+
+	opts := NewCPUSetPartitionViewOptionsWithState(
+		nil, dynamicConf, topology, CPUSetPartitionViewState{}, false)
+	if opts.HardPartitionTargetError != nil {
+		t.Fatalf("inactive hard partition unexpectedly resolved state: %v", opts.HardPartitionTargetError)
+	}
+	if opts.HardPartitionEnabled {
+		t.Fatal("hard partition must stay inactive")
+	}
+}
+
+func TestNewCPUSetPartitionViewOptionsRequiresTopologyWhenHardPartitionActive(t *testing.T) {
+	t.Parallel()
+
+	dynamicConf := dynamicconfig.NewDynamicAgentConfiguration().GetDynamicConfiguration()
+	dynamicConf.EnableReclaim = true
+	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.EnableRampUpReclaimHardPartition = true
+
+	opts := NewCPUSetPartitionViewOptionsWithState(
+		nil, dynamicConf, nil, CPUSetPartitionViewState{
+			State: cpustate.NewCPUPluginState(nil),
+		}, true)
+	if opts.HardPartitionTargetError == nil ||
+		!strings.Contains(opts.HardPartitionTargetError.Error(), "missing topology") {
+		t.Fatalf("error = %v, want missing-topology error", opts.HardPartitionTargetError)
+	}
+}
+
+func TestBuildValidatedCPUSetPartitionViewRejectsNilStateForHardPartition(t *testing.T) {
+	t.Parallel()
+
+	_, err := BuildValidatedCPUSetPartitionView(nil, testTwoNUMATopology(), CPUSetPartitionViewOptions{
+		HardPartitionEnabled:              true,
+		HardPartitionReclaimTargetPerNUMA: map[int]int{0: 2, 1: 2},
+	})
+	if err == nil || !strings.Contains(err.Error(), "missing state") {
+		t.Fatalf("error = %v, want missing-state error", err)
 	}
 }
 
@@ -866,6 +1108,25 @@ func testTwoNUMATopology() *machine.CPUTopology {
 			5: {NUMANodeID: 1, SocketID: 1, CoreID: 5},
 			6: {NUMANodeID: 1, SocketID: 1, CoreID: 6},
 			7: {NUMANodeID: 1, SocketID: 1, CoreID: 7},
+		},
+	}
+}
+
+func testTwoNUMASMTTopology() *machine.CPUTopology {
+	return &machine.CPUTopology{
+		NumCPUs:      8,
+		NumCores:     4,
+		NumSockets:   2,
+		NumNUMANodes: 2,
+		CPUDetails: machine.CPUDetails{
+			0: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
+			1: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
+			2: {NUMANodeID: 0, SocketID: 0, CoreID: 1},
+			3: {NUMANodeID: 0, SocketID: 0, CoreID: 1},
+			4: {NUMANodeID: 1, SocketID: 1, CoreID: 2},
+			5: {NUMANodeID: 1, SocketID: 1, CoreID: 2},
+			6: {NUMANodeID: 1, SocketID: 1, CoreID: 3},
+			7: {NUMANodeID: 1, SocketID: 1, CoreID: 3},
 		},
 	}
 }
