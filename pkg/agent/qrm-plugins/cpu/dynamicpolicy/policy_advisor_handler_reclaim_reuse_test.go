@@ -23,6 +23,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
@@ -106,6 +107,153 @@ func TestSyncReclaimPoolWithAdjustmentCommitOverride(t *testing.T) {
 	require.True(t, got.OriginalAllocationResult.Equals(machine.NewCPUSet(2, 3)))
 	require.NotEmpty(t, got.TopologyAwareAssignments)
 	require.NotEmpty(t, got.OriginalTopologyAwareAssignments)
+}
+
+func TestSyncReclaimPoolWithAdjustmentCommitOverrideAlsoSyncsDefaultShare(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+
+	allCPUs := p.machineInfo.CPUDetails.CPUs()
+	eligibleCPUs := allCPUs.Difference(p.reservedCPUs)
+	newEntries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult:         machine.NewCPUSet(0, 1),
+				OriginalAllocationResult: machine.NewCPUSet(0, 1),
+			},
+		},
+		commonstate.PoolNameShare: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+				AllocationResult:         eligibleCPUs.Difference(machine.NewCPUSet(0, 1)),
+				OriginalAllocationResult: eligibleCPUs.Difference(machine.NewCPUSet(0, 1)),
+			},
+		},
+	}
+	override := &cpusetutil.CPUSetAdjustmentCommitOverride{
+		ReclaimEffective: machine.NewCPUSet(2, 3),
+		Source:           "cpuset_topology",
+	}
+
+	require.NoError(t, p.syncReclaimPoolWithAdjustmentCommitOverride(newEntries, override))
+
+	share := newEntries[commonstate.PoolNameShare][commonstate.FakedContainerName]
+	require.NotNil(t, share)
+	require.True(t, share.AllocationResult.Equals(eligibleCPUs.Difference(machine.NewCPUSet(2, 3))),
+		"default share must track the residual after reclaim override, got %s", share.AllocationResult)
+	require.True(t, share.OriginalAllocationResult.Equals(share.AllocationResult))
+	require.NotEmpty(t, share.TopologyAwareAssignments)
+}
+
+func TestReclaimCommitOverrideSyncsOwnerAllocationsBeforePrecommit(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+
+	eligible := p.machineInfo.CPUDetails.CPUs().Difference(p.reservedCPUs)
+	initialReclaim := machine.NewCPUSet(0, 1, 24, 25)
+	finalReclaim := machine.NewCPUSet(2, 3, 26, 27)
+	initialShare := eligible.Difference(initialReclaim)
+	entries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult:         initialReclaim.Clone(),
+				OriginalAllocationResult: initialReclaim.Clone(),
+			},
+		},
+		commonstate.PoolNameShare: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+				AllocationResult:         initialShare.Clone(),
+				OriginalAllocationResult: initialShare.Clone(),
+			},
+		},
+		"reclaimed": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "reclaimed",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameReclaim,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelReclaimedCores,
+				},
+				AllocationResult:         machine.NewCPUSet(24, 25),
+				OriginalAllocationResult: machine.NewCPUSet(24, 25),
+			},
+		},
+		"rnb": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "rnb",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameReclaim,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelReclaimedCores,
+					Annotations: map[string]string{
+						apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+					},
+				},
+				AllocationResult:         machine.NewCPUSet(0, 1),
+				OriginalAllocationResult: machine.NewCPUSet(0, 1),
+			},
+		},
+		"shared": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "shared",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameShare,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+				},
+				AllocationResult:         initialShare.Clone(),
+				OriginalAllocationResult: initialShare.Clone(),
+			},
+		},
+	}
+	entries["rnb"]["main"].SetSpecifiedNUMABindingNUMAID([]uint64{0})
+
+	require.NoError(t, p.syncReclaimPoolWithAdjustmentCommitOverride(
+		entries,
+		&cpusetutil.CPUSetAdjustmentCommitOverride{
+			ReclaimEffective: finalReclaim,
+			Source:           "cpuset_topology",
+		},
+		eligible,
+	))
+
+	committed, _, err := p.commitPendingCPUPartition(pendingCPUPartition{
+		expectedRevision: p.state.GetRevision(),
+		entries:          entries,
+		persist:          false,
+		source:           "reclaim override test",
+	})
+	require.NoError(t, err)
+
+	assertAllocation := func(allocation *state.AllocationInfo, expected machine.CPUSet) {
+		t.Helper()
+		require.NotNil(t, allocation)
+		require.True(t, allocation.AllocationResult.Equals(expected))
+		require.True(t, allocation.OriginalAllocationResult.Equals(expected))
+		expectedAssignments, assignmentErr := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, expected)
+		require.NoError(t, assignmentErr)
+		require.True(t, cpuAssignmentsEqual(allocation.TopologyAwareAssignments, expectedAssignments))
+		require.True(t, cpuAssignmentsEqual(allocation.OriginalTopologyAwareAssignments, expectedAssignments))
+	}
+
+	finalShare := eligible.Difference(finalReclaim)
+	assertAllocation(committed[commonstate.PoolNameReclaim].GetPoolEntry(), finalReclaim)
+	assertAllocation(committed[commonstate.PoolNameShare].GetPoolEntry(), finalShare)
+	assertAllocation(committed["rnb"]["main"], machine.NewCPUSet(2, 3))
+	assertAllocation(committed["reclaimed"]["main"], machine.NewCPUSet(26, 27))
+	assertAllocation(committed["shared"]["main"], finalShare)
+	require.Equal(t, commonstate.PoolNameReclaim, committed["rnb"]["main"].GetOwnerPoolName())
+	require.Equal(t, commonstate.PoolNameReclaim, committed["reclaimed"]["main"].GetOwnerPoolName())
+	require.Equal(t, commonstate.PoolNameShare, committed["shared"]["main"].GetOwnerPoolName())
 }
 
 func TestSyncReclaimPoolWithAdjustmentCommitOverrideNoopWhenEmpty(t *testing.T) {

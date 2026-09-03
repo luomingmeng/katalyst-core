@@ -96,7 +96,8 @@ var policyTestMutex = advisorTestMutex
 
 type storeFailureState struct {
 	state.State
-	err error
+	err        error
+	storeCalls int
 }
 
 type releaseTrackingAccompanyPlugin struct {
@@ -163,6 +164,7 @@ func (c *removePodTrackingAdvisorClient) RemovePod(
 }
 
 func (s *storeFailureState) StoreState() error {
+	s.storeCalls++
 	return s.err
 }
 
@@ -515,7 +517,79 @@ func TestCleanPoolsFromPodEntries(t *testing.T) {
 	require.Contains(t, legacyEntries, canonicalPool)
 }
 
-func TestPodDeletionCleansUnownedPoolsBeforeAdjustment(t *testing.T) {
+func TestAdjustAllocationEntriesCleansOrphanInSingleDurableRevision(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	stateDir := t.TempDir()
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, stateDir)
+	require.NoError(t, err)
+
+	const (
+		podUID   = "orphan-owner"
+		poolName = "share-NUMA0"
+	)
+	poolCPUs := machine.NewCPUSet(2, 3)
+	initialEntries := state.PodEntries{
+		poolName: {
+			commonstate.FakedContainerName: {
+				AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(poolName),
+				AllocationResult:         poolCPUs.Clone(),
+				OriginalAllocationResult: poolCPUs.Clone(),
+			},
+		},
+		podUID: {
+			"main": {
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        podUID,
+					ContainerName: "main",
+					OwnerPoolName: poolName,
+					QoSLevel:      consts.PodAnnotationQoSLevelSharedCores,
+				},
+				AllocationResult:         poolCPUs.Clone(),
+				OriginalAllocationResult: poolCPUs.Clone(),
+			},
+		},
+	}
+	initialMachineState, err := generateMachineStateFromPodEntries(
+		topology, initialEntries, policy.state.GetMachineState())
+	require.NoError(t, err)
+	require.NoError(t, policy.state.CommitAdvisorState(
+		initialEntries, initialMachineState, false, false, true))
+	initialRevision := policy.state.GetRevision()
+
+	candidate := initialEntries.Clone()
+	delete(candidate, podUID)
+	commit := func() error {
+		return policy.adjustAllocationEntriesAtRevision(
+			candidate.Clone(), initialMachineState, true, initialRevision)
+	}
+
+	require.NoError(t, os.RemoveAll(stateDir))
+	require.NoError(t, os.WriteFile(stateDir, []byte("block checkpoint directory"), 0o600))
+	require.Error(t, commit())
+	require.Equal(t, initialRevision, policy.state.GetRevision())
+	require.Equal(t, initialEntries, policy.state.GetPodEntries(),
+		"checkpoint failure must roll back both owner removal and orphan cleanup")
+
+	require.NoError(t, os.Remove(stateDir))
+	require.NoError(t, os.MkdirAll(stateDir, 0o755))
+	require.NoError(t, commit())
+	require.Equal(t, initialRevision+1, policy.state.GetRevision(),
+		"owner removal and orphan cleanup must use one revision")
+	require.NotContains(t, policy.state.GetPodEntries(), podUID)
+	require.NotContains(t, policy.state.GetPodEntries(), poolName)
+
+	restarted, err := state.NewCheckpointState(
+		&statedirectory.StateDirectoryConfiguration{StateFileDirectory: stateDir},
+		cpuPluginStateFileName, cpuconsts.CPUResourcePluginPolicyNameDynamic,
+		topology, false, state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
+	require.NoError(t, err)
+	require.Equal(t, initialRevision+1, restarted.GetRevision())
+	require.NotContains(t, restarted.GetPodEntries(), podUID)
+	require.NotContains(t, restarted.GetPodEntries(), poolName)
+}
+
+func TestPodDeletionDefersUnownedPoolCleanupToAdjustmentBoundary(t *testing.T) {
 	policyTestMutex.Lock()
 	defer policyTestMutex.Unlock()
 	defer mockey.UnPatchAll()
@@ -551,18 +625,18 @@ func TestPodDeletionCleansUnownedPoolsBeforeAdjustment(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, policy.state.CommitAdvisorState(entries, machineState, false, false, true))
 
-	assertCleaned := func(entries state.PodEntries) {
+	assertCandidate := func(entries state.PodEntries) {
 		require.NotContains(t, entries, podUID)
-		require.NotContains(t, entries, poolName)
+		require.Contains(t, entries, poolName)
 	}
 
 	t.Run("explicit remove", func(t *testing.T) {
 		adjustErr := errors.New("stop after validating target entries")
-		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAtRevision).
+		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAfterDeletionAtRevision).
 			To(func(_ *DynamicPolicy, entries state.PodEntries, _ state.NUMANodeMap,
 				_ bool, _ uint64,
 			) error {
-				assertCleaned(entries)
+				assertCandidate(entries)
 				return adjustErr
 			}).Build()
 
@@ -575,12 +649,12 @@ func TestPodDeletionCleansUnownedPoolsBeforeAdjustment(t *testing.T) {
 		called := false
 		policy.residualHitMap = make(map[string]int64)
 		policy.residualHitMap[podUID] = maxResidualTime.Nanoseconds()/stateCheckPeriod.Nanoseconds() - 1
-		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAtRevision).
+		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAfterDeletionAtRevision).
 			To(func(_ *DynamicPolicy, entries state.PodEntries, _ state.NUMANodeMap,
 				_ bool, _ uint64,
 			) error {
 				called = true
-				assertCleaned(entries)
+				assertCandidate(entries)
 				return errors.New("stop after validating target entries")
 			}).Build()
 
@@ -623,7 +697,8 @@ func TestGetResourcesAllocationLegacyRampUpExcludesReclaimFloor(t *testing.T) {
 
 	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
 	require.NoError(t, err)
-	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	stateDir := t.TempDir()
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, stateDir)
 	require.NoError(t, err)
 	p.reservedCPUs = machine.NewCPUSet()
 	p.reservedReclaimedCPUSet = machine.NewCPUSet(0, 1)
@@ -662,6 +737,67 @@ func TestGetResourcesAllocationLegacyRampUpExcludesReclaimFloor(t *testing.T) {
 	require.True(t, allocation.RampUp)
 	require.Empty(t, allocation.AllocationResult.Intersection(machine.NewCPUSet(0, 1)).ToSliceInt(),
 		"legacy re-ramp-up allocation overlaps the hard reclaim floor: %s", allocation.AllocationResult)
+}
+
+func TestRollbackAllocationStateStoreFailureKeepsCurrentMemory(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	stateDir := t.TempDir()
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, stateDir)
+	require.NoError(t, err)
+
+	const (
+		podUID        = "rollback-store-failure"
+		containerName = "main"
+	)
+	snapshotEntries := state.PodEntries{
+		podUID: {
+			containerName: &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        podUID,
+					ContainerName: containerName,
+					OwnerPoolName: commonstate.PoolNameDedicated,
+					QoSLevel:      consts.PodAnnotationQoSLevelDedicatedCores,
+				},
+				AllocationResult: machine.NewCPUSet(1),
+				RequestQuantity:  1,
+			},
+		},
+	}
+	snapshotMachineState, err := generateMachineStateFromPodEntries(
+		cpuTopology, snapshotEntries, p.state.GetMachineState())
+	require.NoError(t, err)
+	require.NoError(t, p.state.CommitAdvisorState(
+		snapshotEntries, snapshotMachineState, false, false, true))
+	snapshot := allocationRollbackSnapshot{
+		revision:                p.state.GetRevision(),
+		podEntries:              snapshotEntries,
+		machineState:            snapshotMachineState,
+		allowOverlap:            false,
+		disableDedicatedOverlap: false,
+	}
+
+	currentEntries := snapshotEntries.Clone()
+	currentEntries[podUID][containerName].AllocationResult = machine.NewCPUSet(2)
+	currentMachineState, err := generateMachineStateFromPodEntries(
+		cpuTopology, currentEntries, p.state.GetMachineState())
+	require.NoError(t, err)
+	require.NoError(t, p.state.CommitAdvisorState(
+		currentEntries, currentMachineState, false, false, false))
+	require.NoError(t, os.RemoveAll(stateDir))
+	require.NoError(t, os.WriteFile(stateDir, []byte("block checkpoint directory"), 0o600))
+
+	err = p.rollbackAllocationState(&pluginapi.ResourceRequest{
+		PodUid:        podUID,
+		ContainerName: containerName,
+	}, snapshot)
+	require.Error(t, err)
+	allocation := p.state.GetAllocationInfo(podUID, containerName)
+	require.NotNil(t, allocation)
+	require.True(t, allocation.AllocationResult.Equals(machine.NewCPUSet(2)),
+		"failed rollback persistence must keep current in-memory state")
 }
 
 func TestSystemExclusivePoolSkipsNilAllocationInfo(t *testing.T) {
@@ -849,7 +985,7 @@ func TestRemovePodCommitsCanonicalStateAtomically(t *testing.T) {
 		return plugin
 	}
 
-	t.Run("quantity gate bypass persists deletion before accompany release", func(t *testing.T) {
+	t.Run("recovery persists deletion before accompany release", func(t *testing.T) {
 		defer mockey.UnPatchAll()
 		policy, stateDir, initialRevision, _ := newPolicy(t)
 		releasePlugin := newRegistry(t)
@@ -858,6 +994,8 @@ func TestRemovePodCommitsCanonicalStateAtomically(t *testing.T) {
 			gotRevision uint64
 		)
 		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAtRevision).
+			Return(gateErr).Build()
+		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesForRecoveryAtRevision).
 			To(func(_ *DynamicPolicy, entries state.PodEntries, machineState state.NUMANodeMap,
 				persist bool, expectedRevision uint64,
 			) error {
@@ -866,7 +1004,8 @@ func TestRemovePodCommitsCanonicalStateAtomically(t *testing.T) {
 				require.Equal(t, 0, releasePlugin.releaseCount)
 				gotPersist = persist
 				gotRevision = expectedRevision
-				return gateErr
+				return policy.state.CommitAdvisorStateIfRevision(
+					expectedRevision, entries, machineState, false, false, persist)
 			}).Build()
 
 		_, err := policy.RemovePod(context.Background(), &pluginapi.RemovePodRequest{PodUid: podUID})
@@ -886,7 +1025,7 @@ func TestRemovePodCommitsCanonicalStateAtomically(t *testing.T) {
 		require.NotContains(t, restarted.GetPodEntries(), podUID)
 	})
 
-	t.Run("non gate error preserves canonical state and accompany resource", func(t *testing.T) {
+	t.Run("recovery error preserves canonical state and accompany resource", func(t *testing.T) {
 		defer mockey.UnPatchAll()
 		policy, _, initialRevision, initialMachineState := newPolicy(t)
 		releasePlugin := newRegistry(t)
@@ -918,6 +1057,66 @@ func TestRemovePodCommitsCanonicalStateAtomically(t *testing.T) {
 		require.Equal(t, 0, releasePlugin.releaseCount)
 	})
 
+	t.Run("real checkpoint failure is retryable without post CAS admission", func(t *testing.T) {
+		defer mockey.UnPatchAll()
+		policy, stateDir, initialRevision, initialMachineState := newPolicy(t)
+		releasePlugin := newRegistry(t)
+		advisorClient := &removePodTrackingAdvisorClient{}
+		policy.enableCPUAdvisor = true
+		policy.advisorClient = advisorClient
+
+		handlerCalls := 0
+		policy.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+			"must-not-run": func(context.Context, dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
+				handlerCalls++
+				return errors.New("admission handler must not run during recovery")
+			},
+		}
+		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAtRevision).
+			Return(gateErr).Build()
+
+		require.NoError(t, os.RemoveAll(stateDir))
+		require.NoError(t, os.WriteFile(stateDir, []byte("block checkpoint directory"), 0o600))
+
+		req := &pluginapi.RemovePodRequest{PodUid: podUID}
+		_, err := policy.RemovePod(context.Background(), req)
+		require.Error(t, err)
+		require.Contains(t, policy.state.GetPodEntries(), podUID)
+		require.True(t, reflect.DeepEqual(initialMachineState, policy.state.GetMachineState()))
+		require.Equal(t, initialRevision, policy.state.GetRevision())
+		require.Equal(t, 1, advisorClient.removePodCount)
+		require.Zero(t, releasePlugin.releaseCount)
+		require.Zero(t, handlerCalls)
+		require.False(t, policy.cpuSetAdjustmentRetryQueued)
+		require.False(t, policy.cpuSetAdjustmentRetryAgain)
+		require.False(t, policy.cpuSetAdjustmentRetryDirty)
+
+		require.NoError(t, os.Remove(stateDir))
+		require.NoError(t, os.MkdirAll(stateDir, 0o755))
+
+		_, err = policy.RemovePod(context.Background(), req)
+		require.NoError(t, err)
+		require.NotContains(t, policy.state.GetPodEntries(), podUID)
+		require.Equal(t, initialRevision+1, policy.state.GetRevision())
+		require.Equal(t, 2, advisorClient.removePodCount)
+		require.Equal(t, 1, releasePlugin.releaseCount)
+		require.Zero(t, handlerCalls)
+		require.False(t, policy.cpuSetAdjustmentRetryQueued)
+		require.False(t, policy.cpuSetAdjustmentRetryAgain)
+		require.True(t, policy.cpuSetAdjustmentRetryDirty)
+		require.Contains(t, policy.cpuSetAdjustmentRetryReasons, dynamicpolicyutil.RetryReasonRecoveryCommit)
+
+		restarted, err := state.NewCheckpointState(
+			&statedirectory.StateDirectoryConfiguration{StateFileDirectory: stateDir},
+			cpuPluginStateFileName, cpuconsts.CPUResourcePluginPolicyNameDynamic,
+			policy.machineInfo.CPUTopology, false,
+			state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
+		require.NoError(t, err)
+		require.NotContains(t, restarted.GetPodEntries(), podUID)
+		require.Equal(t, initialRevision+1, restarted.GetRevision())
+		require.True(t, reflect.DeepEqual(policy.state.GetMachineState(), restarted.GetMachineState()))
+	})
+
 	t.Run("release failure retries without repeating state or advisor transaction", func(t *testing.T) {
 		policy, _, initialRevision, _ := newPolicy(t)
 		releasePlugin := newRegistry(t)
@@ -942,6 +1141,147 @@ func TestRemovePodCommitsCanonicalStateAtomically(t *testing.T) {
 		require.Equal(t, 2, releasePlugin.releaseCount)
 		require.Equal(t, 1, advisorClient.removePodCount)
 	})
+}
+
+func TestRemovePodLastRNBExpandsNonRNBAndCleansOrphanInSingleRevision(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	stateDir := t.TempDir()
+	policy, err := getTestDynamicPolicyWithInitialization(topology, stateDir)
+	require.NoError(t, err)
+	policy.reservedCPUs = machine.NewCPUSet()
+	policy.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	policy.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+	policy.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+	policy.enableCPUAdvisor = true
+	policy.advisorClient = &advisorPoolTestClient{}
+	policy.advisorMonitor, err = timemonitor.NewTimeMonitor(
+		"advisor",
+		time.Second,
+		time.Minute,
+		time.Minute,
+		"advisor_unhealthy",
+		&metrics.DummyMetrics{},
+		1,
+		true,
+	)
+	require.NoError(t, err)
+
+	const (
+		removedPodUID = "last-rnb"
+		orphanPool    = "share-NUMA0"
+	)
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	numa1 := topology.CPUDetails.CPUsInNUMANodes(1)
+	allCPUs := numa0.Union(numa1)
+	initialEntries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: {
+				AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult:                 allCPUs.Clone(),
+				OriginalAllocationResult:         allCPUs.Clone(),
+				TopologyAwareAssignments:         map[int]machine.CPUSet{0: numa0.Clone(), 1: numa1.Clone()},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: numa0.Clone(), 1: numa1.Clone()},
+			},
+		},
+		commonstate.PoolNameShare: {
+			commonstate.FakedContainerName: {
+				AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+				AllocationResult:                 numa1.Clone(),
+				OriginalAllocationResult:         numa1.Clone(),
+				TopologyAwareAssignments:         map[int]machine.CPUSet{1: numa1.Clone()},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{1: numa1.Clone()},
+			},
+		},
+		orphanPool: {
+			commonstate.FakedContainerName: {
+				AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(orphanPool),
+				AllocationResult:                 numa0.Clone(),
+				OriginalAllocationResult:         numa0.Clone(),
+				TopologyAwareAssignments:         map[int]machine.CPUSet{0: numa0.Clone()},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: numa0.Clone()},
+			},
+		},
+		"non-rnb": {
+			"main": {
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "non-rnb",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameReclaim,
+					QoSLevel:      consts.PodAnnotationQoSLevelReclaimedCores,
+				},
+				RequestQuantity:                  float64(allCPUs.Size()),
+				AllocationResult:                 numa1.Clone(),
+				OriginalAllocationResult:         numa1.Clone(),
+				TopologyAwareAssignments:         map[int]machine.CPUSet{1: numa1.Clone()},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{1: numa1.Clone()},
+			},
+		},
+		removedPodUID: {
+			"rnb": {
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        removedPodUID,
+					ContainerName: "rnb",
+					OwnerPoolName: commonstate.PoolNameReclaim,
+					QoSLevel:      consts.PodAnnotationQoSLevelReclaimedCores,
+					Annotations: map[string]string{
+						consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+						cpuconsts.CPUStateAnnotationKeyNUMAHint:          "0",
+					},
+				},
+				RequestQuantity:                  float64(numa0.Size()),
+				AllocationResult:                 numa0.Clone(),
+				OriginalAllocationResult:         numa0.Clone(),
+				TopologyAwareAssignments:         map[int]machine.CPUSet{0: numa0.Clone()},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: numa0.Clone()},
+			},
+			"shared-owner": {
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        removedPodUID,
+					ContainerName: "shared-owner",
+					OwnerPoolName: orphanPool,
+					QoSLevel:      consts.PodAnnotationQoSLevelSharedCores,
+				},
+				RequestQuantity:                  float64(numa0.Size()),
+				AllocationResult:                 numa0.Clone(),
+				OriginalAllocationResult:         numa0.Clone(),
+				TopologyAwareAssignments:         map[int]machine.CPUSet{0: numa0.Clone()},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: numa0.Clone()},
+			},
+		},
+	}
+	initialMachineState, err := generateMachineStateFromPodEntries(
+		topology, initialEntries, policy.state.GetMachineState())
+	require.NoError(t, err)
+	require.NoError(t, policy.state.CommitAdvisorState(
+		initialEntries, initialMachineState, false, false, true))
+	initialRevision := policy.state.GetRevision()
+
+	_, err = policy.RemovePod(context.Background(), &pluginapi.RemovePodRequest{PodUid: removedPodUID})
+	require.NoError(t, err)
+	require.Equal(t, initialRevision+1, policy.state.GetRevision(),
+		"pod removal, non-RNB expansion, orphan cleanup, and share deletion must share one durable revision")
+	require.NotContains(t, policy.state.GetPodEntries(), removedPodUID)
+	require.NotContains(t, policy.state.GetPodEntries(), orphanPool)
+	require.NotContains(t, policy.state.GetPodEntries(), commonstate.PoolNameShare,
+		"recovery must delete stale positive-advice share when no residual remains")
+	got := policy.state.GetAllocationInfo("non-rnb", "main").AllocationResult
+	require.True(t, got.Equals(allCPUs),
+		"non-RNB allocation must expand across all eligible CPUs after deleting the last RNB, got %s", got)
+
+	restarted, err := state.NewCheckpointState(
+		&statedirectory.StateDirectoryConfiguration{StateFileDirectory: stateDir},
+		cpuPluginStateFileName, cpuconsts.CPUResourcePluginPolicyNameDynamic,
+		topology, false, state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
+	require.NoError(t, err)
+	require.Equal(t, initialRevision+1, restarted.GetRevision())
+	require.NotContains(t, restarted.GetPodEntries(), removedPodUID)
+	require.NotContains(t, restarted.GetPodEntries(), orphanPool)
+	require.NotContains(t, restarted.GetPodEntries(), commonstate.PoolNameShare)
+	restartedAllocation := restarted.GetAllocationInfo("non-rnb", "main")
+	require.NotNil(t, restartedAllocation)
+	require.True(t, restartedAllocation.AllocationResult.Equals(allCPUs))
+	require.True(t, reflect.DeepEqual(policy.state.GetMachineState(), restarted.GetMachineState()))
 }
 
 func TestRemovePodLastOwnerBackfillsOrphanCPUsInSingleRevision(t *testing.T) {
@@ -2660,13 +3000,14 @@ func TestAllocateReturnsCheckpointFailure(t *testing.T) {
 
 	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
 	require.NoError(t, err)
-	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	stateDir := t.TempDir()
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, stateDir)
 	require.NoError(t, err)
-
-	p.state = &storeFailureState{
+	failingState := &storeFailureState{
 		State: p.state,
 		err:   fmt.Errorf("injected checkpoint failure"),
 	}
+	p.state = failingState
 	p.allocationHandlers[consts.PodAnnotationQoSLevelSharedCores] = func(
 		_ context.Context,
 		req *pluginapi.ResourceRequest,
@@ -2715,6 +3056,18 @@ func TestAllocateReturnsCheckpointFailure(t *testing.T) {
 	require.ErrorContains(t, err, "injected checkpoint failure")
 	require.Nil(t, p.state.GetAllocationInfo(req.PodUid, req.ContainerName),
 		"checkpoint failure must roll back the in-memory allocation")
+	require.True(t, p.state.GetMachineState()[0].AllocatedCPUSet.Intersection(machine.NewCPUSet(7)).IsEmpty(),
+		"checkpoint failure must remove the failed allocation from machine state")
+	require.Equal(t, 1, failingState.storeCalls,
+		"failed allocation persistence must be surfaced while rollback uses atomic state commit")
+
+	wantRestartEntries := p.state.GetPodEntries()
+	restarted, err := getTestDynamicPolicyWithoutInitialization(cpuTopology, stateDir)
+	require.NoError(t, err)
+	require.Equal(t, wantRestartEntries, restarted.state.GetPodEntries(),
+		"failed allocation rollback must persist the canonical state used by in-memory policy")
+	require.Nil(t, restarted.state.GetAllocationInfo(req.PodUid, req.ContainerName),
+		"failed allocation must not appear after restart")
 }
 
 func TestAllocateForPod(t *testing.T) {
@@ -7875,6 +8228,73 @@ func TestGetResourcesAllocationRetriesFailedRampUpCompletion(t *testing.T) {
 	state.SetReadWriteState(dynamicPolicy.state)
 }
 
+func TestGetResourcesAllocationCommitsMainAndSidecarRampUpExitTogether(t *testing.T) {
+	tmpDir, err := ioutil.TempDir("", "checkpoint-TestGetResourcesAllocationCommitsMainAndSidecarRampUpExitTogether")
+	require.NoError(t, err)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	require.NoError(t, err)
+	dynamicPolicy, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
+	require.NoError(t, err)
+	dynamicPolicy.transitionPeriod = 30 * time.Second
+
+	const (
+		podUID      = "ramp-up-exit-pod"
+		mainName    = "main"
+		sidecarName = "sidecar"
+	)
+	req := &pluginapi.ResourceRequest{
+		PodUid:         podUID,
+		PodNamespace:   "test",
+		PodName:        "test",
+		ContainerName:  mainName,
+		ContainerType:  pluginapi.ContainerType_MAIN,
+		ContainerIndex: 0,
+		ResourceName:   string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{
+			string(v1.ResourceCPU): 2,
+		},
+		Labels: map[string]string{
+			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+		},
+		Annotations: map[string]string{
+			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+		},
+	}
+	_, err = dynamicPolicy.Allocate(context.Background(), req)
+	require.NoError(t, err)
+
+	main := dynamicPolicy.state.GetAllocationInfo(podUID, mainName)
+	require.NotNil(t, main)
+	main.InitTimestamp = time.Now().Add(-31 * time.Second).Format(util.QRMTimeFormat)
+	dynamicPolicy.state.SetAllocationInfo(podUID, mainName, main, true)
+
+	sidecar := main.Clone()
+	sidecar.ContainerName = sidecarName
+	sidecar.ContainerType = pluginapi.ContainerType_SIDECAR.String()
+	sidecar.InitTimestamp = time.Now().Format(util.QRMTimeFormat)
+	dynamicPolicy.state.SetAllocationInfo(podUID, sidecarName, sidecar, true)
+	startRevision := dynamicPolicy.state.GetRevision()
+
+	_, err = dynamicPolicy.GetResourcesAllocation(context.Background(), &pluginapi.GetResourcesAllocationRequest{})
+	require.NoError(t, err)
+
+	main = dynamicPolicy.state.GetAllocationInfo(podUID, mainName)
+	sidecar = dynamicPolicy.state.GetAllocationInfo(podUID, sidecarName)
+	require.NotNil(t, main)
+	require.NotNil(t, sidecar)
+	require.False(t, main.RampUp)
+	require.False(t, sidecar.RampUp)
+	require.Equal(t, main.OwnerPoolName, sidecar.OwnerPoolName)
+	require.True(t, sidecar.AllocationResult.Equals(main.AllocationResult))
+	require.True(t, sidecar.OriginalAllocationResult.Equals(main.OriginalAllocationResult))
+	require.True(t, state.CheckAllocationInfoTopologyAwareAssignments(sidecar, main))
+	require.True(t, state.CheckAllocationInfoOriginTopologyAwareAssignments(sidecar, main))
+	require.Equal(t, startRevision+1, dynamicPolicy.state.GetRevision(),
+		"main, pool, and sidecar ramp-up exit must share one revision CAS")
+}
+
 func TestAllocateByQoSAwareServerListAndWatchResp(t *testing.T) {
 	t.Parallel()
 
@@ -9477,123 +9897,6 @@ func TestClearResidualStateTreatsFailedPodAsResidual(t *testing.T) {
 	dynamicPolicy.clearResidualState(nil, nil, nil, nil, nil)
 
 	as.Equal(int64(1), dynamicPolicy.residualHitMap[podUID])
-}
-
-func TestPersistResidualPodDeletionAfterAdjustFailure(t *testing.T) {
-	t.Parallel()
-
-	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
-	require.NoError(t, err)
-
-	const stalePodUID = "stale-pod-uid"
-	initialPodEntries := state.PodEntries{
-		stalePodUID: {
-			"main": &state.AllocationInfo{
-				AllocationMeta: commonstate.AllocationMeta{
-					PodUid:        stalePodUID,
-					PodNamespace:  "platform",
-					PodName:       "stale-pod",
-					ContainerName: "main",
-					QoSLevel:      consts.PodAnnotationQoSLevelSharedCores,
-				},
-				AllocationResult: machine.NewCPUSet(1, 2),
-			},
-		},
-	}
-	seed, err := state.NewCheckpointState(
-		&statedirectory.StateDirectoryConfiguration{StateFileDirectory: t.TempDir()},
-		"residual-cleanup-seed", "test", cpuTopology, false,
-		state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
-	require.NoError(t, err)
-	initialMachineState, err := generateMachineStateFromPodEntries(
-		cpuTopology, initialPodEntries, seed.GetMachineState())
-	require.NoError(t, err)
-	cleanedPodEntries := initialPodEntries.Clone()
-	delete(cleanedPodEntries, stalePodUID)
-	cleanedMachineState, err := generateMachineStateFromPodEntries(
-		cpuTopology, cleanedPodEntries, initialMachineState)
-	require.NoError(t, err)
-	gateErr := fmt.Errorf("adjust failed: %w", &DefaultShareResidualQuantityError{
-		AdvisedQuantity: 19,
-		ResidualSize:    80,
-	})
-
-	t.Run("durable cleanup survives restart and preserves overlap flags", func(t *testing.T) {
-		stateDir := t.TempDir()
-		stateConfig := &statedirectory.StateDirectoryConfiguration{StateFileDirectory: stateDir}
-		first, err := state.NewCheckpointState(
-			stateConfig, "residual-cleanup", "test", cpuTopology, false,
-			state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
-		require.NoError(t, err)
-		require.NoError(t, first.CommitAdvisorState(
-			initialPodEntries, initialMachineState, true, true, true))
-		expectedRevision := first.GetRevision()
-
-		dynamicPolicy := &DynamicPolicy{state: first}
-		require.NoError(t, dynamicPolicy.persistPodDeletionAfterAdjustFailure(
-			gateErr, cleanedPodEntries, cleanedMachineState, expectedRevision))
-
-		restarted, err := state.NewCheckpointState(
-			stateConfig, "residual-cleanup", "test", cpuTopology, false,
-			state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
-		require.NoError(t, err)
-		require.NotContains(t, restarted.GetPodEntries(), stalePodUID)
-		require.True(t, restarted.GetAllowSharedCoresOverlapReclaimedCores())
-		require.True(t, restarted.GetDisableDedicatedCoresOverlapReclaimedCores())
-	})
-
-	t.Run("stale revision does not overwrite newer state", func(t *testing.T) {
-		current, err := state.NewCheckpointState(
-			&statedirectory.StateDirectoryConfiguration{StateFileDirectory: t.TempDir()},
-			"residual-cleanup-stale", "test", cpuTopology, false,
-			state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
-		require.NoError(t, err)
-		require.NoError(t, current.CommitAdvisorState(
-			initialPodEntries, initialMachineState, false, true, false))
-		expectedRevision := current.GetRevision()
-		current.SetAllocationInfo("newer-pod", "main", &state.AllocationInfo{
-			AllocationResult: machine.NewCPUSet(3),
-		}, false)
-
-		dynamicPolicy := &DynamicPolicy{state: current}
-		err = dynamicPolicy.persistPodDeletionAfterAdjustFailure(
-			gateErr, cleanedPodEntries, cleanedMachineState, expectedRevision)
-		require.ErrorIs(t, err, state.ErrStaleStateRevision)
-		require.NotNil(t, current.GetAllocationInfo("newer-pod", "main"))
-		require.Contains(t, current.GetPodEntries(), stalePodUID)
-		require.True(t, current.GetDisableDedicatedCoresOverlapReclaimedCores())
-	})
-
-	t.Run("non-target error does not commit cleanup", func(t *testing.T) {
-		current, err := state.NewCheckpointState(
-			&statedirectory.StateDirectoryConfiguration{StateFileDirectory: t.TempDir()},
-			"residual-cleanup-non-target", "test", cpuTopology, false,
-			state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
-		require.NoError(t, err)
-		require.NoError(t, current.CommitAdvisorState(
-			initialPodEntries, initialMachineState, true, false, false))
-		expectedRevision := current.GetRevision()
-		nonTargetErr := errors.New("unrelated adjustment failure")
-
-		dynamicPolicy := &DynamicPolicy{state: current}
-		err = dynamicPolicy.persistPodDeletionAfterAdjustFailure(
-			nonTargetErr, cleanedPodEntries, cleanedMachineState, expectedRevision)
-		require.ErrorIs(t, err, nonTargetErr)
-		require.Equal(t, expectedRevision, current.GetRevision())
-		require.Contains(t, current.GetPodEntries(), stalePodUID)
-		require.True(t, current.GetAllowSharedCoresOverlapReclaimedCores())
-		require.False(t, current.GetDisableDedicatedCoresOverlapReclaimedCores())
-	})
-
-	t.Run("error recognition does not depend on text", func(t *testing.T) {
-		require.True(t, errors.Is(gateErr, ErrDefaultShareResidualQuantityMismatch))
-		var typedErr *DefaultShareResidualQuantityError
-		require.True(t, errors.As(gateErr, &typedErr))
-		require.Equal(t, 19, typedErr.AdvisedQuantity)
-		require.Equal(t, 80, typedErr.ResidualSize)
-		require.False(t, isDefaultShareResidualQuantityGateError(
-			errors.New("default share quantity 19 is smaller than residual cpuset size 80")))
-	})
 }
 
 func TestStart(t *testing.T) {

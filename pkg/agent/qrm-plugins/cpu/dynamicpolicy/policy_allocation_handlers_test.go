@@ -23,6 +23,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -38,6 +39,7 @@ import (
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/accompanyresource"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	dynamicpolicyutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
@@ -2459,7 +2461,7 @@ func TestDynamicPolicyFinalizeDefaultShareEntryPrunesEmptyShareWhenZeroQuantity(
 		commonstate.PoolNameShare: {
 			commonstate.FakedContainerName: &state.AllocationInfo{
 				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
-				AllocationResult: machine.NewCPUSet(0, 1),
+				AllocationResult: machine.NewCPUSet(2, 3),
 			},
 		},
 		commonstate.PoolNameReclaim: {
@@ -2592,6 +2594,145 @@ func TestApplyPoolsAndIsolatedInfoReturnsStaleRevisionError(t *testing.T) {
 	require.Zero(t, guard.storeCalls)
 	require.True(t, reflect.DeepEqual(beforeEntries, p.state.GetPodEntries()),
 		"stale advisor result must not replace newer state")
+}
+
+func TestApplyPoolsAndIsolatedInfoUsesCandidateMachineStateForRNBTransitions(t *testing.T) {
+	t.Parallel()
+
+	newPolicyAndEntries := func(t *testing.T, withRNB bool) (*DynamicPolicy, state.PodEntries, machine.CPUSet, machine.CPUSet) {
+		t.Helper()
+
+		topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+		require.NoError(t, err)
+		p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+		require.NoError(t, err)
+		p.reservedCPUs = machine.NewCPUSet()
+		p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+
+		numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+		numa1 := topology.CPUDetails.CPUsInNUMANodes(1)
+		allCPUs := numa0.Union(numa1)
+		entries := state.PodEntries{
+			commonstate.PoolNameReclaim: {
+				commonstate.FakedContainerName: {
+					AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+					AllocationResult:                 allCPUs.Clone(),
+					OriginalAllocationResult:         allCPUs.Clone(),
+					TopologyAwareAssignments:         map[int]machine.CPUSet{0: numa0.Clone(), 1: numa1.Clone()},
+					OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: numa0.Clone(), 1: numa1.Clone()},
+				},
+			},
+			"non-rnb": {
+				"main": {
+					AllocationMeta: commonstate.AllocationMeta{
+						PodUid:        "non-rnb",
+						ContainerName: "main",
+						OwnerPoolName: commonstate.PoolNameReclaim,
+						QoSLevel:      apiconsts.PodAnnotationQoSLevelReclaimedCores,
+					},
+					AllocationResult:                 allCPUs.Clone(),
+					OriginalAllocationResult:         allCPUs.Clone(),
+					TopologyAwareAssignments:         map[int]machine.CPUSet{0: numa0.Clone(), 1: numa1.Clone()},
+					OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: numa0.Clone(), 1: numa1.Clone()},
+				},
+			},
+		}
+		if withRNB {
+			entries["rnb"] = state.ContainerEntries{
+				"main": {
+					AllocationMeta: commonstate.AllocationMeta{
+						PodUid:        "rnb",
+						ContainerName: "main",
+						OwnerPoolName: commonstate.PoolNameReclaim,
+						QoSLevel:      apiconsts.PodAnnotationQoSLevelReclaimedCores,
+						Annotations: map[string]string{
+							apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+							cpuconsts.CPUStateAnnotationKeyNUMAHint:             "0",
+						},
+					},
+					AllocationResult:                 numa0.Clone(),
+					OriginalAllocationResult:         numa0.Clone(),
+					TopologyAwareAssignments:         map[int]machine.CPUSet{0: numa0.Clone()},
+					OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: numa0.Clone()},
+				},
+			}
+			entries["non-rnb"]["main"].AllocationResult = numa1.Clone()
+			entries["non-rnb"]["main"].OriginalAllocationResult = numa1.Clone()
+			entries["non-rnb"]["main"].TopologyAwareAssignments = map[int]machine.CPUSet{1: numa1.Clone()}
+			entries["non-rnb"]["main"].OriginalTopologyAwareAssignments = map[int]machine.CPUSet{1: numa1.Clone()}
+		}
+		return p, entries, numa0, numa1
+	}
+
+	applyCandidate := func(t *testing.T, p *DynamicPolicy, entries state.PodEntries) error {
+		t.Helper()
+
+		candidateMachineState, err := generateMachineStateFromPodEntries(
+			p.machineInfo.CPUTopology, entries, p.state.GetMachineState())
+		require.NoError(t, err)
+		return p.applyPoolsAndIsolatedInfo(
+			map[string]machine.CPUSet{
+				commonstate.PoolNameReclaim: p.machineInfo.CPUDetails.CPUs(),
+			},
+			map[string]map[string]machine.CPUSet{},
+			entries,
+			candidateMachineState,
+			sets.NewInt(),
+			false,
+			machine.NewCPUSet(),
+			defaultShareMaterializationPlan{},
+			p.state.GetRevision(),
+		)
+	}
+
+	t.Run("removing last RNB expands non-RNB to released NUMA", func(t *testing.T) {
+		p, initialEntries, numa0, numa1 := newPolicyAndEntries(t, true)
+		initialMachineState, err := generateMachineStateFromPodEntries(
+			p.machineInfo.CPUTopology, initialEntries, p.state.GetMachineState())
+		require.NoError(t, err)
+		require.NoError(t, p.state.CommitAdvisorState(initialEntries, initialMachineState, false, false, false))
+
+		candidate := initialEntries.Clone()
+		delete(candidate, "rnb")
+		require.NoError(t, applyCandidate(t, p, candidate))
+
+		got := p.state.GetAllocationInfo("non-rnb", "main").AllocationResult
+		require.True(t, got.Equals(numa0.Union(numa1)),
+			"non-RNB allocation must expand to the released NUMA, got %s", got)
+	})
+
+	t.Run("adding first RNB excludes its target NUMA from non-RNB", func(t *testing.T) {
+		p, initialEntries, numa0, numa1 := newPolicyAndEntries(t, false)
+		initialMachineState, err := generateMachineStateFromPodEntries(
+			p.machineInfo.CPUTopology, initialEntries, p.state.GetMachineState())
+		require.NoError(t, err)
+		require.NoError(t, p.state.CommitAdvisorState(initialEntries, initialMachineState, false, false, false))
+
+		candidate := initialEntries.Clone()
+		candidate["rnb"] = state.ContainerEntries{
+			"main": {
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "rnb",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameReclaim,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelReclaimedCores,
+					Annotations: map[string]string{
+						apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+						cpuconsts.CPUStateAnnotationKeyNUMAHint:             "0",
+					},
+				},
+				AllocationResult:                 numa0.Clone(),
+				OriginalAllocationResult:         numa0.Clone(),
+				TopologyAwareAssignments:         map[int]machine.CPUSet{0: numa0.Clone()},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: numa0.Clone()},
+			},
+		}
+		require.NoError(t, applyCandidate(t, p, candidate))
+
+		got := p.state.GetAllocationInfo("non-rnb", "main").AllocationResult
+		require.True(t, got.Equals(numa1),
+			"non-RNB allocation must exclude the new RNB target NUMA, got %s", got)
+	})
 }
 
 func applyPoolsAndIsolatedInfoForCommitTest(p *DynamicPolicy, persist bool) error {
@@ -3020,7 +3161,7 @@ func TestAdjustAllocationEntriesWithRampUpFloorKeepsCanonicalSNBCapacityErrorLow
 		},
 		AllocationResult:         machine.NewCPUSet(0, 1, 2, 3),
 		TopologyAwareAssignments: map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1, 2, 3)},
-		RequestQuantity:          4,
+		RequestQuantity:          6,
 	}, false)
 
 	req := &pluginapi.ResourceRequest{
@@ -3801,6 +3942,86 @@ func newDedicatedNUMAExclusiveFailureFixtureInDir(
 	return p, req
 }
 
+func TestAllocateDedicatedNUMAExclusiveAdjustmentRollbackStoreFailureKeepsCanonicalMemoryAndDisk(t *testing.T) {
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	stateDir := t.TempDir()
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, stateDir)
+	require.NoError(t, err)
+	wantDiskEntries := p.state.GetPodEntries()
+	p.reservedCPUs = machine.NewCPUSet()
+	p.reservedReclaimedCPUSet = machine.NewCPUSet()
+	p.reservedReclaimedCPUsSize = 0
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.25
+
+	const podUID = "exclusive-dnb-rollback-store-failure"
+	failingState := &storeFailureState{
+		State: p.state,
+		err:   errors.New("injected DNB rollback checkpoint failure"),
+	}
+	p.state = failingState
+	failedCandidateCPUs := machine.NewCPUSet()
+	restoreAttempted := make(chan struct{}, 1)
+	p.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+		"failing": func(_ context.Context, in dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
+			if in.Mode == dynamicpolicyutil.CPUSetAdjustmentModeAdmission {
+				failedCandidate := in.State.GetAllocationInfo(podUID, "main")
+				if failedCandidate != nil {
+					failedCandidateCPUs = failedCandidate.AllocationResult.Clone()
+				}
+				return errors.New("injected DNB adjustment failure")
+			}
+			restoreAttempted <- struct{}{}
+			return nil
+		},
+	}
+
+	req := &pluginapi.ResourceRequest{
+		PodUid: podUID, PodNamespace: "default", PodName: podUID, ContainerName: "main",
+		ContainerType: pluginapi.ContainerType_MAIN, ResourceName: string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{string(v1.ResourceCPU): 2},
+		Labels: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+		},
+		Annotations: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey:          apiconsts.PodAnnotationQoSLevelDedicatedCores,
+			apiconsts.PodAnnotationMemoryEnhancementKey: `{"numa_binding":"true","numa_exclusive":"true"}`,
+		},
+		Hint: &pluginapi.TopologyHint{Nodes: []uint64{0}},
+	}
+	p.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{{
+		ObjectMeta: metav1.ObjectMeta{
+			UID: types.UID(req.PodUid), Namespace: req.PodNamespace, Name: req.PodName,
+		},
+	}}}
+
+	resp, err := p.Allocate(context.Background(), req)
+	require.Nil(t, resp)
+	require.ErrorContains(t, err, "injected DNB adjustment failure")
+	require.ErrorContains(t, err, "injected DNB rollback checkpoint failure")
+	select {
+	case <-restoreAttempted:
+	default:
+		t.Fatal("successful state rollback must attempt Retry-mode cgroup restore even when rollback persistence fails")
+	}
+	require.Nil(t, p.state.GetAllocationInfo(req.PodUid, req.ContainerName),
+		"rollback persistence failure must not resurrect the failed DNB allocation in memory")
+	require.False(t, failedCandidateCPUs.IsEmpty())
+	require.True(t, p.state.GetMachineState()[0].AllocatedCPUSet.Intersection(failedCandidateCPUs).IsEmpty(),
+		"rollback persistence failure must remove failed DNB CPUs from machine state")
+	require.Equal(t, 1, failingState.storeCalls,
+		"Allocate finalization must make exactly one explicit StoreState attempt")
+
+	restarted, err := getTestDynamicPolicyWithoutInitialization(cpuTopology, stateDir)
+	require.NoError(t, err)
+	require.Equal(t, wantDiskEntries, restarted.state.GetPodEntries(),
+		"failed DNB rollback persistence must leave the old checkpoint unchanged")
+	require.Nil(t, restarted.state.GetAllocationInfo(req.PodUid, req.ContainerName),
+		"failed DNB allocation must not appear after restart")
+}
+
 func TestAllocateDedicatedNUMAExclusiveAdjustmentFailureDoesNotRollbackNewerState(t *testing.T) {
 	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
 	require.NoError(t, err)
@@ -4204,9 +4425,12 @@ func TestAllocateDedicatedNUMAExclusiveRestoreFailureMarksDirtyAndSchedulesBound
 		p.cpuSetAdjustmentRetryMu.Lock()
 		queued := p.cpuSetAdjustmentRetryQueued
 		dirty := p.cpuSetAdjustmentRetryDirty
+		_, hasRestoreFailedReason := p.cpuSetAdjustmentRetryReasons[dynamicpolicyutil.RetryReasonRestoreFailed]
 		p.cpuSetAdjustmentRetryMu.Unlock()
 		if !queued {
 			require.True(t, dirty, "bounded full retry exhaustion must leave latest-state reconciliation dirty")
+			require.True(t, hasRestoreFailedReason,
+				"restore failure must retain the restore-failed retry reason")
 			break
 		}
 		select {
@@ -5070,7 +5294,7 @@ func TestFinalizeDefaultShareEntryReadsPostReviseState(t *testing.T) {
 		"custom": {
 			commonstate.FakedContainerName: &state.AllocationInfo{
 				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta("custom"),
-				AllocationResult: machine.NewCPUSet(2),
+				AllocationResult: machine.NewCPUSet(6),
 			},
 		},
 		"pod": {
@@ -5087,10 +5311,10 @@ func TestFinalizeDefaultShareEntryReadsPostReviseState(t *testing.T) {
 	}
 	candidate := machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)
 
-	// residual = candidate - reclaim(0,1) - custom(2) - isolated(3) = {4,5,6,7}
+	// residual = candidate - reclaim(0,1) - custom(6) - isolated(3) = {2,4,5,7}
 	require.NoError(t, p.finalizeDefaultShareEntry(newPodEntries, newPodEntries, 4, candidate))
 	require.True(t, newPodEntries[commonstate.PoolNameShare][commonstate.FakedContainerName].
-		AllocationResult.Equals(machine.NewCPUSet(4, 5, 6, 7)))
+		AllocationResult.Equals(machine.NewCPUSet(2, 4, 5, 7)))
 	require.NotEmpty(t, newPodEntries[commonstate.PoolNameShare][commonstate.FakedContainerName].
 		TopologyAwareAssignments)
 
@@ -5098,7 +5322,7 @@ func TestFinalizeDefaultShareEntryReadsPostReviseState(t *testing.T) {
 	newPodEntries[commonstate.PoolNameReclaim][commonstate.FakedContainerName].AllocationResult = machine.NewCPUSet(0, 1, 4)
 	require.NoError(t, p.finalizeDefaultShareEntry(newPodEntries, newPodEntries, 3, candidate))
 	require.True(t, newPodEntries[commonstate.PoolNameShare][commonstate.FakedContainerName].
-		AllocationResult.Equals(machine.NewCPUSet(5, 6, 7)))
+		AllocationResult.Equals(machine.NewCPUSet(2, 5, 7)))
 
 	// fail-closed on quantity mismatch.
 	require.Error(t, p.finalizeDefaultShareEntry(newPodEntries, newPodEntries, 2, candidate))
@@ -5182,7 +5406,7 @@ func TestFinalizeDefaultShareEntryAllowsAdvisorShrinkLag(t *testing.T) {
 		AllocationResult.Equals(machine.NewCPUSet(2, 3, 4, 5, 6, 7)))
 }
 
-func TestFinalizeDefaultShareEntryHandlesEmptyResidualByLiveOwnership(t *testing.T) {
+func TestFinalizeDefaultShareEntryHandlesEmptyResidualByLiveOwnershipAndMode(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
@@ -5211,7 +5435,6 @@ func TestFinalizeDefaultShareEntryHandlesEmptyResidualByLiveOwnership(t *testing
 			},
 		}
 	}
-
 	t.Run("prunes ownerless stale share", func(t *testing.T) {
 		p := newPolicy(t)
 		entries := newEntries()
@@ -5284,6 +5507,15 @@ func TestFinalizeDefaultShareEntryHandlesEmptyResidualByLiveOwnership(t *testing
 		require.NoError(t, p.finalizeDefaultShareEntry(entries, entries, candidate.Size(), candidate))
 		require.NotContains(t, entries, commonstate.PoolNameShare)
 	})
+
+	t.Run("recovery deletes stale share despite positive advice", func(t *testing.T) {
+		p := newPolicy(t)
+		entries := newEntries()
+		err := p.finalizeDefaultShareEntryForMode(
+			entries, entries, 2, candidate, defaultShareMaterializationRecovery)
+		require.NoError(t, err)
+		require.NotContains(t, entries, commonstate.PoolNameShare)
+	})
 }
 
 func TestDedicatedCPUSetFromPodEntriesUsesFinalOwner(t *testing.T) {
@@ -5351,140 +5583,6 @@ func TestSupplementPodEntriesWithCurrentNonPoolKeepsPendingContainer(t *testing.
 	require.True(t, merged["pod-a"]["main"].AllocationResult.Equals(machine.NewCPUSet(2, 3)))
 	require.True(t, merged["pod-a"]["sidecar"].AllocationResult.Equals(machine.NewCPUSet(4)))
 	require.NotContains(t, merged, "stale-pool")
-}
-
-// TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorBackfillsDefaultShareResidual is an
-// entry-level integration test for the residual-backfill gate. It exercises the whole
-// adjustPoolsAndIsolatedEntriesWithRampUpFloor entry segment with
-// FillDefaultSharePoolWithNonReclaimCPUs enabled and a stale materialized share
-// quantity, covering the chain:
-//
-//	copyPoolQuantityMap -> gate branch extracts+deletes the default share quantity ->
-//	constructs the default share materialization plan -> groupAndAllocatePools (share pool absent) ->
-//	applyPoolsAndIsolatedInfo backfills newPodEntries[share] with the residual cpuset.
-//
-// It asserts the local rebuild derives the upper bound from the current eligible
-// CPUSet instead of treating the stale checkpoint share size as advisor advice.
-func TestAdjustPoolsAndIsolatedEntriesUsesEligibleDefaultShareUpperBoundAndExcludesDNB(t *testing.T) {
-	t.Parallel()
-
-	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
-	require.NoError(t, err)
-
-	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
-	require.NoError(t, err)
-
-	// deterministic allocation: no reserved cpus, reclaim enabled, overlap disabled
-	// (the backfill gate is mutually exclusive with overlap, see materializeDefaultShareCPUSet).
-	p.reservedCPUs = machine.NewCPUSet()
-	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
-	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
-
-	// open the residual-backfill gate.
-	p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
-
-	// seed a historical reclaim pool so takeCPUsForPoolsInPlaceWithPreferred pins the
-	// reclaim pool to one complete core deterministically, plus a non-binding
-	// shared_cores container that owns the default share pool so cleanPools keeps the
-	// backfilled entry, plus a DNB container whose allocation must remain outside the
-	// default-share residual. the seed is core-aligned (one whole core) because the
-	// tier layer now forces whole-core reclaim selection (invariant B').
-	reclaimSeed := coresInNUMA(topology, 0, 0, 1)
-	dnbCPUSet := coresInNUMA(topology, 0, 1, 2)
-	seedEntries := state.PodEntries{
-		commonstate.PoolNameReclaim: {
-			commonstate.FakedContainerName: &state.AllocationInfo{
-				AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
-				AllocationResult:                 reclaimSeed.Clone(),
-				OriginalAllocationResult:         reclaimSeed.Clone(),
-				TopologyAwareAssignments:         map[int]machine.CPUSet{0: reclaimSeed.Clone()},
-				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: reclaimSeed.Clone()},
-			},
-		},
-		"share-pod": {
-			"container": &state.AllocationInfo{
-				AllocationMeta: commonstate.AllocationMeta{
-					PodUid:        "share-pod",
-					PodNamespace:  "default",
-					PodName:       "share-pod",
-					ContainerName: "container",
-					OwnerPoolName: commonstate.PoolNameShare,
-					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
-				},
-				RequestQuantity: 6,
-			},
-		},
-		"dedicated-pod": {
-			"main": &state.AllocationInfo{
-				AllocationMeta: commonstate.AllocationMeta{
-					PodUid:        "dedicated-pod",
-					PodNamespace:  "default",
-					PodName:       "dedicated-pod",
-					ContainerName: "main",
-					OwnerPoolName: commonstate.PoolNameDedicated,
-					QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
-					Annotations: map[string]string{
-						apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
-					},
-				},
-				RequestQuantity:                  float64(dnbCPUSet.Size()),
-				AllocationResult:                 dnbCPUSet.Clone(),
-				OriginalAllocationResult:         dnbCPUSet.Clone(),
-				TopologyAwareAssignments:         map[int]machine.CPUSet{0: dnbCPUSet.Clone()},
-				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: dnbCPUSet.Clone()},
-			},
-		},
-	}
-	p.state.SetPodEntries(seedEntries, false)
-
-	// The checkpoint share quantity is stale and smaller than the current
-	// residual: candidate {0..7} minus reclaim {0,1} and DNB {2} = 5 cpus.
-	poolsQuantityMap := map[string]map[int]int{
-		commonstate.PoolNameShare: {
-			commonstate.FakedNUMAID: 1,
-		},
-		commonstate.PoolNameReclaim: {
-			commonstate.FakedNUMAID: 2,
-		},
-	}
-
-	err = p.adjustPoolsAndIsolatedEntriesWithRampUpFloor(
-		poolsQuantityMap,
-		map[string]map[string]int{},
-		p.state.GetPodEntries(),
-		p.state.GetMachineState(),
-		false,
-		machine.NewCPUSet(),
-		false,
-	)
-	require.NoError(t, err)
-
-	updatedEntries := p.state.GetPodEntries()
-
-	// reclaim pool stays pinned to its historical whole core.
-	reclaim, err := updatedEntries.GetCPUSetForPool(commonstate.PoolNameReclaim)
-	require.NoError(t, err)
-	require.True(t, reclaim.Equals(reclaimSeed), "reclaim=%s want=%s", reclaim, reclaimSeed)
-	requireCoreAligned(t, topology, reclaim)
-
-	// the default share pool entry is the backfilled residual = candidate - reclaim - DNB.
-	wantShare := topology.CPUDetails.CPUs().Difference(reclaimSeed).Difference(dnbCPUSet)
-	share, err := updatedEntries.GetCPUSetForPool(commonstate.PoolNameShare)
-	require.NoError(t, err)
-	require.True(t, share.Equals(wantShare),
-		"share=%s want=%s", share, wantShare)
-	require.True(t, share.Intersection(dnbCPUSet).IsEmpty())
-	requireCoreAligned(t, topology, share)
-
-	dnb := updatedEntries["dedicated-pod"]["main"]
-	require.NotNil(t, dnb)
-	require.True(t, dnb.AllocationResult.Equals(dnbCPUSet))
-
-	// the owning shared_cores container inherits the backfilled share cpuset.
-	owner := updatedEntries["share-pod"]["container"]
-	require.NotNil(t, owner)
-	require.True(t, owner.AllocationResult.Equals(share),
-		"owner=%s share=%s", owner.AllocationResult, share)
 }
 
 func TestAdjustPoolsAndIsolatedEntriesRejectsRevisionAdvancedBeforeApply(t *testing.T) {
@@ -5563,6 +5661,223 @@ func TestAdjustAllocationEntriesAtRevisionRejectsStateAdvancedAfterInputRead(t *
 		"stale calculation must not replace the concurrent state")
 }
 
+func TestAdjustAllocationEntriesForRecoveryPreservesLiveDefaultShareResidual(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+	p.enableCPUAdvisor = true
+	p.advisorMonitor, err = timemonitor.NewTimeMonitor(
+		"advisor", time.Second, time.Minute, time.Minute,
+		"advisor_unhealthy", &metrics.DummyMetrics{}, 1, true)
+	require.NoError(t, err)
+
+	reclaim := machine.NewCPUSet(0, 1)
+	entries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: {
+				AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult:         reclaim.Clone(),
+				OriginalAllocationResult: reclaim.Clone(),
+			},
+		},
+		commonstate.PoolNameShare: {
+			commonstate.FakedContainerName: {
+				AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+				AllocationResult:         machine.NewCPUSet(2),
+				OriginalAllocationResult: machine.NewCPUSet(2),
+			},
+		},
+	}
+	machineState, err := generateMachineStateFromPodEntries(
+		topology, entries, p.state.GetMachineState())
+	require.NoError(t, err)
+	require.NoError(t, p.state.CommitAdvisorState(entries, machineState, false, false, false))
+	trackingState := &applyPoolsCommitGuardState{State: p.state}
+	p.state = trackingState
+
+	err = p.adjustAllocationEntriesForRecoveryAtRevision(
+		entries, machineState, true, p.state.GetRevision())
+	require.NoError(t, err)
+	require.Equal(t, 1, trackingState.conditionalCalls)
+	require.True(t, trackingState.conditionalPersist,
+		"recovery outcome must follow a durable revision-CAS")
+
+	share, err := p.state.GetPodEntries().GetCPUSetForPool(commonstate.PoolNameShare)
+	require.NoError(t, err)
+	require.True(t, share.Equals(machine.NewCPUSet(2, 3, 4, 5, 6, 7)),
+		"recovery must preserve the live residual, got %s", share.String())
+}
+
+func TestAdjustAllocationEntriesForRecoveryMarksLatestStateRetry(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+	p.enableCPUAdvisor = true
+	p.advisorMonitor, err = timemonitor.NewTimeMonitor(
+		"advisor", time.Second, time.Minute, time.Minute,
+		"advisor_unhealthy", &metrics.DummyMetrics{}, 1, true)
+	require.NoError(t, err)
+
+	entries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: {
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(0, 1),
+			},
+		},
+		commonstate.PoolNameShare: {
+			commonstate.FakedContainerName: {
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+				AllocationResult: machine.NewCPUSet(2),
+			},
+		},
+	}
+	machineState, err := generateMachineStateFromPodEntries(
+		topology, entries, p.state.GetMachineState())
+	require.NoError(t, err)
+	require.NoError(t, p.state.CommitAdvisorState(entries, machineState, false, false, false))
+
+	handlerCalls := 0
+	p.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+		"must-not-run-inline": func(context.Context, dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
+			handlerCalls++
+			return nil
+		},
+	}
+
+	err = p.adjustAllocationEntriesForRecoveryAtRevision(
+		entries, machineState, true, p.state.GetRevision())
+	require.NoError(t, err)
+	require.Zero(t, handlerCalls,
+		"recovery commit must not run fallible cgroup handlers inline")
+	require.True(t, p.cpuSetAdjustmentRetryDirty,
+		"recovery commit must schedule latest-state convergence")
+	require.Contains(t, p.cpuSetAdjustmentRetryReasons, dynamicpolicyutil.RetryReasonRecoveryCommit)
+}
+
+func TestAdjustAllocationEntriesForRecoveryConcurrentCASHasSingleOutcome(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+	p.enableCPUAdvisor = true
+	p.advisorMonitor, err = timemonitor.NewTimeMonitor(
+		"advisor", time.Second, time.Minute, time.Minute,
+		"advisor_unhealthy", &metrics.DummyMetrics{}, 1, true)
+	require.NoError(t, err)
+
+	reclaim := machine.NewCPUSet(0, 1)
+	entries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: {
+				AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult:         reclaim.Clone(),
+				OriginalAllocationResult: reclaim.Clone(),
+			},
+		},
+		commonstate.PoolNameShare: {
+			commonstate.FakedContainerName: {
+				AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+				AllocationResult:         machine.NewCPUSet(2),
+				OriginalAllocationResult: machine.NewCPUSet(2),
+			},
+		},
+	}
+	machineState, err := generateMachineStateFromPodEntries(
+		topology, entries, p.state.GetMachineState())
+	require.NoError(t, err)
+	require.NoError(t, p.state.CommitAdvisorState(entries, machineState, false, false, false))
+	revision := p.state.GetRevision()
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			results <- p.adjustAllocationEntriesForRecoveryAtRevision(
+				entries, machineState, true, revision)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	var succeeded, stale int
+	for result := range results {
+		switch {
+		case result == nil:
+			succeeded++
+		case errors.Is(result, state.ErrStaleStateRevision):
+			stale++
+		default:
+			t.Fatalf("unexpected concurrent recovery error: %v", result)
+		}
+	}
+	require.Equal(t, 1, succeeded)
+	require.Equal(t, 1, stale)
+	require.Equal(t, revision+1, p.state.GetRevision())
+}
+
+func TestPreparePendingCPUPartitionAlwaysValidatesPoolOwnership(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = false
+
+	entries := p.state.GetPodEntries()
+	entries["shared-pod"] = state.ContainerEntries{
+		"main": {
+			AllocationMeta: commonstate.AllocationMeta{
+				PodUid:        "shared-pod",
+				PodNamespace:  "default",
+				PodName:       "shared-pod",
+				ContainerName: "main",
+				OwnerPoolName: "missing-share-pool",
+				QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+			},
+			AllocationResult:         machine.NewCPUSet(2, 3),
+			OriginalAllocationResult: machine.NewCPUSet(2, 3),
+		},
+	}
+
+	_, err = p.preparePendingCPUPartition(pendingCPUPartition{
+		expectedRevision: p.state.GetRevision(),
+		entries:          entries,
+		baseMachineState: p.state.GetMachineState(),
+		validate: func(state.PodEntries, state.NUMANodeMap, bool, bool) error {
+			return nil
+		},
+	})
+	require.ErrorContains(t, err,
+		`shared_cores allocation shared-pod/main owns missing pool "missing-share-pool"`)
+}
+
 func TestAdjustAllocationEntriesRejectsDefaultShareFallbackWithoutHealthyAdvisor(t *testing.T) {
 	t.Parallel()
 
@@ -5580,6 +5895,47 @@ func TestAdjustAllocationEntriesRejectsDefaultShareFallbackWithoutHealthyAdvisor
 		p.state.GetRevision(),
 	)
 	require.EqualError(t, err, "default share residual quantity requires a healthy cpu advisor")
+}
+
+func TestAdjustAllocationEntriesForRecoveryAllowsDefaultShareFallbackWithoutHealthyAdvisor(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+	p.enableCPUAdvisor = false
+	p.reservedCPUs = machine.NewCPUSet()
+	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+
+	entries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: {
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(0, 1),
+			},
+		},
+		commonstate.PoolNameShare: {
+			commonstate.FakedContainerName: {
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+				AllocationResult: machine.NewCPUSet(2),
+			},
+		},
+	}
+	machineState, err := generateMachineStateFromPodEntries(
+		topology, entries, p.state.GetMachineState())
+	require.NoError(t, err)
+	require.NoError(t, p.state.CommitAdvisorState(entries, machineState, false, false, false))
+
+	err = p.adjustAllocationEntriesForRecoveryAtRevision(
+		entries, machineState, true, p.state.GetRevision())
+	require.NoError(t, err)
+	share := p.state.GetAllocationInfo(commonstate.PoolNameShare, commonstate.FakedContainerName)
+	require.NotNil(t, share)
+	require.True(t, share.AllocationResult.Contains(6),
+		"recovery must preserve live default-share residual without requiring healthy advisor")
 }
 
 func TestAdjustPoolsAndIsolatedEntriesRejectsMixedDefaultShareNUMAQuantities(t *testing.T) {
@@ -5644,6 +6000,26 @@ func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorBackfillsDefaultShareResidu
 		"snbpool": {
 			commonstate.FakedContainerName: &state.AllocationInfo{
 				AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta("snbpool"),
+				AllocationResult:                 machine.NewCPUSet(4),
+				OriginalAllocationResult:         machine.NewCPUSet(4),
+				TopologyAwareAssignments:         map[int]machine.CPUSet{0: machine.NewCPUSet(4)},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: machine.NewCPUSet(4)},
+			},
+		},
+		"snb-pod": {
+			"container": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "snb-pod",
+					PodNamespace:  "default",
+					PodName:       "snb-pod",
+					ContainerName: "container",
+					OwnerPoolName: "snbpool",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+					Annotations: map[string]string{
+						apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+					},
+				},
+				RequestQuantity:                  1,
 				AllocationResult:                 machine.NewCPUSet(4),
 				OriginalAllocationResult:         machine.NewCPUSet(4),
 				TopologyAwareAssignments:         map[int]machine.CPUSet{0: machine.NewCPUSet(4)},

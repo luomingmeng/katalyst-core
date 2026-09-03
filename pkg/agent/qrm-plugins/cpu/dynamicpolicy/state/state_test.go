@@ -310,6 +310,48 @@ func TestCheckpointStateCommitAdvisorState(t *testing.T) {
 	})
 }
 
+func TestCheckpointStateCommitAdvisorStateRollsBackMemoryOnFilesystemFailure(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
+	require.NoError(t, err)
+	stateDir := t.TempDir()
+	config := &statedirectory.StateDirectoryConfiguration{StateFileDirectory: stateDir}
+	st, err := NewCheckpointState(
+		config, cpuPluginStateFileName, policyName, topology, false,
+		GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
+	require.NoError(t, err)
+
+	oldEntries := PodEntries{
+		"old": {
+			"main": &AllocationInfo{AllocationResult: machine.NewCPUSet(0)},
+		},
+	}
+	oldMachineState := NUMANodeMap{
+		0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(0)},
+	}
+	require.NoError(t, st.CommitAdvisorState(oldEntries, oldMachineState, false, false, true))
+	oldEntries = st.GetPodEntries()
+	oldMachineState = st.GetMachineState()
+	oldRevision := st.GetRevision()
+
+	require.NoError(t, os.RemoveAll(stateDir))
+	require.NoError(t, os.WriteFile(stateDir, []byte("not a directory"), 0o600))
+
+	err = st.CommitAdvisorStateIfRevision(
+		oldRevision,
+		PodEntries{"new": {"main": &AllocationInfo{AllocationResult: machine.NewCPUSet(1)}}},
+		NUMANodeMap{0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(1)}},
+		true,
+		true,
+		true,
+	)
+	require.Error(t, err)
+	require.Equal(t, oldEntries, st.GetPodEntries())
+	require.Equal(t, oldMachineState, st.GetMachineState())
+	require.False(t, st.GetAllowSharedCoresOverlapReclaimedCores())
+	require.False(t, st.GetDisableDedicatedCoresOverlapReclaimedCores())
+	require.Equal(t, oldRevision, st.GetRevision())
+}
+
 func TestCPUPluginStateRejectsRevisionOverflowWithoutMutation(t *testing.T) {
 	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
 	require.NoError(t, err)

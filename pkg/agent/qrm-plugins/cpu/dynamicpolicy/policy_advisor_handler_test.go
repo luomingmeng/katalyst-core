@@ -33,10 +33,12 @@ import (
 	v1 "k8s.io/api/core/v1"
 	resource2 "k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/sets"
+	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/advisorsvc"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
@@ -121,6 +123,49 @@ func TestAdvisorRequestHasActiveRampUp(t *testing.T) {
 		},
 	}
 	require.False(t, advisorRequestHasActiveRampUp(req))
+}
+
+func TestCreateGetAdviceRequestCopiesMainAnnotationsToNilSidecarAnnotations(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	const (
+		podUID      = "legacy-sidecar"
+		mainName    = "main"
+		sidecarName = "sidecar"
+		annoKey     = "legacy.annotation"
+		annoValue   = "enabled"
+	)
+	req, err := policy.createGetAdviceRequestFromSnapshot(state.PodEntries{
+		podUID: {
+			mainName: {
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        podUID,
+					ContainerName: mainName,
+					ContainerType: pluginapi.ContainerType_MAIN.String(),
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+					Annotations: map[string]string{
+						annoKey: annoValue,
+					},
+				},
+			},
+			sidecarName: {
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        podUID,
+					ContainerName: sidecarName,
+					ContainerType: pluginapi.ContainerType_SIDECAR.String(),
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+				},
+			},
+		},
+	}, policy.state.GetMachineState())
+	require.NoError(t, err)
+	require.Equal(t, annoValue,
+		req.Entries[podUID].Entries[sidecarName].Metadata.Annotations[annoKey])
 }
 
 func TestAllocateByCPUAdvisorRejectsStaleRampUpGeneration(t *testing.T) {
@@ -1199,7 +1244,6 @@ func TestDynamicPolicyApplyBlocksUsesNegotiatedReclaimPlanWhenFreeCPUsCannotMeet
 			PodEntries:    entries,
 		},
 	}, false)
-
 	resp := &advisorapi.ListAndWatchResponse{
 		DisableDedicatedCoresOverlapReclaimedCores: true,
 		Entries: map[string]*advisorapi.CalculationEntries{
@@ -1256,6 +1300,17 @@ func TestDynamicPolicyApplyBlocksMaterializesDefaultShareFromResidual(t *testing
 		"custom": {
 			commonstate.FakedContainerName: &state.AllocationInfo{
 				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta("custom"),
+				AllocationResult: machine.NewCPUSet(1),
+			},
+		},
+		"custom-pod": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "custom-pod",
+					ContainerName: "main",
+					OwnerPoolName: "custom",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+				},
 				AllocationResult: machine.NewCPUSet(1),
 			},
 		},
@@ -1407,6 +1462,78 @@ func TestDynamicPolicyApplyBlocksExcludesDNBFromDefaultShareResidual(t *testing.
 	shareCPUSet := pending.entries[commonstate.PoolNameShare][commonstate.FakedContainerName].AllocationResult
 	require.True(t, shareCPUSet.Equals(machine.NewCPUSet(3, 5, 7)))
 	require.True(t, shareCPUSet.Intersection(dnbCPUSet).IsEmpty())
+}
+
+func TestDynamicPolicyApplyBlocksUsesCandidateEntriesForRNBTopology(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	numa1 := topology.CPUDetails.CPUsInNUMANodes(1)
+	allCPUs := numa0.Union(numa1)
+	policy.state.SetPodEntries(state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: {
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: allCPUs.Clone(),
+			},
+		},
+		"rnb": {
+			"main": {
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "rnb",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameReclaim,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelReclaimedCores,
+					Annotations: map[string]string{
+						apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+						cpuconsts.CPUStateAnnotationKeyNUMAHint:             "0",
+					},
+				},
+				AllocationResult: numa0.Clone(),
+			},
+		},
+		"non-rnb": {
+			"main": {
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "non-rnb",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameReclaim,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelReclaimedCores,
+				},
+				AllocationResult: allCPUs.Clone(),
+			},
+		},
+	}, false)
+
+	resp := &advisorapi.ListAndWatchResponse{
+		Entries: map[string]*advisorapi.CalculationEntries{
+			commonstate.PoolNameReclaim: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameReclaim,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							0: {Blocks: []*advisorapi.Block{{BlockId: "reclaim-0", Result: uint64(numa0.Size())}}},
+							1: {Blocks: []*advisorapi.Block{{BlockId: "reclaim-1", Result: uint64(numa1.Size())}}},
+						},
+					},
+				},
+			},
+		},
+	}
+	pending, err := policy.applyBlocks(advisorapi.BlockCPUSet{
+		"reclaim-0": numa0.Clone(),
+		"reclaim-1": numa1.Clone(),
+	}, resp, false, false)
+	require.NoError(t, err)
+
+	got := pending.entries["non-rnb"]["main"].AllocationResult
+	require.True(t, got.Equals(numa1),
+		"non-RNB allocation must exclude the candidate RNB target NUMA, got %s", got)
 }
 
 func TestDynamicPolicyValidatesDefaultShareAsUpperBoundWhenBackfillEnabled(t *testing.T) {
