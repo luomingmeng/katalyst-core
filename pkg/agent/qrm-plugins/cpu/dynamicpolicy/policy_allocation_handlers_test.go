@@ -1737,13 +1737,30 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_exclusiveDisjointMultiNUMA(t *tes
 		apiconsts.PodAnnotationResourcePackageKey:             "work",
 	}
 
-	result, reclaim, err := p.allocateNumaBindingCPUs(
+	admissionResult, reclaim, err := p.allocateNumaBindingCPUs(
 		8, &pluginapi.TopologyHint{Nodes: []uint64{0, 1}}, machineState, annotations, false)
 	require.NoError(t, err)
 	require.True(t, reclaim.Equals(machine.NewCPUSet(0, 2, 4, 6)), "reclaim=%s", reclaim)
+	require.True(t, admissionResult.Equals(machine.NewCPUSet(0, 1, 2, 3, 4, 6)),
+		"admission result=%s", admissionResult)
+
+	allocationInfo := &state.AllocationInfo{
+		AllocationResult:         admissionResult.Clone(),
+		OriginalAllocationResult: admissionResult.Clone(),
+	}
+	overlap, err := shrinkAllocationInfoForHardReclaimFloor(topology, allocationInfo, reclaim)
+	require.NoError(t, err)
+	require.True(t, overlap.Equals(reclaim), "overlap=%s reclaim=%s", overlap, reclaim)
+	result := allocationInfo.AllocationResult
 	require.True(t, result.Equals(machine.NewCPUSet(1, 3)), "result=%s", result)
 	require.True(t, result.Intersection(reclaim).IsEmpty())
 	require.True(t, result.Union(reclaim).Equals(machine.NewCPUSet(0, 1, 2, 3, 4, 6)))
+	require.Len(t, allocationInfo.TopologyAwareAssignments, 2)
+	require.True(t, allocationInfo.TopologyAwareAssignments[0].Equals(machine.NewCPUSet(1)))
+	require.True(t, allocationInfo.TopologyAwareAssignments[1].Equals(machine.NewCPUSet(3)))
+	require.Len(t, allocationInfo.OriginalTopologyAwareAssignments, 2)
+	require.True(t, allocationInfo.OriginalTopologyAwareAssignments[0].Equals(machine.NewCPUSet(1)))
+	require.True(t, allocationInfo.OriginalTopologyAwareAssignments[1].Equals(machine.NewCPUSet(3)))
 }
 
 func TestDynamicPolicy_allocateNumaBindingCPUs_nonReclaimableUsesConfiguredSteadyFloor(t *testing.T) {
@@ -1788,15 +1805,26 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_nonReclaimableUsesConfiguredStead
 		apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
 	}
 
-	result, reclaim, err := p.allocateNumaBindingCPUs(
+	admissionResult, reclaim, err := p.allocateNumaBindingCPUs(
 		8, &pluginapi.TopologyHint{Nodes: []uint64{0}}, machineState, annotations, false)
 	require.NoError(t, err)
-	require.Equal(t, 6, result.Size(), "result=%s", result)
+	require.Equal(t, 8, admissionResult.Size(), "admission result=%s", admissionResult)
 	require.Equal(t, 2, reclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(0)).Size(), "reclaim=%s", reclaim)
 	require.Equal(t, 2, reclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(1)).Size(), "reclaim=%s", reclaim)
 	require.True(t, p.reservedReclaimedCPUSet.IsSubsetOf(reclaim), "reserve=%s reclaim=%s", p.reservedReclaimedCPUSet, reclaim)
 	require.True(t, reclaim.Intersection(protected).IsEmpty(), "protected=%s reclaim=%s", protected, reclaim)
 	requireCoreAligned(t, topology, reclaim)
+
+	allocationInfo := &state.AllocationInfo{
+		AllocationResult:         admissionResult.Clone(),
+		OriginalAllocationResult: admissionResult.Clone(),
+	}
+	overlap, err := shrinkAllocationInfoForHardReclaimFloor(topology, allocationInfo, reclaim)
+	require.NoError(t, err)
+	require.Equal(t, 2, overlap.Size(), "overlap=%s", overlap)
+	result := allocationInfo.AllocationResult
+	require.Equal(t, 6, result.Size(), "result=%s", result)
+	require.True(t, result.Intersection(reclaim).IsEmpty(), "result=%s reclaim=%s", result, reclaim)
 }
 
 func TestDynamicPolicy_deriveSteadyReclaimFloorRejectsIdentitiesAboveConfiguredTarget(t *testing.T) {
@@ -1893,12 +1921,23 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_preservesMandatoryOnPodLookupFail
 			}
 
 			podReclaimEnabled := false
-			result, reclaim, err := p.allocateNumaBindingCPUs(
+			admissionResult, reclaim, err := p.allocateNumaBindingCPUs(
 				8, &pluginapi.TopologyHint{Nodes: []uint64{0}}, machineState, annotations, podReclaimEnabled)
 			require.NoError(t, err)
 			require.Equal(t, tc.wantSize, reclaim.Size(), "reclaim=%s", reclaim)
+			require.Equal(t, 8, admissionResult.Size(), "admission result=%s", admissionResult)
+
+			allocationInfo := &state.AllocationInfo{
+				AllocationResult:         admissionResult.Clone(),
+				OriginalAllocationResult: admissionResult.Clone(),
+			}
+			overlap, err := shrinkAllocationInfoForHardReclaimFloor(topology, allocationInfo, reclaim)
+			require.NoError(t, err)
+			require.True(t, overlap.Equals(reclaim), "overlap=%s reclaim=%s", overlap, reclaim)
+			result := allocationInfo.AllocationResult
 			require.Equal(t, 8-tc.wantSize, result.Size(), "result=%s", result)
 			require.True(t, result.Union(reclaim).Equals(machineState[0].DefaultCPUSet))
+			require.True(t, result.Intersection(reclaim).IsEmpty(), "result=%s reclaim=%s", result, reclaim)
 		})
 	}
 }
