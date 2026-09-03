@@ -17,6 +17,8 @@ limitations under the License.
 package dynamicpolicy
 
 import (
+	"fmt"
+	"math"
 	"sort"
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
@@ -39,6 +41,95 @@ type boundPreemptionCandidate struct {
 
 func shouldUseNumaBindingAllocationPreference(allocationInfo *state.AllocationInfo) bool {
 	return allocationInfo != nil && allocationInfo.CheckDedicatedNUMABindingNUMAExclusive()
+}
+
+func existingAllocationSatisfiesRequest(
+	allocationInfo *state.AllocationInfo,
+	reqInt int,
+	allowShortNUMABindingAllocation bool,
+) bool {
+	if allocationInfo == nil {
+		return false
+	}
+	if allocationInfo.OriginalAllocationResult.Size() >= reqInt {
+		return true
+	}
+	if !allowShortNUMABindingAllocation {
+		return false
+	}
+	if !allocationInfo.CheckDedicatedNUMABinding() || allocationInfo.OriginalAllocationResult.IsEmpty() {
+		return false
+	}
+	return int(math.Ceil(allocationInfo.RequestQuantity)) == reqInt
+}
+
+func shrinkAllocationInfoForHardReclaimFloor(
+	topology *machine.CPUTopology,
+	allocationInfo *state.AllocationInfo,
+	hardReclaimCPUs machine.CPUSet,
+) (machine.CPUSet, error) {
+	if allocationInfo == nil || hardReclaimCPUs.IsEmpty() {
+		return machine.NewCPUSet(), nil
+	}
+	overlap := allocationInfo.AllocationResult.Intersection(hardReclaimCPUs)
+	if overlap.IsEmpty() {
+		return machine.NewCPUSet(), nil
+	}
+
+	shrunken := allocationInfo.AllocationResult.Difference(overlap)
+	if shrunken.IsEmpty() {
+		return machine.NewCPUSet(), fmt.Errorf("DNB allocation %s is fully covered by ramp-up reclaim floor %s",
+			allocationInfo.AllocationResult.String(), hardReclaimCPUs.String())
+	}
+	topologyAwareAssignments, err := machine.GetNumaAwareAssignments(topology, shrunken)
+	if err != nil {
+		return machine.NewCPUSet(), fmt.Errorf("get topology aware assignments for shrunken DNB allocation failed: %w", err)
+	}
+	allocationInfo.AllocationResult = shrunken.Clone()
+	allocationInfo.OriginalAllocationResult = shrunken.Clone()
+	allocationInfo.TopologyAwareAssignments = topologyAwareAssignments
+	allocationInfo.OriginalTopologyAwareAssignments = machine.DeepcopyCPUAssignment(topologyAwareAssignments)
+	return overlap, nil
+}
+
+func removePodOwnerEntriesForReallocation(podEntries state.PodEntries, podUID, containerName string) {
+	containerEntries := podEntries[podUID]
+	if containerEntries == nil {
+		return
+	}
+	if len(containerEntries) <= 1 {
+		delete(podEntries, podUID)
+		return
+	}
+
+	current := containerEntries[containerName]
+	if current == nil {
+		delete(containerEntries, containerName)
+		if len(containerEntries) == 0 {
+			delete(podEntries, podUID)
+		}
+		return
+	}
+	currentCPUs := allocationCurrentCPUSet(current)
+	if currentCPUs.IsEmpty() {
+		delete(containerEntries, containerName)
+		if len(containerEntries) == 0 {
+			delete(podEntries, podUID)
+		}
+		return
+	}
+	for siblingName, sibling := range containerEntries {
+		if siblingName == containerName {
+			delete(containerEntries, siblingName)
+			continue
+		}
+		if allocationCurrentCPUSet(sibling).Equals(currentCPUs) {
+			delete(containerEntries, siblingName)
+		}
+	}
+	if len(containerEntries) == 0 {
+		delete(podEntries, podUID)
+	}
 }
 
 func (p *DynamicPolicy) numaBindingAllocationPreferenceFromState(

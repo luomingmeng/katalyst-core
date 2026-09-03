@@ -1436,7 +1436,8 @@ func (p *DynamicPolicy) Allocate(ctx context.Context,
 	}()
 
 	allocationInfo := p.state.GetAllocationInfo(req.PodUid, req.ContainerName)
-	if allocationInfo != nil && allocationInfo.OriginalAllocationResult.Size() >= reqInt && !util.PodInplaceUpdateResizing(req) {
+	if existingAllocationSatisfiesRequest(allocationInfo, reqInt, p.isRampUpReclaimHardPartitionEnabled()) &&
+		!util.PodInplaceUpdateResizing(req) {
 		general.InfoS("already allocated and meet requirement",
 			"podNamespace", req.PodNamespace,
 			"podName", req.PodName,

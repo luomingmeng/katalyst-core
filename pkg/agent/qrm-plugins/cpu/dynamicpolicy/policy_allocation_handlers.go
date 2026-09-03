@@ -540,6 +540,8 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 		if shouldUseNumaBindingAllocationPreference(oldAllocationInfo) {
 			allocationPreference = p.numaBindingAllocationPreferenceFromState(req.PodUid, req.ContainerName)
 		}
+		reallocationMachinePodEntries := basePodEntries.Clone()
+		removePodOwnerEntriesForReallocation(reallocationMachinePodEntries, req.PodUid, req.ContainerName)
 		if basePodEntries[req.PodUid] != nil {
 			delete(basePodEntries[req.PodUid], req.ContainerName)
 			if len(basePodEntries[req.PodUid]) == 0 {
@@ -548,7 +550,7 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 		}
 		var err error
 		baseMachineState, err = generateMachineStateFromPodEntries(
-			p.machineInfo.CPUTopology, basePodEntries, baseMachineState)
+			p.machineInfo.CPUTopology, reallocationMachinePodEntries, baseMachineState)
 		if err != nil {
 			general.Errorf("pod: %s/%s, container: %s GenerateMachineStateFromPodEntries failed with error: %v",
 				req.PodNamespace, req.PodName, req.ContainerName, err)
@@ -635,10 +637,6 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 			if floorInNUMA.IsEmpty() {
 				return nil, fmt.Errorf("NUMA-exclusive DNB ramp-up requires non-empty reclaim floor on NUMA %d", numaID)
 			}
-			if overlap := allocationInNUMA.Intersection(floorInNUMA); !overlap.IsEmpty() {
-				return nil, fmt.Errorf("NUMA-exclusive DNB allocation overlaps reclaim floor on NUMA %d: overlap=%s",
-					numaID, overlap.String())
-			}
 			if covered := allocationInNUMA.Union(floorInNUMA); !covered.Equals(coverageTarget) {
 				return nil, fmt.Errorf("NUMA-exclusive DNB allocation and reclaim floor do not cover NUMA %d: allocation=%s floor=%s eligible=%s",
 					numaID, allocationInNUMA.String(), floorInNUMA.String(), coverageTarget.String())
@@ -720,9 +718,21 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 		return nil, fmt.Errorf("planned reclaim %s dropped DNB ramp-up floor %s",
 			reclaimCPUs.String(), hardReclaimCPUs.String())
 	}
-	if overlap := allocationInfo.AllocationResult.Intersection(hardReclaimCPUs); !overlap.IsEmpty() {
-		return nil, fmt.Errorf("planned DNB allocation overlaps ramp-up floor: allocation=%s floor=%s overlap=%s",
-			allocationInfo.AllocationResult.String(), hardReclaimCPUs.String(), overlap.String())
+	if overlap, err := shrinkAllocationInfoForHardReclaimFloor(
+		p.machineInfo.CPUTopology, allocationInfo, hardReclaimCPUs); err != nil {
+		return nil, err
+	} else if !overlap.IsEmpty() {
+		general.InfoS("shrink planned DNB allocation to preserve ramp-up reclaim floor",
+			"pod", req.PodUid,
+			"container", req.ContainerName,
+			"overlap", overlap.String(),
+			"hardReclaimCPUs", hardReclaimCPUs.String(),
+			"shrunkenAllocation", allocationInfo.AllocationResult.String())
+		finalMachineState, err = generateMachineStateFromPodEntries(
+			p.machineInfo.CPUTopology, finalPodEntries, finalMachineState)
+		if err != nil {
+			return nil, fmt.Errorf("regenerate machine state after shrinking DNB allocation failed: %w", err)
+		}
 	}
 	prepared, err := p.preparePendingCPUPartition(pendingCPUPartition{
 		expectedRevision: preCommitRevision,
@@ -1113,7 +1123,7 @@ func (p *DynamicPolicy) allocateNumaBindingCPUsWithEligibilityAndPreference(numC
 		}
 		availableCPUs := machineState[int(numaNode)].GetAvailableCPUSet(p.reservedCPUs)
 		if coverExclusivePartition {
-			availableCPUs = dedicatedEligiblePerNUMA[int(numaNode)]
+			availableCPUs = dedicatedEligiblePerNUMA[int(numaNode)].Union(reclaimEligiblePerNUMA[int(numaNode)])
 		} else {
 			pinnedCPUSetsInNUMA := make(map[string]machine.CPUSet)
 			for resourcePackage, rpState := range machineState[int(numaNode)].ResourcePackageStates {
@@ -1163,11 +1173,7 @@ func (p *DynamicPolicy) allocateNumaBindingCPUsWithEligibilityAndPreference(numC
 			fmt.Errorf("select NUMA binding reclaim partition failed: %w", err)
 	}
 	if !hardReclaimCPUs.IsEmpty() {
-		for numaNode, availableInNUMA := range alignedAvailableCPUsPerNUMA {
-			alignedAvailableCPUsPerNUMA[numaNode] = availableInNUMA.Difference(hardReclaimCPUs)
-		}
-		alignedAvailableCPUs = alignedAvailableCPUs.Difference(hardReclaimCPUs)
-		general.InfoS("ramp-up reclaim hard partition applied node-level reclaim floor",
+		general.InfoS("ramp-up reclaim hard partition selected node-level reclaim floor",
 			"hints", hintNodes,
 			"hardReclaimCPUs", hardReclaimCPUs.String(),
 			"podReclaimEnabled", podReclaimEnabled)
@@ -1193,6 +1199,7 @@ func (p *DynamicPolicy) allocateNumaBindingCPUsWithEligibilityAndPreference(numC
 			// GetAllocationInfo already returns a deep copy, so the result can be used directly.
 			reclaimCPUs = reclaimInfo.AllocationResult
 		}
+		reclaimCPUs = reclaimCPUs.Union(hardReclaimCPUs)
 
 		if !reclaimCPUs.IsEmpty() {
 			preferredAvailableCPUsPerNUMA = make(map[uint64]machine.CPUSet, len(alignedAvailableCPUsPerNUMA))
@@ -1251,10 +1258,6 @@ func (p *DynamicPolicy) allocateNumaBindingCPUsWithEligibilityAndPreference(numC
 			return machine.NewCPUSet(), machine.NewCPUSet(), nil,
 				fmt.Errorf("exclusive disjoint dedicated result is empty")
 		}
-		if !result.Intersection(hardReclaimCPUs).IsEmpty() {
-			return machine.NewCPUSet(), machine.NewCPUSet(), nil,
-				fmt.Errorf("exclusive dedicated result overlaps reclaim partition")
-		}
 		if !result.Union(reclaimInHint).Equals(partitionEligible) {
 			return machine.NewCPUSet(), machine.NewCPUSet(), nil,
 				fmt.Errorf("exclusive dedicated and reclaim do not cover eligible partition")
@@ -1266,12 +1269,6 @@ func (p *DynamicPolicy) allocateNumaBindingCPUsWithEligibilityAndPreference(numC
 		return machine.NewCPUSet(), machine.NewCPUSet(), nil, fmt.Errorf("results can't meet cpus request")
 	}
 
-	// Invariant: the reclaim floor must never leak into the dedicated_cores result.
-	if !hardReclaimCPUs.IsEmpty() && !result.Intersection(hardReclaimCPUs).IsEmpty() {
-		return machine.NewCPUSet(), machine.NewCPUSet(), nil,
-			fmt.Errorf("ramp-up reclaim hard partition invariant violated: dedicated result %s overlaps reclaim floor %s",
-				result.String(), hardReclaimCPUs.String())
-	}
 	return result, hardReclaimCPUs, eligibility, nil
 }
 
