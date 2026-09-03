@@ -1170,6 +1170,80 @@ func TestDynamicPolicy_takeByTopologyPreferring_invariants(t *testing.T) {
 	}
 }
 
+func TestDynamicPolicyAllocateNumaBindingDoesNotHardDeductReclaimFloorForNonExclusiveDNB(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(24, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.2
+	p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
+
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0).ToSliceInt()
+	hardFloor := machine.NewCPUSet(numa0[:2]...)
+	available := machine.NewCPUSet(numa0[:22]...)
+	p.reservedReclaimedCPUSet = hardFloor
+	p.reservedReclaimedCPUsSize = hardFloor.Size()
+	p.state.SetMachineState(state.NUMANodeMap{
+		0: {DefaultCPUSet: available},
+	}, true)
+
+	got, hardReclaimCPUs, err := p.allocateNumaBindingCPUs(21, &pluginapi.TopologyHint{Nodes: []uint64{0}}, p.state.GetMachineState(), map[string]string{
+		apiconsts.PodAnnotationQoSLevelKey:                  apiconsts.PodAnnotationQoSLevelDedicatedCores,
+		apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+	}, true)
+
+	require.NoError(t, err)
+	require.Equal(t, 21, got.Size(), "got=%s", got.String())
+	require.True(t, hardFloor.IsSubsetOf(hardReclaimCPUs), "floor=%s hard=%s", hardFloor, hardReclaimCPUs)
+	require.False(t, got.Intersection(hardFloor).IsEmpty(),
+		"non-exclusive admission must be allowed to borrow from hard floor when reclaim-free CPUs are short, got=%s floor=%s",
+		got.String(), hardFloor.String())
+}
+
+func TestDynamicPolicyAllocateNumaBindingDoesNotHardDeductReclaimFloorForExclusiveDNB(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(48, 2, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.2
+	p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
+
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	numa1 := topology.CPUDetails.CPUsInNUMANodes(1)
+	numa0List := numa0.ToSliceInt()
+	numa1List := numa1.ToSliceInt()
+	hardFloor := machine.NewCPUSet(append(numa0List[:2], numa1List[:2]...)...)
+	p.reservedReclaimedCPUSet = hardFloor
+	p.reservedReclaimedCPUsSize = hardFloor.Size()
+	p.state.SetMachineState(state.NUMANodeMap{
+		0: {DefaultCPUSet: numa0},
+		1: {DefaultCPUSet: numa1},
+	}, true)
+
+	got, hardReclaimCPUs, err := p.allocateNumaBindingCPUs(46, &pluginapi.TopologyHint{Nodes: []uint64{0, 1}}, p.state.GetMachineState(), map[string]string{
+		apiconsts.PodAnnotationQoSLevelKey:                    apiconsts.PodAnnotationQoSLevelDedicatedCores,
+		apiconsts.PodAnnotationMemoryEnhancementNumaBinding:   apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+		apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
+	}, true)
+
+	require.NoError(t, err)
+	require.Equal(t, 48, got.Size(), "exclusive admission must keep the whole hinted partition, got=%s", got.String())
+	require.True(t, hardFloor.IsSubsetOf(hardReclaimCPUs), "floor=%s hard=%s", hardFloor, hardReclaimCPUs)
+	require.True(t, hardFloor.IsSubsetOf(got),
+		"exclusive admission must not hard-deduct the reclaim floor, got=%s floor=%s",
+		got.String(), hardFloor.String())
+}
+
 func TestDynamicPolicy_allocateNumaBindingCPUs_reclaimPreferenceRespectsResourcePackageOrder(t *testing.T) {
 	t.Parallel()
 
@@ -1292,10 +1366,9 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_exclusiveDisjointPartition(t *tes
 
 		result, reclaim, err := call(p, machineState, exclusiveAnnotations("work"), false)
 		require.NoError(t, err)
-		require.True(t, result.Equals(machine.NewCPUSet(1, 5)), "result=%s", result)
+		require.True(t, result.Equals(machine.NewCPUSet(0, 1, 2, 4, 5, 6)), "result=%s", result)
 		require.True(t, reclaim.Equals(machine.NewCPUSet(0, 2, 4, 6)), "reclaim=%s", reclaim)
-		require.True(t, result.Intersection(reclaim).IsEmpty())
-		require.True(t, result.Union(reclaim).Equals(machine.NewCPUSet(0, 1, 2, 4, 5, 6)))
+		require.True(t, reclaim.IsSubsetOf(result))
 		require.True(t, reclaim.Intersection(machine.NewCPUSet(3, 7)).IsEmpty())
 	})
 
@@ -1320,13 +1393,12 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_exclusiveDisjointPartition(t *tes
 
 		result, reclaim, err := call(p, machineState, exclusiveAnnotations(""), true)
 		require.NoError(t, err)
-		require.True(t, result.Equals(machine.NewCPUSet(1, 5)), "result=%s", result)
+		require.True(t, result.Equals(machine.NewCPUSet(0, 1, 2, 4, 5, 6)), "result=%s", result)
 		require.True(t, reclaim.Equals(machine.NewCPUSet(0, 2, 4, 6)), "reclaim=%s", reclaim)
-		require.True(t, result.Intersection(reclaim).IsEmpty())
-		require.True(t, result.Union(reclaim).Equals(machine.NewCPUSet(0, 1, 2, 4, 5, 6)))
+		require.True(t, reclaim.IsSubsetOf(result))
 	})
 
-	t.Run("rejects empty dedicated partition", func(t *testing.T) {
+	t.Run("allows reclaim-only partition for admission", func(t *testing.T) {
 		p := newPolicy(t)
 		p.reservedReclaimedCPUSet = machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)
 		p.reservedReclaimedCPUsSize = 8
@@ -1334,8 +1406,10 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_exclusiveDisjointPartition(t *tes
 			0: {DefaultCPUSet: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)},
 		}
 
-		_, _, err := call(p, machineState, exclusiveAnnotations(""), true)
-		require.ErrorContains(t, err, "dedicated result is empty")
+		result, reclaim, err := call(p, machineState, exclusiveAnnotations(""), true)
+		require.NoError(t, err)
+		require.True(t, result.Equals(machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)), "result=%s", result)
+		require.True(t, reclaim.IsSubsetOf(result), "result=%s reclaim=%s", result, reclaim)
 	})
 
 	t.Run("rejects reserve when reclaim eligibility is insufficient", func(t *testing.T) {
@@ -1358,7 +1432,7 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_exclusiveDisjointPartition(t *tes
 		require.Error(t, err)
 	})
 
-	t.Run("legacy overlap mode still requires request size", func(t *testing.T) {
+	t.Run("legacy overlap mode also admits whole NUMA before partition adjustment", func(t *testing.T) {
 		p := newPolicy(t)
 		p.state.SetDisableDedicatedCoresOverlapReclaimedCores(false, false)
 		p.reservedReclaimedCPUSet = machine.NewCPUSet(0, 1)
@@ -1367,8 +1441,9 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_exclusiveDisjointPartition(t *tes
 			0: {DefaultCPUSet: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)},
 		}
 
-		_, _, err := call(p, machineState, exclusiveAnnotations(""), true)
-		require.ErrorContains(t, err, "results can't meet cpus request")
+		result, _, err := call(p, machineState, exclusiveAnnotations(""), true)
+		require.NoError(t, err)
+		require.True(t, result.Equals(machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)), "result=%s", result)
 	})
 }
 
@@ -1621,7 +1696,7 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_partitionEligibilityGate(t *testi
 		require.Equal(t, 4, reclaim.Size())
 		require.Equal(t, 2, reclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(0)).Size())
 		require.Equal(t, 2, reclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(1)).Size())
-		require.True(t, result.Equals(completeState[0].DefaultCPUSet.Difference(reclaim)), "result=%s", result)
+		require.True(t, result.Equals(completeState[0].DefaultCPUSet), "result=%s", result)
 	})
 }
 
