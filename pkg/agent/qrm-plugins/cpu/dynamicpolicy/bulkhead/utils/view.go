@@ -349,12 +349,14 @@ func rebuildDesiredPoolOwners(view *model.DesiredView, podEntries cpustate.PodEn
 		view.PoolOwners,
 		model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindReclaim},
 		"",
+		"",
 		view.ReclaimEffective,
 	)
 	for poolName, cpus := range view.SharePoolMap {
 		recordDesiredPoolOwner(
 			view.PoolOwners,
 			model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindShare, Name: poolName},
+			"",
 			"",
 			cpus,
 		)
@@ -376,6 +378,7 @@ func rebuildDesiredPoolOwners(view *model.DesiredView, podEntries cpustate.PodEn
 			recordDesiredPoolOwner(
 				view.PoolOwners,
 				identity,
+				allocation.PodUid,
 				containerName,
 				allocation.AllocationResult,
 			)
@@ -395,8 +398,9 @@ func poolIdentityForAllocation(allocation *cpustate.AllocationInfo) (model.CPUSe
 		commonstate.OwnerPoolNameTranslator.Translate(allocation.OwnerPoolName))
 	if poolType == commonstate.PoolNamePrefixIsolation {
 		return model.CPUSetPoolIdentity{
-			Kind:   model.CPUSetPoolKindIsolation,
-			PodUID: allocation.PodUid,
+			Kind:         model.CPUSetPoolKindIsolation,
+			PodNamespace: allocation.PodNamespace,
+			PodName:      allocation.PodName,
 		}, true
 	}
 	switch poolType {
@@ -405,8 +409,9 @@ func poolIdentityForAllocation(allocation *cpustate.AllocationInfo) (model.CPUSe
 	}
 	if allocation.CheckDedicated() {
 		return model.CPUSetPoolIdentity{
-			Kind:   model.CPUSetPoolKindDedicated,
-			PodUID: allocation.PodUid,
+			Kind:         model.CPUSetPoolKindDedicated,
+			PodNamespace: allocation.PodNamespace,
+			PodName:      allocation.PodName,
 		}, true
 	}
 	return model.CPUSetPoolIdentity{}, false
@@ -415,10 +420,14 @@ func poolIdentityForAllocation(allocation *cpustate.AllocationInfo) (model.CPUSe
 func recordDesiredPoolOwner(
 	owners map[model.CPUSetPoolIdentity]model.DesiredPoolOwner,
 	identity model.CPUSetPoolIdentity,
+	podUID string,
 	containerName string,
 	cpus machine.CPUSet,
 ) {
 	owner := owners[identity]
+	if owner.ProofPodUID == "" {
+		owner.ProofPodUID = podUID
+	}
 	owner.ExpectedCPUSet = owner.ExpectedCPUSet.Union(cpus)
 	if containerName != "" {
 		if owner.ContainerCPUSetByName == nil {

@@ -46,25 +46,40 @@ const (
 )
 
 type CPUSetPoolIdentity struct {
-	Kind   CPUSetPoolKind
-	Name   string
-	PodUID string
+	Kind         CPUSetPoolKind
+	Name         string
+	PodNamespace string
+	PodName      string
+}
+
+func (i CPUSetPoolIdentity) Less(other CPUSetPoolIdentity) bool {
+	if i.Kind != other.Kind {
+		return i.Kind < other.Kind
+	}
+	if i.Name != other.Name {
+		return i.Name < other.Name
+	}
+	if i.PodNamespace != other.PodNamespace {
+		return i.PodNamespace < other.PodNamespace
+	}
+	return i.PodName < other.PodName
 }
 
 func (i CPUSetPoolIdentity) Valid() bool {
 	switch i.Kind {
 	case CPUSetPoolKindReclaim:
-		return i.Name == "" && i.PodUID == ""
+		return i.Name == "" && i.PodNamespace == "" && i.PodName == ""
 	case CPUSetPoolKindShare:
-		return i.Name != "" && i.PodUID == ""
+		return i.Name != "" && i.PodNamespace == "" && i.PodName == ""
 	case CPUSetPoolKindDedicated, CPUSetPoolKindIsolation:
-		return i.Name == "" && i.PodUID != ""
+		return i.Name == "" && i.PodNamespace != "" && i.PodName != ""
 	default:
 		return false
 	}
 }
 
 type DesiredPoolOwner struct {
+	ProofPodUID           string
 	ExpectedCPUSet        machine.CPUSet
 	ContainerCPUSetByName map[string]machine.CPUSet
 }
@@ -305,6 +320,7 @@ func cloneDesiredPoolOwners(in map[CPUSetPoolIdentity]DesiredPoolOwner) map[CPUS
 	out := make(map[CPUSetPoolIdentity]DesiredPoolOwner, len(in))
 	for identity, owner := range in {
 		out[identity] = DesiredPoolOwner{
+			ProofPodUID:           owner.ProofPodUID,
 			ExpectedCPUSet:        cloneOptionalCPUSet(owner.ExpectedCPUSet),
 			ContainerCPUSetByName: cloneOptionalCPUSetMap(owner.ContainerCPUSetByName),
 		}
@@ -319,6 +335,7 @@ func equalDesiredPoolOwners(a, b map[CPUSetPoolIdentity]DesiredPoolOwner) bool {
 	for identity, ownerA := range a {
 		ownerB, ok := b[identity]
 		if !ok ||
+			ownerA.ProofPodUID != ownerB.ProofPodUID ||
 			!ownerA.ExpectedCPUSet.Equals(ownerB.ExpectedCPUSet) ||
 			!equalCPUSetMap(ownerA.ContainerCPUSetByName, ownerB.ContainerCPUSetByName) {
 			return false

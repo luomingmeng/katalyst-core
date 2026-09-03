@@ -129,13 +129,7 @@ func sortedPoolIdentities(
 		identities = append(identities, identity)
 	}
 	sort.Slice(identities, func(i, j int) bool {
-		if identities[i].Kind != identities[j].Kind {
-			return identities[i].Kind < identities[j].Kind
-		}
-		if identities[i].Name != identities[j].Name {
-			return identities[i].Name < identities[j].Name
-		}
-		return identities[i].PodUID < identities[j].PodUID
+		return identities[i].Less(identities[j])
 	})
 	return identities
 }
@@ -156,7 +150,7 @@ func appliedProofForOwner(
 	case model.CPUSetPoolKindDedicated, model.CPUSetPoolKindIsolation:
 		proved := machine.NewCPUSet()
 		for containerName := range owner.ContainerCPUSetByName {
-			proved = proved.Union(applied.ContainerCPUSetByPod[identity.PodUID][containerName])
+			proved = proved.Union(applied.ContainerCPUSetByPod[owner.ProofPodUID][containerName])
 		}
 		return owner.ExpectedCPUSet.Intersection(proved)
 	default:
