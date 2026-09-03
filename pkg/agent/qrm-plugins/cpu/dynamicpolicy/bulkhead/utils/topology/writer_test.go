@@ -604,6 +604,215 @@ func TestSafeWriterV2ConfiguredClearWithMemsGrowChecksLiveParentMems(t *testing.
 	}
 }
 
+func TestSafeWriterFinalChildFreezeCoversCPUOnlyShrink(t *testing.T) {
+	identity := CgroupIdentity{Device: 1, Inode: 1}
+	childIdentity := CgroupIdentity{Device: 1, Inode: 2}
+	driver := newFakeHierarchyDriver()
+	driver.add("root", identity, "0-3", "0")
+	driver.add("root/child", childIdentity, "0-1", "0")
+	plan := singleSafeWriterOperationPlan("cpu-only-shrink-freeze", PlanOperation{
+		Rel: "root", ExpectedIdentity: identity,
+		ExpectedChildren:   ChildrenFingerprint([]ChildRef{{Name: "child", Identity: childIdentity}}),
+		ExpectedChildUnion: machine.MustParse("0-1"),
+		ExpectedCurrent:    CPUSetTarget{CPUs: machine.MustParse("0-3"), Mems: "0"},
+		Target:             CPUSetTarget{CPUs: machine.MustParse("0-2"), Mems: "0"},
+		Direction:          WriteShrink,
+	})
+	listCalls := 0
+	driver.beforeCall = func(op HierarchyOperation, rel string) error {
+		if op == HierarchyOperationList && rel == "root" {
+			listCalls++
+			if listCalls == 3 {
+				driver.add("root/late", CgroupIdentity{Device: 1, Inode: 3}, "3", "0")
+			}
+		}
+		return nil
+	}
+
+	err := newSafeCPUSetWriter(driver, NewBudgetTracker(ConvergenceBudget{}), nil).
+		execute(context.Background(), plan)
+	var stale *PlanStaleError
+	if !errors.As(err, &stale) || stale.Resource != "children" {
+		t.Fatalf("execute() error = %v, want final child freeze stale", err)
+	}
+	if len(driver.writes) != 0 {
+		t.Fatalf("CPU-only shrink child churn must fail before writes, got %#v", driver.writes)
+	}
+}
+
+func TestSafeWriterFinalChildFreezeCoversGrow(t *testing.T) {
+	identity := CgroupIdentity{Device: 1, Inode: 1}
+	childIdentity := CgroupIdentity{Device: 1, Inode: 2}
+	driver := newFakeHierarchyDriver()
+	driver.allowUnwitnessedExpansion = true
+	driver.add("root", identity, "0-1", "0")
+	driver.add("root/child", childIdentity, "0", "0")
+	plan := singleSafeWriterOperationPlan("grow-freeze", PlanOperation{
+		Rel: "root", ExpectedIdentity: identity,
+		ExpectedChildren:   ChildrenFingerprint([]ChildRef{{Name: "child", Identity: childIdentity}}),
+		ExpectedChildUnion: machine.NewCPUSet(0),
+		ExpectedCurrent:    CPUSetTarget{CPUs: machine.MustParse("0-1"), Mems: "0"},
+		Target:             CPUSetTarget{CPUs: machine.MustParse("0-2"), Mems: "0"},
+		Direction:          WriteGrow,
+	})
+	listCalls := 0
+	driver.beforeCall = func(op HierarchyOperation, rel string) error {
+		if op == HierarchyOperationList && rel == "root" {
+			listCalls++
+			if listCalls == 3 {
+				driver.add("root/late", CgroupIdentity{Device: 1, Inode: 3}, "0", "0")
+			}
+		}
+		return nil
+	}
+
+	err := newSafeCPUSetWriter(driver, NewBudgetTracker(ConvergenceBudget{}), nil).
+		execute(context.Background(), plan)
+	var stale *PlanStaleError
+	if !errors.As(err, &stale) || stale.Resource != "children" {
+		t.Fatalf("execute() error = %v, want final child freeze stale", err)
+	}
+	if len(driver.writes) != 0 {
+		t.Fatalf("grow child churn must fail before writes, got %#v", driver.writes)
+	}
+}
+
+func TestSafeWriterLaterOperationChurnPreventsAllWrites(t *testing.T) {
+	firstIdentity := CgroupIdentity{Device: 1, Inode: 1}
+	firstChildIdentity := CgroupIdentity{Device: 1, Inode: 2}
+	secondIdentity := CgroupIdentity{Device: 1, Inode: 3}
+	secondChildIdentity := CgroupIdentity{Device: 1, Inode: 4}
+	driver := newFakeHierarchyDriver()
+	driver.add("first", firstIdentity, "0-3", "0")
+	driver.add("first/child", firstChildIdentity, "0-1", "0")
+	driver.add("second", secondIdentity, "0-3", "0")
+	driver.add("second/child", secondChildIdentity, "0-1", "0")
+	plan := PhasePlan{
+		ConvergenceID: "later-operation-churn",
+		Kind:          PhaseDrain,
+		Operations: []PlanOperation{
+			{
+				Rel: "first", ExpectedIdentity: firstIdentity,
+				ExpectedChildren:   ChildrenFingerprint([]ChildRef{{Name: "child", Identity: firstChildIdentity}}),
+				ExpectedChildUnion: machine.MustParse("0-1"),
+				ExpectedCurrent:    CPUSetTarget{CPUs: machine.MustParse("0-3"), Mems: "0"},
+				Target:             CPUSetTarget{CPUs: machine.MustParse("0-2"), Mems: "0"},
+				Direction:          WriteShrink, OwnsMems: true, WriteMems: true,
+			},
+			{
+				Rel: "second", ExpectedIdentity: secondIdentity,
+				ExpectedChildren:   ChildrenFingerprint([]ChildRef{{Name: "child", Identity: secondChildIdentity}}),
+				ExpectedChildUnion: machine.MustParse("0-1"),
+				ExpectedCurrent:    CPUSetTarget{CPUs: machine.MustParse("0-3"), Mems: "0"},
+				Target:             CPUSetTarget{CPUs: machine.MustParse("0-2"), Mems: "0"},
+				Direction:          WriteShrink, OwnsMems: true, WriteMems: true,
+			},
+		},
+	}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	for i := range plan.Operations {
+		plan.Operations[i].PlanID = plan.PlanID
+	}
+	secondListCalls := 0
+	driver.beforeCall = func(op HierarchyOperation, rel string) error {
+		if op == HierarchyOperationList && rel == "second" {
+			secondListCalls++
+			if secondListCalls == 3 {
+				driver.add("second/late", CgroupIdentity{Device: 1, Inode: 5}, "3", "0")
+			}
+		}
+		return nil
+	}
+
+	err := newSafeCPUSetWriter(driver, NewBudgetTracker(ConvergenceBudget{}), nil).
+		execute(context.Background(), plan)
+	var stale *PlanStaleError
+	if !errors.As(err, &stale) {
+		t.Fatalf("execute() error = %v, want later-operation churn stale", err)
+	}
+	if len(driver.writes) != 0 {
+		t.Fatalf("later-operation churn must reject the whole plan before writes, got %#v", driver.writes)
+	}
+}
+
+func TestSafeWriterAtomicallyReservesFinalPreflightBeforeFirstWrite(t *testing.T) {
+	firstIdentity := CgroupIdentity{Device: 1, Inode: 1}
+	secondIdentity := CgroupIdentity{Device: 1, Inode: 2}
+	driver := newFakeHierarchyDriver()
+	driver.add("first", firstIdentity, "0-3", "0")
+	driver.add("second", secondIdentity, "0-3", "0")
+	plan := PhasePlan{
+		ConvergenceID: "atomic-final-preflight-reservation",
+		Kind:          PhaseDrain,
+		Operations: []PlanOperation{
+			{
+				Rel: "first", ExpectedIdentity: firstIdentity, ExpectedChildren: ChildrenFingerprint(nil),
+				ExpectedCurrent: CPUSetTarget{CPUs: machine.MustParse("0-3"), Mems: "0"},
+				Target:          CPUSetTarget{CPUs: machine.MustParse("0-2"), Mems: "0"},
+				Direction:       WriteShrink,
+			},
+			{
+				Rel: "second", ExpectedIdentity: secondIdentity, ExpectedChildren: ChildrenFingerprint(nil),
+				ExpectedCurrent: CPUSetTarget{CPUs: machine.MustParse("0-3"), Mems: "0"},
+				Target:          CPUSetTarget{CPUs: machine.MustParse("0-2"), Mems: "0"},
+				Direction:       WriteShrink,
+			},
+		},
+	}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	for i := range plan.Operations {
+		plan.Operations[i].PlanID = plan.PlanID
+	}
+	// The sizing scan costs four calls. Full-plan final preflight plus mutation
+	// costs ten more; leave one call short so the atomic reservation must fail.
+	budget := NewBudgetTracker(ConvergenceBudget{MaxHierarchyIOOperations: 13})
+	err := newSafeCPUSetWriter(driver, budget, nil).execute(context.Background(), plan)
+	if !errors.Is(err, ErrHierarchyIOOperationBudgetExceeded) {
+		t.Fatalf("execute() error = %v, want atomic hierarchy I/O reservation failure", err)
+	}
+	if len(driver.writes) != 0 {
+		t.Fatalf("reservation failure must happen before first write, got %#v", driver.writes)
+	}
+	if got := budget.Usage().HierarchyIOOperations; got != 4 {
+		t.Fatalf("hierarchy I/O usage = %d, want only four sizing-scan calls", got)
+	}
+}
+
+func TestSafeWriterPrepaidDriverNeverFallsBackToOrdinaryCharging(t *testing.T) {
+	identity := CgroupIdentity{Device: 1, Inode: 1}
+	driver := newFakeHierarchyDriver()
+	driver.add("root", identity, "0-1", "0")
+	budget := NewBudgetTracker(ConvergenceBudget{MaxHierarchyIOOperations: 2})
+	reserved, err := newStrictReservedHierarchyDriver(
+		context.Background(), driver, budget, 1)
+	if err != nil {
+		t.Fatalf("newStrictReservedHierarchyDriver() error = %v", err)
+	}
+	if _, err := reserved.ReadEntry(context.Background(), "root"); err != nil {
+		t.Fatalf("first prepaid ReadEntry() error = %v", err)
+	}
+	if _, err := reserved.ReadEntry(context.Background(), "root"); !errors.Is(err, ErrHierarchyIOOperationBudgetExceeded) {
+		t.Fatalf("second ReadEntry() error = %v, want prepaid exhaustion", err)
+	}
+	if got := budget.Usage().HierarchyIOOperations; got != 1 {
+		t.Fatalf("hierarchy I/O usage = %d, want reserved charge to remain 1", got)
+	}
+	if got := driver.calls; got != 1 {
+		t.Fatalf("underlying calls = %d, want exhausted call blocked", got)
+	}
+}
+
+func singleSafeWriterOperationPlan(convergenceID string, operation PlanOperation) PhasePlan {
+	plan := PhasePlan{
+		ConvergenceID: convergenceID,
+		Kind:          PhaseDrain,
+		Operations:    []PlanOperation{operation},
+	}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	plan.Operations[0].PlanID = plan.PlanID
+	return plan
+}
+
 func TestValidateLiveOperationDirectionRejectsMemsDirectionMismatch(t *testing.T) {
 	t.Parallel()
 

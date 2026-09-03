@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -1243,6 +1244,145 @@ func TestBudgetTrackerRoundDomainEdgeOperationBoundaries(t *testing.T) {
 				t.Fatalf("usage after rejected charge = %d, want 2", got)
 			}
 		})
+	}
+}
+
+func TestBudgetTrackerRejectsOverflowingCumulativeCharge(t *testing.T) {
+	t.Parallel()
+
+	maxInt := int(^uint(0) >> 1)
+	budget := NewBudgetTracker(ConvergenceBudget{MaxPlanOperations: maxInt})
+	budget.usage.Operations = maxInt - 1
+
+	err := budget.ConsumePlanOperations(2)
+	if !errors.Is(err, ErrPlanOperationBudgetExceeded) {
+		t.Fatalf("overflowing charge error = %v, want %v", err, ErrPlanOperationBudgetExceeded)
+	}
+	if got := budget.Usage().Operations; got != maxInt-1 {
+		t.Fatalf("usage after rejected overflowing charge = %d, want %d", got, maxInt-1)
+	}
+}
+
+func TestBudgetTrackerReserveHierarchyIOOperationsPrefersCanceledContext(t *testing.T) {
+	t.Parallel()
+
+	budget := NewBudgetTracker(ConvergenceBudget{MaxHierarchyIOOperations: 1})
+	if err := budget.ReserveHierarchyIOOperations(context.Background(), 1); err != nil {
+		t.Fatalf("fill hierarchy I/O budget: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := budget.ReserveHierarchyIOOperations(ctx, 1)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("reservation error = %v, want context.Canceled", err)
+	}
+	if errors.Is(err, ErrHierarchyIOOperationBudgetExceeded) {
+		t.Fatalf("reservation error = %v, must prefer context cancellation over budget exhaustion", err)
+	}
+	if got := budget.Usage().HierarchyIOOperations; got != 1 {
+		t.Fatalf("usage after canceled reservation = %d, want 1", got)
+	}
+}
+
+func TestBudgetTrackerReserveHierarchyIOOperationsPrefersExpiredAbsoluteDeadline(t *testing.T) {
+	t.Parallel()
+
+	budget := NewBudgetTracker(ConvergenceBudget{
+		MaxHierarchyIOOperations: 1,
+		Deadline:                 time.Now().Add(-time.Second),
+	})
+	budget.usage.HierarchyIOOperations = 1
+
+	err := budget.ReserveHierarchyIOOperations(context.Background(), 1)
+	if !errors.Is(err, ErrConvergenceDeadlineExceeded) {
+		t.Fatalf("reservation error = %v, want ErrConvergenceDeadlineExceeded", err)
+	}
+	if errors.Is(err, ErrHierarchyIOOperationBudgetExceeded) {
+		t.Fatalf("reservation error = %v, must prefer absolute deadline over budget exhaustion", err)
+	}
+	if got := budget.Usage().HierarchyIOOperations; got != 1 {
+		t.Fatalf("usage after expired-deadline reservation = %d, want 1", got)
+	}
+}
+
+func TestBudgetTrackerConcurrentHierarchyIOReservations(t *testing.T) {
+	t.Parallel()
+
+	const (
+		limit    = 64
+		attempts = 128
+	)
+	budget := NewBudgetTracker(ConvergenceBudget{MaxHierarchyIOOperations: limit})
+	start := make(chan struct{})
+	errs := make(chan error, attempts)
+	var wg sync.WaitGroup
+	wg.Add(attempts)
+	for i := 0; i < attempts; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- budget.ReserveHierarchyIOOperations(context.Background(), 1)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	var succeeded, exhausted int
+	for err := range errs {
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrHierarchyIOOperationBudgetExceeded):
+			exhausted++
+		default:
+			t.Fatalf("reservation error = %v, want nil or hierarchy I/O budget error", err)
+		}
+	}
+	if succeeded != limit || exhausted != attempts-limit {
+		t.Fatalf("reservation results: succeeded=%d exhausted=%d, want %d and %d",
+			succeeded, exhausted, limit, attempts-limit)
+	}
+	if got := budget.Usage().HierarchyIOOperations; got != limit {
+		t.Fatalf("charged hierarchy I/O = %d, want %d", got, limit)
+	}
+}
+
+func TestReservedBudgetedHierarchyDriverConcurrentPrepaidUse(t *testing.T) {
+	t.Parallel()
+
+	const operations = 64
+	budget := NewBudgetTracker(ConvergenceBudget{MaxHierarchyIOOperations: operations})
+	driver, err := newReservedBudgetedHierarchyDriver(context.Background(), newFakeHierarchyDriver(), budget, operations)
+	if err != nil {
+		t.Fatalf("reserve hierarchy I/O: %v", err)
+	}
+	reserved := driver.(*budgetedHierarchyDriver)
+
+	start := make(chan struct{})
+	errs := make(chan error, operations)
+	var wg sync.WaitGroup
+	wg.Add(operations)
+	for i := 0; i < operations; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			_, callErr := reserved.context(context.Background())
+			errs <- callErr
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	for callErr := range errs {
+		if callErr != nil {
+			t.Fatalf("prepaid context failed: %v", callErr)
+		}
+	}
+	if got := budget.Usage().HierarchyIOOperations; got != operations {
+		t.Fatalf("charged hierarchy I/O = %d, want reserved %d", got, operations)
 	}
 }
 

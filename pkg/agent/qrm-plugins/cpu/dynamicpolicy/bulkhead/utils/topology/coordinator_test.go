@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -222,6 +223,47 @@ func TestTopologyCoordinatorV2DisabledResetConvergesOnEmptyConfiguredCPUs(t *tes
 	got := state.CPUs.String()
 	if !state.ConfiguredCPUs.IsEmpty() || got != "0-3" {
 		t.Fatalf("state configured/effective = %q/%q, want empty/0-3", state.ConfiguredCPUs.String(), got)
+	}
+}
+
+func TestTopologyCoordinatorResetModeAutoBudgetBoundsPostSnapshotDescendantChurn(t *testing.T) {
+	dag, err := BuildDAG([]NodeSpec{{
+		Rel: "primary", Domain: DomainPrimary, Role: TopoNodeRolePrimary,
+		CPUs: machine.NewCPUSet(0, 1, 2, 3), Mems: "0", TrustAnchor: true,
+	}})
+	if err != nil {
+		t.Fatalf("BuildDAG() error = %v", err)
+	}
+	driver := newFakeHierarchyDriver()
+	driver.allowUnwitnessedExpansion = true
+	driver.add("primary", CgroupIdentity{Device: 1, Inode: 1}, "0-3", "0")
+	listPrimaryCalls := 0
+	driver.beforeCall = func(op HierarchyOperation, rel string) error {
+		if op != HierarchyOperationList || rel != "primary" {
+			return nil
+		}
+		listPrimaryCalls++
+		if listPrimaryCalls != 2 {
+			return nil
+		}
+		for i := 0; i < 128; i++ {
+			childRel := fmt.Sprintf("primary/churn-%03d", i)
+			driver.add(childRel, CgroupIdentity{Device: 1, Inode: uint64(i + 2)}, "0", "0")
+		}
+		return nil
+	}
+	cg := newTopologyFakeCgroup()
+	provider := &coordinatorSnapshotTestCgroup{topologyFakeCgroup: cg, driver: driver}
+
+	_, err = (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
+		DAG:    dag,
+		Cgroup: provider,
+		Mems:   "0",
+		Mode:   ResetModeGuard(),
+		Budget: ConvergenceBudget{DeadlineDuration: time.Minute},
+	})
+	if !errors.Is(err, ErrHierarchyIOOperationBudgetExceeded) {
+		t.Fatalf("Converge(reset) error = %v, want %v", err, ErrHierarchyIOOperationBudgetExceeded)
 	}
 }
 
@@ -1014,6 +1056,102 @@ func TestTopologyCoordinatorAdaptiveRoundBudgetConverges96CPUCleanupOnly(t *test
 	}
 }
 
+func TestTopologyCoordinatorAutoBudgetConvergesProductionHierarchyShape(t *testing.T) {
+	const (
+		cpuCount        = 101
+		handoffCPUCount = 100
+		numaBucketCount = 8
+		descendantCount = 174
+	)
+
+	details := benchmarkCPUDetails(numaBucketCount, cpuCount/numaBucketCount)
+	for cpu := len(details); cpu < cpuCount; cpu++ {
+		details[cpu] = machine.CPUTopoInfo{
+			NUMANodeID: cpu % numaBucketCount,
+			SocketID:   cpu % numaBucketCount,
+			CoreID:     cpu,
+		}
+	}
+	allCPUs := details.CPUs()
+	handoffCPUs := machine.NewCPUSet()
+	for cpu := 0; cpu < handoffCPUCount; cpu++ {
+		handoffCPUs.Add(cpu)
+	}
+	specs := []NodeSpec{
+		{
+			Rel: "primary", Domain: DomainPrimary, Role: TopoNodeRolePrimary,
+			CPUs: machine.NewCPUSet(handoffCPUCount), Mems: "0", ControlledRoot: true, TrustAnchor: true,
+		},
+		{
+			Rel: "reclaim", Domain: DomainReclaim, Role: TopoNodeRoleReclaim,
+			CPUs: handoffCPUs, Mems: "0", ControlledRoot: true, TrustAnchor: true,
+		},
+	}
+	cg := newTopologyFakeCgroup()
+	cg.cpus["primary"] = allCPUs
+	cg.cpus["reclaim"] = machine.NewCPUSet()
+	cg.files["primary"] = map[string][]byte{"cpuset.mems": []byte("0")}
+	cg.files["reclaim"] = map[string][]byte{"cpuset.mems": []byte("0")}
+
+	for numa := 0; numa < numaBucketCount; numa++ {
+		rel := fmt.Sprintf("reclaim/numa-%d", numa)
+		target := machine.NewCPUSet()
+		for cpu, info := range details {
+			if cpu < handoffCPUCount && info.NUMANodeID == numa {
+				target.Add(cpu)
+			}
+		}
+		specs = append(specs, NodeSpec{
+			Rel: rel, ParentRel: "reclaim", Domain: DomainReclaim,
+			Role: TopoNodeRoleReclaimNUMABucket, CPUs: target, Mems: "0",
+			TrustAnchor: true,
+			Constraint: TopologyConstraint{
+				CPUUpperBound: target.Clone(),
+				Scope:         TopologyScopeNUMANode,
+			},
+			Metadata: map[string]string{"numa": strconv.Itoa(numa)},
+		})
+		cg.cpus[rel] = machine.NewCPUSet()
+		cg.files[rel] = map[string][]byte{"cpuset.mems": []byte("0")}
+		cg.children["reclaim"] = append(cg.children["reclaim"], fmt.Sprintf("numa-%d", numa))
+	}
+	for i := 0; i < descendantCount; i++ {
+		name := fmt.Sprintf("pod-%03d", i)
+		rel := "primary/" + name
+		cg.children["primary"] = append(cg.children["primary"], name)
+		cg.cpus[rel] = machine.NewCPUSet(i % handoffCPUCount)
+		cg.files[rel] = map[string][]byte{"cpuset.mems": []byte("0")}
+	}
+	dag, err := BuildDAG(specs)
+	if err != nil {
+		t.Fatalf("BuildDAG: %v", err)
+	}
+
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
+		DAG:        dag,
+		Cgroup:     cg,
+		CPUDetails: details,
+		Mems:       "0",
+		DrainSelection: DrainSelectionPolicy{
+			MaxCPUsDrainRatio:         0.01,
+			RequirePairedSwapProgress: true,
+		},
+		Budget: ConvergenceBudget{DeadlineDuration: time.Minute},
+	})
+	if err != nil {
+		if !errors.Is(err, ErrHierarchyIOOperationBudgetExceeded) {
+			t.Fatalf("Converge error = %v, want successful convergence (old code must fail with typed hierarchy I/O budget error)", err)
+		}
+		t.Fatalf("Converge exhausted auto hierarchy I/O budget: %v; rounds=%d writes=%d", err, len(res.Rounds), len(cg.writes))
+	}
+	if !res.Converged || !res.FinalSnapshotCurrent {
+		t.Fatalf("Converge result = %+v, want current converged snapshot", res)
+	}
+	if got := len(res.FinalSnapshot.Entries); got != 2+numaBucketCount+descendantCount {
+		t.Fatalf("final snapshot entries = %d, want %d", got, 2+numaBucketCount+descendantCount)
+	}
+}
+
 func TestBudgetTrackerDerivesCumulativeAutoLimitsFromRoundsAndSnapshotSize(t *testing.T) {
 	t.Parallel()
 
@@ -1021,7 +1159,15 @@ func TestBudgetTrackerDerivesCumulativeAutoLimitsFromRoundsAndSnapshotSize(t *te
 		MaxSnapshotNodes: 4096,
 		MaxSnapshotDepth: 16,
 	})
-	if err := budget.configureAutoCumulativeLimits(513, 1000); err != nil {
+	if err := budget.configureAutoCumulativeLimitsFromInput(AutoCumulativeBudgetInput{
+		RemainingRounds:          513,
+		SnapshotIOUpperBound:     1000,
+		MaxDrainFrontiersTotal:   513,
+		MaxGrowDomainsTotal:      513,
+		MaxPlanOperationsTotal:   513 * 1000,
+		MaxChildMembershipsTotal: 1000,
+		StaleRetryAllowance:      513,
+	}); err != nil {
 		t.Fatalf("configure auto limits: %v", err)
 	}
 	if budget.limit.MaxRounds != 513 {
@@ -1043,13 +1189,114 @@ func TestBudgetTrackerPreservesExplicitNonZeroCumulativeLimits(t *testing.T) {
 		MaxHierarchyIOOperations: 11,
 		MaxPlanOperations:        13,
 	})
-	if err := budget.configureAutoCumulativeLimits(513, 1000); err != nil {
+	if err := budget.configureAutoCumulativeLimitsFromInput(AutoCumulativeBudgetInput{
+		RemainingRounds:          513,
+		SnapshotIOUpperBound:     1000,
+		MaxDrainFrontiersTotal:   513,
+		MaxGrowDomainsTotal:      513,
+		MaxPlanOperationsTotal:   513 * 1000,
+		MaxChildMembershipsTotal: 1000,
+		StaleRetryAllowance:      513,
+	}); err != nil {
 		t.Fatalf("configure explicit limits: %v", err)
 	}
 	if budget.limit.MaxRounds != 7 ||
 		budget.limit.MaxHierarchyIOOperations != 11 ||
 		budget.limit.MaxPlanOperations != 13 {
 		t.Fatalf("explicit limits changed: %+v", budget.limit)
+	}
+}
+
+func TestBudgetTrackerAutoCumulativeConfigurationIsAtomicOnOverflow(t *testing.T) {
+	t.Parallel()
+
+	budget := NewBudgetTracker(ConvergenceBudget{})
+	maxInt := int(^uint(0) >> 1)
+	err := budget.configureAutoCumulativeLimitsFromInput(AutoCumulativeBudgetInput{
+		RemainingRounds:        2,
+		SnapshotIOUpperBound:   maxInt,
+		MaxPlanOperationsTotal: 17,
+	})
+	if !errors.Is(err, ErrAutoCumulativeBudgetInvalid) {
+		t.Fatalf("configure auto limits error = %v, want %v", err, ErrAutoCumulativeBudgetInvalid)
+	}
+	if budget.limit.MaxRounds != 0 ||
+		budget.limit.MaxHierarchyIOOperations != 0 ||
+		budget.limit.MaxPlanOperations != 0 {
+		t.Fatalf("failed configuration partially changed limits: %+v", budget.limit)
+	}
+}
+
+func TestCoordinatorAutoPlanOperationsTotalUsesDepthFrontiersAndRoundsOnce(t *testing.T) {
+	t.Parallel()
+
+	snapshot := &CompleteSnapshot{
+		Entries: map[string]EntryState{
+			"root":         {},
+			"root/child":   {},
+			"root/child/x": {},
+		},
+		Children: map[string][]ChildRef{
+			"root":       {{Name: "child"}},
+			"root/child": {{Name: "x"}},
+		},
+	}
+	got, err := coordinatorAutoPlanOperationsTotal(2, snapshot)
+	if err != nil {
+		t.Fatalf("coordinatorAutoPlanOperationsTotal: %v", err)
+	}
+	// Per round: initial drain projection+operations = 3+2+3,
+	// frontier rebases = 2+1+0, and expand = 3.
+	if want := 2 * (8 + 3 + 3); got != want {
+		t.Fatalf("plan operations total = %d, want %d", got, want)
+	}
+}
+
+func TestBudgetTrackerAutoCumulativeConfigurationPreservesExplicitPlanLimit(t *testing.T) {
+	t.Parallel()
+
+	budget := NewBudgetTracker(ConvergenceBudget{MaxPlanOperations: 7})
+	err := budget.configureAutoCumulativeLimitsFromInput(AutoCumulativeBudgetInput{
+		RemainingRounds:        2,
+		SnapshotIOUpperBound:   3,
+		MaxPlanOperationsTotal: 100,
+	})
+	if err != nil {
+		t.Fatalf("configure auto limits: %v", err)
+	}
+	if got := budget.limit.MaxPlanOperations; got != 7 {
+		t.Fatalf("explicit plan operation limit = %d, want 7", got)
+	}
+	if err := budget.ConsumePlanOperations(8); !errors.Is(err, ErrPlanOperationBudgetExceeded) {
+		t.Fatalf("explicit plan limit overflow error = %v, want %v", err, ErrPlanOperationBudgetExceeded)
+	}
+}
+
+func TestCoordinatorAutoCumulativeBudgetInputReturnsTypedPlanOverflow(t *testing.T) {
+	t.Parallel()
+
+	dag, err := BuildDAG([]NodeSpec{{
+		Rel: "root", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0),
+	}})
+	if err != nil {
+		t.Fatalf("BuildDAG: %v", err)
+	}
+	snapshot := &CompleteSnapshot{
+		Entries: map[string]EntryState{
+			"root":       {},
+			"root/child": {},
+		},
+		Children: map[string][]ChildRef{
+			"root": {{Name: "child"}},
+		},
+		DomainUnion: map[DomainID]machine.CPUSet{
+			DomainPrimary: machine.NewCPUSet(0),
+		},
+		Cost: BudgetUsage{HierarchyIOOperations: 1},
+	}
+	_, err = coordinatorAutoCumulativeBudgetInput(int(^uint(0)>>1), dag, snapshot, BudgetUsage{})
+	if !errors.Is(err, ErrAutoCumulativeBudgetInvalid) {
+		t.Fatalf("coordinator auto budget error = %v, want %v", err, ErrAutoCumulativeBudgetInvalid)
 	}
 }
 
@@ -2964,6 +3211,55 @@ func deepDrainDynamicTargets() map[string]machine.CPUSet {
 	return map[string]machine.CPUSet{
 		"primary/child":      machine.NewCPUSet(0),
 		"primary/child/deep": machine.NewCPUSet(0),
+	}
+}
+
+func TestTopologyCoordinatorExplicitIOAutoPlanBudgetConverges300DeepDynamicDescendants(t *testing.T) {
+	const dynamicDepth = 300
+
+	dag, err := BuildDAG([]NodeSpec{{
+		Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0), Mems: "0",
+	}})
+	if err != nil {
+		t.Fatalf("BuildDAG: %v", err)
+	}
+	cg := newTopologyFakeCgroup()
+	cg.cpus["primary"] = machine.NewCPUSet(0, 1)
+	cg.files["primary"] = map[string][]byte{"cpuset.mems": []byte("0")}
+	dynamicTargets := make(map[string]machine.CPUSet, dynamicDepth)
+	parent := "primary"
+	for i := 0; i < dynamicDepth; i++ {
+		name := fmt.Sprintf("child-%03d", i)
+		rel := parent + "/" + name
+		cg.children[parent] = []string{name}
+		cg.cpus[rel] = machine.NewCPUSet(0, 1)
+		cg.files[rel] = map[string][]byte{"cpuset.mems": []byte("0")}
+		dynamicTargets[rel] = machine.NewCPUSet(0)
+		parent = rel
+	}
+
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
+		DAG:                 dag,
+		Cgroup:              cg,
+		CPUDetails:          machine.CPUDetails{0: {}, 1: {}},
+		ExpectedCPUSetByRel: dynamicTargets,
+		Budget: ConvergenceBudget{
+			MaxHierarchyIOOperations: 1_000_000,
+			MaxSnapshotDepth:         512,
+			DeadlineDuration:         time.Minute,
+		},
+	})
+	if err != nil {
+		if !errors.Is(err, ErrPlanOperationBudgetExceeded) {
+			t.Fatalf("Converge error = %v, want successful convergence (old code must fail with typed plan budget error)", err)
+		}
+		t.Fatalf("Converge exhausted auto plan budget: %v; rounds=%d writes=%d", err, len(res.Rounds), len(cg.writes))
+	}
+	if !res.Converged || !res.FinalSnapshotCurrent {
+		t.Fatalf("Converge result = %+v, want current converged snapshot", res)
+	}
+	if got := res.FinalSnapshot.Entries[parent].CPUs; !got.Equals(machine.NewCPUSet(0)) {
+		t.Fatalf("deepest descendant CPUs = %s, want 0", got.String())
 	}
 }
 
