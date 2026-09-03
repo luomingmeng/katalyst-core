@@ -17,6 +17,7 @@ limitations under the License.
 package model
 
 import (
+	"sort"
 	"testing"
 
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
@@ -42,12 +43,12 @@ func TestCPUSetPoolIdentityValid_BitsUT(t *testing.T) {
 		},
 		{
 			name:     "dedicated",
-			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindDedicated, PodUID: "dedicated-pod"},
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindDedicated, PodNamespace: "default", PodName: "dedicated-pod"},
 			want:     true,
 		},
 		{
 			name:     "isolation",
-			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindIsolation, PodUID: "isolation-pod"},
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindIsolation, PodNamespace: "default", PodName: "isolation-pod"},
 			want:     true,
 		},
 		{
@@ -59,36 +60,44 @@ func TestCPUSetPoolIdentityValid_BitsUT(t *testing.T) {
 			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindReclaim, Name: "reclaim"},
 		},
 		{
-			name:     "reclaim with pod uid",
-			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindReclaim, PodUID: "pod"},
+			name:     "reclaim with pod namespace",
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindReclaim, PodNamespace: "default"},
 		},
 		{
-			name:     "reclaim with name and pod uid",
-			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindReclaim, Name: "reclaim", PodUID: "pod"},
+			name:     "reclaim with pod name",
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindReclaim, PodName: "pod"},
 		},
 		{
 			name:     "share without name",
 			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindShare},
 		},
 		{
-			name:     "share with pod uid",
-			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindShare, Name: "share", PodUID: "pod"},
+			name:     "share with pod namespace",
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindShare, Name: "share", PodNamespace: "default"},
 		},
 		{
-			name:     "dedicated without pod uid",
+			name:     "dedicated without pod namespace",
 			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindDedicated},
 		},
 		{
-			name:     "dedicated with name",
-			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindDedicated, Name: "dedicated", PodUID: "pod"},
+			name:     "dedicated without pod name",
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindDedicated, PodNamespace: "default"},
 		},
 		{
-			name:     "isolation without pod uid",
+			name:     "dedicated with name",
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindDedicated, Name: "dedicated", PodNamespace: "default", PodName: "pod"},
+		},
+		{
+			name:     "isolation without pod namespace",
 			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindIsolation},
 		},
 		{
+			name:     "isolation without pod name",
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindIsolation, PodNamespace: "default"},
+		},
+		{
 			name:     "isolation with name",
-			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindIsolation, Name: "isolation", PodUID: "pod"},
+			identity: CPUSetPoolIdentity{Kind: CPUSetPoolKindIsolation, Name: "isolation", PodNamespace: "default", PodName: "pod"},
 		},
 	}
 
@@ -100,6 +109,36 @@ func TestCPUSetPoolIdentityValid_BitsUT(t *testing.T) {
 				t.Fatalf("Valid() = %v, want %v for %#v", got, tt.want, tt.identity)
 			}
 		})
+	}
+}
+
+func TestCPUSetPoolIdentityLess_BitsUT(t *testing.T) {
+	t.Parallel()
+
+	got := []CPUSetPoolIdentity{
+		{Kind: CPUSetPoolKindDedicated, PodNamespace: "team-b", PodName: "api"},
+		{Kind: CPUSetPoolKindReclaim},
+		{Kind: CPUSetPoolKindDedicated, PodNamespace: "team-a", PodName: "api-b"},
+		{Kind: CPUSetPoolKindShare, Name: "share-b"},
+		{Kind: CPUSetPoolKindDedicated, PodNamespace: "team-a", PodName: "api-a"},
+		{Kind: CPUSetPoolKindShare, Name: "share-a"},
+	}
+	sort.Slice(got, func(i, j int) bool {
+		return got[i].Less(got[j])
+	})
+
+	want := []CPUSetPoolIdentity{
+		{Kind: CPUSetPoolKindDedicated, PodNamespace: "team-a", PodName: "api-a"},
+		{Kind: CPUSetPoolKindDedicated, PodNamespace: "team-a", PodName: "api-b"},
+		{Kind: CPUSetPoolKindDedicated, PodNamespace: "team-b", PodName: "api"},
+		{Kind: CPUSetPoolKindReclaim},
+		{Kind: CPUSetPoolKindShare, Name: "share-a"},
+		{Kind: CPUSetPoolKindShare, Name: "share-b"},
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("sorted identity[%d] = %+v, want %+v; all=%+v", i, got[i], want[i], got)
+		}
 	}
 }
 
@@ -214,7 +253,7 @@ func TestDesiredViewToAppliedViewDeepCopyIsolation_BitsUT(t *testing.T) {
 func TestAppliedViewDeepCopyIsolation_BitsUT(t *testing.T) {
 	t.Parallel()
 
-	dedicated := CPUSetPoolIdentity{Kind: CPUSetPoolKindDedicated, PodUID: "abcdef"}
+	dedicated := CPUSetPoolIdentity{Kind: CPUSetPoolKindDedicated, PodNamespace: "default", PodName: "api"}
 	applied := &AppliedView{
 		CPUSetByRel: map[string]machine.CPUSet{
 			"system": machine.NewCPUSet(2, 3),
@@ -268,7 +307,7 @@ func TestAppliedViewDeepCopyIsolation_BitsUT(t *testing.T) {
 func TestAppliedViewPoolProjectionEquality_BitsUT(t *testing.T) {
 	t.Parallel()
 
-	dedicated := CPUSetPoolIdentity{Kind: CPUSetPoolKindDedicated, PodUID: "abcdef"}
+	dedicated := CPUSetPoolIdentity{Kind: CPUSetPoolKindDedicated, PodNamespace: "default", PodName: "api"}
 	applied := &AppliedView{
 		CPUSetPartitionView: NewCPUSetPartitionView(),
 		PoolProjection: AppliedPoolProjection{
@@ -293,7 +332,7 @@ func TestAppliedViewPoolProjectionEquality_BitsUT(t *testing.T) {
 	copied = applied.DeepCopy()
 	delete(copied.PoolProjection.CPUSetByIdentity, dedicated)
 	copied.PoolProjection.CPUSetByIdentity[CPUSetPoolIdentity{
-		Kind: CPUSetPoolKindDedicated, PodUID: "fedcba",
+		Kind: CPUSetPoolKindDedicated, PodNamespace: "default", PodName: "api-v2",
 	}] = machine.NewCPUSet(2, 3)
 	if EqualAppliedView(applied, copied) {
 		t.Fatal("EqualAppliedView should compare projected pool identities")

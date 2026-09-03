@@ -1168,8 +1168,9 @@ func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t
 				cgroup: cg,
 			}
 			dedicatedIdentity := model.CPUSetPoolIdentity{
-				Kind:   model.CPUSetPoolKindDedicated,
-				PodUID: podUID,
+				Kind:         model.CPUSetPoolKindDedicated,
+				PodNamespace: "default",
+				PodName:      "dedicated-pod",
 			}
 			desired := model.NewDesiredView()
 			desired.NonReclaimPool = machine.NewCPUSet(0, 1)
@@ -1179,6 +1180,7 @@ func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t
 				"main": desiredLeaf.Clone(),
 			}
 			desired.PoolOwners[dedicatedIdentity] = model.DesiredPoolOwner{
+				ProofPodUID:    podUID,
 				ExpectedCPUSet: desiredLeaf.Clone(),
 				ContainerCPUSetByName: map[string]machine.CPUSet{
 					"main": desiredLeaf.Clone(),
@@ -2006,7 +2008,7 @@ func TestCPUSetTopologyPluginReconcileDisabledPublishesReclaimOnlyProof(t *testi
 		{Kind: model.CPUSetPoolKindShare, Name: "stale-share"}: {
 			ExpectedCPUSet: machine.NewCPUSet(4, 5),
 		},
-		{Kind: model.CPUSetPoolKindDedicated, PodUID: "stale-pod"}: {
+		{Kind: model.CPUSetPoolKindDedicated, PodNamespace: "default", PodName: "stale-pod"}: {
 			ExpectedCPUSet: machine.NewCPUSet(6, 7),
 		},
 	}

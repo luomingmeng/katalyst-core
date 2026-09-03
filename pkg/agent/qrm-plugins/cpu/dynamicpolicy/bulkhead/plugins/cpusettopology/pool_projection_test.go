@@ -29,10 +29,10 @@ func TestBuildAppliedPoolProjectionFull(t *testing.T) {
 	reclaim := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindReclaim}
 	shareA := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindShare, Name: "share-a"}
 	shareB := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindShare, Name: "share-b"}
-	dedicatedA := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindDedicated, PodUID: "dedicated-a"}
-	dedicatedB := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindDedicated, PodUID: "dedicated-b"}
-	isolationA := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindIsolation, PodUID: "isolation-a"}
-	isolationB := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindIsolation, PodUID: "isolation-b"}
+	dedicatedA := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindDedicated, PodNamespace: "default", PodName: "dedicated-a"}
+	dedicatedB := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindDedicated, PodNamespace: "default", PodName: "dedicated-b"}
+	isolationA := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindIsolation, PodNamespace: "default", PodName: "isolation-a"}
+	isolationB := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindIsolation, PodNamespace: "default", PodName: "isolation-b"}
 	invalid := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindDedicated}
 
 	desired := model.NewDesiredView()
@@ -47,6 +47,7 @@ func TestBuildAppliedPoolProjectionFull(t *testing.T) {
 			ExpectedCPUSet: machine.NewCPUSet(4, 5, 6),
 		},
 		dedicatedA: {
+			ProofPodUID:    "dedicated-a",
 			ExpectedCPUSet: machine.NewCPUSet(3, 6, 7),
 			ContainerCPUSetByName: map[string]machine.CPUSet{
 				"main":    machine.NewCPUSet(3, 6),
@@ -54,18 +55,21 @@ func TestBuildAppliedPoolProjectionFull(t *testing.T) {
 			},
 		},
 		dedicatedB: {
+			ProofPodUID:    "dedicated-b",
 			ExpectedCPUSet: machine.NewCPUSet(11),
 			ContainerCPUSetByName: map[string]machine.CPUSet{
 				"main": machine.NewCPUSet(11),
 			},
 		},
 		isolationA: {
+			ProofPodUID:    "isolation-a",
 			ExpectedCPUSet: machine.NewCPUSet(6, 7),
 			ContainerCPUSetByName: map[string]machine.CPUSet{
 				"main": machine.NewCPUSet(6, 7),
 			},
 		},
 		isolationB: {
+			ProofPodUID:    "isolation-b",
 			ExpectedCPUSet: machine.NewCPUSet(12),
 			ContainerCPUSetByName: map[string]machine.CPUSet{
 				"main": machine.NewCPUSet(12),
@@ -126,7 +130,7 @@ func TestBuildAppliedPoolProjectionExcludesReserveBeforeOwnershipChecks(t *testi
 	t.Parallel()
 
 	share := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindShare, Name: "share"}
-	dedicated := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindDedicated, PodUID: "pod"}
+	dedicated := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindDedicated, PodNamespace: "default", PodName: "pod"}
 	invalid := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindDedicated}
 	desired := model.NewDesiredView()
 	desired.PoolOwners = map[model.CPUSetPoolIdentity]model.DesiredPoolOwner{
@@ -134,6 +138,7 @@ func TestBuildAppliedPoolProjectionExcludesReserveBeforeOwnershipChecks(t *testi
 			ExpectedCPUSet: machine.NewCPUSet(0, 1),
 		},
 		dedicated: {
+			ProofPodUID:    "pod",
 			ExpectedCPUSet: machine.NewCPUSet(1),
 			ContainerCPUSetByName: map[string]machine.CPUSet{
 				"main": machine.NewCPUSet(1),
@@ -177,7 +182,7 @@ func TestBuildAppliedPoolProjectionExcludesReserveBeforeOwnershipChecks(t *testi
 func TestBuildAppliedPoolProjectionMissingOrDeferredLeafDoesNotFallBackToDesired(t *testing.T) {
 	t.Parallel()
 
-	identity := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindDedicated, PodUID: "pod"}
+	identity := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindDedicated, PodNamespace: "default", PodName: "pod"}
 	for _, tt := range []struct {
 		name       string
 		finalByPod func() map[string]map[string]machine.CPUSet
@@ -201,6 +206,7 @@ func TestBuildAppliedPoolProjectionMissingOrDeferredLeafDoesNotFallBackToDesired
 
 			desired := model.NewDesiredView()
 			desired.PoolOwners[identity] = model.DesiredPoolOwner{
+				ProofPodUID:    "pod",
 				ExpectedCPUSet: machine.NewCPUSet(2),
 				ContainerCPUSetByName: map[string]machine.CPUSet{
 					"main": machine.NewCPUSet(2),

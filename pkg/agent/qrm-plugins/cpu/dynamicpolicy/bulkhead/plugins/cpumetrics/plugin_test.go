@@ -180,11 +180,11 @@ func TestCPUMetricsPluginPeriodicalHandler(t *testing.T) {
 	t.Parallel()
 
 	pools := map[model.CPUSetPoolIdentity]machine.CPUSet{
-		{Kind: model.CPUSetPoolKindReclaim}:                      machine.NewCPUSet(4, 5),
-		{Kind: model.CPUSetPoolKindShare, Name: "batch NUMA0"}:   machine.NewCPUSet(0, 2),
-		{Kind: model.CPUSetPoolKindDedicated, PodUID: "ab91"}:    machine.NewCPUSet(1),
-		{Kind: model.CPUSetPoolKindIsolation, PodUID: "cd91"}:    machine.NewCPUSet(3),
-		{Kind: model.CPUSetPoolKindShare, Name: "empty ignored"}: machine.NewCPUSet(),
+		{Kind: model.CPUSetPoolKindReclaim}:                                                machine.NewCPUSet(4, 5),
+		{Kind: model.CPUSetPoolKindShare, Name: "batch NUMA0"}:                             machine.NewCPUSet(0, 2),
+		{Kind: model.CPUSetPoolKindDedicated, PodNamespace: "default", PodName: "api"}:     machine.NewCPUSet(1),
+		{Kind: model.CPUSetPoolKindIsolation, PodNamespace: "kube-system", PodName: "qrm"}: machine.NewCPUSet(3),
+		{Kind: model.CPUSetPoolKindShare, Name: "empty ignored"}:                           machine.NewCPUSet(),
 	}
 	details := machine.CPUDetails{
 		0: {NUMANodeID: 0}, 1: {NUMANodeID: 0},
@@ -279,11 +279,11 @@ func TestCPUMetricsPluginDiagnostics(t *testing.T) {
 	t.Parallel()
 
 	view := viewWithProjection(model.AppliedViewLevelFull, map[model.CPUSetPoolIdentity]machine.CPUSet{
-		{Kind: model.CPUSetPoolKindReclaim}:                   machine.NewCPUSet(0),
-		{Kind: model.CPUSetPoolKindShare, Name: "same label"}: machine.NewCPUSet(1),
-		{Kind: model.CPUSetPoolKindShare, Name: "same_label"}: machine.NewCPUSet(2),
-		{Kind: model.CPUSetPoolKindDedicated, PodUID: ""}:     machine.NewCPUSet(3),
-		{Kind: model.CPUSetPoolKindIsolation, PodUID: ""}:     machine.NewCPUSet(4),
+		{Kind: model.CPUSetPoolKindReclaim}:                                  machine.NewCPUSet(0),
+		{Kind: model.CPUSetPoolKindShare, Name: "same label"}:                machine.NewCPUSet(1),
+		{Kind: model.CPUSetPoolKindShare, Name: "same_label"}:                machine.NewCPUSet(2),
+		{Kind: model.CPUSetPoolKindDedicated, PodNamespace: "", PodName: ""}: machine.NewCPUSet(3),
+		{Kind: model.CPUSetPoolKindIsolation, PodNamespace: "", PodName: ""}: machine.NewCPUSet(4),
 	})
 	view.PoolProjection.UncoveredCPUs = machine.NewCPUSet(5, 6)
 	view.PoolProjection.AmbiguousCPUs = machine.NewCPUSet(7)

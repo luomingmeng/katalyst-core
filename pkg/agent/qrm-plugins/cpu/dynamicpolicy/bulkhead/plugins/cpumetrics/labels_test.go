@@ -20,7 +20,6 @@ import (
 	"math/rand"
 	"strings"
 	"testing"
-	"unicode/utf8"
 
 	"github.com/stretchr/testify/require"
 
@@ -36,11 +35,11 @@ func TestAssignPoolLabels(t *testing.T) {
 	share := func(name string) model.CPUSetPoolIdentity {
 		return model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindShare, Name: name}
 	}
-	dedicated := func(uid string) model.CPUSetPoolIdentity {
-		return model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindDedicated, PodUID: uid}
+	dedicated := func(namespace, name string) model.CPUSetPoolIdentity {
+		return model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindDedicated, PodNamespace: namespace, PodName: name}
 	}
-	isolation := func(uid string) model.CPUSetPoolIdentity {
-		return model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindIsolation, PodUID: uid}
+	isolation := func(namespace, name string) model.CPUSetPoolIdentity {
+		return model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindIsolation, PodNamespace: namespace, PodName: name}
 	}
 	wantEmptyConflicts := func() map[model.CPUSetPoolKind]machine.CPUSet {
 		return map[model.CPUSetPoolKind]machine.CPUSet{
@@ -50,167 +49,73 @@ func TestAssignPoolLabels(t *testing.T) {
 		}
 	}
 
-	t.Run("assigns fixed formatted and short UID labels", func(t *testing.T) {
+	t.Run("assigns fixed formatted pool labels", func(t *testing.T) {
 		t.Parallel()
 
 		byIdentity := map[model.CPUSetPoolIdentity]machine.CPUSet{
-			reclaim:              machine.NewCPUSet(0),
-			share("batch NUMA0"): machine.NewCPUSet(1),
-			dedicated("ab91"):    machine.NewCPUSet(2),
-			isolation("x"):       machine.NewCPUSet(3),
+			reclaim:                               machine.NewCPUSet(0),
+			share("batch NUMA0"):                  machine.NewCPUSet(1),
+			dedicated("default", "api-pod"):       machine.NewCPUSet(2),
+			isolation("kube-system", "agent pod"): machine.NewCPUSet(3),
 		}
 
 		got := assignPoolLabels(byIdentity)
 
 		require.Equal(t, []labeledPool{
-			{identity: dedicated("ab91"), label: "dedicated-ab", cpus: machine.NewCPUSet(2)},
-			{identity: isolation("x"), label: "isolation-x", cpus: machine.NewCPUSet(3)},
+			{identity: dedicated("default", "api-pod"), label: "dedicated-default/api-pod", cpus: machine.NewCPUSet(2)},
+			{identity: isolation("kube-system", "agent pod"), label: "isolation-kube-system/agent_pod", cpus: machine.NewCPUSet(3)},
 			{identity: reclaim, label: "reclaim", cpus: machine.NewCPUSet(0)},
 			{identity: share("batch NUMA0"), label: "batch_NUMA0", cpus: machine.NewCPUSet(1)},
 		}, got.pools)
 		require.Equal(t, wantEmptyConflicts(), got.conflictCPUByKind)
 	})
 
-	t.Run("extends all colliding UID candidates to the shortest unique prefix", func(t *testing.T) {
+	t.Run("omits pod identities missing namespace or name", func(t *testing.T) {
 		t.Parallel()
 
 		got := assignPoolLabels(map[model.CPUSetPoolIdentity]machine.CPUSet{
-			dedicated("ab91"): machine.NewCPUSet(9),
-			dedicated("ab72"): machine.NewCPUSet(7),
+			dedicated("", "pod"):        machine.NewCPUSet(1),
+			isolation("default", ""):    machine.NewCPUSet(2),
+			dedicated("default", "pod"): machine.NewCPUSet(3),
 		})
 
 		require.Equal(t, []labeledPool{
-			{identity: dedicated("ab72"), label: "dedicated-ab7", cpus: machine.NewCPUSet(7)},
-			{identity: dedicated("ab91"), label: "dedicated-ab9", cpus: machine.NewCPUSet(9)},
+			{identity: dedicated("default", "pod"), label: "dedicated-default/pod", cpus: machine.NewCPUSet(3)},
+		}, got.pools)
+		require.Equal(t, map[model.CPUSetPoolKind]machine.CPUSet{
+			model.CPUSetPoolKindShare:     machine.NewCPUSet(),
+			model.CPUSetPoolKindDedicated: machine.NewCPUSet(1),
+			model.CPUSetPoolKindIsolation: machine.NewCPUSet(2),
+		}, got.conflictCPUByKind)
+	})
+
+	t.Run("keeps namespace as part of the pod pool label", func(t *testing.T) {
+		t.Parallel()
+
+		got := assignPoolLabels(map[model.CPUSetPoolIdentity]machine.CPUSet{
+			dedicated("team-a", "api"): machine.NewCPUSet(1),
+			dedicated("team-b", "api"): machine.NewCPUSet(2),
+		})
+
+		require.Equal(t, []labeledPool{
+			{identity: dedicated("team-a", "api"), label: "dedicated-team-a/api", cpus: machine.NewCPUSet(1)},
+			{identity: dedicated("team-b", "api"), label: "dedicated-team-b/api", cpus: machine.NewCPUSet(2)},
 		}, got.pools)
 		require.Equal(t, wantEmptyConflicts(), got.conflictCPUByKind)
 	})
 
-	t.Run("extends UID labels through the first differing character", func(t *testing.T) {
-		t.Parallel()
-
-		tests := []struct {
-			name        string
-			firstUID    string
-			secondUID   string
-			firstLabel  string
-			secondLabel string
-		}{
-			{
-				name:        "fourth character",
-				firstUID:    "abc1tail",
-				secondUID:   "abc2tail",
-				firstLabel:  "dedicated-abc1",
-				secondLabel: "dedicated-abc2",
-			},
-			{
-				name:        "fifth character",
-				firstUID:    "abcd1tail",
-				secondUID:   "abcd2tail",
-				firstLabel:  "dedicated-abcd1",
-				secondLabel: "dedicated-abcd2",
-			},
-			{
-				name:        "sixth character",
-				firstUID:    "abcde1tail",
-				secondUID:   "abcde2tail",
-				firstLabel:  "dedicated-abcde1",
-				secondLabel: "dedicated-abcde2",
-			},
-			{
-				name:        "seventh character",
-				firstUID:    "abcdef1tail",
-				secondUID:   "abcdef2tail",
-				firstLabel:  "dedicated-abcdef1",
-				secondLabel: "dedicated-abcdef2",
-			},
-			{
-				name:        "eighth character",
-				firstUID:    "abcdefg1tail",
-				secondUID:   "abcdefg2tail",
-				firstLabel:  "dedicated-abcdefg1",
-				secondLabel: "dedicated-abcdefg2",
-			},
-		}
-
-		for _, tc := range tests {
-			tc := tc
-			t.Run(tc.name, func(t *testing.T) {
-				t.Parallel()
-
-				got := assignPoolLabels(map[model.CPUSetPoolIdentity]machine.CPUSet{
-					dedicated(tc.firstUID):  machine.NewCPUSet(1),
-					dedicated(tc.secondUID): machine.NewCPUSet(2),
-				})
-
-				require.Equal(t, []labeledPool{
-					{identity: dedicated(tc.firstUID), label: tc.firstLabel, cpus: machine.NewCPUSet(1)},
-					{identity: dedicated(tc.secondUID), label: tc.secondLabel, cpus: machine.NewCPUSet(2)},
-				}, got.pools)
-				require.Equal(t, wantEmptyConflicts(), got.conflictCPUByKind)
-			})
-		}
-	})
-
-	t.Run("falls back to complete UID after the first eight characters collide", func(t *testing.T) {
+	t.Run("omits fixed pod label colliding with a shared label", func(t *testing.T) {
 		t.Parallel()
 
 		got := assignPoolLabels(map[model.CPUSetPoolIdentity]machine.CPUSet{
-			dedicated("abcdefgh1"): machine.NewCPUSet(1),
-			dedicated("abcdefgh2"): machine.NewCPUSet(2),
+			share("dedicated-default/pod"):    machine.NewCPUSet(1),
+			dedicated("default", "pod"):       machine.NewCPUSet(2),
+			dedicated("default", "other-pod"): machine.NewCPUSet(3),
 		})
 
 		require.Equal(t, []labeledPool{
-			{identity: dedicated("abcdefgh1"), label: "dedicated-abcdefgh1", cpus: machine.NewCPUSet(1)},
-			{identity: dedicated("abcdefgh2"), label: "dedicated-abcdefgh2", cpus: machine.NewCPUSet(2)},
+			{identity: dedicated("default", "other-pod"), label: "dedicated-default/other-pod", cpus: machine.NewCPUSet(3)},
 		}, got.pools)
-		require.Equal(t, wantEmptyConflicts(), got.conflictCPUByKind)
-	})
-
-	t.Run("falls back to complete non-ASCII UIDs after eight runes collide", func(t *testing.T) {
-		t.Parallel()
-
-		firstUID := "甲乙丙丁戊己庚辛一"
-		secondUID := "甲乙丙丁戊己庚辛二"
-		got := assignPoolLabels(map[model.CPUSetPoolIdentity]machine.CPUSet{
-			dedicated(firstUID):  machine.NewCPUSet(1),
-			dedicated(secondUID): machine.NewCPUSet(2),
-		})
-
-		require.Equal(t, []labeledPool{
-			{identity: dedicated(firstUID), label: "dedicated-" + firstUID, cpus: machine.NewCPUSet(1)},
-			{identity: dedicated(secondUID), label: "dedicated-" + secondUID, cpus: machine.NewCPUSet(2)},
-		}, got.pools)
-		for _, pool := range got.pools {
-			require.True(t, utf8.ValidString(pool.label))
-		}
-		require.Equal(t, wantEmptyConflicts(), got.conflictCPUByKind)
-	})
-
-	t.Run("extends a dynamic label past a reserved shared label", func(t *testing.T) {
-		t.Parallel()
-
-		got := assignPoolLabels(map[model.CPUSetPoolIdentity]machine.CPUSet{
-			share("dedicated-ab"): machine.NewCPUSet(1),
-			dedicated("ab91"):     machine.NewCPUSet(2),
-		})
-
-		require.Equal(t, []labeledPool{
-			{identity: dedicated("ab91"), label: "dedicated-ab9", cpus: machine.NewCPUSet(2)},
-			{identity: share("dedicated-ab"), label: "dedicated-ab", cpus: machine.NewCPUSet(1)},
-		}, got.pools)
-		require.Equal(t, wantEmptyConflicts(), got.conflictCPUByKind)
-	})
-
-	t.Run("omits every participant in an unresolvable dynamic shared collision", func(t *testing.T) {
-		t.Parallel()
-
-		got := assignPoolLabels(map[model.CPUSetPoolIdentity]machine.CPUSet{
-			share("dedicated-x"): machine.NewCPUSet(1),
-			dedicated("x"):       machine.NewCPUSet(2),
-		})
-
-		require.Empty(t, got.pools)
 		require.Equal(t, map[model.CPUSetPoolKind]machine.CPUSet{
 			model.CPUSetPoolKindShare:     machine.NewCPUSet(1),
 			model.CPUSetPoolKindDedicated: machine.NewCPUSet(2),
@@ -259,15 +164,13 @@ func TestAssignPoolLabels(t *testing.T) {
 		}, got.conflictCPUByKind)
 	})
 
-	t.Run("omits all dynamic identities when complete formatted labels still collide", func(t *testing.T) {
+	t.Run("omits pod identities whose formatted labels collide", func(t *testing.T) {
 		t.Parallel()
 
 		common := strings.Repeat("a", utilmetric.MaxTagLength)
-		firstUID := common + "1"
-		secondUID := common + "2"
 		got := assignPoolLabels(map[model.CPUSetPoolIdentity]machine.CPUSet{
-			dedicated(firstUID):  machine.NewCPUSet(4),
-			dedicated(secondUID): machine.NewCPUSet(5),
+			dedicated(common+"1", "pod"): machine.NewCPUSet(4),
+			dedicated(common+"2", "pod"): machine.NewCPUSet(5),
 		})
 
 		require.Empty(t, got.pools)
@@ -275,27 +178,6 @@ func TestAssignPoolLabels(t *testing.T) {
 			model.CPUSetPoolKindShare:     machine.NewCPUSet(),
 			model.CPUSetPoolKindDedicated: machine.NewCPUSet(4, 5),
 			model.CPUSetPoolKindIsolation: machine.NewCPUSet(),
-		}, got.conflictCPUByKind)
-	})
-
-	t.Run("omits empty UIDs and accepts one character UIDs", func(t *testing.T) {
-		t.Parallel()
-
-		got := assignPoolLabels(map[model.CPUSetPoolIdentity]machine.CPUSet{
-			dedicated(""):  machine.NewCPUSet(0),
-			isolation(""):  machine.NewCPUSet(1),
-			dedicated("d"): machine.NewCPUSet(2),
-			isolation("i"): machine.NewCPUSet(3),
-		})
-
-		require.Equal(t, []labeledPool{
-			{identity: dedicated("d"), label: "dedicated-d", cpus: machine.NewCPUSet(2)},
-			{identity: isolation("i"), label: "isolation-i", cpus: machine.NewCPUSet(3)},
-		}, got.pools)
-		require.Equal(t, map[model.CPUSetPoolKind]machine.CPUSet{
-			model.CPUSetPoolKindShare:     machine.NewCPUSet(),
-			model.CPUSetPoolKindDedicated: machine.NewCPUSet(0),
-			model.CPUSetPoolKindIsolation: machine.NewCPUSet(1),
 		}, got.conflictCPUByKind)
 	})
 
@@ -309,9 +191,9 @@ func TestAssignPoolLabels(t *testing.T) {
 		entries := []entry{
 			{identity: reclaim, cpus: machine.NewCPUSet(0)},
 			{identity: share("batch NUMA0"), cpus: machine.NewCPUSet(1)},
-			{identity: dedicated("ab91"), cpus: machine.NewCPUSet(2)},
-			{identity: dedicated("ab72"), cpus: machine.NewCPUSet(3)},
-			{identity: isolation("z"), cpus: machine.NewCPUSet(4)},
+			{identity: dedicated("default", "api-b"), cpus: machine.NewCPUSet(2)},
+			{identity: dedicated("default", "api-a"), cpus: machine.NewCPUSet(3)},
+			{identity: isolation("kube-system", "agent"), cpus: machine.NewCPUSet(4)},
 		}
 		baselineMap := make(map[model.CPUSetPoolIdentity]machine.CPUSet, len(entries))
 		for _, entry := range entries {
@@ -336,37 +218,16 @@ func TestAssignPoolLabels(t *testing.T) {
 		t.Parallel()
 
 		withCollision := assignPoolLabels(map[model.CPUSetPoolIdentity]machine.CPUSet{
-			dedicated("ab91"): machine.NewCPUSet(1),
-			dedicated("ab72"): machine.NewCPUSet(2),
+			share("dedicated-default/api"): machine.NewCPUSet(1),
+			dedicated("default", "api"):    machine.NewCPUSet(2),
 		})
 		withoutCollision := assignPoolLabels(map[model.CPUSetPoolIdentity]machine.CPUSet{
-			dedicated("ab91"): machine.NewCPUSet(1),
+			dedicated("default", "api"): machine.NewCPUSet(2),
 		})
 
-		require.Equal(t, "dedicated-ab9", withCollision.pools[1].label)
+		require.Empty(t, withCollision.pools)
 		require.Equal(t, []labeledPool{
-			{identity: dedicated("ab91"), label: "dedicated-ab", cpus: machine.NewCPUSet(1)},
+			{identity: dedicated("default", "api"), label: "dedicated-default/api", cpus: machine.NewCPUSet(2)},
 		}, withoutCollision.pools)
 	})
-}
-
-func TestUIDLabelCandidates(t *testing.T) {
-	t.Parallel()
-
-	uid := "甲乙丙丁戊己庚辛壬"
-	got := uidLabelCandidates("dedicated-", uid)
-
-	require.Equal(t, []string{
-		"dedicated-甲乙",
-		"dedicated-甲乙丙",
-		"dedicated-甲乙丙丁",
-		"dedicated-甲乙丙丁戊",
-		"dedicated-甲乙丙丁戊己",
-		"dedicated-甲乙丙丁戊己庚",
-		"dedicated-甲乙丙丁戊己庚辛",
-		"dedicated-" + uid,
-	}, got)
-	for _, candidate := range got {
-		require.True(t, utf8.ValidString(candidate))
-	}
 }

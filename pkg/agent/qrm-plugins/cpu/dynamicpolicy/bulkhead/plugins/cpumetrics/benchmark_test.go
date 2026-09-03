@@ -36,8 +36,9 @@ func BenchmarkCPUMetricsPlugin256Pods8NUMA(b *testing.B) {
 	details := make(machine.CPUDetails, podCount)
 	for cpu := 0; cpu < podCount; cpu++ {
 		pools[model.CPUSetPoolIdentity{
-			Kind:   model.CPUSetPoolKindDedicated,
-			PodUID: fmt.Sprintf("benchmark-pod-%03d", cpu),
+			Kind:         model.CPUSetPoolKindDedicated,
+			PodNamespace: "default",
+			PodName:      fmt.Sprintf("benchmark-pod-%03d", cpu),
 		}] = machine.NewCPUSet(cpu)
 		cpus = append(cpus, cpu)
 		details[cpu] = machine.CPUTopoInfo{

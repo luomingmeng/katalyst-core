@@ -1054,8 +1054,9 @@ func TestManagerPublishedPoolProjectionSurvivesSourceMutation(t *testing.T) {
 	t.Parallel()
 
 	identity := model.CPUSetPoolIdentity{
-		Kind:   model.CPUSetPoolKindDedicated,
-		PodUID: "dedicated-pod",
+		Kind:         model.CPUSetPoolKindDedicated,
+		PodNamespace: "default",
+		PodName:      "dedicated-pod",
 	}
 	source := model.NewDesiredView().ToAppliedView()
 	source.Level = model.AppliedViewLevelFull

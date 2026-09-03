@@ -538,9 +538,11 @@ func TestBuildCPUSetPartitionViewPoolOwners(t *testing.T) {
 					"main":    machine.NewCPUSet(2),
 					"sidecar": machine.NewCPUSet(3),
 				} {
-					state.SetAllocationInfo("dedicated-pod", containerName, &cpustate.AllocationInfo{
+					state.SetAllocationInfo("dedicated-uid", containerName, &cpustate.AllocationInfo{
 						AllocationMeta: commonstate.AllocationMeta{
-							PodUid:        "dedicated-pod",
+							PodUid:        "dedicated-uid",
+							PodNamespace:  "default",
+							PodName:       "dedicated-pod",
 							ContainerName: containerName,
 							OwnerPoolName: commonstate.PoolNameDedicated,
 							QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
@@ -548,9 +550,11 @@ func TestBuildCPUSetPartitionViewPoolOwners(t *testing.T) {
 						AllocationResult: cpus,
 					})
 				}
-				state.SetAllocationInfo("isolation-pod", "main", &cpustate.AllocationInfo{
+				state.SetAllocationInfo("isolation-uid", "main", &cpustate.AllocationInfo{
 					AllocationMeta: commonstate.AllocationMeta{
-						PodUid:        "isolation-pod",
+						PodUid:        "isolation-uid",
+						PodNamespace:  "default",
+						PodName:       "isolation-pod",
 						ContainerName: "main",
 						OwnerPoolName: "rp-a/isolation-workload",
 						QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
@@ -620,14 +624,16 @@ func TestBuildCPUSetPartitionViewPoolOwners(t *testing.T) {
 				{Kind: model.CPUSetPoolKindShare, Name: "rp-c/share-NUMA0"}: {
 					ExpectedCPUSet: machine.NewCPUSet(6),
 				},
-				{Kind: model.CPUSetPoolKindDedicated, PodUID: "dedicated-pod"}: {
+				{Kind: model.CPUSetPoolKindDedicated, PodNamespace: "default", PodName: "dedicated-pod"}: {
+					ProofPodUID:    "dedicated-uid",
 					ExpectedCPUSet: machine.NewCPUSet(2, 3),
 					ContainerCPUSetByName: map[string]machine.CPUSet{
 						"main":    machine.NewCPUSet(2),
 						"sidecar": machine.NewCPUSet(3),
 					},
 				},
-				{Kind: model.CPUSetPoolKindIsolation, PodUID: "isolation-pod"}: {
+				{Kind: model.CPUSetPoolKindIsolation, PodNamespace: "default", PodName: "isolation-pod"}: {
+					ProofPodUID:    "isolation-uid",
 					ExpectedCPUSet: machine.NewCPUSet(4, 5),
 					ContainerCPUSetByName: map[string]machine.CPUSet{
 						"main": machine.NewCPUSet(4, 5),
