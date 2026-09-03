@@ -403,7 +403,11 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 		ProtectedPending: in.ProtectedPendingCPUSet, ProtectedByRel: in.ProtectedCPUSetByRel,
 		CPUDetails: in.CPUDetails, Selection: round.selection,
 	}, in.Budget.MaxRounds)
-	if err := budget.configureAutoCumulativeLimits(round.maxRounds, len(initialSnapshot.Entries)); err != nil {
+	autoBudgetInput, err := coordinatorAutoCumulativeBudgetInput(round.maxRounds, in.DAG, initialSnapshot, budget.Usage())
+	if err != nil {
+		return *res, err
+	}
+	if err := budget.configureAutoCumulativeLimitsFromInput(autoBudgetInput); err != nil {
 		return *res, err
 	}
 	round.pendingSnapshot = initialSnapshot
@@ -613,6 +617,102 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 	}
 }
 
+func coordinatorAutoCumulativeBudgetInput(
+	rounds int,
+	dag *TopoDAG,
+	snapshot *CompleteSnapshot,
+	usage BudgetUsage,
+) (AutoCumulativeBudgetInput, error) {
+	if dag == nil || snapshot == nil {
+		return AutoCumulativeBudgetInput{}, fmt.Errorf("%w: DAG and initial snapshot are required", ErrAutoCumulativeBudgetInvalid)
+	}
+	snapshotNodes := len(snapshot.Entries)
+	if snapshotNodes == 0 {
+		snapshotNodes = 1
+	}
+	snapshotIO := snapshot.Cost.HierarchyIOOperations
+	if snapshotIO <= 0 {
+		snapshotIO = saturatingAdd(saturatingMultiply(snapshotNodes, 2), 1)
+	}
+	drainFrontiers, err := checkedAutoBudgetMultiply(rounds, len(dag.index))
+	if err != nil {
+		return AutoCumulativeBudgetInput{}, err
+	}
+	growDomains, err := checkedAutoBudgetMultiply(rounds, len(snapshot.DomainUnion))
+	if err != nil {
+		return AutoCumulativeBudgetInput{}, err
+	}
+	planOperations, err := coordinatorAutoPlanOperationsTotal(rounds, snapshot)
+	if err != nil {
+		return AutoCumulativeBudgetInput{}, err
+	}
+	childMemberships, err := checkedAutoBudgetMultiply(rounds, snapshotChildEdgeCount(snapshot))
+	if err != nil {
+		return AutoCumulativeBudgetInput{}, err
+	}
+	return AutoCumulativeBudgetInput{
+		CurrentUsedIO:            usage.HierarchyIOOperations,
+		RemainingRounds:          rounds,
+		SnapshotIOUpperBound:     snapshotIO,
+		MaxDrainFrontiersTotal:   drainFrontiers,
+		MaxGrowDomainsTotal:      growDomains,
+		MaxPlanOperationsTotal:   planOperations,
+		MaxChildMembershipsTotal: childMemberships,
+		StaleRetryAllowance:      rounds,
+	}, nil
+}
+
+func coordinatorAutoPlanOperationsTotal(rounds int, snapshot *CompleteSnapshot) (int, error) {
+	if rounds <= 0 || snapshot == nil {
+		return 0, fmt.Errorf("%w: positive rounds and initial snapshot are required for plan operations",
+			ErrAutoCumulativeBudgetInvalid)
+	}
+	snapshotNodes := len(snapshot.Entries)
+	if snapshotNodes == 0 {
+		snapshotNodes = 1
+	}
+
+	// One drain build charges a projection walk over every entry and child
+	// membership, followed by at most one monotonic shrink operation per entry.
+	// Expand likewise contributes at most one monotonic grow operation per entry.
+	initialPlan, err := checkedAutoBudgetSum(
+		snapshotNodes,
+		snapshotChildEdgeCount(snapshot),
+		snapshotNodes,
+	)
+	if err != nil {
+		return 0, err
+	}
+	perRound, err := checkedAutoBudgetSum(initialPlan, snapshotNodes)
+	if err != nil {
+		return 0, err
+	}
+
+	// Drain executes one depth frontier at a time. Every completed frontier
+	// rebases the plan and charges the number of operations still pending.
+	// Derive that cumulative triangular term from the initial hierarchy shape:
+	// wide siblings share one frontier, while a deep chain has one per depth.
+	depthByRel := buildSnapshotDepthByRel(snapshot, nil)
+	frontierWidths := make(map[int]int)
+	for rel := range snapshot.Entries {
+		frontierWidths[depthByRel[rel]]++
+	}
+	depths := make([]int, 0, len(frontierWidths))
+	for depth := range frontierWidths {
+		depths = append(depths, depth)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(depths)))
+	remaining := len(snapshot.Entries)
+	for _, depth := range depths {
+		remaining -= frontierWidths[depth]
+		perRound, err = checkedAutoBudgetSum(perRound, remaining)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return checkedAutoBudgetMultiply(rounds, perRound)
+}
+
 func prioritizeRoundStalePlanError(outcome RoundOutcome, err error) error {
 	if err == nil || outcome.Blocker == nil || !replanRequired(outcome.Blocker) {
 		return err
@@ -804,6 +904,19 @@ func (c TopologyCoordinator) convergeReset(ctx context.Context, in CoordinatorIn
 		return *res, err
 	}
 	defer driver.Close()
+	if in.Budget.MaxHierarchyIOOperations == 0 {
+		initialSnapshot, err := newCompleteSnapshotSource(driver, in.DAG, budget, in.TraversalBoundaries)(ctx)
+		if err != nil {
+			return *res, err
+		}
+		autoBudgetInput, err := coordinatorAutoCumulativeBudgetInput(1, in.DAG, initialSnapshot, budget.Usage())
+		if err != nil {
+			return *res, err
+		}
+		if err := budget.configureAutoCumulativeLimitsFromInput(autoBudgetInput); err != nil {
+			return *res, err
+		}
+	}
 	writer := newResetCoordinatorWriter(driver, budget, in.Mems, res)
 	if err := writer.execute(ctx, in.DAG, targets, allowEmptyTarget, in.ExpectedCPUSetByRel, in.TraversalBoundaries); err != nil {
 		return *res, err

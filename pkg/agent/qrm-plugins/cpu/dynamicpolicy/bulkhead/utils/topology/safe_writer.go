@@ -40,9 +40,10 @@ type safeCPSetWriter struct {
 }
 
 type stableLiveChildren struct {
-	cpus machine.CPUSet
-	mems machine.CPUSet
-	refs []ChildRef
+	cpus  machine.CPUSet
+	mems  machine.CPUSet
+	refs  []ChildRef
+	byRel map[string]EntryState
 }
 
 func newSafeCPUSetWriter(driver HierarchyDriver, budget *BudgetTracker, res *ConvergenceResult) safeCPSetWriter {
@@ -69,45 +70,44 @@ func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 		return fmt.Errorf("phase writer requires convergence budget")
 	}
 	failClosedRels := safeWriterFailClosedRels(plan)
-	stableChildUnion, err := w.scanStableShrinkChildren(
+	stableChildUnion, err := w.scanStableOperationChildren(
 		ctx, plan.Operations, plan.Capabilities, failClosedRels)
 	if err != nil {
 		return err
 	}
 	ioOperations := 0
 	for _, operation := range plan.Operations {
-		ioOperations++ // local operation read/identity/direction precondition
-		if operation.ParentRel != "" {
-			ioOperations++ // live immediate-parent identity/containment precondition
-		}
-		if operation.WriteMems {
-			ioOperations++
-		}
-		if operation.Direction == WriteShrink && operation.WriteMems {
-			children := stableChildUnion[operation.Rel]
-			// Re-prove live child mems before writing. A missing v2 cpuset interface
-			// needs one identity stat before an uncontrolled child can be skipped.
-			ioOperations += 2 + 2*len(children.refs)
-		}
-		ioOperations++ // CPU write
-		ioOperations++ // post-write read/journal
+		ioOperations = saturatingAdd(ioOperations,
+			estimateFinalPreflightAndMutationHierarchyIO(operation, len(stableChildUnion[operation.Rel].refs)))
 	}
-	driver, err := newReservedBudgetedHierarchyDriver(w.driver, w.budget, ioOperations)
+	driver, err := newStrictReservedHierarchyDriver(ctx, w.driver, w.budget, ioOperations)
 	if err != nil {
 		return err
 	}
 	w.driver = driver
+
+	// Freeze and validate the complete operation set before the first mutation.
+	// In particular, a later operation becoming stale must not leave an earlier
+	// operation partially applied.
+	preflightChildren := make(map[string]stableLiveChildren, len(plan.Operations))
+	precedingOperations := make(map[string]PlanOperation, len(plan.Operations))
 	for _, operation := range plan.Operations {
-		if operation.Direction == WriteShrink && operation.WriteMems {
-			children, err := scanLiveChildrenOnce(ctx, w.driver, operation, failClosedRels)
-			if err != nil {
-				return err
-			}
-			stableChildUnion[operation.Rel] = children
-		}
-		if err := w.precheckOperation(ctx, operation, stableChildUnion, plan.Capabilities); err != nil {
+		children, err := scanFrozenLiveChildrenOnce(
+			ctx, w.driver, operation, stableChildUnion[operation.Rel],
+			operation.Direction == WriteShrink && operation.WriteMems, failClosedRels)
+		if err != nil {
 			return err
 		}
+		children = projectPrecedingChildTargets(operation.Rel, children, precedingOperations)
+		preflightChildren[operation.Rel] = children
+		if err := w.precheckOperation(
+			ctx, operation, preflightChildren, plan.Capabilities, precedingOperations); err != nil {
+			return err
+		}
+		precedingOperations[operation.Rel] = operation
+	}
+
+	for _, operation := range plan.Operations {
 		if w.res != nil {
 			w.res.Attempted++
 		}
@@ -162,6 +162,29 @@ func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 	return nil
 }
 
+func estimateStableChildScanHierarchyIO(scans, childMemberships int) int {
+	if scans < 0 || childMemberships < 0 {
+		return 0
+	}
+	// Two child-list observations bracket one entry read per membership.
+	return saturatingAdd(saturatingMultiply(2, scans), childMemberships)
+}
+
+func estimateFinalPreflightAndMutationHierarchyIO(operation PlanOperation, childMemberships int) int {
+	operations := 3 // local precheck, CPU write, and post-write readback
+	if operation.ParentRel != "" {
+		operations++ // live parent identity/containment precheck
+	}
+	if operation.WriteMems {
+		operations++ // cpuset.mems write
+	}
+	// Every operation gets one final child-set freeze before any operation is
+	// written. Each frozen child can require a read and an identity stat when an
+	// unavailable v2 interface is skipped.
+	operations = saturatingAdd(operations, saturatingAdd(2, saturatingMultiply(2, childMemberships)))
+	return operations
+}
+
 func (w safeCPSetWriter) classifyWriteError(
 	err error,
 	phase PhaseKind,
@@ -188,7 +211,7 @@ func phaseWriteError(
 		phase, operation.Rel, operation.Direction, resource, current, target, err)
 }
 
-func (w safeCPSetWriter) scanStableShrinkChildren(
+func (w safeCPSetWriter) scanStableOperationChildren(
 	ctx context.Context,
 	operations []PlanOperation,
 	capabilities HierarchyCapabilities,
@@ -200,20 +223,15 @@ func (w safeCPSetWriter) scanStableShrinkChildren(
 	}
 	stableChildren := make(map[string]stableLiveChildren)
 	for _, operation := range operations {
-		if operation.Direction != WriteShrink {
-			continue
-		}
 		skipCPUCheck := isConfiguredInheritanceClear(operation, capabilities)
-		checkMems := operation.WriteMems
-		if skipCPUCheck && !checkMems {
-			continue
-		}
+		checkMems := operation.Direction == WriteShrink && operation.WriteMems
 		children, err := scanStableLiveChildren(
 			ctx, driver, operation.Rel, checkMems, failClosedRels)
 		if err != nil {
 			return nil, err
 		}
-		if !skipCPUCheck && !children.cpus.IsSubsetOf(operation.Target.CPUs) {
+		if operation.Direction == WriteShrink &&
+			!skipCPUCheck && !children.cpus.IsSubsetOf(operation.Target.CPUs) {
 			return nil, &PlanStaleError{
 				Rel: operation.Rel, Direction: operation.Direction, Resource: "child_union",
 				Current: children.cpus.String(), Target: operation.Target.CPUs.String(),
@@ -223,6 +241,107 @@ func (w safeCPSetWriter) scanStableShrinkChildren(
 		stableChildren[operation.Rel] = children
 	}
 	return stableChildren, nil
+}
+
+func scanFrozenLiveChildrenOnce(
+	ctx context.Context,
+	driver HierarchyDriver,
+	operation PlanOperation,
+	frozen stableLiveChildren,
+	readMems bool,
+	failClosedRels map[string]struct{},
+) (stableLiveChildren, error) {
+	before, err := driver.ListChildren(ctx, operation.Rel)
+	if err != nil {
+		return stableLiveChildren{}, err
+	}
+	frozenFingerprint := ChildrenFingerprint(frozen.refs)
+	if currentFingerprint := ChildrenFingerprint(before); currentFingerprint != frozenFingerprint {
+		return stableLiveChildren{}, &PlanStaleError{
+			Rel: operation.Rel, Direction: operation.Direction, Resource: "children",
+			Current: currentFingerprint, Target: frozenFingerprint,
+			Err: fmt.Errorf("live children changed during final preflight"),
+		}
+	}
+	children := stableLiveChildren{
+		cpus:  machine.NewCPUSet(),
+		mems:  machine.NewCPUSet(),
+		refs:  before,
+		byRel: make(map[string]EntryState, len(before)),
+	}
+	for _, child := range before {
+		childRel := filepath.Join(operation.Rel, child.Name)
+		entry, readErr := driver.ReadEntry(ctx, childRel)
+		if readErr != nil {
+			skip, proofErr := proveSafeUnavailableChildSkip(
+				ctx, driver, childRel, child.Identity, readErr, failClosedRels)
+			if proofErr != nil {
+				return stableLiveChildren{}, proofErr
+			}
+			if skip {
+				continue
+			}
+			return stableLiveChildren{}, readErr
+		}
+		if entry.Identity != child.Identity {
+			return stableLiveChildren{}, &PlanStaleError{
+				Rel: operation.Rel, Direction: operation.Direction, Resource: "child_identity",
+				Current: fmt.Sprint(entry.Identity), Target: fmt.Sprint(child.Identity),
+				Err: fmt.Errorf("live child identity changed during final preflight"),
+			}
+		}
+		children.cpus = children.cpus.Union(entry.CPUs)
+		children.byRel[childRel] = entry
+		if readMems {
+			childMems, parseErr := machine.Parse(entry.Mems)
+			if parseErr != nil {
+				return stableLiveChildren{}, fmt.Errorf("parse live child %q cpuset.mems=%q: %w",
+					childRel, entry.Mems, parseErr)
+			}
+			children.mems = children.mems.Union(childMems)
+		}
+	}
+	after, err := driver.ListChildren(ctx, operation.Rel)
+	if err != nil {
+		return stableLiveChildren{}, err
+	}
+	if currentFingerprint := ChildrenFingerprint(after); currentFingerprint != frozenFingerprint {
+		return stableLiveChildren{}, &PlanStaleError{
+			Rel: operation.Rel, Direction: operation.Direction, Resource: "children",
+			Current: currentFingerprint, Target: frozenFingerprint,
+			Err: fmt.Errorf("live children changed during final preflight"),
+		}
+	}
+	return children, nil
+}
+
+func projectPrecedingChildTargets(
+	parentRel string,
+	children stableLiveChildren,
+	precedingOperations map[string]PlanOperation,
+) stableLiveChildren {
+	projected := stableLiveChildren{
+		cpus:  machine.NewCPUSet(),
+		mems:  machine.NewCPUSet(),
+		refs:  children.refs,
+		byRel: make(map[string]EntryState, len(children.byRel)),
+	}
+	for rel, entry := range children.byRel {
+		if operation, ok := precedingOperations[rel]; ok && filepath.Dir(rel) == parentRel {
+			entry.CPUs = operation.Target.CPUs.Clone()
+			if operation.WriteMems {
+				entry.Mems = operation.Target.Mems
+			}
+		}
+		projected.byRel[rel] = entry
+		projected.cpus = projected.cpus.Union(entry.CPUs)
+		if entry.Mems != "" {
+			if mems, err := machine.Parse(entry.Mems); err == nil {
+				projected.mems = projected.mems.Union(mems)
+			}
+		}
+	}
+	return projected
 }
 
 func scanStableLiveChildren(
@@ -242,6 +361,7 @@ func scanStableLiveChildren(
 		}
 		childUnion := machine.NewCPUSet()
 		childMemsUnion := machine.NewCPUSet()
+		childEntries := make(map[string]EntryState, len(before))
 		stale := false
 		for _, child := range before {
 			childRel := filepath.Join(rel, child.Name)
@@ -265,6 +385,7 @@ func scanStableLiveChildren(
 				stale = true
 				break
 			}
+			childEntries[childRel] = entry
 			if readMems {
 				childMems, parseErr := machine.Parse(entry.Mems)
 				if parseErr != nil {
@@ -289,8 +410,118 @@ func scanStableLiveChildren(
 		if ChildrenFingerprint(before) != ChildrenFingerprint(after) {
 			continue
 		}
-		return stableLiveChildren{cpus: childUnion, mems: childMemsUnion, refs: before}, nil
+		return stableLiveChildren{cpus: childUnion, mems: childMemsUnion, refs: before, byRel: childEntries}, nil
 	}
+}
+
+// strictReservedHierarchyDriver consumes only the slots atomically reserved by
+// safeCPSetWriter. Exhaustion is a fail-closed accounting bug; it must never
+// fall back to ordinary per-call charging after mutation preflight begins.
+type strictReservedHierarchyDriver struct {
+	HierarchyDriver
+	budget    *BudgetTracker
+	remaining int
+}
+
+func newStrictReservedHierarchyDriver(
+	ctx context.Context,
+	driver HierarchyDriver,
+	budget *BudgetTracker,
+	operations int,
+) (HierarchyDriver, error) {
+	if err := budget.ReserveHierarchyIOOperations(ctx, operations); err != nil {
+		return nil, err
+	}
+	if wrapped, ok := driver.(*budgetedHierarchyDriver); ok && wrapped.budget == budget {
+		driver = wrapped.driver
+	}
+	return &strictReservedHierarchyDriver{
+		HierarchyDriver: driver,
+		budget:          budget,
+		remaining:       operations,
+	}, nil
+}
+
+func (d *strictReservedHierarchyDriver) consume(ctx context.Context) error {
+	if err := d.budget.checkContextDeadline(ctx); err != nil {
+		return err
+	}
+	if d.remaining <= 0 {
+		return fmt.Errorf("%w: prepaid hierarchy I/O exhausted",
+			ErrHierarchyIOOperationBudgetExceeded)
+	}
+	d.remaining--
+	return nil
+}
+
+func (d *strictReservedHierarchyDriver) Roots(ctx context.Context) ([]RootRef, error) {
+	if err := d.consume(ctx); err != nil {
+		return nil, err
+	}
+	return d.HierarchyDriver.Roots(ctx)
+}
+
+func (d *strictReservedHierarchyDriver) StatIdentity(ctx context.Context, rel string) (CgroupIdentity, error) {
+	if err := d.consume(ctx); err != nil {
+		return CgroupIdentity{}, err
+	}
+	return d.HierarchyDriver.StatIdentity(ctx, rel)
+}
+
+func (d *strictReservedHierarchyDriver) ReadEntry(ctx context.Context, rel string) (EntryState, error) {
+	if err := d.consume(ctx); err != nil {
+		return EntryState{}, err
+	}
+	return d.HierarchyDriver.ReadEntry(ctx, rel)
+}
+
+func (d *strictReservedHierarchyDriver) ListChildren(ctx context.Context, rel string) ([]ChildRef, error) {
+	if err := d.consume(ctx); err != nil {
+		return nil, err
+	}
+	if driver, ok := d.HierarchyDriver.(interface {
+		listChildrenWithBudget(context.Context, string, *BudgetTracker) ([]ChildRef, error)
+	}); ok {
+		return driver.listChildrenWithBudget(ctx, rel, d.budget)
+	}
+	children, err := d.HierarchyDriver.ListChildren(ctx, rel)
+	if err != nil {
+		return nil, err
+	}
+	depth := childDepth(rel)
+	for _, child := range children {
+		if err := d.budget.checkContextDeadline(ctx); err != nil {
+			return nil, err
+		}
+		if err := d.budget.VisitNode(filepath.Join(rel, child.Name), child.Identity, depth); err != nil {
+			return nil, err
+		}
+	}
+	return children, nil
+}
+
+func (d *strictReservedHierarchyDriver) WriteCPUs(
+	ctx context.Context,
+	rel string,
+	expected CgroupIdentity,
+	cpus machine.CPUSet,
+) error {
+	if err := d.consume(ctx); err != nil {
+		return err
+	}
+	return d.HierarchyDriver.WriteCPUs(ctx, rel, expected, cpus)
+}
+
+func (d *strictReservedHierarchyDriver) WriteMems(
+	ctx context.Context,
+	rel string,
+	expected CgroupIdentity,
+	mems string,
+) error {
+	if err := d.consume(ctx); err != nil {
+		return err
+	}
+	return d.HierarchyDriver.WriteMems(ctx, rel, expected, mems)
 }
 
 func scanLiveChildrenOnce(
@@ -398,6 +629,7 @@ func (w safeCPSetWriter) precheckOperation(
 	operation PlanOperation,
 	stableChildUnion map[string]stableLiveChildren,
 	capabilities HierarchyCapabilities,
+	precedingOperations map[string]PlanOperation,
 ) error {
 	if operation.Direction != WriteShrink && operation.Direction != WriteGrow {
 		return fmt.Errorf("unsupported plan operation direction %q", operation.Direction)
@@ -425,24 +657,32 @@ func (w safeCPSetWriter) precheckOperation(
 			return fmt.Errorf("%w: planned operation parent=%q expected=%v current=%v",
 				ErrCgroupIdentityChanged, operation.ParentRel, operation.ExpectedParentIdentity, parent.Identity)
 		}
-		if operation.Direction == WriteGrow && !operation.Target.CPUs.IsSubsetOf(parent.CPUs) {
+		parentCPUs := parent.CPUs
+		parentMems := parent.Mems
+		if parentOperation, ok := precedingOperations[operation.ParentRel]; ok {
+			parentCPUs = parentOperation.Target.CPUs
+			if parentOperation.WriteMems {
+				parentMems = parentOperation.Target.Mems
+			}
+		}
+		if operation.Direction == WriteGrow && !operation.Target.CPUs.IsSubsetOf(parentCPUs) {
 			return &PlanStaleError{
 				Rel:       operation.Rel,
 				Direction: operation.Direction,
 				Resource:  "parent_cpuset.cpus",
-				Current:   parent.CPUs.String(),
+				Current:   parentCPUs.String(),
 				Target:    operation.Target.CPUs.String(),
 				Err: fmt.Errorf("planned grow target outside live parent %q",
 					operation.ParentRel),
 			}
 		}
 		if operation.Direction == WriteGrow && operation.WriteMems {
-			parentMems, parentErr := machine.Parse(parent.Mems)
+			parsedParentMems, parentErr := machine.Parse(parentMems)
 			targetMems, targetErr := machine.Parse(operation.Target.Mems)
-			if parentErr != nil || targetErr != nil || !targetMems.IsSubsetOf(parentMems) {
+			if parentErr != nil || targetErr != nil || !targetMems.IsSubsetOf(parsedParentMems) {
 				return &PlanStaleError{
 					Rel: operation.Rel, Direction: operation.Direction, Resource: "parent_cpuset.mems",
-					Current: parent.Mems, Target: operation.Target.Mems,
+					Current: parentMems, Target: operation.Target.Mems,
 					Err: fmt.Errorf("planned mems grow target outside live parent %q: parent_parse=%v target_parse=%v",
 						operation.ParentRel, parentErr, targetErr),
 				}

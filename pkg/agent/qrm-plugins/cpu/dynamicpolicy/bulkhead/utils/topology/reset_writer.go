@@ -110,7 +110,7 @@ func (w resetCoordinatorWriter) writeResetRel(ctx context.Context, rel, parentRe
 	if mems != "" {
 		operations++ // WriteMems(rel).
 	}
-	driver, err := newReservedBudgetedHierarchyDriver(w.driver, w.budget, operations)
+	driver, err := newReservedBudgetedHierarchyDriver(ctx, w.driver, w.budget, operations)
 	if err != nil {
 		return err
 	}
@@ -180,7 +180,7 @@ func (w resetCoordinatorWriter) propagateResetTarget(
 		}
 		return
 	}
-	driver, err := newReservedBudgetedHierarchyDriver(w.driver, w.budget, 1)
+	driver, err := newReservedBudgetedHierarchyDriver(ctx, w.driver, w.budget, 1)
 	if err != nil {
 		if *firstErr == nil {
 			*firstErr = err

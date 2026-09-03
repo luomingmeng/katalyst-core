@@ -38,6 +38,7 @@ var (
 	ErrPlanOperationBudgetExceeded        = errors.New("plan operation budget exceeded")
 	ErrDeadlockProbeBudgetExceeded        = errors.New("deadlock probe operation budget exceeded")
 	ErrConvergenceDeadlineExceeded        = errors.New("convergence deadline exceeded")
+	ErrAutoCumulativeBudgetInvalid        = errors.New("automatic cumulative budget is invalid")
 )
 
 // ConvergenceBudget bounds all work performed by one coordinator invocation.
@@ -77,7 +78,22 @@ type BudgetUsage struct {
 	DeadlockProbeOperations int
 }
 
+// AutoCumulativeBudgetInput is an invocation-scoped upper bound assembled
+// from the initial snapshot and the coordinator's finite round/work limits.
+// Totals are cumulative and must not be multiplied by RemainingRounds again.
+type AutoCumulativeBudgetInput struct {
+	CurrentUsedIO            int
+	RemainingRounds          int
+	SnapshotIOUpperBound     int
+	MaxDrainFrontiersTotal   int
+	MaxGrowDomainsTotal      int
+	MaxPlanOperationsTotal   int
+	MaxChildMembershipsTotal int
+	StaleRetryAllowance      int
+}
+
 const defaultConvergenceDeadlineDuration = 10 * time.Second
+const fixedInvocationHierarchyIOHeadroom = 64
 
 // DefaultConvergenceBudget returns defensive structural limits. Cumulative
 // round, hierarchy-I/O, and plan limits are derived after the first snapshot.
@@ -204,35 +220,107 @@ func (b *BudgetTracker) Usage() BudgetUsage {
 	return b.usage
 }
 
-func (b *BudgetTracker) configureAutoCumulativeLimits(rounds, snapshotNodes int) error {
+func (b *BudgetTracker) configureAutoCumulativeLimitsFromInput(in AutoCumulativeBudgetInput) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.usage.Rounds != 0 {
 		return fmt.Errorf("cannot configure cumulative budgets after round use: used=%d", b.usage.Rounds)
 	}
-	if rounds <= 0 {
-		return fmt.Errorf("automatic round budget must be positive: %d", rounds)
+	if in.RemainingRounds <= 0 {
+		return fmt.Errorf("%w: remaining rounds must be positive: %d", ErrAutoCumulativeBudgetInvalid, in.RemainingRounds)
 	}
-	if snapshotNodes <= 0 {
-		snapshotNodes = 1
+	for name, value := range map[string]int{
+		"current used I/O":         in.CurrentUsedIO,
+		"snapshot I/O upper bound": in.SnapshotIOUpperBound,
+		"drain frontiers":          in.MaxDrainFrontiersTotal,
+		"grow domains":             in.MaxGrowDomainsTotal,
+		"plan operations":          in.MaxPlanOperationsTotal,
+		"child memberships":        in.MaxChildMembershipsTotal,
+		"stale retries":            in.StaleRetryAllowance,
+	} {
+		if value < 0 {
+			return fmt.Errorf("%w: %s must not be negative: %d", ErrAutoCumulativeBudgetInvalid, name, value)
+		}
+	}
+	if in.SnapshotIOUpperBound == 0 {
+		return fmt.Errorf("%w: snapshot I/O upper bound must be positive", ErrAutoCumulativeBudgetInvalid)
+	}
+	if b.limit.MaxHierarchyIOOperations != 0 {
+		if b.limit.MaxRounds == 0 {
+			b.limit.MaxRounds = in.RemainingRounds
+		}
+		if b.limit.MaxPlanOperations == 0 {
+			b.limit.MaxPlanOperations = in.MaxPlanOperationsTotal
+		}
+		return nil
+	}
+
+	maxSnapshots, err := checkedAutoBudgetSum(
+		1,
+		in.RemainingRounds,
+		in.MaxDrainFrontiersTotal,
+		in.MaxGrowDomainsTotal,
+		in.StaleRetryAllowance,
+	)
+	if err != nil {
+		return err
+	}
+	snapshotIO, err := checkedAutoBudgetMultiply(maxSnapshots, in.SnapshotIOUpperBound)
+	if err != nil {
+		return err
+	}
+	stableChildScanIO, err := checkedAutoBudgetMultiply(
+		estimateStableChildScanHierarchyIO(in.MaxDrainFrontiersTotal, in.MaxChildMembershipsTotal),
+		2,
+	)
+	if err != nil {
+		return err
+	}
+	mutationIO, err := checkedAutoBudgetMultiply(in.MaxPlanOperationsTotal, 5)
+	if err != nil {
+		return err
+	}
+	limit, err := checkedAutoBudgetSum(
+		in.CurrentUsedIO,
+		snapshotIO,
+		stableChildScanIO,
+		mutationIO,
+		fixedInvocationHierarchyIOHeadroom,
+	)
+	if err != nil {
+		return err
 	}
 	if b.limit.MaxRounds == 0 {
-		b.limit.MaxRounds = rounds
-	}
-	if b.limit.MaxHierarchyIOOperations == 0 {
-		// A fixed-point round may take several complete snapshots plus
-		// verification and writes. Size this from the actual controlled
-		// hierarchy instead of a machine-independent cumulative constant.
-		perRound := saturatingAdd(saturatingMultiply(snapshotNodes, 8), 64)
-		b.limit.MaxHierarchyIOOperations = saturatingMultiply(saturatingAdd(rounds, 2), perRound)
+		b.limit.MaxRounds = in.RemainingRounds
 	}
 	if b.limit.MaxPlanOperations == 0 {
-		// Drain and expand planning each walk controlled entries and charge
-		// candidate operations. Leave conservative room for both phases.
-		perRound := saturatingAdd(saturatingMultiply(snapshotNodes, 4), 32)
-		b.limit.MaxPlanOperations = saturatingMultiply(rounds, perRound)
+		b.limit.MaxPlanOperations = in.MaxPlanOperationsTotal
 	}
+	b.limit.MaxHierarchyIOOperations = limit
 	return nil
+}
+
+func checkedAutoBudgetMultiply(left, right int) (int, error) {
+	if left < 0 || right < 0 {
+		return 0, fmt.Errorf("%w: negative multiplication operand: %d * %d", ErrAutoCumulativeBudgetInvalid, left, right)
+	}
+	maxInt := int(^uint(0) >> 1)
+	if left != 0 && right > maxInt/left {
+		return 0, fmt.Errorf("%w: integer overflow multiplying %d by %d", ErrAutoCumulativeBudgetInvalid, left, right)
+	}
+	return left * right, nil
+}
+
+func checkedAutoBudgetSum(values ...int) (int, error) {
+	total := 0
+	maxInt := int(^uint(0) >> 1)
+	for _, value := range values {
+		if value < 0 || value > maxInt-total {
+			return 0, fmt.Errorf("%w: integer overflow adding %d to %d", ErrAutoCumulativeBudgetInvalid, value, total)
+		}
+		total += value
+	}
+	return total, nil
 }
 
 func saturatingMultiply(left, right int) int {
@@ -268,11 +356,15 @@ func (b *BudgetTracker) beforeHierarchyIOOperation(ctx context.Context) error {
 }
 
 func (b *BudgetTracker) checkContextDeadline(ctx context.Context) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.checkContextDeadlineLocked(ctx)
+}
+
+func (b *BudgetTracker) checkContextDeadlineLocked(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
 	if !b.limit.Deadline.IsZero() && !time.Now().Before(b.limit.Deadline) {
 		return fmt.Errorf("%w: deadline=%s", ErrConvergenceDeadlineExceeded, b.limit.Deadline.Format(time.RFC3339Nano))
 	}
@@ -365,16 +457,24 @@ func (b *BudgetTracker) ConsumePlanOperations(count int) error {
 // ReserveHierarchyIOOperations charges a known execution upper bound before
 // mutation starts. The reserved calls must then use the unbudgeted execution
 // path so they are not charged a second time.
-func (b *BudgetTracker) ReserveHierarchyIOOperations(count int) error {
-	if err := b.checkContextDeadline(context.Background()); err != nil {
+func (b *BudgetTracker) ReserveHierarchyIOOperations(ctx context.Context, count int) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := b.checkContextDeadlineLocked(ctx); err != nil {
 		return err
 	}
-	return b.consume(
-		&b.usage.HierarchyIOOperations,
-		b.limit.MaxHierarchyIOOperations,
-		count,
-		ErrHierarchyIOOperationBudgetExceeded,
-	)
+	if count < 0 {
+		return fmt.Errorf("negative budget charge: %d", count)
+	}
+	maxInt := int(^uint(0) >> 1)
+	used := b.usage.HierarchyIOOperations
+	limit := b.limit.MaxHierarchyIOOperations
+	if used < 0 || count > maxInt-used || limit > 0 && (used > limit || count > limit-used) {
+		return fmt.Errorf("%w: limit=%d used=%d requested=%d",
+			ErrHierarchyIOOperationBudgetExceeded, limit, used, count)
+	}
+	b.usage.HierarchyIOOperations += count
+	return nil
 }
 
 func (b *BudgetTracker) consume(used *int, limit, count int, sentinel error) error {
@@ -383,7 +483,8 @@ func (b *BudgetTracker) consume(used *int, limit, count int, sentinel error) err
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if limit > 0 && *used+count > limit {
+	maxInt := int(^uint(0) >> 1)
+	if *used < 0 || count > maxInt-*used || limit > 0 && (*used > limit || count > limit-*used) {
 		return fmt.Errorf("%w: limit=%d used=%d requested=%d", sentinel, limit, *used, count)
 	}
 	*used += count
@@ -395,17 +496,18 @@ type budgetedHierarchyDriver struct {
 	budget *BudgetTracker
 	// prepaid is the number of real driver calls charged atomically before a
 	// mutation phase starts. Each method call still consumes one prepaid slot.
-	prepaid int
-	close   sync.Once
-	err     error
+	prepaidMu sync.Mutex
+	prepaid   int
+	close     sync.Once
+	err       error
 }
 
 func NewBudgetedHierarchyDriver(driver HierarchyDriver, budget *BudgetTracker) HierarchyDriver {
 	return &budgetedHierarchyDriver{driver: driver, budget: budget}
 }
 
-func newReservedBudgetedHierarchyDriver(driver HierarchyDriver, budget *BudgetTracker, operations int) (HierarchyDriver, error) {
-	if err := budget.ReserveHierarchyIOOperations(operations); err != nil {
+func newReservedBudgetedHierarchyDriver(ctx context.Context, driver HierarchyDriver, budget *BudgetTracker, operations int) (HierarchyDriver, error) {
+	if err := budget.ReserveHierarchyIOOperations(ctx, operations); err != nil {
 		return nil, err
 	}
 	if wrapped, ok := driver.(*budgetedHierarchyDriver); ok && wrapped.budget == budget {
@@ -422,13 +524,17 @@ func (d *budgetedHierarchyDriver) Close() error {
 }
 
 func (d *budgetedHierarchyDriver) context(ctx context.Context) (context.Context, error) {
+	d.prepaidMu.Lock()
 	if d.prepaid > 0 {
 		if err := d.budget.checkContextDeadline(ctx); err != nil {
+			d.prepaidMu.Unlock()
 			return nil, err
 		}
 		d.prepaid--
+		d.prepaidMu.Unlock()
 		return ctx, nil
 	}
+	d.prepaidMu.Unlock()
 	if err := d.budget.beforeHierarchyIOOperation(ctx); err != nil {
 		return nil, err
 	}
