@@ -440,7 +440,6 @@ func (p *DynamicPolicy) clearResidualState(_ *coreconfig.Configuration,
 			delete(podEntries, podUID)
 		}
 
-		p.cleanPoolsFromPodEntries(podEntries)
 		var updatedMachineState state.NUMANodeMap
 		updatedMachineState, err = generateMachineStateFromPodEntries(p.machineInfo.CPUTopology, podEntries, p.state.GetMachineState())
 		if err != nil {
@@ -448,19 +447,11 @@ func (p *DynamicPolicy) clearResidualState(_ *coreconfig.Configuration,
 			return
 		}
 
-		err = p.adjustAllocationEntriesAtRevision(
-			podEntries, updatedMachineState, false, expectedRevision)
+		err = p.adjustAllocationEntriesAfterDeletionAtRevision(
+			podEntries, updatedMachineState, true, expectedRevision)
 		if err != nil {
 			general.ErrorS(err, "adjustAllocationEntries failed")
-			err = p.persistPodDeletionAfterAdjustFailure(
-				err, podEntries, updatedMachineState, expectedRevision)
-			if err != nil {
-				general.ErrorS(err, "persist residual pod deletion after adjust failure failed")
-			}
 			return
-		}
-		if err := p.state.StoreState(); err != nil {
-			general.ErrorS(err, "store state failed")
 		}
 	}
 }

@@ -3156,7 +3156,7 @@ func TestAllocateSharedNUMABindingWithoutHardPartitionUsesAtomicPoolCommitAndPre
 	allocation, err := p.allocateSharedNumaBindingCPUs(context.Background(), req, req.Hint, false)
 	require.NoError(t, err)
 	require.NotNil(t, allocation)
-	require.Equal(t, initialRevision+4, p.state.GetRevision())
+	require.Equal(t, initialRevision+2, p.state.GetRevision())
 	require.Equal(t, []uint64{initialRevision, initialRevision + 1}, hookRevisions)
 	require.Equal(t, [][2]int{{-1, 0}, {0, allocation.AllocationResult.Size()}}, hookAllocationSizes)
 }

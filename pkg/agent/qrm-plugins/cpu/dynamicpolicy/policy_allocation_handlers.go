@@ -766,12 +766,12 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 	adjustErr := p.runCPUSetAdjustmentHandlers(adjustCtx, dynamicpolicyutil.CPUSetAdjustmentModeAdmission)
 	cancel()
 	if adjustErr != nil {
-		rollbackErr, persistErr := p.rollbackFailedDNBAllocation(
+		stateRolledBack, rollbackErr, persistErr := p.rollbackFailedDNBAllocation(
 			req.PodUid, req.ContainerName, oldAllocationInfo, allocationInfo,
 			preCommitRevision, sourcePodEntries, sourceMachineState,
 			sourceAllowOverlap, sourceDisableDedicated, persistCheckpoint)
 		var restoreErr error
-		if rollbackErr == nil {
+		if stateRolledBack {
 			restoreCtx, restoreCancel := context.WithTimeout(context.Background(), cpuSetAdjustmentHandlerTimeout(p.conf))
 			restoreErr = p.runCPUSetAdjustmentHandlers(restoreCtx, dynamicpolicyutil.CPUSetAdjustmentModeRetry)
 			restoreCancel()
@@ -793,7 +793,7 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 		err := fmt.Errorf("apply DNB allocation and reclaim floor failed: %v; state rollback error: %v; "+
 			"state persistence error: %v; machine restore error: %v",
 			adjustErr, rollbackErr, persistErr, restoreErr)
-		if rollbackErr == nil {
+		if stateRolledBack || rollbackErr == nil {
 			return nil, &requestStateCompensatedError{err: err}
 		}
 		return nil, err
@@ -815,22 +815,22 @@ func (p *DynamicPolicy) rollbackFailedDNBAllocation(
 	sourceMachineState state.NUMANodeMap,
 	sourceAllowOverlap, sourceDisableDedicated bool,
 	persistCheckpoint bool,
-) (error, error) {
+) (bool, error, error) {
 	latestRevision := p.state.GetRevision()
 	latestEntries := p.state.GetPodEntries()
 	latestCandidate := latestEntries[podUID][containerName]
 	if latestCandidate == nil {
-		return nil, nil
+		return false, nil, nil
 	}
 	if !reflect.DeepEqual(latestCandidate, failedCandidate) {
-		return &requestStateOwnershipLostError{err: fmt.Errorf(
+		return false, &requestStateOwnershipLostError{err: fmt.Errorf(
 			"allocation %s/%s ownership lost: allocation advanced after failed candidate; skip stale candidate rollback",
 			podUID, containerName)}, nil
 	}
 	if latestRevision == sourceRevision+1 {
 		if err := p.validatePendingAdvisorPartitionView(
 			sourceEntries, sourceMachineState, sourceAllowOverlap, sourceDisableDedicated); err != nil {
-			return fmt.Errorf("validate exact DNB source rollback: %w", err), nil
+			return false, fmt.Errorf("validate exact DNB source rollback: %w", err), nil
 		}
 		if err := p.state.CommitAdvisorStateIfRevision(
 			latestRevision,
@@ -840,15 +840,15 @@ func (p *DynamicPolicy) rollbackFailedDNBAllocation(
 			sourceDisableDedicated,
 			false,
 		); err != nil {
-			return fmt.Errorf("restore exact DNB source state: %w", err), nil
+			return false, fmt.Errorf("restore exact DNB source state: %w", err), nil
 		}
 		p.emitFinalPoolSizeMetrics(sourceEntries)
 		if persistCheckpoint {
 			if err := p.state.StoreState(); err != nil {
-				return nil, fmt.Errorf("persist restored DNB source state: %w", err)
+				return true, nil, fmt.Errorf("persist restored DNB source state: %w", err)
 			}
 		}
-		return nil, nil
+		return true, nil, nil
 	}
 
 	if previous != nil {
@@ -863,7 +863,7 @@ func (p *DynamicPolicy) rollbackFailedDNBAllocation(
 	latestMachineState, err := generateMachineStateFromPodEntries(
 		p.machineInfo.CPUTopology, latestEntries, p.state.GetMachineState())
 	if err != nil {
-		return fmt.Errorf("recompute machine state without failed DNB allocation: %w", err), nil
+		return false, fmt.Errorf("recompute machine state without failed DNB allocation: %w", err), nil
 	}
 	planningState := state.NewTransientState(p.machineInfo.CPUTopology)
 	if err := planningState.CommitAdvisorState(
@@ -873,13 +873,14 @@ func (p *DynamicPolicy) rollbackFailedDNBAllocation(
 		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
 		false,
 	); err != nil {
-		return fmt.Errorf("initialize failed DNB rollback state: %w", err), nil
+		return false, fmt.Errorf("initialize failed DNB rollback state: %w", err), nil
 	}
 	planningPolicy := p.newRampUpPlanningPolicy(planningState)
 	planningRevision := planningState.GetRevision()
-	if err := planningPolicy.adjustAllocationEntriesWithRampUpFloorAtRevision(
-		latestEntries, latestMachineState, false, machine.NewCPUSet(), false, planningRevision); err != nil {
-		return fmt.Errorf("recompute pools and reclaim floor without failed DNB allocation: %w", err), nil
+	if err := planningPolicy.adjustAllocationEntriesWithRampUpFloorForModeAtRevision(
+		latestEntries, latestMachineState, false, machine.NewCPUSet(), false,
+		planningRevision, defaultShareMaterializationRecovery); err != nil {
+		return false, fmt.Errorf("recompute pools and reclaim floor without failed DNB allocation: %w", err), nil
 	}
 	_, _, err = p.commitPendingCPUPartition(pendingCPUPartition{
 		expectedRevision: latestRevision,
@@ -891,12 +892,15 @@ func (p *DynamicPolicy) rollbackFailedDNBAllocation(
 		source:           "DNB rollback",
 		validate:         p.validatePendingAdvisorPartitionView,
 	})
-	if err == nil && persistCheckpoint {
+	if err != nil {
+		return false, err, nil
+	}
+	if persistCheckpoint {
 		if storeErr := p.state.StoreState(); storeErr != nil {
-			return nil, fmt.Errorf("persist replanned DNB rollback state: %w", storeErr)
+			return true, nil, fmt.Errorf("persist replanned DNB rollback state: %w", storeErr)
 		}
 	}
-	return err, nil
+	return true, nil, nil
 }
 
 // newRampUpPlanningPolicy creates an isolated policy view for speculative
@@ -1423,7 +1427,19 @@ func (p *DynamicPolicy) putAllocationsAndAdjustAllocationEntries(
 	incrByReq bool,
 	persistCheckpoint bool,
 ) error {
-	return p.putAllocationsAndAdjustAllocationEntriesResizeAware(nil, allocationInfos, incrByReq, false, persistCheckpoint)
+	return p.putAllocationsAndAdjustAllocationEntriesAtRevision(
+		nil, allocationInfos, incrByReq, persistCheckpoint, p.state.GetRevision())
+}
+
+func (p *DynamicPolicy) putAllocationsAndAdjustAllocationEntriesAtRevision(
+	entries state.PodEntries,
+	allocationInfos []*state.AllocationInfo,
+	incrByReq bool,
+	persistCheckpoint bool,
+	expectedRevision uint64,
+) error {
+	return p.putAllocationsAndAdjustAllocationEntriesResizeAwareAtRevision(
+		nil, entries, allocationInfos, incrByReq, false, persistCheckpoint, expectedRevision)
 }
 
 // putAllocationsAndAdjustAllocationEntriesResizeAware adjusts the allocation entries based on the given allocation infos,
@@ -1434,6 +1450,20 @@ func (p *DynamicPolicy) putAllocationsAndAdjustAllocationEntriesResizeAware(
 	incrByReq,
 	podInplaceUpdateResizing,
 	persistCheckpoint bool,
+) (err error) {
+	return p.putAllocationsAndAdjustAllocationEntriesResizeAwareAtRevision(
+		originAllocationInfos, nil, allocationInfos, incrByReq, podInplaceUpdateResizing,
+		persistCheckpoint, p.state.GetRevision())
+}
+
+func (p *DynamicPolicy) putAllocationsAndAdjustAllocationEntriesResizeAwareAtRevision(
+	originAllocationInfos []*state.AllocationInfo,
+	entries state.PodEntries,
+	allocationInfos []*state.AllocationInfo,
+	incrByReq,
+	podInplaceUpdateResizing,
+	persistCheckpoint bool,
+	expectedRevision uint64,
 ) (err error) {
 	start := time.Now()
 	podUID, podName, podNamespace, containerName := "", "", "", ""
@@ -1463,19 +1493,23 @@ func (p *DynamicPolicy) putAllocationsAndAdjustAllocationEntriesResizeAware(
 		}
 	}
 
-	entries := p.state.GetPodEntries()
+	if entries == nil {
+		entries = p.state.GetPodEntries()
+	} else {
+		entries = entries.Clone()
+	}
 
 	for _, allocationInfo := range allocationInfos {
 		if allocationInfo == nil {
 			return fmt.Errorf("found nil allocationInfo in input parameter")
-		} else if !allocationInfo.CheckShared() {
-			return fmt.Errorf("put container with invalid qos level: %s into pool", allocationInfo.QoSLevel)
-		} else if entries[allocationInfo.PodUid][allocationInfo.ContainerName] == nil {
-			if entries[allocationInfo.PodUid] == nil {
-				entries[allocationInfo.PodUid] = make(state.ContainerEntries)
-			}
-			entries[allocationInfo.PodUid][allocationInfo.ContainerName] = allocationInfo.Clone()
 		}
+		if !allocationInfo.CheckShared() {
+			return fmt.Errorf("put container with invalid qos level: %s into pool", allocationInfo.QoSLevel)
+		}
+		if entries[allocationInfo.PodUid] == nil {
+			entries[allocationInfo.PodUid] = make(state.ContainerEntries)
+		}
+		entries[allocationInfo.PodUid][allocationInfo.ContainerName] = allocationInfo.Clone()
 
 		poolName := allocationInfo.GetSpecifiedPoolName()
 		if poolName == commonstate.EmptyOwnerPoolName {
@@ -1544,8 +1578,9 @@ func (p *DynamicPolicy) putAllocationsAndAdjustAllocationEntriesResizeAware(
 	}
 
 	isolatedQuantityMap := state.GetIsolatedQuantityMapFromPodEntries(entries, allocationInfos, p.getContainerRequestedCores)
-	err = p.adjustPoolsAndIsolatedEntries(poolsQuantityMap, isolatedQuantityMap,
-		entries, machineState, persistCheckpoint)
+	err = p.adjustPoolsAndIsolatedEntriesWithRampUpFloorAtRevision(
+		poolsQuantityMap, isolatedQuantityMap, entries, machineState, persistCheckpoint,
+		machine.NewCPUSet(), true, expectedRevision)
 	if err != nil {
 		return fmt.Errorf("adjustpoolsandisolatedentries failed with error: %s", strings.ToLower(err.Error()))
 	}
@@ -1661,6 +1696,41 @@ func (p *DynamicPolicy) adjustAllocationEntriesAtRevision(
 		entries, machineState, persistCheckpoint, machine.NewCPUSet(), true, expectedRevision)
 }
 
+func (p *DynamicPolicy) adjustAllocationEntriesForRecoveryAtRevision(
+	entries state.PodEntries,
+	machineState state.NUMANodeMap,
+	persistCheckpoint bool,
+	expectedRevision uint64,
+) error {
+	if err := p.adjustAllocationEntriesWithRampUpFloorForModeAtRevision(
+		entries, machineState, persistCheckpoint, machine.NewCPUSet(), false,
+		expectedRevision, defaultShareMaterializationRecovery); err != nil {
+		return err
+	}
+	p.markCPUSetAdjustmentDirty(dynamicpolicyutil.RetryReasonRecoveryCommit)
+	return nil
+}
+
+func (p *DynamicPolicy) adjustAllocationEntriesAfterDeletionAtRevision(
+	entries state.PodEntries,
+	machineState state.NUMANodeMap,
+	persistCheckpoint bool,
+	expectedRevision uint64,
+) error {
+	// Preserve the normal adjustment path when current advisor quantities can
+	// represent the deletion. If only the default-share quantity gate is stale,
+	// retry the same CAS in recovery mode and leave cgroup convergence dirty.
+	p.cleanPoolsFromPodEntries(entries)
+	err := p.adjustAllocationEntriesAtRevision(
+		entries, machineState, persistCheckpoint, expectedRevision)
+	if err == nil || !isDefaultShareResidualQuantityGateError(err) {
+		return err
+	}
+	general.Warningf("retry pod deletion in default-share recovery mode: %v", err)
+	return p.adjustAllocationEntriesForRecoveryAtRevision(
+		entries, machineState, persistCheckpoint, expectedRevision)
+}
+
 func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloor(
 	entries state.PodEntries,
 	machineState state.NUMANodeMap,
@@ -1681,6 +1751,20 @@ func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloorAtRevision(
 	runCPUSetHandlers bool,
 	expectedRevision uint64,
 ) error {
+	return p.adjustAllocationEntriesWithRampUpFloorForModeAtRevision(
+		entries, machineState, persistCheckpoint, explicitRampUpFloor,
+		runCPUSetHandlers, expectedRevision, defaultShareMaterializationNormal)
+}
+
+func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloorForModeAtRevision(
+	entries state.PodEntries,
+	machineState state.NUMANodeMap,
+	persistCheckpoint bool,
+	explicitRampUpFloor machine.CPUSet,
+	runCPUSetHandlers bool,
+	expectedRevision uint64,
+	defaultShareMode defaultShareMaterializationMode,
+) error {
 	startTime := time.Now()
 	general.Infof("called")
 	defer func() {
@@ -1689,7 +1773,8 @@ func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloorAtRevision(
 
 	// Remove orphan non-resident pools from this adjustment's candidate before
 	// deriving pool quantities and materializing the default-share residual.
-	// Precommit cleanup remains a defense against pools introduced by later hooks.
+	// The precommit cleanup remains as a defense against orphans introduced by
+	// later hooks.
 	p.cleanPoolsFromPodEntries(entries)
 
 	// since adjustAllocationEntries will cause re-generate pools,
@@ -1699,7 +1784,8 @@ func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloorAtRevision(
 	dynamicConfig := p.dynamicConfig.GetDynamicConfiguration()
 	advisorHealthy := p.enableCPUAdvisor && p.advisorMonitor != nil &&
 		!cpuutil.AdvisorDegradation(p.advisorMonitor.GetHealthy(), dynamicConfig.EnableReclaim)
-	if dynamicConfig.FillDefaultSharePoolWithNonReclaimCPUs && !advisorHealthy {
+	if dynamicConfig.FillDefaultSharePoolWithNonReclaimCPUs &&
+		defaultShareMode != defaultShareMaterializationRecovery && !advisorHealthy {
 		return fmt.Errorf("default share residual quantity requires a healthy cpu advisor")
 	}
 	if advisorHealthy {
@@ -1717,9 +1803,9 @@ func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloorAtRevision(
 	}
 	isolatedQuantityMap := state.GetIsolatedQuantityMapFromPodEntries(entries, nil, p.getContainerRequestedCores)
 
-	err := p.adjustPoolsAndIsolatedEntriesWithRampUpFloorAtRevision(
+	err := p.adjustPoolsAndIsolatedEntriesWithRampUpFloorForModeAtRevision(
 		poolsQuantityMap, isolatedQuantityMap, entries, machineState, persistCheckpoint,
-		explicitRampUpFloor, runCPUSetHandlers, expectedRevision)
+		explicitRampUpFloor, runCPUSetHandlers, expectedRevision, defaultShareMode)
 	if err != nil {
 		return fmt.Errorf("adjustpoolsandisolatedentries failed with error: %w", err)
 	}
@@ -1730,8 +1816,7 @@ func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloorAtRevision(
 // adjustPoolsAndIsolatedEntries works for the following steps
 // 1. calculate pools and isolated cpusets according to expectant quantities
 // 2. make reclaimed overlap with numa-binding
-// 3. apply them to local state
-// 4. clean pools
+// 3. apply them to local state; precommit removes orphan pools before the CAS
 func (p *DynamicPolicy) adjustPoolsAndIsolatedEntries(
 	poolsQuantityMap map[string]map[int]int,
 	isolatedQuantityMap map[string]map[string]int,
@@ -1753,6 +1838,23 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloorAtRevision(
 	explicitRampUpFloor machine.CPUSet,
 	runCPUSetHandlers bool,
 	expectedRevision uint64,
+) error {
+	return p.adjustPoolsAndIsolatedEntriesWithRampUpFloorForModeAtRevision(
+		poolsQuantityMap, isolatedQuantityMap, entries, machineState,
+		persistCheckpoint, explicitRampUpFloor, runCPUSetHandlers,
+		expectedRevision, defaultShareMaterializationNormal)
+}
+
+func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloorForModeAtRevision(
+	poolsQuantityMap map[string]map[int]int,
+	isolatedQuantityMap map[string]map[string]int,
+	entries state.PodEntries,
+	machineState state.NUMANodeMap,
+	persistCheckpoint bool,
+	explicitRampUpFloor machine.CPUSet,
+	runCPUSetHandlers bool,
+	expectedRevision uint64,
+	defaultShareMode defaultShareMaterializationMode,
 ) error {
 	rampUpReclaimFloor := explicitRampUpFloor.Clone()
 	if p.isRampUpReclaimHardPartitionEnabled() && rampUpReclaimFloor.IsEmpty() {
@@ -1795,7 +1897,7 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloorAtRevision(
 	// first, and later materialize the default share pool with residual CPUs in
 	// applyPoolsAndIsolatedInfo.
 	fixedPoolsQuantityMap := copyPoolQuantityMap(poolsQuantityMap)
-	defaultSharePlan := defaultShareMaterializationPlan{}
+	defaultSharePlan := defaultShareMaterializationPlan{mode: defaultShareMode}
 	if p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs {
 		defaultSharePlan.enabled = true
 		quantityByNUMA, ok := fixedPoolsQuantityMap[commonstate.PoolNameShare]
@@ -1848,11 +1950,6 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloorAtRevision(
 		defaultSharePlan, expectedRevision)
 	if err != nil {
 		return fmt.Errorf("applyPoolsAndIsolatedInfo failed with error: %w", err)
-	}
-
-	err = p.cleanPools()
-	if err != nil {
-		return fmt.Errorf("cleanPools failed with error: %v", err)
 	}
 
 	if runCPUSetHandlers {
@@ -2080,7 +2177,15 @@ type defaultShareMaterializationPlan struct {
 	advisedQuantity              int
 	deriveUpperBoundFromEligible bool
 	eligibleCPUSet               machine.CPUSet
+	mode                         defaultShareMaterializationMode
 }
+
+type defaultShareMaterializationMode uint8
+
+const (
+	defaultShareMaterializationNormal defaultShareMaterializationMode = iota
+	defaultShareMaterializationRecovery
+)
 
 // buildDefaultShareEligibleCPUSet derives the default-share source of truth
 // from the complete physical topology and the entries being finalized. It must
@@ -2231,9 +2336,17 @@ func hasLiveDefaultShareOwner(entries state.PodEntries) bool {
 func materializeDefaultShareCPUSet(expectedQuantity int, availableCPUs machine.CPUSet,
 	pools map[string]machine.CPUSet, isolated map[string]map[string]machine.CPUSet,
 ) (machine.CPUSet, error) {
+	return materializeDefaultShareCPUSetForMode(
+		expectedQuantity, availableCPUs, pools, isolated, defaultShareMaterializationNormal)
+}
+
+func materializeDefaultShareCPUSetForMode(expectedQuantity int, availableCPUs machine.CPUSet,
+	pools map[string]machine.CPUSet, isolated map[string]map[string]machine.CPUSet,
+	mode defaultShareMaterializationMode,
+) (machine.CPUSet, error) {
 	fixed := unionPoolCPUSet(pools, commonstate.PoolNameShare).Union(unionIsolatedCPUSet(isolated))
 	residual := availableCPUs.Difference(fixed)
-	if residual.Size() > expectedQuantity {
+	if residual.Size() > expectedQuantity && mode != defaultShareMaterializationRecovery {
 		return machine.NewCPUSet(), &DefaultShareResidualQuantityError{
 			AdvisedQuantity: expectedQuantity,
 			ResidualSize:    residual.Size(),
@@ -2262,13 +2375,25 @@ func materializeDefaultShareCPUSet(expectedQuantity int, availableCPUs machine.C
 // post-overlap / post-revise pool entries and installs it into newPodEntries.
 // It reads each non-share pool's AllocationResult directly from newPodEntries
 // so that any adjustment made by reclaimOverlapNUMABinding / reviseReclaimPool /
-// explicitRampUpFloor is naturally reflected in the residual. If QRM observes a
-// newly allocated fixed pool before SysAdvisor shrinks the default share
-// quantity, the computed residual still replaces the old default share entry.
+// explicitRampUpFloor is naturally reflected in the residual. Normal updates
+// reject residuals above advice; rollback and pod-removal recovery preserve the
+// live residual until SysAdvisor catches up.
 func (p *DynamicPolicy) finalizeDefaultShareEntry(
 	newPodEntries state.PodEntries,
 	ownershipEntries state.PodEntries,
 	expectedQuantity int, candidate machine.CPUSet,
+) error {
+	return p.finalizeDefaultShareEntryForMode(
+		newPodEntries, ownershipEntries, expectedQuantity, candidate,
+		defaultShareMaterializationNormal)
+}
+
+func (p *DynamicPolicy) finalizeDefaultShareEntryForMode(
+	newPodEntries state.PodEntries,
+	ownershipEntries state.PodEntries,
+	expectedQuantity int,
+	candidate machine.CPUSet,
+	mode defaultShareMaterializationMode,
 ) error {
 	finalPools := make(map[string]machine.CPUSet)
 	for poolName, entries := range newPodEntries {
@@ -2277,8 +2402,9 @@ func (p *DynamicPolicy) finalizeDefaultShareEntry(
 		}
 		finalPools[poolName] = entries[commonstate.FakedContainerName].AllocationResult
 	}
-	share, err := materializeDefaultShareCPUSet(
-		expectedQuantity, candidate, finalPools, dedicatedCPUSetFromPodEntries(ownershipEntries))
+	share, err := materializeDefaultShareCPUSetForMode(
+		expectedQuantity, candidate, finalPools,
+		dedicatedCPUSetFromPodEntries(ownershipEntries), mode)
 	if err != nil {
 		return err
 	}
@@ -2323,8 +2449,9 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 	newPodEntries := make(state.PodEntries)
 	unionDedicatedIsolatedCPUSet := machine.NewCPUSet()
 
-	// calculate NUMAs without actual numa_binding reclaimed pods
-	nonReclaimActualBindingNUMAs := p.state.GetMachineState().GetFilteredNUMASet(state.WrapAllocationMetaFilter((*commonstate.AllocationMeta).CheckReclaimedActualNUMABinding))
+	// Calculate from this adjustment's candidate snapshot so materialization
+	// and precommit validation observe the same RNB ownership.
+	nonReclaimActualBindingNUMAs := machineState.GetFilteredNUMASet(state.WrapAllocationMetaFilter((*commonstate.AllocationMeta).CheckReclaimedActualNUMABinding))
 	// 1. construct entries for isolated containers (probably be dedicated_cores not numa_binding )
 	for podUID, containerEntries := range isolatedCPUSet {
 		for containerName, isolatedCPUs := range containerEntries {
@@ -2431,8 +2558,9 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 		if defaultSharePlan.deriveUpperBoundFromEligible {
 			defaultSharePlan.advisedQuantity = defaultSharePlan.eligibleCPUSet.Size()
 		}
-		if err := p.finalizeDefaultShareEntry(
-			newPodEntries, eligibilityEntries, defaultSharePlan.advisedQuantity, defaultSharePlan.eligibleCPUSet,
+		if err := p.finalizeDefaultShareEntryForMode(
+			newPodEntries, eligibilityEntries, defaultSharePlan.advisedQuantity,
+			defaultSharePlan.eligibleCPUSet, defaultSharePlan.mode,
 		); err != nil {
 			return err
 		}
@@ -2634,6 +2762,7 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 		persist:          persistCheckpoint,
 		source:           "pool adjustment",
 		validate:         p.validatePendingAdvisorPartitionView,
+		residualFloor:    rampUpReclaimFloor,
 	})
 	return err
 }

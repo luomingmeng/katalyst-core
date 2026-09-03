@@ -294,7 +294,7 @@ func (p *DynamicPolicy) rollbackAllocationState(
 		snapshot.machineState,
 		snapshot.allowOverlap,
 		snapshot.disableDedicatedOverlap,
-		false,
+		true,
 	)
 	if err == nil {
 		return nil
@@ -341,12 +341,14 @@ func (p *DynamicPolicy) rollbackAllocationState(
 	}
 
 	planningPolicy := p.newRampUpPlanningPolicy(planningState)
-	if err := planningPolicy.adjustAllocationEntriesWithRampUpFloor(
+	if err := planningPolicy.adjustAllocationEntriesWithRampUpFloorForModeAtRevision(
 		currentPodEntries,
 		currentMachineState,
 		false,
 		machine.NewCPUSet(),
 		false,
+		planningState.GetRevision(),
+		defaultShareMaterializationRecovery,
 	); err != nil {
 		return fmt.Errorf("replan pools for stale allocation rollback: %w", err)
 	}
@@ -357,9 +359,9 @@ func (p *DynamicPolicy) rollbackAllocationState(
 		planningState.GetMachineState(),
 		allowOverlap,
 		disableDedicatedOverlap,
-		false,
+		true,
 	); err != nil {
-		return fmt.Errorf("commit stale allocation rollback: %w", err)
+		return fmt.Errorf("persist stale allocation rollback: %w", err)
 	}
 	return nil
 }
@@ -865,8 +867,22 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 	p.Lock()
 	defer p.Unlock()
 
+	expectedRevision := p.state.GetRevision()
 	podEntries := p.state.GetPodEntries()
 	machineState := p.state.GetMachineState()
+	hasSharedRampUpExit := false
+	now := time.Now()
+	for _, containerEntries := range podEntries {
+		if containerEntries.IsPoolEntry() {
+			continue
+		}
+		main := containerEntries.GetMainContainerEntry()
+		finishRampUp, _ := shouldAllocationFinishRampUp(main, p.transitionPeriod, now)
+		if finishRampUp && main.CheckShared() {
+			hasSharedRampUpExit = true
+			break
+		}
+	}
 
 	// rumpUpPooledCPUs is the total available cpu cores minus those that are reserved
 	rumpUpPooledCPUs := machineState.GetFilteredAvailableCPUSet(p.reservedCPUs,
@@ -892,6 +908,11 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 
 			// sync allocation info from main container to sidecar
 			if allocationInfo.CheckSideCar() && mainContainerAllocationInfo != nil {
+				if hasSharedRampUpExit {
+					// The precommit phase synchronizes sidecars after their main
+					// containers and pools have reached the final candidate.
+					continue
+				}
 				if p.applySidecarAllocationInfoFromMainContainer(allocationInfo, mainContainerAllocationInfo) {
 					general.Infof("pod: %s/%s, container: %s sync allocation info from main container",
 						allocationInfo.PodNamespace, allocationInfo.PodName, containerName)
@@ -902,6 +923,9 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 					}
 					needUpdateMachineState = true
 				}
+				// A sidecar mirrors its main container and must not advance the
+				// ramp-up lifecycle independently using its own timestamp.
+				continue
 			}
 
 			_, tsErr := time.Parse(util.QRMTimeFormat, allocationInfo.InitTimestamp)
@@ -932,6 +956,11 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 				}
 
 				allocationInfo.InitTimestamp = time.Now().Format(util.QRMTimeFormat)
+				if hasSharedRampUpExit {
+					podEntries[podUID][containerName] = allocationInfo
+					needUpdateMachineState = true
+					continue
+				}
 				if err := p.updateAllocationInfo(podUID, containerName, originAllocationInfo, allocationInfo, true); err != nil {
 					general.Errorf("updateAllocationInfo failed for pod: %s/%s, container: %s: %v",
 						allocationInfo.PodNamespace, allocationInfo.PodName, containerName, err)
@@ -940,8 +969,13 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 				general.Infof("pod: %s/%s, container: %s ramp up finished", allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName)
 				allocationInfo.RampUp = false
 				if allocationInfo.CheckShared() {
-					p.state.SetAllocationInfo(podUID, containerName, allocationInfo, false)
+					podEntries[podUID][containerName] = allocationInfo
 					allocationInfosJustFinishRampUp = append(allocationInfosJustFinishRampUp, allocationInfo)
+					continue
+				}
+				if hasSharedRampUpExit {
+					podEntries[podUID][containerName] = allocationInfo
+					needUpdateMachineState = true
 					continue
 				}
 				if err := p.updateAllocationInfo(podUID, containerName, originAllocationInfo, allocationInfo, true); err != nil {
@@ -955,17 +989,8 @@ func (p *DynamicPolicy) GetResourcesAllocation(_ context.Context,
 	}
 
 	if len(allocationInfosJustFinishRampUp) > 0 {
-		if err := p.putAllocationsAndAdjustAllocationEntries(allocationInfosJustFinishRampUp, true, true); err != nil {
-			for _, allocationInfo := range allocationInfosJustFinishRampUp {
-				current := p.state.GetAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName)
-				if current != nil && !current.RampUp &&
-					current.OwnerPoolName != commonstate.EmptyOwnerPoolName {
-					continue
-				}
-				allocationInfo = allocationInfo.Clone()
-				allocationInfo.RampUp = true
-				p.state.SetAllocationInfo(allocationInfo.PodUid, allocationInfo.ContainerName, allocationInfo, false)
-			}
+		if err := p.putAllocationsAndAdjustAllocationEntriesAtRevision(
+			podEntries, allocationInfosJustFinishRampUp, true, true, expectedRevision); err != nil {
 			// not influencing return response to kubelet when putAllocationsAndAdjustAllocationEntries failed
 			general.Errorf("putAllocationsAndAdjustAllocationEntries failed with error: %v", err)
 		}
@@ -1524,22 +1549,17 @@ func (p *DynamicPolicy) RemovePod(ctx context.Context,
 	expectedRevision := p.state.GetRevision()
 	podEntries := currentPodEntries.Clone()
 	delete(podEntries, req.PodUid)
-	p.cleanPoolsFromPodEntries(podEntries)
 	machineState, err := generateMachineStateFromPodEntries(
 		p.machineInfo.CPUTopology, podEntries, p.state.GetMachineState())
 	if err != nil {
 		return nil, fmt.Errorf("GenerateMachineStateFromPodEntries failed with error: %v", err)
 	}
 
-	err = p.adjustAllocationEntriesAtRevision(
+	err = p.adjustAllocationEntriesAfterDeletionAtRevision(
 		podEntries, machineState, true, expectedRevision)
 	if err != nil {
 		general.ErrorS(err, "adjustAllocationEntries failed", "podUID", req.PodUid)
-		err = p.persistPodDeletionAfterAdjustFailure(
-			err, podEntries, machineState, expectedRevision)
-		if err != nil {
-			return nil, fmt.Errorf("commit pod removal failed: %w", err)
-		}
+		return nil, fmt.Errorf("commit pod removal failed: %w", err)
 	}
 
 	if err := AccompanyResourceRegistry.ReleaseAccompanyResource(req); err != nil {
@@ -1709,7 +1729,12 @@ func (p *DynamicPolicy) cleanPoolsFromPodEntries(podEntries state.PodEntries) se
 
 	// when default share residual backfill is enabled, the share pool is
 	// synthesized without any owning container, so it must be retained here.
-	keepSyntheticDefaultShare := p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs
+	keepSyntheticDefaultShare := false
+	if p != nil && p.dynamicConfig != nil {
+		dynamicConfig := p.dynamicConfig.GetDynamicConfiguration()
+		keepSyntheticDefaultShare = dynamicConfig != nil &&
+			dynamicConfig.FillDefaultSharePoolWithNonReclaimCPUs
+	}
 
 	// if pool exists in entries, but has no corresponding container, we need to delete it
 	poolsToDelete := sets.NewString()
@@ -1886,12 +1911,14 @@ func (p *DynamicPolicy) checkNonBindingShareCoresCpuResource(req *pluginapi.Reso
 
 func (p *DynamicPolicy) applySidecarAllocationInfoFromMainContainer(sidecarAllocationInfo, mainAllocationInfo *state.AllocationInfo) bool {
 	changed := false
-	if sidecarAllocationInfo.OwnerPoolName != mainAllocationInfo.OwnerPoolName ||
+	if sidecarAllocationInfo.RampUp != mainAllocationInfo.RampUp ||
+		sidecarAllocationInfo.OwnerPoolName != mainAllocationInfo.OwnerPoolName ||
 		!sidecarAllocationInfo.AllocationResult.Equals(mainAllocationInfo.AllocationResult) ||
 		!sidecarAllocationInfo.OriginalAllocationResult.Equals(mainAllocationInfo.OriginalAllocationResult) ||
 		!state.CheckAllocationInfoTopologyAwareAssignments(sidecarAllocationInfo, mainAllocationInfo) ||
 		!state.CheckAllocationInfoOriginTopologyAwareAssignments(sidecarAllocationInfo, mainAllocationInfo) {
 
+		sidecarAllocationInfo.RampUp = mainAllocationInfo.RampUp
 		sidecarAllocationInfo.OwnerPoolName = mainAllocationInfo.OwnerPoolName
 		sidecarAllocationInfo.AllocationResult = mainAllocationInfo.AllocationResult.Clone()
 		sidecarAllocationInfo.OriginalAllocationResult = mainAllocationInfo.OriginalAllocationResult.Clone()
@@ -1902,6 +1929,9 @@ func (p *DynamicPolicy) applySidecarAllocationInfoFromMainContainer(sidecarAlloc
 	}
 
 	// Copy annotations from main container
+	if sidecarAllocationInfo.Annotations == nil && len(mainAllocationInfo.Annotations) > 0 {
+		sidecarAllocationInfo.Annotations = make(map[string]string, len(mainAllocationInfo.Annotations))
+	}
 	for key, value := range mainAllocationInfo.Annotations {
 		if sidecarAllocationInfo.Annotations[key] != value {
 			sidecarAllocationInfo.Annotations[key] = value

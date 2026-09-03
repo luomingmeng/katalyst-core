@@ -322,7 +322,10 @@ func (p *DynamicPolicy) createGetAdviceRequestFromSnapshot(
 				// to ensure backward compatibility with checkpoint written by older versions of the plugin.
 				if allocationInfo.CheckSideCar() {
 					mainContainerInfo := containerEntries.GetMainContainerEntry()
-					if mainContainerInfo != nil {
+					if mainContainerInfo != nil && len(mainContainerInfo.Annotations) > 0 {
+						if info.Metadata.Annotations == nil {
+							info.Metadata.Annotations = make(map[string]string, len(mainContainerInfo.Annotations))
+						}
 						for key, value := range mainContainerInfo.Annotations {
 							if _, ok := info.Metadata.Annotations[key]; !ok {
 								info.Metadata.Annotations[key] = value
@@ -1881,6 +1884,7 @@ type pendingAdvisorState struct {
 	allowOverlap         bool
 	disableDedicated     bool
 	enforceSteadyReclaim bool
+	residualFloor        machine.CPUSet
 }
 
 func (p *DynamicPolicy) pendingAdvisorStateMatchesCommitted(pending *pendingAdvisorState) bool {
@@ -1990,8 +1994,13 @@ func (p *DynamicPolicy) applyBlocks(
 		}
 	}
 
-	// calculate NUMAs without actual numa_binding reclaimed pods
-	nonReclaimActualBindingNUMAs := p.state.GetMachineState().GetFilteredNUMASet(state.WrapAllocationMetaFilter((*commonstate.AllocationMeta).CheckReclaimedActualNUMABinding))
+	// Calculate from the candidate entry snapshot rather than the currently
+	// published machine state. The latter may still describe the previous
+	// placement while this advisor frame is being prepared.
+	nonReclaimActualBindingNUMAs, err := p.nonReclaimActualBindingNUMAsFromCandidate(curEntries)
+	if err != nil {
+		return nil, err
+	}
 
 	// deal with blocks of dedicated_cores and pools
 	for entryName, entry := range resp.Entries {
@@ -2293,7 +2302,9 @@ func (p *DynamicPolicy) applyBlocks(
 	if err != nil {
 		return nil, fmt.Errorf("build adjustment commit override from pod entries failed with error: %w", err)
 	}
-	if err := p.syncReclaimPoolWithAdjustmentCommitOverride(newEntries, commitOverride); err != nil {
+	if err := p.syncReclaimPoolWithAdjustmentCommitOverride(
+		newEntries, commitOverride, defaultSharePlan.eligibleCPUSet,
+	); err != nil {
 		return nil, fmt.Errorf("sync reclaim pool with adjustment commit override failed with error: %w", err)
 	}
 	if defaultSharePlan.enabled {
@@ -2311,6 +2322,7 @@ func (p *DynamicPolicy) applyBlocks(
 		entries:           newEntries,
 		allowOverlap:      allowSharedCoresOverlapReclaimedCores,
 		disableDedicated:  resp.DisableDedicatedCoresOverlapReclaimedCores,
+		residualFloor:     rampUpReclaimFloor,
 	}, nil
 }
 
@@ -2370,6 +2382,7 @@ func (p *DynamicPolicy) commitPendingAdvisorState(pending *pendingAdvisorState) 
 		persist:              true,
 		source:               "advisor apply",
 		enforceSteadyReclaim: pending.enforceSteadyReclaim,
+		residualFloor:        pending.residualFloor,
 	})
 	if err == nil {
 		pending.entries = entries
@@ -2446,7 +2459,11 @@ func (p *DynamicPolicy) buildAdjustmentCommitOverrideFromPodEntries(
 	}, nil
 }
 
-func (p *DynamicPolicy) syncReclaimPoolWithAdjustmentCommitOverride(newEntries state.PodEntries, override *cpusetutil.CPUSetAdjustmentCommitOverride) error {
+func (p *DynamicPolicy) syncReclaimPoolWithAdjustmentCommitOverride(
+	newEntries state.PodEntries,
+	override *cpusetutil.CPUSetAdjustmentCommitOverride,
+	defaultShareEligible ...machine.CPUSet,
+) error {
 	if override == nil || override.ReclaimEffective.IsEmpty() {
 		return nil
 	}
@@ -2465,7 +2482,101 @@ func (p *DynamicPolicy) syncReclaimPoolWithAdjustmentCommitOverride(newEntries s
 	reclaimEntry.OriginalTopologyAwareAssignments = machine.DeepcopyCPUAssignment(assignments)
 	general.Infof("bulkhead: synced reclaim pool with adjustment commit override, source=%s reclaim=%s",
 		override.Source, reclaim.String())
+	if p.dynamicConfig != nil {
+		dynamicConfig := p.dynamicConfig.GetDynamicConfiguration()
+		if dynamicConfig != nil && dynamicConfig.FillDefaultSharePoolWithNonReclaimCPUs {
+			var eligible machine.CPUSet
+			if len(defaultShareEligible) > 0 {
+				eligible = defaultShareEligible[0].Clone()
+			} else {
+				eligible = p.buildDefaultShareEligibleCPUSet(
+					newEntries, p.state.GetMachineState(), machine.NewCPUSet())
+			}
+			if err := p.finalizeDefaultShareEntryForMode(
+				newEntries,
+				newEntries,
+				0,
+				eligible,
+				defaultShareMaterializationRecovery,
+			); err != nil {
+				return fmt.Errorf("sync default share with reclaim override: %w", err)
+			}
+		}
+	}
+	return p.syncReclaimAndShareAllocationsWithFinalPools(newEntries)
+}
+
+func (p *DynamicPolicy) syncReclaimAndShareAllocationsWithFinalPools(
+	entries state.PodEntries,
+) error {
+	nonReclaimActualBindingNUMAs, err := p.nonReclaimActualBindingNUMAsFromCandidate(entries)
+	if err != nil {
+		return err
+	}
+
+	for podUID, containerEntries := range entries {
+		if containerEntries.IsPoolEntry() {
+			continue
+		}
+		for containerName, allocation := range containerEntries {
+			if allocation == nil || allocation.RampUp {
+				continue
+			}
+
+			ownerPoolName := allocation.GetOwnerPoolName()
+			poolEntry := entries[ownerPoolName].GetPoolEntry()
+			switch {
+			case allocation.CheckReclaimed() && ownerPoolName == commonstate.PoolNameReclaim:
+				if poolEntry == nil {
+					return fmt.Errorf("sync reclaim override owner %s/%s: reclaim pool entry is missing",
+						podUID, containerName)
+				}
+				if err := p.updateReclaimAllocationResultByPoolEntry(
+					allocation, poolEntry, nonReclaimActualBindingNUMAs,
+				); err != nil {
+					return fmt.Errorf("sync reclaim override owner %s/%s: %w", podUID, containerName, err)
+				}
+			case allocation.CheckShared() && ownerPoolName == commonstate.PoolNameShare:
+				if poolEntry == nil {
+					return fmt.Errorf("sync reclaim override owner %s/%s: default share pool entry is missing",
+						podUID, containerName)
+				}
+				allocation.AllocationResult = poolEntry.AllocationResult.Clone()
+				allocation.OriginalAllocationResult = poolEntry.OriginalAllocationResult.Clone()
+				allocation.TopologyAwareAssignments = machine.DeepcopyCPUAssignment(poolEntry.TopologyAwareAssignments)
+				allocation.OriginalTopologyAwareAssignments = machine.DeepcopyCPUAssignment(
+					poolEntry.OriginalTopologyAwareAssignments)
+			}
+		}
+	}
 	return nil
+}
+
+func (p *DynamicPolicy) nonReclaimActualBindingNUMAsFromCandidate(
+	entries state.PodEntries,
+) (machine.CPUSet, error) {
+	if p == nil || p.machineInfo == nil || p.machineInfo.CPUTopology == nil {
+		return machine.NewCPUSet(), fmt.Errorf("derive candidate RNB topology: cpu topology is not initialized")
+	}
+
+	result := machine.NewCPUSet(p.machineInfo.CPUDetails.NUMANodes().ToSliceInt()...)
+	for podUID, containerEntries := range entries {
+		if containerEntries.IsPoolEntry() {
+			continue
+		}
+		for containerName, allocation := range containerEntries {
+			if allocation == nil || !allocation.CheckReclaimedActualNUMABinding() {
+				continue
+			}
+			numaID, err := allocation.GetSpecifiedNUMABindingNUMAID()
+			if err != nil {
+				return machine.NewCPUSet(), fmt.Errorf(
+					"derive candidate RNB topology for %s/%s: %w", podUID, containerName, err)
+			}
+			result = result.Difference(machine.NewCPUSet(numaID))
+		}
+	}
+	return result, nil
 }
 
 func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommit(

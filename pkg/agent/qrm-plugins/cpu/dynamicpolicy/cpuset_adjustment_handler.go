@@ -735,6 +735,19 @@ func (p *DynamicPolicy) retryLatestCPUSetAdjustment(
 	return persistErr
 }
 
+func (p *DynamicPolicy) markCPUSetAdjustmentDirty(reason cpusetutil.CPUSetAdjustmentRetryReason) {
+	p.cpuSetAdjustmentRetryMu.Lock()
+	defer p.cpuSetAdjustmentRetryMu.Unlock()
+	if p.cpuSetAdjustmentRetryStopping {
+		return
+	}
+	p.cpuSetAdjustmentRetryDirty = true
+	if p.cpuSetAdjustmentRetryReasons == nil {
+		p.cpuSetAdjustmentRetryReasons = make(map[cpusetutil.CPUSetAdjustmentRetryReason]struct{})
+	}
+	p.cpuSetAdjustmentRetryReasons[reason] = struct{}{}
+}
+
 func (p *DynamicPolicy) scheduleCPUSetAdjustmentRetry(reason cpusetutil.CPUSetAdjustmentRetryReason) {
 	p.cpuSetAdjustmentRetryMu.Lock()
 	if p.cpuSetAdjustmentRetryStopping {

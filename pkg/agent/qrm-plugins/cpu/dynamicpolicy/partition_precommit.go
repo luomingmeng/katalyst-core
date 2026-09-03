@@ -34,6 +34,7 @@ type pendingCPUPartition struct {
 	source               string
 	validate             func(state.PodEntries, state.NUMANodeMap, bool, bool) error
 	enforceSteadyReclaim bool
+	residualFloor        machine.CPUSet
 }
 
 type preparedCPUPartition struct {
@@ -59,6 +60,7 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 	if err := p.invokeAllocationHooksForPodEntries(currentEntries, candidate); err != nil {
 		return nil, p.wrapPartitionPrecommitError(pending.source, "run allocation hooks", err)
 	}
+	p.syncCandidateSidecarsFromMain(candidate)
 	var machineState state.NUMANodeMap
 	if p.machineInfo == nil || p.machineInfo.CPUTopology == nil {
 		if pending.baseMachineState == nil {
@@ -100,6 +102,12 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 			return nil, p.wrapPartitionPrecommitError(pending.source, "rebuild machine state", err)
 		}
 	}
+	if err := p.validateResidualBackfillCandidate(candidate, machineState, pending.residualFloor); err != nil {
+		return nil, p.wrapPartitionPrecommitError(pending.source, "validate residual backfill candidate", err)
+	}
+	if err := validatePendingPoolOwnership(candidate); err != nil {
+		return nil, p.wrapPartitionPrecommitError(pending.source, "validate allocation ownership", err)
+	}
 	validate := pending.validate
 	if validate == nil {
 		validate = p.validateAdvisorPartitionBeforeCommit
@@ -112,6 +120,168 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 		entries:      candidate,
 		machineState: machineState,
 	}, nil
+}
+
+func (p *DynamicPolicy) syncCandidateSidecarsFromMain(entries state.PodEntries) {
+	for _, containerEntries := range entries {
+		if containerEntries.IsPoolEntry() {
+			continue
+		}
+		main := containerEntries.GetMainContainerEntry()
+		if main == nil {
+			continue
+		}
+		for _, allocation := range containerEntries {
+			if allocation == nil || !allocation.CheckSideCar() {
+				continue
+			}
+			p.applySidecarAllocationInfoFromMainContainer(allocation, main)
+		}
+	}
+}
+
+func (p *DynamicPolicy) validateResidualBackfillCandidate(
+	entries state.PodEntries,
+	machineState state.NUMANodeMap,
+	residualFloor machine.CPUSet,
+) error {
+	if p.dynamicConfig == nil {
+		return nil
+	}
+	dynamicConfig := p.dynamicConfig.GetDynamicConfiguration()
+	if dynamicConfig == nil || !dynamicConfig.FillDefaultSharePoolWithNonReclaimCPUs {
+		return nil
+	}
+	if p.machineInfo == nil || p.machineInfo.CPUTopology == nil {
+		return fmt.Errorf("cpu topology is not initialized")
+	}
+
+	share := machine.NewCPUSet()
+	var shareEntry *state.AllocationInfo
+	if poolEntries := entries[commonstate.PoolNameShare]; poolEntries != nil {
+		shareEntry = poolEntries.GetPoolEntry()
+		if shareEntry == nil {
+			return fmt.Errorf("default share pool entry is invalid")
+		}
+		share = shareEntry.AllocationResult
+	}
+
+	fixedPools := machine.NewCPUSet()
+	for poolName, containerEntries := range entries {
+		if poolName == commonstate.PoolNameShare || !containerEntries.IsPoolEntry() {
+			continue
+		}
+		poolEntry := containerEntries.GetPoolEntry()
+		if poolEntry != nil {
+			fixedPools = fixedPools.Union(poolEntry.AllocationResult)
+		}
+	}
+	dedicated := unionIsolatedCPUSet(dedicatedCPUSetFromPodEntries(entries))
+
+	if overlap := share.Intersection(fixedPools); !overlap.IsEmpty() {
+		return fmt.Errorf("default share overlaps fixed pools: %s", overlap.String())
+	}
+	if overlap := share.Intersection(dedicated); !overlap.IsEmpty() {
+		return fmt.Errorf("default share overlaps isolated or dedicated cpus: %s", overlap.String())
+	}
+
+	eligible := p.buildDefaultShareEligibleCPUSet(entries, machineState, residualFloor)
+	expected := eligible.Difference(fixedPools).Difference(dedicated)
+	if !share.Equals(expected) {
+		return fmt.Errorf("default share cpuset %s differs from eligible residual %s (eligible=%s fixed=%s dedicated=%s)",
+			share.String(), expected.String(), eligible.String(), fixedPools.String(), dedicated.String())
+	}
+	if shareEntry == nil {
+		return nil
+	}
+
+	expectedAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, share)
+	if err != nil {
+		return fmt.Errorf("calculate default share topology assignments: %w", err)
+	}
+	if !cpuAssignmentsEqual(shareEntry.TopologyAwareAssignments, expectedAssignments) {
+		return fmt.Errorf("default share topology assignments are inconsistent with cpuset %s", share.String())
+	}
+	return nil
+}
+
+func cpuAssignmentsEqual(left, right map[int]machine.CPUSet) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for numaID, leftCPUSet := range left {
+		rightCPUSet, ok := right[numaID]
+		if !ok || !leftCPUSet.Equals(rightCPUSet) {
+			return false
+		}
+	}
+	return true
+}
+
+func validatePendingPoolOwnership(entries state.PodEntries) error {
+	actualRNBTargetNUMAs := make(map[int]struct{})
+	for podUID, containerEntries := range entries {
+		if containerEntries.IsPoolEntry() {
+			continue
+		}
+		for containerName, allocation := range containerEntries {
+			if allocation == nil || allocation.RampUp ||
+				!allocation.CheckReclaimedActualNUMABinding() {
+				continue
+			}
+			numaID, err := allocation.GetSpecifiedNUMABindingNUMAID()
+			if err != nil {
+				return fmt.Errorf("%s allocation %s/%s has invalid target NUMA: %w",
+					allocation.QoSLevel, podUID, containerName, err)
+			}
+			actualRNBTargetNUMAs[numaID] = struct{}{}
+		}
+	}
+
+	for podUID, containerEntries := range entries {
+		if containerEntries.IsPoolEntry() {
+			continue
+		}
+		for containerName, allocation := range containerEntries {
+			if allocation == nil || allocation.RampUp ||
+				(!allocation.CheckShared() && !allocation.CheckReclaimed()) {
+				continue
+			}
+			ownerPool := allocation.GetOwnerPoolName()
+			if ownerPool == commonstate.EmptyOwnerPoolName {
+				return fmt.Errorf("%s allocation %s/%s has empty owner pool",
+					allocation.QoSLevel, podUID, containerName)
+			}
+			pool := entries[ownerPool].GetPoolEntry()
+			if pool == nil {
+				return fmt.Errorf("%s allocation %s/%s owns missing pool %q",
+					allocation.QoSLevel, podUID, containerName, ownerPool)
+			}
+			expectedAllocation := pool.AllocationResult
+			if allocation.CheckReclaimedActualNUMABinding() {
+				numaID, err := allocation.GetSpecifiedNUMABindingNUMAID()
+				if err != nil {
+					return fmt.Errorf("%s allocation %s/%s has invalid target NUMA: %w",
+						allocation.QoSLevel, podUID, containerName, err)
+				}
+				expectedAllocation = pool.TopologyAwareAssignments[numaID]
+			} else if allocation.CheckReclaimed() {
+				expectedAllocation = machine.NewCPUSet()
+				for numaID, numaAllocation := range pool.TopologyAwareAssignments {
+					if _, ok := actualRNBTargetNUMAs[numaID]; ok {
+						continue
+					}
+					expectedAllocation = expectedAllocation.Union(numaAllocation)
+				}
+			}
+			if !allocation.AllocationResult.Equals(expectedAllocation) {
+				return fmt.Errorf("%s allocation %s/%s cpuset %s differs from owner pool %q cpuset %s",
+					allocation.QoSLevel, podUID, containerName,
+					allocation.AllocationResult.String(), ownerPool, expectedAllocation.String())
+			}
+		}
+	}
+	return nil
 }
 
 // commitPreparedCPUPartition is the only state mutation for a prepared CPU
@@ -177,6 +347,12 @@ func validateAllocationShapeAfterHooks(
 	for podUID, plannedContainers := range planned {
 		for containerName, plannedAllocation := range plannedContainers {
 			if plannedAllocation == nil {
+				continue
+			}
+			// Sidecars are intentionally normalized to their main container
+			// after hooks, so their previous quantity and NUMA shape are not an
+			// independent allocation contract.
+			if plannedAllocation.CheckSideCar() {
 				continue
 			}
 			candidateAllocation := candidate[podUID][containerName]
