@@ -45,6 +45,7 @@ const (
 	RetryReasonOwnershipLost CPUSetAdjustmentRetryReason = "ownership_lost"
 	RetryReasonRestoreFailed CPUSetAdjustmentRetryReason = "restore_failed"
 	RetryReasonApplyFailed   CPUSetAdjustmentRetryReason = "apply_failed"
+	RetryReasonPersistFailed CPUSetAdjustmentRetryReason = "persist_failed"
 )
 
 func (m CPUSetAdjustmentMode) OrFullDefault() CPUSetAdjustmentMode {

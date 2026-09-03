@@ -46,6 +46,24 @@ type hardReclaimPartitionPlan struct {
 	donorCPUs map[string]machine.CPUSet
 }
 
+const (
+	hardReclaimCoreSelectionFrontierWidth = 64
+	hardReclaimCoreSelectionMaxStates     = 4096
+)
+
+type hardReclaimCoreSelectionState struct {
+	selected       machine.CPUSet
+	selectedByNUMA []int
+	donations      []int
+	retained       int
+	donated        int
+}
+
+type hardReclaimCoreSelectionCandidate struct {
+	coreAlignedCandidate
+	numaIndex int
+}
+
 func planHardReclaimPartition(in hardReclaimPartitionInput) (*hardReclaimPartitionPlan, error) {
 	if in.topology == nil {
 		return nil, fmt.Errorf("hard reclaim partition topology is nil")
@@ -56,10 +74,9 @@ func planHardReclaimPartition(in hardReclaimPartitionInput) (*hardReclaimPartiti
 		donorCPUs: make(map[string]machine.CPUSet, len(in.donors)),
 	}
 	donorByKey := make(map[string]hardReclaimPartitionDonor, len(in.donors))
-	donorKeys := make([]string, 0, len(in.donors))
-	donorGroupByKey := make(map[string]string, len(in.donors))
 	groupMinimum := make(map[string]int)
-	groupDonorKeys := make(map[string][]string)
+	groupCPUs := make(map[string]machine.CPUSet)
+	groupByCPU := make(map[int]string)
 	allDonorCPUs := machine.NewCPUSet()
 	for _, donor := range in.donors {
 		if donor.key == "" {
@@ -77,14 +94,26 @@ func planHardReclaimPartition(in hardReclaimPartitionInput) (*hardReclaimPartiti
 			groupKey = donor.key
 		}
 		donorByKey[donor.key] = donor
-		donorGroupByKey[donor.key] = groupKey
-		groupDonorKeys[groupKey] = append(groupDonorKeys[groupKey], donor.key)
 		groupMinimum[groupKey] = general.Max(groupMinimum[groupKey], int(math.Ceil(donor.requestQuantity)))
-		donorKeys = append(donorKeys, donor.key)
 		plan.donorCPUs[donor.key] = donor.cpus.Clone()
+		for _, cpu := range donor.cpus.ToSliceInt() {
+			if existing, found := groupByCPU[cpu]; found && existing != groupKey {
+				return nil, fmt.Errorf(
+					"hard reclaim partition has overlapping donor ownership on CPU %d: %q and %q",
+					cpu, existing, groupKey)
+			}
+			groupByCPU[cpu] = groupKey
+		}
+		groupCPUs[groupKey] = groupCPUs[groupKey].Union(donor.cpus)
 		allDonorCPUs = allDonorCPUs.Union(donor.cpus)
 	}
-	sort.Strings(donorKeys)
+	groupDonationLimit := make(map[string]int, len(groupCPUs))
+	for groupKey, cpus := range groupCPUs {
+		groupDonationLimit[groupKey] = cpus.Size() - groupMinimum[groupKey]
+		if groupDonationLimit[groupKey] < 0 {
+			groupDonationLimit[groupKey] = 0
+		}
+	}
 
 	numaIDs := make([]int, 0, len(in.targetByNUMA))
 	for numaID := range in.targetByNUMA {
@@ -92,8 +121,11 @@ func planHardReclaimPartition(in hardReclaimPartitionInput) (*hardReclaimPartiti
 	}
 	sort.Ints(numaIDs)
 
-	for _, numaID := range numaIDs {
+	candidates := make([]hardReclaimCoreSelectionCandidate, 0)
+	targets := make([]int, len(numaIDs))
+	for numaIndex, numaID := range numaIDs {
 		target := in.targetByNUMA[numaID]
+		targets[numaIndex] = target
 		if target < 0 {
 			return nil, fmt.Errorf("NUMA %d has negative hard reclaim target %d", numaID, target)
 		}
@@ -107,59 +139,223 @@ func planHardReclaimPartition(in hardReclaimPartitionInput) (*hardReclaimPartiti
 				numaID, eligible.Size(), target)
 		}
 
-		// fill from the non-donor pool first (currently pinned reclaim + free
-		// cpus), selecting complete physical cores only. stable and free are
-		// merged into one candidate universe so a core whose siblings are split
-		// across the two (one sibling already reclaimed, the other still free)
-		// is still selectable as a whole core; `currentReclaim` is passed as the
-		// preference so stable cores are consumed before fresh ones (minimizing
-		// churn) — invariant B.
-		stableReclaim := in.currentReclaim.Intersection(eligible).Difference(allDonorCPUs)
-		free := in.free.Intersection(eligible).
-			Difference(in.currentReclaim).
-			Difference(allDonorCPUs)
-		nonDonorPool := stableReclaim.Union(free)
-		selected := takeCoreAlignedCPUSet(in.topology, nonDonorPool, in.currentReclaim, target)
-		need := target - selected.Size()
-
-		for _, key := range donorKeys {
-			if need == 0 {
-				break
-			}
-			remainingDonor := plan.donorCPUs[key]
-			groupKey := donorGroupByKey[key]
-			groupRemaining := 0
-			for _, groupDonorKey := range groupDonorKeys[groupKey] {
-				groupRemaining += plan.donorCPUs[groupDonorKey].Size()
-			}
-			excess := groupRemaining - groupMinimum[groupKey]
-			if excess <= 0 {
-				continue
-			}
-			candidates := remainingDonor.Intersection(eligible)
-			limit := need
-			if excess < limit {
-				limit = excess
-			}
-			// hand donor excess back in complete cores only: preferring the cores
-			// that already overlap the current reclaim set keeps churn low, and
-			// takeCoreAlignedCPUSet crops `limit` down to a whole-core multiple so
-			// the donor never loses (nor reclaim gains) a lone SMT sibling.
-			taken := takeCoreAlignedCPUSet(in.topology, candidates, in.currentReclaim, limit)
-			selected = selected.Union(taken)
-			plan.donorCPUs[key] = remainingDonor.Difference(taken)
-			need -= taken.Size()
+		source := in.currentReclaim.Union(in.free).Union(allDonorCPUs).Intersection(eligible)
+		for _, candidate := range coreAlignedCandidates(in.topology, source, in.currentReclaim) {
+			candidates = append(candidates, hardReclaimCoreSelectionCandidate{
+				coreAlignedCandidate: candidate,
+				numaIndex:            numaIndex,
+			})
 		}
-		if need > 0 {
-			return nil, fmt.Errorf("NUMA %d needs %d more reclaim CPUs", numaID, need)
-		}
-		plan.reclaim = plan.reclaim.Union(selected)
 	}
+	selected, err := selectHardReclaimCoresByNUMAWithFrontier(
+		candidates, numaIDs, targets, in.currentReclaim, groupCPUs, groupDonationLimit)
+	if err != nil {
+		return nil, err
+	}
+	plan.reclaim = selected
 
 	if err := assertCoreAligned(plan.reclaim, in.topology); err != nil {
 		return nil, fmt.Errorf("hard reclaim partition plan violated core alignment: %w", err)
 	}
+	for key, donor := range donorByKey {
+		plan.donorCPUs[key] = donor.cpus.Difference(plan.reclaim)
+	}
 	return plan, nil
+}
+
+func selectHardReclaimCoresWithFrontier(
+	candidates []coreAlignedCandidate,
+	target int,
+	currentReclaim machine.CPUSet,
+	groupCPUs map[string]machine.CPUSet,
+	groupDonationLimit map[string]int,
+) (machine.CPUSet, error) {
+	candidatesByNUMA := make([]hardReclaimCoreSelectionCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		candidatesByNUMA = append(candidatesByNUMA, hardReclaimCoreSelectionCandidate{
+			coreAlignedCandidate: candidate,
+		})
+	}
+	return selectHardReclaimCoresByNUMAWithFrontier(
+		candidatesByNUMA, []int{0}, []int{target}, currentReclaim, groupCPUs, groupDonationLimit)
+}
+
+func selectHardReclaimCoresByNUMAWithFrontier(
+	candidates []hardReclaimCoreSelectionCandidate,
+	numaIDs []int,
+	targets []int,
+	currentReclaim machine.CPUSet,
+	groupCPUs map[string]machine.CPUSet,
+	groupDonationLimit map[string]int,
+) (machine.CPUSet, error) {
+	groupKeys := make([]string, 0, len(groupCPUs))
+	for groupKey := range groupCPUs {
+		groupKeys = append(groupKeys, groupKey)
+	}
+	sort.Strings(groupKeys)
+
+	states := []hardReclaimCoreSelectionState{{
+		selected:       machine.NewCPUSet(),
+		selectedByNUMA: make([]int, len(targets)),
+		donations:      make([]int, len(groupKeys)),
+	}}
+	frontierTruncated := false
+	for _, candidate := range candidates {
+		nextByKey := make(map[string]hardReclaimCoreSelectionState, len(states)*2)
+		for _, state := range states {
+			addHardReclaimCoreSelectionState(nextByKey, state)
+			if state.selectedByNUMA[candidate.numaIndex]+candidate.cpus.Size() >
+				targets[candidate.numaIndex] {
+				continue
+			}
+			next := hardReclaimCoreSelectionState{
+				selected:       state.selected.Union(candidate.cpus),
+				selectedByNUMA: append([]int(nil), state.selectedByNUMA...),
+				donations:      append([]int(nil), state.donations...),
+				retained:       state.retained + candidate.cpus.Intersection(currentReclaim).Size(),
+				donated:        state.donated,
+			}
+			next.selectedByNUMA[candidate.numaIndex] += candidate.cpus.Size()
+			allowed := true
+			for i, groupKey := range groupKeys {
+				donated := candidate.cpus.Intersection(groupCPUs[groupKey]).Size()
+				next.donations[i] += donated
+				next.donated += donated
+				if next.donations[i] > groupDonationLimit[groupKey] {
+					allowed = false
+					break
+				}
+			}
+			if allowed {
+				addHardReclaimCoreSelectionState(nextByKey, next)
+			}
+		}
+		var truncated bool
+		states, truncated = pruneHardReclaimCoreSelectionStates(nextByKey)
+		frontierTruncated = frontierTruncated || truncated
+	}
+
+	var best *hardReclaimCoreSelectionState
+	for i := range states {
+		if !intSlicesEqual(states[i].selectedByNUMA, targets) {
+			continue
+		}
+		if best == nil || hardReclaimCoreSelectionStateLess(states[i], *best) {
+			candidate := states[i]
+			best = &candidate
+		}
+	}
+	if best == nil {
+		if frontierTruncated {
+			return machine.NewCPUSet(), fmt.Errorf(
+				"search frontier truncated at width %d before proving a feasible reclaim selection",
+				hardReclaimCoreSelectionFrontierWidth)
+		}
+		var bestPartial *hardReclaimCoreSelectionState
+		for _, state := range states {
+			if bestPartial == nil || state.selected.Size() > bestPartial.selected.Size() ||
+				(state.selected.Size() == bestPartial.selected.Size() &&
+					hardReclaimCoreSelectionStateLess(state, *bestPartial)) {
+				candidate := state
+				bestPartial = &candidate
+			}
+		}
+		for i, target := range targets {
+			if bestPartial.selectedByNUMA[i] < target {
+				return machine.NewCPUSet(), fmt.Errorf(
+					"NUMA %d needs %d more reclaim CPUs",
+					numaIDs[i], target-bestPartial.selectedByNUMA[i])
+			}
+		}
+		return machine.NewCPUSet(), fmt.Errorf("no feasible hard reclaim selection")
+	}
+	return best.selected, nil
+}
+
+func intSlicesEqual(left, right []int) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func addHardReclaimCoreSelectionState(
+	states map[string]hardReclaimCoreSelectionState,
+	candidate hardReclaimCoreSelectionState,
+) {
+	key := fmt.Sprintf("%v/%v", candidate.selectedByNUMA, candidate.donations)
+	current, found := states[key]
+	if !found || hardReclaimCoreSelectionStateLess(candidate, current) {
+		states[key] = candidate
+	}
+}
+
+func pruneHardReclaimCoreSelectionStates(
+	states map[string]hardReclaimCoreSelectionState,
+) ([]hardReclaimCoreSelectionState, bool) {
+	byProgress := make(map[string][]hardReclaimCoreSelectionState)
+	for _, state := range states {
+		progress := fmt.Sprint(state.selectedByNUMA)
+		byProgress[progress] = append(byProgress[progress], state)
+	}
+	progresses := make([]string, 0, len(byProgress))
+	for progress := range byProgress {
+		progresses = append(progresses, progress)
+	}
+	sort.Strings(progresses)
+
+	result := make([]hardReclaimCoreSelectionState, 0, len(states))
+	truncated := false
+	for _, progress := range progresses {
+		bucket := byProgress[progress]
+		sort.Slice(bucket, func(i, j int) bool {
+			return hardReclaimCoreSelectionStateLess(bucket[i], bucket[j])
+		})
+		if len(bucket) > hardReclaimCoreSelectionFrontierWidth {
+			truncated = true
+			bucket = bucket[:hardReclaimCoreSelectionFrontierWidth]
+		}
+		result = append(result, bucket...)
+	}
+	if len(result) > hardReclaimCoreSelectionMaxStates {
+		truncated = true
+		sort.Slice(result, func(i, j int) bool {
+			if result[i].selected.Size() != result[j].selected.Size() {
+				return result[i].selected.Size() > result[j].selected.Size()
+			}
+			for k := range result[i].selectedByNUMA {
+				if result[i].selectedByNUMA[k] != result[j].selectedByNUMA[k] {
+					return result[i].selectedByNUMA[k] < result[j].selectedByNUMA[k]
+				}
+			}
+			return hardReclaimCoreSelectionStateLess(result[i], result[j])
+		})
+		result = result[:hardReclaimCoreSelectionMaxStates]
+	}
+	return result, truncated
+}
+
+func hardReclaimCoreSelectionStateLess(
+	left, right hardReclaimCoreSelectionState,
+) bool {
+	if left.retained != right.retained {
+		return left.retained > right.retained
+	}
+	if left.donated != right.donated {
+		return left.donated < right.donated
+	}
+	leftCPUs, rightCPUs := left.selected.ToSliceInt(), right.selected.ToSliceInt()
+	for i := range leftCPUs {
+		if leftCPUs[i] != rightCPUs[i] {
+			return leftCPUs[i] < rightCPUs[i]
+		}
+	}
+	return false
 }
 
 func pinHardReclaimPartitionDemands(

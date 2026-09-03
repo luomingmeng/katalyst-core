@@ -72,6 +72,67 @@ func takeCoreAlignedCPUSet(
 	return selected
 }
 
+// takeCoreAlignedCPUSetByTiers selects complete physical cores in tier order.
+// A core belongs to a tier only when all of its SMT siblings are in that tier;
+// a partial-core hit never raises the core's priority.
+func takeCoreAlignedCPUSetByTiers(
+	topology *machine.CPUTopology,
+	candidates machine.CPUSet,
+	preferredTiers []machine.CPUSet,
+	quantity int,
+) machine.CPUSet {
+	if quantity <= 0 || candidates.IsEmpty() || topology == nil {
+		return machine.NewCPUSet()
+	}
+	cpusPerCore := topology.CPUsPerCore()
+	if cpusPerCore <= 0 {
+		return machine.NewCPUSet()
+	}
+	coresWanted := quantity / cpusPerCore
+	if coresWanted <= 0 {
+		return machine.NewCPUSet()
+	}
+
+	type tieredCoreCandidate struct {
+		coreID int
+		cpus   machine.CPUSet
+		tier   int
+	}
+
+	completeCores := coreAlignedCandidates(topology, candidates, machine.NewCPUSet())
+	tieredCores := make([]tieredCoreCandidate, 0, len(completeCores))
+	for _, core := range completeCores {
+		tier := len(preferredTiers)
+		for tierIndex, preferred := range preferredTiers {
+			if core.cpus.IsSubsetOf(preferred) {
+				tier = tierIndex
+				break
+			}
+		}
+		tieredCores = append(tieredCores, tieredCoreCandidate{
+			coreID: core.coreID,
+			cpus:   core.cpus,
+			tier:   tier,
+		})
+	}
+	sort.Slice(tieredCores, func(i, j int) bool {
+		if tieredCores[i].tier != tieredCores[j].tier {
+			return tieredCores[i].tier < tieredCores[j].tier
+		}
+		return tieredCores[i].coreID < tieredCores[j].coreID
+	})
+
+	selected := machine.NewCPUSet()
+	for _, core := range tieredCores {
+		if coresWanted == 0 {
+			break
+		}
+		selected = selected.Union(core.cpus)
+		coresWanted--
+	}
+	return selected
+}
+
 // coreAlignedCandidates returns complete physical cores in deterministic
 // tiered-preference order: cores with more siblings in prefer come first, then
 // lower core IDs. Callers can use the individual candidates when a full core

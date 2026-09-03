@@ -988,6 +988,117 @@ func TestAdvisorWriteAheadTargetFailureDoesNotCommitDesired(t *testing.T) {
 	require.Nil(t, p.currentAdvisorPostCommitTarget())
 }
 
+func TestAdvisorWriteAheadPromoteFailureKeepsCommittedTargetPendingAndRecoverable(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	dir := t.TempDir()
+	p.advisorPostCommitCheckpointDir = dir
+	p.cpuSetAdjustmentRetryMu.Lock()
+	p.cpuSetAdjustmentRetryStopping = true
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	preCommitRevision := p.state.GetRevision()
+	activePath := filepath.Join(dir, advisorPostCommitCheckpointName)
+
+	target, err := p.commitAdvisorResponseWithWriteAhead(
+		&advisorapi.ListAndWatchResponse{
+			ExtraEntries: []*advisorsvc.CalculationInfo{{CgroupPath: "/committed"}},
+		},
+		preCommitRevision,
+		func() error {
+			if err := p.state.CommitAdvisorStateIfRevision(
+				preCommitRevision,
+				p.state.GetPodEntries(),
+				p.state.GetMachineState(),
+				p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+				p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+				true,
+			); err != nil {
+				return err
+			}
+			return os.Mkdir(activePath, 0o700)
+		},
+	)
+
+	require.ErrorContains(t, err, "promote advisor post-commit target")
+	require.Nil(t, target)
+	require.Equal(t, preCommitRevision+1, p.state.GetRevision())
+	pending := p.currentAdvisorPostCommitTarget()
+	require.NotNil(t, pending, "committed target must block later frames even when WAL promotion fails")
+	require.Equal(t, p.state.GetRevision(), pending.revision)
+	require.FileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName+".staging"))
+
+	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"fail": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			return errors.New("keep committed target pending")
+		},
+	}
+	err = p.allocateByCPUAdvisor(nil, &advisorapi.ListAndWatchResponse{}, nil)
+	require.ErrorContains(t, err, "keep committed target pending")
+
+	require.NoError(t, os.Remove(activePath))
+	p.cpuSetAdjustmentRetryMu.Lock()
+	p.advisorPostCommitTarget = nil
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	require.NoError(t, p.restoreAdvisorPostCommitTarget())
+	require.NotNil(t, p.currentAdvisorPostCommitTarget())
+	require.Equal(t, "/committed",
+		p.currentAdvisorPostCommitTarget().response.ExtraEntries[0].CgroupPath)
+	require.FileExists(t, activePath)
+	require.NoFileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName+".staging"))
+}
+
+func TestAdvisorWriteAheadPromoteFailureImmediatelyRetriesExactTarget(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	dir := t.TempDir()
+	p.advisorPostCommitCheckpointDir = dir
+	preCommitRevision := p.state.GetRevision()
+	activePath := filepath.Join(dir, advisorPostCommitCheckpointName)
+	applied := make(chan map[int]float64, 1)
+	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"observe": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			applied <- in.State.GetNUMAHeadroom()
+			return nil
+		},
+	}
+
+	_, err := p.commitAdvisorResponseWithWriteAhead(
+		&advisorapi.ListAndWatchResponse{
+			ExtraEntries: []*advisorsvc.CalculationInfo{{
+				CalculationResult: &advisorsvc.CalculationResult{
+					Values: map[string]string{
+						string(advisorapi.ControlKnobKeyCPUNUMAHeadroom): `{"0":7.5}`,
+					},
+				},
+			}},
+		},
+		preCommitRevision,
+		func() error {
+			if err := p.state.CommitAdvisorStateIfRevision(
+				preCommitRevision,
+				p.state.GetPodEntries(),
+				p.state.GetMachineState(),
+				p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+				p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+				true,
+			); err != nil {
+				return err
+			}
+			return os.Mkdir(activePath, 0o700)
+		},
+	)
+	require.ErrorContains(t, err, "promote advisor post-commit target")
+
+	select {
+	case headroom := <-applied:
+		require.Equal(t, map[int]float64{0: 7.5}, headroom,
+			"the retry must apply the exact committed response target")
+	case <-time.After(time.Second):
+		t.Fatal("WAL promotion failure did not immediately schedule the exact target retry")
+	}
+	p.cpuSetAdjustmentRetryWG.Wait()
+}
+
 func TestAdvisorWriteAheadTargetIsRemovedWhenDesiredCommitFails(t *testing.T) {
 	p, cleanup := newReclaimReuseTestPolicy(t)
 	defer cleanup()
@@ -1037,7 +1148,9 @@ func TestAdvisorWriteAheadCommitFailurePreservesActiveTarget(t *testing.T) {
 	require.NoFileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName+".staging"))
 	require.Same(t, active, p.currentAdvisorPostCommitTarget())
 
+	p.cpuSetAdjustmentRetryMu.Lock()
 	p.advisorPostCommitTarget = nil
+	p.cpuSetAdjustmentRetryMu.Unlock()
 	require.NoError(t, p.restoreAdvisorPostCommitTarget())
 	require.Equal(t, "/active", p.currentAdvisorPostCommitTarget().response.ExtraEntries[0].CgroupPath)
 }
@@ -1204,41 +1317,73 @@ func TestAdvisorPostCommitCheckpointStopStartRequeuesPendingTarget(t *testing.T)
 		"Stop/Start must retain the pending checkpoint")
 }
 
-func TestAdvisorPostCommitCheckpointRevisionMismatchAndCorruptionAreCleaned(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		prepare func(t *testing.T, p *DynamicPolicy, dir string)
-	}{
-		{
-			name: "revision mismatch",
-			prepare: func(t *testing.T, p *DynamicPolicy, _ string) {
-				p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
-				p.state.SetAllowSharedCoresOverlapReclaimedCores(
-					!p.state.GetAllowSharedCoresOverlapReclaimedCores(), false)
-			},
-		},
-		{
-			name: "corrupted checkpoint",
-			prepare: func(t *testing.T, _ *DynamicPolicy, dir string) {
-				require.NoError(t, os.WriteFile(
-					filepath.Join(dir, advisorPostCommitCheckpointName), []byte("{broken"), 0o600))
-			},
-		},
-	} {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			p, cleanup := newReclaimReuseTestPolicy(t)
-			defer cleanup()
-			p.advisorPostCommitCheckpointDir = dir
-			tc.prepare(t, p, dir)
-			p.advisorPostCommitTarget = nil
+func TestAdvisorPostCommitCheckpointRevisionMismatchIsCleaned(t *testing.T) {
+	dir := t.TempDir()
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	p.advisorPostCommitCheckpointDir = dir
+	p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+	p.state.SetAllowSharedCoresOverlapReclaimedCores(
+		!p.state.GetAllowSharedCoresOverlapReclaimedCores(), false)
+	p.cpuSetAdjustmentRetryMu.Lock()
+	p.advisorPostCommitTarget = nil
+	p.cpuSetAdjustmentRetryMu.Unlock()
 
-			require.NoError(t, p.restoreAdvisorPostCommitTarget())
-			require.Nil(t, p.currentAdvisorPostCommitTarget())
-			require.NoFileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName))
-		})
-	}
+	require.NoError(t, p.restoreAdvisorPostCommitTarget())
+	require.Nil(t, p.currentAdvisorPostCommitTarget())
+	require.NoFileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName))
+}
+
+func TestAdvisorPostCommitTargetCurrentCleansStaleActiveAndStagingCheckpoints(t *testing.T) {
+	dir := t.TempDir()
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	p.advisorPostCommitCheckpointDir = dir
+	target := p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+	stagingPath := filepath.Join(dir, advisorPostCommitCheckpointName+".staging")
+	require.NoError(t, p.storeAdvisorPostCommitTarget(target, stagingPath))
+	p.state.SetAllowSharedCoresOverlapReclaimedCores(
+		!p.state.GetAllowSharedCoresOverlapReclaimedCores(), false)
+
+	require.False(t, p.advisorPostCommitTargetCurrent(target))
+
+	require.Nil(t, p.currentAdvisorPostCommitTarget())
+	require.NoFileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName))
+	require.NoFileExists(t, stagingPath)
+}
+
+func TestAdvisorPostCommitReconcileCleansActiveAndStagingCheckpoints(t *testing.T) {
+	dir := t.TempDir()
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	p.advisorPostCommitCheckpointDir = dir
+	target := p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+	stagingPath := filepath.Join(dir, advisorPostCommitCheckpointName+".staging")
+	require.NoError(t, p.storeAdvisorPostCommitTarget(target, stagingPath))
+
+	require.NoError(t, p.reconcileAdvisorPostCommitTarget(context.Background(), target))
+
+	require.Nil(t, p.currentAdvisorPostCommitTarget())
+	require.NoFileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName))
+	require.NoFileExists(t, stagingPath)
+}
+
+func TestAdvisorPostCommitCheckpointCorruptionFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	p.advisorPostCommitCheckpointDir = dir
+	checkpointPath := filepath.Join(dir, advisorPostCommitCheckpointName)
+	require.NoError(t, os.WriteFile(checkpointPath, []byte("{broken"), 0o600))
+
+	err := p.restoreAdvisorPostCommitTarget()
+
+	require.ErrorContains(t, err, "corrupted active advisor post-commit checkpoint")
+	require.Nil(t, p.currentAdvisorPostCommitTarget())
+	require.FileExists(t, checkpointPath,
+		"a corrupted checkpoint for the committed revision must remain for operator recovery")
 }
 
 func TestCgroupCreateRetriesOnlyDeferredLeafDirtyAdjustment(t *testing.T) {

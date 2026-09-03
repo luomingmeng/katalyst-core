@@ -302,6 +302,10 @@ func getTestDynamicPolicyWithoutInitialization(
 
 		topologyAllocationAnnotationKey: coreconsts.QRMPodAnnotationTopologyAllocationKey,
 	}
+	policyImplement.advisorPostCommitCheckpointDir = stateFileDirectory
+	if err := policyImplement.restoreSteadyFakeNUMAMigrationTarget(); err != nil {
+		return nil, fmt.Errorf("restore steady fake-NUMA migration target: %w", err)
+	}
 
 	// Important: We must register the topologyAllocationHook and set the annotation keys
 	// to ensure that the test environment correctly generates NUMA topology annotations

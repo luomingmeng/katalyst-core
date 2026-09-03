@@ -25,6 +25,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"time"
 
 	"github.com/samber/lo"
@@ -602,6 +603,22 @@ func (p *DynamicPolicy) allocateByCPUAdvisorWithRevision(
 		general.InfoS("finished", "duration", time.Since(startTime))
 	}()
 
+	// A committed advisor revision is not complete until its post-commit
+	// production apply succeeds. Reconcile that exact revision before planning
+	// another frame so a failed staged migration cannot be overwritten by a
+	// later frame while the source state has already advanced.
+	if target := p.currentAdvisorPostCommitTarget(); target != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), cpuSetAdjustmentHandlerTimeout(p.conf))
+		reconcileErr := p.reconcileAdvisorPostCommitTarget(
+			ctx, target, cpusetutil.CPUSetAdjustmentModeRetry)
+		cancel()
+		if reconcileErr != nil {
+			return fmt.Errorf(
+				"previous advisor post-commit apply for revision %d is still pending: %w",
+				target.revision, reconcileErr)
+		}
+	}
+
 	// The synchronous response is valid only for the exact state generation
 	// used to build its request. The later precommit CAS protects mutations
 	// during planning; this guard protects the RPC round-trip itself.
@@ -648,6 +665,21 @@ func (p *DynamicPolicy) allocateByCPUAdvisorWithRevision(
 	pending, applyErr := p.applyBlocks(blockToCPUSet, resp, responseAllowOverlap, hardActive)
 	if applyErr != nil {
 		return fmt.Errorf("prepare applyBlocks failed with error: %w", applyErr)
+	}
+	pending.enforceSteadyReclaim = !hardActive &&
+		advisorResponseHasFakeNUMAMandatoryReclaim(resp)
+	if p.pendingAdvisorStateMatchesCommitted(pending) &&
+		len(resp.ExtraEntries) == 0 &&
+		!p.hasAnyPendingAdvisorPostCommitTarget() {
+		if err := p.validateAdvisorPartitionBeforeCommit(
+			pending.entries,
+			p.state.GetMachineState(),
+			pending.allowOverlap,
+			pending.disableDedicated,
+		); err != nil {
+			return fmt.Errorf("validate converged advisor state failed with error: %w", err)
+		}
+		return nil
 	}
 	target, applyErr := p.commitAdvisorResponseWithWriteAhead(resp, pending.preCommitRevision, func() error {
 		return p.commitPendingAdvisorState(pending)
@@ -1531,30 +1563,51 @@ func validateHardPartitionReclaimDistribution(
 	if outside := reclaim.Difference(eligible); !outside.IsEmpty() {
 		return fmt.Errorf("hard-partition reclaim outside eligible CPUs: %s", outside.String())
 	}
+	if err := assertCoreAligned(reclaim, topology); err != nil {
+		return fmt.Errorf("hard-partition reclaim is not core-aligned: %w", err)
+	}
 
-	minimum, maximum := 0, 0
-	seen := false
+	countByNUMA := make(map[int]int)
+	completeCapacityByNUMA := make(map[int]int)
+	firstNonSkippedNUMA := -1
 	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
 		if skipNUMAs.Has(numaID) {
 			continue
 		}
-		count := reclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID)).Size()
+		if firstNonSkippedNUMA < 0 {
+			firstNonSkippedNUMA = numaID
+		}
+		numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
+		completeCapacity := len(coreAlignedCandidates(
+			topology, eligible.Intersection(numaCPUs), machine.NewCPUSet())) * cpusPerCore
+		if completeCapacity == 0 {
+			continue
+		}
+		count := reclaim.Intersection(numaCPUs).Size()
 		if count < minimumPerNUMA {
 			return fmt.Errorf("hard-partition reclaim NUMA %d has %d CPUs, minimum is %d",
 				numaID, count, minimumPerNUMA)
 		}
-		if !seen || count < minimum {
-			minimum = count
-		}
-		if !seen || count > maximum {
-			maximum = count
-		}
-		seen = true
+		countByNUMA[numaID] = count
+		completeCapacityByNUMA[numaID] = completeCapacity
 	}
-	// imbalance tolerance is one complete core, matching the core-granular
-	// water-filling in expandHardPartitionReclaimPhase.
-	if maximum-minimum > cpusPerCore {
-		return fmt.Errorf("hard-partition reclaim is imbalanced across physical NUMAs: max=%d min=%d", maximum, minimum)
+	if len(countByNUMA) == 0 && firstNonSkippedNUMA >= 0 {
+		return fmt.Errorf("hard-partition reclaim NUMA %d has 0 CPUs, minimum is %d",
+			firstNonSkippedNUMA, minimumPerNUMA)
+	}
+
+	for lowNUMA, lowCount := range countByNUMA {
+		if lowCount+cpusPerCore > completeCapacityByNUMA[lowNUMA] {
+			continue
+		}
+		for _, highCount := range countByNUMA {
+			if highCount-lowCount > cpusPerCore {
+				return fmt.Errorf(
+					"hard-partition reclaim is imbalanced across physical NUMAs: "+
+						"NUMA %d can accept another core at count %d while another NUMA has %d",
+					lowNUMA, lowCount, highCount)
+			}
+		}
 	}
 	return nil
 }
@@ -1823,10 +1876,21 @@ func buildLegacyMandatoryReclaimDescriptors(
 }
 
 type pendingAdvisorState struct {
-	preCommitRevision uint64
-	entries           state.PodEntries
-	allowOverlap      bool
-	disableDedicated  bool
+	preCommitRevision    uint64
+	entries              state.PodEntries
+	allowOverlap         bool
+	disableDedicated     bool
+	enforceSteadyReclaim bool
+}
+
+func (p *DynamicPolicy) pendingAdvisorStateMatchesCommitted(pending *pendingAdvisorState) bool {
+	if p == nil || p.state == nil || pending == nil {
+		return false
+	}
+	return pending.preCommitRevision == p.state.GetRevision() &&
+		pending.allowOverlap == p.state.GetAllowSharedCoresOverlapReclaimedCores() &&
+		pending.disableDedicated == p.state.GetDisableDedicatedCoresOverlapReclaimedCores() &&
+		reflect.DeepEqual(pending.entries, p.state.GetPodEntries())
 }
 
 // applyBlocks prepares an advisor state transition without
@@ -1866,6 +1930,39 @@ func defaultShareQuantityFromAdvisorResponse(resp *advisorapi.ListAndWatchRespon
 		return 0, fmt.Errorf("convert default share quantity %d to int: %w", quantity, err)
 	}
 	return q, nil
+}
+
+func advisorResponseHasFakeNUMAMandatoryReclaim(
+	resp *advisorapi.ListAndWatchResponse,
+) bool {
+	if resp == nil || !resp.DisableDedicatedCoresOverlapReclaimedCores {
+		return false
+	}
+	for _, calculationEntries := range resp.Entries {
+		if calculationEntries == nil {
+			continue
+		}
+		for _, calculationInfo := range calculationEntries.Entries {
+			if calculationInfo == nil {
+				continue
+			}
+			ownerPoolName, _ := resourcepackage.UnwrapOwnerPoolName(
+				calculationInfo.OwnerPoolName)
+			if commonstate.GetPoolType(ownerPoolName) != commonstate.PoolNameReclaim {
+				continue
+			}
+			result := calculationInfo.CalculationResultsByNumas[commonstate.FakedNUMAID]
+			if result == nil {
+				continue
+			}
+			for _, block := range result.Blocks {
+				if block != nil && len(block.OverlapTargets) == 0 {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func (p *DynamicPolicy) applyBlocks(
@@ -2215,12 +2312,13 @@ func (p *DynamicPolicy) commitPendingAdvisorState(pending *pendingAdvisorState) 
 		return fmt.Errorf("pending advisor state is nil")
 	}
 	entries, _, err := p.commitPendingCPUPartition(pendingCPUPartition{
-		expectedRevision: pending.preCommitRevision,
-		entries:          pending.entries,
-		allowOverlap:     pending.allowOverlap,
-		disableDedicated: pending.disableDedicated,
-		persist:          true,
-		source:           "advisor apply",
+		expectedRevision:     pending.preCommitRevision,
+		entries:              pending.entries,
+		allowOverlap:         pending.allowOverlap,
+		disableDedicated:     pending.disableDedicated,
+		persist:              true,
+		source:               "advisor apply",
+		enforceSteadyReclaim: pending.enforceSteadyReclaim,
 	})
 	if err == nil {
 		pending.entries = entries

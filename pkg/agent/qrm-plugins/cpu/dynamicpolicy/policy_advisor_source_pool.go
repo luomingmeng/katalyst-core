@@ -390,6 +390,7 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhase(
 	blockIDByDemandKey := make(map[string]string, len(descriptors))
 	ordinalByStableKey := make(map[string]int, len(descriptors))
 	var coreFloors []partitionCoreFloorConstraint
+	var steadyFakeDemandKeys []string
 	expandHardReclaimPhase := preserveClass && hardActive
 	expandSteadyReclaimPhase := preserveClass && !hardActive &&
 		hasFakeNUMAMandatoryReclaimDescriptor(descriptors)
@@ -417,6 +418,20 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhase(
 		demands = append(demands, expanded...)
 		for demandKey, blockID := range expandedBlockIDs {
 			blockIDByDemandKey[demandKey] = blockID
+		}
+		if expandSteadyReclaimPhase {
+			mandatoryBlockIDs := make(map[string]struct{})
+			for _, descriptor := range descriptors {
+				if descriptor.Class == advisorBlockClassMandatoryReclaim {
+					mandatoryBlockIDs[descriptor.BlockID] = struct{}{}
+				}
+			}
+			for demandKey, blockID := range expandedBlockIDs {
+				if _, mandatory := mandatoryBlockIDs[blockID]; mandatory {
+					steadyFakeDemandKeys = append(steadyFakeDemandKeys, demandKey)
+				}
+			}
+			sort.Strings(steadyFakeDemandKeys)
 		}
 	}
 	for _, descriptor := range descriptors {
@@ -462,7 +477,25 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhase(
 	}
 	var assignments map[string]machine.CPUSet
 	var solveErr error
-	if len(coreFloors) > 0 {
+	if len(steadyFakeDemandKeys) > 0 {
+		assignments, solveErr = solveSteadyFakeNUMAWholeCoreWithFloorsAndProject(
+			demands,
+			steadyFakeDemandKeys,
+			coreFloors,
+			p.machineInfo.CPUTopology,
+			func(
+				demands []partitionDemand,
+				fakeKeys []string,
+				committed machine.CPUSet,
+				desired map[string]machine.CPUSet,
+				floors []partitionCoreFloorConstraint,
+				_ *machine.CPUTopology,
+			) (map[string]machine.CPUSet, error) {
+				return p.projectSteadyFakeNUMAStageWithCheckpoint(
+					demands, fakeKeys, committed, desired, floors)
+			},
+		)
+	} else if len(coreFloors) > 0 {
 		assignments, solveErr = solveDisjointPartitionsWithCoreFloors(
 			demands, coreFloors, p.machineInfo.CPUTopology)
 	} else {

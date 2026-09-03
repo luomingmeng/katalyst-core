@@ -17,6 +17,7 @@ limitations under the License.
 package dynamicpolicy
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -370,4 +371,185 @@ func TestPlanHardReclaimPartitionSharesRequestFloorAcrossNUMADonors(t *testing.T
 	require.Equal(t, 2, plan.reclaim.Intersection(numa1).Size())
 	require.Equal(t, 8, plan.donorCPUs["dnb-numa0"].Size()+plan.donorCPUs["dnb-numa1"].Size())
 	requireCoreAligned(t, topology, plan.reclaim)
+}
+
+func TestPlanHardReclaimPartitionBuildsCoreAcrossFreeAndDonor(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(4, 1, 1)
+	require.NoError(t, err)
+	core := coresInNUMA(topology, 0, 0, 1)
+	threads := core.ToSliceInt()
+
+	plan, err := planHardReclaimPartition(hardReclaimPartitionInput{
+		topology:        topology,
+		targetByNUMA:    map[int]int{0: 2},
+		free:            machine.NewCPUSet(threads[0]),
+		reclaimEligible: core,
+		donors: []hardReclaimPartitionDonor{{
+			key: "donor", cpus: machine.NewCPUSet(threads[1]), requestQuantity: 0,
+		}},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, core, plan.reclaim)
+	require.True(t, plan.donorCPUs["donor"].IsEmpty())
+}
+
+func TestPlanHardReclaimPartitionCountsOverlappingBlocksByOwnerUnion(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(4, 1, 1)
+	require.NoError(t, err)
+	core := coresInNUMA(topology, 0, 0, 1)
+
+	plan, err := planHardReclaimPartition(hardReclaimPartitionInput{
+		topology:        topology,
+		targetByNUMA:    map[int]int{0: 2},
+		reclaimEligible: core,
+		donors: []hardReclaimPartitionDonor{
+			{key: "block-a", groupKey: "pod/main", cpus: core, requestQuantity: 0},
+			{key: "block-b", groupKey: "pod/main", cpus: core, requestQuantity: 0},
+		},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, core, plan.reclaim)
+	require.True(t, plan.donorCPUs["block-a"].IsEmpty())
+	require.True(t, plan.donorCPUs["block-b"].IsEmpty())
+}
+
+func TestPlanHardReclaimPartitionRejectsOverlappingDifferentOwners(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(4, 1, 1)
+	require.NoError(t, err)
+	core := coresInNUMA(topology, 0, 0, 1)
+
+	plan, err := planHardReclaimPartition(hardReclaimPartitionInput{
+		topology:        topology,
+		targetByNUMA:    map[int]int{0: 2},
+		reclaimEligible: core,
+		donors: []hardReclaimPartitionDonor{
+			{key: "owner-a", groupKey: "pod-a/main", cpus: core, requestQuantity: 0},
+			{key: "owner-b", groupKey: "pod-b/main", cpus: core, requestQuantity: 0},
+		},
+	})
+
+	require.Nil(t, plan)
+	require.ErrorContains(t, err, "overlapping donor ownership")
+}
+
+func TestPlanHardReclaimPartitionFrontierAvoidsGreedyDonorDeadEnd(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(6, 1, 1)
+	require.NoError(t, err)
+	core0 := coresInNUMA(topology, 0, 0, 1)
+	core1 := coresInNUMA(topology, 0, 1, 2)
+	core2 := coresInNUMA(topology, 0, 2, 3)
+	core0Threads := core0.ToSliceInt()
+	donorA := core1.Union(machine.NewCPUSet(core0Threads[0]))
+	donorB := core2.Union(machine.NewCPUSet(core0Threads[1]))
+
+	plan, err := planHardReclaimPartition(hardReclaimPartitionInput{
+		topology:        topology,
+		targetByNUMA:    map[int]int{0: 4},
+		reclaimEligible: topology.CPUDetails.CPUs(),
+		donors: []hardReclaimPartitionDonor{
+			{key: "donor-a", groupKey: "pod-a/main", cpus: donorA, requestQuantity: 1},
+			{key: "donor-b", groupKey: "pod-b/main", cpus: donorB, requestQuantity: 1},
+		},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, core1.Union(core2), plan.reclaim)
+	requireCoreAligned(t, topology, plan.reclaim)
+}
+
+func TestSelectHardReclaimCoresReportsFrontierTruncation(t *testing.T) {
+	t.Parallel()
+
+	candidates := make([]coreAlignedCandidate, 0, 9)
+	groupCPUs := make(map[string]machine.CPUSet, 9)
+	groupDonationLimit := make(map[string]int, 9)
+	for i := 0; i < 9; i++ {
+		cpu := machine.NewCPUSet(i)
+		candidates = append(candidates, coreAlignedCandidate{coreID: i, cpus: cpu})
+		groupKey := fmt.Sprintf("group-%d", i)
+		groupCPUs[groupKey] = cpu
+		groupDonationLimit[groupKey] = 1
+	}
+
+	selected, err := selectHardReclaimCoresWithFrontier(
+		candidates, 10, machine.NewCPUSet(), groupCPUs, groupDonationLimit)
+
+	require.True(t, selected.IsEmpty())
+	require.ErrorContains(t, err, "search frontier truncated")
+}
+
+func TestPruneHardReclaimCoreSelectionStatesCapsTotalStateCount(t *testing.T) {
+	t.Parallel()
+
+	states := make(map[string]hardReclaimCoreSelectionState, hardReclaimCoreSelectionMaxStates+1)
+	for i := 0; i <= hardReclaimCoreSelectionMaxStates; i++ {
+		states[fmt.Sprint(i)] = hardReclaimCoreSelectionState{
+			selected:       machine.NewCPUSet(i),
+			selectedByNUMA: []int{i},
+		}
+	}
+
+	got, truncated := pruneHardReclaimCoreSelectionStates(states)
+
+	require.True(t, truncated)
+	require.Len(t, got, hardReclaimCoreSelectionMaxStates)
+}
+
+func TestPlanHardReclaimPartitionEnforcesDonorFloorAcrossNUMAs(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(16, 1, 2)
+	require.NoError(t, err)
+	donor0 := coresInNUMA(topology, 0, 0, 2)
+	donor1 := coresInNUMA(topology, 1, 0, 2)
+	donorUnion := donor0.Union(donor1)
+
+	plan, err := planHardReclaimPartition(hardReclaimPartitionInput{
+		topology:        topology,
+		targetByNUMA:    map[int]int{0: 4, 1: 4},
+		reclaimEligible: donorUnion,
+		donors: []hardReclaimPartitionDonor{
+			{key: "numa-0", groupKey: "pod/main", cpus: donor0, requestQuantity: 4},
+			{key: "numa-1", groupKey: "pod/main", cpus: donor1, requestQuantity: 4},
+		},
+	})
+
+	require.Nil(t, plan)
+	require.ErrorContains(t, err, "NUMA 1 needs 4 more reclaim CPUs")
+}
+
+func TestPlanHardReclaimPartitionJointlyAllocatesSharedDonorQuotaAcrossNUMAs(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(16, 1, 2)
+	require.NoError(t, err)
+	numa0Donor := coresInNUMA(topology, 0, 0, 1)
+	numa0Free := coresInNUMA(topology, 0, 1, 2)
+	numa1Donor := coresInNUMA(topology, 1, 0, 1)
+
+	plan, err := planHardReclaimPartition(hardReclaimPartitionInput{
+		topology:        topology,
+		targetByNUMA:    map[int]int{0: 2, 1: 2},
+		currentReclaim:  numa0Donor,
+		free:            numa0Free,
+		reclaimEligible: numa0Donor.Union(numa0Free).Union(numa1Donor),
+		donors: []hardReclaimPartitionDonor{
+			{key: "numa-0", groupKey: "pod/main", cpus: numa0Donor, requestQuantity: 2},
+			{key: "numa-1", groupKey: "pod/main", cpus: numa1Donor, requestQuantity: 2},
+		},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, numa0Free.Union(numa1Donor), plan.reclaim)
+	require.Equal(t, 2, plan.donorCPUs["numa-0"].Union(plan.donorCPUs["numa-1"]).Size())
 }

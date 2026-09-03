@@ -41,6 +41,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	dynamicpolicyutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
+	"github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/statedirectory"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/spd"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
@@ -118,10 +119,13 @@ func (*failingAllocateAccompanyPlugin) ReleaseAccompanyResource(_ *pluginapi.Rem
 
 type atomicCommitTrackingState struct {
 	state.State
-	commitErr   error
-	failCommits int
-	commitCalls int
-	storeCalls  int
+	commitErr      error
+	storeErr       error
+	failCommits    int
+	failStores     int
+	commitCalls    int
+	commitPersists []bool
+	storeCalls     int
 }
 
 type applyPoolsCommitGuardState struct {
@@ -171,6 +175,7 @@ func (s *atomicCommitTrackingState) CommitAdvisorState(
 	allowOverlap, disableDedicatedOverlap, persist bool,
 ) error {
 	s.commitCalls++
+	s.commitPersists = append(s.commitPersists, persist)
 	if s.commitErr != nil && (s.failCommits < 0 || s.commitCalls <= s.failCommits) {
 		return s.commitErr
 	}
@@ -184,6 +189,7 @@ func (s *atomicCommitTrackingState) CommitAdvisorStateIfRevision(
 	allowOverlap, disableDedicatedOverlap, persist bool,
 ) error {
 	s.commitCalls++
+	s.commitPersists = append(s.commitPersists, persist)
 	if s.commitErr != nil && (s.failCommits < 0 || s.commitCalls <= s.failCommits) {
 		return s.commitErr
 	}
@@ -193,6 +199,9 @@ func (s *atomicCommitTrackingState) CommitAdvisorStateIfRevision(
 
 func (s *atomicCommitTrackingState) StoreState() error {
 	s.storeCalls++
+	if s.storeErr != nil && (s.failStores < 0 || s.storeCalls <= s.failStores) {
+		return s.storeErr
+	}
 	return s.State.StoreState()
 }
 
@@ -3636,11 +3645,18 @@ func newDedicatedNUMAExclusiveFailureFixture(
 	t *testing.T,
 	podUID string,
 ) (*DynamicPolicy, *pluginapi.ResourceRequest) {
+	return newDedicatedNUMAExclusiveFailureFixtureInDir(t, podUID, t.TempDir())
+}
+
+func newDedicatedNUMAExclusiveFailureFixtureInDir(
+	t *testing.T,
+	podUID, stateDir string,
+) (*DynamicPolicy, *pluginapi.ResourceRequest) {
 	t.Helper()
 
 	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
 	require.NoError(t, err)
-	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, stateDir)
 	require.NoError(t, err)
 	p.reservedCPUs = machine.NewCPUSet()
 	p.reservedReclaimedCPUSet = machine.NewCPUSet()
@@ -3754,6 +3770,188 @@ func TestAllocateDedicatedNUMAExclusiveAdjustmentFailureDoesNotRollbackNewerStat
 		"reclaim floor/pool overlaps newer dedicated allocation: %s", reclaim.AllocationResult)
 	require.True(t, reclaim.AllocationResult.Intersection(failedCandidateCPUs).IsEmpty(),
 		"reclaim floor/pool overlaps failed candidate allocation: %s", reclaim.AllocationResult)
+}
+
+func TestAllocateDedicatedNUMAExclusiveApplyFailureRestoresSourceAndRetriesSameStage(t *testing.T) {
+	p, req := newDedicatedNUMAExclusiveFailureFixture(t, "exclusive-dnb-same-stage")
+	sourceEntries := p.state.GetPodEntries()
+	sourceMachine := p.state.GetMachineState()
+
+	failAdmission := true
+	type stagedAllocation struct {
+		dedicated machine.CPUSet
+		reclaim   machine.CPUSet
+	}
+	var attempted []stagedAllocation
+	p.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+		"apply": func(_ context.Context, in dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
+			if in.Mode != dynamicpolicyutil.CPUSetAdjustmentModeAdmission {
+				return nil
+			}
+			attempted = append(attempted, stagedAllocation{
+				dedicated: in.State.GetAllocationInfo(req.PodUid, req.ContainerName).AllocationResult,
+				reclaim: in.State.GetAllocationInfo(
+					commonstate.PoolNameReclaim, commonstate.FakedContainerName).AllocationResult,
+			})
+			if failAdmission {
+				return errors.New("injected apply failure")
+			}
+			return nil
+		},
+	}
+
+	allocate := func() (*pluginapi.ResourceAllocationResponse, error) {
+		p.Lock()
+		defer p.Unlock()
+		return p.dedicatedCoresWithNUMABindingAllocationHandler(
+			withAllocationPodMeta(context.Background(), req), req, true)
+	}
+
+	first, err := allocate()
+	require.Nil(t, first)
+	require.ErrorContains(t, err, "injected apply failure")
+	require.Equal(t, sourceEntries, p.state.GetPodEntries(),
+		"failed apply must restore the exact source pod state")
+	require.Equal(t, sourceMachine, p.state.GetMachineState(),
+		"failed apply must restore the exact source machine state")
+
+	failAdmission = false
+	second, err := allocate()
+	require.NoError(t, err)
+	require.NotNil(t, second)
+	require.Len(t, attempted, 2)
+	require.Equal(t, attempted[0], attempted[1],
+		"retry from the restored source must reproduce the same staged allocation")
+}
+
+func TestAllocateDedicatedNUMAExclusiveRollbackRestoresInMemoryBeforeSingleStoreFailure(t *testing.T) {
+	stateDir := t.TempDir()
+	p, req := newDedicatedNUMAExclusiveFailureFixtureInDir(
+		t, "exclusive-dnb-rollback-store-failure", stateDir)
+	sourceEntries := p.state.GetPodEntries()
+	sourceMachine := p.state.GetMachineState()
+	tracking := &atomicCommitTrackingState{
+		State:      p.state,
+		storeErr:   errors.New("injected rollback checkpoint write failure"),
+		failStores: 1,
+	}
+	p.state = tracking
+	var retryModes []dynamicpolicyutil.CPUSetAdjustmentMode
+	failedCandidateObserved := false
+	p.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+		"fail": func(_ context.Context, in dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
+			if in.Mode == dynamicpolicyutil.CPUSetAdjustmentModeAdmission {
+				return errors.New("injected apply failure")
+			}
+			retryModes = append(retryModes, in.Mode)
+			failedCandidateObserved = failedCandidateObserved ||
+				in.State.GetAllocationInfo(req.PodUid, req.ContainerName) != nil
+			return nil
+		},
+	}
+
+	p.Lock()
+	_, err := p.dedicatedCoresWithNUMABindingAllocationHandler(
+		withAllocationPodMeta(context.Background(), req), req, true)
+
+	require.ErrorContains(t, err, "injected rollback checkpoint write failure")
+	var compensated *requestStateCompensatedError
+	require.ErrorAs(t, err, &compensated,
+		"successful in-memory rollback must be reported as compensated despite StoreState failure")
+	require.Equal(t, []bool{true, false}, tracking.commitPersists,
+		"rollback must restore memory without an implicit checkpoint write")
+	require.Equal(t, 1, tracking.storeCalls,
+		"rollback must attempt exactly one explicit checkpoint write")
+	require.Equal(t, sourceEntries, p.state.GetPodEntries(),
+		"checkpoint failure must not undo the in-memory source restoration")
+	require.Equal(t, sourceMachine, p.state.GetMachineState())
+	require.Equal(t, []dynamicpolicyutil.CPUSetAdjustmentMode{
+		dynamicpolicyutil.CPUSetAdjustmentModeRetry,
+	}, retryModes, "production state must be restored immediately after memory rollback")
+	require.False(t, failedCandidateObserved)
+	p.cpuSetAdjustmentRetryMu.Lock()
+	require.True(t, p.cpuSetAdjustmentRetryDirty)
+	require.True(t, p.cpuSetAdjustmentRetryQueued)
+	p.cpuSetAdjustmentRetryMu.Unlock()
+
+	p.Unlock()
+	p.cpuSetAdjustmentRetryWG.Wait()
+
+	require.Equal(t, 2, tracking.storeCalls,
+		"one-shot checkpoint failure must be retried in the background")
+	require.False(t, failedCandidateObserved,
+		"the failed candidate must never be exposed by production retries")
+	p.cpuSetAdjustmentRetryMu.Lock()
+	require.False(t, p.cpuSetAdjustmentRetryDirty)
+	require.False(t, p.cpuSetAdjustmentRetryQueued)
+	p.cpuSetAdjustmentRetryMu.Unlock()
+
+	restarted, err := state.NewCheckpointState(
+		&statedirectory.StateDirectoryConfiguration{StateFileDirectory: stateDir},
+		"cpu_plugin_state", "dynamic", p.machineInfo.CPUTopology, false,
+		generateMachineStateFromPodEntries, metrics.DummyMetrics{})
+	require.NoError(t, err)
+	require.Nil(t, restarted.GetAllocationInfo(req.PodUid, req.ContainerName),
+		"the failed candidate must not resurrect after restart")
+}
+
+func TestAllocateDedicatedNUMAExclusiveRollbackPersistsSourceDespitePersistentRetryFailure(t *testing.T) {
+	stateDir := t.TempDir()
+	p, req := newDedicatedNUMAExclusiveFailureFixtureInDir(
+		t, "exclusive-dnb-persist-independent-of-retry", stateDir)
+	sourceEntries := p.state.GetPodEntries()
+	sourceMachine := p.state.GetMachineState()
+	tracking := &atomicCommitTrackingState{
+		State:      p.state,
+		storeErr:   errors.New("injected rollback checkpoint write failure"),
+		failStores: 1,
+	}
+	p.state = tracking
+	retryCalls := 0
+	failedCandidateObserved := false
+	p.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+		"persistent-cgroup-failure": func(_ context.Context, in dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
+			if in.Mode == dynamicpolicyutil.CPUSetAdjustmentModeAdmission {
+				return errors.New("injected admission cgroup failure")
+			}
+			retryCalls++
+			failedCandidateObserved = failedCandidateObserved ||
+				in.State.GetAllocationInfo(req.PodUid, req.ContainerName) != nil
+			return errors.New("injected persistent retry cgroup failure")
+		},
+	}
+
+	p.Lock()
+	_, err := p.dedicatedCoresWithNUMABindingAllocationHandler(
+		withAllocationPodMeta(context.Background(), req), req, true)
+	require.ErrorContains(t, err, "injected rollback checkpoint write failure")
+	require.Equal(t, sourceEntries, p.state.GetPodEntries())
+	require.Equal(t, sourceMachine, p.state.GetMachineState())
+	p.Unlock()
+
+	p.cpuSetAdjustmentRetryWG.Wait()
+
+	require.Greater(t, retryCalls, 1,
+		"persistent cgroup failure must exercise the bounded background retry path")
+	require.Equal(t, 2, tracking.storeCalls,
+		"restored source must be persisted independently once storage recovers")
+	require.False(t, failedCandidateObserved,
+		"the rolled-back candidate must never be exposed to cgroup retries")
+	p.cpuSetAdjustmentRetryMu.Lock()
+	require.True(t, p.cpuSetAdjustmentRetryDirty,
+		"persistent cgroup failure must keep latest-state reconciliation dirty")
+	require.False(t, p.cpuSetAdjustmentRetryPersist,
+		"successful independent persistence must clear only the persistence obligation")
+	require.False(t, p.cpuSetAdjustmentRetryQueued)
+	p.cpuSetAdjustmentRetryMu.Unlock()
+
+	restarted, err := state.NewCheckpointState(
+		&statedirectory.StateDirectoryConfiguration{StateFileDirectory: stateDir},
+		"cpu_plugin_state", "dynamic", p.machineInfo.CPUTopology, false,
+		generateMachineStateFromPodEntries, metrics.DummyMetrics{})
+	require.NoError(t, err)
+	require.Nil(t, restarted.GetAllocationInfo(req.PodUid, req.ContainerName),
+		"the failed candidate must not resurrect after restart")
 }
 
 func TestAllocateDedicatedNUMAExclusiveAdjustmentFailureReportsOwnershipLostAndReconcilesLatestState(t *testing.T) {

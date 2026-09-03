@@ -102,6 +102,72 @@ func TestCommitPendingCPUPartitionRejectsRevisionChangedByHook(t *testing.T) {
 	require.Nil(t, p.state.GetAllocationInfo("dedicated-pod", "main"))
 }
 
+func TestPreparePendingCPUPartitionRevalidatesQuantityAfterHooks(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	candidate := precommitPartitionEntries(machine.NewCPUSet(0, 48), machine.NewCPUSet(1, 49))
+	p.allocationHooks = []AllocationHook{func(_, allocation *state.AllocationInfo) error {
+		if allocation.PodUid == "dedicated-pod" {
+			allocation.AllocationResult = machine.NewCPUSet(1)
+		}
+		return nil
+	}}
+
+	_, _, err := p.commitPendingCPUPartition(pendingCPUPartition{
+		expectedRevision: p.state.GetRevision(),
+		entries:          candidate,
+		disableDedicated: true,
+		persist:          false,
+	})
+
+	require.ErrorContains(t, err, "allocation quantity changed after hooks")
+	require.Nil(t, p.state.GetAllocationInfo("dedicated-pod", "main"))
+}
+
+func TestValidateSteadyReclaimPrecommitInvariant(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(32, 2, 2)
+	require.NoError(t, err)
+	committed := coresInNUMA(topology, 0, 0, 4)
+	planned := coresInNUMA(topology, 0, 2, 4).
+		Union(coresInNUMA(topology, 1, 0, 2))
+
+	for _, tc := range []struct {
+		name      string
+		candidate machine.CPUSet
+		want      string
+	}{
+		{
+			name: "fragmented whole core",
+			candidate: planned.Difference(machine.NewCPUSet(planned.ToSliceInt()[0])).
+				Union(machine.NewCPUSet(coresInNUMA(topology, 1, 2, 3).ToSliceInt()[0])),
+			want: "not core-aligned",
+		},
+		{
+			name:      "quantity changed",
+			candidate: coresInNUMA(topology, 0, 2, 4),
+			want:      "quantity changed",
+		},
+		{
+			name:      "per-NUMA floor changed",
+			candidate: coresInNUMA(topology, 0, 0, 4),
+			want:      "NUMA distribution changed",
+		},
+		{
+			name:      "committed churn exceeds limit",
+			candidate: coresInNUMA(topology, 0, 4, 8),
+			want:      "migration churn",
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateSteadyReclaimPrecommitInvariant(
+				planned, tc.candidate, committed, topology)
+			require.ErrorContains(t, err, tc.want)
+		})
+	}
+}
+
 func TestCommitPendingCPUPartitionRejectsInvalidOverrideAndDeletionFallback(t *testing.T) {
 	p, cleanup := newReclaimReuseTestPolicy(t)
 	defer cleanup()

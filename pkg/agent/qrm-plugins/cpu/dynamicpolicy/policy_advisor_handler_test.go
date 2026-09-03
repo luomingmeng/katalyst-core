@@ -290,16 +290,14 @@ func TestAllocateByCPUAdvisorLegacyHardReclaimAliases(t *testing.T) {
 		}
 	}
 
-	t.Run("mandatory reclaim ignores legal overlap aliases and stays balanced", func(t *testing.T) {
+	t.Run("mandatory reclaim rejects aliases that fragment physical cores", func(t *testing.T) {
 		policy, resp := newPolicyAndResponse(t, true)
-		require.NoError(t, policy.allocateByCPUAdvisor(nil, resp, nil))
+		revision := policy.state.GetRevision()
 
-		reclaim := policy.state.GetAllocationInfo(
-			commonstate.PoolNameReclaim, commonstate.FakedContainerName).AllocationResult
-		for numaID := 0; numaID < 2; numaID++ {
-			require.Equal(t, 3, reclaim.Intersection(
-				policy.machineInfo.CPUDetails.CPUsInNUMANodes(numaID)).Size())
-		}
+		err := policy.allocateByCPUAdvisor(nil, resp, nil)
+
+		require.ErrorContains(t, err, "not core-aligned")
+		require.Equal(t, revision, policy.state.GetRevision())
 	})
 
 	t.Run("overlap only fails closed without mandatory reclaim", func(t *testing.T) {
@@ -338,16 +336,170 @@ func TestGenerateBlockCPUSetDisjointPlannerRequiresCapability(t *testing.T) {
 	require.Empty(t, got)
 }
 
+func TestAllocateByCPUAdvisorConvergedFrameIsStrictNoOp(t *testing.T) {
+	policy, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	applied := 0
+	policy.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"count": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			applied++
+			return nil
+		},
+	}
+	resp := &advisorapi.ListAndWatchResponse{Entries: map[string]*advisorapi.CalculationEntries{}}
+
+	require.NoError(t, policy.allocateByCPUAdvisor(nil, resp, nil))
+	require.Equal(t, 1, applied)
+	convergedRevision := policy.state.GetRevision()
+	convergedEntries := policy.state.GetPodEntries()
+
+	require.NoError(t, policy.allocateByCPUAdvisor(nil, resp, nil))
+	require.Equal(t, convergedRevision, policy.state.GetRevision(),
+		"a converged advisor frame must not create another state revision")
+	require.Equal(t, convergedEntries, policy.state.GetPodEntries())
+	require.Equal(t, 1, applied,
+		"a converged advisor frame must not invoke the cpuset production chain again")
+	require.False(t, policy.hasAnyPendingAdvisorPostCommitTarget())
+}
+
+func TestAllocateByCPUAdvisorControlOnlyFrameIsNotStrictNoOp(t *testing.T) {
+	policy, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	applied := 0
+	policy.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"count": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			applied++
+			return nil
+		},
+	}
+	base := &advisorapi.ListAndWatchResponse{Entries: map[string]*advisorapi.CalculationEntries{}}
+	require.NoError(t, policy.allocateByCPUAdvisor(nil, base, nil))
+	convergedRevision := policy.state.GetRevision()
+
+	controlOnly := &advisorapi.ListAndWatchResponse{
+		Entries: map[string]*advisorapi.CalculationEntries{},
+		ExtraEntries: []*advisorsvc.CalculationInfo{{
+			CalculationResult: &advisorsvc.CalculationResult{
+				Values: map[string]string{
+					string(advisorapi.ControlKnobKeyCPUNUMAHeadroom): `{"0":2.5}`,
+				},
+			},
+		}},
+	}
+	require.NoError(t, policy.allocateByCPUAdvisor(nil, controlOnly, nil))
+
+	require.Equal(t, map[int]float64{0: 2.5}, policy.state.GetNUMAHeadroom())
+	require.Equal(t, convergedRevision+1, policy.state.GetRevision(),
+		"a response with changed control items must be committed and applied")
+	require.Equal(t, 2, applied,
+		"a response with changed control items must run the production chain")
+}
+
+func TestAllocateByCPUAdvisorPendingPostCommitApplyBlocksStageAdvanceAndRetriesSameStage(t *testing.T) {
+	policy, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	policy.cpuSetAdjustmentRetryMu.Lock()
+	policy.cpuSetAdjustmentRetryStopping = true
+	policy.cpuSetAdjustmentRetryMu.Unlock()
+
+	failApply := true
+	applied := 0
+	policy.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"controlled": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			applied++
+			if failApply {
+				return fmt.Errorf("injected post-commit apply failure")
+			}
+			return nil
+		},
+	}
+	resp := &advisorapi.ListAndWatchResponse{Entries: map[string]*advisorapi.CalculationEntries{}}
+
+	err := policy.allocateByCPUAdvisor(nil, resp, nil)
+	require.ErrorContains(t, err, "injected post-commit apply failure")
+	stagedRevision := policy.state.GetRevision()
+	stagedEntries := policy.state.GetPodEntries()
+	require.True(t, policy.hasAnyPendingAdvisorPostCommitTarget())
+
+	err = policy.allocateByCPUAdvisor(nil, resp, nil)
+	require.ErrorContains(t, err, "injected post-commit apply failure")
+	require.Equal(t, stagedRevision, policy.state.GetRevision(),
+		"a failed retry must not commit the next advisor frame")
+	require.Equal(t, stagedEntries, policy.state.GetPodEntries())
+	require.True(t, policy.hasAnyPendingAdvisorPostCommitTarget())
+
+	failApply = false
+	require.NoError(t, policy.allocateByCPUAdvisor(nil, resp, nil))
+	require.Equal(t, stagedRevision, policy.state.GetRevision(),
+		"retrying the same stage must only finish its post-commit apply")
+	require.Equal(t, stagedEntries, policy.state.GetPodEntries())
+	require.False(t, policy.hasAnyPendingAdvisorPostCommitTarget())
+	require.Equal(t, 3, applied)
+}
+
+func TestAllocateByCPUAdvisorConcurrentFrameCannotOvertakePendingPostCommitApply(t *testing.T) {
+	policy, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	policy.cpuSetAdjustmentRetryMu.Lock()
+	policy.cpuSetAdjustmentRetryStopping = true
+	policy.cpuSetAdjustmentRetryMu.Unlock()
+
+	failApply := true
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	policy.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"controlled": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			if failApply {
+				return fmt.Errorf("injected post-commit apply failure")
+			}
+			entered <- struct{}{}
+			<-release
+			return nil
+		},
+	}
+	resp := &advisorapi.ListAndWatchResponse{Entries: map[string]*advisorapi.CalculationEntries{}}
+	require.Error(t, policy.allocateByCPUAdvisor(nil, resp, nil))
+	stagedRevision := policy.state.GetRevision()
+	failApply = false
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- policy.allocateByCPUAdvisor(nil, resp, nil)
+	}()
+	<-entered
+
+	secondStarted := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		close(secondStarted)
+		secondDone <- policy.allocateByCPUAdvisor(nil, resp, nil)
+	}()
+	<-secondStarted
+	require.Equal(t, stagedRevision, policy.state.GetRevision(),
+		"a concurrent frame must not advance while the prior post-commit apply is blocked")
+
+	close(release)
+	require.NoError(t, <-firstDone)
+	require.NoError(t, <-secondDone)
+	require.Equal(t, stagedRevision, policy.state.GetRevision())
+	require.False(t, policy.hasAnyPendingAdvisorPostCommitTarget())
+}
+
 func TestValidateHardPartitionReclaimDistribution(t *testing.T) {
 	t.Parallel()
 
-	topology := &machine.CPUTopology{NumCPUs: 8, NumCores: 4, CPUDetails: machine.CPUDetails{
-		0: {NUMANodeID: 0, CoreID: 0}, 1: {NUMANodeID: 0, CoreID: 1},
-		2: {NUMANodeID: 0, CoreID: 2}, 3: {NUMANodeID: 0, CoreID: 3},
-		4: {NUMANodeID: 1, CoreID: 0}, 5: {NUMANodeID: 1, CoreID: 1},
-		6: {NUMANodeID: 1, CoreID: 2}, 7: {NUMANodeID: 1, CoreID: 3},
-	}}
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
 	allCPUs := topology.CPUDetails.CPUs()
+	numa0OneCore := coresInNUMA(topology, 0, 0, 1)
+	numa0TwoCores := coresInNUMA(topology, 0, 0, 2)
+	numa1OneCore := coresInNUMA(topology, 1, 0, 1)
+	fragmentedFull := numa0OneCore.Union(numa1OneCore)
+	fragmented := fragmentedFull.Difference(machine.NewCPUSet(fragmentedFull.ToSliceInt()[0]))
 
 	for _, tc := range []struct {
 		name     string
@@ -358,17 +510,18 @@ func TestValidateHardPartitionReclaimDistribution(t *testing.T) {
 	}{
 		{
 			name:     "two per NUMA",
-			reclaim:  machine.NewCPUSet(0, 1, 4, 5),
+			reclaim:  numa0OneCore.Union(numa1OneCore),
 			eligible: allCPUs,
 		},
 		{
-			name:     "three and two",
-			reclaim:  machine.NewCPUSet(0, 1, 2, 4, 5),
+			name:     "fragmented physical core",
+			reclaim:  fragmented,
 			eligible: allCPUs,
+			wantErr:  "not core-aligned",
 		},
 		{
 			name:     "four and zero",
-			reclaim:  machine.NewCPUSet(0, 1, 2, 3),
+			reclaim:  numa0TwoCores,
 			eligible: allCPUs,
 			wantErr:  "NUMA 1 has 0 CPUs, minimum is 2",
 		},
@@ -376,13 +529,12 @@ func TestValidateHardPartitionReclaimDistribution(t *testing.T) {
 			name:     "three and one",
 			reclaim:  machine.NewCPUSet(0, 1, 2, 4),
 			eligible: allCPUs,
-			wantErr:  "NUMA 1 has 1 CPUs, minimum is 2",
+			wantErr:  "not core-aligned",
 		},
 		{
 			name:     "eligible missing physical NUMA",
-			reclaim:  machine.NewCPUSet(0, 1),
-			eligible: machine.NewCPUSet(0, 1, 2, 3),
-			wantErr:  "NUMA 1 has 0 CPUs, minimum is 2",
+			reclaim:  numa0OneCore,
+			eligible: topology.CPUDetails.CPUsInNUMANodes(0),
 		},
 		{
 			name:     "empty eligible",
@@ -391,10 +543,16 @@ func TestValidateHardPartitionReclaimDistribution(t *testing.T) {
 			wantErr:  "NUMA 0 has 0 CPUs, minimum is 2",
 		},
 		{
+			name:    "fragmented eligible NUMA skipped",
+			reclaim: numa0OneCore,
+			eligible: numa0OneCore.Union(machine.NewCPUSet(
+				numa1OneCore.ToSliceInt()[0])),
+		},
+		{
 			name:     "outside eligible",
-			reclaim:  machine.NewCPUSet(0, 1, 3, 4, 5),
-			eligible: machine.NewCPUSet(0, 1, 2, 4, 5, 6, 7),
-			wantErr:  "outside eligible CPUs: 3",
+			reclaim:  numa0OneCore.Union(numa1OneCore),
+			eligible: allCPUs.Difference(numa1OneCore),
+			wantErr:  "outside eligible CPUs",
 		},
 		{
 			name:     "outside machine",
@@ -407,19 +565,19 @@ func TestValidateHardPartitionReclaimDistribution(t *testing.T) {
 			// finalized reserve there; without the carve-out the imbalance guard
 			// rejects every other ramp-up QoS on the node.
 			name:     "steady exclusive numa skipped avoids minimum",
-			reclaim:  machine.NewCPUSet(0, 1, 2, 3),
+			reclaim:  numa0TwoCores,
 			eligible: allCPUs,
 			skip:     sets.NewInt(1),
 		},
 		{
 			name:     "steady exclusive numa skipped avoids imbalance",
-			reclaim:  machine.NewCPUSet(0, 1, 2, 3, 4, 5),
+			reclaim:  numa0TwoCores.Union(numa1OneCore),
 			eligible: allCPUs,
 			skip:     sets.NewInt(1),
 		},
 		{
 			name:     "non-skipped numa still enforces minimum",
-			reclaim:  machine.NewCPUSet(0, 1, 2, 3),
+			reclaim:  numa0TwoCores,
 			eligible: allCPUs,
 			skip:     sets.NewInt(0),
 			wantErr:  "NUMA 1 has 0 CPUs, minimum is 2",
@@ -436,9 +594,26 @@ func TestValidateHardPartitionReclaimDistribution(t *testing.T) {
 				require.NoError(t, err)
 				return
 			}
-			require.EqualError(t, err, "hard-partition reclaim "+tc.wantErr)
+			require.ErrorContains(t, err, tc.wantErr)
 		})
 	}
+}
+
+func TestValidateHardPartitionReclaimDistributionAllowsCapacitySaturatedImbalance(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(16, 1, 2)
+	require.NoError(t, err)
+	reclaim := coresInNUMA(topology, 0, 0, 1).
+		Union(coresInNUMA(topology, 1, 0, 3))
+
+	require.NoError(t, validateHardPartitionReclaimDistribution(
+		reclaim,
+		reclaim,
+		topology,
+		nil,
+		topology.CPUsPerCore(),
+	))
 }
 
 func TestValidateHardPartitionBlockPlanSkipsWhenDisabled(t *testing.T) {
@@ -678,12 +853,9 @@ func TestSolveAdvisorDescriptorPhaseHandles24Plus178Plus4(t *testing.T) {
 	got := advisorapi.BlockCPUSet{}
 	remaining, err := policy.solveAdvisorDescriptorPhase(descriptors, available, got, true, false)
 
-	require.NoError(t, err)
-	require.Equal(t, 24, got["reclaim-numa0"].Size())
-	require.Equal(t, 178, got["reclaim-global"].Size())
-	require.Equal(t, 4, got["shared-numa0"].Size())
-	require.True(t, got["shared-numa0"].IsSubsetOf(numa0))
-	require.Equal(t, 2, remaining.Size())
+	require.Equal(t, available, remaining)
+	require.ErrorContains(t, err, "insufficient core-capacity quota")
+	require.Empty(t, got)
 }
 
 func TestSolveAdvisorDescriptorPhaseFailureIsAtomic(t *testing.T) {

@@ -198,11 +198,13 @@ type DynamicPolicy struct {
 	cpuSetAdjustmentRetryAgain     bool
 	cpuSetAdjustmentRetryDirty     bool
 	cpuSetAdjustmentRetryReasons   map[cpusetutil.CPUSetAdjustmentRetryReason]struct{}
+	cpuSetAdjustmentRetryPersist   bool
 	cpuSetAdjustmentRetryStopCh    <-chan struct{}
 	cpuSetAdjustmentRetryStopping  bool
 	cpuSetAdjustmentRetryWG        sync.WaitGroup
 	advisorPostCommitTarget        *advisorPostCommitTarget
 	advisorPostCommitCheckpointDir string
+	steadyFakeNUMAMigrationTarget  *steadyFakeNUMAMigrationTarget
 	cpuSetAdjustmentGeneration     uint64
 
 	cpuPressureEviction       agent.Component
@@ -453,6 +455,9 @@ func NewDynamicPolicy(agentCtx *agent.GenericContext, conf *config.Configuration
 		reclaimConsumersForKCNR:         conf.ReclaimConsumersForKCNR,
 	}
 	policyImplement.advisorPostCommitCheckpointDir, _ = conf.StateDirectoryConfiguration.GetCurrentAndPreviousStateFileDirectory()
+	if err := policyImplement.restoreSteadyFakeNUMAMigrationTarget(); err != nil {
+		return false, nil, fmt.Errorf("restore steady fake-NUMA migration target: %w", err)
+	}
 
 	policyImplement.RegisterAllocationHook(policyImplement.topologyAllocationHook)
 

@@ -974,6 +974,36 @@ func hardReclaimDemandQuotasByBlock(
 	return quotas
 }
 
+func TestExpandHardPartitionReclaimPhaseFakeCapacityExcludesRealReclaim(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	numa1 := topology.CPUDetails.CPUsInNUMANodes(1)
+	realEligible := coresInNUMA(topology, 0, 0, 1)
+	available := numa0.Union(numa1)
+	descriptors := []advisorBlockDescriptor{
+		{
+			BlockID: "real", Class: advisorBlockClassMandatoryReclaim, NUMAID: 0,
+			Quantity: 2, ComponentKey: "real", Eligible: realEligible,
+		},
+		{
+			BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
+			Quantity: 4, ComponentKey: "fake", Eligible: realEligible.Union(numa1),
+		},
+	}
+
+	demands, _, err := expandHardPartitionReclaimPhase(
+		descriptors, available, topology, nil)
+
+	require.NoError(t, err)
+	require.Equal(t, map[string]map[int]int{
+		"real": {0: 2},
+		"fake": {1: 4},
+	}, hardReclaimDemandQuotasByBlock(t, demands, topology))
+}
+
 func requireHardReclaimFinalBalance(
 	t *testing.T,
 	demands []partitionDemand,

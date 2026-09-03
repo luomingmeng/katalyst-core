@@ -409,7 +409,6 @@ func expandSteadyFakeNUMAReclaimPhase(
 	demands := make([]partitionDemand, 0, len(mandatory)+topology.NumNUMANodes)
 	blockIDByDemandKey := make(map[string]string, len(mandatory)+topology.NumNUMANodes)
 	floors := make([]partitionCoreFloorConstraint, 0, topology.NumNUMANodes)
-	realCoreFloorByNUMA := make(map[int]bool)
 	for _, descriptor := range mandatory {
 		if descriptor.NUMAID == commonstate.FakedNUMAID {
 			continue
@@ -438,7 +437,6 @@ func expandSteadyFakeNUMAReclaimPhase(
 			})
 			blockIDByDemandKey[key] = descriptor.BlockID
 			floors = append(floors, partitionCoreFloorConstraint{demandKey: key})
-			realCoreFloorByNUMA[descriptor.NUMAID] = true
 
 			residual := descriptor.Quantity - cpusPerCore
 			if residual > 0 {
@@ -467,65 +465,85 @@ func expandSteadyFakeNUMAReclaimPhase(
 
 	fake := fakeDescriptors[0]
 	fakeEligible := fake.Eligible.Intersection(available)
+	realMandatoryPreferred := machine.NewCPUSet()
+	for _, descriptor := range mandatory {
+		if descriptor.NUMAID != commonstate.FakedNUMAID {
+			realMandatoryPreferred = realMandatoryPreferred.Union(descriptor.OldPreferred)
+		}
+	}
+	fakeOldPreferred := fake.OldPreferred.Difference(realMandatoryPreferred).Intersection(fakeEligible)
 	numaIDs := topology.CPUDetails.KeepOnly(fakeEligible).NUMANodes().ToSliceInt()
 	sort.Ints(numaIDs)
-	floorEligibleByNUMA := make(map[int]machine.CPUSet, len(numaIDs))
-	requiredFloorQuantity := 0
-	for _, numaID := range numaIDs {
-		if skipNUMAs.Has(numaID) || realCoreFloorByNUMA[numaID] {
+	minimumByNUMA := make(map[int]int, len(numaIDs))
+	maximumByNUMA := make(map[int]int, len(numaIDs))
+	fixedQuantityByNUMA := make(map[int]int, len(numaIDs))
+	realMandatoryQuantityByNUMA := make(map[int]int, len(numaIDs))
+	for _, descriptor := range descriptors {
+		if descriptor.BlockID == fake.BlockID {
 			continue
 		}
-		numaEligible := fakeEligible.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
-		coreCandidates := coreAlignedCandidates(
-			topology, numaEligible, fake.OldPreferred.Intersection(numaEligible))
-		if len(coreCandidates) == 0 {
-			continue
+		finalEligible := descriptor.Eligible.Intersection(available)
+		eligibleNUMAs := topology.CPUDetails.KeepOnly(finalEligible).NUMANodes().ToSliceInt()
+		if len(eligibleNUMAs) == 1 {
+			fixedQuantityByNUMA[eligibleNUMAs[0]] += descriptor.Quantity
 		}
-		floorEligible := machine.NewCPUSet()
-		for _, candidate := range coreCandidates {
-			floorEligible = floorEligible.Union(candidate.cpus)
+		if descriptor.Class == advisorBlockClassMandatoryReclaim &&
+			descriptor.NUMAID != commonstate.FakedNUMAID {
+			realMandatoryQuantityByNUMA[descriptor.NUMAID] += descriptor.Quantity
 		}
-		floorEligibleByNUMA[numaID] = floorEligible
-		requiredFloorQuantity += cpusPerCore
 	}
-	if fake.Quantity < requiredFloorQuantity {
-		return nil, nil, nil, fmt.Errorf(
-			"steady fake reclaim quantity %d is smaller than required steady minimum %d",
-			fake.Quantity, requiredFloorQuantity)
+	for _, numaID := range numaIDs {
+		if skipNUMAs.Has(numaID) {
+			maximumByNUMA[numaID] = general.Max(
+				0,
+				available.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID)).Size()-
+					fixedQuantityByNUMA[numaID],
+			)
+		} else {
+			numaEligible := fakeEligible.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
+			realMandatory := realMandatoryQuantityByNUMA[numaID]
+			if realMandatory == 0 {
+				coreCandidates := coreAlignedCandidates(
+					topology, numaEligible, fakeOldPreferred.Intersection(numaEligible))
+				if len(coreCandidates) > 0 {
+					minimumByNUMA[numaID] = cpusPerCore
+				}
+			} else if remainder := realMandatory % cpusPerCore; remainder != 0 {
+				minimumByNUMA[numaID] = cpusPerCore - remainder
+			}
+			maximumByNUMA[numaID] = general.Max(
+				0,
+				available.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID)).Size()-
+					fixedQuantityByNUMA[numaID],
+			)
+		}
+	}
+	quotas, err := planSteadyFakeNUMACoreCapacityQuotasWithLimits(
+		fake.Quantity,
+		fakeOldPreferred,
+		fakeEligible,
+		topology,
+		skipNUMAs,
+		minimumByNUMA,
+		maximumByNUMA,
+		realMandatoryQuantityByNUMA,
+	)
+	if err != nil {
+		return nil, nil, nil, err
 	}
 
-	remaining := fake.Quantity
 	for _, numaID := range numaIDs {
-		floorEligible, found := floorEligibleByNUMA[numaID]
-		if !found {
+		quota := quotas[numaID]
+		if quota == 0 {
 			continue
 		}
+		eligible := fakeEligible.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
 		key := hardReclaimPhaseDemandKey(fake, numaID)
 		demands = append(demands, partitionDemand{
 			key:       key,
-			quantity:  cpusPerCore,
-			eligible:  floorEligible,
-			preferred: fake.OldPreferred.Intersection(floorEligible),
-			class:     advisorBlockClassMandatoryReclaim,
-		})
-		blockIDByDemandKey[key] = fake.BlockID
-		floors = append(floors, partitionCoreFloorConstraint{demandKey: key})
-		remaining -= cpusPerCore
-	}
-
-	if remaining > 0 {
-		eligible := fakeEligible.Clone()
-		for numaID := range skipNUMAs {
-			eligible = eligible.Difference(topology.CPUDetails.CPUsInNUMANodes(numaID))
-		}
-		preferred := takeCoreAlignedCPUSet(
-			topology, eligible, fake.OldPreferred.Intersection(eligible), remaining)
-		key := hardReclaimPhaseDemandKey(fake, commonstate.FakedNUMAID)
-		demands = append(demands, partitionDemand{
-			key:       key,
-			quantity:  remaining,
+			quantity:  quota,
 			eligible:  eligible,
-			preferred: preferred,
+			preferred: fakeOldPreferred.Intersection(eligible),
 			class:     advisorBlockClassMandatoryReclaim,
 		})
 		blockIDByDemandKey[key] = fake.BlockID
@@ -606,6 +624,12 @@ func expandHardPartitionReclaimPhase(
 					descriptor.BlockID, descriptor.Quantity)
 			}
 			for _, numaID := range topology.CPUDetails.KeepOnly(finalEligible).NUMANodes().ToSliceInt() {
+				numaEligible := finalEligible.Intersection(
+					available).Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
+				if len(coreAlignedCandidates(
+					topology, numaEligible, descriptor.OldPreferred.Intersection(numaEligible))) == 0 {
+					continue
+				}
 				eligibleNUMAs[numaID] = struct{}{}
 				capacityByNUMA[numaID] = available.Intersection(
 					topology.CPUDetails.CPUsInNUMANodes(numaID)).Size()
@@ -670,8 +694,12 @@ func expandHardPartitionReclaimPhase(
 	finalEligible := fake.Eligible.Intersection(available)
 	eligibleCapacityByNUMA := make(map[int]int, len(numaIDs))
 	for _, numaID := range numaIDs {
-		eligibleCapacityByNUMA[numaID] = finalEligible.Intersection(
-			topology.CPUDetails.CPUsInNUMANodes(numaID)).Size()
+		numaEligible := finalEligible.Intersection(
+			available).Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
+		completeCapacity := len(coreAlignedCandidates(
+			topology, numaEligible, fake.OldPreferred.Intersection(numaEligible))) * cpusPerCore
+		eligibleCapacityByNUMA[numaID] = general.Max(
+			0, completeCapacity-finalByNUMA[numaID])
 	}
 	general.InfoS("hard reclaim fake mandatory water-filling input",
 		"blockID", fake.BlockID,

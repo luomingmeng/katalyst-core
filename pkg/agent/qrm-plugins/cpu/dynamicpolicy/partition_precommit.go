@@ -19,19 +19,21 @@ package dynamicpolicy
 import (
 	"fmt"
 
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
 type pendingCPUPartition struct {
-	expectedRevision uint64
-	entries          state.PodEntries
-	baseMachineState state.NUMANodeMap
-	allowOverlap     bool
-	disableDedicated bool
-	persist          bool
-	source           string
-	validate         func(state.PodEntries, state.NUMANodeMap, bool, bool) error
+	expectedRevision     uint64
+	entries              state.PodEntries
+	baseMachineState     state.NUMANodeMap
+	allowOverlap         bool
+	disableDedicated     bool
+	persist              bool
+	source               string
+	validate             func(state.PodEntries, state.NUMANodeMap, bool, bool) error
+	enforceSteadyReclaim bool
 }
 
 type preparedCPUPartition struct {
@@ -66,6 +68,24 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 	} else {
 		if err := p.normalizePendingCPUPartition(candidate); err != nil {
 			return nil, p.wrapPartitionPrecommitError(pending.source, "normalize allocation entries", err)
+		}
+		if err := validateAllocationShapeAfterHooks(
+			pending.entries, candidate, p.machineInfo.CPUTopology,
+		); err != nil {
+			return nil, p.wrapPartitionPrecommitError(
+				pending.source, "revalidate allocation shape after hooks", err)
+		}
+		if pending.enforceSteadyReclaim {
+			plannedReclaim := reclaimPoolCPUSet(pending.entries)
+			candidateReclaim := reclaimPoolCPUSet(candidate)
+			committedReclaim := reclaimPoolCPUSet(currentEntries)
+			if err := validateSteadyReclaimPrecommitInvariant(
+				plannedReclaim, candidateReclaim, committedReclaim,
+				p.machineInfo.CPUTopology,
+			); err != nil {
+				return nil, p.wrapPartitionPrecommitError(
+					pending.source, "revalidate steady reclaim after hooks", err)
+			}
 		}
 		baseMachineState := pending.baseMachineState
 		if baseMachineState == nil {
@@ -145,6 +165,84 @@ func (p *DynamicPolicy) normalizePendingCPUPartition(entries state.PodEntries) e
 			}
 			allocation.TopologyAwareAssignments = assignments
 			allocation.OriginalTopologyAwareAssignments = originalAssignments
+		}
+	}
+	return nil
+}
+
+func validateAllocationShapeAfterHooks(
+	planned, candidate state.PodEntries,
+	topology *machine.CPUTopology,
+) error {
+	for podUID, plannedContainers := range planned {
+		for containerName, plannedAllocation := range plannedContainers {
+			if plannedAllocation == nil {
+				continue
+			}
+			candidateAllocation := candidate[podUID][containerName]
+			if candidateAllocation == nil {
+				return fmt.Errorf("allocation %s/%s was removed after hooks", podUID, containerName)
+			}
+			if plannedAllocation.AllocationResult.Size() != candidateAllocation.AllocationResult.Size() {
+				return fmt.Errorf(
+					"allocation quantity changed after hooks for %s/%s: planned=%d candidate=%d",
+					podUID, containerName,
+					plannedAllocation.AllocationResult.Size(),
+					candidateAllocation.AllocationResult.Size())
+			}
+			for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
+				numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
+				plannedQuantity := plannedAllocation.AllocationResult.Intersection(numaCPUs).Size()
+				candidateQuantity := candidateAllocation.AllocationResult.Intersection(numaCPUs).Size()
+				if plannedQuantity != candidateQuantity {
+					return fmt.Errorf(
+						"allocation NUMA distribution changed after hooks for %s/%s NUMA %d: planned=%d candidate=%d",
+						podUID, containerName, numaID, plannedQuantity, candidateQuantity)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func reclaimPoolCPUSet(entries state.PodEntries) machine.CPUSet {
+	if reclaimEntries := entries[commonstate.PoolNameReclaim]; reclaimEntries != nil {
+		if reclaim := reclaimEntries[commonstate.FakedContainerName]; reclaim != nil {
+			return reclaim.AllocationResult.Clone()
+		}
+	}
+	return machine.NewCPUSet()
+}
+
+func validateSteadyReclaimPrecommitInvariant(
+	planned, candidate, committed machine.CPUSet,
+	topology *machine.CPUTopology,
+) error {
+	if topology == nil {
+		return fmt.Errorf("steady reclaim precommit topology is nil")
+	}
+	if err := assertCoreAligned(candidate, topology); err != nil {
+		return fmt.Errorf("steady reclaim is not core-aligned: %w", err)
+	}
+	if candidate.Size() != planned.Size() {
+		return fmt.Errorf(
+			"steady reclaim quantity changed after hooks: planned=%d candidate=%d",
+			planned.Size(), candidate.Size())
+	}
+	if churn := steadyFakeNUMAMigrationChurn(committed, candidate); churn >
+		steadyFakeNUMAMaxMigratedCPUs {
+		return fmt.Errorf(
+			"steady reclaim migration churn %d exceeds limit %d",
+			churn, steadyFakeNUMAMaxMigratedCPUs)
+	}
+	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
+		numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
+		plannedQuantity := planned.Intersection(numaCPUs).Size()
+		candidateQuantity := candidate.Intersection(numaCPUs).Size()
+		if plannedQuantity != candidateQuantity {
+			return fmt.Errorf(
+				"steady reclaim NUMA distribution changed after hooks for NUMA %d: planned=%d candidate=%d",
+				numaID, plannedQuantity, candidateQuantity)
 		}
 	}
 	return nil

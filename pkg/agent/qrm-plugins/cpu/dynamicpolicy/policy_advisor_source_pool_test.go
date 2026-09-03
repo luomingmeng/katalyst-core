@@ -1611,6 +1611,22 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 		requireCoreAligned(t, topology, got)
 	})
 
+	t.Run("fragmented logical capacity is not treated as a complete core", func(t *testing.T) {
+		numa0Cores := topology.CPUDetails.CoresInNUMANodes(0).ToSliceInt()
+		fragmentedNUMA0 := machine.NewCPUSet(
+			topology.CPUDetails.CPUsInCores(numa0Cores[0]).ToSliceInt()[0],
+			topology.CPUDetails.CPUsInCores(numa0Cores[1]).ToSliceInt()[0],
+		)
+		numa1Core := coresInNUMA(topology, 1, 0, 1)
+		available := fragmentedNUMA0.Union(numa1Core)
+
+		got, err := solve(t, newPolicy(t, true), 2, available, machine.NewCPUSet())
+
+		require.NoError(t, err)
+		require.Equal(t, numa1Core, got)
+		requireCoreAligned(t, topology, got)
+	})
+
 	t.Run("old reclaim concentrated on one NUMA is rebalanced", func(t *testing.T) {
 		got, err := solve(t, newPolicy(t, true), 4, allCPUs, numa1)
 		require.NoError(t, err)
@@ -1789,7 +1805,7 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 		require.ErrorContains(t, err, "smaller than required steady minimum")
 	})
 
-	t.Run("steady reclaim floor avoids a real reclaim demand's only CPU", func(t *testing.T) {
+	t.Run("steady reclaim rejects odd mandatory reclaim union", func(t *testing.T) {
 		singleNUMATopology, err := machine.GenerateDummyCPUTopology(6, 1, 1)
 		require.NoError(t, err)
 		p, err := getTestDynamicPolicyWithoutInitialization(singleNUMATopology, t.TempDir())
@@ -1810,10 +1826,8 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 				Quantity: 2, ComponentKey: "fake", Eligible: singleNUMACPUs, OldPreferred: fakePreferred,
 			},
 		}, singleNUMACPUs, result, true, false)
-		require.NoError(t, err)
-		require.Equal(t, realEligible, result["real"])
-		require.True(t, result["fake"].Intersection(realEligible).IsEmpty())
-		requireCoreAligned(t, singleNUMATopology, result["fake"])
+		require.ErrorContains(t, err, "quantity 3 is not a whole-core multiple of 2")
+		require.Empty(t, result)
 	})
 
 	t.Run("steady real reclaim quantity must include a complete core", func(t *testing.T) {
@@ -1835,6 +1849,37 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 		require.NoError(t, err)
 		requireCoreAligned(t, topology, result["real"])
 		requireCoreAligned(t, topology, result["fake"])
+	})
+
+	t.Run("steady fake quota jointly completes cross numa real mandatory capacity", func(t *testing.T) {
+		p := newPolicy(t, false)
+		numa0Core := coresInNUMA(topology, 0, 0, 1).ToSliceInt()
+		numa1Core := coresInNUMA(topology, 1, 0, 1).ToSliceInt()
+		real0 := machine.NewCPUSet(numa0Core[0])
+		real1 := machine.NewCPUSet(numa1Core[0])
+		fakePreferred := machine.NewCPUSet(numa0Core[1], numa1Core[1])
+		result := advisorapi.NewBlockCPUSet()
+
+		_, err := p.solveAdvisorDescriptorPhase([]advisorBlockDescriptor{
+			{
+				BlockID: "real-0", Class: advisorBlockClassMandatoryReclaim, NUMAID: 0,
+				Quantity: 1, ComponentKey: "real-0", Eligible: real0, OldPreferred: real0,
+			},
+			{
+				BlockID: "real-1", Class: advisorBlockClassMandatoryReclaim, NUMAID: 1,
+				Quantity: 1, ComponentKey: "real-1", Eligible: real1, OldPreferred: real1,
+			},
+			{
+				BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
+				Quantity: 2, ComponentKey: "fake", Eligible: allCPUs, OldPreferred: fakePreferred,
+			},
+		}, allCPUs, result, true, false)
+
+		require.NoError(t, err)
+		require.Equal(t, 2, result["real-0"].Union(result["fake"]).Intersection(numa0).Size())
+		require.Equal(t, 2, result["real-1"].Union(result["fake"]).Intersection(numa1).Size())
+		requireCoreAligned(t, topology,
+			result["real-0"].Union(result["real-1"]).Union(result["fake"]))
 	})
 
 	t.Run("steady residual prefers complete cores over fragmented previous reclaim", func(t *testing.T) {
@@ -1907,9 +1952,10 @@ func TestPlanDisjointAdvisorBlocksPreservesCeiledOwnerRequestWhenDonating(t *tes
 	// pod owns {0..7}, so the free pool {8,9,10,11} are all orphan half cores
 	// (siblings 2,3,4,5 are owned). the ceiled owner request is 7, leaving only
 	// a 1-CPU donor excess. under the core-aligned invariant neither the orphan
-	// half cores nor a lone 1-CPU excess can form a whole core, so reclaim can
-	// take nothing and the planner fails loud for the full core-aligned target.
-	require.ErrorContains(t, err, "NUMA 0 needs 6 more reclaim CPUs")
+	// half cores and the lone 1-CPU excess can jointly form one complete core,
+	// but the donor floor forbids taking any second sibling. reclaim therefore
+	// remains four CPUs short of the full core-aligned target.
+	require.ErrorContains(t, err, "NUMA 0 needs 4 more reclaim CPUs")
 	require.Empty(t, result)
 }
 
