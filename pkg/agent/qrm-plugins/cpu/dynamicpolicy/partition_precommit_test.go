@@ -78,7 +78,7 @@ func TestCommitPendingCPUPartitionNormalizesBeforeRebuildingMachineState(t *test
 	require.Empty(t, committed["dedicated-pod"]["main"].TopologyAwareAssignments[1])
 	require.True(t, machineState[0].PodEntries["dedicated-pod"]["main"].AllocationResult.Equals(machine.NewCPUSet(2, 3)))
 	require.Len(t, emitter.records, 1)
-	requirePoolSizeMetric(t, emitter.records, commonstate.PoolNameReclaim, 0, 2)
+	requirePoolSizeMetric(t, emitter.records, commonstate.PoolNameReclaim, commonstate.PoolNameReclaim, 0, 2)
 }
 
 func TestCommitPendingCPUPartitionRejectsRevisionChangedByHook(t *testing.T) {

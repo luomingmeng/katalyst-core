@@ -19,6 +19,7 @@ package dynamicpolicy
 import (
 	"context"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -44,7 +45,7 @@ type recordingMetricEmitter struct {
 	records []metricRecord
 }
 
-func requirePoolSizeMetric(t *testing.T, records []metricRecord, poolName string, numaID int, value int64) {
+func requirePoolSizeMetric(t *testing.T, records []metricRecord, poolName, formattedPoolName string, numaID int, value int64) {
 	t.Helper()
 
 	for _, record := range records {
@@ -54,12 +55,13 @@ func requirePoolSizeMetric(t *testing.T, records []metricRecord, poolName string
 		}
 		if record.key == util.MetricNamePoolSize &&
 			tags["poolName"] == poolName &&
+			tags["pool_name"] == formattedPoolName &&
 			tags["numa_id"] == strconv.Itoa(numaID) {
 			require.Equal(t, value, record.val)
 			return
 		}
 	}
-	t.Fatalf("missing pool size metric for pool %q numa %d", poolName, numaID)
+	t.Fatalf("missing pool size metric for pool %q formatted %q numa %d", poolName, formattedPoolName, numaID)
 }
 
 func (e *recordingMetricEmitter) StoreInt64(key string, val int64, emitType metrics.MetricTypeName, tags ...metrics.MetricTag) error {
@@ -152,6 +154,27 @@ func TestEmitFinalPoolSizeMetrics(t *testing.T) {
 				},
 			},
 		},
+		commonstate.PoolNamePrefixIsolation + "-isolation-uid": {
+			commonstate.FakedContainerName: {
+				AllocationMeta: commonstate.GenerateGenericPoolAllocationMeta(
+					commonstate.PoolNamePrefixIsolation + "-isolation-uid"),
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: machine.NewCPUSet(6),
+				},
+			},
+		},
+		"isolation-uid": {
+			"main": {
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "isolation-uid",
+					PodNamespace:  "default",
+					PodName:       "isolation-pod",
+					ContainerType: pluginapi.ContainerType_MAIN.String(),
+					QoSLevel:      consts.PodAnnotationQoSLevelDedicatedCores,
+					OwnerPoolName: commonstate.PoolNamePrefixIsolation + "-isolation-uid",
+				},
+			},
+		},
 		"pod": {
 			"container": {
 				AllocationMeta: commonstate.AllocationMeta{PodUid: "pod"},
@@ -165,6 +188,7 @@ func TestEmitFinalPoolSizeMetrics(t *testing.T) {
 	policy.emitFinalPoolSizeMetrics(entries)
 
 	actual := make(map[string]int64)
+	formattedPoolNames := make(map[string]string)
 	for _, record := range emitter.records {
 		require.Equal(t, util.MetricNamePoolSize, record.key)
 		require.Equal(t, metrics.MetricTypeNameRaw, record.emitType)
@@ -174,13 +198,18 @@ func TestEmitFinalPoolSizeMetrics(t *testing.T) {
 			tags[tag.Key] = tag.Val
 		}
 		actual[tags["poolName"]+"/"+tags["numa_id"]] = record.val
+		require.NotEmpty(t, tags["pool_name"])
+		formattedPoolNames[tags["poolName"]+"/"+tags["numa_id"]] = tags["pool_name"]
 	}
 	require.Equal(t, map[string]int64{
-		commonstate.PoolNameShare + "/0":   2,
-		commonstate.PoolNameShare + "/1":   2,
-		commonstate.PoolNameReclaim + "/0": 1,
-		commonstate.PoolNameReclaim + "/1": 1,
+		commonstate.PoolNameShare + "/0":                              2,
+		commonstate.PoolNameShare + "/1":                              2,
+		commonstate.PoolNameReclaim + "/0":                            1,
+		commonstate.PoolNameReclaim + "/1":                            1,
+		commonstate.PoolNamePrefixIsolation + "-isolation-uid" + "/0": 1,
 	}, actual)
+	require.Equal(t, "isolation-default/isolation-pod",
+		formattedPoolNames[commonstate.PoolNamePrefixIsolation+"-isolation-uid"+"/0"])
 }
 
 func newDynamicConfigWithEnableReclaim(enabled bool) *dynamicconfig.DynamicAgentConfiguration {
@@ -192,9 +221,18 @@ func newDynamicConfigWithEnableReclaim(enabled bool) *dynamicconfig.DynamicAgent
 }
 
 func dedicatedMainContainerEntry(podUID string, assignments map[int]machine.CPUSet) *state.AllocationInfo {
+	return dedicatedMainContainerEntryWithPodName(podUID, podUID, assignments)
+}
+
+func dedicatedMainContainerEntryWithPodName(
+	podUID, podName string,
+	assignments map[int]machine.CPUSet,
+) *state.AllocationInfo {
 	return &state.AllocationInfo{
 		AllocationMeta: commonstate.AllocationMeta{
 			PodUid:        podUID,
+			PodNamespace:  "default",
+			PodName:       podName,
 			ContainerType: pluginapi.ContainerType_MAIN.String(),
 			QoSLevel:      consts.PodAnnotationQoSLevelDedicatedCores,
 		},
@@ -203,8 +241,8 @@ func dedicatedMainContainerEntry(podUID string, assignments map[int]machine.CPUS
 }
 
 // collectPoolSizeMetrics folds the recorded pool size series into a map keyed by
-// "poolName/pool_type/numa_id" so that both the value and the pool_type label can
-// be asserted deterministically.
+// "poolName/pool_type/pool_name/numa_id" so that legacy and formatted pool labels
+// can be asserted deterministically.
 func collectPoolSizeMetrics(t *testing.T, records []metricRecord) map[string]int64 {
 	t.Helper()
 
@@ -217,7 +255,8 @@ func collectPoolSizeMetrics(t *testing.T, records []metricRecord) map[string]int
 		for _, tag := range record.tags {
 			tags[tag.Key] = tag.Val
 		}
-		actual[tags["poolName"]+"/"+tags["pool_type"]+"/"+tags["numa_id"]] = record.val
+		require.NotEmpty(t, tags["pool_name"])
+		actual[tags["poolName"]+"/"+tags["pool_type"]+"/"+tags["pool_name"]+"/"+tags["numa_id"]] = record.val
 	}
 	return actual
 }
@@ -226,9 +265,10 @@ func TestEmitFinalPoolSizeMetricsWithDedicated(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
-		entries state.PodEntries
-		want    map[string]int64
+		name       string
+		entries    state.PodEntries
+		want       map[string]int64
+		wantSeries int
 	}{
 		{
 			name: "single dedicated pod single numa",
@@ -245,8 +285,8 @@ func TestEmitFinalPoolSizeMetricsWithDedicated(t *testing.T) {
 				},
 			},
 			want: map[string]int64{
-				commonstate.PoolNameShare + "/" + commonstate.PoolNameShare + "/0":         2,
-				commonstate.PoolNameDedicated + "/" + commonstate.PoolNameDedicated + "/0": 4,
+				poolSizeMetricKey(commonstate.PoolNameShare, commonstate.PoolNameShare, commonstate.PoolNameShare, 0):                 2,
+				poolSizeMetricKey(commonstate.PoolNameDedicated, commonstate.PoolNameDedicated, "dedicated-default/dedicated-pod", 0): 4,
 			},
 		},
 		{
@@ -260,9 +300,56 @@ func TestEmitFinalPoolSizeMetricsWithDedicated(t *testing.T) {
 				},
 			},
 			want: map[string]int64{
-				commonstate.PoolNameDedicated + "/" + commonstate.PoolNameDedicated + "/2": 3,
-				commonstate.PoolNameDedicated + "/" + commonstate.PoolNameDedicated + "/3": 2,
+				poolSizeMetricKey(commonstate.PoolNameDedicated, commonstate.PoolNameDedicated, "dedicated-default/dedicated-pod", 2): 3,
+				poolSizeMetricKey(commonstate.PoolNameDedicated, commonstate.PoolNameDedicated, "dedicated-default/dedicated-pod", 3): 2,
 			},
+		},
+		{
+			name: "dedicated pods on same numa keep separate pool names",
+			entries: state.PodEntries{
+				"dedicated-a": {
+					"container": dedicatedMainContainerEntry("dedicated-a",
+						map[int]machine.CPUSet{0: machine.NewCPUSet(2, 3)}),
+				},
+				"dedicated-b": {
+					"container": dedicatedMainContainerEntry("dedicated-b",
+						map[int]machine.CPUSet{0: machine.NewCPUSet(4, 5, 6)}),
+				},
+			},
+			want: map[string]int64{
+				poolSizeMetricKey(commonstate.PoolNameDedicated, commonstate.PoolNameDedicated, "dedicated-default/dedicated-a", 0): 2,
+				poolSizeMetricKey(commonstate.PoolNameDedicated, commonstate.PoolNameDedicated, "dedicated-default/dedicated-b", 0): 3,
+			},
+		},
+		{
+			name: "dedicated main containers in one pod are unioned per numa",
+			entries: state.PodEntries{
+				"dedicated-pod": {
+					"container-a": dedicatedMainContainerEntry("dedicated-pod",
+						map[int]machine.CPUSet{0: machine.NewCPUSet(2, 3)}),
+					"container-b": dedicatedMainContainerEntry("dedicated-pod",
+						map[int]machine.CPUSet{0: machine.NewCPUSet(3, 4, 5)}),
+				},
+			},
+			want: map[string]int64{
+				poolSizeMetricKey(commonstate.PoolNameDedicated, commonstate.PoolNameDedicated, "dedicated-default/dedicated-pod", 0): 4,
+			},
+		},
+		{
+			name: "long dedicated pod names keep distinct pool names",
+			entries: state.PodEntries{
+				"dedicated-a": {
+					"container": dedicatedMainContainerEntryWithPodName(
+						"dedicated-a", strings.Repeat("a", 245)+"x",
+						map[int]machine.CPUSet{0: machine.NewCPUSet(2)}),
+				},
+				"dedicated-b": {
+					"container": dedicatedMainContainerEntryWithPodName(
+						"dedicated-b", strings.Repeat("a", 245)+"y",
+						map[int]machine.CPUSet{0: machine.NewCPUSet(3)}),
+				},
+			},
+			wantSeries: 2,
 		},
 		{
 			name: "dedicated coexists with share and reclaim sidecar not double counted",
@@ -293,9 +380,9 @@ func TestEmitFinalPoolSizeMetricsWithDedicated(t *testing.T) {
 				},
 			},
 			want: map[string]int64{
-				commonstate.PoolNameShare + "/" + commonstate.PoolNameShare + "/0":         2,
-				commonstate.PoolNameReclaim + "/" + commonstate.PoolNameReclaim + "/0":      1,
-				commonstate.PoolNameDedicated + "/" + commonstate.PoolNameDedicated + "/0": 3,
+				poolSizeMetricKey(commonstate.PoolNameShare, commonstate.PoolNameShare, commonstate.PoolNameShare, 0):                 2,
+				poolSizeMetricKey(commonstate.PoolNameReclaim, commonstate.PoolNameReclaim, commonstate.PoolNameReclaim, 0):           1,
+				poolSizeMetricKey(commonstate.PoolNameDedicated, commonstate.PoolNameDedicated, "dedicated-default/dedicated-pod", 0): 3,
 			},
 		},
 	}
@@ -310,7 +397,18 @@ func TestEmitFinalPoolSizeMetricsWithDedicated(t *testing.T) {
 
 			policy.emitFinalPoolSizeMetrics(tt.entries)
 
-			require.Equal(t, tt.want, collectPoolSizeMetrics(t, emitter.records))
+			got := collectPoolSizeMetrics(t, emitter.records)
+			if tt.want != nil {
+				require.Equal(t, tt.want, got)
+			}
+			if tt.wantSeries > 0 {
+				require.Len(t, emitter.records, tt.wantSeries)
+				require.Len(t, got, tt.wantSeries)
+			}
 		})
 	}
+}
+
+func poolSizeMetricKey(poolName, poolType, formattedPoolName string, numaID int) string {
+	return poolName + "/" + poolType + "/" + formattedPoolName + "/" + strconv.Itoa(numaID)
 }

@@ -1323,7 +1323,7 @@ func TestDynamicPolicyApplyBlocksMaterializesDefaultShareFromResidual(t *testing
 	require.True(t, share.Equals(machine.NewCPUSet(4, 5)),
 		"frozen hard-active state must keep the legacy reclaim floor while newEntries is incomplete, got %s", share)
 	require.NoError(t, policy.commitPendingAdvisorState(pending))
-	requirePoolSizeMetric(t, emitter.records, commonstate.PoolNameShare, 0, int64(share.Size()))
+	requirePoolSizeMetric(t, emitter.records, commonstate.PoolNameShare, commonstate.PoolNameShare, 0, int64(share.Size()))
 }
 
 func TestDynamicPolicyApplyBlocksExcludesDNBFromDefaultShareResidual(t *testing.T) {
