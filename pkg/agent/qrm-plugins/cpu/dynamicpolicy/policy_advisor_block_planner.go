@@ -370,6 +370,90 @@ func hasFakeNUMAMandatoryReclaimDescriptor(descriptors []advisorBlockDescriptor)
 	return false
 }
 
+func normalizeAdvisorDescriptorsForWholeCoreReclaim(
+	descriptors []advisorBlockDescriptor,
+	topology *machine.CPUTopology,
+) ([]advisorBlockDescriptor, error) {
+	if topology == nil {
+		return nil, fmt.Errorf("cannot normalize advisor descriptors with nil CPU topology")
+	}
+	cpusPerCore := topology.CPUsPerCore()
+	if cpusPerCore <= 1 {
+		return append([]advisorBlockDescriptor(nil), descriptors...), nil
+	}
+
+	normalized := append([]advisorBlockDescriptor(nil), descriptors...)
+	mandatoryByNUMA := make(map[int][]int)
+	dedicatedByNUMA := make(map[int][]int)
+	mandatoryQuantityByNUMA := make(map[int]int)
+	for i, descriptor := range normalized {
+		if descriptor.NUMAID == commonstate.FakedNUMAID {
+			continue
+		}
+		switch descriptor.Class {
+		case advisorBlockClassMandatoryReclaim:
+			mandatoryByNUMA[descriptor.NUMAID] = append(mandatoryByNUMA[descriptor.NUMAID], i)
+			mandatoryQuantityByNUMA[descriptor.NUMAID] += descriptor.Quantity
+		case advisorBlockClassDedicated:
+			dedicatedByNUMA[descriptor.NUMAID] = append(dedicatedByNUMA[descriptor.NUMAID], i)
+		}
+	}
+
+	numaIDs := make([]int, 0, len(mandatoryQuantityByNUMA))
+	for numaID := range mandatoryQuantityByNUMA {
+		numaIDs = append(numaIDs, numaID)
+	}
+	sort.Ints(numaIDs)
+	for _, numaID := range numaIDs {
+		quantity := mandatoryQuantityByNUMA[numaID]
+		remainder := quantity % cpusPerCore
+		if remainder == 0 {
+			continue
+		}
+		deficit := cpusPerCore - remainder
+		mandatoryIndexes := append([]int(nil), mandatoryByNUMA[numaID]...)
+		dedicatedIndexes := append([]int(nil), dedicatedByNUMA[numaID]...)
+		sort.Slice(mandatoryIndexes, func(i, j int) bool {
+			return advisorBlockDescriptorLess(normalized[mandatoryIndexes[i]], normalized[mandatoryIndexes[j]])
+		})
+		sort.Slice(dedicatedIndexes, func(i, j int) bool {
+			return advisorBlockDescriptorLess(normalized[dedicatedIndexes[i]], normalized[dedicatedIndexes[j]])
+		})
+		if len(mandatoryIndexes) == 0 {
+			return nil, fmt.Errorf("NUMA %d has mandatory reclaim quantity %d but no reclaim descriptor",
+				numaID, quantity)
+		}
+		if len(dedicatedIndexes) == 0 {
+			return nil, fmt.Errorf(
+				"NUMA %d mandatory reclaim quantity %d needs %d CPUs to become a whole-core multiple of %d, but no dedicated descriptor can shrink",
+				numaID, quantity, deficit, cpusPerCore)
+		}
+		remaining := deficit
+		for _, index := range dedicatedIndexes {
+			if remaining == 0 {
+				break
+			}
+			take := general.Min(normalized[index].Quantity, remaining)
+			normalized[index].Quantity -= take
+			remaining -= take
+		}
+		if remaining > 0 {
+			return nil, fmt.Errorf(
+				"NUMA %d mandatory reclaim quantity %d needs %d CPUs to become a whole-core multiple of %d, but dedicated descriptors are short by %d",
+				numaID, quantity, deficit, cpusPerCore, remaining)
+		}
+		normalized[mandatoryIndexes[0]].Quantity += deficit
+		general.InfoS("normalize advisor descriptors to preserve whole-core reclaim",
+			"numaID", numaID,
+			"cpusPerCore", cpusPerCore,
+			"mandatoryQuantityBefore", quantity,
+			"deficit", deficit,
+			"mandatoryBlockID", normalized[mandatoryIndexes[0]].BlockID,
+			"mandatoryQuantityAfter", normalized[mandatoryIndexes[0]].Quantity)
+	}
+	return normalized, nil
+}
+
 // expandSteadyFakeNUMAReclaimPhase reserves one complete physical core on each
 // eligible NUMA before leaving the remaining fake-NUMA quantity to the regular
 // joint solver. This preserves the advisor-published total while preventing a

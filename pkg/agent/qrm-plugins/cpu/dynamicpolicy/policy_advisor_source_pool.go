@@ -287,6 +287,13 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocks(
 	if err != nil {
 		return nil, err
 	}
+	if resp.DisableDedicatedCoresOverlapReclaimedCores {
+		descriptors, err = normalizeAdvisorDescriptorsForWholeCoreReclaim(
+			descriptors, topology)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	result := advisorapi.NewBlockCPUSet()
 	available, err := p.allocateStaticAndForbiddenPools(resp, result, allCPUs)

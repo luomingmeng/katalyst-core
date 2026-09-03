@@ -254,6 +254,65 @@ func TestGenerateBlockCPUSetSkipsDefaultShareUpperBound(t *testing.T) {
 	}
 }
 
+func TestGenerateBlockCPUSetNormalizesRealMandatoryReclaimToWholeCore(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	p.state.SetPodEntries(state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(0, 1, 48, 49),
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: machine.NewCPUSet(0, 1, 48, 49),
+				},
+			},
+		},
+		"pod-0": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-0",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameDedicated,
+				},
+				AllocationResult: machine.NewCPUSet(2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59),
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: machine.NewCPUSet(2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59),
+				},
+			},
+		},
+	}, false)
+
+	resp := advisorBlockTestResponse([]advisorBlockTestAlias{
+		{
+			entry: "pod-0", subEntry: "main", owner: commonstate.PoolNameDedicated,
+			numaID: 0, blockID: "dedicated-0", quantity: 21,
+		},
+		{
+			entry: commonstate.PoolNameReclaim, subEntry: commonstate.FakedContainerName,
+			owner: commonstate.PoolNameReclaim, numaID: 0, blockID: "reclaim-0", quantity: 3,
+		},
+		{
+			entry: commonstate.PoolNameReclaim, subEntry: commonstate.FakedContainerName,
+			owner: commonstate.PoolNameReclaim, numaID: commonstate.FakedNUMAID, blockID: "fake-reclaim", quantity: 2,
+		},
+	}, rand.New(rand.NewSource(1)))
+	resp.DisableDedicatedCoresOverlapReclaimedCores = true
+
+	featureGates := map[string]*advisorsvc.FeatureGate{
+		feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition: {
+			Name: feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
+		},
+	}
+	blocks, err := p.generateBlockCPUSet(resp, featureGates, false)
+
+	require.NoError(t, err)
+	require.Equal(t, 20, blocks["dedicated-0"].Size())
+	require.Equal(t, 4, blocks["reclaim-0"].Size())
+	require.True(t, blocks["dedicated-0"].Intersection(blocks["reclaim-0"]).IsEmpty())
+}
+
 func TestBuildAdvisorBlockDescriptors_BlockIDIsOnlyFinalTieBreak(t *testing.T) {
 	t.Parallel()
 
