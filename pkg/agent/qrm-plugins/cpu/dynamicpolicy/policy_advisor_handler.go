@@ -2134,10 +2134,14 @@ func (p *DynamicPolicy) applyBlocks(
 		rampUpReclaimFloor = legacyFloor
 	}
 	if defaultSharePlan.enabled {
+		ownershipEntries, err := projectDefaultShareOwnershipEntries(curEntries, newEntries, resp)
+		if err != nil {
+			return nil, err
+		}
 		defaultSharePlan.eligibleCPUSet = p.buildDefaultShareEligibleCPUSet(
 			newEntries, currentMachineState, rampUpReclaimFloor)
 		if err := p.finalizeDefaultShareEntry(
-			newEntries, newEntries, defaultSharePlan.advisedQuantity, defaultSharePlan.eligibleCPUSet,
+			newEntries, ownershipEntries, defaultSharePlan.advisedQuantity, defaultSharePlan.eligibleCPUSet,
 		); err != nil {
 			return nil, err
 		}
@@ -2208,7 +2212,10 @@ func (p *DynamicPolicy) applyBlocks(
 				newEntries[podUID][containerName].TopologyAwareAssignments = topologyAwareAssignments
 				newEntries[podUID][containerName].OriginalTopologyAwareAssignments = machine.DeepcopyCPUAssignment(topologyAwareAssignments)
 			case consts.PodAnnotationQoSLevelSharedCores:
-				ownerPoolName := p.getOwnerPoolNameFromAdvisor(allocationInfo, resp)
+				ownerPoolName, err := p.getOwnerPoolNameFromAdvisor(allocationInfo, resp)
+				if err != nil {
+					return nil, err
+				}
 				if allocationInfo.RampUp {
 					general.Infof("pod: %s/%s container: %s is in ramp up, set its allocation result from %s to rampUpCPUs :%s",
 						allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName, allocationInfo.AllocationResult.String(), rampUpCPUs.String())
@@ -2257,7 +2264,10 @@ func (p *DynamicPolicy) applyBlocks(
 					newEntries[podUID][containerName].OriginalTopologyAwareAssignments = machine.DeepcopyCPUAssignment(poolEntry.TopologyAwareAssignments)
 				}
 			case consts.PodAnnotationQoSLevelReclaimedCores:
-				ownerPoolName := p.getOwnerPoolNameFromAdvisor(allocationInfo, resp)
+				ownerPoolName, err := p.getOwnerPoolNameFromAdvisor(allocationInfo, resp)
+				if err != nil {
+					return nil, err
+				}
 				poolEntry, err := p.getAllocationPoolEntry(allocationInfo, ownerPoolName, newEntries)
 				if err != nil {
 					return nil, err
@@ -2286,6 +2296,15 @@ func (p *DynamicPolicy) applyBlocks(
 	if err := p.syncReclaimPoolWithAdjustmentCommitOverride(newEntries, commitOverride); err != nil {
 		return nil, fmt.Errorf("sync reclaim pool with adjustment commit override failed with error: %w", err)
 	}
+	if defaultSharePlan.enabled {
+		defaultSharePlan.eligibleCPUSet = p.buildDefaultShareEligibleCPUSet(
+			newEntries, currentMachineState, rampUpReclaimFloor)
+		if err := p.finalizeDefaultShareEntry(
+			newEntries, newEntries, defaultSharePlan.advisedQuantity, defaultSharePlan.eligibleCPUSet,
+		); err != nil {
+			return nil, err
+		}
+	}
 
 	return &pendingAdvisorState{
 		preCommitRevision: stateRevision,
@@ -2293,6 +2312,38 @@ func (p *DynamicPolicy) applyBlocks(
 		allowOverlap:      allowSharedCoresOverlapReclaimedCores,
 		disableDedicated:  resp.DisableDedicatedCoresOverlapReclaimedCores,
 	}, nil
+}
+
+func projectDefaultShareOwnershipEntries(
+	current, pending state.PodEntries,
+	resp *advisorapi.ListAndWatchResponse,
+) (state.PodEntries, error) {
+	if resp == nil {
+		return nil, fmt.Errorf("advisor response is nil during shared owner projection")
+	}
+	projectedCurrent := current.Clone()
+	for podUID, containerEntries := range projectedCurrent {
+		if containerEntries.IsPoolEntry() {
+			continue
+		}
+		for containerName, allocationInfo := range containerEntries {
+			if allocationInfo == nil || allocationInfo.RampUp ||
+				allocationInfo.QoSLevel != consts.PodAnnotationQoSLevelSharedCores {
+				continue
+			}
+			calculationInfo, ok := resp.GetCalculationInfo(podUID, containerName)
+			if !ok {
+				continue
+			}
+			if calculationInfo == nil {
+				return nil, fmt.Errorf(
+					"nil calculation info for shared owner projection: pod=%s container=%s",
+					podUID, containerName)
+			}
+			allocationInfo.OwnerPoolName = calculationInfo.OwnerPoolName
+		}
+	}
+	return supplementPodEntriesWithCurrentNonPool(pending, projectedCurrent), nil
 }
 
 func validateEmptyRampUpCPUReuse(hardPartitionEnabled bool, oldAllocation, reclaimFloor machine.CPUSet) error {
@@ -2626,9 +2677,16 @@ func (p *DynamicPolicy) hardBulkheadPartitionValidationEnabled() bool {
 		cpuConf.EnableRampUpReclaimHardPartition
 }
 
-func (p *DynamicPolicy) getOwnerPoolNameFromAdvisor(allocationInfo *state.AllocationInfo, resp *advisorapi.ListAndWatchResponse) string {
+func (p *DynamicPolicy) getOwnerPoolNameFromAdvisor(
+	allocationInfo *state.AllocationInfo,
+	resp *advisorapi.ListAndWatchResponse,
+) (string, error) {
 	ownerPoolName := allocationInfo.GetOwnerPoolName()
 	if calculationInfo, ok := resp.GetCalculationInfo(allocationInfo.PodUid, allocationInfo.ContainerName); ok {
+		if calculationInfo == nil {
+			return "", fmt.Errorf("nil calculation info for pod %s container %s",
+				allocationInfo.PodUid, allocationInfo.ContainerName)
+		}
 		general.Infof("cpu advisor put pod: %s/%s, container: %s from %s to %s",
 			allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName, ownerPoolName, calculationInfo.OwnerPoolName)
 
@@ -2637,7 +2695,7 @@ func (p *DynamicPolicy) getOwnerPoolNameFromAdvisor(allocationInfo *state.Alloca
 		general.Warningf("cpu advisor doesn't return entry for pod: %s/%s, container: %s, qosLevel: %s",
 			allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName, allocationInfo.QoSLevel)
 	}
-	return ownerPoolName
+	return ownerPoolName, nil
 }
 
 func (p *DynamicPolicy) applyHeadroom(resp *advisorapi.ListAndWatchResponse) error {

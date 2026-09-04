@@ -2155,7 +2155,7 @@ func dedicatedCPUSetFromPodEntries(entries state.PodEntries) map[string]map[stri
 			continue
 		}
 		for containerName, allocationInfo := range containers {
-			if allocationInfo == nil || !allocationInfo.CheckDedicated() {
+			if allocationInfo == nil || allocationInfo.GetPoolName() != commonstate.PoolNameDedicated {
 				continue
 			}
 			if dedicated[podUID] == nil {
@@ -2165,6 +2165,47 @@ func dedicatedCPUSetFromPodEntries(entries state.PodEntries) map[string]map[stri
 		}
 	}
 	return dedicated
+}
+
+func supplementPodEntriesWithCurrentNonPool(pending, current state.PodEntries) state.PodEntries {
+	merged := pending.Clone()
+	if merged == nil {
+		merged = make(state.PodEntries)
+	}
+	for podUID, containerEntries := range current {
+		if containerEntries.IsPoolEntry() {
+			continue
+		}
+		if merged[podUID] == nil {
+			merged[podUID] = make(state.ContainerEntries)
+		}
+		for containerName, allocationInfo := range containerEntries {
+			if _, ok := merged[podUID][containerName]; ok {
+				continue
+			}
+			if allocationInfo == nil {
+				merged[podUID][containerName] = nil
+			} else {
+				merged[podUID][containerName] = allocationInfo.Clone()
+			}
+		}
+	}
+	return merged
+}
+
+func hasLiveDefaultShareOwner(entries state.PodEntries) bool {
+	for _, containers := range entries {
+		if containers.IsPoolEntry() {
+			continue
+		}
+		for _, allocationInfo := range containers {
+			if allocationInfo != nil && !allocationInfo.RampUp &&
+				allocationInfo.GetPoolName() == commonstate.PoolNameShare {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // materializeDefaultShareCPUSet computes the residual cpuset for the default
@@ -2242,11 +2283,13 @@ func (p *DynamicPolicy) finalizeDefaultShareEntry(
 		return err
 	}
 	if share.IsEmpty() {
-		if expectedQuantity == 0 {
+		if !hasLiveDefaultShareOwner(ownershipEntries) {
+			general.InfoS("prune empty ownerless default share residual",
+				"expectedQuantity", expectedQuantity)
 			delete(newPodEntries, commonstate.PoolNameShare)
 			return nil
 		}
-		return fmt.Errorf("default share residual is empty")
+		return fmt.Errorf("default share residual is empty with live owner")
 	}
 	topologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, share)
 	if err != nil {
@@ -2382,15 +2425,7 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 	// that a quantity mismatch fails closed without persisting a partial
 	// checkpoint.
 	if defaultSharePlan.enabled {
-		eligibilityEntries := make(state.PodEntries, len(newPodEntries)+len(curEntries))
-		for podUID, containerEntries := range newPodEntries {
-			eligibilityEntries[podUID] = containerEntries
-		}
-		for podUID, containerEntries := range curEntries {
-			if !containerEntries.IsPoolEntry() {
-				eligibilityEntries[podUID] = containerEntries
-			}
-		}
+		eligibilityEntries := supplementPodEntriesWithCurrentNonPool(newPodEntries, curEntries)
 		defaultSharePlan.eligibleCPUSet = p.buildDefaultShareEligibleCPUSet(
 			eligibilityEntries, machineState, rampUpReclaimFloor)
 		if defaultSharePlan.deriveUpperBoundFromEligible {

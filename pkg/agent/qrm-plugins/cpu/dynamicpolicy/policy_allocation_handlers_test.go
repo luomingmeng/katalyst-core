@@ -5182,6 +5182,177 @@ func TestFinalizeDefaultShareEntryAllowsAdvisorShrinkLag(t *testing.T) {
 		AllocationResult.Equals(machine.NewCPUSet(2, 3, 4, 5, 6, 7)))
 }
 
+func TestFinalizeDefaultShareEntryHandlesEmptyResidualByLiveOwnership(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	candidate := topology.CPUDetails.CPUs()
+
+	newPolicy := func(t *testing.T) *DynamicPolicy {
+		t.Helper()
+		p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+		require.NoError(t, err)
+		return p
+	}
+	newEntries := func() state.PodEntries {
+		return state.PodEntries{
+			commonstate.PoolNameReclaim: {
+				commonstate.FakedContainerName: {
+					AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+					AllocationResult: candidate.Clone(),
+				},
+			},
+			commonstate.PoolNameShare: {
+				commonstate.FakedContainerName: {
+					AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+					AllocationResult: machine.NewCPUSet(6, 7),
+				},
+			},
+		}
+	}
+
+	t.Run("prunes ownerless stale share", func(t *testing.T) {
+		p := newPolicy(t)
+		entries := newEntries()
+
+		require.NoError(t, p.finalizeDefaultShareEntry(entries, entries, candidate.Size(), candidate))
+		require.NotContains(t, entries, commonstate.PoolNameShare)
+	})
+
+	t.Run("rejects empty residual with live share owner", func(t *testing.T) {
+		p := newPolicy(t)
+		entries := newEntries()
+		entries["live-share-pod"] = state.ContainerEntries{
+			"main": {
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "live-share-pod",
+					PodNamespace:  "default",
+					PodName:       "live-share-pod",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameShare,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+				},
+				AllocationResult: machine.NewCPUSet(6, 7),
+			},
+		}
+
+		err := p.finalizeDefaultShareEntry(entries, entries, candidate.Size(), candidate)
+		require.ErrorContains(t, err, "default share residual is empty")
+		require.Contains(t, entries, commonstate.PoolNameShare)
+	})
+
+	t.Run("rejects zero quantity with live share owner", func(t *testing.T) {
+		p := newPolicy(t)
+		entries := newEntries()
+		entries["live-share-pod"] = state.ContainerEntries{
+			"main": {
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "live-share-pod",
+					PodNamespace:  "default",
+					PodName:       "live-share-pod",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameShare,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+				},
+				AllocationResult: machine.NewCPUSet(6, 7),
+			},
+		}
+
+		err := p.finalizeDefaultShareEntry(entries, entries, 0, candidate)
+		require.ErrorContains(t, err, "default share residual is empty")
+		require.Contains(t, entries, commonstate.PoolNameShare)
+	})
+
+	t.Run("prunes empty residual with ownerless ramp-up shared container", func(t *testing.T) {
+		p := newPolicy(t)
+		entries := newEntries()
+		entries["ramp-up-share-pod"] = state.ContainerEntries{
+			"main": {
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "ramp-up-share-pod",
+					PodNamespace:  "default",
+					PodName:       "ramp-up-share-pod",
+					ContainerName: "main",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+				},
+				AllocationResult: machine.NewCPUSet(6, 7),
+				RampUp:           true,
+			},
+		}
+
+		require.NoError(t, p.finalizeDefaultShareEntry(entries, entries, candidate.Size(), candidate))
+		require.NotContains(t, entries, commonstate.PoolNameShare)
+	})
+}
+
+func TestDedicatedCPUSetFromPodEntriesUsesFinalOwner(t *testing.T) {
+	t.Parallel()
+
+	entries := state.PodEntries{
+		"isolated-shared-pod": {
+			"main": {
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "isolated-shared-pod",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameDedicated,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+				},
+				AllocationResult: machine.NewCPUSet(2, 3),
+			},
+		},
+	}
+
+	dedicated := dedicatedCPUSetFromPodEntries(entries)
+
+	require.True(t, dedicated["isolated-shared-pod"]["main"].Equals(machine.NewCPUSet(2, 3)))
+}
+
+func TestSupplementPodEntriesWithCurrentNonPoolKeepsPendingContainer(t *testing.T) {
+	t.Parallel()
+
+	current := state.PodEntries{
+		"pod-a": {
+			"main": {
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-a",
+					ContainerName: "main",
+				},
+				AllocationResult: machine.NewCPUSet(0, 1),
+			},
+			"sidecar": {
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-a",
+					ContainerName: "sidecar",
+				},
+				AllocationResult: machine.NewCPUSet(4),
+			},
+		},
+		"stale-pool": {
+			commonstate.FakedContainerName: {
+				AllocationMeta: commonstate.GenerateGenericPoolAllocationMeta("stale-pool"),
+			},
+		},
+	}
+	pending := state.PodEntries{
+		"pod-a": {
+			"main": {
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-a",
+					ContainerName: "main",
+				},
+				AllocationResult: machine.NewCPUSet(2, 3),
+			},
+		},
+	}
+
+	merged := supplementPodEntriesWithCurrentNonPool(pending, current)
+
+	require.True(t, merged["pod-a"]["main"].AllocationResult.Equals(machine.NewCPUSet(2, 3)))
+	require.True(t, merged["pod-a"]["sidecar"].AllocationResult.Equals(machine.NewCPUSet(4)))
+	require.NotContains(t, merged, "stale-pool")
+}
+
 // TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorBackfillsDefaultShareResidual is an
 // entry-level integration test for the residual-backfill gate. It exercises the whole
 // adjustPoolsAndIsolatedEntriesWithRampUpFloor entry segment with

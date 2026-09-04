@@ -1464,7 +1464,7 @@ func TestDynamicPolicyValidatesDefaultShareAsUpperBoundWhenBackfillEnabled(t *te
 	require.NoError(t, policy.validateAdvisorResponse(resp))
 }
 
-func TestDynamicPolicyApplyBlocksRejectsEmptyDefaultShareResidual(t *testing.T) {
+func TestDynamicPolicyApplyBlocksPrunesEmptyDefaultShareAfterLastOwnerMoves(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
@@ -1485,6 +1485,23 @@ func TestDynamicPolicyApplyBlocksRejectsEmptyDefaultShareResidual(t *testing.T) 
 			commonstate.FakedContainerName: &state.AllocationInfo{
 				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
 				AllocationResult: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
+			},
+		},
+		"custom": {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta("custom"),
+				AllocationResult: machine.NewCPUSet(0),
+			},
+		},
+		"moving-share-pod": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "moving-share-pod",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameShare,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+				},
+				AllocationResult: previousShare.Clone(),
 			},
 		},
 	}, false)
@@ -1515,18 +1532,40 @@ func TestDynamicPolicyApplyBlocksRejectsEmptyDefaultShareResidual(t *testing.T) 
 					},
 				},
 			},
+			"custom": {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: "custom",
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "custom", Result: 1}},
+							},
+						},
+					},
+				},
+			},
+			"moving-share-pod": {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					"main": {
+						OwnerPoolName: "custom",
+					},
+				},
+			},
 		},
 	}
 	blockCPUSet := advisorapi.BlockCPUSet{
 		"share":   machine.NewCPUSet(0),
 		"reclaim": machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
+		"custom":  machine.NewCPUSet(0),
 	}
 
 	pending, err := policy.applyBlocks(blockCPUSet, resp, false, false)
-	require.Nil(t, pending)
-	require.ErrorContains(t, err, "default share residual is empty")
+	require.NoError(t, err)
+	require.NotNil(t, pending)
+	require.NotContains(t, pending.entries, commonstate.PoolNameShare)
+	require.Equal(t, "custom", pending.entries["moving-share-pod"]["main"].OwnerPoolName)
 	currentShare := policy.state.GetPodEntries()[commonstate.PoolNameShare][commonstate.FakedContainerName].AllocationResult
-	require.True(t, currentShare.Equals(previousShare), "rejected update changed current share, got %s", currentShare.String())
+	require.True(t, currentShare.Equals(previousShare), "prepared update changed current share, got %s", currentShare.String())
 }
 
 func TestValidateEmptyRampUpCPUReuseRejectsOverlapWithHardReclaimFloor(t *testing.T) {
@@ -1575,7 +1614,7 @@ func TestValidateEmptyRampUpCPUReuseRejectsOverlapWithHardReclaimFloor(t *testin
 	}
 }
 
-func TestDynamicPolicyApplyBlocksRejectsEmptyDefaultShareWithoutPreviousPool(t *testing.T) {
+func TestDynamicPolicyApplyBlocksPrunesOwnerlessEmptyDefaultShareWithoutPreviousPool(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
@@ -1622,11 +1661,218 @@ func TestDynamicPolicyApplyBlocksRejectsEmptyDefaultShareWithoutPreviousPool(t *
 		},
 	}
 
-	_, err = policy.applyBlocks(advisorapi.BlockCPUSet{
+	pending, err := policy.applyBlocks(advisorapi.BlockCPUSet{
 		"share":   machine.NewCPUSet(0),
 		"reclaim": machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
 	}, resp, false, false)
-	require.ErrorContains(t, err, "default share residual is empty")
+	require.NoError(t, err)
+	require.NotNil(t, pending)
+	require.NotContains(t, pending.entries, commonstate.PoolNameShare)
+}
+
+func TestDynamicPolicyApplyBlocksRejectsEmptyDefaultShareWhenOwnerMovesIn(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	policy.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+
+	policy.state.SetPodEntries(state.PodEntries{
+		"custom": {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta("custom"),
+				AllocationResult: machine.NewCPUSet(2, 3),
+			},
+		},
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
+			},
+		},
+		"moving-share-pod": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "moving-share-pod",
+					ContainerName: "main",
+					OwnerPoolName: "custom",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+				},
+				AllocationResult: machine.NewCPUSet(2, 3),
+			},
+		},
+	}, false)
+
+	resp := &advisorapi.ListAndWatchResponse{
+		Entries: map[string]*advisorapi.CalculationEntries{
+			commonstate.PoolNameShare: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameShare,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "share", Result: 1}},
+							},
+						},
+					},
+				},
+			},
+			commonstate.PoolNameReclaim: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameReclaim,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "reclaim", Result: 8}},
+							},
+						},
+					},
+				},
+			},
+			"moving-share-pod": {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					"main": {
+						OwnerPoolName: commonstate.PoolNameShare,
+					},
+				},
+			},
+		},
+	}
+
+	pending, err := policy.applyBlocks(advisorapi.BlockCPUSet{
+		"share":   machine.NewCPUSet(0),
+		"reclaim": machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
+	}, resp, false, false)
+	require.Nil(t, pending)
+	require.ErrorContains(t, err, "default share residual is empty with live owner")
+}
+
+func TestProjectDefaultShareOwnershipEntriesRejectsNilAdvisorInfo(t *testing.T) {
+	t.Parallel()
+
+	current := state.PodEntries{
+		"shared-pod": {
+			"main": {
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "shared-pod",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameShare,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+				},
+			},
+		},
+	}
+	resp := &advisorapi.ListAndWatchResponse{
+		Entries: map[string]*advisorapi.CalculationEntries{
+			"shared-pod": {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					"main": nil,
+				},
+			},
+		},
+	}
+
+	entries, err := projectDefaultShareOwnershipEntries(current, nil, resp)
+
+	require.Nil(t, entries)
+	require.ErrorContains(t, err, "nil calculation info for shared owner projection")
+}
+
+func TestGetOwnerPoolNameFromAdvisorRejectsNilInfo(t *testing.T) {
+	t.Parallel()
+
+	allocationInfo := &state.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        "ramp-up-shared-pod",
+			ContainerName: "main",
+			QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+		},
+		RampUp: true,
+	}
+	resp := &advisorapi.ListAndWatchResponse{
+		Entries: map[string]*advisorapi.CalculationEntries{
+			allocationInfo.PodUid: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					allocationInfo.ContainerName: nil,
+				},
+			},
+		},
+	}
+
+	ownerPoolName, err := (&DynamicPolicy{}).getOwnerPoolNameFromAdvisor(allocationInfo, resp)
+
+	require.Empty(t, ownerPoolName)
+	require.ErrorContains(t, err, "nil calculation info")
+}
+
+func TestDynamicPolicyApplyBlocksRematerializesDefaultShareAfterReclaimPadding(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	policy.reservedCPUs = machine.NewCPUSet()
+	dynamicConf := policy.dynamicConfig.GetDynamicConfiguration()
+	dynamicConf.FillDefaultSharePoolWithNonReclaimCPUs = true
+	dynamicConf.EnableReclaim = true
+	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.EnableRampUpReclaimHardPartition = true
+	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.Enable = true
+	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.NonReclaimPoolMinSize = 4
+
+	policy.state.SetPodEntries(state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: {
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(2, 3, 4, 5, 6, 7),
+			},
+		},
+	}, false)
+
+	resp := &advisorapi.ListAndWatchResponse{
+		DisableDedicatedCoresOverlapReclaimedCores: true,
+		Entries: map[string]*advisorapi.CalculationEntries{
+			commonstate.PoolNameShare: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameShare,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "share", Result: 8}},
+							},
+						},
+					},
+				},
+			},
+			commonstate.PoolNameReclaim: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameReclaim,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "reclaim", Result: 6}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	pending, err := policy.applyBlocks(advisorapi.BlockCPUSet{
+		"share":   machine.NewCPUSet(0, 1),
+		"reclaim": machine.NewCPUSet(2, 3, 4, 5, 6, 7),
+	}, resp, false, false)
+	require.NoError(t, err)
+	require.NotNil(t, pending)
+
+	share := pending.entries[commonstate.PoolNameShare][commonstate.FakedContainerName].AllocationResult
+	reclaim := pending.entries[commonstate.PoolNameReclaim][commonstate.FakedContainerName].AllocationResult
+	require.Equal(t, 4, share.Size())
+	require.True(t, share.Intersection(reclaim).IsEmpty())
+	require.True(t, share.Union(reclaim).Equals(topology.CPUDetails.CPUs()))
 }
 
 func TestDynamicPolicyApplyBlocksRejectsDefaultShareResidualLargerThanAdviceAtomically(t *testing.T) {
