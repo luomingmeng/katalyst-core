@@ -1673,6 +1673,7 @@ func (p *DynamicPolicy) cleanPools() error {
 
 func (p *DynamicPolicy) cleanPoolsFromPodEntries(podEntries state.PodEntries) sets.String {
 	remainPools := make(map[string]bool)
+	numaResourcePackagePinnedCPUSet := p.state.GetMachineState().GetNUMAResourcePackagePinnedCPUSet()
 
 	// walk through pod entries to put them into specified pool maps
 	for podUID, entries := range podEntries {
@@ -1686,6 +1687,20 @@ func (p *DynamicPolicy) cleanPoolsFromPodEntries(podEntries state.PodEntries) se
 				continue
 			}
 			ownerPool := allocationInfo.GetOwnerPoolName()
+			if ownerPool == commonstate.EmptyOwnerPoolName && !allocationInfo.RampUp {
+				if allocationInfo.CheckSharedNUMABinding() {
+					var err error
+					ownerPool, _, err = state.GetCanonicalSharedNUMABindingPoolKey(
+						numaResourcePackagePinnedCPUSet, allocationInfo)
+					if err != nil {
+						general.Warningf("pod %s container %s has invalid legacy shared NUMA-binding ownership during cleanPools: %v; skip cleanup",
+							podUID, containerName, err)
+						return sets.NewString()
+					}
+				} else {
+					ownerPool = allocationInfo.GetPoolName()
+				}
+			}
 			if ownerPool != commonstate.EmptyOwnerPoolName {
 				remainPools[ownerPool] = true
 			}

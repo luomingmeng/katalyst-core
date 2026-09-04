@@ -85,6 +85,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	"github.com/kubewharf/katalyst-core/pkg/util/reclaim"
+	"github.com/kubewharf/katalyst-core/pkg/util/timemonitor"
 )
 
 const (
@@ -482,6 +483,36 @@ func TestCleanPoolsFromPodEntries(t *testing.T) {
 	require.Contains(t, entries, commonstate.PoolNameShare)
 	require.Contains(t, entries, commonstate.PoolNameReserve)
 	require.Contains(t, entries, "system-service")
+
+	legacySNB := &state.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        "legacy-snb",
+			ContainerName: "main",
+			QoSLevel:      consts.PodAnnotationQoSLevelSharedCores,
+			Annotations: map[string]string{
+				consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+				consts.PodAnnotationResourcePackageKey:           "legacy-package",
+			},
+		},
+	}
+	legacySNB.SetSpecifiedNUMABindingNUMAID([]uint64{0})
+	machineState := policy.state.GetMachineState()
+	machineState[0].ResourcePackageStates = map[string]*state.ResourcePackageState{
+		"legacy-package": {PinnedCPUSet: machine.NewCPUSet(0)},
+	}
+	policy.state.SetMachineState(machineState, false)
+	canonicalPool, _, err := state.GetCanonicalSharedNUMABindingPoolKey(
+		machineState.GetNUMAResourcePackagePinnedCPUSet(), legacySNB)
+	require.NoError(t, err)
+	legacyEntries := state.PodEntries{
+		canonicalPool: newPoolEntry(canonicalPool),
+		"legacy-snb":  {"main": legacySNB},
+	}
+
+	deletedPools = policy.cleanPoolsFromPodEntries(legacyEntries)
+
+	require.Empty(t, deletedPools)
+	require.Contains(t, legacyEntries, canonicalPool)
 }
 
 func TestPodDeletionCleansUnownedPoolsBeforeAdjustment(t *testing.T) {
@@ -911,6 +942,121 @@ func TestRemovePodCommitsCanonicalStateAtomically(t *testing.T) {
 		require.Equal(t, 2, releasePlugin.releaseCount)
 		require.Equal(t, 1, advisorClient.removePodCount)
 	})
+}
+
+func TestRemovePodLastOwnerBackfillsOrphanCPUsInSingleRevision(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(12, 1, 3)
+	require.NoError(t, err)
+	stateDir := t.TempDir()
+	policy, err := getTestDynamicPolicyWithInitialization(topology, stateDir)
+	require.NoError(t, err)
+	policy.reservedCPUs = machine.NewCPUSet()
+	policy.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	policy.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+	policy.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+	policy.enableCPUAdvisor = true
+	policy.advisorClient = &advisorPoolTestClient{}
+	policy.advisorMonitor, err = timemonitor.NewTimeMonitor(
+		"advisor",
+		time.Second,
+		time.Minute,
+		time.Minute,
+		"advisor_unhealthy",
+		&metrics.DummyMetrics{},
+		1,
+		true,
+	)
+	require.NoError(t, err)
+
+	const (
+		removedPodUID = "last-owner"
+		orphanPool    = "share-NUMA0"
+	)
+	orphanCPUs := topology.CPUDetails.CPUsInNUMANodes(0)
+	reclaimCPUs := topology.CPUDetails.CPUsInNUMANodes(1)
+	shareCPUs := topology.CPUDetails.CPUsInNUMANodes(2)
+	initialEntries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: {
+				AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult:                 reclaimCPUs.Clone(),
+				OriginalAllocationResult:         reclaimCPUs.Clone(),
+				TopologyAwareAssignments:         map[int]machine.CPUSet{1: reclaimCPUs.Clone()},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{1: reclaimCPUs.Clone()},
+			},
+		},
+		commonstate.PoolNameShare: {
+			commonstate.FakedContainerName: {
+				AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+				AllocationResult:                 shareCPUs.Clone(),
+				OriginalAllocationResult:         shareCPUs.Clone(),
+				TopologyAwareAssignments:         map[int]machine.CPUSet{2: shareCPUs.Clone()},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{2: shareCPUs.Clone()},
+			},
+		},
+		orphanPool: {
+			commonstate.FakedContainerName: {
+				AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(orphanPool),
+				AllocationResult:                 orphanCPUs.Clone(),
+				OriginalAllocationResult:         orphanCPUs.Clone(),
+				TopologyAwareAssignments:         map[int]machine.CPUSet{0: orphanCPUs.Clone()},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: orphanCPUs.Clone()},
+			},
+		},
+		removedPodUID: {
+			"main": {
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        removedPodUID,
+					ContainerName: "main",
+					OwnerPoolName: orphanPool,
+					QoSLevel:      consts.PodAnnotationQoSLevelSharedCores,
+				},
+				RequestQuantity:                  float64(orphanCPUs.Size()),
+				AllocationResult:                 orphanCPUs.Clone(),
+				OriginalAllocationResult:         orphanCPUs.Clone(),
+				TopologyAwareAssignments:         map[int]machine.CPUSet{0: orphanCPUs.Clone()},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: orphanCPUs.Clone()},
+			},
+		},
+	}
+	initialMachineState, err := generateMachineStateFromPodEntries(
+		topology, initialEntries, policy.state.GetMachineState())
+	require.NoError(t, err)
+	require.NoError(t, policy.state.CommitAdvisorState(
+		initialEntries, initialMachineState, false, false, true))
+	initialRevision := policy.state.GetRevision()
+
+	// Exercise the revision-scoped adjustment candidate produced by RemovePod
+	// before its caller-local cleanup, so the common adjustment boundary must
+	// canonicalize the orphan pool before deriving quantities.
+	removedEntries := policy.state.GetPodEntries()
+	delete(removedEntries, removedPodUID)
+	removedMachineState, err := generateMachineStateFromPodEntries(
+		topology, removedEntries, policy.state.GetMachineState())
+	require.NoError(t, err)
+	err = policy.adjustAllocationEntriesAtRevision(
+		removedEntries, removedMachineState, true, initialRevision)
+	require.NoError(t, err)
+	require.Equal(t, initialRevision+1, policy.state.GetRevision(),
+		"pod removal, orphan cleanup, share backfill, and machine state must use one durable revision")
+
+	committedEntries := policy.state.GetPodEntries()
+	require.NotContains(t, committedEntries, removedPodUID)
+	require.NotContains(t, committedEntries, orphanPool)
+	committedShare, err := committedEntries.GetCPUSetForPool(commonstate.PoolNameShare)
+	require.NoError(t, err)
+	require.True(t, orphanCPUs.IsSubsetOf(committedShare),
+		"orphan CPUs %s must be backfilled into committed default share %s", orphanCPUs, committedShare)
+	committedMachineState := policy.state.GetMachineState()
+
+	restarted, err := state.NewCheckpointState(
+		&statedirectory.StateDirectoryConfiguration{StateFileDirectory: stateDir},
+		cpuPluginStateFileName, cpuconsts.CPUResourcePluginPolicyNameDynamic,
+		topology, false, state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
+	require.NoError(t, err)
+	require.Equal(t, initialRevision+1, restarted.GetRevision())
+	require.Equal(t, committedEntries, restarted.GetPodEntries())
+	require.True(t, reflect.DeepEqual(committedMachineState, restarted.GetMachineState()))
 }
 
 func TestAllocate(t *testing.T) {

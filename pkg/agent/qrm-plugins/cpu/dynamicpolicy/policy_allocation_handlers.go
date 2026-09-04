@@ -1687,6 +1687,11 @@ func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloorAtRevision(
 		general.InfoS("finished", "duration", time.Since(startTime))
 	}()
 
+	// Remove orphan non-resident pools from this adjustment's candidate before
+	// deriving pool quantities and materializing the default-share residual.
+	// Precommit cleanup remains a defense against pools introduced by later hooks.
+	p.cleanPoolsFromPodEntries(entries)
+
 	// since adjustAllocationEntries will cause re-generate pools,
 	// if sys advisor is enabled, we believe the pools' ratio that sys advisor indicates,
 	// else we do sum(containers req) for each pool to get pools ratio
