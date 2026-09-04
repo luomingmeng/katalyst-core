@@ -1149,6 +1149,16 @@ func TestBudgetedCgroupV1DriverChargesWriteOnce(t *testing.T) {
 	}
 }
 
+func TestBudgetTrackerReserveHierarchyIOOperationsCompatibility(t *testing.T) {
+	budget := NewBudgetTracker(ConvergenceBudget{MaxHierarchyIOOperations: 1})
+	if err := budget.ReserveHierarchyIOOperations(1); err != nil {
+		t.Fatalf("ReserveHierarchyIOOperations() error = %v", err)
+	}
+	if got := budget.Usage().HierarchyIOOperations; got != 1 {
+		t.Fatalf("reserved hierarchy I/O operations = %d, want 1", got)
+	}
+}
+
 func TestBudgetTrackerDepthBoundaryZeroValueAndCanceledContext(t *testing.T) {
 	t.Run("depth-at-limit", func(t *testing.T) {
 		budget := NewBudgetTracker(ConvergenceBudget{MaxSnapshotDepth: 2})
@@ -1267,13 +1277,13 @@ func TestBudgetTrackerReserveHierarchyIOOperationsPrefersCanceledContext(t *test
 	t.Parallel()
 
 	budget := NewBudgetTracker(ConvergenceBudget{MaxHierarchyIOOperations: 1})
-	if err := budget.ReserveHierarchyIOOperations(context.Background(), 1); err != nil {
+	if err := budget.ReserveHierarchyIOOperationsWithContext(context.Background(), 1); err != nil {
 		t.Fatalf("fill hierarchy I/O budget: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := budget.ReserveHierarchyIOOperations(ctx, 1)
+	err := budget.ReserveHierarchyIOOperationsWithContext(ctx, 1)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("reservation error = %v, want context.Canceled", err)
 	}
@@ -1294,7 +1304,7 @@ func TestBudgetTrackerReserveHierarchyIOOperationsPrefersExpiredAbsoluteDeadline
 	})
 	budget.usage.HierarchyIOOperations = 1
 
-	err := budget.ReserveHierarchyIOOperations(context.Background(), 1)
+	err := budget.ReserveHierarchyIOOperationsWithContext(context.Background(), 1)
 	if !errors.Is(err, ErrConvergenceDeadlineExceeded) {
 		t.Fatalf("reservation error = %v, want ErrConvergenceDeadlineExceeded", err)
 	}
@@ -1322,7 +1332,7 @@ func TestBudgetTrackerConcurrentHierarchyIOReservations(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			errs <- budget.ReserveHierarchyIOOperations(context.Background(), 1)
+			errs <- budget.ReserveHierarchyIOOperationsWithContext(context.Background(), 1)
 		}()
 	}
 	close(start)

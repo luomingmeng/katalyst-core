@@ -329,6 +329,38 @@ func TestTopologyCoordinatorInitialSnapshotGenerationChurnUsesIOBudget(t *testin
 	}
 }
 
+func TestTopologyCoordinatorInitialSnapshotGenerationChurnUsesAutoIOBudget(t *testing.T) {
+	dag, cg, driver := newCoordinatorSnapshotTestFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	statCalls := 0
+	driver.beforeCall = func(op HierarchyOperation, rel string) error {
+		if op != HierarchyOperationStat || rel != "primary" {
+			return nil
+		}
+		statCalls++
+		if statCalls >= 1000 {
+			cancel()
+		}
+		return ErrCgroupIdentityChanged
+	}
+
+	_, err := (TopologyCoordinator{}).Converge(ctx, CoordinatorInput{
+		DAG: dag, Cgroup: cg, CPUDetails: machine.CPUDetails{0: {}},
+		Budget: ConvergenceBudget{
+			MaxSnapshotNodes: 1,
+			DeadlineDuration: time.Minute,
+		},
+	})
+	if !errors.Is(err, ErrHierarchyIOOperationBudgetExceeded) {
+		t.Fatalf("Converge error = %v after %d stat calls, want %v",
+			err, statCalls, ErrHierarchyIOOperationBudgetExceeded)
+	}
+	if statCalls >= 1000 {
+		t.Fatalf("automatic hierarchy I/O budget did not stop initial snapshot churn: statCalls=%d", statCalls)
+	}
+}
+
 func TestTopologyCoordinatorMissingConfiguredRelReturnsStaleWithoutDeadlineScanLoop(t *testing.T) {
 	dag, cg, driver := newCoordinatorSnapshotTestFixture(t)
 	delete(driver.nodes, "primary")
