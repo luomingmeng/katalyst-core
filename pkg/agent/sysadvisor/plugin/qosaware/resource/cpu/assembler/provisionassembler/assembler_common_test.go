@@ -51,6 +51,50 @@ import (
 	resourcepackage "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 )
 
+func TestCanonicalizeDefaultShareEntries(t *testing.T) {
+	t.Parallel()
+
+	t.Run("preserve fake NUMA share and unrelated pools", func(t *testing.T) {
+		t.Parallel()
+
+		result := &types.InternalCPUCalculationResult{
+			PoolEntries: make(map[string]map[int]types.CPUResource),
+		}
+		result.SetPoolEntry(commonstate.PoolNameShare, commonstate.FakedNUMAID, 4, -1)
+		result.SetPoolEntry(commonstate.PoolNameShare, 0, 6, -1)
+		result.SetPoolEntry(commonstate.PoolNameShare, 1, 8, -1)
+		result.SetPoolEntry("share-NUMA0", 0, 2, -1)
+		result.SetPoolEntry(commonstate.PoolNameReclaim, 0, 4, -1)
+
+		before := canonicalizeDefaultShareEntries(result)
+
+		require.Equal(t, 4, before)
+		require.Len(t, result.PoolEntries[commonstate.PoolNameShare], 1)
+		require.Contains(t, result.PoolEntries[commonstate.PoolNameShare], commonstate.FakedNUMAID)
+		require.Contains(t, result.PoolEntries, "share-NUMA0")
+		require.Contains(t, result.PoolEntries, commonstate.PoolNameReclaim)
+	})
+
+	t.Run("remove generic share with only real NUMA entries", func(t *testing.T) {
+		t.Parallel()
+
+		result := &types.InternalCPUCalculationResult{
+			PoolEntries: make(map[string]map[int]types.CPUResource),
+		}
+		result.SetPoolEntry(commonstate.PoolNameShare, 0, 6, -1)
+		result.SetPoolEntry(commonstate.PoolNameShare, 1, 8, -1)
+		result.SetPoolEntry("share-NUMA0", 0, 2, -1)
+		result.SetPoolEntry(commonstate.PoolNameReclaim, 0, 4, -1)
+
+		before := canonicalizeDefaultShareEntries(result)
+
+		require.Zero(t, before)
+		require.NotContains(t, result.PoolEntries, commonstate.PoolNameShare)
+		require.Contains(t, result.PoolEntries, "share-NUMA0")
+		require.Contains(t, result.PoolEntries, commonstate.PoolNameReclaim)
+	})
+}
+
 type FakeRegion struct {
 	name                       string
 	ownerPoolName              string
@@ -4057,7 +4101,13 @@ func TestFinalizeDefaultShareBackfillMatrix(t *testing.T) {
 			name:            "reclaim advice does not lower qrm residual upper bound",
 			numaAvailable:   map[int]int{0: 95, 1: 95},
 			nonBinding:      machine.NewCPUSet(),
-			entries:         []entry{{commonstate.PoolNameReclaim, 0, 28}, {commonstate.PoolNameReclaim, 1, 28}, {commonstate.PoolNameShare, commonstate.FakedNUMAID, 4}},
+			entries: []entry{
+				{commonstate.PoolNameReclaim, 0, 28},
+				{commonstate.PoolNameReclaim, 1, 28},
+				{commonstate.PoolNameShare, commonstate.FakedNUMAID, 4},
+				{commonstate.PoolNameShare, 0, 6},
+				{commonstate.PoolNameShare, 1, 8},
+			},
 			enabled:         true,
 			wantShare:       190,
 			wantAllocatable: 190,
@@ -4134,6 +4184,7 @@ func TestFinalizeDefaultShareBackfillMatrix(t *testing.T) {
 			if !tc.enabled {
 				return
 			}
+			require.Len(t, result.PoolEntries[commonstate.PoolNameShare], 1)
 			require.Equal(t, tc.wantAllocatable, result.DefaultShareBackfill.AllocatableBudget)
 			require.Equal(t, tc.wantShare, result.DefaultShareBackfill.DefaultShareFinal)
 

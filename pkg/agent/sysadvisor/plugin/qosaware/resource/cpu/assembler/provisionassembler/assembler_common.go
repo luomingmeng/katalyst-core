@@ -291,6 +291,29 @@ func hasEligibleDefaultShareDomain(budgetByNUMA map[int]defaultShareNUMABudget) 
 	return false
 }
 
+func canonicalizeDefaultShareEntries(result *types.InternalCPUCalculationResult) int {
+	if result == nil {
+		return 0
+	}
+	byNUMA := result.PoolEntries[commonstate.PoolNameShare]
+	if byNUMA == nil {
+		return 0
+	}
+	before := 0
+	if existing, ok := byNUMA[commonstate.FakedNUMAID]; ok {
+		before = existing.Size
+	}
+	for numaID := range byNUMA {
+		if numaID != commonstate.FakedNUMAID {
+			delete(byNUMA, numaID)
+		}
+	}
+	if len(byNUMA) == 0 {
+		delete(result.PoolEntries, commonstate.PoolNameShare)
+	}
+	return before
+}
+
 // dedicatedTopology captures the dedicated-cores topology needed by the default
 // share budget accounting: the set of NUMAs owned by NUMA-exclusive dedicated
 // regions, and a lookup from dedicated pod uid to its owner pool name.
@@ -575,6 +598,7 @@ func (pa *ProvisionAssemblerCommon) finalizeDefaultShareBackfill(
 	if !result.DefaultShareBackfill.Enabled {
 		return nil
 	}
+	before := canonicalizeDefaultShareEntries(result)
 	budgetByNUMA, summary, err := pa.buildDefaultShareBudget(regionHelper, result)
 	if err != nil {
 		return err
@@ -585,10 +609,6 @@ func (pa *ProvisionAssemblerCommon) finalizeDefaultShareBackfill(
 	}
 	if target == 0 && hasEligibleDefaultShareDomain(budgetByNUMA) {
 		return fmt.Errorf("default share target is zero before sysadvisor publish")
-	}
-	before := 0
-	if byNUMA := result.PoolEntries[commonstate.PoolNameShare]; byNUMA != nil {
-		before = byNUMA[commonstate.FakedNUMAID].Size
 	}
 	result.SetPoolEntry(commonstate.PoolNameShare, commonstate.FakedNUMAID, target, -1)
 	result.DefaultShareBackfill.AllocatableBudget = summary.AllocatableSize
