@@ -168,10 +168,11 @@ type budgetNodeKey struct {
 // BudgetTracker owns invocation-scoped usage shared by the driver, snapshot,
 // planner, writer, and coordinator.
 type BudgetTracker struct {
-	mu      sync.Mutex
-	limit   ConvergenceBudget
-	usage   BudgetUsage
-	visited map[budgetNodeKey]struct{}
+	mu                       sync.Mutex
+	limit                    ConvergenceBudget
+	usage                    BudgetUsage
+	visited                  map[budgetNodeKey]struct{}
+	autoHierarchyIOBootstrap bool
 }
 
 func NewBudgetTracker(limit ConvergenceBudget) *BudgetTracker {
@@ -220,6 +221,32 @@ func (b *BudgetTracker) Usage() BudgetUsage {
 	return b.usage
 }
 
+func (b *BudgetTracker) configureAutoHierarchyIOBootstrap(staleRetryAllowance int) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.limit.MaxHierarchyIOOperations != 0 {
+		return nil
+	}
+	if staleRetryAllowance < 0 {
+		return fmt.Errorf("%w: stale retry allowance must not be negative: %d",
+			ErrAutoCumulativeBudgetInvalid, staleRetryAllowance)
+	}
+	snapshotIO, err := checkedAutoBudgetMultiply(b.limit.MaxSnapshotNodes, 5)
+	if err != nil {
+		return err
+	}
+	limit, err := checkedAutoBudgetSum(snapshotIO, staleRetryAllowance, fixedInvocationHierarchyIOHeadroom)
+	if err != nil {
+		return err
+	}
+	if limit <= 0 {
+		return fmt.Errorf("%w: bootstrap hierarchy I/O limit must be positive", ErrAutoCumulativeBudgetInvalid)
+	}
+	b.limit.MaxHierarchyIOOperations = limit
+	b.autoHierarchyIOBootstrap = true
+	return nil
+}
+
 func (b *BudgetTracker) configureAutoCumulativeLimitsFromInput(in AutoCumulativeBudgetInput) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -245,7 +272,7 @@ func (b *BudgetTracker) configureAutoCumulativeLimitsFromInput(in AutoCumulative
 	if in.SnapshotIOUpperBound == 0 {
 		return fmt.Errorf("%w: snapshot I/O upper bound must be positive", ErrAutoCumulativeBudgetInvalid)
 	}
-	if b.limit.MaxHierarchyIOOperations != 0 {
+	if b.limit.MaxHierarchyIOOperations != 0 && !b.autoHierarchyIOBootstrap {
 		if b.limit.MaxRounds == 0 {
 			b.limit.MaxRounds = in.RemainingRounds
 		}
@@ -297,6 +324,7 @@ func (b *BudgetTracker) configureAutoCumulativeLimitsFromInput(in AutoCumulative
 		b.limit.MaxPlanOperations = in.MaxPlanOperationsTotal
 	}
 	b.limit.MaxHierarchyIOOperations = limit
+	b.autoHierarchyIOBootstrap = false
 	return nil
 }
 
@@ -454,10 +482,15 @@ func (b *BudgetTracker) ConsumePlanOperations(count int) error {
 	return b.consume(&b.usage.Operations, b.limit.MaxPlanOperations, count, ErrPlanOperationBudgetExceeded)
 }
 
-// ReserveHierarchyIOOperations charges a known execution upper bound before
-// mutation starts. The reserved calls must then use the unbudgeted execution
-// path so they are not charged a second time.
-func (b *BudgetTracker) ReserveHierarchyIOOperations(ctx context.Context, count int) error {
+// ReserveHierarchyIOOperations preserves the original context-free API.
+func (b *BudgetTracker) ReserveHierarchyIOOperations(count int) error {
+	return b.ReserveHierarchyIOOperationsWithContext(context.Background(), count)
+}
+
+// ReserveHierarchyIOOperationsWithContext charges a known execution upper
+// bound before mutation starts. The reserved calls must then use the
+// unbudgeted execution path so they are not charged a second time.
+func (b *BudgetTracker) ReserveHierarchyIOOperationsWithContext(ctx context.Context, count int) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if err := b.checkContextDeadlineLocked(ctx); err != nil {
@@ -507,7 +540,7 @@ func NewBudgetedHierarchyDriver(driver HierarchyDriver, budget *BudgetTracker) H
 }
 
 func newReservedBudgetedHierarchyDriver(ctx context.Context, driver HierarchyDriver, budget *BudgetTracker, operations int) (HierarchyDriver, error) {
-	if err := budget.ReserveHierarchyIOOperations(ctx, operations); err != nil {
+	if err := budget.ReserveHierarchyIOOperationsWithContext(ctx, operations); err != nil {
 		return nil, err
 	}
 	if wrapped, ok := driver.(*budgetedHierarchyDriver); ok && wrapped.budget == budget {

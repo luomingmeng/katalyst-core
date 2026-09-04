@@ -308,6 +308,13 @@ func (c TopologyCoordinator) Converge(ctx context.Context, in CoordinatorInput) 
 	defer token.Exit()
 	budgetLimit := BudgetWithInvocationDeadline(ctx, in.Budget, time.Now())
 	budget := NewBudgetTracker(budgetLimit)
+	initialSnapshotRetryAllowance := budgetLimit.MaxRounds
+	if initialSnapshotRetryAllowance == 0 {
+		initialSnapshotRetryAllowance = defaultCoordinatorAutoRounds
+	}
+	if err := budget.configureAutoHierarchyIOBootstrap(initialSnapshotRetryAllowance); err != nil {
+		return res, err
+	}
 	var result ConvergenceResult
 	switch in.Mode.modeOrDefault() {
 	case CoordinatorModeReset:

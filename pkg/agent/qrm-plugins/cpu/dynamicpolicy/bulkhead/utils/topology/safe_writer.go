@@ -429,7 +429,7 @@ func newStrictReservedHierarchyDriver(
 	budget *BudgetTracker,
 	operations int,
 ) (HierarchyDriver, error) {
-	if err := budget.ReserveHierarchyIOOperations(ctx, operations); err != nil {
+	if err := budget.ReserveHierarchyIOOperationsWithContext(ctx, operations); err != nil {
 		return nil, err
 	}
 	if wrapped, ok := driver.(*budgetedHierarchyDriver); ok && wrapped.budget == budget {
