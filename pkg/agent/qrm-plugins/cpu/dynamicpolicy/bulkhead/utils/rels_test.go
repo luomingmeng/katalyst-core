@@ -477,6 +477,50 @@ func TestBuildTopologyNodeSpecsFromViewRetainsEmptyPhysicalNUMABucket(t *testing
 	}
 }
 
+func TestBuildTopologyNodeSpecsFromViewBackfillsMissingEmptyPhysicalNUMABucket(t *testing.T) {
+	t.Parallel()
+
+	cfg := bulkheadconfig.BulkheadConfiguration{
+		BulkheadPrimaryRelPath:      "kubepods",
+		BulkheadReclaimRelPaths:     []string{"sandboxes"},
+		BulkheadReclaimNumaPrefixes: []string{"sandboxes/reclaimed-"},
+	}
+	view := &model.CPUSetPartitionView{
+		NonReclaimPool:   machine.NewCPUSet(0, 1, 2, 3, 4, 5),
+		ReclaimEffective: machine.NewCPUSet(0, 2, 4),
+		ReclaimEffectivePerNUMA: map[int]machine.CPUSet{
+			0: machine.NewCPUSet(0),
+			1: machine.NewCPUSet(2),
+			2: machine.NewCPUSet(4),
+		},
+	}
+	cpuDetails := machine.CPUDetails{
+		0: {NUMANodeID: 0}, 1: {NUMANodeID: 0},
+		2: {NUMANodeID: 1}, 3: {NUMANodeID: 1},
+		4: {NUMANodeID: 2}, 5: {NUMANodeID: 2},
+		6: {NUMANodeID: 3}, 7: {NUMANodeID: 3},
+	}
+
+	specs, err := BuildTopologyNodeSpecsFromView(cfg, view, cpuDetails, nil, nil)
+	if err != nil {
+		t.Fatalf("BuildTopologyNodeSpecsFromView: %v", err)
+	}
+	byRel := make(map[string]topology.NodeSpec, len(specs))
+	for _, spec := range specs {
+		byRel[spec.Rel] = spec
+	}
+	emptyBucket, ok := byRel["sandboxes/reclaimed-3"]
+	if !ok {
+		t.Fatalf("missing empty physical NUMA bucket was omitted from topology specs: %#v", specs)
+	}
+	if !emptyBucket.CPUs.IsEmpty() {
+		t.Fatalf("missing empty physical NUMA bucket CPUs = %s, want empty", emptyBucket.CPUs.String())
+	}
+	if !emptyBucket.Constraint.CPUUpperBound.Equals(machine.NewCPUSet(6, 7)) {
+		t.Fatalf("missing empty physical NUMA bucket upper bound = %s, want 6-7", emptyBucket.Constraint.CPUUpperBound.String())
+	}
+}
+
 func TestBuildTopologyNodeSpecsFromViewRetainsConfiguredMissingRels(t *testing.T) {
 	t.Parallel()
 
