@@ -3340,8 +3340,8 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorUsesEligiblePerNUMACapacity(t *tes
 	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
 	numa1 := topology.CPUDetails.CPUsInNUMANodes(1)
 	p.state.SetMachineState(state.NUMANodeMap{
-		0: {DefaultCPUSet: machine.NewCPUSet(numa0.ToSliceInt()[:8]...)},
-		1: {DefaultCPUSet: machine.NewCPUSet(numa1.ToSliceInt()[:8]...)},
+		0: {DefaultCPUSet: coresInNUMA(topology, 0, 0, 4)},
+		1: {DefaultCPUSet: coresInNUMA(topology, 1, 0, 4)},
 	}, false)
 
 	// cpusPerCore==2. Dedicated / non-exclusive DNB workloads leave only an
@@ -3355,6 +3355,138 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorUsesEligiblePerNUMACapacity(t *tes
 	require.NoError(t, err)
 	require.Equal(t, 2, floor.Intersection(numa0).Size())
 	require.Equal(t, 2, floor.Intersection(numa1).Size())
+}
+
+func TestDynamicPolicyDeriveRampUpReclaimFloorRepairsPartialPreferredCore(t *testing.T) {
+	t.Parallel()
+
+	details := make(machine.CPUDetails, 256)
+	for cpu := 0; cpu < 128; cpu++ {
+		numaID := cpu / 16
+		details[cpu] = machine.CPUTopoInfo{
+			NUMANodeID: numaID,
+			SocketID:   numaID,
+			CoreID:     cpu,
+		}
+		details[cpu+128] = machine.CPUTopoInfo{
+			NUMANodeID: numaID,
+			SocketID:   numaID,
+			CoreID:     cpu,
+		}
+	}
+	topology := &machine.CPUTopology{
+		NumCPUs:      256,
+		NumCores:     128,
+		NumSockets:   8,
+		NumNUMANodes: 8,
+		CPUDetails:   details,
+	}
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.reservedReclaimedCPUSet = machine.NewCPUSet(16)
+	p.reservedReclaimedCPUsSize = 0
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.2
+	p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
+
+	currentReclaim := machine.MustParse(
+		"0-3,6-8,11-15,21-23,32-38,48-131,134-136,139-143,149-151,160-166,176-255")
+	p.state.SetAllocationInfo(
+		commonstate.PoolNameReclaim,
+		commonstate.FakedContainerName,
+		&state.AllocationInfo{
+			AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+			AllocationResult: currentReclaim,
+		},
+		false,
+	)
+
+	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), true)
+	require.NoError(t, err)
+	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
+		require.Equal(t, 6, floor.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID)).Size(),
+			"NUMA %d floor=%s", numaID, floor)
+	}
+	require.True(t, machine.NewCPUSet(16, 144).IsSubsetOf(floor),
+		"reserved reclaim identity and its sibling must be preserved, floor=%s", floor)
+	requireCoreAligned(t, topology, floor)
+}
+
+func TestDynamicPolicyDeriveRampUpReclaimFloorRejectsUnrepairableReservedIdentity(t *testing.T) {
+	t.Parallel()
+
+	details := machine.CPUDetails{
+		0: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
+		1: {NUMANodeID: 0, SocketID: 0, CoreID: 1},
+		2: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
+		3: {NUMANodeID: 0, SocketID: 0, CoreID: 1},
+		4: {NUMANodeID: 0, SocketID: 0, CoreID: 2},
+		5: {NUMANodeID: 0, SocketID: 0, CoreID: 3},
+		6: {NUMANodeID: 0, SocketID: 0, CoreID: 2},
+		7: {NUMANodeID: 0, SocketID: 0, CoreID: 3},
+	}
+	topology := &machine.CPUTopology{
+		NumCPUs:      8,
+		NumCores:     4,
+		NumSockets:   1,
+		NumNUMANodes: 1,
+		CPUDetails:   details,
+	}
+
+	tests := []struct {
+		name     string
+		eligible machine.CPUSet
+		reserved machine.CPUSet
+		ratio    float64
+		wantErr  string
+	}{
+		{
+			name:     "reserved sibling outside eligible",
+			eligible: machine.NewCPUSet(0, 1, 3),
+			reserved: machine.NewCPUSet(0),
+			ratio:    0,
+			wantErr:  "reserved floor core siblings 2 are outside eligible cpus",
+		},
+		{
+			name:     "completed reserved floor exceeds target",
+			eligible: details.CPUs(),
+			reserved: machine.NewCPUSet(0, 1),
+			ratio:    0,
+			wantErr:  "core-aligned reserved floor 4 exceeds target 2",
+		},
+		{
+			name:     "eligible lacks enough complete cores",
+			eligible: machine.NewCPUSet(0, 1, 2, 4),
+			reserved: machine.NewCPUSet(),
+			ratio:    1,
+			wantErr:  "selected 2 cpus, target is 4",
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+			require.NoError(t, err)
+			p.reservedCPUs = details.CPUs().Difference(tt.eligible)
+			p.reservedReclaimedCPUSet = tt.reserved
+			p.reservedReclaimedCPUsSize = 0
+			p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+			p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+			p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = tt.ratio
+			p.conf.GetDynamicConfiguration().MinReclaimedResourceForAllocate = v1.ResourceList{
+				v1.ResourceCPU: *resource.NewQuantity(0, resource.DecimalSI),
+			}
+			p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
+
+			floor, err := p.deriveRampUpReclaimFloor(
+				p.state.GetMachineState(), p.state.GetPodEntries(), true)
+			require.True(t, floor.IsEmpty())
+			require.ErrorContains(t, err, tt.wantErr)
+		})
+	}
 }
 
 func TestDynamicPolicyDeriveRampUpReclaimFloorSkipsSteadyExclusiveNUMA(t *testing.T) {
@@ -3438,7 +3570,7 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorToleratesFullyOccupiedNUMA(t *test
 	// configured reclaim floor (4 CPUs) that NUMA 0 cannot hold.
 	p.state.SetMachineState(state.NUMANodeMap{
 		0: {DefaultCPUSet: machine.NewCPUSet()},
-		1: {DefaultCPUSet: machine.NewCPUSet(numa1.ToSliceInt()[:8]...)},
+		1: {DefaultCPUSet: coresInNUMA(topology, 1, 0, 4)},
 	}, false)
 
 	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), true)
@@ -3646,12 +3778,13 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorBalancesGlobalTargetAcrossUnevenNU
 			p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 			require.NoError(t, err)
 
-			numa0CPUs := p.machineInfo.CPUDetails.CPUsInNUMANodes(0).ToSliceInt()
-			numa1CPUs := p.machineInfo.CPUDetails.CPUsInNUMANodes(1).ToSliceInt()
-			eligible := machine.NewCPUSet(append(numa0CPUs[:4], numa1CPUs[:12]...)...)
+			eligibleNUMA0 := coresInNUMA(cpuTopology, 0, 0, 2)
+			eligibleNUMA1 := coresInNUMA(cpuTopology, 1, 0, 6)
+			eligible := eligibleNUMA0.Union(eligibleNUMA1)
 			p.reservedCPUs = p.machineInfo.CPUDetails.CPUs().Difference(eligible)
 			if tt.withReserved {
-				p.reservedReclaimedCPUSet = machine.NewCPUSet(numa0CPUs[0], numa0CPUs[1], numa1CPUs[0], numa1CPUs[1])
+				p.reservedReclaimedCPUSet = coresInNUMA(cpuTopology, 0, 0, 1).
+					Union(coresInNUMA(cpuTopology, 1, 0, 1))
 				p.reservedReclaimedCPUsSize = tt.configuredReserve
 			} else {
 				p.reservedReclaimedCPUSet = machine.NewCPUSet()
@@ -4105,6 +4238,90 @@ func TestAllocateDedicatedNUMAExclusiveAdjustmentFailureDoesNotRollbackNewerStat
 		"reclaim floor/pool overlaps newer dedicated allocation: %s", reclaim.AllocationResult)
 	require.True(t, reclaim.AllocationResult.Intersection(failedCandidateCPUs).IsEmpty(),
 		"reclaim floor/pool overlaps failed candidate allocation: %s", reclaim.AllocationResult)
+}
+
+func TestAllocateDedicatedNUMAExclusiveAdjustmentFailureDoesNotRestoreConcurrentlyDeletedCandidate(t *testing.T) {
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.reservedReclaimedCPUSet = machine.NewCPUSet()
+	p.reservedReclaimedCPUsSize = 0
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.25
+
+	const podUID = "exclusive-dnb-concurrent-delete"
+	req := &pluginapi.ResourceRequest{
+		PodUid: podUID, PodNamespace: "default", PodName: podUID, ContainerName: "main",
+		ContainerType: pluginapi.ContainerType_MAIN, ResourceName: string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{string(v1.ResourceCPU): 2},
+		Labels: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+		},
+		Annotations: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey:          apiconsts.PodAnnotationQoSLevelDedicatedCores,
+			apiconsts.PodAnnotationMemoryEnhancementKey: `{"numa_binding":"true","numa_exclusive":"true"}`,
+		},
+		Hint: &pluginapi.TopologyHint{Nodes: []uint64{0}},
+	}
+	_, err = p.Allocate(context.Background(), req)
+	require.NoError(t, err)
+	previous := p.state.GetAllocationInfo(podUID, "main")
+	require.NotNil(t, previous)
+	previous.AllocationResult = machine.NewCPUSet(6)
+	previous.OriginalAllocationResult = machine.NewCPUSet(6)
+	previous.TopologyAwareAssignments = map[int]machine.CPUSet{0: machine.NewCPUSet(6)}
+	previous.OriginalTopologyAwareAssignments = map[int]machine.CPUSet{0: machine.NewCPUSet(6)}
+	previous.RequestQuantity = 1
+	p.state.SetAllocationInfo(podUID, "main", previous, false)
+	req.Annotations[apiconsts.PodAnnotationMemoryEnhancementKey] = `{"numa_binding":"true","numa_exclusive":"true"}`
+
+	adjustmentStarted := make(chan struct{})
+	releaseAdjustment := make(chan struct{})
+	latestStateReconciled := make(chan struct{}, 1)
+	p.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+		"failing": func(_ context.Context, in dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
+			if in.Mode == dynamicpolicyutil.CPUSetAdjustmentModeAdmission {
+				close(adjustmentStarted)
+				<-releaseAdjustment
+				return errors.New("injected adjustment failure")
+			}
+			require.Nil(t, in.State.GetAllocationInfo(podUID, "main"),
+				"latest-state retry observed the stale pre-delete allocation")
+			latestStateReconciled <- struct{}{}
+			return nil
+		},
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := p.Allocate(context.Background(), req)
+		result <- err
+	}()
+	<-adjustmentStarted
+
+	p.Lock()
+	entries := p.state.GetPodEntries()
+	delete(entries, podUID)
+	p.state.SetPodEntries(entries, false)
+	p.Unlock()
+	close(releaseAdjustment)
+
+	allocationErr := <-result
+	require.Error(t, allocationErr)
+	var ownershipLost interface{ OwnershipLost() bool }
+	require.ErrorAs(t, allocationErr, &ownershipLost)
+	require.True(t, ownershipLost.OwnershipLost())
+	require.ErrorContains(t, allocationErr, "ownership lost")
+	require.Nil(t, p.state.GetAllocationInfo(podUID, "main"),
+		"rollback restored the stale allocation that a concurrent delete removed")
+	select {
+	case <-latestStateReconciled:
+	case <-time.After(time.Second):
+		t.Fatal("concurrent-delete ownership loss did not schedule a latest-state reconciliation")
+	}
 }
 
 func TestAllocateDedicatedNUMAExclusiveApplyFailureRestoresSourceAndRetriesSameStage(t *testing.T) {

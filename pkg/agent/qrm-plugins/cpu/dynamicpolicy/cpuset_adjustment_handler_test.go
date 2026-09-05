@@ -224,6 +224,103 @@ func TestDeferredFullRetryRetriesFailureWithBackoff(t *testing.T) {
 	}
 }
 
+func TestDeferredFullRetryCountsTrailingRoundsTowardAttemptBudget(t *testing.T) {
+	t.Parallel()
+
+	attempts := make(chan time.Time, cpuSetAdjustmentRetryMaxAttempts+1)
+	var attemptCount int32
+	p := &DynamicPolicy{
+		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+			"retry": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+				if in.Mode != cpusetutil.CPUSetAdjustmentModeRetry {
+					return nil
+				}
+				attempt := atomic.AddInt32(&attemptCount, 1)
+				attempts <- time.Now()
+				if attempt <= cpuSetAdjustmentRetryMaxAttempts {
+					in.ScheduleFullRetry(cpusetutil.RetryReasonDeferredLeaf)
+				}
+				return nil
+			},
+		},
+	}
+
+	p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonDeferredLeaf)
+	deadline := time.Now().Add(time.Second)
+	for {
+		p.cpuSetAdjustmentRetryMu.Lock()
+		queued := p.cpuSetAdjustmentRetryQueued
+		p.cpuSetAdjustmentRetryMu.Unlock()
+		if !queued {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("self-scheduled trailing retries did not stop within the bounded attempt window")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	require.Equal(t, int32(cpuSetAdjustmentRetryMaxAttempts), atomic.LoadInt32(&attemptCount),
+		"every worker round, including successful trailing rounds, must consume the shared attempt budget")
+	var previous time.Time
+	for i := 0; i < cpuSetAdjustmentRetryMaxAttempts; i++ {
+		current := <-attempts
+		if !previous.IsZero() {
+			require.GreaterOrEqual(t, current.Sub(previous), cpuSetAdjustmentRetryInitialBackoff,
+				"trailing retry %d ran without backoff", i+1)
+		}
+		previous = current
+	}
+	p.cpuSetAdjustmentRetryMu.Lock()
+	defer p.cpuSetAdjustmentRetryMu.Unlock()
+	require.False(t, p.cpuSetAdjustmentRetryQueued)
+	require.False(t, p.cpuSetAdjustmentRetryAgain)
+	require.True(t, p.cpuSetAdjustmentRetryDirty)
+	require.Contains(t, p.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonDeferredLeaf)
+}
+
+func TestDeferredFullRetrySuccessfulTrailingRoundClearsTrimmedRequest(t *testing.T) {
+	t.Parallel()
+
+	var attemptCount int32
+	p := &DynamicPolicy{
+		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+			"retry": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+				if in.Mode != cpusetutil.CPUSetAdjustmentModeRetry {
+					return nil
+				}
+				if atomic.AddInt32(&attemptCount, 1) == 1 {
+					in.ScheduleFullRetry(cpusetutil.RetryReasonDeferredLeaf)
+					in.ScheduleFullRetry(cpusetutil.RetryReasonDeferredLeaf)
+				}
+				return nil
+			},
+		},
+	}
+
+	p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonDeferredLeaf)
+	deadline := time.Now().Add(time.Second)
+	for {
+		p.cpuSetAdjustmentRetryMu.Lock()
+		queued := p.cpuSetAdjustmentRetryQueued
+		p.cpuSetAdjustmentRetryMu.Unlock()
+		if !queued {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("successful trailing retry did not finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	require.Equal(t, int32(2), atomic.LoadInt32(&attemptCount))
+	p.cpuSetAdjustmentRetryMu.Lock()
+	defer p.cpuSetAdjustmentRetryMu.Unlock()
+	require.False(t, p.cpuSetAdjustmentRetryDirty)
+	require.Nil(t, p.cpuSetAdjustmentRetryReasons)
+	require.False(t, p.cpuSetAdjustmentRetryAgain)
+}
+
 func TestDeferredFullRetryExhaustionStaysDirtyUntilPeriodicLatestStateReconcile(t *testing.T) {
 	t.Parallel()
 
@@ -361,6 +458,74 @@ func TestCPUSetAdjustmentCommitsTopologyReclaimOverride(t *testing.T) {
 	require.NotNil(t, reclaim)
 	require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(2, 3)),
 		"reclaim allocation=%s, want topology verified override 2-3", reclaim.AllocationResult)
+}
+
+func TestCPUSetAdjustmentAlignsAdmissionReclaimOverrideToWholeCores(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	setReclaimPoolCPUSet(t, p, machine.NewCPUSet(0, 1, 48, 49))
+	p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
+	var handlerCalls int32
+	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"topology-override": func(_ context.Context, handlerCtx cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			if atomic.AddInt32(&handlerCalls, 1) == 1 {
+				handlerCtx.CommitOverride.ReclaimEffective = machine.NewCPUSet(1, 48, 49)
+			} else {
+				handlerCtx.CommitOverride.ReclaimEffective = machine.NewCPUSet(1, 49)
+			}
+			handlerCtx.CommitOverride.Source = "cpuset_topology"
+			return nil
+		},
+	}
+
+	p.Lock()
+	err := p.runCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentModeAdmission)
+	p.Unlock()
+	require.NoError(t, err)
+
+	reclaim := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	require.NotNil(t, reclaim)
+	require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(1, 49)),
+		"admission override must retain complete physical cores only, got %s", reclaim.AllocationResult)
+	require.Eventually(t, func() bool {
+		return atomic.LoadInt32(&handlerCalls) >= 2
+	}, time.Second, 10*time.Millisecond,
+		"trimming an applied override must schedule a latest-state convergence pass")
+}
+
+func TestCPUSetAdjustmentRetrySchedulesAgainWhenReclaimOverrideTrimmed(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	setReclaimPoolCPUSet(t, p, machine.NewCPUSet(0, 1, 48, 49))
+	p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
+	p.cpuSetAdjustmentRetryQueued = true
+	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"topology-override": func(_ context.Context, handlerCtx cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			if handlerCtx.CommitOverride == nil {
+				t.Fatal("CPUSet adjustment runner did not provide a commit override")
+			}
+			handlerCtx.CommitOverride.ReclaimEffective = machine.NewCPUSet(1, 48, 49)
+			handlerCtx.CommitOverride.Source = "cpuset_topology"
+			return nil
+		},
+	}
+
+	p.Lock()
+	err := p.runCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentModeRetry)
+	p.Unlock()
+	require.NoError(t, err)
+
+	reclaim := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	require.NotNil(t, reclaim)
+	require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(1, 49)),
+		"retry override must commit only complete physical cores, got %s", reclaim.AllocationResult)
+	require.True(t, p.cpuSetAdjustmentRetryAgain,
+		"trimming during a retry must request another latest-state pass to align runtime side effects with the committed checkpoint")
+	require.Contains(t, p.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonRecoveryCommit)
 }
 
 func TestCPUSetAdjustmentCommitOverrideUsesRevisionGuard(t *testing.T) {
@@ -795,7 +960,6 @@ func TestAdvisorCheckpointSubprocessRestoresDisjointPartitionRevisionPendingAndR
 	case "timeout-probe":
 		fmt.Fprintln(os.Stderr, "advisor checkpoint timeout probe started")
 		select {}
-		return
 	}
 
 	dir := t.TempDir()
@@ -893,10 +1057,10 @@ func runAdvisorCheckpointReader(t *testing.T, dir string) {
 	require.NoError(t, err)
 	p.advisorPostCommitCheckpointDir = dir
 	retryCalls := make(chan cpusetutil.CPUSetAdjustmentHandlerCtx, 1)
-	var retryCallCount atomic.Int32
+	var retryCallCount int32
 	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"keep-pending": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-			retryCallCount.Add(1)
+			atomic.AddInt32(&retryCallCount, 1)
 			select {
 			case retryCalls <- in:
 			default:
@@ -912,9 +1076,9 @@ func runAdvisorCheckpointReader(t *testing.T, dir string) {
 	case call := <-retryCalls:
 		require.Equal(t, cpusetutil.CPUSetAdjustmentModeRetry, call.Mode)
 	case <-time.After(2 * time.Second):
-		t.Fatalf("retry handler was not called after Start; calls=%d", retryCallCount.Load())
+		t.Fatalf("retry handler was not called after Start; calls=%d", atomic.LoadInt32(&retryCallCount))
 	}
-	require.GreaterOrEqual(t, retryCallCount.Load(), int32(1))
+	require.GreaterOrEqual(t, atomic.LoadInt32(&retryCallCount), int32(1))
 
 	dedicated := p.state.GetAllocationInfo("pod-dedicated", "main").AllocationResult
 	reclaim := p.state.GetAllocationInfo(
