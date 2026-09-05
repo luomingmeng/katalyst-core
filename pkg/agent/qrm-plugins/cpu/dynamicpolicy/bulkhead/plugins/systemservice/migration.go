@@ -89,6 +89,17 @@ func (p *SystemServicePlugin) runMigrate(ctx context.Context, in bulkheadapi.Per
 		return nil
 	}
 
+	_, cpusetProof, cpusetReady, err := p.authorizedMigrationTarget(ctx, in)
+	if err != nil {
+		authorizeErr := operationError(cgcommon.CgroupSubsysCPUSet, "authorize_error",
+			fmt.Errorf("authorize cpuset target %q: %w", targetRel, err))
+		emitBulkheadSystemServiceFailures(in.Emitter, "migrate", []error{authorizeErr})
+		return authorizeErr
+	}
+	if !cpusetReady {
+		return nil
+	}
+
 	controllerAttacher, err := p.controllerAttacher()
 	if err != nil {
 		emitBulkheadSystemServiceFailures(in.Emitter, "migrate", []error{err})
@@ -96,7 +107,7 @@ func (p *SystemServicePlugin) runMigrate(ctx context.Context, in bulkheadapi.Per
 	}
 	sources, sourceErrors := p.controllerSources(ctx, controllerAttacher)
 	candidates, listErrors := p.listRootMigrationCandidates(sources)
-	targets, targetOutcome := p.prepareMigrationTargets(ctx, in, candidates, controllerAttacher)
+	targets, targetOutcome := p.prepareMigrationTargets(ctx, candidates, controllerAttacher, cpusetProof)
 	outcome := migrationOutcome{}
 	outcome.errors = append(sourceErrors, listErrors...)
 	outcome.merge(targetOutcome)
@@ -120,26 +131,19 @@ func (p *SystemServicePlugin) runMigrate(ctx context.Context, in bulkheadapi.Per
 
 func (p *SystemServicePlugin) prepareMigrationTargets(
 	ctx context.Context,
-	in bulkheadapi.PeriodicalHandlerContext,
 	candidates []migrationCandidate,
 	cpuAttacher cgroupclient.ControllerPIDAttacher,
+	cpusetProof model.CgroupRelProof,
 ) (migrationTargets, migrationOutcome) {
 	targets := migrationTargets{
 		targetRel:   strings.Trim(p.targetRel, "/"),
+		cpusetProof: cpusetProof,
+		cpusetReady: true,
 		cpuAttacher: cpuAttacher,
 	}
 	var outcome migrationOutcome
 	needsCPUSet, needsCPU := candidateControllerNeeds(candidates)
 
-	if needsCPUSet {
-		var err error
-		_, targets.cpusetProof, targets.cpusetReady, err = p.authorizedMigrationTarget(ctx, in)
-		if err != nil {
-			outcome.addError(operationError(cgcommon.CgroupSubsysCPUSet, "authorize_error",
-				fmt.Errorf("authorize cpuset target %q: %w", targets.targetRel, err)))
-			targets.cpusetReady = false
-		}
-	}
 	if needsCPU {
 		if err := cpuAttacher.EnsureControllerDir(ctx, cgcommon.CgroupSubsysCPU, targets.targetRel); err != nil {
 			outcome.addError(operationError(cgcommon.CgroupSubsysCPU, "ensure_error",
@@ -285,6 +289,12 @@ func (p *SystemServicePlugin) authorizedMigrationTarget(
 		emitBulkheadSystemServiceResult(in.Emitter, "migrate", "skipped", "empty_target_rel", cgcommon.CgroupSubsysCPUSet)
 		return "", model.CgroupRelProof{}, false, nil
 	}
+	proof, proved := in.AppliedView.RelProofByRel[targetRel]
+	if !proved || proof.Device == 0 || proof.Inode == 0 || proof.CPUSet.IsEmpty() {
+		general.InfofV(4, "system_service: migration skipped, target rel lacks non-empty identity-bound applied proof, rel=%q", targetRel)
+		emitBulkheadSystemServiceResult(in.Emitter, "migrate", "skipped", "missing_target_rel_proof", cgcommon.CgroupSubsysCPUSet)
+		return "", model.CgroupRelProof{}, false, nil
+	}
 	// Target cgroup not created yet — bail early, cpuset_topology owns
 	// creation. Next tick will retry the same AppliedView revision.
 	if _, err := p.cgroup.StatDir(ctx, targetRel); err != nil {
@@ -297,21 +307,14 @@ func (p *SystemServicePlugin) authorizedMigrationTarget(
 		return "", model.CgroupRelProof{}, false, nil
 	}
 
-	proof, proved := in.AppliedView.RelProofByRel[targetRel]
-	if !proved || proof.Device == 0 || proof.Inode == 0 || proof.CPUSet.IsEmpty() {
-		general.InfofV(4, "system_service: migration skipped, target rel lacks non-empty identity-bound applied proof, rel=%q", targetRel)
-		emitBulkheadSystemServiceResult(in.Emitter, "migrate", "skipped", "missing_target_rel_proof", cgcommon.CgroupSubsysCPUSet)
-		return "", model.CgroupRelProof{}, false, nil
-	}
 	targetCPUSet, err := p.readTargetCPUSet(ctx, targetRel)
 	if err != nil {
 		return "", model.CgroupRelProof{}, false, err
 	}
 	if targetCPUSet.IsEmpty() || !targetCPUSet.Equals(proof.CPUSet) {
-		general.InfofV(4, "system_service: migration skipped, target rel differs from applied proof, rel=%q target=%s applied=%s",
+		return "", model.CgroupRelProof{}, false, fmt.Errorf(
+			"target cpuset %q differs from applied proof: got %s want %s",
 			targetRel, targetCPUSet.String(), proof.CPUSet.String())
-		emitBulkheadSystemServiceResult(in.Emitter, "migrate", "skipped", "target_not_in_applied_view", cgcommon.CgroupSubsysCPUSet)
-		return "", model.CgroupRelProof{}, false, nil
 	}
 	return targetRel, proof, true, nil
 }

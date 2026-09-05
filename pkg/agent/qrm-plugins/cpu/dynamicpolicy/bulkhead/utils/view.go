@@ -490,6 +490,40 @@ func validateHardPartitionReclaimPerNUMA(
 	return nil
 }
 
+// ValidateHardPartitionAppliedView verifies the topology layer's per-NUMA
+// reclaim proof without reconstructing it from the aggregate reclaim root.
+// Callers must handle any level-specific reset sentinel before invoking this
+// common validator; an empty aggregate reclaim set otherwise fails closed.
+func ValidateHardPartitionAppliedView(
+	view *model.AppliedView,
+	state cpustate.ReadonlyState,
+	topology *machine.CPUTopology,
+	opts CPUSetPartitionViewOptions,
+) error {
+	if !opts.HardPartitionEnabled || view == nil || topology == nil {
+		return nil
+	}
+
+	skipNUMAs := sets.NewInt()
+	if state != nil {
+		skipNUMAs = state.GetPodEntries().SteadyExclusiveNUMAs(topology)
+	}
+	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
+		if skipNUMAs.Has(numaID) {
+			continue
+		}
+		if _, ok := view.ReclaimEffectivePerNUMA[numaID]; !ok {
+			return fmt.Errorf("bulkhead hard-partition applied reclaim proof missing for NUMA %d", numaID)
+		}
+	}
+	return validateHardPartitionReclaimPerNUMA(
+		view.ReclaimEffectivePerNUMA,
+		opts.HardPartitionReclaimTargetPerNUMA,
+		skipNUMAs,
+		topology,
+	)
+}
+
 // BuildCPUSetPartitionViewFromTarget creates an owned partition view whose
 // reclaim domain is the topology layer's write-verified target. Metadata that
 // is independent of partition ownership is copied from desired.
