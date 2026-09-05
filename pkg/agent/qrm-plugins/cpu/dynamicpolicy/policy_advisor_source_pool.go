@@ -481,6 +481,12 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhase(
 			return available, fmt.Errorf("plan hard reclaim partition: %w", err)
 		}
 		demands = pinnedDemands
+	} else if preserveClass && !expandSteadyReclaimPhase {
+		pinnedDemands, err := pinHardReclaimPartitionDemands(demands, available, p.machineInfo.CPUTopology)
+		if err != nil {
+			return available, fmt.Errorf("plan steady real-NUMA reclaim partition: %w", err)
+		}
+		demands = pinnedDemands
 	}
 	var assignments map[string]machine.CPUSet
 	var solveErr error

@@ -25,16 +25,17 @@ import (
 )
 
 type pendingCPUPartition struct {
-	expectedRevision     uint64
-	entries              state.PodEntries
-	baseMachineState     state.NUMANodeMap
-	allowOverlap         bool
-	disableDedicated     bool
-	persist              bool
-	source               string
-	validate             func(state.PodEntries, state.NUMANodeMap, bool, bool) error
-	enforceSteadyReclaim bool
-	residualFloor        machine.CPUSet
+	expectedRevision          uint64
+	entries                   state.PodEntries
+	baseMachineState          state.NUMANodeMap
+	allowOverlap              bool
+	disableDedicated          bool
+	persist                   bool
+	source                    string
+	validate                  func(state.PodEntries, state.NUMANodeMap, bool, bool) error
+	requireCoreAlignedReclaim bool
+	enforceSteadyReclaim      bool
+	residualFloor             machine.CPUSet
 }
 
 type preparedCPUPartition struct {
@@ -77,13 +78,17 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 			return nil, p.wrapPartitionPrecommitError(
 				pending.source, "revalidate allocation shape after hooks", err)
 		}
+		if pending.requireCoreAlignedReclaim {
+			if err := assertCoreAligned(reclaimPoolCPUSet(candidate), p.machineInfo.CPUTopology); err != nil {
+				return nil, p.wrapPartitionPrecommitError(
+					pending.source, "revalidate reclaim core alignment after hooks", err)
+			}
+		}
 		if pending.enforceSteadyReclaim {
 			plannedReclaim := reclaimPoolCPUSet(pending.entries)
 			candidateReclaim := reclaimPoolCPUSet(candidate)
-			committedReclaim := reclaimPoolCPUSet(currentEntries)
 			if err := validateSteadyReclaimPrecommitInvariant(
-				plannedReclaim, candidateReclaim, committedReclaim,
-				p.machineInfo.CPUTopology,
+				plannedReclaim, candidateReclaim, p.machineInfo.CPUTopology,
 			); err != nil {
 				return nil, p.wrapPartitionPrecommitError(
 					pending.source, "revalidate steady reclaim after hooks", err)
@@ -187,9 +192,13 @@ func (p *DynamicPolicy) validateResidualBackfillCandidate(
 
 	eligible := p.buildDefaultShareEligibleCPUSet(entries, machineState, residualFloor)
 	expected := eligible.Difference(fixedPools).Difference(dedicated)
-	if !share.Equals(expected) {
-		return fmt.Errorf("default share cpuset %s differs from eligible residual %s (eligible=%s fixed=%s dedicated=%s)",
-			share.String(), expected.String(), eligible.String(), fixedPools.String(), dedicated.String())
+	activeRampUp := activeRampUpCPUSet(entries)
+	extraShare := share.Difference(expected)
+	uncoveredResidual := expected.Difference(share).Difference(activeRampUp)
+	if !extraShare.IsEmpty() || !uncoveredResidual.IsEmpty() {
+		return fmt.Errorf("default share cpuset %s with active ramp-up %s differs from eligible residual %s (uncovered=%s extra_share=%s eligible=%s fixed=%s dedicated=%s)",
+			share.String(), activeRampUp.String(), expected.String(), uncoveredResidual.String(), extraShare.String(),
+			eligible.String(), fixedPools.String(), dedicated.String())
 	}
 	if shareEntry == nil {
 		return nil
@@ -391,7 +400,7 @@ func reclaimPoolCPUSet(entries state.PodEntries) machine.CPUSet {
 }
 
 func validateSteadyReclaimPrecommitInvariant(
-	planned, candidate, committed machine.CPUSet,
+	planned, candidate machine.CPUSet,
 	topology *machine.CPUTopology,
 ) error {
 	if topology == nil {
@@ -405,10 +414,10 @@ func validateSteadyReclaimPrecommitInvariant(
 			"steady reclaim quantity changed after hooks: planned=%d candidate=%d",
 			planned.Size(), candidate.Size())
 	}
-	if churn := steadyFakeNUMAMigrationChurn(committed, candidate); churn >
+	if churn := steadyFakeNUMAMigrationChurn(planned, candidate); churn >
 		steadyFakeNUMAMaxMigratedCPUs {
 		return fmt.Errorf(
-			"steady reclaim migration churn %d exceeds limit %d",
+			"steady reclaim hook migration churn %d exceeds limit %d",
 			churn, steadyFakeNUMAMaxMigratedCPUs)
 	}
 	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {

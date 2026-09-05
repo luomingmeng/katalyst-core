@@ -2375,14 +2375,15 @@ func (p *DynamicPolicy) commitPendingAdvisorState(pending *pendingAdvisorState) 
 		return fmt.Errorf("pending advisor state is nil")
 	}
 	entries, _, err := p.commitPendingCPUPartition(pendingCPUPartition{
-		expectedRevision:     pending.preCommitRevision,
-		entries:              pending.entries,
-		allowOverlap:         pending.allowOverlap,
-		disableDedicated:     pending.disableDedicated,
-		persist:              true,
-		source:               "advisor apply",
-		enforceSteadyReclaim: pending.enforceSteadyReclaim,
-		residualFloor:        pending.residualFloor,
+		expectedRevision:          pending.preCommitRevision,
+		entries:                   pending.entries,
+		allowOverlap:              pending.allowOverlap,
+		disableDedicated:          pending.disableDedicated,
+		persist:                   true,
+		source:                    "advisor apply",
+		requireCoreAlignedReclaim: pending.disableDedicated,
+		enforceSteadyReclaim:      pending.enforceSteadyReclaim,
+		residualFloor:             pending.residualFloor,
 	})
 	if err == nil {
 		pending.entries = entries
@@ -2417,8 +2418,15 @@ func (p *DynamicPolicy) buildAdjustmentCommitOverrideFromPodEntries(
 				}
 			}
 		}
+		reclaim, err := p.coreAlignedReclaimOverride(
+			reclaimEntry.AllocationResult.Difference(dedicated),
+			disableDedicatedCoresOverlapReclaimedCores,
+		)
+		if err != nil {
+			return nil, err
+		}
 		return &cpusetutil.CPUSetAdjustmentCommitOverride{
-			ReclaimEffective: reclaimEntry.AllocationResult.Difference(dedicated),
+			ReclaimEffective: reclaim,
 			Source:           "advisor_pending_entries",
 		}, nil
 	}
@@ -2450,13 +2458,43 @@ func (p *DynamicPolicy) buildAdjustmentCommitOverrideFromPodEntries(
 			return nil, err
 		}
 	}
-	if view == nil || view.ReclaimEffective.IsEmpty() {
+	if view == nil {
 		return nil, nil
 	}
+	reclaim, err := p.coreAlignedReclaimOverride(
+		view.ReclaimEffective,
+		disableDedicatedCoresOverlapReclaimedCores,
+	)
+	if err != nil {
+		return nil, err
+	}
 	return &cpusetutil.CPUSetAdjustmentCommitOverride{
-		ReclaimEffective: view.ReclaimEffective.Clone(),
+		ReclaimEffective: reclaim,
 		Source:           "advisor_pending_entries",
 	}, nil
+}
+
+func (p *DynamicPolicy) coreAlignedReclaimOverride(
+	reclaim machine.CPUSet,
+	requireCoreAlignment bool,
+) (machine.CPUSet, error) {
+	if !requireCoreAlignment {
+		return reclaim.Clone(), nil
+	}
+	if p == nil || p.machineInfo == nil || p.machineInfo.CPUTopology == nil {
+		return machine.NewCPUSet(), fmt.Errorf("cannot align reclaim override without cpu topology")
+	}
+	for _, cpu := range reclaim.ToSliceInt() {
+		if _, ok := p.machineInfo.CPUTopology.CPUDetails[cpu]; !ok {
+			return machine.NewCPUSet(), fmt.Errorf("reclaim override cpu %d has no topology metadata", cpu)
+		}
+	}
+	return takeCoreAlignedCPUSet(
+		p.machineInfo.CPUTopology,
+		reclaim,
+		reclaim,
+		reclaim.Size(),
+	), nil
 }
 
 func (p *DynamicPolicy) syncReclaimPoolWithAdjustmentCommitOverride(
@@ -2464,7 +2502,7 @@ func (p *DynamicPolicy) syncReclaimPoolWithAdjustmentCommitOverride(
 	override *cpusetutil.CPUSetAdjustmentCommitOverride,
 	defaultShareEligible ...machine.CPUSet,
 ) error {
-	if override == nil || override.ReclaimEffective.IsEmpty() {
+	if override == nil || (override.ReclaimEffective.IsEmpty() && override.Source == "") {
 		return nil
 	}
 	reclaimEntry, ok := newEntries[commonstate.PoolNameReclaim][commonstate.FakedContainerName]
