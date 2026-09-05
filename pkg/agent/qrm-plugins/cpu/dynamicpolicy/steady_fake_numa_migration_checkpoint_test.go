@@ -26,6 +26,90 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
+func TestSteadyFakeNUMAMigrationBudgetIsEightCPUIds(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, 8, steadyFakeNUMAMaxMigratedCPUs)
+}
+
+func TestProjectSteadyFakeNUMAStageWithCheckpointKeepsFixedReplacementChurnBudget(t *testing.T) {
+	t.Run("large topology does not increase budget", func(t *testing.T) {
+		topology, err := machine.GenerateDummyCPUTopology(256, 2, 8)
+		require.NoError(t, err)
+		all := topology.CPUDetails.CPUs()
+		committed := coresInNUMA(topology, 0, 0, 6)
+		target := coresInNUMA(topology, 0, 6, 12)
+		policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+		require.NoError(t, err)
+
+		next, err := policy.projectSteadyFakeNUMAStageWithCheckpoint(
+			stagedMigrationDemands(all, committed, target.Size()),
+			[]string{"fake"},
+			committed,
+			map[string]machine.CPUSet{
+				"fake":  target,
+				"share": all.Difference(target),
+			},
+			nil,
+		)
+
+		require.NoError(t, err)
+		require.LessOrEqual(t,
+			steadyFakeNUMAMigrationChurn(committed, next["fake"]),
+			steadyFakeNUMAMaxMigratedCPUs)
+		require.NotNil(t, policy.steadyFakeNUMAMigrationTarget)
+		require.Equal(t, target, policy.steadyFakeNUMAMigrationTarget.target)
+	})
+
+	t.Run("offsetting demand shrink and grow do not increase budget", func(t *testing.T) {
+		topology, err := machine.GenerateDummyCPUTopologyWithoutSMT(20, 1, 1)
+		require.NoError(t, err)
+		all := topology.CPUDetails.CPUs()
+		oldShrink := coresInNUMA(topology, 0, 0, 6)
+		oldGrow := machine.NewCPUSet()
+		committed := oldShrink.Union(oldGrow)
+		targetShrink := coresInNUMA(topology, 0, 6, 7)
+		targetGrow := coresInNUMA(topology, 0, 7, 12)
+		target := targetShrink.Union(targetGrow)
+		policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+		require.NoError(t, err)
+		demands := []partitionDemand{
+			{
+				key: "shrink", quantity: targetShrink.Size(), eligible: all,
+				preferred: oldShrink, class: advisorBlockClassMandatoryReclaim,
+			},
+			{
+				key: "grow", quantity: targetGrow.Size(), eligible: all,
+				preferred: oldGrow, class: advisorBlockClassMandatoryReclaim,
+			},
+			{
+				key: "share", quantity: all.Size() - target.Size(), eligible: all,
+				preferred: all.Difference(committed), class: advisorBlockClassShared,
+			},
+		}
+
+		next, err := policy.projectSteadyFakeNUMAStageWithCheckpoint(
+			demands,
+			[]string{"shrink", "grow"},
+			committed,
+			map[string]machine.CPUSet{
+				"shrink": targetShrink,
+				"grow":   targetGrow,
+				"share":  all.Difference(target),
+			},
+			nil,
+		)
+
+		require.NoError(t, err)
+		nextReclaim := next["shrink"].Union(next["grow"])
+		require.LessOrEqual(t,
+			steadyFakeNUMAMigrationChurn(committed, nextReclaim),
+			steadyFakeNUMAMaxMigratedCPUs)
+		require.NotNil(t, policy.steadyFakeNUMAMigrationTarget)
+		require.Equal(t, target, policy.steadyFakeNUMAMigrationTarget.target)
+	})
+}
+
 func TestSteadyFakeNUMAMigrationTargetSurvivesRestart(t *testing.T) {
 	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
 	require.NoError(t, err)

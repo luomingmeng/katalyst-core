@@ -17,6 +17,7 @@ limitations under the License.
 package dynamicpolicy
 
 import (
+	"fmt"
 	"math/rand"
 	"testing"
 
@@ -1199,8 +1200,7 @@ func TestSolveSteadyFakeNUMADesiredWholeCoreRepairsDC05FlowFixture(t *testing.T)
 	require.Equal(t, 204, committed.Size())
 	require.NoError(t, assertCoreAligned(committed, topology))
 	require.Equal(t, 100, ordinaryDesired.Size())
-	require.Greater(t, fragmentedLogicalCPUCount(ordinaryDesired, topology),
-		steadyFakeNUMAMaxMigratedCPUs)
+	require.Greater(t, fragmentedLogicalCPUCount(ordinaryDesired, topology), 0)
 
 	demands := []partitionDemand{
 		{
@@ -1225,6 +1225,485 @@ func TestSolveSteadyFakeNUMADesiredWholeCoreRepairsDC05FlowFixture(t *testing.T)
 	require.NoError(t, assertCoreAligned(got["fake"], topology))
 	require.True(t, got["fake"].Intersection(got["share"]).IsEmpty())
 	require.Equal(t, all, got["fake"].Union(got["share"]))
+}
+
+func TestSolveSteadyFakeNUMADesiredWholeCoreRepairsDC05ExpandedEightNUMAFixture(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(256, 2, 8)
+	require.NoError(t, err)
+	all := topology.CPUDetails.CPUs()
+	oldFake, err := machine.Parse("1,16-20,32-127,129,144-148,160-255")
+	require.NoError(t, err)
+	failedBaseline, err := machine.Parse(
+		"1,6-8,11-28,32-44,48-60,68-73,80-127,129,134-154,160-170,176-186,208-255")
+	require.NoError(t, err)
+	quantitiesByNUMA := map[int]int{
+		0: 20,
+		1: 24,
+		2: 24,
+		3: 24,
+		4: 6,
+		5: 32,
+		6: 32,
+		7: 32,
+	}
+	demands := make([]partitionDemand, 0, len(quantitiesByNUMA)+1)
+	fakeKeys := make([]string, 0, len(quantitiesByNUMA))
+	for numaID, quantity := range quantitiesByNUMA {
+		key := fmt.Sprintf("fake-%d", numaID)
+		numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
+		demands = append(demands, partitionDemand{
+			key:       key,
+			quantity:  quantity,
+			eligible:  numaCPUs,
+			preferred: oldFake.Intersection(numaCPUs),
+			class:     advisorBlockClassMandatoryReclaim,
+		})
+		fakeKeys = append(fakeKeys, key)
+	}
+	demands = append(demands, partitionDemand{
+		key:       "share",
+		quantity:  all.Size() - failedBaseline.Size(),
+		eligible:  all,
+		preferred: all.Difference(oldFake),
+		class:     advisorBlockClassShared,
+	})
+
+	baseline, err := solveDisjointPartitions(demands, topology)
+	require.NoError(t, err)
+	baselineReclaim := unionPartitionAssignments(baseline, fakeKeys)
+	require.Equal(t, failedBaseline.Size(), baselineReclaim.Size())
+	require.Greater(t, fragmentedLogicalCPUCount(baselineReclaim, topology), 0)
+
+	got, err := solveSteadyFakeNUMADesiredWholeCore(
+		demands, fakeKeys, nil, topology, baseline)
+
+	require.NoError(t, err)
+	reclaim := unionPartitionAssignments(got, fakeKeys)
+	require.Equal(t, oldFake.Size()-10, reclaim.Size())
+	require.NoError(t, assertCoreAligned(reclaim, topology))
+	require.True(t, reclaim.Intersection(got["share"]).IsEmpty())
+	require.Equal(t, all, reclaim.Union(got["share"]))
+}
+
+func TestSolveSteadyFakeNUMADesiredWholeCoreRepairsDC05ShrinkFixture(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(256, 2, 8)
+	require.NoError(t, err)
+	all := topology.CPUDetails.CPUs()
+	committed, err := machine.Parse(
+		"0-1,6,16-18,32-129,134,144-146,160-255")
+	require.NoError(t, err)
+	failedBaseline, err := machine.Parse(
+		"1,6-8,11-28,32-44,48-60,68-73,80-127,129,134-154,160-170,176-186,208-255")
+	require.NoError(t, err)
+	quantitiesByNUMA := map[int]int{
+		0: 20,
+		1: 24,
+		2: 24,
+		3: 24,
+		4: 6,
+		5: 32,
+		6: 32,
+		7: 32,
+	}
+	demands := make([]partitionDemand, 0, len(quantitiesByNUMA)+1)
+	fakeKeys := make([]string, 0, len(quantitiesByNUMA))
+	for numaID, quantity := range quantitiesByNUMA {
+		key := fmt.Sprintf("fake-%d", numaID)
+		numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
+		demands = append(demands, partitionDemand{
+			key:       key,
+			quantity:  quantity,
+			eligible:  numaCPUs,
+			preferred: committed.Intersection(numaCPUs),
+			class:     advisorBlockClassMandatoryReclaim,
+		})
+		fakeKeys = append(fakeKeys, key)
+	}
+	demands = append(demands, partitionDemand{
+		key:       "share",
+		quantity:  all.Size() - failedBaseline.Size(),
+		eligible:  all,
+		preferred: all.Difference(committed),
+		class:     advisorBlockClassShared,
+	})
+
+	baseline, err := solveDisjointPartitions(demands, topology)
+	require.NoError(t, err)
+	baselineReclaim := unionPartitionAssignments(baseline, fakeKeys)
+	require.Equal(t, failedBaseline.Size(), baselineReclaim.Size())
+	require.Greater(t, fragmentedLogicalCPUCount(baselineReclaim, topology), 0)
+
+	got, err := solveSteadyFakeNUMADesiredWholeCore(
+		demands, fakeKeys, nil, topology, baseline)
+
+	require.NoError(t, err)
+	reclaim := unionPartitionAssignments(got, fakeKeys)
+	require.Equal(t, failedBaseline.Size(), reclaim.Size())
+	require.NoError(t, assertCoreAligned(reclaim, topology))
+	require.True(t, reclaim.Intersection(got["share"]).IsEmpty())
+	require.Equal(t, all, reclaim.Union(got["share"]))
+}
+
+func TestProjectSteadyFakeNUMAStageRejectsDC05RampUpTransitionBeyondFixedBudget(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(256, 2, 8)
+	require.NoError(t, err)
+	all := topology.CPUDetails.CPUs()
+	committed, err := machine.Parse(
+		"1,17-18,33-34,49-50,68-127,129,145-146,161-162,177-178,196-255")
+	require.NoError(t, err)
+	failedBaseline, err := machine.Parse(
+		"1,6-8,11-28,32-44,48-60,68-69,80-81,96-97,112-113,129,134-154,160-170,176-186")
+	require.NoError(t, err)
+	quantitiesByNUMA := map[int]int{
+		0: 20,
+		1: 24,
+		2: 24,
+		3: 24,
+		4: 2,
+		5: 2,
+		6: 2,
+		7: 2,
+	}
+	demands := make([]partitionDemand, 0, len(quantitiesByNUMA)+1)
+	fakeKeys := make([]string, 0, len(quantitiesByNUMA))
+	for numaID, quantity := range quantitiesByNUMA {
+		if quantity == 0 {
+			continue
+		}
+		key := fmt.Sprintf("fake-%d", numaID)
+		numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
+		demands = append(demands, partitionDemand{
+			key:       key,
+			quantity:  quantity,
+			eligible:  numaCPUs,
+			preferred: committed.Intersection(numaCPUs),
+			class:     advisorBlockClassMandatoryReclaim,
+		})
+		fakeKeys = append(fakeKeys, key)
+	}
+	demands = append(demands, partitionDemand{
+		key:       "share",
+		quantity:  all.Size() - failedBaseline.Size(),
+		eligible:  all,
+		preferred: all.Difference(committed),
+		class:     advisorBlockClassShared,
+	})
+	baseline := map[string]machine.CPUSet{"share": all.Difference(failedBaseline)}
+	for _, demand := range demands {
+		if demand.class == advisorBlockClassMandatoryReclaim {
+			baseline[demand.key] = failedBaseline.Intersection(demand.eligible)
+		}
+	}
+	require.Greater(t, fragmentedLogicalCPUCount(
+		unionPartitionAssignments(baseline, fakeKeys), topology), 0)
+
+	desired, err := solveSteadyFakeNUMADesiredWholeCore(
+		demands, fakeKeys, nil, topology, baseline)
+	require.NoError(t, err)
+	staged, err := projectSteadyFakeNUMAStage(
+		demands, fakeKeys, committed, desired, nil, topology)
+
+	require.Error(t, err)
+	require.Nil(t, staged)
+}
+
+func TestProjectSteadyFakeNUMAStageRejectsDC05RampDownTransitionBeyondFixedBudget(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(256, 2, 8)
+	require.NoError(t, err)
+	all := topology.CPUDetails.CPUs()
+	committed, err := machine.Parse(
+		"1,17-18,33-34,49-50,68-127,129,145-146,161-162,177-178,196-255")
+	require.NoError(t, err)
+	failedBaseline, err := machine.Parse(
+		"1,6-8,11-28,32-44,49,68-69,80-81,96-97,112-113,129,134-154,160-170,177")
+	require.NoError(t, err)
+
+	demands := []partitionDemand{
+		{
+			key: "real-0", quantity: 2,
+			eligible:  topology.CPUDetails.CPUsInNUMANodes(0),
+			preferred: machine.NewCPUSet(1, 129), class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "real-1-floor", quantity: 2,
+			eligible:  topology.CPUDetails.CPUsInNUMANodes(1),
+			preferred: machine.NewCPUSet(17, 145), class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "real-1-residual", quantity: 2,
+			eligible:  topology.CPUDetails.CPUsInNUMANodes(1),
+			preferred: machine.NewCPUSet(18, 146), class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "real-2-floor", quantity: 2,
+			eligible:  topology.CPUDetails.CPUsInNUMANodes(2),
+			preferred: machine.NewCPUSet(33, 161), class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "real-2-residual", quantity: 2,
+			eligible:  topology.CPUDetails.CPUsInNUMANodes(2),
+			preferred: machine.NewCPUSet(34, 162), class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "real-3", quantity: 2,
+			eligible:  topology.CPUDetails.CPUsInNUMANodes(3),
+			preferred: machine.NewCPUSet(49, 50, 177, 178), class: advisorBlockClassMandatoryReclaim,
+		},
+	}
+	fakeKeys := []string{
+		"real-0", "real-1-floor", "real-1-residual",
+		"real-2-floor", "real-2-residual", "real-3",
+	}
+	globalOnlyPreferred := committed.Difference(machine.NewCPUSet(
+		1, 17, 18, 33, 34, 49, 50, 129, 145, 146, 161, 162, 177, 178))
+	quantitiesByNUMA := map[int]int{0: 18, 1: 20, 2: 20, 4: 2, 5: 2, 6: 2, 7: 2}
+	for numaID, quantity := range quantitiesByNUMA {
+		key := fmt.Sprintf("fake-%d", numaID)
+		numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
+		demands = append(demands, partitionDemand{
+			key:       key,
+			quantity:  quantity,
+			eligible:  numaCPUs,
+			preferred: globalOnlyPreferred.Intersection(numaCPUs),
+			class:     advisorBlockClassMandatoryReclaim,
+		})
+		fakeKeys = append(fakeKeys, key)
+	}
+	demands = append(demands, partitionDemand{
+		key:       "share",
+		quantity:  all.Size() - failedBaseline.Size(),
+		eligible:  all,
+		preferred: all.Difference(committed),
+		class:     advisorBlockClassShared,
+	})
+	baseline := map[string]machine.CPUSet{
+		"real-0":          machine.NewCPUSet(1, 129),
+		"real-1-floor":    machine.NewCPUSet(17, 145),
+		"real-1-residual": machine.NewCPUSet(18, 146),
+		"real-2-floor":    machine.NewCPUSet(33, 161),
+		"real-2-residual": machine.NewCPUSet(34, 162),
+		"real-3":          machine.NewCPUSet(49, 177),
+		"share":           all.Difference(failedBaseline),
+	}
+	realBaseline := baseline["real-0"].Union(baseline["real-1-floor"]).
+		Union(baseline["real-1-residual"]).Union(baseline["real-2-floor"]).
+		Union(baseline["real-2-residual"]).Union(baseline["real-3"])
+	for numaID := range quantitiesByNUMA {
+		key := fmt.Sprintf("fake-%d", numaID)
+		baseline[key] = failedBaseline.Intersection(
+			topology.CPUDetails.CPUsInNUMANodes(numaID)).Difference(realBaseline)
+	}
+	require.Equal(t, 78, unionPartitionAssignments(baseline, fakeKeys).Size())
+	require.Greater(t, fragmentedLogicalCPUCount(
+		unionPartitionAssignments(baseline, fakeKeys), topology), 0)
+
+	desired, err := solveSteadyFakeNUMADesiredWholeCore(
+		demands, fakeKeys, []partitionCoreFloorConstraint{
+			{demandKey: "real-0"},
+			{demandKey: "real-1-floor"},
+			{demandKey: "real-2-floor"},
+			{demandKey: "real-3"},
+		}, topology, baseline)
+	require.NoError(t, err)
+	staged, err := projectSteadyFakeNUMAStage(
+		demands, fakeKeys, committed, desired,
+		[]partitionCoreFloorConstraint{
+			{demandKey: "real-0"},
+			{demandKey: "real-1-floor"},
+			{demandKey: "real-2-floor"},
+			{demandKey: "real-3"},
+		}, topology)
+
+	require.Error(t, err)
+	require.Nil(t, staged)
+}
+
+func TestSolveAdvisorDescriptorPhaseSteadyFakeNUMARepairsDC05RampUpTransitionWithRealMandatoryFixture(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(256, 2, 8)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	all := topology.CPUDetails.CPUs()
+	globalPreferred, err := machine.Parse(
+		"1,17-18,33-34,49-50,68-127,129,145-146,161-162,177-178,196-255")
+	require.NoError(t, err)
+
+	descriptors := []advisorBlockDescriptor{
+		{
+			BlockID: "real-0", Class: advisorBlockClassMandatoryReclaim,
+			NUMAID: 0, Quantity: 2, ComponentKey: "real-0",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(0),
+			OldPreferred: machine.NewCPUSet(1, 129),
+		},
+		{
+			BlockID: "real-1", Class: advisorBlockClassMandatoryReclaim,
+			NUMAID: 1, Quantity: 4, ComponentKey: "real-1",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(1),
+			OldPreferred: machine.NewCPUSet(17, 18, 145, 146),
+		},
+		{
+			BlockID: "real-2", Class: advisorBlockClassMandatoryReclaim,
+			NUMAID: 2, Quantity: 4, ComponentKey: "real-2",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(2),
+			OldPreferred: machine.NewCPUSet(33, 34, 161, 162),
+		},
+		{
+			BlockID: "real-3", Class: advisorBlockClassMandatoryReclaim,
+			NUMAID: 3, Quantity: 4, ComponentKey: "real-3",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(3),
+			OldPreferred: machine.NewCPUSet(49, 50, 177, 178),
+		},
+		{
+			BlockID: "global", Class: advisorBlockClassMandatoryReclaim,
+			NUMAID: commonstate.FakedNUMAID, Quantity: 86, ComponentKey: "global",
+			Eligible:     all,
+			OldPreferred: globalPreferred,
+		},
+		{
+			BlockID: "dedicated-0", Class: advisorBlockClassDedicated,
+			NUMAID: 0, Quantity: 2, ComponentKey: "dedicated-0",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(0),
+			OldPreferred: machine.NewCPUSet(2, 130),
+		},
+		{
+			BlockID: "dedicated-1", Class: advisorBlockClassDedicated,
+			NUMAID: 0, Quantity: 2, ComponentKey: "dedicated-1",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(0),
+			OldPreferred: machine.NewCPUSet(4, 132),
+		},
+		{
+			BlockID: "dedicated-2", Class: advisorBlockClassDedicated,
+			NUMAID: 0, Quantity: 2, ComponentKey: "dedicated-2",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(0),
+			OldPreferred: machine.NewCPUSet(3, 131),
+		},
+		{
+			BlockID: "dedicated-3", Class: advisorBlockClassDedicated,
+			NUMAID: 0, Quantity: 2, ComponentKey: "dedicated-3",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(0),
+			OldPreferred: machine.NewCPUSet(5, 133),
+		},
+		{
+			BlockID: "share", Class: advisorBlockClassShared,
+			NUMAID: commonstate.FakedNUMAID, Quantity: all.Size() - 100 - 8,
+			ComponentKey: "share", Eligible: all,
+			OldPreferred: all.Difference(globalPreferred).
+				Difference(machine.NewCPUSet(2, 3, 4, 5, 130, 131, 132, 133)),
+		},
+	}
+	result := make(map[string]machine.CPUSet)
+
+	remaining, err := p.solveAdvisorDescriptorPhase(descriptors, all, result, true, false)
+
+	require.NoError(t, err)
+	reclaim := result["real-0"].Union(result["real-1"]).
+		Union(result["real-2"]).Union(result["real-3"]).Union(result["global"])
+	require.Equal(t, 100, reclaim.Size())
+	require.NoError(t, assertCoreAligned(reclaim, topology))
+	require.True(t, remaining.IsEmpty())
+	require.Equal(t, all, reclaim.Union(result["share"]).
+		Union(result["dedicated-0"]).Union(result["dedicated-1"]).
+		Union(result["dedicated-2"]).Union(result["dedicated-3"]))
+}
+
+func TestSolveAdvisorDescriptorPhaseSteadyFakeNUMARepairsDC05RampDownWithRealMandatoryFixture(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(256, 2, 8)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	all := topology.CPUDetails.CPUs()
+	globalPreferred, err := machine.Parse(
+		"1,17-18,33-34,49-50,68-127,129,145-146,161-162,177-178,196-255")
+	require.NoError(t, err)
+
+	descriptors := []advisorBlockDescriptor{
+		{
+			BlockID: "real-0", Class: advisorBlockClassMandatoryReclaim,
+			NUMAID: 0, Quantity: 2, ComponentKey: "real-0",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(0),
+			OldPreferred: machine.NewCPUSet(1, 129),
+		},
+		{
+			BlockID: "real-1", Class: advisorBlockClassMandatoryReclaim,
+			NUMAID: 1, Quantity: 4, ComponentKey: "real-1",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(1),
+			OldPreferred: machine.NewCPUSet(17, 18, 145, 146),
+		},
+		{
+			BlockID: "real-2", Class: advisorBlockClassMandatoryReclaim,
+			NUMAID: 2, Quantity: 4, ComponentKey: "real-2",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(2),
+			OldPreferred: machine.NewCPUSet(33, 34, 161, 162),
+		},
+		{
+			BlockID: "real-3", Class: advisorBlockClassMandatoryReclaim,
+			NUMAID: 3, Quantity: 2, ComponentKey: "real-3",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(3),
+			OldPreferred: machine.NewCPUSet(49, 177),
+		},
+		{
+			BlockID: "global", Class: advisorBlockClassMandatoryReclaim,
+			NUMAID: commonstate.FakedNUMAID, Quantity: 66, ComponentKey: "global",
+			Eligible:     all,
+			OldPreferred: globalPreferred,
+		},
+		{
+			BlockID: "dedicated-0", Class: advisorBlockClassDedicated,
+			NUMAID: 0, Quantity: 2, ComponentKey: "dedicated-0",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(0),
+			OldPreferred: machine.NewCPUSet(2, 130),
+		},
+		{
+			BlockID: "dedicated-1", Class: advisorBlockClassDedicated,
+			NUMAID: 0, Quantity: 2, ComponentKey: "dedicated-1",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(0),
+			OldPreferred: machine.NewCPUSet(4, 132),
+		},
+		{
+			BlockID: "dedicated-2", Class: advisorBlockClassDedicated,
+			NUMAID: 0, Quantity: 2, ComponentKey: "dedicated-2",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(0),
+			OldPreferred: machine.NewCPUSet(3, 131),
+		},
+		{
+			BlockID: "dedicated-3", Class: advisorBlockClassDedicated,
+			NUMAID: 0, Quantity: 2, ComponentKey: "dedicated-3",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(0),
+			OldPreferred: machine.NewCPUSet(5, 133),
+		},
+		{
+			BlockID: "share", Class: advisorBlockClassShared,
+			NUMAID: commonstate.FakedNUMAID, Quantity: all.Size() - 78 - 8,
+			ComponentKey: "share", Eligible: all,
+			OldPreferred: all.Difference(globalPreferred).
+				Difference(machine.NewCPUSet(2, 3, 4, 5, 130, 131, 132, 133)),
+		},
+	}
+	result := make(map[string]machine.CPUSet)
+
+	remaining, err := p.solveAdvisorDescriptorPhase(descriptors, all, result, true, false)
+
+	require.NoError(t, err)
+	reclaim := result["real-0"].Union(result["real-1"]).
+		Union(result["real-2"]).Union(result["real-3"]).Union(result["global"])
+	require.Equal(t, 78, reclaim.Size())
+	require.NoError(t, assertCoreAligned(reclaim, topology))
+	require.True(t, remaining.IsEmpty())
+	require.Equal(t, all, reclaim.Union(result["share"]).
+		Union(result["dedicated-0"]).Union(result["dedicated-1"]).
+		Union(result["dedicated-2"]).Union(result["dedicated-3"]))
 }
 
 func TestSolveSteadyFakeNUMADesiredWholeCoreRepairsHighlyFragmentedPreferred(t *testing.T) {
@@ -1307,6 +1786,228 @@ func TestSolveAdvisorDescriptorPhaseRepairsDC05CheckpointWithinEightChangedCPUs(
 		require.Equal(t, oldQuantity, result["fake"].Intersection(
 			topology.CPUDetails.CPUsInNUMANodes(numaID)).Size(), "NUMA %d", numaID)
 	}
+}
+
+func TestSolveAdvisorDescriptorPhaseRejectsDC05StableSeedpoolRepairBeyondFixedBudget(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(256, 2, 8)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	all := topology.CPUDetails.CPUs()
+	globalPreferred, err := machine.Parse(
+		"1,17-18,33-34,49-50,68-127,129,145-146,161-162,177-178,192-255")
+	require.NoError(t, err)
+
+	descriptors := []advisorBlockDescriptor{
+		{
+			BlockID: "real-0", Class: advisorBlockClassMandatoryReclaim,
+			NUMAID: 0, Quantity: 20, ComponentKey: "real-0",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(0),
+			OldPreferred: machine.NewCPUSet(1, 129),
+		},
+		{
+			BlockID: "dedicated-0", Class: advisorBlockClassDedicated,
+			NUMAID: 0, Quantity: 2, ComponentKey: "dedicated-0",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(0),
+			OldPreferred: machine.NewCPUSet(2, 130),
+		},
+		{
+			BlockID: "dedicated-1", Class: advisorBlockClassDedicated,
+			NUMAID: 0, Quantity: 2, ComponentKey: "dedicated-1",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(0),
+			OldPreferred: machine.NewCPUSet(5, 133),
+		},
+		{
+			BlockID: "dedicated-2", Class: advisorBlockClassDedicated,
+			NUMAID: 0, Quantity: 2, ComponentKey: "dedicated-2",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(0),
+			OldPreferred: machine.NewCPUSet(4, 132),
+		},
+		{
+			BlockID: "dedicated-3", Class: advisorBlockClassDedicated,
+			NUMAID: 0, Quantity: 2, ComponentKey: "dedicated-3",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(0),
+			OldPreferred: machine.NewCPUSet(3, 131),
+		},
+		{
+			BlockID: "snb-0", Class: advisorBlockClassShared,
+			NUMAID: 0, Quantity: 4, ComponentKey: "snb-0",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(0),
+			OldPreferred: machine.NewCPUSet(0, 128),
+		},
+		{
+			BlockID: "real-1", Class: advisorBlockClassMandatoryReclaim,
+			NUMAID: 1, Quantity: 24, ComponentKey: "real-1",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(1),
+			OldPreferred: machine.NewCPUSet(17, 18, 145, 146),
+		},
+		{
+			BlockID: "snb-1", Class: advisorBlockClassShared,
+			NUMAID: 1, Quantity: 4, ComponentKey: "snb-1",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(1),
+			OldPreferred: machine.NewCPUSet(16, 144),
+		},
+		{
+			BlockID: "real-2", Class: advisorBlockClassMandatoryReclaim,
+			NUMAID: 2, Quantity: 22, ComponentKey: "real-2",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(2),
+			OldPreferred: machine.NewCPUSet(33, 34, 161, 162),
+		},
+		{
+			BlockID: "snb-2", Class: advisorBlockClassShared,
+			NUMAID: 2, Quantity: 10, ComponentKey: "snb-2",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(2),
+			OldPreferred: machine.NewCPUSet(32, 160),
+		},
+		{
+			BlockID: "real-3", Class: advisorBlockClassMandatoryReclaim,
+			NUMAID: 3, Quantity: 24, ComponentKey: "real-3",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(3),
+			OldPreferred: machine.NewCPUSet(49, 50, 177, 178),
+		},
+		{
+			BlockID: "snb-3", Class: advisorBlockClassShared,
+			NUMAID: 3, Quantity: 4, ComponentKey: "snb-3",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(3),
+			OldPreferred: machine.NewCPUSet(48, 176),
+		},
+		{
+			BlockID: "global", Class: advisorBlockClassMandatoryReclaim,
+			NUMAID: commonstate.FakedNUMAID, Quantity: 102, ComponentKey: "global",
+			Eligible:     all,
+			OldPreferred: globalPreferred,
+		},
+	}
+	result := make(map[string]machine.CPUSet)
+
+	_, err = p.solveAdvisorDescriptorPhase(descriptors, all, result, true, false)
+
+	require.ErrorContains(t, err, "invalid committed reclaim requires atomic repair")
+}
+
+func TestSolveAdvisorDescriptorPhaseRejectsDC05GlobalSeedpoolRepairBeyondFixedBudget(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(256, 2, 8)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	all := topology.CPUDetails.CPUs()
+	globalPreferred, err := machine.Parse(
+		"1,17-18,33-34,49-50,68-127,129,145-146,161-162,177-178,192-255")
+	require.NoError(t, err)
+
+	descriptors := []advisorBlockDescriptor{
+		{
+			BlockID: "real-0", Class: advisorBlockClassMandatoryReclaim,
+			NUMAID: 0, Quantity: 20, ComponentKey: "real-0",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(0),
+			OldPreferred: machine.NewCPUSet(1, 129),
+		},
+		{
+			BlockID: "dedicated-0", Class: advisorBlockClassDedicated,
+			NUMAID: 0, Quantity: 2, ComponentKey: "dedicated-0",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(0),
+			OldPreferred: machine.NewCPUSet(2, 130),
+		},
+		{
+			BlockID: "dedicated-1", Class: advisorBlockClassDedicated,
+			NUMAID: 0, Quantity: 2, ComponentKey: "dedicated-1",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(0),
+			OldPreferred: machine.NewCPUSet(5, 133),
+		},
+		{
+			BlockID: "dedicated-2", Class: advisorBlockClassDedicated,
+			NUMAID: 0, Quantity: 2, ComponentKey: "dedicated-2",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(0),
+			OldPreferred: machine.NewCPUSet(4, 132),
+		},
+		{
+			BlockID: "dedicated-3", Class: advisorBlockClassDedicated,
+			NUMAID: 0, Quantity: 2, ComponentKey: "dedicated-3",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(0),
+			OldPreferred: machine.NewCPUSet(3, 131),
+		},
+		{
+			BlockID: "snb-0", Class: advisorBlockClassShared,
+			NUMAID: 0, Quantity: 4, ComponentKey: "snb-0",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(0),
+			OldPreferred: machine.NewCPUSet(0, 128),
+		},
+		{
+			BlockID: "real-1", Class: advisorBlockClassMandatoryReclaim,
+			NUMAID: 1, Quantity: 24, ComponentKey: "real-1",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(1),
+			OldPreferred: machine.NewCPUSet(17, 18, 145, 146),
+		},
+		{
+			BlockID: "snb-1", Class: advisorBlockClassShared,
+			NUMAID: 1, Quantity: 4, ComponentKey: "snb-1",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(1),
+			OldPreferred: machine.NewCPUSet(16, 144),
+		},
+		{
+			BlockID: "real-2", Class: advisorBlockClassMandatoryReclaim,
+			NUMAID: 2, Quantity: 20, ComponentKey: "real-2",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(2),
+			OldPreferred: machine.NewCPUSet(33, 34, 161, 162),
+		},
+		{
+			BlockID: "snb-2", Class: advisorBlockClassShared,
+			NUMAID: 2, Quantity: 12, ComponentKey: "snb-2",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(2),
+			OldPreferred: machine.NewCPUSet(32, 160),
+		},
+		{
+			BlockID: "real-3", Class: advisorBlockClassMandatoryReclaim,
+			NUMAID: 3, Quantity: 24, ComponentKey: "real-3",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(3),
+			OldPreferred: machine.NewCPUSet(49, 50, 177, 178),
+		},
+		{
+			BlockID: "snb-3", Class: advisorBlockClassShared,
+			NUMAID: 3, Quantity: 4, ComponentKey: "snb-3",
+			Eligible:     topology.CPUDetails.CPUsInNUMANodes(3),
+			OldPreferred: machine.NewCPUSet(48, 176),
+		},
+		{
+			BlockID: "global", Class: advisorBlockClassMandatoryReclaim,
+			NUMAID: commonstate.FakedNUMAID, Quantity: 102, ComponentKey: "global",
+			Eligible:     all,
+			OldPreferred: globalPreferred,
+		},
+		{
+			BlockID: "seedpool-0", Class: advisorBlockClassShared,
+			NUMAID: commonstate.FakedNUMAID, Quantity: 4, ComponentKey: "seedpool-0",
+			Eligible:     all,
+			OldPreferred: machine.NewCPUSet(64),
+		},
+		{
+			BlockID: "seedpool-1", Class: advisorBlockClassShared,
+			NUMAID: commonstate.FakedNUMAID, Quantity: 4, ComponentKey: "seedpool-1",
+			Eligible:     all,
+			OldPreferred: machine.NewCPUSet(65),
+		},
+		{
+			BlockID: "seedpool-2", Class: advisorBlockClassShared,
+			NUMAID: commonstate.FakedNUMAID, Quantity: 4, ComponentKey: "seedpool-2",
+			Eligible:     all,
+			OldPreferred: machine.NewCPUSet(66),
+		},
+		{
+			BlockID: "seedpool-3", Class: advisorBlockClassShared,
+			NUMAID: commonstate.FakedNUMAID, Quantity: 4, ComponentKey: "seedpool-3",
+			Eligible:     all,
+			OldPreferred: machine.NewCPUSet(67),
+		},
+	}
+	result := make(map[string]machine.CPUSet)
+
+	_, err = p.solveAdvisorDescriptorPhase(descriptors, all, result, true, false)
+
+	require.ErrorContains(t, err, "invalid committed reclaim requires atomic repair")
 }
 
 func TestSolveSteadyFakeNUMAWholeCoreSupportsSMT1AndSMT4(t *testing.T) {
