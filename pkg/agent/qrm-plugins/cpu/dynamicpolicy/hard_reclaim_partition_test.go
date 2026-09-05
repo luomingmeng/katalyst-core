@@ -467,6 +467,33 @@ func TestPlanHardReclaimPartitionFrontierAvoidsGreedyDonorDeadEnd(t *testing.T) 
 	requireCoreAligned(t, topology, plan.reclaim)
 }
 
+func TestCoreAlignmentDistinguishesReusedCoreIDsAcrossNUMAs(t *testing.T) {
+	t.Parallel()
+
+	topology := &machine.CPUTopology{
+		NumCPUs:      4,
+		NumCores:     2,
+		NumSockets:   2,
+		NumNUMANodes: 2,
+		CPUDetails: machine.CPUDetails{
+			0: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
+			1: {NUMANodeID: 1, SocketID: 1, CoreID: 0},
+			2: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
+			3: {NUMANodeID: 1, SocketID: 1, CoreID: 0},
+		},
+	}
+
+	completed, err := completeCoresForCPUSet(topology, machine.NewCPUSet(0))
+	require.NoError(t, err)
+	require.True(t, completed.Equals(machine.NewCPUSet(0, 2)), "completed=%s", completed)
+
+	candidates := coreAlignedCandidates(
+		topology, topology.CPUDetails.CPUs(), machine.NewCPUSet())
+	require.Len(t, candidates, 2)
+	require.NoError(t, assertCoreAligned(machine.NewCPUSet(0, 2), topology))
+	require.ErrorContains(t, assertCoreAligned(machine.NewCPUSet(0, 1), topology), "not core-aligned")
+}
+
 func TestSelectHardReclaimCoresReportsFrontierTruncation(t *testing.T) {
 	t.Parallel()
 

@@ -156,6 +156,41 @@ func TestCommitPendingCPUPartitionValidatesResidualBackfillAfterHooks(t *testing
 			AllocationResult.Equals(machine.NewCPUSet(2, 3)))
 	})
 
+	t.Run("accepts share residual excluding ramp-up shared allocation", func(t *testing.T) {
+		p, err := newResidualBackfillPrecommitTestPolicy(t)
+		require.NoError(t, err)
+		require.False(t, p.hardBulkheadPartitionValidationEnabled())
+
+		candidate := residualBackfillPrecommitEntries(
+			machine.NewCPUSet(3),
+			machine.NewCPUSet(4, 5, 6, 7),
+		)
+		candidate["ramp-up-shared-pod"] = state.ContainerEntries{
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "ramp-up-shared-pod",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.EmptyOwnerPoolName,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+				},
+				RampUp:                   true,
+				AllocationResult:         machine.NewCPUSet(2),
+				TopologyAwareAssignments: map[int]machine.CPUSet{0: machine.NewCPUSet(2)},
+			},
+		}
+
+		committed, _, err := p.commitPendingCPUPartition(pendingCPUPartition{
+			expectedRevision: p.state.GetRevision(),
+			entries:          candidate,
+			persist:          false,
+			source:           "residual ramp-up test",
+		})
+		require.NoError(t, err)
+		require.True(t, committed[commonstate.PoolNameShare][commonstate.FakedContainerName].
+			AllocationResult.Equals(machine.NewCPUSet(4, 5, 6, 7)))
+		require.True(t, committed["ramp-up-shared-pod"]["main"].RampUp)
+	})
+
 	t.Run("rejects share topology assignments inconsistent with cpuset", func(t *testing.T) {
 		p, err := newResidualBackfillPrecommitTestPolicy(t)
 		require.NoError(t, err)
@@ -251,6 +286,16 @@ func TestValidateSteadyReclaimPrecommitInvariant(t *testing.T) {
 	planned := coresInNUMA(topology, 0, 2, 4).
 		Union(coresInNUMA(topology, 1, 0, 2))
 
+	t.Run("accepts planner migration above fixed limit when hooks preserve plan", func(t *testing.T) {
+		largePlan := coresInNUMA(topology, 1, 0, 4)
+		require.Greater(t,
+			steadyFakeNUMAMigrationChurn(committed, largePlan),
+			steadyFakeNUMAMaxMigratedCPUs,
+		)
+		require.NoError(t, validateSteadyReclaimPrecommitInvariant(
+			largePlan, largePlan, topology))
+	})
+
 	for _, tc := range []struct {
 		name      string
 		candidate machine.CPUSet
@@ -273,18 +318,41 @@ func TestValidateSteadyReclaimPrecommitInvariant(t *testing.T) {
 			want:      "NUMA distribution changed",
 		},
 		{
-			name:      "committed churn exceeds limit",
-			candidate: coresInNUMA(topology, 0, 4, 8),
-			want:      "migration churn",
+			name: "hook churn exceeds limit",
+			candidate: coresInNUMA(topology, 0, 4, 6).
+				Union(coresInNUMA(topology, 1, 2, 4)),
+			want: "migration churn",
 		},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			err := validateSteadyReclaimPrecommitInvariant(
-				planned, tc.candidate, committed, topology)
+				planned, tc.candidate, topology)
 			require.ErrorContains(t, err, tc.want)
 		})
 	}
+}
+
+func TestCommitPendingAdvisorStateRejectsFragmentedReclaimInDisjointMode(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	revision := p.state.GetRevision()
+	core := coresInNUMA(p.machineInfo.CPUTopology, 0, 0, 1)
+	fragmentedReclaim := machine.NewCPUSet(core.ToSliceInt()[0])
+	dedicated := coresInNUMA(p.machineInfo.CPUTopology, 0, 1, 2)
+
+	err := p.commitPendingAdvisorState(&pendingAdvisorState{
+		preCommitRevision: revision,
+		entries:           precommitPartitionEntries(fragmentedReclaim, dedicated),
+		allowOverlap:      false,
+		disableDedicated:  true,
+	})
+
+	require.ErrorContains(t, err, "reclaim set")
+	require.ErrorContains(t, err, "is not core-aligned")
+	require.Equal(t, revision, p.state.GetRevision(),
+		"fragmented reclaim must be rejected before the revision CAS")
 }
 
 func TestCommitPendingCPUPartitionRejectsInvalidOverrideAndDeletionFallback(t *testing.T) {

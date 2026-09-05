@@ -182,9 +182,9 @@ func TestGenerateBlockCPUSetOwnerUnionsStableAcrossRandomMapOrderAndBlockIDRotat
 		commonstate.FakedContainerName, "")
 	wantOwners := map[string]machine.CPUSet{
 		dedicatedOwner: machine.NewCPUSet(0, 1),
-		reclaimOwner:   machine.NewCPUSet(2, 3),
+		reclaimOwner:   coresInNUMA(p.machineInfo.CPUTopology, 0, 2, 3),
 	}
-	wantUnion := machine.NewCPUSet(0, 1, 2, 3)
+	wantUnion := wantOwners[dedicatedOwner].Union(wantOwners[reclaimOwner])
 	for seed := int64(0); seed < 1000; seed++ {
 		aliases := []advisorBlockTestAlias{
 			{

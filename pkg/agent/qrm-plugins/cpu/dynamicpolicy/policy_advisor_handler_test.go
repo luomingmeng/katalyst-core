@@ -676,7 +676,7 @@ func TestGenerateBlockCPUSetDisjointPlannerUsesJointRPEligibility(t *testing.T) 
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 	require.NoError(t, err)
 
-	legacyOverlap := machine.NewCPUSet(0, 1)
+	legacyOverlap := coresInNUMA(topology, 0, 0, 1)
 	policy.state.SetPodEntries(state.PodEntries{
 		"pod-dedicated": {
 			"main": &state.AllocationInfo{
@@ -760,9 +760,8 @@ func TestGenerateBlockCPUSetDisjointPlannerJointlySolvesRemainingShared(t *testi
 	require.NoError(t, err)
 
 	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
-	numa0CPUs := numa0.ToSliceInt()
-	require.Len(t, numa0CPUs, 8)
-	pinned := machine.NewCPUSet(numa0CPUs[:4]...)
+	pinned := coresInNUMA(topology, 0, 0, 2)
+	require.Equal(t, 4, pinned.Size())
 	unpinned := numa0.Difference(pinned)
 	machineState := policy.state.GetMachineState()
 	machineState[0].ResourcePackageStates = map[string]*state.ResourcePackageState{
@@ -971,8 +970,8 @@ func TestExclusiveDisjointPartitionLifecycleAndFlagTransitions(t *testing.T) {
 	policy.advisorPostCommitCheckpointDir = checkpointDir
 
 	wholeNUMA := topology.CPUDetails.CPUsInNUMANodes(0)
-	wholeNUMACPUs := wholeNUMA.ToSliceInt()
-	initialDedicated := machine.NewCPUSet(wholeNUMACPUs[:wholeNUMA.Size()/2]...)
+	initialDedicated := coresInNUMA(
+		topology, 0, 0, wholeNUMA.Size()/(2*topology.CPUsPerCore()))
 	policy.state.SetPodEntries(state.PodEntries{
 		"pod-dedicated": {
 			"main": &state.AllocationInfo{
@@ -1226,21 +1225,21 @@ func TestDynamicPolicyApplyBlocksUsesNegotiatedReclaimPlanWhenFreeCPUsCannotMeet
 					OwnerPoolName: commonstate.PoolNameDedicated,
 					QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
 				},
-				AllocationResult: machine.NewCPUSet(1, 2, 3, 4, 5, 6, 7),
+				AllocationResult: machine.NewCPUSet(1, 2, 3, 5, 6, 7),
 				RequestQuantity:  6,
 			},
 		},
 		commonstate.PoolNameReclaim: {
 			commonstate.FakedContainerName: &state.AllocationInfo{
 				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
-				AllocationResult: machine.NewCPUSet(0),
+				AllocationResult: machine.NewCPUSet(0, 4),
 			},
 		},
 	}
 	policy.state.SetPodEntries(entries, false)
 	policy.state.SetMachineState(state.NUMANodeMap{
 		0: {
-			DefaultCPUSet: machine.NewCPUSet(0),
+			DefaultCPUSet: machine.NewCPUSet(0, 4),
 			PodEntries:    entries,
 		},
 	}, false)
@@ -1267,12 +1266,12 @@ func TestDynamicPolicyApplyBlocksUsesNegotiatedReclaimPlanWhenFreeCPUsCannotMeet
 	}
 
 	pending, err := policy.applyBlocks(advisorapi.BlockCPUSet{
-		"dedicated": machine.NewCPUSet(1, 2, 3, 4, 5, 6),
-		"reclaim":   machine.NewCPUSet(0, 7),
+		"dedicated": machine.NewCPUSet(1, 2, 3, 5, 6, 7),
+		"reclaim":   machine.NewCPUSet(0, 4),
 	}, resp, false, false)
 	require.NoError(t, err)
 	require.True(t, pending.entries[commonstate.PoolNameReclaim][commonstate.FakedContainerName].
-		AllocationResult.Equals(machine.NewCPUSet(0, 7)))
+		AllocationResult.Equals(machine.NewCPUSet(0, 4)))
 }
 
 func TestDynamicPolicyApplyBlocksMaterializesDefaultShareFromResidual(t *testing.T) {
@@ -1953,7 +1952,7 @@ func TestDynamicPolicyApplyBlocksRematerializesDefaultShareAfterReclaimPadding(t
 		commonstate.PoolNameReclaim: {
 			commonstate.FakedContainerName: {
 				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
-				AllocationResult: machine.NewCPUSet(2, 3, 4, 5, 6, 7),
+				AllocationResult: machine.NewCPUSet(0, 1, 2, 4, 5, 6),
 			},
 		},
 	}, false)
@@ -1989,15 +1988,17 @@ func TestDynamicPolicyApplyBlocksRematerializesDefaultShareAfterReclaimPadding(t
 	}
 
 	pending, err := policy.applyBlocks(advisorapi.BlockCPUSet{
-		"share":   machine.NewCPUSet(0, 1),
-		"reclaim": machine.NewCPUSet(2, 3, 4, 5, 6, 7),
+		"share":   machine.NewCPUSet(3, 7),
+		"reclaim": machine.NewCPUSet(0, 1, 2, 4, 5, 6),
 	}, resp, false, false)
 	require.NoError(t, err)
 	require.NotNil(t, pending)
 
 	share := pending.entries[commonstate.PoolNameShare][commonstate.FakedContainerName].AllocationResult
 	reclaim := pending.entries[commonstate.PoolNameReclaim][commonstate.FakedContainerName].AllocationResult
-	require.Equal(t, 4, share.Size())
+	require.Equal(t, 6, share.Size())
+	require.Equal(t, 2, reclaim.Size())
+	require.NoError(t, assertCoreAligned(reclaim, topology))
 	require.True(t, share.Intersection(reclaim).IsEmpty())
 	require.True(t, share.Union(reclaim).Equals(topology.CPUDetails.CPUs()))
 }
@@ -3087,7 +3088,7 @@ func TestDynamicPolicyApplyBlocksPreservesExplicitDisjointReclaim(t *testing.T) 
 					commonstate.FakedContainerName: {
 						OwnerPoolName: commonstate.PoolNameReclaim,
 						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
-							0: {Blocks: []*advisorapi.Block{{BlockId: "reclaim", Result: 1}}},
+							0: {Blocks: []*advisorapi.Block{{BlockId: "reclaim", Result: 2}}},
 						},
 					},
 				},
@@ -3096,13 +3097,13 @@ func TestDynamicPolicyApplyBlocksPreservesExplicitDisjointReclaim(t *testing.T) 
 	}
 	blocks := advisorapi.BlockCPUSet{
 		"dedicated": machine.NewCPUSet(2),
-		"reclaim":   machine.NewCPUSet(0),
+		"reclaim":   machine.NewCPUSet(0, 4),
 	}
 
 	require.NoError(t, prepareAndCommitAdvisorBlocks(policy, blocks, resp, true))
 	reclaim := policy.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
 	require.NotNil(t, reclaim)
-	require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(0)),
+	require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(0, 4)),
 		"disjoint apply must not revise or fallback-expand planner reclaim, got %s", reclaim.AllocationResult)
 }
 
@@ -3314,8 +3315,8 @@ func TestDynamicPolicyApplyBlocksRejectsStaleFrameWithoutOverwritingDesiredState
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 	require.NoError(t, err)
 
-	oldDedicated := machine.NewCPUSet(0, 1, 2, 3)
-	oldReclaim := machine.NewCPUSet(4, 5, 6, 7)
+	oldDedicated := coresInNUMA(topology, 0, 0, 2)
+	oldReclaim := coresInNUMA(topology, 0, 2, 4)
 	policy.state.SetPodEntries(state.PodEntries{
 		"pod-dedicated": {
 			"main": &state.AllocationInfo{
