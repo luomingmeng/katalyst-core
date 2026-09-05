@@ -73,9 +73,26 @@ func (p *DynamicPolicy) takeByTieredPreferredCPUs(
 	availableCPUs machine.CPUSet,
 	preferredTiers []machine.CPUSet,
 	cpuRequirement int,
+	atomicDonors ...machine.CPUSet,
 ) (machine.CPUSet, machine.CPUSet, error) {
 	remaining := availableCPUs.Clone()
 	taken := machine.NewCPUSet()
+	atomicDonorClosure := machine.NewCPUSet()
+	for _, donor := range atomicDonors {
+		closure, err := completeCoresForCPUSet(p.machineInfo.CPUTopology, donor)
+		if err != nil {
+			return machine.NewCPUSet(), availableCPUs, err
+		}
+		atomicDonorClosure = atomicDonorClosure.Union(closure)
+	}
+	respectsAtomicDonors := func(candidate machine.CPUSet) bool {
+		touched := candidate.Intersection(atomicDonorClosure)
+		if touched.IsEmpty() {
+			return true
+		}
+		closure, err := completeCoresForCPUSet(p.machineInfo.CPUTopology, touched)
+		return err == nil && closure.IsSubsetOf(candidate)
+	}
 
 	if cpuRequirement <= 0 {
 		return taken, remaining, nil
@@ -94,7 +111,7 @@ func (p *DynamicPolicy) takeByTieredPreferredCPUs(
 	// combine or trim candidates.
 	for _, tier := range preferredTiers {
 		candidate := tier.Intersection(remaining)
-		if candidate.Size() == cpuRequirement {
+		if candidate.Size() == cpuRequirement && respectsAtomicDonors(candidate) {
 			return candidate, remaining.Difference(candidate), nil
 		}
 	}
@@ -107,7 +124,7 @@ func (p *DynamicPolicy) takeByTieredPreferredCPUs(
 		preferredDomain = preferredDomain.Union(tier.Intersection(remaining))
 	}
 	selectable := remaining.Clone()
-	if preferredDomain.Size() >= cpuRequirement {
+	if atomicDonorClosure.IsEmpty() && preferredDomain.Size() >= cpuRequirement {
 		selectable = preferredDomain
 	}
 
@@ -121,31 +138,33 @@ func (p *DynamicPolicy) takeByTieredPreferredCPUs(
 	}
 
 	type rankedCandidate struct {
-		cpus   machine.CPUSet
-		numaID int
-		rank   int
-		hits   int
-		id     int
+		cpus    machine.CPUSet
+		numaID  int
+		rank    int
+		hits    int
+		id      int
+		coreKey physicalCoreKey
 	}
 
 	// Build every complete core once. Preferred orphan siblings contribute their
 	// tier rank and are completed from selectable when the source domain allows it.
-	cpusByCore := make(map[int]machine.CPUSet)
+	cpusByCore := make(map[physicalCoreKey]machine.CPUSet)
 	for _, cpu := range selectable.ToSliceInt() {
 		info, ok := topology.CPUDetails[cpu]
 		if !ok {
 			continue
 		}
-		coreCPUs := cpusByCore[info.CoreID]
+		key := physicalCoreKeyForCPU(info)
+		coreCPUs := cpusByCore[key]
 		if !coreCPUs.Initialed {
 			coreCPUs = machine.NewCPUSet()
 		}
 		coreCPUs.Add(cpu)
-		cpusByCore[info.CoreID] = coreCPUs
+		cpusByCore[key] = coreCPUs
 	}
 
 	coreCandidates := make([]rankedCandidate, 0, len(cpusByCore))
-	for coreID, coreCPUs := range cpusByCore {
+	for coreKey, coreCPUs := range cpusByCore {
 		if coreCPUs.Size() != cpusPerCore {
 			continue
 		}
@@ -153,7 +172,7 @@ func (p *DynamicPolicy) takeByTieredPreferredCPUs(
 		rank, hits := preference(coreCPUs)
 		coreCandidates = append(coreCandidates, rankedCandidate{
 			cpus: coreCPUs, numaID: topology.CPUDetails[firstCPU].NUMANodeID,
-			rank: rank, hits: hits, id: coreID,
+			rank: rank, hits: hits, id: coreKey.coreID, coreKey: coreKey,
 		})
 	}
 
@@ -167,6 +186,9 @@ func (p *DynamicPolicy) takeByTieredPreferredCPUs(
 		}
 		if left.hits != right.hits {
 			return left.hits > right.hits
+		}
+		if left.coreKey != right.coreKey {
+			return physicalCoreKeyLess(left.coreKey, right.coreKey)
 		}
 		return left.id < right.id
 	}
@@ -190,6 +212,11 @@ func (p *DynamicPolicy) takeByTieredPreferredCPUs(
 
 	// Fill the exact sub-core tail with the same cumulative NUMA load. NUMA
 	// balance is primary; tier order and logical CPU ID break equal-load ties.
+	// A tail may not take a sibling from an atomic donor core: donor CPUs can
+	// move only through the complete-core loop above.
+	if !atomicDonorClosure.IsEmpty() {
+		selectable = remaining.Difference(atomicDonorClosure)
+	}
 	for taken.Size() < cpuRequirement && !selectable.IsEmpty() {
 		cpuCandidates := make([]rankedCandidate, 0, selectable.Size())
 		for _, cpu := range selectable.ToSliceInt() {
@@ -222,7 +249,9 @@ func (p *DynamicPolicy) takeByTieredPreferredCPUs(
 
 	if taken.Size() < cpuRequirement {
 		return machine.NewCPUSet(), availableCPUs, fmt.Errorf(
-			"take tiered preferred cpus failed: not enough cpus available to satisfy request")
+			"take tiered preferred cpus failed: not enough cpus available to satisfy request: "+
+				"available=%s taken=%s atomic-donor-closure=%s",
+			availableCPUs.String(), taken.String(), atomicDonorClosure.String())
 	}
 
 	return taken, remaining, nil
@@ -330,6 +359,7 @@ func (p *DynamicPolicy) takeCPUsForPoolsInPlaceWithPreferred(
 	poolsCPUSet map[string]machine.CPUSet,
 	availableCPUs machine.CPUSet,
 	preferredCPUsByPool map[string]machine.CPUSet,
+	atomicDonors ...machine.CPUSet,
 ) (machine.CPUSet, error) {
 	originalAvailableCPUSet := availableCPUs.Clone()
 
@@ -364,7 +394,8 @@ func (p *DynamicPolicy) takeCPUsForPoolsInPlaceWithPreferred(
 			preferredTiers = []machine.CPUSet{preferred}
 		}
 
-		cset, remaining, err := p.takeByTieredPreferredCPUs(availableCPUs, preferredTiers, req)
+		cset, remaining, err := p.takeByTieredPreferredCPUs(
+			availableCPUs, preferredTiers, req, atomicDonors...)
 		if err != nil {
 			return originalAvailableCPUSet, fmt.Errorf("take cpu for pool: %s of req: %d failed with error: %v",
 				poolName, req, err)
@@ -386,6 +417,7 @@ func (p *DynamicPolicy) generateProportionalPoolsCPUSetInPlaceWithPreferred(
 	poolsCPUSet map[string]machine.CPUSet,
 	availableCPUs machine.CPUSet,
 	preferredCPUsByPool map[string]machine.CPUSet,
+	atomicDonors ...machine.CPUSet,
 ) (machine.CPUSet, error) {
 	availableSize := availableCPUs.Size()
 
@@ -406,7 +438,7 @@ func (p *DynamicPolicy) generateProportionalPoolsCPUSetInPlaceWithPreferred(
 	}
 
 	return p.takeCPUsForPoolsInPlaceWithPreferred(
-		proportionalPoolsQuantityMap, poolsCPUSet, availableCPUs, preferredCPUsByPool)
+		proportionalPoolsQuantityMap, poolsCPUSet, availableCPUs, preferredCPUsByPool, atomicDonors...)
 }
 
 // takeCPUsForContainersWithPreferred follows the same semantics as takeCPUsForContainers, but
@@ -416,6 +448,7 @@ func (p *DynamicPolicy) takeCPUsForContainersWithPreferred(
 	containersQuantityMap map[string]map[string]int,
 	availableCPUs machine.CPUSet,
 	preferredCPUsByContainer map[string]map[string]machine.CPUSet,
+	atomicDonors ...machine.CPUSet,
 ) (map[string]map[string]machine.CPUSet, machine.CPUSet, error) {
 	containersCPUSet := make(map[string]map[string]machine.CPUSet)
 	clonedAvailableCPUs := availableCPUs.Clone()
@@ -443,7 +476,8 @@ func (p *DynamicPolicy) takeCPUsForContainersWithPreferred(
 				}
 			}
 
-			cset, remaining, err := p.takeByTieredPreferredCPUs(availableCPUs, preferredTiers, quantity)
+			cset, remaining, err := p.takeByTieredPreferredCPUs(
+				availableCPUs, preferredTiers, quantity, atomicDonors...)
 			if err != nil {
 				return nil, clonedAvailableCPUs, fmt.Errorf("take cpu for pod: %s container: %s of req: %d failed with error: %v",
 					podUID, containerName, quantity, err)

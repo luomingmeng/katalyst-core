@@ -24,6 +24,8 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/sets"
 
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -62,6 +64,37 @@ type steadyFakeNUMASearchTracker struct {
 	candidateActions int
 }
 
+type steadyFakeNUMACommittedAssignment struct {
+	blockID      string
+	blockIDs     []string
+	componentKey string
+	class        advisorBlockClass
+	numaID       int
+	cpus         machine.CPUSet
+	eligible     machine.CPUSet
+}
+
+type steadyFakeNUMACommittedSnapshot struct {
+	assignments         []steadyFakeNUMACommittedAssignment
+	rawReclaimAggregate machine.CPUSet
+	reclaim             machine.CPUSet
+}
+
+func (snapshot steadyFakeNUMACommittedSnapshot) clone() steadyFakeNUMACommittedSnapshot {
+	cloned := steadyFakeNUMACommittedSnapshot{
+		assignments:         make([]steadyFakeNUMACommittedAssignment, len(snapshot.assignments)),
+		rawReclaimAggregate: snapshot.rawReclaimAggregate.Clone(),
+		reclaim:             snapshot.reclaim.Clone(),
+	}
+	copy(cloned.assignments, snapshot.assignments)
+	for i := range cloned.assignments {
+		cloned.assignments[i].blockIDs = append([]string(nil), cloned.assignments[i].blockIDs...)
+		cloned.assignments[i].cpus = cloned.assignments[i].cpus.Clone()
+		cloned.assignments[i].eligible = cloned.assignments[i].eligible.Clone()
+	}
+	return cloned
+}
+
 var errSteadyFakeNUMAPinBudgetExhausted = errors.New(
 	"steady fake-NUMA pin assignment budget exhausted")
 var errSteadyFakeNUMASearchBudgetExhausted = errors.New(
@@ -79,7 +112,7 @@ type steadyFakeNUMAPinsForUnionFunc func(
 type steadyFakeNUMAProjectFunc func(
 	demands []partitionDemand,
 	fakeKeys []string,
-	committed machine.CPUSet,
+	committed steadyFakeNUMACommittedSnapshot,
 	desired map[string]machine.CPUSet,
 	floors []partitionCoreFloorConstraint,
 	topology *machine.CPUTopology,
@@ -112,7 +145,7 @@ func solveSteadyFakeNUMAWholeCore(
 func projectSteadyFakeNUMAStage(
 	demands []partitionDemand,
 	fakeKeys []string,
-	committed machine.CPUSet,
+	committed steadyFakeNUMACommittedSnapshot,
 	desired map[string]machine.CPUSet,
 	floors []partitionCoreFloorConstraint,
 	topology *machine.CPUTopology,
@@ -125,7 +158,7 @@ func projectSteadyFakeNUMAStage(
 func projectSteadyFakeNUMAStageWithBudget(
 	demands []partitionDemand,
 	fakeKeys []string,
-	committed machine.CPUSet,
+	committed steadyFakeNUMACommittedSnapshot,
 	desired map[string]machine.CPUSet,
 	floors []partitionCoreFloorConstraint,
 	topology *machine.CPUTopology,
@@ -139,7 +172,7 @@ func projectSteadyFakeNUMAStageWithBudget(
 func projectSteadyFakeNUMAStageWithBudgetAndPins(
 	demands []partitionDemand,
 	fakeKeys []string,
-	committed machine.CPUSet,
+	committed steadyFakeNUMACommittedSnapshot,
 	desired map[string]machine.CPUSet,
 	floors []partitionCoreFloorConstraint,
 	topology *machine.CPUTopology,
@@ -166,21 +199,55 @@ func projectSteadyFakeNUMAStageWithBudgetAndPins(
 	if err := assertCoreAligned(desiredFake, topology); err != nil {
 		return nil, fmt.Errorf("invalid desired steady fake-NUMA assignment: %w", err)
 	}
-	if outside := committed.Difference(topology.CPUDetails.CPUs()); !outside.IsEmpty() {
+	if outside := committed.reclaim.Difference(topology.CPUDetails.CPUs()); !outside.IsEmpty() {
 		return nil, fmt.Errorf(
 			"invalid committed reclaim outside machine topology: %s", outside.String())
 	}
-	if committedErr := validateCommittedSteadyFakeNUMASnapshot(
-		demands, fakeKeys, committed, floors, topology,
-	); committedErr != nil {
-		replacementChurn := steadyFakeNUMAMigrationChurn(committed, desiredFake)
-		if replacementChurn <= steadyFakeNUMAMaxMigratedCPUs {
+	committedErr := validateCommittedSteadyFakeNUMASnapshot(committed, floors, topology)
+	if committedErr != nil {
+		if committed.reclaim.IsEmpty() {
 			return cloneSteadyFakeNUMAAssignments(desired), nil
 		}
-		return nil, fmt.Errorf(
-			"invalid committed reclaim requires atomic repair: %w", committedErr)
+		fakeSet := make(map[string]struct{}, len(fakeKeys))
+		for _, key := range fakeKeys {
+			fakeSet[key] = struct{}{}
+		}
+		repairDemands := append([]partitionDemand(nil), demands...)
+		repairQuantity := 0
+		for i := range repairDemands {
+			if _, fake := fakeSet[repairDemands[i].key]; !fake {
+				continue
+			}
+			preferred := committed.reclaim.Intersection(repairDemands[i].eligible)
+			repairDemands[i].quantity = preferred.Size()
+			repairDemands[i].preferred = preferred
+			repairQuantity += preferred.Size()
+		}
+		if repairQuantity == committed.reclaim.Size() {
+			baseline, solveErr := solveDisjointPartitionsWithCoreFloors(
+				repairDemands, floors, topology)
+			if solveErr == nil {
+				repair, repairErr := solveSteadyFakeNUMADesiredWholeCore(
+					repairDemands, fakeKeys, floors, topology, baseline)
+				if repairErr == nil &&
+					steadyFakeNUMAMigrationChurn(
+						committed.reclaim, unionPartitionAssignments(repair, fakeKeys),
+					) <= steadyFakeNUMAMaxMigratedCPUs {
+					return repair, nil
+				}
+			}
+		}
+		return cloneSteadyFakeNUMAAssignments(desired), nil
 	}
-	if steadyFakeNUMAMigrationChurn(committed, desiredFake) <= steadyFakeNUMAMaxMigratedCPUs {
+	migrationLimit := steadyFakeNUMAMaxMigratedCPUs
+	if steadyFakeNUMAMigrationChurn(committed.reclaim, desiredFake) <= migrationLimit {
+		general.InfoS("steady fake NUMA migration reaches frozen target",
+			"currentCPUSet", committed.reclaim.String(),
+			"frozenTargetCPUSet", desiredFake.String(),
+			"stageCPUSet", desiredFake.String(),
+			"currentDistance", steadyFakeNUMAMigrationChurn(committed.reclaim, desiredFake),
+			"nextDistance", 0,
+			"stageChurn", steadyFakeNUMAMigrationChurn(committed.reclaim, desiredFake))
 		return cloneSteadyFakeNUMAAssignments(desired), nil
 	}
 
@@ -201,19 +268,19 @@ func projectSteadyFakeNUMAStageWithBudgetAndPins(
 		}
 	}
 	desiredOther := unionAssignmentsExcept(desired, fakeKeys)
-	currentOnlySet := committed.Difference(desiredFake)
-	desiredOnlySet := desiredFake.Difference(committed)
+	currentOnlySet := committed.reclaim.Difference(desiredFake)
+	desiredOnlySet := desiredFake.Difference(committed.reclaim)
 	currentOnly := steadyFakeNUMACoreSetsByPreference(
 		currentOnlySet, currentOnlySet.Difference(desiredOther), topology)
 	desiredOnly := steadyFakeNUMACoreSetsByPreference(
 		desiredOnlySet, desiredOnlySet.Difference(donorPreferred), topology)
-	common := committed.Intersection(desiredFake)
-	if len(currentOnly)*cpusPerCore != committed.Difference(desiredFake).Size() ||
-		len(desiredOnly)*cpusPerCore != desiredFake.Difference(committed).Size() {
+	common := committed.reclaim.Intersection(desiredFake)
+	if len(currentOnly)*cpusPerCore != committed.reclaim.Difference(desiredFake).Size() ||
+		len(desiredOnly)*cpusPerCore != desiredFake.Difference(committed.reclaim).Size() {
 		return nil, fmt.Errorf("steady fake-NUMA migration contains fragmented core differences")
 	}
 
-	replacementBudget := steadyFakeNUMAMaxMigratedCPUs / (2 * cpusPerCore)
+	replacementBudget := migrationLimit / (2 * cpusPerCore)
 	replacementPairs := len(currentOnly)
 	if len(desiredOnly) < replacementPairs {
 		replacementPairs = len(desiredOnly)
@@ -229,93 +296,200 @@ func projectSteadyFakeNUMAStageWithBudgetAndPins(
 		return nil, fmt.Errorf("cannot derive bounded steady fake-NUMA migration cardinality")
 	}
 
-	selectionLimit := budget.maxCandidateActions + 1
-	addedSelections := steadyFakeNUMACoreSelections(
-		desiredOnly, selectedAddedCount, selectionLimit)
-	currentSelections := steadyFakeNUMACoreSelections(
-		currentOnly, retainedCurrentCount, selectionLimit)
-	demandByKey := make(map[string]partitionDemand, len(demands))
-	for _, demand := range demands {
-		demandByKey[demand.key] = demand
-	}
-
-	tracker := &steadyFakeNUMASearchTracker{budget: budget}
 	var lastErr error
-	var best map[string]machine.CPUSet
-	for _, selectedAdded := range addedSelections {
-		for _, retainedCurrent := range currentSelections {
-			if budgetErr := tracker.consumeCandidateAction(); budgetErr != nil {
-				return nil, budgetErr
-			}
-			target := common
-			for _, core := range selectedAdded {
-				target = target.Union(core)
-			}
-			for _, core := range retainedCurrent {
-				target = target.Union(core)
-			}
-			pins, pinErr := pinsForUnion(
-				target, fakeKeys, demandByKey, desired, topology, tracker)
-			if pinErr != nil {
-				if errors.Is(pinErr, errSteadyFakeNUMAPinBudgetExhausted) ||
-					errors.Is(pinErr, errSteadyFakeNUMASearchBudgetExhausted) {
-					return nil, pinErr
+	currentDistance := steadyFakeNUMAMigrationChurn(committed.reclaim, desiredFake)
+	selectionLimit := budget.maxCandidateActions + 1
+	for replacementCoreCount := replacementBudget; replacementCoreCount >= 1; replacementCoreCount-- {
+		selectedAddedCount = len(desiredOnly) - (replacementPairs - replacementCoreCount)
+		retainedCurrentCount = desiredFake.Size()/cpusPerCore -
+			common.Size()/cpusPerCore - selectedAddedCount
+		if selectedAddedCount < 0 || retainedCurrentCount < 0 ||
+			selectedAddedCount > len(desiredOnly) || retainedCurrentCount > len(currentOnly) {
+			continue
+		}
+
+		addedSelections := steadyFakeNUMACoreSelections(
+			desiredOnly, selectedAddedCount, selectionLimit)
+		currentSelections := steadyFakeNUMACoreSelections(
+			currentOnly, retainedCurrentCount, selectionLimit)
+		tracker := &steadyFakeNUMASearchTracker{budget: budget}
+		var best map[string]machine.CPUSet
+		batchExhausted := false
+
+	batchSearch:
+		for _, selectedAdded := range addedSelections {
+			for _, retainedCurrent := range currentSelections {
+				if budgetErr := tracker.consumeCandidateAction(); budgetErr != nil {
+					lastErr = budgetErr
+					batchExhausted = true
+					break batchSearch
 				}
-				lastErr = pinErr
-				continue
-			}
-			if budgetErr := tracker.consumeCandidateAction(); budgetErr != nil {
-				return nil, budgetErr
-			}
-			assignments, solveErr := solveSteadyFakeNUMAWithPinsBudget(
-				demands, fakeKeys, floors, pins, topology, &tracker.solveAttempts,
-				tracker.budget.maxSolveAttempts)
-			if solveErr != nil {
-				lastErr = solveErr
-				if tracker.solveAttempts >= budget.maxSolveAttempts {
-					return nil, fmt.Errorf(
-						"steady fake-NUMA staged migration solve budget %d exhausted: %w",
-						budget.maxSolveAttempts, solveErr)
+				target := common
+				for _, core := range selectedAdded {
+					target = target.Union(core)
 				}
-				continue
-			}
-			if _, validateErr := validateSteadyFakeNUMAFinal(
-				demands, fakeKeys, assignments, topology, nil, false,
-			); validateErr != nil {
-				lastErr = validateErr
-				continue
-			}
-			nextFake := unionPartitionAssignments(assignments, fakeKeys)
-			if alignErr := assertCoreAligned(nextFake, topology); alignErr != nil {
-				lastErr = alignErr
-				continue
-			}
-			if churn := steadyFakeNUMAMigrationChurn(committed, nextFake); churn >
-				steadyFakeNUMAMaxMigratedCPUs {
-				lastErr = fmt.Errorf("projected migration churn %d exceeds limit", churn)
-				continue
-			}
-			if best == nil || steadyFakeNUMAStageAssignmentLess(best, assignments, demands, topology) {
-				best = assignments
+				for _, core := range retainedCurrent {
+					target = target.Union(core)
+				}
+				stageDemands, stageDemandByKey, stageErr := steadyFakeNUMAStageDemands(
+					demands, fakeSet, target, desired, topology)
+				if stageErr != nil {
+					lastErr = stageErr
+					continue
+				}
+				pins, pinErr := pinsForUnion(
+					target, fakeKeys, stageDemandByKey, desired, topology, tracker)
+				if pinErr != nil {
+					if errors.Is(pinErr, errSteadyFakeNUMAPinBudgetExhausted) {
+						return nil, pinErr
+					}
+					lastErr = pinErr
+					if errors.Is(pinErr, errSteadyFakeNUMASearchBudgetExhausted) {
+						batchExhausted = true
+						break batchSearch
+					}
+					continue
+				}
+				if budgetErr := tracker.consumeCandidateAction(); budgetErr != nil {
+					lastErr = budgetErr
+					batchExhausted = true
+					break batchSearch
+				}
+				assignments, solveErr := solveSteadyFakeNUMAWithPinsBudget(
+					stageDemands, fakeKeys, floors, pins, topology, &tracker.solveAttempts,
+					tracker.budget.maxSolveAttempts)
+				if solveErr != nil {
+					lastErr = solveErr
+					if tracker.solveAttempts >= budget.maxSolveAttempts {
+						lastErr = fmt.Errorf(
+							"steady fake-NUMA staged migration solve budget %d exhausted: %w",
+							budget.maxSolveAttempts, solveErr)
+						batchExhausted = true
+						break batchSearch
+					}
+					continue
+				}
+				if _, validateErr := validateSteadyFakeNUMAFinal(
+					stageDemands, fakeKeys, assignments, topology, nil, false,
+				); validateErr != nil {
+					lastErr = validateErr
+					continue
+				}
+				nextFake := unionPartitionAssignments(assignments, fakeKeys)
+				if alignErr := assertCoreAligned(nextFake, topology); alignErr != nil {
+					lastErr = alignErr
+					continue
+				}
+				if churn := steadyFakeNUMAMigrationChurn(committed.reclaim, nextFake); churn >
+					migrationLimit {
+					lastErr = fmt.Errorf("projected migration churn %d exceeds limit", churn)
+					continue
+				}
+				if distance := steadyFakeNUMAMigrationChurn(nextFake, desiredFake); distance >=
+					currentDistance {
+					lastErr = fmt.Errorf(
+						"projected migration target distance %d does not improve current distance %d",
+						distance, currentDistance)
+					continue
+				}
+				if best == nil || steadyFakeNUMAStageAssignmentLess(
+					best, assignments, stageDemands, fakeKeys, desired, topology) {
+					best = assignments
+				}
 			}
 		}
-	}
-	if best != nil {
-		return best, nil
-	}
-	if len(addedSelections) >= selectionLimit || len(currentSelections) >= selectionLimit {
-		return nil, fmt.Errorf(
-			"steady fake-NUMA staged migration search budget %d exhausted",
-			budget.maxCandidateActions)
+		if len(addedSelections) >= selectionLimit || len(currentSelections) >= selectionLimit {
+			lastErr = fmt.Errorf(
+				"steady fake-NUMA staged migration search budget %d exhausted",
+				budget.maxCandidateActions)
+			batchExhausted = true
+		}
+		if best != nil && !batchExhausted {
+			nextFake := unionPartitionAssignments(best, fakeKeys)
+			general.InfoS("steady fake NUMA migration stage planned",
+				"currentCPUSet", committed.reclaim.String(),
+				"frozenTargetCPUSet", desiredFake.String(),
+				"stageCPUSet", nextFake.String(),
+				"currentDistance", currentDistance,
+				"nextDistance", steadyFakeNUMAMigrationChurn(nextFake, desiredFake),
+				"stageChurn", steadyFakeNUMAMigrationChurn(committed.reclaim, nextFake))
+			return best, nil
+		}
 	}
 	if lastErr != nil {
 		return nil, fmt.Errorf(
 			"no legal staged reclaim migration within %d changed CPU IDs: %w",
-			steadyFakeNUMAMaxMigratedCPUs, lastErr)
+			migrationLimit, lastErr)
 	}
 	return nil, fmt.Errorf(
 		"no legal staged reclaim migration within %d changed CPU IDs",
-		steadyFakeNUMAMaxMigratedCPUs)
+		migrationLimit)
+}
+
+func steadyFakeNUMAStageDemands(
+	demands []partitionDemand,
+	fakeSet map[string]struct{},
+	target machine.CPUSet,
+	desired map[string]machine.CPUSet,
+	topology *machine.CPUTopology,
+) ([]partitionDemand, map[string]partitionDemand, error) {
+	stageDemands := make([]partitionDemand, len(demands))
+	stageDemandByKey := make(map[string]partitionDemand, len(demands))
+	fakeDemandByKey := make(map[string]partitionDemand, len(fakeSet))
+	for i, demand := range demands {
+		stageDemand := demand
+		if _, fake := fakeSet[demand.key]; fake {
+			stageDemand.quantity = 0
+			fakeDemandByKey[demand.key] = demand
+		}
+		stageDemands[i] = stageDemand
+	}
+	for _, core := range steadyFakeNUMACoreSets(target, topology) {
+		keys := make([]string, 0, len(fakeDemandByKey))
+		for key, demand := range fakeDemandByKey {
+			if core.IsSubsetOf(demand.eligible) {
+				keys = append(keys, key)
+			}
+		}
+		if len(keys) == 0 {
+			return nil, nil, fmt.Errorf(
+				"steady fake-NUMA stage core %s has no eligible demand", core.String())
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			left, right := fakeDemandByKey[keys[i]], fakeDemandByKey[keys[j]]
+			leftDesired := core.IsSubsetOf(desired[keys[i]])
+			rightDesired := core.IsSubsetOf(desired[keys[j]])
+			if leftDesired != rightDesired {
+				return leftDesired
+			}
+			leftPreferred := core.IsSubsetOf(left.preferred)
+			rightPreferred := core.IsSubsetOf(right.preferred)
+			if leftPreferred != rightPreferred {
+				return leftPreferred
+			}
+			return keys[i] < keys[j]
+		})
+		selected := keys[0]
+		for i := range stageDemands {
+			if stageDemands[i].key == selected {
+				stageDemands[i].quantity += core.Size()
+				break
+			}
+		}
+	}
+	assignedFakeQuantity := 0
+	for _, stageDemand := range stageDemands {
+		stageDemandByKey[stageDemand.key] = stageDemand
+		if _, fake := fakeSet[stageDemand.key]; fake {
+			assignedFakeQuantity += stageDemand.quantity
+		}
+	}
+	if assignedFakeQuantity != target.Size() {
+		return nil, nil, fmt.Errorf(
+			"steady fake-NUMA stage target quantity %d differs from assigned quantity %d",
+			target.Size(), assignedFakeQuantity)
+	}
+	return stageDemands, stageDemandByKey, nil
 }
 
 func (b *steadyFakeNUMASearchTracker) consumeCandidateAction() error {
@@ -331,93 +505,265 @@ func (b *steadyFakeNUMASearchTracker) consumeCandidateAction() error {
 	return nil
 }
 
+func buildSteadyFakeNUMACommittedSnapshot(
+	descriptors []advisorBlockDescriptor,
+	available machine.CPUSet,
+) (steadyFakeNUMACommittedSnapshot, error) {
+	snapshot := steadyFakeNUMACommittedSnapshot{
+		assignments:         make([]steadyFakeNUMACommittedAssignment, 0, len(descriptors)),
+		rawReclaimAggregate: machine.NewCPUSet(),
+		reclaim:             machine.NewCPUSet(),
+	}
+	seenBlockIDs := make(map[string]struct{}, len(descriptors))
+	realMandatory := machine.NewCPUSet()
+	rawAggregateComponent := ""
+	for _, descriptor := range descriptors {
+		if descriptor.BlockID == "" {
+			return steadyFakeNUMACommittedSnapshot{}, fmt.Errorf("committed descriptor has empty block ID")
+		}
+		if descriptor.ComponentKey == "" {
+			return steadyFakeNUMACommittedSnapshot{}, fmt.Errorf(
+				"committed block %q has empty component key", descriptor.BlockID)
+		}
+		if _, duplicate := seenBlockIDs[descriptor.BlockID]; duplicate {
+			return steadyFakeNUMACommittedSnapshot{}, fmt.Errorf(
+				"duplicate committed block ID %q", descriptor.BlockID)
+		}
+		seenBlockIDs[descriptor.BlockID] = struct{}{}
+		if descriptor.Class == advisorBlockClassMandatoryReclaim &&
+			descriptor.NUMAID != commonstate.FakedNUMAID {
+			realMandatory = realMandatory.Union(descriptor.Committed)
+		}
+		if descriptor.Class == advisorBlockClassMandatoryReclaim &&
+			descriptor.NUMAID == commonstate.FakedNUMAID {
+			if rawAggregateComponent != "" && rawAggregateComponent != descriptor.ComponentKey {
+				return steadyFakeNUMACommittedSnapshot{}, fmt.Errorf(
+					"multiple committed fake-NUMA reclaim aggregates")
+			}
+			rawAggregateComponent = descriptor.ComponentKey
+			snapshot.rawReclaimAggregate = snapshot.rawReclaimAggregate.Union(descriptor.Committed)
+		}
+	}
+	assignmentByComponent := make(map[string]int, len(descriptors))
+	for _, descriptor := range descriptors {
+		if descriptor.Class == advisorBlockClassReclaimOverlap ||
+			descriptor.Class == advisorBlockClassStatic {
+			continue
+		}
+		committed := descriptor.Committed.Clone()
+		if descriptor.Class == advisorBlockClassMandatoryReclaim &&
+			descriptor.NUMAID == commonstate.FakedNUMAID {
+			committed = committed.Difference(realMandatory)
+		}
+		index, found := assignmentByComponent[descriptor.ComponentKey]
+		if found {
+			assignment := &snapshot.assignments[index]
+			if assignment.class != descriptor.Class || assignment.numaID != descriptor.NUMAID {
+				return steadyFakeNUMACommittedSnapshot{}, fmt.Errorf(
+					"committed component %q has inconsistent class or NUMA", descriptor.ComponentKey)
+			}
+			assignment.blockIDs = append(assignment.blockIDs, descriptor.BlockID)
+			if descriptor.BlockID < assignment.blockID {
+				assignment.blockID = descriptor.BlockID
+			}
+			assignment.cpus = assignment.cpus.Union(committed)
+			assignment.eligible = assignment.eligible.Intersection(
+				descriptor.Eligible.Intersection(available))
+			continue
+		}
+		assignment := steadyFakeNUMACommittedAssignment{
+			blockID:      descriptor.BlockID,
+			blockIDs:     []string{descriptor.BlockID},
+			componentKey: descriptor.ComponentKey,
+			class:        descriptor.Class,
+			numaID:       descriptor.NUMAID,
+			cpus:         committed.Clone(),
+			eligible:     descriptor.Eligible.Intersection(available),
+		}
+		assignmentByComponent[descriptor.ComponentKey] = len(snapshot.assignments)
+		snapshot.assignments = append(snapshot.assignments, assignment)
+	}
+	for i := range snapshot.assignments {
+		sort.Strings(snapshot.assignments[i].blockIDs)
+		if snapshot.assignments[i].class == advisorBlockClassMandatoryReclaim {
+			snapshot.reclaim = snapshot.reclaim.Union(snapshot.assignments[i].cpus)
+		}
+	}
+	sort.Slice(snapshot.assignments, func(i, j int) bool {
+		return snapshot.assignments[i].blockID < snapshot.assignments[j].blockID
+	})
+	return snapshot, nil
+}
+
 func validateCommittedSteadyFakeNUMASnapshot(
-	demands []partitionDemand,
-	fakeKeys []string,
-	committed machine.CPUSet,
+	snapshot steadyFakeNUMACommittedSnapshot,
 	floors []partitionCoreFloorConstraint,
 	topology *machine.CPUTopology,
 ) error {
 	if topology == nil {
 		return fmt.Errorf("topology is nil")
 	}
-	if outside := committed.Difference(topology.CPUDetails.CPUs()); !outside.IsEmpty() {
+	if outside := snapshot.reclaim.Difference(topology.CPUDetails.CPUs()); !outside.IsEmpty() {
 		return fmt.Errorf("committed reclaim outside machine topology: %s", outside.String())
 	}
-
-	demandByKey := make(map[string]partitionDemand, len(demands))
-	for _, demand := range demands {
-		if _, duplicate := demandByKey[demand.key]; duplicate {
-			return fmt.Errorf("duplicate committed demand key %q", demand.key)
+	assignmentByBlockID := make(map[string]steadyFakeNUMACommittedAssignment, len(snapshot.assignments))
+	assignmentByComponent := make(map[string]struct{}, len(snapshot.assignments))
+	mandatoryReclaim := machine.NewCPUSet()
+	for _, assignment := range snapshot.assignments {
+		if assignment.blockID == "" {
+			return fmt.Errorf("committed assignment has empty block ID")
 		}
-		demandByKey[demand.key] = demand
+		componentKey := assignment.componentKey
+		if componentKey == "" {
+			componentKey = assignment.blockID
+		}
+		if _, duplicate := assignmentByComponent[componentKey]; duplicate {
+			return fmt.Errorf("duplicate committed component %q", componentKey)
+		}
+		assignmentByComponent[componentKey] = struct{}{}
+		blockIDs := append([]string{assignment.blockID}, assignment.blockIDs...)
+		seenAssignmentBlockIDs := make(map[string]struct{}, len(blockIDs))
+		for _, blockID := range blockIDs {
+			if blockID == "" {
+				return fmt.Errorf("committed assignment has empty block ID")
+			}
+			if _, duplicate := seenAssignmentBlockIDs[blockID]; duplicate {
+				continue
+			}
+			seenAssignmentBlockIDs[blockID] = struct{}{}
+			if _, duplicate := assignmentByBlockID[blockID]; duplicate {
+				return fmt.Errorf("duplicate committed block ID %q", blockID)
+			}
+			assignmentByBlockID[blockID] = assignment
+		}
+		if outside := assignment.cpus.Difference(topology.CPUDetails.CPUs()); !outside.IsEmpty() {
+			return fmt.Errorf(
+				"committed block %q has CPUs outside machine topology: %s",
+				assignment.blockID, outside.String())
+		}
+		if outside := assignment.cpus.Difference(assignment.eligible); !outside.IsEmpty() {
+			return fmt.Errorf(
+				"committed block %q is outside eligibility: %s",
+				assignment.blockID, outside.String())
+		}
+		if assignment.class == advisorBlockClassMandatoryReclaim {
+			mandatoryReclaim = mandatoryReclaim.Union(assignment.cpus)
+		}
 	}
-	fakeSet := make(map[string]struct{}, len(fakeKeys))
-	committedFakeSnapshot := machine.NewCPUSet()
-	for _, key := range fakeKeys {
-		demand, found := demandByKey[key]
-		if !found {
-			return fmt.Errorf("committed fake demand key %q is missing", key)
-		}
-		if _, duplicate := fakeSet[key]; duplicate {
-			return fmt.Errorf("duplicate committed fake demand key %q", key)
-		}
-		fakeSet[key] = struct{}{}
-		committedFakeSnapshot = committedFakeSnapshot.Union(demand.preferred)
-	}
-	if !committedFakeSnapshot.Equals(committed) {
+	if !mandatoryReclaim.Equals(snapshot.reclaim) {
 		return fmt.Errorf(
-			"committed fake snapshot quantity/set %s does not match source snapshot %s",
-			committed.String(), committedFakeSnapshot.String())
+			"committed mandatory reclaim union %s does not match snapshot reclaim %s",
+			mandatoryReclaim.String(), snapshot.reclaim.String())
 	}
-	if err := assertCoreAligned(committed, topology); err != nil {
-		return err
+	if !snapshot.rawReclaimAggregate.Equals(snapshot.reclaim) {
+		return fmt.Errorf(
+			"raw committed reclaim aggregate %s does not match normalized reclaim leaves %s",
+			snapshot.rawReclaimAggregate.String(), snapshot.reclaim.String())
 	}
-
-	used := machine.NewCPUSet()
-	for _, demand := range demands {
-		source := demand.preferred
-		if outside := source.Difference(topology.CPUDetails.CPUs()); !outside.IsEmpty() {
-			return fmt.Errorf(
-				"committed demand %q is outside machine topology: %s",
-				demand.key, outside.String())
-		}
-		if outside := source.Difference(demand.eligible); !outside.IsEmpty() {
-			return fmt.Errorf(
-				"committed demand %q is outside eligibility: %s",
-				demand.key, outside.String())
-		}
-		if overlap := used.Intersection(source); !overlap.IsEmpty() {
-			return fmt.Errorf(
-				"committed demand %q overlaps an earlier donor/partition assignment: %s",
-				demand.key, overlap.String())
-		}
-		used = used.Union(source)
+	if err := assertCoreAligned(snapshot.reclaim, topology); err != nil {
+		return fmt.Errorf("committed reclaim is not core-aligned: %w", err)
 	}
 	for _, floor := range floors {
-		demand, found := demandByKey[floor.demandKey]
+		assignment, found := assignmentByBlockID[floor.committedBlockID]
 		if !found {
-			return fmt.Errorf("committed core floor demand %q is missing", floor.demandKey)
+			return fmt.Errorf("committed core floor block %q is missing", floor.committedBlockID)
 		}
-		if len(coreAlignedCandidates(topology, demand.preferred, demand.preferred)) == 0 {
+		if assignment.class != advisorBlockClassMandatoryReclaim ||
+			assignment.numaID == commonstate.FakedNUMAID {
 			return fmt.Errorf(
-				"committed demand %q violates its NUMA/core floor", floor.demandKey)
+				"committed floor block %q is not a real-NUMA mandatory reclaim block",
+				floor.committedBlockID)
+		}
+		if len(coreAlignedCandidates(topology, assignment.cpus, assignment.cpus)) == 0 {
+			return fmt.Errorf(
+				"committed block %q violates its NUMA/core floor", floor.committedBlockID)
 		}
 	}
+	for _, assignment := range snapshot.assignments {
+		if assignment.class != advisorBlockClassMandatoryReclaim ||
+			assignment.numaID != commonstate.FakedNUMAID {
+			continue
+		}
+		if err := assertCoreAligned(assignment.cpus, topology); err != nil {
+			return fmt.Errorf(
+				"committed fake-NUMA block %q is not core-aligned: %w",
+				assignment.blockID, err)
+		}
+	}
+	used := machine.NewCPUSet()
+	usedByBlock := make(map[int]string)
+	for _, assignment := range snapshot.assignments {
+		if overlap := used.Intersection(assignment.cpus); !overlap.IsEmpty() {
+			other := ""
+			for _, cpu := range overlap.ToSliceInt() {
+				other = usedByBlock[cpu]
+				if other != "" {
+					break
+				}
+			}
+			return fmt.Errorf(
+				"committed blocks %q and %q overlap: %s",
+				minString(other, assignment.blockID),
+				maxString(other, assignment.blockID),
+				overlap.String())
+		}
+		for _, cpu := range assignment.cpus.ToSliceInt() {
+			usedByBlock[cpu] = assignment.blockID
+		}
+		used = used.Union(assignment.cpus)
+	}
 	return nil
+}
+
+func minString(left, right string) string {
+	if left < right {
+		return left
+	}
+	return right
+}
+
+func maxString(left, right string) string {
+	if left > right {
+		return left
+	}
+	return right
 }
 
 func steadyFakeNUMAStageAssignmentLess(
 	left, right map[string]machine.CPUSet,
 	demands []partitionDemand,
+	fakeKeys []string,
+	desired map[string]machine.CPUSet,
 	topology *machine.CPUTopology,
 ) bool {
+	leftDistance := steadyFakeNUMAQuotaDistance(left, desired, fakeKeys, topology)
+	rightDistance := steadyFakeNUMAQuotaDistance(right, desired, fakeKeys, topology)
+	if leftDistance != rightDistance {
+		return leftDistance > rightDistance
+	}
 	leftCost, leftErr := steadyFakeNUMAStageAssignmentCost(left, demands, topology)
 	rightCost, rightErr := steadyFakeNUMAStageAssignmentCost(right, demands, topology)
 	if leftErr == nil && rightErr == nil && leftCost != rightCost {
 		return leftCost > rightCost
 	}
 	return steadyFakeNUMAAssignmentSignature(left) > steadyFakeNUMAAssignmentSignature(right)
+}
+
+func steadyFakeNUMAQuotaDistance(
+	assignments, desired map[string]machine.CPUSet,
+	fakeKeys []string,
+	topology *machine.CPUTopology,
+) int {
+	currentFake := unionPartitionAssignments(assignments, fakeKeys)
+	desiredFake := unionPartitionAssignments(desired, fakeKeys)
+	distance := 0
+	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
+		numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
+		distance += absInt(
+			currentFake.Intersection(numaCPUs).Size() -
+				desiredFake.Intersection(numaCPUs).Size())
+	}
+	return distance
 }
 
 func steadyFakeNUMAStageAssignmentCost(
@@ -485,22 +831,8 @@ func solveSteadyFakeNUMAWholeCoreWithFloors(
 	floors []partitionCoreFloorConstraint,
 	topology *machine.CPUTopology,
 ) (map[string]machine.CPUSet, error) {
-	return solveSteadyFakeNUMAWholeCoreWithFloorsAndProject(
-		demands, fakeDemandKeys, floors, topology, projectSteadyFakeNUMAStage)
-}
-
-func solveSteadyFakeNUMAWholeCoreWithFloorsAndProject(
-	demands []partitionDemand,
-	fakeDemandKeys []string,
-	floors []partitionCoreFloorConstraint,
-	topology *machine.CPUTopology,
-	project steadyFakeNUMAProjectFunc,
-) (map[string]machine.CPUSet, error) {
 	if topology == nil {
 		return nil, fmt.Errorf("steady fake-NUMA whole-core topology is nil")
-	}
-	if project == nil {
-		return nil, fmt.Errorf("steady fake-NUMA whole-core projector is nil")
 	}
 	cpusPerCore := topology.CPUsPerCore()
 	if cpusPerCore <= 0 {
@@ -530,18 +862,57 @@ func solveSteadyFakeNUMAWholeCoreWithFloorsAndProject(
 	if len(fakeKeys) == 0 {
 		return baseline, nil
 	}
+	return solveSteadyFakeNUMADesiredWholeCore(
+		demands, fakeKeys, floors, topology, baseline)
+}
 
-	committedFake := machine.NewCPUSet()
-	for _, key := range fakeKeys {
-		committedFake = committedFake.Union(demandByKey[key].preferred)
+func solveSteadyFakeNUMAWholeCoreWithFloorsAndProject(
+	demands []partitionDemand,
+	fakeDemandKeys []string,
+	committed steadyFakeNUMACommittedSnapshot,
+	floors []partitionCoreFloorConstraint,
+	topology *machine.CPUTopology,
+	project steadyFakeNUMAProjectFunc,
+) (map[string]machine.CPUSet, error) {
+	if topology == nil {
+		return nil, fmt.Errorf("steady fake-NUMA whole-core topology is nil")
+	}
+	if project == nil {
+		return nil, fmt.Errorf("steady fake-NUMA whole-core projector is nil")
+	}
+	cpusPerCore := topology.CPUsPerCore()
+	if cpusPerCore <= 0 {
+		return nil, fmt.Errorf(
+			"steady fake-NUMA whole-core has non-positive cpus per core %d", cpusPerCore)
+	}
+	demandByKey := make(map[string]partitionDemand, len(demands))
+	for _, demand := range demands {
+		demandByKey[demand.key] = demand
+	}
+	requestedFakeQuantity := totalFakeQuantity(demandByKey, fakeDemandKeys)
+	if requestedFakeQuantity%cpusPerCore != 0 {
+		return nil, fmt.Errorf(
+			"steady fake-NUMA quantity %d is not a whole-core multiple of %d",
+			requestedFakeQuantity, cpusPerCore)
+	}
+	baseline, err := solveDisjointPartitionsWithCoreFloors(demands, floors, topology)
+	if err != nil {
+		return nil, fmt.Errorf("steady fake-NUMA baseline: %w", err)
+	}
+	fakeKeys, err := validateSteadyFakeNUMAFinal(
+		demands, fakeDemandKeys, baseline, topology, nil, false)
+	if err != nil {
+		return nil, fmt.Errorf("steady fake-NUMA baseline: %w", err)
+	}
+	if len(fakeKeys) == 0 {
+		return baseline, nil
 	}
 	desired, err := solveSteadyFakeNUMADesiredWholeCore(
 		demands, fakeKeys, floors, topology, baseline)
 	if err != nil {
 		return nil, err
 	}
-	return project(
-		demands, fakeKeys, committedFake, desired, floors, topology)
+	return project(demands, fakeKeys, committed.clone(), desired, floors, topology)
 }
 
 func solveSteadyFakeNUMADesiredWholeCore(
@@ -614,6 +985,26 @@ func solveSteadyFakeNUMADesiredWholeCore(
 	}
 	initial.signature = steadyFakeNUMAPinSignature(initial.pins)
 	best := initial
+	attempts := 0
+
+	requestedFakeQuantity := targetWhole * cpusPerCore
+	aggregateTarget := steadyFakeNUMAAggregateTargetByNUMA(
+		fakeKeys, demandByKey, baselineFake, topology)
+	if aggregateTarget.Size() == requestedFakeQuantity {
+		if aggregatePins, pinErr := steadyFakeNUMAPinsForUnion(
+			aggregateTarget, fakeKeys, demandByKey, baseline, topology,
+		); pinErr == nil {
+			if aggregate, solveErr := solveSteadyFakeNUMAWithPins(
+				demands, fakeKeys, floors, aggregatePins, topology, &attempts,
+			); solveErr == nil {
+				if _, validateErr := validateSteadyFakeNUMAFinal(
+					demands, fakeKeys, aggregate, topology, baseline, true,
+				); validateErr == nil {
+					return aggregate, nil
+				}
+			}
+		}
+	}
 
 	fastPins := make(map[string][]machine.CPUSet, len(fakeKeys))
 	for _, key := range fakeKeys {
@@ -622,7 +1013,6 @@ func solveSteadyFakeNUMADesiredWholeCore(
 			fastPins[key] = append(fastPins[key], candidates[key][i].cpus)
 		}
 	}
-	attempts := 0
 	if fast, solveErr := solveSteadyFakeNUMAWithPins(
 		demands, fakeKeys, floors, fastPins, topology, &attempts,
 	); solveErr == nil {
@@ -746,6 +1136,60 @@ func solveSteadyFakeNUMADesiredWholeCore(
 	return best.assignments, nil
 }
 
+func steadyFakeNUMAAggregateTargetByNUMA(
+	fakeKeys []string,
+	demands map[string]partitionDemand,
+	baselineFake machine.CPUSet,
+	topology *machine.CPUTopology,
+) machine.CPUSet {
+	quantityByNUMA := make(map[int]int)
+	eligibleByNUMA := make(map[int]machine.CPUSet)
+	preferredByNUMA := make(map[int]machine.CPUSet)
+	globalQuantity := 0
+	globalEligible := machine.NewCPUSet()
+	globalPreferred := machine.NewCPUSet()
+	for _, key := range fakeKeys {
+		demand := demands[key]
+		numaIDs := topology.CPUDetails.KeepOnly(demand.eligible).NUMANodes().ToSliceInt()
+		if len(numaIDs) == 1 {
+			numaID := numaIDs[0]
+			quantityByNUMA[numaID] += demand.quantity
+			eligibleByNUMA[numaID] = eligibleByNUMA[numaID].Union(demand.eligible)
+			preferredByNUMA[numaID] = preferredByNUMA[numaID].Union(demand.preferred)
+			continue
+		}
+		globalQuantity += demand.quantity
+		globalEligible = globalEligible.Union(demand.eligible)
+		globalPreferred = globalPreferred.Union(demand.preferred)
+	}
+
+	target := machine.NewCPUSet()
+	for numaID, quantity := range quantityByNUMA {
+		numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
+		target = target.Union(takeCoreAlignedCPUSetByTiers(
+			topology,
+			eligibleByNUMA[numaID].Intersection(numaCPUs),
+			[]machine.CPUSet{
+				baselineFake.Intersection(numaCPUs),
+				preferredByNUMA[numaID].Intersection(numaCPUs),
+			},
+			quantity,
+		))
+	}
+	if globalQuantity > 0 {
+		target = target.Union(takeCoreAlignedCPUSetByTiers(
+			topology,
+			globalEligible.Difference(target),
+			[]machine.CPUSet{
+				baselineFake.Difference(target),
+				globalPreferred.Difference(target),
+			},
+			globalQuantity,
+		))
+	}
+	return target
+}
+
 func steadyFakeNUMACoreSets(
 	cpus machine.CPUSet,
 	topology *machine.CPUTopology,
@@ -843,10 +1287,39 @@ func steadyFakeNUMAPinsForUnionWithBudget(
 	if len(cores)*topology.CPUsPerCore() != target.Size() {
 		return nil, fmt.Errorf("staged fake reclaim target is not core aligned")
 	}
+	eligibleKeysByCore := make([][]string, len(cores))
+	suffixEligibleCounts := make([]map[string]int, len(cores)+1)
+	suffixEligibleCounts[len(cores)] = make(map[string]int, len(keys))
+	for index := len(cores) - 1; index >= 0; index-- {
+		suffixEligibleCounts[index] = cloneStringIntMap(suffixEligibleCounts[index+1])
+		for _, key := range keys {
+			if !cores[index].IsSubsetOf(demands[key].eligible) {
+				continue
+			}
+			eligibleKeysByCore[index] = append(eligibleKeysByCore[index], key)
+			suffixEligibleCounts[index][key]++
+		}
+		if len(eligibleKeysByCore[index]) == 0 {
+			return nil, fmt.Errorf("staged fake reclaim target core %s cannot be assigned to any fake demand",
+				cores[index].String())
+		}
+	}
+	for _, key := range keys {
+		if suffixEligibleCounts[0][key] < capacity[key] {
+			return nil, fmt.Errorf("staged fake reclaim target has %d assignable cores for demand %q, want %d",
+				suffixEligibleCounts[0][key], key, capacity[key])
+		}
+	}
 
 	pins := make(map[string][]machine.CPUSet, len(keys))
 	var assign func(int) bool
 	assign = func(index int) bool {
+		for _, key := range keys {
+			if len(pins[key]) > capacity[key] ||
+				len(pins[key])+suffixEligibleCounts[index][key] < capacity[key] {
+				return false
+			}
+		}
 		if tracker.consumeCandidateAction() != nil {
 			return false
 		}
@@ -859,7 +1332,7 @@ func steadyFakeNUMAPinsForUnionWithBudget(
 			return true
 		}
 		core := cores[index]
-		candidateKeys := append([]string(nil), keys...)
+		candidateKeys := append([]string(nil), eligibleKeysByCore[index]...)
 		sort.SliceStable(candidateKeys, func(i, j int) bool {
 			leftDesired := boolRank(core.IsSubsetOf(desired[candidateKeys[i]]))
 			rightDesired := boolRank(core.IsSubsetOf(desired[candidateKeys[j]]))
@@ -871,8 +1344,7 @@ func steadyFakeNUMAPinsForUnionWithBudget(
 			return leftOld > rightOld
 		})
 		for _, key := range candidateKeys {
-			if len(pins[key]) >= capacity[key] ||
-				!core.IsSubsetOf(demands[key].eligible) {
+			if len(pins[key]) >= capacity[key] {
 				continue
 			}
 			pins[key] = append(pins[key], core)
@@ -1458,6 +1930,14 @@ func absInt(value int) int {
 
 func cloneIntMap(source map[int]int) map[int]int {
 	result := make(map[int]int, len(source)+1)
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+func cloneStringIntMap(source map[string]int) map[string]int {
+	result := make(map[string]int, len(source)+1)
 	for key, value := range source {
 		result[key] = value
 	}

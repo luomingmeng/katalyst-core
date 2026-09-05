@@ -214,6 +214,99 @@ func TestCPUAdvisorValidatorValidatesNUMABindingDedicatedQuantityInDisjointMode(
 	})
 }
 
+func TestCPUAdvisorValidatorMissingSharedNUMABindingCalculationInfo(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		name          string
+		rampUp        bool
+		ownerPoolName string
+		wantErr       bool
+	}{
+		{
+			name:    "ramp-up with empty owner is allowed",
+			rampUp:  true,
+			wantErr: false,
+		},
+		{
+			name:          "ramp-up with assigned owner fails closed",
+			rampUp:        true,
+			ownerPoolName: commonstate.PoolNameShare,
+			wantErr:       true,
+		},
+		{
+			name:    "steady with empty owner fails closed",
+			rampUp:  false,
+			wantErr: true,
+		},
+		{
+			name:          "steady with assigned owner fails closed",
+			rampUp:        false,
+			ownerPoolName: commonstate.PoolNameShare,
+			wantErr:       true,
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			currentState := cpustate.NewCPUPluginState(nil)
+			currentState.SetPodEntries(cpustate.PodEntries{
+				"pod": {
+					"container": &cpustate.AllocationInfo{
+						AllocationMeta: commonstate.AllocationMeta{
+							PodUid:        "pod",
+							ContainerName: "container",
+							QoSLevel:      consts.PodAnnotationQoSLevelSharedCores,
+							OwnerPoolName: tc.ownerPoolName,
+							Annotations: map[string]string{
+								consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+							},
+						},
+						RampUp: tc.rampUp,
+					},
+				},
+			})
+			v := NewCPUAdvisorValidator(currentState,
+				&machine.KatalystMachineInfo{CPUTopology: topology})
+
+			err := v.validateEntries(&advisorapi.ListAndWatchResponse{})
+			if tc.wantErr {
+				require.ErrorContains(t, err, "missing CalculationInfo")
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestCPUAdvisorValidatorRejectsMissingDedicatedRampUpCalculationInfo(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	currentState := cpustate.NewCPUPluginState(nil)
+	currentState.SetPodEntries(cpustate.PodEntries{
+		"pod": {
+			"container": &cpustate.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod",
+					ContainerName: "container",
+					QoSLevel:      consts.PodAnnotationQoSLevelDedicatedCores,
+				},
+				RampUp: true,
+			},
+		},
+	})
+	v := NewCPUAdvisorValidator(currentState,
+		&machine.KatalystMachineInfo{CPUTopology: topology})
+
+	require.Error(t, v.validateEntries(&advisorapi.ListAndWatchResponse{}))
+}
+
 func TestCPUAdvisorValidatorValidatesDefaultShareUpperBound(t *testing.T) {
 	t.Parallel()
 
@@ -485,4 +578,37 @@ func TestCPUAdvisorValidatorUsesIncomingOverlapMode(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCPUAdvisorValidatorDoesNotApplyHardFakeCapacityToSteady(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	validator := NewCPUAdvisorValidator(cpustate.NewCPUPluginState(nil),
+		&machine.KatalystMachineInfo{CPUTopology: topology})
+
+	resp := &advisorapi.ListAndWatchResponse{
+		DisableDedicatedCoresOverlapReclaimedCores: true,
+		Entries: map[string]*advisorapi.CalculationEntries{
+			commonstate.PoolNameReclaim: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameReclaim,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							0: {
+								Blocks: []*advisorapi.Block{{BlockId: "real-0", Result: 2}},
+							},
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "fake", Result: 6}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	require.NoError(t, validator.validateBlocks(resp),
+		"the generic validator must not apply hard-only fake capacity before hardActive is known")
 }

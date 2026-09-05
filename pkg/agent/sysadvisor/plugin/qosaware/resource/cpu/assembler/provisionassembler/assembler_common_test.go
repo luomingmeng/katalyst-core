@@ -1869,6 +1869,7 @@ func TestAssembleWithoutNUMAExclusivePoolOverlapPolicyMatrix(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result, err := runOrdinaryOverlapAssemblerCase(t, ordinaryOverlapAssemblerCase{
 				capacity:                20,
+				nonBindingNUMACapacity:  20,
 				reserved:                4,
 				allowSharedOverlap:      tt.want.AllowSharedCoresOverlapReclaimedCores,
 				disableDedicatedOverlap: tt.want.DisableDedicatedCoresOverlapReclaimedCores,
@@ -2184,6 +2185,7 @@ func TestAssembleWithoutNUMAExclusivePoolUsesActiveHardTargetAsEffectiveReserve(
 
 type ordinaryOverlapAssemblerCase struct {
 	capacity                int
+	nonBindingNUMACapacity  int
 	reserved                int
 	hardPartition           bool
 	hardTarget              int
@@ -2264,6 +2266,10 @@ func runOrdinaryOverlapAssemblerCase(
 	}
 	numaAvailable := map[int]int{0: tc.capacity}
 	nonBindingNUMAs := machine.NewCPUSet()
+	if tc.nonBindingNUMACapacity > 0 {
+		numaAvailable[1] = tc.nonBindingNUMACapacity
+		nonBindingNUMAs = machine.NewCPUSet(1)
+	}
 	metaReader := metacache.NewDummyMetaCacheImp()
 	resourcePackageConfig := types.ResourcePackageConfig{}
 	if tc.dedicatedPackage != "" {

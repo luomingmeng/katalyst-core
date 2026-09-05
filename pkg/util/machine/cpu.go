@@ -161,6 +161,35 @@ func GetCoreNumReservedForReclaim(numReservedCores, numNumaNodes, cpusPerCore in
 	return reservedForReclaim
 }
 
+// GetCoreNumReservedForReclaimOnNUMAs generates a core-aligned reclaim target
+// for each real NUMA ID. Every NUMA starts with one complete physical core, then
+// complete cores are added in sorted NUMA-ID order until the aggregate covers
+// numReservedCPUs. The caller-owned NUMA ID slice is never mutated.
+func GetCoreNumReservedForReclaimOnNUMAs(numReservedCPUs int, numaIDs []int, cpusPerCore int) map[int]int {
+	sortedNUMAIDs := append([]int(nil), numaIDs...)
+	sort.Ints(sortedNUMAIDs)
+
+	coreWidth := cpusPerCore
+	if coreWidth <= 0 {
+		coreWidth = 1
+	}
+
+	reservedForReclaim := make(map[int]int, len(sortedNUMAIDs))
+	total := 0
+	for _, numaID := range sortedNUMAIDs {
+		reservedForReclaim[numaID] = coreWidth
+		total += coreWidth
+	}
+
+	for i := 0; total < numReservedCPUs && len(sortedNUMAIDs) > 0; i++ {
+		numaID := sortedNUMAIDs[i%len(sortedNUMAIDs)]
+		reservedForReclaim[numaID] += coreWidth
+		total += coreWidth
+	}
+
+	return reservedForReclaim
+}
+
 func SmtActive() bool {
 	checkOnce.Do(func() {
 		data, err := ioutil.ReadFile("/sys/devices/system/cpu/smt/active")

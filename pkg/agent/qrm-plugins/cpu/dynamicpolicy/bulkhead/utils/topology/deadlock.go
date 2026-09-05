@@ -28,6 +28,9 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
+var ErrIncompleteRequiredCoreReleaseWitness = errors.New(
+	"incomplete required core release witness")
+
 const defaultDeadlockProbeBudget = 4096
 
 type ProbeCompleteness string
@@ -142,9 +145,10 @@ func analyzeV1Deadlock(in PhasePlanInput) (analysis DeadlockAnalysis, err error)
 		}
 		sort.Slice(destinations, func(i, j int) bool { return destinations[i] < destinations[j] })
 		for _, destination := range destinations {
-			for _, cpu := range graph[source][destination].ToSliceInt() {
+			for _, cpus := range drainAtomCPUSetGroups(
+				graph[source][destination], in.CPUDetails) {
 				analysis.Atoms = append(analysis.Atoms, DrainAtom{
-					Source: source, Destination: destination, CPUs: machine.NewCPUSet(cpu),
+					Source: source, Destination: destination, CPUs: cpus,
 				})
 			}
 		}
@@ -262,11 +266,17 @@ func analyzeV1Deadlock(in PhasePlanInput) (analysis DeadlockAnalysis, err error)
 		for rel, cpus := range projection.EmptyBlockers {
 			analysis.EmptyBlockers[rel] = analysis.EmptyBlockers[rel].Union(cpus)
 		}
-		if !projection.DomainUnion[atom.Source].Contains(atom.CPUs.ToSliceInt()[0]) {
+		if projection.DomainUnion[atom.Source].Intersection(atom.CPUs).IsEmpty() {
 			analysis.AtomClasses = append(analysis.AtomClasses, DrainAtomClassReleasable)
 			seed := atom
 			analysis.SafeSeed = &seed
 			return analysis, nil
+		}
+		if atom.CPUs.Size() > 1 {
+			return analysis, fmt.Errorf(
+				"%w: source=%s destination=%s core=%s",
+				ErrIncompleteRequiredCoreReleaseWitness,
+				atom.Source, atom.Destination, atom.CPUs.String())
 		}
 		emptyBlocked := machine.NewCPUSet()
 		for _, cpus := range projection.EmptyBlockers {
@@ -279,6 +289,55 @@ func analyzeV1Deadlock(in PhasePlanInput) (analysis DeadlockAnalysis, err error)
 		}
 	}
 	return analysis, nil
+}
+
+type drainAtomCoreKey struct {
+	numaID   int
+	socketID int
+	coreID   int
+}
+
+func drainAtomCPUSetGroups(
+	cpus machine.CPUSet,
+	details machine.CPUDetails,
+) []machine.CPUSet {
+	if len(details) == 0 {
+		groups := make([]machine.CPUSet, 0, cpus.Size())
+		for _, cpu := range cpus.ToSliceInt() {
+			groups = append(groups, machine.NewCPUSet(cpu))
+		}
+		return groups
+	}
+	byCore := make(map[drainAtomCoreKey]machine.CPUSet)
+	for _, cpu := range cpus.ToSliceInt() {
+		detail, ok := details[cpu]
+		if !ok {
+			byCore[drainAtomCoreKey{coreID: cpu}] = machine.NewCPUSet(cpu)
+			continue
+		}
+		key := drainAtomCoreKey{
+			numaID: detail.NUMANodeID, socketID: detail.SocketID, coreID: detail.CoreID,
+		}
+		byCore[key] = byCore[key].Union(machine.NewCPUSet(cpu))
+	}
+	keys := make([]drainAtomCoreKey, 0, len(byCore))
+	for key := range byCore {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].numaID != keys[j].numaID {
+			return keys[i].numaID < keys[j].numaID
+		}
+		if keys[i].socketID != keys[j].socketID {
+			return keys[i].socketID < keys[j].socketID
+		}
+		return keys[i].coreID < keys[j].coreID
+	})
+	groups := make([]machine.CPUSet, 0, len(keys))
+	for _, key := range keys {
+		groups = append(groups, byCore[key])
+	}
+	return groups
 }
 
 func snapshotChildEdgeCount(snapshot *CompleteSnapshot) int {

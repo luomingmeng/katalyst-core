@@ -18,25 +18,170 @@ package dynamicpolicy
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
+	"github.com/bytedance/mockey"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
 	"github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
+	cgroupcommon "github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
+	cgroupmanager "github.com/kubewharf/katalyst-core/pkg/util/cgroup/manager"
+	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
+
+type systemExclusiveCommitFailureState struct {
+	state.State
+	err      error
+	attempts int
+}
+
+func (s *systemExclusiveCommitFailureState) CommitAdvisorStateIfRevision(
+	expectedRevision uint64,
+	podEntries state.PodEntries,
+	machineState state.NUMANodeMap,
+	allowSharedCoresOverlapReclaimedCores bool,
+	disableDedicatedCoresOverlapReclaimedCores bool,
+	persist bool,
+	permits ...*state.WritePermit,
+) error {
+	s.attempts++
+	if s.attempts == 1 {
+		return s.err
+	}
+	return s.State.CommitAdvisorStateIfRevision(
+		expectedRevision,
+		podEntries,
+		machineState,
+		allowSharedCoresOverlapReclaimedCores,
+		disableDedicatedCoresOverlapReclaimedCores,
+		persist,
+		permits...,
+	)
+}
+
+func TestCheckCPUSetHealth(t *testing.T) {
+	general.RegisterHeartbeatCheck(cpuconsts.CheckCPUSet, time.Hour, general.HealthzCheckStateReady, 0)
+
+	newAllocation := func(podUID, containerName, qosLevel string, allocation, original machine.CPUSet) *state.AllocationInfo {
+		return &state.AllocationInfo{
+			AllocationMeta: commonstate.AllocationMeta{
+				PodUid: podUID, PodNamespace: "test-ns", PodName: podUID,
+				ContainerName: containerName, ContainerType: v1alpha1.ContainerType_MAIN.String(),
+				QoSLevel:    qosLevel,
+				Annotations: map[string]string{consts.PodAnnotationAggregatedRequestsKey: "1"},
+			},
+			AllocationResult: allocation, OriginalAllocationResult: original, RequestQuantity: 1,
+		}
+	}
+	newPod := func(podUID, containerName, containerID string) *v1.Pod {
+		return &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID), Namespace: "test-ns", Name: podUID},
+			Spec: v1.PodSpec{Containers: []v1.Container{{
+				Name:      containerName,
+				Resources: v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("1")}},
+			}}},
+			Status: v1.PodStatus{Phase: v1.PodRunning, ContainerStatuses: []v1.ContainerStatus{{
+				Name: containerName, ContainerID: "containerd://" + containerID,
+				State: v1.ContainerState{Running: &v1.ContainerStateRunning{}},
+			}}},
+		}
+	}
+	assertReady := func(t *testing.T) {
+		t.Helper()
+		result := general.GetRegisterReadinessCheckResult()[general.HealthzCheckName(cpuconsts.CheckCPUSet)]
+		require.True(t, result.Ready, result.Message)
+	}
+
+	t.Run("actual shared and dedicated overlap is not masked by committed cpusets", func(t *testing.T) {
+		policy := newTestDynamicPolicy(t, "check-cpuset-actual-overlap")
+		policy.emitter = &metrics.DummyMetrics{}
+		sharedUID, dedicatedUID := "health-shared", "health-dedicated"
+		sharedContainer, dedicatedContainer := "shared", "dedicated"
+		policy.state.SetPodEntries(state.PodEntries{
+			sharedUID: {sharedContainer: newAllocation(sharedUID, sharedContainer,
+				consts.PodAnnotationQoSLevelSharedCores, machine.MustParse("0-1"), machine.MustParse("0-1"))},
+			dedicatedUID: {dedicatedContainer: newAllocation(dedicatedUID, dedicatedContainer,
+				consts.PodAnnotationQoSLevelDedicatedCores, machine.MustParse("2-3"), machine.MustParse("4-5"))},
+		}, false)
+		policy.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+		policy.metaServer = &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: &pod.PodFetcherStub{
+			PodList: []*v1.Pod{
+				newPod(sharedUID, sharedContainer, "shared-id"),
+				newPod(dedicatedUID, dedicatedContainer, "dedicated-id"),
+			},
+		}}}
+
+		mockey.PatchConvey("use observed cgroup cpusets", t, func() {
+			mockey.Mock(cgroupcommon.GetContainerAbsCgroupPath).Return("/test/cgroup", nil).Build()
+			mockey.Mock(cgroupmanager.GetCPUSetWithAbsolutePath).
+				Return(&cgroupcommon.CPUSetStats{CPUs: "4-5"}, nil).Build()
+			policy.checkCPUSet(nil, nil, nil, nil, nil)
+			result := general.GetRegisterReadinessCheckResult()[general.HealthzCheckName(cpuconsts.CheckCPUSet)]
+			require.False(t, result.Ready)
+			require.Equal(t, "cpuset overlap", result.Message)
+		})
+	})
+
+	t.Run("container id lookup failure is transient", func(t *testing.T) {
+		policy := newTestDynamicPolicy(t, "check-cpuset-container-id-error")
+		policy.emitter = &metrics.DummyMetrics{}
+		policy.state.SetPodEntries(state.PodEntries{"missing-pod": {"main": newAllocation(
+			"missing-pod", "main", consts.PodAnnotationQoSLevelDedicatedCores,
+			machine.MustParse("0-1"), machine.MustParse("0-1"))}}, false)
+		policy.metaServer = &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: &pod.PodFetcherStub{}}}
+		policy.checkCPUSet(nil, nil, nil, nil, nil)
+		assertReady(t)
+	})
+
+	t.Run("container cgroup path lookup failure is transient", func(t *testing.T) {
+		policy := newTestDynamicPolicy(t, "check-cpuset-cgroup-path-error")
+		policy.emitter = &metrics.DummyMetrics{}
+		policy.state.SetPodEntries(state.PodEntries{"missing-cgroup": {"main": newAllocation(
+			"missing-cgroup", "main", consts.PodAnnotationQoSLevelDedicatedCores,
+			machine.MustParse("0-1"), machine.MustParse("0-1"))}}, false)
+		policy.metaServer = &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: &pod.PodFetcherStub{
+			PodList: []*v1.Pod{newPod("missing-cgroup", "main", "missing-id")},
+		}}}
+		policy.checkCPUSet(nil, nil, nil, nil, nil)
+		assertReady(t)
+	})
+}
+
+func TestEmitExceededMetricsWithNilDynamicConfiguration(t *testing.T) {
+	policy := &DynamicPolicy{emitter: &metrics.DummyMetrics{}, dynamicConfig: dynamicconfig.NewDynamicAgentConfiguration()}
+	policy.dynamicConfig.SetDynamicConfiguration(nil)
+	podUID := "nil-dynamic-configuration"
+	podEntries := state.PodEntries{podUID: {"main": {
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid: podUID, ContainerName: "main", ContainerType: v1alpha1.ContainerType_MAIN.String(),
+			QoSLevel: consts.PodAnnotationQoSLevelSharedCores,
+		},
+	}}}
+	cpusetState := &cpusetPodState{
+		cpuset: machine.MustParse("0"), totalMilliCPURequest: 2000,
+		podMap: map[string]*v1.Pod{podUID: {ObjectMeta: metav1.ObjectMeta{Namespace: "test-ns", Name: podUID}}},
+	}
+	require.NotPanics(t, func() {
+		policy.emitExceededMetrics(podEntries, "0", cpusetState, 0.5, false)
+	})
+}
 
 func TestBuildCPUSetPodStateMap(t *testing.T) {
 	t.Parallel()
@@ -540,6 +685,37 @@ func TestApplySystemExclusivePoolChanges(t *testing.T) {
 
 	assert.Equal(t, 2, poolAllocationInfo.AllocationResult.Size())
 	assert.True(t, podAllocationInfo.AllocationResult.Equals(poolAllocationInfo.AllocationResult))
+}
+
+func TestApplySystemExclusivePoolChangesRetriesFailedAtomicCommit(t *testing.T) {
+	policy := newTestDynamicPolicy(t, "apply-system-exclusive-pool-changes-atomic")
+	policy.reservedCPUs = machine.NewCPUSet()
+	defaultSystemCPUs := policy.machineInfo.CPUDetails.CPUs()
+	require.NoError(t, policy.state.SetAllocationInfo("pod-with-pool", "main",
+		newSystemAllocationInfo(t, policy, "pod-with-pool", "main", "latency", defaultSystemCPUs), false))
+	oldEntries := policy.state.GetPodEntries()
+	oldMachineState := policy.state.GetMachineState()
+	commitErr := errors.New("atomic system exclusive commit failed")
+	failingState := &systemExclusiveCommitFailureState{
+		State: policy.state,
+		err:   commitErr,
+	}
+	policy.state = failingState
+	toCreate := map[string]int{commonstate.GetSystemPoolName("latency"): 2}
+
+	err := policy.applySystemExclusivePoolChanges(toCreate, nil, nil)
+
+	require.ErrorIs(t, err, commitErr)
+	require.Equal(t, oldEntries, policy.state.GetPodEntries())
+	require.Equal(t, oldMachineState, policy.state.GetMachineState())
+
+	err = policy.applySystemExclusivePoolChanges(toCreate, nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, 2, failingState.attempts)
+	poolAllocationInfo := policy.state.GetAllocationInfo(
+		commonstate.GetSystemPoolName("latency"), commonstate.FakedContainerName)
+	require.NotNil(t, poolAllocationInfo)
+	require.Equal(t, 2, poolAllocationInfo.AllocationResult.Size())
 }
 
 func TestGetSystemExclusivePoolMetricValueAndStatus(t *testing.T) {

@@ -27,12 +27,57 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/sets"
 
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/metacache"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
+
+func TestCPUResourceAdvisorUpdateNUMAsAvailableUsesRealNUMAIDs(t *testing.T) {
+	t.Parallel()
+
+	conf := generateTestConfiguration(t, t.TempDir(), t.TempDir())
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	for cpuID, cpuInfo := range topology.CPUDetails {
+		if cpuInfo.NUMANodeID == 0 {
+			cpuInfo.NUMANodeID = 2
+		} else {
+			cpuInfo.NUMANodeID = 7
+		}
+		topology.CPUDetails[cpuID] = cpuInfo
+	}
+	topology.NUMAToCPUs = machine.NUMANodeInfo{
+		2: topology.CPUDetails.CPUsInNUMANodes(2),
+		7: topology.CPUDetails.CPUsInNUMANodes(7),
+	}
+
+	metaCache := metacache.NewDummyMetaCacheImp()
+	require.NoError(t, metaCache.SetPoolInfo(commonstate.PoolNameReserve, &types.PoolInfo{
+		PoolName: commonstate.PoolNameReserve,
+		TopologyAwareAssignments: types.TopologyAwareAssignment{
+			2: machine.NewCPUSet(0),
+			7: machine.NewCPUSet(2, 6),
+		},
+	}))
+	cra := &cpuResourceAdvisor{
+		conf:      conf,
+		metaCache: metaCache,
+		metaServer: &metaserver.MetaServer{
+			MetaAgent: &agent.MetaAgent{
+				KatalystMachineInfo: &machine.KatalystMachineInfo{
+					CPUTopology: topology,
+				},
+			},
+		},
+	}
+
+	require.NoError(t, cra.updateNumasAvailableResource(
+		conf.GetDynamicConfiguration(), false, nil))
+	require.Equal(t, map[int]int{2: 3, 7: 2}, cra.numaAvailable)
+}
 
 func Test_cpuResourceAdvisor_updateReservedForReclaim(t *testing.T) {
 	t.Parallel()
@@ -189,10 +234,10 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimIgnoresHardPartitionRatio(t *
 			wantReserved:      map[int]int{0: 4, 1: 4},
 		},
 		{
-			name:              "odd configured reserve keeps existing steady split",
+			name:              "odd configured reserve uses real-id helper distribution",
 			ratio:             0,
 			configuredReserve: resource.MustParse("5"),
-			wantReserved:      map[int]int{0: 2, 1: 2},
+			wantReserved:      map[int]int{0: 4, 1: 2},
 		},
 		{
 			name:              "larger ratio does not replace static reserve",
@@ -408,10 +453,9 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimFallbacks(t *testing.T) {
 		}
 
 		require.NoError(t, cra.updateReservedForReclaim(cra.conf.GetDynamicConfiguration()))
-		// reclaim disabled => non-hard-partition path. the configured 6-CPU
-		// global reserve spreads to 3 CPUs/NUMA, each rounded up to a complete
-		// physical core (cpusPerCore==2) => 4 CPUs per NUMA.
-		assert.Equal(t, map[int]int{0: 4, 1: 4}, cra.reservedForReclaim)
+		// The real-ID helper preserves the six-CPU global floor in complete
+		// cores, assigning the remainder deterministically to NUMA 0.
+		assert.Equal(t, map[int]int{0: 4, 1: 2}, cra.reservedForReclaim)
 	})
 
 	t.Run("nil dynamic configuration returns error and clears reservation", func(t *testing.T) {
@@ -449,9 +493,9 @@ func TestCPUResourceAdvisorUpdateReservedForReclaimFallbacks(t *testing.T) {
 		}
 
 		require.NoError(t, cra.updateReservedForReclaim(cra.conf.GetDynamicConfiguration()))
-		// non-hard-partition path: the configured 6-CPU global reserve spreads to
-		// 3 CPUs/NUMA, each rounded up to a complete physical core => 4 per NUMA.
-		assert.Equal(t, map[int]int{0: 4, 1: 4}, cra.reservedForReclaim)
+		// The real-ID helper preserves the six-CPU global floor in complete
+		// cores, assigning the remainder deterministically to NUMA 0.
+		assert.Equal(t, map[int]int{0: 4, 1: 2}, cra.reservedForReclaim)
 	})
 }
 

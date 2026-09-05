@@ -378,8 +378,9 @@ func TestBuildAdjustmentCommitOverrideFromPodEntriesProtectsDedicatedWhenSharedO
 	override, err := p.buildAdjustmentCommitOverrideFromPodEntries(newEntries, true, true)
 	require.NoError(t, err)
 	require.NotNil(t, override)
-	require.True(t, override.ReclaimEffective.Equals(machine.NewCPUSet(0, 1, 3)),
-		"shared overlap must remain while dedicated overlap is removed, got %s", override.ReclaimEffective)
+	require.Empty(t, override.ReclaimEffective.ToSliceInt(),
+		"dedicated disjoint mode must drop every partial physical core from reclaim, got %s",
+		override.ReclaimEffective)
 }
 
 func TestBuildAdjustmentCommitOverrideFromPodEntriesHandlesDirectContainerOverlap(t *testing.T) {
@@ -417,6 +418,72 @@ func TestBuildAdjustmentCommitOverrideFromPodEntriesHandlesDirectContainerOverla
 	require.NoError(t, err)
 	require.Equal(t, "advisor_pending_entries", override.Source)
 	require.True(t, override.ReclaimEffective.Equals(machine.NewCPUSet(2, 3)))
+}
+
+func TestBuildAdjustmentCommitOverrideFromPodEntriesPreservesWholeCores(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	t.Run("drops the partial sibling pair", func(t *testing.T) {
+		newEntries := state.PodEntries{
+			commonstate.PoolNameReclaim: {
+				commonstate.FakedContainerName: &state.AllocationInfo{
+					AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+					AllocationResult:         machine.NewCPUSet(0, 1, 48, 49),
+					OriginalAllocationResult: machine.NewCPUSet(0, 1, 48, 49),
+				},
+			},
+			"pod-dedicated": {
+				"main": &state.AllocationInfo{
+					AllocationMeta: commonstate.AllocationMeta{
+						PodUid:        "pod-dedicated",
+						ContainerName: "main",
+						OwnerPoolName: commonstate.PoolNameDedicated,
+						QoSLevel:      "dedicated_cores",
+					},
+					AllocationResult: machine.NewCPUSet(0),
+				},
+			},
+		}
+
+		override, err := p.buildAdjustmentCommitOverrideFromPodEntries(newEntries, false, true)
+		require.NoError(t, err)
+		require.NotNil(t, override)
+		require.True(t, override.ReclaimEffective.Equals(machine.NewCPUSet(1, 49)),
+			"partial core must be removed from reclaim, got %s", override.ReclaimEffective)
+	})
+
+	t.Run("commits an empty reclaim override", func(t *testing.T) {
+		newEntries := state.PodEntries{
+			commonstate.PoolNameReclaim: {
+				commonstate.FakedContainerName: &state.AllocationInfo{
+					AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+					AllocationResult:         machine.NewCPUSet(0, 48),
+					OriginalAllocationResult: machine.NewCPUSet(0, 48),
+				},
+			},
+			"pod-dedicated": {
+				"main": &state.AllocationInfo{
+					AllocationMeta: commonstate.AllocationMeta{
+						PodUid:        "pod-dedicated",
+						ContainerName: "main",
+						OwnerPoolName: commonstate.PoolNameDedicated,
+						QoSLevel:      "dedicated_cores",
+					},
+					AllocationResult: machine.NewCPUSet(0),
+				},
+			},
+		}
+
+		override, err := p.buildAdjustmentCommitOverrideFromPodEntries(newEntries, false, true)
+		require.NoError(t, err)
+		require.NotNil(t, override)
+		require.Empty(t, override.ReclaimEffective.ToSliceInt())
+		require.NoError(t, p.syncReclaimPoolWithAdjustmentCommitOverride(newEntries, override))
+		require.Empty(t, reclaimPoolCPUSet(newEntries).ToSliceInt())
+	})
 }
 
 // TestGenerateReclaimBlockCPUSet_InPlaceReuse verifies that when the previous

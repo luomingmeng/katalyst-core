@@ -347,6 +347,7 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 	if err != nil {
 		return fmt.Errorf("build bulkhead topology inputs: %w", err)
 	}
+	requiredCPUSetByRel := topology.RequiredCPUSetByRelFromNodeSpecs(specs)
 	dag, err := topology.BuildDAG(specs)
 	if deadlineErr := admissionStageDeadlineError(ctx, "build bulkhead topology dag"); deadlineErr != nil {
 		return deadlineErr
@@ -383,6 +384,7 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 		CPUDetails:          cpuDetails,
 		ReservedCPUSet:      reservedCPUSet,
 		ExpectedCPUSetByRel: expectedRes.ExpectedByRel,
+		RequiredCPUSetByRel: requiredCPUSetByRel,
 		Objective:           objective,
 		DeferredCPUSetByRel: expectedRes.DeferredLeafByRel,
 		AdmissionBudget: &topology.AdmissionConvergenceBudget{
@@ -730,7 +732,7 @@ func (p *CPUSetTopologyPlugin) reconcileDisabledOnce(
 	ctx context.Context,
 	in bulkheadapi.HandlerContext,
 ) (bulkheadapi.DAGApplyResult, topology.ConvergenceResult, error) {
-	configured := p.configuredReclaimRels(in.DesiredView)
+	configured := p.configuredReclaimRels(in.DesiredView, in.Topology)
 	observed, err := topology.ObserveConfiguredRels(ctx, p.cgroup, configured)
 	if err != nil {
 		return bulkheadapi.DAGApplyResult{}, topology.ConvergenceResult{}, fmt.Errorf("classify reclaim-only rels: %w", err)
@@ -839,18 +841,34 @@ func (p *CPUSetTopologyPlugin) reconcileDisabledOnce(
 	return result, res, nil
 }
 
-func (p *CPUSetTopologyPlugin) configuredReclaimRels(desired *model.DesiredView) []string {
+func (p *CPUSetTopologyPlugin) configuredReclaimRels(
+	desired *model.DesiredView,
+	cpuTopology *machine.CPUTopology,
+) []string {
 	rels := make([]string, 0, len(p.cfg.BulkheadReclaimRelPaths))
+	numaIDs := map[int]struct{}{}
+	if desired != nil {
+		for numaID := range desired.ReclaimEffectivePerNUMA {
+			numaIDs[numaID] = struct{}{}
+		}
+	}
+	if cpuTopology != nil {
+		for _, numaID := range cpuTopology.CPUDetails.NUMANodes().ToSliceInt() {
+			numaIDs[numaID] = struct{}{}
+		}
+	}
+	sortedNUMAIDs := make([]int, 0, len(numaIDs))
+	for numaID := range numaIDs {
+		sortedNUMAIDs = append(sortedNUMAIDs, numaID)
+	}
+	sort.Ints(sortedNUMAIDs)
 	for reclaimIndex, root := range p.cfg.BulkheadReclaimRelPaths {
 		root = strings.Trim(root, "/")
 		if root == "" {
 			continue
 		}
 		rels = append(rels, root)
-		if desired == nil {
-			continue
-		}
-		for numaID := range desired.ReclaimEffectivePerNUMA {
+		for _, numaID := range sortedNUMAIDs {
 			if rel := p.cfg.ReclaimPerNUMA(reclaimIndex, numaID); rel != "" {
 				rels = append(rels, strings.Trim(rel, "/"))
 			}

@@ -2307,6 +2307,52 @@ func TestCPUSetTopologyPluginReconcileDisabledSkipsMissingNUMABucket(t *testing.
 	}
 }
 
+func TestCPUSetTopologyPluginReconcileDisabledDrainsExistingNUMABucketRemovedFromDesiredView(t *testing.T) {
+	t.Parallel()
+
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV2,
+		"bulkhead-reclaim-only-removed-numa-pod",
+		"bulkhead-reclaim-only-removed-numa-container",
+	)
+	p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled = true
+	in.Topology.CPUDetails = machine.CPUDetails{
+		0: {NUMANodeID: 0},
+		1: {NUMANodeID: 0},
+		2: {NUMANodeID: 1},
+		3: {NUMANodeID: 1},
+	}
+	cg.existing["reclaim/reclaim-1"] = true
+	cg.children["reclaim"] = []string{"reclaim-0", "reclaim-1"}
+	cg.cpus["reclaim"] = machine.NewCPUSet(0, 1, 2, 3)
+	cg.cpus["reclaim/reclaim-0"] = machine.NewCPUSet(0, 1)
+	cg.cpus["reclaim/reclaim-1"] = machine.NewCPUSet(2, 3)
+	in.DesiredView.ReclaimEffective = machine.NewCPUSet(0, 1)
+	in.DesiredView.ReclaimEffectivePerNUMA = map[int]machine.CPUSet{
+		0: machine.NewCPUSet(0, 1),
+	}
+
+	result, err := p.ReconcileDisabled(context.Background(), in)
+	if err != nil {
+		t.Fatalf("ReconcileDisabled() error: %v", err)
+	}
+	if got := cg.cpus["reclaim/reclaim-1"]; !got.IsEmpty() {
+		t.Fatalf("removed NUMA bucket cpuset = %s, want empty", got.String())
+	}
+	bucket := indexOfString(cg.writeOrder, "reclaim/reclaim-1")
+	root := indexOfString(cg.writeOrder, "reclaim")
+	if bucket < 0 || root < 0 || bucket >= root {
+		t.Fatalf("write order = %v, want removed NUMA bucket before reclaim root", cg.writeOrder)
+	}
+	if result.AppliedView == nil || !result.AppliedView.ReclaimEffective.Equals(machine.NewCPUSet(0, 1)) {
+		t.Fatalf("applied reclaim = %+v, want 0-1", result.AppliedView)
+	}
+	if got, ok := result.AppliedView.ReclaimEffectivePerNUMA[1]; ok && !got.IsEmpty() {
+		t.Fatalf("removed NUMA applied reclaim = %s, want absent or empty", got.String())
+	}
+}
+
 func TestCPUSetTopologyPluginReconcileDisabledReclassifiesAppearingNUMABucket(t *testing.T) {
 	t.Parallel()
 

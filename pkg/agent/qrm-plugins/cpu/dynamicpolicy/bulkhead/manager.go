@@ -295,6 +295,9 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 							return empty, nonConverged
 						}
 					}
+					if err := m.validateAppliedHardPartition(in, result.AppliedView); err != nil {
+						return empty, fmt.Errorf("validate bulkhead topology applied view: %w", err)
+					}
 					handlerCtx.AppliedView = result.AppliedView.DeepCopy()
 					handlerCtx.View = handlerCtx.AppliedView.CPUSetPartitionView.DeepCopy()
 					verifiedReclaim = handlerCtx.AppliedView.ReclaimEffective.Clone()
@@ -400,6 +403,9 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 					emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", p.Name(), "failed", nonConverged.Error())
 					return empty, nonConverged
 				}
+			}
+			if err := m.validateAppliedHardPartition(in, result.AppliedView); err != nil {
+				return empty, fmt.Errorf("validate bulkhead topology applied view: %w", err)
 			}
 			handlerCtx.AppliedView = result.AppliedView.DeepCopy()
 			handlerCtx.View = handlerCtx.AppliedView.CPUSetPartitionView.DeepCopy()
@@ -516,6 +522,9 @@ func (m *Manager) tryPublishAppliedView(
 	if !model.EqualDesiredView(finalDesired, desiredSnapshot) {
 		return false
 	}
+	if err := bulkheadutils.ValidateHardPartitionAppliedView(result.AppliedView, in.State, in.Topology, opts); err != nil {
+		return false
+	}
 	return commitIfGenerationCurrent(in.CPUSetAdjustmentHandlerCtx, func() {
 		m.appliedView = result.AppliedView.DeepCopy()
 		m.appliedViewRevision++
@@ -559,6 +568,29 @@ func (m *Manager) cpuSetPartitionViewOptions(
 		opts.NonReclaimPoolMinSize = m.defaultNonReclaimPoolMinSize
 	}
 	return opts
+}
+
+func (m *Manager) validateAppliedHardPartition(
+	in cpusetutil.CPUSetAdjustmentHandlerCtx,
+	applied *model.AppliedView,
+) error {
+	if applied != nil &&
+		applied.Level == model.AppliedViewLevelReclaimOnly &&
+		applied.ReclaimEffective.IsEmpty() {
+		return nil
+	}
+	hardActive := in.State != nil && in.State.GetPodEntries().HasActiveRampUp()
+	opts := m.cpuSetPartitionViewOptions(in, hardActive)
+	if opts.HardPartitionTargetError != nil {
+		return opts.HardPartitionTargetError
+	}
+	if !opts.HardPartitionEnabled {
+		return nil
+	}
+	if applied == nil {
+		return fmt.Errorf("missing applied view")
+	}
+	return bulkheadutils.ValidateHardPartitionAppliedView(applied, in.State, in.Topology, opts)
 }
 
 func (m *Manager) buildPluginEnabledState(in bulkheadapi.HandlerContext) map[string]bool {

@@ -1493,6 +1493,36 @@ func TestSolveAdvisorDescriptorPhaseBlockIDRotationPreservesGrowOwnerUnion(t *te
 	require.Equal(t, solve("z-rotated-a", "a-rotated-b"), solve("a-next-a", "z-next-b"))
 }
 
+func TestSolveAdvisorDescriptorPhaseKeepsBlocksWithinComponentSeparate(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	allCPUs := cpuTopology.CPUDetails.CPUs()
+	descriptors := []advisorBlockDescriptor{
+		{
+			BlockID: "block-a", Owners: []string{"shared-owner"},
+			Class: advisorBlockClassShared, NUMAID: commonstate.FakedNUMAID,
+			Quantity: 2, ComponentKey: "shared-component", Eligible: allCPUs,
+		},
+		{
+			BlockID: "block-b", Owners: []string{"shared-owner"},
+			Class: advisorBlockClassShared, NUMAID: commonstate.FakedNUMAID,
+			Quantity: 2, ComponentKey: "shared-component", Eligible: allCPUs,
+		},
+	}
+	result := advisorapi.NewBlockCPUSet()
+
+	_, err = p.solveAdvisorDescriptorPhase(descriptors, allCPUs, result, false, false)
+
+	require.NoError(t, err)
+	require.Len(t, result, 2)
+	require.Equal(t, 2, result["block-a"].Size())
+	require.Equal(t, 2, result["block-b"].Size())
+}
+
 func TestPlanDisjointAdvisorBlocksOverlapNeverReintroducesStateForbiddenOrSystemCPUs(t *testing.T) {
 	t.Parallel()
 
@@ -1634,7 +1664,7 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 		require.Equal(t, 2, got.Intersection(numa1).Size())
 	})
 
-	t.Run("real NUMA reclaim seeds fake NUMA water filling", func(t *testing.T) {
+	t.Run("real NUMA reclaim excludes that NUMA from fake water filling", func(t *testing.T) {
 		p := newPolicy(t, true)
 		result := advisorapi.NewBlockCPUSet()
 		_, err := p.solveAdvisorDescriptorPhase([]advisorBlockDescriptor{
@@ -1649,12 +1679,10 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 		}, allCPUs, result, true, true)
 		require.NoError(t, err)
 		require.Equal(t, 2, result["real-0"].Intersection(numa0).Size())
-		// fake=4 is two whole cores: one core water-fills the empty numa1, the
-		// next lands back on numa0, so both NUMAs stay core-aligned.
-		require.Equal(t, 2, result["fake"].Intersection(numa0).Size())
-		require.Equal(t, 2, result["fake"].Intersection(numa1).Size())
-		require.Equal(t, 4, result["real-0"].Union(result["fake"]).Intersection(numa0).Size())
-		require.Equal(t, 2, result["real-0"].Union(result["fake"]).Intersection(numa1).Size())
+		require.Zero(t, result["fake"].Intersection(numa0).Size())
+		require.Equal(t, 4, result["fake"].Intersection(numa1).Size())
+		require.Equal(t, 2, result["real-0"].Union(result["fake"]).Intersection(numa0).Size())
+		require.Equal(t, 4, result["real-0"].Union(result["fake"]).Intersection(numa1).Size())
 		requireCoreAligned(t, topology, result["real-0"].Union(result["fake"]))
 	})
 
@@ -1802,7 +1830,7 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 
 	t.Run("steady reclaim rejects quantity below all eligible NUMA floors", func(t *testing.T) {
 		_, err := solve(t, newPolicy(t, false), 2, allCPUs, machine.NewCPUSet())
-		require.ErrorContains(t, err, "smaller than required steady minimum")
+		require.ErrorContains(t, err, "smaller than required minimum")
 	})
 
 	t.Run("steady reclaim rejects odd mandatory reclaim union", func(t *testing.T) {
@@ -1826,7 +1854,7 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 				Quantity: 2, ComponentKey: "fake", Eligible: singleNUMACPUs, OldPreferred: fakePreferred,
 			},
 		}, singleNUMACPUs, result, true, false)
-		require.ErrorContains(t, err, "quantity 3 is not a whole-core multiple of 2")
+		require.ErrorContains(t, err, "insufficient aggregate capacity for quantity 2")
 		require.Empty(t, result)
 	})
 
@@ -1851,7 +1879,7 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 		requireCoreAligned(t, topology, result["fake"])
 	})
 
-	t.Run("steady fake quota jointly completes cross numa real mandatory capacity", func(t *testing.T) {
+	t.Run("steady fake quota rejects when real mandatory descriptors exclude every numa", func(t *testing.T) {
 		p := newPolicy(t, false)
 		numa0Core := coresInNUMA(topology, 0, 0, 1).ToSliceInt()
 		numa1Core := coresInNUMA(topology, 1, 0, 1).ToSliceInt()
@@ -1875,11 +1903,8 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 			},
 		}, allCPUs, result, true, false)
 
-		require.NoError(t, err)
-		require.Equal(t, 2, result["real-0"].Union(result["fake"]).Intersection(numa0).Size())
-		require.Equal(t, 2, result["real-1"].Union(result["fake"]).Intersection(numa1).Size())
-		requireCoreAligned(t, topology,
-			result["real-0"].Union(result["real-1"]).Union(result["fake"]))
+		require.ErrorContains(t, err, "insufficient aggregate capacity")
+		require.Empty(t, result)
 	})
 
 	t.Run("steady residual prefers complete cores over fragmented previous reclaim", func(t *testing.T) {

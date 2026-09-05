@@ -17,7 +17,10 @@ limitations under the License.
 package dynamicpolicy
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +30,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gogo/protobuf/proto"
@@ -49,6 +53,8 @@ const (
 	cpuSetAdjustmentRetryInitialBackoff = 10 * time.Millisecond
 	cpuSetAdjustmentRetryMaxBackoff     = 200 * time.Millisecond
 	advisorPostCommitCheckpointName     = "cpu_advisor_post_commit_target"
+	advisorPostCommitCheckpointVersion  = 2
+	advisorPostCommitWALV2Magic         = "\x00KATALYST_CPU_ADVISOR_WAL_V2\x00"
 )
 
 type cpuSetAdjustmentRevisionedState interface {
@@ -56,13 +62,159 @@ type cpuSetAdjustmentRevisionedState interface {
 }
 
 type advisorPostCommitTarget struct {
-	revision uint64
-	response *advisorapi.ListAndWatchResponse
+	preCommitRevision             uint64
+	prepared                      bool
+	abortPending                  bool
+	publicationPending            bool
+	applyMarkerPending            bool
+	cleanupPending                bool
+	previousTarget                *advisorPostCommitTarget
+	applied                       bool
+	checkpointVersion             int
+	revision                      uint64
+	response                      *advisorapi.ListAndWatchResponse
+	migrationCheckpointTransition steadyFakeNUMAMigrationCheckpointTransition
+}
+
+type advisorPostCommitTargetContextKey struct{}
+
+func cpuSetAdjustmentExecutionLeaseFromContext(
+	ctx context.Context,
+	p *DynamicPolicy,
+) *cpuSetAdjustmentExecutionLease {
+	lease, _ := ctx.Value(cpuSetAdjustmentExecutionLeaseContextKey{}).(*cpuSetAdjustmentExecutionLease)
+	if !lease.isActiveFor(p, p.cpuSetAdjustmentExecution) {
+		return nil
+	}
+	return lease
 }
 
 type advisorPostCommitCheckpoint struct {
-	Revision uint64 `json:"revision"`
-	Response []byte `json:"response"`
+	Version                       int                                      `json:"version,omitempty"`
+	PreCommitRevision             *uint64                                  `json:"pre_commit_revision,omitempty"`
+	Revision                      uint64                                   `json:"revision"`
+	Response                      []byte                                   `json:"response"`
+	MigrationCheckpointTransition *advisorMigrationCheckpointTransitionWAL `json:"migration_checkpoint_transition,omitempty"`
+	Applied                       bool                                     `json:"applied,omitempty"`
+	Checksum                      string                                   `json:"checksum,omitempty"`
+}
+
+type advisorMigrationCheckpointTransitionWAL struct {
+	Kind             steadyFakeNUMAMigrationCheckpointTransitionKind `json:"kind"`
+	ConstraintDigest string                                          `json:"constraint_digest,omitempty"`
+	TargetCPUs       []int                                           `json:"target_cpus,omitempty"`
+}
+
+func advisorMigrationCheckpointTransitionToWAL(
+	transition steadyFakeNUMAMigrationCheckpointTransition,
+	topology *machine.CPUTopology,
+) (*advisorMigrationCheckpointTransitionWAL, error) {
+	switch transition.kind {
+	case steadyFakeNUMAMigrationCheckpointKeep:
+		return nil, nil
+	case steadyFakeNUMAMigrationCheckpointRemove:
+		return &advisorMigrationCheckpointTransitionWAL{
+			Kind: steadyFakeNUMAMigrationCheckpointRemove,
+		}, nil
+	case steadyFakeNUMAMigrationCheckpointReplace:
+		if transition.target == nil || transition.target.constraintDigest == "" {
+			return nil, fmt.Errorf("invalid empty advisor migration checkpoint replacement")
+		}
+		if err := validateAdvisorMigrationCheckpointTarget(
+			transition.target.target, topology); err != nil {
+			return nil, err
+		}
+		return &advisorMigrationCheckpointTransitionWAL{
+			Kind:             steadyFakeNUMAMigrationCheckpointReplace,
+			ConstraintDigest: transition.target.constraintDigest,
+			TargetCPUs:       transition.target.target.ToSliceInt(),
+		}, nil
+	default:
+		return nil, fmt.Errorf(
+			"invalid advisor migration checkpoint transition %d", transition.kind)
+	}
+}
+
+func advisorMigrationCheckpointTransitionFromWAL(
+	transition *advisorMigrationCheckpointTransitionWAL,
+	topology *machine.CPUTopology,
+) (steadyFakeNUMAMigrationCheckpointTransition, error) {
+	keep := steadyFakeNUMAMigrationCheckpointTransition{
+		kind: steadyFakeNUMAMigrationCheckpointKeep,
+	}
+	if transition == nil {
+		return keep, nil
+	}
+	switch transition.Kind {
+	case steadyFakeNUMAMigrationCheckpointRemove:
+		return steadyFakeNUMAMigrationCheckpointTransition{
+			kind: steadyFakeNUMAMigrationCheckpointRemove,
+		}, nil
+	case steadyFakeNUMAMigrationCheckpointReplace:
+		if transition.ConstraintDigest == "" {
+			return keep, fmt.Errorf(
+				"advisor migration checkpoint replacement has empty constraint digest")
+		}
+		target := machine.NewCPUSet(transition.TargetCPUs...)
+		if target.Size() != len(transition.TargetCPUs) {
+			return keep, fmt.Errorf(
+				"advisor migration checkpoint replacement contains duplicate CPUs")
+		}
+		if err := validateAdvisorMigrationCheckpointTarget(target, topology); err != nil {
+			return keep, err
+		}
+		return steadyFakeNUMAMigrationCheckpointTransition{
+			kind: steadyFakeNUMAMigrationCheckpointReplace,
+			target: &steadyFakeNUMAMigrationTarget{
+				constraintDigest: transition.ConstraintDigest,
+				target:           target,
+			},
+		}, nil
+	default:
+		return keep, fmt.Errorf(
+			"invalid advisor migration checkpoint transition %d", transition.Kind)
+	}
+}
+
+func validateAdvisorMigrationCheckpointTarget(
+	target machine.CPUSet,
+	topology *machine.CPUTopology,
+) error {
+	if topology == nil {
+		return fmt.Errorf("advisor migration checkpoint validation requires CPU topology")
+	}
+	if outside := target.Difference(topology.CPUDetails.CPUs()); !outside.IsEmpty() {
+		return fmt.Errorf(
+			"advisor migration checkpoint target contains CPUs outside topology: %s",
+			outside.String())
+	}
+	if err := assertCoreAligned(target, topology); err != nil {
+		return fmt.Errorf("advisor migration checkpoint target is not core aligned: %w", err)
+	}
+	return nil
+}
+
+func advisorPostCommitCheckpointChecksum(
+	version int,
+	preCommitRevision *uint64,
+	revision uint64,
+	response []byte,
+	transition *advisorMigrationCheckpointTransitionWAL,
+	applied ...bool,
+) string {
+	hash := sha256.New()
+	_, _ = fmt.Fprintf(hash, "%d\n%d\n", version, revision)
+	if preCommitRevision != nil {
+		_, _ = fmt.Fprintf(hash, "%d\n", *preCommitRevision)
+	}
+	_, _ = hash.Write(response)
+	_, _ = hash.Write([]byte{'\n'})
+	transitionBytes, _ := json.Marshal(transition)
+	_, _ = hash.Write(transitionBytes)
+	if len(applied) > 0 && applied[0] {
+		_, _ = hash.Write([]byte("\napplied"))
+	}
+	return hex.EncodeToString(hash.Sum(nil))
 }
 
 func cpuSetAdjustmentHandlerTimeout(conf *config.Configuration) time.Duration {
@@ -172,6 +324,7 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 	if len(p.cpuSetAdjustmentHandlers) == 0 {
 		return nil
 	}
+	reconcileTarget, _ := ctx.Value(advisorPostCommitTargetContextKey{}).(*advisorPostCommitTarget)
 	mode := cpusetutil.CPUSetAdjustmentModePeriodic
 	if len(modes) > 0 {
 		mode = modes[0].OrFullDefault()
@@ -180,24 +333,16 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 	// Serialize complete adjustment rounds without retaining the policy lock.
 	// Waiting before taking the immutable snapshot ensures a queued round plans
 	// from state left by the preceding round and its caller-side error handling.
-	if p.cpuSetAdjustmentExecution == nil {
-		p.cpuSetAdjustmentExecution = make(chan struct{}, 1)
+	executionLease := cpuSetAdjustmentExecutionLeaseFromContext(ctx, p)
+	if executionLease == nil {
+		var err error
+		executionLease, err = p.acquireCPUSetAdjustmentExecutionLocked(ctx)
+		if err != nil {
+			return err
+		}
+		defer executionLease.release()
+		ctx = context.WithValue(ctx, cpuSetAdjustmentExecutionLeaseContextKey{}, executionLease)
 	}
-	execution := p.cpuSetAdjustmentExecution
-	p.Unlock()
-	select {
-	case execution <- struct{}{}:
-	case <-ctx.Done():
-		p.Lock()
-		return ctx.Err()
-	}
-	if err := ctx.Err(); err != nil {
-		<-execution
-		p.Lock()
-		return err
-	}
-	p.Lock()
-	defer func() { <-execution }()
 
 	for {
 		var topology *machine.CPUTopology
@@ -277,25 +422,42 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 			}
 			return ctx.Err()
 		}
-		if roundErr == nil && !commitOverride.ReclaimEffective.IsEmpty() {
+		reclaimOverrideTrimmed := false
+		if roundErr == nil && commitOverride.Source != "" {
+			appliedReclaim := commitOverride.ReclaimEffective.Clone()
+			alignedReclaim, err := p.coreAlignedReclaimOverride(
+				commitOverride.ReclaimEffective,
+				p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+			)
+			if err != nil {
+				roundErr = fmt.Errorf("align reclaim cpuset adjustment override: %w", err)
+			} else {
+				commitOverride.ReclaimEffective = alignedReclaim
+				reclaimOverrideTrimmed = !alignedReclaim.Equals(appliedReclaim)
+			}
+		}
+		if roundErr == nil && commitOverride.Source != "" {
 			newEntries := p.state.GetPodEntries()
 			if err := p.syncReclaimPoolWithAdjustmentCommitOverride(newEntries, commitOverride); err != nil {
 				roundErr = fmt.Errorf("sync reclaim pool from cpuset adjustment override: %w", err)
 			} else {
-				_, _, err := p.commitPendingCPUPartition(pendingCPUPartition{
-					expectedRevision: stateRevision,
-					entries:          newEntries,
-					allowOverlap:     p.state.GetAllowSharedCoresOverlapReclaimedCores(),
-					disableDedicated: p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
-					persist:          true,
-					source:           "cpuset override",
-					validate:         p.validatePendingAdvisorPartitionView,
-				})
+				_, _, err := p.commitPendingCPUPartitionForAdvisorTarget(pendingCPUPartition{
+					expectedRevision:          stateRevision,
+					entries:                   newEntries,
+					allowOverlap:              p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+					disableDedicated:          p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+					persist:                   true,
+					source:                    "cpuset override",
+					validate:                  p.validatePendingAdvisorPartitionView,
+					requireCoreAlignedReclaim: p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+				}, reconcileTarget)
 				if err != nil {
 					if errors.Is(err, state.ErrStaleStateRevision) {
 						p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonStaleState)
 					}
 					roundErr = fmt.Errorf("commit cpuset adjustment override: %w", err)
+				} else if reclaimOverrideTrimmed {
+					p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonRecoveryCommit)
 				}
 			}
 		}
@@ -315,12 +477,24 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 func cloneAdvisorPostCommitTarget(
 	resp *advisorapi.ListAndWatchResponse,
 	revision uint64,
+	transitions ...steadyFakeNUMAMigrationCheckpointTransition,
 ) *advisorPostCommitTarget {
 	cloned := &advisorapi.ListAndWatchResponse{}
 	if resp != nil {
 		cloned = proto.Clone(resp).(*advisorapi.ListAndWatchResponse)
 	}
-	return &advisorPostCommitTarget{revision: revision, response: cloned}
+	transition := steadyFakeNUMAMigrationCheckpointTransition{
+		kind: steadyFakeNUMAMigrationCheckpointKeep,
+	}
+	if len(transitions) > 0 {
+		transition = cloneSteadyFakeNUMAMigrationCheckpointTransition(transitions[0])
+	}
+	return &advisorPostCommitTarget{
+		checkpointVersion:             advisorPostCommitCheckpointVersion,
+		revision:                      revision,
+		response:                      cloned,
+		migrationCheckpointTransition: transition,
+	}
 }
 
 func nextAdvisorRevision(revision uint64) (uint64, error) {
@@ -333,8 +507,12 @@ func nextAdvisorRevision(revision uint64) (uint64, error) {
 func (p *DynamicPolicy) prepareAdvisorPostCommitTarget(
 	resp *advisorapi.ListAndWatchResponse,
 	postCommitRevision uint64,
+	transitions ...steadyFakeNUMAMigrationCheckpointTransition,
 ) (*advisorPostCommitTarget, error) {
-	target := cloneAdvisorPostCommitTarget(resp, postCommitRevision)
+	target := cloneAdvisorPostCommitTarget(resp, postCommitRevision, transitions...)
+	if postCommitRevision > 0 {
+		target.preCommitRevision = postCommitRevision - 1
+	}
 	if err := p.storeAdvisorPostCommitTarget(target, p.advisorPostCommitStagingPath()); err != nil {
 		return nil, err
 	}
@@ -343,27 +521,111 @@ func (p *DynamicPolicy) prepareAdvisorPostCommitTarget(
 
 func (p *DynamicPolicy) publishPreparedAdvisorPostCommitTarget(target *advisorPostCommitTarget) {
 	p.cpuSetAdjustmentRetryMu.Lock()
-	p.advisorPostCommitTarget = target
+	p.setAdvisorPostCommitTargetLocked(target)
 	p.cpuSetAdjustmentRetryMu.Unlock()
+}
+
+func (p *DynamicPolicy) beginPreparedAdvisorPostCommitTarget(
+	target *advisorPostCommitTarget,
+	preCommitRevision uint64,
+) *advisorPostCommitTarget {
+	p.cpuSetAdjustmentRetryMu.Lock()
+	defer p.cpuSetAdjustmentRetryMu.Unlock()
+	previous := p.advisorPostCommitTarget
+	target.preCommitRevision = preCommitRevision
+	target.prepared = true
+	p.setAdvisorPostCommitTargetLocked(target)
+	return previous
+}
+
+func (p *DynamicPolicy) finishPreparedAdvisorPostCommitTarget(target *advisorPostCommitTarget) {
+	p.cpuSetAdjustmentRetryMu.Lock()
+	defer p.cpuSetAdjustmentRetryMu.Unlock()
+	if p.advisorPostCommitTarget == target {
+		target.prepared = false
+	}
+}
+
+func (p *DynamicPolicy) rollbackPreparedAdvisorPostCommitTarget(
+	target, previous *advisorPostCommitTarget,
+) {
+	p.cpuSetAdjustmentRetryMu.Lock()
+	defer p.cpuSetAdjustmentRetryMu.Unlock()
+	if p.advisorPostCommitTarget == target {
+		p.setAdvisorPostCommitTargetLocked(previous)
+	}
+	for permit, permitTarget := range p.advisorStateWritePermits {
+		if permitTarget == target {
+			delete(p.advisorStateWritePermits, permit)
+		}
+	}
+}
+
+func (p *DynamicPolicy) markAdvisorPostCommitAbortPending(
+	target, previous *advisorPostCommitTarget,
+) {
+	p.cpuSetAdjustmentRetryMu.Lock()
+	if p.advisorPostCommitTarget == target {
+		target.abortPending = true
+		target.previousTarget = previous
+	}
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonApplyFailed)
+}
+
+func (p *DynamicPolicy) markAdvisorPostCommitPublicationPending(target *advisorPostCommitTarget) {
+	p.cpuSetAdjustmentRetryMu.Lock()
+	if p.advisorPostCommitTarget == target {
+		target.publicationPending = true
+	}
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.markAdvisorApplyFailed(target.revision)
 }
 
 func (p *DynamicPolicy) commitAdvisorResponseWithWriteAhead(
 	resp *advisorapi.ListAndWatchResponse,
 	preCommitRevision uint64,
-	commitDesired func() error,
+	commitDesired func(*advisorPostCommitTarget) error,
+) (*advisorPostCommitTarget, error) {
+	return p.commitAdvisorResponseWithWriteAheadTransition(
+		resp,
+		steadyFakeNUMAMigrationCheckpointTransition{
+			kind: steadyFakeNUMAMigrationCheckpointKeep,
+		},
+		preCommitRevision,
+		commitDesired,
+	)
+}
+
+func (p *DynamicPolicy) commitAdvisorResponseWithWriteAheadTransition(
+	resp *advisorapi.ListAndWatchResponse,
+	transition steadyFakeNUMAMigrationCheckpointTransition,
+	preCommitRevision uint64,
+	commitDesired func(*advisorPostCommitTarget) error,
 ) (*advisorPostCommitTarget, error) {
 	postCommitRevision, err := nextAdvisorRevision(preCommitRevision)
 	if err != nil {
 		return nil, err
 	}
-	target, err := p.prepareAdvisorPostCommitTarget(resp, postCommitRevision)
-	if err != nil {
+	target := cloneAdvisorPostCommitTarget(resp, postCommitRevision, transition)
+	p.installCPUStateWritePermit()
+	previousTarget := p.beginPreparedAdvisorPostCommitTarget(target, preCommitRevision)
+	if err := p.storeAdvisorPostCommitTarget(target, p.advisorPostCommitStagingPath()); err != nil {
+		if removeErr := p.removeAdvisorPostCommitStaging(); removeErr != nil {
+			p.markAdvisorPostCommitAbortPending(target, previousTarget)
+			return nil, fmt.Errorf(
+				"persist advisor post-commit target: %w; remove incomplete target while retaining writer fence: %v",
+				err, removeErr)
+		}
+		p.rollbackPreparedAdvisorPostCommitTarget(target, previousTarget)
 		return nil, fmt.Errorf("persist advisor post-commit target: %w", err)
 	}
-	if err := commitDesired(); err != nil {
+	if err := commitDesired(target); err != nil {
 		if removeErr := p.removeAdvisorPostCommitStaging(); removeErr != nil {
+			p.markAdvisorPostCommitAbortPending(target, previousTarget)
 			return nil, fmt.Errorf("%w; remove uncommitted advisor target: %v", err, removeErr)
 		}
+		p.rollbackPreparedAdvisorPostCommitTarget(target, previousTarget)
 		return nil, err
 	}
 	if p.state == nil || p.state.GetRevision() != postCommitRevision {
@@ -372,19 +634,20 @@ func (p *DynamicPolicy) commitAdvisorResponseWithWriteAhead(
 			actualRevision = p.state.GetRevision()
 		}
 		if removeErr := p.removeAdvisorPostCommitStaging(); removeErr != nil {
+			p.markAdvisorPostCommitAbortPending(target, previousTarget)
 			return nil, fmt.Errorf("advisor desired commit revision mismatch: expected=%d actual=%d; remove target: %v",
 				postCommitRevision, actualRevision, removeErr)
 		}
+		p.rollbackPreparedAdvisorPostCommitTarget(target, previousTarget)
 		return nil, fmt.Errorf("advisor desired commit revision mismatch: expected=%d actual=%d",
 			postCommitRevision, actualRevision)
 	}
-	// Once the canonical state revision advances, this target is pending even
-	// if the durable staging-to-active rename fails. Publishing it first keeps
-	// later advisor frames blocked and lets this process retry the exact frame;
-	// the already-synced staging file provides crash recovery.
-	p.publishPreparedAdvisorPostCommitTarget(target)
+	// The prepared target already fences every unrelated writer. Once the
+	// canonical revision advances, switch it to post-commit reconciliation
+	// before promoting the durable staging record.
+	p.finishPreparedAdvisorPostCommitTarget(target)
 	if err := p.promoteAdvisorPostCommitStaging(); err != nil {
-		p.markAdvisorApplyFailed(target.revision)
+		p.markAdvisorPostCommitPublicationPending(target)
 		return nil, fmt.Errorf("promote advisor post-commit target: %w", err)
 	}
 	return target, nil
@@ -413,10 +676,26 @@ func (p *DynamicPolicy) storeAdvisorPostCommitTarget(target *advisorPostCommitTa
 	if err != nil {
 		return fmt.Errorf("marshal advisor response: %w", err)
 	}
-	data, err := json.Marshal(advisorPostCommitCheckpoint{
-		Revision: target.revision,
-		Response: response,
-	})
+	var topology *machine.CPUTopology
+	if p.machineInfo != nil {
+		topology = p.machineInfo.CPUTopology
+	}
+	transition, err := advisorMigrationCheckpointTransitionToWAL(
+		target.migrationCheckpointTransition, topology)
+	if err != nil {
+		return err
+	}
+	checkpoint := advisorPostCommitCheckpoint{
+		Version:                       advisorPostCommitCheckpointVersion,
+		PreCommitRevision:             &target.preCommitRevision,
+		Revision:                      target.revision,
+		Response:                      append([]byte(advisorPostCommitWALV2Magic), response...),
+		MigrationCheckpointTransition: transition,
+		Applied:                       target.applied,
+	}
+	checkpoint.Checksum = advisorPostCommitCheckpointChecksum(
+		checkpoint.Version, checkpoint.PreCommitRevision, checkpoint.Revision, response, transition, checkpoint.Applied)
+	data, err := json.Marshal(checkpoint)
 	if err != nil {
 		return fmt.Errorf("marshal advisor checkpoint: %w", err)
 	}
@@ -474,7 +753,10 @@ func removeAdvisorPostCommitPath(path string) error {
 	if path == "" {
 		return nil
 	}
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
+			return nil
+		}
 		return fmt.Errorf("remove advisor checkpoint: %w", err)
 	}
 	return syncAdvisorPostCommitDirectory(path)
@@ -489,10 +771,10 @@ func (p *DynamicPolicy) removeAdvisorPostCommitStaging() error {
 }
 
 func (p *DynamicPolicy) removeAdvisorPostCommitCheckpoints() error {
-	if err := p.removeAdvisorPostCommitCheckpoint(); err != nil {
+	if err := p.removeAdvisorPostCommitStaging(); err != nil {
 		return err
 	}
-	return p.removeAdvisorPostCommitStaging()
+	return p.removeAdvisorPostCommitCheckpoint()
 }
 
 func (p *DynamicPolicy) promoteAdvisorPostCommitStaging() error {
@@ -507,20 +789,154 @@ func (p *DynamicPolicy) promoteAdvisorPostCommitStaging() error {
 	return syncAdvisorPostCommitDirectory(activePath)
 }
 
-func loadAdvisorPostCommitTarget(path string) (*advisorPostCommitTarget, error) {
+func advisorPostCommitTargetsEqual(left, right *advisorPostCommitTarget) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.checkpointVersion == right.checkpointVersion &&
+		left.preCommitRevision == right.preCommitRevision &&
+		left.revision == right.revision &&
+		proto.Equal(left.response, right.response) &&
+		reflect.DeepEqual(left.migrationCheckpointTransition, right.migrationCheckpointTransition)
+}
+
+func (p *DynamicPolicy) ensureAdvisorPostCommitPublished(target *advisorPostCommitTarget) error {
+	stagingPath := p.advisorPostCommitStagingPath()
+	if stagingPath == "" {
+		return nil
+	}
+	if _, err := os.Stat(stagingPath); err == nil {
+		return p.promoteAdvisorPostCommitStaging()
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat advisor staging checkpoint: %w", err)
+	}
+
+	activePath := p.advisorPostCommitCheckpointPath()
+	var topology *machine.CPUTopology
+	if p.machineInfo != nil {
+		topology = p.machineInfo.CPUTopology
+	}
+	active, err := loadAdvisorPostCommitTarget(activePath, topology)
+	if err != nil {
+		return fmt.Errorf("load promoted advisor checkpoint: %w", err)
+	}
+	if !advisorPostCommitTargetsEqual(active, target) {
+		return fmt.Errorf("promoted advisor checkpoint does not match pending revision %d", target.revision)
+	}
+	return syncAdvisorPostCommitDirectory(activePath)
+}
+
+func loadAdvisorPostCommitTarget(
+	path string,
+	topology *machine.CPUTopology,
+) (*advisorPostCommitTarget, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
 	var checkpoint advisorPostCommitCheckpoint
-	if err := json.Unmarshal(data, &checkpoint); err != nil {
-		return nil, err
+	if err := decoder.Decode(&checkpoint); err != nil {
+		return nil, fmt.Errorf("decode advisor checkpoint: %w", err)
+	}
+	if err := ensureSteadyFakeNUMACheckpointEOF(decoder); err != nil {
+		return nil, fmt.Errorf("advisor checkpoint trailing data: %w", err)
+	}
+	responseBytes := checkpoint.Response
+	switch checkpoint.Version {
+	case 0:
+		if checkpoint.Checksum != "" || checkpoint.MigrationCheckpointTransition != nil ||
+			checkpoint.Applied ||
+			bytes.HasPrefix(responseBytes, []byte(advisorPostCommitWALV2Magic)) {
+			return nil, fmt.Errorf("advisor checkpoint version is missing")
+		}
+	case advisorPostCommitCheckpointVersion:
+		if checkpoint.Checksum == "" {
+			return nil, fmt.Errorf("advisor checkpoint checksum is missing")
+		}
+		if checkpoint.PreCommitRevision == nil {
+			return nil, fmt.Errorf("advisor checkpoint pre-commit revision is missing")
+		}
+		if !bytes.HasPrefix(responseBytes, []byte(advisorPostCommitWALV2Magic)) {
+			return nil, fmt.Errorf("advisor WAL V2 magic is missing")
+		}
+		responseBytes = responseBytes[len(advisorPostCommitWALV2Magic):]
+		if checkpoint.Checksum != advisorPostCommitCheckpointChecksum(
+			checkpoint.Version,
+			checkpoint.PreCommitRevision,
+			checkpoint.Revision,
+			responseBytes,
+			checkpoint.MigrationCheckpointTransition,
+			checkpoint.Applied,
+		) {
+			return nil, fmt.Errorf("advisor checkpoint checksum mismatch")
+		}
+	default:
+		return nil, fmt.Errorf(
+			"unsupported advisor checkpoint version %d", checkpoint.Version)
 	}
 	response := &advisorapi.ListAndWatchResponse{}
-	if err := proto.Unmarshal(checkpoint.Response, response); err != nil {
+	if err := proto.Unmarshal(responseBytes, response); err != nil {
 		return nil, err
 	}
-	return &advisorPostCommitTarget{revision: checkpoint.Revision, response: response}, nil
+	transition, err := advisorMigrationCheckpointTransitionFromWAL(
+		checkpoint.MigrationCheckpointTransition, topology)
+	if err != nil {
+		return nil, err
+	}
+	if checkpoint.Version == advisorPostCommitCheckpointVersion {
+		postCommitRevision, err := nextAdvisorRevision(*checkpoint.PreCommitRevision)
+		if err != nil {
+			return nil, fmt.Errorf("invalid advisor checkpoint revision transition: %w", err)
+		}
+		if checkpoint.Revision != postCommitRevision {
+			return nil, fmt.Errorf(
+				"invalid advisor checkpoint revision transition: pre=%d post=%d",
+				*checkpoint.PreCommitRevision, checkpoint.Revision)
+		}
+	}
+	target := &advisorPostCommitTarget{
+		checkpointVersion:             checkpoint.Version,
+		revision:                      checkpoint.Revision,
+		response:                      response,
+		migrationCheckpointTransition: transition,
+		applied:                       checkpoint.Applied,
+	}
+	if checkpoint.PreCommitRevision != nil {
+		target.preCommitRevision = *checkpoint.PreCommitRevision
+	}
+	return target, nil
+}
+
+type advisorPostCommitRecoveryState int
+
+const (
+	advisorPostCommitRecoveryCleanup advisorPostCommitRecoveryState = iota
+	advisorPostCommitRecoveryReplay
+	advisorPostCommitRecoveryBeforeCommit
+)
+
+func advisorPostCommitRecoveryForRevision(
+	target *advisorPostCommitTarget,
+	currentRevision uint64,
+) advisorPostCommitRecoveryState {
+	if target == nil {
+		return advisorPostCommitRecoveryCleanup
+	}
+	if target.checkpointVersion != advisorPostCommitCheckpointVersion {
+		if currentRevision == target.revision {
+			return advisorPostCommitRecoveryReplay
+		}
+		return advisorPostCommitRecoveryCleanup
+	}
+	if currentRevision == target.revision {
+		return advisorPostCommitRecoveryReplay
+	}
+	if currentRevision == target.preCommitRevision {
+		return advisorPostCommitRecoveryBeforeCommit
+	}
+	return advisorPostCommitRecoveryCleanup
 }
 
 func (p *DynamicPolicy) restoreAdvisorPostCommitTarget() error {
@@ -533,16 +949,22 @@ func (p *DynamicPolicy) restoreAdvisorPostCommitTarget() error {
 	if p.state != nil {
 		mainRevision = p.state.GetRevision()
 	}
-	active, activeErr := loadAdvisorPostCommitTarget(activePath)
-	staging, stagingErr := loadAdvisorPostCommitTarget(stagingPath)
+	var topology *machine.CPUTopology
+	if p.machineInfo != nil {
+		topology = p.machineInfo.CPUTopology
+	}
+	active, activeErr := loadAdvisorPostCommitTarget(activePath, topology)
+	staging, stagingErr := loadAdvisorPostCommitTarget(stagingPath, topology)
 
 	var selected *advisorPostCommitTarget
-	if stagingErr == nil && staging.revision == mainRevision {
+	if stagingErr == nil &&
+		advisorPostCommitRecoveryForRevision(staging, mainRevision) == advisorPostCommitRecoveryReplay {
 		selected = staging
 		if err := p.promoteAdvisorPostCommitStaging(); err != nil {
 			return err
 		}
-	} else if activeErr == nil && active.revision == mainRevision {
+	} else if activeErr == nil &&
+		advisorPostCommitRecoveryForRevision(active, mainRevision) == advisorPostCommitRecoveryReplay {
 		selected = active
 		if err := p.removeAdvisorPostCommitStaging(); err != nil {
 			return err
@@ -563,7 +985,7 @@ func (p *DynamicPolicy) restoreAdvisorPostCommitTarget() error {
 		return nil
 	}
 	p.cpuSetAdjustmentRetryMu.Lock()
-	p.advisorPostCommitTarget = selected
+	p.setAdvisorPostCommitTargetLocked(selected)
 	p.cpuSetAdjustmentRetryMu.Unlock()
 	return nil
 }
@@ -578,13 +1000,18 @@ func (p *DynamicPolicy) prepareAdvisorPostCommitTargetOnStart() error {
 		}
 	}
 
+	stateRevision := uint64(0)
+	if p.state != nil {
+		stateRevision = p.state.GetRevision()
+	}
+
 	p.cpuSetAdjustmentRetryMu.Lock()
 	defer p.cpuSetAdjustmentRetryMu.Unlock()
 	if p.advisorPostCommitTarget == nil {
 		return nil
 	}
-	if p.state == nil || p.advisorPostCommitTarget.revision != p.state.GetRevision() {
-		p.advisorPostCommitTarget = nil
+	if p.state == nil || p.advisorPostCommitTarget.revision != stateRevision {
+		p.setAdvisorPostCommitTargetLocked(nil)
 		return p.removeAdvisorPostCommitCheckpoints()
 	}
 	p.cpuSetAdjustmentRetryDirty = true
@@ -601,10 +1028,177 @@ func (p *DynamicPolicy) hasAnyPendingAdvisorPostCommitTarget() bool {
 	return p.advisorPostCommitTarget != nil
 }
 
+func (p *DynamicPolicy) installCPUStateWritePermit() {
+	p.state.SetWritePermit(func(revision uint64, operation string, permit *state.WritePermit) error {
+		if permit == nil {
+			return p.ensureCPUStateWriterAllowed(revision, "state."+operation, nil)
+		}
+
+		p.cpuSetAdjustmentRetryMu.Lock()
+		defer p.cpuSetAdjustmentRetryMu.Unlock()
+		target, ok := p.advisorStateWritePermits[permit]
+		delete(p.advisorStateWritePermits, permit)
+		if ok && target != nil && p.advisorPostCommitTarget == target {
+			if target.prepared && revision == target.preCommitRevision {
+				return nil
+			}
+			if !target.prepared && revision == target.revision {
+				return nil
+			}
+		}
+		pendingRevision := uint64(0)
+		if p.advisorPostCommitTarget != nil {
+			pendingRevision = p.advisorPostCommitTarget.revision
+		}
+		return &advisorPostCommitPendingError{
+			pendingRevision:   pendingRevision,
+			attemptedRevision: revision,
+			source:            "state." + operation,
+		}
+	})
+}
+
+func (p *DynamicPolicy) newAdvisorStateWritePermit(target *advisorPostCommitTarget) *state.WritePermit {
+	permit := state.NewWritePermit()
+	p.cpuSetAdjustmentRetryMu.Lock()
+	if p.advisorStateWritePermits == nil {
+		p.advisorStateWritePermits = make(map[*state.WritePermit]*advisorPostCommitTarget)
+	}
+	p.advisorStateWritePermits[permit] = target
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	return permit
+}
+
+func (p *DynamicPolicy) ensureCPUStateWriterAllowed(
+	attemptedRevision uint64,
+	source string,
+	reconcileTarget *advisorPostCommitTarget,
+) error {
+	p.cpuSetAdjustmentRetryMu.Lock()
+	pendingTarget := p.advisorPostCommitTarget
+	if pendingTarget == nil {
+		p.cpuSetAdjustmentRetryMu.Unlock()
+		return nil
+	}
+	pendingPrepared := pendingTarget.prepared
+	pendingPreCommitRevision := pendingTarget.preCommitRevision
+	pendingRevision := pendingTarget.revision
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	if reconcileTarget == pendingTarget {
+		if pendingPrepared && attemptedRevision == pendingPreCommitRevision {
+			return nil
+		}
+		if !pendingPrepared && attemptedRevision == pendingRevision {
+			return nil
+		}
+	}
+	return &advisorPostCommitPendingError{
+		pendingRevision:   pendingRevision,
+		attemptedRevision: attemptedRevision,
+		source:            source,
+	}
+}
+
 func (p *DynamicPolicy) currentAdvisorPostCommitTarget() *advisorPostCommitTarget {
 	p.cpuSetAdjustmentRetryMu.Lock()
 	defer p.cpuSetAdjustmentRetryMu.Unlock()
 	return p.advisorPostCommitTarget
+}
+
+func (p *DynamicPolicy) currentAdvisorPostCommitTargetAndChange() (*advisorPostCommitTarget, <-chan struct{}) {
+	p.cpuSetAdjustmentRetryMu.Lock()
+	defer p.cpuSetAdjustmentRetryMu.Unlock()
+	if p.advisorPostCommitTargetChange == nil {
+		p.advisorPostCommitTargetChange = make(chan struct{})
+	}
+	return p.advisorPostCommitTarget, p.advisorPostCommitTargetChange
+}
+
+// setAdvisorPostCommitTargetLocked publishes a pointer transition and wakes all
+// waiters that atomically observed the previous target and change channel.
+// cpuSetAdjustmentRetryMu must be held by the caller.
+func (p *DynamicPolicy) setAdvisorPostCommitTargetLocked(target *advisorPostCommitTarget) {
+	if p.advisorPostCommitTarget == target {
+		return
+	}
+	if p.advisorPostCommitTargetChange != nil {
+		close(p.advisorPostCommitTargetChange)
+	}
+	p.advisorPostCommitTarget = target
+	p.advisorPostCommitTargetChange = make(chan struct{})
+}
+
+func (p *DynamicPolicy) retryAdvisorPostCommitAbort(target *advisorPostCommitTarget) error {
+	if err := p.removeAdvisorPostCommitStaging(); err != nil {
+		p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonApplyFailed)
+		return fmt.Errorf("remove aborted advisor post-commit staging: %w", err)
+	}
+	previous := target.previousTarget
+	p.rollbackPreparedAdvisorPostCommitTarget(target, previous)
+	p.cpuSetAdjustmentRetryMu.Lock()
+	delete(p.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
+	if len(p.cpuSetAdjustmentRetryReasons) == 0 && previous == nil {
+		p.cpuSetAdjustmentRetryDirty = false
+		p.cpuSetAdjustmentRetryReasons = nil
+	}
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	return nil
+}
+
+func (p *DynamicPolicy) retryAdvisorPostCommitPublication(target *advisorPostCommitTarget) error {
+	if err := p.ensureAdvisorPostCommitPublished(target); err != nil {
+		p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonApplyFailed)
+		return fmt.Errorf("publish committed advisor post-commit target: %w", err)
+	}
+	p.cpuSetAdjustmentRetryMu.Lock()
+	if p.advisorPostCommitTarget == target {
+		target.publicationPending = false
+	}
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	return nil
+}
+
+func (p *DynamicPolicy) persistAdvisorPostCommitApplied(target *advisorPostCommitTarget) error {
+	if err := p.storeAdvisorPostCommitTarget(target, p.advisorPostCommitCheckpointPath()); err != nil {
+		p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonApplyFailed)
+		return fmt.Errorf("persist applied advisor post-commit target: %w", err)
+	}
+	p.cpuSetAdjustmentRetryMu.Lock()
+	if p.advisorPostCommitTarget == target {
+		target.applyMarkerPending = false
+		target.cleanupPending = true
+	}
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	return nil
+}
+
+func (p *DynamicPolicy) completeAdvisorPostCommitCleanup(target *advisorPostCommitTarget) error {
+	if err := p.removeAdvisorPostCommitCheckpoints(); err != nil {
+		p.cpuSetAdjustmentRetryMu.Lock()
+		if p.advisorPostCommitTarget == target {
+			target.cleanupPending = true
+		}
+		p.cpuSetAdjustmentRetryMu.Unlock()
+		p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonApplyFailed)
+		return fmt.Errorf("remove reconciled advisor post-commit checkpoints: %w", err)
+	}
+
+	p.cpuSetAdjustmentRetryMu.Lock()
+	if p.advisorPostCommitTarget == target {
+		p.setAdvisorPostCommitTargetLocked(nil)
+		for permit, permitTarget := range p.advisorStateWritePermits {
+			if permitTarget == target {
+				delete(p.advisorStateWritePermits, permit)
+			}
+		}
+		delete(p.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
+		if len(p.cpuSetAdjustmentRetryReasons) == 0 {
+			p.cpuSetAdjustmentRetryDirty = false
+			p.cpuSetAdjustmentRetryReasons = nil
+		}
+	}
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	return nil
 }
 
 func (p *DynamicPolicy) reconcileAdvisorPostCommitTarget(
@@ -615,7 +1209,55 @@ func (p *DynamicPolicy) reconcileAdvisorPostCommitTarget(
 	if target == nil {
 		return nil
 	}
-	if !p.advisorPostCommitTargetCurrent(target) {
+	executionLease := cpuSetAdjustmentExecutionLeaseFromContext(ctx, p)
+	if executionLease == nil {
+		var err error
+		executionLease, err = p.acquireCPUSetAdjustmentExecutionLocked(ctx)
+		if err != nil {
+			return fmt.Errorf("reconcile advisor post-commit target waiting for cpuset adjustment execution: %w", err)
+		}
+		defer executionLease.release()
+		ctx = context.WithValue(ctx, cpuSetAdjustmentExecutionLeaseContextKey{}, executionLease)
+	}
+	p.cpuSetAdjustmentRetryMu.Lock()
+	current := p.advisorPostCommitTarget == target
+	abortPending := target.abortPending
+	publicationPending := target.publicationPending
+	applyMarkerPending := target.applyMarkerPending
+	cleanupPending := target.cleanupPending
+	applied := target.applied
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	if !current {
+		return nil
+	}
+	if abortPending {
+		return p.retryAdvisorPostCommitAbort(target)
+	}
+	if publicationPending {
+		if err := p.retryAdvisorPostCommitPublication(target); err != nil {
+			return err
+		}
+	}
+	if applyMarkerPending {
+		if err := p.persistAdvisorPostCommitApplied(target); err != nil {
+			return err
+		}
+		cleanupPending = true
+	}
+	if applied && !cleanupPending {
+		p.cpuSetAdjustmentRetryMu.Lock()
+		if p.advisorPostCommitTarget == target {
+			target.cleanupPending = true
+		}
+		p.cpuSetAdjustmentRetryMu.Unlock()
+		cleanupPending = true
+	}
+	if cleanupPending || applied {
+		return p.completeAdvisorPostCommitCleanup(target)
+	}
+	if current, err := p.advisorPostCommitTargetStatus(target); err != nil {
+		return err
+	} else if !current {
 		return nil
 	}
 
@@ -623,31 +1265,43 @@ func (p *DynamicPolicy) reconcileAdvisorPostCommitTarget(
 	if len(modes) > 0 {
 		mode = modes[0].OrFullDefault()
 	}
+	if err := p.applySteadyFakeNUMAMigrationCheckpointTransition(
+		target.migrationCheckpointTransition); err != nil {
+		if mode != cpusetutil.CPUSetAdjustmentModeRetry {
+			p.markAdvisorApplyFailed(target.revision)
+		}
+		return fmt.Errorf("apply migration checkpoint transition failed: %w", err)
+	}
+	if current, err := p.advisorPostCommitTargetStatus(target); err != nil {
+		return err
+	} else if !current {
+		return nil
+	}
 	headroomErr := p.applyHeadroom(target.response)
-	if !p.advisorPostCommitTargetCurrent(target) {
+	if current, err := p.advisorPostCommitTargetStatus(target); err != nil {
+		return err
+	} else if !current {
 		return nil
 	}
 	cgroupErr := p.applyCgroupConfigs(target.response)
-	if !p.advisorPostCommitTargetCurrent(target) {
+	if current, err := p.advisorPostCommitTargetStatus(target); err != nil {
+		return err
+	} else if !current {
 		return nil
 	}
-	adjustmentErr := p.runCPUSetAdjustmentHandlers(ctx, mode)
+	adjustmentCtx := context.WithValue(ctx, advisorPostCommitTargetContextKey{}, target)
+	adjustmentErr := p.runCPUSetAdjustmentHandlers(adjustmentCtx, mode)
 	if headroomErr == nil && cgroupErr == nil && adjustmentErr == nil {
 		p.cpuSetAdjustmentRetryMu.Lock()
 		if p.advisorPostCommitTarget == target {
-			if err := p.removeAdvisorPostCommitCheckpoints(); err != nil {
-				p.cpuSetAdjustmentRetryMu.Unlock()
-				return err
-			}
-			p.advisorPostCommitTarget = nil
-			delete(p.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
-			if len(p.cpuSetAdjustmentRetryReasons) == 0 {
-				p.cpuSetAdjustmentRetryDirty = false
-				p.cpuSetAdjustmentRetryReasons = nil
-			}
+			target.applied = true
+			target.applyMarkerPending = true
 		}
 		p.cpuSetAdjustmentRetryMu.Unlock()
-		return nil
+		if err := p.persistAdvisorPostCommitApplied(target); err != nil {
+			return err
+		}
+		return p.completeAdvisorPostCommitCleanup(target)
 	}
 
 	if mode != cpusetutil.CPUSetAdjustmentModeRetry {
@@ -667,19 +1321,28 @@ func (p *DynamicPolicy) reconcileAdvisorPostCommitTarget(
 }
 
 func (p *DynamicPolicy) advisorPostCommitTargetCurrent(target *advisorPostCommitTarget) bool {
+	current, _ := p.advisorPostCommitTargetStatus(target)
+	return current
+}
+
+func (p *DynamicPolicy) advisorPostCommitTargetStatus(
+	target *advisorPostCommitTarget,
+) (bool, error) {
 	p.cpuSetAdjustmentRetryMu.Lock()
-	defer p.cpuSetAdjustmentRetryMu.Unlock()
-	if p.advisorPostCommitTarget != target {
-		return false
+	current := p.advisorPostCommitTarget
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	if current != target || target == nil || p.state == nil {
+		return false, nil
 	}
-	if p.state != nil && p.state.GetRevision() == target.revision {
-		return true
+	actualRevision := p.state.GetRevision()
+	if actualRevision != target.revision {
+		return false, &advisorPostCommitPendingError{
+			pendingRevision:   target.revision,
+			attemptedRevision: actualRevision,
+			source:            "advisor post-commit reconcile",
+		}
 	}
-	p.advisorPostCommitTarget = nil
-	if err := p.removeAdvisorPostCommitCheckpoints(); err != nil {
-		general.Errorf("remove stale advisor post-commit checkpoints failed: %v", err)
-	}
-	return false
+	return true, nil
 }
 
 func (p *DynamicPolicy) markAdvisorApplyFailed(revision uint64) {
@@ -798,22 +1461,9 @@ func (p *DynamicPolicy) scheduleCPUSetAdjustmentRetry(reason cpusetutil.CPUSetAd
 			err := p.retryLatestCPUSetAdjustment(ctx, cpusetutil.CPUSetAdjustmentModeRetry)
 			cancel()
 			p.Unlock()
+			attempt++
 			if err != nil {
-				attempt++
 				general.Errorf("retry latest cpuset adjustment failed, reason=%s: %v", reason, err)
-				if attempt < cpuSetAdjustmentRetryMaxAttempts {
-					timer := time.NewTimer(cpuSetAdjustmentRetryBackoff(attempt))
-					select {
-					case <-timer.C:
-					case <-stopCh:
-						if !timer.Stop() {
-							<-timer.C
-						}
-						finishStopped()
-						return
-					}
-					continue
-				}
 			}
 
 			p.cpuSetAdjustmentRetryMu.Lock()
@@ -823,13 +1473,25 @@ func (p *DynamicPolicy) scheduleCPUSetAdjustmentRetry(reason cpusetutil.CPUSetAd
 				p.cpuSetAdjustmentRetryMu.Unlock()
 				return
 			}
-			if p.cpuSetAdjustmentRetryAgain {
+			retryAgain := p.cpuSetAdjustmentRetryAgain
+			if retryAgain {
 				p.cpuSetAdjustmentRetryAgain = false
+			}
+			if (err != nil || retryAgain) && attempt < cpuSetAdjustmentRetryMaxAttempts {
 				p.cpuSetAdjustmentRetryMu.Unlock()
-				attempt = 0
+				timer := time.NewTimer(cpuSetAdjustmentRetryBackoff(attempt))
+				select {
+				case <-timer.C:
+				case <-stopCh:
+					if !timer.Stop() {
+						<-timer.C
+					}
+					finishStopped()
+					return
+				}
 				continue
 			}
-			if err == nil && p.advisorPostCommitTarget == nil && !p.cpuSetAdjustmentRetryPersist {
+			if err == nil && !retryAgain && p.advisorPostCommitTarget == nil && !p.cpuSetAdjustmentRetryPersist {
 				p.cpuSetAdjustmentRetryDirty = false
 				p.cpuSetAdjustmentRetryReasons = nil
 			} else {

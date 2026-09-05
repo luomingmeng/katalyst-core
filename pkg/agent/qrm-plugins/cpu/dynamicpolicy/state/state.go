@@ -911,20 +911,37 @@ type reader interface {
 	GetRevision() uint64
 }
 
+// WritePermit is an opaque, single-use capability for one gated state write.
+// Callers can create a token, but only the installed WriteGate can bind and
+// authorize it.
+type WritePermit struct {
+	consumed bool
+}
+
+func NewWritePermit() *WritePermit {
+	return &WritePermit{}
+}
+
+// WriteGate may reject a state mutation before it changes memory or persistent
+// state. The revision and operation identify the attempted write; permit is nil
+// for ordinary writers.
+type WriteGate func(revision uint64, operation string, permit *WritePermit) error
+
 // writer is used to store information into local states,
 // and it also provides functionality to maintain the local files
 type writer interface {
-	SetMachineState(numaNodeMap NUMANodeMap, persist bool)
-	SetNUMAHeadroom(numaHeadroom map[int]float64, persist bool)
-	SetPodEntries(podEntries PodEntries, writeThrough bool)
-	SetAllocationInfo(podUID string, containerName string, allocationInfo *AllocationInfo, persist bool)
-	SetAllowSharedCoresOverlapReclaimedCores(allowSharedCoresOverlapReclaimedCores, persist bool)
-	SetDisableDedicatedCoresOverlapReclaimedCores(disableDedicatedCoresOverlapReclaimedCores, persist bool)
-	CommitAdvisorState(podEntries PodEntries, machineState NUMANodeMap, allowSharedCoresOverlapReclaimedCores, disableDedicatedCoresOverlapReclaimedCores, persist bool) error
-	CommitAdvisorStateIfRevision(expectedRevision uint64, podEntries PodEntries, machineState NUMANodeMap, allowSharedCoresOverlapReclaimedCores, disableDedicatedCoresOverlapReclaimedCores, persist bool) error
+	SetWritePermit(gate WriteGate)
+	SetMachineState(numaNodeMap NUMANodeMap, persist bool) error
+	SetNUMAHeadroom(numaHeadroom map[int]float64, persist bool) error
+	SetPodEntries(podEntries PodEntries, writeThrough bool) error
+	SetAllocationInfo(podUID string, containerName string, allocationInfo *AllocationInfo, persist bool) error
+	SetAllowSharedCoresOverlapReclaimedCores(allowSharedCoresOverlapReclaimedCores, persist bool) error
+	SetDisableDedicatedCoresOverlapReclaimedCores(disableDedicatedCoresOverlapReclaimedCores, persist bool) error
+	CommitAdvisorState(podEntries PodEntries, machineState NUMANodeMap, allowSharedCoresOverlapReclaimedCores, disableDedicatedCoresOverlapReclaimedCores, persist bool, permits ...*WritePermit) error
+	CommitAdvisorStateIfRevision(expectedRevision uint64, podEntries PodEntries, machineState NUMANodeMap, allowSharedCoresOverlapReclaimedCores, disableDedicatedCoresOverlapReclaimedCores, persist bool, permits ...*WritePermit) error
 
-	Delete(podUID string, containerName string, persist bool)
-	ClearState()
+	Delete(podUID string, containerName string, persist bool) error
+	ClearState() error
 	StoreState() error
 }
 

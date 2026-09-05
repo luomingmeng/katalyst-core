@@ -48,9 +48,10 @@ import (
 // ---------------------------------------------------------------------------
 
 type fakeFS struct {
-	reads    map[string]string // path -> file content (e.g. root cgroup.procs)
-	readErr  error
-	readErrs map[string]error
+	reads     map[string]string // path -> file content (e.g. root cgroup.procs)
+	readErr   error
+	readErrs  map[string]error
+	readPaths []string
 }
 
 func newFakeFS() *fakeFS {
@@ -58,6 +59,7 @@ func newFakeFS() *fakeFS {
 }
 
 func (f *fakeFS) ReadFile(p string) ([]byte, error) {
+	f.readPaths = append(f.readPaths, p)
 	if f.readErr != nil {
 		return nil, f.readErr
 	}
@@ -108,6 +110,7 @@ type fakeCgroup struct {
 	existingDirs       map[string]bool // rel -> whether StatDir succeeds
 	attaches           []attachCall
 	identityAttaches   []identityAttachCall
+	cpusetApplies      []cpusetApplyCall
 	attachErr          error
 	attachHook         func()
 	identityAttachHook func()
@@ -129,6 +132,9 @@ type fakeCgroup struct {
 	controllerTaskAttachErr map[string]error
 	controllerFileErrs      map[string]map[string]error
 	controllerEnsureErr     map[string]error
+	statCalls               int
+	readCgroupCalls         int
+	readCPUSetCalls         int
 }
 
 type attachCall struct {
@@ -140,6 +146,12 @@ type identityAttachCall struct {
 	rel      string
 	identity cgroupclient.CgroupIdentity
 	pid      int
+}
+
+type cpusetApplyCall struct {
+	rel  string
+	cpus string
+	mems string
 }
 
 type controllerAttachCall struct {
@@ -168,6 +180,7 @@ func newFakeCgroup() *fakeCgroup {
 }
 
 func (f *fakeCgroup) StatDir(_ context.Context, rel string) (time.Time, error) {
+	f.statCalls++
 	if f.existingDirs[rel] {
 		return time.Time{}, nil
 	}
@@ -202,7 +215,28 @@ func (f *fakeCgroup) AttachPIDWithIdentity(
 	return nil
 }
 
+func (f *fakeCgroup) ApplyCPUSet(_ context.Context, rel string, data *cgcommon.CPUSetData) error {
+	if data == nil {
+		return errors.New("nil cpuset data")
+	}
+	f.cpusetApplies = append(f.cpusetApplies, cpusetApplyCall{rel: rel, cpus: data.CPUs, mems: data.Mems})
+	if f.cgroupFiles == nil {
+		f.cgroupFiles = map[string]map[string][]byte{}
+	}
+	if f.cgroupFiles[rel] == nil {
+		f.cgroupFiles[rel] = map[string][]byte{}
+	}
+	if data.CPUs != "" || data.WriteEmptyCPUs {
+		f.cgroupFiles[rel]["cpuset.cpus.effective"] = []byte(data.CPUs)
+	}
+	if data.Mems != "" || data.WriteEmptyMems {
+		f.cgroupFiles[rel]["cpuset.mems"] = []byte(data.Mems)
+	}
+	return nil
+}
+
 func (f *fakeCgroup) ReadCgroupFile(_ context.Context, rel, file string) ([]byte, error) {
+	f.readCgroupCalls++
 	if f.cgroupFileErr != nil {
 		return nil, f.cgroupFileErr
 	}
@@ -215,6 +249,7 @@ func (f *fakeCgroup) ReadCgroupFile(_ context.Context, rel, file string) ([]byte
 }
 
 func (f *fakeCgroup) ReadCPUSet(_ context.Context, rel string) (machine.CPUSet, error) {
+	f.readCPUSetCalls++
 	if cpus, ok := f.cpuSets[rel]; ok {
 		return cpus, nil
 	}
@@ -637,6 +672,84 @@ func TestCPUSetAdjustmentHandler_IsNoOp(t *testing.T) {
 	}
 	if len(fCg.attaches) != 0 {
 		t.Fatalf("CPUSetAdjustmentHandler must NOT invoke AttachPID, got %+v", fCg.attaches)
+	}
+}
+
+func TestCPUSetAdjustmentHandlerDoesNotWriteTargetCPUSet(t *testing.T) {
+	t.Parallel()
+	fFS := newFakeFS()
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		100: {PID: 100, Comm: "crond"},
+	}}
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	seedTargetEffectiveCPUSet(fCg, "system", "0-7")
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+
+	if err := p.CPUSetAdjustmentHandler(context.Background(), bulkheadapi.HandlerContext{
+		AppliedView:         appliedViewWithReclaim(machine.NewCPUSet(2, 3)),
+		AppliedViewRevision: 15,
+	}); err != nil {
+		t.Fatalf("CPUSetAdjustmentHandler: %v", err)
+	}
+	if len(fCg.cpusetApplies) != 0 {
+		t.Fatalf("systemservice must not own target cpuset writes, got %+v", fCg.cpusetApplies)
+	}
+	if len(fCg.identityAttaches) != 0 || len(fCg.attaches) != 0 {
+		t.Fatalf("CPUSetAdjustmentHandler must not migrate PIDs, identity=%+v path=%+v", fCg.identityAttaches, fCg.attaches)
+	}
+}
+
+func TestCPUSetAdjustmentHandlerDoesNotReplaceTargetCPUSet(t *testing.T) {
+	t.Parallel()
+	fFS := newFakeFS()
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		100: {PID: 100, Comm: "crond"},
+	}}
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	seedTargetEffectiveCPUSet(fCg, "system", "0-1")
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+
+	if err := p.CPUSetAdjustmentHandler(context.Background(), bulkheadapi.HandlerContext{
+		AppliedView:         appliedViewWithReclaim(machine.NewCPUSet(2, 3)),
+		AppliedViewRevision: 16,
+	}); err != nil {
+		t.Fatalf("CPUSetAdjustmentHandler: %v", err)
+	}
+	if len(fCg.cpusetApplies) != 0 {
+		t.Fatalf("systemservice must not replace target cpuset, got %+v", fCg.cpusetApplies)
+	}
+	if len(fCg.identityAttaches) != 0 || len(fCg.attaches) != 0 {
+		t.Fatalf("CPUSetAdjustmentHandler must not migrate PIDs, identity=%+v path=%+v", fCg.identityAttaches, fCg.attaches)
+	}
+}
+
+func TestCPUSetAdjustmentHandlerDoesNotWriteWithoutRelProof(t *testing.T) {
+	t.Parallel()
+
+	fFS := newFakeFS()
+	fProc := &fakeProc{procs: map[int]procfscommon.ProcInfo{
+		100: {PID: 100, Comm: "crond"},
+	}}
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	seedTargetEffectiveCPUSet(fCg, "system", "0-7")
+	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
+	applied := model.NewDesiredView()
+	applied.ReclaimEffective = machine.NewCPUSet(2, 3)
+
+	if err := p.CPUSetAdjustmentHandler(context.Background(), bulkheadapi.HandlerContext{
+		AppliedView:         applied.ToAppliedView(),
+		AppliedViewRevision: 15,
+	}); err != nil {
+		t.Fatalf("CPUSetAdjustmentHandler: %v", err)
+	}
+	if len(fCg.cpusetApplies) != 0 {
+		t.Fatalf("systemservice must not synthesize target cpuset ownership, got %+v", fCg.cpusetApplies)
+	}
+	if len(fCg.identityAttaches) != 0 || len(fCg.attaches) != 0 {
+		t.Fatalf("CPUSetAdjustmentHandler must not migrate PIDs, identity=%+v path=%+v", fCg.identityAttaches, fCg.attaches)
 	}
 }
 
@@ -1147,14 +1260,17 @@ func TestPeriodicalSystemServiceDoesNotResampleDesiredPartition(t *testing.T) {
 	})
 
 	in := appliedPeriodCtx(true, 8, machine.NewCPUSet(2, 3))
-	if err := p.PeriodicalHandler(context.Background(), in); err != nil {
-		t.Fatalf("PeriodicalHandler: %v", err)
+	if err := p.PeriodicalHandler(context.Background(), in); err == nil {
+		t.Fatal("runtime target cpuset mismatch must be reported")
 	}
-	if len(fCg.attaches) != 0 {
-		t.Fatalf("target outside AppliedView reclaim must not migrate even if static config exists, got %+v", fCg.attaches)
+	if len(fCg.cpusetApplies) != 0 {
+		t.Fatalf("systemservice must not ApplyCPUSet, got %+v", fCg.cpusetApplies)
 	}
-	if p.lastMigratedAppliedViewRevision != 0 {
-		t.Fatalf("unauthorized target must not consume revision, got %d", p.lastMigratedAppliedViewRevision)
+	if len(fCg.identityAttaches) != 0 {
+		t.Fatalf("target outside AppliedView reclaim must not migrate, got %+v", fCg.identityAttaches)
+	}
+	if len(fFS.readPaths) != 0 {
+		t.Fatalf("proof mismatch must stop before candidate reads, got %v", fFS.readPaths)
 	}
 }
 
@@ -1172,11 +1288,35 @@ func TestPeriodicalSystemServiceRequiresPerRelAppliedProof(t *testing.T) {
 
 	in := appliedPeriodCtx(true, 8, machine.NewCPUSet(0, 1, 2, 3))
 	in.AppliedView.CPUSetByRel["system"] = machine.NewCPUSet(2, 3)
+	delete(in.AppliedView.RelProofByRel, "system")
 	if err := p.PeriodicalHandler(context.Background(), in); err != nil {
 		t.Fatalf("PeriodicalHandler: %v", err)
 	}
+	if len(fFS.readPaths) != 0 || fCg.statCalls != 0 || fCg.readCgroupCalls != 0 || fCg.readCPUSetCalls != 0 {
+		t.Fatalf("missing per-rel CPUSet+identity proof must stop before reads: fs=%v stat=%d cgroup=%d cpuset=%d",
+			fFS.readPaths, fCg.statCalls, fCg.readCgroupCalls, fCg.readCPUSetCalls)
+	}
 	if len(fCg.attaches) != 0 {
 		t.Fatalf("aggregate reclaim membership must not replace per-rel proof, got %+v", fCg.attaches)
+	}
+}
+
+func TestPeriodicalSystemServiceReportsAuthorizationErrorWithoutCandidates(t *testing.T) {
+	t.Parallel()
+
+	fFS := newFakeFS()
+	seedRootPIDs(fFS)
+	fCg := newFakeCgroup()
+	fCg.existingDirs["system"] = true
+	fCg.cgroupFileErr = errors.New("read runtime cpuset failed")
+	p := newTestPlugin("system", fFS, &fakeProc{}, fCg, bulkheadconfig.BulkheadConfiguration{})
+
+	err := p.PeriodicalHandler(context.Background(), appliedPeriodCtx(true, 14, machine.NewCPUSet(0, 1)))
+	if err == nil || !strings.Contains(err.Error(), "authorize cpuset target") {
+		t.Fatalf("authorization error must be reported without candidates, got %v", err)
+	}
+	if len(fFS.readPaths) != 0 {
+		t.Fatalf("authorization must run before candidate reads, got %v", fFS.readPaths)
 	}
 }
 
@@ -1807,7 +1947,7 @@ func TestPeriodicalHandler_ResetListError(t *testing.T) {
 	}
 }
 
-func TestPeriodicalHandler_CPUOnlyRootDoesNotRequireCPUSetProof(t *testing.T) {
+func TestPeriodicalHandler_CPUOnlyRootRequiresCPUSetProof(t *testing.T) {
 	t.Parallel()
 
 	fFS := newFakeFS()
@@ -1822,21 +1962,23 @@ func TestPeriodicalHandler_CPUOnlyRootDoesNotRequireCPUSetProof(t *testing.T) {
 	fCg.mounts[cgcommon.CgroupSubsysCPU] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpu"}
 	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
 
-	if err := p.PeriodicalHandler(context.Background(), periodCtx(true)); err != nil {
+	in := periodCtx(true)
+	delete(in.AppliedView.RelProofByRel, "system")
+	if err := p.PeriodicalHandler(context.Background(), in); err != nil {
 		t.Fatalf("PeriodicalHandler: %v", err)
 	}
-	if got, want := fCg.ensures, []controllerEnsureCall{{controller: cgcommon.CgroupSubsysCPU, rel: "system"}}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("cpu target ensure calls = %+v, want %+v", got, want)
+	if len(fCg.ensures) != 0 {
+		t.Fatalf("missing per-rel proof must prevent cpu target writes, got %+v", fCg.ensures)
 	}
-	if got, want := fCg.controllerAttaches, []controllerAttachCall{{controller: cgcommon.CgroupSubsysCPU, rel: "system", pid: 100}}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("cpu controller attaches = %+v, want %+v", got, want)
+	if len(fCg.controllerAttaches) != 0 {
+		t.Fatalf("missing per-rel proof must prevent cpu attaches, got %+v", fCg.controllerAttaches)
 	}
-	if len(fCg.identityAttaches) != 0 {
-		t.Fatalf("cpu-only candidate must not attach to cpuset, got %+v", fCg.identityAttaches)
+	if len(fFS.readPaths) != 0 {
+		t.Fatalf("missing per-rel proof must prevent candidate reads, got %v", fFS.readPaths)
 	}
 }
 
-func TestPeriodicalHandler_PreparesTargetsFromCandidateNeeds(t *testing.T) {
+func TestPeriodicalHandler_PreflightsProofBeforeDiscoveringCandidateNeeds(t *testing.T) {
 	t.Parallel()
 
 	fFS := newFakeFS()
@@ -1850,22 +1992,18 @@ func TestPeriodicalHandler_PreparesTargetsFromCandidateNeeds(t *testing.T) {
 	fCg.mounts[cgcommon.CgroupSubsysCPUSet] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpuset"}
 	fCg.mounts[cgcommon.CgroupSubsysCPU] = cgcommon.ControllerMount{Root: "/sys/fs/cgroup/cpu"}
 	fCg.existingDirs["system"] = true
-	fCg.cgroupFileErr = errors.New("cpuset target must not be inspected")
+	fCg.cgroupFileErr = errors.New("cpuset authorization failed")
 	p := newTestPlugin("system", fFS, fProc, fCg, bulkheadconfig.BulkheadConfiguration{})
 
-	if err := p.PeriodicalHandler(context.Background(), appliedPeriodCtx(true, 1, machine.NewCPUSet(0, 1))); err != nil {
-		t.Fatalf("PeriodicalHandler must ignore unused cpuset target: %v", err)
+	err := p.PeriodicalHandler(context.Background(), appliedPeriodCtx(true, 1, machine.NewCPUSet(0, 1)))
+	if err == nil || !strings.Contains(err.Error(), "authorize cpuset target") {
+		t.Fatalf("PeriodicalHandler must report proof preflight error: %v", err)
 	}
-	if got, want := fCg.ensures, []controllerEnsureCall{{controller: cgcommon.CgroupSubsysCPU, rel: "system"}}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("target ensure calls = %+v, want %+v", got, want)
+	if len(fFS.readPaths) != 0 {
+		t.Fatalf("proof preflight error must precede candidate reads, got %v", fFS.readPaths)
 	}
-	if got, want := fCg.controllerAttaches, []controllerAttachCall{{
-		controller: cgcommon.CgroupSubsysCPU, rel: "system", pid: 100,
-	}}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("cpu controller attaches = %+v, want %+v", got, want)
-	}
-	if len(fCg.identityAttaches) != 0 {
-		t.Fatalf("unused cpuset target must not receive attaches, got %+v", fCg.identityAttaches)
+	if len(fCg.ensures) != 0 || len(fCg.controllerAttaches) != 0 {
+		t.Fatalf("proof preflight error must prevent writes, ensures=%+v attaches=%+v", fCg.ensures, fCg.controllerAttaches)
 	}
 }
 
@@ -1974,7 +2112,7 @@ func TestPeriodicalHandler_ResetDoesNotAttachCPUTaskOnlyMembershipForCPUSetLeade
 	}
 }
 
-func TestPeriodicalHandler_InvalidAppliedViewStillMigratesCPU(t *testing.T) {
+func TestPeriodicalHandler_InvalidAppliedViewDoesNotReadOrMigrateCPU(t *testing.T) {
 	t.Parallel()
 
 	fFS := newFakeFS()
@@ -1996,17 +2134,18 @@ func TestPeriodicalHandler_InvalidAppliedViewStillMigratesCPU(t *testing.T) {
 	if err := p.PeriodicalHandler(context.Background(), in); err != nil {
 		t.Fatalf("PeriodicalHandler: %v", err)
 	}
-	if got, want := fCg.controllerAttaches, []controllerAttachCall{{
-		controller: cgcommon.CgroupSubsysCPU, rel: "system", pid: 100,
-	}}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("cpu controller attaches = %+v, want %+v", got, want)
+	if len(fFS.readPaths) != 0 {
+		t.Fatalf("invalid applied view must prevent candidate reads, got %v", fFS.readPaths)
+	}
+	if len(fCg.controllerAttaches) != 0 {
+		t.Fatalf("invalid applied view must prevent cpu attaches, got %+v", fCg.controllerAttaches)
 	}
 	if p.lastMigratedAppliedViewRevision != 0 {
 		t.Fatalf("cpu-only migration must not consume applied-view revision, got %d", p.lastMigratedAppliedViewRevision)
 	}
 }
 
-func TestPeriodicalHandler_MixedCandidateMigratesOnlyCPUWhenCPUSetUnauthorized(t *testing.T) {
+func TestPeriodicalHandler_MixedCandidateRuntimeMismatchBlocksAllControllers(t *testing.T) {
 	t.Parallel()
 
 	fFS := newFakeFS()
@@ -2029,23 +2168,24 @@ func TestPeriodicalHandler_MixedCandidateMigratesOnlyCPUWhenCPUSetUnauthorized(t
 		AppliedViewValidForPeriodical: true,
 	}
 
-	if err := p.PeriodicalHandler(context.Background(), in); err != nil {
-		t.Fatalf("PeriodicalHandler: %v", err)
+	if err := p.PeriodicalHandler(context.Background(), in); err == nil {
+		t.Fatal("runtime target cpuset mismatch must be reported")
 	}
 	if len(fCg.identityAttaches) != 0 {
 		t.Fatalf("unauthorized cpuset membership must not migrate, got %+v", fCg.identityAttaches)
 	}
-	if got, want := fCg.controllerAttaches, []controllerAttachCall{{
-		controller: cgcommon.CgroupSubsysCPU, rel: "system", pid: 100,
-	}}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("cpu controller attaches = %+v, want %+v", got, want)
+	if len(fCg.controllerAttaches) != 0 {
+		t.Fatalf("runtime mismatch must prevent cpu controller writes, got %+v", fCg.controllerAttaches)
+	}
+	if len(fFS.readPaths) != 0 {
+		t.Fatalf("runtime mismatch must be detected before candidate reads, got %v", fFS.readPaths)
 	}
 	if p.lastMigratedAppliedViewRevision != 0 {
-		t.Fatalf("cpu-only migration must not consume applied-view revision, got %d", p.lastMigratedAppliedViewRevision)
+		t.Fatalf("blocked migration must not consume applied-view revision, got %d", p.lastMigratedAppliedViewRevision)
 	}
 }
 
-func TestPeriodicalHandler_LaterCPUSetAuthorizationDoesNotRepeatCPU(t *testing.T) {
+func TestPeriodicalHandler_LaterCPUSetAuthorizationStartsMigration(t *testing.T) {
 	t.Parallel()
 
 	fFS := newFakeFS()
@@ -2066,16 +2206,15 @@ func TestPeriodicalHandler_LaterCPUSetAuthorizationDoesNotRepeatCPU(t *testing.T
 	if err := p.PeriodicalHandler(context.Background(), invalid); err != nil {
 		t.Fatalf("first PeriodicalHandler: %v", err)
 	}
-	if len(fCg.controllerAttaches) != 1 {
-		t.Fatalf("first sweep must migrate cpu once, got %+v", fCg.controllerAttaches)
+	if len(fCg.controllerAttaches) != 0 {
+		t.Fatalf("first sweep without proof must not migrate cpu, got %+v", fCg.controllerAttaches)
 	}
 
-	fFS.reads["/sys/fs/cgroup/cpu/cgroup.procs"] = ""
 	if err := p.PeriodicalHandler(context.Background(), appliedPeriodCtx(true, 11, machine.NewCPUSet(0, 1))); err != nil {
 		t.Fatalf("second PeriodicalHandler: %v", err)
 	}
 	if len(fCg.controllerAttaches) != 1 {
-		t.Fatalf("later cpuset authorization must not repeat cpu migration, got %+v", fCg.controllerAttaches)
+		t.Fatalf("later authorization must migrate cpu once, got %+v", fCg.controllerAttaches)
 	}
 	if len(fCg.identityAttaches) != 1 || fCg.identityAttaches[0].pid != 100 {
 		t.Fatalf("later valid cpuset proof must migrate cpuset membership, got %+v", fCg.identityAttaches)
@@ -2088,7 +2227,7 @@ func TestPeriodicalHandler_LaterCPUSetAuthorizationDoesNotRepeatCPU(t *testing.T
 func TestPeriodicalHandler_PreflightsControllerErrorsOnceWithoutCrossBlocking(t *testing.T) {
 	t.Parallel()
 
-	t.Run("cpuset authorization error does not block cpu", func(t *testing.T) {
+	t.Run("cpuset authorization error blocks cpu before candidate reads", func(t *testing.T) {
 		fFS := newFakeFS()
 		fFS.reads["/sys/fs/cgroup/cpuset/cgroup.procs"] = "100\n101\n"
 		fFS.reads["/sys/fs/cgroup/cpu/cgroup.procs"] = "100\n101\n"
@@ -2111,8 +2250,11 @@ func TestPeriodicalHandler_PreflightsControllerErrorsOnceWithoutCrossBlocking(t 
 		if got := strings.Count(err.Error(), "authorize cpuset target"); got != 1 {
 			t.Fatalf("cpuset authorization error count = %d, want 1: %v", got, err)
 		}
-		if len(fCg.controllerAttaches) != 2 {
-			t.Fatalf("cpuset authorization error must not block cpu migrations, got %+v", fCg.controllerAttaches)
+		if len(fFS.readPaths) != 0 {
+			t.Fatalf("cpuset authorization error must precede candidate reads, got %v", fFS.readPaths)
+		}
+		if len(fCg.controllerAttaches) != 0 {
+			t.Fatalf("cpuset authorization error must block cpu migrations, got %+v", fCg.controllerAttaches)
 		}
 	})
 

@@ -202,6 +202,33 @@ func TestDynamicPolicy_takeByTieredPreferredCPUs(t *testing.T) {
 		require.True(t, taken.Union(remaining).Equals(available))
 		require.True(t, taken.Intersection(remaining).IsEmpty())
 	})
+
+	t.Run("keeps duplicate core ids on different sockets distinct", func(t *testing.T) {
+		t.Parallel()
+
+		topology, err := machine.GenerateDummyCPUTopology(8, 2, 2)
+		require.NoError(t, err)
+		for cpu, info := range topology.CPUDetails {
+			if info.SocketID == 1 {
+				info.CoreID -= 2
+				topology.CPUDetails[cpu] = info
+			}
+		}
+
+		policy := &DynamicPolicy{
+			machineInfo: &machine.KatalystMachineInfo{CPUTopology: topology},
+		}
+		available := topology.CPUDetails.CPUs()
+		atomicDonor := machine.NewCPUSet(2, 6)
+
+		taken, remaining, err := policy.takeByTieredPreferredCPUs(
+			available, nil, topology.CPUsPerCore(), atomicDonor)
+		require.NoError(t, err)
+		assertTieredTakenCoreAligned(t, topology, taken)
+		require.Equal(t, topology.CPUsPerCore(), taken.Size())
+		require.True(t, taken.Union(remaining).Equals(available))
+		require.True(t, taken.Intersection(remaining).IsEmpty())
+	})
 }
 
 // assertTieredTakenCoreAligned fails when a core-aligned test case returns a
@@ -209,13 +236,23 @@ func TestDynamicPolicy_takeByTieredPreferredCPUs(t *testing.T) {
 func assertTieredTakenCoreAligned(t *testing.T, topology *machine.CPUTopology, taken machine.CPUSet) {
 	t.Helper()
 	cpusPerCore := topology.CPUsPerCore()
-	byCore := make(map[int]int)
+	type physicalCoreID struct {
+		numaID   int
+		socketID int
+		coreID   int
+	}
+	byCore := make(map[physicalCoreID]int)
 	for _, cpu := range taken.ToSliceInt() {
-		byCore[topology.CPUDetails[cpu].CoreID]++
+		info := topology.CPUDetails[cpu]
+		byCore[physicalCoreID{
+			numaID:   info.NUMANodeID,
+			socketID: info.SocketID,
+			coreID:   info.CoreID,
+		}]++
 	}
 	for core, cnt := range byCore {
 		if cnt != cpusPerCore {
-			t.Fatalf("core %d has %d/%d siblings in taken %s (half core)",
+			t.Fatalf("core %+v has %d/%d siblings in taken %s (half core)",
 				core, cnt, cpusPerCore, taken.String())
 		}
 	}
@@ -411,18 +448,18 @@ func TestDynamicPolicy_takeCPUsForPoolsInPlaceWithPreferred(t *testing.T) {
 			commonstate.PoolNameReclaim: 2,
 		}
 		preferred := map[string]machine.CPUSet{
-			commonstate.PoolNameShare:   machine.NewCPUSet(8, 9),
-			commonstate.PoolNameReclaim: machine.NewCPUSet(8, 9),
+			commonstate.PoolNameShare:   machine.NewCPUSet(0, 8),
+			commonstate.PoolNameReclaim: machine.NewCPUSet(0, 8),
 		}
 
 		remaining, err := p.takeCPUsForPoolsInPlaceWithPreferred(
 			poolsQuantityMap, poolsCPUSet, available, preferred)
 		require.NoError(t, err)
 
-		require.True(t, poolsCPUSet[commonstate.PoolNameReclaim].Equals(machine.NewCPUSet(8, 9)),
+		require.True(t, poolsCPUSet[commonstate.PoolNameReclaim].Equals(machine.NewCPUSet(0, 8)),
 			"reclaim pool should keep its historical cpuset before share consumes preferred cpus, got %s",
 			poolsCPUSet[commonstate.PoolNameReclaim].String())
-		require.True(t, poolsCPUSet[commonstate.PoolNameShare].Equals(machine.NewCPUSet(0, 1)),
+		require.True(t, poolsCPUSet[commonstate.PoolNameShare].Equals(machine.NewCPUSet(1, 9)),
 			"share pool should fall back after reclaim keeps historical cpus, got %s",
 			poolsCPUSet[commonstate.PoolNameShare].String())
 		require.True(t, remaining.IsEmpty())

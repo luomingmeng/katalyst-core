@@ -551,6 +551,130 @@ func TestManagerEmptyReclaimOnlyResultDoesNotWriteCommitOverride(t *testing.T) {
 	}
 }
 
+func TestManagerHardPartitionAcceptsEmptyReclaimOnlyResultWithoutCommitOverride(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(64, 2, 2)
+	if err != nil {
+		t.Fatalf("GenerateDummyCPUTopology() error: %v", err)
+	}
+	state := cpustate.NewCPUPluginState(topology)
+	state.SetAllocationInfo(
+		commonstate.PoolNameReserve,
+		commonstate.FakedContainerName,
+		&cpustate.AllocationInfo{
+			AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReserve),
+			AllocationResult: machine.NewCPUSet(),
+		},
+	)
+	state.SetAllocationInfo(
+		commonstate.PoolNameReclaim,
+		commonstate.FakedContainerName,
+		&cpustate.AllocationInfo{
+			AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+			AllocationResult: topology.CPUDetails.CPUs(),
+		},
+	)
+	state.SetAllocationInfo("ramp-up-pod", "main", &cpustate.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        "ramp-up-pod",
+			ContainerName: "main",
+		},
+		RampUp: true,
+	})
+
+	topologyPlugin := &fakeDisabledTopologyPlugin{
+		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
+		shouldReconcile: true,
+		results:         []bulkheadapi.DAGApplyResult{reclaimOnlyResult(machine.NewCPUSet())},
+	}
+	manager := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin}}
+	override := &cpusetutil.CPUSetAdjustmentCommitOverride{}
+	dynamicConf := dynamicBulkheadConf(true)
+	dynamicConf.EnableReclaim = true
+	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.EnableRampUpReclaimHardPartition = true
+	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.InitialRampUpReclaimCPUSetRatio = 0.2
+
+	got, err := manager.Apply(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
+		DynamicConf:    dynamicConf,
+		State:          state,
+		Topology:       topology,
+		CommitOverride: override,
+	})
+	if err != nil {
+		t.Fatalf("Apply() error: %v", err)
+	}
+	if !got.IsEmpty() || !manager.LatestAppliedReclaim().IsEmpty() {
+		t.Fatalf("empty reclaim-only result not retained: return=%s latest=%s",
+			got.String(), manager.LatestAppliedReclaim().String())
+	}
+	if override.Source != "" || !override.ReclaimEffective.IsEmpty() {
+		t.Fatalf("empty reclaim-only result wrote commit override: %+v", override)
+	}
+}
+
+func TestManagerValidateAppliedHardPartitionEmptyAppliedView(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(64, 2, 2)
+	if err != nil {
+		t.Fatalf("GenerateDummyCPUTopology() error: %v", err)
+	}
+	state := cpustate.NewCPUPluginState(topology)
+	state.SetAllocationInfo(
+		commonstate.PoolNameReserve,
+		commonstate.FakedContainerName,
+		&cpustate.AllocationInfo{
+			AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReserve),
+			AllocationResult: machine.NewCPUSet(),
+		},
+	)
+	state.SetAllocationInfo(
+		commonstate.PoolNameReclaim,
+		commonstate.FakedContainerName,
+		&cpustate.AllocationInfo{
+			AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+			AllocationResult: topology.CPUDetails.CPUs(),
+		},
+	)
+	state.SetAllocationInfo("ramp-up-pod", "main", &cpustate.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        "ramp-up-pod",
+			ContainerName: "main",
+		},
+		RampUp: true,
+	})
+	dynamicConf := dynamicBulkheadConf(true)
+	dynamicConf.EnableReclaim = true
+	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.EnableRampUpReclaimHardPartition = true
+	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.InitialRampUpReclaimCPUSetRatio = 0.2
+	in := cpusetutil.CPUSetAdjustmentHandlerCtx{
+		DynamicConf: dynamicConf,
+		State:       state,
+		Topology:    topology,
+	}
+
+	for _, tc := range []struct {
+		name    string
+		level   model.AppliedViewLevel
+		wantErr bool
+	}{
+		{name: "reclaim-only reset sentinel", level: model.AppliedViewLevelReclaimOnly},
+		{name: "full view fails closed", level: model.AppliedViewLevelFull, wantErr: true},
+		{name: "parent-safe view fails closed", level: model.AppliedViewLevelParentSafe, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			applied := model.NewDesiredView().ToAppliedView()
+			applied.Level = tc.level
+
+			err := (&Manager{}).validateAppliedHardPartition(in, applied)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validateAppliedHardPartition() error = %v, wantErr %t", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestManagerRejectsInvalidReclaimOnlyResult(t *testing.T) {
 	t.Parallel()
 
@@ -1047,6 +1171,86 @@ func TestManagerApplyPassesOwnedVerifiedViewToDependentsAndReturnsReclaim(t *tes
 	applied.NonReclaimPool.Add(1)
 	if dependent.adjustOwnedViews[0].NonReclaimPool.Contains(1) {
 		t.Fatal("dependent view aliases topology result AppliedView")
+	}
+}
+
+func TestManagerApplyRejectsFullyConvergedAppliedViewWithMissingPerNUMAProof(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(64, 2, 2)
+	if err != nil {
+		t.Fatalf("GenerateDummyCPUTopology() error: %v", err)
+	}
+	state := cpustate.NewCPUPluginState(topology)
+	state.SetAllocationInfo(
+		commonstate.PoolNameReserve,
+		commonstate.FakedContainerName,
+		&cpustate.AllocationInfo{
+			AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReserve),
+			AllocationResult: machine.NewCPUSet(),
+		},
+	)
+	state.SetAllocationInfo(
+		commonstate.PoolNameReclaim,
+		commonstate.FakedContainerName,
+		&cpustate.AllocationInfo{
+			AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+			AllocationResult: topology.CPUDetails.CPUs(),
+		},
+	)
+	state.SetAllocationInfo("ramp-up-pod", "main", &cpustate.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        "ramp-up-pod",
+			ContainerName: "main",
+		},
+		RampUp: true,
+	})
+
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0).ToSliceInt()
+	numa1 := topology.CPUDetails.CPUsInNUMANodes(1).ToSliceInt()
+	verified := machine.NewCPUSet(append(numa0[:6], numa1[:6]...)...)
+	applied := model.NewDesiredView().ToAppliedView()
+	applied.ReclaimEffective = verified
+	applied.ReclaimEffectivePerNUMA = map[int]machine.CPUSet{
+		0: machine.NewCPUSet(numa0[:6]...),
+	}
+	topologyPlugin := &fakeTopologyPlugin{
+		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
+		result: bulkheadapi.DAGApplyResult{
+			FullyConverged:       true,
+			FinalSnapshotCurrent: true,
+			AppliedView:          applied,
+		},
+	}
+	dependent := &fakePlugin{name: "workqueue", enabled: true}
+	manager := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, dependent}}
+	override := &cpusetutil.CPUSetAdjustmentCommitOverride{}
+	dynamicConf := dynamicBulkheadConf(true)
+	dynamicConf.EnableReclaim = true
+	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.EnableRampUpReclaimHardPartition = true
+	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.InitialRampUpReclaimCPUSetRatio = 0.2
+
+	got, err := manager.Apply(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
+		DynamicConf:    dynamicConf,
+		State:          state,
+		Topology:       topology,
+		CommitOverride: override,
+	})
+	if err == nil || !strings.Contains(err.Error(), "proof missing for NUMA 1") {
+		t.Fatalf("Apply() error = %v, want missing per-NUMA applied proof", err)
+	}
+	if !got.IsEmpty() {
+		t.Fatalf("Apply() reclaim = %s, want empty on hard-floor violation", got.String())
+	}
+	if len(dependent.adjustViews) != 0 {
+		t.Fatalf("dependent calls = %d, want 0", len(dependent.adjustViews))
+	}
+	if manager.appliedView != nil || !manager.LatestAppliedReclaim().IsEmpty() {
+		t.Fatalf("invalid applied view published: view=%+v reclaim=%s",
+			manager.appliedView, manager.LatestAppliedReclaim().String())
+	}
+	if override.Source != "" || !override.ReclaimEffective.IsEmpty() {
+		t.Fatalf("invalid applied view wrote commit override: %+v", override)
 	}
 }
 

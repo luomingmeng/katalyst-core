@@ -30,8 +30,8 @@ func (p *SystemServicePlugin) Enable(in bulkheadapi.HandlerContext) bool {
 	return enableBulkheadSystemService(in.DynamicConf)
 }
 
-// CPUSetAdjustmentHandler is intentionally a no-op: all migration runs in
-// PeriodicalHandler via cgroup.procs (AttachPID).
+// CPUSetAdjustmentHandler is intentionally a no-op: cpuset_topology exclusively
+// owns target cpuset writes, while migration runs in PeriodicalHandler.
 func (p *SystemServicePlugin) CPUSetAdjustmentHandler(context.Context, bulkheadapi.HandlerContext) error {
 	return nil
 }

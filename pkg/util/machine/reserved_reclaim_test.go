@@ -30,6 +30,28 @@ func evenCapacity(size int) func(int) int {
 	return func(int) int { return size }
 }
 
+func sparseNUMATestTopology(t *testing.T) *CPUTopology {
+	t.Helper()
+
+	topology, err := GenerateDummyCPUTopology(8, 1, 2)
+	if err != nil {
+		t.Fatalf("generate dummy topology: %v", err)
+	}
+	for cpuID, cpuInfo := range topology.CPUDetails {
+		if cpuInfo.NUMANodeID == 0 {
+			cpuInfo.NUMANodeID = 2
+		} else {
+			cpuInfo.NUMANodeID = 7
+		}
+		topology.CPUDetails[cpuID] = cpuInfo
+	}
+	topology.NUMAToCPUs = NUMANodeInfo{
+		2: topology.CPUDetails.CPUsInNUMANodes(2),
+		7: topology.CPUDetails.CPUsInNUMANodes(7),
+	}
+	return topology
+}
+
 func TestResolvePerNUMAReservedForReclaim(t *testing.T) {
 	t.Parallel()
 
@@ -118,6 +140,87 @@ func TestResolvePerNUMAReservedForReclaim(t *testing.T) {
 				t.Fatalf("ResolvePerNUMAReservedForReclaim() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestResolvePerNUMAReservedForReclaimUsesRealNUMAIDs(t *testing.T) {
+	t.Parallel()
+
+	topology := sparseNUMATestTopology(t)
+	tests := []struct {
+		name  string
+		conf  *dynamicconfig.Configuration
+		floor int
+	}{
+		{
+			name:  "global floor",
+			conf:  newReclaimTestConfig(0, "5", "", ""),
+			floor: 5,
+		},
+		{
+			name:  "numa ratio",
+			conf:  newReclaimTestConfig(0, "0", "0.25", "0"),
+			floor: 4,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := ResolvePerNUMAReservedForReclaim(tt.conf, topology)
+			if _, ok := got[2]; !ok {
+				t.Fatalf("missing real NUMA ID 2 in %v", got)
+			}
+			if _, ok := got[7]; !ok {
+				t.Fatalf("missing real NUMA ID 7 in %v", got)
+			}
+			if len(got) != 2 {
+				t.Fatalf("ResolvePerNUMAReservedForReclaim() keys = %v, want only [2 7]", got)
+			}
+
+			total := 0
+			for numaID, target := range got {
+				if target%topology.CPUsPerCore() != 0 {
+					t.Fatalf("NUMA ID %d target %d is not core aligned", numaID, target)
+				}
+				total += target
+			}
+			if total < tt.floor {
+				t.Fatalf("aggregate target %d is below configured floor %d", total, tt.floor)
+			}
+			if total-tt.floor >= topology.CPUsPerCore() {
+				t.Fatalf("aggregate target %d overshoots floor %d by at least one core", total, tt.floor)
+			}
+		})
+	}
+}
+
+func TestResolvePerNUMAReservedForReclaimRespectsUnevenNUMACapacity(t *testing.T) {
+	t.Parallel()
+
+	topology, err := GenerateDummyCPUTopology(16, 1, 2)
+	if err != nil {
+		t.Fatalf("generate dummy topology: %v", err)
+	}
+	for cpuID, cpuInfo := range topology.CPUDetails {
+		if cpuID == 0 || cpuID == 8 {
+			cpuInfo.NUMANodeID = 2
+		} else {
+			cpuInfo.NUMANodeID = 7
+		}
+		topology.CPUDetails[cpuID] = cpuInfo
+	}
+	topology.NUMAToCPUs = NUMANodeInfo{
+		2: topology.CPUDetails.CPUsInNUMANodes(2),
+		7: topology.CPUDetails.CPUsInNUMANodes(7),
+	}
+
+	got := ResolvePerNUMAReservedForReclaim(newReclaimTestConfig(0, "10", "", ""), topology)
+	want := map[int]int{2: 2, 7: 8}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ResolvePerNUMAReservedForReclaim() = %v, want capacity-aware %v", got, want)
 	}
 }
 
@@ -324,6 +427,16 @@ func TestResolveConfiguredReclaimFloorFromConfig(t *testing.T) {
 				t.Fatalf("ResolveConfiguredReclaimFloorFromConfig() = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestResolveConfiguredReclaimFloorFromConfigUsesRealNUMAIDs(t *testing.T) {
+	t.Parallel()
+
+	topology := sparseNUMATestTopology(t)
+	conf := newReclaimTestConfig(0, "0", "0.25", "0")
+	if got, want := ResolveConfiguredReclaimFloorFromConfig(conf, topology, 0), 4; got != want {
+		t.Fatalf("ResolveConfiguredReclaimFloorFromConfig() = %d, want %d", got, want)
 	}
 }
 

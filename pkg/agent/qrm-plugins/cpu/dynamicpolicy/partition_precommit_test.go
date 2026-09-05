@@ -18,16 +18,68 @@ package dynamicpolicy
 
 import (
 	"errors"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/util/sets"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
+
+type retryablePartitionCommitError interface {
+	error
+	Retryable() bool
+}
+
+type alternatingDynamicConfigurationSource struct {
+	configs []*dynamicconfig.Configuration
+	reads   int
+}
+
+func (s *alternatingDynamicConfigurationSource) GetDynamicConfiguration() *dynamicconfig.Configuration {
+	index := s.reads
+	s.reads++
+	if index >= len(s.configs) {
+		index = len(s.configs) - 1
+	}
+	return s.configs[index]
+}
+
+func TestCommitPendingCPUPartitionRejectsOrdinaryWriterWhileAdvisorTargetPending(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	dir := t.TempDir()
+	p.advisorPostCommitCheckpointDir = dir
+	initialRevision := p.state.GetRevision()
+	target := p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, initialRevision)
+	initialEntries := p.state.GetPodEntries()
+
+	_, _, err := p.commitPendingCPUPartition(pendingCPUPartition{
+		expectedRevision: initialRevision,
+		entries:          initialEntries,
+		allowOverlap:     p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+		disableDedicated: p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+		persist:          false,
+		source:           "ordinary writer test",
+	})
+
+	require.Error(t, err)
+	var retryable retryablePartitionCommitError
+	require.ErrorAs(t, err, &retryable)
+	require.True(t, retryable.Retryable())
+	require.Equal(t, initialRevision, p.state.GetRevision())
+	require.Equal(t, initialEntries, p.state.GetPodEntries())
+	require.Same(t, target, p.currentAdvisorPostCommitTarget())
+	require.FileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName))
+}
 
 func TestCommitPendingCPUPartitionRunsHooksBeforeValidation(t *testing.T) {
 	p, cleanup := newReclaimReuseTestPolicy(t)
@@ -55,6 +107,126 @@ func TestCommitPendingCPUPartitionRunsHooksBeforeValidation(t *testing.T) {
 	require.Nil(t, p.state.GetAllocationInfo("dedicated-pod", "main"),
 		"candidate made invalid by a hook must not be committed")
 	require.Empty(t, emitter.records, "failed commit must not emit pool size metrics")
+}
+
+func TestPreparePendingCPUPartitionUsesFrozenDynamicConfiguration(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	frozen := p.dynamicConfig.GetDynamicConfiguration()
+	frozen.FillDefaultSharePoolWithNonReclaimCPUs = false
+	replacement := dynamicconfig.NewConfiguration()
+	replacement.FillDefaultSharePoolWithNonReclaimCPUs = true
+	p.dynamicConfig.SetDynamicConfiguration(replacement)
+
+	_, err := p.preparePendingCPUPartition(pendingCPUPartition{
+		expectedRevision: p.state.GetRevision(),
+		entries: precommitPartitionEntries(
+			machine.NewCPUSet(0, 1),
+			machine.NewCPUSet(2, 3),
+		),
+		dynamicConfig: frozen,
+		persist:       false,
+		source:        "frozen dynamic configuration test",
+	})
+	require.NoError(t, err)
+}
+
+func TestCaptureAdvisorAttemptConfigurationClonesMutableFields(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	current := p.dynamicConfig.GetDynamicConfiguration()
+	current.EnableRampUpReclaimHardPartition = true
+	current.InitialRampUpReclaimCPUSetRatio = 0.2
+	current.SystemExclusivePool = map[string]int{"system": 2}
+	shrinkRatio := 0.5
+	current.SystemExclusivePoolShrinkRatio = &shrinkRatio
+
+	frozen, err := p.captureAdvisorAttemptConfiguration()
+	require.NoError(t, err)
+	require.NotNil(t, frozen.dynamic)
+	require.NotNil(t, frozen.floor)
+
+	current.EnableRampUpReclaimHardPartition = false
+	current.InitialRampUpReclaimCPUSetRatio = 0
+	current.SystemExclusivePool["system"] = 4
+	*current.SystemExclusivePoolShrinkRatio = 0.9
+
+	require.True(t, frozen.dynamic.EnableRampUpReclaimHardPartition)
+	require.Equal(t, 0.2, frozen.dynamic.InitialRampUpReclaimCPUSetRatio)
+	require.Equal(t, map[string]int{"system": 2}, frozen.dynamic.SystemExclusivePool)
+	require.Equal(t, 0.5, *frozen.dynamic.SystemExclusivePoolShrinkRatio)
+}
+
+func TestCaptureAdvisorAttemptConfigurationReadsOncePerAttempt(t *testing.T) {
+	first := dynamicconfig.NewConfiguration()
+	first.EnableReclaim = true
+	first.EnableRampUpReclaimHardPartition = true
+	first.InitialRampUpReclaimCPUSetRatio = 0.2
+	second := dynamicconfig.NewConfiguration()
+	second.EnableReclaim = false
+	second.EnableRampUpReclaimHardPartition = false
+	second.InitialRampUpReclaimCPUSetRatio = 0
+	source := &alternatingDynamicConfigurationSource{
+		configs: []*dynamicconfig.Configuration{first, second},
+	}
+
+	attemptOne, err := captureAdvisorAttemptConfigurationFrom(source)
+	require.NoError(t, err)
+	require.Equal(t, 1, source.reads)
+	require.True(t, attemptOne.dynamic.EnableReclaim)
+	require.True(t, attemptOne.dynamic.EnableRampUpReclaimHardPartition)
+	require.Equal(t, 0.2, attemptOne.dynamic.InitialRampUpReclaimCPUSetRatio)
+	require.Same(t, attemptOne.dynamic, attemptOne.floor)
+
+	attemptTwo, err := captureAdvisorAttemptConfigurationFrom(source)
+	require.NoError(t, err)
+	require.Equal(t, 2, source.reads)
+	require.False(t, attemptTwo.dynamic.EnableReclaim)
+	require.False(t, attemptTwo.dynamic.EnableRampUpReclaimHardPartition)
+	require.Zero(t, attemptTwo.dynamic.InitialRampUpReclaimCPUSetRatio)
+}
+
+func TestPreparePendingCPUPartitionDerivesHardFloorFromFinalCandidate(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	current := p.dynamicConfig.GetDynamicConfiguration()
+	current.EnableReclaim = true
+	current.EnableRampUpReclaimHardPartition = true
+	current.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.Enable = true
+	frozen, err := p.captureAdvisorAttemptConfiguration()
+	require.NoError(t, err)
+
+	candidate := precommitPartitionEntries(machine.NewCPUSet(0, 1), machine.NewCPUSet(2, 3))
+	require.False(t, candidate.HasActiveRampUp())
+	p.allocationHooks = []AllocationHook{func(_, allocation *state.AllocationInfo) error {
+		if allocation.PodUid == "dedicated-pod" {
+			allocation.RampUp = true
+		}
+		return nil
+	}}
+
+	validated := false
+	_, err = p.preparePendingCPUPartition(pendingCPUPartition{
+		expectedRevision: p.state.GetRevision(),
+		entries:          candidate,
+		dynamicConfig:    frozen.dynamic,
+		persist:          false,
+		source:           "final candidate hard floor test",
+		validate: func(entries state.PodEntries, _ state.NUMANodeMap, _, _ bool) error {
+			validated = true
+			require.True(t, entries.HasActiveRampUp())
+			options := p.cpuSetPartitionViewOptionsWithDynamicConfig(
+				p.state, entries.HasActiveRampUp(), frozen.dynamic)
+			require.True(t, options.HardPartitionEnabled)
+			return nil
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, validated)
+	require.False(t, candidate.HasActiveRampUp(), "precommit must not mutate the caller's candidate")
 }
 
 func TestCommitPendingCPUPartitionValidatesResidualBackfillAfterHooks(t *testing.T) {
@@ -156,6 +328,41 @@ func TestCommitPendingCPUPartitionValidatesResidualBackfillAfterHooks(t *testing
 			AllocationResult.Equals(machine.NewCPUSet(2, 3)))
 	})
 
+	t.Run("accepts share residual excluding ramp-up shared allocation", func(t *testing.T) {
+		p, err := newResidualBackfillPrecommitTestPolicy(t)
+		require.NoError(t, err)
+		require.False(t, p.hardBulkheadPartitionValidationEnabled())
+
+		candidate := residualBackfillPrecommitEntries(
+			machine.NewCPUSet(3),
+			machine.NewCPUSet(4, 5, 6, 7),
+		)
+		candidate["ramp-up-shared-pod"] = state.ContainerEntries{
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "ramp-up-shared-pod",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.EmptyOwnerPoolName,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+				},
+				RampUp:                   true,
+				AllocationResult:         machine.NewCPUSet(2),
+				TopologyAwareAssignments: map[int]machine.CPUSet{0: machine.NewCPUSet(2)},
+			},
+		}
+
+		committed, _, err := p.commitPendingCPUPartition(pendingCPUPartition{
+			expectedRevision: p.state.GetRevision(),
+			entries:          candidate,
+			persist:          false,
+			source:           "residual ramp-up test",
+		})
+		require.NoError(t, err)
+		require.True(t, committed[commonstate.PoolNameShare][commonstate.FakedContainerName].
+			AllocationResult.Equals(machine.NewCPUSet(4, 5, 6, 7)))
+		require.True(t, committed["ramp-up-shared-pod"]["main"].RampUp)
+	})
+
 	t.Run("rejects share topology assignments inconsistent with cpuset", func(t *testing.T) {
 		p, err := newResidualBackfillPrecommitTestPolicy(t)
 		require.NoError(t, err)
@@ -251,6 +458,16 @@ func TestValidateSteadyReclaimPrecommitInvariant(t *testing.T) {
 	planned := coresInNUMA(topology, 0, 2, 4).
 		Union(coresInNUMA(topology, 1, 0, 2))
 
+	t.Run("accepts planner migration above fixed limit when hooks preserve plan", func(t *testing.T) {
+		largePlan := coresInNUMA(topology, 1, 0, 4)
+		require.Greater(t,
+			steadyFakeNUMAMigrationChurn(committed, largePlan),
+			steadyFakeNUMAMaxMigratedCPUs,
+		)
+		require.NoError(t, validateSteadyReclaimPrecommitInvariant(
+			largePlan, largePlan, topology))
+	})
+
 	for _, tc := range []struct {
 		name      string
 		candidate machine.CPUSet
@@ -273,18 +490,93 @@ func TestValidateSteadyReclaimPrecommitInvariant(t *testing.T) {
 			want:      "NUMA distribution changed",
 		},
 		{
-			name:      "committed churn exceeds limit",
-			candidate: coresInNUMA(topology, 0, 4, 8),
-			want:      "migration churn",
+			name: "hook churn exceeds limit",
+			candidate: coresInNUMA(topology, 0, 4, 6).
+				Union(coresInNUMA(topology, 1, 2, 4)),
+			want: "migration churn",
 		},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			err := validateSteadyReclaimPrecommitInvariant(
-				planned, tc.candidate, committed, topology)
+				planned, tc.candidate, topology)
 			require.ErrorContains(t, err, tc.want)
 		})
 	}
+}
+
+func TestCommitPendingAdvisorStateRejectsFragmentedReclaimInDisjointMode(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	revision := p.state.GetRevision()
+	core := coresInNUMA(p.machineInfo.CPUTopology, 0, 0, 1)
+	fragmentedReclaim := machine.NewCPUSet(core.ToSliceInt()[0])
+	dedicated := coresInNUMA(p.machineInfo.CPUTopology, 0, 1, 2)
+
+	err := p.commitPendingAdvisorState(&pendingAdvisorState{
+		preCommitRevision: revision,
+		entries:           precommitPartitionEntries(fragmentedReclaim, dedicated),
+		allowOverlap:      false,
+		disableDedicated:  true,
+	})
+
+	require.ErrorContains(t, err, "reclaim set")
+	require.ErrorContains(t, err, "is not core-aligned")
+	require.Equal(t, revision, p.state.GetRevision(),
+		"fragmented reclaim must be rejected before the revision CAS")
+}
+
+func TestPoolAdjustmentRejectsFragmentedReclaimBeforeCommit(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(96, 2, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+	p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
+	currentReclaim := machine.NewCPUSet(1, 25, 49, 73)
+	currentAssignments, err := machine.GetNumaAwareAssignments(topology, currentReclaim)
+	require.NoError(t, err)
+	p.state.SetAllocationInfo(
+		commonstate.PoolNameReclaim,
+		commonstate.FakedContainerName,
+		&state.AllocationInfo{
+			AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+			AllocationResult:                 currentReclaim.Clone(),
+			OriginalAllocationResult:         currentReclaim.Clone(),
+			TopologyAwareAssignments:         currentAssignments,
+			OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(currentAssignments),
+		},
+		false,
+	)
+
+	revision := p.state.GetRevision()
+	currentEntries := p.state.GetPodEntries()
+	require.NoError(t, assertCoreAligned(currentReclaim, p.machineInfo.CPUTopology))
+	require.Equal(t, 4, currentReclaim.Size())
+
+	err = p.applyPoolsAndIsolatedInfo(
+		map[string]machine.CPUSet{
+			commonstate.PoolNameReclaim: machine.NewCPUSet(1, 2, 25, 26),
+			commonstate.PoolNameReserve: p.reservedCPUs.Clone(),
+		},
+		map[string]map[string]machine.CPUSet{},
+		currentEntries,
+		p.state.GetMachineState(),
+		sets.NewInt(),
+		false,
+		machine.NewCPUSet(),
+		defaultShareMaterializationPlan{},
+		revision,
+	)
+
+	require.ErrorContains(t, err, "reclaim set")
+	require.ErrorContains(t, err, "is not core-aligned")
+	require.Equal(t, revision, p.state.GetRevision(),
+		"fragmented pool adjustment must be rejected before the revision CAS")
+	require.True(t, p.state.GetAllocationInfo(
+		commonstate.PoolNameReclaim, commonstate.FakedContainerName).
+		AllocationResult.Equals(currentReclaim))
 }
 
 func TestCommitPendingCPUPartitionRejectsInvalidOverrideAndDeletionFallback(t *testing.T) {

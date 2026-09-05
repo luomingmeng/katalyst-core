@@ -81,7 +81,7 @@ func BuildTopologyNodeSpecsFromView(
 		if view == nil {
 			continue
 		}
-		for _, numaID := range sortedNUMAIDs(view.ReclaimEffectivePerNUMA) {
+		for _, numaID := range sortedPhysicalAndViewNUMAIDs(view.ReclaimEffectivePerNUMA, cpuDetails) {
 			cpus := view.ReclaimEffectivePerNUMA[numaID]
 			physicalNUMACPUs := cpuDetails.CPUsInNUMANodes(numaID)
 			if physicalNUMACPUs.IsEmpty() {
@@ -195,9 +195,16 @@ func isStrictRelDescendant(rel, ancestor string) bool {
 	return rel != "" && ancestor != "" && rel != ancestor && strings.HasPrefix(rel, ancestor+"/")
 }
 
-func sortedNUMAIDs(perNUMA map[int]machine.CPUSet) []int {
-	numaIDs := make([]int, 0, len(perNUMA))
+func sortedPhysicalAndViewNUMAIDs(perNUMA map[int]machine.CPUSet, cpuDetails machine.CPUDetails) []int {
+	seen := map[int]struct{}{}
+	for _, numaID := range cpuDetails.NUMANodes().ToSliceInt() {
+		seen[numaID] = struct{}{}
+	}
 	for numaID := range perNUMA {
+		seen[numaID] = struct{}{}
+	}
+	numaIDs := make([]int, 0, len(seen))
+	for numaID := range seen {
 		numaIDs = append(numaIDs, numaID)
 	}
 	sort.Ints(numaIDs)

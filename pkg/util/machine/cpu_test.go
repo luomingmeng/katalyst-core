@@ -91,12 +91,21 @@ func TestGetCoreNumReservedForReclaim(t *testing.T) {
 			want:             map[int]int{0: 2, 1: 2, 2: 2, 3: 2},
 		},
 		{
-			// SMT2: 12 over 4 NUMA -> 3 CPUs each rounds UP to 4 (2 cores).
-			name:             "smt2 rounds odd per numa up to core",
+			// SMT2: distribute complete cores until the aggregate reaches 12.
+			name:             "smt2 preserves dense even split",
 			numReservedCores: 12,
 			numNumaNodes:     4,
 			cpusPerCore:      2,
 			want:             map[int]int{0: 4, 1: 4, 2: 4, 3: 4},
+		},
+		{
+			// The legacy dense API divides first and intentionally drops the
+			// global remainder instead of redistributing it across low IDs.
+			name:             "smt2 preserves dense remainder semantics",
+			numReservedCores: 10,
+			numNumaNodes:     4,
+			cpusPerCore:      2,
+			want:             map[int]int{0: 2, 1: 2, 2: 2, 3: 2},
 		},
 	}
 

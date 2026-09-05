@@ -24,14 +24,29 @@ import (
 )
 
 type coreAlignedCandidate struct {
+	key          physicalCoreKey
 	coreID       int
 	cpus         machine.CPUSet
 	preferredHit int
 }
 
+type physicalCoreKey struct {
+	numaID   int
+	socketID int
+	coreID   int
+}
+
+func physicalCoreKeyForCPU(info machine.CPUTopoInfo) physicalCoreKey {
+	return physicalCoreKey{
+		numaID:   info.NUMANodeID,
+		socketID: info.SocketID,
+		coreID:   info.CoreID,
+	}
+}
+
 // takeCoreAlignedCPUSet selects cpus from candidates in complete physical cores
 // only. It picks up to quantity cpus, but a core is chosen only when every one
-// of its cpusPerCore siblings is present in candidates, so the returned set is
+// of its topology siblings is present in candidates, so the returned set is
 // always core-aligned (invariant B). quantity is cropped DOWN to a whole-core
 // multiple: a request that is not a whole-core amount never pulls a lone SMT
 // sibling — Tasks 1-3 make the reclaim demands core-aligned, so this crop is a
@@ -40,8 +55,8 @@ type coreAlignedCandidate struct {
 // Cores are ordered by how many of their siblings live in the prefer set
 // (descending) so stability (the currently pinned reclaim cpuset) is kept before
 // fresh cpus are pulled in, then by ascending CoreID for a deterministic
-// tie-break. On non-SMT topologies (CPUsPerCore()==1) every cpu is its own core
-// and the result reduces to a prefer-first, lowest-id take with zero drift.
+// tie-break. The sibling set is derived per physical core rather than from the
+// machine-wide CPUsPerCore average, which also supports non-uniform SMT.
 func takeCoreAlignedCPUSet(
 	topology *machine.CPUTopology,
 	candidates machine.CPUSet,
@@ -51,23 +66,13 @@ func takeCoreAlignedCPUSet(
 	if quantity <= 0 || candidates.IsEmpty() || topology == nil {
 		return machine.NewCPUSet()
 	}
-	cpusPerCore := topology.CPUsPerCore()
-	if cpusPerCore <= 0 {
-		return machine.NewCPUSet()
-	}
-	coresWanted := quantity / cpusPerCore
-	if coresWanted <= 0 {
-		return machine.NewCPUSet()
-	}
-
 	completeCores := coreAlignedCandidates(topology, candidates, prefer)
 	selected := machine.NewCPUSet()
 	for _, core := range completeCores {
-		if coresWanted == 0 {
-			break
+		if selected.Size()+core.cpus.Size() > quantity {
+			continue
 		}
 		selected = selected.Union(core.cpus)
-		coresWanted--
 	}
 	return selected
 }
@@ -84,19 +89,10 @@ func takeCoreAlignedCPUSetByTiers(
 	if quantity <= 0 || candidates.IsEmpty() || topology == nil {
 		return machine.NewCPUSet()
 	}
-	cpusPerCore := topology.CPUsPerCore()
-	if cpusPerCore <= 0 {
-		return machine.NewCPUSet()
-	}
-	coresWanted := quantity / cpusPerCore
-	if coresWanted <= 0 {
-		return machine.NewCPUSet()
-	}
-
 	type tieredCoreCandidate struct {
-		coreID int
-		cpus   machine.CPUSet
-		tier   int
+		key  physicalCoreKey
+		cpus machine.CPUSet
+		tier int
 	}
 
 	completeCores := coreAlignedCandidates(topology, candidates, machine.NewCPUSet())
@@ -110,25 +106,24 @@ func takeCoreAlignedCPUSetByTiers(
 			}
 		}
 		tieredCores = append(tieredCores, tieredCoreCandidate{
-			coreID: core.coreID,
-			cpus:   core.cpus,
-			tier:   tier,
+			key:  core.key,
+			cpus: core.cpus,
+			tier: tier,
 		})
 	}
 	sort.Slice(tieredCores, func(i, j int) bool {
 		if tieredCores[i].tier != tieredCores[j].tier {
 			return tieredCores[i].tier < tieredCores[j].tier
 		}
-		return tieredCores[i].coreID < tieredCores[j].coreID
+		return physicalCoreKeyLess(tieredCores[i].key, tieredCores[j].key)
 	})
 
 	selected := machine.NewCPUSet()
 	for _, core := range tieredCores {
-		if coresWanted == 0 {
-			break
+		if selected.Size()+core.cpus.Size() > quantity {
+			continue
 		}
 		selected = selected.Union(core.cpus)
-		coresWanted--
 	}
 	return selected
 }
@@ -145,32 +140,31 @@ func coreAlignedCandidates(
 	if topology == nil {
 		return nil
 	}
-	cpusPerCore := topology.CPUsPerCore()
-	if cpusPerCore <= 0 {
-		return nil
-	}
-
-	cpusByCore := make(map[int]machine.CPUSet)
+	allCPUsByCore := physicalCoreCPUs(topology)
+	cpusByCore := make(map[physicalCoreKey]machine.CPUSet)
 	for _, cpu := range candidates.ToSliceInt() {
 		info, ok := topology.CPUDetails[cpu]
 		if !ok {
 			continue
 		}
-		set := cpusByCore[info.CoreID]
+		key := physicalCoreKeyForCPU(info)
+		set := cpusByCore[key]
 		if !set.Initialed {
 			set = machine.NewCPUSet()
 		}
 		set.Add(cpu)
-		cpusByCore[info.CoreID] = set
+		cpusByCore[key] = set
 	}
 
 	completeCores := make([]coreAlignedCandidate, 0, len(cpusByCore))
-	for coreID, cpus := range cpusByCore {
-		if cpus.Size() != cpusPerCore {
+	for key, cpus := range cpusByCore {
+		siblings, ok := allCPUsByCore[key]
+		if !ok || !cpus.Equals(siblings) {
 			continue
 		}
 		completeCores = append(completeCores, coreAlignedCandidate{
-			coreID:       coreID,
+			key:          key,
+			coreID:       key.coreID,
 			cpus:         cpus,
 			preferredHit: cpus.Intersection(prefer).Size(),
 		})
@@ -180,29 +174,57 @@ func coreAlignedCandidates(
 		if completeCores[i].preferredHit != completeCores[j].preferredHit {
 			return completeCores[i].preferredHit > completeCores[j].preferredHit
 		}
-		return completeCores[i].coreID < completeCores[j].coreID
+		return physicalCoreKeyLess(completeCores[i].key, completeCores[j].key)
 	})
 	return completeCores
+}
+
+func physicalCoreCPUs(topology *machine.CPUTopology) map[physicalCoreKey]machine.CPUSet {
+	cores := make(map[physicalCoreKey]machine.CPUSet)
+	if topology == nil {
+		return cores
+	}
+	for cpu, info := range topology.CPUDetails {
+		key := physicalCoreKeyForCPU(info)
+		siblings := cores[key]
+		if !siblings.Initialed {
+			siblings = machine.NewCPUSet()
+		}
+		siblings.Add(cpu)
+		cores[key] = siblings
+	}
+	return cores
+}
+
+func physicalCoreKeyLess(left, right physicalCoreKey) bool {
+	if left.numaID != right.numaID {
+		return left.numaID < right.numaID
+	}
+	if left.socketID != right.socketID {
+		return left.socketID < right.socketID
+	}
+	return left.coreID < right.coreID
 }
 
 func completeCoresForCPUSet(topology *machine.CPUTopology, cpus machine.CPUSet) (machine.CPUSet, error) {
 	if topology == nil {
 		return machine.NewCPUSet(), fmt.Errorf("cannot complete cores with nil cpu topology")
 	}
-	coreIDs := make([]int, 0, cpus.Size())
-	seen := make(map[int]struct{}, cpus.Size())
+	keys := make(map[physicalCoreKey]struct{}, cpus.Size())
 	for _, cpu := range cpus.ToSliceInt() {
 		info, ok := topology.CPUDetails[cpu]
 		if !ok {
 			return machine.NewCPUSet(), fmt.Errorf("cpu %d has no topology metadata", cpu)
 		}
-		if _, ok := seen[info.CoreID]; ok {
-			continue
-		}
-		seen[info.CoreID] = struct{}{}
-		coreIDs = append(coreIDs, info.CoreID)
+		keys[physicalCoreKeyForCPU(info)] = struct{}{}
 	}
-	return topology.CPUDetails.CPUsInCores(coreIDs...), nil
+	completed := machine.NewCPUSet()
+	for cpu, info := range topology.CPUDetails {
+		if _, ok := keys[physicalCoreKeyForCPU(info)]; ok {
+			completed.Add(cpu)
+		}
+	}
+	return completed, nil
 }
 
 func completeEligibleCoresForPreferredCPUSet(
@@ -213,10 +235,6 @@ func completeEligibleCoresForPreferredCPUSet(
 	if topology == nil {
 		return machine.NewCPUSet(), fmt.Errorf("cannot select eligible preferred cores with nil cpu topology")
 	}
-	if topology.CPUsPerCore() <= 0 {
-		return machine.NewCPUSet(), fmt.Errorf("cannot select eligible preferred cores with non-positive cpus per core %d", topology.CPUsPerCore())
-	}
-
 	selected := machine.NewCPUSet()
 	for _, core := range coreAlignedCandidates(topology, eligible, prefer) {
 		if core.preferredHit == 0 {
@@ -228,22 +246,17 @@ func completeEligibleCoresForPreferredCPUSet(
 }
 
 // assertCoreAligned is a fail-loud safety net: it returns a lowercase error when
-// reclaim holds a partial physical core (a CoreID whose sibling count differs
-// from CPUsPerCore()). It never repairs silently; a violation signals an upstream
+// reclaim holds a partial physical core. It never repairs silently; a violation signals an upstream
 // invariant break (quantity/reserve/selection) that must be surfaced, not masked.
 func assertCoreAligned(reclaim machine.CPUSet, topology *machine.CPUTopology) error {
 	if topology == nil {
 		return fmt.Errorf("cannot assert core alignment with nil cpu topology")
 	}
-	cpusPerCore := topology.CPUsPerCore()
-	if cpusPerCore <= 0 {
-		return fmt.Errorf("cannot assert core alignment with non-positive cpus per core %d", cpusPerCore)
-	}
 	if reclaim.IsEmpty() {
 		return nil
 	}
 
-	countByCore := make(map[int]int)
+	cpusByCore := make(map[physicalCoreKey]machine.CPUSet)
 	orphanCPUs := machine.NewCPUSet()
 	for _, cpu := range reclaim.ToSliceInt() {
 		info, ok := topology.CPUDetails[cpu]
@@ -251,22 +264,33 @@ func assertCoreAligned(reclaim machine.CPUSet, topology *machine.CPUTopology) er
 			orphanCPUs.Add(cpu)
 			continue
 		}
-		countByCore[info.CoreID]++
+		key := physicalCoreKeyForCPU(info)
+		cpus := cpusByCore[key]
+		if !cpus.Initialed {
+			cpus = machine.NewCPUSet()
+		}
+		cpus.Add(cpu)
+		cpusByCore[key] = cpus
 	}
 	if !orphanCPUs.IsEmpty() {
 		return fmt.Errorf("reclaim set %s contains cpus without topology metadata: %s",
 			reclaim.String(), orphanCPUs.String())
 	}
 
-	coreIDs := make([]int, 0, len(countByCore))
-	for coreID := range countByCore {
-		coreIDs = append(coreIDs, coreID)
+	allCPUsByCore := physicalCoreCPUs(topology)
+	coreKeys := make([]physicalCoreKey, 0, len(cpusByCore))
+	for key := range cpusByCore {
+		coreKeys = append(coreKeys, key)
 	}
-	sort.Ints(coreIDs)
-	for _, coreID := range coreIDs {
-		if countByCore[coreID] != cpusPerCore {
-			return fmt.Errorf("reclaim set %s is not core-aligned: core %d has %d of %d siblings",
-				reclaim.String(), coreID, countByCore[coreID], cpusPerCore)
+	sort.Slice(coreKeys, func(i, j int) bool {
+		return physicalCoreKeyLess(coreKeys[i], coreKeys[j])
+	})
+	for _, key := range coreKeys {
+		cpus := cpusByCore[key]
+		siblings := allCPUsByCore[key]
+		if !cpus.Equals(siblings) {
+			return fmt.Errorf("reclaim set %s is not core-aligned: numa %d socket %d core %d has %d of %d siblings",
+				reclaim.String(), key.numaID, key.socketID, key.coreID, cpus.Size(), siblings.Size())
 		}
 	}
 	return nil

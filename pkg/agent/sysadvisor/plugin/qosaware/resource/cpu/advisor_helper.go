@@ -165,6 +165,7 @@ func (cra *cpuResourceAdvisor) updateNumasAvailableResource(
 ) error {
 	numaAvailable := make(map[int]int)
 	reservePoolInfo, _ := cra.metaCache.GetPoolInfo(commonstate.PoolNameReserve)
+	numaIDs := cra.metaServer.CPUDetails.NUMANodes().ToSliceInt()
 
 	forbiddenCPUsMap := make(map[int]int)
 	cra.metaCache.RangePool(func(poolName string, poolInfo *types.PoolInfo) bool {
@@ -180,7 +181,7 @@ func (cra *cpuResourceAdvisor) updateNumasAvailableResource(
 		return true
 	})
 
-	for id := 0; id < cra.metaServer.NumNUMANodes; id++ {
+	for _, id := range numaIDs {
 		reservePoolNuma := 0
 		if cpuset, ok := reservePoolInfo.TopologyAwareAssignments[id]; ok {
 			reservePoolNuma = cpuset.Size()
@@ -193,7 +194,7 @@ func (cra *cpuResourceAdvisor) updateNumasAvailableResource(
 	}
 
 	if dynamicConf != nil && dynamicConf.EnableRampUpReclaimHardPartition {
-		for id := 0; id < cra.metaServer.NumNUMANodes; id++ {
+		for _, id := range numaIDs {
 			if numaAvailable[id] < 2 {
 				general.Warningf("NUMA %d has %d available CPUs; QRM ramp-up reclaim hard partition may reject admission",
 					id, numaAvailable[id])

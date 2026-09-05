@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -40,6 +41,45 @@ const (
 type steadyFakeNUMAMigrationTarget struct {
 	constraintDigest string
 	target           machine.CPUSet
+}
+
+type steadyFakeNUMAMigrationCheckpointTransitionKind uint8
+
+const (
+	steadyFakeNUMAMigrationCheckpointKeep steadyFakeNUMAMigrationCheckpointTransitionKind = iota
+	steadyFakeNUMAMigrationCheckpointReplace
+	steadyFakeNUMAMigrationCheckpointRemove
+)
+
+type steadyFakeNUMAMigrationCheckpointTransition struct {
+	kind   steadyFakeNUMAMigrationCheckpointTransitionKind
+	target *steadyFakeNUMAMigrationTarget
+}
+
+func (kind steadyFakeNUMAMigrationCheckpointTransitionKind) String() string {
+	switch kind {
+	case steadyFakeNUMAMigrationCheckpointKeep:
+		return "keep"
+	case steadyFakeNUMAMigrationCheckpointReplace:
+		return "replace"
+	case steadyFakeNUMAMigrationCheckpointRemove:
+		return "remove"
+	default:
+		return fmt.Sprintf("unknown(%d)", kind)
+	}
+}
+
+func cloneSteadyFakeNUMAMigrationCheckpointTransition(
+	transition steadyFakeNUMAMigrationCheckpointTransition,
+) steadyFakeNUMAMigrationCheckpointTransition {
+	cloned := steadyFakeNUMAMigrationCheckpointTransition{kind: transition.kind}
+	if transition.target != nil {
+		cloned.target = &steadyFakeNUMAMigrationTarget{
+			constraintDigest: transition.target.constraintDigest,
+			target:           transition.target.target.Clone(),
+		}
+	}
+	return cloned
 }
 
 type steadyFakeNUMAMigrationCheckpoint struct {
@@ -194,63 +234,123 @@ func (p *DynamicPolicy) removeSteadyFakeNUMAMigrationTarget() error {
 	return nil
 }
 
+func (p *DynamicPolicy) applySteadyFakeNUMAMigrationCheckpointTransition(
+	transition steadyFakeNUMAMigrationCheckpointTransition,
+) error {
+	switch transition.kind {
+	case steadyFakeNUMAMigrationCheckpointKeep:
+		return nil
+	case steadyFakeNUMAMigrationCheckpointReplace:
+		return p.storeSteadyFakeNUMAMigrationTarget(transition.target)
+	case steadyFakeNUMAMigrationCheckpointRemove:
+		return p.removeSteadyFakeNUMAMigrationTarget()
+	default:
+		return fmt.Errorf(
+			"invalid steady fake-NUMA migration checkpoint transition %d",
+			transition.kind)
+	}
+}
+
 func (p *DynamicPolicy) projectSteadyFakeNUMAStageWithCheckpoint(
 	demands []partitionDemand,
 	fakeKeys []string,
-	committed machine.CPUSet,
+	committed steadyFakeNUMACommittedSnapshot,
 	freshDesired map[string]machine.CPUSet,
 	floors []partitionCoreFloorConstraint,
 ) (map[string]machine.CPUSet, error) {
+	assignments, transition, err := p.planSteadyFakeNUMAStageWithCheckpoint(
+		demands, fakeKeys, committed, freshDesired, floors)
+	if err != nil {
+		return nil, err
+	}
+	if err := p.applySteadyFakeNUMAMigrationCheckpointTransition(transition); err != nil {
+		return nil, err
+	}
+	return assignments, nil
+}
+
+func (p *DynamicPolicy) planSteadyFakeNUMAStageWithCheckpoint(
+	demands []partitionDemand,
+	fakeKeys []string,
+	committed steadyFakeNUMACommittedSnapshot,
+	freshDesired map[string]machine.CPUSet,
+	floors []partitionCoreFloorConstraint,
+) (
+	map[string]machine.CPUSet,
+	steadyFakeNUMAMigrationCheckpointTransition,
+	error,
+) {
+	keep := steadyFakeNUMAMigrationCheckpointTransition{
+		kind: steadyFakeNUMAMigrationCheckpointKeep,
+	}
 	if p.machineInfo == nil || p.machineInfo.CPUTopology == nil {
-		return nil, fmt.Errorf("cannot project durable steady fake-NUMA migration without topology")
+		return nil, keep, fmt.Errorf(
+			"cannot project durable steady fake-NUMA migration without topology")
 	}
 	topology := p.machineInfo.CPUTopology
 	digest, err := steadyFakeNUMAConstraintDigest(demands, fakeKeys, floors, topology)
 	if err != nil {
-		return nil, err
+		return nil, keep, err
+	}
+	if err := validateCommittedSteadyFakeNUMASnapshot(committed, floors, topology); err != nil {
+		assignments, projectErr := projectSteadyFakeNUMAStage(
+			demands, fakeKeys, committed, freshDesired, floors, topology)
+		if projectErr != nil {
+			return nil, keep, projectErr
+		}
+		if p.steadyFakeNUMAMigrationTarget == nil {
+			return assignments, keep, nil
+		}
+		return assignments, steadyFakeNUMAMigrationCheckpointTransition{
+			kind: steadyFakeNUMAMigrationCheckpointRemove,
+		}, nil
 	}
 
 	desired := freshDesired
 	target := unionPartitionAssignments(freshDesired, fakeKeys)
-	var targetToStore *steadyFakeNUMAMigrationTarget
-	removeTarget := false
+	transition := keep
 	if current := p.steadyFakeNUMAMigrationTarget; current != nil &&
 		current.constraintDigest == digest {
-		if committed.Equals(current.target) {
-			removeTarget = true
+		if committed.reclaim.Equals(current.target) {
+			transition.kind = steadyFakeNUMAMigrationCheckpointRemove
 		} else {
 			desired, err = steadyFakeNUMAAssignmentsForTarget(
 				demands, fakeKeys, current.target, freshDesired, floors, topology)
 			if err != nil {
-				return nil, fmt.Errorf("resume steady fake-NUMA migration target: %w", err)
+				return nil, keep, fmt.Errorf(
+					"resume steady fake-NUMA migration target: %w", err)
 			}
 			target = current.target
 		}
-	} else if steadyFakeNUMAMigrationChurn(committed, target) >
+	} else if steadyFakeNUMAMigrationChurn(committed.reclaim, target) >
 		steadyFakeNUMAMaxMigratedCPUs {
-		targetToStore = &steadyFakeNUMAMigrationTarget{
-			constraintDigest: digest,
-			target:           target,
+		transition = steadyFakeNUMAMigrationCheckpointTransition{
+			kind: steadyFakeNUMAMigrationCheckpointReplace,
+			target: &steadyFakeNUMAMigrationTarget{
+				constraintDigest: digest,
+				target:           target.Clone(),
+			},
 		}
 	} else if p.steadyFakeNUMAMigrationTarget != nil {
-		removeTarget = true
+		transition.kind = steadyFakeNUMAMigrationCheckpointRemove
 	}
 
 	assignments, err := projectSteadyFakeNUMAStage(
 		demands, fakeKeys, committed, desired, floors, topology)
 	if err != nil {
-		return nil, err
+		return nil, keep, err
 	}
-	if targetToStore != nil {
-		if err := p.storeSteadyFakeNUMAMigrationTarget(targetToStore); err != nil {
-			return nil, err
-		}
-	} else if removeTarget {
-		if err := p.removeSteadyFakeNUMAMigrationTarget(); err != nil {
-			return nil, err
-		}
-	}
-	return assignments, nil
+	stage := unionPartitionAssignments(assignments, fakeKeys)
+	general.InfoS("steady fake NUMA migration checkpoint planned",
+		"constraintDigest", digest,
+		"currentCPUSet", committed.reclaim.String(),
+		"frozenTargetCPUSet", target.String(),
+		"stageCPUSet", stage.String(),
+		"currentDistance", steadyFakeNUMAMigrationChurn(committed.reclaim, target),
+		"nextDistance", steadyFakeNUMAMigrationChurn(stage, target),
+		"stageChurn", steadyFakeNUMAMigrationChurn(committed.reclaim, stage),
+		"checkpointTransition", transition.kind.String())
+	return assignments, transition, nil
 }
 
 func steadyFakeNUMAAssignmentsForTarget(

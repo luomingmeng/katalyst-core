@@ -21,26 +21,45 @@ import (
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
 type pendingCPUPartition struct {
-	expectedRevision     uint64
-	entries              state.PodEntries
-	baseMachineState     state.NUMANodeMap
-	allowOverlap         bool
-	disableDedicated     bool
-	persist              bool
-	source               string
-	validate             func(state.PodEntries, state.NUMANodeMap, bool, bool) error
-	enforceSteadyReclaim bool
-	residualFloor        machine.CPUSet
+	expectedRevision          uint64
+	entries                   state.PodEntries
+	baseMachineState          state.NUMANodeMap
+	allowOverlap              bool
+	disableDedicated          bool
+	persist                   bool
+	source                    string
+	validate                  func(state.PodEntries, state.NUMANodeMap, bool, bool) error
+	requireCoreAlignedReclaim bool
+	enforceSteadyReclaim      bool
+	residualFloor             machine.CPUSet
+	dynamicConfig             *dynamicconfig.Configuration
 }
 
 type preparedCPUPartition struct {
 	pending      pendingCPUPartition
 	entries      state.PodEntries
 	machineState state.NUMANodeMap
+}
+
+type advisorPostCommitPendingError struct {
+	pendingRevision   uint64
+	attemptedRevision uint64
+	source            string
+}
+
+func (e *advisorPostCommitPendingError) Error() string {
+	return fmt.Sprintf(
+		"cpu state writer %q must retry while advisor post-commit revision %d is pending (attempted revision %d)",
+		e.source, e.pendingRevision, e.attemptedRevision)
+}
+
+func (e *advisorPostCommitPendingError) Retryable() bool {
+	return true
 }
 
 // preparePendingCPUPartition performs every fallible precommit step without
@@ -50,6 +69,9 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 ) (*preparedCPUPartition, error) {
 	if p == nil || p.state == nil {
 		return nil, fmt.Errorf("prepare pending cpu partition: policy is not initialized")
+	}
+	if pending.dynamicConfig == nil {
+		pending.dynamicConfig = p.currentAdvisorAttemptConfiguration().dynamic
 	}
 	if pending.entries == nil {
 		return nil, fmt.Errorf("prepare pending cpu partition: entries are nil")
@@ -77,13 +99,17 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 			return nil, p.wrapPartitionPrecommitError(
 				pending.source, "revalidate allocation shape after hooks", err)
 		}
+		if pending.requireCoreAlignedReclaim {
+			if err := assertCoreAligned(reclaimPoolCPUSet(candidate), p.machineInfo.CPUTopology); err != nil {
+				return nil, p.wrapPartitionPrecommitError(
+					pending.source, "revalidate reclaim core alignment after hooks", err)
+			}
+		}
 		if pending.enforceSteadyReclaim {
 			plannedReclaim := reclaimPoolCPUSet(pending.entries)
 			candidateReclaim := reclaimPoolCPUSet(candidate)
-			committedReclaim := reclaimPoolCPUSet(currentEntries)
 			if err := validateSteadyReclaimPrecommitInvariant(
-				plannedReclaim, candidateReclaim, committedReclaim,
-				p.machineInfo.CPUTopology,
+				plannedReclaim, candidateReclaim, p.machineInfo.CPUTopology,
 			); err != nil {
 				return nil, p.wrapPartitionPrecommitError(
 					pending.source, "revalidate steady reclaim after hooks", err)
@@ -102,7 +128,8 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 			return nil, p.wrapPartitionPrecommitError(pending.source, "rebuild machine state", err)
 		}
 	}
-	if err := p.validateResidualBackfillCandidate(candidate, machineState, pending.residualFloor); err != nil {
+	if err := p.validateResidualBackfillCandidateWithDynamicConfig(
+		candidate, machineState, pending.residualFloor, pending.dynamicConfig); err != nil {
 		return nil, p.wrapPartitionPrecommitError(pending.source, "validate residual backfill candidate", err)
 	}
 	if err := validatePendingPoolOwnership(candidate); err != nil {
@@ -110,7 +137,14 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 	}
 	validate := pending.validate
 	if validate == nil {
-		validate = p.validateAdvisorPartitionBeforeCommit
+		validate = func(
+			entries state.PodEntries,
+			machineState state.NUMANodeMap,
+			allowOverlap, disableDedicated bool,
+		) error {
+			return p.validateAdvisorPartitionBeforeCommitWithDynamicConfig(
+				entries, machineState, allowOverlap, disableDedicated, pending.dynamicConfig)
+		}
 	}
 	if err := validate(candidate, machineState, pending.allowOverlap, pending.disableDedicated); err != nil {
 		return nil, p.wrapPartitionPrecommitError(pending.source, "validate hard floor and partition", err)
@@ -145,10 +179,20 @@ func (p *DynamicPolicy) validateResidualBackfillCandidate(
 	machineState state.NUMANodeMap,
 	residualFloor machine.CPUSet,
 ) error {
-	if p.dynamicConfig == nil {
-		return nil
+	var dynamicConfig *dynamicconfig.Configuration
+	if p != nil && p.dynamicConfig != nil {
+		dynamicConfig = p.dynamicConfig.GetDynamicConfiguration()
 	}
-	dynamicConfig := p.dynamicConfig.GetDynamicConfiguration()
+	return p.validateResidualBackfillCandidateWithDynamicConfig(
+		entries, machineState, residualFloor, dynamicConfig)
+}
+
+func (p *DynamicPolicy) validateResidualBackfillCandidateWithDynamicConfig(
+	entries state.PodEntries,
+	machineState state.NUMANodeMap,
+	residualFloor machine.CPUSet,
+	dynamicConfig *dynamicconfig.Configuration,
+) error {
 	if dynamicConfig == nil || !dynamicConfig.FillDefaultSharePoolWithNonReclaimCPUs {
 		return nil
 	}
@@ -187,9 +231,13 @@ func (p *DynamicPolicy) validateResidualBackfillCandidate(
 
 	eligible := p.buildDefaultShareEligibleCPUSet(entries, machineState, residualFloor)
 	expected := eligible.Difference(fixedPools).Difference(dedicated)
-	if !share.Equals(expected) {
-		return fmt.Errorf("default share cpuset %s differs from eligible residual %s (eligible=%s fixed=%s dedicated=%s)",
-			share.String(), expected.String(), eligible.String(), fixedPools.String(), dedicated.String())
+	activeRampUp := activeRampUpCPUSet(entries)
+	extraShare := share.Difference(expected)
+	uncoveredResidual := expected.Difference(share).Difference(activeRampUp)
+	if !extraShare.IsEmpty() || !uncoveredResidual.IsEmpty() {
+		return fmt.Errorf("default share cpuset %s with active ramp-up %s differs from eligible residual %s (uncovered=%s extra_share=%s eligible=%s fixed=%s dedicated=%s)",
+			share.String(), activeRampUp.String(), expected.String(), uncoveredResidual.String(), extraShare.String(),
+			eligible.String(), fixedPools.String(), dedicated.String())
 	}
 	if shareEntry == nil {
 		return nil
@@ -287,8 +335,19 @@ func validatePendingPoolOwnership(entries state.PodEntries) error {
 // commitPreparedCPUPartition is the only state mutation for a prepared CPU
 // partition. No fallible response or finalize work may follow this revision-CAS.
 func (p *DynamicPolicy) commitPreparedCPUPartition(prepared *preparedCPUPartition) error {
+	return p.commitPreparedCPUPartitionForAdvisorTarget(prepared, nil)
+}
+
+func (p *DynamicPolicy) commitPreparedCPUPartitionForAdvisorTarget(
+	prepared *preparedCPUPartition,
+	reconcileTarget *advisorPostCommitTarget,
+) error {
 	if prepared == nil {
 		return fmt.Errorf("commit prepared cpu partition: candidate is nil")
+	}
+	var permits []*state.WritePermit
+	if reconcileTarget != nil {
+		permits = append(permits, p.newAdvisorStateWritePermit(reconcileTarget))
 	}
 	if err := p.state.CommitAdvisorStateIfRevision(
 		prepared.pending.expectedRevision,
@@ -297,6 +356,7 @@ func (p *DynamicPolicy) commitPreparedCPUPartition(prepared *preparedCPUPartitio
 		prepared.pending.allowOverlap,
 		prepared.pending.disableDedicated,
 		prepared.pending.persist,
+		permits...,
 	); err != nil {
 		return err
 	}
@@ -307,11 +367,22 @@ func (p *DynamicPolicy) commitPreparedCPUPartition(prepared *preparedCPUPartitio
 func (p *DynamicPolicy) commitPendingCPUPartition(
 	pending pendingCPUPartition,
 ) (state.PodEntries, state.NUMANodeMap, error) {
+	return p.commitPendingCPUPartitionForAdvisorTarget(pending, nil)
+}
+
+func (p *DynamicPolicy) commitPendingCPUPartitionForAdvisorTarget(
+	pending pendingCPUPartition,
+	reconcileTarget *advisorPostCommitTarget,
+) (state.PodEntries, state.NUMANodeMap, error) {
+	if err := p.ensureCPUStateWriterAllowed(
+		pending.expectedRevision, pending.source, reconcileTarget); err != nil {
+		return nil, nil, err
+	}
 	prepared, err := p.preparePendingCPUPartition(pending)
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := p.commitPreparedCPUPartition(prepared); err != nil {
+	if err := p.commitPreparedCPUPartitionForAdvisorTarget(prepared, reconcileTarget); err != nil {
 		return nil, nil, err
 	}
 	return prepared.entries, prepared.machineState, nil
@@ -391,7 +462,7 @@ func reclaimPoolCPUSet(entries state.PodEntries) machine.CPUSet {
 }
 
 func validateSteadyReclaimPrecommitInvariant(
-	planned, candidate, committed machine.CPUSet,
+	planned, candidate machine.CPUSet,
 	topology *machine.CPUTopology,
 ) error {
 	if topology == nil {
@@ -405,10 +476,10 @@ func validateSteadyReclaimPrecommitInvariant(
 			"steady reclaim quantity changed after hooks: planned=%d candidate=%d",
 			planned.Size(), candidate.Size())
 	}
-	if churn := steadyFakeNUMAMigrationChurn(committed, candidate); churn >
+	if churn := steadyFakeNUMAMigrationChurn(planned, candidate); churn >
 		steadyFakeNUMAMaxMigratedCPUs {
 		return fmt.Errorf(
-			"steady reclaim migration churn %d exceeds limit %d",
+			"steady reclaim hook migration churn %d exceeds limit %d",
 			churn, steadyFakeNUMAMaxMigratedCPUs)
 	}
 	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
