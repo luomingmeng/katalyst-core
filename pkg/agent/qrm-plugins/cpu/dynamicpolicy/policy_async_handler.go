@@ -114,6 +114,7 @@ func (p *DynamicPolicy) checkCPUSet(_ *coreconfig.Configuration,
 			containerId, err := p.metaServer.GetContainerID(podUID, containerName)
 			if err != nil {
 				general.Errorf("get container id of pod: %s container: %s failed with error: %v", podUID, containerName, err)
+				errList = append(errList, fmt.Errorf("get container id of pod %s container %s: %w", podUID, containerName, err))
 				continue
 			}
 
@@ -121,6 +122,7 @@ func (p *DynamicPolicy) checkCPUSet(_ *coreconfig.Configuration,
 			if err != nil {
 				general.Errorf("get container abs cgroup path of pod: %s container: %s failed with error: %v", podUID, containerName, err)
 				_ = p.emitter.StoreInt64(util.MetricNameCgroupPathNotFound, 1, metrics.MetricTypeNameRaw, tags...)
+				errList = append(errList, fmt.Errorf("get container abs cgroup path of pod %s container %s: %w", podUID, containerName, err))
 				continue
 			}
 
@@ -165,7 +167,6 @@ func (p *DynamicPolicy) checkCPUSet(_ *coreconfig.Configuration,
 			if allocationInfo == nil {
 				continue
 			}
-
 			switch allocationInfo.QoSLevel {
 			case consts.PodAnnotationQoSLevelDedicatedCores:
 				if !cpuSetOverlap && cset.Intersection(unionDedicatedCPUSet).Size() != 0 {
@@ -318,7 +319,11 @@ func (p *DynamicPolicy) emitExceededMetrics(
 	exceededRatio float64,
 	allowSharedCoresOverlapReclaimedCores bool,
 ) {
-	enableReclaim := p.dynamicConfig.GetDynamicConfiguration().EnableReclaim
+	enableReclaim := false
+	dynamicConfiguration := p.dynamicConfig.GetDynamicConfiguration()
+	if dynamicConfiguration != nil && dynamicConfiguration.AdminQoSConfiguration != nil {
+		enableReclaim = dynamicConfiguration.EnableReclaim
+	}
 	for podUID, pod := range cs.podMap {
 		mainContainerEntry := podEntries[podUID].GetMainContainerEntry()
 		if mainContainerEntry == nil ||

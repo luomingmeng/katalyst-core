@@ -820,7 +820,9 @@ func (p *DynamicPolicy) rollbackFailedDNBAllocation(
 	latestEntries := p.state.GetPodEntries()
 	latestCandidate := latestEntries[podUID][containerName]
 	if latestCandidate == nil {
-		return false, nil, nil
+		return false, &requestStateOwnershipLostError{err: fmt.Errorf(
+			"allocation %s/%s ownership lost: failed candidate was deleted; skip stale candidate rollback",
+			podUID, containerName)}, nil
 	}
 	if !reflect.DeepEqual(latestCandidate, failedCandidate) {
 		return false, &requestStateOwnershipLostError{err: fmt.Errorf(
@@ -2228,6 +2230,22 @@ func (p *DynamicPolicy) buildDefaultShareEligibleCPUSet(
 		eligible = eligible.Difference(pinned)
 	}
 	return eligible.Difference(rampUpReclaimFloor)
+}
+
+func activeRampUpCPUSet(entries state.PodEntries) machine.CPUSet {
+	result := machine.NewCPUSet()
+	for _, containerEntries := range entries {
+		if containerEntries.IsPoolEntry() {
+			continue
+		}
+		for _, allocationInfo := range containerEntries {
+			if allocationInfo == nil || !allocationInfo.RampUp || !allocationInfo.CheckShared() {
+				continue
+			}
+			result = result.Union(allocationInfo.AllocationResult)
+		}
+	}
+	return result
 }
 
 // unionPoolCPUSet unions all pool cpusets except the excluded pool.
@@ -3880,13 +3898,44 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloorForMode(
 				numaID, reservedFloor.Size(), target)
 		}
 		floorInNUMA := reservedFloor
+		if immutablePerNUMA && !floorInNUMA.IsEmpty() {
+			completedReservedFloor, err := completeCoresForCPUSet(
+				p.machineInfo.CPUTopology, floorInNUMA)
+			if err != nil {
+				return machine.NewCPUSet(), fmt.Errorf(
+					"complete reserved ramp-up reclaim floor for NUMA %d failed: %w", numaID, err)
+			}
+			if !completedReservedFloor.IsSubsetOf(eligible) {
+				return machine.NewCPUSet(), fmt.Errorf(
+					"derive ramp-up reclaim floor for NUMA %d: reserved floor core siblings %s are outside eligible cpus %s",
+					numaID, completedReservedFloor.Difference(eligible).String(), eligible.String())
+			}
+			floorInNUMA = completedReservedFloor
+		}
 		additional := target - floorInNUMA.Size()
+		if additional < 0 {
+			return machine.NewCPUSet(), fmt.Errorf(
+				"derive ramp-up reclaim floor for NUMA %d: core-aligned reserved floor %d exceeds target %d",
+				numaID, floorInNUMA.Size(), target)
+		}
 		if additional > 0 {
 			additionalEligible := eligible.Difference(floorInNUMA)
 			preferred := currentReclaim.Intersection(additionalEligible)
-			supplement, err := p.takeByTopologyPreferring(additionalEligible, preferred, additional)
-			if err != nil {
-				return machine.NewCPUSet(), fmt.Errorf("select ramp-up reclaim floor for NUMA %d failed: %w", numaID, err)
+			var supplement machine.CPUSet
+			if immutablePerNUMA {
+				supplement = takeCoreAlignedCPUSet(
+					p.machineInfo.CPUTopology, additionalEligible, preferred, additional)
+				if supplement.Size() != additional {
+					return machine.NewCPUSet(), fmt.Errorf(
+						"select core-aligned ramp-up reclaim floor for NUMA %d: selected %d cpus, target is %d",
+						numaID, supplement.Size(), additional)
+				}
+			} else {
+				var err error
+				supplement, err = p.takeByTopologyPreferring(additionalEligible, preferred, additional)
+				if err != nil {
+					return machine.NewCPUSet(), fmt.Errorf("select ramp-up reclaim floor for NUMA %d failed: %w", numaID, err)
+				}
 			}
 			floorInNUMA = floorInNUMA.Union(supplement)
 		}

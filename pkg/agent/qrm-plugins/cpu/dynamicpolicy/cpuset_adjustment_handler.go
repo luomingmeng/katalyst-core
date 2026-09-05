@@ -277,25 +277,42 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 			}
 			return ctx.Err()
 		}
-		if roundErr == nil && !commitOverride.ReclaimEffective.IsEmpty() {
+		reclaimOverrideTrimmed := false
+		if roundErr == nil && commitOverride.Source != "" {
+			appliedReclaim := commitOverride.ReclaimEffective.Clone()
+			alignedReclaim, err := p.coreAlignedReclaimOverride(
+				commitOverride.ReclaimEffective,
+				p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+			)
+			if err != nil {
+				roundErr = fmt.Errorf("align reclaim cpuset adjustment override: %w", err)
+			} else {
+				commitOverride.ReclaimEffective = alignedReclaim
+				reclaimOverrideTrimmed = !alignedReclaim.Equals(appliedReclaim)
+			}
+		}
+		if roundErr == nil && commitOverride.Source != "" {
 			newEntries := p.state.GetPodEntries()
 			if err := p.syncReclaimPoolWithAdjustmentCommitOverride(newEntries, commitOverride); err != nil {
 				roundErr = fmt.Errorf("sync reclaim pool from cpuset adjustment override: %w", err)
 			} else {
 				_, _, err := p.commitPendingCPUPartition(pendingCPUPartition{
-					expectedRevision: stateRevision,
-					entries:          newEntries,
-					allowOverlap:     p.state.GetAllowSharedCoresOverlapReclaimedCores(),
-					disableDedicated: p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
-					persist:          true,
-					source:           "cpuset override",
-					validate:         p.validatePendingAdvisorPartitionView,
+					expectedRevision:          stateRevision,
+					entries:                   newEntries,
+					allowOverlap:              p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+					disableDedicated:          p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+					persist:                   true,
+					source:                    "cpuset override",
+					validate:                  p.validatePendingAdvisorPartitionView,
+					requireCoreAlignedReclaim: p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
 				})
 				if err != nil {
 					if errors.Is(err, state.ErrStaleStateRevision) {
 						p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonStaleState)
 					}
 					roundErr = fmt.Errorf("commit cpuset adjustment override: %w", err)
+				} else if reclaimOverrideTrimmed {
+					p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonRecoveryCommit)
 				}
 			}
 		}
@@ -798,22 +815,9 @@ func (p *DynamicPolicy) scheduleCPUSetAdjustmentRetry(reason cpusetutil.CPUSetAd
 			err := p.retryLatestCPUSetAdjustment(ctx, cpusetutil.CPUSetAdjustmentModeRetry)
 			cancel()
 			p.Unlock()
+			attempt++
 			if err != nil {
-				attempt++
 				general.Errorf("retry latest cpuset adjustment failed, reason=%s: %v", reason, err)
-				if attempt < cpuSetAdjustmentRetryMaxAttempts {
-					timer := time.NewTimer(cpuSetAdjustmentRetryBackoff(attempt))
-					select {
-					case <-timer.C:
-					case <-stopCh:
-						if !timer.Stop() {
-							<-timer.C
-						}
-						finishStopped()
-						return
-					}
-					continue
-				}
 			}
 
 			p.cpuSetAdjustmentRetryMu.Lock()
@@ -823,13 +827,25 @@ func (p *DynamicPolicy) scheduleCPUSetAdjustmentRetry(reason cpusetutil.CPUSetAd
 				p.cpuSetAdjustmentRetryMu.Unlock()
 				return
 			}
-			if p.cpuSetAdjustmentRetryAgain {
+			retryAgain := p.cpuSetAdjustmentRetryAgain
+			if retryAgain {
 				p.cpuSetAdjustmentRetryAgain = false
+			}
+			if (err != nil || retryAgain) && attempt < cpuSetAdjustmentRetryMaxAttempts {
 				p.cpuSetAdjustmentRetryMu.Unlock()
-				attempt = 0
+				timer := time.NewTimer(cpuSetAdjustmentRetryBackoff(attempt))
+				select {
+				case <-timer.C:
+				case <-stopCh:
+					if !timer.Stop() {
+						<-timer.C
+					}
+					finishStopped()
+					return
+				}
 				continue
 			}
-			if err == nil && p.advisorPostCommitTarget == nil && !p.cpuSetAdjustmentRetryPersist {
+			if err == nil && !retryAgain && p.advisorPostCommitTarget == nil && !p.cpuSetAdjustmentRetryPersist {
 				p.cpuSetAdjustmentRetryDirty = false
 				p.cpuSetAdjustmentRetryReasons = nil
 			} else {
