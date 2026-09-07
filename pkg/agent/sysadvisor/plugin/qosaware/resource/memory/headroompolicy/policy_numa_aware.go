@@ -304,9 +304,19 @@ func (p *PolicyNUMAAware) getReclaimMemoryLimit(actualNUMABindingNUMAs, nonActua
 	}
 
 	if !nonActualNUMABindingNUMAs.IsEmpty() {
+		// The reclaim parent cgroup carries only a single aggregate memory.max
+		// (no per-NUMA memory.max exists for a non-NUMA-binding cgroup), so the
+		// aggregate is split evenly as the baseline per-NUMA limit.
 		reclaimMemoryLimitPerNUMA := totalParentLimit / float64(nonActualNUMABindingNUMAs.Size())
 		for _, numaID := range nonActualNUMABindingNUMAs.ToSliceNoSortInt() {
 			numaReclaimMemoryLimit[numaID] = reclaimMemoryLimitPerNUMA
+			// Constrain the evenly-split baseline down to the actual per-NUMA
+			// reclaim cgroup memory limit when it is materialized on this NUMA.
+			// This is fail-closed: an unreadable per-NUMA limit leaves the
+			// baseline untouched rather than inflating the constraint.
+			if limit, ok := p.sumCgroupMetric(p.numaBindingReclaimRelativeRootCgroupPaths[numaID], consts.MetricMemLimitCgroup); ok {
+				numaReclaimMemoryLimit[numaID] = math.Min(numaReclaimMemoryLimit[numaID], limit)
+			}
 		}
 	}
 
