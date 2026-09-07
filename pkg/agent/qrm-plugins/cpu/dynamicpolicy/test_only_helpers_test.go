@@ -17,6 +17,8 @@ limitations under the License.
 package dynamicpolicy
 
 import (
+	"context"
+
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
@@ -35,7 +37,7 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloor(
 	runCPUSetHandlers bool,
 ) error {
 	return p.adjustPoolsAndIsolatedEntriesWithRampUpFloorAtRevision(
-		poolsQuantityMap, isolatedQuantityMap, entries, machineState, persistCheckpoint,
+		context.Background(), poolsQuantityMap, isolatedQuantityMap, entries, machineState, persistCheckpoint,
 		explicitRampUpFloor, runCPUSetHandlers, p.state.GetRevision())
 }
 
@@ -46,6 +48,9 @@ func (p *DynamicPolicy) publishAdvisorPostCommitTarget(
 	revision uint64,
 ) *advisorPostCommitTarget {
 	target := cloneAdvisorPostCommitTarget(resp, revision)
+	if revision > 0 {
+		target.preCommitRevision = revision - 1
+	}
 	if err := p.storeAdvisorPostCommitTarget(target, p.advisorPostCommitCheckpointPath()); err != nil {
 		general.Errorf("persist advisor post-commit target for revision %d failed: %v", revision, err)
 	}

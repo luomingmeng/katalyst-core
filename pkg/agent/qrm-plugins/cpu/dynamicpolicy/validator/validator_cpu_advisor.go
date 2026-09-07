@@ -234,10 +234,13 @@ func (c *CPUAdvisorValidator) validateEntries(resp *advisorapi.ListAndWatchRespo
 	sharedNUMABindingAllocationInfos := entries.GetFilteredPodEntries(state.WrapAllocationMetaFilter((*commonstate.AllocationMeta).CheckSharedNUMABinding))
 
 	for podUID, containerEntries := range sharedNUMABindingAllocationInfos {
-		for containerName := range containerEntries {
+		for containerName, allocationInfo := range containerEntries {
 			calculationInfo, ok := resp.GetCalculationInfo(podUID, containerName)
 
 			if !ok {
+				if allocationInfo.RampUp && allocationInfo.OwnerPoolName == commonstate.EmptyOwnerPoolName {
+					continue
+				}
 				return fmt.Errorf("missing CalculationInfo for pod: %s container: %s", podUID, containerName)
 			}
 

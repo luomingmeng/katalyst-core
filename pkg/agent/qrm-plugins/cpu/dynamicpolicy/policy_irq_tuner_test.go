@@ -52,6 +52,63 @@ type dummyIRQTuner struct{}
 func (t *dummyIRQTuner) Run(_ <-chan struct{}) {}
 func (t *dummyIRQTuner) Stop()                 {}
 
+type irqStateMutationRecorder struct {
+	state.State
+
+	mu                   sync.Mutex
+	setPodEntriesCalls   int
+	setMachineStateCalls int
+	commitCalls          int
+	commitPersist        bool
+	afterSnapshot        func()
+}
+
+func (s *irqStateMutationRecorder) GetAdvisorStateSnapshot() (state.PodEntries, state.NUMANodeMap, uint64) {
+	snapshotReader := s.State.(interface {
+		GetAdvisorStateSnapshot() (state.PodEntries, state.NUMANodeMap, uint64)
+	})
+	entries, machineState, revision := snapshotReader.GetAdvisorStateSnapshot()
+	if s.afterSnapshot != nil {
+		s.afterSnapshot()
+	}
+	return entries, machineState, revision
+}
+
+func (s *irqStateMutationRecorder) SetPodEntries(entries state.PodEntries, persist bool) error {
+	s.mu.Lock()
+	s.setPodEntriesCalls++
+	s.mu.Unlock()
+	return s.State.SetPodEntries(entries, persist)
+}
+
+func (s *irqStateMutationRecorder) SetMachineState(machineState state.NUMANodeMap, persist bool) error {
+	s.mu.Lock()
+	s.setMachineStateCalls++
+	s.mu.Unlock()
+	return s.State.SetMachineState(machineState, persist)
+}
+
+func (s *irqStateMutationRecorder) CommitAdvisorStateIfRevision(
+	expectedRevision uint64,
+	entries state.PodEntries,
+	machineState state.NUMANodeMap,
+	allowOverlap, disableDedicatedOverlap, persist bool,
+	permits ...*state.WritePermit,
+) error {
+	s.mu.Lock()
+	s.commitCalls++
+	s.commitPersist = persist
+	s.mu.Unlock()
+	return s.State.CommitAdvisorStateIfRevision(
+		expectedRevision, entries, machineState, allowOverlap, disableDedicatedOverlap, persist, permits...)
+}
+
+func (s *irqStateMutationRecorder) mutationCalls() (int, int, int, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.setPodEntriesCalls, s.setMachineStateCalls, s.commitCalls, s.commitPersist
+}
+
 func newTestDynamicPolicy(t *testing.T, name string) *DynamicPolicy {
 	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
 	require.NoError(t, err)
@@ -482,6 +539,99 @@ func TestDynamicPolicy_SetExclusiveIRQCPUSet(t *testing.T) {
 		podEntries := policyImpl.state.GetPodEntries()
 		as.NotNil(podEntries[commonstate.PoolNameInterrupt][commonstate.FakedContainerName])
 		as.True(podEntries[commonstate.PoolNameInterrupt][commonstate.FakedContainerName].AllocationResult.Equals(irqCPUSet))
+	})
+
+	t.Run("waits for policy lock", func(t *testing.T) {
+		t.Parallel()
+
+		policyImpl := newTestDynamicPolicy(t, "set-exclusive-irq-cpuset-policy-lock")
+		available := policyImpl.state.GetMachineState().GetAvailableCPUSet(policyImpl.reservedCPUs)
+		irqCPUSet := machine.NewCPUSet(available.ToSliceInt()[0])
+
+		policyImpl.Lock()
+		started := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			close(started)
+			done <- policyImpl.SetExclusiveIRQCPUSet(irqCPUSet)
+		}()
+		<-started
+
+		select {
+		case err := <-done:
+			policyImpl.Unlock()
+			t.Fatalf("SetExclusiveIRQCPUSet completed while policy lock was held: %v", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+
+		policyImpl.Unlock()
+		require.NoError(t, <-done)
+	})
+
+	t.Run("waits for cpuset adjustment execution lease", func(t *testing.T) {
+		t.Parallel()
+
+		policyImpl := newTestDynamicPolicy(t, "set-exclusive-irq-cpuset-execution-lease")
+		available := policyImpl.state.GetMachineState().GetAvailableCPUSet(policyImpl.reservedCPUs)
+		irqCPUSet := machine.NewCPUSet(available.ToSliceInt()[0])
+		policyImpl.cpuSetAdjustmentExecution = make(chan struct{}, 1)
+		policyImpl.cpuSetAdjustmentExecution <- struct{}{}
+
+		started := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			close(started)
+			done <- policyImpl.SetExclusiveIRQCPUSet(irqCPUSet)
+		}()
+		<-started
+
+		select {
+		case err := <-done:
+			<-policyImpl.cpuSetAdjustmentExecution
+			t.Fatalf("SetExclusiveIRQCPUSet completed while execution lease was held: %v", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+
+		<-policyImpl.cpuSetAdjustmentExecution
+		require.NoError(t, <-done)
+	})
+
+	t.Run("commits irq and machine state atomically", func(t *testing.T) {
+		t.Parallel()
+
+		policyImpl := newTestDynamicPolicy(t, "set-exclusive-irq-cpuset-atomic")
+		recorder := &irqStateMutationRecorder{State: policyImpl.state}
+		policyImpl.state = recorder
+		available := policyImpl.state.GetMachineState().GetAvailableCPUSet(policyImpl.reservedCPUs)
+		irqCPUSet := machine.NewCPUSet(available.ToSliceInt()[0])
+
+		require.NoError(t, policyImpl.SetExclusiveIRQCPUSet(irqCPUSet))
+		setEntries, setMachine, commits, persisted := recorder.mutationCalls()
+		require.Zero(t, setEntries, "must not persist pod entries separately")
+		require.Zero(t, setMachine, "must not persist machine state separately")
+		require.Equal(t, 1, commits, "must commit the candidate exactly once")
+		require.True(t, persisted, "the atomic commit must persist the complete candidate")
+	})
+
+	t.Run("rejects a stale snapshot without dropping the concurrent update", func(t *testing.T) {
+		t.Parallel()
+
+		policyImpl := newTestDynamicPolicy(t, "set-exclusive-irq-cpuset-stale")
+		recorder := &irqStateMutationRecorder{State: policyImpl.state}
+		recorder.afterSnapshot = func() {
+			require.NoError(t, recorder.State.SetAllocationInfo("concurrent-pod", "main", &state.AllocationInfo{
+				AllocationResult: machine.NewCPUSet(15),
+			}, true))
+		}
+		policyImpl.state = recorder
+		available := policyImpl.state.GetMachineState().GetAvailableCPUSet(policyImpl.reservedCPUs)
+		irqCPUSet := machine.NewCPUSet(available.ToSliceInt()[0])
+
+		err := policyImpl.SetExclusiveIRQCPUSet(irqCPUSet)
+		require.ErrorIs(t, err, state.ErrStaleStateRevision)
+		require.NotNil(t, policyImpl.state.GetAllocationInfo("concurrent-pod", "main"))
+		require.Nil(t, policyImpl.state.GetAllocationInfo(
+			commonstate.PoolNameInterrupt, commonstate.FakedContainerName))
 	})
 }
 

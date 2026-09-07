@@ -55,6 +55,7 @@ type advisorBlockDescriptor struct {
 	Quantity     int
 	ComponentKey string
 	Eligible     machine.CPUSet
+	Committed    machine.CPUSet
 	OldPreferred machine.CPUSet
 }
 
@@ -173,9 +174,10 @@ func buildAdvisorBlockDescriptors(
 						builder.ownerSeen[ownerKey] = struct{}{}
 						builder.Owners = append(builder.Owners, ownerKey)
 					}
-					builder.OldPreferred = builder.OldPreferred.Union(
-						advisorBlockOwnerOldPreferred(podEntries, entryName, subEntryName, numaID, numaCPUs),
-					)
+					committed := advisorBlockOwnerOldPreferred(
+						podEntries, entryName, subEntryName, numaID, numaCPUs)
+					builder.Committed = builder.Committed.Union(committed)
+					builder.OldPreferred = builder.OldPreferred.Union(committed)
 				}
 			}
 		}
@@ -207,6 +209,8 @@ func buildAdvisorBlockDescriptors(
 			"owners", descriptor.Owners,
 			"eligibleSize", descriptor.Eligible.Size(),
 			"eligible", descriptor.Eligible.String(),
+			"committedSize", descriptor.Committed.Size(),
+			"committed", descriptor.Committed.String(),
 			"oldPreferredSize", descriptor.OldPreferred.Size(),
 			"oldPreferred", descriptor.OldPreferred.String())
 	}
@@ -520,18 +524,20 @@ func expandSteadyFakeNUMAReclaimPhase(
 				class:     advisorBlockClassMandatoryReclaim,
 			})
 			blockIDByDemandKey[key] = descriptor.BlockID
-			floors = append(floors, partitionCoreFloorConstraint{demandKey: key})
+			floors = append(floors, partitionCoreFloorConstraint{
+				demandKey:        key,
+				committedBlockID: descriptor.BlockID,
+			})
 
 			residual := descriptor.Quantity - cpusPerCore
 			if residual > 0 {
 				residualKey := key + "\x00residual"
 				demands = append(demands, partitionDemand{
-					key:      residualKey,
-					quantity: residual,
-					eligible: eligible,
-					preferred: takeCoreAlignedCPUSet(
-						topology, eligible, descriptor.OldPreferred.Intersection(eligible), residual),
-					class: advisorBlockClassMandatoryReclaim,
+					key:       residualKey,
+					quantity:  residual,
+					eligible:  eligible,
+					preferred: descriptor.OldPreferred.Intersection(eligible),
+					class:     advisorBlockClassMandatoryReclaim,
 				})
 				blockIDByDemandKey[residualKey] = descriptor.BlockID
 			}

@@ -380,6 +380,111 @@ func TestBuildAdvisorBlockDescriptors_IntersectsAliasEligibilityAndAggregatesOld
 	require.Equal(t, machine.NewCPUSet(1, 2, 3), descriptors[0].OldPreferred)
 }
 
+func TestBuildAdvisorBlockDescriptors_PreservesRawReclaimAggregateAndLeafOwnership(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	rawAggregate := coresInNUMA(p.machineInfo.CPUTopology, 0, 0, 2)
+	realLeaf := coresInNUMA(p.machineInfo.CPUTopology, 0, 0, 1)
+	p.state.SetPodEntries(state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationResult: rawAggregate,
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: realLeaf,
+				},
+			},
+		},
+	}, false)
+	resp := advisorBlockTestResponse([]advisorBlockTestAlias{
+		{
+			entry: commonstate.PoolNameReclaim, subEntry: commonstate.FakedContainerName,
+			owner: commonstate.PoolNameReclaim, numaID: commonstate.FakedNUMAID,
+			blockID: "aggregate", quantity: 4,
+		},
+		{
+			entry: commonstate.PoolNameReclaim, subEntry: commonstate.FakedContainerName,
+			owner: commonstate.PoolNameReclaim, numaID: 0,
+			blockID: "leaf", quantity: 2,
+		},
+	}, rand.New(rand.NewSource(13)))
+
+	descriptors, err := buildAdvisorBlockDescriptors(
+		resp, p.machineInfo.CPUDetails, p.state.GetPodEntries(), nil, machine.NewCPUSet())
+	require.NoError(t, err)
+	require.Len(t, descriptors, 2)
+	byID := make(map[string]advisorBlockDescriptor, len(descriptors))
+	for _, descriptor := range descriptors {
+		byID[descriptor.BlockID] = descriptor
+	}
+	require.Equal(t, rawAggregate, byID["aggregate"].Committed)
+	require.Equal(t, realLeaf, byID["leaf"].Committed)
+
+	snapshot, err := buildSteadyFakeNUMACommittedSnapshot(
+		descriptors, p.machineInfo.CPUDetails.CPUs())
+	require.NoError(t, err)
+	require.Equal(t, rawAggregate, snapshot.rawReclaimAggregate)
+	require.Equal(t, rawAggregate, snapshot.reclaim)
+	require.Equal(t, rawAggregate.Difference(realLeaf),
+		committedAssignmentForTest(t, &snapshot, "aggregate").cpus)
+	require.Equal(t, realLeaf,
+		committedAssignmentForTest(t, &snapshot, "leaf").cpus)
+	require.NoError(t, validateCommittedSteadyFakeNUMASnapshot(snapshot, nil, p.machineInfo.CPUTopology))
+}
+
+func TestBuildAdvisorBlockDescriptors_PreservesCommittedCPUsOutsideEligibility(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	rawAggregate := coresInNUMA(p.machineInfo.CPUTopology, 0, 0, 1)
+	threads := rawAggregate.ToSliceInt()
+	require.Len(t, threads, 2)
+	p.state.SetPodEntries(state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationResult: rawAggregate,
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: rawAggregate,
+				},
+			},
+		},
+	}, false)
+	resp := advisorBlockTestResponse([]advisorBlockTestAlias{
+		{
+			entry: commonstate.PoolNameReclaim, subEntry: commonstate.FakedContainerName,
+			owner: commonstate.PoolNameReclaim, numaID: commonstate.FakedNUMAID,
+			blockID: "aggregate", quantity: 2,
+		},
+		{
+			entry: commonstate.PoolNameReclaim, subEntry: commonstate.FakedContainerName,
+			owner: commonstate.PoolNameReclaim, numaID: 0,
+			blockID: "leaf", quantity: 1,
+		},
+	}, rand.New(rand.NewSource(14)))
+
+	descriptors, err := buildAdvisorBlockDescriptors(
+		resp, p.machineInfo.CPUDetails, p.state.GetPodEntries(), nil, machine.NewCPUSet(threads[1]))
+	require.NoError(t, err)
+	byID := make(map[string]advisorBlockDescriptor, len(descriptors))
+	for _, descriptor := range descriptors {
+		byID[descriptor.BlockID] = descriptor
+	}
+	require.Equal(t, rawAggregate, byID["aggregate"].Committed)
+	require.Equal(t, rawAggregate, byID["leaf"].Committed)
+	require.Equal(t, machine.NewCPUSet(threads[0]), byID["leaf"].OldPreferred)
+
+	snapshot, err := buildSteadyFakeNUMACommittedSnapshot(
+		descriptors, p.machineInfo.CPUDetails.CPUs())
+	require.NoError(t, err)
+	require.ErrorContains(t,
+		validateCommittedSteadyFakeNUMASnapshot(snapshot, nil, p.machineInfo.CPUTopology),
+		fmt.Sprintf(`committed block "leaf" is outside eligibility: %d`, threads[1]))
+}
+
 func TestBuildAdvisorBlockDescriptors_FailsClosedForDifferentAliasResourcePackages(t *testing.T) {
 	t.Parallel()
 

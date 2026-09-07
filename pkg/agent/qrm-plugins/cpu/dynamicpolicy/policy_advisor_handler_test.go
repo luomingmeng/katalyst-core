@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bytedance/mockey"
 	"github.com/smartystreets/goconvey/convey"
@@ -201,6 +202,82 @@ func TestAllocateByCPUAdvisorRejectsStaleRampUpGeneration(t *testing.T) {
 	require.ErrorContains(t, err, "advisor request ramp-up state is stale")
 	require.Equal(t, revision, policy.state.GetRevision())
 	require.Equal(t, allowOverlap, policy.state.GetAllowSharedCoresOverlapReclaimedCores())
+}
+
+func TestAllocateByCPUAdvisorPreservesUnadvisedSharedNUMABindingRampUpAllocation(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	policy.reservedCPUs = topology.CPUDetails.CPUsInNUMANodes(1)
+	policy.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"noop": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			return nil
+		},
+	}
+
+	const (
+		podUID        = "shared-numa-ramp-up"
+		containerName = "main"
+	)
+	numa0CPUs := topology.CPUDetails.CPUsInNUMANodes(0).ToSliceInt()
+	require.Len(t, numa0CPUs, 4)
+	allocated := machine.NewCPUSet(numa0CPUs[:2]...)
+	assignments, err := machine.GetNumaAwareAssignments(topology, allocated)
+	require.NoError(t, err)
+	original := &state.AllocationInfo{
+		AllocationMeta: commonstate.AllocationMeta{
+			PodUid:        podUID,
+			ContainerName: containerName,
+			ContainerType: pluginapi.ContainerType_MAIN.String(),
+			QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+			Annotations: map[string]string{
+				apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			},
+		},
+		RampUp:                           true,
+		AllocationResult:                 allocated.Clone(),
+		OriginalAllocationResult:         allocated.Clone(),
+		TopologyAwareAssignments:         assignments,
+		OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(assignments),
+		RequestQuantity:                  1,
+	}
+	policy.state.SetPodEntries(state.PodEntries{
+		podUID: {
+			containerName: original,
+		},
+	}, false)
+	machineState, err := state.GenerateMachineStateFromPodEntries(
+		topology, policy.state.GetPodEntries(), policy.state.GetMachineState())
+	require.NoError(t, err)
+	policy.state.SetMachineState(machineState, false)
+
+	req, requestRevision, err := policy.createGetAdviceRequestAtRevision()
+	require.NoError(t, err)
+
+	beforeEntries := policy.state.GetPodEntries()
+	beforeMachineState := policy.state.GetMachineState()
+	err = policy.allocateByCPUAdvisorAtRevision(
+		req, &advisorapi.ListAndWatchResponse{}, nil, requestRevision+1)
+	require.ErrorContains(t, err, "advisor request state revision is stale")
+	require.Equal(t, requestRevision, policy.state.GetRevision())
+	require.Equal(t, beforeEntries, policy.state.GetPodEntries())
+	require.Equal(t, beforeMachineState, policy.state.GetMachineState())
+
+	require.NoError(t, policy.allocateByCPUAdvisorAtRevision(
+		req, &advisorapi.ListAndWatchResponse{}, nil, requestRevision))
+
+	got := policy.state.GetAllocationInfo(podUID, containerName)
+	require.NotNil(t, got)
+	require.True(t, got.RampUp)
+	require.Empty(t, got.OwnerPoolName)
+	require.True(t, got.CheckSharedNUMABinding())
+	require.True(t, got.AllocationResult.Equals(allocated))
+	require.True(t, got.OriginalAllocationResult.Equals(allocated))
+	require.Equal(t, assignments, got.TopologyAwareAssignments)
+	require.Equal(t, assignments, got.OriginalTopologyAwareAssignments)
 }
 
 func TestAllocateByCPUAdvisorRejectsStaleRequestRevision(t *testing.T) {
@@ -532,6 +609,152 @@ func TestAllocateByCPUAdvisorConcurrentFrameCannotOvertakePendingPostCommitApply
 	require.NoError(t, <-secondDone)
 	require.Equal(t, stagedRevision, policy.state.GetRevision())
 	require.False(t, policy.hasAnyPendingAdvisorPostCommitTarget())
+}
+
+func TestAdvisorAndRetrySameTargetShareExecutionLease(t *testing.T) {
+	policy, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	policy.cpuSetAdjustmentRetryMu.Lock()
+	policy.cpuSetAdjustmentRetryStopping = true
+	policy.cpuSetAdjustmentRetryMu.Unlock()
+
+	firstHandlerEntered := make(chan struct{})
+	releaseFirstHandler := make(chan struct{})
+	var callsMu sync.Mutex
+	headroomCalls := 0
+	handlerCalls := 0
+	policy.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"controlled": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			callsMu.Lock()
+			handlerCalls++
+			call := handlerCalls
+			callsMu.Unlock()
+			if call == 1 {
+				close(firstHandlerEntered)
+				<-releaseFirstHandler
+			}
+			return nil
+		},
+	}
+	resp := &advisorapi.ListAndWatchResponse{Entries: map[string]*advisorapi.CalculationEntries{}}
+
+	mockey.PatchConvey("retry waits before replaying advisor side effects", t, func() {
+		mockey.Mock((*DynamicPolicy).applyHeadroom).
+			To(func(_ *DynamicPolicy, _ *advisorapi.ListAndWatchResponse) error {
+				callsMu.Lock()
+				headroomCalls++
+				callsMu.Unlock()
+				return nil
+			}).Build()
+
+		advisorDone := make(chan error, 1)
+		go func() {
+			advisorDone <- policy.allocateByCPUAdvisor(nil, resp, nil)
+		}()
+		<-firstHandlerEntered
+
+		target := policy.currentAdvisorPostCommitTarget()
+		require.NotNil(t, target)
+		require.FileExists(t, policy.advisorPostCommitCheckpointPath())
+
+		retryLocked := make(chan struct{})
+		continueRetry := make(chan struct{})
+		retryDone := make(chan error, 1)
+		go func() {
+			policy.Lock()
+			close(retryLocked)
+			<-continueRetry
+			retryDone <- policy.retryLatestCPUSetAdjustment(
+				context.Background(), cpusetutil.CPUSetAdjustmentModeRetry)
+			policy.Unlock()
+		}()
+		<-retryLocked
+		close(continueRetry)
+
+		// Once this lock is available, the retry has reached the execution
+		// lease wait. It must not have replayed any target side effect.
+		policy.Lock()
+		policy.Unlock()
+		callsMu.Lock()
+		require.Equal(t, 1, headroomCalls)
+		require.Equal(t, 1, handlerCalls)
+		callsMu.Unlock()
+
+		close(releaseFirstHandler)
+		require.NoError(t, <-advisorDone)
+		require.NoError(t, <-retryDone)
+
+		callsMu.Lock()
+		require.Equal(t, 1, headroomCalls, "the retry must not re-enter a completed target")
+		require.Equal(t, 1, handlerCalls, "the retry must not replay cpuset side effects")
+		callsMu.Unlock()
+		require.Nil(t, policy.currentAdvisorPostCommitTarget())
+		require.NoFileExists(t, policy.advisorPostCommitCheckpointPath(),
+			"a stale retry must not resurrect the cleaned active WAL")
+		require.NoFileExists(t, policy.advisorPostCommitStagingPath())
+
+		select {
+		case policy.cpuSetAdjustmentExecution <- struct{}{}:
+			<-policy.cpuSetAdjustmentExecution
+		default:
+			t.Fatal("execution lease was not released")
+		}
+	})
+}
+
+func TestAllocateByCPUAdvisorExecutionLeaseTimeoutLeavesCommittedTransactionUntouched(t *testing.T) {
+	policy, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	policy.cpuSetAdjustmentRetryMu.Lock()
+	policy.cpuSetAdjustmentRetryStopping = true
+	policy.cpuSetAdjustmentRetryMu.Unlock()
+	policy.conf.CPUQRMPluginConfig.BulkheadConfiguration.
+		TopologyConvergenceBudget.DeadlineDuration = time.Millisecond
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	policy.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"block-first-advisor": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			enteredOnce.Do(func() { close(entered) })
+			<-release
+			return nil
+		},
+	}
+	resp := &advisorapi.ListAndWatchResponse{Entries: map[string]*advisorapi.CalculationEntries{}}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- policy.allocateByCPUAdvisor(nil, resp, nil)
+	}()
+	<-entered
+
+	revision := policy.state.GetRevision()
+	entries := policy.state.GetPodEntries()
+	machineState := policy.state.GetMachineState()
+	target := policy.currentAdvisorPostCommitTarget()
+	require.NotNil(t, target)
+	activePath := policy.advisorPostCommitCheckpointPath()
+	stagingPath := policy.advisorPostCommitStagingPath()
+	activeWAL, err := os.ReadFile(activePath)
+	require.NoError(t, err)
+	require.NoFileExists(t, stagingPath)
+
+	err = policy.allocateByCPUAdvisor(nil, resp, nil)
+	require.Equal(t, context.DeadlineExceeded, err)
+	require.Equal(t, revision, policy.state.GetRevision())
+	require.Equal(t, entries, policy.state.GetPodEntries())
+	require.Equal(t, machineState, policy.state.GetMachineState())
+	require.Same(t, target, policy.currentAdvisorPostCommitTarget())
+	require.NoFileExists(t, stagingPath)
+	gotActiveWAL, readErr := os.ReadFile(activePath)
+	require.NoError(t, readErr)
+	require.Equal(t, activeWAL, gotActiveWAL)
+
+	close(release)
+	require.NoError(t, <-firstDone)
 }
 
 func TestValidateHardPartitionReclaimDistribution(t *testing.T) {
@@ -2168,12 +2391,13 @@ func (s *advisorCommitRecordingState) CommitAdvisorState(
 	allowOverlap bool,
 	disableDedicatedOverlap bool,
 	persist bool,
+	permits ...*state.WritePermit,
 ) error {
 	s.calls++
 	if s.err != nil {
 		return s.err
 	}
-	return s.State.CommitAdvisorState(entries, machineState, allowOverlap, disableDedicatedOverlap, persist)
+	return s.State.CommitAdvisorState(entries, machineState, allowOverlap, disableDedicatedOverlap, persist, permits...)
 }
 
 func (s *advisorCommitRecordingState) CommitAdvisorStateIfRevision(
@@ -2183,12 +2407,14 @@ func (s *advisorCommitRecordingState) CommitAdvisorStateIfRevision(
 	allowOverlap bool,
 	disableDedicatedOverlap bool,
 	persist bool,
+	permits ...*state.WritePermit,
 ) error {
 	s.calls++
 	if s.err != nil {
 		return s.err
 	}
-	return s.State.CommitAdvisorStateIfRevision(expectedRevision, entries, machineState, allowOverlap, disableDedicatedOverlap, persist)
+	return s.State.CommitAdvisorStateIfRevision(
+		expectedRevision, entries, machineState, allowOverlap, disableDedicatedOverlap, persist, permits...)
 }
 
 func (s *advisorCommitGuardState) CommitAdvisorState(
@@ -2197,6 +2423,7 @@ func (s *advisorCommitGuardState) CommitAdvisorState(
 	bool,
 	bool,
 	bool,
+	...*state.WritePermit,
 ) error {
 	s.unconditionalCommitCalls++
 	return fmt.Errorf("advisor applyBlocks must use CommitAdvisorStateIfRevision")
@@ -2209,10 +2436,12 @@ func (s *advisorCommitGuardState) CommitAdvisorStateIfRevision(
 	allowOverlap bool,
 	disableDedicatedOverlap bool,
 	persist bool,
+	permits ...*state.WritePermit,
 ) error {
 	s.conditionalCommitCalls++
 	s.conditionalRevision = expectedRevision
-	return s.State.CommitAdvisorStateIfRevision(expectedRevision, entries, machineState, allowOverlap, disableDedicatedOverlap, persist)
+	return s.State.CommitAdvisorStateIfRevision(
+		expectedRevision, entries, machineState, allowOverlap, disableDedicatedOverlap, persist, permits...)
 }
 
 func (s *staleAdvisorCommitState) CommitAdvisorStateIfRevision(
@@ -2222,6 +2451,7 @@ func (s *staleAdvisorCommitState) CommitAdvisorStateIfRevision(
 	allowOverlap bool,
 	disableDedicatedOverlap bool,
 	persist bool,
+	permits ...*state.WritePermit,
 ) error {
 	if !s.injected {
 		s.injected = true
@@ -2229,7 +2459,7 @@ func (s *staleAdvisorCommitState) CommitAdvisorStateIfRevision(
 			!s.State.GetAllowSharedCoresOverlapReclaimedCores(), false)
 	}
 	return s.State.CommitAdvisorStateIfRevision(
-		expectedRevision, entries, machineState, allowOverlap, disableDedicatedOverlap, persist)
+		expectedRevision, entries, machineState, allowOverlap, disableDedicatedOverlap, persist, permits...)
 }
 
 func TestDynamicPolicy_checkAndApplyIfCgroupV1(t *testing.T) {
@@ -3403,13 +3633,13 @@ func TestDynamicPolicyReviseReclaimPoolUsesResponseMode(t *testing.T) {
 			name:         "true to false",
 			oldMode:      true,
 			responseMode: false,
-			expected:     machine.NewCPUSet(0),
+			expected:     machine.NewCPUSet(0, 3, 4, 7),
 		},
 		{
 			name:         "false to true",
 			oldMode:      false,
 			responseMode: true,
-			expected:     machine.NewCPUSet(0, 2),
+			expected:     machine.NewCPUSet(0, 2, 4, 6),
 		},
 	} {
 		tc := tc
@@ -3424,10 +3654,10 @@ func TestDynamicPolicyReviseReclaimPoolUsesResponseMode(t *testing.T) {
 
 			policy, err := getTestDynamicPolicyWithoutInitialization(topology, tmpDir)
 			require.NoError(t, err)
-			policy.reservedReclaimedCPUSet = machine.NewCPUSet(0, 2)
+			policy.reservedReclaimedCPUSet = machine.NewCPUSet(0, 2, 4, 6)
 			policy.reservedReclaimedTopologyAwareAssignments = map[int]machine.CPUSet{
-				0: machine.NewCPUSet(0),
-				1: machine.NewCPUSet(2),
+				0: machine.NewCPUSet(0, 4),
+				1: machine.NewCPUSet(2, 6),
 			}
 			policy.state.SetAllowSharedCoresOverlapReclaimedCores(tc.oldMode, false)
 
@@ -3440,22 +3670,22 @@ func TestDynamicPolicyReviseReclaimPoolUsesResponseMode(t *testing.T) {
 							OwnerPoolName: commonstate.PoolNameDedicated,
 							QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
 						},
-						AllocationResult: machine.NewCPUSet(2),
+						AllocationResult: machine.NewCPUSet(2, 6),
 						TopologyAwareAssignments: map[int]machine.CPUSet{
-							1: machine.NewCPUSet(2),
+							1: machine.NewCPUSet(2, 6),
 						},
 					},
 				},
 				commonstate.PoolNameReclaim: {
 					commonstate.FakedContainerName: &state.AllocationInfo{
 						AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
-						AllocationResult:         machine.NewCPUSet(0),
-						OriginalAllocationResult: machine.NewCPUSet(0),
+						AllocationResult:         machine.NewCPUSet(0, 4),
+						OriginalAllocationResult: machine.NewCPUSet(0, 4),
 						TopologyAwareAssignments: map[int]machine.CPUSet{
-							0: machine.NewCPUSet(0),
+							0: machine.NewCPUSet(0, 4),
 						},
 						OriginalTopologyAwareAssignments: map[int]machine.CPUSet{
-							0: machine.NewCPUSet(0),
+							0: machine.NewCPUSet(0, 4),
 						},
 					},
 				},
@@ -3464,12 +3694,13 @@ func TestDynamicPolicyReviseReclaimPoolUsesResponseMode(t *testing.T) {
 			err = policy.reviseReclaimPool(
 				newEntries,
 				machine.NewCPUSet(),
-				machine.NewCPUSet(2),
+				machine.NewCPUSet(2, 6),
 				tc.responseMode,
 			)
 			require.NoError(t, err)
 			reclaimPool := newEntries[commonstate.PoolNameReclaim][commonstate.FakedContainerName]
 			require.True(t, reclaimPool.AllocationResult.Equals(tc.expected))
+			requireCoreAligned(t, topology, reclaimPool.AllocationResult)
 			require.Equal(t, tc.oldMode, policy.state.GetAllowSharedCoresOverlapReclaimedCores())
 		})
 	}

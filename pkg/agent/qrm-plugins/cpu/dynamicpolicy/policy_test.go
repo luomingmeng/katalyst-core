@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -632,8 +633,8 @@ func TestPodDeletionDefersUnownedPoolCleanupToAdjustmentBoundary(t *testing.T) {
 
 	t.Run("explicit remove", func(t *testing.T) {
 		adjustErr := errors.New("stop after validating target entries")
-		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAfterDeletionAtRevision).
-			To(func(_ *DynamicPolicy, entries state.PodEntries, _ state.NUMANodeMap,
+		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAfterDeletionAtRevisionWithContext).
+			To(func(_ *DynamicPolicy, _ context.Context, entries state.PodEntries, _ state.NUMANodeMap,
 				_ bool, _ uint64,
 			) error {
 				assertCandidate(entries)
@@ -853,6 +854,178 @@ func TestInitPoolAndCalculator(t *testing.T) {
 	as.Equal(reclaimPoolAllocationInfo.AllocationResult.Size(), reservedReclaimedCPUsSize)
 }
 
+func TestDynamicPolicyInitReclaimPoolWholeCoreAcrossNUMAs(t *testing.T) {
+	t.Parallel()
+
+	t.Run("rounds the configured floor up to complete cores", func(t *testing.T) {
+		t.Parallel()
+
+		topology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+		require.NoError(t, err)
+
+		policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+		require.NoError(t, err)
+		policy.reservedCPUs = machine.NewCPUSet()
+		policy.reservedReclaimedCPUsSize = 5
+
+		require.NoError(t, policy.initReclaimPool())
+
+		reclaim := policy.state.GetAllocationInfo(
+			commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+		require.NotNil(t, reclaim)
+		requireCoreAligned(t, topology, reclaim.AllocationResult)
+		require.Equal(t, 6, reclaim.AllocationResult.Size(),
+			"the configured floor must round up to complete cores")
+		require.Equal(t, reclaim.AllocationResult.Size(), policy.reservedReclaimedCPUsSize)
+		require.Len(t, reclaim.TopologyAwareAssignments, 3)
+	})
+
+	t.Run("selects a numa that has an available complete core", func(t *testing.T) {
+		t.Parallel()
+
+		topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+		require.NoError(t, err)
+
+		policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+		require.NoError(t, err)
+		policy.reservedCPUs = topology.CPUDetails.CPUsInNUMANodes(0)
+		policy.reservedReclaimedCPUsSize = 2
+
+		require.NoError(t, policy.initReclaimPool())
+
+		require.True(t, policy.reservedReclaimedCPUSet.IsSubsetOf(
+			topology.CPUDetails.CPUsInNUMANodes(1)),
+			"the reserved reclaim source must skip the low NUMA without an available complete core, got %s",
+			policy.reservedReclaimedCPUSet.String())
+		reclaim := policy.state.GetAllocationInfo(
+			commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+		require.NotNil(t, reclaim)
+		requireCoreAligned(t, topology, reclaim.AllocationResult)
+		require.True(t, reclaim.AllocationResult.IsSubsetOf(
+			topology.CPUDetails.CPUsInNUMANodes(1)),
+			"reclaim should skip the low NUMA without an available complete core, got %s",
+			reclaim.AllocationResult.String())
+	})
+
+	t.Run("skips a full numa while assigning the global complete-core target", func(t *testing.T) {
+		t.Parallel()
+
+		topology, err := machine.GenerateDummyCPUTopology(12, 2, 2)
+		require.NoError(t, err)
+
+		policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+		require.NoError(t, err)
+		numa0CPUs := topology.CPUDetails.CPUsInNUMANodes(0)
+		numa1CPUs := topology.CPUDetails.CPUsInNUMANodes(1)
+		policy.reservedCPUs = numa0CPUs.Difference(machine.NewCPUSet(2, 8))
+		policy.reservedReclaimedCPUsSize = 6
+
+		require.NoError(t, policy.initReclaimPool())
+
+		requireCoreAligned(t, topology, policy.reservedReclaimedCPUSet)
+		require.Equal(t, 2, policy.reservedReclaimedCPUSet.Intersection(numa0CPUs).Size())
+		require.Equal(t, 4, policy.reservedReclaimedCPUSet.Intersection(numa1CPUs).Size())
+		require.Equal(t, 6, policy.reservedReclaimedCPUSet.Size())
+		reclaim := policy.state.GetAllocationInfo(
+			commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+		require.NotNil(t, reclaim)
+		require.True(t, reclaim.AllocationResult.Equals(policy.reservedReclaimedCPUSet))
+	})
+
+	t.Run("uses global capacity when one numa cannot satisfy its target", func(t *testing.T) {
+		t.Parallel()
+
+		topology, err := machine.GenerateDummyCPUTopology(8, 2, 2)
+		require.NoError(t, err)
+
+		policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+		require.NoError(t, err)
+		policy.reservedCPUs = machine.NewCPUSet()
+		policy.reservedReclaimedCPUsSize = 4
+
+		dedicated := topology.CPUDetails.CPUsInNUMANodes(0)
+		entries := state.PodEntries{
+			"dedicated-pod": {
+				"main": &state.AllocationInfo{
+					AllocationMeta: commonstate.AllocationMeta{
+						PodUid:        "dedicated-pod",
+						ContainerName: "main",
+						OwnerPoolName: commonstate.PoolNameDedicated,
+						QoSLevel:      consts.PodAnnotationQoSLevelDedicatedCores,
+					},
+					AllocationResult:                 dedicated,
+					OriginalAllocationResult:         dedicated,
+					TopologyAwareAssignments:         map[int]machine.CPUSet{0: dedicated},
+					OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: dedicated},
+					RequestQuantity:                  float64(dedicated.Size()),
+				},
+			},
+		}
+		machineState, err := generateMachineStateFromPodEntries(
+			topology, entries, policy.state.GetMachineState())
+		require.NoError(t, err)
+		require.NoError(t, policy.state.CommitAdvisorState(
+			entries, machineState, false, false, false))
+
+		require.NoError(t, policy.initReclaimPool())
+
+		reclaim := policy.state.GetAllocationInfo(
+			commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+		require.NotNil(t, reclaim)
+		requireCoreAligned(t, topology, reclaim.AllocationResult)
+		require.Equal(t, policy.reservedReclaimedCPUsSize, reclaim.AllocationResult.Size())
+		require.True(t, reclaim.AllocationResult.Equals(topology.CPUDetails.CPUsInNUMANodes(1)),
+			"reclaim should use the globally available complete cores, got %s",
+			reclaim.AllocationResult.String())
+	})
+}
+
+func TestDynamicPolicyInitReclaimPoolDoesNotReplayOverlappingReserve(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	policy.reservedCPUs = machine.NewCPUSet()
+	policy.reservedReclaimedCPUsSize = 2
+
+	dedicated := topology.CPUDetails.CPUs()
+	entries := state.PodEntries{
+		"dedicated-pod": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "dedicated-pod",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameDedicated,
+					QoSLevel:      consts.PodAnnotationQoSLevelDedicatedCores,
+				},
+				AllocationResult:         dedicated.Clone(),
+				OriginalAllocationResult: dedicated.Clone(),
+				TopologyAwareAssignments: map[int]machine.CPUSet{
+					0: topology.CPUDetails.CPUsInNUMANodes(0),
+					1: topology.CPUDetails.CPUsInNUMANodes(1),
+				},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{
+					0: topology.CPUDetails.CPUsInNUMANodes(0),
+					1: topology.CPUDetails.CPUsInNUMANodes(1),
+				},
+				RequestQuantity: float64(dedicated.Size()),
+			},
+		},
+	}
+	machineState, err := generateMachineStateFromPodEntries(
+		topology, entries, policy.state.GetMachineState())
+	require.NoError(t, err)
+	require.NoError(t, policy.state.CommitAdvisorState(
+		entries, machineState, false, false, false))
+
+	err = policy.initReclaimPool()
+	require.ErrorContains(t, err, "select core-aligned reclaim cpus")
+	require.Nil(t, policy.state.GetAllocationInfo(
+		commonstate.PoolNameReclaim, commonstate.FakedContainerName))
+}
+
 func TestRemovePod(t *testing.T) {
 	t.Parallel()
 
@@ -936,6 +1109,476 @@ func TestRemovePod(t *testing.T) {
 	as.True(strings.Contains(err.Error(), "is not show up in cpu plugin state"))
 }
 
+func TestAllocateAndRemovePodWaitForAdvisorOwnerToConverge(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	var reconcileCalls int32
+	p.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+		"record": func(_ context.Context, handlerCtx dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
+			if handlerCtx.Mode == dynamicpolicyutil.CPUSetAdjustmentModeRetry {
+				atomic.AddInt32(&reconcileCalls, 1)
+			}
+			return nil
+		},
+	}
+	req := &pluginapi.ResourceRequest{
+		PodUid:        string(uuid.NewUUID()),
+		PodNamespace:  "pending-wal",
+		PodName:       "pending-wal",
+		ContainerName: "main",
+		ContainerType: pluginapi.ContainerType_MAIN,
+		ResourceName:  string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{
+			string(v1.ResourceCPU): 2,
+		},
+		Labels:      map[string]string{},
+		Annotations: map[string]string{},
+	}
+	_, err = p.Allocate(context.Background(), req)
+	require.NoError(t, err)
+	trackedState := &atomicCommitTrackingState{State: p.state}
+	p.state = trackedState
+	revision := p.state.GetRevision()
+	p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, revision)
+
+	allocateDone := make(chan error, 1)
+	go func() {
+		_, allocateErr := p.Allocate(context.Background(), req)
+		allocateDone <- allocateErr
+	}()
+	select {
+	case allocateErr := <-allocateDone:
+		t.Fatalf("Allocate returned before the retry owner converged pending target: %v", allocateErr)
+	case <-time.After(30 * time.Millisecond):
+	}
+	require.Equal(t, int32(0), atomic.LoadInt32(&reconcileCalls),
+		"admission must not reconcile the pending target")
+
+	p.scheduleCPUSetAdjustmentRetry(dynamicpolicyutil.RetryReasonApplyFailed)
+	require.NoError(t, <-allocateDone)
+	p.cpuSetAdjustmentRetryWG.Wait()
+	require.Equal(t, int32(1), atomic.LoadInt32(&reconcileCalls))
+	require.Nil(t, p.currentAdvisorPostCommitTarget())
+
+	trackedState.commitCalls = 0
+	trackedState.storeCalls = 0
+	revision = p.state.GetRevision()
+	p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, revision)
+
+	removeDone := make(chan error, 1)
+	go func() {
+		_, removeErr := p.RemovePod(context.Background(), &pluginapi.RemovePodRequest{PodUid: req.PodUid})
+		removeDone <- removeErr
+	}()
+	select {
+	case removeErr := <-removeDone:
+		t.Fatalf("RemovePod returned before the retry owner converged pending target: %v", removeErr)
+	case <-time.After(30 * time.Millisecond):
+	}
+	require.Equal(t, int32(1), atomic.LoadInt32(&reconcileCalls),
+		"RemovePod must not reconcile the pending target")
+
+	p.scheduleCPUSetAdjustmentRetry(dynamicpolicyutil.RetryReasonApplyFailed)
+	require.NoError(t, <-removeDone)
+	p.cpuSetAdjustmentRetryWG.Wait()
+	require.Equal(t, int32(2), atomic.LoadInt32(&reconcileCalls))
+	require.Nil(t, p.currentAdvisorPostCommitTarget())
+	require.Nil(t, p.state.GetAllocationInfo(req.PodUid, req.ContainerName))
+	require.NoFileExists(t, p.advisorPostCommitCheckpointPath())
+}
+
+func TestAllocateAndRemovePodPendingWaitHonorsRequestContextWithoutStateWrites(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	req := &pluginapi.ResourceRequest{
+		PodUid:        string(uuid.NewUUID()),
+		PodNamespace:  "pending-wal-failure",
+		PodName:       "pending-wal-failure",
+		ContainerName: "main",
+		ContainerType: pluginapi.ContainerType_MAIN,
+		ResourceName:  string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{
+			string(v1.ResourceCPU): 2,
+		},
+		Labels:      map[string]string{},
+		Annotations: map[string]string{},
+	}
+	_, err = p.Allocate(context.Background(), req)
+	require.NoError(t, err)
+
+	trackedState := &atomicCommitTrackingState{State: p.state}
+	p.state = trackedState
+	emitter := &recordingMetricEmitter{}
+	p.emitter = emitter
+	var reconcileCalls int32
+	p.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+		"must-not-run-from-admission": func(ctx context.Context, _ dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
+			atomic.AddInt32(&reconcileCalls, 1)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	revision := p.state.GetRevision()
+	target := p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, revision)
+
+	allocateCtx, cancelAllocate := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancelAllocate()
+	_, err = p.Allocate(allocateCtx, req)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Equal(t, int32(0), atomic.LoadInt32(&reconcileCalls),
+		"Allocate must wait rather than reconcile")
+	require.Equal(t, 0, trackedState.commitCalls, "pre-admission failure must not rollback state")
+	require.Equal(t, 0, trackedState.storeCalls, "pre-admission failure must not store state")
+	require.Equal(t, revision, p.state.GetRevision())
+	require.NotNil(t, p.state.GetAllocationInfo(req.PodUid, req.ContainerName))
+	require.Same(t, target, p.currentAdvisorPostCommitTarget())
+	require.FileExists(t, p.advisorPostCommitCheckpointPath())
+	require.Equal(t, 1, countMetricRecords(emitter.records, util.MetricNameAllocateFailed),
+		"pre-admission Allocate failure must retain failure metrics")
+
+	removeCtx, cancelRemove := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancelRemove()
+	_, err = p.RemovePod(removeCtx, &pluginapi.RemovePodRequest{PodUid: req.PodUid})
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Equal(t, int32(0), atomic.LoadInt32(&reconcileCalls),
+		"RemovePod must wait rather than reconcile")
+	require.Equal(t, 0, trackedState.commitCalls)
+	require.Equal(t, 0, trackedState.storeCalls)
+	require.Equal(t, revision, p.state.GetRevision())
+	require.NotNil(t, p.state.GetAllocationInfo(req.PodUid, req.ContainerName))
+	require.Same(t, target, p.currentAdvisorPostCommitTarget())
+	require.FileExists(t, p.advisorPostCommitCheckpointPath())
+	require.Equal(t, 1, countMetricRecords(emitter.records, util.MetricNameRemovePodFailed),
+		"pre-admission RemovePod failure must retain failure metrics")
+}
+
+func TestGetResourcesAllocationWaitsForAdvisorOwnerToConverge(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+		"noop": func(context.Context, dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
+			return nil
+		},
+	}
+	target := p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+
+	done := make(chan error, 1)
+	go func() {
+		_, getErr := p.GetResourcesAllocation(
+			context.Background(), &pluginapi.GetResourcesAllocationRequest{})
+		done <- getErr
+	}()
+	select {
+	case getErr := <-done:
+		t.Fatalf("GetResourcesAllocation returned before the retry owner converged target %d: %v",
+			target.revision, getErr)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	p.scheduleCPUSetAdjustmentRetry(dynamicpolicyutil.RetryReasonApplyFailed)
+	require.NoError(t, <-done)
+	p.cpuSetAdjustmentRetryWG.Wait()
+	require.Nil(t, p.currentAdvisorPostCommitTarget())
+}
+
+func TestGetResourcesAllocationPendingWaitHonorsRequestContextWithoutStateWrites(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	trackedState := &atomicCommitTrackingState{State: p.state}
+	p.state = trackedState
+	target := p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	_, err = p.GetResourcesAllocation(ctx, &pluginapi.GetResourcesAllocationRequest{})
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Equal(t, 0, trackedState.commitCalls)
+	require.Equal(t, 0, trackedState.storeCalls)
+	require.Same(t, target, p.currentAdvisorPostCommitTarget())
+	require.FileExists(t, p.advisorPostCommitCheckpointPath())
+}
+
+func TestAllocateExecutionLeaseRechecksAdvisorTarget(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	adjustmentEntered := make(chan struct{})
+	releaseAdjustment := make(chan struct{})
+	var adjustmentCalls int32
+	p.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+		"block": func(context.Context, dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
+			if atomic.AddInt32(&adjustmentCalls, 1) != 1 {
+				return nil
+			}
+			close(adjustmentEntered)
+			<-releaseAdjustment
+			return nil
+		},
+	}
+	adjustmentDone := make(chan error, 1)
+	go func() {
+		p.Lock()
+		adjustmentDone <- p.runCPUSetAdjustmentHandlers(context.Background())
+		p.Unlock()
+	}()
+	<-adjustmentEntered
+
+	req := &pluginapi.ResourceRequest{
+		PodUid:        string(uuid.NewUUID()),
+		PodNamespace:  "execution-lease",
+		PodName:       "execution-lease",
+		ContainerName: "main",
+		ContainerType: pluginapi.ContainerType_MAIN,
+		ResourceName:  string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{
+			string(v1.ResourceCPU): 2,
+		},
+		Labels:      map[string]string{},
+		Annotations: map[string]string{},
+	}
+	allocateDone := make(chan error, 1)
+	go func() {
+		_, allocateErr := p.Allocate(context.Background(), req)
+		allocateDone <- allocateErr
+	}()
+
+	select {
+	case allocateErr := <-allocateDone:
+		t.Fatalf("Allocate returned while cpuset adjustment still held the execution lease: %v", allocateErr)
+	case <-time.After(30 * time.Millisecond):
+	}
+	require.Nil(t, p.state.GetAllocationInfo(req.PodUid, req.ContainerName))
+
+	target := p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+	close(releaseAdjustment)
+	require.NoError(t, <-adjustmentDone)
+
+	select {
+	case allocateErr := <-allocateDone:
+		t.Fatalf("Allocate returned without rechecking target %d after acquiring the execution lease: %v",
+			target.revision, allocateErr)
+	case <-time.After(30 * time.Millisecond):
+	}
+	require.Nil(t, p.state.GetAllocationInfo(req.PodUid, req.ContainerName))
+
+	p.scheduleCPUSetAdjustmentRetry(dynamicpolicyutil.RetryReasonApplyFailed)
+	require.NoError(t, <-allocateDone)
+	p.cpuSetAdjustmentRetryWG.Wait()
+	require.Nil(t, p.currentAdvisorPostCommitTarget())
+	require.NotNil(t, p.state.GetAllocationInfo(req.PodUid, req.ContainerName))
+}
+
+func TestPendingAdvisorPostCommitWaitWakesImmediatelyOnTargetChange(t *testing.T) {
+	p := &DynamicPolicy{}
+	target := &advisorPostCommitTarget{revision: 1}
+	p.publishPreparedAdvisorPostCommitTarget(target)
+
+	current, changed := p.currentAdvisorPostCommitTargetAndChange()
+	require.Same(t, target, current)
+	require.NotNil(t, changed)
+
+	p.rollbackPreparedAdvisorPostCommitTarget(target, nil)
+
+	select {
+	case <-changed:
+	default:
+		t.Fatal("target change must synchronously close the observed change channel")
+	}
+}
+
+func TestPendingAdvisorPostCommitWaitRechecksDeadlineAfterReacquiringPolicyLock(t *testing.T) {
+	p := &DynamicPolicy{}
+	target := &advisorPostCommitTarget{revision: 1}
+	p.publishPreparedAdvisorPostCommitTarget(target)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	locked := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		p.Lock()
+		close(locked)
+		err := p.waitForPendingAdvisorPostCommitTargetLocked(ctx, "test")
+		p.Unlock()
+		done <- err
+	}()
+
+	<-locked
+	p.Lock()
+	p.rollbackPreparedAdvisorPostCommitTarget(target, nil)
+	<-ctx.Done()
+	p.Unlock()
+
+	require.ErrorIs(t, <-done, context.DeadlineExceeded)
+}
+
+func countMetricRecords(records []metricRecord, name string) int {
+	count := 0
+	for _, record := range records {
+		if record.key == name {
+			count++
+		}
+	}
+	return count
+}
+
+func TestInstalledStateWritePermitRejectsLegacyWriterWhileAdvisorTargetPending(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.installCPUStateWritePermit()
+	revision := p.state.GetRevision()
+	target := p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, revision)
+
+	err = p.state.SetMachineState(p.state.GetMachineState(), false)
+
+	require.Error(t, err)
+	var retryable retryablePartitionCommitError
+	require.ErrorAs(t, err, &retryable)
+	require.True(t, retryable.Retryable())
+	require.Equal(t, revision, p.state.GetRevision())
+	require.Same(t, target, p.currentAdvisorPostCommitTarget())
+}
+
+func TestAdvisorStateWritePermitBindsTargetAndRevisionAndIsSingleUse(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.installCPUStateWritePermit()
+	revision := p.state.GetRevision()
+	wrongRevisionTarget := p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, revision+1)
+	err = p.state.CommitAdvisorStateIfRevision(
+		revision,
+		p.state.GetPodEntries(),
+		p.state.GetMachineState(),
+		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+		false,
+		p.newAdvisorStateWritePermit(wrongRevisionTarget),
+	)
+	require.Error(t, err)
+	require.Equal(t, revision, p.state.GetRevision())
+
+	target := p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, revision)
+	permit := p.newAdvisorStateWritePermit(target)
+	err = p.state.CommitAdvisorStateIfRevision(
+		revision,
+		p.state.GetPodEntries(),
+		p.state.GetMachineState(),
+		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+		false,
+		permit,
+	)
+	require.NoError(t, err)
+	require.Equal(t, revision+1, p.state.GetRevision())
+
+	err = p.state.CommitAdvisorStateIfRevision(
+		revision+1,
+		p.state.GetPodEntries(),
+		p.state.GetMachineState(),
+		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+		false,
+		permit,
+	)
+	require.Error(t, err, "a successful permit must not be reusable")
+
+	replacedPermit := p.newAdvisorStateWritePermit(target)
+	replacement := p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+	require.NotSame(t, target, replacement)
+	err = p.state.CommitAdvisorStateIfRevision(
+		p.state.GetRevision(),
+		p.state.GetPodEntries(),
+		p.state.GetMachineState(),
+		p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+		false,
+		replacedPermit,
+	)
+	require.Error(t, err, "a permit must not authorize a replaced target")
+}
+
+func TestNewDynamicPolicyRestoresPendingWALBeforeStartupStateWriters(t *testing.T) {
+	defer state.SetReadonlyState(nil)
+	defer state.SetReadWriteState(nil)
+
+	topology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	require.NoError(t, err)
+	stateDir := t.TempDir()
+	first, err := getTestDynamicPolicyWithInitialization(topology, stateDir)
+	require.NoError(t, err)
+	require.NoError(t, first.state.CommitAdvisorStateIfRevision(
+		first.state.GetRevision(),
+		first.state.GetPodEntries(),
+		first.state.GetMachineState(),
+		first.state.GetAllowSharedCoresOverlapReclaimedCores(),
+		first.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+		true,
+	))
+	revision := first.state.GetRevision()
+	first.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, revision)
+	require.FileExists(t, first.advisorPostCommitCheckpointPath())
+
+	conf := config.NewConfiguration()
+	conf.GenericQRMPluginConfiguration.StateDirectoryConfiguration =
+		&statedirectory.StateDirectoryConfiguration{StateFileDirectory: stateDir}
+	kccConf := generateTestConfiguration(t, "pending-wal-restart", filepath.Join(stateDir, "metaserver"))
+	kccMgr, err := kcc.NewDynamicConfigManager(nil, nil, nil, kccConf)
+	require.NoError(t, err)
+	metaServer := &metaserver.MetaServer{
+		MetaAgent: &agent.MetaAgent{
+			KatalystMachineInfo: &machine.KatalystMachineInfo{CPUTopology: topology},
+		},
+		ConfigurationManager: kccMgr,
+	}
+	agentCtx := &componentagent.GenericContext{
+		GenericContext: &katalystbase.GenericContext{
+			EmitterPool: metricspool.DummyMetricsEmitterPool{},
+		},
+		MetaServer: metaServer,
+	}
+
+	ok, _, err := NewDynamicPolicy(agentCtx, conf, nil, "pending-wal-restart")
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	restartedState, err := state.GetReadWriteState()
+	require.NoError(t, err)
+	require.Equal(t, revision, restartedState.GetRevision(),
+		"constructor must not advance the checkpoint revision before recovering the matching WAL")
+	err = restartedState.SetMachineState(restartedState.GetMachineState(), false)
+	require.Error(t, err, "the recovered WAL gate must be installed before NewDynamicPolicy returns")
+	var retryable retryablePartitionCommitError
+	require.ErrorAs(t, err, &retryable)
+	require.True(t, retryable.Retryable())
+	require.Equal(t, revision, restartedState.GetRevision())
+	require.FileExists(t, first.advisorPostCommitCheckpointPath())
+}
+
 func TestRemovePodCommitsCanonicalStateAtomically(t *testing.T) {
 	policyTestMutex.Lock()
 	defer policyTestMutex.Unlock()
@@ -993,10 +1636,10 @@ func TestRemovePodCommitsCanonicalStateAtomically(t *testing.T) {
 			gotPersist  bool
 			gotRevision uint64
 		)
-		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAtRevision).
+		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAtRevisionWithContext).
 			Return(gateErr).Build()
-		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesForRecoveryAtRevision).
-			To(func(_ *DynamicPolicy, entries state.PodEntries, machineState state.NUMANodeMap,
+		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesForRecoveryAtRevisionWithContext).
+			To(func(_ *DynamicPolicy, _ context.Context, entries state.PodEntries, machineState state.NUMANodeMap,
 				persist bool, expectedRevision uint64,
 			) error {
 				require.NotContains(t, entries, podUID)
@@ -1029,7 +1672,7 @@ func TestRemovePodCommitsCanonicalStateAtomically(t *testing.T) {
 		defer mockey.UnPatchAll()
 		policy, _, initialRevision, initialMachineState := newPolicy(t)
 		releasePlugin := newRegistry(t)
-		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAtRevision).
+		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAtRevisionWithContext).
 			Return(nonGateErr).Build()
 
 		_, err := policy.RemovePod(context.Background(), &pluginapi.RemovePodRequest{PodUid: podUID})
@@ -1046,7 +1689,7 @@ func TestRemovePodCommitsCanonicalStateAtomically(t *testing.T) {
 		releasePlugin := newRegistry(t)
 		require.NoError(t, os.RemoveAll(stateDir))
 		require.NoError(t, os.WriteFile(stateDir, []byte("block checkpoint directory"), 0o600))
-		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAtRevision).
+		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAtRevisionWithContext).
 			Return(gateErr).Build()
 
 		_, err := policy.RemovePod(context.Background(), &pluginapi.RemovePodRequest{PodUid: podUID})
@@ -1072,7 +1715,7 @@ func TestRemovePodCommitsCanonicalStateAtomically(t *testing.T) {
 				return errors.New("admission handler must not run during recovery")
 			},
 		}
-		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAtRevision).
+		mockey.Mock((*DynamicPolicy).adjustAllocationEntriesAtRevisionWithContext).
 			Return(gateErr).Build()
 
 		require.NoError(t, os.RemoveAll(stateDir))
@@ -1374,6 +2017,7 @@ func TestRemovePodLastOwnerBackfillsOrphanCPUsInSingleRevision(t *testing.T) {
 	removedMachineState, err := generateMachineStateFromPodEntries(
 		topology, removedEntries, policy.state.GetMachineState())
 	require.NoError(t, err)
+	beforeMachineState := policy.state.GetMachineState()
 	err = policy.adjustAllocationEntriesAtRevision(
 		removedEntries, removedMachineState, true, initialRevision)
 	require.NoError(t, err)
@@ -1388,6 +2032,11 @@ func TestRemovePodLastOwnerBackfillsOrphanCPUsInSingleRevision(t *testing.T) {
 	require.True(t, orphanCPUs.IsSubsetOf(committedShare),
 		"orphan CPUs %s must be backfilled into committed default share %s", orphanCPUs, committedShare)
 	committedMachineState := policy.state.GetMachineState()
+	expectedCommittedMachineState, err := state.GenerateMachineStateFromPodEntries(
+		topology, committedEntries, beforeMachineState)
+	require.NoError(t, err)
+	require.True(t, reflect.DeepEqual(expectedCommittedMachineState, committedMachineState),
+		"committed machine state must be self-consistent with committed pod entries")
 
 	restarted, err := state.NewCheckpointState(
 		&statedirectory.StateDirectoryConfiguration{StateFileDirectory: stateDir},
@@ -1577,12 +2226,10 @@ func TestAllocate(t *testing.T) {
 							IsNodeResource:    false,
 							IsScalarResource:  true,
 							AllocatedQuantity: 4,
-							AllocationResult:  machine.NewCPUSet(1, 3, 4, 6).String(),
+							AllocationResult:  machine.NewCPUSet(1, 3, 9, 11).String(),
 							TopologyAssignments: map[uint64]uint64{
-								0: 1,
-								1: 1,
-								2: 1,
-								3: 1,
+								0: 2,
+								1: 2,
 							},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{nil},
@@ -2287,10 +2934,10 @@ func TestAllocate(t *testing.T) {
 							OciPropertyName:   util.OCIPropertyNameCPUSetCPUs,
 							IsNodeResource:    false,
 							IsScalarResource:  true,
-							AllocatedQuantity: 1,
-							AllocationResult:  machine.NewCPUSet(1).String(),
+							AllocatedQuantity: 2,
+							AllocationResult:  machine.NewCPUSet(1, 9).String(),
 							TopologyAssignments: map[uint64]uint64{
-								0: 1,
+								0: 2,
 							},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{
@@ -2359,12 +3006,10 @@ func TestAllocate(t *testing.T) {
 							IsNodeResource:    false,
 							IsScalarResource:  true,
 							AllocatedQuantity: 4,
-							AllocationResult:  machine.NewCPUSet(1, 3, 4, 6).String(),
+							AllocationResult:  machine.NewCPUSet(1, 3, 9, 11).String(),
 							TopologyAssignments: map[uint64]uint64{
-								0: 1,
-								1: 1,
-								2: 1,
-								3: 1,
+								0: 2,
+								1: 2,
 							},
 							ResourceHints: &pluginapi.ListOfTopologyHints{
 								Hints: []*pluginapi.TopologyHint{
@@ -7205,16 +7850,12 @@ func TestGetTopologyAwareResources(t *testing.T) {
 							AggregatedQuantity:         4,
 							OriginalAggregatedQuantity: 4,
 							TopologyAwareQuantityList: []*pluginapi.TopologyAwareQuantity{
-								{ResourceValue: 1, Node: 0},
-								{ResourceValue: 1, Node: 1},
-								{ResourceValue: 1, Node: 2},
-								{ResourceValue: 1, Node: 3},
+								{ResourceValue: 2, Node: 0},
+								{ResourceValue: 2, Node: 1},
 							},
 							OriginalTopologyAwareQuantityList: []*pluginapi.TopologyAwareQuantity{
-								{ResourceValue: 1, Node: 0},
-								{ResourceValue: 1, Node: 1},
-								{ResourceValue: 1, Node: 2},
-								{ResourceValue: 1, Node: 3},
+								{ResourceValue: 2, Node: 0},
+								{ResourceValue: 2, Node: 1},
 							},
 						},
 					},

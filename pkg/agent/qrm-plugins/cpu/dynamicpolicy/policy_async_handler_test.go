@@ -18,6 +18,7 @@ package dynamicpolicy
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -44,6 +45,36 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
+
+type systemExclusiveCommitFailureState struct {
+	state.State
+	err      error
+	attempts int
+}
+
+func (s *systemExclusiveCommitFailureState) CommitAdvisorStateIfRevision(
+	expectedRevision uint64,
+	podEntries state.PodEntries,
+	machineState state.NUMANodeMap,
+	allowSharedCoresOverlapReclaimedCores bool,
+	disableDedicatedCoresOverlapReclaimedCores bool,
+	persist bool,
+	permits ...*state.WritePermit,
+) error {
+	s.attempts++
+	if s.attempts == 1 {
+		return s.err
+	}
+	return s.State.CommitAdvisorStateIfRevision(
+		expectedRevision,
+		podEntries,
+		machineState,
+		allowSharedCoresOverlapReclaimedCores,
+		disableDedicatedCoresOverlapReclaimedCores,
+		persist,
+		permits...,
+	)
+}
 
 func TestCheckCPUSetHealth(t *testing.T) {
 	general.RegisterHeartbeatCheck(cpuconsts.CheckCPUSet, time.Hour, general.HealthzCheckStateReady, 0)
@@ -654,6 +685,37 @@ func TestApplySystemExclusivePoolChanges(t *testing.T) {
 
 	assert.Equal(t, 2, poolAllocationInfo.AllocationResult.Size())
 	assert.True(t, podAllocationInfo.AllocationResult.Equals(poolAllocationInfo.AllocationResult))
+}
+
+func TestApplySystemExclusivePoolChangesRetriesFailedAtomicCommit(t *testing.T) {
+	policy := newTestDynamicPolicy(t, "apply-system-exclusive-pool-changes-atomic")
+	policy.reservedCPUs = machine.NewCPUSet()
+	defaultSystemCPUs := policy.machineInfo.CPUDetails.CPUs()
+	require.NoError(t, policy.state.SetAllocationInfo("pod-with-pool", "main",
+		newSystemAllocationInfo(t, policy, "pod-with-pool", "main", "latency", defaultSystemCPUs), false))
+	oldEntries := policy.state.GetPodEntries()
+	oldMachineState := policy.state.GetMachineState()
+	commitErr := errors.New("atomic system exclusive commit failed")
+	failingState := &systemExclusiveCommitFailureState{
+		State: policy.state,
+		err:   commitErr,
+	}
+	policy.state = failingState
+	toCreate := map[string]int{commonstate.GetSystemPoolName("latency"): 2}
+
+	err := policy.applySystemExclusivePoolChanges(toCreate, nil, nil)
+
+	require.ErrorIs(t, err, commitErr)
+	require.Equal(t, oldEntries, policy.state.GetPodEntries())
+	require.Equal(t, oldMachineState, policy.state.GetMachineState())
+
+	err = policy.applySystemExclusivePoolChanges(toCreate, nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, 2, failingState.attempts)
+	poolAllocationInfo := policy.state.GetAllocationInfo(
+		commonstate.GetSystemPoolName("latency"), commonstate.FakedContainerName)
+	require.NotNil(t, poolAllocationInfo)
+	require.Equal(t, 2, poolAllocationInfo.AllocationResult.Size())
 }
 
 func TestGetSystemExclusivePoolMetricValueAndStatus(t *testing.T) {

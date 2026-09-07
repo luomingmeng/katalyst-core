@@ -44,6 +44,22 @@ type preparedCPUPartition struct {
 	machineState state.NUMANodeMap
 }
 
+type advisorPostCommitPendingError struct {
+	pendingRevision   uint64
+	attemptedRevision uint64
+	source            string
+}
+
+func (e *advisorPostCommitPendingError) Error() string {
+	return fmt.Sprintf(
+		"cpu state writer %q must retry while advisor post-commit revision %d is pending (attempted revision %d)",
+		e.source, e.pendingRevision, e.attemptedRevision)
+}
+
+func (e *advisorPostCommitPendingError) Retryable() bool {
+	return true
+}
+
 // preparePendingCPUPartition performs every fallible precommit step without
 // mutating plugin state: clone, hooks, normalize, rebuild, and validation.
 func (p *DynamicPolicy) preparePendingCPUPartition(
@@ -296,8 +312,19 @@ func validatePendingPoolOwnership(entries state.PodEntries) error {
 // commitPreparedCPUPartition is the only state mutation for a prepared CPU
 // partition. No fallible response or finalize work may follow this revision-CAS.
 func (p *DynamicPolicy) commitPreparedCPUPartition(prepared *preparedCPUPartition) error {
+	return p.commitPreparedCPUPartitionForAdvisorTarget(prepared, nil)
+}
+
+func (p *DynamicPolicy) commitPreparedCPUPartitionForAdvisorTarget(
+	prepared *preparedCPUPartition,
+	reconcileTarget *advisorPostCommitTarget,
+) error {
 	if prepared == nil {
 		return fmt.Errorf("commit prepared cpu partition: candidate is nil")
+	}
+	var permits []*state.WritePermit
+	if reconcileTarget != nil {
+		permits = append(permits, p.newAdvisorStateWritePermit(reconcileTarget))
 	}
 	if err := p.state.CommitAdvisorStateIfRevision(
 		prepared.pending.expectedRevision,
@@ -306,6 +333,7 @@ func (p *DynamicPolicy) commitPreparedCPUPartition(prepared *preparedCPUPartitio
 		prepared.pending.allowOverlap,
 		prepared.pending.disableDedicated,
 		prepared.pending.persist,
+		permits...,
 	); err != nil {
 		return err
 	}
@@ -316,11 +344,22 @@ func (p *DynamicPolicy) commitPreparedCPUPartition(prepared *preparedCPUPartitio
 func (p *DynamicPolicy) commitPendingCPUPartition(
 	pending pendingCPUPartition,
 ) (state.PodEntries, state.NUMANodeMap, error) {
+	return p.commitPendingCPUPartitionForAdvisorTarget(pending, nil)
+}
+
+func (p *DynamicPolicy) commitPendingCPUPartitionForAdvisorTarget(
+	pending pendingCPUPartition,
+	reconcileTarget *advisorPostCommitTarget,
+) (state.PodEntries, state.NUMANodeMap, error) {
+	if err := p.ensureCPUStateWriterAllowed(
+		pending.expectedRevision, pending.source, reconcileTarget); err != nil {
+		return nil, nil, err
+	}
 	prepared, err := p.preparePendingCPUPartition(pending)
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := p.commitPreparedCPUPartition(prepared); err != nil {
+	if err := p.commitPreparedCPUPartitionForAdvisorTarget(prepared, reconcileTarget); err != nil {
 		return nil, nil, err
 	}
 	return prepared.entries, prepared.machineState, nil

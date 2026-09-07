@@ -270,6 +270,14 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocks(
 	resp *advisorapi.ListAndWatchResponse,
 	hardActive bool,
 ) (advisorapi.BlockCPUSet, error) {
+	return p.planDisjointAdvisorBlocksWithCheckpointTransition(resp, hardActive, nil)
+}
+
+func (p *DynamicPolicy) planDisjointAdvisorBlocksWithCheckpointTransition(
+	resp *advisorapi.ListAndWatchResponse,
+	hardActive bool,
+	checkpointTransition *steadyFakeNUMAMigrationCheckpointTransition,
+) (advisorapi.BlockCPUSet, error) {
 	topology := p.machineInfo.CPUTopology
 	allCPUs := topology.CPUDetails.CPUs()
 	machineState := p.state.GetMachineState()
@@ -310,7 +318,8 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocks(
 			descriptor.Class == advisorBlockClassMandatoryReclaim ||
 			(!hardActive && descriptor.Class == advisorBlockClassShared && descriptor.NUMAID != commonstate.FakedNUMAID)
 	})
-	available, err = p.solveAdvisorDescriptorPhase(core, available, result, true, hardActive)
+	available, err = p.solveAdvisorDescriptorPhaseWithCheckpointTransition(
+		core, available, result, true, hardActive, checkpointTransition)
 	if err != nil {
 		return nil, fmt.Errorf("solve dedicated and mandatory reclaim: %w", err)
 	}
@@ -390,6 +399,18 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhase(
 	preserveClass bool,
 	hardActive bool,
 ) (machine.CPUSet, error) {
+	return p.solveAdvisorDescriptorPhaseWithCheckpointTransition(
+		descriptors, available, result, preserveClass, hardActive, nil)
+}
+
+func (p *DynamicPolicy) solveAdvisorDescriptorPhaseWithCheckpointTransition(
+	descriptors []advisorBlockDescriptor,
+	available machine.CPUSet,
+	result advisorapi.BlockCPUSet,
+	preserveClass bool,
+	hardActive bool,
+	checkpointTransition *steadyFakeNUMAMigrationCheckpointTransition,
+) (machine.CPUSet, error) {
 	if len(descriptors) == 0 {
 		return available, nil
 	}
@@ -398,6 +419,7 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhase(
 	ordinalByStableKey := make(map[string]int, len(descriptors))
 	var coreFloors []partitionCoreFloorConstraint
 	var steadyFakeDemandKeys []string
+	var committedSnapshot steadyFakeNUMACommittedSnapshot
 	expandHardReclaimPhase := preserveClass && hardActive
 	expandSteadyReclaimPhase := preserveClass && !hardActive &&
 		hasFakeNUMAMandatoryReclaimDescriptor(descriptors)
@@ -416,6 +438,11 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhase(
 			expanded, expandedBlockIDs, err = expandHardPartitionReclaimPhase(
 				descriptors, available, p.machineInfo.CPUTopology, skipNUMAs)
 		} else {
+			committedSnapshot, err = buildSteadyFakeNUMACommittedSnapshot(
+				descriptors, available)
+			if err != nil {
+				return available, fmt.Errorf("build committed blocks: %w", err)
+			}
 			expanded, expandedBlockIDs, coreFloors, err = expandSteadyFakeNUMAReclaimPhase(
 				descriptors, available, p.machineInfo.CPUTopology, skipNUMAs)
 		}
@@ -494,18 +521,23 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhase(
 		assignments, solveErr = solveSteadyFakeNUMAWholeCoreWithFloorsAndProject(
 			demands,
 			steadyFakeDemandKeys,
+			committedSnapshot,
 			coreFloors,
 			p.machineInfo.CPUTopology,
 			func(
 				demands []partitionDemand,
 				fakeKeys []string,
-				committed machine.CPUSet,
+				committed steadyFakeNUMACommittedSnapshot,
 				desired map[string]machine.CPUSet,
 				floors []partitionCoreFloorConstraint,
 				_ *machine.CPUTopology,
 			) (map[string]machine.CPUSet, error) {
-				return p.projectSteadyFakeNUMAStageWithCheckpoint(
+				projected, transition, err := p.planSteadyFakeNUMAStageWithCheckpoint(
 					demands, fakeKeys, committed, desired, floors)
+				if err == nil && checkpointTransition != nil {
+					*checkpointTransition = transition
+				}
+				return projected, err
 			},
 		)
 	} else if len(coreFloors) > 0 {

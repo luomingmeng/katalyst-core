@@ -55,12 +55,16 @@ type advisorCommitCheckpointManager struct {
 	mu          sync.Mutex
 	createCalls int
 	createErr   error
+	checkpoint  *CPUPluginCheckpoint
 }
 
-func (m *advisorCommitCheckpointManager) CreateCheckpoint(_ string, _ checkpointmanager.Checkpoint) error {
+func (m *advisorCommitCheckpointManager) CreateCheckpoint(_ string, checkpoint checkpointmanager.Checkpoint) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.createCalls++
+	if checkpoint, ok := checkpoint.(*CPUPluginCheckpoint); ok {
+		m.checkpoint = checkpoint
+	}
 	return m.createErr
 }
 
@@ -80,6 +84,12 @@ func (m *advisorCommitCheckpointManager) calls() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.createCalls
+}
+
+func (m *advisorCommitCheckpointManager) lastCheckpoint() *CPUPluginCheckpoint {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.checkpoint
 }
 
 func TestCPUPluginStateCommitAdvisorStateIsAtomic(t *testing.T) {
@@ -352,6 +362,114 @@ func TestCheckpointStateCommitAdvisorStateRollsBackMemoryOnFilesystemFailure(t *
 	require.Equal(t, oldRevision, st.GetRevision())
 }
 
+func TestCheckpointStatePersistentMutationsRollBackMemoryOnStoreFailure(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*stateCheckpoint) error
+	}{
+		{
+			name: "machine state",
+			mutate: func(sc *stateCheckpoint) error {
+				return sc.SetMachineState(NUMANodeMap{
+					0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(1)},
+				}, true)
+			},
+		},
+		{
+			name: "numa headroom",
+			mutate: func(sc *stateCheckpoint) error {
+				return sc.SetNUMAHeadroom(map[int]float64{0: 2}, true)
+			},
+		},
+		{
+			name: "allocation info",
+			mutate: func(sc *stateCheckpoint) error {
+				return sc.SetAllocationInfo("new-pod", "main", &AllocationInfo{
+					AllocationResult: machine.NewCPUSet(1),
+				}, true)
+			},
+		},
+		{
+			name: "pod entries",
+			mutate: func(sc *stateCheckpoint) error {
+				return sc.SetPodEntries(PodEntries{
+					"new-pod": {
+						"main": &AllocationInfo{AllocationResult: machine.NewCPUSet(1)},
+					},
+				}, true)
+			},
+		},
+		{
+			name: "allow overlap",
+			mutate: func(sc *stateCheckpoint) error {
+				return sc.SetAllowSharedCoresOverlapReclaimedCores(true, true)
+			},
+		},
+		{
+			name: "disable dedicated overlap",
+			mutate: func(sc *stateCheckpoint) error {
+				return sc.SetDisableDedicatedCoresOverlapReclaimedCores(true, true)
+			},
+		},
+		{
+			name: "delete",
+			mutate: func(sc *stateCheckpoint) error {
+				return sc.Delete("old-pod", "main", true)
+			},
+		},
+		{
+			name: "clear",
+			mutate: func(sc *stateCheckpoint) error {
+				return sc.ClearState()
+			},
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			manager := &advisorCommitCheckpointManager{createErr: stderrors.New("store failed")}
+			cache := NewCPUPluginState(topology)
+			require.NoError(t, cache.CommitAdvisorState(
+				PodEntries{
+					"old-pod": {
+						"main": &AllocationInfo{AllocationResult: machine.NewCPUSet(0)},
+					},
+				},
+				NUMANodeMap{0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(0)}},
+				false,
+				false,
+				false,
+			))
+			require.NoError(t, cache.SetNUMAHeadroom(map[int]float64{0: 1}))
+			sc := &stateCheckpoint{
+				cache:             cache,
+				checkpointManager: manager,
+				checkpointName:    cpuPluginStateFileName,
+				emitter:           metrics.DummyMetrics{},
+			}
+			oldEntries := sc.GetPodEntries()
+			oldMachineState := sc.GetMachineState()
+			oldHeadroom := sc.GetNUMAHeadroom()
+			oldAllowOverlap := sc.GetAllowSharedCoresOverlapReclaimedCores()
+			oldDisableDedicatedOverlap := sc.GetDisableDedicatedCoresOverlapReclaimedCores()
+			oldRevision := sc.GetRevision()
+
+			err := tc.mutate(sc)
+
+			require.EqualError(t, err, "store failed")
+			require.Equal(t, 1, manager.calls())
+			require.Equal(t, oldEntries, sc.GetPodEntries())
+			require.Equal(t, oldMachineState, sc.GetMachineState())
+			require.Equal(t, oldHeadroom, sc.GetNUMAHeadroom())
+			require.Equal(t, oldAllowOverlap, sc.GetAllowSharedCoresOverlapReclaimedCores())
+			require.Equal(t, oldDisableDedicatedOverlap, sc.GetDisableDedicatedCoresOverlapReclaimedCores())
+			require.Equal(t, oldRevision, sc.GetRevision())
+		})
+	}
+}
+
 func TestCPUPluginStateRejectsRevisionOverflowWithoutMutation(t *testing.T) {
 	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
 	require.NoError(t, err)
@@ -374,57 +492,57 @@ func TestCPUPluginStateRejectsRevisionOverflowWithoutMutation(t *testing.T) {
 	require.Equal(t, oldMachineState, s.GetMachineState())
 }
 
-func TestCPUPluginStateVoidMutationsFailStopWhenRevisionIsExhausted(t *testing.T) {
+func TestCPUPluginStateMutationsReturnRevisionOverflowWithoutMutation(t *testing.T) {
 	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
 	require.NoError(t, err)
 
 	for _, tc := range []struct {
 		name   string
-		mutate func(*cpuPluginState)
+		mutate func(*cpuPluginState) error
 	}{
 		{
 			name: "machine state",
-			mutate: func(s *cpuPluginState) {
-				s.SetMachineState(NUMANodeMap{
+			mutate: func(s *cpuPluginState) error {
+				return s.SetMachineState(NUMANodeMap{
 					0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(1)},
 				})
 			},
 		},
 		{
 			name:   "numa headroom",
-			mutate: func(s *cpuPluginState) { s.SetNUMAHeadroom(map[int]float64{0: 1}) },
+			mutate: func(s *cpuPluginState) error { return s.SetNUMAHeadroom(map[int]float64{0: 1}) },
 		},
 		{
 			name: "allocation info",
-			mutate: func(s *cpuPluginState) {
-				s.SetAllocationInfo("new-pod", "main", &AllocationInfo{
+			mutate: func(s *cpuPluginState) error {
+				return s.SetAllocationInfo("new-pod", "main", &AllocationInfo{
 					AllocationResult: machine.NewCPUSet(1),
 				})
 			},
 		},
 		{
 			name:   "pod entries",
-			mutate: func(s *cpuPluginState) { s.SetPodEntries(PodEntries{}) },
+			mutate: func(s *cpuPluginState) error { return s.SetPodEntries(PodEntries{}) },
 		},
 		{
 			name: "allow overlap",
-			mutate: func(s *cpuPluginState) {
-				s.SetAllowSharedCoresOverlapReclaimedCores(true)
+			mutate: func(s *cpuPluginState) error {
+				return s.SetAllowSharedCoresOverlapReclaimedCores(true)
 			},
 		},
 		{
 			name: "disable dedicated overlap",
-			mutate: func(s *cpuPluginState) {
-				s.SetDisableDedicatedCoresOverlapReclaimedCores(true)
+			mutate: func(s *cpuPluginState) error {
+				return s.SetDisableDedicatedCoresOverlapReclaimedCores(true)
 			},
 		},
 		{
 			name:   "delete",
-			mutate: func(s *cpuPluginState) { s.Delete("pod", "main") },
+			mutate: func(s *cpuPluginState) error { return s.Delete("pod", "main") },
 		},
 		{
 			name:   "clear",
-			mutate: func(s *cpuPluginState) { s.ClearState() },
+			mutate: func(s *cpuPluginState) error { return s.ClearState() },
 		},
 	} {
 		tc := tc
@@ -435,11 +553,169 @@ func TestCPUPluginStateVoidMutationsFailStopWhenRevisionIsExhausted(t *testing.T
 			}
 			s.revision = math.MaxUint64
 
-			require.PanicsWithError(t, ErrStateRevisionOverflow.Error(), func() {
-				tc.mutate(s)
-			})
+			require.ErrorIs(t, tc.mutate(s), ErrStateRevisionOverflow)
 			require.Equal(t, uint64(math.MaxUint64), s.GetRevision())
 			require.NotNil(t, s.GetAllocationInfo("pod", "main"))
+		})
+	}
+}
+
+func TestCPUPluginStateSetAllocationInfoRejectsNil(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
+	require.NoError(t, err)
+	s := NewCPUPluginState(topology)
+
+	revision := s.GetRevision()
+	err = s.SetAllocationInfo("pod", "main", nil)
+
+	require.Error(t, err)
+	require.ErrorContains(t, err, "allocation info is nil")
+	require.Equal(t, revision, s.GetRevision())
+	require.Nil(t, s.GetAllocationInfo("pod", "main"))
+}
+
+func TestCheckpointStateWritePermitRejectsMutationBeforeStateChange(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
+	require.NoError(t, err)
+	sc := &stateCheckpoint{cache: NewCPUPluginState(topology)}
+	denied := stderrors.New("write denied")
+	var gotRevision uint64
+	var gotOperation string
+	sc.SetWritePermit(func(revision uint64, operation string, _ *WritePermit) error {
+		gotRevision = revision
+		gotOperation = operation
+		return denied
+	})
+	oldState := sc.GetMachineState()
+	oldRevision := sc.GetRevision()
+
+	err = sc.SetMachineState(NUMANodeMap{
+		0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(1)},
+	}, false)
+
+	require.ErrorIs(t, err, denied)
+	require.Equal(t, oldRevision, gotRevision)
+	require.Equal(t, "SetMachineState", gotOperation)
+	require.Equal(t, oldRevision, sc.GetRevision())
+	require.Equal(t, oldState, sc.GetMachineState())
+}
+
+func TestCheckpointStateStoreStateBypassesMutationPermit(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
+	require.NoError(t, err)
+	manager := &advisorCommitCheckpointManager{}
+	sc := &stateCheckpoint{
+		cache:             NewCPUPluginState(topology),
+		checkpointManager: manager,
+		checkpointName:    cpuPluginStateFileName,
+		emitter:           metrics.DummyMetrics{},
+	}
+	require.NoError(t, sc.cache.SetAllocationInfo("pod", "main", &AllocationInfo{
+		AllocationResult: machine.NewCPUSet(0),
+	}))
+	oldEntries := sc.GetPodEntries()
+	oldMachineState := sc.GetMachineState()
+	oldRevision := sc.GetRevision()
+	denied := stderrors.New("write denied")
+	sc.SetWritePermit(func(uint64, string, *WritePermit) error {
+		return denied
+	})
+
+	require.NoError(t, sc.StoreState())
+	require.Equal(t, oldRevision, sc.GetRevision())
+	require.Equal(t, oldEntries, sc.GetPodEntries())
+	require.Equal(t, oldMachineState, sc.GetMachineState())
+	require.Equal(t, 1, manager.calls())
+	checkpoint := manager.lastCheckpoint()
+	require.NotNil(t, checkpoint)
+	require.Equal(t, oldRevision, checkpoint.Revision)
+	require.Equal(t, oldEntries, checkpoint.PodEntries)
+	require.Equal(t, oldMachineState, checkpoint.MachineState)
+
+	err = sc.SetMachineState(NUMANodeMap{
+		0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(1)},
+	}, false)
+	require.ErrorIs(t, err, denied)
+	require.Equal(t, oldRevision, sc.GetRevision())
+	require.Equal(t, oldMachineState, sc.GetMachineState())
+}
+
+func TestTransientStateStoreStateBypassesMutationPermit(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
+	require.NoError(t, err)
+	s := NewTransientState(topology)
+	oldEntries := s.GetPodEntries()
+	oldMachineState := s.GetMachineState()
+	oldRevision := s.GetRevision()
+	denied := stderrors.New("write denied")
+	s.SetWritePermit(func(uint64, string, *WritePermit) error {
+		return denied
+	})
+
+	require.NoError(t, s.StoreState())
+	require.Equal(t, oldRevision, s.GetRevision())
+	require.Equal(t, oldEntries, s.GetPodEntries())
+	require.Equal(t, oldMachineState, s.GetMachineState())
+
+	err = s.SetMachineState(NUMANodeMap{
+		0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(1)},
+	}, false)
+	require.ErrorIs(t, err, denied)
+	require.Equal(t, oldRevision, s.GetRevision())
+	require.Equal(t, oldMachineState, s.GetMachineState())
+}
+
+func TestCheckpointStateWritePermitGuardsAdvisorCommits(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(2, 1, 1)
+	require.NoError(t, err)
+	denied := stderrors.New("write denied")
+
+	for _, tc := range []struct {
+		name      string
+		operation string
+		commit    func(*stateCheckpoint, PodEntries, NUMANodeMap) error
+	}{
+		{
+			name:      "unconditional",
+			operation: "CommitAdvisorState",
+			commit: func(sc *stateCheckpoint, entries PodEntries, machineState NUMANodeMap) error {
+				return sc.CommitAdvisorState(entries, machineState, true, false, false)
+			},
+		},
+		{
+			name:      "revision conditional",
+			operation: "CommitAdvisorStateIfRevision",
+			commit: func(sc *stateCheckpoint, entries PodEntries, machineState NUMANodeMap) error {
+				return sc.CommitAdvisorStateIfRevision(
+					sc.GetRevision(), entries, machineState, true, false, false)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sc := &stateCheckpoint{cache: NewCPUPluginState(topology)}
+			oldEntries := sc.GetPodEntries()
+			oldMachineState := sc.GetMachineState()
+			oldRevision := sc.GetRevision()
+			var gotRevision uint64
+			var gotOperation string
+			sc.SetWritePermit(func(revision uint64, operation string, _ *WritePermit) error {
+				gotRevision = revision
+				gotOperation = operation
+				return denied
+			})
+
+			err := tc.commit(
+				sc,
+				PodEntries{"new": {"main": &AllocationInfo{AllocationResult: machine.NewCPUSet(1)}}},
+				NUMANodeMap{0: &NUMANodeState{AllocatedCPUSet: machine.NewCPUSet(1)}},
+			)
+
+			require.ErrorIs(t, err, denied)
+			require.Equal(t, oldRevision, gotRevision)
+			require.Equal(t, tc.operation, gotOperation)
+			require.Equal(t, oldRevision, sc.GetRevision())
+			require.Equal(t, oldEntries, sc.GetPodEntries())
+			require.Equal(t, oldMachineState, sc.GetMachineState())
 		})
 	}
 }

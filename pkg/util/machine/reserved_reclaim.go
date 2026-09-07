@@ -68,9 +68,9 @@ func extractReclaimReservationKnobs(
 //  1. when NumaMinReclaimedResourceRatioForAllocate is enabled (its
 //     integer-rounded value is non-zero), each NUMA reserves
 //     max(ceil(ratio*numaCPUSize), NumaMinReclaimedResourceForAllocate);
-//  2. otherwise fall back to MinReclaimedResourceForAllocate, clamped to
-//     NumCPUs and lifted to at least NumNUMANodes, then spread evenly across
-//     NUMA nodes via GetCoreNumReservedForReclaim.
+//  2. otherwise fall back to MinReclaimedResourceForAllocate, clamped to the
+//     aggregate core-aligned capacity and lifted to one complete core on each
+//     NUMA that owns one, then water-filled without exceeding NUMA capacity.
 //
 // The topology owns both the NUMA capacity view (NUMAToCPUs) and the node
 // counts, so this stays byte-for-byte aligned with the hard-partition helpers
@@ -86,13 +86,13 @@ func ResolvePerNUMAReservedForReclaim(
 
 	numaReservedRatio, numaReservedFloor, globalReservedCores := extractReclaimReservationKnobs(conf, 0)
 	numCPUs := topology.NumCPUs
-	numNUMANodes := topology.NumNUMANodes
+	numaIDs := topology.CPUDetails.NUMANodes().ToSliceInt()
 	cpusPerCore := topology.CPUsPerCore()
 	numaCPUSize := func(numaID int) int { return topology.NUMAToCPUs.CPUSizeInNUMAs(numaID) }
 
 	if numaReservedRatio > 0 {
-		reservedForReclaim := make(map[int]int, numNUMANodes)
-		for id := 0; id < numNUMANodes; id++ {
+		reservedForReclaim := make(map[int]int, len(numaIDs))
+		for _, id := range numaIDs {
 			size := 0
 			if numaCPUSize != nil {
 				size = numaCPUSize(id)
@@ -108,10 +108,30 @@ func ResolvePerNUMAReservedForReclaim(
 	if coreNumReservedForReclaim > numCPUs {
 		coreNumReservedForReclaim = numCPUs
 	}
-	if coreNumReservedForReclaim < numNUMANodes {
-		coreNumReservedForReclaim = numNUMANodes
+	if cpusPerCore <= 0 {
+		cpusPerCore = 1
 	}
-	return GetCoreNumReservedForReclaim(coreNumReservedForReclaim, numNUMANodes, cpusPerCore)
+	capacityByNUMA := make(map[int]int, len(numaIDs))
+	baselineByNUMA := make(map[int]int, len(numaIDs))
+	totalCoreAlignedCapacity := 0
+	for _, numaID := range numaIDs {
+		capacity := numaCPUSize(numaID)
+		alignedCapacity := (capacity / cpusPerCore) * cpusPerCore
+		capacityByNUMA[numaID] = capacity
+		if alignedCapacity >= cpusPerCore {
+			baselineByNUMA[numaID] = cpusPerCore
+		}
+		totalCoreAlignedCapacity += alignedCapacity
+	}
+	if coreNumReservedForReclaim > totalCoreAlignedCapacity {
+		coreNumReservedForReclaim = totalCoreAlignedCapacity
+	}
+	targets, err := DistributeConfiguredHardReclaimFloor(
+		capacityByNUMA, baselineByNUMA, coreNumReservedForReclaim, cpusPerCore)
+	if err != nil {
+		return baselineByNUMA
+	}
+	return targets
 }
 
 // ResolveConfiguredReclaimFloor resolves the scalar total reserved-for-reclaim
@@ -178,6 +198,16 @@ func ResolveConfiguredReclaimFloorFromConfig(
 	numaIDs := topology.CPUDetails.NUMANodes().ToSliceInt()
 
 	numaReservedRatio, numaReservedFloor, globalReserved := extractReclaimReservationKnobs(conf, globalReservedFallback)
+	if numaReservedRatio > 0 {
+		total := 0
+		for _, numaID := range numaIDs {
+			size := topology.CPUDetails.CPUsInNUMANodes(numaID).Size()
+			reserved := math.Ceil(numaReservedRatio * float64(size))
+			floor := int(math.Max(float64(numaReservedFloor), reserved))
+			total += roundUpToCoreAligned(floor, topology.CPUsPerCore())
+		}
+		return total
+	}
 
 	return ResolveConfiguredReclaimFloor(
 		numaReservedRatio,

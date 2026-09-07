@@ -41,6 +41,18 @@ func TestSteadyFakeNUMAMigrationChurn(t *testing.T) {
 		{"one replacement", machine.NewCPUSet(0, 1), machine.NewCPUSet(0, 2), 2},
 		{"expansion with replacement", machine.NewCPUSet(0, 1), machine.NewCPUSet(0, 2, 3, 4), 2},
 		{"shrink with replacement", machine.NewCPUSet(0, 1, 2, 3), machine.NewCPUSet(0, 4), 2},
+		{
+			"five replacements are exactly ten CPU IDs",
+			machine.NewCPUSet(0, 1, 2, 3, 4),
+			machine.NewCPUSet(5, 6, 7, 8, 9),
+			10,
+		},
+		{
+			"eight replacements are exactly sixteen CPU IDs",
+			machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
+			machine.NewCPUSet(8, 9, 10, 11, 12, 13, 14, 15),
+			16,
+		},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -62,18 +74,19 @@ func TestSolveSteadyFakeNUMAWholeCoreDelegatesFinalProjection(t *testing.T) {
 	got, err := solveSteadyFakeNUMAWholeCoreWithFloorsAndProject(
 		demands,
 		[]string{"fake"},
+		newSteadyFakeNUMACommittedSnapshotForTest(fake, all),
 		nil,
 		topology,
 		func(
 			_ []partitionDemand,
 			_ []string,
-			committed machine.CPUSet,
+			committed steadyFakeNUMACommittedSnapshot,
 			desired map[string]machine.CPUSet,
 			_ []partitionCoreFloorConstraint,
 			_ *machine.CPUTopology,
 		) (map[string]machine.CPUSet, error) {
 			called = true
-			require.Equal(t, fake, committed)
+			require.Equal(t, fake, committed.reclaim)
 			return desired, nil
 		},
 	)
@@ -108,7 +121,9 @@ func TestProjectSteadyFakeNUMAStageConvergesInBoundedStages(t *testing.T) {
 			},
 		}
 		next, solveErr := projectSteadyFakeNUMAStage(
-			demands, []string{"fake"}, current, desired, nil, topology)
+			demands, []string{"fake"},
+			newSteadyFakeNUMACommittedSnapshotForTest(current, all),
+			desired, nil, topology)
 		require.NoError(t, solveErr)
 		require.NoError(t, assertCoreAligned(next["fake"], topology))
 		require.Equal(t, target.Size(), next["fake"].Size())
@@ -155,7 +170,9 @@ func TestProjectSteadyFakeNUMAStageSupportsSMT1SMT2AndSMT4(t *testing.T) {
 			for cycle := 0; cycle < maxCycles && !current.Equals(target); cycle++ {
 				demands := stagedMigrationDemands(all, current, target.Size())
 				next, solveErr := projectSteadyFakeNUMAStage(
-					demands, []string{"fake"}, current, desired, nil, tc.topology)
+					demands, []string{"fake"},
+					newSteadyFakeNUMACommittedSnapshotForTest(current, all),
+					desired, nil, tc.topology)
 				require.NoError(t, solveErr)
 				require.NoError(t, assertCoreAligned(next["fake"], tc.topology))
 				require.Equal(t, target.Size(), next["fake"].Size())
@@ -213,9 +230,9 @@ func TestProjectSteadyFakeNUMAStagePreservesNUMAQuotaAndDonorFloor(t *testing.T)
 	next, err := projectSteadyFakeNUMAStage(
 		demands,
 		[]string{"fake-0", "fake-1"},
-		current,
+		newSteadyFakeNUMACommittedSnapshotForTest(current, all),
 		desired,
-		[]partitionCoreFloorConstraint{{demandKey: "donor"}},
+		nil,
 		topology,
 	)
 
@@ -244,17 +261,22 @@ func TestProjectSteadyFakeNUMAStageUsesLatestCommittedStateAndIsIdempotent(t *te
 
 	demands := stagedMigrationDemands(all, initial, targetA.Size())
 	first, err := projectSteadyFakeNUMAStage(
-		demands, []string{"fake"}, initial, desiredA, nil, topology)
+		demands, []string{"fake"},
+		newSteadyFakeNUMACommittedSnapshotForTest(initial, all),
+		desiredA, nil, topology)
 	require.NoError(t, err)
 	retry, err := projectSteadyFakeNUMAStage(
-		demands, []string{"fake"}, initial, desiredA, nil, topology)
+		demands, []string{"fake"},
+		newSteadyFakeNUMACommittedSnapshotForTest(initial, all),
+		desiredA, nil, topology)
 	require.NoError(t, err)
 	require.Equal(t, first, retry)
 
 	committed := first["fake"]
 	nextTowardA, err := projectSteadyFakeNUMAStage(
 		stagedMigrationDemands(all, committed, targetA.Size()),
-		[]string{"fake"}, committed, desiredA, nil, topology)
+		[]string{"fake"}, newSteadyFakeNUMACommittedSnapshotForTest(committed, all),
+		desiredA, nil, topology)
 	require.NoError(t, err)
 	require.NotEqual(t, committed, nextTowardA["fake"])
 
@@ -263,7 +285,8 @@ func TestProjectSteadyFakeNUMAStageUsesLatestCommittedStateAndIsIdempotent(t *te
 	}
 	redirected, err := projectSteadyFakeNUMAStage(
 		stagedMigrationDemands(all, committed, targetB.Size()),
-		[]string{"fake"}, committed, desiredB, nil, topology)
+		[]string{"fake"}, newSteadyFakeNUMACommittedSnapshotForTest(committed, all),
+		desiredB, nil, topology)
 	require.NoError(t, err)
 	require.Equal(t, targetB, redirected["fake"])
 	require.NotEqual(t, nextTowardA["fake"], redirected["fake"])
@@ -272,7 +295,8 @@ func TestProjectSteadyFakeNUMAStageUsesLatestCommittedStateAndIsIdempotent(t *te
 		steadyFakeNUMAMaxMigratedCPUs)
 	converged, err := projectSteadyFakeNUMAStage(
 		stagedMigrationDemands(all, targetB, targetB.Size()),
-		[]string{"fake"}, targetB, desiredB, nil, topology)
+		[]string{"fake"}, newSteadyFakeNUMACommittedSnapshotForTest(targetB, all),
+		desiredB, nil, topology)
 	require.NoError(t, err)
 	require.Equal(t, desiredB, converged)
 }
@@ -302,7 +326,9 @@ func TestProjectSteadyFakeNUMAStageDoesNotChargePureResize(t *testing.T) {
 			}
 			next, solveErr := projectSteadyFakeNUMAStage(
 				stagedMigrationDemands(all, tc.committed, tc.target.Size()),
-				[]string{"fake"}, tc.committed, desired, nil, topology)
+				[]string{"fake"},
+				newSteadyFakeNUMACommittedSnapshotForTest(tc.committed, all),
+				desired, nil, topology)
 			require.NoError(t, solveErr)
 			require.Equal(t, desired, next)
 			require.Zero(t, steadyFakeNUMAMigrationChurn(tc.committed, next["fake"]))
@@ -310,7 +336,7 @@ func TestProjectSteadyFakeNUMAStageDoesNotChargePureResize(t *testing.T) {
 	}
 }
 
-func TestProjectSteadyFakeNUMAStageRejectsPartialRepairOfFragmentedCommittedState(t *testing.T) {
+func TestProjectSteadyFakeNUMAStageAtomicallyReplacesFragmentedCommittedState(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(64, 1, 1)
@@ -327,13 +353,14 @@ func TestProjectSteadyFakeNUMAStageRejectsPartialRepairOfFragmentedCommittedStat
 
 	next, err := projectSteadyFakeNUMAStage(
 		stagedMigrationDemands(all, committed, target.Size()),
-		[]string{"fake"}, committed, desired, nil, topology)
+		[]string{"fake"}, newSteadyFakeNUMACommittedSnapshotForTest(committed, all),
+		desired, nil, topology)
 
-	require.Nil(t, next)
-	require.ErrorContains(t, err, "invalid committed reclaim requires atomic repair")
+	require.NoError(t, err)
+	require.Equal(t, desired, next)
 }
 
-func TestProjectSteadyFakeNUMAStageValidatesCommittedBeforeFastPath(t *testing.T) {
+func TestProjectSteadyFakeNUMAStageRepairsFragmentedCommittedBeforeFastPath(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(24, 1, 1)
@@ -345,38 +372,109 @@ func TestProjectSteadyFakeNUMAStageValidatesCommittedBeforeFastPath(t *testing.T
 		"share": all.Difference(target),
 	}
 
-	for _, tc := range []struct {
-		name      string
-		committed machine.CPUSet
-		want      string
-	}{
-		{
-			name: "fragmented",
-			committed: func() machine.CPUSet {
-				result := machine.NewCPUSet()
-				for _, coreID := range topology.CPUDetails.Cores().ToSliceInt()[2:] {
-					result.Add(topology.CPUDetails.CPUsInCores(coreID).ToSliceInt()[0])
-				}
-				return result
-			}(),
-			want: "invalid committed reclaim requires atomic repair",
-		},
-		{
-			name:      "outside topology",
-			committed: target.Union(machine.NewCPUSet(100, 101)),
-			want:      "outside machine topology",
-		},
-	} {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			got, projectErr := projectSteadyFakeNUMAStage(
-				stagedMigrationDemands(all, tc.committed, target.Size()),
-				[]string{"fake"}, tc.committed, desired, nil, topology)
-			require.Nil(t, got)
-			require.ErrorContains(t, projectErr, tc.want)
-		})
+	fragmented := machine.NewCPUSet()
+	for _, coreID := range topology.CPUDetails.Cores().ToSliceInt()[2:] {
+		fragmented.Add(topology.CPUDetails.CPUsInCores(coreID).ToSliceInt()[0])
 	}
+	got, projectErr := projectSteadyFakeNUMAStage(
+		stagedMigrationDemands(all, fragmented, target.Size()),
+		[]string{"fake"},
+		newSteadyFakeNUMACommittedSnapshotForTest(fragmented, all),
+		desired, nil, topology)
+	require.NoError(t, projectErr)
+	require.Equal(t, desired, got)
+}
+
+func TestProjectSteadyFakeNUMAStageAtomicallyRepairsMultiOwnerFragmentedRepairBeyondBudget(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(32, 1, 1)
+	require.NoError(t, err)
+	all := topology.CPUDetails.CPUs()
+	cores := topology.CPUDetails.Cores().ToSliceInt()
+	require.GreaterOrEqual(t, len(cores), 16)
+
+	fragmented0 := machine.NewCPUSet()
+	fragmented1 := machine.NewCPUSet()
+	for _, coreID := range cores[:8] {
+		siblings := topology.CPUDetails.CPUsInCores(coreID).ToSliceInt()
+		fragmented0.Add(siblings[0])
+		fragmented1.Add(siblings[1])
+	}
+	target0 := topology.CPUDetails.CPUsInCores(cores[8:12]...)
+	target1 := topology.CPUDetails.CPUsInCores(cores[12:16]...)
+	target := target0.Union(target1)
+	committedReclaim := fragmented0.Union(fragmented1)
+	require.NoError(t, assertCoreAligned(committedReclaim, topology))
+	require.Equal(t, 32, steadyFakeNUMAMigrationChurn(committedReclaim, target))
+
+	demands := []partitionDemand{
+		{
+			key: "fake-0", quantity: target0.Size(), eligible: all,
+			preferred: fragmented0, class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "fake-1", quantity: target1.Size(), eligible: all,
+			preferred: fragmented1, class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "share", quantity: all.Size() - target.Size(), eligible: all,
+			preferred: all.Difference(committedReclaim), class: advisorBlockClassShared,
+		},
+	}
+	desired := map[string]machine.CPUSet{
+		"fake-0": target0,
+		"fake-1": target1,
+		"share":  all.Difference(target),
+	}
+	committed := steadyFakeNUMACommittedSnapshot{
+		assignments: []steadyFakeNUMACommittedAssignment{
+			{
+				blockID: "fake-0", class: advisorBlockClassMandatoryReclaim,
+				numaID: commonstate.FakedNUMAID, cpus: fragmented0, eligible: all,
+			},
+			{
+				blockID: "fake-1", class: advisorBlockClassMandatoryReclaim,
+				numaID: commonstate.FakedNUMAID, cpus: fragmented1, eligible: all,
+			},
+			{
+				blockID: "share", class: advisorBlockClassShared,
+				numaID: commonstate.FakedNUMAID,
+				cpus:   all.Difference(committedReclaim), eligible: all,
+			},
+		},
+		rawReclaimAggregate: committedReclaim,
+		reclaim:             committedReclaim,
+	}
+
+	got, projectErr := projectSteadyFakeNUMAStage(
+		demands, []string{"fake-0", "fake-1"}, committed, desired, nil, topology)
+
+	require.NoError(t, projectErr)
+	require.Equal(t, desired, got)
+}
+
+func TestProjectSteadyFakeNUMAStageRejectsCommittedCPUsOutsideTopology(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(24, 1, 1)
+	require.NoError(t, err)
+	all := topology.CPUDetails.CPUs()
+	target := coresInNUMA(topology, 0, 0, 3)
+	committed := target.Union(machine.NewCPUSet(100, 101))
+	desired := map[string]machine.CPUSet{
+		"fake":  target,
+		"share": all.Difference(target),
+	}
+
+	got, projectErr := projectSteadyFakeNUMAStage(
+		stagedMigrationDemands(all, committed, target.Size()),
+		[]string{"fake"},
+		newSteadyFakeNUMACommittedSnapshotForTest(committed, all),
+		desired, nil, topology)
+
+	require.Nil(t, got)
+	require.ErrorContains(t, projectErr, "outside machine topology")
 }
 
 func TestProjectSteadyFakeNUMAStagePreservesPreferredDonorCore(t *testing.T) {
@@ -410,7 +508,9 @@ func TestProjectSteadyFakeNUMAStagePreservesPreferredDonorCore(t *testing.T) {
 	}
 
 	next, err := projectSteadyFakeNUMAStage(
-		demands, []string{"fake"}, currentFake, desired, nil, topology)
+		demands, []string{"fake"},
+		newSteadyFakeNUMACommittedSnapshotForTest(currentFake, all),
+		desired, nil, topology)
 
 	require.NoError(t, err)
 	require.True(t, preferredDonor.IsSubsetOf(next["donor"]),
@@ -459,7 +559,9 @@ func TestProjectSteadyFakeNUMAStageFailsClosedWhenSearchIsTruncatedAfterFindingB
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			got, projectErr := projectSteadyFakeNUMAStageWithBudget(
-				demands, []string{"fake"}, current, desired, nil, topology, tc.budget)
+				demands, []string{"fake"},
+				newSteadyFakeNUMACommittedSnapshotForTest(current, all),
+				desired, nil, topology, tc.budget)
 
 			require.Nil(t, got,
 				"a truncated search must not return a provisional best assignment")
@@ -483,7 +585,7 @@ func TestProjectSteadyFakeNUMAStageDoesNotSwallowPinsForUnionBudgetExhaustion(t 
 	got, projectErr := projectSteadyFakeNUMAStageWithBudgetAndPins(
 		demands,
 		[]string{"fake"},
-		current,
+		newSteadyFakeNUMACommittedSnapshotForTest(current, all),
 		desired,
 		nil,
 		topology,
@@ -528,7 +630,7 @@ func TestProjectSteadyFakeNUMAStageSharesCandidateAndPinBudget(t *testing.T) {
 	got, projectErr := projectSteadyFakeNUMAStageWithBudget(
 		stagedMigrationDemands(all, current, target.Size()),
 		[]string{"fake"},
-		current,
+		newSteadyFakeNUMACommittedSnapshotForTest(current, all),
 		desired,
 		nil,
 		topology,
@@ -542,7 +644,7 @@ func TestProjectSteadyFakeNUMAStageSharesCandidateAndPinBudget(t *testing.T) {
 	require.ErrorContains(t, projectErr, "staged migration search budget 25 exhausted")
 }
 
-func TestProjectSteadyFakeNUMAStageRejectsInvalidCommittedSourceSnapshotBeyondAtomicBudget(t *testing.T) {
+func TestProjectSteadyFakeNUMAStageAtomicallyReplacesInvalidCommittedSourceSnapshotBeyondBudget(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopologyWithoutSMT(24, 1, 1)
@@ -556,81 +658,78 @@ func TestProjectSteadyFakeNUMAStageRejectsInvalidCommittedSourceSnapshotBeyondAt
 		"share": all.Difference(target).Difference(coresInNUMA(topology, 0, 16, 17)),
 	}
 
+	demands := []partitionDemand{
+		{
+			key: "fake", quantity: target.Size(), eligible: all,
+			preferred: current, class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "donor", quantity: 1, eligible: all,
+			preferred: desired["donor"], class: advisorBlockClassDedicated,
+		},
+		{
+			key: "share", quantity: all.Size() - target.Size() - 1, eligible: all,
+			preferred: desired["share"], class: advisorBlockClassShared,
+		},
+	}
+	base := steadyFakeNUMACommittedSnapshot{
+		assignments: []steadyFakeNUMACommittedAssignment{
+			{
+				blockID: "fake", class: advisorBlockClassMandatoryReclaim,
+				numaID: commonstate.FakedNUMAID, cpus: current, eligible: all,
+			},
+			{
+				blockID: "donor", class: advisorBlockClassDedicated,
+				numaID: 0, cpus: desired["donor"], eligible: all,
+			},
+			{
+				blockID: "share", class: advisorBlockClassShared,
+				numaID: 0, cpus: desired["share"], eligible: all,
+			},
+		},
+		rawReclaimAggregate: current,
+		reclaim:             current,
+	}
 	for _, tc := range []struct {
-		name    string
-		demands []partitionDemand
-		want    string
+		name string
+		edit func(*steadyFakeNUMACommittedSnapshot)
 	}{
 		{
-			name: "quantity snapshot mismatch",
-			demands: []partitionDemand{
-				{
-					key: "fake", quantity: target.Size(), eligible: all,
-					preferred: current.Difference(machine.NewCPUSet(7)),
-					class:     advisorBlockClassMandatoryReclaim,
-				},
-				{
-					key: "donor", quantity: 1, eligible: all,
-					preferred: desired["donor"], class: advisorBlockClassDedicated,
-				},
-				{
-					key: "share", quantity: all.Size() - target.Size() - 1, eligible: all,
-					preferred: desired["share"], class: advisorBlockClassShared,
-				},
+			name: "reclaim union mismatch",
+			edit: func(snapshot *steadyFakeNUMACommittedSnapshot) {
+				snapshot.reclaim = snapshot.reclaim.Difference(machine.NewCPUSet(7))
 			},
-			want: "committed fake snapshot",
 		},
 		{
 			name: "fake eligibility violation",
-			demands: []partitionDemand{
-				{
-					key: "fake", quantity: current.Size(),
-					eligible:  all.Difference(machine.NewCPUSet(0)),
-					preferred: current, class: advisorBlockClassMandatoryReclaim,
-				},
-				{
-					key: "donor", quantity: 1, eligible: all,
-					preferred: desired["donor"], class: advisorBlockClassDedicated,
-				},
-				{
-					key: "share", quantity: all.Size() - target.Size() - 1, eligible: all,
-					preferred: desired["share"], class: advisorBlockClassShared,
-				},
+			edit: func(snapshot *steadyFakeNUMACommittedSnapshot) {
+				committedAssignmentForTest(t, snapshot, "fake").eligible =
+					all.Difference(machine.NewCPUSet(0))
 			},
-			want: "outside eligibility",
 		},
 		{
 			name: "donor overlap",
-			demands: []partitionDemand{
-				{
-					key: "fake", quantity: current.Size(), eligible: all,
-					preferred: current, class: advisorBlockClassMandatoryReclaim,
-				},
-				{
-					key: "donor", quantity: 1, eligible: all,
-					preferred: machine.NewCPUSet(0), class: advisorBlockClassDedicated,
-				},
-				{
-					key: "share", quantity: all.Size() - target.Size() - 1, eligible: all,
-					preferred: desired["share"], class: advisorBlockClassShared,
-				},
+			edit: func(snapshot *steadyFakeNUMACommittedSnapshot) {
+				committedAssignmentForTest(t, snapshot, "donor").cpus =
+					machine.NewCPUSet(0)
 			},
-			want: "overlaps",
 		},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			committed := cloneSteadyFakeNUMACommittedSnapshotForTest(base)
+			tc.edit(&committed)
 			got, projectErr := projectSteadyFakeNUMAStage(
-				tc.demands, []string{"fake"}, current, desired, nil, topology)
+				demands, []string{"fake"}, committed, desired, nil, topology)
 
-			require.Nil(t, got)
-			require.ErrorContains(t, projectErr, "invalid committed reclaim requires atomic repair")
-			require.ErrorContains(t, projectErr, tc.want)
+			require.NoError(t, projectErr)
+			require.Equal(t, desired, got,
+				"invalid committed ownership must be replaced atomically without entering staged search")
 		})
 	}
 }
 
-func TestProjectSteadyFakeNUMAStageRejectsCommittedNUMAFloorViolationBeyondAtomicBudget(t *testing.T) {
+func TestProjectSteadyFakeNUMAStageAtomicallyReplacesCommittedNUMAFloorViolationBeyondBudget(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(16, 1, 1)
@@ -651,12 +750,12 @@ func TestProjectSteadyFakeNUMAStageRejectsCommittedNUMAFloorViolationBeyondAtomi
 		{
 			key: "fake-0", quantity: target0.Size(),
 			eligible:  all,
-			preferred: fragmentedFloor, class: advisorBlockClassMandatoryReclaim,
+			preferred: target0, class: advisorBlockClassMandatoryReclaim,
 		},
 		{
 			key: "fake-1", quantity: target1.Size(),
 			eligible:  all,
-			preferred: fragmentedPeer, class: advisorBlockClassMandatoryReclaim,
+			preferred: target1, class: advisorBlockClassMandatoryReclaim,
 		},
 		{
 			key: "share", quantity: all.Size() - target.Size(), eligible: all,
@@ -666,14 +765,34 @@ func TestProjectSteadyFakeNUMAStageRejectsCommittedNUMAFloorViolationBeyondAtomi
 	desired := map[string]machine.CPUSet{
 		"fake-0": target0, "fake-1": target1, "share": all.Difference(target),
 	}
+	committed := steadyFakeNUMACommittedSnapshot{
+		assignments: []steadyFakeNUMACommittedAssignment{
+			{
+				blockID: "fake-0", class: advisorBlockClassMandatoryReclaim,
+				numaID: 0, cpus: fragmentedFloor, eligible: all,
+			},
+			{
+				blockID: "fake-1", class: advisorBlockClassMandatoryReclaim,
+				numaID: 0, cpus: fragmentedPeer, eligible: all,
+			},
+			{
+				blockID: "share", class: advisorBlockClassShared,
+				numaID: 0, cpus: all.Difference(current), eligible: all,
+			},
+		},
+		rawReclaimAggregate: current,
+		reclaim:             current,
+	}
 
 	got, projectErr := projectSteadyFakeNUMAStage(
-		demands, []string{"fake-0", "fake-1"}, current, desired,
-		[]partitionCoreFloorConstraint{{demandKey: "fake-0"}}, topology)
+		demands, []string{"fake-0", "fake-1"}, committed, desired,
+		[]partitionCoreFloorConstraint{{
+			demandKey: "fake-0", committedBlockID: "fake-0",
+		}}, topology)
 
-	require.Nil(t, got)
-	require.ErrorContains(t, projectErr, "invalid committed reclaim requires atomic repair")
-	require.ErrorContains(t, projectErr, "core floor")
+	require.NoError(t, projectErr)
+	require.Equal(t, desired, got,
+		"invalid committed floor ownership must be replaced atomically without staged search")
 }
 
 func TestProjectSteadyFakeNUMAStageAllowsBudgetedAtomicRepairOfInvalidCommittedSnapshot(t *testing.T) {
@@ -688,10 +807,24 @@ func TestProjectSteadyFakeNUMAStageAllowsBudgetedAtomicRepairOfInvalidCommittedS
 		"fake": target, "share": all.Difference(target),
 	}
 	demands := stagedMigrationDemands(all, current, target.Size())
-	demands[0].eligible = all.Difference(machine.NewCPUSet(current.ToSliceInt()[0]))
+	committed := steadyFakeNUMACommittedSnapshot{
+		assignments: []steadyFakeNUMACommittedAssignment{
+			{
+				blockID: "fake", class: advisorBlockClassMandatoryReclaim,
+				numaID: commonstate.FakedNUMAID, cpus: current,
+				eligible: all.Difference(machine.NewCPUSet(current.ToSliceInt()[0])),
+			},
+			{
+				blockID: "share", class: advisorBlockClassShared,
+				numaID: commonstate.FakedNUMAID, cpus: all.Difference(current), eligible: all,
+			},
+		},
+		rawReclaimAggregate: current,
+		reclaim:             current,
+	}
 
 	got, projectErr := projectSteadyFakeNUMAStage(
-		demands, []string{"fake"}, current, desired, nil, topology)
+		demands, []string{"fake"}, committed, desired, nil, topology)
 
 	require.NoError(t, projectErr)
 	require.Equal(t, desired, got)
@@ -709,11 +842,13 @@ func TestProjectSteadyFakeNUMAStageAtomicRepairUsesReplacementChurnForPureShrink
 		"fake": target, "share": all.Difference(target),
 	}
 	demands := stagedMigrationDemands(all, committed, target.Size())
-	demands[0].eligible = all.Difference(
-		machine.NewCPUSet(committed.Difference(target).ToSliceInt()[0]))
+	committedSnapshot := newSteadyFakeNUMACommittedSnapshotForTest(
+		committed,
+		all.Difference(machine.NewCPUSet(committed.Difference(target).ToSliceInt()[0])),
+	)
 
 	got, projectErr := projectSteadyFakeNUMAStage(
-		demands, []string{"fake"}, committed, desired, nil, topology)
+		demands, []string{"fake"}, committedSnapshot, desired, nil, topology)
 
 	require.NoError(t, projectErr)
 	require.Equal(t, desired, got)
@@ -803,7 +938,7 @@ func TestSolveSteadyFakeNUMAWholeCoreKeepsAlignedBaseline(t *testing.T) {
 	all := topology.CPUDetails.CPUs()
 	oldFake := coresInNUMA(topology, 0, 2, 6)
 
-	got, err := solveSteadyFakeNUMAWholeCore([]partitionDemand{
+	demands := []partitionDemand{
 		{
 			key:       "fake",
 			quantity:  oldFake.Size(),
@@ -818,7 +953,11 @@ func TestSolveSteadyFakeNUMAWholeCoreKeepsAlignedBaseline(t *testing.T) {
 			preferred: all.Difference(oldFake),
 			class:     advisorBlockClassShared,
 		},
-	}, []string{"fake"}, topology)
+	}
+	committed := newSteadyFakeNUMACommittedSnapshotForTest(oldFake, all)
+	got, err := solveSteadyFakeNUMAWholeCoreWithFloorsAndProject(
+		demands, []string{"fake"}, committed, nil, topology,
+		projectSteadyFakeNUMAStage)
 
 	require.NoError(t, err)
 	require.Equal(t, oldFake, got["fake"])
@@ -914,7 +1053,7 @@ func TestSolveSteadyFakeNUMAWholeCoreRejectsOddQuantity(t *testing.T) {
 	require.ErrorContains(t, err, "not a whole-core multiple")
 }
 
-func TestSolveSteadyFakeNUMAWholeCoreRejectsIncompleteRepairBeyondEightChangedCPUs(t *testing.T) {
+func TestSolveSteadyFakeNUMAWholeCoreAtomicallyRepairsIncompleteCommittedState(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(64, 1, 1)
@@ -925,7 +1064,7 @@ func TestSolveSteadyFakeNUMAWholeCoreRejectsIncompleteRepairBeyondEightChangedCP
 		oldFake.Add(topology.CPUDetails.CPUsInCores(coreID).ToSliceInt()[0])
 	}
 
-	got, err := solveSteadyFakeNUMAWholeCore([]partitionDemand{
+	demands := []partitionDemand{
 		{
 			key:       "fake",
 			quantity:  oldFake.Size(),
@@ -940,10 +1079,20 @@ func TestSolveSteadyFakeNUMAWholeCoreRejectsIncompleteRepairBeyondEightChangedCP
 			preferred: all.Difference(oldFake),
 			class:     advisorBlockClassShared,
 		},
-	}, []string{"fake"}, topology)
+	}
+	got, err := solveSteadyFakeNUMAWholeCoreWithFloorsAndProject(
+		demands,
+		[]string{"fake"},
+		newSteadyFakeNUMACommittedSnapshotForTest(oldFake, all),
+		nil,
+		topology,
+		projectSteadyFakeNUMAStage,
+	)
 
-	require.Nil(t, got)
-	require.ErrorContains(t, err, "invalid committed reclaim requires atomic repair")
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	require.Equal(t, oldFake.Size(), got["fake"].Size())
+	require.NoError(t, assertCoreAligned(got["fake"], topology))
 }
 
 func TestSolveSteadyFakeNUMAWholeCoreAllowsAlignedExpansionBeyondMigrationBudget(t *testing.T) {
@@ -1407,7 +1556,9 @@ func TestProjectSteadyFakeNUMAStageRejectsDC05RampUpTransitionBeyondFixedBudget(
 		demands, fakeKeys, nil, topology, baseline)
 	require.NoError(t, err)
 	staged, err := projectSteadyFakeNUMAStage(
-		demands, fakeKeys, committed, desired, nil, topology)
+		demands, fakeKeys,
+		newSteadyFakeNUMACommittedSnapshotForTest(committed, all),
+		desired, nil, topology)
 
 	require.Error(t, err)
 	require.Nil(t, staged)
@@ -1514,13 +1665,9 @@ func TestProjectSteadyFakeNUMAStageRejectsDC05RampDownTransitionBeyondFixedBudge
 		}, topology, baseline)
 	require.NoError(t, err)
 	staged, err := projectSteadyFakeNUMAStage(
-		demands, fakeKeys, committed, desired,
-		[]partitionCoreFloorConstraint{
-			{demandKey: "real-0"},
-			{demandKey: "real-1-floor"},
-			{demandKey: "real-2-floor"},
-			{demandKey: "real-3"},
-		}, topology)
+		demands, fakeKeys,
+		newSteadyFakeNUMACommittedSnapshotForTest(committed, all),
+		desired, nil, topology)
 
 	require.Error(t, err)
 	require.Nil(t, staged)
@@ -1788,16 +1935,14 @@ func TestSolveAdvisorDescriptorPhaseRepairsDC05CheckpointWithinEightChangedCPUs(
 	}
 }
 
-func TestSolveAdvisorDescriptorPhaseRejectsDC05StableSeedpoolRepairBeyondFixedBudget(t *testing.T) {
+func TestSolveAdvisorDescriptorPhaseConvergesEightNUMASMT2NoResetState(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(256, 2, 8)
 	require.NoError(t, err)
-	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
-	require.NoError(t, err)
 	all := topology.CPUDetails.CPUs()
 	globalPreferred, err := machine.Parse(
-		"1,17-18,33-34,49-50,68-127,129,145-146,161-162,177-178,192-255")
+		"68-127,192-255")
 	require.NoError(t, err)
 
 	descriptors := []advisorBlockDescriptor{
@@ -1880,14 +2025,300 @@ func TestSolveAdvisorDescriptorPhaseRejectsDC05StableSeedpoolRepairBeyondFixedBu
 			OldPreferred: globalPreferred,
 		},
 	}
-	result := make(map[string]machine.CPUSet)
+	baselineDescriptors := append([]advisorBlockDescriptor(nil), descriptors...)
+	baselineReclaim, baselineKeys := runSteadyFakeNUMAConvergencePathForTest(
+		t, topology, all, baselineDescriptors, "real-0")
 
-	_, err = p.solveAdvisorDescriptorPhase(descriptors, all, result, true, false)
+	equivalentDescriptors := append([]advisorBlockDescriptor(nil), descriptors...)
+	for i := range equivalentDescriptors {
+		equivalentDescriptors[i].BlockID = "equivalent-" + equivalentDescriptors[i].BlockID
+	}
+	equivalentReclaim, equivalentKeys := runSteadyFakeNUMAConvergencePathForTest(
+		t, topology, all, equivalentDescriptors, "equivalent-real-0")
 
-	require.ErrorContains(t, err, "invalid committed reclaim requires atomic repair")
+	require.NotEqual(t, baselineKeys, equivalentKeys,
+		"changing external block IDs must rebuild internal demand keys")
+	require.Equal(t, baselineReclaim, equivalentReclaim,
+		"equivalent external block IDs must converge to the same reclaim CPUSet")
 }
 
-func TestSolveAdvisorDescriptorPhaseRejectsDC05GlobalSeedpoolRepairBeyondFixedBudget(t *testing.T) {
+func runSteadyFakeNUMAConvergencePathForTest(
+	t *testing.T,
+	topology *machine.CPUTopology,
+	all machine.CPUSet,
+	descriptors []advisorBlockDescriptor,
+	real0BlockID string,
+) (machine.CPUSet, [2]string) {
+	t.Helper()
+
+	dir := t.TempDir()
+	p, err := getTestDynamicPolicyWithoutInitialization(topology, dir)
+	require.NoError(t, err)
+	checkpointPath := p.steadyFakeNUMAMigrationCheckpointPath()
+	realCommitted := machine.NewCPUSet()
+	globalCommitted := machine.NewCPUSet()
+	for _, descriptor := range descriptors {
+		if descriptor.Class != advisorBlockClassMandatoryReclaim {
+			continue
+		}
+		if descriptor.NUMAID == commonstate.FakedNUMAID {
+			globalCommitted = globalCommitted.Union(descriptor.OldPreferred)
+		} else {
+			realCommitted = realCommitted.Union(descriptor.OldPreferred)
+		}
+	}
+	require.True(t, globalCommitted.Intersection(realCommitted).IsEmpty(),
+		"global committed CPUs must be disjoint from real-NUMA committed blocks")
+
+	demands, blockIDByDemandKey, floors, err := expandSteadyFakeNUMAReclaimPhase(
+		descriptors, all, topology, nil)
+	require.NoError(t, err)
+	var real0FloorKey string
+	for _, floor := range floors {
+		if floor.committedBlockID == real0BlockID {
+			real0FloorKey = floor.demandKey
+			break
+		}
+	}
+	require.NotEmpty(t, real0FloorKey)
+	remainingDemands := make(map[string]partitionDemand)
+	for _, demand := range demands {
+		if blockIDByDemandKey[demand.key] == real0BlockID {
+			remainingDemands[demand.key] = demand
+		}
+	}
+	floor, found := remainingDemands[real0FloorKey]
+	require.True(t, found)
+	delete(remainingDemands, real0FloorKey)
+	require.Len(t, remainingDemands, 1)
+	var real0ResidualKey string
+	var residual partitionDemand
+	for key, demand := range remainingDemands {
+		real0ResidualKey = key
+		residual = demand
+		delete(remainingDemands, key)
+	}
+	require.Empty(t, remainingDemands)
+	require.Equal(t, machine.NewCPUSet(1, 129), floor.preferred)
+	require.Equal(t, machine.NewCPUSet(1, 129), residual.preferred)
+
+	var reclaimDemandKeys []string
+	for _, demand := range demands {
+		if demand.class == advisorBlockClassMandatoryReclaim {
+			reclaimDemandKeys = append(reclaimDemandKeys, demand.key)
+		}
+	}
+	baseline, err := solveDisjointPartitionsWithCoreFloors(demands, floors, topology)
+	require.NoError(t, err)
+	targetAssignments, err := solveSteadyFakeNUMADesiredWholeCore(
+		demands, reclaimDemandKeys, floors, topology, baseline)
+	require.NoError(t, err)
+	targetReclaim := unionPartitionAssignments(targetAssignments, reclaimDemandKeys)
+	removable := coreAlignedCandidates(
+		topology, targetReclaim.Difference(realCommitted), machine.NewCPUSet())
+	addable := coreAlignedCandidates(
+		topology, all.Difference(targetReclaim), machine.NewCPUSet())
+	require.GreaterOrEqual(t, len(removable), 3)
+	require.GreaterOrEqual(t, len(addable), 3)
+	initial := targetReclaim.Clone()
+	for i := 0; i < 3; i++ {
+		initial = initial.Difference(removable[i].cpus).Union(addable[i].cpus)
+	}
+	require.Equal(t, 12, steadyFakeNUMAMigrationChurn(initial, targetReclaim))
+	for i := range descriptors {
+		descriptors[i].Committed = machine.NewCPUSet()
+		if descriptors[i].Class != advisorBlockClassMandatoryReclaim {
+			continue
+		}
+		if descriptors[i].NUMAID == commonstate.FakedNUMAID {
+			descriptors[i].Committed = initial.Clone()
+		} else {
+			descriptors[i].Committed = descriptors[i].OldPreferred.Clone()
+		}
+	}
+	committed := initial
+	var durableTarget machine.CPUSet
+	converged := false
+	maxCycles := 0
+	for cycle := 0; ; cycle++ {
+		if maxCycles > 0 {
+			require.Less(t, cycle, maxCycles,
+				"no-reset migration exceeded its initial-churn bound")
+		}
+		previous := committed
+		cycleResult := make(map[string]machine.CPUSet)
+
+		transition := steadyFakeNUMAMigrationCheckpointTransition{
+			kind: steadyFakeNUMAMigrationCheckpointKeep,
+		}
+		beforeTarget := cloneSteadyFakeNUMAMigrationTargetForTest(
+			p.steadyFakeNUMAMigrationTarget)
+		remaining, solveErr := p.solveAdvisorDescriptorPhaseWithCheckpointTransition(
+			descriptors, all, cycleResult, true, false, &transition)
+		require.NoError(t, solveErr)
+		require.Equal(t, beforeTarget, p.steadyFakeNUMAMigrationTarget,
+			"planning must not mutate the in-memory checkpoint")
+		require.True(t, remaining.IsSubsetOf(all))
+		requireExactDescriptorQuantitiesForTest(t, descriptors, cycleResult)
+		requireDisjointEligibleAssignmentsForTest(t, descriptors, cycleResult)
+		require.Contains(t, cycleResult, real0BlockID)
+		require.NotContains(t, cycleResult, real0FloorKey)
+		require.NotContains(t, cycleResult, real0ResidualKey,
+			"internal floor/residual keys must be rebuilt into the external block ID")
+
+		next := unionMandatoryReclaimBlocksFromResultForTest(descriptors, cycleResult)
+		require.NoError(t, assertCoreAligned(next, topology))
+		require.LessOrEqual(t,
+			steadyFakeNUMAMigrationChurn(previous, next),
+			steadyFakeNUMAMaxMigratedCPUs)
+		requireRealNUMAFloorsForTest(t, topology, descriptors, cycleResult)
+		require.NoError(t, p.applySteadyFakeNUMAMigrationCheckpointTransition(transition))
+
+		if cycle == 0 {
+			require.NotNil(t, p.steadyFakeNUMAMigrationTarget)
+			durableTarget = p.steadyFakeNUMAMigrationTarget.target.Clone()
+			initialChurn := steadyFakeNUMAMigrationChurn(initial, durableTarget)
+			require.Greater(t, initialChurn,
+				steadyFakeNUMAMaxMigratedCPUs)
+			maxCycles = 2 + initialChurn/steadyFakeNUMAMaxMigratedCPUs
+			require.NotEqual(t, durableTarget, next,
+				"the production shape must exercise at least one intermediate stage")
+		}
+
+		committed = next
+		updateDescriptorOldPreferredForTest(descriptors, cycleResult)
+		convergedThisCycle := committed.Equals(durableTarget) &&
+			p.steadyFakeNUMAMigrationTarget == nil
+		if convergedThisCycle {
+			require.Nil(t, p.steadyFakeNUMAMigrationTarget,
+				"convergence must clear the in-memory durable target")
+			require.NoFileExists(t, checkpointPath,
+				"convergence must remove the durable target checkpoint")
+		} else {
+			require.NotNil(t, p.steadyFakeNUMAMigrationTarget,
+				"every intermediate stage must retain the durable target")
+			require.Equal(t, durableTarget, p.steadyFakeNUMAMigrationTarget.target,
+				"every intermediate stage must retain the first-round target")
+			require.FileExists(t, checkpointPath,
+				"every intermediate stage must persist the durable target")
+		}
+
+		restarted, restartErr := getTestDynamicPolicyWithoutInitialization(topology, dir)
+		require.NoError(t, restartErr)
+		if convergedThisCycle {
+			require.Nil(t, restarted.steadyFakeNUMAMigrationTarget,
+				"a restart after convergence must not restore a durable target")
+			require.NoFileExists(t, checkpointPath)
+			converged = true
+			break
+		}
+		require.NotNil(t, restarted.steadyFakeNUMAMigrationTarget,
+			"an intermediate-stage restart must restore the durable target")
+		require.Equal(t, durableTarget, restarted.steadyFakeNUMAMigrationTarget.target,
+			"an intermediate-stage restart must restore the first-round target")
+		p = restarted
+	}
+	require.True(t, converged, "no-reset migration did not converge within %d cycles", maxCycles)
+	return committed, [2]string{real0FloorKey, real0ResidualKey}
+}
+
+func requireExactDescriptorQuantitiesForTest(
+	t *testing.T,
+	descriptors []advisorBlockDescriptor,
+	result map[string]machine.CPUSet,
+) {
+	t.Helper()
+	for _, descriptor := range descriptors {
+		require.Equal(t, descriptor.Quantity, result[descriptor.BlockID].Size(),
+			"block %q", descriptor.BlockID)
+	}
+}
+
+func requireDisjointEligibleAssignmentsForTest(
+	t *testing.T,
+	descriptors []advisorBlockDescriptor,
+	result map[string]machine.CPUSet,
+) {
+	t.Helper()
+	used := machine.NewCPUSet()
+	for _, descriptor := range descriptors {
+		cpus := result[descriptor.BlockID]
+		require.True(t, cpus.IsSubsetOf(descriptor.Eligible), "block %q", descriptor.BlockID)
+		require.True(t, used.Intersection(cpus).IsEmpty(), "block %q overlaps", descriptor.BlockID)
+		used = used.Union(cpus)
+	}
+}
+
+func requireRealNUMAFloorsForTest(
+	t *testing.T,
+	topology *machine.CPUTopology,
+	descriptors []advisorBlockDescriptor,
+	result map[string]machine.CPUSet,
+) {
+	t.Helper()
+	for _, descriptor := range descriptors {
+		if descriptor.Class != advisorBlockClassMandatoryReclaim ||
+			descriptor.NUMAID == commonstate.FakedNUMAID {
+			continue
+		}
+		cpus := result[descriptor.BlockID]
+		require.NotEmpty(t, coreAlignedCandidates(topology, cpus, cpus),
+			"real-NUMA reclaim block %q lost its complete-core floor", descriptor.BlockID)
+	}
+}
+
+func unionMandatoryReclaimBlocksForTest(
+	descriptors []advisorBlockDescriptor,
+) machine.CPUSet {
+	result := machine.NewCPUSet()
+	for _, descriptor := range descriptors {
+		if descriptor.Class == advisorBlockClassMandatoryReclaim {
+			result = result.Union(descriptor.OldPreferred)
+		}
+	}
+	return result
+}
+
+func unionMandatoryReclaimBlocksFromResultForTest(
+	descriptors []advisorBlockDescriptor,
+	result map[string]machine.CPUSet,
+) machine.CPUSet {
+	reclaim := machine.NewCPUSet()
+	for _, descriptor := range descriptors {
+		if descriptor.Class == advisorBlockClassMandatoryReclaim {
+			reclaim = reclaim.Union(result[descriptor.BlockID])
+		}
+	}
+	return reclaim
+}
+
+func updateDescriptorOldPreferredForTest(
+	descriptors []advisorBlockDescriptor,
+	result map[string]machine.CPUSet,
+) {
+	for i := range descriptors {
+		descriptors[i].OldPreferred = result[descriptors[i].BlockID].Clone()
+	}
+	setCommittedDescriptorOwnershipForTest(descriptors)
+}
+
+func setCommittedDescriptorOwnershipForTest(descriptors []advisorBlockDescriptor) {
+	rawAggregate := machine.NewCPUSet()
+	for _, descriptor := range descriptors {
+		if descriptor.Class == advisorBlockClassMandatoryReclaim {
+			rawAggregate = rawAggregate.Union(descriptor.OldPreferred)
+		}
+	}
+	for i := range descriptors {
+		descriptors[i].Committed = descriptors[i].OldPreferred.Clone()
+		if descriptors[i].Class == advisorBlockClassMandatoryReclaim &&
+			descriptors[i].NUMAID == commonstate.FakedNUMAID {
+			descriptors[i].Committed = rawAggregate.Clone()
+		}
+	}
+}
+
+func TestSolveAdvisorDescriptorPhaseAtomicallyRepairsDC05GlobalSeedpoolBeyondFixedBudget(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(256, 2, 8)
@@ -2004,10 +2435,13 @@ func TestSolveAdvisorDescriptorPhaseRejectsDC05GlobalSeedpoolRepairBeyondFixedBu
 		},
 	}
 	result := make(map[string]machine.CPUSet)
+	setCommittedDescriptorOwnershipForTest(descriptors)
 
-	_, err = p.solveAdvisorDescriptorPhase(descriptors, all, result, true, false)
+	remaining, err := p.solveAdvisorDescriptorPhase(descriptors, all, result, true, false)
 
-	require.ErrorContains(t, err, "invalid committed reclaim requires atomic repair")
+	require.NoError(t, err)
+	require.NotEmpty(t, result)
+	require.True(t, remaining.IsSubsetOf(all))
 }
 
 func TestSolveSteadyFakeNUMAWholeCoreSupportsSMT1AndSMT4(t *testing.T) {

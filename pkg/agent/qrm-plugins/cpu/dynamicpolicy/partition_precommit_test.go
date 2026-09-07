@@ -18,16 +18,53 @@ package dynamicpolicy
 
 import (
 	"errors"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/util/sets"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
+
+type retryablePartitionCommitError interface {
+	error
+	Retryable() bool
+}
+
+func TestCommitPendingCPUPartitionRejectsOrdinaryWriterWhileAdvisorTargetPending(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	dir := t.TempDir()
+	p.advisorPostCommitCheckpointDir = dir
+	initialRevision := p.state.GetRevision()
+	target := p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, initialRevision)
+	initialEntries := p.state.GetPodEntries()
+
+	_, _, err := p.commitPendingCPUPartition(pendingCPUPartition{
+		expectedRevision: initialRevision,
+		entries:          initialEntries,
+		allowOverlap:     p.state.GetAllowSharedCoresOverlapReclaimedCores(),
+		disableDedicated: p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+		persist:          false,
+		source:           "ordinary writer test",
+	})
+
+	require.Error(t, err)
+	var retryable retryablePartitionCommitError
+	require.ErrorAs(t, err, &retryable)
+	require.True(t, retryable.Retryable())
+	require.Equal(t, initialRevision, p.state.GetRevision())
+	require.Equal(t, initialEntries, p.state.GetPodEntries())
+	require.Same(t, target, p.currentAdvisorPostCommitTarget())
+	require.FileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName))
+}
 
 func TestCommitPendingCPUPartitionRunsHooksBeforeValidation(t *testing.T) {
 	p, cleanup := newReclaimReuseTestPolicy(t)
@@ -353,6 +390,58 @@ func TestCommitPendingAdvisorStateRejectsFragmentedReclaimInDisjointMode(t *test
 	require.ErrorContains(t, err, "is not core-aligned")
 	require.Equal(t, revision, p.state.GetRevision(),
 		"fragmented reclaim must be rejected before the revision CAS")
+}
+
+func TestPoolAdjustmentRejectsFragmentedReclaimBeforeCommit(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(96, 2, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+	p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
+	currentReclaim := machine.NewCPUSet(1, 25, 49, 73)
+	currentAssignments, err := machine.GetNumaAwareAssignments(topology, currentReclaim)
+	require.NoError(t, err)
+	p.state.SetAllocationInfo(
+		commonstate.PoolNameReclaim,
+		commonstate.FakedContainerName,
+		&state.AllocationInfo{
+			AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+			AllocationResult:                 currentReclaim.Clone(),
+			OriginalAllocationResult:         currentReclaim.Clone(),
+			TopologyAwareAssignments:         currentAssignments,
+			OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(currentAssignments),
+		},
+		false,
+	)
+
+	revision := p.state.GetRevision()
+	currentEntries := p.state.GetPodEntries()
+	require.NoError(t, assertCoreAligned(currentReclaim, p.machineInfo.CPUTopology))
+	require.Equal(t, 4, currentReclaim.Size())
+
+	err = p.applyPoolsAndIsolatedInfo(
+		map[string]machine.CPUSet{
+			commonstate.PoolNameReclaim: machine.NewCPUSet(1, 2, 25, 26),
+			commonstate.PoolNameReserve: p.reservedCPUs.Clone(),
+		},
+		map[string]map[string]machine.CPUSet{},
+		currentEntries,
+		p.state.GetMachineState(),
+		sets.NewInt(),
+		false,
+		machine.NewCPUSet(),
+		defaultShareMaterializationPlan{},
+		revision,
+	)
+
+	require.ErrorContains(t, err, "reclaim set")
+	require.ErrorContains(t, err, "is not core-aligned")
+	require.Equal(t, revision, p.state.GetRevision(),
+		"fragmented pool adjustment must be rejected before the revision CAS")
+	require.True(t, p.state.GetAllocationInfo(
+		commonstate.PoolNameReclaim, commonstate.FakedContainerName).
+		AllocationResult.Equals(currentReclaim))
 }
 
 func TestCommitPendingCPUPartitionRejectsInvalidOverrideAndDeletionFallback(t *testing.T) {

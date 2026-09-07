@@ -26,7 +26,8 @@ import (
 const partitionCoreFloorSolveBudget = 64
 
 type partitionCoreFloorConstraint struct {
-	demandKey string
+	demandKey        string
+	committedBlockID string
 }
 
 // solveDisjointPartitionsWithCoreFloors keeps complete-core requirements inside

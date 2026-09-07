@@ -1493,6 +1493,36 @@ func TestSolveAdvisorDescriptorPhaseBlockIDRotationPreservesGrowOwnerUnion(t *te
 	require.Equal(t, solve("z-rotated-a", "a-rotated-b"), solve("a-next-a", "z-next-b"))
 }
 
+func TestSolveAdvisorDescriptorPhaseKeepsBlocksWithinComponentSeparate(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
+	allCPUs := cpuTopology.CPUDetails.CPUs()
+	descriptors := []advisorBlockDescriptor{
+		{
+			BlockID: "block-a", Owners: []string{"shared-owner"},
+			Class: advisorBlockClassShared, NUMAID: commonstate.FakedNUMAID,
+			Quantity: 2, ComponentKey: "shared-component", Eligible: allCPUs,
+		},
+		{
+			BlockID: "block-b", Owners: []string{"shared-owner"},
+			Class: advisorBlockClassShared, NUMAID: commonstate.FakedNUMAID,
+			Quantity: 2, ComponentKey: "shared-component", Eligible: allCPUs,
+		},
+	}
+	result := advisorapi.NewBlockCPUSet()
+
+	_, err = p.solveAdvisorDescriptorPhase(descriptors, allCPUs, result, false, false)
+
+	require.NoError(t, err)
+	require.Len(t, result, 2)
+	require.Equal(t, 2, result["block-a"].Size())
+	require.Equal(t, 2, result["block-b"].Size())
+}
+
 func TestPlanDisjointAdvisorBlocksOverlapNeverReintroducesStateForbiddenOrSystemCPUs(t *testing.T) {
 	t.Parallel()
 
