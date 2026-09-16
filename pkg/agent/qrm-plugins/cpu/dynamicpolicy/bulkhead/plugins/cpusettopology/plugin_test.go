@@ -1100,6 +1100,56 @@ func TestTopologyResultFromFinalConvergenceDeterminesAppliedViewLevel(t *testing
 	}
 }
 
+func TestCPUSetTopologyPluginAdmissionPublishesFrozenTraceResult(t *testing.T) {
+	cg := &fakeCgroupClient{
+		existing: map[string]bool{"primary": true, "reclaim": true},
+		cpus: map[string]machine.CPUSet{
+			"primary": machine.NewCPUSet(0, 1),
+			"reclaim": machine.NewCPUSet(2, 3),
+		},
+		children: map[string][]string{"": {"primary", "reclaim"}},
+	}
+	p := &CPUSetTopologyPlugin{
+		cfg: bulkheadconfig.BulkheadConfiguration{
+			BulkheadPrimaryRelPath:     "primary",
+			BulkheadReclaimRelPaths:    []string{"reclaim"},
+			EnableAdmissionLeafDefer:   true,
+			AdmissionSafeDuration:      time.Second,
+			AdmissionMaxRequiredWrites: 8,
+		},
+		cgroup: cg,
+	}
+	desired := model.NewDesiredView()
+	desired.NonReclaimPool = machine.NewCPUSet(0, 1)
+	desired.ReclaimEffective = machine.NewCPUSet(2, 3)
+	var result bulkheadapi.TopologyResult
+
+	_, err := p.Apply(context.Background(), bulkheadapi.HandlerContext{
+		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+			Mode: cpusetutil.CPUSetAdjustmentModeAdmission,
+			Topology: &machine.CPUTopology{CPUDetails: machine.CPUDetails{
+				0: {}, 1: {}, 2: {}, 3: {},
+			}},
+		},
+		DesiredView: desired,
+		ReportTopologyResult: func(got bulkheadapi.TopologyResult) {
+			result = got
+		},
+	})
+	if err != nil {
+		t.Fatalf("Apply(admission) error = %v", err)
+	}
+	if !result.Converged || !result.FinalSnapshotCurrent || result.AppliedView == nil {
+		t.Fatalf("admission result = %+v, want published current frozen-trace result", result)
+	}
+	if got := result.AppliedView.NonReclaimPool.String(); got != "0-1" {
+		t.Fatalf("published non-reclaim pool = %q, want 0-1", got)
+	}
+	if got := result.AppliedView.ReclaimEffective.String(); got != "2-3" {
+		t.Fatalf("published reclaim pool = %q, want 2-3", got)
+	}
+}
+
 func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t *testing.T) {
 	t.Parallel()
 

@@ -400,11 +400,6 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 	round.expectedAbsentRels = cloneRelSet(in.ExpectedAbsentRels)
 	round.snapshotSource = newCompleteSnapshotSource(snapshotDriver, in.DAG, budget, in.TraversalBoundaries)
 	round.driver = snapshotDriver
-	defer func() {
-		if round.admissionTicket != nil {
-			round.admissionTicket.ReleaseUnused()
-		}
-	}()
 	initialSnapshot, err := round.nextSnapshot(ctx)
 	if err != nil {
 		return *res, err
@@ -422,6 +417,16 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 		return *res, err
 	}
 	if err := budget.configureAutoCumulativeLimitsFromInput(autoBudgetInput); err != nil {
+		return *res, err
+	}
+	if round.objective == ConvergenceObjectiveParentSafe {
+		_, err := round.executeParentSafeAdmission(
+			ctx,
+			initialSnapshot,
+			res,
+			in.PublishFinalSnapshot,
+			in.PublishParentSafeSnapshot,
+		)
 		return *res, err
 	}
 	round.pendingSnapshot = initialSnapshot
@@ -444,7 +449,16 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 		return repeatedNoProgress >= 2
 	}
 	for {
-		outcome, err := round.executeFixedPointRound(ctx, in.Mems, res)
+		engineResult, engineErr := round.runFixedPointEngine(
+			ctx,
+			newLivePhaseSession(round, res),
+			fixedPointEngineSingleRound,
+		)
+		outcome := RoundOutcome{}
+		if engineResult != nil {
+			outcome = engineResult.Outcome
+		}
+		err := engineErr
 		if err != nil {
 			err = prioritizeRoundStalePlanError(outcome, err)
 			if preflightObservationStale(err) {
@@ -454,14 +468,6 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 			}
 			if replanRequired(err) {
 				res.Rounds = append(res.Rounds, outcome)
-				if round.admissionTicket != nil {
-					if round.admissionTicket.hasPhysicalConsumption() {
-						res.State = ConvergenceStateNonConverged
-						return *res, err
-					}
-					round.admissionTicket.ReleaseUnused()
-					round.admissionTicket = nil
-				}
 				if replanBlocked(outcome) {
 					res.State = ConvergenceStateBlocked
 					return *res, &CoordinatorBlockedError{Blocker: outcome.Blocker}
@@ -487,13 +493,6 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 			return *res, err
 		}
 		res.ConvergenceReport = evaluation.Report
-		admissionBudgetExceeded := false
-		if in.Objective.orFullDefault() == ConvergenceObjectiveParentSafe && in.AdmissionBudget != nil {
-			admissionBudgetExceeded = round.admissionBudgetReached(res)
-			if admissionBudgetExceeded && !evaluation.ParentSafety.Safe {
-				return *res, fmt.Errorf("admission convergence budget exhausted before parent-safe proof")
-			}
-		}
 		parentSafeDeferred := in.Objective.orFullDefault() == ConvergenceObjectiveParentSafe &&
 			evaluation.ParentSafety.Safe && !evaluation.Report.FullyConverged
 		if evaluation.Report.FullyConverged || parentSafeDeferred {
@@ -531,10 +530,6 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 				return *res, err
 			}
 			res.ConvergenceReport = freshEvaluation.Report
-			admissionBudgetExceeded = round.admissionBudgetReached(res)
-			if admissionBudgetExceeded && !freshEvaluation.ParentSafety.Safe {
-				return *res, fmt.Errorf("admission convergence budget exhausted before fresh parent-safe proof")
-			}
 			parentSafeDeferred = in.Objective.orFullDefault() == ConvergenceObjectiveParentSafe &&
 				freshEvaluation.ParentSafety.Safe &&
 				!freshEvaluation.Report.FullyConverged
@@ -598,15 +593,6 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 					outcome.Snapshot = fresh
 					outcome.Blocker = err
 					res.Rounds[len(res.Rounds)-1] = outcome
-					if round.admissionTicket != nil &&
-						round.admissionTicket.hasPhysicalConsumption() {
-						res.State = ConvergenceStateNonConverged
-						return *res, err
-					}
-					if round.admissionTicket != nil {
-						round.admissionTicket.ReleaseUnused()
-						round.admissionTicket = nil
-					}
 					round.pendingSnapshot = fresh
 					round.dynamicByRel = cloneCPUSetMap(in.ExpectedCPUSetByRel)
 					if replanBlocked(outcome) {
@@ -820,6 +806,9 @@ func roundOutcomeMadeNetProgress(outcome RoundOutcome) bool {
 		measure.DrainChangedRels = len(outcome.ChangedRels)
 	}
 	for _, applied := range outcome.Journal {
+		if applied.PhysicalImpact == PhysicalImpactUncertain {
+			continue
+		}
 		if applied.Observed.CPUs.Equals(applied.Target.CPUs) && applied.Observed.Mems == applied.Target.Mems {
 			measure.VerifiedWrites++
 		}
@@ -1007,7 +996,8 @@ type coordinatorRound struct {
 	deferredCleanupRels   map[string]struct{}
 	objective             ConvergenceObjective
 	admissionBudget       *AdmissionConvergenceBudget
-	admissionTicket       *AdmissionBudgetTicket
+	frozenTrace           *CompiledPhaseTrace
+	executionTicket       *ExecutionReservationTicket
 	allowEmptyTarget      bool
 	protectedPending      machine.CPUSet
 	protectedByRel        map[string]machine.CPUSet
@@ -1025,6 +1015,80 @@ type coordinatorRound struct {
 	pendingSnapshot       *CompleteSnapshot
 	round                 int
 	maxRounds             int
+}
+
+// executeParentSafeAdmission is the sole ParentSafe hierarchy mutation path.
+// It compiles from base on an isolated projection, reserves that exact immutable
+// trace, preflights the whole trace, and executes it without live replanning.
+func (r *coordinatorRound) executeParentSafeAdmission(
+	ctx context.Context,
+	base *CompleteSnapshot,
+	res *ConvergenceResult,
+	publishFinal func(*CompleteSnapshot) error,
+	publishParentSafe func(*CompleteSnapshot, map[string]struct{}) error,
+) (RoundOutcome, error) {
+	outcome := RoundOutcome{Status: RoundStatusBlocked}
+	if r == nil || r.objective.orFullDefault() != ConvergenceObjectiveParentSafe {
+		return outcome, fmt.Errorf("frozen admission execution requires ParentSafe objective")
+	}
+	if res == nil {
+		return outcome, fmt.Errorf("frozen admission execution requires convergence result")
+	}
+
+	trace, err := r.compileFixedPointTrace(ctx, base)
+	if err != nil {
+		return outcome, err
+	}
+	r.frozenTrace = trace
+
+	maxRequiredWrites := 0
+	if r.admissionBudget != nil {
+		maxRequiredWrites = r.admissionBudget.MaxRequiredWrites
+	}
+	ticket, err := r.budget.ReservePhaseTrace(trace, maxRequiredWrites)
+	if err != nil {
+		return outcome, err
+	}
+	r.executionTicket = ticket
+
+	finalize := func(
+		ctx context.Context,
+		frozen *CompiledPhaseTrace,
+	) (frozenTraceFinalization, error) {
+		finalization, finalizeErr := r.proveFrozenTraceFinalState(ctx, frozen)
+		if finalizeErr != nil {
+			return finalization, finalizeErr
+		}
+		if finalizeErr = ctx.Err(); finalizeErr != nil {
+			return finalization, finalizeErr
+		}
+		parentSafeDeferred := finalization.evaluation.ParentSafety.Safe &&
+			!finalization.evaluation.Report.FullyConverged
+		switch {
+		case parentSafeDeferred && publishParentSafe != nil:
+			finalizeErr = publishParentSafe(
+				finalization.snapshot,
+				cloneRelSet(frozen.EvaluationInput.DeferredCleanupRels),
+			)
+		case finalization.evaluation.Report.FullyConverged && publishFinal != nil:
+			finalizeErr = publishFinal(finalization.snapshot)
+		}
+		return finalization, finalizeErr
+	}
+
+	outcome, err = r.executeFrozenTrace(ctx, trace, ticket, res, finalize)
+	res.Rounds = append(res.Rounds, outcome)
+	if err != nil {
+		return outcome, err
+	}
+
+	if res.ParentSafe {
+		res.DeferredLeafCount = len(trace.EvaluationInput.DeferredByRel)
+		for _, cpus := range trace.EvaluationInput.DeferredByRel {
+			res.DeferredCPUCount += cpus.Size()
+		}
+	}
+	return outcome, nil
 }
 
 func newCoordinatorRoundWithBudget(
@@ -1228,7 +1292,7 @@ func (r *coordinatorRound) buildPlan(ctx context.Context, kind PhaseKind, snapsh
 		Context: ctx, Kind: kind, DAG: r.dag, Snapshot: snapshot,
 		DesiredByRel: r.targetByRel, DynamicByRel: r.dynamicByRel, DesiredMemsByRel: r.desiredMemsByRel(),
 		AllowedCPUs: r.allowedCPUs(), AllowEmptyTarget: r.allowEmptyTarget,
-		Capabilities: r.driver.Capabilities(),
+		Capabilities: snapshot.Capabilities,
 		Witnesses:    r.witnesses, ProtectedPending: r.protectedPending,
 		ProtectedByRel: r.protectedByRel, CPUDetails: r.cpuDetails,
 		Selection: r.selection, Budget: r.budget,
@@ -1267,54 +1331,11 @@ func (r *coordinatorRound) executePlan(ctx context.Context, plan PhasePlan, res 
 	if r.budget == nil {
 		return fmt.Errorf("phase writer requires convergence budget")
 	}
-	if err := r.checkAdmissionExecutionBudget(plan, res); err != nil {
-		return err
-	}
 	if err := r.revalidateGrowAuthorization(ctx, plan); err != nil {
 		return err
 	}
 	writer := newSafeCPUSetWriter(r.driver, r.budget, res)
-	writer.admissionTicket = r.admissionTicket
 	return writer.execute(ctx, plan)
-}
-
-func (r *coordinatorRound) admissionBudgetReached(res *ConvergenceResult) bool {
-	if r == nil || r.objective != ConvergenceObjectiveParentSafe || r.admissionBudget == nil {
-		return false
-	}
-	if r.admissionBudget.MaxRequiredWrites > 0 &&
-		r.admissionTicket != nil && r.admissionTicket.forwardExhausted() {
-		return true
-	}
-	return false
-}
-
-func (r *coordinatorRound) checkAdmissionExecutionBudget(plan PhasePlan, res *ConvergenceResult) error {
-	if r == nil || r.objective != ConvergenceObjectiveParentSafe ||
-		r.admissionBudget == nil || len(plan.Operations) == 0 {
-		return nil
-	}
-	if r.admissionTicket == nil {
-		if err := r.reserveAdmissionClosure(plan); err != nil {
-			return err
-		}
-	}
-	return r.admissionTicket.consume(plan)
-}
-
-func (r *coordinatorRound) reserveAdmissionClosure(plan PhasePlan) error {
-	if r == nil || r.objective != ConvergenceObjectiveParentSafe ||
-		r.admissionBudget == nil || len(plan.Operations) == 0 ||
-		r.admissionTicket != nil {
-		return nil
-	}
-	ticket, err := r.budget.ReserveAdmissionBudget(
-		plan, r.requiredByRel, r.admissionBudget.MaxRequiredWrites)
-	if err != nil {
-		return err
-	}
-	r.admissionTicket = ticket
-	return nil
 }
 
 func (r *coordinatorRound) revalidateGrowAuthorization(ctx context.Context, plan PhasePlan) error {
@@ -1398,149 +1419,6 @@ func sortedOperationDomains(operations map[DomainID][]PlanOperation) []DomainID 
 	}
 	sort.Slice(domains, func(i, j int) bool { return domains[i] < domains[j] })
 	return domains
-}
-
-func (r *coordinatorRound) executeFixedPointRound(ctx context.Context, defaultMems string, res *ConvergenceResult) (RoundOutcome, error) {
-	if r.round >= r.maxRounds {
-		return RoundOutcome{}, fmt.Errorf("%w: limit=%d used=%d", ErrRoundBudgetExceeded, r.maxRounds, r.round)
-	}
-	if err := r.budget.ConsumeRound(); err != nil {
-		return RoundOutcome{}, err
-	}
-	r.round++
-	r.deferredCleanupRels = make(map[string]struct{})
-	journalBefore := len(res.Journal)
-	var progressBase, progressSnapshot *CompleteSnapshot
-	var changedRels []string
-	staleOutcome := func(err error) RoundOutcome {
-		return RoundOutcome{
-			Status:      RoundStatusStale,
-			Snapshot:    progressSnapshot,
-			Blocker:     err,
-			Journal:     append([]AppliedPlanOperation(nil), res.Journal[journalBefore:]...),
-			ChangedRels: append([]string(nil), changedRels...),
-			Cost:        r.budget.Usage(),
-		}
-	}
-	appliedBefore := res.Applied
-	drainSnapshot, err := r.nextSnapshot(ctx)
-	if err != nil {
-		return staleOutcome(err), err
-	}
-	drain, err := r.buildPlan(ctx, PhaseDrain, drainSnapshot)
-	if err != nil {
-		var structural *StructuralV1NonEmptyDeadlock
-		if errors.As(err, &structural) {
-			return RoundOutcome{
-				Status:   RoundStatusBlocked,
-				Snapshot: drainSnapshot,
-				Blocker:  err,
-				Cost:     r.budget.Usage(),
-			}, nil
-		}
-		return staleOutcome(err), err
-	}
-	progressBase = drain.Base
-	if err := r.reserveAdmissionClosure(drain); err != nil {
-		return staleOutcome(err), err
-	}
-	fresh, released, err := r.executeDrainBatches(ctx, drain, res)
-	if fresh != nil {
-		progressSnapshot = fresh
-		changedRels = verifiedDrainProgressRels(progressBase, fresh, drain.TargetByRel)
-	}
-	if err != nil {
-		return staleOutcome(err), err
-	}
-	r.witnesses = r.witnesses[:0]
-	for source, destinations := range released {
-		for destination, cpus := range destinations {
-			if cpus.IsEmpty() {
-				continue
-			}
-			witness := NewReleaseWitness(drain.ConvergenceID, source, destination, cpus, fresh)
-			if witness.CPUs.IsEmpty() {
-				continue
-			}
-			r.witnesses = append(r.witnesses, witness)
-		}
-	}
-	expand, err := r.buildPlan(ctx, PhaseExpand, fresh)
-	if err != nil {
-		return staleOutcome(err), err
-	}
-	if err := r.executePlan(ctx, expand, res); err != nil {
-		return staleOutcome(err), err
-	}
-	final, err := r.nextSnapshot(ctx)
-	if err != nil {
-		return staleOutcome(err), err
-	}
-	r.recomputeBlocked(final)
-	status := RoundStatusProgress
-	if res.Applied == appliedBefore {
-		status = RoundStatusBlocked
-	}
-	journal := append([]AppliedPlanOperation(nil), res.Journal[journalBefore:]...)
-	return RoundOutcome{
-		Status:      status,
-		Snapshot:    final,
-		Witnesses:   append([]ReleaseWitness(nil), r.witnesses...),
-		Journal:     journal,
-		ChangedRels: append([]string(nil), changedRels...),
-		Progress: ProgressMeasure{
-			DrainChangedRels: len(changedRels),
-			VerifiedWrites:   len(journal),
-		},
-		Cost: r.budget.Usage(),
-	}, nil
-}
-
-func (r *coordinatorRound) executeDrainBatches(
-	ctx context.Context,
-	plan PhasePlan,
-	res *ConvergenceResult,
-) (*CompleteSnapshot, map[DomainID]map[DomainID]machine.CPUSet, error) {
-	fresh := plan.Base
-	released := make(map[DomainID]map[DomainID]machine.CPUSet)
-	if len(plan.Operations) == 0 {
-		next, err := r.nextSnapshot(ctx)
-		return next, released, err
-	}
-	for len(plan.Operations) > 0 {
-		batch, err := drainFrontier(plan)
-		if err != nil {
-			return fresh, released, err
-		}
-		r.planID = batch.PlanID
-		accumulateDrainTransfers(released, plan.TransferGraph, plan.DrainBatch)
-		if err := r.executePlan(ctx, batch, res); err != nil {
-			if recovered, snapshotErr := r.nextSnapshot(ctx); snapshotErr == nil {
-				fresh = recovered
-			}
-			return fresh, released, err
-		}
-		next, err := r.nextSnapshot(ctx)
-		if err != nil {
-			return fresh, released, err
-		}
-		fresh = next
-		plan, err = rebaseDrainPlan(plan, fresh, r.dag, r.budget)
-		if err != nil {
-			return fresh, released, err
-		}
-		if r.objective == ConvergenceObjectiveParentSafe {
-			required, _, splitErr := SplitPlanForAdmission(&plan, AdmissionSafetyInput{
-				ProtectedPendingCPUSet: r.admissionSafetyCPUSet(),
-				DeferredCPUSetByRel:    r.deferredByRel,
-			})
-			if splitErr != nil {
-				return fresh, released, splitErr
-			}
-			plan = *required
-		}
-	}
-	return fresh, released, nil
 }
 
 func drainFrontier(plan PhasePlan) (PhasePlan, error) {

@@ -28,18 +28,29 @@ import (
 )
 
 type AppliedPlanOperation struct {
-	PlanID    string
-	Rel       string
-	Direction WriteDirection
-	Target    CPUSetTarget
-	Observed  CPUSetTarget
+	PlanID                string
+	Rel                   string
+	Direction             WriteDirection
+	Target                CPUSetTarget
+	Observed              CPUSetTarget
+	Resource              HierarchyOperation
+	PhysicalImpact        PhysicalImpact
+	LogicalOperationIndex int
+	Phase                 PhaseKind
 }
 
+type PhysicalImpact string
+
+const (
+	PhysicalImpactNone      PhysicalImpact = ""
+	PhysicalImpactConfirmed PhysicalImpact = "confirmed"
+	PhysicalImpactUncertain PhysicalImpact = "uncertain"
+)
+
 type safeCPSetWriter struct {
-	driver          HierarchyDriver
-	budget          *BudgetTracker
-	res             *ConvergenceResult
-	admissionTicket *AdmissionBudgetTicket
+	driver HierarchyDriver
+	budget *BudgetTracker
+	res    *ConvergenceResult
 }
 
 type stableLiveChildren struct {
@@ -114,19 +125,9 @@ func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 		if w.res != nil {
 			w.res.Attempted++
 		}
-		if w.admissionTicket != nil {
-			if err := w.admissionTicket.consumeOperation(operation); err != nil {
-				return err
-			}
-		}
 		wroteMems := false
 		wroteCPUs := false
 		if operation.WriteMems && operation.ExpectedCurrent.Mems != operation.Target.Mems {
-			if w.admissionTicket != nil {
-				if err := w.admissionTicket.consumeForward(PhysicalWriteCost{MemsWrites: 1}); err != nil {
-					return err
-				}
-			}
 			if err := w.driver.WriteMems(ctx, operation.Rel, operation.ExpectedIdentity, operation.Target.Mems); err != nil {
 				if w.res != nil {
 					w.res.Failed++
@@ -138,11 +139,6 @@ func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 			wroteMems = true
 		}
 		if !operation.ExpectedCurrent.CPUs.Equals(operation.Target.CPUs) {
-			if w.admissionTicket != nil {
-				if err := w.admissionTicket.consumeForward(PhysicalWriteCost{CPUSetWrites: 1}); err != nil {
-					return err
-				}
-			}
 			if err := w.driver.WriteCPUs(ctx, operation.Rel, operation.ExpectedIdentity, operation.Target.CPUs); err != nil {
 				if w.res != nil {
 					w.res.Failed++
@@ -203,14 +199,6 @@ func (w safeCPSetWriter) rollbackOperation(
 ) error {
 	var rollbackErr error
 	if wroteCPUs {
-		if w.admissionTicket != nil {
-			if err := w.admissionTicket.consumeRollback(PhysicalWriteCost{CPUSetWrites: 1}); err != nil {
-				rollbackErr = utilerrors.NewAggregate([]error{rollbackErr, err})
-				wroteCPUs = false
-			}
-		}
-	}
-	if wroteCPUs {
 		if err := w.driver.WriteCPUs(
 			ctx, operation.Rel, operation.ExpectedIdentity, operation.ExpectedCurrent.CPUs,
 		); err != nil {
@@ -218,14 +206,6 @@ func (w safeCPSetWriter) rollbackOperation(
 				rollbackErr,
 				fmt.Errorf("rollback cpuset.cpus for %q: %w", operation.Rel, err),
 			})
-		}
-	}
-	if wroteMems {
-		if w.admissionTicket != nil {
-			if err := w.admissionTicket.consumeRollback(PhysicalWriteCost{MemsWrites: 1}); err != nil {
-				rollbackErr = utilerrors.NewAggregate([]error{rollbackErr, err})
-				wroteMems = false
-			}
 		}
 	}
 	if wroteMems {

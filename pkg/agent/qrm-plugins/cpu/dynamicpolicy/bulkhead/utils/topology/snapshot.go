@@ -97,17 +97,29 @@ func ObserveConfiguredRels(
 	return out, nil
 }
 
+type UnavailableChildReason string
+
+const (
+	UnavailableChildReasonControllerUnavailable UnavailableChildReason = "controller-unavailable"
+)
+
+type UnavailableChildEvidence struct {
+	Identity CgroupIdentity
+	Reason   UnavailableChildReason
+}
+
 // CompleteSnapshot is the only ownership evidence accepted by the coordinator.
 type CompleteSnapshot struct {
-	ID           SnapshotID
-	CapturedAt   time.Time
-	Capabilities HierarchyCapabilities
-	Entries      map[string]EntryState
-	Children     map[string][]ChildRef
-	DomainByRel  map[string]DomainID
-	DomainUnion  map[DomainID]machine.CPUSet
-	ScanBoundary ScanBoundary
-	Cost         BudgetUsage
+	ID                  SnapshotID
+	CapturedAt          time.Time
+	Capabilities        HierarchyCapabilities
+	Entries             map[string]EntryState
+	Children            map[string][]ChildRef
+	UnavailableChildren map[string]UnavailableChildEvidence
+	DomainByRel         map[string]DomainID
+	DomainUnion         map[DomainID]machine.CPUSet
+	ScanBoundary        ScanBoundary
+	Cost                BudgetUsage
 }
 
 // SnapshotError preserves the failed operation and driver classification.
@@ -129,12 +141,13 @@ func (e *SnapshotError) Error() string {
 func (e *SnapshotError) Unwrap() error { return e.Err }
 
 type snapshotBuilder struct {
-	ctx        context.Context
-	driver     HierarchyDriver
-	budget     *BudgetTracker
-	snapshot   *CompleteSnapshot
-	controlled map[string]*TopoNode
-	boundaries map[string]struct{}
+	ctx            context.Context
+	driver         HierarchyDriver
+	budget         *BudgetTracker
+	snapshot       *CompleteSnapshot
+	controlled     map[string]*TopoNode
+	boundaries     map[string]struct{}
+	exactExpansion map[string]struct{}
 }
 
 // BuildCompleteSnapshot returns either complete purpose-scoped evidence or a
@@ -147,6 +160,63 @@ func BuildCompleteSnapshot(
 	budget *BudgetTracker,
 ) (*CompleteSnapshot, error) {
 	return buildCompleteSnapshot(ctx, driver, dag, request, budget, nil)
+}
+
+// BuildCompleteSnapshotForBoundary replays an already captured scan boundary
+// exactly. Roots are observed without inferring that they were affected, and
+// only relations recorded in ExpandedRels have their children listed.
+func BuildCompleteSnapshotForBoundary(
+	ctx context.Context,
+	driver HierarchyDriver,
+	dag *TopoDAG,
+	boundary ScanBoundary,
+	budget *BudgetTracker,
+) (*CompleteSnapshot, error) {
+	if driver == nil || dag == nil || budget == nil {
+		return nil, &SnapshotError{
+			Operation: HierarchyOperationRead,
+			Class:     HierarchyErrorInvalid,
+			Err:       fmt.Errorf("driver, dag and budget are required"),
+		}
+	}
+	if !driver.Capabilities().StableIdentity {
+		return nil, &SnapshotError{
+			Operation: HierarchyOperationStat,
+			Class:     HierarchyErrorInvalid,
+			Err:       fmt.Errorf("stable hierarchy identity is required"),
+		}
+	}
+	if wrapped, ok := driver.(*budgetedHierarchyDriver); !ok || wrapped.budget != budget {
+		driver = NewBudgetedHierarchyDriver(driver, budget)
+	}
+	if boundary.Purpose != ScanForPlan {
+		return nil, &SnapshotError{
+			Operation: HierarchyOperationRead,
+			Class:     HierarchyErrorInvalid,
+			Err:       fmt.Errorf("exact snapshot boundary replay requires plan purpose, got %q", boundary.Purpose),
+		}
+	}
+	frozen := cloneScanBoundary(boundary)
+	frozen.Roots = normalizeRels(frozen.Roots)
+	frozen.ExpandedRels = normalizeRels(frozen.ExpandedRels)
+	expand := make(map[string]bool, len(frozen.Roots))
+	for _, rel := range frozen.Roots {
+		node := dag.index[rel]
+		if node == nil || node.Domain == "" {
+			return nil, &SnapshotError{
+				Operation: HierarchyOperationRead,
+				Class:     HierarchyErrorInvalid,
+				Err:       fmt.Errorf("snapshot boundary rel %q is not controlled with an explicit domain", rel),
+			}
+		}
+	}
+	exactExpansion := make(map[string]struct{}, len(frozen.ExpandedRels))
+	for _, rel := range frozen.ExpandedRels {
+		exactExpansion[rel] = struct{}{}
+	}
+	return buildCompleteSnapshotWithBoundary(
+		ctx, driver, dag, frozen, expand, budget, nil, exactExpansion,
+	)
 }
 
 func buildCompleteSnapshot(
@@ -174,20 +244,40 @@ func buildCompleteSnapshot(
 	if err != nil {
 		return nil, &SnapshotError{Operation: HierarchyOperationRead, Class: HierarchyErrorInvalid, Err: err}
 	}
+	return buildCompleteSnapshotWithBoundary(
+		ctx, driver, dag, boundary, expand, budget, boundaries, nil,
+	)
+}
+
+func buildCompleteSnapshotWithBoundary(
+	ctx context.Context,
+	driver HierarchyDriver,
+	dag *TopoDAG,
+	boundary ScanBoundary,
+	expand map[string]bool,
+	budget *BudgetTracker,
+	boundaries map[string]struct{},
+	exactExpansion map[string]struct{},
+) (*CompleteSnapshot, error) {
 	builder := &snapshotBuilder{
-		ctx:        ctx,
-		driver:     driver,
-		budget:     budget,
-		controlled: make(map[string]*TopoNode, len(dag.index)),
-		boundaries: boundaries,
+		ctx:            ctx,
+		driver:         driver,
+		budget:         budget,
+		controlled:     make(map[string]*TopoNode, len(dag.index)),
+		boundaries:     boundaries,
+		exactExpansion: exactExpansion,
 		snapshot: &CompleteSnapshot{
-			CapturedAt:   time.Now(),
-			Capabilities: driver.Capabilities(),
-			Entries:      make(map[string]EntryState),
-			Children:     make(map[string][]ChildRef),
-			DomainByRel:  make(map[string]DomainID),
-			DomainUnion:  make(map[DomainID]machine.CPUSet),
-			ScanBoundary: boundary,
+			CapturedAt:          time.Now(),
+			Capabilities:        driver.Capabilities(),
+			Entries:             make(map[string]EntryState),
+			Children:            make(map[string][]ChildRef),
+			UnavailableChildren: make(map[string]UnavailableChildEvidence),
+			DomainByRel:         make(map[string]DomainID),
+			DomainUnion:         make(map[DomainID]machine.CPUSet),
+			ScanBoundary: ScanBoundary{
+				Purpose: boundary.Purpose,
+				Roots:   append([]string(nil), boundary.Roots...),
+			},
 		},
 	}
 	for rel, node := range dag.index {
@@ -196,12 +286,25 @@ func buildCompleteSnapshot(
 	for _, rel := range boundary.Roots {
 		node := dag.index[rel]
 		domain := node.Domain
-		if err := builder.scan(rel, domain, 1, CgroupIdentity{}, expand[rel], request.Purpose == ScanForPrecheck); err != nil {
+		if err := builder.scan(rel, domain, 1, CgroupIdentity{}, expand[rel], boundary.Purpose == ScanForPrecheck); err != nil {
 			return nil, err
 		}
 	}
 	builder.snapshot.Cost = budget.Usage()
 	builder.snapshot.ID = fingerprintSnapshot(builder.snapshot)
+	if exactExpansion != nil &&
+		!equalStringSlices(builder.snapshot.ScanBoundary.ExpandedRels, boundary.ExpandedRels) {
+		return nil, &SnapshotError{
+			Operation:  HierarchyOperationList,
+			Class:      HierarchyErrorInvalid,
+			EvidenceID: builder.snapshot.ID,
+			Err: fmt.Errorf(
+				"exact snapshot boundary expansion mismatch: got=%v want=%v",
+				builder.snapshot.ScanBoundary.ExpandedRels,
+				boundary.ExpandedRels,
+			),
+		}
+	}
 	return builder.snapshot, nil
 }
 
@@ -262,6 +365,10 @@ func (b *snapshotBuilder) scan(rel string, domain DomainID, depth int, expected 
 	entry, err := b.driver.ReadEntry(b.ctx, rel)
 	if err != nil {
 		if b.shouldSkipUnavailableController(rel, depth, err) {
+			b.snapshot.UnavailableChildren[rel] = UnavailableChildEvidence{
+				Identity: before,
+				Reason:   UnavailableChildReasonControllerUnavailable,
+			}
 			return nil
 		}
 		return b.fail(HierarchyOperationRead, rel, before, err)
@@ -280,6 +387,9 @@ func (b *snapshotBuilder) scan(rel string, domain DomainID, depth int, expected 
 	b.snapshot.DomainByRel[rel] = domain
 	b.snapshot.DomainUnion[domain] = b.snapshot.DomainUnion[domain].Union(entry.CPUs)
 
+	if b.exactExpansion != nil {
+		_, expand = b.exactExpansion[rel]
+	}
 	if !expand && !immediateOnly {
 		return nil
 	}
@@ -312,12 +422,27 @@ func (b *snapshotBuilder) scan(rel string, domain DomainID, depth int, expected 
 			childDomain = childNode.Domain
 		}
 		childExpand := expand && !immediateOnly
+		if b.exactExpansion != nil {
+			_, childExpand = b.exactExpansion[childRel]
+		}
 		if err := b.scan(childRel, childDomain, depth+1, child.Identity, childExpand, false); err != nil {
 			return err
 		}
 	}
 	sort.Strings(b.snapshot.ScanBoundary.ExpandedRels)
 	return nil
+}
+
+func equalStringSlices(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (b *snapshotBuilder) shouldSkipUnavailableController(rel string, depth int, err error) bool {
@@ -423,12 +548,23 @@ func selectSnapshotBoundary(dag *TopoDAG, request SnapshotRequest) (ScanBoundary
 
 func fingerprintSnapshot(snapshot *CompleteSnapshot) SnapshotID {
 	hash := sha256.New()
+	writeHashString(hash, "bulkhead-complete-snapshot-v2")
+	writeHashString(hash, "purpose")
 	writeHashString(hash, string(snapshot.ScanBoundary.Purpose))
+	writeHashString(hash, "capabilities")
 	writeHashUint64(hash, hierarchyCapabilitiesBits(snapshot.Capabilities))
-	for _, rel := range snapshot.ScanBoundary.Roots {
+	roots := append([]string(nil), snapshot.ScanBoundary.Roots...)
+	sort.Strings(roots)
+	writeHashString(hash, "roots")
+	writeHashUint64(hash, uint64(len(roots)))
+	for _, rel := range roots {
 		writeHashString(hash, rel)
 	}
-	for _, rel := range snapshot.ScanBoundary.ExpandedRels {
+	expandedRels := append([]string(nil), snapshot.ScanBoundary.ExpandedRels...)
+	sort.Strings(expandedRels)
+	writeHashString(hash, "expanded-rels")
+	writeHashUint64(hash, uint64(len(expandedRels)))
+	for _, rel := range expandedRels {
 		writeHashString(hash, rel)
 	}
 	domains := make([]string, 0, len(snapshot.DomainUnion))
@@ -436,6 +572,8 @@ func fingerprintSnapshot(snapshot *CompleteSnapshot) SnapshotID {
 		domains = append(domains, string(domain))
 	}
 	sort.Strings(domains)
+	writeHashString(hash, "domain-union")
+	writeHashUint64(hash, uint64(len(domains)))
 	for _, domain := range domains {
 		writeHashString(hash, domain)
 		writeHashString(hash, snapshot.DomainUnion[DomainID(domain)].String())
@@ -445,21 +583,56 @@ func fingerprintSnapshot(snapshot *CompleteSnapshot) SnapshotID {
 		rels = append(rels, rel)
 	}
 	sort.Strings(rels)
+	writeHashString(hash, "entries")
+	writeHashUint64(hash, uint64(len(rels)))
 	for _, rel := range rels {
 		entry := snapshot.Entries[rel]
 		writeHashString(hash, rel)
-		writeHashString(hash, string(snapshot.DomainByRel[rel]))
 		writeHashUint64(hash, entry.Identity.Device)
 		writeHashUint64(hash, entry.Identity.Inode)
 		writeHashString(hash, entry.CPUs.String())
 		writeHashString(hash, entry.Mems)
 		writeHashString(hash, entry.ConfiguredCPUs.String())
 		writeHashString(hash, entry.ConfiguredMems)
-		for _, child := range snapshot.Children[rel] {
+	}
+	domainRels := sortedStringKeys(snapshot.DomainByRel)
+	writeHashString(hash, "domain-by-rel")
+	writeHashUint64(hash, uint64(len(domainRels)))
+	for _, rel := range domainRels {
+		writeHashString(hash, rel)
+		writeHashString(hash, string(snapshot.DomainByRel[rel]))
+	}
+	childParents := sortedStringKeys(snapshot.Children)
+	writeHashString(hash, "children")
+	writeHashUint64(hash, uint64(len(childParents)))
+	for _, rel := range childParents {
+		writeHashString(hash, rel)
+		children := append([]ChildRef(nil), snapshot.Children[rel]...)
+		sort.Slice(children, func(i, j int) bool {
+			if children[i].Name != children[j].Name {
+				return children[i].Name < children[j].Name
+			}
+			if children[i].Identity.Device != children[j].Identity.Device {
+				return children[i].Identity.Device < children[j].Identity.Device
+			}
+			return children[i].Identity.Inode < children[j].Identity.Inode
+		})
+		writeHashUint64(hash, uint64(len(children)))
+		for _, child := range children {
 			writeHashString(hash, child.Name)
 			writeHashUint64(hash, child.Identity.Device)
 			writeHashUint64(hash, child.Identity.Inode)
 		}
+	}
+	unavailableRels := sortedStringKeys(snapshot.UnavailableChildren)
+	writeHashString(hash, "unavailable-children")
+	writeHashUint64(hash, uint64(len(unavailableRels)))
+	for _, rel := range unavailableRels {
+		evidence := snapshot.UnavailableChildren[rel]
+		writeHashString(hash, rel)
+		writeHashUint64(hash, evidence.Identity.Device)
+		writeHashUint64(hash, evidence.Identity.Inode)
+		writeHashString(hash, string(evidence.Reason))
 	}
 	var id SnapshotID
 	copy(id[:], hash.Sum(nil))
@@ -498,5 +671,70 @@ func cloneCPUSetMap(in map[string]machine.CPUSet) map[string]machine.CPUSet {
 	for rel, cpus := range in {
 		out[rel] = cpus.Clone()
 	}
+	return out
+}
+
+func cloneUnavailableChildEvidenceMap(
+	in map[string]UnavailableChildEvidence,
+) map[string]UnavailableChildEvidence {
+	out := make(map[string]UnavailableChildEvidence, len(in))
+	for rel, evidence := range in {
+		out[rel] = evidence
+	}
+	return out
+}
+
+// CloneCompleteSnapshot returns a deep copy that shares no mutable map, slice,
+// or CPUSet state with the input. Compilation and projection rely on this
+// isolation to model a fixed point without disturbing captured evidence.
+func CloneCompleteSnapshot(in *CompleteSnapshot) *CompleteSnapshot {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Entries = make(map[string]EntryState, len(in.Entries))
+	for rel, entry := range in.Entries {
+		cloned := entry
+		cloned.CPUs = entry.CPUs.Clone()
+		cloned.ConfiguredCPUs = entry.ConfiguredCPUs.Clone()
+		out.Entries[rel] = cloned
+	}
+	out.Children = make(map[string][]ChildRef, len(in.Children))
+	for rel, refs := range in.Children {
+		out.Children[rel] = append([]ChildRef(nil), refs...)
+	}
+	out.UnavailableChildren = cloneUnavailableChildEvidenceMap(in.UnavailableChildren)
+	out.DomainByRel = cloneDomainByRel(in.DomainByRel)
+	out.DomainUnion = cloneDomainUnion(in.DomainUnion)
+	out.ScanBoundary = cloneScanBoundary(in.ScanBoundary)
+	return &out
+}
+
+func cloneDomainByRel(in map[string]DomainID) map[string]DomainID {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]DomainID, len(in))
+	for rel, domain := range in {
+		out[rel] = domain
+	}
+	return out
+}
+
+func cloneDomainUnion(in map[DomainID]machine.CPUSet) map[DomainID]machine.CPUSet {
+	if in == nil {
+		return nil
+	}
+	out := make(map[DomainID]machine.CPUSet, len(in))
+	for domain, cpus := range in {
+		out[domain] = cpus.Clone()
+	}
+	return out
+}
+
+func cloneScanBoundary(in ScanBoundary) ScanBoundary {
+	out := in
+	out.Roots = append([]string(nil), in.Roots...)
+	out.ExpandedRels = append([]string(nil), in.ExpandedRels...)
 	return out
 }

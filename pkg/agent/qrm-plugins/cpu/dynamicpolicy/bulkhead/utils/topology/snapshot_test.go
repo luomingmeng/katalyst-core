@@ -26,6 +26,8 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -154,6 +156,14 @@ func TestSnapshotSkipsUncontrolledCgroupV2DescendantWithoutCpusetController(t *t
 	}
 	if _, ok := snapshot.Entries["primary/pod-a/container-a"]; ok {
 		t.Fatalf("snapshot included uncontrolled descendant without cpuset controller")
+	}
+	childIdentity := fake.nodes["primary/pod-a/container-a"].identity
+	wantEvidence := UnavailableChildEvidence{
+		Identity: childIdentity,
+		Reason:   UnavailableChildReasonControllerUnavailable,
+	}
+	if got, ok := snapshot.UnavailableChildren["primary/pod-a/container-a"]; !ok || got != wantEvidence {
+		t.Fatalf("unavailable-child evidence = %v, want %v", snapshot.UnavailableChildren, wantEvidence)
 	}
 	if got := snapshot.DomainUnion[DomainPrimary].String(); got != "0-1" {
 		t.Fatalf("primary domain union = %q, want 0-1", got)
@@ -480,6 +490,181 @@ func TestSnapshotIDChangesWithConfiguredCPUsOrMems(t *testing.T) {
 			if got := fingerprintSnapshot(changed); got == baseID {
 				t.Fatalf("snapshot ID did not change for %s drift", tc.name)
 			}
+		})
+	}
+}
+
+func TestSnapshotFingerprintSeparatesSectionBoundariesAndMapOwnership(t *testing.T) {
+	entry := EntryState{
+		Rel: "a", Identity: CgroupIdentity{Device: 1, Inode: 1},
+		CPUs: machine.NewCPUSet(0), ConfiguredCPUs: machine.NewCPUSet(0),
+	}
+	base := &CompleteSnapshot{
+		Entries:      map[string]EntryState{"a": entry, "b": entry},
+		Children:     map[string][]ChildRef{"a": {{Name: "x"}}, "b": {{Name: "y"}}},
+		DomainByRel:  map[string]DomainID{"a": DomainPrimary, "b": DomainPrimary},
+		ScanBoundary: ScanBoundary{Purpose: ScanForPlan, Roots: []string{"a"}, ExpandedRels: []string{"b"}},
+	}
+	tests := []struct {
+		name   string
+		mutate func(*CompleteSnapshot)
+	}{
+		{
+			name: "roots cannot collide with expanded rels",
+			mutate: func(snapshot *CompleteSnapshot) {
+				snapshot.ScanBoundary.Roots = []string{"a", "b"}
+				snapshot.ScanBoundary.ExpandedRels = nil
+			},
+		},
+		{
+			name: "children cannot move between parent keys",
+			mutate: func(snapshot *CompleteSnapshot) {
+				snapshot.Children["a"] = []ChildRef{{Name: "x"}, {Name: "y"}}
+				snapshot.Children["b"] = nil
+			},
+		},
+		{
+			name: "orphan children key is covered",
+			mutate: func(snapshot *CompleteSnapshot) {
+				snapshot.Children["orphan"] = nil
+			},
+		},
+		{
+			name: "orphan domain key is covered",
+			mutate: func(snapshot *CompleteSnapshot) {
+				snapshot.DomainByRel["orphan"] = DomainReclaim
+			},
+		},
+		{
+			name: "unavailable-child evidence is covered",
+			mutate: func(snapshot *CompleteSnapshot) {
+				snapshot.UnavailableChildren = map[string]UnavailableChildEvidence{
+					"a/x": {
+						Identity: CgroupIdentity{Device: 1, Inode: 9},
+						Reason:   UnavailableChildReasonControllerUnavailable,
+					},
+				}
+			},
+		},
+		{
+			name: "unavailable-child reason is covered",
+			mutate: func(snapshot *CompleteSnapshot) {
+				snapshot.UnavailableChildren = map[string]UnavailableChildEvidence{
+					"a/x": {
+						Identity: CgroupIdentity{Device: 1, Inode: 9},
+						Reason:   UnavailableChildReason("different-reason"),
+					},
+				}
+			},
+		},
+	}
+
+	baseID := fingerprintSnapshot(base)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			changed := CloneCompleteSnapshot(base)
+			tc.mutate(changed)
+			if got := fingerprintSnapshot(changed); got == baseID {
+				t.Fatalf("fingerprint collision: base=%x changed=%x", baseID, got)
+			}
+		})
+	}
+}
+
+func TestCloneCompleteSnapshotIsolatesUnavailableChildEvidence(t *testing.T) {
+	original := &CompleteSnapshot{
+		UnavailableChildren: map[string]UnavailableChildEvidence{
+			"root/child": {
+				Identity: CgroupIdentity{Device: 1, Inode: 2},
+				Reason:   UnavailableChildReasonControllerUnavailable,
+			},
+		},
+	}
+	cloned := CloneCompleteSnapshot(original)
+	cloned.UnavailableChildren["root/child"] = UnavailableChildEvidence{
+		Identity: CgroupIdentity{Device: 9, Inode: 9},
+		Reason:   UnavailableChildReasonControllerUnavailable,
+	}
+	require.Equal(t, UnavailableChildEvidence{
+		Identity: CgroupIdentity{Device: 1, Inode: 2},
+		Reason:   UnavailableChildReasonControllerUnavailable,
+	}, original.UnavailableChildren["root/child"])
+}
+
+func TestValidateCompleteSnapshotEvidenceRejectsInvalidUnavailableChildProof(t *testing.T) {
+	childIdentity := CgroupIdentity{Device: 1, Inode: 2}
+	valid := &CompleteSnapshot{
+		Capabilities: v2Capabilities(),
+		Entries: map[string]EntryState{
+			"root": {Rel: "root", Identity: CgroupIdentity{Device: 1, Inode: 1}},
+		},
+		Children: map[string][]ChildRef{
+			"root": {{Name: "child", Identity: childIdentity}},
+		},
+		UnavailableChildren: map[string]UnavailableChildEvidence{
+			"root/child": {
+				Identity: childIdentity,
+				Reason:   UnavailableChildReasonControllerUnavailable,
+			},
+		},
+		DomainByRel: map[string]DomainID{"root": DomainPrimary},
+		DomainUnion: map[DomainID]machine.CPUSet{DomainPrimary: machine.NewCPUSet()},
+		ScanBoundary: ScanBoundary{
+			Purpose: ScanForPlan, Roots: []string{"root"}, ExpandedRels: []string{"root"},
+		},
+	}
+	require.NoError(t, validateCompleteSnapshotEvidence(valid))
+
+	tests := []struct {
+		name   string
+		mutate func(*CompleteSnapshot)
+	}{
+		{
+			name: "unsupported hierarchy",
+			mutate: func(snapshot *CompleteSnapshot) {
+				snapshot.Capabilities.EffectiveCPUSet = false
+			},
+		},
+		{
+			name: "orphan evidence",
+			mutate: func(snapshot *CompleteSnapshot) {
+				snapshot.UnavailableChildren["root/orphan"] = UnavailableChildEvidence{
+					Identity: childIdentity,
+					Reason:   UnavailableChildReasonControllerUnavailable,
+				}
+			},
+		},
+		{
+			name: "identity mismatch",
+			mutate: func(snapshot *CompleteSnapshot) {
+				snapshot.UnavailableChildren["root/child"] = UnavailableChildEvidence{
+					Identity: CgroupIdentity{Device: 9, Inode: 9},
+					Reason:   UnavailableChildReasonControllerUnavailable,
+				}
+			},
+		},
+		{
+			name: "unexpected skip reason",
+			mutate: func(snapshot *CompleteSnapshot) {
+				snapshot.UnavailableChildren["root/child"] = UnavailableChildEvidence{
+					Identity: childIdentity,
+					Reason:   UnavailableChildReason("permission-denied"),
+				}
+			},
+		},
+		{
+			name: "entry and skip evidence overlap",
+			mutate: func(snapshot *CompleteSnapshot) {
+				snapshot.Entries["root/child"] = EntryState{Rel: "root/child", Identity: childIdentity}
+				snapshot.DomainByRel["root/child"] = DomainPrimary
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := CloneCompleteSnapshot(valid)
+			tc.mutate(snapshot)
+			require.Error(t, validateCompleteSnapshotEvidence(snapshot))
 		})
 	}
 }

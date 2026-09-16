@@ -96,6 +96,13 @@ type CPUSetTarget struct {
 	Mems string
 }
 
+// ExecutionReservationCost is the exact forward-write budget of a frozen
+// trace and the matching rollback capacity required to reverse every write.
+type ExecutionReservationCost struct {
+	Forward  PhysicalWriteCost
+	Rollback PhysicalWriteCost
+}
+
 type OperationRequirement string
 
 const (

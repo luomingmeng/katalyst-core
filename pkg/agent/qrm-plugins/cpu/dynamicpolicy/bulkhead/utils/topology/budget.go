@@ -88,9 +88,38 @@ func (c PhysicalWriteCost) Total() int {
 	return saturatingAdd(c.CPUSetWrites, c.MemsWrites)
 }
 
-type AdmissionReservationCost struct {
-	Forward  PhysicalWriteCost
-	Rollback PhysicalWriteCost
+func physicalWriteCost(from, to CPUSetTarget, writeMems bool) PhysicalWriteCost {
+	cost := PhysicalWriteCost{}
+	if !from.CPUs.Equals(to.CPUs) {
+		cost.CPUSetWrites = 1
+	}
+	if writeMems && from.Mems != to.Mems {
+		cost.MemsWrites = 1
+	}
+	return cost
+}
+
+func addPhysicalWriteCost(left, right PhysicalWriteCost) PhysicalWriteCost {
+	return PhysicalWriteCost{
+		CPUSetWrites: saturatingAdd(left.CPUSetWrites, right.CPUSetWrites),
+		MemsWrites:   saturatingAdd(left.MemsWrites, right.MemsWrites),
+	}
+}
+
+func subtractPhysicalWriteCost(left, right PhysicalWriteCost) PhysicalWriteCost {
+	return PhysicalWriteCost{
+		CPUSetWrites: left.CPUSetWrites - right.CPUSetWrites,
+		MemsWrites:   left.MemsWrites - right.MemsWrites,
+	}
+}
+
+func physicalWriteCostFits(required, available PhysicalWriteCost) bool {
+	return required.CPUSetWrites <= available.CPUSetWrites &&
+		required.MemsWrites <= available.MemsWrites
+}
+
+func (c ExecutionReservationCost) Total() int {
+	return saturatingAdd(c.Forward.Total(), c.Rollback.Total())
 }
 
 // AutoCumulativeBudgetInput is an invocation-scoped upper bound assembled
@@ -234,6 +263,15 @@ func (b *BudgetTracker) Usage() BudgetUsage {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.usage
+}
+
+func (b *BudgetTracker) Deadline() time.Time {
+	if b == nil {
+		return time.Time{}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.limit.Deadline
 }
 
 func (b *BudgetTracker) configureAutoHierarchyIOBootstrap(staleRetryAllowance int) error {
