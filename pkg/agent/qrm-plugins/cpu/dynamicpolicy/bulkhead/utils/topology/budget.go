@@ -88,6 +88,10 @@ func (c PhysicalWriteCost) Total() int {
 	return saturatingAdd(c.CPUSetWrites, c.MemsWrites)
 }
 
+func (c ExecutionReservationCost) Total() int {
+	return saturatingAdd(c.Forward.Total(), c.Rollback.Total())
+}
+
 type AdmissionReservationCost struct {
 	Forward  PhysicalWriteCost
 	Rollback PhysicalWriteCost

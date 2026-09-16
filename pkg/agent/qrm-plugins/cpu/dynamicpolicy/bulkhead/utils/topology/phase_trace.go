@@ -654,17 +654,16 @@ func cloneStringMap(in map[string]string) map[string]string {
 
 func executionReservationCost(phases []CompiledPhase) ExecutionReservationCost {
 	var forward PhysicalWriteCost
+	var rollback PhysicalWriteCost
 	for _, phase := range phases {
 		for _, operation := range phase.Operations {
-			if !operation.ExpectedCurrent.CPUs.Equals(operation.Target.CPUs) {
-				forward.CPUSetWrites++
-			}
-			if operation.WriteMems {
-				forward.MemsWrites++
-			}
+			forward = addPhysicalWriteCost(forward, physicalWriteCost(
+				operation.ExpectedCurrent, operation.Target, operation.WriteMems))
+			rollback = addPhysicalWriteCost(rollback, physicalWriteCost(
+				operation.Target, operation.ExpectedCurrent, operation.WriteMems))
 		}
 	}
-	return ExecutionReservationCost{Forward: forward, Rollback: forward}
+	return ExecutionReservationCost{Forward: forward, Rollback: rollback}
 }
 
 func cloneCPUSetTargetMap(in map[string]CPUSetTarget) map[string]CPUSetTarget {

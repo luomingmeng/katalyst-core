@@ -1,0 +1,214 @@
+/*
+Copyright 2026 The Katalyst Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package topology
+
+import (
+	"fmt"
+	"sync"
+)
+
+type frozenOperationAuthorization struct {
+	phaseIndex          int
+	phaseOperationIndex int
+	operation           PlanOperation
+}
+
+// ExecutionReservationTicket authorizes one frozen trace in strict global
+// operation order and accounts forward and rollback writes independently.
+type ExecutionReservationTicket struct {
+	mu               sync.Mutex
+	traceID          string
+	operations       []frozenOperationAuthorization
+	nextOperation    int
+	reserved         ExecutionReservationCost
+	consumedForward  PhysicalWriteCost
+	consumedRollback PhysicalWriteCost
+	released         bool
+}
+
+// ReservePhaseTrace validates and freezes the complete trace before taking any
+// BudgetTracker lock. Reservation therefore never compiles or validates a trace
+// while holding BudgetTracker.mu and never performs a live hierarchy write.
+func (b *BudgetTracker) ReservePhaseTrace(
+	trace *CompiledPhaseTrace,
+	maxRequiredWrites int,
+) (*ExecutionReservationTicket, error) {
+	if b == nil {
+		return nil, fmt.Errorf("phase trace reservation requires budget tracker")
+	}
+	if maxRequiredWrites < 0 {
+		return nil, fmt.Errorf("%w: maximum required writes must not be negative: %d",
+			ErrAdmissionReservationExceeded, maxRequiredWrites)
+	}
+
+	frozen, err := FreezePhaseTrace(trace)
+	if err != nil {
+		return nil, err
+	}
+	reserved := phaseTracePhysicalWriteCost(frozen)
+	required := reserved.Total()
+	if maxRequiredWrites > 0 && required > maxRequiredWrites {
+		return nil, fmt.Errorf("%w before frozen trace execution: limit=%d required=%d",
+			ErrAdmissionReservationExceeded, maxRequiredWrites, required)
+	}
+
+	operations := make([]frozenOperationAuthorization, 0)
+	for phaseIndex, phase := range frozen.Phases {
+		for phaseOperationIndex, operation := range phase.Operations {
+			operations = append(operations, frozenOperationAuthorization{
+				phaseIndex:          phaseIndex,
+				phaseOperationIndex: phaseOperationIndex,
+				operation:           clonePlanOperation(operation),
+			})
+		}
+	}
+	return &ExecutionReservationTicket{
+		traceID:    frozen.TraceID,
+		operations: operations,
+		reserved:   reserved,
+	}, nil
+}
+
+// AuthorizeNext accepts exactly the next global operation of the frozen trace.
+// A rejected authorization does not advance the ticket.
+func (t *ExecutionReservationTicket) AuthorizeNext(
+	traceID string,
+	operationIndex int,
+	operation PlanOperation,
+) error {
+	if t == nil {
+		return fmt.Errorf("%w: execution reservation ticket is nil",
+			ErrAdmissionReservationExceeded)
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.released {
+		return fmt.Errorf("%w: ticket already released", ErrAdmissionReservationExceeded)
+	}
+	if traceID != t.traceID {
+		return fmt.Errorf("%w: trace identity mismatch", ErrAdmissionReservationExceeded)
+	}
+	if operationIndex != t.nextOperation {
+		return fmt.Errorf("%w: operation index out of order: got=%d want=%d",
+			ErrAdmissionReservationExceeded, operationIndex, t.nextOperation)
+	}
+	if t.nextOperation >= len(t.operations) {
+		return fmt.Errorf("%w: operation index %d exceeds frozen trace length %d",
+			ErrAdmissionReservationExceeded, operationIndex, len(t.operations))
+	}
+	expected := t.operations[t.nextOperation]
+	if !planOperationsEqual(expected.operation, operation) {
+		return fmt.Errorf(
+			"%w: operation %d does not match frozen phase %d operation %d",
+			ErrAdmissionReservationExceeded, operationIndex,
+			expected.phaseIndex, expected.phaseOperationIndex)
+	}
+	t.nextOperation++
+	return nil
+}
+
+func (t *ExecutionReservationTicket) consumeForward(cost PhysicalWriteCost) error {
+	if t == nil {
+		return fmt.Errorf("%w: execution reservation ticket is nil",
+			ErrAdmissionReservationExceeded)
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.released {
+		return fmt.Errorf("%w: ticket already released", ErrAdmissionReservationExceeded)
+	}
+	if !validPhysicalWriteCost(cost) {
+		return fmt.Errorf("%w: invalid forward write cost %+v",
+			ErrAdmissionReservationExceeded, cost)
+	}
+	remaining := subtractPhysicalWriteCost(t.reserved.Forward, t.consumedForward)
+	if !physicalWriteCostFits(cost, remaining) {
+		return fmt.Errorf("%w: forward remaining=%+v requested=%+v",
+			ErrAdmissionReservationExceeded, remaining, cost)
+	}
+	t.consumedForward = addPhysicalWriteCost(t.consumedForward, cost)
+	return nil
+}
+
+func (t *ExecutionReservationTicket) consumeRollback(cost PhysicalWriteCost) error {
+	if t == nil {
+		return fmt.Errorf("%w: execution reservation ticket is nil",
+			ErrAdmissionReservationExceeded)
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.released {
+		return fmt.Errorf("%w: ticket already released", ErrAdmissionReservationExceeded)
+	}
+	if !validPhysicalWriteCost(cost) {
+		return fmt.Errorf("%w: invalid rollback write cost %+v",
+			ErrAdmissionReservationExceeded, cost)
+	}
+	remaining := subtractPhysicalWriteCost(t.reserved.Rollback, t.consumedRollback)
+	if !physicalWriteCostFits(cost, remaining) {
+		return fmt.Errorf("%w: rollback remaining=%+v requested=%+v",
+			ErrAdmissionReservationExceeded, remaining, cost)
+	}
+	t.consumedRollback = addPhysicalWriteCost(t.consumedRollback, cost)
+	return nil
+}
+
+func (t *ExecutionReservationTicket) ReleaseUnused() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.released = true
+}
+
+func validPhysicalWriteCost(cost PhysicalWriteCost) bool {
+	return cost.CPUSetWrites >= 0 && cost.MemsWrites >= 0
+}
+
+func phaseTracePhysicalWriteCost(trace *CompiledPhaseTrace) ExecutionReservationCost {
+	if trace == nil {
+		return ExecutionReservationCost{}
+	}
+	return executionReservationCost(trace.Phases)
+}
+
+func clonePlanOperation(operation PlanOperation) PlanOperation {
+	operation.ExpectedChildUnion = operation.ExpectedChildUnion.Clone()
+	operation.ExpectedCurrent = cloneCPUSetTarget(operation.ExpectedCurrent)
+	operation.Target = cloneCPUSetTarget(operation.Target)
+	return operation
+}
+
+func planOperationsEqual(left, right PlanOperation) bool {
+	return left.PlanID == right.PlanID &&
+		left.Rel == right.Rel &&
+		left.ExpectedIdentity == right.ExpectedIdentity &&
+		left.ExpectedChildren == right.ExpectedChildren &&
+		left.ExpectedChildUnion.Equals(right.ExpectedChildUnion) &&
+		left.ParentRel == right.ParentRel &&
+		left.ExpectedParentIdentity == right.ExpectedParentIdentity &&
+		left.ExpectedCurrent.Mems == right.ExpectedCurrent.Mems &&
+		left.ExpectedCurrent.CPUs.Equals(right.ExpectedCurrent.CPUs) &&
+		left.Target.Mems == right.Target.Mems &&
+		left.Target.CPUs.Equals(right.Target.CPUs) &&
+		left.Direction == right.Direction &&
+		left.OwnsMems == right.OwnsMems &&
+		left.WriteMems == right.WriteMems &&
+		left.Requirement == right.Requirement
+}
