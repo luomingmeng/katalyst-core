@@ -247,6 +247,12 @@ func (f *fakeHierarchyDriver) WriteMems(_ context.Context, rel string, expected 
 	return nil
 }
 
+// PhysicalWriteCount reports how many physical CPU or memory writes have been
+// committed against the live driver. Trace compilation must keep this at zero.
+func (f *fakeHierarchyDriver) PhysicalWriteCount() int {
+	return len(f.writes)
+}
+
 func (f *fakeHierarchyDriver) snapshot() fakeHierarchyState {
 	state := make(fakeHierarchyState, len(f.nodes))
 	for rel, node := range f.nodes {
