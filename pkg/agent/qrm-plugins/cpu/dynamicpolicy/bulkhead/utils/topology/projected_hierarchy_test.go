@@ -17,6 +17,7 @@ limitations under the License.
 package topology
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -234,6 +235,7 @@ func (h *projectedHierarchy) cpuOperation(rel string, configured, target machine
 	return PlanOperation{
 		Rel:                    rel,
 		ExpectedIdentity:       entry.Identity,
+		ExpectedChildren:       ChildrenFingerprint(h.snapshot.Children[rel]),
 		ParentRel:              parentRel,
 		ExpectedParentIdentity: h.snapshot.Entries[parentRel].Identity,
 		ExpectedCurrent:        CPUSetTarget{CPUs: entry.CPUs.Clone(), Mems: entry.Mems},
@@ -252,6 +254,7 @@ func (h *projectedHierarchy) memsOperation(rel, configuredMems, targetMems strin
 	return PlanOperation{
 		Rel:                    rel,
 		ExpectedIdentity:       entry.Identity,
+		ExpectedChildren:       ChildrenFingerprint(h.snapshot.Children[rel]),
 		ParentRel:              parentRel,
 		ExpectedParentIdentity: h.snapshot.Entries[parentRel].Identity,
 		ExpectedCurrent:        CPUSetTarget{CPUs: entry.CPUs.Clone(), Mems: entry.Mems},
@@ -351,26 +354,27 @@ func TestProjectedHierarchyParentGrowUpdatesInheritedDescendants(t *testing.T) {
 	require.Equal(t, "0-3", hierarchy.snapshot.Entries[projectedGrandchildRel].CPUs.String())
 }
 
-// TestProjectedHierarchyParentShrinkUpdatesInheritedDescendants proves inherited
-// descendants shrink with their parent.
-func TestProjectedHierarchyParentShrinkUpdatesInheritedDescendants(t *testing.T) {
+// TestProjectedHierarchyParentShrinkRecursivelyUpdatesInheritedDescendants
+// proves configured-empty v2 descendants inherit the projected parent shrink.
+func TestProjectedHierarchyParentShrinkRecursivelyUpdatesInheritedDescendants(t *testing.T) {
 	hierarchy := projectedHierarchyFixture(t, v2Capabilities())
 
-	err := hierarchy.applyOperation(hierarchy.cpuOperation(
+	operation := hierarchy.cpuOperation(
 		projectedRootRel,
 		machine.MustParse("0-3"),
 		machine.MustParse("0-1"),
-	))
+	)
+	operation.ExpectedChildUnion = machine.MustParse("0-3")
+	err := hierarchy.applyOperation(operation)
 	require.NoError(t, err)
-
+	require.Equal(t, "0-1", hierarchy.snapshot.Entries[projectedRootRel].CPUs.String())
 	require.Equal(t, "0-1", hierarchy.snapshot.Entries[projectedInheritRel].CPUs.String())
 	require.Equal(t, "0-1", hierarchy.snapshot.Entries[projectedGrandchildRel].CPUs.String())
 }
 
-// TestProjectedHierarchyNonEmptyConfiguredDescendantRetainsTarget proves a
-// descendant with its own configured cpuset is not overwritten by parent
-// inheritance, only clamped by kernel containment.
-func TestProjectedHierarchyNonEmptyConfiguredDescendantRetainsTarget(t *testing.T) {
+// TestProjectedHierarchyParentShrinkRejectsConfiguredDescendantOutsideTarget
+// proves a configured-nonempty descendant cannot be silently clamped.
+func TestProjectedHierarchyParentShrinkRejectsConfiguredDescendantOutsideTarget(t *testing.T) {
 	hierarchy := projectedHierarchyFixture(t, v2Capabilities())
 
 	err := hierarchy.applyOperation(hierarchy.cpuOperation(
@@ -382,15 +386,19 @@ func TestProjectedHierarchyNonEmptyConfiguredDescendantRetainsTarget(t *testing.
 	require.Equal(t, "1-2", hierarchy.snapshot.Entries[projectedInheritRel].ConfiguredCPUs.String())
 	require.Equal(t, "1-2", hierarchy.snapshot.Entries[projectedInheritRel].CPUs.String())
 
-	err = hierarchy.applyOperation(hierarchy.cpuOperation(
+	operation := hierarchy.cpuOperation(
 		projectedRootRel,
 		machine.MustParse("0-3"),
 		machine.MustParse("0-1"),
-	))
-	require.NoError(t, err)
-	// The descendant keeps its configured target, clamped into the parent.
+	)
+	operation.ExpectedChildUnion = machine.MustParse("1-2")
+	err = hierarchy.applyOperation(operation)
+	var stale *PlanStaleError
+	require.ErrorAs(t, err, &stale)
+	require.Equal(t, "child_configured_cpuset", stale.Resource)
+	// The rejected parent shrink does not truncate the descendant.
 	require.Equal(t, "1-2", hierarchy.snapshot.Entries[projectedInheritRel].ConfiguredCPUs.String())
-	require.Equal(t, "1", hierarchy.snapshot.Entries[projectedInheritRel].CPUs.String())
+	require.Equal(t, "1-2", hierarchy.snapshot.Entries[projectedInheritRel].CPUs.String())
 }
 
 // TestProjectedHierarchyRejectsInvalidParentContainment proves a grow outside
@@ -420,12 +428,13 @@ func TestProjectedHierarchyCPUAndMemsInheritanceAreIndependent(t *testing.T) {
 	hierarchy.snapshot.Entries[projectedRootRel] = root
 
 	err := hierarchy.applyOperation(hierarchy.memsOperation(projectedInheritRel, "0", ""))
-	require.NoError(t, err)
+	var stale *PlanStaleError
+	require.ErrorAs(t, err, &stale)
+	require.Equal(t, "child_union_cpuset.mems", stale.Resource)
 
 	got := hierarchy.snapshot.Entries[projectedInheritRel]
-	require.Equal(t, "", got.ConfiguredMems)
-	require.Equal(t, "0-1", got.Mems)
-	// CPUs remain inherited from the untouched parent effective set.
+	require.Equal(t, "0", got.ConfiguredMems)
+	require.Equal(t, "0", got.Mems)
 	require.Equal(t, "0-3", got.CPUs.String())
 }
 
@@ -433,6 +442,13 @@ func TestProjectedHierarchyCPUAndMemsInheritanceAreIndependent(t *testing.T) {
 // unions and the snapshot fingerprint so downstream proofs bind to end state.
 func TestProjectedHierarchyRecomputesEvidence(t *testing.T) {
 	hierarchy := projectedHierarchyFixture(t, v2Capabilities())
+	for _, rel := range []string{projectedChildRel, projectedInheritRel, projectedGrandchildRel} {
+		entry := hierarchy.snapshot.Entries[rel]
+		entry.CPUs = machine.MustParse("0-1")
+		entry.ConfiguredCPUs = machine.MustParse("0-1")
+		hierarchy.snapshot.Entries[rel] = entry
+	}
+	require.NoError(t, hierarchy.recomputeEvidence())
 	beforeID := hierarchy.snapshot.ID
 	beforeUnion := hierarchy.snapshot.DomainUnion[DomainPrimary].String()
 
@@ -446,4 +462,609 @@ func TestProjectedHierarchyRecomputesEvidence(t *testing.T) {
 	require.NotEqual(t, beforeID, hierarchy.snapshot.ID)
 	require.NotEqual(t, beforeUnion, hierarchy.snapshot.DomainUnion[DomainPrimary].String())
 	require.Equal(t, "0-1", hierarchy.snapshot.DomainUnion[DomainPrimary].String())
+}
+
+func projectedV2ExternalInheritanceFixture(t *testing.T) *projectedHierarchy {
+	t.Helper()
+	rootIdentity := CgroupIdentity{Device: 1, Inode: 1}
+	childIdentity := CgroupIdentity{Device: 1, Inode: 2}
+	base := &CompleteSnapshot{
+		Capabilities: v2Capabilities(),
+		Entries: map[string]EntryState{
+			projectedRootRel: {
+				Rel: projectedRootRel, Identity: rootIdentity,
+				CPUs: machine.MustParse("0-3"), ConfiguredCPUs: machine.NewCPUSet(),
+				Mems: "0-1", ConfiguredMems: "",
+			},
+			projectedInheritRel: {
+				Rel: projectedInheritRel, Identity: childIdentity,
+				CPUs: machine.MustParse("0-3"), ConfiguredCPUs: machine.NewCPUSet(),
+				Mems: "0-1", ConfiguredMems: "",
+			},
+		},
+		Children: map[string][]ChildRef{
+			projectedRootRel: {{Name: "besteffort", Identity: childIdentity}},
+		},
+		DomainByRel: map[string]DomainID{
+			projectedRootRel: DomainPrimary, projectedInheritRel: DomainPrimary,
+		},
+		DomainUnion: map[DomainID]machine.CPUSet{
+			DomainPrimary: machine.MustParse("0-3"),
+		},
+		ScanBoundary: ScanBoundary{
+			Purpose: ScanForPlan, Roots: []string{projectedRootRel},
+			ExpandedRels: []string{projectedRootRel, projectedInheritRel},
+		},
+	}
+	base.ID = fingerprintSnapshot(base)
+	hierarchy, err := newProjectedHierarchy(base, v2Capabilities())
+	require.NoError(t, err)
+	return hierarchy
+}
+
+func TestProjectedHierarchyV2RootMemsOnlyWritePreservesExternalInheritedCPUs(t *testing.T) {
+	hierarchy := projectedV2ExternalInheritanceFixture(t)
+	root := hierarchy.snapshot.Entries[projectedRootRel]
+	operation := PlanOperation{
+		Rel: projectedRootRel, ExpectedIdentity: root.Identity,
+		ExpectedChildren: ChildrenFingerprint(hierarchy.snapshot.Children[projectedRootRel]),
+		ExpectedCurrent:  CPUSetTarget{CPUs: root.CPUs.Clone(), Mems: root.Mems},
+		Target:           CPUSetTarget{CPUs: root.CPUs.Clone(), Mems: root.Mems},
+		Direction:        WriteGrow, OwnsMems: true, WriteMems: true,
+	}
+
+	require.NoError(t, hierarchy.applyOperation(operation))
+
+	projectedRoot := hierarchy.snapshot.Entries[projectedRootRel]
+	projectedChild := hierarchy.snapshot.Entries[projectedInheritRel]
+	require.True(t, projectedRoot.ConfiguredCPUs.IsEmpty())
+	require.Equal(t, "0-3", projectedRoot.CPUs.String())
+	require.Equal(t, "0-3", projectedChild.CPUs.String())
+	require.Equal(t, "0-3", hierarchy.snapshot.DomainUnion[DomainPrimary].String())
+	require.Equal(t, fingerprintSnapshot(hierarchy.snapshot), hierarchy.snapshot.ID)
+
+	live := newFakeHierarchyDriver()
+	live.capabilities = v2Capabilities()
+	live.add(projectedRootRel, root.Identity, "0-3", "0-1")
+	live.nodes[projectedRootRel].configuredCPUs = machine.NewCPUSet()
+	require.NoError(t, live.WriteMems(context.Background(), projectedRootRel, root.Identity, root.Mems))
+	liveRoot, err := live.ReadEntry(context.Background(), projectedRootRel)
+	require.NoError(t, err)
+	require.Equal(t, liveRoot.CPUs, projectedRoot.CPUs)
+	require.Equal(t, liveRoot.Mems, projectedRoot.Mems)
+}
+
+func TestProjectedHierarchyV2RootCPUOnlyWritePreservesExternalInheritedMems(t *testing.T) {
+	hierarchy := projectedV2ExternalInheritanceFixture(t)
+	root := hierarchy.snapshot.Entries[projectedRootRel]
+	operation := PlanOperation{
+		Rel: projectedRootRel, ExpectedIdentity: root.Identity,
+		ExpectedChildren:   ChildrenFingerprint(hierarchy.snapshot.Children[projectedRootRel]),
+		ExpectedChildUnion: machine.MustParse("0-3"),
+		ExpectedCurrent:    CPUSetTarget{CPUs: root.CPUs.Clone(), Mems: root.Mems},
+		Target:             CPUSetTarget{CPUs: machine.MustParse("0-1"), Mems: root.Mems},
+		Direction:          WriteShrink,
+	}
+
+	require.NoError(t, hierarchy.applyOperation(operation))
+
+	projectedRoot := hierarchy.snapshot.Entries[projectedRootRel]
+	projectedChild := hierarchy.snapshot.Entries[projectedInheritRel]
+	require.Equal(t, "0-1", projectedRoot.CPUs.String())
+	require.Equal(t, "0-1", projectedChild.CPUs.String())
+	require.Empty(t, projectedRoot.ConfiguredMems)
+	require.Equal(t, "0-1", projectedRoot.Mems)
+	require.Equal(t, "0-1", projectedChild.Mems)
+	require.Equal(t, "0-1", hierarchy.snapshot.DomainUnion[DomainPrimary].String())
+	require.Equal(t, fingerprintSnapshot(hierarchy.snapshot), hierarchy.snapshot.ID)
+
+	live := newFakeHierarchyDriver()
+	live.capabilities = v2Capabilities()
+	live.add(projectedRootRel, root.Identity, "0-3", "0-1")
+	live.nodes[projectedRootRel].configuredCPUs = machine.NewCPUSet()
+	require.NoError(t, live.WriteCPUs(
+		context.Background(), projectedRootRel, root.Identity, operation.Target.CPUs,
+	))
+	liveRoot, err := live.ReadEntry(context.Background(), projectedRootRel)
+	require.NoError(t, err)
+	require.Equal(t, liveRoot.CPUs, projectedRoot.CPUs)
+	require.Equal(t, liveRoot.Mems, projectedRoot.Mems)
+}
+
+func TestProjectedHierarchyV2RootInheritanceRequiresInitialEffectiveEvidence(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*EntryState)
+	}{
+		{
+			name: "CPU effective is empty",
+			mutate: func(entry *EntryState) {
+				entry.CPUs = machine.NewCPUSet()
+			},
+		},
+		{
+			name: "mems effective is empty",
+			mutate: func(entry *EntryState) {
+				entry.Mems = ""
+			},
+		},
+		{
+			name: "mems effective is malformed",
+			mutate: func(entry *EntryState) {
+				entry.Mems = "not-a-node-list"
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			base := projectedV2ExternalInheritanceFixture(t).snapshot
+			entry := base.Entries[projectedRootRel]
+			tc.mutate(&entry)
+			base.Entries[projectedRootRel] = entry
+
+			_, err := newProjectedHierarchy(base, v2Capabilities())
+
+			require.Error(t, err)
+			require.ErrorContains(t, err, "external inheritance")
+		})
+	}
+}
+
+func TestProjectedHierarchyJointWriteMatchesSafeWriterPhaseAndFinalSnapshot(t *testing.T) {
+	const (
+		rootRel  = "root"
+		childRel = "root/child"
+	)
+	rootIdentity := CgroupIdentity{Device: 1, Inode: 1}
+	childIdentity := CgroupIdentity{Device: 1, Inode: 2}
+	capabilities := v2Capabilities()
+	initialCPUs := machine.NewCPUSet(0)
+	targetCPUs := machine.MustParse("0-1")
+
+	base := &CompleteSnapshot{
+		Capabilities: capabilities,
+		Entries: map[string]EntryState{
+			rootRel: {
+				Rel: rootRel, Identity: rootIdentity,
+				CPUs: machine.MustParse("0-3"), ConfiguredCPUs: machine.MustParse("0-3"),
+				Mems: "0-1", ConfiguredMems: "0-1",
+			},
+			childRel: {
+				Rel: childRel, Identity: childIdentity,
+				CPUs: initialCPUs.Clone(), ConfiguredCPUs: initialCPUs.Clone(),
+				Mems: "0", ConfiguredMems: "0",
+			},
+		},
+		Children: map[string][]ChildRef{
+			rootRel: {{Name: "child", Identity: childIdentity}},
+		},
+		DomainByRel: map[string]DomainID{
+			rootRel: DomainPrimary, childRel: DomainPrimary,
+		},
+		DomainUnion: map[DomainID]machine.CPUSet{
+			DomainPrimary: machine.MustParse("0-3"),
+		},
+		ScanBoundary: ScanBoundary{
+			Purpose: ScanForPlan, Roots: []string{rootRel}, ExpandedRels: []string{rootRel, childRel},
+		},
+	}
+	base.ID = fingerprintSnapshot(base)
+
+	operation := PlanOperation{
+		Rel: childRel, ExpectedIdentity: childIdentity,
+		ExpectedChildren: ChildrenFingerprint(nil), ExpectedChildUnion: machine.NewCPUSet(),
+		ParentRel: rootRel, ExpectedParentIdentity: rootIdentity,
+		ExpectedCurrent: CPUSetTarget{CPUs: initialCPUs.Clone(), Mems: "0"},
+		Target:          CPUSetTarget{CPUs: targetCPUs.Clone(), Mems: "0-1"},
+		Direction:       WriteGrow, OwnsMems: true, WriteMems: true,
+	}
+	plan := PhasePlan{
+		ConvergenceID: "joint-cpu-mems",
+		Kind:          PhaseExpand,
+		Capabilities:  capabilities,
+		Operations:    []PlanOperation{operation},
+	}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	plan.Operations[0].PlanID = plan.PlanID
+
+	projected, err := newProjectedHierarchy(base, capabilities)
+	require.NoError(t, err)
+	require.NoError(t, projected.applyOperation(plan.Operations[0]))
+
+	live := newFakeHierarchyDriver()
+	live.capabilities = capabilities
+	live.allowUnwitnessedExpansion = true
+	live.add(rootRel, rootIdentity, "0-3", "0-1")
+	live.add(childRel, childIdentity, "0", "0")
+	result := &ConvergenceResult{}
+	require.NoError(t, newSafeCPUSetWriter(
+		live, NewBudgetTracker(ConvergenceBudget{}), result,
+	).execute(context.Background(), plan))
+
+	require.Len(t, live.writes, 2)
+	require.Equal(t, initialCPUs, live.writes[0].cpus)
+	require.Equal(t, "0-1", live.writes[0].mems)
+	require.Equal(t, targetCPUs, live.writes[1].cpus)
+	require.Equal(t, "0-1", live.writes[1].mems)
+
+	projectedEntry := projected.snapshot.Entries[childRel]
+	liveEntry, err := live.ReadEntry(context.Background(), childRel)
+	require.NoError(t, err)
+	require.Equal(t, liveEntry.CPUs, projectedEntry.CPUs)
+	require.Equal(t, liveEntry.Mems, projectedEntry.Mems)
+	require.Equal(t, liveEntry.ConfiguredCPUs, projectedEntry.ConfiguredCPUs)
+	require.Equal(t, liveEntry.ConfiguredMems, projectedEntry.ConfiguredMems)
+	require.Len(t, result.Journal, 1)
+	require.Equal(t, plan.Operations[0].Target, result.Journal[0].Target)
+	require.Equal(t, CPUSetTarget{CPUs: projectedEntry.CPUs, Mems: projectedEntry.Mems}, result.Journal[0].Observed)
+}
+
+func TestProjectedHierarchyJointGrowRejectsMemsOutsideParentLikeSafeWriter(t *testing.T) {
+	const (
+		rootRel  = "root"
+		childRel = "root/child"
+	)
+	rootIdentity := CgroupIdentity{Device: 1, Inode: 1}
+	childIdentity := CgroupIdentity{Device: 1, Inode: 2}
+	capabilities := v2Capabilities()
+	initialCPUs := machine.NewCPUSet(0)
+	targetCPUs := machine.MustParse("0-1")
+	operation := PlanOperation{
+		Rel: childRel, ExpectedIdentity: childIdentity,
+		ExpectedChildren: ChildrenFingerprint(nil), ExpectedChildUnion: machine.NewCPUSet(),
+		ParentRel: rootRel, ExpectedParentIdentity: rootIdentity,
+		ExpectedCurrent: CPUSetTarget{CPUs: initialCPUs.Clone(), Mems: "0"},
+		Target:          CPUSetTarget{CPUs: targetCPUs.Clone(), Mems: "0-1"},
+		Direction:       WriteGrow, OwnsMems: true, WriteMems: true,
+	}
+	plan := PhasePlan{
+		ConvergenceID: "joint-grow-invalid-parent-mems",
+		Kind:          PhaseExpand,
+		Capabilities:  capabilities,
+		Operations:    []PlanOperation{operation},
+	}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	plan.Operations[0].PlanID = plan.PlanID
+
+	base := &CompleteSnapshot{
+		Capabilities: capabilities,
+		Entries: map[string]EntryState{
+			rootRel: {
+				Rel: rootRel, Identity: rootIdentity,
+				CPUs: machine.MustParse("0-3"), ConfiguredCPUs: machine.MustParse("0-3"),
+				Mems: "0", ConfiguredMems: "0",
+			},
+			childRel: {
+				Rel: childRel, Identity: childIdentity,
+				CPUs: initialCPUs.Clone(), ConfiguredCPUs: initialCPUs.Clone(),
+				Mems: "0", ConfiguredMems: "0",
+			},
+		},
+		Children: map[string][]ChildRef{
+			rootRel: {{Name: "child", Identity: childIdentity}},
+		},
+		DomainByRel: map[string]DomainID{
+			rootRel: DomainPrimary, childRel: DomainPrimary,
+		},
+		DomainUnion: map[DomainID]machine.CPUSet{
+			DomainPrimary: machine.MustParse("0-3"),
+		},
+		ScanBoundary: ScanBoundary{
+			Purpose: ScanForPlan, Roots: []string{rootRel}, ExpandedRels: []string{rootRel, childRel},
+		},
+	}
+	base.ID = fingerprintSnapshot(base)
+
+	projected, err := newProjectedHierarchy(base, capabilities)
+	require.NoError(t, err)
+	projectedBefore := CloneCompleteSnapshot(projected.snapshot)
+	projectedErr := projected.applyOperation(plan.Operations[0])
+
+	live := newFakeHierarchyDriver()
+	live.capabilities = capabilities
+	live.allowUnwitnessedExpansion = true
+	live.add(rootRel, rootIdentity, "0-3", "0")
+	live.add(childRel, childIdentity, "0", "0")
+	liveErr := newSafeCPUSetWriter(
+		live, NewBudgetTracker(ConvergenceBudget{}), &ConvergenceResult{},
+	).execute(context.Background(), plan)
+
+	var projectedStale, liveStale *PlanStaleError
+	require.ErrorAs(t, projectedErr, &projectedStale)
+	require.ErrorAs(t, liveErr, &liveStale)
+	require.Equal(t, "parent_cpuset.mems", liveStale.Resource)
+	require.Equal(t, liveStale.Resource, projectedStale.Resource)
+	require.Equal(t, liveStale.Current, projectedStale.Current)
+	require.Equal(t, liveStale.Target, projectedStale.Target)
+	require.Equal(t, projectedBefore, projected.snapshot)
+	require.Zero(t, live.PhysicalWriteCount())
+}
+
+func TestProjectedHierarchyRejectedJointWriteIsAtomic(t *testing.T) {
+	tests := []struct {
+		name         string
+		capabilities HierarchyCapabilities
+		parentCPUs   machine.CPUSet
+		targetCPUs   machine.CPUSet
+		wantErr      error
+	}{
+		{
+			name:         "v1 empty CPU target",
+			capabilities: v1Capabilities(),
+			parentCPUs:   machine.MustParse("0-3"),
+			targetCPUs:   machine.NewCPUSet(),
+			wantErr:      ErrEmptyCPUSetUnsupported,
+		},
+		{
+			name:         "v2 target outside parent",
+			capabilities: v2Capabilities(),
+			parentCPUs:   machine.MustParse("0-1"),
+			targetCPUs:   machine.MustParse("0-3"),
+			wantErr:      ErrProjectedParentContainment,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			hierarchy := projectedHierarchyFixture(t, tc.capabilities)
+			hierarchy.setParentTarget(tc.parentCPUs)
+			require.NoError(t, hierarchy.recomputeEffectiveSubtree(projectedRootRel))
+			entry := hierarchy.snapshot.Entries[projectedInheritRel]
+			entry.CPUs = machine.NewCPUSet(0)
+			entry.ConfiguredCPUs = machine.NewCPUSet(0)
+			hierarchy.snapshot.Entries[projectedInheritRel] = entry
+			require.NoError(t, hierarchy.recomputeEvidence())
+			before := CloneCompleteSnapshot(hierarchy.snapshot)
+			direction := WriteGrow
+			if tc.targetCPUs.IsSubsetOf(entry.CPUs) {
+				direction = WriteShrink
+			}
+			operation := PlanOperation{
+				Rel: projectedInheritRel, ExpectedIdentity: entry.Identity,
+				ExpectedChildren:       ChildrenFingerprint(hierarchy.snapshot.Children[projectedInheritRel]),
+				ParentRel:              projectedRootRel,
+				ExpectedParentIdentity: hierarchy.snapshot.Entries[projectedRootRel].Identity,
+				ExpectedCurrent:        CPUSetTarget{CPUs: entry.CPUs.Clone(), Mems: entry.Mems},
+				Target:                 CPUSetTarget{CPUs: tc.targetCPUs.Clone(), Mems: "1"},
+				Direction:              direction,
+				OwnsMems:               true,
+				WriteMems:              true,
+			}
+
+			err := hierarchy.applyOperation(operation)
+			require.ErrorIs(t, err, tc.wantErr)
+			require.Equal(t, before.Entries[projectedInheritRel], hierarchy.snapshot.Entries[projectedInheritRel])
+			require.Equal(t, before.ID, hierarchy.snapshot.ID)
+			require.Equal(t, before.DomainUnion, hierarchy.snapshot.DomainUnion)
+		})
+	}
+}
+
+func TestProjectedHierarchyRejectsStalePredecessorBeforeMutation(t *testing.T) {
+	tests := []struct {
+		name         string
+		wantResource string
+		mutate       func(*PlanOperation)
+	}{
+		{
+			name:         "expected cpus",
+			wantResource: "cpuset.cpus",
+			mutate: func(operation *PlanOperation) {
+				operation.ExpectedCurrent.CPUs = machine.NewCPUSet(3)
+			},
+		},
+		{
+			name:         "expected mems",
+			wantResource: "cpuset.mems",
+			mutate: func(operation *PlanOperation) {
+				operation.ExpectedCurrent.Mems = "1"
+			},
+		},
+		{
+			name:         "expected identity",
+			wantResource: "identity",
+			mutate: func(operation *PlanOperation) {
+				operation.ExpectedIdentity = CgroupIdentity{Device: 9, Inode: 9}
+			},
+		},
+		{
+			name:         "expected parent identity",
+			wantResource: "parent_identity",
+			mutate: func(operation *PlanOperation) {
+				operation.ExpectedParentIdentity = CgroupIdentity{Device: 9, Inode: 9}
+			},
+		},
+		{
+			name:         "expected children fingerprint",
+			wantResource: "children",
+			mutate: func(operation *PlanOperation) {
+				operation.ExpectedChildren = "stale-children"
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			hierarchy := projectedHierarchyFixture(t, v2Capabilities())
+			operation := hierarchy.cpuOperation(
+				projectedChildRel,
+				machine.NewCPUSet(),
+				machine.NewCPUSet(0),
+			)
+			operation.ParentRel = projectedRootRel
+			operation.ExpectedParentIdentity = hierarchy.snapshot.Entries[projectedRootRel].Identity
+			operation.ExpectedChildren = ChildrenFingerprint(hierarchy.snapshot.Children[projectedChildRel])
+			operation.WriteMems = true
+			operation.OwnsMems = true
+			operation.Target.Mems = "0-1"
+			tc.mutate(&operation)
+			before := CloneCompleteSnapshot(hierarchy.snapshot)
+
+			err := hierarchy.applyOperation(operation)
+
+			var stale *PlanStaleError
+			require.ErrorAs(t, err, &stale)
+			require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+			require.Equal(t, tc.wantResource, stale.Resource)
+			if tc.wantResource == "identity" || tc.wantResource == "parent_identity" {
+				require.ErrorIs(t, stale.Err, ErrCgroupIdentityChanged)
+			}
+			require.Equal(t, before, hierarchy.snapshot)
+		})
+	}
+}
+
+func TestProjectedHierarchyParentShrinkRejectsChildCPUUnionBeforeMutation(t *testing.T) {
+	tests := []struct {
+		name               string
+		childCPUs          machine.CPUSet
+		expectedChildUnion machine.CPUSet
+		targetCPUs         machine.CPUSet
+	}{
+		{
+			name:               "expected child union outside target",
+			childCPUs:          machine.NewCPUSet(0),
+			expectedChildUnion: machine.MustParse("0-1"),
+			targetCPUs:         machine.NewCPUSet(0),
+		},
+		{
+			name:               "projected live child union outside target",
+			childCPUs:          machine.MustParse("0-1"),
+			expectedChildUnion: machine.NewCPUSet(0),
+			targetCPUs:         machine.NewCPUSet(0),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			hierarchy := projectedHierarchyFixture(t, v2Capabilities())
+			child := hierarchy.snapshot.Entries[projectedChildRel]
+			child.CPUs = tc.childCPUs.Clone()
+			child.ConfiguredCPUs = tc.childCPUs.Clone()
+			hierarchy.snapshot.Entries[projectedChildRel] = child
+			require.NoError(t, hierarchy.recomputeEvidence())
+
+			operation := hierarchy.cpuOperation(
+				projectedRootRel,
+				machine.MustParse("0-3"),
+				tc.targetCPUs,
+			)
+			operation.ExpectedChildUnion = tc.expectedChildUnion.Clone()
+			before := CloneCompleteSnapshot(hierarchy.snapshot)
+
+			err := hierarchy.applyOperation(operation)
+
+			var stale *PlanStaleError
+			require.ErrorAs(t, err, &stale)
+			require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+			require.Equal(t, before, hierarchy.snapshot)
+		})
+	}
+}
+
+func TestProjectedHierarchyJointMemsShrinkRejectsChildUnionBeforeMutation(t *testing.T) {
+	hierarchy := projectedHierarchyFixture(t, v2Capabilities())
+	root := hierarchy.snapshot.Entries[projectedRootRel]
+	root.Mems = "0-1"
+	root.ConfiguredMems = "0-1"
+	hierarchy.snapshot.Entries[projectedRootRel] = root
+	child := hierarchy.snapshot.Entries[projectedChildRel]
+	child.Mems = "1"
+	child.ConfiguredMems = "1"
+	hierarchy.snapshot.Entries[projectedChildRel] = child
+	require.NoError(t, hierarchy.recomputeEvidence())
+
+	operation := hierarchy.cpuOperation(
+		projectedRootRel,
+		machine.MustParse("0-3"),
+		machine.MustParse("0-3"),
+	)
+	operation.Direction = WriteShrink
+	operation.ExpectedChildUnion = machine.MustParse("0-3")
+	operation.ExpectedCurrent.Mems = "0-1"
+	operation.Target.Mems = "0"
+	operation.OwnsMems = true
+	operation.WriteMems = true
+	before := CloneCompleteSnapshot(hierarchy.snapshot)
+
+	err := hierarchy.applyOperation(operation)
+
+	var stale *PlanStaleError
+	require.ErrorAs(t, err, &stale)
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	require.Equal(t, "child_union_cpuset.mems", stale.Resource)
+	require.Equal(t, before, hierarchy.snapshot)
+}
+
+func TestProjectedHierarchyParentShrinkMatchesSafeWriterUnavailableChildSkip(t *testing.T) {
+	const (
+		rootRel  = "root"
+		childRel = "root/dynamic"
+	)
+	rootIdentity := CgroupIdentity{Device: 1, Inode: 1}
+	childIdentity := CgroupIdentity{Device: 1, Inode: 2}
+	capabilities := v2Capabilities()
+	base := &CompleteSnapshot{
+		Capabilities: capabilities,
+		Entries: map[string]EntryState{
+			rootRel: {
+				Rel: rootRel, Identity: rootIdentity,
+				CPUs: machine.MustParse("0-3"), ConfiguredCPUs: machine.MustParse("0-3"),
+				Mems: "0", ConfiguredMems: "0",
+			},
+		},
+		Children: map[string][]ChildRef{
+			rootRel: {{Name: "dynamic", Identity: childIdentity}},
+		},
+		UnavailableChildren: map[string]UnavailableChildEvidence{
+			childRel: {
+				Identity: childIdentity,
+				Reason:   UnavailableChildReasonControllerUnavailable,
+			},
+		},
+		DomainByRel: map[string]DomainID{rootRel: DomainPrimary},
+		DomainUnion: map[DomainID]machine.CPUSet{
+			DomainPrimary: machine.MustParse("0-3"),
+		},
+		ScanBoundary: ScanBoundary{
+			Purpose: ScanForPlan, Roots: []string{rootRel}, ExpandedRels: []string{rootRel},
+		},
+	}
+	base.ID = fingerprintSnapshot(base)
+	operation := PlanOperation{
+		Rel: rootRel, ExpectedIdentity: rootIdentity,
+		ExpectedChildren:   ChildrenFingerprint(base.Children[rootRel]),
+		ExpectedChildUnion: machine.NewCPUSet(),
+		ExpectedCurrent: CPUSetTarget{
+			CPUs: machine.MustParse("0-3"), Mems: "0",
+		},
+		Target: CPUSetTarget{
+			CPUs: machine.MustParse("0-1"), Mems: "0",
+		},
+		Direction: WriteShrink,
+	}
+	plan := PhasePlan{
+		ConvergenceID: "unavailable-child-shrink", Kind: PhaseDrain,
+		Base: base, Capabilities: capabilities, Operations: []PlanOperation{operation},
+	}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	plan.Operations[0].PlanID = plan.PlanID
+
+	projected, err := newProjectedHierarchy(base, capabilities)
+	require.NoError(t, err)
+	require.NoError(t, projected.applyOperation(plan.Operations[0]))
+
+	live := newFakeHierarchyDriver()
+	live.capabilities = capabilities
+	live.add(rootRel, rootIdentity, "0-3", "0")
+	live.add(childRel, childIdentity, "0-1", "0")
+	live.beforeCall = func(op HierarchyOperation, rel string) error {
+		if op == HierarchyOperationRead && rel == childRel {
+			return ErrCgroupControllerUnavailable
+		}
+		return nil
+	}
+	require.NoError(t, newSafeCPUSetWriter(
+		live, NewBudgetTracker(ConvergenceBudget{}), &ConvergenceResult{},
+	).execute(context.Background(), plan))
+	require.Equal(t, live.nodes[rootRel].cpus, projected.snapshot.Entries[rootRel].CPUs)
 }

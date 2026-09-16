@@ -126,6 +126,9 @@ func TestAdmissionReservationChargesPhysicalWrites(t *testing.T) {
 			plan, driver := admissionReservationPlanForTest(t, tc.currentCPUs, tc.targetCPUs, tc.currentMems, tc.targetMems)
 			round := admissionReservationRoundForTest(driver, tc.wantBudget, plan.PlanID)
 
+			if err := round.reserveAdmissionClosure(plan); err != nil {
+				t.Fatalf("reserveAdmissionClosure() error = %v", err)
+			}
 			if err := round.executePlan(context.Background(), plan, &ConvergenceResult{}); err != nil {
 				t.Fatalf("executePlan() error = %v", err)
 			}
@@ -173,7 +176,7 @@ func TestAdmissionReservationRejectsBeforeAnyPhysicalWrite(t *testing.T) {
 			round := admissionReservationRoundForTest(driver, 1, plan.PlanID)
 			result := &ConvergenceResult{}
 
-			err := round.executePlan(context.Background(), plan, result)
+			err := round.reserveAdmissionClosure(plan)
 			if !errors.Is(err, ErrAdmissionReservationExceeded) {
 				t.Errorf("executePlan() error = %v, want ErrAdmissionReservationExceeded", err)
 			}
@@ -208,7 +211,7 @@ func TestAdmissionReservationRejectsBeforeAnyPhysicalWrite(t *testing.T) {
 	round := admissionReservationRoundForTest(driver, 3, required.PlanID)
 	result := &ConvergenceResult{}
 
-	err = round.executePlan(context.Background(), *required, result)
+	err = round.reserveAdmissionClosure(*required)
 	if !errors.Is(err, ErrAdmissionReservationExceeded) {
 		t.Errorf("executePlan() error = %v, want ErrAdmissionReservationExceeded", err)
 	}
@@ -238,7 +241,7 @@ func TestAdmissionReservationLocksCanonicalClosureBeforeIntermediateDrain(t *tes
 	plan.Operations[0].PlanID = plan.PlanID
 	round := admissionReservationRoundForTest(driver, 3, plan.PlanID)
 
-	err := round.executePlan(context.Background(), plan, &ConvergenceResult{})
+	err := round.reserveAdmissionClosure(plan)
 	if !errors.Is(err, ErrAdmissionReservationExceeded) {
 		t.Fatalf("executePlan() error = %v, want ErrAdmissionReservationExceeded", err)
 	}
@@ -261,7 +264,7 @@ func TestAdmissionReservationRejectsUnprovableRequiredClosureBeforeWrite(t *test
 		"root": machine.MustParse("0-2"),
 	}
 
-	err := round.executePlan(context.Background(), plan, &ConvergenceResult{})
+	err := round.reserveAdmissionClosure(plan)
 	require.Error(t, err)
 	require.ErrorContains(t, err, "required admission closure does not prove parent safety")
 	require.Zero(t, driver.writeCPUs)
@@ -279,6 +282,9 @@ func TestAdmissionReservationIsCumulativeAcrossPlans(t *testing.T) {
 	round := admissionReservationRoundForTest(driver, 2, first.PlanID)
 	result := &ConvergenceResult{}
 
+	if err := round.reserveAdmissionClosure(first); err != nil {
+		t.Fatalf("reserveAdmissionClosure() error = %v", err)
+	}
 	if err := round.executePlan(context.Background(), first, result); err != nil {
 		t.Fatalf("first executePlan() error = %v", err)
 	}
@@ -368,6 +374,7 @@ func TestAdmissionReservationRollsBackMemsWhenCPUWriteFails(t *testing.T) {
 	driver.failWriteCPUs = true
 	round := admissionReservationRoundForTest(driver, 4, plan.PlanID)
 
+	require.NoError(t, round.reserveAdmissionClosure(plan))
 	err := round.executePlan(context.Background(), plan, &ConvergenceResult{})
 	if err == nil {
 		t.Fatal("executePlan() error = nil, want CPU write failure")
@@ -391,6 +398,7 @@ func TestAdmissionReservationRollsBackBothWritesWhenFreshReadBackFails(t *testin
 	driver.failReadAt = 2
 	round := admissionReservationRoundForTest(driver, 4, plan.PlanID)
 
+	require.NoError(t, round.reserveAdmissionClosure(plan))
 	err := round.executePlan(context.Background(), plan, &ConvergenceResult{})
 	if err == nil {
 		t.Fatal("executePlan() error = nil, want fresh read-back failure")
@@ -440,6 +448,7 @@ func TestAdmissionReservationRejectsFalseSuccessAndRollsBack(t *testing.T) {
 	driver.ignoreCPUWrite = true
 	round := admissionReservationRoundForTest(driver, 2, plan.PlanID)
 
+	require.NoError(t, round.reserveAdmissionClosure(plan))
 	err := round.executePlan(context.Background(), plan, &ConvergenceResult{})
 	if err == nil {
 		t.Fatal("executePlan() error = nil, want fresh read-back mismatch")
@@ -461,6 +470,7 @@ func TestAdmissionReservationReportsRollbackWriteFailure(t *testing.T) {
 	driver.failWriteMemsAt = 2
 	round := admissionReservationRoundForTest(driver, 4, plan.PlanID)
 
+	require.NoError(t, round.reserveAdmissionClosure(plan))
 	err := round.executePlan(context.Background(), plan, &ConvergenceResult{})
 	require.Error(t, err)
 	require.ErrorContains(t, err, "injected CPU write failure")

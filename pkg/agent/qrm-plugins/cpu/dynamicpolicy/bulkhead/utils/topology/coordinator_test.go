@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"syscall"
@@ -3130,6 +3131,43 @@ func TestTopologyCoordinatorConvergePostWriteRestoreUsesRoundBudget(t *testing.T
 		if round.Journal[0].Observed.CPUs.Equals(round.Journal[0].Target.CPUs) {
 			t.Fatalf("round[%d] journal = %+v, want restored observation to prove no net progress", i, round.Journal)
 		}
+	}
+}
+
+func TestLiveFixedPointSessionReturnsJournalPrefixOnStale(t *testing.T) {
+	t.Parallel()
+
+	dag, err := BuildDAG([]NodeSpec{{
+		Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1), Mems: "0",
+	}})
+	if err != nil {
+		t.Fatalf("BuildDAG: %v", err)
+	}
+	cg := newTopologyFakeCgroup()
+	cg.cpus["primary"] = machine.NewCPUSet(0)
+	cg.afterApply = func(rel string, _ *cgcommon.CPUSetData) {
+		if rel == "primary" {
+			cg.cpus[rel] = machine.NewCPUSet(0)
+		}
+	}
+
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
+		DAG:        dag,
+		Cgroup:     cg,
+		CPUDetails: machine.CPUDetails{0: {}, 1: {}},
+		Budget:     ConvergenceBudget{MaxRounds: 1},
+	})
+	if !errors.Is(err, ErrRoundBudgetExceeded) {
+		t.Fatalf("Converge error = %T %v, want round budget exhaustion; result=%+v", err, err, res)
+	}
+	if len(res.Rounds) != 1 || res.Rounds[0].Status != RoundStatusStale {
+		t.Fatalf("rounds=%+v, want one stale single-round engine outcome", res.Rounds)
+	}
+	if len(res.Journal) != 1 || len(res.Rounds[0].Journal) != 1 {
+		t.Fatalf("result journal=%+v round journal=%+v, want the live safe-writer prefix", res.Journal, res.Rounds[0].Journal)
+	}
+	if !reflect.DeepEqual(res.Journal[0], res.Rounds[0].Journal[0]) {
+		t.Fatalf("round journal=%+v, want exact result journal prefix=%+v", res.Rounds[0].Journal, res.Journal)
 	}
 }
 

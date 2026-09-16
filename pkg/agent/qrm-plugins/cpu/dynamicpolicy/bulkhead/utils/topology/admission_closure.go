@@ -140,26 +140,7 @@ func proveAdmissionRequiredClosure(
 }
 
 func cloneAdmissionSnapshot(snapshot *CompleteSnapshot) *CompleteSnapshot {
-	out := *snapshot
-	out.Entries = make(map[string]EntryState, len(snapshot.Entries))
-	for rel, entry := range snapshot.Entries {
-		entry.CPUs = entry.CPUs.Clone()
-		entry.ConfiguredCPUs = entry.ConfiguredCPUs.Clone()
-		out.Entries[rel] = entry
-	}
-	out.Children = make(map[string][]ChildRef, len(snapshot.Children))
-	for rel, children := range snapshot.Children {
-		out.Children[rel] = append([]ChildRef(nil), children...)
-	}
-	out.DomainByRel = make(map[string]DomainID, len(snapshot.DomainByRel))
-	for rel, domain := range snapshot.DomainByRel {
-		out.DomainByRel[rel] = domain
-	}
-	out.DomainUnion = make(map[DomainID]machine.CPUSet, len(snapshot.DomainUnion))
-	for domain, cpus := range snapshot.DomainUnion {
-		out.DomainUnion[domain] = cpus.Clone()
-	}
-	return &out
+	return CloneCompleteSnapshot(snapshot)
 }
 
 func projectAdmissionOperation(snapshot *CompleteSnapshot, operation PlanOperation) error {

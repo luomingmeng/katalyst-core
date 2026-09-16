@@ -18,6 +18,8 @@ package topology
 
 import (
 	"context"
+	"errors"
+	"sort"
 	"strings"
 	"testing"
 
@@ -59,7 +61,6 @@ type admissionTraceFixture struct {
 // can never make progress.
 type recordingProjectedDriver struct {
 	IgnoreWrites bool
-	writes       []fakeHierarchyWrite
 }
 
 // liveTraceSession adapts the live fake driver to the phase execution session
@@ -80,26 +81,42 @@ func (s *liveTraceSession) Snapshot(ctx context.Context) (*CompleteSnapshot, err
 	return s.round.snapshotSource(ctx)
 }
 
-func (s *liveTraceSession) Apply(ctx context.Context, phase PhaseKind, operations []PlanOperation) error {
-	for _, op := range operations {
+func (*liveTraceSession) PrepareRound(PhasePlan) error {
+	return nil
+}
+
+func (s *liveTraceSession) Apply(ctx context.Context, plan PhasePlan) (phaseSessionApplyResult, error) {
+	result := phaseSessionApplyResult{}
+	for _, op := range plan.Operations {
 		if op.WriteMems {
 			if err := s.round.driver.WriteMems(ctx, op.Rel, op.ExpectedIdentity, op.Target.Mems); err != nil {
-				return err
+				return result, err
 			}
-			continue
 		}
-		if err := s.round.driver.WriteCPUs(ctx, op.Rel, op.ExpectedIdentity, op.Target.CPUs); err != nil {
-			return err
+		if !op.ExpectedCurrent.CPUs.Equals(op.Target.CPUs) {
+			if err := s.round.driver.WriteCPUs(ctx, op.Rel, op.ExpectedIdentity, op.Target.CPUs); err != nil {
+				return result, err
+			}
 		}
+		result.Applied++
+		result.Journal = append(result.Journal, AppliedPlanOperation{
+			PlanID: op.PlanID, Rel: op.Rel, Direction: op.Direction,
+			Target: op.Target, Observed: op.Target,
+		})
 	}
-	return nil
+	return result, nil
+}
+
+func (s *liveTraceSession) Capabilities() HierarchyCapabilities {
+	return s.round.driver.Capabilities()
 }
 
 // projectedTraceSession adapts a clone-backed projectedHierarchy to the phase
 // execution session contract. Snapshot returns an isolated clone so the engine
 // can freeze plan.Base before Apply mutates the projection in place.
 type projectedTraceSession struct {
-	hierarchy *projectedHierarchy
+	hierarchy    *projectedHierarchy
+	ignoreWrites bool
 }
 
 func newProjectedTraceSession(t *testing.T, base *CompleteSnapshot, capabilities HierarchyCapabilities) *projectedTraceSession {
@@ -113,13 +130,30 @@ func (s *projectedTraceSession) Snapshot(_ context.Context) (*CompleteSnapshot, 
 	return CloneCompleteSnapshot(s.hierarchy.snapshot), nil
 }
 
-func (s *projectedTraceSession) Apply(_ context.Context, _ PhaseKind, operations []PlanOperation) error {
-	for _, operation := range operations {
-		if err := s.hierarchy.applyOperation(operation); err != nil {
-			return err
-		}
-	}
+func (*projectedTraceSession) PrepareRound(PhasePlan) error {
 	return nil
+}
+
+func (s *projectedTraceSession) Apply(_ context.Context, plan PhasePlan) (phaseSessionApplyResult, error) {
+	if s.ignoreWrites {
+		return phaseSessionApplyResult{}, nil
+	}
+	result := phaseSessionApplyResult{}
+	for _, operation := range plan.Operations {
+		if err := s.hierarchy.applyOperation(operation); err != nil {
+			return result, err
+		}
+		result.Applied++
+		result.Journal = append(result.Journal, AppliedPlanOperation{
+			PlanID: operation.PlanID, Rel: operation.Rel, Direction: operation.Direction,
+			Target: operation.Target, Observed: operation.Target,
+		})
+	}
+	return result, nil
+}
+
+func (s *projectedTraceSession) Capabilities() HierarchyCapabilities {
+	return s.hierarchy.capabilities
 }
 
 func newAdmissionTraceFixture(t *testing.T) *admissionTraceFixture {
@@ -212,10 +246,47 @@ func (f *admissionTraceFixture) setCanonicalTarget(rel, cpus string) {
 
 func (f *admissionTraceFixture) configureStagedSMTTransferWithDynamicDescendant() {
 	f.selection.MaxCPUsDrainRatio = 0.5
-	f.addPrimary("kubepods", "0-3", "0")
+	f.driver.capabilities = cgroupV2Policy.capabilities(true)
+	f.round.allowEmptyTarget = true
+	f.cpuDetails[4] = machine.CPUTopoInfo{NUMANodeID: 0}
+	f.addPrimary("kubepods", "1-3", "0")
 	f.addDynamicDescendant("kubepods/besteffort", "1-3", "0")
-	f.addReclaim("reclaimed-0", "0", "0")
+	f.addReclaim("reclaimed", "4", "0")
+	f.addReclaim("reclaimed/leaf", "0", "0")
+	f.specs[len(f.specs)-1].CPUs = machine.NewCPUSet()
+	f.targetByRel["reclaimed/leaf"] = machine.NewCPUSet()
 	f.requireCPUSet("kubepods", "0-3")
+	f.requireCPUSet("kubepods/besteffort", "0-3")
+}
+
+func (f *admissionTraceFixture) configureMultiFrontierParentSafeDrain() {
+	f.driver.capabilities = cgroupV2Policy.capabilities(true)
+	f.addPrimary("kubepods", "0-3", "0")
+	f.addDynamicDescendant("kubepods/besteffort", "0-3", "0")
+	f.addReclaim("reclaimed", "4", "0")
+	f.targetByRel["kubepods"] = machine.MustParse("0-2")
+	f.targetByRel["kubepods/besteffort"] = machine.MustParse("0-2")
+	f.dynamicByRel["kubepods/besteffort"] = machine.MustParse("0-2")
+	f.requireCPUSet("reclaimed", "3-4")
+}
+
+func (f *admissionTraceFixture) addUnavailableDynamicChild(rel, cpus, mems string) {
+	f.driver.add(rel, CgroupIdentity{Device: 1, Inode: f.allocInode()}, cpus, mems)
+	f.driver.beforeCall = func(op HierarchyOperation, candidate string) error {
+		if op == HierarchyOperationRead && candidate == rel {
+			return ErrCgroupControllerUnavailable
+		}
+		return nil
+	}
+}
+
+func (f *admissionTraceFixture) configureProtectedDeferredEvaluationInputs() {
+	f.addDynamicDescendant("kubepods/deferred", "1-3", "0")
+	f.targetByRel["kubepods/deferred"] = machine.MustParse("0-3")
+	f.round.protectedPending = machine.NewCPUSet(1)
+	f.round.deferredByRel = map[string]machine.CPUSet{
+		"kubepods/deferred": machine.MustParse("1-3"),
+	}
 }
 
 // snapshot wires the round to the current fixture topology and returns a fresh
@@ -285,11 +356,7 @@ func traceContainsOperation(
 
 func TestCompileFixedPointTraceIncludesStagedDynamicDescendantGrow(t *testing.T) {
 	fixture := newAdmissionTraceFixture(t)
-	fixture.selection.MaxCPUsDrainRatio = 0.5
-	fixture.addPrimary("kubepods", "0-3", "0")
-	fixture.addDynamicDescendant("kubepods/besteffort", "1-3", "0")
-	fixture.addReclaim("reclaimed-0", "0", "0")
-	fixture.requireCPUSet("kubepods", "0-3")
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
 
 	trace, err := fixture.round.compileFixedPointTrace(
 		context.Background(),
@@ -305,6 +372,16 @@ func TestCompileFixedPointTraceIncludesStagedDynamicDescendantGrow(t *testing.T)
 		machine.MustParse("0-3"),
 	))
 	require.True(t, trace.FinalEvaluation.ParentSafety.Safe)
+	require.NotEmpty(t, trace.TraceID)
+	require.NotEmpty(t, trace.ConvergenceID)
+	require.Equal(t, ConvergenceObjectiveParentSafe, trace.Objective)
+	require.NotNil(t, trace.InitialSnapshot)
+	require.NotNil(t, trace.FinalSnapshot)
+	require.Equal(t, fixture.driver.Capabilities(), trace.Capabilities)
+	require.Equal(t, machine.MustParse("0-3"), trace.RequiredCPUSetByRel["kubepods"])
+	require.Equal(t, machine.MustParse("0-3"), trace.CanonicalTargetByRel["kubepods"].CPUs)
+	require.Positive(t, trace.Cost.Forward.Total())
+	require.Equal(t, trace.Cost.Forward, trace.Cost.Rollback)
 	require.Zero(t, fixture.driver.PhysicalWriteCount())
 }
 
@@ -336,6 +413,282 @@ func TestFixedPointEngineUsesSamePlanSequenceForProjectedAndRecordingSessions(t 
 	require.Equal(t, projectedResult.Phases, recordingResult.Phases)
 }
 
+func TestFixedPointEngineSingleRoundReturnsNeutralOutcome(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	base := fixture.snapshot()
+	session := newProjectedTraceSession(t, base, fixture.driver.Capabilities())
+
+	result, err := fixture.round.runFixedPointEngine(
+		context.Background(),
+		session,
+		fixedPointEngineSingleRound,
+	)
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Rounds)
+	require.NotNil(t, result.FinalSnapshot)
+	require.NotEmpty(t, result.Phases)
+	require.Equal(t, result.FinalSnapshot, result.Outcome.Snapshot)
+	require.Equal(t, RoundStatusConverged, result.Outcome.Status)
+	require.True(t, result.ObjectiveSatisfied)
+}
+
+func TestFixedPointEngineSessionReceivesCompletePhasePlan(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	base := fixture.snapshot()
+	projected := newProjectedTraceSession(t, base, fixture.driver.Capabilities())
+	session := &planRecordingSession{phaseExecutionSession: projected}
+
+	_, err := fixture.round.runFixedPointEngine(
+		context.Background(),
+		session,
+		fixedPointEngineSingleRound,
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, session.plans)
+	for _, plan := range session.plans {
+		require.NotEmpty(t, plan.PlanID)
+		require.NotNil(t, plan.Base)
+		require.NotEmpty(t, plan.CanonicalTargetByRel)
+		require.NotEmpty(t, plan.Operations)
+	}
+}
+
+type planRecordingSession struct {
+	phaseExecutionSession
+	prepared []PhasePlan
+	plans    []PhasePlan
+}
+
+type admissionReservationRecordingSession struct {
+	phaseExecutionSession
+	round            *coordinatorRound
+	prepared         []PhasePlan
+	reservationCount int
+}
+
+func (s *admissionReservationRecordingSession) PrepareRound(plan PhasePlan) error {
+	s.prepared = append(s.prepared, plan)
+	before := s.round.admissionTicket
+	err := s.phaseExecutionSession.PrepareRound(plan)
+	if before == nil && s.round.admissionTicket != nil {
+		s.reservationCount++
+	}
+	return err
+}
+
+func (s *planRecordingSession) PrepareRound(plan PhasePlan) error {
+	s.prepared = append(s.prepared, plan)
+	return s.phaseExecutionSession.PrepareRound(plan)
+}
+
+func (s *planRecordingSession) Apply(ctx context.Context, plan PhasePlan) (phaseSessionApplyResult, error) {
+	s.plans = append(s.plans, plan)
+	return s.phaseExecutionSession.Apply(ctx, plan)
+}
+
+func TestFixedPointEnginePreparesCompleteDrainBeforeFirstFrontier(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureMultiFrontierParentSafeDrain()
+	base := fixture.snapshot()
+	projected := newProjectedTraceSession(t, base, fixture.driver.Capabilities())
+	session := &planRecordingSession{phaseExecutionSession: projected}
+
+	_, err := fixture.round.runFixedPointEngine(
+		context.Background(),
+		session,
+		fixedPointEngineSingleRound,
+	)
+	require.NoError(t, err)
+	require.Len(t, session.prepared, 2)
+	require.NotEmpty(t, session.plans)
+	require.Greater(t, len(session.prepared[0].Operations), len(session.plans[0].Operations))
+	require.Equal(t, session.prepared[0].PlanID, canonicalExecutionPlanID(session.prepared[0]))
+	require.Equal(t, PhaseExpand, session.prepared[1].Kind)
+}
+
+func TestLiveFixedPointEngineRejectsMultiFrontierReservationBeforePhysicalWrite(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureMultiFrontierParentSafeDrain()
+	base := fixture.snapshot()
+	fullDrain, err := fixture.round.buildPlan(context.Background(), PhaseDrain, base)
+	require.NoError(t, err)
+	firstFrontier, err := drainFrontier(fullDrain)
+	require.NoError(t, err)
+	require.Greater(t, len(fullDrain.Operations), len(firstFrontier.Operations))
+	firstCost := admissionPlanPhysicalWriteCost(firstFrontier)
+	fullCost := admissionPlanPhysicalWriteCost(fullDrain)
+	require.Greater(t, fullCost.Total(), firstCost.Total())
+
+	fixture.round.round = 0
+	fixture.round.admissionTicket = nil
+	fixture.round.admissionBudget = &AdmissionConvergenceBudget{
+		MaxRequiredWrites: 2 * firstCost.Total(),
+	}
+	_, err = fixture.round.runFixedPointEngine(
+		context.Background(),
+		newLivePhaseSession(fixture.round, &ConvergenceResult{}),
+		fixedPointEngineSingleRound,
+	)
+	require.ErrorIs(t, err, ErrAdmissionReservationExceeded)
+	require.Zero(t, fixture.driver.PhysicalWriteCount())
+	require.Nil(t, fixture.round.admissionTicket)
+}
+
+func TestLivePhaseSessionApplyRequiresPreparedFullDrainReservation(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureMultiFrontierParentSafeDrain()
+	fullDrain, err := fixture.round.buildPlan(
+		context.Background(),
+		PhaseDrain,
+		fixture.snapshot(),
+	)
+	require.NoError(t, err)
+	firstFrontier, err := drainFrontier(fullDrain)
+	require.NoError(t, err)
+	require.Greater(t, len(fullDrain.Operations), len(firstFrontier.Operations))
+	fixture.round.admissionBudget = &AdmissionConvergenceBudget{
+		MaxRequiredWrites: 2 * admissionPlanPhysicalWriteCost(fullDrain).Total(),
+	}
+	session := newLivePhaseSession(fixture.round, &ConvergenceResult{})
+
+	_, err = session.Apply(context.Background(), firstFrontier)
+
+	require.ErrorIs(t, err, ErrAdmissionReservationExceeded)
+	require.ErrorContains(t, err, "not prepared")
+	require.Zero(t, fixture.driver.PhysicalWriteCount())
+	require.Nil(t, fixture.round.admissionTicket)
+}
+
+func TestLiveFixedPointEnginePureExpandReservesCompletePlanOnce(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.addPrimary("kubepods", "0", "0")
+	fixture.requireCPUSet("kubepods", "0-1")
+	base := fixture.snapshot()
+
+	drain, err := fixture.round.buildPlan(context.Background(), PhaseDrain, base)
+	require.NoError(t, err)
+	require.Empty(t, drain.Operations)
+	expand, err := fixture.round.buildPlan(context.Background(), PhaseExpand, base)
+	require.NoError(t, err)
+	require.NotEmpty(t, expand.Operations)
+	fixture.round.admissionBudget = &AdmissionConvergenceBudget{
+		MaxRequiredWrites: 2 * admissionPlanPhysicalWriteCost(expand).Total(),
+	}
+	session := &admissionReservationRecordingSession{
+		phaseExecutionSession: newLivePhaseSession(fixture.round, &ConvergenceResult{}),
+		round:                 fixture.round,
+	}
+
+	result, err := fixture.round.runFixedPointEngine(
+		context.Background(),
+		session,
+		fixedPointEngineSingleRound,
+	)
+
+	require.NoError(t, err)
+	require.True(t, result.ObjectiveSatisfied)
+	require.Equal(t, 1, session.reservationCount)
+	require.Len(t, session.prepared, 2)
+	require.Empty(t, session.prepared[0].Operations)
+	require.Equal(t, expand.Operations, session.prepared[1].Operations)
+	require.Equal(t, len(expand.Operations), fixture.driver.PhysicalWriteCount())
+}
+
+func TestLiveFixedPointEnginePureExpandRejectsInsufficientReservationBeforeWrite(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.addPrimary("kubepods", "0", "0")
+	fixture.requireCPUSet("kubepods", "0-1")
+	base := fixture.snapshot()
+
+	expand, err := fixture.round.buildPlan(context.Background(), PhaseExpand, base)
+	require.NoError(t, err)
+	required := 2 * admissionPlanPhysicalWriteCost(expand).Total()
+	require.Greater(t, required, 1)
+	fixture.round.admissionBudget = &AdmissionConvergenceBudget{
+		MaxRequiredWrites: required - 1,
+	}
+	session := &admissionReservationRecordingSession{
+		phaseExecutionSession: newLivePhaseSession(fixture.round, &ConvergenceResult{}),
+		round:                 fixture.round,
+	}
+
+	_, err = fixture.round.runFixedPointEngine(
+		context.Background(),
+		session,
+		fixedPointEngineSingleRound,
+	)
+
+	require.ErrorIs(t, err, ErrAdmissionReservationExceeded)
+	require.Zero(t, fixture.driver.PhysicalWriteCount())
+	require.Zero(t, session.reservationCount)
+	require.Len(t, session.prepared, 2)
+	require.Equal(t, expand.Operations, session.prepared[1].Operations)
+	require.Nil(t, fixture.round.admissionTicket)
+}
+
+func TestLiveFixedPointEngineExpandDoesNotReserveAgainAfterDrainTicket(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	fixture.snapshot()
+	fixture.round.admissionBudget = &AdmissionConvergenceBudget{MaxRequiredWrites: 100}
+	session := &admissionReservationRecordingSession{
+		phaseExecutionSession: newLivePhaseSession(fixture.round, &ConvergenceResult{}),
+		round:                 fixture.round,
+	}
+
+	result, err := fixture.round.runFixedPointEngine(
+		context.Background(),
+		session,
+		fixedPointEngineSingleRound,
+	)
+
+	require.NoError(t, err)
+	require.True(t, result.ObjectiveSatisfied)
+	require.Equal(t, 1, session.reservationCount)
+	require.Len(t, session.prepared, 2)
+	require.NotEmpty(t, session.prepared[0].Operations)
+	require.NotEmpty(t, session.prepared[1].Operations)
+}
+
+type firstSnapshotErrorSession struct {
+	phaseExecutionSession
+	err error
+}
+
+func (s *firstSnapshotErrorSession) Snapshot(context.Context) (*CompleteSnapshot, error) {
+	return nil, s.err
+}
+
+func TestFixedPointEngineFirstSnapshotFailureReturnsStaleOutcome(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	base := fixture.snapshot()
+	fixture.budget = NewBudgetTracker(ConvergenceBudget{MaxRounds: 2})
+	fixture.round.budget = fixture.budget
+	fixture.round.round = 0
+	snapshotErr := errors.New("initial snapshot preflight failed")
+	session := &firstSnapshotErrorSession{
+		phaseExecutionSession: newProjectedTraceSession(t, base, fixture.driver.Capabilities()),
+		err:                   snapshotErr,
+	}
+
+	result, err := fixture.round.runFixedPointEngine(
+		context.Background(),
+		session,
+		fixedPointEngineSingleRound,
+	)
+
+	require.ErrorIs(t, err, snapshotErr)
+	require.NotNil(t, result)
+	require.Equal(t, RoundStatusStale, result.Outcome.Status)
+	require.ErrorIs(t, result.Outcome.Blocker, snapshotErr)
+	require.Equal(t, fixture.budget.Usage(), result.Outcome.Cost)
+	require.Equal(t, 1, result.Outcome.Cost.Rounds)
+	require.Equal(t, 1, result.Rounds)
+}
+
 func TestCompiledTraceMatchesFixedPointEngineTrace(t *testing.T) {
 	fixture := newAdmissionTraceFixture(t)
 	fixture.configureStagedSMTTransferWithDynamicDescendant()
@@ -346,22 +699,54 @@ func TestCompiledTraceMatchesFixedPointEngineTrace(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	observed := fixture.runFixedPointAgainstRecordingDriver(t)
+	recordingFixture := newAdmissionTraceFixture(t)
+	recordingFixture.configureStagedSMTTransferWithDynamicDescendant()
+	observed := recordingFixture.runFixedPointAgainstRecordingDriver(t)
 	require.Equal(t, flattenTraceOperations(compiled), observed)
 }
 
-func TestCompileFixedPointTraceRejectsNoProgress(t *testing.T) {
+func TestParentSafeCompileAndLiveApplySkipFrozenUnavailableChild(t *testing.T) {
 	fixture := newAdmissionTraceFixture(t)
-	fixture.addPrimary("kubepods", "0-3", "0")
-	fixture.addDynamicDescendant("kubepods/besteffort", "1-3", "0")
-	fixture.addReclaim("reclaimed-0", "0", "0")
-	fixture.requireCPUSet("kubepods", "0-3")
-	fixture.projectedDriver.IgnoreWrites = true
+	fixture.configureMultiFrontierParentSafeDrain()
+	fixture.addUnavailableDynamicChild("kubepods/besteffort/container", "0-2", "0")
+	base := fixture.snapshot()
+	childIdentity := fixture.driver.nodes["kubepods/besteffort/container"].identity
+	wantEvidence := UnavailableChildEvidence{
+		Identity: childIdentity,
+		Reason:   UnavailableChildReasonControllerUnavailable,
+	}
+	require.Equal(t, wantEvidence, base.UnavailableChildren["kubepods/besteffort/container"])
 
-	_, err := fixture.round.compileFixedPointTrace(
+	trace, err := fixture.round.compileFixedPointTrace(context.Background(), base)
+	require.NoError(t, err)
+	require.True(t, trace.FinalEvaluation.ParentSafety.Safe)
+	require.Equal(t, wantEvidence, trace.InitialSnapshot.UnavailableChildren["kubepods/besteffort/container"])
+
+	fixture.round.round = 0
+	fixture.round.admissionTicket = nil
+	fixture.round.admissionBudget = &AdmissionConvergenceBudget{
+		MaxRequiredWrites: 2 * trace.Cost.Forward.Total(),
+	}
+	result, err := fixture.round.runFixedPointEngine(
 		context.Background(),
-		fixture.snapshot(),
+		newLivePhaseSession(fixture.round, &ConvergenceResult{}),
+		fixedPointEngineSingleRound,
 	)
+	require.NoError(t, err)
+	require.True(t, result.ObjectiveSatisfied)
+	require.Positive(t, fixture.driver.PhysicalWriteCount())
+}
+
+func TestFreezePhaseTraceRejectsNoProgress(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	trace, err := fixture.round.compileFixedPointTrace(context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+	trace.Phases = nil
+	trace.FinalSnapshot = CloneCompleteSnapshot(trace.InitialSnapshot)
+	trace.FinalEvaluation.ParentSafety.Safe = false
+
+	_, err = FreezePhaseTrace(trace)
 	require.ErrorIs(t, err, ErrNoProgress)
 	require.Zero(t, fixture.driver.PhysicalWriteCount())
 }
@@ -379,4 +764,302 @@ func TestCompileFixedPointTraceRejectsUnprovableRequiredFloor(t *testing.T) {
 	)
 	require.Error(t, err)
 	require.Zero(t, fixture.driver.PhysicalWriteCount())
+}
+
+func TestFreezePhaseTraceIsolatedFromMutableInputs(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	fixture.configureProtectedDeferredEvaluationInputs()
+	trace, err := fixture.round.compileFixedPointTrace(context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+
+	frozen, err := FreezePhaseTrace(trace)
+	require.NoError(t, err)
+	originalID := frozen.TraceID
+	originalInitial := CloneCompleteSnapshot(frozen.InitialSnapshot)
+	originalFinal := CloneCompleteSnapshot(frozen.FinalSnapshot)
+	originalOperation := frozen.Phases[0].Operations[0]
+	originalCanonical := frozen.CanonicalTargetByRel["kubepods"]
+	originalRequired := frozen.RequiredCPUSetByRel["kubepods"]
+	originalEvaluationInput := cloneFrozenCoordinatorEvaluationInput(frozen.EvaluationInput)
+
+	trace.InitialSnapshot.Entries["kubepods"] = EntryState{}
+	trace.FinalSnapshot.Entries["kubepods"] = EntryState{}
+	trace.CanonicalTargetByRel["kubepods"] = CPUSetTarget{CPUs: machine.NewCPUSet(99)}
+	trace.RequiredCPUSetByRel["kubepods"] = machine.NewCPUSet(99)
+	trace.Phases[0].Operations[0] = PlanOperation{}
+	trace.FinalEvaluation.ParentSafety.RequiredFloorDeficit["kubepods"] = machine.NewCPUSet(99)
+	trace.EvaluationInput.ProtectedPending = machine.NewCPUSet(99)
+	trace.EvaluationInput.DeferredByRel["kubepods/deferred"] = machine.NewCPUSet(99)
+	for rel := range trace.EvaluationInput.DeferredCleanupRels {
+		delete(trace.EvaluationInput.DeferredCleanupRels, rel)
+	}
+	trace.EvaluationInput.DAGSpecs[0].CPUs = machine.NewCPUSet(99)
+
+	require.Equal(t, originalID, frozen.TraceID)
+	require.Equal(t, originalInitial, frozen.InitialSnapshot)
+	require.Equal(t, originalFinal, frozen.FinalSnapshot)
+	require.Equal(t, originalOperation, frozen.Phases[0].Operations[0])
+	require.Equal(t, originalCanonical, frozen.CanonicalTargetByRel["kubepods"])
+	require.Equal(t, originalRequired, frozen.RequiredCPUSetByRel["kubepods"])
+	require.Equal(t, originalEvaluationInput, frozen.EvaluationInput)
+	require.Empty(t, frozen.FinalEvaluation.ParentSafety.RequiredFloorDeficit)
+}
+
+func TestFreezePhaseTraceIDIsIndependentOfMapInsertionOrder(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	trace, err := fixture.round.compileFixedPointTrace(context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+
+	reordered := *trace
+	reordered.TraceID = ""
+	reordered.CanonicalTargetByRel = make(map[string]CPUSetTarget, len(trace.CanonicalTargetByRel))
+	reordered.RequiredCPUSetByRel = make(map[string]machine.CPUSet, len(trace.RequiredCPUSetByRel))
+	rels := make([]string, 0, len(trace.CanonicalTargetByRel))
+	for rel := range trace.CanonicalTargetByRel {
+		rels = append(rels, rel)
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(rels)))
+	for _, rel := range rels {
+		if target, ok := trace.CanonicalTargetByRel[rel]; ok {
+			reordered.CanonicalTargetByRel[rel] = target
+		}
+		if required, ok := trace.RequiredCPUSetByRel[rel]; ok {
+			reordered.RequiredCPUSetByRel[rel] = required
+		}
+	}
+
+	frozen, err := FreezePhaseTrace(&reordered)
+	require.NoError(t, err)
+	require.Equal(t, trace.TraceID, frozen.TraceID)
+	require.Equal(t, trace.Phases, frozen.Phases)
+}
+
+func TestFreezePhaseTraceRejectsTamperedFinalEvaluation(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	trace, err := fixture.round.compileFixedPointTrace(context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+
+	trace.FinalEvaluation.Report.PendingToPrimary = machine.NewCPUSet(99)
+
+	_, err = FreezePhaseTrace(trace)
+	require.ErrorContains(t, err, "final evaluation")
+}
+
+func TestFreezePhaseTraceProductionEvaluationParityWithProtectedDeferredInputs(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	fixture.configureProtectedDeferredEvaluationInputs()
+
+	trace, err := fixture.round.compileFixedPointTrace(context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+	require.False(t, trace.EvaluationInput.ProtectedPending.IsEmpty())
+	require.NotEmpty(t, trace.EvaluationInput.DeferredByRel)
+	require.NotEmpty(t, trace.EvaluationInput.DeferredCleanupRels)
+
+	recomputed, err := trace.EvaluationInput.evaluate(trace.FinalSnapshot)
+	require.NoError(t, err)
+	require.Equal(
+		t,
+		normalizeCoordinatorSnapshotEvaluation(trace.FinalEvaluation),
+		normalizeCoordinatorSnapshotEvaluation(recomputed),
+	)
+	require.Zero(t, fixture.driver.PhysicalWriteCount())
+}
+
+func TestFreezePhaseTraceRejectsProtectedDeferredInputTampering(t *testing.T) {
+	newTrace := func(t *testing.T) *CompiledPhaseTrace {
+		t.Helper()
+		fixture := newAdmissionTraceFixture(t)
+		fixture.configureStagedSMTTransferWithDynamicDescendant()
+		fixture.configureProtectedDeferredEvaluationInputs()
+		trace, err := fixture.round.compileFixedPointTrace(context.Background(), fixture.snapshot())
+		require.NoError(t, err)
+		require.NotEmpty(t, trace.EvaluationInput.DeferredCleanupRels)
+		return trace
+	}
+
+	tests := []struct {
+		name       string
+		mutate     func(*CompiledPhaseTrace)
+		wantSubstr string
+	}{
+		{
+			name: "protected pending",
+			mutate: func(trace *CompiledPhaseTrace) {
+				trace.EvaluationInput.ProtectedPending = machine.NewCPUSet(4)
+			},
+			wantSubstr: "final evaluation",
+		},
+		{
+			name: "deferred leaf",
+			mutate: func(trace *CompiledPhaseTrace) {
+				trace.EvaluationInput.DeferredByRel["kubepods/deferred"] = machine.NewCPUSet(4)
+			},
+			wantSubstr: "final evaluation",
+		},
+		{
+			name: "deferred cleanup rel",
+			mutate: func(trace *CompiledPhaseTrace) {
+				for rel := range trace.EvaluationInput.DeferredCleanupRels {
+					delete(trace.EvaluationInput.DeferredCleanupRels, rel)
+				}
+			},
+			wantSubstr: "identity",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			trace := newTrace(t)
+			tc.mutate(trace)
+
+			_, err := FreezePhaseTrace(trace)
+			require.ErrorContains(t, err, tc.wantSubstr)
+		})
+	}
+}
+
+func TestCanonicalPhaseTraceIDBindsFinalEvaluation(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	trace, err := fixture.round.compileFixedPointTrace(context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+
+	tampered := *trace
+	tampered.FinalEvaluation = cloneCoordinatorSnapshotEvaluation(trace.FinalEvaluation)
+	tampered.FinalEvaluation.Report.PendingToPrimary = machine.NewCPUSet(99)
+
+	require.NotEqual(t, canonicalPhaseTraceID(trace), canonicalPhaseTraceID(&tampered))
+}
+
+func TestCloneForProjectionDeepCopiesCPUDetails(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	clone := fixture.round.cloneForProjection()
+
+	clone.cpuDetails[0] = machine.CPUTopoInfo{NUMANodeID: 99}
+	delete(clone.cpuDetails, 1)
+
+	require.Equal(t, 0, fixture.round.cpuDetails[0].NUMANodeID)
+	require.Contains(t, fixture.round.cpuDetails, 1)
+}
+
+func TestFreezePhaseTraceRejectsOrphanOrInconsistentSnapshotEvidence(t *testing.T) {
+	newTrace := func(t *testing.T) *CompiledPhaseTrace {
+		t.Helper()
+		fixture := newAdmissionTraceFixture(t)
+		fixture.configureStagedSMTTransferWithDynamicDescendant()
+		trace, err := fixture.round.compileFixedPointTrace(context.Background(), fixture.snapshot())
+		require.NoError(t, err)
+		return trace
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*CompleteSnapshot)
+	}{
+		{
+			name: "orphan children key",
+			mutate: func(snapshot *CompleteSnapshot) {
+				snapshot.Children["orphan"] = []ChildRef{{
+					Name: "leaf", Identity: CgroupIdentity{Device: 1, Inode: 999},
+				}}
+			},
+		},
+		{
+			name: "orphan domain key",
+			mutate: func(snapshot *CompleteSnapshot) {
+				snapshot.DomainByRel["orphan"] = DomainPrimary
+			},
+		},
+		{
+			name: "entry missing domain",
+			mutate: func(snapshot *CompleteSnapshot) {
+				delete(snapshot.DomainByRel, "kubepods")
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			trace := newTrace(t)
+			tc.mutate(trace.InitialSnapshot)
+			trace.InitialSnapshot.ID = fingerprintSnapshot(trace.InitialSnapshot)
+
+			_, err := FreezePhaseTrace(trace)
+			require.ErrorContains(t, err, "snapshot evidence")
+		})
+	}
+}
+
+func TestFreezePhaseTraceRejectsUnsafeFinalSnapshot(t *testing.T) {
+	newTrace := func(t *testing.T) *CompiledPhaseTrace {
+		t.Helper()
+		fixture := newAdmissionTraceFixture(t)
+		fixture.configureStagedSMTTransferWithDynamicDescendant()
+		trace, err := fixture.round.compileFixedPointTrace(context.Background(), fixture.snapshot())
+		require.NoError(t, err)
+		return trace
+	}
+
+	tests := []struct {
+		name       string
+		mutate     func(*CompiledPhaseTrace)
+		wantSubstr string
+	}{
+		{
+			name: "nil initial snapshot",
+			mutate: func(trace *CompiledPhaseTrace) {
+				trace.InitialSnapshot = nil
+			},
+			wantSubstr: "snapshot",
+		},
+		{
+			name: "missing operation identity",
+			mutate: func(trace *CompiledPhaseTrace) {
+				trace.Phases[0].Operations[0].ExpectedIdentity = CgroupIdentity{}
+			},
+			wantSubstr: "identity",
+		},
+		{
+			name: "expected current mismatch",
+			mutate: func(trace *CompiledPhaseTrace) {
+				trace.Phases[0].Operations[0].ExpectedCurrent.CPUs = machine.NewCPUSet(99)
+			},
+			wantSubstr: "expected current",
+		},
+		{
+			name: "objective not satisfied",
+			mutate: func(trace *CompiledPhaseTrace) {
+				trace.FinalEvaluation.ParentSafety.Safe = false
+			},
+			wantSubstr: "objective",
+		},
+		{
+			name: "required CPUs absent",
+			mutate: func(trace *CompiledPhaseTrace) {
+				trace.RequiredCPUSetByRel["kubepods"] = machine.NewCPUSet(99)
+			},
+			wantSubstr: "required CPUs",
+		},
+		{
+			name: "zero progress before objective",
+			mutate: func(trace *CompiledPhaseTrace) {
+				trace.Phases = nil
+				trace.FinalSnapshot = CloneCompleteSnapshot(trace.InitialSnapshot)
+				trace.FinalEvaluation.ParentSafety.Safe = false
+			},
+			wantSubstr: "no progress",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			trace := newTrace(t)
+			tc.mutate(trace)
+			_, err := FreezePhaseTrace(trace)
+			require.ErrorContains(t, err, tc.wantSubstr)
+		})
+	}
 }

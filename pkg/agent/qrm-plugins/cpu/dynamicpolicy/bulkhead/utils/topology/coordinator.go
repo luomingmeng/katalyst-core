@@ -444,7 +444,16 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 		return repeatedNoProgress >= 2
 	}
 	for {
-		outcome, err := round.executeFixedPointRound(ctx, in.Mems, res)
+		engineResult, engineErr := round.runFixedPointEngine(
+			ctx,
+			newLivePhaseSession(round, res),
+			fixedPointEngineSingleRound,
+		)
+		outcome := RoundOutcome{}
+		if engineResult != nil {
+			outcome = engineResult.Outcome
+		}
+		err := engineErr
 		if err != nil {
 			err = prioritizeRoundStalePlanError(outcome, err)
 			if preflightObservationStale(err) {
@@ -1228,7 +1237,7 @@ func (r *coordinatorRound) buildPlan(ctx context.Context, kind PhaseKind, snapsh
 		Context: ctx, Kind: kind, DAG: r.dag, Snapshot: snapshot,
 		DesiredByRel: r.targetByRel, DynamicByRel: r.dynamicByRel, DesiredMemsByRel: r.desiredMemsByRel(),
 		AllowedCPUs: r.allowedCPUs(), AllowEmptyTarget: r.allowEmptyTarget,
-		Capabilities: r.driver.Capabilities(),
+		Capabilities: snapshot.Capabilities,
 		Witnesses:    r.witnesses, ProtectedPending: r.protectedPending,
 		ProtectedByRel: r.protectedByRel, CPUDetails: r.cpuDetails,
 		Selection: r.selection, Budget: r.budget,
@@ -1295,9 +1304,8 @@ func (r *coordinatorRound) checkAdmissionExecutionBudget(plan PhasePlan, res *Co
 		return nil
 	}
 	if r.admissionTicket == nil {
-		if err := r.reserveAdmissionClosure(plan); err != nil {
-			return err
-		}
+		return fmt.Errorf("%w: admission round was not prepared before apply",
+			ErrAdmissionReservationExceeded)
 	}
 	return r.admissionTicket.consume(plan)
 }
@@ -1398,149 +1406,6 @@ func sortedOperationDomains(operations map[DomainID][]PlanOperation) []DomainID 
 	}
 	sort.Slice(domains, func(i, j int) bool { return domains[i] < domains[j] })
 	return domains
-}
-
-func (r *coordinatorRound) executeFixedPointRound(ctx context.Context, defaultMems string, res *ConvergenceResult) (RoundOutcome, error) {
-	if r.round >= r.maxRounds {
-		return RoundOutcome{}, fmt.Errorf("%w: limit=%d used=%d", ErrRoundBudgetExceeded, r.maxRounds, r.round)
-	}
-	if err := r.budget.ConsumeRound(); err != nil {
-		return RoundOutcome{}, err
-	}
-	r.round++
-	r.deferredCleanupRels = make(map[string]struct{})
-	journalBefore := len(res.Journal)
-	var progressBase, progressSnapshot *CompleteSnapshot
-	var changedRels []string
-	staleOutcome := func(err error) RoundOutcome {
-		return RoundOutcome{
-			Status:      RoundStatusStale,
-			Snapshot:    progressSnapshot,
-			Blocker:     err,
-			Journal:     append([]AppliedPlanOperation(nil), res.Journal[journalBefore:]...),
-			ChangedRels: append([]string(nil), changedRels...),
-			Cost:        r.budget.Usage(),
-		}
-	}
-	appliedBefore := res.Applied
-	drainSnapshot, err := r.nextSnapshot(ctx)
-	if err != nil {
-		return staleOutcome(err), err
-	}
-	drain, err := r.buildPlan(ctx, PhaseDrain, drainSnapshot)
-	if err != nil {
-		var structural *StructuralV1NonEmptyDeadlock
-		if errors.As(err, &structural) {
-			return RoundOutcome{
-				Status:   RoundStatusBlocked,
-				Snapshot: drainSnapshot,
-				Blocker:  err,
-				Cost:     r.budget.Usage(),
-			}, nil
-		}
-		return staleOutcome(err), err
-	}
-	progressBase = drain.Base
-	if err := r.reserveAdmissionClosure(drain); err != nil {
-		return staleOutcome(err), err
-	}
-	fresh, released, err := r.executeDrainBatches(ctx, drain, res)
-	if fresh != nil {
-		progressSnapshot = fresh
-		changedRels = verifiedDrainProgressRels(progressBase, fresh, drain.TargetByRel)
-	}
-	if err != nil {
-		return staleOutcome(err), err
-	}
-	r.witnesses = r.witnesses[:0]
-	for source, destinations := range released {
-		for destination, cpus := range destinations {
-			if cpus.IsEmpty() {
-				continue
-			}
-			witness := NewReleaseWitness(drain.ConvergenceID, source, destination, cpus, fresh)
-			if witness.CPUs.IsEmpty() {
-				continue
-			}
-			r.witnesses = append(r.witnesses, witness)
-		}
-	}
-	expand, err := r.buildPlan(ctx, PhaseExpand, fresh)
-	if err != nil {
-		return staleOutcome(err), err
-	}
-	if err := r.executePlan(ctx, expand, res); err != nil {
-		return staleOutcome(err), err
-	}
-	final, err := r.nextSnapshot(ctx)
-	if err != nil {
-		return staleOutcome(err), err
-	}
-	r.recomputeBlocked(final)
-	status := RoundStatusProgress
-	if res.Applied == appliedBefore {
-		status = RoundStatusBlocked
-	}
-	journal := append([]AppliedPlanOperation(nil), res.Journal[journalBefore:]...)
-	return RoundOutcome{
-		Status:      status,
-		Snapshot:    final,
-		Witnesses:   append([]ReleaseWitness(nil), r.witnesses...),
-		Journal:     journal,
-		ChangedRels: append([]string(nil), changedRels...),
-		Progress: ProgressMeasure{
-			DrainChangedRels: len(changedRels),
-			VerifiedWrites:   len(journal),
-		},
-		Cost: r.budget.Usage(),
-	}, nil
-}
-
-func (r *coordinatorRound) executeDrainBatches(
-	ctx context.Context,
-	plan PhasePlan,
-	res *ConvergenceResult,
-) (*CompleteSnapshot, map[DomainID]map[DomainID]machine.CPUSet, error) {
-	fresh := plan.Base
-	released := make(map[DomainID]map[DomainID]machine.CPUSet)
-	if len(plan.Operations) == 0 {
-		next, err := r.nextSnapshot(ctx)
-		return next, released, err
-	}
-	for len(plan.Operations) > 0 {
-		batch, err := drainFrontier(plan)
-		if err != nil {
-			return fresh, released, err
-		}
-		r.planID = batch.PlanID
-		accumulateDrainTransfers(released, plan.TransferGraph, plan.DrainBatch)
-		if err := r.executePlan(ctx, batch, res); err != nil {
-			if recovered, snapshotErr := r.nextSnapshot(ctx); snapshotErr == nil {
-				fresh = recovered
-			}
-			return fresh, released, err
-		}
-		next, err := r.nextSnapshot(ctx)
-		if err != nil {
-			return fresh, released, err
-		}
-		fresh = next
-		plan, err = rebaseDrainPlan(plan, fresh, r.dag, r.budget)
-		if err != nil {
-			return fresh, released, err
-		}
-		if r.objective == ConvergenceObjectiveParentSafe {
-			required, _, splitErr := SplitPlanForAdmission(&plan, AdmissionSafetyInput{
-				ProtectedPendingCPUSet: r.admissionSafetyCPUSet(),
-				DeferredCPUSetByRel:    r.deferredByRel,
-			})
-			if splitErr != nil {
-				return fresh, released, splitErr
-			}
-			plan = *required
-		}
-	}
-	return fresh, released, nil
 }
 
 func drainFrontier(plan PhasePlan) (PhasePlan, error) {
