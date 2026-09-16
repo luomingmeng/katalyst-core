@@ -95,6 +95,33 @@ func (s *liveTraceSession) Apply(ctx context.Context, phase PhaseKind, operation
 	return nil
 }
 
+// projectedTraceSession adapts a clone-backed projectedHierarchy to the phase
+// execution session contract. Snapshot returns an isolated clone so the engine
+// can freeze plan.Base before Apply mutates the projection in place.
+type projectedTraceSession struct {
+	hierarchy *projectedHierarchy
+}
+
+func newProjectedTraceSession(t *testing.T, base *CompleteSnapshot, capabilities HierarchyCapabilities) *projectedTraceSession {
+	t.Helper()
+	hierarchy, err := newProjectedHierarchy(base, capabilities)
+	require.NoError(t, err)
+	return &projectedTraceSession{hierarchy: hierarchy}
+}
+
+func (s *projectedTraceSession) Snapshot(_ context.Context) (*CompleteSnapshot, error) {
+	return CloneCompleteSnapshot(s.hierarchy.snapshot), nil
+}
+
+func (s *projectedTraceSession) Apply(_ context.Context, _ PhaseKind, operations []PlanOperation) error {
+	for _, operation := range operations {
+		if err := s.hierarchy.applyOperation(operation); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func newAdmissionTraceFixture(t *testing.T) *admissionTraceFixture {
 	t.Helper()
 	f := &admissionTraceFixture{
@@ -279,6 +306,34 @@ func TestCompileFixedPointTraceIncludesStagedDynamicDescendantGrow(t *testing.T)
 	))
 	require.True(t, trace.FinalEvaluation.ParentSafety.Safe)
 	require.Zero(t, fixture.driver.PhysicalWriteCount())
+}
+
+// TestFixedPointEngineUsesSamePlanSequenceForProjectedAndRecordingSessions
+// proves the engine is session-agnostic: given the same starting snapshot, a
+// clone-backed projected session and a live recording session must produce a
+// byte-for-byte identical ordered phase trace. The engine only decides and
+// sequences operations; each session is responsible for faithfully applying
+// them, so parity here is the frozen-vs-live equivalence the compiler relies on.
+func TestFixedPointEngineUsesSamePlanSequenceForProjectedAndRecordingSessions(t *testing.T) {
+	projectedFixture := newAdmissionTraceFixture(t)
+	projectedFixture.configureStagedSMTTransferWithDynamicDescendant()
+	projectedBase := projectedFixture.snapshot()
+	projectedResult, err := projectedFixture.round.runFixedPointEngine(
+		context.Background(),
+		newProjectedTraceSession(t, projectedBase, projectedFixture.driver.Capabilities()),
+	)
+	require.NoError(t, err)
+
+	recordingFixture := newAdmissionTraceFixture(t)
+	recordingFixture.configureStagedSMTTransferWithDynamicDescendant()
+	recordingBase := recordingFixture.snapshot()
+	recordingResult, err := recordingFixture.round.runFixedPointEngine(
+		context.Background(),
+		newLiveTraceSession(recordingFixture.round, recordingBase),
+	)
+	require.NoError(t, err)
+
+	require.Equal(t, projectedResult.Phases, recordingResult.Phases)
 }
 
 func TestCompiledTraceMatchesFixedPointEngineTrace(t *testing.T) {
