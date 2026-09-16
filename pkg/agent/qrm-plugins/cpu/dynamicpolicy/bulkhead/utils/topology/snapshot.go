@@ -500,3 +500,57 @@ func cloneCPUSetMap(in map[string]machine.CPUSet) map[string]machine.CPUSet {
 	}
 	return out
 }
+
+// CloneCompleteSnapshot returns a deep copy that shares no mutable map, slice,
+// or CPUSet state with the input. Compilation and projection rely on this
+// isolation to model a fixed point without disturbing captured evidence.
+func CloneCompleteSnapshot(in *CompleteSnapshot) *CompleteSnapshot {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Entries = make(map[string]EntryState, len(in.Entries))
+	for rel, entry := range in.Entries {
+		cloned := entry
+		cloned.CPUs = entry.CPUs.Clone()
+		cloned.ConfiguredCPUs = entry.ConfiguredCPUs.Clone()
+		out.Entries[rel] = cloned
+	}
+	out.Children = make(map[string][]ChildRef, len(in.Children))
+	for rel, refs := range in.Children {
+		out.Children[rel] = append([]ChildRef(nil), refs...)
+	}
+	out.DomainByRel = cloneDomainByRel(in.DomainByRel)
+	out.DomainUnion = cloneDomainUnion(in.DomainUnion)
+	out.ScanBoundary = cloneScanBoundary(in.ScanBoundary)
+	return &out
+}
+
+func cloneDomainByRel(in map[string]DomainID) map[string]DomainID {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]DomainID, len(in))
+	for rel, domain := range in {
+		out[rel] = domain
+	}
+	return out
+}
+
+func cloneDomainUnion(in map[DomainID]machine.CPUSet) map[DomainID]machine.CPUSet {
+	if in == nil {
+		return nil
+	}
+	out := make(map[DomainID]machine.CPUSet, len(in))
+	for domain, cpus := range in {
+		out[domain] = cpus.Clone()
+	}
+	return out
+}
+
+func cloneScanBoundary(in ScanBoundary) ScanBoundary {
+	out := in
+	out.Roots = append([]string(nil), in.Roots...)
+	out.ExpandedRels = append([]string(nil), in.ExpandedRels...)
+	return out
+}
