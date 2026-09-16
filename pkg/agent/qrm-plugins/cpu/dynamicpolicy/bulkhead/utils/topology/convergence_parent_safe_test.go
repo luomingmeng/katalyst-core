@@ -86,6 +86,7 @@ func TestBuildParentSafetyReportAllowsOnlySafeDeferredLeafSuperset(t *testing.T)
 		},
 		machine.NewCPUSet(0, 1, 2, 3),
 		nil,
+		nil,
 		map[string]machine.CPUSet{"primary/pod/container": machine.NewCPUSet(1)},
 		nil,
 		machine.NewCPUSet(1),
@@ -125,6 +126,123 @@ func TestParentSafetyAllowsPlannerDeferredCleanupMismatch(t *testing.T) {
 	)
 	if !got.Safe || len(got.DeferredLeafMismatches) != 1 {
 		t.Fatalf("parent safety report = %+v, want planner-deferred cleanup accepted", got)
+	}
+}
+
+func TestParentSafetyRejectsDeferredNUMAHardFloorDeficit(t *testing.T) {
+	t.Parallel()
+
+	missing := machine.MustParse("0-1,96-97")
+	requiredNUMA0 := machine.MustParse(
+		"0-1,7-8,10,13-16,96-97,103-104,106,109-112")
+	currentNUMA0 := requiredNUMA0.Difference(missing)
+	primaryCPUs := machine.MustParse("2-6,9,11-12,98-102,105,107-108")
+	if currentNUMA0.Size() != 14 || requiredNUMA0.Size() != 18 || missing.Size() != 4 {
+		t.Fatalf("invalid fixture: observed=%d required=%d deficit=%d, want 14/18/4",
+			currentNUMA0.Size(), requiredNUMA0.Size(), missing.Size())
+	}
+
+	dag := mustPlanDAG(t, []NodeSpec{
+		{Rel: "sandboxes/dedicated-0", Domain: DomainPrimary, CPUs: primaryCPUs, TrustAnchor: true},
+		{Rel: "sandboxes/reclaimed-0", Domain: DomainReclaim, CPUs: requiredNUMA0, TrustAnchor: true},
+	})
+	snapshot := planSnapshot(map[string]EntryState{
+		"sandboxes/dedicated-0": {
+			Identity: CgroupIdentity{Inode: 1},
+			CPUs:     primaryCPUs,
+		},
+		"sandboxes/reclaimed-0": {
+			Identity: CgroupIdentity{Inode: 2},
+			CPUs:     currentNUMA0,
+		},
+	}, map[DomainID]machine.CPUSet{
+		DomainPrimary: primaryCPUs,
+		DomainReclaim: currentNUMA0,
+	})
+	const requiredRel = "sandboxes/reclaimed-0"
+	const ordinaryDeferredRel = "primary/history"
+	convergence := ConvergenceReport{NonConvergedTargets: []RelConvergence{
+		{
+			Rel:      requiredRel,
+			Observed: currentNUMA0,
+			Target:   requiredNUMA0,
+			Reason:   convergenceReasonTargetMismatch,
+		},
+		{
+			Rel:      ordinaryDeferredRel,
+			Observed: machine.NewCPUSet(2),
+			Target:   machine.NewCPUSet(2, 3),
+			Reason:   convergenceReasonTargetMismatch,
+		},
+	}}
+	requiredByRel := map[string]machine.CPUSet{
+		requiredRel: requiredNUMA0,
+	}
+
+	report := buildParentSafetyReportWithRequired(
+		snapshot,
+		dag,
+		map[string]machine.CPUSet{
+			"sandboxes/dedicated-0": primaryCPUs,
+			"sandboxes/reclaimed-0": requiredNUMA0,
+		},
+		convergence,
+		machine.NewCPUSet(),
+		requiredByRel,
+		nil,
+		map[string]struct{}{
+			requiredRel:         {},
+			ordinaryDeferredRel: {},
+		},
+		HierarchyCapabilities{},
+	)
+	if report.Safe {
+		t.Fatalf("parent safety report = %+v, want deferred NUMA hard-floor deficit %s rejected",
+			report, missing.String())
+	}
+	if len(report.RequiredFloorDeficit) != 1 {
+		t.Fatalf("required floor deficit = %+v, want exactly one", report.RequiredFloorDeficit)
+	}
+	deficit, ok := report.RequiredFloorDeficit[requiredRel]
+	if !ok || !deficit.Equals(missing) {
+		t.Fatalf("required floor deficit = %+v, want %q=%s",
+			report.RequiredFloorDeficit, requiredRel, missing.String())
+	}
+	if len(report.DeferredLeafMismatches) != 1 ||
+		report.DeferredLeafMismatches[0].Rel != ordinaryDeferredRel {
+		t.Fatalf("deferred mismatches = %+v, want only ordinary mismatch %q deferred",
+			report.DeferredLeafMismatches, ordinaryDeferredRel)
+	}
+
+	snapshot.Entries[requiredRel] = EntryState{
+		Identity: CgroupIdentity{Inode: 2},
+		CPUs:     requiredNUMA0,
+	}
+	snapshot.DomainUnion[DomainReclaim] = requiredNUMA0
+	convergence.NonConvergedTargets = convergence.NonConvergedTargets[1:]
+	report = buildParentSafetyReportWithRequired(
+		snapshot,
+		dag,
+		map[string]machine.CPUSet{
+			"sandboxes/dedicated-0": primaryCPUs,
+			"sandboxes/reclaimed-0": requiredNUMA0,
+		},
+		convergence,
+		machine.NewCPUSet(),
+		requiredByRel,
+		nil,
+		map[string]struct{}{
+			requiredRel:         {},
+			ordinaryDeferredRel: {},
+		},
+		HierarchyCapabilities{},
+	)
+	if requiredNUMA0.Size() != 18 || snapshot.Entries[requiredRel].CPUs.Size() != 18 {
+		t.Fatalf("invalid control fixture: observed=%d required=%d, want 18/18",
+			snapshot.Entries[requiredRel].CPUs.Size(), requiredNUMA0.Size())
+	}
+	if !report.Safe || len(report.RequiredFloorDeficit) != 0 {
+		t.Fatalf("parent safety report = %+v, want safe with empty required floor deficit", report)
 	}
 }
 

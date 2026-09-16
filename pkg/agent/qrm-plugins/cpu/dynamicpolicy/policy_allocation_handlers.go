@@ -3964,10 +3964,14 @@ func (p *DynamicPolicy) updateReclaimAllocationResultByPoolEntry(allocationInfo 
 // isRampUpReclaimHardPartitionEnabled reports whether the ramp-up reclaim hard
 // partition feature is enabled by the current dynamic configuration.
 func (p *DynamicPolicy) isRampUpReclaimHardPartitionEnabled() bool {
-	if p.dynamicConfig == nil {
-		return false
+	var dyn *dynamicconfig.Configuration
+	if p != nil && p.dynamicConfig != nil {
+		dyn = p.dynamicConfig.GetDynamicConfiguration()
 	}
-	dyn := p.dynamicConfig.GetDynamicConfiguration()
+	return isRampUpReclaimHardPartitionEnabledWithConfig(dyn)
+}
+
+func isRampUpReclaimHardPartitionEnabledWithConfig(dyn *dynamicconfig.Configuration) bool {
 	return dyn != nil && dyn.EnableReclaim && dyn.EnableRampUpReclaimHardPartition
 }
 
@@ -4002,8 +4006,20 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloorForMode(
 	enteringRampUp bool,
 	immutablePerNUMA bool,
 ) (machine.CPUSet, error) {
+	return p.deriveRampUpReclaimFloorForModeWithDynamicConfig(
+		machineState, candidateEntries, enteringRampUp, immutablePerNUMA,
+		p.currentAdvisorAttemptConfiguration())
+}
+
+func (p *DynamicPolicy) deriveRampUpReclaimFloorForModeWithDynamicConfig(
+	machineState state.NUMANodeMap,
+	candidateEntries state.PodEntries,
+	enteringRampUp bool,
+	immutablePerNUMA bool,
+	attemptConfig advisorAttemptConfiguration,
+) (machine.CPUSet, error) {
 	floor := machine.NewCPUSet()
-	if !p.isRampUpReclaimHardPartitionEnabled() ||
+	if !isRampUpReclaimHardPartitionEnabledWithConfig(attemptConfig.dynamic) ||
 		(!enteringRampUp && !candidateEntries.HasActiveRampUp()) ||
 		p.machineInfo == nil {
 		return floor, nil
@@ -4014,7 +4030,7 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloorForMode(
 		currentReclaim = reclaimInfo.AllocationResult
 	}
 
-	ratio := p.getInitialRampUpReclaimCPUSetRatio()
+	ratio := initialRampUpReclaimCPUSetRatioFromConfig(attemptConfig.dynamic)
 	numaIDs := p.machineInfo.CPUDetails.NUMANodes().ToSliceInt()
 	eligibleByNUMA := make(map[int]machine.CPUSet, len(numaIDs))
 	availableByNUMA := make(map[int]int, len(numaIDs))
@@ -4040,14 +4056,8 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloorForMode(
 	// this path stays consistent with isRampUpReclaimHardPartitionEnabled and
 	// getInitialRampUpReclaimCPUSetRatio. in production both resolve to the same
 	// dynamic configuration object.
-	var floorConf *dynamicconfig.Configuration
-	if p.conf != nil {
-		floorConf = p.conf.GetDynamicConfiguration()
-	}
-	var ratioConf *dynamicconfig.Configuration
-	if p.dynamicConfig != nil {
-		ratioConf = p.dynamicConfig.GetDynamicConfiguration()
-	}
+	floorConf := attemptConfig.floor
+	ratioConf := attemptConfig.dynamic
 
 	// preserve p.reservedReclaimedCPUsSize as the fallback floor when the global
 	// scalar is unset, matching the pre-unification default. the config-aware
@@ -4483,10 +4493,14 @@ func (p *DynamicPolicy) podEnableReclaimOrFallback(ctx context.Context, podUID, 
 // getInitialRampUpReclaimCPUSetRatio returns the configured initial ramp-up
 // reclaim cpuset ratio ([0,1]); 0 means "reserve-only".
 func (p *DynamicPolicy) getInitialRampUpReclaimCPUSetRatio() float64 {
-	if p.dynamicConfig == nil {
-		return 0
+	var dyn *dynamicconfig.Configuration
+	if p != nil && p.dynamicConfig != nil {
+		dyn = p.dynamicConfig.GetDynamicConfiguration()
 	}
-	dyn := p.dynamicConfig.GetDynamicConfiguration()
+	return initialRampUpReclaimCPUSetRatioFromConfig(dyn)
+}
+
+func initialRampUpReclaimCPUSetRatioFromConfig(dyn *dynamicconfig.Configuration) float64 {
 	if dyn == nil {
 		return 0
 	}

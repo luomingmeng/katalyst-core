@@ -125,6 +125,125 @@ func TestBuildAdvisorBlockDescriptors_StableAcrossMapOrderAndBlockIDRotation(t *
 	}
 }
 
+func TestBuildAdvisorBlockDescriptors_MandatoryFakeEligibleExcludesNonReclaimableCPUs(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	allCPUs := topology.CPUDetails.CPUs()
+	nonReclaimable := machine.NewCPUSet(0, 3, 4)
+	resp := advisorBlockTestResponse([]advisorBlockTestAlias{{
+		entry:    commonstate.PoolNameReclaim,
+		subEntry: commonstate.FakedContainerName,
+		owner:    commonstate.PoolNameReclaim,
+		numaID:   commonstate.FakedNUMAID,
+		blockID:  "fake-reclaim",
+		quantity: 2,
+	}}, rand.New(rand.NewSource(0)))
+
+	descriptors, err := buildAdvisorBlockDescriptors(
+		resp, topology.CPUDetails, nil, nil, nonReclaimable)
+
+	require.NoError(t, err)
+	require.Len(t, descriptors, 1)
+	require.Equal(t, advisorBlockClassMandatoryReclaim, descriptors[0].Class)
+	require.Equal(t, commonstate.FakedNUMAID, descriptors[0].NUMAID)
+	require.True(t, descriptors[0].Eligible.Equals(allCPUs.Difference(nonReclaimable)))
+}
+
+func TestPlanDisjointAdvisorBlocks_ResponseDescriptorPlanAggregatesExpandedDemandsByBlockID(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	resp := advisorBlockTestResponse([]advisorBlockTestAlias{{
+		entry:    commonstate.PoolNameReclaim,
+		subEntry: commonstate.FakedContainerName,
+		owner:    commonstate.PoolNameReclaim,
+		numaID:   commonstate.FakedNUMAID,
+		blockID:  "fake-reclaim",
+		quantity: 4,
+	}}, rand.New(rand.NewSource(0)))
+	resp.DisableDedicatedCoresOverlapReclaimedCores = true
+
+	descriptors, err := buildAdvisorBlockDescriptors(
+		resp,
+		topology.CPUDetails,
+		p.state.GetPodEntries(),
+		nil,
+		machine.NewCPUSet(),
+	)
+	require.NoError(t, err)
+	require.Len(t, descriptors, 1)
+	require.Equal(t, "fake-reclaim", descriptors[0].BlockID)
+
+	planned, err := p.planDisjointAdvisorBlocks(resp, true)
+	require.NoError(t, err)
+	require.Len(t, planned, 1)
+	require.Equal(t, 4, planned["fake-reclaim"].Size())
+	require.Equal(t, 2, planned["fake-reclaim"].Intersection(
+		topology.CPUDetails.CPUsInNUMANodes(0)).Size())
+	require.Equal(t, 2, planned["fake-reclaim"].Intersection(
+		topology.CPUDetails.CPUsInNUMANodes(1)).Size())
+	requireCoreAligned(t, topology, planned["fake-reclaim"])
+}
+
+func TestPlanDisjointAdvisorBlocks_ZeroQuantityFakeBlockRemainsInCompletePlan(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	resp := advisorBlockTestResponse([]advisorBlockTestAlias{{
+		entry:    commonstate.PoolNameReclaim,
+		subEntry: commonstate.FakedContainerName,
+		owner:    commonstate.PoolNameReclaim,
+		numaID:   commonstate.FakedNUMAID,
+		blockID:  "fake-reclaim-zero",
+		quantity: 0,
+	}}, rand.New(rand.NewSource(0)))
+	resp.DisableDedicatedCoresOverlapReclaimedCores = true
+
+	planned, err := p.planDisjointAdvisorBlocks(resp, true)
+
+	require.NoError(t, err)
+	require.Contains(t, planned, "fake-reclaim-zero")
+	require.True(t, planned["fake-reclaim-zero"].IsEmpty())
+}
+
+func TestGenerateAndValidateDisjointAdvisorBlocks_ZeroQuantityFakeBlock(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	resp := advisorBlockTestResponse([]advisorBlockTestAlias{{
+		entry:    commonstate.PoolNameReclaim,
+		subEntry: commonstate.FakedContainerName,
+		owner:    commonstate.PoolNameReclaim,
+		numaID:   commonstate.FakedNUMAID,
+		blockID:  "fake-reclaim-zero",
+		quantity: 0,
+	}}, rand.New(rand.NewSource(0)))
+	resp.DisableDedicatedCoresOverlapReclaimedCores = true
+	featureGates := map[string]*advisorsvc.FeatureGate{
+		feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition: {
+			Name: feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
+		},
+	}
+
+	planned, err := p.generateBlockCPUSet(resp, featureGates, true)
+
+	require.NoError(t, err)
+	require.Contains(t, planned, "fake-reclaim-zero")
+	require.True(t, planned["fake-reclaim-zero"].IsEmpty())
+	require.NoError(t, p.validateHardPartitionBlockPlan(resp, planned, true))
+}
+
 func TestGenerateBlockCPUSetOwnerUnionsStableAcrossRandomMapOrderAndBlockIDRotation(t *testing.T) {
 	t.Parallel()
 
@@ -305,6 +424,96 @@ func TestGenerateBlockCPUSetNormalizesRealMandatoryReclaimToWholeCore(t *testing
 			Name: feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
 		},
 	}
+	blocks, err := p.generateBlockCPUSet(resp, featureGates, true)
+
+	require.NoError(t, err)
+	require.Equal(t, 20, blocks["dedicated-0"].Size())
+	require.Equal(t, 4, blocks["reclaim-0"].Size())
+	require.True(t, blocks["dedicated-0"].Intersection(blocks["reclaim-0"]).IsEmpty())
+}
+
+func TestGenerateBlockCPUSetHardNormalizationIgnoresUnavailableHeterogeneousCore(t *testing.T) {
+	t.Parallel()
+
+	topology := &machine.CPUTopology{
+		NumCPUs: 5, NumCores: 3, NumSockets: 1, NumNUMANodes: 1,
+		CPUDetails: machine.CPUDetails{
+			0: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
+			1: {NUMANodeID: 0, SocketID: 0, CoreID: 1},
+			2: {NUMANodeID: 0, SocketID: 0, CoreID: 1},
+			3: {NUMANodeID: 0, SocketID: 0, CoreID: 2},
+			4: {NUMANodeID: 0, SocketID: 0, CoreID: 2},
+		},
+	}
+	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.state.SetPodEntries(state.PodEntries{
+		commonstate.PoolNameReserve: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReserve),
+				AllocationResult: machine.NewCPUSet(0),
+			},
+		},
+	}, false)
+	resp := advisorBlockTestResponse([]advisorBlockTestAlias{
+		{
+			entry: commonstate.PoolNameReserve, subEntry: commonstate.FakedContainerName,
+			owner: commonstate.PoolNameReserve, numaID: commonstate.FakedNUMAID,
+			blockID: "reserve", quantity: 1,
+		},
+		{
+			entry: "pod-0", subEntry: "main", owner: commonstate.PoolNameDedicated,
+			numaID: 0, blockID: "dedicated-0", quantity: 3,
+		},
+		{
+			entry: commonstate.PoolNameReclaim, subEntry: commonstate.FakedContainerName,
+			owner: commonstate.PoolNameReclaim, numaID: 0, blockID: "reclaim-0", quantity: 1,
+		},
+	}, rand.New(rand.NewSource(1)))
+	resp.DisableDedicatedCoresOverlapReclaimedCores = true
+	featureGates := map[string]*advisorsvc.FeatureGate{
+		feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition: {
+			Name: feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
+		},
+	}
+
+	blocks, err := p.generateBlockCPUSet(resp, featureGates, true)
+
+	require.NoError(t, err)
+	require.True(t, blocks["reserve"].Equals(machine.NewCPUSet(0)))
+	require.Equal(t, 2, blocks["dedicated-0"].Size())
+	require.Equal(t, 2, blocks["reclaim-0"].Size())
+	require.True(t, blocks["dedicated-0"].Intersection(blocks["reclaim-0"]).IsEmpty())
+	require.True(t, blocks["dedicated-0"].Union(blocks["reclaim-0"]).Equals(machine.NewCPUSet(1, 2, 3, 4)))
+}
+
+func TestGenerateBlockCPUSetSteadyNormalizesRealMandatoryReclaimToWholeCore(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	resp := advisorBlockTestResponse([]advisorBlockTestAlias{
+		{
+			entry: "pod-0", subEntry: "main", owner: commonstate.PoolNameDedicated,
+			numaID: 0, blockID: "dedicated-0", quantity: 21,
+		},
+		{
+			entry: commonstate.PoolNameReclaim, subEntry: commonstate.FakedContainerName,
+			owner: commonstate.PoolNameReclaim, numaID: 0, blockID: "reclaim-0", quantity: 3,
+		},
+		{
+			entry: commonstate.PoolNameReclaim, subEntry: commonstate.FakedContainerName,
+			owner: commonstate.PoolNameReclaim, numaID: commonstate.FakedNUMAID,
+			blockID: "fake-reclaim", quantity: 2,
+		},
+	}, rand.New(rand.NewSource(1)))
+	resp.DisableDedicatedCoresOverlapReclaimedCores = true
+	featureGates := map[string]*advisorsvc.FeatureGate{
+		feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition: {
+			Name: feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
+		},
+	}
+
 	blocks, err := p.generateBlockCPUSet(resp, featureGates, false)
 
 	require.NoError(t, err)
@@ -903,7 +1112,7 @@ func TestBuildAdvisorBlockDescriptors_FailsClosedWhenEligibleCapacityIsInsuffici
 	require.ErrorContains(t, err, "eligible capacity")
 }
 
-func TestExpandHardPartitionReclaimPhase_MixedRealAndFakeWaterFilling(t *testing.T) {
+func TestExpandHardPartitionReclaimPhase_MixedRealAndFakeUseDisjointNUMAs(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
@@ -934,9 +1143,324 @@ func TestExpandHardPartitionReclaimPhase_MixedRealAndFakeWaterFilling(t *testing
 	require.NoError(t, err)
 	require.Equal(t, map[string]map[int]int{
 		"real-0": {0: 2},
-		"fake":   {0: 2, 1: 2},
+		"fake":   {1: 4},
 	}, hardReclaimDemandQuotasByBlock(t, demands, topology))
-	requireHardReclaimFinalBalance(t, demands, topology, []int{0, 1})
+}
+
+func TestExpandHardPartitionReclaimPhase_ExcludesSkipNUMAsWithoutRealMandatory(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	all := topology.CPUDetails.CPUs()
+	descriptors := []advisorBlockDescriptor{{
+		BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
+		Quantity: 2, ComponentKey: "fake", Eligible: all,
+	}}
+
+	demands, _, err := expandHardPartitionReclaimPhase(
+		descriptors, all, topology, sets.NewInt(0))
+
+	require.NoError(t, err)
+	require.Equal(t, map[string]map[int]int{
+		"fake": {1: 2},
+	}, hardReclaimDemandQuotasByBlock(t, demands, topology))
+}
+
+func TestExpandHardPartitionReclaimPhase_RejectsHeterogeneousParticipatingRealAndFakeDomains(t *testing.T) {
+	t.Parallel()
+
+	topology := &machine.CPUTopology{
+		NumCPUs: 6, NumCores: 4, NumSockets: 1, NumNUMANodes: 2,
+		CPUDetails: machine.CPUDetails{
+			0: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
+			1: {NUMANodeID: 0, SocketID: 0, CoreID: 1},
+			2: {NUMANodeID: 1, SocketID: 0, CoreID: 2},
+			3: {NUMANodeID: 1, SocketID: 0, CoreID: 2},
+			4: {NUMANodeID: 1, SocketID: 0, CoreID: 3},
+			5: {NUMANodeID: 1, SocketID: 0, CoreID: 3},
+		},
+	}
+	all := topology.CPUDetails.CPUs()
+	descriptors := []advisorBlockDescriptor{
+		{
+			BlockID: "real-smt1", Class: advisorBlockClassMandatoryReclaim, NUMAID: 0,
+			Quantity: 1, ComponentKey: "real-smt1", Eligible: topology.CPUDetails.CPUsInNUMANodes(0),
+		},
+		{
+			BlockID: "fake-smt2", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
+			Quantity: 2, ComponentKey: "fake-smt2", Eligible: all,
+		},
+	}
+
+	_, _, err := expandHardPartitionReclaimPhase(descriptors, all, topology, nil)
+	require.ErrorContains(t, err, "non-uniform physical core width")
+}
+
+func TestExpandHardPartitionReclaimPhase_IgnoresDedicatedSaturatedHeterogeneousNUMAForFakeCoreWidth(t *testing.T) {
+	t.Parallel()
+
+	topology := &machine.CPUTopology{
+		NumCPUs: 6, NumCores: 4, NumSockets: 1, NumNUMANodes: 2,
+		CPUDetails: machine.CPUDetails{
+			0: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
+			1: {NUMANodeID: 0, SocketID: 0, CoreID: 1},
+			2: {NUMANodeID: 1, SocketID: 0, CoreID: 2},
+			3: {NUMANodeID: 1, SocketID: 0, CoreID: 2},
+			4: {NUMANodeID: 1, SocketID: 0, CoreID: 3},
+			5: {NUMANodeID: 1, SocketID: 0, CoreID: 3},
+		},
+	}
+	all := topology.CPUDetails.CPUs()
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	descriptors := []advisorBlockDescriptor{
+		{
+			BlockID: "dedicated-smt1", Class: advisorBlockClassDedicated, NUMAID: 0,
+			Quantity: numa0.Size(), ComponentKey: "dedicated-smt1", Eligible: numa0,
+		},
+		{
+			BlockID: "fake-smt2", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
+			Quantity: 2, ComponentKey: "fake-smt2", Eligible: all,
+		},
+	}
+
+	demands, _, err := expandHardPartitionReclaimPhase(descriptors, all, topology, nil)
+
+	require.NoError(t, err)
+	require.Equal(t, map[string]map[int]int{
+		"fake-smt2": {1: 2},
+	}, hardReclaimDemandQuotasByBlock(t, demands, topology))
+}
+
+func TestExpandHardPartitionReclaimPhase_IgnoresSkippedHeterogeneousCoreWidth(t *testing.T) {
+	t.Parallel()
+
+	topology := &machine.CPUTopology{
+		NumCPUs: 9, NumCores: 5, NumSockets: 1, NumNUMANodes: 3,
+		CPUDetails: machine.CPUDetails{
+			0: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
+			1: {NUMANodeID: 1, SocketID: 0, CoreID: 1},
+			2: {NUMANodeID: 1, SocketID: 0, CoreID: 1},
+			3: {NUMANodeID: 1, SocketID: 0, CoreID: 2},
+			4: {NUMANodeID: 1, SocketID: 0, CoreID: 2},
+			5: {NUMANodeID: 2, SocketID: 0, CoreID: 3},
+			6: {NUMANodeID: 2, SocketID: 0, CoreID: 3},
+			7: {NUMANodeID: 2, SocketID: 0, CoreID: 4},
+			8: {NUMANodeID: 2, SocketID: 0, CoreID: 4},
+		},
+	}
+	all := topology.CPUDetails.CPUs()
+	descriptors := []advisorBlockDescriptor{{
+		BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
+		Quantity: 4, ComponentKey: "fake", Eligible: all,
+	}}
+	skipNUMAs := sets.NewInt(0)
+
+	demands, _, err := expandHardPartitionReclaimPhase(
+		descriptors, all, topology, skipNUMAs)
+	require.NoError(t, err)
+	require.Equal(t, map[string]map[int]int{
+		"fake": {1: 2, 2: 2},
+	}, hardReclaimDemandQuotasByBlock(t, demands, topology))
+}
+
+func TestExpandHardPartitionReclaimPhase_IgnoresDedicatedOnNonParticipatingNUMA(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(12, 1, 3)
+	require.NoError(t, err)
+	all := topology.CPUDetails.CPUs()
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	numa1 := topology.CPUDetails.CPUsInNUMANodes(1)
+	numa2 := topology.CPUDetails.CPUsInNUMANodes(2)
+
+	for _, tc := range []struct {
+		name         string
+		fakeEligible machine.CPUSet
+		skipNUMAs    sets.Int
+	}{
+		{
+			name:         "outside fake eligibility",
+			fakeEligible: numa0.Union(numa1),
+		},
+		{
+			name:         "skipped for fake reclaim",
+			fakeEligible: all,
+			skipNUMAs:    sets.NewInt(2),
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			descriptors := []advisorBlockDescriptor{
+				{
+					BlockID: "dedicated-2", Class: advisorBlockClassDedicated, NUMAID: 2,
+					Quantity: 2, ComponentKey: "dedicated-2", Eligible: numa2,
+				},
+				{
+					BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
+					Quantity: 4, ComponentKey: "fake", Eligible: tc.fakeEligible,
+				},
+			}
+
+			demands, _, err := expandHardPartitionReclaimPhase(
+				descriptors, all, topology, tc.skipNUMAs)
+
+			require.NoError(t, err)
+			require.Equal(t, map[string]map[int]int{
+				"fake": {0: 2, 1: 2},
+			}, hardReclaimDemandQuotasByBlock(t, demands, topology))
+		})
+	}
+}
+
+func TestExpandHardPartitionReclaimPhase_ZeroQuantityAllowsEmptyTarget(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	descriptors := []advisorBlockDescriptor{{
+		BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
+		Quantity: 0, ComponentKey: "fake", Eligible: machine.NewCPUSet(),
+	}}
+
+	demands, blockIDs, err := expandHardPartitionReclaimPhase(
+		descriptors, topology.CPUDetails.CPUs(), topology, nil)
+	require.NoError(t, err)
+	require.Empty(t, demands)
+	require.Empty(t, blockIDs)
+}
+
+func TestExpandHardPartitionReclaimPhase_MultipleRealNUMAsDeductCapacityAndStayDeterministic(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(32, 1, 4)
+	require.NoError(t, err)
+	all := topology.CPUDetails.CPUs()
+	base := []advisorBlockDescriptor{
+		{
+			BlockID: "real-0", Class: advisorBlockClassMandatoryReclaim, NUMAID: 0,
+			Quantity: 2, ComponentKey: "real-0", Eligible: topology.CPUDetails.CPUsInNUMANodes(0),
+		},
+		{
+			BlockID: "real-2", Class: advisorBlockClassMandatoryReclaim, NUMAID: 2,
+			Quantity: 2, ComponentKey: "real-2", Eligible: topology.CPUDetails.CPUsInNUMANodes(2),
+		},
+		{
+			BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
+			Quantity: 8, ComponentKey: "fake", Eligible: all,
+		},
+	}
+	want := map[string]map[int]int{
+		"real-0": {0: 2},
+		"real-2": {2: 2},
+		"fake":   {1: 4, 3: 4},
+	}
+	for seed := int64(0); seed < 20; seed++ {
+		descriptors := append([]advisorBlockDescriptor(nil), base...)
+		rand.New(rand.NewSource(seed)).Shuffle(len(descriptors), func(i, j int) {
+			descriptors[i], descriptors[j] = descriptors[j], descriptors[i]
+		})
+		demands, blockIDs, solveErr := expandHardPartitionReclaimPhase(
+			descriptors, all, topology, nil)
+		require.NoError(t, solveErr, "seed %d", seed)
+		require.Equal(t, want, hardReclaimDemandQuotasByBlock(t, demands, topology), "seed %d", seed)
+		for demandKey, blockID := range blockIDs {
+			require.Contains(t, demandKey, "\x00block\x00"+blockID+"\x00", "seed %d", seed)
+		}
+	}
+}
+
+func TestExpandHardPartitionReclaimPhase_AllowsCapacitySaturatedImbalance(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(16, 1, 2)
+	require.NoError(t, err)
+	eligible := coresInNUMA(topology, 0, 0, 1).
+		Union(coresInNUMA(topology, 1, 0, 3))
+	descriptors := []advisorBlockDescriptor{{
+		BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
+		Quantity: 8, ComponentKey: "fake", Eligible: eligible, OldPreferred: eligible,
+	}}
+
+	demands, _, err := expandHardPartitionReclaimPhase(
+		descriptors, topology.CPUDetails.CPUs(), topology, nil)
+
+	require.NoError(t, err)
+	require.Equal(t, map[string]map[int]int{
+		"fake": {0: 2, 1: 6},
+	}, hardReclaimDemandQuotasByBlock(t, demands, topology))
+}
+
+func TestExpandHardPartitionReclaimPhase_RejectsFakeConfinedToRealMandatoryNUMA(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	descriptors := []advisorBlockDescriptor{
+		{
+			BlockID: "real-0", Class: advisorBlockClassMandatoryReclaim, NUMAID: 0,
+			Quantity: 2, ComponentKey: "real-0", Eligible: numa0,
+		},
+		{
+			BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
+			Quantity: 2, ComponentKey: "fake", Eligible: numa0,
+		},
+	}
+
+	_, _, err = expandHardPartitionReclaimPhase(
+		descriptors, topology.CPUDetails.CPUs(), topology, nil)
+	require.ErrorContains(t, err, "no effective NUMA capacity")
+}
+
+func TestExpandHardPartitionReclaimPhase_IgnoresNonCandidateCoreWidth(t *testing.T) {
+	t.Parallel()
+
+	topology := &machine.CPUTopology{
+		NumCPUs: 5, NumCores: 3, NumSockets: 1, NumNUMANodes: 1,
+		CPUDetails: machine.CPUDetails{
+			0: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
+			1: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
+			2: {NUMANodeID: 0, SocketID: 0, CoreID: 1},
+			3: {NUMANodeID: 0, SocketID: 0, CoreID: 1},
+			4: {NUMANodeID: 0, SocketID: 0, CoreID: 2},
+		},
+	}
+	eligible := machine.NewCPUSet(0, 1, 2, 3)
+	descriptors := []advisorBlockDescriptor{{
+		BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
+		Quantity: 4, ComponentKey: "fake", Eligible: eligible,
+	}}
+
+	demands, _, err := expandHardPartitionReclaimPhase(
+		descriptors, topology.CPUDetails.CPUs(), topology, nil)
+	require.NoError(t, err)
+	require.Equal(t, map[string]map[int]int{
+		"fake": {0: 4},
+	}, hardReclaimDemandQuotasByBlock(t, demands, topology))
+}
+
+func TestExpandHardPartitionReclaimPhase_RejectsNonUniformPhysicalCoreWidths(t *testing.T) {
+	t.Parallel()
+
+	topology := &machine.CPUTopology{
+		NumCPUs: 3, NumCores: 2, NumSockets: 1, NumNUMANodes: 1,
+		CPUDetails: machine.CPUDetails{
+			0: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
+			1: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
+			2: {NUMANodeID: 0, SocketID: 0, CoreID: 1},
+		},
+	}
+	descriptors := []advisorBlockDescriptor{{
+		BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
+		Quantity: 1, ComponentKey: "fake", Eligible: topology.CPUDetails.CPUs(),
+	}}
+
+	_, _, err := expandHardPartitionReclaimPhase(
+		descriptors, topology.CPUDetails.CPUs(), topology, nil)
+	require.ErrorContains(t, err, "non-uniform physical core width")
 }
 
 func TestExpandHardPartitionReclaimPhase_WaterFillsCompleteCores(t *testing.T) {
@@ -967,18 +1491,10 @@ func TestExpandHardPartitionReclaimPhase_WaterFillsCompleteCores(t *testing.T) {
 
 	demands, _, err := expandHardPartitionReclaimPhase(descriptors, available, topology, nil)
 	require.NoError(t, err)
-
-	final := make(map[int]int)
-	for _, demand := range demands {
-		numaIDs := topology.CPUDetails.KeepOnly(demand.eligible).NUMANodes().ToSliceInt()
-		require.Len(t, numaIDs, 1)
-		final[numaIDs[0]] += demand.quantity
-	}
-	for numaID, quantity := range final {
-		require.Zerof(t, quantity%cpusPerCore,
-			"NUMA %d hard reclaim total %d must be a whole-core multiple of %d",
-			numaID, quantity, cpusPerCore)
-	}
+	require.Equal(t, map[string]map[int]int{
+		"real-0": {0: 2},
+		"fake":   {1: 4},
+	}, hardReclaimDemandQuotasByBlock(t, demands, topology))
 }
 
 func TestExpandHardPartitionReclaimPhase_MultipleFakeBlocksFailClosed(t *testing.T) {
@@ -1043,18 +1559,15 @@ func TestExpandHardPartitionReclaimPhase_FailsWhenPositiveFakeDemandHasNoEligibl
 	require.NotPanics(t, func() {
 		_, _, err = expandHardPartitionReclaimPhase(descriptors, topology.CPUDetails.CPUs(), topology, nil)
 	})
-	require.ErrorContains(t, err, `hard reclaim fake block "empty-eligible" has quantity 1 but no eligible NUMA`)
+	require.ErrorContains(t, err, `hard reclaim fake block "empty-eligible" has quantity 1 but no effective NUMA capacity`)
 }
 
-func TestExpandHardPartitionReclaimPhase_SkipsSteadyExclusiveNUMAImbalance(t *testing.T) {
+func TestExpandHardPartitionReclaimPhase_RejectsFakeWhenEveryNUMAHasRealMandatory(t *testing.T) {
 	t.Parallel()
 
-	// SMT2, two NUMAs. NUMA0 is wholly owned by a committed steady exclusive DNB:
-	// only its 2-cpu steady reclaim reserve remains and is emitted as a real
-	// mandatory block. NUMA1 is ramping up: a 2-cpu seed plus a 4-cpu fake block
-	// water-fill it to its 6-cpu ratio target. Without the steady-exclusive
-	// carve-out the planner compares NUMA0's finalized reserve (2) against NUMA1's
-	// ramp-up target (6) and fails closed on a false cross-NUMA imbalance.
+	// SMT2, two NUMAs. Both NUMAs publish real mandatory reclaim blocks, so the
+	// fake block has no NUMA domain left. A steady-exclusive skip does not make a
+	// real mandatory NUMA eligible for fake reclaim again.
 	topology, err := machine.GenerateDummyCPUTopology(64, 1, 2)
 	require.NoError(t, err)
 	require.Equal(t, 2, topology.CPUsPerCore())
@@ -1091,23 +1604,12 @@ func TestExpandHardPartitionReclaimPhase_SkipsSteadyExclusiveNUMAImbalance(t *te
 		},
 	}
 
-	// Empty skip set reproduces the false imbalance failure.
 	_, _, err = expandHardPartitionReclaimPhase(descriptors, available, topology, nil)
-	require.ErrorContains(t, err, "imbalanced")
+	require.ErrorContains(t, err, "no effective NUMA capacity")
 
-	// Skipping the steady exclusive NUMA lets the finalized reserve coexist with
-	// the ramp-up target on the other NUMA.
-	demands, _, err := expandHardPartitionReclaimPhase(
+	_, _, err = expandHardPartitionReclaimPhase(
 		descriptors, available, topology, sets.NewInt(0))
-	require.NoError(t, err)
-	final := make(map[int]int)
-	for _, demand := range demands {
-		numaIDs := topology.CPUDetails.KeepOnly(demand.eligible).NUMANodes().ToSliceInt()
-		require.Len(t, numaIDs, 1)
-		final[numaIDs[0]] += demand.quantity
-	}
-	require.Equal(t, 2, final[0])
-	require.Equal(t, 6, final[1])
+	require.ErrorContains(t, err, "no effective NUMA capacity")
 }
 
 func hardReclaimDemandQuotasByBlock(
@@ -1138,7 +1640,7 @@ func hardReclaimDemandQuotasByBlock(
 	return quotas
 }
 
-func TestExpandHardPartitionReclaimPhaseFakeCapacityExcludesRealReclaim(t *testing.T) {
+func TestExpandHardPartitionReclaimPhaseFakeCapacityExcludesRealReclaimNUMA(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)

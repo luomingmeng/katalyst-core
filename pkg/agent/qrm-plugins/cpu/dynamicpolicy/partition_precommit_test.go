@@ -29,12 +29,27 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
 type retryablePartitionCommitError interface {
 	error
 	Retryable() bool
+}
+
+type alternatingDynamicConfigurationSource struct {
+	configs []*dynamicconfig.Configuration
+	reads   int
+}
+
+func (s *alternatingDynamicConfigurationSource) GetDynamicConfiguration() *dynamicconfig.Configuration {
+	index := s.reads
+	s.reads++
+	if index >= len(s.configs) {
+		index = len(s.configs) - 1
+	}
+	return s.configs[index]
 }
 
 func TestCommitPendingCPUPartitionRejectsOrdinaryWriterWhileAdvisorTargetPending(t *testing.T) {
@@ -92,6 +107,126 @@ func TestCommitPendingCPUPartitionRunsHooksBeforeValidation(t *testing.T) {
 	require.Nil(t, p.state.GetAllocationInfo("dedicated-pod", "main"),
 		"candidate made invalid by a hook must not be committed")
 	require.Empty(t, emitter.records, "failed commit must not emit pool size metrics")
+}
+
+func TestPreparePendingCPUPartitionUsesFrozenDynamicConfiguration(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	frozen := p.dynamicConfig.GetDynamicConfiguration()
+	frozen.FillDefaultSharePoolWithNonReclaimCPUs = false
+	replacement := dynamicconfig.NewConfiguration()
+	replacement.FillDefaultSharePoolWithNonReclaimCPUs = true
+	p.dynamicConfig.SetDynamicConfiguration(replacement)
+
+	_, err := p.preparePendingCPUPartition(pendingCPUPartition{
+		expectedRevision: p.state.GetRevision(),
+		entries: precommitPartitionEntries(
+			machine.NewCPUSet(0, 1),
+			machine.NewCPUSet(2, 3),
+		),
+		dynamicConfig: frozen,
+		persist:       false,
+		source:        "frozen dynamic configuration test",
+	})
+	require.NoError(t, err)
+}
+
+func TestCaptureAdvisorAttemptConfigurationClonesMutableFields(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	current := p.dynamicConfig.GetDynamicConfiguration()
+	current.EnableRampUpReclaimHardPartition = true
+	current.InitialRampUpReclaimCPUSetRatio = 0.2
+	current.SystemExclusivePool = map[string]int{"system": 2}
+	shrinkRatio := 0.5
+	current.SystemExclusivePoolShrinkRatio = &shrinkRatio
+
+	frozen, err := p.captureAdvisorAttemptConfiguration()
+	require.NoError(t, err)
+	require.NotNil(t, frozen.dynamic)
+	require.NotNil(t, frozen.floor)
+
+	current.EnableRampUpReclaimHardPartition = false
+	current.InitialRampUpReclaimCPUSetRatio = 0
+	current.SystemExclusivePool["system"] = 4
+	*current.SystemExclusivePoolShrinkRatio = 0.9
+
+	require.True(t, frozen.dynamic.EnableRampUpReclaimHardPartition)
+	require.Equal(t, 0.2, frozen.dynamic.InitialRampUpReclaimCPUSetRatio)
+	require.Equal(t, map[string]int{"system": 2}, frozen.dynamic.SystemExclusivePool)
+	require.Equal(t, 0.5, *frozen.dynamic.SystemExclusivePoolShrinkRatio)
+}
+
+func TestCaptureAdvisorAttemptConfigurationReadsOncePerAttempt(t *testing.T) {
+	first := dynamicconfig.NewConfiguration()
+	first.EnableReclaim = true
+	first.EnableRampUpReclaimHardPartition = true
+	first.InitialRampUpReclaimCPUSetRatio = 0.2
+	second := dynamicconfig.NewConfiguration()
+	second.EnableReclaim = false
+	second.EnableRampUpReclaimHardPartition = false
+	second.InitialRampUpReclaimCPUSetRatio = 0
+	source := &alternatingDynamicConfigurationSource{
+		configs: []*dynamicconfig.Configuration{first, second},
+	}
+
+	attemptOne, err := captureAdvisorAttemptConfigurationFrom(source)
+	require.NoError(t, err)
+	require.Equal(t, 1, source.reads)
+	require.True(t, attemptOne.dynamic.EnableReclaim)
+	require.True(t, attemptOne.dynamic.EnableRampUpReclaimHardPartition)
+	require.Equal(t, 0.2, attemptOne.dynamic.InitialRampUpReclaimCPUSetRatio)
+	require.Same(t, attemptOne.dynamic, attemptOne.floor)
+
+	attemptTwo, err := captureAdvisorAttemptConfigurationFrom(source)
+	require.NoError(t, err)
+	require.Equal(t, 2, source.reads)
+	require.False(t, attemptTwo.dynamic.EnableReclaim)
+	require.False(t, attemptTwo.dynamic.EnableRampUpReclaimHardPartition)
+	require.Zero(t, attemptTwo.dynamic.InitialRampUpReclaimCPUSetRatio)
+}
+
+func TestPreparePendingCPUPartitionDerivesHardFloorFromFinalCandidate(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+
+	current := p.dynamicConfig.GetDynamicConfiguration()
+	current.EnableReclaim = true
+	current.EnableRampUpReclaimHardPartition = true
+	current.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.Enable = true
+	frozen, err := p.captureAdvisorAttemptConfiguration()
+	require.NoError(t, err)
+
+	candidate := precommitPartitionEntries(machine.NewCPUSet(0, 1), machine.NewCPUSet(2, 3))
+	require.False(t, candidate.HasActiveRampUp())
+	p.allocationHooks = []AllocationHook{func(_, allocation *state.AllocationInfo) error {
+		if allocation.PodUid == "dedicated-pod" {
+			allocation.RampUp = true
+		}
+		return nil
+	}}
+
+	validated := false
+	_, err = p.preparePendingCPUPartition(pendingCPUPartition{
+		expectedRevision: p.state.GetRevision(),
+		entries:          candidate,
+		dynamicConfig:    frozen.dynamic,
+		persist:          false,
+		source:           "final candidate hard floor test",
+		validate: func(entries state.PodEntries, _ state.NUMANodeMap, _, _ bool) error {
+			validated = true
+			require.True(t, entries.HasActiveRampUp())
+			options := p.cpuSetPartitionViewOptionsWithDynamicConfig(
+				p.state, entries.HasActiveRampUp(), frozen.dynamic)
+			require.True(t, options.HardPartitionEnabled)
+			return nil
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, validated)
+	require.False(t, candidate.HasActiveRampUp(), "precommit must not mutate the caller's candidate")
 }
 
 func TestCommitPendingCPUPartitionValidatesResidualBackfillAfterHooks(t *testing.T) {

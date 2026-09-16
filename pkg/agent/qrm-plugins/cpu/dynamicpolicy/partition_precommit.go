@@ -21,6 +21,7 @@ import (
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -36,6 +37,7 @@ type pendingCPUPartition struct {
 	requireCoreAlignedReclaim bool
 	enforceSteadyReclaim      bool
 	residualFloor             machine.CPUSet
+	dynamicConfig             *dynamicconfig.Configuration
 }
 
 type preparedCPUPartition struct {
@@ -67,6 +69,9 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 ) (*preparedCPUPartition, error) {
 	if p == nil || p.state == nil {
 		return nil, fmt.Errorf("prepare pending cpu partition: policy is not initialized")
+	}
+	if pending.dynamicConfig == nil {
+		pending.dynamicConfig = p.currentAdvisorAttemptConfiguration().dynamic
 	}
 	if pending.entries == nil {
 		return nil, fmt.Errorf("prepare pending cpu partition: entries are nil")
@@ -123,7 +128,8 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 			return nil, p.wrapPartitionPrecommitError(pending.source, "rebuild machine state", err)
 		}
 	}
-	if err := p.validateResidualBackfillCandidate(candidate, machineState, pending.residualFloor); err != nil {
+	if err := p.validateResidualBackfillCandidateWithDynamicConfig(
+		candidate, machineState, pending.residualFloor, pending.dynamicConfig); err != nil {
 		return nil, p.wrapPartitionPrecommitError(pending.source, "validate residual backfill candidate", err)
 	}
 	if err := validatePendingPoolOwnership(candidate); err != nil {
@@ -131,7 +137,14 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 	}
 	validate := pending.validate
 	if validate == nil {
-		validate = p.validateAdvisorPartitionBeforeCommit
+		validate = func(
+			entries state.PodEntries,
+			machineState state.NUMANodeMap,
+			allowOverlap, disableDedicated bool,
+		) error {
+			return p.validateAdvisorPartitionBeforeCommitWithDynamicConfig(
+				entries, machineState, allowOverlap, disableDedicated, pending.dynamicConfig)
+		}
 	}
 	if err := validate(candidate, machineState, pending.allowOverlap, pending.disableDedicated); err != nil {
 		return nil, p.wrapPartitionPrecommitError(pending.source, "validate hard floor and partition", err)
@@ -166,10 +179,20 @@ func (p *DynamicPolicy) validateResidualBackfillCandidate(
 	machineState state.NUMANodeMap,
 	residualFloor machine.CPUSet,
 ) error {
-	if p.dynamicConfig == nil {
-		return nil
+	var dynamicConfig *dynamicconfig.Configuration
+	if p != nil && p.dynamicConfig != nil {
+		dynamicConfig = p.dynamicConfig.GetDynamicConfiguration()
 	}
-	dynamicConfig := p.dynamicConfig.GetDynamicConfiguration()
+	return p.validateResidualBackfillCandidateWithDynamicConfig(
+		entries, machineState, residualFloor, dynamicConfig)
+}
+
+func (p *DynamicPolicy) validateResidualBackfillCandidateWithDynamicConfig(
+	entries state.PodEntries,
+	machineState state.NUMANodeMap,
+	residualFloor machine.CPUSet,
+	dynamicConfig *dynamicconfig.Configuration,
+) error {
 	if dynamicConfig == nil || !dynamicConfig.FillDefaultSharePoolWithNonReclaimCPUs {
 		return nil
 	}

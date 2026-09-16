@@ -125,6 +125,7 @@ type PlanOperation struct {
 type AdmissionSafetyInput struct {
 	ProtectedPendingCPUSet machine.CPUSet
 	DeferredCPUSetByRel    map[string]machine.CPUSet
+	RequiredCPUSetByRel    map[string]machine.CPUSet
 }
 
 // SplitPlanForAdmission returns an executable safety closure and a summary-only
@@ -172,6 +173,9 @@ func SplitPlanForAdmission(plan *PhasePlan, in AdmissionSafetyInput) (required, 
 			classes[i] = operationClass{required: true, requirement: OperationAdmissionAncestorGrow}
 		case operation.Direction == WriteGrow &&
 			!addedCPUs.Intersection(incomingCPUsByDestination[operationDomain]).IsEmpty():
+			classes[i] = operationClass{required: true, requirement: OperationAdmissionSafetyRepair}
+		case operation.Direction == WriteGrow &&
+			!addedCPUs.Intersection(in.RequiredCPUSetByRel[operation.Rel]).IsEmpty():
 			classes[i] = operationClass{required: true, requirement: OperationAdmissionSafetyRepair}
 		case explicitlyDeferred &&
 			operation.Direction == WriteShrink &&
@@ -341,11 +345,30 @@ type PhasePlan struct {
 	ControlledRels   []string
 	Witnesses        []ReleaseWitness
 	TransferGraph    map[DomainID]map[DomainID]machine.CPUSet
-	TargetByRel      map[string]CPUSetTarget
-	AllowedEntering  map[DomainID]machine.CPUSet
-	DrainBatch       map[DomainID]machine.CPUSet
-	Operations       []PlanOperation
-	CostUpperBound   BudgetUsage
+	// CanonicalTargetByRel is the immutable final target for the convergence
+	// attempt. TargetByRel remains the executable target for this phase.
+	CanonicalTargetByRel map[string]CPUSetTarget
+	TargetByRel          map[string]CPUSetTarget
+	AllowedEntering      map[DomainID]machine.CPUSet
+	DrainBatch           map[DomainID]machine.CPUSet
+	Operations           []PlanOperation
+	CostUpperBound       BudgetUsage
+}
+
+func finalAdmissionTarget(plan *PhasePlan) map[string]CPUSetTarget {
+	if plan == nil {
+		return nil
+	}
+	targets := make(map[string]CPUSetTarget, len(plan.TargetByRel)+len(plan.CanonicalTargetByRel))
+	for rel, target := range plan.TargetByRel {
+		target.CPUs = target.CPUs.Clone()
+		targets[rel] = target
+	}
+	for rel, target := range plan.CanonicalTargetByRel {
+		target.CPUs = target.CPUs.Clone()
+		targets[rel] = target
+	}
+	return targets
 }
 
 type RoundStatus string
@@ -459,18 +482,19 @@ func buildPhasePlanWithStats(in PhasePlanInput, stats *plannerBuildStats) (Phase
 	}
 
 	plan := PhasePlan{
-		ConvergenceID:    canonicalConvergenceID(in),
-		Base:             in.Snapshot,
-		FailClosedRoots:  normalizeRels(in.Snapshot.ScanBoundary.Roots),
-		Kind:             in.Kind,
-		AllowEmptyTarget: in.AllowEmptyTarget,
-		Capabilities:     in.Capabilities,
-		ControlledRels:   controlledRels,
-		Witnesses:        append([]ReleaseWitness(nil), in.Witnesses...),
-		TransferGraph:    graph,
-		TargetByRel:      make(map[string]CPUSetTarget, len(in.Snapshot.Entries)),
-		AllowedEntering:  make(map[DomainID]machine.CPUSet, len(domains)),
-		DrainBatch:       make(map[DomainID]machine.CPUSet, len(domains)),
+		ConvergenceID:        canonicalConvergenceID(in),
+		Base:                 in.Snapshot,
+		FailClosedRoots:      normalizeRels(in.Snapshot.ScanBoundary.Roots),
+		Kind:                 in.Kind,
+		AllowEmptyTarget:     in.AllowEmptyTarget,
+		Capabilities:         in.Capabilities,
+		ControlledRels:       controlledRels,
+		Witnesses:            append([]ReleaseWitness(nil), in.Witnesses...),
+		TransferGraph:        graph,
+		CanonicalTargetByRel: canonicalPhaseTargets(in),
+		TargetByRel:          make(map[string]CPUSetTarget, len(in.Snapshot.Entries)),
+		AllowedEntering:      make(map[DomainID]machine.CPUSet, len(domains)),
+		DrainBatch:           make(map[DomainID]machine.CPUSet, len(domains)),
 	}
 	switch in.Kind {
 	case PhaseDrain:
@@ -530,6 +554,26 @@ func buildPhasePlanWithStats(in PhasePlanInput, stats *plannerBuildStats) (Phase
 	}
 	plan.CostUpperBound = BudgetUsage{Domains: len(domains), Edges: edgeCount, Operations: len(operations)}
 	return plan, nil
+}
+
+func canonicalPhaseTargets(in PhasePlanInput) map[string]CPUSetTarget {
+	targets := make(map[string]CPUSetTarget, len(in.DAG.index))
+	for _, node := range in.DAG.Nodes() {
+		cpus := node.CPUs.Clone()
+		if desired, ok := in.DesiredByRel[node.Rel]; ok {
+			cpus = desired.Clone()
+		}
+		mems := node.Mems
+		if desiredMems := in.DesiredMemsByRel[node.Rel]; desiredMems != "" {
+			mems = desiredMems
+		} else if mems == "" {
+			if current, ok := in.Snapshot.Entries[node.Rel]; ok {
+				mems = current.Mems
+			}
+		}
+		targets[node.Rel] = CPUSetTarget{CPUs: cpus, Mems: mems}
+	}
+	return targets
 }
 
 func canonicalConvergenceID(in PhasePlanInput) string {
@@ -676,6 +720,19 @@ func canonicalExecutionPlanID(plan PhasePlan) string {
 	writeHashUint64(hash, uint64(len(controlledRels)))
 	for _, rel := range controlledRels {
 		writeHashString(hash, rel)
+	}
+
+	canonicalRels := make([]string, 0, len(plan.CanonicalTargetByRel))
+	for rel := range plan.CanonicalTargetByRel {
+		canonicalRels = append(canonicalRels, rel)
+	}
+	sort.Strings(canonicalRels)
+	writeHashUint64(hash, uint64(len(canonicalRels)))
+	for _, rel := range canonicalRels {
+		target := plan.CanonicalTargetByRel[rel]
+		writeHashString(hash, rel)
+		writeHashString(hash, target.CPUs.String())
+		writeHashString(hash, target.Mems)
 	}
 
 	writeHashUint64(hash, uint64(len(plan.Operations)))

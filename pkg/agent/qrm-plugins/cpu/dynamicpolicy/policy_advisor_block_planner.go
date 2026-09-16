@@ -374,6 +374,253 @@ func hasFakeNUMAMandatoryReclaimDescriptor(descriptors []advisorBlockDescriptor)
 	return false
 }
 
+func uniformCandidateCoreWidth(
+	topology *machine.CPUTopology,
+	candidateCPUs machine.CPUSet,
+) (int, error) {
+	if topology == nil {
+		return 0, fmt.Errorf("cannot validate physical core width with nil CPU topology")
+	}
+	candidates := coreAlignedCandidates(topology, candidateCPUs, machine.NewCPUSet())
+	width := 0
+	for _, candidate := range candidates {
+		cpus := candidate.cpus
+		if width == 0 {
+			width = cpus.Size()
+			continue
+		}
+		if cpus.Size() != width {
+			return 0, fmt.Errorf(
+				"non-uniform physical core width: NUMA %d socket %d core %d has %d CPUs, want %d",
+				candidate.key.numaID, candidate.key.socketID, candidate.key.coreID, cpus.Size(), width)
+		}
+	}
+	if width <= 0 {
+		return 0, fmt.Errorf("candidate CPU set has no complete physical cores")
+	}
+	return width, nil
+}
+
+func completePreferredCoreCPUCount(
+	topology *machine.CPUTopology,
+	eligible, preferred machine.CPUSet,
+) int {
+	count := 0
+	for _, candidate := range coreAlignedCandidates(topology, eligible, preferred) {
+		if candidate.cpus.IsSubsetOf(preferred) {
+			count += candidate.cpus.Size()
+		}
+	}
+	return count
+}
+
+func planWholeCoreCapacityQuotas(
+	quantity, coreWidth int,
+	numaIDs []int,
+	capacityByNUMA, minimumByNUMA, preferredByNUMA map[int]int,
+	enforceSaturation bool,
+) (map[int]int, error) {
+	if coreWidth <= 0 {
+		return nil, fmt.Errorf("whole-core quota planner has non-positive core width %d", coreWidth)
+	}
+	if quantity < 0 {
+		return nil, fmt.Errorf("whole-core quota has negative quantity %d", quantity)
+	}
+
+	sortedNUMAs := append([]int(nil), numaIDs...)
+	sort.Ints(sortedNUMAs)
+	quotas := make(map[int]int, len(sortedNUMAs))
+	normalizedCapacity := make(map[int]int, len(sortedNUMAs))
+	total := 0
+	for _, numaID := range sortedNUMAs {
+		minimum := minimumByNUMA[numaID]
+		if minimum < 0 {
+			return nil, fmt.Errorf(
+				"whole-core quota NUMA %d has negative minimum %d", numaID, minimum)
+		}
+		capacity := capacityByNUMA[numaID]
+		if minimum > capacity {
+			return nil, fmt.Errorf(
+				"whole-core quota NUMA %d minimum %d exceeds capacity %d",
+				numaID, minimum, capacity)
+		}
+		capacity -= (capacity - minimum) % coreWidth
+		quotas[numaID] = minimum
+		total += minimum
+		normalizedCapacity[numaID] = capacity
+	}
+	if total > quantity {
+		return nil, fmt.Errorf(
+			"whole-core quota quantity %d is smaller than required minimum %d",
+			quantity, total)
+	}
+	if (quantity-total)%coreWidth != 0 {
+		return nil, fmt.Errorf(
+			"whole-core quota residual quantity %d is not a multiple of %d",
+			quantity-total, coreWidth)
+	}
+
+	for total < quantity {
+		selectedNUMA := 0
+		selected := false
+		selectedImprovement := 0
+		for _, numaID := range sortedNUMAs {
+			if quotas[numaID]+coreWidth > normalizedCapacity[numaID] {
+				continue
+			}
+			improvement := absInt(quotas[numaID]-preferredByNUMA[numaID]) -
+				absInt(quotas[numaID]+coreWidth-preferredByNUMA[numaID])
+			if !selected ||
+				quotas[numaID] < quotas[selectedNUMA] ||
+				(quotas[numaID] == quotas[selectedNUMA] &&
+					(improvement > selectedImprovement ||
+						(improvement == selectedImprovement && numaID < selectedNUMA))) {
+				selectedNUMA = numaID
+				selected = true
+				selectedImprovement = improvement
+			}
+		}
+		if !selected {
+			return nil, fmt.Errorf(
+				"whole-core quota has insufficient aggregate capacity for quantity %d", quantity)
+		}
+		quotas[selectedNUMA] += coreWidth
+		total += coreWidth
+	}
+	if enforceSaturation {
+		if err := validateWholeCoreQuotaSaturation(
+			quotas, normalizedCapacity, minimumByNUMA, sortedNUMAs, coreWidth,
+		); err != nil {
+			return nil, err
+		}
+	}
+	return quotas, nil
+}
+
+func validateWholeCoreQuotaSaturation(
+	quotas, capacityByNUMA, minimumByNUMA map[int]int,
+	numaIDs []int,
+	coreWidth int,
+) error {
+	for _, highNUMA := range numaIDs {
+		for _, lowNUMA := range numaIDs {
+			if quotas[highNUMA] <= quotas[lowNUMA]+coreWidth {
+				continue
+			}
+			donorCanYield := quotas[highNUMA]-coreWidth >= minimumByNUMA[highNUMA]
+			receiverHasCapacity := quotas[lowNUMA]+coreWidth <= capacityByNUMA[lowNUMA]
+			if donorCanYield && receiverHasCapacity {
+				return fmt.Errorf(
+					"whole-core quota is not capacity-saturated: NUMA %d quota %d can transfer one core to NUMA %d quota %d",
+					highNUMA, quotas[highNUMA], lowNUMA, quotas[lowNUMA])
+			}
+		}
+	}
+	return nil
+}
+
+type fakeNUMAReclaimCapacity struct {
+	rawEligible     machine.CPUSet
+	effectiveByNUMA map[int]int
+	numaIDs         []int
+}
+
+func hardPartitionFakeNUMAReclaimCapacity(
+	fake advisorBlockDescriptor,
+	descriptors []advisorBlockDescriptor,
+	available machine.CPUSet,
+	topology *machine.CPUTopology,
+	skipNUMAs sets.Int,
+) fakeNUMAReclaimCapacity {
+	skippedCPUs := topology.CPUDetails.CPUsInNUMANodes(skipNUMAs.List()...)
+	realMandatoryNUMAs := sets.NewInt()
+	dedicatedByNUMA := make(map[int]int)
+	for _, descriptor := range descriptors {
+		if descriptor.NUMAID == commonstate.FakedNUMAID {
+			continue
+		}
+		switch descriptor.Class {
+		case advisorBlockClassMandatoryReclaim:
+			realMandatoryNUMAs.Insert(descriptor.NUMAID)
+		case advisorBlockClassDedicated:
+			dedicatedByNUMA[descriptor.NUMAID] += descriptor.Quantity
+		}
+	}
+	excludedCPUs := skippedCPUs.Union(
+		topology.CPUDetails.CPUsInNUMANodes(realMandatoryNUMAs.List()...))
+	rawEligible := fake.Eligible.Intersection(available).Difference(excludedCPUs)
+
+	result := fakeNUMAReclaimCapacity{
+		rawEligible:     rawEligible,
+		effectiveByNUMA: make(map[int]int),
+	}
+	for _, numaID := range topology.CPUDetails.KeepOnly(rawEligible).NUMANodes().ToSliceInt() {
+		numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
+		numaEligible := rawEligible.Intersection(numaCPUs)
+		candidates := coreAlignedCandidates(topology, numaEligible, machine.NewCPUSet())
+		if len(candidates) == 0 {
+			continue
+		}
+		coreWidth := candidates[0].cpus.Size()
+		completeCapacity := 0
+		for _, candidate := range candidates {
+			completeCapacity += candidate.cpus.Size()
+		}
+		remainingCapacity := general.Max(
+			0, available.Intersection(numaCPUs).Size()-dedicatedByNUMA[numaID])
+		remainingCapacity -= remainingCapacity % coreWidth
+		effectiveCapacity := general.Min(completeCapacity, remainingCapacity)
+		if effectiveCapacity == 0 {
+			continue
+		}
+		result.numaIDs = append(result.numaIDs, numaID)
+		result.effectiveByNUMA[numaID] = effectiveCapacity
+	}
+	sort.Ints(result.numaIDs)
+	return result
+}
+
+func mandatoryReclaimCoreWidth(
+	descriptors []advisorBlockDescriptor,
+	available machine.CPUSet,
+	topology *machine.CPUTopology,
+	skipNUMAs sets.Int,
+) (int, error) {
+	participatingCPUs := machine.NewCPUSet()
+	for _, descriptor := range descriptors {
+		if descriptor.Class != advisorBlockClassMandatoryReclaim {
+			continue
+		}
+		if descriptor.Quantity == 0 {
+			continue
+		}
+		if descriptor.NUMAID == commonstate.FakedNUMAID {
+			capacity := hardPartitionFakeNUMAReclaimCapacity(
+				descriptor, descriptors, available, topology, skipNUMAs)
+			for _, numaID := range capacity.numaIDs {
+				if capacity.effectiveByNUMA[numaID] == 0 {
+					continue
+				}
+				participatingCPUs = participatingCPUs.Union(
+					capacity.rawEligible.Intersection(
+						topology.CPUDetails.CPUsInNUMANodes(numaID)))
+			}
+			continue
+		}
+		if skipNUMAs.Has(descriptor.NUMAID) {
+			continue
+		}
+		participatingCPUs = participatingCPUs.Union(
+			descriptor.Eligible.
+				Intersection(available).
+				Intersection(topology.CPUDetails.CPUsInNUMANodes(descriptor.NUMAID)))
+	}
+	if participatingCPUs.IsEmpty() {
+		return 1, nil
+	}
+	return uniformCandidateCoreWidth(topology, participatingCPUs)
+}
+
 func normalizeAdvisorDescriptorsForWholeCoreReclaim(
 	descriptors []advisorBlockDescriptor,
 	topology *machine.CPUTopology,
@@ -381,7 +628,56 @@ func normalizeAdvisorDescriptorsForWholeCoreReclaim(
 	if topology == nil {
 		return nil, fmt.Errorf("cannot normalize advisor descriptors with nil CPU topology")
 	}
-	cpusPerCore := topology.CPUsPerCore()
+	return normalizeAdvisorDescriptorsForWholeCoreReclaimWithWidth(
+		descriptors, topology.CPUsPerCore())
+}
+
+func normalizeAdvisorDescriptorsForHardPartitionWholeCoreReclaim(
+	descriptors []advisorBlockDescriptor,
+	available machine.CPUSet,
+	topology *machine.CPUTopology,
+	skipNUMAs sets.Int,
+) ([]advisorBlockDescriptor, error) {
+	if topology == nil {
+		return nil, fmt.Errorf("cannot normalize advisor descriptors with nil CPU topology")
+	}
+	participatingCPUs := machine.NewCPUSet()
+	for _, descriptor := range descriptors {
+		if descriptor.Class != advisorBlockClassMandatoryReclaim ||
+			descriptor.NUMAID == commonstate.FakedNUMAID ||
+			skipNUMAs.Has(descriptor.NUMAID) ||
+			descriptor.Quantity == 0 {
+			continue
+		}
+		participatingCPUs = participatingCPUs.Union(
+			descriptor.Eligible.
+				Intersection(available).
+				Intersection(topology.CPUDetails.CPUsInNUMANodes(descriptor.NUMAID)))
+	}
+	if participatingCPUs.IsEmpty() {
+		return append([]advisorBlockDescriptor(nil), descriptors...), nil
+	}
+	cpusPerCore, err := uniformCandidateCoreWidth(topology, participatingCPUs)
+	if err != nil {
+		return nil, fmt.Errorf("cannot normalize advisor descriptors: %w", err)
+	}
+	return normalizeAdvisorDescriptorsForWholeCoreReclaimWithWidthAndSkipNUMAs(
+		descriptors, cpusPerCore, skipNUMAs)
+}
+
+func normalizeAdvisorDescriptorsForWholeCoreReclaimWithWidth(
+	descriptors []advisorBlockDescriptor,
+	cpusPerCore int,
+) ([]advisorBlockDescriptor, error) {
+	return normalizeAdvisorDescriptorsForWholeCoreReclaimWithWidthAndSkipNUMAs(
+		descriptors, cpusPerCore, nil)
+}
+
+func normalizeAdvisorDescriptorsForWholeCoreReclaimWithWidthAndSkipNUMAs(
+	descriptors []advisorBlockDescriptor,
+	cpusPerCore int,
+	skipNUMAs sets.Int,
+) ([]advisorBlockDescriptor, error) {
 	if cpusPerCore <= 1 {
 		return append([]advisorBlockDescriptor(nil), descriptors...), nil
 	}
@@ -391,7 +687,7 @@ func normalizeAdvisorDescriptorsForWholeCoreReclaim(
 	dedicatedByNUMA := make(map[int][]int)
 	mandatoryQuantityByNUMA := make(map[int]int)
 	for i, descriptor := range normalized {
-		if descriptor.NUMAID == commonstate.FakedNUMAID {
+		if descriptor.NUMAID == commonstate.FakedNUMAID || skipNUMAs.Has(descriptor.NUMAID) {
 			continue
 		}
 		switch descriptor.Class {
@@ -554,18 +850,23 @@ func expandSteadyFakeNUMAReclaimPhase(
 	}
 
 	fake := fakeDescriptors[0]
-	fakeEligible := fake.Eligible.Intersection(available)
+	realMandatoryNUMAs := sets.NewInt()
 	realMandatoryPreferred := machine.NewCPUSet()
 	for _, descriptor := range mandatory {
 		if descriptor.NUMAID != commonstate.FakedNUMAID {
+			realMandatoryNUMAs.Insert(descriptor.NUMAID)
 			realMandatoryPreferred = realMandatoryPreferred.Union(descriptor.OldPreferred)
 		}
 	}
+	excludedNUMAs := realMandatoryNUMAs.Union(skipNUMAs)
+	fakeEligible := fake.Eligible.Intersection(available).Difference(
+		topology.CPUDetails.CPUsInNUMANodes(excludedNUMAs.List()...))
 	fakeOldPreferred := fake.OldPreferred.Difference(realMandatoryPreferred).Intersection(fakeEligible)
 	numaIDs := topology.CPUDetails.KeepOnly(fakeEligible).NUMANodes().ToSliceInt()
 	sort.Ints(numaIDs)
 	minimumByNUMA := make(map[int]int, len(numaIDs))
 	maximumByNUMA := make(map[int]int, len(numaIDs))
+	preferredByNUMA := make(map[int]int, len(numaIDs))
 	fixedQuantityByNUMA := make(map[int]int, len(numaIDs))
 	realMandatoryQuantityByNUMA := make(map[int]int, len(numaIDs))
 	for _, descriptor := range descriptors {
@@ -607,20 +908,33 @@ func expandSteadyFakeNUMAReclaimPhase(
 					fixedQuantityByNUMA[numaID],
 			)
 		}
+		numaEligible := fakeEligible.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
+		preferredByNUMA[numaID] = completePreferredCoreCPUCount(
+			topology, numaEligible, fakeOldPreferred.Intersection(numaEligible))
 	}
-	quotas, err := planSteadyFakeNUMACoreCapacityQuotasWithLimits(
+	quotas, err := planWholeCoreCapacityQuotas(
 		fake.Quantity,
-		fakeOldPreferred,
-		fakeEligible,
-		topology,
-		skipNUMAs,
-		minimumByNUMA,
+		cpusPerCore,
+		numaIDs,
 		maximumByNUMA,
-		realMandatoryQuantityByNUMA,
+		minimumByNUMA,
+		preferredByNUMA,
+		true,
 	)
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	general.InfoS("steady reclaim fake NUMA quota planned",
+		"quantity", fake.Quantity,
+		"coreWidth", cpusPerCore,
+		"eligibleNUMAs", numaIDs,
+		"excludedRealNUMAs", realMandatoryNUMAs.List(),
+		"excludedSteadyExclusiveNUMAs", skipNUMAs.List(),
+		"capacityByNUMA", maximumByNUMA,
+		"minimumByNUMA", minimumByNUMA,
+		"oldQuotaByNUMA", preferredByNUMA,
+		"targetQuotaByNUMA", quotas,
+		"saturationValidated", true)
 
 	for _, numaID := range numaIDs {
 		quota := quotas[numaID]
@@ -650,11 +964,6 @@ func expandHardPartitionReclaimPhase(
 	if topology == nil {
 		return nil, nil, fmt.Errorf("cannot expand hard reclaim phase with nil CPU topology")
 	}
-	cpusPerCore := topology.CPUsPerCore()
-	if cpusPerCore <= 0 {
-		return nil, nil, fmt.Errorf(
-			"cannot expand hard reclaim phase with non-positive cpus per core %d", cpusPerCore)
-	}
 
 	mandatory := filterAdvisorDescriptors(descriptors, func(descriptor advisorBlockDescriptor) bool {
 		return descriptor.Class == advisorBlockClassMandatoryReclaim
@@ -681,6 +990,13 @@ func expandHardPartitionReclaimPhase(
 	capacityByNUMA := make(map[int]int)
 	eligibleNUMAs := make(map[int]struct{})
 	totalQuantity := 0
+	var fakeEligible machine.CPUSet
+	var fakeCapacity fakeNUMAReclaimCapacity
+	if len(fakeDescriptors) == 1 {
+		fakeCapacity = hardPartitionFakeNUMAReclaimCapacity(
+			fakeDescriptors[0], descriptors, available, topology, skipNUMAs)
+		fakeEligible = fakeCapacity.rawEligible
+	}
 
 	for _, descriptor := range descriptors {
 		if descriptor.Class == advisorBlockClassDedicated && descriptor.NUMAID != commonstate.FakedNUMAID {
@@ -708,14 +1024,15 @@ func expandHardPartitionReclaimPhase(
 			"finalEligibleSize", finalEligible.Size(),
 			"finalEligible", finalEligible.String())
 		if descriptor.NUMAID == commonstate.FakedNUMAID {
-			if topology.CPUDetails.KeepOnly(finalEligible).NUMANodes().IsEmpty() {
+			if descriptor.Quantity > 0 &&
+				topology.CPUDetails.KeepOnly(fakeEligible).NUMANodes().IsEmpty() {
 				return nil, nil, fmt.Errorf(
-					"hard reclaim fake block %q has quantity %d but no eligible NUMA",
+					"hard reclaim fake block %q has quantity %d but no effective NUMA capacity remains after dedicated occupancy, real mandatory NUMAs, and skip NUMAs",
 					descriptor.BlockID, descriptor.Quantity)
 			}
-			for _, numaID := range topology.CPUDetails.KeepOnly(finalEligible).NUMANodes().ToSliceInt() {
-				numaEligible := finalEligible.Intersection(
-					available).Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
+			for _, numaID := range fakeCapacity.numaIDs {
+				numaEligible := fakeEligible.Intersection(
+					topology.CPUDetails.CPUsInNUMANodes(numaID))
 				if len(coreAlignedCandidates(
 					topology, numaEligible, descriptor.OldPreferred.Intersection(numaEligible))) == 0 {
 					continue
@@ -734,7 +1051,6 @@ func expandHardPartitionReclaimPhase(
 				"hard reclaim block %q NUMA %d eligible capacity %d is smaller than quantity %d",
 				descriptor.BlockID, descriptor.NUMAID, eligible.Size(), descriptor.Quantity)
 		}
-		eligibleNUMAs[descriptor.NUMAID] = struct{}{}
 		capacityByNUMA[descriptor.NUMAID] = available.Intersection(numaCPUs).Size()
 		finalByNUMA[descriptor.NUMAID] += descriptor.Quantity
 		key := hardReclaimPhaseDemandKey(descriptor, descriptor.NUMAID)
@@ -754,20 +1070,29 @@ func expandHardPartitionReclaimPhase(
 		"finalByNUMA", finalByNUMA,
 		"fixedDedicatedByNUMA", fixedDedicatedByNUMA)
 
-	if len(fakeDescriptors) == 0 {
+	if len(fakeDescriptors) == 0 || fakeDescriptors[0].Quantity == 0 {
 		return demands, blockIDByDemandKey, nil
 	}
+	fake := fakeDescriptors[0]
 	if len(eligibleNUMAs) == 0 {
-		return demands, blockIDByDemandKey, nil
-	}
-	requiredMinimum := minimumHardReclaimCoresPerNUMA * cpusPerCore * len(eligibleNUMAs)
-	if totalQuantity < requiredMinimum {
 		return nil, nil, fmt.Errorf(
-			"hard reclaim quantity %d is smaller than required minimum %d",
-			totalQuantity, requiredMinimum)
+			"hard reclaim fake block %q has quantity %d but no effective NUMA capacity remains after dedicated occupancy, real mandatory NUMAs, and skip NUMAs",
+			fake.BlockID, fake.Quantity)
+	}
+	cpusPerCore, err := mandatoryReclaimCoreWidth(
+		descriptors, available, topology, skipNUMAs)
+	if err != nil {
+		return nil, nil, fmt.Errorf("cannot expand hard reclaim phase: %w", err)
+	}
+	requiredFakeMinimum := len(fakeCapacity.numaIDs) * minimumHardReclaimCoresPerNUMA * cpusPerCore
+	if fakeDescriptors[0].Quantity < requiredFakeMinimum {
+		return nil, nil, fmt.Errorf(
+			"hard reclaim fake quantity %d is smaller than required minimum %d",
+			fakeDescriptors[0].Quantity, requiredFakeMinimum)
 	}
 
-	for numaID, quantity := range finalByNUMA {
+	for numaID := range capacityByNUMA {
+		quantity := finalByNUMA[numaID]
 		if fixedDedicatedByNUMA[numaID]+quantity > capacityByNUMA[numaID] {
 			return nil, nil, fmt.Errorf(
 				"hard reclaim NUMA %d initial quantity %d with fixed dedicated load %d exceeds capacity %d",
@@ -780,16 +1105,15 @@ func expandHardPartitionReclaimPhase(
 		numaIDs = append(numaIDs, numaID)
 	}
 	sort.Ints(numaIDs)
-	fake := fakeDescriptors[0]
-	finalEligible := fake.Eligible.Intersection(available)
 	eligibleCapacityByNUMA := make(map[int]int, len(numaIDs))
+	minimumByNUMA := make(map[int]int, len(numaIDs))
+	preferredByNUMA := make(map[int]int, len(numaIDs))
 	for _, numaID := range numaIDs {
-		numaEligible := finalEligible.Intersection(
-			available).Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
-		completeCapacity := len(coreAlignedCandidates(
-			topology, numaEligible, fake.OldPreferred.Intersection(numaEligible))) * cpusPerCore
-		eligibleCapacityByNUMA[numaID] = general.Max(
-			0, completeCapacity-finalByNUMA[numaID])
+		numaEligible := fakeEligible.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
+		eligibleCapacityByNUMA[numaID] = fakeCapacity.effectiveByNUMA[numaID]
+		minimumByNUMA[numaID] = minimumHardReclaimCoresPerNUMA * cpusPerCore
+		preferredByNUMA[numaID] = completePreferredCoreCPUCount(
+			topology, numaEligible, fake.OldPreferred.Intersection(numaEligible))
 	}
 	general.InfoS("hard reclaim fake mandatory water-filling input",
 		"blockID", fake.BlockID,
@@ -800,36 +1124,43 @@ func expandHardPartitionReclaimPhase(
 		"capacityByNUMA", capacityByNUMA,
 		"fixedDedicatedByNUMA", fixedDedicatedByNUMA,
 		"finalByNUMABeforeFake", finalByNUMA)
-	quotas := make(map[int]int, len(numaIDs))
 	if fake.Quantity%cpusPerCore != 0 {
 		return nil, nil, fmt.Errorf(
 			"hard reclaim fake block %q quantity %d is not a whole-core multiple of %d",
 			fake.BlockID, fake.Quantity, cpusPerCore)
 	}
-	// water-fill complete physical cores round-robin: every step grants a full core
-	// (cpusPerCore cpus) to the currently least-loaded eligible NUMA, so a balanced
-	// result never strands a lone SMT sibling. On non-SMT topologies cpusPerCore==1
-	// and this reduces byte-for-byte to the historical single-CPU water-filling.
-	for allocated := 0; allocated < fake.Quantity; allocated += cpusPerCore {
-		selectedNUMA := 0
-		selected := false
-		for _, numaID := range numaIDs {
-			if quotas[numaID]+cpusPerCore > eligibleCapacityByNUMA[numaID] ||
-				fixedDedicatedByNUMA[numaID]+finalByNUMA[numaID]+cpusPerCore > capacityByNUMA[numaID] {
-				continue
-			}
-			if !selected || finalByNUMA[numaID] < finalByNUMA[selectedNUMA] {
-				selectedNUMA = numaID
-				selected = true
-			}
+	quotas, err := planWholeCoreCapacityQuotas(
+		fake.Quantity,
+		cpusPerCore,
+		numaIDs,
+		eligibleCapacityByNUMA,
+		minimumByNUMA,
+		preferredByNUMA,
+		true,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf(
+			"hard reclaim fake block %q: %w", fake.BlockID, err)
+	}
+	excludedRealNUMAs := sets.NewInt()
+	for _, descriptor := range mandatory {
+		if descriptor.NUMAID != commonstate.FakedNUMAID {
+			excludedRealNUMAs.Insert(descriptor.NUMAID)
 		}
-		if !selected {
-			return nil, nil, fmt.Errorf(
-				"hard reclaim fake block %q has insufficient aggregate capacity for quantity %d",
-				fake.BlockID, fake.Quantity)
-		}
-		quotas[selectedNUMA] += cpusPerCore
-		finalByNUMA[selectedNUMA] += cpusPerCore
+	}
+	general.InfoS("hard reclaim fake NUMA quota planned",
+		"quantity", fake.Quantity,
+		"coreWidth", cpusPerCore,
+		"eligibleNUMAs", numaIDs,
+		"excludedRealNUMAs", excludedRealNUMAs.List(),
+		"excludedSteadyExclusiveNUMAs", skipNUMAs.List(),
+		"capacityByNUMA", eligibleCapacityByNUMA,
+		"minimumByNUMA", minimumByNUMA,
+		"oldQuotaByNUMA", preferredByNUMA,
+		"targetQuotaByNUMA", quotas,
+		"saturationValidated", true)
+	for numaID, quota := range quotas {
+		finalByNUMA[numaID] += quota
 	}
 	general.InfoS("hard reclaim fake mandatory water-filling result",
 		"blockID", fake.BlockID,
@@ -839,7 +1170,7 @@ func expandHardPartitionReclaimPhase(
 		if quotas[numaID] == 0 {
 			continue
 		}
-		eligible := finalEligible.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
+		eligible := fakeEligible.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
 		key := hardReclaimPhaseDemandKey(fake, numaID)
 		demands = append(demands, partitionDemand{
 			key:       key,
@@ -849,45 +1180,6 @@ func expandHardPartitionReclaimPhase(
 			class:     advisorBlockClassMandatoryReclaim,
 		})
 		blockIDByDemandKey[key] = fake.BlockID
-	}
-
-	minimum, maximum := 0, 0
-	seen := false
-	perNUMAMinimum := minimumHardReclaimCoresPerNUMA * cpusPerCore
-	for _, numaID := range numaIDs {
-		// NUMAs already owned by a committed steady exclusive DNB keep only their
-		// finalized reserve once ramp-up ends, regardless of reclaimability. The
-		// node-level per-NUMA minimum and cross-NUMA imbalance guards must not
-		// re-impose the ratio-derived target on them, otherwise the planner fails
-		// closed for every other ramp-up QoS on the node.
-		if skipNUMAs.Has(numaID) {
-			continue
-		}
-		if finalByNUMA[numaID] < perNUMAMinimum {
-			return nil, nil, fmt.Errorf(
-				"hard reclaim NUMA %d final quantity %d is smaller than minimum %d",
-				numaID, finalByNUMA[numaID], perNUMAMinimum)
-		}
-		if !seen || finalByNUMA[numaID] < minimum {
-			minimum = finalByNUMA[numaID]
-		}
-		if !seen || finalByNUMA[numaID] > maximum {
-			maximum = finalByNUMA[numaID]
-		}
-		seen = true
-	}
-	// imbalance tolerance is one complete core: core-granular water-filling can leave
-	// at most one NUMA a single core ahead, never a fractional-core skew.
-	if seen && maximum-minimum > cpusPerCore {
-		general.InfoS("hard reclaim final NUMA quantities imbalanced",
-			"minimum", minimum,
-			"maximum", maximum,
-			"finalByNUMA", finalByNUMA,
-			"capacityByNUMA", capacityByNUMA,
-			"fixedDedicatedByNUMA", fixedDedicatedByNUMA,
-			"fakeQuotas", quotas)
-		return nil, nil, fmt.Errorf(
-			"hard reclaim final NUMA quantities are imbalanced: min %d max %d", minimum, maximum)
 	}
 	return demands, blockIDByDemandKey, nil
 }

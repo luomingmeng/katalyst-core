@@ -94,7 +94,18 @@ func TestCoordinatorRoundAdmissionBudgetStopsBeforeSafetyClosure(t *testing.T) {
 		objective:       ConvergenceObjectiveParentSafe,
 		admissionBudget: &AdmissionConvergenceBudget{MaxRequiredWrites: 2},
 	}
-	closure := PhasePlan{Operations: []PlanOperation{{Rel: "a"}, {Rel: "b"}}}
+	closure := PhasePlan{Operations: []PlanOperation{
+		{
+			Rel:             "a",
+			ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(0)},
+			Target:          CPUSetTarget{CPUs: machine.NewCPUSet(1)},
+		},
+		{
+			Rel:             "b",
+			ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(2)},
+			Target:          CPUSetTarget{CPUs: machine.NewCPUSet(3)},
+		},
+	}}
 	res := &ConvergenceResult{Applied: 1}
 
 	err := round.checkAdmissionExecutionBudget(closure, res)
@@ -1543,7 +1554,6 @@ func TestTopologyCoordinatorConvergesOpposingCPUAndMemsDirectionsAcrossPhases(t 
 			wantWrites: []fakeHierarchyWrite{
 				{rel: "primary", cpus: machine.NewCPUSet(0), mems: "0"},
 				{rel: "primary", cpus: machine.NewCPUSet(0), mems: "0-1"},
-				{rel: "primary", cpus: machine.NewCPUSet(0), mems: "0-1"},
 			},
 		},
 		{
@@ -1551,7 +1561,6 @@ func TestTopologyCoordinatorConvergesOpposingCPUAndMemsDirectionsAcrossPhases(t 
 			currentCPUs: "0", targetCPUs: machine.NewCPUSet(0, 1),
 			currentMems: "0-1", targetMems: "1",
 			wantWrites: []fakeHierarchyWrite{
-				{rel: "primary", cpus: machine.NewCPUSet(0), mems: "1"},
 				{rel: "primary", cpus: machine.NewCPUSet(0), mems: "1"},
 				{rel: "primary", cpus: machine.NewCPUSet(0, 1), mems: "1"},
 			},
@@ -2339,7 +2348,7 @@ func TestSafeWriterClassifiesMemsWriteEBUSYAsPlanStale(t *testing.T) {
 	}
 }
 
-func TestSafeWriterPreservesPartialMemsJournalWhenCPUWriteIsStale(t *testing.T) {
+func TestSafeWriterRollsBackMemsWhenCPUWriteIsStale(t *testing.T) {
 	t.Parallel()
 
 	driver := newFakeHierarchyDriver()
@@ -2378,17 +2387,11 @@ func TestSafeWriterPreservesPartialMemsJournalWhenCPUWriteIsStale(t *testing.T) 
 		!errors.Is(stale.Err, syscall.EBUSY) {
 		t.Fatalf("stale=%+v, want fresh CPU observation after partial mems apply", stale)
 	}
-	if got := driver.nodes["root"].mems; got != "0-1" {
-		t.Fatalf("live mems=%q, want successful partial write retained", got)
+	if got := driver.nodes["root"].mems; got != "0" {
+		t.Fatalf("live mems=%q, want rollback to 0", got)
 	}
-	if len(res.Journal) != 1 {
-		t.Fatalf("journal=%+v, want one partial applied operation", res.Journal)
-	}
-	applied := res.Journal[0]
-	if applied.PlanID != plan.PlanID || applied.Rel != "root" || applied.Direction != WriteGrow ||
-		applied.Observed.CPUs.String() != "0" || applied.Observed.Mems != "0-1" ||
-		applied.Target.CPUs.String() != "0-1" || applied.Target.Mems != "0-1" {
-		t.Fatalf("partial journal=%+v, want fresh observed cpus=0 mems=0-1 and original target", applied)
+	if len(res.Journal) != 0 {
+		t.Fatalf("journal=%+v, want no applied operation after rollback", res.Journal)
 	}
 	if res.Applied != 0 || res.Failed != 1 {
 		t.Fatalf("result=%+v, want partial failure without fully applied count", res)
@@ -2686,7 +2689,7 @@ func TestTopologyMemsAreVerifiedPostWriteAndInFinalReport(t *testing.T) {
 		identity := CgroupIdentity{Device: 1, Inode: 1}
 		driver.add("primary", identity, "0", "0")
 		driver.beforeCall = func(operation HierarchyOperation, rel string) error {
-			if operation == HierarchyOperationRead && rel == "primary" && len(driver.writes) == 2 {
+			if operation == HierarchyOperationRead && rel == "primary" && len(driver.writes) == 1 {
 				driver.nodes[rel].mems = "0"
 			}
 			return nil

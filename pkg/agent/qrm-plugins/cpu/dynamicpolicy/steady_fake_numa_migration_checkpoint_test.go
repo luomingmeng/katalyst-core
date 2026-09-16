@@ -347,7 +347,8 @@ func TestSteadyFakeNUMAMigrationTargetIsNotStoredForAtomicCommittedRepair(t *tes
 	)
 
 	require.NoError(t, err)
-	require.Equal(t, target, got["fake"])
+	require.Equal(t, committed, got["fake"])
+	require.Equal(t, all.Difference(committed), got["share"])
 	require.Nil(t, policy.steadyFakeNUMAMigrationTarget)
 	require.NoFileExists(t, filepath.Join(dir, steadyFakeNUMAMigrationCheckpointName))
 }

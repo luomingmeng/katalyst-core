@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"path/filepath"
 
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -34,9 +36,10 @@ type AppliedPlanOperation struct {
 }
 
 type safeCPSetWriter struct {
-	driver HierarchyDriver
-	budget *BudgetTracker
-	res    *ConvergenceResult
+	driver          HierarchyDriver
+	budget          *BudgetTracker
+	res             *ConvergenceResult
+	admissionTicket *AdmissionBudgetTicket
 }
 
 type stableLiveChildren struct {
@@ -111,7 +114,19 @@ func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 		if w.res != nil {
 			w.res.Attempted++
 		}
-		if operation.WriteMems {
+		if w.admissionTicket != nil {
+			if err := w.admissionTicket.consumeOperation(operation); err != nil {
+				return err
+			}
+		}
+		wroteMems := false
+		wroteCPUs := false
+		if operation.WriteMems && operation.ExpectedCurrent.Mems != operation.Target.Mems {
+			if w.admissionTicket != nil {
+				if err := w.admissionTicket.consumeForward(PhysicalWriteCost{MemsWrites: 1}); err != nil {
+					return err
+				}
+			}
 			if err := w.driver.WriteMems(ctx, operation.Rel, operation.ExpectedIdentity, operation.Target.Mems); err != nil {
 				if w.res != nil {
 					w.res.Failed++
@@ -120,30 +135,42 @@ func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 					err, plan.Kind, HierarchyOperationWriteMems, operation, "cpuset.mems",
 					operation.ExpectedCurrent.Mems, operation.Target.Mems)
 			}
+			wroteMems = true
 		}
-		if err := w.driver.WriteCPUs(ctx, operation.Rel, operation.ExpectedIdentity, operation.Target.CPUs); err != nil {
-			if w.res != nil {
-				w.res.Failed++
-			}
-			if w.driver.Classify(err, HierarchyOperationWriteCPUs) != HierarchyErrorStale {
-				return phaseWriteError(
-					err, plan.Kind, operation, "cpuset.cpus",
-					operation.ExpectedCurrent.CPUs.String(), operation.Target.CPUs.String(),
-				)
-			}
-			current := operation.ExpectedCurrent.CPUs.String()
-			if operation.WriteMems {
-				if applied, readErr := w.readAppliedObservation(ctx, operation); readErr == nil {
-					current = applied.Observed.CPUs.String()
-					if w.res != nil {
-						w.res.Journal = append(w.res.Journal, applied)
-					}
+		if !operation.ExpectedCurrent.CPUs.Equals(operation.Target.CPUs) {
+			if w.admissionTicket != nil {
+				if err := w.admissionTicket.consumeForward(PhysicalWriteCost{CPUSetWrites: 1}); err != nil {
+					return err
 				}
 			}
-			return &PlanStaleError{
-				Rel: operation.Rel, Direction: operation.Direction, Resource: "cpuset.cpus",
-				Current: current, Target: operation.Target.CPUs.String(), Err: err,
+			if err := w.driver.WriteCPUs(ctx, operation.Rel, operation.ExpectedIdentity, operation.Target.CPUs); err != nil {
+				if w.res != nil {
+					w.res.Failed++
+				}
+				writeErr := err
+				if w.driver.Classify(err, HierarchyOperationWriteCPUs) != HierarchyErrorStale {
+					writeErr = phaseWriteError(
+						err, plan.Kind, operation, "cpuset.cpus",
+						operation.ExpectedCurrent.CPUs.String(), operation.Target.CPUs.String(),
+					)
+				} else {
+					current := operation.ExpectedCurrent.CPUs.String()
+					if wroteMems {
+						if applied, readErr := w.readAppliedObservation(ctx, operation); readErr == nil {
+							current = applied.Observed.CPUs.String()
+						}
+					}
+					writeErr = &PlanStaleError{
+						Rel: operation.Rel, Direction: operation.Direction, Resource: "cpuset.cpus",
+						Current: current, Target: operation.Target.CPUs.String(), Err: err,
+					}
+				}
+				if rollbackErr := w.rollbackOperation(ctx, operation, wroteCPUs, wroteMems); rollbackErr != nil {
+					return executionWithRollbackError(writeErr, rollbackErr)
+				}
+				return writeErr
 			}
+			wroteCPUs = true
 		}
 		applied, err := w.readAfterWrite(ctx, operation)
 		if w.res != nil && applied.PlanID != "" {
@@ -153,6 +180,9 @@ func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 			if w.res != nil {
 				w.res.Failed++
 			}
+			if rollbackErr := w.rollbackOperation(ctx, operation, wroteCPUs, wroteMems); rollbackErr != nil {
+				return executionWithRollbackError(err, rollbackErr)
+			}
 			return err
 		}
 		if w.res != nil {
@@ -160,6 +190,55 @@ func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 		}
 	}
 	return nil
+}
+
+func executionWithRollbackError(executionErr, rollbackErr error) error {
+	return fmt.Errorf("%v: %w", rollbackErr, executionErr)
+}
+
+func (w safeCPSetWriter) rollbackOperation(
+	ctx context.Context,
+	operation PlanOperation,
+	wroteCPUs, wroteMems bool,
+) error {
+	var rollbackErr error
+	if wroteCPUs {
+		if w.admissionTicket != nil {
+			if err := w.admissionTicket.consumeRollback(PhysicalWriteCost{CPUSetWrites: 1}); err != nil {
+				rollbackErr = utilerrors.NewAggregate([]error{rollbackErr, err})
+				wroteCPUs = false
+			}
+		}
+	}
+	if wroteCPUs {
+		if err := w.driver.WriteCPUs(
+			ctx, operation.Rel, operation.ExpectedIdentity, operation.ExpectedCurrent.CPUs,
+		); err != nil {
+			rollbackErr = utilerrors.NewAggregate([]error{
+				rollbackErr,
+				fmt.Errorf("rollback cpuset.cpus for %q: %w", operation.Rel, err),
+			})
+		}
+	}
+	if wroteMems {
+		if w.admissionTicket != nil {
+			if err := w.admissionTicket.consumeRollback(PhysicalWriteCost{MemsWrites: 1}); err != nil {
+				rollbackErr = utilerrors.NewAggregate([]error{rollbackErr, err})
+				wroteMems = false
+			}
+		}
+	}
+	if wroteMems {
+		if err := w.driver.WriteMems(
+			ctx, operation.Rel, operation.ExpectedIdentity, operation.ExpectedCurrent.Mems,
+		); err != nil {
+			rollbackErr = utilerrors.NewAggregate([]error{
+				rollbackErr,
+				fmt.Errorf("rollback cpuset.mems for %q: %w", operation.Rel, err),
+			})
+		}
+	}
+	return rollbackErr
 }
 
 func estimateStableChildScanHierarchyIO(scans, childMemberships int) int {
@@ -171,12 +250,15 @@ func estimateStableChildScanHierarchyIO(scans, childMemberships int) int {
 }
 
 func estimateFinalPreflightAndMutationHierarchyIO(operation PlanOperation, childMemberships int) int {
-	operations := 3 // local precheck, CPU write, and post-write readback
+	operations := 2 // local precheck and post-write readback
 	if operation.ParentRel != "" {
 		operations++ // live parent identity/containment precheck
 	}
-	if operation.WriteMems {
-		operations++ // cpuset.mems write
+	if !operation.ExpectedCurrent.CPUs.Equals(operation.Target.CPUs) {
+		operations += 2 // cpuset.cpus forward write and worst-case rollback
+	}
+	if operation.WriteMems && operation.ExpectedCurrent.Mems != operation.Target.Mems {
+		operations += 2 // cpuset.mems forward write and worst-case rollback
 	}
 	// Every operation gets one final child-set freeze before any operation is
 	// written. Each frozen child can require a read and an identity stat when an

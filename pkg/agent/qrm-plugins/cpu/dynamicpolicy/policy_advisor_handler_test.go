@@ -1121,7 +1121,7 @@ func TestSolveAdvisorDescriptorPhaseHandles24Plus178Plus4(t *testing.T) {
 	remaining, err := policy.solveAdvisorDescriptorPhase(descriptors, available, got, true, false)
 
 	require.Equal(t, available, remaining)
-	require.ErrorContains(t, err, "insufficient core-capacity quota")
+	require.ErrorContains(t, err, "insufficient aggregate capacity for quantity 178")
 	require.Empty(t, got)
 }
 

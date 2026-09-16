@@ -144,6 +144,93 @@ func TestSplitPlanForAdmissionRequiresIncomingTransferGrowAndDefersUnrelatedGrow
 	}
 }
 
+func TestFinalAdmissionTargetPreservesCanonicalTargetOverIntermediateDrainOperation(t *testing.T) {
+	t.Parallel()
+
+	const rel = "reclaimed-0"
+	canonicalCPUs := machine.NewCPUSet(
+		0, 1, 2, 3, 4, 5, 6, 7, 8,
+		9, 10, 11, 12, 13, 14, 15, 16, 17,
+	)
+	if got := canonicalCPUs.Size(); got != 18 {
+		t.Fatalf("canonical CPUs size = %d, want 18", got)
+	}
+	intermediateDrainCPUs := machine.NewCPUSet(0, 1)
+	if got := intermediateDrainCPUs.Size(); got != 2 {
+		t.Fatalf("intermediate drain CPUs size = %d, want 2", got)
+	}
+	canonicalTargets := map[string]CPUSetTarget{
+		rel:       {CPUs: canonicalCPUs, Mems: "0-1"},
+		"primary": {CPUs: machine.NewCPUSet(18, 19), Mems: "0"},
+	}
+	plan := &PhasePlan{
+		TargetByRel: map[string]CPUSetTarget{
+			rel:       {CPUs: canonicalCPUs, Mems: "0-1"},
+			"primary": {CPUs: machine.NewCPUSet(18, 19), Mems: "0"},
+		},
+		Operations: []PlanOperation{{
+			Rel:             rel,
+			Direction:       WriteShrink,
+			ExpectedCurrent: CPUSetTarget{CPUs: canonicalCPUs, Mems: "0-1"},
+			Target:          CPUSetTarget{CPUs: intermediateDrainCPUs, Mems: "0"},
+		}},
+	}
+
+	required, _, err := SplitPlanForAdmission(plan, AdmissionSafetyInput{
+		ProtectedPendingCPUSet: machine.NewCPUSet(2),
+	})
+	if err != nil {
+		t.Fatalf("SplitPlanForAdmission() error = %v", err)
+	}
+	if len(required.Operations) != 1 {
+		t.Fatalf("required operations = %+v, want intermediate drain operation", required.Operations)
+	}
+	if got := required.Operations[0].Target.CPUs.Size(); got != 2 {
+		t.Fatalf("intermediate drain target size = %d, want 2", got)
+	}
+
+	finalTargets := finalAdmissionTarget(required)
+	if !reflect.DeepEqual(finalTargets, required.TargetByRel) {
+		t.Fatalf("final admission targets = %+v, want required canonical targets %+v",
+			finalTargets, required.TargetByRel)
+	}
+	if !reflect.DeepEqual(finalTargets, canonicalTargets) {
+		t.Fatalf("final admission targets = %+v, want original canonical targets %+v",
+			finalTargets, canonicalTargets)
+	}
+	got, ok := finalTargets[rel]
+	if !ok {
+		t.Fatalf("finalAdmissionTarget() did not find canonical target for %q", rel)
+	}
+	if got.CPUs.Size() != 18 || !got.CPUs.Equals(canonicalCPUs) {
+		t.Fatalf("final admission CPUs = %s (size %d), want canonical %s (size 18)",
+			got.CPUs.String(), got.CPUs.Size(), canonicalCPUs.String())
+	}
+	if got.Mems != "0-1" {
+		t.Fatalf("final admission mems = %q, want canonical %q", got.Mems, "0-1")
+	}
+}
+
+func TestRequiredCPUSetByRelFromNodeSpecsFreezesCanonicalReclaimTargets(t *testing.T) {
+	t.Parallel()
+
+	specs := []NodeSpec{
+		{Rel: "primary", Role: TopoNodeRolePrimary, CPUs: machine.NewCPUSet(0, 1)},
+		{Rel: "reclaim", Role: TopoNodeRoleReclaim, CPUs: machine.NewCPUSet(2, 3)},
+		{Rel: "reclaim/numa-0", Role: TopoNodeRoleReclaimNUMABucket, CPUs: machine.NewCPUSet(2, 3)},
+	}
+
+	required := RequiredCPUSetByRelFromNodeSpecs(specs)
+	specs[2].CPUs = machine.NewCPUSet(4, 5)
+
+	if len(required) != 1 || !required["reclaim/numa-0"].Equals(machine.NewCPUSet(2, 3)) {
+		t.Fatalf("required targets = %+v, want frozen reclaim/numa-0=2-3", required)
+	}
+	if _, ok := required["reclaim"]; ok {
+		t.Fatalf("aggregate reclaim rel must not become a required NUMA-floor owner")
+	}
+}
+
 func TestSplitPlanForAdmissionPromotesAncestorGrowRequiredByChild(t *testing.T) {
 	t.Parallel()
 

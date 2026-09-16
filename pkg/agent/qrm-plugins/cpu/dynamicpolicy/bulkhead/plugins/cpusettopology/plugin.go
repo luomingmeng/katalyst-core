@@ -347,6 +347,7 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 	if err != nil {
 		return fmt.Errorf("build bulkhead topology inputs: %w", err)
 	}
+	requiredCPUSetByRel := topology.RequiredCPUSetByRelFromNodeSpecs(specs)
 	dag, err := topology.BuildDAG(specs)
 	if deadlineErr := admissionStageDeadlineError(ctx, "build bulkhead topology dag"); deadlineErr != nil {
 		return deadlineErr
@@ -383,6 +384,7 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 		CPUDetails:          cpuDetails,
 		ReservedCPUSet:      reservedCPUSet,
 		ExpectedCPUSetByRel: expectedRes.ExpectedByRel,
+		RequiredCPUSetByRel: requiredCPUSetByRel,
 		Objective:           objective,
 		DeferredCPUSetByRel: expectedRes.DeferredLeafByRel,
 		AdmissionBudget: &topology.AdmissionConvergenceBudget{

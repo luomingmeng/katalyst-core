@@ -41,6 +41,7 @@ type ParentSafetyReport struct {
 	PendingOutsidePrimary  machine.CPUSet
 	PendingInsideReclaim   machine.CPUSet
 	PrimaryReclaimOverlap  machine.CPUSet
+	RequiredFloorDeficit   map[string]machine.CPUSet
 	UnsafeRequiredRels     []RelConvergence
 	DeferredLeafMismatches []RelConvergence
 }
@@ -59,6 +60,7 @@ func evaluateCoordinatorSnapshot(
 	desired map[DomainID]machine.CPUSet,
 	allowedCPUs machine.CPUSet,
 	expectedByRel map[string]machine.CPUSet,
+	requiredByRel map[string]machine.CPUSet,
 	deferredByRel map[string]machine.CPUSet,
 	deferredMismatchRels map[string]struct{},
 	protectedPending machine.CPUSet,
@@ -76,9 +78,9 @@ func evaluateCoordinatorSnapshot(
 	includeMaterializedDynamicConvergence(&report, snapshot, deferredByRel, capabilities)
 	return coordinatorSnapshotEvaluation{
 		Report: report,
-		ParentSafety: buildParentSafetyReport(
+		ParentSafety: buildParentSafetyReportWithRequired(
 			snapshot, dag, parentSafetyTargetByRel, report, protectedPending,
-			deferredByRel, deferredMismatchRels, capabilities,
+			requiredByRel, deferredByRel, deferredMismatchRels, capabilities,
 		),
 	}, nil
 }
@@ -93,8 +95,26 @@ func buildParentSafetyReport(
 	deferredMismatchRels map[string]struct{},
 	capabilities HierarchyCapabilities,
 ) ParentSafetyReport {
+	return buildParentSafetyReportWithRequired(
+		snapshot, dag, targetByRel, convergence, protectedPending,
+		nil, deferredByRel, deferredMismatchRels, capabilities,
+	)
+}
+
+func buildParentSafetyReportWithRequired(
+	snapshot *CompleteSnapshot,
+	dag *TopoDAG,
+	targetByRel map[string]machine.CPUSet,
+	convergence ConvergenceReport,
+	protectedPending machine.CPUSet,
+	requiredByRel map[string]machine.CPUSet,
+	deferredByRel map[string]machine.CPUSet,
+	deferredMismatchRels map[string]struct{},
+	capabilities HierarchyCapabilities,
+) ParentSafetyReport {
 	report := ParentSafetyReport{
 		PendingOutsidePrimary: protectedPending.Clone(),
+		RequiredFloorDeficit:  make(map[string]machine.CPUSet),
 	}
 	if snapshot == nil || dag == nil {
 		return report
@@ -110,6 +130,9 @@ func buildParentSafetyReport(
 	report.PendingInsideReclaim = protectedPending.Intersection(reclaim)
 	report.PrimaryReclaimOverlap = primary.Intersection(reclaim)
 	for _, mismatch := range convergence.NonConvergedTargets {
+		if _, required := requiredByRel[mismatch.Rel]; required {
+			continue
+		}
 		_, deferredLeaf := deferredByRel[mismatch.Rel]
 		_, deferredCleanup := deferredMismatchRels[mismatch.Rel]
 		if deferredLeaf || deferredCleanup {
@@ -133,6 +156,17 @@ func buildParentSafetyReport(
 			})
 		}
 	}
+	for rel, required := range requiredByRel {
+		entry, ok := snapshot.Entries[rel]
+		if !ok {
+			report.RequiredFloorDeficit[rel] = required.Clone()
+			continue
+		}
+		observed := observedCPUsForTargetProof(entry, required, capabilities)
+		if deficit := required.Difference(observed); !deficit.IsEmpty() {
+			report.RequiredFloorDeficit[rel] = deficit
+		}
+	}
 	for parentRel, children := range snapshot.Children {
 		parent, ok := snapshot.Entries[parentRel]
 		if !ok {
@@ -154,6 +188,7 @@ func buildParentSafetyReport(
 	report.Safe = report.PendingOutsidePrimary.IsEmpty() &&
 		report.PendingInsideReclaim.IsEmpty() &&
 		report.PrimaryReclaimOverlap.IsEmpty() &&
+		len(report.RequiredFloorDeficit) == 0 &&
 		len(report.UnsafeRequiredRels) == 0
 	return report
 }

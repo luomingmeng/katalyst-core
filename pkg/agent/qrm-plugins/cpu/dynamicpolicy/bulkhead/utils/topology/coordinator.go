@@ -249,6 +249,7 @@ type CoordinatorInput struct {
 	CPUDetails          machine.CPUDetails
 	ReservedCPUSet      machine.CPUSet
 	ExpectedCPUSetByRel map[string]machine.CPUSet
+	RequiredCPUSetByRel map[string]machine.CPUSet
 	// ProtectedPendingCPUSet is the union of container allocations that already
 	// exist in QRM state but whose cgroup leaf has not been created yet (pod
 	// admit window). These have no resolvable rel, so the writer folds them into
@@ -388,6 +389,7 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 	defer snapshotDriver.Close()
 	round := newCoordinatorRoundWithBudget(in.DAG, in.Cgroup, effectiveTargets, in.CPUDetails, in.ReservedCPUSet, in.DrainSelection, budget)
 	round.dynamicByRel = cloneCPUSetMap(in.ExpectedCPUSetByRel)
+	round.requiredByRel = cloneCPUSetMap(in.RequiredCPUSetByRel)
 	round.objective = in.Objective.orFullDefault()
 	round.deferredByRel = cloneCPUSetMap(in.DeferredCPUSetByRel)
 	round.admissionBudget = in.AdmissionBudget
@@ -398,6 +400,11 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 	round.expectedAbsentRels = cloneRelSet(in.ExpectedAbsentRels)
 	round.snapshotSource = newCompleteSnapshotSource(snapshotDriver, in.DAG, budget, in.TraversalBoundaries)
 	round.driver = snapshotDriver
+	defer func() {
+		if round.admissionTicket != nil {
+			round.admissionTicket.ReleaseUnused()
+		}
+	}()
 	initialSnapshot, err := round.nextSnapshot(ctx)
 	if err != nil {
 		return *res, err
@@ -447,6 +454,14 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 			}
 			if replanRequired(err) {
 				res.Rounds = append(res.Rounds, outcome)
+				if round.admissionTicket != nil {
+					if round.admissionTicket.hasPhysicalConsumption() {
+						res.State = ConvergenceStateNonConverged
+						return *res, err
+					}
+					round.admissionTicket.ReleaseUnused()
+					round.admissionTicket = nil
+				}
 				if replanBlocked(outcome) {
 					res.State = ConvergenceStateBlocked
 					return *res, &CoordinatorBlockedError{Blocker: outcome.Blocker}
@@ -464,7 +479,7 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 		evaluation, err := evaluateCoordinatorSnapshot(
 			snapshot, in.DAG, effectiveTargets, parentSafetyTargets, round.desiredMemsByRel(),
 			round.desiredDomainUnion(), round.allowedCPUs(),
-			in.ExpectedCPUSetByRel, in.DeferredCPUSetByRel,
+			in.ExpectedCPUSetByRel, in.RequiredCPUSetByRel, in.DeferredCPUSetByRel,
 			round.deferredCleanupRels,
 			round.admissionSafetyCPUSet(), snapshotDriver.Capabilities(), allowEmptyTarget,
 		)
@@ -508,7 +523,7 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 			freshEvaluation, err := evaluateCoordinatorSnapshot(
 				fresh, in.DAG, effectiveTargets, parentSafetyTargets, round.desiredMemsByRel(),
 				round.desiredDomainUnion(), round.allowedCPUs(),
-				in.ExpectedCPUSetByRel, in.DeferredCPUSetByRel,
+				in.ExpectedCPUSetByRel, in.RequiredCPUSetByRel, in.DeferredCPUSetByRel,
 				round.deferredCleanupRels,
 				round.admissionSafetyCPUSet(), snapshotDriver.Capabilities(), allowEmptyTarget,
 			)
@@ -583,6 +598,15 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 					outcome.Snapshot = fresh
 					outcome.Blocker = err
 					res.Rounds[len(res.Rounds)-1] = outcome
+					if round.admissionTicket != nil &&
+						round.admissionTicket.hasPhysicalConsumption() {
+						res.State = ConvergenceStateNonConverged
+						return *res, err
+					}
+					if round.admissionTicket != nil {
+						round.admissionTicket.ReleaseUnused()
+						round.admissionTicket = nil
+					}
 					round.pendingSnapshot = fresh
 					round.dynamicByRel = cloneCPUSetMap(in.ExpectedCPUSetByRel)
 					if replanBlocked(outcome) {
@@ -979,9 +1003,11 @@ type coordinatorRound struct {
 	targetByRel           map[string]machine.CPUSet
 	dynamicByRel          map[string]machine.CPUSet
 	deferredByRel         map[string]machine.CPUSet
+	requiredByRel         map[string]machine.CPUSet
 	deferredCleanupRels   map[string]struct{}
 	objective             ConvergenceObjective
 	admissionBudget       *AdmissionConvergenceBudget
+	admissionTicket       *AdmissionBudgetTicket
 	allowEmptyTarget      bool
 	protectedPending      machine.CPUSet
 	protectedByRel        map[string]machine.CPUSet
@@ -1211,6 +1237,7 @@ func (r *coordinatorRound) buildPlan(ctx context.Context, kind PhaseKind, snapsh
 		required, deferred, splitErr := SplitPlanForAdmission(&plan, AdmissionSafetyInput{
 			ProtectedPendingCPUSet: r.admissionSafetyCPUSet(),
 			DeferredCPUSetByRel:    r.deferredByRel,
+			RequiredCPUSetByRel:    r.requiredByRel,
 		})
 		if splitErr != nil {
 			return PhasePlan{}, splitErr
@@ -1246,15 +1273,17 @@ func (r *coordinatorRound) executePlan(ctx context.Context, plan PhasePlan, res 
 	if err := r.revalidateGrowAuthorization(ctx, plan); err != nil {
 		return err
 	}
-	return newSafeCPUSetWriter(r.driver, r.budget, res).execute(ctx, plan)
+	writer := newSafeCPUSetWriter(r.driver, r.budget, res)
+	writer.admissionTicket = r.admissionTicket
+	return writer.execute(ctx, plan)
 }
 
 func (r *coordinatorRound) admissionBudgetReached(res *ConvergenceResult) bool {
 	if r == nil || r.objective != ConvergenceObjectiveParentSafe || r.admissionBudget == nil {
 		return false
 	}
-	if r.admissionBudget.MaxRequiredWrites > 0 && res != nil &&
-		res.Applied >= r.admissionBudget.MaxRequiredWrites {
+	if r.admissionBudget.MaxRequiredWrites > 0 &&
+		r.admissionTicket != nil && r.admissionTicket.forwardExhausted() {
 		return true
 	}
 	return false
@@ -1265,15 +1294,26 @@ func (r *coordinatorRound) checkAdmissionExecutionBudget(plan PhasePlan, res *Co
 		r.admissionBudget == nil || len(plan.Operations) == 0 {
 		return nil
 	}
-	applied := 0
-	if res != nil {
-		applied = res.Applied
+	if r.admissionTicket == nil {
+		if err := r.reserveAdmissionClosure(plan); err != nil {
+			return err
+		}
 	}
-	if limit := r.admissionBudget.MaxRequiredWrites; limit > 0 &&
-		applied+len(plan.Operations) > limit {
-		return fmt.Errorf("admission convergence write budget exhausted before safety closure: limit=%d applied=%d required=%d",
-			limit, applied, len(plan.Operations))
+	return r.admissionTicket.consume(plan)
+}
+
+func (r *coordinatorRound) reserveAdmissionClosure(plan PhasePlan) error {
+	if r == nil || r.objective != ConvergenceObjectiveParentSafe ||
+		r.admissionBudget == nil || len(plan.Operations) == 0 ||
+		r.admissionTicket != nil {
+		return nil
 	}
+	ticket, err := r.budget.ReserveAdmissionBudget(
+		plan, r.requiredByRel, r.admissionBudget.MaxRequiredWrites)
+	if err != nil {
+		return err
+	}
+	r.admissionTicket = ticket
 	return nil
 }
 
@@ -1401,6 +1441,9 @@ func (r *coordinatorRound) executeFixedPointRound(ctx context.Context, defaultMe
 		return staleOutcome(err), err
 	}
 	progressBase = drain.Base
+	if err := r.reserveAdmissionClosure(drain); err != nil {
+		return staleOutcome(err), err
+	}
 	fresh, released, err := r.executeDrainBatches(ctx, drain, res)
 	if fresh != nil {
 		progressSnapshot = fresh

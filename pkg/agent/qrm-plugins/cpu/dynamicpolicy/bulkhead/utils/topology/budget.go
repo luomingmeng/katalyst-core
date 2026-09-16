@@ -39,6 +39,7 @@ var (
 	ErrDeadlockProbeBudgetExceeded        = errors.New("deadlock probe operation budget exceeded")
 	ErrConvergenceDeadlineExceeded        = errors.New("convergence deadline exceeded")
 	ErrAutoCumulativeBudgetInvalid        = errors.New("automatic cumulative budget is invalid")
+	ErrAdmissionReservationExceeded       = errors.New("admission reservation exceeded")
 )
 
 // ConvergenceBudget bounds all work performed by one coordinator invocation.
@@ -76,6 +77,20 @@ type BudgetUsage struct {
 	Edges                   int
 	Operations              int
 	DeadlockProbeOperations int
+}
+
+type PhysicalWriteCost struct {
+	CPUSetWrites int
+	MemsWrites   int
+}
+
+func (c PhysicalWriteCost) Total() int {
+	return saturatingAdd(c.CPUSetWrites, c.MemsWrites)
+}
+
+type AdmissionReservationCost struct {
+	Forward  PhysicalWriteCost
+	Rollback PhysicalWriteCost
 }
 
 // AutoCumulativeBudgetInput is an invocation-scoped upper bound assembled

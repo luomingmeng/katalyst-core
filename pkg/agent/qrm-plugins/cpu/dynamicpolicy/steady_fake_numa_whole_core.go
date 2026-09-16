@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -204,10 +205,49 @@ func projectSteadyFakeNUMAStageWithBudgetAndPins(
 	}
 	committedErr := validateCommittedSteadyFakeNUMASnapshot(committed, floors, topology)
 	if committedErr != nil {
+		if committed.reclaim.IsEmpty() {
+			return cloneSteadyFakeNUMAAssignments(desired), nil
+		}
+		fakeSet := make(map[string]struct{}, len(fakeKeys))
+		for _, key := range fakeKeys {
+			fakeSet[key] = struct{}{}
+		}
+		repairDemands := append([]partitionDemand(nil), demands...)
+		repairQuantity := 0
+		for i := range repairDemands {
+			if _, fake := fakeSet[repairDemands[i].key]; !fake {
+				continue
+			}
+			preferred := committed.reclaim.Intersection(repairDemands[i].eligible)
+			repairDemands[i].quantity = preferred.Size()
+			repairDemands[i].preferred = preferred
+			repairQuantity += preferred.Size()
+		}
+		if repairQuantity == committed.reclaim.Size() {
+			baseline, solveErr := solveDisjointPartitionsWithCoreFloors(
+				repairDemands, floors, topology)
+			if solveErr == nil {
+				repair, repairErr := solveSteadyFakeNUMADesiredWholeCore(
+					repairDemands, fakeKeys, floors, topology, baseline)
+				if repairErr == nil &&
+					steadyFakeNUMAMigrationChurn(
+						committed.reclaim, unionPartitionAssignments(repair, fakeKeys),
+					) <= steadyFakeNUMAMaxMigratedCPUs {
+					return repair, nil
+				}
+			}
+		}
 		return cloneSteadyFakeNUMAAssignments(desired), nil
 	}
 	migrationLimit := steadyFakeNUMAMaxMigratedCPUs
 	if steadyFakeNUMAMigrationChurn(committed.reclaim, desiredFake) <= migrationLimit {
+		general.InfoS("steady fake NUMA migration reaches frozen target",
+			"currentCPUSet", committed.reclaim.String(),
+			"frozenTargetCPUSet", desiredFake.String(),
+			"stageCPUSet", desiredFake.String(),
+			"currentDistance", steadyFakeNUMAMigrationChurn(committed.reclaim, desiredFake),
+			"nextDistance", 0,
+			"stageChurn", steadyFakeNUMAMigrationChurn(committed.reclaim, desiredFake))
 		return cloneSteadyFakeNUMAAssignments(desired), nil
 	}
 
@@ -256,11 +296,6 @@ func projectSteadyFakeNUMAStageWithBudgetAndPins(
 		return nil, fmt.Errorf("cannot derive bounded steady fake-NUMA migration cardinality")
 	}
 
-	demandByKey := make(map[string]partitionDemand, len(demands))
-	for _, demand := range demands {
-		demandByKey[demand.key] = demand
-	}
-
 	var lastErr error
 	currentDistance := steadyFakeNUMAMigrationChurn(committed.reclaim, desiredFake)
 	selectionLimit := budget.maxCandidateActions + 1
@@ -296,8 +331,14 @@ func projectSteadyFakeNUMAStageWithBudgetAndPins(
 				for _, core := range retainedCurrent {
 					target = target.Union(core)
 				}
+				stageDemands, stageDemandByKey, stageErr := steadyFakeNUMAStageDemands(
+					demands, fakeSet, target, desired, topology)
+				if stageErr != nil {
+					lastErr = stageErr
+					continue
+				}
 				pins, pinErr := pinsForUnion(
-					target, fakeKeys, demandByKey, desired, topology, tracker)
+					target, fakeKeys, stageDemandByKey, desired, topology, tracker)
 				if pinErr != nil {
 					if errors.Is(pinErr, errSteadyFakeNUMAPinBudgetExhausted) {
 						return nil, pinErr
@@ -315,7 +356,7 @@ func projectSteadyFakeNUMAStageWithBudgetAndPins(
 					break batchSearch
 				}
 				assignments, solveErr := solveSteadyFakeNUMAWithPinsBudget(
-					demands, fakeKeys, floors, pins, topology, &tracker.solveAttempts,
+					stageDemands, fakeKeys, floors, pins, topology, &tracker.solveAttempts,
 					tracker.budget.maxSolveAttempts)
 				if solveErr != nil {
 					lastErr = solveErr
@@ -329,7 +370,7 @@ func projectSteadyFakeNUMAStageWithBudgetAndPins(
 					continue
 				}
 				if _, validateErr := validateSteadyFakeNUMAFinal(
-					demands, fakeKeys, assignments, topology, nil, false,
+					stageDemands, fakeKeys, assignments, topology, nil, false,
 				); validateErr != nil {
 					lastErr = validateErr
 					continue
@@ -351,7 +392,8 @@ func projectSteadyFakeNUMAStageWithBudgetAndPins(
 						distance, currentDistance)
 					continue
 				}
-				if best == nil || steadyFakeNUMAStageAssignmentLess(best, assignments, demands, topology) {
+				if best == nil || steadyFakeNUMAStageAssignmentLess(
+					best, assignments, stageDemands, fakeKeys, desired, topology) {
 					best = assignments
 				}
 			}
@@ -363,6 +405,14 @@ func projectSteadyFakeNUMAStageWithBudgetAndPins(
 			batchExhausted = true
 		}
 		if best != nil && !batchExhausted {
+			nextFake := unionPartitionAssignments(best, fakeKeys)
+			general.InfoS("steady fake NUMA migration stage planned",
+				"currentCPUSet", committed.reclaim.String(),
+				"frozenTargetCPUSet", desiredFake.String(),
+				"stageCPUSet", nextFake.String(),
+				"currentDistance", currentDistance,
+				"nextDistance", steadyFakeNUMAMigrationChurn(nextFake, desiredFake),
+				"stageChurn", steadyFakeNUMAMigrationChurn(committed.reclaim, nextFake))
 			return best, nil
 		}
 	}
@@ -374,6 +424,72 @@ func projectSteadyFakeNUMAStageWithBudgetAndPins(
 	return nil, fmt.Errorf(
 		"no legal staged reclaim migration within %d changed CPU IDs",
 		migrationLimit)
+}
+
+func steadyFakeNUMAStageDemands(
+	demands []partitionDemand,
+	fakeSet map[string]struct{},
+	target machine.CPUSet,
+	desired map[string]machine.CPUSet,
+	topology *machine.CPUTopology,
+) ([]partitionDemand, map[string]partitionDemand, error) {
+	stageDemands := make([]partitionDemand, len(demands))
+	stageDemandByKey := make(map[string]partitionDemand, len(demands))
+	fakeDemandByKey := make(map[string]partitionDemand, len(fakeSet))
+	for i, demand := range demands {
+		stageDemand := demand
+		if _, fake := fakeSet[demand.key]; fake {
+			stageDemand.quantity = 0
+			fakeDemandByKey[demand.key] = demand
+		}
+		stageDemands[i] = stageDemand
+	}
+	for _, core := range steadyFakeNUMACoreSets(target, topology) {
+		keys := make([]string, 0, len(fakeDemandByKey))
+		for key, demand := range fakeDemandByKey {
+			if core.IsSubsetOf(demand.eligible) {
+				keys = append(keys, key)
+			}
+		}
+		if len(keys) == 0 {
+			return nil, nil, fmt.Errorf(
+				"steady fake-NUMA stage core %s has no eligible demand", core.String())
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			left, right := fakeDemandByKey[keys[i]], fakeDemandByKey[keys[j]]
+			leftDesired := core.IsSubsetOf(desired[keys[i]])
+			rightDesired := core.IsSubsetOf(desired[keys[j]])
+			if leftDesired != rightDesired {
+				return leftDesired
+			}
+			leftPreferred := core.IsSubsetOf(left.preferred)
+			rightPreferred := core.IsSubsetOf(right.preferred)
+			if leftPreferred != rightPreferred {
+				return leftPreferred
+			}
+			return keys[i] < keys[j]
+		})
+		selected := keys[0]
+		for i := range stageDemands {
+			if stageDemands[i].key == selected {
+				stageDemands[i].quantity += core.Size()
+				break
+			}
+		}
+	}
+	assignedFakeQuantity := 0
+	for _, stageDemand := range stageDemands {
+		stageDemandByKey[stageDemand.key] = stageDemand
+		if _, fake := fakeSet[stageDemand.key]; fake {
+			assignedFakeQuantity += stageDemand.quantity
+		}
+	}
+	if assignedFakeQuantity != target.Size() {
+		return nil, nil, fmt.Errorf(
+			"steady fake-NUMA stage target quantity %d differs from assigned quantity %d",
+			target.Size(), assignedFakeQuantity)
+	}
+	return stageDemands, stageDemandByKey, nil
 }
 
 func (b *steadyFakeNUMASearchTracker) consumeCandidateAction() error {
@@ -616,14 +732,38 @@ func maxString(left, right string) string {
 func steadyFakeNUMAStageAssignmentLess(
 	left, right map[string]machine.CPUSet,
 	demands []partitionDemand,
+	fakeKeys []string,
+	desired map[string]machine.CPUSet,
 	topology *machine.CPUTopology,
 ) bool {
+	leftDistance := steadyFakeNUMAQuotaDistance(left, desired, fakeKeys, topology)
+	rightDistance := steadyFakeNUMAQuotaDistance(right, desired, fakeKeys, topology)
+	if leftDistance != rightDistance {
+		return leftDistance > rightDistance
+	}
 	leftCost, leftErr := steadyFakeNUMAStageAssignmentCost(left, demands, topology)
 	rightCost, rightErr := steadyFakeNUMAStageAssignmentCost(right, demands, topology)
 	if leftErr == nil && rightErr == nil && leftCost != rightCost {
 		return leftCost > rightCost
 	}
 	return steadyFakeNUMAAssignmentSignature(left) > steadyFakeNUMAAssignmentSignature(right)
+}
+
+func steadyFakeNUMAQuotaDistance(
+	assignments, desired map[string]machine.CPUSet,
+	fakeKeys []string,
+	topology *machine.CPUTopology,
+) int {
+	currentFake := unionPartitionAssignments(assignments, fakeKeys)
+	desiredFake := unionPartitionAssignments(desired, fakeKeys)
+	distance := 0
+	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
+		numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
+		distance += absInt(
+			currentFake.Intersection(numaCPUs).Size() -
+				desiredFake.Intersection(numaCPUs).Size())
+	}
+	return distance
 }
 
 func steadyFakeNUMAStageAssignmentCost(

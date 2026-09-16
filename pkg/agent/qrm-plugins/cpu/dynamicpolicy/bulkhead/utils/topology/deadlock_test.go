@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
@@ -113,6 +114,66 @@ func TestBuildPhasePlanUsesProvenSafeSeedInsteadOfArbitraryHeldCPUs(t *testing.T
 	}
 	if got := plan.TargetByRel["primary-c"].CPUs; got.Contains(2) {
 		t.Fatalf("primary-c drain target = %s, want safe seed CPU 2 released", got.String())
+	}
+}
+
+func TestBuildPhasePlanMandatoryDrainSeedIncludesCompleteSMTCore(t *testing.T) {
+	input, _ := smt2RequiredCoreDeadlockInput(t, true, 0)
+
+	plan, err := BuildPhasePlan(input)
+	if err != nil {
+		t.Fatalf("BuildPhasePlan: %v", err)
+	}
+	want := machine.NewCPUSet(2, 5)
+	if got := plan.DrainBatch[DomainPrimary]; !got.Equals(want) {
+		t.Fatalf("primary mandatory drain seed = %s, want complete SMT2 core %s",
+			got.String(), want.String())
+	}
+	wantTarget := machine.NewCPUSet(4)
+	if got := plan.TargetByRel["primary-release"].CPUs; !got.Equals(wantTarget) {
+		t.Fatalf("primary-release target = %s, want %s after releasing complete SMT2 core",
+			got.String(), wantTarget.String())
+	}
+	var drainOperation *PlanOperation
+	for i := range plan.Operations {
+		if plan.Operations[i].Rel == "primary-release" {
+			drainOperation = &plan.Operations[i]
+			break
+		}
+	}
+	if drainOperation == nil {
+		t.Fatalf("operations = %+v, want primary-release drain operation", plan.Operations)
+	}
+	if drainOperation.Direction != WriteShrink || !drainOperation.Target.CPUs.Equals(wantTarget) {
+		t.Fatalf("primary-release operation = %+v, want shrink target %s",
+			*drainOperation, wantTarget.String())
+	}
+	if removed := drainOperation.ExpectedCurrent.CPUs.Difference(drainOperation.Target.CPUs); !removed.Equals(want) {
+		t.Fatalf("primary-release drain operation removes %s, want complete SMT2 core %s; operation=%+v",
+			removed.String(), want.String(), *drainOperation)
+	}
+}
+
+func TestBuildPhasePlanMissingCompleteCoreReleaseWitnessFailsClosedDeterministically(t *testing.T) {
+	const attempts = 16
+	signatures := make(map[string]struct{}, attempts)
+	for attempt := 0; attempt < attempts; attempt++ {
+		input, signature := smt2RequiredCoreDeadlockInput(t, false, attempt)
+		signatures[signature] = struct{}{}
+		plan, err := BuildPhasePlan(input)
+		if err == nil {
+			t.Fatalf("attempt %d BuildPhasePlan succeeded with partial mandatory drain seed %s; "+
+				"want fail-closed without a complete SMT2 core release witness",
+				attempt, plan.DrainBatch[DomainPrimary].String())
+		}
+		if !errors.Is(err, ErrIncompleteRequiredCoreReleaseWitness) {
+			t.Fatalf("attempt %d BuildPhasePlan error = %v, want errors.Is(_, ErrIncompleteRequiredCoreReleaseWitness)",
+				attempt, err)
+		}
+	}
+	if len(signatures) <= 5 {
+		t.Fatalf("%d attempts produced only %d distinct insertion signatures, want > 5: %v",
+			attempts, len(signatures), signatures)
 	}
 }
 
@@ -772,6 +833,129 @@ func primaryReclaimSwapInput(t *testing.T, primary, reclaim machine.CPUSet) Phas
 		},
 		Budget: NewBudgetTracker(ConvergenceBudget{}),
 	}
+}
+
+func smt2RequiredCoreDeadlockInput(t *testing.T, completeReleaseWitness bool, attempt int) (PhasePlanInput, string) {
+	t.Helper()
+
+	// CPUs 2 and 5 are the two SMT siblings of one physical core. Both are
+	// currently owned by the primary source and are mandatory in reclaim's
+	// desired target, so deadlock progress must release them atomically.
+	primaryReleaseCurrent := machine.NewCPUSet(2, 4, 5)
+	primaryReleaseDesired := machine.NewCPUSet(4)
+	specs := []NodeSpec{
+		{Rel: "primary-held-0", Role: TopoNodeRolePrimary, Domain: DomainPrimary, CPUs: machine.NewCPUSet(3), TrustAnchor: true},
+		{Rel: "primary-held-1", Role: TopoNodeRolePrimary, Domain: DomainPrimary, CPUs: machine.NewCPUSet(3), TrustAnchor: true},
+		{Rel: "primary-release", Role: TopoNodeRolePrimary, Domain: DomainPrimary, CPUs: primaryReleaseDesired, TrustAnchor: true},
+		{Rel: "reclaim", Role: TopoNodeRoleReclaim, Domain: DomainReclaim, CPUs: machine.NewCPUSet(0, 1, 2, 5), TrustAnchor: true},
+	}
+	entryByRel := map[string]EntryState{
+		"primary-held-0": {Identity: CgroupIdentity{Inode: 1}, CPUs: machine.NewCPUSet(0)},
+		"primary-held-1": {Identity: CgroupIdentity{Inode: 2}, CPUs: machine.NewCPUSet(1)},
+		"primary-release": {
+			Identity: CgroupIdentity{Inode: 3},
+			CPUs:     primaryReleaseCurrent,
+		},
+		"reclaim": {Identity: CgroupIdentity{Inode: 4}, CPUs: machine.NewCPUSet(3)},
+	}
+	if !completeReleaseWitness {
+		// CPU 5 remains required by a distinct source leaf. CPU 2 alone is
+		// releasable, but that partial witness cannot justify draining the core.
+		specs = append(specs, NodeSpec{
+			Rel: "primary-holds-sibling", Role: TopoNodeRolePrimary,
+			Domain: DomainPrimary, CPUs: machine.NewCPUSet(3), TrustAnchor: true,
+		})
+		entryByRel["primary-release"] = EntryState{
+			Identity: CgroupIdentity{Inode: 3},
+			CPUs:     machine.NewCPUSet(2, 4),
+		}
+		entryByRel["primary-holds-sibling"] = EntryState{
+			Identity: CgroupIdentity{Inode: 5},
+			CPUs:     machine.NewCPUSet(5),
+		}
+	}
+
+	rels := []string{"primary-held-0", "primary-held-1", "primary-release", "reclaim"}
+	if !completeReleaseWitness {
+		rels = append(rels, "primary-holds-sibling")
+	}
+	rngFor := func(stream int64) *rand.Rand {
+		const attemptStride = int64(1_000_003)
+		return rand.New(rand.NewSource(int64(attempt+1)*attemptStride + stream))
+	}
+	rngFor(1).Shuffle(len(specs), func(i, j int) {
+		specs[i], specs[j] = specs[j], specs[i]
+	})
+	shuffledRels := func(stream int64) []string {
+		order := append([]string(nil), rels...)
+		rngFor(stream).Shuffle(len(order), func(i, j int) {
+			order[i], order[j] = order[j], order[i]
+		})
+		return order
+	}
+	entryOrder := shuffledRels(2)
+	domainOrder := shuffledRels(3)
+	desiredOrder := shuffledRels(4)
+
+	domainValueByRel := make(map[string]DomainID, len(rels))
+	desiredValueByRel := make(map[string]machine.CPUSet, len(rels))
+	for _, rel := range rels {
+		domainValueByRel[rel] = DomainPrimary
+		desiredValueByRel[rel] = machine.NewCPUSet(3)
+	}
+	domainValueByRel["reclaim"] = DomainReclaim
+	desiredValueByRel["primary-release"] = primaryReleaseDesired
+	desiredValueByRel["reclaim"] = machine.NewCPUSet(0, 1, 2, 5)
+
+	entries := make(map[string]EntryState, len(rels))
+	domainByRel := make(map[string]DomainID, len(rels))
+	desiredByRel := make(map[string]machine.CPUSet, len(rels))
+	for _, rel := range entryOrder {
+		entries[rel] = entryByRel[rel]
+	}
+	for _, rel := range domainOrder {
+		domainByRel[rel] = domainValueByRel[rel]
+	}
+	for _, rel := range desiredOrder {
+		desiredByRel[rel] = desiredValueByRel[rel]
+	}
+
+	dag := mustPlanDAG(t, specs)
+	snapshot := planSnapshot(entries, map[DomainID]machine.CPUSet{
+		DomainPrimary: machine.NewCPUSet(0, 1, 2, 4, 5),
+		DomainReclaim: machine.NewCPUSet(3),
+	})
+	snapshot.DomainByRel = domainByRel
+	snapshot.ID = fingerprintSnapshot(snapshot)
+
+	specOrder := make([]string, len(specs))
+	for i := range specs {
+		specOrder[i] = specs[i].Rel
+	}
+	signature := fmt.Sprintf("specs=%s entries=%s domains=%s desired=%s",
+		strings.Join(specOrder, ","),
+		strings.Join(entryOrder, ","),
+		strings.Join(domainOrder, ","),
+		strings.Join(desiredOrder, ","))
+
+	return PhasePlanInput{
+		Kind: PhaseDrain, DAG: dag, Snapshot: snapshot,
+		DesiredByRel: desiredByRel,
+		AllowedCPUs:  machine.NewCPUSet(0, 1, 2, 3, 4, 5),
+		CPUDetails: machine.CPUDetails{
+			0: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
+			3: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
+			1: {NUMANodeID: 0, SocketID: 0, CoreID: 1},
+			4: {NUMANodeID: 0, SocketID: 0, CoreID: 1},
+			2: {NUMANodeID: 0, SocketID: 0, CoreID: 2},
+			5: {NUMANodeID: 0, SocketID: 0, CoreID: 2},
+		},
+		Selection: DrainSelectionPolicy{
+			MaxCPUsDrainRatio:         0.5,
+			RequirePairedSwapProgress: true,
+		},
+		Budget: NewBudgetTracker(ConvergenceBudget{}),
+	}, signature
 }
 
 func loadOverlapChurnReplayInput(t *testing.T) (PhasePlanInput, overlapChurnReplayFixture) {

@@ -21,11 +21,14 @@ import (
 	"sort"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/util/sets"
+
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/calculator"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	cpuutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/util"
+	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	resourcepackage "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
@@ -278,12 +281,29 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocksWithCheckpointTransition(
 	hardActive bool,
 	checkpointTransition *steadyFakeNUMAMigrationCheckpointTransition,
 ) (advisorapi.BlockCPUSet, error) {
+	var dynamicConf *dynamicconfig.Configuration
+	if p != nil && p.conf != nil {
+		dynamicConf = p.conf.GetDynamicConfiguration()
+	}
+	return p.planDisjointAdvisorBlocksWithCheckpointTransitionAndDynamicConfig(
+		resp, hardActive, checkpointTransition, dynamicConf)
+}
+
+func (p *DynamicPolicy) planDisjointAdvisorBlocksWithCheckpointTransitionAndDynamicConfig(
+	resp *advisorapi.ListAndWatchResponse,
+	hardActive bool,
+	checkpointTransition *steadyFakeNUMAMigrationCheckpointTransition,
+	dynamicConf *dynamicconfig.Configuration,
+) (advisorapi.BlockCPUSet, error) {
 	topology := p.machineInfo.CPUTopology
 	allCPUs := topology.CPUDetails.CPUs()
 	machineState := p.state.GetMachineState()
 	rpPinnedCPUSet := machineState.GetResourcePackagePinnedCPUSet()
 
-	selectorText := p.conf.GetDynamicConfiguration().DisableReclaimPinnedCPUSetResourcePackageSelector
+	if dynamicConf == nil {
+		return nil, fmt.Errorf("disjoint advisor planning requires dynamic configuration")
+	}
+	selectorText := dynamicConf.DisableReclaimPinnedCPUSetResourcePackageSelector
 	disableReclaimSelector, err := general.ParseSelector(selectorText)
 	if err != nil {
 		return nil, err
@@ -295,18 +315,23 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocksWithCheckpointTransition(
 	if err != nil {
 		return nil, err
 	}
-	if resp.DisableDedicatedCoresOverlapReclaimedCores {
-		descriptors, err = normalizeAdvisorDescriptorsForWholeCoreReclaim(
-			descriptors, topology)
-		if err != nil {
-			return nil, err
-		}
-	}
 
 	result := advisorapi.NewBlockCPUSet()
 	available, err := p.allocateStaticAndForbiddenPools(resp, result, allCPUs)
 	if err != nil {
 		return nil, err
+	}
+	skipNUMAs := p.state.GetPodEntries().SteadyExclusiveNUMAs(topology)
+	if resp.DisableDedicatedCoresOverlapReclaimedCores {
+		if hardActive {
+			descriptors, err = normalizeAdvisorDescriptorsForHardPartitionWholeCoreReclaim(
+				descriptors, available, topology, skipNUMAs)
+		} else {
+			descriptors, err = normalizeAdvisorDescriptorsForWholeCoreReclaim(descriptors, topology)
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 	baseAllocatable := available.Clone()
 	if err := allocateAdvisorStaticDescriptors(descriptors, result); err != nil {
@@ -318,8 +343,8 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocksWithCheckpointTransition(
 			descriptor.Class == advisorBlockClassMandatoryReclaim ||
 			(!hardActive && descriptor.Class == advisorBlockClassShared && descriptor.NUMAID != commonstate.FakedNUMAID)
 	})
-	available, err = p.solveAdvisorDescriptorPhaseWithCheckpointTransition(
-		core, available, result, true, hardActive, checkpointTransition)
+	available, err = p.solveAdvisorDescriptorPhaseWithCheckpointTransitionAndSkipNUMAs(
+		core, available, result, true, hardActive, checkpointTransition, skipNUMAs)
 	if err != nil {
 		return nil, fmt.Errorf("solve dedicated and mandatory reclaim: %w", err)
 	}
@@ -363,6 +388,13 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocksWithCheckpointTransition(
 		return nil, fmt.Errorf("allocate overlap reclaim blocks: %w", err)
 	}
 
+	for _, descriptor := range descriptors {
+		if descriptor.Quantity == 0 {
+			if _, found := result[descriptor.BlockID]; !found {
+				result[descriptor.BlockID] = machine.NewCPUSet()
+			}
+		}
+	}
 	if err := validateAdvisorDescriptorPlan(descriptors, result); err != nil {
 		return nil, err
 	}
@@ -411,6 +443,20 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhaseWithCheckpointTransition(
 	hardActive bool,
 	checkpointTransition *steadyFakeNUMAMigrationCheckpointTransition,
 ) (machine.CPUSet, error) {
+	skipNUMAs := p.state.GetPodEntries().SteadyExclusiveNUMAs(p.machineInfo.CPUTopology)
+	return p.solveAdvisorDescriptorPhaseWithCheckpointTransitionAndSkipNUMAs(
+		descriptors, available, result, preserveClass, hardActive, checkpointTransition, skipNUMAs)
+}
+
+func (p *DynamicPolicy) solveAdvisorDescriptorPhaseWithCheckpointTransitionAndSkipNUMAs(
+	descriptors []advisorBlockDescriptor,
+	available machine.CPUSet,
+	result advisorapi.BlockCPUSet,
+	preserveClass bool,
+	hardActive bool,
+	checkpointTransition *steadyFakeNUMAMigrationCheckpointTransition,
+	skipNUMAs sets.Int,
+) (machine.CPUSet, error) {
 	if len(descriptors) == 0 {
 		return available, nil
 	}
@@ -428,7 +474,6 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhaseWithCheckpointTransition(
 		// reserve once ramp-up ends; the planner must skip them so its per-NUMA
 		// minimum and cross-NUMA imbalance guards do not re-impose the ratio-derived
 		// target and reject every other ramp-up QoS on the node.
-		skipNUMAs := p.state.GetPodEntries().SteadyExclusiveNUMAs(p.machineInfo.CPUTopology)
 		var (
 			expanded         []partitionDemand
 			expandedBlockIDs map[string]string

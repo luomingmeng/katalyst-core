@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -53,6 +54,19 @@ const (
 type steadyFakeNUMAMigrationCheckpointTransition struct {
 	kind   steadyFakeNUMAMigrationCheckpointTransitionKind
 	target *steadyFakeNUMAMigrationTarget
+}
+
+func (kind steadyFakeNUMAMigrationCheckpointTransitionKind) String() string {
+	switch kind {
+	case steadyFakeNUMAMigrationCheckpointKeep:
+		return "keep"
+	case steadyFakeNUMAMigrationCheckpointReplace:
+		return "replace"
+	case steadyFakeNUMAMigrationCheckpointRemove:
+		return "remove"
+	default:
+		return fmt.Sprintf("unknown(%d)", kind)
+	}
 }
 
 func cloneSteadyFakeNUMAMigrationCheckpointTransition(
@@ -326,6 +340,16 @@ func (p *DynamicPolicy) planSteadyFakeNUMAStageWithCheckpoint(
 	if err != nil {
 		return nil, keep, err
 	}
+	stage := unionPartitionAssignments(assignments, fakeKeys)
+	general.InfoS("steady fake NUMA migration checkpoint planned",
+		"constraintDigest", digest,
+		"currentCPUSet", committed.reclaim.String(),
+		"frozenTargetCPUSet", target.String(),
+		"stageCPUSet", stage.String(),
+		"currentDistance", steadyFakeNUMAMigrationChurn(committed.reclaim, target),
+		"nextDistance", steadyFakeNUMAMigrationChurn(stage, target),
+		"stageChurn", steadyFakeNUMAMigrationChurn(committed.reclaim, stage),
+		"checkpointTransition", transition.kind.String())
 	return assignments, transition, nil
 }
 

@@ -827,7 +827,10 @@ func TestProjectSteadyFakeNUMAStageAllowsBudgetedAtomicRepairOfInvalidCommittedS
 		demands, []string{"fake"}, committed, desired, nil, topology)
 
 	require.NoError(t, projectErr)
-	require.Equal(t, desired, got)
+	require.Equal(t, current, got["fake"])
+	require.Equal(t, all.Difference(current), got["share"])
+	require.NoError(t, assertCoreAligned(got["fake"], topology))
+	require.Zero(t, steadyFakeNUMAMigrationChurn(current, got["fake"]))
 }
 
 func TestProjectSteadyFakeNUMAStageAtomicRepairUsesReplacementChurnForPureShrink(t *testing.T) {
@@ -1208,6 +1211,190 @@ func TestPlanSteadyFakeNUMACoreCapacityQuotasPreservesOldCounts(t *testing.T) {
 	require.Equal(t, map[int]int{0: 4, 1: 6}, quotas)
 }
 
+func TestPlanWholeCoreCapacityQuotasScalesAcross1024CPUShapes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		capacities []int
+	}{
+		{name: "two NUMAs equal", capacities: []int{512, 512}},
+		{name: "two NUMAs asymmetric", capacities: []int{256, 768}},
+		{name: "four NUMAs equal", capacities: []int{256, 256, 256, 256}},
+		{name: "four NUMAs asymmetric", capacities: []int{128, 192, 320, 384}},
+		{name: "eight NUMAs equal", capacities: []int{128, 128, 128, 128, 128, 128, 128, 128}},
+		{name: "eight NUMAs asymmetric", capacities: []int{64, 96, 128, 128, 128, 160, 160, 160}},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			numaIDs := make([]int, len(tc.capacities))
+			capacityByNUMA := make(map[int]int, len(tc.capacities))
+			minimumByNUMA := make(map[int]int, len(tc.capacities))
+			oldQuotaByNUMA := make(map[int]int, len(tc.capacities))
+			for numaID, capacity := range tc.capacities {
+				numaIDs[numaID] = numaID
+				capacityByNUMA[numaID] = capacity
+				oldQuotaByNUMA[numaID] = capacity
+			}
+
+			quotas, err := planWholeCoreCapacityQuotas(
+				768, 2, numaIDs, capacityByNUMA, minimumByNUMA, oldQuotaByNUMA, true)
+			require.NoError(t, err)
+			require.NoError(t, validateWholeCoreQuotaSaturation(
+				quotas, capacityByNUMA, minimumByNUMA, numaIDs, 2))
+
+			total := 0
+			for numaID, quota := range quotas {
+				require.Zero(t, quota%2)
+				require.LessOrEqual(t, quota, capacityByNUMA[numaID])
+				total += quota
+			}
+			require.Equal(t, 768, total)
+		})
+	}
+}
+
+func TestExpandSteadyFakeNUMAReclaimPhaseBalancesEqualCapacityNUMAs(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(128, 1, 2)
+	require.NoError(t, err)
+	require.Equal(t, 2, topology.CPUsPerCore())
+	all := topology.CPUDetails.CPUs()
+	oldPreferred := coresInNUMA(topology, 0, 0, 7).
+		Union(coresInNUMA(topology, 1, 0, 21))
+	require.Equal(t, 14, oldPreferred.Intersection(
+		topology.CPUDetails.CPUsInNUMANodes(0)).Size())
+	require.Equal(t, 42, oldPreferred.Intersection(
+		topology.CPUDetails.CPUsInNUMANodes(1)).Size())
+
+	demands, blockIDByDemandKey, _, err := expandSteadyFakeNUMAReclaimPhase(
+		[]advisorBlockDescriptor{{
+			BlockID:      "fake",
+			Class:        advisorBlockClassMandatoryReclaim,
+			NUMAID:       commonstate.FakedNUMAID,
+			Quantity:     56,
+			ComponentKey: "fake",
+			Eligible:     all,
+			OldPreferred: oldPreferred,
+		}},
+		all,
+		topology,
+		nil,
+	)
+	require.NoError(t, err)
+
+	quotaByNUMA := make(map[int]int)
+	for _, demand := range demands {
+		if blockIDByDemandKey[demand.key] != "fake" {
+			continue
+		}
+		numaIDs := topology.CPUDetails.KeepOnly(demand.eligible).NUMANodes().ToSliceInt()
+		require.Len(t, numaIDs, 1)
+		quotaByNUMA[numaIDs[0]] += demand.quantity
+	}
+	require.Equal(t, map[int]int{0: 28, 1: 28}, quotaByNUMA)
+}
+
+func TestSolveAdvisorDescriptorPhaseSteadyFakeNUMAStagesTowardBalancedTarget(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(128, 1, 2)
+	require.NoError(t, err)
+	require.Equal(t, 2, topology.CPUsPerCore())
+	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	all := topology.CPUDetails.CPUs()
+	committed := coresInNUMA(topology, 0, 0, 7).
+		Union(coresInNUMA(topology, 1, 0, 21))
+	descriptors := []advisorBlockDescriptor{
+		{
+			BlockID: "fake", Class: advisorBlockClassMandatoryReclaim,
+			NUMAID: commonstate.FakedNUMAID, Quantity: 56, ComponentKey: "fake",
+			Eligible: all, OldPreferred: committed,
+		},
+		{
+			BlockID: "share", Class: advisorBlockClassShared,
+			NUMAID: commonstate.FakedNUMAID, Quantity: all.Size() - 56, ComponentKey: "share",
+			Eligible: all, OldPreferred: all.Difference(committed),
+		},
+	}
+	setCommittedDescriptorOwnershipForTest(descriptors)
+	result := make(map[string]machine.CPUSet)
+	transition := steadyFakeNUMAMigrationCheckpointTransition{
+		kind: steadyFakeNUMAMigrationCheckpointKeep,
+	}
+
+	remaining, err := p.solveAdvisorDescriptorPhaseWithCheckpointTransition(
+		descriptors, all, result, true, false, &transition)
+
+	require.NoError(t, err)
+	require.True(t, remaining.IsEmpty())
+	require.NotNil(t, transition.target,
+		"real steady planning must freeze the balanced final target before staging")
+	require.Equal(t, steadyFakeNUMAMigrationCheckpointReplace, transition.kind)
+	target := transition.target.target
+	targetByNUMA := map[int]int{
+		0: target.Intersection(topology.CPUDetails.CPUsInNUMANodes(0)).Size(),
+		1: target.Intersection(topology.CPUDetails.CPUsInNUMANodes(1)).Size(),
+	}
+	require.Equal(t, map[int]int{0: 28, 1: 28}, targetByNUMA)
+
+	next := result["fake"]
+	require.Equal(t, 56, next.Size())
+	require.NoError(t, assertCoreAligned(next, topology))
+	require.LessOrEqual(t,
+		steadyFakeNUMAMigrationChurn(committed, next),
+		steadyFakeNUMAMaxMigratedCPUs)
+	require.Less(t,
+		steadyFakeNUMAMigrationChurn(next, target),
+		steadyFakeNUMAMigrationChurn(committed, target))
+}
+
+func TestExpandSteadyFakeNUMAReclaimPhaseExcludesRealMandatoryNUMAFromFakePreference(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(16, 1, 2)
+	require.NoError(t, err)
+	all := topology.CPUDetails.CPUs()
+	realPreferred := coresInNUMA(topology, 0, 0, 1)
+	fakePreferred := realPreferred.
+		Union(coresInNUMA(topology, 0, 1, 2)).
+		Union(coresInNUMA(topology, 1, 0, 1))
+
+	demands, blockIDByDemandKey, _, err := expandSteadyFakeNUMAReclaimPhase(
+		[]advisorBlockDescriptor{
+			{
+				BlockID: "real-0", Class: advisorBlockClassMandatoryReclaim, NUMAID: 0,
+				Quantity: 2, ComponentKey: "real-0",
+				Eligible: topology.CPUDetails.CPUsInNUMANodes(0), OldPreferred: realPreferred,
+			},
+			{
+				BlockID: "fake", Class: advisorBlockClassMandatoryReclaim, NUMAID: commonstate.FakedNUMAID,
+				Quantity: 4, ComponentKey: "fake", Eligible: all, OldPreferred: fakePreferred,
+			},
+		},
+		all,
+		topology,
+		nil,
+	)
+	require.NoError(t, err)
+
+	fakeDemandPreferred := machine.NewCPUSet()
+	for _, demand := range demands {
+		if blockIDByDemandKey[demand.key] == "fake" {
+			fakeDemandPreferred = fakeDemandPreferred.Union(demand.preferred)
+		}
+	}
+	require.False(t, fakeDemandPreferred.IsEmpty())
+	require.True(t, fakeDemandPreferred.Equals(
+		fakePreferred.Intersection(topology.CPUDetails.CPUsInNUMANodes(1))),
+		"fake-NUMA preference must exclude the complete NUMA owned by a real mandatory descriptor")
+}
+
 func TestPlanSteadyFakeNUMACoreCapacityQuotasUsesCoreCapacityBeforeOddOldCounts(t *testing.T) {
 	t.Parallel()
 
@@ -1313,6 +1500,7 @@ func TestSolveAdvisorDescriptorPhaseSteadyFakeNUMARepairsProductionShape(t *test
 			Quantity:     oldFake.Size(),
 			ComponentKey: "fake",
 			Eligible:     all,
+			Committed:    oldFake,
 			OldPreferred: oldFake,
 		},
 		{
@@ -1910,6 +2098,7 @@ func TestSolveAdvisorDescriptorPhaseRepairsDC05CheckpointWithinEightChangedCPUs(
 			Quantity:     oldFake.Size(),
 			ComponentKey: "fake",
 			Eligible:     all,
+			Committed:    oldFake,
 			OldPreferred: oldFake,
 		},
 		{

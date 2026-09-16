@@ -579,3 +579,36 @@ func TestCPUAdvisorValidatorUsesIncomingOverlapMode(t *testing.T) {
 		})
 	}
 }
+
+func TestCPUAdvisorValidatorDoesNotApplyHardFakeCapacityToSteady(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	validator := NewCPUAdvisorValidator(cpustate.NewCPUPluginState(nil),
+		&machine.KatalystMachineInfo{CPUTopology: topology})
+
+	resp := &advisorapi.ListAndWatchResponse{
+		DisableDedicatedCoresOverlapReclaimedCores: true,
+		Entries: map[string]*advisorapi.CalculationEntries{
+			commonstate.PoolNameReclaim: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameReclaim,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							0: {
+								Blocks: []*advisorapi.Block{{BlockId: "real-0", Result: 2}},
+							},
+							commonstate.FakedNUMAID: {
+								Blocks: []*advisorapi.Block{{BlockId: "fake", Result: 6}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	require.NoError(t, validator.validateBlocks(resp),
+		"the generic validator must not apply hard-only fake capacity before hardActive is known")
+}
