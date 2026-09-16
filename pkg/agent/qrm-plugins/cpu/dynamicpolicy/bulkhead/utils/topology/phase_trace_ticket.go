@@ -37,7 +37,12 @@ type ExecutionReservationTicket struct {
 	reserved         ExecutionReservationCost
 	consumedForward  PhysicalWriteCost
 	consumedRollback PhysicalWriteCost
-	released         bool
+	// Rollback hierarchy I/O is isolated from the ordinary convergence budget,
+	// but remains finite. Every reserved inverse write permits one identity
+	// check, one write, and one final read-back.
+	rollbackIOOperations         int
+	consumedRollbackIOOperations int
+	released                     bool
 }
 
 // ReservePhaseTrace validates and freezes the complete trace before taking any
@@ -77,9 +82,10 @@ func (b *BudgetTracker) ReservePhaseTrace(
 		}
 	}
 	return &ExecutionReservationTicket{
-		traceID:    frozen.TraceID,
-		operations: operations,
-		reserved:   reserved,
+		traceID:              frozen.TraceID,
+		operations:           operations,
+		reserved:             reserved,
+		rollbackIOOperations: saturatingMultiply(reserved.Rollback.Total(), 3),
 	}, nil
 }
 
@@ -165,6 +171,24 @@ func (t *ExecutionReservationTicket) consumeRollback(cost PhysicalWriteCost) err
 			ErrAdmissionReservationExceeded, remaining, cost)
 	}
 	t.consumedRollback = addPhysicalWriteCost(t.consumedRollback, cost)
+	return nil
+}
+
+func (t *ExecutionReservationTicket) consumeRollbackIO() error {
+	if t == nil {
+		return fmt.Errorf("%w: execution reservation ticket is nil",
+			ErrAdmissionReservationExceeded)
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.released {
+		return fmt.Errorf("%w: ticket already released", ErrAdmissionReservationExceeded)
+	}
+	if t.consumedRollbackIOOperations >= t.rollbackIOOperations {
+		return fmt.Errorf("%w: rollback hierarchy I/O remaining=0 requested=1",
+			ErrAdmissionReservationExceeded)
+	}
+	t.consumedRollbackIOOperations++
 	return nil
 }
 

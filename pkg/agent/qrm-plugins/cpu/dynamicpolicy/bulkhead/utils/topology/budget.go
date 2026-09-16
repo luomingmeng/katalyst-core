@@ -240,6 +240,15 @@ func (b *BudgetTracker) Usage() BudgetUsage {
 	return b.usage
 }
 
+func (b *BudgetTracker) Deadline() time.Time {
+	if b == nil {
+		return time.Time{}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.limit.Deadline
+}
+
 func (b *BudgetTracker) configureAutoHierarchyIOBootstrap(staleRetryAllowance int) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()

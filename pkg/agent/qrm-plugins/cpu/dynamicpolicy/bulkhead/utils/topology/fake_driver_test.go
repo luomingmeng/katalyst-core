@@ -34,6 +34,7 @@ type fakeHierarchyNode struct {
 	cpus           machine.CPUSet
 	configuredCPUs machine.CPUSet
 	mems           string
+	configuredMems string
 }
 
 type fakeHierarchyWrite struct {
@@ -91,6 +92,7 @@ func (f *fakeHierarchyDriver) add(rel string, identity CgroupIdentity, cpus, mem
 		cpus:           machine.MustParse(cpus),
 		configuredCPUs: machine.MustParse(cpus),
 		mems:           mems,
+		configuredMems: mems,
 	}
 	if filepath.Dir(rel) == "." {
 		f.roots = append(f.roots, rel)
@@ -148,7 +150,7 @@ func (f *fakeHierarchyDriver) ReadEntry(_ context.Context, rel string) (EntrySta
 	return EntryState{
 		Rel: rel, Identity: node.identity,
 		CPUs: node.cpus.Clone(), ConfiguredCPUs: node.configuredCPUs.Clone(),
-		Mems: node.mems, ConfiguredMems: node.mems,
+		Mems: node.mems, ConfiguredMems: node.configuredMems,
 	}, nil
 }
 
@@ -200,6 +202,7 @@ func (f *fakeHierarchyDriver) WriteCPUs(_ context.Context, rel string, expected 
 	trace.after[rel] = fakeHierarchyNode{
 		identity: current.identity, cpus: effective.Clone(),
 		configuredCPUs: cpus.Clone(), mems: current.mems,
+		configuredMems: current.configuredMems,
 	}
 	if err := f.checkInvariants(trace); err != nil {
 		return err
@@ -234,14 +237,24 @@ func (f *fakeHierarchyDriver) WriteMems(_ context.Context, rel string, expected 
 		return ErrCgroupIdentityChanged
 	}
 	trace := f.nextTrace(write, before)
+	effective := mems
+	if f.capabilities.EmptyConfiguredCPUSet && mems == "" {
+		if parent := f.nodes[filepath.Dir(rel)]; parent != nil {
+			effective = parent.mems
+		} else {
+			effective = current.mems
+		}
+	}
 	trace.after[rel] = fakeHierarchyNode{
 		identity: current.identity, cpus: current.cpus.Clone(),
-		configuredCPUs: current.configuredCPUs.Clone(), mems: mems,
+		configuredCPUs: current.configuredCPUs.Clone(), mems: effective,
+		configuredMems: mems,
 	}
 	if err := f.checkInvariants(trace); err != nil {
 		return err
 	}
-	current.mems = mems
+	current.configuredMems = mems
+	current.mems = effective
 	f.writes = append(f.writes, write)
 	f.traces = append(f.traces, trace)
 	return nil
@@ -261,6 +274,7 @@ func (f *fakeHierarchyDriver) snapshot() fakeHierarchyState {
 			cpus:           node.cpus.Clone(),
 			configuredCPUs: node.configuredCPUs.Clone(),
 			mems:           node.mems,
+			configuredMems: node.configuredMems,
 		}
 	}
 	return state

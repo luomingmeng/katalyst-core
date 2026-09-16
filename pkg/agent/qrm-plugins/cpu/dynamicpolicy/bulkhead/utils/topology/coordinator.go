@@ -829,6 +829,9 @@ func roundOutcomeMadeNetProgress(outcome RoundOutcome) bool {
 		measure.DrainChangedRels = len(outcome.ChangedRels)
 	}
 	for _, applied := range outcome.Journal {
+		if applied.PhysicalImpact == PhysicalImpactUncertain {
+			continue
+		}
 		if applied.Observed.CPUs.Equals(applied.Target.CPUs) && applied.Observed.Mems == applied.Target.Mems {
 			measure.VerifiedWrites++
 		}

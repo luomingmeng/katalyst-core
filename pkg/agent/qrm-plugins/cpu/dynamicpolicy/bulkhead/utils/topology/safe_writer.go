@@ -28,12 +28,24 @@ import (
 )
 
 type AppliedPlanOperation struct {
-	PlanID    string
-	Rel       string
-	Direction WriteDirection
-	Target    CPUSetTarget
-	Observed  CPUSetTarget
+	PlanID                string
+	Rel                   string
+	Direction             WriteDirection
+	Target                CPUSetTarget
+	Observed              CPUSetTarget
+	Resource              HierarchyOperation
+	PhysicalImpact        PhysicalImpact
+	LogicalOperationIndex int
+	Phase                 PhaseKind
 }
+
+type PhysicalImpact string
+
+const (
+	PhysicalImpactNone      PhysicalImpact = ""
+	PhysicalImpactConfirmed PhysicalImpact = "confirmed"
+	PhysicalImpactUncertain PhysicalImpact = "uncertain"
+)
 
 type safeCPSetWriter struct {
 	driver          HierarchyDriver
