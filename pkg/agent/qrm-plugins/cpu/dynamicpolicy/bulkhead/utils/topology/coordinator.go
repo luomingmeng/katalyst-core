@@ -468,14 +468,6 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 			}
 			if replanRequired(err) {
 				res.Rounds = append(res.Rounds, outcome)
-				if round.admissionTicket != nil {
-					if round.admissionTicket.hasPhysicalConsumption() {
-						res.State = ConvergenceStateNonConverged
-						return *res, err
-					}
-					round.admissionTicket.ReleaseUnused()
-					round.admissionTicket = nil
-				}
 				if replanBlocked(outcome) {
 					res.State = ConvergenceStateBlocked
 					return *res, &CoordinatorBlockedError{Blocker: outcome.Blocker}
@@ -501,13 +493,6 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 			return *res, err
 		}
 		res.ConvergenceReport = evaluation.Report
-		admissionBudgetExceeded := false
-		if in.Objective.orFullDefault() == ConvergenceObjectiveParentSafe && in.AdmissionBudget != nil {
-			admissionBudgetExceeded = round.admissionBudgetReached(res)
-			if admissionBudgetExceeded && !evaluation.ParentSafety.Safe {
-				return *res, fmt.Errorf("admission convergence budget exhausted before parent-safe proof")
-			}
-		}
 		parentSafeDeferred := in.Objective.orFullDefault() == ConvergenceObjectiveParentSafe &&
 			evaluation.ParentSafety.Safe && !evaluation.Report.FullyConverged
 		if evaluation.Report.FullyConverged || parentSafeDeferred {
@@ -545,10 +530,6 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 				return *res, err
 			}
 			res.ConvergenceReport = freshEvaluation.Report
-			admissionBudgetExceeded = round.admissionBudgetReached(res)
-			if admissionBudgetExceeded && !freshEvaluation.ParentSafety.Safe {
-				return *res, fmt.Errorf("admission convergence budget exhausted before fresh parent-safe proof")
-			}
 			parentSafeDeferred = in.Objective.orFullDefault() == ConvergenceObjectiveParentSafe &&
 				freshEvaluation.ParentSafety.Safe &&
 				!freshEvaluation.Report.FullyConverged
@@ -612,15 +593,6 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 					outcome.Snapshot = fresh
 					outcome.Blocker = err
 					res.Rounds[len(res.Rounds)-1] = outcome
-					if round.admissionTicket != nil &&
-						round.admissionTicket.hasPhysicalConsumption() {
-						res.State = ConvergenceStateNonConverged
-						return *res, err
-					}
-					if round.admissionTicket != nil {
-						round.admissionTicket.ReleaseUnused()
-						round.admissionTicket = nil
-					}
 					round.pendingSnapshot = fresh
 					round.dynamicByRel = cloneCPUSetMap(in.ExpectedCPUSetByRel)
 					if replanBlocked(outcome) {
@@ -1016,20 +988,16 @@ func newCoordinatorHierarchyDriver(
 }
 
 type coordinatorRound struct {
-	dag                 *TopoDAG
-	targetByRel         map[string]machine.CPUSet
-	dynamicByRel        map[string]machine.CPUSet
-	deferredByRel       map[string]machine.CPUSet
-	requiredByRel       map[string]machine.CPUSet
-	deferredCleanupRels map[string]struct{}
-	objective           ConvergenceObjective
-	admissionBudget     *AdmissionConvergenceBudget
-	frozenTrace         *CompiledPhaseTrace
-	executionTicket     *ExecutionReservationTicket
-	// admissionTicket remains only for the legacy admission-closure tests until
-	// Task 10 removes that retired implementation. Production ParentSafe
-	// convergence never enters the live phase session that owns this field.
-	admissionTicket       *AdmissionBudgetTicket
+	dag                   *TopoDAG
+	targetByRel           map[string]machine.CPUSet
+	dynamicByRel          map[string]machine.CPUSet
+	deferredByRel         map[string]machine.CPUSet
+	requiredByRel         map[string]machine.CPUSet
+	deferredCleanupRels   map[string]struct{}
+	objective             ConvergenceObjective
+	admissionBudget       *AdmissionConvergenceBudget
+	frozenTrace           *CompiledPhaseTrace
+	executionTicket       *ExecutionReservationTicket
 	allowEmptyTarget      bool
 	protectedPending      machine.CPUSet
 	protectedByRel        map[string]machine.CPUSet
@@ -1363,53 +1331,11 @@ func (r *coordinatorRound) executePlan(ctx context.Context, plan PhasePlan, res 
 	if r.budget == nil {
 		return fmt.Errorf("phase writer requires convergence budget")
 	}
-	if err := r.checkAdmissionExecutionBudget(plan, res); err != nil {
-		return err
-	}
 	if err := r.revalidateGrowAuthorization(ctx, plan); err != nil {
 		return err
 	}
 	writer := newSafeCPUSetWriter(r.driver, r.budget, res)
-	writer.admissionTicket = r.admissionTicket
 	return writer.execute(ctx, plan)
-}
-
-func (r *coordinatorRound) admissionBudgetReached(res *ConvergenceResult) bool {
-	if r == nil || r.objective != ConvergenceObjectiveParentSafe || r.admissionBudget == nil {
-		return false
-	}
-	if r.admissionBudget.MaxRequiredWrites > 0 &&
-		r.admissionTicket != nil && r.admissionTicket.forwardExhausted() {
-		return true
-	}
-	return false
-}
-
-func (r *coordinatorRound) checkAdmissionExecutionBudget(plan PhasePlan, res *ConvergenceResult) error {
-	if r == nil || r.objective != ConvergenceObjectiveParentSafe ||
-		r.admissionBudget == nil || len(plan.Operations) == 0 {
-		return nil
-	}
-	if r.admissionTicket == nil {
-		return fmt.Errorf("%w: admission round was not prepared before apply",
-			ErrAdmissionReservationExceeded)
-	}
-	return r.admissionTicket.consume(plan)
-}
-
-func (r *coordinatorRound) reserveAdmissionClosure(plan PhasePlan) error {
-	if r == nil || r.objective != ConvergenceObjectiveParentSafe ||
-		r.admissionBudget == nil || len(plan.Operations) == 0 ||
-		r.admissionTicket != nil {
-		return nil
-	}
-	ticket, err := r.budget.ReserveAdmissionBudget(
-		plan, r.requiredByRel, r.admissionBudget.MaxRequiredWrites)
-	if err != nil {
-		return err
-	}
-	r.admissionTicket = ticket
-	return nil
 }
 
 func (r *coordinatorRound) revalidateGrowAuthorization(ctx context.Context, plan PhasePlan) error {

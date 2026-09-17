@@ -81,10 +81,6 @@ func (s *liveTraceSession) Snapshot(ctx context.Context) (*CompleteSnapshot, err
 	return s.round.snapshotSource(ctx)
 }
 
-func (*liveTraceSession) PrepareRound(PhasePlan) error {
-	return nil
-}
-
 func (s *liveTraceSession) Apply(ctx context.Context, plan PhasePlan) (phaseSessionApplyResult, error) {
 	result := phaseSessionApplyResult{}
 	for _, op := range plan.Operations {
@@ -128,10 +124,6 @@ func newProjectedTraceSession(t *testing.T, base *CompleteSnapshot, capabilities
 
 func (s *projectedTraceSession) Snapshot(_ context.Context) (*CompleteSnapshot, error) {
 	return CloneCompleteSnapshot(s.hierarchy.snapshot), nil
-}
-
-func (*projectedTraceSession) PrepareRound(PhasePlan) error {
-	return nil
 }
 
 func (s *projectedTraceSession) Apply(_ context.Context, plan PhasePlan) (phaseSessionApplyResult, error) {
@@ -457,199 +449,12 @@ func TestFixedPointEngineSessionReceivesCompletePhasePlan(t *testing.T) {
 
 type planRecordingSession struct {
 	phaseExecutionSession
-	prepared []PhasePlan
-	plans    []PhasePlan
-}
-
-type admissionReservationRecordingSession struct {
-	phaseExecutionSession
-	round            *coordinatorRound
-	prepared         []PhasePlan
-	reservationCount int
-}
-
-func (s *admissionReservationRecordingSession) PrepareRound(plan PhasePlan) error {
-	s.prepared = append(s.prepared, plan)
-	before := s.round.admissionTicket
-	err := s.phaseExecutionSession.PrepareRound(plan)
-	if before == nil && s.round.admissionTicket != nil {
-		s.reservationCount++
-	}
-	return err
-}
-
-func (s *planRecordingSession) PrepareRound(plan PhasePlan) error {
-	s.prepared = append(s.prepared, plan)
-	return s.phaseExecutionSession.PrepareRound(plan)
+	plans []PhasePlan
 }
 
 func (s *planRecordingSession) Apply(ctx context.Context, plan PhasePlan) (phaseSessionApplyResult, error) {
 	s.plans = append(s.plans, plan)
 	return s.phaseExecutionSession.Apply(ctx, plan)
-}
-
-func TestFixedPointEnginePreparesCompleteDrainBeforeFirstFrontier(t *testing.T) {
-	fixture := newAdmissionTraceFixture(t)
-	fixture.configureMultiFrontierParentSafeDrain()
-	base := fixture.snapshot()
-	projected := newProjectedTraceSession(t, base, fixture.driver.Capabilities())
-	session := &planRecordingSession{phaseExecutionSession: projected}
-
-	_, err := fixture.round.runFixedPointEngine(
-		context.Background(),
-		session,
-		fixedPointEngineSingleRound,
-	)
-	require.NoError(t, err)
-	require.Len(t, session.prepared, 2)
-	require.NotEmpty(t, session.plans)
-	require.Greater(t, len(session.prepared[0].Operations), len(session.plans[0].Operations))
-	require.Equal(t, session.prepared[0].PlanID, canonicalExecutionPlanID(session.prepared[0]))
-	require.Equal(t, PhaseExpand, session.prepared[1].Kind)
-}
-
-func TestLiveFixedPointEngineRejectsMultiFrontierReservationBeforePhysicalWrite(t *testing.T) {
-	fixture := newAdmissionTraceFixture(t)
-	fixture.configureMultiFrontierParentSafeDrain()
-	base := fixture.snapshot()
-	fullDrain, err := fixture.round.buildPlan(context.Background(), PhaseDrain, base)
-	require.NoError(t, err)
-	firstFrontier, err := drainFrontier(fullDrain)
-	require.NoError(t, err)
-	require.Greater(t, len(fullDrain.Operations), len(firstFrontier.Operations))
-	firstCost := admissionPlanPhysicalWriteCost(firstFrontier)
-	fullCost := admissionPlanPhysicalWriteCost(fullDrain)
-	require.Greater(t, fullCost.Total(), firstCost.Total())
-
-	fixture.round.round = 0
-	fixture.round.admissionTicket = nil
-	fixture.round.admissionBudget = &AdmissionConvergenceBudget{
-		MaxRequiredWrites: 2 * firstCost.Total(),
-	}
-	_, err = fixture.round.runFixedPointEngine(
-		context.Background(),
-		newLivePhaseSession(fixture.round, &ConvergenceResult{}),
-		fixedPointEngineSingleRound,
-	)
-	require.ErrorIs(t, err, ErrAdmissionReservationExceeded)
-	require.Zero(t, fixture.driver.PhysicalWriteCount())
-	require.Nil(t, fixture.round.admissionTicket)
-}
-
-func TestLivePhaseSessionApplyRequiresPreparedFullDrainReservation(t *testing.T) {
-	fixture := newAdmissionTraceFixture(t)
-	fixture.configureMultiFrontierParentSafeDrain()
-	fullDrain, err := fixture.round.buildPlan(
-		context.Background(),
-		PhaseDrain,
-		fixture.snapshot(),
-	)
-	require.NoError(t, err)
-	firstFrontier, err := drainFrontier(fullDrain)
-	require.NoError(t, err)
-	require.Greater(t, len(fullDrain.Operations), len(firstFrontier.Operations))
-	fixture.round.admissionBudget = &AdmissionConvergenceBudget{
-		MaxRequiredWrites: 2 * admissionPlanPhysicalWriteCost(fullDrain).Total(),
-	}
-	session := newLivePhaseSession(fixture.round, &ConvergenceResult{})
-
-	_, err = session.Apply(context.Background(), firstFrontier)
-
-	require.ErrorIs(t, err, ErrAdmissionReservationExceeded)
-	require.ErrorContains(t, err, "not prepared")
-	require.Zero(t, fixture.driver.PhysicalWriteCount())
-	require.Nil(t, fixture.round.admissionTicket)
-}
-
-func TestLiveFixedPointEnginePureExpandReservesCompletePlanOnce(t *testing.T) {
-	fixture := newAdmissionTraceFixture(t)
-	fixture.addPrimary("kubepods", "0", "0")
-	fixture.requireCPUSet("kubepods", "0-1")
-	base := fixture.snapshot()
-
-	drain, err := fixture.round.buildPlan(context.Background(), PhaseDrain, base)
-	require.NoError(t, err)
-	require.Empty(t, drain.Operations)
-	expand, err := fixture.round.buildPlan(context.Background(), PhaseExpand, base)
-	require.NoError(t, err)
-	require.NotEmpty(t, expand.Operations)
-	fixture.round.admissionBudget = &AdmissionConvergenceBudget{
-		MaxRequiredWrites: 2 * admissionPlanPhysicalWriteCost(expand).Total(),
-	}
-	session := &admissionReservationRecordingSession{
-		phaseExecutionSession: newLivePhaseSession(fixture.round, &ConvergenceResult{}),
-		round:                 fixture.round,
-	}
-
-	result, err := fixture.round.runFixedPointEngine(
-		context.Background(),
-		session,
-		fixedPointEngineSingleRound,
-	)
-
-	require.NoError(t, err)
-	require.True(t, result.ObjectiveSatisfied)
-	require.Equal(t, 1, session.reservationCount)
-	require.Len(t, session.prepared, 2)
-	require.Empty(t, session.prepared[0].Operations)
-	require.Equal(t, expand.Operations, session.prepared[1].Operations)
-	require.Equal(t, len(expand.Operations), fixture.driver.PhysicalWriteCount())
-}
-
-func TestLiveFixedPointEnginePureExpandRejectsInsufficientReservationBeforeWrite(t *testing.T) {
-	fixture := newAdmissionTraceFixture(t)
-	fixture.addPrimary("kubepods", "0", "0")
-	fixture.requireCPUSet("kubepods", "0-1")
-	base := fixture.snapshot()
-
-	expand, err := fixture.round.buildPlan(context.Background(), PhaseExpand, base)
-	require.NoError(t, err)
-	required := 2 * admissionPlanPhysicalWriteCost(expand).Total()
-	require.Greater(t, required, 1)
-	fixture.round.admissionBudget = &AdmissionConvergenceBudget{
-		MaxRequiredWrites: required - 1,
-	}
-	session := &admissionReservationRecordingSession{
-		phaseExecutionSession: newLivePhaseSession(fixture.round, &ConvergenceResult{}),
-		round:                 fixture.round,
-	}
-
-	_, err = fixture.round.runFixedPointEngine(
-		context.Background(),
-		session,
-		fixedPointEngineSingleRound,
-	)
-
-	require.ErrorIs(t, err, ErrAdmissionReservationExceeded)
-	require.Zero(t, fixture.driver.PhysicalWriteCount())
-	require.Zero(t, session.reservationCount)
-	require.Len(t, session.prepared, 2)
-	require.Equal(t, expand.Operations, session.prepared[1].Operations)
-	require.Nil(t, fixture.round.admissionTicket)
-}
-
-func TestLiveFixedPointEngineExpandDoesNotReserveAgainAfterDrainTicket(t *testing.T) {
-	fixture := newAdmissionTraceFixture(t)
-	fixture.configureStagedSMTTransferWithDynamicDescendant()
-	fixture.snapshot()
-	fixture.round.admissionBudget = &AdmissionConvergenceBudget{MaxRequiredWrites: 100}
-	session := &admissionReservationRecordingSession{
-		phaseExecutionSession: newLivePhaseSession(fixture.round, &ConvergenceResult{}),
-		round:                 fixture.round,
-	}
-
-	result, err := fixture.round.runFixedPointEngine(
-		context.Background(),
-		session,
-		fixedPointEngineSingleRound,
-	)
-
-	require.NoError(t, err)
-	require.True(t, result.ObjectiveSatisfied)
-	require.Equal(t, 1, session.reservationCount)
-	require.Len(t, session.prepared, 2)
-	require.NotEmpty(t, session.prepared[0].Operations)
-	require.NotEmpty(t, session.prepared[1].Operations)
 }
 
 type firstSnapshotErrorSession struct {
@@ -705,7 +510,7 @@ func TestCompiledTraceMatchesFixedPointEngineTrace(t *testing.T) {
 	require.Equal(t, flattenTraceOperations(compiled), observed)
 }
 
-func TestParentSafeCompileAndLiveApplySkipFrozenUnavailableChild(t *testing.T) {
+func TestParentSafeCompileSkipsFrozenUnavailableChild(t *testing.T) {
 	fixture := newAdmissionTraceFixture(t)
 	fixture.configureMultiFrontierParentSafeDrain()
 	fixture.addUnavailableDynamicChild("kubepods/besteffort/container", "0-2", "0")
@@ -721,20 +526,6 @@ func TestParentSafeCompileAndLiveApplySkipFrozenUnavailableChild(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, trace.FinalEvaluation.ParentSafety.Safe)
 	require.Equal(t, wantEvidence, trace.InitialSnapshot.UnavailableChildren["kubepods/besteffort/container"])
-
-	fixture.round.round = 0
-	fixture.round.admissionTicket = nil
-	fixture.round.admissionBudget = &AdmissionConvergenceBudget{
-		MaxRequiredWrites: 2 * trace.Cost.Forward.Total(),
-	}
-	result, err := fixture.round.runFixedPointEngine(
-		context.Background(),
-		newLivePhaseSession(fixture.round, &ConvergenceResult{}),
-		fixedPointEngineSingleRound,
-	)
-	require.NoError(t, err)
-	require.True(t, result.ObjectiveSatisfied)
-	require.Positive(t, fixture.driver.PhysicalWriteCount())
 }
 
 func TestFreezePhaseTraceRejectsNoProgress(t *testing.T) {

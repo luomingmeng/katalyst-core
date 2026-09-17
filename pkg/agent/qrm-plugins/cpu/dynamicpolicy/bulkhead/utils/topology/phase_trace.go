@@ -125,7 +125,6 @@ func (in FrozenCoordinatorEvaluationInput) evaluate(
 // it to a clone-backed projection; live replay binds it to the real driver.
 type phaseExecutionSession interface {
 	Snapshot(ctx context.Context) (*CompleteSnapshot, error)
-	PrepareRound(plan PhasePlan) error
 	Apply(ctx context.Context, plan PhasePlan) (phaseSessionApplyResult, error)
 	Capabilities() HierarchyCapabilities
 }
@@ -145,13 +144,6 @@ func newLivePhaseSession(round *coordinatorRound, res *ConvergenceResult) *liveP
 
 func (s *livePhaseSession) Snapshot(ctx context.Context) (*CompleteSnapshot, error) {
 	return s.round.nextSnapshot(ctx)
-}
-
-func (s *livePhaseSession) PrepareRound(plan PhasePlan) error {
-	if s.round.objective.orFullDefault() == ConvergenceObjectiveFull {
-		return nil
-	}
-	return s.round.reserveAdmissionClosure(plan)
 }
 
 func (s *livePhaseSession) Apply(ctx context.Context, plan PhasePlan) (phaseSessionApplyResult, error) {
@@ -188,10 +180,6 @@ func newProjectedPhaseSession(
 
 func (s *projectedPhaseSession) Snapshot(_ context.Context) (*CompleteSnapshot, error) {
 	return CloneCompleteSnapshot(s.hierarchy.snapshot), nil
-}
-
-func (*projectedPhaseSession) PrepareRound(PhasePlan) error {
-	return nil
 }
 
 func (s *projectedPhaseSession) Apply(ctx context.Context, plan PhasePlan) (phaseSessionApplyResult, error) {
@@ -344,9 +332,6 @@ func (r *coordinatorRound) runFixedPointEngine(
 			convergenceID = drain.ConvergenceID
 			canonicalTargets = cloneCPUSetTargetMap(drain.CanonicalTargetByRel)
 		}
-		if err := session.PrepareRound(drain); err != nil {
-			return errorResult(start, nil, err), err
-		}
 		fresh, released, drainJournal, err := r.applyDrainPhases(ctx, session, drain, &phases)
 		journal = append(journal, drainJournal...)
 		changedRels := verifiedDrainProgressRels(drain.Base, fresh, drain.TargetByRel)
@@ -376,9 +361,6 @@ func (r *coordinatorRound) runFixedPointEngine(
 			return errorResult(fresh, journal, err), err
 		}
 		if len(expand.Operations) > 0 {
-			if err := session.PrepareRound(expand); err != nil {
-				return errorResult(fresh, journal, err), err
-			}
 			applyResult, err := session.Apply(ctx, expand)
 			journal = append(journal, applyResult.Journal...)
 			if err != nil {
@@ -669,14 +651,17 @@ func executionReservationCost(phases []CompiledPhase) ExecutionReservationCost {
 	return ExecutionReservationCost{Forward: forward, Rollback: rollback}
 }
 
+func cloneCPUSetTarget(in CPUSetTarget) CPUSetTarget {
+	return CPUSetTarget{CPUs: in.CPUs.Clone(), Mems: in.Mems}
+}
+
 func cloneCPUSetTargetMap(in map[string]CPUSetTarget) map[string]CPUSetTarget {
 	if in == nil {
 		return nil
 	}
 	out := make(map[string]CPUSetTarget, len(in))
 	for rel, target := range in {
-		target.CPUs = target.CPUs.Clone()
-		out[rel] = target
+		out[rel] = cloneCPUSetTarget(target)
 	}
 	return out
 }

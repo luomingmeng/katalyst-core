@@ -92,34 +92,6 @@ func TestCoordinatorHierarchyDriverSelectsVersionPolicyAndPreservesSnapshotHook(
 	}
 }
 
-func TestCoordinatorRoundAdmissionBudgetStopsBeforeSafetyClosure(t *testing.T) {
-	round := &coordinatorRound{
-		objective:       ConvergenceObjectiveParentSafe,
-		admissionBudget: &AdmissionConvergenceBudget{MaxRequiredWrites: 2},
-	}
-	closure := PhasePlan{Operations: []PlanOperation{
-		{
-			Rel:             "a",
-			ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(0)},
-			Target:          CPUSetTarget{CPUs: machine.NewCPUSet(1)},
-		},
-		{
-			Rel:             "b",
-			ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(2)},
-			Target:          CPUSetTarget{CPUs: machine.NewCPUSet(3)},
-		},
-	}}
-	res := &ConvergenceResult{Applied: 1}
-
-	err := round.checkAdmissionExecutionBudget(closure, res)
-	if err == nil {
-		t.Fatal("checkAdmissionExecutionBudget() error = nil, want fail-closed before partial safety-closure execution")
-	}
-	if res.Applied != 1 {
-		t.Fatalf("applied = %d, want budget check to have no side effects", res.Applied)
-	}
-}
-
 func TestCoordinatorRoundAdmissionSafetyCPUSetOnlyCoversPendingAllocation(t *testing.T) {
 	round := &coordinatorRound{
 		protectedPending: machine.NewCPUSet(1),
