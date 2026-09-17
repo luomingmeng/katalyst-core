@@ -27,6 +27,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	cgroupclient "github.com/kubewharf/katalyst-core/pkg/util/cgroup/client"
 	cgcommon "github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
@@ -133,6 +135,290 @@ func TestCoordinatorRoundAdmissionSafetyCPUSetOnlyCoversPendingAllocation(t *tes
 	if !got.Equals(machine.NewCPUSet(1)) {
 		t.Fatalf("admissionSafetyCPUSet() = %s, want only pending allocation CPU 1", got.String())
 	}
+}
+
+func TestParentSafeAdmissionCompilesReservesAndExecutesOneFrozenTrace(t *testing.T) {
+	fixture, base := newTask9ParentSafeFixture(t)
+	result := &ConvergenceResult{}
+	published := 0
+
+	outcome, err := fixture.round.executeParentSafeAdmission(
+		context.Background(), base, result,
+		func(*CompleteSnapshot) error {
+			published++
+			return nil
+		},
+		func(*CompleteSnapshot, map[string]struct{}) error {
+			published++
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("executeParentSafeAdmission() error = %v", err)
+	}
+	if fixture.round.frozenTrace == nil || fixture.round.executionTicket == nil {
+		t.Fatal("ParentSafe admission did not retain its frozen trace and execution ticket")
+	}
+	if len(outcome.Journal) != len(flattenTraceOperations(fixture.round.frozenTrace)) {
+		t.Fatalf("executed journal = %d operations, want frozen trace length %d",
+			len(outcome.Journal), len(flattenTraceOperations(fixture.round.frozenTrace)))
+	}
+	if published != 1 || (!result.ParentSafe && !result.Converged) || !result.FinalSnapshotCurrent {
+		t.Fatalf("published=%d result=%+v, want one successful frozen-trace publication", published, result)
+	}
+}
+
+func TestAdmissionCompileFailurePerformsZeroPhysicalWrites(t *testing.T) {
+	fixture, base := newTask9ParentSafeFixture(t)
+	fixture.round.maxRounds = 0
+
+	_, err := fixture.round.executeParentSafeAdmission(
+		context.Background(), base, &ConvergenceResult{}, nil, nil)
+	if !errors.Is(err, ErrRoundBudgetExceeded) {
+		t.Fatalf("executeParentSafeAdmission() error = %v, want %v", err, ErrRoundBudgetExceeded)
+	}
+	if fixture.driver.PhysicalWriteCount() != 0 {
+		t.Fatalf("compile failure performed %d physical writes", fixture.driver.PhysicalWriteCount())
+	}
+}
+
+func TestAdmissionReservationFailurePerformsZeroPhysicalWrites(t *testing.T) {
+	fixture, base := newTask9ParentSafeFixture(t)
+	trace, err := fixture.round.compileFixedPointTrace(context.Background(), base)
+	if err != nil {
+		t.Fatalf("compileFixedPointTrace() error = %v", err)
+	}
+	fixture.round.round = 0
+	fixture.round.admissionBudget = &AdmissionConvergenceBudget{
+		MaxRequiredWrites: trace.Cost.Forward.Total() - 1,
+	}
+
+	_, err = fixture.round.executeParentSafeAdmission(
+		context.Background(), base, &ConvergenceResult{}, nil, nil)
+	if !errors.Is(err, ErrAdmissionReservationExceeded) {
+		t.Fatalf("executeParentSafeAdmission() error = %v, want %v", err, ErrAdmissionReservationExceeded)
+	}
+	if fixture.driver.PhysicalWriteCount() != 0 {
+		t.Fatalf("reservation failure performed %d physical writes", fixture.driver.PhysicalWriteCount())
+	}
+}
+
+func TestAdmissionPreflightDriftPerformsZeroPhysicalWrites(t *testing.T) {
+	fixture, base := newTask9ParentSafeFixture(t)
+	drifted := false
+	fixture.driver.beforeCall = func(op HierarchyOperation, rel string) error {
+		if op == HierarchyOperationStat && rel == "kubepods" && !drifted {
+			drifted = true
+			fixture.driver.bumpIdentity("kubepods")
+		}
+		return nil
+	}
+
+	_, err := fixture.round.executeParentSafeAdmission(
+		context.Background(), base, &ConvergenceResult{}, nil, nil)
+	if err == nil {
+		t.Fatal("executeParentSafeAdmission() error = nil, want preflight drift")
+	}
+	if fixture.driver.PhysicalWriteCount() != 0 {
+		t.Fatalf("preflight drift performed %d physical writes", fixture.driver.PhysicalWriteCount())
+	}
+}
+
+func TestAdmissionPostWriteDriftRollsBackBeforeReturning(t *testing.T) {
+	fixture, base := newTask9ParentSafeFixture(t)
+	trace, err := fixture.round.compileFixedPointTrace(context.Background(), base)
+	if err != nil {
+		t.Fatalf("compileFixedPointTrace() error = %v", err)
+	}
+	fixture.round.round = 0
+	initial := fixture.driver.snapshot()
+	injected := &injectedTraceDriver{
+		HierarchyDriver: fixture.driver,
+		injection:       traceFailureInjection{failFinalProof: true},
+		expectedForward: len(expectedPhysicalWrites(trace)),
+	}
+	fixture.round.driver = injected
+
+	_, err = fixture.round.executeParentSafeAdmission(
+		context.Background(), base, &ConvergenceResult{}, nil, nil)
+	if err == nil {
+		t.Fatal("executeParentSafeAdmission() error = nil, want post-write drift")
+	}
+	if !injected.injected {
+		t.Fatal("post-write failure injection was not reached")
+	}
+	if got := fixture.driver.snapshot(); !reflect.DeepEqual(got, initial) {
+		t.Fatalf("post-write drift did not roll back complete prefix: got=%#v want=%#v", got, initial)
+	}
+}
+
+func TestAdmissionPublishesOnlyAfterFreshFinalParentSafeProof(t *testing.T) {
+	fixture, base := newTask9ParentSafeFixture(t)
+	result := &ConvergenceResult{}
+	published := false
+	publish := func(snapshot *CompleteSnapshot) error {
+		if snapshot == nil || fixture.round.frozenTrace == nil ||
+			snapshot.ID != fixture.round.frozenTrace.FinalSnapshot.ID {
+			return errors.New("publication did not receive the fresh final proof")
+		}
+		if result.FinalSnapshotCurrent || result.FinalSnapshot != nil ||
+			result.ParentSafe || result.Converged {
+			return errors.New("result committed before publication succeeded")
+		}
+		published = true
+		return nil
+	}
+
+	_, err := fixture.round.executeParentSafeAdmission(
+		context.Background(), base, result, publish,
+		func(snapshot *CompleteSnapshot, _ map[string]struct{}) error {
+			return publish(snapshot)
+		},
+	)
+	if err != nil {
+		t.Fatalf("executeParentSafeAdmission() error = %v", err)
+	}
+	if !published {
+		t.Fatal("fresh final ParentSafe proof was not published")
+	}
+	if !result.FinalSnapshotCurrent || result.FinalSnapshot == nil ||
+		(!result.ParentSafe && !result.Converged) {
+		t.Fatalf("successful publication did not commit result: %+v", result)
+	}
+}
+
+func TestAdmissionFinalizeFailureRollsBackFrozenTrace(t *testing.T) {
+	publishParentSafeErr := errors.New("injected PublishParentSafe failure")
+	publishFinalErr := errors.New("injected PublishFinal failure")
+	tests := []struct {
+		name              string
+		deferred          bool
+		wantErr           error
+		publishFinal      func(context.CancelFunc) func(*CompleteSnapshot) error
+		publishParentSafe func(context.CancelFunc) func(*CompleteSnapshot, map[string]struct{}) error
+	}{
+		{
+			name:    "proof后cancel",
+			wantErr: context.Canceled,
+			publishFinal: func(cancel context.CancelFunc) func(*CompleteSnapshot) error {
+				return func(*CompleteSnapshot) error {
+					cancel()
+					return context.Canceled
+				}
+			},
+		},
+		{
+			name:     "PublishParentSafe失败",
+			deferred: true,
+			wantErr:  publishParentSafeErr,
+			publishParentSafe: func(context.CancelFunc) func(*CompleteSnapshot, map[string]struct{}) error {
+				return func(*CompleteSnapshot, map[string]struct{}) error {
+					return publishParentSafeErr
+				}
+			},
+		},
+		{
+			name:    "PublishFinal失败",
+			wantErr: publishFinalErr,
+			publishFinal: func(context.CancelFunc) func(*CompleteSnapshot) error {
+				return func(*CompleteSnapshot) error {
+					return publishFinalErr
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fixture, base := newTask9FinalizeFixture(t, tt.deferred)
+			initial := fixture.driver.snapshot()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var publishFinal func(*CompleteSnapshot) error
+			if tt.publishFinal != nil {
+				publishFinal = tt.publishFinal(cancel)
+			}
+			var publishParentSafe func(*CompleteSnapshot, map[string]struct{}) error
+			if tt.publishParentSafe != nil {
+				publishParentSafe = tt.publishParentSafe(cancel)
+			}
+			result := &ConvergenceResult{}
+
+			outcome, err := fixture.round.executeParentSafeAdmission(
+				ctx, base, result, publishFinal, publishParentSafe)
+
+			require.ErrorIs(t, err, tt.wantErr)
+			require.Equal(t, initial, fixture.driver.snapshot())
+			require.False(t, result.ParentSafe)
+			require.False(t, result.Converged)
+			require.False(t, result.FinalSnapshotCurrent)
+			require.Nil(t, result.FinalSnapshot)
+			require.Empty(t, result.Journal)
+			require.Zero(t, result.Applied)
+			require.Equal(t, ConvergenceStateNonConverged, result.State)
+			require.Equal(t, RoundStatusBlocked, outcome.Status)
+			require.Positive(t, fixture.round.executionTicket.consumedRollback.Total())
+		})
+	}
+}
+
+func TestDeferredCleanupRemainsOutsideParentSafeTrace(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	fixture.configureProtectedDeferredEvaluationInputs()
+	base := fixture.snapshot()
+	fixture.round.admissionBudget = &AdmissionConvergenceBudget{MaxRequiredWrites: 100}
+	var publishedDeferred map[string]struct{}
+
+	_, err := fixture.round.executeParentSafeAdmission(
+		context.Background(), base, &ConvergenceResult{}, nil,
+		func(_ *CompleteSnapshot, deferred map[string]struct{}) error {
+			publishedDeferred = cloneRelSet(deferred)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("executeParentSafeAdmission() error = %v", err)
+	}
+	for _, operation := range flattenTraceOperations(fixture.round.frozenTrace) {
+		if _, deferred := fixture.round.frozenTrace.EvaluationInput.DeferredCleanupRels[operation.Rel]; deferred {
+			t.Fatalf("deferred cleanup rel %q leaked into frozen ParentSafe trace", operation.Rel)
+		}
+	}
+	if !reflect.DeepEqual(publishedDeferred, fixture.round.frozenTrace.EvaluationInput.DeferredCleanupRels) {
+		t.Fatalf("published deferred cleanup rels = %#v, want %#v",
+			publishedDeferred, fixture.round.frozenTrace.EvaluationInput.DeferredCleanupRels)
+	}
+}
+
+func newTask9ParentSafeFixture(t *testing.T) (*admissionTraceFixture, *CompleteSnapshot) {
+	return newTask9FinalizeFixture(t, true)
+}
+
+func newTask9FinalizeFixture(
+	t *testing.T,
+	deferred bool,
+) (*admissionTraceFixture, *CompleteSnapshot) {
+	t.Helper()
+	fixture := newAdmissionTraceFixture(t)
+	if deferred {
+		fixture.configureStagedSMTTransferWithDynamicDescendant()
+		fixture.configureProtectedDeferredEvaluationInputs()
+		fixture.driver.nodes["reclaimed/leaf"].configuredCPUs = machine.NewCPUSet()
+		fixture.driver.nodes["reclaimed/leaf"].cpus = machine.NewCPUSet(4)
+	} else {
+		fixture.driver.capabilities = cgroupV2Policy.capabilities(true)
+		fixture.round.allowEmptyTarget = true
+		fixture.cpuDetails[4] = machine.CPUTopoInfo{NUMANodeID: 0}
+		fixture.addPrimary("kubepods", "1-3", "0")
+		fixture.addReclaim("reclaimed", "0,4", "0")
+		fixture.requireCPUSet("kubepods", "0-3")
+		fixture.dynamicByRel["kubepods"] = machine.MustParse("0-3")
+		fixture.targetByRel["reclaimed"] = machine.NewCPUSet(4)
+	}
+	base := fixture.snapshot()
+	fixture.round.admissionBudget = &AdmissionConvergenceBudget{MaxRequiredWrites: 100}
+	return fixture, base
 }
 
 func TestTopologyCoordinatorAdmissionDeadlineCoversFreshProofAndFailsClosed(t *testing.T) {

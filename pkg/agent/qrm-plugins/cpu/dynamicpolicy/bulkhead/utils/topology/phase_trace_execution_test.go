@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -83,6 +84,43 @@ func TestTracePreflightValidatesLaterOperationsAgainstOverlay(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, driver.PhysicalWriteCount())
 	require.Equal(t, initialState, driver.snapshot())
+}
+
+func TestTracePreflightProducesEveryProjectedPhysicalPredecessorIncludingV2EmptyConfigured(t *testing.T) {
+	fixture, base := newTask9ParentSafeFixture(t)
+	candidate, err := fixture.round.compileFixedPointTrace(context.Background(), base)
+	require.NoError(t, err)
+	candidateOperations := flattenTraceOperations(candidate)
+	require.NotEmpty(t, candidateOperations)
+	inheritedRel := candidateOperations[0].Rel
+	fixture.driver.nodes[inheritedRel].configuredCPUs = machine.NewCPUSet()
+	fixture.driver.nodes[inheritedRel].configuredMems = ""
+	base = fixture.snapshot()
+	trace, err := fixture.round.compileFixedPointTrace(context.Background(), base)
+	require.NoError(t, err)
+	fixture.round.round = 0
+
+	evidence, err := newTracePreflightWriter(fixture.driver).
+		preflightFrozenTraceOperations(context.Background(), trace)
+
+	require.NoError(t, err)
+	require.Len(t, evidence, len(flattenTraceOperations(trace)))
+	foundInherited := false
+	for index, operation := range flattenTraceOperations(trace) {
+		require.Equal(t, operation.ExpectedIdentity, evidence[index].before.Identity)
+		require.Equal(t, operation.ExpectedIdentity, evidence[index].after.Identity)
+		if operation.Rel != inheritedRel {
+			continue
+		}
+		foundInherited = true
+		require.True(t, evidence[index].before.ConfiguredCPUs.IsEmpty())
+		require.Empty(t, evidence[index].before.ConfiguredMems)
+		require.False(t, evidence[index].before.EffectiveCPUs.IsEmpty())
+		require.NotEmpty(t, evidence[index].before.EffectiveMems)
+	}
+	require.True(t, foundInherited,
+		"fixture must retain the v2 inherited relation in the global trace")
+	require.Zero(t, fixture.driver.PhysicalWriteCount())
 }
 
 func TestTracePreflightReplaysAncestorOnlyBoundaryWithoutReadingExtraDescendants(t *testing.T) {
@@ -160,6 +198,215 @@ func TestTracePreflightRejectsInvalidV2InheritanceWithoutWrites(t *testing.T) {
 	require.ErrorContains(t, err, "validate frozen phase trace operation")
 	require.Zero(t, driver.PhysicalWriteCount())
 	require.Equal(t, initialState, driver.snapshot())
+}
+
+func TestFrozenTraceDriftAfterPreflightBeforeFirstWritePerformsNoUnauthorizedWrite(t *testing.T) {
+	trace, live := compiledTraceWithCPUAndMemoryWrites(t)
+	live.invariants = nil
+	initial := live.snapshot()
+	driver := newPreWriteDriftDriver(live, trace.InitialSnapshot, 0, "")
+	round := frozenExecutionRound(t, trace, driver)
+	ticket := reserveTraceWithBudget(t, round.budget, trace)
+	res := &ConvergenceResult{}
+
+	_, err := round.executeFrozenTrace(context.Background(), trace, ticket, res)
+
+	var stale *PlanStaleError
+	require.ErrorAs(t, err, &stale)
+	require.Zero(t, driver.forwardWrites,
+		"state drift after preflight must be rejected before the first physical write")
+	require.Zero(t, ticket.consumedForward.Total())
+	require.NotEmpty(t, driver.driftedRel)
+	driftedState := live.snapshot()
+	delete(initial, driver.driftedRel)
+	delete(driftedState, driver.driftedRel)
+	require.Equal(t, initial, driftedState,
+		"executor must not change any relation after rejecting external drift")
+	require.Empty(t, res.Journal)
+	require.Zero(t, res.Applied)
+}
+
+func TestFrozenTraceDriftBetweenOperationsRollsBackAppliedPrefix(t *testing.T) {
+	trace, live := compiledTraceWithCPUAndMemoryWrites(t)
+	live.invariants = nil
+	operations := flattenTraceOperations(trace)
+	require.GreaterOrEqual(t, len(operations), 2)
+	nextRel := ""
+	for _, operation := range operations[1:] {
+		if operation.Rel != operations[0].Rel {
+			nextRel = operation.Rel
+			break
+		}
+	}
+	require.NotEmpty(t, nextRel, "fixture needs a later operation on another relation")
+	initial := live.snapshot()
+	driver := newPreWriteDriftDriver(live, trace.InitialSnapshot, 1, nextRel)
+	round := frozenExecutionRound(t, trace, driver)
+	ticket := reserveTraceWithBudget(t, round.budget, trace)
+	res := &ConvergenceResult{}
+
+	_, err := round.executeFrozenTrace(context.Background(), trace, ticket, res)
+
+	var stale *PlanStaleError
+	require.ErrorAs(t, err, &stale)
+	require.Positive(t, driver.forwardWrites,
+		"the first operation must be applied before the injected inter-operation drift")
+	driftedState := live.snapshot()
+	delete(initial, driver.driftedRel)
+	delete(driftedState, driver.driftedRel)
+	require.Equal(t, initial, driftedState,
+		"the completed physical-write prefix must be rolled back; only external drift may remain")
+	require.Empty(t, res.Journal)
+	require.Zero(t, res.Applied)
+	require.Positive(t, ticket.consumedRollback.Total())
+}
+
+func TestFrozenTraceValidatesCompletePredecessorBeforeOperationFirstWrite(t *testing.T) {
+	type driftCase struct {
+		name     string
+		selectOp func(PlanOperation, *CompiledPhaseTrace) bool
+		mutate   func(*fakeHierarchyDriver, PlanOperation)
+	}
+	tests := []driftCase{
+		{
+			name:     "current identity",
+			selectOp: func(PlanOperation, *CompiledPhaseTrace) bool { return true },
+			mutate: func(live *fakeHierarchyDriver, operation PlanOperation) {
+				live.bumpIdentity(operation.Rel)
+			},
+		},
+		{
+			name: "parent identity",
+			selectOp: func(operation PlanOperation, _ *CompiledPhaseTrace) bool {
+				return operation.ParentRel != ""
+			},
+			mutate: func(live *fakeHierarchyDriver, operation PlanOperation) {
+				live.bumpIdentity(operation.ParentRel)
+			},
+		},
+		{
+			name: "children fingerprint",
+			selectOp: func(operation PlanOperation, trace *CompiledPhaseTrace) bool {
+				return len(trace.InitialSnapshot.Children[operation.Rel]) > 0
+			},
+			mutate: func(live *fakeHierarchyDriver, operation PlanOperation) {
+				childRel := filepath.Join(operation.Rel, "external-child")
+				live.add(childRel, CgroupIdentity{Device: 99, Inode: 99}, "0", "0")
+			},
+		},
+		{
+			name: "child identity",
+			selectOp: func(operation PlanOperation, trace *CompiledPhaseTrace) bool {
+				return len(trace.InitialSnapshot.Children[operation.Rel]) > 0
+			},
+			mutate: func(live *fakeHierarchyDriver, operation PlanOperation) {
+				child := traceChildRel(t, operation.Rel, live)
+				live.bumpIdentity(child)
+			},
+		},
+		{
+			name: "child CPU union",
+			selectOp: func(operation PlanOperation, trace *CompiledPhaseTrace) bool {
+				return len(trace.InitialSnapshot.Children[operation.Rel]) > 0
+			},
+			mutate: func(live *fakeHierarchyDriver, operation PlanOperation) {
+				child := traceChildRel(t, operation.Rel, live)
+				live.nodes[child].configuredCPUs =
+					live.nodes[child].configuredCPUs.Union(machine.NewCPUSet(99))
+				live.nodes[child].cpus =
+					live.nodes[child].cpus.Union(machine.NewCPUSet(99))
+			},
+		},
+		{
+			name: "child mems union",
+			selectOp: func(operation PlanOperation, trace *CompiledPhaseTrace) bool {
+				return len(trace.InitialSnapshot.Children[operation.Rel]) > 0
+			},
+			mutate: func(live *fakeHierarchyDriver, operation PlanOperation) {
+				child := traceChildRel(t, operation.Rel, live)
+				live.nodes[child].configuredMems = "0-99"
+				live.nodes[child].mems = "0-99"
+			},
+		},
+		{
+			name: "CPU resource before mems write",
+			selectOp: func(operation PlanOperation, _ *CompiledPhaseTrace) bool {
+				return operation.WriteMems &&
+					!operation.ExpectedCurrent.CPUs.Equals(operation.Target.CPUs)
+			},
+			mutate: func(live *fakeHierarchyDriver, operation PlanOperation) {
+				live.nodes[operation.Rel].configuredCPUs =
+					live.nodes[operation.Rel].configuredCPUs.Union(machine.NewCPUSet(99))
+				live.nodes[operation.Rel].cpus =
+					live.nodes[operation.Rel].cpus.Union(machine.NewCPUSet(99))
+			},
+		},
+		{
+			name: "mems resource before CPU write",
+			selectOp: func(operation PlanOperation, _ *CompiledPhaseTrace) bool {
+				return !operation.WriteMems &&
+					!operation.ExpectedCurrent.CPUs.Equals(operation.Target.CPUs)
+			},
+			mutate: func(live *fakeHierarchyDriver, operation PlanOperation) {
+				live.nodes[operation.Rel].configuredMems = "0-99"
+				live.nodes[operation.Rel].mems = "0-99"
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			trace, live := compiledTraceWithCPUAndMemoryWrites(t)
+			live.invariants = nil
+			operation := selectTraceOperation(t, trace, tt.selectOp)
+			driver := newFrozenPredecessorDriftDriver(live, trace.InitialSnapshot, operation, tt.mutate)
+			round := frozenExecutionRound(t, trace, driver)
+			ticket := reserveTraceWithBudget(t, round.budget, trace)
+			res := &ConvergenceResult{}
+
+			_, err := round.executeFrozenTrace(context.Background(), trace, ticket, res)
+
+			var stale *PlanStaleError
+			require.ErrorAs(t, err, &stale)
+			require.True(t, driver.drifted)
+			require.Zero(t, driver.writesToDriftedOperation,
+				"the drifted operation must perform no physical write")
+		})
+	}
+}
+
+func TestFrozenTraceV2EmptyConfiguredTargetIsNoOpWithoutForwardTicket(t *testing.T) {
+	writer, live, operation, ticket := v2InheritedRollbackFixture(
+		t, HierarchyOperationWriteCPUs)
+	operation.ExpectedCurrent.CPUs = machine.MustParse("0-1")
+	operation.Target.CPUs = machine.NewCPUSet()
+	ticket.traceID = "v2-empty"
+	ticket.operations = []frozenOperationAuthorization{{operation: operation}}
+	ticket.reserved.Forward.CPUSetWrites = 1
+	current, err := live.ReadEntry(context.Background(), operation.Rel)
+	require.NoError(t, err)
+	preflight := frozenOperationPreflight{
+		before: frozenOperationState{
+			Identity:       current.Identity,
+			ConfiguredCPUs: machine.MustParse("0-1"),
+			EffectiveCPUs:  machine.MustParse("0-1"),
+			ConfiguredMems: current.ConfiguredMems,
+			EffectiveMems:  current.Mems,
+		},
+		after: freezeOperationState(current),
+	}
+	stack := &traceMutationStack{}
+
+	applied, err := writer.applyFrozenOperation(
+		context.Background(), PhaseDrain, 0, operation, preflight, stack, ticket, "v2-empty")
+
+	require.NoError(t, err)
+	require.Equal(t, operation.PlanID, applied.PlanID)
+	require.Zero(t, live.PhysicalWriteCount())
+	require.Zero(t, ticket.consumedForward.Total())
+	require.Empty(t, stack.writes)
+	require.True(t, live.nodes[operation.Rel].configuredCPUs.IsEmpty())
+	require.Equal(t, "0-3", live.nodes[operation.Rel].cpus.String())
 }
 
 func TestFrozenTraceFailureRollsBackCompleteAppliedPrefix(t *testing.T) {
@@ -259,7 +506,7 @@ func TestFrozenTraceFailureRollsBackCompleteAppliedPrefix(t *testing.T) {
 			require.False(t, res.ParentSafe)
 			require.False(t, res.Converged)
 			require.False(t, res.FinalSnapshotCurrent)
-			if injection.failWriteAt != 1 {
+			if injection.failWriteAt != 1 && injection.falseSuccessWriteAt == 0 {
 				require.Positive(t, ticket.consumedRollback.Total())
 			}
 		})
@@ -390,6 +637,38 @@ func TestFrozenTraceRollbackAfterForwardCancellationRestoresInitialState(t *test
 	require.NotContains(t, err.Error(), "rollback failed")
 }
 
+func TestFrozenTraceRollbackAfterForwardDeadlineRestoresInitialState(t *testing.T) {
+	trace, live := compiledTraceWithCPUAndMemoryWrites(t)
+	live.invariants = nil
+	initial := live.snapshot()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	deadline, ok := ctx.Deadline()
+	require.True(t, ok)
+	driver := &injectedTraceDriver{
+		HierarchyDriver: live,
+		injection: traceFailureInjection{
+			blockAfterWriteUntilDeadline: 1,
+		},
+		expectedForward: len(expectedPhysicalWrites(trace)),
+	}
+	round := frozenExecutionRound(t, trace, driver)
+	round.budget = NewBudgetTracker(ConvergenceBudget{Deadline: deadline})
+	ticket := reserveTraceWithBudget(t, round.budget, trace)
+	res := &ConvergenceResult{}
+
+	_, err := round.executeFrozenTrace(ctx, trace, ticket, res)
+
+	require.ErrorIs(t, err, context.DeadlineExceeded,
+		"the original forward deadline must remain the primary unwrap chain")
+	require.Equal(t, initial, live.snapshot(),
+		"rollback must use an independent deadline after the forward deadline expires")
+	require.Empty(t, res.Journal)
+	require.Zero(t, res.Applied)
+	require.Positive(t, ticket.consumedRollback.Total())
+	require.NotContains(t, err.Error(), "rollback failed")
+}
+
 func TestFrozenTraceRecoveryDeadlineRetainsPhysicalImpactEvidence(t *testing.T) {
 	trace, live := compiledTraceWithCPUAndMemoryWrites(t)
 	live.invariants = nil
@@ -415,7 +694,7 @@ func TestFrozenTraceRecoveryDeadlineRetainsPhysicalImpactEvidence(t *testing.T) 
 	require.ErrorIs(t, err, context.DeadlineExceeded,
 		"the bounded recovery deadline must be attached")
 	require.Equal(t,
-		"execution failed: context canceled; rollback failed: [stat identity before rollback write_cpus for \"reclaimed/leaf\": context deadline exceeded, read \"reclaimed/leaf\" after rollback: context deadline exceeded]",
+		"execution failed: context canceled; rollback failed: [read entry before rollback write_cpus for \"reclaimed/leaf\": context deadline exceeded, read \"reclaimed/leaf\" after rollback: context deadline exceeded]",
 		err.Error(),
 	)
 	require.NotEmpty(t, res.Journal)
@@ -750,6 +1029,95 @@ func TestRollbackIdentityDriftDoesNotWriteReplacementGeneration(t *testing.T) {
 	require.Equal(t, machine.MustParse("0-1"), live.nodes["a"].cpus)
 }
 
+func TestRollbackPinnedReadSkipsAlreadyRestoredStateWithoutWriteBudget(t *testing.T) {
+	for _, resource := range []HierarchyOperation{
+		HierarchyOperationWriteCPUs,
+		HierarchyOperationWriteMems,
+	} {
+		resource := resource
+		t.Run(string(resource), func(t *testing.T) {
+			live := newFakeHierarchyDriver()
+			live.allowUnwitnessedExpansion = true
+			identity := CgroupIdentity{Device: 1, Inode: 1}
+			live.add("a", identity, "0", "0")
+			write := AppliedPhysicalWrite{
+				PlanID: "plan", Rel: "a", Identity: identity,
+				Direction: WriteGrow, Resource: resource,
+				Before: "0", BeforeEffective: "0",
+				After: "0-1", AfterEffective: "0-1",
+				Impact: PhysicalImpactConfirmed,
+			}
+			stack := &traceMutationStack{writes: []AppliedPhysicalWrite{write}}
+			cpuWrites, memWrites := 0, 0
+			if resource == HierarchyOperationWriteCPUs {
+				cpuWrites = 1
+			} else {
+				memWrites = 1
+			}
+			ticket := rollbackOnlyTicket(cpuWrites, memWrites)
+			writer := newSafeCPUSetWriter(live, NewBudgetTracker(ConvergenceBudget{}), nil)
+
+			err := writer.rollbackTracePrefix(context.Background(), stack, ticket)
+
+			require.NoError(t, err)
+			require.Zero(t, live.PhysicalWriteCount())
+			require.Zero(t, ticket.consumedRollback.Total())
+		})
+	}
+}
+
+func TestRollbackPinnedReadRejectsSameGenerationThirdStateAndPreservesImpact(t *testing.T) {
+	for _, resource := range []HierarchyOperation{
+		HierarchyOperationWriteCPUs,
+		HierarchyOperationWriteMems,
+	} {
+		resource := resource
+		t.Run(string(resource), func(t *testing.T) {
+			live := newFakeHierarchyDriver()
+			live.allowUnwitnessedExpansion = true
+			identity := CgroupIdentity{Device: 1, Inode: 1}
+			live.add("a", identity, "0", "0")
+			write := AppliedPhysicalWrite{
+				PlanID: "plan", Rel: "a", Identity: identity,
+				Direction: WriteGrow, Resource: resource,
+				Before: "0", BeforeEffective: "0",
+				After: "0-1", AfterEffective: "0-1",
+				Impact:                PhysicalImpactConfirmed,
+				LogicalOperationIndex: 2, Phase: PhaseExpand,
+			}
+			cpuWrites, memWrites := 0, 0
+			switch resource {
+			case HierarchyOperationWriteCPUs:
+				cpuWrites = 1
+				live.nodes["a"].configuredCPUs = machine.MustParse(write.After)
+				live.nodes["a"].cpus = machine.MustParse("0-2")
+			case HierarchyOperationWriteMems:
+				memWrites = 1
+				live.nodes["a"].configuredMems = write.After
+				live.nodes["a"].mems = "0-2"
+			}
+			stack := &traceMutationStack{writes: []AppliedPhysicalWrite{write}}
+			ticket := rollbackOnlyTicket(cpuWrites, memWrites)
+			res := &ConvergenceResult{}
+			writer := newSafeCPUSetWriter(live, NewBudgetTracker(ConvergenceBudget{}), res)
+
+			err := writer.failFrozenTrace(
+				context.Background(), errors.New("forward failed"), stack, ticket, res, 0, 0)
+
+			require.ErrorContains(t, err, "neither rollback after nor before")
+			require.Zero(t, live.PhysicalWriteCount())
+			require.Zero(t, ticket.consumedRollback.Total())
+			require.Len(t, res.Journal, 1)
+			require.Equal(t, PhysicalImpactUncertain, res.Journal[0].PhysicalImpact)
+			if resource == HierarchyOperationWriteCPUs {
+				require.Equal(t, "0-2", res.Journal[0].Observed.CPUs.String())
+			} else {
+				require.Equal(t, "0-2", res.Journal[0].Observed.Mems)
+			}
+		})
+	}
+}
+
 func TestRepeatedRelationRollsBackToInvocationInitialValue(t *testing.T) {
 	live := newFakeHierarchyDriver()
 	live.allowUnwitnessedExpansion = true
@@ -774,10 +1142,16 @@ func TestFrozenTraceRollbackRestoresV2EmptyConfiguredState(t *testing.T) {
 		resource := resource
 		t.Run(string(resource), func(t *testing.T) {
 			writer, live, operation, ticket := v2InheritedRollbackFixture(t, resource)
+			ticket.operations = make([]frozenOperationAuthorization, 12)
+			for i := range ticket.operations {
+				ticket.operations[i].operation = operation
+			}
+			ticket.nextOperation = 11
 			stack := &traceMutationStack{}
 
 			_, err := writer.applyFrozenOperation(
-				context.Background(), PhaseDrain, 11, operation, stack, ticket)
+				context.Background(), PhaseDrain, 11, operation,
+				preflightForDirectOperation(t, live, operation), stack, ticket, "direct")
 			require.NoError(t, err)
 			require.Len(t, stack.writes, 1)
 			require.Equal(t, 11, stack.writes[0].LogicalOperationIndex)
@@ -811,7 +1185,8 @@ func TestFrozenTraceUncertainWriteRollbackRestoresV2EmptyConfiguredState(t *test
 			stack := &traceMutationStack{}
 
 			_, err := writer.applyFrozenOperation(
-				context.Background(), PhaseDrain, 0, operation, stack, ticket)
+				context.Background(), PhaseDrain, 0, operation,
+				preflightForDirectOperation(t, live, operation), stack, ticket, "direct")
 			require.ErrorContains(t, err, "injected uncertain")
 			require.Len(t, stack.writes, 1)
 			require.Equal(t, PhysicalImpactUncertain, stack.writes[0].Impact)
@@ -859,6 +1234,8 @@ func v2InheritedRollbackFixture(
 		t.Fatalf("unsupported resource %q", resource)
 	}
 	ticket := &ExecutionReservationTicket{
+		traceID:    "direct",
+		operations: []frozenOperationAuthorization{{operation: operation}},
 		reserved: ExecutionReservationCost{
 			Forward:  forward,
 			Rollback: forward,
@@ -868,6 +1245,34 @@ func v2InheritedRollbackFixture(
 	return newSafeCPUSetWriter(
 		live, NewBudgetTracker(ConvergenceBudget{}), nil,
 	), live, operation, ticket
+}
+
+func preflightForDirectOperation(
+	t *testing.T,
+	live *fakeHierarchyDriver,
+	operation PlanOperation,
+) frozenOperationPreflight {
+	t.Helper()
+	current, err := live.ReadEntry(context.Background(), operation.Rel)
+	require.NoError(t, err)
+	after := current
+	if !operation.ExpectedCurrent.CPUs.Equals(operation.Target.CPUs) {
+		after.ConfiguredCPUs = operation.Target.CPUs.Clone()
+		after.CPUs = operation.Target.CPUs.Clone()
+	}
+	if operation.WriteMems {
+		after.ConfiguredMems = operation.Target.Mems
+		after.Mems = operation.Target.Mems
+	}
+	return frozenOperationPreflight{
+		before: freezeOperationState(current),
+		after:  freezeOperationState(after),
+		children: stableLiveChildren{
+			cpus:  machine.NewCPUSet(),
+			mems:  machine.NewCPUSet(),
+			byRel: make(map[string]EntryState),
+		},
+	}
 }
 
 func assertV2InheritedState(t *testing.T, live *fakeHierarchyDriver, rel string) {
@@ -1027,6 +1432,7 @@ type traceFailureInjection struct {
 	driftIdentityOnFailedReadback bool
 	failFinalProof                bool
 	cancelAfterWrite              int
+	blockAfterWriteUntilDeadline  int
 	blockRollbackIdentity         bool
 }
 
@@ -1039,6 +1445,184 @@ type injectedTraceDriver struct {
 	pendingReadback bool
 	injected        bool
 	cancel          context.CancelFunc
+}
+
+type preWriteDriftDriver struct {
+	HierarchyDriver
+	live                 *fakeHierarchyDriver
+	initialRels          map[string]struct{}
+	preflightSeen        map[string]struct{}
+	preflightComplete    bool
+	driftAfterWriteCount int
+	driftRel             string
+	driftedRel           string
+	drifted              bool
+	forwardWrites        int
+}
+
+type frozenPredecessorDriftDriver struct {
+	HierarchyDriver
+	live                     *fakeHierarchyDriver
+	initialRels              map[string]struct{}
+	preflightSeen            map[string]struct{}
+	preflightComplete        bool
+	operation                PlanOperation
+	mutate                   func(*fakeHierarchyDriver, PlanOperation)
+	drifted                  bool
+	writesToDriftedOperation int
+}
+
+func selectTraceOperation(
+	t *testing.T,
+	trace *CompiledPhaseTrace,
+	matches func(PlanOperation, *CompiledPhaseTrace) bool,
+) PlanOperation {
+	t.Helper()
+	for _, operation := range flattenTraceOperations(trace) {
+		if matches(operation, trace) {
+			return operation
+		}
+	}
+	t.Fatal("compiled trace has no operation matching predecessor drift case")
+	return PlanOperation{}
+}
+
+func traceChildRel(t *testing.T, parentRel string, live *fakeHierarchyDriver) string {
+	t.Helper()
+	children := make([]string, 0)
+	for rel := range live.nodes {
+		if filepath.Dir(rel) == parentRel {
+			children = append(children, rel)
+		}
+	}
+	require.NotEmpty(t, children, "predecessor drift case requires a child")
+	sort.Strings(children)
+	return children[0]
+}
+
+func newFrozenPredecessorDriftDriver(
+	live *fakeHierarchyDriver,
+	initial *CompleteSnapshot,
+	operation PlanOperation,
+	mutate func(*fakeHierarchyDriver, PlanOperation),
+) *frozenPredecessorDriftDriver {
+	rels := make(map[string]struct{}, len(initial.Entries))
+	for rel := range initial.Entries {
+		rels[rel] = struct{}{}
+	}
+	return &frozenPredecessorDriftDriver{
+		HierarchyDriver: live,
+		live:            live,
+		initialRels:     rels,
+		preflightSeen:   make(map[string]struct{}, len(rels)),
+		operation:       operation,
+		mutate:          mutate,
+	}
+}
+
+func (d *frozenPredecessorDriftDriver) ReadEntry(
+	ctx context.Context,
+	rel string,
+) (EntryState, error) {
+	if !d.preflightComplete {
+		if _, expected := d.initialRels[rel]; expected {
+			d.preflightSeen[rel] = struct{}{}
+			if len(d.preflightSeen) == len(d.initialRels) {
+				d.preflightComplete = true
+			}
+		}
+		return d.HierarchyDriver.ReadEntry(ctx, rel)
+	}
+	if !d.drifted && rel == d.operation.Rel {
+		d.mutate(d.live, d.operation)
+		d.drifted = true
+	}
+	return d.HierarchyDriver.ReadEntry(ctx, rel)
+}
+
+func (d *frozenPredecessorDriftDriver) WriteCPUs(
+	ctx context.Context,
+	rel string,
+	identity CgroupIdentity,
+	cpus machine.CPUSet,
+) error {
+	if d.drifted && rel == d.operation.Rel {
+		d.writesToDriftedOperation++
+	}
+	return d.HierarchyDriver.WriteCPUs(ctx, rel, identity, cpus)
+}
+
+func (d *frozenPredecessorDriftDriver) WriteMems(
+	ctx context.Context,
+	rel string,
+	identity CgroupIdentity,
+	mems string,
+) error {
+	if d.drifted && rel == d.operation.Rel {
+		d.writesToDriftedOperation++
+	}
+	return d.HierarchyDriver.WriteMems(ctx, rel, identity, mems)
+}
+
+func newPreWriteDriftDriver(
+	live *fakeHierarchyDriver,
+	initial *CompleteSnapshot,
+	driftAfterWriteCount int,
+	driftRel string,
+) *preWriteDriftDriver {
+	rels := make(map[string]struct{}, len(initial.Entries))
+	for rel := range initial.Entries {
+		rels[rel] = struct{}{}
+	}
+	return &preWriteDriftDriver{
+		HierarchyDriver:      live,
+		live:                 live,
+		initialRels:          rels,
+		preflightSeen:        make(map[string]struct{}, len(rels)),
+		driftAfterWriteCount: driftAfterWriteCount,
+		driftRel:             driftRel,
+	}
+}
+
+func (d *preWriteDriftDriver) ReadEntry(ctx context.Context, rel string) (EntryState, error) {
+	if !d.preflightComplete {
+		if _, expected := d.initialRels[rel]; expected {
+			d.preflightSeen[rel] = struct{}{}
+			if len(d.preflightSeen) == len(d.initialRels) {
+				d.preflightComplete = true
+			}
+		}
+		return d.HierarchyDriver.ReadEntry(ctx, rel)
+	}
+	if !d.drifted && d.forwardWrites >= d.driftAfterWriteCount &&
+		(d.driftRel == "" || d.driftRel == rel) {
+		node := d.live.nodes[rel]
+		node.configuredCPUs = node.configuredCPUs.Union(machine.NewCPUSet(99))
+		node.cpus = node.cpus.Union(machine.NewCPUSet(99))
+		d.driftedRel = rel
+		d.drifted = true
+	}
+	return d.HierarchyDriver.ReadEntry(ctx, rel)
+}
+
+func (d *preWriteDriftDriver) WriteCPUs(
+	ctx context.Context,
+	rel string,
+	identity CgroupIdentity,
+	cpus machine.CPUSet,
+) error {
+	d.forwardWrites++
+	return d.HierarchyDriver.WriteCPUs(ctx, rel, identity, cpus)
+}
+
+func (d *preWriteDriftDriver) WriteMems(
+	ctx context.Context,
+	rel string,
+	identity CgroupIdentity,
+	mems string,
+) error {
+	d.forwardWrites++
+	return d.HierarchyDriver.WriteMems(ctx, rel, identity, mems)
 }
 
 func (d *injectedTraceDriver) StatIdentity(ctx context.Context, rel string) (CgroupIdentity, error) {
@@ -1077,6 +1661,10 @@ func (d *injectedTraceDriver) ReadEntry(ctx context.Context, rel string) (EntryS
 		}
 		return EntryState{}, errors.New("injected uncertain write read-back failure")
 	}
+	if d.injected && d.injection.blockRollbackIdentity {
+		<-ctx.Done()
+		return EntryState{}, ctx.Err()
+	}
 	return d.HierarchyDriver.ReadEntry(ctx, rel)
 }
 
@@ -1111,7 +1699,7 @@ func (d *injectedTraceDriver) WriteMems(
 }
 
 func (d *injectedTraceDriver) write(
-	_ context.Context,
+	ctx context.Context,
 	resource HierarchyOperation,
 	rel string,
 	delegate func() error,
@@ -1144,6 +1732,10 @@ func (d *injectedTraceDriver) write(
 		d.forwardSuccess++
 		if d.injection.failPostWriteReadback {
 			d.pendingReadback = true
+		}
+		if d.injection.blockAfterWriteUntilDeadline == d.forwardSuccess {
+			d.injected = true
+			<-ctx.Done()
 		}
 		if d.injection.cancelAfterWrite == d.forwardSuccess {
 			d.injected = true

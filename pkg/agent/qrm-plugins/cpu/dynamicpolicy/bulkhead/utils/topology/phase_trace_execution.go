@@ -43,6 +43,7 @@ type AppliedPhysicalWrite struct {
 	// Before value by the same identity-pinned read immediately before write.
 	BeforeEffective string
 	After           string
+	AfterEffective  string
 	Impact          PhysicalImpact
 }
 
@@ -56,6 +57,31 @@ type rollbackObservation struct {
 	err     error
 }
 
+type frozenTraceFinalization struct {
+	snapshot   *CompleteSnapshot
+	evaluation coordinatorSnapshotEvaluation
+}
+
+type frozenTraceFinalizer func(
+	context.Context,
+	*CompiledPhaseTrace,
+) (frozenTraceFinalization, error)
+
+type frozenOperationState struct {
+	Identity       CgroupIdentity
+	ConfiguredCPUs machine.CPUSet
+	EffectiveCPUs  machine.CPUSet
+	ConfiguredMems string
+	EffectiveMems  string
+}
+
+type frozenOperationPreflight struct {
+	before         frozenOperationState
+	after          frozenOperationState
+	parentIdentity CgroupIdentity
+	children       stableLiveChildren
+}
+
 // preflightFrozenTrace proves that a frozen trace is executable from one fresh
 // complete snapshot. Every operation is validated and applied to an isolated
 // projected hierarchy in global trace order; no live hierarchy write occurs.
@@ -63,29 +89,37 @@ func (w safeCPSetWriter) preflightFrozenTrace(
 	ctx context.Context,
 	trace *CompiledPhaseTrace,
 ) error {
+	_, err := w.preflightFrozenTraceOperations(ctx, trace)
+	return err
+}
+
+func (w safeCPSetWriter) preflightFrozenTraceOperations(
+	ctx context.Context,
+	trace *CompiledPhaseTrace,
+) ([]frozenOperationPreflight, error) {
 	if w.driver == nil {
-		return fmt.Errorf("frozen trace preflight requires hierarchy driver")
+		return nil, fmt.Errorf("frozen trace preflight requires hierarchy driver")
 	}
 	if w.budget == nil {
-		return fmt.Errorf("frozen trace preflight requires convergence budget")
+		return nil, fmt.Errorf("frozen trace preflight requires convergence budget")
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, err
 	}
 
 	frozen, err := FreezePhaseTrace(trace)
 	if err != nil {
-		return fmt.Errorf("freeze phase trace before preflight: %w", err)
+		return nil, fmt.Errorf("freeze phase trace before preflight: %w", err)
 	}
 	if frozen.InitialSnapshot.ScanBoundary.Purpose != ScanForPlan {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"frozen trace preflight requires plan snapshot evidence, got %q",
 			frozen.InitialSnapshot.ScanBoundary.Purpose,
 		)
 	}
 	dag, err := BuildDAG(cloneNodeSpecs(frozen.EvaluationInput.DAGSpecs))
 	if err != nil {
-		return fmt.Errorf("rebuild frozen trace DAG for preflight: %w", err)
+		return nil, fmt.Errorf("rebuild frozen trace DAG for preflight: %w", err)
 	}
 	fresh, err := BuildCompleteSnapshotForBoundary(
 		ctx,
@@ -95,10 +129,10 @@ func (w safeCPSetWriter) preflightFrozenTrace(
 		w.budget,
 	)
 	if err != nil {
-		return fmt.Errorf("capture frozen trace preflight snapshot: %w", err)
+		return nil, fmt.Errorf("capture frozen trace preflight snapshot: %w", err)
 	}
 	if fresh.ID != frozen.InitialSnapshot.ID {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"frozen trace initial snapshot drift: current=%x expected=%x",
 			fresh.ID, frozen.InitialSnapshot.ID,
 		)
@@ -106,25 +140,114 @@ func (w safeCPSetWriter) preflightFrozenTrace(
 
 	projection, err := newProjectedHierarchy(fresh, frozen.Capabilities)
 	if err != nil {
-		return fmt.Errorf("create frozen trace preflight projection: %w", err)
+		return nil, fmt.Errorf("create frozen trace preflight projection: %w", err)
 	}
+	operationCount := 0
+	for _, phase := range frozen.Phases {
+		operationCount = saturatingAdd(operationCount, len(phase.Operations))
+	}
+	evidence := make([]frozenOperationPreflight, 0, operationCount)
 	for phaseIndex, phase := range frozen.Phases {
 		for operationIndex, operation := range phase.Operations {
+			before, ok := projection.snapshot.Entries[operation.Rel]
+			if !ok {
+				return nil, fmt.Errorf(
+					"preflight frozen phase trace operation %d/%d has no predecessor for %q",
+					phaseIndex, operationIndex, operation.Rel,
+				)
+			}
+			children, err := frozenChildrenFromSnapshot(projection.snapshot, operation.Rel)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"preflight frozen phase trace operation %d/%d children: %w",
+					phaseIndex, operationIndex, err,
+				)
+			}
+			var parentIdentity CgroupIdentity
+			if operation.ParentRel != "" {
+				parent, parentOK := projection.snapshot.Entries[operation.ParentRel]
+				if !parentOK {
+					return nil, fmt.Errorf(
+						"preflight frozen phase trace operation %d/%d has no parent predecessor for %q",
+						phaseIndex, operationIndex, operation.ParentRel,
+					)
+				}
+				parentIdentity = parent.Identity
+			}
 			if err := projection.applyOperation(operation); err != nil {
-				return fmt.Errorf(
+				return nil, fmt.Errorf(
 					"preflight frozen phase trace operation %d/%d: %w",
 					phaseIndex, operationIndex, err,
 				)
 			}
+			after := projection.snapshot.Entries[operation.Rel]
+			evidence = append(evidence, frozenOperationPreflight{
+				before:         freezeOperationState(before),
+				after:          freezeOperationState(after),
+				parentIdentity: parentIdentity,
+				children:       children,
+			})
 		}
 	}
 	if projection.snapshot.ID != frozen.FinalSnapshot.ID {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"frozen trace projected final snapshot drift: projected=%x expected=%x",
 			projection.snapshot.ID, frozen.FinalSnapshot.ID,
 		)
 	}
-	return nil
+	return evidence, nil
+}
+
+func frozenChildrenFromSnapshot(
+	snapshot *CompleteSnapshot,
+	rel string,
+) (stableLiveChildren, error) {
+	children := stableLiveChildren{
+		cpus:  machine.NewCPUSet(),
+		mems:  machine.NewCPUSet(),
+		refs:  append([]ChildRef(nil), snapshot.Children[rel]...),
+		byRel: make(map[string]EntryState, len(snapshot.Children[rel])),
+	}
+	for _, child := range children.refs {
+		childRel := child.Name
+		if rel != "" {
+			childRel = rel + "/" + child.Name
+		}
+		entry, ok := snapshot.Entries[childRel]
+		if !ok {
+			if _, unavailable := snapshot.UnavailableChildren[childRel]; unavailable {
+				continue
+			}
+			return stableLiveChildren{}, fmt.Errorf(
+				"child %q has neither entry nor unavailable evidence", childRel)
+		}
+		if entry.Identity != child.Identity {
+			return stableLiveChildren{}, fmt.Errorf(
+				"child %q identity disagrees with frozen listing", childRel)
+		}
+		children.byRel[childRel] = entry
+		children.cpus = children.cpus.Union(entry.CPUs)
+		if entry.Mems != "" {
+			mems, err := machine.Parse(entry.Mems)
+			if err != nil {
+				return stableLiveChildren{}, fmt.Errorf(
+					"parse frozen child %q cpuset.mems=%q: %w",
+					childRel, entry.Mems, err)
+			}
+			children.mems = children.mems.Union(mems)
+		}
+	}
+	return children, nil
+}
+
+func freezeOperationState(entry EntryState) frozenOperationState {
+	return frozenOperationState{
+		Identity:       entry.Identity,
+		ConfiguredCPUs: entry.ConfiguredCPUs.Clone(),
+		EffectiveCPUs:  entry.CPUs.Clone(),
+		ConfiguredMems: entry.ConfiguredMems,
+		EffectiveMems:  entry.Mems,
+	}
 }
 
 // executeFrozenTrace applies exactly the globally ordered operations authorized
@@ -135,6 +258,7 @@ func (r *coordinatorRound) executeFrozenTrace(
 	trace *CompiledPhaseTrace,
 	ticket *ExecutionReservationTicket,
 	res *ConvergenceResult,
+	finalizers ...frozenTraceFinalizer,
 ) (RoundOutcome, error) {
 	outcome := RoundOutcome{Status: RoundStatusBlocked}
 	if r == nil || r.driver == nil {
@@ -150,6 +274,9 @@ func (r *coordinatorRound) executeFrozenTrace(
 	if res == nil {
 		return outcome, fmt.Errorf("frozen trace execution requires convergence result")
 	}
+	if len(finalizers) > 1 {
+		return outcome, fmt.Errorf("frozen trace execution accepts at most one finalizer")
+	}
 	frozen, err := FreezePhaseTrace(trace)
 	if err != nil {
 		return outcome, err
@@ -157,7 +284,8 @@ func (r *coordinatorRound) executeFrozenTrace(
 	defer ticket.ReleaseUnused()
 
 	writer := newSafeCPUSetWriter(r.driver, r.budget, res)
-	if err := writer.preflightFrozenTrace(ctx, frozen); err != nil {
+	preflight, err := writer.preflightFrozenTraceOperations(ctx, frozen)
+	if err != nil {
 		return outcome, err
 	}
 	writer.driver = NewBudgetedHierarchyDriver(r.driver, r.budget)
@@ -168,14 +296,11 @@ func (r *coordinatorRound) executeFrozenTrace(
 	operationIndex := 0
 	for _, phase := range frozen.Phases {
 		for _, operation := range phase.Operations {
-			if err := ticket.AuthorizeNext(frozen.TraceID, operationIndex, operation); err != nil {
-				return outcome, writer.failFrozenTrace(
-					ctx, err, stack, ticket, res, journalStart, appliedStart)
-			}
-			operationIndex++
 			res.Attempted++
 			applied, applyErr := writer.applyFrozenOperation(
-				ctx, phase.Kind, operationIndex-1, operation, stack, ticket)
+				ctx, phase.Kind, operationIndex, operation,
+				preflight[operationIndex], stack, ticket, frozen.TraceID)
+			operationIndex++
 			if applied.PlanID != "" {
 				res.Journal = append(res.Journal, applied)
 			}
@@ -188,6 +313,47 @@ func (r *coordinatorRound) executeFrozenTrace(
 		}
 	}
 
+	finalize := r.proveFrozenTraceFinalState
+	if len(finalizers) == 1 {
+		if finalizers[0] == nil {
+			return outcome, writer.failFrozenTrace(
+				ctx, fmt.Errorf("frozen trace execution requires non-nil finalizer"),
+				stack, ticket, res, journalStart, appliedStart)
+		}
+		finalize = finalizers[0]
+	}
+	finalization, err := finalize(ctx, frozen)
+	if err != nil {
+		res.Failed++
+		return outcome, writer.failFrozenTrace(
+			ctx, err, stack, ticket, res, journalStart, appliedStart)
+	}
+
+	res.FinalSnapshot = finalization.snapshot
+	res.FinalSnapshotCurrent = true
+	res.ConvergenceReport = finalization.evaluation.Report
+	res.ParentSafe = frozen.Objective == ConvergenceObjectiveParentSafe &&
+		finalization.evaluation.ParentSafety.Safe &&
+		!finalization.evaluation.Report.FullyConverged
+	res.Converged = finalization.evaluation.Report.FullyConverged
+	if res.Converged {
+		res.State = ConvergenceStateConverged
+		outcome.Status = RoundStatusConverged
+	} else {
+		res.State = ConvergenceStateParentSafeLeafDeferred
+		outcome.Status = RoundStatusProgress
+	}
+	outcome.Snapshot = finalization.snapshot
+	outcome.Journal = append(
+		outcome.Journal, res.Journal[journalStart:]...)
+	return outcome, nil
+}
+
+func (r *coordinatorRound) proveFrozenTraceFinalState(
+	ctx context.Context,
+	frozen *CompiledPhaseTrace,
+) (frozenTraceFinalization, error) {
+	var finalization frozenTraceFinalization
 	fresh, err := BuildCompleteSnapshotForBoundary(
 		ctx,
 		r.driver,
@@ -201,34 +367,33 @@ func (r *coordinatorRound) executeFrozenTrace(
 			fresh.ID, frozen.FinalSnapshot.ID,
 		)
 	}
-	if err == nil && !traceObjectiveSatisfied(frozen) {
-		err = fmt.Errorf("frozen trace final objective is not satisfied")
+	var freshEvaluation coordinatorSnapshotEvaluation
+	if err == nil {
+		freshEvaluation, err = frozen.EvaluationInput.evaluate(fresh)
+	}
+	if err == nil {
+		switch frozen.Objective {
+		case ConvergenceObjectiveParentSafe:
+			if !freshEvaluation.ParentSafety.Safe {
+				err = fmt.Errorf("fresh frozen trace final state is not ParentSafe")
+			}
+		case ConvergenceObjectiveFull:
+			if !freshEvaluation.Report.FullyConverged {
+				err = fmt.Errorf("fresh frozen trace final state is not fully converged")
+			}
+		default:
+			err = fmt.Errorf("frozen trace final objective is unsupported: %q", frozen.Objective)
+		}
 	}
 	if err != nil {
-		res.Failed++
-		return outcome, writer.failFrozenTrace(
-			ctx,
-			fmt.Errorf("prove frozen trace final state: %w", err),
-			stack, ticket, res, journalStart, appliedStart)
+		return finalization, fmt.Errorf("prove frozen trace final state: %w", err)
 	}
-
-	res.FinalSnapshot = fresh
-	res.FinalSnapshotCurrent = true
-	res.ConvergenceReport = frozen.FinalEvaluation.Report
-	res.ParentSafe = frozen.Objective == ConvergenceObjectiveParentSafe &&
-		frozen.FinalEvaluation.ParentSafety.Safe
-	res.Converged = frozen.FinalEvaluation.Report.FullyConverged
-	if res.Converged {
-		res.State = ConvergenceStateConverged
-		outcome.Status = RoundStatusConverged
-	} else {
-		res.State = ConvergenceStateParentSafeLeafDeferred
-		outcome.Status = RoundStatusProgress
+	if err := ctx.Err(); err != nil {
+		return finalization, err
 	}
-	outcome.Snapshot = fresh
-	outcome.Journal = append(
-		outcome.Journal, res.Journal[journalStart:]...)
-	return outcome, nil
+	finalization.snapshot = fresh
+	finalization.evaluation = freshEvaluation
+	return finalization, nil
 }
 
 func (w safeCPSetWriter) applyFrozenOperation(
@@ -236,19 +401,30 @@ func (w safeCPSetWriter) applyFrozenOperation(
 	phase PhaseKind,
 	logicalOperationIndex int,
 	operation PlanOperation,
+	preflight frozenOperationPreflight,
 	stack *traceMutationStack,
 	ticket *ExecutionReservationTicket,
+	traceID string,
 ) (AppliedPlanOperation, error) {
 	if err := ctx.Err(); err != nil {
 		return AppliedPlanOperation{}, err
 	}
+	current, alreadyAtTarget, err := w.validateFrozenOperationPredecessor(
+		ctx, operation, preflight)
+	if err != nil {
+		return AppliedPlanOperation{}, err
+	}
+	if err := ticket.AuthorizeNext(traceID, logicalOperationIndex, operation); err != nil {
+		return AppliedPlanOperation{}, err
+	}
+	if alreadyAtTarget {
+		return w.readAfterWrite(ctx, operation)
+	}
+
 	if operation.WriteMems && operation.ExpectedCurrent.Mems != operation.Target.Mems {
-		write, err := w.capturePhysicalWriteBefore(
-			ctx, operation, HierarchyOperationWriteMems, operation.Target.Mems,
-			logicalOperationIndex, phase)
-		if err != nil {
-			return AppliedPlanOperation{}, err
-		}
+		write := physicalWriteBeforeFromEntry(
+			current, operation, HierarchyOperationWriteMems, operation.Target.Mems,
+			logicalOperationIndex, phase, preflight.after.EffectiveMems)
 		if err := ticket.consumeForward(PhysicalWriteCost{MemsWrites: 1}); err != nil {
 			return AppliedPlanOperation{}, err
 		}
@@ -267,12 +443,9 @@ func (w safeCPSetWriter) applyFrozenOperation(
 		stack.writes = append(stack.writes, write)
 	}
 	if !operation.ExpectedCurrent.CPUs.Equals(operation.Target.CPUs) {
-		write, err := w.capturePhysicalWriteBefore(
-			ctx, operation, HierarchyOperationWriteCPUs, operation.Target.CPUs.String(),
-			logicalOperationIndex, phase)
-		if err != nil {
-			return AppliedPlanOperation{}, err
-		}
+		write := physicalWriteBeforeFromEntry(
+			current, operation, HierarchyOperationWriteCPUs, operation.Target.CPUs.String(),
+			logicalOperationIndex, phase, preflight.after.EffectiveCPUs.String())
 		if err := ticket.consumeForward(PhysicalWriteCost{CPUSetWrites: 1}); err != nil {
 			return AppliedPlanOperation{}, err
 		}
@@ -293,6 +466,108 @@ func (w safeCPSetWriter) applyFrozenOperation(
 	return w.readAfterWrite(ctx, operation)
 }
 
+func (w safeCPSetWriter) validateFrozenOperationPredecessor(
+	ctx context.Context,
+	operation PlanOperation,
+	preflight frozenOperationPreflight,
+) (EntryState, bool, error) {
+	current, err := w.driver.ReadEntry(ctx, operation.Rel)
+	if err != nil {
+		return EntryState{}, false, w.classifyHierarchyReadError(err, operation)
+	}
+	if current.Identity != preflight.before.Identity ||
+		current.Identity != preflight.after.Identity {
+		return EntryState{}, false, &PlanStaleError{
+			Rel: operation.Rel, Direction: operation.Direction, Resource: "identity",
+			Current: fmt.Sprint(current.Identity), Target: fmt.Sprint(preflight.before.Identity),
+			Err: fmt.Errorf("%w: frozen pre-write identity changed", ErrCgroupIdentityChanged),
+		}
+	}
+	if frozenOperationStateEqual(current, preflight.after) {
+		return current, true, nil
+	}
+	if !frozenOperationStateEqual(current, preflight.before) {
+		return EntryState{}, false, &PlanStaleError{
+			Rel: operation.Rel, Direction: operation.Direction,
+			Resource: "pre_write_predecessor",
+			Current:  frozenOperationStateString(freezeOperationState(current)),
+			Target:   frozenOperationStateString(preflight.before),
+			Err:      fmt.Errorf("live physical state does not match the complete frozen predecessor"),
+		}
+	}
+
+	if operation.ParentRel != "" {
+		parent, parentErr := w.driver.ReadEntry(ctx, operation.ParentRel)
+		if parentErr != nil {
+			return EntryState{}, false, w.classifyHierarchyReadError(parentErr, operation)
+		}
+		if parent.Identity != preflight.parentIdentity ||
+			parent.Identity != operation.ExpectedParentIdentity {
+			return EntryState{}, false, &PlanStaleError{
+				Rel: operation.Rel, Direction: operation.Direction,
+				Resource: "parent_identity",
+				Current:  fmt.Sprint(parent.Identity),
+				Target:   fmt.Sprint(preflight.parentIdentity),
+				Err:      fmt.Errorf("%w: frozen predecessor parent identity changed", ErrCgroupIdentityChanged),
+			}
+		}
+	}
+
+	children, err := scanFrozenLiveChildrenOnce(
+		ctx, w.driver, operation, preflight.children, true, nil)
+	if err != nil {
+		return EntryState{}, false, err
+	}
+	if !children.cpus.Equals(preflight.children.cpus) {
+		return EntryState{}, false, &PlanStaleError{
+			Rel: operation.Rel, Direction: operation.Direction,
+			Resource: "child_union",
+			Current:  children.cpus.String(),
+			Target:   preflight.children.cpus.String(),
+			Err:      fmt.Errorf("live child CPU union changed from frozen predecessor"),
+		}
+	}
+	if !children.mems.Equals(preflight.children.mems) {
+		return EntryState{}, false, &PlanStaleError{
+			Rel: operation.Rel, Direction: operation.Direction,
+			Resource: "child_union_cpuset.mems",
+			Current:  children.mems.String(),
+			Target:   preflight.children.mems.String(),
+			Err:      fmt.Errorf("live child mems union changed from frozen predecessor"),
+		}
+	}
+	return current, false, nil
+}
+
+func frozenOperationStateEqual(
+	current EntryState,
+	expected frozenOperationState,
+) bool {
+	return current.Identity == expected.Identity &&
+		current.ConfiguredCPUs.Equals(expected.ConfiguredCPUs) &&
+		current.CPUs.Equals(expected.EffectiveCPUs) &&
+		cpusetListValuesEqual(current.ConfiguredMems, expected.ConfiguredMems) &&
+		cpusetListValuesEqual(current.Mems, expected.EffectiveMems)
+}
+
+func cpusetListValuesEqual(left, right string) bool {
+	if left == "" || right == "" {
+		return left == right
+	}
+	leftSet, leftErr := machine.Parse(left)
+	rightSet, rightErr := machine.Parse(right)
+	return leftErr == nil && rightErr == nil && leftSet.Equals(rightSet)
+}
+
+func frozenOperationStateString(
+	state frozenOperationState,
+) string {
+	return fmt.Sprintf(
+		"configured_cpus=%s effective_cpus=%s configured_mems=%s effective_mems=%s",
+		state.ConfiguredCPUs.String(), state.EffectiveCPUs.String(),
+		state.ConfiguredMems, state.EffectiveMems)
+}
+
 func (w safeCPSetWriter) capturePhysicalWriteBefore(
 	ctx context.Context,
 	operation PlanOperation,
@@ -311,11 +586,34 @@ func (w safeCPSetWriter) capturePhysicalWriteBefore(
 			ErrCgroupIdentityChanged, operation.Rel,
 			operation.ExpectedIdentity, current.Identity)
 	}
+	if resource != HierarchyOperationWriteCPUs &&
+		resource != HierarchyOperationWriteMems {
+		return AppliedPhysicalWrite{}, fmt.Errorf(
+			"unsupported physical write resource %q for %q", resource, operation.Rel)
+	}
+	return physicalWriteBeforeFromEntry(
+		current, operation, resource, after, logicalOperationIndex, phase,
+	), nil
+}
+
+func physicalWriteBeforeFromEntry(
+	current EntryState,
+	operation PlanOperation,
+	resource HierarchyOperation,
+	after string,
+	logicalOperationIndex int,
+	phase PhaseKind,
+	afterEffective ...string,
+) AppliedPhysicalWrite {
 	write := AppliedPhysicalWrite{
 		PlanID: operation.PlanID, Rel: operation.Rel, Identity: current.Identity,
 		Direction: operation.Direction, Resource: resource, After: after,
 		Impact: PhysicalImpactConfirmed, LogicalOperationIndex: logicalOperationIndex,
 		Phase: phase,
+	}
+	write.AfterEffective = after
+	if len(afterEffective) > 0 {
+		write.AfterEffective = afterEffective[0]
 	}
 	switch resource {
 	case HierarchyOperationWriteCPUs:
@@ -325,10 +623,9 @@ func (w safeCPSetWriter) capturePhysicalWriteBefore(
 		write.Before = current.ConfiguredMems
 		write.BeforeEffective = current.Mems
 	default:
-		return AppliedPhysicalWrite{}, fmt.Errorf(
-			"unsupported physical write resource %q for %q", resource, operation.Rel)
+		return AppliedPhysicalWrite{}
 	}
-	return write, nil
+	return write
 }
 
 // recordUncertainPhysicalWrite performs a generation-pinned read-back after a
@@ -385,9 +682,14 @@ func (w safeCPSetWriter) failFrozenTrace(
 ) error {
 	res.ParentSafe = false
 	res.Converged = false
+	res.State = ConvergenceStateNonConverged
+	res.ConvergenceReport = ConvergenceReport{}
+	res.FinalSnapshot = nil
 	res.FinalSnapshotCurrent = false
+	res.DeferredLeafCount = 0
+	res.DeferredCPUCount = 0
 
-	recoveryCtx, cancelRecovery := newFrozenTraceRecoveryContext(ctx, w.budget)
+	recoveryCtx, cancelRecovery := newFrozenTraceRecoveryContext()
 	defer cancelRecovery()
 	rollbackErr := w.rollbackTracePrefix(recoveryCtx, stack, ticket)
 	if rollbackErr == nil {
@@ -399,24 +701,12 @@ func (w safeCPSetWriter) failFrozenTrace(
 	return newExecutionRollbackError(executionErr, rollbackErr)
 }
 
-// newFrozenTraceRecoveryContext detaches rollback from forward cancellation
-// while retaining the invocation's absolute deadline and a short internal cap.
-// The rollback driver additionally enforces the ticket's reserved write and I/O
-// budgets, so detached recovery remains bounded on both time and work.
-func newFrozenTraceRecoveryContext(
-	invocationCtx context.Context,
-	budget *BudgetTracker,
-) (context.Context, context.CancelFunc) {
-	deadline := time.Now().Add(frozenTraceRecoveryTimeout)
-	if invocationCtx != nil {
-		if invocationDeadline, ok := invocationCtx.Deadline(); ok {
-			deadline = earliestDeadline(deadline, invocationDeadline)
-		}
-	}
-	if budget != nil {
-		deadline = earliestDeadline(deadline, budget.Deadline())
-	}
-	return context.WithDeadline(context.Background(), deadline)
+// newFrozenTraceRecoveryContext detaches rollback from forward cancellation and
+// deadlines. The recovery window starts now and remains bounded by its short
+// internal cap; rollback work is bounded separately by the ticket's reserved
+// write and hierarchy-I/O quotas.
+func newFrozenTraceRecoveryContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), frozenTraceRecoveryTimeout)
 }
 
 func (w safeCPSetWriter) rollbackTracePrefix(
@@ -427,22 +717,36 @@ func (w safeCPSetWriter) rollbackTracePrefix(
 	if stack == nil || len(stack.writes) == 0 {
 		return nil
 	}
-	rollbackDriver := newRollbackHierarchyDriver(w.driver, w.budget, ticket)
+	rollbackDriver := newRollbackHierarchyDriver(w.driver, ticket)
 	var rollbackErrors []error
 	for i := len(stack.writes) - 1; i >= 0; i-- {
 		write := stack.writes[i]
-		currentIdentity, err := rollbackDriver.StatIdentity(ctx, write.Rel)
+		current, err := rollbackDriver.ReadEntry(ctx, write.Rel)
 		if err != nil {
 			rollbackErrors = append(rollbackErrors,
-				fmt.Errorf("stat identity before rollback %s for %q: %w",
+				fmt.Errorf("read entry before rollback %s for %q: %w",
 					write.Resource, write.Rel, err))
 			continue
 		}
-		if currentIdentity != write.Identity {
+		if current.Identity != write.Identity {
 			rollbackErrors = append(rollbackErrors, fmt.Errorf(
 				"%w: refuse rollback %s for replacement rel=%q expected=%v current=%v",
 				ErrCgroupIdentityChanged, write.Resource, write.Rel,
-				write.Identity, currentIdentity))
+				write.Identity, current.Identity))
+			continue
+		}
+		switch classifyRollbackPhysicalState(write, current) {
+		case rollbackPhysicalStateBefore:
+			continue
+		case rollbackPhysicalStateAfter:
+		case rollbackPhysicalStateThird:
+			rollbackErrors = append(rollbackErrors, fmt.Errorf(
+				"refuse rollback %s for %q: same-generation state matches neither rollback after nor before: current=%s after=%s before=%s",
+				write.Resource, write.Rel,
+				rollbackPhysicalStateString(write.Resource, current),
+				rollbackPhysicalExpectedString(write.Resource, write.After, write.AfterEffective),
+				rollbackPhysicalExpectedString(write.Resource, write.Before, write.BeforeEffective),
+			))
 			continue
 		}
 
@@ -478,6 +782,79 @@ func (w safeCPSetWriter) rollbackTracePrefix(
 	}
 	rollbackErrors = append(rollbackErrors, w.verifyRolledBackPrefix(ctx, rollbackDriver, stack)...)
 	return utilerrors.NewAggregate(rollbackErrors)
+}
+
+type rollbackPhysicalState uint8
+
+const (
+	rollbackPhysicalStateAfter rollbackPhysicalState = iota
+	rollbackPhysicalStateBefore
+	rollbackPhysicalStateThird
+)
+
+func classifyRollbackPhysicalState(
+	write AppliedPhysicalWrite,
+	current EntryState,
+) rollbackPhysicalState {
+	if rollbackPhysicalResourceEqual(
+		write.Resource, current, write.After, write.AfterEffective) {
+		return rollbackPhysicalStateAfter
+	}
+	if rollbackPhysicalResourceEqual(
+		write.Resource, current, write.Before, write.BeforeEffective) {
+		return rollbackPhysicalStateBefore
+	}
+	return rollbackPhysicalStateThird
+}
+
+func rollbackPhysicalResourceEqual(
+	resource HierarchyOperation,
+	current EntryState,
+	configured, effective string,
+) bool {
+	if effective == "" && configured != "" {
+		effective = configured
+	}
+	switch resource {
+	case HierarchyOperationWriteCPUs:
+		configuredCPUs, configuredErr := machine.Parse(configured)
+		effectiveCPUs, effectiveErr := machine.Parse(effective)
+		return configuredErr == nil && effectiveErr == nil &&
+			current.ConfiguredCPUs.Equals(configuredCPUs) &&
+			current.CPUs.Equals(effectiveCPUs)
+	case HierarchyOperationWriteMems:
+		return cpusetListValuesEqual(current.ConfiguredMems, configured) &&
+			cpusetListValuesEqual(current.Mems, effective)
+	default:
+		return false
+	}
+}
+
+func rollbackPhysicalStateString(
+	resource HierarchyOperation,
+	current EntryState,
+) string {
+	switch resource {
+	case HierarchyOperationWriteCPUs:
+		return rollbackPhysicalExpectedString(
+			resource, current.ConfiguredCPUs.String(), current.CPUs.String())
+	case HierarchyOperationWriteMems:
+		return rollbackPhysicalExpectedString(
+			resource, current.ConfiguredMems, current.Mems)
+	default:
+		return "<unsupported>"
+	}
+}
+
+func rollbackPhysicalExpectedString(
+	resource HierarchyOperation,
+	configured, effective string,
+) string {
+	if effective == "" && configured != "" {
+		effective = configured
+	}
+	return fmt.Sprintf("%s(configured=%s effective=%s)",
+		resource, configured, effective)
 }
 
 func (w safeCPSetWriter) verifyRolledBackPrefix(
@@ -644,10 +1021,14 @@ func (w safeCPSetWriter) rebuildPhysicalImpactEvidence(
 
 		source := last
 		if observed && observation.err == nil {
-			configured := configuredPhysicalResource(last.Resource, observation.current)
 			matched := false
 			for i := len(chain.writes) - 1; i >= 0; i-- {
-				if configured == chain.writes[i].After {
+				if rollbackPhysicalResourceEqual(
+					last.Resource,
+					observation.current,
+					chain.writes[i].After,
+					chain.writes[i].AfterEffective,
+				) {
 					source = chain.writes[i]
 					matched = true
 					break
@@ -722,17 +1103,6 @@ func (w safeCPSetWriter) rebuildPhysicalImpactEvidence(
 	}
 }
 
-func configuredPhysicalResource(resource HierarchyOperation, current EntryState) string {
-	switch resource {
-	case HierarchyOperationWriteCPUs:
-		return current.ConfiguredCPUs.String()
-	case HierarchyOperationWriteMems:
-		return current.ConfiguredMems
-	default:
-		return ""
-	}
-}
-
 func physicalResourceRestored(
 	resource HierarchyOperation,
 	current EntryState,
@@ -796,13 +1166,11 @@ func newExecutionEvidenceError(executionErr, evidenceErr error) error {
 
 type rollbackHierarchyDriver struct {
 	HierarchyDriver
-	budget *BudgetTracker
 	ticket *ExecutionReservationTicket
 }
 
 func newRollbackHierarchyDriver(
 	driver HierarchyDriver,
-	budget *BudgetTracker,
 	ticket *ExecutionReservationTicket,
 ) HierarchyDriver {
 	for {
@@ -814,7 +1182,6 @@ func newRollbackHierarchyDriver(
 		default:
 			return &rollbackHierarchyDriver{
 				HierarchyDriver: driver,
-				budget:          budget,
 				ticket:          ticket,
 			}
 		}
@@ -822,10 +1189,7 @@ func newRollbackHierarchyDriver(
 }
 
 func (d *rollbackHierarchyDriver) consume(ctx context.Context) error {
-	if d.budget == nil {
-		return fmt.Errorf("rollback hierarchy driver requires convergence budget")
-	}
-	if err := d.budget.checkContextDeadline(ctx); err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	return d.ticket.consumeRollbackIO()

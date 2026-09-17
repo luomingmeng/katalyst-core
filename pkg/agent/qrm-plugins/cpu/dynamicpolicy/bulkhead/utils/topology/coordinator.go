@@ -400,11 +400,6 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 	round.expectedAbsentRels = cloneRelSet(in.ExpectedAbsentRels)
 	round.snapshotSource = newCompleteSnapshotSource(snapshotDriver, in.DAG, budget, in.TraversalBoundaries)
 	round.driver = snapshotDriver
-	defer func() {
-		if round.admissionTicket != nil {
-			round.admissionTicket.ReleaseUnused()
-		}
-	}()
 	initialSnapshot, err := round.nextSnapshot(ctx)
 	if err != nil {
 		return *res, err
@@ -422,6 +417,16 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 		return *res, err
 	}
 	if err := budget.configureAutoCumulativeLimitsFromInput(autoBudgetInput); err != nil {
+		return *res, err
+	}
+	if round.objective == ConvergenceObjectiveParentSafe {
+		_, err := round.executeParentSafeAdmission(
+			ctx,
+			initialSnapshot,
+			res,
+			in.PublishFinalSnapshot,
+			in.PublishParentSafeSnapshot,
+		)
 		return *res, err
 	}
 	round.pendingSnapshot = initialSnapshot
@@ -1011,14 +1016,19 @@ func newCoordinatorHierarchyDriver(
 }
 
 type coordinatorRound struct {
-	dag                   *TopoDAG
-	targetByRel           map[string]machine.CPUSet
-	dynamicByRel          map[string]machine.CPUSet
-	deferredByRel         map[string]machine.CPUSet
-	requiredByRel         map[string]machine.CPUSet
-	deferredCleanupRels   map[string]struct{}
-	objective             ConvergenceObjective
-	admissionBudget       *AdmissionConvergenceBudget
+	dag                 *TopoDAG
+	targetByRel         map[string]machine.CPUSet
+	dynamicByRel        map[string]machine.CPUSet
+	deferredByRel       map[string]machine.CPUSet
+	requiredByRel       map[string]machine.CPUSet
+	deferredCleanupRels map[string]struct{}
+	objective           ConvergenceObjective
+	admissionBudget     *AdmissionConvergenceBudget
+	frozenTrace         *CompiledPhaseTrace
+	executionTicket     *ExecutionReservationTicket
+	// admissionTicket remains only for the legacy admission-closure tests until
+	// Task 10 removes that retired implementation. Production ParentSafe
+	// convergence never enters the live phase session that owns this field.
 	admissionTicket       *AdmissionBudgetTicket
 	allowEmptyTarget      bool
 	protectedPending      machine.CPUSet
@@ -1037,6 +1047,80 @@ type coordinatorRound struct {
 	pendingSnapshot       *CompleteSnapshot
 	round                 int
 	maxRounds             int
+}
+
+// executeParentSafeAdmission is the sole ParentSafe hierarchy mutation path.
+// It compiles from base on an isolated projection, reserves that exact immutable
+// trace, preflights the whole trace, and executes it without live replanning.
+func (r *coordinatorRound) executeParentSafeAdmission(
+	ctx context.Context,
+	base *CompleteSnapshot,
+	res *ConvergenceResult,
+	publishFinal func(*CompleteSnapshot) error,
+	publishParentSafe func(*CompleteSnapshot, map[string]struct{}) error,
+) (RoundOutcome, error) {
+	outcome := RoundOutcome{Status: RoundStatusBlocked}
+	if r == nil || r.objective.orFullDefault() != ConvergenceObjectiveParentSafe {
+		return outcome, fmt.Errorf("frozen admission execution requires ParentSafe objective")
+	}
+	if res == nil {
+		return outcome, fmt.Errorf("frozen admission execution requires convergence result")
+	}
+
+	trace, err := r.compileFixedPointTrace(ctx, base)
+	if err != nil {
+		return outcome, err
+	}
+	r.frozenTrace = trace
+
+	maxRequiredWrites := 0
+	if r.admissionBudget != nil {
+		maxRequiredWrites = r.admissionBudget.MaxRequiredWrites
+	}
+	ticket, err := r.budget.ReservePhaseTrace(trace, maxRequiredWrites)
+	if err != nil {
+		return outcome, err
+	}
+	r.executionTicket = ticket
+
+	finalize := func(
+		ctx context.Context,
+		frozen *CompiledPhaseTrace,
+	) (frozenTraceFinalization, error) {
+		finalization, finalizeErr := r.proveFrozenTraceFinalState(ctx, frozen)
+		if finalizeErr != nil {
+			return finalization, finalizeErr
+		}
+		if finalizeErr = ctx.Err(); finalizeErr != nil {
+			return finalization, finalizeErr
+		}
+		parentSafeDeferred := finalization.evaluation.ParentSafety.Safe &&
+			!finalization.evaluation.Report.FullyConverged
+		switch {
+		case parentSafeDeferred && publishParentSafe != nil:
+			finalizeErr = publishParentSafe(
+				finalization.snapshot,
+				cloneRelSet(frozen.EvaluationInput.DeferredCleanupRels),
+			)
+		case finalization.evaluation.Report.FullyConverged && publishFinal != nil:
+			finalizeErr = publishFinal(finalization.snapshot)
+		}
+		return finalization, finalizeErr
+	}
+
+	outcome, err = r.executeFrozenTrace(ctx, trace, ticket, res, finalize)
+	res.Rounds = append(res.Rounds, outcome)
+	if err != nil {
+		return outcome, err
+	}
+
+	if res.ParentSafe {
+		res.DeferredLeafCount = len(trace.EvaluationInput.DeferredByRel)
+		for _, cpus := range trace.EvaluationInput.DeferredByRel {
+			res.DeferredCPUCount += cpus.Size()
+		}
+	}
+	return outcome, nil
 }
 
 func newCoordinatorRoundWithBudget(

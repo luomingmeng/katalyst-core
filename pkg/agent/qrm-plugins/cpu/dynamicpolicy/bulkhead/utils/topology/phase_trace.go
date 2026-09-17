@@ -148,6 +148,9 @@ func (s *livePhaseSession) Snapshot(ctx context.Context) (*CompleteSnapshot, err
 }
 
 func (s *livePhaseSession) PrepareRound(plan PhasePlan) error {
+	if s.round.objective.orFullDefault() == ConvergenceObjectiveFull {
+		return nil
+	}
 	return s.round.reserveAdmissionClosure(plan)
 }
 
