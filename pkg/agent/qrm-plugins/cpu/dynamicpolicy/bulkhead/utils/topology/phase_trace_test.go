@@ -19,6 +19,8 @@ package topology
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"testing"
@@ -27,6 +29,8 @@ import (
 
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
+
+const topologyScaleTestEnv = "KATALYST_TOPOLOGY_SCALE_TEST"
 
 // admissionTraceFixture wires a coordinatorRound to a fake hierarchy driver so
 // tests can compile a complete Drain->Expand fixed point on a cloned snapshot
@@ -375,6 +379,55 @@ func TestCompileFixedPointTraceIncludesStagedDynamicDescendantGrow(t *testing.T)
 	require.Positive(t, trace.Cost.Forward.Total())
 	require.Equal(t, trace.Cost.Forward, trace.Cost.Rollback)
 	require.Zero(t, fixture.driver.PhysicalWriteCount())
+}
+
+func TestCompileFixedPointTraceScalesAcross1024CPUShapes(t *testing.T) {
+	requireTopologyScaleTests(t)
+
+	for _, depth := range []int{4, 8, 16} {
+		depth := depth
+		t.Run(fmt.Sprintf("depth=%d", depth), func(t *testing.T) {
+			fixture := newTraceBenchmarkFixture(t, 100, depth, 1024)
+			trace, err := fixture.compile()
+			require.NoError(t, err)
+			require.True(t, trace.FinalEvaluation.ParentSafety.Safe)
+			require.Equal(t, 100, len(trace.FinalSnapshot.Entries))
+			require.Contains(t, trace.EvaluationInput.AllowedCPUs.ToSliceInt(), 1023)
+			require.NotEmpty(t, flattenTraceOperations(trace))
+		})
+	}
+}
+
+func TestCompileFixedPointTraceHandlesTenThousandRelationsWithinBudget(t *testing.T) {
+	requireTopologyScaleTests(t)
+
+	const nodes = 10000
+	fixture := newTraceBenchmarkFixture(t, nodes, 16, benchmarkTraceCPUs)
+	trace, err := fixture.compile()
+	require.NoError(t, err)
+	require.True(t, trace.FinalEvaluation.ParentSafety.Safe)
+	require.Equal(t, nodes, len(trace.FinalSnapshot.Entries))
+	require.LessOrEqual(t, len(flattenTraceOperations(trace)), nodes)
+	require.Zero(t, fixture.driver.readCount())
+	require.Zero(t, fixture.driver.writeCount())
+}
+
+func TestCompileFixedPointTracePerformsNoPhysicalHierarchyIO(t *testing.T) {
+	fixture := newTraceBenchmarkFixture(t, 100, 8, 1024)
+	fixture.driver.resetCounts()
+
+	trace, err := fixture.compile()
+	require.NoError(t, err)
+	require.NotEmpty(t, flattenTraceOperations(trace))
+	require.Zero(t, fixture.driver.readCount())
+	require.Zero(t, fixture.driver.writeCount())
+}
+
+func requireTopologyScaleTests(t *testing.T) {
+	t.Helper()
+	if os.Getenv(topologyScaleTestEnv) != "1" {
+		t.Skipf("set %s=1 to run high-cost topology scale tests", topologyScaleTestEnv)
+	}
 }
 
 // TestFixedPointEngineUsesSamePlanSequenceForProjectedAndRecordingSessions
