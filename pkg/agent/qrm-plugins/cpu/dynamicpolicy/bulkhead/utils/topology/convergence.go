@@ -41,6 +41,7 @@ type ParentSafetyReport struct {
 	PendingOutsidePrimary  machine.CPUSet
 	PendingInsideReclaim   machine.CPUSet
 	PrimaryReclaimOverlap  machine.CPUSet
+	PendingScopeDeficit    map[string]machine.CPUSet
 	RequiredFloorDeficit   map[string]machine.CPUSet
 	UnsafeRequiredRels     []RelConvergence
 	DeferredLeafMismatches []RelConvergence
@@ -112,8 +113,27 @@ func buildParentSafetyReportWithRequired(
 	deferredMismatchRels map[string]struct{},
 	capabilities HierarchyCapabilities,
 ) ParentSafetyReport {
+	return buildParentSafetyReportWithScopedPending(
+		snapshot, dag, targetByRel, convergence, protectedPending,
+		nil, requiredByRel, deferredByRel, deferredMismatchRels, capabilities,
+	)
+}
+
+func buildParentSafetyReportWithScopedPending(
+	snapshot *CompleteSnapshot,
+	dag *TopoDAG,
+	targetByRel map[string]machine.CPUSet,
+	convergence ConvergenceReport,
+	protectedPending machine.CPUSet,
+	pendingRequiredByRel map[string]machine.CPUSet,
+	requiredByRel map[string]machine.CPUSet,
+	deferredByRel map[string]machine.CPUSet,
+	deferredMismatchRels map[string]struct{},
+	capabilities HierarchyCapabilities,
+) ParentSafetyReport {
 	report := ParentSafetyReport{
 		PendingOutsidePrimary: protectedPending.Clone(),
+		PendingScopeDeficit:   make(map[string]machine.CPUSet),
 		RequiredFloorDeficit:  make(map[string]machine.CPUSet),
 	}
 	if snapshot == nil || dag == nil {
@@ -167,6 +187,16 @@ func buildParentSafetyReportWithRequired(
 			report.RequiredFloorDeficit[rel] = deficit
 		}
 	}
+	for rel, required := range pendingRequiredByRel {
+		entry, ok := snapshot.Entries[rel]
+		if !ok {
+			report.PendingScopeDeficit[rel] = required.Clone()
+			continue
+		}
+		if deficit := required.Difference(entry.CPUs); !deficit.IsEmpty() {
+			report.PendingScopeDeficit[rel] = deficit
+		}
+	}
 	for parentRel, children := range snapshot.Children {
 		parent, ok := snapshot.Entries[parentRel]
 		if !ok {
@@ -188,6 +218,7 @@ func buildParentSafetyReportWithRequired(
 	report.Safe = report.PendingOutsidePrimary.IsEmpty() &&
 		report.PendingInsideReclaim.IsEmpty() &&
 		report.PrimaryReclaimOverlap.IsEmpty() &&
+		len(report.PendingScopeDeficit) == 0 &&
 		len(report.RequiredFloorDeficit) == 0 &&
 		len(report.UnsafeRequiredRels) == 0
 	return report
