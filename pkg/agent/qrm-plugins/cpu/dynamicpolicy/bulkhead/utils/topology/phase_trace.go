@@ -86,6 +86,7 @@ type FrozenCoordinatorEvaluationInput struct {
 	DeferredByRel           map[string]machine.CPUSet
 	DeferredCleanupRels     map[string]struct{}
 	ProtectedPending        machine.CPUSet
+	PendingRequiredByRel    map[string]machine.CPUSet
 	Capabilities            HierarchyCapabilities
 	AllowEmptyTarget        bool
 }
@@ -128,6 +129,7 @@ func (in FrozenCoordinatorEvaluationInput) evaluate(
 		snapshot, dag, in.TargetByRel, in.ParentSafetyTargetByRel, in.TargetMemsByRel,
 		in.DesiredByDomain, in.AllowedCPUs, in.ExpectedByRel, in.RequiredByRel,
 		in.DeferredByRel, in.DeferredCleanupRels, in.ProtectedPending,
+		in.PendingRequiredByRel,
 		in.Capabilities, in.AllowEmptyTarget,
 	)
 }
@@ -432,7 +434,8 @@ func (r *coordinatorRound) runFixedPointEngine(
 			r.desiredDomainUnion(), r.allowedCPUs(),
 			r.dynamicByRel, r.requiredByRel, r.deferredByRel,
 			r.deferredCleanupRels,
-			r.admissionSafetyCPUSet(), capabilities, r.allowEmptyTarget,
+			r.admissionSafetyCPUSet(), r.pendingRequiredByRel,
+			capabilities, r.allowEmptyTarget,
 		)
 		if err != nil {
 			return nil, err
@@ -561,8 +564,10 @@ func (r *coordinatorRound) applyDrainPhases(
 		}
 		if r.objective == ConvergenceObjectiveParentSafe {
 			required, _, splitErr := SplitPlanForAdmission(&plan, AdmissionSafetyInput{
-				ProtectedPendingCPUSet: r.admissionSafetyCPUSet(),
-				DeferredCPUSetByRel:    r.deferredByRel,
+				PendingCPUSet:        r.admissionSafetyCPUSet(),
+				PendingRequiredByRel: r.pendingRequiredByRel,
+				DeferredCPUSetByRel:  r.deferredByRel,
+				RequiredCPUSetByRel:  r.requiredByRel,
 			})
 			if splitErr != nil {
 				return fresh, released, journal, splitErr
@@ -579,6 +584,7 @@ func (r *coordinatorRound) cloneForProjection() *coordinatorRound {
 	out.dynamicByRel = cloneCPUSetMap(r.dynamicByRel)
 	out.deferredByRel = cloneCPUSetMap(r.deferredByRel)
 	out.requiredByRel = cloneCPUSetMap(r.requiredByRel)
+	out.pendingRequiredByRel = cloneCPUSetMap(r.pendingRequiredByRel)
 	out.protectedPending = r.protectedPending.Clone()
 	out.protectedByRel = cloneCPUSetMap(r.protectedByRel)
 	out.requiredIdentityByRel = cloneIdentityMap(r.requiredIdentityByRel)
@@ -634,6 +640,7 @@ func freezeCoordinatorEvaluationInput(
 		DeferredByRel:           cloneCPUSetMap(r.deferredByRel),
 		DeferredCleanupRels:     cloneRelSet(r.deferredCleanupRels),
 		ProtectedPending:        r.admissionSafetyCPUSet(),
+		PendingRequiredByRel:    cloneCPUSetMap(r.pendingRequiredByRel),
 		Capabilities:            capabilities,
 		AllowEmptyTarget:        r.allowEmptyTarget,
 	}
@@ -654,6 +661,7 @@ func cloneFrozenCoordinatorEvaluationInput(
 		DeferredByRel:           cloneCPUSetMap(in.DeferredByRel),
 		DeferredCleanupRels:     cloneRelSet(in.DeferredCleanupRels),
 		ProtectedPending:        in.ProtectedPending.Clone(),
+		PendingRequiredByRel:    cloneCPUSetMap(in.PendingRequiredByRel),
 		Capabilities:            in.Capabilities,
 		AllowEmptyTarget:        in.AllowEmptyTarget,
 	}
@@ -773,6 +781,7 @@ func cloneCoordinatorSnapshotEvaluation(in coordinatorSnapshotEvaluation) coordi
 	out.ParentSafety.PendingOutsidePrimary = in.ParentSafety.PendingOutsidePrimary.Clone()
 	out.ParentSafety.PendingInsideReclaim = in.ParentSafety.PendingInsideReclaim.Clone()
 	out.ParentSafety.PrimaryReclaimOverlap = in.ParentSafety.PrimaryReclaimOverlap.Clone()
+	out.ParentSafety.PendingScopeDeficit = cloneCPUSetMap(in.ParentSafety.PendingScopeDeficit)
 	out.ParentSafety.RequiredFloorDeficit = cloneCPUSetMap(in.ParentSafety.RequiredFloorDeficit)
 	out.ParentSafety.UnsafeRequiredRels = cloneRelConvergences(in.ParentSafety.UnsafeRequiredRels)
 	out.ParentSafety.DeferredLeafMismatches = cloneRelConvergences(in.ParentSafety.DeferredLeafMismatches)
@@ -1022,6 +1031,9 @@ func normalizeCoordinatorSnapshotEvaluation(in coordinatorSnapshotEvaluation) co
 	if out.ParentSafety.RequiredFloorDeficit == nil {
 		out.ParentSafety.RequiredFloorDeficit = make(map[string]machine.CPUSet)
 	}
+	if out.ParentSafety.PendingScopeDeficit == nil {
+		out.ParentSafety.PendingScopeDeficit = make(map[string]machine.CPUSet)
+	}
 	sortRelConvergences(out.Report.NonConvergedTargets)
 	sortRelConvergences(out.ParentSafety.UnsafeRequiredRels)
 	sortRelConvergences(out.ParentSafety.DeferredLeafMismatches)
@@ -1167,6 +1179,7 @@ func writeFrozenCoordinatorEvaluationInputHash(
 	writeCPUSetMapHash(hash, in.DeferredByRel)
 	writeRelSetHash(hash, in.DeferredCleanupRels)
 	writeHashString(hash, in.ProtectedPending.String())
+	writeCPUSetMapHash(hash, in.PendingRequiredByRel)
 	writeHashUint64(hash, hierarchyCapabilitiesBits(in.Capabilities))
 	writeHashUint64(hash, boolUint64(in.AllowEmptyTarget))
 }
@@ -1186,6 +1199,7 @@ func writeCoordinatorSnapshotEvaluationHash(
 	writeHashString(hash, evaluation.ParentSafety.PendingOutsidePrimary.String())
 	writeHashString(hash, evaluation.ParentSafety.PendingInsideReclaim.String())
 	writeHashString(hash, evaluation.ParentSafety.PrimaryReclaimOverlap.String())
+	writeCPUSetMapHash(hash, evaluation.ParentSafety.PendingScopeDeficit)
 	writeCPUSetMapHash(hash, evaluation.ParentSafety.RequiredFloorDeficit)
 	writeRelConvergencesHash(hash, evaluation.ParentSafety.UnsafeRequiredRels)
 	writeRelConvergencesHash(hash, evaluation.ParentSafety.DeferredLeafMismatches)

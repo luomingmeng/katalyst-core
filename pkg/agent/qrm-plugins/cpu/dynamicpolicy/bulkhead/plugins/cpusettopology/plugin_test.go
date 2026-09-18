@@ -1316,6 +1316,12 @@ func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t
 					BulkheadReclaimRelPaths: []string{"reclaim"},
 				},
 				cgroup: cg,
+				pendingProtections: map[string]pendingPodProtection{
+					podUID: {
+						rel:          "primary",
+						protectUntil: time.Now().Add(defaultPendingPodProtectionTTL),
+					},
+				},
 			}
 			dedicatedIdentity := model.CPUSetPoolIdentity{
 				Kind:         model.CPUSetPoolKindDedicated,

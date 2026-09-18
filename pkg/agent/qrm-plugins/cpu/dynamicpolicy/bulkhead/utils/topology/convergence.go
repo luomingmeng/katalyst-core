@@ -65,6 +65,7 @@ func evaluateCoordinatorSnapshot(
 	deferredByRel map[string]machine.CPUSet,
 	deferredMismatchRels map[string]struct{},
 	protectedPending machine.CPUSet,
+	pendingRequiredByRel map[string]machine.CPUSet,
 	capabilities HierarchyCapabilities,
 	allowEmptyTarget bool,
 ) (coordinatorSnapshotEvaluation, error) {
@@ -79,9 +80,9 @@ func evaluateCoordinatorSnapshot(
 	includeMaterializedDynamicConvergence(&report, snapshot, deferredByRel, capabilities)
 	return coordinatorSnapshotEvaluation{
 		Report: report,
-		ParentSafety: buildParentSafetyReportWithRequired(
+		ParentSafety: buildParentSafetyReportWithScopedPending(
 			snapshot, dag, parentSafetyTargetByRel, report, protectedPending,
-			requiredByRel, deferredByRel, deferredMismatchRels, capabilities,
+			pendingRequiredByRel, requiredByRel, deferredByRel, deferredMismatchRels, capabilities,
 		),
 	}, nil
 }

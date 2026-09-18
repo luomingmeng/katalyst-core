@@ -130,10 +130,10 @@ type PlanOperation struct {
 }
 
 type AdmissionSafetyInput struct {
-	ProtectedPendingCPUSet machine.CPUSet
-	PendingRequiredByRel   map[string]machine.CPUSet
-	DeferredCPUSetByRel    map[string]machine.CPUSet
-	RequiredCPUSetByRel    map[string]machine.CPUSet
+	PendingCPUSet        machine.CPUSet
+	PendingRequiredByRel map[string]machine.CPUSet
+	DeferredCPUSetByRel  map[string]machine.CPUSet
+	RequiredCPUSetByRel  map[string]machine.CPUSet
 }
 
 // SplitPlanForAdmission returns an executable safety closure and a summary-only
@@ -169,8 +169,8 @@ func SplitPlanForAdmission(plan *PhasePlan, in AdmissionSafetyInput) (required, 
 		}
 		switch {
 		case operation.Direction == WriteShrink &&
-			!operation.ExpectedCurrent.CPUs.Intersection(in.ProtectedPendingCPUSet).IsEmpty() &&
-			operation.Target.CPUs.Intersection(in.ProtectedPendingCPUSet).IsEmpty():
+			!operation.ExpectedCurrent.CPUs.Intersection(in.PendingCPUSet).IsEmpty() &&
+			operation.Target.CPUs.Intersection(in.PendingCPUSet).IsEmpty():
 			classes[i] = operationClass{required: true, requirement: OperationAdmissionSourceDrain}
 		case operation.Direction == WriteShrink &&
 			!removedCPUs.Intersection(outgoingCPUsBySource[operationDomain]).IsEmpty():
@@ -178,11 +178,6 @@ func SplitPlanForAdmission(plan *PhasePlan, in AdmissionSafetyInput) (required, 
 		case operation.Direction == WriteGrow &&
 			!operation.Target.CPUs.Difference(operation.ExpectedCurrent.CPUs).
 				Intersection(in.PendingRequiredByRel[operation.Rel]).IsEmpty():
-			classes[i] = operationClass{required: true, requirement: OperationAdmissionAncestorGrow}
-		case len(in.PendingRequiredByRel) == 0 &&
-			operation.Direction == WriteGrow &&
-			!operation.Target.CPUs.Difference(operation.ExpectedCurrent.CPUs).
-				Intersection(in.ProtectedPendingCPUSet).IsEmpty():
 			classes[i] = operationClass{required: true, requirement: OperationAdmissionAncestorGrow}
 		case operation.Direction == WriteGrow &&
 			!addedCPUs.Intersection(incomingCPUsByDestination[operationDomain]).IsEmpty():

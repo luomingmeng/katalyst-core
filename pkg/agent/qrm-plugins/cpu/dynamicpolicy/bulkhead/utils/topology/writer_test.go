@@ -1912,10 +1912,14 @@ func TestTopologyCoordinatorConvergePreShrinksReclaimBeforePendingPrimaryGrow(t 
 	}
 
 	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
-		DAG:                    dag,
-		Cgroup:                 cg,
-		CPUDetails:             testCPUDetails(),
-		ProtectedPendingCPUSet: machine.NewCPUSet(6),
+		DAG:        dag,
+		Cgroup:     cg,
+		CPUDetails: testCPUDetails(),
+		PendingProtections: []PendingProtection{{
+			ScopeRel: "kubepods/pod-pending",
+			CPUs:     machine.NewCPUSet(6),
+			PodUID:   "pod-pending",
+		}},
 	})
 	if err != nil {
 		t.Fatalf("TopologyCoordinatorConverge: %v; writes=%#v", err, cg.writes)
@@ -1961,10 +1965,14 @@ func TestTopologyCoordinatorConvergePreShrinksReclaimSiblingBeforePendingPrimary
 	}
 
 	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
-		DAG:                    dag,
-		Cgroup:                 cg,
-		CPUDetails:             testCPUDetails(),
-		ProtectedPendingCPUSet: machine.NewCPUSet(6),
+		DAG:        dag,
+		Cgroup:     cg,
+		CPUDetails: testCPUDetails(),
+		PendingProtections: []PendingProtection{{
+			ScopeRel: "kubepods/pod-pending",
+			CPUs:     machine.NewCPUSet(6),
+			PodUID:   "pod-pending",
+		}},
 	})
 	if err != nil {
 		t.Fatalf("TopologyCoordinatorConverge: %v; writes=%#v", err, cg.writes)
@@ -2545,7 +2553,7 @@ func TestComputeEffectiveTargetsDoesNotProtectPodParentOrSandboxFullCPUSet(t *te
 	if err != nil {
 		t.Fatalf("BuildDAG: %v", err)
 	}
-	effective, err := computeEffectiveTargets(dag, false, nil, machine.NewCPUSet())
+	effective, err := computeEffectiveTargets(dag, false, nil, nil)
 	if err != nil {
 		t.Fatalf("computeEffectiveTargets: %v", err)
 	}
@@ -2556,7 +2564,7 @@ func TestComputeEffectiveTargetsDoesNotProtectPodParentOrSandboxFullCPUSet(t *te
 
 // TestTopologyCoordinatorConvergeWidensPrimaryEffectiveTargetForPendingAllocation verifies that
 // an admit-window container (allocation known, no cgroup leaf yet) folded in via
-// ProtectedPendingCPUSet also widens the primary effective target, so the parent
+// PendingProtections also widens the scoped primary effective target, so the parent
 // never shrinks below an allocation that is about to materialize.
 func TestTopologyCoordinatorConvergeWidensPrimaryEffectiveTargetForPendingAllocation(t *testing.T) {
 	t.Parallel()
@@ -2569,10 +2577,14 @@ func TestTopologyCoordinatorConvergeWidensPrimaryEffectiveTargetForPendingAlloca
 	cg.cpus["kubepods"] = machine.NewCPUSet(1, 2, 9)
 
 	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
-		DAG:                    dag,
-		Cgroup:                 cg,
-		CPUDetails:             testCPUDetails(),
-		ProtectedPendingCPUSet: machine.NewCPUSet(9),
+		DAG:        dag,
+		Cgroup:     cg,
+		CPUDetails: testCPUDetails(),
+		PendingProtections: []PendingProtection{{
+			ScopeRel: "kubepods/pod-pending",
+			CPUs:     machine.NewCPUSet(9),
+			PodUID:   "pod-pending",
+		}},
 	})
 	if err != nil {
 		t.Fatalf("TopologyCoordinatorConverge: %v", err)
@@ -2639,7 +2651,7 @@ func TestTopologyCoordinatorConvergePropagatesProtectedRelToPrimaryAndDeductsRec
 	if err != nil {
 		t.Fatalf("BuildDAG: %v", err)
 	}
-	effective, err := computeEffectiveTargets(dag, false, nil, machine.NewCPUSet(), map[string]machine.CPUSet{
+	effective, err := computeEffectiveTargets(dag, false, nil, nil, map[string]machine.CPUSet{
 		"kubepods/podA": machine.NewCPUSet(2, 3),
 	})
 	if err != nil {

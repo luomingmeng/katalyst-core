@@ -294,11 +294,17 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 		emitBulkheadPruneResult(in.Emitter, "skipped", "container_error")
 		return fmt.Errorf("build expected container cpuset: %w", err)
 	}
+	protections, err := p.pendingProtectionScopes(ctx, expectedRes.PendingByPod)
+	if err != nil {
+		emitBulkheadPruneResult(in.Emitter, "skipped", "pending_scope_error")
+		return fmt.Errorf("resolve pending protection scopes: %w", err)
+	}
+	protectedPending := pendingProtectionCPUSetUnion(protections)
 	protectedByRel := p.pendingProtectedCPUSetByRel(ctx, expectedRes.PendingByPod)
 	if deadlineErr := admissionStageDeadlineError(ctx, "protect pending container cpuset"); deadlineErr != nil {
 		return deadlineErr
 	}
-	if protected := expectedRes.PendingCPUSetUnion().Union(unionCPUSetByRel(protectedByRel)); topologyCoversProtectedView(in.Topology, in.DesiredView, protected) {
+	if protected := protectedPending.Union(unionCPUSetByRel(protectedByRel)); topologyCoversProtectedView(in.Topology, in.DesiredView, protected) {
 		general.InfofV(5, "bulkhead: applying transient pending protection, pending_count=%d protected_rel_count=%d protected_union=%s protected_by_rel=%s desired_reclaim=%s desired_reclaim_per_numa=%s reclaim_before=%s reclaim_per_numa_before=%s",
 			len(expectedRes.PendingByPod), len(protectedByRel), protected.String(), formatCPUSetByRel(protectedByRel),
 			in.DesiredView.DesiredReclaimEffective.String(), formatCPUSetByNUMA(in.DesiredView.DesiredReclaimEffectivePerNUMA),
@@ -358,8 +364,8 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 	}
 	p.drainSafeDeferredLeaves(ctx, in.DesiredView, dag)
 	general.InfofV(5, "cpuset_topology: apply start specs=%d siblings=%d expected_leaf_count=%d pending_count=%d protected_pending=%s protected_rel_count=%d",
-		len(specs), len(siblings), len(expectedRes.ExpectedByRel), len(expectedRes.PendingByPod),
-		expectedRes.PendingCPUSetUnion().String(), len(protectedByRel))
+		len(specs), len(siblings), len(expectedRes.ExpectedByRel), len(protections),
+		protectedPending.String(), len(protectedByRel))
 	reservedCPUSet := in.DesiredView.Reserve
 	objective := topology.ConvergenceObjectiveFull
 	if p.cfg.EnableAdmissionLeafDefer && in.Mode.OrFullDefault() == cpusetutil.CPUSetAdjustmentModeAdmission {
@@ -390,8 +396,8 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 		AdmissionBudget: &topology.AdmissionConvergenceBudget{
 			MaxRequiredWrites: p.cfg.AdmissionMaxRequiredWrites,
 		},
-		ProtectedPendingCPUSet: expectedRes.PendingCPUSetUnion(),
-		ProtectedCPUSetByRel:   protectedByRel,
+		PendingProtections:   protections,
+		ProtectedCPUSetByRel: protectedByRel,
 		PublishFinalSnapshot: func(snapshot *topology.CompleteSnapshot) error {
 			appliedView, err := appliedViewFromFinalSnapshotWithContext(
 				ctx, in.MetaServer, in.DesiredView, dag, snapshot,
@@ -421,8 +427,8 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 	})
 	general.Infof("cpuset_topology: coordinator converge finished duration=%s err=%v attempted=%d applied=%d skipped=%d failed=%d deferred=%d converged=%t final_snapshot_current=%t state=%s expected_leaf_count=%d pending_count=%d pending_cpu_count=%d protected_rel_count=%d specs=%d siblings=%d",
 		time.Since(convergeStart), err, res.Attempted, res.Applied, res.Skipped, res.Failed, res.Deferred,
-		res.Converged, res.FinalSnapshotCurrent, res.State, len(expectedRes.ExpectedByRel), len(expectedRes.PendingByPod),
-		expectedRes.PendingCPUSetUnion().Size(), len(protectedByRel), len(specs), len(siblings))
+		res.Converged, res.FinalSnapshotCurrent, res.State, len(expectedRes.ExpectedByRel), len(protections),
+		protectedPending.Size(), len(protectedByRel), len(specs), len(siblings))
 	if err != nil {
 		emitBulkheadTopologySummary(in.Emitter, "normal", res, err)
 		emitBulkheadPruneResult(in.Emitter, "skipped", "dag_error")
@@ -853,21 +859,20 @@ func (p *CPUSetTopologyPlugin) reconcileDisabledOnce(
 	}
 	var finalAppliedView *model.AppliedView
 	res, err := (topology.TopologyCoordinator{}).Converge(ctx, topology.CoordinatorInput{
-		DAG:                    dag,
-		Cgroup:                 p.cgroup,
-		Mode:                   topology.NormalModeGuardWithGate(p.sharedModeGate()),
-		Budget:                 topologyBudgetFromConfig(p.cfg.TopologyConvergenceBudget),
-		DrainSelection:         topologyDrainSelectionFromConfig(p.cfg.TopologyDrainSelection),
-		CPUDetails:             cpuDetails,
-		ReservedCPUSet:         in.DesiredView.Reserve,
-		ExpectedCPUSetByRel:    expected,
-		DeferredCPUSetByRel:    deferred,
-		ProtectedCPUSetByRel:   protected,
-		ProtectedPendingCPUSet: machine.NewCPUSet(),
-		TraversalBoundaries:    absentBoundaries,
-		RequiredIdentityByRel:  requiredIdentities,
-		ExpectedAbsentRels:     absentBoundaries,
-		Objective:              topology.ConvergenceObjectiveFull,
+		DAG:                   dag,
+		Cgroup:                p.cgroup,
+		Mode:                  topology.NormalModeGuardWithGate(p.sharedModeGate()),
+		Budget:                topologyBudgetFromConfig(p.cfg.TopologyConvergenceBudget),
+		DrainSelection:        topologyDrainSelectionFromConfig(p.cfg.TopologyDrainSelection),
+		CPUDetails:            cpuDetails,
+		ReservedCPUSet:        in.DesiredView.Reserve,
+		ExpectedCPUSetByRel:   expected,
+		DeferredCPUSetByRel:   deferred,
+		ProtectedCPUSetByRel:  protected,
+		TraversalBoundaries:   absentBoundaries,
+		RequiredIdentityByRel: requiredIdentities,
+		ExpectedAbsentRels:    absentBoundaries,
+		Objective:             topology.ConvergenceObjectiveFull,
 		PublishFinalSnapshot: func(snapshot *topology.CompleteSnapshot) error {
 			current, err := topology.ObserveConfiguredRels(ctx, p.cgroup, configured)
 			if err != nil {
@@ -1797,6 +1802,14 @@ func unionCPUSetByRel(byRel map[string]machine.CPUSet) machine.CPUSet {
 	union := machine.NewCPUSet()
 	for _, cpus := range byRel {
 		union = union.Union(cpus)
+	}
+	return union
+}
+
+func pendingProtectionCPUSetUnion(protections []topology.PendingProtection) machine.CPUSet {
+	union := machine.NewCPUSet()
+	for _, protection := range protections {
+		union = union.Union(protection.CPUs)
 	}
 	return union
 }

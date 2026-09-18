@@ -37,15 +37,15 @@ func desiredTargets(dag *TopoDAG) map[string]machine.CPUSet {
 //
 // The normalization order is fixed:
 //  1. initialize desired target from DAG nodes
-//  2. widen primary targets with protected pending/current CPUs
+//  2. widen primary targets with scoped pending/current CPUs
 //  3. deduct primary effective targets from reclaim roles
 //  4. widen reclaim parents to contain NUMA bucket targets
 //  5. validate primary/reclaim no-overlap
 //  6. validate reclaim NUMA bucket sibling disjointness
 //  7. validate reclaim NUMA bucket target belongs to its NUMA node
-func computeEffectiveTargets(dag *TopoDAG, allowEmptyTarget bool, cpuDetails machine.CPUDetails, protectedPending machine.CPUSet, protectedByRel ...map[string]machine.CPUSet) (map[string]machine.CPUSet, error) {
+func computeEffectiveTargets(dag *TopoDAG, allowEmptyTarget bool, cpuDetails machine.CPUDetails, pendingRequiredByRel map[string]machine.CPUSet, protectedByRel ...map[string]machine.CPUSet) (map[string]machine.CPUSet, error) {
 	effective := desiredTargets(dag)
-	widenPrimaryTargetsWithProtectedCPUs(dag, effective, allowEmptyTarget, protectedPending, protectedByRel...)
+	widenPrimaryTargetsWithScopedProtections(dag, effective, allowEmptyTarget, pendingRequiredByRel, protectedByRel...)
 	normalizeReclaimTargetsByPrimary(dag, effective)
 	normalizeReclaimParentContainsNUMABuckets(dag, effective)
 	if err := validateNoPrimaryReclaimOverlap(dag, effective); err != nil {
@@ -60,7 +60,7 @@ func computeEffectiveTargets(dag *TopoDAG, allowEmptyTarget bool, cpuDetails mac
 	return effective, nil
 }
 
-func widenPrimaryTargetsWithProtectedCPUs(dag *TopoDAG, effective map[string]machine.CPUSet, allowEmptyTarget bool, protectedPending machine.CPUSet, protectedByRel ...map[string]machine.CPUSet) {
+func widenPrimaryTargetsWithScopedProtections(dag *TopoDAG, effective map[string]machine.CPUSet, allowEmptyTarget bool, pendingRequiredByRel map[string]machine.CPUSet, protectedByRel ...map[string]machine.CPUSet) {
 	var protected map[string]machine.CPUSet
 	if len(protectedByRel) > 0 {
 		protected = protectedByRel[0]
@@ -74,10 +74,7 @@ func widenPrimaryTargetsWithProtectedCPUs(dag *TopoDAG, effective map[string]mac
 		if allowEmptyTarget && n.CPUs.IsEmpty() {
 			continue
 		}
-		protectedUnion := machine.NewCPUSet()
-		if !protectedPending.IsEmpty() {
-			protectedUnion = protectedUnion.Union(protectedPending)
-		}
+		protectedUnion := pendingRequiredByRel[n.Rel].Clone()
 		for rel, cpus := range protected {
 			if cpus.IsEmpty() || !isRelAtOrUnder(rel, n.Rel) {
 				continue

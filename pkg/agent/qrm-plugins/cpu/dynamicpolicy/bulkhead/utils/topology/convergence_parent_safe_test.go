@@ -90,6 +90,7 @@ func TestBuildParentSafetyReportAllowsOnlySafeDeferredLeafSuperset(t *testing.T)
 		map[string]machine.CPUSet{"primary/pod/container": machine.NewCPUSet(1)},
 		nil,
 		machine.NewCPUSet(1),
+		nil,
 		HierarchyCapabilities{},
 		false,
 	)

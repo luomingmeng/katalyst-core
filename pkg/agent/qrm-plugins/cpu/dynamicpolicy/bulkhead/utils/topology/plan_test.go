@@ -39,7 +39,10 @@ func TestSplitPlanForAdmissionClassifiesRequiredAndDeferredWithoutLoss(t *testin
 		},
 	}
 	required, deferred, err := SplitPlanForAdmission(plan, AdmissionSafetyInput{
-		ProtectedPendingCPUSet: machine.NewCPUSet(1),
+		PendingCPUSet: machine.NewCPUSet(1),
+		PendingRequiredByRel: map[string]machine.CPUSet{
+			"primary/pod": machine.NewCPUSet(1),
+		},
 		DeferredCPUSetByRel: map[string]machine.CPUSet{
 			"primary/pod/container": machine.NewCPUSet(0, 1),
 		},
@@ -235,7 +238,7 @@ func TestFinalAdmissionTargetPreservesCanonicalTargetOverIntermediateDrainOperat
 	}
 
 	required, _, err := SplitPlanForAdmission(plan, AdmissionSafetyInput{
-		ProtectedPendingCPUSet: machine.NewCPUSet(2),
+		PendingCPUSet: machine.NewCPUSet(2),
 	})
 	if err != nil {
 		t.Fatalf("SplitPlanForAdmission() error = %v", err)
