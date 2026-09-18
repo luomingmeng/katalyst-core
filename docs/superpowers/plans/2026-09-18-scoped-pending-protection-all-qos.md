@@ -329,10 +329,11 @@ For each pending Pod:
 
 1. retain a previously proved cached relation when present;
 2. otherwise use native Kubernetes QoS retained in allocation metadata from the
-   kubelet request, falling back to the cached Pod specification only when it is
-   already visible, and generate candidates from the corresponding canonical
-   configured root; unknown QoS retains all roots and therefore cannot bypass
-   ambiguity checks;
+   kubelet request; when an older kubelet leaves that field empty, force one
+   fresh kubelet Pod-cache synchronization and derive QoS from the refreshed
+   Pod specification, then generate candidates from the corresponding
+   canonical configured root; unknown QoS retains all roots and therefore
+   cannot bypass ambiguity checks;
 3. after DAG construction, select the sole candidate under the deepest
    controlled-primary ancestor;
 4. fail closed on no match or ambiguity;

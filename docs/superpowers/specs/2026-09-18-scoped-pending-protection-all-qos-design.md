@@ -105,8 +105,10 @@ The plugin resolves each pending Pod in this order:
 
 1. Use the existing Pod relative cgroup path when it is available.
 2. Otherwise read the native Kubernetes QoS class retained in the committed
-   allocation metadata from the kubelet request. The metaserver Pod is only a
-   fallback because its cache may not contain a newly admitted Pod yet. Ask
+   allocation metadata from the kubelet request. When an older kubelet leaves
+   that field empty, force one fresh kubelet Pod-cache synchronization before
+   reading the Pod specification; an ordinary cached lookup is insufficient
+   during cold admission. Ask
    `pkg/util/cgroup/common` for the pure candidates implied by the canonical
    configured root for that class. This prevents the Guaranteed, Burstable, and
    BestEffort roots from becoming artificial equal-depth alternatives.
