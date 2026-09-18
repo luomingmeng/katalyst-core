@@ -1729,24 +1729,25 @@ func (p *CPUSetTopologyPlugin) pendingProtectionScopes(
 	if p.pendingProtections == nil {
 		p.pendingProtections = map[string]pendingPodProtection{}
 	}
+
 	now := p.now()
 	aggregated := make(map[string]pendingContainerCPUSet, len(pendingByPod))
 	active := make(map[string]struct{}, len(pendingByPod))
 	for _, pending := range pendingByPod {
 		active[pending.PodUID] = struct{}{}
-		current := aggregated[pending.PodUID]
-		if current.PodUID == "" {
-			current = pending
-		} else {
-			current.CPUs = current.CPUs.Union(pending.CPUs)
+		current, ok := aggregated[pending.PodUID]
+		if !ok {
+			aggregated[pending.PodUID] = pending
+			continue
 		}
+		current.CPUs = current.CPUs.Union(pending.CPUs)
 		aggregated[pending.PodUID] = current
 	}
 
 	out := make([]topology.PendingProtection, 0, len(aggregated))
 	for podUID, pending := range aggregated {
-		protection := p.pendingProtections[podUID]
-		if protection.protectUntil.IsZero() || !now.Before(protection.protectUntil) {
+		protection, ok := p.pendingProtections[podUID]
+		if !ok || !now.Before(protection.protectUntil) {
 			protection.protectUntil = now.Add(defaultPendingPodProtectionTTL)
 		}
 		rel := protection.rel
@@ -1754,7 +1755,7 @@ func (p *CPUSetTopologyPlugin) pendingProtectionScopes(
 			var err error
 			rel, err = cgcommon.GetPodRelativeCgroupPath(podUID)
 			if err != nil {
-				return nil, fmt.Errorf("resolve pending pod %q scope: %w", podUID, err)
+				return nil, fmt.Errorf("resolve pending pod scope %q: %w", podUID, err)
 			}
 		}
 		rel = path.Clean(strings.Trim(rel, "/"))
