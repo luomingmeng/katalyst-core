@@ -1472,7 +1472,38 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in 
 							pending.NativeQOSClass = v1.PodQOSClass(allocation.NativeQOSClass)
 						}
 					}
-					if pending.NativeQOSClass == "" {
+					if metapod.IsPodNotFound(err) {
+						refreshCtx := context.WithValue(ctx, metapod.BypassCacheKey, metapod.BypassCacheTrue)
+						pod, podErr := in.MetaServer.GetPod(refreshCtx, podUID)
+						switch {
+						case podErr == nil && pod == nil:
+							errs = append(errs, fmt.Errorf(
+								"fresh pod lookup returned nil pod without error: pod=%s container=%s",
+								podUID, containerName))
+							continue
+						case podErr == nil:
+							pending.NativeQOSClass = v1qos.GetPodQOS(pod)
+						case !metapod.IsPodNotFound(podErr):
+							errs = append(errs, fmt.Errorf(
+								"fresh pod lookup failed: pod=%s container=%s: %w",
+								podUID, containerName, podErr))
+							continue
+						default:
+							exists, existsErr := p.pendingPodCgroupExists(
+								ctx, podUID, pending.NativeQOSClass)
+							if existsErr != nil {
+								errs = append(errs, fmt.Errorf(
+									"check pod cgroup after fresh pod not found: pod=%s container=%s: %w",
+									podUID, containerName, existsErr))
+								continue
+							}
+							if !exists {
+								general.Infof("bulkhead: stale checkpoint allocation skipped from pending protection, pod=%q container=%q cpuset=%s",
+									podUID, containerName, cpus.String())
+								continue
+							}
+						}
+					} else if pending.NativeQOSClass == "" {
 						refreshCtx := context.WithValue(ctx, metapod.BypassCacheKey, metapod.BypassCacheTrue)
 						pod, podErr := in.MetaServer.GetPod(refreshCtx, podUID)
 						if podErr == nil && pod != nil {
@@ -1508,6 +1539,29 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in 
 		return nil, apierrors.NewAggregate(errs)
 	}
 	return out, nil
+}
+
+func (p *CPUSetTopologyPlugin) pendingPodCgroupExists(
+	ctx context.Context,
+	podUID string,
+	qosClass v1.PodQOSClass,
+) (bool, error) {
+	if p.cgroup == nil {
+		return false, fmt.Errorf("cgroup client is nil")
+	}
+	candidates := cgcommon.GetPodRelativeCgroupPathCandidatesForQOS(podUID, qosClass)
+	for _, rel := range candidates {
+		rel = strings.Trim(rel, "/")
+		if rel == "" {
+			continue
+		}
+		if _, err := p.cgroup.StatDir(ctx, rel); err == nil {
+			return true, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return false, fmt.Errorf("stat pod cgroup candidate %q: %w", rel, err)
+		}
+	}
+	return false, nil
 }
 
 func (p *CPUSetTopologyPlugin) reclassifyAdmissionDeferredLeaves(ctx context.Context, view *model.DesiredView, expectedRes *expectedCPUSetBuildResult) {
