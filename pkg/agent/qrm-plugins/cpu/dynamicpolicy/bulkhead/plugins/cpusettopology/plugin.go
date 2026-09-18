@@ -409,6 +409,12 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 			if err != nil {
 				return fmt.Errorf("derive parent-safe applied view from final topology snapshot: %w", err)
 			}
+			// Final-snapshot classification can discover a materialized dynamic leaf
+			// that became a safe superset after the compile-time classification. Keep
+			// the observed proof for ParentSafe publication, but register its exact
+			// desired target so the post-publish drain does not leave the wider cpuset
+			// in place indefinitely.
+			p.recordDeferredLeafDrains(expectedRes.DeferredLeafByRel)
 			finalAppliedView = appliedView
 			return nil
 		},
@@ -567,14 +573,56 @@ func appliedViewFromFinalSnapshotWithDeferredCleanup(
 	if len(expectedCPUSetByRel) > 1 {
 		deferred = expectedCPUSetByRel[1]
 	}
+	// deferredCleanupRels is only non-nil on the ParentSafe publish path. There a
+	// dynamic container leaf may transiently keep a wider cpuset between compile
+	// and finalization, so publishing a safe superset is allowed as long as it
+	// stays inside the finalized primary domain and never overlaps reclaim. The
+	// full-convergence publish path leaves finalization.parentSafe false, keeping
+	// exact-match mandatory.
+	finalization := containerLeafFinalization{}
+	if deferredCleanupRels != nil {
+		finalization = containerLeafFinalization{
+			parentSafe:         true,
+			finalPrimaryDomain: applied.NonReclaimPool.Clone(),
+			finalReclaimDomain: applied.ReclaimEffective.Clone(),
+		}
+	}
 	containerCPUSetByPod, err := containerCPUSetByPodFromFinalSnapshotWithDeferredCleanup(
-		ctx, metaServer, desired, snapshot, expected, deferred, deferredCleanupRels)
+		ctx, metaServer, desired, snapshot, expected, deferred, deferredCleanupRels, finalization)
 	if err != nil {
 		return nil, err
 	}
 	applied.ContainerCPUSetByPod = containerCPUSetByPod
 	applied.PoolProjection = buildAppliedPoolProjection(model.AppliedViewLevelFull, desired, applied)
 	return applied, nil
+}
+
+// containerLeafFinalization carries the finalized topology domains that bound
+// which observed container-leaf cpusets may be published. It is only populated
+// with a permissive contract on the ParentSafe publish path; the full-convergence
+// publish path leaves parentSafe false so exact-match remains mandatory.
+type containerLeafFinalization struct {
+	parentSafe         bool
+	finalPrimaryDomain machine.CPUSet
+	finalReclaimDomain machine.CPUSet
+}
+
+// allowsSafeSuperset reports whether an observed container-leaf cpuset that is a
+// strict superset of the desired cpuset is still safe to publish under the
+// ParentSafe contract. A dynamic container leaf may transiently retain a wider
+// cpuset between compile and finalization; publishing that superset is safe only
+// when it stays inside the finalized primary domain and never overlaps reclaim.
+func (f containerLeafFinalization) allowsSafeSuperset(desired, observed machine.CPUSet) bool {
+	if !f.parentSafe {
+		return false
+	}
+	if !desired.IsSubsetOf(observed) {
+		return false
+	}
+	if !observed.IsSubsetOf(f.finalPrimaryDomain) {
+		return false
+	}
+	return observed.Intersection(f.finalReclaimDomain).IsEmpty()
 }
 
 func containerCPUSetByPodFromFinalSnapshotWithDeferredCleanup(
@@ -585,6 +633,7 @@ func containerCPUSetByPodFromFinalSnapshotWithDeferredCleanup(
 	expectedCPUSetByRel map[string]machine.CPUSet,
 	deferredCPUSetByRel map[string]machine.CPUSet,
 	deferredCleanupRels map[string]struct{},
+	finalization containerLeafFinalization,
 ) (map[string]map[string]machine.CPUSet, error) {
 	out := map[string]map[string]machine.CPUSet{}
 	if desired == nil || len(desired.ContainerCPUSetByPod) == 0 {
@@ -643,6 +692,16 @@ func containerCPUSetByPodFromFinalSnapshotWithDeferredCleanup(
 				}
 				if deferred, ok := deferredCPUSetByRel[rel]; ok &&
 					deferred.Equals(desiredCPUs) && desiredCPUs.IsSubsetOf(proof) {
+					if out[podUID] == nil {
+						out[podUID] = map[string]machine.CPUSet{}
+					}
+					out[podUID][containerName] = proof.Clone()
+					continue
+				}
+				if finalization.allowsSafeSuperset(desiredCPUs, proof) {
+					if deferredCPUSetByRel != nil {
+						deferredCPUSetByRel[rel] = desiredCPUs.Clone()
+					}
 					if out[podUID] == nil {
 						out[podUID] = map[string]machine.CPUSet{}
 					}

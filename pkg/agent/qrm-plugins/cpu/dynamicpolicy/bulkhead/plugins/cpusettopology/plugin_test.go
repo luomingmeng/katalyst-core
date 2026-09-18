@@ -3441,6 +3441,170 @@ func TestFinalSnapshotFailsClosedWhenIdentityRefreshFails(t *testing.T) {
 	}
 }
 
+// parentSafeDynamicLeafFixture builds a single dynamic container-leaf fixture
+// whose observed final-snapshot cpuset is provided by the caller, so the
+// ParentSafe safe-superset contract can be exercised in isolation.
+func parentSafeDynamicLeafFixture(
+	t *testing.T,
+	handlerName string,
+	podUID string,
+	containerID string,
+	rel string,
+	desiredCPUs machine.CPUSet,
+	observedCPUs machine.CPUSet,
+) (*metaserver.MetaServer, *model.DesiredView, *topology.CompleteSnapshot) {
+	t.Helper()
+	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+		Name: handlerName,
+		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
+			if gotPodUID == podUID && gotContainerID == containerID {
+				return rel, false, nil
+			}
+			return "", true, nil
+		},
+	})
+	fetcher := &bypassAwareContainerIDFetcher{cachedID: containerID, currentID: containerID}
+	metaServer := &metaserver.MetaServer{
+		MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
+	}
+	desired := model.NewDesiredView()
+	desired.ContainerCPUSetByPod[podUID] = map[string]machine.CPUSet{"main": desiredCPUs}
+	snapshot := &topology.CompleteSnapshot{Entries: map[string]topology.EntryState{
+		rel: {Identity: topology.CgroupIdentity{Inode: 1}, CPUs: observedCPUs},
+	}}
+	return metaServer, desired, snapshot
+}
+
+func TestParentSafeFinalizationPublishesDynamicLeafSafeSuperset(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID      = "pod-parentsafe-superset"
+		containerID = "container-parentsafe-superset"
+		rel         = "primary/container-parentsafe-superset"
+	)
+	desiredCPUs := machine.NewCPUSet(0, 1)
+	observedCPUs := machine.NewCPUSet(0, 1, 2, 3)
+	finalPrimary := machine.NewCPUSet(0, 1, 2, 3, 4, 5)
+	finalReclaim := machine.NewCPUSet(6, 7)
+	metaServer, desired, snapshot := parentSafeDynamicLeafFixture(
+		t, "parentsafe-superset", podUID, containerID, rel, desiredCPUs, observedCPUs)
+
+	deferredCPUSetByRel := map[string]machine.CPUSet{}
+	published, err := containerCPUSetByPodFromFinalSnapshotParentSafe(
+		context.Background(), metaServer, desired, snapshot,
+		nil, deferredCPUSetByRel, finalPrimary, finalReclaim)
+	if err != nil {
+		t.Fatalf("parent-safe dynamic leaf safe superset must publish: %v", err)
+	}
+	if got := published[podUID]["main"]; !got.Equals(observedCPUs) {
+		t.Fatalf("published dynamic leaf cpuset = %s, want observed superset %s",
+			got.String(), observedCPUs.String())
+	}
+	if got, ok := deferredCPUSetByRel[rel]; !ok || !got.Equals(desiredCPUs) {
+		t.Fatalf("deferred drain target = %s ok=%t, want exact desired %s", got.String(), ok, desiredCPUs.String())
+	}
+}
+
+func TestParentSafeFinalizationRejectsDynamicLeafOverlappingReclaim(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID      = "pod-parentsafe-reclaim-overlap"
+		containerID = "container-parentsafe-reclaim-overlap"
+		rel         = "primary/container-parentsafe-reclaim-overlap"
+	)
+	desiredCPUs := machine.NewCPUSet(0, 1)
+	// Observed superset reaches into the finalized reclaim domain, which is
+	// never a safe superset even on the ParentSafe path.
+	observedCPUs := machine.NewCPUSet(0, 1, 6)
+	finalPrimary := machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6)
+	finalReclaim := machine.NewCPUSet(6, 7)
+	metaServer, desired, snapshot := parentSafeDynamicLeafFixture(
+		t, "parentsafe-reclaim-overlap", podUID, containerID, rel, desiredCPUs, observedCPUs)
+
+	_, err := containerCPUSetByPodFromFinalSnapshotParentSafe(
+		context.Background(), metaServer, desired, snapshot,
+		nil, nil, finalPrimary, finalReclaim)
+	var staleErr *topology.PlanStaleError
+	if !errors.As(err, &staleErr) {
+		t.Fatalf("dynamic leaf overlapping reclaim must fail closed, got err = %v", err)
+	}
+}
+
+func TestParentSafeFinalizationRejectsDynamicLeafMissingDesiredCPU(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID      = "pod-parentsafe-missing-desired"
+		containerID = "container-parentsafe-missing-desired"
+		rel         = "primary/container-parentsafe-missing-desired"
+	)
+	desiredCPUs := machine.NewCPUSet(0, 1)
+	observedCPUs := machine.NewCPUSet(0, 2, 3)
+	finalPrimary := machine.NewCPUSet(0, 1, 2, 3, 4, 5)
+	finalReclaim := machine.NewCPUSet(6, 7)
+	metaServer, desired, snapshot := parentSafeDynamicLeafFixture(
+		t, "parentsafe-missing-desired", podUID, containerID, rel, desiredCPUs, observedCPUs)
+
+	_, err := containerCPUSetByPodFromFinalSnapshotParentSafe(
+		context.Background(), metaServer, desired, snapshot,
+		nil, nil, finalPrimary, finalReclaim)
+	var staleErr *topology.PlanStaleError
+	if !errors.As(err, &staleErr) {
+		t.Fatalf("dynamic leaf missing desired CPUs must fail closed, got err = %v", err)
+	}
+}
+
+func TestParentSafeFinalizationRejectsDynamicLeafExceedingPrimaryDomain(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID      = "pod-parentsafe-exceeds-primary"
+		containerID = "container-parentsafe-exceeds-primary"
+		rel         = "primary/container-parentsafe-exceeds-primary"
+	)
+	desiredCPUs := machine.NewCPUSet(0, 1)
+	// Observed superset includes CPU 9 which is outside the finalized primary
+	// domain and not part of reclaim; it must not be published.
+	observedCPUs := machine.NewCPUSet(0, 1, 9)
+	finalPrimary := machine.NewCPUSet(0, 1, 2, 3)
+	finalReclaim := machine.NewCPUSet(6, 7)
+	metaServer, desired, snapshot := parentSafeDynamicLeafFixture(
+		t, "parentsafe-exceeds-primary", podUID, containerID, rel, desiredCPUs, observedCPUs)
+
+	_, err := containerCPUSetByPodFromFinalSnapshotParentSafe(
+		context.Background(), metaServer, desired, snapshot,
+		nil, nil, finalPrimary, finalReclaim)
+	var staleErr *topology.PlanStaleError
+	if !errors.As(err, &staleErr) {
+		t.Fatalf("dynamic leaf exceeding primary domain must fail closed, got err = %v", err)
+	}
+}
+
+func TestFullConvergenceFinalizationRejectsDynamicLeafSuperset(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID      = "pod-full-converge-superset"
+		containerID = "container-full-converge-superset"
+		rel         = "primary/container-full-converge-superset"
+	)
+	desiredCPUs := machine.NewCPUSet(0, 1)
+	observedCPUs := machine.NewCPUSet(0, 1, 2, 3)
+	metaServer, desired, snapshot := parentSafeDynamicLeafFixture(
+		t, "full-converge-superset", podUID, containerID, rel, desiredCPUs, observedCPUs)
+
+	// The full-convergence publish path (parentSafe=false) must keep exact-match
+	// mandatory even when the observed cpuset would be a safe superset.
+	_, err := containerCPUSetByPodFromFinalSnapshotWithContext(
+		context.Background(), metaServer, desired, snapshot, nil)
+	var staleErr *topology.PlanStaleError
+	if !errors.As(err, &staleErr) {
+		t.Fatalf("full-convergence path must reject superset, got err = %v", err)
+	}
+}
+
 func TestCPUSetTopologyPluginTreatsRotatedContainerIdentityAsPending(t *testing.T) {
 	t.Parallel()
 
