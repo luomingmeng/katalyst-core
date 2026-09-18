@@ -284,28 +284,25 @@ func (w safeCPSetWriter) preflightFrozenTraceOperations(
 		return nil, fmt.Errorf("rebuild frozen trace DAG for preflight: %w", err)
 	}
 	physicalWritesBefore := w.physicalWriteCount()
-	fresh, err := BuildCompleteSnapshotForBoundary(
+	boundaryEvaluation, err := EvaluateFrozenBoundary(
 		ctx,
 		w.driver,
 		dag,
-		cloneScanBoundary(frozen.InitialSnapshot.ScanBoundary),
 		w.budget,
+		frozen.FrozenBoundary,
+		frozen.InitialSnapshot,
 	)
+	fresh := boundaryEvaluation.Snapshot
 	physicalWritesAfter := w.physicalWriteCount()
 	if err != nil {
 		err = fmt.Errorf("capture frozen trace preflight snapshot: %w", err)
+		if fresh != nil {
+			return nil, newFrozenInitialSnapshotDriftError(
+				fresh, frozen.InitialSnapshot, fresh.ID, err,
+				physicalWritesBefore, physicalWritesAfter)
+		}
 		return nil, wrapFrozenInitialPreflightError(
 			err, frozen.InitialSnapshot, physicalWritesBefore, physicalWritesAfter)
-	}
-	if fresh.ID != frozen.InitialSnapshot.ID {
-		return nil, newFrozenInitialSnapshotDriftError(
-			fresh,
-			frozen.InitialSnapshot,
-			fresh.ID,
-			fmt.Errorf("fresh preflight snapshot differs from frozen trace base"),
-			physicalWritesBefore,
-			physicalWritesAfter,
-		)
 	}
 
 	projection, err := newProjectedHierarchy(fresh, frozen.Capabilities)
@@ -359,10 +356,11 @@ func (w safeCPSetWriter) preflightFrozenTraceOperations(
 			})
 		}
 	}
-	if projection.snapshot.ID != frozen.FinalSnapshot.ID {
+	if err := evaluateFrozenBoundarySnapshot(
+		frozen.FrozenBoundary, frozen.FinalSnapshot, projection.snapshot,
+	); err != nil {
 		return nil, fmt.Errorf(
-			"frozen trace projected final snapshot drift: projected=%x expected=%x",
-			projection.snapshot.ID, frozen.FinalSnapshot.ID,
+			"frozen trace projected final boundary drift: %w", err,
 		)
 	}
 	return evidence, nil
@@ -537,24 +535,26 @@ func (r *coordinatorRound) proveFrozenTraceFinalState(
 	frozen *CompiledPhaseTrace,
 ) (frozenTraceFinalization, error) {
 	var finalization frozenTraceFinalization
-	fresh, err := BuildCompleteSnapshotForBoundary(
+	boundaryEvaluation, err := EvaluateFrozenBoundary(
 		ctx,
 		r.driver,
 		r.dag,
-		cloneScanBoundary(frozen.FinalSnapshot.ScanBoundary),
 		r.budget,
+		frozen.FrozenBoundary,
+		frozen.FinalSnapshot,
 	)
-	if err == nil && fresh.ID != frozen.FinalSnapshot.ID {
+	fresh := boundaryEvaluation.Snapshot
+	if err != nil {
 		err = &frozenFinalSnapshotDriftError{
 			current:  fresh,
 			expected: frozen.FinalSnapshot,
 			stale: &PlanStaleError{
 				Rel:       "controlled",
 				Direction: WritePublish,
-				Resource:  "final_snapshot",
+				Resource:  "final_boundary",
 				Current:   snapshotLogicalState(fresh),
 				Target:    snapshotLogicalState(frozen.FinalSnapshot),
-				Err:       fmt.Errorf("fresh final snapshot differs from frozen trace target"),
+				Err:       err,
 			},
 		}
 	}

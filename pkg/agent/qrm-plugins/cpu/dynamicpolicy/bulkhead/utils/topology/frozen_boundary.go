@@ -57,14 +57,9 @@ func compileFrozenBoundaryV1(
 	for _, spec := range input.DAGSpecs {
 		controlled[spec.Rel] = struct{}{}
 	}
-	relevant := input.AllowedCPUs.Clone()
-	relevant = relevant.Union(input.ProtectedPending)
+	relevant := input.ProtectedPending.Clone()
 	for _, values := range []map[string]machine.CPUSet{
-		input.TargetByRel,
-		input.ParentSafetyTargetByRel,
-		input.ExpectedByRel,
 		input.RequiredByRel,
-		input.DeferredByRel,
 		input.PendingRequiredByRel,
 	} {
 		for _, cpus := range values {
@@ -180,7 +175,36 @@ func EvaluateFrozenBoundary(
 	if err := evaluateFrozenBoundarySnapshot(boundary, expected, fresh); err != nil {
 		return FrozenBoundaryEvaluation{Snapshot: fresh}, err
 	}
-	return FrozenBoundaryEvaluation{Snapshot: fresh}, nil
+	return FrozenBoundaryEvaluation{
+		Snapshot: projectFrozenBoundarySnapshot(boundary, expected, fresh),
+	}, nil
+}
+
+func projectFrozenBoundarySnapshot(
+	boundary FrozenBoundary,
+	expected, current *CompleteSnapshot,
+) *CompleteSnapshot {
+	projected := CloneCompleteSnapshot(expected)
+	for _, rel := range boundary.ControlledRels {
+		projected.Entries[rel] = cloneEntryState(current.Entries[rel])
+		projected.Children[rel] = append([]ChildRef(nil), current.Children[rel]...)
+	}
+	for _, rel := range boundary.RelevantCPUHolders {
+		projected.Entries[rel] = cloneEntryState(current.Entries[rel])
+	}
+	projected.DomainUnion = make(map[DomainID]machine.CPUSet)
+	for rel, entry := range projected.Entries {
+		domain := projected.DomainByRel[rel]
+		projected.DomainUnion[domain] = projected.DomainUnion[domain].Union(entry.CPUs)
+	}
+	projected.ID = fingerprintSnapshot(projected)
+	return projected
+}
+
+func cloneEntryState(entry EntryState) EntryState {
+	entry.CPUs = entry.CPUs.Clone()
+	entry.ConfiguredCPUs = entry.ConfiguredCPUs.Clone()
+	return entry
 }
 
 func evaluateFrozenBoundarySnapshot(
@@ -228,7 +252,7 @@ func evaluateFrozenBoundarySnapshot(
 		}
 	}
 	sort.Strings(currentHolders)
-	if !reflect.DeepEqual(currentHolders, expectedHolders) {
+	if !equalStringSlices(currentHolders, expectedHolders) {
 		return frozenBoundaryStale(
 			"dynamic", fmt.Sprint(currentHolders), fmt.Sprint(expectedHolders),
 			fmt.Errorf("relevant CPU holder set changed"))

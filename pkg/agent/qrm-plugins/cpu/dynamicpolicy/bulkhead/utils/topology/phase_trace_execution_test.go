@@ -50,6 +50,52 @@ func TestTracePreflightRejectsInitialSnapshotDriftWithoutWrites(t *testing.T) {
 	require.Equal(t, initialState, driver.snapshot())
 }
 
+func TestTracePreflightAllowsUnrelatedDynamicSiblingChurn(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	fixture.driver.add(
+		"kubepods/besteffort/unrelated-parent",
+		CgroupIdentity{Device: 1, Inode: 1000}, "99", "1")
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(),
+		fixture.snapshot(),
+	)
+	require.NoError(t, err)
+	fixture.driver.add(
+		"kubepods/besteffort/unrelated-parent/churn",
+		CgroupIdentity{Device: 1, Inode: 1001}, "100", "1")
+
+	err = newTracePreflightWriter(fixture.driver).
+		preflightFrozenTrace(context.Background(), trace)
+
+	require.NoError(t, err)
+	require.Zero(t, fixture.driver.PhysicalWriteCount())
+}
+
+func TestTraceFinalizationAllowsUnrelatedDynamicSiblingChurn(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	fixture.driver.add(
+		"kubepods/besteffort/unrelated-parent",
+		CgroupIdentity{Device: 1, Inode: 1000}, "99", "1")
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(),
+		fixture.snapshot(),
+	)
+	require.NoError(t, err)
+	driver, _ := frozenBoundaryDriver(t, trace.FinalSnapshot, trace.EvaluationInput.DAGSpecs)
+	driver.add(
+		"kubepods/besteffort/unrelated-parent/churn",
+		CgroupIdentity{Device: 1, Inode: 1001}, "100", "1")
+	round := frozenExecutionRound(t, trace, driver)
+
+	finalization, err := round.proveFrozenTraceFinalState(context.Background(), trace)
+
+	require.NoError(t, err)
+	require.NotNil(t, finalization.snapshot)
+	require.True(t, finalization.evaluation.ParentSafety.Safe)
+}
+
 func TestTracePreflightWrapsExactBoundaryExpansionMismatchAsInitialDriftWithoutWrites(t *testing.T) {
 	fixture := newAdmissionTraceFixture(t)
 	fixture.configureStagedSMTTransferWithDynamicDescendant()

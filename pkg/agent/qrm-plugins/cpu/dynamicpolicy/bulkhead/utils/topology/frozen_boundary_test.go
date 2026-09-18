@@ -96,7 +96,7 @@ func TestEvaluateFrozenBoundaryAllowsUnrelatedDynamicSiblingChurn(t *testing.T) 
 
 	require.NoError(t, err)
 	require.NotNil(t, evaluation.Snapshot)
-	require.Contains(t, evaluation.Snapshot.Entries, "root/direct/new-unrelated")
+	require.NotContains(t, evaluation.Snapshot.Entries, "root/direct/new-unrelated")
 }
 
 func TestEvaluateFrozenBoundaryRejectsControlledRelDrift(t *testing.T) {
