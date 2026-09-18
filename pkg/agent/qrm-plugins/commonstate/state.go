@@ -111,6 +111,7 @@ func (am *AllocationMeta) Clone() *AllocationMeta {
 		PodRole:        am.PodRole,
 		PodType:        am.PodType,
 		QoSLevel:       am.QoSLevel,
+		NativeQOSClass: am.NativeQOSClass,
 		Labels:         general.DeepCopyMap(am.Labels),
 		Annotations:    general.DeepCopyMap(am.Annotations),
 	}
