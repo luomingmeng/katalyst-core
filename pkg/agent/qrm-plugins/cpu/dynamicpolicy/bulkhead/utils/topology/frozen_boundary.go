@@ -68,8 +68,9 @@ func compileFrozenBoundaryV1(
 	}
 	for _, phase := range phases {
 		for _, operation := range phase.Operations {
-			relevant = relevant.Union(operation.ExpectedCurrent.CPUs)
-			relevant = relevant.Union(operation.Target.CPUs)
+			transition := operation.ExpectedCurrent.CPUs.Difference(operation.Target.CPUs).
+				Union(operation.Target.CPUs.Difference(operation.ExpectedCurrent.CPUs))
+			relevant = relevant.Union(transition)
 		}
 	}
 

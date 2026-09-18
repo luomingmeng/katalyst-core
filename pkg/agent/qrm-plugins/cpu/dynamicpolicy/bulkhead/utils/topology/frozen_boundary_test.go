@@ -38,7 +38,7 @@ func TestCompileFrozenBoundaryV1ClassifiesControlledDirectChildrenAndRelevantHol
 		Name:     "direct",
 		Identity: CgroupIdentity{Device: 1, Inode: 2},
 	}}, boundary.DirectChildrenByRel["root"])
-	require.Equal(t, machine.MustParse("0-3"), boundary.RelevantCPUs)
+	require.Equal(t, machine.MustParse("0,2-3"), boundary.RelevantCPUs)
 	require.Equal(t, []string{"root/direct", "root/direct/holder"}, boundary.RelevantCPUHolders)
 }
 
@@ -76,7 +76,7 @@ func TestCloneFrozenBoundaryIsDeeplyIsolated(t *testing.T) {
 	require.Equal(t, []string{"root"}, cloned.ControlledRels)
 	require.Equal(t, "direct", cloned.DirectChildrenByRel["root"][0].Name)
 	require.Equal(t, []string{"root/direct", "root/direct/holder"}, cloned.RelevantCPUHolders)
-	require.Equal(t, "0-3", cloned.RelevantCPUs.String())
+	require.Equal(t, "0,2-3", cloned.RelevantCPUs.String())
 }
 
 func TestEvaluateFrozenBoundaryAllowsUnrelatedDynamicSiblingChurn(t *testing.T) {
@@ -130,13 +130,29 @@ func TestEvaluateFrozenBoundaryRejectsDirectChildChurn(t *testing.T) {
 	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
 }
 
+func TestEvaluateFrozenBoundaryRejectsDirectChildStateDrift(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+	driver.nodes["root/direct"].configuredMems = "1"
+	driver.nodes["root/direct"].mems = "1"
+
+	_, err = EvaluateFrozenBoundary(
+		context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+		boundary, snapshot)
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+}
+
 func TestEvaluateFrozenBoundaryRejectsRelevantCPUHolderDrift(t *testing.T) {
 	snapshot, input, phases := frozenBoundaryFixture()
 	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
 	require.NoError(t, err)
 	driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
-	driver.nodes["root/direct/holder"].configuredCPUs = machine.NewCPUSet(2)
-	driver.nodes["root/direct/holder"].cpus = machine.NewCPUSet(2)
+	driver.nodes["root/direct/holder"].configuredCPUs = machine.NewCPUSet(3)
+	driver.nodes["root/direct/holder"].cpus = machine.NewCPUSet(3)
 
 	_, err = EvaluateFrozenBoundary(
 		context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
@@ -201,7 +217,7 @@ func frozenBoundaryFixture() (*CompleteSnapshot, FrozenCoordinatorEvaluationInpu
 		},
 		"root/direct/holder": {
 			Rel: "root/direct/holder", Identity: identities["root/direct/holder"],
-			CPUs: machine.NewCPUSet(1), ConfiguredCPUs: machine.NewCPUSet(1),
+			CPUs: machine.NewCPUSet(2), ConfiguredCPUs: machine.NewCPUSet(2),
 			Mems: "0", ConfiguredMems: "0",
 		},
 		"root/direct/unrelated": {
