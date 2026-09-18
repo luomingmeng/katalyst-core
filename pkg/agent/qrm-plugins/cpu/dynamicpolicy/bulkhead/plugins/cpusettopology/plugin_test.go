@@ -704,7 +704,7 @@ func TestPendingProtectionScopesRetainExpectedPathsForAllQoS(t *testing.T) {
 				},
 			}
 
-			got, err := p.pendingProtectionScopes(context.Background(), []pendingContainerCPUSet{{
+			got, err := p.pendingProtectionScopes(context.Background(), nil, []pendingContainerCPUSet{{
 				PodUID: tt.podUID, ContainerName: "main", CPUs: tt.cpus,
 			}})
 
@@ -743,7 +743,7 @@ func TestPendingProtectionScopesUseExistingPodEvidence(t *testing.T) {
 		},
 	}
 
-	got, err := p.pendingProtectionScopes(context.Background(), []pendingContainerCPUSet{
+	got, err := p.pendingProtectionScopes(context.Background(), nil, []pendingContainerCPUSet{
 		{PodUID: podUID, ContainerName: "main", CPUs: machine.NewCPUSet(0, 1)},
 		{PodUID: podUID, ContainerName: "sidecar", CPUs: machine.NewCPUSet(2, 3)},
 	})
@@ -756,6 +756,41 @@ func TestPendingProtectionScopesUseExistingPodEvidence(t *testing.T) {
 		CPUs:     machine.NewCPUSet(0, 1, 2, 3),
 		PodUID:   podUID,
 		Source:   topology.PendingProtectionSourceExistingPod,
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("pending protections = %#v, want %#v", got, want)
+	}
+}
+
+func TestPendingProtectionScopesResolveColdPodFromDAGWithoutFilesystemEvidence(t *testing.T) {
+	t.Parallel()
+
+	const podUID = "cold-shared"
+	dag, err := topology.BuildDAG([]topology.NodeSpec{{
+		Rel:            "kubepods/burstable",
+		Role:           topology.TopoNodeRolePrimary,
+		Domain:         topology.DomainPrimary,
+		ControlledRoot: true,
+	}})
+	if err != nil {
+		t.Fatalf("BuildDAG() error = %v", err)
+	}
+	p := &CPUSetTopologyPlugin{
+		cgroup:             &fakeCgroupClient{},
+		pendingProtections: map[string]pendingPodProtection{},
+	}
+
+	got, err := p.pendingProtectionScopes(context.Background(), dag, []pendingContainerCPUSet{{
+		PodUID: podUID, ContainerName: "main", CPUs: machine.NewCPUSet(0, 1),
+	}})
+	if err != nil {
+		t.Fatalf("pendingProtectionScopes() error = %v", err)
+	}
+	want := []topology.PendingProtection{{
+		ScopeRel: "kubepods/burstable/podcold-shared",
+		CPUs:     machine.NewCPUSet(0, 1),
+		PodUID:   podUID,
+		Source:   topology.PendingProtectionSourceExpectedPod,
 	}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("pending protections = %#v, want %#v", got, want)

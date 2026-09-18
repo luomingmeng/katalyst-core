@@ -19,11 +19,17 @@ limitations under the License.
 package topology
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
+)
+
+var (
+	ErrNoControlledPrimaryCandidate        = errors.New("no candidate has a controlled primary ancestor")
+	ErrAmbiguousControlledPrimaryCandidate = errors.New("multiple candidates have equally deep controlled primary ancestors")
 )
 
 type TopoNodeRole string
@@ -177,6 +183,78 @@ func (d *TopoDAG) Nodes() []*TopoNode {
 	}
 	sort.Slice(out, func(i, j int) bool { return lessNode(out[i], out[j]) })
 	return out
+}
+
+// SelectUniqueControlledPrimaryCandidate selects the sole candidate covered by
+// the deepest controlled primary DAG node. It fails closed when no candidate is
+// covered or distinct candidates tie at the best ancestor depth.
+func (d *TopoDAG) SelectUniqueControlledPrimaryCandidate(candidates []string) (string, error) {
+	if d == nil {
+		return "", ErrNoControlledPrimaryCandidate
+	}
+
+	bestDepth := -1
+	best := make(map[string]struct{})
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		candidate = strings.Trim(strings.TrimSpace(candidate), "/")
+		if candidate == "" {
+			continue
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+
+		candidateDepth := -1
+		for _, node := range d.index {
+			if node == nil || node.Role != TopoNodeRolePrimary ||
+				node.Domain != DomainPrimary || !node.ControlledRoot {
+				continue
+			}
+			ancestor := strings.Trim(strings.TrimSpace(node.Rel), "/")
+			if ancestor == "" || (candidate != ancestor && !strings.HasPrefix(candidate, ancestor+"/")) {
+				continue
+			}
+			if depth := relDepth(ancestor); depth > candidateDepth {
+				candidateDepth = depth
+			}
+		}
+		if candidateDepth < 0 {
+			continue
+		}
+		switch {
+		case candidateDepth > bestDepth:
+			bestDepth = candidateDepth
+			best = map[string]struct{}{candidate: {}}
+		case candidateDepth == bestDepth:
+			best[candidate] = struct{}{}
+		}
+	}
+
+	if len(best) == 0 {
+		return "", ErrNoControlledPrimaryCandidate
+	}
+	if len(best) != 1 {
+		matches := make([]string, 0, len(best))
+		for candidate := range best {
+			matches = append(matches, candidate)
+		}
+		sort.Strings(matches)
+		return "", fmt.Errorf("%w: depth=%d candidates=%v",
+			ErrAmbiguousControlledPrimaryCandidate, bestDepth, matches)
+	}
+	for candidate := range best {
+		return candidate, nil
+	}
+	panic("unreachable")
+}
+
+func relDepth(rel string) int {
+	if rel == "" {
+		return 0
+	}
+	return len(strings.Split(rel, "/"))
 }
 
 func lessNode(a, b *TopoNode) bool {

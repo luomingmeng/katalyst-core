@@ -294,10 +294,45 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 		emitBulkheadPruneResult(in.Emitter, "skipped", "container_error")
 		return fmt.Errorf("build expected container cpuset: %w", err)
 	}
-	protections, err := p.pendingProtectionScopes(ctx, expectedRes.PendingByPod)
+	discoveredSiblings, err := p.discoverBulkheadReclaimSiblings(ctx, in.DesiredView)
+	if deadlineErr := admissionStageDeadlineError(ctx, "discover bulkhead reclaim siblings"); deadlineErr != nil {
+		return deadlineErr
+	}
+	if err != nil {
+		emitBulkheadPruneResult(in.Emitter, "skipped", "discover_error")
+		return fmt.Errorf("discover bulkhead reclaim siblings: %w", err)
+	}
+	siblings := p.mergeBulkheadReclaimSiblings(
+		discoveredSiblings,
+		p.configuredBulkheadReclaimSiblings(),
+		desiredCPUSetPartitionView(in.DesiredView),
+	)
+	var cpuDetails machine.CPUDetails
+	if in.Topology != nil {
+		cpuDetails = in.Topology.CPUDetails
+	}
+	specs, err := bulkheadutils.BuildTopologyNodeSpecsFromView(p.cfg, desiredCPUSetPartitionView(in.DesiredView), cpuDetails, siblings, relExists)
+	if deadlineErr := admissionStageDeadlineError(ctx, "build bulkhead topology inputs"); deadlineErr != nil {
+		return deadlineErr
+	}
+	if err != nil {
+		return fmt.Errorf("build bulkhead topology inputs: %w", err)
+	}
+	dag, err := topology.BuildDAG(specs)
+	if deadlineErr := admissionStageDeadlineError(ctx, "build bulkhead topology dag"); deadlineErr != nil {
+		return deadlineErr
+	}
+	if err != nil {
+		emitBulkheadPruneResult(in.Emitter, "skipped", "dag_error")
+		return fmt.Errorf("build bulkhead topology dag: %w", err)
+	}
+	protections, err := p.pendingProtectionScopes(ctx, dag, expectedRes.PendingByPod)
 	if err != nil {
 		emitBulkheadPruneResult(in.Emitter, "skipped", "pending_scope_error")
 		return fmt.Errorf("resolve pending protection scopes: %w", err)
+	}
+	if err := p.ensureBulkheadReclaimSiblingDirs(ctx, siblings); err != nil {
+		return fmt.Errorf("ensure bulkhead reclaim sibling cgroups: %w", err)
 	}
 	protectedPending := pendingProtectionCPUSetUnion(protections)
 	protectedByRel := p.pendingProtectedCPUSetByRel(ctx, expectedRes.PendingByPod)
@@ -324,44 +359,21 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 		if p.cfg.EnableAdmissionLeafDefer && in.Mode.OrFullDefault() == cpusetutil.CPUSetAdjustmentModeAdmission {
 			p.reclassifyAdmissionDeferredLeaves(ctx, in.DesiredView, expectedRes)
 		}
-	}
-	p.recordDeferredLeafDrains(expectedRes.DeferredLeafByRel)
-	discoveredSiblings, err := p.discoverBulkheadReclaimSiblings(ctx, in.DesiredView)
-	if deadlineErr := admissionStageDeadlineError(ctx, "discover bulkhead reclaim siblings"); deadlineErr != nil {
-		return deadlineErr
-	}
-	if err != nil {
-		emitBulkheadPruneResult(in.Emitter, "skipped", "discover_error")
-		return fmt.Errorf("discover bulkhead reclaim siblings: %w", err)
-	}
-	siblings := p.mergeBulkheadReclaimSiblings(
-		discoveredSiblings,
-		p.configuredBulkheadReclaimSiblings(),
-		desiredCPUSetPartitionView(in.DesiredView),
-	)
-	if err := p.ensureBulkheadReclaimSiblingDirs(ctx, siblings); err != nil {
-		return fmt.Errorf("ensure bulkhead reclaim sibling cgroups: %w", err)
-	}
-	var cpuDetails machine.CPUDetails
-	if in.Topology != nil {
-		cpuDetails = in.Topology.CPUDetails
-	}
-	specs, err := bulkheadutils.BuildTopologyNodeSpecsFromView(p.cfg, desiredCPUSetPartitionView(in.DesiredView), cpuDetails, siblings, relExists)
-	if deadlineErr := admissionStageDeadlineError(ctx, "build bulkhead topology inputs"); deadlineErr != nil {
-		return deadlineErr
-	}
-	if err != nil {
-		return fmt.Errorf("build bulkhead topology inputs: %w", err)
+		// Transient protection changes desired primary/reclaim CPU sets. Rebuild
+		// the DAG so the coordinator receives those updated targets while keeping
+		// scope resolution anchored to the already validated DAG boundary.
+		specs, err = bulkheadutils.BuildTopologyNodeSpecsFromView(
+			p.cfg, desiredCPUSetPartitionView(in.DesiredView), cpuDetails, siblings, relExists)
+		if err != nil {
+			return fmt.Errorf("rebuild protected bulkhead topology inputs: %w", err)
+		}
+		dag, err = topology.BuildDAG(specs)
+		if err != nil {
+			return fmt.Errorf("rebuild protected bulkhead topology dag: %w", err)
+		}
 	}
 	requiredCPUSetByRel := topology.RequiredCPUSetByRelFromNodeSpecs(specs)
-	dag, err := topology.BuildDAG(specs)
-	if deadlineErr := admissionStageDeadlineError(ctx, "build bulkhead topology dag"); deadlineErr != nil {
-		return deadlineErr
-	}
-	if err != nil {
-		emitBulkheadPruneResult(in.Emitter, "skipped", "dag_error")
-		return fmt.Errorf("build bulkhead topology dag: %w", err)
-	}
+	p.recordDeferredLeafDrains(expectedRes.DeferredLeafByRel)
 	p.drainSafeDeferredLeaves(ctx, in.DesiredView, dag)
 	general.InfofV(5, "cpuset_topology: apply start specs=%d siblings=%d expected_leaf_count=%d pending_count=%d protected_pending=%s protected_rel_count=%d",
 		len(specs), len(siblings), len(expectedRes.ExpectedByRel), len(protections),
@@ -1726,6 +1738,7 @@ func (p *CPUSetTopologyPlugin) pendingProtectedCPUSetByRel(ctx context.Context, 
 
 func (p *CPUSetTopologyPlugin) pendingProtectionScopes(
 	ctx context.Context,
+	dag *topology.TopoDAG,
 	pendingByPod []pendingContainerCPUSet,
 ) ([]topology.PendingProtection, error) {
 	if p.now == nil {
@@ -1758,7 +1771,8 @@ func (p *CPUSetTopologyPlugin) pendingProtectionScopes(
 		rel := protection.rel
 		if rel == "" {
 			var err error
-			rel, err = cgcommon.GetPodRelativeCgroupPath(podUID)
+			rel, err = dag.SelectUniqueControlledPrimaryCandidate(
+				cgcommon.GetPodRelativeCgroupPathCandidates(podUID))
 			if err != nil {
 				return nil, fmt.Errorf("resolve pending pod scope %q: %w", podUID, err)
 			}

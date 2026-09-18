@@ -17,10 +17,30 @@ limitations under the License.
 package common
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestPodRelativeCgroupPathCandidatesUseConfiguredRootsWithoutExistenceLookup(t *testing.T) {
+	t.Parallel()
+
+	got := podRelativeCgroupPathCandidates([]string{
+		"/kubepods",
+		"/kubepods/burstable",
+		"/kubepods/besteffort",
+		"/kubepods/burstable",
+	}, "abc-def")
+	want := []string{
+		"/kubepods/podabc-def",
+		"/kubepods/burstable/podabc-def",
+		"/kubepods/besteffort/podabc-def",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("pod candidates = %v, want %v", got, want)
+	}
+}
 
 func TestGetExistingRelativeCgroupPaths(t *testing.T) {
 	t.Parallel()

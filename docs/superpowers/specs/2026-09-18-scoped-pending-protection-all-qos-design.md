@@ -104,10 +104,13 @@ scoped pending representations.
 The plugin resolves each pending Pod in this order:
 
 1. Use the existing Pod relative cgroup path when it is available.
-2. Otherwise derive the expected Pod parent from Pod QoS, cgroup version,
-   configured primary root, and the repository's cgroup layout abstraction.
-3. Select the deepest controlled primary ancestor in the topology DAG.
-4. Return `PendingProtectionScopeError` when no scope can be proved.
+2. Otherwise ask `pkg/util/cgroup/common` for every pure Pod-path candidate
+   implied by its configured Kubernetes roots. Candidate generation performs no
+   filesystem lookup.
+3. After `BuildDAG`, select the unique candidate whose controlled-primary
+   ancestor is deepest.
+4. Fail closed when no candidate matches or distinct candidates tie at the
+   deepest ancestor depth.
 
 The fallback must not hard-code one cgroup layout inside the planner. It must
 use a resolver at the plugin boundary so cgroupfs and systemd naming remain

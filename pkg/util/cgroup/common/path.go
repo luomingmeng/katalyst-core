@@ -219,6 +219,31 @@ func GetKubernetesAnyExistRelativeCgroupPath(suffix string) (string, error) {
 	return "", fmt.Errorf("failed to find relative path of suffix: %s, error: %v", suffix, utilerrors.NewAggregate(errs))
 }
 
+// GetPodRelativeCgroupPathCandidates returns every pod-level relative cgroup
+// path implied by the configured Kubernetes roots. It does not inspect the
+// filesystem, so callers can resolve a pod scope before kubelet materializes
+// the pod cgroup.
+func GetPodRelativeCgroupPathCandidates(podUID string) []string {
+	k8sCgroupPathLock.RLock()
+	defer k8sCgroupPathLock.RUnlock()
+	return podRelativeCgroupPathCandidates(k8sCgroupPathList.List(), podUID)
+}
+
+func podRelativeCgroupPathCandidates(kubernetesRoots []string, podUID string) []string {
+	suffix := fmt.Sprintf("%s%s", PodCgroupPathPrefix, podUID)
+	candidates := make([]string, 0, len(kubernetesRoots))
+	seen := make(map[string]struct{}, len(kubernetesRoots))
+	for _, root := range kubernetesRoots {
+		candidate := path.Join(root, suffix)
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		candidates = append(candidates, candidate)
+	}
+	return candidates
+}
+
 // GetPodAbsCgroupPath returns absolute cgroup path for pod level
 func GetPodAbsCgroupPath(subsys, podUID string) (string, error) {
 	return GetKubernetesAnyExistAbsCgroupPath(subsys, fmt.Sprintf("%s%s", PodCgroupPathPrefix, podUID))

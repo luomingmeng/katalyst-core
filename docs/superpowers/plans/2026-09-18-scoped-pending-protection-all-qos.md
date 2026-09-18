@@ -271,12 +271,16 @@ git commit -m "feat(qrm-cpu): scope pending protection by cgroup ancestry"
 
 **Files:**
 
+- Modify: `pkg/util/cgroup/common/path.go`
+- Modify: `pkg/util/cgroup/common/path_filter_test.go`
+- Modify: `pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology/dag.go`
+- Modify: `pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology/dag_test.go`
 - Modify: `pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/plugins/cpusettopology/plugin.go`
 - Modify: `pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/plugins/cpusettopology/plugin_test.go`
 
 - [ ] **Step 1: Add RED resolver tests**
 
-Use the registered relative-cgroup-path handler to return:
+Add a pure common API that expands the configured Kubernetes roots into:
 
 ```text
 kubepods/burstable/pod-shared
@@ -284,12 +288,13 @@ kubepods/burstable/pod-snb
 kubepods/pod-dnb
 ```
 
-Make `driver.Stat` return `os.ErrNotExist` for each Pod path. Assert that
-`pendingProtections` still returns a protection with the expected `ScopeRel`,
-CPU set, Pod UID, and `PendingProtectionSourceExpectedPod`.
+It must not inspect the filesystem. Build the topology DAG, select the unique
+candidate with the deepest controlled-primary ancestor, and assert that
+`pendingProtections` returns the expected `ScopeRel`, CPU set, Pod UID, and
+`PendingProtectionSourceExpectedPod` while every candidate path is absent.
 
-Add a case where `GetPodRelativeCgroupPath` fails and assert
-`ErrPendingProtectionScopeUnknown`.
+Add no-match and equal-depth ambiguity cases and assert deterministic
+fail-closed errors.
 
 - [ ] **Step 2: Verify RED**
 
@@ -302,24 +307,25 @@ Expected: build failure because the scoped resolver is absent.
 
 - [ ] **Step 3: Implement expected-path retention**
 
-Replace `pendingProtectedCPUSetByRel` with:
+Add:
 
 ```go
-func pendingProtections(
-    ctx context.Context,
-    pending []pendingContainer,
-    driver topology.HierarchyDriver,
-) ([]topology.PendingProtection, error)
+func GetPodRelativeCgroupPathCandidates(podUID string) []string
+
+func (d *TopoDAG) SelectUniqueControlledPrimaryCandidate(
+    candidates []string,
+) (string, error)
 ```
 
 For each pending Pod:
 
-1. call `cgcommon.GetPodRelativeCgroupPath(pending.PodUID)`;
-2. canonicalize the returned rel;
-3. call `driver.Stat`;
-4. use `ExistingPod` when stat succeeds;
-5. use `ExpectedPod` when stat returns not-exist;
-6. propagate all other stat and path-resolution errors.
+1. retain a previously proved cached relation when present;
+2. otherwise generate candidates from common's configured Kubernetes roots;
+3. after DAG construction, select the sole candidate under the deepest
+   controlled-primary ancestor;
+4. fail closed on no match or ambiguity;
+5. use `ExistingPod` when physical read-back succeeds;
+6. use `ExpectedPod` when the selected Pod path is not materialized.
 
 Deduplicate by `(ScopeRel, PodUID)` and union CPUs for repeated containers.
 
