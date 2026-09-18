@@ -83,6 +83,26 @@ func TestTracePreflightWrapsExactBoundaryExpansionMismatchAsInitialDriftWithoutW
 	require.Equal(t, initialState, fixture.driver.snapshot())
 }
 
+func TestTracePreflightWrapsVanishedSnapshotEntryAsInitialDriftWithoutWrites(t *testing.T) {
+	trace, driver := compiledTraceWithCPUAndMemoryWrites(t)
+	operation := flattenTraceOperations(trace)[0]
+	delete(driver.nodes, operation.Rel)
+	initialState := driver.snapshot()
+
+	err := newTracePreflightWriter(driver).preflightFrozenTrace(context.Background(), trace)
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	var drift *frozenInitialSnapshotDriftError
+	require.ErrorAs(t, err, &drift)
+	require.Contains(t, err.Error(), `class=stale: no such file or directory`)
+	require.NotEqual(t, drift.currentEvidenceID, drift.expected.ID)
+	require.Equal(t, 0, drift.physicalWritesBefore)
+	require.Equal(t, 0, drift.physicalWritesAfter)
+	require.Zero(t, driver.PhysicalWriteCount())
+	require.Equal(t, initialState, driver.snapshot())
+}
+
 func TestTracePreflightBoundaryExpansionMismatchAfterPhysicalWriteFailsClosed(t *testing.T) {
 	t.Parallel()
 

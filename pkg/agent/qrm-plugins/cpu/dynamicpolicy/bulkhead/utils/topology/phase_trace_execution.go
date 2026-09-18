@@ -177,11 +177,12 @@ func wrapFrozenInitialPreflightError(
 	if physicalWritesBefore != 0 || physicalWritesAfter != 0 {
 		return err
 	}
-	if !errors.Is(err, ErrSnapshotBoundaryExpansionMismatch) {
-		return err
-	}
 	var snapshotErr *SnapshotError
 	if !errors.As(err, &snapshotErr) {
+		return err
+	}
+	if snapshotErr.Class != HierarchyErrorStale &&
+		!errors.Is(err, ErrSnapshotBoundaryExpansionMismatch) {
 		return err
 	}
 	return newFrozenInitialSnapshotDriftError(
