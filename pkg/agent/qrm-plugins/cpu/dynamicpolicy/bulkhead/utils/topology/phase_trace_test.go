@@ -119,6 +119,28 @@ type projectedTraceSession struct {
 	ignoreWrites bool
 }
 
+// snapshotMetadataChurnSession changes fingerprinted but plan-irrelevant
+// configured mems evidence on every snapshot. It models concurrent hierarchy
+// churn that changes SnapshotID without advancing the protected CPU transfer.
+type snapshotMetadataChurnSession struct {
+	phaseExecutionSession
+	rel  string
+	next int
+}
+
+func (s *snapshotMetadataChurnSession) Snapshot(ctx context.Context) (*CompleteSnapshot, error) {
+	snapshot, err := s.phaseExecutionSession.Snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	entry := snapshot.Entries[s.rel]
+	entry.ConfiguredMems = fmt.Sprintf("snapshot-churn-%d", s.next)
+	s.next++
+	snapshot.Entries[s.rel] = entry
+	snapshot.ID = fingerprintSnapshot(snapshot)
+	return snapshot, nil
+}
+
 func newProjectedTraceSession(t *testing.T, base *CompleteSnapshot, capabilities HierarchyCapabilities) *projectedTraceSession {
 	t.Helper()
 	hierarchy, err := newProjectedHierarchy(base, capabilities)
@@ -282,6 +304,27 @@ func (f *admissionTraceFixture) configureProtectedDeferredEvaluationInputs() {
 	f.round.protectedPending = machine.NewCPUSet(1)
 	f.round.deferredByRel = map[string]machine.CPUSet{
 		"kubepods/deferred": machine.MustParse("1-3"),
+	}
+}
+
+func (f *admissionTraceFixture) configureAllProtectedSwap() {
+	f.driver.add("primary", CgroupIdentity{Device: 1, Inode: f.allocInode()}, "0", "0")
+	f.driver.add("reclaim", CgroupIdentity{Device: 1, Inode: f.allocInode()}, "1", "0")
+	f.specs = append(f.specs,
+		NodeSpec{
+			Rel: "primary", Role: TopoNodeRolePrimary, Domain: DomainPrimary,
+			CPUs: machine.NewCPUSet(1), Mems: "0", TrustAnchor: true,
+		},
+		NodeSpec{
+			Rel: "reclaim", Role: TopoNodeRoleReclaim, Domain: DomainReclaim,
+			CPUs: machine.NewCPUSet(0), Mems: "0", TrustAnchor: true,
+		},
+	)
+	f.targetByRel["primary"] = machine.NewCPUSet(1)
+	f.targetByRel["reclaim"] = machine.NewCPUSet(0)
+	f.round.protectedByRel = map[string]machine.CPUSet{
+		"primary": machine.NewCPUSet(0),
+		"reclaim": machine.NewCPUSet(1),
 	}
 }
 
@@ -476,6 +519,89 @@ func TestFixedPointEngineSingleRoundReturnsNeutralOutcome(t *testing.T) {
 	require.Equal(t, result.FinalSnapshot, result.Outcome.Snapshot)
 	require.Equal(t, RoundStatusConverged, result.Outcome.Status)
 	require.True(t, result.ObjectiveSatisfied)
+}
+
+func TestFixedPointEngineFailsClosedWhenAllTransferCPUsRemainProtectedDuringSnapshotChurn(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureAllProtectedSwap()
+	base := fixture.snapshot()
+	fixture.round.maxRounds = 4
+	projected := newProjectedTraceSession(t, base, fixture.driver.Capabilities())
+	session := &snapshotMetadataChurnSession{
+		phaseExecutionSession: projected,
+		rel:                   "primary",
+	}
+
+	_, err := fixture.round.runFixedPointEngine(context.Background(), session)
+
+	require.ErrorIs(t, err, ErrNoProgress)
+	require.NotErrorIs(t, err, ErrRoundBudgetExceeded)
+	var stall *ProtectedTransferStallError
+	require.ErrorAs(t, err, &stall)
+	require.Equal(t, machine.NewCPUSet(0, 1), stall.CPUs)
+	require.Equal(t, 1, fixture.round.round)
+}
+
+func TestProtectedTransferStallRequiresZeroWriteFullyProtectedEmptyBatch(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureAllProtectedSwap()
+	base := fixture.snapshot()
+	plan, err := fixture.round.buildPlan(context.Background(), PhaseDrain, base)
+	require.NoError(t, err)
+	require.Empty(t, plan.Operations)
+
+	tests := []struct {
+		name    string
+		mutate  func(*PhasePlan, *coordinatorRound) []AppliedPlanOperation
+		wantNil bool
+	}{
+		{
+			name: "all protected",
+			mutate: func(_ *PhasePlan, _ *coordinatorRound) []AppliedPlanOperation {
+				return nil
+			},
+		},
+		{
+			name: "partially protected",
+			mutate: func(_ *PhasePlan, round *coordinatorRound) []AppliedPlanOperation {
+				round.protectedByRel["reclaim"] = machine.NewCPUSet()
+				return nil
+			},
+			wantNil: true,
+		},
+		{
+			name: "executable drain batch",
+			mutate: func(plan *PhasePlan, _ *coordinatorRound) []AppliedPlanOperation {
+				plan.DrainBatch[DomainPrimary] = machine.NewCPUSet(0)
+				return nil
+			},
+			wantNil: true,
+		},
+		{
+			name: "verified write",
+			mutate: func(_ *PhasePlan, _ *coordinatorRound) []AppliedPlanOperation {
+				return []AppliedPlanOperation{{Rel: "primary"}}
+			},
+			wantNil: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := plan
+			candidate.DrainBatch = cloneDomainUnion(plan.DrainBatch)
+			round := fixture.round.cloneForProjection()
+			journal := tc.mutate(&candidate, round)
+
+			got := protectedTransferStallCPUs(candidate, round, journal)
+
+			if tc.wantNil {
+				require.True(t, got.IsEmpty())
+				return
+			}
+			require.Equal(t, machine.NewCPUSet(0, 1), got)
+		})
+	}
 }
 
 func TestFixedPointEngineSessionReceivesCompletePhasePlan(t *testing.T) {

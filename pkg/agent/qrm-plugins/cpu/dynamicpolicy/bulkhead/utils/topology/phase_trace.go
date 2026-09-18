@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"time"
 
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
@@ -32,6 +33,17 @@ import (
 // ParentSafe: a projected phase produced no state change, so freezing the trace
 // would loop forever instead of converging.
 var ErrNoProgress = errors.New("fixed-point compilation made no progress")
+
+type ProtectedTransferStallError struct {
+	CPUs machine.CPUSet
+}
+
+func (e *ProtectedTransferStallError) Error() string {
+	return fmt.Sprintf("%v: all pending transfer CPUs remain protected: cpus=%s",
+		ErrNoProgress, e.CPUs.String())
+}
+
+func (e *ProtectedTransferStallError) Unwrap() error { return ErrNoProgress }
 
 // CompiledPhase is one ordered, frozen phase of a fixed-point trace. Operations
 // are already sequenced; execution replays them verbatim without re-planning.
@@ -246,6 +258,36 @@ func (r *coordinatorRound) compileFixedPointTrace(
 	return FreezePhaseTrace(trace)
 }
 
+// checkEngineDeadline fails fast at the top of every fixed-point round.
+//
+// The projected session used by compileFixedPointTrace performs Snapshot/Apply
+// purely in memory, so it never routes through the budgeted hierarchy driver
+// that enforces the convergence deadline on each I/O. Without this guard a
+// non-converging (thrashing) projection would silently consume the entire
+// admission handler timeout inside compile, leaving no budget for
+// executeFrozenTrace and surfacing as "admission parent-safe deadline
+// exceeded" with attempted=0 applied=0 (the coordinator never attempts a
+// physical write).
+//
+// Both context cancellation/deadline and the budget's absolute Deadline are
+// wrapped in ErrConvergenceDeadlineExceeded so callers classify the failure
+// as a convergence-budget error (fail-closed), while the underlying context
+// error stays on the chain for errors.Is. Used rounds and budget usage are
+// annotated for diagnosis.
+func (r *coordinatorRound) checkEngineDeadline(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: %w after rounds=%d usage=%+v",
+			ErrConvergenceDeadlineExceeded, err, r.round, r.budget.Usage())
+	}
+	if r.budget != nil && !r.budget.limit.Deadline.IsZero() &&
+		!time.Now().Before(r.budget.limit.Deadline) {
+		return fmt.Errorf("%w: budget_deadline=%s after rounds=%d usage=%+v",
+			ErrConvergenceDeadlineExceeded,
+			r.budget.limit.Deadline.Format(time.RFC3339Nano), r.round, r.budget.Usage())
+	}
+	return nil
+}
+
 // runFixedPointEngine drives the shared fixed-point engine against an execution
 // session, returning the ordered trace it produced.
 //
@@ -300,6 +342,9 @@ func (r *coordinatorRound) runFixedPointEngine(
 		}
 	}
 	for {
+		if err := r.checkEngineDeadline(ctx); err != nil {
+			return nil, err
+		}
 		if r.round >= r.maxRounds {
 			return nil, fmt.Errorf("%w: limit=%d used=%d", ErrRoundBudgetExceeded, r.maxRounds, r.round)
 		}
@@ -426,10 +471,47 @@ func (r *coordinatorRound) runFixedPointEngine(
 		if objectiveSatisfied || mode == fixedPointEngineSingleRound {
 			return result, nil
 		}
+		if protected := protectedTransferStallCPUs(drain, r, journal); !protected.IsEmpty() {
+			return nil, &ProtectedTransferStallError{CPUs: protected}
+		}
 		if final.ID == start.ID {
 			return nil, ErrNoProgress
 		}
 	}
+}
+
+func protectedTransferStallCPUs(
+	plan PhasePlan,
+	round *coordinatorRound,
+	journal []AppliedPlanOperation,
+) machine.CPUSet {
+	if len(journal) != 0 {
+		return machine.NewCPUSet()
+	}
+	if round == nil || round.dag == nil || len(plan.TransferGraph) == 0 {
+		return machine.NewCPUSet()
+	}
+	protectedByDomain := protectedCPUSetByDomain(
+		round.protectedByRel,
+		round.protectedPending,
+		round.dag,
+	)
+	all := machine.NewCPUSet()
+	for source, destinations := range plan.TransferGraph {
+		if !plan.DrainBatch[source].IsEmpty() {
+			return machine.NewCPUSet()
+		}
+		for _, cpus := range destinations {
+			if cpus.IsEmpty() {
+				continue
+			}
+			if !cpus.IsSubsetOf(protectedByDomain[source]) {
+				return machine.NewCPUSet()
+			}
+			all = all.Union(cpus)
+		}
+	}
+	return all
 }
 
 // applyDrainPhases executes a drain plan one frontier batch at a time against
