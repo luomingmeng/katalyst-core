@@ -96,7 +96,7 @@ func TestTraceFinalizationAllowsUnrelatedDynamicSiblingChurn(t *testing.T) {
 	require.True(t, finalization.evaluation.ParentSafety.Safe)
 }
 
-func TestTracePreflightWrapsExactBoundaryExpansionMismatchAsInitialDriftWithoutWrites(t *testing.T) {
+func TestTracePreflightWrapsDirectChildRemovalAsInitialDriftWithoutWrites(t *testing.T) {
 	fixture := newAdmissionTraceFixture(t)
 	fixture.configureStagedSMTTransferWithDynamicDescendant()
 	const removed = "kubepods/runtime-created"
@@ -120,8 +120,7 @@ func TestTracePreflightWrapsExactBoundaryExpansionMismatchAsInitialDriftWithoutW
 	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
 	var drift *frozenInitialSnapshotDriftError
 	require.ErrorAs(t, err, &drift)
-	require.Contains(t, err.Error(), "exact snapshot boundary expansion mismatch")
-	require.ErrorIs(t, drift.cause, ErrSnapshotBoundaryExpansionMismatch)
+	require.Contains(t, err.Error(), "direct children changed")
 	require.NotEqual(t, drift.currentEvidenceID, drift.expected.ID)
 	require.Equal(t, 0, drift.physicalWritesBefore)
 	require.Equal(t, 0, drift.physicalWritesAfter)
@@ -149,35 +148,6 @@ func TestTracePreflightWrapsVanishedSnapshotEntryAsInitialDriftWithoutWrites(t *
 	require.Equal(t, initialState, driver.snapshot())
 }
 
-func TestTracePreflightBoundaryExpansionMismatchAfterPhysicalWriteFailsClosed(t *testing.T) {
-	t.Parallel()
-
-	snapshotErr := &SnapshotError{
-		Operation:  HierarchyOperationList,
-		Class:      HierarchyErrorInvalid,
-		EvidenceID: SnapshotID{1},
-		Err:        ErrSnapshotBoundaryExpansionMismatch,
-	}
-	expected := &CompleteSnapshot{ID: SnapshotID{2}}
-	for _, counts := range []struct {
-		name   string
-		before int
-		after  int
-	}{
-		{name: "write already preceded preflight", before: 1, after: 1},
-		{name: "write occurred during preflight", before: 0, after: 1},
-	} {
-		t.Run(counts.name, func(t *testing.T) {
-			err := wrapFrozenInitialPreflightError(
-				snapshotErr, expected, counts.before, counts.after)
-
-			require.Same(t, snapshotErr, err)
-			var drift *frozenInitialSnapshotDriftError
-			require.False(t, errors.As(err, &drift))
-		})
-	}
-}
-
 func TestTracePreflightReadsInvocationPhysicalWriteCountBeforeClassifyingDrift(t *testing.T) {
 	fixture := newAdmissionTraceFixture(t)
 	fixture.configureStagedSMTTransferWithDynamicDescendant()
@@ -195,7 +165,7 @@ func TestTracePreflightReadsInvocationPhysicalWriteCountBeforeClassifyingDrift(t
 	err = writer.preflightFrozenTrace(context.Background(), trace)
 
 	require.Error(t, err)
-	require.ErrorIs(t, err, ErrSnapshotBoundaryExpansionMismatch)
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
 	var drift *frozenInitialSnapshotDriftError
 	require.False(t, errors.As(err, &drift))
 }
@@ -354,7 +324,7 @@ func TestTracePreflightProducesEveryProjectedPhysicalPredecessorIncludingV2Empty
 	require.Zero(t, fixture.driver.PhysicalWriteCount())
 }
 
-func TestTracePreflightReplaysAncestorOnlyBoundaryWithoutReadingExtraDescendants(t *testing.T) {
+func TestTracePreflightFreshScanRejectsNewDirectChild(t *testing.T) {
 	fixture := newAdmissionTraceFixture(t)
 	fixture.driver.capabilities = cgroupV2Policy.capabilities(true)
 	fixture.round.allowEmptyTarget = true
@@ -378,7 +348,6 @@ func TestTracePreflightReplaysAncestorOnlyBoundaryWithoutReadingExtraDescendants
 
 	trace, err := fixture.round.compileFixedPointTrace(context.Background(), base)
 	require.NoError(t, err)
-	traceID := trace.TraceID
 	fixture.driver.add(
 		"kubepods/unrelated",
 		CgroupIdentity{Device: 1, Inode: 999},
@@ -388,20 +357,14 @@ func TestTracePreflightReplaysAncestorOnlyBoundaryWithoutReadingExtraDescendants
 	var calls []string
 	fixture.driver.beforeCall = func(op HierarchyOperation, rel string) error {
 		calls = append(calls, string(op)+":"+rel)
-		if rel == "kubepods/unrelated" {
-			return errors.New("ancestor-only replay must not read unrelated descendant")
-		}
 		return nil
 	}
 
 	err = newTracePreflightWriter(fixture.driver).preflightFrozenTrace(context.Background(), trace)
 
-	require.NoError(t, err)
-	require.Equal(t, traceID, trace.TraceID)
-	require.NotContains(t, calls, string(HierarchyOperationList)+":kubepods")
-	for _, call := range calls {
-		require.NotContains(t, call, "kubepods/unrelated")
-	}
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	require.Contains(t, calls, string(HierarchyOperationList)+":kubepods")
+	require.Contains(t, calls, string(HierarchyOperationRead)+":kubepods/unrelated")
 	require.Zero(t, fixture.driver.PhysicalWriteCount())
 }
 
@@ -412,15 +375,11 @@ func TestTracePreflightRejectsInvalidV2InheritanceWithoutWrites(t *testing.T) {
 	operation.Target.CPUs = parent.CPUs.Union(machine.NewCPUSet(99))
 	operation.Direction = WriteGrow
 	replaceTraceOperation(t, trace, operation)
-	fresh, err := BuildCompleteSnapshotForBoundary(
-		context.Background(),
-		driver,
-		mustBuildTraceDAG(t, trace),
-		trace.InitialSnapshot.ScanBoundary,
-		NewBudgetTracker(ConvergenceBudget{}),
+	boundary, err := compileFrozenBoundaryV1(
+		trace.InitialSnapshot, trace.EvaluationInput, trace.Phases,
 	)
 	require.NoError(t, err)
-	require.Equal(t, trace.InitialSnapshot.ID, fresh.ID)
+	trace.FrozenBoundary = boundary
 	initialState := driver.snapshot()
 
 	err = newTracePreflightWriter(driver).preflightFrozenTrace(context.Background(), trace)

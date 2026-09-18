@@ -42,8 +42,6 @@ const (
 	ScanForAppliedView ScanPurpose = "applied_view"
 )
 
-var ErrSnapshotBoundaryExpansionMismatch = errors.New("exact snapshot boundary expansion mismatch")
-
 // ScanBoundary records the minimum sufficient evidence selected for a purpose.
 type ScanBoundary struct {
 	Purpose      ScanPurpose
@@ -143,13 +141,12 @@ func (e *SnapshotError) Error() string {
 func (e *SnapshotError) Unwrap() error { return e.Err }
 
 type snapshotBuilder struct {
-	ctx            context.Context
-	driver         HierarchyDriver
-	budget         *BudgetTracker
-	snapshot       *CompleteSnapshot
-	controlled     map[string]*TopoNode
-	boundaries     map[string]struct{}
-	exactExpansion map[string]struct{}
+	ctx        context.Context
+	driver     HierarchyDriver
+	budget     *BudgetTracker
+	snapshot   *CompleteSnapshot
+	controlled map[string]*TopoNode
+	boundaries map[string]struct{}
 }
 
 // BuildCompleteSnapshot returns either complete purpose-scoped evidence or a
@@ -162,63 +159,6 @@ func BuildCompleteSnapshot(
 	budget *BudgetTracker,
 ) (*CompleteSnapshot, error) {
 	return buildCompleteSnapshot(ctx, driver, dag, request, budget, nil)
-}
-
-// BuildCompleteSnapshotForBoundary replays an already captured scan boundary
-// exactly. Roots are observed without inferring that they were affected, and
-// only relations recorded in ExpandedRels have their children listed.
-func BuildCompleteSnapshotForBoundary(
-	ctx context.Context,
-	driver HierarchyDriver,
-	dag *TopoDAG,
-	boundary ScanBoundary,
-	budget *BudgetTracker,
-) (*CompleteSnapshot, error) {
-	if driver == nil || dag == nil || budget == nil {
-		return nil, &SnapshotError{
-			Operation: HierarchyOperationRead,
-			Class:     HierarchyErrorInvalid,
-			Err:       fmt.Errorf("driver, dag and budget are required"),
-		}
-	}
-	if !driver.Capabilities().StableIdentity {
-		return nil, &SnapshotError{
-			Operation: HierarchyOperationStat,
-			Class:     HierarchyErrorInvalid,
-			Err:       fmt.Errorf("stable hierarchy identity is required"),
-		}
-	}
-	if wrapped, ok := driver.(*budgetedHierarchyDriver); !ok || wrapped.budget != budget {
-		driver = NewBudgetedHierarchyDriver(driver, budget)
-	}
-	if boundary.Purpose != ScanForPlan {
-		return nil, &SnapshotError{
-			Operation: HierarchyOperationRead,
-			Class:     HierarchyErrorInvalid,
-			Err:       fmt.Errorf("exact snapshot boundary replay requires plan purpose, got %q", boundary.Purpose),
-		}
-	}
-	frozen := cloneScanBoundary(boundary)
-	frozen.Roots = normalizeRels(frozen.Roots)
-	frozen.ExpandedRels = normalizeRels(frozen.ExpandedRels)
-	expand := make(map[string]bool, len(frozen.Roots))
-	for _, rel := range frozen.Roots {
-		node := dag.index[rel]
-		if node == nil || node.Domain == "" {
-			return nil, &SnapshotError{
-				Operation: HierarchyOperationRead,
-				Class:     HierarchyErrorInvalid,
-				Err:       fmt.Errorf("snapshot boundary rel %q is not controlled with an explicit domain", rel),
-			}
-		}
-	}
-	exactExpansion := make(map[string]struct{}, len(frozen.ExpandedRels))
-	for _, rel := range frozen.ExpandedRels {
-		exactExpansion[rel] = struct{}{}
-	}
-	return buildCompleteSnapshotWithBoundary(
-		ctx, driver, dag, frozen, expand, budget, nil, exactExpansion,
-	)
 }
 
 func buildCompleteSnapshot(
@@ -247,7 +187,7 @@ func buildCompleteSnapshot(
 		return nil, &SnapshotError{Operation: HierarchyOperationRead, Class: HierarchyErrorInvalid, Err: err}
 	}
 	return buildCompleteSnapshotWithBoundary(
-		ctx, driver, dag, boundary, expand, budget, boundaries, nil,
+		ctx, driver, dag, boundary, expand, budget, boundaries,
 	)
 }
 
@@ -259,15 +199,13 @@ func buildCompleteSnapshotWithBoundary(
 	expand map[string]bool,
 	budget *BudgetTracker,
 	boundaries map[string]struct{},
-	exactExpansion map[string]struct{},
 ) (*CompleteSnapshot, error) {
 	builder := &snapshotBuilder{
-		ctx:            ctx,
-		driver:         driver,
-		budget:         budget,
-		controlled:     make(map[string]*TopoNode, len(dag.index)),
-		boundaries:     boundaries,
-		exactExpansion: exactExpansion,
+		ctx:        ctx,
+		driver:     driver,
+		budget:     budget,
+		controlled: make(map[string]*TopoNode, len(dag.index)),
+		boundaries: boundaries,
 		snapshot: &CompleteSnapshot{
 			CapturedAt:          time.Now(),
 			Capabilities:        driver.Capabilities(),
@@ -294,20 +232,6 @@ func buildCompleteSnapshotWithBoundary(
 	}
 	builder.snapshot.Cost = budget.Usage()
 	builder.snapshot.ID = fingerprintSnapshot(builder.snapshot)
-	if exactExpansion != nil &&
-		!equalStringSlices(builder.snapshot.ScanBoundary.ExpandedRels, boundary.ExpandedRels) {
-		return nil, &SnapshotError{
-			Operation:  HierarchyOperationList,
-			Class:      HierarchyErrorInvalid,
-			EvidenceID: builder.snapshot.ID,
-			Err: fmt.Errorf(
-				"%w: got=%v want=%v",
-				ErrSnapshotBoundaryExpansionMismatch,
-				builder.snapshot.ScanBoundary.ExpandedRels,
-				boundary.ExpandedRels,
-			),
-		}
-	}
 	return builder.snapshot, nil
 }
 
@@ -390,9 +314,6 @@ func (b *snapshotBuilder) scan(rel string, domain DomainID, depth int, expected 
 	b.snapshot.DomainByRel[rel] = domain
 	b.snapshot.DomainUnion[domain] = b.snapshot.DomainUnion[domain].Union(entry.CPUs)
 
-	if b.exactExpansion != nil {
-		_, expand = b.exactExpansion[rel]
-	}
 	if !expand && !immediateOnly {
 		return nil
 	}
@@ -425,27 +346,12 @@ func (b *snapshotBuilder) scan(rel string, domain DomainID, depth int, expected 
 			childDomain = childNode.Domain
 		}
 		childExpand := expand && !immediateOnly
-		if b.exactExpansion != nil {
-			_, childExpand = b.exactExpansion[childRel]
-		}
 		if err := b.scan(childRel, childDomain, depth+1, child.Identity, childExpand, false); err != nil {
 			return err
 		}
 	}
 	sort.Strings(b.snapshot.ScanBoundary.ExpandedRels)
 	return nil
-}
-
-func equalStringSlices(left, right []string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for i := range left {
-		if left[i] != right[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func (b *snapshotBuilder) shouldSkipUnavailableController(rel string, depth int, err error) bool {
@@ -561,13 +467,6 @@ func fingerprintSnapshot(snapshot *CompleteSnapshot) SnapshotID {
 	writeHashString(hash, "roots")
 	writeHashUint64(hash, uint64(len(roots)))
 	for _, rel := range roots {
-		writeHashString(hash, rel)
-	}
-	expandedRels := append([]string(nil), snapshot.ScanBoundary.ExpandedRels...)
-	sort.Strings(expandedRels)
-	writeHashString(hash, "expanded-rels")
-	writeHashUint64(hash, uint64(len(expandedRels)))
-	for _, rel := range expandedRels {
 		writeHashString(hash, rel)
 	}
 	domains := make([]string, 0, len(snapshot.DomainUnion))

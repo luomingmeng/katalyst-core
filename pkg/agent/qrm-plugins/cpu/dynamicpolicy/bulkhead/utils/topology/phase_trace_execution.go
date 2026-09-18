@@ -181,8 +181,7 @@ func wrapFrozenInitialPreflightError(
 	if !errors.As(err, &snapshotErr) {
 		return err
 	}
-	if snapshotErr.Class != HierarchyErrorStale &&
-		!errors.Is(err, ErrSnapshotBoundaryExpansionMismatch) {
+	if snapshotErr.Class != HierarchyErrorStale {
 		return err
 	}
 	return newFrozenInitialSnapshotDriftError(

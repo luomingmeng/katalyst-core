@@ -510,13 +510,6 @@ func TestSnapshotFingerprintSeparatesSectionBoundariesAndMapOwnership(t *testing
 		mutate func(*CompleteSnapshot)
 	}{
 		{
-			name: "roots cannot collide with expanded rels",
-			mutate: func(snapshot *CompleteSnapshot) {
-				snapshot.ScanBoundary.Roots = []string{"a", "b"}
-				snapshot.ScanBoundary.ExpandedRels = nil
-			},
-		},
-		{
 			name: "children cannot move between parent keys",
 			mutate: func(snapshot *CompleteSnapshot) {
 				snapshot.Children["a"] = []ChildRef{{Name: "x"}, {Name: "y"}}
@@ -569,6 +562,15 @@ func TestSnapshotFingerprintSeparatesSectionBoundariesAndMapOwnership(t *testing
 			}
 		})
 	}
+}
+
+func TestSnapshotFingerprintIgnoresExpandedRelsDiagnostics(t *testing.T) {
+	snapshot := mustBuildSnapshot(
+		t, buildSnapshotTestHierarchy(), ScanForPlan, []string{"primary"})
+	changed := CloneCompleteSnapshot(snapshot)
+	changed.ScanBoundary.ExpandedRels = []string{"diagnostic-only"}
+
+	require.Equal(t, fingerprintSnapshot(snapshot), fingerprintSnapshot(changed))
 }
 
 func TestCloneCompleteSnapshotIsolatesUnavailableChildEvidence(t *testing.T) {

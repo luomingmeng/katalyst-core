@@ -918,6 +918,14 @@ func FreezePhaseTrace(in *CompiledPhaseTrace) (*CompiledPhaseTrace, error) {
 		return nil, fmt.Errorf("frozen phase trace final evaluation does not match final snapshot evidence: got=%+v want=%+v",
 			actualEvaluation, expectedEvaluation)
 	}
+	expectedBoundary, err := compileFrozenBoundaryV1(
+		out.InitialSnapshot, out.EvaluationInput, out.Phases)
+	if err != nil {
+		return nil, fmt.Errorf("derive frozen phase trace boundary: %w", err)
+	}
+	if !frozenBoundariesEqual(out.FrozenBoundary, expectedBoundary) {
+		return nil, fmt.Errorf("frozen phase trace boundary is not compiler-derived")
+	}
 	out.FinalEvaluation = expectedEvaluation
 	out.TraceID = canonicalPhaseTraceID(&out)
 	if providedTraceID != "" && providedTraceID != out.TraceID {
@@ -948,14 +956,6 @@ func validateFrozenPhaseTrace(trace *CompiledPhaseTrace) error {
 	}
 	if err := validateFrozenBoundary(trace.FrozenBoundary, trace.InitialSnapshot); err != nil {
 		return fmt.Errorf("frozen phase trace has invalid frozen boundary: %w", err)
-	}
-	expectedBoundary, err := compileFrozenBoundaryV1(
-		trace.InitialSnapshot, trace.EvaluationInput, trace.Phases)
-	if err != nil {
-		return fmt.Errorf("derive frozen phase trace boundary: %w", err)
-	}
-	if !frozenBoundariesEqual(trace.FrozenBoundary, expectedBoundary) {
-		return fmt.Errorf("frozen phase trace boundary is not compiler-derived")
 	}
 	if !reflect.DeepEqual(trace.RequiredCPUSetByRel, trace.EvaluationInput.RequiredByRel) {
 		return fmt.Errorf("frozen phase trace required CPUs inputs disagree")
@@ -1063,14 +1063,6 @@ func validateCompleteSnapshotEvidence(snapshot *CompleteSnapshot) error {
 	for _, rel := range snapshot.ScanBoundary.Roots {
 		if _, ok := snapshot.Entries[rel]; !ok {
 			return fmt.Errorf("root %q has no entry", rel)
-		}
-	}
-	for _, rel := range snapshot.ScanBoundary.ExpandedRels {
-		if _, ok := snapshot.Entries[rel]; !ok {
-			return fmt.Errorf("expanded rel %q has no entry", rel)
-		}
-		if _, ok := snapshot.Children[rel]; !ok {
-			return fmt.Errorf("expanded rel %q has no children evidence", rel)
 		}
 	}
 	union := make(map[DomainID]machine.CPUSet)
