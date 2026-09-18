@@ -17,6 +17,7 @@ limitations under the License.
 package topology
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -76,6 +77,108 @@ func TestCloneFrozenBoundaryIsDeeplyIsolated(t *testing.T) {
 	require.Equal(t, "direct", cloned.DirectChildrenByRel["root"][0].Name)
 	require.Equal(t, []string{"root/direct", "root/direct/holder"}, cloned.RelevantCPUHolders)
 	require.Equal(t, "0-3", cloned.RelevantCPUs.String())
+}
+
+func TestEvaluateFrozenBoundaryAllowsUnrelatedDynamicSiblingChurn(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+	driver.nodes["root/direct/unrelated"].configuredCPUs = machine.NewCPUSet(8)
+	driver.nodes["root/direct/unrelated"].cpus = machine.NewCPUSet(8)
+	driver.nodes["root/direct/unrelated"].configuredMems = "1"
+	driver.nodes["root/direct/unrelated"].mems = "1"
+	driver.add("root/direct/new-unrelated", CgroupIdentity{Device: 1, Inode: 9}, "9", "1")
+
+	evaluation, err := EvaluateFrozenBoundary(
+		context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+		boundary, snapshot)
+
+	require.NoError(t, err)
+	require.NotNil(t, evaluation.Snapshot)
+	require.Contains(t, evaluation.Snapshot.Entries, "root/direct/new-unrelated")
+}
+
+func TestEvaluateFrozenBoundaryRejectsControlledRelDrift(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+	driver.nodes["root"].configuredCPUs = machine.MustParse("0-2")
+	driver.nodes["root"].cpus = machine.MustParse("0-2")
+
+	_, err = EvaluateFrozenBoundary(
+		context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+		boundary, snapshot)
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+}
+
+func TestEvaluateFrozenBoundaryRejectsDirectChildChurn(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+	driver.add("root/new-direct", CgroupIdentity{Device: 1, Inode: 9}, "9", "1")
+
+	_, err = EvaluateFrozenBoundary(
+		context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+		boundary, snapshot)
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+}
+
+func TestEvaluateFrozenBoundaryRejectsRelevantCPUHolderDrift(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+	driver.nodes["root/direct/holder"].configuredCPUs = machine.NewCPUSet(2)
+	driver.nodes["root/direct/holder"].cpus = machine.NewCPUSet(2)
+
+	_, err = EvaluateFrozenBoundary(
+		context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+		boundary, snapshot)
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+}
+
+func TestEvaluateFrozenBoundaryRejectsNewRelevantCPUHolder(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+	driver.add("root/direct/new-holder", CgroupIdentity{Device: 1, Inode: 9}, "0", "0")
+
+	_, err = EvaluateFrozenBoundary(
+		context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+		boundary, snapshot)
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+}
+
+func frozenBoundaryDriver(
+	t *testing.T,
+	snapshot *CompleteSnapshot,
+	specs []NodeSpec,
+) (*fakeHierarchyDriver, *TopoDAG) {
+	t.Helper()
+	driver := newFakeHierarchyDriver()
+	driver.capabilities = snapshot.Capabilities
+	rels := sortedStringKeys(snapshot.Entries)
+	for _, rel := range rels {
+		entry := snapshot.Entries[rel]
+		driver.add(rel, entry.Identity, entry.CPUs.String(), entry.Mems)
+		driver.nodes[rel].configuredCPUs = entry.ConfiguredCPUs.Clone()
+		driver.nodes[rel].configuredMems = entry.ConfiguredMems
+	}
+	dag, err := BuildDAG(specs)
+	require.NoError(t, err)
+	return driver, dag
 }
 
 func frozenBoundaryFixture() (*CompleteSnapshot, FrozenCoordinatorEvaluationInput, []CompiledPhase) {

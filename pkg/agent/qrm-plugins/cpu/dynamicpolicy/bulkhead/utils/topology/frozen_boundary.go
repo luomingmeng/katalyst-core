@@ -17,6 +17,7 @@ limitations under the License.
 package topology
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"sort"
@@ -38,6 +39,10 @@ type FrozenBoundary struct {
 	DirectChildrenByRel map[string][]ChildRef
 	RelevantCPUHolders  []string
 	RelevantCPUs        machine.CPUSet
+}
+
+type FrozenBoundaryEvaluation struct {
+	Snapshot *CompleteSnapshot
 }
 
 func compileFrozenBoundaryV1(
@@ -145,6 +150,130 @@ func cloneFrozenBoundary(in FrozenBoundary) FrozenBoundary {
 	out.RelevantCPUHolders = append([]string(nil), in.RelevantCPUHolders...)
 	out.RelevantCPUs = in.RelevantCPUs.Clone()
 	return out
+}
+
+// EvaluateFrozenBoundary captures a fresh root-complete snapshot and compares
+// only the compiler-owned execution boundary. Dynamic descendants outside that
+// boundary remain observable in the returned snapshot but do not invalidate a
+// trace merely because they churn.
+func EvaluateFrozenBoundary(
+	ctx context.Context,
+	driver HierarchyDriver,
+	dag *TopoDAG,
+	budget *BudgetTracker,
+	boundary FrozenBoundary,
+	expected *CompleteSnapshot,
+) (FrozenBoundaryEvaluation, error) {
+	if err := validateFrozenBoundary(boundary, expected); err != nil {
+		return FrozenBoundaryEvaluation{}, err
+	}
+	fresh, err := BuildCompleteSnapshot(
+		ctx,
+		driver,
+		dag,
+		SnapshotRequest{Purpose: ScanForPlan, AffectedRels: boundary.Roots},
+		budget,
+	)
+	if err != nil {
+		return FrozenBoundaryEvaluation{}, err
+	}
+	if err := evaluateFrozenBoundarySnapshot(boundary, expected, fresh); err != nil {
+		return FrozenBoundaryEvaluation{Snapshot: fresh}, err
+	}
+	return FrozenBoundaryEvaluation{Snapshot: fresh}, nil
+}
+
+func evaluateFrozenBoundarySnapshot(
+	boundary FrozenBoundary,
+	expected, current *CompleteSnapshot,
+) error {
+	if err := validateFrozenBoundary(boundary, expected); err != nil {
+		return err
+	}
+	if current == nil {
+		return frozenBoundaryStale("boundary", "<nil>", "snapshot", fmt.Errorf("fresh snapshot is nil"))
+	}
+	controlled := make(map[string]struct{}, len(boundary.ControlledRels))
+	for _, rel := range boundary.ControlledRels {
+		controlled[rel] = struct{}{}
+		want, wantOK := expected.Entries[rel]
+		got, gotOK := current.Entries[rel]
+		if !wantOK || !gotOK {
+			return frozenBoundaryStale(
+				rel, fmt.Sprintf("exists=%t", gotOK), fmt.Sprintf("exists=%t", wantOK),
+				fmt.Errorf("controlled relation presence changed"))
+		}
+		if !entryPhysicalStateEqual(got, want) {
+			return frozenBoundaryStale(
+				rel, frozenEntryStateString(got), frozenEntryStateString(want),
+				fmt.Errorf("controlled relation state changed"))
+		}
+		gotChildren := cloneSortedChildRefs(current.Children[rel])
+		wantChildren := cloneSortedChildRefs(boundary.DirectChildrenByRel[rel])
+		if !equalChildRefs(gotChildren, wantChildren) {
+			return frozenBoundaryStale(
+				rel, fmt.Sprint(gotChildren), fmt.Sprint(wantChildren),
+				fmt.Errorf("controlled relation direct children changed"))
+		}
+	}
+
+	expectedHolders := append([]string(nil), boundary.RelevantCPUHolders...)
+	currentHolders := make([]string, 0, len(expectedHolders))
+	for rel, entry := range current.Entries {
+		if _, isControlled := controlled[rel]; isControlled {
+			continue
+		}
+		if !entry.CPUs.Intersection(boundary.RelevantCPUs).IsEmpty() {
+			currentHolders = append(currentHolders, rel)
+		}
+	}
+	sort.Strings(currentHolders)
+	if !reflect.DeepEqual(currentHolders, expectedHolders) {
+		return frozenBoundaryStale(
+			"dynamic", fmt.Sprint(currentHolders), fmt.Sprint(expectedHolders),
+			fmt.Errorf("relevant CPU holder set changed"))
+	}
+	for _, rel := range expectedHolders {
+		want, wantOK := expected.Entries[rel]
+		got, gotOK := current.Entries[rel]
+		if !wantOK || !gotOK {
+			return frozenBoundaryStale(
+				rel, fmt.Sprintf("exists=%t", gotOK), fmt.Sprintf("exists=%t", wantOK),
+				fmt.Errorf("relevant CPU holder presence changed"))
+		}
+		if !entryPhysicalStateEqual(got, want) {
+			return frozenBoundaryStale(
+				rel, frozenEntryStateString(got), frozenEntryStateString(want),
+				fmt.Errorf("relevant CPU holder state changed"))
+		}
+	}
+	return nil
+}
+
+func entryPhysicalStateEqual(left, right EntryState) bool {
+	return left.Identity == right.Identity &&
+		left.ConfiguredCPUs.Equals(right.ConfiguredCPUs) &&
+		left.CPUs.Equals(right.CPUs) &&
+		cpusetListValuesEqual(left.ConfiguredMems, right.ConfiguredMems) &&
+		cpusetListValuesEqual(left.Mems, right.Mems)
+}
+
+func frozenEntryStateString(entry EntryState) string {
+	return fmt.Sprintf(
+		"identity=%v configured_cpus=%s effective_cpus=%s configured_mems=%s effective_mems=%s",
+		entry.Identity, entry.ConfiguredCPUs.String(), entry.CPUs.String(),
+		entry.ConfiguredMems, entry.Mems)
+}
+
+func frozenBoundaryStale(rel, current, target string, cause error) error {
+	return &PlanStaleError{
+		Rel:       rel,
+		Direction: WritePublish,
+		Resource:  "frozen_boundary",
+		Current:   current,
+		Target:    target,
+		Err:       cause,
+	}
 }
 
 func cloneSortedChildRefs(in []ChildRef) []ChildRef {
