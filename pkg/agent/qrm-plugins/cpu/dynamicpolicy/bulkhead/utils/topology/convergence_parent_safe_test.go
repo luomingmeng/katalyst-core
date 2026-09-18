@@ -90,6 +90,7 @@ func TestBuildParentSafetyReportAllowsOnlySafeDeferredLeafSuperset(t *testing.T)
 		map[string]machine.CPUSet{"primary/pod/container": machine.NewCPUSet(1)},
 		nil,
 		machine.NewCPUSet(1),
+		nil,
 		HierarchyCapabilities{},
 		false,
 	)
@@ -98,6 +99,71 @@ func TestBuildParentSafetyReportAllowsOnlySafeDeferredLeafSuperset(t *testing.T)
 	}
 	if freshProof.ParentSafety.Safe {
 		t.Fatalf("fresh proof = %+v, want fresh reclaim overlap to invalidate the earlier parent-safe decision", freshProof)
+	}
+}
+
+func TestEvaluateParentSafetyRejectsScopedAncestorDeficit(t *testing.T) {
+	t.Parallel()
+
+	dag := mustPlanDAG(t, []NodeSpec{
+		{Rel: "kubepods", Domain: DomainPrimary, CPUs: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7), TrustAnchor: true},
+		{Rel: "kubepods/burstable", Domain: DomainPrimary, CPUs: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)},
+		{Rel: "reclaim", Domain: DomainReclaim, CPUs: machine.NewCPUSet(8, 9), TrustAnchor: true},
+	})
+	snapshot := planSnapshot(map[string]EntryState{
+		"kubepods":           {Identity: CgroupIdentity{Inode: 1}, CPUs: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)},
+		"kubepods/burstable": {Identity: CgroupIdentity{Inode: 2}, CPUs: machine.NewCPUSet(0, 1, 2, 3, 4, 5)},
+		"reclaim":            {Identity: CgroupIdentity{Inode: 3}, CPUs: machine.NewCPUSet(8, 9)},
+	}, map[DomainID]machine.CPUSet{
+		DomainPrimary: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
+		DomainReclaim: machine.NewCPUSet(8, 9),
+	})
+	pendingRequiredByRel := map[string]machine.CPUSet{
+		"kubepods":           machine.NewCPUSet(6, 7),
+		"kubepods/burstable": machine.NewCPUSet(6, 7),
+	}
+
+	report := buildParentSafetyReportWithScopedPending(
+		snapshot, dag, nil, ConvergenceReport{}, machine.NewCPUSet(6, 7),
+		pendingRequiredByRel, nil, nil, nil, HierarchyCapabilities{},
+	)
+
+	if report.Safe {
+		t.Fatalf("parent safety report = %+v, want scoped ancestor deficit rejected", report)
+	}
+	if deficit := report.PendingScopeDeficit["kubepods/burstable"]; !deficit.Equals(machine.NewCPUSet(6, 7)) {
+		t.Fatalf("pending scope deficit = %+v, want kubepods/burstable=6-7", report.PendingScopeDeficit)
+	}
+}
+
+func TestEvaluateParentSafetyAcceptsSatisfiedScopedAncestors(t *testing.T) {
+	t.Parallel()
+
+	dag := mustPlanDAG(t, []NodeSpec{
+		{Rel: "kubepods", Domain: DomainPrimary, CPUs: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7), TrustAnchor: true},
+		{Rel: "kubepods/burstable", Domain: DomainPrimary, CPUs: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)},
+		{Rel: "reclaim", Domain: DomainReclaim, CPUs: machine.NewCPUSet(8, 9), TrustAnchor: true},
+	})
+	snapshot := planSnapshot(map[string]EntryState{
+		"kubepods":           {Identity: CgroupIdentity{Inode: 1}, CPUs: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)},
+		"kubepods/burstable": {Identity: CgroupIdentity{Inode: 2}, CPUs: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)},
+		"reclaim":            {Identity: CgroupIdentity{Inode: 3}, CPUs: machine.NewCPUSet(8, 9)},
+	}, map[DomainID]machine.CPUSet{
+		DomainPrimary: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
+		DomainReclaim: machine.NewCPUSet(8, 9),
+	})
+
+	report := buildParentSafetyReportWithScopedPending(
+		snapshot, dag, nil, ConvergenceReport{}, machine.NewCPUSet(6, 7),
+		map[string]machine.CPUSet{
+			"kubepods":           machine.NewCPUSet(6, 7),
+			"kubepods/burstable": machine.NewCPUSet(6, 7),
+		},
+		nil, nil, nil, HierarchyCapabilities{},
+	)
+
+	if !report.Safe || len(report.PendingScopeDeficit) != 0 {
+		t.Fatalf("parent safety report = %+v, want scoped ancestors safe", report)
 	}
 }
 

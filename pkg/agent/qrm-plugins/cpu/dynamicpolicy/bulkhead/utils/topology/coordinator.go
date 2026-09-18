@@ -250,12 +250,9 @@ type CoordinatorInput struct {
 	ReservedCPUSet      machine.CPUSet
 	ExpectedCPUSetByRel map[string]machine.CPUSet
 	RequiredCPUSetByRel map[string]machine.CPUSet
-	// ProtectedPendingCPUSet is the union of container allocations that already
-	// exist in QRM state but whose cgroup leaf has not been created yet (pod
-	// admit window). These have no resolvable rel, so the writer folds them into
-	// the primary node's effective target to guarantee the primary cgroup never
-	// shrinks below an allocation that is about to materialize.
-	ProtectedPendingCPUSet machine.CPUSet
+	// PendingProtections is the canonical owner of pending allocations. The
+	// coordinator derives both their union and controlled ancestor closure.
+	PendingProtections []PendingProtection
 	// ProtectedCPUSetByRel records cgroup rels whose current/pending cpuset must
 	// stay covered during a short runtime creation window.
 	ProtectedCPUSetByRel map[string]machine.CPUSet
@@ -376,8 +373,13 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 	if len(in.CPUDetails) == 0 {
 		return *res, errors.New("TopologyCoordinator.Converge: empty CPUDetails in normal mode")
 	}
+	pendingRequiredByRel, err := pendingRequiredCPUSetByRel(in.DAG, in.PendingProtections)
+	if err != nil {
+		return *res, err
+	}
+	protectedPending := pendingProtectionUnion(in.PendingProtections)
 	allowEmptyTarget := in.Cgroup.Version(ctx) == cgroupclient.CgroupVersionV2
-	effectiveTargets, err := computeEffectiveTargets(in.DAG, allowEmptyTarget, in.CPUDetails, in.ProtectedPendingCPUSet, in.ProtectedCPUSetByRel)
+	effectiveTargets, err := computeEffectiveTargets(in.DAG, allowEmptyTarget, in.CPUDetails, pendingRequiredByRel, in.ProtectedCPUSetByRel)
 	if err != nil {
 		return *res, err
 	}
@@ -394,7 +396,8 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 	round.deferredByRel = cloneCPUSetMap(in.DeferredCPUSetByRel)
 	round.admissionBudget = in.AdmissionBudget
 	round.allowEmptyTarget = allowEmptyTarget
-	round.protectedPending = in.ProtectedPendingCPUSet.Clone()
+	round.protectedPending = protectedPending
+	round.pendingRequiredByRel = cloneCPUSetMap(pendingRequiredByRel)
 	round.protectedByRel = cloneCPUSetMap(in.ProtectedCPUSetByRel)
 	round.requiredIdentityByRel = cloneIdentityMap(in.RequiredIdentityByRel)
 	round.expectedAbsentRels = cloneRelSet(in.ExpectedAbsentRels)
@@ -409,7 +412,7 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 	round.maxRounds = coordinatorMaxRoundsForPlanInput(PhasePlanInput{
 		Kind: PhaseDrain, DAG: in.DAG, Snapshot: initialSnapshot,
 		DesiredByRel: effectiveTargets, AllowedCPUs: round.allowedCPUs(),
-		ProtectedPending: in.ProtectedPendingCPUSet, ProtectedByRel: in.ProtectedCPUSetByRel,
+		ProtectedPending: protectedPending, ProtectedByRel: in.ProtectedCPUSetByRel,
 		CPUDetails: in.CPUDetails, Selection: round.selection,
 	}, in.Budget.MaxRounds)
 	autoBudgetInput, err := coordinatorAutoCumulativeBudgetInput(round.maxRounds, in.DAG, initialSnapshot, budget.Usage())
@@ -487,7 +490,8 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 			round.desiredDomainUnion(), round.allowedCPUs(),
 			in.ExpectedCPUSetByRel, in.RequiredCPUSetByRel, in.DeferredCPUSetByRel,
 			round.deferredCleanupRels,
-			round.admissionSafetyCPUSet(), snapshotDriver.Capabilities(), allowEmptyTarget,
+			round.admissionSafetyCPUSet(), round.pendingRequiredByRel,
+			snapshotDriver.Capabilities(), allowEmptyTarget,
 		)
 		if err != nil {
 			return *res, err
@@ -524,7 +528,8 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 				round.desiredDomainUnion(), round.allowedCPUs(),
 				in.ExpectedCPUSetByRel, in.RequiredCPUSetByRel, in.DeferredCPUSetByRel,
 				round.deferredCleanupRels,
-				round.admissionSafetyCPUSet(), snapshotDriver.Capabilities(), allowEmptyTarget,
+				round.admissionSafetyCPUSet(), round.pendingRequiredByRel,
+				snapshotDriver.Capabilities(), allowEmptyTarget,
 			)
 			if err != nil {
 				return *res, err
@@ -1000,6 +1005,7 @@ type coordinatorRound struct {
 	executionTicket       *ExecutionReservationTicket
 	allowEmptyTarget      bool
 	protectedPending      machine.CPUSet
+	pendingRequiredByRel  map[string]machine.CPUSet
 	protectedByRel        map[string]machine.CPUSet
 	requiredIdentityByRel map[string]CgroupIdentity
 	expectedAbsentRels    map[string]struct{}
@@ -1299,9 +1305,10 @@ func (r *coordinatorRound) buildPlan(ctx context.Context, kind PhaseKind, snapsh
 	})
 	if err == nil && r.objective == ConvergenceObjectiveParentSafe {
 		required, deferred, splitErr := SplitPlanForAdmission(&plan, AdmissionSafetyInput{
-			ProtectedPendingCPUSet: r.admissionSafetyCPUSet(),
-			DeferredCPUSetByRel:    r.deferredByRel,
-			RequiredCPUSetByRel:    r.requiredByRel,
+			PendingCPUSet:        r.admissionSafetyCPUSet(),
+			PendingRequiredByRel: r.pendingRequiredByRel,
+			DeferredCPUSetByRel:  r.deferredByRel,
+			RequiredCPUSetByRel:  r.requiredByRel,
 		})
 		if splitErr != nil {
 			return PhasePlan{}, splitErr

@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -117,6 +118,28 @@ func (s *liveTraceSession) Capabilities() HierarchyCapabilities {
 type projectedTraceSession struct {
 	hierarchy    *projectedHierarchy
 	ignoreWrites bool
+}
+
+// snapshotMetadataChurnSession changes fingerprinted but plan-irrelevant
+// configured mems evidence on every snapshot. It models concurrent hierarchy
+// churn that changes SnapshotID without advancing the protected CPU transfer.
+type snapshotMetadataChurnSession struct {
+	phaseExecutionSession
+	rel  string
+	next int
+}
+
+func (s *snapshotMetadataChurnSession) Snapshot(ctx context.Context) (*CompleteSnapshot, error) {
+	snapshot, err := s.phaseExecutionSession.Snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	entry := snapshot.Entries[s.rel]
+	entry.ConfiguredMems = fmt.Sprintf("snapshot-churn-%d", s.next)
+	s.next++
+	snapshot.Entries[s.rel] = entry
+	snapshot.ID = fingerprintSnapshot(snapshot)
+	return snapshot, nil
 }
 
 func newProjectedTraceSession(t *testing.T, base *CompleteSnapshot, capabilities HierarchyCapabilities) *projectedTraceSession {
@@ -285,6 +308,27 @@ func (f *admissionTraceFixture) configureProtectedDeferredEvaluationInputs() {
 	}
 }
 
+func (f *admissionTraceFixture) configureAllProtectedSwap() {
+	f.driver.add("primary", CgroupIdentity{Device: 1, Inode: f.allocInode()}, "0", "0")
+	f.driver.add("reclaim", CgroupIdentity{Device: 1, Inode: f.allocInode()}, "1", "0")
+	f.specs = append(f.specs,
+		NodeSpec{
+			Rel: "primary", Role: TopoNodeRolePrimary, Domain: DomainPrimary,
+			CPUs: machine.NewCPUSet(1), Mems: "0", TrustAnchor: true,
+		},
+		NodeSpec{
+			Rel: "reclaim", Role: TopoNodeRoleReclaim, Domain: DomainReclaim,
+			CPUs: machine.NewCPUSet(0), Mems: "0", TrustAnchor: true,
+		},
+	)
+	f.targetByRel["primary"] = machine.NewCPUSet(1)
+	f.targetByRel["reclaim"] = machine.NewCPUSet(0)
+	f.round.protectedByRel = map[string]machine.CPUSet{
+		"primary": machine.NewCPUSet(0),
+		"reclaim": machine.NewCPUSet(1),
+	}
+}
+
 // snapshot wires the round to the current fixture topology and returns a fresh
 // complete snapshot captured from the live fake driver.
 func (f *admissionTraceFixture) snapshot() *CompleteSnapshot {
@@ -423,6 +467,146 @@ func TestCompileFixedPointTracePerformsNoPhysicalHierarchyIO(t *testing.T) {
 	require.Zero(t, fixture.driver.writeCount())
 }
 
+func TestCompileFixedPointTraceLivePendingShape(t *testing.T) {
+	const (
+		controlledSpecCount      = 17
+		dynamicDescendantCount   = 177
+		controlledAncestorCount  = 5
+		requiredFloorRepairCount = 2
+	)
+	fixture := newLivePendingShapeFixture(t)
+
+	trace, err := fixture.compile()
+
+	require.NoError(t, err)
+	require.Len(t, trace.EvaluationInput.DAGSpecs, controlledSpecCount)
+	require.Len(t, trace.FinalSnapshot.Entries, controlledSpecCount+dynamicDescendantCount)
+	require.LessOrEqual(t, trace.OperationCount(),
+		controlledAncestorCount+requiredFloorRepairCount)
+	require.True(t, trace.FinalEvaluation.ParentSafety.Safe)
+	require.Zero(t, fixture.driver.writeCount())
+}
+
+func newLivePendingShapeFixture(t testing.TB) *traceBenchmarkFixture {
+	t.Helper()
+	const (
+		primaryRoots     = 12
+		controlledDepth  = 5
+		dynamicPrimary   = 176
+		liveShapeEntries = 194
+	)
+	capabilities := cgroupV2Policy.capabilities(true)
+	driver := &traceBenchmarkDriver{
+		nodes:        make(map[string]EntryState, liveShapeEntries),
+		children:     make(map[string][]ChildRef, liveShapeEntries),
+		capabilities: capabilities,
+	}
+	specs := make([]NodeSpec, 0, 17)
+	targetByRel := make(map[string]machine.CPUSet, liveShapeEntries)
+	dynamicByRel := make(map[string]machine.CPUSet, dynamicPrimary+1)
+	pendingRequiredByRel := make(map[string]machine.CPUSet, controlledDepth)
+	nextInode := uint64(1)
+	add := func(rel, parent string, role TopoNodeRole, domain DomainID, observed machine.CPUSet, controlled bool) {
+		identity := CgroupIdentity{Device: 1, Inode: nextInode}
+		nextInode++
+		driver.nodes[rel] = EntryState{
+			Rel: rel, Identity: identity,
+			CPUs: observed.Clone(), ConfiguredCPUs: observed.Clone(),
+			Mems: "0", ConfiguredMems: "0",
+		}
+		if parent == "" {
+			driver.roots = append(driver.roots, RootRef{Rel: rel, Identity: identity})
+		} else {
+			driver.children[parent] = append(driver.children[parent], ChildRef{
+				Name: filepath.Base(rel), Identity: identity,
+			})
+		}
+		if controlled {
+			specs = append(specs, NodeSpec{
+				Rel: rel, ParentRel: parent, Role: role, Domain: domain,
+				CPUs: observed.Clone(), Mems: "0", TrustAnchor: parent == "",
+			})
+		}
+		targetByRel[rel] = observed.Clone()
+	}
+	setControlledTarget := func(rel string, target machine.CPUSet) {
+		targetByRel[rel] = target.Clone()
+		for i := range specs {
+			if specs[i].Rel == rel {
+				specs[i].CPUs = target.Clone()
+				return
+			}
+		}
+		t.Fatalf("controlled rel %q has no spec", rel)
+	}
+
+	primaryObserved := machine.MustParse("1-6")
+	primaryTarget := machine.MustParse("0-6")
+	for index := 0; index < primaryRoots; index++ {
+		rel := fmt.Sprintf("primary-%02d", index)
+		add(rel, "", TopoNodeRolePrimary, DomainPrimary, primaryObserved, true)
+	}
+	parent := "primary-00"
+	setControlledTarget(parent, primaryTarget)
+	pendingRequiredByRel[parent] = machine.NewCPUSet(0)
+	for level := 1; level < controlledDepth; level++ {
+		rel := fmt.Sprintf("%s/level-%02d", parent, level)
+		add(rel, parent, TopoNodeRolePrimary, DomainPrimary, primaryObserved, true)
+		setControlledTarget(rel, primaryTarget)
+		pendingRequiredByRel[rel] = machine.NewCPUSet(0)
+		parent = rel
+	}
+	for index := 0; index < dynamicPrimary; index++ {
+		rel := fmt.Sprintf("%s/pod-%03d", parent, index)
+		add(rel, parent, TopoNodeRolePrimary, DomainPrimary, primaryObserved, false)
+		dynamicByRel[rel] = primaryObserved.Clone()
+	}
+	add("reclaim", "", TopoNodeRoleReclaim, DomainReclaim, machine.NewCPUSet(0, 7), true)
+	setControlledTarget("reclaim", machine.NewCPUSet(7))
+	add("reclaim/release", "reclaim", TopoNodeRoleReclaim, DomainReclaim, machine.NewCPUSet(0), false)
+	targetByRel["reclaim/release"] = machine.NewCPUSet()
+	dynamicByRel["reclaim/release"] = machine.NewCPUSet()
+
+	for rel := range driver.children {
+		sort.Slice(driver.children[rel], func(i, j int) bool {
+			return driver.children[rel][i].Name < driver.children[rel][j].Name
+		})
+	}
+	sort.Slice(driver.roots, func(i, j int) bool { return driver.roots[i].Rel < driver.roots[j].Rel })
+	dag, err := BuildDAG(specs)
+	require.NoError(t, err)
+	budget := NewBudgetTracker(traceScaleBudget(liveShapeEntries, controlledDepth))
+	base, err := newCompleteSnapshotSource(driver, dag, budget)(context.Background())
+	require.NoError(t, err)
+	driver.resetCounts()
+	round := &coordinatorRound{
+		objective:            ConvergenceObjectiveParentSafe,
+		dag:                  dag,
+		driver:               driver,
+		budget:               NewBudgetTracker(traceScaleBudget(liveShapeEntries, controlledDepth)),
+		selection:            DefaultDrainSelectionPolicy(),
+		targetByRel:          targetByRel,
+		dynamicByRel:         dynamicByRel,
+		pendingRequiredByRel: pendingRequiredByRel,
+		protectedPending:     machine.NewCPUSet(0),
+		cpuDetails: machine.CPUDetails{
+			0: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
+			1: {NUMANodeID: 0, SocketID: 0, CoreID: 1},
+			2: {NUMANodeID: 0, SocketID: 0, CoreID: 2},
+			3: {NUMANodeID: 0, SocketID: 0, CoreID: 3},
+			4: {NUMANodeID: 0, SocketID: 0, CoreID: 4},
+			5: {NUMANodeID: 0, SocketID: 0, CoreID: 5},
+			6: {NUMANodeID: 0, SocketID: 0, CoreID: 6},
+			7: {NUMANodeID: 0, SocketID: 0, CoreID: 7},
+		},
+		reservedCPUs:     machine.NewCPUSet(),
+		blocked:          map[DomainID]machine.CPUSet{},
+		maxRounds:        64,
+		allowEmptyTarget: true,
+	}
+	return &traceBenchmarkFixture{driver: driver, round: round, base: base}
+}
+
 func requireTopologyScaleTests(t *testing.T) {
 	t.Helper()
 	if os.Getenv(topologyScaleTestEnv) != "1" {
@@ -476,6 +660,156 @@ func TestFixedPointEngineSingleRoundReturnsNeutralOutcome(t *testing.T) {
 	require.Equal(t, result.FinalSnapshot, result.Outcome.Snapshot)
 	require.Equal(t, RoundStatusConverged, result.Outcome.Status)
 	require.True(t, result.ObjectiveSatisfied)
+}
+
+func TestFixedPointEngineFailsClosedWhenAllTransferCPUsRemainProtectedDuringSnapshotChurn(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureAllProtectedSwap()
+	base := fixture.snapshot()
+	fixture.round.maxRounds = 4
+	projected := newProjectedTraceSession(t, base, fixture.driver.Capabilities())
+	session := &snapshotMetadataChurnSession{
+		phaseExecutionSession: projected,
+		rel:                   "primary",
+	}
+
+	_, err := fixture.round.runFixedPointEngine(context.Background(), session)
+
+	require.ErrorIs(t, err, ErrNoProgress)
+	require.NotErrorIs(t, err, ErrRoundBudgetExceeded)
+	var stall *ProtectedTransferStallError
+	require.ErrorAs(t, err, &stall)
+	require.Equal(t, machine.NewCPUSet(0, 1), stall.CPUs)
+	require.Equal(t, 1, fixture.round.round)
+}
+
+func TestProjectedPhaseNoProgress(t *testing.T) {
+	hierarchy := projectedHierarchyFixture(t, v2Capabilities())
+	entry := hierarchy.snapshot.Entries[projectedChildRel]
+	entry.CPUs = machine.NewCPUSet(0)
+	entry.ConfiguredCPUs = machine.NewCPUSet(0)
+	hierarchy.snapshot.Entries[projectedChildRel] = entry
+	require.NoError(t, hierarchy.settleEvidence())
+	session, err := newProjectedPhaseSession(hierarchy.snapshot, hierarchy.capabilities)
+	require.NoError(t, err)
+	require.NoError(t, session.hierarchy.settleEvidence())
+	settledID := session.hierarchy.snapshot.ID
+	entry = session.hierarchy.snapshot.Entries[projectedChildRel]
+	plan := PhasePlan{
+		Kind: PhaseDrain,
+		Operations: []PlanOperation{{
+			Rel: projectedChildRel, ExpectedIdentity: entry.Identity,
+			ExpectedChildren: ChildrenFingerprint(session.hierarchy.snapshot.Children[projectedChildRel]),
+			ExpectedCurrent:  CPUSetTarget{CPUs: entry.CPUs.Clone(), Mems: entry.Mems},
+			Target:           CPUSetTarget{CPUs: entry.CPUs.Clone(), Mems: entry.Mems},
+			Direction:        WriteShrink,
+		}},
+	}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	plan.Operations[0].PlanID = plan.PlanID
+
+	_, err = session.Apply(context.Background(), plan)
+
+	require.ErrorIs(t, err, ErrNoProgress)
+	var noProgress *ProjectedPhaseNoProgressError
+	require.ErrorAs(t, err, &noProgress)
+	require.Equal(t, settledID, noProgress.SnapshotID)
+	require.Equal(t, plan.PlanID, noProgress.PlanID)
+}
+
+func TestProjectedPhaseCycle(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	base := fixture.snapshot()
+	session, err := newProjectedPhaseSession(base, fixture.driver.Capabilities())
+	require.NoError(t, err)
+	entry := session.hierarchy.snapshot.Entries["reclaimed/leaf"]
+	plan := PhasePlan{
+		Kind: PhaseDrain,
+		Operations: []PlanOperation{{
+			Rel: "reclaimed/leaf", ExpectedIdentity: entry.Identity,
+			ExpectedChildren:       ChildrenFingerprint(session.hierarchy.snapshot.Children["reclaimed/leaf"]),
+			ParentRel:              "reclaimed",
+			ExpectedParentIdentity: session.hierarchy.snapshot.Entries["reclaimed"].Identity,
+			ExpectedCurrent:        CPUSetTarget{CPUs: entry.CPUs.Clone(), Mems: entry.Mems},
+			Target:                 CPUSetTarget{CPUs: machine.NewCPUSet(), Mems: entry.Mems},
+			Direction:              WriteShrink,
+		}},
+	}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	plan.Operations[0].PlanID = plan.PlanID
+	session.progress[phaseProgressKey{SnapshotID: base.ID, PlanID: plan.PlanID}] = struct{}{}
+
+	_, err = session.Apply(context.Background(), plan)
+
+	require.ErrorIs(t, err, ErrNoProgress)
+	var cycle *ProjectedPhaseCycleError
+	require.ErrorAs(t, err, &cycle)
+	require.Equal(t, base.ID, cycle.SnapshotID)
+	require.Equal(t, plan.PlanID, cycle.PlanID)
+	require.Equal(t, 1, fixture.round.round+1)
+}
+
+func TestProtectedTransferStallRequiresZeroWriteFullyProtectedEmptyBatch(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureAllProtectedSwap()
+	base := fixture.snapshot()
+	plan, err := fixture.round.buildPlan(context.Background(), PhaseDrain, base)
+	require.NoError(t, err)
+	require.Empty(t, plan.Operations)
+
+	tests := []struct {
+		name    string
+		mutate  func(*PhasePlan, *coordinatorRound) []AppliedPlanOperation
+		wantNil bool
+	}{
+		{
+			name: "all protected",
+			mutate: func(_ *PhasePlan, _ *coordinatorRound) []AppliedPlanOperation {
+				return nil
+			},
+		},
+		{
+			name: "partially protected",
+			mutate: func(_ *PhasePlan, round *coordinatorRound) []AppliedPlanOperation {
+				round.protectedByRel["reclaim"] = machine.NewCPUSet()
+				return nil
+			},
+			wantNil: true,
+		},
+		{
+			name: "executable drain batch",
+			mutate: func(plan *PhasePlan, _ *coordinatorRound) []AppliedPlanOperation {
+				plan.DrainBatch[DomainPrimary] = machine.NewCPUSet(0)
+				return nil
+			},
+			wantNil: true,
+		},
+		{
+			name: "verified write",
+			mutate: func(_ *PhasePlan, _ *coordinatorRound) []AppliedPlanOperation {
+				return []AppliedPlanOperation{{Rel: "primary"}}
+			},
+			wantNil: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := plan
+			candidate.DrainBatch = cloneDomainUnion(plan.DrainBatch)
+			round := fixture.round.cloneForProjection()
+			journal := tc.mutate(&candidate, round)
+
+			got := protectedTransferStallCPUs(candidate, round, journal)
+
+			if tc.wantNil {
+				require.True(t, got.IsEmpty())
+				return
+			}
+			require.Equal(t, machine.NewCPUSet(0, 1), got)
+		})
+	}
 }
 
 func TestFixedPointEngineSessionReceivesCompletePhasePlan(t *testing.T) {

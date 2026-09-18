@@ -34,6 +34,11 @@ var ErrProjectedParentContainment = errors.New("projected target exceeds parent 
 // effective state to model its parent outside the captured hierarchy.
 var ErrProjectedExternalInheritanceUnknown = errors.New("projected external inheritance is unknown")
 
+// ErrProjectedFrontierDependency reports that one projected frontier contains
+// an ancestor and descendant. Such operations depend on intermediate effective
+// state and therefore cannot share one evidence settlement.
+var ErrProjectedFrontierDependency = errors.New("projected frontier contains dependent operations")
+
 type projectedExternalInheritance struct {
 	CPUs    machine.CPUSet
 	Mems    string
@@ -51,11 +56,12 @@ type projectedExternalInheritance struct {
 // snapshot's Children map, not by path strings, so inheritance follows the same
 // edges the driver observed.
 type projectedHierarchy struct {
-	snapshot      *CompleteSnapshot
-	capabilities  HierarchyCapabilities
-	parentByRel   map[string]string
-	childrenByRel map[string][]string
-	externalByRel map[string]projectedExternalInheritance
+	snapshot         *CompleteSnapshot
+	capabilities     HierarchyCapabilities
+	parentByRel      map[string]string
+	childrenByRel    map[string][]string
+	externalByRel    map[string]projectedExternalInheritance
+	evidenceRebuilds int
 }
 
 // newProjectedHierarchy clones base and indexes its parent/child edges by
@@ -134,11 +140,17 @@ func newProjectedHierarchy(
 	}, nil
 }
 
-// applyOperation projects one plan operation onto the clone under the backend's
-// cgroup-version semantics, re-derives the effective subtree it changed, and
-// refreshes the snapshot evidence. It rejects operations the live kernel would
-// refuse (empty v1 configured, out-of-parent grows) before mutating any state.
+// applyOperation projects one standalone operation and settles its evidence.
+// Frontier projection uses applyConfiguredOperation for every independent
+// operation and settles once after the complete frontier.
 func (h *projectedHierarchy) applyOperation(operation PlanOperation) error {
+	if err := h.applyConfiguredOperation(operation); err != nil {
+		return err
+	}
+	return h.settleEvidence()
+}
+
+func (h *projectedHierarchy) applyConfiguredOperation(operation PlanOperation) error {
 	entry, ok := h.snapshot.Entries[operation.Rel]
 	if !ok {
 		return fmt.Errorf("projected hierarchy has no entry for rel %q", operation.Rel)
@@ -237,7 +249,33 @@ func (h *projectedHierarchy) applyOperation(operation PlanOperation) error {
 	if err := h.recomputeEffectiveSubtree(operation.Rel); err != nil {
 		return err
 	}
+	return nil
+}
+
+func (h *projectedHierarchy) settleEvidence() error {
 	return h.recomputeEvidence()
+}
+
+func validateProjectedFrontierIndependence(
+	hierarchy *projectedHierarchy,
+	operations []PlanOperation,
+) error {
+	if hierarchy == nil {
+		return fmt.Errorf("projected frontier requires a hierarchy")
+	}
+	rels := make(map[string]struct{}, len(operations))
+	for _, operation := range operations {
+		rels[operation.Rel] = struct{}{}
+	}
+	for _, operation := range operations {
+		for parent := hierarchy.parentByRel[operation.Rel]; parent != ""; parent = hierarchy.parentByRel[parent] {
+			if _, dependent := rels[parent]; dependent {
+				return fmt.Errorf("%w: ancestor=%q descendant=%q",
+					ErrProjectedFrontierDependency, parent, operation.Rel)
+			}
+		}
+	}
+	return nil
 }
 
 func (h *projectedHierarchy) precheckExternalInheritance(operation PlanOperation, entry EntryState) error {
@@ -487,6 +525,7 @@ func (h *projectedHierarchy) parentEntry(rel string) (EntryState, bool) {
 // and refreshes the snapshot fingerprint so downstream proofs bind to the exact
 // projected end state rather than the pre-operation snapshot.
 func (h *projectedHierarchy) recomputeEvidence() error {
+	h.evidenceRebuilds++
 	unions := make(map[DomainID]machine.CPUSet, len(h.snapshot.DomainUnion))
 	for rel, entry := range h.snapshot.Entries {
 		domain, ok := h.snapshot.DomainByRel[rel]

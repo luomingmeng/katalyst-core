@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,8 +41,192 @@ func TestTracePreflightRejectsInitialSnapshotDriftWithoutWrites(t *testing.T) {
 	err := newTracePreflightWriter(driver).preflightFrozenTrace(context.Background(), trace)
 
 	require.Error(t, err)
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	var drift *frozenInitialSnapshotDriftError
+	require.ErrorAs(t, err, &drift)
+	require.NotNil(t, drift.current)
+	require.NotNil(t, drift.expected)
 	require.Zero(t, driver.PhysicalWriteCount())
 	require.Equal(t, initialState, driver.snapshot())
+}
+
+func TestTracePreflightWrapsExactBoundaryExpansionMismatchAsInitialDriftWithoutWrites(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	const removed = "kubepods/runtime-created"
+	fixture.driver.add(removed, CgroupIdentity{Device: 1, Inode: 1000}, "1-3", "0")
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(),
+		fixture.snapshot(),
+	)
+	require.NoError(t, err)
+	require.Contains(t, trace.InitialSnapshot.ScanBoundary.ExpandedRels, removed)
+	for rel := range fixture.driver.nodes {
+		if rel == removed || strings.HasPrefix(rel, removed+"/") {
+			delete(fixture.driver.nodes, rel)
+		}
+	}
+	initialState := fixture.driver.snapshot()
+
+	err = newTracePreflightWriter(fixture.driver).preflightFrozenTrace(context.Background(), trace)
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	var drift *frozenInitialSnapshotDriftError
+	require.ErrorAs(t, err, &drift)
+	require.Contains(t, err.Error(), "exact snapshot boundary expansion mismatch")
+	require.ErrorIs(t, drift.cause, ErrSnapshotBoundaryExpansionMismatch)
+	require.NotEqual(t, drift.currentEvidenceID, drift.expected.ID)
+	require.Equal(t, 0, drift.physicalWritesBefore)
+	require.Equal(t, 0, drift.physicalWritesAfter)
+	require.Zero(t, fixture.driver.PhysicalWriteCount())
+	require.Equal(t, initialState, fixture.driver.snapshot())
+}
+
+func TestTracePreflightWrapsVanishedSnapshotEntryAsInitialDriftWithoutWrites(t *testing.T) {
+	trace, driver := compiledTraceWithCPUAndMemoryWrites(t)
+	operation := flattenTraceOperations(trace)[0]
+	delete(driver.nodes, operation.Rel)
+	initialState := driver.snapshot()
+
+	err := newTracePreflightWriter(driver).preflightFrozenTrace(context.Background(), trace)
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	var drift *frozenInitialSnapshotDriftError
+	require.ErrorAs(t, err, &drift)
+	require.Contains(t, err.Error(), `class=stale: no such file or directory`)
+	require.NotEqual(t, drift.currentEvidenceID, drift.expected.ID)
+	require.Equal(t, 0, drift.physicalWritesBefore)
+	require.Equal(t, 0, drift.physicalWritesAfter)
+	require.Zero(t, driver.PhysicalWriteCount())
+	require.Equal(t, initialState, driver.snapshot())
+}
+
+func TestTracePreflightBoundaryExpansionMismatchAfterPhysicalWriteFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	snapshotErr := &SnapshotError{
+		Operation:  HierarchyOperationList,
+		Class:      HierarchyErrorInvalid,
+		EvidenceID: SnapshotID{1},
+		Err:        ErrSnapshotBoundaryExpansionMismatch,
+	}
+	expected := &CompleteSnapshot{ID: SnapshotID{2}}
+	for _, counts := range []struct {
+		name   string
+		before int
+		after  int
+	}{
+		{name: "write already preceded preflight", before: 1, after: 1},
+		{name: "write occurred during preflight", before: 0, after: 1},
+	} {
+		t.Run(counts.name, func(t *testing.T) {
+			err := wrapFrozenInitialPreflightError(
+				snapshotErr, expected, counts.before, counts.after)
+
+			require.Same(t, snapshotErr, err)
+			var drift *frozenInitialSnapshotDriftError
+			require.False(t, errors.As(err, &drift))
+		})
+	}
+}
+
+func TestTracePreflightReadsInvocationPhysicalWriteCountBeforeClassifyingDrift(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	const removed = "kubepods/runtime-created"
+	fixture.driver.add(removed, CgroupIdentity{Device: 1, Inode: 1000}, "1-3", "0")
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(),
+		fixture.snapshot(),
+	)
+	require.NoError(t, err)
+	delete(fixture.driver.nodes, removed)
+
+	writer := newTracePreflightWriter(fixture.driver)
+	*writer.physicalWriteAttempts = 1
+	err = writer.preflightFrozenTrace(context.Background(), trace)
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrSnapshotBoundaryExpansionMismatch)
+	var drift *frozenInitialSnapshotDriftError
+	require.False(t, errors.As(err, &drift))
+}
+
+func TestTracePreflightSnapshotIdentityDriftAfterPhysicalWriteFailsClosed(t *testing.T) {
+	trace, driver := compiledTraceWithCPUAndMemoryWrites(t)
+	operation := flattenTraceOperations(trace)[0]
+	driver.nodes[operation.Rel].cpus = operation.ExpectedCurrent.CPUs.Union(machine.NewCPUSet(99))
+	driver.nodes[operation.Rel].configuredCPUs = driver.nodes[operation.Rel].cpus.Clone()
+	writer := newTracePreflightWriter(driver)
+	*writer.physicalWriteAttempts = 1
+
+	err := writer.preflightFrozenTrace(context.Background(), trace)
+
+	require.Error(t, err)
+	var drift *frozenInitialSnapshotDriftError
+	require.False(t, errors.As(err, &drift))
+	require.Contains(t, err.Error(), "physical_writes_before=1")
+	require.Contains(t, err.Error(), "physical_writes_after=1")
+}
+
+func TestFinalSnapshotDriftBecomesReplanSafeOnlyAfterVerifiedRollback(t *testing.T) {
+	t.Parallel()
+
+	drift := &frozenFinalSnapshotDriftError{
+		stale: &PlanStaleError{
+			Rel: "controlled", Direction: WritePublish, Resource: "final_snapshot",
+			Err: fmt.Errorf("test final snapshot drift"),
+		},
+	}
+	var safe interface{ FrozenSnapshotDriftReplanSafe() bool }
+	require.False(t, errors.As(drift, &safe),
+		"a final drift is not retryable before the physical rollback is verified")
+
+	writer := safeCPSetWriter{}
+	res := &ConvergenceResult{Applied: 3, Journal: []AppliedPlanOperation{{PlanID: "seed"}}}
+	err := writer.failFrozenTrace(
+		context.Background(), drift, &traceMutationStack{}, nil, res, 1, 3)
+
+	require.ErrorAs(t, err, &safe)
+	require.True(t, safe.FrozenSnapshotDriftReplanSafe())
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	require.Equal(t, 3, res.Applied)
+	require.Len(t, res.Journal, 1)
+}
+
+func TestFinalSnapshotDriftWithUnverifiedRollbackIsNotReplanSafe(t *testing.T) {
+	t.Parallel()
+
+	trace, live := compiledTraceWithCPUAndMemoryWrites(t)
+	operation := flattenTraceOperations(trace)[0]
+	initial := trace.InitialSnapshot.Entries[operation.Rel]
+	badIdentity := initial.Identity
+	badIdentity.Inode++
+	stack := &traceMutationStack{writes: []AppliedPhysicalWrite{{
+		PlanID: "final-drift", Rel: operation.Rel, Identity: badIdentity,
+		Direction: operation.Direction, Resource: HierarchyOperationWriteCPUs,
+		Before: initial.ConfiguredCPUs.String(), BeforeEffective: initial.CPUs.String(),
+		After: operation.Target.CPUs.String(), AfterEffective: operation.Target.CPUs.String(),
+		Impact: PhysicalImpactConfirmed,
+	}}}
+	drift := &frozenFinalSnapshotDriftError{stale: &PlanStaleError{
+		Rel: "controlled", Direction: WritePublish, Resource: "final_snapshot",
+		Err: fmt.Errorf("test final snapshot drift"),
+	}}
+	writer := safeCPSetWriter{driver: live}
+	res := &ConvergenceResult{}
+
+	err := writer.failFrozenTrace(context.Background(), drift, stack, nil, res, 0, 0)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "rollback failed")
+	var safe interface{ FrozenSnapshotDriftReplanSafe() bool }
+	require.False(t, errors.As(err, &safe),
+		"unverified rollback must never authorize an admission replan")
+	require.NotEmpty(t, res.Journal,
+		"unverified rollback must retain physical-impact evidence")
 }
 
 func TestTracePreflightRejectsIdentityDriftWithoutWrites(t *testing.T) {

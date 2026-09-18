@@ -210,6 +210,14 @@ func (h *projectedHierarchy) setParentTarget(cpus machine.CPUSet) {
 	h.snapshot.Entries[projectedRootRel] = root
 }
 
+func (h *projectedHierarchy) resetEvidenceRebuildCount() {
+	h.evidenceRebuilds = 0
+}
+
+func (h *projectedHierarchy) evidenceRebuildCount() int {
+	return h.evidenceRebuilds
+}
+
 // cpuOperation seeds the target rel's current configured/effective state to
 // `configured` and returns a CPU PlanOperation toward `target`. Seeding keeps
 // applyOperation's ExpectedCurrent and identity validation meaningful while the
@@ -462,6 +470,57 @@ func TestProjectedHierarchyRecomputesEvidence(t *testing.T) {
 	require.NotEqual(t, beforeID, hierarchy.snapshot.ID)
 	require.NotEqual(t, beforeUnion, hierarchy.snapshot.DomainUnion[DomainPrimary].String())
 	require.Equal(t, "0-1", hierarchy.snapshot.DomainUnion[DomainPrimary].String())
+}
+
+func TestProjectedHierarchySettlesEvidenceOncePerFrontier(t *testing.T) {
+	hierarchy := projectedHierarchyFixture(t, v2Capabilities())
+	for _, rel := range []string{projectedChildRel, projectedInheritRel} {
+		entry := hierarchy.snapshot.Entries[rel]
+		entry.CPUs = machine.NewCPUSet(0)
+		entry.ConfiguredCPUs = machine.NewCPUSet(0)
+		hierarchy.snapshot.Entries[rel] = entry
+	}
+	require.NoError(t, hierarchy.recomputeEvidence())
+	hierarchy.resetEvidenceRebuildCount()
+
+	session := &projectedPhaseSession{
+		hierarchy: hierarchy,
+		progress:  make(map[phaseProgressKey]struct{}),
+	}
+	operations := []PlanOperation{
+		hierarchy.cpuOperation(projectedChildRel, machine.NewCPUSet(0), machine.MustParse("0-1")),
+		hierarchy.cpuOperation(projectedInheritRel, machine.NewCPUSet(0), machine.MustParse("0-1")),
+	}
+	plan := PhasePlan{Kind: PhaseExpand, Operations: operations}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	for i := range plan.Operations {
+		plan.Operations[i].PlanID = plan.PlanID
+	}
+
+	result, err := session.Apply(context.Background(), plan)
+
+	require.NoError(t, err)
+	require.Equal(t, len(operations), result.Applied)
+	require.Equal(t, 1, hierarchy.evidenceRebuildCount())
+}
+
+func TestCompiledFrontierRejectsDependency(t *testing.T) {
+	hierarchy := projectedHierarchyFixture(t, v2Capabilities())
+	root := hierarchy.cpuOperation(
+		projectedRootRel,
+		machine.MustParse("0-3"),
+		machine.MustParse("0-2"),
+	)
+	root.ExpectedChildUnion = machine.MustParse("0-3")
+	descendant := hierarchy.cpuOperation(
+		projectedGrandchildRel,
+		machine.MustParse("0-3"),
+		machine.MustParse("0-2"),
+	)
+
+	err := validateProjectedFrontierIndependence(hierarchy, []PlanOperation{root, descendant})
+
+	require.ErrorIs(t, err, ErrProjectedFrontierDependency)
 }
 
 func projectedV2ExternalInheritanceFixture(t *testing.T) *projectedHierarchy {

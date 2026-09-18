@@ -48,9 +48,10 @@ const (
 )
 
 type safeCPSetWriter struct {
-	driver HierarchyDriver
-	budget *BudgetTracker
-	res    *ConvergenceResult
+	driver                HierarchyDriver
+	budget                *BudgetTracker
+	res                   *ConvergenceResult
+	physicalWriteAttempts *int
 }
 
 type stableLiveChildren struct {
@@ -61,7 +62,13 @@ type stableLiveChildren struct {
 }
 
 func newSafeCPUSetWriter(driver HierarchyDriver, budget *BudgetTracker, res *ConvergenceResult) safeCPSetWriter {
-	return safeCPSetWriter{driver: driver, budget: budget, res: res}
+	physicalWriteAttempts := 0
+	return safeCPSetWriter{
+		driver:                driver,
+		budget:                budget,
+		res:                   res,
+		physicalWriteAttempts: &physicalWriteAttempts,
+	}
 }
 
 func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {

@@ -39,7 +39,10 @@ func TestSplitPlanForAdmissionClassifiesRequiredAndDeferredWithoutLoss(t *testin
 		},
 	}
 	required, deferred, err := SplitPlanForAdmission(plan, AdmissionSafetyInput{
-		ProtectedPendingCPUSet: machine.NewCPUSet(1),
+		PendingCPUSet: machine.NewCPUSet(1),
+		PendingRequiredByRel: map[string]machine.CPUSet{
+			"primary/pod": machine.NewCPUSet(1),
+		},
 		DeferredCPUSetByRel: map[string]machine.CPUSet{
 			"primary/pod/container": machine.NewCPUSet(0, 1),
 		},
@@ -144,6 +147,64 @@ func TestSplitPlanForAdmissionRequiresIncomingTransferGrowAndDefersUnrelatedGrow
 	}
 }
 
+func TestSplitPlanForAdmissionScopesPendingGrowToRequiredRelations(t *testing.T) {
+	t.Parallel()
+
+	plan := &PhasePlan{
+		Kind: PhaseExpand,
+		Operations: []PlanOperation{
+			{
+				Rel: "kubepods", Direction: WriteGrow,
+				ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(0, 1)},
+				Target:          CPUSetTarget{CPUs: machine.NewCPUSet(0, 1, 6, 7)},
+			},
+			{
+				Rel: "kubepods/burstable", Direction: WriteGrow,
+				ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(0, 1)},
+				Target:          CPUSetTarget{CPUs: machine.NewCPUSet(0, 1, 6, 7)},
+			},
+			{
+				Rel: "kubepods/besteffort", Direction: WriteGrow,
+				ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(0, 1)},
+				Target:          CPUSetTarget{CPUs: machine.NewCPUSet(0, 1, 6, 7)},
+			},
+			{
+				Rel: "kubepods/burstable/pod-old", Direction: WriteGrow,
+				ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(0, 1)},
+				Target:          CPUSetTarget{CPUs: machine.NewCPUSet(0, 1, 6, 7)},
+			},
+		},
+	}
+
+	required, deferred, err := SplitPlanForAdmission(plan, AdmissionSafetyInput{
+		PendingRequiredByRel: map[string]machine.CPUSet{
+			"kubepods":           machine.NewCPUSet(6, 7),
+			"kubepods/burstable": machine.NewCPUSet(6, 7),
+		},
+	})
+	if err != nil {
+		t.Fatalf("SplitPlanForAdmission() error = %v", err)
+	}
+	if got := operationRels(required.Operations); !reflect.DeepEqual(got, []string{
+		"kubepods", "kubepods/burstable",
+	}) {
+		t.Fatalf("required rels = %v, want scoped ancestors", got)
+	}
+	if got := operationRels(deferred.Operations); !reflect.DeepEqual(got, []string{
+		"kubepods/besteffort", "kubepods/burstable/pod-old",
+	}) {
+		t.Fatalf("deferred rels = %v, want unrelated siblings", got)
+	}
+}
+
+func operationRels(operations []PlanOperation) []string {
+	rels := make([]string, 0, len(operations))
+	for _, operation := range operations {
+		rels = append(rels, operation.Rel)
+	}
+	return rels
+}
+
 func TestFinalAdmissionTargetPreservesCanonicalTargetOverIntermediateDrainOperation(t *testing.T) {
 	t.Parallel()
 
@@ -177,7 +238,7 @@ func TestFinalAdmissionTargetPreservesCanonicalTargetOverIntermediateDrainOperat
 	}
 
 	required, _, err := SplitPlanForAdmission(plan, AdmissionSafetyInput{
-		ProtectedPendingCPUSet: machine.NewCPUSet(2),
+		PendingCPUSet: machine.NewCPUSet(2),
 	})
 	if err != nil {
 		t.Fatalf("SplitPlanForAdmission() error = %v", err)

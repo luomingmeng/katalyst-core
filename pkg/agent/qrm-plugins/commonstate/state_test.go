@@ -41,6 +41,14 @@ func TestAllocationMetaToClosAssignmentMeta(t *testing.T) {
 	}, meta.ToClosAssignmentMeta())
 }
 
+func TestAllocationMetaCloneRetainsNativeQOSClass(t *testing.T) {
+	t.Parallel()
+
+	original := &AllocationMeta{NativeQOSClass: "Guaranteed"}
+
+	require.Equal(t, original.NativeQOSClass, original.Clone().NativeQOSClass)
+}
+
 func TestAllocationMetaGetters(t *testing.T) {
 	t.Parallel()
 

@@ -28,7 +28,9 @@ import (
 	"sync"
 	"time"
 
+	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/util/errors"
+	v1qos "k8s.io/kubernetes/pkg/apis/core/v1/helper/qos"
 
 	bulkheadapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
@@ -294,11 +296,52 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 		emitBulkheadPruneResult(in.Emitter, "skipped", "container_error")
 		return fmt.Errorf("build expected container cpuset: %w", err)
 	}
+	discoveredSiblings, err := p.discoverBulkheadReclaimSiblings(ctx, in.DesiredView)
+	if deadlineErr := admissionStageDeadlineError(ctx, "discover bulkhead reclaim siblings"); deadlineErr != nil {
+		return deadlineErr
+	}
+	if err != nil {
+		emitBulkheadPruneResult(in.Emitter, "skipped", "discover_error")
+		return fmt.Errorf("discover bulkhead reclaim siblings: %w", err)
+	}
+	siblings := p.mergeBulkheadReclaimSiblings(
+		discoveredSiblings,
+		p.configuredBulkheadReclaimSiblings(),
+		desiredCPUSetPartitionView(in.DesiredView),
+	)
+	var cpuDetails machine.CPUDetails
+	if in.Topology != nil {
+		cpuDetails = in.Topology.CPUDetails
+	}
+	specs, err := bulkheadutils.BuildTopologyNodeSpecsFromView(p.cfg, desiredCPUSetPartitionView(in.DesiredView), cpuDetails, siblings, relExists)
+	if deadlineErr := admissionStageDeadlineError(ctx, "build bulkhead topology inputs"); deadlineErr != nil {
+		return deadlineErr
+	}
+	if err != nil {
+		return fmt.Errorf("build bulkhead topology inputs: %w", err)
+	}
+	dag, err := topology.BuildDAG(specs)
+	if deadlineErr := admissionStageDeadlineError(ctx, "build bulkhead topology dag"); deadlineErr != nil {
+		return deadlineErr
+	}
+	if err != nil {
+		emitBulkheadPruneResult(in.Emitter, "skipped", "dag_error")
+		return fmt.Errorf("build bulkhead topology dag: %w", err)
+	}
+	protections, err := p.pendingProtectionScopes(ctx, dag, expectedRes.PendingByPod)
+	if err != nil {
+		emitBulkheadPruneResult(in.Emitter, "skipped", "pending_scope_error")
+		return fmt.Errorf("resolve pending protection scopes: %w", err)
+	}
+	if err := p.ensureBulkheadReclaimSiblingDirs(ctx, siblings); err != nil {
+		return fmt.Errorf("ensure bulkhead reclaim sibling cgroups: %w", err)
+	}
+	protectedPending := pendingProtectionCPUSetUnion(protections)
 	protectedByRel := p.pendingProtectedCPUSetByRel(ctx, expectedRes.PendingByPod)
 	if deadlineErr := admissionStageDeadlineError(ctx, "protect pending container cpuset"); deadlineErr != nil {
 		return deadlineErr
 	}
-	if protected := expectedRes.PendingCPUSetUnion().Union(unionCPUSetByRel(protectedByRel)); topologyCoversProtectedView(in.Topology, in.DesiredView, protected) {
+	if protected := protectedPending.Union(unionCPUSetByRel(protectedByRel)); topologyCoversProtectedView(in.Topology, in.DesiredView, protected) {
 		general.InfofV(5, "bulkhead: applying transient pending protection, pending_count=%d protected_rel_count=%d protected_union=%s protected_by_rel=%s desired_reclaim=%s desired_reclaim_per_numa=%s reclaim_before=%s reclaim_per_numa_before=%s",
 			len(expectedRes.PendingByPod), len(protectedByRel), protected.String(), formatCPUSetByRel(protectedByRel),
 			in.DesiredView.DesiredReclaimEffective.String(), formatCPUSetByNUMA(in.DesiredView.DesiredReclaimEffectivePerNUMA),
@@ -318,48 +361,25 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 		if p.cfg.EnableAdmissionLeafDefer && in.Mode.OrFullDefault() == cpusetutil.CPUSetAdjustmentModeAdmission {
 			p.reclassifyAdmissionDeferredLeaves(ctx, in.DesiredView, expectedRes)
 		}
-	}
-	p.recordDeferredLeafDrains(expectedRes.DeferredLeafByRel)
-	discoveredSiblings, err := p.discoverBulkheadReclaimSiblings(ctx, in.DesiredView)
-	if deadlineErr := admissionStageDeadlineError(ctx, "discover bulkhead reclaim siblings"); deadlineErr != nil {
-		return deadlineErr
-	}
-	if err != nil {
-		emitBulkheadPruneResult(in.Emitter, "skipped", "discover_error")
-		return fmt.Errorf("discover bulkhead reclaim siblings: %w", err)
-	}
-	siblings := p.mergeBulkheadReclaimSiblings(
-		discoveredSiblings,
-		p.configuredBulkheadReclaimSiblings(),
-		desiredCPUSetPartitionView(in.DesiredView),
-	)
-	if err := p.ensureBulkheadReclaimSiblingDirs(ctx, siblings); err != nil {
-		return fmt.Errorf("ensure bulkhead reclaim sibling cgroups: %w", err)
-	}
-	var cpuDetails machine.CPUDetails
-	if in.Topology != nil {
-		cpuDetails = in.Topology.CPUDetails
-	}
-	specs, err := bulkheadutils.BuildTopologyNodeSpecsFromView(p.cfg, desiredCPUSetPartitionView(in.DesiredView), cpuDetails, siblings, relExists)
-	if deadlineErr := admissionStageDeadlineError(ctx, "build bulkhead topology inputs"); deadlineErr != nil {
-		return deadlineErr
-	}
-	if err != nil {
-		return fmt.Errorf("build bulkhead topology inputs: %w", err)
+		// Transient protection changes desired primary/reclaim CPU sets. Rebuild
+		// the DAG so the coordinator receives those updated targets while keeping
+		// scope resolution anchored to the already validated DAG boundary.
+		specs, err = bulkheadutils.BuildTopologyNodeSpecsFromView(
+			p.cfg, desiredCPUSetPartitionView(in.DesiredView), cpuDetails, siblings, relExists)
+		if err != nil {
+			return fmt.Errorf("rebuild protected bulkhead topology inputs: %w", err)
+		}
+		dag, err = topology.BuildDAG(specs)
+		if err != nil {
+			return fmt.Errorf("rebuild protected bulkhead topology dag: %w", err)
+		}
 	}
 	requiredCPUSetByRel := topology.RequiredCPUSetByRelFromNodeSpecs(specs)
-	dag, err := topology.BuildDAG(specs)
-	if deadlineErr := admissionStageDeadlineError(ctx, "build bulkhead topology dag"); deadlineErr != nil {
-		return deadlineErr
-	}
-	if err != nil {
-		emitBulkheadPruneResult(in.Emitter, "skipped", "dag_error")
-		return fmt.Errorf("build bulkhead topology dag: %w", err)
-	}
+	p.recordDeferredLeafDrains(expectedRes.DeferredLeafByRel)
 	p.drainSafeDeferredLeaves(ctx, in.DesiredView, dag)
 	general.InfofV(5, "cpuset_topology: apply start specs=%d siblings=%d expected_leaf_count=%d pending_count=%d protected_pending=%s protected_rel_count=%d",
-		len(specs), len(siblings), len(expectedRes.ExpectedByRel), len(expectedRes.PendingByPod),
-		expectedRes.PendingCPUSetUnion().String(), len(protectedByRel))
+		len(specs), len(siblings), len(expectedRes.ExpectedByRel), len(protections),
+		protectedPending.String(), len(protectedByRel))
 	reservedCPUSet := in.DesiredView.Reserve
 	objective := topology.ConvergenceObjectiveFull
 	if p.cfg.EnableAdmissionLeafDefer && in.Mode.OrFullDefault() == cpusetutil.CPUSetAdjustmentModeAdmission {
@@ -390,8 +410,8 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 		AdmissionBudget: &topology.AdmissionConvergenceBudget{
 			MaxRequiredWrites: p.cfg.AdmissionMaxRequiredWrites,
 		},
-		ProtectedPendingCPUSet: expectedRes.PendingCPUSetUnion(),
-		ProtectedCPUSetByRel:   protectedByRel,
+		PendingProtections:   protections,
+		ProtectedCPUSetByRel: protectedByRel,
 		PublishFinalSnapshot: func(snapshot *topology.CompleteSnapshot) error {
 			appliedView, err := appliedViewFromFinalSnapshotWithContext(
 				ctx, in.MetaServer, in.DesiredView, dag, snapshot,
@@ -409,14 +429,20 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 			if err != nil {
 				return fmt.Errorf("derive parent-safe applied view from final topology snapshot: %w", err)
 			}
+			// Final-snapshot classification can discover a materialized dynamic leaf
+			// that became a safe superset after the compile-time classification. Keep
+			// the observed proof for ParentSafe publication, but register its exact
+			// desired target so the post-publish drain does not leave the wider cpuset
+			// in place indefinitely.
+			p.recordDeferredLeafDrains(expectedRes.DeferredLeafByRel)
 			finalAppliedView = appliedView
 			return nil
 		},
 	})
 	general.Infof("cpuset_topology: coordinator converge finished duration=%s err=%v attempted=%d applied=%d skipped=%d failed=%d deferred=%d converged=%t final_snapshot_current=%t state=%s expected_leaf_count=%d pending_count=%d pending_cpu_count=%d protected_rel_count=%d specs=%d siblings=%d",
 		time.Since(convergeStart), err, res.Attempted, res.Applied, res.Skipped, res.Failed, res.Deferred,
-		res.Converged, res.FinalSnapshotCurrent, res.State, len(expectedRes.ExpectedByRel), len(expectedRes.PendingByPod),
-		expectedRes.PendingCPUSetUnion().Size(), len(protectedByRel), len(specs), len(siblings))
+		res.Converged, res.FinalSnapshotCurrent, res.State, len(expectedRes.ExpectedByRel), len(protections),
+		protectedPending.Size(), len(protectedByRel), len(specs), len(siblings))
 	if err != nil {
 		emitBulkheadTopologySummary(in.Emitter, "normal", res, err)
 		emitBulkheadPruneResult(in.Emitter, "skipped", "dag_error")
@@ -567,14 +593,56 @@ func appliedViewFromFinalSnapshotWithDeferredCleanup(
 	if len(expectedCPUSetByRel) > 1 {
 		deferred = expectedCPUSetByRel[1]
 	}
+	// deferredCleanupRels is only non-nil on the ParentSafe publish path. There a
+	// dynamic container leaf may transiently keep a wider cpuset between compile
+	// and finalization, so publishing a safe superset is allowed as long as it
+	// stays inside the finalized primary domain and never overlaps reclaim. The
+	// full-convergence publish path leaves finalization.parentSafe false, keeping
+	// exact-match mandatory.
+	finalization := containerLeafFinalization{}
+	if deferredCleanupRels != nil {
+		finalization = containerLeafFinalization{
+			parentSafe:         true,
+			finalPrimaryDomain: applied.NonReclaimPool.Clone(),
+			finalReclaimDomain: applied.ReclaimEffective.Clone(),
+		}
+	}
 	containerCPUSetByPod, err := containerCPUSetByPodFromFinalSnapshotWithDeferredCleanup(
-		ctx, metaServer, desired, snapshot, expected, deferred, deferredCleanupRels)
+		ctx, metaServer, desired, snapshot, expected, deferred, deferredCleanupRels, finalization)
 	if err != nil {
 		return nil, err
 	}
 	applied.ContainerCPUSetByPod = containerCPUSetByPod
 	applied.PoolProjection = buildAppliedPoolProjection(model.AppliedViewLevelFull, desired, applied)
 	return applied, nil
+}
+
+// containerLeafFinalization carries the finalized topology domains that bound
+// which observed container-leaf cpusets may be published. It is only populated
+// with a permissive contract on the ParentSafe publish path; the full-convergence
+// publish path leaves parentSafe false so exact-match remains mandatory.
+type containerLeafFinalization struct {
+	parentSafe         bool
+	finalPrimaryDomain machine.CPUSet
+	finalReclaimDomain machine.CPUSet
+}
+
+// allowsSafeSuperset reports whether an observed container-leaf cpuset that is a
+// strict superset of the desired cpuset is still safe to publish under the
+// ParentSafe contract. A dynamic container leaf may transiently retain a wider
+// cpuset between compile and finalization; publishing that superset is safe only
+// when it stays inside the finalized primary domain and never overlaps reclaim.
+func (f containerLeafFinalization) allowsSafeSuperset(desired, observed machine.CPUSet) bool {
+	if !f.parentSafe {
+		return false
+	}
+	if !desired.IsSubsetOf(observed) {
+		return false
+	}
+	if !observed.IsSubsetOf(f.finalPrimaryDomain) {
+		return false
+	}
+	return observed.Intersection(f.finalReclaimDomain).IsEmpty()
 }
 
 func containerCPUSetByPodFromFinalSnapshotWithDeferredCleanup(
@@ -585,6 +653,7 @@ func containerCPUSetByPodFromFinalSnapshotWithDeferredCleanup(
 	expectedCPUSetByRel map[string]machine.CPUSet,
 	deferredCPUSetByRel map[string]machine.CPUSet,
 	deferredCleanupRels map[string]struct{},
+	finalization containerLeafFinalization,
 ) (map[string]map[string]machine.CPUSet, error) {
 	out := map[string]map[string]machine.CPUSet{}
 	if desired == nil || len(desired.ContainerCPUSetByPod) == 0 {
@@ -643,6 +712,16 @@ func containerCPUSetByPodFromFinalSnapshotWithDeferredCleanup(
 				}
 				if deferred, ok := deferredCPUSetByRel[rel]; ok &&
 					deferred.Equals(desiredCPUs) && desiredCPUs.IsSubsetOf(proof) {
+					if out[podUID] == nil {
+						out[podUID] = map[string]machine.CPUSet{}
+					}
+					out[podUID][containerName] = proof.Clone()
+					continue
+				}
+				if finalization.allowsSafeSuperset(desiredCPUs, proof) {
+					if deferredCPUSetByRel != nil {
+						deferredCPUSetByRel[rel] = desiredCPUs.Clone()
+					}
 					if out[podUID] == nil {
 						out[podUID] = map[string]machine.CPUSet{}
 					}
@@ -794,21 +873,20 @@ func (p *CPUSetTopologyPlugin) reconcileDisabledOnce(
 	}
 	var finalAppliedView *model.AppliedView
 	res, err := (topology.TopologyCoordinator{}).Converge(ctx, topology.CoordinatorInput{
-		DAG:                    dag,
-		Cgroup:                 p.cgroup,
-		Mode:                   topology.NormalModeGuardWithGate(p.sharedModeGate()),
-		Budget:                 topologyBudgetFromConfig(p.cfg.TopologyConvergenceBudget),
-		DrainSelection:         topologyDrainSelectionFromConfig(p.cfg.TopologyDrainSelection),
-		CPUDetails:             cpuDetails,
-		ReservedCPUSet:         in.DesiredView.Reserve,
-		ExpectedCPUSetByRel:    expected,
-		DeferredCPUSetByRel:    deferred,
-		ProtectedCPUSetByRel:   protected,
-		ProtectedPendingCPUSet: machine.NewCPUSet(),
-		TraversalBoundaries:    absentBoundaries,
-		RequiredIdentityByRel:  requiredIdentities,
-		ExpectedAbsentRels:     absentBoundaries,
-		Objective:              topology.ConvergenceObjectiveFull,
+		DAG:                   dag,
+		Cgroup:                p.cgroup,
+		Mode:                  topology.NormalModeGuardWithGate(p.sharedModeGate()),
+		Budget:                topologyBudgetFromConfig(p.cfg.TopologyConvergenceBudget),
+		DrainSelection:        topologyDrainSelectionFromConfig(p.cfg.TopologyDrainSelection),
+		CPUDetails:            cpuDetails,
+		ReservedCPUSet:        in.DesiredView.Reserve,
+		ExpectedCPUSetByRel:   expected,
+		DeferredCPUSetByRel:   deferred,
+		ProtectedCPUSetByRel:  protected,
+		TraversalBoundaries:   absentBoundaries,
+		RequiredIdentityByRel: requiredIdentities,
+		ExpectedAbsentRels:    absentBoundaries,
+		Objective:             topology.ConvergenceObjectiveFull,
 		PublishFinalSnapshot: func(snapshot *topology.CompleteSnapshot) error {
 			current, err := topology.ObserveConfiguredRels(ctx, p.cgroup, configured)
 			if err != nil {
@@ -1307,10 +1385,11 @@ func (p *CPUSetTopologyPlugin) applyBulkheadPartitionFlag(ctx context.Context, f
 // available to write, its cpuset protects the controlled ancestors' effective
 // targets from shrinking below the allocation; the absent leaf is not written.
 type pendingContainerCPUSet struct {
-	PodUID        string
-	ContainerName string
-	CPUs          machine.CPUSet
-	Reason        string
+	PodUID         string
+	ContainerName  string
+	CPUs           machine.CPUSet
+	Reason         string
+	NativeQOSClass v1.PodQOSClass
 }
 
 // expectedCPUSetBuildResult separates resolvable container leaves (ExpectedByRel,
@@ -1385,9 +1464,53 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in 
 					// admit); record it so the writer keeps the parent a superset.
 					general.InfofV(5, "bulkhead: container rel pending, protecting allocation, pod=%q container=%q cpuset=%s cpuset_size=%d err=%v",
 						podUID, containerName, cpus.String(), cpus.Size(), err)
-					out.PendingByPod = append(out.PendingByPod, pendingContainerCPUSet{
+					pending := pendingContainerCPUSet{
 						PodUID: podUID, ContainerName: containerName, CPUs: cpus, Reason: err.Error(),
-					})
+					}
+					if in.State != nil {
+						if allocation := in.State.GetAllocationInfo(podUID, containerName); allocation != nil {
+							pending.NativeQOSClass = v1.PodQOSClass(allocation.NativeQOSClass)
+						}
+					}
+					if metapod.IsPodNotFound(err) {
+						refreshCtx := context.WithValue(ctx, metapod.BypassCacheKey, metapod.BypassCacheTrue)
+						pod, podErr := in.MetaServer.GetPod(refreshCtx, podUID)
+						switch {
+						case podErr == nil && pod == nil:
+							errs = append(errs, fmt.Errorf(
+								"fresh pod lookup returned nil pod without error: pod=%s container=%s",
+								podUID, containerName))
+							continue
+						case podErr == nil:
+							pending.NativeQOSClass = v1qos.GetPodQOS(pod)
+						case !metapod.IsPodNotFound(podErr):
+							errs = append(errs, fmt.Errorf(
+								"fresh pod lookup failed: pod=%s container=%s: %w",
+								podUID, containerName, podErr))
+							continue
+						default:
+							exists, existsErr := p.pendingPodCgroupExists(
+								ctx, podUID, pending.NativeQOSClass)
+							if existsErr != nil {
+								errs = append(errs, fmt.Errorf(
+									"check pod cgroup after fresh pod not found: pod=%s container=%s: %w",
+									podUID, containerName, existsErr))
+								continue
+							}
+							if !exists {
+								general.Infof("bulkhead: stale checkpoint allocation skipped from pending protection, pod=%q container=%q cpuset=%s",
+									podUID, containerName, cpus.String())
+								continue
+							}
+						}
+					} else if pending.NativeQOSClass == "" {
+						refreshCtx := context.WithValue(ctx, metapod.BypassCacheKey, metapod.BypassCacheTrue)
+						pod, podErr := in.MetaServer.GetPod(refreshCtx, podUID)
+						if podErr == nil && pod != nil {
+							pending.NativeQOSClass = v1qos.GetPodQOS(pod)
+						}
+					}
+					out.PendingByPod = append(out.PendingByPod, pending)
 					continue
 				}
 				// A real internal error (illegal rel, cgroup/metaserver failure):
@@ -1416,6 +1539,29 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in 
 		return nil, apierrors.NewAggregate(errs)
 	}
 	return out, nil
+}
+
+func (p *CPUSetTopologyPlugin) pendingPodCgroupExists(
+	ctx context.Context,
+	podUID string,
+	qosClass v1.PodQOSClass,
+) (bool, error) {
+	if p.cgroup == nil {
+		return false, fmt.Errorf("cgroup client is nil")
+	}
+	candidates := cgcommon.GetPodRelativeCgroupPathCandidatesForQOS(podUID, qosClass)
+	for _, rel := range candidates {
+		rel = strings.Trim(rel, "/")
+		if rel == "" {
+			continue
+		}
+		if _, err := p.cgroup.StatDir(ctx, rel); err == nil {
+			return true, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return false, fmt.Errorf("stat pod cgroup candidate %q: %w", rel, err)
+		}
+	}
+	return false, nil
 }
 
 func (p *CPUSetTopologyPlugin) reclassifyAdmissionDeferredLeaves(ctx context.Context, view *model.DesiredView, expectedRes *expectedCPUSetBuildResult) {
@@ -1660,10 +1806,101 @@ func (p *CPUSetTopologyPlugin) pendingProtectedCPUSetByRel(ctx context.Context, 
 	return out
 }
 
+func (p *CPUSetTopologyPlugin) pendingProtectionScopes(
+	ctx context.Context,
+	dag *topology.TopoDAG,
+	pendingByPod []pendingContainerCPUSet,
+) ([]topology.PendingProtection, error) {
+	if p.now == nil {
+		p.now = time.Now
+	}
+	if p.pendingProtections == nil {
+		p.pendingProtections = map[string]pendingPodProtection{}
+	}
+
+	now := p.now()
+	aggregated := make(map[string]pendingContainerCPUSet, len(pendingByPod))
+	active := make(map[string]struct{}, len(pendingByPod))
+	for _, pending := range pendingByPod {
+		active[pending.PodUID] = struct{}{}
+		current, ok := aggregated[pending.PodUID]
+		if !ok {
+			aggregated[pending.PodUID] = pending
+			continue
+		}
+		current.CPUs = current.CPUs.Union(pending.CPUs)
+		if current.NativeQOSClass == "" {
+			current.NativeQOSClass = pending.NativeQOSClass
+		}
+		aggregated[pending.PodUID] = current
+	}
+
+	out := make([]topology.PendingProtection, 0, len(aggregated))
+	for podUID, pending := range aggregated {
+		protection, ok := p.pendingProtections[podUID]
+		if !ok || !now.Before(protection.protectUntil) {
+			protection.protectUntil = now.Add(defaultPendingPodProtectionTTL)
+		}
+		rel := protection.rel
+		if rel == "" {
+			var err error
+			candidates := cgcommon.GetPodRelativeCgroupPathCandidatesForQOS(
+				podUID, pending.NativeQOSClass)
+			rel, err = dag.SelectUniqueControlledPrimaryCandidate(candidates)
+			if err != nil {
+				return nil, fmt.Errorf("resolve pending pod scope %q with native qos %q from candidates %v: %w",
+					podUID, pending.NativeQOSClass, candidates, err)
+			}
+		}
+		rel = path.Clean(strings.Trim(rel, "/"))
+		if rel == "." || rel == "" || rel == ".." || strings.HasPrefix(rel, "../") {
+			return nil, fmt.Errorf("%w: pod=%q scope=%q",
+				topology.ErrInvalidPendingProtection, podUID, rel)
+		}
+
+		source := topology.PendingProtectionSourceExpectedPod
+		current, err := p.cgroup.ReadCPUSet(ctx, rel)
+		if err == nil && !current.IsEmpty() {
+			source = topology.PendingProtectionSourceExistingPod
+			protection.current = current
+		}
+		protection.rel = rel
+		p.pendingProtections[podUID] = protection
+		general.Infof("bulkhead: pending pod scope selected, pod=%q native_qos=%q scope=%q source=%q cpuset=%s",
+			podUID, pending.NativeQOSClass, rel, source, pending.CPUs.String())
+		out = append(out, topology.PendingProtection{
+			ScopeRel: rel,
+			CPUs:     pending.CPUs.Clone(),
+			PodUID:   podUID,
+			Source:   source,
+		})
+	}
+	for podUID := range p.pendingProtections {
+		if _, ok := active[podUID]; !ok {
+			delete(p.pendingProtections, podUID)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ScopeRel != out[j].ScopeRel {
+			return out[i].ScopeRel < out[j].ScopeRel
+		}
+		return out[i].PodUID < out[j].PodUID
+	})
+	return out, nil
+}
+
 func unionCPUSetByRel(byRel map[string]machine.CPUSet) machine.CPUSet {
 	union := machine.NewCPUSet()
 	for _, cpus := range byRel {
 		union = union.Union(cpus)
+	}
+	return union
+}
+
+func pendingProtectionCPUSetUnion(protections []topology.PendingProtection) machine.CPUSet {
+	union := machine.NewCPUSet()
+	for _, protection := range protections {
+		union = union.Union(protection.CPUs)
 	}
 	return union
 }

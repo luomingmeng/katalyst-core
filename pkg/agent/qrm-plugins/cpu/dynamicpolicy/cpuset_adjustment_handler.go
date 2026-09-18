@@ -52,6 +52,7 @@ const (
 	cpuSetAdjustmentRetryMaxAttempts    = 4
 	cpuSetAdjustmentRetryInitialBackoff = 10 * time.Millisecond
 	cpuSetAdjustmentRetryMaxBackoff     = 200 * time.Millisecond
+	cpuSetAdjustmentAdmissionReplans    = 4
 	advisorPostCommitCheckpointName     = "cpu_advisor_post_commit_target"
 	advisorPostCommitCheckpointVersion  = 2
 	advisorPostCommitWALV2Magic         = "\x00KATALYST_CPU_ADVISOR_WAL_V2\x00"
@@ -406,8 +407,23 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 		p.Unlock()
 		var roundErr error
 		for _, name := range names {
-			if err := handlers[name](ctx, handlerCtx); err != nil {
-				roundErr = fmt.Errorf("run cpuset adjustment handler %q: %w", name, err)
+			for attempt := 1; ; attempt++ {
+				err := handlers[name](ctx, handlerCtx)
+				if err == nil {
+					break
+				}
+				wrapped := fmt.Errorf("run cpuset adjustment handler %q: %w", name, err)
+				if mode == cpusetutil.CPUSetAdjustmentModeAdmission &&
+					attempt < cpuSetAdjustmentAdmissionReplans &&
+					isFrozenSnapshotDriftReplanSafe(err) && ctx.Err() == nil {
+					general.InfoS("retry cpuset adjustment handler after safe frozen snapshot drift",
+						"handler", name, "attempt", attempt)
+					continue
+				}
+				roundErr = wrapped
+				break
+			}
+			if roundErr != nil {
 				break
 			}
 		}
@@ -472,6 +488,15 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 		}
 		return roundErr
 	}
+}
+
+func isFrozenSnapshotDriftReplanSafe(err error) bool {
+	var initialDrift interface{ FrozenInitialSnapshotDrift() bool }
+	if errors.As(err, &initialDrift) && initialDrift.FrozenInitialSnapshotDrift() {
+		return true
+	}
+	var verifiedRollback interface{ FrozenSnapshotDriftReplanSafe() bool }
+	return errors.As(err, &verifiedRollback) && verifiedRollback.FrozenSnapshotDriftReplanSafe()
 }
 
 func cloneAdvisorPostCommitTarget(

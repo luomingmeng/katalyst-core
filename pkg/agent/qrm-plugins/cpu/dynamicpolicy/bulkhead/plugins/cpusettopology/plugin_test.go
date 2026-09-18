@@ -28,6 +28,7 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -662,6 +663,178 @@ func TestPendingProtectedCPUSetByRelClearsPodNoLongerPending(t *testing.T) {
 	}
 }
 
+func TestPendingProtectionScopesRetainExpectedPathsForAllQoS(t *testing.T) {
+	now := time.Date(2026, time.September, 18, 8, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		podUID string
+		podRel string
+		cpus   machine.CPUSet
+	}{
+		{
+			name:   "ordinary shared",
+			podUID: "pod-shared",
+			podRel: "kubepods/burstable/pod-shared",
+			cpus:   machine.NewCPUSet(0, 1, 2, 3),
+		},
+		{
+			name:   "snb",
+			podUID: "pod-snb",
+			podRel: "kubepods/burstable/pod-snb",
+			cpus:   machine.NewCPUSet(4, 5),
+		},
+		{
+			name:   "dnb",
+			podUID: "pod-dnb",
+			podRel: "kubepods/pod-dnb",
+			cpus:   machine.NewCPUSet(6, 7),
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			p := &CPUSetTopologyPlugin{
+				cgroup: &fakeCgroupClient{},
+				now:    func() time.Time { return now },
+				pendingProtections: map[string]pendingPodProtection{
+					tt.podUID: {
+						rel:          tt.podRel,
+						protectUntil: now.Add(defaultPendingPodProtectionTTL),
+					},
+				},
+			}
+
+			got, err := p.pendingProtectionScopes(context.Background(), nil, []pendingContainerCPUSet{{
+				PodUID: tt.podUID, ContainerName: "main", CPUs: tt.cpus,
+			}})
+
+			if err != nil {
+				t.Fatalf("pendingProtectionScopes() error = %v", err)
+			}
+			want := []topology.PendingProtection{{
+				ScopeRel: tt.podRel,
+				CPUs:     tt.cpus,
+				PodUID:   tt.podUID,
+				Source:   topology.PendingProtectionSourceExpectedPod,
+			}}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("pending protections = %#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+func TestPendingProtectionScopesUseExistingPodEvidence(t *testing.T) {
+	now := time.Date(2026, time.September, 18, 8, 0, 0, 0, time.UTC)
+	const (
+		podUID = "pod-existing"
+		podRel = "kubepods/burstable/pod-existing"
+	)
+	p := &CPUSetTopologyPlugin{
+		cgroup: &fakeCgroupClient{cpus: map[string]machine.CPUSet{
+			podRel: machine.NewCPUSet(0, 1, 2, 3),
+		}},
+		now: func() time.Time { return now },
+		pendingProtections: map[string]pendingPodProtection{
+			podUID: {
+				rel:          podRel,
+				protectUntil: now.Add(defaultPendingPodProtectionTTL),
+			},
+		},
+	}
+
+	got, err := p.pendingProtectionScopes(context.Background(), nil, []pendingContainerCPUSet{
+		{PodUID: podUID, ContainerName: "main", CPUs: machine.NewCPUSet(0, 1)},
+		{PodUID: podUID, ContainerName: "sidecar", CPUs: machine.NewCPUSet(2, 3)},
+	})
+
+	if err != nil {
+		t.Fatalf("pendingProtectionScopes() error = %v", err)
+	}
+	want := []topology.PendingProtection{{
+		ScopeRel: podRel,
+		CPUs:     machine.NewCPUSet(0, 1, 2, 3),
+		PodUID:   podUID,
+		Source:   topology.PendingProtectionSourceExistingPod,
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("pending protections = %#v, want %#v", got, want)
+	}
+}
+
+func TestPendingProtectionScopesResolveColdPodFromDAGWithoutFilesystemEvidence(t *testing.T) {
+	t.Parallel()
+
+	const podUID = "cold-shared"
+	dag, err := topology.BuildDAG([]topology.NodeSpec{{
+		Rel:            "kubepods/burstable",
+		Role:           topology.TopoNodeRolePrimary,
+		Domain:         topology.DomainPrimary,
+		ControlledRoot: true,
+	}})
+	if err != nil {
+		t.Fatalf("BuildDAG() error = %v", err)
+	}
+	p := &CPUSetTopologyPlugin{
+		cgroup:             &fakeCgroupClient{},
+		pendingProtections: map[string]pendingPodProtection{},
+	}
+
+	got, err := p.pendingProtectionScopes(context.Background(), dag, []pendingContainerCPUSet{{
+		PodUID: podUID, ContainerName: "main", CPUs: machine.NewCPUSet(0, 1),
+		NativeQOSClass: v1.PodQOSBurstable,
+	}})
+	if err != nil {
+		t.Fatalf("pendingProtectionScopes() error = %v", err)
+	}
+	want := []topology.PendingProtection{{
+		ScopeRel: "kubepods/burstable/podcold-shared",
+		CPUs:     machine.NewCPUSet(0, 1),
+		PodUID:   podUID,
+		Source:   topology.PendingProtectionSourceExpectedPod,
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("pending protections = %#v, want %#v", got, want)
+	}
+}
+
+func TestPendingProtectionScopesResolveGuaranteedPodUnderProductionPrimaryRoot(t *testing.T) {
+	t.Parallel()
+
+	const podUID = "cold-guaranteed"
+	dag, err := topology.BuildDAG([]topology.NodeSpec{{
+		Rel:            "kubepods",
+		Role:           topology.TopoNodeRolePrimary,
+		Domain:         topology.DomainPrimary,
+		ControlledRoot: true,
+	}})
+	if err != nil {
+		t.Fatalf("BuildDAG() error = %v", err)
+	}
+	p := &CPUSetTopologyPlugin{
+		cgroup:             &fakeCgroupClient{},
+		pendingProtections: map[string]pendingPodProtection{},
+	}
+
+	got, err := p.pendingProtectionScopes(context.Background(), dag, []pendingContainerCPUSet{{
+		PodUID: podUID, ContainerName: "main", CPUs: machine.NewCPUSet(0, 1),
+		NativeQOSClass: v1.PodQOSGuaranteed,
+	}})
+	if err != nil {
+		t.Fatalf("pendingProtectionScopes() error = %v", err)
+	}
+	want := []topology.PendingProtection{{
+		ScopeRel: "kubepods/podcold-guaranteed",
+		CPUs:     machine.NewCPUSet(0, 1),
+		PodUID:   podUID,
+		Source:   topology.PendingProtectionSourceExpectedPod,
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("pending protections = %#v, want %#v", got, want)
+	}
+}
+
 func TestDeferredLeafDrainWritesSafeLeafDespiteGlobalMismatch(t *testing.T) {
 	t.Parallel()
 
@@ -1216,6 +1389,12 @@ func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t
 					BulkheadReclaimRelPaths: []string{"reclaim"},
 				},
 				cgroup: cg,
+				pendingProtections: map[string]pendingPodProtection{
+					podUID: {
+						rel:          "primary",
+						protectUntil: time.Now().Add(defaultPendingPodProtectionTTL),
+					},
+				},
 			}
 			dedicatedIdentity := model.CPUSetPoolIdentity{
 				Kind:         model.CPUSetPoolKindDedicated,
@@ -3123,13 +3302,20 @@ func bulkheadCpusetTopologyDynamicConf(enableBulkheadCpusetTopology, allowShared
 	return conf
 }
 
-func TestCPUSetTopologyPluginSkipsExpectedCPUSetForMissingPod(t *testing.T) {
+func TestCPUSetTopologyPluginDropsFreshMissingPodWithoutPodCgroupFromPendingProtection(t *testing.T) {
 	t.Parallel()
 
-	p := &CPUSetTopologyPlugin{}
+	podUID := "missing-pod"
+	statErrors := make(map[string]error)
+	for _, rel := range cgcommon.GetPodRelativeCgroupPathCandidates(podUID) {
+		statErrors[strings.Trim(rel, "/")] = os.ErrNotExist
+	}
+	p := &CPUSetTopologyPlugin{
+		cgroup: &fakeCgroupClient{statErrors: statErrors},
+	}
 	view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
 		ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
-			"missing-pod": {
+			podUID: {
 				"main": machine.NewCPUSet(0, 1),
 			},
 		},
@@ -3140,24 +3326,18 @@ func TestCPUSetTopologyPluginSkipsExpectedCPUSetForMissingPod(t *testing.T) {
 		},
 	}
 
-	// A missing pod fails at the container-id stage, which is the admit-safe
-	// pending case: no error, no expected leaf, but the allocation is recorded
-	// as protected-pending so the writer keeps the parent a superset.
 	res, err := p.buildExpectedCPUSetByRel(context.Background(), bulkheadapi.HandlerContext{
 		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{MetaServer: metaServer},
 		DesiredView:                view,
 	})
 	if err != nil {
-		t.Fatalf("missing pod must not error (admit-safe pending), got %v", err)
+		t.Fatalf("fresh missing pod with no pod cgroup must be ignored as stale checkpoint state, got %v", err)
 	}
 	if len(res.ExpectedByRel) != 0 {
 		t.Fatalf("expected no resolved leaves, got %#v", res.ExpectedByRel)
 	}
-	if len(res.PendingByPod) != 1 {
-		t.Fatalf("expected one protected-pending entry, got %#v", res.PendingByPod)
-	}
-	if got := res.PendingCPUSetUnion().String(); got != "0-1" {
-		t.Fatalf("pending union = %s, want 0-1", got)
+	if len(res.PendingByPod) != 0 {
+		t.Fatalf("stale checkpoint entry entered pending protection: %#v", res.PendingByPod)
 	}
 }
 
@@ -3179,6 +3359,48 @@ type disappearingContainerIDFetcher struct {
 	metapod.PodFetcherStub
 	containerID string
 	calls       int
+}
+
+type allocationLookupState struct {
+	cpustate.ReadonlyState
+	info *cpustate.AllocationInfo
+}
+
+func (s *allocationLookupState) GetAllocationInfo(_, _ string) *cpustate.AllocationInfo {
+	return s.info
+}
+
+type bypassAwarePodFetcher struct {
+	metapod.PodFetcherStub
+	pod *v1.Pod
+}
+
+func (f *bypassAwarePodFetcher) GetPod(ctx context.Context, _ string) (*v1.Pod, error) {
+	if ctx.Value(metapod.BypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, metapod.NewPodNotFoundError(string(f.pod.UID))
+	}
+	return f.pod.DeepCopy(), nil
+}
+
+type freshPodLookupFetcher struct {
+	metapod.PodFetcherStub
+	pod      *v1.Pod
+	err      error
+	freshHit bool
+}
+
+func (f *freshPodLookupFetcher) GetPod(ctx context.Context, _ string) (*v1.Pod, error) {
+	if ctx.Value(metapod.BypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("pod freshness query did not bypass cache")
+	}
+	f.freshHit = true
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.pod == nil {
+		return nil, metapod.NewPodNotFoundError("missing")
+	}
+	return f.pod.DeepCopy(), nil
 }
 
 type bypassAwareContainerIDFetcher struct {
@@ -3441,6 +3663,170 @@ func TestFinalSnapshotFailsClosedWhenIdentityRefreshFails(t *testing.T) {
 	}
 }
 
+// parentSafeDynamicLeafFixture builds a single dynamic container-leaf fixture
+// whose observed final-snapshot cpuset is provided by the caller, so the
+// ParentSafe safe-superset contract can be exercised in isolation.
+func parentSafeDynamicLeafFixture(
+	t *testing.T,
+	handlerName string,
+	podUID string,
+	containerID string,
+	rel string,
+	desiredCPUs machine.CPUSet,
+	observedCPUs machine.CPUSet,
+) (*metaserver.MetaServer, *model.DesiredView, *topology.CompleteSnapshot) {
+	t.Helper()
+	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+		Name: handlerName,
+		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
+			if gotPodUID == podUID && gotContainerID == containerID {
+				return rel, false, nil
+			}
+			return "", true, nil
+		},
+	})
+	fetcher := &bypassAwareContainerIDFetcher{cachedID: containerID, currentID: containerID}
+	metaServer := &metaserver.MetaServer{
+		MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
+	}
+	desired := model.NewDesiredView()
+	desired.ContainerCPUSetByPod[podUID] = map[string]machine.CPUSet{"main": desiredCPUs}
+	snapshot := &topology.CompleteSnapshot{Entries: map[string]topology.EntryState{
+		rel: {Identity: topology.CgroupIdentity{Inode: 1}, CPUs: observedCPUs},
+	}}
+	return metaServer, desired, snapshot
+}
+
+func TestParentSafeFinalizationPublishesDynamicLeafSafeSuperset(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID      = "pod-parentsafe-superset"
+		containerID = "container-parentsafe-superset"
+		rel         = "primary/container-parentsafe-superset"
+	)
+	desiredCPUs := machine.NewCPUSet(0, 1)
+	observedCPUs := machine.NewCPUSet(0, 1, 2, 3)
+	finalPrimary := machine.NewCPUSet(0, 1, 2, 3, 4, 5)
+	finalReclaim := machine.NewCPUSet(6, 7)
+	metaServer, desired, snapshot := parentSafeDynamicLeafFixture(
+		t, "parentsafe-superset", podUID, containerID, rel, desiredCPUs, observedCPUs)
+
+	deferredCPUSetByRel := map[string]machine.CPUSet{}
+	published, err := containerCPUSetByPodFromFinalSnapshotParentSafe(
+		context.Background(), metaServer, desired, snapshot,
+		nil, deferredCPUSetByRel, finalPrimary, finalReclaim)
+	if err != nil {
+		t.Fatalf("parent-safe dynamic leaf safe superset must publish: %v", err)
+	}
+	if got := published[podUID]["main"]; !got.Equals(observedCPUs) {
+		t.Fatalf("published dynamic leaf cpuset = %s, want observed superset %s",
+			got.String(), observedCPUs.String())
+	}
+	if got, ok := deferredCPUSetByRel[rel]; !ok || !got.Equals(desiredCPUs) {
+		t.Fatalf("deferred drain target = %s ok=%t, want exact desired %s", got.String(), ok, desiredCPUs.String())
+	}
+}
+
+func TestParentSafeFinalizationRejectsDynamicLeafOverlappingReclaim(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID      = "pod-parentsafe-reclaim-overlap"
+		containerID = "container-parentsafe-reclaim-overlap"
+		rel         = "primary/container-parentsafe-reclaim-overlap"
+	)
+	desiredCPUs := machine.NewCPUSet(0, 1)
+	// Observed superset reaches into the finalized reclaim domain, which is
+	// never a safe superset even on the ParentSafe path.
+	observedCPUs := machine.NewCPUSet(0, 1, 6)
+	finalPrimary := machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6)
+	finalReclaim := machine.NewCPUSet(6, 7)
+	metaServer, desired, snapshot := parentSafeDynamicLeafFixture(
+		t, "parentsafe-reclaim-overlap", podUID, containerID, rel, desiredCPUs, observedCPUs)
+
+	_, err := containerCPUSetByPodFromFinalSnapshotParentSafe(
+		context.Background(), metaServer, desired, snapshot,
+		nil, nil, finalPrimary, finalReclaim)
+	var staleErr *topology.PlanStaleError
+	if !errors.As(err, &staleErr) {
+		t.Fatalf("dynamic leaf overlapping reclaim must fail closed, got err = %v", err)
+	}
+}
+
+func TestParentSafeFinalizationRejectsDynamicLeafMissingDesiredCPU(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID      = "pod-parentsafe-missing-desired"
+		containerID = "container-parentsafe-missing-desired"
+		rel         = "primary/container-parentsafe-missing-desired"
+	)
+	desiredCPUs := machine.NewCPUSet(0, 1)
+	observedCPUs := machine.NewCPUSet(0, 2, 3)
+	finalPrimary := machine.NewCPUSet(0, 1, 2, 3, 4, 5)
+	finalReclaim := machine.NewCPUSet(6, 7)
+	metaServer, desired, snapshot := parentSafeDynamicLeafFixture(
+		t, "parentsafe-missing-desired", podUID, containerID, rel, desiredCPUs, observedCPUs)
+
+	_, err := containerCPUSetByPodFromFinalSnapshotParentSafe(
+		context.Background(), metaServer, desired, snapshot,
+		nil, nil, finalPrimary, finalReclaim)
+	var staleErr *topology.PlanStaleError
+	if !errors.As(err, &staleErr) {
+		t.Fatalf("dynamic leaf missing desired CPUs must fail closed, got err = %v", err)
+	}
+}
+
+func TestParentSafeFinalizationRejectsDynamicLeafExceedingPrimaryDomain(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID      = "pod-parentsafe-exceeds-primary"
+		containerID = "container-parentsafe-exceeds-primary"
+		rel         = "primary/container-parentsafe-exceeds-primary"
+	)
+	desiredCPUs := machine.NewCPUSet(0, 1)
+	// Observed superset includes CPU 9 which is outside the finalized primary
+	// domain and not part of reclaim; it must not be published.
+	observedCPUs := machine.NewCPUSet(0, 1, 9)
+	finalPrimary := machine.NewCPUSet(0, 1, 2, 3)
+	finalReclaim := machine.NewCPUSet(6, 7)
+	metaServer, desired, snapshot := parentSafeDynamicLeafFixture(
+		t, "parentsafe-exceeds-primary", podUID, containerID, rel, desiredCPUs, observedCPUs)
+
+	_, err := containerCPUSetByPodFromFinalSnapshotParentSafe(
+		context.Background(), metaServer, desired, snapshot,
+		nil, nil, finalPrimary, finalReclaim)
+	var staleErr *topology.PlanStaleError
+	if !errors.As(err, &staleErr) {
+		t.Fatalf("dynamic leaf exceeding primary domain must fail closed, got err = %v", err)
+	}
+}
+
+func TestFullConvergenceFinalizationRejectsDynamicLeafSuperset(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID      = "pod-full-converge-superset"
+		containerID = "container-full-converge-superset"
+		rel         = "primary/container-full-converge-superset"
+	)
+	desiredCPUs := machine.NewCPUSet(0, 1)
+	observedCPUs := machine.NewCPUSet(0, 1, 2, 3)
+	metaServer, desired, snapshot := parentSafeDynamicLeafFixture(
+		t, "full-converge-superset", podUID, containerID, rel, desiredCPUs, observedCPUs)
+
+	// The full-convergence publish path (parentSafe=false) must keep exact-match
+	// mandatory even when the observed cpuset would be a safe superset.
+	_, err := containerCPUSetByPodFromFinalSnapshotWithContext(
+		context.Background(), metaServer, desired, snapshot, nil)
+	var staleErr *topology.PlanStaleError
+	if !errors.As(err, &staleErr) {
+		t.Fatalf("full-convergence path must reject superset, got err = %v", err)
+	}
+}
+
 func TestCPUSetTopologyPluginTreatsRotatedContainerIdentityAsPending(t *testing.T) {
 	t.Parallel()
 
@@ -3542,6 +3928,8 @@ func TestCPUSetTopologyPluginSkipsExpectedCPUSetForMissingContainer(t *testing.T
 	t.Parallel()
 
 	p := &CPUSetTopologyPlugin{}
+	allocationInfo := &cpustate.AllocationInfo{}
+	allocationInfo.NativeQOSClass = string(v1.PodQOSGuaranteed)
 	metaServer := &metaserver.MetaServer{
 		MetaAgent: &agent.MetaAgent{
 			PodFetcher: &metapod.PodFetcherStub{PodList: []*v1.Pod{{
@@ -3560,8 +3948,11 @@ func TestCPUSetTopologyPluginSkipsExpectedCPUSetForMissingContainer(t *testing.T
 	// A container with no status yet also fails at the container-id stage:
 	// admit-safe pending, not an error.
 	res, err := p.buildExpectedCPUSetByRel(context.Background(), bulkheadapi.HandlerContext{
-		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{MetaServer: metaServer},
-		DesiredView:                view,
+		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+			MetaServer: metaServer,
+			State:      &allocationLookupState{info: allocationInfo},
+		},
+		DesiredView: view,
 	})
 	if err != nil {
 		t.Fatalf("missing container must not error (admit-safe pending), got %v", err)
@@ -3571,6 +3962,151 @@ func TestCPUSetTopologyPluginSkipsExpectedCPUSetForMissingContainer(t *testing.T
 	}
 	if len(res.PendingByPod) != 1 {
 		t.Fatalf("expected one protected-pending entry, got %#v", res.PendingByPod)
+	}
+	if got := res.PendingByPod[0].NativeQOSClass; got != v1.PodQOSGuaranteed {
+		t.Fatalf("pending native qos class = %q, want %q", got, v1.PodQOSGuaranteed)
+	}
+}
+
+func TestCPUSetTopologyPluginRefreshesPodForPendingNativeQOSClass(t *testing.T) {
+	t.Parallel()
+
+	podUID := "pod-1"
+	p := &CPUSetTopologyPlugin{}
+	allocationInfo := &cpustate.AllocationInfo{}
+	metaServer := &metaserver.MetaServer{
+		MetaAgent: &agent.MetaAgent{
+			PodFetcher: &bypassAwarePodFetcher{pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+				Spec: v1.PodSpec{Containers: []v1.Container{{
+					Name: "main",
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    resource.MustParse("1"),
+							v1.ResourceMemory: resource.MustParse("1Gi"),
+						},
+						Limits: v1.ResourceList{
+							v1.ResourceCPU:    resource.MustParse("1"),
+							v1.ResourceMemory: resource.MustParse("1Gi"),
+						},
+					},
+				}}},
+			}},
+		},
+	}
+	view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+			podUID: {"main": machine.NewCPUSet(0, 1)},
+		},
+	}}
+
+	res, err := p.buildExpectedCPUSetByRel(context.Background(), bulkheadapi.HandlerContext{
+		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+			MetaServer: metaServer,
+			State:      &allocationLookupState{info: allocationInfo},
+		},
+		DesiredView: view,
+	})
+	if err != nil {
+		t.Fatalf("missing container must remain admit-safe pending, got %v", err)
+	}
+	if len(res.PendingByPod) != 1 {
+		t.Fatalf("expected one protected-pending entry, got %#v", res.PendingByPod)
+	}
+	if got := res.PendingByPod[0].NativeQOSClass; got != v1.PodQOSGuaranteed {
+		t.Fatalf("pending native qos class = %q, want %q", got, v1.PodQOSGuaranteed)
+	}
+}
+
+func TestCPUSetTopologyPluginLivePodWithoutCgroupStillBuildsExpectedPendingScope(t *testing.T) {
+	t.Parallel()
+
+	const podUID = "live-pod-without-cgroup"
+	fetcher := &freshPodLookupFetcher{pod: &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+		Spec: v1.PodSpec{Containers: []v1.Container{{
+			Name: "main",
+			Resources: v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceCPU:    resource.MustParse("1"),
+					v1.ResourceMemory: resource.MustParse("1Gi"),
+				},
+				Limits: v1.ResourceList{
+					v1.ResourceCPU:    resource.MustParse("1"),
+					v1.ResourceMemory: resource.MustParse("1Gi"),
+				},
+			},
+		}}},
+	}}
+	metaServer := &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: fetcher}}
+	p := &CPUSetTopologyPlugin{
+		cgroup:             &fakeCgroupClient{},
+		pendingProtections: map[string]pendingPodProtection{},
+	}
+	view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+			podUID: {"main": machine.NewCPUSet(0, 1)},
+		},
+	}}
+
+	res, err := p.buildExpectedCPUSetByRel(context.Background(), bulkheadapi.HandlerContext{
+		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{MetaServer: metaServer},
+		DesiredView:                view,
+	})
+	if err != nil {
+		t.Fatalf("live pod without cgroup must remain pending: %v", err)
+	}
+	dag, err := topology.BuildDAG([]topology.NodeSpec{{
+		Rel:            "kubepods",
+		Role:           topology.TopoNodeRolePrimary,
+		Domain:         topology.DomainPrimary,
+		ControlledRoot: true,
+	}})
+	if err != nil {
+		t.Fatalf("BuildDAG() error = %v", err)
+	}
+	scopes, err := p.pendingProtectionScopes(context.Background(), dag, res.PendingByPod)
+	if err != nil {
+		t.Fatalf("pendingProtectionScopes() error = %v", err)
+	}
+	want := []topology.PendingProtection{{
+		ScopeRel: "kubepods/pod" + podUID,
+		CPUs:     machine.NewCPUSet(0, 1),
+		PodUID:   podUID,
+		Source:   topology.PendingProtectionSourceExpectedPod,
+	}}
+	if !reflect.DeepEqual(scopes, want) {
+		t.Fatalf("pending scopes = %#v, want %#v", scopes, want)
+	}
+	if !fetcher.freshHit {
+		t.Fatal("live pod was not confirmed through a fresh lookup")
+	}
+}
+
+func TestCPUSetTopologyPluginFailsClosedOnUnknownFreshPodLookupError(t *testing.T) {
+	t.Parallel()
+
+	queryErr := errors.New("apiserver query failed")
+	fetcher := &freshPodLookupFetcher{err: queryErr}
+	metaServer := &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: fetcher}}
+	view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+			"unknown-query-pod": {"main": machine.NewCPUSet(0, 1)},
+		},
+	}}
+
+	res, err := (&CPUSetTopologyPlugin{cgroup: &fakeCgroupClient{}}).buildExpectedCPUSetByRel(
+		context.Background(),
+		bulkheadapi.HandlerContext{
+			CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{MetaServer: metaServer},
+			DesiredView:                view,
+		},
+	)
+	if !errors.Is(err, queryErr) {
+		t.Fatalf("unknown fresh pod lookup error must fail closed, got res=%#v err=%v", res, err)
+	}
+	if !fetcher.freshHit {
+		t.Fatal("unknown error path did not execute a fresh pod lookup")
 	}
 }
 

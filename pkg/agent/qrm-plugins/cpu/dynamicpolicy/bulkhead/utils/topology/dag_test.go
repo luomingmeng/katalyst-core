@@ -17,11 +17,119 @@ limitations under the License.
 package topology
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
+
+func TestSelectUniqueCandidateByDeepestControlledPrimaryAncestor(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		primaryRel string
+		candidates []string
+		want       string
+	}{
+		{
+			name:       "ordinary shared",
+			primaryRel: "kubepods/burstable",
+			candidates: []string{
+				"kubepods/pod-shared",
+				"kubepods/besteffort/pod-shared",
+				"kubepods/burstable/pod-shared",
+			},
+			want: "kubepods/burstable/pod-shared",
+		},
+		{
+			name:       "snb",
+			primaryRel: "kubepods/shared-numa-binding",
+			candidates: []string{
+				"kubepods/pod-snb",
+				"kubepods/shared-numa-binding/pod-snb",
+			},
+			want: "kubepods/shared-numa-binding/pod-snb",
+		},
+		{
+			name:       "dnb",
+			primaryRel: "kubepods/dedicated-numa-binding",
+			candidates: []string{
+				"kubepods/pod-dnb",
+				"kubepods/dedicated-numa-binding/pod-dnb",
+			},
+			want: "kubepods/dedicated-numa-binding/pod-dnb",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dag, err := BuildDAG([]NodeSpec{{
+				Rel:            tt.primaryRel,
+				Role:           TopoNodeRolePrimary,
+				Domain:         DomainPrimary,
+				ControlledRoot: true,
+			}})
+			if err != nil {
+				t.Fatalf("BuildDAG() error = %v", err)
+			}
+
+			got, err := dag.SelectUniqueControlledPrimaryCandidate(tt.candidates)
+			if err != nil {
+				t.Fatalf("SelectUniqueControlledPrimaryCandidate() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("selected candidate = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSelectUniqueControlledPrimaryCandidateFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	dag, err := BuildDAG([]NodeSpec{{
+		Rel:            "kubepods",
+		Role:           TopoNodeRolePrimary,
+		Domain:         DomainPrimary,
+		ControlledRoot: true,
+	}})
+	if err != nil {
+		t.Fatalf("BuildDAG() error = %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		candidates []string
+		wantErr    error
+	}{
+		{
+			name:       "no matching controlled primary ancestor",
+			candidates: []string{"outside/pod-a"},
+			wantErr:    ErrNoControlledPrimaryCandidate,
+		},
+		{
+			name: "ambiguous candidates at same ancestor depth",
+			candidates: []string{
+				"kubepods/burstable/pod-a",
+				"kubepods/besteffort/pod-a",
+			},
+			wantErr: ErrAmbiguousControlledPrimaryCandidate,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := dag.SelectUniqueControlledPrimaryCandidate(tt.candidates); !errors.Is(err, tt.wantErr) {
+				t.Fatalf("SelectUniqueControlledPrimaryCandidate() error = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
 
 func TestBuildDAGValidationAndTraversal(t *testing.T) {
 	t.Parallel()

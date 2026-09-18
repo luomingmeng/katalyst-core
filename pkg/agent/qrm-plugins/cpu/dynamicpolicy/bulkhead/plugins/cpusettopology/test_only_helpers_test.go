@@ -53,5 +53,28 @@ func containerCPUSetByPodFromFinalSnapshotWithContext(
 		deferredCPUSetByRel = deferredCPUSetMaps[0]
 	}
 	return containerCPUSetByPodFromFinalSnapshotWithDeferredCleanup(
-		ctx, metaServer, desired, snapshot, expectedCPUSetByRel, deferredCPUSetByRel, nil)
+		ctx, metaServer, desired, snapshot, expectedCPUSetByRel, deferredCPUSetByRel, nil,
+		containerLeafFinalization{})
+}
+
+// containerCPUSetByPodFromFinalSnapshotParentSafe is a test-only wrapper that
+// exercises the ParentSafe publish path with the safe-superset finalization
+// contract enabled.
+func containerCPUSetByPodFromFinalSnapshotParentSafe(
+	ctx context.Context,
+	metaServer *metaserver.MetaServer,
+	desired *model.DesiredView,
+	snapshot *topology.CompleteSnapshot,
+	expectedCPUSetByRel map[string]machine.CPUSet,
+	deferredCPUSetByRel map[string]machine.CPUSet,
+	finalPrimaryDomain machine.CPUSet,
+	finalReclaimDomain machine.CPUSet,
+) (map[string]map[string]machine.CPUSet, error) {
+	return containerCPUSetByPodFromFinalSnapshotWithDeferredCleanup(
+		ctx, metaServer, desired, snapshot, expectedCPUSetByRel, deferredCPUSetByRel, map[string]struct{}{},
+		containerLeafFinalization{
+			parentSafe:         true,
+			finalPrimaryDomain: finalPrimaryDomain,
+			finalReclaimDomain: finalReclaimDomain,
+		})
 }

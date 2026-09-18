@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"time"
 
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
@@ -32,6 +33,47 @@ import (
 // ParentSafe: a projected phase produced no state change, so freezing the trace
 // would loop forever instead of converging.
 var ErrNoProgress = errors.New("fixed-point compilation made no progress")
+
+type ProtectedTransferStallError struct {
+	CPUs machine.CPUSet
+}
+
+func (e *ProtectedTransferStallError) Error() string {
+	return fmt.Sprintf("%v: all pending transfer CPUs remain protected: cpus=%s",
+		ErrNoProgress, e.CPUs.String())
+}
+
+func (e *ProtectedTransferStallError) Unwrap() error { return ErrNoProgress }
+
+type phaseProgressKey struct {
+	SnapshotID SnapshotID
+	PlanID     string
+}
+
+type ProjectedPhaseCycleError struct {
+	SnapshotID SnapshotID
+	PlanID     string
+}
+
+func (e *ProjectedPhaseCycleError) Error() string {
+	return fmt.Sprintf("%v: projected phase cycle snapshot=%x plan=%s",
+		ErrNoProgress, e.SnapshotID, e.PlanID)
+}
+
+func (e *ProjectedPhaseCycleError) Unwrap() error { return ErrNoProgress }
+
+type ProjectedPhaseNoProgressError struct {
+	SnapshotID SnapshotID
+	PlanID     string
+	Operations int
+}
+
+func (e *ProjectedPhaseNoProgressError) Error() string {
+	return fmt.Sprintf("%v: projected frontier had no effect snapshot=%x plan=%s operations=%d",
+		ErrNoProgress, e.SnapshotID, e.PlanID, e.Operations)
+}
+
+func (e *ProjectedPhaseNoProgressError) Unwrap() error { return ErrNoProgress }
 
 // CompiledPhase is one ordered, frozen phase of a fixed-point trace. Operations
 // are already sequenced; execution replays them verbatim without re-planning.
@@ -58,6 +100,17 @@ type CompiledPhaseTrace struct {
 	Cost                 ExecutionReservationCost
 }
 
+func (t *CompiledPhaseTrace) OperationCount() int {
+	if t == nil {
+		return 0
+	}
+	count := 0
+	for _, phase := range t.Phases {
+		count += len(phase.Operations)
+	}
+	return count
+}
+
 // FrozenCoordinatorEvaluationInput owns every semantic input consumed by the
 // production coordinator evaluator. FreezePhaseTrace rebuilds the DAG and
 // recomputes FinalEvaluation from this immutable evidence instead of maintaining
@@ -74,6 +127,7 @@ type FrozenCoordinatorEvaluationInput struct {
 	DeferredByRel           map[string]machine.CPUSet
 	DeferredCleanupRels     map[string]struct{}
 	ProtectedPending        machine.CPUSet
+	PendingRequiredByRel    map[string]machine.CPUSet
 	Capabilities            HierarchyCapabilities
 	AllowEmptyTarget        bool
 }
@@ -116,6 +170,7 @@ func (in FrozenCoordinatorEvaluationInput) evaluate(
 		snapshot, dag, in.TargetByRel, in.ParentSafetyTargetByRel, in.TargetMemsByRel,
 		in.DesiredByDomain, in.AllowedCPUs, in.ExpectedByRel, in.RequiredByRel,
 		in.DeferredByRel, in.DeferredCleanupRels, in.ProtectedPending,
+		in.PendingRequiredByRel,
 		in.Capabilities, in.AllowEmptyTarget,
 	)
 }
@@ -131,6 +186,7 @@ type phaseExecutionSession interface {
 
 type projectedPhaseSession struct {
 	hierarchy *projectedHierarchy
+	progress  map[phaseProgressKey]struct{}
 }
 
 type livePhaseSession struct {
@@ -175,7 +231,10 @@ func newProjectedPhaseSession(
 	if err != nil {
 		return nil, err
 	}
-	return &projectedPhaseSession{hierarchy: hierarchy}, nil
+	return &projectedPhaseSession{
+		hierarchy: hierarchy,
+		progress:  make(map[phaseProgressKey]struct{}),
+	}, nil
 }
 
 func (s *projectedPhaseSession) Snapshot(_ context.Context) (*CompleteSnapshot, error) {
@@ -186,9 +245,28 @@ func (s *projectedPhaseSession) Apply(ctx context.Context, plan PhasePlan) (phas
 	if err := ctx.Err(); err != nil {
 		return phaseSessionApplyResult{}, err
 	}
+	if len(plan.Operations) == 0 {
+		return phaseSessionApplyResult{}, nil
+	}
+	key := phaseProgressKey{SnapshotID: s.hierarchy.snapshot.ID, PlanID: plan.PlanID}
+	if _, repeated := s.progress[key]; repeated {
+		return phaseSessionApplyResult{}, &ProjectedPhaseCycleError{
+			SnapshotID: key.SnapshotID,
+			PlanID:     key.PlanID,
+		}
+	}
+	s.progress[key] = struct{}{}
+	candidate, err := newProjectedHierarchy(s.hierarchy.snapshot, s.hierarchy.capabilities)
+	if err != nil {
+		return phaseSessionApplyResult{}, err
+	}
+	candidate.evidenceRebuilds = s.hierarchy.evidenceRebuilds
+	if err := validateProjectedFrontierIndependence(candidate, plan.Operations); err != nil {
+		return phaseSessionApplyResult{}, err
+	}
 	result := phaseSessionApplyResult{}
 	for _, operation := range plan.Operations {
-		if err := s.hierarchy.applyOperation(operation); err != nil {
+		if err := candidate.applyConfiguredOperation(operation); err != nil {
 			return result, err
 		}
 		result.Applied++
@@ -197,6 +275,21 @@ func (s *projectedPhaseSession) Apply(ctx context.Context, plan PhasePlan) (phas
 			Target: operation.Target, Observed: operation.Target,
 		})
 	}
+	if result.Applied != len(plan.Operations) {
+		return result, fmt.Errorf("projected frontier applied=%d operations=%d",
+			result.Applied, len(plan.Operations))
+	}
+	if err := candidate.settleEvidence(); err != nil {
+		return result, err
+	}
+	if candidate.snapshot.ID == key.SnapshotID {
+		return phaseSessionApplyResult{}, &ProjectedPhaseNoProgressError{
+			SnapshotID: key.SnapshotID,
+			PlanID:     key.PlanID,
+			Operations: len(plan.Operations),
+		}
+	}
+	*s.hierarchy = *candidate
 	return result, nil
 }
 
@@ -244,6 +337,36 @@ func (r *coordinatorRound) compileFixedPointTrace(
 		Cost:                 executionReservationCost(result.Phases),
 	}
 	return FreezePhaseTrace(trace)
+}
+
+// checkEngineDeadline fails fast at the top of every fixed-point round.
+//
+// The projected session used by compileFixedPointTrace performs Snapshot/Apply
+// purely in memory, so it never routes through the budgeted hierarchy driver
+// that enforces the convergence deadline on each I/O. Without this guard a
+// non-converging (thrashing) projection would silently consume the entire
+// admission handler timeout inside compile, leaving no budget for
+// executeFrozenTrace and surfacing as "admission parent-safe deadline
+// exceeded" with attempted=0 applied=0 (the coordinator never attempts a
+// physical write).
+//
+// Both context cancellation/deadline and the budget's absolute Deadline are
+// wrapped in ErrConvergenceDeadlineExceeded so callers classify the failure
+// as a convergence-budget error (fail-closed), while the underlying context
+// error stays on the chain for errors.Is. Used rounds and budget usage are
+// annotated for diagnosis.
+func (r *coordinatorRound) checkEngineDeadline(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: %w after rounds=%d usage=%+v",
+			ErrConvergenceDeadlineExceeded, err, r.round, r.budget.Usage())
+	}
+	if r.budget != nil && !r.budget.limit.Deadline.IsZero() &&
+		!time.Now().Before(r.budget.limit.Deadline) {
+		return fmt.Errorf("%w: budget_deadline=%s after rounds=%d usage=%+v",
+			ErrConvergenceDeadlineExceeded,
+			r.budget.limit.Deadline.Format(time.RFC3339Nano), r.round, r.budget.Usage())
+	}
+	return nil
 }
 
 // runFixedPointEngine drives the shared fixed-point engine against an execution
@@ -300,6 +423,9 @@ func (r *coordinatorRound) runFixedPointEngine(
 		}
 	}
 	for {
+		if err := r.checkEngineDeadline(ctx); err != nil {
+			return nil, err
+		}
 		if r.round >= r.maxRounds {
 			return nil, fmt.Errorf("%w: limit=%d used=%d", ErrRoundBudgetExceeded, r.maxRounds, r.round)
 		}
@@ -360,8 +486,12 @@ func (r *coordinatorRound) runFixedPointEngine(
 		if err != nil {
 			return errorResult(fresh, journal, err), err
 		}
-		if len(expand.Operations) > 0 {
-			applyResult, err := session.Apply(ctx, expand)
+		for len(expand.Operations) > 0 {
+			frontier, frontierErr := drainFrontier(expand)
+			if frontierErr != nil {
+				return errorResult(fresh, journal, frontierErr), frontierErr
+			}
+			applyResult, err := session.Apply(ctx, frontier)
 			journal = append(journal, applyResult.Journal...)
 			if err != nil {
 				recovered, snapshotErr := session.Snapshot(ctx)
@@ -372,8 +502,9 @@ func (r *coordinatorRound) runFixedPointEngine(
 			}
 			phases = append(phases, CompiledPhase{
 				Kind:       PhaseExpand,
-				Operations: append([]PlanOperation(nil), expand.Operations...),
+				Operations: append([]PlanOperation(nil), frontier.Operations...),
 			})
+			expand.Operations = expand.Operations[len(frontier.Operations):]
 		}
 
 		final, err := session.Snapshot(ctx)
@@ -387,7 +518,8 @@ func (r *coordinatorRound) runFixedPointEngine(
 			r.desiredDomainUnion(), r.allowedCPUs(),
 			r.dynamicByRel, r.requiredByRel, r.deferredByRel,
 			r.deferredCleanupRels,
-			r.admissionSafetyCPUSet(), capabilities, r.allowEmptyTarget,
+			r.admissionSafetyCPUSet(), r.pendingRequiredByRel,
+			capabilities, r.allowEmptyTarget,
 		)
 		if err != nil {
 			return nil, err
@@ -426,10 +558,47 @@ func (r *coordinatorRound) runFixedPointEngine(
 		if objectiveSatisfied || mode == fixedPointEngineSingleRound {
 			return result, nil
 		}
+		if protected := protectedTransferStallCPUs(drain, r, journal); !protected.IsEmpty() {
+			return nil, &ProtectedTransferStallError{CPUs: protected}
+		}
 		if final.ID == start.ID {
 			return nil, ErrNoProgress
 		}
 	}
+}
+
+func protectedTransferStallCPUs(
+	plan PhasePlan,
+	round *coordinatorRound,
+	journal []AppliedPlanOperation,
+) machine.CPUSet {
+	if len(journal) != 0 {
+		return machine.NewCPUSet()
+	}
+	if round == nil || round.dag == nil || len(plan.TransferGraph) == 0 {
+		return machine.NewCPUSet()
+	}
+	protectedByDomain := protectedCPUSetByDomain(
+		round.protectedByRel,
+		round.protectedPending,
+		round.dag,
+	)
+	all := machine.NewCPUSet()
+	for source, destinations := range plan.TransferGraph {
+		if !plan.DrainBatch[source].IsEmpty() {
+			return machine.NewCPUSet()
+		}
+		for _, cpus := range destinations {
+			if cpus.IsEmpty() {
+				continue
+			}
+			if !cpus.IsSubsetOf(protectedByDomain[source]) {
+				return machine.NewCPUSet()
+			}
+			all = all.Union(cpus)
+		}
+	}
+	return all
 }
 
 // applyDrainPhases executes a drain plan one frontier batch at a time against
@@ -479,8 +648,10 @@ func (r *coordinatorRound) applyDrainPhases(
 		}
 		if r.objective == ConvergenceObjectiveParentSafe {
 			required, _, splitErr := SplitPlanForAdmission(&plan, AdmissionSafetyInput{
-				ProtectedPendingCPUSet: r.admissionSafetyCPUSet(),
-				DeferredCPUSetByRel:    r.deferredByRel,
+				PendingCPUSet:        r.admissionSafetyCPUSet(),
+				PendingRequiredByRel: r.pendingRequiredByRel,
+				DeferredCPUSetByRel:  r.deferredByRel,
+				RequiredCPUSetByRel:  r.requiredByRel,
 			})
 			if splitErr != nil {
 				return fresh, released, journal, splitErr
@@ -497,6 +668,7 @@ func (r *coordinatorRound) cloneForProjection() *coordinatorRound {
 	out.dynamicByRel = cloneCPUSetMap(r.dynamicByRel)
 	out.deferredByRel = cloneCPUSetMap(r.deferredByRel)
 	out.requiredByRel = cloneCPUSetMap(r.requiredByRel)
+	out.pendingRequiredByRel = cloneCPUSetMap(r.pendingRequiredByRel)
 	out.protectedPending = r.protectedPending.Clone()
 	out.protectedByRel = cloneCPUSetMap(r.protectedByRel)
 	out.requiredIdentityByRel = cloneIdentityMap(r.requiredIdentityByRel)
@@ -552,6 +724,7 @@ func freezeCoordinatorEvaluationInput(
 		DeferredByRel:           cloneCPUSetMap(r.deferredByRel),
 		DeferredCleanupRels:     cloneRelSet(r.deferredCleanupRels),
 		ProtectedPending:        r.admissionSafetyCPUSet(),
+		PendingRequiredByRel:    cloneCPUSetMap(r.pendingRequiredByRel),
 		Capabilities:            capabilities,
 		AllowEmptyTarget:        r.allowEmptyTarget,
 	}
@@ -572,6 +745,7 @@ func cloneFrozenCoordinatorEvaluationInput(
 		DeferredByRel:           cloneCPUSetMap(in.DeferredByRel),
 		DeferredCleanupRels:     cloneRelSet(in.DeferredCleanupRels),
 		ProtectedPending:        in.ProtectedPending.Clone(),
+		PendingRequiredByRel:    cloneCPUSetMap(in.PendingRequiredByRel),
 		Capabilities:            in.Capabilities,
 		AllowEmptyTarget:        in.AllowEmptyTarget,
 	}
@@ -691,6 +865,7 @@ func cloneCoordinatorSnapshotEvaluation(in coordinatorSnapshotEvaluation) coordi
 	out.ParentSafety.PendingOutsidePrimary = in.ParentSafety.PendingOutsidePrimary.Clone()
 	out.ParentSafety.PendingInsideReclaim = in.ParentSafety.PendingInsideReclaim.Clone()
 	out.ParentSafety.PrimaryReclaimOverlap = in.ParentSafety.PrimaryReclaimOverlap.Clone()
+	out.ParentSafety.PendingScopeDeficit = cloneCPUSetMap(in.ParentSafety.PendingScopeDeficit)
 	out.ParentSafety.RequiredFloorDeficit = cloneCPUSetMap(in.ParentSafety.RequiredFloorDeficit)
 	out.ParentSafety.UnsafeRequiredRels = cloneRelConvergences(in.ParentSafety.UnsafeRequiredRels)
 	out.ParentSafety.DeferredLeafMismatches = cloneRelConvergences(in.ParentSafety.DeferredLeafMismatches)
@@ -940,6 +1115,9 @@ func normalizeCoordinatorSnapshotEvaluation(in coordinatorSnapshotEvaluation) co
 	if out.ParentSafety.RequiredFloorDeficit == nil {
 		out.ParentSafety.RequiredFloorDeficit = make(map[string]machine.CPUSet)
 	}
+	if out.ParentSafety.PendingScopeDeficit == nil {
+		out.ParentSafety.PendingScopeDeficit = make(map[string]machine.CPUSet)
+	}
 	sortRelConvergences(out.Report.NonConvergedTargets)
 	sortRelConvergences(out.ParentSafety.UnsafeRequiredRels)
 	sortRelConvergences(out.ParentSafety.DeferredLeafMismatches)
@@ -967,6 +1145,10 @@ func validateTraceOperations(trace *CompiledPhaseTrace) error {
 	if err != nil {
 		return err
 	}
+	session := &projectedPhaseSession{
+		hierarchy: projection,
+		progress:  make(map[phaseProgressKey]struct{}),
+	}
 	for phaseIndex, phase := range trace.Phases {
 		if phase.Kind != PhaseDrain && phase.Kind != PhaseExpand {
 			return fmt.Errorf("frozen phase trace has invalid phase %q at index %d", phase.Kind, phaseIndex)
@@ -982,15 +1164,6 @@ func validateTraceOperations(trace *CompiledPhaseTrace) error {
 				return fmt.Errorf("frozen phase trace operation %d/%d identity mismatch for rel %q",
 					phaseIndex, operationIndex, operation.Rel)
 			}
-			current := CPUSetTarget{
-				CPUs: observedCPUsForTargetProof(entry, operation.Target.CPUs, trace.Capabilities),
-				Mems: entry.Mems,
-			}
-			if !current.CPUs.Equals(operation.ExpectedCurrent.CPUs) ||
-				current.Mems != operation.ExpectedCurrent.Mems {
-				return fmt.Errorf("frozen phase trace operation %d/%d expected current mismatch for rel %q",
-					phaseIndex, operationIndex, operation.Rel)
-			}
 			if operation.ParentRel != "" {
 				parent, ok := projection.snapshot.Entries[operation.ParentRel]
 				if !ok || operation.ExpectedParentIdentity == (CgroupIdentity{}) ||
@@ -1003,23 +1176,17 @@ func validateTraceOperations(trace *CompiledPhaseTrace) error {
 				return fmt.Errorf("frozen phase trace operation %d/%d child fingerprint mismatch for rel %q",
 					phaseIndex, operationIndex, operation.Rel)
 			}
-			childUnion := machine.NewCPUSet()
-			for _, child := range projection.snapshot.Children[operation.Rel] {
-				childRel := child.Name
-				if operation.Rel != "" {
-					childRel = operation.Rel + "/" + child.Name
-				}
-				if childEntry, ok := projection.snapshot.Entries[childRel]; ok {
-					childUnion = childUnion.Union(childEntry.CPUs)
-				}
-			}
-			if !childUnion.Equals(operation.ExpectedChildUnion) {
-				return fmt.Errorf("frozen phase trace operation %d/%d child union mismatch for rel %q",
-					phaseIndex, operationIndex, operation.Rel)
-			}
-			if err := projection.applyOperation(operation); err != nil {
-				return fmt.Errorf("validate frozen phase trace operation %d/%d: %w", phaseIndex, operationIndex, err)
-			}
+		}
+		planID := ""
+		if len(phase.Operations) > 0 {
+			planID = phase.Operations[0].PlanID
+		}
+		_, err := session.Apply(context.Background(), PhasePlan{
+			PlanID: planID, Kind: phase.Kind,
+			Operations: append([]PlanOperation(nil), phase.Operations...),
+		})
+		if err != nil {
+			return fmt.Errorf("validate frozen phase trace operation frontier=%d: %w", phaseIndex, err)
 		}
 	}
 	if projection.snapshot.ID != trace.FinalSnapshot.ID {
@@ -1085,6 +1252,7 @@ func writeFrozenCoordinatorEvaluationInputHash(
 	writeCPUSetMapHash(hash, in.DeferredByRel)
 	writeRelSetHash(hash, in.DeferredCleanupRels)
 	writeHashString(hash, in.ProtectedPending.String())
+	writeCPUSetMapHash(hash, in.PendingRequiredByRel)
 	writeHashUint64(hash, hierarchyCapabilitiesBits(in.Capabilities))
 	writeHashUint64(hash, boolUint64(in.AllowEmptyTarget))
 }
@@ -1104,6 +1272,7 @@ func writeCoordinatorSnapshotEvaluationHash(
 	writeHashString(hash, evaluation.ParentSafety.PendingOutsidePrimary.String())
 	writeHashString(hash, evaluation.ParentSafety.PendingInsideReclaim.String())
 	writeHashString(hash, evaluation.ParentSafety.PrimaryReclaimOverlap.String())
+	writeCPUSetMapHash(hash, evaluation.ParentSafety.PendingScopeDeficit)
 	writeCPUSetMapHash(hash, evaluation.ParentSafety.RequiredFloorDeficit)
 	writeRelConvergencesHash(hash, evaluation.ParentSafety.UnsafeRequiredRels)
 	writeRelConvergencesHash(hash, evaluation.ParentSafety.DeferredLeafMismatches)
