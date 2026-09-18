@@ -30,6 +30,8 @@ import (
 
 const frozenTraceRecoveryTimeout = time.Second
 
+var ErrFrozenTransferUnauthorized = errors.New("frozen transfer grow lacks invocation-local source release")
+
 type AppliedPhysicalWrite struct {
 	PlanID                string
 	Rel                   string
@@ -50,11 +52,18 @@ type AppliedPhysicalWrite struct {
 type traceMutationStack struct {
 	writes               []AppliedPhysicalWrite
 	rollbackObservations map[string]rollbackObservation
+	releasedByDomain     map[DomainID]map[int]struct{}
 }
 
 type rollbackObservation struct {
 	current EntryState
 	err     error
+}
+
+type frozenSourceReleaseGuard struct {
+	sourceDomain DomainID
+	cpus         machine.CPUSet
+	sourceRoots  []FrozenRelIdentity
 }
 
 type frozenTraceFinalization struct {
@@ -80,6 +89,8 @@ type frozenOperationPreflight struct {
 	after          frozenOperationState
 	parentIdentity CgroupIdentity
 	children       stableLiveChildren
+	releaseGuards  []frozenSourceReleaseGuard
+	domain         DomainID
 }
 
 // frozenInitialSnapshotDriftError carries the fresh snapshot that invalidated a
@@ -181,8 +192,7 @@ func wrapFrozenInitialPreflightError(
 	if !errors.As(err, &snapshotErr) {
 		return err
 	}
-	if snapshotErr.Class != HierarchyErrorStale &&
-		!errors.Is(err, ErrSnapshotBoundaryExpansionMismatch) {
+	if snapshotErr.Class != HierarchyErrorStale {
 		return err
 	}
 	return newFrozenInitialSnapshotDriftError(
@@ -284,28 +294,25 @@ func (w safeCPSetWriter) preflightFrozenTraceOperations(
 		return nil, fmt.Errorf("rebuild frozen trace DAG for preflight: %w", err)
 	}
 	physicalWritesBefore := w.physicalWriteCount()
-	fresh, err := BuildCompleteSnapshotForBoundary(
+	boundaryEvaluation, err := EvaluateFrozenBoundary(
 		ctx,
 		w.driver,
 		dag,
-		cloneScanBoundary(frozen.InitialSnapshot.ScanBoundary),
 		w.budget,
+		frozen.FrozenBoundary,
+		frozen.InitialSnapshot,
 	)
+	fresh := boundaryEvaluation.Snapshot
 	physicalWritesAfter := w.physicalWriteCount()
 	if err != nil {
 		err = fmt.Errorf("capture frozen trace preflight snapshot: %w", err)
+		if fresh != nil {
+			return nil, newFrozenInitialSnapshotDriftError(
+				fresh, frozen.InitialSnapshot, fresh.ID, err,
+				physicalWritesBefore, physicalWritesAfter)
+		}
 		return nil, wrapFrozenInitialPreflightError(
 			err, frozen.InitialSnapshot, physicalWritesBefore, physicalWritesAfter)
-	}
-	if fresh.ID != frozen.InitialSnapshot.ID {
-		return nil, newFrozenInitialSnapshotDriftError(
-			fresh,
-			frozen.InitialSnapshot,
-			fresh.ID,
-			fmt.Errorf("fresh preflight snapshot differs from frozen trace base"),
-			physicalWritesBefore,
-			physicalWritesAfter,
-		)
 	}
 
 	projection, err := newProjectedHierarchy(fresh, frozen.Capabilities)
@@ -316,8 +323,57 @@ func (w safeCPSetWriter) preflightFrozenTraceOperations(
 	for _, phase := range frozen.Phases {
 		operationCount = saturatingAdd(operationCount, len(phase.Operations))
 	}
+	evidence, err := projectFrozenTraceOperations(frozen, projection)
+	if err != nil {
+		return nil, err
+	}
+	if len(evidence) != operationCount {
+		return nil, fmt.Errorf(
+			"frozen trace preflight projected evidence=%d operations=%d",
+			len(evidence), operationCount,
+		)
+	}
+	if err := evaluateFrozenBoundarySnapshot(
+		frozen.FrozenBoundary, frozen.FinalSnapshot, projection.snapshot,
+	); err != nil {
+		return nil, fmt.Errorf(
+			"frozen trace projected final boundary drift: %w", err,
+		)
+	}
+	return evidence, nil
+}
+
+func projectFrozenTraceOperations(
+	frozen *CompiledPhaseTrace,
+	projection *projectedHierarchy,
+) ([]frozenOperationPreflight, error) {
+	if frozen == nil {
+		return nil, fmt.Errorf("project frozen trace operations requires a trace")
+	}
+	if projection == nil {
+		return nil, fmt.Errorf("project frozen trace operations requires a hierarchy")
+	}
+	operationCount := 0
+	for _, phase := range frozen.Phases {
+		operationCount = saturatingAdd(operationCount, len(phase.Operations))
+	}
+	releaseGuards, err := compileFrozenGrowReleaseGuards(frozen)
+	if err != nil {
+		return nil, err
+	}
 	evidence := make([]frozenOperationPreflight, 0, operationCount)
+	globalOperationIndex := 0
 	for phaseIndex, phase := range frozen.Phases {
+		if len(phase.Operations) == 0 {
+			continue
+		}
+		if err := validateProjectedFrontierIndependence(projection, phase.Operations); err != nil {
+			return nil, fmt.Errorf(
+				"preflight frozen phase trace frontier %d: %w",
+				phaseIndex, err,
+			)
+		}
+		frontierStart := len(evidence)
 		for operationIndex, operation := range phase.Operations {
 			before, ok := projection.snapshot.Entries[operation.Rel]
 			if !ok {
@@ -326,12 +382,20 @@ func (w safeCPSetWriter) preflightFrozenTraceOperations(
 					phaseIndex, operationIndex, operation.Rel,
 				)
 			}
-			children, err := frozenChildrenFromSnapshot(projection.snapshot, operation.Rel)
-			if err != nil {
-				return nil, fmt.Errorf(
-					"preflight frozen phase trace operation %d/%d children: %w",
-					phaseIndex, operationIndex, err,
-				)
+			children := stableLiveChildren{
+				cpus:  machine.NewCPUSet(),
+				mems:  machine.NewCPUSet(),
+				byRel: make(map[string]EntryState),
+			}
+			if operation.Direction == WriteShrink {
+				projectedChildren, err := frozenChildrenFromSnapshot(projection.snapshot, operation.Rel)
+				if err != nil {
+					return nil, fmt.Errorf(
+						"preflight frozen phase trace operation %d/%d shrink children: %w",
+						phaseIndex, operationIndex, err,
+					)
+				}
+				children = projectedChildren
 			}
 			var parentIdentity CgroupIdentity
 			if operation.ParentRel != "" {
@@ -344,28 +408,271 @@ func (w safeCPSetWriter) preflightFrozenTraceOperations(
 				}
 				parentIdentity = parent.Identity
 			}
-			if err := projection.applyOperation(operation); err != nil {
+			evidence = append(evidence, frozenOperationPreflight{
+				before:         freezeOperationState(before),
+				parentIdentity: parentIdentity,
+				children:       children,
+				releaseGuards:  cloneFrozenSourceReleaseGuards(releaseGuards[globalOperationIndex]),
+				domain:         frozen.InitialSnapshot.DomainByRel[operation.Rel],
+			})
+			globalOperationIndex++
+		}
+		for operationIndex, operation := range phase.Operations {
+			if err := projection.applyConfiguredOperation(operation); err != nil {
 				return nil, fmt.Errorf(
 					"preflight frozen phase trace operation %d/%d: %w",
 					phaseIndex, operationIndex, err,
 				)
 			}
+		}
+		if err := projection.settleEvidence(); err != nil {
+			return nil, fmt.Errorf(
+				"preflight frozen phase trace frontier %d settlement: %w",
+				phaseIndex, err,
+			)
+		}
+		for operationIndex, operation := range phase.Operations {
 			after := projection.snapshot.Entries[operation.Rel]
-			evidence = append(evidence, frozenOperationPreflight{
-				before:         freezeOperationState(before),
-				after:          freezeOperationState(after),
-				parentIdentity: parentIdentity,
-				children:       children,
-			})
+			evidence[frontierStart+operationIndex].after = freezeOperationState(after)
 		}
 	}
-	if projection.snapshot.ID != frozen.FinalSnapshot.ID {
-		return nil, fmt.Errorf(
-			"frozen trace projected final snapshot drift: projected=%x expected=%x",
-			projection.snapshot.ID, frozen.FinalSnapshot.ID,
-		)
-	}
 	return evidence, nil
+}
+
+func compileFrozenGrowReleaseGuards(
+	trace *CompiledPhaseTrace,
+) (map[int][]frozenSourceReleaseGuard, error) {
+	if trace == nil || trace.InitialSnapshot == nil {
+		return nil, fmt.Errorf("compile frozen grow release guards requires initial snapshot")
+	}
+	projection, err := newProjectedHierarchy(trace.InitialSnapshot, trace.Capabilities)
+	if err != nil {
+		return nil, fmt.Errorf("compile frozen grow release guards projection: %w", err)
+	}
+	initialDomainsByCPU := make(map[int][]DomainID)
+	for domain, cpus := range trace.InitialSnapshot.DomainUnion {
+		for _, cpu := range cpus.ToSliceInt() {
+			initialDomainsByCPU[cpu] = append(initialDomainsByCPU[cpu], domain)
+		}
+	}
+	sourceRootsByDomain, err := frozenControlledDomainRoots(trace)
+	if err != nil {
+		return nil, err
+	}
+	guards := make(map[int][]frozenSourceReleaseGuard)
+	releasedByDomain := make(map[DomainID]map[int]struct{})
+	operationIndex := 0
+	for phaseIndex, phase := range trace.Phases {
+		for _, operation := range phase.Operations {
+			domain, ok := trace.InitialSnapshot.DomainByRel[operation.Rel]
+			if !ok || domain == "" {
+				return nil, fmt.Errorf(
+					"frozen operation %d rel %q has no ownership domain",
+					operationIndex, operation.Rel,
+				)
+			}
+			if operation.Direction == WriteGrow {
+				added := operation.Target.CPUs.Difference(operation.ExpectedCurrent.CPUs)
+				requiredBySource := make(map[DomainID]map[int]struct{})
+				for _, cpu := range added.ToSliceInt() {
+					if projection.snapshot.DomainUnion[domain].Contains(cpu) {
+						continue
+					}
+					for sourceDomain, owned := range projection.snapshot.DomainUnion {
+						if sourceDomain != domain && owned.Contains(cpu) {
+							return nil, fmt.Errorf(
+								"frozen grow operation %d rel %q lacks source shrink coverage: source domain release incomplete; source=%q still owns CPU %d",
+								operationIndex, operation.Rel, sourceDomain, cpu,
+							)
+						}
+					}
+					hasRelease := false
+					for sourceDomain, released := range releasedByDomain {
+						if sourceDomain == domain {
+							continue
+						}
+						if _, ok := released[cpu]; ok {
+							addCPUToAccumulator(requiredBySource, sourceDomain, cpu)
+							hasRelease = true
+						}
+					}
+					initiallyOwnedElsewhere := false
+					for _, initialDomain := range initialDomainsByCPU[cpu] {
+						if initialDomain != domain {
+							initiallyOwnedElsewhere = true
+							break
+						}
+					}
+					if !hasRelease && initiallyOwnedElsewhere {
+						return nil, fmt.Errorf(
+							"frozen grow operation %d rel %q lacks source shrink coverage: CPU %d has no current release provenance",
+							operationIndex, operation.Rel, cpu,
+						)
+					}
+				}
+				for _, sourceDomain := range sortedAccumulatedDomains(requiredBySource) {
+					required := cpuSetFromAccumulator(requiredBySource[sourceDomain])
+					if !accumulatorContainsCPUSet(releasedByDomain[sourceDomain], required) {
+						return nil, fmt.Errorf(
+							"frozen grow operation %d rel %q lacks source shrink coverage: source domain release incomplete source=%q destination=%q required=%s",
+							operationIndex, operation.Rel, sourceDomain, domain,
+							required.String(),
+						)
+					}
+					guards[operationIndex] = append(
+						guards[operationIndex],
+						frozenSourceReleaseGuard{
+							sourceDomain: sourceDomain,
+							cpus:         required,
+							sourceRoots:  append([]FrozenRelIdentity(nil), sourceRootsByDomain[sourceDomain]...),
+						},
+					)
+				}
+			}
+			operationIndex++
+		}
+		beforeUnion := cloneDomainUnion(projection.snapshot.DomainUnion)
+		if err := validateProjectedFrontierIndependence(projection, phase.Operations); err != nil {
+			return nil, fmt.Errorf(
+				"compile frozen grow release guards frontier %d: %w", phaseIndex, err)
+		}
+		for operationIndex, operation := range phase.Operations {
+			if err := projection.applyConfiguredOperation(operation); err != nil {
+				return nil, fmt.Errorf(
+					"compile frozen grow release guards operation %d/%d: %w",
+					phaseIndex, operationIndex, err,
+				)
+			}
+		}
+		if len(phase.Operations) > 0 {
+			if err := projection.settleEvidence(); err != nil {
+				return nil, fmt.Errorf(
+					"compile frozen grow release guards frontier %d settlement: %w",
+					phaseIndex, err,
+				)
+			}
+		}
+		for domain, before := range beforeUnion {
+			released := before.Difference(projection.snapshot.DomainUnion[domain])
+			if !released.IsEmpty() {
+				addCPUSetToAccumulator(releasedByDomain, domain, released)
+			}
+		}
+		for domain, after := range projection.snapshot.DomainUnion {
+			gained := after.Difference(beforeUnion[domain])
+			removeCPUSetFromAllAccumulators(releasedByDomain, gained)
+		}
+	}
+	return guards, nil
+}
+
+func frozenControlledDomainRoots(
+	trace *CompiledPhaseTrace,
+) (map[DomainID][]FrozenRelIdentity, error) {
+	specByRel := make(map[string]NodeSpec, len(trace.EvaluationInput.DAGSpecs))
+	for _, spec := range trace.EvaluationInput.DAGSpecs {
+		specByRel[spec.Rel] = spec
+	}
+	roots := make(map[DomainID][]FrozenRelIdentity)
+	for _, spec := range trace.EvaluationInput.DAGSpecs {
+		parent, hasParent := specByRel[spec.ParentRel]
+		if hasParent && parent.Domain == spec.Domain {
+			continue
+		}
+		entry, ok := trace.InitialSnapshot.Entries[spec.Rel]
+		if !ok || entry.Identity == (CgroupIdentity{}) {
+			return nil, fmt.Errorf(
+				"frozen source domain %q root %q has no stable identity",
+				spec.Domain, spec.Rel,
+			)
+		}
+		roots[spec.Domain] = append(roots[spec.Domain], FrozenRelIdentity{
+			Rel: spec.Rel, Identity: entry.Identity,
+		})
+	}
+	for domain := range roots {
+		sort.Slice(roots[domain], func(i, j int) bool {
+			return roots[domain][i].Rel < roots[domain][j].Rel
+		})
+	}
+	return roots, nil
+}
+
+func addCPUSetToAccumulator(
+	accumulator map[DomainID]map[int]struct{},
+	domain DomainID,
+	cpus machine.CPUSet,
+) {
+	for _, cpu := range cpus.ToSliceInt() {
+		addCPUToAccumulator(accumulator, domain, cpu)
+	}
+}
+
+func addCPUToAccumulator(
+	accumulator map[DomainID]map[int]struct{},
+	domain DomainID,
+	cpu int,
+) {
+	if accumulator[domain] == nil {
+		accumulator[domain] = make(map[int]struct{})
+	}
+	accumulator[domain][cpu] = struct{}{}
+}
+
+func removeCPUSetFromAllAccumulators(
+	accumulator map[DomainID]map[int]struct{},
+	cpus machine.CPUSet,
+) {
+	for _, cpu := range cpus.ToSliceInt() {
+		for domain, values := range accumulator {
+			delete(values, cpu)
+			if len(values) == 0 {
+				delete(accumulator, domain)
+			}
+		}
+	}
+}
+
+func accumulatorContainsCPUSet(
+	accumulated map[int]struct{},
+	required machine.CPUSet,
+) bool {
+	for _, cpu := range required.ToSliceInt() {
+		if _, ok := accumulated[cpu]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func cpuSetFromAccumulator(accumulated map[int]struct{}) machine.CPUSet {
+	cpus := make([]int, 0, len(accumulated))
+	for cpu := range accumulated {
+		cpus = append(cpus, cpu)
+	}
+	return machine.NewCPUSet(cpus...)
+}
+
+func sortedAccumulatedDomains(
+	accumulated map[DomainID]map[int]struct{},
+) []DomainID {
+	domains := make([]DomainID, 0, len(accumulated))
+	for domain := range accumulated {
+		domains = append(domains, domain)
+	}
+	sort.Slice(domains, func(i, j int) bool { return domains[i] < domains[j] })
+	return domains
+}
+
+func cloneFrozenSourceReleaseGuards(
+	in []frozenSourceReleaseGuard,
+) []frozenSourceReleaseGuard {
+	out := append([]frozenSourceReleaseGuard(nil), in...)
+	for i := range out {
+		out[i].cpus = out[i].cpus.Clone()
+		out[i].sourceRoots = append([]FrozenRelIdentity(nil), out[i].sourceRoots...)
+	}
+	return out
 }
 
 func (w safeCPSetWriter) physicalWriteCount() int {
@@ -494,6 +801,7 @@ func (r *coordinatorRound) executeFrozenTrace(
 			}
 			res.Applied++
 		}
+		stack.consumeFrozenGrowCredits(phase.Operations)
 	}
 
 	finalize := r.proveFrozenTraceFinalState
@@ -537,24 +845,26 @@ func (r *coordinatorRound) proveFrozenTraceFinalState(
 	frozen *CompiledPhaseTrace,
 ) (frozenTraceFinalization, error) {
 	var finalization frozenTraceFinalization
-	fresh, err := BuildCompleteSnapshotForBoundary(
+	boundaryEvaluation, err := EvaluateFrozenBoundary(
 		ctx,
 		r.driver,
 		r.dag,
-		cloneScanBoundary(frozen.FinalSnapshot.ScanBoundary),
 		r.budget,
+		frozen.FrozenBoundary,
+		frozen.FinalSnapshot,
 	)
-	if err == nil && fresh.ID != frozen.FinalSnapshot.ID {
+	fresh := boundaryEvaluation.Snapshot
+	if err != nil && fresh != nil {
 		err = &frozenFinalSnapshotDriftError{
 			current:  fresh,
 			expected: frozen.FinalSnapshot,
 			stale: &PlanStaleError{
 				Rel:       "controlled",
 				Direction: WritePublish,
-				Resource:  "final_snapshot",
+				Resource:  "final_boundary",
 				Current:   snapshotLogicalState(fresh),
 				Target:    snapshotLogicalState(frozen.FinalSnapshot),
-				Err:       fmt.Errorf("fresh final snapshot differs from frozen trace target"),
+				Err:       err,
 			},
 		}
 	}
@@ -608,10 +918,12 @@ func (w safeCPSetWriter) applyFrozenOperation(
 	if err := ticket.AuthorizeNext(traceID, logicalOperationIndex, operation); err != nil {
 		return AppliedPlanOperation{}, err
 	}
+	if err := w.authorizeFrozenGrowRelease(ctx, operation, preflight, stack); err != nil {
+		return AppliedPlanOperation{}, err
+	}
 	if alreadyAtTarget {
 		return w.readAfterWrite(ctx, operation)
 	}
-
 	if operation.WriteMems && operation.ExpectedCurrent.Mems != operation.Target.Mems {
 		write := physicalWriteBeforeFromEntry(
 			current, operation, HierarchyOperationWriteMems, operation.Target.Mems,
@@ -656,7 +968,100 @@ func (w safeCPSetWriter) applyFrozenOperation(
 		}
 		stack.writes = append(stack.writes, write)
 	}
-	return w.readAfterWrite(ctx, operation)
+	applied, err := w.readAfterWrite(ctx, operation)
+	if err != nil {
+		return applied, err
+	}
+	if operation.Direction == WriteShrink &&
+		!operation.ExpectedCurrent.CPUs.Equals(operation.Target.CPUs) {
+		stack.recordFrozenRelease(preflight.domain, operation, applied)
+	}
+	return applied, nil
+}
+
+func (w safeCPSetWriter) authorizeFrozenGrowRelease(
+	ctx context.Context,
+	operation PlanOperation,
+	preflight frozenOperationPreflight,
+	stack *traceMutationStack,
+) error {
+	if operation.Direction != WriteGrow || len(preflight.releaseGuards) == 0 {
+		return nil
+	}
+	if stack == nil {
+		return fmt.Errorf("%w: grow rel=%q has no mutation stack",
+			ErrFrozenTransferUnauthorized, operation.Rel)
+	}
+	for _, guard := range preflight.releaseGuards {
+		if len(guard.sourceRoots) == 0 {
+			return fmt.Errorf(
+				"%w: grow rel=%q source_domain=%q has no controlled roots",
+				ErrFrozenTransferUnauthorized, operation.Rel, guard.sourceDomain,
+			)
+		}
+		released := stack.releasedByDomain[guard.sourceDomain]
+		if !accumulatorContainsCPUSet(released, guard.cpus) {
+			return fmt.Errorf(
+				"%w: grow rel=%q source_domain=%q required=%s",
+				ErrFrozenTransferUnauthorized, operation.Rel, guard.sourceDomain,
+				guard.cpus.String(),
+			)
+		}
+		for _, sourceRoot := range guard.sourceRoots {
+			current, err := w.driver.ReadEntry(ctx, sourceRoot.Rel)
+			if err != nil {
+				return w.classifyHierarchyReadError(err, operation)
+			}
+			if current.Identity != sourceRoot.Identity {
+				return &PlanStaleError{
+					Rel: operation.Rel, Direction: operation.Direction,
+					Resource: "source_root_identity",
+					Current:  fmt.Sprint(current.Identity),
+					Target:   fmt.Sprint(sourceRoot.Identity),
+					Err:      fmt.Errorf("%w: frozen source root identity changed", ErrCgroupIdentityChanged),
+				}
+			}
+			if !current.CPUs.Intersection(guard.cpus).IsEmpty() {
+				return fmt.Errorf(
+					"%w: grow rel=%q source_domain=%q root=%q reacquired=%s",
+					ErrFrozenTransferUnauthorized, operation.Rel, guard.sourceDomain,
+					sourceRoot.Rel, current.CPUs.Intersection(guard.cpus).String(),
+				)
+			}
+		}
+	}
+	return nil
+}
+
+func (s *traceMutationStack) recordFrozenRelease(
+	domain DomainID,
+	operation PlanOperation,
+	applied AppliedPlanOperation,
+) {
+	if s == nil {
+		return
+	}
+	released := operation.ExpectedCurrent.CPUs.Difference(applied.Observed.CPUs)
+	if released.IsEmpty() {
+		return
+	}
+	if s.releasedByDomain == nil {
+		s.releasedByDomain = make(map[DomainID]map[int]struct{})
+	}
+	addCPUSetToAccumulator(s.releasedByDomain, domain, released)
+}
+
+func (s *traceMutationStack) consumeFrozenGrowCredits(operations []PlanOperation) {
+	if s == nil || len(s.releasedByDomain) == 0 {
+		return
+	}
+	for _, operation := range operations {
+		if operation.Direction != WriteGrow {
+			continue
+		}
+		added := operation.Target.CPUs.Difference(operation.ExpectedCurrent.CPUs)
+		removeCPUSetFromAllAccumulators(s.releasedByDomain, added)
+	}
 }
 
 func (w safeCPSetWriter) validateFrozenOperationPredecessor(
@@ -704,29 +1109,40 @@ func (w safeCPSetWriter) validateFrozenOperationPredecessor(
 				Err:      fmt.Errorf("%w: frozen predecessor parent identity changed", ErrCgroupIdentityChanged),
 			}
 		}
-	}
-
-	children, err := scanFrozenLiveChildrenOnce(
-		ctx, w.driver, operation, preflight.children, true, nil)
-	if err != nil {
-		return EntryState{}, false, err
-	}
-	if !children.cpus.Equals(preflight.children.cpus) {
-		return EntryState{}, false, &PlanStaleError{
-			Rel: operation.Rel, Direction: operation.Direction,
-			Resource: "child_union",
-			Current:  children.cpus.String(),
-			Target:   preflight.children.cpus.String(),
-			Err:      fmt.Errorf("live child CPU union changed from frozen predecessor"),
+		if !operation.Target.CPUs.IsSubsetOf(parent.CPUs) {
+			return EntryState{}, false, &PlanStaleError{
+				Rel: operation.Rel, Direction: operation.Direction,
+				Resource: "parent_containment",
+				Current:  parent.CPUs.String(),
+				Target:   operation.Target.CPUs.String(),
+				Err:      fmt.Errorf("live parent no longer contains operation target"),
+			}
 		}
 	}
-	if !children.mems.Equals(preflight.children.mems) {
-		return EntryState{}, false, &PlanStaleError{
-			Rel: operation.Rel, Direction: operation.Direction,
-			Resource: "child_union_cpuset.mems",
-			Current:  children.mems.String(),
-			Target:   preflight.children.mems.String(),
-			Err:      fmt.Errorf("live child mems union changed from frozen predecessor"),
+
+	if operation.Direction == WriteShrink {
+		children, err := scanFrozenLiveChildrenOnce(
+			ctx, w.driver, operation, preflight.children, true, nil)
+		if err != nil {
+			return EntryState{}, false, err
+		}
+		if !children.cpus.Equals(preflight.children.cpus) {
+			return EntryState{}, false, &PlanStaleError{
+				Rel: operation.Rel, Direction: operation.Direction,
+				Resource: "child_union",
+				Current:  children.cpus.String(),
+				Target:   preflight.children.cpus.String(),
+				Err:      fmt.Errorf("live child CPU union changed from frozen predecessor"),
+			}
+		}
+		if !children.mems.Equals(preflight.children.mems) {
+			return EntryState{}, false, &PlanStaleError{
+				Rel: operation.Rel, Direction: operation.Direction,
+				Resource: "child_union_cpuset.mems",
+				Current:  children.mems.String(),
+				Target:   preflight.children.mems.String(),
+				Err:      fmt.Errorf("live child mems union changed from frozen predecessor"),
+			}
 		}
 	}
 	return current, false, nil

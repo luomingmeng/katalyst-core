@@ -34,6 +34,7 @@ import (
 
 	bulkheadapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
+	bulkheadutils "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology"
 	cpustate "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
@@ -3359,6 +3360,7 @@ type disappearingContainerIDFetcher struct {
 	metapod.PodFetcherStub
 	containerID string
 	calls       int
+	pod         *v1.Pod
 }
 
 type allocationLookupState struct {
@@ -3387,6 +3389,37 @@ type freshPodLookupFetcher struct {
 	pod      *v1.Pod
 	err      error
 	freshHit bool
+}
+
+type absenceThenFreshPodFetcher struct {
+	metapod.PodFetcherStub
+	absenceErr error
+	pod        *v1.Pod
+	freshErr   error
+	freshHit   bool
+}
+
+func (f *absenceThenFreshPodFetcher) GetContainerIDWithContext(
+	context.Context, string, string,
+) (string, error) {
+	return "", f.absenceErr
+}
+
+func (f *absenceThenFreshPodFetcher) GetPod(ctx context.Context, _ string) (*v1.Pod, error) {
+	if ctx.Value(metapod.BypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("pod freshness query did not bypass cache")
+	}
+	if ctx.Value(metapod.StrictBypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("pod freshness query did not require strict bypass")
+	}
+	f.freshHit = true
+	if f.freshErr != nil {
+		return nil, f.freshErr
+	}
+	if f.pod == nil {
+		return nil, metapod.NewPodNotFoundError("missing")
+	}
+	return f.pod.DeepCopy(), nil
 }
 
 func (f *freshPodLookupFetcher) GetPod(ctx context.Context, _ string) (*v1.Pod, error) {
@@ -3438,6 +3471,16 @@ func (f *disappearingContainerIDFetcher) GetContainerIDWithContext(
 		return f.containerID, nil
 	}
 	return "", metapod.ErrContainerNotFound
+}
+
+func (f *disappearingContainerIDFetcher) GetPod(ctx context.Context, _ string) (*v1.Pod, error) {
+	if ctx.Value(metapod.BypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("pod freshness query did not bypass cache")
+	}
+	if ctx.Value(metapod.StrictBypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("pod freshness query did not require strict bypass")
+	}
+	return f.pod.DeepCopy(), nil
 }
 
 func (f *rotatingContainerIDFetcher) GetContainerIDWithContext(
@@ -3893,7 +3936,12 @@ func TestCPUSetTopologyPluginTreatsDisappearedContainerAsPending(t *testing.T) {
 			return "", true, nil
 		},
 	})
-	fetcher := &disappearingContainerIDFetcher{containerID: containerID}
+	fetcher := &disappearingContainerIDFetcher{
+		containerID: containerID,
+		pod: &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+		},
+	}
 	metaServer := &metaserver.MetaServer{
 		MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
 	}
@@ -3963,8 +4011,8 @@ func TestCPUSetTopologyPluginSkipsExpectedCPUSetForMissingContainer(t *testing.T
 	if len(res.PendingByPod) != 1 {
 		t.Fatalf("expected one protected-pending entry, got %#v", res.PendingByPod)
 	}
-	if got := res.PendingByPod[0].NativeQOSClass; got != v1.PodQOSGuaranteed {
-		t.Fatalf("pending native qos class = %q, want %q", got, v1.PodQOSGuaranteed)
+	if got := res.PendingByPod[0].NativeQOSClass; got != v1.PodQOSBestEffort {
+		t.Fatalf("pending native qos class = %q, want fresh pod qos %q", got, v1.PodQOSBestEffort)
 	}
 }
 
@@ -4015,6 +4063,212 @@ func TestCPUSetTopologyPluginRefreshesPodForPendingNativeQOSClass(t *testing.T) 
 	}
 	if got := res.PendingByPod[0].NativeQOSClass; got != v1.PodQOSGuaranteed {
 		t.Fatalf("pending native qos class = %q, want %q", got, v1.PodQOSGuaranteed)
+	}
+}
+
+func TestCPUSetTopologyPluginFreshlyGetsPodForEveryContainerAbsenceClass(t *testing.T) {
+	absenceErrors := []error{
+		metapod.NewPodNotFoundError("pod-absence"),
+		metapod.ErrContainerNotFound,
+		bulkheadutils.ErrContainerNotRunning,
+	}
+	for _, absenceErr := range absenceErrors {
+		t.Run(absenceErr.Error(), func(t *testing.T) {
+			fetcher := &absenceThenFreshPodFetcher{
+				absenceErr: absenceErr,
+				pod: &v1.Pod{
+					ObjectMeta: metav1.ObjectMeta{UID: types.UID("pod-absence")},
+				},
+			}
+			metaServer := &metaserver.MetaServer{
+				MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
+			}
+			allocationInfo := &cpustate.AllocationInfo{}
+			allocationInfo.NativeQOSClass = string(v1.PodQOSGuaranteed)
+			view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+				ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+					"pod-absence": {"main": machine.NewCPUSet(0, 1)},
+				},
+			}}
+
+			res, err := (&CPUSetTopologyPlugin{}).buildExpectedCPUSetByRel(
+				context.Background(),
+				bulkheadapi.HandlerContext{
+					CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+						MetaServer: metaServer,
+						State:      &allocationLookupState{info: allocationInfo},
+					},
+					DesiredView: view,
+				},
+			)
+
+			if err != nil {
+				t.Fatalf("absence-class error %v must remain pending after fresh live pod lookup: %v",
+					absenceErr, err)
+			}
+			if !fetcher.freshHit {
+				t.Fatalf("absence-class error %v did not trigger a fresh pod lookup", absenceErr)
+			}
+			if len(res.PendingByPod) != 1 {
+				t.Fatalf("absence-class error %v produced pending=%#v, want one entry",
+					absenceErr, res.PendingByPod)
+			}
+		})
+	}
+}
+
+func TestCPUSetTopologyPluginFreshUnknownErrorFailsForEveryContainerAbsenceClass(t *testing.T) {
+	queryErr := errors.New("fresh pod query failed")
+	absenceErrors := []error{
+		metapod.NewPodNotFoundError("pod-absence"),
+		metapod.ErrContainerNotFound,
+		bulkheadutils.ErrContainerNotRunning,
+	}
+	for _, absenceErr := range absenceErrors {
+		t.Run(absenceErr.Error(), func(t *testing.T) {
+			fetcher := &absenceThenFreshPodFetcher{
+				absenceErr: absenceErr,
+				freshErr:   queryErr,
+			}
+			metaServer := &metaserver.MetaServer{
+				MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
+			}
+			allocationInfo := &cpustate.AllocationInfo{}
+			allocationInfo.NativeQOSClass = string(v1.PodQOSGuaranteed)
+			view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+				ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+					"pod-absence": {"main": machine.NewCPUSet(0, 1)},
+				},
+			}}
+
+			_, err := (&CPUSetTopologyPlugin{}).buildExpectedCPUSetByRel(
+				context.Background(),
+				bulkheadapi.HandlerContext{
+					CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+						MetaServer: metaServer,
+						State:      &allocationLookupState{info: allocationInfo},
+					},
+					DesiredView: view,
+				},
+			)
+
+			if !errors.Is(err, queryErr) {
+				t.Fatalf("absence-class error %v with unknown fresh error got %v, want %v",
+					absenceErr, err, queryErr)
+			}
+			if !fetcher.freshHit {
+				t.Fatalf("absence-class error %v did not trigger a fresh pod lookup", absenceErr)
+			}
+		})
+	}
+}
+
+func TestCPUSetTopologyPluginFreshNotFoundChecksAllQoSCgroupsBeforeDroppingStale(t *testing.T) {
+	const podUID = "cross-qos-stale-check"
+	fetcher := &absenceThenFreshPodFetcher{
+		absenceErr: metapod.ErrContainerNotFound,
+		freshErr:   metapod.NewPodNotFoundError(podUID),
+	}
+	metaServer := &metaserver.MetaServer{
+		MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
+	}
+	allCandidates := cgcommon.GetPodRelativeCgroupPathCandidates(podUID)
+	statErrors := make(map[string]error, len(allCandidates))
+	for _, candidate := range allCandidates {
+		statErrors[strings.Trim(candidate, "/")] = os.ErrNotExist
+	}
+	bestEffortCandidates := cgcommon.GetPodRelativeCgroupPathCandidatesForQOS(
+		podUID, v1.PodQOSBestEffort)
+	if len(bestEffortCandidates) == 0 {
+		t.Fatal("expected at least one BestEffort pod cgroup candidate")
+	}
+	existingBestEffort := strings.Trim(bestEffortCandidates[0], "/")
+	delete(statErrors, existingBestEffort)
+	cgroup := &fakeCgroupClient{
+		existing:   map[string]bool{existingBestEffort: true},
+		statErrors: statErrors,
+	}
+	allocationInfo := &cpustate.AllocationInfo{}
+	allocationInfo.NativeQOSClass = string(v1.PodQOSGuaranteed)
+	view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+			podUID: {"main": machine.NewCPUSet(0, 1)},
+		},
+	}}
+
+	res, err := (&CPUSetTopologyPlugin{cgroup: cgroup}).buildExpectedCPUSetByRel(
+		context.Background(),
+		bulkheadapi.HandlerContext{
+			CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+				MetaServer: metaServer,
+				State:      &allocationLookupState{info: allocationInfo},
+			},
+			DesiredView: view,
+		},
+	)
+
+	if err != nil {
+		t.Fatalf("fresh NotFound with an existing alternate-QoS cgroup must remain pending: %v", err)
+	}
+	if len(res.PendingByPod) != 1 {
+		t.Fatalf("alternate-QoS cgroup was dropped as stale: pending=%#v", res.PendingByPod)
+	}
+}
+
+func TestCPUSetTopologyPluginFreshNotFoundRetainsExistingPodCgroupForEveryQOS(t *testing.T) {
+	for _, qosClass := range []v1.PodQOSClass{
+		v1.PodQOSGuaranteed,
+		v1.PodQOSBurstable,
+		v1.PodQOSBestEffort,
+	} {
+		t.Run(string(qosClass), func(t *testing.T) {
+			podUID := "existing-" + strings.ToLower(string(qosClass))
+			fetcher := &absenceThenFreshPodFetcher{
+				absenceErr: bulkheadutils.ErrContainerNotRunning,
+				freshErr:   metapod.NewPodNotFoundError(podUID),
+			}
+			metaServer := &metaserver.MetaServer{
+				MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
+			}
+			allCandidates := cgcommon.GetPodRelativeCgroupPathCandidates(podUID)
+			statErrors := make(map[string]error, len(allCandidates))
+			for _, candidate := range allCandidates {
+				statErrors[strings.Trim(candidate, "/")] = os.ErrNotExist
+			}
+			qosCandidates := cgcommon.GetPodRelativeCgroupPathCandidatesForQOS(podUID, qosClass)
+			if len(qosCandidates) == 0 {
+				t.Fatalf("expected at least one %s pod cgroup candidate", qosClass)
+			}
+			existing := strings.Trim(qosCandidates[0], "/")
+			delete(statErrors, existing)
+			cgroup := &fakeCgroupClient{
+				existing:   map[string]bool{existing: true},
+				statErrors: statErrors,
+			}
+			view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+				ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+					podUID: {"main": machine.NewCPUSet(0, 1)},
+				},
+			}}
+
+			res, err := (&CPUSetTopologyPlugin{cgroup: cgroup}).buildExpectedCPUSetByRel(
+				context.Background(),
+				bulkheadapi.HandlerContext{
+					CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+						MetaServer: metaServer,
+					},
+					DesiredView: view,
+				},
+			)
+
+			if err != nil {
+				t.Fatalf("fresh NotFound with existing %s cgroup must remain pending: %v", qosClass, err)
+			}
+			if len(res.PendingByPod) != 1 {
+				t.Fatalf("existing %s cgroup was dropped as stale: pending=%#v",
+					qosClass, res.PendingByPod)
+			}
+		})
 	}
 }
 

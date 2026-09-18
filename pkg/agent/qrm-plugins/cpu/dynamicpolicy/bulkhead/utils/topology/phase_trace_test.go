@@ -944,6 +944,50 @@ func TestCompileFixedPointTraceRejectsUnprovableRequiredFloor(t *testing.T) {
 	require.Zero(t, fixture.driver.PhysicalWriteCount())
 }
 
+func TestCompileFixedPointTraceOwnsFrozenBoundary(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+
+	trace, err := fixture.round.compileFixedPointTrace(context.Background(), fixture.snapshot())
+
+	require.NoError(t, err)
+	require.Equal(t, FrozenBoundaryVersionV1, trace.FrozenBoundary.Version)
+	require.NotEmpty(t, trace.FrozenBoundary.Roots)
+	require.NotEmpty(t, trace.FrozenBoundary.ControlledRels)
+	require.False(t, trace.FrozenBoundary.RelevantCPUs.IsEmpty())
+}
+
+func TestFreezePhaseTraceRejectsUnknownFrozenBoundaryVersion(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	trace, err := fixture.round.compileFixedPointTrace(context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+	trace.FrozenBoundary.Version = FrozenBoundaryVersion(99)
+
+	_, err = FreezePhaseTrace(trace)
+
+	require.ErrorContains(t, err, "frozen boundary version")
+}
+
+func TestFreezePhaseTraceDeepCopiesFrozenBoundary(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	trace, err := fixture.round.compileFixedPointTrace(context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+
+	frozen, err := FreezePhaseTrace(trace)
+	require.NoError(t, err)
+	want := cloneFrozenBoundary(frozen.FrozenBoundary)
+	trace.FrozenBoundary.Roots[0] = "changed"
+	trace.FrozenBoundary.ControlledRels[0] = "changed"
+	if len(trace.FrozenBoundary.RelevantCPUHolders) > 0 {
+		trace.FrozenBoundary.RelevantCPUHolders[0] = "changed"
+	}
+	trace.FrozenBoundary.RelevantCPUs = machine.NewCPUSet(99)
+
+	require.Equal(t, want, frozen.FrozenBoundary)
+}
+
 func TestFreezePhaseTraceIsolatedFromMutableInputs(t *testing.T) {
 	fixture := newAdmissionTraceFixture(t)
 	fixture.configureStagedSMTTransferWithDynamicDescendant()

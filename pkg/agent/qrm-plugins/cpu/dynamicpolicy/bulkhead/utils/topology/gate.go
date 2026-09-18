@@ -210,11 +210,6 @@ func sourceBoundaryFingerprint(snapshot *CompleteSnapshot, source DomainID) stri
 			writeHashString(hash, root)
 		}
 	}
-	for _, rel := range snapshot.ScanBoundary.ExpandedRels {
-		if snapshotRelBelongsToDomain(snapshot, rel, source) {
-			writeHashString(hash, rel)
-		}
-	}
 	return string(hash.Sum(nil))
 }
 

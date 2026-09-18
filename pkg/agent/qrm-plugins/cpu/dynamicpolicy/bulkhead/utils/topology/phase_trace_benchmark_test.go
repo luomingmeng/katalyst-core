@@ -208,6 +208,71 @@ func TestCompileFixedPointTraceOperationHeavyScale(t *testing.T) {
 	}
 }
 
+func TestFrozenPreflightOperationHeavyExecutionOverheadRemainsLinear(t *testing.T) {
+	if os.Getenv(topologyScaleTestEnv) != "1" {
+		t.Skipf("set %s=1 to run high-cost topology scale tests", topologyScaleTestEnv)
+	}
+	const linearScaleTolerance = 3.0
+	var previous uint64
+	for _, nodes := range []int{100, 1000} {
+		fixture := newOperationHeavyTraceFixture(t, nodes)
+		trace, err := fixture.compile()
+		require.NoError(t, err)
+
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		writer := newSafeCPUSetWriter(
+			fixture.driver,
+			NewBudgetTracker(traceScaleBudget(nodes, fixture.base.Cost.MaxDepth)),
+			&ConvergenceResult{},
+		)
+		_, err = writer.preflightFrozenTraceOperations(context.Background(), trace)
+		require.NoError(t, err)
+		runtime.ReadMemStats(&after)
+		allocations := after.Mallocs - before.Mallocs
+		t.Logf("nodes=%d operations=%d reads=%d allocations=%d",
+			nodes, trace.OperationCount(), fixture.driver.readCount(), allocations)
+		require.LessOrEqual(t, fixture.driver.readCount(), int64(nodes*8),
+			"operation-heavy preflight hierarchy reads must remain O(N)")
+		if previous != 0 {
+			require.LessOrEqual(t, float64(allocations)/float64(previous),
+				10*linearScaleTolerance,
+				"10x more operations must not cause super-linear full preflight allocations")
+		}
+		previous = allocations
+	}
+}
+
+func TestFrozenPreflightSettlesEvidenceOncePerCompiledFrontier(t *testing.T) {
+	const nodes = 1000
+	fixture := newOperationHeavyTraceFixture(t, nodes)
+	trace, err := fixture.compile()
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, trace.OperationCount(), nodes-18)
+
+	projection, err := newProjectedHierarchy(trace.InitialSnapshot, trace.Capabilities)
+	require.NoError(t, err)
+	projection.resetEvidenceRebuildCount()
+
+	evidence, err := projectFrozenTraceOperations(trace, projection)
+	require.NoError(t, err)
+	require.Len(t, evidence, trace.OperationCount())
+	require.Equal(t, nonEmptyCompiledPhaseCount(trace), projection.evidenceRebuildCount(),
+		"frozen preflight must settle evidence once per compiled frontier")
+	require.Equal(t, trace.FinalSnapshot.ID, projection.snapshot.ID)
+}
+
+func nonEmptyCompiledPhaseCount(trace *CompiledPhaseTrace) int {
+	count := 0
+	for _, phase := range trace.Phases {
+		if len(phase.Operations) > 0 {
+			count++
+		}
+	}
+	return count
+}
+
 type operationHeavyScaleMeasurement struct {
 	nodes         int
 	operations    int

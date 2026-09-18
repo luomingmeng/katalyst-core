@@ -75,6 +75,23 @@ func (e *ProjectedPhaseNoProgressError) Error() string {
 
 func (e *ProjectedPhaseNoProgressError) Unwrap() error { return ErrNoProgress }
 
+type convergenceDeadlineContextError struct {
+	cause  error
+	rounds int
+	usage  BudgetUsage
+}
+
+func (e *convergenceDeadlineContextError) Error() string {
+	return fmt.Sprintf("%v: %v after rounds=%d usage=%+v",
+		ErrConvergenceDeadlineExceeded, e.cause, e.rounds, e.usage)
+}
+
+func (e *convergenceDeadlineContextError) Unwrap() error { return e.cause }
+
+func (e *convergenceDeadlineContextError) Is(target error) bool {
+	return target == ErrConvergenceDeadlineExceeded || errors.Is(e.cause, target)
+}
+
 // CompiledPhase is one ordered, frozen phase of a fixed-point trace. Operations
 // are already sequenced; execution replays them verbatim without re-planning.
 type CompiledPhase struct {
@@ -94,6 +111,7 @@ type CompiledPhaseTrace struct {
 	RequiredCPUSetByRel  map[string]machine.CPUSet
 	Capabilities         HierarchyCapabilities
 	EvaluationInput      FrozenCoordinatorEvaluationInput
+	FrozenBoundary       FrozenBoundary
 	Phases               []CompiledPhase
 	FinalSnapshot        *CompleteSnapshot
 	FinalEvaluation      coordinatorSnapshotEvaluation
@@ -323,6 +341,11 @@ func (r *coordinatorRound) compileFixedPointTrace(
 	if err != nil {
 		return nil, err
 	}
+	evaluationInput := freezeCoordinatorEvaluationInput(projectedRound, capabilities)
+	frozenBoundary, err := compileFrozenBoundaryV1(base, evaluationInput, result.Phases)
+	if err != nil {
+		return nil, fmt.Errorf("compile frozen boundary: %w", err)
+	}
 	trace := &CompiledPhaseTrace{
 		ConvergenceID:        result.ConvergenceID,
 		Objective:            projectedRound.objective.orFullDefault(),
@@ -330,7 +353,8 @@ func (r *coordinatorRound) compileFixedPointTrace(
 		CanonicalTargetByRel: cloneCPUSetTargetMap(result.CanonicalTargetByRel),
 		RequiredCPUSetByRel:  cloneCPUSetMap(projectedRound.requiredByRel),
 		Capabilities:         capabilities,
-		EvaluationInput:      freezeCoordinatorEvaluationInput(projectedRound, capabilities),
+		EvaluationInput:      evaluationInput,
+		FrozenBoundary:       frozenBoundary,
 		Phases:               cloneCompiledPhases(result.Phases),
 		FinalSnapshot:        CloneCompleteSnapshot(result.FinalSnapshot),
 		FinalEvaluation:      cloneCoordinatorSnapshotEvaluation(result.FinalEvaluation),
@@ -357,8 +381,9 @@ func (r *coordinatorRound) compileFixedPointTrace(
 // annotated for diagnosis.
 func (r *coordinatorRound) checkEngineDeadline(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("%w: %w after rounds=%d usage=%+v",
-			ErrConvergenceDeadlineExceeded, err, r.round, r.budget.Usage())
+		return &convergenceDeadlineContextError{
+			cause: err, rounds: r.round, usage: r.budget.Usage(),
+		}
 	}
 	if r.budget != nil && !r.budget.limit.Deadline.IsZero() &&
 		!time.Now().Before(r.budget.limit.Deadline) {
@@ -894,6 +919,7 @@ func FreezePhaseTrace(in *CompiledPhaseTrace) (*CompiledPhaseTrace, error) {
 	out.CanonicalTargetByRel = cloneCPUSetTargetMap(in.CanonicalTargetByRel)
 	out.RequiredCPUSetByRel = cloneCPUSetMap(in.RequiredCPUSetByRel)
 	out.EvaluationInput = cloneFrozenCoordinatorEvaluationInput(in.EvaluationInput)
+	out.FrozenBoundary = cloneFrozenBoundary(in.FrozenBoundary)
 	out.Phases = cloneCompiledPhases(in.Phases)
 	out.FinalSnapshot = CloneCompleteSnapshot(in.FinalSnapshot)
 	out.FinalEvaluation = cloneCoordinatorSnapshotEvaluation(in.FinalEvaluation)
@@ -909,6 +935,14 @@ func FreezePhaseTrace(in *CompiledPhaseTrace) (*CompiledPhaseTrace, error) {
 	if !reflect.DeepEqual(actualEvaluation, expectedEvaluation) {
 		return nil, fmt.Errorf("frozen phase trace final evaluation does not match final snapshot evidence: got=%+v want=%+v",
 			actualEvaluation, expectedEvaluation)
+	}
+	expectedBoundary, err := compileFrozenBoundaryV1(
+		out.InitialSnapshot, out.EvaluationInput, out.Phases)
+	if err != nil {
+		return nil, fmt.Errorf("derive frozen phase trace boundary: %w", err)
+	}
+	if !frozenBoundariesEqual(out.FrozenBoundary, expectedBoundary) {
+		return nil, fmt.Errorf("frozen phase trace boundary is not compiler-derived")
 	}
 	out.FinalEvaluation = expectedEvaluation
 	out.TraceID = canonicalPhaseTraceID(&out)
@@ -937,6 +971,9 @@ func validateFrozenPhaseTrace(trace *CompiledPhaseTrace) error {
 	}
 	if len(trace.EvaluationInput.DAGSpecs) == 0 {
 		return fmt.Errorf("frozen phase trace requires evaluation DAG semantics")
+	}
+	if err := validateFrozenBoundary(trace.FrozenBoundary, trace.InitialSnapshot); err != nil {
+		return fmt.Errorf("frozen phase trace has invalid frozen boundary: %w", err)
 	}
 	if !reflect.DeepEqual(trace.RequiredCPUSetByRel, trace.EvaluationInput.RequiredByRel) {
 		return fmt.Errorf("frozen phase trace required CPUs inputs disagree")
@@ -996,6 +1033,9 @@ func validateFrozenPhaseTrace(trace *CompiledPhaseTrace) error {
 	if err := validateTraceOperations(trace); err != nil {
 		return err
 	}
+	if _, err := compileFrozenGrowReleaseGuards(trace); err != nil {
+		return fmt.Errorf("frozen phase trace grow release contract is invalid: %w", err)
+	}
 	for rel, required := range trace.RequiredCPUSetByRel {
 		entry, ok := trace.FinalSnapshot.Entries[rel]
 		if !ok || !required.IsSubsetOf(entry.CPUs) {
@@ -1044,14 +1084,6 @@ func validateCompleteSnapshotEvidence(snapshot *CompleteSnapshot) error {
 	for _, rel := range snapshot.ScanBoundary.Roots {
 		if _, ok := snapshot.Entries[rel]; !ok {
 			return fmt.Errorf("root %q has no entry", rel)
-		}
-	}
-	for _, rel := range snapshot.ScanBoundary.ExpandedRels {
-		if _, ok := snapshot.Entries[rel]; !ok {
-			return fmt.Errorf("expanded rel %q has no entry", rel)
-		}
-		if _, ok := snapshot.Children[rel]; !ok {
-			return fmt.Errorf("expanded rel %q has no children evidence", rel)
 		}
 	}
 	union := make(map[DomainID]machine.CPUSet)
@@ -1205,6 +1237,7 @@ func canonicalPhaseTraceID(trace *CompiledPhaseTrace) string {
 	writeCPUSetTargetMapHash(hash, trace.CanonicalTargetByRel)
 	writeCPUSetMapHash(hash, trace.RequiredCPUSetByRel)
 	writeFrozenCoordinatorEvaluationInputHash(hash, trace.EvaluationInput)
+	writeFrozenBoundaryHash(hash, trace.FrozenBoundary)
 	writeHashUint64(hash, uint64(len(trace.Phases)))
 	for _, phase := range trace.Phases {
 		writeHashString(hash, string(phase.Kind))

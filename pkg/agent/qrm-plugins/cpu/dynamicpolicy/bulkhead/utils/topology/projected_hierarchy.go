@@ -193,12 +193,14 @@ func (h *projectedHierarchy) applyConfiguredOperation(operation PlanOperation) e
 			)
 		}
 	}
-	currentChildren := ChildrenFingerprint(h.snapshot.Children[operation.Rel])
-	if currentChildren != operation.ExpectedChildren {
-		return stale(
-			"children", currentChildren, operation.ExpectedChildren,
-			fmt.Errorf("projected children changed"),
-		)
+	if operation.Direction == WriteShrink {
+		currentChildren := ChildrenFingerprint(h.snapshot.Children[operation.Rel])
+		if currentChildren != operation.ExpectedChildren {
+			return stale(
+				"children", currentChildren, operation.ExpectedChildren,
+				fmt.Errorf("projected shrink children changed"),
+			)
+		}
 	}
 	if err := h.precheckOperationChildren(operation); err != nil {
 		return err

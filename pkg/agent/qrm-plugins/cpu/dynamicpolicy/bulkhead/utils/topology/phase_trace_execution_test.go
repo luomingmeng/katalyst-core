@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -50,7 +49,426 @@ func TestTracePreflightRejectsInitialSnapshotDriftWithoutWrites(t *testing.T) {
 	require.Equal(t, initialState, driver.snapshot())
 }
 
-func TestTracePreflightWrapsExactBoundaryExpansionMismatchAsInitialDriftWithoutWrites(t *testing.T) {
+func TestCheckEngineDeadlinePreservesBudgetAndContextErrors(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	round := &coordinatorRound{
+		round:  3,
+		budget: NewBudgetTracker(ConvergenceBudget{}),
+	}
+
+	err := round.checkEngineDeadline(ctx)
+
+	require.ErrorIs(t, err, ErrConvergenceDeadlineExceeded)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Contains(t, err.Error(), "rounds=3")
+}
+
+func TestTracePreflightAllowsUnrelatedDynamicSiblingChurn(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	fixture.driver.add(
+		"kubepods/besteffort/unrelated-parent",
+		CgroupIdentity{Device: 1, Inode: 1000}, "99", "1")
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(),
+		fixture.snapshot(),
+	)
+	require.NoError(t, err)
+	fixture.driver.add(
+		"kubepods/besteffort/unrelated-parent/churn",
+		CgroupIdentity{Device: 1, Inode: 1001}, "100", "1")
+
+	err = newTracePreflightWriter(fixture.driver).
+		preflightFrozenTrace(context.Background(), trace)
+
+	require.NoError(t, err)
+	require.Zero(t, fixture.driver.PhysicalWriteCount())
+}
+
+func TestTraceFinalizationAllowsUnrelatedDynamicSiblingChurn(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	fixture.driver.add(
+		"kubepods/besteffort/unrelated-parent",
+		CgroupIdentity{Device: 1, Inode: 1000}, "99", "1")
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(),
+		fixture.snapshot(),
+	)
+	require.NoError(t, err)
+	driver, _ := frozenBoundaryDriver(t, trace.FinalSnapshot, trace.EvaluationInput.DAGSpecs)
+	driver.add(
+		"kubepods/besteffort/unrelated-parent/churn",
+		CgroupIdentity{Device: 1, Inode: 1001}, "100", "1")
+	round := frozenExecutionRound(t, trace, driver)
+
+	finalization, err := round.proveFrozenTraceFinalState(context.Background(), trace)
+
+	require.NoError(t, err)
+	require.NotNil(t, finalization.snapshot)
+	require.True(t, finalization.evaluation.ParentSafety.Safe)
+}
+
+func TestFrozenTraceAllowsGrowDirectChildRemoval(t *testing.T) {
+	live := newFakeHierarchyDriver()
+	live.add("root", CgroupIdentity{Device: 1, Inode: 1}, "0-1", "0")
+	live.add("root/ephemeral", CgroupIdentity{Device: 1, Inode: 2}, "9", "0")
+	operation := PlanOperation{
+		Rel: "root", ExpectedIdentity: live.nodes["root"].identity,
+		ExpectedCurrent: CPUSetTarget{CPUs: machine.MustParse("0-1"), Mems: "0"},
+		Target:          CPUSetTarget{CPUs: machine.MustParse("0-3"), Mems: "0"},
+		Direction:       WriteGrow,
+	}
+	before, err := live.ReadEntry(context.Background(), operation.Rel)
+	require.NoError(t, err)
+	after := before
+	after.ConfiguredCPUs = operation.Target.CPUs.Clone()
+	after.CPUs = operation.Target.CPUs.Clone()
+	child, err := live.ReadEntry(context.Background(), "root/ephemeral")
+	require.NoError(t, err)
+	delete(live.nodes, "root/ephemeral")
+	preflight := frozenOperationPreflight{
+		before: freezeOperationState(before),
+		after:  freezeOperationState(after),
+		children: stableLiveChildren{
+			cpus: child.CPUs.Clone(),
+			mems: machine.NewCPUSet(0),
+			refs: []ChildRef{{
+				Name: "ephemeral", Identity: child.Identity,
+			}},
+			byRel: map[string]EntryState{"root/ephemeral": child},
+		},
+	}
+	writer := newSafeCPUSetWriter(
+		live, NewBudgetTracker(ConvergenceBudget{}), nil)
+
+	current, alreadyAtTarget, err := writer.validateFrozenOperationPredecessor(
+		context.Background(), operation, preflight)
+
+	require.NoError(t, err)
+	require.False(t, alreadyAtTarget)
+	require.Equal(t, before.Identity, current.Identity)
+	require.Zero(t, live.PhysicalWriteCount())
+}
+
+func TestTracePreflightRejectsShrinkDirectChildAdditionOutsideTargetWithoutWrites(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+	shrink := traceOperationByDirection(t, trace, WriteShrink)
+	fixture.driver.add(
+		filepath.Join(shrink.Rel, "outside-target"),
+		CgroupIdentity{Device: 1, Inode: 1001}, "99", "1")
+	initialState := fixture.driver.snapshot()
+
+	err = newTracePreflightWriter(fixture.driver).
+		preflightFrozenTrace(context.Background(), trace)
+
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	require.Contains(t, err.Error(), "shrink relation direct children changed")
+	require.Zero(t, fixture.driver.PhysicalWriteCount())
+	require.Equal(t, initialState, fixture.driver.snapshot())
+}
+
+func TestTracePreflightRejectsGrowNewRelevantCPUHolderWithoutWrites(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+	grow := traceOperationByDirection(t, trace, WriteGrow)
+	added := grow.Target.CPUs.Difference(grow.ExpectedCurrent.CPUs)
+	require.False(t, added.IsEmpty())
+	fixture.driver.add(
+		filepath.Join(grow.Rel, "new-holder"),
+		CgroupIdentity{Device: 1, Inode: 1002}, added.String(), "0")
+	initialState := fixture.driver.snapshot()
+
+	err = newTracePreflightWriter(fixture.driver).
+		preflightFrozenTrace(context.Background(), trace)
+
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	require.Contains(t, err.Error(), "relevant CPU holder set changed")
+	require.Zero(t, fixture.driver.PhysicalWriteCount())
+	require.Equal(t, initialState, fixture.driver.snapshot())
+}
+
+func TestFrozenTraceGrowIsBackedByEarlierSourceShrinkReadback(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+	round := frozenExecutionRound(t, trace, fixture.driver)
+	ticket := reserveTraceWithBudget(t, round.budget, trace)
+	res := &ConvergenceResult{}
+
+	_, err = round.executeFrozenTrace(context.Background(), trace, ticket, res)
+
+	require.NoError(t, err)
+	operations := flattenTraceOperations(trace)
+	operationByPlanID := make(map[string]PlanOperation, len(operations))
+	for _, operation := range operations {
+		operationByPlanID[operation.PlanID] = operation
+	}
+	var released machine.CPUSet
+	backedGrow := false
+	for _, applied := range res.Journal {
+		operation, ok := operationByPlanID[applied.PlanID]
+		require.True(t, ok, "journal plan %q must belong to the frozen trace", applied.PlanID)
+		switch applied.Direction {
+		case WriteShrink:
+			require.True(t, applied.Observed.CPUs.Equals(operation.Target.CPUs),
+				"source shrink must be read back before execution advances")
+			released = released.Union(
+				operation.ExpectedCurrent.CPUs.Difference(applied.Observed.CPUs))
+		case WriteGrow:
+			added := applied.Observed.CPUs.Difference(operation.ExpectedCurrent.CPUs)
+			require.False(t, added.IsEmpty())
+			if !added.Intersection(released).IsEmpty() {
+				require.True(t, added.IsSubsetOf(released),
+					"transfer grow of %s exceeds earlier source shrink readback %s",
+					added.String(), released.String())
+				backedGrow = true
+			}
+		}
+	}
+	require.True(t, backedGrow, "fixture must execute a transfer grow after source shrink readback")
+}
+
+func TestFrozenTraceTransferGrowWithoutInvocationReleaseFailsBeforeWrite(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+	writer := newTracePreflightWriter(fixture.driver)
+	preflight, err := writer.preflightFrozenTraceOperations(context.Background(), trace)
+	require.NoError(t, err)
+
+	operations := flattenTraceOperations(trace)
+	operationIndex := transferGrowOperationIndex(t, trace, operations)
+	operation := operations[operationIndex]
+	operationPreflight := preflight[operationIndex]
+	fixture.driver.invariants = nil
+	current := fixture.driver.nodes[operation.Rel]
+	current.configuredCPUs = operationPreflight.before.ConfiguredCPUs.Clone()
+	current.cpus = operationPreflight.before.EffectiveCPUs.Clone()
+	current.configuredMems = operationPreflight.before.ConfiguredMems
+	current.mems = operationPreflight.before.EffectiveMems
+	if operation.ParentRel != "" {
+		parent := fixture.driver.nodes[operation.ParentRel]
+		parent.cpus = parent.cpus.Union(operation.Target.CPUs)
+		parent.configuredCPUs = parent.cpus.Clone()
+	}
+	writesBefore := fixture.driver.PhysicalWriteCount()
+	cost := physicalWriteCost(operation.ExpectedCurrent, operation.Target, operation.WriteMems)
+	ticket := &ExecutionReservationTicket{
+		traceID: "transfer-grow-without-release",
+		operations: []frozenOperationAuthorization{{
+			operation: clonePlanOperation(operation),
+		}},
+		reserved: ExecutionReservationCost{Forward: cost},
+	}
+
+	_, err = writer.applyFrozenOperation(
+		context.Background(), PhaseExpand, 0, operation, operationPreflight,
+		&traceMutationStack{}, ticket, ticket.traceID)
+
+	require.Error(t, err)
+	require.Equal(t, writesBefore, fixture.driver.PhysicalWriteCount(),
+		"transfer grow must be rejected before its first physical write")
+}
+
+func TestFrozenTraceTransferGrowRejectsSourceRootReacquisitionBeforeWrite(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+	writer := newTracePreflightWriter(fixture.driver)
+	preflight, err := writer.preflightFrozenTraceOperations(context.Background(), trace)
+	require.NoError(t, err)
+
+	operations := flattenTraceOperations(trace)
+	operationIndex := transferGrowOperationIndex(t, trace, operations)
+	operation := operations[operationIndex]
+	operationPreflight := preflight[operationIndex]
+	require.NotEmpty(t, operationPreflight.releaseGuards)
+	guard := operationPreflight.releaseGuards[0]
+	sourceRoot := ""
+	specByRel := make(map[string]NodeSpec, len(trace.EvaluationInput.DAGSpecs))
+	for _, spec := range trace.EvaluationInput.DAGSpecs {
+		specByRel[spec.Rel] = spec
+	}
+	for _, spec := range trace.EvaluationInput.DAGSpecs {
+		parent, hasParent := specByRel[spec.ParentRel]
+		if spec.Domain == guard.sourceDomain &&
+			(!hasParent || parent.Domain != guard.sourceDomain) {
+			sourceRoot = spec.Rel
+			break
+		}
+	}
+	require.NotEmpty(t, sourceRoot)
+	fixture.driver.invariants = nil
+	current := fixture.driver.nodes[operation.Rel]
+	current.configuredCPUs = operationPreflight.before.ConfiguredCPUs.Clone()
+	current.cpus = operationPreflight.before.EffectiveCPUs.Clone()
+	if operation.ParentRel != "" {
+		parent := fixture.driver.nodes[operation.ParentRel]
+		parent.cpus = parent.cpus.Union(operation.Target.CPUs)
+		parent.configuredCPUs = parent.cpus.Clone()
+	}
+	source := fixture.driver.nodes[sourceRoot]
+	source.cpus = source.cpus.Union(guard.cpus)
+	source.configuredCPUs = source.cpus.Clone()
+	stack := &traceMutationStack{
+		releasedByDomain: map[DomainID]map[int]struct{}{},
+	}
+	addCPUSetToAccumulator(stack.releasedByDomain, guard.sourceDomain, guard.cpus)
+	writesBefore := fixture.driver.PhysicalWriteCount()
+	cost := physicalWriteCost(operation.ExpectedCurrent, operation.Target, operation.WriteMems)
+	ticket := &ExecutionReservationTicket{
+		traceID: "transfer-grow-source-reacquired",
+		operations: []frozenOperationAuthorization{{
+			operation: clonePlanOperation(operation),
+		}},
+		reserved: ExecutionReservationCost{Forward: cost},
+	}
+
+	_, err = writer.applyFrozenOperation(
+		context.Background(), PhaseExpand, 0, operation, operationPreflight,
+		stack, ticket, ticket.traceID)
+
+	require.Error(t, err)
+	require.Equal(t, writesBefore, fixture.driver.PhysicalWriteCount(),
+		"source root reacquisition must be rejected before the transfer grow writes")
+}
+
+func TestCompileFrozenGrowReleaseGuardsRejectsCrossDomainGrowWithoutSourceShrink(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+	operations := flattenTraceOperations(trace)
+	growIndex := transferGrowOperationIndex(t, trace, operations)
+	grow := operations[growIndex]
+	destination := trace.InitialSnapshot.DomainByRel[grow.Rel]
+	added := grow.Target.CPUs.Difference(grow.ExpectedCurrent.CPUs)
+
+	modified := *trace
+	modified.Phases = cloneCompiledPhases(trace.Phases)
+	for phaseIndex := range modified.Phases {
+		filtered := modified.Phases[phaseIndex].Operations[:0]
+		for _, operation := range modified.Phases[phaseIndex].Operations {
+			source := trace.InitialSnapshot.DomainByRel[operation.Rel]
+			released := operation.ExpectedCurrent.CPUs.Difference(operation.Target.CPUs)
+			if operation.Direction == WriteShrink && source != destination &&
+				!released.Intersection(added).IsEmpty() {
+				continue
+			}
+			filtered = append(filtered, operation)
+		}
+		modified.Phases[phaseIndex].Operations = filtered
+	}
+
+	_, err = compileFrozenGrowReleaseGuards(&modified)
+
+	require.Error(t, err)
+	require.ErrorContains(t, err, "source shrink coverage")
+}
+
+func TestCompileFrozenGrowReleaseGuardsRejectsSourceDomainStillHoldingCPU(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+	operations := flattenTraceOperations(trace)
+	growIndex := transferGrowOperationIndex(t, trace, operations)
+	grow := operations[growIndex]
+	added := grow.Target.CPUs.Difference(grow.ExpectedCurrent.CPUs)
+	sourceDomain := DomainID("")
+	for sourceIndex := 0; sourceIndex < growIndex; sourceIndex++ {
+		source := operations[sourceIndex]
+		released := source.ExpectedCurrent.CPUs.Difference(source.Target.CPUs)
+		if source.Direction == WriteShrink && !released.Intersection(added).IsEmpty() {
+			sourceDomain = trace.InitialSnapshot.DomainByRel[source.Rel]
+			break
+		}
+	}
+	require.NotEmpty(t, sourceDomain)
+
+	modified := *trace
+	modified.InitialSnapshot = CloneCompleteSnapshot(trace.InitialSnapshot)
+	const holderRel = "unreleased-source-holder"
+	holderIdentity := CgroupIdentity{Device: 1, Inode: 9001}
+	modified.InitialSnapshot.Entries[holderRel] = EntryState{
+		Rel: holderRel, Identity: holderIdentity,
+		CPUs: added.Clone(), ConfiguredCPUs: added.Clone(),
+		Mems: "0", ConfiguredMems: "0",
+	}
+	modified.InitialSnapshot.DomainByRel[holderRel] = sourceDomain
+	modified.InitialSnapshot.ScanBoundary.Roots =
+		append(modified.InitialSnapshot.ScanBoundary.Roots, holderRel)
+	modified.InitialSnapshot.DomainUnion[sourceDomain] =
+		modified.InitialSnapshot.DomainUnion[sourceDomain].Union(added)
+	modified.InitialSnapshot.ID = fingerprintSnapshot(modified.InitialSnapshot)
+
+	_, err = compileFrozenGrowReleaseGuards(&modified)
+
+	require.Error(t, err)
+	require.ErrorContains(t, err, "source domain release")
+}
+
+func transferGrowOperationIndex(
+	t *testing.T,
+	trace *CompiledPhaseTrace,
+	operations []PlanOperation,
+) int {
+	t.Helper()
+	for growIndex, grow := range operations {
+		if grow.Direction != WriteGrow {
+			continue
+		}
+		added := grow.Target.CPUs.Difference(grow.ExpectedCurrent.CPUs)
+		destination := trace.InitialSnapshot.DomainByRel[grow.Rel]
+		for sourceIndex := 0; sourceIndex < growIndex; sourceIndex++ {
+			source := operations[sourceIndex]
+			if source.Direction != WriteShrink ||
+				trace.InitialSnapshot.DomainByRel[source.Rel] == destination {
+				continue
+			}
+			released := source.ExpectedCurrent.CPUs.Difference(source.Target.CPUs)
+			if !released.Intersection(added).IsEmpty() {
+				return growIndex
+			}
+		}
+	}
+	t.Fatal("trace has no transfer grow backed by an earlier cross-domain shrink")
+	return -1
+}
+
+func traceOperationByDirection(
+	t *testing.T,
+	trace *CompiledPhaseTrace,
+	direction WriteDirection,
+) PlanOperation {
+	t.Helper()
+	for _, operation := range flattenTraceOperations(trace) {
+		if operation.Direction == direction {
+			return operation
+		}
+	}
+	t.Fatalf("trace has no %s operation", direction)
+	return PlanOperation{}
+}
+
+func TestTracePreflightWrapsRelevantHolderRemovalAsInitialDriftWithoutWrites(t *testing.T) {
 	fixture := newAdmissionTraceFixture(t)
 	fixture.configureStagedSMTTransferWithDynamicDescendant()
 	const removed = "kubepods/runtime-created"
@@ -74,8 +492,7 @@ func TestTracePreflightWrapsExactBoundaryExpansionMismatchAsInitialDriftWithoutW
 	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
 	var drift *frozenInitialSnapshotDriftError
 	require.ErrorAs(t, err, &drift)
-	require.Contains(t, err.Error(), "exact snapshot boundary expansion mismatch")
-	require.ErrorIs(t, drift.cause, ErrSnapshotBoundaryExpansionMismatch)
+	require.Contains(t, err.Error(), "relevant CPU holder set changed")
 	require.NotEqual(t, drift.currentEvidenceID, drift.expected.ID)
 	require.Equal(t, 0, drift.physicalWritesBefore)
 	require.Equal(t, 0, drift.physicalWritesAfter)
@@ -103,35 +520,6 @@ func TestTracePreflightWrapsVanishedSnapshotEntryAsInitialDriftWithoutWrites(t *
 	require.Equal(t, initialState, driver.snapshot())
 }
 
-func TestTracePreflightBoundaryExpansionMismatchAfterPhysicalWriteFailsClosed(t *testing.T) {
-	t.Parallel()
-
-	snapshotErr := &SnapshotError{
-		Operation:  HierarchyOperationList,
-		Class:      HierarchyErrorInvalid,
-		EvidenceID: SnapshotID{1},
-		Err:        ErrSnapshotBoundaryExpansionMismatch,
-	}
-	expected := &CompleteSnapshot{ID: SnapshotID{2}}
-	for _, counts := range []struct {
-		name   string
-		before int
-		after  int
-	}{
-		{name: "write already preceded preflight", before: 1, after: 1},
-		{name: "write occurred during preflight", before: 0, after: 1},
-	} {
-		t.Run(counts.name, func(t *testing.T) {
-			err := wrapFrozenInitialPreflightError(
-				snapshotErr, expected, counts.before, counts.after)
-
-			require.Same(t, snapshotErr, err)
-			var drift *frozenInitialSnapshotDriftError
-			require.False(t, errors.As(err, &drift))
-		})
-	}
-}
-
 func TestTracePreflightReadsInvocationPhysicalWriteCountBeforeClassifyingDrift(t *testing.T) {
 	fixture := newAdmissionTraceFixture(t)
 	fixture.configureStagedSMTTransferWithDynamicDescendant()
@@ -149,7 +537,7 @@ func TestTracePreflightReadsInvocationPhysicalWriteCountBeforeClassifyingDrift(t
 	err = writer.preflightFrozenTrace(context.Background(), trace)
 
 	require.Error(t, err)
-	require.ErrorIs(t, err, ErrSnapshotBoundaryExpansionMismatch)
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
 	var drift *frozenInitialSnapshotDriftError
 	require.False(t, errors.As(err, &drift))
 }
@@ -229,27 +617,73 @@ func TestFinalSnapshotDriftWithUnverifiedRollbackIsNotReplanSafe(t *testing.T) {
 		"unverified rollback must retain physical-impact evidence")
 }
 
+func TestFinalBoundaryOperationalFailuresAreNotMarkedAsFrozenFinalDrift(t *testing.T) {
+	readFailure := errors.New("injected final boundary read failure")
+	tests := []struct {
+		name      string
+		prepare   func(*coordinatorRound, *CompiledPhaseTrace) context.Context
+		wantError error
+	}{
+		{
+			name: "deadline",
+			prepare: func(_ *coordinatorRound, _ *CompiledPhaseTrace) context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx
+			},
+			wantError: context.Canceled,
+		},
+		{
+			name: "budget",
+			prepare: func(round *coordinatorRound, _ *CompiledPhaseTrace) context.Context {
+				round.budget = NewBudgetTracker(ConvergenceBudget{MaxHierarchyIOOperations: 1})
+				return context.Background()
+			},
+			wantError: ErrHierarchyIOOperationBudgetExceeded,
+		},
+		{
+			name: "read",
+			prepare: func(round *coordinatorRound, trace *CompiledPhaseTrace) context.Context {
+				round.driver = &readErrorHierarchyDriver{
+					HierarchyDriver: round.driver,
+					err:             readFailure,
+					rel:             trace.FrozenBoundary.ControlledRels[0],
+				}
+				return context.Background()
+			},
+			wantError: readFailure,
+		},
+		{
+			name: "invalid boundary",
+			prepare: func(_ *coordinatorRound, trace *CompiledPhaseTrace) context.Context {
+				trace.FrozenBoundary.Version = FrozenBoundaryVersion(99)
+				return context.Background()
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			trace, driver := compiledTraceWithCPUAndMemoryWrites(t)
+			round := frozenExecutionRound(t, trace, driver)
+			ctx := tt.prepare(round, trace)
+
+			_, err := round.proveFrozenTraceFinalState(ctx, trace)
+
+			require.Error(t, err)
+			if tt.wantError != nil {
+				require.ErrorIs(t, err, tt.wantError)
+			}
+			var drift *frozenFinalSnapshotDriftError
+			require.False(t, errors.As(err, &drift))
+			require.False(t, replanRequired(err))
+		})
+	}
+}
+
 func TestTracePreflightRejectsIdentityDriftWithoutWrites(t *testing.T) {
 	trace, driver := compiledTraceWithCPUAndMemoryWrites(t)
 	driver.bumpIdentity(flattenTraceOperations(trace)[0].Rel)
-	initialState := driver.snapshot()
-
-	err := newTracePreflightWriter(driver).preflightFrozenTrace(context.Background(), trace)
-
-	require.Error(t, err)
-	require.Zero(t, driver.PhysicalWriteCount())
-	require.Equal(t, initialState, driver.snapshot())
-}
-
-func TestTracePreflightRejectsChildFingerprintDriftWithoutWrites(t *testing.T) {
-	trace, driver := compiledTraceWithCPUAndMemoryWrites(t)
-	operation := operationWithCapturedChildren(t, trace)
-	driver.add(
-		filepath.Join(operation.Rel, "preflight-drift"),
-		CgroupIdentity{Device: 1, Inode: 1000},
-		"",
-		"0",
-	)
 	initialState := driver.snapshot()
 
 	err := newTracePreflightWriter(driver).preflightFrozenTrace(context.Background(), trace)
@@ -308,57 +742,6 @@ func TestTracePreflightProducesEveryProjectedPhysicalPredecessorIncludingV2Empty
 	require.Zero(t, fixture.driver.PhysicalWriteCount())
 }
 
-func TestTracePreflightReplaysAncestorOnlyBoundaryWithoutReadingExtraDescendants(t *testing.T) {
-	fixture := newAdmissionTraceFixture(t)
-	fixture.driver.capabilities = cgroupV2Policy.capabilities(true)
-	fixture.round.allowEmptyTarget = true
-	fixture.addPrimary("kubepods", "0-3", "0")
-	fixture.addDynamicDescendant("kubepods/besteffort", "0-3", "0")
-	_ = fixture.snapshot()
-
-	base, err := BuildCompleteSnapshot(
-		context.Background(),
-		fixture.driver,
-		fixture.round.dag,
-		SnapshotRequest{
-			Purpose:      ScanForPlan,
-			AffectedRels: []string{"kubepods/besteffort"},
-		},
-		NewBudgetTracker(ConvergenceBudget{}),
-	)
-	require.NoError(t, err)
-	require.Equal(t, []string{"kubepods", "kubepods/besteffort"}, base.ScanBoundary.Roots)
-	require.Equal(t, []string{"kubepods/besteffort"}, base.ScanBoundary.ExpandedRels)
-
-	trace, err := fixture.round.compileFixedPointTrace(context.Background(), base)
-	require.NoError(t, err)
-	traceID := trace.TraceID
-	fixture.driver.add(
-		"kubepods/unrelated",
-		CgroupIdentity{Device: 1, Inode: 999},
-		"0-3",
-		"0",
-	)
-	var calls []string
-	fixture.driver.beforeCall = func(op HierarchyOperation, rel string) error {
-		calls = append(calls, string(op)+":"+rel)
-		if rel == "kubepods/unrelated" {
-			return errors.New("ancestor-only replay must not read unrelated descendant")
-		}
-		return nil
-	}
-
-	err = newTracePreflightWriter(fixture.driver).preflightFrozenTrace(context.Background(), trace)
-
-	require.NoError(t, err)
-	require.Equal(t, traceID, trace.TraceID)
-	require.NotContains(t, calls, string(HierarchyOperationList)+":kubepods")
-	for _, call := range calls {
-		require.NotContains(t, call, "kubepods/unrelated")
-	}
-	require.Zero(t, fixture.driver.PhysicalWriteCount())
-}
-
 func TestTracePreflightRejectsInvalidV2InheritanceWithoutWrites(t *testing.T) {
 	trace, driver := compiledTraceWithCPUAndMemoryWrites(t)
 	operation := operationWithParent(t, trace)
@@ -366,15 +749,11 @@ func TestTracePreflightRejectsInvalidV2InheritanceWithoutWrites(t *testing.T) {
 	operation.Target.CPUs = parent.CPUs.Union(machine.NewCPUSet(99))
 	operation.Direction = WriteGrow
 	replaceTraceOperation(t, trace, operation)
-	fresh, err := BuildCompleteSnapshotForBoundary(
-		context.Background(),
-		driver,
-		mustBuildTraceDAG(t, trace),
-		trace.InitialSnapshot.ScanBoundary,
-		NewBudgetTracker(ConvergenceBudget{}),
+	boundary, err := compileFrozenBoundaryV1(
+		trace.InitialSnapshot, trace.EvaluationInput, trace.Phases,
 	)
 	require.NoError(t, err)
-	require.Equal(t, trace.InitialSnapshot.ID, fresh.ID)
+	trace.FrozenBoundary = boundary
 	initialState := driver.snapshot()
 
 	err = newTracePreflightWriter(driver).preflightFrozenTrace(context.Background(), trace)
@@ -470,47 +849,15 @@ func TestFrozenTraceValidatesCompletePredecessorBeforeOperationFirstWrite(t *tes
 			},
 		},
 		{
-			name: "children fingerprint",
-			selectOp: func(operation PlanOperation, trace *CompiledPhaseTrace) bool {
-				return len(trace.InitialSnapshot.Children[operation.Rel]) > 0
+			name: "parent no longer contains grow target",
+			selectOp: func(operation PlanOperation, _ *CompiledPhaseTrace) bool {
+				return operation.Direction == WriteGrow && operation.ParentRel != ""
 			},
 			mutate: func(live *fakeHierarchyDriver, operation PlanOperation) {
-				childRel := filepath.Join(operation.Rel, "external-child")
-				live.add(childRel, CgroupIdentity{Device: 99, Inode: 99}, "0", "0")
-			},
-		},
-		{
-			name: "child identity",
-			selectOp: func(operation PlanOperation, trace *CompiledPhaseTrace) bool {
-				return len(trace.InitialSnapshot.Children[operation.Rel]) > 0
-			},
-			mutate: func(live *fakeHierarchyDriver, operation PlanOperation) {
-				child := traceChildRel(t, operation.Rel, live)
-				live.bumpIdentity(child)
-			},
-		},
-		{
-			name: "child CPU union",
-			selectOp: func(operation PlanOperation, trace *CompiledPhaseTrace) bool {
-				return len(trace.InitialSnapshot.Children[operation.Rel]) > 0
-			},
-			mutate: func(live *fakeHierarchyDriver, operation PlanOperation) {
-				child := traceChildRel(t, operation.Rel, live)
-				live.nodes[child].configuredCPUs =
-					live.nodes[child].configuredCPUs.Union(machine.NewCPUSet(99))
-				live.nodes[child].cpus =
-					live.nodes[child].cpus.Union(machine.NewCPUSet(99))
-			},
-		},
-		{
-			name: "child mems union",
-			selectOp: func(operation PlanOperation, trace *CompiledPhaseTrace) bool {
-				return len(trace.InitialSnapshot.Children[operation.Rel]) > 0
-			},
-			mutate: func(live *fakeHierarchyDriver, operation PlanOperation) {
-				child := traceChildRel(t, operation.Rel, live)
-				live.nodes[child].configuredMems = "0-99"
-				live.nodes[child].mems = "0-99"
+				parent := live.nodes[operation.ParentRel]
+				parent.cpus = parent.cpus.Difference(
+					operation.Target.CPUs.Difference(operation.ExpectedCurrent.CPUs))
+				parent.configuredCPUs = parent.cpus.Clone()
 			},
 		},
 		{
@@ -1657,6 +2004,22 @@ type frozenPredecessorDriftDriver struct {
 	writesToDriftedOperation int
 }
 
+type readErrorHierarchyDriver struct {
+	HierarchyDriver
+	err error
+	rel string
+}
+
+func (d *readErrorHierarchyDriver) ReadEntry(
+	ctx context.Context,
+	rel string,
+) (EntryState, error) {
+	if rel == d.rel {
+		return EntryState{}, d.err
+	}
+	return d.HierarchyDriver.ReadEntry(ctx, rel)
+}
+
 func selectTraceOperation(
 	t *testing.T,
 	trace *CompiledPhaseTrace,
@@ -1670,19 +2033,6 @@ func selectTraceOperation(
 	}
 	t.Fatal("compiled trace has no operation matching predecessor drift case")
 	return PlanOperation{}
-}
-
-func traceChildRel(t *testing.T, parentRel string, live *fakeHierarchyDriver) string {
-	t.Helper()
-	children := make([]string, 0)
-	for rel := range live.nodes {
-		if filepath.Dir(rel) == parentRel {
-			children = append(children, rel)
-		}
-	}
-	require.NotEmpty(t, children, "predecessor drift case requires a child")
-	sort.Strings(children)
-	return children[0]
 }
 
 func newFrozenPredecessorDriftDriver(
