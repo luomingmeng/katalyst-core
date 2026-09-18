@@ -42,6 +42,8 @@ const (
 	ScanForAppliedView ScanPurpose = "applied_view"
 )
 
+var ErrSnapshotBoundaryExpansionMismatch = errors.New("exact snapshot boundary expansion mismatch")
+
 // ScanBoundary records the minimum sufficient evidence selected for a purpose.
 type ScanBoundary struct {
 	Purpose      ScanPurpose
@@ -299,7 +301,8 @@ func buildCompleteSnapshotWithBoundary(
 			Class:      HierarchyErrorInvalid,
 			EvidenceID: builder.snapshot.ID,
 			Err: fmt.Errorf(
-				"exact snapshot boundary expansion mismatch: got=%v want=%v",
+				"%w: got=%v want=%v",
+				ErrSnapshotBoundaryExpansionMismatch,
 				builder.snapshot.ScanBoundary.ExpandedRels,
 				boundary.ExpandedRels,
 			),

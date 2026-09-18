@@ -87,17 +87,39 @@ type frozenOperationPreflight struct {
 // recompile from this snapshot while the same invocation budget and deadline
 // remain in force.
 type frozenInitialSnapshotDriftError struct {
-	current  *CompleteSnapshot
-	expected *CompleteSnapshot
-	stale    *PlanStaleError
+	current              *CompleteSnapshot
+	expected             *CompleteSnapshot
+	currentEvidenceID    SnapshotID
+	physicalWritesBefore int
+	physicalWritesAfter  int
+	cause                error
+	stale                *PlanStaleError
 }
 
 func (e *frozenInitialSnapshotDriftError) Error() string {
-	if e == nil || e.current == nil || e.expected == nil {
+	if e == nil {
 		return "frozen trace initial snapshot drift"
 	}
-	return fmt.Sprintf("frozen trace initial snapshot drift: current=%x expected=%x",
-		e.current.ID, e.expected.ID)
+	var currentID, expectedID SnapshotID
+	if e.current != nil {
+		currentID = e.current.ID
+	} else {
+		currentID = e.currentEvidenceID
+	}
+	if e.expected != nil {
+		expectedID = e.expected.ID
+	}
+	message := fmt.Sprintf(
+		"frozen trace initial snapshot drift: current=%x expected=%x physical_writes_before=%d physical_writes_after=%d: %v",
+		currentID, expectedID, e.physicalWritesBefore, e.physicalWritesAfter, e.cause,
+	)
+	if e.cause == nil {
+		message = fmt.Sprintf(
+			"frozen trace initial snapshot drift: current=%x expected=%x physical_writes_before=%d physical_writes_after=%d",
+			currentID, expectedID, e.physicalWritesBefore, e.physicalWritesAfter,
+		)
+	}
+	return message
 }
 
 func (e *frozenInitialSnapshotDriftError) Unwrap() error {
@@ -110,6 +132,62 @@ func (e *frozenInitialSnapshotDriftError) Unwrap() error {
 func (e *frozenInitialSnapshotDriftError) ReplanRequired() bool { return true }
 
 func (e *frozenInitialSnapshotDriftError) FrozenInitialSnapshotDrift() bool { return true }
+
+func newFrozenInitialSnapshotDriftError(
+	current *CompleteSnapshot,
+	expected *CompleteSnapshot,
+	currentEvidenceID SnapshotID,
+	cause error,
+	physicalWritesBefore, physicalWritesAfter int,
+) error {
+	currentState := fmt.Sprintf("%x", currentEvidenceID)
+	if current != nil {
+		currentState = snapshotLogicalState(current)
+	}
+	stale := &PlanStaleError{
+		Rel:       "controlled",
+		Direction: WritePublish,
+		Resource:  "initial_snapshot",
+		Current:   currentState,
+		Target:    snapshotLogicalState(expected),
+		Err:       cause,
+	}
+	if physicalWritesBefore != 0 || physicalWritesAfter != 0 {
+		return fmt.Errorf(
+			"frozen trace initial snapshot drift is not replan-safe: current=%x expected=%x physical_writes_before=%d physical_writes_after=%d: %w",
+			currentEvidenceID, expected.ID, physicalWritesBefore, physicalWritesAfter, stale,
+		)
+	}
+	return &frozenInitialSnapshotDriftError{
+		current:              current,
+		expected:             expected,
+		currentEvidenceID:    currentEvidenceID,
+		physicalWritesBefore: physicalWritesBefore,
+		physicalWritesAfter:  physicalWritesAfter,
+		cause:                cause,
+		stale:                stale,
+	}
+}
+
+func wrapFrozenInitialPreflightError(
+	err error,
+	expected *CompleteSnapshot,
+	physicalWritesBefore, physicalWritesAfter int,
+) error {
+	if physicalWritesBefore != 0 || physicalWritesAfter != 0 {
+		return err
+	}
+	if !errors.Is(err, ErrSnapshotBoundaryExpansionMismatch) {
+		return err
+	}
+	var snapshotErr *SnapshotError
+	if !errors.As(err, &snapshotErr) {
+		return err
+	}
+	return newFrozenInitialSnapshotDriftError(
+		nil, expected, snapshotErr.EvidenceID, err,
+		physicalWritesBefore, physicalWritesAfter)
+}
 
 // frozenFinalSnapshotDriftError records external hierarchy drift discovered only
 // after the frozen write sequence. It is not safe to replan until failFrozenTrace
@@ -204,6 +282,7 @@ func (w safeCPSetWriter) preflightFrozenTraceOperations(
 	if err != nil {
 		return nil, fmt.Errorf("rebuild frozen trace DAG for preflight: %w", err)
 	}
+	physicalWritesBefore := w.physicalWriteCount()
 	fresh, err := BuildCompleteSnapshotForBoundary(
 		ctx,
 		w.driver,
@@ -211,22 +290,21 @@ func (w safeCPSetWriter) preflightFrozenTraceOperations(
 		cloneScanBoundary(frozen.InitialSnapshot.ScanBoundary),
 		w.budget,
 	)
+	physicalWritesAfter := w.physicalWriteCount()
 	if err != nil {
-		return nil, fmt.Errorf("capture frozen trace preflight snapshot: %w", err)
+		err = fmt.Errorf("capture frozen trace preflight snapshot: %w", err)
+		return nil, wrapFrozenInitialPreflightError(
+			err, frozen.InitialSnapshot, physicalWritesBefore, physicalWritesAfter)
 	}
 	if fresh.ID != frozen.InitialSnapshot.ID {
-		return nil, &frozenInitialSnapshotDriftError{
-			current:  fresh,
-			expected: frozen.InitialSnapshot,
-			stale: &PlanStaleError{
-				Rel:       "controlled",
-				Direction: WritePublish,
-				Resource:  "initial_snapshot",
-				Current:   snapshotLogicalState(fresh),
-				Target:    snapshotLogicalState(frozen.InitialSnapshot),
-				Err:       fmt.Errorf("fresh preflight snapshot differs from frozen trace base"),
-			},
-		}
+		return nil, newFrozenInitialSnapshotDriftError(
+			fresh,
+			frozen.InitialSnapshot,
+			fresh.ID,
+			fmt.Errorf("fresh preflight snapshot differs from frozen trace base"),
+			physicalWritesBefore,
+			physicalWritesAfter,
+		)
 	}
 
 	projection, err := newProjectedHierarchy(fresh, frozen.Capabilities)
@@ -287,6 +365,19 @@ func (w safeCPSetWriter) preflightFrozenTraceOperations(
 		)
 	}
 	return evidence, nil
+}
+
+func (w safeCPSetWriter) physicalWriteCount() int {
+	if w.physicalWriteAttempts == nil {
+		return 0
+	}
+	return *w.physicalWriteAttempts
+}
+
+func (w safeCPSetWriter) recordPhysicalWriteAttempt() {
+	if w.physicalWriteAttempts != nil {
+		*w.physicalWriteAttempts++
+	}
 }
 
 func frozenChildrenFromSnapshot(
@@ -527,6 +618,7 @@ func (w safeCPSetWriter) applyFrozenOperation(
 		if err := ticket.consumeForward(PhysicalWriteCost{MemsWrites: 1}); err != nil {
 			return AppliedPlanOperation{}, err
 		}
+		w.recordPhysicalWriteAttempt()
 		if err := w.driver.WriteMems(
 			ctx, operation.Rel, operation.ExpectedIdentity, operation.Target.Mems,
 		); err != nil {
@@ -548,6 +640,7 @@ func (w safeCPSetWriter) applyFrozenOperation(
 		if err := ticket.consumeForward(PhysicalWriteCost{CPUSetWrites: 1}); err != nil {
 			return AppliedPlanOperation{}, err
 		}
+		w.recordPhysicalWriteAttempt()
 		if err := w.driver.WriteCPUs(
 			ctx, operation.Rel, operation.ExpectedIdentity, operation.Target.CPUs,
 		); err != nil {
@@ -865,6 +958,7 @@ func (w safeCPSetWriter) rollbackTracePrefix(
 					fmt.Errorf("parse rollback cpuset.cpus for %q: %w", write.Rel, err))
 				continue
 			}
+			w.recordPhysicalWriteAttempt()
 			if err := rollbackDriver.WriteCPUs(ctx, write.Rel, write.Identity, before); err != nil {
 				rollbackErrors = append(rollbackErrors,
 					fmt.Errorf("rollback cpuset.cpus for %q: %w", write.Rel, err))
@@ -874,6 +968,7 @@ func (w safeCPSetWriter) rollbackTracePrefix(
 				rollbackErrors = append(rollbackErrors, err)
 				continue
 			}
+			w.recordPhysicalWriteAttempt()
 			if err := rollbackDriver.WriteMems(ctx, write.Rel, write.Identity, write.Before); err != nil {
 				rollbackErrors = append(rollbackErrors,
 					fmt.Errorf("rollback cpuset.mems for %q: %w", write.Rel, err))
