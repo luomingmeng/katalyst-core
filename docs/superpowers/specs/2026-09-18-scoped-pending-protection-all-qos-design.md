@@ -104,9 +104,13 @@ scoped pending representations.
 The plugin resolves each pending Pod in this order:
 
 1. Use the existing Pod relative cgroup path when it is available.
-2. Otherwise ask `pkg/util/cgroup/common` for every pure Pod-path candidate
-   implied by its configured Kubernetes roots. Candidate generation performs no
-   filesystem lookup.
+2. Otherwise derive the Pod's native Kubernetes QoS class from the cached Pod
+   specification, then ask `pkg/util/cgroup/common` for the pure candidates
+   implied by the canonical configured root for that class. This prevents the
+   Guaranteed, Burstable, and BestEffort roots from becoming artificial
+   equal-depth alternatives. Candidate generation performs no filesystem
+   lookup. If native QoS is unavailable, retain all configured candidates so
+   selection fails closed rather than guessing.
 3. After `BuildDAG`, select the unique candidate whose controlled-primary
    ancestor is deepest.
 4. Fail closed when no candidate matches or distinct candidates tie at the

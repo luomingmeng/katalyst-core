@@ -292,6 +292,9 @@ It must not inspect the filesystem. Build the topology DAG, select the unique
 candidate with the deepest controlled-primary ancestor, and assert that
 `pendingProtections` returns the expected `ScopeRel`, CPU set, Pod UID, and
 `PendingProtectionSourceExpectedPod` while every candidate path is absent.
+Cover the production primary-root shape (`kubepods`) with all configured
+Kubernetes QoS roots present: native Guaranteed must resolve only the direct
+root candidate, while Burstable and BestEffort select their canonical roots.
 
 Add no-match and equal-depth ambiguity cases and assert deterministic
 fail-closed errors.
@@ -312,6 +315,11 @@ Add:
 ```go
 func GetPodRelativeCgroupPathCandidates(podUID string) []string
 
+func GetPodRelativeCgroupPathCandidatesForQOS(
+    podUID string,
+    qosClass v1.PodQOSClass,
+) []string
+
 func (d *TopoDAG) SelectUniqueControlledPrimaryCandidate(
     candidates []string,
 ) (string, error)
@@ -320,7 +328,9 @@ func (d *TopoDAG) SelectUniqueControlledPrimaryCandidate(
 For each pending Pod:
 
 1. retain a previously proved cached relation when present;
-2. otherwise generate candidates from common's configured Kubernetes roots;
+2. otherwise derive native Kubernetes QoS from the cached Pod specification
+   and generate candidates from the corresponding canonical configured root;
+   unknown QoS retains all roots and therefore cannot bypass ambiguity checks;
 3. after DAG construction, select the sole candidate under the deepest
    controlled-primary ancestor;
 4. fail closed on no match or ambiguity;
@@ -881,7 +891,8 @@ For each probe, require:
 
 ```text
 no ParentSafe deadline
-protected_rel_count or scoped-protection evidence present
+pending_count is non-zero and a `pending pod scope selected` record identifies
+the native QoS, selected scope, source, and protected CPU set
 pending CPUs contained by scoped ancestors
 pending CPUs disjoint from reclaim
 Pod reaches Running
