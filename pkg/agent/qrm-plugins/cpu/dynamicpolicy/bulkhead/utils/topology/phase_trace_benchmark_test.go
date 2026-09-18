@@ -19,10 +19,15 @@ package topology
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
@@ -173,6 +178,156 @@ func TestBenchmarkMetricPerIterationUsesAllIterations(t *testing.T) {
 	if got, want := benchmarkMetricPerIteration(18, 3), float64(6); got != want {
 		t.Fatalf("benchmarkMetricPerIteration(18, 3) = %v, want %v", got, want)
 	}
+}
+
+func TestCompileFixedPointTraceOperationHeavyScale(t *testing.T) {
+	if os.Getenv(topologyScaleTestEnv) != "1" {
+		t.Skipf("set %s=1 to run high-cost topology scale tests", topologyScaleTestEnv)
+	}
+	const linearScaleTolerance = 3.0
+	var previous operationHeavyScaleMeasurement
+	for _, nodes := range []int{100, 1000, 10000} {
+		measurement := measureOperationHeavyScale(t, nodes)
+		t.Logf("nodes=%d operations=%d elapsed=%s allocations=%d peak_live_bytes=%d",
+			nodes, measurement.operations, measurement.elapsed,
+			measurement.allocations, measurement.peakLiveBytes)
+		require.GreaterOrEqual(t, measurement.operations, nodes-18)
+		if previous.nodes != 0 {
+			nodeRatio := float64(nodes) / float64(previous.nodes)
+			require.LessOrEqual(t,
+				float64(measurement.allocations)/float64(previous.allocations),
+				nodeRatio*linearScaleTolerance)
+			require.LessOrEqual(t,
+				float64(measurement.peakLiveBytes)/float64(previous.peakLiveBytes),
+				nodeRatio*linearScaleTolerance)
+			require.LessOrEqual(t,
+				float64(measurement.elapsed)/float64(previous.elapsed),
+				nodeRatio*linearScaleTolerance)
+		}
+		previous = measurement
+	}
+}
+
+type operationHeavyScaleMeasurement struct {
+	nodes         int
+	operations    int
+	elapsed       time.Duration
+	allocations   uint64
+	peakLiveBytes uint64
+}
+
+func measureOperationHeavyScale(t testing.TB, nodes int) operationHeavyScaleMeasurement {
+	t.Helper()
+	fixture := newOperationHeavyTraceFixture(t, nodes)
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	started := time.Now()
+	trace, err := fixture.compile()
+	elapsed := time.Since(started)
+	runtime.ReadMemStats(&after)
+	require.NoError(t, err)
+	require.True(t, trace.FinalEvaluation.ParentSafety.Safe)
+	require.Zero(t, fixture.driver.readCount())
+	require.Zero(t, fixture.driver.writeCount())
+	peakLive := after.HeapAlloc
+	if peakLive < before.HeapAlloc {
+		peakLive = before.HeapAlloc
+	}
+	return operationHeavyScaleMeasurement{
+		nodes:         nodes,
+		operations:    trace.OperationCount(),
+		elapsed:       elapsed,
+		allocations:   after.Mallocs - before.Mallocs,
+		peakLiveBytes: peakLive,
+	}
+}
+
+func newOperationHeavyTraceFixture(tb testing.TB, nodes int) *traceBenchmarkFixture {
+	tb.Helper()
+	if nodes < 20 {
+		tb.Fatalf("nodes=%d must be at least 20", nodes)
+	}
+	capabilities := cgroupV2Policy.capabilities(true)
+	driver := &traceBenchmarkDriver{
+		nodes:        make(map[string]EntryState, nodes),
+		children:     make(map[string][]ChildRef, nodes),
+		capabilities: capabilities,
+	}
+	specs := make([]NodeSpec, 0, nodes)
+	targetByRel := make(map[string]machine.CPUSet, nodes)
+	dynamicByRel := make(map[string]machine.CPUSet, nodes)
+	requiredByRel := make(map[string]machine.CPUSet, nodes)
+	nextInode := uint64(1)
+	add := func(rel, parent string, role TopoNodeRole, domain DomainID, observed, target machine.CPUSet) {
+		identity := CgroupIdentity{Device: 1, Inode: nextInode}
+		nextInode++
+		driver.nodes[rel] = EntryState{
+			Rel: rel, Identity: identity,
+			CPUs: observed.Clone(), ConfiguredCPUs: observed.Clone(),
+			Mems: "0", ConfiguredMems: "0",
+		}
+		if parent == "" {
+			driver.roots = append(driver.roots, RootRef{Rel: rel, Identity: identity})
+		} else {
+			driver.children[parent] = append(driver.children[parent], ChildRef{
+				Name: filepath.Base(rel), Identity: identity,
+			})
+		}
+		specs = append(specs, NodeSpec{
+			Rel: rel, ParentRel: parent, Role: role, Domain: domain,
+			CPUs: target.Clone(), Mems: "0", TrustAnchor: parent == "",
+		})
+		targetByRel[rel] = target.Clone()
+	}
+
+	primaryCPUs := machine.MustParse("0-6")
+	add("primary", "", TopoNodeRolePrimary, DomainPrimary, primaryCPUs, primaryCPUs)
+	add("reclaim", "", TopoNodeRoleReclaim, DomainReclaim,
+		machine.NewCPUSet(0, 7), machine.NewCPUSet(7))
+	for index := 2; index < nodes; index++ {
+		rel := fmt.Sprintf("reclaim/cleanup-%06d", index)
+		add(rel, "reclaim", TopoNodeRoleReclaim, DomainReclaim,
+			machine.NewCPUSet(0), machine.NewCPUSet())
+		dynamicByRel[rel] = machine.NewCPUSet()
+		requiredByRel[rel] = machine.NewCPUSet()
+	}
+	sort.Slice(driver.children["reclaim"], func(i, j int) bool {
+		return driver.children["reclaim"][i].Name < driver.children["reclaim"][j].Name
+	})
+	sort.Slice(driver.roots, func(i, j int) bool { return driver.roots[i].Rel < driver.roots[j].Rel })
+	dag, err := BuildDAG(specs)
+	require.NoError(tb, err)
+	budget := NewBudgetTracker(traceScaleBudget(nodes, 2))
+	base, err := newCompleteSnapshotSource(driver, dag, budget)(context.Background())
+	require.NoError(tb, err)
+	driver.resetCounts()
+	cpuDetails := machine.CPUDetails{
+		0: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
+		1: {NUMANodeID: 0, SocketID: 0, CoreID: 1},
+		2: {NUMANodeID: 0, SocketID: 0, CoreID: 2},
+		3: {NUMANodeID: 0, SocketID: 0, CoreID: 3},
+		4: {NUMANodeID: 0, SocketID: 0, CoreID: 4},
+		5: {NUMANodeID: 0, SocketID: 0, CoreID: 5},
+		6: {NUMANodeID: 0, SocketID: 0, CoreID: 6},
+		7: {NUMANodeID: 0, SocketID: 0, CoreID: 7},
+	}
+	round := &coordinatorRound{
+		objective:        ConvergenceObjectiveFull,
+		dag:              dag,
+		driver:           driver,
+		budget:           NewBudgetTracker(traceScaleBudget(nodes, 2)),
+		selection:        DefaultDrainSelectionPolicy(),
+		targetByRel:      targetByRel,
+		dynamicByRel:     dynamicByRel,
+		requiredByRel:    requiredByRel,
+		cpuDetails:       cpuDetails,
+		reservedCPUs:     machine.NewCPUSet(),
+		blocked:          map[DomainID]machine.CPUSet{},
+		maxRounds:        64,
+		allowEmptyTarget: true,
+	}
+	return &traceBenchmarkFixture{driver: driver, round: round, base: base}
 }
 
 func benchmarkMetricPerIteration(total int64, iterations int) float64 {

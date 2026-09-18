@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -464,6 +465,146 @@ func TestCompileFixedPointTracePerformsNoPhysicalHierarchyIO(t *testing.T) {
 	require.NotEmpty(t, flattenTraceOperations(trace))
 	require.Zero(t, fixture.driver.readCount())
 	require.Zero(t, fixture.driver.writeCount())
+}
+
+func TestCompileFixedPointTraceLivePendingShape(t *testing.T) {
+	const (
+		controlledSpecCount      = 17
+		dynamicDescendantCount   = 177
+		controlledAncestorCount  = 5
+		requiredFloorRepairCount = 2
+	)
+	fixture := newLivePendingShapeFixture(t)
+
+	trace, err := fixture.compile()
+
+	require.NoError(t, err)
+	require.Len(t, trace.EvaluationInput.DAGSpecs, controlledSpecCount)
+	require.Len(t, trace.FinalSnapshot.Entries, controlledSpecCount+dynamicDescendantCount)
+	require.LessOrEqual(t, trace.OperationCount(),
+		controlledAncestorCount+requiredFloorRepairCount)
+	require.True(t, trace.FinalEvaluation.ParentSafety.Safe)
+	require.Zero(t, fixture.driver.writeCount())
+}
+
+func newLivePendingShapeFixture(t testing.TB) *traceBenchmarkFixture {
+	t.Helper()
+	const (
+		primaryRoots     = 12
+		controlledDepth  = 5
+		dynamicPrimary   = 176
+		liveShapeEntries = 194
+	)
+	capabilities := cgroupV2Policy.capabilities(true)
+	driver := &traceBenchmarkDriver{
+		nodes:        make(map[string]EntryState, liveShapeEntries),
+		children:     make(map[string][]ChildRef, liveShapeEntries),
+		capabilities: capabilities,
+	}
+	specs := make([]NodeSpec, 0, 17)
+	targetByRel := make(map[string]machine.CPUSet, liveShapeEntries)
+	dynamicByRel := make(map[string]machine.CPUSet, dynamicPrimary+1)
+	pendingRequiredByRel := make(map[string]machine.CPUSet, controlledDepth)
+	nextInode := uint64(1)
+	add := func(rel, parent string, role TopoNodeRole, domain DomainID, observed machine.CPUSet, controlled bool) {
+		identity := CgroupIdentity{Device: 1, Inode: nextInode}
+		nextInode++
+		driver.nodes[rel] = EntryState{
+			Rel: rel, Identity: identity,
+			CPUs: observed.Clone(), ConfiguredCPUs: observed.Clone(),
+			Mems: "0", ConfiguredMems: "0",
+		}
+		if parent == "" {
+			driver.roots = append(driver.roots, RootRef{Rel: rel, Identity: identity})
+		} else {
+			driver.children[parent] = append(driver.children[parent], ChildRef{
+				Name: filepath.Base(rel), Identity: identity,
+			})
+		}
+		if controlled {
+			specs = append(specs, NodeSpec{
+				Rel: rel, ParentRel: parent, Role: role, Domain: domain,
+				CPUs: observed.Clone(), Mems: "0", TrustAnchor: parent == "",
+			})
+		}
+		targetByRel[rel] = observed.Clone()
+	}
+	setControlledTarget := func(rel string, target machine.CPUSet) {
+		targetByRel[rel] = target.Clone()
+		for i := range specs {
+			if specs[i].Rel == rel {
+				specs[i].CPUs = target.Clone()
+				return
+			}
+		}
+		t.Fatalf("controlled rel %q has no spec", rel)
+	}
+
+	primaryObserved := machine.MustParse("1-6")
+	primaryTarget := machine.MustParse("0-6")
+	for index := 0; index < primaryRoots; index++ {
+		rel := fmt.Sprintf("primary-%02d", index)
+		add(rel, "", TopoNodeRolePrimary, DomainPrimary, primaryObserved, true)
+	}
+	parent := "primary-00"
+	setControlledTarget(parent, primaryTarget)
+	pendingRequiredByRel[parent] = machine.NewCPUSet(0)
+	for level := 1; level < controlledDepth; level++ {
+		rel := fmt.Sprintf("%s/level-%02d", parent, level)
+		add(rel, parent, TopoNodeRolePrimary, DomainPrimary, primaryObserved, true)
+		setControlledTarget(rel, primaryTarget)
+		pendingRequiredByRel[rel] = machine.NewCPUSet(0)
+		parent = rel
+	}
+	for index := 0; index < dynamicPrimary; index++ {
+		rel := fmt.Sprintf("%s/pod-%03d", parent, index)
+		add(rel, parent, TopoNodeRolePrimary, DomainPrimary, primaryObserved, false)
+		dynamicByRel[rel] = primaryObserved.Clone()
+	}
+	add("reclaim", "", TopoNodeRoleReclaim, DomainReclaim, machine.NewCPUSet(0, 7), true)
+	setControlledTarget("reclaim", machine.NewCPUSet(7))
+	add("reclaim/release", "reclaim", TopoNodeRoleReclaim, DomainReclaim, machine.NewCPUSet(0), false)
+	targetByRel["reclaim/release"] = machine.NewCPUSet()
+	dynamicByRel["reclaim/release"] = machine.NewCPUSet()
+
+	for rel := range driver.children {
+		sort.Slice(driver.children[rel], func(i, j int) bool {
+			return driver.children[rel][i].Name < driver.children[rel][j].Name
+		})
+	}
+	sort.Slice(driver.roots, func(i, j int) bool { return driver.roots[i].Rel < driver.roots[j].Rel })
+	dag, err := BuildDAG(specs)
+	require.NoError(t, err)
+	budget := NewBudgetTracker(traceScaleBudget(liveShapeEntries, controlledDepth))
+	base, err := newCompleteSnapshotSource(driver, dag, budget)(context.Background())
+	require.NoError(t, err)
+	driver.resetCounts()
+	round := &coordinatorRound{
+		objective:            ConvergenceObjectiveParentSafe,
+		dag:                  dag,
+		driver:               driver,
+		budget:               NewBudgetTracker(traceScaleBudget(liveShapeEntries, controlledDepth)),
+		selection:            DefaultDrainSelectionPolicy(),
+		targetByRel:          targetByRel,
+		dynamicByRel:         dynamicByRel,
+		pendingRequiredByRel: pendingRequiredByRel,
+		protectedPending:     machine.NewCPUSet(0),
+		cpuDetails: machine.CPUDetails{
+			0: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
+			1: {NUMANodeID: 0, SocketID: 0, CoreID: 1},
+			2: {NUMANodeID: 0, SocketID: 0, CoreID: 2},
+			3: {NUMANodeID: 0, SocketID: 0, CoreID: 3},
+			4: {NUMANodeID: 0, SocketID: 0, CoreID: 4},
+			5: {NUMANodeID: 0, SocketID: 0, CoreID: 5},
+			6: {NUMANodeID: 0, SocketID: 0, CoreID: 6},
+			7: {NUMANodeID: 0, SocketID: 0, CoreID: 7},
+		},
+		reservedCPUs:     machine.NewCPUSet(),
+		blocked:          map[DomainID]machine.CPUSet{},
+		maxRounds:        64,
+		allowEmptyTarget: true,
+	}
+	return &traceBenchmarkFixture{driver: driver, round: round, base: base}
 }
 
 func requireTopologyScaleTests(t *testing.T) {

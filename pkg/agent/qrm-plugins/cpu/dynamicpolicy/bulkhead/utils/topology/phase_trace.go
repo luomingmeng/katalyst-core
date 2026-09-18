@@ -100,6 +100,17 @@ type CompiledPhaseTrace struct {
 	Cost                 ExecutionReservationCost
 }
 
+func (t *CompiledPhaseTrace) OperationCount() int {
+	if t == nil {
+		return 0
+	}
+	count := 0
+	for _, phase := range t.Phases {
+		count += len(phase.Operations)
+	}
+	return count
+}
+
 // FrozenCoordinatorEvaluationInput owns every semantic input consumed by the
 // production coordinator evaluator. FreezePhaseTrace rebuilds the DAG and
 // recomputes FinalEvaluation from this immutable evidence instead of maintaining
