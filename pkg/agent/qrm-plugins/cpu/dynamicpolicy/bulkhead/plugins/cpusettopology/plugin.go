@@ -1473,7 +1473,8 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in 
 						}
 					}
 					if pending.NativeQOSClass == "" {
-						pod, podErr := in.MetaServer.GetPod(ctx, podUID)
+						refreshCtx := context.WithValue(ctx, metapod.BypassCacheKey, metapod.BypassCacheTrue)
+						pod, podErr := in.MetaServer.GetPod(refreshCtx, podUID)
 						if podErr == nil && pod != nil {
 							pending.NativeQOSClass = v1qos.GetPodQOS(pod)
 						}

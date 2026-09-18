@@ -28,6 +28,7 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -3368,6 +3369,18 @@ func (s *allocationLookupState) GetAllocationInfo(_, _ string) *cpustate.Allocat
 	return s.info
 }
 
+type bypassAwarePodFetcher struct {
+	metapod.PodFetcherStub
+	pod *v1.Pod
+}
+
+func (f *bypassAwarePodFetcher) GetPod(ctx context.Context, _ string) (*v1.Pod, error) {
+	if ctx.Value(metapod.BypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, metapod.NewPodNotFoundError(string(f.pod.UID))
+	}
+	return f.pod.DeepCopy(), nil
+}
+
 type bypassAwareContainerIDFetcher struct {
 	metapod.PodFetcherStub
 	cachedID   string
@@ -3922,6 +3935,56 @@ func TestCPUSetTopologyPluginSkipsExpectedCPUSetForMissingContainer(t *testing.T
 	}
 	if len(res.ExpectedByRel) != 0 {
 		t.Fatalf("expected no resolved leaves, got %#v", res.ExpectedByRel)
+	}
+	if len(res.PendingByPod) != 1 {
+		t.Fatalf("expected one protected-pending entry, got %#v", res.PendingByPod)
+	}
+	if got := res.PendingByPod[0].NativeQOSClass; got != v1.PodQOSGuaranteed {
+		t.Fatalf("pending native qos class = %q, want %q", got, v1.PodQOSGuaranteed)
+	}
+}
+
+func TestCPUSetTopologyPluginRefreshesPodForPendingNativeQOSClass(t *testing.T) {
+	t.Parallel()
+
+	podUID := "pod-1"
+	p := &CPUSetTopologyPlugin{}
+	allocationInfo := &cpustate.AllocationInfo{}
+	metaServer := &metaserver.MetaServer{
+		MetaAgent: &agent.MetaAgent{
+			PodFetcher: &bypassAwarePodFetcher{pod: &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+				Spec: v1.PodSpec{Containers: []v1.Container{{
+					Name: "main",
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    resource.MustParse("1"),
+							v1.ResourceMemory: resource.MustParse("1Gi"),
+						},
+						Limits: v1.ResourceList{
+							v1.ResourceCPU:    resource.MustParse("1"),
+							v1.ResourceMemory: resource.MustParse("1Gi"),
+						},
+					},
+				}}},
+			}},
+		},
+	}
+	view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+			podUID: {"main": machine.NewCPUSet(0, 1)},
+		},
+	}}
+
+	res, err := p.buildExpectedCPUSetByRel(context.Background(), bulkheadapi.HandlerContext{
+		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+			MetaServer: metaServer,
+			State:      &allocationLookupState{info: allocationInfo},
+		},
+		DesiredView: view,
+	})
+	if err != nil {
+		t.Fatalf("missing container must remain admit-safe pending, got %v", err)
 	}
 	if len(res.PendingByPod) != 1 {
 		t.Fatalf("expected one protected-pending entry, got %#v", res.PendingByPod)
