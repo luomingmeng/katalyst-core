@@ -82,6 +82,89 @@ type frozenOperationPreflight struct {
 	children       stableLiveChildren
 }
 
+// frozenInitialSnapshotDriftError carries the fresh snapshot that invalidated a
+// frozen trace before any live hierarchy write. ParentSafe admission may safely
+// recompile from this snapshot while the same invocation budget and deadline
+// remain in force.
+type frozenInitialSnapshotDriftError struct {
+	current  *CompleteSnapshot
+	expected *CompleteSnapshot
+	stale    *PlanStaleError
+}
+
+func (e *frozenInitialSnapshotDriftError) Error() string {
+	if e == nil || e.current == nil || e.expected == nil {
+		return "frozen trace initial snapshot drift"
+	}
+	return fmt.Sprintf("frozen trace initial snapshot drift: current=%x expected=%x",
+		e.current.ID, e.expected.ID)
+}
+
+func (e *frozenInitialSnapshotDriftError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.stale
+}
+
+func (e *frozenInitialSnapshotDriftError) ReplanRequired() bool { return true }
+
+func (e *frozenInitialSnapshotDriftError) FrozenInitialSnapshotDrift() bool { return true }
+
+// frozenFinalSnapshotDriftError records external hierarchy drift discovered only
+// after the frozen write sequence. It is not safe to replan until failFrozenTrace
+// has completed and verified rollback of the full physical-write prefix.
+type frozenFinalSnapshotDriftError struct {
+	current  *CompleteSnapshot
+	expected *CompleteSnapshot
+	stale    *PlanStaleError
+}
+
+func (e *frozenFinalSnapshotDriftError) Error() string {
+	if e == nil || e.current == nil || e.expected == nil {
+		return "frozen trace final snapshot drift"
+	}
+	return fmt.Sprintf("frozen trace final snapshot drift: current=%x expected=%x",
+		e.current.ID, e.expected.ID)
+}
+
+func (e *frozenFinalSnapshotDriftError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.stale
+}
+
+func (e *frozenFinalSnapshotDriftError) ReplanRequired() bool { return true }
+
+func (e *frozenFinalSnapshotDriftError) FrozenFinalSnapshotDrift() bool { return true }
+
+// frozenSnapshotDriftAfterVerifiedRollbackError is issued only after every
+// physical write made by the failed frozen trace has been rolled back and read
+// back at its original configured and effective value. This marker is the sole
+// authorization for the admission boundary to compile and execute a fresh plan.
+type frozenSnapshotDriftAfterVerifiedRollbackError struct {
+	err error
+}
+
+func (e *frozenSnapshotDriftAfterVerifiedRollbackError) Error() string {
+	if e == nil || e.err == nil {
+		return "frozen snapshot drift after verified rollback"
+	}
+	return e.err.Error()
+}
+
+func (e *frozenSnapshotDriftAfterVerifiedRollbackError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func (*frozenSnapshotDriftAfterVerifiedRollbackError) FrozenSnapshotDriftReplanSafe() bool {
+	return true
+}
+
 // preflightFrozenTrace proves that a frozen trace is executable from one fresh
 // complete snapshot. Every operation is validated and applied to an isolated
 // projected hierarchy in global trace order; no live hierarchy write occurs.
@@ -132,10 +215,18 @@ func (w safeCPSetWriter) preflightFrozenTraceOperations(
 		return nil, fmt.Errorf("capture frozen trace preflight snapshot: %w", err)
 	}
 	if fresh.ID != frozen.InitialSnapshot.ID {
-		return nil, fmt.Errorf(
-			"frozen trace initial snapshot drift: current=%x expected=%x",
-			fresh.ID, frozen.InitialSnapshot.ID,
-		)
+		return nil, &frozenInitialSnapshotDriftError{
+			current:  fresh,
+			expected: frozen.InitialSnapshot,
+			stale: &PlanStaleError{
+				Rel:       "controlled",
+				Direction: WritePublish,
+				Resource:  "initial_snapshot",
+				Current:   snapshotLogicalState(fresh),
+				Target:    snapshotLogicalState(frozen.InitialSnapshot),
+				Err:       fmt.Errorf("fresh preflight snapshot differs from frozen trace base"),
+			},
+		}
 	}
 
 	projection, err := newProjectedHierarchy(fresh, frozen.Capabilities)
@@ -362,10 +453,18 @@ func (r *coordinatorRound) proveFrozenTraceFinalState(
 		r.budget,
 	)
 	if err == nil && fresh.ID != frozen.FinalSnapshot.ID {
-		err = fmt.Errorf(
-			"frozen trace final snapshot drift: current=%x expected=%x",
-			fresh.ID, frozen.FinalSnapshot.ID,
-		)
+		err = &frozenFinalSnapshotDriftError{
+			current:  fresh,
+			expected: frozen.FinalSnapshot,
+			stale: &PlanStaleError{
+				Rel:       "controlled",
+				Direction: WritePublish,
+				Resource:  "final_snapshot",
+				Current:   snapshotLogicalState(fresh),
+				Target:    snapshotLogicalState(frozen.FinalSnapshot),
+				Err:       fmt.Errorf("fresh final snapshot differs from frozen trace target"),
+			},
+		}
 	}
 	var freshEvaluation coordinatorSnapshotEvaluation
 	if err == nil {
@@ -695,6 +794,10 @@ func (w safeCPSetWriter) failFrozenTrace(
 	if rollbackErr == nil {
 		res.Journal = res.Journal[:journalStart]
 		res.Applied = appliedStart
+		var finalDrift interface{ FrozenFinalSnapshotDrift() bool }
+		if errors.As(executionErr, &finalDrift) && finalDrift.FrozenFinalSnapshotDrift() {
+			return &frozenSnapshotDriftAfterVerifiedRollbackError{err: executionErr}
+		}
 		return executionErr
 	}
 	w.rebuildPhysicalImpactEvidence(stack, res, journalStart, appliedStart)

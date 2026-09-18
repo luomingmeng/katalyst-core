@@ -40,8 +40,71 @@ func TestTracePreflightRejectsInitialSnapshotDriftWithoutWrites(t *testing.T) {
 	err := newTracePreflightWriter(driver).preflightFrozenTrace(context.Background(), trace)
 
 	require.Error(t, err)
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	var drift *frozenInitialSnapshotDriftError
+	require.ErrorAs(t, err, &drift)
+	require.NotNil(t, drift.current)
+	require.NotNil(t, drift.expected)
 	require.Zero(t, driver.PhysicalWriteCount())
 	require.Equal(t, initialState, driver.snapshot())
+}
+
+func TestFinalSnapshotDriftBecomesReplanSafeOnlyAfterVerifiedRollback(t *testing.T) {
+	t.Parallel()
+
+	drift := &frozenFinalSnapshotDriftError{
+		stale: &PlanStaleError{
+			Rel: "controlled", Direction: WritePublish, Resource: "final_snapshot",
+			Err: fmt.Errorf("test final snapshot drift"),
+		},
+	}
+	var safe interface{ FrozenSnapshotDriftReplanSafe() bool }
+	require.False(t, errors.As(drift, &safe),
+		"a final drift is not retryable before the physical rollback is verified")
+
+	writer := safeCPSetWriter{}
+	res := &ConvergenceResult{Applied: 3, Journal: []AppliedPlanOperation{{PlanID: "seed"}}}
+	err := writer.failFrozenTrace(
+		context.Background(), drift, &traceMutationStack{}, nil, res, 1, 3)
+
+	require.ErrorAs(t, err, &safe)
+	require.True(t, safe.FrozenSnapshotDriftReplanSafe())
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	require.Equal(t, 3, res.Applied)
+	require.Len(t, res.Journal, 1)
+}
+
+func TestFinalSnapshotDriftWithUnverifiedRollbackIsNotReplanSafe(t *testing.T) {
+	t.Parallel()
+
+	trace, live := compiledTraceWithCPUAndMemoryWrites(t)
+	operation := flattenTraceOperations(trace)[0]
+	initial := trace.InitialSnapshot.Entries[operation.Rel]
+	badIdentity := initial.Identity
+	badIdentity.Inode++
+	stack := &traceMutationStack{writes: []AppliedPhysicalWrite{{
+		PlanID: "final-drift", Rel: operation.Rel, Identity: badIdentity,
+		Direction: operation.Direction, Resource: HierarchyOperationWriteCPUs,
+		Before: initial.ConfiguredCPUs.String(), BeforeEffective: initial.CPUs.String(),
+		After: operation.Target.CPUs.String(), AfterEffective: operation.Target.CPUs.String(),
+		Impact: PhysicalImpactConfirmed,
+	}}}
+	drift := &frozenFinalSnapshotDriftError{stale: &PlanStaleError{
+		Rel: "controlled", Direction: WritePublish, Resource: "final_snapshot",
+		Err: fmt.Errorf("test final snapshot drift"),
+	}}
+	writer := safeCPSetWriter{driver: live}
+	res := &ConvergenceResult{}
+
+	err := writer.failFrozenTrace(context.Background(), drift, stack, nil, res, 0, 0)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "rollback failed")
+	var safe interface{ FrozenSnapshotDriftReplanSafe() bool }
+	require.False(t, errors.As(err, &safe),
+		"unverified rollback must never authorize an admission replan")
+	require.NotEmpty(t, res.Journal,
+		"unverified rollback must retain physical-impact evidence")
 }
 
 func TestTracePreflightRejectsIdentityDriftWithoutWrites(t *testing.T) {

@@ -188,6 +188,129 @@ func TestCPUSetAdjustmentHandlerTimeoutDerivesFromConfiguredTopologyDeadline(t *
 	}
 }
 
+type frozenInitialSnapshotDriftTestError struct{}
+
+func (*frozenInitialSnapshotDriftTestError) Error() string {
+	return "frozen trace initial snapshot drift"
+}
+
+func (*frozenInitialSnapshotDriftTestError) FrozenInitialSnapshotDrift() bool { return true }
+
+func TestAdmissionRetriesFrozenInitialSnapshotDriftInPlace(t *testing.T) {
+	t.Parallel()
+
+	firstCalls := 0
+	secondCalls := 0
+	p := &DynamicPolicy{
+		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+			"a-stale-once": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+				firstCalls++
+				if firstCalls == 1 {
+					return &frozenInitialSnapshotDriftTestError{}
+				}
+				return nil
+			},
+			"b-success": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+				secondCalls++
+				return nil
+			},
+		},
+	}
+
+	p.Lock()
+	err := p.runCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentModeAdmission)
+	p.Unlock()
+
+	require.NoError(t, err)
+	require.Equal(t, 2, firstCalls)
+	require.Equal(t, 1, secondCalls)
+}
+
+func TestAdmissionFrozenInitialSnapshotDriftRetryIsBounded(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	p := &DynamicPolicy{
+		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+			"always-stale": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+				calls++
+				return &frozenInitialSnapshotDriftTestError{}
+			},
+		},
+	}
+
+	p.Lock()
+	err := p.runCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentModeAdmission)
+	p.Unlock()
+
+	require.Error(t, err)
+	require.Equal(t, cpuSetAdjustmentAdmissionReplans, calls)
+	require.ErrorContains(t, err, "frozen trace initial snapshot drift")
+}
+
+type frozenSnapshotDriftAfterVerifiedRollbackTestError struct{}
+
+func (*frozenSnapshotDriftAfterVerifiedRollbackTestError) Error() string {
+	return "frozen trace final snapshot drift after verified rollback"
+}
+
+func (*frozenSnapshotDriftAfterVerifiedRollbackTestError) FrozenSnapshotDriftReplanSafe() bool {
+	return true
+}
+
+type frozenFinalSnapshotDriftUnverifiedTestError struct{}
+
+func (*frozenFinalSnapshotDriftUnverifiedTestError) Error() string {
+	return "frozen trace final snapshot drift"
+}
+
+func (*frozenFinalSnapshotDriftUnverifiedTestError) FrozenFinalSnapshotDrift() bool { return true }
+
+func TestAdmissionRetriesFinalSnapshotDriftAfterVerifiedRollback(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	p := &DynamicPolicy{
+		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+			"final-drift-once": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+				calls++
+				if calls == 1 {
+					return &frozenSnapshotDriftAfterVerifiedRollbackTestError{}
+				}
+				return nil
+			},
+		},
+	}
+
+	p.Lock()
+	err := p.runCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentModeAdmission)
+	p.Unlock()
+
+	require.NoError(t, err)
+	require.Equal(t, 2, calls)
+}
+
+func TestAdmissionDoesNotRetryUnverifiedFinalSnapshotDrift(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	p := &DynamicPolicy{
+		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+			"unsafe-final-drift": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+				calls++
+				return &frozenFinalSnapshotDriftUnverifiedTestError{}
+			},
+		},
+	}
+
+	p.Lock()
+	err := p.runCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentModeAdmission)
+	p.Unlock()
+
+	require.Error(t, err)
+	require.Equal(t, 1, calls)
+}
+
 func TestRunCPUSetAdjustmentHandlersPropagatesMode(t *testing.T) {
 	t.Parallel()
 
