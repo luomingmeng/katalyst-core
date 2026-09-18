@@ -94,6 +94,7 @@ type CompiledPhaseTrace struct {
 	RequiredCPUSetByRel  map[string]machine.CPUSet
 	Capabilities         HierarchyCapabilities
 	EvaluationInput      FrozenCoordinatorEvaluationInput
+	FrozenBoundary       FrozenBoundary
 	Phases               []CompiledPhase
 	FinalSnapshot        *CompleteSnapshot
 	FinalEvaluation      coordinatorSnapshotEvaluation
@@ -323,6 +324,11 @@ func (r *coordinatorRound) compileFixedPointTrace(
 	if err != nil {
 		return nil, err
 	}
+	evaluationInput := freezeCoordinatorEvaluationInput(projectedRound, capabilities)
+	frozenBoundary, err := compileFrozenBoundaryV1(base, evaluationInput, result.Phases)
+	if err != nil {
+		return nil, fmt.Errorf("compile frozen boundary: %w", err)
+	}
 	trace := &CompiledPhaseTrace{
 		ConvergenceID:        result.ConvergenceID,
 		Objective:            projectedRound.objective.orFullDefault(),
@@ -330,7 +336,8 @@ func (r *coordinatorRound) compileFixedPointTrace(
 		CanonicalTargetByRel: cloneCPUSetTargetMap(result.CanonicalTargetByRel),
 		RequiredCPUSetByRel:  cloneCPUSetMap(projectedRound.requiredByRel),
 		Capabilities:         capabilities,
-		EvaluationInput:      freezeCoordinatorEvaluationInput(projectedRound, capabilities),
+		EvaluationInput:      evaluationInput,
+		FrozenBoundary:       frozenBoundary,
 		Phases:               cloneCompiledPhases(result.Phases),
 		FinalSnapshot:        CloneCompleteSnapshot(result.FinalSnapshot),
 		FinalEvaluation:      cloneCoordinatorSnapshotEvaluation(result.FinalEvaluation),
@@ -894,6 +901,7 @@ func FreezePhaseTrace(in *CompiledPhaseTrace) (*CompiledPhaseTrace, error) {
 	out.CanonicalTargetByRel = cloneCPUSetTargetMap(in.CanonicalTargetByRel)
 	out.RequiredCPUSetByRel = cloneCPUSetMap(in.RequiredCPUSetByRel)
 	out.EvaluationInput = cloneFrozenCoordinatorEvaluationInput(in.EvaluationInput)
+	out.FrozenBoundary = cloneFrozenBoundary(in.FrozenBoundary)
 	out.Phases = cloneCompiledPhases(in.Phases)
 	out.FinalSnapshot = CloneCompleteSnapshot(in.FinalSnapshot)
 	out.FinalEvaluation = cloneCoordinatorSnapshotEvaluation(in.FinalEvaluation)
@@ -937,6 +945,17 @@ func validateFrozenPhaseTrace(trace *CompiledPhaseTrace) error {
 	}
 	if len(trace.EvaluationInput.DAGSpecs) == 0 {
 		return fmt.Errorf("frozen phase trace requires evaluation DAG semantics")
+	}
+	if err := validateFrozenBoundary(trace.FrozenBoundary, trace.InitialSnapshot); err != nil {
+		return fmt.Errorf("frozen phase trace has invalid frozen boundary: %w", err)
+	}
+	expectedBoundary, err := compileFrozenBoundaryV1(
+		trace.InitialSnapshot, trace.EvaluationInput, trace.Phases)
+	if err != nil {
+		return fmt.Errorf("derive frozen phase trace boundary: %w", err)
+	}
+	if !frozenBoundariesEqual(trace.FrozenBoundary, expectedBoundary) {
+		return fmt.Errorf("frozen phase trace boundary is not compiler-derived")
 	}
 	if !reflect.DeepEqual(trace.RequiredCPUSetByRel, trace.EvaluationInput.RequiredByRel) {
 		return fmt.Errorf("frozen phase trace required CPUs inputs disagree")
@@ -1205,6 +1224,7 @@ func canonicalPhaseTraceID(trace *CompiledPhaseTrace) string {
 	writeCPUSetTargetMapHash(hash, trace.CanonicalTargetByRel)
 	writeCPUSetMapHash(hash, trace.RequiredCPUSetByRel)
 	writeFrozenCoordinatorEvaluationInputHash(hash, trace.EvaluationInput)
+	writeFrozenBoundaryHash(hash, trace.FrozenBoundary)
 	writeHashUint64(hash, uint64(len(trace.Phases)))
 	for _, phase := range trace.Phases {
 		writeHashString(hash, string(phase.Kind))

@@ -18,6 +18,7 @@ package topology
 
 import (
 	"fmt"
+	"reflect"
 	"sort"
 
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
@@ -170,4 +171,46 @@ func equalChildRefs(left, right []ChildRef) bool {
 		}
 	}
 	return true
+}
+
+func frozenBoundariesEqual(left, right FrozenBoundary) bool {
+	return left.Version == right.Version &&
+		reflect.DeepEqual(left.Roots, right.Roots) &&
+		reflect.DeepEqual(left.ControlledRels, right.ControlledRels) &&
+		reflect.DeepEqual(left.DirectChildrenByRel, right.DirectChildrenByRel) &&
+		reflect.DeepEqual(left.RelevantCPUHolders, right.RelevantCPUHolders) &&
+		left.RelevantCPUs.Equals(right.RelevantCPUs)
+}
+
+func writeFrozenBoundaryHash(
+	hash interface{ Write([]byte) (int, error) },
+	boundary FrozenBoundary,
+) {
+	writeHashString(hash, "frozen-boundary")
+	writeHashUint64(hash, uint64(boundary.Version))
+	writeStringSliceHash(hash, boundary.Roots)
+	writeStringSliceHash(hash, boundary.ControlledRels)
+	writeHashUint64(hash, uint64(len(boundary.ControlledRels)))
+	for _, rel := range boundary.ControlledRels {
+		writeHashString(hash, rel)
+		children := boundary.DirectChildrenByRel[rel]
+		writeHashUint64(hash, uint64(len(children)))
+		for _, child := range children {
+			writeHashString(hash, child.Name)
+			writeHashUint64(hash, child.Identity.Device)
+			writeHashUint64(hash, child.Identity.Inode)
+		}
+	}
+	writeStringSliceHash(hash, boundary.RelevantCPUHolders)
+	writeHashString(hash, boundary.RelevantCPUs.String())
+}
+
+func writeStringSliceHash(
+	hash interface{ Write([]byte) (int, error) },
+	values []string,
+) {
+	writeHashUint64(hash, uint64(len(values)))
+	for _, value := range values {
+		writeHashString(hash, value)
+	}
 }
