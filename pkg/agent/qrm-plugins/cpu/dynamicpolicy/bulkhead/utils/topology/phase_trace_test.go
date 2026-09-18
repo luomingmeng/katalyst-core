@@ -542,6 +542,73 @@ func TestFixedPointEngineFailsClosedWhenAllTransferCPUsRemainProtectedDuringSnap
 	require.Equal(t, 1, fixture.round.round)
 }
 
+func TestProjectedPhaseNoProgress(t *testing.T) {
+	hierarchy := projectedHierarchyFixture(t, v2Capabilities())
+	entry := hierarchy.snapshot.Entries[projectedChildRel]
+	entry.CPUs = machine.NewCPUSet(0)
+	entry.ConfiguredCPUs = machine.NewCPUSet(0)
+	hierarchy.snapshot.Entries[projectedChildRel] = entry
+	require.NoError(t, hierarchy.settleEvidence())
+	session, err := newProjectedPhaseSession(hierarchy.snapshot, hierarchy.capabilities)
+	require.NoError(t, err)
+	require.NoError(t, session.hierarchy.settleEvidence())
+	settledID := session.hierarchy.snapshot.ID
+	entry = session.hierarchy.snapshot.Entries[projectedChildRel]
+	plan := PhasePlan{
+		Kind: PhaseDrain,
+		Operations: []PlanOperation{{
+			Rel: projectedChildRel, ExpectedIdentity: entry.Identity,
+			ExpectedChildren: ChildrenFingerprint(session.hierarchy.snapshot.Children[projectedChildRel]),
+			ExpectedCurrent:  CPUSetTarget{CPUs: entry.CPUs.Clone(), Mems: entry.Mems},
+			Target:           CPUSetTarget{CPUs: entry.CPUs.Clone(), Mems: entry.Mems},
+			Direction:        WriteShrink,
+		}},
+	}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	plan.Operations[0].PlanID = plan.PlanID
+
+	_, err = session.Apply(context.Background(), plan)
+
+	require.ErrorIs(t, err, ErrNoProgress)
+	var noProgress *ProjectedPhaseNoProgressError
+	require.ErrorAs(t, err, &noProgress)
+	require.Equal(t, settledID, noProgress.SnapshotID)
+	require.Equal(t, plan.PlanID, noProgress.PlanID)
+}
+
+func TestProjectedPhaseCycle(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	base := fixture.snapshot()
+	session, err := newProjectedPhaseSession(base, fixture.driver.Capabilities())
+	require.NoError(t, err)
+	entry := session.hierarchy.snapshot.Entries["reclaimed/leaf"]
+	plan := PhasePlan{
+		Kind: PhaseDrain,
+		Operations: []PlanOperation{{
+			Rel: "reclaimed/leaf", ExpectedIdentity: entry.Identity,
+			ExpectedChildren:       ChildrenFingerprint(session.hierarchy.snapshot.Children["reclaimed/leaf"]),
+			ParentRel:              "reclaimed",
+			ExpectedParentIdentity: session.hierarchy.snapshot.Entries["reclaimed"].Identity,
+			ExpectedCurrent:        CPUSetTarget{CPUs: entry.CPUs.Clone(), Mems: entry.Mems},
+			Target:                 CPUSetTarget{CPUs: machine.NewCPUSet(), Mems: entry.Mems},
+			Direction:              WriteShrink,
+		}},
+	}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	plan.Operations[0].PlanID = plan.PlanID
+	session.progress[phaseProgressKey{SnapshotID: base.ID, PlanID: plan.PlanID}] = struct{}{}
+
+	_, err = session.Apply(context.Background(), plan)
+
+	require.ErrorIs(t, err, ErrNoProgress)
+	var cycle *ProjectedPhaseCycleError
+	require.ErrorAs(t, err, &cycle)
+	require.Equal(t, base.ID, cycle.SnapshotID)
+	require.Equal(t, plan.PlanID, cycle.PlanID)
+	require.Equal(t, 1, fixture.round.round+1)
+}
+
 func TestProtectedTransferStallRequiresZeroWriteFullyProtectedEmptyBatch(t *testing.T) {
 	fixture := newAdmissionTraceFixture(t)
 	fixture.configureAllProtectedSwap()

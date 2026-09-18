@@ -45,6 +45,36 @@ func (e *ProtectedTransferStallError) Error() string {
 
 func (e *ProtectedTransferStallError) Unwrap() error { return ErrNoProgress }
 
+type phaseProgressKey struct {
+	SnapshotID SnapshotID
+	PlanID     string
+}
+
+type ProjectedPhaseCycleError struct {
+	SnapshotID SnapshotID
+	PlanID     string
+}
+
+func (e *ProjectedPhaseCycleError) Error() string {
+	return fmt.Sprintf("%v: projected phase cycle snapshot=%x plan=%s",
+		ErrNoProgress, e.SnapshotID, e.PlanID)
+}
+
+func (e *ProjectedPhaseCycleError) Unwrap() error { return ErrNoProgress }
+
+type ProjectedPhaseNoProgressError struct {
+	SnapshotID SnapshotID
+	PlanID     string
+	Operations int
+}
+
+func (e *ProjectedPhaseNoProgressError) Error() string {
+	return fmt.Sprintf("%v: projected frontier had no effect snapshot=%x plan=%s operations=%d",
+		ErrNoProgress, e.SnapshotID, e.PlanID, e.Operations)
+}
+
+func (e *ProjectedPhaseNoProgressError) Unwrap() error { return ErrNoProgress }
+
 // CompiledPhase is one ordered, frozen phase of a fixed-point trace. Operations
 // are already sequenced; execution replays them verbatim without re-planning.
 type CompiledPhase struct {
@@ -145,6 +175,7 @@ type phaseExecutionSession interface {
 
 type projectedPhaseSession struct {
 	hierarchy *projectedHierarchy
+	progress  map[phaseProgressKey]struct{}
 }
 
 type livePhaseSession struct {
@@ -189,7 +220,10 @@ func newProjectedPhaseSession(
 	if err != nil {
 		return nil, err
 	}
-	return &projectedPhaseSession{hierarchy: hierarchy}, nil
+	return &projectedPhaseSession{
+		hierarchy: hierarchy,
+		progress:  make(map[phaseProgressKey]struct{}),
+	}, nil
 }
 
 func (s *projectedPhaseSession) Snapshot(_ context.Context) (*CompleteSnapshot, error) {
@@ -200,9 +234,28 @@ func (s *projectedPhaseSession) Apply(ctx context.Context, plan PhasePlan) (phas
 	if err := ctx.Err(); err != nil {
 		return phaseSessionApplyResult{}, err
 	}
+	if len(plan.Operations) == 0 {
+		return phaseSessionApplyResult{}, nil
+	}
+	key := phaseProgressKey{SnapshotID: s.hierarchy.snapshot.ID, PlanID: plan.PlanID}
+	if _, repeated := s.progress[key]; repeated {
+		return phaseSessionApplyResult{}, &ProjectedPhaseCycleError{
+			SnapshotID: key.SnapshotID,
+			PlanID:     key.PlanID,
+		}
+	}
+	s.progress[key] = struct{}{}
+	candidate, err := newProjectedHierarchy(s.hierarchy.snapshot, s.hierarchy.capabilities)
+	if err != nil {
+		return phaseSessionApplyResult{}, err
+	}
+	candidate.evidenceRebuilds = s.hierarchy.evidenceRebuilds
+	if err := validateProjectedFrontierIndependence(candidate, plan.Operations); err != nil {
+		return phaseSessionApplyResult{}, err
+	}
 	result := phaseSessionApplyResult{}
 	for _, operation := range plan.Operations {
-		if err := s.hierarchy.applyOperation(operation); err != nil {
+		if err := candidate.applyConfiguredOperation(operation); err != nil {
 			return result, err
 		}
 		result.Applied++
@@ -211,6 +264,21 @@ func (s *projectedPhaseSession) Apply(ctx context.Context, plan PhasePlan) (phas
 			Target: operation.Target, Observed: operation.Target,
 		})
 	}
+	if result.Applied != len(plan.Operations) {
+		return result, fmt.Errorf("projected frontier applied=%d operations=%d",
+			result.Applied, len(plan.Operations))
+	}
+	if err := candidate.settleEvidence(); err != nil {
+		return result, err
+	}
+	if candidate.snapshot.ID == key.SnapshotID {
+		return phaseSessionApplyResult{}, &ProjectedPhaseNoProgressError{
+			SnapshotID: key.SnapshotID,
+			PlanID:     key.PlanID,
+			Operations: len(plan.Operations),
+		}
+	}
+	*s.hierarchy = *candidate
 	return result, nil
 }
 
@@ -407,8 +475,12 @@ func (r *coordinatorRound) runFixedPointEngine(
 		if err != nil {
 			return errorResult(fresh, journal, err), err
 		}
-		if len(expand.Operations) > 0 {
-			applyResult, err := session.Apply(ctx, expand)
+		for len(expand.Operations) > 0 {
+			frontier, frontierErr := drainFrontier(expand)
+			if frontierErr != nil {
+				return errorResult(fresh, journal, frontierErr), frontierErr
+			}
+			applyResult, err := session.Apply(ctx, frontier)
 			journal = append(journal, applyResult.Journal...)
 			if err != nil {
 				recovered, snapshotErr := session.Snapshot(ctx)
@@ -419,8 +491,9 @@ func (r *coordinatorRound) runFixedPointEngine(
 			}
 			phases = append(phases, CompiledPhase{
 				Kind:       PhaseExpand,
-				Operations: append([]PlanOperation(nil), expand.Operations...),
+				Operations: append([]PlanOperation(nil), frontier.Operations...),
 			})
+			expand.Operations = expand.Operations[len(frontier.Operations):]
 		}
 
 		final, err := session.Snapshot(ctx)
@@ -1061,6 +1134,10 @@ func validateTraceOperations(trace *CompiledPhaseTrace) error {
 	if err != nil {
 		return err
 	}
+	session := &projectedPhaseSession{
+		hierarchy: projection,
+		progress:  make(map[phaseProgressKey]struct{}),
+	}
 	for phaseIndex, phase := range trace.Phases {
 		if phase.Kind != PhaseDrain && phase.Kind != PhaseExpand {
 			return fmt.Errorf("frozen phase trace has invalid phase %q at index %d", phase.Kind, phaseIndex)
@@ -1076,15 +1153,6 @@ func validateTraceOperations(trace *CompiledPhaseTrace) error {
 				return fmt.Errorf("frozen phase trace operation %d/%d identity mismatch for rel %q",
 					phaseIndex, operationIndex, operation.Rel)
 			}
-			current := CPUSetTarget{
-				CPUs: observedCPUsForTargetProof(entry, operation.Target.CPUs, trace.Capabilities),
-				Mems: entry.Mems,
-			}
-			if !current.CPUs.Equals(operation.ExpectedCurrent.CPUs) ||
-				current.Mems != operation.ExpectedCurrent.Mems {
-				return fmt.Errorf("frozen phase trace operation %d/%d expected current mismatch for rel %q",
-					phaseIndex, operationIndex, operation.Rel)
-			}
 			if operation.ParentRel != "" {
 				parent, ok := projection.snapshot.Entries[operation.ParentRel]
 				if !ok || operation.ExpectedParentIdentity == (CgroupIdentity{}) ||
@@ -1097,23 +1165,17 @@ func validateTraceOperations(trace *CompiledPhaseTrace) error {
 				return fmt.Errorf("frozen phase trace operation %d/%d child fingerprint mismatch for rel %q",
 					phaseIndex, operationIndex, operation.Rel)
 			}
-			childUnion := machine.NewCPUSet()
-			for _, child := range projection.snapshot.Children[operation.Rel] {
-				childRel := child.Name
-				if operation.Rel != "" {
-					childRel = operation.Rel + "/" + child.Name
-				}
-				if childEntry, ok := projection.snapshot.Entries[childRel]; ok {
-					childUnion = childUnion.Union(childEntry.CPUs)
-				}
-			}
-			if !childUnion.Equals(operation.ExpectedChildUnion) {
-				return fmt.Errorf("frozen phase trace operation %d/%d child union mismatch for rel %q",
-					phaseIndex, operationIndex, operation.Rel)
-			}
-			if err := projection.applyOperation(operation); err != nil {
-				return fmt.Errorf("validate frozen phase trace operation %d/%d: %w", phaseIndex, operationIndex, err)
-			}
+		}
+		planID := ""
+		if len(phase.Operations) > 0 {
+			planID = phase.Operations[0].PlanID
+		}
+		_, err := session.Apply(context.Background(), PhasePlan{
+			PlanID: planID, Kind: phase.Kind,
+			Operations: append([]PlanOperation(nil), phase.Operations...),
+		})
+		if err != nil {
+			return fmt.Errorf("validate frozen phase trace operation frontier=%d: %w", phaseIndex, err)
 		}
 	}
 	if projection.snapshot.ID != trace.FinalSnapshot.ID {
