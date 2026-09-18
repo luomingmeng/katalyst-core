@@ -662,6 +662,106 @@ func TestPendingProtectedCPUSetByRelClearsPodNoLongerPending(t *testing.T) {
 	}
 }
 
+func TestPendingProtectionScopesRetainExpectedPathsForAllQoS(t *testing.T) {
+	now := time.Date(2026, time.September, 18, 8, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		podUID string
+		podRel string
+		cpus   machine.CPUSet
+	}{
+		{
+			name:   "ordinary shared",
+			podUID: "pod-shared",
+			podRel: "kubepods/burstable/pod-shared",
+			cpus:   machine.NewCPUSet(0, 1, 2, 3),
+		},
+		{
+			name:   "snb",
+			podUID: "pod-snb",
+			podRel: "kubepods/burstable/pod-snb",
+			cpus:   machine.NewCPUSet(4, 5),
+		},
+		{
+			name:   "dnb",
+			podUID: "pod-dnb",
+			podRel: "kubepods/pod-dnb",
+			cpus:   machine.NewCPUSet(6, 7),
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			p := &CPUSetTopologyPlugin{
+				cgroup: &fakeCgroupClient{},
+				now:    func() time.Time { return now },
+				pendingProtections: map[string]pendingPodProtection{
+					tt.podUID: {
+						rel:          tt.podRel,
+						protectUntil: now.Add(defaultPendingPodProtectionTTL),
+					},
+				},
+			}
+
+			got, err := p.pendingProtectionScopes(context.Background(), []pendingContainerCPUSet{{
+				PodUID: tt.podUID, ContainerName: "main", CPUs: tt.cpus,
+			}})
+
+			if err != nil {
+				t.Fatalf("pendingProtectionScopes() error = %v", err)
+			}
+			want := []topology.PendingProtection{{
+				ScopeRel: tt.podRel,
+				CPUs:     tt.cpus,
+				PodUID:   tt.podUID,
+				Source:   topology.PendingProtectionSourceExpectedPod,
+			}}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("pending protections = %#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+func TestPendingProtectionScopesUseExistingPodEvidence(t *testing.T) {
+	now := time.Date(2026, time.September, 18, 8, 0, 0, 0, time.UTC)
+	const (
+		podUID = "pod-existing"
+		podRel = "kubepods/burstable/pod-existing"
+	)
+	p := &CPUSetTopologyPlugin{
+		cgroup: &fakeCgroupClient{cpus: map[string]machine.CPUSet{
+			podRel: machine.NewCPUSet(0, 1, 2, 3),
+		}},
+		now: func() time.Time { return now },
+		pendingProtections: map[string]pendingPodProtection{
+			podUID: {
+				rel:          podRel,
+				protectUntil: now.Add(defaultPendingPodProtectionTTL),
+			},
+		},
+	}
+
+	got, err := p.pendingProtectionScopes(context.Background(), []pendingContainerCPUSet{
+		{PodUID: podUID, ContainerName: "main", CPUs: machine.NewCPUSet(0, 1)},
+		{PodUID: podUID, ContainerName: "sidecar", CPUs: machine.NewCPUSet(2, 3)},
+	})
+
+	if err != nil {
+		t.Fatalf("pendingProtectionScopes() error = %v", err)
+	}
+	want := []topology.PendingProtection{{
+		ScopeRel: podRel,
+		CPUs:     machine.NewCPUSet(0, 1, 2, 3),
+		PodUID:   podUID,
+		Source:   topology.PendingProtectionSourceExistingPod,
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("pending protections = %#v, want %#v", got, want)
+	}
+}
+
 func TestDeferredLeafDrainWritesSafeLeafDespiteGlobalMismatch(t *testing.T) {
 	t.Parallel()
 
