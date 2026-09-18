@@ -19,8 +19,10 @@ package topology
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
@@ -36,7 +38,7 @@ type FrozenBoundary struct {
 	Version             FrozenBoundaryVersion
 	Roots               []string
 	ControlledRels      []string
-	DirectChildrenByRel map[string][]ChildRef
+	ShrinkChildrenByRel map[string][]ChildRef
 	RelevantCPUHolders  []string
 	RelevantCPUs        machine.CPUSet
 }
@@ -58,6 +60,7 @@ func compileFrozenBoundaryV1(
 		controlled[spec.Rel] = struct{}{}
 	}
 	relevant := input.ProtectedPending.Clone()
+	shrinkRels := make(map[string]struct{})
 	for _, values := range []map[string]machine.CPUSet{
 		input.RequiredByRel,
 		input.PendingRequiredByRel,
@@ -68,6 +71,9 @@ func compileFrozenBoundaryV1(
 	}
 	for _, phase := range phases {
 		for _, operation := range phase.Operations {
+			if operation.Direction == WriteShrink {
+				shrinkRels[operation.Rel] = struct{}{}
+			}
 			transition := operation.ExpectedCurrent.CPUs.Difference(operation.Target.CPUs).
 				Union(operation.Target.CPUs.Difference(operation.ExpectedCurrent.CPUs))
 			relevant = relevant.Union(transition)
@@ -78,14 +84,19 @@ func compileFrozenBoundaryV1(
 		Version:             FrozenBoundaryVersionV1,
 		Roots:               normalizeRels(snapshot.ScanBoundary.Roots),
 		ControlledRels:      sortedStringKeys(controlled),
-		DirectChildrenByRel: make(map[string][]ChildRef, len(controlled)),
+		ShrinkChildrenByRel: make(map[string][]ChildRef, len(shrinkRels)),
 		RelevantCPUs:        relevant,
 	}
 	for _, rel := range boundary.ControlledRels {
 		if _, ok := snapshot.Entries[rel]; !ok {
 			return FrozenBoundary{}, fmt.Errorf("controlled rel %q is absent from initial snapshot", rel)
 		}
-		boundary.DirectChildrenByRel[rel] = cloneSortedChildRefs(snapshot.Children[rel])
+	}
+	for rel := range shrinkRels {
+		if _, ok := snapshot.Entries[rel]; !ok {
+			return FrozenBoundary{}, fmt.Errorf("shrink rel %q is absent from initial snapshot", rel)
+		}
+		boundary.ShrinkChildrenByRel[rel] = cloneSortedChildRefs(snapshot.Children[rel])
 	}
 	for rel, entry := range snapshot.Entries {
 		if _, ok := controlled[rel]; ok {
@@ -116,11 +127,16 @@ func validateFrozenBoundary(boundary FrozenBoundary, snapshot *CompleteSnapshot)
 		if _, ok := snapshot.Entries[rel]; !ok {
 			return fmt.Errorf("frozen boundary controlled rel %q has no snapshot entry", rel)
 		}
+	}
+	for rel, children := range boundary.ShrinkChildrenByRel {
+		if _, ok := snapshot.Entries[rel]; !ok {
+			return fmt.Errorf("frozen boundary shrink rel %q has no snapshot entry", rel)
+		}
 		if !equalChildRefs(
-			cloneSortedChildRefs(boundary.DirectChildrenByRel[rel]),
+			cloneSortedChildRefs(children),
 			cloneSortedChildRefs(snapshot.Children[rel]),
 		) {
-			return fmt.Errorf("frozen boundary direct children for %q do not match snapshot", rel)
+			return fmt.Errorf("frozen boundary shrink children for %q do not match snapshot", rel)
 		}
 	}
 	for _, rel := range boundary.RelevantCPUHolders {
@@ -139,9 +155,9 @@ func cloneFrozenBoundary(in FrozenBoundary) FrozenBoundary {
 	out := in
 	out.Roots = append([]string(nil), in.Roots...)
 	out.ControlledRels = append([]string(nil), in.ControlledRels...)
-	out.DirectChildrenByRel = make(map[string][]ChildRef, len(in.DirectChildrenByRel))
-	for rel, children := range in.DirectChildrenByRel {
-		out.DirectChildrenByRel[rel] = append([]ChildRef(nil), children...)
+	out.ShrinkChildrenByRel = make(map[string][]ChildRef, len(in.ShrinkChildrenByRel))
+	for rel, children := range in.ShrinkChildrenByRel {
+		out.ShrinkChildrenByRel[rel] = append([]ChildRef(nil), children...)
 	}
 	out.RelevantCPUHolders = append([]string(nil), in.RelevantCPUHolders...)
 	out.RelevantCPUs = in.RelevantCPUs.Clone()
@@ -188,7 +204,21 @@ func projectFrozenBoundarySnapshot(
 	projected := CloneCompleteSnapshot(expected)
 	for _, rel := range boundary.ControlledRels {
 		projected.Entries[rel] = cloneEntryState(current.Entries[rel])
+	}
+	for rel := range boundary.ShrinkChildrenByRel {
 		projected.Children[rel] = append([]ChildRef(nil), current.Children[rel]...)
+		for _, child := range current.Children[rel] {
+			childRel := filepath.Join(rel, child.Name)
+			if entry, ok := current.Entries[childRel]; ok {
+				projected.Entries[childRel] = cloneEntryState(entry)
+			}
+		}
+	}
+	for _, rel := range boundary.ControlledRels {
+		if _, shrink := boundary.ShrinkChildrenByRel[rel]; shrink {
+			continue
+		}
+		projectGrowChildren(projected, current, rel)
 	}
 	for _, rel := range boundary.RelevantCPUHolders {
 		projected.Entries[rel] = cloneEntryState(current.Entries[rel])
@@ -200,6 +230,34 @@ func projectFrozenBoundarySnapshot(
 	}
 	projected.ID = fingerprintSnapshot(projected)
 	return projected
+}
+
+func projectGrowChildren(projected, current *CompleteSnapshot, rel string) {
+	currentChildren := make(map[ChildRef]struct{}, len(current.Children[rel]))
+	for _, child := range current.Children[rel] {
+		currentChildren[child] = struct{}{}
+	}
+	retained := make([]ChildRef, 0, len(projected.Children[rel]))
+	for _, child := range projected.Children[rel] {
+		if _, ok := currentChildren[child]; ok {
+			retained = append(retained, child)
+			continue
+		}
+		deleteProjectedSubtree(projected, filepath.Join(rel, child.Name))
+	}
+	projected.Children[rel] = retained
+}
+
+func deleteProjectedSubtree(snapshot *CompleteSnapshot, rel string) {
+	prefix := rel + "/"
+	for candidate := range snapshot.Entries {
+		if candidate == rel || strings.HasPrefix(candidate, prefix) {
+			delete(snapshot.Entries, candidate)
+			delete(snapshot.Children, candidate)
+			delete(snapshot.DomainByRel, candidate)
+			delete(snapshot.UnavailableChildren, candidate)
+		}
+	}
 }
 
 func cloneEntryState(entry EntryState) EntryState {
@@ -233,12 +291,32 @@ func evaluateFrozenBoundarySnapshot(
 				rel, frozenEntryStateString(got), frozenEntryStateString(want),
 				fmt.Errorf("controlled relation state changed"))
 		}
+	}
+	for rel, children := range boundary.ShrinkChildrenByRel {
 		gotChildren := cloneSortedChildRefs(current.Children[rel])
-		wantChildren := cloneSortedChildRefs(boundary.DirectChildrenByRel[rel])
+		wantChildren := cloneSortedChildRefs(children)
 		if !equalChildRefs(gotChildren, wantChildren) {
 			return frozenBoundaryStale(
 				rel, fmt.Sprint(gotChildren), fmt.Sprint(wantChildren),
-				fmt.Errorf("controlled relation direct children changed"))
+				fmt.Errorf("shrink relation direct children changed"))
+		}
+		wantCPUs, wantMems, err := frozenDirectChildUnion(expected, rel, wantChildren)
+		if err != nil {
+			return err
+		}
+		gotCPUs, gotMems, err := frozenDirectChildUnion(current, rel, gotChildren)
+		if err != nil {
+			return err
+		}
+		if !gotCPUs.Equals(wantCPUs) {
+			return frozenBoundaryStale(
+				rel, gotCPUs.String(), wantCPUs.String(),
+				fmt.Errorf("shrink direct child CPU union changed"))
+		}
+		if !gotMems.Equals(wantMems) {
+			return frozenBoundaryStale(
+				rel, gotMems.String(), wantMems.String(),
+				fmt.Errorf("shrink direct child mems union changed"))
 		}
 	}
 
@@ -273,6 +351,39 @@ func evaluateFrozenBoundarySnapshot(
 		}
 	}
 	return nil
+}
+
+func frozenDirectChildUnion(
+	snapshot *CompleteSnapshot,
+	parentRel string,
+	children []ChildRef,
+) (machine.CPUSet, machine.CPUSet, error) {
+	cpus := machine.NewCPUSet()
+	mems := machine.NewCPUSet()
+	for _, child := range children {
+		childRel := filepath.Join(parentRel, child.Name)
+		entry, ok := snapshot.Entries[childRel]
+		if !ok {
+			if _, unavailable := snapshot.UnavailableChildren[childRel]; unavailable {
+				continue
+			}
+			return machine.CPUSet{}, machine.CPUSet{}, frozenBoundaryStale(
+				parentRel, childRel, "direct child entry",
+				fmt.Errorf("shrink direct child has no snapshot evidence"))
+		}
+		cpus = cpus.Union(entry.CPUs)
+		if entry.Mems == "" {
+			continue
+		}
+		childMems, err := machine.Parse(entry.Mems)
+		if err != nil {
+			return machine.CPUSet{}, machine.CPUSet{}, fmt.Errorf(
+				"parse shrink direct child %q cpuset.mems=%q: %w",
+				childRel, entry.Mems, err)
+		}
+		mems = mems.Union(childMems)
+	}
+	return cpus, mems, nil
 }
 
 func entryPhysicalStateEqual(left, right EntryState) bool {
@@ -343,7 +454,7 @@ func frozenBoundariesEqual(left, right FrozenBoundary) bool {
 	return left.Version == right.Version &&
 		reflect.DeepEqual(left.Roots, right.Roots) &&
 		reflect.DeepEqual(left.ControlledRels, right.ControlledRels) &&
-		reflect.DeepEqual(left.DirectChildrenByRel, right.DirectChildrenByRel) &&
+		reflect.DeepEqual(left.ShrinkChildrenByRel, right.ShrinkChildrenByRel) &&
 		reflect.DeepEqual(left.RelevantCPUHolders, right.RelevantCPUHolders) &&
 		left.RelevantCPUs.Equals(right.RelevantCPUs)
 }
@@ -356,10 +467,11 @@ func writeFrozenBoundaryHash(
 	writeHashUint64(hash, uint64(boundary.Version))
 	writeStringSliceHash(hash, boundary.Roots)
 	writeStringSliceHash(hash, boundary.ControlledRels)
-	writeHashUint64(hash, uint64(len(boundary.ControlledRels)))
-	for _, rel := range boundary.ControlledRels {
+	shrinkRels := sortedStringKeys(boundary.ShrinkChildrenByRel)
+	writeHashUint64(hash, uint64(len(shrinkRels)))
+	for _, rel := range shrinkRels {
 		writeHashString(hash, rel)
-		children := boundary.DirectChildrenByRel[rel]
+		children := boundary.ShrinkChildrenByRel[rel]
 		writeHashUint64(hash, uint64(len(children)))
 		for _, child := range children {
 			writeHashString(hash, child.Name)

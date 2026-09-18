@@ -37,7 +37,7 @@ func TestCompileFrozenBoundaryV1ClassifiesControlledDirectChildrenAndRelevantHol
 	require.Equal(t, []ChildRef{{
 		Name:     "direct",
 		Identity: CgroupIdentity{Device: 1, Inode: 2},
-	}}, boundary.DirectChildrenByRel["root"])
+	}}, boundary.ShrinkChildrenByRel["root"])
 	require.Equal(t, machine.MustParse("0,2-3"), boundary.RelevantCPUs)
 	require.Equal(t, []string{"root/direct", "root/direct/holder"}, boundary.RelevantCPUHolders)
 }
@@ -68,13 +68,13 @@ func TestCloneFrozenBoundaryIsDeeplyIsolated(t *testing.T) {
 	cloned := cloneFrozenBoundary(boundary)
 	boundary.Roots[0] = "changed"
 	boundary.ControlledRels[0] = "changed"
-	boundary.DirectChildrenByRel["root"][0].Name = "changed"
+	boundary.ShrinkChildrenByRel["root"][0].Name = "changed"
 	boundary.RelevantCPUHolders[0] = "changed"
 	boundary.RelevantCPUs = machine.NewCPUSet(99)
 
 	require.Equal(t, []string{"root"}, cloned.Roots)
 	require.Equal(t, []string{"root"}, cloned.ControlledRels)
-	require.Equal(t, "direct", cloned.DirectChildrenByRel["root"][0].Name)
+	require.Equal(t, "direct", cloned.ShrinkChildrenByRel["root"][0].Name)
 	require.Equal(t, []string{"root/direct", "root/direct/holder"}, cloned.RelevantCPUHolders)
 	require.Equal(t, "0,2-3", cloned.RelevantCPUs.String())
 }
@@ -115,7 +115,7 @@ func TestEvaluateFrozenBoundaryRejectsControlledRelDrift(t *testing.T) {
 	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
 }
 
-func TestEvaluateFrozenBoundaryRejectsDirectChildChurn(t *testing.T) {
+func TestEvaluateFrozenBoundaryRejectsShrinkDirectChildAdditionOutsideTarget(t *testing.T) {
 	snapshot, input, phases := frozenBoundaryFixture()
 	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
 	require.NoError(t, err)
@@ -128,6 +128,44 @@ func TestEvaluateFrozenBoundaryRejectsDirectChildChurn(t *testing.T) {
 
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+}
+
+func TestEvaluateFrozenBoundaryRejectsShrinkDirectChildUnionDrift(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	addFrozenBoundaryDirectChild(
+		snapshot, "ephemeral", CgroupIdentity{Device: 1, Inode: 9}, machine.NewCPUSet(9))
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+	driver.nodes["root/ephemeral"].configuredCPUs = machine.NewCPUSet(10)
+	driver.nodes["root/ephemeral"].cpus = machine.NewCPUSet(10)
+
+	_, err = EvaluateFrozenBoundary(
+		context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+		boundary, snapshot)
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	require.Contains(t, err.Error(), "shrink direct child CPU union changed")
+}
+
+func TestEvaluateFrozenBoundaryAllowsGrowDirectChildRemoval(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	phases[0].Operations[0].Direction = WriteGrow
+	phases[0].Operations[0].ExpectedCurrent.CPUs = machine.MustParse("0-1")
+	phases[0].Operations[0].Target.CPUs = machine.MustParse("0-3")
+	addFrozenBoundaryDirectChild(
+		snapshot, "ephemeral", CgroupIdentity{Device: 1, Inode: 9}, machine.NewCPUSet(9))
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+	delete(driver.nodes, "root/ephemeral")
+
+	_, err = EvaluateFrozenBoundary(
+		context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+		boundary, snapshot)
+
+	require.NoError(t, err)
 }
 
 func TestEvaluateFrozenBoundaryRejectsDirectChildStateDrift(t *testing.T) {
@@ -162,12 +200,15 @@ func TestEvaluateFrozenBoundaryRejectsRelevantCPUHolderDrift(t *testing.T) {
 	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
 }
 
-func TestEvaluateFrozenBoundaryRejectsNewRelevantCPUHolder(t *testing.T) {
+func TestEvaluateFrozenBoundaryRejectsGrowNewRelevantCPUHolder(t *testing.T) {
 	snapshot, input, phases := frozenBoundaryFixture()
+	phases[0].Operations[0].Direction = WriteGrow
+	phases[0].Operations[0].ExpectedCurrent.CPUs = machine.MustParse("0-1")
+	phases[0].Operations[0].Target.CPUs = machine.MustParse("0-3")
 	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
 	require.NoError(t, err)
 	driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
-	driver.add("root/direct/new-holder", CgroupIdentity{Device: 1, Inode: 9}, "0", "0")
+	driver.add("root/new-holder", CgroupIdentity{Device: 1, Inode: 9}, "2", "0")
 
 	_, err = EvaluateFrozenBoundary(
 		context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
@@ -175,6 +216,26 @@ func TestEvaluateFrozenBoundaryRejectsNewRelevantCPUHolder(t *testing.T) {
 
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+}
+
+func addFrozenBoundaryDirectChild(
+	snapshot *CompleteSnapshot,
+	name string,
+	identity CgroupIdentity,
+	cpus machine.CPUSet,
+) {
+	rel := "root/" + name
+	snapshot.Entries[rel] = EntryState{
+		Rel: rel, Identity: identity,
+		CPUs: cpus.Clone(), ConfiguredCPUs: cpus.Clone(),
+		Mems: "0", ConfiguredMems: "0",
+	}
+	snapshot.Children["root"] = append(snapshot.Children["root"], ChildRef{
+		Name: name, Identity: identity,
+	})
+	snapshot.DomainByRel[rel] = DomainPrimary
+	snapshot.ScanBoundary.ExpandedRels = append(snapshot.ScanBoundary.ExpandedRels, rel)
+	snapshot.ID = fingerprintSnapshot(snapshot)
 }
 
 func frozenBoundaryDriver(
@@ -272,6 +333,7 @@ func frozenBoundaryFixture() (*CompleteSnapshot, FrozenCoordinatorEvaluationInpu
 			Rel:             "root",
 			ExpectedCurrent: CPUSetTarget{CPUs: machine.MustParse("0-3"), Mems: "0"},
 			Target:          CPUSetTarget{CPUs: machine.MustParse("0-1"), Mems: "0"},
+			Direction:       WriteShrink,
 		}},
 	}}
 	return snapshot, input, phases

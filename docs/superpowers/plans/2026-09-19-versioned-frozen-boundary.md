@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpower-subagent-driven-development (recommended) or superpower-executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace `ExpandedRels` exact replay with a compiler-owned, versioned `FrozenBoundary` whose shared evaluator ignores unrelated dynamic sibling churn and fails closed on controlled, direct-child, or relevant-CPU-holder drift.
+**Goal:** Replace `ExpandedRels` exact replay with a compiler-owned, versioned `FrozenBoundary` whose shared evaluator ignores unrelated dynamic sibling churn, binds exact direct-child membership/union only for shrink operations, and fails closed on controlled or relevant-CPU-holder drift.
 
-**Architecture:** The trace compiler derives and freezes one semantic boundary from its DAG, evaluation inputs, operations, and initial snapshot. Preflight and finalization both perform a fresh root scan and call the same evaluator against their expected snapshot. `ExpandedRels` remains diagnostic only and is removed from replay, fingerprint, and stale-decision ownership.
+**Architecture:** The trace compiler derives and freezes one semantic boundary from its DAG, evaluation inputs, operations, and initial snapshot. Preflight and finalization both perform a fresh root scan and call the same evaluator against their expected snapshot. Shrink operations retain exact child membership/identity/union proof; grow operations allow direct-child additions and removals while preserving controlled identity, configured/effective predecessor, parent containment, and relevant-CPU ownership checks. `ExpandedRels` remains diagnostic only and is removed from replay, fingerprint, and stale-decision ownership.
 
 **Tech Stack:** Go 1.18.10, Kubernetes CPUSet utilities, existing topology snapshot/compiler/executor and fake hierarchy drivers.
 
@@ -252,6 +252,47 @@ git log --oneline c23cea45a..HEAD
 
 No deployment is performed.
 
+## Task 8: Make Direct-Child Proof Operation-Directional
+
+- [ ] Add RED integration tests:
+
+```go
+func TestTraceGrowDirectChildRemovalSucceeds(t *testing.T)
+func TestTraceShrinkDirectChildAdditionOutsideTargetFailsBeforeUnsafeWrite(t *testing.T)
+func TestTraceGrowNewRelevantCPUHolderFails(t *testing.T)
+```
+
+The grow-removal fixture removes a non-relevant direct child after trace compilation and must
+complete without restoring or depending on that child. The shrink fixture adds a direct child whose
+CPU lies outside the shrink target and asserts zero unsafe forward writes. The grow-holder fixture
+adds a direct child that owns a transition CPU and must fail during frozen-boundary preflight.
+
+- [ ] Run RED before production edits:
+
+```bash
+go test ./pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology \
+  -run 'TestTrace(GrowDirectChildRemovalSucceeds|ShrinkDirectChildAdditionOutsideTargetFailsBeforeUnsafeWrite|GrowNewRelevantCPUHolderFails)' \
+  -count=1
+```
+
+Expected: grow child removal fails under the old direction-agnostic direct-child contract.
+
+- [ ] Replace `DirectChildrenByRel` with shrink-only `ShrinkChildrenByRel`; compile, validate,
+  clone, hash, and evaluate exact child evidence only for relations with shrink operations.
+- [ ] In projected preflight, require `ExpectedChildren` and child union only for shrink operations.
+- [ ] In frozen execution, freeze and revalidate exact child membership/identity/union only for
+  shrink operations. Grow operations continue to verify controlled identity, complete configured
+  and effective predecessor, parent identity/containment, and evaluator-owned relevant CPU holders.
+- [ ] Delete direction-agnostic direct-child tests and wording; retain tests for shrink exactness.
+- [ ] Run focused GREEN, all verification gates, and create one independent commit:
+
+```bash
+git add docs/superpowers/specs/2026-09-19-versioned-frozen-boundary-design.md \
+  docs/superpowers/plans/2026-09-19-versioned-frozen-boundary.md \
+  pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology
+git commit -m "fix(qrm-cpu): make frozen child proof direction-aware"
+```
+
 ## Acceptance Matrix
 
 | Requirement | Evidence |
@@ -260,7 +301,8 @@ No deployment is performed.
 | Compiler is sole owner | derived-boundary equality test and no caller injection path |
 | Shared preflight/final evaluator | parity integration test and one evaluator call path |
 | Unrelated dynamic sibling churn valid | preflight and finalization create/delete/change cases |
-| Direct child changes fail closed | direct-child identity/set matrix |
+| Shrink direct child changes fail closed | shrink direct-child identity/set/union matrix |
+| Grow non-relevant direct child churn valid | grow direct-child removal success |
 | Controlled rel changes fail closed | controlled state matrix |
 | Relevant CPU holder changes fail closed | existing/new holder matrix |
 | ExpandedRels diagnostic only | fingerprint test and retired exact-replay symbols |

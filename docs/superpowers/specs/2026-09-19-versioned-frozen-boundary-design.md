@@ -23,12 +23,13 @@ preflight/finalization 一致性所有者的现状。`ExpandedRels` 只保留为
 最终发布前读取当前层级，并只比较执行相关证据：
 
 1. controlled relation 的身份和 CPU/mems 状态；
-2. controlled relation 的直接子项集合和身份；
+2. 仅 shrink operation 的 direct-child exact membership、identity 和 union；
 3. 持有 relevant CPU 的动态 relation 的身份和 CPU/mems 状态；
 4. 当前新出现的 relevant CPU holder。
 
-无关 dynamic sibling churn 必须有效；direct child、controlled relation 或 relevant CPU
-holder 的创建、删除、身份或资源状态变化必须 fail-closed。
+无关 dynamic sibling churn 必须有效。grow operation 允许 direct child 创建和删除；shrink
+operation 的 direct-child membership、identity 或 union 变化，以及 controlled relation
+或 relevant CPU holder 的身份/资源状态变化，必须 fail-closed。
 
 ## Ownership
 
@@ -59,7 +60,7 @@ type FrozenBoundary struct {
     Version             FrozenBoundaryVersion
     Roots               []string
     ControlledRels      []string
-    DirectChildrenByRel map[string][]ChildRef
+    ShrinkChildrenByRel map[string][]ChildRef
     RelevantCPUHolders  []string
     RelevantCPUs        machine.CPUSet
 }
@@ -69,7 +70,7 @@ V1 语义：
 
 - `Roots` 是 evaluator 每次重新采集的根，来自 compiler 输入快照的 plan roots；
 - `ControlledRels` 来自冻结 DAG，且必须全部存在于 expected snapshot；
-- `DirectChildrenByRel` 是每个 controlled rel 的直接子项身份集合；
+- `ShrinkChildrenByRel` 只包含 shrink operation relation，值是编译时直接子项身份集合；
 - `RelevantCPUs` 是所有 operation 的 expected/target CPU、required CPU、pending/protected
   CPU、动态 expected CPU 和 parent-safety target CPU 的并集；
 - `RelevantCPUHolders` 是 expected snapshot 中非 controlled 且 effective CPU 与
@@ -101,7 +102,8 @@ evaluator 必须：
 1. 校验边界版本和规范形态；
 2. 从 `Roots` 做 fresh、非 exact-replay 的完整扫描；
 3. 比较每个 controlled rel 的存在性、identity、configured/effective CPU 与 mems；
-4. 比较每个 controlled rel 的直接 child name+identity 集合；
+4. 仅对 `ShrinkChildrenByRel` 比较 direct child name+identity exact membership，并重新计算
+   CPU/mems union 供 shrink target containment 证明；
 5. 比较每个冻结 relevant holder 的存在性、identity、configured/effective CPU 与 mems；
 6. 在 fresh snapshot 中重新计算 relevant holders，发现新增 holder 时拒绝；
 7. 返回 fresh snapshot，供调用者继续做 trace 初态投影或最终 ParentSafe 证明。
@@ -115,7 +117,9 @@ preflight 和 finalization 都必须调用此 evaluator。两者只在 expected 
 |---|---|
 | 非 controlled、非 direct child、且不持有 relevant CPU 的 dynamic sibling 创建/删除/状态变化 | 允许 |
 | controlled rel 创建、删除、identity、configured/effective CPU 或 mems 变化 | fail-closed |
-| controlled rel 的直接 child 集合或 child identity 变化 | fail-closed |
+| shrink operation rel 的 direct child 集合、identity 或 union 变化 | fail-closed |
+| grow operation rel 的非 relevant direct child 创建或删除 | 允许 |
+| grow operation rel 新增 direct child 且其持有 relevant CPU | fail-closed |
 | 冻结 relevant CPU holder 创建、删除、identity 或 CPU/mems 状态变化 | fail-closed |
 | 新 dynamic relation 开始持有 relevant CPU | fail-closed |
 | `ExpandedRels` 变化但上述语义证据不变 | 允许 |
@@ -137,7 +141,7 @@ preflight 和 finalization 都必须调用此 evaluator。两者只在 expected 
 
 - 拒绝零值或未知版本；
 - 深拷贝并规范化边界；
-- 验证 controlled rel、direct-child evidence 和 relevant holder 都能由 initial snapshot
+- 验证 controlled rel、shrink direct-child evidence 和 relevant holder 都能由 initial snapshot
   证明；
 - 验证边界等于 compiler 从 frozen inputs 推导出的规范结果，防止第二 owner；
 - 将完整边界写入 `TraceID`。
@@ -145,6 +149,10 @@ preflight 和 finalization 都必须调用此 evaluator。两者只在 expected 
 ## Failure Semantics
 
 - preflight boundary mismatch：首写前返回 `frozenInitialSnapshotDriftError`，零物理写；
+- 每个 operation 的执行证明按方向解释：shrink 在首写前绑定 exact direct-child
+  membership/identity/union；grow 不绑定 direct-child membership，但仍验证 controlled
+  identity、完整 configured/effective predecessor、parent identity/containment，以及 frozen
+  evaluator 的 relevant CPU ownership；
 - operation 间 drift：维持现有 predecessor 检查和完整前缀 rollback；
 - finalization boundary mismatch：完整 rollback 后才允许 replan；
 - evaluator 读取失败、版本未知、证据不完整：一律 fail-closed；
@@ -155,7 +163,8 @@ preflight 和 finalization 都必须调用此 evaluator。两者只在 expected 
 必须通过：
 
 - RED 证明无关 dynamic sibling churn 当前会失败；
-- RED 覆盖 direct child、controlled rel、existing/new relevant holder drift；
+- RED 覆盖 grow child removal 成功、shrink child addition outside target 在 unsafe write 前失败、
+  controlled rel drift，以及 grow new relevant CPU holder 失败；
 - preflight 与 finalization 的 evaluator parity 测试；
 - trace freeze isolation、版本拒绝、确定性 hash；
 - topology 全包；
@@ -169,8 +178,10 @@ preflight 和 finalization 都必须调用此 evaluator。两者只在 expected 
 
 - Old owner: `ScanBoundary.ExpandedRels` exact replay 和完整 `SnapshotID` equality。
 - New owner: compiler 生成的 `FrozenBoundaryV1`。
-- Shared policy owner: `EvaluateFrozenBoundary`。
+- Shared policy owner: `EvaluateFrozenBoundary`；direct-child proof 由 operation direction 决定。
 - Diagnostic-only field: `ScanBoundary.ExpandedRels`。
 - Delete-first targets:
   `BuildCompleteSnapshotForBoundary`、`exactExpansion`、
   `ErrSnapshotBoundaryExpansionMismatch` 及对应 exact-replay 测试。
+- Deleted contract: 对所有 controlled relation 无差别执行 direct-child exact membership
+  比较，以及 grow operation 的 direction-agnostic child fingerprint/union 绑定。

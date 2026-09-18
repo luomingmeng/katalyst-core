@@ -936,6 +936,7 @@ func TestProjectedHierarchyRejectsStalePredecessorBeforeMutation(t *testing.T) {
 			name:         "expected children fingerprint",
 			wantResource: "children",
 			mutate: func(operation *PlanOperation) {
+				operation.Direction = WriteShrink
 				operation.ExpectedChildren = "stale-children"
 			},
 		},

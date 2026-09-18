@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -96,7 +95,108 @@ func TestTraceFinalizationAllowsUnrelatedDynamicSiblingChurn(t *testing.T) {
 	require.True(t, finalization.evaluation.ParentSafety.Safe)
 }
 
-func TestTracePreflightWrapsDirectChildRemovalAsInitialDriftWithoutWrites(t *testing.T) {
+func TestFrozenTraceAllowsGrowDirectChildRemoval(t *testing.T) {
+	live := newFakeHierarchyDriver()
+	live.add("root", CgroupIdentity{Device: 1, Inode: 1}, "0-1", "0")
+	live.add("root/ephemeral", CgroupIdentity{Device: 1, Inode: 2}, "9", "0")
+	operation := PlanOperation{
+		Rel: "root", ExpectedIdentity: live.nodes["root"].identity,
+		ExpectedCurrent: CPUSetTarget{CPUs: machine.MustParse("0-1"), Mems: "0"},
+		Target:          CPUSetTarget{CPUs: machine.MustParse("0-3"), Mems: "0"},
+		Direction:       WriteGrow,
+	}
+	before, err := live.ReadEntry(context.Background(), operation.Rel)
+	require.NoError(t, err)
+	after := before
+	after.ConfiguredCPUs = operation.Target.CPUs.Clone()
+	after.CPUs = operation.Target.CPUs.Clone()
+	child, err := live.ReadEntry(context.Background(), "root/ephemeral")
+	require.NoError(t, err)
+	delete(live.nodes, "root/ephemeral")
+	preflight := frozenOperationPreflight{
+		before: freezeOperationState(before),
+		after:  freezeOperationState(after),
+		children: stableLiveChildren{
+			cpus: child.CPUs.Clone(),
+			mems: machine.NewCPUSet(0),
+			refs: []ChildRef{{
+				Name: "ephemeral", Identity: child.Identity,
+			}},
+			byRel: map[string]EntryState{"root/ephemeral": child},
+		},
+	}
+	writer := newSafeCPUSetWriter(
+		live, NewBudgetTracker(ConvergenceBudget{}), nil)
+
+	current, alreadyAtTarget, err := writer.validateFrozenOperationPredecessor(
+		context.Background(), operation, preflight)
+
+	require.NoError(t, err)
+	require.False(t, alreadyAtTarget)
+	require.Equal(t, before.Identity, current.Identity)
+	require.Zero(t, live.PhysicalWriteCount())
+}
+
+func TestTracePreflightRejectsShrinkDirectChildAdditionOutsideTargetWithoutWrites(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+	shrink := traceOperationByDirection(t, trace, WriteShrink)
+	fixture.driver.add(
+		filepath.Join(shrink.Rel, "outside-target"),
+		CgroupIdentity{Device: 1, Inode: 1001}, "99", "1")
+	initialState := fixture.driver.snapshot()
+
+	err = newTracePreflightWriter(fixture.driver).
+		preflightFrozenTrace(context.Background(), trace)
+
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	require.Contains(t, err.Error(), "shrink relation direct children changed")
+	require.Zero(t, fixture.driver.PhysicalWriteCount())
+	require.Equal(t, initialState, fixture.driver.snapshot())
+}
+
+func TestTracePreflightRejectsGrowNewRelevantCPUHolderWithoutWrites(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+	grow := traceOperationByDirection(t, trace, WriteGrow)
+	added := grow.Target.CPUs.Difference(grow.ExpectedCurrent.CPUs)
+	require.False(t, added.IsEmpty())
+	fixture.driver.add(
+		filepath.Join(grow.Rel, "new-holder"),
+		CgroupIdentity{Device: 1, Inode: 1002}, added.String(), "0")
+	initialState := fixture.driver.snapshot()
+
+	err = newTracePreflightWriter(fixture.driver).
+		preflightFrozenTrace(context.Background(), trace)
+
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	require.Contains(t, err.Error(), "relevant CPU holder set changed")
+	require.Zero(t, fixture.driver.PhysicalWriteCount())
+	require.Equal(t, initialState, fixture.driver.snapshot())
+}
+
+func traceOperationByDirection(
+	t *testing.T,
+	trace *CompiledPhaseTrace,
+	direction WriteDirection,
+) PlanOperation {
+	t.Helper()
+	for _, operation := range flattenTraceOperations(trace) {
+		if operation.Direction == direction {
+			return operation
+		}
+	}
+	t.Fatalf("trace has no %s operation", direction)
+	return PlanOperation{}
+}
+
+func TestTracePreflightWrapsRelevantHolderRemovalAsInitialDriftWithoutWrites(t *testing.T) {
 	fixture := newAdmissionTraceFixture(t)
 	fixture.configureStagedSMTTransferWithDynamicDescendant()
 	const removed = "kubepods/runtime-created"
@@ -120,7 +220,7 @@ func TestTracePreflightWrapsDirectChildRemovalAsInitialDriftWithoutWrites(t *tes
 	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
 	var drift *frozenInitialSnapshotDriftError
 	require.ErrorAs(t, err, &drift)
-	require.Contains(t, err.Error(), "direct children changed")
+	require.Contains(t, err.Error(), "relevant CPU holder set changed")
 	require.NotEqual(t, drift.currentEvidenceID, drift.expected.ID)
 	require.Equal(t, 0, drift.physicalWritesBefore)
 	require.Equal(t, 0, drift.physicalWritesAfter)
@@ -257,24 +357,6 @@ func TestTracePreflightRejectsIdentityDriftWithoutWrites(t *testing.T) {
 	require.Equal(t, initialState, driver.snapshot())
 }
 
-func TestTracePreflightRejectsChildFingerprintDriftWithoutWrites(t *testing.T) {
-	trace, driver := compiledTraceWithCPUAndMemoryWrites(t)
-	operation := operationWithCapturedChildren(t, trace)
-	driver.add(
-		filepath.Join(operation.Rel, "preflight-drift"),
-		CgroupIdentity{Device: 1, Inode: 1000},
-		"",
-		"0",
-	)
-	initialState := driver.snapshot()
-
-	err := newTracePreflightWriter(driver).preflightFrozenTrace(context.Background(), trace)
-
-	require.Error(t, err)
-	require.Zero(t, driver.PhysicalWriteCount())
-	require.Equal(t, initialState, driver.snapshot())
-}
-
 func TestTracePreflightValidatesLaterOperationsAgainstOverlay(t *testing.T) {
 	trace, driver := compiledTraceWithCPUAndMemoryWrites(t)
 	require.True(t, traceRequiresEarlierParentOverlay(trace))
@@ -321,50 +403,6 @@ func TestTracePreflightProducesEveryProjectedPhysicalPredecessorIncludingV2Empty
 	}
 	require.True(t, foundInherited,
 		"fixture must retain the v2 inherited relation in the global trace")
-	require.Zero(t, fixture.driver.PhysicalWriteCount())
-}
-
-func TestTracePreflightFreshScanRejectsNewDirectChild(t *testing.T) {
-	fixture := newAdmissionTraceFixture(t)
-	fixture.driver.capabilities = cgroupV2Policy.capabilities(true)
-	fixture.round.allowEmptyTarget = true
-	fixture.addPrimary("kubepods", "0-3", "0")
-	fixture.addDynamicDescendant("kubepods/besteffort", "0-3", "0")
-	_ = fixture.snapshot()
-
-	base, err := BuildCompleteSnapshot(
-		context.Background(),
-		fixture.driver,
-		fixture.round.dag,
-		SnapshotRequest{
-			Purpose:      ScanForPlan,
-			AffectedRels: []string{"kubepods/besteffort"},
-		},
-		NewBudgetTracker(ConvergenceBudget{}),
-	)
-	require.NoError(t, err)
-	require.Equal(t, []string{"kubepods", "kubepods/besteffort"}, base.ScanBoundary.Roots)
-	require.Equal(t, []string{"kubepods/besteffort"}, base.ScanBoundary.ExpandedRels)
-
-	trace, err := fixture.round.compileFixedPointTrace(context.Background(), base)
-	require.NoError(t, err)
-	fixture.driver.add(
-		"kubepods/unrelated",
-		CgroupIdentity{Device: 1, Inode: 999},
-		"0-3",
-		"0",
-	)
-	var calls []string
-	fixture.driver.beforeCall = func(op HierarchyOperation, rel string) error {
-		calls = append(calls, string(op)+":"+rel)
-		return nil
-	}
-
-	err = newTracePreflightWriter(fixture.driver).preflightFrozenTrace(context.Background(), trace)
-
-	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
-	require.Contains(t, calls, string(HierarchyOperationList)+":kubepods")
-	require.Contains(t, calls, string(HierarchyOperationRead)+":kubepods/unrelated")
 	require.Zero(t, fixture.driver.PhysicalWriteCount())
 }
 
@@ -472,50 +510,6 @@ func TestFrozenTraceValidatesCompletePredecessorBeforeOperationFirstWrite(t *tes
 			},
 			mutate: func(live *fakeHierarchyDriver, operation PlanOperation) {
 				live.bumpIdentity(operation.ParentRel)
-			},
-		},
-		{
-			name: "children fingerprint",
-			selectOp: func(operation PlanOperation, trace *CompiledPhaseTrace) bool {
-				return len(trace.InitialSnapshot.Children[operation.Rel]) > 0
-			},
-			mutate: func(live *fakeHierarchyDriver, operation PlanOperation) {
-				childRel := filepath.Join(operation.Rel, "external-child")
-				live.add(childRel, CgroupIdentity{Device: 99, Inode: 99}, "0", "0")
-			},
-		},
-		{
-			name: "child identity",
-			selectOp: func(operation PlanOperation, trace *CompiledPhaseTrace) bool {
-				return len(trace.InitialSnapshot.Children[operation.Rel]) > 0
-			},
-			mutate: func(live *fakeHierarchyDriver, operation PlanOperation) {
-				child := traceChildRel(t, operation.Rel, live)
-				live.bumpIdentity(child)
-			},
-		},
-		{
-			name: "child CPU union",
-			selectOp: func(operation PlanOperation, trace *CompiledPhaseTrace) bool {
-				return len(trace.InitialSnapshot.Children[operation.Rel]) > 0
-			},
-			mutate: func(live *fakeHierarchyDriver, operation PlanOperation) {
-				child := traceChildRel(t, operation.Rel, live)
-				live.nodes[child].configuredCPUs =
-					live.nodes[child].configuredCPUs.Union(machine.NewCPUSet(99))
-				live.nodes[child].cpus =
-					live.nodes[child].cpus.Union(machine.NewCPUSet(99))
-			},
-		},
-		{
-			name: "child mems union",
-			selectOp: func(operation PlanOperation, trace *CompiledPhaseTrace) bool {
-				return len(trace.InitialSnapshot.Children[operation.Rel]) > 0
-			},
-			mutate: func(live *fakeHierarchyDriver, operation PlanOperation) {
-				child := traceChildRel(t, operation.Rel, live)
-				live.nodes[child].configuredMems = "0-99"
-				live.nodes[child].mems = "0-99"
 			},
 		},
 		{
@@ -1675,19 +1669,6 @@ func selectTraceOperation(
 	}
 	t.Fatal("compiled trace has no operation matching predecessor drift case")
 	return PlanOperation{}
-}
-
-func traceChildRel(t *testing.T, parentRel string, live *fakeHierarchyDriver) string {
-	t.Helper()
-	children := make([]string, 0)
-	for rel := range live.nodes {
-		if filepath.Dir(rel) == parentRel {
-			children = append(children, rel)
-		}
-	}
-	require.NotEmpty(t, children, "predecessor drift case requires a child")
-	sort.Strings(children)
-	return children[0]
 }
 
 func newFrozenPredecessorDriftDriver(

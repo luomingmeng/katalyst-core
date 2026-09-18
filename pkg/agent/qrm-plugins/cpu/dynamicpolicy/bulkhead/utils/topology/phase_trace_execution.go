@@ -322,12 +322,19 @@ func (w safeCPSetWriter) preflightFrozenTraceOperations(
 					phaseIndex, operationIndex, operation.Rel,
 				)
 			}
-			children, err := frozenChildrenFromSnapshot(projection.snapshot, operation.Rel)
-			if err != nil {
-				return nil, fmt.Errorf(
-					"preflight frozen phase trace operation %d/%d children: %w",
-					phaseIndex, operationIndex, err,
-				)
+			children := stableLiveChildren{
+				cpus:  machine.NewCPUSet(),
+				mems:  machine.NewCPUSet(),
+				byRel: make(map[string]EntryState),
+			}
+			if operation.Direction == WriteShrink {
+				children, err = frozenChildrenFromSnapshot(projection.snapshot, operation.Rel)
+				if err != nil {
+					return nil, fmt.Errorf(
+						"preflight frozen phase trace operation %d/%d shrink children: %w",
+						phaseIndex, operationIndex, err,
+					)
+				}
 			}
 			var parentIdentity CgroupIdentity
 			if operation.ParentRel != "" {
@@ -705,27 +712,29 @@ func (w safeCPSetWriter) validateFrozenOperationPredecessor(
 		}
 	}
 
-	children, err := scanFrozenLiveChildrenOnce(
-		ctx, w.driver, operation, preflight.children, true, nil)
-	if err != nil {
-		return EntryState{}, false, err
-	}
-	if !children.cpus.Equals(preflight.children.cpus) {
-		return EntryState{}, false, &PlanStaleError{
-			Rel: operation.Rel, Direction: operation.Direction,
-			Resource: "child_union",
-			Current:  children.cpus.String(),
-			Target:   preflight.children.cpus.String(),
-			Err:      fmt.Errorf("live child CPU union changed from frozen predecessor"),
+	if operation.Direction == WriteShrink {
+		children, err := scanFrozenLiveChildrenOnce(
+			ctx, w.driver, operation, preflight.children, true, nil)
+		if err != nil {
+			return EntryState{}, false, err
 		}
-	}
-	if !children.mems.Equals(preflight.children.mems) {
-		return EntryState{}, false, &PlanStaleError{
-			Rel: operation.Rel, Direction: operation.Direction,
-			Resource: "child_union_cpuset.mems",
-			Current:  children.mems.String(),
-			Target:   preflight.children.mems.String(),
-			Err:      fmt.Errorf("live child mems union changed from frozen predecessor"),
+		if !children.cpus.Equals(preflight.children.cpus) {
+			return EntryState{}, false, &PlanStaleError{
+				Rel: operation.Rel, Direction: operation.Direction,
+				Resource: "child_union",
+				Current:  children.cpus.String(),
+				Target:   preflight.children.cpus.String(),
+				Err:      fmt.Errorf("live child CPU union changed from frozen predecessor"),
+			}
+		}
+		if !children.mems.Equals(preflight.children.mems) {
+			return EntryState{}, false, &PlanStaleError{
+				Rel: operation.Rel, Direction: operation.Direction,
+				Resource: "child_union_cpuset.mems",
+				Current:  children.mems.String(),
+				Target:   preflight.children.mems.String(),
+				Err:      fmt.Errorf("live child mems union changed from frozen predecessor"),
+			}
 		}
 	}
 	return current, false, nil
