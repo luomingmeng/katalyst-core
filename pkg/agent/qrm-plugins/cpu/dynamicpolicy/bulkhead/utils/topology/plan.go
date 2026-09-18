@@ -131,6 +131,7 @@ type PlanOperation struct {
 
 type AdmissionSafetyInput struct {
 	ProtectedPendingCPUSet machine.CPUSet
+	PendingRequiredByRel   map[string]machine.CPUSet
 	DeferredCPUSetByRel    map[string]machine.CPUSet
 	RequiredCPUSetByRel    map[string]machine.CPUSet
 }
@@ -175,6 +176,11 @@ func SplitPlanForAdmission(plan *PhasePlan, in AdmissionSafetyInput) (required, 
 			!removedCPUs.Intersection(outgoingCPUsBySource[operationDomain]).IsEmpty():
 			classes[i] = operationClass{required: true, requirement: OperationAdmissionSourceDrain}
 		case operation.Direction == WriteGrow &&
+			!operation.Target.CPUs.Difference(operation.ExpectedCurrent.CPUs).
+				Intersection(in.PendingRequiredByRel[operation.Rel]).IsEmpty():
+			classes[i] = operationClass{required: true, requirement: OperationAdmissionAncestorGrow}
+		case len(in.PendingRequiredByRel) == 0 &&
+			operation.Direction == WriteGrow &&
 			!operation.Target.CPUs.Difference(operation.ExpectedCurrent.CPUs).
 				Intersection(in.ProtectedPendingCPUSet).IsEmpty():
 			classes[i] = operationClass{required: true, requirement: OperationAdmissionAncestorGrow}
