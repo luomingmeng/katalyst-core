@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	v1 "k8s.io/api/core/v1"
 )
 
 func TestPodRelativeCgroupPathCandidatesUseConfiguredRootsWithoutExistenceLookup(t *testing.T) {
@@ -39,6 +40,58 @@ func TestPodRelativeCgroupPathCandidatesUseConfiguredRootsWithoutExistenceLookup
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("pod candidates = %v, want %v", got, want)
+	}
+}
+
+func TestPodRelativeCgroupPathCandidatesForQOSSelectsCanonicalConfiguredRoot(t *testing.T) {
+	t.Parallel()
+
+	roots := []string{
+		"/kubepods",
+		"/kubepods/burstable",
+		"/kubepods/besteffort",
+		"/kubepods/offline-besteffort",
+		"/kubepods.slice",
+		"/kubepods.slice/kubepods-burstable.slice",
+		"/kubepods.slice/kubepods-besteffort.slice",
+	}
+	tests := []struct {
+		name string
+		qos  v1.PodQOSClass
+		want []string
+	}{
+		{
+			name: "guaranteed",
+			qos:  v1.PodQOSGuaranteed,
+			want: []string{
+				"/kubepods/podabc-def",
+				"/kubepods.slice/podabc-def",
+			},
+		},
+		{
+			name: "burstable",
+			qos:  v1.PodQOSBurstable,
+			want: []string{
+				"/kubepods/burstable/podabc-def",
+				"/kubepods.slice/kubepods-burstable.slice/podabc-def",
+			},
+		},
+		{
+			name: "best effort",
+			qos:  v1.PodQOSBestEffort,
+			want: []string{
+				"/kubepods/besteffort/podabc-def",
+				"/kubepods.slice/kubepods-besteffort.slice/podabc-def",
+			},
+		},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := podRelativeCgroupPathCandidatesForQOS(roots, "abc-def", tc.qos)
+			require.Equal(t, tc.want, got)
+		})
 	}
 }
 

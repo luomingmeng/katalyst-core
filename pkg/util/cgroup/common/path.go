@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 
+	v1 "k8s.io/api/core/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 
@@ -229,6 +230,15 @@ func GetPodRelativeCgroupPathCandidates(podUID string) []string {
 	return podRelativeCgroupPathCandidates(k8sCgroupPathList.List(), podUID)
 }
 
+// GetPodRelativeCgroupPathCandidatesForQOS returns the filesystem-independent
+// candidates for the pod's native Kubernetes QoS class. Unknown QoS classes
+// retain all configured roots so the DAG selector can fail closed on ambiguity.
+func GetPodRelativeCgroupPathCandidatesForQOS(podUID string, qosClass v1.PodQOSClass) []string {
+	k8sCgroupPathLock.RLock()
+	defer k8sCgroupPathLock.RUnlock()
+	return podRelativeCgroupPathCandidatesForQOS(k8sCgroupPathList.List(), podUID, qosClass)
+}
+
 func podRelativeCgroupPathCandidates(kubernetesRoots []string, podUID string) []string {
 	suffix := fmt.Sprintf("%s%s", PodCgroupPathPrefix, podUID)
 	candidates := make([]string, 0, len(kubernetesRoots))
@@ -242,6 +252,35 @@ func podRelativeCgroupPathCandidates(kubernetesRoots []string, podUID string) []
 		candidates = append(candidates, candidate)
 	}
 	return candidates
+}
+
+func podRelativeCgroupPathCandidatesForQOS(
+	kubernetesRoots []string,
+	podUID string,
+	qosClass v1.PodQOSClass,
+) []string {
+	allowedRoots := map[string]struct{}{}
+	switch qosClass {
+	case v1.PodQOSGuaranteed:
+		allowedRoots[path.Clean(CgroupFsRootPath)] = struct{}{}
+		allowedRoots[path.Clean(SystemdRootPath)] = struct{}{}
+	case v1.PodQOSBurstable:
+		allowedRoots[path.Clean(CgroupFsRootPathBurstable)] = struct{}{}
+		allowedRoots[path.Clean(SystemdRootPathBurstable)] = struct{}{}
+	case v1.PodQOSBestEffort:
+		allowedRoots[path.Clean(CgroupFsRootPathBestEffort)] = struct{}{}
+		allowedRoots[path.Clean(SystemdRootPathBestEffort)] = struct{}{}
+	default:
+		return podRelativeCgroupPathCandidates(kubernetesRoots, podUID)
+	}
+
+	filteredRoots := make([]string, 0, len(kubernetesRoots))
+	for _, root := range kubernetesRoots {
+		if _, ok := allowedRoots[path.Clean(root)]; ok {
+			filteredRoots = append(filteredRoots, root)
+		}
+	}
+	return podRelativeCgroupPathCandidates(filteredRoots, podUID)
 }
 
 // GetPodAbsCgroupPath returns absolute cgroup path for pod level

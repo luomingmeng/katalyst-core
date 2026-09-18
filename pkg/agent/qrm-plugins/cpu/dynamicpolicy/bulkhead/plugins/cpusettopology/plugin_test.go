@@ -28,6 +28,7 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -782,12 +783,49 @@ func TestPendingProtectionScopesResolveColdPodFromDAGWithoutFilesystemEvidence(t
 
 	got, err := p.pendingProtectionScopes(context.Background(), dag, []pendingContainerCPUSet{{
 		PodUID: podUID, ContainerName: "main", CPUs: machine.NewCPUSet(0, 1),
+		NativeQOSClass: v1.PodQOSBurstable,
 	}})
 	if err != nil {
 		t.Fatalf("pendingProtectionScopes() error = %v", err)
 	}
 	want := []topology.PendingProtection{{
 		ScopeRel: "kubepods/burstable/podcold-shared",
+		CPUs:     machine.NewCPUSet(0, 1),
+		PodUID:   podUID,
+		Source:   topology.PendingProtectionSourceExpectedPod,
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("pending protections = %#v, want %#v", got, want)
+	}
+}
+
+func TestPendingProtectionScopesResolveGuaranteedPodUnderProductionPrimaryRoot(t *testing.T) {
+	t.Parallel()
+
+	const podUID = "cold-guaranteed"
+	dag, err := topology.BuildDAG([]topology.NodeSpec{{
+		Rel:            "kubepods",
+		Role:           topology.TopoNodeRolePrimary,
+		Domain:         topology.DomainPrimary,
+		ControlledRoot: true,
+	}})
+	if err != nil {
+		t.Fatalf("BuildDAG() error = %v", err)
+	}
+	p := &CPUSetTopologyPlugin{
+		cgroup:             &fakeCgroupClient{},
+		pendingProtections: map[string]pendingPodProtection{},
+	}
+
+	got, err := p.pendingProtectionScopes(context.Background(), dag, []pendingContainerCPUSet{{
+		PodUID: podUID, ContainerName: "main", CPUs: machine.NewCPUSet(0, 1),
+		NativeQOSClass: v1.PodQOSGuaranteed,
+	}})
+	if err != nil {
+		t.Fatalf("pendingProtectionScopes() error = %v", err)
+	}
+	want := []topology.PendingProtection{{
+		ScopeRel: "kubepods/podcold-guaranteed",
 		CPUs:     machine.NewCPUSet(0, 1),
 		PodUID:   podUID,
 		Source:   topology.PendingProtectionSourceExpectedPod,
@@ -3851,6 +3889,19 @@ func TestCPUSetTopologyPluginSkipsExpectedCPUSetForMissingContainer(t *testing.T
 		MetaAgent: &agent.MetaAgent{
 			PodFetcher: &metapod.PodFetcherStub{PodList: []*v1.Pod{{
 				ObjectMeta: metav1.ObjectMeta{UID: types.UID("pod-1")},
+				Spec: v1.PodSpec{Containers: []v1.Container{{
+					Name: "missing-container",
+					Resources: v1.ResourceRequirements{
+						Requests: v1.ResourceList{
+							v1.ResourceCPU:    resource.MustParse("1"),
+							v1.ResourceMemory: resource.MustParse("256Mi"),
+						},
+						Limits: v1.ResourceList{
+							v1.ResourceCPU:    resource.MustParse("1"),
+							v1.ResourceMemory: resource.MustParse("256Mi"),
+						},
+					},
+				}}},
 			}}},
 		},
 	}
@@ -3876,6 +3927,9 @@ func TestCPUSetTopologyPluginSkipsExpectedCPUSetForMissingContainer(t *testing.T
 	}
 	if len(res.PendingByPod) != 1 {
 		t.Fatalf("expected one protected-pending entry, got %#v", res.PendingByPod)
+	}
+	if got := res.PendingByPod[0].NativeQOSClass; got != v1.PodQOSGuaranteed {
+		t.Fatalf("pending native qos class = %q, want %q", got, v1.PodQOSGuaranteed)
 	}
 }
 

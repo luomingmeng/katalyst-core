@@ -28,7 +28,9 @@ import (
 	"sync"
 	"time"
 
+	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/util/errors"
+	v1qos "k8s.io/kubernetes/pkg/apis/core/v1/helper/qos"
 
 	bulkheadapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
@@ -1383,10 +1385,11 @@ func (p *CPUSetTopologyPlugin) applyBulkheadPartitionFlag(ctx context.Context, f
 // available to write, its cpuset protects the controlled ancestors' effective
 // targets from shrinking below the allocation; the absent leaf is not written.
 type pendingContainerCPUSet struct {
-	PodUID        string
-	ContainerName string
-	CPUs          machine.CPUSet
-	Reason        string
+	PodUID         string
+	ContainerName  string
+	CPUs           machine.CPUSet
+	Reason         string
+	NativeQOSClass v1.PodQOSClass
 }
 
 // expectedCPUSetBuildResult separates resolvable container leaves (ExpectedByRel,
@@ -1461,9 +1464,13 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in 
 					// admit); record it so the writer keeps the parent a superset.
 					general.InfofV(5, "bulkhead: container rel pending, protecting allocation, pod=%q container=%q cpuset=%s cpuset_size=%d err=%v",
 						podUID, containerName, cpus.String(), cpus.Size(), err)
-					out.PendingByPod = append(out.PendingByPod, pendingContainerCPUSet{
+					pending := pendingContainerCPUSet{
 						PodUID: podUID, ContainerName: containerName, CPUs: cpus, Reason: err.Error(),
-					})
+					}
+					if pod, podErr := in.MetaServer.GetPod(ctx, podUID); podErr == nil && pod != nil {
+						pending.NativeQOSClass = v1qos.GetPodQOS(pod)
+					}
+					out.PendingByPod = append(out.PendingByPod, pending)
 					continue
 				}
 				// A real internal error (illegal rel, cgroup/metaserver failure):
@@ -1759,6 +1766,9 @@ func (p *CPUSetTopologyPlugin) pendingProtectionScopes(
 			continue
 		}
 		current.CPUs = current.CPUs.Union(pending.CPUs)
+		if current.NativeQOSClass == "" {
+			current.NativeQOSClass = pending.NativeQOSClass
+		}
 		aggregated[pending.PodUID] = current
 	}
 
@@ -1771,10 +1781,12 @@ func (p *CPUSetTopologyPlugin) pendingProtectionScopes(
 		rel := protection.rel
 		if rel == "" {
 			var err error
-			rel, err = dag.SelectUniqueControlledPrimaryCandidate(
-				cgcommon.GetPodRelativeCgroupPathCandidates(podUID))
+			candidates := cgcommon.GetPodRelativeCgroupPathCandidatesForQOS(
+				podUID, pending.NativeQOSClass)
+			rel, err = dag.SelectUniqueControlledPrimaryCandidate(candidates)
 			if err != nil {
-				return nil, fmt.Errorf("resolve pending pod scope %q: %w", podUID, err)
+				return nil, fmt.Errorf("resolve pending pod scope %q with native qos %q from candidates %v: %w",
+					podUID, pending.NativeQOSClass, candidates, err)
 			}
 		}
 		rel = path.Clean(strings.Trim(rel, "/"))
@@ -1791,6 +1803,8 @@ func (p *CPUSetTopologyPlugin) pendingProtectionScopes(
 		}
 		protection.rel = rel
 		p.pendingProtections[podUID] = protection
+		general.Infof("bulkhead: pending pod scope selected, pod=%q native_qos=%q scope=%q source=%q cpuset=%s",
+			podUID, pending.NativeQOSClass, rel, source, pending.CPUs.String())
 		out = append(out, topology.PendingProtection{
 			ScopeRel: rel,
 			CPUs:     pending.CPUs.Clone(),
