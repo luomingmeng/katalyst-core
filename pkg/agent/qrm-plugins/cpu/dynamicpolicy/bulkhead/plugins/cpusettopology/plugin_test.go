@@ -28,7 +28,6 @@ import (
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -3360,6 +3359,15 @@ type disappearingContainerIDFetcher struct {
 	calls       int
 }
 
+type allocationLookupState struct {
+	cpustate.ReadonlyState
+	info *cpustate.AllocationInfo
+}
+
+func (s *allocationLookupState) GetAllocationInfo(_, _ string) *cpustate.AllocationInfo {
+	return s.info
+}
+
 type bypassAwareContainerIDFetcher struct {
 	metapod.PodFetcherStub
 	cachedID   string
@@ -3885,24 +3893,11 @@ func TestCPUSetTopologyPluginSkipsExpectedCPUSetForMissingContainer(t *testing.T
 	t.Parallel()
 
 	p := &CPUSetTopologyPlugin{}
+	allocationInfo := &cpustate.AllocationInfo{}
+	allocationInfo.NativeQOSClass = string(v1.PodQOSGuaranteed)
 	metaServer := &metaserver.MetaServer{
 		MetaAgent: &agent.MetaAgent{
-			PodFetcher: &metapod.PodFetcherStub{PodList: []*v1.Pod{{
-				ObjectMeta: metav1.ObjectMeta{UID: types.UID("pod-1")},
-				Spec: v1.PodSpec{Containers: []v1.Container{{
-					Name: "missing-container",
-					Resources: v1.ResourceRequirements{
-						Requests: v1.ResourceList{
-							v1.ResourceCPU:    resource.MustParse("1"),
-							v1.ResourceMemory: resource.MustParse("256Mi"),
-						},
-						Limits: v1.ResourceList{
-							v1.ResourceCPU:    resource.MustParse("1"),
-							v1.ResourceMemory: resource.MustParse("256Mi"),
-						},
-					},
-				}}},
-			}}},
+			PodFetcher: &metapod.PodFetcherStub{},
 		},
 	}
 	view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
@@ -3916,8 +3911,11 @@ func TestCPUSetTopologyPluginSkipsExpectedCPUSetForMissingContainer(t *testing.T
 	// A container with no status yet also fails at the container-id stage:
 	// admit-safe pending, not an error.
 	res, err := p.buildExpectedCPUSetByRel(context.Background(), bulkheadapi.HandlerContext{
-		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{MetaServer: metaServer},
-		DesiredView:                view,
+		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+			MetaServer: metaServer,
+			State:      &allocationLookupState{info: allocationInfo},
+		},
+		DesiredView: view,
 	})
 	if err != nil {
 		t.Fatalf("missing container must not error (admit-safe pending), got %v", err)

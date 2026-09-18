@@ -1467,8 +1467,16 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in 
 					pending := pendingContainerCPUSet{
 						PodUID: podUID, ContainerName: containerName, CPUs: cpus, Reason: err.Error(),
 					}
-					if pod, podErr := in.MetaServer.GetPod(ctx, podUID); podErr == nil && pod != nil {
-						pending.NativeQOSClass = v1qos.GetPodQOS(pod)
+					if in.State != nil {
+						if allocation := in.State.GetAllocationInfo(podUID, containerName); allocation != nil {
+							pending.NativeQOSClass = v1.PodQOSClass(allocation.NativeQOSClass)
+						}
+					}
+					if pending.NativeQOSClass == "" {
+						pod, podErr := in.MetaServer.GetPod(ctx, podUID)
+						if podErr == nil && pod != nil {
+							pending.NativeQOSClass = v1qos.GetPodQOS(pod)
+						}
 					}
 					out.PendingByPod = append(out.PendingByPod, pending)
 					continue

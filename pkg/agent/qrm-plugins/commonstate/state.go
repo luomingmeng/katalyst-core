@@ -43,6 +43,9 @@ type AllocationMeta struct {
 	Labels      map[string]string `json:"labels"`
 	Annotations map[string]string `json:"annotations"`
 	QoSLevel    string            `json:"qosLevel"`
+	// NativeQOSClass preserves the kubelet request's Kubernetes QoS class even
+	// before the Pod appears in the metaserver cache.
+	NativeQOSClass string `json:"native_qos_class,omitempty"`
 }
 
 func (am AllocationMeta) ToClosAssignmentMeta() resctrlutil.ClosAssignmentMeta {
