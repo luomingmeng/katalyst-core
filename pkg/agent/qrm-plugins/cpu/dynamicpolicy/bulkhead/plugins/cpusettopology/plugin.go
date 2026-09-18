@@ -1719,6 +1719,79 @@ func (p *CPUSetTopologyPlugin) pendingProtectedCPUSetByRel(ctx context.Context, 
 	return out
 }
 
+func (p *CPUSetTopologyPlugin) pendingProtectionScopes(
+	ctx context.Context,
+	pendingByPod []pendingContainerCPUSet,
+) ([]topology.PendingProtection, error) {
+	if p.now == nil {
+		p.now = time.Now
+	}
+	if p.pendingProtections == nil {
+		p.pendingProtections = map[string]pendingPodProtection{}
+	}
+	now := p.now()
+	aggregated := make(map[string]pendingContainerCPUSet, len(pendingByPod))
+	active := make(map[string]struct{}, len(pendingByPod))
+	for _, pending := range pendingByPod {
+		active[pending.PodUID] = struct{}{}
+		current := aggregated[pending.PodUID]
+		if current.PodUID == "" {
+			current = pending
+		} else {
+			current.CPUs = current.CPUs.Union(pending.CPUs)
+		}
+		aggregated[pending.PodUID] = current
+	}
+
+	out := make([]topology.PendingProtection, 0, len(aggregated))
+	for podUID, pending := range aggregated {
+		protection := p.pendingProtections[podUID]
+		if protection.protectUntil.IsZero() || !now.Before(protection.protectUntil) {
+			protection.protectUntil = now.Add(defaultPendingPodProtectionTTL)
+		}
+		rel := protection.rel
+		if rel == "" {
+			var err error
+			rel, err = cgcommon.GetPodRelativeCgroupPath(podUID)
+			if err != nil {
+				return nil, fmt.Errorf("resolve pending pod %q scope: %w", podUID, err)
+			}
+		}
+		rel = path.Clean(strings.Trim(rel, "/"))
+		if rel == "." || rel == "" || rel == ".." || strings.HasPrefix(rel, "../") {
+			return nil, fmt.Errorf("%w: pod=%q scope=%q",
+				topology.ErrInvalidPendingProtection, podUID, rel)
+		}
+
+		source := topology.PendingProtectionSourceExpectedPod
+		current, err := p.cgroup.ReadCPUSet(ctx, rel)
+		if err == nil && !current.IsEmpty() {
+			source = topology.PendingProtectionSourceExistingPod
+			protection.current = current
+		}
+		protection.rel = rel
+		p.pendingProtections[podUID] = protection
+		out = append(out, topology.PendingProtection{
+			ScopeRel: rel,
+			CPUs:     pending.CPUs.Clone(),
+			PodUID:   podUID,
+			Source:   source,
+		})
+	}
+	for podUID := range p.pendingProtections {
+		if _, ok := active[podUID]; !ok {
+			delete(p.pendingProtections, podUID)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ScopeRel != out[j].ScopeRel {
+			return out[i].ScopeRel < out[j].ScopeRel
+		}
+		return out[i].PodUID < out[j].PodUID
+	})
+	return out, nil
+}
+
 func unionCPUSetByRel(byRel map[string]machine.CPUSet) machine.CPUSet {
 	union := machine.NewCPUSet()
 	for _, cpus := range byRel {
