@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"syscall"
 	"time"
 
 	cgroupclient "github.com/kubewharf/katalyst-core/pkg/util/cgroup/client"
@@ -289,7 +290,7 @@ func (b *snapshotBuilder) scan(rel string, domain DomainID, depth int, expected 
 	if err != nil {
 		if expected != (CgroupIdentity{}) &&
 			b.retirable[rel] == expected &&
-			isCgroupNotFoundError(err) {
+			isCgroupPathAbsent(err) {
 			b.retired[rel] = struct{}{}
 			return nil
 		}
@@ -303,7 +304,7 @@ func (b *snapshotBuilder) scan(rel string, domain DomainID, depth int, expected 
 	}
 	entry, err := b.driver.ReadEntry(b.ctx, rel)
 	if err != nil {
-		if b.retirable[rel] == before && isCgroupNotFoundError(err) {
+		if b.retirable[rel] == before && isCgroupPathAbsent(err) {
 			b.retired[rel] = struct{}{}
 			return nil
 		}
@@ -318,7 +319,7 @@ func (b *snapshotBuilder) scan(rel string, domain DomainID, depth int, expected 
 	}
 	after, err := b.driver.StatIdentity(b.ctx, rel)
 	if err != nil {
-		if b.retirable[rel] == before && isCgroupNotFoundError(err) {
+		if b.retirable[rel] == before && isCgroupPathAbsent(err) {
 			b.retired[rel] = struct{}{}
 			return nil
 		}
@@ -379,6 +380,15 @@ func (b *snapshotBuilder) scan(rel string, domain DomainID, depth int, expected 
 	b.snapshot.Children[rel] = retainedChildren
 	sort.Strings(b.snapshot.ScanBoundary.ExpandedRels)
 	return nil
+}
+
+func isCgroupPathAbsent(err error) bool {
+	if err == nil || errors.Is(err, ErrCgroupControllerUnavailable) {
+		return false
+	}
+	return errors.Is(err, syscall.ENOENT) ||
+		errors.Is(err, syscall.ENOTDIR) ||
+		errors.Is(err, syscall.ENODEV)
 }
 
 func (b *snapshotBuilder) shouldSkipUnavailableController(rel string, depth int, err error) bool {

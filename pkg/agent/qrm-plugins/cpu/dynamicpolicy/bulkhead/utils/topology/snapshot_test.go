@@ -19,6 +19,7 @@ package topology
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -271,6 +272,57 @@ func TestSnapshotRejectsIdentityChangeAndListStatDeleteRace(t *testing.T) {
 			t.Fatalf("snapshot=%v error=%v, want parent identity-changed failure and nil snapshot", snapshot, err)
 		}
 	})
+}
+
+func TestSnapshotRetirementRejectsControllerError(t *testing.T) {
+	assertSnapshotRetirementRejectsError(t, fmt.Errorf(
+		"read cpuset.cpus: %w: %w", ErrCgroupControllerUnavailable, syscall.ENOENT))
+}
+
+func TestSnapshotRetirementRejectsPermissionError(t *testing.T) {
+	assertSnapshotRetirementRejectsError(t, syscall.EACCES)
+}
+
+func TestSnapshotRetirementRejectsIOError(t *testing.T) {
+	assertSnapshotRetirementRejectsError(t, syscall.EIO)
+}
+
+func TestSnapshotRetirementRejectsDeadlineError(t *testing.T) {
+	assertSnapshotRetirementRejectsError(t, context.DeadlineExceeded)
+}
+
+func TestSnapshotRetirementRejectsBudgetError(t *testing.T) {
+	assertSnapshotRetirementRejectsError(t, ErrHierarchyIOOperationBudgetExceeded)
+}
+
+func TestSnapshotRetirementRejectsTextError(t *testing.T) {
+	assertSnapshotRetirementRejectsError(t, errors.New("read cpuset.cpus: no such file or directory"))
+}
+
+func assertSnapshotRetirementRejectsError(t *testing.T, injected error) {
+	t.Helper()
+	fake := buildSnapshotTestHierarchy()
+	identity := fake.nodes["primary/pod-a"].identity
+	parentListed := false
+	fake.beforeCall = func(op HierarchyOperation, rel string) error {
+		if op == HierarchyOperationList && rel == "primary" {
+			parentListed = true
+		}
+		if parentListed && op == HierarchyOperationStat && rel == "primary/pod-a" {
+			return injected
+		}
+		return nil
+	}
+
+	snapshot, err := buildCompleteSnapshot(
+		context.Background(), fake, buildSnapshotTestDAG(t),
+		SnapshotRequest{Purpose: ScanForPlan, AffectedRels: []string{"primary"}},
+		NewBudgetTracker(ConvergenceBudget{}), nil,
+		map[string]CgroupIdentity{"primary/pod-a": identity},
+	)
+
+	require.Nil(t, snapshot)
+	require.Error(t, err)
 }
 
 func TestSnapshotRejectsSymlinkWithDriverErrorAndNilResult(t *testing.T) {
