@@ -18,6 +18,8 @@ package topology
 
 import (
 	"context"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -278,7 +280,6 @@ func TestEvaluateFrozenBoundaryAllowsUnreferencedHolderRetirementDuringSnapshot(
 	for _, retirementOperation := range []HierarchyOperation{
 		HierarchyOperationStat,
 		HierarchyOperationRead,
-		HierarchyOperationList,
 	} {
 		t.Run(string(retirementOperation), func(t *testing.T) {
 			snapshot, input, phases := frozenBoundaryFixture()
@@ -300,6 +301,73 @@ func TestEvaluateFrozenBoundaryAllowsUnreferencedHolderRetirementDuringSnapshot(
 			})
 		})
 	}
+}
+
+func TestEvaluateFrozenBoundaryAllowsAuthorizedHolderRetirementDuringList(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+	driver.beforeCall = func(operation HierarchyOperation, rel string) error {
+		if operation == HierarchyOperationList && rel == "root/direct/holder" {
+			delete(driver.nodes, "root/direct/holder")
+			return syscall.ENOENT
+		}
+		return nil
+	}
+
+	evaluation, err := EvaluateFrozenBoundary(
+		context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+		boundary, snapshot)
+
+	require.NoError(t, err)
+	assertSnapshotExcludesSubtree(t, evaluation.Snapshot, "root/direct/holder")
+}
+
+func TestEvaluateFrozenBoundaryAllowsAuthorizedHolderRetirementAtRecursiveFence(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+	stats := 0
+	driver.beforeCall = func(operation HierarchyOperation, rel string) error {
+		if operation == HierarchyOperationStat && rel == "root/direct/holder" {
+			stats++
+			if stats == 3 {
+				delete(driver.nodes, rel)
+			}
+		}
+		return nil
+	}
+
+	evaluation, err := EvaluateFrozenBoundary(
+		context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+		boundary, snapshot)
+
+	require.NoError(t, err)
+	assertSnapshotExcludesSubtree(t, evaluation.Snapshot, "root/direct/holder")
+}
+
+func TestEvaluateFrozenBoundaryDiscardsAuthorizedParentRetiredDuringChildScan(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+	driver.beforeCall = func(operation HierarchyOperation, rel string) error {
+		if operation == HierarchyOperationRead && rel == "root/direct/holder" {
+			delete(driver.nodes, "root/direct")
+			delete(driver.nodes, "root/direct/holder")
+			delete(driver.nodes, "root/direct/unrelated")
+		}
+		return nil
+	}
+
+	evaluation, err := EvaluateFrozenBoundary(
+		context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+		boundary, snapshot)
+
+	require.NoError(t, err)
+	assertSnapshotExcludesSubtree(t, evaluation.Snapshot, "root/direct")
 }
 
 func TestEvaluateFrozenBoundaryRejectsReferencedHolderRetirementDuringSnapshot(t *testing.T) {
@@ -454,15 +522,43 @@ func deleteHolderDuringRead(
 			holderStats++
 		}
 		retireNow := operation == retirementOperation
-		if retirementOperation == HierarchyOperationList {
-			retireNow = operation == HierarchyOperationStat && holderStats == 2
-		}
 		if rel == holderRel && parentListed && !retired && retireNow {
 			delete(driver.nodes, holderRel)
 			retired = true
 		}
 		return nil
 	}
+}
+
+func assertSnapshotExcludesSubtree(t *testing.T, snapshot *CompleteSnapshot, retiredRel string) {
+	t.Helper()
+	require.NotNil(t, snapshot)
+	prefix := retiredRel + "/"
+	for rel := range snapshot.Entries {
+		require.False(t, rel == retiredRel || strings.HasPrefix(rel, prefix), "Entries contains retired rel %q", rel)
+	}
+	for rel, children := range snapshot.Children {
+		require.False(t, rel == retiredRel || strings.HasPrefix(rel, prefix), "Children contains retired parent %q", rel)
+		for _, child := range children {
+			childRel := filepath.Join(rel, child.Name)
+			require.False(t, childRel == retiredRel || strings.HasPrefix(childRel, prefix),
+				"Children contains retired child %q", childRel)
+		}
+	}
+	for rel := range snapshot.DomainByRel {
+		require.False(t, rel == retiredRel || strings.HasPrefix(rel, prefix), "DomainByRel contains retired rel %q", rel)
+	}
+	for rel := range snapshot.UnavailableChildren {
+		require.False(t, rel == retiredRel || strings.HasPrefix(rel, prefix), "UnavailableChildren contains retired rel %q", rel)
+	}
+	for _, rel := range snapshot.ScanBoundary.ExpandedRels {
+		require.False(t, rel == retiredRel || strings.HasPrefix(rel, prefix), "ExpandedRels contains retired rel %q", rel)
+	}
+	union := make(map[DomainID]machine.CPUSet)
+	for rel, entry := range snapshot.Entries {
+		union[snapshot.DomainByRel[rel]] = union[snapshot.DomainByRel[rel]].Union(entry.CPUs)
+	}
+	require.Equal(t, union, snapshot.DomainUnion)
 }
 
 func addFrozenBoundaryDirectChild(
