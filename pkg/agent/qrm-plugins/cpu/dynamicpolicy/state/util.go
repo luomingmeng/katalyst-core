@@ -184,6 +184,7 @@ func GetSharedQuantityMapFromPodEntries(
 	podEntries PodEntries,
 	ignoreAllocationInfos []*AllocationInfo,
 	getContainerRequestedCores GetContainerRequestedCoresFunc,
+	sharedNUMABindingCPUIncrRatio float64,
 ) (map[string]map[int]int, error) {
 	poolsQuantityMap := make(map[string]map[int]int)
 	allocationInfosToCount := make([]*AllocationInfo, 0, len(podEntries))
@@ -212,7 +213,13 @@ func GetSharedQuantityMapFromPodEntries(
 		}
 	}
 
-	err := CountAllocationInfosToPoolsQuantityMap(numaResourcePackagePinnedCPUSet, allocationInfosToCount, poolsQuantityMap, getContainerRequestedCores)
+	err := CountAllocationInfosToPoolsQuantityMap(
+		numaResourcePackagePinnedCPUSet,
+		allocationInfosToCount,
+		poolsQuantityMap,
+		getContainerRequestedCores,
+		sharedNUMABindingCPUIncrRatio,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("CountAllocationInfosToPoolsQuantityMap faild with error: %v", err)
 	}
@@ -373,15 +380,6 @@ func updateMachineStatePreOccPodEntries(currentMachineState, originMachineState 
 	}
 }
 
-func GetCPUIncrRatio(allocationInfo *AllocationInfo) float64 {
-	if allocationInfo.CheckSharedNUMABinding() {
-		// multiply incrRatio for numa_binding shared_cores to allow it burst
-		return cpuconsts.CPUIncrRatioSharedCoresNUMABinding
-	}
-
-	return cpuconsts.CPUIncrRatioDefault
-}
-
 func GetSharedBindingNUMAsFromQuantityMap(poolsQuantityMap map[string]map[int]int) sets.Int {
 	res := sets.NewInt()
 
@@ -455,6 +453,7 @@ func CountAllocationInfosToPoolsQuantityMap(
 	allocationInfos []*AllocationInfo,
 	poolsQuantityMap map[string]map[int]int,
 	getContainerRequestedCores GetContainerRequestedCoresFunc,
+	sharedNUMABindingCPUIncrRatio float64,
 ) error {
 	if poolsQuantityMap == nil {
 		return fmt.Errorf("nil poolsQuantityMap in CountAllocationInfosToPoolsQuantityMap")
@@ -467,7 +466,11 @@ func CountAllocationInfosToPoolsQuantityMap(
 			return fmt.Errorf("CountAllocationInfosToPoolsQuantityMap got nil allocationInfo")
 		}
 
-		reqFloat64 := getContainerRequestedCores(allocationInfo) * GetCPUIncrRatio(allocationInfo)
+		cpuIncrRatio := cpuconsts.CPUIncrRatioDefault
+		if allocationInfo.CheckSharedNUMABinding() {
+			cpuIncrRatio = sharedNUMABindingCPUIncrRatio
+		}
+		reqFloat64 := getContainerRequestedCores(allocationInfo) * cpuIncrRatio
 
 		var targetNUMAID int
 		var poolName string

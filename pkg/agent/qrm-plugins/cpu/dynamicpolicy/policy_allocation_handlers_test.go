@@ -290,6 +290,55 @@ func TestIsRampUpReclaimHardPartitionEnabledRequiresNodeReclaim(t *testing.T) {
 	}
 }
 
+func TestSharedNUMABindingCPUIncrRatio(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		enableReclaim   bool
+		enableHardFloor bool
+		want            float64
+	}{
+		{
+			name: "both disabled",
+			want: cpuconsts.CPUIncrRatioSharedCoresNUMABinding,
+		},
+		{
+			name:            "hard partition disabled",
+			enableReclaim:   true,
+			enableHardFloor: false,
+			want:            cpuconsts.CPUIncrRatioSharedCoresNUMABinding,
+		},
+		{
+			name:            "reclaim disabled",
+			enableReclaim:   false,
+			enableHardFloor: true,
+			want:            cpuconsts.CPUIncrRatioSharedCoresNUMABinding,
+		},
+		{
+			name:            "hard partition active",
+			enableReclaim:   true,
+			enableHardFloor: true,
+			want:            cpuconsts.CPUIncrRatioDefault,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dyn := dynamicconfig.NewDynamicAgentConfiguration()
+			dynamicConf := dyn.GetDynamicConfiguration()
+			dynamicConf.EnableReclaim = tt.enableReclaim
+			dynamicConf.EnableRampUpReclaimHardPartition = tt.enableHardFloor
+
+			p := &DynamicPolicy{dynamicConfig: dyn}
+			require.Equal(t, tt.want, p.getSharedNUMABindingCPUIncrRatio())
+		})
+	}
+}
+
 func (s *applyPoolsCommitGuardState) SetPodEntries(entries state.PodEntries, persist bool) error {
 	s.setPodEntriesCalls++
 	return s.State.SetPodEntries(entries, persist)
@@ -3063,6 +3112,7 @@ func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorRejectsPinnedSNBPoolShrinkA
 		[]*state.AllocationInfo{allocation},
 		quantities,
 		p.getContainerRequestedCores,
+		cpuconsts.CPUIncrRatioSharedCoresNUMABinding,
 	))
 	specifiedPoolName, err := allocation.GetSpecifiedNUMABindingPoolName()
 	require.NoError(t, err)
@@ -3081,6 +3131,7 @@ func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorRejectsPinnedSNBPoolShrinkA
 		[]*state.AllocationInfo{alreadyWrapped},
 		alreadyWrappedQuantities,
 		p.getContainerRequestedCores,
+		cpuconsts.CPUIncrRatioSharedCoresNUMABinding,
 	))
 	require.Equal(t, map[string]map[int]int{
 		pinnedPoolName: {0: 4},
@@ -3157,6 +3208,7 @@ func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorRejectsBareOwnedPinnedSNBPo
 		[]*state.AllocationInfo{allocation},
 		quantities,
 		p.getContainerRequestedCores,
+		cpuconsts.CPUIncrRatioSharedCoresNUMABinding,
 	))
 	pinnedPoolName := rputil.WrapOwnerPoolName(allocation.OwnerPoolName, resourcePackageName)
 	require.Equal(t, map[string]map[int]int{
@@ -3361,7 +3413,7 @@ func TestAllocateSharedNUMABindingRampUpRejectsLateHardFloorAtomically(t *testin
 	resp, err := p.Allocate(context.Background(), req)
 	require.Nil(t, resp)
 	require.ErrorContains(t, err,
-		`insufficient capacity for owned pool "share-numa1" in numa 1: requested 4 cpus, allocated 0`)
+		`insufficient capacity for owned pool "share-numa1" in numa 1: requested 2 cpus, allocated 0`)
 	require.Equal(t, strings.ToLower(err.Error()), err.Error())
 	require.Equal(t, initialEntries, p.state.GetPodEntries())
 	require.Equal(t, initialMachineState, p.state.GetMachineState())

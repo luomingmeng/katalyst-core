@@ -1550,6 +1550,7 @@ func (p *DynamicPolicy) putAllocationsAndAdjustAllocationEntriesResizeAwareAtRev
 
 	machineState := p.state.GetMachineState()
 	numaResourcePackagePinnedCPUSet := machineState.GetNUMAResourcePackagePinnedCPUSet()
+	sharedNUMABindingCPUIncrRatio := p.getSharedNUMABindingCPUIncrRatio()
 
 	var poolsQuantityMap map[string]map[int]int
 	if p.enableCPUAdvisor &&
@@ -1582,7 +1583,13 @@ func (p *DynamicPolicy) putAllocationsAndAdjustAllocationEntriesResizeAwareAtRev
 				return fmt.Errorf("pool %s cross NUMA: %+v", poolName, poolsQuantityMap[poolName])
 			}
 		} else if incrByReq {
-			err := state.CountAllocationInfosToPoolsQuantityMap(numaResourcePackagePinnedCPUSet, allocationInfos, poolsQuantityMap, p.getContainerRequestedCores)
+			err := state.CountAllocationInfosToPoolsQuantityMap(
+				numaResourcePackagePinnedCPUSet,
+				allocationInfos,
+				poolsQuantityMap,
+				p.getContainerRequestedCores,
+				sharedNUMABindingCPUIncrRatio,
+			)
 			if err != nil {
 				return fmt.Errorf("CountAllocationInfosToPoolsQuantityMap failed with error: %v", err)
 			}
@@ -1590,7 +1597,13 @@ func (p *DynamicPolicy) putAllocationsAndAdjustAllocationEntriesResizeAwareAtRev
 	} else {
 		// else we do sum(containers req) for each pool to get pools ratio
 		var err error
-		poolsQuantityMap, err = state.GetSharedQuantityMapFromPodEntries(numaResourcePackagePinnedCPUSet, entries, allocationInfos, p.getContainerRequestedCores)
+		poolsQuantityMap, err = state.GetSharedQuantityMapFromPodEntries(
+			numaResourcePackagePinnedCPUSet,
+			entries,
+			allocationInfos,
+			p.getContainerRequestedCores,
+			sharedNUMABindingCPUIncrRatio,
+		)
 		if err != nil {
 			return fmt.Errorf("GetSharedQuantityMapFromPodEntries failed with error: %v", err)
 		}
@@ -1601,7 +1614,13 @@ func (p *DynamicPolicy) putAllocationsAndAdjustAllocationEntriesResizeAwareAtRev
 					allocationInfos[0].PodNamespace, allocationInfos[0].PodName, allocationInfos[0].ContainerName)
 			}
 			// if advisor is disabled, qrm can re-calc the pool size exactly. we don't need to adjust the pool size.
-			cErr := state.CountAllocationInfosToPoolsQuantityMap(numaResourcePackagePinnedCPUSet, allocationInfos, poolsQuantityMap, p.getContainerRequestedCores)
+			cErr := state.CountAllocationInfosToPoolsQuantityMap(
+				numaResourcePackagePinnedCPUSet,
+				allocationInfos,
+				poolsQuantityMap,
+				p.getContainerRequestedCores,
+				sharedNUMABindingCPUIncrRatio,
+			)
 			if cErr != nil {
 				return fmt.Errorf("CountAllocationInfosToPoolsQuantityMap failed with error: %v", cErr)
 			}
@@ -1862,6 +1881,7 @@ func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloorForModeAtRevisionW
 	// else we do sum(containers req) for each pool to get pools ratio
 	var poolsQuantityMap map[string]map[int]int
 	dynamicConfig := p.dynamicConfig.GetDynamicConfiguration()
+	sharedNUMABindingCPUIncrRatio := getSharedNUMABindingCPUIncrRatioWithConfig(dynamicConfig)
 	advisorHealthy := p.enableCPUAdvisor && p.advisorMonitor != nil &&
 		!cpuutil.AdvisorDegradation(p.advisorMonitor.GetHealthy(), dynamicConfig.EnableReclaim)
 	if dynamicConfig.FillDefaultSharePoolWithNonReclaimCPUs &&
@@ -1876,7 +1896,13 @@ func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloorForModeAtRevisionW
 		poolsQuantityMap = machine.ParseCPUAssignmentQuantityMap(poolsCPUSetMap)
 	} else {
 		var err error
-		poolsQuantityMap, err = state.GetSharedQuantityMapFromPodEntries(machineState.GetNUMAResourcePackagePinnedCPUSet(), entries, nil, p.getContainerRequestedCores)
+		poolsQuantityMap, err = state.GetSharedQuantityMapFromPodEntries(
+			machineState.GetNUMAResourcePackagePinnedCPUSet(),
+			entries,
+			nil,
+			p.getContainerRequestedCores,
+			sharedNUMABindingCPUIncrRatio,
+		)
 		if err != nil {
 			return fmt.Errorf("GetSharedQuantityMapFromPodEntries failed with error: %v", err)
 		}
@@ -3973,6 +3999,21 @@ func (p *DynamicPolicy) isRampUpReclaimHardPartitionEnabled() bool {
 
 func isRampUpReclaimHardPartitionEnabledWithConfig(dyn *dynamicconfig.Configuration) bool {
 	return dyn != nil && dyn.EnableReclaim && dyn.EnableRampUpReclaimHardPartition
+}
+
+func (p *DynamicPolicy) getSharedNUMABindingCPUIncrRatio() float64 {
+	var dyn *dynamicconfig.Configuration
+	if p != nil && p.dynamicConfig != nil {
+		dyn = p.dynamicConfig.GetDynamicConfiguration()
+	}
+	return getSharedNUMABindingCPUIncrRatioWithConfig(dyn)
+}
+
+func getSharedNUMABindingCPUIncrRatioWithConfig(dyn *dynamicconfig.Configuration) float64 {
+	if isRampUpReclaimHardPartitionEnabledWithConfig(dyn) {
+		return cpuconsts.CPUIncrRatioDefault
+	}
+	return cpuconsts.CPUIncrRatioSharedCoresNUMABinding
 }
 
 // isReclaimEnabled reports the node-level reclaim switch from dynamic config.
