@@ -80,6 +80,12 @@ type frozenOperationPreflight struct {
 	after          frozenOperationState
 	parentIdentity CgroupIdentity
 	children       stableLiveChildren
+	snapshot       *CompleteSnapshot
+}
+
+type frozenGrowRevalidation struct {
+	dag      *TopoDAG
+	boundary FrozenBoundary
 }
 
 // frozenInitialSnapshotDriftError carries the fresh snapshot that invalidated a
@@ -347,6 +353,7 @@ func (w safeCPSetWriter) preflightFrozenTraceOperations(
 				}
 				parentIdentity = parent.Identity
 			}
+			beforeSnapshot := CloneCompleteSnapshot(projection.snapshot)
 			if err := projection.applyOperation(operation); err != nil {
 				return nil, fmt.Errorf(
 					"preflight frozen phase trace operation %d/%d: %w",
@@ -359,6 +366,7 @@ func (w safeCPSetWriter) preflightFrozenTraceOperations(
 				after:          freezeOperationState(after),
 				parentIdentity: parentIdentity,
 				children:       children,
+				snapshot:       beforeSnapshot,
 			})
 		}
 	}
@@ -486,7 +494,8 @@ func (r *coordinatorRound) executeFrozenTrace(
 			res.Attempted++
 			applied, applyErr := writer.applyFrozenOperation(
 				ctx, phase.Kind, operationIndex, operation,
-				preflight[operationIndex], stack, ticket, frozen.TraceID)
+				preflight[operationIndex], stack, ticket, frozen.TraceID,
+				frozenGrowRevalidation{dag: r.dag, boundary: frozen.FrozenBoundary})
 			operationIndex++
 			if applied.PlanID != "" {
 				res.Journal = append(res.Journal, applied)
@@ -602,6 +611,7 @@ func (w safeCPSetWriter) applyFrozenOperation(
 	stack *traceMutationStack,
 	ticket *ExecutionReservationTicket,
 	traceID string,
+	growRevalidation ...frozenGrowRevalidation,
 ) (AppliedPlanOperation, error) {
 	if err := ctx.Err(); err != nil {
 		return AppliedPlanOperation{}, err
@@ -616,6 +626,17 @@ func (w safeCPSetWriter) applyFrozenOperation(
 	}
 	if alreadyAtTarget {
 		return w.readAfterWrite(ctx, operation)
+	}
+	if operation.Direction == WriteGrow && len(growRevalidation) > 0 {
+		revalidation := growRevalidation[0]
+		if _, err := EvaluateFrozenBoundary(
+			ctx, w.driver, revalidation.dag, w.budget,
+			revalidation.boundary, preflight.snapshot,
+		); err != nil {
+			return AppliedPlanOperation{}, fmt.Errorf(
+				"revalidate frozen relevant holders before grow %q: %w",
+				operation.Rel, err)
+		}
 	}
 
 	if operation.WriteMems && operation.ExpectedCurrent.Mems != operation.Target.Mems {

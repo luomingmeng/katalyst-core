@@ -181,6 +181,25 @@ func TestTracePreflightRejectsGrowNewRelevantCPUHolderWithoutWrites(t *testing.T
 	require.Equal(t, initialState, fixture.driver.snapshot())
 }
 
+func TestFrozenTraceRevalidatesRelevantHoldersBeforeEveryGrowWrite(t *testing.T) {
+	trace, live := compiledTraceWithCPUAndMemoryWrites(t)
+	live.invariants = nil
+	grow := traceOperationByDirection(t, trace, WriteGrow)
+	added := grow.Target.CPUs.Difference(grow.ExpectedCurrent.CPUs)
+	require.False(t, added.IsEmpty())
+	driver := newPostPreflightRelevantHolderDriver(live, trace.InitialSnapshot, grow, added)
+	round := frozenExecutionRound(t, trace, driver)
+	ticket := reserveTraceWithBudget(t, round.budget, trace)
+	res := &ConvergenceResult{}
+
+	_, err := round.executeFrozenTrace(context.Background(), trace, ticket, res)
+
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	require.True(t, driver.injected)
+	require.Zero(t, driver.growWrites,
+		"a relevant holder created after preflight must block the grow before any grow write")
+}
+
 func traceOperationByDirection(
 	t *testing.T,
 	trace *CompiledPhaseTrace,
@@ -1654,6 +1673,114 @@ type frozenPredecessorDriftDriver struct {
 	mutate                   func(*fakeHierarchyDriver, PlanOperation)
 	drifted                  bool
 	writesToDriftedOperation int
+}
+
+type postPreflightRelevantHolderDriver struct {
+	HierarchyDriver
+	live              *fakeHierarchyDriver
+	initialRels       map[string]struct{}
+	preflightSeen     map[string]struct{}
+	preflightComplete bool
+	grow              PlanOperation
+	added             machine.CPUSet
+	injected          bool
+	growWrites        int
+}
+
+func newPostPreflightRelevantHolderDriver(
+	live *fakeHierarchyDriver,
+	initial *CompleteSnapshot,
+	grow PlanOperation,
+	added machine.CPUSet,
+) *postPreflightRelevantHolderDriver {
+	rels := make(map[string]struct{}, len(initial.Entries))
+	for rel := range initial.Entries {
+		rels[rel] = struct{}{}
+	}
+	return &postPreflightRelevantHolderDriver{
+		HierarchyDriver: live,
+		live:            live,
+		initialRels:     rels,
+		preflightSeen:   make(map[string]struct{}, len(rels)),
+		grow:            grow,
+		added:           added.Clone(),
+	}
+}
+
+func (d *postPreflightRelevantHolderDriver) ReadEntry(
+	ctx context.Context,
+	rel string,
+) (EntryState, error) {
+	if !d.preflightComplete {
+		if _, expected := d.initialRels[rel]; expected {
+			d.preflightSeen[rel] = struct{}{}
+			if len(d.preflightSeen) == len(d.initialRels) {
+				d.preflightComplete = true
+			}
+		}
+		return d.HierarchyDriver.ReadEntry(ctx, rel)
+	}
+	if !d.injected && rel == d.grow.Rel {
+		parentRel := ""
+		growDomain := d.grow.Rel
+		if d.grow.ParentRel != "" {
+			growDomain = d.grow.ParentRel
+		}
+		for candidate, domain := range d.liveSnapshotDomains() {
+			if domain != d.liveSnapshotDomains()[growDomain] {
+				parentRel = candidate
+				break
+			}
+		}
+		if parentRel == "" {
+			parentRel = d.grow.Rel
+		}
+		d.live.add(filepath.Join(parentRel, "post-preflight-holder"),
+			CgroupIdentity{Device: 99, Inode: 99}, d.added.String(), "0")
+		d.injected = true
+	}
+	return d.HierarchyDriver.ReadEntry(ctx, rel)
+}
+
+func (d *postPreflightRelevantHolderDriver) liveSnapshotDomains() map[string]DomainID {
+	domains := make(map[string]DomainID)
+	for rel := range d.live.nodes {
+		for ancestor := rel; ancestor != "." && ancestor != ""; ancestor = filepath.Dir(ancestor) {
+			if ancestor == "kubepods" {
+				domains[rel] = DomainPrimary
+				break
+			}
+			if ancestor == "tiger" {
+				domains[rel] = DomainReclaim
+				break
+			}
+		}
+	}
+	return domains
+}
+
+func (d *postPreflightRelevantHolderDriver) WriteCPUs(
+	ctx context.Context,
+	rel string,
+	identity CgroupIdentity,
+	cpus machine.CPUSet,
+) error {
+	if rel == d.grow.Rel {
+		d.growWrites++
+	}
+	return d.HierarchyDriver.WriteCPUs(ctx, rel, identity, cpus)
+}
+
+func (d *postPreflightRelevantHolderDriver) WriteMems(
+	ctx context.Context,
+	rel string,
+	identity CgroupIdentity,
+	mems string,
+) error {
+	if rel == d.grow.Rel {
+		d.growWrites++
+	}
+	return d.HierarchyDriver.WriteMems(ctx, rel, identity, mems)
 }
 
 func selectTraceOperation(
