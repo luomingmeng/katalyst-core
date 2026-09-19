@@ -148,9 +148,9 @@ type snapshotBuilder struct {
 	budget     *BudgetTracker
 	snapshot   *CompleteSnapshot
 	controlled map[string]*TopoNode
+	selected   map[string]struct{}
 	boundaries map[string]struct{}
 	retirable  map[string]CgroupIdentity
-	retired    map[string]struct{}
 }
 
 // BuildCompleteSnapshot returns either complete purpose-scoped evidence or a
@@ -211,9 +211,9 @@ func buildCompleteSnapshotWithBoundary(
 		driver:     driver,
 		budget:     budget,
 		controlled: make(map[string]*TopoNode, len(dag.index)),
+		selected:   make(map[string]struct{}, len(boundary.Roots)),
 		boundaries: boundaries,
 		retirable:  retirable,
-		retired:    make(map[string]struct{}),
 		snapshot: &CompleteSnapshot{
 			CapturedAt:          time.Now(),
 			Capabilities:        driver.Capabilities(),
@@ -230,6 +230,9 @@ func buildCompleteSnapshotWithBoundary(
 	}
 	for rel, node := range dag.index {
 		builder.controlled[rel] = node
+	}
+	for _, rel := range boundary.Roots {
+		builder.selected[rel] = struct{}{}
 	}
 	for _, rel := range boundary.Roots {
 		node := dag.index[rel]
@@ -305,8 +308,7 @@ func (b *snapshotBuilder) scan(
 	before, err := b.driver.StatIdentity(b.ctx, rel)
 	if err != nil {
 		if b.authorizedRetirement(rel, expected, err) {
-			b.retireSubtree(rel)
-			return true, nil
+			return b.confirmEarlyRetirement(rel, expected, err)
 		}
 		return false, b.fail(HierarchyOperationStat, rel, expected, err)
 	}
@@ -319,8 +321,7 @@ func (b *snapshotBuilder) scan(
 	entry, err := b.driver.ReadEntry(b.ctx, rel)
 	if err != nil {
 		if b.authorizedRetirement(rel, before, err) {
-			b.retireSubtree(rel)
-			return true, nil
+			return b.confirmEarlyRetirement(rel, before, err)
 		}
 		if b.shouldSkipUnavailableController(rel, depth, err) {
 			b.snapshot.UnavailableChildren[rel] = UnavailableChildEvidence{
@@ -334,8 +335,7 @@ func (b *snapshotBuilder) scan(
 	after, err := b.driver.StatIdentity(b.ctx, rel)
 	if err != nil {
 		if b.authorizedRetirement(rel, before, err) {
-			b.retireSubtree(rel)
-			return true, nil
+			return b.confirmEarlyRetirement(rel, before, err)
 		}
 		return false, b.fail(HierarchyOperationStat, rel, before, err)
 	}
@@ -348,7 +348,7 @@ func (b *snapshotBuilder) scan(
 	b.snapshot.Entries[rel] = entry
 	b.snapshot.DomainByRel[rel] = domain
 
-	if !expand && !immediateOnly {
+	if !expand && !immediateOnly && !b.hasSelectedControlledChild(rel) {
 		return false, nil
 	}
 	children, err := b.driver.ListChildren(b.ctx, rel)
@@ -366,16 +366,22 @@ func (b *snapshotBuilder) scan(
 	}
 	sort.Slice(children, func(i, j int) bool { return children[i].Name < children[j].Name })
 	retainedChildren := make([]ChildRef, 0, len(children))
+	scannedChildren := make([]ChildRef, 0, len(children))
+	childRetired := false
 	b.snapshot.ScanBoundary.ExpandedRels = append(b.snapshot.ScanBoundary.ExpandedRels, rel)
 	for _, child := range children {
 		childRel := filepath.Join(rel, child.Name)
 		if withinTraversalBoundary(childRel, b.boundaries) {
-			retainedChildren = append(retainedChildren, child)
 			continue
 		}
 		childNode, isControlled := b.controlled[childRel]
 		if isControlled && !immediateOnly {
-			retainedChildren = append(retainedChildren, child)
+			if _, selected := b.selected[childRel]; selected {
+				retainedChildren = append(retainedChildren, child)
+			}
+			continue
+		}
+		if !expand && !immediateOnly {
 			continue
 		}
 		childDomain := domain
@@ -383,8 +389,11 @@ func (b *snapshotBuilder) scan(
 			childDomain = childNode.Domain
 		}
 		childExpand := expand && !immediateOnly
-		childRetired, scanErr := b.scan(childRel, childDomain, depth+1, child.Identity, childExpand, false)
+		retiredChild, scanErr := b.scan(childRel, childDomain, depth+1, child.Identity, childExpand, false)
 		if scanErr != nil {
+			if !isCgroupPathAbsent(scanErr) {
+				return false, scanErr
+			}
 			retired, confirmErr := b.confirmRetirement(rel, entry.Identity)
 			if confirmErr != nil {
 				return false, confirmErr
@@ -394,8 +403,36 @@ func (b *snapshotBuilder) scan(
 			}
 			return false, scanErr
 		}
-		if !childRetired {
+		if !retiredChild {
 			retainedChildren = append(retainedChildren, child)
+			scannedChildren = append(scannedChildren, child)
+		} else {
+			childRetired = true
+		}
+	}
+	if childRetired {
+		currentChildren, listErr := b.driver.ListChildren(b.ctx, rel)
+		if listErr != nil {
+			if isCgroupPathAbsent(listErr) {
+				retired, confirmErr := b.confirmRetirement(rel, entry.Identity)
+				if confirmErr != nil {
+					return false, confirmErr
+				}
+				if retired {
+					return true, nil
+				}
+			}
+			return false, b.fail(HierarchyOperationList, rel, entry.Identity, listErr)
+		}
+		currentChildren = b.filterRecursivelyScannedChildren(
+			rel, currentChildren, expand, immediateOnly)
+		sort.Slice(currentChildren, func(i, j int) bool {
+			return currentChildren[i].Name < currentChildren[j].Name
+		})
+		if !equalChildRefs(scannedChildren, currentChildren) {
+			return false, b.fail(HierarchyOperationList, rel, entry.Identity, fmt.Errorf(
+				"%w: children changed after retirement: expected=%v current=%v",
+				ErrCgroupIdentityChanged, scannedChildren, currentChildren))
 		}
 	}
 	b.snapshot.Children[rel] = retainedChildren
@@ -407,10 +444,61 @@ func (b *snapshotBuilder) scan(
 	return retired, nil
 }
 
+func (b *snapshotBuilder) filterRecursivelyScannedChildren(
+	parentRel string,
+	children []ChildRef,
+	expand bool,
+	immediateOnly bool,
+) []ChildRef {
+	inScope := make([]ChildRef, 0, len(children))
+	for _, child := range children {
+		childRel := filepath.Join(parentRel, child.Name)
+		if withinTraversalBoundary(childRel, b.boundaries) {
+			continue
+		}
+		if _, isControlled := b.controlled[childRel]; isControlled && !immediateOnly {
+			continue
+		}
+		if !expand && !immediateOnly {
+			continue
+		}
+		inScope = append(inScope, child)
+	}
+	return inScope
+}
+
+func (b *snapshotBuilder) hasSelectedControlledChild(rel string) bool {
+	for selectedRel := range b.selected {
+		node := b.controlled[selectedRel]
+		if node != nil && node.parent != nil && node.parent.Rel == rel {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *snapshotBuilder) authorizedRetirement(rel string, identity CgroupIdentity, err error) bool {
 	return identity != (CgroupIdentity{}) &&
 		b.retirable[rel] == identity &&
 		isCgroupPathAbsent(err)
+}
+
+func (b *snapshotBuilder) confirmEarlyRetirement(
+	rel string,
+	identity CgroupIdentity,
+	absenceErr error,
+) (bool, error) {
+	current, err := b.driver.StatIdentity(b.ctx, rel)
+	if err != nil {
+		if b.authorizedRetirement(rel, identity, err) {
+			b.retireSubtree(rel)
+			return true, nil
+		}
+		return false, b.fail(HierarchyOperationStat, rel, identity, err)
+	}
+	return false, b.fail(HierarchyOperationStat, rel, current, fmt.Errorf(
+		"%w: rel=%q appeared after absence (%v): expected=%v current=%v",
+		ErrCgroupIdentityChanged, rel, absenceErr, identity, current))
 }
 
 func (b *snapshotBuilder) confirmRetirement(rel string, identity CgroupIdentity) (bool, error) {
@@ -430,7 +518,6 @@ func (b *snapshotBuilder) confirmRetirement(rel string, identity CgroupIdentity)
 }
 
 func (b *snapshotBuilder) retireSubtree(rel string) {
-	b.retired[rel] = struct{}{}
 	prefix := rel + "/"
 	underRetiredRoot := func(candidate string) bool {
 		return candidate == rel || strings.HasPrefix(candidate, prefix)
@@ -439,6 +526,11 @@ func (b *snapshotBuilder) retireSubtree(rel string) {
 		if underRetiredRoot(candidate) {
 			delete(b.snapshot.Entries, candidate)
 			delete(b.snapshot.DomainByRel, candidate)
+			delete(b.snapshot.UnavailableChildren, candidate)
+		}
+	}
+	for candidate := range b.snapshot.UnavailableChildren {
+		if underRetiredRoot(candidate) {
 			delete(b.snapshot.UnavailableChildren, candidate)
 		}
 	}
@@ -476,9 +568,7 @@ func isCgroupPathAbsent(err error) bool {
 	if err == nil || errors.Is(err, ErrCgroupControllerUnavailable) {
 		return false
 	}
-	return errors.Is(err, syscall.ENOENT) ||
-		errors.Is(err, syscall.ENOTDIR) ||
-		errors.Is(err, syscall.ENODEV)
+	return errors.Is(err, syscall.ENOENT)
 }
 
 func (b *snapshotBuilder) shouldSkipUnavailableController(rel string, depth int, err error) bool {

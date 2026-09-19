@@ -283,6 +283,14 @@ func TestSnapshotRetirementRejectsPermissionError(t *testing.T) {
 	assertSnapshotRetirementRejectsError(t, syscall.EACCES)
 }
 
+func TestSnapshotRetirementRejectsENOTDIRAndENODEV(t *testing.T) {
+	for _, err := range []error{syscall.ENOTDIR, syscall.ENODEV} {
+		t.Run(err.Error(), func(t *testing.T) {
+			assertSnapshotRetirementRejectsError(t, err)
+		})
+	}
+}
+
 func TestSnapshotRetirementRejectsIOError(t *testing.T) {
 	assertSnapshotRetirementRejectsError(t, syscall.EIO)
 }
@@ -297,6 +305,231 @@ func TestSnapshotRetirementRejectsBudgetError(t *testing.T) {
 
 func TestSnapshotRetirementRejectsTextError(t *testing.T) {
 	assertSnapshotRetirementRejectsError(t, errors.New("read cpuset.cpus: no such file or directory"))
+}
+
+func TestSnapshotDoesNotSwallowChildNonAbsenceErrorWhenParentThenRetires(t *testing.T) {
+	fake := buildSnapshotTestHierarchy()
+	parentRel := "primary/pod-a"
+	parentIdentity := fake.nodes[parentRel].identity
+	injected := fmt.Errorf("read child state: %w", syscall.EIO)
+	fake.beforeCall = func(op HierarchyOperation, rel string) error {
+		if op == HierarchyOperationRead && rel == parentRel+"/container-a" {
+			delete(fake.nodes, parentRel+"/container-a")
+			delete(fake.nodes, parentRel)
+			return injected
+		}
+		return nil
+	}
+
+	snapshot, err := buildCompleteSnapshot(
+		context.Background(), fake, buildSnapshotTestDAG(t),
+		SnapshotRequest{Purpose: ScanForPlan, AffectedRels: []string{"primary"}},
+		NewBudgetTracker(ConvergenceBudget{}), nil,
+		map[string]CgroupIdentity{parentRel: parentIdentity},
+	)
+
+	require.Nil(t, snapshot)
+	require.ErrorIs(t, err, syscall.EIO)
+	var snapshotErr *SnapshotError
+	require.ErrorAs(t, err, &snapshotErr)
+	require.Equal(t, HierarchyOperationRead, snapshotErr.Operation)
+	require.Equal(t, parentRel+"/container-a", snapshotErr.Rel)
+}
+
+func TestSnapshotAuthorizedListAbsencePreservesErrorWhenParentStillPresent(t *testing.T) {
+	fake := buildSnapshotTestHierarchy()
+	parentRel := "primary/pod-a"
+	parentIdentity := fake.nodes[parentRel].identity
+	fake.beforeCall = func(op HierarchyOperation, rel string) error {
+		if op == HierarchyOperationList && rel == parentRel {
+			return syscall.ENOENT
+		}
+		return nil
+	}
+
+	snapshot, err := buildCompleteSnapshot(
+		context.Background(), fake, buildSnapshotTestDAG(t),
+		SnapshotRequest{Purpose: ScanForPlan, AffectedRels: []string{"primary"}},
+		NewBudgetTracker(ConvergenceBudget{}), nil,
+		map[string]CgroupIdentity{parentRel: parentIdentity},
+	)
+
+	require.Nil(t, snapshot)
+	require.ErrorIs(t, err, syscall.ENOENT)
+	var snapshotErr *SnapshotError
+	require.ErrorAs(t, err, &snapshotErr)
+	require.Equal(t, HierarchyOperationList, snapshotErr.Operation)
+	require.Equal(t, parentRel, snapshotErr.Rel)
+}
+
+func TestSnapshotAuthorizedListAbsenceRejectsReplacement(t *testing.T) {
+	fake := buildSnapshotTestHierarchy()
+	parentRel := "primary/pod-a"
+	parentIdentity := fake.nodes[parentRel].identity
+	fake.beforeCall = func(op HierarchyOperation, rel string) error {
+		if op == HierarchyOperationList && rel == parentRel {
+			replacement := *fake.nodes[parentRel]
+			replacement.identity.Inode++
+			fake.nodes[parentRel] = &replacement
+			return syscall.ENOENT
+		}
+		return nil
+	}
+
+	snapshot, err := buildCompleteSnapshot(
+		context.Background(), fake, buildSnapshotTestDAG(t),
+		SnapshotRequest{Purpose: ScanForPlan, AffectedRels: []string{"primary"}},
+		NewBudgetTracker(ConvergenceBudget{}), nil,
+		map[string]CgroupIdentity{parentRel: parentIdentity},
+	)
+
+	require.Nil(t, snapshot)
+	require.ErrorIs(t, err, ErrCgroupIdentityChanged)
+}
+
+func TestSnapshotRetirementOnlyAcceptsENOENT(t *testing.T) {
+	t.Parallel()
+
+	require.True(t, isCgroupPathAbsent(syscall.ENOENT))
+	require.True(t, isCgroupPathAbsent(fmt.Errorf("wrapped: %w", syscall.ENOENT)))
+	require.False(t, isCgroupPathAbsent(syscall.ENOTDIR))
+	require.False(t, isCgroupPathAbsent(syscall.ENODEV))
+}
+
+func TestSnapshotConfirmsEarlyRetirableChildAbsenceAndRejectsReplacement(t *testing.T) {
+	for _, firstFailure := range []HierarchyOperation{
+		HierarchyOperationStat,
+		HierarchyOperationRead,
+	} {
+		t.Run(string(firstFailure), func(t *testing.T) {
+			fake := buildSnapshotTestHierarchy()
+			childRel := "primary/pod-a"
+			oldIdentity := fake.nodes[childRel].identity
+			parentListed := false
+			injected := false
+			fake.beforeCall = func(op HierarchyOperation, rel string) error {
+				if op == HierarchyOperationList && rel == "primary" {
+					parentListed = true
+				}
+				if parentListed && !injected && op == firstFailure && rel == childRel {
+					replacement := *fake.nodes[childRel]
+					replacement.identity.Inode++
+					fake.nodes[childRel] = &replacement
+					injected = true
+					return syscall.ENOENT
+				}
+				return nil
+			}
+
+			snapshot, err := buildCompleteSnapshot(
+				context.Background(), fake, buildSnapshotTestDAG(t),
+				SnapshotRequest{Purpose: ScanForPlan, AffectedRels: []string{"primary"}},
+				NewBudgetTracker(ConvergenceBudget{}), nil,
+				map[string]CgroupIdentity{childRel: oldIdentity},
+			)
+
+			require.Nil(t, snapshot)
+			require.ErrorIs(t, err, ErrCgroupIdentityChanged)
+		})
+	}
+}
+
+func TestSnapshotRechecksParentChildrenAfterChildRetirement(t *testing.T) {
+	for _, mutation := range []string{"same-name replacement", "membership drift"} {
+		t.Run(mutation, func(t *testing.T) {
+			fake := buildSnapshotTestHierarchy()
+			childRel := "primary/pod-a"
+			childIdentity := fake.nodes[childRel].identity
+			parentLists := 0
+			fake.beforeCall = func(op HierarchyOperation, rel string) error {
+				if op == HierarchyOperationList && rel == "primary" {
+					parentLists++
+					if parentLists == 2 {
+						switch mutation {
+						case "same-name replacement":
+							fake.add(childRel, CgroupIdentity{
+								Device: childIdentity.Device,
+								Inode:  childIdentity.Inode + 100,
+							}, "0-3", "0")
+						case "membership drift":
+							fake.add("primary/new-child", CgroupIdentity{
+								Device: 1,
+								Inode:  100,
+							}, "0", "0")
+						}
+					}
+				}
+				if op == HierarchyOperationStat && rel == childRel {
+					delete(fake.nodes, childRel)
+					return syscall.ENOENT
+				}
+				return nil
+			}
+
+			snapshot, err := buildCompleteSnapshot(
+				context.Background(), fake, buildSnapshotTestDAG(t),
+				SnapshotRequest{Purpose: ScanForPlan, AffectedRels: []string{"primary"}},
+				NewBudgetTracker(ConvergenceBudget{}), nil,
+				map[string]CgroupIdentity{childRel: childIdentity},
+			)
+
+			require.Nil(t, snapshot)
+			require.ErrorIs(t, err, ErrCgroupIdentityChanged)
+			require.Equal(t, 2, parentLists)
+		})
+	}
+}
+
+func TestSnapshotParentRelistFiltersOutOfScopeSiblingsAfterChildRetirement(t *testing.T) {
+	tests := []struct {
+		name         string
+		parentRel    string
+		retirableRel string
+		boundaries   map[string]struct{}
+	}{
+		{
+			name:         "controlled sibling",
+			parentRel:    "reclaim",
+			retirableRel: "reclaim/a-retirable",
+		},
+		{
+			name:         "traversal boundary sibling",
+			parentRel:    "primary",
+			retirableRel: "primary/a-retirable",
+			boundaries:   map[string]struct{}{"primary/pod-a": {}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := buildSnapshotTestHierarchy()
+			retirableIdentity := CgroupIdentity{Device: 1, Inode: 100}
+			fake.add(tt.retirableRel, retirableIdentity, "0", "0")
+			parentLists := 0
+			fake.beforeCall = func(op HierarchyOperation, rel string) error {
+				if op == HierarchyOperationList && rel == tt.parentRel {
+					parentLists++
+				}
+				if op == HierarchyOperationStat && rel == tt.retirableRel {
+					delete(fake.nodes, tt.retirableRel)
+					return syscall.ENOENT
+				}
+				return nil
+			}
+
+			snapshot, err := buildCompleteSnapshot(
+				context.Background(), fake, buildSnapshotTestDAG(t),
+				SnapshotRequest{Purpose: ScanForPlan, AffectedRels: []string{tt.parentRel}},
+				NewBudgetTracker(ConvergenceBudget{}), tt.boundaries,
+				map[string]CgroupIdentity{tt.retirableRel: retirableIdentity},
+			)
+
+			require.NoError(t, err)
+			require.NotNil(t, snapshot)
+			require.Equal(t, 2, parentLists)
+			require.NotContains(t, snapshot.Entries, tt.retirableRel)
+			require.Empty(t, snapshot.Children[tt.parentRel])
+		})
+	}
 }
 
 func assertSnapshotRetirementRejectsError(t *testing.T, injected error) {
@@ -383,6 +616,26 @@ func TestSnapshotDoesNotCrossControlledBoundary(t *testing.T) {
 	}
 }
 
+func TestSnapshotPreservesSelectedControlledChildEdge(t *testing.T) {
+	snapshot, err := BuildCompleteSnapshot(
+		context.Background(),
+		buildSnapshotTestHierarchy(),
+		buildSnapshotTestDAG(t),
+		SnapshotRequest{
+			Purpose:      ScanForPlan,
+			AffectedRels: []string{"reclaim/bucket-0"},
+		},
+		NewBudgetTracker(ConvergenceBudget{}),
+	)
+	require.NoError(t, err)
+	require.Contains(t, snapshot.Entries, "reclaim")
+	require.Contains(t, snapshot.Entries, "reclaim/bucket-0")
+	require.Equal(t, []ChildRef{{
+		Name:     "bucket-0",
+		Identity: snapshot.Entries["reclaim/bucket-0"].Identity,
+	}}, snapshot.Children["reclaim"])
+}
+
 func TestSnapshotNodeAndDepthBudgetFailWithoutPartialResult(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -420,6 +673,88 @@ func TestSnapshotHierarchyIOBudgetFailsWithoutPartialResult(t *testing.T) {
 	}
 }
 
+func TestSnapshotStableExpandedNodeUsesFiveHierarchyCalls(t *testing.T) {
+	fake := newFakeHierarchyDriver()
+	fake.add("root", CgroupIdentity{Device: 1, Inode: 1}, "0-1", "0")
+	dag, err := BuildDAG([]NodeSpec{{
+		Rel: "root", Role: TopoNodeRolePrimary, Domain: DomainPrimary,
+		ControlledRoot: true,
+	}})
+	require.NoError(t, err)
+	var calls []HierarchyOperation
+	fake.beforeCall = func(op HierarchyOperation, rel string) error {
+		if rel == "root" {
+			calls = append(calls, op)
+		}
+		return nil
+	}
+
+	_, err = BuildCompleteSnapshot(
+		context.Background(), fake, dag,
+		SnapshotRequest{Purpose: ScanForPlan, AffectedRels: []string{"root"}},
+		NewBudgetTracker(ConvergenceBudget{}),
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, []HierarchyOperation{
+		HierarchyOperationStat,
+		HierarchyOperationRead,
+		HierarchyOperationStat,
+		HierarchyOperationList,
+		HierarchyOperationStat,
+	}, calls)
+}
+
+func TestSnapshotRetireSubtreeRemovesUnavailableOnlyDescendants(t *testing.T) {
+	holderIdentity := CgroupIdentity{Device: 1, Inode: 2}
+	unavailableIdentity := CgroupIdentity{Device: 1, Inode: 3}
+	snapshot := &CompleteSnapshot{
+		Capabilities: v2Capabilities(),
+		Entries: map[string]EntryState{
+			"root": {
+				Rel: "root", Identity: CgroupIdentity{Device: 1, Inode: 1},
+				CPUs: machine.MustParse("0-1"), ConfiguredCPUs: machine.MustParse("0-1"),
+			},
+			"root/holder": {
+				Rel: "root/holder", Identity: holderIdentity,
+				CPUs: machine.NewCPUSet(1), ConfiguredCPUs: machine.NewCPUSet(1),
+			},
+		},
+		Children: map[string][]ChildRef{
+			"root": {{Name: "holder", Identity: holderIdentity}},
+			"root/holder": {{
+				Name: "unavailable", Identity: unavailableIdentity,
+			}},
+		},
+		UnavailableChildren: map[string]UnavailableChildEvidence{
+			"root/holder/unavailable": {
+				Identity: unavailableIdentity,
+				Reason:   UnavailableChildReasonControllerUnavailable,
+			},
+		},
+		DomainByRel: map[string]DomainID{
+			"root": DomainPrimary, "root/holder": DomainPrimary,
+		},
+		DomainUnion: map[DomainID]machine.CPUSet{
+			DomainPrimary: machine.MustParse("0-1"),
+		},
+		ScanBoundary: ScanBoundary{
+			Purpose: ScanForPlan, Roots: []string{"root"},
+			ExpandedRels: []string{"root", "root/holder"},
+		},
+	}
+	require.NoError(t, validateCompleteSnapshotEvidence(snapshot))
+	builder := &snapshotBuilder{
+		snapshot: snapshot,
+	}
+
+	builder.retireSubtree("root/holder")
+	builder.rebuildDomainUnion()
+
+	require.NotContains(t, snapshot.UnavailableChildren, "root/holder/unavailable")
+	require.NoError(t, validateCompleteSnapshotEvidence(snapshot))
+}
+
 func TestSnapshotPrecheckIncludesControlledImmediateChild(t *testing.T) {
 	snapshot, err := BuildCompleteSnapshot(
 		context.Background(),
@@ -437,6 +772,25 @@ func TestSnapshotPrecheckIncludesControlledImmediateChild(t *testing.T) {
 	if _, ok := snapshot.Entries["reclaim/bucket-0/pod-r"]; ok {
 		t.Fatal("precheck snapshot expanded below immediate child")
 	}
+}
+
+func TestSnapshotTraversalBoundaryChildIsExcludedFromChildren(t *testing.T) {
+	snapshot, err := buildCompleteSnapshot(
+		context.Background(),
+		buildSnapshotTestHierarchy(),
+		buildSnapshotTestDAG(t),
+		SnapshotRequest{Purpose: ScanForPlan, AffectedRels: []string{"primary"}},
+		NewBudgetTracker(ConvergenceBudget{}),
+		map[string]struct{}{"primary/pod-a": {}},
+		nil,
+	)
+
+	require.NoError(t, err)
+	require.NotContains(t, snapshot.Entries, "primary/pod-a")
+	require.NotContains(t, snapshot.Children["primary"], ChildRef{
+		Name:     "pod-a",
+		Identity: CgroupIdentity{Device: 1, Inode: 2},
+	})
 }
 
 func TestSnapshotAppliedViewExpandsMismatchOnly(t *testing.T) {

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1892,6 +1893,149 @@ func TestFrozenTraceExecutionPublishesOnlyFreshFinalProof(t *testing.T) {
 	require.Equal(t, res.Applied, len(res.Journal))
 	require.Equal(t, res.Journal, outcome.Journal)
 	require.Zero(t, ticket.consumedRollback.Total())
+}
+
+func TestFrozenTraceAllowsAuthorizedHolderRetirementDuringFinalProof(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	const holder = "kubepods/retiring-holder"
+	fixture.driver.add(holder, CgroupIdentity{Device: 1, Inode: 1000}, "1", "0")
+	fixture.driver.add(holder+"/child", CgroupIdentity{Device: 1, Inode: 1001}, "1", "0")
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+	makeFrozenTraceHolderRetirable(t, trace, holder)
+	require.Contains(t, trace.InitialSnapshot.Entries, holder)
+	require.Contains(t, trace.FrozenBoundary.RelevantCPUHolders, holder)
+	require.Contains(t, trace.FrozenBoundary.RetirableCPUHolders, holder)
+	fixture.driver.invariants = nil
+	retired := false
+	fixture.driver.beforeCall = func(operation HierarchyOperation, rel string) error {
+		if !retired && fixture.driver.PhysicalWriteCount() > 0 &&
+			operation == HierarchyOperationList && rel == holder {
+			deleteFakeHierarchySubtree(fixture.driver, holder)
+			retired = true
+			return syscall.ENOENT
+		}
+		return nil
+	}
+	round := frozenExecutionRound(t, trace, fixture.driver)
+	ticket := reserveTraceWithBudget(t, round.budget, trace)
+	res := &ConvergenceResult{}
+
+	outcome, err := round.executeFrozenTrace(context.Background(), trace, ticket, res)
+
+	require.NoError(t, err)
+	require.True(t, retired, "final proof retirement window was not reached")
+	require.True(t, res.FinalSnapshotCurrent)
+	assertSnapshotExcludesSubtree(t, outcome.Snapshot, holder)
+	assertSnapshotExcludesSubtree(t, res.FinalSnapshot, holder)
+	require.Zero(t, ticket.consumedRollback.Total())
+}
+
+func TestFrozenTraceRequiredHolderRetirementDuringFinalProofRollsBack(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	const holder = "kubepods/required-holder"
+	fixture.driver.add(holder, CgroupIdentity{Device: 1, Inode: 1000}, "1", "0")
+	fixture.requiredByRel[holder] = machine.NewCPUSet(1)
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+	require.Contains(t, trace.InitialSnapshot.Entries, holder)
+	require.Contains(t, trace.FrozenBoundary.RelevantCPUHolders, holder)
+	require.NotContains(t, trace.FrozenBoundary.RetirableCPUHolders, holder)
+	initial := fixture.driver.snapshot()
+	fixture.driver.invariants = nil
+	retired := false
+	fixture.driver.beforeCall = func(operation HierarchyOperation, rel string) error {
+		if !retired && fixture.driver.PhysicalWriteCount() > 0 &&
+			operation == HierarchyOperationList && rel == holder {
+			deleteFakeHierarchySubtree(fixture.driver, holder)
+			retired = true
+			return syscall.ENOENT
+		}
+		return nil
+	}
+	round := frozenExecutionRound(t, trace, fixture.driver)
+	ticket := reserveTraceWithBudget(t, round.budget, trace)
+	res := &ConvergenceResult{FinalSnapshotCurrent: true}
+
+	_, err = round.executeFrozenTrace(context.Background(), trace, ticket, res)
+
+	require.Error(t, err)
+	require.True(t, retired, "final proof retirement window was not reached")
+	require.False(t, res.FinalSnapshotCurrent)
+	require.Positive(t, ticket.consumedRollback.Total())
+	delete(initial, holder)
+	require.Equal(t, initial, fixture.driver.snapshot(),
+		"the complete physical write prefix must be rolled back")
+}
+
+func TestTracePreflightAllowsAuthorizedHolderRetirementWithoutWrites(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	const holder = "kubepods/preflight-retiring-holder"
+	fixture.driver.add(holder, CgroupIdentity{Device: 1, Inode: 1000}, "1", "0")
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+	makeFrozenTraceHolderRetirable(t, trace, holder)
+	require.Contains(t, trace.InitialSnapshot.Entries, holder)
+	require.Contains(t, trace.FrozenBoundary.RelevantCPUHolders, holder)
+	require.Contains(t, trace.FrozenBoundary.RetirableCPUHolders, holder)
+	retired := false
+	fixture.driver.beforeCall = func(operation HierarchyOperation, rel string) error {
+		if !retired && operation == HierarchyOperationList && rel == holder {
+			deleteFakeHierarchySubtree(fixture.driver, holder)
+			retired = true
+			return syscall.ENOENT
+		}
+		return nil
+	}
+
+	err = newTracePreflightWriter(fixture.driver).
+		preflightFrozenTrace(context.Background(), trace)
+
+	require.NoError(t, err)
+	require.True(t, retired, "preflight retirement window was not reached")
+	require.Zero(t, fixture.driver.PhysicalWriteCount())
+}
+
+func deleteFakeHierarchySubtree(driver *fakeHierarchyDriver, rel string) {
+	for candidate := range driver.nodes {
+		if candidate == rel || strings.HasPrefix(candidate, rel+"/") {
+			delete(driver.nodes, candidate)
+		}
+	}
+}
+
+func makeFrozenTraceHolderRetirable(t *testing.T, trace *CompiledPhaseTrace, holder string) {
+	t.Helper()
+	for _, rels := range []map[string]machine.CPUSet{
+		trace.EvaluationInput.TargetByRel,
+		trace.EvaluationInput.ParentSafetyTargetByRel,
+		trace.EvaluationInput.ExpectedByRel,
+		trace.EvaluationInput.RequiredByRel,
+		trace.EvaluationInput.DeferredByRel,
+		trace.EvaluationInput.PendingRequiredByRel,
+	} {
+		for rel := range rels {
+			if rel == holder || strings.HasPrefix(rel, holder+"/") {
+				delete(rels, rel)
+			}
+		}
+	}
+	for rel := range trace.EvaluationInput.DeferredCleanupRels {
+		if rel == holder || strings.HasPrefix(rel, holder+"/") {
+			delete(trace.EvaluationInput.DeferredCleanupRels, rel)
+		}
+	}
+	boundary, err := compileFrozenBoundaryV1(
+		trace.InitialSnapshot, trace.EvaluationInput, trace.Phases)
+	require.NoError(t, err)
+	trace.FrozenBoundary = boundary
+	trace.TraceID = ""
 }
 
 type expectedTraceWrite struct {

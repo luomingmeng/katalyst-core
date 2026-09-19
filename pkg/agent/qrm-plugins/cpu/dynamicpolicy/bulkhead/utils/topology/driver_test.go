@@ -397,6 +397,27 @@ func TestCgroupFSDriverListChildrenSkipsVanishedChild(t *testing.T) {
 	}
 }
 
+func TestCgroupFSDriverListChildrenReportsRequestedParentAbsence(t *testing.T) {
+	root := resolvedPath(t, t.TempDir())
+	parent := filepath.Join(root, "parent")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	driver := newTestCgroupV1Driver(t, root, nil)
+	if err := os.Remove(parent); err != nil {
+		t.Fatal(err)
+	}
+
+	children, err := driver.ListChildren(context.Background(), "parent")
+
+	if children != nil {
+		t.Fatalf("ListChildren() children = %+v, want nil", children)
+	}
+	if !isCgroupPathAbsent(err) {
+		t.Fatalf("ListChildren() error = %v, want typed requested-parent absence", err)
+	}
+}
+
 func TestCgroupFSDriverListChildrenDoesNotSkipPermissionError(t *testing.T) {
 	assertListChildrenDoesNotSkipOpenError(t, syscall.EACCES)
 }

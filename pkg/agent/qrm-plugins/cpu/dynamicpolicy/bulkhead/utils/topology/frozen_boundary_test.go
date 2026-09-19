@@ -528,7 +528,116 @@ func TestEvaluateFrozenBoundaryAllowsMultipleRetirementsWithinOneSnapshot(t *tes
 	require.NoError(t, err)
 	require.NotContains(t, evaluation.Snapshot.Entries, "root/direct/holder")
 	require.NotContains(t, evaluation.Snapshot.Entries, secondRel)
-	require.Equal(t, 1, parentLists)
+	require.Equal(t, 2, parentLists)
+}
+
+func TestProjectFrozenBoundaryRetiresNestedAndSiblingUnavailableOnlyDescendants(t *testing.T) {
+	expected, input, phases := frozenBoundaryFixture()
+	expected.UnavailableChildren = make(map[string]UnavailableChildEvidence)
+	expected.Children["root/direct/unrelated"] = nil
+	secondRel := "root/direct/holder-second"
+	secondIdentity := CgroupIdentity{Device: 1, Inode: 5}
+	expected.Entries[secondRel] = EntryState{
+		Rel: secondRel, Identity: secondIdentity,
+		CPUs: machine.NewCPUSet(2), ConfiguredCPUs: machine.NewCPUSet(2),
+		Mems: "0", ConfiguredMems: "0",
+	}
+	expected.Children["root/direct"] = append(expected.Children["root/direct"], ChildRef{
+		Name: "holder-second", Identity: secondIdentity,
+	})
+	expected.DomainByRel[secondRel] = DomainPrimary
+	expected.ScanBoundary.ExpandedRels = append(expected.ScanBoundary.ExpandedRels, secondRel)
+	for index, holderRel := range []string{"root/direct/holder", secondRel} {
+		unavailableRel := filepath.Join(holderRel, "unavailable")
+		unavailableIdentity := CgroupIdentity{Device: 1, Inode: uint64(10 + index)}
+		expected.Children[holderRel] = []ChildRef{{
+			Name: "unavailable", Identity: unavailableIdentity,
+		}}
+		expected.UnavailableChildren[unavailableRel] = UnavailableChildEvidence{
+			Identity: unavailableIdentity,
+			Reason:   UnavailableChildReasonControllerUnavailable,
+		}
+	}
+	expected.DomainUnion = map[DomainID]machine.CPUSet{
+		DomainPrimary: machine.MustParse("0-3,9"),
+	}
+	expected.ID = fingerprintSnapshot(expected)
+	require.NoError(t, validateCompleteSnapshotEvidence(expected))
+	boundary, err := compileFrozenBoundaryV1(expected, input, phases)
+	require.NoError(t, err)
+	require.ElementsMatch(t,
+		[]string{"root/direct", "root/direct/holder", secondRel},
+		boundary.RetirableCPUHolders)
+
+	current := CloneCompleteSnapshot(expected)
+	for _, holderRel := range []string{"root/direct/holder", secondRel} {
+		delete(current.Entries, holderRel)
+		delete(current.Children, holderRel)
+		delete(current.DomainByRel, holderRel)
+		delete(current.UnavailableChildren, filepath.Join(holderRel, "unavailable"))
+	}
+	current.Children["root/direct"] = []ChildRef{{
+		Name:     "unrelated",
+		Identity: expected.Entries["root/direct/unrelated"].Identity,
+	}}
+	current.ScanBoundary.ExpandedRels = []string{"root", "root/direct", "root/direct/unrelated"}
+	current.DomainUnion = map[DomainID]machine.CPUSet{
+		DomainPrimary: machine.MustParse("0-3,9"),
+	}
+	require.NoError(t, validateCompleteSnapshotEvidence(current))
+
+	projected := projectFrozenBoundarySnapshot(boundary, expected, current)
+
+	require.NoError(t, validateCompleteSnapshotEvidence(projected))
+	assertSnapshotExcludesSubtree(t, projected, "root/direct/holder")
+	assertSnapshotExcludesSubtree(t, projected, secondRel)
+	require.Contains(t, projected.Entries, "root/direct/unrelated")
+}
+
+func TestProjectFrozenBoundaryRetiresOutermostMissingRetirablePath(t *testing.T) {
+	expected, input, phases := frozenBoundaryFixture()
+	boundary, err := compileFrozenBoundaryV1(expected, input, phases)
+	require.NoError(t, err)
+	boundary.RelevantCPUHolders = []string{"root/direct/holder"}
+	boundary.RetirableCPUHolders = []string{"root/direct/holder"}
+	boundary.RelevantHolderPaths = map[string][]FrozenRelIdentity{
+		"root/direct/holder": boundary.RelevantHolderPaths["root/direct/holder"],
+	}
+	require.NoError(t, validateFrozenBoundary(boundary, expected))
+
+	current := CloneCompleteSnapshot(expected)
+	deleteProjectedSubtree(current, "root/direct")
+	current.Children["root"] = nil
+	current.DomainUnion = map[DomainID]machine.CPUSet{
+		DomainPrimary: expected.Entries["root"].CPUs.Clone(),
+	}
+	current.ID = fingerprintSnapshot(current)
+	require.NoError(t, validateCompleteSnapshotEvidence(current))
+
+	projected := projectFrozenBoundarySnapshot(boundary, expected, current)
+
+	require.NoError(t, validateCompleteSnapshotEvidence(projected))
+	assertSnapshotExcludesSubtree(t, projected, "root/direct")
+}
+
+func TestDeleteProjectedSubtreeRemovesExpandedRels(t *testing.T) {
+	snapshot := &CompleteSnapshot{
+		Entries: map[string]EntryState{
+			"root":        {Rel: "root"},
+			"root/gone":   {Rel: "root/gone"},
+			"root/gone/x": {Rel: "root/gone/x"},
+		},
+		Children:            make(map[string][]ChildRef),
+		UnavailableChildren: make(map[string]UnavailableChildEvidence),
+		DomainByRel:         make(map[string]DomainID),
+		ScanBoundary: ScanBoundary{
+			ExpandedRels: []string{"root", "root/gone", "root/gone/x"},
+		},
+	}
+
+	deleteProjectedSubtree(snapshot, "root/gone")
+
+	require.Equal(t, []string{"root"}, snapshot.ScanBoundary.ExpandedRels)
 }
 
 func TestEvaluateFrozenBoundaryDoesNotRetryRetirableHolderIdentityError(t *testing.T) {
@@ -785,6 +894,8 @@ func frozenBoundaryFixture() (*CompleteSnapshot, FrozenCoordinatorEvaluationInpu
 				{Name: "holder", Identity: identities["root/direct/holder"]},
 				{Name: "unrelated", Identity: identities["root/direct/unrelated"]},
 			},
+			"root/direct/holder":    nil,
+			"root/direct/unrelated": nil,
 		},
 		DomainByRel: map[string]DomainID{
 			"root":                  DomainPrimary,
@@ -793,7 +904,7 @@ func frozenBoundaryFixture() (*CompleteSnapshot, FrozenCoordinatorEvaluationInpu
 			"root/direct/unrelated": DomainPrimary,
 		},
 		DomainUnion: map[DomainID]machine.CPUSet{
-			DomainPrimary: machine.MustParse("0-3"),
+			DomainPrimary: machine.MustParse("0-3,9"),
 		},
 		ScanBoundary: ScanBoundary{
 			Purpose: ScanForPlan,
