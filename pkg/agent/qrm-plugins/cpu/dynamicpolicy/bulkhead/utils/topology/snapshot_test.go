@@ -713,12 +713,49 @@ func TestValidateCompleteSnapshotEvidenceRejectsInvalidUnavailableChildProof(t *
 				snapshot.DomainByRel["root/child"] = DomainPrimary
 			},
 		},
+		{
+			name: "dangling child reference",
+			mutate: func(snapshot *CompleteSnapshot) {
+				delete(snapshot.UnavailableChildren, "root/child")
+			},
+		},
+		{
+			name: "child identity mismatch",
+			mutate: func(snapshot *CompleteSnapshot) {
+				delete(snapshot.UnavailableChildren, "root/child")
+				snapshot.Entries["root/child"] = EntryState{
+					Rel: "root/child", Identity: CgroupIdentity{Device: 9, Inode: 9},
+				}
+				snapshot.DomainByRel["root/child"] = DomainPrimary
+			},
+		},
+		{
+			name: "duplicate child name",
+			mutate: func(snapshot *CompleteSnapshot) {
+				snapshot.Children["root"] = append(snapshot.Children["root"], snapshot.Children["root"][0])
+			},
+		},
+		{
+			name: "expanded rel without entry",
+			mutate: func(snapshot *CompleteSnapshot) {
+				snapshot.ScanBoundary.ExpandedRels = append(
+					snapshot.ScanBoundary.ExpandedRels, "root/missing")
+			},
+		},
+		{
+			name: "stale domain union",
+			mutate: func(snapshot *CompleteSnapshot) {
+				snapshot.DomainUnion[DomainPrimary] = machine.NewCPUSet(9)
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			snapshot := CloneCompleteSnapshot(valid)
 			tc.mutate(snapshot)
+			before := fmt.Sprintf("%#v", snapshot)
 			require.Error(t, validateCompleteSnapshotEvidence(snapshot))
+			require.Equal(t, before, fmt.Sprintf("%#v", snapshot), "validation mutated snapshot")
 		})
 	}
 }
