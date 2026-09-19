@@ -63,6 +63,7 @@ var (
 )
 
 var errReclaimClassificationChanged = errors.New("reclaim path classification changed")
+var errPendingPodScopeAmbiguous = errors.New("pending pod scope is ambiguous")
 
 type CPUSetTopologyPlugin struct {
 	cfg                bulkheadconfig.BulkheadConfiguration
@@ -1390,6 +1391,14 @@ type pendingContainerCPUSet struct {
 	CPUs           machine.CPUSet
 	Reason         string
 	NativeQOSClass v1.PodQOSClass
+	ScopeRel       string
+	// Expected marks an admit-window pending entry produced by
+	// buildExpectedCPUSetByRel: the container cgroup is not materialized yet
+	// because the pod is being admitted. For such entries a failed pod-leaf
+	// cgroup path lookup degrades to the controlled primary ancestor scope
+	// instead of rejecting admission. Entries without this mark whose leaf
+	// cannot be resolved fail closed.
+	Expected bool
 }
 
 // expectedCPUSetBuildResult separates resolvable container leaves (ExpectedByRel,
@@ -1459,63 +1468,30 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in 
 			rel, err := bulkheadutils.ResolveContainerRelPathWithContext(ctx, in.MetaServer, podUID, containerName)
 			if err != nil {
 				if isContainerPendingErr(err) {
-					// admit-safe pending: state has the allocation but the container
-					// cgroup does not exist yet. Do NOT fail (that would reject pod
-					// admit); record it so the writer keeps the parent a superset.
+					scopeRel, nativeQOSClass, stale, scopeErr := p.resolvePendingPodScopeFresh(
+						ctx, in.MetaServer, podUID)
+					if scopeErr != nil {
+						errs = append(errs, fmt.Errorf(
+							"resolve pending pod scope: pod=%s container=%s: %w",
+							podUID, containerName, scopeErr))
+						continue
+					}
+					if stale {
+						general.Infof("bulkhead: stale checkpoint allocation skipped from pending protection, pod=%q container=%q cpuset=%s",
+							podUID, containerName, cpus.String())
+						continue
+					}
 					general.InfofV(5, "bulkhead: container rel pending, protecting allocation, pod=%q container=%q cpuset=%s cpuset_size=%d err=%v",
 						podUID, containerName, cpus.String(), cpus.Size(), err)
-					pending := pendingContainerCPUSet{
+					out.PendingByPod = append(out.PendingByPod, pendingContainerCPUSet{
 						PodUID: podUID, ContainerName: containerName, CPUs: cpus, Reason: err.Error(),
-					}
-					if in.State != nil {
-						if allocation := in.State.GetAllocationInfo(podUID, containerName); allocation != nil {
-							pending.NativeQOSClass = v1.PodQOSClass(allocation.NativeQOSClass)
-						}
-					}
-					if isContainerAbsentErr(err) {
-						refreshCtx := context.WithValue(ctx, metapod.BypassCacheKey, metapod.BypassCacheTrue)
-						refreshCtx = context.WithValue(
-							refreshCtx, metapod.StrictBypassCacheKey, metapod.BypassCacheTrue)
-						pod, podErr := in.MetaServer.GetPod(refreshCtx, podUID)
-						switch {
-						case podErr == nil && pod == nil:
-							errs = append(errs, fmt.Errorf(
-								"fresh pod lookup returned nil pod without error: pod=%s container=%s",
-								podUID, containerName))
-							continue
-						case podErr == nil:
-							pending.NativeQOSClass = v1qos.GetPodQOS(pod)
-						case !metapod.IsPodNotFound(podErr):
-							errs = append(errs, fmt.Errorf(
-								"fresh pod lookup failed: pod=%s container=%s: %w",
-								podUID, containerName, podErr))
-							continue
-						default:
-							exists, existsErr := p.pendingPodCgroupExists(ctx, podUID)
-							if existsErr != nil {
-								errs = append(errs, fmt.Errorf(
-									"check pod cgroup after fresh pod not found: pod=%s container=%s: %w",
-									podUID, containerName, existsErr))
-								continue
-							}
-							if !exists {
-								general.Infof("bulkhead: stale checkpoint allocation skipped from pending protection, pod=%q container=%q cpuset=%s",
-									podUID, containerName, cpus.String())
-								continue
-							}
-						}
-					} else if pending.NativeQOSClass == "" {
-						refreshCtx := context.WithValue(ctx, metapod.BypassCacheKey, metapod.BypassCacheTrue)
-						pod, podErr := in.MetaServer.GetPod(refreshCtx, podUID)
-						if podErr == nil && pod != nil {
-							pending.NativeQOSClass = v1qos.GetPodQOS(pod)
-						}
-					}
-					out.PendingByPod = append(out.PendingByPod, pending)
+						NativeQOSClass: nativeQOSClass, ScopeRel: scopeRel, Expected: true,
+					})
 					continue
 				}
-				// A real internal error (illegal rel, cgroup/metaserver failure):
-				// block this round rather than apply a partial/wrong topology.
+				// A real internal error (illegal rel, cgroup/metaserver failure, or a
+				// refresh/transport failure): block this round rather than apply a
+				// partial/wrong topology.
 				errs = append(errs, fmt.Errorf("pod=%s container=%s cpuset=%s: %w",
 					podUID, containerName, cpus.String(), err))
 				continue
@@ -1542,26 +1518,157 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in 
 	return out, nil
 }
 
-func (p *CPUSetTopologyPlugin) pendingPodCgroupExists(
+func (p *CPUSetTopologyPlugin) resolvePendingPodScopeFresh(
+	ctx context.Context,
+	metaServer *metaserver.MetaServer,
+	podUID string,
+) (scopeRel string, qosClass v1.PodQOSClass, stale bool, err error) {
+	refreshCtx := context.WithValue(ctx, metapod.BypassCacheKey, metapod.BypassCacheTrue)
+	refreshCtx = context.WithValue(refreshCtx, metapod.StrictBypassCacheKey, metapod.BypassCacheTrue)
+	pod, podErr := metaServer.GetPod(refreshCtx, podUID)
+	switch {
+	case podErr == nil && pod == nil:
+		return "", "", false, fmt.Errorf("fresh pod lookup returned nil pod without error")
+	case podErr == nil:
+		qosClass = v1qos.GetPodQOS(pod)
+		candidates := p.pendingPodScopeCandidatesForQOS(podUID, qosClass)
+		if len(candidates) == 1 {
+			return strings.Trim(candidates[0], "/"), qosClass, false, nil
+		}
+		// Unknown or non-canonical QoS/root layouts may only use a concrete,
+		// uniquely existing scope; never guess among multiple candidates.
+		scopeRel, stale, err = p.selectConcretePendingPodScope(ctx, podUID, candidates)
+		return scopeRel, qosClass, stale, err
+	case !metapod.IsPodNotFound(podErr):
+		return "", "", false, podErr
+	default:
+		scopeRel, stale, err = p.selectConcretePendingPodScope(
+			ctx, podUID, relativePendingPodScopeCandidates(
+				cgcommon.GetPodRelativeCgroupPathCandidates(podUID)))
+		return scopeRel, "", stale, err
+	}
+}
+
+func relativePendingPodScopeCandidates(candidates []string) []string {
+	out := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		out = append(out, strings.Trim(candidate, "/"))
+	}
+	return out
+}
+
+func (p *CPUSetTopologyPlugin) pendingPodScopeCandidatesForQOS(
+	podUID string,
+	qosClass v1.PodQOSClass,
+) []string {
+	primary := strings.Trim(p.cfg.BulkheadPrimaryRelPath, "/")
+	if primary == "" {
+		return relativePendingPodScopeCandidates(
+			cgcommon.GetPodRelativeCgroupPathCandidatesForQOS(podUID, qosClass))
+	}
+	configured := cgcommon.GetPodRelativeCgroupPathCandidatesForQOS(podUID, qosClass)
+	underPrimary := make([]string, 0, len(configured))
+	for _, candidate := range configured {
+		rel := strings.Trim(candidate, "/")
+		if rel == primary || strings.HasPrefix(rel, primary+"/") {
+			underPrimary = append(underPrimary, rel)
+		}
+	}
+	if len(underPrimary) > 0 {
+		return underPrimary
+	}
+
+	// Custom primary roots are outside the Kubernetes root registry. Preserve
+	// the cgroupfs hierarchy shape relative to that explicitly configured root.
+	podName := cgcommon.PodCgroupPathPrefix + podUID
+	switch qosClass {
+	case v1.PodQOSGuaranteed:
+		return []string{path.Join(primary, podName)}
+	case v1.PodQOSBurstable:
+		return []string{path.Join(primary, "burstable", podName)}
+	case v1.PodQOSBestEffort:
+		return []string{path.Join(primary, "besteffort", podName)}
+	default:
+		return cgcommon.GetPodRelativeCgroupPathCandidates(podUID)
+	}
+}
+
+func (p *CPUSetTopologyPlugin) selectConcretePendingPodScope(
 	ctx context.Context,
 	podUID string,
-) (bool, error) {
+	candidates []string,
+) (string, bool, error) {
 	if p.cgroup == nil {
-		return false, fmt.Errorf("cgroup client is nil")
+		return "", false, fmt.Errorf("cgroup client is nil")
 	}
-	candidates := cgcommon.GetPodRelativeCgroupPathCandidates(podUID)
-	for _, rel := range candidates {
-		rel = strings.Trim(rel, "/")
-		if rel == "" {
+	allowed := p.allowedPendingPodScopeCandidates(podUID)
+	normalized := make([]string, 0, len(candidates))
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		rel, err := normalizePendingPodScopeCandidate(candidate)
+		if err != nil {
+			return "", false, err
+		}
+		if _, ok := allowed[rel]; !ok {
+			return "", false, fmt.Errorf("pending pod scope candidate %q is outside allowed roots", candidate)
+		}
+		if _, ok := seen[rel]; ok {
 			continue
 		}
+		seen[rel] = struct{}{}
+		normalized = append(normalized, rel)
+	}
+
+	var concrete []string
+	for _, rel := range normalized {
 		if _, err := p.cgroup.StatDir(ctx, rel); err == nil {
-			return true, nil
+			concrete = append(concrete, rel)
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return false, fmt.Errorf("stat pod cgroup candidate %q: %w", rel, err)
+			return "", false, err
 		}
 	}
-	return false, nil
+	switch len(concrete) {
+	case 0:
+		return "", true, nil
+	case 1:
+		return concrete[0], false, nil
+	default:
+		return "", false, fmt.Errorf("%w: pod=%q candidates=%v",
+			errPendingPodScopeAmbiguous, podUID, concrete)
+	}
+}
+
+func normalizePendingPodScopeCandidate(candidate string) (string, error) {
+	if candidate == "" || strings.HasPrefix(candidate, "/") {
+		return "", fmt.Errorf("unsafe pending pod scope candidate %q", candidate)
+	}
+	for _, component := range strings.Split(candidate, "/") {
+		if component == "." || component == ".." {
+			return "", fmt.Errorf("unsafe pending pod scope candidate %q", candidate)
+		}
+	}
+	rel := path.Clean(candidate)
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, "../") {
+		return "", fmt.Errorf("unsafe pending pod scope candidate %q", candidate)
+	}
+	return rel, nil
+}
+
+func (p *CPUSetTopologyPlugin) allowedPendingPodScopeCandidates(podUID string) map[string]struct{} {
+	allowed := make(map[string]struct{})
+	add := func(candidates []string) {
+		for _, candidate := range candidates {
+			rel := path.Clean(strings.Trim(candidate, "/"))
+			if rel != "" && rel != "." && rel != ".." && !strings.HasPrefix(rel, "../") {
+				allowed[rel] = struct{}{}
+			}
+		}
+	}
+	add(cgcommon.GetPodRelativeCgroupPathCandidates(podUID))
+	add(p.pendingPodScopeCandidatesForQOS(podUID, v1.PodQOSGuaranteed))
+	add(p.pendingPodScopeCandidatesForQOS(podUID, v1.PodQOSBurstable))
+	add(p.pendingPodScopeCandidatesForQOS(podUID, v1.PodQOSBestEffort))
+	return allowed
 }
 
 func (p *CPUSetTopologyPlugin) reclassifyAdmissionDeferredLeaves(ctx context.Context, view *model.DesiredView, expectedRes *expectedCPUSetBuildResult) {
@@ -1829,6 +1936,12 @@ func (p *CPUSetTopologyPlugin) pendingProtectionScopes(
 			continue
 		}
 		current.CPUs = current.CPUs.Union(pending.CPUs)
+		if current.ScopeRel == "" {
+			current.ScopeRel = pending.ScopeRel
+		} else if pending.ScopeRel != "" && current.ScopeRel != pending.ScopeRel {
+			return nil, fmt.Errorf("%w: pod=%q scopes=%q,%q",
+				errPendingPodScopeAmbiguous, pending.PodUID, current.ScopeRel, pending.ScopeRel)
+		}
 		if current.NativeQOSClass == "" {
 			current.NativeQOSClass = pending.NativeQOSClass
 		}
@@ -1841,7 +1954,10 @@ func (p *CPUSetTopologyPlugin) pendingProtectionScopes(
 		if !ok || !now.Before(protection.protectUntil) {
 			protection.protectUntil = now.Add(defaultPendingPodProtectionTTL)
 		}
-		rel := protection.rel
+		rel := pending.ScopeRel
+		if rel == "" {
+			rel = protection.rel
+		}
 		if rel == "" {
 			var err error
 			candidates := cgcommon.GetPodRelativeCgroupPathCandidatesForQOS(

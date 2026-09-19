@@ -448,6 +448,7 @@ type fakeCgroupClient struct {
 	mems                    map[string]string
 	children                map[string][]string
 	statErrors              map[string]error
+	statCalls               []string
 	requireExistingForApply bool
 	writes                  map[string]string
 	writeOrder              []string
@@ -548,6 +549,7 @@ func pluginFakeIdentity(rel string) topology.CgroupIdentity {
 }
 
 func (f *fakeCgroupClient) StatDir(_ context.Context, rel string) (time.Time, error) {
+	f.statCalls = append(f.statCalls, rel)
 	if err := f.statErrors[rel]; err != nil {
 		return time.Time{}, err
 	}
@@ -3328,8 +3330,11 @@ func TestCPUSetTopologyPluginDropsFreshMissingPodWithoutPodCgroupFromPendingProt
 	}
 
 	res, err := p.buildExpectedCPUSetByRel(context.Background(), bulkheadapi.HandlerContext{
-		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{MetaServer: metaServer},
-		DesiredView:                view,
+		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+			MetaServer: metaServer,
+			Mode:       cpusetutil.CPUSetAdjustmentModeAdmission,
+		},
+		DesiredView: view,
 	})
 	if err != nil {
 		t.Fatalf("fresh missing pod with no pod cgroup must be ignored as stale checkpoint state, got %v", err)
@@ -3354,6 +3359,7 @@ type rotatingContainerIDFetcher struct {
 	metapod.PodFetcherStub
 	containerIDs []string
 	calls        int
+	pod          *v1.Pod
 }
 
 type disappearingContainerIDFetcher struct {
@@ -3473,12 +3479,15 @@ func (f *disappearingContainerIDFetcher) GetContainerIDWithContext(
 	return "", metapod.ErrContainerNotFound
 }
 
-func (f *disappearingContainerIDFetcher) GetPod(ctx context.Context, _ string) (*v1.Pod, error) {
+func (f *disappearingContainerIDFetcher) GetPod(ctx context.Context, podUID string) (*v1.Pod, error) {
 	if ctx.Value(metapod.BypassCacheKey) != metapod.BypassCacheTrue {
 		return nil, errors.New("pod freshness query did not bypass cache")
 	}
 	if ctx.Value(metapod.StrictBypassCacheKey) != metapod.BypassCacheTrue {
 		return nil, errors.New("pod freshness query did not require strict bypass")
+	}
+	if f.pod == nil {
+		return nil, metapod.NewPodNotFoundError(podUID)
 	}
 	return f.pod.DeepCopy(), nil
 }
@@ -3489,6 +3498,17 @@ func (f *rotatingContainerIDFetcher) GetContainerIDWithContext(
 	containerID := f.containerIDs[f.calls]
 	f.calls++
 	return containerID, nil
+}
+
+func (f *rotatingContainerIDFetcher) GetPod(ctx context.Context, podUID string) (*v1.Pod, error) {
+	if ctx.Value(metapod.BypassCacheKey) != metapod.BypassCacheTrue ||
+		ctx.Value(metapod.StrictBypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("pod lookup was not strict fresh")
+	}
+	if f.pod == nil {
+		return nil, metapod.NewPodNotFoundError(podUID)
+	}
+	return f.pod.DeepCopy(), nil
 }
 
 func (f *admissionContextContainerIDFetcher) GetContainerIDWithContext(
@@ -3888,7 +3908,10 @@ func TestCPUSetTopologyPluginTreatsRotatedContainerIdentityAsPending(t *testing.
 			return "", true, nil
 		},
 	})
-	fetcher := &rotatingContainerIDFetcher{containerIDs: []string{oldContainer, newContainer}}
+	fetcher := &rotatingContainerIDFetcher{
+		containerIDs: []string{oldContainer, newContainer},
+		pod:          &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)}},
+	}
 	metaServer := &metaserver.MetaServer{
 		MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
 	}

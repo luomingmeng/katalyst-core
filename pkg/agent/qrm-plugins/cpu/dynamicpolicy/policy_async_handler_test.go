@@ -34,6 +34,7 @@ import (
 	"github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
+	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
@@ -50,6 +51,117 @@ type systemExclusiveCommitFailureState struct {
 	state.State
 	err      error
 	attempts int
+}
+
+func newResidualCleanupLivenessPolicy(t *testing.T) *DynamicPolicy {
+	t.Helper()
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	return p
+}
+
+func TestClearResidualStateProgressingTargetDefersHealthy(t *testing.T) {
+	p := newResidualCleanupLivenessPolicy(t)
+	p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	require.NoError(t, p.clearResidualStateAfterPodList(ctx, nil))
+}
+
+func TestClearResidualStateUnchangedStuckTargetReportsError(t *testing.T) {
+	p := newResidualCleanupLivenessPolicy(t)
+	target := p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+	p.cpuSetAdjustmentRetryMu.Lock()
+	target.lastProgressAt = time.Now().Add(-advisorPostCommitStuckThreshold(p.conf) - time.Second)
+	p.cpuSetAdjustmentRetryMu.Unlock()
+
+	err := p.clearResidualStateAfterPodList(context.Background(), nil)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "stuck")
+}
+
+func TestClearResidualStateAgesResidualOnlyOncePerInvocation(t *testing.T) {
+	p := newResidualCleanupLivenessPolicy(t)
+	const podUID = "residual"
+	p.state.SetPodEntries(state.PodEntries{
+		podUID: {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{PodUid: podUID, ContainerName: "main"},
+			},
+		},
+	}, false)
+	p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	require.NoError(t, p.clearResidualStateAfterPodList(ctx, nil))
+	require.Equal(t, int64(1), p.residualHitMap[podUID])
+}
+
+func TestClearResidualStateTargetChangeWakesBoundedRetry(t *testing.T) {
+	p := newResidualCleanupLivenessPolicy(t)
+	const podUID = "residual-during-target-replacement"
+	p.state.SetPodEntries(state.PodEntries{
+		podUID: {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{PodUid: podUID, ContainerName: "main"},
+			},
+		},
+	}, false)
+	beforeRevision := p.state.GetRevision()
+	beforeEntries := p.state.GetPodEntries()
+	beforeMachineState := p.state.GetMachineState()
+	targetA := p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, beforeRevision)
+	result := make(chan error, 1)
+	go func() {
+		result <- p.clearResidualStateAfterPodList(context.Background(), nil)
+	}()
+
+	require.Eventually(t, func() bool {
+		p.Lock()
+		defer p.Unlock()
+		return p.residualHitMap[podUID] == 1
+	}, time.Second, time.Millisecond, "cleanup did not enter bounded wait for target A")
+
+	targetB := p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, beforeRevision)
+	require.NotSame(t, targetA, targetB)
+
+	select {
+	case err := <-result:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatalf("cleanup did not wake after replacing target revision %d", targetA.revision)
+	}
+	require.Equal(t, beforeRevision, p.state.GetRevision())
+	require.Equal(t, beforeEntries, p.state.GetPodEntries())
+	require.Equal(t, beforeMachineState, p.state.GetMachineState())
+}
+
+func TestClearResidualStateNeverMutatesWhileFenced(t *testing.T) {
+	p := newResidualCleanupLivenessPolicy(t)
+	const podUID = "mature-residual"
+	entries := state.PodEntries{
+		podUID: {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{PodUid: podUID, ContainerName: "main"},
+			},
+		},
+	}
+	p.state.SetPodEntries(entries, false)
+	p.residualHitMap = map[string]int64{
+		podUID: maxResidualTime.Nanoseconds() / stateCheckPeriod.Nanoseconds(),
+	}
+	p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	require.NoError(t, p.clearResidualStateAfterPodList(ctx, nil))
+	require.Contains(t, p.state.GetPodEntries(), podUID)
 }
 
 func (s *systemExclusiveCommitFailureState) CommitAdvisorStateIfRevision(

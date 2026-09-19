@@ -201,7 +201,6 @@ func TestStrictBypassCacheReturnsSyncErrorWithoutStaleFallback(t *testing.T) {
 	ctx = context.WithValue(ctx, StrictBypassCacheKey, BypassCacheTrue)
 
 	_, err := pf.GetPod(ctx, "cached")
-
 	if err != syncErr {
 		t.Fatalf("GetPod() error = %v, want original strict sync error %v", err, syncErr)
 	}
