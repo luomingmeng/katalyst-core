@@ -273,6 +273,9 @@ func (d *cgroupFSDriver) listChildrenWithBudget(ctx context.Context, rel string,
 			}
 			childFD, identity, err := d.openChildDirWithIdentity(dirFD, before.Device, childRel, entry.Name())
 			if err != nil {
+				if isCgroupPathAbsent(err) {
+					continue
+				}
 				return nil, fmt.Errorf("open child %q: %w", childRel, err)
 			}
 			closeErr := unix.Close(childFD)

@@ -365,6 +365,90 @@ func TestCgroupV1DriverUsesNonMountedRootPathForAllHierarchyIO(t *testing.T) {
 	}
 }
 
+func TestCgroupFSDriverListChildrenSkipsVanishedChild(t *testing.T) {
+	root := resolvedPath(t, t.TempDir())
+	parent := filepath.Join(root, "parent")
+	survivor := filepath.Join(parent, "survivor")
+	vanished := filepath.Join(parent, "vanished")
+	for _, path := range []string{survivor, vanished} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	driver := newTestCgroupV1Driver(t, root, nil)
+	wantIdentity := identityFromDirectory(t, survivor)
+	originalOpen := driver.openDirAt
+	driver.openDirAt = func(dirFD int, name string, flags int, mode uint32) (int, error) {
+		if name == "vanished" {
+			if err := os.Remove(vanished); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return -1, err
+			}
+		}
+		return originalOpen(dirFD, name, flags, mode)
+	}
+
+	children, err := driver.ListChildren(context.Background(), "parent")
+
+	if err != nil {
+		t.Fatalf("ListChildren() error = %v", err)
+	}
+	if len(children) != 1 || children[0] != (ChildRef{Name: "survivor", Identity: wantIdentity}) {
+		t.Fatalf("ListChildren() = %+v, want surviving child with identity %v", children, wantIdentity)
+	}
+}
+
+func TestCgroupFSDriverListChildrenDoesNotSkipPermissionError(t *testing.T) {
+	assertListChildrenDoesNotSkipOpenError(t, syscall.EACCES)
+}
+
+func TestCgroupFSDriverListChildrenDoesNotSkipCrossDeviceError(t *testing.T) {
+	assertListChildrenDoesNotSkipOpenError(t, ErrCgroupCrossDevice)
+}
+
+func TestCgroupFSDriverListChildrenDoesNotSkipIdentityError(t *testing.T) {
+	assertListChildrenDoesNotSkipOpenError(t, ErrCgroupIdentityChanged)
+}
+
+func TestCgroupFSDriverListChildrenDoesNotSkipSymlinkError(t *testing.T) {
+	root := resolvedPath(t, t.TempDir())
+	parent := filepath.Join(root, "parent")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(parent, "child")); err != nil {
+		t.Fatal(err)
+	}
+	driver := newTestCgroupV1Driver(t, root, nil)
+
+	_, err := driver.ListChildren(context.Background(), "parent")
+
+	if err == nil || !strings.Contains(err.Error(), "symlink is not allowed") {
+		t.Fatalf("ListChildren() error = %v, want symlink rejection", err)
+	}
+}
+
+func assertListChildrenDoesNotSkipOpenError(t *testing.T, injected error) {
+	t.Helper()
+	root := resolvedPath(t, t.TempDir())
+	if err := os.MkdirAll(filepath.Join(root, "parent", "child"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	driver := newTestCgroupV1Driver(t, root, nil)
+	originalOpen := driver.openDirAt
+	driver.openDirAt = func(dirFD int, name string, flags int, mode uint32) (int, error) {
+		if name == "child" {
+			return -1, injected
+		}
+		return originalOpen(dirFD, name, flags, mode)
+	}
+
+	_, err := driver.ListChildren(context.Background(), "parent")
+
+	if !errors.Is(err, injected) {
+		t.Fatalf("ListChildren() error = %v, want %v", err, injected)
+	}
+}
+
 func TestCgroupV1DriverRejectsPathOutsideRoot(t *testing.T) {
 	parent := t.TempDir()
 	root := filepath.Join(parent, "root")

@@ -158,6 +158,9 @@ func (f *fakeHierarchyDriver) ListChildren(_ context.Context, rel string) ([]Chi
 	if err := f.called(HierarchyOperationList, rel); err != nil {
 		return nil, err
 	}
+	if f.nodes[rel] == nil {
+		return nil, syscall.ENOENT
+	}
 	children := make([]ChildRef, 0)
 	for candidate, node := range f.nodes {
 		if filepath.Dir(candidate) == rel {
@@ -703,6 +706,16 @@ func TestFakeHierarchyCallHookReturnsError(t *testing.T) {
 	}
 	if len(fake.traces) != 0 {
 		t.Fatalf("traces = %v, want none after failed call", fake.traces)
+	}
+}
+
+func TestFakeHierarchyListChildrenMissingParent(t *testing.T) {
+	fake := newFakeHierarchyDriver()
+
+	children, err := fake.ListChildren(context.Background(), "missing")
+
+	if !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("ListChildren() = (%v, %v), want ENOENT", children, err)
 	}
 }
 
