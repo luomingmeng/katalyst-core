@@ -220,17 +220,6 @@ func TestFrozenPreflightOperationHeavyExecutionOverheadRemainsLinear(t *testing.
 		require.NoError(t, err)
 
 		runtime.GC()
-		var projectionBefore, projectionAfter runtime.MemStats
-		runtime.ReadMemStats(&projectionBefore)
-		projection, err := newProjectedHierarchy(trace.InitialSnapshot, trace.Capabilities)
-		require.NoError(t, err)
-		for _, operation := range flattenTraceOperations(trace) {
-			require.NoError(t, projection.applyOperation(operation))
-		}
-		runtime.ReadMemStats(&projectionAfter)
-		projectionAllocations := projectionAfter.Mallocs - projectionBefore.Mallocs
-
-		runtime.GC()
 		var before, after runtime.MemStats
 		runtime.ReadMemStats(&before)
 		writer := newSafeCPUSetWriter(
@@ -242,20 +231,46 @@ func TestFrozenPreflightOperationHeavyExecutionOverheadRemainsLinear(t *testing.
 		require.NoError(t, err)
 		runtime.ReadMemStats(&after)
 		allocations := after.Mallocs - before.Mallocs
-		require.GreaterOrEqual(t, allocations, projectionAllocations)
-		overhead := allocations - projectionAllocations
-		t.Logf("nodes=%d operations=%d reads=%d allocations=%d projection_allocations=%d overhead=%d",
-			nodes, trace.OperationCount(), fixture.driver.readCount(), allocations,
-			projectionAllocations, overhead)
+		t.Logf("nodes=%d operations=%d reads=%d allocations=%d",
+			nodes, trace.OperationCount(), fixture.driver.readCount(), allocations)
 		require.LessOrEqual(t, fixture.driver.readCount(), int64(nodes*8),
 			"operation-heavy preflight hierarchy reads must remain O(N)")
 		if previous != 0 {
-			require.LessOrEqual(t, float64(overhead)/float64(previous),
+			require.LessOrEqual(t, float64(allocations)/float64(previous),
 				10*linearScaleTolerance,
-				"10x more operations must not cause super-linear execution overhead allocations")
+				"10x more operations must not cause super-linear full preflight allocations")
 		}
-		previous = overhead
+		previous = allocations
 	}
+}
+
+func TestFrozenPreflightSettlesEvidenceOncePerCompiledFrontier(t *testing.T) {
+	const nodes = 1000
+	fixture := newOperationHeavyTraceFixture(t, nodes)
+	trace, err := fixture.compile()
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, trace.OperationCount(), nodes-18)
+
+	projection, err := newProjectedHierarchy(trace.InitialSnapshot, trace.Capabilities)
+	require.NoError(t, err)
+	projection.resetEvidenceRebuildCount()
+
+	evidence, err := projectFrozenTraceOperations(trace, projection)
+	require.NoError(t, err)
+	require.Len(t, evidence, trace.OperationCount())
+	require.Equal(t, nonEmptyCompiledPhaseCount(trace), projection.evidenceRebuildCount(),
+		"frozen preflight must settle evidence once per compiled frontier")
+	require.Equal(t, trace.FinalSnapshot.ID, projection.snapshot.ID)
+}
+
+func nonEmptyCompiledPhaseCount(trace *CompiledPhaseTrace) int {
+	count := 0
+	for _, phase := range trace.Phases {
+		if len(phase.Operations) > 0 {
+			count++
+		}
+	}
+	return count
 }
 
 type operationHeavyScaleMeasurement struct {

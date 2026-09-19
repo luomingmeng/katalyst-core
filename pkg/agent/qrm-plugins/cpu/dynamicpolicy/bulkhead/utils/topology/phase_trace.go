@@ -1015,6 +1015,9 @@ func validateFrozenPhaseTrace(trace *CompiledPhaseTrace) error {
 	if err := validateTraceOperations(trace); err != nil {
 		return err
 	}
+	if _, err := compileFrozenGrowReleaseGuards(trace); err != nil {
+		return fmt.Errorf("frozen phase trace grow release contract is invalid: %w", err)
+	}
 	for rel, required := range trace.RequiredCPUSetByRel {
 		entry, ok := trace.FinalSnapshot.Entries[rel]
 		if !ok || !required.IsSubsetOf(entry.CPUs) {

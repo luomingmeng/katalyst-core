@@ -224,6 +224,220 @@ func TestFrozenTraceGrowIsBackedByEarlierSourceShrinkReadback(t *testing.T) {
 	require.True(t, backedGrow, "fixture must execute a transfer grow after source shrink readback")
 }
 
+func TestFrozenTraceTransferGrowWithoutInvocationReleaseFailsBeforeWrite(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+	writer := newTracePreflightWriter(fixture.driver)
+	preflight, err := writer.preflightFrozenTraceOperations(context.Background(), trace)
+	require.NoError(t, err)
+
+	operations := flattenTraceOperations(trace)
+	operationIndex := transferGrowOperationIndex(t, trace, operations)
+	operation := operations[operationIndex]
+	operationPreflight := preflight[operationIndex]
+	fixture.driver.invariants = nil
+	current := fixture.driver.nodes[operation.Rel]
+	current.configuredCPUs = operationPreflight.before.ConfiguredCPUs.Clone()
+	current.cpus = operationPreflight.before.EffectiveCPUs.Clone()
+	current.configuredMems = operationPreflight.before.ConfiguredMems
+	current.mems = operationPreflight.before.EffectiveMems
+	if operation.ParentRel != "" {
+		parent := fixture.driver.nodes[operation.ParentRel]
+		parent.cpus = parent.cpus.Union(operation.Target.CPUs)
+		parent.configuredCPUs = parent.cpus.Clone()
+	}
+	writesBefore := fixture.driver.PhysicalWriteCount()
+	cost := physicalWriteCost(operation.ExpectedCurrent, operation.Target, operation.WriteMems)
+	ticket := &ExecutionReservationTicket{
+		traceID: "transfer-grow-without-release",
+		operations: []frozenOperationAuthorization{{
+			operation: clonePlanOperation(operation),
+		}},
+		reserved: ExecutionReservationCost{Forward: cost},
+	}
+
+	_, err = writer.applyFrozenOperation(
+		context.Background(), PhaseExpand, 0, operation, operationPreflight,
+		&traceMutationStack{}, ticket, ticket.traceID)
+
+	require.Error(t, err)
+	require.Equal(t, writesBefore, fixture.driver.PhysicalWriteCount(),
+		"transfer grow must be rejected before its first physical write")
+}
+
+func TestFrozenTraceTransferGrowRejectsSourceRootReacquisitionBeforeWrite(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+	writer := newTracePreflightWriter(fixture.driver)
+	preflight, err := writer.preflightFrozenTraceOperations(context.Background(), trace)
+	require.NoError(t, err)
+
+	operations := flattenTraceOperations(trace)
+	operationIndex := transferGrowOperationIndex(t, trace, operations)
+	operation := operations[operationIndex]
+	operationPreflight := preflight[operationIndex]
+	require.NotEmpty(t, operationPreflight.releaseGuards)
+	guard := operationPreflight.releaseGuards[0]
+	sourceRoot := ""
+	specByRel := make(map[string]NodeSpec, len(trace.EvaluationInput.DAGSpecs))
+	for _, spec := range trace.EvaluationInput.DAGSpecs {
+		specByRel[spec.Rel] = spec
+	}
+	for _, spec := range trace.EvaluationInput.DAGSpecs {
+		parent, hasParent := specByRel[spec.ParentRel]
+		if spec.Domain == guard.sourceDomain &&
+			(!hasParent || parent.Domain != guard.sourceDomain) {
+			sourceRoot = spec.Rel
+			break
+		}
+	}
+	require.NotEmpty(t, sourceRoot)
+	fixture.driver.invariants = nil
+	current := fixture.driver.nodes[operation.Rel]
+	current.configuredCPUs = operationPreflight.before.ConfiguredCPUs.Clone()
+	current.cpus = operationPreflight.before.EffectiveCPUs.Clone()
+	if operation.ParentRel != "" {
+		parent := fixture.driver.nodes[operation.ParentRel]
+		parent.cpus = parent.cpus.Union(operation.Target.CPUs)
+		parent.configuredCPUs = parent.cpus.Clone()
+	}
+	source := fixture.driver.nodes[sourceRoot]
+	source.cpus = source.cpus.Union(guard.cpus)
+	source.configuredCPUs = source.cpus.Clone()
+	stack := &traceMutationStack{
+		releasedByDomain: map[DomainID]map[int]struct{}{},
+	}
+	addCPUSetToAccumulator(stack.releasedByDomain, guard.sourceDomain, guard.cpus)
+	writesBefore := fixture.driver.PhysicalWriteCount()
+	cost := physicalWriteCost(operation.ExpectedCurrent, operation.Target, operation.WriteMems)
+	ticket := &ExecutionReservationTicket{
+		traceID: "transfer-grow-source-reacquired",
+		operations: []frozenOperationAuthorization{{
+			operation: clonePlanOperation(operation),
+		}},
+		reserved: ExecutionReservationCost{Forward: cost},
+	}
+
+	_, err = writer.applyFrozenOperation(
+		context.Background(), PhaseExpand, 0, operation, operationPreflight,
+		stack, ticket, ticket.traceID)
+
+	require.Error(t, err)
+	require.Equal(t, writesBefore, fixture.driver.PhysicalWriteCount(),
+		"source root reacquisition must be rejected before the transfer grow writes")
+}
+
+func TestCompileFrozenGrowReleaseGuardsRejectsCrossDomainGrowWithoutSourceShrink(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+	operations := flattenTraceOperations(trace)
+	growIndex := transferGrowOperationIndex(t, trace, operations)
+	grow := operations[growIndex]
+	destination := trace.InitialSnapshot.DomainByRel[grow.Rel]
+	added := grow.Target.CPUs.Difference(grow.ExpectedCurrent.CPUs)
+
+	modified := *trace
+	modified.Phases = cloneCompiledPhases(trace.Phases)
+	for phaseIndex := range modified.Phases {
+		filtered := modified.Phases[phaseIndex].Operations[:0]
+		for _, operation := range modified.Phases[phaseIndex].Operations {
+			source := trace.InitialSnapshot.DomainByRel[operation.Rel]
+			released := operation.ExpectedCurrent.CPUs.Difference(operation.Target.CPUs)
+			if operation.Direction == WriteShrink && source != destination &&
+				!released.Intersection(added).IsEmpty() {
+				continue
+			}
+			filtered = append(filtered, operation)
+		}
+		modified.Phases[phaseIndex].Operations = filtered
+	}
+
+	_, err = compileFrozenGrowReleaseGuards(&modified)
+
+	require.Error(t, err)
+	require.ErrorContains(t, err, "source shrink coverage")
+}
+
+func TestCompileFrozenGrowReleaseGuardsRejectsSourceDomainStillHoldingCPU(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+	operations := flattenTraceOperations(trace)
+	growIndex := transferGrowOperationIndex(t, trace, operations)
+	grow := operations[growIndex]
+	added := grow.Target.CPUs.Difference(grow.ExpectedCurrent.CPUs)
+	sourceDomain := DomainID("")
+	for sourceIndex := 0; sourceIndex < growIndex; sourceIndex++ {
+		source := operations[sourceIndex]
+		released := source.ExpectedCurrent.CPUs.Difference(source.Target.CPUs)
+		if source.Direction == WriteShrink && !released.Intersection(added).IsEmpty() {
+			sourceDomain = trace.InitialSnapshot.DomainByRel[source.Rel]
+			break
+		}
+	}
+	require.NotEmpty(t, sourceDomain)
+
+	modified := *trace
+	modified.InitialSnapshot = CloneCompleteSnapshot(trace.InitialSnapshot)
+	const holderRel = "unreleased-source-holder"
+	holderIdentity := CgroupIdentity{Device: 1, Inode: 9001}
+	modified.InitialSnapshot.Entries[holderRel] = EntryState{
+		Rel: holderRel, Identity: holderIdentity,
+		CPUs: added.Clone(), ConfiguredCPUs: added.Clone(),
+		Mems: "0", ConfiguredMems: "0",
+	}
+	modified.InitialSnapshot.DomainByRel[holderRel] = sourceDomain
+	modified.InitialSnapshot.ScanBoundary.Roots =
+		append(modified.InitialSnapshot.ScanBoundary.Roots, holderRel)
+	modified.InitialSnapshot.DomainUnion[sourceDomain] =
+		modified.InitialSnapshot.DomainUnion[sourceDomain].Union(added)
+	modified.InitialSnapshot.ID = fingerprintSnapshot(modified.InitialSnapshot)
+
+	_, err = compileFrozenGrowReleaseGuards(&modified)
+
+	require.Error(t, err)
+	require.ErrorContains(t, err, "source domain release")
+}
+
+func transferGrowOperationIndex(
+	t *testing.T,
+	trace *CompiledPhaseTrace,
+	operations []PlanOperation,
+) int {
+	t.Helper()
+	for growIndex, grow := range operations {
+		if grow.Direction != WriteGrow {
+			continue
+		}
+		added := grow.Target.CPUs.Difference(grow.ExpectedCurrent.CPUs)
+		destination := trace.InitialSnapshot.DomainByRel[grow.Rel]
+		for sourceIndex := 0; sourceIndex < growIndex; sourceIndex++ {
+			source := operations[sourceIndex]
+			if source.Direction != WriteShrink ||
+				trace.InitialSnapshot.DomainByRel[source.Rel] == destination {
+				continue
+			}
+			released := source.ExpectedCurrent.CPUs.Difference(source.Target.CPUs)
+			if !released.Intersection(added).IsEmpty() {
+				return growIndex
+			}
+		}
+	}
+	t.Fatal("trace has no transfer grow backed by an earlier cross-domain shrink")
+	return -1
+}
+
 func traceOperationByDirection(
 	t *testing.T,
 	trace *CompiledPhaseTrace,

@@ -51,6 +51,40 @@ func TestCompileFrozenBoundaryV1ExcludesUnrelatedDynamicSibling(t *testing.T) {
 	require.NotContains(t, boundary.RelevantCPUHolders, "root/direct/unrelated")
 }
 
+func TestCompileFrozenBoundaryRejectsRelevantHolderWithoutControlledAncestor(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	const rel = "orphan"
+	snapshot.Entries[rel] = EntryState{
+		Rel: rel, Identity: CgroupIdentity{Device: 1, Inode: 99},
+		CPUs: machine.NewCPUSet(0), ConfiguredCPUs: machine.NewCPUSet(0),
+		Mems: "0", ConfiguredMems: "0",
+	}
+	snapshot.DomainByRel[rel] = DomainPrimary
+	snapshot.ScanBoundary.ExpandedRels = append(snapshot.ScanBoundary.ExpandedRels, rel)
+	snapshot.ID = fingerprintSnapshot(snapshot)
+
+	_, err := compileFrozenBoundaryV1(snapshot, input, phases)
+
+	require.Error(t, err)
+	require.ErrorContains(t, err, "controlled ancestor")
+}
+
+func TestEvaluateFrozenBoundaryRejectsRelevantHolderParentEdgeIdentityDrift(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	phases[0].Operations[0].Direction = WriteGrow
+	phases[0].Operations[0].Target.CPUs = machine.MustParse("0-4")
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	current := CloneCompleteSnapshot(snapshot)
+	current.Children["root"][0].Identity = CgroupIdentity{Device: 1, Inode: 200}
+	current.ID = fingerprintSnapshot(current)
+
+	err = evaluateFrozenBoundarySnapshot(boundary, snapshot, current)
+
+	require.Error(t, err)
+	require.ErrorContains(t, err, "holder coverage")
+}
+
 func TestCompileFrozenBoundaryV1RelevantCPUsCoverAllSemanticInputsAndCompleteOperations(t *testing.T) {
 	snapshot, input, phases := frozenBoundaryFixture()
 	input.ExpectedByRel = map[string]machine.CPUSet{"expected": machine.NewCPUSet(4)}

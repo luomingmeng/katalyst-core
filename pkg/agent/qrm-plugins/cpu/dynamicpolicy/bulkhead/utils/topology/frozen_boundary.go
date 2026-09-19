@@ -40,7 +40,13 @@ type FrozenBoundary struct {
 	ControlledRels      []string
 	ShrinkChildrenByRel map[string][]ChildRef
 	RelevantCPUHolders  []string
+	RelevantHolderPaths map[string][]FrozenRelIdentity
 	RelevantCPUs        machine.CPUSet
+}
+
+type FrozenRelIdentity struct {
+	Rel      string
+	Identity CgroupIdentity
 }
 
 type FrozenBoundaryEvaluation struct {
@@ -110,6 +116,19 @@ func compileFrozenBoundaryV1(
 		}
 	}
 	sort.Strings(boundary.RelevantCPUHolders)
+	childIdentities, err := indexFrozenChildIdentities(snapshot)
+	if err != nil {
+		return FrozenBoundary{}, err
+	}
+	boundary.RelevantHolderPaths = make(
+		map[string][]FrozenRelIdentity, len(boundary.RelevantCPUHolders))
+	for _, rel := range boundary.RelevantCPUHolders {
+		path, err := compileFrozenHolderPath(snapshot, childIdentities, controlled, rel)
+		if err != nil {
+			return FrozenBoundary{}, err
+		}
+		boundary.RelevantHolderPaths[rel] = path
+	}
 	if err := validateFrozenBoundary(boundary, snapshot); err != nil {
 		return FrozenBoundary{}, err
 	}
@@ -126,10 +145,16 @@ func validateFrozenBoundary(boundary FrozenBoundary, snapshot *CompleteSnapshot)
 	if len(boundary.Roots) == 0 {
 		return fmt.Errorf("frozen boundary requires roots")
 	}
+	controlled := make(map[string]struct{}, len(boundary.ControlledRels))
 	for _, rel := range boundary.ControlledRels {
+		controlled[rel] = struct{}{}
 		if _, ok := snapshot.Entries[rel]; !ok {
 			return fmt.Errorf("frozen boundary controlled rel %q has no snapshot entry", rel)
 		}
+	}
+	childIdentities, err := indexFrozenChildIdentities(snapshot)
+	if err != nil {
+		return err
 	}
 	for rel, children := range boundary.ShrinkChildrenByRel {
 		if _, ok := snapshot.Entries[rel]; !ok {
@@ -150,6 +175,18 @@ func validateFrozenBoundary(boundary FrozenBoundary, snapshot *CompleteSnapshot)
 		if entry.CPUs.Intersection(boundary.RelevantCPUs).IsEmpty() {
 			return fmt.Errorf("frozen boundary holder %q does not hold relevant CPUs", rel)
 		}
+		path, ok := boundary.RelevantHolderPaths[rel]
+		if !ok {
+			return fmt.Errorf("frozen boundary holder %q has no controlled ancestor path", rel)
+		}
+		if err := validateFrozenHolderPath(
+			snapshot, childIdentities, controlled, rel, path,
+		); err != nil {
+			return err
+		}
+	}
+	if len(boundary.RelevantHolderPaths) != len(boundary.RelevantCPUHolders) {
+		return fmt.Errorf("frozen boundary holder coverage does not match relevant holders")
 	}
 	return nil
 }
@@ -163,8 +200,139 @@ func cloneFrozenBoundary(in FrozenBoundary) FrozenBoundary {
 		out.ShrinkChildrenByRel[rel] = append([]ChildRef(nil), children...)
 	}
 	out.RelevantCPUHolders = append([]string(nil), in.RelevantCPUHolders...)
+	out.RelevantHolderPaths = make(map[string][]FrozenRelIdentity, len(in.RelevantHolderPaths))
+	for rel, path := range in.RelevantHolderPaths {
+		out.RelevantHolderPaths[rel] = append([]FrozenRelIdentity(nil), path...)
+	}
 	out.RelevantCPUs = in.RelevantCPUs.Clone()
 	return out
+}
+
+func compileFrozenHolderPath(
+	snapshot *CompleteSnapshot,
+	childIdentities map[string]map[string]CgroupIdentity,
+	controlled map[string]struct{},
+	holderRel string,
+) ([]FrozenRelIdentity, error) {
+	var reversed []FrozenRelIdentity
+	currentRel := holderRel
+	visited := make(map[string]struct{})
+	for {
+		if _, duplicate := visited[currentRel]; duplicate {
+			return nil, fmt.Errorf("relevant holder %q controlled ancestor path contains a cycle", holderRel)
+		}
+		visited[currentRel] = struct{}{}
+		entry, ok := snapshot.Entries[currentRel]
+		if !ok {
+			return nil, fmt.Errorf(
+				"relevant holder %q controlled ancestor path is missing rel %q",
+				holderRel, currentRel,
+			)
+		}
+		reversed = append(reversed, FrozenRelIdentity{
+			Rel: currentRel, Identity: entry.Identity,
+		})
+		if _, ok := controlled[currentRel]; ok {
+			break
+		}
+		parentRel := filepath.Dir(currentRel)
+		if parentRel == "." || parentRel == currentRel {
+			return nil, fmt.Errorf(
+				"relevant holder %q has no controlled ancestor", holderRel)
+		}
+		if err := validateFrozenHolderParentEdge(
+			childIdentities, parentRel, currentRel, entry.Identity,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"relevant holder %q controlled ancestor path: %w", holderRel, err)
+		}
+		currentRel = parentRel
+	}
+	path := make([]FrozenRelIdentity, len(reversed))
+	for i := range reversed {
+		path[len(reversed)-1-i] = reversed[i]
+	}
+	return path, nil
+}
+
+func validateFrozenHolderPath(
+	snapshot *CompleteSnapshot,
+	childIdentities map[string]map[string]CgroupIdentity,
+	controlled map[string]struct{},
+	holderRel string,
+	path []FrozenRelIdentity,
+) error {
+	if len(path) < 2 || path[len(path)-1].Rel != holderRel {
+		return fmt.Errorf("frozen holder coverage for %q has invalid endpoints", holderRel)
+	}
+	if _, ok := controlled[path[0].Rel]; !ok {
+		return fmt.Errorf(
+			"frozen holder coverage for %q does not start at a controlled ancestor",
+			holderRel,
+		)
+	}
+	for i, item := range path {
+		entry, ok := snapshot.Entries[item.Rel]
+		if !ok || entry.Identity != item.Identity {
+			return fmt.Errorf(
+				"frozen holder coverage for %q identity changed at %q",
+				holderRel, item.Rel,
+			)
+		}
+		if i == 0 {
+			continue
+		}
+		if filepath.Dir(item.Rel) != path[i-1].Rel {
+			return fmt.Errorf(
+				"frozen holder coverage for %q is not a direct identity path",
+				holderRel,
+			)
+		}
+		if err := validateFrozenHolderParentEdge(
+			childIdentities, path[i-1].Rel, item.Rel, item.Identity,
+		); err != nil {
+			return fmt.Errorf("frozen holder coverage for %q: %w", holderRel, err)
+		}
+	}
+	return nil
+}
+
+func validateFrozenHolderParentEdge(
+	childIdentities map[string]map[string]CgroupIdentity,
+	parentRel, childRel string,
+	childIdentity CgroupIdentity,
+) error {
+	name := filepath.Base(childRel)
+	identity, ok := childIdentities[parentRel][name]
+	if !ok {
+		return fmt.Errorf(
+			"parent edge %q -> %q has no identity link", parentRel, childRel)
+	}
+	if identity != childIdentity {
+		return fmt.Errorf(
+			"parent edge %q -> %q identity mismatch", parentRel, childRel)
+	}
+	return nil
+}
+
+func indexFrozenChildIdentities(
+	snapshot *CompleteSnapshot,
+) (map[string]map[string]CgroupIdentity, error) {
+	index := make(map[string]map[string]CgroupIdentity, len(snapshot.Children))
+	for parentRel, children := range snapshot.Children {
+		byName := make(map[string]CgroupIdentity, len(children))
+		for _, child := range children {
+			if _, duplicate := byName[child.Name]; duplicate {
+				return nil, fmt.Errorf(
+					"parent %q has duplicate child identity evidence for %q",
+					parentRel, child.Name,
+				)
+			}
+			byName[child.Name] = child.Identity
+		}
+		index[parentRel] = byName
+	}
+	return index, nil
 }
 
 // EvaluateFrozenBoundary captures a fresh root-complete snapshot and compares
@@ -225,6 +393,9 @@ func projectFrozenBoundarySnapshot(
 	}
 	for _, rel := range boundary.RelevantCPUHolders {
 		projected.Entries[rel] = cloneEntryState(current.Entries[rel])
+		for _, item := range boundary.RelevantHolderPaths[rel] {
+			projected.Entries[item.Rel] = cloneEntryState(current.Entries[item.Rel])
+		}
 	}
 	projected.DomainUnion = make(map[DomainID]machine.CPUSet)
 	for rel, entry := range projected.Entries {
@@ -339,6 +510,12 @@ func evaluateFrozenBoundarySnapshot(
 			"dynamic", fmt.Sprint(currentHolders), fmt.Sprint(expectedHolders),
 			fmt.Errorf("relevant CPU holder set changed"))
 	}
+	childIdentities, err := indexFrozenChildIdentities(current)
+	if err != nil {
+		return frozenBoundaryStale(
+			"dynamic", err.Error(), "unique holder coverage",
+			fmt.Errorf("relevant holder coverage changed"))
+	}
 	for _, rel := range expectedHolders {
 		want, wantOK := expected.Entries[rel]
 		got, gotOK := current.Entries[rel]
@@ -351,6 +528,13 @@ func evaluateFrozenBoundarySnapshot(
 			return frozenBoundaryStale(
 				rel, frozenEntryStateString(got), frozenEntryStateString(want),
 				fmt.Errorf("relevant CPU holder state changed"))
+		}
+		if err := validateFrozenHolderPath(
+			current, childIdentities, controlled, rel, boundary.RelevantHolderPaths[rel],
+		); err != nil {
+			return frozenBoundaryStale(
+				rel, err.Error(), "stable holder coverage",
+				fmt.Errorf("relevant holder coverage changed"))
 		}
 	}
 	return nil
@@ -459,6 +643,7 @@ func frozenBoundariesEqual(left, right FrozenBoundary) bool {
 		reflect.DeepEqual(left.ControlledRels, right.ControlledRels) &&
 		reflect.DeepEqual(left.ShrinkChildrenByRel, right.ShrinkChildrenByRel) &&
 		reflect.DeepEqual(left.RelevantCPUHolders, right.RelevantCPUHolders) &&
+		reflect.DeepEqual(left.RelevantHolderPaths, right.RelevantHolderPaths) &&
 		left.RelevantCPUs.Equals(right.RelevantCPUs)
 }
 
@@ -483,6 +668,18 @@ func writeFrozenBoundaryHash(
 		}
 	}
 	writeStringSliceHash(hash, boundary.RelevantCPUHolders)
+	holderRels := sortedStringKeys(boundary.RelevantHolderPaths)
+	writeHashUint64(hash, uint64(len(holderRels)))
+	for _, rel := range holderRels {
+		writeHashString(hash, rel)
+		path := boundary.RelevantHolderPaths[rel]
+		writeHashUint64(hash, uint64(len(path)))
+		for _, item := range path {
+			writeHashString(hash, item.Rel)
+			writeHashUint64(hash, item.Identity.Device)
+			writeHashUint64(hash, item.Identity.Inode)
+		}
+	}
 	writeHashString(hash, boundary.RelevantCPUs.String())
 }
 
