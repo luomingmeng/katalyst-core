@@ -197,7 +197,15 @@ func validateFrozenBoundary(boundary FrozenBoundary, snapshot *CompleteSnapshot)
 	for _, rel := range boundary.RelevantCPUHolders {
 		relevantHolders[rel] = struct{}{}
 	}
+	retirableHolders := make(map[string]struct{}, len(boundary.RetirableCPUHolders))
 	for _, rel := range boundary.RetirableCPUHolders {
+		if _, duplicate := retirableHolders[rel]; duplicate {
+			return fmt.Errorf("frozen boundary has duplicate retirable holder %q", rel)
+		}
+		retirableHolders[rel] = struct{}{}
+		if _, isControlled := controlled[rel]; isControlled {
+			return fmt.Errorf("frozen boundary retirable holder %q is controlled", rel)
+		}
 		if _, ok := relevantHolders[rel]; !ok {
 			return fmt.Errorf("frozen boundary retirable holder %q is not relevant", rel)
 		}
@@ -775,11 +783,19 @@ func frozenBoundaryRetirementAuthorizations(
 ) map[string]CgroupIdentity {
 	_, retirablePaths := indexFrozenRetirablePaths(boundary)
 	authorizations := make(map[string]CgroupIdentity, len(retirablePaths))
+	controlled := make(map[string]struct{}, len(boundary.ControlledRels))
+	for _, rel := range boundary.ControlledRels {
+		controlled[rel] = struct{}{}
+	}
 	for _, holderRel := range boundary.RetirableCPUHolders {
 		for _, item := range boundary.RelevantHolderPaths[holderRel] {
-			if _, ok := retirablePaths[item.Rel]; ok {
-				authorizations[item.Rel] = item.Identity
+			if _, ok := retirablePaths[item.Rel]; !ok {
+				continue
 			}
+			if _, isControlled := controlled[item.Rel]; isControlled {
+				continue
+			}
+			authorizations[item.Rel] = item.Identity
 		}
 	}
 	return authorizations

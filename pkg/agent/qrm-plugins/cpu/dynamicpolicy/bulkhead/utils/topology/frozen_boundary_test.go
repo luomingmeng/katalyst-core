@@ -403,6 +403,66 @@ func TestCompileFrozenBoundaryDoesNotRetireTargetOnlyHolder(t *testing.T) {
 	require.NotContains(t, boundary.RetirableCPUHolders, "root/direct/holder")
 }
 
+func TestFrozenBoundaryRetirementAuthorizationExcludesControlledRels(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+
+	authorizations := frozenBoundaryRetirementAuthorizations(boundary)
+
+	require.NotContains(t, authorizations, "root")
+	require.Contains(t, authorizations, "root/direct")
+	require.Contains(t, authorizations, "root/direct/holder")
+}
+
+func TestFrozenBoundaryRetirementAuthorizationExcludesSharedRequiredPath(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	requiredRel := "root/direct/required"
+	requiredIdentity := CgroupIdentity{Device: 1, Inode: 5}
+	snapshot.Entries[requiredRel] = EntryState{
+		Rel: requiredRel, Identity: requiredIdentity,
+		CPUs: machine.NewCPUSet(2), ConfiguredCPUs: machine.NewCPUSet(2),
+		Mems: "0", ConfiguredMems: "0",
+	}
+	snapshot.Children["root/direct"] = append(snapshot.Children["root/direct"], ChildRef{
+		Name: "required", Identity: requiredIdentity,
+	})
+	snapshot.DomainByRel[requiredRel] = DomainPrimary
+	snapshot.ScanBoundary.ExpandedRels = append(snapshot.ScanBoundary.ExpandedRels, requiredRel)
+	input.ExpectedByRel = map[string]machine.CPUSet{requiredRel: machine.NewCPUSet(2)}
+
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	authorizations := frozenBoundaryRetirementAuthorizations(boundary)
+
+	require.Equal(t, map[string]CgroupIdentity{
+		"root/direct/holder": snapshot.Entries["root/direct/holder"].Identity,
+	}, authorizations)
+}
+
+func TestFrozenBoundaryRejectsDuplicateRetirableHolders(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	boundary.RetirableCPUHolders = append(
+		boundary.RetirableCPUHolders, boundary.RetirableCPUHolders[0])
+
+	err = validateFrozenBoundary(boundary, snapshot)
+
+	require.ErrorContains(t, err, "duplicate")
+}
+
+func TestFrozenBoundaryRejectsControlledRetirableHolder(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	boundary.RetirableCPUHolders = append(boundary.RetirableCPUHolders, "root")
+
+	err = validateFrozenBoundary(boundary, snapshot)
+
+	require.ErrorContains(t, err, "controlled")
+}
+
 func TestEvaluateFrozenBoundaryAllowsRetirableShrinkDirectChildRemovalDuringSnapshot(t *testing.T) {
 	snapshot, input, phases := frozenBoundaryFixture()
 	addFrozenBoundaryDirectChild(
