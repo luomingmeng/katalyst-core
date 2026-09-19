@@ -276,7 +276,7 @@ func TestSnapshotRejectsIdentityChangeAndListStatDeleteRace(t *testing.T) {
 
 func TestSnapshotRetirementRejectsControllerError(t *testing.T) {
 	assertSnapshotRetirementRejectsError(t, fmt.Errorf(
-		"read cpuset.cpus: %w: %w", ErrCgroupControllerUnavailable, syscall.ENOENT))
+		"read cpuset.cpus: %w: %v", ErrCgroupControllerUnavailable, syscall.ENOENT))
 }
 
 func TestSnapshotRetirementRejectsPermissionError(t *testing.T) {
