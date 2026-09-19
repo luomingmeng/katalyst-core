@@ -2750,8 +2750,14 @@ func TestAdvisorPostCommitProgressIdentityPhaseGenerationAndNotification(t *test
 	require.Equal(t, published.createdAt, applying.createdAt)
 	require.False(t, applying.lastProgressAt.Before(published.lastProgressAt))
 
+	replacedTargetChanged := applying.changed
 	replacement := cloneAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, 8)
 	p.publishPreparedAdvisorPostCommitTarget(replacement)
+	select {
+	case <-replacedTargetChanged:
+	case <-time.After(time.Second):
+		t.Fatal("replacing a non-nil target did not close the previous target's changed channel")
+	}
 	replaced := p.currentAdvisorPostCommitProgress()
 	require.Same(t, replacement, replaced.target)
 	require.NotEqual(t, applying.target, replaced.target)

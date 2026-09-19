@@ -103,23 +103,43 @@ func TestClearResidualStateAgesResidualOnlyOncePerInvocation(t *testing.T) {
 
 func TestClearResidualStateTargetChangeWakesBoundedRetry(t *testing.T) {
 	p := newResidualCleanupLivenessPolicy(t)
-	target := p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+	const podUID = "residual-during-target-replacement"
+	p.state.SetPodEntries(state.PodEntries{
+		podUID: {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{PodUid: podUID, ContainerName: "main"},
+			},
+		},
+	}, false)
+	beforeRevision := p.state.GetRevision()
+	beforeEntries := p.state.GetPodEntries()
+	beforeMachineState := p.state.GetMachineState()
+	targetA := p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, beforeRevision)
 	result := make(chan error, 1)
 	go func() {
 		result <- p.clearResidualStateAfterPodList(context.Background(), nil)
 	}()
 
-	time.Sleep(20 * time.Millisecond)
-	p.cpuSetAdjustmentRetryMu.Lock()
-	p.setAdvisorPostCommitTargetLocked(nil)
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	require.Eventually(t, func() bool {
+		p.Lock()
+		defer p.Unlock()
+		return p.residualHitMap[podUID] == 1
+	}, time.Second, time.Millisecond, "cleanup did not enter bounded wait for target A")
+
+	targetB := p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, beforeRevision)
+	require.NotSame(t, targetA, targetB)
 
 	select {
 	case err := <-result:
 		require.NoError(t, err)
 	case <-time.After(time.Second):
-		t.Fatalf("cleanup did not wake after replacing target revision %d", target.revision)
+		t.Fatalf("cleanup did not wake after replacing target revision %d", targetA.revision)
 	}
+	require.Equal(t, beforeRevision, p.state.GetRevision())
+	require.Equal(t, beforeEntries, p.state.GetPodEntries())
+	require.Equal(t, beforeMachineState, p.state.GetMachineState())
 }
 
 func TestClearResidualStateNeverMutatesWhileFenced(t *testing.T) {
