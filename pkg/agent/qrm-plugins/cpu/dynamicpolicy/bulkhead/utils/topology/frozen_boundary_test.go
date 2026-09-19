@@ -558,6 +558,92 @@ func TestEvaluateFrozenBoundaryDoesNotRetryRetirableHolderIdentityError(t *testi
 	require.Equal(t, 1, holderStats)
 }
 
+func TestEvaluateFrozenBoundaryRejectsUnauthorizedRetirementWindows(t *testing.T) {
+	for _, window := range []string{"list", "recursive-fence"} {
+		t.Run("semantic-"+window, func(t *testing.T) {
+			snapshot, input, phases := frozenBoundaryFixture()
+			input.ExpectedByRel = map[string]machine.CPUSet{
+				"root/direct/holder": machine.NewCPUSet(2),
+			}
+			boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+			require.NoError(t, err)
+			driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+			injectFrozenRetirementWindow(driver, "root/direct/holder", window, false)
+
+			_, err = EvaluateFrozenBoundary(
+				context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+				boundary, snapshot)
+
+			require.Error(t, err)
+		})
+
+		t.Run("controlled-"+window, func(t *testing.T) {
+			snapshot, input, phases := frozenBoundaryFixture()
+			boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+			require.NoError(t, err)
+			driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+			injectFrozenRetirementWindow(driver, "root", window, false)
+
+			_, err = EvaluateFrozenBoundary(
+				context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+				boundary, snapshot)
+
+			require.Error(t, err)
+		})
+
+		t.Run("replacement-"+window, func(t *testing.T) {
+			snapshot, input, phases := frozenBoundaryFixture()
+			boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+			require.NoError(t, err)
+			driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+			injectFrozenRetirementWindow(driver, "root/direct/holder", window, true)
+
+			_, err = EvaluateFrozenBoundary(
+				context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+				boundary, snapshot)
+
+			require.Error(t, err)
+			require.ErrorIs(t, err, ErrCgroupIdentityChanged)
+		})
+	}
+}
+
+func injectFrozenRetirementWindow(
+	driver *fakeHierarchyDriver,
+	rel, window string,
+	replacement bool,
+) {
+	stats := 0
+	driver.beforeCall = func(operation HierarchyOperation, calledRel string) error {
+		if calledRel != rel {
+			return nil
+		}
+		trigger := operation == HierarchyOperationList && window == "list"
+		if operation == HierarchyOperationStat {
+			stats++
+			trigger = trigger || window == "recursive-fence" && stats == 3
+		}
+		if !trigger {
+			return nil
+		}
+		old := driver.nodes[rel]
+		delete(driver.nodes, rel)
+		if replacement {
+			driver.nodes[rel] = &fakeHierarchyNode{
+				identity:       CgroupIdentity{Device: old.identity.Device, Inode: old.identity.Inode + 100},
+				cpus:           old.cpus.Clone(),
+				configuredCPUs: old.configuredCPUs.Clone(),
+				mems:           old.mems,
+				configuredMems: old.configuredMems,
+			}
+		}
+		if window == "list" {
+			return syscall.ENOENT
+		}
+		return nil
+	}
+}
+
 func deleteHolderAfterParentListing(
 	driver *fakeHierarchyDriver,
 	parentRel, holderRel string,
