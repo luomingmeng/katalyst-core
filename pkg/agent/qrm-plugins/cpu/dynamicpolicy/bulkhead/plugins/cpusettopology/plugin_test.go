@@ -3360,6 +3360,7 @@ type disappearingContainerIDFetcher struct {
 	metapod.PodFetcherStub
 	containerID string
 	calls       int
+	pod         *v1.Pod
 }
 
 type allocationLookupState struct {
@@ -3467,6 +3468,13 @@ func (f *disappearingContainerIDFetcher) GetContainerIDWithContext(
 		return f.containerID, nil
 	}
 	return "", metapod.ErrContainerNotFound
+}
+
+func (f *disappearingContainerIDFetcher) GetPod(ctx context.Context, _ string) (*v1.Pod, error) {
+	if ctx.Value(metapod.BypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("pod freshness query did not bypass cache")
+	}
+	return f.pod.DeepCopy(), nil
 }
 
 func (f *rotatingContainerIDFetcher) GetContainerIDWithContext(
@@ -3922,7 +3930,12 @@ func TestCPUSetTopologyPluginTreatsDisappearedContainerAsPending(t *testing.T) {
 			return "", true, nil
 		},
 	})
-	fetcher := &disappearingContainerIDFetcher{containerID: containerID}
+	fetcher := &disappearingContainerIDFetcher{
+		containerID: containerID,
+		pod: &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+		},
+	}
 	metaServer := &metaserver.MetaServer{
 		MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
 	}
@@ -3992,8 +4005,8 @@ func TestCPUSetTopologyPluginSkipsExpectedCPUSetForMissingContainer(t *testing.T
 	if len(res.PendingByPod) != 1 {
 		t.Fatalf("expected one protected-pending entry, got %#v", res.PendingByPod)
 	}
-	if got := res.PendingByPod[0].NativeQOSClass; got != v1.PodQOSGuaranteed {
-		t.Fatalf("pending native qos class = %q, want %q", got, v1.PodQOSGuaranteed)
+	if got := res.PendingByPod[0].NativeQOSClass; got != v1.PodQOSBestEffort {
+		t.Fatalf("pending native qos class = %q, want fresh pod qos %q", got, v1.PodQOSBestEffort)
 	}
 }
 
