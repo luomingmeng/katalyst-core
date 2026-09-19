@@ -181,23 +181,47 @@ func TestTracePreflightRejectsGrowNewRelevantCPUHolderWithoutWrites(t *testing.T
 	require.Equal(t, initialState, fixture.driver.snapshot())
 }
 
-func TestFrozenTraceRevalidatesRelevantHoldersBeforeEveryGrowWrite(t *testing.T) {
-	trace, live := compiledTraceWithCPUAndMemoryWrites(t)
-	live.invariants = nil
-	grow := traceOperationByDirection(t, trace, WriteGrow)
-	added := grow.Target.CPUs.Difference(grow.ExpectedCurrent.CPUs)
-	require.False(t, added.IsEmpty())
-	driver := newPostPreflightRelevantHolderDriver(live, trace.InitialSnapshot, grow, added)
-	round := frozenExecutionRound(t, trace, driver)
+func TestFrozenTraceGrowIsBackedByEarlierSourceShrinkReadback(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+	round := frozenExecutionRound(t, trace, fixture.driver)
 	ticket := reserveTraceWithBudget(t, round.budget, trace)
 	res := &ConvergenceResult{}
 
-	_, err := round.executeFrozenTrace(context.Background(), trace, ticket, res)
+	_, err = round.executeFrozenTrace(context.Background(), trace, ticket, res)
 
-	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
-	require.True(t, driver.injected)
-	require.Zero(t, driver.growWrites,
-		"a relevant holder created after preflight must block the grow before any grow write")
+	require.NoError(t, err)
+	operations := flattenTraceOperations(trace)
+	operationByPlanID := make(map[string]PlanOperation, len(operations))
+	for _, operation := range operations {
+		operationByPlanID[operation.PlanID] = operation
+	}
+	var released machine.CPUSet
+	backedGrow := false
+	for _, applied := range res.Journal {
+		operation, ok := operationByPlanID[applied.PlanID]
+		require.True(t, ok, "journal plan %q must belong to the frozen trace", applied.PlanID)
+		switch applied.Direction {
+		case WriteShrink:
+			require.True(t, applied.Observed.CPUs.Equals(operation.Target.CPUs),
+				"source shrink must be read back before execution advances")
+			released = released.Union(
+				operation.ExpectedCurrent.CPUs.Difference(applied.Observed.CPUs))
+		case WriteGrow:
+			added := applied.Observed.CPUs.Difference(operation.ExpectedCurrent.CPUs)
+			require.False(t, added.IsEmpty())
+			if !added.Intersection(released).IsEmpty() {
+				require.True(t, added.IsSubsetOf(released),
+					"transfer grow of %s exceeds earlier source shrink readback %s",
+					added.String(), released.String())
+				backedGrow = true
+			}
+		}
+	}
+	require.True(t, backedGrow, "fixture must execute a transfer grow after source shrink readback")
 }
 
 func traceOperationByDirection(
@@ -593,6 +617,18 @@ func TestFrozenTraceValidatesCompletePredecessorBeforeOperationFirstWrite(t *tes
 			},
 			mutate: func(live *fakeHierarchyDriver, operation PlanOperation) {
 				live.bumpIdentity(operation.ParentRel)
+			},
+		},
+		{
+			name: "parent no longer contains grow target",
+			selectOp: func(operation PlanOperation, _ *CompiledPhaseTrace) bool {
+				return operation.Direction == WriteGrow && operation.ParentRel != ""
+			},
+			mutate: func(live *fakeHierarchyDriver, operation PlanOperation) {
+				parent := live.nodes[operation.ParentRel]
+				parent.cpus = parent.cpus.Difference(
+					operation.Target.CPUs.Difference(operation.ExpectedCurrent.CPUs))
+				parent.configuredCPUs = parent.cpus.Clone()
 			},
 		},
 		{
@@ -1739,18 +1775,6 @@ type frozenPredecessorDriftDriver struct {
 	writesToDriftedOperation int
 }
 
-type postPreflightRelevantHolderDriver struct {
-	HierarchyDriver
-	live              *fakeHierarchyDriver
-	initialRels       map[string]struct{}
-	preflightSeen     map[string]struct{}
-	preflightComplete bool
-	grow              PlanOperation
-	added             machine.CPUSet
-	injected          bool
-	growWrites        int
-}
-
 type readErrorHierarchyDriver struct {
 	HierarchyDriver
 	err error
@@ -1765,102 +1789,6 @@ func (d *readErrorHierarchyDriver) ReadEntry(
 		return EntryState{}, d.err
 	}
 	return d.HierarchyDriver.ReadEntry(ctx, rel)
-}
-
-func newPostPreflightRelevantHolderDriver(
-	live *fakeHierarchyDriver,
-	initial *CompleteSnapshot,
-	grow PlanOperation,
-	added machine.CPUSet,
-) *postPreflightRelevantHolderDriver {
-	rels := make(map[string]struct{}, len(initial.Entries))
-	for rel := range initial.Entries {
-		rels[rel] = struct{}{}
-	}
-	return &postPreflightRelevantHolderDriver{
-		HierarchyDriver: live,
-		live:            live,
-		initialRels:     rels,
-		preflightSeen:   make(map[string]struct{}, len(rels)),
-		grow:            grow,
-		added:           added.Clone(),
-	}
-}
-
-func (d *postPreflightRelevantHolderDriver) ReadEntry(
-	ctx context.Context,
-	rel string,
-) (EntryState, error) {
-	if !d.preflightComplete {
-		if _, expected := d.initialRels[rel]; expected {
-			d.preflightSeen[rel] = struct{}{}
-			if len(d.preflightSeen) == len(d.initialRels) {
-				d.preflightComplete = true
-			}
-		}
-		return d.HierarchyDriver.ReadEntry(ctx, rel)
-	}
-	if !d.injected && rel == d.grow.Rel {
-		parentRel := ""
-		growDomain := d.grow.Rel
-		if d.grow.ParentRel != "" {
-			growDomain = d.grow.ParentRel
-		}
-		for candidate, domain := range d.liveSnapshotDomains() {
-			if domain != d.liveSnapshotDomains()[growDomain] {
-				parentRel = candidate
-				break
-			}
-		}
-		if parentRel == "" {
-			parentRel = d.grow.Rel
-		}
-		d.live.add(filepath.Join(parentRel, "post-preflight-holder"),
-			CgroupIdentity{Device: 99, Inode: 99}, d.added.String(), "0")
-		d.injected = true
-	}
-	return d.HierarchyDriver.ReadEntry(ctx, rel)
-}
-
-func (d *postPreflightRelevantHolderDriver) liveSnapshotDomains() map[string]DomainID {
-	domains := make(map[string]DomainID)
-	for rel := range d.live.nodes {
-		for ancestor := rel; ancestor != "." && ancestor != ""; ancestor = filepath.Dir(ancestor) {
-			if ancestor == "kubepods" {
-				domains[rel] = DomainPrimary
-				break
-			}
-			if ancestor == "tiger" {
-				domains[rel] = DomainReclaim
-				break
-			}
-		}
-	}
-	return domains
-}
-
-func (d *postPreflightRelevantHolderDriver) WriteCPUs(
-	ctx context.Context,
-	rel string,
-	identity CgroupIdentity,
-	cpus machine.CPUSet,
-) error {
-	if rel == d.grow.Rel {
-		d.growWrites++
-	}
-	return d.HierarchyDriver.WriteCPUs(ctx, rel, identity, cpus)
-}
-
-func (d *postPreflightRelevantHolderDriver) WriteMems(
-	ctx context.Context,
-	rel string,
-	identity CgroupIdentity,
-	mems string,
-) error {
-	if rel == d.grow.Rel {
-		d.growWrites++
-	}
-	return d.HierarchyDriver.WriteMems(ctx, rel, identity, mems)
 }
 
 func selectTraceOperation(

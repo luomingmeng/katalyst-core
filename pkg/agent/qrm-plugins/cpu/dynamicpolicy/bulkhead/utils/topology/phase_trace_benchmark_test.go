@@ -208,6 +208,56 @@ func TestCompileFixedPointTraceOperationHeavyScale(t *testing.T) {
 	}
 }
 
+func TestFrozenPreflightOperationHeavyExecutionOverheadRemainsLinear(t *testing.T) {
+	if os.Getenv(topologyScaleTestEnv) != "1" {
+		t.Skipf("set %s=1 to run high-cost topology scale tests", topologyScaleTestEnv)
+	}
+	const linearScaleTolerance = 3.0
+	var previous uint64
+	for _, nodes := range []int{100, 1000} {
+		fixture := newOperationHeavyTraceFixture(t, nodes)
+		trace, err := fixture.compile()
+		require.NoError(t, err)
+
+		runtime.GC()
+		var projectionBefore, projectionAfter runtime.MemStats
+		runtime.ReadMemStats(&projectionBefore)
+		projection, err := newProjectedHierarchy(trace.InitialSnapshot, trace.Capabilities)
+		require.NoError(t, err)
+		for _, operation := range flattenTraceOperations(trace) {
+			require.NoError(t, projection.applyOperation(operation))
+		}
+		runtime.ReadMemStats(&projectionAfter)
+		projectionAllocations := projectionAfter.Mallocs - projectionBefore.Mallocs
+
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		writer := newSafeCPUSetWriter(
+			fixture.driver,
+			NewBudgetTracker(traceScaleBudget(nodes, fixture.base.Cost.MaxDepth)),
+			&ConvergenceResult{},
+		)
+		_, err = writer.preflightFrozenTraceOperations(context.Background(), trace)
+		require.NoError(t, err)
+		runtime.ReadMemStats(&after)
+		allocations := after.Mallocs - before.Mallocs
+		require.GreaterOrEqual(t, allocations, projectionAllocations)
+		overhead := allocations - projectionAllocations
+		t.Logf("nodes=%d operations=%d reads=%d allocations=%d projection_allocations=%d overhead=%d",
+			nodes, trace.OperationCount(), fixture.driver.readCount(), allocations,
+			projectionAllocations, overhead)
+		require.LessOrEqual(t, fixture.driver.readCount(), int64(nodes*8),
+			"operation-heavy preflight hierarchy reads must remain O(N)")
+		if previous != 0 {
+			require.LessOrEqual(t, float64(overhead)/float64(previous),
+				10*linearScaleTolerance,
+				"10x more operations must not cause super-linear execution overhead allocations")
+		}
+		previous = overhead
+	}
+}
+
 type operationHeavyScaleMeasurement struct {
 	nodes         int
 	operations    int
