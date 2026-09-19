@@ -75,6 +75,23 @@ func (e *ProjectedPhaseNoProgressError) Error() string {
 
 func (e *ProjectedPhaseNoProgressError) Unwrap() error { return ErrNoProgress }
 
+type convergenceDeadlineContextError struct {
+	cause  error
+	rounds int
+	usage  BudgetUsage
+}
+
+func (e *convergenceDeadlineContextError) Error() string {
+	return fmt.Sprintf("%v: %v after rounds=%d usage=%+v",
+		ErrConvergenceDeadlineExceeded, e.cause, e.rounds, e.usage)
+}
+
+func (e *convergenceDeadlineContextError) Unwrap() error { return e.cause }
+
+func (e *convergenceDeadlineContextError) Is(target error) bool {
+	return target == ErrConvergenceDeadlineExceeded || errors.Is(e.cause, target)
+}
+
 // CompiledPhase is one ordered, frozen phase of a fixed-point trace. Operations
 // are already sequenced; execution replays them verbatim without re-planning.
 type CompiledPhase struct {
@@ -364,8 +381,9 @@ func (r *coordinatorRound) compileFixedPointTrace(
 // annotated for diagnosis.
 func (r *coordinatorRound) checkEngineDeadline(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("%w: %w after rounds=%d usage=%+v",
-			ErrConvergenceDeadlineExceeded, err, r.round, r.budget.Usage())
+		return &convergenceDeadlineContextError{
+			cause: err, rounds: r.round, usage: r.budget.Usage(),
+		}
 	}
 	if r.budget != nil && !r.budget.limit.Deadline.IsZero() &&
 		!time.Now().Before(r.budget.limit.Deadline) {

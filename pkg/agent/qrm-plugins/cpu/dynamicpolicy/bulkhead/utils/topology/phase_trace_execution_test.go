@@ -49,6 +49,21 @@ func TestTracePreflightRejectsInitialSnapshotDriftWithoutWrites(t *testing.T) {
 	require.Equal(t, initialState, driver.snapshot())
 }
 
+func TestCheckEngineDeadlinePreservesBudgetAndContextErrors(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	round := &coordinatorRound{
+		round:  3,
+		budget: NewBudgetTracker(ConvergenceBudget{}),
+	}
+
+	err := round.checkEngineDeadline(ctx)
+
+	require.ErrorIs(t, err, ErrConvergenceDeadlineExceeded)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Contains(t, err.Error(), "rounds=3")
+}
+
 func TestTracePreflightAllowsUnrelatedDynamicSiblingChurn(t *testing.T) {
 	fixture := newAdmissionTraceFixture(t)
 	fixture.configureStagedSMTTransferWithDynamicDescendant()
