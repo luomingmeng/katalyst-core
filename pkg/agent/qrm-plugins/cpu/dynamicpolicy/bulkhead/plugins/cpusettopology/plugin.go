@@ -1472,7 +1472,7 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in 
 							pending.NativeQOSClass = v1.PodQOSClass(allocation.NativeQOSClass)
 						}
 					}
-					if metapod.IsPodNotFound(err) {
+					if isContainerAbsentErr(err) {
 						refreshCtx := context.WithValue(ctx, metapod.BypassCacheKey, metapod.BypassCacheTrue)
 						pod, podErr := in.MetaServer.GetPod(refreshCtx, podUID)
 						switch {
@@ -1489,8 +1489,7 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in 
 								podUID, containerName, podErr))
 							continue
 						default:
-							exists, existsErr := p.pendingPodCgroupExists(
-								ctx, podUID, pending.NativeQOSClass)
+							exists, existsErr := p.pendingPodCgroupExists(ctx, podUID)
 							if existsErr != nil {
 								errs = append(errs, fmt.Errorf(
 									"check pod cgroup after fresh pod not found: pod=%s container=%s: %w",
@@ -1544,12 +1543,11 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in 
 func (p *CPUSetTopologyPlugin) pendingPodCgroupExists(
 	ctx context.Context,
 	podUID string,
-	qosClass v1.PodQOSClass,
 ) (bool, error) {
 	if p.cgroup == nil {
 		return false, fmt.Errorf("cgroup client is nil")
 	}
-	candidates := cgcommon.GetPodRelativeCgroupPathCandidatesForQOS(podUID, qosClass)
+	candidates := cgcommon.GetPodRelativeCgroupPathCandidates(podUID)
 	for _, rel := range candidates {
 		rel = strings.Trim(rel, "/")
 		if rel == "" {
