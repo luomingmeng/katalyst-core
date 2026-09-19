@@ -1,0 +1,295 @@
+package cpusettopology
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"testing"
+
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+
+	bulkheadapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
+	bulkheadutils "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils"
+	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
+	bulkheadconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/bulkhead"
+	"github.com/kubewharf/katalyst-core/pkg/metaserver"
+	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent"
+	metapod "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
+	"github.com/kubewharf/katalyst-core/pkg/util/machine"
+)
+
+type strictFreshPendingFetcher struct {
+	metapod.PodFetcherStub
+	containerErr error
+	pods         map[string]*v1.Pod
+	podErrs      map[string]error
+	freshLookups map[string]int
+}
+
+func (f *strictFreshPendingFetcher) GetContainerIDWithContext(
+	context.Context, string, string,
+) (string, error) {
+	return "", f.containerErr
+}
+
+func (f *strictFreshPendingFetcher) GetPod(ctx context.Context, podUID string) (*v1.Pod, error) {
+	if ctx.Value(metapod.BypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("fresh pod lookup did not bypass cache")
+	}
+	if ctx.Value(metapod.StrictBypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("fresh pod lookup was not strict")
+	}
+	f.freshLookups[podUID]++
+	if err := f.podErrs[podUID]; err != nil {
+		return nil, err
+	}
+	if pod := f.pods[podUID]; pod != nil {
+		return pod.DeepCopy(), nil
+	}
+	return nil, metapod.NewPodNotFoundError(podUID)
+}
+
+func pendingScopeTestView(entries map[string]machine.CPUSet) *model.DesiredView {
+	byPod := make(map[string]map[string]machine.CPUSet, len(entries))
+	for podUID, cpus := range entries {
+		byPod[podUID] = map[string]machine.CPUSet{"main": cpus}
+	}
+	return &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ContainerCPUSetByPod: byPod,
+	}}
+}
+
+func pendingScopeTestContext(
+	fetcher metapod.PodFetcher,
+	view *model.DesiredView,
+) bulkheadapi.HandlerContext {
+	return bulkheadapi.HandlerContext{
+		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+			MetaServer: &metaserver.MetaServer{
+				MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
+			},
+			Mode: cpusetutil.CPUSetAdjustmentModeAdmission,
+		},
+		DesiredView: view,
+	}
+}
+
+func podScopeCandidates(podUID string) []string {
+	return []string{
+		"kubepods/pod" + podUID,
+		"kubepods/besteffort/pod" + podUID,
+		"kubepods/burstable/pod" + podUID,
+	}
+}
+
+func absentCandidateErrors(podUID string) map[string]error {
+	out := make(map[string]error, 3)
+	for _, rel := range podScopeCandidates(podUID) {
+		out[rel] = os.ErrNotExist
+	}
+	return out
+}
+
+func TestPendingContainerErrorsUseStrictFreshPodAndFreshQoS(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "pod not found", err: metapod.NewPodNotFoundError("cached")},
+		{name: "container not found", err: metapod.ErrContainerNotFound},
+		{name: "container not running", err: bulkheadutils.ErrContainerNotRunning},
+		{name: "identity changed", err: fmt.Errorf("%w: old=old-id current=new-id", bulkheadutils.ErrContainerIdentityChanged)},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			podUID := "strict-fresh-" + strings.ReplaceAll(tt.name, " ", "-")
+			fetcher := &strictFreshPendingFetcher{
+				containerErr: tt.err,
+				pods: map[string]*v1.Pod{
+					podUID: {
+						ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+					},
+				},
+				podErrs:      map[string]error{},
+				freshLookups: map[string]int{},
+			}
+			p := &CPUSetTopologyPlugin{
+				cfg:    bulkheadConfigWithPrimary("kubepods"),
+				cgroup: &fakeCgroupClient{},
+			}
+
+			res, err := p.buildExpectedCPUSetByRel(context.Background(), pendingScopeTestContext(
+				fetcher,
+				pendingScopeTestView(map[string]machine.CPUSet{podUID: machine.NewCPUSet(0, 1)}),
+			))
+			if err != nil {
+				t.Fatalf("pending error for live pod must remain pending: %v", err)
+			}
+			if fetcher.freshLookups[podUID] != 1 {
+				t.Fatalf("strict fresh lookups = %d, want 1", fetcher.freshLookups[podUID])
+			}
+			if len(res.PendingByPod) != 1 {
+				t.Fatalf("pending entries = %#v, want one", res.PendingByPod)
+			}
+			if got := res.PendingByPod[0].NativeQOSClass; got != v1.PodQOSBestEffort {
+				t.Fatalf("pending qos = %q, want fresh pod qos %q", got, v1.PodQOSBestEffort)
+			}
+			if got := res.PendingByPod[0].ScopeRel; got != "kubepods/besteffort/pod"+podUID {
+				t.Fatalf("pending scope = %q, want fresh best-effort scope", got)
+			}
+		})
+	}
+}
+
+func TestFreshAbsentPendingPodCandidateCardinality(t *testing.T) {
+	t.Parallel()
+
+	const podUID = "fresh-absent"
+	tests := []struct {
+		name       string
+		statErrors map[string]error
+		existing   map[string]bool
+		wantScope  string
+		wantSkip   bool
+		wantErr    error
+	}{
+		{
+			name:       "zero candidates skips stale checkpoint entry",
+			statErrors: absentCandidateErrors(podUID),
+			wantSkip:   true,
+		},
+		{
+			name:       "one candidate retains concrete scope",
+			statErrors: absentCandidateErrors(podUID),
+			existing: map[string]bool{
+				"kubepods/burstable/pod" + podUID: true,
+			},
+			wantScope: "kubepods/burstable/pod" + podUID,
+		},
+		{
+			name:       "multiple candidates fail closed",
+			statErrors: absentCandidateErrors(podUID),
+			existing: map[string]bool{
+				"kubepods/pod" + podUID:           true,
+				"kubepods/burstable/pod" + podUID: true,
+			},
+			wantErr: errPendingPodScopeAmbiguous,
+		},
+		{
+			name: "non ENOENT is preserved",
+			statErrors: func() map[string]error {
+				errs := absentCandidateErrors(podUID)
+				errs["kubepods/burstable/pod"+podUID] = os.ErrPermission
+				return errs
+			}(),
+			wantErr: os.ErrPermission,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			statErrors := make(map[string]error, len(tt.statErrors))
+			for rel, statErr := range tt.statErrors {
+				statErrors[rel] = statErr
+			}
+			for rel := range tt.existing {
+				delete(statErrors, rel)
+			}
+			fetcher := &strictFreshPendingFetcher{
+				containerErr: metapod.ErrContainerNotFound,
+				pods:         map[string]*v1.Pod{},
+				podErrs:      map[string]error{},
+				freshLookups: map[string]int{},
+			}
+			p := &CPUSetTopologyPlugin{
+				cfg: bulkheadConfigWithPrimary("kubepods"),
+				cgroup: &fakeCgroupClient{
+					existing:   tt.existing,
+					statErrors: statErrors,
+				},
+			}
+
+			res, err := p.buildExpectedCPUSetByRel(context.Background(), pendingScopeTestContext(
+				fetcher,
+				pendingScopeTestView(map[string]machine.CPUSet{podUID: machine.NewCPUSet(2, 3)}),
+			))
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("error = %v, want errors.Is(_, %v)", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("buildExpectedCPUSetByRel() error = %v", err)
+			}
+			if fetcher.freshLookups[podUID] != 1 {
+				t.Fatalf("strict fresh lookups = %d, want 1", fetcher.freshLookups[podUID])
+			}
+			if tt.wantSkip {
+				if len(res.PendingByPod) != 0 {
+					t.Fatalf("stale pod entered pending protection: %#v", res.PendingByPod)
+				}
+				return
+			}
+			if len(res.PendingByPod) != 1 || res.PendingByPod[0].ScopeRel != tt.wantScope {
+				t.Fatalf("pending entries = %#v, want concrete scope %q", res.PendingByPod, tt.wantScope)
+			}
+		})
+	}
+}
+
+func TestRemovePodIgnoresUnrelatedStalePendingEntry(t *testing.T) {
+	t.Parallel()
+
+	const (
+		liveUID  = "remove-pod-live"
+		staleUID = "remove-pod-unrelated-stale"
+	)
+	fetcher := &strictFreshPendingFetcher{
+		containerErr: metapod.ErrContainerNotFound,
+		pods: map[string]*v1.Pod{
+			liveUID: {
+				ObjectMeta: metav1.ObjectMeta{UID: types.UID(liveUID)},
+			},
+		},
+		podErrs:      map[string]error{},
+		freshLookups: map[string]int{},
+	}
+	statErrors := absentCandidateErrors(staleUID)
+	p := &CPUSetTopologyPlugin{
+		cfg: bulkheadConfigWithPrimary("kubepods"),
+		cgroup: &fakeCgroupClient{
+			statErrors: statErrors,
+		},
+	}
+
+	res, err := p.buildExpectedCPUSetByRel(context.Background(), pendingScopeTestContext(
+		fetcher,
+		pendingScopeTestView(map[string]machine.CPUSet{
+			liveUID:  machine.NewCPUSet(0, 1),
+			staleUID: machine.NewCPUSet(2, 3),
+		}),
+	))
+	if err != nil {
+		t.Fatalf("RemovePod-shaped round must ignore unrelated stale entry: %v", err)
+	}
+	if len(res.PendingByPod) != 1 || res.PendingByPod[0].PodUID != liveUID {
+		t.Fatalf("pending entries = %#v, want only live pod", res.PendingByPod)
+	}
+	if fetcher.freshLookups[liveUID] != 1 || fetcher.freshLookups[staleUID] != 1 {
+		t.Fatalf("fresh lookups = %#v, want one per pending pod", fetcher.freshLookups)
+	}
+}
+
+func bulkheadConfigWithPrimary(primary string) bulkheadconfig.BulkheadConfiguration {
+	return bulkheadconfig.BulkheadConfiguration{BulkheadPrimaryRelPath: primary}
+}
