@@ -2723,6 +2723,63 @@ func TestAdvisorPostCommitCheckpointCorruptionFailsClosed(t *testing.T) {
 		"a corrupted checkpoint for the committed revision must remain for operator recovery")
 }
 
+func TestAdvisorPostCommitProgressIdentityPhaseGenerationAndNotification(t *testing.T) {
+	p := &DynamicPolicy{}
+	target := cloneAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, 7)
+
+	p.publishPreparedAdvisorPostCommitTarget(target)
+	published := p.currentAdvisorPostCommitProgress()
+	require.Same(t, target, published.target)
+	require.Equal(t, advisorPostCommitPhasePublished, published.phase)
+	require.NotZero(t, published.generation)
+	require.False(t, published.createdAt.IsZero())
+	require.False(t, published.lastProgressAt.IsZero())
+
+	_, changed := p.currentAdvisorPostCommitTargetAndChange()
+	p.recordAdvisorPostCommitProgress(target, advisorPostCommitPhasePhysicalApply)
+	select {
+	case <-changed:
+	case <-time.After(time.Second):
+		t.Fatal("progress update did not notify waiters")
+	}
+
+	applying := p.currentAdvisorPostCommitProgress()
+	require.Same(t, target, applying.target)
+	require.Equal(t, advisorPostCommitPhasePhysicalApply, applying.phase)
+	require.Greater(t, applying.generation, published.generation)
+	require.Equal(t, published.createdAt, applying.createdAt)
+	require.False(t, applying.lastProgressAt.Before(published.lastProgressAt))
+
+	replacement := cloneAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, 8)
+	p.publishPreparedAdvisorPostCommitTarget(replacement)
+	replaced := p.currentAdvisorPostCommitProgress()
+	require.Same(t, replacement, replaced.target)
+	require.NotEqual(t, applying.target, replaced.target)
+	require.Equal(t, advisorPostCommitPhasePublished, replaced.phase)
+}
+
+func TestRecoveredAdvisorPostCommitTargetStartsFreshProgressClock(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	dir := t.TempDir()
+	first, err := getTestDynamicPolicyWithoutInitialization(topology, dir)
+	require.NoError(t, err)
+	first.state.SetPodEntries(state.PodEntries{}, true)
+	target := cloneAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, first.state.GetRevision())
+	require.NoError(t, first.storeAdvisorPostCommitTarget(target, first.advisorPostCommitCheckpointPath()))
+
+	before := time.Now()
+	restarted, err := getTestDynamicPolicyWithoutInitialization(topology, dir)
+	require.NoError(t, err)
+	require.NoError(t, restarted.restoreAdvisorPostCommitTarget())
+	progress := restarted.currentAdvisorPostCommitProgress()
+	require.NotNil(t, progress.target)
+	require.Equal(t, advisorPostCommitPhasePublished, progress.phase)
+	require.NotZero(t, progress.generation)
+	require.False(t, progress.createdAt.Before(before))
+	require.False(t, progress.lastProgressAt.Before(before))
+}
+
 func TestCgroupCreateRetriesOnlyDeferredLeafDirtyAdjustment(t *testing.T) {
 	t.Parallel()
 

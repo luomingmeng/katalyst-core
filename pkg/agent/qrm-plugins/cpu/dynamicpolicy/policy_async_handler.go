@@ -362,7 +362,6 @@ func (p *DynamicPolicy) clearResidualState(_ *coreconfig.Configuration,
 		err     error
 		podList []*v1.Pod
 	)
-	residualSet := make(map[string]bool)
 
 	defer func() {
 		_ = general.UpdateHealthzStateByError(cpuconsts.ClearResidualState, err)
@@ -380,24 +379,85 @@ func (p *DynamicPolicy) clearResidualState(_ *coreconfig.Configuration,
 		return
 	}
 
+	err = p.clearResidualStateAfterPodList(ctx, podList)
+	if err != nil {
+		general.ErrorS(err, "clear residual state failed")
+	}
+}
+
+func advisorPostCommitStuckThreshold(conf *coreconfig.Configuration) time.Duration {
+	threshold := 2 * cpuSetAdjustmentHandlerTimeout(conf)
+	healthWindow := time.Duration(healthCheckTolerationTimes) * stateCheckPeriod
+	maxThreshold := healthWindow - stateCheckPeriod
+	if threshold <= 0 || threshold > maxThreshold {
+		return maxThreshold
+	}
+	return threshold
+}
+
+func advisorPostCommitCleanupWait(conf *coreconfig.Configuration) time.Duration {
+	wait := cpuSetAdjustmentHandlerTimeout(conf) / 2
+	maxWait := stateCheckPeriod / 4
+	if wait <= 0 || wait > maxWait {
+		return maxWait
+	}
+	return wait
+}
+
+func (p *DynamicPolicy) clearResidualStateAfterPodList(
+	ctx context.Context,
+	podList []*v1.Pod,
+) error {
 	podSet := sets.NewString()
 	for _, pod := range podList {
 		podSet.Insert(fmt.Sprintf("%v", pod.UID))
 	}
 
-	p.Lock()
-	defer p.Unlock()
+	wait := advisorPostCommitCleanupWait(p.conf)
+	aged := make(map[string]struct{})
+	for attempt := 0; attempt < 2; attempt++ {
+		p.Lock()
+		progress, err := p.clearResidualStateAttempt(ctx, podSet, aged)
+		p.Unlock()
+		if err != nil {
+			return err
+		}
+		if progress.target == nil {
+			return nil
+		}
+		if attempt == 1 {
+			return nil
+		}
 
-	if err = p.ensureCPUStateWriterAllowed(
-		p.state.GetRevision(), "clearResidualState", nil); err != nil {
-		general.ErrorS(err, "defer residual state cleanup while advisor post-commit target is pending")
-		return
+		timer := time.NewTimer(wait)
+		select {
+		case <-progress.changed:
+		case <-timer.C:
+		case <-ctx.Done():
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
 	}
+	return nil
+}
 
+// clearResidualStateAttempt observes and ages residuals before consulting the
+// post-commit fence. Canonical state mutation remains behind the final writer
+// fence and revision CAS.
+func (p *DynamicPolicy) clearResidualStateAttempt(
+	ctx context.Context,
+	podSet sets.String,
+	aged map[string]struct{},
+) (advisorPostCommitProgress, error) {
 	if p.residualHitMap == nil {
 		p.residualHitMap = make(map[string]int64)
 	}
 
+	residualSet := make(map[string]bool)
 	expectedRevision := p.state.GetRevision()
 	podEntries := p.state.GetPodEntries()
 	for podUID, containerEntries := range podEntries {
@@ -407,7 +467,10 @@ func (p *DynamicPolicy) clearResidualState(_ *coreconfig.Configuration,
 
 		if !podSet.Has(podUID) {
 			residualSet[podUID] = true
-			p.residualHitMap[podUID] += 1
+			if _, alreadyAged := aged[podUID]; !alreadyAged {
+				p.residualHitMap[podUID]++
+				aged[podUID] = struct{}{}
+			}
 			general.Infof("found pod: %s with state but doesn't show up in pod watcher, hit count: %d", podUID, p.residualHitMap[podUID])
 		}
 	}
@@ -425,7 +488,31 @@ func (p *DynamicPolicy) clearResidualState(_ *coreconfig.Configuration,
 		}
 	}
 
+	progress := p.currentAdvisorPostCommitProgress()
+	if progress.target != nil {
+		sinceProgress := time.Since(progress.lastProgressAt)
+		if sinceProgress >= advisorPostCommitStuckThreshold(p.conf) {
+			return progress, fmt.Errorf(
+				"advisor post-commit target stuck: revision=%d phase=%s generation=%d target_age=%s since_progress=%s",
+				progress.revision, progress.phase, progress.generation,
+				time.Since(progress.createdAt), sinceProgress)
+		}
+		general.InfoS("defer residual state cleanup while advisor post-commit target is progressing",
+			"revision", progress.revision,
+			"phase", progress.phase,
+			"generation", progress.generation,
+			"targetAge", time.Since(progress.createdAt),
+			"sinceProgress", sinceProgress)
+		return progress, nil
+	}
+
 	if podsToDelete.Len() > 0 {
+		// This is the final gate before external RemovePod side effects and the
+		// revision-CAS-protected canonical state commit.
+		if err := p.ensureCPUStateWriterAllowed(
+			expectedRevision, "clearResidualState", nil); err != nil {
+			return p.currentAdvisorPostCommitProgress(), nil
+		}
 		for {
 			podUID, found := podsToDelete.PopAny()
 			if !found {
@@ -451,20 +538,21 @@ func (p *DynamicPolicy) clearResidualState(_ *coreconfig.Configuration,
 			delete(podEntries, podUID)
 		}
 
-		var updatedMachineState state.NUMANodeMap
-		updatedMachineState, err = generateMachineStateFromPodEntries(p.machineInfo.CPUTopology, podEntries, p.state.GetMachineState())
-		if err != nil {
-			general.Errorf("GenerateMachineStateFromPodEntries failed with error: %v", err)
-			return
+		updatedMachineState, generateErr := generateMachineStateFromPodEntries(
+			p.machineInfo.CPUTopology, podEntries, p.state.GetMachineState())
+		if generateErr != nil {
+			general.Errorf("GenerateMachineStateFromPodEntries failed with error: %v", generateErr)
+			return advisorPostCommitProgress{}, generateErr
 		}
 
-		err = p.adjustAllocationEntriesAfterDeletionAtRevision(
+		adjustErr := p.adjustAllocationEntriesAfterDeletionAtRevision(
 			podEntries, updatedMachineState, true, expectedRevision)
-		if err != nil {
-			general.ErrorS(err, "adjustAllocationEntries failed")
-			return
+		if adjustErr != nil {
+			general.ErrorS(adjustErr, "adjustAllocationEntries failed")
+			return advisorPostCommitProgress{}, adjustErr
 		}
 	}
+	return advisorPostCommitProgress{}, nil
 }
 
 func (p *DynamicPolicy) persistPodDeletionAfterAdjustFailure(

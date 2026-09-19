@@ -62,6 +62,16 @@ type cpuSetAdjustmentRevisionedState interface {
 	GetRevision() uint64
 }
 
+type advisorPostCommitPhase string
+
+const (
+	advisorPostCommitPhasePrepared      advisorPostCommitPhase = "prepared"
+	advisorPostCommitPhasePublished     advisorPostCommitPhase = "published"
+	advisorPostCommitPhasePhysicalApply advisorPostCommitPhase = "physical_apply"
+	advisorPostCommitPhaseAppliedMarker advisorPostCommitPhase = "applied_marker"
+	advisorPostCommitPhaseCleanup       advisorPostCommitPhase = "cleanup"
+)
+
 type advisorPostCommitTarget struct {
 	preCommitRevision             uint64
 	prepared                      bool
@@ -75,6 +85,20 @@ type advisorPostCommitTarget struct {
 	revision                      uint64
 	response                      *advisorapi.ListAndWatchResponse
 	migrationCheckpointTransition steadyFakeNUMAMigrationCheckpointTransition
+	phase                         advisorPostCommitPhase
+	createdAt                     time.Time
+	lastProgressAt                time.Time
+	progressGeneration            uint64
+}
+
+type advisorPostCommitProgress struct {
+	target         *advisorPostCommitTarget
+	revision       uint64
+	phase          advisorPostCommitPhase
+	createdAt      time.Time
+	lastProgressAt time.Time
+	generation     uint64
+	changed        <-chan struct{}
 }
 
 type advisorPostCommitTargetContextKey struct{}
@@ -514,12 +538,25 @@ func cloneAdvisorPostCommitTarget(
 	if len(transitions) > 0 {
 		transition = cloneSteadyFakeNUMAMigrationCheckpointTransition(transitions[0])
 	}
-	return &advisorPostCommitTarget{
+	target := &advisorPostCommitTarget{
 		checkpointVersion:             advisorPostCommitCheckpointVersion,
 		revision:                      revision,
 		response:                      cloned,
 		migrationCheckpointTransition: transition,
 	}
+	initializeAdvisorPostCommitProgress(target, advisorPostCommitPhasePrepared)
+	return target
+}
+
+func initializeAdvisorPostCommitProgress(target *advisorPostCommitTarget, phase advisorPostCommitPhase) {
+	if target == nil {
+		return
+	}
+	now := time.Now()
+	target.phase = phase
+	target.createdAt = now
+	target.lastProgressAt = now
+	target.progressGeneration = 1
 }
 
 func nextAdvisorRevision(revision uint64) (uint64, error) {
@@ -547,6 +584,7 @@ func (p *DynamicPolicy) prepareAdvisorPostCommitTarget(
 func (p *DynamicPolicy) publishPreparedAdvisorPostCommitTarget(target *advisorPostCommitTarget) {
 	p.cpuSetAdjustmentRetryMu.Lock()
 	p.setAdvisorPostCommitTargetLocked(target)
+	p.recordAdvisorPostCommitProgressLocked(target, advisorPostCommitPhasePublished)
 	p.cpuSetAdjustmentRetryMu.Unlock()
 }
 
@@ -560,6 +598,7 @@ func (p *DynamicPolicy) beginPreparedAdvisorPostCommitTarget(
 	target.preCommitRevision = preCommitRevision
 	target.prepared = true
 	p.setAdvisorPostCommitTargetLocked(target)
+	p.recordAdvisorPostCommitProgressLocked(target, advisorPostCommitPhasePrepared)
 	return previous
 }
 
@@ -675,6 +714,7 @@ func (p *DynamicPolicy) commitAdvisorResponseWithWriteAheadTransition(
 		p.markAdvisorPostCommitPublicationPending(target)
 		return nil, fmt.Errorf("promote advisor post-commit target: %w", err)
 	}
+	p.recordAdvisorPostCommitProgress(target, advisorPostCommitPhasePublished)
 	return target, nil
 }
 
@@ -928,6 +968,11 @@ func loadAdvisorPostCommitTarget(
 		migrationCheckpointTransition: transition,
 		applied:                       checkpoint.Applied,
 	}
+	phase := advisorPostCommitPhasePublished
+	if checkpoint.Applied {
+		phase = advisorPostCommitPhaseCleanup
+	}
+	initializeAdvisorPostCommitProgress(target, phase)
 	if checkpoint.PreCommitRevision != nil {
 		target.preCommitRevision = *checkpoint.PreCommitRevision
 	}
@@ -1139,6 +1184,61 @@ func (p *DynamicPolicy) currentAdvisorPostCommitTargetAndChange() (*advisorPostC
 	return p.advisorPostCommitTarget, p.advisorPostCommitTargetChange
 }
 
+func (p *DynamicPolicy) currentAdvisorPostCommitProgress() advisorPostCommitProgress {
+	p.cpuSetAdjustmentRetryMu.Lock()
+	defer p.cpuSetAdjustmentRetryMu.Unlock()
+	if p.advisorPostCommitTargetChange == nil {
+		p.advisorPostCommitTargetChange = make(chan struct{})
+	}
+	target := p.advisorPostCommitTarget
+	if target == nil {
+		return advisorPostCommitProgress{changed: p.advisorPostCommitTargetChange}
+	}
+	return advisorPostCommitProgress{
+		target:         target,
+		revision:       target.revision,
+		phase:          target.phase,
+		createdAt:      target.createdAt,
+		lastProgressAt: target.lastProgressAt,
+		generation:     target.progressGeneration,
+		changed:        p.advisorPostCommitTargetChange,
+	}
+}
+
+func (p *DynamicPolicy) recordAdvisorPostCommitProgress(
+	target *advisorPostCommitTarget,
+	phase advisorPostCommitPhase,
+) {
+	p.cpuSetAdjustmentRetryMu.Lock()
+	defer p.cpuSetAdjustmentRetryMu.Unlock()
+	p.recordAdvisorPostCommitProgressLocked(target, phase)
+}
+
+// recordAdvisorPostCommitProgressLocked records runtime-only progress and wakes
+// waiters. It deliberately does not alter the WAL or canonical state.
+func (p *DynamicPolicy) recordAdvisorPostCommitProgressLocked(
+	target *advisorPostCommitTarget,
+	phase advisorPostCommitPhase,
+) {
+	if target == nil || p.advisorPostCommitTarget != target {
+		return
+	}
+	if target.phase == phase && target.progressGeneration > 0 {
+		return
+	}
+	now := time.Now()
+	if target.createdAt.IsZero() {
+		target.createdAt = now
+	}
+	target.phase = phase
+	target.lastProgressAt = now
+	target.progressGeneration++
+	if p.advisorPostCommitTargetChange != nil {
+		close(p.advisorPostCommitTargetChange)
+	}
+	p.advisorPostCommitTargetChange = make(chan struct{})
+}
+
 // setAdvisorPostCommitTargetLocked publishes a pointer transition and wakes all
 // waiters that atomically observed the previous target and change channel.
 // cpuSetAdjustmentRetryMu must be held by the caller.
@@ -1178,6 +1278,7 @@ func (p *DynamicPolicy) retryAdvisorPostCommitPublication(target *advisorPostCom
 	p.cpuSetAdjustmentRetryMu.Lock()
 	if p.advisorPostCommitTarget == target {
 		target.publicationPending = false
+		p.recordAdvisorPostCommitProgressLocked(target, advisorPostCommitPhasePublished)
 	}
 	p.cpuSetAdjustmentRetryMu.Unlock()
 	return nil
@@ -1192,6 +1293,7 @@ func (p *DynamicPolicy) persistAdvisorPostCommitApplied(target *advisorPostCommi
 	if p.advisorPostCommitTarget == target {
 		target.applyMarkerPending = false
 		target.cleanupPending = true
+		p.recordAdvisorPostCommitProgressLocked(target, advisorPostCommitPhaseCleanup)
 	}
 	p.cpuSetAdjustmentRetryMu.Unlock()
 	return nil
@@ -1286,6 +1388,7 @@ func (p *DynamicPolicy) reconcileAdvisorPostCommitTarget(
 		return nil
 	}
 
+	p.recordAdvisorPostCommitProgress(target, advisorPostCommitPhasePhysicalApply)
 	mode := cpusetutil.CPUSetAdjustmentModePeriodic
 	if len(modes) > 0 {
 		mode = modes[0].OrFullDefault()
@@ -1321,6 +1424,7 @@ func (p *DynamicPolicy) reconcileAdvisorPostCommitTarget(
 		if p.advisorPostCommitTarget == target {
 			target.applied = true
 			target.applyMarkerPending = true
+			p.recordAdvisorPostCommitProgressLocked(target, advisorPostCommitPhaseAppliedMarker)
 		}
 		p.cpuSetAdjustmentRetryMu.Unlock()
 		if err := p.persistAdvisorPostCommitApplied(target); err != nil {
