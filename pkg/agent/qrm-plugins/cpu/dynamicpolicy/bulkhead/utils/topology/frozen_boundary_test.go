@@ -18,6 +18,8 @@ package topology
 
 import (
 	"context"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -278,7 +280,6 @@ func TestEvaluateFrozenBoundaryAllowsUnreferencedHolderRetirementDuringSnapshot(
 	for _, retirementOperation := range []HierarchyOperation{
 		HierarchyOperationStat,
 		HierarchyOperationRead,
-		HierarchyOperationList,
 	} {
 		t.Run(string(retirementOperation), func(t *testing.T) {
 			snapshot, input, phases := frozenBoundaryFixture()
@@ -300,6 +301,73 @@ func TestEvaluateFrozenBoundaryAllowsUnreferencedHolderRetirementDuringSnapshot(
 			})
 		})
 	}
+}
+
+func TestEvaluateFrozenBoundaryAllowsAuthorizedHolderRetirementDuringList(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+	driver.beforeCall = func(operation HierarchyOperation, rel string) error {
+		if operation == HierarchyOperationList && rel == "root/direct/holder" {
+			delete(driver.nodes, "root/direct/holder")
+			return syscall.ENOENT
+		}
+		return nil
+	}
+
+	evaluation, err := EvaluateFrozenBoundary(
+		context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+		boundary, snapshot)
+
+	require.NoError(t, err)
+	assertSnapshotExcludesSubtree(t, evaluation.Snapshot, "root/direct/holder")
+}
+
+func TestEvaluateFrozenBoundaryAllowsAuthorizedHolderRetirementAtRecursiveFence(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+	stats := 0
+	driver.beforeCall = func(operation HierarchyOperation, rel string) error {
+		if operation == HierarchyOperationStat && rel == "root/direct/holder" {
+			stats++
+			if stats == 3 {
+				delete(driver.nodes, rel)
+			}
+		}
+		return nil
+	}
+
+	evaluation, err := EvaluateFrozenBoundary(
+		context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+		boundary, snapshot)
+
+	require.NoError(t, err)
+	assertSnapshotExcludesSubtree(t, evaluation.Snapshot, "root/direct/holder")
+}
+
+func TestEvaluateFrozenBoundaryDiscardsAuthorizedParentRetiredDuringChildScan(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+	driver.beforeCall = func(operation HierarchyOperation, rel string) error {
+		if operation == HierarchyOperationRead && rel == "root/direct/holder" {
+			delete(driver.nodes, "root/direct")
+			delete(driver.nodes, "root/direct/holder")
+			delete(driver.nodes, "root/direct/unrelated")
+		}
+		return nil
+	}
+
+	evaluation, err := EvaluateFrozenBoundary(
+		context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+		boundary, snapshot)
+
+	require.NoError(t, err)
+	assertSnapshotExcludesSubtree(t, evaluation.Snapshot, "root/direct")
 }
 
 func TestEvaluateFrozenBoundaryRejectsReferencedHolderRetirementDuringSnapshot(t *testing.T) {
@@ -333,6 +401,66 @@ func TestCompileFrozenBoundaryDoesNotRetireTargetOnlyHolder(t *testing.T) {
 	require.NoError(t, err)
 	require.NotContains(t, boundary.RetirableCPUHolders, "root/direct")
 	require.NotContains(t, boundary.RetirableCPUHolders, "root/direct/holder")
+}
+
+func TestFrozenBoundaryRetirementAuthorizationExcludesControlledRels(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+
+	authorizations := frozenBoundaryRetirementAuthorizations(boundary)
+
+	require.NotContains(t, authorizations, "root")
+	require.Contains(t, authorizations, "root/direct")
+	require.Contains(t, authorizations, "root/direct/holder")
+}
+
+func TestFrozenBoundaryRetirementAuthorizationExcludesSharedRequiredPath(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	requiredRel := "root/direct/required"
+	requiredIdentity := CgroupIdentity{Device: 1, Inode: 5}
+	snapshot.Entries[requiredRel] = EntryState{
+		Rel: requiredRel, Identity: requiredIdentity,
+		CPUs: machine.NewCPUSet(2), ConfiguredCPUs: machine.NewCPUSet(2),
+		Mems: "0", ConfiguredMems: "0",
+	}
+	snapshot.Children["root/direct"] = append(snapshot.Children["root/direct"], ChildRef{
+		Name: "required", Identity: requiredIdentity,
+	})
+	snapshot.DomainByRel[requiredRel] = DomainPrimary
+	snapshot.ScanBoundary.ExpandedRels = append(snapshot.ScanBoundary.ExpandedRels, requiredRel)
+	input.ExpectedByRel = map[string]machine.CPUSet{requiredRel: machine.NewCPUSet(2)}
+
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	authorizations := frozenBoundaryRetirementAuthorizations(boundary)
+
+	require.Equal(t, map[string]CgroupIdentity{
+		"root/direct/holder": snapshot.Entries["root/direct/holder"].Identity,
+	}, authorizations)
+}
+
+func TestFrozenBoundaryRejectsDuplicateRetirableHolders(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	boundary.RetirableCPUHolders = append(
+		boundary.RetirableCPUHolders, boundary.RetirableCPUHolders[0])
+
+	err = validateFrozenBoundary(boundary, snapshot)
+
+	require.ErrorContains(t, err, "duplicate")
+}
+
+func TestFrozenBoundaryRejectsControlledRetirableHolder(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	boundary.RetirableCPUHolders = append(boundary.RetirableCPUHolders, "root")
+
+	err = validateFrozenBoundary(boundary, snapshot)
+
+	require.ErrorContains(t, err, "controlled")
 }
 
 func TestEvaluateFrozenBoundaryAllowsRetirableShrinkDirectChildRemovalDuringSnapshot(t *testing.T) {
@@ -400,7 +528,116 @@ func TestEvaluateFrozenBoundaryAllowsMultipleRetirementsWithinOneSnapshot(t *tes
 	require.NoError(t, err)
 	require.NotContains(t, evaluation.Snapshot.Entries, "root/direct/holder")
 	require.NotContains(t, evaluation.Snapshot.Entries, secondRel)
-	require.Equal(t, 1, parentLists)
+	require.Equal(t, 2, parentLists)
+}
+
+func TestProjectFrozenBoundaryRetiresNestedAndSiblingUnavailableOnlyDescendants(t *testing.T) {
+	expected, input, phases := frozenBoundaryFixture()
+	expected.UnavailableChildren = make(map[string]UnavailableChildEvidence)
+	expected.Children["root/direct/unrelated"] = nil
+	secondRel := "root/direct/holder-second"
+	secondIdentity := CgroupIdentity{Device: 1, Inode: 5}
+	expected.Entries[secondRel] = EntryState{
+		Rel: secondRel, Identity: secondIdentity,
+		CPUs: machine.NewCPUSet(2), ConfiguredCPUs: machine.NewCPUSet(2),
+		Mems: "0", ConfiguredMems: "0",
+	}
+	expected.Children["root/direct"] = append(expected.Children["root/direct"], ChildRef{
+		Name: "holder-second", Identity: secondIdentity,
+	})
+	expected.DomainByRel[secondRel] = DomainPrimary
+	expected.ScanBoundary.ExpandedRels = append(expected.ScanBoundary.ExpandedRels, secondRel)
+	for index, holderRel := range []string{"root/direct/holder", secondRel} {
+		unavailableRel := filepath.Join(holderRel, "unavailable")
+		unavailableIdentity := CgroupIdentity{Device: 1, Inode: uint64(10 + index)}
+		expected.Children[holderRel] = []ChildRef{{
+			Name: "unavailable", Identity: unavailableIdentity,
+		}}
+		expected.UnavailableChildren[unavailableRel] = UnavailableChildEvidence{
+			Identity: unavailableIdentity,
+			Reason:   UnavailableChildReasonControllerUnavailable,
+		}
+	}
+	expected.DomainUnion = map[DomainID]machine.CPUSet{
+		DomainPrimary: machine.MustParse("0-3,9"),
+	}
+	expected.ID = fingerprintSnapshot(expected)
+	require.NoError(t, validateCompleteSnapshotEvidence(expected))
+	boundary, err := compileFrozenBoundaryV1(expected, input, phases)
+	require.NoError(t, err)
+	require.ElementsMatch(t,
+		[]string{"root/direct", "root/direct/holder", secondRel},
+		boundary.RetirableCPUHolders)
+
+	current := CloneCompleteSnapshot(expected)
+	for _, holderRel := range []string{"root/direct/holder", secondRel} {
+		delete(current.Entries, holderRel)
+		delete(current.Children, holderRel)
+		delete(current.DomainByRel, holderRel)
+		delete(current.UnavailableChildren, filepath.Join(holderRel, "unavailable"))
+	}
+	current.Children["root/direct"] = []ChildRef{{
+		Name:     "unrelated",
+		Identity: expected.Entries["root/direct/unrelated"].Identity,
+	}}
+	current.ScanBoundary.ExpandedRels = []string{"root", "root/direct", "root/direct/unrelated"}
+	current.DomainUnion = map[DomainID]machine.CPUSet{
+		DomainPrimary: machine.MustParse("0-3,9"),
+	}
+	require.NoError(t, validateCompleteSnapshotEvidence(current))
+
+	projected := projectFrozenBoundarySnapshot(boundary, expected, current)
+
+	require.NoError(t, validateCompleteSnapshotEvidence(projected))
+	assertSnapshotExcludesSubtree(t, projected, "root/direct/holder")
+	assertSnapshotExcludesSubtree(t, projected, secondRel)
+	require.Contains(t, projected.Entries, "root/direct/unrelated")
+}
+
+func TestProjectFrozenBoundaryRetiresOutermostMissingRetirablePath(t *testing.T) {
+	expected, input, phases := frozenBoundaryFixture()
+	boundary, err := compileFrozenBoundaryV1(expected, input, phases)
+	require.NoError(t, err)
+	boundary.RelevantCPUHolders = []string{"root/direct/holder"}
+	boundary.RetirableCPUHolders = []string{"root/direct/holder"}
+	boundary.RelevantHolderPaths = map[string][]FrozenRelIdentity{
+		"root/direct/holder": boundary.RelevantHolderPaths["root/direct/holder"],
+	}
+	require.NoError(t, validateFrozenBoundary(boundary, expected))
+
+	current := CloneCompleteSnapshot(expected)
+	deleteProjectedSubtree(current, "root/direct")
+	current.Children["root"] = nil
+	current.DomainUnion = map[DomainID]machine.CPUSet{
+		DomainPrimary: expected.Entries["root"].CPUs.Clone(),
+	}
+	current.ID = fingerprintSnapshot(current)
+	require.NoError(t, validateCompleteSnapshotEvidence(current))
+
+	projected := projectFrozenBoundarySnapshot(boundary, expected, current)
+
+	require.NoError(t, validateCompleteSnapshotEvidence(projected))
+	assertSnapshotExcludesSubtree(t, projected, "root/direct")
+}
+
+func TestDeleteProjectedSubtreeRemovesExpandedRels(t *testing.T) {
+	snapshot := &CompleteSnapshot{
+		Entries: map[string]EntryState{
+			"root":        {Rel: "root"},
+			"root/gone":   {Rel: "root/gone"},
+			"root/gone/x": {Rel: "root/gone/x"},
+		},
+		Children:            make(map[string][]ChildRef),
+		UnavailableChildren: make(map[string]UnavailableChildEvidence),
+		DomainByRel:         make(map[string]DomainID),
+		ScanBoundary: ScanBoundary{
+			ExpandedRels: []string{"root", "root/gone", "root/gone/x"},
+		},
+	}
+
+	deleteProjectedSubtree(snapshot, "root/gone")
+
+	require.Equal(t, []string{"root"}, snapshot.ScanBoundary.ExpandedRels)
 }
 
 func TestEvaluateFrozenBoundaryDoesNotRetryRetirableHolderIdentityError(t *testing.T) {
@@ -430,6 +667,92 @@ func TestEvaluateFrozenBoundaryDoesNotRetryRetirableHolderIdentityError(t *testi
 	require.Equal(t, 1, holderStats)
 }
 
+func TestEvaluateFrozenBoundaryRejectsUnauthorizedRetirementWindows(t *testing.T) {
+	for _, window := range []string{"list", "recursive-fence"} {
+		t.Run("semantic-"+window, func(t *testing.T) {
+			snapshot, input, phases := frozenBoundaryFixture()
+			input.ExpectedByRel = map[string]machine.CPUSet{
+				"root/direct/holder": machine.NewCPUSet(2),
+			}
+			boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+			require.NoError(t, err)
+			driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+			injectFrozenRetirementWindow(driver, "root/direct/holder", window, false)
+
+			_, err = EvaluateFrozenBoundary(
+				context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+				boundary, snapshot)
+
+			require.Error(t, err)
+		})
+
+		t.Run("controlled-"+window, func(t *testing.T) {
+			snapshot, input, phases := frozenBoundaryFixture()
+			boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+			require.NoError(t, err)
+			driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+			injectFrozenRetirementWindow(driver, "root", window, false)
+
+			_, err = EvaluateFrozenBoundary(
+				context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+				boundary, snapshot)
+
+			require.Error(t, err)
+		})
+
+		t.Run("replacement-"+window, func(t *testing.T) {
+			snapshot, input, phases := frozenBoundaryFixture()
+			boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+			require.NoError(t, err)
+			driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+			injectFrozenRetirementWindow(driver, "root/direct/holder", window, true)
+
+			_, err = EvaluateFrozenBoundary(
+				context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+				boundary, snapshot)
+
+			require.Error(t, err)
+			require.ErrorIs(t, err, ErrCgroupIdentityChanged)
+		})
+	}
+}
+
+func injectFrozenRetirementWindow(
+	driver *fakeHierarchyDriver,
+	rel, window string,
+	replacement bool,
+) {
+	stats := 0
+	driver.beforeCall = func(operation HierarchyOperation, calledRel string) error {
+		if calledRel != rel {
+			return nil
+		}
+		trigger := operation == HierarchyOperationList && window == "list"
+		if operation == HierarchyOperationStat {
+			stats++
+			trigger = trigger || window == "recursive-fence" && stats == 3
+		}
+		if !trigger {
+			return nil
+		}
+		old := driver.nodes[rel]
+		delete(driver.nodes, rel)
+		if replacement {
+			driver.nodes[rel] = &fakeHierarchyNode{
+				identity:       CgroupIdentity{Device: old.identity.Device, Inode: old.identity.Inode + 100},
+				cpus:           old.cpus.Clone(),
+				configuredCPUs: old.configuredCPUs.Clone(),
+				mems:           old.mems,
+				configuredMems: old.configuredMems,
+			}
+		}
+		if window == "list" {
+			return syscall.ENOENT
+		}
+		return nil
+	}
+}
+
 func deleteHolderAfterParentListing(
 	driver *fakeHierarchyDriver,
 	parentRel, holderRel string,
@@ -454,15 +777,43 @@ func deleteHolderDuringRead(
 			holderStats++
 		}
 		retireNow := operation == retirementOperation
-		if retirementOperation == HierarchyOperationList {
-			retireNow = operation == HierarchyOperationStat && holderStats == 2
-		}
 		if rel == holderRel && parentListed && !retired && retireNow {
 			delete(driver.nodes, holderRel)
 			retired = true
 		}
 		return nil
 	}
+}
+
+func assertSnapshotExcludesSubtree(t *testing.T, snapshot *CompleteSnapshot, retiredRel string) {
+	t.Helper()
+	require.NotNil(t, snapshot)
+	prefix := retiredRel + "/"
+	for rel := range snapshot.Entries {
+		require.False(t, rel == retiredRel || strings.HasPrefix(rel, prefix), "Entries contains retired rel %q", rel)
+	}
+	for rel, children := range snapshot.Children {
+		require.False(t, rel == retiredRel || strings.HasPrefix(rel, prefix), "Children contains retired parent %q", rel)
+		for _, child := range children {
+			childRel := filepath.Join(rel, child.Name)
+			require.False(t, childRel == retiredRel || strings.HasPrefix(childRel, prefix),
+				"Children contains retired child %q", childRel)
+		}
+	}
+	for rel := range snapshot.DomainByRel {
+		require.False(t, rel == retiredRel || strings.HasPrefix(rel, prefix), "DomainByRel contains retired rel %q", rel)
+	}
+	for rel := range snapshot.UnavailableChildren {
+		require.False(t, rel == retiredRel || strings.HasPrefix(rel, prefix), "UnavailableChildren contains retired rel %q", rel)
+	}
+	for _, rel := range snapshot.ScanBoundary.ExpandedRels {
+		require.False(t, rel == retiredRel || strings.HasPrefix(rel, prefix), "ExpandedRels contains retired rel %q", rel)
+	}
+	union := make(map[DomainID]machine.CPUSet)
+	for rel, entry := range snapshot.Entries {
+		union[snapshot.DomainByRel[rel]] = union[snapshot.DomainByRel[rel]].Union(entry.CPUs)
+	}
+	require.Equal(t, union, snapshot.DomainUnion)
 }
 
 func addFrozenBoundaryDirectChild(
@@ -543,6 +894,8 @@ func frozenBoundaryFixture() (*CompleteSnapshot, FrozenCoordinatorEvaluationInpu
 				{Name: "holder", Identity: identities["root/direct/holder"]},
 				{Name: "unrelated", Identity: identities["root/direct/unrelated"]},
 			},
+			"root/direct/holder":    nil,
+			"root/direct/unrelated": nil,
 		},
 		DomainByRel: map[string]DomainID{
 			"root":                  DomainPrimary,
@@ -551,7 +904,7 @@ func frozenBoundaryFixture() (*CompleteSnapshot, FrozenCoordinatorEvaluationInpu
 			"root/direct/unrelated": DomainPrimary,
 		},
 		DomainUnion: map[DomainID]machine.CPUSet{
-			DomainPrimary: machine.MustParse("0-3"),
+			DomainPrimary: machine.MustParse("0-3,9"),
 		},
 		ScanBoundary: ScanBoundary{
 			Purpose: ScanForPlan,

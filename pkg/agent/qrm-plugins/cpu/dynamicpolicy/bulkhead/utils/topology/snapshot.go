@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strings"
+	"syscall"
 	"time"
 
 	cgroupclient "github.com/kubewharf/katalyst-core/pkg/util/cgroup/client"
@@ -146,9 +148,9 @@ type snapshotBuilder struct {
 	budget     *BudgetTracker
 	snapshot   *CompleteSnapshot
 	controlled map[string]*TopoNode
+	selected   map[string]struct{}
 	boundaries map[string]struct{}
 	retirable  map[string]CgroupIdentity
-	retired    map[string]struct{}
 }
 
 // BuildCompleteSnapshot returns either complete purpose-scoped evidence or a
@@ -209,9 +211,9 @@ func buildCompleteSnapshotWithBoundary(
 		driver:     driver,
 		budget:     budget,
 		controlled: make(map[string]*TopoNode, len(dag.index)),
+		selected:   make(map[string]struct{}, len(boundary.Roots)),
 		boundaries: boundaries,
 		retirable:  retirable,
-		retired:    make(map[string]struct{}),
 		snapshot: &CompleteSnapshot{
 			CapturedAt:          time.Now(),
 			Capabilities:        driver.Capabilities(),
@@ -230,13 +232,25 @@ func buildCompleteSnapshotWithBoundary(
 		builder.controlled[rel] = node
 	}
 	for _, rel := range boundary.Roots {
+		builder.selected[rel] = struct{}{}
+	}
+	for _, rel := range boundary.Roots {
 		node := dag.index[rel]
 		domain := node.Domain
-		if err := builder.scan(rel, domain, 1, CgroupIdentity{}, expand[rel], boundary.Purpose == ScanForPrecheck); err != nil {
+		if _, err := builder.scan(rel, domain, 1, CgroupIdentity{}, expand[rel], boundary.Purpose == ScanForPrecheck); err != nil {
 			return nil, err
 		}
 	}
+	builder.rebuildDomainUnion()
 	builder.snapshot.Cost = budget.Usage()
+	if err := validateCompleteSnapshotEvidence(builder.snapshot); err != nil {
+		return nil, &SnapshotError{
+			Operation:  HierarchyOperationRead,
+			Class:      HierarchyErrorInvalid,
+			EvidenceID: fingerprintSnapshot(builder.snapshot),
+			Err:        fmt.Errorf("validate snapshot closure: %w", err),
+		}
+	}
 	builder.snapshot.ID = fingerprintSnapshot(builder.snapshot)
 	return builder.snapshot, nil
 }
@@ -281,87 +295,93 @@ func newCompleteSnapshotSource(
 	}
 }
 
-func (b *snapshotBuilder) scan(rel string, domain DomainID, depth int, expected CgroupIdentity, expand, immediateOnly bool) error {
+func (b *snapshotBuilder) scan(
+	rel string,
+	domain DomainID,
+	depth int,
+	expected CgroupIdentity,
+	expand, immediateOnly bool,
+) (bool, error) {
 	if _, done := b.snapshot.Entries[rel]; done {
-		return nil
+		return false, nil
 	}
 	before, err := b.driver.StatIdentity(b.ctx, rel)
 	if err != nil {
-		if expected != (CgroupIdentity{}) &&
-			b.retirable[rel] == expected &&
-			isCgroupNotFoundError(err) {
-			b.retired[rel] = struct{}{}
-			return nil
+		if b.authorizedRetirement(rel, expected, err) {
+			return b.confirmEarlyRetirement(rel, expected, err)
 		}
-		return b.fail(HierarchyOperationStat, rel, expected, err)
+		return false, b.fail(HierarchyOperationStat, rel, expected, err)
 	}
 	if expected != (CgroupIdentity{}) && before != expected {
-		return b.fail(HierarchyOperationStat, rel, before, fmt.Errorf("%w: listed=%v stat=%v", ErrCgroupIdentityChanged, expected, before))
+		return false, b.fail(HierarchyOperationStat, rel, before, fmt.Errorf("%w: listed=%v stat=%v", ErrCgroupIdentityChanged, expected, before))
 	}
 	if err := b.budget.VisitNode(rel, before, depth); err != nil {
-		return b.fail(HierarchyOperationStat, rel, before, err)
+		return false, b.fail(HierarchyOperationStat, rel, before, err)
 	}
 	entry, err := b.driver.ReadEntry(b.ctx, rel)
 	if err != nil {
-		if b.retirable[rel] == before && isCgroupNotFoundError(err) {
-			b.retired[rel] = struct{}{}
-			return nil
+		if b.authorizedRetirement(rel, before, err) {
+			return b.confirmEarlyRetirement(rel, before, err)
 		}
 		if b.shouldSkipUnavailableController(rel, depth, err) {
 			b.snapshot.UnavailableChildren[rel] = UnavailableChildEvidence{
 				Identity: before,
 				Reason:   UnavailableChildReasonControllerUnavailable,
 			}
-			return nil
+			return false, nil
 		}
-		return b.fail(HierarchyOperationRead, rel, before, err)
+		return false, b.fail(HierarchyOperationRead, rel, before, err)
 	}
 	after, err := b.driver.StatIdentity(b.ctx, rel)
 	if err != nil {
-		if b.retirable[rel] == before && isCgroupNotFoundError(err) {
-			b.retired[rel] = struct{}{}
-			return nil
+		if b.authorizedRetirement(rel, before, err) {
+			return b.confirmEarlyRetirement(rel, before, err)
 		}
-		return b.fail(HierarchyOperationStat, rel, before, err)
+		return false, b.fail(HierarchyOperationStat, rel, before, err)
 	}
 	if before != after || entry.Identity != before {
-		return b.fail(HierarchyOperationStat, rel, after, fmt.Errorf("%w: before=%v read=%v after=%v", ErrCgroupIdentityChanged, before, entry.Identity, after))
+		return false, b.fail(HierarchyOperationStat, rel, after, fmt.Errorf("%w: before=%v read=%v after=%v", ErrCgroupIdentityChanged, before, entry.Identity, after))
 	}
 	entry.Rel = rel
 	entry.CPUs = entry.CPUs.Clone()
 	entry.ConfiguredCPUs = entry.ConfiguredCPUs.Clone()
 	b.snapshot.Entries[rel] = entry
 	b.snapshot.DomainByRel[rel] = domain
-	b.snapshot.DomainUnion[domain] = b.snapshot.DomainUnion[domain].Union(entry.CPUs)
 
-	if !expand && !immediateOnly {
-		return nil
+	if !expand && !immediateOnly && !b.hasSelectedControlledChild(rel) {
+		return false, nil
 	}
 	children, err := b.driver.ListChildren(b.ctx, rel)
 	if err != nil {
-		return b.fail(HierarchyOperationList, rel, entry.Identity, err)
-	}
-	parentIdentity, err := b.driver.StatIdentity(b.ctx, rel)
-	if err != nil {
-		return b.fail(HierarchyOperationStat, rel, entry.Identity, err)
-	}
-	if parentIdentity != entry.Identity {
-		return b.fail(HierarchyOperationStat, rel, parentIdentity, fmt.Errorf(
-			"%w: read=%v after-list=%v", ErrCgroupIdentityChanged, entry.Identity, parentIdentity))
+		if isCgroupPathAbsent(err) {
+			retired, confirmErr := b.confirmRetirement(rel, entry.Identity)
+			if confirmErr != nil {
+				return false, confirmErr
+			}
+			if retired {
+				return true, nil
+			}
+		}
+		return false, b.fail(HierarchyOperationList, rel, entry.Identity, err)
 	}
 	sort.Slice(children, func(i, j int) bool { return children[i].Name < children[j].Name })
-	b.snapshot.Children[rel] = append([]ChildRef(nil), children...)
 	retainedChildren := make([]ChildRef, 0, len(children))
+	scannedChildren := make([]ChildRef, 0, len(children))
+	childRetired := false
 	b.snapshot.ScanBoundary.ExpandedRels = append(b.snapshot.ScanBoundary.ExpandedRels, rel)
 	for _, child := range children {
 		childRel := filepath.Join(rel, child.Name)
 		if withinTraversalBoundary(childRel, b.boundaries) {
-			retainedChildren = append(retainedChildren, child)
 			continue
 		}
 		childNode, isControlled := b.controlled[childRel]
 		if isControlled && !immediateOnly {
-			retainedChildren = append(retainedChildren, child)
+			if _, selected := b.selected[childRel]; selected {
+				retainedChildren = append(retainedChildren, child)
+			}
+			continue
+		}
+		if !expand && !immediateOnly {
 			continue
 		}
 		childDomain := domain
@@ -369,16 +389,186 @@ func (b *snapshotBuilder) scan(rel string, domain DomainID, depth int, expected 
 			childDomain = childNode.Domain
 		}
 		childExpand := expand && !immediateOnly
-		if err := b.scan(childRel, childDomain, depth+1, child.Identity, childExpand, false); err != nil {
-			return err
+		retiredChild, scanErr := b.scan(childRel, childDomain, depth+1, child.Identity, childExpand, false)
+		if scanErr != nil {
+			if !isCgroupPathAbsent(scanErr) {
+				return false, scanErr
+			}
+			retired, confirmErr := b.confirmRetirement(rel, entry.Identity)
+			if confirmErr != nil {
+				return false, confirmErr
+			}
+			if retired {
+				return true, nil
+			}
+			return false, scanErr
 		}
-		if _, retired := b.retired[childRel]; !retired {
+		if !retiredChild {
 			retainedChildren = append(retainedChildren, child)
+			scannedChildren = append(scannedChildren, child)
+		} else {
+			childRetired = true
+		}
+	}
+	if childRetired {
+		currentChildren, listErr := b.driver.ListChildren(b.ctx, rel)
+		if listErr != nil {
+			if isCgroupPathAbsent(listErr) {
+				retired, confirmErr := b.confirmRetirement(rel, entry.Identity)
+				if confirmErr != nil {
+					return false, confirmErr
+				}
+				if retired {
+					return true, nil
+				}
+			}
+			return false, b.fail(HierarchyOperationList, rel, entry.Identity, listErr)
+		}
+		currentChildren = b.filterRecursivelyScannedChildren(
+			rel, currentChildren, expand, immediateOnly)
+		sort.Slice(currentChildren, func(i, j int) bool {
+			return currentChildren[i].Name < currentChildren[j].Name
+		})
+		if !equalChildRefs(scannedChildren, currentChildren) {
+			return false, b.fail(HierarchyOperationList, rel, entry.Identity, fmt.Errorf(
+				"%w: children changed after retirement: expected=%v current=%v",
+				ErrCgroupIdentityChanged, scannedChildren, currentChildren))
 		}
 	}
 	b.snapshot.Children[rel] = retainedChildren
 	sort.Strings(b.snapshot.ScanBoundary.ExpandedRels)
-	return nil
+	retired, err := b.confirmRetirement(rel, entry.Identity)
+	if err != nil {
+		return false, err
+	}
+	return retired, nil
+}
+
+func (b *snapshotBuilder) filterRecursivelyScannedChildren(
+	parentRel string,
+	children []ChildRef,
+	expand bool,
+	immediateOnly bool,
+) []ChildRef {
+	inScope := make([]ChildRef, 0, len(children))
+	for _, child := range children {
+		childRel := filepath.Join(parentRel, child.Name)
+		if withinTraversalBoundary(childRel, b.boundaries) {
+			continue
+		}
+		if _, isControlled := b.controlled[childRel]; isControlled && !immediateOnly {
+			continue
+		}
+		if !expand && !immediateOnly {
+			continue
+		}
+		inScope = append(inScope, child)
+	}
+	return inScope
+}
+
+func (b *snapshotBuilder) hasSelectedControlledChild(rel string) bool {
+	for selectedRel := range b.selected {
+		node := b.controlled[selectedRel]
+		if node != nil && node.parent != nil && node.parent.Rel == rel {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *snapshotBuilder) authorizedRetirement(rel string, identity CgroupIdentity, err error) bool {
+	return identity != (CgroupIdentity{}) &&
+		b.retirable[rel] == identity &&
+		isCgroupPathAbsent(err)
+}
+
+func (b *snapshotBuilder) confirmEarlyRetirement(
+	rel string,
+	identity CgroupIdentity,
+	absenceErr error,
+) (bool, error) {
+	current, err := b.driver.StatIdentity(b.ctx, rel)
+	if err != nil {
+		if b.authorizedRetirement(rel, identity, err) {
+			b.retireSubtree(rel)
+			return true, nil
+		}
+		return false, b.fail(HierarchyOperationStat, rel, identity, err)
+	}
+	return false, b.fail(HierarchyOperationStat, rel, current, fmt.Errorf(
+		"%w: rel=%q appeared after absence (%v): expected=%v current=%v",
+		ErrCgroupIdentityChanged, rel, absenceErr, identity, current))
+}
+
+func (b *snapshotBuilder) confirmRetirement(rel string, identity CgroupIdentity) (bool, error) {
+	current, err := b.driver.StatIdentity(b.ctx, rel)
+	if err != nil {
+		if b.authorizedRetirement(rel, identity, err) {
+			b.retireSubtree(rel)
+			return true, nil
+		}
+		return false, b.fail(HierarchyOperationStat, rel, identity, err)
+	}
+	if current != identity {
+		return false, b.fail(HierarchyOperationStat, rel, current, fmt.Errorf(
+			"%w: read=%v recursive-fence=%v", ErrCgroupIdentityChanged, identity, current))
+	}
+	return false, nil
+}
+
+func (b *snapshotBuilder) retireSubtree(rel string) {
+	prefix := rel + "/"
+	underRetiredRoot := func(candidate string) bool {
+		return candidate == rel || strings.HasPrefix(candidate, prefix)
+	}
+	for candidate := range b.snapshot.Entries {
+		if underRetiredRoot(candidate) {
+			delete(b.snapshot.Entries, candidate)
+			delete(b.snapshot.DomainByRel, candidate)
+			delete(b.snapshot.UnavailableChildren, candidate)
+		}
+	}
+	for candidate := range b.snapshot.UnavailableChildren {
+		if underRetiredRoot(candidate) {
+			delete(b.snapshot.UnavailableChildren, candidate)
+		}
+	}
+	for parent, children := range b.snapshot.Children {
+		if underRetiredRoot(parent) {
+			delete(b.snapshot.Children, parent)
+			continue
+		}
+		retained := children[:0]
+		for _, child := range children {
+			if !underRetiredRoot(filepath.Join(parent, child.Name)) {
+				retained = append(retained, child)
+			}
+		}
+		b.snapshot.Children[parent] = retained
+	}
+	expanded := b.snapshot.ScanBoundary.ExpandedRels[:0]
+	for _, candidate := range b.snapshot.ScanBoundary.ExpandedRels {
+		if !underRetiredRoot(candidate) {
+			expanded = append(expanded, candidate)
+		}
+	}
+	b.snapshot.ScanBoundary.ExpandedRels = expanded
+}
+
+func (b *snapshotBuilder) rebuildDomainUnion() {
+	b.snapshot.DomainUnion = make(map[DomainID]machine.CPUSet)
+	for rel, entry := range b.snapshot.Entries {
+		domain := b.snapshot.DomainByRel[rel]
+		b.snapshot.DomainUnion[domain] = b.snapshot.DomainUnion[domain].Union(entry.CPUs)
+	}
+}
+
+func isCgroupPathAbsent(err error) bool {
+	if err == nil || errors.Is(err, ErrCgroupControllerUnavailable) {
+		return false
+	}
+	return errors.Is(err, syscall.ENOENT)
 }
 
 func (b *snapshotBuilder) shouldSkipUnavailableController(rel string, depth int, err error) bool {

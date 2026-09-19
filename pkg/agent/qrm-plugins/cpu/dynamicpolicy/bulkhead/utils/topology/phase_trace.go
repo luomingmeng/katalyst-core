@@ -1081,9 +1081,43 @@ func validateCompleteSnapshotEvidence(snapshot *CompleteSnapshot) error {
 			return fmt.Errorf("children parent %q has no entry", rel)
 		}
 	}
+	for parentRel, children := range snapshot.Children {
+		names := make(map[string]struct{}, len(children))
+		for _, child := range children {
+			if _, duplicate := names[child.Name]; duplicate {
+				return fmt.Errorf("children parent %q has duplicate child %q", parentRel, child.Name)
+			}
+			names[child.Name] = struct{}{}
+			childRel := filepath.Join(parentRel, child.Name)
+			entry, hasEntry := snapshot.Entries[childRel]
+			unavailable, hasUnavailable := snapshot.UnavailableChildren[childRel]
+			if hasEntry == hasUnavailable {
+				return fmt.Errorf("child %q must have exactly one entry or unavailable proof", childRel)
+			}
+			if hasEntry && entry.Identity != child.Identity {
+				return fmt.Errorf("child %q identity disagrees with entry", childRel)
+			}
+			if hasUnavailable && unavailable.Identity != child.Identity {
+				return fmt.Errorf("child %q identity disagrees with unavailable proof", childRel)
+			}
+		}
+	}
 	for _, rel := range snapshot.ScanBoundary.Roots {
 		if _, ok := snapshot.Entries[rel]; !ok {
 			return fmt.Errorf("root %q has no entry", rel)
+		}
+	}
+	expanded := make(map[string]struct{}, len(snapshot.ScanBoundary.ExpandedRels))
+	for _, rel := range snapshot.ScanBoundary.ExpandedRels {
+		if _, duplicate := expanded[rel]; duplicate {
+			return fmt.Errorf("expanded rel %q is duplicated", rel)
+		}
+		expanded[rel] = struct{}{}
+		if _, ok := snapshot.Entries[rel]; !ok {
+			return fmt.Errorf("expanded rel %q has no entry", rel)
+		}
+		if _, ok := snapshot.Children[rel]; !ok {
+			return fmt.Errorf("expanded rel %q has no children evidence", rel)
 		}
 	}
 	union := make(map[DomainID]machine.CPUSet)

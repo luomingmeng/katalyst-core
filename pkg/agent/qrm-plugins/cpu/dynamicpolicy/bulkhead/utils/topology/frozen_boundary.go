@@ -197,7 +197,15 @@ func validateFrozenBoundary(boundary FrozenBoundary, snapshot *CompleteSnapshot)
 	for _, rel := range boundary.RelevantCPUHolders {
 		relevantHolders[rel] = struct{}{}
 	}
+	retirableHolders := make(map[string]struct{}, len(boundary.RetirableCPUHolders))
 	for _, rel := range boundary.RetirableCPUHolders {
+		if _, duplicate := retirableHolders[rel]; duplicate {
+			return fmt.Errorf("frozen boundary has duplicate retirable holder %q", rel)
+		}
+		retirableHolders[rel] = struct{}{}
+		if _, isControlled := controlled[rel]; isControlled {
+			return fmt.Errorf("frozen boundary retirable holder %q is controlled", rel)
+		}
 		if _, ok := relevantHolders[rel]; !ok {
 			return fmt.Errorf("frozen boundary retirable holder %q is not relevant", rel)
 		}
@@ -446,9 +454,12 @@ func EvaluateFrozenBoundary(
 	if err := evaluateFrozenBoundarySnapshot(boundary, expected, fresh); err != nil {
 		return FrozenBoundaryEvaluation{Snapshot: fresh}, err
 	}
-	return FrozenBoundaryEvaluation{
-		Snapshot: projectFrozenBoundarySnapshot(boundary, expected, fresh),
-	}, nil
+	projected := projectFrozenBoundarySnapshot(boundary, expected, fresh)
+	if err := validateCompleteSnapshotEvidence(projected); err != nil {
+		return FrozenBoundaryEvaluation{Snapshot: projected},
+			fmt.Errorf("validate frozen boundary projection: %w", err)
+	}
+	return FrozenBoundaryEvaluation{Snapshot: projected}, nil
 }
 
 func projectFrozenBoundarySnapshot(
@@ -456,7 +467,7 @@ func projectFrozenBoundarySnapshot(
 	expected, current *CompleteSnapshot,
 ) *CompleteSnapshot {
 	projected := CloneCompleteSnapshot(expected)
-	retirableHolders, _ := indexFrozenRetirablePaths(boundary)
+	retirableHolders, retirablePaths := indexFrozenRetirablePaths(boundary)
 	retiredRoots := make(map[string]CgroupIdentity)
 	for _, rel := range boundary.ControlledRels {
 		projected.Entries[rel] = cloneEntryState(current.Entries[rel])
@@ -477,6 +488,20 @@ func projectFrozenBoundarySnapshot(
 		projectGrowChildren(projected, current, rel)
 	}
 	for _, rel := range boundary.RelevantCPUHolders {
+		retiredPath := false
+		for _, item := range boundary.RelevantHolderPaths[rel] {
+			if _, present := current.Entries[item.Rel]; present {
+				continue
+			}
+			if _, retirable := retirablePaths[item.Rel]; retirable {
+				retiredRoots[item.Rel] = item.Identity
+				retiredPath = true
+				break
+			}
+		}
+		if retiredPath {
+			continue
+		}
 		if entry, ok := current.Entries[rel]; ok {
 			projected.Entries[rel] = cloneEntryState(entry)
 		} else if _, retirable := retirableHolders[rel]; retirable {
@@ -538,6 +563,11 @@ func retireProjectedSubtrees(
 			delete(snapshot.UnavailableChildren, rel)
 		}
 	}
+	for rel := range snapshot.UnavailableChildren {
+		if underRetiredRoot(rel) {
+			delete(snapshot.UnavailableChildren, rel)
+		}
+	}
 	for parentRel, children := range snapshot.Children {
 		if underRetiredRoot(parentRel) {
 			delete(snapshot.Children, parentRel)
@@ -581,14 +611,29 @@ func projectGrowChildren(projected, current *CompleteSnapshot, rel string) {
 
 func deleteProjectedSubtree(snapshot *CompleteSnapshot, rel string) {
 	prefix := rel + "/"
+	underDeletedRoot := func(candidate string) bool {
+		return candidate == rel || strings.HasPrefix(candidate, prefix)
+	}
 	for candidate := range snapshot.Entries {
-		if candidate == rel || strings.HasPrefix(candidate, prefix) {
+		if underDeletedRoot(candidate) {
 			delete(snapshot.Entries, candidate)
 			delete(snapshot.Children, candidate)
 			delete(snapshot.DomainByRel, candidate)
 			delete(snapshot.UnavailableChildren, candidate)
 		}
 	}
+	for candidate := range snapshot.UnavailableChildren {
+		if underDeletedRoot(candidate) {
+			delete(snapshot.UnavailableChildren, candidate)
+		}
+	}
+	expanded := snapshot.ScanBoundary.ExpandedRels[:0]
+	for _, candidate := range snapshot.ScanBoundary.ExpandedRels {
+		if !underDeletedRoot(candidate) {
+			expanded = append(expanded, candidate)
+		}
+	}
+	snapshot.ScanBoundary.ExpandedRels = expanded
 }
 
 func cloneEntryState(entry EntryState) EntryState {
@@ -775,11 +820,19 @@ func frozenBoundaryRetirementAuthorizations(
 ) map[string]CgroupIdentity {
 	_, retirablePaths := indexFrozenRetirablePaths(boundary)
 	authorizations := make(map[string]CgroupIdentity, len(retirablePaths))
+	controlled := make(map[string]struct{}, len(boundary.ControlledRels))
+	for _, rel := range boundary.ControlledRels {
+		controlled[rel] = struct{}{}
+	}
 	for _, holderRel := range boundary.RetirableCPUHolders {
 		for _, item := range boundary.RelevantHolderPaths[holderRel] {
-			if _, ok := retirablePaths[item.Rel]; ok {
-				authorizations[item.Rel] = item.Identity
+			if _, ok := retirablePaths[item.Rel]; !ok {
+				continue
 			}
+			if _, isControlled := controlled[item.Rel]; isControlled {
+				continue
+			}
+			authorizations[item.Rel] = item.Identity
 		}
 	}
 	return authorizations
