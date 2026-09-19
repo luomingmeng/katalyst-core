@@ -62,7 +62,11 @@ func compileFrozenBoundaryV1(
 	relevant := input.ProtectedPending.Clone()
 	shrinkRels := make(map[string]struct{})
 	for _, values := range []map[string]machine.CPUSet{
+		input.ExpectedByRel,
+		input.TargetByRel,
+		input.ParentSafetyTargetByRel,
 		input.RequiredByRel,
+		input.DeferredByRel,
 		input.PendingRequiredByRel,
 	} {
 		for _, cpus := range values {
@@ -74,9 +78,8 @@ func compileFrozenBoundaryV1(
 			if operation.Direction == WriteShrink {
 				shrinkRels[operation.Rel] = struct{}{}
 			}
-			transition := operation.ExpectedCurrent.CPUs.Difference(operation.Target.CPUs).
-				Union(operation.Target.CPUs.Difference(operation.ExpectedCurrent.CPUs))
-			relevant = relevant.Union(transition)
+			relevant = relevant.Union(operation.ExpectedCurrent.CPUs).
+				Union(operation.Target.CPUs)
 		}
 	}
 

@@ -38,7 +38,7 @@ func TestCompileFrozenBoundaryV1ClassifiesControlledDirectChildrenAndRelevantHol
 		Name:     "direct",
 		Identity: CgroupIdentity{Device: 1, Inode: 2},
 	}}, boundary.ShrinkChildrenByRel["root"])
-	require.Equal(t, machine.MustParse("0,2-3"), boundary.RelevantCPUs)
+	require.Equal(t, machine.MustParse("0-3"), boundary.RelevantCPUs)
 	require.Equal(t, []string{"root/direct", "root/direct/holder"}, boundary.RelevantCPUHolders)
 }
 
@@ -49,6 +49,24 @@ func TestCompileFrozenBoundaryV1ExcludesUnrelatedDynamicSibling(t *testing.T) {
 
 	require.NoError(t, err)
 	require.NotContains(t, boundary.RelevantCPUHolders, "root/direct/unrelated")
+}
+
+func TestCompileFrozenBoundaryV1RelevantCPUsCoverAllSemanticInputsAndCompleteOperations(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	input.ExpectedByRel = map[string]machine.CPUSet{"expected": machine.NewCPUSet(4)}
+	input.TargetByRel = map[string]machine.CPUSet{"target": machine.NewCPUSet(5)}
+	input.ParentSafetyTargetByRel = map[string]machine.CPUSet{"parent-safe": machine.NewCPUSet(6)}
+	input.RequiredByRel = map[string]machine.CPUSet{"required": machine.NewCPUSet(7)}
+	input.DeferredByRel = map[string]machine.CPUSet{"deferred": machine.NewCPUSet(8)}
+	input.PendingRequiredByRel = map[string]machine.CPUSet{"pending": machine.NewCPUSet(9)}
+	input.ProtectedPending = machine.NewCPUSet(10)
+	phases[0].Operations[0].ExpectedCurrent.CPUs = machine.MustParse("11-12")
+	phases[0].Operations[0].Target.CPUs = machine.MustParse("12-13")
+
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+
+	require.NoError(t, err)
+	require.Equal(t, machine.MustParse("4-13"), boundary.RelevantCPUs)
 }
 
 func TestValidateFrozenBoundaryRejectsUnknownVersion(t *testing.T) {
@@ -76,7 +94,7 @@ func TestCloneFrozenBoundaryIsDeeplyIsolated(t *testing.T) {
 	require.Equal(t, []string{"root"}, cloned.ControlledRels)
 	require.Equal(t, "direct", cloned.ShrinkChildrenByRel["root"][0].Name)
 	require.Equal(t, []string{"root/direct", "root/direct/holder"}, cloned.RelevantCPUHolders)
-	require.Equal(t, "0,2-3", cloned.RelevantCPUs.String())
+	require.Equal(t, "0-3", cloned.RelevantCPUs.String())
 }
 
 func TestEvaluateFrozenBoundaryAllowsUnrelatedDynamicSiblingChurn(t *testing.T) {
