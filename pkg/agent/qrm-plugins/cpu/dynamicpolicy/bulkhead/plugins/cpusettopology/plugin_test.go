@@ -448,6 +448,7 @@ type fakeCgroupClient struct {
 	mems                    map[string]string
 	children                map[string][]string
 	statErrors              map[string]error
+	statCalls               []string
 	requireExistingForApply bool
 	writes                  map[string]string
 	writeOrder              []string
@@ -548,6 +549,7 @@ func pluginFakeIdentity(rel string) topology.CgroupIdentity {
 }
 
 func (f *fakeCgroupClient) StatDir(_ context.Context, rel string) (time.Time, error) {
+	f.statCalls = append(f.statCalls, rel)
 	if err := f.statErrors[rel]; err != nil {
 		return time.Time{}, err
 	}

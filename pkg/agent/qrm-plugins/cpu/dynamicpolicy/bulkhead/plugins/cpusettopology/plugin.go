@@ -1543,9 +1543,18 @@ func (p *CPUSetTopologyPlugin) resolvePendingPodScopeFresh(
 		return "", "", false, podErr
 	default:
 		scopeRel, stale, err = p.selectConcretePendingPodScope(
-			ctx, podUID, cgcommon.GetPodRelativeCgroupPathCandidates(podUID))
+			ctx, podUID, relativePendingPodScopeCandidates(
+				cgcommon.GetPodRelativeCgroupPathCandidates(podUID)))
 		return scopeRel, "", stale, err
 	}
+}
+
+func relativePendingPodScopeCandidates(candidates []string) []string {
+	out := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		out = append(out, strings.Trim(candidate, "/"))
+	}
+	return out
 }
 
 func (p *CPUSetTopologyPlugin) pendingPodScopeCandidatesForQOS(
@@ -1554,7 +1563,8 @@ func (p *CPUSetTopologyPlugin) pendingPodScopeCandidatesForQOS(
 ) []string {
 	primary := strings.Trim(p.cfg.BulkheadPrimaryRelPath, "/")
 	if primary == "" {
-		return cgcommon.GetPodRelativeCgroupPathCandidatesForQOS(podUID, qosClass)
+		return relativePendingPodScopeCandidates(
+			cgcommon.GetPodRelativeCgroupPathCandidatesForQOS(podUID, qosClass))
 	}
 	configured := cgcommon.GetPodRelativeCgroupPathCandidatesForQOS(podUID, qosClass)
 	underPrimary := make([]string, 0, len(configured))
@@ -1591,12 +1601,26 @@ func (p *CPUSetTopologyPlugin) selectConcretePendingPodScope(
 	if p.cgroup == nil {
 		return "", false, fmt.Errorf("cgroup client is nil")
 	}
-	var concrete []string
+	allowed := p.allowedPendingPodScopeCandidates(podUID)
+	normalized := make([]string, 0, len(candidates))
+	seen := make(map[string]struct{}, len(candidates))
 	for _, candidate := range candidates {
-		rel := strings.Trim(candidate, "/")
-		if rel == "" {
+		rel, err := normalizePendingPodScopeCandidate(candidate)
+		if err != nil {
+			return "", false, err
+		}
+		if _, ok := allowed[rel]; !ok {
+			return "", false, fmt.Errorf("pending pod scope candidate %q is outside allowed roots", candidate)
+		}
+		if _, ok := seen[rel]; ok {
 			continue
 		}
+		seen[rel] = struct{}{}
+		normalized = append(normalized, rel)
+	}
+
+	var concrete []string
+	for _, rel := range normalized {
 		if _, err := p.cgroup.StatDir(ctx, rel); err == nil {
 			concrete = append(concrete, rel)
 		} else if !errors.Is(err, os.ErrNotExist) {
@@ -1612,6 +1636,39 @@ func (p *CPUSetTopologyPlugin) selectConcretePendingPodScope(
 		return "", false, fmt.Errorf("%w: pod=%q candidates=%v",
 			errPendingPodScopeAmbiguous, podUID, concrete)
 	}
+}
+
+func normalizePendingPodScopeCandidate(candidate string) (string, error) {
+	if candidate == "" || strings.HasPrefix(candidate, "/") {
+		return "", fmt.Errorf("unsafe pending pod scope candidate %q", candidate)
+	}
+	for _, component := range strings.Split(candidate, "/") {
+		if component == "." || component == ".." {
+			return "", fmt.Errorf("unsafe pending pod scope candidate %q", candidate)
+		}
+	}
+	rel := path.Clean(candidate)
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, "../") {
+		return "", fmt.Errorf("unsafe pending pod scope candidate %q", candidate)
+	}
+	return rel, nil
+}
+
+func (p *CPUSetTopologyPlugin) allowedPendingPodScopeCandidates(podUID string) map[string]struct{} {
+	allowed := make(map[string]struct{})
+	add := func(candidates []string) {
+		for _, candidate := range candidates {
+			rel := path.Clean(strings.Trim(candidate, "/"))
+			if rel != "" && rel != "." && rel != ".." && !strings.HasPrefix(rel, "../") {
+				allowed[rel] = struct{}{}
+			}
+		}
+	}
+	add(cgcommon.GetPodRelativeCgroupPathCandidates(podUID))
+	add(p.pendingPodScopeCandidatesForQOS(podUID, v1.PodQOSGuaranteed))
+	add(p.pendingPodScopeCandidatesForQOS(podUID, v1.PodQOSBurstable))
+	add(p.pendingPodScopeCandidatesForQOS(podUID, v1.PodQOSBestEffort))
+	return allowed
 }
 
 func (p *CPUSetTopologyPlugin) reclassifyAdmissionDeferredLeaves(ctx context.Context, view *model.DesiredView, expectedRes *expectedCPUSetBuildResult) {

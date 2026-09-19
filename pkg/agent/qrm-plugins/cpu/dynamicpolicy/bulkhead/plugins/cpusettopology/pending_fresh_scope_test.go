@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"syscall"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
@@ -245,6 +246,169 @@ func TestFreshAbsentPendingPodCandidateCardinality(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestIdentityChangedMissingPodCandidateCardinality(t *testing.T) {
+	t.Parallel()
+
+	const podUID = "identity-changed-missing"
+	tests := []struct {
+		name      string
+		existing  map[string]bool
+		wantScope string
+		wantSkip  bool
+		wantErr   error
+	}{
+		{
+			name:     "zero candidates skips stale checkpoint entry",
+			wantSkip: true,
+		},
+		{
+			name: "one candidate retains concrete scope",
+			existing: map[string]bool{
+				"kubepods/burstable/pod" + podUID: true,
+			},
+			wantScope: "kubepods/burstable/pod" + podUID,
+		},
+		{
+			name: "multiple candidates fail closed",
+			existing: map[string]bool{
+				"kubepods/pod" + podUID:           true,
+				"kubepods/burstable/pod" + podUID: true,
+			},
+			wantErr: errPendingPodScopeAmbiguous,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			statErrors := absentCandidateErrors(podUID)
+			for rel := range tt.existing {
+				delete(statErrors, rel)
+			}
+			fetcher := &strictFreshPendingFetcher{
+				containerErr: fmt.Errorf("%w: old=old-id current=new-id", bulkheadutils.ErrContainerIdentityChanged),
+				pods:         map[string]*v1.Pod{},
+				podErrs:      map[string]error{},
+				freshLookups: map[string]int{},
+			}
+			p := &CPUSetTopologyPlugin{
+				cfg: bulkheadConfigWithPrimary("kubepods"),
+				cgroup: &fakeCgroupClient{
+					existing:   tt.existing,
+					statErrors: statErrors,
+				},
+			}
+
+			res, err := p.buildExpectedCPUSetByRel(context.Background(), pendingScopeTestContext(
+				fetcher,
+				pendingScopeTestView(map[string]machine.CPUSet{podUID: machine.NewCPUSet(4, 5)}),
+			))
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("error = %v, want errors.Is(_, %v)", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("buildExpectedCPUSetByRel() error = %v", err)
+			}
+			if fetcher.freshLookups[podUID] != 1 {
+				t.Fatalf("strict fresh lookups = %d, want 1", fetcher.freshLookups[podUID])
+			}
+			if tt.wantSkip {
+				if len(res.PendingByPod) != 0 {
+					t.Fatalf("stale pod entered pending protection: %#v", res.PendingByPod)
+				}
+				return
+			}
+			if len(res.PendingByPod) != 1 || res.PendingByPod[0].ScopeRel != tt.wantScope {
+				t.Fatalf("pending entries = %#v, want concrete scope %q", res.PendingByPod, tt.wantScope)
+			}
+		})
+	}
+}
+
+func TestSelectConcretePendingPodScope(t *testing.T) {
+	t.Parallel()
+
+	t.Run("rejects unsafe candidates before lookup", func(t *testing.T) {
+		tests := []string{
+			"",
+			".",
+			"..",
+			"../escape",
+			"kubepods/../escape",
+			"unmanaged/podunsafe",
+			"/kubepods/podunsafe",
+		}
+		for _, candidate := range tests {
+			candidate := candidate
+			t.Run(fmt.Sprintf("%q", candidate), func(t *testing.T) {
+				cg := &fakeCgroupClient{}
+				p := &CPUSetTopologyPlugin{
+					cfg:    bulkheadConfigWithPrimary("kubepods"),
+					cgroup: cg,
+				}
+
+				_, _, err := p.selectConcretePendingPodScope(
+					context.Background(), "unsafe", []string{candidate})
+				if err == nil {
+					t.Fatalf("candidate %q succeeded, want safety error", candidate)
+				}
+				if len(cg.statCalls) != 0 {
+					t.Fatalf("unsafe candidate reached StatDir: %#v", cg.statCalls)
+				}
+			})
+		}
+	})
+
+	t.Run("deduplicates normalized candidates before cardinality", func(t *testing.T) {
+		const (
+			podUID = "duplicate"
+			want   = "kubepods/podduplicate"
+		)
+		cg := &fakeCgroupClient{existing: map[string]bool{want: true}}
+		p := &CPUSetTopologyPlugin{
+			cfg:    bulkheadConfigWithPrimary("kubepods"),
+			cgroup: cg,
+		}
+
+		scope, stale, err := p.selectConcretePendingPodScope(context.Background(), podUID, []string{
+			want,
+			"kubepods//podduplicate",
+			"kubepods/podduplicate/",
+		})
+		if err != nil {
+			t.Fatalf("selectConcretePendingPodScope() error = %v", err)
+		}
+		if stale || scope != want {
+			t.Fatalf("scope=%q stale=%v, want scope=%q stale=false", scope, stale, want)
+		}
+		if len(cg.statCalls) != 1 || cg.statCalls[0] != want {
+			t.Fatalf("StatDir calls = %#v, want one canonical lookup for %q", cg.statCalls, want)
+		}
+	})
+
+	t.Run("preserves EIO from StatDir", func(t *testing.T) {
+		const candidate = "kubepods/podio"
+		eio := fmt.Errorf("stat candidate: %w", syscall.EIO)
+		cg := &fakeCgroupClient{statErrors: map[string]error{candidate: eio}}
+		p := &CPUSetTopologyPlugin{
+			cfg:    bulkheadConfigWithPrimary("kubepods"),
+			cgroup: cg,
+		}
+
+		_, _, err := p.selectConcretePendingPodScope(
+			context.Background(), "io", []string{candidate})
+		if err != eio {
+			t.Fatalf("error = %v, want original EIO %v", err, eio)
+		}
+		if !errors.Is(err, syscall.EIO) {
+			t.Fatalf("error = %v, want errors.Is(_, EIO)", err)
+		}
+	})
 }
 
 func TestRemovePodIgnoresUnrelatedStalePendingEntry(t *testing.T) {
