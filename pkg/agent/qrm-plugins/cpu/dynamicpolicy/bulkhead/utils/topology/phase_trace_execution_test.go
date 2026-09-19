@@ -364,6 +364,70 @@ func TestFinalSnapshotDriftWithUnverifiedRollbackIsNotReplanSafe(t *testing.T) {
 		"unverified rollback must retain physical-impact evidence")
 }
 
+func TestFinalBoundaryOperationalFailuresAreNotMarkedAsFrozenFinalDrift(t *testing.T) {
+	readFailure := errors.New("injected final boundary read failure")
+	tests := []struct {
+		name      string
+		prepare   func(*coordinatorRound, *CompiledPhaseTrace) context.Context
+		wantError error
+	}{
+		{
+			name: "deadline",
+			prepare: func(_ *coordinatorRound, _ *CompiledPhaseTrace) context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx
+			},
+			wantError: context.Canceled,
+		},
+		{
+			name: "budget",
+			prepare: func(round *coordinatorRound, _ *CompiledPhaseTrace) context.Context {
+				round.budget = NewBudgetTracker(ConvergenceBudget{MaxHierarchyIOOperations: 1})
+				return context.Background()
+			},
+			wantError: ErrHierarchyIOOperationBudgetExceeded,
+		},
+		{
+			name: "read",
+			prepare: func(round *coordinatorRound, trace *CompiledPhaseTrace) context.Context {
+				round.driver = &readErrorHierarchyDriver{
+					HierarchyDriver: round.driver,
+					err:             readFailure,
+					rel:             trace.FrozenBoundary.ControlledRels[0],
+				}
+				return context.Background()
+			},
+			wantError: readFailure,
+		},
+		{
+			name: "invalid boundary",
+			prepare: func(_ *coordinatorRound, trace *CompiledPhaseTrace) context.Context {
+				trace.FrozenBoundary.Version = FrozenBoundaryVersion(99)
+				return context.Background()
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			trace, driver := compiledTraceWithCPUAndMemoryWrites(t)
+			round := frozenExecutionRound(t, trace, driver)
+			ctx := tt.prepare(round, trace)
+
+			_, err := round.proveFrozenTraceFinalState(ctx, trace)
+
+			require.Error(t, err)
+			if tt.wantError != nil {
+				require.ErrorIs(t, err, tt.wantError)
+			}
+			var drift *frozenFinalSnapshotDriftError
+			require.False(t, errors.As(err, &drift))
+			require.False(t, replanRequired(err))
+		})
+	}
+}
+
 func TestTracePreflightRejectsIdentityDriftWithoutWrites(t *testing.T) {
 	trace, driver := compiledTraceWithCPUAndMemoryWrites(t)
 	driver.bumpIdentity(flattenTraceOperations(trace)[0].Rel)
@@ -1685,6 +1749,22 @@ type postPreflightRelevantHolderDriver struct {
 	added             machine.CPUSet
 	injected          bool
 	growWrites        int
+}
+
+type readErrorHierarchyDriver struct {
+	HierarchyDriver
+	err error
+	rel string
+}
+
+func (d *readErrorHierarchyDriver) ReadEntry(
+	ctx context.Context,
+	rel string,
+) (EntryState, error) {
+	if rel == d.rel {
+		return EntryState{}, d.err
+	}
+	return d.HierarchyDriver.ReadEntry(ctx, rel)
 }
 
 func newPostPreflightRelevantHolderDriver(

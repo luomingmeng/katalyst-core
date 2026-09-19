@@ -559,7 +559,7 @@ func (r *coordinatorRound) proveFrozenTraceFinalState(
 		frozen.FinalSnapshot,
 	)
 	fresh := boundaryEvaluation.Snapshot
-	if err != nil {
+	if err != nil && fresh != nil {
 		err = &frozenFinalSnapshotDriftError{
 			current:  fresh,
 			expected: frozen.FinalSnapshot,
