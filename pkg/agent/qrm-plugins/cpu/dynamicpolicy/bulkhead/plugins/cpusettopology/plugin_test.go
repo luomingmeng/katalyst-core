@@ -3409,6 +3409,9 @@ func (f *absenceThenFreshPodFetcher) GetPod(ctx context.Context, _ string) (*v1.
 	if ctx.Value(metapod.BypassCacheKey) != metapod.BypassCacheTrue {
 		return nil, errors.New("pod freshness query did not bypass cache")
 	}
+	if ctx.Value(metapod.StrictBypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("pod freshness query did not require strict bypass")
+	}
 	f.freshHit = true
 	if f.freshErr != nil {
 		return nil, f.freshErr
@@ -3473,6 +3476,9 @@ func (f *disappearingContainerIDFetcher) GetContainerIDWithContext(
 func (f *disappearingContainerIDFetcher) GetPod(ctx context.Context, _ string) (*v1.Pod, error) {
 	if ctx.Value(metapod.BypassCacheKey) != metapod.BypassCacheTrue {
 		return nil, errors.New("pod freshness query did not bypass cache")
+	}
+	if ctx.Value(metapod.StrictBypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("pod freshness query did not require strict bypass")
 	}
 	return f.pod.DeepCopy(), nil
 }

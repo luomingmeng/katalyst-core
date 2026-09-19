@@ -1474,6 +1474,8 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in 
 					}
 					if isContainerAbsentErr(err) {
 						refreshCtx := context.WithValue(ctx, metapod.BypassCacheKey, metapod.BypassCacheTrue)
+						refreshCtx = context.WithValue(
+							refreshCtx, metapod.StrictBypassCacheKey, metapod.BypassCacheTrue)
 						pod, podErr := in.MetaServer.GetPod(refreshCtx, podUID)
 						switch {
 						case podErr == nil && pod == nil:

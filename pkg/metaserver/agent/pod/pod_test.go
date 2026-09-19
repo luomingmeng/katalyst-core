@@ -176,6 +176,37 @@ func (contextBlockingKubeletPodFetcher) GetPodList(ctx context.Context, _ func(*
 	return nil, ctx.Err()
 }
 
+type errorKubeletPodFetcher struct {
+	err error
+}
+
+func (f errorKubeletPodFetcher) GetPodList(
+	context.Context, func(*v1.Pod) bool,
+) ([]*v1.Pod, error) {
+	return nil, f.err
+}
+
+func TestStrictBypassCacheReturnsSyncErrorWithoutStaleFallback(t *testing.T) {
+	t.Parallel()
+
+	syncErr := errors.New("strict kubelet sync failed")
+	pf := &podFetcherImpl{
+		kubeletPodFetcher: errorKubeletPodFetcher{err: syncErr},
+		kubeletPodsCache: map[string]*v1.Pod{
+			"cached": {ObjectMeta: metav1.ObjectMeta{UID: "cached"}},
+		},
+		emitter: metrics.DummyMetrics{},
+	}
+	ctx := context.WithValue(context.Background(), BypassCacheKey, BypassCacheTrue)
+	ctx = context.WithValue(ctx, StrictBypassCacheKey, BypassCacheTrue)
+
+	_, err := pf.GetPod(ctx, "cached")
+
+	if err != syncErr {
+		t.Fatalf("GetPod() error = %v, want original strict sync error %v", err, syncErr)
+	}
+}
+
 type gatedKubeletPodFetcher struct {
 	entered chan struct{}
 	release chan struct{}

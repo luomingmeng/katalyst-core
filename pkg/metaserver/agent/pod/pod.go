@@ -50,8 +50,9 @@ type ContainerInfo struct {
 }
 
 const (
-	BypassCacheKey  ContextKey = "bypass_cache"
-	BypassCacheTrue ContextKey = "true"
+	BypassCacheKey       ContextKey = "bypass_cache"
+	StrictBypassCacheKey ContextKey = "strict_bypass_cache"
+	BypassCacheTrue      ContextKey = "true"
 
 	podFetcherKubeletHealthCheckName = "pod_fetcher_kubelet"
 	podFetcherRuntimeHealthCheckName = "pod_fetcher_runtime"
@@ -416,6 +417,9 @@ func (w *podFetcherImpl) GetPodList(ctx context.Context, podFilter func(*v1.Pod)
 func (w *podFetcherImpl) GetPod(ctx context.Context, podUID string) (*v1.Pod, error) {
 	kubeletPodsCache, err := w.getKubeletPodsCache(ctx)
 	if err != nil {
+		if ctx.Value(StrictBypassCacheKey) == BypassCacheTrue {
+			return nil, err
+		}
 		return nil, fmt.Errorf("getKubeletPodsCache failed with error: %v", err)
 	}
 	if pod, ok := kubeletPodsCache[podUID]; ok {
@@ -429,10 +433,17 @@ func (w *podFetcherImpl) getKubeletPodsCache(ctx context.Context) (map[string]*v
 	if err := lockRLockContext(ctx, &w.kubeletPodsCacheLock); err != nil {
 		return nil, err
 	}
-	if w.kubeletPodsCache == nil || len(w.kubeletPodsCache) == 0 || ctx.Value(BypassCacheKey) == BypassCacheTrue {
+	strictBypass := ctx.Value(StrictBypassCacheKey) == BypassCacheTrue
+	if w.kubeletPodsCache == nil || len(w.kubeletPodsCache) == 0 ||
+		ctx.Value(BypassCacheKey) == BypassCacheTrue || strictBypass {
 		w.kubeletPodsCacheLock.RUnlock()
-		if err := w.syncKubeletPodWithContext(ctx); err != nil && ctx.Err() != nil {
-			return nil, ctx.Err()
+		if err := w.syncKubeletPodWithContext(ctx); err != nil {
+			if strictBypass {
+				return nil, err
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 		}
 	} else {
 		w.kubeletPodsCacheLock.RUnlock()
