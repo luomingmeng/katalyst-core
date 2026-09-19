@@ -147,6 +147,8 @@ type snapshotBuilder struct {
 	snapshot   *CompleteSnapshot
 	controlled map[string]*TopoNode
 	boundaries map[string]struct{}
+	retirable  map[string]CgroupIdentity
+	retired    map[string]struct{}
 }
 
 // BuildCompleteSnapshot returns either complete purpose-scoped evidence or a
@@ -158,7 +160,7 @@ func BuildCompleteSnapshot(
 	request SnapshotRequest,
 	budget *BudgetTracker,
 ) (*CompleteSnapshot, error) {
-	return buildCompleteSnapshot(ctx, driver, dag, request, budget, nil)
+	return buildCompleteSnapshot(ctx, driver, dag, request, budget, nil, nil)
 }
 
 func buildCompleteSnapshot(
@@ -168,6 +170,7 @@ func buildCompleteSnapshot(
 	request SnapshotRequest,
 	budget *BudgetTracker,
 	boundaries map[string]struct{},
+	retirable map[string]CgroupIdentity,
 ) (*CompleteSnapshot, error) {
 	if driver == nil || dag == nil || budget == nil {
 		return nil, &SnapshotError{Operation: HierarchyOperationRead, Class: HierarchyErrorInvalid, Err: fmt.Errorf("driver, dag and budget are required")}
@@ -187,7 +190,7 @@ func buildCompleteSnapshot(
 		return nil, &SnapshotError{Operation: HierarchyOperationRead, Class: HierarchyErrorInvalid, Err: err}
 	}
 	return buildCompleteSnapshotWithBoundary(
-		ctx, driver, dag, boundary, expand, budget, boundaries,
+		ctx, driver, dag, boundary, expand, budget, boundaries, retirable,
 	)
 }
 
@@ -199,6 +202,7 @@ func buildCompleteSnapshotWithBoundary(
 	expand map[string]bool,
 	budget *BudgetTracker,
 	boundaries map[string]struct{},
+	retirable map[string]CgroupIdentity,
 ) (*CompleteSnapshot, error) {
 	builder := &snapshotBuilder{
 		ctx:        ctx,
@@ -206,6 +210,8 @@ func buildCompleteSnapshotWithBoundary(
 		budget:     budget,
 		controlled: make(map[string]*TopoNode, len(dag.index)),
 		boundaries: boundaries,
+		retirable:  retirable,
+		retired:    make(map[string]struct{}),
 		snapshot: &CompleteSnapshot{
 			CapturedAt:          time.Now(),
 			Capabilities:        driver.Capabilities(),
@@ -271,7 +277,7 @@ func newCompleteSnapshotSource(
 		return buildCompleteSnapshot(ctx, driver, dag, SnapshotRequest{
 			Purpose:      ScanForPlan,
 			AffectedRels: affected,
-		}, budget, boundaries)
+		}, budget, boundaries, nil)
 	}
 }
 
@@ -281,6 +287,12 @@ func (b *snapshotBuilder) scan(rel string, domain DomainID, depth int, expected 
 	}
 	before, err := b.driver.StatIdentity(b.ctx, rel)
 	if err != nil {
+		if expected != (CgroupIdentity{}) &&
+			b.retirable[rel] == expected &&
+			isCgroupNotFoundError(err) {
+			b.retired[rel] = struct{}{}
+			return nil
+		}
 		return b.fail(HierarchyOperationStat, rel, expected, err)
 	}
 	if expected != (CgroupIdentity{}) && before != expected {
@@ -291,6 +303,10 @@ func (b *snapshotBuilder) scan(rel string, domain DomainID, depth int, expected 
 	}
 	entry, err := b.driver.ReadEntry(b.ctx, rel)
 	if err != nil {
+		if b.retirable[rel] == before && isCgroupNotFoundError(err) {
+			b.retired[rel] = struct{}{}
+			return nil
+		}
 		if b.shouldSkipUnavailableController(rel, depth, err) {
 			b.snapshot.UnavailableChildren[rel] = UnavailableChildEvidence{
 				Identity: before,
@@ -302,6 +318,10 @@ func (b *snapshotBuilder) scan(rel string, domain DomainID, depth int, expected 
 	}
 	after, err := b.driver.StatIdentity(b.ctx, rel)
 	if err != nil {
+		if b.retirable[rel] == before && isCgroupNotFoundError(err) {
+			b.retired[rel] = struct{}{}
+			return nil
+		}
 		return b.fail(HierarchyOperationStat, rel, before, err)
 	}
 	if before != after || entry.Identity != before {
@@ -331,14 +351,17 @@ func (b *snapshotBuilder) scan(rel string, domain DomainID, depth int, expected 
 	}
 	sort.Slice(children, func(i, j int) bool { return children[i].Name < children[j].Name })
 	b.snapshot.Children[rel] = append([]ChildRef(nil), children...)
+	retainedChildren := make([]ChildRef, 0, len(children))
 	b.snapshot.ScanBoundary.ExpandedRels = append(b.snapshot.ScanBoundary.ExpandedRels, rel)
 	for _, child := range children {
 		childRel := filepath.Join(rel, child.Name)
 		if withinTraversalBoundary(childRel, b.boundaries) {
+			retainedChildren = append(retainedChildren, child)
 			continue
 		}
 		childNode, isControlled := b.controlled[childRel]
 		if isControlled && !immediateOnly {
+			retainedChildren = append(retainedChildren, child)
 			continue
 		}
 		childDomain := domain
@@ -349,7 +372,11 @@ func (b *snapshotBuilder) scan(rel string, domain DomainID, depth int, expected 
 		if err := b.scan(childRel, childDomain, depth+1, child.Identity, childExpand, false); err != nil {
 			return err
 		}
+		if _, retired := b.retired[childRel]; !retired {
+			retainedChildren = append(retainedChildren, child)
+		}
 	}
+	b.snapshot.Children[rel] = retainedChildren
 	sort.Strings(b.snapshot.ScanBoundary.ExpandedRels)
 	return nil
 }

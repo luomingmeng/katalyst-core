@@ -18,6 +18,7 @@ package topology
 
 import (
 	"context"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -40,6 +41,7 @@ func TestCompileFrozenBoundaryV1ClassifiesControlledDirectChildrenAndRelevantHol
 	}}, boundary.ShrinkChildrenByRel["root"])
 	require.Equal(t, machine.MustParse("0-3"), boundary.RelevantCPUs)
 	require.Equal(t, []string{"root/direct", "root/direct/holder"}, boundary.RelevantCPUHolders)
+	require.Equal(t, []string{"root/direct", "root/direct/holder"}, boundary.RetirableCPUHolders)
 }
 
 func TestCompileFrozenBoundaryV1ExcludesUnrelatedDynamicSibling(t *testing.T) {
@@ -122,12 +124,14 @@ func TestCloneFrozenBoundaryIsDeeplyIsolated(t *testing.T) {
 	boundary.ControlledRels[0] = "changed"
 	boundary.ShrinkChildrenByRel["root"][0].Name = "changed"
 	boundary.RelevantCPUHolders[0] = "changed"
+	boundary.RetirableCPUHolders[0] = "changed"
 	boundary.RelevantCPUs = machine.NewCPUSet(99)
 
 	require.Equal(t, []string{"root"}, cloned.Roots)
 	require.Equal(t, []string{"root"}, cloned.ControlledRels)
 	require.Equal(t, "direct", cloned.ShrinkChildrenByRel["root"][0].Name)
 	require.Equal(t, []string{"root/direct", "root/direct/holder"}, cloned.RelevantCPUHolders)
+	require.Equal(t, []string{"root/direct", "root/direct/holder"}, cloned.RetirableCPUHolders)
 	require.Equal(t, "0-3", cloned.RelevantCPUs.String())
 }
 
@@ -268,6 +272,197 @@ func TestEvaluateFrozenBoundaryRejectsGrowNewRelevantCPUHolder(t *testing.T) {
 
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+}
+
+func TestEvaluateFrozenBoundaryAllowsUnreferencedHolderRetirementDuringSnapshot(t *testing.T) {
+	for _, retirementOperation := range []HierarchyOperation{
+		HierarchyOperationStat,
+		HierarchyOperationRead,
+		HierarchyOperationList,
+	} {
+		t.Run(string(retirementOperation), func(t *testing.T) {
+			snapshot, input, phases := frozenBoundaryFixture()
+			boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+			require.NoError(t, err)
+			driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+			deleteHolderDuringRead(
+				driver, "root/direct", "root/direct/holder", retirementOperation)
+
+			evaluation, err := EvaluateFrozenBoundary(
+				context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+				boundary, snapshot)
+
+			require.NoError(t, err)
+			require.NotNil(t, evaluation.Snapshot)
+			require.NotContains(t, evaluation.Snapshot.Entries, "root/direct/holder")
+			require.NotContains(t, evaluation.Snapshot.Children["root/direct"], ChildRef{
+				Name: "holder", Identity: CgroupIdentity{Device: 1, Inode: 3},
+			})
+		})
+	}
+}
+
+func TestEvaluateFrozenBoundaryRejectsReferencedHolderRetirementDuringSnapshot(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	input.ExpectedByRel = map[string]machine.CPUSet{
+		"root/direct/holder": machine.NewCPUSet(2),
+	}
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	require.NotContains(t, boundary.RetirableCPUHolders, "root/direct")
+	require.NotContains(t, boundary.RetirableCPUHolders, "root/direct/holder")
+	driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+	deleteHolderAfterParentListing(driver, "root/direct", "root/direct/holder")
+
+	_, err = EvaluateFrozenBoundary(
+		context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+		boundary, snapshot)
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, syscall.ENOENT)
+}
+
+func TestCompileFrozenBoundaryDoesNotRetireTargetOnlyHolder(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	input.TargetByRel = map[string]machine.CPUSet{
+		"root/direct/holder": machine.NewCPUSet(2),
+	}
+
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+
+	require.NoError(t, err)
+	require.NotContains(t, boundary.RetirableCPUHolders, "root/direct")
+	require.NotContains(t, boundary.RetirableCPUHolders, "root/direct/holder")
+}
+
+func TestEvaluateFrozenBoundaryAllowsRetirableShrinkDirectChildRemovalDuringSnapshot(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	addFrozenBoundaryDirectChild(
+		snapshot, "retired", CgroupIdentity{Device: 1, Inode: 9}, machine.NewCPUSet(2))
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	require.Contains(t, boundary.RetirableCPUHolders, "root/retired")
+	driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+	deleteHolderAfterParentListing(driver, "root", "root/retired")
+
+	evaluation, err := EvaluateFrozenBoundary(
+		context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+		boundary, snapshot)
+
+	require.NoError(t, err)
+	require.NotNil(t, evaluation.Snapshot)
+	require.NotContains(t, evaluation.Snapshot.Entries, "root/retired")
+	require.NotContains(t, evaluation.Snapshot.Children["root"], ChildRef{
+		Name: "retired", Identity: CgroupIdentity{Device: 1, Inode: 9},
+	})
+}
+
+func TestEvaluateFrozenBoundaryAllowsMultipleRetirementsWithinOneSnapshot(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	secondRel := "root/direct/holder-second"
+	secondIdentity := CgroupIdentity{Device: 1, Inode: 5}
+	snapshot.Entries[secondRel] = EntryState{
+		Rel: secondRel, Identity: secondIdentity,
+		CPUs: machine.NewCPUSet(2), ConfiguredCPUs: machine.NewCPUSet(2),
+		Mems: "0", ConfiguredMems: "0",
+	}
+	snapshot.Children["root/direct"] = append(
+		snapshot.Children["root/direct"],
+		ChildRef{Name: "holder-second", Identity: secondIdentity},
+	)
+	snapshot.DomainByRel[secondRel] = DomainPrimary
+	snapshot.ScanBoundary.ExpandedRels = append(
+		snapshot.ScanBoundary.ExpandedRels, secondRel)
+	snapshot.ID = fingerprintSnapshot(snapshot)
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+	parentLists := 0
+	driver.beforeCall = func(operation HierarchyOperation, rel string) error {
+		if operation == HierarchyOperationList && rel == "root/direct" {
+			parentLists++
+		}
+		switch {
+		case operation == HierarchyOperationStat &&
+			rel == "root/direct/holder" && parentLists == 1:
+			delete(driver.nodes, rel)
+		case operation == HierarchyOperationStat &&
+			rel == secondRel && parentLists == 1:
+			delete(driver.nodes, rel)
+		}
+		return nil
+	}
+
+	evaluation, err := EvaluateFrozenBoundary(
+		context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+		boundary, snapshot)
+
+	require.NoError(t, err)
+	require.NotContains(t, evaluation.Snapshot.Entries, "root/direct/holder")
+	require.NotContains(t, evaluation.Snapshot.Entries, secondRel)
+	require.Equal(t, 1, parentLists)
+}
+
+func TestEvaluateFrozenBoundaryDoesNotRetryRetirableHolderIdentityError(t *testing.T) {
+	snapshot, input, phases := frozenBoundaryFixture()
+	boundary, err := compileFrozenBoundaryV1(snapshot, input, phases)
+	require.NoError(t, err)
+	driver, dag := frozenBoundaryDriver(t, snapshot, input.DAGSpecs)
+	parentListed := false
+	holderStats := 0
+	driver.beforeCall = func(operation HierarchyOperation, rel string) error {
+		if operation == HierarchyOperationList && rel == "root/direct" {
+			parentListed = true
+		}
+		if operation == HierarchyOperationStat && rel == "root/direct/holder" && parentListed {
+			holderStats++
+			return ErrCgroupIdentityChanged
+		}
+		return nil
+	}
+
+	_, err = EvaluateFrozenBoundary(
+		context.Background(), driver, dag, NewBudgetTracker(ConvergenceBudget{}),
+		boundary, snapshot)
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrCgroupIdentityChanged)
+	require.Equal(t, 1, holderStats)
+}
+
+func deleteHolderAfterParentListing(
+	driver *fakeHierarchyDriver,
+	parentRel, holderRel string,
+) {
+	deleteHolderDuringRead(driver, parentRel, holderRel, HierarchyOperationStat)
+}
+
+func deleteHolderDuringRead(
+	driver *fakeHierarchyDriver,
+	parentRel, holderRel string,
+	retirementOperation HierarchyOperation,
+) {
+	parentListed := false
+	retired := false
+	holderStats := 0
+	driver.beforeCall = func(operation HierarchyOperation, rel string) error {
+		if operation == HierarchyOperationList && rel == parentRel {
+			parentListed = true
+			return nil
+		}
+		if operation == HierarchyOperationStat && rel == holderRel {
+			holderStats++
+		}
+		retireNow := operation == retirementOperation
+		if retirementOperation == HierarchyOperationList {
+			retireNow = operation == HierarchyOperationStat && holderStats == 2
+		}
+		if rel == holderRel && parentListed && !retired && retireNow {
+			delete(driver.nodes, holderRel)
+			retired = true
+		}
+		return nil
+	}
 }
 
 func addFrozenBoundaryDirectChild(
