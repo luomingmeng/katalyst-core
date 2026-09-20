@@ -90,3 +90,49 @@ func TestEffectiveTargetsScopePendingProtection(t *testing.T) {
 		})
 	}
 }
+
+func TestNormalizeV1NonEmptyReclaimDesiredTargetsScopesNUMABucketFallback(t *testing.T) {
+	t.Parallel()
+
+	primaryRel := "sandboxes/shared-0"
+	reclaimRel := "sandboxes/reclaimed-0"
+	numaBound := machine.NewCPUSet(0, 1)
+	historicalFullMachine := machine.NewCPUSet(0, 1, 2, 3)
+	dag := mustPlanDAG(t, []NodeSpec{
+		{
+			Rel:    primaryRel,
+			Role:   TopoNodeRolePrimary,
+			Domain: DomainPrimary,
+			CPUs:   historicalFullMachine,
+		},
+		{
+			Rel:    reclaimRel,
+			Role:   TopoNodeRoleReclaimNUMABucket,
+			Domain: DomainReclaim,
+			Constraint: TopologyConstraint{
+				CPUUpperBound: numaBound,
+				Scope:         TopologyScopeNUMANode,
+			},
+		},
+	})
+	snapshot := &CompleteSnapshot{
+		Entries: map[string]EntryState{
+			primaryRel: {Rel: primaryRel, CPUs: historicalFullMachine},
+			reclaimRel: {Rel: reclaimRel, CPUs: historicalFullMachine},
+		},
+	}
+	desired := map[string]machine.CPUSet{
+		primaryRel: historicalFullMachine,
+		reclaimRel: machine.NewCPUSet(),
+	}
+
+	normalized := normalizeV1NonEmptyReclaimDesiredTargets(dag, snapshot, desired, false)
+
+	if got := normalized[reclaimRel]; !got.Equals(numaBound) {
+		t.Fatalf("normalized reclaim NUMA bucket target = %s, want scoped fallback %s", got.String(), numaBound.String())
+	}
+	wantPrimary := machine.NewCPUSet(2, 3)
+	if got := normalized[primaryRel]; !got.Equals(wantPrimary) {
+		t.Fatalf("normalized primary target = %s, want only scoped fallback CPUs removed %s", got.String(), wantPrimary.String())
+	}
+}

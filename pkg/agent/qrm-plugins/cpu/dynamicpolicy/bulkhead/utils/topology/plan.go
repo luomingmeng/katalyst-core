@@ -1921,8 +1921,12 @@ func normalizeV1NonEmptyReclaimDesiredTargets(
 		if current.IsEmpty() {
 			continue
 		}
-		out[node.Rel] = current.Clone()
-		preserved = preserved.Union(current)
+		fallback := v1NonEmptyReclaimFallbackTarget(node, current)
+		if fallback.IsEmpty() {
+			continue
+		}
+		out[node.Rel] = fallback
+		preserved = preserved.Union(fallback)
 	}
 	if preserved.IsEmpty() {
 		return out
@@ -1967,6 +1971,16 @@ func phaseTargetDomain(rel string, dag *TopoDAG, domainByRel map[string]DomainID
 
 func allowV1NonEmptyReclaimTargetFallback(node *TopoNode) bool {
 	return node != nil && node.Domain == DomainReclaim
+}
+
+func v1NonEmptyReclaimFallbackTarget(node *TopoNode, current machine.CPUSet) machine.CPUSet {
+	if node == nil {
+		return current.Clone()
+	}
+	if node.Role == TopoNodeRoleReclaimNUMABucket && !node.Constraint.CPUUpperBound.IsEmpty() {
+		return current.Intersection(node.Constraint.CPUUpperBound)
+	}
+	return current.Clone()
 }
 
 func buildPlannerRelations(
