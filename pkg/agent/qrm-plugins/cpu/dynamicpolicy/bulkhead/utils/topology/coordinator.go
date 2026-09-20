@@ -1021,9 +1021,12 @@ type coordinatorRound struct {
 	maxRounds             int
 }
 
-// executeParentSafeAdmission is the sole ParentSafe hierarchy mutation path.
-// It compiles from base on an isolated projection, reserves that exact immutable
-// trace, preflights the whole trace, and executes it without live replanning.
+// executeParentSafeAdmission is the sole owner of the ParentSafe hierarchy
+// mutation transaction. It compiles a closed trace from base on an isolated
+// projection, reserves that exact immutable trace, preflights all evidence, and
+// executes without live replanning. Compilation, reservation, or preflight
+// failure performs no writes; later failure is successful only as an atomic
+// failure after the written prefix has been rolled back and verified.
 func (r *coordinatorRound) executeParentSafeAdmission(
 	ctx context.Context,
 	base *CompleteSnapshot,

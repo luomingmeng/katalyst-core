@@ -295,6 +295,12 @@ func newCompleteSnapshotSource(
 	}
 }
 
+// scan owns construction of one identity-fenced subtree in the snapshot
+// evidence closure. A successful return leaves every retained child backed by
+// exactly one entry or typed-unavailable proof; a scan error rejects the whole
+// builder result, so callers never consume its partial mutations. Authorized
+// disappearance is retirement only for the frozen identity and typed path
+// absence, after which the complete retired subtree is removed.
 func (b *snapshotBuilder) scan(
 	rel string,
 	domain DomainID,
@@ -477,6 +483,10 @@ func (b *snapshotBuilder) hasSelectedControlledChild(rel string) bool {
 	return false
 }
 
+// authorizedRetirement recognizes the only absence that may close a frozen
+// retirement window: typed cgroup-path absence for the exact authorized
+// identity. Zero identities, replacements, controller unavailability, and
+// untyped errors remain failures.
 func (b *snapshotBuilder) authorizedRetirement(rel string, identity CgroupIdentity, err error) bool {
 	return identity != (CgroupIdentity{}) &&
 		b.retirable[rel] == identity &&
@@ -517,6 +527,9 @@ func (b *snapshotBuilder) confirmRetirement(rel string, identity CgroupIdentity)
 	return false, nil
 }
 
+// retireSubtree removes a retired rel and its complete descendant evidence,
+// including domain ownership, unavailable proofs, parent edges, and expanded
+// markers, so no dangling evidence escapes in an otherwise valid snapshot.
 func (b *snapshotBuilder) retireSubtree(rel string) {
 	prefix := rel + "/"
 	underRetiredRoot := func(candidate string) bool {

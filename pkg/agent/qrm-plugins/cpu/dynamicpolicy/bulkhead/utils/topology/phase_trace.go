@@ -362,10 +362,12 @@ func (r *coordinatorRound) compileFixedPointTrace(
 	return validated.trace()
 }
 
-// compileValidatedFixedPointTrace owns compilation and the sole validation
-// freeze for the production ParentSafe chain. The returned carrier is immutable
-// by ownership: reservation, preflight, and execution may read but never expose
-// or mutate its trace.
+// compileValidatedFixedPointTrace is the sole owner of compilation and the
+// validation freeze for the production ParentSafe chain. It closes the trace
+// over initial and final snapshot evidence, evaluation input, frozen boundary,
+// phases, and reservation cost before publishing the carrier. Failure publishes
+// no carrier; success transfers immutable read-only ownership to reservation,
+// preflight, and execution, which never expose or mutate the trace.
 func (r *coordinatorRound) compileValidatedFixedPointTrace(
 	ctx context.Context,
 	base *CompleteSnapshot,
@@ -1203,6 +1205,10 @@ func traceObjectiveSatisfied(trace *CompiledPhaseTrace) bool {
 	return trace.FinalEvaluation.Report.FullyConverged
 }
 
+// validateCompleteSnapshotEvidence proves the snapshot's structural closure:
+// entries and domains are bijective, every listed child has exactly one
+// identity-matching entry or typed-unavailable proof, every root and expanded
+// rel has its required evidence, and domain unions equal the closed entry set.
 func validateCompleteSnapshotEvidence(snapshot *CompleteSnapshot) error {
 	if snapshot == nil {
 		return fmt.Errorf("snapshot is nil")

@@ -54,6 +54,11 @@ type FrozenBoundaryEvaluation struct {
 	Snapshot *CompleteSnapshot
 }
 
+// compileFrozenBoundaryV1 is the sole owner of deriving the V1 semantic
+// closure from the compiler's initial snapshot and immutable phase sequence.
+// The closure pins every controlled rel, shrink child listing, relevant CPU
+// holder, and holder ancestry identity that live execution is allowed to
+// observe; missing required evidence is an error rather than implicit absence.
 func compileFrozenBoundaryV1(
 	snapshot *CompleteSnapshot,
 	input FrozenCoordinatorEvaluationInput,
@@ -424,9 +429,11 @@ func indexFrozenChildIdentities(
 	return index, nil
 }
 
-// EvaluateFrozenBoundary captures a fresh root-complete snapshot and compares
-// only the compiler-owned execution boundary. Dynamic descendants outside that
-// boundary remain observable in the returned snapshot but do not invalidate a
+// EvaluateFrozenBoundary is the sole owner of refreshing and checking the
+// compiler-owned execution boundary. It accepts identity-scoped retirement
+// only when the scanner reports typed path absence, then projects a
+// root-complete snapshot whose evidence closure is revalidated. Dynamic
+// descendants outside the boundary remain observable but do not invalidate a
 // trace merely because they churn.
 func EvaluateFrozenBoundary(
 	ctx context.Context,
@@ -524,6 +531,10 @@ func projectFrozenBoundarySnapshot(
 	return projected
 }
 
+// retireProjectedSubtrees removes each minimal retired root and all of its
+// descendant evidence from a projection. It also removes the matching
+// identity-bearing parent edge and expanded markers so the remaining snapshot
+// preserves entry, domain, child, and traversal closure.
 func retireProjectedSubtrees(
 	snapshot *CompleteSnapshot,
 	retired map[string]CgroupIdentity,
@@ -815,6 +826,10 @@ func indexFrozenRetirablePaths(
 	return retirable, paths
 }
 
+// frozenBoundaryRetirementAuthorizations derives the only identity-scoped
+// absences that a boundary refresh may treat as retirement. Controlled rels
+// and ancestry shared with a non-retirable holder stay required, preserving
+// the boundary's evidence closure.
 func frozenBoundaryRetirementAuthorizations(
 	boundary FrozenBoundary,
 ) map[string]CgroupIdentity {

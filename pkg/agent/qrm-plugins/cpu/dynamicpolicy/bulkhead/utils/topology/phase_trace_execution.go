@@ -867,9 +867,12 @@ func freezeOperationState(entry EntryState) frozenOperationState {
 	}
 }
 
-// executeValidatedFrozenTrace owns live replay of compiler-produced admission
-// traces. It consumes the validated carrier without cloning; ticket order and
-// preflight evidence protect the immutable operation sequence during execution.
+// executeValidatedFrozenTrace is the sole owner of live replay for a validated
+// admission trace. It consumes the immutable carrier without cloning; complete
+// preflight evidence and ticket order close the authorized operation sequence.
+// Any apply or finalization failure rolls the written prefix back and publishes
+// no logical progress when rollback verifies; rollback failure is surfaced with
+// the remaining physical-impact evidence instead of claiming atomic success.
 func (r *coordinatorRound) executeValidatedFrozenTrace(
 	ctx context.Context,
 	validated *validatedPhaseTrace,
@@ -1449,6 +1452,10 @@ func newFrozenTraceRecoveryContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), frozenTraceRecoveryTimeout)
 }
 
+// rollbackTracePrefix restores the recorded write prefix in reverse order under
+// reserved rollback authority. It refuses replacement identities and
+// same-generation third states, aggregates all recovery failures, and verifies
+// the complete prefix before the caller may treat failed execution as atomic.
 func (w safeCPSetWriter) rollbackTracePrefix(
 	ctx context.Context,
 	stack *traceMutationStack,

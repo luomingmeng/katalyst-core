@@ -46,9 +46,11 @@ type ExecutionReservationTicket struct {
 	released                     bool
 }
 
-// reserveValidatedPhaseTrace owns reservation for compiler-produced traces.
-// Its invariant is that the carrier has already been cloned and validated once,
-// so reservation derives authorization only from that immutable evidence.
+// reserveValidatedPhaseTrace is the sole owner of reserving write authority for
+// a compiler-produced trace. The carrier has already been cloned, closed, and
+// validated once, so reservation derives ordered forward and rollback authority
+// only from that immutable evidence. Failure returns no ticket and consumes no
+// operation authorization, making reservation atomic from the caller's view.
 func (b *BudgetTracker) reserveValidatedPhaseTrace(
 	ctx context.Context,
 	validated *validatedPhaseTrace,
