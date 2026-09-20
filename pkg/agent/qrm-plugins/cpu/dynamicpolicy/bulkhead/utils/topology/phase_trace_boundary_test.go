@@ -32,7 +32,6 @@ import (
 func TestParentSafeValidatedTraceProductionBoundary(t *testing.T) {
 	files := parseTopologyProductionFiles(t)
 
-	var freezeCallers []string
 	functions := make(map[string]*ast.FuncDecl)
 	for _, file := range files {
 		for _, declaration := range file.Decls {
@@ -41,22 +40,9 @@ func TestParentSafeValidatedTraceProductionBoundary(t *testing.T) {
 				continue
 			}
 			functions[function.Name.Name] = function
-			ast.Inspect(function.Body, func(node ast.Node) bool {
-				call, ok := node.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				identifier, ok := call.Fun.(*ast.Ident)
-				if ok && identifier.Name == "freezeValidatedPhaseTrace" {
-					freezeCallers = append(freezeCallers, function.Name.Name)
-				}
-				return true
-			})
 		}
 	}
 
-	require.Equal(t, []string{"compileValidatedFixedPointTrace"}, freezeCallers,
-		"only the compiler boundary may construct a validated carrier")
 	for _, name := range []string{
 		"ReservePhaseTrace",
 		"preflightFrozenTrace",
@@ -73,12 +59,42 @@ func TestParentSafeValidatedTraceProductionBoundary(t *testing.T) {
 	} {
 		require.True(t, functionAcceptsValidatedCarrier(functions[name]),
 			"%s must accept *validatedPhaseTrace", name)
+		require.Empty(t, validatedConsumerConstructionViolations(functions[name]),
+			"%s must only consume its validated carrier", name)
 	}
 
 	require.Equal(t, []string{"frozen"}, productionStructFieldNames(t, files, "validatedPhaseTrace"))
 	fields := productionStructFieldNames(t, files, "coordinatorRound")
 	require.NotContains(t, fields, "frozenTrace")
 	require.NotContains(t, fields, "executionTicket")
+}
+
+func validatedConsumerConstructionViolations(function *ast.FuncDecl) []string {
+	if function == nil || function.Body == nil {
+		return []string{"missing function body"}
+	}
+	var violations []string
+	ast.Inspect(function.Body, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.CallExpr:
+			identifier, ok := typed.Fun.(*ast.Ident)
+			if ok && (identifier.Name == "FreezePhaseTrace" ||
+				identifier.Name == "freezeValidatedPhaseTrace") {
+				violations = append(violations, identifier.Name+" call")
+			}
+		case *ast.CompositeLit:
+			typ := typed.Type
+			if pointer, ok := typ.(*ast.StarExpr); ok {
+				typ = pointer.X
+			}
+			identifier, ok := typ.(*ast.Ident)
+			if ok && identifier.Name == "validatedPhaseTrace" {
+				violations = append(violations, "validatedPhaseTrace literal")
+			}
+		}
+		return true
+	})
+	return violations
 }
 
 func parseTopologyProductionFiles(t *testing.T) []*ast.File {

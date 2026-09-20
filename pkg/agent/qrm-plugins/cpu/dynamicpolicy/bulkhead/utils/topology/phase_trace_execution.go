@@ -315,7 +315,7 @@ func (w safeCPSetWriter) preflightValidatedTraceOperations(
 	for _, phase := range frozen.Phases {
 		operationCount = saturatingAdd(operationCount, len(phase.Operations))
 	}
-	evidence, err := projectFrozenTraceOperations(frozen, projection)
+	evidence, err := projectFrozenTraceOperations(ctx, frozen, projection)
 	if err != nil {
 		return nil, err
 	}
@@ -336,9 +336,13 @@ func (w safeCPSetWriter) preflightValidatedTraceOperations(
 }
 
 func projectFrozenTraceOperations(
+	ctx context.Context,
 	frozen *CompiledPhaseTrace,
 	projection *projectedHierarchy,
 ) ([]frozenOperationPreflight, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if frozen == nil {
 		return nil, fmt.Errorf("project frozen trace operations requires a trace")
 	}
@@ -350,16 +354,29 @@ func projectFrozenTraceOperations(
 		operationCount = saturatingAdd(operationCount, len(phase.Operations))
 	}
 	releaseGuards, err := compileFrozenGrowReleaseGuards(frozen)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	if err != nil {
 		return nil, err
 	}
 	evidence := make([]frozenOperationPreflight, 0, operationCount)
 	globalOperationIndex := 0
 	for phaseIndex, phase := range frozen.Phases {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if len(phase.Operations) == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			continue
 		}
-		if err := validateProjectedFrontierIndependence(projection, phase.Operations); err != nil {
+		err := validateProjectedFrontierIndependence(projection, phase.Operations)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if err != nil {
 			return nil, fmt.Errorf(
 				"preflight frozen phase trace frontier %d: %w",
 				phaseIndex, err,
@@ -367,6 +384,9 @@ func projectFrozenTraceOperations(
 		}
 		frontierStart := len(evidence)
 		for operationIndex, operation := range phase.Operations {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			before, ok := projection.snapshot.Entries[operation.Rel]
 			if !ok {
 				return nil, fmt.Errorf(
@@ -381,6 +401,9 @@ func projectFrozenTraceOperations(
 			}
 			if operation.Direction == WriteShrink {
 				projectedChildren, err := frozenChildrenFromSnapshot(projection.snapshot, operation.Rel)
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, ctxErr
+				}
 				if err != nil {
 					return nil, fmt.Errorf(
 						"preflight frozen phase trace operation %d/%d shrink children: %w",
@@ -408,25 +431,54 @@ func projectFrozenTraceOperations(
 				domain:         frozen.InitialSnapshot.DomainByRel[operation.Rel],
 			})
 			globalOperationIndex++
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 		}
 		for operationIndex, operation := range phase.Operations {
-			if err := projection.applyConfiguredOperation(operation); err != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			err := projection.applyConfiguredOperation(operation)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			if err != nil {
 				return nil, fmt.Errorf(
 					"preflight frozen phase trace operation %d/%d: %w",
 					phaseIndex, operationIndex, err,
 				)
 			}
 		}
-		if err := projection.settleEvidence(); err != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		err = projection.settleEvidence()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if err != nil {
 			return nil, fmt.Errorf(
 				"preflight frozen phase trace frontier %d settlement: %w",
 				phaseIndex, err,
 			)
 		}
 		for operationIndex, operation := range phase.Operations {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			after := projection.snapshot.Entries[operation.Rel]
 			evidence[frontierStart+operationIndex].after = freezeOperationState(after)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return evidence, nil
 }

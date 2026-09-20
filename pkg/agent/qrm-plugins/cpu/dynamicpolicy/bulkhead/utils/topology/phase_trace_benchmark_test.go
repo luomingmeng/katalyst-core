@@ -255,7 +255,7 @@ func TestFrozenPreflightSettlesEvidenceOncePerCompiledFrontier(t *testing.T) {
 	require.NoError(t, err)
 	projection.resetEvidenceRebuildCount()
 
-	evidence, err := projectFrozenTraceOperations(trace, projection)
+	evidence, err := projectFrozenTraceOperations(context.Background(), trace, projection)
 	require.NoError(t, err)
 	require.Len(t, evidence, trace.OperationCount())
 	require.Equal(t, nonEmptyCompiledPhaseCount(trace), projection.evidenceRebuildCount(),
