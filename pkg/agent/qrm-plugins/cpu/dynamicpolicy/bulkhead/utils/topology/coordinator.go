@@ -1052,7 +1052,7 @@ func (r *coordinatorRound) executeParentSafeAdmission(
 	if r.admissionBudget != nil {
 		maxRequiredWrites = r.admissionBudget.MaxRequiredWrites
 	}
-	ticket, err := r.budget.reserveValidatedPhaseTrace(validated, maxRequiredWrites)
+	ticket, err := r.budget.reserveValidatedPhaseTrace(ctx, validated, maxRequiredWrites)
 	if err != nil {
 		return outcome, err
 	}

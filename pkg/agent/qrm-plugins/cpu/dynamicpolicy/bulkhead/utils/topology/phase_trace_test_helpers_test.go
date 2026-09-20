@@ -40,7 +40,7 @@ func (b *BudgetTracker) ReservePhaseTrace(
 	if err != nil {
 		return nil, err
 	}
-	return b.reserveValidatedPhaseTrace(validated, maxRequiredWrites)
+	return b.reserveValidatedPhaseTrace(context.Background(), validated, maxRequiredWrites)
 }
 
 func (w safeCPSetWriter) preflightFrozenTrace(

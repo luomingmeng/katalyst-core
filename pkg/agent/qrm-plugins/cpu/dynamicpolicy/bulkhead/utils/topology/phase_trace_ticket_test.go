@@ -25,6 +25,52 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
+func TestReserveValidatedPhaseTraceHonorsContextCancellation(t *testing.T) {
+	trace, _ := compiledTraceWithCPUAndMemoryWrites(t)
+	validated, err := validatedPhaseTraceForTest(context.Background(), trace)
+	require.NoError(t, err)
+	require.Greater(t, trace.OperationCount(), 1)
+
+	t.Run("before reservation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		ticket, err := NewBudgetTracker(ConvergenceBudget{}).
+			reserveValidatedPhaseTrace(ctx, validated, trace.Cost.Total())
+
+		require.Nil(t, ticket)
+		require.ErrorIs(t, err, context.Canceled)
+	})
+
+	t.Run("while cloning authorization", func(t *testing.T) {
+		ctx := &reservationCancellationContext{
+			Context:  context.Background(),
+			cancelOn: 4,
+		}
+
+		ticket, err := NewBudgetTracker(ConvergenceBudget{}).
+			reserveValidatedPhaseTrace(ctx, validated, trace.Cost.Total())
+
+		require.Nil(t, ticket)
+		require.ErrorIs(t, err, context.Canceled)
+		require.GreaterOrEqual(t, ctx.checks, ctx.cancelOn)
+	})
+}
+
+type reservationCancellationContext struct {
+	context.Context
+	checks   int
+	cancelOn int
+}
+
+func (c *reservationCancellationContext) Err() error {
+	c.checks++
+	if c.checks >= c.cancelOn {
+		return context.Canceled
+	}
+	return c.Context.Err()
+}
+
 func TestReservePhaseTraceRejectsOneWriteShortWithoutPhysicalWrites(t *testing.T) {
 	trace, driver := compiledTraceWithCPUAndMemoryWrites(t)
 	required := trace.Cost.Total()
