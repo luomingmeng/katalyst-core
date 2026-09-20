@@ -30,13 +30,17 @@ func TestPodRelativeCgroupPathCandidatesUseConfiguredRootsWithoutExistenceLookup
 	got := podRelativeCgroupPathCandidates([]string{
 		"/kubepods",
 		"/kubepods/burstable",
-		"/kubepods/besteffort",
+		"/kubepods.slice",
+		"/kubepods.slice/kubepods-burstable.slice",
+		"/kubepods.slice/kubepods-offline.slice",
 		"/kubepods/burstable",
 	}, "abc-def")
 	want := []string{
 		"/kubepods/podabc-def",
 		"/kubepods/burstable/podabc-def",
-		"/kubepods/besteffort/podabc-def",
+		"/kubepods.slice/kubepods-podabc_def.slice",
+		"/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podabc_def.slice",
+		"/kubepods.slice/kubepods-offline.slice/kubepods-offline-podabc_def.slice",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("pod candidates = %v, want %v", got, want)
@@ -65,7 +69,7 @@ func TestPodRelativeCgroupPathCandidatesForQOSSelectsCanonicalConfiguredRoot(t *
 			qos:  v1.PodQOSGuaranteed,
 			want: []string{
 				"/kubepods/podabc-def",
-				"/kubepods.slice/podabc-def",
+				"/kubepods.slice/kubepods-podabc_def.slice",
 			},
 		},
 		{
@@ -73,7 +77,7 @@ func TestPodRelativeCgroupPathCandidatesForQOSSelectsCanonicalConfiguredRoot(t *
 			qos:  v1.PodQOSBurstable,
 			want: []string{
 				"/kubepods/burstable/podabc-def",
-				"/kubepods.slice/kubepods-burstable.slice/podabc-def",
+				"/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-podabc_def.slice",
 			},
 		},
 		{
@@ -81,7 +85,7 @@ func TestPodRelativeCgroupPathCandidatesForQOSSelectsCanonicalConfiguredRoot(t *
 			qos:  v1.PodQOSBestEffort,
 			want: []string{
 				"/kubepods/besteffort/podabc-def",
-				"/kubepods.slice/kubepods-besteffort.slice/podabc-def",
+				"/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-podabc_def.slice",
 			},
 		},
 	}

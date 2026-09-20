@@ -24,6 +24,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -463,6 +464,7 @@ type fakeCgroupClient struct {
 	afterApply              func(rel string, data *cgcommon.CPUSetData)
 	readOverride            func(rel string) (machine.CPUSet, bool)
 	readErrByRel            map[string]error
+	readCalls               []string
 	statIdentityHook        func(string) (topology.CgroupIdentity, error)
 }
 
@@ -567,6 +569,7 @@ func (f *fakeCgroupClient) Version(context.Context) cgroupclient.CgroupVersion {
 }
 
 func (f *fakeCgroupClient) ReadCPUSet(_ context.Context, rel string) (machine.CPUSet, error) {
+	f.readCalls = append(f.readCalls, rel)
 	if err := f.readErrByRel[rel]; err != nil {
 		return machine.NewCPUSet(), err
 	}
@@ -698,8 +701,11 @@ func TestPendingProtectionScopesRetainExpectedPathsForAllQoS(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			p := &CPUSetTopologyPlugin{
-				cgroup: &fakeCgroupClient{},
-				now:    func() time.Time { return now },
+				cgroup: &fakeCgroupClient{
+					readErrByRel: map[string]error{tt.podRel: os.ErrNotExist},
+					statErrors:   map[string]error{tt.podRel: syscall.ENOENT},
+				},
+				now: func() time.Time { return now },
 				pendingProtections: map[string]pendingPodProtection{
 					tt.podUID: {
 						rel:          tt.podRel,
@@ -766,6 +772,177 @@ func TestPendingProtectionScopesUseExistingPodEvidence(t *testing.T) {
 	}
 }
 
+func TestPendingProtectionScopesClassifyScopeExistence(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID = "pod-scope-existence"
+		podRel = "kubepods/burstable/pod-scope-existence"
+	)
+	readErr := errors.New("read cpuset failed")
+	statErr := errors.New("stat failed")
+	untypedMissingErr := errors.New("missing")
+	tests := []struct {
+		name       string
+		cgroup     *fakeCgroupClient
+		wantSource topology.PendingProtectionSource
+		wantErr    error
+		wantStats  int
+	}{
+		{
+			name:       "successful empty cpuset proves existing pod",
+			cgroup:     &fakeCgroupClient{},
+			wantSource: topology.PendingProtectionSourceExistingPod,
+		},
+		{
+			name: "typed ENOENT after read failure means expected pod",
+			cgroup: &fakeCgroupClient{
+				readErrByRel: map[string]error{podRel: readErr},
+				statErrors: map[string]error{podRel: &os.PathError{
+					Op: "stat", Path: podRel, Err: syscall.ENOENT,
+				}},
+			},
+			wantSource: topology.PendingProtectionSourceExpectedPod,
+			wantStats:  1,
+		},
+		{
+			name: "existing directory preserves original read error",
+			cgroup: &fakeCgroupClient{
+				existing:     map[string]bool{podRel: true},
+				readErrByRel: map[string]error{podRel: readErr},
+			},
+			wantErr:   readErr,
+			wantStats: 1,
+		},
+		{
+			name: "untyped missing stat error fails closed",
+			cgroup: &fakeCgroupClient{
+				readErrByRel: map[string]error{podRel: readErr},
+				statErrors:   map[string]error{podRel: untypedMissingErr},
+			},
+			wantErr:   untypedMissingErr,
+			wantStats: 1,
+		},
+		{
+			name: "other stat error fails closed",
+			cgroup: &fakeCgroupClient{
+				readErrByRel: map[string]error{podRel: readErr},
+				statErrors:   map[string]error{podRel: statErr},
+			},
+			wantErr:   statErr,
+			wantStats: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			p := &CPUSetTopologyPlugin{
+				cgroup:             tt.cgroup,
+				pendingProtections: map[string]pendingPodProtection{},
+			}
+			got, err := p.pendingProtectionScopes(context.Background(), nil, []pendingContainerCPUSet{{
+				PodUID: podUID, ContainerName: "main", CPUs: machine.NewCPUSet(0, 1), ScopeRel: podRel,
+			}})
+
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("pendingProtectionScopes() error = %v, want %v", err, tt.wantErr)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("pendingProtectionScopes() error = %v", err)
+				}
+				if len(got) != 1 || got[0].Source != tt.wantSource {
+					t.Fatalf("pending protections = %#v, want source %q", got, tt.wantSource)
+				}
+			}
+			if got := len(tt.cgroup.readCalls); got != 1 {
+				t.Fatalf("ReadCPUSet calls = %d, want 1; calls=%v", got, tt.cgroup.readCalls)
+			}
+			if got := len(tt.cgroup.statCalls); got != tt.wantStats {
+				t.Fatalf("StatDir calls = %d, want %d; calls=%v", got, tt.wantStats, tt.cgroup.statCalls)
+			}
+		})
+	}
+}
+
+func TestPendingProtectionScopesCachesMissingScopeObservation(t *testing.T) {
+	t.Parallel()
+
+	const podRel = "kubepods/burstable/pod-shared-missing-scope"
+	readErr := errors.New("read cpuset failed")
+	cg := &fakeCgroupClient{
+		readErrByRel: map[string]error{podRel: readErr},
+		statErrors:   map[string]error{podRel: syscall.ENOENT},
+	}
+	p := &CPUSetTopologyPlugin{
+		cgroup:             cg,
+		pendingProtections: map[string]pendingPodProtection{},
+	}
+
+	got, err := p.pendingProtectionScopes(context.Background(), nil, []pendingContainerCPUSet{
+		{PodUID: "pod-a", ContainerName: "main", CPUs: machine.NewCPUSet(0, 1), ScopeRel: podRel},
+		{PodUID: "pod-b", ContainerName: "main", CPUs: machine.NewCPUSet(2, 3), ScopeRel: podRel},
+	})
+
+	if err != nil {
+		t.Fatalf("pendingProtectionScopes() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("pending protections = %#v, want two expected pods", got)
+	}
+	for _, protection := range got {
+		if protection.Source != topology.PendingProtectionSourceExpectedPod {
+			t.Fatalf("pending protection source = %q, want %q", protection.Source, topology.PendingProtectionSourceExpectedPod)
+		}
+	}
+	if len(cg.readCalls) != 1 || len(cg.statCalls) != 1 {
+		t.Fatalf("scope observations: reads=%v stats=%v, want one read and one stat", cg.readCalls, cg.statCalls)
+	}
+}
+
+func TestNormalPendingProtectionReadsEachScopeOnce(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID = "pod-single-scope-read"
+		podRel = "kubepods/burstable/pod-single-scope-read"
+	)
+	cg := &fakeCgroupClient{cpus: map[string]machine.CPUSet{
+		podRel: machine.NewCPUSet(0, 1, 2, 3),
+	}}
+	p := &CPUSetTopologyPlugin{
+		cgroup:             cg,
+		pendingProtections: map[string]pendingPodProtection{},
+	}
+	pending := []pendingContainerCPUSet{{
+		PodUID: podUID, ContainerName: "main", CPUs: machine.NewCPUSet(0, 1),
+		ScopeRel: podRel,
+	}, {
+		PodUID: "pod-sharing-scope", ContainerName: "sidecar", CPUs: machine.NewCPUSet(2, 3),
+		ScopeRel: podRel,
+	}}
+
+	protections, err := p.pendingProtectionScopes(context.Background(), nil, pending)
+	if err != nil {
+		t.Fatalf("pendingProtectionScopes() error = %v", err)
+	}
+	protectedByRel := pendingProtectedCPUSetByResolvedScopes(protections)
+	if len(protections) != 2 || !protectedByRel[podRel].Equals(machine.NewCPUSet(0, 1, 2, 3)) {
+		t.Fatalf("normal pending protection = %#v protected=%v, want two owners sharing one protected scope", protections, protectedByRel)
+	}
+	var scopeReads int
+	for _, rel := range cg.readCalls {
+		if rel == podRel {
+			scopeReads++
+		}
+	}
+	if scopeReads != 1 {
+		t.Fatalf("normal pending scope reads = %d, want exactly 1; calls=%v", scopeReads, cg.readCalls)
+	}
+}
+
 func TestPendingProtectionScopesResolveColdPodFromDAGWithoutFilesystemEvidence(t *testing.T) {
 	t.Parallel()
 
@@ -779,8 +956,12 @@ func TestPendingProtectionScopesResolveColdPodFromDAGWithoutFilesystemEvidence(t
 	if err != nil {
 		t.Fatalf("BuildDAG() error = %v", err)
 	}
+	const podRel = "kubepods/burstable/podcold-shared"
 	p := &CPUSetTopologyPlugin{
-		cgroup:             &fakeCgroupClient{},
+		cgroup: &fakeCgroupClient{
+			readErrByRel: map[string]error{podRel: os.ErrNotExist},
+			statErrors:   map[string]error{podRel: syscall.ENOENT},
+		},
 		pendingProtections: map[string]pendingPodProtection{},
 	}
 
@@ -792,7 +973,7 @@ func TestPendingProtectionScopesResolveColdPodFromDAGWithoutFilesystemEvidence(t
 		t.Fatalf("pendingProtectionScopes() error = %v", err)
 	}
 	want := []topology.PendingProtection{{
-		ScopeRel: "kubepods/burstable/podcold-shared",
+		ScopeRel: podRel,
 		CPUs:     machine.NewCPUSet(0, 1),
 		PodUID:   podUID,
 		Source:   topology.PendingProtectionSourceExpectedPod,
@@ -815,8 +996,12 @@ func TestPendingProtectionScopesResolveGuaranteedPodUnderProductionPrimaryRoot(t
 	if err != nil {
 		t.Fatalf("BuildDAG() error = %v", err)
 	}
+	const podRel = "kubepods/podcold-guaranteed"
 	p := &CPUSetTopologyPlugin{
-		cgroup:             &fakeCgroupClient{},
+		cgroup: &fakeCgroupClient{
+			readErrByRel: map[string]error{podRel: os.ErrNotExist},
+			statErrors:   map[string]error{podRel: syscall.ENOENT},
+		},
 		pendingProtections: map[string]pendingPodProtection{},
 	}
 
@@ -828,7 +1013,7 @@ func TestPendingProtectionScopesResolveGuaranteedPodUnderProductionPrimaryRoot(t
 		t.Fatalf("pendingProtectionScopes() error = %v", err)
 	}
 	want := []topology.PendingProtection{{
-		ScopeRel: "kubepods/podcold-guaranteed",
+		ScopeRel: podRel,
 		CPUs:     machine.NewCPUSet(0, 1),
 		PodUID:   podUID,
 		Source:   topology.PendingProtectionSourceExpectedPod,
@@ -4316,8 +4501,12 @@ func TestCPUSetTopologyPluginLivePodWithoutCgroupStillBuildsExpectedPendingScope
 		}}},
 	}}
 	metaServer := &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: fetcher}}
+	podRel := "kubepods/pod" + podUID
 	p := &CPUSetTopologyPlugin{
-		cgroup:             &fakeCgroupClient{},
+		cgroup: &fakeCgroupClient{
+			readErrByRel: map[string]error{podRel: os.ErrNotExist},
+			statErrors:   map[string]error{podRel: syscall.ENOENT},
+		},
 		pendingProtections: map[string]pendingPodProtection{},
 	}
 	view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
@@ -4347,7 +4536,7 @@ func TestCPUSetTopologyPluginLivePodWithoutCgroupStillBuildsExpectedPendingScope
 		t.Fatalf("pendingProtectionScopes() error = %v", err)
 	}
 	want := []topology.PendingProtection{{
-		ScopeRel: "kubepods/pod" + podUID,
+		ScopeRel: podRel,
 		CPUs:     machine.NewCPUSet(0, 1),
 		PodUID:   podUID,
 		Source:   topology.PendingProtectionSourceExpectedPod,

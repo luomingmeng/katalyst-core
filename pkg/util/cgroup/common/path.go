@@ -240,11 +240,10 @@ func GetPodRelativeCgroupPathCandidatesForQOS(podUID string, qosClass v1.PodQOSC
 }
 
 func podRelativeCgroupPathCandidates(kubernetesRoots []string, podUID string) []string {
-	suffix := fmt.Sprintf("%s%s", PodCgroupPathPrefix, podUID)
 	candidates := make([]string, 0, len(kubernetesRoots))
 	seen := make(map[string]struct{}, len(kubernetesRoots))
 	for _, root := range kubernetesRoots {
-		candidate := path.Join(root, suffix)
+		candidate := podRelativeCgroupPath(root, podUID)
 		if _, ok := seen[candidate]; ok {
 			continue
 		}
@@ -252,6 +251,20 @@ func podRelativeCgroupPathCandidates(kubernetesRoots []string, podUID string) []
 		candidates = append(candidates, candidate)
 	}
 	return candidates
+}
+
+// podRelativeCgroupPath converts the abstract pod component into the naming
+// convention implied by root. Cgroupfs keeps pod<UID> as a directory, while a
+// systemd slice must include its parent unit prefix and escape UID dashes.
+func podRelativeCgroupPath(root, podUID string) string {
+	podName := fmt.Sprintf("%s%s", PodCgroupPathPrefix, podUID)
+	rootBase := path.Base(path.Clean(root))
+	if !strings.HasSuffix(rootBase, ".slice") {
+		return path.Join(root, podName)
+	}
+
+	unitPrefix := strings.TrimSuffix(rootBase, ".slice")
+	return path.Join(root, fmt.Sprintf("%s-%s.slice", unitPrefix, strings.ReplaceAll(podName, "-", "_")))
 }
 
 func podRelativeCgroupPathCandidatesForQOS(

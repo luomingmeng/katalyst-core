@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -338,7 +339,7 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 		return fmt.Errorf("ensure bulkhead reclaim sibling cgroups: %w", err)
 	}
 	protectedPending := pendingProtectionCPUSetUnion(protections)
-	protectedByRel := p.pendingProtectedCPUSetByRel(ctx, expectedRes.PendingByPod)
+	protectedByRel := pendingProtectedCPUSetByResolvedScopes(protections)
 	if deadlineErr := admissionStageDeadlineError(ctx, "protect pending container cpuset"); deadlineErr != nil {
 		return deadlineErr
 	}
@@ -1919,6 +1920,13 @@ func (p *CPUSetTopologyPlugin) pendingProtectedCPUSetByRel(ctx context.Context, 
 	return out
 }
 
+// pendingProtectionScopes owns the single normal-path filesystem read for each
+// pending scope. Downstream normal-path consumers must use the returned source
+// classification instead of reading the scope again.
+// pendingProtectionScopes resolves one stable cgroup observation per scope.
+// A successful read proves that the scope exists even when its configured
+// cpuset is empty; only typed ENOENT authorizes treating it as not materialized.
+// Every other read or stat failure remains fail-closed.
 func (p *CPUSetTopologyPlugin) pendingProtectionScopes(
 	ctx context.Context,
 	dag *topology.TopoDAG,
@@ -1955,6 +1963,14 @@ func (p *CPUSetTopologyPlugin) pendingProtectionScopes(
 	}
 
 	out := make([]topology.PendingProtection, 0, len(aggregated))
+	// This invocation owns one observation per scope. Multiple pending Pod
+	// records may resolve to the same scope, so they must share that observation.
+	type scopeObservation struct {
+		current machine.CPUSet
+		source  topology.PendingProtectionSource
+		err     error
+	}
+	observedByRel := make(map[string]scopeObservation)
 	for podUID, pending := range aggregated {
 		protection, ok := p.pendingProtections[podUID]
 		if !ok || !now.Before(protection.protectUntil) {
@@ -1980,21 +1996,41 @@ func (p *CPUSetTopologyPlugin) pendingProtectionScopes(
 				topology.ErrInvalidPendingProtection, podUID, rel)
 		}
 
-		source := topology.PendingProtectionSourceExpectedPod
-		current, err := p.cgroup.ReadCPUSet(ctx, rel)
-		if err == nil && !current.IsEmpty() {
-			source = topology.PendingProtectionSourceExistingPod
-			protection.current = current
+		observation, observed := observedByRel[rel]
+		if !observed {
+			current, readErr := p.cgroup.ReadCPUSet(ctx, rel)
+			observation.current = current
+			switch {
+			case readErr == nil:
+				observation.source = topology.PendingProtectionSourceExistingPod
+			default:
+				_, statErr := p.cgroup.StatDir(ctx, rel)
+				switch {
+				case statErr == nil:
+					observation.err = fmt.Errorf("read cpuset for existing pending pod scope %q: %w", rel, readErr)
+				case errors.Is(statErr, syscall.ENOENT):
+					observation.source = topology.PendingProtectionSourceExpectedPod
+				default:
+					observation.err = fmt.Errorf("stat pending pod scope %q after cpuset read failed: %w", rel, statErr)
+				}
+			}
+			observedByRel[rel] = observation
+		}
+		if observation.err != nil {
+			return nil, observation.err
+		}
+		if observation.source == topology.PendingProtectionSourceExistingPod {
+			protection.current = observation.current
 		}
 		protection.rel = rel
 		p.pendingProtections[podUID] = protection
 		general.Infof("bulkhead: pending pod scope selected, pod=%q native_qos=%q scope=%q source=%q cpuset=%s",
-			podUID, pending.NativeQOSClass, rel, source, pending.CPUs.String())
+			podUID, pending.NativeQOSClass, rel, observation.source, pending.CPUs.String())
 		out = append(out, topology.PendingProtection{
 			ScopeRel: rel,
 			CPUs:     pending.CPUs.Clone(),
 			PodUID:   podUID,
-			Source:   source,
+			Source:   observation.source,
 		})
 	}
 	for podUID := range p.pendingProtections {
@@ -2009,6 +2045,17 @@ func (p *CPUSetTopologyPlugin) pendingProtectionScopes(
 		return out[i].PodUID < out[j].PodUID
 	})
 	return out, nil
+}
+
+func pendingProtectedCPUSetByResolvedScopes(protections []topology.PendingProtection) map[string]machine.CPUSet {
+	out := make(map[string]machine.CPUSet)
+	for _, protection := range protections {
+		if protection.Source != topology.PendingProtectionSourceExistingPod {
+			continue
+		}
+		out[protection.ScopeRel] = out[protection.ScopeRel].Union(protection.CPUs)
+	}
+	return out
 }
 
 func unionCPUSetByRel(byRel map[string]machine.CPUSet) machine.CPUSet {
