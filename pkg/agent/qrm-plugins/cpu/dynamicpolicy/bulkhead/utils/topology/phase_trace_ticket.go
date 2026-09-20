@@ -17,6 +17,7 @@ limitations under the License.
 package topology
 
 import (
+	"context"
 	"fmt"
 	"sync"
 )
@@ -59,12 +60,33 @@ func (b *BudgetTracker) ReservePhaseTrace(
 		return nil, fmt.Errorf("%w: maximum required writes must not be negative: %d",
 			ErrAdmissionReservationExceeded, maxRequiredWrites)
 	}
-
-	frozen, err := FreezePhaseTrace(trace)
+	validated, err := freezeValidatedPhaseTrace(context.Background(), trace)
 	if err != nil {
 		return nil, err
 	}
-	reserved := phaseTracePhysicalWriteCost(frozen)
+	return b.reserveValidatedPhaseTrace(validated, maxRequiredWrites)
+}
+
+// reserveValidatedPhaseTrace owns reservation for compiler-produced traces.
+// Its invariant is that the carrier has already been cloned and validated once,
+// so reservation derives authorization only from that immutable evidence.
+func (b *BudgetTracker) reserveValidatedPhaseTrace(
+	validated *validatedPhaseTrace,
+	maxRequiredWrites int,
+) (*ExecutionReservationTicket, error) {
+	if b == nil {
+		return nil, fmt.Errorf("phase trace reservation requires budget tracker")
+	}
+	if maxRequiredWrites < 0 {
+		return nil, fmt.Errorf("%w: maximum required writes must not be negative: %d",
+			ErrAdmissionReservationExceeded, maxRequiredWrites)
+	}
+
+	frozen, err := validated.trace()
+	if err != nil {
+		return nil, err
+	}
+	reserved := frozen.Cost
 	required := reserved.Total()
 	if maxRequiredWrites > 0 && required > maxRequiredWrites {
 		return nil, fmt.Errorf("%w before frozen trace execution: limit=%d required=%d",
@@ -203,13 +225,6 @@ func (t *ExecutionReservationTicket) ReleaseUnused() {
 
 func validPhysicalWriteCost(cost PhysicalWriteCost) bool {
 	return cost.CPUSetWrites >= 0 && cost.MemsWrites >= 0
-}
-
-func phaseTracePhysicalWriteCost(trace *CompiledPhaseTrace) ExecutionReservationCost {
-	if trace == nil {
-		return ExecutionReservationCost{}
-	}
-	return executionReservationCost(trace.Phases)
 }
 
 func clonePlanOperation(operation PlanOperation) PlanOperation {

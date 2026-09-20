@@ -278,10 +278,33 @@ func (w safeCPSetWriter) preflightFrozenTraceOperations(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-
-	frozen, err := FreezePhaseTrace(trace)
+	validated, err := freezeValidatedPhaseTrace(ctx, trace)
 	if err != nil {
 		return nil, fmt.Errorf("freeze phase trace before preflight: %w", err)
+	}
+	return w.preflightValidatedTraceOperations(ctx, validated)
+}
+
+// preflightValidatedTraceOperations owns the no-write projection check for the
+// production chain. Its carrier is already immutable and validated, so this
+// stage must not clone or replay trace validation.
+func (w safeCPSetWriter) preflightValidatedTraceOperations(
+	ctx context.Context,
+	validated *validatedPhaseTrace,
+) ([]frozenOperationPreflight, error) {
+	if w.driver == nil {
+		return nil, fmt.Errorf("frozen trace preflight requires hierarchy driver")
+	}
+	if w.budget == nil {
+		return nil, fmt.Errorf("frozen trace preflight requires convergence budget")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	frozen, err := validated.trace()
+	if err != nil {
+		return nil, err
 	}
 	if frozen.InitialSnapshot.ScanBoundary.Purpose != ScanForPlan {
 		return nil, fmt.Errorf(
@@ -767,14 +790,48 @@ func (r *coordinatorRound) executeFrozenTrace(
 	if len(finalizers) > 1 {
 		return outcome, fmt.Errorf("frozen trace execution accepts at most one finalizer")
 	}
-	frozen, err := FreezePhaseTrace(trace)
+	validated, err := freezeValidatedPhaseTrace(ctx, trace)
+	if err != nil {
+		return outcome, err
+	}
+	return r.executeValidatedFrozenTrace(ctx, validated, ticket, res, finalizers...)
+}
+
+// executeValidatedFrozenTrace owns live replay of compiler-produced admission
+// traces. It consumes the validated carrier without cloning; ticket order and
+// preflight evidence protect the immutable operation sequence during execution.
+func (r *coordinatorRound) executeValidatedFrozenTrace(
+	ctx context.Context,
+	validated *validatedPhaseTrace,
+	ticket *ExecutionReservationTicket,
+	res *ConvergenceResult,
+	finalizers ...frozenTraceFinalizer,
+) (RoundOutcome, error) {
+	outcome := RoundOutcome{Status: RoundStatusBlocked}
+	if r == nil || r.driver == nil {
+		return outcome, fmt.Errorf("frozen trace execution requires hierarchy driver")
+	}
+	if r.budget == nil {
+		return outcome, fmt.Errorf("frozen trace execution requires convergence budget")
+	}
+	if ticket == nil {
+		return outcome, fmt.Errorf("%w: frozen trace execution requires reservation ticket",
+			ErrAdmissionReservationExceeded)
+	}
+	if res == nil {
+		return outcome, fmt.Errorf("frozen trace execution requires convergence result")
+	}
+	if len(finalizers) > 1 {
+		return outcome, fmt.Errorf("frozen trace execution accepts at most one finalizer")
+	}
+	frozen, err := validated.trace()
 	if err != nil {
 		return outcome, err
 	}
 	defer ticket.ReleaseUnused()
 
 	writer := newSafeCPUSetWriter(r.driver, r.budget, res)
-	preflight, err := writer.preflightFrozenTraceOperations(ctx, frozen)
+	preflight, err := writer.preflightValidatedTraceOperations(ctx, validated)
 	if err != nil {
 		return outcome, err
 	}

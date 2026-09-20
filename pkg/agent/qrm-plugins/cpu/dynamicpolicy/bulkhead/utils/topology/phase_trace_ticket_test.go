@@ -70,9 +70,8 @@ func TestReservePhaseTraceCountsExactForwardAndInverseWrites(t *testing.T) {
 		},
 	}
 
-	cost := phaseTracePhysicalWriteCost(&CompiledPhaseTrace{
-		Phases: []CompiledPhase{{Kind: PhaseExpand, Operations: operations}},
-	})
+	cost := executionReservationCost(
+		[]CompiledPhase{{Kind: PhaseExpand, Operations: operations}})
 
 	expected := PhysicalWriteCost{CPUSetWrites: 1, MemsWrites: 1}
 	require.Equal(t, ExecutionReservationCost{

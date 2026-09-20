@@ -31,6 +31,18 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
+func TestProjectedPhaseSessionSnapshotHonorsCanceledContext(t *testing.T) {
+	_, base := newTask9ParentSafeFixture(t)
+	session, err := newProjectedPhaseSession(base, base.Capabilities)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = session.Snapshot(ctx)
+
+	require.ErrorIs(t, err, context.Canceled)
+}
+
 const topologyScaleTestEnv = "KATALYST_TOPOLOGY_SCALE_TEST"
 
 // admissionTraceFixture wires a coordinatorRound to a fake hierarchy driver so

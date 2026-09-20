@@ -923,18 +923,6 @@ func equalChildRefs(left, right []ChildRef) bool {
 	return true
 }
 
-func equalStringSlices(left, right []string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for i := range left {
-		if left[i] != right[i] {
-			return false
-		}
-	}
-	return true
-}
-
 func frozenBoundariesEqual(left, right FrozenBoundary) bool {
 	return left.Version == right.Version &&
 		reflect.DeepEqual(left.Roots, right.Roots) &&

@@ -140,6 +140,22 @@ func TestParentSafeAdmissionCompilesReservesAndExecutesOneFrozenTrace(t *testing
 	}
 }
 
+func TestValidatedTraceCarrierIsFrozenOnceAcrossAdmissionStages(t *testing.T) {
+	fixture, base := newTask9ParentSafeFixture(t)
+	result := &ConvergenceResult{}
+
+	validated, err := fixture.round.compileValidatedFixedPointTrace(context.Background(), base)
+	require.NoError(t, err)
+	require.Equal(t, uint8(1), validated.freezePasses)
+
+	ticket, err := fixture.round.budget.reserveValidatedPhaseTrace(validated, 0)
+	require.NoError(t, err)
+	_, err = fixture.round.executeValidatedFrozenTrace(
+		context.Background(), validated, ticket, result)
+	require.NoError(t, err)
+	require.Equal(t, uint8(1), validated.freezePasses)
+}
+
 func TestAdmissionCompileFailurePerformsZeroPhysicalWrites(t *testing.T) {
 	fixture, base := newTask9ParentSafeFixture(t)
 	fixture.round.maxRounds = 0

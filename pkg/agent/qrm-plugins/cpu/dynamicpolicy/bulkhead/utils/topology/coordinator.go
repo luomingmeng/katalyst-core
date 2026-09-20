@@ -1041,7 +1041,11 @@ func (r *coordinatorRound) executeParentSafeAdmission(
 		return outcome, fmt.Errorf("frozen admission execution requires convergence result")
 	}
 
-	trace, err := r.compileFixedPointTrace(ctx, base)
+	validated, err := r.compileValidatedFixedPointTrace(ctx, base)
+	if err != nil {
+		return outcome, err
+	}
+	trace, err := validated.trace()
 	if err != nil {
 		return outcome, err
 	}
@@ -1051,7 +1055,7 @@ func (r *coordinatorRound) executeParentSafeAdmission(
 	if r.admissionBudget != nil {
 		maxRequiredWrites = r.admissionBudget.MaxRequiredWrites
 	}
-	ticket, err := r.budget.ReservePhaseTrace(trace, maxRequiredWrites)
+	ticket, err := r.budget.reserveValidatedPhaseTrace(validated, maxRequiredWrites)
 	if err != nil {
 		return outcome, err
 	}
@@ -1082,7 +1086,7 @@ func (r *coordinatorRound) executeParentSafeAdmission(
 		return finalization, finalizeErr
 	}
 
-	outcome, err = r.executeFrozenTrace(ctx, trace, ticket, res, finalize)
+	outcome, err = r.executeValidatedFrozenTrace(ctx, validated, ticket, res, finalize)
 	res.Rounds = append(res.Rounds, outcome)
 	if err != nil {
 		return outcome, err
