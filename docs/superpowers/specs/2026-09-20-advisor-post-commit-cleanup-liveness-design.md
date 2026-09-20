@@ -34,8 +34,6 @@ state, and causes later GetAdvice meta-cache failures.
 - Prevent residual detection from starving behind a sequence of short-lived
   targets.
 - Retire provably stale pending allocations without guessing a QoS path.
-- Avoid creating a new canonical revision for unchanged Advisor control
-  payloads.
 - Preserve crash recovery, WAL durability, revision fencing, and rollback.
 
 ## Non-Goals
@@ -45,6 +43,9 @@ state, and causes later GetAdvice meta-cache failures.
 - Do not select an arbitrary cgroup candidate.
 - Do not make SysAdvisor silently ignore arbitrary missing Pods.
 - Do not weaken topology, ownership, or checkpoint validation.
+- Do not reduce Advisor revision churn or deduplicate unchanged
+  `ExtraEntries`. That is a performance concern owned by a separate design.
+- Do not add transaction identity or change checkpoint/WAL schemas.
 
 ## Design
 
@@ -110,28 +111,6 @@ Scope resolution with unknown QoS may use only the concrete path established
 above. It must not infer identity from all hypothetical paths sharing a common
 controlled ancestor.
 
-### Control Payload No-Op
-
-The policy persists the normalized Advisor control payload that was last
-durably applied:
-
-- cgroup configuration entries;
-- NUMA headroom entry;
-- overlap control fields;
-- other post-commit control entries.
-
-Before opening a new WAL transaction, it compares the normalized response with
-the last applied payload. A converged CPU state with an identical control
-payload follows the no-op path even when `ExtraEntries` is non-empty.
-
-The comparison is order-independent, duplicate-rejecting, and based on
-canonical key/value content. Any malformed, duplicate, changed, or previously
-unrecorded payload still creates a normal transaction.
-
-The applied payload identity is written into the existing advisor post-commit
-checkpoint and canonical CPU checkpoint in a backward-compatible optional
-field. Recovery may use it only after checksum and revision validation.
-
 ## Failure Semantics
 
 - A target with no progress beyond the threshold remains health-failing.
@@ -141,7 +120,7 @@ field. Recovery may use it only after checksum and revision validation.
 - Unknown or ambiguous live cgroup scope remains fail-closed.
 - Absence is accepted only after both fresh Pod lookup and all cgroup
   candidates prove absence.
-- A changed control payload always opens a transaction.
+- Existing Advisor transaction, checkpoint, and WAL behavior remains unchanged.
 
 ## Observability
 
@@ -162,8 +141,6 @@ Metrics distinguish:
 - stuck target;
 - stale pending allocation skipped;
 - ambiguous live scope;
-- semantic control no-op;
-- changed control transaction.
 
 ## Tests
 
@@ -179,10 +156,6 @@ Metrics distinguish:
 - Missing Pod plus one concrete cgroup path is protected using that path.
 - Multiple existing paths fail closed.
 - Permission and I/O errors fail closed.
-- Identical normalized `ExtraEntries` do not advance revision.
-- Changed, malformed, or duplicate controls do advance or fail closed as
-  appropriate.
-- WAL recovery preserves control payload identity.
 
 ### Integration
 
@@ -206,6 +179,5 @@ Metrics distinguish:
 - No `clearResidualState` starvation across five minutes of continuous
   successful Advisor activity.
 - No ambiguous pending scope for a Pod proven absent from both API and cgroup.
-- Unchanged controls do not advance canonical revision.
 - All existing fail-closed tests continue to pass.
 - Three independent canonical suites pass with final reset.

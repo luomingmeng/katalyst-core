@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpower-subagent-driven-development (recommended) or superpower-executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Prevent progressing Advisor transactions from starving residual cleanup, retire provably stale pending scopes, and avoid revisions for unchanged controls.
+**Goal:** Prevent progressing Advisor transactions from starving residual cleanup and retire provably stale pending scopes.
 
-**Architecture:** Add target progress identity and bounded target-change retry to cleanup, while retaining the writer fence for mutation. Resolve unknown-QoS pending scopes only from fresh Pod data or concrete existing cgroups. Canonicalize and persist Advisor control identity so unchanged non-empty controls can use the no-op path.
+**Architecture:** Add target progress state and bounded target-change retry to cleanup, while retaining the writer fence for mutation. Resolve unknown-QoS pending scopes only from fresh Pod data or concrete existing cgroups. Advisor revision churn remains unchanged and is explicitly outside this repair.
 
 **Tech Stack:** Go 1.18, Kubernetes Pod/QoS API, QRM state checkpoint/WAL, Linux cgroup v1/v2, testify, race detector, native linux/amd64 CGO.
 
@@ -64,52 +64,19 @@
 - [ ] Use the concrete scope directly when QoS remains unknown.
 - [ ] Re-run tests and commit.
 
-## Task 4: Control Payload Identity
-
-**Files:**
-- Create: `pkg/agent/qrm-plugins/cpu/dynamicpolicy/advisor_control_payload.go`
-- Create: `pkg/agent/qrm-plugins/cpu/dynamicpolicy/advisor_control_payload_test.go`
-- Modify: `pkg/agent/qrm-plugins/cpu/dynamicpolicy/state/checkpoint.go`
-- Modify: `pkg/agent/qrm-plugins/cpu/dynamicpolicy/state/state.go`
-- Modify: `pkg/agent/qrm-plugins/cpu/dynamicpolicy/state/state_mem.go`
-- Modify: `pkg/agent/qrm-plugins/cpu/dynamicpolicy/state/state_checkpoint.go`
-- Modify: `pkg/agent/qrm-plugins/cpu/dynamicpolicy/state/state_transient.go`
-- Test: `pkg/agent/qrm-plugins/cpu/dynamicpolicy/state/state_test.go`
-
-- [ ] Add RED tests for order independence, JSON canonicalization, duplicates, malformed values, changes, and unrecorded identity.
-- [ ] Normalize path/knob/value tuples, reject duplicates, canonicalize JSON values, sort, and SHA-256 hash.
-- [ ] Persist the optional identity atomically with canonical Advisor state.
-- [ ] Preserve old checkpoint checksum compatibility and rollback identity on store failure.
-- [ ] Run state and payload tests and commit.
-
-## Task 5: Semantic No-Op and WAL Recovery
-
-**Files:**
-- Modify: `pkg/agent/qrm-plugins/cpu/dynamicpolicy/policy_advisor_handler.go`
-- Modify: `pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuset_adjustment_handler.go`
-- Test: `pkg/agent/qrm-plugins/cpu/dynamicpolicy/policy_advisor_handler_test.go`
-- Test: `pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuset_adjustment_handler_test.go`
-
-- [ ] Add RED tests proving identical and reordered non-empty controls do not advance revision or create WAL.
-- [ ] Add tests proving changed, malformed, duplicate, unrecorded, or currently pending controls cannot use no-op.
-- [ ] Store the validated control identity in the post-commit checkpoint with legacy compatibility.
-- [ ] Replace `len(resp.ExtraEntries) == 0` with semantic identity equality in the no-op condition.
-- [ ] Keep changed controls on the normal WAL/commit/apply path.
-- [ ] Run Advisor checkpoint, recovery, cleanup, and allocation suites and commit.
-
-## Task 6: Observability and Integration
+## Task 4: Observability and Integration
 
 **Files:**
 - Modify: `pkg/agent/qrm-plugins/util/consts.go`
 - Test: dynamic policy and cpuset topology integration tests
 
-- [ ] Add result metrics for progressing deferral, wait recovery, stuck target, stale skip, ambiguous scope, semantic no-op, and changed transaction.
+- [ ] Add result metrics for progressing deferral, wait recovery, stuck target, stale skip, and ambiguous scope.
 - [ ] Include revision, phase, generation, target age, and since-progress in stuck diagnostics.
 - [ ] Add an integration test proving an unrelated stale allocation no longer blocks `RemovePod`.
 - [ ] Add an integration test proving continuously progressing Advisor traffic does not make cleanup health unhealthy.
 - [ ] Run focused repetitions and commit.
 
-## Task 7: Local Verification
+## Task 5: Local Verification
 
 - [ ] Run focused tests with `-count=100`.
 - [ ] Run dynamic policy, topology plugin, and state race suites.
@@ -123,7 +90,7 @@
 - [ ] Run `go vet`, `gofmt -d`, and `git diff --check`.
 - [ ] Confirm no timeout, health tolerance, writer fence, revision CAS, or checksum weakening.
 
-## Task 8: Native Build and Deployment
+## Task 6: Native Build and Deployment
 
 - [ ] Archive the exact clean core HEAD and verify its SHA on the Linux builder.
 - [ ] Run Linux Go 1.18 focused and race tests.
@@ -133,12 +100,12 @@
 - [ ] Back up and replace both QRM and SysAdvisor binaries.
 - [ ] Verify build, rootfs, and `/proc/<pid>/exe` SHA identity plus healthz.
 
-## Task 9: E2E Gates
+## Task 7: E2E Gates
 
 - [ ] Run reset dry-run/actual and target dry-run/actual.
 - [ ] Run focused high-churn for five rounds.
 - [ ] Run focused overlap for three rounds.
-- [ ] Verify health remains ready across multiple cleanup ticks, residual state drains, stale UIDs do not survive, and unchanged controls do not advance revision.
+- [ ] Verify health remains ready across multiple cleanup ticks, residual state drains, and stale UIDs do not survive as terminal failures.
 - [ ] Run three independent canonical suites serially.
 - [ ] Stop after the first suite failure, but always execute final reset.
 - [ ] Package every run, verify remote/local size and SHA-256, and validate each tar archive.
