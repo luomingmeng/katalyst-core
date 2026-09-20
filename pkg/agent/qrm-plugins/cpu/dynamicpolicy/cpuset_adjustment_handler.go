@@ -58,10 +58,6 @@ const (
 	advisorPostCommitWALV2Magic         = "\x00KATALYST_CPU_ADVISOR_WAL_V2\x00"
 )
 
-type cpuSetAdjustmentRevisionedState interface {
-	GetRevision() uint64
-}
-
 type advisorPostCommitPhase string
 
 const (
@@ -273,8 +269,8 @@ type cpuSetAdjustmentStateSnapshot struct {
 	podEntries       state.PodEntries
 	allowOverlap     bool
 	disableDedicated bool
-	revision         uint64
-	hasRevision      bool
+	// revision is the sole owner of snapshot freshness; state payloads are views, not identities.
+	revision uint64
 }
 
 func newCPUSetAdjustmentStateSnapshot(source state.ReadonlyState) *cpuSetAdjustmentStateSnapshot {
@@ -287,10 +283,7 @@ func newCPUSetAdjustmentStateSnapshot(source state.ReadonlyState) *cpuSetAdjustm
 		podEntries:       source.GetPodEntries(),
 		allowOverlap:     source.GetAllowSharedCoresOverlapReclaimedCores(),
 		disableDedicated: source.GetDisableDedicatedCoresOverlapReclaimedCores(),
-	}
-	if revisioned, ok := source.(cpuSetAdjustmentRevisionedState); ok {
-		snapshot.revision = revisioned.GetRevision()
-		snapshot.hasRevision = true
+		revision:         source.GetRevision(),
 	}
 	return snapshot
 }
@@ -299,15 +292,7 @@ func (s *cpuSetAdjustmentStateSnapshot) matches(source state.ReadonlyState) bool
 	if s == nil || source == nil {
 		return s == nil && source == nil
 	}
-	if s.hasRevision {
-		revisioned, ok := source.(cpuSetAdjustmentRevisionedState)
-		return ok && s.revision == revisioned.GetRevision()
-	}
-	return s.allowOverlap == source.GetAllowSharedCoresOverlapReclaimedCores() &&
-		s.disableDedicated == source.GetDisableDedicatedCoresOverlapReclaimedCores() &&
-		reflect.DeepEqual(s.machineState, source.GetMachineState()) &&
-		reflect.DeepEqual(s.numaHeadroom, source.GetNUMAHeadroom()) &&
-		reflect.DeepEqual(s.podEntries, source.GetPodEntries())
+	return s.revision == source.GetRevision()
 }
 
 func (s *cpuSetAdjustmentStateSnapshot) GetMachineState() state.NUMANodeMap {

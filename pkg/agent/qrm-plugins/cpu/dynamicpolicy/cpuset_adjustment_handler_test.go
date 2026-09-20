@@ -64,6 +64,23 @@ type cpusetOverrideCommitGuardState struct {
 	conditionalRevision      uint64
 }
 
+func TestCPUSetAdjustmentStateSnapshotMatchesSameRevision(t *testing.T) {
+	source := state.NewCPUPluginState(nil)
+	snapshot := &cpuSetAdjustmentStateSnapshot{revision: source.GetRevision()}
+
+	require.True(t, snapshot.matches(source))
+}
+
+func TestCPUSetAdjustmentStateSnapshotRejectsChangedRevision(t *testing.T) {
+	source := state.NewCPUPluginState(nil)
+	snapshot := newCPUSetAdjustmentStateSnapshot(source)
+	require.True(t, snapshot.matches(source))
+
+	require.NoError(t, source.SetPodEntries(state.PodEntries{}))
+
+	require.False(t, snapshot.matches(source))
+}
+
 func TestCPUSetAdjustmentExecutionLeaseStaleContextAfterRelease(t *testing.T) {
 	p := &DynamicPolicy{
 		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
