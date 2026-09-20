@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"sync/atomic"
@@ -38,6 +39,16 @@ import (
 
 func Test_getCgroupRootPaths(t *testing.T) {
 	t.Parallel()
+
+	const subprocessEnv = "KATALYST_TEST_GET_CGROUP_ROOT_PATHS_SUBPROCESS"
+	if os.Getenv(subprocessEnv) != "1" {
+		cmd := exec.Command(os.Args[0], "-test.run=^Test_getCgroupRootPaths$")
+		cmd.Env = append(os.Environ(), subprocessEnv+"=1")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("subprocess failed: %v\n%s", err, output)
+		}
+		return
+	}
 
 	want := []string{
 		"/sys/fs/cgroup/cpu/kubepods",
