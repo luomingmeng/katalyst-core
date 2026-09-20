@@ -27,6 +27,9 @@ type advisorDynamicConfigurationSource interface {
 	GetDynamicConfiguration() *dynamicconfig.Configuration
 }
 
+// captureAdvisorAttemptConfiguration freezes the dynamic and floor sources
+// into an attempt-local configuration that remains immutable for the complete
+// advisor operation.
 func (p *DynamicPolicy) captureAdvisorAttemptConfiguration() (advisorAttemptConfiguration, error) {
 	if p == nil {
 		return advisorAttemptConfiguration{}, nil

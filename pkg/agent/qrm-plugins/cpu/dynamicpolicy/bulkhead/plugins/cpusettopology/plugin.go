@@ -1600,6 +1600,10 @@ func (p *CPUSetTopologyPlugin) pendingPodScopeCandidatesForQOS(
 	}
 }
 
+// selectConcretePendingPodScope observes each normalized, allowed candidate
+// once. An all-typed-ENOENT result only authorizes the caller to classify the
+// allocation as stale after a fresh Pod lookup also reports that the Pod is
+// absent; every other observation error fails closed.
 func (p *CPUSetTopologyPlugin) selectConcretePendingPodScope(
 	ctx context.Context,
 	podUID string,
@@ -2047,6 +2051,8 @@ func (p *CPUSetTopologyPlugin) pendingProtectionScopes(
 	return out, nil
 }
 
+// pendingProtectedCPUSetByResolvedScopes derives protection only from the
+// already resolved scope classifications, avoiding duplicate cgroup I/O.
 func pendingProtectedCPUSetByResolvedScopes(protections []topology.PendingProtection) map[string]machine.CPUSet {
 	out := make(map[string]machine.CPUSet)
 	for _, protection := range protections {

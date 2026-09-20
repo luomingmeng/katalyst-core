@@ -52,6 +52,9 @@ func pendingProtectionUnion(protections []PendingProtection) machine.CPUSet {
 	return out
 }
 
+// pendingRequiredCPUSetByRel expands each pending protection to the controlled
+// primary ancestor closure that owns its scope, unioning the protected CPUs at
+// every matching ancestor.
 func pendingRequiredCPUSetByRel(
 	dag *TopoDAG,
 	protections []PendingProtection,
