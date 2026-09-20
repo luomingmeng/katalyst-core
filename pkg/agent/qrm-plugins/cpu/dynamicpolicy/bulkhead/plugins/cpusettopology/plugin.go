@@ -1392,13 +1392,6 @@ type pendingContainerCPUSet struct {
 	Reason         string
 	NativeQOSClass v1.PodQOSClass
 	ScopeRel       string
-	// Expected marks an admit-window pending entry produced by
-	// buildExpectedCPUSetByRel: the container cgroup is not materialized yet
-	// because the pod is being admitted. For such entries a failed pod-leaf
-	// cgroup path lookup degrades to the controlled primary ancestor scope
-	// instead of rejecting admission. Entries without this mark whose leaf
-	// cannot be resolved fail closed.
-	Expected bool
 }
 
 // expectedCPUSetBuildResult separates resolvable container leaves (ExpectedByRel,
@@ -1450,6 +1443,7 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in 
 		DeferredLeafByRel: map[string]machine.CPUSet{},
 	}
 	var errs []error
+	pendingByPod := make(map[string][]pendingContainerCPUSet)
 	for podUID, containers := range in.DesiredView.ContainerCPUSetByPod {
 		for containerName, cpus := range containers {
 			if cpus.IsEmpty() {
@@ -1468,24 +1462,8 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in 
 			rel, err := bulkheadutils.ResolveContainerRelPathWithContext(ctx, in.MetaServer, podUID, containerName)
 			if err != nil {
 				if isContainerPendingErr(err) {
-					scopeRel, nativeQOSClass, stale, scopeErr := p.resolvePendingPodScopeFresh(
-						ctx, in.MetaServer, podUID)
-					if scopeErr != nil {
-						errs = append(errs, fmt.Errorf(
-							"resolve pending pod scope: pod=%s container=%s: %w",
-							podUID, containerName, scopeErr))
-						continue
-					}
-					if stale {
-						general.Infof("bulkhead: stale checkpoint allocation skipped from pending protection, pod=%q container=%q cpuset=%s",
-							podUID, containerName, cpus.String())
-						continue
-					}
-					general.InfofV(5, "bulkhead: container rel pending, protecting allocation, pod=%q container=%q cpuset=%s cpuset_size=%d err=%v",
-						podUID, containerName, cpus.String(), cpus.Size(), err)
-					out.PendingByPod = append(out.PendingByPod, pendingContainerCPUSet{
+					pendingByPod[podUID] = append(pendingByPod[podUID], pendingContainerCPUSet{
 						PodUID: podUID, ContainerName: containerName, CPUs: cpus, Reason: err.Error(),
-						NativeQOSClass: nativeQOSClass, ScopeRel: scopeRel, Expected: true,
 					})
 					continue
 				}
@@ -1512,12 +1490,39 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in 
 			out.ExpectedByRel[rel] = cpus
 		}
 	}
+	for podUID, pending := range pendingByPod {
+		scopeRel, nativeQOSClass, stale, scopeErr := p.resolvePendingPodScopeFresh(
+			ctx, in.MetaServer, podUID)
+		if scopeErr != nil {
+			errs = append(errs, fmt.Errorf("resolve pending pod scope: pod=%s: %w", podUID, scopeErr))
+			continue
+		}
+		if stale {
+			for _, container := range pending {
+				general.Infof("bulkhead: stale checkpoint allocation skipped from pending protection, pod=%q container=%q cpuset=%s",
+					podUID, container.ContainerName, container.CPUs.String())
+			}
+			continue
+		}
+		for i := range pending {
+			pending[i].NativeQOSClass = nativeQOSClass
+			pending[i].ScopeRel = scopeRel
+			general.InfofV(5, "bulkhead: container rel pending, protecting allocation, pod=%q container=%q cpuset=%s cpuset_size=%d reason=%s",
+				podUID, pending[i].ContainerName, pending[i].CPUs.String(), pending[i].CPUs.Size(), pending[i].Reason)
+		}
+		out.PendingByPod = append(out.PendingByPod, pending...)
+	}
 	if len(errs) > 0 {
 		return nil, apierrors.NewAggregate(errs)
 	}
 	return out, nil
 }
 
+// resolvePendingPodScopeFresh owns pending scope freshness for one Pod.
+// All pending containers from that Pod must consume this single result so QoS,
+// scope, and stale classification cannot come from mixed Pod snapshots. A
+// missing scope is stale only when the fresh Pod is absent and every allowed
+// cgroup candidate is absent; a live Pod remains pending until materialization.
 func (p *CPUSetTopologyPlugin) resolvePendingPodScopeFresh(
 	ctx context.Context,
 	metaServer *metaserver.MetaServer,
@@ -1535,10 +1540,11 @@ func (p *CPUSetTopologyPlugin) resolvePendingPodScopeFresh(
 		if len(candidates) == 1 {
 			return strings.Trim(candidates[0], "/"), qosClass, false, nil
 		}
-		// Unknown or non-canonical QoS/root layouts may only use a concrete,
-		// uniquely existing scope; never guess among multiple candidates.
-		scopeRel, stale, err = p.selectConcretePendingPodScope(ctx, podUID, candidates)
-		return scopeRel, qosClass, stale, err
+		// Prefer a uniquely materialized scope and fail closed if multiple
+		// candidates exist. No materialized candidate is still a live pending
+		// Pod; the topology DAG selects its controlled primary scope later.
+		scopeRel, _, err = p.selectConcretePendingPodScope(ctx, podUID, candidates)
+		return scopeRel, qosClass, false, err
 	case !metapod.IsPodNotFound(podErr):
 		return "", "", false, podErr
 	default:

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"syscall"
 	"testing"
@@ -21,6 +22,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent"
 	metapod "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
+	cgcommon "github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -147,6 +149,105 @@ func TestPendingContainerErrorsUseStrictFreshPodAndFreshQoS(t *testing.T) {
 				t.Fatalf("pending scope = %q, want fresh best-effort scope", got)
 			}
 		})
+	}
+}
+
+func TestLivePendingPodWithNoMaterializedCandidateIsNotStale(t *testing.T) {
+	const subprocessEnv = "KATALYST_TEST_LIVE_PENDING_MULTIPLE_CANDIDATES"
+	if os.Getenv(subprocessEnv) != "1" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestLivePendingPodWithNoMaterializedCandidateIsNotStale$")
+		cmd.Env = append(os.Environ(), subprocessEnv+"=1")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("isolated candidate-root test failed: %v\n%s", err, output)
+		}
+		return
+	}
+
+	const podUID = "live-multiple-candidates"
+	cgcommon.InitKubernetesCGroupPath(cgcommon.CgroupTypeSystemd, []string{
+		cgcommon.CgroupFsRootPath,
+		cgcommon.CgroupFsRootPathBestEffort,
+		cgcommon.CgroupFsRootPathBurstable,
+	})
+	statErrors := make(map[string]error)
+	for _, rel := range relativePendingPodScopeCandidates(
+		cgcommon.GetPodRelativeCgroupPathCandidatesForQOS(podUID, v1.PodQOSBestEffort)) {
+		statErrors[rel] = os.ErrNotExist
+	}
+	fetcher := &strictFreshPendingFetcher{
+		containerErr: metapod.ErrContainerNotFound,
+		pods: map[string]*v1.Pod{
+			podUID: {
+				ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+			},
+		},
+		podErrs:      map[string]error{},
+		freshLookups: map[string]int{},
+	}
+	p := &CPUSetTopologyPlugin{
+		cgroup: &fakeCgroupClient{
+			statErrors: statErrors,
+		},
+	}
+
+	res, err := p.buildExpectedCPUSetByRel(context.Background(), pendingScopeTestContext(
+		fetcher,
+		pendingScopeTestView(map[string]machine.CPUSet{podUID: machine.NewCPUSet(0, 1)}),
+	))
+	if err != nil {
+		t.Fatalf("live pending pod must not fail when candidates are not materialized: %v", err)
+	}
+	if fetcher.freshLookups[podUID] != 1 {
+		t.Fatalf("strict fresh lookups = %d, want 1", fetcher.freshLookups[podUID])
+	}
+	if len(res.PendingByPod) != 1 {
+		t.Fatalf("pending entries = %#v, want one live allocation", res.PendingByPod)
+	}
+	if got := res.PendingCPUSetUnion(); !got.Equals(machine.NewCPUSet(0, 1)) {
+		t.Fatalf("pending CPU union = %s, want 0-1", got.String())
+	}
+}
+
+func TestPendingContainersResolveFreshScopeOncePerPodAndProtectUnion(t *testing.T) {
+	t.Parallel()
+
+	const podUID = "pending-container-union"
+	fetcher := &strictFreshPendingFetcher{
+		containerErr: metapod.ErrContainerNotFound,
+		pods: map[string]*v1.Pod{
+			podUID: {
+				ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+			},
+		},
+		podErrs:      map[string]error{},
+		freshLookups: map[string]int{},
+	}
+	p := &CPUSetTopologyPlugin{
+		cfg:    bulkheadConfigWithPrimary("kubepods"),
+		cgroup: &fakeCgroupClient{},
+	}
+	view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+			podUID: {
+				"main":    machine.NewCPUSet(0, 1),
+				"sidecar": machine.NewCPUSet(2, 3),
+			},
+		},
+	}}
+
+	res, err := p.buildExpectedCPUSetByRel(
+		context.Background(), pendingScopeTestContext(fetcher, view))
+	if err != nil {
+		t.Fatalf("buildExpectedCPUSetByRel() error = %v", err)
+	}
+	if fetcher.freshLookups[podUID] != 1 {
+		t.Fatalf("strict fresh lookups = %d, want one pod-level lookup", fetcher.freshLookups[podUID])
+	}
+	if len(res.PendingByPod) != 2 {
+		t.Fatalf("pending entries = %#v, want both containers", res.PendingByPod)
+	}
+	if got := res.PendingCPUSetUnion(); !got.Equals(machine.NewCPUSet(0, 1, 2, 3)) {
+		t.Fatalf("pending CPU union = %s, want 0-3", got.String())
 	}
 }
 
