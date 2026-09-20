@@ -1001,8 +1001,6 @@ type coordinatorRound struct {
 	deferredCleanupRels   map[string]struct{}
 	objective             ConvergenceObjective
 	admissionBudget       *AdmissionConvergenceBudget
-	frozenTrace           *CompiledPhaseTrace
-	executionTicket       *ExecutionReservationTicket
 	allowEmptyTarget      bool
 	protectedPending      machine.CPUSet
 	pendingRequiredByRel  map[string]machine.CPUSet
@@ -1049,7 +1047,6 @@ func (r *coordinatorRound) executeParentSafeAdmission(
 	if err != nil {
 		return outcome, err
 	}
-	r.frozenTrace = trace
 
 	maxRequiredWrites := 0
 	if r.admissionBudget != nil {
@@ -1059,7 +1056,6 @@ func (r *coordinatorRound) executeParentSafeAdmission(
 	if err != nil {
 		return outcome, err
 	}
-	r.executionTicket = ticket
 
 	finalize := func(
 		ctx context.Context,

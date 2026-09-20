@@ -74,29 +74,6 @@ func BenchmarkCompileFixedPointTrace(b *testing.B) {
 	})
 }
 
-func BenchmarkCompileValidatedFixedPointTrace(b *testing.B) {
-	runTraceBenchmarks(b, func(b *testing.B, fixture *traceBenchmarkFixture) {
-		var validated *validatedPhaseTrace
-		fixture.driver.resetCounts()
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			var err error
-			validated, err = fixture.round.compileValidatedFixedPointTrace(
-				context.Background(), fixture.base)
-			if err != nil {
-				b.Fatal(err)
-			}
-		}
-		b.StopTimer()
-		trace, err := validated.trace()
-		if err != nil {
-			b.Fatal(err)
-		}
-		b.ReportMetric(float64(validated.freezePasses), "freezes/op")
-		reportTraceMetrics(b, trace, fixture.driver, b.N)
-	})
-}
-
 func BenchmarkFreezePhaseTrace(b *testing.B) {
 	runTraceBenchmarks(b, func(b *testing.B, fixture *traceBenchmarkFixture) {
 		trace, err := fixture.compile()

@@ -17,7 +17,6 @@ limitations under the License.
 package topology
 
 import (
-	"context"
 	"fmt"
 	"sync"
 )
@@ -44,27 +43,6 @@ type ExecutionReservationTicket struct {
 	rollbackIOOperations         int
 	consumedRollbackIOOperations int
 	released                     bool
-}
-
-// ReservePhaseTrace validates and freezes the complete trace before taking any
-// BudgetTracker lock. Reservation therefore never compiles or validates a trace
-// while holding BudgetTracker.mu and never performs a live hierarchy write.
-func (b *BudgetTracker) ReservePhaseTrace(
-	trace *CompiledPhaseTrace,
-	maxRequiredWrites int,
-) (*ExecutionReservationTicket, error) {
-	if b == nil {
-		return nil, fmt.Errorf("phase trace reservation requires budget tracker")
-	}
-	if maxRequiredWrites < 0 {
-		return nil, fmt.Errorf("%w: maximum required writes must not be negative: %d",
-			ErrAdmissionReservationExceeded, maxRequiredWrites)
-	}
-	validated, err := freezeValidatedPhaseTrace(context.Background(), trace)
-	if err != nil {
-		return nil, err
-	}
-	return b.reserveValidatedPhaseTrace(validated, maxRequiredWrites)
 }
 
 // reserveValidatedPhaseTrace owns reservation for compiler-produced traces.

@@ -113,6 +113,8 @@ func TestParentSafeAdmissionCompilesReservesAndExecutesOneFrozenTrace(t *testing
 	fixture, base := newTask9ParentSafeFixture(t)
 	result := &ConvergenceResult{}
 	published := 0
+	expectedTrace, err := fixture.round.compileFixedPointTrace(context.Background(), base)
+	require.NoError(t, err)
 
 	outcome, err := fixture.round.executeParentSafeAdmission(
 		context.Background(), base, result,
@@ -128,32 +130,13 @@ func TestParentSafeAdmissionCompilesReservesAndExecutesOneFrozenTrace(t *testing
 	if err != nil {
 		t.Fatalf("executeParentSafeAdmission() error = %v", err)
 	}
-	if fixture.round.frozenTrace == nil || fixture.round.executionTicket == nil {
-		t.Fatal("ParentSafe admission did not retain its frozen trace and execution ticket")
-	}
-	if len(outcome.Journal) != len(flattenTraceOperations(fixture.round.frozenTrace)) {
+	if len(outcome.Journal) != len(flattenTraceOperations(expectedTrace)) {
 		t.Fatalf("executed journal = %d operations, want frozen trace length %d",
-			len(outcome.Journal), len(flattenTraceOperations(fixture.round.frozenTrace)))
+			len(outcome.Journal), len(flattenTraceOperations(expectedTrace)))
 	}
 	if published != 1 || (!result.ParentSafe && !result.Converged) || !result.FinalSnapshotCurrent {
 		t.Fatalf("published=%d result=%+v, want one successful frozen-trace publication", published, result)
 	}
-}
-
-func TestValidatedTraceCarrierIsFrozenOnceAcrossAdmissionStages(t *testing.T) {
-	fixture, base := newTask9ParentSafeFixture(t)
-	result := &ConvergenceResult{}
-
-	validated, err := fixture.round.compileValidatedFixedPointTrace(context.Background(), base)
-	require.NoError(t, err)
-	require.Equal(t, uint8(1), validated.freezePasses)
-
-	ticket, err := fixture.round.budget.reserveValidatedPhaseTrace(validated, 0)
-	require.NoError(t, err)
-	_, err = fixture.round.executeValidatedFrozenTrace(
-		context.Background(), validated, ticket, result)
-	require.NoError(t, err)
-	require.Equal(t, uint8(1), validated.freezePasses)
 }
 
 func TestAdmissionCompileFailurePerformsZeroPhysicalWrites(t *testing.T) {
@@ -244,9 +227,10 @@ func TestAdmissionPublishesOnlyAfterFreshFinalParentSafeProof(t *testing.T) {
 	fixture, base := newTask9ParentSafeFixture(t)
 	result := &ConvergenceResult{}
 	published := false
+	expectedTrace, err := fixture.round.compileFixedPointTrace(context.Background(), base)
+	require.NoError(t, err)
 	publish := func(snapshot *CompleteSnapshot) error {
-		if snapshot == nil || fixture.round.frozenTrace == nil ||
-			snapshot.ID != fixture.round.frozenTrace.FinalSnapshot.ID {
+		if snapshot == nil || snapshot.ID != expectedTrace.FinalSnapshot.ID {
 			return errors.New("publication did not receive the fresh final proof")
 		}
 		if result.FinalSnapshotCurrent || result.FinalSnapshot != nil ||
@@ -257,7 +241,7 @@ func TestAdmissionPublishesOnlyAfterFreshFinalParentSafeProof(t *testing.T) {
 		return nil
 	}
 
-	_, err := fixture.round.executeParentSafeAdmission(
+	_, err = fixture.round.executeParentSafeAdmission(
 		context.Background(), base, result, publish,
 		func(snapshot *CompleteSnapshot, _ map[string]struct{}) error {
 			return publish(snapshot)
@@ -345,7 +329,8 @@ func TestAdmissionFinalizeFailureRollsBackFrozenTrace(t *testing.T) {
 			require.Zero(t, result.Applied)
 			require.Equal(t, ConvergenceStateNonConverged, result.State)
 			require.Equal(t, RoundStatusBlocked, outcome.Status)
-			require.Positive(t, fixture.round.executionTicket.consumedRollback.Total())
+			require.Positive(t, fixture.driver.PhysicalWriteCount(),
+				"failed finalization must execute and roll back a physical write prefix")
 		})
 	}
 }
@@ -357,8 +342,10 @@ func TestDeferredCleanupRemainsOutsideParentSafeTrace(t *testing.T) {
 	base := fixture.snapshot()
 	fixture.round.admissionBudget = &AdmissionConvergenceBudget{MaxRequiredWrites: 100}
 	var publishedDeferred map[string]struct{}
+	expectedTrace, err := fixture.round.compileFixedPointTrace(context.Background(), base)
+	require.NoError(t, err)
 
-	_, err := fixture.round.executeParentSafeAdmission(
+	_, err = fixture.round.executeParentSafeAdmission(
 		context.Background(), base, &ConvergenceResult{}, nil,
 		func(_ *CompleteSnapshot, deferred map[string]struct{}) error {
 			publishedDeferred = cloneRelSet(deferred)
@@ -368,14 +355,14 @@ func TestDeferredCleanupRemainsOutsideParentSafeTrace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("executeParentSafeAdmission() error = %v", err)
 	}
-	for _, operation := range flattenTraceOperations(fixture.round.frozenTrace) {
-		if _, deferred := fixture.round.frozenTrace.EvaluationInput.DeferredCleanupRels[operation.Rel]; deferred {
+	for _, operation := range flattenTraceOperations(expectedTrace) {
+		if _, deferred := expectedTrace.EvaluationInput.DeferredCleanupRels[operation.Rel]; deferred {
 			t.Fatalf("deferred cleanup rel %q leaked into frozen ParentSafe trace", operation.Rel)
 		}
 	}
-	if !reflect.DeepEqual(publishedDeferred, fixture.round.frozenTrace.EvaluationInput.DeferredCleanupRels) {
+	if !reflect.DeepEqual(publishedDeferred, expectedTrace.EvaluationInput.DeferredCleanupRels) {
 		t.Fatalf("published deferred cleanup rels = %#v, want %#v",
-			publishedDeferred, fixture.round.frozenTrace.EvaluationInput.DeferredCleanupRels)
+			publishedDeferred, expectedTrace.EvaluationInput.DeferredCleanupRels)
 	}
 }
 

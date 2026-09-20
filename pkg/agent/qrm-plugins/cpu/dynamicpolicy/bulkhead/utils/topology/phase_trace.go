@@ -122,13 +122,12 @@ type CompiledPhaseTrace struct {
 // production admission chain. Its trace must never escape to mutable callers;
 // every internal consumer relies on the single successful freeze recorded here.
 type validatedPhaseTrace struct {
-	frozen       *CompiledPhaseTrace
-	freezePasses uint8
+	frozen *CompiledPhaseTrace
 }
 
 func (t *validatedPhaseTrace) trace() (*CompiledPhaseTrace, error) {
-	if t == nil || t.frozen == nil || t.freezePasses != 1 {
-		return nil, fmt.Errorf("validated phase trace requires exactly one freeze pass")
+	if t == nil || t.frozen == nil {
+		return nil, fmt.Errorf("validated phase trace is unavailable")
 	}
 	return t.frozen, nil
 }
@@ -968,20 +967,26 @@ func cloneRelConvergences(in []RelConvergence) []RelConvergence {
 // immutable copy to a deterministic content ID. This exported defensive
 // boundary always treats its input as mutable and performs a fresh validation.
 func FreezePhaseTrace(in *CompiledPhaseTrace) (*CompiledPhaseTrace, error) {
-	validated, err := freezeValidatedPhaseTrace(context.Background(), in)
-	if err != nil {
-		return nil, err
-	}
-	return validated.trace()
+	return freezePhaseTrace(context.Background(), in)
 }
 
-// freezeValidatedPhaseTrace is the sole constructor for validatedPhaseTrace.
-// It owns exactly one clone-and-validation pass and records that invariant in
-// the carrier consumed by the internal admission APIs.
 func freezeValidatedPhaseTrace(
 	ctx context.Context,
 	in *CompiledPhaseTrace,
 ) (*validatedPhaseTrace, error) {
+	frozen, err := freezePhaseTrace(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	return &validatedPhaseTrace{frozen: frozen}, nil
+}
+
+// freezePhaseTrace owns the defensive clone-and-validation pass shared by the
+// public raw-trace API and the compiler-owned validated carrier boundary.
+func freezePhaseTrace(
+	ctx context.Context,
+	in *CompiledPhaseTrace,
+) (*CompiledPhaseTrace, error) {
 	if in == nil {
 		return nil, fmt.Errorf("cannot freeze nil phase trace")
 	}
@@ -1034,7 +1039,7 @@ func freezeValidatedPhaseTrace(
 	if providedTraceID != "" && providedTraceID != out.TraceID {
 		return nil, fmt.Errorf("frozen phase trace identity does not match frozen inputs")
 	}
-	return &validatedPhaseTrace{frozen: &out, freezePasses: 1}, nil
+	return &out, nil
 }
 
 func validateFrozenPhaseTrace(trace *CompiledPhaseTrace) error {

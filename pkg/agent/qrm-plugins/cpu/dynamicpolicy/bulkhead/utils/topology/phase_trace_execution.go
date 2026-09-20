@@ -254,37 +254,6 @@ func (*frozenSnapshotDriftAfterVerifiedRollbackError) FrozenSnapshotDriftReplanS
 	return true
 }
 
-// preflightFrozenTrace proves that a frozen trace is executable from one fresh
-// complete snapshot. Every operation is validated and applied to an isolated
-// projected hierarchy in global trace order; no live hierarchy write occurs.
-func (w safeCPSetWriter) preflightFrozenTrace(
-	ctx context.Context,
-	trace *CompiledPhaseTrace,
-) error {
-	_, err := w.preflightFrozenTraceOperations(ctx, trace)
-	return err
-}
-
-func (w safeCPSetWriter) preflightFrozenTraceOperations(
-	ctx context.Context,
-	trace *CompiledPhaseTrace,
-) ([]frozenOperationPreflight, error) {
-	if w.driver == nil {
-		return nil, fmt.Errorf("frozen trace preflight requires hierarchy driver")
-	}
-	if w.budget == nil {
-		return nil, fmt.Errorf("frozen trace preflight requires convergence budget")
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	validated, err := freezeValidatedPhaseTrace(ctx, trace)
-	if err != nil {
-		return nil, fmt.Errorf("freeze phase trace before preflight: %w", err)
-	}
-	return w.preflightValidatedTraceOperations(ctx, validated)
-}
-
 // preflightValidatedTraceOperations owns the no-write projection check for the
 // production chain. Its carrier is already immutable and validated, so this
 // stage must not clone or replay trace validation.
@@ -761,40 +730,6 @@ func freezeOperationState(entry EntryState) frozenOperationState {
 		ConfiguredMems: entry.ConfiguredMems,
 		EffectiveMems:  entry.Mems,
 	}
-}
-
-// executeFrozenTrace applies exactly the globally ordered operations authorized
-// by ticket. It never replans. Any execution or final-proof failure rolls back
-// the complete physical-write prefix accumulated by this invocation.
-func (r *coordinatorRound) executeFrozenTrace(
-	ctx context.Context,
-	trace *CompiledPhaseTrace,
-	ticket *ExecutionReservationTicket,
-	res *ConvergenceResult,
-	finalizers ...frozenTraceFinalizer,
-) (RoundOutcome, error) {
-	outcome := RoundOutcome{Status: RoundStatusBlocked}
-	if r == nil || r.driver == nil {
-		return outcome, fmt.Errorf("frozen trace execution requires hierarchy driver")
-	}
-	if r.budget == nil {
-		return outcome, fmt.Errorf("frozen trace execution requires convergence budget")
-	}
-	if ticket == nil {
-		return outcome, fmt.Errorf("%w: frozen trace execution requires reservation ticket",
-			ErrAdmissionReservationExceeded)
-	}
-	if res == nil {
-		return outcome, fmt.Errorf("frozen trace execution requires convergence result")
-	}
-	if len(finalizers) > 1 {
-		return outcome, fmt.Errorf("frozen trace execution accepts at most one finalizer")
-	}
-	validated, err := freezeValidatedPhaseTrace(ctx, trace)
-	if err != nil {
-		return outcome, err
-	}
-	return r.executeValidatedFrozenTrace(ctx, validated, ticket, res, finalizers...)
 }
 
 // executeValidatedFrozenTrace owns live replay of compiler-produced admission
