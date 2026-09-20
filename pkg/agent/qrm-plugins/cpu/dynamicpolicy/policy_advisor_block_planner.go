@@ -414,6 +414,10 @@ func completePreferredCoreCPUCount(
 	return count
 }
 
+// planWholeCoreCapacityQuotas is the canonical owner of whole-core quota
+// apportionment across NUMA nodes. It preserves each NUMA minimum, rounds only
+// residual capacity to physical-core width, and deterministically balances
+// additional cores toward the preferred distribution.
 func planWholeCoreCapacityQuotas(
 	quantity, coreWidth int,
 	numaIDs []int,

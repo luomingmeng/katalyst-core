@@ -536,6 +536,10 @@ func (p *DynamicPolicy) dedicatedCoresWithoutNUMABindingAllocationHandler(_ cont
 	return nil, fmt.Errorf("not support dedicated_cores without NUMA binding")
 }
 
+// dedicatedCoresWithNUMABindingAllocationHandler plans the dedicated allocation
+// and reclaim-floor update as one revision-CAS transaction. If physical apply
+// fails after commit, rollback removes only this request's owned delta from the
+// latest state, preserving unrelated concurrent allocations.
 func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx context.Context,
 	req *pluginapi.ResourceRequest, persistCheckpoint bool,
 ) (*pluginapi.ResourceAllocationResponse, error) {
@@ -4077,6 +4081,10 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloorForMode(
 		p.currentAdvisorAttemptConfiguration())
 }
 
+// deriveRampUpReclaimFloorForModeWithDynamicConfig derives the reclaim floor
+// from the immutable configuration snapshot owned by the current advisor
+// attempt. Keeping both the scalar floor and dynamic NUMA policy in that
+// canonical snapshot prevents a single plan from mixing config generations.
 func (p *DynamicPolicy) deriveRampUpReclaimFloorForModeWithDynamicConfig(
 	machineState state.NUMANodeMap,
 	candidateEntries state.PodEntries,

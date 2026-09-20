@@ -370,6 +370,10 @@ func (p *DynamicPolicy) commitPendingCPUPartition(
 	return p.commitPendingCPUPartitionForAdvisorTarget(pending, nil)
 }
 
+// commitPendingCPUPartitionForAdvisorTarget is the canonical mutation boundary
+// for a planned CPU partition. It validates writer ownership, prepares the
+// complete candidate, and publishes it only through the pending revision CAS;
+// an advisor target supplies the narrow fence permit for that exact commit.
 func (p *DynamicPolicy) commitPendingCPUPartitionForAdvisorTarget(
 	pending pendingCPUPartition,
 	reconcileTarget *advisorPostCommitTarget,

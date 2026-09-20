@@ -269,6 +269,10 @@ func (p *DynamicPolicy) projectSteadyFakeNUMAStageWithCheckpoint(
 	return assignments, nil
 }
 
+// planSteadyFakeNUMAStageWithCheckpoint computes one bounded migration stage
+// and the checkpoint transition that describes its durable intent. Planning is
+// side-effect free: the caller remains the canonical owner of applying the
+// returned transition only after the surrounding state transaction is ready.
 func (p *DynamicPolicy) planSteadyFakeNUMAStageWithCheckpoint(
 	demands []partitionDemand,
 	fakeKeys []string,

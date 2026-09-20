@@ -581,6 +581,10 @@ func (p *DynamicPolicy) allocateByCPUAdvisorAtRevision(
 	return p.allocateByCPUAdvisorWithRevision(req, resp, featureGates, &requestRevision)
 }
 
+// allocateByCPUAdvisorWithRevision owns one advisor response transaction from
+// request-generation validation through canonical state commit and post-commit
+// apply. The request revision rejects stale RPC responses, while the later
+// precommit revision CAS closes races introduced during local planning.
 func (p *DynamicPolicy) allocateByCPUAdvisorWithRevision(
 	req *advisorapi.GetAdviceRequest,
 	resp *advisorapi.ListAndWatchResponse,

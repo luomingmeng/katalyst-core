@@ -402,6 +402,10 @@ func advisorPostCommitCleanupWait(conf *coreconfig.Configuration) time.Duration 
 	return wait
 }
 
+// clearResidualStateAfterPodList performs at most two cleanup observations
+// around an in-flight advisor target. It defers residual mutation while the
+// post-commit fence can still advance, then retries against the latest
+// canonical revision so cleanup cannot overwrite a committed advisor delta.
 func (p *DynamicPolicy) clearResidualStateAfterPodList(
 	ctx context.Context,
 	podList []*v1.Pod,

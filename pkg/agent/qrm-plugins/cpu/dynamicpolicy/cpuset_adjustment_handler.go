@@ -646,6 +646,10 @@ func (p *DynamicPolicy) commitAdvisorResponseWithWriteAhead(
 	)
 }
 
+// commitAdvisorResponseWithWriteAheadTransition installs the writer fence and
+// durably stages the post-commit target before advancing canonical state. The
+// revision-CAS commit is therefore recoverable from the WAL; the fence remains
+// until publication, physical apply, and durable cleanup have completed.
 func (p *DynamicPolicy) commitAdvisorResponseWithWriteAheadTransition(
 	resp *advisorapi.ListAndWatchResponse,
 	transition steadyFakeNUMAMigrationCheckpointTransition,
@@ -1313,6 +1317,10 @@ func (p *DynamicPolicy) completeAdvisorPostCommitCleanup(target *advisorPostComm
 	return nil
 }
 
+// reconcileAdvisorPostCommitTarget is the sole owner of advancing a committed
+// WAL target through publication, physical apply, applied-marker persistence,
+// and cleanup. It defers checkpoint removal and writer-fence release until the
+// exact target revision is durably marked applied.
 func (p *DynamicPolicy) reconcileAdvisorPostCommitTarget(
 	ctx context.Context,
 	target *advisorPostCommitTarget,
