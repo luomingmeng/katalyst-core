@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -30,6 +31,102 @@ import (
 
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
+
+func TestProjectedPhaseSessionSnapshotHonorsCanceledContext(t *testing.T) {
+	_, base := newTask9ParentSafeFixture(t)
+	session, err := newProjectedPhaseSession(base, base.Capabilities)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = session.Snapshot(ctx)
+
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestFrozenTraceValidationHonorsCancellationDuringOperationReplay(t *testing.T) {
+	trace, _ := compiledTraceWithCPUAndMemoryWrites(t)
+	require.Greater(t, trace.OperationCount(), 1)
+	ctx := &traceValidationCancellationContext{
+		Context:  context.Background(),
+		cancelOn: 4,
+	}
+
+	err := validateTraceOperations(ctx, trace)
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.GreaterOrEqual(t, ctx.checks, ctx.cancelOn)
+}
+
+func TestFrozenGrowReleaseGuardCompilationHonorsCancellation(t *testing.T) {
+	trace, _ := compiledTraceWithCPUAndMemoryWrites(t)
+	require.Greater(t, trace.OperationCount(), 1)
+	ctx := &traceValidationCancellationContext{
+		Context:  context.Background(),
+		cancelOn: 4,
+	}
+
+	_, err := compileFrozenGrowReleaseGuards(ctx, trace)
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.GreaterOrEqual(t, ctx.checks, ctx.cancelOn)
+}
+
+func TestCompileValidatedFixedPointTracePropagatesContextThroughValidation(t *testing.T) {
+	for _, target := range []string{
+		"validateFrozenPhaseTrace",
+		"compileFrozenGrowReleaseGuards",
+	} {
+		t.Run(target, func(t *testing.T) {
+			fixture := newAdmissionTraceFixture(t)
+			fixture.configureStagedSMTTransferWithDynamicDescendant()
+			ctx := &cancelInFunctionContext{
+				Context: context.Background(),
+				target:  target,
+			}
+
+			trace, err := fixture.round.compileValidatedFixedPointTrace(
+				ctx, fixture.snapshot())
+
+			require.Nil(t, trace)
+			require.ErrorIs(t, err, context.Canceled)
+			require.True(t, ctx.seen, "caller context must reach %s", target)
+		})
+	}
+}
+
+type traceValidationCancellationContext struct {
+	context.Context
+	checks   int
+	cancelOn int
+}
+
+func (c *traceValidationCancellationContext) Err() error {
+	c.checks++
+	if c.checks >= c.cancelOn {
+		return context.Canceled
+	}
+	return c.Context.Err()
+}
+
+type cancelInFunctionContext struct {
+	context.Context
+	target string
+	seen   bool
+}
+
+func (c *cancelInFunctionContext) Err() error {
+	callers := make([]uintptr, 16)
+	count := runtime.Callers(2, callers)
+	for _, caller := range callers[:count] {
+		function := runtime.FuncForPC(caller)
+		if function != nil && strings.HasSuffix(function.Name(), "."+c.target) {
+			c.seen = true
+			return context.Canceled
+		}
+	}
+	return c.Context.Err()
+}
 
 const topologyScaleTestEnv = "KATALYST_TOPOLOGY_SCALE_TEST"
 

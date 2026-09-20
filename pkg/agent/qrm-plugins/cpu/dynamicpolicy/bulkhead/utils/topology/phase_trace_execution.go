@@ -254,20 +254,12 @@ func (*frozenSnapshotDriftAfterVerifiedRollbackError) FrozenSnapshotDriftReplanS
 	return true
 }
 
-// preflightFrozenTrace proves that a frozen trace is executable from one fresh
-// complete snapshot. Every operation is validated and applied to an isolated
-// projected hierarchy in global trace order; no live hierarchy write occurs.
-func (w safeCPSetWriter) preflightFrozenTrace(
+// preflightValidatedTraceOperations owns the no-write projection check for the
+// production chain. Its carrier is already immutable and validated, so this
+// stage must not clone or replay trace validation.
+func (w safeCPSetWriter) preflightValidatedTraceOperations(
 	ctx context.Context,
-	trace *CompiledPhaseTrace,
-) error {
-	_, err := w.preflightFrozenTraceOperations(ctx, trace)
-	return err
-}
-
-func (w safeCPSetWriter) preflightFrozenTraceOperations(
-	ctx context.Context,
-	trace *CompiledPhaseTrace,
+	validated *validatedPhaseTrace,
 ) ([]frozenOperationPreflight, error) {
 	if w.driver == nil {
 		return nil, fmt.Errorf("frozen trace preflight requires hierarchy driver")
@@ -279,9 +271,9 @@ func (w safeCPSetWriter) preflightFrozenTraceOperations(
 		return nil, err
 	}
 
-	frozen, err := FreezePhaseTrace(trace)
+	frozen, err := validated.trace()
 	if err != nil {
-		return nil, fmt.Errorf("freeze phase trace before preflight: %w", err)
+		return nil, err
 	}
 	if frozen.InitialSnapshot.ScanBoundary.Purpose != ScanForPlan {
 		return nil, fmt.Errorf(
@@ -323,7 +315,7 @@ func (w safeCPSetWriter) preflightFrozenTraceOperations(
 	for _, phase := range frozen.Phases {
 		operationCount = saturatingAdd(operationCount, len(phase.Operations))
 	}
-	evidence, err := projectFrozenTraceOperations(frozen, projection)
+	evidence, err := projectFrozenTraceOperations(ctx, frozen, projection)
 	if err != nil {
 		return nil, err
 	}
@@ -344,9 +336,13 @@ func (w safeCPSetWriter) preflightFrozenTraceOperations(
 }
 
 func projectFrozenTraceOperations(
+	ctx context.Context,
 	frozen *CompiledPhaseTrace,
 	projection *projectedHierarchy,
 ) ([]frozenOperationPreflight, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if frozen == nil {
 		return nil, fmt.Errorf("project frozen trace operations requires a trace")
 	}
@@ -357,17 +353,30 @@ func projectFrozenTraceOperations(
 	for _, phase := range frozen.Phases {
 		operationCount = saturatingAdd(operationCount, len(phase.Operations))
 	}
-	releaseGuards, err := compileFrozenGrowReleaseGuards(frozen)
+	releaseGuards, err := compileFrozenGrowReleaseGuards(ctx, frozen)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	if err != nil {
 		return nil, err
 	}
 	evidence := make([]frozenOperationPreflight, 0, operationCount)
 	globalOperationIndex := 0
 	for phaseIndex, phase := range frozen.Phases {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if len(phase.Operations) == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			continue
 		}
-		if err := validateProjectedFrontierIndependence(projection, phase.Operations); err != nil {
+		err := validateProjectedFrontierIndependence(projection, phase.Operations)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if err != nil {
 			return nil, fmt.Errorf(
 				"preflight frozen phase trace frontier %d: %w",
 				phaseIndex, err,
@@ -375,6 +384,9 @@ func projectFrozenTraceOperations(
 		}
 		frontierStart := len(evidence)
 		for operationIndex, operation := range phase.Operations {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			before, ok := projection.snapshot.Entries[operation.Rel]
 			if !ok {
 				return nil, fmt.Errorf(
@@ -389,6 +401,9 @@ func projectFrozenTraceOperations(
 			}
 			if operation.Direction == WriteShrink {
 				projectedChildren, err := frozenChildrenFromSnapshot(projection.snapshot, operation.Rel)
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, ctxErr
+				}
 				if err != nil {
 					return nil, fmt.Errorf(
 						"preflight frozen phase trace operation %d/%d shrink children: %w",
@@ -416,32 +431,65 @@ func projectFrozenTraceOperations(
 				domain:         frozen.InitialSnapshot.DomainByRel[operation.Rel],
 			})
 			globalOperationIndex++
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 		}
 		for operationIndex, operation := range phase.Operations {
-			if err := projection.applyConfiguredOperation(operation); err != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			err := projection.applyConfiguredOperation(operation)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			if err != nil {
 				return nil, fmt.Errorf(
 					"preflight frozen phase trace operation %d/%d: %w",
 					phaseIndex, operationIndex, err,
 				)
 			}
 		}
-		if err := projection.settleEvidence(); err != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		err = projection.settleEvidence()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if err != nil {
 			return nil, fmt.Errorf(
 				"preflight frozen phase trace frontier %d settlement: %w",
 				phaseIndex, err,
 			)
 		}
 		for operationIndex, operation := range phase.Operations {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			after := projection.snapshot.Entries[operation.Rel]
 			evidence[frontierStart+operationIndex].after = freezeOperationState(after)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return evidence, nil
 }
 
 func compileFrozenGrowReleaseGuards(
+	ctx context.Context,
 	trace *CompiledPhaseTrace,
 ) (map[int][]frozenSourceReleaseGuard, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if trace == nil || trace.InitialSnapshot == nil {
 		return nil, fmt.Errorf("compile frozen grow release guards requires initial snapshot")
 	}
@@ -449,13 +497,25 @@ func compileFrozenGrowReleaseGuards(
 	if err != nil {
 		return nil, fmt.Errorf("compile frozen grow release guards projection: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	initialDomainsByCPU := make(map[int][]DomainID)
 	for domain, cpus := range trace.InitialSnapshot.DomainUnion {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		for _, cpu := range cpus.ToSliceInt() {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			initialDomainsByCPU[cpu] = append(initialDomainsByCPU[cpu], domain)
 		}
 	}
-	sourceRootsByDomain, err := frozenControlledDomainRoots(trace)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	sourceRootsByDomain, err := frozenControlledDomainRoots(ctx, trace)
 	if err != nil {
 		return nil, err
 	}
@@ -463,7 +523,13 @@ func compileFrozenGrowReleaseGuards(
 	releasedByDomain := make(map[DomainID]map[int]struct{})
 	operationIndex := 0
 	for phaseIndex, phase := range trace.Phases {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		for _, operation := range phase.Operations {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			domain, ok := trace.InitialSnapshot.DomainByRel[operation.Rel]
 			if !ok || domain == "" {
 				return nil, fmt.Errorf(
@@ -475,10 +541,16 @@ func compileFrozenGrowReleaseGuards(
 				added := operation.Target.CPUs.Difference(operation.ExpectedCurrent.CPUs)
 				requiredBySource := make(map[DomainID]map[int]struct{})
 				for _, cpu := range added.ToSliceInt() {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
 					if projection.snapshot.DomainUnion[domain].Contains(cpu) {
 						continue
 					}
 					for sourceDomain, owned := range projection.snapshot.DomainUnion {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
 						if sourceDomain != domain && owned.Contains(cpu) {
 							return nil, fmt.Errorf(
 								"frozen grow operation %d rel %q lacks source shrink coverage: source domain release incomplete; source=%q still owns CPU %d",
@@ -488,6 +560,9 @@ func compileFrozenGrowReleaseGuards(
 					}
 					hasRelease := false
 					for sourceDomain, released := range releasedByDomain {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
 						if sourceDomain == domain {
 							continue
 						}
@@ -498,6 +573,9 @@ func compileFrozenGrowReleaseGuards(
 					}
 					initiallyOwnedElsewhere := false
 					for _, initialDomain := range initialDomainsByCPU[cpu] {
+						if err := ctx.Err(); err != nil {
+							return nil, err
+						}
 						if initialDomain != domain {
 							initiallyOwnedElsewhere = true
 							break
@@ -511,6 +589,9 @@ func compileFrozenGrowReleaseGuards(
 					}
 				}
 				for _, sourceDomain := range sortedAccumulatedDomains(requiredBySource) {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
 					required := cpuSetFromAccumulator(requiredBySource[sourceDomain])
 					if !accumulatorContainsCPUSet(releasedByDomain[sourceDomain], required) {
 						return nil, fmt.Errorf(
@@ -530,51 +611,91 @@ func compileFrozenGrowReleaseGuards(
 				}
 			}
 			operationIndex++
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 		}
 		beforeUnion := cloneDomainUnion(projection.snapshot.DomainUnion)
-		if err := validateProjectedFrontierIndependence(projection, phase.Operations); err != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		frontierErr := validateProjectedFrontierIndependence(projection, phase.Operations)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if frontierErr != nil {
 			return nil, fmt.Errorf(
-				"compile frozen grow release guards frontier %d: %w", phaseIndex, err)
+				"compile frozen grow release guards frontier %d: %w", phaseIndex, frontierErr)
 		}
 		for operationIndex, operation := range phase.Operations {
-			if err := projection.applyConfiguredOperation(operation); err != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			applyErr := projection.applyConfiguredOperation(operation)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			if applyErr != nil {
 				return nil, fmt.Errorf(
 					"compile frozen grow release guards operation %d/%d: %w",
-					phaseIndex, operationIndex, err,
+					phaseIndex, operationIndex, applyErr,
 				)
 			}
 		}
 		if len(phase.Operations) > 0 {
-			if err := projection.settleEvidence(); err != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			settleErr := projection.settleEvidence()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			if settleErr != nil {
 				return nil, fmt.Errorf(
 					"compile frozen grow release guards frontier %d settlement: %w",
-					phaseIndex, err,
+					phaseIndex, settleErr,
 				)
 			}
 		}
 		for domain, before := range beforeUnion {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			released := before.Difference(projection.snapshot.DomainUnion[domain])
 			if !released.IsEmpty() {
 				addCPUSetToAccumulator(releasedByDomain, domain, released)
 			}
 		}
 		for domain, after := range projection.snapshot.DomainUnion {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			gained := after.Difference(beforeUnion[domain])
 			removeCPUSetFromAllAccumulators(releasedByDomain, gained)
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return guards, nil
 }
 
 func frozenControlledDomainRoots(
+	ctx context.Context,
 	trace *CompiledPhaseTrace,
 ) (map[DomainID][]FrozenRelIdentity, error) {
 	specByRel := make(map[string]NodeSpec, len(trace.EvaluationInput.DAGSpecs))
 	for _, spec := range trace.EvaluationInput.DAGSpecs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		specByRel[spec.Rel] = spec
 	}
 	roots := make(map[DomainID][]FrozenRelIdentity)
 	for _, spec := range trace.EvaluationInput.DAGSpecs {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		parent, hasParent := specByRel[spec.ParentRel]
 		if hasParent && parent.Domain == spec.Domain {
 			continue
@@ -591,9 +712,15 @@ func frozenControlledDomainRoots(
 		})
 	}
 	for domain := range roots {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		sort.Slice(roots[domain], func(i, j int) bool {
 			return roots[domain][i].Rel < roots[domain][j].Rel
 		})
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return roots, nil
 }
@@ -740,12 +867,12 @@ func freezeOperationState(entry EntryState) frozenOperationState {
 	}
 }
 
-// executeFrozenTrace applies exactly the globally ordered operations authorized
-// by ticket. It never replans. Any execution or final-proof failure rolls back
-// the complete physical-write prefix accumulated by this invocation.
-func (r *coordinatorRound) executeFrozenTrace(
+// executeValidatedFrozenTrace owns live replay of compiler-produced admission
+// traces. It consumes the validated carrier without cloning; ticket order and
+// preflight evidence protect the immutable operation sequence during execution.
+func (r *coordinatorRound) executeValidatedFrozenTrace(
 	ctx context.Context,
-	trace *CompiledPhaseTrace,
+	validated *validatedPhaseTrace,
 	ticket *ExecutionReservationTicket,
 	res *ConvergenceResult,
 	finalizers ...frozenTraceFinalizer,
@@ -767,14 +894,14 @@ func (r *coordinatorRound) executeFrozenTrace(
 	if len(finalizers) > 1 {
 		return outcome, fmt.Errorf("frozen trace execution accepts at most one finalizer")
 	}
-	frozen, err := FreezePhaseTrace(trace)
+	frozen, err := validated.trace()
 	if err != nil {
 		return outcome, err
 	}
 	defer ticket.ReleaseUnused()
 
 	writer := newSafeCPUSetWriter(r.driver, r.budget, res)
-	preflight, err := writer.preflightFrozenTraceOperations(ctx, frozen)
+	preflight, err := writer.preflightValidatedTraceOperations(ctx, validated)
 	if err != nil {
 		return outcome, err
 	}

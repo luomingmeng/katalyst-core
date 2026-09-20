@@ -17,6 +17,7 @@ limitations under the License.
 package topology
 
 import (
+	"context"
 	"fmt"
 	"sync"
 )
@@ -45,26 +46,30 @@ type ExecutionReservationTicket struct {
 	released                     bool
 }
 
-// ReservePhaseTrace validates and freezes the complete trace before taking any
-// BudgetTracker lock. Reservation therefore never compiles or validates a trace
-// while holding BudgetTracker.mu and never performs a live hierarchy write.
-func (b *BudgetTracker) ReservePhaseTrace(
-	trace *CompiledPhaseTrace,
+// reserveValidatedPhaseTrace owns reservation for compiler-produced traces.
+// Its invariant is that the carrier has already been cloned and validated once,
+// so reservation derives authorization only from that immutable evidence.
+func (b *BudgetTracker) reserveValidatedPhaseTrace(
+	ctx context.Context,
+	validated *validatedPhaseTrace,
 	maxRequiredWrites int,
 ) (*ExecutionReservationTicket, error) {
 	if b == nil {
 		return nil, fmt.Errorf("phase trace reservation requires budget tracker")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if maxRequiredWrites < 0 {
 		return nil, fmt.Errorf("%w: maximum required writes must not be negative: %d",
 			ErrAdmissionReservationExceeded, maxRequiredWrites)
 	}
 
-	frozen, err := FreezePhaseTrace(trace)
+	frozen, err := validated.trace()
 	if err != nil {
 		return nil, err
 	}
-	reserved := phaseTracePhysicalWriteCost(frozen)
+	reserved := frozen.Cost
 	required := reserved.Total()
 	if maxRequiredWrites > 0 && required > maxRequiredWrites {
 		return nil, fmt.Errorf("%w before frozen trace execution: limit=%d required=%d",
@@ -73,13 +78,25 @@ func (b *BudgetTracker) ReservePhaseTrace(
 
 	operations := make([]frozenOperationAuthorization, 0)
 	for phaseIndex, phase := range frozen.Phases {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		for phaseOperationIndex, operation := range phase.Operations {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			operations = append(operations, frozenOperationAuthorization{
 				phaseIndex:          phaseIndex,
 				phaseOperationIndex: phaseOperationIndex,
 				operation:           clonePlanOperation(operation),
 			})
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return &ExecutionReservationTicket{
 		traceID:              frozen.TraceID,
@@ -203,13 +220,6 @@ func (t *ExecutionReservationTicket) ReleaseUnused() {
 
 func validPhysicalWriteCost(cost PhysicalWriteCost) bool {
 	return cost.CPUSetWrites >= 0 && cost.MemsWrites >= 0
-}
-
-func phaseTracePhysicalWriteCost(trace *CompiledPhaseTrace) ExecutionReservationCost {
-	if trace == nil {
-		return ExecutionReservationCost{}
-	}
-	return executionReservationCost(trace.Phases)
 }
 
 func clonePlanOperation(operation PlanOperation) PlanOperation {

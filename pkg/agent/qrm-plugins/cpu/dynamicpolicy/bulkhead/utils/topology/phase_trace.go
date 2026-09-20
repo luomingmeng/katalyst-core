@@ -118,6 +118,20 @@ type CompiledPhaseTrace struct {
 	Cost                 ExecutionReservationCost
 }
 
+// validatedPhaseTrace is the compiler-owned immutable carrier used by the
+// production admission chain. Its trace must never escape to mutable callers;
+// every internal consumer relies on the single successful freeze recorded here.
+type validatedPhaseTrace struct {
+	frozen *CompiledPhaseTrace
+}
+
+func (t *validatedPhaseTrace) trace() (*CompiledPhaseTrace, error) {
+	if t == nil || t.frozen == nil {
+		return nil, fmt.Errorf("validated phase trace is unavailable")
+	}
+	return t.frozen, nil
+}
+
 func (t *CompiledPhaseTrace) OperationCount() int {
 	if t == nil {
 		return 0
@@ -255,8 +269,15 @@ func newProjectedPhaseSession(
 	}, nil
 }
 
-func (s *projectedPhaseSession) Snapshot(_ context.Context) (*CompleteSnapshot, error) {
-	return CloneCompleteSnapshot(s.hierarchy.snapshot), nil
+func (s *projectedPhaseSession) Snapshot(ctx context.Context) (*CompleteSnapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	snapshot := CloneCompleteSnapshot(s.hierarchy.snapshot)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return snapshot, nil
 }
 
 func (s *projectedPhaseSession) Apply(ctx context.Context, plan PhasePlan) (phaseSessionApplyResult, error) {
@@ -278,12 +299,18 @@ func (s *projectedPhaseSession) Apply(ctx context.Context, plan PhasePlan) (phas
 	if err != nil {
 		return phaseSessionApplyResult{}, err
 	}
+	if err := ctx.Err(); err != nil {
+		return phaseSessionApplyResult{}, err
+	}
 	candidate.evidenceRebuilds = s.hierarchy.evidenceRebuilds
 	if err := validateProjectedFrontierIndependence(candidate, plan.Operations); err != nil {
 		return phaseSessionApplyResult{}, err
 	}
 	result := phaseSessionApplyResult{}
 	for _, operation := range plan.Operations {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
 		if err := candidate.applyConfiguredOperation(operation); err != nil {
 			return result, err
 		}
@@ -297,7 +324,13 @@ func (s *projectedPhaseSession) Apply(ctx context.Context, plan PhasePlan) (phas
 		return result, fmt.Errorf("projected frontier applied=%d operations=%d",
 			result.Applied, len(plan.Operations))
 	}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	if err := candidate.settleEvidence(); err != nil {
+		return result, err
+	}
+	if err := ctx.Err(); err != nil {
 		return result, err
 	}
 	if candidate.snapshot.ID == key.SnapshotID {
@@ -322,6 +355,21 @@ func (r *coordinatorRound) compileFixedPointTrace(
 	ctx context.Context,
 	base *CompleteSnapshot,
 ) (*CompiledPhaseTrace, error) {
+	validated, err := r.compileValidatedFixedPointTrace(ctx, base)
+	if err != nil {
+		return nil, err
+	}
+	return validated.trace()
+}
+
+// compileValidatedFixedPointTrace owns compilation and the sole validation
+// freeze for the production ParentSafe chain. The returned carrier is immutable
+// by ownership: reservation, preflight, and execution may read but never expose
+// or mutate its trace.
+func (r *coordinatorRound) compileValidatedFixedPointTrace(
+	ctx context.Context,
+	base *CompleteSnapshot,
+) (*validatedPhaseTrace, error) {
 	if r == nil {
 		return nil, fmt.Errorf("compile fixed-point trace requires a coordinator round")
 	}
@@ -332,8 +380,14 @@ func (r *coordinatorRound) compileFixedPointTrace(
 		return nil, fmt.Errorf("compile fixed-point trace requires a convergence budget")
 	}
 	capabilities := base.Capabilities
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	session, err := newProjectedPhaseSession(base, capabilities)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	projectedRound := r.cloneForProjection()
@@ -341,10 +395,16 @@ func (r *coordinatorRound) compileFixedPointTrace(
 	if err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	evaluationInput := freezeCoordinatorEvaluationInput(projectedRound, capabilities)
 	frozenBoundary, err := compileFrozenBoundaryV1(base, evaluationInput, result.Phases)
 	if err != nil {
 		return nil, fmt.Errorf("compile frozen boundary: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	trace := &CompiledPhaseTrace{
 		ConvergenceID:        result.ConvergenceID,
@@ -360,7 +420,7 @@ func (r *coordinatorRound) compileFixedPointTrace(
 		FinalEvaluation:      cloneCoordinatorSnapshotEvaluation(result.FinalEvaluation),
 		Cost:                 executionReservationCost(result.Phases),
 	}
-	return FreezePhaseTrace(trace)
+	return freezeValidatedPhaseTrace(ctx, trace)
 }
 
 // checkEngineDeadline fails fast at the top of every fixed-point round.
@@ -907,10 +967,34 @@ func cloneRelConvergences(in []RelConvergence) []RelConvergence {
 }
 
 // FreezePhaseTrace validates and deep-copies a compiled trace, then binds the
-// immutable copy to a deterministic content ID.
+// immutable copy to a deterministic content ID. This exported defensive
+// boundary always treats its input as mutable and performs a fresh validation.
 func FreezePhaseTrace(in *CompiledPhaseTrace) (*CompiledPhaseTrace, error) {
+	return freezePhaseTrace(context.Background(), in)
+}
+
+func freezeValidatedPhaseTrace(
+	ctx context.Context,
+	in *CompiledPhaseTrace,
+) (*validatedPhaseTrace, error) {
+	frozen, err := freezePhaseTrace(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	return &validatedPhaseTrace{frozen: frozen}, nil
+}
+
+// freezePhaseTrace owns the defensive clone-and-validation pass shared by the
+// public raw-trace API and the compiler-owned validated carrier boundary.
+func freezePhaseTrace(
+	ctx context.Context,
+	in *CompiledPhaseTrace,
+) (*CompiledPhaseTrace, error) {
 	if in == nil {
 		return nil, fmt.Errorf("cannot freeze nil phase trace")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	providedTraceID := in.TraceID
 	out := *in
@@ -923,11 +1007,20 @@ func FreezePhaseTrace(in *CompiledPhaseTrace) (*CompiledPhaseTrace, error) {
 	out.Phases = cloneCompiledPhases(in.Phases)
 	out.FinalSnapshot = CloneCompleteSnapshot(in.FinalSnapshot)
 	out.FinalEvaluation = cloneCoordinatorSnapshotEvaluation(in.FinalEvaluation)
-	if err := validateFrozenPhaseTrace(&out); err != nil {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := validateFrozenPhaseTrace(ctx, &out); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	evaluation, err := out.EvaluationInput.evaluate(out.FinalSnapshot)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	actualEvaluation := normalizeCoordinatorSnapshotEvaluation(out.FinalEvaluation)
@@ -952,7 +1045,10 @@ func FreezePhaseTrace(in *CompiledPhaseTrace) (*CompiledPhaseTrace, error) {
 	return &out, nil
 }
 
-func validateFrozenPhaseTrace(trace *CompiledPhaseTrace) error {
+func validateFrozenPhaseTrace(ctx context.Context, trace *CompiledPhaseTrace) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if trace == nil || trace.InitialSnapshot == nil || trace.FinalSnapshot == nil {
 		return fmt.Errorf("frozen phase trace requires initial and final snapshots")
 	}
@@ -975,50 +1071,86 @@ func validateFrozenPhaseTrace(trace *CompiledPhaseTrace) error {
 	if err := validateFrozenBoundary(trace.FrozenBoundary, trace.InitialSnapshot); err != nil {
 		return fmt.Errorf("frozen phase trace has invalid frozen boundary: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !reflect.DeepEqual(trace.RequiredCPUSetByRel, trace.EvaluationInput.RequiredByRel) {
 		return fmt.Errorf("frozen phase trace required CPUs inputs disagree")
 	}
 	controlledRels := make(map[string]struct{}, len(trace.EvaluationInput.DAGSpecs))
 	for _, spec := range trace.EvaluationInput.DAGSpecs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		controlledRels[spec.Rel] = struct{}{}
 	}
 	for rel := range trace.InitialSnapshot.UnavailableChildren {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if _, controlled := controlledRels[rel]; controlled {
 			return fmt.Errorf("frozen phase trace initial snapshot marks controlled rel %q unavailable", rel)
 		}
 	}
 	for rel := range trace.FinalSnapshot.UnavailableChildren {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if _, controlled := controlledRels[rel]; controlled {
 			return fmt.Errorf("frozen phase trace final snapshot marks controlled rel %q unavailable", rel)
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := validateCompleteSnapshotEvidence(trace.InitialSnapshot); err != nil {
 		return fmt.Errorf("frozen phase trace initial snapshot evidence is inconsistent: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if err := validateCompleteSnapshotEvidence(trace.FinalSnapshot); err != nil {
 		return fmt.Errorf("frozen phase trace final snapshot evidence is inconsistent: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if fingerprintSnapshot(trace.InitialSnapshot) != trace.InitialSnapshot.ID {
 		return fmt.Errorf("frozen phase trace initial snapshot evidence is invalid")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if fingerprintSnapshot(trace.FinalSnapshot) != trace.FinalSnapshot.ID {
 		return fmt.Errorf("frozen phase trace final snapshot evidence is invalid")
 	}
 	for rel, entry := range trace.InitialSnapshot.Entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if entry.Identity == (CgroupIdentity{}) {
 			return fmt.Errorf("frozen phase trace initial snapshot rel %q is missing identity", rel)
 		}
 		for _, child := range trace.InitialSnapshot.Children[rel] {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if child.Identity == (CgroupIdentity{}) {
 				return fmt.Errorf("frozen phase trace initial snapshot child %q/%q is missing identity", rel, child.Name)
 			}
 		}
 	}
 	for rel, entry := range trace.FinalSnapshot.Entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if entry.Identity == (CgroupIdentity{}) {
 			return fmt.Errorf("frozen phase trace final snapshot rel %q is missing identity", rel)
 		}
 		for _, child := range trace.FinalSnapshot.Children[rel] {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if child.Identity == (CgroupIdentity{}) {
 				return fmt.Errorf("frozen phase trace final snapshot child %q/%q is missing identity", rel, child.Name)
 			}
@@ -1030,13 +1162,25 @@ func validateFrozenPhaseTrace(trace *CompiledPhaseTrace) error {
 	if !traceObjectiveSatisfied(trace) {
 		return fmt.Errorf("frozen phase trace final evaluation does not satisfy objective %q", trace.Objective)
 	}
-	if err := validateTraceOperations(trace); err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if _, err := compileFrozenGrowReleaseGuards(trace); err != nil {
+	if err := validateTraceOperations(ctx, trace); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, err := compileFrozenGrowReleaseGuards(ctx, trace); err != nil {
 		return fmt.Errorf("frozen phase trace grow release contract is invalid: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	for rel, required := range trace.RequiredCPUSetByRel {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		entry, ok := trace.FinalSnapshot.Entries[rel]
 		if !ok || !required.IsSubsetOf(entry.CPUs) {
 			return fmt.Errorf("frozen phase trace required CPUs for rel %q are absent from final physical proof", rel)
@@ -1045,6 +1189,9 @@ func validateFrozenPhaseTrace(trace *CompiledPhaseTrace) error {
 	expectedCost := executionReservationCost(trace.Phases)
 	if trace.Cost != expectedCost {
 		return fmt.Errorf("frozen phase trace cost mismatch: got=%+v want=%+v", trace.Cost, expectedCost)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1206,9 +1353,15 @@ func sortRelConvergences(values []RelConvergence) {
 	})
 }
 
-func validateTraceOperations(trace *CompiledPhaseTrace) error {
+func validateTraceOperations(ctx context.Context, trace *CompiledPhaseTrace) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	projection, err := newProjectedHierarchy(trace.InitialSnapshot, trace.Capabilities)
 	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	session := &projectedPhaseSession{
@@ -1216,10 +1369,16 @@ func validateTraceOperations(trace *CompiledPhaseTrace) error {
 		progress:  make(map[phaseProgressKey]struct{}),
 	}
 	for phaseIndex, phase := range trace.Phases {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if phase.Kind != PhaseDrain && phase.Kind != PhaseExpand {
 			return fmt.Errorf("frozen phase trace has invalid phase %q at index %d", phase.Kind, phaseIndex)
 		}
 		for operationIndex, operation := range phase.Operations {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			entry, ok := projection.snapshot.Entries[operation.Rel]
 			if !ok {
 				return fmt.Errorf("frozen phase trace operation %d/%d refers to unknown rel %q",
@@ -1243,17 +1402,29 @@ func validateTraceOperations(trace *CompiledPhaseTrace) error {
 					phaseIndex, operationIndex, operation.Rel)
 			}
 		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		planID := ""
 		if len(phase.Operations) > 0 {
 			planID = phase.Operations[0].PlanID
 		}
-		_, err := session.Apply(context.Background(), PhasePlan{
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		_, err := session.Apply(ctx, PhasePlan{
 			PlanID: planID, Kind: phase.Kind,
 			Operations: append([]PlanOperation(nil), phase.Operations...),
 		})
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if err != nil {
 			return fmt.Errorf("validate frozen phase trace operation frontier=%d: %w", phaseIndex, err)
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if projection.snapshot.ID != trace.FinalSnapshot.ID {
 		return fmt.Errorf("frozen phase trace projected final snapshot mismatch")

@@ -65,6 +65,73 @@ func TestCheckEngineDeadlinePreservesBudgetAndContextErrors(t *testing.T) {
 	require.Contains(t, err.Error(), "rounds=3")
 }
 
+func TestProjectFrozenTraceOperationsHonorsCancellationBoundaries(t *testing.T) {
+	trace, _ := compiledTraceWithCPUAndMemoryWrites(t)
+	require.NotEmpty(t, flattenTraceOperations(trace))
+
+	t.Run("before projection", func(t *testing.T) {
+		projection, err := newProjectedHierarchy(trace.InitialSnapshot, trace.Capabilities)
+		require.NoError(t, err)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, err = projectFrozenTraceOperations(ctx, trace, projection)
+
+		require.ErrorIs(t, err, context.Canceled)
+		require.Equal(t, trace.InitialSnapshot.ID, projection.snapshot.ID)
+	})
+
+	t.Run("after operation", func(t *testing.T) {
+		projection, err := newProjectedHierarchy(trace.InitialSnapshot, trace.Capabilities)
+		require.NoError(t, err)
+		operation := flattenTraceOperations(trace)[0]
+		before := freezeOperationState(projection.snapshot.Entries[operation.Rel])
+		ctx := projectionCancellationContext{
+			Context: context.Background(),
+			cancelled: func() bool {
+				return !frozenOperationStateEqual(
+					projection.snapshot.Entries[operation.Rel], before)
+			},
+		}
+
+		_, err = projectFrozenTraceOperations(ctx, trace, projection)
+
+		require.ErrorIs(t, err, context.Canceled)
+		require.Zero(t, projection.evidenceRebuildCount(),
+			"cancellation after an operation must stop before settlement")
+	})
+
+	t.Run("after settlement", func(t *testing.T) {
+		projection, err := newProjectedHierarchy(trace.InitialSnapshot, trace.Capabilities)
+		require.NoError(t, err)
+		projection.resetEvidenceRebuildCount()
+		ctx := projectionCancellationContext{
+			Context: context.Background(),
+			cancelled: func() bool {
+				return projection.evidenceRebuildCount() > 0
+			},
+		}
+
+		_, err = projectFrozenTraceOperations(ctx, trace, projection)
+
+		require.ErrorIs(t, err, context.Canceled)
+		require.Equal(t, 1, projection.evidenceRebuildCount(),
+			"cancellation after settlement must stop before the next frontier")
+	})
+}
+
+type projectionCancellationContext struct {
+	context.Context
+	cancelled func() bool
+}
+
+func (c projectionCancellationContext) Err() error {
+	if c.cancelled != nil && c.cancelled() {
+		return context.Canceled
+	}
+	return c.Context.Err()
+}
+
 func TestTracePreflightAllowsUnrelatedDynamicSiblingChurn(t *testing.T) {
 	fixture := newAdmissionTraceFixture(t)
 	fixture.configureStagedSMTTransferWithDynamicDescendant()
@@ -377,7 +444,7 @@ func TestCompileFrozenGrowReleaseGuardsRejectsCrossDomainGrowWithoutSourceShrink
 		modified.Phases[phaseIndex].Operations = filtered
 	}
 
-	_, err = compileFrozenGrowReleaseGuards(&modified)
+	_, err = compileFrozenGrowReleaseGuards(context.Background(), &modified)
 
 	require.Error(t, err)
 	require.ErrorContains(t, err, "source shrink coverage")
@@ -420,7 +487,7 @@ func TestCompileFrozenGrowReleaseGuardsRejectsSourceDomainStillHoldingCPU(t *tes
 		modified.InitialSnapshot.DomainUnion[sourceDomain].Union(added)
 	modified.InitialSnapshot.ID = fingerprintSnapshot(modified.InitialSnapshot)
 
-	_, err = compileFrozenGrowReleaseGuards(&modified)
+	_, err = compileFrozenGrowReleaseGuards(context.Background(), &modified)
 
 	require.Error(t, err)
 	require.ErrorContains(t, err, "source domain release")
