@@ -60,11 +60,12 @@ func validateFinalTargets(in PhasePlanInput) error {
 	if in.DAG == nil {
 		return nil
 	}
+	semanticByRel := semanticTargetsForPlan(in)
 	bucketUnionByRoot := make(map[string]machine.CPUSet)
 	bucketCountByRoot := make(map[string]int)
 	reclaimFinalByRoot := make(map[string]machine.CPUSet)
 	for _, node := range in.DAG.Nodes() {
-		final := in.DesiredByRel[node.Rel]
+		final := semanticByRel[node.Rel]
 		if !node.Constraint.CPUUpperBound.IsEmpty() &&
 			!final.IsSubsetOf(node.Constraint.CPUUpperBound) {
 			return fmt.Errorf("%w: rel=%q final CPUs=%s upper=%s",

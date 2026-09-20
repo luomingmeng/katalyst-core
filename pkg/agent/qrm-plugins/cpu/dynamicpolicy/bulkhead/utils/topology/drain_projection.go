@@ -178,6 +178,9 @@ func prepareIncrementalDrainProjectionContext(
 	frontierRelsByCPU := make(map[int][]string)
 	ancestorsByRel := make(map[string][]string, len(rels))
 	for _, rel := range rels {
+		if relInDormantSubtree(rel, in.DormantRels) {
+			continue
+		}
 		out.phase = "rel_index"
 		if err := charge(); err != nil {
 			return err
@@ -207,6 +210,9 @@ func prepareIncrementalDrainProjectionContext(
 		childCount := make(map[int]int)
 		for _, child := range in.Snapshot.Children[rel] {
 			childRel := filepath.Join(rel, child.Name)
+			if relInDormantSubtree(childRel, in.DormantRels) {
+				continue
+			}
 			childCurrent = childCurrent.Union(in.Snapshot.Entries[childRel].CPUs)
 			childTarget := baseProjection.TargetByRel[childRel].CPUs
 			childTargetUnion = childTargetUnion.Union(childTarget)
@@ -264,6 +270,9 @@ func prepareIncrementalDrainProjectionContext(
 		return ancestors, nil
 	}
 	for _, rel := range rels {
+		if relInDormantSubtree(rel, in.DormantRels) {
+			continue
+		}
 		if _, err := buildAncestors(rel, make(map[string]bool)); err != nil {
 			return err
 		}
@@ -425,6 +434,9 @@ func projectDrainTargets(input DrainProjectionInput) (DrainProjection, error) {
 	rels := sortedSnapshotRels(in.Snapshot, input.DepthByRel)
 	bucketUpperByRel := make(map[string]machine.CPUSet)
 	for _, rel := range rels {
+		if relInDormantSubtree(rel, in.DormantRels) {
+			continue
+		}
 		if node := in.DAG.index[rel]; node != nil {
 			if node.Role == TopoNodeRoleReclaimNUMABucket &&
 				!node.Constraint.CPUUpperBound.IsEmpty() {
@@ -443,6 +455,9 @@ func projectDrainTargets(input DrainProjectionInput) (DrainProjection, error) {
 			return DrainProjection{}, err
 		}
 		rel := rels[i]
+		if relInDormantSubtree(rel, in.DormantRels) {
+			continue
+		}
 		projection.Cost.Rels++
 		required := machine.NewCPUSet()
 		node := in.DAG.index[rel]
@@ -468,11 +483,15 @@ func projectDrainTargets(input DrainProjectionInput) (DrainProjection, error) {
 			}
 		}
 		for _, child := range in.Snapshot.Children[rel] {
+			childRel := filepath.Join(rel, child.Name)
+			if relInDormantSubtree(childRel, in.DormantRels) {
+				continue
+			}
 			if err := chargeProbe(); err != nil {
 				return DrainProjection{}, err
 			}
 			projection.Cost.Children++
-			if childTarget, ok := projection.TargetByRel[filepath.Join(rel, child.Name)]; ok {
+			if childTarget, ok := projection.TargetByRel[childRel]; ok {
 				required = required.Union(childTarget.CPUs)
 			}
 		}

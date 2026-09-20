@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -153,6 +154,33 @@ func (d *cgroupFSDriver) StatIdentity(ctx context.Context, rel string) (CgroupId
 }
 
 func (d *cgroupFSDriver) ReadEntry(ctx context.Context, rel string) (EntryState, error) {
+	return d.readEntry(ctx, rel, CgroupIdentity{}, false, nil)
+}
+
+func (d *cgroupFSDriver) ReadEntryWithActivity(
+	ctx context.Context,
+	rel string,
+	expected CgroupIdentity,
+) (EntryState, error) {
+	return d.readEntryWithActivityAndBudget(ctx, rel, expected, nil)
+}
+
+func (d *cgroupFSDriver) readEntryWithActivityAndBudget(
+	ctx context.Context,
+	rel string,
+	expected CgroupIdentity,
+	budget *BudgetTracker,
+) (EntryState, error) {
+	return d.readEntry(ctx, rel, expected, true, budget)
+}
+
+func (d *cgroupFSDriver) readEntry(
+	ctx context.Context,
+	rel string,
+	expected CgroupIdentity,
+	readActivity bool,
+	budget *BudgetTracker,
+) (EntryState, error) {
 	if err := ctx.Err(); err != nil {
 		return EntryState{}, err
 	}
@@ -164,6 +192,38 @@ func (d *cgroupFSDriver) ReadEntry(ctx context.Context, rel string) (EntryState,
 	before, err := d.identityFromFD(dirFD)
 	if err != nil {
 		return EntryState{}, fmt.Errorf("fstat before read %q: %w", rel, err)
+	}
+	if expected != (CgroupIdentity{}) && before != expected {
+		return EntryState{}, identityMismatchError(rel, expected, before)
+	}
+	var childrenBefore []ChildRef
+	if readActivity {
+		if d.policy != cgroupV1Policy {
+			return EntryState{}, fmt.Errorf("cgroup activity proof is only supported for v1")
+		}
+		childrenBefore, err = d.listChildrenFromFD(ctx, dirFD, rel, before, budget)
+		if err != nil {
+			return EntryState{}, err
+		}
+	}
+	activity := CgroupActivity{}
+	if readActivity {
+		rawTasks, readErr := d.readFileAt(dirFD, "tasks")
+		if readErr != nil {
+			return EntryState{}, d.wrapReadEntryFileError(rel, "tasks", readErr)
+		}
+		rawProcs, readErr := d.readFileAt(dirFD, "cgroup.procs")
+		if readErr != nil {
+			return EntryState{}, d.wrapReadEntryFileError(rel, "cgroup.procs", readErr)
+		}
+		activity.TasksEmpty, err = membershipFileEmpty(rawTasks)
+		if err != nil {
+			return EntryState{}, fmt.Errorf("parse tasks %q: %w", rel, err)
+		}
+		activity.CgroupProcsEmpty, err = membershipFileEmpty(rawProcs)
+		if err != nil {
+			return EntryState{}, fmt.Errorf("parse cgroup.procs %q: %w", rel, err)
+		}
 	}
 	// A snapshot's effective/configured files must derive from this verified directory FD,
 	// keeping the snapshot generation-safe if the path is replaced.
@@ -198,6 +258,17 @@ func (d *cgroupFSDriver) ReadEntry(ctx context.Context, rel string) (EntryState,
 		}
 		configuredMems = strings.TrimSpace(string(rawConfiguredMems))
 	}
+	if readActivity {
+		childrenAfter, listErr := d.listChildrenFromFD(ctx, dirFD, rel, before, budget)
+		if listErr != nil {
+			return EntryState{}, listErr
+		}
+		if ChildrenFingerprint(childrenBefore) != ChildrenFingerprint(childrenAfter) {
+			return EntryState{}, fmt.Errorf("%w: rel=%q child identity set changed during activity read",
+				ErrCgroupIdentityChanged, rel)
+		}
+		activity.Childless = len(childrenBefore) == 0
+	}
 	after, err := d.identityFromFD(dirFD)
 	if err != nil {
 		return EntryState{}, fmt.Errorf("fstat after read %q: %w", rel, err)
@@ -213,7 +284,19 @@ func (d *cgroupFSDriver) ReadEntry(ctx context.Context, rel string) (EntryState,
 		// In v2, empty configured means inheritance; effective is the runtime state visible to the planner.
 		ConfiguredCPUs: configuredCPUs,
 		ConfiguredMems: configuredMems,
+		Activity:       activity,
 	}, nil
+}
+
+func membershipFileEmpty(raw []byte) (bool, error) {
+	fields := strings.Fields(string(raw))
+	for _, field := range fields {
+		pid, err := strconv.ParseUint(field, 10, 64)
+		if err != nil || pid == 0 {
+			return false, fmt.Errorf("invalid pid %q", field)
+		}
+	}
+	return len(fields) == 0, nil
 }
 
 func (d *cgroupFSDriver) wrapReadEntryFileError(rel, file string, err error) error {
@@ -241,16 +324,48 @@ func (d *cgroupFSDriver) listChildrenWithBudget(ctx context.Context, rel string,
 	if err != nil {
 		return nil, fmt.Errorf("open cgroup directory %q: %w", rel, err)
 	}
-	file := os.NewFile(uintptr(dirFD), rel)
-	if file == nil {
-		_ = unix.Close(dirFD)
-		return nil, fmt.Errorf("wrap directory fd")
-	}
-	defer file.Close()
+	defer unix.Close(dirFD)
 	before, err := d.identityFromFD(dirFD)
 	if err != nil {
 		return nil, fmt.Errorf("fstat before list %q: %w", rel, err)
 	}
+	return d.listChildrenFromFD(ctx, dirFD, rel, before, budget)
+}
+
+func (d *cgroupFSDriver) listChildrenFromFD(
+	ctx context.Context,
+	dirFD int,
+	rel string,
+	expectedParent CgroupIdentity,
+	budget *BudgetTracker,
+) ([]ChildRef, error) {
+	checkWork := func() error {
+		if budget != nil {
+			return budget.checkContextDeadline(ctx)
+		}
+		return ctx.Err()
+	}
+	before, err := d.identityFromFD(dirFD)
+	if err != nil {
+		return nil, fmt.Errorf("fstat before list %q: %w", rel, err)
+	}
+	if before != expectedParent {
+		return nil, identityMismatchError(rel, expectedParent, before)
+	}
+	openDirAt := d.openDirAt
+	if openDirAt == nil {
+		openDirAt = unix.Openat
+	}
+	enumerationFD, err := openDirAt(dirFD, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open pinned directory fd for list %q: %w", rel, err)
+	}
+	file := os.NewFile(uintptr(enumerationFD), rel)
+	if file == nil {
+		_ = unix.Close(enumerationFD)
+		return nil, fmt.Errorf("wrap directory fd")
+	}
+	defer file.Close()
 	children := make([]ChildRef, 0, listChildrenBatchSize)
 	for {
 		if err := checkWork(); err != nil {
@@ -298,8 +413,8 @@ func (d *cgroupFSDriver) listChildrenWithBudget(ctx context.Context, rel string,
 	if err != nil {
 		return nil, fmt.Errorf("fstat after list %q: %w", rel, err)
 	}
-	if before != after {
-		return nil, identityMismatchError(rel, before, after)
+	if after != expectedParent {
+		return nil, identityMismatchError(rel, expectedParent, after)
 	}
 	return children, nil
 }

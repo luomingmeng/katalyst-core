@@ -232,6 +232,57 @@ func TestAppliedViewFromFinalSnapshotPreservesCPUOwnership(t *testing.T) {
 	}
 }
 
+func TestAppliedViewUsesSemanticOwnershipForDormantV1Bucket(t *testing.T) {
+	dag, err := topology.BuildDAG([]topology.NodeSpec{
+		{
+			Rel: "reclaim", Role: topology.TopoNodeRoleReclaim, Domain: topology.DomainReclaim,
+			CPUs: machine.NewCPUSet(2, 3), ControlledRoot: true, TrustAnchor: true,
+		},
+		{
+			Rel: "reclaim/numa-0", ParentRel: "reclaim", Role: topology.TopoNodeRoleReclaimNUMABucket,
+			Domain: topology.DomainReclaim, CPUs: machine.NewCPUSet(), TrustAnchor: true,
+			Constraint: topology.TopologyConstraint{
+				CPUUpperBound: machine.NewCPUSet(0, 1),
+				Scope:         topology.TopologyScopeNUMANode,
+			},
+			Metadata: map[string]string{"numa": "0"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildDAG() error = %v", err)
+	}
+	snapshot := &topology.CompleteSnapshot{
+		Entries: map[string]topology.EntryState{
+			"reclaim": {
+				Rel: "reclaim", Identity: topology.CgroupIdentity{Device: 7, Inode: 10},
+				CPUs: machine.NewCPUSet(0, 1, 2, 3),
+			},
+			"reclaim/numa-0": {
+				Rel: "reclaim/numa-0", Identity: topology.CgroupIdentity{Device: 7, Inode: 11},
+				CPUs: machine.NewCPUSet(0, 1),
+			},
+		},
+		OwnershipByRel: map[string]machine.CPUSet{
+			"reclaim":        machine.NewCPUSet(2, 3),
+			"reclaim/numa-0": machine.NewCPUSet(),
+		},
+	}
+
+	applied, err := appliedViewFromFinalSnapshot(nil, model.NewDesiredView(), dag, snapshot)
+	if err != nil {
+		t.Fatalf("appliedViewFromFinalSnapshot() error = %v", err)
+	}
+	if got := applied.ReclaimEffective; !got.Equals(machine.NewCPUSet(2, 3)) {
+		t.Fatalf("reclaim ownership = %s, want semantic target 2-3", got.String())
+	}
+	if got := applied.ReclaimEffectivePerNUMA[0]; !got.IsEmpty() {
+		t.Fatalf("dormant NUMA ownership = %s, want empty", got.String())
+	}
+	if got := applied.CPUSetByRel["reclaim/numa-0"]; !got.IsEmpty() {
+		t.Fatalf("dormant rel proof = %s, want empty semantic ownership", got.String())
+	}
+}
+
 func TestAppliedViewFromFinalSnapshotRejectsNUMATargetProofOutsideUpperBound(t *testing.T) {
 	dag, err := topology.BuildDAG([]topology.NodeSpec{
 		{
@@ -502,6 +553,23 @@ func (d *fakeSnapshotDriver) ReadEntry(ctx context.Context, rel string) (topolog
 		mems = "0"
 	}
 	return topology.EntryState{Rel: rel, Identity: pluginFakeIdentity(rel), CPUs: cpus, Mems: mems}, nil
+}
+
+func (d *fakeSnapshotDriver) ReadEntryWithActivity(
+	ctx context.Context,
+	rel string,
+	expected topology.CgroupIdentity,
+) (topology.EntryState, error) {
+	entry, err := d.ReadEntry(ctx, rel)
+	if err != nil {
+		return topology.EntryState{}, err
+	}
+	if entry.Identity != expected {
+		return topology.EntryState{}, topology.ErrCgroupIdentityChanged
+	}
+	// Existing plugin fixtures model populated runtime cgroups unless a test
+	// supplies a purpose-built topology driver with explicit inactivity.
+	return entry, nil
 }
 
 func (d *fakeSnapshotDriver) ListChildren(ctx context.Context, rel string) ([]topology.ChildRef, error) {
@@ -1941,14 +2009,14 @@ func TestCPUSetTopologyPluginHandlesConfiguredNUMABucketTransitionToEmpty(t *tes
 			})
 
 			if tc.version == cgroupclient.CgroupVersionV1 {
-				if err != nil {
-					t.Fatalf("CPUSetAdjustmentHandler: %v", err)
+				if err == nil {
+					t.Fatal("CPUSetAdjustmentHandler error = nil, want fail-closed active/unproved empty bucket")
 				}
 				if got := cg.cpus[bucket1]; got.IsEmpty() || !got.Equals(machine.NewCPUSet(3)) {
 					t.Fatalf("v1 bucket %q cpuset = %s, want preserved non-empty current 3", bucket1, got.String())
 				}
 				if got := cg.cpus[reclaim]; !got.Equals(machine.NewCPUSet(2, 3)) {
-					t.Fatalf("v1 parent reclaim cpuset = %s, want it to cover preserved bucket %q", got.String(), bucket1)
+					t.Fatalf("v1 parent reclaim cpuset = %s, want unchanged 2-3", got.String())
 				}
 				return
 			}

@@ -74,6 +74,155 @@ func TestSnapshotIncludesControlledRootsBucketsAndDynamicDescendants(t *testing.
 	}
 }
 
+func TestSnapshotCollectsActivityOnlyForReclaimNUMABucketCandidates(t *testing.T) {
+	dag := buildSnapshotTestDAG(t)
+	fake := newFakeHierarchyDriver()
+	fake.add("primary", CgroupIdentity{Device: 1, Inode: 1}, "0-1", "0")
+	fake.add("primary/holder/leaf", CgroupIdentity{Device: 1, Inode: 2}, "1", "0")
+	fake.add("reclaim", CgroupIdentity{Device: 1, Inode: 3}, "2-3", "0")
+	fake.add("reclaim/bucket-0", CgroupIdentity{Device: 1, Inode: 4}, "2-3", "0")
+	fake.add("reclaim/bucket-0/holder", CgroupIdentity{Device: 1, Inode: 5}, "3", "0")
+	fake.nodes["reclaim/bucket-0/holder"].activity = CgroupActivity{TasksEmpty: true}
+
+	snapshot, err := BuildCompleteSnapshot(context.Background(), fake, dag, SnapshotRequest{
+		Purpose:                ScanForPlan,
+		AffectedRels:           []string{"primary", "reclaim", "reclaim/bucket-0"},
+		CollectDormantActivity: true,
+	}, NewBudgetTracker(ConvergenceBudget{}))
+	if err != nil {
+		t.Fatalf("BuildCompleteSnapshot() error = %v", err)
+	}
+	if got := snapshot.Entries["reclaim/bucket-0"].Activity; got.Inactive() || got.Childless {
+		t.Fatalf("bucket activity = %+v, want non-leaf proof", got)
+	}
+	if got := snapshot.Entries["reclaim/bucket-0/holder"].Activity; got != (CgroupActivity{}) {
+		t.Fatalf("dynamic descendant activity = %+v, want no activity scan below non-leaf bucket", got)
+	}
+	if got := snapshot.Entries["primary"].Activity; got != (CgroupActivity{}) {
+		t.Fatalf("primary activity = %+v, want no unnecessary membership scan", got)
+	}
+}
+
+func TestSnapshotCollectsActivityForBucketThatBecomesEmptyAfterNormalization(t *testing.T) {
+	dag := mustPlanDAG(t, []NodeSpec{
+		{Rel: "primary", Role: TopoNodeRolePrimary, Domain: DomainPrimary, CPUs: machine.NewCPUSet(0), TrustAnchor: true},
+		{Rel: "reclaim", Role: TopoNodeRoleReclaim, Domain: DomainReclaim, CPUs: machine.NewCPUSet(0, 1), TrustAnchor: true},
+		{
+			Rel: "reclaim/bucket-0", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket,
+			Domain: DomainReclaim, CPUs: machine.NewCPUSet(0),
+			Constraint: TopologyConstraint{CPUUpperBound: machine.NewCPUSet(0), Scope: TopologyScopeNUMANode},
+			Metadata:   map[string]string{"numa": "0"},
+		},
+	})
+	fake := newFakeHierarchyDriver()
+	fake.add("primary", CgroupIdentity{Device: 1, Inode: 1}, "0", "0")
+	fake.add("reclaim", CgroupIdentity{Device: 1, Inode: 2}, "1", "0")
+	fake.add("reclaim/bucket-0", CgroupIdentity{Device: 1, Inode: 3}, "0-1", "0")
+	fake.markInactive("reclaim/bucket-0")
+
+	snapshot, err := BuildCompleteSnapshot(context.Background(), fake, dag, SnapshotRequest{
+		Purpose:                ScanForPlan,
+		AffectedRels:           []string{"primary", "reclaim", "reclaim/bucket-0"},
+		CollectDormantActivity: true,
+	}, NewBudgetTracker(ConvergenceBudget{}))
+	if err != nil {
+		t.Fatalf("BuildCompleteSnapshot() error = %v", err)
+	}
+	if got := snapshot.Entries["reclaim/bucket-0"].Activity; !got.Inactive() {
+		t.Fatalf("bucket activity = %+v, want proof collected before effective-target normalization", got)
+	}
+
+	effective, err := computeEffectiveTargets(
+		dag, false,
+		machine.CPUDetails{0: {NUMANodeID: 0}, 1: {NUMANodeID: 1}},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("computeEffectiveTargets() error = %v", err)
+	}
+	if !effective["reclaim/bucket-0"].IsEmpty() {
+		t.Fatalf("normalized bucket target = %s, want empty", effective["reclaim/bucket-0"].String())
+	}
+	materialized := materializeTargets(dag, snapshot, false, effective)
+	if _, dormant := materialized.DormantRels["reclaim/bucket-0"]; !dormant {
+		t.Fatal("bucket that became empty after normalization was not classified dormant")
+	}
+}
+
+func TestSnapshotFailsClosedForDormantLeafActivityAndChildRaces(t *testing.T) {
+	dag := mustPlanDAG(t, []NodeSpec{
+		{Rel: "reclaim", Role: TopoNodeRoleReclaim, Domain: DomainReclaim, CPUs: machine.NewCPUSet(1), TrustAnchor: true},
+		{Rel: "reclaim/bucket-0", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket, Domain: DomainReclaim, CPUs: machine.NewCPUSet()},
+	})
+
+	t.Run("task migrates into scanned node", func(t *testing.T) {
+		fake := newFakeHierarchyDriver()
+		fake.add("reclaim", CgroupIdentity{Device: 1, Inode: 1}, "1", "0")
+		fake.add("reclaim/bucket-0", CgroupIdentity{Device: 1, Inode: 2}, "0-1", "0")
+		fake.beforeCall = func(op HierarchyOperation, rel string) error {
+			if op == HierarchyOperationRead && rel == "reclaim/bucket-0" {
+				fake.nodes[rel].activity.TasksEmpty = false
+			}
+			return nil
+		}
+
+		snapshot, err := BuildCompleteSnapshot(context.Background(), fake, dag, SnapshotRequest{
+			Purpose:                ScanForPlan,
+			AffectedRels:           []string{"reclaim/bucket-0"},
+			CollectDormantActivity: true,
+		}, NewBudgetTracker(ConvergenceBudget{}))
+		if err != nil {
+			t.Fatalf("BuildCompleteSnapshot() error = %v", err)
+		}
+		if got := materializeTargets(dag, snapshot, false, desiredTargets(dag)); len(got.DormantRels) != 0 {
+			t.Fatalf("busy bucket classified dormant: %v", got.DormantRels)
+		}
+	})
+
+	t.Run("new child appears during atomic activity read", func(t *testing.T) {
+		fake := newFakeHierarchyDriver()
+		fake.add("reclaim", CgroupIdentity{Device: 1, Inode: 1}, "1", "0")
+		fake.add("reclaim/bucket-0", CgroupIdentity{Device: 1, Inode: 2}, "0-1", "0")
+		fake.beforeCall = func(op HierarchyOperation, rel string) error {
+			if op == HierarchyOperationRead && rel == "reclaim/bucket-0" {
+				fake.add("reclaim/bucket-0/new", CgroupIdentity{Device: 1, Inode: 3}, "0", "0")
+			}
+			return nil
+		}
+
+		snapshot, err := BuildCompleteSnapshot(context.Background(), fake, dag, SnapshotRequest{
+			Purpose:                ScanForPlan,
+			AffectedRels:           []string{"reclaim/bucket-0"},
+			CollectDormantActivity: true,
+		}, NewBudgetTracker(ConvergenceBudget{}))
+		if err == nil || snapshot != nil {
+			t.Fatalf("snapshot=%v error=%v, want fail-closed child creation", snapshot, err)
+		}
+	})
+
+	t.Run("child identity changes during atomic activity read", func(t *testing.T) {
+		fake := newFakeHierarchyDriver()
+		fake.add("reclaim", CgroupIdentity{Device: 1, Inode: 1}, "1", "0")
+		fake.add("reclaim/bucket-0", CgroupIdentity{Device: 1, Inode: 2}, "0-1", "0")
+		fake.add("reclaim/bucket-0/child", CgroupIdentity{Device: 1, Inode: 3}, "0", "0")
+		fake.beforeCall = func(op HierarchyOperation, rel string) error {
+			if op == HierarchyOperationRead && rel == "reclaim/bucket-0" {
+				fake.bumpIdentity("reclaim/bucket-0/child")
+			}
+			return nil
+		}
+
+		snapshot, err := BuildCompleteSnapshot(context.Background(), fake, dag, SnapshotRequest{
+			Purpose:                ScanForPlan,
+			AffectedRels:           []string{"reclaim/bucket-0"},
+			CollectDormantActivity: true,
+		}, NewBudgetTracker(ConvergenceBudget{}))
+		if err == nil || snapshot != nil {
+			t.Fatalf("snapshot=%v error=%v, want fail-closed child ABA rejection", snapshot, err)
+		}
+	})
+}
+
 func TestSnapshotRejectsDriverWithoutStableIdentityBeforeIO(t *testing.T) {
 	fake := buildSnapshotTestHierarchy()
 	fake.stableIdentity = false

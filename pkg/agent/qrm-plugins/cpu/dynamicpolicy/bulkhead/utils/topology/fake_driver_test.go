@@ -35,6 +35,7 @@ type fakeHierarchyNode struct {
 	configuredCPUs machine.CPUSet
 	mems           string
 	configuredMems string
+	activity       CgroupActivity
 }
 
 type fakeHierarchyWrite struct {
@@ -100,6 +101,55 @@ func (f *fakeHierarchyDriver) add(rel string, identity CgroupIdentity, cpus, mem
 	}
 }
 
+func (f *fakeHierarchyDriver) markInactive(rel string) {
+	node := f.nodes[rel]
+	if node == nil {
+		panic(fmt.Sprintf("mark inactive missing rel %q", rel))
+	}
+	node.activity.TasksEmpty = true
+	node.activity.CgroupProcsEmpty = true
+}
+
+func (f *fakeHierarchyDriver) ReadEntryWithActivity(
+	ctx context.Context,
+	rel string,
+	expected CgroupIdentity,
+) (EntryState, error) {
+	node := f.nodes[rel]
+	if node == nil {
+		return EntryState{}, syscall.ENOENT
+	}
+	if node.identity != expected {
+		return EntryState{}, ErrCgroupIdentityChanged
+	}
+	before := f.directChildren(rel)
+	entry, err := f.ReadEntry(ctx, rel)
+	if err != nil {
+		return EntryState{}, err
+	}
+	if entry.Identity != expected {
+		return EntryState{}, ErrCgroupIdentityChanged
+	}
+	entry.Activity = f.nodes[rel].activity
+	after := f.directChildren(rel)
+	if ChildrenFingerprint(before) != ChildrenFingerprint(after) {
+		return EntryState{}, ErrCgroupIdentityChanged
+	}
+	entry.Activity.Childless = len(before) == 0
+	return entry, nil
+}
+
+func (f *fakeHierarchyDriver) directChildren(rel string) []ChildRef {
+	children := make([]ChildRef, 0)
+	for candidate, node := range f.nodes {
+		if filepath.Dir(candidate) == rel {
+			children = append(children, ChildRef{Name: filepath.Base(candidate), Identity: node.identity})
+		}
+	}
+	sort.Slice(children, func(i, j int) bool { return children[i].Name < children[j].Name })
+	return children
+}
+
 func (f *fakeHierarchyDriver) bumpIdentity(rel string) {
 	f.nodes[rel].identity.Inode++
 }
@@ -161,14 +211,7 @@ func (f *fakeHierarchyDriver) ListChildren(_ context.Context, rel string) ([]Chi
 	if f.nodes[rel] == nil {
 		return nil, syscall.ENOENT
 	}
-	children := make([]ChildRef, 0)
-	for candidate, node := range f.nodes {
-		if filepath.Dir(candidate) == rel {
-			children = append(children, ChildRef{Name: filepath.Base(candidate), Identity: node.identity})
-		}
-	}
-	sort.Slice(children, func(i, j int) bool { return children[i].Name < children[j].Name })
-	return children, nil
+	return f.directChildren(rel), nil
 }
 
 func (f *fakeHierarchyDriver) WriteCPUs(_ context.Context, rel string, expected CgroupIdentity, cpus machine.CPUSet) error {
@@ -206,6 +249,7 @@ func (f *fakeHierarchyDriver) WriteCPUs(_ context.Context, rel string, expected 
 		identity: current.identity, cpus: effective.Clone(),
 		configuredCPUs: cpus.Clone(), mems: current.mems,
 		configuredMems: current.configuredMems,
+		activity:       current.activity,
 	}
 	if err := f.checkInvariants(trace); err != nil {
 		return err
@@ -252,6 +296,7 @@ func (f *fakeHierarchyDriver) WriteMems(_ context.Context, rel string, expected 
 		identity: current.identity, cpus: current.cpus.Clone(),
 		configuredCPUs: current.configuredCPUs.Clone(), mems: effective,
 		configuredMems: mems,
+		activity:       current.activity,
 	}
 	if err := f.checkInvariants(trace); err != nil {
 		return err
@@ -278,6 +323,7 @@ func (f *fakeHierarchyDriver) snapshot() fakeHierarchyState {
 			configuredCPUs: node.configuredCPUs.Clone(),
 			mems:           node.mems,
 			configuredMems: node.configuredMems,
+			activity:       node.activity,
 		}
 	}
 	return state

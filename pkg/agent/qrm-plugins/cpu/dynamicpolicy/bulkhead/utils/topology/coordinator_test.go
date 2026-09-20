@@ -396,6 +396,92 @@ func newTask9FinalizeFixture(
 	return fixture, base
 }
 
+func TestTopologyCoordinatorV1FourNUMADormantBucketsConvergeWithPhysicalParentEnvelope(t *testing.T) {
+	dag, err := BuildDAG([]NodeSpec{
+		{Rel: "primary", Role: TopoNodeRolePrimary, Domain: DomainPrimary, CPUs: machine.MustParse("0-3"), Mems: "0-3", TrustAnchor: true},
+		{Rel: "reclaim", Role: TopoNodeRoleReclaim, Domain: DomainReclaim, CPUs: machine.MustParse("4-7"), Mems: "0-3", TrustAnchor: true},
+		{Rel: "reclaim/numa-0", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket, Domain: DomainReclaim, CPUs: machine.NewCPUSet(), Mems: "0", Metadata: map[string]string{"numa": "0"}},
+		{Rel: "reclaim/numa-1", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket, Domain: DomainReclaim, CPUs: machine.NewCPUSet(), Mems: "1", Metadata: map[string]string{"numa": "1"}},
+		{Rel: "reclaim/numa-2", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket, Domain: DomainReclaim, CPUs: machine.MustParse("4-5"), Mems: "2", Metadata: map[string]string{"numa": "2"}},
+		{Rel: "reclaim/numa-3", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket, Domain: DomainReclaim, CPUs: machine.MustParse("6-7"), Mems: "3", Metadata: map[string]string{"numa": "3"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	driver := newFakeHierarchyDriver()
+	driver.add("primary", CgroupIdentity{Device: 1, Inode: 1}, "0-3", "0-3")
+	driver.add("reclaim", CgroupIdentity{Device: 1, Inode: 2}, "4-7", "0-3")
+	driver.add("reclaim/numa-0", CgroupIdentity{Device: 1, Inode: 3}, "0-7", "0")
+	driver.add("reclaim/numa-1", CgroupIdentity{Device: 1, Inode: 4}, "0-7", "1")
+	driver.add("reclaim/numa-2", CgroupIdentity{Device: 1, Inode: 5}, "4-5", "2")
+	driver.add("reclaim/numa-3", CgroupIdentity{Device: 1, Inode: 6}, "6-7", "3")
+	driver.markInactive("reclaim/numa-0")
+	driver.markInactive("reclaim/numa-1")
+	driver.witnessAuthorizedExpansions = map[string]machine.CPUSet{
+		"reclaim": machine.MustParse("0-3"),
+	}
+	dormantReads := 0
+	driver.beforeCall = func(op HierarchyOperation, rel string) error {
+		if op == HierarchyOperationRead && (rel == "reclaim/numa-0" || rel == "reclaim/numa-1") {
+			dormantReads++
+		}
+		return nil
+	}
+	cg := newTopologyFakeCgroup()
+	cg.version = cgroupclient.CgroupVersionV1
+	provider := &coordinatorSnapshotTestCgroup{topologyFakeCgroup: cg, driver: driver}
+	var published *CompleteSnapshot
+
+	result, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
+		DAG: dag, Cgroup: provider, Mems: "0-3",
+		CPUDetails: machine.CPUDetails{
+			0: {NUMANodeID: 0}, 1: {NUMANodeID: 0},
+			2: {NUMANodeID: 1}, 3: {NUMANodeID: 1},
+			4: {NUMANodeID: 2}, 5: {NUMANodeID: 2},
+			6: {NUMANodeID: 3}, 7: {NUMANodeID: 3},
+		},
+		PublishFinalSnapshot: func(snapshot *CompleteSnapshot) error {
+			published = snapshot
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Converge() error = %v", err)
+	}
+	if !result.Converged || !result.FinalSnapshotCurrent {
+		t.Fatalf("result = %+v, want current converged proof", result)
+	}
+	writesByRel := make(map[string]int)
+	for _, write := range driver.writes {
+		writesByRel[write.rel]++
+	}
+	if writesByRel["reclaim"] == 0 {
+		t.Fatalf("writer mutations = %v, want physical parent envelope write", driver.writes)
+	}
+	for _, rel := range []string{"reclaim/numa-0", "reclaim/numa-1"} {
+		if writesByRel[rel] != 0 {
+			t.Fatalf("dormant rel %q writes = %d, want no reclaim ownership write", rel, writesByRel[rel])
+		}
+	}
+	if dormantReads < 8 {
+		t.Fatalf("dormant activity reads = %d, want both buckets revalidated across round and final proofs", dormantReads)
+	}
+	if got, want := result.FinalSnapshot.DomainUnion[DomainReclaim], machine.MustParse("4-7"); !got.Equals(want) {
+		t.Fatalf("published reclaim ownership = %s, want %s", got.String(), want.String())
+	}
+	if published != result.FinalSnapshot {
+		t.Fatalf("published snapshot = %p, want final snapshot %p", published, result.FinalSnapshot)
+	}
+	for _, rel := range []string{"reclaim/numa-0", "reclaim/numa-1"} {
+		if got, ok := published.TargetProofCPUs(rel, machine.NewCPUSet()); !ok || !got.IsEmpty() {
+			t.Fatalf("published dormant ownership %q = %s, found=%v, want empty semantic proof", rel, got.String(), ok)
+		}
+		if published.Entries[rel].CPUs.IsEmpty() {
+			t.Fatalf("published physical observation %q unexpectedly empty", rel)
+		}
+	}
+}
+
 func TestTopologyCoordinatorAdmissionDeadlineCoversFreshProofAndFailsClosed(t *testing.T) {
 	dag, cg, driver := newCoordinatorSnapshotTestFixture(t)
 	primaryScans := 0
@@ -1483,6 +1569,36 @@ func TestBudgetTrackerDerivesCumulativeAutoLimitsFromRoundsAndSnapshotSize(t *te
 	}
 	if budget.limit.MaxPlanOperations < 513*1000 {
 		t.Fatalf("plan operation limit = %d, want conservative cumulative headroom", budget.limit.MaxPlanOperations)
+	}
+}
+
+func TestBudgetTrackerBootstrapAccountsForDormantActivityWorstCase(t *testing.T) {
+	t.Parallel()
+
+	const (
+		nodes        = 17
+		staleRetries = 3
+	)
+	normal := NewBudgetTracker(ConvergenceBudget{MaxSnapshotNodes: nodes})
+	if err := normal.configureAutoHierarchyIOBootstrap(staleRetries, false); err != nil {
+		t.Fatalf("configure normal bootstrap: %v", err)
+	}
+	activity := NewBudgetTracker(ConvergenceBudget{MaxSnapshotNodes: nodes})
+	if err := activity.configureAutoHierarchyIOBootstrap(staleRetries, true); err != nil {
+		t.Fatalf("configure activity bootstrap: %v", err)
+	}
+
+	if got, want := normal.limit.MaxHierarchyIOOperations,
+		nodes*normalSnapshotHierarchyIOPerNode+staleRetries+fixedInvocationHierarchyIOHeadroom; got != want {
+		t.Fatalf("normal bootstrap I/O limit = %d, want %d", got, want)
+	}
+	if got, want := activity.limit.MaxHierarchyIOOperations,
+		nodes*activitySnapshotHierarchyIOPerNode+staleRetries+fixedInvocationHierarchyIOHeadroom; got != want {
+		t.Fatalf("activity bootstrap I/O limit = %d, want %d", got, want)
+	}
+	if activity.limit.MaxHierarchyIOOperations <= normal.limit.MaxHierarchyIOOperations {
+		t.Fatalf("activity bootstrap limit = %d, want greater than normal %d",
+			activity.limit.MaxHierarchyIOOperations, normal.limit.MaxHierarchyIOOperations)
 	}
 }
 
@@ -3594,6 +3710,78 @@ func TestTopologyCoordinatorExplicitIOAutoPlanBudgetConverges300DeepDynamicDesce
 	}
 	if got := res.FinalSnapshot.Entries[parent].CPUs; !got.Equals(machine.NewCPUSet(0)) {
 		t.Fatalf("deepest descendant CPUs = %s, want 0", got.String())
+	}
+}
+
+func TestCoordinatorReclassifiesDormantBucketAtPlanningBoundary(t *testing.T) {
+	t.Parallel()
+
+	dag := mustPlanDAG(t, []NodeSpec{
+		{
+			Rel: "primary", Role: TopoNodeRolePrimary, Domain: DomainPrimary,
+			CPUs: machine.NewCPUSet(0, 1), TrustAnchor: true,
+		},
+		{
+			Rel: "reclaim", Role: TopoNodeRoleReclaim, Domain: DomainReclaim,
+			CPUs: machine.NewCPUSet(), TrustAnchor: true,
+		},
+		{
+			Rel: "reclaim/bucket-0", ParentRel: "reclaim",
+			Role: TopoNodeRoleReclaimNUMABucket, Domain: DomainReclaim,
+			CPUs: machine.NewCPUSet(),
+			Constraint: TopologyConstraint{
+				CPUUpperBound: machine.NewCPUSet(0, 1),
+				Scope:         TopologyScopeNUMANode,
+			},
+		},
+	})
+	inactive := CgroupActivity{TasksEmpty: true, CgroupProcsEmpty: true, Childless: true}
+	first := planSnapshot(map[string]EntryState{
+		"primary":          {Identity: CgroupIdentity{Inode: 1}, CPUs: machine.NewCPUSet(0, 1)},
+		"reclaim":          {Identity: CgroupIdentity{Inode: 2}, CPUs: machine.NewCPUSet(0, 1)},
+		"reclaim/bucket-0": {Identity: CgroupIdentity{Inode: 3}, CPUs: machine.NewCPUSet(0, 1), Activity: inactive},
+	}, nil)
+	first.Children = map[string][]ChildRef{
+		"primary": {}, "reclaim": {{Name: "bucket-0", Identity: CgroupIdentity{Inode: 3}}},
+		"reclaim/bucket-0": {},
+	}
+	round := &coordinatorRound{
+		dag:                 dag,
+		semanticTargetByRel: desiredTargets(dag),
+		allowEmptyTarget:    false,
+		pendingSnapshot:     first,
+	}
+
+	snapshot, err := round.nextPlanningSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("first nextPlanningSnapshot() error = %v", err)
+	}
+	if _, dormant := round.dormantRels["reclaim/bucket-0"]; !dormant {
+		t.Fatalf("dormant rels = %v, want empty inactive bucket", round.dormantRels)
+	}
+	if got, _ := snapshot.TargetProofCPUs("reclaim/bucket-0", machine.NewCPUSet()); !got.IsEmpty() {
+		t.Fatalf("first semantic ownership = %s, want empty", got.String())
+	}
+
+	second := *first
+	second.Entries = make(map[string]EntryState, len(first.Entries))
+	for rel, observed := range first.Entries {
+		second.Entries[rel] = observed
+	}
+	entry := second.Entries["reclaim/bucket-0"]
+	entry.Activity.TasksEmpty = false
+	second.Entries["reclaim/bucket-0"] = entry
+	round.pendingSnapshot = &second
+
+	snapshot, err = round.nextPlanningSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("second nextPlanningSnapshot() error = %v", err)
+	}
+	if _, dormant := round.dormantRels["reclaim/bucket-0"]; dormant {
+		t.Fatalf("dormant rels = %v, want active bucket after task arrival", round.dormantRels)
+	}
+	if len(snapshot.OwnershipByRel) != 0 {
+		t.Fatalf("ownership overlay = %v, want raw active snapshot", snapshot.OwnershipByRel)
 	}
 }
 

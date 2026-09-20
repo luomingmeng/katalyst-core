@@ -470,6 +470,199 @@ func assertListChildrenDoesNotSkipOpenError(t *testing.T, injected error) {
 	}
 }
 
+func TestCgroupV1DriverReadsAndValidatesMembershipFromPinnedDirectory(t *testing.T) {
+	root := resolvedPath(t, t.TempDir())
+	holderDir := filepath.Join(root, "holder")
+	if err := os.MkdirAll(holderDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{
+		"cpuset.cpus":  "0-3",
+		"cpuset.mems":  "0",
+		"tasks":        "",
+		"cgroup.procs": "",
+	} {
+		if err := os.WriteFile(filepath.Join(holderDir, name), []byte(value), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	driver := newTestCgroupV1Driver(t, root, nil)
+	identity, err := driver.StatIdentity(context.Background(), "holder")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entry, err := driver.ReadEntryWithActivity(context.Background(), "holder", identity)
+	if err != nil {
+		t.Fatalf("ReadEntryWithActivity() error = %v", err)
+	}
+	if !entry.Activity.Inactive() {
+		t.Fatalf("activity = %+v, want both membership files proved empty", entry.Activity)
+	}
+
+	if err := os.WriteFile(filepath.Join(holderDir, "tasks"), []byte("not-a-pid\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := driver.ReadEntryWithActivity(context.Background(), "holder", identity); err == nil {
+		t.Fatal("ReadEntryWithActivity() accepted malformed tasks content")
+	}
+}
+
+func TestBudgetedCgroupV1ActivityReadChargesPinnedChildScan(t *testing.T) {
+	root := resolvedPath(t, t.TempDir())
+	holderDir := filepath.Join(root, "holder")
+	if err := os.MkdirAll(filepath.Join(holderDir, "child"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{
+		"cpuset.cpus": "0-3", "cpuset.mems": "0", "tasks": "", "cgroup.procs": "",
+	} {
+		if err := os.WriteFile(filepath.Join(holderDir, name), []byte(value), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base := newTestCgroupV1Driver(t, root, nil)
+	identity, err := base.StatIdentity(context.Background(), "holder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	budget := NewBudgetTracker(ConvergenceBudget{MaxSnapshotNodes: 1})
+	if err := budget.VisitNode("holder", identity, 1); err != nil {
+		t.Fatal(err)
+	}
+	driver := NewBudgetedHierarchyDriver(base, budget)
+	reader := driver.(hierarchyActivityReader)
+
+	if _, err := reader.ReadEntryWithActivity(context.Background(), "holder", identity); !errors.Is(err, ErrNodeBudgetExceeded) {
+		t.Fatalf("ReadEntryWithActivity() error = %v, want node budget from pinned child scan", err)
+	}
+}
+
+func TestBudgetedCgroupV1ActivityReadHonorsTrackerDeadlineDuringPinnedChildScan(t *testing.T) {
+	root := resolvedPath(t, t.TempDir())
+	holderDir := filepath.Join(root, "holder")
+	if err := os.MkdirAll(filepath.Join(holderDir, "child-a"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(holderDir, "child-b"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{
+		"cpuset.cpus": "0-3", "cpuset.mems": "0", "tasks": "", "cgroup.procs": "",
+	} {
+		if err := os.WriteFile(filepath.Join(holderDir, name), []byte(value), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base := newTestCgroupV1Driver(t, root, nil)
+	identity, err := base.StatIdentity(context.Background(), "holder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	budget := NewBudgetTracker(ConvergenceBudget{})
+	openAt := base.openDirAt
+	childOpens := 0
+	base.openDirAt = func(dirFD int, name string, flags int, mode uint32) (int, error) {
+		if strings.HasPrefix(name, "child-") {
+			childOpens++
+			if childOpens == 1 {
+				budget.mu.Lock()
+				budget.limit.Deadline = time.Now().Add(-time.Second)
+				budget.mu.Unlock()
+			}
+		}
+		return openAt(dirFD, name, flags, mode)
+	}
+	driver := NewBudgetedHierarchyDriver(base, budget)
+	reader := driver.(hierarchyActivityReader)
+
+	if _, err := reader.ReadEntryWithActivity(context.Background(), "holder", identity); !errors.Is(err, ErrConvergenceDeadlineExceeded) {
+		t.Fatalf("ReadEntryWithActivity() error = %v, want tracker deadline", err)
+	}
+	if childOpens != 1 {
+		t.Fatalf("opened children = %d, want scan to stop after tracker deadline", childOpens)
+	}
+}
+
+func TestCgroupV1DriverActivityReadRejectsChildCreationInsideAtomicWindow(t *testing.T) {
+	root := resolvedPath(t, t.TempDir())
+	holderDir := filepath.Join(root, "holder")
+	if err := os.MkdirAll(holderDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{
+		"cpuset.cpus": "0-3", "cpuset.mems": "0", "tasks": "", "cgroup.procs": "",
+	} {
+		if err := os.WriteFile(filepath.Join(holderDir, name), []byte(value), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	driver := newTestCgroupV1Driver(t, root, nil)
+	identity, err := driver.StatIdentity(context.Background(), "holder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalRead := driver.readFileAt
+	driver.readFileAt = func(dirFD int, name string) ([]byte, error) {
+		raw, readErr := originalRead(dirFD, name)
+		if name == "tasks" {
+			if mkdirErr := os.Mkdir(filepath.Join(holderDir, "new-child"), 0o755); mkdirErr != nil {
+				t.Fatal(mkdirErr)
+			}
+		}
+		return raw, readErr
+	}
+
+	if _, err := driver.ReadEntryWithActivity(context.Background(), "holder", identity); !errors.Is(err, ErrCgroupIdentityChanged) {
+		t.Fatalf("ReadEntryWithActivity() error = %v, want child-closure stale error", err)
+	}
+}
+
+func TestCgroupV1DriverActivityReadUsesOnePinnedFDAndRejectsExpectedParentABA(t *testing.T) {
+	root := resolvedPath(t, t.TempDir())
+	holderDir := filepath.Join(root, "holder")
+	if err := os.MkdirAll(holderDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{
+		"cpuset.cpus": "0-3", "cpuset.mems": "0", "tasks": "", "cgroup.procs": "",
+	} {
+		if err := os.WriteFile(filepath.Join(holderDir, name), []byte(value), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	driver := newTestCgroupV1Driver(t, root, nil)
+	identity, err := driver.StatIdentity(context.Background(), "holder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalRead := driver.readFileAt
+	var readFDs []int
+	driver.readFileAt = func(dirFD int, name string) ([]byte, error) {
+		readFDs = append(readFDs, dirFD)
+		return originalRead(dirFD, name)
+	}
+
+	entry, err := driver.ReadEntryWithActivity(context.Background(), "holder", identity)
+	if err != nil {
+		t.Fatalf("ReadEntryWithActivity() error = %v", err)
+	}
+	if !entry.Activity.Inactive() {
+		t.Fatalf("activity = %+v, want childless inactive leaf", entry.Activity)
+	}
+	for _, fd := range readFDs[1:] {
+		if fd != readFDs[0] {
+			t.Fatalf("activity read FDs = %v, want one pinned directory FD", readFDs)
+		}
+	}
+
+	wrong := identity
+	wrong.Inode++
+	if _, err := driver.ReadEntryWithActivity(context.Background(), "holder", wrong); !errors.Is(err, ErrCgroupIdentityChanged) {
+		t.Fatalf("wrong expected parent identity error = %v, want ErrCgroupIdentityChanged", err)
+	}
+}
+
 func TestCgroupV1DriverRejectsPathOutsideRoot(t *testing.T) {
 	parent := t.TempDir()
 	root := filepath.Join(parent, "root")

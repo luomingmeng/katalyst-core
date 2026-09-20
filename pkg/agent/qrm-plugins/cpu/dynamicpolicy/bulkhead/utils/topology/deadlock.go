@@ -126,7 +126,7 @@ func analyzeV1Deadlock(in PhasePlanInput) (analysis DeadlockAnalysis, err error)
 	analysis.ProbeStats.ProtectedRels = len(in.ProtectedByRel)
 	analysis.ProbeStats.ProtectedPendingCPUs = in.ProtectedPending.Size()
 	analysis.ProbeStats.SnapshotID = in.Snapshot.ID
-	desiredByDomain := desiredDomainUnions(in.DAG, in.DesiredByRel)
+	desiredByDomain := desiredDomainUnions(in.DAG, semanticTargetsForPlan(in))
 	domains := sortedDomains(in.Snapshot.DomainUnion, desiredByDomain)
 	graph := buildTransferGraph(domains, in.Snapshot.DomainUnion, desiredByDomain, nil)
 	if !isNarrowPrimaryReclaimCycle(graph) {

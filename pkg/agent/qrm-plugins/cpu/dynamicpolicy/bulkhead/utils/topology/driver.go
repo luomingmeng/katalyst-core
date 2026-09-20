@@ -40,6 +40,21 @@ type EntryState struct {
 	// in cgroup v2, empty configured state means parent inheritance, not an empty effective set.
 	ConfiguredCPUs machine.CPUSet
 	ConfiguredMems string
+	// Activity proves that both cgroup v1 membership files and child closure
+	// were read from the same pinned cgroup directory generation.
+	Activity CgroupActivity
+}
+
+type CgroupActivity struct {
+	TasksEmpty       bool
+	CgroupProcsEmpty bool
+	// Childless is true only when one pinned-directory observation saw the same
+	// empty child set both before and after membership and cpuset reads.
+	Childless bool
+}
+
+func (a CgroupActivity) Inactive() bool {
+	return a.TasksEmpty && a.CgroupProcsEmpty && a.Childless
 }
 
 // HierarchyCapabilities describes semantics guaranteed by a hierarchy backend.
@@ -132,4 +147,12 @@ type HierarchyDriver interface {
 	WriteMems(context.Context, string, CgroupIdentity, string) error
 	Classify(error, HierarchyOperation) HierarchyErrorClass
 	Capabilities() HierarchyCapabilities
+}
+
+type hierarchyActivityReader interface {
+	ReadEntryWithActivity(context.Context, string, CgroupIdentity) (EntryState, error)
+}
+
+type budgetedHierarchyActivityReader interface {
+	readEntryWithActivityAndBudget(context.Context, string, CgroupIdentity, *BudgetTracker) (EntryState, error)
 }

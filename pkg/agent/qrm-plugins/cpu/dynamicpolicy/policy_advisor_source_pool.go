@@ -321,6 +321,12 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocksWithCheckpointTransitionAndDyna
 	if err != nil {
 		return nil, err
 	}
+	// This exclusion is committed-state ownership, not an inference from pod
+	// annotations or the existence of a source/isolation component. Only a
+	// steady dedicated NUMA-binding exclusive allocation owns an entire NUMA;
+	// ordinary shared-core entries remain eligible for fake-NUMA balancing.
+	// Reuse the same set in normalization and solving so both phases agree on
+	// which NUMAs are immutable.
 	skipNUMAs := p.state.GetPodEntries().SteadyExclusiveNUMAs(topology)
 	if resp.DisableDedicatedCoresOverlapReclaimedCores {
 		if hardActive {

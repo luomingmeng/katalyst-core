@@ -416,8 +416,11 @@ func completePreferredCoreCPUCount(
 
 // planWholeCoreCapacityQuotas is the canonical owner of whole-core quota
 // apportionment across NUMA nodes. It preserves each NUMA minimum, rounds only
-// residual capacity to physical-core width, and deterministically balances
-// additional cores toward the preferred distribution.
+// residual capacity to physical-core width, and gives the next core to the
+// currently smallest quota. preferredByNUMA is deliberately only a tie-breaker
+// between equal quotas, so an already core-aligned historical placement cannot
+// preserve cross-NUMA imbalance. enforceSaturation verifies that no legal
+// one-core transfer can improve the resulting capacity-aware balance.
 func planWholeCoreCapacityQuotas(
 	quantity, coreWidth int,
 	numaIDs []int,
@@ -862,6 +865,11 @@ func expandSteadyFakeNUMAReclaimPhase(
 			realMandatoryPreferred = realMandatoryPreferred.Union(descriptor.OldPreferred)
 		}
 	}
+	// Real-NUMA reclaim descriptors and committed steady exclusive DNB
+	// allocations already have a finalized NUMA owner. Exclude those NUMAs from
+	// the fake block instead of treating their CPUs as movable balance capacity.
+	// skipNUMAs is state-derived by SteadyExclusiveNUMAs; a shared-core pod's
+	// numa_exclusive annotation alone must not exclude a NUMA.
 	excludedNUMAs := realMandatoryNUMAs.Union(skipNUMAs)
 	fakeEligible := fake.Eligible.Intersection(available).Difference(
 		topology.CPUDetails.CPUsInNUMANodes(excludedNUMAs.List()...))

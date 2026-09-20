@@ -450,7 +450,11 @@ func EvaluateFrozenBoundary(
 		ctx,
 		driver,
 		dag,
-		SnapshotRequest{Purpose: ScanForPlan, AffectedRels: boundary.Roots},
+		SnapshotRequest{
+			Purpose:                ScanForPlan,
+			AffectedRels:           boundary.Roots,
+			CollectDormantActivity: expected != nil && !expected.Capabilities.EmptyConfiguredCPUSet,
+		},
 		budget,
 		nil,
 		frozenBoundaryRetirementAuthorizations(boundary),

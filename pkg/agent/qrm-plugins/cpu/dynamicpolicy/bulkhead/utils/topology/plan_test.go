@@ -586,6 +586,518 @@ func TestV2PlannerEmptyTargetNormalConvergenceUsesConfiguredCPUs(t *testing.T) {
 	}
 }
 
+func TestMaterializeTargetsClassifiesOnlyV1EmptyReclaimBucketsAsDormant(t *testing.T) {
+	t.Parallel()
+
+	allCPUs := machine.MustParse("0-7")
+	dag := mustPlanDAG(t, []NodeSpec{
+		{Rel: "primary", Role: TopoNodeRolePrimary, Domain: DomainPrimary, CPUs: machine.MustParse("0-3"), Mems: "0-3", TrustAnchor: true},
+		{Rel: "reclaim", Role: TopoNodeRoleReclaim, Domain: DomainReclaim, CPUs: machine.MustParse("4-7"), Mems: "0-3", TrustAnchor: true},
+		{Rel: "reclaim/sibling", ParentRel: "reclaim", Role: TopoNodeRoleReclaimSibling, Domain: DomainReclaim, CPUs: machine.NewCPUSet(), Mems: "0-3"},
+		{Rel: "reclaim/numa-0", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket, Domain: DomainReclaim, CPUs: machine.NewCPUSet(), Mems: "0", Constraint: TopologyConstraint{CPUUpperBound: machine.MustParse("0-1")}, Metadata: map[string]string{"numa": "0"}},
+		{Rel: "reclaim/numa-1", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket, Domain: DomainReclaim, CPUs: machine.NewCPUSet(), Mems: "1", Constraint: TopologyConstraint{CPUUpperBound: machine.MustParse("2-3")}, Metadata: map[string]string{"numa": "1"}},
+		{Rel: "reclaim/numa-2", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket, Domain: DomainReclaim, CPUs: machine.MustParse("4-5"), Mems: "2", Constraint: TopologyConstraint{CPUUpperBound: machine.MustParse("4-5")}, Metadata: map[string]string{"numa": "2"}},
+		{Rel: "reclaim/numa-3", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket, Domain: DomainReclaim, CPUs: machine.MustParse("6-7"), Mems: "3", Constraint: TopologyConstraint{CPUUpperBound: machine.MustParse("6-7")}, Metadata: map[string]string{"numa": "3"}},
+	})
+	snapshot := planSnapshot(map[string]EntryState{
+		"primary":         {Identity: CgroupIdentity{Inode: 1}, CPUs: machine.MustParse("0-3"), Mems: "0-3"},
+		"reclaim":         {Identity: CgroupIdentity{Inode: 2}, CPUs: machine.MustParse("4-7"), Mems: "0-3"},
+		"reclaim/sibling": {Identity: CgroupIdentity{Inode: 7}, CPUs: machine.MustParse("4-7"), Mems: "0-3"},
+		"reclaim/numa-0":  {Identity: CgroupIdentity{Inode: 3}, CPUs: allCPUs, Mems: "0", Activity: CgroupActivity{TasksEmpty: true, CgroupProcsEmpty: true, Childless: true}},
+		"reclaim/numa-1":  {Identity: CgroupIdentity{Inode: 4}, CPUs: allCPUs, Mems: "1", Activity: CgroupActivity{TasksEmpty: true, CgroupProcsEmpty: true, Childless: true}},
+		"reclaim/numa-2":  {Identity: CgroupIdentity{Inode: 5}, CPUs: machine.MustParse("4-5"), Mems: "2"},
+		"reclaim/numa-3":  {Identity: CgroupIdentity{Inode: 6}, CPUs: machine.MustParse("6-7"), Mems: "3"},
+	}, map[DomainID]machine.CPUSet{
+		DomainPrimary: machine.MustParse("0-3"),
+		DomainReclaim: allCPUs,
+	})
+	snapshot.DomainByRel = map[string]DomainID{
+		"primary": DomainPrimary, "reclaim": DomainReclaim,
+		"reclaim/sibling": DomainReclaim,
+		"reclaim/numa-0":  DomainReclaim, "reclaim/numa-1": DomainReclaim,
+		"reclaim/numa-2": DomainReclaim, "reclaim/numa-3": DomainReclaim,
+	}
+	snapshot.Children = map[string][]ChildRef{
+		"reclaim/numa-0": nil,
+		"reclaim/numa-1": nil,
+	}
+	v1 := materializeTargets(dag, snapshot, false, desiredTargets(dag))
+	if _, dormant := v1.DormantRels["reclaim/sibling"]; dormant {
+		t.Fatal("empty reclaim sibling was classified dormant; only reclaim NUMA buckets may be dormant")
+	}
+	for _, rel := range []string{"reclaim/numa-0", "reclaim/numa-1"} {
+		if _, dormant := v1.DormantRels[rel]; !dormant {
+			t.Fatalf("v1 rel %q was not classified dormant", rel)
+		}
+		if got := v1.PhysicalByRel[rel]; !got.Equals(allCPUs) {
+			t.Fatalf("v1 dormant rel %q physical target = %s, want observed envelope %s", rel, got.String(), allCPUs.String())
+		}
+		if !v1.SemanticByRel[rel].IsEmpty() {
+			t.Fatalf("v1 dormant rel %q semantic target = %s, want empty", rel, v1.SemanticByRel[rel].String())
+		}
+	}
+	if got, want := v1.Snapshot.DomainUnion[DomainReclaim], machine.MustParse("4-7"); !got.Equals(want) {
+		t.Fatalf("v1 reclaim ownership = %s, want %s without dormant observations", got.String(), want.String())
+	}
+	if got, want := v1.PhysicalByRel["primary"], machine.MustParse("0-3"); !got.Equals(want) {
+		t.Fatalf("v1 primary target = %s, want %s without dormant deduction", got.String(), want.String())
+	}
+	for _, rel := range []string{"reclaim/numa-2", "reclaim/numa-3"} {
+		if _, dormant := v1.DormantRels[rel]; dormant {
+			t.Fatalf("active v1 rel %q was classified dormant", rel)
+		}
+		if got, want := v1.PhysicalByRel[rel], dag.index[rel].CPUs; !got.Equals(want) {
+			t.Fatalf("active v1 rel %q physical target = %s, want %s", rel, got.String(), want.String())
+		}
+	}
+
+	v2 := materializeTargets(dag, snapshot, true, desiredTargets(dag))
+	if len(v2.DormantRels) != 0 {
+		t.Fatalf("v2 dormant rels = %v, want none", v2.DormantRels)
+	}
+	if got := v2.PhysicalByRel["reclaim/numa-0"]; !got.IsEmpty() {
+		t.Fatalf("v2 empty physical target = %s, want unchanged empty target", got.String())
+	}
+	if got := v2.Snapshot.DomainUnion[DomainReclaim]; !got.Equals(allCPUs) {
+		t.Fatalf("v2 reclaim ownership = %s, want observed %s", got.String(), allCPUs.String())
+	}
+}
+
+func TestMaterializeTargetsKeepsLegalV1FourNUMAParentChildContainment(t *testing.T) {
+	t.Parallel()
+
+	allCPUs := machine.MustParse("0-7")
+	dag := mustPlanDAG(t, []NodeSpec{
+		{Rel: "primary", Role: TopoNodeRolePrimary, Domain: DomainPrimary, CPUs: machine.MustParse("0-3"), Mems: "0-3", TrustAnchor: true},
+		{Rel: "reclaim", Role: TopoNodeRoleReclaim, Domain: DomainReclaim, CPUs: machine.MustParse("4-7"), Mems: "0-3", TrustAnchor: true},
+		{
+			Rel: "reclaim/numa-0", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket,
+			Domain: DomainReclaim, CPUs: machine.NewCPUSet(), Mems: "0",
+			Constraint: TopologyConstraint{CPUUpperBound: machine.MustParse("0-1")},
+		},
+		{
+			Rel: "reclaim/numa-1", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket,
+			Domain: DomainReclaim, CPUs: machine.NewCPUSet(), Mems: "1",
+			Constraint: TopologyConstraint{CPUUpperBound: machine.MustParse("2-3")},
+		},
+		{
+			Rel: "reclaim/numa-2", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket,
+			Domain: DomainReclaim, CPUs: machine.MustParse("4-5"), Mems: "2",
+			Constraint: TopologyConstraint{CPUUpperBound: machine.MustParse("4-5")},
+		},
+		{
+			Rel: "reclaim/numa-3", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket,
+			Domain: DomainReclaim, CPUs: machine.MustParse("6-7"), Mems: "3",
+			Constraint: TopologyConstraint{CPUUpperBound: machine.MustParse("6-7")},
+		},
+	})
+	inactive := CgroupActivity{TasksEmpty: true, CgroupProcsEmpty: true, Childless: true}
+	snapshot := planSnapshot(map[string]EntryState{
+		"primary":        {Identity: CgroupIdentity{Inode: 1}, CPUs: machine.MustParse("0-3"), Mems: "0-3"},
+		"reclaim":        {Identity: CgroupIdentity{Inode: 2}, CPUs: allCPUs, Mems: "0-3"},
+		"reclaim/numa-0": {Identity: CgroupIdentity{Inode: 3}, CPUs: allCPUs, Mems: "0", Activity: inactive},
+		"reclaim/numa-1": {Identity: CgroupIdentity{Inode: 4}, CPUs: allCPUs, Mems: "1", Activity: inactive},
+		"reclaim/numa-2": {Identity: CgroupIdentity{Inode: 5}, CPUs: machine.MustParse("4-5"), Mems: "2"},
+		"reclaim/numa-3": {Identity: CgroupIdentity{Inode: 6}, CPUs: machine.MustParse("6-7"), Mems: "3"},
+	}, map[DomainID]machine.CPUSet{
+		DomainPrimary: machine.MustParse("0-3"),
+		DomainReclaim: allCPUs,
+	})
+	snapshot.DomainByRel = map[string]DomainID{
+		"primary": DomainPrimary, "reclaim": DomainReclaim,
+		"reclaim/numa-0": DomainReclaim, "reclaim/numa-1": DomainReclaim,
+		"reclaim/numa-2": DomainReclaim, "reclaim/numa-3": DomainReclaim,
+	}
+	snapshot.Children = map[string][]ChildRef{
+		"reclaim/numa-0": nil,
+		"reclaim/numa-1": nil,
+	}
+
+	materialized := materializeTargets(dag, snapshot, false, desiredTargets(dag))
+
+	if got, want := materialized.SemanticByRel["reclaim"], machine.MustParse("4-7"); !got.Equals(want) {
+		t.Fatalf("semantic reclaim target = %s, want %s", got.String(), want.String())
+	}
+	if got, want := materialized.Snapshot.DomainUnion[DomainReclaim], machine.MustParse("4-7"); !got.Equals(want) {
+		t.Fatalf("reclaim ownership = %s, want semantic ownership %s", got.String(), want.String())
+	}
+	for _, rel := range []string{"reclaim/numa-0", "reclaim/numa-1"} {
+		if got := materialized.PhysicalByRel[rel]; !got.Equals(allCPUs) {
+			t.Fatalf("physical dormant target %q = %s, want observed envelope %s", rel, got.String(), allCPUs.String())
+		}
+	}
+	if got := materialized.PhysicalByRel["reclaim"]; !got.Equals(allCPUs) {
+		t.Fatalf("physical reclaim parent target = %s, want child-containing envelope %s", got.String(), allCPUs.String())
+	}
+	if overlap := desiredDomainUnions(dag, materialized.SemanticByRel)[DomainPrimary].
+		Intersection(desiredDomainUnions(dag, materialized.SemanticByRel)[DomainReclaim]); !overlap.IsEmpty() {
+		t.Fatalf("semantic ownership overlap = %s, want none", overlap.String())
+	}
+}
+
+func TestMaterializeTargetsRequiresInactivePhysicalSubtreeProof(t *testing.T) {
+	t.Parallel()
+
+	dag := mustPlanDAG(t, []NodeSpec{
+		{Rel: "reclaim", Role: TopoNodeRoleReclaim, Domain: DomainReclaim, CPUs: machine.MustParse("2-3"), Mems: "0", TrustAnchor: true},
+		{Rel: "reclaim/numa-0", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket, Domain: DomainReclaim, CPUs: machine.NewCPUSet(), Mems: "0"},
+	})
+	inactive := CgroupActivity{TasksEmpty: true, CgroupProcsEmpty: true, Childless: true}
+	for _, tc := range []struct {
+		name    string
+		entries map[string]EntryState
+		dormant bool
+	}{
+		{
+			name: "childless leaf inactive",
+			entries: map[string]EntryState{
+				"reclaim":        {Identity: CgroupIdentity{Inode: 1}, CPUs: machine.MustParse("2-3"), Activity: inactive},
+				"reclaim/numa-0": {Identity: CgroupIdentity{Inode: 2}, CPUs: machine.MustParse("0-3"), Activity: inactive},
+			},
+			dormant: true,
+		},
+		{
+			name: "inactive bucket still has child",
+			entries: map[string]EntryState{
+				"reclaim":                {Identity: CgroupIdentity{Inode: 1}, CPUs: machine.MustParse("2-3"), Activity: inactive},
+				"reclaim/numa-0":         {Identity: CgroupIdentity{Inode: 2}, CPUs: machine.MustParse("0-3"), Activity: inactive},
+				"reclaim/numa-0/runtime": {Identity: CgroupIdentity{Inode: 3}, CPUs: machine.MustParse("0-1"), Activity: inactive},
+			},
+		},
+		{
+			name: "bucket has tasks",
+			entries: map[string]EntryState{
+				"reclaim":        {Identity: CgroupIdentity{Inode: 1}, CPUs: machine.MustParse("2-3"), Activity: inactive},
+				"reclaim/numa-0": {Identity: CgroupIdentity{Inode: 2}, CPUs: machine.MustParse("0-3"), Activity: CgroupActivity{CgroupProcsEmpty: true}},
+			},
+		},
+		{
+			name: "dynamic descendant has cgroup procs",
+			entries: map[string]EntryState{
+				"reclaim":                {Identity: CgroupIdentity{Inode: 1}, CPUs: machine.MustParse("2-3"), Activity: inactive},
+				"reclaim/numa-0":         {Identity: CgroupIdentity{Inode: 2}, CPUs: machine.MustParse("0-3"), Activity: inactive},
+				"reclaim/numa-0/runtime": {Identity: CgroupIdentity{Inode: 3}, CPUs: machine.MustParse("0-1"), Activity: CgroupActivity{TasksEmpty: true}},
+			},
+		},
+		{
+			name: "activity was not proved",
+			entries: map[string]EntryState{
+				"reclaim":        {Identity: CgroupIdentity{Inode: 1}, CPUs: machine.MustParse("2-3"), Activity: inactive},
+				"reclaim/numa-0": {Identity: CgroupIdentity{Inode: 2}, CPUs: machine.MustParse("0-3")},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := planSnapshot(tc.entries, map[DomainID]machine.CPUSet{DomainReclaim: machine.MustParse("0-3")})
+			snapshot.DomainByRel = make(map[string]DomainID, len(tc.entries))
+			for rel := range tc.entries {
+				snapshot.DomainByRel[rel] = DomainReclaim
+			}
+			snapshot.Children = map[string][]ChildRef{
+				"reclaim/numa-0": nil,
+			}
+			if _, hasRuntime := tc.entries["reclaim/numa-0/runtime"]; hasRuntime {
+				snapshot.Children["reclaim/numa-0"] = []ChildRef{{
+					Name: "runtime", Identity: tc.entries["reclaim/numa-0/runtime"].Identity,
+				}}
+				snapshot.Children["reclaim/numa-0/runtime"] = nil
+			}
+			got := materializeTargets(dag, snapshot, false, desiredTargets(dag))
+			_, dormant := got.DormantRels["reclaim/numa-0"]
+			if dormant != tc.dormant {
+				t.Fatalf("dormant = %v, want %v", dormant, tc.dormant)
+			}
+		})
+	}
+}
+
+func TestDormantReclaimBucketRequiresChildlessLeafAndBindsObservedCPUSet(t *testing.T) {
+	t.Parallel()
+
+	const rel = "reclaim/numa-0"
+	dag := mustPlanDAG(t, []NodeSpec{
+		{Rel: "reclaim", Role: TopoNodeRoleReclaim, Domain: DomainReclaim, CPUs: machine.MustParse("2-3")},
+		{Rel: rel, ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket, Domain: DomainReclaim, CPUs: machine.NewCPUSet()},
+	})
+	inactiveLeaf := CgroupActivity{TasksEmpty: true, CgroupProcsEmpty: true, Childless: true}
+	base := planSnapshot(map[string]EntryState{
+		"reclaim": {Identity: CgroupIdentity{Device: 1, Inode: 1}, CPUs: machine.MustParse("2-3")},
+		rel: {
+			Identity: CgroupIdentity{Device: 1, Inode: 2},
+			CPUs:     machine.MustParse("0-3"),
+			Activity: inactiveLeaf,
+		},
+	}, map[DomainID]machine.CPUSet{DomainReclaim: machine.MustParse("0-3")})
+	base.DomainByRel = map[string]DomainID{"reclaim": DomainReclaim, rel: DomainReclaim}
+	base.Children = map[string][]ChildRef{rel: nil}
+
+	materialized := materializeTargets(dag, base, false, desiredTargets(dag))
+	proof, dormant := materialized.DormantProofs[rel]
+	if !dormant {
+		t.Fatal("childless inactive reclaim NUMA bucket was not dormant")
+	}
+	if !proof.ObservedCPUs.Equals(machine.MustParse("0-3")) {
+		t.Fatalf("proof cpuset = %s, want observed 0-3", proof.ObservedCPUs.String())
+	}
+
+	withChild := *base
+	withChild.Children = map[string][]ChildRef{
+		rel: {{Name: "runtime", Identity: CgroupIdentity{Device: 1, Inode: 3}}},
+	}
+	entry := withChild.Entries[rel]
+	entry.Activity.Childless = false
+	withChild.Entries = map[string]EntryState{"reclaim": base.Entries["reclaim"], rel: entry}
+	if got := materializeTargets(dag, &withChild, false, desiredTargets(dag)); len(got.DormantRels) != 0 {
+		t.Fatalf("bucket with child classified dormant: %v", got.DormantRels)
+	}
+
+	fresh := *base
+	fresh.Entries = map[string]EntryState{"reclaim": base.Entries["reclaim"], rel: base.Entries[rel]}
+	changed := fresh.Entries[rel]
+	changed.CPUs = machine.MustParse("0-2")
+	fresh.Entries[rel] = changed
+	if err := validateDormantProofs(&fresh, materialized.DormantProofs); !errors.Is(err, ErrCoordinatorPlanStale) {
+		t.Fatalf("cpuset drift validation error = %v, want ErrCoordinatorPlanStale", err)
+	}
+}
+
+func TestDormantReclaimBucketRequiresNoNewSemanticPrimaryOwnership(t *testing.T) {
+	t.Parallel()
+
+	const rel = "reclaim/numa-0"
+	dag := mustPlanDAG(t, []NodeSpec{
+		{Rel: "primary", Role: TopoNodeRolePrimary, Domain: DomainPrimary, CPUs: machine.MustParse("0-1")},
+		{Rel: "reclaim", Role: TopoNodeRoleReclaim, Domain: DomainReclaim, CPUs: machine.MustParse("2-3")},
+		{
+			Rel: rel, ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket,
+			Domain: DomainReclaim, CPUs: machine.NewCPUSet(),
+			Constraint: TopologyConstraint{CPUUpperBound: machine.MustParse("0-3")},
+		},
+	})
+	inactive := CgroupActivity{TasksEmpty: true, CgroupProcsEmpty: true, Childless: true}
+	snapshot := planSnapshot(map[string]EntryState{
+		"primary": {Identity: CgroupIdentity{Inode: 1}, CPUs: machine.MustParse("0-1")},
+		"reclaim": {Identity: CgroupIdentity{Inode: 2}, CPUs: machine.MustParse("0-3")},
+		rel:       {Identity: CgroupIdentity{Inode: 3}, CPUs: machine.MustParse("0-3"), Activity: inactive},
+	}, map[DomainID]machine.CPUSet{
+		DomainPrimary: machine.MustParse("0-1"),
+		DomainReclaim: machine.MustParse("0-3"),
+	})
+	snapshot.DomainByRel = map[string]DomainID{
+		"primary": DomainPrimary, "reclaim": DomainReclaim, rel: DomainReclaim,
+	}
+	snapshot.Children = map[string][]ChildRef{rel: nil}
+
+	materialized := materializeTargets(dag, snapshot, false, desiredTargets(dag))
+	if _, dormant := materialized.DormantRels[rel]; dormant {
+		t.Fatal("bucket was dormant even though observed CPUs inside its upper bound include non-primary semantic ownership")
+	}
+}
+
+func TestMaterializeTargetsRejectsDormantProofTruncatedByTraversalBoundary(t *testing.T) {
+	dag := mustPlanDAG(t, []NodeSpec{
+		{Rel: "reclaim", Role: TopoNodeRoleReclaim, Domain: DomainReclaim, CPUs: machine.MustParse("2-3"), Mems: "0", TrustAnchor: true},
+		{Rel: "reclaim/numa-0", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket, Domain: DomainReclaim, CPUs: machine.NewCPUSet(), Mems: "0"},
+	})
+	inactive := CgroupActivity{TasksEmpty: true, CgroupProcsEmpty: true}
+	driver := newFakeHierarchyDriver()
+	driver.add("reclaim", CgroupIdentity{Device: 1, Inode: 1}, "2-3", "0")
+	driver.add("reclaim/numa-0", CgroupIdentity{Device: 1, Inode: 2}, "0-3", "0")
+	driver.add("reclaim/numa-0/runtime", CgroupIdentity{Device: 1, Inode: 3}, "0-3", "0")
+	driver.add("reclaim/numa-0/runtime/busy", CgroupIdentity{Device: 1, Inode: 4}, "0-1", "0")
+	driver.nodes["reclaim"].activity = inactive
+	driver.nodes["reclaim/numa-0"].activity = inactive
+	driver.nodes["reclaim/numa-0/runtime"].activity = inactive
+	driver.nodes["reclaim/numa-0/runtime/busy"].activity = CgroupActivity{
+		TasksEmpty:       false,
+		CgroupProcsEmpty: false,
+	}
+
+	snapshot, err := buildCompleteSnapshot(
+		context.Background(),
+		driver,
+		dag,
+		SnapshotRequest{
+			Purpose:                ScanForPlan,
+			AffectedRels:           []string{"reclaim/numa-0"},
+			CollectDormantActivity: true,
+		},
+		NewBudgetTracker(ConvergenceBudget{}),
+		map[string]struct{}{"reclaim/numa-0/runtime": {}},
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("buildCompleteSnapshot() error = %v", err)
+	}
+	if _, scanned := snapshot.Entries["reclaim/numa-0/runtime"]; scanned {
+		t.Fatal("snapshot crossed traversal boundary")
+	}
+
+	materialized := materializeTargets(dag, snapshot, false, desiredTargets(dag))
+	if _, dormant := materialized.DormantRels["reclaim/numa-0"]; dormant {
+		t.Fatal("truncated subtree produced a dormant proof despite a busy descendant behind the traversal boundary")
+	}
+}
+
+func TestDormantProofRevalidationRejectsActivityIdentityAndChildChanges(t *testing.T) {
+	t.Parallel()
+
+	inactive := CgroupActivity{TasksEmpty: true, CgroupProcsEmpty: true, Childless: true}
+	base := &CompleteSnapshot{Entries: map[string]EntryState{
+		"reclaim/numa-0": {Identity: CgroupIdentity{Device: 1, Inode: 1}, CPUs: machine.MustParse("0-3"), Activity: inactive},
+	}, Children: map[string][]ChildRef{
+		"reclaim/numa-0": nil,
+	}}
+	proof, ok := dormantLeafProof(base, "reclaim/numa-0")
+	if !ok {
+		t.Fatal("dormantSubtreeProof() rejected inactive leaf")
+	}
+	if err := validateDormantProofs(base, map[string]DormantLeafProof{"reclaim/numa-0": proof}); err != nil {
+		t.Fatalf("validateDormantProofs(base) error = %v", err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(map[string]EntryState)
+	}{
+		{
+			name: "root becomes active",
+			mutate: func(entries map[string]EntryState) {
+				entry := entries["reclaim/numa-0"]
+				entry.Activity.TasksEmpty = false
+				entries["reclaim/numa-0"] = entry
+			},
+		},
+		{
+			name: "leaf ABA replacement",
+			mutate: func(entries map[string]EntryState) {
+				entry := entries["reclaim/numa-0"]
+				entry.Identity.Inode++
+				entries["reclaim/numa-0"] = entry
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fresh := &CompleteSnapshot{
+				Entries:  make(map[string]EntryState, len(base.Entries)),
+				Children: base.Children,
+			}
+			for rel, entry := range base.Entries {
+				fresh.Entries[rel] = entry
+			}
+			tc.mutate(fresh.Entries)
+			err := validateDormantProofs(fresh, map[string]DormantLeafProof{"reclaim/numa-0": proof})
+			if !errors.Is(err, ErrCoordinatorPlanStale) {
+				t.Fatalf("validateDormantProofs() error = %v, want ErrCoordinatorPlanStale", err)
+			}
+		})
+	}
+}
+
+func TestDormantProofRevalidationRejectsMissingFreshChildClosure(t *testing.T) {
+	t.Parallel()
+
+	inactive := CgroupActivity{TasksEmpty: true, CgroupProcsEmpty: true, Childless: true}
+	base := &CompleteSnapshot{
+		Entries: map[string]EntryState{
+			"reclaim/numa-0": {Identity: CgroupIdentity{Device: 1, Inode: 1}, Activity: inactive},
+		},
+		Children: map[string][]ChildRef{
+			"reclaim/numa-0": nil,
+		},
+	}
+	proof, ok := dormantLeafProof(base, "reclaim/numa-0")
+	if !ok {
+		t.Fatal("dormantSubtreeProof() rejected complete inactive leaf")
+	}
+	fresh := &CompleteSnapshot{
+		Entries:  base.Entries,
+		Children: map[string][]ChildRef{},
+	}
+	err := validateDormantProofs(fresh, map[string]DormantLeafProof{"reclaim/numa-0": proof})
+	if !errors.Is(err, ErrCoordinatorPlanStale) {
+		t.Fatalf("validateDormantProofs() error = %v, want stale truncated closure rejection", err)
+	}
+}
+
+func TestV1DormantReclaimBucketsProduceNoWrites(t *testing.T) {
+	t.Parallel()
+
+	dag := mustPlanDAG(t, []NodeSpec{
+		{Rel: "primary", Role: TopoNodeRolePrimary, Domain: DomainPrimary, CPUs: machine.MustParse("0-3"), Mems: "0-3", TrustAnchor: true},
+		{Rel: "reclaim", Role: TopoNodeRoleReclaim, Domain: DomainReclaim, CPUs: machine.MustParse("4-7"), Mems: "0-3", TrustAnchor: true},
+		{Rel: "reclaim/numa-0", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket, Domain: DomainReclaim, CPUs: machine.NewCPUSet(), Mems: "0", Constraint: TopologyConstraint{CPUUpperBound: machine.MustParse("0-1")}, Metadata: map[string]string{"numa": "0"}},
+		{Rel: "reclaim/numa-1", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket, Domain: DomainReclaim, CPUs: machine.NewCPUSet(), Mems: "1", Constraint: TopologyConstraint{CPUUpperBound: machine.MustParse("2-3")}, Metadata: map[string]string{"numa": "1"}},
+		{Rel: "reclaim/numa-2", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket, Domain: DomainReclaim, CPUs: machine.MustParse("4-5"), Mems: "2", Constraint: TopologyConstraint{CPUUpperBound: machine.MustParse("4-5")}, Metadata: map[string]string{"numa": "2"}},
+		{Rel: "reclaim/numa-3", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket, Domain: DomainReclaim, CPUs: machine.MustParse("6-7"), Mems: "3", Constraint: TopologyConstraint{CPUUpperBound: machine.MustParse("6-7")}, Metadata: map[string]string{"numa": "3"}},
+	})
+	snapshot := planSnapshot(map[string]EntryState{
+		"primary":        {Identity: CgroupIdentity{Inode: 1}, CPUs: machine.MustParse("0-3"), Mems: "0-3"},
+		"reclaim":        {Identity: CgroupIdentity{Inode: 2}, CPUs: machine.MustParse("4-7"), Mems: "0-3"},
+		"reclaim/numa-0": {Identity: CgroupIdentity{Inode: 3}, CPUs: machine.MustParse("0-7"), Mems: "0", Activity: CgroupActivity{TasksEmpty: true, CgroupProcsEmpty: true, Childless: true}},
+		"reclaim/numa-1": {Identity: CgroupIdentity{Inode: 4}, CPUs: machine.MustParse("0-7"), Mems: "1", Activity: CgroupActivity{TasksEmpty: true, CgroupProcsEmpty: true, Childless: true}},
+		"reclaim/numa-2": {Identity: CgroupIdentity{Inode: 5}, CPUs: machine.MustParse("4-5"), Mems: "2"},
+		"reclaim/numa-3": {Identity: CgroupIdentity{Inode: 6}, CPUs: machine.MustParse("6-7"), Mems: "3"},
+	}, map[DomainID]machine.CPUSet{
+		DomainPrimary: machine.MustParse("0-3"),
+		DomainReclaim: machine.MustParse("0-7"),
+	})
+	snapshot.DomainByRel = map[string]DomainID{
+		"primary": DomainPrimary, "reclaim": DomainReclaim,
+		"reclaim/numa-0": DomainReclaim, "reclaim/numa-1": DomainReclaim,
+		"reclaim/numa-2": DomainReclaim, "reclaim/numa-3": DomainReclaim,
+	}
+	snapshot.Children = map[string][]ChildRef{
+		"reclaim/numa-0": nil,
+		"reclaim/numa-1": nil,
+	}
+	materialized := materializeTargets(dag, snapshot, false, desiredTargets(dag))
+	cpuDetails := machine.CPUDetails{
+		0: {NUMANodeID: 0}, 1: {NUMANodeID: 0},
+		2: {NUMANodeID: 1}, 3: {NUMANodeID: 1},
+		4: {NUMANodeID: 2}, 5: {NUMANodeID: 2},
+		6: {NUMANodeID: 3}, 7: {NUMANodeID: 3},
+	}
+	for _, phase := range []PhaseKind{PhaseDrain, PhaseExpand} {
+		plan, err := BuildPhasePlan(PhasePlanInput{
+			Kind: phase, DAG: dag, Snapshot: materialized.Snapshot,
+			DesiredByRel:  materialized.PhysicalByRel,
+			SemanticByRel: materialized.SemanticByRel,
+			DormantRels:   materialized.DormantRels,
+			AllowedCPUs:   machine.MustParse("0-7"),
+			Capabilities:  cgroupV1Policy.capabilities(true),
+			CPUDetails:    cpuDetails,
+			Budget:        NewBudgetTracker(ConvergenceBudget{}),
+		})
+		if err != nil {
+			t.Fatalf("BuildPhasePlan(%s): %v", phase, err)
+		}
+		for rel, want := range map[string]machine.CPUSet{
+			"primary": machine.MustParse("0-3"),
+			"reclaim": func() machine.CPUSet {
+				if phase == PhaseExpand {
+					return machine.MustParse("0-7")
+				}
+				return machine.MustParse("4-7")
+			}(),
+		} {
+			if got := plan.TargetByRel[rel].CPUs; !got.Equals(want) {
+				t.Fatalf("%s target for %q = %s, want %s", phase, rel, got.String(), want.String())
+			}
+		}
+		for rel := range materialized.DormantRels {
+			if _, targeted := plan.TargetByRel[rel]; targeted {
+				t.Fatalf("%s dormant rel %q received a physical plan target", phase, rel)
+			}
+		}
+		for _, operation := range plan.Operations {
+			if _, dormant := materialized.DormantRels[operation.Rel]; dormant {
+				t.Fatalf("%s dormant rel %q received operation %+v", phase, operation.Rel, operation)
+			}
+		}
+	}
+}
+
 func TestV2PlannerNonEmptyConfiguredCPUsEmitsOneClearOperation(t *testing.T) {
 	t.Parallel()
 
@@ -2370,25 +2882,24 @@ func TestDrainPlanConfinesFullResetBucketToNUMAUpperBound(t *testing.T) {
 	}
 }
 
-func TestV1PlannerPreservesNonEmptyReclaimBucketWhenDesiredIsEmpty(t *testing.T) {
+func TestV1PlannerRejectsActiveReclaimBucketWithEmptyTarget(t *testing.T) {
 	t.Parallel()
 
 	allCPUs := machine.NewCPUSet(0, 1, 2, 3)
 	bucket0 := machine.NewCPUSet(0, 1)
 	bucket1 := machine.NewCPUSet(2, 3)
-	currentBucket0 := machine.NewCPUSet(0)
 	dag := mustPlanDAG(t, []NodeSpec{
-		{Rel: "kubepods", Domain: DomainPrimary, Role: TopoNodeRolePrimary, CPUs: allCPUs, Mems: "0-1", TrustAnchor: true},
-		{Rel: "kubesandbox", Domain: DomainReclaim, Role: TopoNodeRoleReclaimSibling, CPUs: allCPUs, Mems: "0-1", TrustAnchor: true},
+		{Rel: "primary", Domain: DomainPrimary, Role: TopoNodeRolePrimary, CPUs: allCPUs, Mems: "0-1", TrustAnchor: true},
+		{Rel: "reclaim", Domain: DomainReclaim, Role: TopoNodeRoleReclaimSibling, CPUs: bucket1, Mems: "0-1", TrustAnchor: true},
 		{
-			Rel: "kubesandbox/reclaimed-0", ParentRel: "kubesandbox", Domain: DomainReclaim,
-			Role: TopoNodeRoleReclaimNUMABucket, CPUs: bucket0, Mems: "0",
+			Rel: "reclaim/bucket-0", ParentRel: "reclaim", Domain: DomainReclaim,
+			Role: TopoNodeRoleReclaimNUMABucket, CPUs: machine.NewCPUSet(), Mems: "0",
 			Constraint: TopologyConstraint{
 				CPUUpperBound: bucket0, MemUpperBound: machine.NewCPUSet(0), Scope: TopologyScopeNUMANode,
 			},
 		},
 		{
-			Rel: "kubesandbox/reclaimed-1", ParentRel: "kubesandbox", Domain: DomainReclaim,
+			Rel: "reclaim/bucket-1", ParentRel: "reclaim", Domain: DomainReclaim,
 			Role: TopoNodeRoleReclaimNUMABucket, CPUs: bucket1, Mems: "1",
 			Constraint: TopologyConstraint{
 				CPUUpperBound: bucket1, MemUpperBound: machine.NewCPUSet(1), Scope: TopologyScopeNUMANode,
@@ -2396,38 +2907,33 @@ func TestV1PlannerPreservesNonEmptyReclaimBucketWhenDesiredIsEmpty(t *testing.T)
 		},
 	})
 	snapshot := planSnapshot(map[string]EntryState{
-		"kubepods":                {Identity: CgroupIdentity{Inode: 1}, CPUs: machine.NewCPUSet(2, 3), Mems: "0-1"},
-		"kubesandbox":             {Identity: CgroupIdentity{Inode: 2}, CPUs: allCPUs, Mems: "0-1"},
-		"kubesandbox/reclaimed-0": {Identity: CgroupIdentity{Inode: 3}, CPUs: currentBucket0, Mems: "0"},
-		"kubesandbox/reclaimed-1": {Identity: CgroupIdentity{Inode: 4}, CPUs: bucket1, Mems: "1"},
+		"primary":          {Identity: CgroupIdentity{Inode: 1}, CPUs: allCPUs, Mems: "0-1"},
+		"reclaim":          {Identity: CgroupIdentity{Inode: 2}, CPUs: allCPUs, Mems: "0-1"},
+		"reclaim/bucket-0": {Identity: CgroupIdentity{Inode: 3}, CPUs: bucket0, Mems: "0"},
+		"reclaim/bucket-1": {Identity: CgroupIdentity{Inode: 4}, CPUs: bucket1, Mems: "1"},
 	}, map[DomainID]machine.CPUSet{
-		DomainPrimary: machine.NewCPUSet(2, 3),
+		DomainPrimary: allCPUs,
 		DomainReclaim: allCPUs,
 	})
 
-	plan, err := BuildPhasePlan(PhasePlanInput{
+	_, err := BuildPhasePlan(PhasePlanInput{
 		Kind: PhaseDrain, DAG: dag, Snapshot: snapshot,
 		DesiredByRel: map[string]machine.CPUSet{
-			"kubepods":                allCPUs,
-			"kubesandbox":             bucket1,
-			"kubesandbox/reclaimed-0": machine.NewCPUSet(),
-			"kubesandbox/reclaimed-1": bucket1,
+			"primary":          allCPUs,
+			"reclaim":          bucket1,
+			"reclaim/bucket-0": machine.NewCPUSet(),
+			"reclaim/bucket-1": bucket1,
 		},
 		DesiredMemsByRel: map[string]string{
-			"kubepods": "0-1", "kubesandbox": "0-1",
-			"kubesandbox/reclaimed-0": "0", "kubesandbox/reclaimed-1": "1",
+			"primary": "0-1", "reclaim": "0-1",
+			"reclaim/bucket-0": "0", "reclaim/bucket-1": "1",
 		},
 		AllowedCPUs: allCPUs,
 		Budget:      NewBudgetTracker(ConvergenceBudget{}),
 	})
-	if err != nil {
-		t.Fatalf("BuildPhasePlan returned error for v1 empty reclaim bucket desired target: %v", err)
-	}
-	if got := plan.TargetByRel["kubesandbox/reclaimed-0"].CPUs; got.IsEmpty() || !got.Equals(currentBucket0) {
-		t.Fatalf("reclaimed-0 target = %s, want preserved current non-empty %s", got.String(), currentBucket0.String())
-	}
-	if got := plan.TargetByRel["kubesandbox"].CPUs; !currentBucket0.IsSubsetOf(got) {
-		t.Fatalf("kubesandbox target = %s, want it to cover preserved reclaimed-0 target %s", got.String(), currentBucket0.String())
+	var unsupported *UnsupportedEmptyTargetError
+	if !errors.As(err, &unsupported) || unsupported.Rel != "reclaim/bucket-0" {
+		t.Fatalf("BuildPhasePlan error = %T %v, want active v1 bucket empty-target rejection", err, err)
 	}
 }
 

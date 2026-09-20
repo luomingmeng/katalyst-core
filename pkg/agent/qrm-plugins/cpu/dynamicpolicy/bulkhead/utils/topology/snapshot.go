@@ -53,11 +53,12 @@ type ScanBoundary struct {
 
 // SnapshotRequest selects a purpose-specific hierarchy boundary.
 type SnapshotRequest struct {
-	Purpose      ScanPurpose
-	AffectedRels []string
-	ParentRel    string
-	SourceDomain DomainID
-	MismatchRels []string
+	Purpose                ScanPurpose
+	AffectedRels           []string
+	ParentRel              string
+	SourceDomain           DomainID
+	MismatchRels           []string
+	CollectDormantActivity bool
 }
 
 // RelObservation records whether a configured rel exists and, when present,
@@ -110,7 +111,12 @@ type UnavailableChildEvidence struct {
 	Reason   UnavailableChildReason
 }
 
-// CompleteSnapshot is the only ownership evidence accepted by the coordinator.
+// CompleteSnapshot is the only hierarchy evidence accepted by the coordinator.
+// Entries always contains the physical state observed from cgroupfs.
+// OwnershipByRel is an optional semantic overlay for cgroup v1 nodes whose
+// physical non-empty cpuset is only a containment envelope. Consumers that
+// reason about CPU ownership must use TargetProofCPUs instead of reading
+// Entries directly.
 type CompleteSnapshot struct {
 	ID                  SnapshotID
 	CapturedAt          time.Time
@@ -120,6 +126,7 @@ type CompleteSnapshot struct {
 	UnavailableChildren map[string]UnavailableChildEvidence
 	DomainByRel         map[string]DomainID
 	DomainUnion         map[DomainID]machine.CPUSet
+	OwnershipByRel      map[string]machine.CPUSet
 	ScanBoundary        ScanBoundary
 	Cost                BudgetUsage
 }
@@ -143,14 +150,15 @@ func (e *SnapshotError) Error() string {
 func (e *SnapshotError) Unwrap() error { return e.Err }
 
 type snapshotBuilder struct {
-	ctx        context.Context
-	driver     HierarchyDriver
-	budget     *BudgetTracker
-	snapshot   *CompleteSnapshot
-	controlled map[string]*TopoNode
-	selected   map[string]struct{}
-	boundaries map[string]struct{}
-	retirable  map[string]CgroupIdentity
+	ctx           context.Context
+	driver        HierarchyDriver
+	budget        *BudgetTracker
+	snapshot      *CompleteSnapshot
+	controlled    map[string]*TopoNode
+	selected      map[string]struct{}
+	boundaries    map[string]struct{}
+	retirable     map[string]CgroupIdentity
+	activityRoots map[string]struct{}
 }
 
 // BuildCompleteSnapshot returns either complete purpose-scoped evidence or a
@@ -193,6 +201,7 @@ func buildCompleteSnapshot(
 	}
 	return buildCompleteSnapshotWithBoundary(
 		ctx, driver, dag, boundary, expand, budget, boundaries, retirable,
+		request.CollectDormantActivity,
 	)
 }
 
@@ -205,15 +214,17 @@ func buildCompleteSnapshotWithBoundary(
 	budget *BudgetTracker,
 	boundaries map[string]struct{},
 	retirable map[string]CgroupIdentity,
+	collectDormantActivity bool,
 ) (*CompleteSnapshot, error) {
 	builder := &snapshotBuilder{
-		ctx:        ctx,
-		driver:     driver,
-		budget:     budget,
-		controlled: make(map[string]*TopoNode, len(dag.index)),
-		selected:   make(map[string]struct{}, len(boundary.Roots)),
-		boundaries: boundaries,
-		retirable:  retirable,
+		ctx:           ctx,
+		driver:        driver,
+		budget:        budget,
+		controlled:    make(map[string]*TopoNode, len(dag.index)),
+		selected:      make(map[string]struct{}, len(boundary.Roots)),
+		boundaries:    boundaries,
+		retirable:     retirable,
+		activityRoots: make(map[string]struct{}),
 		snapshot: &CompleteSnapshot{
 			CapturedAt:          time.Now(),
 			Capabilities:        driver.Capabilities(),
@@ -230,6 +241,11 @@ func buildCompleteSnapshotWithBoundary(
 	}
 	for rel, node := range dag.index {
 		builder.controlled[rel] = node
+		if collectDormantActivity &&
+			!builder.snapshot.Capabilities.EmptyConfiguredCPUSet &&
+			node.Role == TopoNodeRoleReclaimNUMABucket {
+			builder.activityRoots[rel] = struct{}{}
+		}
 	}
 	for _, rel := range boundary.Roots {
 		builder.selected[rel] = struct{}{}
@@ -256,11 +272,18 @@ func buildCompleteSnapshotWithBoundary(
 }
 
 // TargetProofCPUs returns the state that proves a target under the snapshot's
-// hierarchy semantics. Empty cgroup v2 targets are proved by configured state;
-// every other target is proved by effective state.
+// hierarchy semantics. Semantic ownership overlays take precedence over
+// physical cgroup state. Empty cgroup v2 targets are otherwise proved by
+// configured state; every other target is proved by effective state. Callers
+// must not bypass this method and read Entries for ownership decisions: a
+// dormant v1 envelope is intentionally present in Entries while absent from
+// semantic ownership.
 func (s *CompleteSnapshot) TargetProofCPUs(rel string, target machine.CPUSet) (machine.CPUSet, bool) {
 	if s == nil {
 		return machine.NewCPUSet(), false
+	}
+	if cpus, ok := s.OwnershipByRel[rel]; ok {
+		return cpus.Clone(), true
 	}
 	entry, ok := s.Entries[rel]
 	if !ok {
@@ -273,6 +296,25 @@ func newCompleteSnapshotSource(
 	driver HierarchyDriver,
 	dag *TopoDAG,
 	budget *BudgetTracker,
+	boundarySets ...map[string]struct{},
+) func(context.Context) (*CompleteSnapshot, error) {
+	return newCompleteSnapshotSourceWithActivity(driver, dag, budget, false, boundarySets...)
+}
+
+func newDormantCompleteSnapshotSource(
+	driver HierarchyDriver,
+	dag *TopoDAG,
+	budget *BudgetTracker,
+	boundarySets ...map[string]struct{},
+) func(context.Context) (*CompleteSnapshot, error) {
+	return newCompleteSnapshotSourceWithActivity(driver, dag, budget, true, boundarySets...)
+}
+
+func newCompleteSnapshotSourceWithActivity(
+	driver HierarchyDriver,
+	dag *TopoDAG,
+	budget *BudgetTracker,
+	collectDormantActivity bool,
 	boundarySets ...map[string]struct{},
 ) func(context.Context) (*CompleteSnapshot, error) {
 	affected := make([]string, 0, len(dag.index))
@@ -289,8 +331,9 @@ func newCompleteSnapshotSource(
 	}
 	return func(ctx context.Context) (*CompleteSnapshot, error) {
 		return buildCompleteSnapshot(ctx, driver, dag, SnapshotRequest{
-			Purpose:      ScanForPlan,
-			AffectedRels: affected,
+			Purpose:                ScanForPlan,
+			AffectedRels:           affected,
+			CollectDormantActivity: collectDormantActivity,
 		}, budget, boundaries, nil)
 	}
 }
@@ -324,7 +367,7 @@ func (b *snapshotBuilder) scan(
 	if err := b.budget.VisitNode(rel, before, depth); err != nil {
 		return false, b.fail(HierarchyOperationStat, rel, before, err)
 	}
-	entry, err := b.driver.ReadEntry(b.ctx, rel)
+	entry, err := b.readEntry(rel, before)
 	if err != nil {
 		if b.authorizedRetirement(rel, before, err) {
 			return b.confirmEarlyRetirement(rel, before, err)
@@ -540,6 +583,7 @@ func (b *snapshotBuilder) retireSubtree(rel string) {
 			delete(b.snapshot.Entries, candidate)
 			delete(b.snapshot.DomainByRel, candidate)
 			delete(b.snapshot.UnavailableChildren, candidate)
+			delete(b.snapshot.OwnershipByRel, candidate)
 		}
 	}
 	for candidate := range b.snapshot.UnavailableChildren {
@@ -582,6 +626,17 @@ func isCgroupPathAbsent(err error) bool {
 		return false
 	}
 	return errors.Is(err, syscall.ENOENT)
+}
+
+func (b *snapshotBuilder) readEntry(rel string, expected CgroupIdentity) (EntryState, error) {
+	if _, collectActivity := b.activityRoots[rel]; b.snapshot.Capabilities.EmptyConfiguredCPUSet || !collectActivity {
+		return b.driver.ReadEntry(b.ctx, rel)
+	}
+	reader, ok := b.driver.(hierarchyActivityReader)
+	if !ok {
+		return EntryState{}, fmt.Errorf("cgroup v1 activity proof is unavailable for rel %q", rel)
+	}
+	return reader.ReadEntryWithActivity(b.ctx, rel, expected)
 }
 
 func (b *snapshotBuilder) shouldSkipUnavailableController(rel string, depth int, err error) bool {
@@ -726,6 +781,21 @@ func fingerprintSnapshot(snapshot *CompleteSnapshot) SnapshotID {
 		writeHashString(hash, entry.Mems)
 		writeHashString(hash, entry.ConfiguredCPUs.String())
 		writeHashString(hash, entry.ConfiguredMems)
+		if entry.Activity.TasksEmpty {
+			writeHashUint64(hash, 1)
+		} else {
+			writeHashUint64(hash, 0)
+		}
+		if entry.Activity.CgroupProcsEmpty {
+			writeHashUint64(hash, 1)
+		} else {
+			writeHashUint64(hash, 0)
+		}
+		if entry.Activity.Childless {
+			writeHashUint64(hash, 1)
+		} else {
+			writeHashUint64(hash, 0)
+		}
 	}
 	domainRels := sortedStringKeys(snapshot.DomainByRel)
 	writeHashString(hash, "domain-by-rel")

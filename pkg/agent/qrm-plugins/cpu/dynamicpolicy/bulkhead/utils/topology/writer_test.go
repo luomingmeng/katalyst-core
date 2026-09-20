@@ -156,6 +156,30 @@ func (d *topologyFakeSnapshotDriver) ReadEntry(ctx context.Context, rel string) 
 	return EntryState{Rel: rel, Identity: identity, CPUs: cpus, Mems: mems}, nil
 }
 
+func (d *topologyFakeSnapshotDriver) ReadEntryWithActivity(
+	ctx context.Context,
+	rel string,
+	expected CgroupIdentity,
+) (EntryState, error) {
+	entry, err := d.ReadEntry(ctx, rel)
+	if err != nil {
+		return EntryState{}, err
+	}
+	if entry.Identity != expected {
+		return EntryState{}, ErrCgroupIdentityChanged
+	}
+	tasksEmpty, err := membershipFileEmpty(d.cg.files[rel]["tasks"])
+	if err != nil {
+		return EntryState{}, err
+	}
+	procsEmpty, err := membershipFileEmpty(d.cg.files[rel]["cgroup.procs"])
+	if err != nil {
+		return EntryState{}, err
+	}
+	entry.Activity = CgroupActivity{TasksEmpty: tasksEmpty, CgroupProcsEmpty: procsEmpty, Childless: true}
+	return entry, nil
+}
+
 func (d *topologyFakeSnapshotDriver) ListChildren(ctx context.Context, rel string) ([]ChildRef, error) {
 	names, err := d.cg.ListChildren(ctx, rel)
 	if err != nil {
@@ -413,6 +437,138 @@ func TestSafeWriterV2EmptyConfiguredCPUWriteRecordsSuccessfulJournal(t *testing.
 	}
 	if !roundOutcomeMadeNetProgress(RoundOutcome{Journal: result.Journal}) {
 		t.Fatal("verified empty configured CPU write must count as progress")
+	}
+}
+
+func TestV1FourNUMAWriterSkipsDormantBucketsAndWritesActiveBuckets(t *testing.T) {
+	dag := mustPlanDAG(t, []NodeSpec{
+		{Rel: "reclaim", Role: TopoNodeRoleReclaim, Domain: DomainReclaim, CPUs: machine.MustParse("4-7"), Mems: "0-3", TrustAnchor: true},
+		{Rel: "reclaim/numa-0", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket, Domain: DomainReclaim, CPUs: machine.NewCPUSet(), Mems: "0"},
+		{Rel: "reclaim/numa-1", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket, Domain: DomainReclaim, CPUs: machine.NewCPUSet(), Mems: "1"},
+		{Rel: "reclaim/numa-2", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket, Domain: DomainReclaim, CPUs: machine.NewCPUSet(4, 7), Mems: "2"},
+		{Rel: "reclaim/numa-3", ParentRel: "reclaim", Role: TopoNodeRoleReclaimNUMABucket, Domain: DomainReclaim, CPUs: machine.NewCPUSet(5, 6), Mems: "3"},
+	})
+	inactive := CgroupActivity{TasksEmpty: true, CgroupProcsEmpty: true, Childless: true}
+	driver := newFakeHierarchyDriver()
+	driver.add("reclaim", CgroupIdentity{Device: 1, Inode: 1}, "0-7", "0-3")
+	driver.add("reclaim/numa-0", CgroupIdentity{Device: 1, Inode: 2}, "0-7", "0")
+	driver.add("reclaim/numa-1", CgroupIdentity{Device: 1, Inode: 3}, "0-7", "1")
+	driver.add("reclaim/numa-2", CgroupIdentity{Device: 1, Inode: 4}, "4-5", "2")
+	driver.add("reclaim/numa-3", CgroupIdentity{Device: 1, Inode: 5}, "6-7", "3")
+	driver.nodes["reclaim/numa-0"].activity = inactive
+	driver.nodes["reclaim/numa-1"].activity = inactive
+
+	snapshot := planSnapshot(map[string]EntryState{
+		"reclaim":        {Identity: driver.nodes["reclaim"].identity, CPUs: machine.MustParse("0-7"), Mems: "0-3"},
+		"reclaim/numa-0": {Identity: driver.nodes["reclaim/numa-0"].identity, CPUs: machine.MustParse("0-7"), Mems: "0", Activity: inactive},
+		"reclaim/numa-1": {Identity: driver.nodes["reclaim/numa-1"].identity, CPUs: machine.MustParse("0-7"), Mems: "1", Activity: inactive},
+		"reclaim/numa-2": {Identity: driver.nodes["reclaim/numa-2"].identity, CPUs: machine.MustParse("4-5"), Mems: "2"},
+		"reclaim/numa-3": {Identity: driver.nodes["reclaim/numa-3"].identity, CPUs: machine.MustParse("6-7"), Mems: "3"},
+	}, map[DomainID]machine.CPUSet{DomainReclaim: machine.MustParse("0-7")})
+	snapshot.DomainByRel = map[string]DomainID{
+		"reclaim": DomainReclaim, "reclaim/numa-0": DomainReclaim,
+		"reclaim/numa-1": DomainReclaim, "reclaim/numa-2": DomainReclaim,
+		"reclaim/numa-3": DomainReclaim,
+	}
+	snapshot.Children = map[string][]ChildRef{
+		"reclaim": {
+			{Name: "numa-0", Identity: driver.nodes["reclaim/numa-0"].identity},
+			{Name: "numa-1", Identity: driver.nodes["reclaim/numa-1"].identity},
+			{Name: "numa-2", Identity: driver.nodes["reclaim/numa-2"].identity},
+			{Name: "numa-3", Identity: driver.nodes["reclaim/numa-3"].identity},
+		},
+		"reclaim/numa-0": nil,
+		"reclaim/numa-1": nil,
+		"reclaim/numa-2": nil,
+		"reclaim/numa-3": nil,
+	}
+
+	materialized := materializeTargets(dag, snapshot, false, desiredTargets(dag))
+	plan, err := BuildPhasePlan(PhasePlanInput{
+		Kind: PhaseDrain, DAG: dag, Snapshot: materialized.Snapshot,
+		DesiredByRel:  materialized.PhysicalByRel,
+		SemanticByRel: materialized.SemanticByRel,
+		DormantRels:   materialized.DormantRels,
+		AllowedCPUs:   machine.MustParse("0-7"),
+		Capabilities:  cgroupV1Policy.capabilities(true),
+		CPUDetails: machine.CPUDetails{
+			0: {NUMANodeID: 0}, 1: {NUMANodeID: 0},
+			2: {NUMANodeID: 1}, 3: {NUMANodeID: 1},
+			4: {NUMANodeID: 2}, 5: {NUMANodeID: 2},
+			6: {NUMANodeID: 3}, 7: {NUMANodeID: 3},
+		},
+		Budget: NewBudgetTracker(ConvergenceBudget{}),
+	})
+	if err != nil {
+		t.Fatalf("BuildPhasePlan() error = %v", err)
+	}
+	result := &ConvergenceResult{}
+	if err := newSafeCPUSetWriter(driver, NewBudgetTracker(ConvergenceBudget{}), result).
+		execute(context.Background(), plan); err != nil {
+		t.Fatalf("writer execute() error = %v", err)
+	}
+
+	writesByRel := make(map[string]int)
+	for _, write := range driver.writes {
+		writesByRel[write.rel]++
+	}
+	for _, rel := range []string{"reclaim/numa-0", "reclaim/numa-1"} {
+		if writesByRel[rel] != 0 {
+			t.Fatalf("dormant rel %q writes = %d, want zero", rel, writesByRel[rel])
+		}
+	}
+	for _, rel := range []string{"reclaim/numa-2", "reclaim/numa-3"} {
+		if writesByRel[rel] == 0 {
+			t.Fatalf("active rel %q received no writer operation", rel)
+		}
+	}
+	for i, trace := range driver.traces {
+		if err := subsetInvariant(trace); err != nil {
+			t.Fatalf("write step %d violated parent containment: %v", i, err)
+		}
+	}
+}
+
+func TestSafeWriterRevalidatesDormantProofsImmediatelyBeforeFirstMutation(t *testing.T) {
+	inactive := CgroupActivity{TasksEmpty: true, CgroupProcsEmpty: true, Childless: true}
+	primaryIdentity := CgroupIdentity{Device: 1, Inode: 1}
+	dormantIdentity := CgroupIdentity{Device: 1, Inode: 2}
+	driver := newFakeHierarchyDriver()
+	driver.add("primary", primaryIdentity, "0", "0")
+	driver.add("dormant", dormantIdentity, "0", "0")
+	driver.nodes["dormant"].activity = CgroupActivity{
+		TasksEmpty: false, CgroupProcsEmpty: true, Childless: true,
+	}
+	plan := PhasePlan{
+		ConvergenceID: "dormant-proof-race",
+		Kind:          PhaseExpand,
+		Capabilities:  cgroupV1Policy.capabilities(true),
+		Operations: []PlanOperation{{
+			Rel: "primary", ExpectedIdentity: primaryIdentity,
+			ExpectedCurrent: CPUSetTarget{CPUs: machine.NewCPUSet(0), Mems: "0"},
+			Target:          CPUSetTarget{CPUs: machine.MustParse("0-1"), Mems: "0"},
+			Direction:       WriteGrow, OwnsMems: true,
+		}},
+	}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	plan.Operations[0].PlanID = plan.PlanID
+	writer := newSafeCPUSetWriter(driver, NewBudgetTracker(ConvergenceBudget{}), nil)
+	writer.dormantProofs = map[string]DormantLeafProof{
+		"dormant": {
+			Identity:     dormantIdentity,
+			ObservedCPUs: machine.NewCPUSet(0),
+		},
+	}
+
+	err := writer.execute(context.Background(), plan)
+	if !errors.Is(err, ErrCoordinatorPlanStale) {
+		t.Fatalf("execute() error = %v, want stale dormant proof", err)
+	}
+	if len(driver.writes) != 0 {
+		t.Fatalf("writes = %+v, want none before dormant proof revalidation", driver.writes)
+	}
+	if inactive == driver.nodes["dormant"].activity {
+		t.Fatal("test setup did not make the dormant proof stale")
 	}
 }
 

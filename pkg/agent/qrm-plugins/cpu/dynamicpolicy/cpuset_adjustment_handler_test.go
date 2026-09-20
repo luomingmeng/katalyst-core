@@ -2404,6 +2404,46 @@ func TestAdvisorWALRecoveryUsesPreCommitRevisionOnlyForV2(t *testing.T) {
 	})
 }
 
+func TestAdvisorV0PostCommitReplayCleansCheckpoint(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	p.advisorPostCommitCheckpointDir = t.TempDir()
+	p.installCPUStateWritePermit()
+	revision := p.state.GetRevision()
+	response := &advisorapi.ListAndWatchResponse{
+		ExtraEntries: []*advisorsvc.CalculationInfo{{CgroupPath: "/legacy-v0"}},
+	}
+	responseBytes, err := proto.Marshal(response)
+	require.NoError(t, err)
+	data, err := json.Marshal(advisorPostCommitCheckpoint{
+		Revision: revision,
+		Response: responseBytes,
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(p.advisorPostCommitCheckpointPath(), data, 0o600))
+
+	applied := 0
+	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"count": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			applied++
+			return nil
+		},
+	}
+	require.NoError(t, p.restoreAdvisorPostCommitTarget())
+	restored := p.currentAdvisorPostCommitTarget()
+	require.NotNil(t, restored)
+	require.Zero(t, restored.checkpointVersion)
+
+	p.Lock()
+	err = p.reconcileAdvisorPostCommitTarget(context.Background(), restored)
+	p.Unlock()
+	require.NoError(t, err)
+	require.Equal(t, 1, applied)
+	require.Nil(t, p.currentAdvisorPostCommitTarget())
+	require.NoFileExists(t, p.advisorPostCommitCheckpointPath())
+	require.NoFileExists(t, p.advisorPostCommitStagingPath())
+}
+
 func TestAdvisorWriteAheadTargetRealRestartAtCommitCrashPoints(t *testing.T) {
 	for _, tc := range []struct {
 		name          string

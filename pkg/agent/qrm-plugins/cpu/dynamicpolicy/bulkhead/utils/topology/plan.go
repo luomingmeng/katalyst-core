@@ -351,6 +351,7 @@ type PhasePlan struct {
 	AllowEmptyTarget bool
 	Capabilities     HierarchyCapabilities
 	ControlledRels   []string
+	DormantRels      map[string]struct{}
 	Witnesses        []ReleaseWitness
 	TransferGraph    map[DomainID]map[DomainID]machine.CPUSet
 	// CanonicalTargetByRel is the immutable final target for the convergence
@@ -409,13 +410,17 @@ func (m ProgressMeasure) MadeProgress() bool {
 }
 
 type PhasePlanInput struct {
-	Context          context.Context
-	Kind             PhaseKind
-	DAG              *TopoDAG
-	Snapshot         *CompleteSnapshot
+	Context  context.Context
+	Kind     PhaseKind
+	DAG      *TopoDAG
+	Snapshot *CompleteSnapshot
+	// DesiredByRel is the physical writer/convergence target. SemanticByRel
+	// remains the ownership authority for domain transfer decisions.
 	DesiredByRel     map[string]machine.CPUSet
+	SemanticByRel    map[string]machine.CPUSet
 	DynamicByRel     map[string]machine.CPUSet
 	DesiredMemsByRel map[string]string
+	DormantRels      map[string]struct{}
 	AllowedCPUs      machine.CPUSet
 	// AllowEmptyTarget records whether the backing cgroup version accepts an
 	// explicitly empty cpuset.cpus target.
@@ -438,6 +443,13 @@ func BuildPhasePlan(in PhasePlanInput) (PhasePlan, error) {
 	return buildPhasePlanWithStats(in, nil)
 }
 
+func semanticTargetsForPlan(in PhasePlanInput) map[string]machine.CPUSet {
+	if in.SemanticByRel != nil {
+		return in.SemanticByRel
+	}
+	return in.DesiredByRel
+}
+
 type plannerBuildStats struct {
 	DomainEntries          int
 	TransferEdgesCounted   int
@@ -458,6 +470,9 @@ func buildPhasePlanWithStats(in PhasePlanInput, stats *plannerBuildStats) (Phase
 	if in.AllowedCPUs.IsEmpty() {
 		return PhasePlan{}, fmt.Errorf("phase planner requires explicit non-empty AllowedCPUs")
 	}
+	if len(in.DormantRels) > 0 && in.SemanticByRel == nil {
+		return PhasePlan{}, fmt.Errorf("phase planner requires semantic targets for dormant relations")
+	}
 	if err := validateFinalTargets(in); err != nil {
 		return PhasePlan{}, err
 	}
@@ -467,7 +482,8 @@ func buildPhasePlanWithStats(in PhasePlanInput, stats *plannerBuildStats) (Phase
 	if err := validateTopologyConstraints(in); err != nil {
 		return PhasePlan{}, err
 	}
-	domains, desiredByDomain, err := collectPlannerDomains(in.DAG, in.Snapshot.DomainUnion, in.DesiredByRel, in.Budget)
+	semanticByRel := semanticTargetsForPlan(in)
+	domains, desiredByDomain, err := collectPlannerDomains(in.DAG, in.Snapshot.DomainUnion, semanticByRel, in.Budget)
 	if err != nil {
 		return PhasePlan{}, err
 	}
@@ -497,6 +513,7 @@ func buildPhasePlanWithStats(in PhasePlanInput, stats *plannerBuildStats) (Phase
 		AllowEmptyTarget:     in.AllowEmptyTarget,
 		Capabilities:         in.Capabilities,
 		ControlledRels:       controlledRels,
+		DormantRels:          cloneRelSet(in.DormantRels),
 		Witnesses:            append([]ReleaseWitness(nil), in.Witnesses...),
 		TransferGraph:        graph,
 		CanonicalTargetByRel: canonicalPhaseTargets(in),
@@ -521,8 +538,12 @@ func buildPhasePlanWithStats(in PhasePlanInput, stats *plannerBuildStats) (Phase
 			return PhasePlan{}, err
 		}
 	}
+	for rel := range plan.TargetByRel {
+		if relInDormantSubtree(rel, in.DormantRels) {
+			delete(plan.TargetByRel, rel)
+		}
+	}
 	postProcessPhaseOperationTargets(in.Kind, in.AllowEmptyTarget, in.Capabilities, plan.TargetByRel, in.Snapshot)
-	applyV1NonEmptyReclaimFallbackTargets(in, plan.TargetByRel, domainByRel)
 	if err := propagatePhaseTargetEnvelope(plan.TargetByRel, parentByRel, depthByRel); err != nil {
 		return PhasePlan{}, err
 	}
@@ -618,6 +639,7 @@ func canonicalConvergenceID(in PhasePlanInput) string {
 	}
 	writeHashString(hash, "desired-cpus")
 	writeCPUSetMap(in.DesiredByRel)
+	writeCPUSetMap(in.SemanticByRel)
 	writeHashString(hash, "dynamic-cpus")
 	writeCPUSetMap(in.DynamicByRel)
 	writeHashString(hash, "desired-mems")
@@ -727,6 +749,15 @@ func canonicalExecutionPlanID(plan PhasePlan) string {
 	sort.Strings(controlledRels)
 	writeHashUint64(hash, uint64(len(controlledRels)))
 	for _, rel := range controlledRels {
+		writeHashString(hash, rel)
+	}
+	dormantRels := make([]string, 0, len(plan.DormantRels))
+	for rel := range plan.DormantRels {
+		dormantRels = append(dormantRels, rel)
+	}
+	sort.Strings(dormantRels)
+	writeHashUint64(hash, uint64(len(dormantRels)))
+	for _, rel := range dormantRels {
 		writeHashString(hash, rel)
 	}
 
@@ -968,11 +999,15 @@ func buildExpandTargets(
 		plan.AllowedEntering[domain] = gate.AllowedEntering(domain)
 	}
 	for rel, entry := range in.Snapshot.Entries {
+		if relInDormantSubtree(rel, in.DormantRels) {
+			continue
+		}
 		node := in.DAG.index[rel]
 		target := entry.CPUs.Clone()
 		if node != nil {
 			desired := in.DesiredByRel[rel]
 			available := plan.AllowedEntering[node.Domain].Union(in.Snapshot.DomainUnion[node.Domain])
+			available = available.Union(desired.Difference(semanticTargetsForPlan(in)[rel]))
 			target, err = buildPhaseTransition(PhaseExpand, RelTransition{
 				Current:            entry.CPUs,
 				Final:              desired,
@@ -1859,101 +1894,13 @@ func validateExecutableEmptyTargets(in PhasePlanInput) error {
 				Rel: rel, Source: EmptyTargetSourceExplicitDynamic, Current: current.CPUs.Clone(),
 			}
 		}
-		if in.DAG != nil && in.DAG.index[rel] != nil && in.DesiredByRel[rel].IsEmpty() &&
-			!allowV1NonEmptyReclaimTargetFallback(in.DAG.index[rel]) {
+		if in.DAG != nil && in.DAG.index[rel] != nil && in.DesiredByRel[rel].IsEmpty() {
 			return &UnsupportedEmptyTargetError{
 				Rel: rel, Source: EmptyTargetSourceControlled, Current: current.CPUs.Clone(),
 			}
 		}
 	}
 	return nil
-}
-
-func applyV1NonEmptyReclaimFallbackTargets(
-	in PhasePlanInput,
-	targets map[string]CPUSetTarget,
-	domainByRel map[string]DomainID,
-) {
-	if in.AllowEmptyTarget || in.DAG == nil || in.Snapshot == nil {
-		return
-	}
-	preserved := machine.NewCPUSet()
-	for _, node := range in.DAG.Nodes() {
-		if !allowV1NonEmptyReclaimTargetFallback(node) || !in.DesiredByRel[node.Rel].IsEmpty() {
-			continue
-		}
-		current := in.Snapshot.Entries[node.Rel].CPUs
-		if current.IsEmpty() {
-			continue
-		}
-		if target, ok := targets[node.Rel]; ok && !target.CPUs.IsEmpty() {
-			preserved = preserved.Union(target.CPUs)
-		}
-	}
-	if preserved.IsEmpty() {
-		return
-	}
-	for rel, target := range targets {
-		if phaseTargetDomain(rel, in.DAG, domainByRel) == DomainReclaim {
-			continue
-		}
-		target.CPUs = target.CPUs.Difference(preserved)
-		targets[rel] = target
-	}
-}
-
-func normalizeV1NonEmptyReclaimDesiredTargets(
-	dag *TopoDAG,
-	snapshot *CompleteSnapshot,
-	desired map[string]machine.CPUSet,
-	allowEmptyTarget bool,
-) map[string]machine.CPUSet {
-	out := cloneCPUSetMap(desired)
-	if allowEmptyTarget || dag == nil || snapshot == nil {
-		return out
-	}
-	preserved := machine.NewCPUSet()
-	for _, node := range dag.Nodes() {
-		if !allowV1NonEmptyReclaimTargetFallback(node) || !out[node.Rel].IsEmpty() {
-			continue
-		}
-		current := snapshot.Entries[node.Rel].CPUs
-		if current.IsEmpty() {
-			continue
-		}
-		out[node.Rel] = current.Clone()
-		preserved = preserved.Union(current)
-	}
-	if preserved.IsEmpty() {
-		return out
-	}
-	for _, node := range dag.Nodes() {
-		if node.Domain == DomainReclaim {
-			continue
-		}
-		out[node.Rel] = out[node.Rel].Difference(preserved)
-	}
-	propagateControlledDesiredCPUEnvelope(out, dag)
-	return out
-}
-
-func propagateControlledDesiredCPUEnvelope(targets map[string]machine.CPUSet, dag *TopoDAG) {
-	if dag == nil {
-		return
-	}
-	nodes := dag.Nodes()
-	sort.Slice(nodes, func(i, j int) bool {
-		if topoNodeDepth(nodes[i]) != topoNodeDepth(nodes[j]) {
-			return topoNodeDepth(nodes[i]) > topoNodeDepth(nodes[j])
-		}
-		return nodes[i].Rel < nodes[j].Rel
-	})
-	for _, node := range nodes {
-		if node == nil || node.parent == nil {
-			continue
-		}
-		targets[node.parent.Rel] = targets[node.parent.Rel].Union(targets[node.Rel])
-	}
 }
 
 func phaseTargetDomain(rel string, dag *TopoDAG, domainByRel map[string]DomainID) DomainID {
@@ -1963,10 +1910,6 @@ func phaseTargetDomain(rel string, dag *TopoDAG, domainByRel map[string]DomainID
 		}
 	}
 	return domainByRel[rel]
-}
-
-func allowV1NonEmptyReclaimTargetFallback(node *TopoNode) bool {
-	return node != nil && node.Domain == DomainReclaim
 }
 
 func buildPlannerRelations(
@@ -2068,11 +2011,12 @@ func buildSnapshotDepthByRel(snapshot *CompleteSnapshot, stats *depthBuildStats)
 }
 
 func validateTopologyConstraints(in PhasePlanInput) error {
+	semanticByRel := semanticTargetsForPlan(in)
 	for _, node := range in.DAG.Nodes() {
 		constraint := node.Constraint
-		desired := in.DesiredByRel[node.Rel]
+		desired := semanticByRel[node.Rel]
 		if parent := node.parent; parent != nil {
-			parentCPUs := in.DesiredByRel[parent.Rel]
+			parentCPUs := semanticByRel[parent.Rel]
 			if !desired.IsSubsetOf(parentCPUs) {
 				return fmt.Errorf("%w: controlled child=%q CPUs=%s outside parent %q=%s",
 					ErrInvalidReclaimBucketTarget, node.Rel, desired.String(), parent.Rel, parentCPUs.String())
@@ -2089,7 +2033,7 @@ func validateTopologyConstraints(in PhasePlanInput) error {
 		}
 		if constraint.MemUpperBound.IsEmpty() {
 			if node.Role == TopoNodeRoleReclaimNUMABucket {
-				if err := validateBucketHierarchyEnvelope(in, node, desired, in.DesiredMemsByRel[node.Rel]); err != nil {
+				if err := validateBucketHierarchyEnvelope(in, semanticByRel, node, desired, in.DesiredMemsByRel[node.Rel]); err != nil {
 					return err
 				}
 			}
@@ -2104,7 +2048,7 @@ func validateTopologyConstraints(in PhasePlanInput) error {
 			return fmt.Errorf("%w: rel=%q desired mems=%q upper=%s", ErrInvalidReclaimBucketTarget, node.Rel, mems, constraint.MemUpperBound.String())
 		}
 		if node.Role == TopoNodeRoleReclaimNUMABucket {
-			if err := validateBucketHierarchyEnvelope(in, node, desired, mems); err != nil {
+			if err := validateBucketHierarchyEnvelope(in, semanticByRel, node, desired, mems); err != nil {
 				return err
 			}
 		}
@@ -2143,9 +2087,15 @@ func validateMemsSubset(child, parent string) error {
 	return nil
 }
 
-func validateBucketHierarchyEnvelope(in PhasePlanInput, node *TopoNode, cpus machine.CPUSet, mems string) error {
+func validateBucketHierarchyEnvelope(
+	in PhasePlanInput,
+	semanticByRel map[string]machine.CPUSet,
+	node *TopoNode,
+	cpus machine.CPUSet,
+	mems string,
+) error {
 	for parent := node.parent; parent != nil; parent = parent.parent {
-		parentCPUs := in.DesiredByRel[parent.Rel]
+		parentCPUs := semanticByRel[parent.Rel]
 		if !cpus.IsSubsetOf(parentCPUs) {
 			return fmt.Errorf("%w: bucket=%q CPUs=%s outside parent/domain envelope %q=%s",
 				ErrInvalidReclaimBucketTarget, node.Rel, cpus.String(), parent.Rel, parentCPUs.String())
@@ -2167,6 +2117,7 @@ func validateBucketHierarchyEnvelope(in PhasePlanInput, node *TopoNode, cpus mac
 }
 
 func validatePhaseTargets(in PhasePlanInput, targets map[string]CPUSetTarget) error {
+	semanticByRel := semanticTargetsForPlan(in)
 	seenReclaimBucketCPUsByRoot := make(map[string]machine.CPUSet)
 	for rel, target := range targets {
 		node := in.DAG.index[rel]
@@ -2190,7 +2141,7 @@ func validatePhaseTargets(in PhasePlanInput, targets map[string]CPUSetTarget) er
 		if node.Role != TopoNodeRoleReclaimNUMABucket {
 			continue
 		}
-		desired := in.DesiredByRel[rel]
+		desired := semanticByRel[rel]
 		if !node.Constraint.CPUUpperBound.IsEmpty() && !desired.IsSubsetOf(node.Constraint.CPUUpperBound) {
 			return fmt.Errorf("%w: bucket=%q desired CPUs=%s upper=%s",
 				ErrInvalidReclaimBucketTarget, rel, desired.String(), node.Constraint.CPUUpperBound.String())

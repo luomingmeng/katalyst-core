@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 
@@ -52,6 +53,7 @@ type safeCPSetWriter struct {
 	budget                *BudgetTracker
 	res                   *ConvergenceResult
 	physicalWriteAttempts *int
+	dormantProofs         map[string]DormantLeafProof
 }
 
 type stableLiveChildren struct {
@@ -100,7 +102,9 @@ func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 	for _, operation := range plan.Operations {
 		ioOperations = saturatingAdd(ioOperations,
 			estimateFinalPreflightAndMutationHierarchyIO(operation, len(stableChildUnion[operation.Rel].refs)))
+		ioOperations = saturatingAdd(ioOperations, w.dormantProofCountUnder(operation.Rel))
 	}
+	ioOperations = saturatingAdd(ioOperations, len(w.dormantProofs))
 	driver, err := newStrictReservedHierarchyDriver(ctx, w.driver, w.budget, ioOperations)
 	if err != nil {
 		return err
@@ -128,7 +132,19 @@ func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 		precedingOperations[operation.Rel] = operation
 	}
 
+	if len(plan.Operations) > 0 {
+		if err := w.revalidateDormantProofs(ctx, ""); err != nil {
+			return err
+		}
+	}
 	for _, operation := range plan.Operations {
+		// Recheck only the dormant envelopes that this operation's ancestor
+		// containment depends on. This keeps the authorization close to the
+		// corresponding write without multiplying activity scans for unrelated
+		// leaves.
+		if err := w.revalidateDormantProofs(ctx, operation.Rel); err != nil {
+			return err
+		}
 		if w.res != nil {
 			w.res.Attempted++
 		}
@@ -226,6 +242,66 @@ func (w safeCPSetWriter) rollbackOperation(
 		}
 	}
 	return rollbackErr
+}
+
+func (w safeCPSetWriter) dormantProofCountUnder(ancestor string) int {
+	count := 0
+	for root := range w.dormantProofs {
+		if ancestor == "" || isRelAtOrUnder(root, ancestor) {
+			count++
+		}
+	}
+	return count
+}
+
+// revalidateDormantProofs verifies the inactive cgroup v1 leaves whose
+// physical envelopes authorize ancestor containment. An empty ancestor checks
+// the complete proof set before the first mutation; a non-empty ancestor
+// narrows the check to envelopes used by that operation. External task attach
+// does not share a lifecycle lock with this writer, so every mismatch is stale
+// evidence that must abort the plan and trigger replanning; the writer must
+// never continue by retrying the old physical envelope.
+func (w safeCPSetWriter) revalidateDormantProofs(ctx context.Context, ancestor string) error {
+	reader, ok := w.driver.(hierarchyActivityReader)
+	if !ok && len(w.dormantProofs) > 0 {
+		return &PlanStaleError{
+			Direction: WritePublish, Resource: "dormant_subtree",
+			Current: "activity proof unavailable", Target: "complete inactive child closure",
+		}
+	}
+	roots := make([]string, 0, len(w.dormantProofs))
+	for root := range w.dormantProofs {
+		roots = append(roots, root)
+	}
+	sort.Strings(roots)
+	for _, root := range roots {
+		if ancestor != "" && !isRelAtOrUnder(root, ancestor) {
+			continue
+		}
+		proof := w.dormantProofs[root]
+		entry, err := reader.ReadEntryWithActivity(ctx, root, proof.Identity)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+				isConvergenceBudgetError(err) ||
+				w.driver.Classify(err, HierarchyOperationRead) != HierarchyErrorStale {
+				return err
+			}
+			return &PlanStaleError{
+				Rel: root, Direction: WritePublish, Resource: "dormant_subtree",
+				Current: "unavailable", Target: "complete inactive child closure", Err: err,
+			}
+		}
+		if entry.Identity != proof.Identity || !entry.Activity.Inactive() ||
+			!entry.CPUs.Equals(proof.ObservedCPUs) {
+			return &PlanStaleError{
+				Rel: root, Direction: WritePublish, Resource: "dormant_subtree",
+				Current: fmt.Sprintf("identity=%v cpus=%s activity=%+v",
+					entry.Identity, entry.CPUs.String(), entry.Activity),
+				Target: fmt.Sprintf("identity=%v cpus=%s inactive", proof.Identity, proof.ObservedCPUs.String()),
+			}
+		}
+	}
+	return nil
 }
 
 func estimateStableChildScanHierarchyIO(scans, childMemberships int) int {
@@ -542,6 +618,24 @@ func (d *strictReservedHierarchyDriver) ReadEntry(ctx context.Context, rel strin
 		return EntryState{}, err
 	}
 	return d.HierarchyDriver.ReadEntry(ctx, rel)
+}
+
+func (d *strictReservedHierarchyDriver) ReadEntryWithActivity(
+	ctx context.Context,
+	rel string,
+	expected CgroupIdentity,
+) (EntryState, error) {
+	if err := d.consume(ctx); err != nil {
+		return EntryState{}, err
+	}
+	if reader, ok := d.HierarchyDriver.(budgetedHierarchyActivityReader); ok {
+		return reader.readEntryWithActivityAndBudget(ctx, rel, expected, d.budget)
+	}
+	reader, ok := d.HierarchyDriver.(hierarchyActivityReader)
+	if !ok {
+		return EntryState{}, fmt.Errorf("hierarchy driver does not support cgroup activity proofs")
+	}
+	return reader.ReadEntryWithActivity(ctx, rel, expected)
 }
 
 func (d *strictReservedHierarchyDriver) ListChildren(ctx context.Context, rel string) ([]ChildRef, error) {

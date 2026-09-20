@@ -904,11 +904,15 @@ func (r *coordinatorRound) executeValidatedFrozenTrace(
 	defer ticket.ReleaseUnused()
 
 	writer := newSafeCPUSetWriter(r.driver, r.budget, res)
+	writer.dormantProofs = r.dormantProofs
 	preflight, err := writer.preflightValidatedTraceOperations(ctx, validated)
 	if err != nil {
 		return outcome, err
 	}
 	writer.driver = NewBudgetedHierarchyDriver(r.driver, r.budget)
+	if err := writer.revalidateDormantProofs(ctx, ""); err != nil {
+		return outcome, err
+	}
 
 	journalStart := len(res.Journal)
 	appliedStart := res.Applied
@@ -916,6 +920,10 @@ func (r *coordinatorRound) executeValidatedFrozenTrace(
 	operationIndex := 0
 	for _, phase := range frozen.Phases {
 		for _, operation := range phase.Operations {
+			if err := writer.revalidateDormantProofs(ctx, operation.Rel); err != nil {
+				return outcome, writer.failFrozenTrace(
+					ctx, err, stack, ticket, res, journalStart, appliedStart)
+			}
 			res.Attempted++
 			applied, applyErr := writer.applyFrozenOperation(
 				ctx, phase.Kind, operationIndex, operation,

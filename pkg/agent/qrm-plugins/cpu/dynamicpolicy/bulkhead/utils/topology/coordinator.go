@@ -306,11 +306,13 @@ func (c TopologyCoordinator) Converge(ctx context.Context, in CoordinatorInput) 
 	defer token.Exit()
 	budgetLimit := BudgetWithInvocationDeadline(ctx, in.Budget, time.Now())
 	budget := NewBudgetTracker(budgetLimit)
+	allowEmptyTarget := in.Cgroup.Version(ctx) == cgroupclient.CgroupVersionV2
+	collectDormantActivity := in.Mode.modeOrDefault() == CoordinatorModeNormal && !allowEmptyTarget
 	initialSnapshotRetryAllowance := budgetLimit.MaxRounds
 	if initialSnapshotRetryAllowance == 0 {
 		initialSnapshotRetryAllowance = defaultCoordinatorAutoRounds
 	}
-	if err := budget.configureAutoHierarchyIOBootstrap(initialSnapshotRetryAllowance); err != nil {
+	if err := budget.configureAutoHierarchyIOBootstrap(initialSnapshotRetryAllowance, collectDormantActivity); err != nil {
 		return res, err
 	}
 	var result ConvergenceResult
@@ -383,13 +385,13 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 	if err != nil {
 		return *res, err
 	}
-	parentSafetyTargets := desiredTargets(in.DAG)
 	snapshotDriver, err := snapshotDriverForCoordinator(ctx, in.Cgroup)
 	if err != nil {
 		return *res, err
 	}
 	defer snapshotDriver.Close()
-	round := newCoordinatorRoundWithBudget(in.DAG, in.Cgroup, effectiveTargets, in.CPUDetails, in.ReservedCPUSet, in.DrainSelection, budget)
+	round := newCoordinatorRoundWithBudget(in.DAG, in.Cgroup, in.CPUDetails, in.ReservedCPUSet, in.DrainSelection, budget)
+	round.semanticTargetByRel = cloneCPUSetMap(effectiveTargets)
 	round.dynamicByRel = cloneCPUSetMap(in.ExpectedCPUSetByRel)
 	round.requiredByRel = cloneCPUSetMap(in.RequiredCPUSetByRel)
 	round.objective = in.Objective.orFullDefault()
@@ -402,16 +404,18 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 	round.requiredIdentityByRel = cloneIdentityMap(in.RequiredIdentityByRel)
 	round.expectedAbsentRels = cloneRelSet(in.ExpectedAbsentRels)
 	round.snapshotSource = newCompleteSnapshotSource(snapshotDriver, in.DAG, budget, in.TraversalBoundaries)
+	if !allowEmptyTarget {
+		round.snapshotSource = newDormantCompleteSnapshotSource(snapshotDriver, in.DAG, budget, in.TraversalBoundaries)
+	}
 	round.driver = snapshotDriver
-	initialSnapshot, err := round.nextSnapshot(ctx)
+	initialSnapshot, err := round.nextPlanningSnapshot(ctx)
 	if err != nil {
 		return *res, err
 	}
-	effectiveTargets = normalizeV1NonEmptyReclaimDesiredTargets(in.DAG, initialSnapshot, effectiveTargets, allowEmptyTarget)
-	round.targetByRel = effectiveTargets
 	round.maxRounds = coordinatorMaxRoundsForPlanInput(PhasePlanInput{
 		Kind: PhaseDrain, DAG: in.DAG, Snapshot: initialSnapshot,
-		DesiredByRel: effectiveTargets, AllowedCPUs: round.allowedCPUs(),
+		DesiredByRel: round.targetByRel, SemanticByRel: round.semanticTargetByRel,
+		DormantRels: round.dormantRels, AllowedCPUs: round.allowedCPUs(),
 		ProtectedPending: protectedPending, ProtectedByRel: in.ProtectedCPUSetByRel,
 		CPUDetails: in.CPUDetails, Selection: round.selection,
 	}, in.Budget.MaxRounds)
@@ -486,7 +490,8 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 			return *res, errors.New("TopologyCoordinator.Converge: fixed-point round completed without final snapshot")
 		}
 		evaluation, err := evaluateCoordinatorSnapshot(
-			snapshot, in.DAG, effectiveTargets, parentSafetyTargets, round.desiredMemsByRel(),
+			snapshot, in.DAG, round.targetByRel, round.semanticTargetByRel,
+			round.desiredMemsByRel(),
 			round.desiredDomainUnion(), round.allowedCPUs(),
 			in.ExpectedCPUSetByRel, in.RequiredCPUSetByRel, in.DeferredCPUSetByRel,
 			round.deferredCleanupRels,
@@ -524,7 +529,8 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 				continue
 			}
 			freshEvaluation, err := evaluateCoordinatorSnapshot(
-				fresh, in.DAG, effectiveTargets, parentSafetyTargets, round.desiredMemsByRel(),
+				fresh, in.DAG, round.targetByRel, round.semanticTargetByRel,
+				round.desiredMemsByRel(),
 				round.desiredDomainUnion(), round.allowedCPUs(),
 				in.ExpectedCPUSetByRel, in.RequiredCPUSetByRel, in.DeferredCPUSetByRel,
 				round.deferredCleanupRels,
@@ -802,7 +808,8 @@ func publishRelevantEntriesEqual(before, after map[string]EntryState, rel string
 		beforeEntry.CPUs.Equals(afterEntry.CPUs) &&
 		beforeEntry.Mems == afterEntry.Mems &&
 		beforeEntry.ConfiguredCPUs.Equals(afterEntry.ConfiguredCPUs) &&
-		beforeEntry.ConfiguredMems == afterEntry.ConfiguredMems
+		beforeEntry.ConfiguredMems == afterEntry.ConfiguredMems &&
+		beforeEntry.Activity == afterEntry.Activity
 }
 
 func roundOutcomeMadeNetProgress(outcome RoundOutcome) bool {
@@ -995,6 +1002,9 @@ func newCoordinatorHierarchyDriver(
 type coordinatorRound struct {
 	dag                   *TopoDAG
 	targetByRel           map[string]machine.CPUSet
+	semanticTargetByRel   map[string]machine.CPUSet
+	dormantRels           map[string]struct{}
+	dormantProofs         map[string]DormantLeafProof
 	dynamicByRel          map[string]machine.CPUSet
 	deferredByRel         map[string]machine.CPUSet
 	requiredByRel         map[string]machine.CPUSet
@@ -1103,14 +1113,13 @@ func (r *coordinatorRound) executeParentSafeAdmission(
 func newCoordinatorRoundWithBudget(
 	dag *TopoDAG,
 	cg cgroupclient.CgroupClient,
-	targetByRel map[string]machine.CPUSet,
 	cpuDetails machine.CPUDetails,
 	reservedCPUs machine.CPUSet,
 	selection DrainSelectionPolicy,
 	budget *BudgetTracker,
 ) *coordinatorRound {
 	r := &coordinatorRound{
-		dag: dag, targetByRel: cloneCPUSetMap(targetByRel), cpuDetails: cpuDetails,
+		dag: dag, cpuDetails: cpuDetails,
 		reservedCPUs: reservedCPUs.Clone(), budget: budget, maxRounds: budget.limit.MaxRounds,
 		selection: NormalizeDrainSelectionPolicy(selection),
 		blocked:   make(map[DomainID]machine.CPUSet),
@@ -1147,7 +1156,7 @@ func coordinatorMaxRoundsForPlanInput(in PhasePlanInput, explicitMaxRounds int) 
 		return required
 	}
 
-	desiredByDomain := desiredDomainUnions(in.DAG, in.DesiredByRel)
+	desiredByDomain := desiredDomainUnions(in.DAG, semanticTargetsForPlan(in))
 	protectedByDomain := protectedCPUSetByDomain(in.ProtectedByRel, in.ProtectedPending, in.DAG)
 
 	batchLimit := maxCPUsPerDrainRound(len(in.CPUDetails), in.Selection.MaxCPUsDrainRatio)
@@ -1180,7 +1189,11 @@ func (r *coordinatorRound) allowedCPUs() machine.CPUSet {
 }
 
 func (r *coordinatorRound) desiredDomainUnion() map[DomainID]machine.CPUSet {
-	return desiredDomainUnions(r.dag, r.targetByRel)
+	targets := r.semanticTargetByRel
+	if targets == nil {
+		targets = r.targetByRel
+	}
+	return desiredDomainUnions(r.dag, targets)
 }
 
 func (r *coordinatorRound) desiredMemsByRel() map[string]string {
@@ -1191,11 +1204,11 @@ func (r *coordinatorRound) desiredMemsByRel() map[string]string {
 	return out
 }
 
-func (r *coordinatorRound) nextSnapshot(ctx context.Context) (*CompleteSnapshot, error) {
+func (r *coordinatorRound) nextRawSnapshot(ctx context.Context) (*CompleteSnapshot, error) {
 	if r.pendingSnapshot != nil {
 		snapshot := r.pendingSnapshot
 		r.pendingSnapshot = nil
-		return snapshot, r.validatePreflightObservations(ctx, snapshot)
+		return snapshotWithoutOwnershipOverlay(snapshot), nil
 	}
 	if r.snapshotSource == nil {
 		return nil, fmt.Errorf("topology coordinator requires complete snapshot source")
@@ -1208,7 +1221,7 @@ func (r *coordinatorRound) nextSnapshot(ctx context.Context) (*CompleteSnapshot,
 	for {
 		snapshot, err := r.snapshotSource(ctx)
 		if err == nil {
-			return snapshot, r.validatePreflightObservations(ctx, snapshot)
+			return snapshot, nil
 		}
 		var snapshotErr *SnapshotError
 		if !errors.As(err, &snapshotErr) || snapshotErr.Class != HierarchyErrorStale {
@@ -1233,6 +1246,40 @@ func (r *coordinatorRound) nextSnapshot(ctx context.Context) (*CompleteSnapshot,
 			return nil, err
 		}
 	}
+}
+
+// nextPlanningSnapshot starts each fixed-point round from current physical
+// evidence and derives a new immutable semantic/physical materialization.
+// Reclassification is intentionally limited to round boundaries; snapshots
+// taken while executing a plan must continue to validate the plan's proof.
+func (r *coordinatorRound) nextPlanningSnapshot(ctx context.Context) (*CompleteSnapshot, error) {
+	snapshot, err := r.nextRawSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	materialized := materializeTargets(
+		r.dag, snapshot, r.allowEmptyTarget, r.semanticTargetByRel)
+	r.targetByRel = materialized.PhysicalByRel
+	r.semanticTargetByRel = materialized.SemanticByRel
+	r.dormantRels = materialized.DormantRels
+	r.dormantProofs = materialized.DormantProofs
+	return materialized.Snapshot, r.validatePreflightObservations(ctx, materialized.Snapshot)
+}
+
+func (r *coordinatorRound) nextSnapshot(ctx context.Context) (*CompleteSnapshot, error) {
+	snapshot, err := r.nextRawSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return r.prepareSnapshot(ctx, snapshot)
+}
+
+func (r *coordinatorRound) prepareSnapshot(ctx context.Context, snapshot *CompleteSnapshot) (*CompleteSnapshot, error) {
+	if err := validateDormantProofs(snapshot, r.dormantProofs); err != nil {
+		return snapshot, err
+	}
+	snapshot = snapshotWithDormantOwnershipOverlay(snapshot, r.dormantRels, r.semanticTargetByRel)
+	return snapshot, r.validatePreflightObservations(ctx, snapshot)
 }
 
 func (r *coordinatorRound) validatePreflightObservations(ctx context.Context, snapshot *CompleteSnapshot) error {
@@ -1299,7 +1346,9 @@ func cloneRelSet(in map[string]struct{}) map[string]struct{} {
 func (r *coordinatorRound) buildPlan(ctx context.Context, kind PhaseKind, snapshot *CompleteSnapshot) (PhasePlan, error) {
 	plan, err := BuildPhasePlan(PhasePlanInput{
 		Context: ctx, Kind: kind, DAG: r.dag, Snapshot: snapshot,
-		DesiredByRel: r.targetByRel, DynamicByRel: r.dynamicByRel, DesiredMemsByRel: r.desiredMemsByRel(),
+		DesiredByRel: r.targetByRel, SemanticByRel: r.semanticTargetByRel,
+		DynamicByRel: r.dynamicByRel, DesiredMemsByRel: r.desiredMemsByRel(),
+		DormantRels: r.dormantRels,
 		AllowedCPUs: r.allowedCPUs(), AllowEmptyTarget: r.allowEmptyTarget,
 		Capabilities: snapshot.Capabilities,
 		Witnesses:    r.witnesses, ProtectedPending: r.protectedPending,
@@ -1345,6 +1394,7 @@ func (r *coordinatorRound) executePlan(ctx context.Context, plan PhasePlan, res 
 		return err
 	}
 	writer := newSafeCPUSetWriter(r.driver, r.budget, res)
+	writer.dormantProofs = r.dormantProofs
 	return writer.execute(ctx, plan)
 }
 
@@ -1388,7 +1438,10 @@ func (r *coordinatorRound) revalidateGrowAuthorization(ctx context.Context, plan
 				})
 			}
 			delta := operation.Target.CPUs.Difference(current.CPUs)
-			authorized := fresh.DomainUnion[domain].Union(gate.AllowedEntering(domain))
+			physicalEnvelope := r.targetByRel[operation.Rel].Difference(r.semanticTargetByRel[operation.Rel])
+			authorized := fresh.DomainUnion[domain].
+				Union(gate.AllowedEntering(domain)).
+				Union(physicalEnvelope)
 			if !delta.IsSubsetOf(authorized) {
 				return staleWithFresh(&PlanStaleError{
 					Rel: operation.Rel, Direction: operation.Direction, Resource: "authorization",
@@ -1486,6 +1539,11 @@ func rebaseDrainPlan(plan PhasePlan, fresh *CompleteSnapshot, dag *TopoDAG, budg
 				Rel: rel, Direction: WriteShrink, Resource: "snapshot",
 				Current: "missing", Target: plan.TargetByRel[rel].CPUs.String(),
 			}
+		}
+	}
+	for rel := range targets {
+		if relInDormantSubtree(rel, plan.DormantRels) {
+			delete(targets, rel)
 		}
 	}
 	depthByRel := buildSnapshotDepthByRel(fresh, nil)

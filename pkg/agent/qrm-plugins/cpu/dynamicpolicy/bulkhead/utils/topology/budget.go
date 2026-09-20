@@ -138,6 +138,10 @@ type AutoCumulativeBudgetInput struct {
 
 const defaultConvergenceDeadlineDuration = 10 * time.Second
 const fixedInvocationHierarchyIOHeadroom = 64
+const (
+	normalSnapshotHierarchyIOPerNode   = 5
+	activitySnapshotHierarchyIOPerNode = 7
+)
 
 // DefaultConvergenceBudget returns defensive structural limits. Cumulative
 // round, hierarchy-I/O, and plan limits are derived after the first snapshot.
@@ -274,7 +278,7 @@ func (b *BudgetTracker) Deadline() time.Time {
 	return b.limit.Deadline
 }
 
-func (b *BudgetTracker) configureAutoHierarchyIOBootstrap(staleRetryAllowance int) error {
+func (b *BudgetTracker) configureAutoHierarchyIOBootstrap(staleRetryAllowance int, collectDormantActivity bool) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.limit.MaxHierarchyIOOperations != 0 {
@@ -284,7 +288,15 @@ func (b *BudgetTracker) configureAutoHierarchyIOBootstrap(staleRetryAllowance in
 		return fmt.Errorf("%w: stale retry allowance must not be negative: %d",
 			ErrAutoCumulativeBudgetInvalid, staleRetryAllowance)
 	}
-	snapshotIO, err := checkedAutoBudgetMultiply(b.limit.MaxSnapshotNodes, 5)
+	perNode := normalSnapshotHierarchyIOPerNode
+	if collectDormantActivity {
+		// Activity mode proves a v1 leaf with child-list brackets around
+		// membership and cpuset reads. Keep bootstrap capacity for the worst
+		// logical scan shape before the measured first snapshot can size the
+		// cumulative invocation budget.
+		perNode = activitySnapshotHierarchyIOPerNode
+	}
+	snapshotIO, err := checkedAutoBudgetMultiply(b.limit.MaxSnapshotNodes, perNode)
 	if err != nil {
 		return err
 	}
@@ -649,6 +661,25 @@ func (d *budgetedHierarchyDriver) ReadEntry(ctx context.Context, rel string) (En
 		return EntryState{}, err
 	}
 	return d.driver.ReadEntry(ctx, rel)
+}
+
+func (d *budgetedHierarchyDriver) ReadEntryWithActivity(
+	ctx context.Context,
+	rel string,
+	expected CgroupIdentity,
+) (EntryState, error) {
+	ctx, err := d.context(ctx)
+	if err != nil {
+		return EntryState{}, err
+	}
+	reader, ok := d.driver.(hierarchyActivityReader)
+	if !ok {
+		return EntryState{}, fmt.Errorf("hierarchy driver does not support cgroup activity proofs")
+	}
+	if reader, ok := d.driver.(budgetedHierarchyActivityReader); ok {
+		return reader.readEntryWithActivityAndBudget(ctx, rel, expected, d.budget)
+	}
+	return reader.ReadEntryWithActivity(ctx, rel, expected)
 }
 
 func (d *budgetedHierarchyDriver) ListChildren(ctx context.Context, rel string) ([]ChildRef, error) {
