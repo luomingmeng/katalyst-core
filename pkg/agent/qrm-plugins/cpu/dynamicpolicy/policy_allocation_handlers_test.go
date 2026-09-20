@@ -3066,6 +3066,67 @@ func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorAllowsNonBindingSharedPoolS
 	})
 }
 
+func TestAdjustPoolsAndIsolatedEntriesUsesFrozenAttemptConfiguration(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.reservedReclaimedCPUSet = machine.NewCPUSet()
+	p.reservedReclaimedCPUsSize = 0
+	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
+
+	dynamicConf := p.dynamicConfig.GetDynamicConfiguration()
+	dynamicConf.EnableReclaim = true
+	dynamicConf.EnableRampUpReclaimHardPartition = true
+	dynamicConf.InitialRampUpReclaimCPUSetRatio = 0.5
+	attemptConfig, err := p.captureAdvisorAttemptConfiguration()
+	require.NoError(t, err)
+
+	dynamicConf.EnableRampUpReclaimHardPartition = false
+	dynamicConf.InitialRampUpReclaimCPUSetRatio = 0
+
+	entries := state.PodEntries{
+		"owned-snb-ramp-up": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "owned-snb-ramp-up",
+					PodNamespace:  "default",
+					PodName:       "owned-snb-ramp-up",
+					ContainerName: "main",
+					OwnerPoolName: "share-NUMA0",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+					Annotations: map[string]string{
+						apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+					},
+				},
+				AllocationResult:         machine.NewCPUSet(0, 1, 2, 3, 4, 5),
+				TopologyAwareAssignments: map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1, 2, 3, 4, 5)},
+				RequestQuantity:          6,
+				RampUp:                   true,
+			},
+		},
+	}
+
+	err = p.adjustPoolsAndIsolatedEntriesWithRampUpFloorForModeAtRevision(
+		context.Background(),
+		map[string]map[int]int{"share-NUMA0": {0: 6}},
+		nil,
+		entries,
+		p.state.GetMachineState(),
+		false,
+		machine.NewCPUSet(),
+		false,
+		p.state.GetRevision(),
+		defaultShareMaterializationNormal,
+		attemptConfig,
+	)
+	require.ErrorContains(t, err,
+		`insufficient capacity for owned pool "share-numa0" in numa 0: requested 6 cpus, allocated 4`)
+}
+
 func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorRejectsPinnedSNBPoolShrinkAtomically(t *testing.T) {
 	t.Parallel()
 

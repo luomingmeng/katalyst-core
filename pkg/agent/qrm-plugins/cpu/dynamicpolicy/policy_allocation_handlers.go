@@ -1524,6 +1524,11 @@ func (p *DynamicPolicy) putAllocationsAndAdjustAllocationEntriesResizeAwareAtRev
 		}
 	}
 
+	attemptConfig, err := p.captureAdvisorAttemptConfiguration()
+	if err != nil {
+		return fmt.Errorf("capture advisor attempt configuration failed: %w", err)
+	}
+
 	if entries == nil {
 		entries = p.state.GetPodEntries()
 	} else {
@@ -1550,11 +1555,11 @@ func (p *DynamicPolicy) putAllocationsAndAdjustAllocationEntriesResizeAwareAtRev
 
 	machineState := p.state.GetMachineState()
 	numaResourcePackagePinnedCPUSet := machineState.GetNUMAResourcePackagePinnedCPUSet()
-	sharedNUMABindingCPUIncrRatio := p.getSharedNUMABindingCPUIncrRatio()
+	sharedNUMABindingCPUIncrRatio := getSharedNUMABindingCPUIncrRatioWithConfig(attemptConfig.dynamic)
 
 	var poolsQuantityMap map[string]map[int]int
 	if p.enableCPUAdvisor &&
-		!cpuutil.AdvisorDegradation(p.advisorMonitor.GetHealthy(), p.dynamicConfig.GetDynamicConfiguration().EnableReclaim) {
+		!cpuutil.AdvisorDegradation(p.advisorMonitor.GetHealthy(), attemptConfig.dynamic.EnableReclaim) {
 		// if sys advisor is enabled, we believe the pools' ratio that sys advisor indicates
 		csetMap, err := entries.GetFilteredPoolsCPUSetMap(state.IsResidentPool, commonstate.IsSystemPool)
 		if err != nil {
@@ -1628,9 +1633,9 @@ func (p *DynamicPolicy) putAllocationsAndAdjustAllocationEntriesResizeAwareAtRev
 	}
 
 	isolatedQuantityMap := state.GetIsolatedQuantityMapFromPodEntries(entries, allocationInfos, p.getContainerRequestedCores)
-	err = p.adjustPoolsAndIsolatedEntriesWithRampUpFloorAtRevision(
+	err = p.adjustPoolsAndIsolatedEntriesWithRampUpFloorForModeAtRevision(
 		ctx, poolsQuantityMap, isolatedQuantityMap, entries, machineState, persistCheckpoint,
-		machine.NewCPUSet(), true, expectedRevision)
+		machine.NewCPUSet(), true, expectedRevision, defaultShareMaterializationNormal, attemptConfig)
 	if err != nil {
 		return fmt.Errorf("adjustpoolsandisolatedentries failed with error: %s", strings.ToLower(err.Error()))
 	}
@@ -1870,6 +1875,11 @@ func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloorForModeAtRevisionW
 		general.InfoS("finished", "duration", time.Since(startTime))
 	}()
 
+	attemptConfig, err := p.captureAdvisorAttemptConfiguration()
+	if err != nil {
+		return fmt.Errorf("capture advisor attempt configuration failed: %w", err)
+	}
+
 	// Remove orphan non-resident pools from this adjustment's candidate before
 	// deriving pool quantities and materializing the default-share residual.
 	// The precommit cleanup remains as a defense against orphans introduced by
@@ -1880,11 +1890,10 @@ func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloorForModeAtRevisionW
 	// if sys advisor is enabled, we believe the pools' ratio that sys advisor indicates,
 	// else we do sum(containers req) for each pool to get pools ratio
 	var poolsQuantityMap map[string]map[int]int
-	dynamicConfig := p.dynamicConfig.GetDynamicConfiguration()
-	sharedNUMABindingCPUIncrRatio := getSharedNUMABindingCPUIncrRatioWithConfig(dynamicConfig)
+	sharedNUMABindingCPUIncrRatio := getSharedNUMABindingCPUIncrRatioWithConfig(attemptConfig.dynamic)
 	advisorHealthy := p.enableCPUAdvisor && p.advisorMonitor != nil &&
-		!cpuutil.AdvisorDegradation(p.advisorMonitor.GetHealthy(), dynamicConfig.EnableReclaim)
-	if dynamicConfig.FillDefaultSharePoolWithNonReclaimCPUs &&
+		!cpuutil.AdvisorDegradation(p.advisorMonitor.GetHealthy(), attemptConfig.dynamic.EnableReclaim)
+	if attemptConfig.dynamic.FillDefaultSharePoolWithNonReclaimCPUs &&
 		defaultShareMode != defaultShareMaterializationRecovery && !advisorHealthy {
 		return fmt.Errorf("default share residual quantity requires a healthy cpu advisor")
 	}
@@ -1909,9 +1918,9 @@ func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloorForModeAtRevisionW
 	}
 	isolatedQuantityMap := state.GetIsolatedQuantityMapFromPodEntries(entries, nil, p.getContainerRequestedCores)
 
-	err := p.adjustPoolsAndIsolatedEntriesWithRampUpFloorForModeAtRevision(
+	err = p.adjustPoolsAndIsolatedEntriesWithRampUpFloorForModeAtRevision(
 		ctx, poolsQuantityMap, isolatedQuantityMap, entries, machineState, persistCheckpoint,
-		explicitRampUpFloor, runCPUSetHandlers, expectedRevision, defaultShareMode)
+		explicitRampUpFloor, runCPUSetHandlers, expectedRevision, defaultShareMode, attemptConfig)
 	if err != nil {
 		return fmt.Errorf("adjustpoolsandisolatedentries failed with error: %w", err)
 	}
@@ -1930,9 +1939,13 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntries(
 	machineState state.NUMANodeMap,
 	persistCheckpoint bool,
 ) error {
-	return p.adjustPoolsAndIsolatedEntriesWithRampUpFloorAtRevision(
+	attemptConfig, err := p.captureAdvisorAttemptConfiguration()
+	if err != nil {
+		return fmt.Errorf("capture advisor attempt configuration failed: %w", err)
+	}
+	return p.adjustPoolsAndIsolatedEntriesWithRampUpFloorForModeAtRevision(
 		context.Background(), poolsQuantityMap, isolatedQuantityMap, entries, machineState, persistCheckpoint,
-		machine.NewCPUSet(), true, p.state.GetRevision())
+		machine.NewCPUSet(), true, p.state.GetRevision(), defaultShareMaterializationNormal, attemptConfig)
 }
 
 func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloorAtRevision(
@@ -1946,12 +1959,20 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloorAtRevision(
 	runCPUSetHandlers bool,
 	expectedRevision uint64,
 ) error {
+	attemptConfig, err := p.captureAdvisorAttemptConfiguration()
+	if err != nil {
+		return fmt.Errorf("capture advisor attempt configuration failed: %w", err)
+	}
 	return p.adjustPoolsAndIsolatedEntriesWithRampUpFloorForModeAtRevision(
 		ctx, poolsQuantityMap, isolatedQuantityMap, entries, machineState,
 		persistCheckpoint, explicitRampUpFloor, runCPUSetHandlers,
-		expectedRevision, defaultShareMaterializationNormal)
+		expectedRevision, defaultShareMaterializationNormal, attemptConfig)
 }
 
+// adjustPoolsAndIsolatedEntriesWithRampUpFloorForModeAtRevision keeps the
+// shared NUMA-binding ratio and its hard-partition floor on one immutable
+// attemptConfig. Re-reading dynamic configuration between those decisions can
+// size the pool under one mode and reserve reclaim capacity under another.
 func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloorForModeAtRevision(
 	ctx context.Context,
 	poolsQuantityMap map[string]map[int]int,
@@ -1963,11 +1984,15 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloorForModeAtRev
 	runCPUSetHandlers bool,
 	expectedRevision uint64,
 	defaultShareMode defaultShareMaterializationMode,
+	attemptConfig advisorAttemptConfiguration,
 ) error {
 	rampUpReclaimFloor := explicitRampUpFloor.Clone()
-	if p.isRampUpReclaimHardPartitionEnabled() && rampUpReclaimFloor.IsEmpty() {
+	hardPartitionEnabled := isRampUpReclaimHardPartitionEnabledWithConfig(attemptConfig.dynamic)
+	if hardPartitionEnabled && rampUpReclaimFloor.IsEmpty() {
 		var err error
-		rampUpReclaimFloor, err = p.deriveRampUpReclaimFloor(machineState, entries, false)
+		rampUpReclaimFloor, err = p.deriveRampUpReclaimFloorForModeWithDynamicConfig(
+			machineState, entries, false,
+			p.state.GetDisableDedicatedCoresOverlapReclaimedCores(), attemptConfig)
 		if err != nil {
 			return fmt.Errorf("derive reclaim floor before allocating pools failed: %w", err)
 		}
@@ -1985,7 +2010,7 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloorForModeAtRev
 	// or forbidden pools.
 	notAllocatablePoolCPUs := p.getNotAllocatablePoolCPUs(entries)
 	availableCPUs = availableCPUs.Difference(notAllocatablePoolCPUs)
-	hardPartitionWithExplicitFloor := p.isRampUpReclaimHardPartitionEnabled() && !rampUpReclaimFloor.IsEmpty()
+	hardPartitionWithExplicitFloor := hardPartitionEnabled && !rampUpReclaimFloor.IsEmpty()
 	if hardPartitionWithExplicitFloor {
 		availableCPUs = availableCPUs.Difference(rampUpReclaimFloor)
 	}
@@ -2006,7 +2031,7 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloorForModeAtRev
 	// applyPoolsAndIsolatedInfo.
 	fixedPoolsQuantityMap := copyPoolQuantityMap(poolsQuantityMap)
 	defaultSharePlan := defaultShareMaterializationPlan{mode: defaultShareMode}
-	if p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs {
+	if attemptConfig.dynamic.FillDefaultSharePoolWithNonReclaimCPUs {
 		defaultSharePlan.enabled = true
 		quantityByNUMA, ok := fixedPoolsQuantityMap[commonstate.PoolNameShare]
 		if !ok {
