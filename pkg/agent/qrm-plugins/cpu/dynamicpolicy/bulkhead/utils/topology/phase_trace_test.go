@@ -689,6 +689,77 @@ func TestCompileFixedPointTraceIncludesStagedDynamicDescendantGrow(t *testing.T)
 	require.Zero(t, fixture.driver.PhysicalWriteCount())
 }
 
+func TestCompileFixedPointTraceStagesPendingSourceDrainAndDefersUnrelatedSiblingShrink(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.driver.capabilities = cgroupV2Policy.capabilities(true)
+	fixture.round.allowEmptyTarget = true
+	fixture.selection.MaxCPUsDrainRatio = 0.25
+	for cpu := 4; cpu < 192; cpu++ {
+		fixture.cpuDetails[cpu] = machine.CPUTopoInfo{NUMANodeID: 0}
+	}
+
+	const (
+		allCPUs       = "0-191"
+		pendingCPUs   = "0-103"
+		scopeCPUs     = "0-51"
+		remainingCPUs = "104-191"
+	)
+	fixture.addPrimary("primary", pendingCPUs, "0")
+	fixture.addDynamicDescendant("primary/scope", scopeCPUs, "0")
+	fixture.addDynamicDescendant("primary/sibling", pendingCPUs, "0")
+	fixture.addReclaim("reclaim", allCPUs, "0")
+	fixture.addReclaim("reclaim/bucket", allCPUs, "0")
+	fixture.addReclaim("reclaim/bucket/leaf", allCPUs, "0")
+
+	fixture.targetByRel["primary/scope"] = machine.MustParse(pendingCPUs)
+	fixture.dynamicByRel["primary/scope"] = machine.MustParse(pendingCPUs)
+	fixture.targetByRel["primary/sibling"] = machine.NewCPUSet()
+	fixture.dynamicByRel["primary/sibling"] = machine.NewCPUSet()
+	fixture.targetByRel["reclaim"] = machine.MustParse(remainingCPUs)
+	fixture.targetByRel["reclaim/bucket"] = machine.MustParse(remainingCPUs)
+	fixture.targetByRel["reclaim/bucket/leaf"] = machine.MustParse(remainingCPUs)
+	for i := range fixture.specs {
+		fixture.specs[i].CPUs = fixture.targetByRel[fixture.specs[i].Rel].Clone()
+	}
+	fixture.round.protectedPending = machine.MustParse(pendingCPUs)
+	fixture.round.pendingRequiredByRel = map[string]machine.CPUSet{
+		"primary":       machine.MustParse(pendingCPUs),
+		"primary/scope": machine.MustParse(pendingCPUs),
+	}
+	fixture.round.deferredByRel = map[string]machine.CPUSet{
+		"primary/sibling": machine.NewCPUSet(),
+	}
+
+	base := fixture.snapshot()
+	trace, err := fixture.round.compileFixedPointTrace(context.Background(), base)
+	require.NoError(t, err)
+	require.True(t, trace.FinalEvaluation.ParentSafety.Safe)
+	require.Zero(t, fixture.driver.PhysicalWriteCount())
+
+	sourceDrainPhases := 0
+	sawPartialSourceDrain := false
+	for _, phase := range trace.Phases {
+		if phase.Kind != PhaseDrain {
+			continue
+		}
+		for _, operation := range phase.Operations {
+			require.NotEqual(t, "primary/sibling", operation.Rel,
+				"unrelated primary sibling cleanup must remain deferred")
+			if operation.Rel != "reclaim/bucket/leaf" || operation.Direction != WriteShrink {
+				continue
+			}
+			sourceDrainPhases++
+			if !operation.Target.CPUs.Intersection(machine.MustParse(pendingCPUs)).IsEmpty() {
+				sawPartialSourceDrain = true
+			}
+		}
+	}
+	require.Greater(t, sourceDrainPhases, 1, "pending source must drain in staged rounds")
+	require.True(t, sawPartialSourceDrain, "trace must retain an intermediate partial source drain")
+	require.True(t, trace.FinalSnapshot.DomainUnion[DomainReclaim].
+		Intersection(machine.MustParse(pendingCPUs)).IsEmpty())
+}
+
 func TestCompileFixedPointTraceScalesAcross1024CPUShapes(t *testing.T) {
 	requireTopologyScaleTests(t)
 

@@ -138,7 +138,11 @@ type AdmissionSafetyInput struct {
 
 // SplitPlanForAdmission returns an executable safety closure and a summary-only
 // deferred plan. Callers must never persist or replay the deferred operations;
-// retry/periodic rounds rebuild a full plan from a fresh snapshot.
+// retry/periodic rounds rebuild a full plan from a fresh snapshot. Pending CPUs
+// are classified per destination domain: a shrink is mandatory only when it
+// removes pending CPUs still owned by the source domain and no pending
+// requirement targets that same domain. Missing ownership evidence falls back
+// to the conservative global rule.
 func SplitPlanForAdmission(plan *PhasePlan, in AdmissionSafetyInput) (required, deferred *PhasePlan, err error) {
 	if plan == nil {
 		return nil, nil, errors.New("cannot split nil admission plan")
@@ -153,10 +157,21 @@ func SplitPlanForAdmission(plan *PhasePlan, in AdmissionSafetyInput) (required, 
 	classes := make([]operationClass, len(plan.Operations))
 	outgoingCPUsBySource := make(map[DomainID]machine.CPUSet, len(plan.TransferGraph))
 	incomingCPUsByDestination := make(map[DomainID]machine.CPUSet, len(plan.TransferGraph))
+	pendingCPUsByDestination := make(map[DomainID]machine.CPUSet)
 	for source, destinations := range plan.TransferGraph {
 		for destination, cpus := range destinations {
 			outgoingCPUsBySource[source] = outgoingCPUsBySource[source].Union(cpus)
 			incomingCPUsByDestination[destination] = incomingCPUsByDestination[destination].Union(cpus)
+		}
+	}
+	if plan.Base != nil {
+		for rel, cpus := range in.PendingRequiredByRel {
+			domain := plan.Base.DomainByRel[rel]
+			if domain == "" {
+				continue
+			}
+			pendingCPUsByDestination[domain] = pendingCPUsByDestination[domain].
+				Union(cpus.Intersection(in.PendingCPUSet))
 		}
 	}
 	for i, operation := range plan.Operations {
@@ -167,10 +182,18 @@ func SplitPlanForAdmission(plan *PhasePlan, in AdmissionSafetyInput) (required, 
 		if plan.Base != nil {
 			operationDomain = plan.Base.DomainByRel[operation.Rel]
 		}
+		removedPending := removedCPUs.Intersection(in.PendingCPUSet)
+		sourceOwnedPendingDrain := !removedPending.IsEmpty()
+		if plan.Base != nil && operationDomain != "" {
+			if !pendingCPUsByDestination[operationDomain].IsEmpty() {
+				sourceOwnedPendingDrain = false
+			} else if owned, ok := plan.Base.DomainUnion[operationDomain]; ok {
+				sourceOwnedPendingDrain = !removedPending.Intersection(owned).IsEmpty()
+			}
+		}
 		switch {
 		case operation.Direction == WriteShrink &&
-			!operation.ExpectedCurrent.CPUs.Intersection(in.PendingCPUSet).IsEmpty() &&
-			operation.Target.CPUs.Intersection(in.PendingCPUSet).IsEmpty():
+			sourceOwnedPendingDrain:
 			classes[i] = operationClass{required: true, requirement: OperationAdmissionSourceDrain}
 		case operation.Direction == WriteShrink &&
 			!removedCPUs.Intersection(outgoingCPUsBySource[operationDomain]).IsEmpty():
