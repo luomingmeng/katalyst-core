@@ -18,6 +18,7 @@ package dynamicpolicy
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -449,6 +450,88 @@ func TestPreparePendingCPUPartitionRevalidatesQuantityAfterHooks(t *testing.T) {
 
 	require.ErrorContains(t, err, "allocation quantity changed after hooks")
 	require.Nil(t, p.state.GetAllocationInfo("dedicated-pod", "main"))
+}
+
+func TestPreparePendingCPUPartitionRejectsReplacementQuantityMutation(t *testing.T) {
+	testPreparePendingCPUPartitionRejectsReplacementMutation(t,
+		func(topology *machine.CPUTopology, entries state.PodEntries) {
+			dedicated := coresInNUMA(topology, 0, 1, 2)
+			entries["dedicated-pod"]["main"].AllocationResult =
+				machine.NewCPUSet(dedicated.ToSliceInt()[0])
+		},
+		"allocation quantity changed",
+	)
+}
+
+func TestPreparePendingCPUPartitionRejectsReplacementNUMAMigration(t *testing.T) {
+	testPreparePendingCPUPartitionRejectsReplacementMutation(t,
+		func(topology *machine.CPUTopology, entries state.PodEntries) {
+			entries["dedicated-pod"]["main"].AllocationResult =
+				coresInNUMA(topology, 1, 0, 1)
+		},
+		"allocation NUMA distribution changed",
+	)
+}
+
+func TestPreparePendingCPUPartitionRejectsPartialReclaimCore(t *testing.T) {
+	testPreparePendingCPUPartitionRejectsReplacementMutation(t,
+		func(topology *machine.CPUTopology, entries state.PodEntries) {
+			firstCore := coresInNUMA(topology, 0, 0, 1).ToSliceInt()
+			secondCore := coresInNUMA(topology, 0, 1, 2).ToSliceInt()
+			entries[commonstate.PoolNameReclaim][commonstate.FakedContainerName].
+				AllocationResult = machine.NewCPUSet(firstCore[0], secondCore[0])
+		},
+		"reclaim is not core-aligned",
+	)
+}
+
+func testPreparePendingCPUPartitionRejectsReplacementMutation(
+	t *testing.T,
+	mutate func(*machine.CPUTopology, state.PodEntries),
+	wantError string,
+) {
+	t.Helper()
+
+	topology, err := machine.GenerateDummyCPUTopology(96, 2, 2)
+	require.NoError(t, err)
+	stateDir := t.TempDir()
+	p, err := getTestDynamicPolicyWithoutInitialization(topology, stateDir)
+	require.NoError(t, err)
+
+	require.NoError(t, p.state.StoreState())
+	initialRevision := p.state.GetRevision()
+	initialEntries := p.state.GetPodEntries()
+	initialMachineState := p.state.GetMachineState()
+	checkpointPath := filepath.Join(stateDir, cpuPluginStateFileName)
+	initialCheckpoint, err := os.ReadFile(checkpointPath)
+	require.NoError(t, err)
+
+	planned := precommitPartitionEntries(
+		coresInNUMA(topology, 0, 0, 1),
+		coresInNUMA(topology, 0, 1, 2),
+	)
+
+	_, _, err = p.commitPendingCPUPartition(pendingCPUPartition{
+		expectedRevision:          initialRevision,
+		entries:                   planned,
+		disableDedicated:          true,
+		persist:                   true,
+		source:                    "replacement mutation test",
+		requireCoreAlignedReclaim: true,
+		enforceSteadyReclaim:      true,
+		validate: func(entries state.PodEntries, _ state.NUMANodeMap, _, _ bool) error {
+			mutate(topology, entries)
+			return nil
+		},
+	})
+
+	require.ErrorContains(t, err, wantError)
+	require.Equal(t, initialRevision, p.state.GetRevision())
+	require.Equal(t, initialEntries, p.state.GetPodEntries())
+	require.Equal(t, initialMachineState, p.state.GetMachineState())
+	afterCheckpoint, readErr := os.ReadFile(checkpointPath)
+	require.NoError(t, readErr)
+	require.Equal(t, initialCheckpoint, afterCheckpoint)
 }
 
 func TestValidateSteadyReclaimPrecommitInvariant(t *testing.T) {

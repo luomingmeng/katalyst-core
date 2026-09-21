@@ -18,6 +18,7 @@ package dynamicpolicy
 
 import (
 	"fmt"
+	"reflect"
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
@@ -146,8 +147,44 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 				entries, machineState, allowOverlap, disableDedicated, pending.dynamicConfig)
 		}
 	}
+	preValidationEntries := candidate.Clone()
+	preValidationMachineState := machineState.Clone()
 	if err := validate(candidate, machineState, pending.allowOverlap, pending.disableDedicated); err != nil {
 		return nil, p.wrapPartitionPrecommitError(pending.source, "validate hard floor and partition", err)
+	}
+	// Keep the frozen plan authoritative through the complete prepare phase.
+	// A validator is expected to be read-only, but re-check the candidate here
+	// so a late mutation cannot bypass the hook-time replacement invariants.
+	if p.machineInfo != nil && p.machineInfo.CPUTopology != nil {
+		if err := validateAllocationShapeAfterHooks(
+			pending.entries, candidate, p.machineInfo.CPUTopology,
+		); err != nil {
+			return nil, p.wrapPartitionPrecommitError(
+				pending.source, "revalidate replacement baseline after partition validation", err)
+		}
+		if pending.requireCoreAlignedReclaim {
+			if err := assertCoreAligned(reclaimPoolCPUSet(candidate), p.machineInfo.CPUTopology); err != nil {
+				return nil, p.wrapPartitionPrecommitError(
+					pending.source, "revalidate replacement baseline after partition validation",
+					fmt.Errorf("reclaim is not core-aligned: %w", err))
+			}
+		}
+		if pending.enforceSteadyReclaim {
+			if err := validateSteadyReclaimPrecommitInvariant(
+				reclaimPoolCPUSet(pending.entries),
+				reclaimPoolCPUSet(candidate),
+				p.machineInfo.CPUTopology,
+			); err != nil {
+				return nil, p.wrapPartitionPrecommitError(
+					pending.source, "revalidate replacement baseline after partition validation", err)
+			}
+		}
+	}
+	if !reflect.DeepEqual(preValidationEntries, candidate) ||
+		!reflect.DeepEqual(preValidationMachineState, machineState) {
+		return nil, p.wrapPartitionPrecommitError(
+			pending.source, "revalidate replacement baseline after partition validation",
+			fmt.Errorf("partition validator mutated its candidate"))
 	}
 	return &preparedCPUPartition{
 		pending:      pending,
