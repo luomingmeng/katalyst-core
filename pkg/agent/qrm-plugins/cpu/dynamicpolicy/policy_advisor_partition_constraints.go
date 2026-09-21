@@ -82,12 +82,21 @@ func solveDisjointPartitionsWithPinnedCoreFloors(
 		if !found {
 			return nil, fmt.Errorf("partition core-floor demand %q is missing", floor.demandKey)
 		}
+		demand := demands[demandIndex]
+		if demand.quantity <= 0 {
+			return nil, fmt.Errorf(
+				"partition core-floor demand %q has non-positive quantity %d",
+				floor.demandKey, demand.quantity)
+		}
 		assigned := assignments[floor.demandKey]
+		if assigned.IsEmpty() {
+			return nil, fmt.Errorf(
+				"partition core-floor demand %q has empty assignment", floor.demandKey)
+		}
 		if assertCoreAligned(assigned, topology) == nil {
 			continue
 		}
 
-		demand := demands[demandIndex]
 		candidates := coreAlignedCandidates(topology, demand.eligible, demand.preferred)
 		assignedToOtherDemands := machine.NewCPUSet()
 		for key, cpus := range assignments {

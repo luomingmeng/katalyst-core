@@ -229,11 +229,15 @@ func projectSteadyFakeNUMAStageWithBudgetAndPins(
 			if solveErr == nil {
 				repair, repairErr := solveSteadyFakeNUMADesiredWholeCore(
 					repairDemands, fakeKeys, floors, topology, baseline)
-				if repairErr == nil &&
-					steadyFakeNUMAMigrationChurn(
-						committed.reclaim, unionPartitionAssignments(repair, fakeKeys),
-					) <= steadyFakeNUMAMaxMigratedCPUs {
-					return repair, nil
+				if repairErr == nil {
+					contractErr := validateSteadyFakeNUMARepairBlockQuantities(
+						demands, fakeKeys, repair)
+					if contractErr == nil &&
+						steadyFakeNUMAMigrationChurn(
+							committed.reclaim, unionPartitionAssignments(repair, fakeKeys),
+						) <= steadyFakeNUMAMaxMigratedCPUs {
+						return repair, nil
+					}
 				}
 			}
 		}
@@ -424,6 +428,49 @@ func projectSteadyFakeNUMAStageWithBudgetAndPins(
 	return nil, fmt.Errorf(
 		"no legal staged reclaim migration within %d changed CPU IDs",
 		migrationLimit)
+}
+
+func validateSteadyFakeNUMARepairBlockQuantities(
+	demands []partitionDemand,
+	fakeKeys []string,
+	assignments map[string]machine.CPUSet,
+) error {
+	demandByKey := make(map[string]partitionDemand, len(demands))
+	for _, demand := range demands {
+		demandByKey[demand.key] = demand
+	}
+
+	requestedByBlock := make(map[string]int)
+	assignedByBlock := make(map[string]int)
+	for _, key := range fakeKeys {
+		demand, found := demandByKey[key]
+		if !found {
+			return fmt.Errorf("repair contract demand %q is missing", key)
+		}
+		assigned, found := assignments[key]
+		if !found {
+			return fmt.Errorf("repair contract assignment %q is missing", key)
+		}
+		blockKey := steadyFakeNUMARepairBlockKey(key)
+		requestedByBlock[blockKey] += demand.quantity
+		assignedByBlock[blockKey] += assigned.Size()
+	}
+	for blockKey, requested := range requestedByBlock {
+		if assigned := assignedByBlock[blockKey]; assigned != requested {
+			return fmt.Errorf(
+				"repair block %q assigned quantity %d, want %d",
+				blockKey, assigned, requested)
+		}
+	}
+	return nil
+}
+
+func steadyFakeNUMARepairBlockKey(demandKey string) string {
+	const numaMarker = "\x00numa\x00"
+	if index := strings.LastIndex(demandKey, numaMarker); index >= 0 {
+		return demandKey[:index]
+	}
+	return demandKey
 }
 
 func steadyFakeNUMAStageDemands(
