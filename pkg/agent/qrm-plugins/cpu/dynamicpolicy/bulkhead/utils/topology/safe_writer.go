@@ -373,6 +373,12 @@ func (w safeCPSetWriter) scanStableOperationChildren(
 		children, err := scanStableLiveChildren(
 			ctx, driver, operation.Rel, checkMems, failClosedRels)
 		if err != nil {
+			if driver.Classify(err, HierarchyOperationList) == HierarchyErrorStale {
+				return nil, &PlanStaleError{
+					Rel: operation.Rel, Direction: operation.Direction, Resource: "hierarchy",
+					Err: err,
+				}
+			}
 			return nil, err
 		}
 		if operation.Direction == WriteShrink &&
@@ -500,7 +506,10 @@ func scanStableLiveChildren(
 		before, err := driver.ListChildren(ctx, rel)
 		if err != nil {
 			if driver.Classify(err, HierarchyOperationList) == HierarchyErrorStale {
-				continue
+				// The relation being scanned, rather than one of its children,
+				// disappeared. Re-listing cannot recover the frozen generation;
+				// return the stale evidence so the caller can replan.
+				return stableLiveChildren{}, err
 			}
 			return stableLiveChildren{}, err
 		}
@@ -548,7 +557,10 @@ func scanStableLiveChildren(
 		after, err := driver.ListChildren(ctx, rel)
 		if err != nil {
 			if driver.Classify(err, HierarchyOperationList) == HierarchyErrorStale {
-				continue
+				// A stale second list means the scanned relation vanished after
+				// the first observation. Child churn is retried above, but this
+				// parent-generation loss must invalidate the plan.
+				return stableLiveChildren{}, err
 			}
 			return stableLiveChildren{}, err
 		}

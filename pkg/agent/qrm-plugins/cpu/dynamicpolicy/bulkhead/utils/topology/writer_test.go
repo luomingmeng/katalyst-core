@@ -398,8 +398,10 @@ func TestVerifyResetConvergenceKeepsEffectiveCPUsForNonEmptyTarget(t *testing.T)
 
 func TestSafeWriterV2EmptyConfiguredCPUWriteRecordsSuccessfulJournal(t *testing.T) {
 	identity := CgroupIdentity{Device: 1, Inode: 1}
+	hierarchy := newFakeHierarchyDriver()
+	hierarchy.add("primary", identity, "0-3", "0")
 	driver := &resetConvergenceStateDriver{
-		HierarchyDriver: newFakeHierarchyDriver(),
+		HierarchyDriver: hierarchy,
 		states: map[string]EntryState{"primary": {
 			Rel: "primary", Identity: identity,
 			CPUs: machine.MustParse("0-3"), ConfiguredCPUs: machine.MustParse("0-3"),
