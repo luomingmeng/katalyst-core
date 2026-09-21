@@ -42,6 +42,173 @@ func TestProjectedPhaseSessionSnapshotHonorsCanceledContext(t *testing.T) {
 	_, err = session.Snapshot(ctx)
 
 	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, err, ErrConvergenceDeadlineExceeded)
+}
+
+func TestProjectedPhaseSessionSnapshotDoesNotPublishCloneWhenCanceledAfterClone(t *testing.T) {
+	_, base := newTask9ParentSafeFixture(t)
+	session, err := newProjectedPhaseSession(base, base.Capabilities)
+	require.NoError(t, err)
+	ctx := &traceValidationCancellationContext{
+		Context:  context.Background(),
+		cancelOn: 2,
+	}
+
+	snapshot, err := session.Snapshot(ctx)
+
+	require.Nil(t, snapshot)
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, err, ErrConvergenceDeadlineExceeded)
+	require.Equal(t, 2, ctx.checks)
+}
+
+func TestProjectedPhaseSessionApplyHonorsCancellationBeforeOperation(t *testing.T) {
+	hierarchy := projectedHierarchyFixture(t, v2Capabilities())
+	session := &projectedPhaseSession{
+		hierarchy: hierarchy,
+		progress:  make(map[phaseProgressKey]struct{}),
+	}
+	operation := hierarchy.cpuOperation(
+		projectedChildRel,
+		machine.NewCPUSet(),
+		machine.NewCPUSet(0),
+	)
+	plan := PhasePlan{Kind: PhaseExpand, Operations: []PlanOperation{operation}}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	plan.Operations[0].PlanID = plan.PlanID
+	before := CloneCompleteSnapshot(session.hierarchy.snapshot)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	result, err := session.Apply(ctx, plan)
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, err, ErrConvergenceDeadlineExceeded)
+	require.Zero(t, result.Applied)
+	require.Empty(t, result.Journal)
+	require.Equal(t, before, session.hierarchy.snapshot)
+}
+
+func TestProjectedPhaseSessionApplyPreservesPartialResultWithoutPublishingCandidateOnCancellation(t *testing.T) {
+	hierarchy := projectedHierarchyFixture(t, v2Capabilities())
+	for _, rel := range []string{projectedChildRel, projectedInheritRel} {
+		entry := hierarchy.snapshot.Entries[rel]
+		entry.CPUs = machine.NewCPUSet(0)
+		entry.ConfiguredCPUs = machine.NewCPUSet(0)
+		hierarchy.snapshot.Entries[rel] = entry
+	}
+	require.NoError(t, hierarchy.recomputeEvidence())
+	session := &projectedPhaseSession{
+		hierarchy: hierarchy,
+		progress:  make(map[phaseProgressKey]struct{}),
+	}
+	plan := PhasePlan{
+		Kind: PhaseExpand,
+		Operations: []PlanOperation{
+			hierarchy.cpuOperation(projectedChildRel, machine.NewCPUSet(0), machine.MustParse("0-1")),
+			hierarchy.cpuOperation(projectedInheritRel, machine.NewCPUSet(0), machine.MustParse("0-1")),
+		},
+	}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	for i := range plan.Operations {
+		plan.Operations[i].PlanID = plan.PlanID
+	}
+	before := CloneCompleteSnapshot(session.hierarchy.snapshot)
+	ctx := &traceValidationCancellationContext{
+		Context:  context.Background(),
+		cancelOn: 4,
+	}
+
+	result, err := session.Apply(ctx, plan)
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, err, ErrConvergenceDeadlineExceeded)
+	require.Equal(t, 1, result.Applied)
+	require.Len(t, result.Journal, 1)
+	require.Equal(t, plan.Operations[0].Rel, result.Journal[0].Rel)
+	require.Equal(t, before, session.hierarchy.snapshot,
+		"partially applied candidate must not replace the published projected hierarchy")
+}
+
+func TestProjectedPhaseSessionApplyCanceledPlanCanRetryWithFreshContext(t *testing.T) {
+	hierarchy := projectedHierarchyFixture(t, v2Capabilities())
+	for _, rel := range []string{projectedChildRel, projectedInheritRel} {
+		entry := hierarchy.snapshot.Entries[rel]
+		entry.CPUs = machine.NewCPUSet(0)
+		entry.ConfiguredCPUs = machine.NewCPUSet(0)
+		hierarchy.snapshot.Entries[rel] = entry
+	}
+	require.NoError(t, hierarchy.recomputeEvidence())
+	session := &projectedPhaseSession{
+		hierarchy: hierarchy,
+		progress:  make(map[phaseProgressKey]struct{}),
+	}
+	plan := PhasePlan{
+		Kind: PhaseExpand,
+		Operations: []PlanOperation{
+			hierarchy.cpuOperation(projectedChildRel, machine.NewCPUSet(0), machine.MustParse("0-1")),
+			hierarchy.cpuOperation(projectedInheritRel, machine.NewCPUSet(0), machine.MustParse("0-1")),
+		},
+	}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	for i := range plan.Operations {
+		plan.Operations[i].PlanID = plan.PlanID
+	}
+	key := phaseProgressKey{SnapshotID: hierarchy.snapshot.ID, PlanID: plan.PlanID}
+	canceled := &traceValidationCancellationContext{
+		Context:  context.Background(),
+		cancelOn: 4,
+	}
+
+	_, err := session.Apply(canceled, plan)
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotContains(t, session.progress, key,
+		"an uncommitted candidate must not consume the plan progress key")
+
+	result, err := session.Apply(context.Background(), plan)
+	require.NoError(t, err)
+	require.Equal(t, len(plan.Operations), result.Applied)
+	require.Contains(t, session.progress, key)
+	require.True(t, session.hierarchy.snapshot.Entries[projectedChildRel].CPUs.Equals(machine.MustParse("0-1")))
+	require.True(t, session.hierarchy.snapshot.Entries[projectedInheritRel].CPUs.Equals(machine.MustParse("0-1")))
+}
+
+func TestCompileValidatedFixedPointTraceCanceledEntryCarriesCoordinatorUsage(t *testing.T) {
+	fixture := newAdmissionTraceFixture(t)
+	fixture.configureStagedSMTTransferWithDynamicDescendant()
+	fixture.round.round = 3
+	require.NoError(t, fixture.budget.ConsumePlanOperations(7))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	trace, err := fixture.round.compileValidatedFixedPointTrace(ctx, fixture.snapshot())
+
+	require.Nil(t, trace)
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, err, ErrConvergenceDeadlineExceeded)
+	var deadlineErr *convergenceDeadlineContextError
+	require.ErrorAs(t, err, &deadlineErr)
+	require.True(t, deadlineErr.hasCoordinatorState)
+	require.Equal(t, 3, deadlineErr.rounds)
+	require.Equal(t, fixture.budget.Usage(), deadlineErr.usage)
+}
+
+func TestProjectedPhaseSessionCanceledEntryDoesNotInventCoordinatorUsage(t *testing.T) {
+	_, base := newTask9ParentSafeFixture(t)
+	session, err := newProjectedPhaseSession(base, base.Capabilities)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = session.Snapshot(ctx)
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, err, ErrConvergenceDeadlineExceeded)
+	var deadlineErr *convergenceDeadlineContextError
+	require.ErrorAs(t, err, &deadlineErr)
+	require.False(t, deadlineErr.hasCoordinatorState)
+	require.NotContains(t, err.Error(), "rounds=")
+	require.NotContains(t, err.Error(), "usage=")
 }
 
 func TestFrozenTraceValidationHonorsCancellationDuringOperationReplay(t *testing.T) {

@@ -76,12 +76,16 @@ func (e *ProjectedPhaseNoProgressError) Error() string {
 func (e *ProjectedPhaseNoProgressError) Unwrap() error { return ErrNoProgress }
 
 type convergenceDeadlineContextError struct {
-	cause  error
-	rounds int
-	usage  BudgetUsage
+	cause               error
+	hasCoordinatorState bool
+	rounds              int
+	usage               BudgetUsage
 }
 
 func (e *convergenceDeadlineContextError) Error() string {
+	if !e.hasCoordinatorState {
+		return fmt.Sprintf("%v: %v", ErrConvergenceDeadlineExceeded, e.cause)
+	}
 	return fmt.Sprintf("%v: %v after rounds=%d usage=%+v",
 		ErrConvergenceDeadlineExceeded, e.cause, e.rounds, e.usage)
 }
@@ -90,6 +94,31 @@ func (e *convergenceDeadlineContextError) Unwrap() error { return e.cause }
 
 func (e *convergenceDeadlineContextError) Is(target error) bool {
 	return target == ErrConvergenceDeadlineExceeded || errors.Is(e.cause, target)
+}
+
+// classifyContextExit maps context cancellation and deadline errors onto the
+// convergence-deadline taxonomy while preserving the original context cause
+// for errors.Is. It attaches projected round and budget usage at most once and
+// leaves non-context errors unchanged.
+func (r *coordinatorRound) classifyContextExit(err error) error {
+	if err == nil || (!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)) {
+		return err
+	}
+	var classified *convergenceDeadlineContextError
+	if errors.As(err, &classified) && classified.hasCoordinatorState {
+		return err
+	}
+	cause := err
+	if classified != nil {
+		cause = classified.cause
+	}
+	classified = &convergenceDeadlineContextError{cause: cause}
+	if r != nil && r.budget != nil {
+		classified.hasCoordinatorState = true
+		classified.rounds = r.round
+		classified.usage = r.budget.Usage()
+	}
+	return classified
 }
 
 // CompiledPhase is one ordered, frozen phase of a fixed-point trace. Operations
@@ -271,18 +300,22 @@ func newProjectedPhaseSession(
 
 func (s *projectedPhaseSession) Snapshot(ctx context.Context) (*CompleteSnapshot, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, &convergenceDeadlineContextError{cause: err}
 	}
 	snapshot := CloneCompleteSnapshot(s.hierarchy.snapshot)
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, &convergenceDeadlineContextError{cause: err}
 	}
 	return snapshot, nil
 }
 
+// Apply evaluates a frontier against an isolated candidate and commits both
+// the projected snapshot and its progress key only after every operation and
+// evidence settlement succeeds. Cancellation cannot consume progress or make
+// a retry appear to be a projected cycle.
 func (s *projectedPhaseSession) Apply(ctx context.Context, plan PhasePlan) (phaseSessionApplyResult, error) {
 	if err := ctx.Err(); err != nil {
-		return phaseSessionApplyResult{}, err
+		return phaseSessionApplyResult{}, &convergenceDeadlineContextError{cause: err}
 	}
 	if len(plan.Operations) == 0 {
 		return phaseSessionApplyResult{}, nil
@@ -294,13 +327,12 @@ func (s *projectedPhaseSession) Apply(ctx context.Context, plan PhasePlan) (phas
 			PlanID:     key.PlanID,
 		}
 	}
-	s.progress[key] = struct{}{}
 	candidate, err := newProjectedHierarchy(s.hierarchy.snapshot, s.hierarchy.capabilities)
 	if err != nil {
 		return phaseSessionApplyResult{}, err
 	}
 	if err := ctx.Err(); err != nil {
-		return phaseSessionApplyResult{}, err
+		return phaseSessionApplyResult{}, &convergenceDeadlineContextError{cause: err}
 	}
 	candidate.evidenceRebuilds = s.hierarchy.evidenceRebuilds
 	if err := validateProjectedFrontierIndependence(candidate, plan.Operations); err != nil {
@@ -309,7 +341,7 @@ func (s *projectedPhaseSession) Apply(ctx context.Context, plan PhasePlan) (phas
 	result := phaseSessionApplyResult{}
 	for _, operation := range plan.Operations {
 		if err := ctx.Err(); err != nil {
-			return result, err
+			return result, &convergenceDeadlineContextError{cause: err}
 		}
 		if err := candidate.applyConfiguredOperation(operation); err != nil {
 			return result, err
@@ -325,13 +357,13 @@ func (s *projectedPhaseSession) Apply(ctx context.Context, plan PhasePlan) (phas
 			result.Applied, len(plan.Operations))
 	}
 	if err := ctx.Err(); err != nil {
-		return result, err
+		return result, &convergenceDeadlineContextError{cause: err}
 	}
 	if err := candidate.settleEvidence(); err != nil {
 		return result, err
 	}
 	if err := ctx.Err(); err != nil {
-		return result, err
+		return result, &convergenceDeadlineContextError{cause: err}
 	}
 	if candidate.snapshot.ID == key.SnapshotID {
 		return phaseSessionApplyResult{}, &ProjectedPhaseNoProgressError{
@@ -341,6 +373,7 @@ func (s *projectedPhaseSession) Apply(ctx context.Context, plan PhasePlan) (phas
 		}
 	}
 	*s.hierarchy = *candidate
+	s.progress[key] = struct{}{}
 	return result, nil
 }
 
@@ -383,22 +416,22 @@ func (r *coordinatorRound) compileValidatedFixedPointTrace(
 	}
 	capabilities := base.Capabilities
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, r.classifyContextExit(err)
 	}
 	session, err := newProjectedPhaseSession(base, capabilities)
 	if err != nil {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, r.classifyContextExit(err)
 	}
 	projectedRound := r.cloneForProjection()
 	result, err := projectedRound.runFixedPointEngine(ctx, session, fixedPointEngineUntilObjective)
 	if err != nil {
-		return nil, err
+		return nil, projectedRound.classifyContextExit(err)
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, projectedRound.classifyContextExit(err)
 	}
 	evaluationInput := freezeCoordinatorEvaluationInput(projectedRound, capabilities)
 	frozenBoundary, err := compileFrozenBoundaryV1(base, evaluationInput, result.Phases)
@@ -406,7 +439,7 @@ func (r *coordinatorRound) compileValidatedFixedPointTrace(
 		return nil, fmt.Errorf("compile frozen boundary: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, projectedRound.classifyContextExit(err)
 	}
 	trace := &CompiledPhaseTrace{
 		ConvergenceID:        result.ConvergenceID,
@@ -422,7 +455,11 @@ func (r *coordinatorRound) compileValidatedFixedPointTrace(
 		FinalEvaluation:      cloneCoordinatorSnapshotEvaluation(result.FinalEvaluation),
 		Cost:                 executionReservationCost(result.Phases),
 	}
-	return freezeValidatedPhaseTrace(ctx, trace)
+	validated, err := freezeValidatedPhaseTrace(ctx, trace)
+	if err != nil {
+		return nil, projectedRound.classifyContextExit(err)
+	}
+	return validated, nil
 }
 
 // checkEngineDeadline fails fast at the top of every fixed-point round.
@@ -443,9 +480,7 @@ func (r *coordinatorRound) compileValidatedFixedPointTrace(
 // annotated for diagnosis.
 func (r *coordinatorRound) checkEngineDeadline(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
-		return &convergenceDeadlineContextError{
-			cause: err, rounds: r.round, usage: r.budget.Usage(),
-		}
+		return r.classifyContextExit(err)
 	}
 	if r.budget != nil && !r.budget.limit.Deadline.IsZero() &&
 		!time.Now().Before(r.budget.limit.Deadline) {
