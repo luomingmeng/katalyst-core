@@ -795,6 +795,73 @@ func TestProjectSteadyFakeNUMAStageAtomicallyReplacesCommittedNUMAFloorViolation
 		"invalid committed floor ownership must be replaced atomically without staged search")
 }
 
+func TestProjectSteadyFakeNUMAStagePreservesOriginalDemandContractDuringInvalidCommittedRepair(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	all := topology.CPUDetails.CPUs()
+	fakeCommitted := coresInNUMA(topology, 0, 0, 1)
+	dedicatedCommitted := all.Difference(fakeCommitted)
+	fakeDesired := coresInNUMA(topology, 0, 1, 2)
+	realDesired := coresInNUMA(topology, 0, 3, 4)
+	dedicatedDesired := all.Difference(fakeDesired).Difference(realDesired)
+
+	demands := []partitionDemand{
+		{
+			key: "fake", quantity: fakeDesired.Size(),
+			eligible: all, preferred: fakeCommitted,
+			class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "real", quantity: realDesired.Size(),
+			eligible: realDesired,
+			class:    advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "dedicated", quantity: dedicatedDesired.Size(),
+			eligible: all, preferred: dedicatedCommitted,
+			class: advisorBlockClassDedicated,
+		},
+	}
+	desired := map[string]machine.CPUSet{
+		"fake":      fakeDesired,
+		"real":      realDesired,
+		"dedicated": dedicatedDesired,
+	}
+	committed := steadyFakeNUMACommittedSnapshot{
+		assignments: []steadyFakeNUMACommittedAssignment{
+			{
+				blockID: "fake", class: advisorBlockClassMandatoryReclaim,
+				numaID: commonstate.FakedNUMAID, cpus: fakeCommitted, eligible: all,
+			},
+			{
+				blockID: "real", class: advisorBlockClassMandatoryReclaim,
+				numaID: 0, cpus: machine.NewCPUSet(), eligible: realDesired,
+			},
+			{
+				blockID: "dedicated", class: advisorBlockClassDedicated,
+				numaID: 0, cpus: dedicatedCommitted, eligible: all,
+			},
+		},
+		rawReclaimAggregate: fakeCommitted,
+		reclaim:             fakeCommitted,
+	}
+
+	got, projectErr := projectSteadyFakeNUMAStage(
+		demands, []string{"fake", "real"}, committed, desired,
+		[]partitionCoreFloorConstraint{{
+			demandKey: "real", committedBlockID: "real",
+		}}, topology)
+
+	require.NoError(t, projectErr)
+	for _, demand := range demands {
+		require.Equal(t, demand.quantity, got[demand.key].Size(), "demand %q", demand.key)
+	}
+	require.Equal(t, desired, got,
+		"a repair that weakens an original demand must fall back to the atomic desired assignment")
+}
+
 func TestProjectSteadyFakeNUMAStageAllowsBudgetedAtomicRepairOfInvalidCommittedSnapshot(t *testing.T) {
 	t.Parallel()
 

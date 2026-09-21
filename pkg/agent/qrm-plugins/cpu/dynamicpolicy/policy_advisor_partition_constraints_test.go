@@ -58,3 +58,21 @@ func TestSolveDisjointPartitionsWithCoreFloorsPrefersConflictFreeCandidate(t *te
 	require.Equal(t, machine.NewCPUSet(64, 129), assignments["floor"])
 	requireCoreAligned(t, topology, assignments["floor"])
 }
+
+func TestSolveDisjointPartitionsWithCoreFloorsRejectsNonPositiveFloorDemand(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+
+	_, err = solveDisjointPartitionsWithCoreFloors(
+		[]partitionDemand{{
+			key:      "floor",
+			quantity: 0,
+			eligible: topology.CPUDetails.CPUs(),
+			class:    advisorBlockClassMandatoryReclaim,
+		}},
+		[]partitionCoreFloorConstraint{{demandKey: "floor"}},
+		topology,
+	)
+
+	require.ErrorContains(t, err, `partition core-floor demand "floor" has non-positive quantity 0`)
+}
