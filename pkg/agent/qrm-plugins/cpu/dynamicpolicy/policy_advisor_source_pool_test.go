@@ -1984,6 +1984,165 @@ func TestPlanDisjointAdvisorBlocksPreservesCeiledOwnerRequestWhenDonating(t *tes
 	require.Empty(t, result)
 }
 
+func productionReplacementSourcePoolFixture(t *testing.T) (
+	*DynamicPolicy,
+	*advisorapi.ListAndWatchResponse,
+	*machine.CPUTopology,
+	machine.CPUSet,
+	machine.CPUSet,
+) {
+	t.Helper()
+
+	topology, demands, reclaimBefore, dedicatedBefore := productionNUMA2ReplacementFixture(t)
+	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.state.SetPodEntries(state.PodEntries{
+		"dedicated-pod": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "dedicated-pod",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameDedicated,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+				},
+				AllocationResult:         dedicatedBefore,
+				TopologyAwareAssignments: map[int]machine.CPUSet{2: dedicatedBefore},
+				RequestQuantity:          demands[1].requestQuantity,
+				RampUp:                   true,
+			},
+		},
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta: commonstate.GenerateGenericPoolAllocationMeta(
+					commonstate.PoolNameReclaim),
+				AllocationResult:         reclaimBefore,
+				TopologyAwareAssignments: map[int]machine.CPUSet{2: reclaimBefore},
+			},
+		},
+	}, false)
+
+	resp := &advisorapi.ListAndWatchResponse{
+		DisableDedicatedCoresOverlapReclaimedCores: true,
+		Entries: map[string]*advisorapi.CalculationEntries{
+			"dedicated-pod": {Entries: map[string]*advisorapi.CalculationInfo{
+				"main": {
+					OwnerPoolName: commonstate.PoolNameDedicated,
+					CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+						2: {Blocks: []*advisorapi.Block{{
+							BlockId: "dedicated-numa-2",
+							Result:  uint64(demands[1].quantity),
+						}}},
+					},
+				},
+			}},
+			commonstate.PoolNameReclaim: {Entries: map[string]*advisorapi.CalculationInfo{
+				commonstate.FakedContainerName: {
+					OwnerPoolName: commonstate.PoolNameReclaim,
+					CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+						2: {Blocks: []*advisorapi.Block{{
+							BlockId: "reclaim-numa-2",
+							Result:  uint64(demands[0].quantity),
+						}}},
+					},
+				},
+			}},
+		},
+	}
+	return p, resp, topology, reclaimBefore, dedicatedBefore
+}
+
+func TestPlanDisjointAdvisorBlocksRepairsDedicatedReclaimBoundary(t *testing.T) {
+	t.Parallel()
+
+	p, resp, topology, _, _ := productionReplacementSourcePoolFixture(t)
+
+	result, err := p.planDisjointAdvisorBlocks(resp, true)
+
+	require.NoError(t, err)
+	reclaim := result["reclaim-numa-2"]
+	dedicated := result["dedicated-numa-2"]
+	require.Equal(t, 8, reclaim.Size())
+	require.Equal(t, 24, dedicated.Size())
+	require.True(t, reclaim.Intersection(dedicated).IsEmpty())
+	requireCoreAligned(t, topology, reclaim)
+}
+
+func TestPlanDisjointAdvisorBlocksKeepsUnreplaceableFailureClosed(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(12, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+
+	allCPUs := topology.CPUDetails.CPUs().ToSliceInt()
+	p.state.SetPodEntries(state.PodEntries{
+		"dedicated-pod": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "dedicated-pod",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameDedicated,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+				},
+				AllocationResult: machine.NewCPUSet(allCPUs[:8]...),
+				RequestQuantity:  6.2,
+				RampUp:           true,
+			},
+		},
+	}, false)
+	resp := &advisorapi.ListAndWatchResponse{
+		DisableDedicatedCoresOverlapReclaimedCores: true,
+		Entries: map[string]*advisorapi.CalculationEntries{
+			"dedicated-pod": {Entries: map[string]*advisorapi.CalculationInfo{
+				"main": {
+					OwnerPoolName: commonstate.PoolNameDedicated,
+					CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+						0: {Blocks: []*advisorapi.Block{{BlockId: "dedicated", Result: 6}}},
+					},
+				},
+			}},
+			commonstate.PoolNameReclaim: {Entries: map[string]*advisorapi.CalculationInfo{
+				commonstate.FakedContainerName: {
+					OwnerPoolName: commonstate.PoolNameReclaim,
+					CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+						0: {Blocks: []*advisorapi.Block{{BlockId: "reclaim", Result: 6}}},
+					},
+				},
+			}},
+		},
+	}
+
+	result, err := p.planDisjointAdvisorBlocks(resp, true)
+
+	require.Error(t, err)
+	require.ErrorContains(t, err, "replacement failed")
+	require.Empty(t, result)
+}
+
+func TestPlanDisjointAdvisorBlocksPreservesReplacementAssignment(t *testing.T) {
+	t.Parallel()
+
+	p, resp, _, _, _ := productionReplacementSourcePoolFixture(t)
+
+	result, err := p.planDisjointAdvisorBlocks(resp, true)
+
+	require.NoError(t, err)
+	require.Equal(t,
+		machine.NewCPUSet(32, 44, 46, 47, 96, 108, 110, 111),
+		result["reclaim-numa-2"])
+	require.Equal(t,
+		machine.NewCPUSet(
+			33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 45,
+			97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 109,
+		),
+		result["dedicated-numa-2"])
+}
+
 func advisorDescriptorBlockIDs(descriptors []advisorBlockDescriptor) []string {
 	result := make([]string, 0, len(descriptors))
 	for _, descriptor := range descriptors {

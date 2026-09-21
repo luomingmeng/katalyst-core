@@ -1105,6 +1105,28 @@ func compareCPUSetLexicographically(left, right machine.CPUSet) int {
 	}
 }
 
+func pinPartitionDemandsToAssignments(
+	demands []partitionDemand,
+	assignments map[string]machine.CPUSet,
+) ([]partitionDemand, error) {
+	pinned := append([]partitionDemand(nil), demands...)
+	for i := range pinned {
+		assignment, ok := assignments[pinned[i].key]
+		if !ok {
+			return nil, fmt.Errorf(
+				"missing exact assignment for partition demand %q", pinned[i].key)
+		}
+		if assignment.Size() != pinned[i].quantity {
+			return nil, fmt.Errorf(
+				"exact assignment %q has size %d, want %d",
+				pinned[i].key, assignment.Size(), pinned[i].quantity)
+		}
+		pinned[i].eligible = assignment.Clone()
+		pinned[i].preferred = assignment.Clone()
+	}
+	return pinned, nil
+}
+
 func pinHardReclaimPartitionDemands(
 	demands []partitionDemand,
 	available machine.CPUSet,
@@ -1153,7 +1175,21 @@ func pinHardReclaimPartitionDemands(
 		donors:          donors,
 	})
 	if err != nil {
-		return nil, err
+		var selectionErr *hardReclaimSelectionError
+		if !errors.As(err, &selectionErr) ||
+			(selectionErr.reason != hardReclaimFailureInsufficientWholeCore &&
+				selectionErr.reason != hardReclaimFailureDonorFloor) {
+			return nil, err
+		}
+
+		assignments, _, replacementErr := solveHardReclaimWithReplacement(
+			demands, available, topology, defaultHardReclaimReplacementOptions())
+		if replacementErr != nil {
+			return nil, fmt.Errorf(
+				"hard reclaim fast path failed: %v; replacement failed: %w",
+				err, replacementErr)
+		}
+		return pinPartitionDemandsToAssignments(demands, assignments)
 	}
 
 	pinned := append([]partitionDemand(nil), demands...)
