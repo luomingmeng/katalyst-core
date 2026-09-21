@@ -215,6 +215,105 @@ func TestStrictBypassCacheReturnsSyncErrorWithoutStaleFallback(t *testing.T) {
 	if err != syncErr {
 		t.Fatalf("GetPod() error = %v, want original strict sync error %v", err, syncErr)
 	}
+
+	_, err = pf.GetPodList(ctx, nil)
+	if !errors.Is(err, syncErr) {
+		t.Fatalf("GetPodList() error = %v, want errors.Is(_, %v)", err, syncErr)
+	}
+}
+
+func TestGetPodListFromCacheNeverSynchronizesKubelet(t *testing.T) {
+	t.Parallel()
+
+	for name, cache := range map[string]map[string]*v1.Pod{
+		"nil cache": nil,
+		"empty map": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			kubelet := &countingKubeletPodFetcher{}
+			pf := &podFetcherImpl{
+				kubeletPodFetcher: kubelet,
+				kubeletPodsCache:  cache,
+			}
+
+			pods, err := pf.GetPodListFromCache(context.Background(), nil)
+			if err != nil {
+				t.Fatalf("GetPodListFromCache() error = %v", err)
+			}
+			if len(pods) != 0 {
+				t.Fatalf("GetPodListFromCache() returned %d pods, want empty", len(pods))
+			}
+			if got := atomic.LoadInt32(&kubelet.callCount); got != 0 {
+				t.Fatalf("kubelet calls = %d, want 0", got)
+			}
+		})
+	}
+
+	t.Run("populated cache returns a deep copy", func(t *testing.T) {
+		kubelet := &countingKubeletPodFetcher{}
+		cached := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				UID:         "cached",
+				Annotations: map[string]string{"version": "cached"},
+			},
+		}
+		pf := &podFetcherImpl{
+			kubeletPodFetcher: kubelet,
+			kubeletPodsCache:  map[string]*v1.Pod{"cached": cached},
+		}
+
+		pods, err := pf.GetPodListFromCache(context.Background(), func(pod *v1.Pod) bool {
+			return pod.UID == "cached"
+		})
+		if err != nil {
+			t.Fatalf("GetPodListFromCache() error = %v", err)
+		}
+		if got := atomic.LoadInt32(&kubelet.callCount); got != 0 {
+			t.Fatalf("kubelet sync calls = %d, want zero", got)
+		}
+		if len(pods) != 1 || pods[0].Annotations["version"] != "cached" {
+			t.Fatalf("cached snapshot = %#v, want cached pod", pods)
+		}
+		pods[0].Annotations["version"] = "mutated"
+		if got := cached.Annotations["version"]; got != "cached" {
+			t.Fatalf("returned pod was not deep-copied: cache version = %q", got)
+		}
+	})
+}
+
+func TestCacheOnlyThenStrictGetPodListSynchronizesKubeletOnce(t *testing.T) {
+	t.Parallel()
+
+	kubelet := &countingKubeletPodFetcher{}
+	pf := &podFetcherImpl{
+		kubeletPodFetcher: kubelet,
+		kubeletPodsCache:  map[string]*v1.Pod{},
+		emitter:           metrics.DummyMetrics{},
+		podConf:           &metaserverconf.PodConfiguration{},
+	}
+
+	cachedPods, err := pf.GetPodListFromCache(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("GetPodListFromCache() error = %v", err)
+	}
+	if len(cachedPods) != 0 {
+		t.Fatalf("GetPodListFromCache() returned %d pods, want empty", len(cachedPods))
+	}
+	if got := atomic.LoadInt32(&kubelet.callCount); got != 0 {
+		t.Fatalf("kubelet calls after cache-only read = %d, want 0", got)
+	}
+
+	strictCtx := context.WithValue(context.Background(), StrictBypassCacheKey, BypassCacheTrue)
+	pods, err := pf.GetPodList(strictCtx, nil)
+	if err != nil {
+		t.Fatalf("strict GetPodList() error = %v", err)
+	}
+	if len(pods) != 1 {
+		t.Fatalf("strict GetPodList() returned %d pods, want 1", len(pods))
+	}
+	if got := atomic.LoadInt32(&kubelet.callCount); got != 1 {
+		t.Fatalf("total kubelet calls = %d, want exactly 1", got)
+	}
 }
 
 type gatedKubeletPodFetcher struct {

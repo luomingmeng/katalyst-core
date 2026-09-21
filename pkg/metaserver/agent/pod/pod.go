@@ -72,6 +72,14 @@ type PodFetcher interface {
 	GetPod(ctx context.Context, podUID string) (*v1.Pod, error)
 }
 
+// CachedPodSnapshotFetcher returns a deep-copied, cache-only Pod snapshot. It
+// never synchronizes kubelet; a nil or empty cache is therefore a valid
+// observation, not proof that Pods are absent. Callers requiring freshness
+// must obtain one explicit strict snapshot after cache-only resolution.
+type CachedPodSnapshotFetcher interface {
+	GetPodListFromCache(ctx context.Context, podFilter func(*v1.Pod) bool) ([]*v1.Pod, error)
+}
+
 type ContainerIdentityFetcher interface {
 	GetContainerIDWithContext(ctx context.Context, podUID, containerName string) (string, error)
 	RefreshKubeletPodCache(ctx context.Context) error
@@ -122,6 +130,7 @@ type podFetcherImpl struct {
 }
 
 var _ ContainerIdentityFetcher = (*podFetcherImpl)(nil)
+var _ CachedPodSnapshotFetcher = (*podFetcherImpl)(nil)
 
 func NewPodFetcher(
 	baseConf *global.BaseConfiguration, podConf *metaserver.PodConfiguration,
@@ -397,7 +406,7 @@ func (w *podFetcherImpl) Run(ctx context.Context) {
 func (w *podFetcherImpl) GetPodList(ctx context.Context, podFilter func(*v1.Pod) bool) ([]*v1.Pod, error) {
 	kubeletPodsCache, err := w.getKubeletPodsCache(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("getKubeletPodsCache failed with error: %v", err)
+		return nil, fmt.Errorf("getKubeletPodsCache failed with error: %w", err)
 	}
 
 	w.kubeletPodsCacheLock.RLock()
@@ -411,6 +420,28 @@ func (w *podFetcherImpl) GetPodList(ctx context.Context, podFilter func(*v1.Pod)
 		res = append(res, p.DeepCopy())
 	}
 
+	return res, nil
+}
+
+func (w *podFetcherImpl) GetPodListFromCache(
+	ctx context.Context,
+	podFilter func(*v1.Pod) bool,
+) ([]*v1.Pod, error) {
+	if w == nil {
+		return nil, fmt.Errorf("get cached pod snapshot from nil pod fetcher")
+	}
+	if err := lockRLockContext(ctx, &w.kubeletPodsCacheLock); err != nil {
+		return nil, err
+	}
+	defer w.kubeletPodsCacheLock.RUnlock()
+
+	res := make([]*v1.Pod, 0, len(w.kubeletPodsCache))
+	for _, pod := range w.kubeletPodsCache {
+		if pod == nil || podFilter != nil && !podFilter(pod) {
+			continue
+		}
+		res = append(res, pod.DeepCopy())
+	}
 	return res, nil
 }
 
