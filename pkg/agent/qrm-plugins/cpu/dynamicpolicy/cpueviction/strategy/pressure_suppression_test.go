@@ -18,6 +18,7 @@ package strategy
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -50,10 +51,20 @@ const (
 	defaultCPUMinSuppressionToleranceDuration = 10 * time.Millisecond
 )
 
+// suppressionReclaimRegistryMu gives each test exclusive ownership of the
+// process-global generic reclaim consumer for its complete lifetime.
+var suppressionReclaimRegistryMu sync.Mutex
+
 func makeSuppressionEvictionConf(t *testing.T,
 	cpuMaxSuppressionToleranceRate float64,
 	cpuMinSuppressionToleranceDuration time.Duration,
 ) *config.Configuration {
+	suppressionReclaimRegistryMu.Lock()
+	t.Cleanup(func() {
+		reclaim.UnregisterConsumer(reclaim.GenericConsumerName)
+		suppressionReclaimRegistryMu.Unlock()
+	})
+
 	conf := config.NewConfiguration()
 	conf.GetDynamicConfiguration().EnableSuppressionEviction = true
 	conf.GetDynamicConfiguration().MaxSuppressionToleranceRate = cpuMaxSuppressionToleranceRate
