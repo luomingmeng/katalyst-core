@@ -17,6 +17,7 @@ limitations under the License.
 package dynamicpolicy
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 
@@ -579,4 +580,739 @@ func TestPlanHardReclaimPartitionJointlyAllocatesSharedDonorQuotaAcrossNUMAs(t *
 	require.NoError(t, err)
 	require.Equal(t, numa0Free.Union(numa1Donor), plan.reclaim)
 	require.Equal(t, 2, plan.donorCPUs["numa-0"].Union(plan.donorCPUs["numa-1"]).Size())
+}
+
+func productionNUMA2ReplacementFixture(t *testing.T) (
+	*machine.CPUTopology,
+	[]partitionDemand,
+	machine.CPUSet,
+	machine.CPUSet,
+) {
+	t.Helper()
+
+	topology, err := machine.GenerateDummyCPUTopology(128, 2, 4)
+	require.NoError(t, err)
+	require.Equal(t, 4, topology.NumNUMANodes)
+
+	available := topology.CPUDetails.CPUsInNUMANodes(2)
+	require.Equal(t, 32, available.Size())
+	reclaimBefore := machine.NewCPUSet(32, 46, 47, 96, 108, 109, 110, 111)
+	dedicatedBefore := machine.NewCPUSet(
+		33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
+		97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107,
+	)
+	demands := []partitionDemand{
+		{
+			key:       "reclaim-numa-2",
+			quantity:  8,
+			eligible:  available,
+			preferred: reclaimBefore,
+			class:     advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key:             "dedicated-numa-2",
+			requestGroupKey: "pod/main",
+			quantity:        24,
+			requestQuantity: 62,
+			eligible:        available,
+			preferred:       dedicatedBefore,
+			class:           advisorBlockClassDedicated,
+		},
+	}
+	return topology, demands, reclaimBefore, dedicatedBefore
+}
+
+func TestPlanHardReclaimPartitionRepairsDedicatedBoundaryByReplacement(t *testing.T) {
+	t.Parallel()
+
+	topology, demands, reclaimBefore, dedicatedBefore := productionNUMA2ReplacementFixture(t)
+	numa2 := topology.CPUDetails.CPUsInNUMANodes(2)
+
+	_, err := planHardReclaimPartition(hardReclaimPartitionInput{
+		topology:        topology,
+		targetByNUMA:    map[int]int{2: 8},
+		currentReclaim:  reclaimBefore,
+		free:            numa2.Difference(reclaimBefore.Union(dedicatedBefore)),
+		reclaimEligible: numa2,
+		donors: []hardReclaimPartitionDonor{{
+			key:             "dedicated-numa-2",
+			groupKey:        "pod/main",
+			cpus:            dedicatedBefore,
+			requestQuantity: 62,
+		}},
+	})
+	require.EqualError(t, err, "NUMA 2 needs 2 more reclaim CPUs")
+	var selectionErr *hardReclaimSelectionError
+	require.ErrorAs(t, err, &selectionErr)
+	require.Equal(t, hardReclaimFailureDonorFloor, selectionErr.reason)
+
+	assignments, proof, err := solveHardReclaimWithReplacement(
+		demands,
+		topology.CPUDetails.CPUs(),
+		topology,
+		defaultHardReclaimReplacementOptions(),
+	)
+	require.NoError(t, err)
+	require.NotNil(t, proof)
+
+	expectedReclaim := machine.NewCPUSet(32, 44, 46, 47, 96, 108, 110, 111)
+	expectedDedicated := machine.NewCPUSet(
+		33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 45,
+		97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 109,
+	)
+	require.Equal(t, expectedReclaim, assignments["reclaim-numa-2"])
+	require.Equal(t, expectedDedicated, assignments["dedicated-numa-2"])
+	require.Equal(t, 8, assignments["reclaim-numa-2"].Size())
+	require.Equal(t, 24, assignments["dedicated-numa-2"].Size())
+	require.True(t, assignments["reclaim-numa-2"].Intersection(assignments["dedicated-numa-2"]).IsEmpty())
+	require.True(t, assignments["reclaim-numa-2"].Union(assignments["dedicated-numa-2"]).
+		Equals(numa2))
+	requireCoreAligned(t, topology, assignments["reclaim-numa-2"])
+	require.Equal(t, reclaimBefore, proof.reclaimBefore)
+	require.Equal(t, expectedReclaim, proof.reclaimAfter)
+	require.Equal(t, dedicatedBefore, proof.dedicatedBeforeByGroup["pod/main"])
+	require.Equal(t, expectedDedicated, proof.dedicatedAfterByGroup["pod/main"])
+}
+
+func TestHardReclaimReplacementPreservesUnderprovisionedDonorSize(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(64, 1, 1)
+	require.NoError(t, err)
+	numa := topology.CPUDetails.CPUsInNUMANodes(0)
+	dedicated := coresInNUMA(topology, 0, 0, 24)
+	reclaim := coresInNUMA(topology, 0, 24, 28)
+	demands := []partitionDemand{
+		{
+			key: "reclaim", quantity: reclaim.Size(), eligible: numa,
+			preferred: reclaim, class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "dedicated", requestGroupKey: "pod/main", quantity: dedicated.Size(),
+			requestQuantity: 62, eligible: numa, preferred: dedicated,
+			class: advisorBlockClassDedicated,
+		},
+	}
+	assignments := map[string]machine.CPUSet{
+		"reclaim":   reclaim,
+		"dedicated": dedicated,
+	}
+
+	proof, err := validateHardReclaimReplacement(
+		demands, assignments, topology, map[int]int{0: reclaim.Size()})
+
+	require.NoError(t, err)
+	require.Equal(t, 48, proof.dedicatedBeforeByGroup["pod/main"].Size())
+	require.Equal(t, 48, proof.dedicatedAfterByGroup["pod/main"].Size())
+}
+
+func TestHardReclaimReplacementRejectsAdditionalDonorLoss(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(64, 1, 1)
+	require.NoError(t, err)
+	numa := topology.CPUDetails.CPUsInNUMANodes(0)
+	before := coresInNUMA(topology, 0, 0, 24)
+	after := coresInNUMA(topology, 0, 0, 23)
+	demands := []partitionDemand{{
+		key: "dedicated", requestGroupKey: "pod/main", quantity: after.Size(),
+		requestQuantity: 62, eligible: numa, preferred: before,
+		class: advisorBlockClassDedicated,
+	}}
+
+	_, err = validateHardReclaimReplacement(
+		demands,
+		map[string]machine.CPUSet{"dedicated": after},
+		topology,
+		map[int]int{},
+	)
+
+	require.ErrorContains(t, err, `dedicated group "pod/main"`)
+	require.ErrorContains(t, err, "changed NUMA 0 ownership from 48 to 46")
+}
+
+func TestHardReclaimReplacementRejectsCrossNUMACompensation(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(16, 1, 2)
+	require.NoError(t, err)
+	before := coresInNUMA(topology, 0, 0, 1)
+	after := coresInNUMA(topology, 1, 0, 1)
+	demands := []partitionDemand{{
+		key: "dedicated", requestGroupKey: "pod/main", quantity: 2,
+		requestQuantity: 2, eligible: topology.CPUDetails.CPUs(), preferred: before,
+		class: advisorBlockClassDedicated,
+	}}
+
+	_, err = validateHardReclaimReplacement(
+		demands,
+		map[string]machine.CPUSet{"dedicated": after},
+		topology,
+		map[int]int{},
+	)
+
+	require.ErrorContains(t, err, "changed NUMA 0 ownership")
+}
+
+func TestHardReclaimReplacementRejectsPartialFinalReclaimCore(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(4, 1, 1)
+	require.NoError(t, err)
+	numa := topology.CPUDetails.CPUsInNUMANodes(0)
+	partial := machine.NewCPUSet(numa.ToSliceInt()[0])
+	demands := []partitionDemand{{
+		key: "reclaim", quantity: 1, eligible: numa, preferred: partial,
+		class: advisorBlockClassMandatoryReclaim,
+	}}
+
+	_, err = validateHardReclaimReplacement(
+		demands,
+		map[string]machine.CPUSet{"reclaim": partial},
+		topology,
+		map[int]int{0: 1},
+	)
+
+	require.ErrorContains(t, err, "not core-aligned")
+}
+
+func TestHardReclaimReplacementDoesNotShareCreditAcrossOwnerGroups(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopologyWithoutSMT(8, 1, 1)
+	require.NoError(t, err)
+	numa := topology.CPUDetails.CPUsInNUMANodes(0)
+	demands := []partitionDemand{
+		{
+			key: "owner-a", requestGroupKey: "pod-a/main", quantity: 1,
+			requestQuantity: 2, eligible: numa, preferred: machine.NewCPUSet(0, 1),
+			class: advisorBlockClassDedicated,
+		},
+		{
+			key: "owner-b", requestGroupKey: "pod-b/main", quantity: 3,
+			eligible: numa, preferred: machine.NewCPUSet(2, 3),
+			class: advisorBlockClassDedicated,
+		},
+	}
+
+	_, err = validateHardReclaimReplacement(
+		demands,
+		map[string]machine.CPUSet{
+			"owner-a": machine.NewCPUSet(0),
+			"owner-b": machine.NewCPUSet(1, 2, 3),
+		},
+		topology,
+		map[int]int{},
+	)
+
+	require.ErrorContains(t, err, `dedicated group "pod-a/main"`)
+	require.ErrorContains(t, err, "changed NUMA 0 ownership from 2 to 1")
+}
+
+func TestHardReclaimReplacementDeduplicatesAliasesByRequestGroup(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopologyWithoutSMT(4, 1, 1)
+	require.NoError(t, err)
+	numa := topology.CPUDetails.CPUsInNUMANodes(0)
+	old := machine.NewCPUSet(0, 1)
+	demands := []partitionDemand{
+		{
+			key: "alias-a", requestGroupKey: "pod/main", quantity: 1,
+			requestQuantity: 2, eligible: numa, preferred: old,
+			class: advisorBlockClassDedicated,
+		},
+		{
+			key: "alias-b", requestGroupKey: "pod/main", quantity: 1,
+			requestQuantity: 2, eligible: numa, preferred: old,
+			class: advisorBlockClassDedicated,
+		},
+	}
+
+	proof, err := validateHardReclaimReplacement(
+		demands,
+		map[string]machine.CPUSet{
+			"alias-a": machine.NewCPUSet(0),
+			"alias-b": machine.NewCPUSet(1),
+		},
+		topology,
+		map[int]int{},
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, 2, proof.dedicatedBeforeByGroup["pod/main"].Size())
+	require.Equal(t, 2, proof.dedicatedAfterByGroup["pod/main"].Size())
+}
+
+func TestHardReclaimReplacementIsDeterministic(t *testing.T) {
+	t.Parallel()
+
+	topology, demands, _, _ := productionNUMA2ReplacementFixture(t)
+	reversed := []partitionDemand{demands[1], demands[0]}
+
+	first, _, err := solveHardReclaimWithReplacement(
+		demands, topology.CPUDetails.CPUs(), topology,
+		defaultHardReclaimReplacementOptions())
+	require.NoError(t, err)
+	second, _, err := solveHardReclaimWithReplacement(
+		reversed, topology.CPUDetails.CPUs(), topology,
+		defaultHardReclaimReplacementOptions())
+	require.NoError(t, err)
+
+	require.Equal(t, first, second)
+}
+
+func TestHardReclaimReplacementExcludesSharedOwnershipFromCandidates(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"shared", "bound-share"} {
+		name := name
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			topology, err := machine.GenerateDummyCPUTopologyWithoutSMT(4, 1, 1)
+			require.NoError(t, err)
+			demands := []partitionDemand{
+				{
+					key: "reclaim", quantity: 2, eligible: machine.NewCPUSet(0, 1),
+					preferred: machine.NewCPUSet(0), class: advisorBlockClassMandatoryReclaim,
+				},
+				{
+					key: name, quantity: 1, eligible: machine.NewCPUSet(1, 2, 3),
+					preferred: machine.NewCPUSet(1), class: advisorBlockClassShared,
+				},
+			}
+
+			assignments, proof, err := solveHardReclaimWithReplacement(
+				demands, topology.CPUDetails.CPUs(), topology,
+				defaultHardReclaimReplacementOptions())
+
+			require.Nil(t, assignments)
+			require.Nil(t, proof)
+			var selectionErr *hardReclaimSelectionError
+			require.ErrorAs(t, err, &selectionErr)
+			require.Equal(t, hardReclaimFailureInsufficientWholeCore, selectionErr.reason)
+		})
+	}
+}
+
+func TestHardReclaimReplacementDefaultBudgetHandlesTwo16CoreNUMAsChoosingFour(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopologyWithoutSMT(32, 1, 2)
+	require.NoError(t, err)
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	numa1 := topology.CPUDetails.CPUsInNUMANodes(1)
+	require.Equal(t, 16, numa0.Size())
+	require.Equal(t, 16, numa1.Size())
+	demands := []partitionDemand{
+		{
+			key: "reclaim-0", quantity: 4, eligible: numa0,
+			class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "reclaim-1", quantity: 4, eligible: numa1,
+			class: advisorBlockClassMandatoryReclaim,
+		},
+	}
+
+	assignments, proof, err := solveHardReclaimWithReplacement(
+		demands, topology.CPUDetails.CPUs(), topology,
+		defaultHardReclaimReplacementOptions())
+
+	require.NoError(t, err)
+	require.NotNil(t, assignments)
+	require.NotNil(t, proof)
+	require.Equal(t, 4, assignments["reclaim-0"].Size())
+	require.Equal(t, 4, assignments["reclaim-1"].Size())
+	require.True(t, assignments["reclaim-0"].IsSubsetOf(numa0))
+	require.True(t, assignments["reclaim-1"].IsSubsetOf(numa1))
+}
+
+func TestHardReclaimReplacementPreservesPerDemandNUMACounts(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopologyWithoutSMT(8, 1, 2)
+	require.NoError(t, err)
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	numa1 := topology.CPUDetails.CPUsInNUMANodes(1)
+	numa0CPUs := numa0.ToSliceInt()
+	numa1CPUs := numa1.ToSliceInt()
+	dedicatedBefore := machine.NewCPUSet(numa0CPUs[1], numa1CPUs[1])
+	demands := []partitionDemand{
+		{
+			key: "reclaim-0", quantity: 1, eligible: numa0,
+			preferred: machine.NewCPUSet(numa0CPUs[0]), class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "reclaim-1", quantity: 1, eligible: numa1,
+			preferred: machine.NewCPUSet(numa1CPUs[0]), class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "dedicated", requestGroupKey: "pod/main", quantity: 2,
+			requestQuantity: 2, eligible: numa0.Union(numa1),
+			preferred: dedicatedBefore, class: advisorBlockClassDedicated,
+		},
+	}
+
+	assignments, proof, err := solveHardReclaimWithReplacement(
+		demands, topology.CPUDetails.CPUs(), topology,
+		defaultHardReclaimReplacementOptions())
+
+	require.NoError(t, err)
+	require.NotNil(t, proof)
+	require.Equal(t, 1, assignments["dedicated"].Intersection(numa0).Size())
+	require.Equal(t, 1, assignments["dedicated"].Intersection(numa1).Size())
+}
+
+func TestHardReclaimReplacementRejectsBudgetExhaustion(t *testing.T) {
+	t.Parallel()
+
+	topology, demands, _, _ := productionNUMA2ReplacementFixture(t)
+
+	assignments, proof, err := solveHardReclaimWithReplacement(
+		demands,
+		topology.CPUDetails.CPUs(),
+		topology,
+		hardReclaimReplacementOptions{maxCandidateStates: 1, maxTerminalSolves: 1},
+	)
+
+	require.Nil(t, assignments)
+	require.Nil(t, proof)
+	var selectionErr *hardReclaimSelectionError
+	require.True(t, errors.As(err, &selectionErr))
+	require.Equal(t, hardReclaimFailureSearchBudget, selectionErr.reason)
+}
+
+func TestHardReclaimReplacementRejectsFeasibleTruncatedTerminalSet(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopologyWithoutSMT(4, 1, 1)
+	require.NoError(t, err)
+	numa := topology.CPUDetails.CPUsInNUMANodes(0)
+	demands := []partitionDemand{{
+		key:       "reclaim",
+		quantity:  1,
+		eligible:  numa,
+		preferred: machine.NewCPUSet(0),
+		class:     advisorBlockClassMandatoryReclaim,
+	}}
+
+	assignments, proof, err := solveHardReclaimWithReplacement(
+		demands,
+		numa,
+		topology,
+		hardReclaimReplacementOptions{
+			maxCandidateStates: 100,
+			maxTerminalSolves:  1,
+		},
+	)
+
+	require.Nil(t, assignments)
+	require.Nil(t, proof)
+	var selectionErr *hardReclaimSelectionError
+	require.ErrorAs(t, err, &selectionErr)
+	require.Equal(t, hardReclaimFailureSearchBudget, selectionErr.reason)
+}
+
+func TestHardReclaimReplacementDoesNotExpandAliasPreferredIntoLocalQuantity(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopologyWithoutSMT(4, 1, 1)
+	require.NoError(t, err)
+	numa := topology.CPUDetails.CPUsInNUMANodes(0)
+	aliasesPreferred := machine.NewCPUSet(0, 1)
+	for _, class := range []advisorBlockClass{
+		advisorBlockClassDedicated,
+		advisorBlockClassShared,
+	} {
+		class := class
+		t.Run(string(class), func(t *testing.T) {
+			demands := []partitionDemand{
+				{
+					key: "reclaim", quantity: 1, eligible: aliasesPreferred,
+					preferred: machine.NewCPUSet(0), class: advisorBlockClassMandatoryReclaim,
+				},
+				{
+					key: "alias-a", requestGroupKey: "pod/main", quantity: 1,
+					requestQuantity: 2, eligible: numa, preferred: aliasesPreferred,
+					class: class,
+				},
+				{
+					key: "alias-b", requestGroupKey: "pod/main", quantity: 1,
+					requestQuantity: 2, eligible: numa, preferred: aliasesPreferred,
+					class: class,
+				},
+			}
+
+			assignments, proof, err := solveHardReclaimWithReplacement(
+				demands, numa, topology, defaultHardReclaimReplacementOptions())
+
+			require.NoError(t, err)
+			require.NotNil(t, proof)
+			require.Equal(t, 1, assignments["alias-a"].Size())
+			require.Equal(t, 1, assignments["alias-b"].Size())
+			require.Equal(t, 2, assignments["alias-a"].Union(assignments["alias-b"]).Size())
+		})
+	}
+}
+
+func TestHardReclaimReplacementOptimizesTouchedGroupUnionAcrossNUMAs(t *testing.T) {
+	t.Parallel()
+
+	topology := &machine.CPUTopology{
+		NumCPUs:      6,
+		NumCores:     6,
+		NumSockets:   2,
+		NumNUMANodes: 2,
+		CPUDetails: machine.CPUDetails{
+			0: {NUMANodeID: 0, SocketID: 0, CoreID: 0},
+			1: {NUMANodeID: 0, SocketID: 0, CoreID: 1},
+			2: {NUMANodeID: 0, SocketID: 0, CoreID: 2},
+			3: {NUMANodeID: 1, SocketID: 1, CoreID: 3},
+			4: {NUMANodeID: 1, SocketID: 1, CoreID: 4},
+			5: {NUMANodeID: 1, SocketID: 1, CoreID: 5},
+		},
+	}
+	all := topology.CPUDetails.CPUs()
+	demands := []partitionDemand{
+		{
+			key: "reclaim-0", quantity: 1, eligible: machine.NewCPUSet(0, 1),
+			class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "reclaim-1", quantity: 1, eligible: machine.NewCPUSet(3, 4),
+			class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "group-a", requestGroupKey: "group-a", quantity: 2,
+			requestQuantity: 2, eligible: all, preferred: machine.NewCPUSet(0, 4),
+			class: advisorBlockClassDedicated,
+		},
+		{
+			key: "group-b", requestGroupKey: "group-b", quantity: 2,
+			requestQuantity: 2, eligible: all, preferred: machine.NewCPUSet(1, 3),
+			class: advisorBlockClassDedicated,
+		},
+	}
+
+	assignments, proof, err := solveHardReclaimWithReplacement(
+		demands, all, topology, defaultHardReclaimReplacementOptions())
+
+	require.NoError(t, err)
+	require.NotNil(t, proof)
+	require.Equal(t, machine.NewCPUSet(0, 4), proof.reclaimAfter)
+	touched := 0
+	for groupKey, before := range proof.dedicatedBeforeByGroup {
+		if !before.Equals(proof.dedicatedAfterByGroup[groupKey]) {
+			touched++
+		}
+	}
+	require.Equal(t, 1, touched)
+	require.Equal(t, 2, assignments["group-a"].Size())
+	require.Equal(t, 2, assignments["group-b"].Size())
+}
+
+func TestSelectHardReclaimCoresRejectsTruncatedFeasibleFrontier(t *testing.T) {
+	t.Parallel()
+
+	candidates := make([]coreAlignedCandidate, 0, hardReclaimCoreSelectionFrontierWidth+1)
+	groupCPUs := make(map[string]machine.CPUSet, hardReclaimCoreSelectionFrontierWidth+1)
+	groupDonationLimit := make(map[string]int, hardReclaimCoreSelectionFrontierWidth+1)
+	for i := 0; i <= hardReclaimCoreSelectionFrontierWidth; i++ {
+		cpu := machine.NewCPUSet(i)
+		candidates = append(candidates, coreAlignedCandidate{coreID: i, cpus: cpu})
+		groupKey := fmt.Sprintf("group-%d", i)
+		groupCPUs[groupKey] = cpu
+		groupDonationLimit[groupKey] = 1
+	}
+
+	selected, err := selectHardReclaimCoresWithFrontier(
+		candidates, 1, machine.NewCPUSet(), groupCPUs, groupDonationLimit)
+
+	require.True(t, selected.IsEmpty())
+	var selectionErr *hardReclaimSelectionError
+	require.ErrorAs(t, err, &selectionErr)
+	require.Equal(t, hardReclaimFailureSearchBudget, selectionErr.reason)
+}
+
+func TestHardReclaimReplacementPropagatesResidualSolverBudget(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopologyWithoutSMT(4, 1, 1)
+	require.NoError(t, err)
+	numa := topology.CPUDetails.CPUsInNUMANodes(0)
+	demands := []partitionDemand{
+		{
+			key: "reclaim", quantity: 1, eligible: machine.NewCPUSet(0, 1),
+			preferred: machine.NewCPUSet(1), class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "shared", quantity: 1, eligible: machine.NewCPUSet(0, 2, 3),
+			preferred: machine.NewCPUSet(2), class: advisorBlockClassShared,
+		},
+	}
+
+	for _, tc := range []struct {
+		name      string
+		edgeLimit int
+	}{
+		{name: "one terminal exceeds budget before another is feasible", edgeLimit: 3},
+		{name: "all terminals exceed budget", edgeLimit: 2},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			assignments, proof, err := solveHardReclaimWithReplacement(
+				demands,
+				numa,
+				topology,
+				hardReclaimReplacementOptions{
+					maxCandidateStates:          100,
+					maxTerminalSolves:           10,
+					maxPartitionAssignmentEdges: tc.edgeLimit,
+					maxPartitionFlowOperations:  partitionFlowOperationBudget,
+				},
+			)
+
+			require.Nil(t, assignments)
+			require.Nil(t, proof)
+			var selectionErr *hardReclaimSelectionError
+			require.ErrorAs(t, err, &selectionErr)
+			require.Equal(t, hardReclaimFailureSearchBudget, selectionErr.reason)
+		})
+	}
+}
+
+func TestHardReclaimReplacementRetriesConflictingGlobalCandidate(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopologyWithoutSMT(4, 1, 2)
+	require.NoError(t, err)
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	numa1 := topology.CPUDetails.CPUsInNUMANodes(1)
+	numa0CPUs := numa0.ToSliceInt()
+	numa1CPUs := numa1.ToSliceInt()
+	demands := []partitionDemand{
+		{
+			key: "reclaim-0", quantity: 1, eligible: numa0,
+			preferred: machine.NewCPUSet(numa0CPUs[0]), class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "reclaim-1", quantity: 1, eligible: numa1,
+			preferred: machine.NewCPUSet(numa1CPUs[0]), class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "dedicated", requestGroupKey: "pod/main", quantity: 1,
+			requestQuantity: 1, eligible: numa0,
+			preferred: machine.NewCPUSet(numa0CPUs[0]), class: advisorBlockClassDedicated,
+		},
+		{
+			key: "shared", quantity: 1, eligible: machine.NewCPUSet(numa0CPUs[1], numa1CPUs[0]),
+			class: advisorBlockClassShared,
+		},
+	}
+
+	assignments, proof, err := solveHardReclaimWithReplacement(
+		demands, topology.CPUDetails.CPUs(), topology,
+		defaultHardReclaimReplacementOptions())
+
+	require.NoError(t, err)
+	require.NotNil(t, proof)
+	require.Equal(t, machine.NewCPUSet(numa0CPUs[0], numa1CPUs[1]), proof.reclaimAfter)
+	require.Equal(t, machine.NewCPUSet(numa0CPUs[1]), assignments["dedicated"])
+	require.Equal(t, machine.NewCPUSet(numa1CPUs[0]), assignments["shared"])
+}
+
+func TestHardReclaimReplacementAllowsSharedDemandToMigrateAcrossNUMAs(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopologyWithoutSMT(4, 1, 2)
+	require.NoError(t, err)
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	numa1 := topology.CPUDetails.CPUsInNUMANodes(1)
+	numa0CPUs := numa0.ToSliceInt()
+	numa1CPUs := numa1.ToSliceInt()
+	demands := []partitionDemand{
+		{
+			key: "reclaim-0", quantity: 1, eligible: numa0,
+			preferred: machine.NewCPUSet(numa0CPUs[0]), class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "reclaim-1", quantity: 1, eligible: numa1,
+			preferred: machine.NewCPUSet(numa1CPUs[0]), class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "shared", quantity: 2, eligible: numa0.Union(numa1),
+			preferred: numa0, class: advisorBlockClassShared,
+		},
+	}
+
+	assignments, proof, err := solveHardReclaimWithReplacement(
+		demands, topology.CPUDetails.CPUs(), topology,
+		defaultHardReclaimReplacementOptions())
+
+	require.NoError(t, err)
+	require.NotNil(t, proof)
+	require.Equal(t, 1, assignments["shared"].Intersection(numa0).Size())
+	require.Equal(t, 1, assignments["shared"].Intersection(numa1).Size())
+}
+
+func TestHardReclaimReplacementComparatorPrefersRetainedReclaimBeforePartialCoreChurn(t *testing.T) {
+	t.Parallel()
+
+	leftProof := &hardReclaimReplacementProof{
+		reclaimBefore:          machine.NewCPUSet(0, 1),
+		reclaimAfter:           machine.NewCPUSet(0, 2),
+		dedicatedBeforeByGroup: map[string]machine.CPUSet{},
+		dedicatedAfterByGroup:  map[string]machine.CPUSet{},
+		partialBeforeCores:     1,
+	}
+	rightProof := &hardReclaimReplacementProof{
+		reclaimBefore:          machine.NewCPUSet(0, 1),
+		reclaimAfter:           machine.NewCPUSet(2, 3),
+		dedicatedBeforeByGroup: map[string]machine.CPUSet{},
+		dedicatedAfterByGroup:  map[string]machine.CPUSet{},
+		partialBeforeCores:     0,
+	}
+
+	require.True(t, hardReclaimReplacementResultLess(
+		map[string]machine.CPUSet{}, leftProof,
+		map[string]machine.CPUSet{}, rightProof))
+}
+
+func TestHardReclaimReplacementSharesResidualBudgetAcrossGlobalCandidates(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopologyWithoutSMT(4, 1, 1)
+	require.NoError(t, err)
+	numa := topology.CPUDetails.CPUsInNUMANodes(0)
+	demands := []partitionDemand{
+		{
+			key: "reclaim", quantity: 1, eligible: numa,
+			preferred: machine.NewCPUSet(0), class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "shared", quantity: 1, eligible: numa,
+			preferred: machine.NewCPUSet(1), class: advisorBlockClassShared,
+		},
+	}
+
+	assignments, proof, err := solveHardReclaimWithReplacement(
+		demands,
+		numa,
+		topology,
+		hardReclaimReplacementOptions{
+			maxCandidateStates:          100,
+			maxTerminalSolves:           10,
+			maxPartitionAssignmentEdges: 4,
+			maxPartitionFlowOperations:  partitionFlowOperationBudget,
+		},
+	)
+
+	require.Nil(t, assignments)
+	require.Nil(t, proof)
+	var selectionErr *hardReclaimSelectionError
+	require.ErrorAs(t, err, &selectionErr)
+	require.Equal(t, hardReclaimFailureSearchBudget, selectionErr.reason)
+	require.ErrorIs(t, err, errPartitionAssignmentEdgeBudget)
 }

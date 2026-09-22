@@ -18,6 +18,7 @@ package dynamicpolicy
 
 import (
 	"container/heap"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -56,6 +57,25 @@ const (
 	partitionFlowOperationBudget = 100_000_000
 )
 
+var (
+	errPartitionAssignmentEdgeBudget = errors.New("partition graph edge budget exceeded")
+	errPartitionFlowOperationBudget  = errors.New("partition flow operation budget exceeded")
+)
+
+type partitionSolverBudget struct {
+	maxAssignmentEdges int
+	maxFlowOperations  int
+	assignmentEdges    int
+	flowOperations     int
+}
+
+func defaultPartitionSolverBudget() partitionSolverBudget {
+	return partitionSolverBudget{
+		maxAssignmentEdges: partitionAssignmentEdgeBudget,
+		maxFlowOperations:  partitionFlowOperationBudget,
+	}
+}
+
 type partitionDistanceItem struct {
 	node     int
 	distance int64
@@ -90,6 +110,22 @@ func solveDisjointPartitions(
 	demands []partitionDemand,
 	topology *machine.CPUTopology,
 ) (map[string]machine.CPUSet, error) {
+	return solveDisjointPartitionsWithBudget(demands, topology, defaultPartitionSolverBudget())
+}
+
+func solveDisjointPartitionsWithBudget(
+	demands []partitionDemand,
+	topology *machine.CPUTopology,
+	budget partitionSolverBudget,
+) (map[string]machine.CPUSet, error) {
+	return solveDisjointPartitionsWithSharedBudget(demands, topology, &budget)
+}
+
+func solveDisjointPartitionsWithSharedBudget(
+	demands []partitionDemand,
+	topology *machine.CPUTopology,
+	budget *partitionSolverBudget,
+) (map[string]machine.CPUSet, error) {
 	sortedDemands, cpus, total, err := validatePartitionDemands(demands, topology)
 	if err != nil {
 		return nil, err
@@ -121,7 +157,6 @@ func solveDisjointPartitions(
 		return nil, err
 	}
 
-	assignmentEdgeCount := 0
 	for cpuIndex, cpu := range cpus {
 		cpuNode := cpuBase + cpuIndex
 		addPartitionFlowEdge(graph, source, cpuNode, 1, 0)
@@ -129,9 +164,9 @@ func solveDisjointPartitions(
 			if !demand.eligible.Contains(cpu) {
 				continue
 			}
-			assignmentEdgeCount++
-			if assignmentEdgeCount > partitionAssignmentEdgeBudget {
-				return nil, fmt.Errorf("partition graph edge budget exceeded")
+			budget.assignmentEdges++
+			if budget.assignmentEdges > budget.maxAssignmentEdges {
+				return nil, errPartitionAssignmentEdgeBudget
 			}
 			cost, costErr := partitionEdgeCost(
 				cpu, cpuIndex, demandIndex, demand, dedicatedEligible, topology,
@@ -152,7 +187,8 @@ func solveDisjointPartitions(
 		addPartitionFlowEdge(graph, demandBase+demandIndex, sink, demand.quantity, 0)
 	}
 
-	flow, err := partitionMinCostFlow(graph, source, sink, total)
+	flow, err := partitionMinCostFlowWithUsage(
+		graph, source, sink, total, &budget.flowOperations, budget.maxFlowOperations)
 	if err != nil {
 		return nil, err
 	}
@@ -390,9 +426,27 @@ func addPartitionFlowEdge(graph [][]partitionFlowEdge, from, to, cap int, cost i
 }
 
 func partitionMinCostFlow(graph [][]partitionFlowEdge, source, sink, wanted int) (int, error) {
+	return partitionMinCostFlowWithBudget(
+		graph, source, sink, wanted, partitionFlowOperationBudget)
+}
+
+func partitionMinCostFlowWithBudget(
+	graph [][]partitionFlowEdge,
+	source, sink, wanted, maxOperations int,
+) (int, error) {
+	operations := 0
+	return partitionMinCostFlowWithUsage(
+		graph, source, sink, wanted, &operations, maxOperations)
+}
+
+func partitionMinCostFlowWithUsage(
+	graph [][]partitionFlowEdge,
+	source, sink, wanted int,
+	operations *int,
+	maxOperations int,
+) (int, error) {
 	flow := 0
 	potential := make([]int64, len(graph))
-	operations := 0
 	for flow < wanted {
 		distance := make([]int64, len(graph))
 		for i := range distance {
@@ -408,7 +462,7 @@ func partitionMinCostFlow(graph [][]partitionFlowEdge, source, sink, wanted int)
 				continue
 			}
 			for _, edge := range graph[item.node] {
-				if err := consumePartitionFlowOperation(&operations); err != nil {
+				if err := consumePartitionFlowOperation(operations, maxOperations); err != nil {
 					return 0, err
 				}
 				if edge.cap == 0 {
@@ -447,7 +501,7 @@ func partitionMinCostFlow(graph [][]partitionFlowEdge, source, sink, wanted int)
 		}
 
 		pushed, err := partitionPushAdmissibleFlow(
-			graph, source, sink, wanted-flow, potential, &operations,
+			graph, source, sink, wanted-flow, potential, operations, maxOperations,
 		)
 		if err != nil {
 			return 0, err
@@ -465,6 +519,7 @@ func partitionPushAdmissibleFlow(
 	source, sink, wanted int,
 	potential []int64,
 	operations *int,
+	maxOperations int,
 ) (int, error) {
 	total := 0
 	for total < wanted {
@@ -478,7 +533,7 @@ func partitionPushAdmissibleFlow(
 		for head := 0; head < len(queue); head++ {
 			node := queue[head]
 			for _, edge := range graph[node] {
-				if err := consumePartitionFlowOperation(operations); err != nil {
+				if err := consumePartitionFlowOperation(operations, maxOperations); err != nil {
 					return 0, err
 				}
 				if edge.cap == 0 || level[edge.to] != -1 {
@@ -502,7 +557,7 @@ func partitionPushAdmissibleFlow(
 		nextEdge := make([]int, len(graph))
 		for total < wanted {
 			pushed, err := partitionPushAdmissiblePath(
-				graph, source, sink, wanted-total, potential, level, nextEdge, operations,
+				graph, source, sink, wanted-total, potential, level, nextEdge, operations, maxOperations,
 			)
 			if err != nil {
 				return 0, err
@@ -522,6 +577,7 @@ func partitionPushAdmissiblePath(
 	potential []int64,
 	level, nextEdge []int,
 	operations *int,
+	maxOperations int,
 ) (int, error) {
 	if node == sink {
 		return available, nil
@@ -529,7 +585,7 @@ func partitionPushAdmissiblePath(
 	for nextEdge[node] < len(graph[node]) {
 		edgeIndex := nextEdge[node]
 		edge := graph[node][edgeIndex]
-		if err := consumePartitionFlowOperation(operations); err != nil {
+		if err := consumePartitionFlowOperation(operations, maxOperations); err != nil {
 			return 0, err
 		}
 		if edge.cap > 0 && level[edge.to] == level[node]+1 {
@@ -544,7 +600,7 @@ func partitionPushAdmissiblePath(
 				}
 				pushed, err := partitionPushAdmissiblePath(
 					graph, edge.to, sink, pathAvailable,
-					potential, level, nextEdge, operations,
+					potential, level, nextEdge, operations, maxOperations,
 				)
 				if err != nil {
 					return 0, err
@@ -577,10 +633,10 @@ func checkedPartitionCostSub(left, right int64) (int64, error) {
 	return left - right, nil
 }
 
-func consumePartitionFlowOperation(operations *int) error {
+func consumePartitionFlowOperation(operations *int, maxOperations int) error {
 	*operations = *operations + 1
-	if *operations > partitionFlowOperationBudget {
-		return fmt.Errorf("partition flow operation budget exceeded")
+	if *operations > maxOperations {
+		return errPartitionFlowOperationBudget
 	}
 	return nil
 }
