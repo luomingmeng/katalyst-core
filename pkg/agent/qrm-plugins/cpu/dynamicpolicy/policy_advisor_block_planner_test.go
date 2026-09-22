@@ -151,6 +151,61 @@ func TestBuildAdvisorBlockDescriptors_MandatoryFakeEligibleExcludesNonReclaimabl
 	require.True(t, descriptors[0].Eligible.Equals(allCPUs.Difference(nonReclaimable)))
 }
 
+// TestBuildAdvisorBlockDescriptors_MandatoryEligibleExcludesIsolationCPUs proves
+// that isolation-pool CPUs are protected from mandatory reclaim eligibility.
+//
+// Isolation pods own exclusive whole cores that the bulkhead domain model folds
+// into the primary (NonReclaimPool) side; they can never be released to reclaim.
+// If mandatory-reclaim eligibility still includes an isolation CPU, whole-core
+// alignment can select the isolation core's SMT sibling as a reclaim donor,
+// which later fails the bulkhead core-release witness with
+// "incomplete required core release witness: source=primary destination=reclaim".
+// buildAdvisorBlockDescriptors must therefore exclude isolation CPUs observed in
+// the committed pod entries, exactly as it already excludes the non-reclaimable
+// resource-package pinned set.
+func TestBuildAdvisorBlockDescriptors_MandatoryEligibleExcludesIsolationCPUs(t *testing.T) {
+	t.Parallel()
+
+	// 8 CPUs / 1 socket / 2 NUMA -> cpusPerCore=2. NUMA0 owns {0,1,4,5} with SMT
+	// pairs (0,4) and (1,5); isolate CPU 1 so its sibling 5 must stay protected.
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
+	isolationCPUs := machine.NewCPUSet(1)
+
+	podEntries := state.PodEntries{
+		commonstate.PoolNamePrefixIsolation + "-pod1": state.ContainerEntries{
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					OwnerPoolName: commonstate.PoolNamePrefixIsolation + "-pod1",
+				},
+				AllocationResult: isolationCPUs.Clone(),
+			},
+		},
+	}
+
+	resp := advisorBlockTestResponse([]advisorBlockTestAlias{{
+		entry:    commonstate.PoolNameReclaim,
+		subEntry: commonstate.FakedContainerName,
+		owner:    commonstate.PoolNameReclaim,
+		numaID:   0,
+		blockID:  "reclaim-numa0",
+		quantity: 2,
+	}}, rand.New(rand.NewSource(0)))
+
+	descriptors, err := buildAdvisorBlockDescriptors(
+		resp, topology.CPUDetails, podEntries, nil, machine.NewCPUSet())
+	require.NoError(t, err)
+	require.Len(t, descriptors, 1)
+	require.Equal(t, advisorBlockClassMandatoryReclaim, descriptors[0].Class)
+	require.True(t, descriptors[0].Eligible.Intersection(isolationCPUs).IsEmpty(),
+		"isolation CPUs must be excluded from mandatory reclaim eligibility, got %s",
+		descriptors[0].Eligible.String())
+	require.True(t, descriptors[0].Eligible.Equals(numa0.Difference(isolationCPUs)),
+		"mandatory reclaim eligibility must be NUMA0 minus isolation, got %s",
+		descriptors[0].Eligible.String())
+}
+
 func TestPlanDisjointAdvisorBlocks_ResponseDescriptorPlanAggregatesExpandedDemandsByBlockID(t *testing.T) {
 	t.Parallel()
 

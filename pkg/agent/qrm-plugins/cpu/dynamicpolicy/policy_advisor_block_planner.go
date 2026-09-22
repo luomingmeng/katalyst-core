@@ -77,6 +77,16 @@ func buildAdvisorBlockDescriptors(
 		return nil, fmt.Errorf("got nil advisor response")
 	}
 
+	// Isolation pods own exclusive whole cores that the bulkhead domain model
+	// folds into the primary (NonReclaimPool) side; they are never releasable to
+	// reclaim. Fold their committed CPUs into the non-reclaimable set so
+	// mandatory-reclaim eligibility (numaCPUs.Difference(nonReclaimableCPUSet))
+	// never offers an isolation core's SMT sibling as a whole-core reclaim donor.
+	// Skipping this lets whole-core alignment select the sibling and later fail
+	// the bulkhead core-release witness (source=primary destination=reclaim).
+	nonReclaimableCPUSet = nonReclaimableCPUSet.Union(
+		state.GetUnitedPoolsCPUs(podEntries, commonstate.IsIsolationPool))
+
 	allCPUs := cpuDetails.CPUs()
 	allPinnedCPUs := machine.NewCPUSet()
 	for _, cpus := range rpPinnedCPUSet {
