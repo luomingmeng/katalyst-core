@@ -1976,6 +1976,309 @@ func TestDynamicPolicy_deriveSteadyReclaimFloorFallsBackWhenReservedIdentityLeav
 	requireCoreAligned(t, topology, got)
 }
 
+func TestDynamicPolicyDeriveSteadyReclaimFloorDegradesBelowSoftTargetWithReservedFallback(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().NumaMinReclaimedResourceRatioForAllocate = v1.ResourceList{
+		v1.ResourceCPU: resource.MustParse("0.75"),
+	}
+
+	p.reservedReclaimedCPUSet = machine.NewCPUSet(2)
+	p.reservedReclaimedCPUsSize = p.reservedReclaimedCPUSet.Size()
+	currentReclaim := machine.NewCPUSet(0, 4)
+	p.state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &state.AllocationInfo{
+		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+		AllocationResult: currentReclaim,
+	}, false)
+
+	eligible := machine.NewCPUSet(0, 1, 4)
+	got, err := p.deriveSteadyReclaimFloor(map[int]machine.CPUSet{0: eligible})
+
+	require.NoError(t, err)
+	require.Equal(t, currentReclaim, got)
+	requireCoreAligned(t, topology, got)
+	require.True(t, got.IsSubsetOf(eligible), "floor=%s eligible=%s", got, eligible)
+}
+
+func TestDynamicPolicyDeriveSteadyReclaimFloorRoundsSoftTargetDown(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedReclaimedCPUSet = machine.NewCPUSet()
+	p.reservedReclaimedCPUsSize = 0
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().NumaMinReclaimedResourceRatioForAllocate = v1.ResourceList{
+		v1.ResourceCPU: resource.MustParse("0.375"),
+	}
+
+	eligible := machine.NewCPUSet(0, 1, 2, 4)
+	floor, err := p.deriveSteadyReclaimFloor(map[int]machine.CPUSet{
+		0: eligible,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 2, floor.Size())
+	require.NoError(t, assertCoreAligned(floor, topology))
+	require.True(t, floor.IsSubsetOf(eligible), "floor=%s eligible=%s", floor, eligible)
+}
+
+func TestDynamicPolicyDeriveSteadyReclaimFloorPreservesMandatoryIdentity(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedReclaimedCPUSet = machine.NewCPUSet(0)
+	p.reservedReclaimedCPUsSize = 1
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.dynamicConfig.GetDynamicConfiguration().NumaMinReclaimedResourceRatioForAllocate = v1.ResourceList{
+		v1.ResourceCPU: resource.MustParse("0.375"),
+	}
+
+	eligible := machine.NewCPUSet(0, 1, 2, 4)
+	mandatoryCore := machine.NewCPUSet(0, 4)
+	floor, err := p.deriveSteadyReclaimFloor(map[int]machine.CPUSet{
+		0: eligible,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 2, floor.Size())
+	require.True(t, mandatoryCore.IsSubsetOf(floor), "mandatory=%s floor=%s", mandatoryCore, floor)
+	require.NoError(t, assertCoreAligned(floor, topology))
+	require.True(t, floor.IsSubsetOf(eligible), "floor=%s eligible=%s", floor, eligible)
+}
+
+func TestSelectAdmissionSteadyReclaimTargetMixedSMTUsesBestBoundedCapacity(t *testing.T) {
+	t.Parallel()
+
+	topology := newMixedSMTAdmissionTopology()
+	eligible := topology.CPUDetails.CPUs()
+
+	got, err := selectAdmissionSteadyReclaimTarget(
+		topology,
+		eligible,
+		machine.NewCPUSet(0, 1, 2, 3, 7, 8),
+		machine.NewCPUSet(),
+		5,
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, machine.NewCPUSet(4, 5, 6, 7, 8), got)
+	require.NoError(t, assertCoreAligned(got, topology))
+}
+
+func TestSelectAdmissionSteadyReclaimTargetTieBreaksByPreferredThenPhysicalCoreKey(t *testing.T) {
+	t.Parallel()
+
+	topology := newMixedSMTAdmissionTopology()
+	eligible := topology.CPUDetails.CPUs()
+
+	got, err := selectAdmissionSteadyReclaimTarget(
+		topology,
+		eligible,
+		machine.NewCPUSet(7, 8),
+		machine.NewCPUSet(),
+		5,
+	)
+	require.NoError(t, err)
+	require.Equal(t, machine.NewCPUSet(4, 5, 6, 7, 8), got,
+		"preferred-hit tie-break must select the preferred SMT2 core")
+
+	got, err = selectAdmissionSteadyReclaimTarget(
+		topology,
+		eligible,
+		machine.NewCPUSet(),
+		machine.NewCPUSet(),
+		5,
+	)
+	require.NoError(t, err)
+	require.Equal(t, machine.NewCPUSet(4, 5, 6, 7, 8), got,
+		"equal-capacity and equal-preference choices must use physical core key order")
+}
+
+func TestSelectAdmissionSteadyReclaimTargetKeepsReservedFallback(t *testing.T) {
+	t.Parallel()
+
+	topology := newMixedSMTAdmissionTopology()
+	eligible := machine.NewCPUSet(4, 5, 6, 7, 8)
+	preferred := machine.NewCPUSet(7, 8)
+
+	got, err := selectAdmissionSteadyReclaimTarget(
+		topology,
+		eligible,
+		preferred,
+		machine.NewCPUSet(0),
+		2,
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, preferred, got,
+		"an ineligible reserved identity must fall back to an eligible preferred core")
+}
+
+func newMixedSMTAdmissionTopology() *machine.CPUTopology {
+	details := machine.CPUDetails{}
+	nextCPU := 0
+	for coreID, threads := range []int{4, 3, 2, 2} {
+		for thread := 0; thread < threads; thread++ {
+			details[nextCPU] = machine.CPUTopoInfo{
+				NUMANodeID: 0,
+				SocketID:   0,
+				CoreID:     coreID,
+			}
+			nextCPU++
+		}
+	}
+	return &machine.CPUTopology{
+		NumCPUs:      nextCPU,
+		NumCores:     4,
+		NumSockets:   1,
+		NumNUMANodes: 1,
+		CPUDetails:   details,
+	}
+}
+
+func TestDedicatedNUMAExclusiveAdmissionReturnsReclaimRemainderToDNB(t *testing.T) {
+	t.Parallel()
+
+	p, req, partitionEligibleByNUMA := newDedicatedNUMAExclusiveRemainderFixture(t, 1)
+	advisorBlockResult := int(req.ResourceRequests[string(v1.ResourceCPU)])
+
+	resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(
+		withAllocationPodMeta(context.Background(), req), req, false)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+
+	dnb := p.state.GetAllocationInfo(req.PodUid, req.ContainerName)
+	reclaim := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	require.NotNil(t, dnb)
+	require.NotNil(t, reclaim)
+	partitionEligible := partitionEligibleByNUMA[0]
+	require.True(t, dnb.AllocationResult.Intersection(reclaim.AllocationResult).IsEmpty())
+	require.True(t, dnb.AllocationResult.Union(reclaim.AllocationResult).Equals(partitionEligible))
+	require.NoError(t, assertCoreAligned(reclaim.AllocationResult, p.machineInfo.CPUTopology))
+	require.Greater(t, dnb.AllocationResult.Size(), advisorBlockResult)
+	require.Equal(t, partitionEligible.Size()-reclaim.AllocationResult.Size(), dnb.AllocationResult.Size())
+}
+
+func TestDedicatedNUMAExclusiveAdmissionKeepsRemainderInOriginalNUMA(t *testing.T) {
+	t.Parallel()
+
+	p, req, partitionEligibleByNUMA := newDedicatedNUMAExclusiveRemainderFixture(t, 2)
+
+	resp, err := p.dedicatedCoresWithNUMABindingAllocationHandler(
+		withAllocationPodMeta(context.Background(), req), req, false)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+
+	dnb := p.state.GetAllocationInfo(req.PodUid, req.ContainerName)
+	reclaim := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	require.NotNil(t, dnb)
+	require.NotNil(t, reclaim)
+	require.True(t, dnb.AllocationResult.Intersection(reclaim.AllocationResult).IsEmpty())
+	require.NoError(t, assertCoreAligned(reclaim.AllocationResult, p.machineInfo.CPUTopology))
+	for numaID, partitionEligible := range partitionEligibleByNUMA {
+		numaCPUs := p.machineInfo.CPUDetails.CPUsInNUMANodes(numaID)
+		dnbInNUMA := dnb.AllocationResult.Intersection(numaCPUs)
+		reclaimInNUMA := reclaim.AllocationResult.Intersection(numaCPUs)
+		require.Equal(t, 2, reclaimInNUMA.Size(), "NUMA %d reclaim=%s", numaID, reclaimInNUMA)
+		require.Equal(t, 6, dnbInNUMA.Size(), "NUMA %d DNB=%s", numaID, dnbInNUMA)
+		require.True(t, dnbInNUMA.Union(reclaimInNUMA).Equals(partitionEligible),
+			"NUMA %d DNB=%s reclaim=%s eligible=%s", numaID, dnbInNUMA, reclaimInNUMA, partitionEligible)
+	}
+}
+
+func newDedicatedNUMAExclusiveRemainderFixture(
+	t *testing.T,
+	numaCount int,
+) (*DynamicPolicy, *pluginapi.ResourceRequest, map[int]machine.CPUSet) {
+	t.Helper()
+
+	topology, err := machine.GenerateDummyCPUTopology(8*numaCount, 1, numaCount)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet()
+	p.reservedReclaimedCPUSet = machine.NewCPUSet()
+	p.reservedReclaimedCPUsSize = 0
+	dynamicConf := p.dynamicConfig.GetDynamicConfiguration()
+	dynamicConf.EnableReclaim = true
+	dynamicConf.EnableRampUpReclaimHardPartition = true
+	dynamicConf.NumaMinReclaimedResourceRatioForAllocate = v1.ResourceList{
+		v1.ResourceCPU: resource.MustParse("0.375"),
+	}
+	dynamicConf.DisableReclaimPinnedCPUSetResourcePackageSelector = "disable-reclaim=true"
+	p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
+	p.metaServer.ServiceProfilingManager = &recordingServiceProfilingManager{
+		DummyServiceProfilingManager: &spd.DummyServiceProfilingManager{},
+		performanceLevel:             spd.PerformanceLevelPoor,
+	}
+
+	machineState := make(state.NUMANodeMap, numaCount)
+	partitionEligibleByNUMA := make(map[int]machine.CPUSet, numaCount)
+	hintNodes := make([]uint64, 0, numaCount)
+	for numaID := 0; numaID < numaCount; numaID++ {
+		numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
+		cores := topology.CPUDetails.CoresInNUMANodes(numaID).ToSliceInt()
+		require.Len(t, cores, 4)
+		protected := topology.CPUDetails.CPUsInCores(cores[1])
+		for _, coreID := range cores[2:] {
+			protected = protected.Union(machine.NewCPUSet(
+				topology.CPUDetails.CPUsInCores(coreID).ToSliceInt()[0]))
+		}
+		work := numaCPUs.Difference(topology.CPUDetails.CPUsInCores(cores[0]))
+		machineState[numaID] = &state.NUMANodeState{
+			DefaultCPUSet: numaCPUs,
+			ResourcePackageStates: map[string]*state.ResourcePackageState{
+				"work": {
+					PinnedCPUSet: work,
+				},
+				"protected": {
+					Attributes:   map[string]string{"disable-reclaim": "true"},
+					PinnedCPUSet: protected,
+				},
+			},
+		}
+		partitionEligibleByNUMA[numaID] = numaCPUs
+		hintNodes = append(hintNodes, uint64(numaID))
+	}
+	require.NoError(t, p.state.SetMachineState(machineState, false))
+
+	req := &pluginapi.ResourceRequest{
+		PodUid:         "exclusive-dnb-reclaim-remainder",
+		PodNamespace:   "default",
+		PodName:        "exclusive-dnb-reclaim-remainder",
+		ContainerName:  "main",
+		ContainerType:  pluginapi.ContainerType_MAIN,
+		ContainerIndex: 0,
+		ResourceName:   string(v1.ResourceCPU),
+		ResourceRequests: map[string]float64{
+			string(v1.ResourceCPU): float64(2 * numaCount),
+		},
+		Labels: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+		},
+		Annotations: map[string]string{
+			apiconsts.PodAnnotationQoSLevelKey:                    apiconsts.PodAnnotationQoSLevelDedicatedCores,
+			apiconsts.PodAnnotationMemoryEnhancementNumaBinding:   apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
+			apiconsts.PodAnnotationResourcePackageKey:             "work",
+		},
+		Hint: &pluginapi.TopologyHint{Nodes: hintNodes},
+	}
+	return p, req, partitionEligibleByNUMA
+}
+
 func TestDynamicPolicy_allocateNumaBindingCPUs_preservesMandatoryOnPodLookupFailure(t *testing.T) {
 	t.Parallel()
 

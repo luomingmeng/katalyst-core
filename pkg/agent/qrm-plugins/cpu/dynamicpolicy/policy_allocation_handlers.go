@@ -4292,39 +4292,153 @@ func (p *DynamicPolicy) deriveSteadyReclaimFloor(
 			return machine.NewCPUSet(), fmt.Errorf("derive steady reclaim floor: missing reclaim eligibility for NUMA %d", numaID)
 		}
 		target := targetByNUMA[numaID]
-		if eligible.Size() < target {
-			return machine.NewCPUSet(), fmt.Errorf(
-				"derive steady reclaim floor for NUMA %d: eligible capacity %d is smaller than steady target %d",
-				numaID, eligible.Size(), target)
-		}
 
 		reservedIdentities := p.reservedReclaimedCPUSet.Intersection(
 			p.machineInfo.CPUDetails.CPUsInNUMANodes(numaID))
-		floorInNUMA, err := completeEligibleCoresForPreferredCPUSet(
-			p.machineInfo.CPUTopology, eligible, reservedIdentities)
+		floorInNUMA, err := selectAdmissionSteadyReclaimTarget(
+			p.machineInfo.CPUTopology,
+			eligible,
+			currentReclaim.Intersection(eligible),
+			reservedIdentities,
+			target,
+		)
 		if err != nil {
 			return machine.NewCPUSet(), fmt.Errorf("derive steady reclaim floor for NUMA %d: %w", numaID, err)
 		}
-		if floorInNUMA.Size() > target {
-			return machine.NewCPUSet(), fmt.Errorf(
-				"derive steady reclaim floor for NUMA %d: mandatory reserve size %d exceeds steady target %d",
-				numaID, floorInNUMA.Size(), target)
-		}
-		additional := target - floorInNUMA.Size()
-		if additional > 0 {
-			additionalEligible := eligible.Difference(floorInNUMA)
-			preferred := currentReclaim.Intersection(additionalEligible)
-			supplement := takeCoreAlignedCPUSet(p.machineInfo.CPUTopology, additionalEligible, preferred, additional)
-			if supplement.Size() != additional {
-				return machine.NewCPUSet(), fmt.Errorf(
-					"select steady reclaim floor for NUMA %d: selected %d of %d core-aligned CPUs",
-					numaID, supplement.Size(), additional)
-			}
-			floorInNUMA = floorInNUMA.Union(supplement)
+		if floorInNUMA.Size() < target {
+			general.InfoS("reclaimTargetShortfall",
+				"numaID", numaID,
+				"requestedReclaimQuantity", target,
+				"actualReclaimQuantity", floorInNUMA.Size(),
+				"remainderForDedicated", target-floorInNUMA.Size(),
+				"reason", "whole_core_capacity")
 		}
 		floor = floor.Union(floorInNUMA)
 	}
 	return floor, nil
+}
+
+func selectAdmissionSteadyReclaimTarget(
+	topology *machine.CPUTopology,
+	eligible machine.CPUSet,
+	preferred machine.CPUSet,
+	mandatory machine.CPUSet,
+	softTarget int,
+) (machine.CPUSet, error) {
+	completedMandatory, err := completeEligibleCoresForPreferredCPUSet(topology, eligible, mandatory)
+	if err != nil {
+		return machine.NewCPUSet(), err
+	}
+	if !completedMandatory.IsSubsetOf(eligible) {
+		return machine.NewCPUSet(), fmt.Errorf(
+			"mandatory reclaim CPUs %s are outside eligibility %s",
+			completedMandatory.String(), eligible.String())
+	}
+	if completedMandatory.Size() > softTarget {
+		return machine.NewCPUSet(), fmt.Errorf(
+			"mandatory reserve size %d exceeds steady target %d",
+			completedMandatory.Size(), softTarget)
+	}
+
+	selected := completedMandatory.Clone()
+	budget := softTarget - selected.Size()
+	if budget <= 0 {
+		return selected, nil
+	}
+	supplementEligible := eligible.Difference(selected)
+	supplement := selectAdmissionCoreAlignedSupplement(
+		topology,
+		supplementEligible,
+		preferred.Intersection(supplementEligible),
+		budget,
+	)
+	return selected.Union(supplement), nil
+}
+
+type admissionCoreSelection struct {
+	cpus         machine.CPUSet
+	preferredHit int
+	keys         []physicalCoreKey
+}
+
+// selectAdmissionCoreAlignedSupplement uses a NUMA-local, budget-bounded
+// knapsack. Mixed-SMT cores may have different logical CPU capacities, so a
+// greedy walk can leave usable capacity behind. Selection priorities are:
+// maximum capacity not exceeding budget, maximum preferred siblings retained,
+// then the lexicographically smallest physical-core key sequence.
+func selectAdmissionCoreAlignedSupplement(
+	topology *machine.CPUTopology,
+	eligible machine.CPUSet,
+	preferred machine.CPUSet,
+	budget int,
+) machine.CPUSet {
+	if topology == nil || budget <= 0 || eligible.IsEmpty() {
+		return machine.NewCPUSet()
+	}
+
+	cores := coreAlignedCandidates(topology, eligible, preferred)
+	sort.Slice(cores, func(i, j int) bool {
+		return physicalCoreKeyLess(cores[i].key, cores[j].key)
+	})
+	totalCapacity := 0
+	for _, core := range cores {
+		totalCapacity += core.cpus.Size()
+	}
+	if budget > totalCapacity {
+		budget = totalCapacity
+	}
+
+	dp := make([]*admissionCoreSelection, budget+1)
+	dp[0] = &admissionCoreSelection{cpus: machine.NewCPUSet()}
+	for _, core := range cores {
+		capacity := core.cpus.Size()
+		if capacity > budget {
+			continue
+		}
+		for used := budget; used >= capacity; used-- {
+			previous := dp[used-capacity]
+			if previous == nil {
+				continue
+			}
+			candidate := &admissionCoreSelection{
+				cpus:         previous.cpus.Union(core.cpus),
+				preferredHit: previous.preferredHit + core.preferredHit,
+				keys:         appendCoreKey(previous.keys, core.key),
+			}
+			if betterAdmissionCoreSelection(candidate, dp[used]) {
+				dp[used] = candidate
+			}
+		}
+	}
+	for used := budget; used >= 0; used-- {
+		if dp[used] != nil {
+			return dp[used].cpus
+		}
+	}
+	return machine.NewCPUSet()
+}
+
+func appendCoreKey(keys []physicalCoreKey, key physicalCoreKey) []physicalCoreKey {
+	appended := make([]physicalCoreKey, len(keys)+1)
+	copy(appended, keys)
+	appended[len(keys)] = key
+	return appended
+}
+
+func betterAdmissionCoreSelection(candidate, current *admissionCoreSelection) bool {
+	if current == nil {
+		return true
+	}
+	if candidate.preferredHit != current.preferredHit {
+		return candidate.preferredHit > current.preferredHit
+	}
+	for i := 0; i < len(candidate.keys) && i < len(current.keys); i++ {
+		if candidate.keys[i] == current.keys[i] {
+			continue
+		}
+		return physicalCoreKeyLess(candidate.keys[i], current.keys[i])
+	}
+	return len(candidate.keys) < len(current.keys)
 }
 
 // numaBindingPartitionEligibility applies the same resource-package owner rules
