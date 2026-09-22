@@ -698,6 +698,12 @@ func TestAllocateSharedNumaBindingCPUsMarksColdStartRampUp(t *testing.T) {
 
 	policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 	require.NoError(t, err)
+
+	// Mockey rewrites method text process-wide. Serialize this unpatched
+	// PodFetcherStub call with the advisor tests that patch adjacent methods.
+	advisorTestMutex.Lock()
+	defer advisorTestMutex.Unlock()
+
 	policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = false
 	policy.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{{
 		ObjectMeta: metav1.ObjectMeta{
