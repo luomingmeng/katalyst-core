@@ -50,14 +50,17 @@ type AppliedPhysicalWrite struct {
 }
 
 type traceMutationStack struct {
-	writes               []AppliedPhysicalWrite
-	rollbackObservations map[string]rollbackObservation
-	releasedByDomain     map[DomainID]map[int]struct{}
+	writes                       []AppliedPhysicalWrite
+	rollbackObservations         map[string]rollbackObservation
+	confirmedRetiredDuringReplay map[string]CgroupIdentity
+	releasedByDomain             map[DomainID]map[int]struct{}
+	rollbackRetirements          []FrozenRollbackRetirement
 }
 
 type rollbackObservation struct {
 	current EntryState
 	err     error
+	retired bool
 }
 
 type frozenSourceReleaseGuard struct {
@@ -916,7 +919,10 @@ func (r *coordinatorRound) executeValidatedFrozenTrace(
 
 	journalStart := len(res.Journal)
 	appliedStart := res.Applied
-	stack := &traceMutationStack{}
+	stack := &traceMutationStack{
+		rollbackRetirements: append(
+			[]FrozenRollbackRetirement(nil), frozen.RollbackRetirements...),
+	}
 	operationIndex := 0
 	for _, phase := range frozen.Phases {
 		for _, operation := range phase.Operations {
@@ -1461,9 +1467,11 @@ func newFrozenTraceRecoveryContext() (context.Context, context.CancelFunc) {
 }
 
 // rollbackTracePrefix restores the recorded write prefix in reverse order under
-// reserved rollback authority. It refuses replacement identities and
-// same-generation third states, aggregates all recovery failures, and verifies
-// the complete prefix before the caller may treat failed execution as atomic.
+// reserved rollback authority. A compiler-authorized dynamic generation that
+// is independently confirmed absent is treated as retired rather than
+// restored. Replacement generations, same-generation third states, and
+// untyped probe failures fail closed. The complete prefix is verified before
+// the caller may report an atomic failure.
 func (w safeCPSetWriter) rollbackTracePrefix(
 	ctx context.Context,
 	stack *traceMutationStack,
@@ -1476,8 +1484,19 @@ func (w safeCPSetWriter) rollbackTracePrefix(
 	var rollbackErrors []error
 	for i := len(stack.writes) - 1; i >= 0; i-- {
 		write := stack.writes[i]
+		if stack.confirmedRetiredDuringReplay[write.Rel] == write.Identity {
+			continue
+		}
 		current, err := rollbackDriver.ReadEntry(ctx, write.Rel)
 		if err != nil {
+			retired, retirementErr := confirmRollbackRetirement(
+				ctx, rollbackDriver, stack, write, err)
+			if retired {
+				continue
+			}
+			if retirementErr != nil {
+				err = retirementErr
+			}
 			rollbackErrors = append(rollbackErrors,
 				fmt.Errorf("read entry before rollback %s for %q: %w",
 					write.Resource, write.Rel, err))
@@ -1519,6 +1538,14 @@ func (w safeCPSetWriter) rollbackTracePrefix(
 			}
 			w.recordPhysicalWriteAttempt()
 			if err := rollbackDriver.WriteCPUs(ctx, write.Rel, write.Identity, before); err != nil {
+				retired, retirementErr := confirmRollbackRetirement(
+					ctx, rollbackDriver, stack, write, err)
+				if retired {
+					continue
+				}
+				if retirementErr != nil {
+					err = retirementErr
+				}
 				rollbackErrors = append(rollbackErrors,
 					fmt.Errorf("rollback cpuset.cpus for %q: %w", write.Rel, err))
 			}
@@ -1529,6 +1556,14 @@ func (w safeCPSetWriter) rollbackTracePrefix(
 			}
 			w.recordPhysicalWriteAttempt()
 			if err := rollbackDriver.WriteMems(ctx, write.Rel, write.Identity, write.Before); err != nil {
+				retired, retirementErr := confirmRollbackRetirement(
+					ctx, rollbackDriver, stack, write, err)
+				if retired {
+					continue
+				}
+				if retirementErr != nil {
+					err = retirementErr
+				}
 				rollbackErrors = append(rollbackErrors,
 					fmt.Errorf("rollback cpuset.mems for %q: %w", write.Rel, err))
 			}
@@ -1539,6 +1574,68 @@ func (w safeCPSetWriter) rollbackTracePrefix(
 	}
 	rollbackErrors = append(rollbackErrors, w.verifyRolledBackPrefix(ctx, rollbackDriver, stack)...)
 	return utilerrors.NewAggregate(rollbackErrors)
+}
+
+// confirmRollbackRetirement accepts a missing rollback target only when the
+// immutable compiler rollback contract names that exact written generation. A
+// second identity lookup must independently confirm typed path absence; a live
+// generation or any other error fails closed.
+func confirmRollbackRetirement(
+	ctx context.Context,
+	driver HierarchyDriver,
+	stack *traceMutationStack,
+	write AppliedPhysicalWrite,
+	readErr error,
+) (bool, error) {
+	if !isCgroupPathAbsent(readErr) ||
+		!frozenTraceAuthorizesRollbackRetirement(stack, write.Rel, write.Identity) {
+		return false, nil
+	}
+	current, err := driver.StatIdentity(ctx, write.Rel)
+	if err != nil {
+		if !isCgroupPathAbsent(err) {
+			return false, fmt.Errorf("confirm rollback retirement for %q: %w", write.Rel, err)
+		}
+		if stack.confirmedRetiredDuringReplay == nil {
+			stack.confirmedRetiredDuringReplay = make(map[string]CgroupIdentity)
+		}
+		stack.confirmedRetiredDuringReplay[write.Rel] = write.Identity
+		return true, nil
+	}
+	if current != write.Identity {
+		return false, fmt.Errorf(
+			"%w: refuse rollback retirement for replacement rel=%q expected=%v current=%v",
+			ErrCgroupIdentityChanged, write.Rel, write.Identity, current)
+	}
+	return false, fmt.Errorf(
+		"refuse rollback retirement for %q: typed absence was not confirmed", write.Rel)
+}
+
+// frozenTraceAuthorizesRollbackRetirement accepts exactly one compiler-issued
+// authorization for the requested relation and generation. Missing, duplicate,
+// zero, or generation-mismatched entries fail closed.
+func frozenTraceAuthorizesRollbackRetirement(
+	stack *traceMutationStack,
+	rel string,
+	identity CgroupIdentity,
+) bool {
+	if stack == nil || identity == (CgroupIdentity{}) {
+		return false
+	}
+	authorized := false
+	for _, retirement := range stack.rollbackRetirements {
+		if retirement.Rel == rel {
+			if authorized {
+				return false
+			}
+			if retirement.Identity != identity ||
+				retirement.Identity == (CgroupIdentity{}) {
+				return false
+			}
+			authorized = true
+		}
+	}
+	return authorized
 }
 
 type rollbackPhysicalState uint8
@@ -1614,23 +1711,31 @@ func rollbackPhysicalExpectedString(
 		resource, configured, effective)
 }
 
+// verifyRolledBackPrefix proves that every written relation is either restored
+// to its initial physical state or is an authorized generation independently
+// confirmed retired. Retirement is revalidated against typed absence and the
+// frozen authority rather than trusting replay observations alone.
 func (w safeCPSetWriter) verifyRolledBackPrefix(
 	ctx context.Context,
 	driver HierarchyDriver,
 	stack *traceMutationStack,
 ) []error {
 	type initialPhysicalState struct {
-		identity       CgroupIdentity
-		configuredCPUs *string
-		effectiveCPUs  *string
-		configuredMems *string
-		effectiveMems  *string
+		identity        CgroupIdentity
+		retirementWrite AppliedPhysicalWrite
+		configuredCPUs  *string
+		effectiveCPUs   *string
+		configuredMems  *string
+		effectiveMems   *string
 	}
 	initialByRel := make(map[string]*initialPhysicalState)
 	for _, write := range stack.writes {
 		initial := initialByRel[write.Rel]
 		if initial == nil {
-			initial = &initialPhysicalState{identity: write.Identity}
+			initial = &initialPhysicalState{
+				identity:        write.Identity,
+				retirementWrite: write,
+			}
 			initialByRel[write.Rel] = initial
 		}
 		switch write.Resource {
@@ -1657,6 +1762,21 @@ func (w safeCPSetWriter) verifyRolledBackPrefix(
 		initial := initialByRel[rel]
 		current, err := driver.ReadEntry(ctx, rel)
 		if err != nil {
+			retired := stack.confirmedRetiredDuringReplay[rel] == initial.identity &&
+				isCgroupPathAbsent(err) &&
+				frozenTraceAuthorizesRollbackRetirement(stack, rel, initial.identity)
+			var retirementErr error
+			if !retired {
+				retired, retirementErr = confirmRollbackRetirement(
+					ctx, driver, stack, initial.retirementWrite, err)
+			}
+			if retired {
+				stack.rollbackObservations[rel] = rollbackObservation{retired: true}
+				continue
+			}
+			if retirementErr != nil {
+				err = retirementErr
+			}
 			stack.rollbackObservations[rel] = rollbackObservation{err: err}
 			verificationErrors = append(verificationErrors,
 				fmt.Errorf("read %q after rollback: %w", rel, err))
@@ -1766,6 +1886,12 @@ func (w safeCPSetWriter) rebuildPhysicalImpactEvidence(
 		chain := chains[chainKey]
 		last := chain.writes[len(chain.writes)-1]
 		observation, observed := stack.rollbackObservations[last.Rel]
+		if observed && observation.retired {
+			// A confirmed retirement leaves no live generation whose physical
+			// mutation can remain observable, so it contributes no residual
+			// physical-impact evidence.
+			continue
+		}
 		impact := PhysicalImpactConfirmed
 		if !observed || observation.err != nil {
 			impact = PhysicalImpactUncertain

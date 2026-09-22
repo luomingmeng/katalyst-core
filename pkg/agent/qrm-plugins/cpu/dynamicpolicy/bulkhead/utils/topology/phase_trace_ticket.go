@@ -40,7 +40,10 @@ type ExecutionReservationTicket struct {
 	consumedRollback PhysicalWriteCost
 	// Rollback hierarchy I/O is isolated from the ordinary convergence budget,
 	// but remains finite. Every reserved inverse write permits one identity
-	// check, one write, and one final read-back.
+	// check, one write, one retirement-confirmation stat, one final read-back,
+	// and one final-verification confirmation stat. Both stats are needed in
+	// the worst case when the first confirmation fails closed and final
+	// verification independently observes typed ENOENT.
 	rollbackIOOperations         int
 	consumedRollbackIOOperations int
 	released                     bool
@@ -104,7 +107,7 @@ func (b *BudgetTracker) reserveValidatedPhaseTrace(
 		traceID:              frozen.TraceID,
 		operations:           operations,
 		reserved:             reserved,
-		rollbackIOOperations: saturatingMultiply(reserved.Rollback.Total(), 3),
+		rollbackIOOperations: saturatingMultiply(reserved.Rollback.Total(), 5),
 	}, nil
 }
 

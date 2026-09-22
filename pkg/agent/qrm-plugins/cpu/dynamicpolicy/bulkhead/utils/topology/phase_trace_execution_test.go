@@ -1629,6 +1629,225 @@ func TestRollbackIdentityDriftDoesNotWriteReplacementGeneration(t *testing.T) {
 	require.Equal(t, machine.MustParse("0-1"), live.nodes["a"].cpus)
 }
 
+func TestRollbackENOENTRequiresExactFrozenWrittenIdentity(t *testing.T) {
+	identity := CgroupIdentity{Device: 1, Inode: 1}
+	newStack := func(retirements []FrozenRollbackRetirement) *traceMutationStack {
+		return &traceMutationStack{
+			writes: []AppliedPhysicalWrite{{
+				PlanID: "plan", Rel: "holder", Identity: identity,
+				Direction: WriteGrow, Resource: HierarchyOperationWriteCPUs,
+				Before: "0", BeforeEffective: "0",
+				After: "0-1", AfterEffective: "0-1",
+				Impact: PhysicalImpactConfirmed,
+			}},
+			rollbackRetirements: retirements,
+		}
+	}
+	authorized := []FrozenRollbackRetirement{{Rel: "holder", Identity: identity}}
+
+	t.Run("exact authorized identity with confirmed absence", func(t *testing.T) {
+		live := newFakeHierarchyDriver()
+		writer := newSafeCPUSetWriter(live, NewBudgetTracker(ConvergenceBudget{}), nil)
+		ticket := rollbackOnlyTicket(1, 0)
+
+		err := writer.rollbackTracePrefix(context.Background(), newStack(authorized), ticket)
+
+		require.NoError(t, err)
+		require.Zero(t, live.PhysicalWriteCount())
+		require.Equal(t, 3, ticket.consumedRollbackIOOperations,
+			"rollback must confirm absence and verify the retired result")
+	})
+
+	tests := []struct {
+		name        string
+		retirements []FrozenRollbackRetirement
+		identity    CgroupIdentity
+		err         error
+		prepare     func(*fakeHierarchyDriver)
+	}{
+		{
+			name:     "unlisted write",
+			identity: identity,
+		},
+		{
+			name:        "zero identity",
+			retirements: []FrozenRollbackRetirement{{Rel: "holder"}},
+		},
+		{
+			name: "authorization identity mismatch",
+			retirements: []FrozenRollbackRetirement{{
+				Rel: "holder", Identity: CgroupIdentity{Device: 1, Inode: 2},
+			}},
+			identity: identity,
+		},
+		{
+			name: "duplicate authorization",
+			retirements: []FrozenRollbackRetirement{
+				{Rel: "holder", Identity: identity},
+				{Rel: "holder", Identity: identity},
+			},
+			identity: identity,
+		},
+		{
+			name:        "untyped absence",
+			retirements: authorized,
+			identity:    identity,
+			err:         errors.New("read cpuset.cpus: no such file or directory"),
+		},
+		{
+			name:        "same identity still present",
+			retirements: authorized,
+			identity:    identity,
+			err:         syscall.ENOENT,
+			prepare: func(live *fakeHierarchyDriver) {
+				live.add("holder", identity, "0-1", "0")
+			},
+		},
+		{
+			name:        "replacement identity",
+			retirements: authorized,
+			identity:    identity,
+			err:         syscall.ENOENT,
+			prepare: func(live *fakeHierarchyDriver) {
+				live.add("holder", CgroupIdentity{Device: 1, Inode: 2}, "0-1", "0")
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			live := newFakeHierarchyDriver()
+			if tt.prepare != nil {
+				tt.prepare(live)
+			}
+			if tt.err != nil {
+				failed := false
+				live.beforeCall = func(operation HierarchyOperation, rel string) error {
+					if !failed && operation == HierarchyOperationRead && rel == "holder" {
+						failed = true
+						return tt.err
+					}
+					return nil
+				}
+			}
+			stack := newStack(tt.retirements)
+			stack.writes[0].Identity = tt.identity
+			writer := newSafeCPUSetWriter(live, NewBudgetTracker(ConvergenceBudget{}), nil)
+			drift := &frozenFinalSnapshotDriftError{stale: &PlanStaleError{
+				Rel: "controlled", Direction: WritePublish, Resource: "final_snapshot",
+				Err: fmt.Errorf("test final snapshot drift"),
+			}}
+			res := &ConvergenceResult{}
+
+			err := writer.failFrozenTrace(
+				context.Background(), drift, stack, rollbackOnlyTicket(1, 0), res, 0, 0)
+
+			require.Error(t, err)
+			require.ErrorContains(t, err, "rollback failed")
+			var safe interface{ FrozenSnapshotDriftReplanSafe() bool }
+			require.False(t, errors.As(err, &safe),
+				"rejected or unverified retirement must not authorize final-drift replan")
+			require.Zero(t, live.PhysicalWriteCount(),
+				"rejected disappearance must never write a live or replacement cgroup")
+		})
+	}
+}
+
+func TestRollbackAuthorizedRetirementAcrossInverseWriteWindows(t *testing.T) {
+	identity := CgroupIdentity{Device: 1, Inode: 1}
+	for _, resource := range []HierarchyOperation{
+		HierarchyOperationWriteCPUs,
+		HierarchyOperationWriteMems,
+	} {
+		resource := resource
+		for _, window := range []rollbackRetirementWindow{
+			rollbackRetirementOnInverseWrite,
+			rollbackRetirementAfterInverseWrite,
+		} {
+			window := window
+			t.Run(string(resource)+"/"+string(window), func(t *testing.T) {
+				live := newFakeHierarchyDriver()
+				live.allowUnwitnessedExpansion = true
+				live.add("holder", identity, "0-1", "0-1")
+				driver := &rollbackRetirementWindowDriver{
+					HierarchyDriver: live,
+					live:            live,
+					rel:             "holder",
+					resource:        resource,
+					window:          window,
+				}
+				write := AppliedPhysicalWrite{
+					PlanID: "plan", Rel: "holder", Identity: identity,
+					Direction: WriteGrow, Resource: resource,
+					Impact: PhysicalImpactConfirmed,
+				}
+				cpuWrites, memWrites := 0, 0
+				switch resource {
+				case HierarchyOperationWriteCPUs:
+					write.Before, write.BeforeEffective = "0", "0"
+					write.After, write.AfterEffective = "0-1", "0-1"
+					cpuWrites = 1
+				case HierarchyOperationWriteMems:
+					write.Before, write.BeforeEffective = "0", "0"
+					write.After, write.AfterEffective = "0-1", "0-1"
+					memWrites = 1
+				}
+				stack := &traceMutationStack{
+					writes: []AppliedPhysicalWrite{write},
+					rollbackRetirements: []FrozenRollbackRetirement{{
+						Rel: "holder", Identity: identity,
+					}},
+				}
+				ticket := rollbackOnlyTicket(cpuWrites, memWrites)
+				writer := newSafeCPUSetWriter(
+					driver, NewBudgetTracker(ConvergenceBudget{}), nil)
+
+				err := writer.rollbackTracePrefix(context.Background(), stack, ticket)
+
+				require.NoError(t, err)
+				require.True(t, driver.retired)
+				require.Equal(t, 1, driver.absentStats,
+					"typed ENOENT must use identity-bound retirement confirmation")
+				require.Equal(t, 4, ticket.consumedRollbackIOOperations,
+					"successful retirement uses read/write/stat/final-read")
+			})
+		}
+	}
+}
+
+func TestFinalSnapshotDriftReplanAllowsConfirmedAuthorizedRollbackRetirementOnly(t *testing.T) {
+	identity := CgroupIdentity{Device: 1, Inode: 1}
+	stack := &traceMutationStack{
+		writes: []AppliedPhysicalWrite{{
+			PlanID: "plan", Rel: "holder", Identity: identity,
+			Direction: WriteGrow, Resource: HierarchyOperationWriteCPUs,
+			Before: "0", BeforeEffective: "0",
+			After: "0-1", AfterEffective: "0-1",
+			Impact: PhysicalImpactConfirmed,
+		}},
+		rollbackRetirements: []FrozenRollbackRetirement{{
+			Rel: "holder", Identity: identity,
+		}},
+	}
+	drift := &frozenFinalSnapshotDriftError{stale: &PlanStaleError{
+		Rel: "controlled", Direction: WritePublish, Resource: "final_snapshot",
+		Err: fmt.Errorf("test final snapshot drift"),
+	}}
+	writer := newSafeCPUSetWriter(
+		newFakeHierarchyDriver(), NewBudgetTracker(ConvergenceBudget{}), nil)
+	res := &ConvergenceResult{Applied: 1, Journal: []AppliedPlanOperation{{PlanID: "plan"}}}
+
+	err := writer.failFrozenTrace(
+		context.Background(), drift, stack, rollbackOnlyTicket(1, 0), res, 0, 0)
+
+	var safe interface{ FrozenSnapshotDriftReplanSafe() bool }
+	require.ErrorAs(t, err, &safe)
+	require.True(t, safe.FrozenSnapshotDriftReplanSafe())
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	require.Zero(t, res.Applied)
+	require.Empty(t, res.Journal)
+}
+
 func TestRollbackPinnedReadSkipsAlreadyRestoredStateWithoutWriteBudget(t *testing.T) {
 	for _, resource := range []HierarchyOperation{
 		HierarchyOperationWriteCPUs,
@@ -1942,6 +2161,92 @@ func TestSuccessfulRollbackRemovesNetJournalAndAppliedProgress(t *testing.T) {
 	require.Positive(t, ticket.consumedRollback.Total())
 }
 
+func TestCompiledTraceRollbackRejectsControlledPrimaryAndReclaimRetirement(t *testing.T) {
+	for _, domain := range []DomainID{DomainPrimary, DomainReclaim} {
+		domain := domain
+		t.Run(string(domain), func(t *testing.T) {
+			trace, live := compiledTraceWithCPUAndMemoryWrites(t)
+			live.invariants = nil
+			operation := selectTraceOperation(t, trace, func(
+				operation PlanOperation,
+				trace *CompiledPhaseTrace,
+			) bool {
+				return trace.InitialSnapshot.DomainByRel[operation.Rel] == domain &&
+					(!operation.ExpectedCurrent.CPUs.Equals(operation.Target.CPUs) ||
+						(operation.WriteMems &&
+							operation.ExpectedCurrent.Mems != operation.Target.Mems))
+			})
+			require.Contains(t, trace.FrozenBoundary.ControlledRels, operation.Rel)
+			driver := &retireWrittenRelOnFinalProofDriver{
+				HierarchyDriver: live,
+				live:            live,
+				rel:             operation.Rel,
+				identity:        operation.ExpectedIdentity,
+			}
+			round := frozenExecutionRound(t, trace, driver)
+			ticket := reserveTraceWithBudget(t, round.budget, trace)
+
+			_, err := round.executeFrozenTrace(
+				context.Background(), trace, ticket, &ConvergenceResult{})
+
+			require.Error(t, err)
+			require.ErrorContains(t, err, "rollback failed")
+			require.True(t, driver.retired)
+			require.NotContains(t, live.nodes, operation.Rel)
+		})
+	}
+}
+
+func TestCompiledTraceRollbackAllowsWrittenDynamicLeafRetirement(t *testing.T) {
+	trace, live, dynamicRel := compiledTraceWithNonControlledDynamicWrite(t)
+	live.invariants = nil
+	operation := selectTraceOperation(t, trace, func(
+		operation PlanOperation,
+		_ *CompiledPhaseTrace,
+	) bool {
+		return operation.Rel == dynamicRel &&
+			!operation.ExpectedCurrent.CPUs.Equals(operation.Target.CPUs)
+	})
+	require.NotContains(t, trace.FrozenBoundary.ControlledRels, operation.Rel)
+	require.Contains(t, trace.FrozenBoundary.RelevantCPUHolders, operation.Rel)
+	driver := &retireWrittenRelOnFinalProofDriver{
+		HierarchyDriver: live,
+		live:            live,
+		rel:             operation.Rel,
+		identity:        operation.ExpectedIdentity,
+	}
+	round := frozenExecutionRound(t, trace, driver)
+	ticket := reserveTraceWithBudget(t, round.budget, trace)
+	res := &ConvergenceResult{}
+
+	_, err := round.executeFrozenTrace(context.Background(), trace, ticket, res)
+
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "rollback failed")
+	require.True(t, driver.retired, "compiled write identity was not retired")
+	require.NotContains(t, live.nodes, operation.Rel)
+	require.Empty(t, res.Journal)
+	require.Zero(t, res.Applied)
+	require.Equal(t, 2, driver.absentReads)
+	require.Equal(t, 1, driver.absentStats,
+		"rollback retirement requires read/stat/read typed-ENOENT confirmation")
+	writtenRels := make(map[string]struct{})
+	require.LessOrEqual(t,
+		ticket.consumedRollbackIOOperations, ticket.rollbackIOOperations)
+	cpuWritesToRetiredRel := 0
+	for _, write := range live.writes {
+		writtenRels[write.rel] = struct{}{}
+		if write.rel == operation.Rel {
+			if !write.cpus.IsEmpty() {
+				cpuWritesToRetiredRel++
+			}
+		}
+	}
+	require.Positive(t, cpuWritesToRetiredRel)
+	require.Equal(t, 3*len(writtenRels), ticket.consumedRollbackIOOperations,
+		"each retired written identity consumes one read/stat/read confirmation")
+}
+
 func TestFrozenTraceExecutionPublishesOnlyFreshFinalProof(t *testing.T) {
 	trace, live := compiledTraceWithCPUAndMemoryWrites(t)
 	live.invariants = nil
@@ -2188,6 +2493,143 @@ type injectedTraceDriver struct {
 	pendingReadback bool
 	injected        bool
 	cancel          context.CancelFunc
+}
+
+type retireWrittenRelOnFinalProofDriver struct {
+	HierarchyDriver
+	live        *fakeHierarchyDriver
+	rel         string
+	identity    CgroupIdentity
+	retired     bool
+	absentReads int
+	absentStats int
+}
+
+type rollbackRetirementWindow string
+
+const (
+	rollbackRetirementOnInverseWrite    rollbackRetirementWindow = "read-success-write-ENOENT"
+	rollbackRetirementAfterInverseWrite rollbackRetirementWindow = "write-success-verify-ENOENT"
+)
+
+type rollbackRetirementWindowDriver struct {
+	HierarchyDriver
+	live        *fakeHierarchyDriver
+	rel         string
+	resource    HierarchyOperation
+	window      rollbackRetirementWindow
+	retired     bool
+	absentStats int
+}
+
+func (d *rollbackRetirementWindowDriver) retire() {
+	deleteFakeHierarchySubtree(d.live, d.rel)
+	d.retired = true
+}
+
+func (d *rollbackRetirementWindowDriver) WriteCPUs(
+	ctx context.Context,
+	rel string,
+	expected CgroupIdentity,
+	cpus machine.CPUSet,
+) error {
+	if rel != d.rel || d.resource != HierarchyOperationWriteCPUs {
+		return d.HierarchyDriver.WriteCPUs(ctx, rel, expected, cpus)
+	}
+	if d.window == rollbackRetirementOnInverseWrite {
+		d.retire()
+		return syscall.ENOENT
+	}
+	err := d.HierarchyDriver.WriteCPUs(ctx, rel, expected, cpus)
+	if err == nil {
+		d.retire()
+	}
+	return err
+}
+
+func (d *rollbackRetirementWindowDriver) WriteMems(
+	ctx context.Context,
+	rel string,
+	expected CgroupIdentity,
+	mems string,
+) error {
+	if rel != d.rel || d.resource != HierarchyOperationWriteMems {
+		return d.HierarchyDriver.WriteMems(ctx, rel, expected, mems)
+	}
+	if d.window == rollbackRetirementOnInverseWrite {
+		d.retire()
+		return syscall.ENOENT
+	}
+	err := d.HierarchyDriver.WriteMems(ctx, rel, expected, mems)
+	if err == nil {
+		d.retire()
+	}
+	return err
+}
+
+func (d *rollbackRetirementWindowDriver) StatIdentity(
+	ctx context.Context,
+	rel string,
+) (CgroupIdentity, error) {
+	identity, err := d.HierarchyDriver.StatIdentity(ctx, rel)
+	if d.retired && rel == d.rel && isCgroupPathAbsent(err) {
+		d.absentStats++
+	}
+	return identity, err
+}
+
+func (d *retireWrittenRelOnFinalProofDriver) Roots(
+	ctx context.Context,
+) ([]RootRef, error) {
+	if err := d.retireForFinalProof(); err != nil {
+		return nil, err
+	}
+	return d.HierarchyDriver.Roots(ctx)
+}
+
+func (d *retireWrittenRelOnFinalProofDriver) ListChildren(
+	ctx context.Context,
+	rel string,
+) ([]ChildRef, error) {
+	if err := d.retireForFinalProof(); err != nil {
+		return nil, err
+	}
+	return d.HierarchyDriver.ListChildren(ctx, rel)
+}
+
+func (d *retireWrittenRelOnFinalProofDriver) retireForFinalProof() error {
+	if !d.retired && d.live.PhysicalWriteCount() > 0 {
+		requireIdentity := d.live.nodes[d.rel]
+		if requireIdentity == nil || requireIdentity.identity != d.identity {
+			return fmt.Errorf("retirement target identity changed")
+		}
+		deleteFakeHierarchySubtree(d.live, d.rel)
+		d.retired = true
+		return errors.New("injected final proof failure after retirement")
+	}
+	return nil
+}
+
+func (d *retireWrittenRelOnFinalProofDriver) ReadEntry(
+	ctx context.Context,
+	rel string,
+) (EntryState, error) {
+	entry, err := d.HierarchyDriver.ReadEntry(ctx, rel)
+	if d.retired && rel == d.rel && isCgroupPathAbsent(err) {
+		d.absentReads++
+	}
+	return entry, err
+}
+
+func (d *retireWrittenRelOnFinalProofDriver) StatIdentity(
+	ctx context.Context,
+	rel string,
+) (CgroupIdentity, error) {
+	identity, err := d.HierarchyDriver.StatIdentity(ctx, rel)
+	if d.retired && rel == d.rel && isCgroupPathAbsent(err) {
+		d.absentStats++
+	}
+	return identity, err
 }
 
 type preWriteDriftDriver struct {
@@ -2524,7 +2966,7 @@ func rollbackOnlyTicket(cpuWrites, memWrites int) *ExecutionReservationTicket {
 		reserved: ExecutionReservationCost{
 			Rollback: rollback,
 		},
-		rollbackIOOperations: saturatingMultiply(rollback.Total(), 3),
+		rollbackIOOperations: saturatingMultiply(rollback.Total(), 5),
 	}
 }
 

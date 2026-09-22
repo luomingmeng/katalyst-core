@@ -126,6 +126,17 @@ func TestReservePhaseTraceCountsExactForwardAndInverseWrites(t *testing.T) {
 	}, cost)
 }
 
+func TestReservePhaseTraceRollbackIOCoversRetirementConfirmationWorstCase(t *testing.T) {
+	trace, _ := compiledTraceWithCPUAndMemoryWrites(t)
+
+	ticket := reserveTraceForTest(t, trace)
+
+	require.Equal(t,
+		saturatingMultiply(trace.Cost.Rollback.Total(), 5),
+		ticket.rollbackIOOperations,
+		"each inverse write may require read/write/stat plus final read/stat confirmation")
+}
+
 func TestTraceTicketRejectsSkippedOperation(t *testing.T) {
 	trace, _ := compiledTraceWithCPUAndMemoryWrites(t)
 	operations := flattenTraceOperations(trace)
@@ -283,6 +294,37 @@ func compiledTraceWithCPUAndMemoryWrites(
 	)
 	require.NoError(t, err)
 	return trace, fixture.driver
+}
+
+func compiledTraceWithNonControlledDynamicWrite(
+	t *testing.T,
+) (*CompiledPhaseTrace, *fakeHierarchyDriver, string) {
+	t.Helper()
+	fixture := newAdmissionTraceFixture(t)
+	fixture.selection.MaxCPUsDrainRatio = 0.5
+	fixture.driver.capabilities = cgroupV2Policy.capabilities(true)
+	fixture.round.allowEmptyTarget = true
+	fixture.cpuDetails[4] = machine.CPUTopoInfo{NUMANodeID: 0}
+	fixture.addPrimary("kubepods", "1-3", "0")
+	const dynamicRel = "kubepods/besteffort"
+	fixture.driver.add(dynamicRel,
+		CgroupIdentity{Device: 1, Inode: fixture.allocInode()}, "1-3", "0")
+	fixture.dynamicByRel[dynamicRel] = machine.MustParse("0-3")
+	fixture.requireCPUSet(dynamicRel, "0-3")
+	fixture.addReclaim("reclaimed", "4", "0")
+	fixture.addReclaim("reclaimed/leaf", "0", "0")
+	fixture.specs[len(fixture.specs)-1].CPUs = machine.NewCPUSet()
+	fixture.targetByRel["reclaimed/leaf"] = machine.NewCPUSet()
+	fixture.requireCPUSet("kubepods", "0-3")
+
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(),
+		fixture.snapshot(),
+	)
+	require.NoError(t, err)
+	require.True(t, traceContainsOperation(
+		trace, dynamicRel, WriteGrow, machine.MustParse("0-3")))
+	return trace, fixture.driver, dynamicRel
 }
 
 func reserveTraceForTest(

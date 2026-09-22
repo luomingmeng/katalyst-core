@@ -1292,6 +1292,66 @@ func TestCompileFixedPointTraceOwnsFrozenBoundary(t *testing.T) {
 	require.False(t, trace.FrozenBoundary.RelevantCPUs.IsEmpty())
 }
 
+func TestCompileFixedPointTraceOwnsIdentityScopedRollbackRetirements(t *testing.T) {
+	trace, _, dynamicRel := compiledTraceWithNonControlledDynamicWrite(t)
+	controlled := make(map[string]struct{}, len(trace.FrozenBoundary.ControlledRels))
+	for _, rel := range trace.FrozenBoundary.ControlledRels {
+		controlled[rel] = struct{}{}
+	}
+	relevantHolders := make(map[string]struct{}, len(trace.FrozenBoundary.RelevantCPUHolders))
+	for _, rel := range trace.FrozenBoundary.RelevantCPUHolders {
+		relevantHolders[rel] = struct{}{}
+	}
+	expectedByRel := make(map[string]CgroupIdentity)
+	for _, operation := range flattenTraceOperations(trace) {
+		if operation.ExpectedCurrent.CPUs.Equals(operation.Target.CPUs) &&
+			(!operation.WriteMems ||
+				operation.ExpectedCurrent.Mems == operation.Target.Mems) {
+			continue
+		}
+		if _, isControlled := controlled[operation.Rel]; isControlled {
+			continue
+		}
+		if _, isRelevantHolder := relevantHolders[operation.Rel]; !isRelevantHolder {
+			continue
+		}
+		expectedByRel[operation.Rel] = operation.ExpectedIdentity
+	}
+
+	require.Len(t, trace.RollbackRetirements, len(expectedByRel))
+	require.Contains(t, expectedByRel, dynamicRel)
+	for i, retirement := range trace.RollbackRetirements {
+		require.Equal(t, expectedByRel[retirement.Rel], retirement.Identity)
+		require.NotEqual(t, CgroupIdentity{}, retirement.Identity)
+		if i > 0 {
+			require.Less(t, trace.RollbackRetirements[i-1].Rel, retirement.Rel)
+		}
+	}
+}
+
+func TestFreezePhaseTraceClonesValidatesAndHashesRollbackRetirements(t *testing.T) {
+	trace, _, _ := compiledTraceWithNonControlledDynamicWrite(t)
+	require.NotEmpty(t, trace.RollbackRetirements)
+	frozen, err := FreezePhaseTrace(trace)
+	require.NoError(t, err)
+	original := append(
+		[]FrozenRollbackRetirement(nil), frozen.RollbackRetirements...)
+
+	trace.RollbackRetirements[0].Rel = "tampered"
+
+	require.Equal(t, original, frozen.RollbackRetirements)
+	_, err = FreezePhaseTrace(trace)
+	require.ErrorContains(t, err, "rollback retirements are not compiler-derived")
+
+	tampered := *frozen
+	tampered.TraceID = ""
+	tampered.RollbackRetirements = append(
+		[]FrozenRollbackRetirement(nil), frozen.RollbackRetirements...)
+	tampered.RollbackRetirements[0].Identity.Inode++
+	require.NotEqual(t,
+		canonicalPhaseTraceID(frozen), canonicalPhaseTraceID(&tampered))
+}
+
 func TestFreezePhaseTraceRejectsUnknownFrozenBoundaryVersion(t *testing.T) {
 	fixture := newAdmissionTraceFixture(t)
 	fixture.configureStagedSMTTransferWithDynamicDescendant()

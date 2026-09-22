@@ -141,10 +141,21 @@ type CompiledPhaseTrace struct {
 	Capabilities         HierarchyCapabilities
 	EvaluationInput      FrozenCoordinatorEvaluationInput
 	FrozenBoundary       FrozenBoundary
+	RollbackRetirements  []FrozenRollbackRetirement
 	Phases               []CompiledPhase
 	FinalSnapshot        *CompleteSnapshot
 	FinalEvaluation      coordinatorSnapshotEvaluation
 	Cost                 ExecutionReservationCost
+}
+
+// FrozenRollbackRetirement is compiler-owned authority to treat one exact
+// generation of a physically written dynamic, non-controlled cgroup as retired
+// while replaying rollback. The target and identity must be proven by the
+// FrozenBoundary relevant-holder path; controlled roots and trust anchors are
+// never eligible.
+type FrozenRollbackRetirement struct {
+	Rel      string
+	Identity CgroupIdentity
 }
 
 // validatedPhaseTrace is the compiler-owned immutable carrier used by the
@@ -438,6 +449,11 @@ func (r *coordinatorRound) compileValidatedFixedPointTrace(
 	if err != nil {
 		return nil, fmt.Errorf("compile frozen boundary: %w", err)
 	}
+	rollbackRetirements, err := compileFrozenRollbackRetirements(
+		base, frozenBoundary, result.Phases)
+	if err != nil {
+		return nil, fmt.Errorf("compile rollback retirements: %w", err)
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, projectedRound.classifyContextExit(err)
 	}
@@ -450,6 +466,7 @@ func (r *coordinatorRound) compileValidatedFixedPointTrace(
 		Capabilities:         capabilities,
 		EvaluationInput:      evaluationInput,
 		FrozenBoundary:       frozenBoundary,
+		RollbackRetirements:  rollbackRetirements,
 		Phases:               cloneCompiledPhases(result.Phases),
 		FinalSnapshot:        CloneCompleteSnapshot(result.FinalSnapshot),
 		FinalEvaluation:      cloneCoordinatorSnapshotEvaluation(result.FinalEvaluation),
@@ -1010,6 +1027,9 @@ func FreezePhaseTrace(in *CompiledPhaseTrace) (*CompiledPhaseTrace, error) {
 	return freezePhaseTrace(context.Background(), in)
 }
 
+// freezeValidatedPhaseTrace is the only constructor for the validated carrier.
+// It defensively clones the raw trace, validates every compiler-derived
+// invariant, and publishes no carrier on cancellation or validation failure.
 func freezeValidatedPhaseTrace(
 	ctx context.Context,
 	in *CompiledPhaseTrace,
@@ -1041,6 +1061,8 @@ func freezePhaseTrace(
 	out.RequiredCPUSetByRel = cloneCPUSetMap(in.RequiredCPUSetByRel)
 	out.EvaluationInput = cloneFrozenCoordinatorEvaluationInput(in.EvaluationInput)
 	out.FrozenBoundary = cloneFrozenBoundary(in.FrozenBoundary)
+	out.RollbackRetirements = append(
+		[]FrozenRollbackRetirement(nil), in.RollbackRetirements...)
 	out.Phases = cloneCompiledPhases(in.Phases)
 	out.FinalSnapshot = CloneCompleteSnapshot(in.FinalSnapshot)
 	out.FinalEvaluation = cloneCoordinatorSnapshotEvaluation(in.FinalEvaluation)
@@ -1082,6 +1104,10 @@ func freezePhaseTrace(
 	return &out, nil
 }
 
+// validateFrozenPhaseTrace checks the complete admission contract: snapshot
+// integrity, objective satisfaction, operation replay, compiler-derived
+// boundary and rollback authority, required-CPU final proof, and exact
+// reservation cost. It performs no live hierarchy I/O.
 func validateFrozenPhaseTrace(ctx context.Context, trace *CompiledPhaseTrace) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1204,6 +1230,14 @@ func validateFrozenPhaseTrace(ctx context.Context, trace *CompiledPhaseTrace) er
 	}
 	if err := validateTraceOperations(ctx, trace); err != nil {
 		return err
+	}
+	expectedRollbackRetirements, err := compileFrozenRollbackRetirements(
+		trace.InitialSnapshot, trace.FrozenBoundary, trace.Phases)
+	if err != nil {
+		return fmt.Errorf("derive frozen rollback retirements: %w", err)
+	}
+	if !reflect.DeepEqual(trace.RollbackRetirements, expectedRollbackRetirements) {
+		return fmt.Errorf("frozen phase trace rollback retirements are not compiler-derived")
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1473,9 +1507,92 @@ func validateTraceOperations(ctx context.Context, trace *CompiledPhaseTrace) err
 	return nil
 }
 
+// compileFrozenRollbackRetirements derives the complete retirement authority
+// from immutable compile-time evidence. Only physically written dynamic
+// holders that terminate frozen relevant-holder paths, are neither controlled
+// nodes nor roots, and match the exact initial generation are eligible. Empty
+// authority is canonicalized to nil so trace identity remains stable.
+func compileFrozenRollbackRetirements(
+	initial *CompleteSnapshot,
+	boundary FrozenBoundary,
+	phases []CompiledPhase,
+) ([]FrozenRollbackRetirement, error) {
+	if initial == nil {
+		return nil, fmt.Errorf("rollback retirement contract requires initial snapshot")
+	}
+	controlled := make(map[string]struct{}, len(boundary.ControlledRels))
+	for _, rel := range boundary.ControlledRels {
+		controlled[rel] = struct{}{}
+	}
+	roots := make(map[string]struct{}, len(boundary.Roots))
+	for _, rel := range boundary.Roots {
+		roots[rel] = struct{}{}
+	}
+	dynamicIdentities := make(map[string]CgroupIdentity, len(boundary.RelevantCPUHolders))
+	for _, rel := range boundary.RelevantCPUHolders {
+		if _, isControlled := controlled[rel]; isControlled {
+			continue
+		}
+		if _, isRoot := roots[rel]; isRoot {
+			continue
+		}
+		path := boundary.RelevantHolderPaths[rel]
+		if len(path) < 2 || path[len(path)-1].Rel != rel {
+			continue
+		}
+		dynamicIdentities[rel] = path[len(path)-1].Identity
+	}
+	identities := make(map[string]CgroupIdentity)
+	for _, phase := range phases {
+		for _, operation := range phase.Operations {
+			writesCPUs := !operation.ExpectedCurrent.CPUs.Equals(operation.Target.CPUs)
+			writesMems := operation.WriteMems &&
+				operation.ExpectedCurrent.Mems != operation.Target.Mems
+			if !writesCPUs && !writesMems {
+				continue
+			}
+			frozenIdentity, isDynamic := dynamicIdentities[operation.Rel]
+			if !isDynamic {
+				continue
+			}
+			entry, ok := initial.Entries[operation.Rel]
+			if !ok {
+				return nil, fmt.Errorf(
+					"rollback retirement rel %q has no initial snapshot entry",
+					operation.Rel)
+			}
+			if operation.ExpectedIdentity == (CgroupIdentity{}) ||
+				entry.Identity != operation.ExpectedIdentity ||
+				frozenIdentity != operation.ExpectedIdentity {
+				return nil, fmt.Errorf(
+					"rollback retirement rel %q identity does not match frozen boundary",
+					operation.Rel)
+			}
+			if identity, exists := identities[operation.Rel]; exists &&
+				identity != operation.ExpectedIdentity {
+				return nil, fmt.Errorf(
+					"rollback retirement rel %q has conflicting identities",
+					operation.Rel)
+			}
+			identities[operation.Rel] = operation.ExpectedIdentity
+		}
+	}
+	rels := sortedStringKeys(identities)
+	if len(rels) == 0 {
+		return nil, nil
+	}
+	out := make([]FrozenRollbackRetirement, 0, len(rels))
+	for _, rel := range rels {
+		out = append(out, FrozenRollbackRetirement{
+			Rel: rel, Identity: identities[rel],
+		})
+	}
+	return out, nil
+}
+
 func canonicalPhaseTraceID(trace *CompiledPhaseTrace) string {
 	hash := sha256.New()
-	writeHashString(hash, "bulkhead-cpuset-phase-trace-v1")
+	writeHashString(hash, "bulkhead-cpuset-phase-trace-v2")
 	writeHashString(hash, trace.ConvergenceID)
 	writeHashString(hash, string(trace.Objective))
 	_, _ = hash.Write(trace.InitialSnapshot.ID[:])
@@ -1484,6 +1601,12 @@ func canonicalPhaseTraceID(trace *CompiledPhaseTrace) string {
 	writeCPUSetMapHash(hash, trace.RequiredCPUSetByRel)
 	writeFrozenCoordinatorEvaluationInputHash(hash, trace.EvaluationInput)
 	writeFrozenBoundaryHash(hash, trace.FrozenBoundary)
+	writeHashUint64(hash, uint64(len(trace.RollbackRetirements)))
+	for _, retirement := range trace.RollbackRetirements {
+		writeHashString(hash, retirement.Rel)
+		writeHashUint64(hash, retirement.Identity.Device)
+		writeHashUint64(hash, retirement.Identity.Inode)
+	}
 	writeHashUint64(hash, uint64(len(trace.Phases)))
 	for _, phase := range trace.Phases {
 		writeHashString(hash, string(phase.Kind))
