@@ -45,6 +45,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/utilcomponent/featuregatenegotiation/finders/feature_cpu"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
+	metaserverpod "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
@@ -481,7 +482,6 @@ func (cs *cpuServer) updateMetaCacheInput(ctx context.Context, req *cpuadvisor.G
 
 	var errs []error
 	livingPoolNameSet := sets.NewString()
-
 	if req.GetResourcePackageConfig() == nil {
 		general.InfoS("resource package config is nil, skip updating meta cache")
 		_ = cs.metaCache.SetResourcePackageConfig(nil)
@@ -556,8 +556,17 @@ func (cs *cpuServer) updateMetaCacheInput(ctx context.Context, req *cpuadvisor.G
 		podUID := entryName
 		pod, err := cs.metaServer.GetPod(ctx, podUID)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("get pod info for %s failed: %w", podUID, err))
-			continue
+			// QRM owns residual-state retirement. A local PodNotFound may only
+			// mean that the kubelet cache has not observed a newly admitted Pod,
+			// so process this frame from its synchronous metadata instead of
+			// deleting a container that QRM still considers canonical.
+			if metaserverpod.IsPodNotFound(err) {
+				general.Warningf("use advisor metadata while pod %s is unavailable: %v", podUID, err)
+				pod = nil
+			} else {
+				errs = append(errs, fmt.Errorf("get pod info for %s failed: %w", podUID, err))
+				continue
+			}
 		}
 
 		for containerName, info := range entry.Entries {
@@ -692,7 +701,10 @@ func (cs *cpuServer) setContainerInfoBasedOnContainerAllocationInfo(
 	ci *types.ContainerInfo,
 	info *cpuadvisor.ContainerAllocationInfo,
 ) error {
-	if err := cs.setContainerInfoBasedOnAllocationInfo(pod, ci, info.AllocationInfo); err != nil {
+	cs.setContainerInfoBasedOnAllocationInfo(ci, info.AllocationInfo)
+
+	ci.QoSLevel = info.Metadata.QosLevel
+	if err := cs.setContainerInfoQoSLevelFromPod(pod, ci); err != nil {
 		return err
 	}
 
@@ -705,9 +717,9 @@ func (cs *cpuServer) setContainerInfoBasedOnContainerAllocationInfo(
 		ci.CPURequest = float64(info.Metadata.RequestQuantity)
 	}
 
-	if info.Metadata.QosLevel == consts.PodAnnotationQoSLevelSharedCores &&
+	if ci.QoSLevel == consts.PodAnnotationQoSLevelSharedCores &&
 		info.Metadata.Annotations[consts.PodAnnotationMemoryEnhancementNumaBinding] == consts.PodAnnotationMemoryEnhancementNumaBindingEnable {
-		poolName, err := commonstate.GetSpecifiedNUMABindingPoolName(info.Metadata.QosLevel, info.Metadata.Annotations)
+		poolName, err := commonstate.GetSpecifiedNUMABindingPoolName(ci.QoSLevel, info.Metadata.Annotations)
 		if err != nil {
 			return fmt.Errorf("get specified numa binding pool name failed: %w", err)
 		}
@@ -730,7 +742,7 @@ func (cs *cpuServer) setContainerInfoBasedOnContainerAllocationInfo(
 
 		ci.OriginOwnerPoolName = poolName
 	} else {
-		ci.OriginOwnerPoolName = commonstate.GetSpecifiedPoolName(info.Metadata.QosLevel, info.Metadata.Annotations[consts.PodAnnotationCPUEnhancementCPUSet])
+		ci.OriginOwnerPoolName = commonstate.GetSpecifiedPoolName(ci.QoSLevel, info.Metadata.Annotations[consts.PodAnnotationCPUEnhancementCPUSet])
 	}
 
 	return nil
@@ -738,24 +750,13 @@ func (cs *cpuServer) setContainerInfoBasedOnContainerAllocationInfo(
 
 // Deprecated: to be removed after all qrm plugins are migrated to the new synchronous model
 func (cs *cpuServer) setContainerInfoBasedOnAllocationInfo(
-	pod *v1.Pod,
 	ci *types.ContainerInfo,
 	info *cpuadvisor.AllocationInfo,
-) error {
+) {
 	ci.RampUp = info.RampUp
 	ci.TopologyAwareAssignments = machine.TransformCPUAssignmentFormat(info.TopologyAwareAssignments)
 	ci.OriginalTopologyAwareAssignments = machine.TransformCPUAssignmentFormat(info.OriginalTopologyAwareAssignments)
 	ci.OwnerPoolName = info.OwnerPoolName
-
-	// get qos level name according to the qos conf
-	qosLevel, err := cs.qosConf.GetQoSLevelForPod(pod)
-	if err != nil {
-		return fmt.Errorf("get qos level failed: %w", err)
-	}
-	if ci.QoSLevel != qosLevel {
-		general.Infof("qos level of %v/%v has change from %s to %s", ci.PodUID, ci.ContainerName, ci.QoSLevel, qosLevel)
-		ci.QoSLevel = qosLevel
-	}
 
 	if ci.OriginOwnerPoolName == "" {
 		ci.OriginOwnerPoolName = ci.OwnerPoolName
@@ -769,7 +770,21 @@ func (cs *cpuServer) setContainerInfoBasedOnAllocationInfo(
 			}
 		}
 	}
+}
 
+func (cs *cpuServer) setContainerInfoQoSLevelFromPod(pod *v1.Pod, ci *types.ContainerInfo) error {
+	if pod == nil {
+		return nil
+	}
+
+	qosLevel, err := cs.qosConf.GetQoSLevelForPod(pod)
+	if err != nil {
+		return fmt.Errorf("get qos level failed: %w", err)
+	}
+	if ci.QoSLevel != qosLevel {
+		general.Infof("qos level of %v/%v has change from %s to %s", ci.PodUID, ci.ContainerName, ci.QoSLevel, qosLevel)
+		ci.QoSLevel = qosLevel
+	}
 	return nil
 }
 
@@ -788,15 +803,6 @@ func (cs *cpuServer) createOrUpdateContainerInfo(
 			ContainerName:  containerName,
 			ContainerType:  info.Metadata.ContainerType,
 			ContainerIndex: int(info.Metadata.ContainerIndex),
-			Labels:         info.Metadata.Labels,
-			Annotations:    info.Metadata.Annotations,
-			QoSLevel:       info.Metadata.QosLevel,
-		}
-
-		if info.Metadata.UseMilliQuantity {
-			ci.CPURequest = float64(info.Metadata.RequestMilliQuantity) / 1000.0
-		} else {
-			ci.CPURequest = float64(info.Metadata.RequestQuantity)
 		}
 
 		if err := cs.setContainerInfoBasedOnContainerAllocationInfo(pod, ci, info); err != nil {
@@ -829,7 +835,8 @@ func (cs *cpuServer) updateContainerInfo(
 		return fmt.Errorf("container %v/%v not exist", podUID, containerName)
 	}
 
-	if err := cs.setContainerInfoBasedOnAllocationInfo(pod, ci, info); err != nil {
+	cs.setContainerInfoBasedOnAllocationInfo(ci, info)
+	if err := cs.setContainerInfoQoSLevelFromPod(pod, ci); err != nil {
 		return fmt.Errorf("update container info %v/%v failed: %w", podUID, containerName, err)
 	}
 

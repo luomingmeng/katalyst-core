@@ -1175,6 +1175,268 @@ func TestCPUServerUpdateMetaCacheInput_InvalidResourcePackageCPUSet(t *testing.T
 	require.Equal(t, types.ResourcePackageConfig{}, cs.metaCache.GetResourcePackageConfig())
 }
 
+func TestCPUServerUpdateMetaCacheInputUsesMetadataUntilCanonicalEntryDisappears(t *testing.T) {
+	t.Parallel()
+
+	request := &cpuadvisor.GetAdviceRequest{
+		Entries: map[string]*cpuadvisor.ContainerAllocationInfoEntries{
+			commonstate.PoolNameShare: {
+				Entries: map[string]*cpuadvisor.ContainerAllocationInfo{
+					commonstate.FakedContainerName: {
+						Metadata: &advisorsvc.ContainerMetadata{
+							PodUid: commonstate.PoolNameShare,
+						},
+						AllocationInfo: &cpuadvisor.AllocationInfo{
+							OwnerPoolName: commonstate.PoolNameShare,
+							TopologyAwareAssignments: map[uint64]string{
+								0: "0-3",
+							},
+							OriginalTopologyAwareAssignments: map[uint64]string{
+								0: "0-3",
+							},
+						},
+					},
+				},
+			},
+			"live-pod": {
+				Entries: map[string]*cpuadvisor.ContainerAllocationInfo{
+					"main": {
+						Metadata: &advisorsvc.ContainerMetadata{
+							PodUid:          "live-pod",
+							PodNamespace:    "test-ns",
+							PodName:         "live-pod",
+							ContainerName:   "main",
+							Labels:          map[string]string{"state": "fresh"},
+							Annotations:     map[string]string{"source": "request"},
+							QosLevel:        consts.PodAnnotationQoSLevelSharedCores,
+							RequestQuantity: 1,
+						},
+						AllocationInfo: &cpuadvisor.AllocationInfo{
+							RampUp:        false,
+							OwnerPoolName: commonstate.PoolNameShare,
+							TopologyAwareAssignments: map[uint64]string{
+								0: "0",
+							},
+						},
+					},
+				},
+			},
+			"stale-pod": {
+				Entries: map[string]*cpuadvisor.ContainerAllocationInfo{
+					"main": {
+						Metadata: &advisorsvc.ContainerMetadata{
+							PodUid:          "stale-pod",
+							PodNamespace:    "test-ns",
+							PodName:         "stale-pod",
+							ContainerName:   "main",
+							QosLevel:        consts.PodAnnotationQoSLevelSharedCores,
+							RequestQuantity: 1,
+						},
+						AllocationInfo: &cpuadvisor.AllocationInfo{
+							OwnerPoolName: commonstate.PoolNameShare,
+							TopologyAwareAssignments: map[uint64]string{
+								0: "1",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	cs := newTestCPUServer(t, nil, []*v1.Pod{{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       k8stypes.UID("live-pod"),
+			Namespace: "test-ns",
+			Name:      "live-pod",
+			Annotations: map[string]string{
+				consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+			},
+		},
+		Spec: v1.PodSpec{Containers: []v1.Container{{Name: "main"}}},
+	}})
+	require.NoError(t, cs.metaCache.SetContainerInfo("live-pod", "main", &types.ContainerInfo{
+		PodUID:        "live-pod",
+		ContainerName: "main",
+		Labels:        map[string]string{"state": "stale"},
+		Annotations:   map[string]string{"source": "cache"},
+		QoSLevel:      consts.PodAnnotationQoSLevelDedicatedCores,
+		CPURequest:    8,
+		RampUp:        true,
+		OwnerPoolName: commonstate.PoolNameDedicated,
+		TopologyAwareAssignments: map[int]machine.CPUSet{
+			1: machine.MustParse("1"),
+		},
+		OriginOwnerPoolName: commonstate.PoolNameDedicated,
+	}))
+	require.NoError(t, cs.metaCache.SetContainerInfo("stale-pod", "main", &types.ContainerInfo{
+		PodUID:              "stale-pod",
+		ContainerName:       "main",
+		OriginOwnerPoolName: commonstate.PoolNameShare,
+	}))
+	_, ok := cs.metaCache.GetContainerInfo("stale-pod", "main")
+	require.True(t, ok)
+
+	err := cs.updateMetaCacheInput(context.Background(), request)
+	require.NoError(t, err)
+	liveInfo, ok := cs.metaCache.GetContainerInfo("live-pod", "main")
+	require.True(t, ok)
+	require.Equal(t, float64(1), liveInfo.CPURequest)
+	require.Equal(t, map[string]string{"state": "fresh"}, liveInfo.Labels)
+	require.Equal(t, map[string]string{"source": "request"}, liveInfo.Annotations)
+	require.Equal(t, consts.PodAnnotationQoSLevelSharedCores, liveInfo.QoSLevel)
+	require.False(t, liveInfo.RampUp)
+	require.Equal(t, commonstate.PoolNameShare, liveInfo.OwnerPoolName)
+	require.Equal(t, commonstate.PoolNameShare, liveInfo.OriginOwnerPoolName)
+	require.Equal(t, machine.MustParse("0"), liveInfo.TopologyAwareAssignments[0])
+	require.NotContains(t, liveInfo.TopologyAwareAssignments, 1)
+	missingPodInfo, ok := cs.metaCache.GetContainerInfo("stale-pod", "main")
+	require.True(t, ok, "a local Pod cache miss must not override the canonical QRM request")
+	require.Equal(t, consts.PodAnnotationQoSLevelSharedCores, missingPodInfo.QoSLevel)
+	require.Equal(t, machine.MustParse("1"), missingPodInfo.TopologyAwareAssignments[0])
+
+	delete(request.Entries, "stale-pod")
+	require.NoError(t, cs.updateMetaCacheInput(context.Background(), request))
+	_, ok = cs.metaCache.GetContainerInfo("stale-pod", "main")
+	require.False(t, ok)
+}
+
+// TestCreateOrUpdateContainerInfoDerivesQoSFromMetadataWhenPodNil pins the
+// synchronous-model fallback contract: when the pod is nil, QoS falls back to
+// ContainerAllocationInfo.Metadata and allocation-derived fields are still
+// populated. Under the legacy behavior GetQoSLevelForPod(nil) silently falls
+// back to the default shared_cores level and overwrites the metadata QoS, which
+// this test forbids.
+func TestCreateOrUpdateContainerInfoDerivesQoSFromMetadataWhenPodNil(t *testing.T) {
+	t.Parallel()
+
+	cs := newTestCPUServer(t, nil, nil)
+
+	const (
+		podUID        = "dedicated-pod"
+		containerName = "main"
+	)
+	info := &cpuadvisor.ContainerAllocationInfo{
+		Metadata: &advisorsvc.ContainerMetadata{
+			PodUid:          podUID,
+			PodNamespace:    "test-ns",
+			PodName:         podUID,
+			ContainerName:   containerName,
+			QosLevel:        consts.PodAnnotationQoSLevelDedicatedCores,
+			RequestQuantity: 4,
+		},
+		AllocationInfo: &cpuadvisor.AllocationInfo{
+			RampUp:        true,
+			OwnerPoolName: "dedicated",
+			TopologyAwareAssignments: map[uint64]string{
+				0: "0-3",
+			},
+		},
+	}
+
+	// pod is nil on purpose: the synchronous model resolves QoS from
+	// info.Metadata, so QoS must stay dedicated and allocation fields must be
+	// populated regardless of the missing pod object.
+	err := cs.createOrUpdateContainerInfo(podUID, containerName, nil, info)
+	require.NoError(t, err)
+
+	ci, ok := cs.metaCache.GetContainerInfo(podUID, containerName)
+	require.True(t, ok)
+	require.Equal(t, consts.PodAnnotationQoSLevelDedicatedCores, ci.QoSLevel)
+	require.True(t, ci.RampUp)
+	require.Equal(t, "dedicated", ci.OwnerPoolName)
+	require.Equal(t, machine.MustParse("0-3"), ci.TopologyAwareAssignments[0])
+}
+
+// TestCreateOrUpdateContainerInfoPodQoSOverridesMetadata pins the precedence
+// contract: when the pod is non-nil, its QoS is authoritative and overrides
+// the metadata fallback. Here Metadata advertises shared_cores while the pod
+// annotation says dedicated_cores, so the resulting QoS must be dedicated_cores.
+func TestCreateOrUpdateContainerInfoPodQoSOverridesMetadata(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID        = "override-pod"
+		containerName = "main"
+	)
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       k8stypes.UID(podUID),
+			Namespace: "test-ns",
+			Name:      podUID,
+			Annotations: map[string]string{
+				consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelDedicatedCores,
+			},
+		},
+		Spec: v1.PodSpec{Containers: []v1.Container{{Name: containerName}}},
+	}
+	cs := newTestCPUServer(t, nil, []*v1.Pod{pod})
+
+	info := &cpuadvisor.ContainerAllocationInfo{
+		Metadata: &advisorsvc.ContainerMetadata{
+			PodUid:          podUID,
+			PodNamespace:    "test-ns",
+			PodName:         podUID,
+			ContainerName:   containerName,
+			QosLevel:        consts.PodAnnotationQoSLevelSharedCores,
+			RequestQuantity: 4,
+		},
+		AllocationInfo: &cpuadvisor.AllocationInfo{
+			OwnerPoolName: "dedicated",
+			TopologyAwareAssignments: map[uint64]string{
+				0: "0-3",
+			},
+		},
+	}
+
+	// pod is non-nil: the QoS derived from the pod (dedicated_cores) must win
+	// over the metadata-advertised shared_cores.
+	err := cs.createOrUpdateContainerInfo(podUID, containerName, pod, info)
+	require.NoError(t, err)
+
+	ci, ok := cs.metaCache.GetContainerInfo(podUID, containerName)
+	require.True(t, ok)
+	require.Equal(t, consts.PodAnnotationQoSLevelDedicatedCores, ci.QoSLevel)
+	require.Equal(t, commonstate.PoolNameDedicated, ci.OriginOwnerPoolName)
+}
+
+func TestSetContainerInfoBasedOnContainerAllocationInfoUsesFinalQoSForNUMABinding(t *testing.T) {
+	t.Parallel()
+
+	const (
+		podUID        = "pod"
+		containerName = "container"
+	)
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			UID: k8stypes.UID(podUID),
+			Annotations: map[string]string{
+				consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelDedicatedCores,
+			},
+		},
+	}
+	cs := newTestCPUServer(t, nil, []*v1.Pod{pod})
+	ci := &types.ContainerInfo{
+		PodUID:        podUID,
+		ContainerName: containerName,
+	}
+	info := &cpuadvisor.ContainerAllocationInfo{
+		Metadata: &advisorsvc.ContainerMetadata{
+			QosLevel: consts.PodAnnotationQoSLevelSharedCores,
+			Annotations: map[string]string{
+				consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+				cpuconsts.CPUStateAnnotationKeyNUMAHint:          "0",
+			},
+		},
+		AllocationInfo: &cpuadvisor.AllocationInfo{
+			OwnerPoolName: commonstate.PoolNameDedicated,
+		},
+	}
+
+	require.NoError(t, cs.setContainerInfoBasedOnContainerAllocationInfo(pod, ci, info))
+	require.Equal(t, consts.PodAnnotationQoSLevelDedicatedCores, ci.QoSLevel)
+	require.Equal(t, commonstate.PoolNameDedicated, ci.OriginOwnerPoolName)
+}
+
 func Test_cpuServer_assembleCgroupConfig_multiReclaim(t *testing.T) {
 	t.Parallel()
 
