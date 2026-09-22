@@ -175,42 +175,79 @@ func ResolveContainerRelPathWithContext(
 	metaServer *metaserver.MetaServer,
 	podUID, containerName string,
 ) (string, error) {
+	rel, _, err := ResolveContainerRelPathAndIDWithContext(ctx, metaServer, podUID, containerName)
+	return rel, err
+}
+
+// ResolveContainerRelPathAndIDWithContext returns both the relative cgroup path
+// and the exact container ID used to resolve that path. Callers that need to
+// validate the resolved leaf against a later Pod snapshot must compare this ID,
+// rather than performing another identity lookup.
+func ResolveContainerRelPathAndIDWithContext(
+	ctx context.Context,
+	metaServer *metaserver.MetaServer,
+	podUID, containerName string,
+) (string, string, error) {
+	rel, containerID, err := ResolveContainerRelPathAndIDCacheOnlyWithContext(
+		ctx, metaServer, podUID, containerName)
+	if err == nil {
+		return rel, containerID, nil
+	}
+	var resolveErr *ContainerRelPathResolveError
+	if !errors.As(err, &resolveErr) || resolveErr.Stage != ContainerRelPathResolveStageCgroupPath {
+		return "", containerID, err
+	}
+
+	currentContainerID, confirmErr := getFreshContainerIDWithContext(ctx, metaServer, podUID, containerName)
+	if confirmErr != nil {
+		return "", "", &ContainerRelPathResolveError{
+			Stage: ContainerRelPathResolveStageContainerID,
+			Err:   fmt.Errorf("confirm container identity after cgroup path failure: %w", confirmErr),
+		}
+	}
+	if currentContainerID != containerID {
+		return "", "", &ContainerRelPathResolveError{
+			Stage: ContainerRelPathResolveStageCgroupPath,
+			Err: fmt.Errorf("%w: previous=%s current=%s",
+				ErrContainerIdentityChanged, containerID, currentContainerID),
+		}
+	}
+	if runningErr := ensureContainerRunning(ctx, metaServer, podUID, containerName, currentContainerID); runningErr != nil {
+		return "", "", &ContainerRelPathResolveError{
+			Stage: ContainerRelPathResolveStageContainerID,
+			Err:   runningErr,
+		}
+	}
+	return "", "", err
+}
+
+// ResolveContainerRelPathAndIDCacheOnlyWithContext resolves against the current
+// identity cache without refreshing it. If cgroup path resolution fails, the
+// returned ID is the exact cached identity used for that failed attempt.
+func ResolveContainerRelPathAndIDCacheOnlyWithContext(
+	ctx context.Context,
+	metaServer *metaserver.MetaServer,
+	podUID, containerName string,
+) (string, string, error) {
 	if metaServer == nil {
-		return "", fmt.Errorf("nil metaServer")
+		return "", "", fmt.Errorf("nil metaServer")
 	}
 	if metaServer.MetaAgent == nil || metaServer.PodFetcher == nil {
-		return "", fmt.Errorf("nil pod fetcher")
+		return "", "", fmt.Errorf("nil pod fetcher")
 	}
 
 	containerID, err := getContainerIDWithContext(ctx, metaServer, podUID, containerName)
 	if err != nil {
-		return "", &ContainerRelPathResolveError{Stage: ContainerRelPathResolveStageContainerID, Err: err}
+		return "", "", &ContainerRelPathResolveError{Stage: ContainerRelPathResolveStageContainerID, Err: err}
 	}
 	rel, err := cgcommon.GetContainerRelativeCgroupPath(podUID, containerID)
 	if err != nil {
-		currentContainerID, confirmErr := getFreshContainerIDWithContext(ctx, metaServer, podUID, containerName)
-		if confirmErr != nil {
-			return "", &ContainerRelPathResolveError{
-				Stage: ContainerRelPathResolveStageContainerID,
-				Err:   fmt.Errorf("confirm container identity after cgroup path failure: %w", confirmErr),
-			}
+		return "", containerID, &ContainerRelPathResolveError{
+			Stage: ContainerRelPathResolveStageCgroupPath,
+			Err:   err,
 		}
-		if currentContainerID != containerID {
-			return "", &ContainerRelPathResolveError{
-				Stage: ContainerRelPathResolveStageCgroupPath,
-				Err: fmt.Errorf("%w: previous=%s current=%s",
-					ErrContainerIdentityChanged, containerID, currentContainerID),
-			}
-		}
-		if runningErr := ensureContainerRunning(ctx, metaServer, podUID, containerName, currentContainerID); runningErr != nil {
-			return "", &ContainerRelPathResolveError{
-				Stage: ContainerRelPathResolveStageContainerID,
-				Err:   runningErr,
-			}
-		}
-		return "", &ContainerRelPathResolveError{Stage: ContainerRelPathResolveStageCgroupPath, Err: err}
 	}
-	return strings.Trim(rel, "/"), nil
+	return strings.Trim(rel, "/"), containerID, nil
 }
 
 func CollectActiveRels(

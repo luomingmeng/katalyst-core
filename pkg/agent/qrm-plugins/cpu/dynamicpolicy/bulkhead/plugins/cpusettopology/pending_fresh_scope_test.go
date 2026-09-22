@@ -17,6 +17,7 @@ import (
 	bulkheadapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/api"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	bulkheadutils "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology"
 	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	bulkheadconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/bulkhead"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
@@ -28,15 +29,119 @@ import (
 
 type strictFreshPendingFetcher struct {
 	metapod.PodFetcherStub
-	containerErr error
-	pods         map[string]*v1.Pod
-	podErrs      map[string]error
-	freshLookups map[string]int
+	containerErr  error
+	containerErrs map[string]error
+	containerIDs  map[string]string
+	pods          map[string]*v1.Pod
+	podErrs       map[string]error
+	freshLookups  map[string]int
+	listCalls     int
+}
+
+type strictSnapshotFetcher struct {
+	metapod.PodFetcherStub
+	containerIDs map[string]string
+	pods         []*v1.Pod
+	listErr      error
+	refreshCalls int
+	listCalls    int
+	getCalls     int
+}
+
+type cacheThenFreshSnapshotFetcher struct {
+	metapod.PodFetcherStub
+	cachedPods       []*v1.Pod
+	freshPods        []*v1.Pod
+	cacheCalls       int
+	freshCalls       int
+	containerIDCalls int
+}
+
+func (f *cacheThenFreshSnapshotFetcher) GetPodListFromCache(
+	_ context.Context, filter func(*v1.Pod) bool,
+) ([]*v1.Pod, error) {
+	f.cacheCalls++
+	return copyFilteredPods(f.cachedPods, filter), nil
+}
+
+func (f *cacheThenFreshSnapshotFetcher) GetPodList(
+	ctx context.Context, filter func(*v1.Pod) bool,
+) ([]*v1.Pod, error) {
+	if ctx.Value(metapod.BypassCacheKey) != metapod.BypassCacheTrue ||
+		ctx.Value(metapod.StrictBypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("fresh pod list lookup was not strict")
+	}
+	f.freshCalls++
+	return copyFilteredPods(f.freshPods, filter), nil
+}
+
+func (f *cacheThenFreshSnapshotFetcher) GetContainerIDWithContext(
+	context.Context, string, string,
+) (string, error) {
+	f.containerIDCalls++
+	return "", errors.New("container ID lookup must use the cache-only snapshot")
+}
+
+func copyFilteredPods(pods []*v1.Pod, filter func(*v1.Pod) bool) []*v1.Pod {
+	out := make([]*v1.Pod, 0, len(pods))
+	for _, pod := range pods {
+		if filter == nil || filter(pod) {
+			out = append(out, pod.DeepCopy())
+		}
+	}
+	return out
+}
+
+func (f *strictSnapshotFetcher) GetContainerIDWithContext(
+	_ context.Context, podUID, containerName string,
+) (string, error) {
+	if id, ok := f.containerIDs[podUID+"/"+containerName]; ok {
+		return id, nil
+	}
+	return "", metapod.ErrContainerNotFound
+}
+
+func (f *strictSnapshotFetcher) RefreshKubeletPodCache(context.Context) error {
+	f.refreshCalls++
+	return nil
+}
+
+func (f *strictSnapshotFetcher) GetPodList(
+	ctx context.Context, podFilter func(*v1.Pod) bool,
+) ([]*v1.Pod, error) {
+	f.listCalls++
+	if ctx.Value(metapod.BypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("fresh pod list did not bypass cache")
+	}
+	if ctx.Value(metapod.StrictBypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("fresh pod list was not strict")
+	}
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	out := make([]*v1.Pod, 0, len(f.pods))
+	for _, pod := range f.pods {
+		if podFilter == nil || podFilter(pod) {
+			out = append(out, pod.DeepCopy())
+		}
+	}
+	return out, nil
+}
+
+func (f *strictSnapshotFetcher) GetPod(context.Context, string) (*v1.Pod, error) {
+	f.getCalls++
+	return nil, errors.New("per-pod lookup must not be used")
 }
 
 func (f *strictFreshPendingFetcher) GetContainerIDWithContext(
-	context.Context, string, string,
+	_ context.Context, _, containerName string,
 ) (string, error) {
+	if err, ok := f.containerErrs[containerName]; ok {
+		return "", err
+	}
+	if id, ok := f.containerIDs[containerName]; ok {
+		return id, nil
+	}
 	return "", f.containerErr
 }
 
@@ -55,6 +160,26 @@ func (f *strictFreshPendingFetcher) GetPod(ctx context.Context, podUID string) (
 		return pod.DeepCopy(), nil
 	}
 	return nil, metapod.NewPodNotFoundError(podUID)
+}
+
+func (f *strictFreshPendingFetcher) GetPodList(
+	ctx context.Context, podFilter func(*v1.Pod) bool,
+) ([]*v1.Pod, error) {
+	if ctx.Value(metapod.BypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("fresh pod list did not bypass cache")
+	}
+	if ctx.Value(metapod.StrictBypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("fresh pod list was not strict")
+	}
+	f.listCalls++
+	out := make([]*v1.Pod, 0, len(f.pods))
+	for podUID, pod := range f.pods {
+		f.freshLookups[podUID]++
+		if podFilter == nil || podFilter(pod) {
+			out = append(out, pod.DeepCopy())
+		}
+	}
+	return out, nil
 }
 
 func pendingScopeTestView(entries map[string]machine.CPUSet) *model.DesiredView {
@@ -98,17 +223,163 @@ func absentCandidateErrors(podUID string) map[string]error {
 	return out
 }
 
+func TestResolvedContainerFreshnessRequiresTypedLeafAbsence(t *testing.T) {
+	const containerName = "main"
+	cpus := machine.NewCPUSet(4, 5)
+
+	tests := []struct {
+		name          string
+		freshPod      func(string, string) *v1.Pod
+		oldStatErr    error
+		oldExists     bool
+		newLeafExists bool
+		wantOld       bool
+		wantNew       bool
+		wantPending   bool
+		wantErr       error
+	}{
+		{
+			name:      "pod absent keeps exact old leaf while it exists",
+			oldExists: true,
+			wantOld:   true,
+		},
+		{
+			name:       "pod absent releases only after typed old leaf absence",
+			oldStatErr: os.ErrNotExist,
+		},
+		{
+			name:       "old leaf operational error fails closed",
+			oldStatErr: syscall.EIO,
+			wantErr:    syscall.EIO,
+		},
+		{
+			name: "new identity protects old and resolved current generations",
+			freshPod: func(podUID, newID string) *v1.Pod {
+				return &v1.Pod{
+					ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+					Spec:       v1.PodSpec{Containers: []v1.Container{{Name: containerName}}},
+					Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
+						Name: containerName, ContainerID: "containerd://" + newID,
+					}}},
+				}
+			},
+			oldExists:     true,
+			newLeafExists: true,
+			wantOld:       true,
+			wantNew:       true,
+		},
+		{
+			name: "new identity with absent leaf remains scoped pending",
+			freshPod: func(podUID, newID string) *v1.Pod {
+				return &v1.Pod{
+					ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+					Spec:       v1.PodSpec{Containers: []v1.Container{{Name: containerName}}},
+					Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
+						Name: containerName, ContainerID: "containerd://" + newID,
+					}}},
+				}
+			},
+			oldStatErr:  os.ErrNotExist,
+			wantPending: true,
+		},
+		{
+			name: "name absent keeps exact old leaf while it exists",
+			freshPod: func(podUID, _ string) *v1.Pod {
+				return &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)}}
+			},
+			oldExists: true,
+			wantOld:   true,
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			podUID := fmt.Sprintf("resolved-freshness-%d", i)
+			oldID := fmt.Sprintf("old-%d", i)
+			newID := fmt.Sprintf("new-%d", i)
+			oldRel := "kubepods/pod" + podUID + "/" + oldID
+			newRel := "kubepods/pod" + podUID + "/" + newID
+			cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+				Name: "resolved-freshness-" + podUID,
+				Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
+					if gotPodUID != podUID {
+						return "", true, nil
+					}
+					switch gotContainerID {
+					case oldID:
+						return "/" + oldRel, false, nil
+					case newID:
+						if tt.newLeafExists {
+							return "/" + newRel, false, nil
+						}
+						return "", false, os.ErrNotExist
+					default:
+						return "", true, nil
+					}
+				},
+			})
+
+			var pods []*v1.Pod
+			if tt.freshPod != nil {
+				pods = append(pods, tt.freshPod(podUID, newID))
+			}
+			fetcher := &strictSnapshotFetcher{
+				containerIDs: map[string]string{podUID + "/" + containerName: oldID},
+				pods:         pods,
+			}
+			cg := &fakeCgroupClient{
+				existing:   map[string]bool{oldRel: tt.oldExists},
+				statErrors: map[string]error{oldRel: tt.oldStatErr},
+			}
+			res, err := (&CPUSetTopologyPlugin{
+				cfg:    bulkheadConfigWithPrimary("kubepods"),
+				cgroup: cg,
+			}).buildExpectedCPUSetByRel(context.Background(), pendingScopeTestContext(
+				fetcher,
+				pendingScopeTestView(map[string]machine.CPUSet{podUID: cpus}),
+			))
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("error = %v, want errors.Is(_, %v)", err, tt.wantErr)
+				}
+			} else if err != nil {
+				t.Fatalf("buildExpectedCPUSetByRel() error = %v", err)
+			}
+			if fetcher.listCalls != 1 {
+				t.Fatalf("strict fresh pod list calls = %d, want 1", fetcher.listCalls)
+			}
+			if tt.wantErr != nil {
+				return
+			}
+			if _, got := res.ExpectedByRel[oldRel]; got != tt.wantOld {
+				t.Fatalf("old rel protected = %v, want %v; expected=%#v", got, tt.wantOld, res.ExpectedByRel)
+			}
+			if _, got := res.ExpectedByRel[newRel]; got != tt.wantNew {
+				t.Fatalf("new rel protected = %v, want %v; expected=%#v", got, tt.wantNew, res.ExpectedByRel)
+			}
+			if got := len(res.PendingByPod) == 1; got != tt.wantPending {
+				t.Fatalf("scoped pending = %v, want %v; pending=%#v", got, tt.wantPending, res.PendingByPod)
+			}
+		})
+	}
+}
+
 func TestPendingContainerErrorsUseStrictFreshPodAndFreshQoS(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name string
-		err  error
+		name        string
+		err         error
+		wantPending bool
 	}{
-		{name: "pod not found", err: metapod.NewPodNotFoundError("cached")},
-		{name: "container not found", err: metapod.ErrContainerNotFound},
-		{name: "container not running", err: bulkheadutils.ErrContainerNotRunning},
-		{name: "identity changed", err: fmt.Errorf("%w: old=old-id current=new-id", bulkheadutils.ErrContainerIdentityChanged)},
+		{name: "pod not found", err: metapod.NewPodNotFoundError("cached"), wantPending: true},
+		{name: "container not found", err: metapod.ErrContainerNotFound, wantPending: true},
+		{name: "container not running", err: bulkheadutils.ErrContainerNotRunning, wantPending: true},
+		{
+			name:        "identity changed",
+			err:         fmt.Errorf("%w: old=old-id current=new-id", bulkheadutils.ErrContainerIdentityChanged),
+			wantPending: true,
+		},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -119,6 +390,7 @@ func TestPendingContainerErrorsUseStrictFreshPodAndFreshQoS(t *testing.T) {
 				pods: map[string]*v1.Pod{
 					podUID: {
 						ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+						Spec:       v1.PodSpec{Containers: []v1.Container{{Name: "main"}}},
 					},
 				},
 				podErrs:      map[string]error{},
@@ -139,8 +411,15 @@ func TestPendingContainerErrorsUseStrictFreshPodAndFreshQoS(t *testing.T) {
 			if fetcher.freshLookups[podUID] != 1 {
 				t.Fatalf("strict fresh lookups = %d, want 1", fetcher.freshLookups[podUID])
 			}
-			if len(res.PendingByPod) != 1 {
-				t.Fatalf("pending entries = %#v, want one", res.PendingByPod)
+			wantPendingCount := 0
+			if tt.wantPending {
+				wantPendingCount = 1
+			}
+			if len(res.PendingByPod) != wantPendingCount {
+				t.Fatalf("pending entries = %#v, want %d", res.PendingByPod, wantPendingCount)
+			}
+			if !tt.wantPending {
+				return
 			}
 			if got := res.PendingByPod[0].NativeQOSClass; got != v1.PodQOSBestEffort {
 				t.Fatalf("pending qos = %q, want fresh pod qos %q", got, v1.PodQOSBestEffort)
@@ -179,6 +458,7 @@ func TestLivePendingPodWithNoMaterializedCandidateIsNotStale(t *testing.T) {
 		pods: map[string]*v1.Pod{
 			podUID: {
 				ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+				Spec:       v1.PodSpec{Containers: []v1.Container{{Name: "main"}}},
 			},
 		},
 		podErrs:      map[string]error{},
@@ -217,6 +497,10 @@ func TestPendingContainersResolveFreshScopeOncePerPodAndProtectUnion(t *testing.
 		pods: map[string]*v1.Pod{
 			podUID: {
 				ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+				Spec: v1.PodSpec{Containers: []v1.Container{
+					{Name: "main"},
+					{Name: "sidecar"},
+				}},
 			},
 		},
 		podErrs:      map[string]error{},
@@ -248,6 +532,658 @@ func TestPendingContainersResolveFreshScopeOncePerPodAndProtectUnion(t *testing.
 	}
 	if got := res.PendingCPUSetUnion(); !got.Equals(machine.NewCPUSet(0, 1, 2, 3)) {
 		t.Fatalf("pending CPU union = %s, want 0-3", got.String())
+	}
+}
+
+func TestPendingContainersFilterAgainstOneStrictFreshMixedContainerSpec(t *testing.T) {
+	t.Parallel()
+
+	const podUID = "mixed-container-pod"
+	identityChanged := fmt.Errorf("%w: previous=old current=new",
+		bulkheadutils.ErrContainerIdentityChanged)
+	containerNotRunning := fmt.Errorf("%w: transient runtime state",
+		bulkheadutils.ErrContainerNotRunning)
+	fetcher := &strictFreshPendingFetcher{
+		containerErrs: map[string]error{
+			"regular-container":   containerNotRunning,
+			"init-container":      metapod.ErrContainerNotFound,
+			"ephemeral-container": bulkheadutils.ErrContainerNotRunning,
+			"removed-container":   metapod.ErrContainerNotFound,
+			"restarted-container": identityChanged,
+		},
+		pods: map[string]*v1.Pod{
+			podUID: {
+				ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+				Spec: v1.PodSpec{
+					Containers:     []v1.Container{{Name: "regular-container"}},
+					InitContainers: []v1.Container{{Name: "init-container"}},
+					EphemeralContainers: []v1.EphemeralContainer{{
+						EphemeralContainerCommon: v1.EphemeralContainerCommon{Name: "ephemeral-container"},
+					}},
+				},
+			},
+		},
+		podErrs:      map[string]error{},
+		freshLookups: map[string]int{},
+	}
+	view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+			podUID: {
+				"regular-container":   machine.NewCPUSet(0),
+				"init-container":      machine.NewCPUSet(1),
+				"ephemeral-container": machine.NewCPUSet(2),
+				"removed-container":   machine.NewCPUSet(3),
+				"restarted-container": machine.NewCPUSet(4),
+			},
+		},
+	}}
+	p := &CPUSetTopologyPlugin{
+		cfg:    bulkheadConfigWithPrimary("kubepods"),
+		cgroup: &fakeCgroupClient{},
+	}
+
+	res, err := p.buildExpectedCPUSetByRel(
+		context.Background(), pendingScopeTestContext(fetcher, view))
+	if err != nil {
+		t.Fatalf("buildExpectedCPUSetByRel() error = %v", err)
+	}
+	if fetcher.freshLookups[podUID] != 1 {
+		t.Fatalf("strict fresh lookups = %d, want exactly one", fetcher.freshLookups[podUID])
+	}
+	if len(res.PendingByPod) != 3 {
+		t.Fatalf("pending entries = %#v, want regular, init, and ephemeral containers", res.PendingByPod)
+	}
+	got := make(map[string]pendingContainerCPUSet, len(res.PendingByPod))
+	for _, pending := range res.PendingByPod {
+		got[pending.ContainerName] = pending
+	}
+	for _, name := range []string{"regular-container", "init-container", "ephemeral-container"} {
+		if _, ok := got[name]; !ok {
+			t.Fatalf("fresh spec container %q was not retained: %#v", name, res.PendingByPod)
+		}
+	}
+	for _, name := range []string{"removed-container", "restarted-container"} {
+		if _, ok := got[name]; ok {
+			t.Fatalf("stale container %q was retained: %#v", name, res.PendingByPod)
+		}
+	}
+	if !errors.Is(got["regular-container"].Cause, bulkheadutils.ErrContainerNotRunning) {
+		t.Fatalf("pending cause = %v, want typed %v",
+			got["regular-container"].Cause, bulkheadutils.ErrContainerNotRunning)
+	}
+	if got := res.PendingCPUSetUnion(); !got.Equals(machine.NewCPUSet(0, 1, 2)) {
+		t.Fatalf("pending CPU union = %s, want 0-2", got.String())
+	}
+}
+
+func TestBuildExpectedFiltersResolvedOnlyOutcomesAgainstOneStrictFreshSpec(t *testing.T) {
+	const (
+		podUID      = "resolved-only-fresh-spec-pod"
+		currentName = "current"
+		removedName = "removed"
+		currentID   = "resolved-only-current-id"
+		removedID   = "resolved-only-removed-id"
+		currentRel  = "kubepods/podresolved-only-fresh-spec-pod/resolved-only-current-id"
+		removedRel  = "kubepods/podresolved-only-fresh-spec-pod/resolved-only-removed-id"
+	)
+	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+		Name: "resolved-only-fresh-spec-filter",
+		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
+			if gotPodUID != podUID {
+				return "", true, nil
+			}
+			switch gotContainerID {
+			case currentID:
+				return "/" + currentRel, false, nil
+			case removedID:
+				return "/" + removedRel, false, nil
+			default:
+				return "", true, nil
+			}
+		},
+	})
+
+	fetcher := &strictFreshPendingFetcher{
+		containerIDs: map[string]string{
+			currentName: currentID,
+			removedName: removedID,
+		},
+		pods: map[string]*v1.Pod{
+			podUID: {
+				ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+				Spec:       v1.PodSpec{Containers: []v1.Container{{Name: currentName}}},
+				Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
+					Name: currentName, ContainerID: "containerd://" + currentID,
+				}}},
+			},
+		},
+		podErrs:      map[string]error{},
+		freshLookups: map[string]int{},
+	}
+	view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+			podUID: {
+				currentName: machine.NewCPUSet(0),
+				removedName: machine.NewCPUSet(1),
+			},
+		},
+	}}
+	cfg := bulkheadConfigWithPrimary("kubepods")
+	cfg.EnableAdmissionLeafDefer = true
+	p := &CPUSetTopologyPlugin{
+		cfg: cfg,
+		cgroup: &fakeCgroupClient{cpus: map[string]machine.CPUSet{
+			currentRel: machine.NewCPUSet(0),
+			removedRel: machine.NewCPUSet(1, 2),
+		}},
+		pendingProtections: map[string]pendingPodProtection{},
+	}
+
+	res, err := p.buildExpectedCPUSetByRel(
+		context.Background(), pendingScopeTestContext(fetcher, view))
+	if err != nil {
+		t.Fatalf("buildExpectedCPUSetByRel() error = %v", err)
+	}
+	if fetcher.freshLookups[podUID] != 1 {
+		t.Fatalf("strict fresh lookups = %d, want exactly one", fetcher.freshLookups[podUID])
+	}
+	if len(res.ExpectedByRel) != 1 || !res.ExpectedByRel[currentRel].Equals(machine.NewCPUSet(0)) {
+		t.Fatalf("expected leaves = %#v, want only current container", res.ExpectedByRel)
+	}
+	if _, ok := res.ExpectedByRel[removedRel]; ok {
+		t.Fatalf("fresh-spec-absent container survived in ExpectedByRel: %#v", res.ExpectedByRel)
+	}
+	if _, ok := res.DeferredLeafByRel[removedRel]; ok {
+		t.Fatalf("fresh-spec-absent container survived in DeferredLeafByRel: %#v", res.DeferredLeafByRel)
+	}
+	if len(res.PendingByPod) != 0 {
+		t.Fatalf("resolved-only outcomes entered PendingByPod: %#v", res.PendingByPod)
+	}
+
+	protections, err := p.pendingProtectionScopes(context.Background(), nil, res.PendingByPod)
+	if err != nil {
+		t.Fatalf("pendingProtectionScopes() error = %v", err)
+	}
+	if len(protections) != 0 || len(p.pendingProtections) != 0 {
+		t.Fatalf("removed container retained protection: scopes=%#v cache=%#v",
+			protections, p.pendingProtections)
+	}
+}
+
+func TestBuildExpectedUsesOneStrictSnapshotForManyPods(t *testing.T) {
+	const podCount = 100
+	fetcher := &strictSnapshotFetcher{
+		containerIDs: make(map[string]string, podCount),
+		pods:         make([]*v1.Pod, 0, podCount),
+	}
+	entries := make(map[string]machine.CPUSet, podCount)
+	for i := 0; i < podCount; i++ {
+		podUID := fmt.Sprintf("snapshot-pod-%d", i)
+		fetcher.containerIDs[podUID+"/main"] = "snapshot-container"
+		fetcher.pods = append(fetcher.pods, &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+			Spec:       v1.PodSpec{Containers: []v1.Container{{Name: "main"}}},
+			Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
+				Name:        "main",
+				ContainerID: "containerd://snapshot-container",
+			}}},
+		})
+		entries[podUID] = machine.NewCPUSet(i % 8)
+	}
+	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+		Name: "strict-snapshot-scaling",
+		Handler: func(podUID, containerID string) (string, bool, error) {
+			if strings.HasPrefix(podUID, "snapshot-pod-") && containerID == "snapshot-container" {
+				return "/kubepods/pod" + podUID + "/" + containerID, false, nil
+			}
+			return "", true, nil
+		},
+	})
+	p := &CPUSetTopologyPlugin{
+		cfg:    bulkheadConfigWithPrimary("kubepods"),
+		cgroup: &fakeCgroupClient{},
+	}
+
+	res, err := p.buildExpectedCPUSetByRel(context.Background(), pendingScopeTestContext(
+		fetcher, pendingScopeTestView(entries)))
+	if err != nil {
+		t.Fatalf("buildExpectedCPUSetByRel() error = %v", err)
+	}
+	if len(res.ExpectedByRel) != podCount {
+		t.Fatalf("resolved leaves = %d, want %d", len(res.ExpectedByRel), podCount)
+	}
+	if got := fetcher.refreshCalls + fetcher.listCalls; got != 1 {
+		t.Fatalf("kubelet pod cache sync total = %d (RefreshKubeletPodCache=%d GetPodList=%d), want 1",
+			got, fetcher.refreshCalls, fetcher.listCalls)
+	}
+	if fetcher.getCalls != 0 {
+		t.Fatalf("per-pod GetPod calls = %d, want zero", fetcher.getCalls)
+	}
+}
+
+func TestBuildExpectedUsesCacheOnlySnapshotBeforeStrictRefresh(t *testing.T) {
+	const (
+		podUID        = "cache-only-snapshot"
+		containerName = "main"
+		containerID   = "cached-id"
+		containerRel  = "kubepods/podcache-only-snapshot/cached-id"
+	)
+	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+		Name: "cache-only-snapshot",
+		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
+			if gotPodUID == podUID && gotContainerID == containerID {
+				return "/" + containerRel, false, nil
+			}
+			return "", true, nil
+		},
+	})
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+		Spec:       v1.PodSpec{Containers: []v1.Container{{Name: containerName}}},
+		Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
+			Name: containerName, ContainerID: "containerd://" + containerID,
+		}}},
+	}
+	fetcher := &cacheThenFreshSnapshotFetcher{
+		cachedPods: []*v1.Pod{pod},
+		freshPods:  []*v1.Pod{pod},
+	}
+	p := &CPUSetTopologyPlugin{
+		cfg:    bulkheadConfigWithPrimary("kubepods"),
+		cgroup: &fakeCgroupClient{},
+	}
+
+	res, err := p.buildExpectedCPUSetByRel(context.Background(), pendingScopeTestContext(
+		fetcher,
+		pendingScopeTestView(map[string]machine.CPUSet{podUID: machine.NewCPUSet(0, 1)}),
+	))
+	if err != nil {
+		t.Fatalf("buildExpectedCPUSetByRel() error = %v", err)
+	}
+	if fetcher.cacheCalls != 1 || fetcher.freshCalls != 1 || fetcher.containerIDCalls != 0 {
+		t.Fatalf("cache/fresh/container-ID calls = %d/%d/%d, want 1/1/0",
+			fetcher.cacheCalls, fetcher.freshCalls, fetcher.containerIDCalls)
+	}
+	if got := res.ExpectedByRel[containerRel]; !got.Equals(machine.NewCPUSet(0, 1)) {
+		t.Fatalf("resolved cpuset = %s, want 0-1; result=%#v", got.String(), res)
+	}
+}
+
+func TestBuildExpectedResolvesFreshIDMissingFromCachedSnapshot(t *testing.T) {
+	const (
+		podUID        = "fresh-id-resolution"
+		containerName = "main"
+		freshID       = "fresh-id"
+		freshRel      = "kubepods/podfresh-id-resolution/fresh-id"
+	)
+	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+		Name: "fresh-id-resolution",
+		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
+			if gotPodUID == podUID && gotContainerID == freshID {
+				return "/" + freshRel, false, nil
+			}
+			return "", true, nil
+		},
+	})
+	cachedPod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+		Spec:       v1.PodSpec{Containers: []v1.Container{{Name: containerName}}},
+	}
+	freshPod := cachedPod.DeepCopy()
+	freshPod.Status.ContainerStatuses = []v1.ContainerStatus{{
+		Name: containerName, ContainerID: "containerd://" + freshID,
+	}}
+	fetcher := &cacheThenFreshSnapshotFetcher{
+		cachedPods: []*v1.Pod{cachedPod},
+		freshPods:  []*v1.Pod{freshPod},
+	}
+	p := &CPUSetTopologyPlugin{
+		cfg:    bulkheadConfigWithPrimary("kubepods"),
+		cgroup: &fakeCgroupClient{},
+	}
+
+	res, err := p.buildExpectedCPUSetByRel(context.Background(), pendingScopeTestContext(
+		fetcher,
+		pendingScopeTestView(map[string]machine.CPUSet{podUID: machine.NewCPUSet(2, 3)}),
+	))
+	if err != nil {
+		t.Fatalf("buildExpectedCPUSetByRel() error = %v", err)
+	}
+	if got := res.ExpectedByRel[freshRel]; !got.Equals(machine.NewCPUSet(2, 3)) {
+		t.Fatalf("fresh-ID cpuset = %s, want 2-3; result=%#v", got.String(), res)
+	}
+	if len(res.PendingByPod) != 0 {
+		t.Fatalf("resolved fresh ID remained pending: %#v", res.PendingByPod)
+	}
+}
+
+func TestBuildExpectedProtectsCurrentGenerationForEveryStatusKind(t *testing.T) {
+	tests := []struct {
+		name      string
+		setStatus func(*v1.Pod, v1.ContainerStatus)
+	}{
+		{
+			name: "regular",
+			setStatus: func(pod *v1.Pod, status v1.ContainerStatus) {
+				pod.Spec.Containers = []v1.Container{{Name: status.Name}}
+				pod.Status.ContainerStatuses = []v1.ContainerStatus{status}
+			},
+		},
+		{
+			name: "init",
+			setStatus: func(pod *v1.Pod, status v1.ContainerStatus) {
+				pod.Spec.InitContainers = []v1.Container{{Name: status.Name}}
+				pod.Status.InitContainerStatuses = []v1.ContainerStatus{status}
+			},
+		},
+		{
+			name: "ephemeral",
+			setStatus: func(pod *v1.Pod, status v1.ContainerStatus) {
+				pod.Spec.EphemeralContainers = []v1.EphemeralContainer{{
+					EphemeralContainerCommon: v1.EphemeralContainerCommon{Name: status.Name},
+				}}
+				pod.Status.EphemeralContainerStatuses = []v1.ContainerStatus{status}
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			podUID := "same-name-restart-" + tt.name
+			containerName := "worker"
+			oldID := "old-" + tt.name
+			newID := "new-" + tt.name
+			oldRel := "kubepods/pod" + podUID + "/" + oldID
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+			}
+			tt.setStatus(pod, v1.ContainerStatus{
+				Name:        containerName,
+				ContainerID: "containerd://" + newID,
+			})
+			fetcher := &strictSnapshotFetcher{
+				containerIDs: map[string]string{podUID + "/" + containerName: oldID},
+				pods:         []*v1.Pod{pod},
+			}
+			cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+				Name: "resolved-old-id-" + tt.name,
+				Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
+					if gotPodUID == podUID && gotContainerID == oldID {
+						return "", false, os.ErrNotExist
+					}
+					return "", true, nil
+				},
+			})
+			p := &CPUSetTopologyPlugin{
+				cfg:    bulkheadConfigWithPrimary("kubepods"),
+				cgroup: &fakeCgroupClient{},
+			}
+			view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+				ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+					podUID: {containerName: machine.NewCPUSet(0)},
+				},
+			}}
+
+			res, err := p.buildExpectedCPUSetByRel(context.Background(), pendingScopeTestContext(
+				fetcher, view))
+			if err != nil {
+				t.Fatalf("buildExpectedCPUSetByRel() error = %v", err)
+			}
+			if _, ok := res.ExpectedByRel[oldRel]; ok {
+				t.Fatalf("old resolved cgroup survived same-name restart: %#v", res.ExpectedByRel)
+			}
+			if len(res.PendingByPod) != 1 {
+				t.Fatalf("new generation without a leaf was not protected as pending: %#v", res.PendingByPod)
+			}
+			if got := fetcher.refreshCalls + fetcher.listCalls; got != 1 {
+				t.Fatalf("kubelet pod cache sync total = %d (RefreshKubeletPodCache=%d GetPodList=%d), want 1",
+					got, fetcher.refreshCalls, fetcher.listCalls)
+			}
+		})
+	}
+}
+
+func TestBuildExpectedKeepsResolvedContainerIDForEveryStatusKind(t *testing.T) {
+	tests := []struct {
+		name      string
+		setStatus func(*v1.Pod, v1.ContainerStatus)
+	}{
+		{
+			name: "regular",
+			setStatus: func(pod *v1.Pod, status v1.ContainerStatus) {
+				pod.Spec.Containers = []v1.Container{{Name: status.Name}}
+				pod.Status.ContainerStatuses = []v1.ContainerStatus{status}
+			},
+		},
+		{
+			name: "init",
+			setStatus: func(pod *v1.Pod, status v1.ContainerStatus) {
+				pod.Spec.InitContainers = []v1.Container{{Name: status.Name}}
+				pod.Status.InitContainerStatuses = []v1.ContainerStatus{status}
+			},
+		},
+		{
+			name: "ephemeral",
+			setStatus: func(pod *v1.Pod, status v1.ContainerStatus) {
+				pod.Spec.EphemeralContainers = []v1.EphemeralContainer{{
+					EphemeralContainerCommon: v1.EphemeralContainerCommon{Name: status.Name},
+				}}
+				pod.Status.EphemeralContainerStatuses = []v1.ContainerStatus{status}
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			podUID := "current-status-" + tt.name
+			containerName := "worker"
+			containerID := "current-" + tt.name
+			rel := "kubepods/pod" + podUID + "/" + containerID
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+			}
+			tt.setStatus(pod, v1.ContainerStatus{
+				Name:        containerName,
+				ContainerID: "containerd://" + containerID,
+			})
+			fetcher := &strictSnapshotFetcher{
+				containerIDs: map[string]string{podUID + "/" + containerName: containerID},
+				pods:         []*v1.Pod{pod},
+			}
+			cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+				Name: "resolved-current-id-" + tt.name,
+				Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
+					if gotPodUID == podUID && gotContainerID == containerID {
+						return "/" + rel, false, nil
+					}
+					return "", true, nil
+				},
+			})
+			p := &CPUSetTopologyPlugin{
+				cfg:    bulkheadConfigWithPrimary("kubepods"),
+				cgroup: &fakeCgroupClient{},
+			}
+			view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+				ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+					podUID: {containerName: machine.NewCPUSet(0)},
+				},
+			}}
+
+			res, err := p.buildExpectedCPUSetByRel(context.Background(), pendingScopeTestContext(
+				fetcher, view))
+			if err != nil {
+				t.Fatalf("buildExpectedCPUSetByRel() error = %v", err)
+			}
+			if got, ok := res.ExpectedByRel[rel]; !ok || !got.Equals(machine.NewCPUSet(0)) {
+				t.Fatalf("resolved current cgroup = %s, ok=%v, want CPU 0", got.String(), ok)
+			}
+		})
+	}
+}
+
+func TestBuildExpectedPreservesStrictSnapshotErrors(t *testing.T) {
+	transportErr := errors.New("snapshot transport failed")
+	for _, wantErr := range []error{context.Canceled, context.DeadlineExceeded, transportErr} {
+		wantErr := wantErr
+		t.Run(wantErr.Error(), func(t *testing.T) {
+			fetcher := &strictSnapshotFetcher{
+				containerIDs: map[string]string{"snapshot-error/main": "container"},
+				listErr:      wantErr,
+			}
+			cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+				Name: "strict-snapshot-error-" + strings.ReplaceAll(wantErr.Error(), " ", "-"),
+				Handler: func(podUID, containerID string) (string, bool, error) {
+					if podUID == "snapshot-error" && containerID == "container" {
+						return "/kubepods/podsnapshot-error/container", false, nil
+					}
+					return "", true, nil
+				},
+			})
+			p := &CPUSetTopologyPlugin{cfg: bulkheadConfigWithPrimary("kubepods")}
+
+			_, err := p.buildExpectedCPUSetByRel(context.Background(), pendingScopeTestContext(
+				fetcher,
+				pendingScopeTestView(map[string]machine.CPUSet{"snapshot-error": machine.NewCPUSet(0)}),
+			))
+			if !errors.Is(err, wantErr) {
+				t.Fatalf("error = %v, want errors.Is(_, %v)", err, wantErr)
+			}
+			if fetcher.listCalls != 1 || fetcher.getCalls != 0 {
+				t.Fatalf("list calls=%d get calls=%d, want 1/0", fetcher.listCalls, fetcher.getCalls)
+			}
+		})
+	}
+}
+
+func TestBuildExpectedFiltersAllPodOutcomesAgainstOneStrictFreshMixedContainerSpec(t *testing.T) {
+	const (
+		podUID      = "mixed-resolved-and-pending-pod"
+		regularName = "regular-resolved"
+		initName    = "init-pending"
+		ephemeral   = "ephemeral-pending"
+		staleName   = "resolved-stale"
+		changedName = "identity-changed"
+		regularID   = "mixed-regular-id"
+		staleID     = "mixed-stale-id"
+		regularRel  = "kubepods/podmixed-resolved-and-pending-pod/mixed-regular-id"
+		staleRel    = "kubepods/podmixed-resolved-and-pending-pod/mixed-stale-id"
+	)
+	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+		Name: "mixed-resolved-and-pending-fresh-filter",
+		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
+			if gotPodUID != podUID {
+				return "", true, nil
+			}
+			switch gotContainerID {
+			case regularID:
+				return "/" + regularRel, false, nil
+			case staleID:
+				return "/" + staleRel, false, nil
+			default:
+				return "", true, nil
+			}
+		},
+	})
+
+	fetcher := &strictFreshPendingFetcher{
+		containerErrs: map[string]error{
+			initName:    metapod.ErrContainerNotFound,
+			ephemeral:   bulkheadutils.ErrContainerNotRunning,
+			changedName: fmt.Errorf("%w: previous=old current=new", bulkheadutils.ErrContainerIdentityChanged),
+		},
+		containerIDs: map[string]string{
+			regularName: regularID,
+			staleName:   staleID,
+		},
+		pods: map[string]*v1.Pod{
+			podUID: {
+				ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+				Spec: v1.PodSpec{
+					Containers:     []v1.Container{{Name: regularName}},
+					InitContainers: []v1.Container{{Name: initName}},
+					EphemeralContainers: []v1.EphemeralContainer{{
+						EphemeralContainerCommon: v1.EphemeralContainerCommon{Name: ephemeral},
+					}},
+				},
+				Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
+					Name: regularName, ContainerID: "containerd://" + regularID,
+				}}},
+			},
+		},
+		podErrs:      map[string]error{},
+		freshLookups: map[string]int{},
+	}
+	view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+			podUID: {
+				regularName: machine.NewCPUSet(0),
+				initName:    machine.NewCPUSet(1),
+				ephemeral:   machine.NewCPUSet(2),
+				staleName:   machine.NewCPUSet(3),
+				changedName: machine.NewCPUSet(4),
+			},
+		},
+	}}
+	p := &CPUSetTopologyPlugin{
+		cfg:                bulkheadConfigWithPrimary("kubepods"),
+		cgroup:             &fakeCgroupClient{},
+		pendingProtections: map[string]pendingPodProtection{},
+	}
+
+	res, err := p.buildExpectedCPUSetByRel(
+		context.Background(), pendingScopeTestContext(fetcher, view))
+	if err != nil {
+		t.Fatalf("buildExpectedCPUSetByRel() error = %v", err)
+	}
+	if fetcher.freshLookups[podUID] != 1 {
+		t.Fatalf("strict fresh lookups = %d, want exactly one", fetcher.freshLookups[podUID])
+	}
+	if len(res.ExpectedByRel) != 1 || !res.ExpectedByRel[regularRel].Equals(machine.NewCPUSet(0)) {
+		t.Fatalf("expected leaves = %#v, want only live regular container", res.ExpectedByRel)
+	}
+	if _, ok := res.ExpectedByRel[staleRel]; ok {
+		t.Fatalf("fresh-spec-absent CPUs survived in ExpectedByRel: %#v", res.ExpectedByRel)
+	}
+	if len(res.PendingByPod) != 2 {
+		t.Fatalf("pending entries = %#v, want only init and ephemeral containers", res.PendingByPod)
+	}
+	pendingNames := make(map[string]struct{}, len(res.PendingByPod))
+	for _, pending := range res.PendingByPod {
+		pendingNames[pending.ContainerName] = struct{}{}
+	}
+	for _, name := range []string{initName, ephemeral} {
+		if _, ok := pendingNames[name]; !ok {
+			t.Fatalf("live pending container %q was dropped: %#v", name, res.PendingByPod)
+		}
+	}
+	for _, name := range []string{staleName, changedName} {
+		if _, ok := pendingNames[name]; ok {
+			t.Fatalf("stale container %q survived in PendingByPod: %#v", name, res.PendingByPod)
+		}
+	}
+	if got := res.PendingCPUSetUnion(); !got.Equals(machine.NewCPUSet(1, 2)) {
+		t.Fatalf("pending CPU union = %s, want 1-2 without stale CPUs 3-4", got.String())
+	}
+
+	dag, err := topology.BuildDAG([]topology.NodeSpec{{
+		Rel:            "kubepods",
+		Role:           topology.TopoNodeRolePrimary,
+		Domain:         topology.DomainPrimary,
+		ControlledRoot: true,
+	}})
+	if err != nil {
+		t.Fatalf("BuildDAG() error = %v", err)
+	}
+	protections, err := p.pendingProtectionScopes(context.Background(), dag, res.PendingByPod)
+	if err != nil {
+		t.Fatalf("pendingProtectionScopes() error = %v", err)
+	}
+	protected := machine.NewCPUSet()
+	for _, protection := range protections {
+		protected = protected.Union(protection.CPUs)
+	}
+	if !protected.Equals(machine.NewCPUSet(1, 2)) {
+		t.Fatalf("protected CPU union = %s, want 1-2 without stale CPUs 3-4", protected.String())
 	}
 }
 
@@ -333,8 +1269,8 @@ func TestFreshAbsentPendingPodCandidateCardinality(t *testing.T) {
 			if err != nil {
 				t.Fatalf("buildExpectedCPUSetByRel() error = %v", err)
 			}
-			if fetcher.freshLookups[podUID] != 1 {
-				t.Fatalf("strict fresh lookups = %d, want 1", fetcher.freshLookups[podUID])
+			if fetcher.listCalls != 1 {
+				t.Fatalf("strict fresh pod list calls = %d, want 1", fetcher.listCalls)
 			}
 			if tt.wantSkip {
 				if len(res.PendingByPod) != 0 {
@@ -365,7 +1301,7 @@ func TestIdentityChangedMissingPodCandidateCardinality(t *testing.T) {
 			wantSkip: true,
 		},
 		{
-			name: "one candidate retains concrete scope",
+			name: "one candidate protects identity-changed allocation",
 			existing: map[string]bool{
 				"kubepods/burstable/pod" + podUID: true,
 			},
@@ -415,8 +1351,8 @@ func TestIdentityChangedMissingPodCandidateCardinality(t *testing.T) {
 			if err != nil {
 				t.Fatalf("buildExpectedCPUSetByRel() error = %v", err)
 			}
-			if fetcher.freshLookups[podUID] != 1 {
-				t.Fatalf("strict fresh lookups = %d, want 1", fetcher.freshLookups[podUID])
+			if fetcher.listCalls != 1 {
+				t.Fatalf("strict fresh pod list calls = %d, want 1", fetcher.listCalls)
 			}
 			if tt.wantSkip {
 				if len(res.PendingByPod) != 0 {
@@ -524,6 +1460,7 @@ func TestRemovePodIgnoresUnrelatedStalePendingEntry(t *testing.T) {
 		pods: map[string]*v1.Pod{
 			liveUID: {
 				ObjectMeta: metav1.ObjectMeta{UID: types.UID(liveUID)},
+				Spec:       v1.PodSpec{Containers: []v1.Container{{Name: "main"}}},
 			},
 		},
 		podErrs:      map[string]error{},
@@ -550,8 +1487,8 @@ func TestRemovePodIgnoresUnrelatedStalePendingEntry(t *testing.T) {
 	if len(res.PendingByPod) != 1 || res.PendingByPod[0].PodUID != liveUID {
 		t.Fatalf("pending entries = %#v, want only live pod", res.PendingByPod)
 	}
-	if fetcher.freshLookups[liveUID] != 1 || fetcher.freshLookups[staleUID] != 1 {
-		t.Fatalf("fresh lookups = %#v, want one per pending pod", fetcher.freshLookups)
+	if fetcher.listCalls != 1 {
+		t.Fatalf("strict fresh pod list calls = %d, want one", fetcher.listCalls)
 	}
 }
 

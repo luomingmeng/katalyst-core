@@ -117,6 +117,75 @@ func TestResolveContainerRelPathWithContextPropagatesCancellation(t *testing.T) 
 	}
 }
 
+func TestResolveContainerRelPathAndIDWithContextReturnsResolvedIdentity(t *testing.T) {
+	const (
+		podUID        = "pod-resolved-identity"
+		containerName = "main"
+		containerID   = "resolved-identity"
+		wantRel       = "kubepods/podpod-resolved-identity/resolved-identity"
+	)
+	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+		Name: "return-resolved-identity",
+		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
+			if gotPodUID == podUID && gotContainerID == containerID {
+				return "/" + wantRel, false, nil
+			}
+			return "", true, nil
+		},
+	})
+	fetcher := &sequenceContainerIDFetcher{results: []containerIDResult{{id: containerID}}}
+	metaServer := &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: fetcher}}
+
+	rel, resolvedID, err := ResolveContainerRelPathAndIDWithContext(
+		context.Background(), metaServer, podUID, containerName)
+	if err != nil {
+		t.Fatalf("ResolveContainerRelPathAndIDWithContext() error = %v", err)
+	}
+	if rel != wantRel || resolvedID != containerID {
+		t.Fatalf("resolved rel/id = %q/%q, want %q/%q", rel, resolvedID, wantRel, containerID)
+	}
+}
+
+func TestResolveContainerRelPathAndIDCacheOnlyWithContextReturnsUsedIdentityOnPathError(t *testing.T) {
+	const (
+		podUID        = "pod-cache-only-path-error"
+		containerName = "main"
+		containerID   = "cached-identity"
+	)
+	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+		Name: "cache-only-path-error",
+		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
+			if gotPodUID == podUID && gotContainerID == containerID {
+				return "", false, os.ErrNotExist
+			}
+			return "", true, nil
+		},
+	})
+	fetcher := &cacheAwareContainerIDFetcher{
+		cachedID:  containerID,
+		currentID: "new-identity",
+	}
+	metaServer := &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: fetcher}}
+
+	rel, usedID, err := ResolveContainerRelPathAndIDCacheOnlyWithContext(
+		context.Background(), metaServer, podUID, containerName)
+	if rel != "" {
+		t.Fatalf("resolved rel = %q, want empty", rel)
+	}
+	if usedID != containerID {
+		t.Fatalf("used container ID = %q, want %q", usedID, containerID)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("error = %v, want errors.Is(_, os.ErrNotExist)", err)
+	}
+	if fetcher.refreshCalls != 0 {
+		t.Fatalf("RefreshKubeletPodCache calls = %d, want 0", fetcher.refreshCalls)
+	}
+	if fetcher.calls != 1 {
+		t.Fatalf("container ID lookup calls = %d, want 1", fetcher.calls)
+	}
+}
+
 func TestResolveContainerRelPathWithContextDetectsContainerIdentityChange(t *testing.T) {
 	t.Parallel()
 

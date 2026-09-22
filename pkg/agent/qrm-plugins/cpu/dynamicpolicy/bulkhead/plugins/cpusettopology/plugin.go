@@ -48,6 +48,7 @@ import (
 	cgcommon "github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
+	"github.com/kubewharf/katalyst-core/pkg/util/native"
 )
 
 const CPUSetTopologyPluginName = "cpuset_topology"
@@ -1389,10 +1390,25 @@ func (p *CPUSetTopologyPlugin) applyBulkheadPartitionFlag(ctx context.Context, f
 type pendingContainerCPUSet struct {
 	PodUID         string
 	ContainerName  string
+	ContainerID    string
 	CPUs           machine.CPUSet
 	Reason         string
+	Cause          error
 	NativeQOSClass v1.PodQOSClass
 	ScopeRel       string
+}
+
+type resolvedContainerCPUSet struct {
+	PodUID        string
+	ContainerName string
+	ContainerID   string
+	Rel           string
+	CPUs          machine.CPUSet
+}
+
+type podContainerCPUSetOutcomes struct {
+	resolved []resolvedContainerCPUSet
+	pending  []pendingContainerCPUSet
 }
 
 // expectedCPUSetBuildResult separates resolvable container leaves (ExpectedByRel,
@@ -1430,22 +1446,38 @@ func isContainerAbsentErr(err error) bool {
 // admission-safe transition. Cache synchronization, kubelet transport, and
 // context errors must fail closed.
 func isContainerPendingErr(err error) bool {
-	return isContainerAbsentErr(err) ||
-		errors.Is(err, bulkheadutils.ErrContainerIdentityChanged)
+	if isContainerAbsentErr(err) || errors.Is(err, bulkheadutils.ErrContainerIdentityChanged) {
+		return true
+	}
+	var resolveErr *bulkheadutils.ContainerRelPathResolveError
+	return errors.As(err, &resolveErr) &&
+		resolveErr.Stage == bulkheadutils.ContainerRelPathResolveStageCgroupPath &&
+		errors.Is(resolveErr.Err, os.ErrNotExist)
 }
 
+// buildExpectedCPUSetByRel uses a two-snapshot protocol. It first resolves
+// candidate leaves from one cache-only Pod snapshot without triggering kubelet
+// I/O, then obtains exactly one strict fresh Pod snapshot for the whole round.
+// Every stale, pending, and generation decision is derived from that same fresh
+// snapshot; per-container refreshes are forbidden because they could mix Pod
+// generations inside one topology plan.
 func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in bulkheadapi.HandlerContext) (*expectedCPUSetBuildResult, error) {
 	if in.MetaServer == nil || in.DesiredView == nil || len(in.DesiredView.ContainerCPUSetByPod) == 0 {
 		return &expectedCPUSetBuildResult{}, nil
 	}
-	ctx = bulkheadutils.WithContainerIdentityRefreshScope(ctx)
 	out := &expectedCPUSetBuildResult{
 		ExpectedByRel:     map[string]machine.CPUSet{},
 		DeferredLeafByRel: map[string]machine.CPUSet{},
 	}
 	var errs []error
-	pendingByPod := make(map[string][]pendingContainerCPUSet)
+	cachedPodsByUID, cacheOnly, err := cachedPodSnapshotByUID(ctx, in.MetaServer)
+	if err != nil {
+		return nil, fmt.Errorf("get cache-only pod snapshot: %w", err)
+	}
+	outcomesByPod := make(map[string]*podContainerCPUSetOutcomes)
 	for podUID, containers := range in.DesiredView.ContainerCPUSetByPod {
+		outcomes := &podContainerCPUSetOutcomes{}
+		outcomesByPod[podUID] = outcomes
 		for containerName, cpus := range containers {
 			if cpus.IsEmpty() {
 				continue
@@ -1460,11 +1492,27 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in 
 			// expected map key would never match the childRel that expandDescendants
 			// produces during recursion, causing per-container cpuset enforcement to
 			// silently degrade to inheriting the parent pool target.
-			rel, err := bulkheadutils.ResolveContainerRelPathWithContext(ctx, in.MetaServer, podUID, containerName)
+			var rel, containerID string
+			var err error
+			if cacheOnly {
+				containerID, _ = podStatusContainerID(cachedPodsByUID[podUID], containerName)
+				if containerID == "" {
+					err = &bulkheadutils.ContainerRelPathResolveError{
+						Stage: bulkheadutils.ContainerRelPathResolveStageContainerID,
+						Err:   metapod.ErrContainerNotFound,
+					}
+				} else {
+					rel, err = resolveContainerRelPathFromID(podUID, containerID)
+				}
+			} else {
+				rel, containerID, err = bulkheadutils.ResolveContainerRelPathAndIDCacheOnlyWithContext(
+					ctx, in.MetaServer, podUID, containerName)
+			}
 			if err != nil {
 				if isContainerPendingErr(err) {
-					pendingByPod[podUID] = append(pendingByPod[podUID], pendingContainerCPUSet{
-						PodUID: podUID, ContainerName: containerName, CPUs: cpus, Reason: err.Error(),
+					outcomes.pending = append(outcomes.pending, pendingContainerCPUSet{
+						PodUID: podUID, ContainerName: containerName, ContainerID: containerID,
+						CPUs: cpus, Reason: err.Error(), Cause: err,
 					})
 					continue
 				}
@@ -1480,38 +1528,84 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in 
 					podUID, containerName, cpus.String()))
 				continue
 			}
-			if p.cfg.EnableAdmissionLeafDefer && in.Mode.OrFullDefault() == cpusetutil.CPUSetAdjustmentModeAdmission {
-				current, readErr := p.cgroup.ReadCPUSet(ctx, rel)
-				if readErr == nil && !current.Equals(cpus) && cpus.IsSubsetOf(current) &&
-					current.Intersection(in.DesiredView.DesiredReclaimEffective).IsEmpty() {
-					out.DeferredLeafByRel[rel] = cpus
-					continue
-				}
-			}
-			out.ExpectedByRel[rel] = cpus
+			outcomes.resolved = append(outcomes.resolved, resolvedContainerCPUSet{
+				PodUID: podUID, ContainerName: containerName, ContainerID: containerID, Rel: rel, CPUs: cpus,
+			})
 		}
 	}
-	for podUID, pending := range pendingByPod {
-		scopeRel, nativeQOSClass, stale, scopeErr := p.resolvePendingPodScopeFresh(
-			ctx, in.MetaServer, podUID)
+	hasOutcomes := false
+	for _, outcomes := range outcomesByPod {
+		if len(outcomes.resolved) > 0 || len(outcomes.pending) > 0 {
+			hasOutcomes = true
+			break
+		}
+	}
+	if !hasOutcomes {
+		if len(errs) > 0 {
+			return nil, apierrors.NewAggregate(errs)
+		}
+		return out, nil
+	}
+	refreshCtx := context.WithValue(ctx, metapod.BypassCacheKey, metapod.BypassCacheTrue)
+	refreshCtx = context.WithValue(refreshCtx, metapod.StrictBypassCacheKey, metapod.BypassCacheTrue)
+	freshPods, err := in.MetaServer.GetPodList(refreshCtx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("get strict fresh pod snapshot: %w", err)
+	}
+	freshPodsByUID := make(map[string]*v1.Pod, len(freshPods))
+	for _, pod := range freshPods {
+		if pod == nil {
+			return nil, fmt.Errorf("strict fresh pod snapshot contains nil pod")
+		}
+		podUID := string(pod.UID)
+		if podUID == "" {
+			return nil, fmt.Errorf("strict fresh pod snapshot contains pod with empty UID")
+		}
+		if _, exists := freshPodsByUID[podUID]; exists {
+			return nil, fmt.Errorf("strict fresh pod snapshot contains duplicate UID %q", podUID)
+		}
+		freshPodsByUID[podUID] = pod
+	}
+	for podUID, outcomes := range outcomesByPod {
+		if len(outcomes.resolved) == 0 && len(outcomes.pending) == 0 {
+			continue
+		}
+		freshPod, exists := freshPodsByUID[podUID]
+		validResolved, scopeRel, nativeQOSClass, validPending, stale, scopeErr := p.filterPodOutcomesAgainstFreshPod(
+			ctx, podUID, outcomes, freshPod, exists)
 		if scopeErr != nil {
-			errs = append(errs, fmt.Errorf("resolve pending pod scope: pod=%s: %w", podUID, scopeErr))
+			errs = append(errs, fmt.Errorf("resolve pod outcomes: pod=%s: %w", podUID, scopeErr))
 			continue
 		}
 		if stale {
-			for _, container := range pending {
+			for _, container := range outcomes.resolved {
+				general.Infof("bulkhead: stale checkpoint allocation skipped from expected leaves, pod=%q container=%q cpuset=%s",
+					podUID, container.ContainerName, container.CPUs.String())
+			}
+			for _, container := range outcomes.pending {
 				general.Infof("bulkhead: stale checkpoint allocation skipped from pending protection, pod=%q container=%q cpuset=%s",
 					podUID, container.ContainerName, container.CPUs.String())
 			}
 			continue
 		}
-		for i := range pending {
-			pending[i].NativeQOSClass = nativeQOSClass
-			pending[i].ScopeRel = scopeRel
-			general.InfofV(5, "bulkhead: container rel pending, protecting allocation, pod=%q container=%q cpuset=%s cpuset_size=%d reason=%s",
-				podUID, pending[i].ContainerName, pending[i].CPUs.String(), pending[i].CPUs.Size(), pending[i].Reason)
+		for _, container := range validResolved {
+			if p.cfg.EnableAdmissionLeafDefer && in.Mode.OrFullDefault() == cpusetutil.CPUSetAdjustmentModeAdmission {
+				current, readErr := p.cgroup.ReadCPUSet(ctx, container.Rel)
+				if readErr == nil && !current.Equals(container.CPUs) && container.CPUs.IsSubsetOf(current) &&
+					current.Intersection(in.DesiredView.DesiredReclaimEffective).IsEmpty() {
+					out.DeferredLeafByRel[container.Rel] = container.CPUs
+					continue
+				}
+			}
+			out.ExpectedByRel[container.Rel] = container.CPUs
 		}
-		out.PendingByPod = append(out.PendingByPod, pending...)
+		for i := range validPending {
+			validPending[i].NativeQOSClass = nativeQOSClass
+			validPending[i].ScopeRel = scopeRel
+			general.InfofV(5, "bulkhead: container rel pending, protecting allocation, pod=%q container=%q cpuset=%s cpuset_size=%d reason=%s",
+				podUID, validPending[i].ContainerName, validPending[i].CPUs.String(), validPending[i].CPUs.Size(), validPending[i].Reason)
+		}
+		out.PendingByPod = append(out.PendingByPod, validPending...)
 	}
 	if len(errs) > 0 {
 		return nil, apierrors.NewAggregate(errs)
@@ -1519,41 +1613,271 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in 
 	return out, nil
 }
 
-// resolvePendingPodScopeFresh owns pending scope freshness for one Pod.
-// All pending containers from that Pod must consume this single result so QoS,
-// scope, and stale classification cannot come from mixed Pod snapshots. A
-// missing scope is stale only when the fresh Pod is absent and every allowed
-// cgroup candidate is absent; a live Pod remains pending until materialization.
-func (p *CPUSetTopologyPlugin) resolvePendingPodScopeFresh(
+// cachedPodSnapshotByUID uses the optional cache-only extension when available.
+// Legacy fetchers may fall back to per-container cache reads, but every outcome
+// is still reconciled against one strict snapshot before it can affect a plan.
+// Cache snapshot errors are fatal and never select the legacy path silently.
+func cachedPodSnapshotByUID(
 	ctx context.Context,
 	metaServer *metaserver.MetaServer,
+) (map[string]*v1.Pod, bool, error) {
+	if metaServer == nil || metaServer.MetaAgent == nil || metaServer.PodFetcher == nil {
+		return nil, false, fmt.Errorf("nil pod fetcher")
+	}
+	fetcher, ok := metaServer.PodFetcher.(metapod.CachedPodSnapshotFetcher)
+	if !ok {
+		return nil, false, nil
+	}
+	pods, err := fetcher.GetPodListFromCache(ctx, nil)
+	if err != nil {
+		return nil, true, err
+	}
+	byUID := make(map[string]*v1.Pod, len(pods))
+	for _, pod := range pods {
+		if pod == nil {
+			continue
+		}
+		byUID[string(pod.UID)] = pod
+	}
+	return byUID, true, nil
+}
+
+func resolveContainerRelPathFromID(podUID, containerID string) (string, error) {
+	rel, err := cgcommon.GetContainerRelativeCgroupPath(podUID, containerID)
+	if err != nil {
+		return "", &bulkheadutils.ContainerRelPathResolveError{
+			Stage: bulkheadutils.ContainerRelPathResolveStageCgroupPath,
+			Err:   err,
+		}
+	}
+	rel = strings.Trim(rel, "/")
+	if rel == "" {
+		return "", &bulkheadutils.ContainerRelPathResolveError{
+			Stage: bulkheadutils.ContainerRelPathResolveStageCgroupPath,
+			Err:   fmt.Errorf("empty relative cgroup path"),
+		}
+	}
+	return rel, nil
+}
+
+// filterPodOutcomesAgainstFreshPod applies one round-wide strict Pod snapshot
+// to all resolved and pending outcomes for one Pod.
+func (p *CPUSetTopologyPlugin) filterPodOutcomesAgainstFreshPod(
+	ctx context.Context,
 	podUID string,
-) (scopeRel string, qosClass v1.PodQOSClass, stale bool, err error) {
-	refreshCtx := context.WithValue(ctx, metapod.BypassCacheKey, metapod.BypassCacheTrue)
-	refreshCtx = context.WithValue(refreshCtx, metapod.StrictBypassCacheKey, metapod.BypassCacheTrue)
-	pod, podErr := metaServer.GetPod(refreshCtx, podUID)
-	switch {
-	case podErr == nil && pod == nil:
-		return "", "", false, fmt.Errorf("fresh pod lookup returned nil pod without error")
-	case podErr == nil:
+	outcomes *podContainerCPUSetOutcomes,
+	pod *v1.Pod,
+	podExists bool,
+) (validResolved []resolvedContainerCPUSet, scopeRel string, qosClass v1.PodQOSClass,
+	validPending []pendingContainerCPUSet, stale bool, err error,
+) {
+	validResolved, resolvedPending, err := p.reconcileResolvedContainersWithFreshPod(
+		ctx, podUID, outcomes.resolved, pod)
+	if err != nil {
+		return nil, "", "", nil, false, err
+	}
+	pendingResolved, validPending, err := reconcilePendingContainersWithFreshPod(
+		podUID, outcomes.pending, pod)
+	if err != nil {
+		return nil, "", "", nil, false, err
+	}
+	validResolved = append(validResolved, pendingResolved...)
+	validPending = append(validPending, resolvedPending...)
+	if podExists {
+		if len(validPending) == 0 {
+			return validResolved, "", v1qos.GetPodQOS(pod), nil, false, nil
+		}
 		qosClass = v1qos.GetPodQOS(pod)
 		candidates := p.pendingPodScopeCandidatesForQOS(podUID, qosClass)
 		if len(candidates) == 1 {
-			return strings.Trim(candidates[0], "/"), qosClass, false, nil
+			return validResolved, strings.Trim(candidates[0], "/"), qosClass, validPending, false, nil
 		}
 		// Prefer a uniquely materialized scope and fail closed if multiple
 		// candidates exist. No materialized candidate is still a live pending
 		// Pod; the topology DAG selects its controlled primary scope later.
-		scopeRel, _, err = p.selectConcretePendingPodScope(ctx, podUID, candidates)
-		return scopeRel, qosClass, false, err
-	case !metapod.IsPodNotFound(podErr):
-		return "", "", false, podErr
-	default:
-		scopeRel, stale, err = p.selectConcretePendingPodScope(
-			ctx, podUID, relativePendingPodScopeCandidates(
-				cgcommon.GetPodRelativeCgroupPathCandidates(podUID)))
-		return scopeRel, "", stale, err
+		scopeRel, stale, err = p.selectConcretePendingPodScope(ctx, podUID, candidates)
+		return validResolved, scopeRel, qosClass, validPending, false, err
 	}
+	if len(validPending) == 0 {
+		return validResolved, "", "", nil, len(validResolved) == 0, nil
+	}
+	scopeRel, stale, err = p.selectConcretePendingPodScope(
+		ctx, podUID, relativePendingPodScopeCandidates(
+			cgcommon.GetPodRelativeCgroupPathCandidates(podUID)))
+	return validResolved, scopeRel, "", validPending, stale && len(validResolved) == 0, err
+}
+
+// reconcileResolvedContainersWithFreshPod treats container identity as
+// generation-scoped. A fresh status may name a new generation while the
+// previously resolved cgroup still exists and can still hold tasks. The old
+// generation remains protected until typed absence proves its physical
+// retirement, while the fresh generation is independently resolved or kept
+// pending. Any non-absence stat or path error aborts the round.
+func (p *CPUSetTopologyPlugin) reconcileResolvedContainersWithFreshPod(
+	ctx context.Context,
+	podUID string,
+	resolved []resolvedContainerCPUSet,
+	pod *v1.Pod,
+) ([]resolvedContainerCPUSet, []pendingContainerCPUSet, error) {
+	valid := make([]resolvedContainerCPUSet, 0, len(resolved)*2)
+	var pending []pendingContainerCPUSet
+	for _, container := range resolved {
+		freshName := pod != nil && podSpecHasContainerName(pod, container.ContainerName)
+		freshContainerID, hasFreshID := podStatusContainerID(pod, container.ContainerName)
+		if freshName && hasFreshID && freshContainerID == container.ContainerID {
+			valid = append(valid, container)
+			continue
+		}
+
+		if p.cgroup == nil {
+			return nil, nil, fmt.Errorf("stat previously resolved container rel %q: cgroup client is nil", container.Rel)
+		}
+		if _, statErr := p.cgroup.StatDir(ctx, container.Rel); statErr == nil {
+			valid = append(valid, container)
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return nil, nil, fmt.Errorf("stat previously resolved container rel %q: %w", container.Rel, statErr)
+		}
+
+		if !freshName {
+			continue
+		}
+		if !hasFreshID {
+			pending = append(pending, pendingFromResolved(container,
+				"fresh pod status has no current container identity"))
+			continue
+		}
+		if freshContainerID == container.ContainerID {
+			continue
+		}
+		fresh, resolveErr := resolvedContainerFromFreshID(podUID, container, freshContainerID)
+		if resolveErr == nil {
+			valid = append(valid, fresh)
+			continue
+		}
+		if errors.Is(resolveErr, os.ErrNotExist) {
+			pending = append(pending, pendingFromResolved(container,
+				fmt.Sprintf("fresh container identity %q has no cgroup leaf", freshContainerID)))
+			continue
+		}
+		return nil, nil, fmt.Errorf(
+			"resolve fresh container generation pod=%q container=%q id=%q: %w",
+			podUID, container.ContainerName, freshContainerID, resolveErr)
+	}
+	return valid, pending, nil
+}
+
+func resolvedContainerFromFreshID(
+	podUID string,
+	previous resolvedContainerCPUSet,
+	containerID string,
+) (resolvedContainerCPUSet, error) {
+	rel, err := resolveContainerRelPathFromID(podUID, containerID)
+	if err != nil {
+		return resolvedContainerCPUSet{}, err
+	}
+	return resolvedContainerCPUSet{
+		PodUID:        podUID,
+		ContainerName: previous.ContainerName,
+		ContainerID:   containerID,
+		Rel:           rel,
+		CPUs:          previous.CPUs,
+	}, nil
+}
+
+func pendingFromResolved(container resolvedContainerCPUSet, reason string) pendingContainerCPUSet {
+	return pendingContainerCPUSet{
+		PodUID:        container.PodUID,
+		ContainerName: container.ContainerName,
+		ContainerID:   container.ContainerID,
+		CPUs:          container.CPUs,
+		Reason:        reason,
+		Cause:         os.ErrNotExist,
+	}
+}
+
+func podStatusContainerID(pod *v1.Pod, name string) (string, bool) {
+	if pod == nil {
+		return "", false
+	}
+	statusGroups := [][]v1.ContainerStatus{
+		pod.Status.ContainerStatuses,
+		pod.Status.InitContainerStatuses,
+		pod.Status.EphemeralContainerStatuses,
+	}
+	for _, statuses := range statusGroups {
+		for _, status := range statuses {
+			if status.Name == name && status.ContainerID != "" {
+				return native.TrimContainerIDPrefix(status.ContainerID), true
+			}
+		}
+	}
+	return "", false
+}
+
+// reconcilePendingContainersWithFreshPod treats the round-wide fresh Pod Spec
+// as the canonical owner of container names. A pending checkpoint entry whose
+// name is absent from that Spec is retired even while the Pod cgroup remains:
+// pod-level liveness cannot prove ownership for one container. Entries with a
+// current Spec name are rebound only to the fresh status ID; if its cgroup leaf
+// is not materialized yet, the allocation remains pending instead of falling
+// back to a stale cached identity.
+func reconcilePendingContainersWithFreshPod(
+	podUID string,
+	pending []pendingContainerCPUSet,
+	pod *v1.Pod,
+) ([]resolvedContainerCPUSet, []pendingContainerCPUSet, error) {
+	var resolved []resolvedContainerCPUSet
+	valid := make([]pendingContainerCPUSet, 0, len(pending))
+	for _, container := range pending {
+		if pod == nil {
+			valid = append(valid, container)
+			continue
+		}
+		if !podSpecHasContainerName(pod, container.ContainerName) {
+			continue
+		}
+		containerID, ok := podStatusContainerID(pod, container.ContainerName)
+		if !ok {
+			valid = append(valid, container)
+			continue
+		}
+		fresh, err := resolvedContainerFromFreshID(podUID, resolvedContainerCPUSet{
+			PodUID:        podUID,
+			ContainerName: container.ContainerName,
+			CPUs:          container.CPUs,
+		}, containerID)
+		if err == nil {
+			resolved = append(resolved, fresh)
+			continue
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			valid = append(valid, container)
+			continue
+		}
+		return nil, nil, fmt.Errorf(
+			"resolve current generation for pending pod=%q container=%q id=%q: %w",
+			podUID, container.ContainerName, containerID, err)
+	}
+	return resolved, valid, nil
+}
+
+func podSpecHasContainerName(pod *v1.Pod, name string) bool {
+	for _, container := range pod.Spec.Containers {
+		if container.Name == name {
+			return true
+		}
+	}
+	for _, container := range pod.Spec.InitContainers {
+		if container.Name == name {
+			return true
+		}
+	}
+	for _, container := range pod.Spec.EphemeralContainers {
+		if container.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func relativePendingPodScopeCandidates(candidates []string) []string {

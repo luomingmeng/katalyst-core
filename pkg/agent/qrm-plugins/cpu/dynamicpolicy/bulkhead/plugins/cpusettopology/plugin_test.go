@@ -626,7 +626,7 @@ func (f *fakeCgroupClient) StatDir(_ context.Context, rel string) (time.Time, er
 	if f.existing[rel] {
 		return time.Time{}, nil
 	}
-	return time.Time{}, errors.New("missing")
+	return time.Time{}, os.ErrNotExist
 }
 
 func (f *fakeCgroupClient) Version(context.Context) cgroupclient.CgroupVersion {
@@ -1593,7 +1593,7 @@ func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t
 			if gotPodUID == podUID && gotContainerID == containerID {
 				return containerRel, false, nil
 			}
-			return "", false, errors.New("not the final-snapshot container proof fixture")
+			return "", true, nil
 		},
 	})
 
@@ -3244,7 +3244,7 @@ func newDisabledTransitionTestPlugin(
 			if gotPodUID == podUID && gotContainerID == containerID {
 				return containerRel, false, nil
 			}
-			return "", false, errors.New("not a bulkhead disabled transition test container")
+			return "", true, nil
 		},
 	})
 
@@ -3294,6 +3294,7 @@ func newDisabledTransitionTestPlugin(
 				MetaAgent: &agent.MetaAgent{
 					PodFetcher: &metapod.PodFetcherStub{PodList: []*v1.Pod{{
 						ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+						Spec:       v1.PodSpec{Containers: []v1.Container{{Name: "main"}}},
 						Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
 							Name:        "main",
 							ContainerID: "containerd://" + containerID,
@@ -3606,6 +3607,7 @@ type admissionContextContainerIDFetcher struct {
 	metapod.PodFetcherStub
 	wantValue string
 	calls     int
+	pod       *v1.Pod
 }
 
 type rotatingContainerIDFetcher struct {
@@ -3641,6 +3643,14 @@ func (f *bypassAwarePodFetcher) GetPod(ctx context.Context, _ string) (*v1.Pod, 
 		return nil, metapod.NewPodNotFoundError(string(f.pod.UID))
 	}
 	return f.pod.DeepCopy(), nil
+}
+
+func (f *bypassAwarePodFetcher) GetPodList(ctx context.Context, _ func(*v1.Pod) bool) ([]*v1.Pod, error) {
+	if ctx.Value(metapod.BypassCacheKey) != metapod.BypassCacheTrue ||
+		ctx.Value(metapod.StrictBypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("pod list lookup was not strict fresh")
+	}
+	return []*v1.Pod{f.pod.DeepCopy()}, nil
 }
 
 type freshPodLookupFetcher struct {
@@ -3681,6 +3691,25 @@ func (f *absenceThenFreshPodFetcher) GetPod(ctx context.Context, _ string) (*v1.
 	return f.pod.DeepCopy(), nil
 }
 
+func (f *absenceThenFreshPodFetcher) GetPodList(
+	ctx context.Context, _ func(*v1.Pod) bool,
+) ([]*v1.Pod, error) {
+	if ctx.Value(metapod.BypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("pod freshness query did not bypass cache")
+	}
+	if ctx.Value(metapod.StrictBypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("pod freshness query did not require strict bypass")
+	}
+	f.freshHit = true
+	if f.freshErr != nil && !metapod.IsPodNotFound(f.freshErr) {
+		return nil, f.freshErr
+	}
+	if f.pod == nil {
+		return nil, nil
+	}
+	return []*v1.Pod{f.pod.DeepCopy()}, nil
+}
+
 func (f *freshPodLookupFetcher) GetPod(ctx context.Context, _ string) (*v1.Pod, error) {
 	if ctx.Value(metapod.BypassCacheKey) != metapod.BypassCacheTrue {
 		return nil, errors.New("pod freshness query did not bypass cache")
@@ -3693,6 +3722,23 @@ func (f *freshPodLookupFetcher) GetPod(ctx context.Context, _ string) (*v1.Pod, 
 		return nil, metapod.NewPodNotFoundError("missing")
 	}
 	return f.pod.DeepCopy(), nil
+}
+
+func (f *freshPodLookupFetcher) GetPodList(
+	ctx context.Context, _ func(*v1.Pod) bool,
+) ([]*v1.Pod, error) {
+	if ctx.Value(metapod.BypassCacheKey) != metapod.BypassCacheTrue ||
+		ctx.Value(metapod.StrictBypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("pod list lookup was not strict fresh")
+	}
+	f.freshHit = true
+	if f.err != nil && !metapod.IsPodNotFound(f.err) {
+		return nil, f.err
+	}
+	if f.pod == nil {
+		return nil, nil
+	}
+	return []*v1.Pod{f.pod.DeepCopy()}, nil
 }
 
 type bypassAwareContainerIDFetcher struct {
@@ -3745,6 +3791,19 @@ func (f *disappearingContainerIDFetcher) GetPod(ctx context.Context, podUID stri
 	return f.pod.DeepCopy(), nil
 }
 
+func (f *disappearingContainerIDFetcher) GetPodList(
+	ctx context.Context, _ func(*v1.Pod) bool,
+) ([]*v1.Pod, error) {
+	if ctx.Value(metapod.BypassCacheKey) != metapod.BypassCacheTrue ||
+		ctx.Value(metapod.StrictBypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("pod list lookup was not strict fresh")
+	}
+	if f.pod == nil {
+		return nil, nil
+	}
+	return []*v1.Pod{f.pod.DeepCopy()}, nil
+}
+
 func (f *rotatingContainerIDFetcher) GetContainerIDWithContext(
 	context.Context, string, string,
 ) (string, error) {
@@ -3764,6 +3823,19 @@ func (f *rotatingContainerIDFetcher) GetPod(ctx context.Context, podUID string) 
 	return f.pod.DeepCopy(), nil
 }
 
+func (f *rotatingContainerIDFetcher) GetPodList(
+	ctx context.Context, _ func(*v1.Pod) bool,
+) ([]*v1.Pod, error) {
+	if ctx.Value(metapod.BypassCacheKey) != metapod.BypassCacheTrue ||
+		ctx.Value(metapod.StrictBypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("pod list lookup was not strict fresh")
+	}
+	if f.pod == nil {
+		return nil, nil
+	}
+	return []*v1.Pod{f.pod.DeepCopy()}, nil
+}
+
 func (f *admissionContextContainerIDFetcher) GetContainerIDWithContext(
 	ctx context.Context, _, _ string,
 ) (string, error) {
@@ -3772,6 +3844,30 @@ func (f *admissionContextContainerIDFetcher) GetContainerIDWithContext(
 	}
 	f.calls++
 	return "context-aware-container", nil
+}
+
+func (f *admissionContextContainerIDFetcher) GetPod(ctx context.Context, _ string) (*v1.Pod, error) {
+	if got := ctx.Value(admissionContextKey{}); got != f.wantValue {
+		return nil, fmt.Errorf("pod lookup context value = %v, want %q", got, f.wantValue)
+	}
+	if ctx.Value(metapod.BypassCacheKey) != metapod.BypassCacheTrue ||
+		ctx.Value(metapod.StrictBypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("pod lookup was not strict fresh")
+	}
+	return f.pod.DeepCopy(), nil
+}
+
+func (f *admissionContextContainerIDFetcher) GetPodList(
+	ctx context.Context, _ func(*v1.Pod) bool,
+) ([]*v1.Pod, error) {
+	if got := ctx.Value(admissionContextKey{}); got != f.wantValue {
+		return nil, fmt.Errorf("pod list lookup context value = %v, want %q", got, f.wantValue)
+	}
+	if ctx.Value(metapod.BypassCacheKey) != metapod.BypassCacheTrue ||
+		ctx.Value(metapod.StrictBypassCacheKey) != metapod.BypassCacheTrue {
+		return nil, errors.New("pod list lookup was not strict fresh")
+	}
+	return []*v1.Pod{f.pod.DeepCopy()}, nil
 }
 
 type failingAdmissionContainerIDFetcher struct {
@@ -3800,10 +3896,19 @@ func TestCPUSetTopologyExpectedBuildAndFinalPublishUseAdmissionContext(t *testin
 			if gotPodUID == podUID && gotContainerID == "context-aware-container" {
 				return containerRel, false, nil
 			}
-			return "", false, errors.New("not the admission context test container")
+			return "", true, nil
 		},
 	})
-	fetcher := &admissionContextContainerIDFetcher{wantValue: contextValue}
+	fetcher := &admissionContextContainerIDFetcher{
+		wantValue: contextValue,
+		pod: &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+			Spec:       v1.PodSpec{Containers: []v1.Container{{Name: containerName}}},
+			Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
+				Name: containerName, ContainerID: "containerd://context-aware-container",
+			}}},
+		},
+	}
 	metaServer := &metaserver.MetaServer{
 		MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
 	}
@@ -4143,7 +4248,7 @@ func TestFullConvergenceFinalizationRejectsDynamicLeafSuperset(t *testing.T) {
 	}
 }
 
-func TestCPUSetTopologyPluginTreatsRotatedContainerIdentityAsPending(t *testing.T) {
+func TestCPUSetTopologyPluginDropsRotatedContainerIdentity(t *testing.T) {
 	t.Parallel()
 
 	const (
@@ -4174,7 +4279,14 @@ func TestCPUSetTopologyPluginTreatsRotatedContainerIdentityAsPending(t *testing.
 		},
 	}}
 
-	res, err := (&CPUSetTopologyPlugin{}).buildExpectedCPUSetByRel(
+	res, err := (&CPUSetTopologyPlugin{
+		cfg: bulkheadconfig.BulkheadConfiguration{
+			BulkheadPrimaryRelPath: "kubepods",
+		},
+		cgroup: &fakeCgroupClient{statErrors: map[string]error{
+			"kubepods/besteffort/pod" + podUID: os.ErrNotExist,
+		}},
+	}).buildExpectedCPUSetByRel(
 		context.Background(),
 		bulkheadapi.HandlerContext{
 			CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{MetaServer: metaServer},
@@ -4182,16 +4294,16 @@ func TestCPUSetTopologyPluginTreatsRotatedContainerIdentityAsPending(t *testing.
 		},
 	)
 	if err != nil {
-		t.Fatalf("rotated container identity must be protected as pending, got %v", err)
+		t.Fatalf("rotated container identity must be dropped, got %v", err)
 	}
 	if len(res.ExpectedByRel) != 0 {
 		t.Fatalf("expected no resolved leaves, got %#v", res.ExpectedByRel)
 	}
-	if len(res.PendingByPod) != 1 {
-		t.Fatalf("expected one protected-pending entry, got %#v", res.PendingByPod)
+	if len(res.PendingByPod) != 0 {
+		t.Fatalf("rotated container identity entered pending protection: %#v", res.PendingByPod)
 	}
-	if fetcher.calls != 2 {
-		t.Fatalf("container ID lookup calls = %d, want 2", fetcher.calls)
+	if fetcher.calls != 1 {
+		t.Fatalf("cache-only container ID lookup calls = %d, want 1", fetcher.calls)
 	}
 }
 
@@ -4216,6 +4328,7 @@ func TestCPUSetTopologyPluginTreatsDisappearedContainerAsPending(t *testing.T) {
 		containerID: containerID,
 		pod: &v1.Pod{
 			ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+			Spec:       v1.PodSpec{Containers: []v1.Container{{Name: containerName}}},
 		},
 	}
 	metaServer := &metaserver.MetaServer{
@@ -4243,52 +4356,81 @@ func TestCPUSetTopologyPluginTreatsDisappearedContainerAsPending(t *testing.T) {
 	if len(res.PendingByPod) != 1 {
 		t.Fatalf("expected one protected-pending entry, got %#v", res.PendingByPod)
 	}
-	if fetcher.calls != 2 {
-		t.Fatalf("container ID lookup calls = %d, want 2", fetcher.calls)
+	if fetcher.calls != 1 {
+		t.Fatalf("cache-only container ID lookup calls = %d, want 1", fetcher.calls)
 	}
 }
 
-func TestCPUSetTopologyPluginSkipsExpectedCPUSetForMissingContainer(t *testing.T) {
+func TestCPUSetTopologyPluginReleasesFreshMissingContainerName(t *testing.T) {
 	t.Parallel()
 
-	p := &CPUSetTopologyPlugin{}
-	allocationInfo := &cpustate.AllocationInfo{}
-	allocationInfo.NativeQOSClass = string(v1.PodQOSGuaranteed)
-	metaServer := &metaserver.MetaServer{
-		MetaAgent: &agent.MetaAgent{
-			PodFetcher: &metapod.PodFetcherStub{PodList: []*v1.Pod{{
-				ObjectMeta: metav1.ObjectMeta{UID: types.UID("pod-1")},
-			}}},
+	const podScope = "kubepods/besteffort/podpod-1"
+	tests := []struct {
+		name   string
+		cgroup *fakeCgroupClient
+	}{
+		{
+			name: "after typed pod scope absence",
+			cgroup: &fakeCgroupClient{statErrors: map[string]error{
+				podScope: os.ErrNotExist,
+			}},
+		},
+		{
+			name: "while pod scope still exists",
+			cgroup: &fakeCgroupClient{existing: map[string]bool{
+				podScope: true,
+			}},
 		},
 	}
-	view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
-		ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
-			"pod-1": {
-				"missing-container": machine.NewCPUSet(0, 1),
-			},
-		},
-	}}
 
-	// A container with no status yet also fails at the container-id stage:
-	// admit-safe pending, not an error.
-	res, err := p.buildExpectedCPUSetByRel(context.Background(), bulkheadapi.HandlerContext{
-		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
-			MetaServer: metaServer,
-			State:      &allocationLookupState{info: allocationInfo},
-		},
-		DesiredView: view,
-	})
-	if err != nil {
-		t.Fatalf("missing container must not error (admit-safe pending), got %v", err)
-	}
-	if len(res.ExpectedByRel) != 0 {
-		t.Fatalf("expected no resolved leaves, got %#v", res.ExpectedByRel)
-	}
-	if len(res.PendingByPod) != 1 {
-		t.Fatalf("expected one protected-pending entry, got %#v", res.PendingByPod)
-	}
-	if got := res.PendingByPod[0].NativeQOSClass; got != v1.PodQOSBestEffort {
-		t.Fatalf("pending native qos class = %q, want fresh pod qos %q", got, v1.PodQOSBestEffort)
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			p := &CPUSetTopologyPlugin{
+				cfg: bulkheadconfig.BulkheadConfiguration{
+					BulkheadPrimaryRelPath: "kubepods",
+				},
+				cgroup: tt.cgroup,
+			}
+			allocationInfo := &cpustate.AllocationInfo{}
+			allocationInfo.NativeQOSClass = string(v1.PodQOSGuaranteed)
+			metaServer := &metaserver.MetaServer{
+				MetaAgent: &agent.MetaAgent{
+					PodFetcher: &metapod.PodFetcherStub{PodList: []*v1.Pod{{
+						ObjectMeta: metav1.ObjectMeta{UID: types.UID("pod-1")},
+					}}},
+				},
+			}
+			view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+				ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+					"pod-1": {
+						"missing-container": machine.NewCPUSet(0, 1),
+					},
+				},
+			}}
+
+			// The fresh Pod Spec is the canonical owner of container names.
+			// A pod-level cgroup only proves that the Pod is live; it cannot
+			// extend the lifetime of a checkpoint-only container allocation.
+			res, err := p.buildExpectedCPUSetByRel(context.Background(), bulkheadapi.HandlerContext{
+				CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+					MetaServer: metaServer,
+					State:      &allocationLookupState{info: allocationInfo},
+				},
+				DesiredView: view,
+			})
+			if err != nil {
+				t.Fatalf("missing container name must be dropped without error, got %v", err)
+			}
+			if len(res.ExpectedByRel) != 0 {
+				t.Fatalf("expected no resolved leaves, got %#v", res.ExpectedByRel)
+			}
+			if len(res.PendingByPod) != 0 {
+				t.Fatalf("fresh-spec-missing container entered pending protection: %#v", res.PendingByPod)
+			}
+		})
 	}
 }
 
@@ -4354,6 +4496,7 @@ func TestCPUSetTopologyPluginFreshlyGetsPodForEveryContainerAbsenceClass(t *test
 				absenceErr: absenceErr,
 				pod: &v1.Pod{
 					ObjectMeta: metav1.ObjectMeta{UID: types.UID("pod-absence")},
+					Spec:       v1.PodSpec{Containers: []v1.Container{{Name: "main"}}},
 				},
 			}
 			metaServer := &metaserver.MetaServer{
@@ -4670,7 +4813,7 @@ func TestCPUSetTopologyPluginFailsExpectedCPUSetForContainerIDDeadline(t *testin
 	}
 }
 
-func TestCPUSetTopologyPluginFailsExpectedCPUSetForUnresolvedContainerRel(t *testing.T) {
+func TestCPUSetTopologyPluginKeepsUnmaterializedFreshContainerPending(t *testing.T) {
 	t.Parallel()
 
 	p := &CPUSetTopologyPlugin{}
@@ -4678,6 +4821,7 @@ func TestCPUSetTopologyPluginFailsExpectedCPUSetForUnresolvedContainerRel(t *tes
 		MetaAgent: &agent.MetaAgent{
 			PodFetcher: &metapod.PodFetcherStub{PodList: []*v1.Pod{{
 				ObjectMeta: metav1.ObjectMeta{UID: types.UID("pod-1")},
+				Spec:       v1.PodSpec{Containers: []v1.Container{{Name: "main"}}},
 				Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
 					Name:        "main",
 					ContainerID: "invalid-container-id",
@@ -4694,15 +4838,21 @@ func TestCPUSetTopologyPluginFailsExpectedCPUSetForUnresolvedContainerRel(t *tes
 		},
 	}}
 
-	// The container id resolves, but the relative cgroup path cannot be resolved
-	// (no handler / broken layout). This is a real error, NOT the admit window,
-	// so the round must fail-closed rather than apply a partial topology.
+	// The fresh status owns this generation, but typed cgroup absence can still
+	// be the normal materialization window. Keep its CPUs scoped pending rather
+	// than dropping them or treating absence as an operational probe failure.
 	res, err := p.buildExpectedCPUSetByRel(context.Background(), bulkheadapi.HandlerContext{
 		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{MetaServer: metaServer},
 		DesiredView:                view,
 	})
-	if err == nil {
-		t.Fatalf("unresolved container rel (id known) must fail-closed, got res=%#v", res)
+	if err != nil {
+		t.Fatalf("unmaterialized fresh container must remain pending, got %v", err)
+	}
+	if len(res.PendingByPod) != 1 {
+		t.Fatalf("pending entries = %#v, want one", res.PendingByPod)
+	}
+	if got := res.PendingByPod[0].ContainerID; got != "invalid-container-id" {
+		t.Fatalf("pending container ID = %q, want invalid-container-id", got)
 	}
 }
 
@@ -4730,7 +4880,7 @@ func TestCPUSetTopologyPluginBuildExpectedCPUSetByRelTrimsLeadingSlash(t *testin
 			if gotPodUID == podUID && gotContainerID == containerID {
 				return prefixedRel, false, nil
 			}
-			return "", false, errors.New("not a build-expected-trim test container")
+			return "", true, nil
 		},
 	})
 
@@ -4741,6 +4891,7 @@ func TestCPUSetTopologyPluginBuildExpectedCPUSetByRelTrimsLeadingSlash(t *testin
 				MetaAgent: &agent.MetaAgent{
 					PodFetcher: &metapod.PodFetcherStub{PodList: []*v1.Pod{{
 						ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+						Spec:       v1.PodSpec{Containers: []v1.Container{{Name: containerNm}}},
 						Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
 							Name:        containerNm,
 							ContainerID: "containerd://" + containerID,
