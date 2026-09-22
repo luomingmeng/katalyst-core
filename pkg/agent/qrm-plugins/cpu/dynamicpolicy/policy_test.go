@@ -1259,6 +1259,55 @@ func TestAllocateAndRemovePodPendingWaitHonorsRequestContextWithoutStateWrites(t
 		"pre-admission RemovePod failure must retain failure metrics")
 }
 
+func TestRemovePodRecoversStaleEntryBehindStuckAdvisorPostCommitTarget(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	const podUID = "stale-pod"
+	entries := state.PodEntries{
+		podUID: {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        podUID,
+					PodNamespace:  "test-ns",
+					PodName:       podUID,
+					ContainerName: "main",
+					ContainerType: pluginapi.ContainerType_MAIN.String(),
+					QoSLevel:      consts.PodAnnotationQoSLevelSharedCores,
+					OwnerPoolName: commonstate.PoolNameShare,
+				},
+				AllocationResult:         machine.NewCPUSet(2),
+				OriginalAllocationResult: machine.NewCPUSet(2),
+				RequestQuantity:          1,
+			},
+		},
+	}
+	machineState, err := generateMachineStateFromPodEntries(topology, entries, p.state.GetMachineState())
+	require.NoError(t, err)
+	require.NoError(t, p.state.CommitAdvisorState(entries, machineState, false, false, true))
+
+	target := p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+	p.recordAdvisorPostCommitProgress(target, advisorPostCommitPhasePhysicalApply)
+	p.cpuSetAdjustmentRetryMu.Lock()
+	target.lastProgressAt = time.Now().Add(-advisorPostCommitStuckThreshold(p.conf) - time.Second)
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	require.FileExists(t, p.advisorPostCommitCheckpointPath())
+
+	_, err = p.RemovePod(context.Background(), &pluginapi.RemovePodRequest{PodUid: podUID})
+	require.NoError(t, err)
+	require.NotContains(t, p.state.GetPodEntries(), podUID)
+	require.Same(t, target, p.currentAdvisorPostCommitTarget())
+	require.FileExists(t, p.advisorPostCommitCheckpointPath())
+	require.Equal(t, advisorPostCommitPhaseCanonicalReconcile,
+		p.currentAdvisorPostCommitProgress().phase)
+	p.cpuSetAdjustmentRetryMu.Lock()
+	require.True(t, p.cpuSetAdjustmentRetryDirty)
+	require.Contains(t, p.cpuSetAdjustmentRetryReasons, dynamicpolicyutil.RetryReasonApplyFailed)
+	p.cpuSetAdjustmentRetryMu.Unlock()
+}
+
 func TestGetResourcesAllocationWaitsForAdvisorOwnerToConverge(t *testing.T) {
 	topology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
 	require.NoError(t, err)
@@ -1300,6 +1349,9 @@ func TestGetResourcesAllocationPendingWaitHonorsRequestContextWithoutStateWrites
 	p.state = trackedState
 	target := p.publishAdvisorPostCommitTarget(
 		&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+	p.cpuSetAdjustmentRetryMu.Lock()
+	target.lastProgressAt = time.Now().Add(-advisorPostCommitStuckThreshold(p.conf) - time.Second)
+	p.cpuSetAdjustmentRetryMu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
@@ -1310,6 +1362,7 @@ func TestGetResourcesAllocationPendingWaitHonorsRequestContextWithoutStateWrites
 	require.Equal(t, 0, trackedState.storeCalls)
 	require.Same(t, target, p.currentAdvisorPostCommitTarget())
 	require.FileExists(t, p.advisorPostCommitCheckpointPath())
+	require.Equal(t, advisorPostCommitPhasePublished, p.currentAdvisorPostCommitProgress().phase)
 }
 
 func TestAllocateExecutionLeaseRechecksAdvisorTarget(t *testing.T) {

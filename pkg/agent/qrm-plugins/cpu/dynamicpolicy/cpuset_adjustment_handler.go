@@ -61,11 +61,12 @@ const (
 type advisorPostCommitPhase string
 
 const (
-	advisorPostCommitPhasePrepared      advisorPostCommitPhase = "prepared"
-	advisorPostCommitPhasePublished     advisorPostCommitPhase = "published"
-	advisorPostCommitPhasePhysicalApply advisorPostCommitPhase = "physical_apply"
-	advisorPostCommitPhaseAppliedMarker advisorPostCommitPhase = "applied_marker"
-	advisorPostCommitPhaseCleanup       advisorPostCommitPhase = "cleanup"
+	advisorPostCommitPhasePrepared           advisorPostCommitPhase = "prepared"
+	advisorPostCommitPhasePublished          advisorPostCommitPhase = "published"
+	advisorPostCommitPhasePhysicalApply      advisorPostCommitPhase = "physical_apply"
+	advisorPostCommitPhaseCanonicalReconcile advisorPostCommitPhase = "canonical_reconcile"
+	advisorPostCommitPhaseAppliedMarker      advisorPostCommitPhase = "applied_marker"
+	advisorPostCommitPhaseCleanup            advisorPostCommitPhase = "cleanup"
 )
 
 type advisorPostCommitTarget struct {
@@ -75,6 +76,7 @@ type advisorPostCommitTarget struct {
 	publicationPending            bool
 	applyMarkerPending            bool
 	cleanupPending                bool
+	writerFenceReleased           bool
 	previousTarget                *advisorPostCommitTarget
 	applied                       bool
 	checkpointVersion             int
@@ -974,6 +976,7 @@ const (
 	advisorPostCommitRecoveryCleanup advisorPostCommitRecoveryState = iota
 	advisorPostCommitRecoveryReplay
 	advisorPostCommitRecoveryBeforeCommit
+	advisorPostCommitRecoverySuperseded
 )
 
 func advisorPostCommitRecoveryForRevision(
@@ -995,6 +998,9 @@ func advisorPostCommitRecoveryForRevision(
 	if currentRevision == target.preCommitRevision {
 		return advisorPostCommitRecoveryBeforeCommit
 	}
+	if currentRevision > target.revision {
+		return advisorPostCommitRecoverySuperseded
+	}
 	return advisorPostCommitRecoveryCleanup
 }
 
@@ -1014,16 +1020,16 @@ func (p *DynamicPolicy) restoreAdvisorPostCommitTarget() error {
 	}
 	active, activeErr := loadAdvisorPostCommitTarget(activePath, topology)
 	staging, stagingErr := loadAdvisorPostCommitTarget(stagingPath, topology)
+	activeRecovery := advisorPostCommitRecoveryForRevision(active, mainRevision)
+	stagingRecovery := advisorPostCommitRecoveryForRevision(staging, mainRevision)
 
 	var selected *advisorPostCommitTarget
-	if stagingErr == nil &&
-		advisorPostCommitRecoveryForRevision(staging, mainRevision) == advisorPostCommitRecoveryReplay {
+	if stagingErr == nil && stagingRecovery == advisorPostCommitRecoveryReplay {
 		selected = staging
 		if err := p.promoteAdvisorPostCommitStaging(); err != nil {
 			return err
 		}
-	} else if activeErr == nil &&
-		advisorPostCommitRecoveryForRevision(active, mainRevision) == advisorPostCommitRecoveryReplay {
+	} else if activeErr == nil && activeRecovery == advisorPostCommitRecoveryReplay {
 		selected = active
 		if err := p.removeAdvisorPostCommitStaging(); err != nil {
 			return err
@@ -1040,6 +1046,13 @@ func (p *DynamicPolicy) restoreAdvisorPostCommitTarget() error {
 		}
 		if err := p.removeAdvisorPostCommitStaging(); err != nil {
 			return err
+		}
+		if activeRecovery == advisorPostCommitRecoverySuperseded ||
+			stagingRecovery == advisorPostCommitRecoverySuperseded {
+			// A newer canonical revision proves that a writer advanced after
+			// the old target released its fence. The old response is obsolete,
+			// but latest-state cpuset reconciliation remains mandatory.
+			p.markCPUSetAdjustmentDirty(cpusetutil.RetryReasonApplyFailed)
 		}
 		return nil
 	}
@@ -1135,7 +1148,7 @@ func (p *DynamicPolicy) ensureCPUStateWriterAllowed(
 ) error {
 	p.cpuSetAdjustmentRetryMu.Lock()
 	pendingTarget := p.advisorPostCommitTarget
-	if pendingTarget == nil {
+	if pendingTarget == nil || pendingTarget.writerFenceReleased {
 		p.cpuSetAdjustmentRetryMu.Unlock()
 		return nil
 	}
@@ -1170,7 +1183,11 @@ func (p *DynamicPolicy) currentAdvisorPostCommitTargetAndChange() (*advisorPostC
 	if p.advisorPostCommitTargetChange == nil {
 		p.advisorPostCommitTargetChange = make(chan struct{})
 	}
-	return p.advisorPostCommitTarget, p.advisorPostCommitTargetChange
+	target := p.advisorPostCommitTarget
+	if target != nil && target.writerFenceReleased {
+		target = nil
+	}
+	return target, p.advisorPostCommitTargetChange
 }
 
 func (p *DynamicPolicy) currentAdvisorPostCommitProgress() advisorPostCommitProgress {
@@ -1192,6 +1209,15 @@ func (p *DynamicPolicy) currentAdvisorPostCommitProgress() advisorPostCommitProg
 		generation:     target.progressGeneration,
 		changed:        p.advisorPostCommitTargetChange,
 	}
+}
+
+// advisorPostCommitProgressStuck reports whether a target has remained in its
+// physical-apply phase past the stuck threshold. Other phases may be waiting on
+// durable publication or cleanup and must retain their target-specific retry.
+func (p *DynamicPolicy) advisorPostCommitProgressStuck(progress advisorPostCommitProgress) bool {
+	return progress.target != nil &&
+		progress.phase == advisorPostCommitPhasePhysicalApply &&
+		time.Since(progress.lastProgressAt) >= advisorPostCommitStuckThreshold(p.conf)
 }
 
 func (p *DynamicPolicy) recordAdvisorPostCommitProgress(
@@ -1300,21 +1326,145 @@ func (p *DynamicPolicy) completeAdvisorPostCommitCleanup(target *advisorPostComm
 	}
 
 	p.cpuSetAdjustmentRetryMu.Lock()
-	if p.advisorPostCommitTarget == target {
-		p.setAdvisorPostCommitTargetLocked(nil)
-		for permit, permitTarget := range p.advisorStateWritePermits {
-			if permitTarget == target {
-				delete(p.advisorStateWritePermits, permit)
-			}
-		}
-		delete(p.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
-		if len(p.cpuSetAdjustmentRetryReasons) == 0 {
-			p.cpuSetAdjustmentRetryDirty = false
-			p.cpuSetAdjustmentRetryReasons = nil
-		}
+	if p.releaseAdvisorPostCommitTargetFenceLocked(target) {
+		p.completeAdvisorPostCommitRetryLocked()
 	}
 	p.cpuSetAdjustmentRetryMu.Unlock()
 	return nil
+}
+
+// releaseAdvisorPostCommitTargetFenceLocked drops only the target ownership and
+// its writer permits. Retry state is completed separately because abandoning a
+// stuck physical apply must leave canonical reconciliation dirty.
+func (p *DynamicPolicy) releaseAdvisorPostCommitTargetFenceLocked(target *advisorPostCommitTarget) bool {
+	if p.advisorPostCommitTarget != target {
+		return false
+	}
+	p.setAdvisorPostCommitTargetLocked(nil)
+	for permit, permitTarget := range p.advisorStateWritePermits {
+		if permitTarget == target {
+			delete(p.advisorStateWritePermits, permit)
+		}
+	}
+	return true
+}
+
+// releaseAdvisorPostCommitWriterFenceLocked lets unrelated writers advance
+// while retaining target and its WAL for a complete physical replay. This is a
+// runtime-only handoff: after a crash the durable target is fenced and replayed
+// again, which is safer than losing an incomplete physical transaction.
+func (p *DynamicPolicy) releaseAdvisorPostCommitWriterFenceLocked(target *advisorPostCommitTarget) bool {
+	if p.advisorPostCommitTarget != target {
+		return false
+	}
+	for permit, permitTarget := range p.advisorStateWritePermits {
+		if permitTarget == target {
+			delete(p.advisorStateWritePermits, permit)
+		}
+	}
+	target.writerFenceReleased = true
+	p.recordAdvisorPostCommitProgressLocked(target, advisorPostCommitPhaseCanonicalReconcile)
+	return true
+}
+
+// completeAdvisorPostCommitRetryLocked clears apply-failure retry state only
+// after the target has completed physical apply and durable cleanup.
+func (p *DynamicPolicy) completeAdvisorPostCommitRetryLocked() {
+	delete(p.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
+	if len(p.cpuSetAdjustmentRetryReasons) == 0 {
+		p.cpuSetAdjustmentRetryDirty = false
+		p.cpuSetAdjustmentRetryReasons = nil
+	}
+}
+
+// recoverStuckAdvisorPostCommitTargetLocked releases the writer fence of an
+// aged physical apply only after all response-owned side effects have
+// converged. The caller holds p.Lock; this method serializes the handoff with
+// the same execution lease used by every physical adjustment round.
+func (p *DynamicPolicy) recoverStuckAdvisorPostCommitTargetLocked(
+	ctx context.Context,
+	target *advisorPostCommitTarget,
+) (bool, error) {
+	if target == nil {
+		return false, nil
+	}
+	executionLease := cpuSetAdjustmentExecutionLeaseFromContext(ctx, p)
+	if executionLease == nil {
+		var err error
+		executionLease, err = p.acquireCPUSetAdjustmentExecutionLocked(ctx)
+		if err != nil {
+			return false, fmt.Errorf("acquire cpuset adjustment execution for stuck recovery: %w", err)
+		}
+		defer executionLease.release()
+	}
+	progress := p.currentAdvisorPostCommitProgress()
+	if progress.target != target || !p.advisorPostCommitProgressStuck(progress) {
+		return false, nil
+	}
+	if err := p.applySteadyFakeNUMAMigrationCheckpointTransition(
+		target.migrationCheckpointTransition); err != nil {
+		return false, fmt.Errorf("replay stuck advisor migration checkpoint transition: %w", err)
+	}
+	headroomErr := p.applyHeadroom(target.response)
+	cgroupErr := p.applyCgroupConfigs(target.response)
+	if headroomErr != nil || cgroupErr != nil {
+		var stageErrors []string
+		if headroomErr != nil {
+			stageErrors = append(stageErrors, fmt.Sprintf("applyHeadroom failed with error: %v", headroomErr))
+		}
+		if cgroupErr != nil {
+			stageErrors = append(stageErrors, fmt.Sprintf("applyCgroupConfigs failed with error: %v", cgroupErr))
+		}
+		return false, fmt.Errorf("replay stuck advisor response-owned state: %s", strings.Join(stageErrors, "; "))
+	}
+	p.cpuSetAdjustmentRetryMu.Lock()
+	released := p.releaseAdvisorPostCommitWriterFenceLocked(target)
+	if released && !p.cpuSetAdjustmentRetryStopping {
+		p.cpuSetAdjustmentRetryDirty = true
+		if p.cpuSetAdjustmentRetryReasons == nil {
+			p.cpuSetAdjustmentRetryReasons = make(map[cpusetutil.CPUSetAdjustmentRetryReason]struct{})
+		}
+		p.cpuSetAdjustmentRetryReasons[cpusetutil.RetryReasonApplyFailed] = struct{}{}
+	}
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	return released, nil
+}
+
+func (p *DynamicPolicy) advisorPostCommitTargetSuperseded(target *advisorPostCommitTarget) bool {
+	p.cpuSetAdjustmentRetryMu.Lock()
+	released := target != nil &&
+		p.advisorPostCommitTarget == target &&
+		target.writerFenceReleased
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	return released && p.state != nil && p.state.GetRevision() != target.revision
+}
+
+// retireSupersededAdvisorPostCommitTarget removes a durable target only after a
+// released writer has advanced canonical revision. Its response-owned effects
+// were replayed before the fence release, so the old response is obsolete; the
+// caller must still reconcile cpuset from the latest canonical state.
+func (p *DynamicPolicy) retireSupersededAdvisorPostCommitTarget(target *advisorPostCommitTarget) error {
+	if err := p.removeAdvisorPostCommitCheckpoints(); err != nil {
+		return fmt.Errorf("remove superseded advisor post-commit checkpoints: %w", err)
+	}
+	p.cpuSetAdjustmentRetryMu.Lock()
+	p.releaseAdvisorPostCommitTargetFenceLocked(target)
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	return nil
+}
+
+func (p *DynamicPolicy) reconcileOrRetireAdvisorPostCommitTarget(
+	ctx context.Context,
+	target *advisorPostCommitTarget,
+	mode cpusetutil.CPUSetAdjustmentMode,
+) error {
+	if p.advisorPostCommitTargetSuperseded(target) {
+		if err := p.retireSupersededAdvisorPostCommitTarget(target); err != nil {
+			return err
+		}
+		return p.runCPUSetAdjustmentHandlers(ctx, mode)
+	}
+	return p.reconcileAdvisorPostCommitTarget(ctx, target, mode)
 }
 
 // reconcileAdvisorPostCommitTarget is the sole owner of advancing a committed
@@ -1507,7 +1657,7 @@ func (p *DynamicPolicy) retryLatestCPUSetAdjustment(
 
 	var adjustmentErr error
 	if target := p.currentAdvisorPostCommitTarget(); target != nil {
-		adjustmentErr = p.reconcileAdvisorPostCommitTarget(ctx, target, mode)
+		adjustmentErr = p.reconcileOrRetireAdvisorPostCommitTarget(ctx, target, mode)
 	} else {
 		adjustmentErr = p.runCPUSetAdjustmentHandlers(ctx, mode)
 	}

@@ -979,6 +979,7 @@ func TestAdvisorPostCommitRetryReplaysAllStagesUntilConverged(t *testing.T) {
 		require.False(t, p.hasPendingAdvisorPostCommitTarget(target.revision))
 		p.cpuSetAdjustmentRetryMu.Lock()
 		require.False(t, p.cpuSetAdjustmentRetryDirty)
+		require.NotContains(t, p.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
 		p.cpuSetAdjustmentRetryMu.Unlock()
 	})
 }
@@ -2717,6 +2718,12 @@ func TestAdvisorPostCommitCleanupRetryDoesNotRepeatSideEffects(t *testing.T) {
 	require.Error(t, err)
 	require.Equal(t, 1, applied)
 	require.Same(t, target, p.currentAdvisorPostCommitTarget())
+	p.cpuSetAdjustmentRetryMu.Lock()
+	p.cpuSetAdjustmentRetryDirty = true
+	p.cpuSetAdjustmentRetryReasons = map[cpusetutil.CPUSetAdjustmentRetryReason]struct{}{
+		cpusetutil.RetryReasonApplyFailed: {},
+	}
+	p.cpuSetAdjustmentRetryMu.Unlock()
 
 	require.NoError(t, os.Remove(blocker))
 	p.Lock()
@@ -2726,6 +2733,10 @@ func TestAdvisorPostCommitCleanupRetryDoesNotRepeatSideEffects(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, applied, "cleanup retry must not repeat post-commit side effects")
 	require.Nil(t, p.currentAdvisorPostCommitTarget())
+	p.cpuSetAdjustmentRetryMu.Lock()
+	require.False(t, p.cpuSetAdjustmentRetryDirty)
+	require.Nil(t, p.cpuSetAdjustmentRetryReasons)
+	p.cpuSetAdjustmentRetryMu.Unlock()
 }
 
 func TestAdvisorPostCommitAppliedMarkerSkipsSideEffectsAfterRestore(t *testing.T) {
@@ -2819,6 +2830,230 @@ func TestAdvisorPostCommitProgressIdentityPhaseGenerationAndNotification(t *test
 	require.Same(t, replacement, replaced.target)
 	require.NotEqual(t, applying.target, replaced.target)
 	require.Equal(t, advisorPostCommitPhasePublished, replaced.phase)
+}
+
+func TestAdvisorPostCommitProgressStuckOnlyForAgedPhysicalApply(t *testing.T) {
+	p := &DynamicPolicy{conf: config.NewConfiguration()}
+	threshold := advisorPostCommitStuckThreshold(p.conf)
+	for _, tc := range []struct {
+		name        string
+		phase       advisorPostCommitPhase
+		progressAge time.Duration
+		wantStuck   bool
+	}{
+		{
+			name:        "aged prepared",
+			phase:       advisorPostCommitPhasePrepared,
+			progressAge: threshold + time.Second,
+		},
+		{
+			name:        "aged published",
+			phase:       advisorPostCommitPhasePublished,
+			progressAge: threshold + time.Second,
+		},
+		{
+			name:        "fresh physical apply",
+			phase:       advisorPostCommitPhasePhysicalApply,
+			progressAge: threshold - time.Second,
+		},
+		{
+			name:        "aged physical apply",
+			phase:       advisorPostCommitPhasePhysicalApply,
+			progressAge: threshold + time.Second,
+			wantStuck:   true,
+		},
+		{
+			name:        "aged applied marker",
+			phase:       advisorPostCommitPhaseAppliedMarker,
+			progressAge: threshold + time.Second,
+		},
+		{
+			name:        "aged cleanup",
+			phase:       advisorPostCommitPhaseCleanup,
+			progressAge: threshold + time.Second,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := &advisorPostCommitTarget{
+				phase:          tc.phase,
+				lastProgressAt: time.Now().Add(-tc.progressAge),
+			}
+			require.Equal(t, tc.wantStuck, p.advisorPostCommitProgressStuck(advisorPostCommitProgress{
+				target:         target,
+				phase:          target.phase,
+				lastProgressAt: target.lastProgressAt,
+			}))
+		})
+	}
+}
+
+func recoverStuckAdvisorPostCommitTargetForTest(
+	p *DynamicPolicy,
+	target *advisorPostCommitTarget,
+) (bool, error) {
+	p.cpuSetAdjustmentRetryMu.Lock()
+	target.lastProgressAt = time.Now().Add(-advisorPostCommitStuckThreshold(p.conf) - time.Second)
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.Lock()
+	defer p.Unlock()
+	return p.recoverStuckAdvisorPostCommitTargetLocked(context.Background(), target)
+}
+
+func TestRecoverStuckAdvisorPostCommitTargetReleasesFenceButRetainsDurableReplay(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	p.advisorPostCommitCheckpointDir = t.TempDir()
+
+	target := p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+	p.recordAdvisorPostCommitProgress(target, advisorPostCommitPhasePhysicalApply)
+	require.NoError(t, p.storeAdvisorPostCommitTarget(target, p.advisorPostCommitStagingPath()))
+	targetPermit := p.newAdvisorStateWritePermit(target)
+	otherTarget := cloneAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, target.revision+1)
+	otherPermit := p.newAdvisorStateWritePermit(otherTarget)
+
+	released, err := recoverStuckAdvisorPostCommitTargetForTest(p, target)
+	require.NoError(t, err)
+	require.True(t, released)
+
+	require.Same(t, target, p.currentAdvisorPostCommitTarget())
+	require.FileExists(t, p.advisorPostCommitCheckpointPath())
+	require.FileExists(t, p.advisorPostCommitStagingPath())
+	require.Equal(t, advisorPostCommitPhaseCanonicalReconcile,
+		p.currentAdvisorPostCommitProgress().phase)
+	fenceTarget, _ := p.currentAdvisorPostCommitTargetAndChange()
+	require.Nil(t, fenceTarget)
+	p.cpuSetAdjustmentRetryMu.Lock()
+	_, targetPermitExists := p.advisorStateWritePermits[targetPermit]
+	require.False(t, targetPermitExists)
+	require.Same(t, otherTarget, p.advisorStateWritePermits[otherPermit])
+	require.True(t, p.cpuSetAdjustmentRetryDirty)
+	require.Contains(t, p.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
+	p.cpuSetAdjustmentRetryMu.Unlock()
+
+	p.Lock()
+	err = p.retryLatestCPUSetAdjustment(
+		context.Background(), cpusetutil.CPUSetAdjustmentModeRetry)
+	p.Unlock()
+	require.NoError(t, err)
+	require.Nil(t, p.currentAdvisorPostCommitTarget())
+	require.NoFileExists(t, p.advisorPostCommitCheckpointPath())
+	require.NoFileExists(t, p.advisorPostCommitStagingPath())
+}
+
+func TestRecoverStuckAdvisorPostCommitTargetRetainsWALWhenPayloadReplayFails(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	p.advisorPostCommitCheckpointDir = t.TempDir()
+
+	target := p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+	p.recordAdvisorPostCommitProgress(target, advisorPostCommitPhasePhysicalApply)
+
+	mockey.PatchConvey("payload replay fails closed", t, func() {
+		mockey.Mock((*DynamicPolicy).applyHeadroom).IncludeCurrentGoRoutine().
+			To(func(_ *DynamicPolicy, _ *advisorapi.ListAndWatchResponse) error {
+				return nil
+			}).Build()
+		mockey.Mock((*DynamicPolicy).applyCgroupConfigs).IncludeCurrentGoRoutine().
+			To(func(_ *DynamicPolicy, _ *advisorapi.ListAndWatchResponse) error {
+				return errors.New("cgroup payload unavailable")
+			}).Build()
+
+		released, err := recoverStuckAdvisorPostCommitTargetForTest(p, target)
+
+		require.ErrorContains(t, err, "cgroup payload unavailable")
+		require.False(t, released)
+		require.Same(t, target, p.currentAdvisorPostCommitTarget())
+		require.FileExists(t, p.advisorPostCommitCheckpointPath())
+	})
+}
+
+func TestRecoverStuckAdvisorPostCommitTargetRestoresDurableReplayAfterRestart(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	dir := t.TempDir()
+	first, err := getTestDynamicPolicyWithoutInitialization(topology, dir)
+	require.NoError(t, err)
+	require.NoError(t, first.state.CommitAdvisorState(
+		first.state.GetPodEntries(), first.state.GetMachineState(), false, false, true))
+	require.NotZero(t, first.state.GetRevision())
+	target := first.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, first.state.GetRevision())
+	first.recordAdvisorPostCommitProgress(target, advisorPostCommitPhasePhysicalApply)
+	released, err := recoverStuckAdvisorPostCommitTargetForTest(first, target)
+	require.NoError(t, err)
+	require.True(t, released)
+	require.FileExists(t, first.advisorPostCommitCheckpointPath())
+	require.NoError(t, first.state.CommitAdvisorState(
+		first.state.GetPodEntries(), first.state.GetMachineState(), false, false, true))
+	require.Greater(t, first.state.GetRevision(), target.revision)
+
+	restarted, err := getTestDynamicPolicyWithoutInitialization(topology, dir)
+	require.NoError(t, err)
+	require.NoError(t, restarted.prepareAdvisorPostCommitTargetOnStart())
+
+	require.Nil(t, restarted.currentAdvisorPostCommitTarget(),
+		"a newer canonical revision supersedes the handed-off target")
+	require.NoFileExists(t, restarted.advisorPostCommitCheckpointPath())
+	restarted.cpuSetAdjustmentRetryMu.Lock()
+	require.True(t, restarted.cpuSetAdjustmentRetryDirty)
+	require.Contains(t, restarted.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
+	restarted.cpuSetAdjustmentRetryMu.Unlock()
+}
+
+func TestRetrySupersededAdvisorPostCommitTargetReconcilesLatestCanonicalState(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	p.advisorPostCommitCheckpointDir = t.TempDir()
+	target := p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+	p.recordAdvisorPostCommitProgress(target, advisorPostCommitPhasePhysicalApply)
+	released, err := recoverStuckAdvisorPostCommitTargetForTest(p, target)
+	require.NoError(t, err)
+	require.True(t, released)
+	require.NoError(t, p.state.CommitAdvisorState(
+		p.state.GetPodEntries(), p.state.GetMachineState(), false, false, true))
+	require.Greater(t, p.state.GetRevision(), target.revision)
+	reconciled := 0
+	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"latest-canonical": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			reconciled++
+			return nil
+		},
+	}
+
+	p.Lock()
+	err = p.retryLatestCPUSetAdjustment(
+		context.Background(), cpusetutil.CPUSetAdjustmentModePeriodic)
+	p.Unlock()
+
+	require.NoError(t, err)
+	require.Equal(t, 1, reconciled)
+	require.Nil(t, p.currentAdvisorPostCommitTarget())
+	require.NoFileExists(t, p.advisorPostCommitCheckpointPath())
+}
+
+func TestRecoverStuckAdvisorPostCommitTargetWhileStoppingKeepsWAL(t *testing.T) {
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	p.advisorPostCommitCheckpointDir = t.TempDir()
+	target := p.publishAdvisorPostCommitTarget(
+		&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+	p.recordAdvisorPostCommitProgress(target, advisorPostCommitPhasePhysicalApply)
+	p.cpuSetAdjustmentRetryMu.Lock()
+	p.cpuSetAdjustmentRetryStopping = true
+	p.cpuSetAdjustmentRetryMu.Unlock()
+
+	released, err := recoverStuckAdvisorPostCommitTargetForTest(p, target)
+	require.NoError(t, err)
+	require.True(t, released)
+
+	require.Same(t, target, p.currentAdvisorPostCommitTarget())
+	require.FileExists(t, p.advisorPostCommitCheckpointPath())
+	require.Equal(t, advisorPostCommitPhaseCanonicalReconcile,
+		p.currentAdvisorPostCommitProgress().phase)
 }
 
 func TestRecoveredAdvisorPostCommitTargetStartsFreshProgressClock(t *testing.T) {

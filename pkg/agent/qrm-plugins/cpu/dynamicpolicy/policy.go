@@ -1389,7 +1389,7 @@ func (p *DynamicPolicy) acquireCPUSetAdjustmentExecutionLeaseLocked(
 		if err != nil {
 			return nil, fmt.Errorf("%s waiting for cpuset adjustment execution: %w", source, err)
 		}
-		if p.currentAdvisorPostCommitTarget() == nil {
+		if target, _ := p.currentAdvisorPostCommitTargetAndChange(); target == nil {
 			return releaseExecution, nil
 		}
 		releaseExecution.release()
@@ -1410,6 +1410,18 @@ func (p *DynamicPolicy) waitForPendingAdvisorPostCommitTargetLocked(
 		target, changed := p.currentAdvisorPostCommitTargetAndChange()
 		if target == nil {
 			return nil
+		}
+
+		// Release an aged physical-apply writer fence after replaying every
+		// response-owned side effect. The target and WAL remain available for a
+		// complete retry, so liveness does not trade away crash consistency.
+		if p.advisorPostCommitProgressStuck(p.currentAdvisorPostCommitProgress()) {
+			_, err := p.recoverStuckAdvisorPostCommitTargetLocked(ctx, target)
+			if err != nil {
+				return fmt.Errorf("%s recovering stuck advisor post-commit revision %d: %w",
+					source, target.revision, err)
+			}
+			continue
 		}
 
 		p.Unlock()

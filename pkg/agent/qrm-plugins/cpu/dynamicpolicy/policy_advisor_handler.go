@@ -627,7 +627,7 @@ func (p *DynamicPolicy) allocateByCPUAdvisorWithRevision(
 	// later frame while the source state has already advanced.
 	if target := p.currentAdvisorPostCommitTarget(); target != nil {
 		ctx, cancel := context.WithTimeout(executionCtx, cpuSetAdjustmentHandlerTimeout(p.conf))
-		reconcileErr := p.reconcileAdvisorPostCommitTarget(
+		reconcileErr := p.reconcileOrRetireAdvisorPostCommitTarget(
 			ctx, target, cpusetutil.CPUSetAdjustmentModeRetry)
 		cancel()
 		if reconcileErr != nil {

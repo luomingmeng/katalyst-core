@@ -493,19 +493,34 @@ func (p *DynamicPolicy) clearResidualStateAttempt(
 	progress := p.currentAdvisorPostCommitProgress()
 	if progress.target != nil {
 		sinceProgress := time.Since(progress.lastProgressAt)
-		if sinceProgress >= advisorPostCommitStuckThreshold(p.conf) {
-			return progress, fmt.Errorf(
-				"advisor post-commit target stuck: revision=%d phase=%s generation=%d target_age=%s since_progress=%s",
-				progress.revision, progress.phase, progress.generation,
-				time.Since(progress.createdAt), sinceProgress)
+		if p.advisorPostCommitProgressStuck(progress) {
+			// Release an aged physical-apply fence only when mature residuals
+			// need the writer. The target WAL remains the retry owner until all
+			// physical side effects converge.
+			if podsToDelete.Len() == 0 {
+				return progress, fmt.Errorf(
+					"advisor post-commit target stuck: revision=%d phase=%s generation=%d target_age=%s since_progress=%s",
+					progress.revision, progress.phase, progress.generation,
+					time.Since(progress.createdAt), sinceProgress)
+			}
+			released, err := p.recoverStuckAdvisorPostCommitTargetLocked(ctx, progress.target)
+			if err != nil {
+				return progress, fmt.Errorf("recover stuck advisor post-commit target: %w", err)
+			}
+			if !released {
+				return p.currentAdvisorPostCommitProgress(), nil
+			}
+			// The WAL remains durable while the released fence lets this
+			// revision-CAS cleanup supersede the blocked canonical state.
+		} else {
+			general.InfoS("defer residual state cleanup while advisor post-commit target is progressing",
+				"revision", progress.revision,
+				"phase", progress.phase,
+				"generation", progress.generation,
+				"targetAge", time.Since(progress.createdAt),
+				"sinceProgress", sinceProgress)
+			return progress, nil
 		}
-		general.InfoS("defer residual state cleanup while advisor post-commit target is progressing",
-			"revision", progress.revision,
-			"phase", progress.phase,
-			"generation", progress.generation,
-			"targetAge", time.Since(progress.createdAt),
-			"sinceProgress", sinceProgress)
-		return progress, nil
 	}
 
 	if podsToDelete.Len() > 0 {

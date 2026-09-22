@@ -36,6 +36,7 @@ import (
 	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent"
@@ -64,16 +65,23 @@ func newResidualCleanupLivenessPolicy(t *testing.T) *DynamicPolicy {
 
 func TestClearResidualStateProgressingTargetDefersHealthy(t *testing.T) {
 	p := newResidualCleanupLivenessPolicy(t)
-	p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+	target := p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+	p.cpuSetAdjustmentRetryMu.Lock()
+	target.lastProgressAt = time.Now().Add(-advisorPostCommitStuckThreshold(p.conf) - time.Second)
+	p.cpuSetAdjustmentRetryMu.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
 	require.NoError(t, p.clearResidualStateAfterPodList(ctx, nil))
+	require.Same(t, target, p.currentAdvisorPostCommitTarget(),
+		"an aged published target still owns durable publication and must not be abandoned")
+	require.FileExists(t, p.advisorPostCommitCheckpointPath())
 }
 
 func TestClearResidualStateUnchangedStuckTargetReportsError(t *testing.T) {
 	p := newResidualCleanupLivenessPolicy(t)
 	target := p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+	p.recordAdvisorPostCommitProgress(target, advisorPostCommitPhasePhysicalApply)
 	p.cpuSetAdjustmentRetryMu.Lock()
 	target.lastProgressAt = time.Now().Add(-advisorPostCommitStuckThreshold(p.conf) - time.Second)
 	p.cpuSetAdjustmentRetryMu.Unlock()
@@ -81,6 +89,39 @@ func TestClearResidualStateUnchangedStuckTargetReportsError(t *testing.T) {
 	err := p.clearResidualStateAfterPodList(context.Background(), nil)
 	require.Error(t, err)
 	require.ErrorContains(t, err, "stuck")
+}
+
+func TestClearResidualStateRecoversMatureResidualBehindStuckAdvisorTarget(t *testing.T) {
+	p := newResidualCleanupLivenessPolicy(t)
+	const podUID = "mature-residual-behind-stuck-target"
+	p.state.SetPodEntries(state.PodEntries{
+		podUID: {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{PodUid: podUID, ContainerName: "main"},
+			},
+		},
+	}, false)
+	p.residualHitMap = map[string]int64{
+		podUID: maxResidualTime.Nanoseconds() / stateCheckPeriod.Nanoseconds(),
+	}
+	target := p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
+	p.recordAdvisorPostCommitProgress(target, advisorPostCommitPhasePhysicalApply)
+	p.cpuSetAdjustmentRetryMu.Lock()
+	target.lastProgressAt = time.Now().Add(-advisorPostCommitStuckThreshold(p.conf) - time.Second)
+	p.cpuSetAdjustmentRetryMu.Unlock()
+	require.FileExists(t, p.advisorPostCommitCheckpointPath())
+
+	err := p.clearResidualStateAfterPodList(context.Background(), nil)
+	require.NoError(t, err)
+	require.NotContains(t, p.state.GetPodEntries(), podUID)
+	require.Same(t, target, p.currentAdvisorPostCommitTarget())
+	require.FileExists(t, p.advisorPostCommitCheckpointPath())
+	require.Equal(t, advisorPostCommitPhaseCanonicalReconcile,
+		p.currentAdvisorPostCommitProgress().phase)
+	p.cpuSetAdjustmentRetryMu.Lock()
+	require.True(t, p.cpuSetAdjustmentRetryDirty)
+	require.Contains(t, p.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
+	p.cpuSetAdjustmentRetryMu.Unlock()
 }
 
 func TestClearResidualStateAgesResidualOnlyOncePerInvocation(t *testing.T) {
