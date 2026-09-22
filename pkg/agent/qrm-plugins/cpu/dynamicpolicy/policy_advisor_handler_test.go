@@ -3239,76 +3239,77 @@ func TestDynamicPolicy_checkAllPodsQuota(t *testing.T) {
 
 	advisorTestMutex.Lock()
 	defer advisorTestMutex.Unlock()
-	mockey.PatchConvey("test checkAndApplyAllPodsQuota", t, func() {
-		mockey.Mock((*DynamicPolicy).getCurrentPathAllPodsDirAndMap).IncludeCurrentGoRoutine().Return(mockPodPathMap, mockPodDirs, nil).Build()
-		mockey.Mock((*DynamicPolicy).getPodAndRelativePath).IncludeCurrentGoRoutine().Return(mockPod, "test_relative_path", nil).Build()
-		mockey.Mock((*DynamicPolicy).applyAllContainersQuota).IncludeCurrentGoRoutine().Return(nil).Build()
-		mockey.Mock(cgroupmgr.ApplyCPUWithRelativePath).IncludeCurrentGoRoutine().Return(nil).Build()
-		mockey.Mock(cgroupmgr.GetCPUWithRelativePath).IncludeCurrentGoRoutine().Return(mockBG, nil).Build()
+	// Patch each target once and vary only the returned scenario state. Repeated
+	// patch/unpatch cycles are not reliable on arm64 and can leak stale text or
+	// miss the current goroutine while the complete package suite is running.
+	mockey.PatchConvey("checkAndApplyAllPodsQuota isolates scenario state", t, func() {
+		var (
+			podDiscoveryErr  error
+			podPathErr       error
+			cgroupReadErr    error
+			containerErr     error
+			cgroupWriteErr   error
+			cgroupReadCalls  int
+			containerCalls   int
+			cgroupWriteCalls int
+		)
 
-		err := p.checkAndApplyAllPodsQuota(mockCal, mockBG.CpuQuota)
-		convey.So(err, convey.ShouldBeNil)
+		mockey.Mock((*DynamicPolicy).getCurrentPathAllPodsDirAndMap).
+			To(func(_ *DynamicPolicy, _ string) (map[string]*v1.Pod, []string, error) {
+				return mockPodPathMap, mockPodDirs, podDiscoveryErr
+			}).Build()
+		mockey.Mock((*DynamicPolicy).getPodAndRelativePath).
+			To(func(_ *DynamicPolicy, _, _ string, _ map[string]*v1.Pod) (*v1.Pod, string, error) {
+				return mockPod, "test_relative_path", podPathErr
+			}).Build()
+		mockey.Mock((*DynamicPolicy).applyAllContainersQuota).
+			To(func(_ *DynamicPolicy, _ *v1.Pod, _ bool) error {
+				containerCalls++
+				return containerErr
+			}).Build()
+		mockey.Mock(cgroupmgr.GetCPUWithRelativePath).
+			To(func(_ string) (*common.CPUStats, error) {
+				cgroupReadCalls++
+				return mockBG, cgroupReadErr
+			}).Build()
+		mockey.Mock(cgroupmgr.ApplyCPUWithRelativePath).
+			To(func(_ string, _ *common.CPUData) error {
+				cgroupWriteCalls++
+				return cgroupWriteErr
+			}).Build()
 
-		err = p.checkAndApplyAllPodsQuota(mockCal, mockBG2.CpuQuota)
-		convey.So(err, convey.ShouldBeNil)
+		for _, quota := range []int64{mockBG.CpuQuota, mockBG2.CpuQuota, mockBG3.CpuQuota} {
+			assert.NoError(t, p.checkAndApplyAllPodsQuota(mockCal, quota), "applies pod quota")
+		}
 
-		err = p.checkAndApplyAllPodsQuota(mockCal, mockBG3.CpuQuota)
-		convey.So(err, convey.ShouldBeNil)
-	})
+		podDiscoveryErr = mockErr
+		assert.Error(t, p.checkAndApplyAllPodsQuota(mockCal, mockBG.CpuQuota), "returns pod discovery failure")
+		podDiscoveryErr = nil
 
-	mockey.PatchConvey("test checkAndApplyAllPodsQuota", t, func() {
-		mockey.Mock((*DynamicPolicy).getCurrentPathAllPodsDirAndMap).IncludeCurrentGoRoutine().Return(nil, nil, mockErr).Build()
-		err := p.checkAndApplyAllPodsQuota(mockCal, mockBG.CpuQuota)
-		convey.So(err, convey.ShouldNotBeNil)
-	})
+		podPathErr = mockErr
+		cgroupReadCallsBefore := cgroupReadCalls
+		containerCallsBefore := containerCalls
+		cgroupWriteCallsBefore := cgroupWriteCalls
+		assert.NoError(t, p.checkAndApplyAllPodsQuota(mockCal, mockBG.CpuQuota), "skips unresolved pod path")
+		assert.Equal(t, cgroupReadCallsBefore, cgroupReadCalls, "does not read cgroup after unresolved pod path")
+		assert.Equal(t, containerCallsBefore, containerCalls, "does not update containers after unresolved pod path")
+		assert.Equal(t, cgroupWriteCallsBefore, cgroupWriteCalls, "does not write cgroup after unresolved pod path")
+		podPathErr = nil
 
-	mockey.PatchConvey("test checkAndApplyAllPodsQuota", t, func() {
-		mockey.Mock((*DynamicPolicy).getCurrentPathAllPodsDirAndMap).IncludeCurrentGoRoutine().Return(mockPodPathMap, mockPodDirs, nil).Build()
-		mockey.Mock((*DynamicPolicy).getPodAndRelativePath).IncludeCurrentGoRoutine().Return(mockPod, "test_relative_path", mockErr).Build()
-		err := p.checkAndApplyAllPodsQuota(mockCal, mockBG.CpuQuota)
-		convey.So(err, convey.ShouldBeNil)
-	})
+		cgroupReadErr = mockErr
+		assert.Error(t, p.checkAndApplyAllPodsQuota(mockCal, mockBG.CpuQuota), "returns cgroup read failure")
+		cgroupReadErr = nil
 
-	mockey.PatchConvey("test checkAndApplyAllPodsQuota", t, func() {
-		mockey.Mock((*DynamicPolicy).getCurrentPathAllPodsDirAndMap).IncludeCurrentGoRoutine().Return(mockPodPathMap, mockPodDirs, nil).Build()
-		mockey.Mock((*DynamicPolicy).getPodAndRelativePath).IncludeCurrentGoRoutine().Return(mockPod, "test_relative_path", nil).Build()
-		mockey.Mock(cgroupmgr.GetCPUWithRelativePath).IncludeCurrentGoRoutine().Return(mockBG, mockErr).Build()
-		err := p.checkAndApplyAllPodsQuota(mockCal, mockBG.CpuQuota)
-		convey.So(err, convey.ShouldNotBeNil)
-	})
+		containerErr = mockErr
+		for _, quota := range []int64{mockBG.CpuQuota, mockBG2.CpuQuota, mockBG3.CpuQuota} {
+			assert.NoError(t, p.checkAndApplyAllPodsQuota(mockCal, quota), "skips container quota failure")
+		}
+		containerErr = nil
 
-	mockey.PatchConvey("test checkAndApplyAllPodsQuota", t, func() {
-		mockey.Mock((*DynamicPolicy).getCurrentPathAllPodsDirAndMap).IncludeCurrentGoRoutine().Return(mockPodPathMap, mockPodDirs, nil).Build()
-		mockey.Mock((*DynamicPolicy).getPodAndRelativePath).IncludeCurrentGoRoutine().Return(mockPod, "test_relative_path", nil).Build()
-		mockey.Mock((*DynamicPolicy).applyAllContainersQuota).IncludeCurrentGoRoutine().Return(mockErr).Build()
-		mockey.Mock(cgroupmgr.ApplyCPUWithRelativePath).IncludeCurrentGoRoutine().Return(nil).Build()
-		mockey.Mock(cgroupmgr.GetCPUWithRelativePath).IncludeCurrentGoRoutine().Return(mockBG, nil).Build()
-
-		err := p.checkAndApplyAllPodsQuota(mockCal, mockBG.CpuQuota)
-		convey.So(err, convey.ShouldBeNil)
-
-		err = p.checkAndApplyAllPodsQuota(mockCal, mockBG2.CpuQuota)
-		convey.So(err, convey.ShouldBeNil)
-
-		err = p.checkAndApplyAllPodsQuota(mockCal, mockBG3.CpuQuota)
-		convey.So(err, convey.ShouldBeNil)
-	})
-
-	mockey.PatchConvey("test checkAndApplyAllPodsQuota", t, func() {
-		mockey.Mock((*DynamicPolicy).getCurrentPathAllPodsDirAndMap).IncludeCurrentGoRoutine().Return(mockPodPathMap, mockPodDirs, nil).Build()
-		mockey.Mock((*DynamicPolicy).getPodAndRelativePath).IncludeCurrentGoRoutine().Return(mockPod, "test_relative_path", nil).Build()
-		mockey.Mock((*DynamicPolicy).applyAllContainersQuota).IncludeCurrentGoRoutine().Return(nil).Build()
-		mockey.Mock(cgroupmgr.ApplyCPUWithRelativePath).IncludeCurrentGoRoutine().Return(mockErr).Build()
-		mockey.Mock(cgroupmgr.GetCPUWithRelativePath).IncludeCurrentGoRoutine().Return(mockBG, nil).Build()
-
-		err := p.checkAndApplyAllPodsQuota(mockCal, mockBG.CpuQuota)
-		convey.So(err, convey.ShouldNotBeNil)
-
-		err = p.checkAndApplyAllPodsQuota(mockCal, mockBG2.CpuQuota)
-		convey.So(err, convey.ShouldNotBeNil)
-
-		err = p.checkAndApplyAllPodsQuota(mockCal, mockBG3.CpuQuota)
-		convey.So(err, convey.ShouldNotBeNil)
+		cgroupWriteErr = mockErr
+		for _, quota := range []int64{mockBG.CpuQuota, mockBG2.CpuQuota, mockBG3.CpuQuota} {
+			assert.Error(t, p.checkAndApplyAllPodsQuota(mockCal, quota), "returns cgroup write failure")
+		}
 	})
 }
 
