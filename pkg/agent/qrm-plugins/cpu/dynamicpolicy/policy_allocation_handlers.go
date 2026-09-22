@@ -4334,12 +4334,9 @@ func selectAdmissionSteadyReclaimTarget(
 			"mandatory reclaim CPUs %s are outside eligibility %s",
 			completedMandatory.String(), eligible.String())
 	}
-	if completedMandatory.Size() > softTarget {
-		return machine.NewCPUSet(), fmt.Errorf(
-			"mandatory reserve size %d exceeds steady target %d",
-			completedMandatory.Size(), softTarget)
-	}
 
+	// Mandatory identities are a hard floor, while softTarget only caps optional
+	// supplementation; completing a mandatory sibling core may exceed that cap.
 	selected := completedMandatory.Clone()
 	budget := softTarget - selected.Size()
 	if budget <= 0 {
@@ -4597,7 +4594,7 @@ func (p *DynamicPolicy) selectNumaBindingReclaimPartitionWithPreference(
 			candidates := reclaimEligible.Difference(selectedInNUMA)
 			var supplement machine.CPUSet
 			if preference == nil {
-				supplement = takeCoreAlignedCPUSet(
+				supplement = selectAdmissionCoreAlignedSupplement(
 					p.machineInfo.CPUTopology,
 					candidates,
 					derivedFloor.Intersection(candidates),
@@ -4607,11 +4604,9 @@ func (p *DynamicPolicy) selectNumaBindingReclaimPartitionWithPreference(
 				supplement = takeReclaimSupplementWithPreference(
 					p.machineInfo.CPUTopology, candidates, remaining, preference)
 			}
-			if supplement.Size() != remaining {
-				return machine.NewCPUSet(), fmt.Errorf(
-					"select NUMA %d reclaim reserve from shared eligibility: selected %d of %d core-aligned CPUs",
-					numaID, supplement.Size(), remaining)
-			}
+			// The target is a soft ceiling after mandatory replacement. Mixed-SMT
+			// cores may not compose the exact remainder, so keep the largest
+			// core-aligned supplement that fits instead of rejecting admission.
 			selectedInNUMA = selectedInNUMA.Union(supplement)
 		}
 		selected = selected.Union(selectedInNUMA)

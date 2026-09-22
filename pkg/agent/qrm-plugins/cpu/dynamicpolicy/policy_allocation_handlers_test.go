@@ -1917,7 +1917,7 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_nonReclaimableUsesConfiguredStead
 	require.True(t, result.Intersection(reclaim).IsEmpty(), "result=%s reclaim=%s", result, reclaim)
 }
 
-func TestDynamicPolicy_deriveSteadyReclaimFloorRejectsIdentitiesAboveConfiguredTarget(t *testing.T) {
+func TestDynamicPolicy_deriveSteadyReclaimFloorPreservesCompletedMandatoryCoreAboveSoftTarget(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
@@ -1935,8 +1935,9 @@ func TestDynamicPolicy_deriveSteadyReclaimFloorRejectsIdentitiesAboveConfiguredT
 	got, err := p.deriveSteadyReclaimFloor(map[int]machine.CPUSet{
 		0: topology.CPUDetails.CPUsInNUMANodes(0),
 	})
-	require.ErrorContains(t, err, "mandatory reserve size 4 exceeds steady target 2")
-	require.True(t, got.IsEmpty(), "got=%s", got)
+	require.NoError(t, err)
+	require.Equal(t, machine.NewCPUSet(0, 1, 4, 5), got)
+	requireCoreAligned(t, topology, got)
 }
 
 func TestDynamicPolicy_deriveSteadyReclaimFloorFallsBackWhenReservedIdentityLeavesEligibility(t *testing.T) {
@@ -2127,9 +2128,13 @@ func TestSelectAdmissionSteadyReclaimTargetKeepsReservedFallback(t *testing.T) {
 }
 
 func newMixedSMTAdmissionTopology() *machine.CPUTopology {
+	return newAdmissionTopologyWithThreads(4, 3, 2, 2)
+}
+
+func newAdmissionTopologyWithThreads(threadsPerCore ...int) *machine.CPUTopology {
 	details := machine.CPUDetails{}
 	nextCPU := 0
-	for coreID, threads := range []int{4, 3, 2, 2} {
+	for coreID, threads := range threadsPerCore {
 		for thread := 0; thread < threads; thread++ {
 			details[nextCPU] = machine.CPUTopoInfo{
 				NUMANodeID: 0,
@@ -2141,7 +2146,7 @@ func newMixedSMTAdmissionTopology() *machine.CPUTopology {
 	}
 	return &machine.CPUTopology{
 		NumCPUs:      nextCPU,
-		NumCores:     4,
+		NumCores:     len(threadsPerCore),
 		NumSockets:   1,
 		NumNUMANodes: 1,
 		CPUDetails:   details,
@@ -2449,6 +2454,33 @@ func TestDynamicPolicy_selectNumaBindingReclaimPartitionFallsBackWhenMandatoryId
 	require.NoError(t, err)
 	require.True(t, derivedFloor.Equals(got), "want=%s got=%s", derivedFloor, got)
 	require.True(t, got.Intersection(staleReserve).IsEmpty(), "got=%s", got)
+}
+
+func TestDynamicPolicy_selectNumaBindingReclaimPartitionRoundsMixedSMTSupplementDown(t *testing.T) {
+	t.Parallel()
+
+	topology := newAdmissionTopologyWithThreads(4, 3, 2, 2, 1)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.reservedReclaimedCPUSet = machine.NewCPUSet()
+	p.reservedReclaimedCPUsSize = 0
+
+	mandatory := machine.NewCPUSet(0, 1, 2, 3)
+	derivedFloor := machine.NewCPUSet(4, 5, 6, 7, 8)
+	eligible := topology.CPUDetails.CPUs().Difference(machine.NewCPUSet(11))
+	got, err := p.selectNumaBindingReclaimPartition(
+		derivedFloor,
+		map[int]machine.CPUSet{0: eligible.Difference(mandatory)},
+		map[int]machine.CPUSet{0: eligible},
+		[]uint64{0},
+		true,
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, mandatory, got)
+	requireCoreAligned(t, topology, got)
 }
 
 // TestDynamicPolicy_generateNUMABindingPoolsCPUSetInPlace verifies the logic of generating CPU sets for NUMA-binding pools.
