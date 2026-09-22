@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/bytedance/mockey"
+	"github.com/gogo/protobuf/proto"
 	"github.com/smartystreets/goconvey/convey"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -40,6 +41,8 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/advisorsvc"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead"
+	bulkheadtopology "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
@@ -50,6 +53,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
+	cgroupclient "github.com/kubewharf/katalyst-core/pkg/util/cgroup/client"
 	"github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 	cgroupmgr "github.com/kubewharf/katalyst-core/pkg/util/cgroup/manager"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
@@ -560,6 +564,431 @@ func TestAllocateByCPUAdvisorPendingPostCommitApplyBlocksStageAdvanceAndRetriesS
 	require.Equal(t, stagedEntries, policy.state.GetPodEntries())
 	require.False(t, policy.hasAnyPendingAdvisorPostCommitTarget())
 	require.Equal(t, 3, applied)
+}
+
+func TestAdvisorReplacementTransactionRetainsExactTargetAcrossRetry(t *testing.T) {
+	cgroupClient := &replacementRecordingCgroupClient{}
+	cgroupFactoryPatch := mockey.Mock(cgroupclient.NewCgroupClient).
+		To(func() cgroupclient.CgroupClient {
+			return cgroupClient
+		}).Build()
+	defer cgroupFactoryPatch.UnPatch()
+
+	policy, resp, topology, reclaimBefore, _ := productionReplacementSourcePoolFixture(t)
+	entries := policy.state.GetPodEntries()
+	entries["dedicated-pod"]["main"].RampUp = false
+	policy.state.SetPodEntries(entries, false)
+	checkpointDir := t.TempDir()
+	policy.advisorPostCommitCheckpointDir = checkpointDir
+	policy.cpuSetAdjustmentRetryMu.Lock()
+	policy.cpuSetAdjustmentRetryStopping = true
+	policy.cpuSetAdjustmentRetryMu.Unlock()
+
+	expectedDedicated := machine.NewCPUSet(
+		33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 45,
+		97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 109,
+	)
+	expectedReclaim := machine.NewCPUSet(32, 44, 46, 47, 96, 108, 110, 111)
+	expectedPrimary := topology.CPUDetails.CPUs().Difference(expectedReclaim)
+	hierarchy := newReplacementRecordingHierarchyDriver(
+		topology, reclaimBefore, "test-primary", "test-reclaim", "test-reclaim/numa-")
+	cgroupClient.driver = hierarchy
+	hierarchy.failFirstGrow = true
+	bulkheadConfig := policy.conf.CPUQRMPluginConfig.BulkheadConfiguration
+	bulkheadConfig.BulkheadPrimaryRelPath = "test-primary"
+	bulkheadConfig.BulkheadReclaimRelPaths = []string{"test-reclaim"}
+	bulkheadConfig.BulkheadReclaimNumaPrefixes = []string{"test-reclaim/numa-"}
+	bulkheadConfig.BulkheadPartitionRelPaths = nil
+	bulkheadConfig.BulkheadReclaimSiblingRelPaths = nil
+	bulkheadConfig.EnableBulkheadReclaimSiblings = false
+	dynamicConfig := policy.dynamicConfig.GetDynamicConfiguration()
+	dynamicConfig.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.Enable = true
+	dynamicConfig.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.EnableBulkheadCpusetTopology = true
+	dynamicConfig.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.EnableBulkheadCpusetMems = false
+	dynamicConfig.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.EnableBulkheadWorkqueue = false
+	dynamicConfig.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.EnableBulkheadSystemService = false
+	manager, err := bulkhead.NewManager(policy.conf)
+	require.NoError(t, err)
+	policy.bulkheadManager = manager
+	require.Empty(t, policy.cpuSetAdjustmentHandlers)
+	require.NoError(t, policy.RegisterCPUSetAdjustmentHandler(
+		"bulkhead", policy.bulkheadManager.RunCPUSetAdjustmentHandlers))
+	request := &advisorapi.GetAdviceRequest{
+		Entries: map[string]*advisorapi.ContainerAllocationInfoEntries{
+			"dedicated-pod": {
+				Entries: map[string]*advisorapi.ContainerAllocationInfo{
+					"main": {
+						Metadata: &advisorsvc.ContainerMetadata{
+							PodUid:        "dedicated-pod",
+							ContainerName: "main",
+							QosLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+						},
+						AllocationInfo: &advisorapi.AllocationInfo{RampUp: false},
+					},
+				},
+			},
+		},
+	}
+	featureGates := map[string]*advisorsvc.FeatureGate{
+		feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition: {
+			Name: feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
+		},
+	}
+
+	preCommitRevision := policy.state.GetRevision()
+	stagingPath := policy.advisorPostCommitStagingPath()
+	activePath := policy.advisorPostCommitCheckpointPath()
+	var preparedTarget *advisorPostCommitTarget
+	preCASObservations := 0
+	policy.allocationHooks = append(policy.allocationHooks, func(_, _ *state.AllocationInfo) error {
+		current := policy.currentAdvisorPostCommitTarget()
+		if current == nil || !current.prepared {
+			return nil
+		}
+		preCASObservations++
+		require.Equal(t, preCommitRevision, policy.state.GetRevision(),
+			"canonical revision must not advance before the prepared target is durable")
+		require.FileExists(t, stagingPath,
+			"the staging WAL must be durable before the canonical CAS")
+		require.NoFileExists(t, activePath,
+			"the active WAL must not be published before the canonical CAS")
+		require.Equal(t, preCommitRevision, current.preCommitRevision)
+		require.Equal(t, preCommitRevision+1, current.revision)
+		require.True(t, proto.Equal(resp, current.response))
+		staged, loadErr := loadAdvisorPostCommitTarget(
+			stagingPath, policy.machineInfo.CPUTopology)
+		require.NoError(t, loadErr)
+		require.True(t, advisorPostCommitTargetsEqual(current, staged),
+			"the in-memory prepared target and durable staging WAL must be identical")
+		if preparedTarget == nil {
+			preparedTarget = current
+		} else {
+			require.Same(t, preparedTarget, current,
+				"all pre-CAS hooks must observe one immutable prepared target")
+		}
+		return nil
+	})
+
+	err = policy.allocateByCPUAdvisor(request, resp, featureGates)
+	require.ErrorContains(t, err, "injected hierarchy grow failure")
+	require.Positive(t, preCASObservations)
+	target := policy.currentAdvisorPostCommitTarget()
+	require.NotNil(t, target)
+	require.Same(t, preparedTarget, target)
+	require.Same(t, target, policy.currentAdvisorPostCommitTarget())
+	committedRevision := preCommitRevision + 1
+	require.Equal(t, committedRevision, policy.state.GetRevision(),
+		"the first attempt must CAS-commit exactly once")
+	require.NoFileExists(t, stagingPath)
+	require.FileExists(t, activePath)
+	require.Equal(t, expectedDedicated,
+		policy.state.GetAllocationInfo("dedicated-pod", "main").AllocationResult)
+	require.Equal(t, expectedReclaim,
+		policy.state.GetAllocationInfo(
+			commonstate.PoolNameReclaim, commonstate.FakedContainerName).AllocationResult)
+
+	active, err := loadAdvisorPostCommitTarget(activePath, policy.machineInfo.CPUTopology)
+	require.NoError(t, err)
+	require.Equal(t, target.revision, active.revision)
+	require.True(t, proto.Equal(resp, active.response))
+	requireMigrationCheckpointTransitionEqual(
+		t, target.migrationCheckpointTransition, active.migrationCheckpointTransition)
+	firstAttempt := append([]replacementHierarchyWrite(nil), hierarchy.writes...)
+	require.Equal(t, []replacementHierarchyWrite{
+		{kind: replacementHierarchyWriteDrain, rel: "test-reclaim/numa-2", target: "32,46-47,96,108,110-111"},
+		{kind: replacementHierarchyWriteDrain, rel: "test-reclaim", target: "32,46-47,96,108,110-111"},
+		{kind: replacementHierarchyWriteDrain, rel: "test-primary", target: "0-31,33-43,45,48-95,97-107,112-127"},
+		{kind: replacementHierarchyWriteGrow, rel: "test-reclaim", target: expectedReclaim.String()},
+	}, firstAttempt)
+
+	require.NoError(t, os.Mkdir(stagingPath, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(stagingPath, "block-cleanup"), []byte("x"), 0o600))
+	err = policy.allocateByCPUAdvisor(request, resp, featureGates)
+	require.ErrorContains(t, err, "previous advisor post-commit apply")
+	require.ErrorContains(t, err, "remove reconciled advisor post-commit checkpoints")
+	reconciledRevision := committedRevision + 1
+	require.Equal(t, reconciledRevision, policy.state.GetRevision(),
+		"the successful physical retry must commit its adjustment override exactly once")
+	require.Equal(t, target.revision, policy.currentAdvisorPostCommitTarget().revision)
+	require.True(t, proto.Equal(resp, policy.currentAdvisorPostCommitTarget().response))
+	requireMigrationCheckpointTransitionEqual(t, target.migrationCheckpointTransition,
+		policy.currentAdvisorPostCommitTarget().migrationCheckpointTransition)
+	retryWrites := hierarchy.writes[len(firstAttempt):]
+	require.NotEmpty(t, retryWrites)
+	require.Equal(t, []replacementHierarchyWrite{
+		{kind: replacementHierarchyWriteGrow, rel: "test-reclaim", target: expectedReclaim.String()},
+		{kind: replacementHierarchyWriteGrow, rel: "test-primary", target: expectedPrimary.String()},
+		{kind: replacementHierarchyWriteGrow, rel: "test-reclaim/numa-2", target: expectedReclaim.String()},
+	}, retryWrites)
+	require.Equal(t, expectedPrimary, hierarchy.entries["test-primary"].CPUs)
+	require.Equal(t, expectedReclaim, hierarchy.entries["test-reclaim"].CPUs)
+	require.Equal(t, expectedReclaim, hierarchy.entries["test-reclaim/numa-2"].CPUs)
+	require.Equal(t, len(firstAttempt)+len(retryWrites), len(hierarchy.writes),
+		"applied-marker cleanup failure must not replay hierarchy writes")
+	require.Same(t, target, policy.currentAdvisorPostCommitTarget(),
+		"writer fence must remain until WAL cleanup succeeds")
+	require.True(t, target.cleanupPending)
+	marked, err := loadAdvisorPostCommitTarget(activePath, policy.machineInfo.CPUTopology)
+	require.NoError(t, err)
+	require.True(t, marked.applied, "applied marker must be durable before cleanup")
+	require.Equal(t, target.revision, marked.revision)
+	require.True(t, proto.Equal(resp, marked.response))
+	requireMigrationCheckpointTransitionEqual(
+		t, target.migrationCheckpointTransition, marked.migrationCheckpointTransition)
+	require.Error(t, policy.state.SetMachineState(policy.state.GetMachineState(), false),
+		"cleanup failure must retain the writer fence")
+
+	require.NoError(t, os.Remove(filepath.Join(stagingPath, "block-cleanup")))
+	require.NoError(t, os.Remove(stagingPath))
+	require.NoError(t, policy.allocateByCPUAdvisor(request, resp, featureGates))
+	require.Equal(t, reconciledRevision, policy.state.GetRevision(),
+		"cleanup-only retry must not advance the committed revision")
+	require.Equal(t, len(firstAttempt)+len(retryWrites), len(hierarchy.writes),
+		"cleanup retry must not replay the physical target")
+	require.Nil(t, policy.currentAdvisorPostCommitTarget())
+	require.NoFileExists(t, activePath)
+	require.NoFileExists(t, stagingPath)
+	require.NoError(t, policy.ensureCPUStateWriterAllowed(
+		policy.state.GetRevision(), "replacement cleanup", nil),
+		"writer fence must be released only after cleanup")
+}
+
+type replacementHierarchyWriteKind string
+
+const (
+	replacementHierarchyWriteDrain replacementHierarchyWriteKind = "drain"
+	replacementHierarchyWriteGrow  replacementHierarchyWriteKind = "expand"
+)
+
+type replacementHierarchyWrite struct {
+	kind   replacementHierarchyWriteKind
+	rel    string
+	target string
+}
+
+type replacementRecordingHierarchyDriver struct {
+	entries       map[string]bulkheadtopology.EntryState
+	children      map[string][]bulkheadtopology.ChildRef
+	roots         []bulkheadtopology.RootRef
+	writes        []replacementHierarchyWrite
+	failFirstGrow bool
+}
+
+func newReplacementRecordingHierarchyDriver(
+	cpuTopology *machine.CPUTopology,
+	reclaimBefore machine.CPUSet,
+	primaryRel, reclaimRel, numaPrefix string,
+) *replacementRecordingHierarchyDriver {
+	allCPUs := cpuTopology.CPUDetails.CPUs()
+	driver := &replacementRecordingHierarchyDriver{
+		entries:  make(map[string]bulkheadtopology.EntryState),
+		children: make(map[string][]bulkheadtopology.ChildRef),
+	}
+	driver.add(primaryRel, allCPUs.Difference(reclaimBefore), "0-3")
+	driver.add(reclaimRel, reclaimBefore, "0-3")
+	driver.add("sys", allCPUs, "0-3")
+	driver.roots = []bulkheadtopology.RootRef{
+		{Rel: primaryRel, Identity: driver.entries[primaryRel].Identity},
+		{Rel: reclaimRel, Identity: driver.entries[reclaimRel].Identity},
+		{Rel: "sys", Identity: driver.entries["sys"].Identity},
+	}
+	for _, numaID := range cpuTopology.CPUDetails.NUMANodes().ToSliceInt() {
+		rel := fmt.Sprintf("%s%d", numaPrefix, numaID)
+		driver.add(rel, reclaimBefore.Intersection(cpuTopology.CPUDetails.CPUsInNUMANodes(numaID)),
+			fmt.Sprintf("%d", numaID))
+		driver.children[reclaimRel] = append(driver.children[reclaimRel],
+			bulkheadtopology.ChildRef{
+				Name: filepath.Base(rel), Identity: driver.entries[rel].Identity,
+			})
+	}
+	return driver
+}
+
+func (d *replacementRecordingHierarchyDriver) add(rel string, cpus machine.CPUSet, mems string) {
+	d.entries[rel] = bulkheadtopology.EntryState{
+		Rel: rel, Identity: replacementHierarchyIdentity(rel),
+		CPUs: cpus.Clone(), ConfiguredCPUs: cpus.Clone(),
+		Mems: mems, ConfiguredMems: mems,
+	}
+}
+
+func (d *replacementRecordingHierarchyDriver) Close() error { return nil }
+
+func (d *replacementRecordingHierarchyDriver) Roots(context.Context) ([]bulkheadtopology.RootRef, error) {
+	return append([]bulkheadtopology.RootRef(nil), d.roots...), nil
+}
+
+func (d *replacementRecordingHierarchyDriver) StatIdentity(
+	_ context.Context, rel string,
+) (bulkheadtopology.CgroupIdentity, error) {
+	entry, ok := d.entries[rel]
+	if !ok {
+		return bulkheadtopology.CgroupIdentity{}, os.ErrNotExist
+	}
+	return entry.Identity, nil
+}
+
+func (d *replacementRecordingHierarchyDriver) ReadEntry(
+	_ context.Context, rel string,
+) (bulkheadtopology.EntryState, error) {
+	entry, ok := d.entries[rel]
+	if !ok {
+		return bulkheadtopology.EntryState{}, os.ErrNotExist
+	}
+	return cloneReplacementHierarchyEntry(entry), nil
+}
+
+func (d *replacementRecordingHierarchyDriver) ReadEntryWithActivity(
+	ctx context.Context,
+	rel string,
+	identity bulkheadtopology.CgroupIdentity,
+) (bulkheadtopology.EntryState, error) {
+	entry, err := d.ReadEntry(ctx, rel)
+	if err != nil {
+		return bulkheadtopology.EntryState{}, err
+	}
+	if entry.Identity != identity {
+		return bulkheadtopology.EntryState{}, bulkheadtopology.ErrCgroupIdentityChanged
+	}
+	entry.Activity = bulkheadtopology.CgroupActivity{
+		TasksEmpty: true, CgroupProcsEmpty: true, Childless: len(d.children[rel]) == 0,
+	}
+	return entry, nil
+}
+
+func (d *replacementRecordingHierarchyDriver) ListChildren(
+	_ context.Context, rel string,
+) ([]bulkheadtopology.ChildRef, error) {
+	return append([]bulkheadtopology.ChildRef(nil), d.children[rel]...), nil
+}
+
+func (d *replacementRecordingHierarchyDriver) WriteCPUs(
+	_ context.Context,
+	rel string,
+	identity bulkheadtopology.CgroupIdentity,
+	cpus machine.CPUSet,
+) error {
+	entry, ok := d.entries[rel]
+	if !ok {
+		return os.ErrNotExist
+	}
+	if entry.Identity != identity {
+		return bulkheadtopology.ErrCgroupIdentityChanged
+	}
+	kind := replacementHierarchyWriteDrain
+	if cpus.Size() > entry.ConfiguredCPUs.Size() {
+		kind = replacementHierarchyWriteGrow
+	}
+	d.writes = append(d.writes, replacementHierarchyWrite{
+		kind: kind, rel: rel, target: cpus.String(),
+	})
+	if kind == replacementHierarchyWriteGrow && d.failFirstGrow {
+		d.failFirstGrow = false
+		return fmt.Errorf("injected hierarchy grow failure")
+	}
+	entry.CPUs = cpus.Clone()
+	entry.ConfiguredCPUs = cpus.Clone()
+	d.entries[rel] = entry
+	return nil
+}
+
+func (d *replacementRecordingHierarchyDriver) WriteMems(
+	_ context.Context,
+	rel string,
+	identity bulkheadtopology.CgroupIdentity,
+	mems string,
+) error {
+	entry, ok := d.entries[rel]
+	if !ok {
+		return os.ErrNotExist
+	}
+	if entry.Identity != identity {
+		return bulkheadtopology.ErrCgroupIdentityChanged
+	}
+	entry.Mems = mems
+	entry.ConfiguredMems = mems
+	d.entries[rel] = entry
+	return nil
+}
+
+func (*replacementRecordingHierarchyDriver) Classify(
+	err error, _ bulkheadtopology.HierarchyOperation,
+) bulkheadtopology.HierarchyErrorClass {
+	if os.IsNotExist(err) {
+		return bulkheadtopology.HierarchyErrorStale
+	}
+	return bulkheadtopology.HierarchyErrorInvalid
+}
+
+func (*replacementRecordingHierarchyDriver) Capabilities() bulkheadtopology.HierarchyCapabilities {
+	return bulkheadtopology.HierarchyCapabilities{
+		StableIdentity: true, KernelParentContainment: true,
+	}
+}
+
+type replacementRecordingCgroupClient struct {
+	cgroupclient.FakeCgroupClient
+	driver *replacementRecordingHierarchyDriver
+}
+
+func (c *replacementRecordingCgroupClient) Version(context.Context) cgroupclient.CgroupVersion {
+	return cgroupclient.CgroupVersionV1
+}
+
+func (c *replacementRecordingCgroupClient) SnapshotDriver() bulkheadtopology.HierarchyDriver {
+	return c.driver
+}
+
+func (c *replacementRecordingCgroupClient) StatDir(
+	ctx context.Context, rel string,
+) (time.Time, error) {
+	_, err := c.driver.StatIdentity(ctx, rel)
+	return time.Time{}, err
+}
+
+func (c *replacementRecordingCgroupClient) ListChildren(
+	ctx context.Context, rel string,
+) ([]string, error) {
+	children, err := c.driver.ListChildren(ctx, rel)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(children))
+	for _, child := range children {
+		names = append(names, child.Name)
+	}
+	return names, nil
+}
+
+func replacementHierarchyIdentity(rel string) bulkheadtopology.CgroupIdentity {
+	var inode uint64 = 1
+	for _, value := range []byte(rel) {
+		inode = inode*131 + uint64(value)
+	}
+	return bulkheadtopology.CgroupIdentity{Device: 1, Inode: inode}
+}
+
+func cloneReplacementHierarchyEntry(
+	entry bulkheadtopology.EntryState,
+) bulkheadtopology.EntryState {
+	entry.CPUs = entry.CPUs.Clone()
+	entry.ConfiguredCPUs = entry.ConfiguredCPUs.Clone()
+	return entry
+}
+
+func requireMigrationCheckpointTransitionEqual(
+	t *testing.T,
+	expected, actual steadyFakeNUMAMigrationCheckpointTransition,
+) {
+	t.Helper()
+	require.Equal(t, expected.kind, actual.kind)
+	if expected.target == nil {
+		require.Nil(t, actual.target)
+		return
+	}
+	require.NotNil(t, actual.target)
+	require.Equal(t, expected.target.constraintDigest, actual.target.constraintDigest)
+	require.Equal(t, expected.target.target, actual.target.target)
 }
 
 func TestAllocateByCPUAdvisorConcurrentFrameCannotOvertakePendingPostCommitApply(t *testing.T) {

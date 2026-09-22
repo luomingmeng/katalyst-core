@@ -1113,6 +1113,326 @@ func TestFrozenTraceFailureRollsBackCompleteAppliedPrefix(t *testing.T) {
 	}
 }
 
+func TestExecuteValidatedFrozenTraceRollsBackDedicatedReclaimReplacement(t *testing.T) {
+	tests := []struct {
+		name       string
+		phase      PhaseKind
+		phaseIndex int
+	}{
+		{name: "first drain", phase: PhaseDrain, phaseIndex: 0},
+		{name: "non-first drain", phase: PhaseDrain, phaseIndex: 1},
+		{name: "first expand", phase: PhaseExpand, phaseIndex: 0},
+		{name: "non-first expand", phase: PhaseExpand, phaseIndex: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			trace, live := compiledDedicatedReclaimReplacementTrace(t)
+			initial := live.snapshot()
+			writes := expectedPhysicalWrites(trace)
+			require.GreaterOrEqual(t, countTraceWritesByPhase(writes, PhaseDrain), 2)
+			require.GreaterOrEqual(t, countTraceWritesByPhase(writes, PhaseExpand), 2)
+			injection := failAtPhaseWrite(t, writes, tt.phase, tt.phaseIndex)
+			driver := &injectedTraceDriver{
+				HierarchyDriver: live,
+				injection:       injection,
+				expectedForward: len(writes),
+			}
+			round := frozenExecutionRound(t, trace, driver)
+			ticket := reserveTraceWithBudget(t, round.budget, trace)
+			res := &ConvergenceResult{}
+
+			_, err := round.executeFrozenTrace(context.Background(), trace, ticket, res)
+
+			require.Error(t, err)
+			require.True(t, driver.injected)
+			require.Equal(t,
+				expectedWriteAttempts(writes, injection.failWriteAt),
+				driver.writeAttempts,
+				"runtime rel/resource/target order must follow the compiled drain/expand trace")
+			assertEveryHierarchyNodeEqual(t, initial, live.snapshot())
+			require.Empty(t, res.Journal)
+			require.Zero(t, res.Applied)
+			if injection.failWriteAt == 1 {
+				require.Zero(t, ticket.consumedRollback.Total(),
+					"a failure before the first physical mutation has no rollback prefix")
+			} else {
+				require.Positive(t, ticket.consumedRollback.Total())
+			}
+		})
+	}
+}
+
+func TestExecuteValidatedFrozenTraceReportsReplacementRollbackFailure(t *testing.T) {
+	probeTrace, _ := compiledDedicatedReclaimReplacementTrace(t)
+	probeWrites := expectedPhysicalWrites(probeTrace)
+	forwardFailures := []struct {
+		name       string
+		phase      PhaseKind
+		phaseIndex int
+	}{
+		{name: "first drain", phase: PhaseDrain, phaseIndex: 0},
+		{name: "non-first drain", phase: PhaseDrain, phaseIndex: 1},
+		{name: "first expand", phase: PhaseExpand, phaseIndex: 0},
+		{name: "non-first expand", phase: PhaseExpand, phaseIndex: 1},
+	}
+	coveredExpandInverseWithEarlierDrainThirdState := false
+	matrixCases := 0
+
+	for _, forward := range forwardFailures {
+		forwardFailure := failAtPhaseWrite(t, probeWrites, forward.phase, forward.phaseIndex)
+		successfulForward := probeWrites[:forwardFailure.failWriteAt-1]
+		for forwardIndex := range successfulForward {
+			matrixCases++
+			failedForward := successfulForward[forwardIndex]
+			t.Run(fmt.Sprintf("%s/rollback-%02d-%s-%s",
+				forward.name, forwardIndex, failedForward.phase, failedForward.rel), func(t *testing.T) {
+				trace, live := compiledDedicatedReclaimReplacementTrace(t)
+				initial := live.snapshot()
+				writes := expectedPhysicalWrites(trace)
+				injection := failAtPhaseWrite(t, writes, forward.phase, forward.phaseIndex)
+				injection.failRollbackWriteAt = len(successfulForward) - forwardIndex
+				driver := &injectedTraceDriver{
+					HierarchyDriver: live,
+					injection:       injection,
+					expectedForward: len(writes),
+				}
+				round := frozenExecutionRound(t, trace, driver)
+				ticket := reserveTraceWithBudget(t, round.budget, trace)
+				res := &ConvergenceResult{}
+
+				_, err := round.executeFrozenTrace(context.Background(), trace, ticket, res)
+
+				require.ErrorContains(t, err, "rollback failed")
+				require.True(t, driver.injected)
+				require.Equal(t,
+					expectedWriteAttemptsWithRollbackFailure(
+						writes, injection.failWriteAt, forwardIndex),
+					driver.writeAttempts,
+					"the rejected inverse and every continued rollback write must be exact")
+				failedRollback := driver.writeAttempts[injection.failWriteAt+injection.failRollbackWriteAt-1]
+				require.Equal(t, traceWriteAttempt{
+					rel:      failedForward.rel,
+					resource: failedForward.resource,
+					target:   failedForward.before,
+				}, failedRollback,
+					"the rejected rollback write must target the captured before-image")
+
+				actual := live.snapshot()
+				expected := expectedStateAfterRollbackWriteFailure(
+					t, initial, successfulForward, forwardIndex)
+				assertEveryHierarchyNodeEqual(t, expected, actual)
+				if failedForward.phase == PhaseExpand &&
+					hasEarlierWriteForSameResource(successfulForward, forwardIndex, PhaseDrain) {
+					coveredExpandInverseWithEarlierDrainThirdState = true
+					require.NotEqual(t, failedForward.before,
+						rollbackResourceValue(actual[failedForward.rel], failedForward.resource),
+						"the failed Expand inverse must retain a third state that the earlier Drain inverse refuses")
+				}
+
+				residualResources := changedHierarchyResources(initial, actual)
+				require.Equal(t, len(residualResources), len(res.Journal),
+					"journal must contain one entry for every residual physical resource")
+				require.Equal(t, len(res.Journal), res.Applied)
+				seenResidual := make(map[string]struct{}, len(res.Journal))
+				for _, impact := range res.Journal {
+					resourceKey := impact.Rel + "\x00" + string(impact.Resource)
+					_, changed := residualResources[resourceKey]
+					require.True(t, changed, "journal item must describe a residual resource: %+v", impact)
+					require.NotContains(t, seenResidual, resourceKey,
+						"journal must not duplicate residual resource %q", resourceKey)
+					seenResidual[resourceKey] = struct{}{}
+					operation, logicalIndex := matchingJournalOperation(t, trace, impact)
+					require.Equal(t, logicalIndex, impact.LogicalOperationIndex)
+					switch impact.Resource {
+					case HierarchyOperationWriteCPUs:
+						require.Equal(t, operation.Target.CPUs, impact.Target.CPUs)
+						require.Equal(t, actual[impact.Rel].cpus, impact.Observed.CPUs)
+					case HierarchyOperationWriteMems:
+						require.Equal(t, operation.Target.Mems, impact.Target.Mems)
+						require.Equal(t, actual[impact.Rel].mems, impact.Observed.Mems)
+					default:
+						t.Fatalf("unsupported journal resource %q", impact.Resource)
+					}
+					if rollbackResourceMatchesTarget(impact) {
+						require.Equal(t, PhysicalImpactConfirmed, impact.PhysicalImpact)
+					} else {
+						require.Equal(t, PhysicalImpactUncertain, impact.PhysicalImpact)
+					}
+				}
+				require.Equal(t, residualResources, seenResidual)
+			})
+		}
+	}
+	require.Equal(t, 6, matrixCases,
+		"four forward failure points must cover every non-empty applied rollback prefix")
+	require.True(t, coveredExpandInverseWithEarlierDrainThirdState,
+		"fixture must exercise an Expand inverse failure followed by an earlier Drain third-state")
+}
+
+func expectedStateAfterRollbackWriteFailure(
+	t *testing.T,
+	initial fakeHierarchyState,
+	successfulForward []expectedTraceWrite,
+	failedForwardIndex int,
+) fakeHierarchyState {
+	t.Helper()
+	expected := make(fakeHierarchyState, len(initial))
+	for rel, node := range initial {
+		expected[rel] = node
+	}
+	for _, write := range successfulForward {
+		setRollbackResourceValue(t, expected, write, write.target)
+	}
+	for index := len(successfulForward) - 1; index >= 0; index-- {
+		write := successfulForward[index]
+		current := rollbackResourceValue(expected[write.rel], write.resource)
+		if current == write.before {
+			continue
+		}
+		if current != write.target || index == failedForwardIndex {
+			continue
+		}
+		setRollbackResourceValue(t, expected, write, write.before)
+	}
+	return expected
+}
+
+func expectedWriteAttemptsWithRollbackFailure(
+	writes []expectedTraceWrite,
+	failWriteAt, failedForwardIndex int,
+) []traceWriteAttempt {
+	successfulForward := writes[:failWriteAt-1]
+	attempts := make([]traceWriteAttempt, 0, failWriteAt+len(successfulForward))
+	current := make(map[string]string)
+	for _, write := range successfulForward {
+		key := write.rel + "\x00" + string(write.resource)
+		if _, ok := current[key]; !ok {
+			current[key] = write.before
+		}
+		current[key] = write.target
+		attempts = append(attempts, traceWriteAttempt{
+			rel: write.rel, resource: write.resource, target: write.target,
+		})
+	}
+	failedForward := writes[failWriteAt-1]
+	attempts = append(attempts, traceWriteAttempt{
+		rel: failedForward.rel, resource: failedForward.resource, target: failedForward.target,
+	})
+	for index := len(successfulForward) - 1; index >= 0; index-- {
+		write := successfulForward[index]
+		key := write.rel + "\x00" + string(write.resource)
+		if current[key] == write.before || current[key] != write.target {
+			continue
+		}
+		attempts = append(attempts, traceWriteAttempt{
+			rel: write.rel, resource: write.resource, target: write.before,
+		})
+		if index != failedForwardIndex {
+			current[key] = write.before
+		}
+	}
+	return attempts
+}
+
+func matchingJournalOperation(
+	t *testing.T,
+	trace *CompiledPhaseTrace,
+	impact AppliedPlanOperation,
+) (PlanOperation, int) {
+	t.Helper()
+	logicalIndex := 0
+	for _, phase := range trace.Phases {
+		for _, operation := range phase.Operations {
+			if operation.PlanID == impact.PlanID &&
+				operation.Rel == impact.Rel &&
+				operation.Direction == impact.Direction &&
+				phase.Kind == impact.Phase {
+				return operation, logicalIndex
+			}
+			logicalIndex++
+		}
+	}
+	t.Fatalf("journal item has no exact frozen-trace operation: %+v", impact)
+	return PlanOperation{}, -1
+}
+
+func setRollbackResourceValue(
+	t *testing.T,
+	state fakeHierarchyState,
+	write expectedTraceWrite,
+	value string,
+) {
+	t.Helper()
+	node := state[write.rel]
+	switch write.resource {
+	case HierarchyOperationWriteCPUs:
+		node.cpus = machine.MustParse(value)
+		node.configuredCPUs = machine.MustParse(value)
+	case HierarchyOperationWriteMems:
+		node.mems = value
+		node.configuredMems = value
+	default:
+		t.Fatalf("unsupported hierarchy resource %q", write.resource)
+	}
+	state[write.rel] = node
+}
+
+func rollbackResourceValue(node fakeHierarchyNode, resource HierarchyOperation) string {
+	switch resource {
+	case HierarchyOperationWriteCPUs:
+		return node.configuredCPUs.String()
+	case HierarchyOperationWriteMems:
+		return node.configuredMems
+	default:
+		return ""
+	}
+}
+
+func hasEarlierWriteForSameResource(
+	writes []expectedTraceWrite,
+	index int,
+	phase PhaseKind,
+) bool {
+	for earlier := 0; earlier < index; earlier++ {
+		if writes[earlier].rel == writes[index].rel &&
+			writes[earlier].resource == writes[index].resource &&
+			writes[earlier].phase == phase {
+			return true
+		}
+	}
+	return false
+}
+
+func changedHierarchyResources(
+	initial, actual fakeHierarchyState,
+) map[string]struct{} {
+	changed := make(map[string]struct{})
+	for rel, before := range initial {
+		after := actual[rel]
+		if !before.configuredCPUs.Equals(after.configuredCPUs) ||
+			!before.cpus.Equals(after.cpus) {
+			changed[rel+"\x00"+string(HierarchyOperationWriteCPUs)] = struct{}{}
+		}
+		if !cpusetListValuesEqual(before.configuredMems, after.configuredMems) ||
+			!cpusetListValuesEqual(before.mems, after.mems) {
+			changed[rel+"\x00"+string(HierarchyOperationWriteMems)] = struct{}{}
+		}
+	}
+	return changed
+}
+
+func rollbackResourceMatchesTarget(operation AppliedPlanOperation) bool {
+	switch operation.Resource {
+	case HierarchyOperationWriteCPUs:
+		return operation.Observed.CPUs.Equals(operation.Target.CPUs)
+	case HierarchyOperationWriteMems:
+		return cpusetListValuesEqual(operation.Observed.Mems, operation.Target.Mems)
+	default:
+		return false
+	}
+}
+
 func TestFrozenTraceMutateThenErrorWithFailedPinnedReadback(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -2413,6 +2733,15 @@ func makeFrozenTraceHolderRetirable(t *testing.T, trace *CompiledPhaseTrace, hol
 type expectedTraceWrite struct {
 	phase    PhaseKind
 	resource HierarchyOperation
+	rel      string
+	before   string
+	target   string
+}
+
+type traceWriteAttempt struct {
+	rel      string
+	resource HierarchyOperation
+	target   string
 }
 
 func expectedPhysicalWrites(trace *CompiledPhaseTrace) []expectedTraceWrite {
@@ -2420,14 +2749,57 @@ func expectedPhysicalWrites(trace *CompiledPhaseTrace) []expectedTraceWrite {
 	for _, phase := range trace.Phases {
 		for _, operation := range phase.Operations {
 			if operation.WriteMems && operation.ExpectedCurrent.Mems != operation.Target.Mems {
-				writes = append(writes, expectedTraceWrite{phase: phase.Kind, resource: HierarchyOperationWriteMems})
+				writes = append(writes, expectedTraceWrite{
+					phase: phase.Kind, resource: HierarchyOperationWriteMems,
+					rel: operation.Rel, before: operation.ExpectedCurrent.Mems, target: operation.Target.Mems,
+				})
 			}
 			if !operation.ExpectedCurrent.CPUs.Equals(operation.Target.CPUs) {
-				writes = append(writes, expectedTraceWrite{phase: phase.Kind, resource: HierarchyOperationWriteCPUs})
+				writes = append(writes, expectedTraceWrite{
+					phase: phase.Kind, resource: HierarchyOperationWriteCPUs,
+					rel: operation.Rel, before: operation.ExpectedCurrent.CPUs.String(),
+					target: operation.Target.CPUs.String(),
+				})
 			}
 		}
 	}
 	return writes
+}
+
+func expectedWriteAttempts(
+	writes []expectedTraceWrite,
+	failWriteAt int,
+) []traceWriteAttempt {
+	forwardAttempts := failWriteAt
+	if forwardAttempts == 0 {
+		forwardAttempts = len(writes)
+	}
+	attempts := make([]traceWriteAttempt, 0, forwardAttempts*2)
+	for _, write := range writes[:forwardAttempts] {
+		attempts = append(attempts, traceWriteAttempt{
+			rel: write.rel, resource: write.resource, target: write.target,
+		})
+	}
+	successfulForward := writes[:forwardAttempts-1]
+	for i := len(successfulForward) - 1; i >= 0; i-- {
+		write := successfulForward[i]
+		attempts = append(attempts, traceWriteAttempt{
+			rel: write.rel, resource: write.resource, target: write.before,
+		})
+	}
+	return attempts
+}
+
+func assertEveryHierarchyNodeEqual(
+	t *testing.T,
+	expected, actual fakeHierarchyState,
+) {
+	t.Helper()
+	require.Equal(t, len(expected), len(actual))
+	for rel, before := range expected {
+		require.Equal(t, before, actual[rel],
+			"hierarchy node %q must equal its complete before-image", rel)
+	}
 }
 
 func failAtNthResourceWrite(
@@ -2473,6 +2845,7 @@ func failAtPhaseWrite(
 
 type traceFailureInjection struct {
 	failWriteAt                   int
+	failRollbackWriteAt           int
 	mutateThenFailWriteAt         int
 	falseSuccessWriteAt           int
 	failPostWriteReadback         bool
@@ -2486,13 +2859,15 @@ type traceFailureInjection struct {
 
 type injectedTraceDriver struct {
 	HierarchyDriver
-	injection       traceFailureInjection
-	expectedForward int
-	writeCalls      int
-	forwardSuccess  int
-	pendingReadback bool
-	injected        bool
-	cancel          context.CancelFunc
+	injection          traceFailureInjection
+	expectedForward    int
+	writeCalls         int
+	forwardSuccess     int
+	rollbackWriteCalls int
+	writeAttempts      []traceWriteAttempt
+	pendingReadback    bool
+	injected           bool
+	cancel             context.CancelFunc
 }
 
 type retireWrittenRelOnFinalProofDriver struct {
@@ -2870,7 +3245,7 @@ func (d *injectedTraceDriver) WriteCPUs(
 	identity CgroupIdentity,
 	cpus machine.CPUSet,
 ) error {
-	return d.write(ctx, HierarchyOperationWriteCPUs, rel, func() error {
+	return d.write(ctx, HierarchyOperationWriteCPUs, rel, cpus.String(), func() error {
 		return d.HierarchyDriver.WriteCPUs(ctx, rel, identity, cpus)
 	})
 }
@@ -2881,7 +3256,7 @@ func (d *injectedTraceDriver) WriteMems(
 	identity CgroupIdentity,
 	mems string,
 ) error {
-	return d.write(ctx, HierarchyOperationWriteMems, rel, func() error {
+	return d.write(ctx, HierarchyOperationWriteMems, rel, mems, func() error {
 		return d.HierarchyDriver.WriteMems(ctx, rel, identity, mems)
 	})
 }
@@ -2890,9 +3265,19 @@ func (d *injectedTraceDriver) write(
 	ctx context.Context,
 	resource HierarchyOperation,
 	rel string,
+	target string,
 	delegate func() error,
 ) error {
 	d.writeCalls++
+	d.writeAttempts = append(d.writeAttempts, traceWriteAttempt{
+		rel: rel, resource: resource, target: target,
+	})
+	if d.injected && d.injection.failRollbackWriteAt > 0 {
+		d.rollbackWriteCalls++
+		if d.rollbackWriteCalls == d.injection.failRollbackWriteAt {
+			return fmt.Errorf("injected rollback %s failure for %q", resource, rel)
+		}
+	}
 	if !d.injected && d.injection.failWriteAt == d.writeCalls {
 		d.injected = true
 		return fmt.Errorf("injected %s failure for %q", resource, rel)
@@ -2933,6 +3318,43 @@ func (d *injectedTraceDriver) write(
 		}
 	}
 	return nil
+}
+
+func compiledDedicatedReclaimReplacementTrace(
+	t *testing.T,
+) (*CompiledPhaseTrace, *fakeHierarchyDriver) {
+	t.Helper()
+	fixture := newAdmissionTraceFixture(t)
+	fixture.driver.capabilities = cgroupV1Policy.capabilities(true)
+	fixture.round.allowEmptyTarget = true
+	fixture.round.objective = ConvergenceObjectiveFull
+	fixture.addPrimary("dedicated", "0-1", "0")
+	fixture.addReclaim("reclaimed", "2-3", "0")
+	fixture.requireCPUSet("dedicated", "1-2")
+	fixture.requireCPUSet("reclaimed", "0,3")
+
+	trace, err := fixture.round.compileFixedPointTrace(
+		context.Background(), fixture.snapshot())
+	require.NoError(t, err)
+	require.True(t, traceContainsOperation(
+		trace, "dedicated", WriteShrink, machine.NewCPUSet(1)))
+	require.True(t, traceContainsOperation(
+		trace, "reclaimed", WriteShrink, machine.NewCPUSet(3)))
+	require.True(t, traceContainsOperation(
+		trace, "dedicated", WriteGrow, machine.MustParse("1-2")))
+	require.True(t, traceContainsOperation(
+		trace, "reclaimed", WriteGrow, machine.MustParse("0,3")))
+	return trace, fixture.driver
+}
+
+func countTraceWritesByPhase(writes []expectedTraceWrite, phase PhaseKind) int {
+	count := 0
+	for _, write := range writes {
+		if write.phase == phase {
+			count++
+		}
+	}
+	return count
 }
 
 func frozenExecutionRound(
