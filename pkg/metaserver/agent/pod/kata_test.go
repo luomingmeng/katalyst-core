@@ -20,6 +20,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 )
@@ -31,13 +33,26 @@ var (
 	testNonKataJsonInfo    = `{"sandboxID": "234567890", "pid": "2345", "runtimeType": "docker"}`
 )
 
+type kataRuntimePodFetcherStub struct {
+	*runtimePodFetcherStub
+	containerIdToError map[string]error
+}
+
+func (r *kataRuntimePodFetcherStub) GetContainerInfo(containerId string) (map[string]string, error) {
+	if err := r.containerIdToError[containerId]; err != nil {
+		return nil, err
+	}
+	return r.runtimePodFetcherStub.GetContainerInfo(containerId)
+}
+
 func TestKataContainerFetcher_getKataCgroupPathSuffix(t *testing.T) {
 	t.Parallel()
 
 	type fields struct {
-		podUid            string
-		containerId       string
-		containerIdToInfo map[string]map[string]string
+		podUid             string
+		containerId        string
+		containerIdToInfo  map[string]map[string]string
+		containerIdToError map[string]error
 	}
 
 	tests := []struct {
@@ -57,10 +72,13 @@ func TestKataContainerFetcher_getKataCgroupPathSuffix(t *testing.T) {
 						"info": testKataJsonInfo,
 					},
 				},
+				containerIdToError: map[string]error{
+					"invalidContainerId": status.Error(codes.NotFound, "container not found"),
+				},
 			},
 			wantCgroupPathSuffix: "",
-			wantSkip:             false,
-			wantErr:              true,
+			wantSkip:             true,
+			wantErr:              false,
 		},
 		{
 			name: "Can find container info but cannot unmarshal json",
@@ -143,8 +161,11 @@ func TestKataContainerFetcher_getKataCgroupPathSuffix(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			kataContainerFetcher := &KataContainerFetcher{
-				runtimePodFetcher: &runtimePodFetcherStub{
-					containerIdToInfo: tt.fields.containerIdToInfo,
+				runtimePodFetcher: &kataRuntimePodFetcherStub{
+					runtimePodFetcherStub: &runtimePodFetcherStub{
+						containerIdToInfo: tt.fields.containerIdToInfo,
+					},
+					containerIdToError: tt.fields.containerIdToError,
 				},
 			}
 			pathSuffix, skip, err := kataContainerFetcher.getKataCgroupPathSuffix(tt.fields.podUid, tt.fields.containerId)
@@ -160,6 +181,25 @@ func TestKataContainerFetcher_getKataCgroupPathSuffix(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestKataContainerFetcher_getKataCgroupPathSuffixReturnsNonNotFoundError(t *testing.T) {
+	t.Parallel()
+
+	kataContainerFetcher := &KataContainerFetcher{
+		runtimePodFetcher: &kataRuntimePodFetcherStub{
+			runtimePodFetcherStub: &runtimePodFetcherStub{},
+			containerIdToError: map[string]error{
+				"container": status.Error(codes.Internal, "runtime unavailable"),
+			},
+		},
+	}
+
+	pathSuffix, skip, err := kataContainerFetcher.getKataCgroupPathSuffix("pod", "container")
+
+	assert.Empty(t, pathSuffix)
+	assert.False(t, skip)
+	assert.Equal(t, codes.Internal, status.Code(err))
 }
 
 func TestKataContainerFetcher_getKataCgroupPathSuffixReturnsErrorForNilRuntimePodFetcher(t *testing.T) {

@@ -22,6 +22,8 @@ import (
 	"strings"
 	"sync"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/util/json"
 
 	"github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
@@ -108,8 +110,11 @@ func (k *KataContainerFetcher) getKataCgroupPathSuffix(podUID, containerId strin
 	}
 
 	infoRaw, err := k.runtimePodFetcher.GetContainerInfo(containerId)
+	if status.Code(err) == codes.NotFound {
+		return "", true, nil
+	}
 	if err != nil {
-		return "", false, fmt.Errorf("failed to get container info, err: %v", err)
+		return "", false, fmt.Errorf("failed to get container info, err: %w", err)
 	}
 
 	var info ContainerInfo
