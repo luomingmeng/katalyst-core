@@ -51,14 +51,14 @@ func TestSelectNumaBindingReclaimPartitionPrefersCommittedOverConfiguredReserveI
 	require.NoError(t, err)
 	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
 	require.NoError(t, err)
-	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
-	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
 
 	configuredReserve := coresInNUMA(topology, 0, 0, 1)
 	committedReclaim := coresInNUMA(topology, 0, 1, 2)
 	eligible := topology.CPUDetails.CPUsInNUMANodes(0)
-	p.reservedReclaimedCPUSet = configuredReserve
-	p.reservedReclaimedCPUsSize = configuredReserve.Size()
+	p.reclaim.reservedReclaimedCPUSet = configuredReserve
+	p.reclaim.reservedReclaimedCPUsSize = configuredReserve.Size()
 
 	got, err := p.selectNumaBindingReclaimPartitionWithPreference(
 		configuredReserve,

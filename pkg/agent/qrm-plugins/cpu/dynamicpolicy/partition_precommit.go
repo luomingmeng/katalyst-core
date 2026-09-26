@@ -85,7 +85,7 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 	}
 	p.syncCandidateSidecarsFromMain(candidate)
 	var machineState state.NUMANodeMap
-	if p.machineInfo == nil || p.machineInfo.CPUTopology == nil {
+	if p.machine.machineInfo == nil || p.machine.machineInfo.CPUTopology == nil {
 		if pending.baseMachineState == nil {
 			return nil, fmt.Errorf("prepare pending cpu partition: cpu topology is not initialized")
 		}
@@ -95,13 +95,13 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 			return nil, p.wrapPartitionPrecommitError(pending.source, "normalize allocation entries", err)
 		}
 		if err := validateAllocationShapeAfterHooks(
-			pending.entries, candidate, p.machineInfo.CPUTopology,
+			pending.entries, candidate, p.machine.machineInfo.CPUTopology,
 		); err != nil {
 			return nil, p.wrapPartitionPrecommitError(
 				pending.source, "revalidate allocation shape after hooks", err)
 		}
 		if pending.requireCoreAlignedReclaim {
-			if err := assertCoreAligned(reclaimPoolCPUSet(candidate), p.machineInfo.CPUTopology); err != nil {
+			if err := assertCoreAligned(reclaimPoolCPUSet(candidate), p.machine.machineInfo.CPUTopology); err != nil {
 				return nil, p.wrapPartitionPrecommitError(
 					pending.source, "revalidate reclaim core alignment after hooks", err)
 			}
@@ -110,7 +110,7 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 			plannedReclaim := reclaimPoolCPUSet(pending.entries)
 			candidateReclaim := reclaimPoolCPUSet(candidate)
 			if err := validateSteadyReclaimPrecommitInvariant(
-				plannedReclaim, candidateReclaim, p.machineInfo.CPUTopology,
+				plannedReclaim, candidateReclaim, p.machine.machineInfo.CPUTopology,
 			); err != nil {
 				return nil, p.wrapPartitionPrecommitError(
 					pending.source, "revalidate steady reclaim after hooks", err)
@@ -124,7 +124,7 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 		}
 		var err error
 		machineState, err = generateMachineStateFromPodEntries(
-			p.machineInfo.CPUTopology, candidate, baseMachineState)
+			p.machine.machineInfo.CPUTopology, candidate, baseMachineState)
 		if err != nil {
 			return nil, p.wrapPartitionPrecommitError(pending.source, "rebuild machine state", err)
 		}
@@ -155,15 +155,15 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 	// Keep the frozen plan authoritative through the complete prepare phase.
 	// A validator is expected to be read-only, but re-check the candidate here
 	// so a late mutation cannot bypass the hook-time replacement invariants.
-	if p.machineInfo != nil && p.machineInfo.CPUTopology != nil {
+	if p.machine.machineInfo != nil && p.machine.machineInfo.CPUTopology != nil {
 		if err := validateAllocationShapeAfterHooks(
-			pending.entries, candidate, p.machineInfo.CPUTopology,
+			pending.entries, candidate, p.machine.machineInfo.CPUTopology,
 		); err != nil {
 			return nil, p.wrapPartitionPrecommitError(
 				pending.source, "revalidate replacement baseline after partition validation", err)
 		}
 		if pending.requireCoreAlignedReclaim {
-			if err := assertCoreAligned(reclaimPoolCPUSet(candidate), p.machineInfo.CPUTopology); err != nil {
+			if err := assertCoreAligned(reclaimPoolCPUSet(candidate), p.machine.machineInfo.CPUTopology); err != nil {
 				return nil, p.wrapPartitionPrecommitError(
 					pending.source, "revalidate replacement baseline after partition validation",
 					fmt.Errorf("reclaim is not core-aligned: %w", err))
@@ -173,7 +173,7 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 			if err := validateSteadyReclaimPrecommitInvariant(
 				reclaimPoolCPUSet(pending.entries),
 				reclaimPoolCPUSet(candidate),
-				p.machineInfo.CPUTopology,
+				p.machine.machineInfo.CPUTopology,
 			); err != nil {
 				return nil, p.wrapPartitionPrecommitError(
 					pending.source, "revalidate replacement baseline after partition validation", err)
@@ -217,8 +217,8 @@ func (p *DynamicPolicy) validateResidualBackfillCandidate(
 	residualFloor machine.CPUSet,
 ) error {
 	var dynamicConfig *dynamicconfig.Configuration
-	if p != nil && p.dynamicConfig != nil {
-		dynamicConfig = p.dynamicConfig.GetDynamicConfiguration()
+	if p != nil && p.config.dynamicConfig != nil {
+		dynamicConfig = p.config.dynamicConfig.GetDynamicConfiguration()
 	}
 	return p.validateResidualBackfillCandidateWithDynamicConfig(
 		entries, machineState, residualFloor, dynamicConfig)
@@ -233,7 +233,7 @@ func (p *DynamicPolicy) validateResidualBackfillCandidateWithDynamicConfig(
 	if dynamicConfig == nil || !dynamicConfig.FillDefaultSharePoolWithNonReclaimCPUs {
 		return nil
 	}
-	if p.machineInfo == nil || p.machineInfo.CPUTopology == nil {
+	if p.machine.machineInfo == nil || p.machine.machineInfo.CPUTopology == nil {
 		return fmt.Errorf("cpu topology is not initialized")
 	}
 
@@ -280,7 +280,7 @@ func (p *DynamicPolicy) validateResidualBackfillCandidateWithDynamicConfig(
 		return nil
 	}
 
-	expectedAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, share)
+	expectedAssignments, err := machine.GetNumaAwareAssignments(p.machine.machineInfo.CPUTopology, share)
 	if err != nil {
 		return fmt.Errorf("calculate default share topology assignments: %w", err)
 	}
@@ -436,12 +436,12 @@ func (p *DynamicPolicy) normalizePendingCPUPartition(entries state.PodEntries) e
 				continue
 			}
 			assignments, err := machine.GetNumaAwareAssignments(
-				p.machineInfo.CPUTopology, allocation.AllocationResult)
+				p.machine.machineInfo.CPUTopology, allocation.AllocationResult)
 			if err != nil {
 				return fmt.Errorf("%s/%s allocation result: %w", podUID, containerName, err)
 			}
 			originalAssignments, err := machine.GetNumaAwareAssignments(
-				p.machineInfo.CPUTopology, allocation.OriginalAllocationResult)
+				p.machine.machineInfo.CPUTopology, allocation.OriginalAllocationResult)
 			if err != nil {
 				return fmt.Errorf("%s/%s original allocation result: %w", podUID, containerName, err)
 			}

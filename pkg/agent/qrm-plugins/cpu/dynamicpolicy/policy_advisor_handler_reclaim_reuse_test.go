@@ -114,10 +114,10 @@ func TestSyncReclaimPoolWithAdjustmentCommitOverrideAlsoSyncsDefaultShare(t *tes
 
 	p, cleanup := newReclaimReuseTestPolicy(t)
 	defer cleanup()
-	p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+	p.config.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
 
-	allCPUs := p.machineInfo.CPUDetails.CPUs()
-	eligibleCPUs := allCPUs.Difference(p.reservedCPUs)
+	allCPUs := p.machine.machineInfo.CPUDetails.CPUs()
+	eligibleCPUs := allCPUs.Difference(p.config.reservedCPUs)
 	newEntries := state.PodEntries{
 		commonstate.PoolNameReclaim: {
 			commonstate.FakedContainerName: &state.AllocationInfo{
@@ -154,9 +154,9 @@ func TestReclaimCommitOverrideSyncsOwnerAllocationsBeforePrecommit(t *testing.T)
 
 	p, cleanup := newReclaimReuseTestPolicy(t)
 	defer cleanup()
-	p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+	p.config.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
 
-	eligible := p.machineInfo.CPUDetails.CPUs().Difference(p.reservedCPUs)
+	eligible := p.machine.machineInfo.CPUDetails.CPUs().Difference(p.config.reservedCPUs)
 	initialReclaim := machine.NewCPUSet(0, 1, 24, 25)
 	finalReclaim := machine.NewCPUSet(2, 3, 26, 27)
 	initialShare := eligible.Difference(initialReclaim)
@@ -239,7 +239,7 @@ func TestReclaimCommitOverrideSyncsOwnerAllocationsBeforePrecommit(t *testing.T)
 		require.NotNil(t, allocation)
 		require.True(t, allocation.AllocationResult.Equals(expected))
 		require.True(t, allocation.OriginalAllocationResult.Equals(expected))
-		expectedAssignments, assignmentErr := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, expected)
+		expectedAssignments, assignmentErr := machine.GetNumaAwareAssignments(p.machine.machineInfo.CPUTopology, expected)
 		require.NoError(t, assignmentErr)
 		require.True(t, cpuAssignmentsEqual(allocation.TopologyAwareAssignments, expectedAssignments))
 		require.True(t, cpuAssignmentsEqual(allocation.OriginalTopologyAwareAssignments, expectedAssignments))
@@ -498,7 +498,7 @@ func TestGenerateReclaimBlockCPUSet_InPlaceReuse(t *testing.T) {
 	prev := machine.NewCPUSet(0, 1, 2, 3)
 	setReclaimPoolCPUSet(t, p, prev)
 
-	node0 := p.machineInfo.CPUDetails.CPUsInNUMANodes(0)
+	node0 := p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(0)
 	blockCPUSet := advisorapi.BlockCPUSet{}
 	err := p.generateReclaimBlockCPUSet(
 		numaAwareReclaimBlock(0, "b0", 2),
@@ -522,7 +522,7 @@ func TestGenerateReclaimBlockCPUSet_ReleaseRefill(t *testing.T) {
 	prev := machine.NewCPUSet(0, 1)
 	setReclaimPoolCPUSet(t, p, prev)
 
-	node0 := p.machineInfo.CPUDetails.CPUsInNUMANodes(0)
+	node0 := p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(0)
 	blockCPUSet := advisorapi.BlockCPUSet{}
 	err := p.generateReclaimBlockCPUSet(
 		numaAwareReclaimBlock(0, "b0", 4),
@@ -546,7 +546,7 @@ func TestGenerateReclaimBlockCPUSet_FirstAllocation(t *testing.T) {
 	// no reclaim pool entry => prevReclaim empty => legacy TakeByTopology path.
 	setReclaimPoolCPUSet(t, p, machine.NewCPUSet())
 
-	node0 := p.machineInfo.CPUDetails.CPUsInNUMANodes(0)
+	node0 := p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(0)
 	blockCPUSet := advisorapi.BlockCPUSet{}
 	err := p.generateReclaimBlockCPUSet(
 		numaAwareReclaimBlock(0, "b0", 4),
@@ -571,8 +571,8 @@ func TestGenerateReclaimBlockCPUSet_CrossNUMAIsolation(t *testing.T) {
 	prev := machine.NewCPUSet(0, 1, 24, 25)
 	setReclaimPoolCPUSet(t, p, prev)
 
-	node0 := p.machineInfo.CPUDetails.CPUsInNUMANodes(0)
-	node1 := p.machineInfo.CPUDetails.CPUsInNUMANodes(1)
+	node0 := p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(0)
+	node1 := p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(1)
 	blockCPUSet := advisorapi.BlockCPUSet{}
 	err := p.generateReclaimBlockCPUSet(
 		numaAwareReclaimBlock(0, "b0", 2),
@@ -595,7 +595,7 @@ func TestGenerateReclaimBlockCPUSet_NonNUMAReuse(t *testing.T) {
 	prev := machine.NewCPUSet(10, 11)
 	setReclaimPoolCPUSet(t, p, prev)
 
-	all := p.machineInfo.CPUDetails.CPUs()
+	all := p.machine.machineInfo.CPUDetails.CPUs()
 	blocks := map[int][]*advisorapi.BlockInfo{
 		commonstate.FakedNUMAID: {
 			{Block: advisorapi.Block{BlockId: "b0", Result: uint64(2)}},

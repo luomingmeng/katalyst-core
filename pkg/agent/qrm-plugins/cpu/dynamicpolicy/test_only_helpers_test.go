@@ -61,7 +61,7 @@ func (p *DynamicPolicy) publishAdvisorPostCommitTarget(
 // hasPendingAdvisorPostCommitTarget is a test-only helper reporting whether the
 // currently published advisor post-commit target matches the given revision.
 func (p *DynamicPolicy) hasPendingAdvisorPostCommitTarget(revision uint64) bool {
-	p.cpuSetAdjustmentRetryMu.Lock()
-	defer p.cpuSetAdjustmentRetryMu.Unlock()
-	return p.advisorPostCommitTarget != nil && p.advisorPostCommitTarget.revision == revision
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	defer p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
+	return p.adjustment.advisorPostCommitTarget != nil && p.adjustment.advisorPostCommitTarget.revision == revision
 }

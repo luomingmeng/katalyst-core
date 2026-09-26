@@ -85,13 +85,11 @@ func TestCPUSetAdjustmentStateSnapshotRejectsChangedRevision(t *testing.T) {
 }
 
 func TestCPUSetAdjustmentExecutionLeaseStaleContextAfterRelease(t *testing.T) {
-	p := &DynamicPolicy{
-		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
-			"noop": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-				return nil
-			},
+	p := &DynamicPolicy{adjustment: adjustmentComponent{cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"noop": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			return nil
 		},
-	}
+	}}}
 
 	p.Lock()
 	staleLease, err := p.acquireCPUSetAdjustmentExecutionLocked(context.Background())
@@ -223,21 +221,19 @@ func TestAdmissionPropagatesFrozenInitialSnapshotDriftWithoutRetry(t *testing.T)
 
 	firstCalls := 0
 	secondCalls := 0
-	p := &DynamicPolicy{
-		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
-			"a-stale-once": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-				firstCalls++
-				if firstCalls == 1 {
-					return &frozenInitialSnapshotDriftTestError{}
-				}
-				return nil
-			},
-			"b-success": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-				secondCalls++
-				return nil
-			},
+	p := &DynamicPolicy{adjustment: adjustmentComponent{cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"a-stale-once": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			firstCalls++
+			if firstCalls == 1 {
+				return &frozenInitialSnapshotDriftTestError{}
+			}
+			return nil
 		},
-	}
+		"b-success": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			secondCalls++
+			return nil
+		},
+	}}}
 
 	p.Lock()
 	err := p.runCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentModeAdmission)
@@ -254,7 +250,7 @@ func TestAdmissionContinuousFrozenInitialSnapshotDriftCallsPluginOnce(t *testing
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 	require.NoError(t, err)
 	calls := 0
-	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"always-stale": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 			calls++
 			return &frozenInitialSnapshotDriftTestError{}
@@ -264,7 +260,7 @@ func TestAdmissionContinuousFrozenInitialSnapshotDriftCallsPluginOnce(t *testing
 	beforeEntries := p.state.GetPodEntries()
 	beforeMachineState := p.state.GetMachineState()
 	target := &advisorPostCommitTarget{revision: beforeRevision}
-	p.advisorPostCommitTarget = target
+	p.adjustment.advisorPostCommitTarget = target
 	stagingPath := p.advisorPostCommitStagingPath()
 	activePath := p.advisorPostCommitCheckpointPath()
 	require.NoError(t, os.WriteFile(stagingPath, []byte("staging-sentinel"), 0o600))
@@ -302,17 +298,15 @@ func TestAdmissionPropagatesFinalSnapshotDriftAfterVerifiedRollbackWithoutRetry(
 	t.Parallel()
 
 	calls := 0
-	p := &DynamicPolicy{
-		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
-			"final-drift-once": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-				calls++
-				if calls == 1 {
-					return errors.New("frozen trace final snapshot drift after verified rollback")
-				}
-				return nil
-			},
+	p := &DynamicPolicy{adjustment: adjustmentComponent{cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"final-drift-once": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			calls++
+			if calls == 1 {
+				return errors.New("frozen trace final snapshot drift after verified rollback")
+			}
+			return nil
 		},
-	}
+	}}}
 
 	p.Lock()
 	err := p.runCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentModeAdmission)
@@ -326,14 +320,12 @@ func TestAdmissionDoesNotRetryUnverifiedFinalSnapshotDrift(t *testing.T) {
 	t.Parallel()
 
 	calls := 0
-	p := &DynamicPolicy{
-		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
-			"unsafe-final-drift": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-				calls++
-				return &frozenFinalSnapshotDriftUnverifiedTestError{}
-			},
+	p := &DynamicPolicy{adjustment: adjustmentComponent{cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"unsafe-final-drift": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			calls++
+			return &frozenFinalSnapshotDriftUnverifiedTestError{}
 		},
-	}
+	}}}
 
 	p.Lock()
 	err := p.runCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentModeAdmission)
@@ -347,14 +339,12 @@ func TestRunCPUSetAdjustmentHandlersPropagatesMode(t *testing.T) {
 	t.Parallel()
 
 	got := make(chan cpusetutil.CPUSetAdjustmentMode, 1)
-	p := &DynamicPolicy{
-		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
-			"mode": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-				got <- in.Mode
-				return nil
-			},
+	p := &DynamicPolicy{adjustment: adjustmentComponent{cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"mode": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			got <- in.Mode
+			return nil
 		},
-	}
+	}}}
 
 	p.Lock()
 	err := p.runCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentModeAdmission)
@@ -371,20 +361,18 @@ func TestDeferredFullRetryCoalescesQueuedRequestsIntoTrailingRetry(t *testing.T)
 	t.Parallel()
 
 	retried := make(chan cpusetutil.CPUSetAdjustmentMode, 2)
-	p := &DynamicPolicy{
-		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
-			"retry": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-				if in.Mode == cpusetutil.CPUSetAdjustmentModeAdmission {
-					in.ScheduleFullRetry(cpusetutil.RetryReasonDeferredLeaf)
-					in.ScheduleFullRetry(cpusetutil.RetryReasonDeferredLeaf)
-					in.ScheduleFullRetry(cpusetutil.RetryReasonDeferredLeaf)
-					return nil
-				}
-				retried <- in.Mode
+	p := &DynamicPolicy{adjustment: adjustmentComponent{cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"retry": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			if in.Mode == cpusetutil.CPUSetAdjustmentModeAdmission {
+				in.ScheduleFullRetry(cpusetutil.RetryReasonDeferredLeaf)
+				in.ScheduleFullRetry(cpusetutil.RetryReasonDeferredLeaf)
+				in.ScheduleFullRetry(cpusetutil.RetryReasonDeferredLeaf)
 				return nil
-			},
+			}
+			retried <- in.Mode
+			return nil
 		},
-	}
+	}}}
 
 	p.Lock()
 	err := p.runCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentModeAdmission)
@@ -420,21 +408,19 @@ func TestDeferredFullRetryRetriesFailureWithBackoff(t *testing.T) {
 
 	attempts := make(chan time.Time, 2)
 	attemptCount := 0
-	p := &DynamicPolicy{
-		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
-			"retry": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-				if in.Mode != cpusetutil.CPUSetAdjustmentModeRetry {
-					return nil
-				}
-				attemptCount++
-				attempts <- time.Now()
-				if attemptCount == 1 {
-					return errors.New("transient retry failure")
-				}
+	p := &DynamicPolicy{adjustment: adjustmentComponent{cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"retry": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			if in.Mode != cpusetutil.CPUSetAdjustmentModeRetry {
 				return nil
-			},
+			}
+			attemptCount++
+			attempts <- time.Now()
+			if attemptCount == 1 {
+				return errors.New("transient retry failure")
+			}
+			return nil
 		},
-	}
+	}}}
 
 	p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonDeferredLeaf)
 	first := <-attempts
@@ -453,28 +439,26 @@ func TestDeferredFullRetryCountsTrailingRoundsTowardAttemptBudget(t *testing.T) 
 
 	attempts := make(chan time.Time, cpuSetAdjustmentRetryMaxAttempts+1)
 	var attemptCount int32
-	p := &DynamicPolicy{
-		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
-			"retry": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-				if in.Mode != cpusetutil.CPUSetAdjustmentModeRetry {
-					return nil
-				}
-				attempt := atomic.AddInt32(&attemptCount, 1)
-				attempts <- time.Now()
-				if attempt <= cpuSetAdjustmentRetryMaxAttempts {
-					in.ScheduleFullRetry(cpusetutil.RetryReasonDeferredLeaf)
-				}
+	p := &DynamicPolicy{adjustment: adjustmentComponent{cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"retry": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			if in.Mode != cpusetutil.CPUSetAdjustmentModeRetry {
 				return nil
-			},
+			}
+			attempt := atomic.AddInt32(&attemptCount, 1)
+			attempts <- time.Now()
+			if attempt <= cpuSetAdjustmentRetryMaxAttempts {
+				in.ScheduleFullRetry(cpusetutil.RetryReasonDeferredLeaf)
+			}
+			return nil
 		},
-	}
+	}}}
 
 	p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonDeferredLeaf)
 	deadline := time.Now().Add(time.Second)
 	for {
-		p.cpuSetAdjustmentRetryMu.Lock()
-		queued := p.cpuSetAdjustmentRetryQueued
-		p.cpuSetAdjustmentRetryMu.Unlock()
+		p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+		queued := p.adjustment.cpuSetAdjustmentRetryQueued
+		p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 		if !queued {
 			break
 		}
@@ -495,39 +479,37 @@ func TestDeferredFullRetryCountsTrailingRoundsTowardAttemptBudget(t *testing.T) 
 		}
 		previous = current
 	}
-	p.cpuSetAdjustmentRetryMu.Lock()
-	defer p.cpuSetAdjustmentRetryMu.Unlock()
-	require.False(t, p.cpuSetAdjustmentRetryQueued)
-	require.False(t, p.cpuSetAdjustmentRetryAgain)
-	require.True(t, p.cpuSetAdjustmentRetryDirty)
-	require.Contains(t, p.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonDeferredLeaf)
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	defer p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
+	require.False(t, p.adjustment.cpuSetAdjustmentRetryQueued)
+	require.False(t, p.adjustment.cpuSetAdjustmentRetryAgain)
+	require.True(t, p.adjustment.cpuSetAdjustmentRetryDirty)
+	require.Contains(t, p.adjustment.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonDeferredLeaf)
 }
 
 func TestDeferredFullRetrySuccessfulTrailingRoundClearsTrimmedRequest(t *testing.T) {
 	t.Parallel()
 
 	var attemptCount int32
-	p := &DynamicPolicy{
-		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
-			"retry": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-				if in.Mode != cpusetutil.CPUSetAdjustmentModeRetry {
-					return nil
-				}
-				if atomic.AddInt32(&attemptCount, 1) == 1 {
-					in.ScheduleFullRetry(cpusetutil.RetryReasonDeferredLeaf)
-					in.ScheduleFullRetry(cpusetutil.RetryReasonDeferredLeaf)
-				}
+	p := &DynamicPolicy{adjustment: adjustmentComponent{cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"retry": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			if in.Mode != cpusetutil.CPUSetAdjustmentModeRetry {
 				return nil
-			},
+			}
+			if atomic.AddInt32(&attemptCount, 1) == 1 {
+				in.ScheduleFullRetry(cpusetutil.RetryReasonDeferredLeaf)
+				in.ScheduleFullRetry(cpusetutil.RetryReasonDeferredLeaf)
+			}
+			return nil
 		},
-	}
+	}}}
 
 	p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonDeferredLeaf)
 	deadline := time.Now().Add(time.Second)
 	for {
-		p.cpuSetAdjustmentRetryMu.Lock()
-		queued := p.cpuSetAdjustmentRetryQueued
-		p.cpuSetAdjustmentRetryMu.Unlock()
+		p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+		queued := p.adjustment.cpuSetAdjustmentRetryQueued
+		p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 		if !queued {
 			break
 		}
@@ -538,11 +520,11 @@ func TestDeferredFullRetrySuccessfulTrailingRoundClearsTrimmedRequest(t *testing
 	}
 
 	require.Equal(t, int32(2), atomic.LoadInt32(&attemptCount))
-	p.cpuSetAdjustmentRetryMu.Lock()
-	defer p.cpuSetAdjustmentRetryMu.Unlock()
-	require.False(t, p.cpuSetAdjustmentRetryDirty)
-	require.Nil(t, p.cpuSetAdjustmentRetryReasons)
-	require.False(t, p.cpuSetAdjustmentRetryAgain)
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	defer p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
+	require.False(t, p.adjustment.cpuSetAdjustmentRetryDirty)
+	require.Nil(t, p.adjustment.cpuSetAdjustmentRetryReasons)
+	require.False(t, p.adjustment.cpuSetAdjustmentRetryAgain)
 }
 
 func TestDeferredFullRetryExhaustionStaysDirtyUntilPeriodicLatestStateReconcile(t *testing.T) {
@@ -550,26 +532,24 @@ func TestDeferredFullRetryExhaustionStaysDirtyUntilPeriodicLatestStateReconcile(
 
 	attempts := make(chan struct{}, 8)
 	recovered := false
-	p := &DynamicPolicy{
-		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
-			"retry": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-				if in.Mode == cpusetutil.CPUSetAdjustmentModeRetry {
-					attempts <- struct{}{}
-				}
-				if recovered {
-					return nil
-				}
-				return errors.New("persistent retry failure")
-			},
+	p := &DynamicPolicy{adjustment: adjustmentComponent{cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"retry": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			if in.Mode == cpusetutil.CPUSetAdjustmentModeRetry {
+				attempts <- struct{}{}
+			}
+			if recovered {
+				return nil
+			}
+			return errors.New("persistent retry failure")
 		},
-	}
+	}}}
 
 	p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonDeferredLeaf)
 	deadline := time.Now().Add(time.Second)
 	for {
-		p.cpuSetAdjustmentRetryMu.Lock()
-		queued := p.cpuSetAdjustmentRetryQueued
-		p.cpuSetAdjustmentRetryMu.Unlock()
+		p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+		queued := p.adjustment.cpuSetAdjustmentRetryQueued
+		p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 		if !queued {
 			break
 		}
@@ -581,18 +561,18 @@ func TestDeferredFullRetryExhaustionStaysDirtyUntilPeriodicLatestStateReconcile(
 	if got := len(attempts); got != 4 {
 		t.Fatalf("retry attempts = %d, want bounded 4 attempts", got)
 	}
-	p.cpuSetAdjustmentRetryMu.Lock()
-	dirtyAfterExhaustion := p.cpuSetAdjustmentRetryDirty
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	dirtyAfterExhaustion := p.adjustment.cpuSetAdjustmentRetryDirty
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	if !dirtyAfterExhaustion {
 		t.Fatal("retry exhaustion cleared dirty latest-state reconciliation")
 	}
 
 	recovered = true
 	p.runBulkheadPeriodicalHandlers(nil, nil, nil, nil, nil)
-	p.cpuSetAdjustmentRetryMu.Lock()
-	dirtyAfterPeriodic := p.cpuSetAdjustmentRetryDirty
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	dirtyAfterPeriodic := p.adjustment.cpuSetAdjustmentRetryDirty
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	if dirtyAfterPeriodic {
 		t.Fatal("successful periodic latest-state reconciliation did not clear dirty state")
 	}
@@ -601,21 +581,19 @@ func TestDeferredFullRetryExhaustionStaysDirtyUntilPeriodicLatestStateReconcile(
 func TestDirtyCPUSetAdjustmentReconcileReturnsFailure(t *testing.T) {
 	t.Parallel()
 
-	p := &DynamicPolicy{
-		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
-			"persistent-failure": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-				return fmt.Errorf("persistent failure")
-			},
+	p := &DynamicPolicy{adjustment: adjustmentComponent{cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"persistent-failure": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			return fmt.Errorf("persistent failure")
 		},
-		cpuSetAdjustmentRetryDirty: true,
-	}
+	},
+		cpuSetAdjustmentRetryDirty: true}}
 
 	if err := p.reconcileDirtyCPUSetAdjustment(); err == nil {
 		t.Fatal("reconcileDirtyCPUSetAdjustment() error = nil, want persistent failure")
 	}
-	p.cpuSetAdjustmentRetryMu.Lock()
-	defer p.cpuSetAdjustmentRetryMu.Unlock()
-	if !p.cpuSetAdjustmentRetryDirty {
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	defer p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
+	if !p.adjustment.cpuSetAdjustmentRetryDirty {
 		t.Fatal("failed periodic reconciliation cleared dirty state")
 	}
 }
@@ -623,19 +601,17 @@ func TestDirtyCPUSetAdjustmentReconcileReturnsFailure(t *testing.T) {
 func TestPeriodicAdjustmentPreservesRetryScheduledDuringRound(t *testing.T) {
 	t.Parallel()
 
-	p := &DynamicPolicy{
-		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{},
-	}
-	p.cpuSetAdjustmentHandlers["schedule-during-round"] = func(
+	p := &DynamicPolicy{adjustment: adjustmentComponent{cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{}}}
+	p.adjustment.cpuSetAdjustmentHandlers["schedule-during-round"] = func(
 		context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx,
 	) error {
-		p.cpuSetAdjustmentRetryMu.Lock()
-		p.cpuSetAdjustmentRetryDirty = true
-		p.cpuSetAdjustmentRetryQueued = true
-		p.cpuSetAdjustmentRetryReasons = map[cpusetutil.CPUSetAdjustmentRetryReason]struct{}{
+		p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+		p.adjustment.cpuSetAdjustmentRetryDirty = true
+		p.adjustment.cpuSetAdjustmentRetryQueued = true
+		p.adjustment.cpuSetAdjustmentRetryReasons = map[cpusetutil.CPUSetAdjustmentRetryReason]struct{}{
 			cpusetutil.RetryReasonDeferredLeaf: {},
 		}
-		p.cpuSetAdjustmentRetryMu.Unlock()
+		p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 		return nil
 	}
 
@@ -646,12 +622,12 @@ func TestPeriodicAdjustmentPreservesRetryScheduledDuringRound(t *testing.T) {
 		t.Fatalf("runCPUSetAdjustmentHandlers() error = %v", err)
 	}
 
-	p.cpuSetAdjustmentRetryMu.Lock()
-	defer p.cpuSetAdjustmentRetryMu.Unlock()
-	if !p.cpuSetAdjustmentRetryDirty {
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	defer p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
+	if !p.adjustment.cpuSetAdjustmentRetryDirty {
 		t.Fatal("successful periodic round cleared a retry scheduled during handler execution")
 	}
-	if _, ok := p.cpuSetAdjustmentRetryReasons[cpusetutil.RetryReasonDeferredLeaf]; !ok {
+	if _, ok := p.adjustment.cpuSetAdjustmentRetryReasons[cpusetutil.RetryReasonDeferredLeaf]; !ok {
 		t.Fatal("successful periodic round dropped deferred-leaf retry reason scheduled during handler execution")
 	}
 }
@@ -662,7 +638,7 @@ func TestCPUSetAdjustmentCommitsTopologyReclaimOverride(t *testing.T) {
 	p, cleanup := newReclaimReuseTestPolicy(t)
 	defer cleanup()
 	setReclaimPoolCPUSet(t, p, machine.NewCPUSet(0, 1))
-	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"topology-override": func(_ context.Context, handlerCtx cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 			if handlerCtx.CommitOverride == nil {
 				t.Fatal("CPUSet adjustment runner did not provide a commit override")
@@ -700,7 +676,7 @@ func TestCPUSetAdjustmentRejectsRampUpSharedReclaimOverlapWhenHardPartitionEnabl
 		p, cleanup := newReclaimReuseTestPolicy(t)
 		t.Cleanup(cleanup)
 
-		dynamicConf := p.dynamicConfig.GetDynamicConfiguration()
+		dynamicConf := p.config.dynamicConfig.GetDynamicConfiguration()
 		dynamicConf.EnableReclaim = true
 		dynamicConf.EnableRampUpReclaimHardPartition = hardPartitionEnabled
 
@@ -721,7 +697,7 @@ func TestCPUSetAdjustmentRejectsRampUpSharedReclaimOverlapWhenHardPartitionEnabl
 		}
 		p.state.SetPodEntries(entries, false)
 
-		p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		p.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 			"topology-override": func(_ context.Context, handlerCtx cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 				if handlerCtx.CommitOverride == nil {
 					t.Fatal("CPUSet adjustment runner did not provide a commit override")
@@ -770,7 +746,7 @@ func TestCPUSetAdjustmentAlignsAdmissionReclaimOverrideToWholeCores(t *testing.T
 	setReclaimPoolCPUSet(t, p, machine.NewCPUSet(0, 1, 48, 49))
 	p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
 	var handlerCalls int32
-	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"topology-override": func(_ context.Context, handlerCtx cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 			if atomic.AddInt32(&handlerCalls, 1) == 1 {
 				handlerCtx.CommitOverride.ReclaimEffective = machine.NewCPUSet(1, 48, 49)
@@ -804,8 +780,8 @@ func TestCPUSetAdjustmentRetrySchedulesAgainWhenReclaimOverrideTrimmed(t *testin
 	defer cleanup()
 	setReclaimPoolCPUSet(t, p, machine.NewCPUSet(0, 1, 48, 49))
 	p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
-	p.cpuSetAdjustmentRetryQueued = true
-	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentRetryQueued = true
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"topology-override": func(_ context.Context, handlerCtx cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 			if handlerCtx.CommitOverride == nil {
 				t.Fatal("CPUSet adjustment runner did not provide a commit override")
@@ -825,9 +801,9 @@ func TestCPUSetAdjustmentRetrySchedulesAgainWhenReclaimOverrideTrimmed(t *testin
 	require.NotNil(t, reclaim)
 	require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(1, 49)),
 		"retry override must commit only complete physical cores, got %s", reclaim.AllocationResult)
-	require.True(t, p.cpuSetAdjustmentRetryAgain,
+	require.True(t, p.adjustment.cpuSetAdjustmentRetryAgain,
 		"trimming during a retry must request another latest-state pass to align runtime side effects with the committed checkpoint")
-	require.Contains(t, p.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonRecoveryCommit)
+	require.Contains(t, p.adjustment.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonRecoveryCommit)
 }
 
 func TestCPUSetAdjustmentCommitOverrideUsesRevisionGuard(t *testing.T) {
@@ -838,7 +814,7 @@ func TestCPUSetAdjustmentCommitOverrideUsesRevisionGuard(t *testing.T) {
 	setReclaimPoolCPUSet(t, p, machine.NewCPUSet(0, 1))
 	guardState := &cpusetOverrideCommitGuardState{State: p.state}
 	p.state = guardState
-	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"topology-override": func(_ context.Context, handlerCtx cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 			if handlerCtx.CommitOverride == nil {
 				t.Fatal("CPUSet adjustment runner did not provide a commit override")
@@ -872,7 +848,7 @@ func TestAdvisorCPUSetAdjustmentFailureRetainsDesiredStateAndRetries(t *testing.
 	setReclaimPoolCPUSet(t, p, desired)
 
 	retried := make(chan machine.CPUSet, 1)
-	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"transient-cgroup-failure": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 			reclaim := in.State.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
 			if in.Mode == cpusetutil.CPUSetAdjustmentModeRetry {
@@ -1057,12 +1033,12 @@ func TestAdvisorPostCommitRetryReplaysAllStagesUntilConverged(t *testing.T) {
 		require.ErrorContains(t, err, "transient cgroup failure")
 		require.Equal(t, []string{"headroom", "cgroup", "cpuset"}, calls)
 		require.True(t, p.hasPendingAdvisorPostCommitTarget(target.revision))
-		p.cpuSetAdjustmentRetryMu.Lock()
-		p.cpuSetAdjustmentRetryDirty = true
-		p.cpuSetAdjustmentRetryReasons = map[cpusetutil.CPUSetAdjustmentRetryReason]struct{}{
+		p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+		p.adjustment.cpuSetAdjustmentRetryDirty = true
+		p.adjustment.cpuSetAdjustmentRetryReasons = map[cpusetutil.CPUSetAdjustmentRetryReason]struct{}{
 			cpusetutil.RetryReasonApplyFailed: {},
 		}
-		p.cpuSetAdjustmentRetryMu.Unlock()
+		p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 
 		p.Lock()
 		err = p.reconcileAdvisorPostCommitTarget(context.Background(), target)
@@ -1070,10 +1046,10 @@ func TestAdvisorPostCommitRetryReplaysAllStagesUntilConverged(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, []string{"headroom", "cgroup", "cpuset", "headroom", "cgroup", "cpuset"}, calls)
 		require.False(t, p.hasPendingAdvisorPostCommitTarget(target.revision))
-		p.cpuSetAdjustmentRetryMu.Lock()
-		require.False(t, p.cpuSetAdjustmentRetryDirty)
-		require.NotContains(t, p.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
-		p.cpuSetAdjustmentRetryMu.Unlock()
+		p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+		require.False(t, p.adjustment.cpuSetAdjustmentRetryDirty)
+		require.NotContains(t, p.adjustment.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
+		p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	})
 }
 
@@ -1235,9 +1211,7 @@ func TestAdvisorPostCommitCheckpointCrashRecoveryAndSuccessfulCleanup(t *testing
 
 	restarted := &DynamicPolicy{
 		state:                          p.state,
-		advisorPostCommitCheckpointDir: dir,
-		cpuSetAdjustmentHandlers:       map[string]cpusetutil.CPUSetAdjustmentHandler{},
-	}
+		advisorPostCommitCheckpointDir: dir, adjustment: adjustmentComponent{cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{}}}
 	require.NoError(t, restarted.restoreAdvisorPostCommitTarget())
 	restored := restarted.currentAdvisorPostCommitTarget()
 	require.NotNil(t, restored)
@@ -1367,7 +1341,7 @@ func runAdvisorCheckpointReader(t *testing.T, dir string) {
 	p.advisorPostCommitCheckpointDir = dir
 	retryCalls := make(chan cpusetutil.CPUSetAdjustmentHandlerCtx, 1)
 	var retryCallCount int32
-	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"keep-pending": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 			atomic.AddInt32(&retryCallCount, 1)
 			select {
@@ -1403,10 +1377,10 @@ func runAdvisorCheckpointReader(t *testing.T, dir string) {
 	require.Equal(t, p.state.GetRevision(), target.revision)
 	require.Greater(t, target.revision, uint64(0))
 	require.True(t, p.hasPendingAdvisorPostCommitTarget(p.state.GetRevision()))
-	p.cpuSetAdjustmentRetryMu.Lock()
-	dirty := p.cpuSetAdjustmentRetryDirty
-	_, hasApplyFailedReason := p.cpuSetAdjustmentRetryReasons[cpusetutil.RetryReasonApplyFailed]
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	dirty := p.adjustment.cpuSetAdjustmentRetryDirty
+	_, hasApplyFailedReason := p.adjustment.cpuSetAdjustmentRetryReasons[cpusetutil.RetryReasonApplyFailed]
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	require.True(t, dirty)
 	require.True(t, hasApplyFailedReason)
 }
@@ -1448,7 +1422,7 @@ func TestAdvisorMigrationTransitionFailureRetainsWALAndStopsLaterSideEffects(t *
 	defer cleanup()
 	dir := t.TempDir()
 	p.advisorPostCommitCheckpointDir = dir
-	topology := p.machineInfo.CPUTopology
+	topology := p.machine.machineInfo.CPUTopology
 	oldTarget := coresInNUMA(topology, 0, 0, 1)
 	newTarget := coresInNUMA(topology, 0, 1, 2)
 	require.NoError(t, p.storeSteadyFakeNUMAMigrationTarget(
@@ -1492,12 +1466,12 @@ func TestAdvisorMigrationTransitionFailureRetainsWALAndStopsLaterSideEffects(t *
 	checkpointPath := p.steadyFakeNUMAMigrationCheckpointPath()
 	require.NoError(t, os.Remove(checkpointPath))
 	require.NoError(t, os.Mkdir(checkpointPath, 0o700))
-	p.cpuSetAdjustmentRetryMu.Lock()
-	p.cpuSetAdjustmentRetryStopping = true
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.cpuSetAdjustmentRetryStopping = true
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 
 	var adjustmentCalls int
-	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"observe": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 			adjustmentCalls++
 			return nil
@@ -1571,7 +1545,7 @@ func TestAdvisorMigrationTransitionSurvivesCommitCrashAndRestart(t *testing.T) {
 		restored.migrationCheckpointTransition.target.constraintDigest)
 
 	observedTransition := false
-	restarted.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+	restarted.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"observe-transition": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 			observedTransition = restarted.steadyFakeNUMAMigrationTarget != nil &&
 				restarted.steadyFakeNUMAMigrationTarget.constraintDigest == "restart"
@@ -1593,7 +1567,7 @@ func TestLegacyAdvisorWALDefaultsMigrationTransitionToKeep(t *testing.T) {
 	defer cleanup()
 	dir := t.TempDir()
 	p.advisorPostCommitCheckpointDir = dir
-	oldTarget := coresInNUMA(p.machineInfo.CPUTopology, 0, 0, 1)
+	oldTarget := coresInNUMA(p.machine.machineInfo.CPUTopology, 0, 0, 1)
 	require.NoError(t, p.storeSteadyFakeNUMAMigrationTarget(
 		&steadyFakeNUMAMigrationTarget{constraintDigest: "legacy", target: oldTarget}))
 	response, err := proto.Marshal(&advisorapi.ListAndWatchResponse{})
@@ -1628,7 +1602,7 @@ func TestAdvisorWALV2IsVersionedChecksummedAndFencedFromLegacyReaders(t *testing
 	response := &advisorapi.ListAndWatchResponse{
 		ExtraEntries: []*advisorsvc.CalculationInfo{{CgroupPath: "/v2"}},
 	}
-	targetCPUs := coresInNUMA(p.machineInfo.CPUTopology, 0, 0, 1)
+	targetCPUs := coresInNUMA(p.machine.machineInfo.CPUTopology, 0, 0, 1)
 	target := cloneAdvisorPostCommitTarget(
 		response,
 		p.state.GetRevision(),
@@ -1924,7 +1898,7 @@ func TestAdvisorMigrationTransitionStaleCASDoesNotApplyAndRemovesStagingWAL(t *t
 	defer cleanup()
 	dir := t.TempDir()
 	p.advisorPostCommitCheckpointDir = dir
-	topology := p.machineInfo.CPUTopology
+	topology := p.machine.machineInfo.CPUTopology
 	oldTarget := coresInNUMA(topology, 0, 0, 1)
 	require.NoError(t, p.storeSteadyFakeNUMAMigrationTarget(
 		&steadyFakeNUMAMigrationTarget{constraintDigest: "old", target: oldTarget}))
@@ -1981,9 +1955,9 @@ func TestAdvisorWriteAheadPromoteFailureKeepsCommittedTargetPendingAndRecoverabl
 	defer cleanup()
 	dir := t.TempDir()
 	p.advisorPostCommitCheckpointDir = dir
-	p.cpuSetAdjustmentRetryMu.Lock()
-	p.cpuSetAdjustmentRetryStopping = true
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.cpuSetAdjustmentRetryStopping = true
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	preCommitRevision := p.state.GetRevision()
 	activePath := filepath.Join(dir, advisorPostCommitCheckpointName)
 
@@ -2016,7 +1990,7 @@ func TestAdvisorWriteAheadPromoteFailureKeepsCommittedTargetPendingAndRecoverabl
 	require.Equal(t, p.state.GetRevision(), pending.revision)
 	require.FileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName+".staging"))
 
-	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"fail": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 			return errors.New("keep committed target pending")
 		},
@@ -2025,9 +1999,9 @@ func TestAdvisorWriteAheadPromoteFailureKeepsCommittedTargetPendingAndRecoverabl
 	require.ErrorContains(t, err, "publish committed advisor post-commit target")
 
 	require.NoError(t, os.Remove(activePath))
-	p.cpuSetAdjustmentRetryMu.Lock()
-	p.advisorPostCommitTarget = nil
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.advisorPostCommitTarget = nil
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	require.NoError(t, p.restoreAdvisorPostCommitTarget())
 	require.NotNil(t, p.currentAdvisorPostCommitTarget())
 	require.Equal(t, "/committed",
@@ -2041,13 +2015,13 @@ func TestAdvisorWriteAheadPromoteFailureRetriesPublicationBeforeApply(t *testing
 	defer cleanup()
 	dir := t.TempDir()
 	p.advisorPostCommitCheckpointDir = dir
-	p.cpuSetAdjustmentRetryMu.Lock()
-	p.cpuSetAdjustmentRetryStopping = true
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.cpuSetAdjustmentRetryStopping = true
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	preCommitRevision := p.state.GetRevision()
 	activePath := filepath.Join(dir, advisorPostCommitCheckpointName)
 	applied := make(chan map[int]float64, 1)
-	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"observe": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 			if _, err := os.Stat(activePath); err != nil {
 				return fmt.Errorf("active WAL is not durable before apply: %w", err)
@@ -2147,9 +2121,9 @@ func TestAdvisorWriteAheadCleanupFailureKeepsPreparedFence(t *testing.T) {
 			p, cleanup := newReclaimReuseTestPolicy(t)
 			defer cleanup()
 			p.installCPUStateWritePermit()
-			p.cpuSetAdjustmentRetryMu.Lock()
-			p.cpuSetAdjustmentRetryStopping = true
-			p.cpuSetAdjustmentRetryMu.Unlock()
+			p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+			p.adjustment.cpuSetAdjustmentRetryStopping = true
+			p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 			dir := t.TempDir()
 			p.advisorPostCommitCheckpointDir = dir
 			stagingPath := filepath.Join(dir, advisorPostCommitCheckpointName+".staging")
@@ -2199,9 +2173,9 @@ func TestAdvisorWriterGateSnapshotsPreparedTargetUnderRetryLock(t *testing.T) {
 		prepared:          true,
 		revision:          2,
 	}
-	p.cpuSetAdjustmentRetryMu.Lock()
-	p.advisorPostCommitTarget = target
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.advisorPostCommitTarget = target
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 
 	const iterations = 10000
 	start := make(chan struct{})
@@ -2211,11 +2185,11 @@ func TestAdvisorWriterGateSnapshotsPreparedTargetUnderRetryLock(t *testing.T) {
 		defer wg.Done()
 		<-start
 		for i := 0; i < iterations; i++ {
-			p.cpuSetAdjustmentRetryMu.Lock()
+			p.adjustment.cpuSetAdjustmentRetryMu.Lock()
 			target.prepared = i%2 == 0
 			target.preCommitRevision = uint64(i)
 			target.revision = uint64(i + 1)
-			p.cpuSetAdjustmentRetryMu.Unlock()
+			p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 		}
 	}()
 	close(start)
@@ -2311,9 +2285,9 @@ func TestAdvisorWriteAheadCommitFailurePreservesActiveTarget(t *testing.T) {
 	require.NoFileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName+".staging"))
 	require.Same(t, active, p.currentAdvisorPostCommitTarget())
 
-	p.cpuSetAdjustmentRetryMu.Lock()
-	p.advisorPostCommitTarget = nil
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.advisorPostCommitTarget = nil
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	require.NoError(t, p.restoreAdvisorPostCommitTarget())
 	require.Equal(t, "/active", p.currentAdvisorPostCommitTarget().response.ExtraEntries[0].CgroupPath)
 }
@@ -2339,8 +2313,7 @@ func TestAdvisorWriteAheadRecoverySelectsMainRevisionAndCleansOtherSlot(t *testi
 			require.NoError(t, err)
 			first := &DynamicPolicy{
 				state:                          firstState,
-				advisorPostCommitCheckpointDir: dir,
-			}
+				advisorPostCommitCheckpointDir: dir}
 			require.NoError(t, firstState.CommitAdvisorStateIfRevision(
 				firstState.GetRevision(),
 				firstState.GetPodEntries(),
@@ -2383,8 +2356,7 @@ func TestAdvisorWriteAheadRecoverySelectsMainRevisionAndCleansOtherSlot(t *testi
 			require.NoError(t, err)
 			restarted := &DynamicPolicy{
 				state:                          restartedState,
-				advisorPostCommitCheckpointDir: dir,
-			}
+				advisorPostCommitCheckpointDir: dir}
 			require.NoError(t, restarted.restoreAdvisorPostCommitTarget())
 			require.NotNil(t, restarted.currentAdvisorPostCommitTarget())
 			require.Equal(t, tc.wantPath,
@@ -2517,7 +2489,7 @@ func TestAdvisorV0PostCommitReplayCleansCheckpoint(t *testing.T) {
 	require.NoError(t, os.WriteFile(p.advisorPostCommitCheckpointPath(), data, 0o600))
 
 	applied := 0
-	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"count": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 			applied++
 			return nil
@@ -2561,8 +2533,7 @@ func TestAdvisorWriteAheadTargetRealRestartAtCommitCrashPoints(t *testing.T) {
 			require.NoError(t, err)
 			first := &DynamicPolicy{
 				state:                          firstState,
-				advisorPostCommitCheckpointDir: dir,
-			}
+				advisorPostCommitCheckpointDir: dir}
 			postCommitRevision, err := nextAdvisorRevision(firstState.GetRevision())
 			require.NoError(t, err)
 			target, err := first.prepareAdvisorPostCommitTarget(
@@ -2592,8 +2563,7 @@ func TestAdvisorWriteAheadTargetRealRestartAtCommitCrashPoints(t *testing.T) {
 			require.NoError(t, err)
 			restarted := &DynamicPolicy{
 				state:                          restartedState,
-				advisorPostCommitCheckpointDir: dir,
-			}
+				advisorPostCommitCheckpointDir: dir}
 			require.NoError(t, restarted.restoreAdvisorPostCommitTarget())
 			if tc.wantRecovered {
 				require.NotNil(t, restarted.currentAdvisorPostCommitTarget())
@@ -2616,17 +2586,17 @@ func TestAdvisorPostCommitCheckpointStopStartRequeuesPendingTarget(t *testing.T)
 		&advisorapi.ListAndWatchResponse{ExtraEntries: []*advisorsvc.CalculationInfo{{CgroupPath: "/pending"}}},
 		p.state.GetRevision())
 
-	p.cpuSetAdjustmentRetryMu.Lock()
-	p.cpuSetAdjustmentRetryStopping = true
-	p.cpuSetAdjustmentRetryDirty = false
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.cpuSetAdjustmentRetryStopping = true
+	p.adjustment.cpuSetAdjustmentRetryDirty = false
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	require.NoError(t, p.prepareAdvisorPostCommitTargetOnStart())
 
 	require.Same(t, target, p.currentAdvisorPostCommitTarget())
-	p.cpuSetAdjustmentRetryMu.Lock()
-	require.True(t, p.cpuSetAdjustmentRetryDirty)
-	require.Contains(t, p.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	require.True(t, p.adjustment.cpuSetAdjustmentRetryDirty)
+	require.Contains(t, p.adjustment.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	require.FileExists(t, filepath.Join(dir, advisorPostCommitCheckpointName),
 		"Stop/Start must retain the pending checkpoint")
 }
@@ -2640,9 +2610,9 @@ func TestAdvisorPostCommitCheckpointRevisionMismatchIsCleaned(t *testing.T) {
 	p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
 	p.state.SetAllowSharedCoresOverlapReclaimedCores(
 		!p.state.GetAllowSharedCoresOverlapReclaimedCores(), false)
-	p.cpuSetAdjustmentRetryMu.Lock()
-	p.advisorPostCommitTarget = nil
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.advisorPostCommitTarget = nil
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 
 	require.NoError(t, p.restoreAdvisorPostCommitTarget())
 	require.Nil(t, p.currentAdvisorPostCommitTarget())
@@ -2654,9 +2624,9 @@ func TestAdvisorPostCommitInitialStoreFailureCleansStagingAndFence(t *testing.T)
 	p, cleanup := newReclaimReuseTestPolicy(t)
 	defer cleanup()
 	p.advisorPostCommitCheckpointDir = dir
-	p.cpuSetAdjustmentRetryMu.Lock()
-	p.cpuSetAdjustmentRetryStopping = true
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.cpuSetAdjustmentRetryStopping = true
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	stagingPath := p.advisorPostCommitStagingPath()
 	require.NoError(t, os.Mkdir(stagingPath, 0o750))
 	commitCalled := false
@@ -2682,9 +2652,9 @@ func TestAdvisorPostCommitInitialStoreCleanupFailureRetainsFence(t *testing.T) {
 	p, cleanup := newReclaimReuseTestPolicy(t)
 	defer cleanup()
 	p.advisorPostCommitCheckpointDir = dir
-	p.cpuSetAdjustmentRetryMu.Lock()
-	p.cpuSetAdjustmentRetryStopping = true
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.cpuSetAdjustmentRetryStopping = true
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	stagingPath := p.advisorPostCommitStagingPath()
 	require.NoError(t, os.Mkdir(stagingPath, 0o750))
 	require.NoError(t, os.WriteFile(filepath.Join(stagingPath, "blocker"), []byte("x"), 0o600))
@@ -2741,7 +2711,7 @@ func TestAdvisorPostCommitExactReconcileMayCommitAdjustmentOverride(t *testing.T
 	revision := p.state.GetRevision()
 	target := p.publishAdvisorPostCommitTarget(
 		&advisorapi.ListAndWatchResponse{}, revision)
-	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"override": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 			in.CommitOverride.ReclaimEffective = machine.NewCPUSet(2, 3)
 			in.CommitOverride.Source = "exact advisor reconcile"
@@ -2788,9 +2758,9 @@ func TestAdvisorPostCommitCleanupRetryDoesNotRepeatSideEffects(t *testing.T) {
 	p, cleanup := newReclaimReuseTestPolicy(t)
 	defer cleanup()
 	p.advisorPostCommitCheckpointDir = dir
-	p.cpuSetAdjustmentRetryMu.Lock()
-	p.cpuSetAdjustmentRetryStopping = true
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.cpuSetAdjustmentRetryStopping = true
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	target := p.publishAdvisorPostCommitTarget(
 		&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
 	stagingPath := p.advisorPostCommitStagingPath()
@@ -2798,7 +2768,7 @@ func TestAdvisorPostCommitCleanupRetryDoesNotRepeatSideEffects(t *testing.T) {
 	blocker := filepath.Join(stagingPath, "blocker")
 	require.NoError(t, os.WriteFile(blocker, []byte("x"), 0o600))
 	applied := 0
-	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"count": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 			applied++
 			return nil
@@ -2811,12 +2781,12 @@ func TestAdvisorPostCommitCleanupRetryDoesNotRepeatSideEffects(t *testing.T) {
 	require.Error(t, err)
 	require.Equal(t, 1, applied)
 	require.Same(t, target, p.currentAdvisorPostCommitTarget())
-	p.cpuSetAdjustmentRetryMu.Lock()
-	p.cpuSetAdjustmentRetryDirty = true
-	p.cpuSetAdjustmentRetryReasons = map[cpusetutil.CPUSetAdjustmentRetryReason]struct{}{
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.cpuSetAdjustmentRetryDirty = true
+	p.adjustment.cpuSetAdjustmentRetryReasons = map[cpusetutil.CPUSetAdjustmentRetryReason]struct{}{
 		cpusetutil.RetryReasonApplyFailed: {},
 	}
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 
 	require.NoError(t, os.Remove(blocker))
 	p.Lock()
@@ -2826,10 +2796,10 @@ func TestAdvisorPostCommitCleanupRetryDoesNotRepeatSideEffects(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, applied, "cleanup retry must not repeat post-commit side effects")
 	require.Nil(t, p.currentAdvisorPostCommitTarget())
-	p.cpuSetAdjustmentRetryMu.Lock()
-	require.False(t, p.cpuSetAdjustmentRetryDirty)
-	require.Nil(t, p.cpuSetAdjustmentRetryReasons)
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	require.False(t, p.adjustment.cpuSetAdjustmentRetryDirty)
+	require.Nil(t, p.adjustment.cpuSetAdjustmentRetryReasons)
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 }
 
 func TestAdvisorPostCommitAppliedMarkerSkipsSideEffectsAfterRestore(t *testing.T) {
@@ -2843,15 +2813,15 @@ func TestAdvisorPostCommitAppliedMarkerSkipsSideEffectsAfterRestore(t *testing.T
 	target.applied = true
 	require.NoError(t, p.storeAdvisorPostCommitTarget(
 		target, p.advisorPostCommitCheckpointPath()))
-	p.cpuSetAdjustmentRetryMu.Lock()
-	p.advisorPostCommitTarget = nil
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.advisorPostCommitTarget = nil
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	require.NoError(t, p.restoreAdvisorPostCommitTarget())
 	restored := p.currentAdvisorPostCommitTarget()
 	require.NotNil(t, restored)
 	require.True(t, restored.applied)
 	applied := 0
-	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"count": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 			applied++
 			return nil
@@ -2926,8 +2896,8 @@ func TestAdvisorPostCommitProgressIdentityPhaseGenerationAndNotification(t *test
 }
 
 func TestAdvisorPostCommitProgressStuckOnlyForAgedPhysicalApply(t *testing.T) {
-	p := &DynamicPolicy{conf: config.NewConfiguration()}
-	threshold := advisorPostCommitStuckThreshold(p.conf)
+	p := &DynamicPolicy{config: configComponent{conf: config.NewConfiguration()}}
+	threshold := advisorPostCommitStuckThreshold(p.config.conf)
 	for _, tc := range []struct {
 		name        string
 		phase       advisorPostCommitPhase
@@ -2984,9 +2954,9 @@ func recoverStuckAdvisorPostCommitTargetForTest(
 	p *DynamicPolicy,
 	target *advisorPostCommitTarget,
 ) (bool, error) {
-	p.cpuSetAdjustmentRetryMu.Lock()
-	target.lastProgressAt = time.Now().Add(-advisorPostCommitStuckThreshold(p.conf) - time.Second)
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	target.lastProgressAt = time.Now().Add(-advisorPostCommitStuckThreshold(p.config.conf) - time.Second)
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	p.Lock()
 	defer p.Unlock()
 	return p.recoverStuckAdvisorPostCommitTargetLocked(context.Background(), target)
@@ -3017,13 +2987,13 @@ func TestRecoverStuckAdvisorPostCommitTargetReleasesFenceButRetainsDurableReplay
 		p.currentAdvisorPostCommitProgress().phase)
 	fenceTarget, _ := p.currentAdvisorPostCommitTargetAndChange()
 	require.Nil(t, fenceTarget)
-	p.cpuSetAdjustmentRetryMu.Lock()
-	_, targetPermitExists := p.advisorStateWritePermits[targetPermit]
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	_, targetPermitExists := p.adjustment.advisorStateWritePermits[targetPermit]
 	require.False(t, targetPermitExists)
-	require.Same(t, otherTarget, p.advisorStateWritePermits[otherPermit])
-	require.True(t, p.cpuSetAdjustmentRetryDirty)
-	require.Contains(t, p.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	require.Same(t, otherTarget, p.adjustment.advisorStateWritePermits[otherPermit])
+	require.True(t, p.adjustment.cpuSetAdjustmentRetryDirty)
+	require.Contains(t, p.adjustment.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 
 	p.Lock()
 	err = p.retryLatestCPUSetAdjustment(
@@ -3090,10 +3060,10 @@ func TestRecoverStuckAdvisorPostCommitTargetRestoresDurableReplayAfterRestart(t 
 	require.Nil(t, restarted.currentAdvisorPostCommitTarget(),
 		"a newer canonical revision supersedes the handed-off target")
 	require.NoFileExists(t, restarted.advisorPostCommitCheckpointPath())
-	restarted.cpuSetAdjustmentRetryMu.Lock()
-	require.True(t, restarted.cpuSetAdjustmentRetryDirty)
-	require.Contains(t, restarted.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
-	restarted.cpuSetAdjustmentRetryMu.Unlock()
+	restarted.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	require.True(t, restarted.adjustment.cpuSetAdjustmentRetryDirty)
+	require.Contains(t, restarted.adjustment.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
+	restarted.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 }
 
 func TestRetrySupersededAdvisorPostCommitTargetReconcilesLatestCanonicalState(t *testing.T) {
@@ -3110,7 +3080,7 @@ func TestRetrySupersededAdvisorPostCommitTargetReconcilesLatestCanonicalState(t 
 		p.state.GetPodEntries(), p.state.GetMachineState(), false, false, true))
 	require.Greater(t, p.state.GetRevision(), target.revision)
 	reconciled := 0
-	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"latest-canonical": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 			reconciled++
 			return nil
@@ -3135,9 +3105,9 @@ func TestRecoverStuckAdvisorPostCommitTargetWhileStoppingKeepsWAL(t *testing.T) 
 	target := p.publishAdvisorPostCommitTarget(
 		&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
 	p.recordAdvisorPostCommitProgress(target, advisorPostCommitPhasePhysicalApply)
-	p.cpuSetAdjustmentRetryMu.Lock()
-	p.cpuSetAdjustmentRetryStopping = true
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.cpuSetAdjustmentRetryStopping = true
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 
 	released, err := recoverStuckAdvisorPostCommitTargetForTest(p, target)
 	require.NoError(t, err)
@@ -3176,20 +3146,18 @@ func TestCgroupCreateRetriesOnlyDeferredLeafDirtyAdjustment(t *testing.T) {
 
 	t.Run("deferred leaf schedules retry", func(t *testing.T) {
 		attempted := make(chan struct{}, 1)
-		p := &DynamicPolicy{
-			cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
-				"retry": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-					if in.Mode == cpusetutil.CPUSetAdjustmentModeRetry {
-						attempted <- struct{}{}
-					}
-					return nil
-				},
+		p := &DynamicPolicy{adjustment: adjustmentComponent{cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+			"retry": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+				if in.Mode == cpusetutil.CPUSetAdjustmentModeRetry {
+					attempted <- struct{}{}
+				}
+				return nil
 			},
+		},
 			cpuSetAdjustmentRetryDirty: true,
 			cpuSetAdjustmentRetryReasons: map[cpusetutil.CPUSetAdjustmentRetryReason]struct{}{
 				cpusetutil.RetryReasonDeferredLeaf: {},
-			},
-		}
+			}}}
 
 		p.handleCgroupCreateEvent()
 		select {
@@ -3201,20 +3169,18 @@ func TestCgroupCreateRetriesOnlyDeferredLeafDirtyAdjustment(t *testing.T) {
 
 	t.Run("unrelated dirty reason does not schedule retry", func(t *testing.T) {
 		attempted := make(chan struct{}, 1)
-		p := &DynamicPolicy{
-			cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
-				"retry": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-					if in.Mode == cpusetutil.CPUSetAdjustmentModeRetry {
-						attempted <- struct{}{}
-					}
-					return nil
-				},
+		p := &DynamicPolicy{adjustment: adjustmentComponent{cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+			"retry": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+				if in.Mode == cpusetutil.CPUSetAdjustmentModeRetry {
+					attempted <- struct{}{}
+				}
+				return nil
 			},
+		},
 			cpuSetAdjustmentRetryDirty: true,
 			cpuSetAdjustmentRetryReasons: map[cpusetutil.CPUSetAdjustmentRetryReason]struct{}{
 				cpusetutil.RetryReasonStaleState: {},
-			},
-		}
+			}}}
 
 		p.handleCgroupCreateEvent()
 		select {
@@ -3236,11 +3202,11 @@ func TestDynamicPolicyConsumesRegisteredCacheSyncEvents(t *testing.T) {
 	}
 	stopCh := make(chan struct{})
 	p := &DynamicPolicy{
-		metaServer: &metaserver.MetaServer{
-			MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
-		},
 		stopCh: stopCh,
-		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+
+		meta: metaComponent{metaServer: &metaserver.MetaServer{
+			MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
+		}}, adjustment: adjustmentComponent{cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
 			"retry": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 				if in.Mode == cpusetutil.CPUSetAdjustmentModeRetry {
 					attempted <- struct{}{}
@@ -3248,10 +3214,10 @@ func TestDynamicPolicyConsumesRegisteredCacheSyncEvents(t *testing.T) {
 				return nil
 			},
 		},
-		cpuSetAdjustmentRetryDirty: true,
-		cpuSetAdjustmentRetryReasons: map[cpusetutil.CPUSetAdjustmentRetryReason]struct{}{
-			cpusetutil.RetryReasonDeferredLeaf: {},
-		},
+			cpuSetAdjustmentRetryDirty: true,
+			cpuSetAdjustmentRetryReasons: map[cpusetutil.CPUSetAdjustmentRetryReason]struct{}{
+				cpusetutil.RetryReasonDeferredLeaf: {},
+			}},
 	}
 	p.startKubeletPodCacheSyncDrivenCPUSetRetry()
 	fetcher.events <- podmeta.KubeletPodCacheSyncEvent{
@@ -3278,21 +3244,19 @@ func TestStopCancelsCPUSetAdjustmentRetryWorker(t *testing.T) {
 	started := make(chan struct{})
 	stopCh := make(chan struct{})
 	p := &DynamicPolicy{
-		started:                     true,
-		stopCh:                      stopCh,
-		cpuSetAdjustmentRetryStopCh: stopCh,
-		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
-			"wait-for-stop": func(ctx context.Context, _ cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-				select {
-				case <-started:
-				default:
-					close(started)
-				}
-				<-ctx.Done()
-				return ctx.Err()
-			},
-		},
-	}
+		started: true,
+		stopCh:  stopCh, adjustment: adjustmentComponent{cpuSetAdjustmentRetryStopCh: stopCh,
+			cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+				"wait-for-stop": func(ctx context.Context, _ cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+					select {
+					case <-started:
+					default:
+						close(started)
+					}
+					<-ctx.Done()
+					return ctx.Err()
+				},
+			}}}
 
 	p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonDeferredLeaf)
 	select {
@@ -3321,18 +3285,16 @@ func TestScheduleCPUSetAdjustmentRetryNoGoroutineLeak(t *testing.T) {
 	stopCh := make(chan struct{})
 	attempted := make(chan struct{}, 1)
 	p := &DynamicPolicy{
-		stopCh:                      stopCh,
-		cpuSetAdjustmentRetryStopCh: stopCh,
-		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
-			"noop": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-				select {
-				case attempted <- struct{}{}:
-				default:
-				}
-				return nil
-			},
-		},
-	}
+		stopCh: stopCh, adjustment: adjustmentComponent{cpuSetAdjustmentRetryStopCh: stopCh,
+			cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+				"noop": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+					select {
+					case attempted <- struct{}{}:
+					default:
+					}
+					return nil
+				},
+			}}}
 
 	p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonDeferredLeaf)
 
@@ -3344,7 +3306,7 @@ func TestScheduleCPUSetAdjustmentRetryNoGoroutineLeak(t *testing.T) {
 
 	// The retry worker (func1) must wind down on its own after a successful
 	// attempt; the per-attempt stopCh watcher (func2) must exit on ctx.Done().
-	p.cpuSetAdjustmentRetryWG.Wait()
+	p.adjustment.cpuSetAdjustmentRetryWG.Wait()
 
 	close(stopCh)
 	time.Sleep(200 * time.Millisecond)
@@ -3362,15 +3324,13 @@ func TestScheduleCPUSetAdjustmentRetryNoGoroutineLeak(t *testing.T) {
 func TestRunCPUSetAdjustmentHandlersDoesNotHoldPolicyLockDuringExecution(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
-	p := &DynamicPolicy{
-		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
-			"blocking-io": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-				close(started)
-				<-release
-				return nil
-			},
+	p := &DynamicPolicy{adjustment: adjustmentComponent{cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"blocking-io": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			close(started)
+			<-release
+			return nil
 		},
-	}
+	}}}
 
 	runDone := make(chan error, 1)
 	go func() {
@@ -3412,7 +3372,7 @@ func TestRunCPUSetAdjustmentHandlersFenceRejectsStaleStateBeforeRetry(t *testing
 	if err != nil {
 		t.Fatalf("getTestDynamicPolicyWithInitialization() error = %v", err)
 	}
-	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"blocking-io": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 			if in.Generation == 1 {
 				close(started)
@@ -3459,7 +3419,7 @@ func TestRunCPUSetAdjustmentHandlersRetriesLatestStateAfterFenceRejection(t *tes
 	if err != nil {
 		t.Fatalf("getTestDynamicPolicyWithInitialization() error = %v", err)
 	}
-	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"generation-aware": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 			if in.Generation == 1 {
 				close(firstStarted)
@@ -3509,7 +3469,7 @@ func TestRunCPUSetAdjustmentHandlersSchedulesLatestStateAfterCanceledStaleRound(
 	if err != nil {
 		t.Fatalf("getTestDynamicPolicyWithInitialization() error = %v", err)
 	}
-	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"generation-aware": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 			if in.Generation == 1 {
 				close(firstStarted)
@@ -3551,7 +3511,7 @@ func TestRunCPUSetAdjustmentHandlersSerializesLockFreeRounds(t *testing.T) {
 	firstRelease := make(chan struct{})
 	secondStarted := make(chan struct{})
 	p := &DynamicPolicy{}
-	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"blocking-io": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 			if in.Generation == 1 {
 				close(firstStarted)
@@ -3593,18 +3553,16 @@ func TestRunCPUSetAdjustmentHandlersCancelsWhileWaitingForExecutionLock(t *testi
 	firstStarted := make(chan struct{})
 	firstRelease := make(chan struct{})
 	var calls int
-	p := &DynamicPolicy{
-		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
-			"blocking-io": func(_ context.Context, _ cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-				calls++
-				if calls == 1 {
-					close(firstStarted)
-					<-firstRelease
-				}
-				return nil
-			},
+	p := &DynamicPolicy{adjustment: adjustmentComponent{cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"blocking-io": func(_ context.Context, _ cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			calls++
+			if calls == 1 {
+				close(firstStarted)
+				<-firstRelease
+			}
+			return nil
 		},
-	}
+	}}}
 
 	firstDone := make(chan error, 1)
 	go func() {
@@ -3652,22 +3610,20 @@ func TestQueuedRetryRequestsAlwaysProduceOneTrailingLatestStateRound(t *testing.
 			firstRelease := make(chan struct{})
 			rounds := make(chan struct{}, 3)
 			calls := 0
-			p := &DynamicPolicy{
-				cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
-					"retry": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-						if in.Mode != cpusetutil.CPUSetAdjustmentModeRetry {
-							return nil
-						}
-						calls++
-						rounds <- struct{}{}
-						if calls == 1 {
-							close(firstStarted)
-							<-firstRelease
-						}
+			p := &DynamicPolicy{adjustment: adjustmentComponent{cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+				"retry": func(_ context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+					if in.Mode != cpusetutil.CPUSetAdjustmentModeRetry {
 						return nil
-					},
+					}
+					calls++
+					rounds <- struct{}{}
+					if calls == 1 {
+						close(firstStarted)
+						<-firstRelease
+					}
+					return nil
 				},
-			}
+			}}}
 
 			p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonDeferredLeaf)
 			<-firstStarted
@@ -3688,9 +3644,9 @@ func TestQueuedRetryRequestsAlwaysProduceOneTrailingLatestStateRound(t *testing.
 			}
 			deadline := time.Now().Add(time.Second)
 			for {
-				p.cpuSetAdjustmentRetryMu.Lock()
-				queued := p.cpuSetAdjustmentRetryQueued
-				p.cpuSetAdjustmentRetryMu.Unlock()
+				p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+				queued := p.adjustment.cpuSetAdjustmentRetryQueued
+				p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 				if !queued {
 					break
 				}

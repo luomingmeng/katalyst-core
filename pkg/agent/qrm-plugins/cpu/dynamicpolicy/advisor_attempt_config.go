@@ -34,22 +34,22 @@ func (p *DynamicPolicy) captureAdvisorAttemptConfiguration() (advisorAttemptConf
 	if p == nil {
 		return advisorAttemptConfiguration{}, nil
 	}
-	if p.dynamicConfig != nil &&
-		(p.conf == nil || p.conf.DynamicAgentConfiguration == nil ||
-			p.conf.DynamicAgentConfiguration == p.dynamicConfig) {
-		return captureAdvisorAttemptConfigurationFrom(p.dynamicConfig)
+	if p.config.dynamicConfig != nil &&
+		(p.config.conf == nil || p.config.conf.DynamicAgentConfiguration == nil ||
+			p.config.conf.DynamicAgentConfiguration == p.config.dynamicConfig) {
+		return captureAdvisorAttemptConfigurationFrom(p.config.dynamicConfig)
 	}
-	if p.dynamicConfig == nil {
-		if p.conf == nil || p.conf.DynamicAgentConfiguration == nil {
+	if p.config.dynamicConfig == nil {
+		if p.config.conf == nil || p.config.conf.DynamicAgentConfiguration == nil {
 			return advisorAttemptConfiguration{}, nil
 		}
-		return captureAdvisorAttemptConfigurationFrom(p.conf)
+		return captureAdvisorAttemptConfigurationFrom(p.config.conf)
 	}
-	dynamic, err := captureAdvisorAttemptConfigurationFrom(p.dynamicConfig)
+	dynamic, err := captureAdvisorAttemptConfigurationFrom(p.config.dynamicConfig)
 	if err != nil {
 		return advisorAttemptConfiguration{}, err
 	}
-	floor, err := captureAdvisorAttemptConfigurationFrom(p.conf)
+	floor, err := captureAdvisorAttemptConfigurationFrom(p.config.conf)
 	if err != nil {
 		return advisorAttemptConfiguration{}, err
 	}

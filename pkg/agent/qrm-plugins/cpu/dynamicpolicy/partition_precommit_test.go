@@ -86,11 +86,11 @@ func TestCommitPendingCPUPartitionRunsHooksBeforeValidation(t *testing.T) {
 	p, cleanup := newReclaimReuseTestPolicy(t)
 	defer cleanup()
 	emitter := &recordingMetricEmitter{}
-	p.emitter = emitter
+	p.emitter.emitter = emitter
 
 	candidate := precommitPartitionEntries(machine.NewCPUSet(0, 1), machine.NewCPUSet(2, 3))
 	original := candidate.Clone()
-	p.allocationHooks = []AllocationHook{func(_, allocation *state.AllocationInfo) error {
+	p.allocation.allocationHooks = []AllocationHook{func(_, allocation *state.AllocationInfo) error {
 		if allocation.PodUid == "dedicated-pod" {
 			allocation.AllocationResult = machine.NewCPUSet(1, 2)
 		}
@@ -114,11 +114,11 @@ func TestPreparePendingCPUPartitionUsesFrozenDynamicConfiguration(t *testing.T) 
 	p, cleanup := newReclaimReuseTestPolicy(t)
 	defer cleanup()
 
-	frozen := p.dynamicConfig.GetDynamicConfiguration()
+	frozen := p.config.dynamicConfig.GetDynamicConfiguration()
 	frozen.FillDefaultSharePoolWithNonReclaimCPUs = false
 	replacement := dynamicconfig.NewConfiguration()
 	replacement.FillDefaultSharePoolWithNonReclaimCPUs = true
-	p.dynamicConfig.SetDynamicConfiguration(replacement)
+	p.config.dynamicConfig.SetDynamicConfiguration(replacement)
 
 	_, err := p.preparePendingCPUPartition(pendingCPUPartition{
 		expectedRevision: p.state.GetRevision(),
@@ -137,7 +137,7 @@ func TestCaptureAdvisorAttemptConfigurationClonesMutableFields(t *testing.T) {
 	p, cleanup := newReclaimReuseTestPolicy(t)
 	defer cleanup()
 
-	current := p.dynamicConfig.GetDynamicConfiguration()
+	current := p.config.dynamicConfig.GetDynamicConfiguration()
 	current.EnableRampUpReclaimHardPartition = true
 	current.InitialRampUpReclaimCPUSetRatio = 0.2
 	current.SystemExclusivePool = map[string]int{"system": 2}
@@ -193,7 +193,7 @@ func TestPreparePendingCPUPartitionDerivesHardFloorFromFinalCandidate(t *testing
 	p, cleanup := newReclaimReuseTestPolicy(t)
 	defer cleanup()
 
-	current := p.dynamicConfig.GetDynamicConfiguration()
+	current := p.config.dynamicConfig.GetDynamicConfiguration()
 	current.EnableReclaim = true
 	current.EnableRampUpReclaimHardPartition = true
 	current.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.Enable = true
@@ -202,7 +202,7 @@ func TestPreparePendingCPUPartitionDerivesHardFloorFromFinalCandidate(t *testing
 
 	candidate := precommitPartitionEntries(machine.NewCPUSet(0, 1), machine.NewCPUSet(2, 3))
 	require.False(t, candidate.HasActiveRampUp())
-	p.allocationHooks = []AllocationHook{func(_, allocation *state.AllocationInfo) error {
+	p.allocation.allocationHooks = []AllocationHook{func(_, allocation *state.AllocationInfo) error {
 		if allocation.PodUid == "dedicated-pod" {
 			allocation.RampUp = true
 		}
@@ -219,7 +219,7 @@ func TestPreparePendingCPUPartitionDerivesHardFloorFromFinalCandidate(t *testing
 		validate: func(entries state.PodEntries, _ state.NUMANodeMap, _, _ bool) error {
 			validated = true
 			require.True(t, entries.HasActiveRampUp())
-			testRampUpDomains, derr := entries.ActiveRampUpDomains(p.machineInfo.CPUTopology)
+			testRampUpDomains, derr := entries.ActiveRampUpDomains(p.machine.machineInfo.CPUTopology)
 			require.NoError(t, derr)
 			options := p.cpuSetPartitionViewOptionsWithDynamicConfig(
 				p.state, testRampUpDomains, frozen.dynamic)
@@ -244,7 +244,7 @@ func TestCommitPendingCPUPartitionValidatesResidualBackfillAfterHooks(t *testing
 		)
 		initialEntries := p.state.GetPodEntries()
 		initialRevision := p.state.GetRevision()
-		p.allocationHooks = []AllocationHook{func(_, allocation *state.AllocationInfo) error {
+		p.allocation.allocationHooks = []AllocationHook{func(_, allocation *state.AllocationInfo) error {
 			if allocation.PodUid == "dedicated-pod" {
 				allocation.AllocationResult = machine.NewCPUSet(4, 5)
 				allocation.OriginalAllocationResult = machine.NewCPUSet(4, 5)
@@ -276,7 +276,7 @@ func TestCommitPendingCPUPartitionValidatesResidualBackfillAfterHooks(t *testing
 		)
 		initialEntries := p.state.GetPodEntries()
 		initialRevision := p.state.GetRevision()
-		p.allocationHooks = []AllocationHook{func(_, allocation *state.AllocationInfo) error {
+		p.allocation.allocationHooks = []AllocationHook{func(_, allocation *state.AllocationInfo) error {
 			if allocation.PodUid == "dedicated-pod" {
 				allocation.AllocationResult = machine.NewCPUSet(2)
 				allocation.OriginalAllocationResult = machine.NewCPUSet(2)
@@ -306,7 +306,7 @@ func TestCommitPendingCPUPartitionValidatesResidualBackfillAfterHooks(t *testing
 			machine.NewCPUSet(2, 4),
 			machine.NewCPUSet(4, 5, 6, 7),
 		)
-		p.allocationHooks = []AllocationHook{func(_, allocation *state.AllocationInfo) error {
+		p.allocation.allocationHooks = []AllocationHook{func(_, allocation *state.AllocationInfo) error {
 			if allocation.PodUid == "dedicated-pod" {
 				allocation.AllocationResult = machine.NewCPUSet(2, 3)
 				allocation.OriginalAllocationResult = machine.NewCPUSet(2, 3)
@@ -375,7 +375,7 @@ func TestCommitPendingCPUPartitionValidatesResidualBackfillAfterHooks(t *testing
 			machine.NewCPUSet(4, 5, 6, 7),
 		)
 		machineState, err := generateMachineStateFromPodEntries(
-			p.machineInfo.CPUTopology, candidate, p.state.GetMachineState())
+			p.machine.machineInfo.CPUTopology, candidate, p.state.GetMachineState())
 		require.NoError(t, err)
 		candidate[commonstate.PoolNameShare][commonstate.FakedContainerName].
 			TopologyAwareAssignments = map[int]machine.CPUSet{0: machine.NewCPUSet(4, 5)}
@@ -389,7 +389,7 @@ func TestCommitPendingCPUPartitionNormalizesBeforeRebuildingMachineState(t *test
 	p, cleanup := newReclaimReuseTestPolicy(t)
 	defer cleanup()
 	emitter := &recordingMetricEmitter{}
-	p.emitter = emitter
+	p.emitter.emitter = emitter
 
 	candidate := precommitPartitionEntries(machine.NewCPUSet(0, 1), machine.NewCPUSet(2, 3))
 	dedicated := candidate["dedicated-pod"]["main"]
@@ -415,7 +415,7 @@ func TestCommitPendingCPUPartitionRejectsRevisionChangedByHook(t *testing.T) {
 	defer cleanup()
 
 	candidate := precommitPartitionEntries(machine.NewCPUSet(0, 1), machine.NewCPUSet(2, 3))
-	p.allocationHooks = []AllocationHook{func(_, _ *state.AllocationInfo) error {
+	p.allocation.allocationHooks = []AllocationHook{func(_, _ *state.AllocationInfo) error {
 		p.state.SetAllowSharedCoresOverlapReclaimedCores(
 			!p.state.GetAllowSharedCoresOverlapReclaimedCores(), false)
 		return nil
@@ -436,7 +436,7 @@ func TestPreparePendingCPUPartitionRevalidatesQuantityAfterHooks(t *testing.T) {
 	defer cleanup()
 
 	candidate := precommitPartitionEntries(machine.NewCPUSet(0, 48), machine.NewCPUSet(1, 49))
-	p.allocationHooks = []AllocationHook{func(_, allocation *state.AllocationInfo) error {
+	p.allocation.allocationHooks = []AllocationHook{func(_, allocation *state.AllocationInfo) error {
 		if allocation.PodUid == "dedicated-pod" {
 			allocation.AllocationResult = machine.NewCPUSet(1)
 		}
@@ -595,9 +595,9 @@ func TestCommitPendingAdvisorStateRejectsFragmentedReclaimInDisjointMode(t *test
 	defer cleanup()
 
 	revision := p.state.GetRevision()
-	core := coresInNUMA(p.machineInfo.CPUTopology, 0, 0, 1)
+	core := coresInNUMA(p.machine.machineInfo.CPUTopology, 0, 0, 1)
 	fragmentedReclaim := machine.NewCPUSet(core.ToSliceInt()[0])
-	dedicated := coresInNUMA(p.machineInfo.CPUTopology, 0, 1, 2)
+	dedicated := coresInNUMA(p.machine.machineInfo.CPUTopology, 0, 1, 2)
 
 	err := p.commitPendingAdvisorState(&pendingAdvisorState{
 		preCommitRevision: revision,
@@ -637,13 +637,13 @@ func TestPoolAdjustmentRejectsFragmentedReclaimBeforeCommit(t *testing.T) {
 
 	revision := p.state.GetRevision()
 	currentEntries := p.state.GetPodEntries()
-	require.NoError(t, assertCoreAligned(currentReclaim, p.machineInfo.CPUTopology))
+	require.NoError(t, assertCoreAligned(currentReclaim, p.machine.machineInfo.CPUTopology))
 	require.Equal(t, 4, currentReclaim.Size())
 
 	err = p.applyPoolsAndIsolatedInfo(
 		map[string]machine.CPUSet{
 			commonstate.PoolNameReclaim: machine.NewCPUSet(1, 2, 25, 26),
-			commonstate.PoolNameReserve: p.reservedCPUs.Clone(),
+			commonstate.PoolNameReserve: p.config.reservedCPUs.Clone(),
 		},
 		map[string]map[string]machine.CPUSet{},
 		currentEntries,
@@ -970,8 +970,8 @@ func newResidualBackfillPrecommitTestPolicy(t *testing.T) (*DynamicPolicy, error
 	if err != nil {
 		return nil, err
 	}
-	p.reservedCPUs = machine.NewCPUSet()
-	dynamicConf := p.dynamicConfig.GetDynamicConfiguration()
+	p.config.reservedCPUs = machine.NewCPUSet()
+	dynamicConf := p.config.dynamicConfig.GetDynamicConfiguration()
 	dynamicConf.FillDefaultSharePoolWithNonReclaimCPUs = true
 	dynamicConf.EnableRampUpReclaimHardPartition = false
 	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.Enable = false

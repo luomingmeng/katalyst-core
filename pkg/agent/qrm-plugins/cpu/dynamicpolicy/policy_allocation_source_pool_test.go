@@ -215,9 +215,7 @@ func TestDynamicPolicy_takeByTieredPreferredCPUs(t *testing.T) {
 			}
 		}
 
-		policy := &DynamicPolicy{
-			machineInfo: &machine.KatalystMachineInfo{CPUTopology: topology},
-		}
+		policy := &DynamicPolicy{machine: machineComponent{machineInfo: &machine.KatalystMachineInfo{CPUTopology: topology}}}
 		available := topology.CPUDetails.CPUs()
 		atomicDonor := machine.NewCPUSet(2, 6)
 
@@ -609,7 +607,7 @@ func TestDynamicPolicy_generatePoolsAndIsolation_reclaimsIsolationCPUs(t *testin
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	require.NoError(t, err)
 
-	p.reservedCPUs = machine.NewCPUSet()
+	p.config.reservedCPUs = machine.NewCPUSet()
 	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, true)
 
 	// seed an existing shared_cores isolation container that historically borrowed 8,9,10
@@ -660,7 +658,7 @@ func TestDynamicPolicy_generatePoolsAndIsolation_overlapReclaimsIsolationCPUs(t 
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	require.NoError(t, err)
 
-	p.reservedCPUs = machine.NewCPUSet()
+	p.config.reservedCPUs = machine.NewCPUSet()
 	p.state.SetAllowSharedCoresOverlapReclaimedCores(true, true)
 	p.state.SetPodEntries(state.PodEntries{
 		"pod1": state.ContainerEntries{

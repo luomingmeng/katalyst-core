@@ -48,8 +48,8 @@ func TestTargetDrivenReclaimConfigCombinations(t *testing.T) {
 			require.NoError(t, err)
 			p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 			require.NoError(t, err)
-			p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = tc.enableReclaim
-			p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = tc.hardPartition
+			p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = tc.enableReclaim
+			p.config.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = tc.hardPartition
 			p.state.SetDisableDedicatedCoresOverlapReclaimedCores(tc.disableOverlap, false)
 			require.Equal(t, tc.expectEnabled, p.targetDrivenHardReclaimEnabled())
 		})

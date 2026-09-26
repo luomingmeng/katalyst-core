@@ -426,7 +426,7 @@ func TestCommitPendingAdvisorStateAppliesCheckpointTransitionOnlyAfterSuccessful
 		t.Run(tc.name, func(t *testing.T) {
 			policy, cleanup := newReclaimReuseTestPolicy(t)
 			defer cleanup()
-			topology := policy.machineInfo.CPUTopology
+			topology := policy.machine.machineInfo.CPUTopology
 			oldTarget := coresInNUMA(topology, 0, 2, 3)
 			newTarget := coresInNUMA(topology, 0, 3, 4)
 			require.NoError(t, policy.storeSteadyFakeNUMAMigrationTarget(
@@ -463,7 +463,7 @@ func TestCommitPendingAdvisorStateAppliesCheckpointTransitionOnlyAfterSuccessful
 func TestCommitPendingAdvisorStateDoesNotApplyCheckpointTransitionAfterSuccessfulCAS(t *testing.T) {
 	policy, cleanup := newReclaimReuseTestPolicy(t)
 	defer cleanup()
-	topology := policy.machineInfo.CPUTopology
+	topology := policy.machine.machineInfo.CPUTopology
 	oldTarget := coresInNUMA(topology, 0, 2, 3)
 	newTarget := coresInNUMA(topology, 0, 3, 4)
 	require.NoError(t, policy.storeSteadyFakeNUMAMigrationTarget(

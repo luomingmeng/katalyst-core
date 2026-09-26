@@ -212,9 +212,9 @@ func TestAllocationRequestLockSerializesOnlySameContainer(t *testing.T) {
 		t.Fatal("same-container waiter did not acquire the released allocation lock")
 	}
 
-	p.allocationRequestLocksMu.Lock()
-	defer p.allocationRequestLocksMu.Unlock()
-	require.Empty(t, p.allocationRequestLocks)
+	p.allocation.allocationRequestLocksMu.Lock()
+	defer p.allocation.allocationRequestLocksMu.Unlock()
+	require.Empty(t, p.allocation.allocationRequestLocks)
 }
 
 func generateSharedNumaBindingPoolAllocationMeta(poolName string) commonstate.AllocationMeta {
@@ -287,25 +287,12 @@ func getTestDynamicPolicyWithoutInitialization(
 	}
 
 	policyImplement := &DynamicPolicy{
-		conf:                      conf,
-		machineInfo:               machineInfo,
-		qosConfig:                 qosConfig,
-		dynamicConfig:             dynamicConfig,
-		state:                     stateImpl,
-		advisorValidator:          validator.NewCPUAdvisorValidator(stateImpl, machineInfo),
-		featureGateManager:        featuregatenegotiation.NewFeatureGateManager(config.NewConfiguration()),
-		reservedReclaimedCPUsSize: general.Max(reservedReclaimedCPUsSize, topology.NumNUMANodes),
-		reservedCPUs:              reservedCPUs,
-		enableReclaimNUMABinding:  true,
-		emitter:                   metrics.DummyMetrics{},
-		podDebugAnnoKeys:          []string{podDebugAnnoKey},
-		numaNumberAnnotationKey:   consts.PodAnnotationCPUEnhancementNumaNumber,
-		numaIDsAnnotationKey:      consts.PodAnnotationCPUEnhancementNumaIDs,
-		resourcePackageManager:    resourcepackage.NewCachedResourcePackageManager(resourcepackage.NewResourcePackageManager(&npd.DummyNPDFetcher{NPD: &nodev1alpha1.NodeProfileDescriptor{}})),
-		bulkheadManager:           bulkheadManager,
-
-		topologyAllocationAnnotationKey: coreconsts.QRMPodAnnotationTopologyAllocationKey,
-	}
+		state: stateImpl,
+		advisor: advisorComponent{
+			advisorValidator:   validator.NewCPUAdvisorValidator(stateImpl, machineInfo),
+			featureGateManager: featuregatenegotiation.NewFeatureGateManager(config.NewConfiguration()),
+		},
+		resourcePackageManager: resourcepackage.NewCachedResourcePackageManager(resourcepackage.NewResourcePackageManager(&npd.DummyNPDFetcher{NPD: &nodev1alpha1.NodeProfileDescriptor{}})), machine: machineComponent{machineInfo: machineInfo}, emitter: emitterComponent{emitter: metrics.DummyMetrics{}}, reclaim: reclaimComponent{reservedReclaimedCPUsSize: general.Max(reservedReclaimedCPUsSize, topology.NumNUMANodes)}, config: configComponent{conf: conf, qosConfig: qosConfig, dynamicConfig: dynamicConfig, reservedCPUs: reservedCPUs, enableReclaimNUMABinding: true, podDebugAnnoKeys: []string{podDebugAnnoKey}, numaNumberAnnotationKey: consts.PodAnnotationCPUEnhancementNumaNumber, numaIDsAnnotationKey: consts.PodAnnotationCPUEnhancementNumaIDs, topologyAllocationAnnotationKey: coreconsts.QRMPodAnnotationTopologyAllocationKey}, bulkhead: bulkheadComponent{bulkheadManager: bulkheadManager}}
 	policyImplement.advisorPostCommitCheckpointDir = stateFileDirectory
 	if err := policyImplement.restoreSteadyFakeNUMAMigrationTarget(); err != nil {
 		return nil, fmt.Errorf("restore steady fake-NUMA migration target: %w", err)
@@ -317,7 +304,7 @@ func getTestDynamicPolicyWithoutInitialization(
 	policyImplement.RegisterAllocationHook(policyImplement.topologyAllocationHook)
 
 	// register allocation behaviors for pods with different QoS level
-	policyImplement.allocationHandlers = map[string]util.AllocationHandler{
+	policyImplement.allocation.allocationHandlers = map[string]util.AllocationHandler{
 		consts.PodAnnotationQoSLevelSharedCores:    policyImplement.sharedCoresAllocationHandler,
 		consts.PodAnnotationQoSLevelDedicatedCores: policyImplement.dedicatedCoresAllocationHandler,
 		consts.PodAnnotationQoSLevelReclaimedCores: policyImplement.reclaimedCoresAllocationHandler,
@@ -325,14 +312,14 @@ func getTestDynamicPolicyWithoutInitialization(
 	}
 
 	// register hint providers for pods with different QoS level
-	policyImplement.hintHandlers = map[string]util.HintHandler{
+	policyImplement.allocation.hintHandlers = map[string]util.HintHandler{
 		consts.PodAnnotationQoSLevelSharedCores:    policyImplement.sharedCoresHintHandler,
 		consts.PodAnnotationQoSLevelDedicatedCores: policyImplement.dedicatedCoresHintHandler,
 		consts.PodAnnotationQoSLevelReclaimedCores: policyImplement.reclaimedCoresHintHandler,
 		consts.PodAnnotationQoSLevelSystemCores:    policyImplement.systemCoresHintHandler,
 	}
 
-	policyImplement.metaServer = &metaserver.MetaServer{
+	policyImplement.meta.metaServer = &metaserver.MetaServer{
 		MetaAgent: &agent.MetaAgent{
 			PodFetcher:          &pod.PodFetcherStub{},
 			KatalystMachineInfo: machineInfo,
@@ -379,7 +366,7 @@ func TestCleanPoolsKeepsSyntheticDefaultShareWhenBackfillEnabled(t *testing.T) {
 	t.Parallel()
 
 	policy := newTestDynamicPolicy(t, "keep-synthetic-share")
-	policy.dynamicConfig.GetDynamicConfiguration().
+	policy.config.dynamicConfig.GetDynamicConfiguration().
 		FillDefaultSharePoolWithNonReclaimCPUs = true
 	policy.state.SetPodEntries(state.PodEntries{
 		commonstate.PoolNameShare: {
@@ -423,7 +410,7 @@ func TestCleanPoolsDeletesDefaultShareAfterBackfillFlippedOff(t *testing.T) {
 
 	policy := newTestDynamicPolicy(t, "delete-synthetic-share-gate-flip")
 	// open the gate first so the synthetic share pool would be retained.
-	policy.dynamicConfig.GetDynamicConfiguration().
+	policy.config.dynamicConfig.GetDynamicConfiguration().
 		FillDefaultSharePoolWithNonReclaimCPUs = true
 	policy.state.SetPodEntries(state.PodEntries{
 		commonstate.PoolNameShare: {
@@ -437,7 +424,7 @@ func TestCleanPoolsDeletesDefaultShareAfterBackfillFlippedOff(t *testing.T) {
 
 	// dynamically flip the gate back to false; cleanPools should now follow the
 	// legacy rules and delete the no-owner share pool.
-	policy.dynamicConfig.GetDynamicConfiguration().
+	policy.config.dynamicConfig.GetDynamicConfiguration().
 		FillDefaultSharePoolWithNonReclaimCPUs = false
 
 	require.NoError(t, policy.cleanPools())
@@ -450,7 +437,7 @@ func TestCleanPoolsFromPodEntries(t *testing.T) {
 	t.Parallel()
 
 	policy := newTestDynamicPolicy(t, "clean-pools-from-entries")
-	policy.dynamicConfig.GetDynamicConfiguration().
+	policy.config.dynamicConfig.GetDynamicConfiguration().
 		FillDefaultSharePoolWithNonReclaimCPUs = true
 
 	newPoolEntry := func(poolName string) state.ContainerEntries {
@@ -701,11 +688,11 @@ func TestGetResourcesAllocationLegacyRampUpExcludesReclaimFloor(t *testing.T) {
 	stateDir := t.TempDir()
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, stateDir)
 	require.NoError(t, err)
-	p.reservedCPUs = machine.NewCPUSet()
-	p.reservedReclaimedCPUSet = machine.NewCPUSet(0, 1)
-	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
-	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
-	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0
+	p.config.reservedCPUs = machine.NewCPUSet()
+	p.reclaim.reservedReclaimedCPUSet = machine.NewCPUSet(0, 1)
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.config.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0
 	p.state.SetPodEntries(state.PodEntries{
 		commonstate.PoolNameReclaim: {
 			commonstate.FakedContainerName: {
@@ -865,8 +852,8 @@ func TestDynamicPolicyInitReclaimPoolWholeCoreAcrossNUMAs(t *testing.T) {
 
 		policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 		require.NoError(t, err)
-		policy.reservedCPUs = machine.NewCPUSet()
-		policy.reservedReclaimedCPUsSize = 5
+		policy.config.reservedCPUs = machine.NewCPUSet()
+		policy.reclaim.reservedReclaimedCPUsSize = 5
 
 		require.NoError(t, policy.initReclaimPool())
 
@@ -876,7 +863,7 @@ func TestDynamicPolicyInitReclaimPoolWholeCoreAcrossNUMAs(t *testing.T) {
 		requireCoreAligned(t, topology, reclaim.AllocationResult)
 		require.Equal(t, 6, reclaim.AllocationResult.Size(),
 			"the configured floor must round up to complete cores")
-		require.Equal(t, reclaim.AllocationResult.Size(), policy.reservedReclaimedCPUsSize)
+		require.Equal(t, reclaim.AllocationResult.Size(), policy.reclaim.reservedReclaimedCPUsSize)
 		require.Len(t, reclaim.TopologyAwareAssignments, 3)
 	})
 
@@ -888,15 +875,15 @@ func TestDynamicPolicyInitReclaimPoolWholeCoreAcrossNUMAs(t *testing.T) {
 
 		policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 		require.NoError(t, err)
-		policy.reservedCPUs = topology.CPUDetails.CPUsInNUMANodes(0)
-		policy.reservedReclaimedCPUsSize = 2
+		policy.config.reservedCPUs = topology.CPUDetails.CPUsInNUMANodes(0)
+		policy.reclaim.reservedReclaimedCPUsSize = 2
 
 		require.NoError(t, policy.initReclaimPool())
 
-		require.True(t, policy.reservedReclaimedCPUSet.IsSubsetOf(
+		require.True(t, policy.reclaim.reservedReclaimedCPUSet.IsSubsetOf(
 			topology.CPUDetails.CPUsInNUMANodes(1)),
 			"the reserved reclaim source must skip the low NUMA without an available complete core, got %s",
-			policy.reservedReclaimedCPUSet.String())
+			policy.reclaim.reservedReclaimedCPUSet.String())
 		reclaim := policy.state.GetAllocationInfo(
 			commonstate.PoolNameReclaim, commonstate.FakedContainerName)
 		require.NotNil(t, reclaim)
@@ -917,19 +904,19 @@ func TestDynamicPolicyInitReclaimPoolWholeCoreAcrossNUMAs(t *testing.T) {
 		require.NoError(t, err)
 		numa0CPUs := topology.CPUDetails.CPUsInNUMANodes(0)
 		numa1CPUs := topology.CPUDetails.CPUsInNUMANodes(1)
-		policy.reservedCPUs = numa0CPUs.Difference(machine.NewCPUSet(2, 8))
-		policy.reservedReclaimedCPUsSize = 6
+		policy.config.reservedCPUs = numa0CPUs.Difference(machine.NewCPUSet(2, 8))
+		policy.reclaim.reservedReclaimedCPUsSize = 6
 
 		require.NoError(t, policy.initReclaimPool())
 
-		requireCoreAligned(t, topology, policy.reservedReclaimedCPUSet)
-		require.Equal(t, 2, policy.reservedReclaimedCPUSet.Intersection(numa0CPUs).Size())
-		require.Equal(t, 4, policy.reservedReclaimedCPUSet.Intersection(numa1CPUs).Size())
-		require.Equal(t, 6, policy.reservedReclaimedCPUSet.Size())
+		requireCoreAligned(t, topology, policy.reclaim.reservedReclaimedCPUSet)
+		require.Equal(t, 2, policy.reclaim.reservedReclaimedCPUSet.Intersection(numa0CPUs).Size())
+		require.Equal(t, 4, policy.reclaim.reservedReclaimedCPUSet.Intersection(numa1CPUs).Size())
+		require.Equal(t, 6, policy.reclaim.reservedReclaimedCPUSet.Size())
 		reclaim := policy.state.GetAllocationInfo(
 			commonstate.PoolNameReclaim, commonstate.FakedContainerName)
 		require.NotNil(t, reclaim)
-		require.True(t, reclaim.AllocationResult.Equals(policy.reservedReclaimedCPUSet))
+		require.True(t, reclaim.AllocationResult.Equals(policy.reclaim.reservedReclaimedCPUSet))
 	})
 
 	t.Run("uses global capacity when one numa cannot satisfy its target", func(t *testing.T) {
@@ -940,8 +927,8 @@ func TestDynamicPolicyInitReclaimPoolWholeCoreAcrossNUMAs(t *testing.T) {
 
 		policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 		require.NoError(t, err)
-		policy.reservedCPUs = machine.NewCPUSet()
-		policy.reservedReclaimedCPUsSize = 4
+		policy.config.reservedCPUs = machine.NewCPUSet()
+		policy.reclaim.reservedReclaimedCPUsSize = 4
 
 		dedicated := topology.CPUDetails.CPUsInNUMANodes(0)
 		entries := state.PodEntries{
@@ -973,7 +960,7 @@ func TestDynamicPolicyInitReclaimPoolWholeCoreAcrossNUMAs(t *testing.T) {
 			commonstate.PoolNameReclaim, commonstate.FakedContainerName)
 		require.NotNil(t, reclaim)
 		requireCoreAligned(t, topology, reclaim.AllocationResult)
-		require.Equal(t, policy.reservedReclaimedCPUsSize, reclaim.AllocationResult.Size())
+		require.Equal(t, policy.reclaim.reservedReclaimedCPUsSize, reclaim.AllocationResult.Size())
 		require.True(t, reclaim.AllocationResult.Equals(topology.CPUDetails.CPUsInNUMANodes(1)),
 			"reclaim should use the globally available complete cores, got %s",
 			reclaim.AllocationResult.String())
@@ -987,8 +974,8 @@ func TestDynamicPolicyInitReclaimPoolDoesNotReplayOverlappingReserve(t *testing.
 	require.NoError(t, err)
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 	require.NoError(t, err)
-	policy.reservedCPUs = machine.NewCPUSet()
-	policy.reservedReclaimedCPUsSize = 2
+	policy.config.reservedCPUs = machine.NewCPUSet()
+	policy.reclaim.reservedReclaimedCPUsSize = 2
 
 	dedicated := topology.CPUDetails.CPUs()
 	entries := state.PodEntries{
@@ -1115,7 +1102,7 @@ func TestAllocateAndRemovePodWaitForAdvisorOwnerToConverge(t *testing.T) {
 	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
 	require.NoError(t, err)
 	var reconcileCalls int32
-	p.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
 		"record": func(_ context.Context, handlerCtx dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
 			if handlerCtx.Mode == dynamicpolicyutil.CPUSetAdjustmentModeRetry {
 				atomic.AddInt32(&reconcileCalls, 1)
@@ -1159,7 +1146,7 @@ func TestAllocateAndRemovePodWaitForAdvisorOwnerToConverge(t *testing.T) {
 
 	p.scheduleCPUSetAdjustmentRetry(dynamicpolicyutil.RetryReasonApplyFailed)
 	require.NoError(t, <-allocateDone)
-	p.cpuSetAdjustmentRetryWG.Wait()
+	p.adjustment.cpuSetAdjustmentRetryWG.Wait()
 	require.Equal(t, int32(1), atomic.LoadInt32(&reconcileCalls))
 	require.Nil(t, p.currentAdvisorPostCommitTarget())
 
@@ -1184,7 +1171,7 @@ func TestAllocateAndRemovePodWaitForAdvisorOwnerToConverge(t *testing.T) {
 
 	p.scheduleCPUSetAdjustmentRetry(dynamicpolicyutil.RetryReasonApplyFailed)
 	require.NoError(t, <-removeDone)
-	p.cpuSetAdjustmentRetryWG.Wait()
+	p.adjustment.cpuSetAdjustmentRetryWG.Wait()
 	require.Equal(t, int32(2), atomic.LoadInt32(&reconcileCalls))
 	require.Nil(t, p.currentAdvisorPostCommitTarget())
 	require.Nil(t, p.state.GetAllocationInfo(req.PodUid, req.ContainerName))
@@ -1215,9 +1202,9 @@ func TestAllocateAndRemovePodPendingWaitHonorsRequestContextWithoutStateWrites(t
 	trackedState := &atomicCommitTrackingState{State: p.state}
 	p.state = trackedState
 	emitter := &recordingMetricEmitter{}
-	p.emitter = emitter
+	p.emitter.emitter = emitter
 	var reconcileCalls int32
-	p.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
 		"must-not-run-from-admission": func(ctx context.Context, _ dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
 			atomic.AddInt32(&reconcileCalls, 1)
 			<-ctx.Done()
@@ -1290,9 +1277,9 @@ func TestRemovePodRecoversStaleEntryBehindStuckAdvisorPostCommitTarget(t *testin
 
 	target := p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
 	p.recordAdvisorPostCommitProgress(target, advisorPostCommitPhasePhysicalApply)
-	p.cpuSetAdjustmentRetryMu.Lock()
-	target.lastProgressAt = time.Now().Add(-advisorPostCommitStuckThreshold(p.conf) - time.Second)
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	target.lastProgressAt = time.Now().Add(-advisorPostCommitStuckThreshold(p.config.conf) - time.Second)
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	require.FileExists(t, p.advisorPostCommitCheckpointPath())
 
 	_, err = p.RemovePod(context.Background(), &pluginapi.RemovePodRequest{PodUid: podUID})
@@ -1302,10 +1289,10 @@ func TestRemovePodRecoversStaleEntryBehindStuckAdvisorPostCommitTarget(t *testin
 	require.FileExists(t, p.advisorPostCommitCheckpointPath())
 	require.Equal(t, advisorPostCommitPhaseCanonicalReconcile,
 		p.currentAdvisorPostCommitProgress().phase)
-	p.cpuSetAdjustmentRetryMu.Lock()
-	require.True(t, p.cpuSetAdjustmentRetryDirty)
-	require.Contains(t, p.cpuSetAdjustmentRetryReasons, dynamicpolicyutil.RetryReasonApplyFailed)
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	require.True(t, p.adjustment.cpuSetAdjustmentRetryDirty)
+	require.Contains(t, p.adjustment.cpuSetAdjustmentRetryReasons, dynamicpolicyutil.RetryReasonApplyFailed)
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 }
 
 func TestGetResourcesAllocationWaitsForAdvisorOwnerToConverge(t *testing.T) {
@@ -1313,7 +1300,7 @@ func TestGetResourcesAllocationWaitsForAdvisorOwnerToConverge(t *testing.T) {
 	require.NoError(t, err)
 	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
 	require.NoError(t, err)
-	p.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
 		"noop": func(context.Context, dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
 			return nil
 		},
@@ -1336,7 +1323,7 @@ func TestGetResourcesAllocationWaitsForAdvisorOwnerToConverge(t *testing.T) {
 
 	p.scheduleCPUSetAdjustmentRetry(dynamicpolicyutil.RetryReasonApplyFailed)
 	require.NoError(t, <-done)
-	p.cpuSetAdjustmentRetryWG.Wait()
+	p.adjustment.cpuSetAdjustmentRetryWG.Wait()
 	require.Nil(t, p.currentAdvisorPostCommitTarget())
 }
 
@@ -1349,9 +1336,9 @@ func TestGetResourcesAllocationPendingWaitHonorsRequestContextWithoutStateWrites
 	p.state = trackedState
 	target := p.publishAdvisorPostCommitTarget(
 		&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
-	p.cpuSetAdjustmentRetryMu.Lock()
-	target.lastProgressAt = time.Now().Add(-advisorPostCommitStuckThreshold(p.conf) - time.Second)
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	target.lastProgressAt = time.Now().Add(-advisorPostCommitStuckThreshold(p.config.conf) - time.Second)
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
@@ -1374,7 +1361,7 @@ func TestAllocateExecutionLeaseRechecksAdvisorTarget(t *testing.T) {
 	adjustmentEntered := make(chan struct{})
 	releaseAdjustment := make(chan struct{})
 	var adjustmentCalls int32
-	p.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+	p.adjustment.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
 		"block": func(context.Context, dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
 			if atomic.AddInt32(&adjustmentCalls, 1) != 1 {
 				return nil
@@ -1433,7 +1420,7 @@ func TestAllocateExecutionLeaseRechecksAdvisorTarget(t *testing.T) {
 
 	p.scheduleCPUSetAdjustmentRetry(dynamicpolicyutil.RetryReasonApplyFailed)
 	require.NoError(t, <-allocateDone)
-	p.cpuSetAdjustmentRetryWG.Wait()
+	p.adjustment.cpuSetAdjustmentRetryWG.Wait()
 	require.Nil(t, p.currentAdvisorPostCommitTarget())
 	require.NotNil(t, p.state.GetAllocationInfo(req.PodUid, req.ContainerName))
 }
@@ -1715,7 +1702,7 @@ func TestRemovePodCommitsCanonicalStateAtomically(t *testing.T) {
 		restarted, err := state.NewCheckpointState(
 			&statedirectory.StateDirectoryConfiguration{StateFileDirectory: stateDir},
 			cpuPluginStateFileName, cpuconsts.CPUResourcePluginPolicyNameDynamic,
-			policy.machineInfo.CPUTopology, false,
+			policy.machine.machineInfo.CPUTopology, false,
 			state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
 		require.NoError(t, err)
 		require.NotContains(t, restarted.GetPodEntries(), podUID)
@@ -1758,11 +1745,11 @@ func TestRemovePodCommitsCanonicalStateAtomically(t *testing.T) {
 		policy, stateDir, initialRevision, initialMachineState := newPolicy(t)
 		releasePlugin := newRegistry(t)
 		advisorClient := &removePodTrackingAdvisorClient{}
-		policy.enableCPUAdvisor = true
-		policy.advisorClient = advisorClient
+		policy.config.enableCPUAdvisor = true
+		policy.advisor.advisorClient = advisorClient
 
 		handlerCalls := 0
-		policy.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+		policy.adjustment.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
 			"must-not-run": func(context.Context, dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
 				handlerCalls++
 				return errors.New("admission handler must not run during recovery")
@@ -1783,9 +1770,9 @@ func TestRemovePodCommitsCanonicalStateAtomically(t *testing.T) {
 		require.Equal(t, 1, advisorClient.removePodCount)
 		require.Zero(t, releasePlugin.releaseCount)
 		require.Zero(t, handlerCalls)
-		require.False(t, policy.cpuSetAdjustmentRetryQueued)
-		require.False(t, policy.cpuSetAdjustmentRetryAgain)
-		require.False(t, policy.cpuSetAdjustmentRetryDirty)
+		require.False(t, policy.adjustment.cpuSetAdjustmentRetryQueued)
+		require.False(t, policy.adjustment.cpuSetAdjustmentRetryAgain)
+		require.False(t, policy.adjustment.cpuSetAdjustmentRetryDirty)
 
 		require.NoError(t, os.Remove(stateDir))
 		require.NoError(t, os.MkdirAll(stateDir, 0o755))
@@ -1797,15 +1784,15 @@ func TestRemovePodCommitsCanonicalStateAtomically(t *testing.T) {
 		require.Equal(t, 2, advisorClient.removePodCount)
 		require.Equal(t, 1, releasePlugin.releaseCount)
 		require.Zero(t, handlerCalls)
-		require.False(t, policy.cpuSetAdjustmentRetryQueued)
-		require.False(t, policy.cpuSetAdjustmentRetryAgain)
-		require.True(t, policy.cpuSetAdjustmentRetryDirty)
-		require.Contains(t, policy.cpuSetAdjustmentRetryReasons, dynamicpolicyutil.RetryReasonRecoveryCommit)
+		require.False(t, policy.adjustment.cpuSetAdjustmentRetryQueued)
+		require.False(t, policy.adjustment.cpuSetAdjustmentRetryAgain)
+		require.True(t, policy.adjustment.cpuSetAdjustmentRetryDirty)
+		require.Contains(t, policy.adjustment.cpuSetAdjustmentRetryReasons, dynamicpolicyutil.RetryReasonRecoveryCommit)
 
 		restarted, err := state.NewCheckpointState(
 			&statedirectory.StateDirectoryConfiguration{StateFileDirectory: stateDir},
 			cpuPluginStateFileName, cpuconsts.CPUResourcePluginPolicyNameDynamic,
-			policy.machineInfo.CPUTopology, false,
+			policy.machine.machineInfo.CPUTopology, false,
 			state.GenerateMachineStateFromPodEntries, metrics.DummyMetrics{})
 		require.NoError(t, err)
 		require.NotContains(t, restarted.GetPodEntries(), podUID)
@@ -1818,8 +1805,8 @@ func TestRemovePodCommitsCanonicalStateAtomically(t *testing.T) {
 		releasePlugin := newRegistry(t)
 		releasePlugin.releaseErrs = []error{errors.New("release failed")}
 		advisorClient := &removePodTrackingAdvisorClient{}
-		policy.enableCPUAdvisor = true
-		policy.advisorClient = advisorClient
+		policy.config.enableCPUAdvisor = true
+		policy.advisor.advisorClient = advisorClient
 
 		req := &pluginapi.RemovePodRequest{PodUid: podUID}
 		_, err := policy.RemovePod(context.Background(), req)
@@ -1845,13 +1832,13 @@ func TestRemovePodLastRNBExpandsNonRNBAndCleansOrphanInSingleRevision(t *testing
 	stateDir := t.TempDir()
 	policy, err := getTestDynamicPolicyWithInitialization(topology, stateDir)
 	require.NoError(t, err)
-	policy.reservedCPUs = machine.NewCPUSet()
-	policy.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
-	policy.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+	policy.config.reservedCPUs = machine.NewCPUSet()
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	policy.config.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
 	policy.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
-	policy.enableCPUAdvisor = true
-	policy.advisorClient = &advisorPoolTestClient{}
-	policy.advisorMonitor, err = timemonitor.NewTimeMonitor(
+	policy.config.enableCPUAdvisor = true
+	policy.advisor.advisorClient = &advisorPoolTestClient{}
+	policy.advisor.advisorMonitor, err = timemonitor.NewTimeMonitor(
 		"advisor",
 		time.Second,
 		time.Minute,
@@ -1986,13 +1973,13 @@ func TestRemovePodLastOwnerBackfillsOrphanCPUsInSingleRevision(t *testing.T) {
 	stateDir := t.TempDir()
 	policy, err := getTestDynamicPolicyWithInitialization(topology, stateDir)
 	require.NoError(t, err)
-	policy.reservedCPUs = machine.NewCPUSet()
-	policy.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
-	policy.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+	policy.config.reservedCPUs = machine.NewCPUSet()
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	policy.config.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
 	policy.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
-	policy.enableCPUAdvisor = true
-	policy.advisorClient = &advisorPoolTestClient{}
-	policy.advisorMonitor, err = timemonitor.NewTimeMonitor(
+	policy.config.enableCPUAdvisor = true
+	policy.advisor.advisorClient = &advisorPoolTestClient{}
+	policy.advisor.advisorMonitor, err = timemonitor.NewTimeMonitor(
 		"advisor",
 		time.Second,
 		time.Minute,
@@ -3435,11 +3422,11 @@ func TestAllocate(t *testing.T) {
 			as.Nil(err)
 
 			if tc.enhancementDefaultValues != nil {
-				dynamicPolicy.qosConfig.QoSEnhancementDefaultValues = tc.enhancementDefaultValues
+				dynamicPolicy.config.qosConfig.QoSEnhancementDefaultValues = tc.enhancementDefaultValues
 			}
 
 			if tc.enableReclaim {
-				dynamicPolicy.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+				dynamicPolicy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 			}
 
 			if tc.allowSharedCoresOverlapReclaimedCores {
@@ -3503,7 +3490,7 @@ func TestAllocateFailureRollbackDoesNotOverwriteNewerState(t *testing.T) {
 		OriginalAllocationResult: machine.NewCPUSet(6),
 	}
 	p.state.SetAllocationInfo(failedPodUID, "main", originalAllocation, false)
-	p.allocationHandlers[consts.PodAnnotationQoSLevelSharedCores] = func(_ context.Context, req *pluginapi.ResourceRequest, _ bool) (*pluginapi.ResourceAllocationResponse, error) {
+	p.allocation.allocationHandlers[consts.PodAnnotationQoSLevelSharedCores] = func(_ context.Context, req *pluginapi.ResourceRequest, _ bool) (*pluginapi.ResourceAllocationResponse, error) {
 		p.state.SetAllocationInfo(req.PodUid, req.ContainerName, &state.AllocationInfo{
 			AllocationMeta: commonstate.AllocationMeta{
 				PodUid:        req.PodUid,
@@ -3594,7 +3581,7 @@ func TestAllocateFailureRollbackDoesNotOverwriteNewerSameContainerState(t *testi
 
 	olderStarted := make(chan struct{})
 	releaseOlder := make(chan struct{})
-	p.allocationHandlers[consts.PodAnnotationQoSLevelSharedCores] = func(
+	p.allocation.allocationHandlers[consts.PodAnnotationQoSLevelSharedCores] = func(
 		_ context.Context,
 		req *pluginapi.ResourceRequest,
 		_ bool,
@@ -3706,7 +3693,7 @@ func TestAllocateReturnsCheckpointFailure(t *testing.T) {
 		err:   fmt.Errorf("injected checkpoint failure"),
 	}
 	p.state = failingState
-	p.allocationHandlers[consts.PodAnnotationQoSLevelSharedCores] = func(
+	p.allocation.allocationHandlers[consts.PodAnnotationQoSLevelSharedCores] = func(
 		_ context.Context,
 		req *pluginapi.ResourceRequest,
 		_ bool,
@@ -3803,8 +3790,8 @@ func TestAllocatePreservesOriginalPodMetaForHandler(t *testing.T) {
 	require.NoError(t, err)
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 	require.NoError(t, err)
-	p.podAnnotationKeptKeys = nil
-	p.podLabelKeptKeys = nil
+	p.config.podAnnotationKeptKeys = nil
+	p.config.podLabelKeptKeys = nil
 
 	const (
 		spdLabelKey      = "spd.katalyst.kubewharf.io/workload"
@@ -3836,7 +3823,7 @@ func TestAllocatePreservesOriginalPodMetaForHandler(t *testing.T) {
 	}
 
 	handlerCalled := false
-	p.allocationHandlers[consts.PodAnnotationQoSLevelSharedCores] = func(
+	p.allocation.allocationHandlers[consts.PodAnnotationQoSLevelSharedCores] = func(
 		ctx context.Context, filteredReq *pluginapi.ResourceRequest, _ bool,
 	) (*pluginapi.ResourceAllocationResponse, error) {
 		handlerCalled = true
@@ -7538,7 +7525,7 @@ func TestGetTopologyHints(t *testing.T) {
 			as.Nil(err)
 
 			if tc.enhancementDefaultValues != nil {
-				dynamicPolicy.qosConfig.QoSEnhancementDefaultValues = tc.enhancementDefaultValues
+				dynamicPolicy.config.qosConfig.QoSEnhancementDefaultValues = tc.enhancementDefaultValues
 			}
 
 			if tc.podEntries != nil {
@@ -7554,25 +7541,25 @@ func TestGetTopologyHints(t *testing.T) {
 			}
 
 			if tc.cpuNUMAHintPreferPolicy != "" {
-				dynamicPolicy.conf.CPUNUMAHintPreferPolicy = tc.cpuNUMAHintPreferPolicy
+				dynamicPolicy.config.conf.CPUNUMAHintPreferPolicy = tc.cpuNUMAHintPreferPolicy
 
-				if dynamicPolicy.conf.CPUNUMAHintPreferPolicy == cpuconsts.CPUNUMAHintPreferPolicyDynamicPacking {
-					dynamicPolicy.conf.CPUNUMAHintPreferLowThreshold = 0.5
+				if dynamicPolicy.config.conf.CPUNUMAHintPreferPolicy == cpuconsts.CPUNUMAHintPreferPolicyDynamicPacking {
+					dynamicPolicy.config.conf.CPUNUMAHintPreferLowThreshold = 0.5
 				}
 			}
 
 			if tc.numaNumberAnnotationKey != "" {
-				dynamicPolicy.numaNumberAnnotationKey = tc.numaNumberAnnotationKey
+				dynamicPolicy.config.numaNumberAnnotationKey = tc.numaNumberAnnotationKey
 			}
 
 			if tc.numaIDsAnnotationKey != "" {
-				dynamicPolicy.numaIDsAnnotationKey = tc.numaIDsAnnotationKey
+				dynamicPolicy.config.numaIDsAnnotationKey = tc.numaIDsAnnotationKey
 			}
 
-			dynamicPolicy.sharedCoresNUMABindingHintOptimizer, err = canonical.NewCanonicalHintOptimizer(dynamicPolicy.generateHintOptimizerFactoryOptions())
+			dynamicPolicy.hintOpt.sharedCoresNUMABindingHintOptimizer, err = canonical.NewCanonicalHintOptimizer(dynamicPolicy.generateHintOptimizerFactoryOptions())
 			as.NoError(err)
 
-			dynamicPolicy.dedicatedCoresNUMABindingHintOptimizer = &hintoptimizer.DummyHintOptimizer{}
+			dynamicPolicy.hintOpt.dedicatedCoresNUMABindingHintOptimizer = &hintoptimizer.DummyHintOptimizer{}
 
 			resp, err := dynamicPolicy.GetTopologyHints(context.Background(), tc.req)
 			if tc.expectErr {
@@ -7674,7 +7661,7 @@ func TestAddReclaimedCPUAllocatable(t *testing.T) {
 	dynamicPolicy, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	as.Nil(err)
 
-	numaNodes := dynamicPolicy.machineInfo.CPUDetails.NUMANodes().ToSliceInt()
+	numaNodes := dynamicPolicy.machine.machineInfo.CPUDetails.NUMANodes().ToSliceInt()
 
 	// headroom is expressed in cores; the reported value is millicpu (cores * 1000).
 	dynamicPolicy.state.SetNUMAHeadroom(map[int]float64{
@@ -7690,7 +7677,7 @@ func TestAddReclaimedCPUAllocatable(t *testing.T) {
 	reclaim.UnregisterConsumer("cpu-kcnr-a")
 	reclaim.UnregisterConsumer("cpu-kcnr-b")
 	reclaim.UnregisterConsumer("cpu-kcnr-c")
-	dynamicPolicy.dynamicConfig.GetDynamicConfiguration().ReclaimedPercentageByConsumer = map[string]int{
+	dynamicPolicy.config.dynamicConfig.GetDynamicConfiguration().ReclaimedPercentageByConsumer = map[string]int{
 		"cpu-kcnr-a": 50,
 		"cpu-kcnr-b": 30,
 		"cpu-kcnr-c": 20,
@@ -7753,7 +7740,7 @@ func TestAddReclaimedCPUAllocatable(t *testing.T) {
 		},
 	}
 
-	dynamicPolicy.conf.EnableReclaimedResourceAllocatableReporting = true
+	dynamicPolicy.config.conf.EnableReclaimedResourceAllocatableReporting = true
 	for _, tc := range testCases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
@@ -7774,15 +7761,15 @@ func TestAddReclaimedCPUAllocatable(t *testing.T) {
 
 	// end-to-end: the ReclaimedResourceMilliCPU entry is present in the full
 	// response when ReclaimConsumersForKCNR is configured.
-	dynamicPolicy.reclaimConsumersForKCNR = []string{"cpu-kcnr-a"}
-	dynamicPolicy.conf.EnableReclaimedResourceAllocatableReporting = false
+	dynamicPolicy.reclaim.reclaimConsumersForKCNR = []string{"cpu-kcnr-a"}
+	dynamicPolicy.config.conf.EnableReclaimedResourceAllocatableReporting = false
 	resp, err := dynamicPolicy.GetTopologyAwareAllocatableResources(context.Background(),
 		&pluginapi.GetTopologyAwareAllocatableResourcesRequest{})
 	as.Nil(err)
 	_, found := resp.AllocatableResources[cpuKey]
 	as.False(found)
 
-	dynamicPolicy.conf.EnableReclaimedResourceAllocatableReporting = true
+	dynamicPolicy.config.conf.EnableReclaimedResourceAllocatableReporting = true
 	resp, err = dynamicPolicy.GetTopologyAwareAllocatableResources(context.Background(),
 		&pluginapi.GetTopologyAwareAllocatableResourcesRequest{})
 	as.Nil(err)
@@ -7944,11 +7931,11 @@ func TestGetTopologyAwareResources(t *testing.T) {
 		as.Equalf(tc.expectedResp, resp, "failed in test case: %s", tc.description)
 
 		if tc.req.Annotations[consts.PodAnnotationQoSLevelKey] == consts.PodAnnotationQoSLevelSharedCores {
-			originalTransitionPeriod := dynamicPolicy.transitionPeriod
-			dynamicPolicy.transitionPeriod = time.Millisecond * 10
+			originalTransitionPeriod := dynamicPolicy.config.transitionPeriod
+			dynamicPolicy.config.transitionPeriod = time.Millisecond * 10
 			time.Sleep(20 * time.Millisecond)
 			_, err = dynamicPolicy.GetResourcesAllocation(context.Background(), &pluginapi.GetResourcesAllocationRequest{})
-			dynamicPolicy.transitionPeriod = originalTransitionPeriod
+			dynamicPolicy.config.transitionPeriod = originalTransitionPeriod
 			as.Nil(err)
 			allocationInfo := dynamicPolicy.state.GetAllocationInfo(tc.req.PodUid, testName)
 			as.NotNil(allocationInfo)
@@ -8004,7 +7991,7 @@ func TestGetResourcesAllocation(t *testing.T) {
 
 	dynamicPolicy, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	as.Nil(err)
-	dynamicPolicy.transitionPeriod = time.Millisecond * 10
+	dynamicPolicy.config.transitionPeriod = time.Millisecond * 10
 
 	testName := "test"
 
@@ -8031,7 +8018,7 @@ func TestGetResourcesAllocation(t *testing.T) {
 	_, err = dynamicPolicy.Allocate(context.Background(), req)
 	as.Nil(err)
 
-	time.Sleep(dynamicPolicy.transitionPeriod * 2)
+	time.Sleep(dynamicPolicy.config.transitionPeriod * 2)
 	resp1, err := dynamicPolicy.GetResourcesAllocation(context.Background(), &pluginapi.GetResourcesAllocationRequest{})
 	as.Nil(err)
 
@@ -8046,7 +8033,7 @@ func TestGetResourcesAllocation(t *testing.T) {
 		IsNodeResource:    false,
 		IsScalarResource:  true,
 		AllocatedQuantity: 10,
-		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.reservedCPUs).Difference(reclaim.AllocationResult).String(),
+		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.config.reservedCPUs).Difference(reclaim.AllocationResult).String(),
 		// whole-core apportion balances lent cores across NUMAs, shifting the
 		// per-NUMA share split while the aggregate stays 10.
 		TopologyAssignments: map[uint64]uint64{
@@ -8061,12 +8048,12 @@ func TestGetResourcesAllocation(t *testing.T) {
 	}, resp1.PodResources[req.PodUid].ContainerResources[testName].ResourceAllocation[string(v1.ResourceCPU)])
 
 	// test after ramping up
-	originalTransitionPeriod := dynamicPolicy.transitionPeriod
-	dynamicPolicy.transitionPeriod = time.Millisecond * 10
+	originalTransitionPeriod := dynamicPolicy.config.transitionPeriod
+	dynamicPolicy.config.transitionPeriod = time.Millisecond * 10
 	time.Sleep(20 * time.Millisecond)
 	_, err = dynamicPolicy.GetResourcesAllocation(context.Background(), &pluginapi.GetResourcesAllocationRequest{})
 	as.Nil(err)
-	dynamicPolicy.transitionPeriod = originalTransitionPeriod
+	dynamicPolicy.config.transitionPeriod = originalTransitionPeriod
 	allocationInfo := dynamicPolicy.state.GetAllocationInfo(req.PodUid, testName)
 	as.NotNil(allocationInfo)
 	as.Equal(false, allocationInfo.RampUp)
@@ -8158,7 +8145,7 @@ func TestGetResourcesAllocation(t *testing.T) {
 	}
 
 	dynamicPolicy.state.SetAllowSharedCoresOverlapReclaimedCores(true, true)
-	dynamicPolicy.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	dynamicPolicy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	dynamicPolicy.state.SetAllocationInfo(commonstate.PoolNameReclaim, "", &state.AllocationInfo{
 		AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
 		AllocationResult:         machine.MustParse("1,3,4-5"),
@@ -8178,12 +8165,12 @@ func TestGetResourcesAllocation(t *testing.T) {
 	as.Nil(err)
 
 	// test after ramping up
-	originalTransitionPeriod = dynamicPolicy.transitionPeriod
-	dynamicPolicy.transitionPeriod = time.Millisecond * 10
+	originalTransitionPeriod = dynamicPolicy.config.transitionPeriod
+	dynamicPolicy.config.transitionPeriod = time.Millisecond * 10
 	time.Sleep(20 * time.Millisecond)
 	_, err = dynamicPolicy.GetResourcesAllocation(context.Background(), &pluginapi.GetResourcesAllocationRequest{})
 	as.Nil(err)
-	dynamicPolicy.transitionPeriod = originalTransitionPeriod
+	dynamicPolicy.config.transitionPeriod = originalTransitionPeriod
 	allocationInfo = dynamicPolicy.state.GetAllocationInfo(req.PodUid, testName)
 	as.NotNil(allocationInfo)
 	as.Equal(false, allocationInfo.RampUp)
@@ -8280,7 +8267,7 @@ func TestShouldSharedCoresRampUpUsesCallerContext(t *testing.T) {
 		PodFetcherStub: &pod.PodFetcherStub{},
 		contexts:       make(chan context.Context, 1),
 	}
-	policy.metaServer.MetaAgent.PodFetcher = fetcher
+	policy.meta.metaServer.MetaAgent.PodFetcher = fetcher
 
 	type contextKey string
 	const key contextKey = "caller"
@@ -8310,7 +8297,7 @@ func TestShouldSharedCoresRampUpDisabledByDynamicConfig(t *testing.T) {
 		as := require.New(t)
 		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 		as.Nil(err)
-		policy.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{
+		policy.meta.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{
 			{
 				ObjectMeta: metav1.ObjectMeta{UID: types.UID(pendingPodUID), Namespace: "default", Name: "pending-pod"},
 				Status:     v1.PodStatus{Phase: v1.PodPending},
@@ -8324,7 +8311,7 @@ func TestShouldSharedCoresRampUpDisabledByDynamicConfig(t *testing.T) {
 		as := require.New(t)
 		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 		as.Nil(err)
-		policy.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: nil}
+		policy.meta.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: nil}
 		assert.True(t, policy.shouldSharedCoresRampUp(context.Background(), "missing-pod"))
 	})
 
@@ -8333,7 +8320,7 @@ func TestShouldSharedCoresRampUpDisabledByDynamicConfig(t *testing.T) {
 		as := require.New(t)
 		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 		as.Nil(err)
-		policy.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{
+		policy.meta.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{
 			{
 				ObjectMeta: metav1.ObjectMeta{UID: types.UID(activePodUID), Namespace: "default", Name: "active-pod"},
 				Status:     v1.PodStatus{Phase: v1.PodRunning},
@@ -8347,8 +8334,8 @@ func TestShouldSharedCoresRampUpDisabledByDynamicConfig(t *testing.T) {
 		as := require.New(t)
 		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 		as.Nil(err)
-		policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
-		policy.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{
+		policy.config.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
+		policy.meta.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{
 			{
 				ObjectMeta: metav1.ObjectMeta{UID: types.UID(pendingPodUID), Namespace: "default", Name: "pending-pod"},
 				Status:     v1.PodStatus{Phase: v1.PodPending},
@@ -8362,7 +8349,7 @@ func TestShouldSharedCoresRampUpDisabledByDynamicConfig(t *testing.T) {
 		as := require.New(t)
 		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 		as.Nil(err)
-		policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
+		policy.config.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
 		assert.False(t, policy.shouldSharedCoresRampUp(context.Background(), "missing-pod"))
 	})
 }
@@ -8400,8 +8387,8 @@ func TestSharedCoresRampUpDisabledAllocation(t *testing.T) {
 		as := require.New(t)
 		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 		as.Nil(err)
-		policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
-		policy.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{
+		policy.config.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
+		policy.meta.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{
 			{
 				ObjectMeta: metav1.ObjectMeta{UID: types.UID("shared-no-ramp-up"), Namespace: "default", Name: "shared-no-ramp-up"},
 				Spec: v1.PodSpec{
@@ -8441,7 +8428,7 @@ func TestSharedCoresRampUpDisabledAllocation(t *testing.T) {
 		allocationInfo := policy.state.GetAllocationInfo(req.PodUid, req.ContainerName)
 		as.NotNil(allocationInfo)
 		assert.False(t, allocationInfo.RampUp)
-		assert.NotEqual(t, cpuTopology.CPUDetails.CPUs().Difference(policy.reservedCPUs).String(), allocationInfo.AllocationResult.String())
+		assert.NotEqual(t, cpuTopology.CPUDetails.CPUs().Difference(policy.config.reservedCPUs).String(), allocationInfo.AllocationResult.String())
 		assert.Equal(t, targetPoolCPUs.String(), allocationInfo.AllocationResult.String())
 	})
 
@@ -8450,7 +8437,7 @@ func TestSharedCoresRampUpDisabledAllocation(t *testing.T) {
 		as := require.New(t)
 		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 		as.Nil(err)
-		policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
+		policy.config.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
 
 		req := newSharedCoresReq("shared-missing-pool")
 		// cold-start seed path: with DisableSharedCoresRampUp=true and no pre-existing
@@ -8477,7 +8464,7 @@ func TestSharedCoresRampUpDisabledAllocation(t *testing.T) {
 		as := require.New(t)
 		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 		as.Nil(err)
-		policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
+		policy.config.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
 
 		const specifiedPool = "seedpool-stable-2"
 		req := newSharedCoresReq("shared-custom-seedpool")
@@ -8520,7 +8507,7 @@ func TestSharedCoresRampUpDisabledAllocation(t *testing.T) {
 		as := require.New(t)
 		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 		as.Nil(err)
-		policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
+		policy.config.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
 		policy.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
 
 		reclaimCPUs := machine.NewCPUSet(10, 11, 12, 13, 14, 15)
@@ -8554,7 +8541,7 @@ func TestSharedCoresRampUpDisabledAllocation(t *testing.T) {
 		as := require.New(t)
 		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 		as.Nil(err)
-		policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
+		policy.config.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
 		policy.state.SetAllowSharedCoresOverlapReclaimedCores(true, false)
 
 		reclaimCPUs := machine.NewCPUSet(10, 11, 12, 13, 14, 15)
@@ -8582,7 +8569,7 @@ func TestSharedCoresRampUpDisabledAllocation(t *testing.T) {
 		as := require.New(t)
 		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 		as.Nil(err)
-		policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
+		policy.config.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
 
 		req := newSharedCoresReq("shared-cold-start-no-reclaim")
 		resp, err := policy.sharedCoresWithoutNUMABindingAllocationHandler(context.Background(), req, false)
@@ -8601,7 +8588,7 @@ func TestSharedCoresRampUpDisabledAllocation(t *testing.T) {
 		checkpointDir := t.TempDir()
 		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, checkpointDir)
 		as.Nil(err)
-		policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
+		policy.config.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
 
 		req := newSharedCoresReq("shared-cold-start-persist")
 		_, err = policy.sharedCoresWithoutNUMABindingAllocationHandler(context.Background(), req, true)
@@ -8621,7 +8608,7 @@ func TestSharedCoresRampUpDisabledAllocation(t *testing.T) {
 		as := require.New(t)
 		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 		as.Nil(err)
-		policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
+		policy.config.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = true
 
 		req1 := newSharedCoresReq("shared-cold-start-first")
 		_, err = policy.sharedCoresWithoutNUMABindingAllocationHandler(context.Background(), req1, false)
@@ -8655,8 +8642,8 @@ func TestSharedCoresRampUpDisabledAllocation(t *testing.T) {
 		as := require.New(t)
 		policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 		as.Nil(err)
-		policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = false
-		policy.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{
+		policy.config.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = false
+		policy.meta.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{
 			{
 				ObjectMeta: metav1.ObjectMeta{UID: types.UID("ramp-up-pending"), Namespace: "default", Name: "ramp-up-pending"},
 				Status:     v1.PodStatus{Phase: v1.PodPending},
@@ -8683,18 +8670,18 @@ func TestSharedCoresRampUpAllocationExcludesAllNUMAReclaimFloor(t *testing.T) {
 	as.NoError(err)
 	policy, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 	as.NoError(err)
-	policy.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = false
-	policy.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
-	policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
-	policy.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0
+	policy.config.dynamicConfig.GetDynamicConfiguration().DisableSharedCoresRampUp = false
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	policy.config.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0
 
-	numa0 := policy.machineInfo.CPUDetails.CPUsInNUMANodes(0).Difference(policy.reservedCPUs).ToSliceInt()
-	numa1 := policy.machineInfo.CPUDetails.CPUsInNUMANodes(1).Difference(policy.reservedCPUs).ToSliceInt()
+	numa0 := policy.machine.machineInfo.CPUDetails.CPUsInNUMANodes(0).Difference(policy.config.reservedCPUs).ToSliceInt()
+	numa1 := policy.machine.machineInfo.CPUDetails.CPUsInNUMANodes(1).Difference(policy.config.reservedCPUs).ToSliceInt()
 	as.GreaterOrEqual(len(numa0), 2)
 	as.GreaterOrEqual(len(numa1), 2)
 	floor := machine.NewCPUSet(numa0[0], numa0[1], numa1[0], numa1[1])
-	policy.reservedReclaimedCPUSet = floor
-	policy.reservedReclaimedCPUsSize = floor.Size()
+	policy.reclaim.reservedReclaimedCPUSet = floor
+	policy.reclaim.reservedReclaimedCPUsSize = floor.Size()
 	policy.state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &state.AllocationInfo{
 		AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
 		AllocationResult: machine.NewCPUSet(),
@@ -8703,7 +8690,7 @@ func TestSharedCoresRampUpAllocationExcludesAllNUMAReclaimFloor(t *testing.T) {
 	policy.state = tracked
 
 	const podUID = "shared-ramp-up-all-numa-floor"
-	policy.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{{
+	policy.meta.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{{
 		ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID), Namespace: "default", Name: podUID},
 		Spec: v1.PodSpec{Containers: []v1.Container{{
 			Name: "main",
@@ -8749,14 +8736,14 @@ func TestAllocateSNBRampUpAllowsGlobalSharePoolToShrink(t *testing.T) {
 	require.NoError(t, err)
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 	require.NoError(t, err)
-	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
-	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
-	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.config.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0
 	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
-	p.enableCPUAdvisor = true
-	p.advisorClient = &advisorPoolTestClient{}
+	p.config.enableCPUAdvisor = true
+	p.advisor.advisorClient = &advisorPoolTestClient{}
 
-	allocationCPUs := p.machineInfo.CPUDetails.CPUs().Difference(p.reservedCPUs)
+	allocationCPUs := p.machine.machineInfo.CPUDetails.CPUs().Difference(p.config.reservedCPUs)
 	assignments, err := machine.GetNumaAwareAssignments(cpuTopology, allocationCPUs)
 	require.NoError(t, err)
 	p.state.SetAllocationInfo(commonstate.PoolNameShare, commonstate.FakedContainerName, &state.AllocationInfo{
@@ -8783,19 +8770,19 @@ func TestAllocateSNBRampUpAllowsGlobalSharePoolToShrink(t *testing.T) {
 		RequestQuantity:                  1,
 	}, false)
 
-	numa0 := p.machineInfo.CPUDetails.CPUsInNUMANodes(0).Difference(p.reservedCPUs).ToSliceInt()
-	numa1 := p.machineInfo.CPUDetails.CPUsInNUMANodes(1).Difference(p.reservedCPUs).ToSliceInt()
+	numa0 := p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(0).Difference(p.config.reservedCPUs).ToSliceInt()
+	numa1 := p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(1).Difference(p.config.reservedCPUs).ToSliceInt()
 	require.GreaterOrEqual(t, len(numa0), 2)
 	require.GreaterOrEqual(t, len(numa1), 2)
 	floor := machine.NewCPUSet(numa0[0], numa0[1], numa1[0], numa1[1])
-	p.reservedReclaimedCPUSet = floor
-	p.reservedReclaimedCPUsSize = floor.Size()
+	p.reclaim.reservedReclaimedCPUSet = floor
+	p.reclaim.reservedReclaimedCPUsSize = floor.Size()
 	p.state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &state.AllocationInfo{
 		AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
 		AllocationResult:                 floor.Clone(),
 		OriginalAllocationResult:         floor.Clone(),
-		TopologyAwareAssignments:         map[int]machine.CPUSet{0: floor.Intersection(p.machineInfo.CPUDetails.CPUsInNUMANodes(0)), 1: floor.Intersection(p.machineInfo.CPUDetails.CPUsInNUMANodes(1))},
-		OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: floor.Intersection(p.machineInfo.CPUDetails.CPUsInNUMANodes(0)), 1: floor.Intersection(p.machineInfo.CPUDetails.CPUsInNUMANodes(1))},
+		TopologyAwareAssignments:         map[int]machine.CPUSet{0: floor.Intersection(p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(0)), 1: floor.Intersection(p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(1))},
+		OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: floor.Intersection(p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(0)), 1: floor.Intersection(p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(1))},
 	}, false)
 	entries := p.state.GetPodEntries()
 	machineState, err := generateMachineStateFromPodEntries(cpuTopology, entries, p.state.GetMachineState())
@@ -8803,7 +8790,7 @@ func TestAllocateSNBRampUpAllowsGlobalSharePoolToShrink(t *testing.T) {
 	p.state.SetMachineState(machineState, false)
 
 	const podUID = "snb-ramp-up"
-	p.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{
+	p.meta.metaServer.MetaAgent.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{
 		{
 			ObjectMeta: metav1.ObjectMeta{UID: types.UID("ordinary-shared"), Namespace: "default", Name: "ordinary-shared"},
 			Spec: v1.PodSpec{Containers: []v1.Container{{
@@ -8860,7 +8847,7 @@ func TestGetResourcesAllocationRetriesFailedRampUpCompletion(t *testing.T) {
 	as.NoError(err)
 	dynamicPolicy, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	as.NoError(err)
-	dynamicPolicy.transitionPeriod = 30 * time.Second
+	dynamicPolicy.config.transitionPeriod = 30 * time.Second
 
 	req := &pluginapi.ResourceRequest{
 		PodUid:         string(uuid.NewUUID()),
@@ -8888,7 +8875,7 @@ func TestGetResourcesAllocationRetriesFailedRampUpCompletion(t *testing.T) {
 	allocationInfo.InitTimestamp = time.Now().Add(-31 * time.Second).Format(util.QRMTimeFormat)
 	dynamicPolicy.state.SetAllocationInfo(req.PodUid, req.ContainerName, allocationInfo, true)
 
-	dynamicPolicy.allocationHooks = []AllocationHook{
+	dynamicPolicy.allocation.allocationHooks = []AllocationHook{
 		func(_, newAllocationInfo *state.AllocationInfo) error {
 			if newAllocationInfo != nil && !newAllocationInfo.RampUp &&
 				newAllocationInfo.OwnerPoolName != commonstate.EmptyOwnerPoolName {
@@ -8906,8 +8893,8 @@ func TestGetResourcesAllocationRetriesFailedRampUpCompletion(t *testing.T) {
 	state.SetReadonlyState(dynamicPolicy.state)
 	state.SetReadWriteState(dynamicPolicy.state)
 
-	dynamicPolicy.allocationHooks = nil
-	dynamicPolicy.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+	dynamicPolicy.allocation.allocationHooks = nil
+	dynamicPolicy.adjustment.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
 		"failing": func(context.Context, dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
 			return fmt.Errorf("force post-commit adjustment failure")
 		},
@@ -8931,7 +8918,7 @@ func TestGetResourcesAllocationCommitsMainAndSidecarRampUpExitTogether(t *testin
 	require.NoError(t, err)
 	dynamicPolicy, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	require.NoError(t, err)
-	dynamicPolicy.transitionPeriod = 30 * time.Second
+	dynamicPolicy.config.transitionPeriod = 30 * time.Second
 
 	const (
 		podUID      = "ramp-up-exit-pod"
@@ -10426,7 +10413,7 @@ func TestAllocateByQoSAwareServerListAndWatchResp(t *testing.T) {
 			dynamicPolicy, err := getTestDynamicPolicyWithInitialization(tc.cpuTopology, tmpDir)
 			as.Nil(err)
 
-			dynamicPolicy.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+			dynamicPolicy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 
 			machineState, err := generateMachineStateFromPodEntries(tc.cpuTopology, tc.podEntries, nil)
 			as.Nil(err)
@@ -10573,7 +10560,7 @@ func TestClearResidualStateTreatsFailedPodAsResidual(t *testing.T) {
 			},
 		},
 	}, false)
-	dynamicPolicy.metaServer = &metaserver.MetaServer{
+	dynamicPolicy.meta.metaServer = &metaserver.MetaServer{
 		MetaAgent: &agent.MetaAgent{
 			PodFetcher: &pod.PodFetcherStub{PodList: []*v1.Pod{
 				{
@@ -10648,16 +10635,16 @@ func TestCheckCPUSet(t *testing.T) {
 	as.Nil(err)
 
 	adjustmentCalls := 0
-	dynamicPolicy.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+	dynamicPolicy.adjustment.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
 		"must-not-run-from-check": func(context.Context, dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
 			adjustmentCalls++
 			return nil
 		},
 	}
-	dynamicPolicy.cpuSetAdjustmentRetryDirty = true
+	dynamicPolicy.adjustment.cpuSetAdjustmentRetryDirty = true
 	dynamicPolicy.checkCPUSet(nil, nil, nil, nil, nil)
 	as.Zero(adjustmentCalls)
-	as.True(dynamicPolicy.cpuSetAdjustmentRetryDirty)
+	as.True(dynamicPolicy.adjustment.cpuSetAdjustmentRetryDirty)
 }
 
 func TestSchedIdle(t *testing.T) {
@@ -10845,7 +10832,7 @@ func TestShoudSharedCoresRampUp(t *testing.T) {
 
 	testName := "test"
 	podUID := uuid.NewUUID()
-	dynamicPolicy.metaServer = &metaserver.MetaServer{
+	dynamicPolicy.meta.metaServer = &metaserver.MetaServer{
 		MetaAgent: &agent.MetaAgent{
 			PodFetcher: &pod.PodFetcherStub{
 				PodList: []*v1.Pod{
@@ -11015,7 +11002,7 @@ func TestSNBAdmitWithSidecarReallocate(t *testing.T) {
 	dynamicPolicy, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	as.Nil(err)
 
-	dynamicPolicy.podAnnotationKeptKeys = []string{
+	dynamicPolicy.config.podAnnotationKeptKeys = []string{
 		consts.PodAnnotationMemoryEnhancementNumaBinding,
 		consts.PodAnnotationInplaceUpdateResizingKey,
 		consts.PodAnnotationAggregatedRequestsKey,
@@ -11139,7 +11126,7 @@ func TestSNBCpuRequestWithFloat(t *testing.T) {
 	dynamicPolicy, err := getTestDynamicPolicyWithInitialization(cpuTopology, tmpDir)
 	as.Nil(err)
 
-	dynamicPolicy.podAnnotationKeptKeys = []string{
+	dynamicPolicy.config.podAnnotationKeptKeys = []string{
 		consts.PodAnnotationMemoryEnhancementNumaBinding,
 		consts.PodAnnotationInplaceUpdateResizingKey,
 		consts.PodAnnotationAggregatedRequestsKey,
@@ -11240,11 +11227,11 @@ func (m *mockCPUAdvisor) RemovePod(
 }
 
 func enableAdvisorForTest(dynamicPolicy *DynamicPolicy, pluginSocketDir string) {
-	dynamicPolicy.enableCPUAdvisor = true
-	dynamicPolicy.getAdviceInterval = 1 * time.Second
+	dynamicPolicy.config.enableCPUAdvisor = true
+	dynamicPolicy.config.getAdviceInterval = 1 * time.Second
 
-	dynamicPolicy.cpuPluginSocketAbsPath = filepath.Join(pluginSocketDir, "cpu-plugin.sock")
-	dynamicPolicy.cpuAdvisorSocketAbsPath = filepath.Join(pluginSocketDir, "cpu-advisor.sock")
+	dynamicPolicy.config.cpuPluginSocketAbsPath = filepath.Join(pluginSocketDir, "cpu-plugin.sock")
+	dynamicPolicy.config.cpuAdvisorSocketAbsPath = filepath.Join(pluginSocketDir, "cpu-advisor.sock")
 }
 
 // TestSwitchToGetAdviceRPC tests the cpu plugin can switch to GetAdvice RPC when cpu-advisor implements it,
@@ -11310,7 +11297,7 @@ func TestSwitchBetweenAPIs(t *testing.T) {
 				for i := 0; i < 5; i++ {
 					select {
 					case <-getAdviceCalledChan:
-					case <-time.After(dynamicPolicy.getAdviceInterval * 2):
+					case <-time.After(dynamicPolicy.config.getAdviceInterval * 2):
 						t.Fatalf("GetAdvice not called")
 					}
 				}
@@ -11346,7 +11333,7 @@ func TestSwitchBetweenAPIs(t *testing.T) {
 				for i := 0; i < 5; i++ {
 					select {
 					case <-getAdviceCalledChan:
-					case <-time.After(dynamicPolicy.getAdviceInterval * 2):
+					case <-time.After(dynamicPolicy.config.getAdviceInterval * 2):
 						t.Fatalf("GetAdvice not called")
 					}
 				}
@@ -11461,7 +11448,7 @@ func TestSwitchBetweenAPIs(t *testing.T) {
 			grpcServer := grpc.NewServer()
 			cpuAdvisorServer := &mockCPUAdvisor{}
 			advisorapi.RegisterCPUAdvisorServer(grpcServer, cpuAdvisorServer)
-			lis, err := net.Listen("unix", dynamicPolicy.cpuAdvisorSocketAbsPath)
+			lis, err := net.Listen("unix", dynamicPolicy.config.cpuAdvisorSocketAbsPath)
 			as.NoError(err)
 			defer func() { _ = lis.Close() }()
 			go func() { _ = grpcServer.Serve(lis) }()

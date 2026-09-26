@@ -195,63 +195,64 @@ type allocationRollbackSnapshot struct {
 	disableDedicatedOverlap bool
 }
 
-// DynamicPolicy is the policy that's used by default;
-// it will consider the dynamic running information to calculate
-// and adjust resource requirements and configurations
-type DynamicPolicy struct {
-	sync.RWMutex
-	pluginapi.UnimplementedResourcePluginServer
-
-	name    string
-	stopCh  chan struct{}
-	started bool
-
-	emitter     metrics.MetricEmitter
-	metaServer  *metaserver.MetaServer
-	machineInfo *machine.KatalystMachineInfo
-
-	advisorClient    advisorapi.CPUAdvisorClient
-	advisorConn      *grpc.ClientConn
-	advisorValidator *validator.CPUAdvisorValidator
-	advisorapi.UnimplementedCPUPluginServer
+// advisorComponent groups the CPU advisor connection, request validation,
+// health-monitor and feature-gate lifecycle fields of DynamicPolicy. It is a
+// pure field grouping with no behavior or signature change: every access moves
+// from p.<field> to p.advisor.<field>, and field types/order are unchanged.
+type advisorComponent struct {
+	advisorClient      advisorapi.CPUAdvisorClient
+	advisorConn        *grpc.ClientConn
+	advisorValidator   *validator.CPUAdvisorValidator
 	advisorMonitor     *timemonitor.TimeMonitor
 	featureGateManager featuregatenegotiation.FeatureGateManager
+}
 
-	state                          state.State
-	residualHitMap                 map[string]int64
-	allocationHandlers             map[string]util.AllocationHandler
-	hintHandlers                   map[string]util.HintHandler
-	allocationHooks                []AllocationHook
-	allocationRequestLocksMu       sync.Mutex
-	allocationRequestLocks         map[allocationRequestKey]*allocationRequestLock
-	cpuSetAdjustmentHandlers       map[string]cpusetutil.CPUSetAdjustmentHandler
-	cpuSetAdjustmentExecution      chan struct{}
-	cpuSetAdjustmentRetryMu        sync.Mutex
-	cpuSetAdjustmentRetryQueued    bool
-	cpuSetAdjustmentRetryAgain     bool
-	cpuSetAdjustmentRetryDirty     bool
-	cpuSetAdjustmentRetryReasons   map[cpusetutil.CPUSetAdjustmentRetryReason]struct{}
-	cpuSetAdjustmentRetryPersist   bool
-	cpuSetAdjustmentRetryStopCh    <-chan struct{}
-	cpuSetAdjustmentRetryStopping  bool
-	cpuSetAdjustmentRetryWG        sync.WaitGroup
-	advisorPostCommitTarget        *advisorPostCommitTarget
-	advisorPostCommitTargetChange  chan struct{}
-	advisorStateWritePermits       map[*state.WritePermit]*advisorPostCommitTarget
-	advisorPostCommitCheckpointDir string
-	steadyFakeNUMAMigrationTarget  *steadyFakeNUMAMigrationTarget
-	cpuSetAdjustmentGeneration     uint64
+// machineComponent groups the machine topology reference of DynamicPolicy. It
+// is a pure field grouping with no behavior or signature change: every access
+// moves from p.machine.machineInfo to p.machine.machineInfo.
+type machineComponent struct {
+	machineInfo *machine.KatalystMachineInfo
+}
 
-	cpuPressureEviction       agent.Component
-	cpuPressureEvictionCancel context.CancelFunc
+// metaComponent groups the metadata server reference of DynamicPolicy. It is a
+// pure field grouping with no behavior or signature change: every access moves
+// from p.meta.metaServer to p.meta.metaServer.
+type metaComponent struct {
+	metaServer *metaserver.MetaServer
+}
 
-	resourcePackageManager *resourcepackage.CachedResourcePackageManager
+// emitterComponent groups the metrics emitter reference of DynamicPolicy. It is
+// a pure field grouping with no behavior or signature change: every access moves
+// from p.emitter.emitter to p.emitter.emitter.emitter.
+type emitterComponent struct {
+	emitter metrics.MetricEmitter
+}
 
-	irqTuner        irqtuner.Tuner
+// reclaimComponent groups the reserved reclaim-pool fields of DynamicPolicy. It
+// is a pure field grouping with no behavior or signature change: every access
+// moves from p.<field> to p.reclaim.<field>.
+type reclaimComponent struct {
+	reservedReclaimedCPUsSize                 int
+	reservedReclaimedCPUSet                   machine.CPUSet
+	reservedReclaimedTopologyAwareAssignments map[int]machine.CPUSet
+	reclaimConsumersForKCNR                   []string
+}
+
+// configComponent groups the configuration-parsed fields of DynamicPolicy. It is
+// a pure field grouping with no behavior or signature change: every access moves
+// from p.<field> to p.config.<field>. Field order is preserved.
+// bulkheadComponent groups the bulkhead manager reference of DynamicPolicy.
+// hintOptimizerComponent groups the shared/dedicated NUMABinding hint optimizers.
+type hintOptimizerComponent struct {
+	sharedCoresNUMABindingHintOptimizer    hintoptimizer.HintOptimizer
+	dedicatedCoresNUMABindingHintOptimizer hintoptimizer.HintOptimizer
+}
+
+type bulkheadComponent struct {
 	bulkheadManager *bulkhead.Manager
+}
 
-	// those are parsed from configurations
-	// todo if we want to use dynamic configuration, we'd better not use self-defined conf
+type configComponent struct {
 	enableCPUAdvisor                          bool
 	getAdviceInterval                         time.Duration
 	reservedCPUs                              machine.CPUSet
@@ -276,42 +277,114 @@ type DynamicPolicy struct {
 	numaIDsAnnotationKey                      string
 	topologyAllocationAnnotationKey           string
 	transitionPeriod                          time.Duration
+}
 
-	reservedReclaimedCPUsSize                 int
-	reservedReclaimedCPUSet                   machine.CPUSet
-	reservedReclaimedTopologyAwareAssignments map[int]machine.CPUSet
+// adjustmentComponent groups the CPU set adjustment retry dispatcher together
+// with the advisor post-commit target state machine of DynamicPolicy. These
+// fields share a single mutex (cpuSetAdjustmentRetryMu) and are mutated together
+// by the cpuset adjustment/post-commit methods in cpuset_adjustment_handler.go
+// (the post-commit target drives the adjustment retry loop). It is a pure field
+// grouping with no behavior or signature change: every access moves from
+// p.<field> to p.adjustment.<field>. Field types and order are unchanged.
+type adjustmentComponent struct {
+	cpuSetAdjustmentHandlers      map[string]cpusetutil.CPUSetAdjustmentHandler
+	cpuSetAdjustmentExecution     chan struct{}
+	cpuSetAdjustmentRetryMu       sync.Mutex
+	cpuSetAdjustmentRetryQueued   bool
+	cpuSetAdjustmentRetryAgain    bool
+	cpuSetAdjustmentRetryDirty    bool
+	cpuSetAdjustmentRetryReasons  map[cpusetutil.CPUSetAdjustmentRetryReason]struct{}
+	cpuSetAdjustmentRetryPersist  bool
+	cpuSetAdjustmentRetryStopCh   <-chan struct{}
+	cpuSetAdjustmentRetryStopping bool
+	cpuSetAdjustmentRetryWG       sync.WaitGroup
+	cpuSetAdjustmentGeneration    uint64
+	advisorPostCommitTarget       *advisorPostCommitTarget
+	advisorPostCommitTargetChange chan struct{}
+	advisorStateWritePermits      map[*state.WritePermit]*advisorPostCommitTarget
+}
 
-	sharedCoresNUMABindingHintOptimizer    hintoptimizer.HintOptimizer
-	dedicatedCoresNUMABindingHintOptimizer hintoptimizer.HintOptimizer
+// allocationComponent groups the CPU allocation dispatch tables, allocation
+// hooks, and the per-request lock registry of DynamicPolicy. These are all read
+// or written only during allocation request handling in policy.go. It is a
+// pure field grouping with no behavior or signature change: every access moves
+// from p.<field> to p.allocation.<field>. Field types and order are unchanged.
+type allocationComponent struct {
+	allocationHandlers       map[string]util.AllocationHandler
+	hintHandlers             map[string]util.HintHandler
+	allocationHooks          []AllocationHook
+	allocationRequestLocksMu sync.Mutex
+	allocationRequestLocks   map[allocationRequestKey]*allocationRequestLock
+}
 
-	reclaimConsumersForKCNR []string
+// DynamicPolicy is the policy that's used by default;
+// it will consider the dynamic running information to calculate
+// and adjust resource requirements and configurations
+type DynamicPolicy struct {
+	sync.RWMutex
+	pluginapi.UnimplementedResourcePluginServer
+
+	name    string
+	stopCh  chan struct{}
+	started bool
+
+	emitter emitterComponent
+	meta    metaComponent
+	machine machineComponent
+
+	advisor advisorComponent
+
+	advisorapi.UnimplementedCPUPluginServer
+
+	state                          state.State
+	residualHitMap                 map[string]int64
+	allocation                     allocationComponent
+	adjustment                     adjustmentComponent
+	advisorPostCommitCheckpointDir string
+	steadyFakeNUMAMigrationTarget  *steadyFakeNUMAMigrationTarget
+
+	cpuPressureEviction       agent.Component
+	cpuPressureEvictionCancel context.CancelFunc
+
+	resourcePackageManager *resourcepackage.CachedResourcePackageManager
+
+	irqTuner irqtuner.Tuner
+	bulkhead bulkheadComponent
+
+	// those are parsed from configurations
+	// todo if we want to use dynamic configuration, we'd better not use self-defined conf
+	config configComponent
+
+	reclaim reclaimComponent
+
+	hintOpt hintOptimizerComponent
 }
 
 func (p *DynamicPolicy) lockAllocationRequest(podUID, containerName string) func() {
 	key := allocationRequestKey{podUID: podUID, containerName: containerName}
 
-	p.allocationRequestLocksMu.Lock()
-	if p.allocationRequestLocks == nil {
-		p.allocationRequestLocks = make(map[allocationRequestKey]*allocationRequestLock)
+	p.allocation.allocationRequestLocksMu.Lock()
+	if p.allocation.allocationRequestLocks == nil {
+		p.allocation.allocationRequestLocks = make(map[allocationRequestKey]*allocationRequestLock)
 	}
-	requestLock := p.allocationRequestLocks[key]
+	requestLock := p.allocation.allocationRequestLocks[key]
 	if requestLock == nil {
 		requestLock = &allocationRequestLock{}
-		p.allocationRequestLocks[key] = requestLock
+		p.allocation.allocationRequestLocks[key] = requestLock
 	}
 	requestLock.refCount++
-	p.allocationRequestLocksMu.Unlock()
+	p.allocation.allocationRequestLocksMu.Unlock()
 
 	requestLock.Lock()
 	return func() {
 		requestLock.Unlock()
 
-		p.allocationRequestLocksMu.Lock()
+		p.allocation.allocationRequestLocksMu.Lock()
 		requestLock.refCount--
-		if requestLock.refCount == 0 && p.allocationRequestLocks[key] == requestLock {
-			delete(p.allocationRequestLocks, key)
+		if requestLock.refCount == 0 && p.allocation.allocationRequestLocks[key] == requestLock {
+			delete(p.allocation.allocationRequestLocks, key)
 		}
-		p.allocationRequestLocksMu.Unlock()
+		p.allocation.allocationRequestLocksMu.Unlock()
 	}
 }
 
@@ -354,7 +427,7 @@ func (p *DynamicPolicy) rollbackAllocationState(
 	}
 
 	currentMachineState, err := generateMachineStateFromPodEntries(
-		p.machineInfo.CPUTopology,
+		p.machine.machineInfo.CPUTopology,
 		currentPodEntries,
 		p.state.GetMachineState(),
 	)
@@ -364,7 +437,7 @@ func (p *DynamicPolicy) rollbackAllocationState(
 
 	allowOverlap := p.state.GetAllowSharedCoresOverlapReclaimedCores()
 	disableDedicatedOverlap := p.state.GetDisableDedicatedCoresOverlapReclaimedCores()
-	planningState := state.NewTransientState(p.machineInfo.CPUTopology)
+	planningState := state.NewTransientState(p.machine.machineInfo.CPUTopology)
 	if err := planningState.CommitAdvisorState(
 		currentPodEntries,
 		currentMachineState,
@@ -446,48 +519,51 @@ func NewDynamicPolicy(agentCtx *agent.GenericContext, conf *config.Configuration
 		name:   fmt.Sprintf("%s_%s", agentName, cpuconsts.CPUResourcePluginPolicyNameDynamic),
 		stopCh: make(chan struct{}),
 
-		machineInfo: agentCtx.KatalystMachineInfo,
-		emitter:     wrappedEmitter,
-		metaServer:  agentCtx.MetaServer,
-
 		resourcePackageManager: resourcepackage.NewCachedResourcePackageManager(agentCtx.MetaServer.ResourcePackageManager),
 
 		state:          stateImpl,
 		residualHitMap: make(map[string]int64),
 
-		advisorValidator:   validator.NewCPUAdvisorValidator(stateImpl, agentCtx.KatalystMachineInfo),
-		featureGateManager: featuregatenegotiation.NewFeatureGateManager(conf),
+		advisor: advisorComponent{
+			advisorValidator:   validator.NewCPUAdvisorValidator(stateImpl, agentCtx.KatalystMachineInfo),
+			featureGateManager: featuregatenegotiation.NewFeatureGateManager(conf),
+		},
 
 		cpuPressureEviction: cpuPressureEviction,
-		bulkheadManager:     bulkheadManager,
-
-		conf:                           conf,
-		qosConfig:                      conf.QoSConfiguration,
-		dynamicConfig:                  conf.DynamicAgentConfiguration,
-		cpuAdvisorSocketAbsPath:        conf.CPUAdvisorSocketAbsPath,
-		cpuPluginSocketAbsPath:         conf.CPUPluginSocketAbsPath,
-		enableReclaimNUMABinding:       conf.EnableReclaimNUMABinding,
-		enableSNBHighNumaPreference:    conf.EnableSNBHighNumaPreference,
-		enableCPUAdvisor:               conf.CPUQRMPluginConfig.EnableCPUAdvisor,
-		getAdviceInterval:              conf.CPUQRMPluginConfig.GetAdviceInterval,
-		reservedCPUs:                   reservedCPUs,
-		extraStateFileAbsPath:          conf.ExtraStateFileAbsPath,
-		enableCPUBurst:                 conf.CPUQRMPluginConfig.EnableCPUBurst,
-		enableSyncingCPUIdle:           conf.CPUQRMPluginConfig.EnableSyncingCPUIdle,
-		enableCPUIdle:                  conf.CPUQRMPluginConfig.EnableCPUIdle,
-		reclaimRelativeRootCgroupPaths: reclaim.AggregateCgroupPaths(),
-		numaBindingReclaimRelativeRootCgroupPaths: reclaim.AggregateNumaBindingCgroupPaths(),
-		podDebugAnnoKeys:                conf.PodDebugAnnoKeys,
-		podAnnotationKeptKeys:           conf.PodAnnotationKeptKeys,
-		podLabelKeptKeys:                conf.PodLabelKeptKeys,
-		numaBindingResultAnnotationKey:  conf.NUMABindingResultAnnotationKey,
-		numaNumberAnnotationKey:         conf.NUMANumberAnnotationKey,
-		numaIDsAnnotationKey:            conf.NUMAIDsAnnotationKey,
-		topologyAllocationAnnotationKey: conf.TopologyAllocationAnnotationKey,
-		transitionPeriod:                rampUpTransitionPeriod,
-		reservedReclaimedCPUsSize:       general.Max(reservedReclaimedCPUsSize, agentCtx.KatalystMachineInfo.NumNUMANodes),
-		reclaimConsumersForKCNR:         conf.ReclaimConsumersForKCNR,
-	}
+		machine:             machineComponent{machineInfo: agentCtx.KatalystMachineInfo},
+		meta:                metaComponent{metaServer: agentCtx.MetaServer},
+		emitter:             emitterComponent{emitter: wrappedEmitter},
+		reclaim: reclaimComponent{
+			reservedReclaimedCPUsSize: general.Max(reservedReclaimedCPUsSize, agentCtx.KatalystMachineInfo.NumNUMANodes),
+			reclaimConsumersForKCNR:   conf.ReclaimConsumersForKCNR,
+		},
+		config: configComponent{
+			conf:                           conf,
+			qosConfig:                      conf.QoSConfiguration,
+			dynamicConfig:                  conf.DynamicAgentConfiguration,
+			cpuAdvisorSocketAbsPath:        conf.CPUAdvisorSocketAbsPath,
+			cpuPluginSocketAbsPath:         conf.CPUPluginSocketAbsPath,
+			enableReclaimNUMABinding:       conf.EnableReclaimNUMABinding,
+			enableSNBHighNumaPreference:    conf.EnableSNBHighNumaPreference,
+			enableCPUAdvisor:               conf.CPUQRMPluginConfig.EnableCPUAdvisor,
+			getAdviceInterval:              conf.CPUQRMPluginConfig.GetAdviceInterval,
+			reservedCPUs:                   reservedCPUs,
+			extraStateFileAbsPath:          conf.ExtraStateFileAbsPath,
+			enableCPUBurst:                 conf.CPUQRMPluginConfig.EnableCPUBurst,
+			enableSyncingCPUIdle:           conf.CPUQRMPluginConfig.EnableSyncingCPUIdle,
+			enableCPUIdle:                  conf.CPUQRMPluginConfig.EnableCPUIdle,
+			reclaimRelativeRootCgroupPaths: reclaim.AggregateCgroupPaths(),
+			numaBindingReclaimRelativeRootCgroupPaths: reclaim.AggregateNumaBindingCgroupPaths(),
+			podDebugAnnoKeys:                conf.PodDebugAnnoKeys,
+			podAnnotationKeptKeys:           conf.PodAnnotationKeptKeys,
+			podLabelKeptKeys:                conf.PodLabelKeptKeys,
+			numaBindingResultAnnotationKey:  conf.NUMABindingResultAnnotationKey,
+			numaNumberAnnotationKey:         conf.NUMANumberAnnotationKey,
+			numaIDsAnnotationKey:            conf.NUMAIDsAnnotationKey,
+			topologyAllocationAnnotationKey: conf.TopologyAllocationAnnotationKey,
+			transitionPeriod:                rampUpTransitionPeriod,
+		},
+		bulkhead: bulkheadComponent{bulkheadManager: bulkheadManager}}
 	policyImplement.advisorPostCommitCheckpointDir, _ = conf.StateDirectoryConfiguration.GetCurrentAndPreviousStateFileDirectory()
 	if err := policyImplement.restoreSteadyFakeNUMAMigrationTarget(); err != nil {
 		return false, nil, fmt.Errorf("restore steady fake-NUMA migration target: %w", err)
@@ -506,7 +582,7 @@ func NewDynamicPolicy(agentCtx *agent.GenericContext, conf *config.Configuration
 	}
 
 	if conf.EnableIRQTuner {
-		irqTuner, err := irqtuingcontroller.NewIrqTuningController(conf.AgentConfiguration, policyImplement, policyImplement.emitter, policyImplement.machineInfo)
+		irqTuner, err := irqtuingcontroller.NewIrqTuningController(conf.AgentConfiguration, policyImplement, policyImplement.emitter.emitter, policyImplement.machine.machineInfo)
 		if err != nil {
 			general.Errorf("failed to NewIrqTuningController, err %s", err)
 			return false, agent.ComponentStub{}, err
@@ -516,7 +592,7 @@ func NewDynamicPolicy(agentCtx *agent.GenericContext, conf *config.Configuration
 	}
 
 	// register allocation behaviors for pods with different QoS level
-	policyImplement.allocationHandlers = map[string]util.AllocationHandler{
+	policyImplement.allocation.allocationHandlers = map[string]util.AllocationHandler{
 		consts.PodAnnotationQoSLevelSharedCores:    policyImplement.sharedCoresAllocationHandler,
 		consts.PodAnnotationQoSLevelDedicatedCores: policyImplement.dedicatedCoresAllocationHandler,
 		consts.PodAnnotationQoSLevelReclaimedCores: policyImplement.reclaimedCoresAllocationHandler,
@@ -524,7 +600,7 @@ func NewDynamicPolicy(agentCtx *agent.GenericContext, conf *config.Configuration
 	}
 
 	// register hint providers for pods with different QoS level
-	policyImplement.hintHandlers = map[string]util.HintHandler{
+	policyImplement.allocation.hintHandlers = map[string]util.HintHandler{
 		consts.PodAnnotationQoSLevelSharedCores:    policyImplement.sharedCoresHintHandler,
 		consts.PodAnnotationQoSLevelDedicatedCores: policyImplement.dedicatedCoresHintHandler,
 		consts.PodAnnotationQoSLevelReclaimedCores: policyImplement.reclaimedCoresHintHandler,
@@ -545,7 +621,7 @@ func NewDynamicPolicy(agentCtx *agent.GenericContext, conf *config.Configuration
 		}
 	}
 
-	if err := policyImplement.RegisterCPUSetAdjustmentHandler("bulkhead", policyImplement.bulkheadManager.RunCPUSetAdjustmentHandlers); err != nil {
+	if err := policyImplement.RegisterCPUSetAdjustmentHandler("bulkhead", policyImplement.bulkhead.bulkheadManager.RunCPUSetAdjustmentHandlers); err != nil {
 		return false, agent.ComponentStub{}, fmt.Errorf("dynamic policy register bulkhead cpuset adjustment handler failed with error: %v", err)
 	}
 
@@ -598,7 +674,7 @@ func (p *DynamicPolicy) topologyAllocationHook(oldInfo, newInfo *state.Allocatio
 		return nil
 	}
 
-	annotations, err := cpuutil.GetCPUTopologyAllocationsAnnotations(newInfo, p.topologyAllocationAnnotationKey)
+	annotations, err := cpuutil.GetCPUTopologyAllocationsAnnotations(newInfo, p.config.topologyAllocationAnnotationKey)
 	if err != nil {
 		return err
 	}
@@ -616,10 +692,10 @@ func (p *DynamicPolicy) ResourceName() string {
 }
 
 func (p *DynamicPolicy) startKubeletPodCacheSyncDrivenCPUSetRetry() {
-	if p.metaServer == nil || p.metaServer.MetaAgent == nil {
+	if p.meta.metaServer == nil || p.meta.metaServer.MetaAgent == nil {
 		return
 	}
-	registrar, ok := p.metaServer.PodFetcher.(podmeta.KubeletPodCacheSyncEventRegistrar)
+	registrar, ok := p.meta.metaServer.PodFetcher.(podmeta.KubeletPodCacheSyncEventRegistrar)
 	if !ok {
 		return
 	}
@@ -658,10 +734,10 @@ func (p *DynamicPolicy) Start() (err error) {
 	}
 	p.started = true
 	p.stopCh = make(chan struct{})
-	p.cpuSetAdjustmentRetryMu.Lock()
-	p.cpuSetAdjustmentRetryStopCh = p.stopCh
-	p.cpuSetAdjustmentRetryStopping = false
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.cpuSetAdjustmentRetryStopCh = p.stopCh
+	p.adjustment.cpuSetAdjustmentRetryStopping = false
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	p.Unlock()
 
 	defer func() {
@@ -688,7 +764,7 @@ func (p *DynamicPolicy) Start() (err error) {
 	p.startKubeletPodCacheSyncDrivenCPUSetRetry()
 
 	go wait.Until(func() {
-		_ = p.emitter.StoreInt64(util.MetricNameHeartBeat, 1, metrics.MetricTypeNameRaw)
+		_ = p.emitter.emitter.StoreInt64(util.MetricNameHeartBeat, 1, metrics.MetricTypeNameRaw)
 		p.emitRuntimeConfigMetrics()
 	}, time.Second*30, p.stopCh)
 
@@ -717,10 +793,10 @@ func (p *DynamicPolicy) Start() (err error) {
 	}
 
 	// start cpu-idle syncing if needed
-	if p.enableSyncingCPUIdle {
+	if p.config.enableSyncingCPUIdle {
 		general.Infof("syncCPUIdle enabled")
 
-		if len(p.reclaimRelativeRootCgroupPaths) == 0 {
+		if len(p.config.reclaimRelativeRootCgroupPaths) == 0 {
 			return fmt.Errorf("enable syncing cpu idle but not set reclaiemd relative root cgroup path in configuration")
 		}
 
@@ -732,7 +808,7 @@ func (p *DynamicPolicy) Start() (err error) {
 	}
 
 	// start cpu burst sync if needed
-	if p.enableCPUBurst {
+	if p.config.enableCPUBurst {
 		general.Infof("cpu burst is enabled")
 
 		err = periodicalhandler.RegisterPeriodicalHandlerWithHealthz(cpuconsts.SyncCPUBurst, general.HealthzCheckStateNotReady,
@@ -742,7 +818,7 @@ func (p *DynamicPolicy) Start() (err error) {
 		}
 	}
 
-	if p.conf.CPUQRMPluginConfig.EnableCPUWeight {
+	if p.config.conf.CPUQRMPluginConfig.EnableCPUWeight {
 		general.Infof("cpu weight is enabled")
 
 		err = periodicalhandler.RegisterPeriodicalHandlerWithHealthz(cpuconsts.SyncCPUWeight, general.HealthzCheckStateNotReady,
@@ -768,12 +844,12 @@ func (p *DynamicPolicy) Start() (err error) {
 	}, 5*time.Second, p.stopCh)
 
 	// pre-check necessary dirs if sys-advisor is enabled
-	if !p.enableCPUAdvisor {
+	if !p.config.enableCPUAdvisor {
 		general.Infof("start dynamic policy cpu plugin without sys-advisor")
 		return nil
-	} else if p.cpuAdvisorSocketAbsPath == "" || p.cpuPluginSocketAbsPath == "" {
+	} else if p.config.cpuAdvisorSocketAbsPath == "" || p.config.cpuPluginSocketAbsPath == "" {
 		return fmt.Errorf("invalid cpuAdvisorSocketAbsPath: %s or cpuPluginSocketAbsPath: %s",
-			p.cpuAdvisorSocketAbsPath, p.cpuPluginSocketAbsPath)
+			p.config.cpuAdvisorSocketAbsPath, p.config.cpuPluginSocketAbsPath)
 	}
 
 	general.Infof("start dynamic policy cpu plugin with sys-advisor")
@@ -785,22 +861,22 @@ func (p *DynamicPolicy) Start() (err error) {
 		return
 	}
 
-	p.advisorMonitor, err = timemonitor.NewTimeMonitor(cpuAdvisorHealthMonitorName, cpuAdvisorHealthMonitorInterval,
+	p.advisor.advisorMonitor, err = timemonitor.NewTimeMonitor(cpuAdvisorHealthMonitorName, cpuAdvisorHealthMonitorInterval,
 		cpuAdvisorUnhealthyThreshold, cpuAdvisorHealthyThreshold,
-		util.MetricNameAdvisorUnhealthy, p.emitter, cpuAdvisorHealthyCount, true)
+		util.MetricNameAdvisorUnhealthy, p.emitter.emitter, cpuAdvisorHealthyCount, true)
 	if err != nil {
 		general.Errorf("initialize cpu advisor monitor failed with error: %v", err)
 		return
 	}
-	go p.advisorMonitor.Run(p.stopCh)
+	go p.advisor.advisorMonitor.Run(p.stopCh)
 
 	go wait.BackoffUntil(func() { p.serveForAdvisor(p.stopCh) }, wait.NewExponentialBackoffManager(
 		800*time.Millisecond, 30*time.Second, 2*time.Minute, 2.0, 0, &clock.RealClock{}), true, p.stopCh)
 
 	communicateWithCPUAdvisorServer := func() {
 		general.Infof("waiting cpu plugin checkpoint server serving confirmation")
-		if conn, err := process.Dial(p.cpuPluginSocketAbsPath, 5*time.Second); err != nil {
-			general.Errorf("dial check at socket: %s failed with err: %v", p.cpuPluginSocketAbsPath, err)
+		if conn, err := process.Dial(p.config.cpuPluginSocketAbsPath, 5*time.Second); err != nil {
+			general.Errorf("dial check at socket: %s failed with err: %v", p.config.cpuPluginSocketAbsPath, err)
 			return
 		} else {
 			_ = conn.Close()
@@ -842,12 +918,12 @@ func (p *DynamicPolicy) Start() (err error) {
 	p.syncResourcePackagePinnedCPUSet()
 	go wait.Until(p.syncResourcePackagePinnedCPUSet, 30*time.Second, p.stopCh)
 
-	err = p.sharedCoresNUMABindingHintOptimizer.Run(p.stopCh)
+	err = p.hintOpt.sharedCoresNUMABindingHintOptimizer.Run(p.stopCh)
 	if err != nil {
 		return fmt.Errorf("sharedCoresNUMABindingHintOptimizer.Run failed with error: %v", err)
 	}
 
-	err = p.dedicatedCoresNUMABindingHintOptimizer.Run(p.stopCh)
+	err = p.hintOpt.dedicatedCoresNUMABindingHintOptimizer.Run(p.stopCh)
 	if err != nil {
 		return fmt.Errorf("dedicatedCoresNUMABindingHintOptimizer.Run failed with error: %v", err)
 	}
@@ -860,7 +936,7 @@ func (p *DynamicPolicy) emitRuntimeConfigMetrics() {
 	if p.isReclaimEnabled() {
 		reclaimEnabled = 1
 	}
-	_ = p.emitter.StoreInt64(util.MetricNameReclaimEnabled, reclaimEnabled, metrics.MetricTypeNameRaw)
+	_ = p.emitter.emitter.StoreInt64(util.MetricNameReclaimEnabled, reclaimEnabled, metrics.MetricTypeNameRaw)
 }
 
 func (p *DynamicPolicy) Stop() error {
@@ -873,12 +949,12 @@ func (p *DynamicPolicy) Stop() error {
 
 	p.started = false
 	stopCh := p.stopCh
-	p.cpuSetAdjustmentRetryMu.Lock()
-	p.cpuSetAdjustmentRetryStopping = true
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.cpuSetAdjustmentRetryStopping = true
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	close(stopCh)
 	p.Unlock()
-	p.cpuSetAdjustmentRetryWG.Wait()
+	p.adjustment.cpuSetAdjustmentRetryWG.Wait()
 
 	if p.cpuPressureEvictionCancel != nil {
 		p.cpuPressureEvictionCancel()
@@ -886,8 +962,8 @@ func (p *DynamicPolicy) Stop() error {
 
 	periodicalhandler.StopHandlersByGroup(qrm.QRMCPUPluginPeriodicalHandlerGroupName)
 
-	if p.advisorConn != nil {
-		if err := p.advisorConn.Close(); err != nil {
+	if p.advisor.advisorConn != nil {
+		if err := p.advisor.advisorConn.Close(); err != nil {
 			return err
 		}
 	}
@@ -925,7 +1001,7 @@ func (p *DynamicPolicy) GetResourcesAllocation(ctx context.Context,
 			continue
 		}
 		main := containerEntries.GetMainContainerEntry()
-		finishRampUp, _ := shouldAllocationFinishRampUp(main, p.transitionPeriod, now)
+		finishRampUp, _ := shouldAllocationFinishRampUp(main, p.config.transitionPeriod, now)
 		if finishRampUp && main.CheckShared() {
 			hasSharedRampUpExit = true
 			break
@@ -933,7 +1009,7 @@ func (p *DynamicPolicy) GetResourcesAllocation(ctx context.Context,
 	}
 
 	// rumpUpPooledCPUs is the total available cpu cores minus those that are reserved
-	rumpUpPooledCPUs := machineState.GetFilteredAvailableCPUSet(p.reservedCPUs,
+	rumpUpPooledCPUs := machineState.GetFilteredAvailableCPUSet(p.config.reservedCPUs,
 		func(ai *state.AllocationInfo) bool {
 			return ai.CheckDedicated() || ai.CheckSharedNUMABinding()
 		},
@@ -997,7 +1073,7 @@ func (p *DynamicPolicy) GetResourcesAllocation(ctx context.Context,
 					}
 					clonedPooledCPUs := rumpUpPooledCPUs.Difference(rampUpReclaimFloor)
 					clonedPooledCPUsTopologyAwareAssignments, err := machine.GetNumaAwareAssignments(
-						p.machineInfo.CPUTopology, clonedPooledCPUs)
+						p.machine.machineInfo.CPUTopology, clonedPooledCPUs)
 					if err != nil {
 						return nil, fmt.Errorf("get NUMA assignments for legacy re-ramp-up failed: %w", err)
 					}
@@ -1021,7 +1097,7 @@ func (p *DynamicPolicy) GetResourcesAllocation(ctx context.Context,
 					general.Errorf("updateAllocationInfo failed for pod: %s/%s, container: %s: %v",
 						allocationInfo.PodNamespace, allocationInfo.PodName, containerName, err)
 				}
-			} else if finishRampUp, _ := shouldAllocationFinishRampUp(allocationInfo, p.transitionPeriod, time.Now()); finishRampUp {
+			} else if finishRampUp, _ := shouldAllocationFinishRampUp(allocationInfo, p.config.transitionPeriod, time.Now()); finishRampUp {
 				general.Infof("pod: %s/%s, container: %s ramp up finished", allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName)
 				allocationInfo.RampUp = false
 				if allocationInfo.CheckShared() {
@@ -1055,7 +1131,7 @@ func (p *DynamicPolicy) GetResourcesAllocation(ctx context.Context,
 		// because putAllocationsAndAdjustAllocationEntries will update machine state.
 		general.Infof("GetResourcesAllocation update machine state")
 		podEntries = p.state.GetPodEntries()
-		updatedMachineState, err := generateMachineStateFromPodEntries(p.machineInfo.CPUTopology, podEntries, machineState)
+		updatedMachineState, err := generateMachineStateFromPodEntries(p.machine.machineInfo.CPUTopology, podEntries, machineState)
 		if err != nil {
 			general.Errorf("GetResourcesAllocation GenerateMachineStateFromPodEntries failed with error: %v", err)
 			return nil, fmt.Errorf("GenerateMachineStateFromPodEntries failed with error: %v", err)
@@ -1173,14 +1249,14 @@ func (p *DynamicPolicy) GetTopologyAwareAllocatableResources(_ context.Context,
 ) (*pluginapi.GetTopologyAwareAllocatableResourcesResponse, error) {
 	general.Infof("is called")
 
-	numaNodes := p.machineInfo.CPUDetails.NUMANodes().ToSliceInt()
+	numaNodes := p.machine.machineInfo.CPUDetails.NUMANodes().ToSliceInt()
 	topologyAwareAllocatableQuantityList := make([]*pluginapi.TopologyAwareQuantity, 0, len(numaNodes))
 	topologyAwareCapacityQuantityList := make([]*pluginapi.TopologyAwareQuantity, 0, len(numaNodes))
 
 	for _, numaNode := range numaNodes {
-		numaNodeCPUs := p.machineInfo.CPUDetails.CPUsInNUMANodes(numaNode).Clone()
+		numaNodeCPUs := p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(numaNode).Clone()
 		topologyAwareAllocatableQuantityList = append(topologyAwareAllocatableQuantityList, &pluginapi.TopologyAwareQuantity{
-			ResourceValue: float64(numaNodeCPUs.Difference(p.reservedCPUs).Size()),
+			ResourceValue: float64(numaNodeCPUs.Difference(p.config.reservedCPUs).Size()),
 			Node:          uint64(numaNode),
 		})
 		topologyAwareCapacityQuantityList = append(topologyAwareCapacityQuantityList, &pluginapi.TopologyAwareQuantity{
@@ -1193,14 +1269,14 @@ func (p *DynamicPolicy) GetTopologyAwareAllocatableResources(_ context.Context,
 		string(v1.ResourceCPU): {
 			IsNodeResource:                       false,
 			IsScalarResource:                     true,
-			AggregatedAllocatableQuantity:        float64(p.machineInfo.NumCPUs - p.reservedCPUs.Size()),
+			AggregatedAllocatableQuantity:        float64(p.machine.machineInfo.NumCPUs - p.config.reservedCPUs.Size()),
 			TopologyAwareAllocatableQuantityList: topologyAwareAllocatableQuantityList,
-			AggregatedCapacityQuantity:           float64(p.machineInfo.NumCPUs),
+			AggregatedCapacityQuantity:           float64(p.machine.machineInfo.NumCPUs),
 			TopologyAwareCapacityQuantityList:    topologyAwareCapacityQuantityList,
 		},
 	}
 
-	p.addReclaimedCPUAllocatable(allocatableResources, numaNodes, p.reclaimConsumersForKCNR)
+	p.addReclaimedCPUAllocatable(allocatableResources, numaNodes, p.reclaim.reclaimConsumersForKCNR)
 
 	return &pluginapi.GetTopologyAwareAllocatableResourcesResponse{
 		AllocatableResources: allocatableResources,
@@ -1218,7 +1294,7 @@ func (p *DynamicPolicy) addReclaimedCPUAllocatable(
 	numaNodes []int,
 	consumerNames []string,
 ) {
-	if !p.conf.EnableReclaimedResourceAllocatableReporting {
+	if !p.config.conf.EnableReclaimedResourceAllocatableReporting {
 		return
 	}
 
@@ -1228,7 +1304,7 @@ func (p *DynamicPolicy) addReclaimedCPUAllocatable(
 
 	numaHeadroom := p.state.GetNUMAHeadroom()
 	reclaimedNUMAHeadroom := reclaim.GetReclaimedNUMAHeadroom(
-		numaHeadroom, p.dynamicConfig.GetDynamicConfiguration(), consumerNames...)
+		numaHeadroom, p.config.dynamicConfig.GetDynamicConfiguration(), consumerNames...)
 
 	topologyAwareList := make([]*pluginapi.TopologyAwareQuantity, 0, len(numaNodes))
 	for _, numaNode := range numaNodes {
@@ -1266,9 +1342,9 @@ func (p *DynamicPolicy) GetTopologyHints(ctx context.Context,
 	// if so, apply specific strategy to it.
 	// since GetKatalystQoSLevelFromResourceReq function will filter annotations,
 	// we should do it before GetKatalystQoSLevelFromResourceReq.
-	isDebugPod := util.IsDebugPod(req.Annotations, p.podDebugAnnoKeys)
+	isDebugPod := util.IsDebugPod(req.Annotations, p.config.podDebugAnnoKeys)
 
-	qosLevel, err := util.GetKatalystQoSLevelFromResourceReq(p.qosConfig, req, p.podAnnotationKeptKeys, p.podLabelKeptKeys)
+	qosLevel, err := util.GetKatalystQoSLevelFromResourceReq(p.config.qosConfig, req, p.config.podAnnotationKeptKeys, p.config.podLabelKeptKeys)
 	if err != nil {
 		err = fmt.Errorf("GetKatalystQoSLevelFromResourceReq for pod: %s/%s, container: %s failed with error: %v",
 			req.PodNamespace, req.PodName, req.ContainerName, err)
@@ -1308,7 +1384,7 @@ func (p *DynamicPolicy) GetTopologyHints(ctx context.Context,
 		p.RUnlock()
 		if err != nil {
 			inplaceUpdateResizing := util.PodInplaceUpdateResizing(req)
-			_ = p.emitter.StoreInt64(util.MetricNameGetTopologyHintsFailed, 1, metrics.MetricTypeNameRaw,
+			_ = p.emitter.emitter.StoreInt64(util.MetricNameGetTopologyHintsFailed, 1, metrics.MetricTypeNameRaw,
 				metrics.MetricTag{Key: "error_message", Val: metric.MetricTagValueFormat(err)},
 				metrics.MetricTag{Key: util.MetricTagNameInplaceUpdateResizing, Val: strconv.FormatBool(inplaceUpdateResizing)})
 
@@ -1327,10 +1403,10 @@ func (p *DynamicPolicy) GetTopologyHints(ctx context.Context,
 		)
 	}()
 
-	if p.hintHandlers[qosLevel] == nil {
+	if p.allocation.hintHandlers[qosLevel] == nil {
 		return nil, fmt.Errorf("katalyst QoS level: %s is not supported yet", qosLevel)
 	}
-	return p.hintHandlers[qosLevel](ctx, req)
+	return p.allocation.hintHandlers[qosLevel](ctx, req)
 }
 
 // GetPodTopologyHints returns hints of corresponding resources for pod
@@ -1358,10 +1434,10 @@ func (p *DynamicPolicy) GetResourcePluginOptions(context.Context,
 func (p *DynamicPolicy) acquireCPUSetAdjustmentExecutionLocked(
 	ctx context.Context,
 ) (*cpuSetAdjustmentExecutionLease, error) {
-	if p.cpuSetAdjustmentExecution == nil {
-		p.cpuSetAdjustmentExecution = make(chan struct{}, 1)
+	if p.adjustment.cpuSetAdjustmentExecution == nil {
+		p.adjustment.cpuSetAdjustmentExecution = make(chan struct{}, 1)
 	}
-	execution := p.cpuSetAdjustmentExecution
+	execution := p.adjustment.cpuSetAdjustmentExecution
 	p.Unlock()
 	select {
 	case execution <- struct{}{}:
@@ -1461,11 +1537,11 @@ func (p *DynamicPolicy) Allocate(ctx context.Context,
 	// if so, apply specific strategy to it.
 	// since GetKatalystQoSLevelFromResourceReq function will filter annotations,
 	// we should do it before GetKatalystQoSLevelFromResourceReq.
-	isDebugPod := util.IsDebugPod(req.Annotations, p.podDebugAnnoKeys)
+	isDebugPod := util.IsDebugPod(req.Annotations, p.config.podDebugAnnoKeys)
 
 	existReallocAnno, isReallocation := util.IsReallocation(req.Annotations)
 
-	qosLevel, err := util.GetKatalystQoSLevelFromResourceReq(p.qosConfig, req, p.podAnnotationKeptKeys, p.podLabelKeptKeys)
+	qosLevel, err := util.GetKatalystQoSLevelFromResourceReq(p.config.qosConfig, req, p.config.podAnnotationKeptKeys, p.config.podLabelKeptKeys)
 	if err != nil {
 		err = fmt.Errorf("GetKatalystQoSLevelFromResourceReq for pod: %s/%s, container: %s failed with error: %v",
 			req.PodNamespace, req.PodName, req.ContainerName, err)
@@ -1539,8 +1615,8 @@ func (p *DynamicPolicy) Allocate(ctx context.Context,
 	var executionLease *cpuSetAdjustmentExecutionLease
 	defer func() {
 		// calls sys-advisor to inform the latest container
-		if p.enableCPUAdvisor && respErr == nil && req.ContainerType != pluginapi.ContainerType_INIT {
-			_, err := p.advisorClient.AddContainer(ctx, &advisorsvc.ContainerMetadata{
+		if p.config.enableCPUAdvisor && respErr == nil && req.ContainerType != pluginapi.ContainerType_INIT {
+			_, err := p.advisor.advisorClient.AddContainer(ctx, &advisorsvc.ContainerMetadata{
 				PodUid:               req.PodUid,
 				PodNamespace:         req.PodNamespace,
 				PodName:              req.PodName,
@@ -1575,7 +1651,7 @@ func (p *DynamicPolicy) Allocate(ctx context.Context,
 			if existReallocAnno {
 				metricTags = append(metricTags, metrics.MetricTag{Key: "reallocation", Val: isReallocation})
 			}
-			_ = p.emitter.StoreInt64(util.MetricNameAllocateFailed, 1, metrics.MetricTypeNameRaw, metricTags...)
+			_ = p.emitter.emitter.StoreInt64(util.MetricNameAllocateFailed, 1, metrics.MetricTypeNameRaw, metricTags...)
 		}
 		if rollbackSnapshot != nil {
 			if err := p.state.StoreState(); err != nil {
@@ -1646,10 +1722,10 @@ func (p *DynamicPolicy) Allocate(ctx context.Context,
 		return resp, nil
 	}
 
-	if p.allocationHandlers[qosLevel] == nil {
+	if p.allocation.allocationHandlers[qosLevel] == nil {
 		return nil, fmt.Errorf("katalyst QoS level: %s is not supported yet", qosLevel)
 	}
-	return p.allocationHandlers[qosLevel](ctx, req, false)
+	return p.allocation.allocationHandlers[qosLevel](ctx, req, false)
 }
 
 // AllocateForPod is called during pod admit so that the resource
@@ -1683,7 +1759,7 @@ func (p *DynamicPolicy) RemovePod(ctx context.Context,
 	defer func() {
 		p.Unlock()
 		if err != nil {
-			_ = p.emitter.StoreInt64(util.MetricNameRemovePodFailed, 1, metrics.MetricTypeNameRaw,
+			_ = p.emitter.emitter.StoreInt64(util.MetricNameRemovePodFailed, 1, metrics.MetricTypeNameRaw,
 				metrics.MetricTag{Key: "error_message", Val: metric.MetricTagValueFormat(err)})
 			general.ErrorS(err, "RemovePod failed", "podUID", req.PodUid)
 		}
@@ -1706,11 +1782,11 @@ func (p *DynamicPolicy) RemovePod(ctx context.Context,
 		return &pluginapi.RemovePodResponse{}, nil
 	}
 
-	if p.enableCPUAdvisor {
-		if p.advisorClient == nil {
+	if p.config.enableCPUAdvisor {
+		if p.advisor.advisorClient == nil {
 			return nil, fmt.Errorf("cpu advisor client is nil")
 		}
-		_, err = p.advisorClient.RemovePod(ctx, &advisorsvc.RemovePodRequest{PodUid: req.PodUid})
+		_, err = p.advisor.advisorClient.RemovePod(ctx, &advisorsvc.RemovePodRequest{PodUid: req.PodUid})
 		if err != nil {
 			return nil, fmt.Errorf("remove pod in QoS aware server failed with error: %v", err)
 		}
@@ -1720,7 +1796,7 @@ func (p *DynamicPolicy) RemovePod(ctx context.Context,
 	podEntries := currentPodEntries.Clone()
 	delete(podEntries, req.PodUid)
 	machineState, err := generateMachineStateFromPodEntries(
-		p.machineInfo.CPUTopology, podEntries, p.state.GetMachineState())
+		p.machine.machineInfo.CPUTopology, podEntries, p.state.GetMachineState())
 	if err != nil {
 		return nil, fmt.Errorf("GenerateMachineStateFromPodEntries failed with error: %v", err)
 	}
@@ -1754,7 +1830,7 @@ func (p *DynamicPolicy) removeContainer(podUID, containerName string, persistChe
 		return nil
 	}
 
-	updatedMachineState, err := generateMachineStateFromPodEntries(p.machineInfo.CPUTopology, podEntries, p.state.GetMachineState())
+	updatedMachineState, err := generateMachineStateFromPodEntries(p.machine.machineInfo.CPUTopology, podEntries, p.state.GetMachineState())
 	if err != nil {
 		return fmt.Errorf("GenerateMachineStateFromPodEntries failed with error: %v", err)
 	}
@@ -1774,7 +1850,7 @@ func (p *DynamicPolicy) removeContainer(podUID, containerName string, persistChe
 // initAdvisorClientConn initializes cpu-advisor related connections
 func (p *DynamicPolicy) initAdvisorClientConn() (err error) {
 	cpuAdvisorConn, err := process.Dial(
-		p.cpuAdvisorSocketAbsPath,
+		p.config.cpuAdvisorSocketAbsPath,
 		5*time.Second,
 		grpc.WithUnaryInterceptor(func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 			// add metadata to outgoing context to indicate that qrm supports GetAdvice.
@@ -1784,12 +1860,12 @@ func (p *DynamicPolicy) initAdvisorClientConn() (err error) {
 		}),
 	)
 	if err != nil {
-		err = fmt.Errorf("get cpu advisor connection with socket: %s failed with error: %v", p.cpuAdvisorSocketAbsPath, err)
+		err = fmt.Errorf("get cpu advisor connection with socket: %s failed with error: %v", p.config.cpuAdvisorSocketAbsPath, err)
 		return
 	}
 
-	p.advisorClient = advisorapi.NewCPUAdvisorClient(cpuAdvisorConn)
-	p.advisorConn = cpuAdvisorConn
+	p.advisor.advisorClient = advisorapi.NewCPUAdvisorClient(cpuAdvisorConn)
+	p.advisor.advisorConn = cpuAdvisorConn
 	return nil
 }
 
@@ -1797,16 +1873,16 @@ func (p *DynamicPolicy) initHintOptimizers() error {
 	var err error
 	hintOptimizerFactoryOptions := p.generateHintOptimizerFactoryOptions()
 
-	p.sharedCoresNUMABindingHintOptimizer, err = registry.SharedCoresHintOptimizerRegistry.HintOptimizerWithFilters(
-		p.conf.SharedCoresHintOptimizerPolicies,
-		p.conf.SharedCoresHintFilterPolicies,
+	p.hintOpt.sharedCoresNUMABindingHintOptimizer, err = registry.SharedCoresHintOptimizerRegistry.HintOptimizerWithFilters(
+		p.config.conf.SharedCoresHintOptimizerPolicies,
+		p.config.conf.SharedCoresHintFilterPolicies,
 		hintOptimizerFactoryOptions,
 	)
 	if err != nil {
 		return fmt.Errorf("SharedCoresHintOptimizerRegistry.HintOptimizerWithFilters failed with error: %v", err)
 	}
 
-	p.dedicatedCoresNUMABindingHintOptimizer, err = registry.DedicatedCoresHintOptimizerRegistry.HintOptimizer(p.conf.DedicatedCoresHintOptimizerPolicies,
+	p.hintOpt.dedicatedCoresNUMABindingHintOptimizer, err = registry.DedicatedCoresHintOptimizerRegistry.HintOptimizer(p.config.conf.DedicatedCoresHintOptimizerPolicies,
 		p.generateHintOptimizerFactoryOptions())
 	if err != nil {
 		return fmt.Errorf("DedicatedCoresHintOptimizerRegistry.HintOptimizer failed with error: %v", err)
@@ -1817,12 +1893,12 @@ func (p *DynamicPolicy) initHintOptimizers() error {
 
 func (p *DynamicPolicy) generateHintOptimizerFactoryOptions() policy.HintOptimizerFactoryOptions {
 	return policy.HintOptimizerFactoryOptions{
-		Conf:                   p.conf,
-		Emitter:                p.emitter,
-		MetaServer:             p.metaServer,
+		Conf:                   p.config.conf,
+		Emitter:                p.emitter.emitter,
+		MetaServer:             p.meta.metaServer,
 		ResourcePackageManager: p.resourcePackageManager,
 		State:                  p.state,
-		ReservedCPUs:           p.reservedCPUs,
+		ReservedCPUs:           p.config.reservedCPUs,
 	}
 }
 
@@ -1836,7 +1912,7 @@ func (p *DynamicPolicy) cleanPools() error {
 	}
 
 	general.Infof("pools to delete: %v", poolsToDelete.UnsortedList())
-	machineState, err := generateMachineStateFromPodEntries(p.machineInfo.CPUTopology, podEntries, p.state.GetMachineState())
+	machineState, err := generateMachineStateFromPodEntries(p.machine.machineInfo.CPUTopology, podEntries, p.state.GetMachineState())
 	if err != nil {
 		return fmt.Errorf("calculate machineState by podEntries failed with error: %v", err)
 	}
@@ -1892,8 +1968,8 @@ func (p *DynamicPolicy) cleanPoolsFromPodEntries(podEntries state.PodEntries) se
 	// when default share residual backfill is enabled, the share pool is
 	// synthesized without any owning container, so it must be retained here.
 	keepSyntheticDefaultShare := false
-	if p != nil && p.dynamicConfig != nil {
-		dynamicConfig := p.dynamicConfig.GetDynamicConfiguration()
+	if p != nil && p.config.dynamicConfig != nil {
+		dynamicConfig := p.config.dynamicConfig.GetDynamicConfiguration()
 		keepSyntheticDefaultShare = dynamicConfig != nil &&
 			dynamicConfig.FillDefaultSharePoolWithNonReclaimCPUs
 	}
@@ -1930,20 +2006,20 @@ func (p *DynamicPolicy) initReservePool() error {
 	reserveAllocationInfo := p.state.GetAllocationInfo(commonstate.PoolNameReserve, commonstate.FakedContainerName)
 	if reserveAllocationInfo != nil && !reserveAllocationInfo.AllocationResult.IsEmpty() {
 		general.Infof("pool: %s allocation result transform from %s to %s",
-			commonstate.PoolNameReserve, reserveAllocationInfo.AllocationResult.String(), p.reservedCPUs)
+			commonstate.PoolNameReserve, reserveAllocationInfo.AllocationResult.String(), p.config.reservedCPUs)
 	}
 
-	general.Infof("initReservePool %s: %s", commonstate.PoolNameReserve, p.reservedCPUs)
-	topologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, p.reservedCPUs)
+	general.Infof("initReservePool %s: %s", commonstate.PoolNameReserve, p.config.reservedCPUs)
+	topologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machine.machineInfo.CPUTopology, p.config.reservedCPUs)
 	if err != nil {
 		return fmt.Errorf("unable to calculate topologyAwareAssignments for pool: %s, result cpuset: %s, error: %v",
-			commonstate.PoolNameReserve, p.reservedCPUs.String(), err)
+			commonstate.PoolNameReserve, p.config.reservedCPUs.String(), err)
 	}
 
 	curReserveAllocationInfo := &state.AllocationInfo{
 		AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReserve),
-		AllocationResult:                 p.reservedCPUs.Clone(),
-		OriginalAllocationResult:         p.reservedCPUs.Clone(),
+		AllocationResult:                 p.config.reservedCPUs.Clone(),
+		OriginalAllocationResult:         p.config.reservedCPUs.Clone(),
 		TopologyAwareAssignments:         topologyAwareAssignments,
 		OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(topologyAwareAssignments),
 	}
@@ -1955,19 +2031,19 @@ func (p *DynamicPolicy) initReservePool() error {
 // if this info already exists in state-file, just use it, otherwise calculate right away
 func (p *DynamicPolicy) initReclaimPool() error {
 	// for reclaimed pool, we must make them exist when the node isn't in hybrid mode even if cause overlap
-	allAvailableCPUs := p.machineInfo.CPUDetails.CPUs().Difference(p.reservedCPUs)
-	numaIDs := p.machineInfo.CPUDetails.NUMANodes().ToSliceInt()
-	cpusPerCore := p.machineInfo.CPUTopology.CPUsPerCore()
+	allAvailableCPUs := p.machine.machineInfo.CPUDetails.CPUs().Difference(p.config.reservedCPUs)
+	numaIDs := p.machine.machineInfo.CPUDetails.NUMANodes().ToSliceInt()
+	cpusPerCore := p.machine.machineInfo.CPUTopology.CPUsPerCore()
 	capacityByNUMA := make(map[int]int, len(numaIDs))
 	for _, numaID := range numaIDs {
 		candidates := allAvailableCPUs.Intersection(
-			p.machineInfo.CPUDetails.CPUsInNUMANodes(numaID))
+			p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(numaID))
 		capacityByNUMA[numaID] = takeCoreAlignedCPUSet(
-			p.machineInfo.CPUTopology, candidates, machine.NewCPUSet(), candidates.Size(),
+			p.machine.machineInfo.CPUTopology, candidates, machine.NewCPUSet(), candidates.Size(),
 		).Size()
 	}
 	reclaimTargets, err := machine.DistributeConfiguredHardReclaimFloor(
-		capacityByNUMA, nil, p.reservedReclaimedCPUsSize, cpusPerCore)
+		capacityByNUMA, nil, p.reclaim.reservedReclaimedCPUsSize, cpusPerCore)
 	if err != nil {
 		return fmt.Errorf("distribute core-aligned reserved reclaim cpus: %w", err)
 	}
@@ -1980,9 +2056,9 @@ func (p *DynamicPolicy) initReclaimPool() error {
 	defaultReservedReclaimedCPUSet := machine.NewCPUSet()
 	for _, numaID := range availableNUMAIDs {
 		target := reclaimTargets[numaID]
-		numaCPUs := p.machineInfo.CPUDetails.CPUsInNUMANodes(numaID)
+		numaCPUs := p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(numaID)
 		selected := takeCoreAlignedCPUSet(
-			p.machineInfo.CPUTopology,
+			p.machine.machineInfo.CPUTopology,
 			allAvailableCPUs.Intersection(numaCPUs),
 			numaCPUs,
 			target,
@@ -1993,15 +2069,15 @@ func (p *DynamicPolicy) initReclaimPool() error {
 		}
 		defaultReservedReclaimedCPUSet = defaultReservedReclaimedCPUSet.Union(selected)
 	}
-	p.reservedReclaimedCPUSet = defaultReservedReclaimedCPUSet.Clone()
-	p.reservedReclaimedCPUsSize = defaultReservedReclaimedCPUSet.Size()
+	p.reclaim.reservedReclaimedCPUSet = defaultReservedReclaimedCPUSet.Clone()
+	p.reclaim.reservedReclaimedCPUsSize = defaultReservedReclaimedCPUSet.Size()
 
-	defaultReservedTopologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, defaultReservedReclaimedCPUSet)
+	defaultReservedTopologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machine.machineInfo.CPUTopology, defaultReservedReclaimedCPUSet)
 	if err != nil {
 		return fmt.Errorf("unable to calculate defaultReservedTopologyAwareAssignments for pool: %s, "+
 			"result cpuset: %s, error: %v", commonstate.PoolNameReclaim, defaultReservedReclaimedCPUSet.String(), err)
 	}
-	p.reservedReclaimedTopologyAwareAssignments = machine.DeepcopyCPUAssignment(defaultReservedTopologyAwareAssignments)
+	p.reclaim.reservedReclaimedTopologyAwareAssignments = machine.DeepcopyCPUAssignment(defaultReservedTopologyAwareAssignments)
 
 	reclaimedAllocationInfo := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
 	if reclaimedAllocationInfo == nil {
@@ -2009,7 +2085,7 @@ func (p *DynamicPolicy) initReclaimPool() error {
 		noneResidentCPUs := podEntries.GetFilteredPoolsCPUSet(state.ResidentPools)
 
 		machineState := p.state.GetMachineState()
-		availableCPUs := machineState.GetFilteredAvailableCPUSet(p.reservedCPUs,
+		availableCPUs := machineState.GetFilteredAvailableCPUSet(p.config.reservedCPUs,
 			func(ai *state.AllocationInfo) bool {
 				return ai.CheckDedicated() || ai.CheckSharedNUMABinding()
 			},
@@ -2017,34 +2093,34 @@ func (p *DynamicPolicy) initReclaimPool() error {
 
 		reclaimedCPUSet := machine.NewCPUSet()
 		for _, numaID := range availableNUMAIDs {
-			target := p.reservedReclaimedTopologyAwareAssignments[numaID].Size()
-			candidates := availableCPUs.Intersection(p.machineInfo.CPUDetails.CPUsInNUMANodes(numaID))
+			target := p.reclaim.reservedReclaimedTopologyAwareAssignments[numaID].Size()
+			candidates := availableCPUs.Intersection(p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(numaID))
 			selected := takeCoreAlignedCPUSet(
-				p.machineInfo.CPUTopology,
+				p.machine.machineInfo.CPUTopology,
 				candidates,
-				p.reservedReclaimedTopologyAwareAssignments[numaID],
+				p.reclaim.reservedReclaimedTopologyAwareAssignments[numaID],
 				target,
 			)
 			reclaimedCPUSet = reclaimedCPUSet.Union(selected)
 		}
 
-		if shortfall := p.reservedReclaimedCPUsSize - reclaimedCPUSet.Size(); shortfall > 0 {
+		if shortfall := p.reclaim.reservedReclaimedCPUsSize - reclaimedCPUSet.Size(); shortfall > 0 {
 			selected := takeCoreAlignedCPUSet(
-				p.machineInfo.CPUTopology,
+				p.machine.machineInfo.CPUTopology,
 				availableCPUs.Difference(reclaimedCPUSet),
-				p.reservedReclaimedCPUSet.Difference(reclaimedCPUSet),
+				p.reclaim.reservedReclaimedCPUSet.Difference(reclaimedCPUSet),
 				shortfall,
 			)
 			reclaimedCPUSet = reclaimedCPUSet.Union(selected)
 		}
 
-		if reclaimedCPUSet.Size() != p.reservedReclaimedCPUsSize {
+		if reclaimedCPUSet.Size() != p.reclaim.reservedReclaimedCPUsSize {
 			return fmt.Errorf("select core-aligned reclaim cpus: got %d, want %d",
-				reclaimedCPUSet.Size(), p.reservedReclaimedCPUsSize)
+				reclaimedCPUSet.Size(), p.reclaim.reservedReclaimedCPUsSize)
 		}
 
 		general.Infof("initReclaimPool %s: %s", commonstate.PoolNameReclaim, reclaimedCPUSet.String())
-		topologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, reclaimedCPUSet)
+		topologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machine.machineInfo.CPUTopology, reclaimedCPUSet)
 		if err != nil {
 			return fmt.Errorf("unable to calculate topologyAwareAssignments for pool: %s, "+
 				"result cpuset: %s, error: %v", commonstate.PoolNameReclaim, reclaimedCPUSet.String(), err)
@@ -2087,7 +2163,7 @@ func (p *DynamicPolicy) initInterruptPool() error {
 
 // getContainerRequestedCores parses and returns request cores for the given container
 func (p *DynamicPolicy) getContainerRequestedCores(allocationInfo *state.AllocationInfo) float64 {
-	return cpuutil.GetContainerRequestedCores(p.metaServer, allocationInfo)
+	return cpuutil.GetContainerRequestedCores(p.meta.metaServer, allocationInfo)
 }
 
 func (p *DynamicPolicy) checkNonBindingShareCoresCpuResource(req *pluginapi.ResourceRequest) (bool, error) {
@@ -2099,7 +2175,7 @@ func (p *DynamicPolicy) checkNonBindingShareCoresCpuResource(req *pluginapi.Reso
 	shareCoresAllocatedInt := state.GetNonBindingSharedRequestedQuantityFromPodEntries(p.state.GetPodEntries(), map[string]float64{req.PodUid: reqFloat64}, p.getContainerRequestedCores)
 
 	machineState := p.state.GetMachineState()
-	pooledCPUs := machineState.GetFilteredAvailableCPUSet(p.reservedCPUs,
+	pooledCPUs := machineState.GetFilteredAvailableCPUSet(p.config.reservedCPUs,
 		state.WrapAllocationMetaFilter((*commonstate.AllocationMeta).CheckDedicated),
 		state.WrapAllocationMetaFilter((*commonstate.AllocationMeta).CheckSharedOrDedicatedNUMABinding))
 
@@ -2163,14 +2239,14 @@ func (p *DynamicPolicy) applySidecarAllocationInfoFromMainContainer(sidecarAlloc
 func (p *DynamicPolicy) RegisterAllocationHook(hook AllocationHook) {
 	p.Lock()
 	defer p.Unlock()
-	p.allocationHooks = append(p.allocationHooks, hook)
+	p.allocation.allocationHooks = append(p.allocation.allocationHooks, hook)
 }
 
 // invokeAllocationHooks triggers all registered allocation hooks.
 // Note: This method must be called with the lock held by the caller if concurrency protection is needed.
 // We avoid internal locking here to prevent potential deadlocks when called from methods that already hold the lock.
 func (p *DynamicPolicy) invokeAllocationHooks(oldAllocationInfo, newAllocationInfo *state.AllocationInfo) error {
-	for _, hook := range p.allocationHooks {
+	for _, hook := range p.allocation.allocationHooks {
 		if err := hook(oldAllocationInfo, newAllocationInfo); err != nil {
 			return err
 		}
@@ -2182,7 +2258,7 @@ func (p *DynamicPolicy) invokeAllocationHooks(oldAllocationInfo, newAllocationIn
 // Note: This method must be called with the lock held by the caller to ensure state consistency
 // and avoid deadlocks due to nested locking.
 func (p *DynamicPolicy) invokeAllocationHooksForPodEntries(curEntries, newEntries state.PodEntries) error {
-	if len(p.allocationHooks) == 0 {
+	if len(p.allocation.allocationHooks) == 0 {
 		return nil
 	}
 
@@ -2208,7 +2284,7 @@ func (p *DynamicPolicy) invokeAllocationHooksForPodEntries(curEntries, newEntrie
 // updateAllocationInfo wraps state.SetAllocationInfo with hook execution.
 // If no hooks are registered, it avoids the overhead of retrieving the old allocation info.
 func (p *DynamicPolicy) updateAllocationInfo(podUID, containerName string, oldAllocationInfo, allocationInfo *state.AllocationInfo, persist bool) error {
-	if len(p.allocationHooks) > 0 {
+	if len(p.allocation.allocationHooks) > 0 {
 		if oldAllocationInfo == nil {
 			oldAllocationInfo = p.state.GetAllocationInfo(podUID, containerName)
 		}
@@ -2223,10 +2299,10 @@ func (p *DynamicPolicy) updateAllocationInfo(podUID, containerName string, oldAl
 // shouldBypassCPUSetAdjustment reports whether response cpuset backfill should
 // be skipped for shared_cores, reclaimed_cores and system_cores pods.
 func (p *DynamicPolicy) shouldBypassCPUSetAdjustment() bool {
-	if p.dynamicConfig == nil {
+	if p.config.dynamicConfig == nil {
 		return false
 	}
-	dyn := p.dynamicConfig.GetDynamicConfiguration()
+	dyn := p.config.dynamicConfig.GetDynamicConfiguration()
 	return dyn != nil && dyn.EnableBypassCPUSetAdjustment
 }
 

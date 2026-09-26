@@ -111,7 +111,7 @@ func (p *DynamicPolicy) checkCPUSet(_ *coreconfig.Configuration,
 				cpuSetStats *cgroupcm.CPUSetStats
 			)
 
-			containerId, err := p.metaServer.GetContainerID(podUID, containerName)
+			containerId, err := p.meta.metaServer.GetContainerID(podUID, containerName)
 			if err != nil {
 				general.Errorf("get container id of pod: %s container: %s failed with error: %v", podUID, containerName, err)
 				continue
@@ -120,7 +120,7 @@ func (p *DynamicPolicy) checkCPUSet(_ *coreconfig.Configuration,
 			cpusetAbsCGPath, err := common.GetContainerAbsCgroupPath(common.CgroupSubsysCPUSet, podUID, containerId)
 			if err != nil {
 				general.Errorf("get container abs cgroup path of pod: %s container: %s failed with error: %v", podUID, containerName, err)
-				_ = p.emitter.StoreInt64(util.MetricNameCgroupPathNotFound, 1, metrics.MetricTypeNameRaw, tags...)
+				_ = p.emitter.emitter.StoreInt64(util.MetricNameCgroupPathNotFound, 1, metrics.MetricTypeNameRaw, tags...)
 				continue
 			}
 
@@ -128,7 +128,7 @@ func (p *DynamicPolicy) checkCPUSet(_ *coreconfig.Configuration,
 			if err != nil {
 				general.Errorf("GetCPUSet of pod: %s container: name(%s), id(%s) failed with error: %v",
 					podUID, containerName, containerId, err)
-				_ = p.emitter.StoreInt64(util.MetricNameRealStateInvalid, 1, metrics.MetricTypeNameRaw, tags...)
+				_ = p.emitter.emitter.StoreInt64(util.MetricNameRealStateInvalid, 1, metrics.MetricTypeNameRaw, tags...)
 				errList = append(errList, err)
 				continue
 			}
@@ -151,7 +151,7 @@ func (p *DynamicPolicy) checkCPUSet(_ *coreconfig.Configuration,
 				invalidCPUSet = true
 				general.Errorf("pod: %s/%s, container: %s, cpuset invalid",
 					allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName)
-				_ = p.emitter.StoreInt64(util.MetricNameCPUSetInvalid, 1, metrics.MetricTypeNameRaw, tags...)
+				_ = p.emitter.emitter.StoreInt64(util.MetricNameCPUSetInvalid, 1, metrics.MetricTypeNameRaw, tags...)
 			}
 		}
 	}
@@ -190,7 +190,7 @@ func (p *DynamicPolicy) checkCPUSet(_ *coreconfig.Configuration,
 	}
 	if cpuSetOverlap {
 		general.Errorf("found cpuset overlap. actualCPUSets: %+v", actualCPUSets)
-		_ = p.emitter.StoreInt64(util.MetricNameCPUSetOverlap, 1, metrics.MetricTypeNameRaw)
+		_ = p.emitter.emitter.StoreInt64(util.MetricNameCPUSetOverlap, 1, metrics.MetricTypeNameRaw)
 	}
 
 	p.checkCPUSetWithPodTotalRequest(podEntries, actualCPUSets)
@@ -242,7 +242,7 @@ func (p *DynamicPolicy) buildCPUSetPodStateMap(ctx context.Context, podEntries s
 		totalMilliCPURequest := int64(0)
 
 		for _, podUID := range cs.podUIDs.List() {
-			pod, err := p.metaServer.GetPod(ctx, podUID)
+			pod, err := p.meta.metaServer.GetPod(ctx, podUID)
 			if err != nil {
 				if metapod.IsPodNotFound(err) {
 					general.Infof("pod: %s is already gone, skip cpuset async check", podUID)
@@ -318,7 +318,7 @@ func (p *DynamicPolicy) emitExceededMetrics(
 	allowSharedCoresOverlapReclaimedCores bool,
 ) {
 	enableReclaim := false
-	dynamicConfiguration := p.dynamicConfig.GetDynamicConfiguration()
+	dynamicConfiguration := p.config.dynamicConfig.GetDynamicConfiguration()
 	if dynamicConfiguration != nil && dynamicConfiguration.AdminQoSConfiguration != nil {
 		enableReclaim = dynamicConfiguration.EnableReclaim
 	}
@@ -336,7 +336,7 @@ func (p *DynamicPolicy) emitExceededMetrics(
 			pod.Namespace, pod.Name, mainContainerEntry.OwnerPoolName, mainContainerEntry.QoSLevel, cpuset, cs.cpuset.Size(),
 			float64(cs.totalMilliCPURequest)/1000, exceededRatio, outOfTolerance)
 
-		_ = p.emitter.StoreFloat64(metricsNamePodTotalRequestLargerThanBindingCPUSet, exceededRatio, metrics.MetricTypeNameRaw, []metrics.MetricTag{
+		_ = p.emitter.emitter.StoreFloat64(metricsNamePodTotalRequestLargerThanBindingCPUSet, exceededRatio, metrics.MetricTypeNameRaw, []metrics.MetricTag{
 			{Key: "podNamespace", Val: pod.Namespace},
 			{Key: "podName", Val: pod.Name},
 			{Key: "qosLevel", Val: mainContainerEntry.QoSLevel},
@@ -365,13 +365,13 @@ func (p *DynamicPolicy) clearResidualState(_ *coreconfig.Configuration,
 		_ = general.UpdateHealthzStateByError(cpuconsts.ClearResidualState, err)
 	}()
 
-	if p.metaServer == nil {
+	if p.meta.metaServer == nil {
 		general.Errorf("nil metaServer")
 		return
 	}
 
 	ctx := context.WithValue(context.Background(), metapod.BypassCacheKey, metapod.BypassCacheTrue)
-	podList, err = p.metaServer.GetPodList(ctx, native.PodIsActive)
+	podList, err = p.meta.metaServer.GetPodList(ctx, native.PodIsActive)
 	if err != nil {
 		general.Errorf("get pod list failed: %v", err)
 		return
@@ -415,7 +415,7 @@ func (p *DynamicPolicy) clearResidualStateAfterPodList(
 		podSet.Insert(fmt.Sprintf("%v", pod.UID))
 	}
 
-	wait := advisorPostCommitCleanupWait(p.conf)
+	wait := advisorPostCommitCleanupWait(p.config.conf)
 	aged := make(map[string]struct{})
 	for attempt := 0; attempt < 2; attempt++ {
 		p.Lock()
@@ -537,12 +537,12 @@ func (p *DynamicPolicy) clearResidualStateAttempt(
 			}
 
 			var rErr error
-			if p.enableCPUAdvisor {
-				if p.advisorClient == nil {
+			if p.config.enableCPUAdvisor {
+				if p.advisor.advisorClient == nil {
 					general.Errorf("remove residual pod: %s in sys advisor failed due to nil cpu advisor client, remain it in state", podUID)
 					continue
 				}
-				_, rErr = p.advisorClient.RemovePod(ctx, &advisorsvc.RemovePodRequest{
+				_, rErr = p.advisor.advisorClient.RemovePod(ctx, &advisorsvc.RemovePodRequest{
 					PodUid: podUID,
 				})
 			}
@@ -556,7 +556,7 @@ func (p *DynamicPolicy) clearResidualStateAttempt(
 		}
 
 		updatedMachineState, generateErr := generateMachineStateFromPodEntries(
-			p.machineInfo.CPUTopology, podEntries, p.state.GetMachineState())
+			p.machine.machineInfo.CPUTopology, podEntries, p.state.GetMachineState())
 		if generateErr != nil {
 			general.Errorf("GenerateMachineStateFromPodEntries failed with error: %v", generateErr)
 			return advisorPostCommitProgress{}, generateErr
@@ -626,22 +626,22 @@ func (p *DynamicPolicy) syncCPUIdle(_ *coreconfig.Configuration,
 		return
 	}
 
-	existingPaths := cgroupcm.GetExistingRelativeCgroupPaths(p.reclaimRelativeRootCgroupPaths...)
-	err = cgroupcmutils.ApplyCPUWithRelativePaths(existingPaths, &cgroupcm.CPUData{CpuIdlePtr: &p.enableCPUIdle})
+	existingPaths := cgroupcm.GetExistingRelativeCgroupPaths(p.config.reclaimRelativeRootCgroupPaths...)
+	err = cgroupcmutils.ApplyCPUWithRelativePaths(existingPaths, &cgroupcm.CPUData{CpuIdlePtr: &p.config.enableCPUIdle})
 	if err != nil {
 		general.Errorf("ApplyCPUWithRelativePaths in %v with enableCPUIdle: %v failed with error: %v",
-			existingPaths, p.enableCPUIdle, err)
+			existingPaths, p.config.enableCPUIdle, err)
 	}
 
 	// sync numa binding reclaim cgroup
-	for numaID, paths := range p.numaBindingReclaimRelativeRootCgroupPaths {
+	for numaID, paths := range p.config.numaBindingReclaimRelativeRootCgroupPaths {
 		existingNUMAPaths := cgroupcm.GetExistingRelativeCgroupPaths(paths...)
 		if len(existingNUMAPaths) == 0 {
 			continue
 		}
-		if err := cgroupcmutils.ApplyCPUWithRelativePaths(existingNUMAPaths, &cgroupcm.CPUData{CpuIdlePtr: &p.enableCPUIdle}); err != nil {
+		if err := cgroupcmutils.ApplyCPUWithRelativePaths(existingNUMAPaths, &cgroupcm.CPUData{CpuIdlePtr: &p.config.enableCPUIdle}); err != nil {
 			general.Errorf("ApplyCPUWithRelativePaths in %v (numa %d) with enableCPUIdle: %v failed with error: %v",
-				existingNUMAPaths, numaID, p.enableCPUIdle, err)
+				existingNUMAPaths, numaID, p.config.enableCPUIdle, err)
 		}
 	}
 }
@@ -661,8 +661,8 @@ func (p *DynamicPolicy) syncCPUBurst(_ *coreconfig.Configuration,
 		_ = general.UpdateHealthzStateByError(cpuconsts.SyncCPUBurst, err)
 	}()
 
-	cpuBurstManager := cpuburst.GetManager(p.metaServer)
-	err = cpuBurstManager.UpdateCPUBurst(p.conf, p.dynamicConfig)
+	cpuBurstManager := cpuburst.GetManager(p.meta.metaServer)
+	err = cpuBurstManager.UpdateCPUBurst(p.config.conf, p.config.dynamicConfig)
 }
 
 func (p *DynamicPolicy) syncSystemExclusivePool(_ *coreconfig.Configuration,
@@ -685,7 +685,7 @@ func (p *DynamicPolicy) syncSystemExclusivePool(_ *coreconfig.Configuration,
 		_ = general.UpdateHealthzStateByError(cpuconsts.SyncSystemExclusivePool, err)
 	}()
 
-	if !p.conf.EnableSystemExclusivePool {
+	if !p.config.conf.EnableSystemExclusivePool {
 		general.Infof("[SystemExclusivePool] disabled")
 		return
 	}
@@ -723,7 +723,7 @@ func (p *DynamicPolicy) listCurrentSystemExclusivePools() map[string]*state.Allo
 }
 
 func (p *DynamicPolicy) getExpectedSystemExclusivePools() map[string]int {
-	dynamicConfig := p.dynamicConfig.GetDynamicConfiguration()
+	dynamicConfig := p.config.dynamicConfig.GetDynamicConfiguration()
 	configuredPools := dynamicConfig.SystemExclusivePool
 
 	expectedPools := make(map[string]int)
@@ -739,7 +739,7 @@ func (p *DynamicPolicy) getExpectedSystemExclusivePools() map[string]int {
 }
 
 func (p *DynamicPolicy) emitSystemExclusivePoolSizes(currentPools map[string]*state.AllocationInfo, expectedPools map[string]int) {
-	if p.emitter == nil {
+	if p.emitter.emitter == nil {
 		return
 	}
 
@@ -753,7 +753,7 @@ func (p *DynamicPolicy) emitSystemExclusivePoolSizes(currentPools map[string]*st
 
 	for _, poolName := range poolNames.List() {
 		poolSize, poolStatus := getSystemExclusivePoolMetricValueAndStatus(currentPools, expectedPools, poolName)
-		_ = p.emitter.StoreInt64(util.MetricNameSystemExclusivePoolSize, poolSize, metrics.MetricTypeNameRaw,
+		_ = p.emitter.emitter.StoreInt64(util.MetricNameSystemExclusivePoolSize, poolSize, metrics.MetricTypeNameRaw,
 			metrics.MetricTag{Key: "pool_name", Val: poolName},
 			metrics.MetricTag{Key: "status", Val: poolStatus})
 	}
@@ -792,7 +792,7 @@ func (p *DynamicPolicy) calculateSystemExclusivePoolChanges(
 	shrinkRatio := defaultSystemExclusivePoolShrinkRatio
 	shrinkMin := defaultSystemExclusivePoolShrinkMin
 	shrinkMax := defaultSystemExclusivePoolShrinkMax
-	dynamicConfig := p.dynamicConfig.GetDynamicConfiguration()
+	dynamicConfig := p.config.dynamicConfig.GetDynamicConfiguration()
 	if dynamicConfig.SystemExclusivePoolShrinkRatio != nil {
 		shrinkRatio = *dynamicConfig.SystemExclusivePoolShrinkRatio
 	}
@@ -893,13 +893,13 @@ func (p *DynamicPolicy) applySystemExclusivePoolChanges(toCreate, toUpdate map[s
 		return fmt.Errorf("%w while snapshotting system exclusive pool state: expected=%d actual=%d",
 			state.ErrStaleStateRevision, revision, currentRevision)
 	}
-	candidateState := state.NewTransientState(p.machineInfo.CPUTopology)
+	candidateState := state.NewTransientState(p.machine.machineInfo.CPUTopology)
 	if err := candidateState.CommitAdvisorState(
 		podEntries, machineState, allowOverlap, disableDedicatedOverlap, false); err != nil {
 		return fmt.Errorf("initialize system exclusive pool candidate state: %w", err)
 	}
 
-	availableCPUs := candidateState.GetMachineState().GetFilteredAvailableCPUSet(p.reservedCPUs,
+	availableCPUs := candidateState.GetMachineState().GetFilteredAvailableCPUSet(p.config.reservedCPUs,
 		state.WrapAllocationMetaFilter((*commonstate.AllocationMeta).CheckDedicated),
 		state.WrapAllocationMetaFilter((*commonstate.AllocationMeta).CheckDedicatedNUMABindingNUMAExclusive))
 	notAllocatablePoolsCPUs := state.GetUnitedPoolsCPUs(
@@ -927,7 +927,7 @@ func (p *DynamicPolicy) applySystemExclusivePoolChanges(toCreate, toUpdate map[s
 
 	candidateEntries := candidateState.GetPodEntries()
 	updatedMachineState, err := generateMachineStateFromPodEntries(
-		p.machineInfo.CPUTopology, candidateEntries, candidateState.GetMachineState())
+		p.machine.machineInfo.CPUTopology, candidateEntries, candidateState.GetMachineState())
 	if err != nil {
 		return fmt.Errorf("GenerateMachineStateFromPodEntries failed: %v", err)
 	}
@@ -993,14 +993,14 @@ func (p *DynamicPolicy) updateSystemExclusivePoolInState(
 
 		var allocationResult machine.CPUSet
 		if delta > 0 {
-			deltaCPUs, _, err := calculator.TakeByNUMABalance(p.machineInfo, availableCPUs, delta)
+			deltaCPUs, _, err := calculator.TakeByNUMABalance(p.machine.machineInfo, availableCPUs, delta)
 			if err != nil {
 				return machine.CPUSet{}, fmt.Errorf("take HT by NUMABalace failed for pool %s with error: %v", name, err)
 			}
 			allocationResult = allocationInfo.AllocationResult.Union(deltaCPUs)
 			availableCPUs = availableCPUs.Difference(deltaCPUs)
 		} else {
-			deltaCPUs, _, err := calculator.TakeByNUMABalanceReversely(p.machineInfo, allocationInfo.AllocationResult, -delta)
+			deltaCPUs, _, err := calculator.TakeByNUMABalanceReversely(p.machine.machineInfo, allocationInfo.AllocationResult, -delta)
 			if err != nil {
 				return machine.CPUSet{}, fmt.Errorf("take HT by NUMABalace failed for pool %s with error: %v", name, err)
 			}
@@ -1008,7 +1008,7 @@ func (p *DynamicPolicy) updateSystemExclusivePoolInState(
 			availableCPUs = availableCPUs.Union(deltaCPUs)
 		}
 
-		topologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, allocationResult)
+		topologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machine.machineInfo.CPUTopology, allocationResult)
 		if err != nil {
 			return machine.CPUSet{}, fmt.Errorf("failed to get numa aware assignments for pool %s: %v", name, err)
 		}
@@ -1039,12 +1039,12 @@ func (p *DynamicPolicy) createSystemExclusivePoolInState(
 	availableCPUs machine.CPUSet,
 ) (machine.CPUSet, error) {
 	for name, size := range toCreate {
-		allocationResult, _, err := calculator.TakeByNUMABalance(p.machineInfo, availableCPUs, size)
+		allocationResult, _, err := calculator.TakeByNUMABalance(p.machine.machineInfo, availableCPUs, size)
 		if err != nil {
 			return machine.CPUSet{}, fmt.Errorf("failed to allocate CPUs for system exclusive pool %s: %v", name, err)
 		}
 
-		topologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, allocationResult)
+		topologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machine.machineInfo.CPUTopology, allocationResult)
 		if err != nil {
 			return machine.CPUSet{}, fmt.Errorf("failed to get numa aware assignments for system exclusive pool %s: %v", name, err)
 		}
@@ -1074,8 +1074,8 @@ func (p *DynamicPolicy) adjustSystemCoresPodAllocation() error {
 }
 
 func (p *DynamicPolicy) adjustSystemCoresPodAllocationInState(stateStore state.State) error {
-	defaultSystemCoresCPUSet := p.machineInfo.CPUDetails.CPUs()
-	defaultSystemCoresTopologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, defaultSystemCoresCPUSet)
+	defaultSystemCoresCPUSet := p.machine.machineInfo.CPUDetails.CPUs()
+	defaultSystemCoresTopologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machine.machineInfo.CPUTopology, defaultSystemCoresCPUSet)
 	if err != nil {
 		return fmt.Errorf("failed to get numa aware assignments for default system cores: %v", err)
 	}
@@ -1155,6 +1155,6 @@ func (p *DynamicPolicy) syncCPUWeight(_ *coreconfig.Configuration,
 		_ = general.UpdateHealthzStateByError(cpuconsts.SyncCPUWeight, err)
 	}()
 
-	cpuWeightManager := cpuweight.GetManager(p.metaServer, p.emitter)
-	err = cpuWeightManager.UpdateCPUWeight(p.dynamicConfig)
+	cpuWeightManager := cpuweight.GetManager(p.meta.metaServer, p.emitter.emitter)
+	err = cpuWeightManager.UpdateCPUWeight(p.config.dynamicConfig)
 }

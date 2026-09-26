@@ -1595,8 +1595,8 @@ func TestPlanDisjointAdvisorBlocksBalancesHardReclaim(t *testing.T) {
 		t.Helper()
 		p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 		require.NoError(t, err)
-		p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = hardPartition
-		p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = hardPartition
+		p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = hardPartition
+		p.config.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = hardPartition
 		return p
 	}
 	solve := func(
@@ -1930,8 +1930,8 @@ func TestPlanDisjointAdvisorBlocksPreservesCeiledOwnerRequestWhenDonating(t *tes
 	require.NoError(t, err)
 	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 	require.NoError(t, err)
-	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
-	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
 
 	allCPUs := topology.CPUDetails.CPUs().ToSliceInt()
 	p.state.SetPodEntries(state.PodEntries{
@@ -1996,8 +1996,8 @@ func productionReplacementSourcePoolFixture(t *testing.T) (
 	topology, demands, reclaimBefore, dedicatedBefore := productionNUMA2ReplacementFixture(t)
 	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 	require.NoError(t, err)
-	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
-	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
 	require.NoError(t, p.state.SetPodEntries(state.PodEntries{
 		"dedicated-pod": {
 			"main": &state.AllocationInfo{
@@ -2076,8 +2076,8 @@ func TestPlanDisjointAdvisorBlocksKeepsUnreplaceableFailureClosed(t *testing.T) 
 	require.NoError(t, err)
 	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 	require.NoError(t, err)
-	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
-	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
 
 	allCPUs := topology.CPUDetails.CPUs().ToSliceInt()
 	p.state.SetPodEntries(state.PodEntries{

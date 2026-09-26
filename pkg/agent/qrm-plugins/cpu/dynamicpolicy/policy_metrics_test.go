@@ -114,10 +114,7 @@ func TestDynamicPolicyEmitRuntimeConfigMetrics(t *testing.T) {
 			t.Parallel()
 
 			emitter := &recordingMetricEmitter{}
-			policy := &DynamicPolicy{
-				emitter:       emitter,
-				dynamicConfig: tt.dynamicConfig,
-			}
+			policy := &DynamicPolicy{emitter: emitterComponent{emitter: emitter}, config: configComponent{dynamicConfig: tt.dynamicConfig}}
 
 			policy.emitRuntimeConfigMetrics()
 
@@ -134,7 +131,7 @@ func TestEmitFinalPoolSizeMetrics(t *testing.T) {
 	t.Parallel()
 
 	emitter := &recordingMetricEmitter{}
-	policy := &DynamicPolicy{emitter: emitter}
+	policy := &DynamicPolicy{emitter: emitterComponent{emitter: emitter}}
 	entries := state.PodEntries{
 		commonstate.PoolNameShare: {
 			commonstate.FakedContainerName: {
@@ -393,7 +390,7 @@ func TestEmitFinalPoolSizeMetricsWithDedicated(t *testing.T) {
 			t.Parallel()
 
 			emitter := &recordingMetricEmitter{}
-			policy := &DynamicPolicy{emitter: emitter}
+			policy := &DynamicPolicy{emitter: emitterComponent{emitter: emitter}}
 
 			policy.emitFinalPoolSizeMetrics(tt.entries)
 

@@ -79,7 +79,7 @@ func (p *DynamicPolicy) takeByTieredPreferredCPUs(
 	taken := machine.NewCPUSet()
 	atomicDonorClosure := machine.NewCPUSet()
 	for _, donor := range atomicDonors {
-		closure, err := completeCoresForCPUSet(p.machineInfo.CPUTopology, donor)
+		closure, err := completeCoresForCPUSet(p.machine.machineInfo.CPUTopology, donor)
 		if err != nil {
 			return machine.NewCPUSet(), availableCPUs, err
 		}
@@ -90,7 +90,7 @@ func (p *DynamicPolicy) takeByTieredPreferredCPUs(
 		if touched.IsEmpty() {
 			return true
 		}
-		closure, err := completeCoresForCPUSet(p.machineInfo.CPUTopology, touched)
+		closure, err := completeCoresForCPUSet(p.machine.machineInfo.CPUTopology, touched)
 		return err == nil && closure.IsSubsetOf(candidate)
 	}
 
@@ -98,7 +98,7 @@ func (p *DynamicPolicy) takeByTieredPreferredCPUs(
 		return taken, remaining, nil
 	}
 
-	topology := p.machineInfo.CPUTopology
+	topology := p.machine.machineInfo.CPUTopology
 	cpusPerCore := topology.CPUsPerCore()
 	if cpusPerCore <= 0 {
 		return machine.NewCPUSet(), availableCPUs, fmt.Errorf(

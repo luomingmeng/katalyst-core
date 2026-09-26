@@ -48,7 +48,7 @@ func TestApportionReclaimedPoolIsDeterministic(t *testing.T) {
 	const poolBeta = "share-beta"
 
 	alphaBase := machine.NewCPUSet(0, 8, 1, 9) // two NUMA0 cores
-	betaBase := machine.NewCPUSet(4, 12)        // one NUMA1 core
+	betaBase := machine.NewCPUSet(4, 12)       // one NUMA1 core
 	nonBinding := map[string]int{
 		poolAlpha: alphaBase.Size(),
 		poolBeta:  betaBase.Size(),
@@ -73,12 +73,9 @@ func TestApportionReclaimedPoolIsDeterministic(t *testing.T) {
 			poolAlpha: alphaBase.Clone(),
 			poolBeta:  betaBase.Clone(),
 		}
-		p := &DynamicPolicy{
-			machineInfo: &machine.KatalystMachineInfo{
-				CPUTopology: topology,
-			},
-			reservedReclaimedCPUsSize: 2,
-		}
+		p := &DynamicPolicy{machine: machineComponent{machineInfo: &machine.KatalystMachineInfo{
+			CPUTopology: topology,
+		}}, reclaim: reclaimComponent{reservedReclaimedCPUsSize: 2}}
 		_ = p.apportionReclaimedPool(poolsCPUSet, reclaimed.Clone(), nonBinding)
 		r := runResult{
 			alpha: poolsCPUSet[poolAlpha].String(),
@@ -104,8 +101,9 @@ func TestApportionReclaimedPoolIsDeterministic(t *testing.T) {
 // reclaim domains never share a physical core.
 //
 // Topology: 16 cpus / 2 sockets / 2 NUMAs, CPUsPerCore()==2.
-//   NUMA0 cores {0,1,2,3} -> cpus {0,1,2,3} + siblings {8,9,10,11}
-//   NUMA1 cores {4,5,6,7} -> cpus {4,5,6,7} + siblings {12,13,14,15}
+//
+//	NUMA0 cores {0,1,2,3} -> cpus {0,1,2,3} + siblings {8,9,10,11}
+//	NUMA1 cores {4,5,6,7} -> cpus {4,5,6,7} + siblings {12,13,14,15}
 //
 // reclaimedCPUs holds three whole cores per NUMA (12 cpus, fully core-aligned),
 // reservedReclaimedCPUsSize keeps a 2-cpu floor, so the share pool is lent
@@ -125,12 +123,9 @@ func TestApportionReclaimedPoolKeepsReclaimResidualCoreAligned(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 2, topology.CPUsPerCore())
 
-	p := &DynamicPolicy{
-		machineInfo: &machine.KatalystMachineInfo{
-			CPUTopology: topology,
-		},
-		reservedReclaimedCPUsSize: 2,
-	}
+	p := &DynamicPolicy{machine: machineComponent{machineInfo: &machine.KatalystMachineInfo{
+		CPUTopology: topology,
+	}}, reclaim: reclaimComponent{reservedReclaimedCPUsSize: 2}}
 
 	// share pool already owns one whole core; it is the only non-binding,
 	// non-reclaimed pool so it receives the full apportioned amount.

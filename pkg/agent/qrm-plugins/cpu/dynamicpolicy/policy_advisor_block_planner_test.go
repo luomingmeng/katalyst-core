@@ -110,7 +110,7 @@ func TestBuildAdvisorBlockDescriptors_StableAcrossMapOrderAndBlockIDRotation(t *
 		resp := advisorBlockTestResponse(rotated, rand.New(rand.NewSource(seed)))
 		descriptors, err := buildAdvisorBlockDescriptors(
 			resp,
-			p.machineInfo.CPUDetails,
+			p.machine.machineInfo.CPUDetails,
 			p.state.GetPodEntries(),
 			nil,
 			machine.NewCPUSet(),
@@ -356,7 +356,7 @@ func TestGenerateBlockCPUSetOwnerUnionsStableAcrossRandomMapOrderAndBlockIDRotat
 		commonstate.FakedContainerName, "")
 	wantOwners := map[string]machine.CPUSet{
 		dedicatedOwner: machine.NewCPUSet(0, 1),
-		reclaimOwner:   coresInNUMA(p.machineInfo.CPUTopology, 0, 2, 3),
+		reclaimOwner:   coresInNUMA(p.machine.machineInfo.CPUTopology, 0, 2, 3),
 	}
 	wantUnion := wantOwners[dedicatedOwner].Union(wantOwners[reclaimOwner])
 	for seed := int64(0); seed < 1000; seed++ {
@@ -399,7 +399,7 @@ func TestGenerateBlockCPUSetSkipsDefaultShareUpperBound(t *testing.T) {
 
 			p, cleanup := newReclaimReuseTestPolicy(t)
 			defer cleanup()
-			p.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+			p.config.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
 
 			resp := advisorBlockTestResponse([]advisorBlockTestAlias{
 				{
@@ -592,7 +592,7 @@ func TestBuildAdvisorBlockDescriptors_BlockIDIsOnlyFinalTieBreak(t *testing.T) {
 			{entry: "pool-a", subEntry: commonstate.FakedContainerName, owner: "pool-a", numaID: 0, blockID: ids[0], quantity: 2},
 			{entry: "pool-a", subEntry: commonstate.FakedContainerName, owner: "pool-a", numaID: 0, blockID: ids[1], quantity: 2},
 		}, rand.New(rand.NewSource(7)))
-		descriptors, err := buildAdvisorBlockDescriptors(resp, p.machineInfo.CPUDetails, nil, nil, machine.NewCPUSet())
+		descriptors, err := buildAdvisorBlockDescriptors(resp, p.machine.machineInfo.CPUDetails, nil, nil, machine.NewCPUSet())
 		require.NoError(t, err)
 		return descriptors
 	}
@@ -634,7 +634,7 @@ func TestBuildAdvisorBlockDescriptors_IntersectsAliasEligibilityAndAggregatesOld
 
 	descriptors, err := buildAdvisorBlockDescriptors(
 		resp,
-		p.machineInfo.CPUDetails,
+		p.machine.machineInfo.CPUDetails,
 		p.state.GetPodEntries(),
 		nil,
 		machine.NewCPUSet(),
@@ -654,8 +654,8 @@ func TestBuildAdvisorBlockDescriptors_PreservesRawReclaimAggregateAndLeafOwnersh
 	p, cleanup := newReclaimReuseTestPolicy(t)
 	defer cleanup()
 
-	rawAggregate := coresInNUMA(p.machineInfo.CPUTopology, 0, 0, 2)
-	realLeaf := coresInNUMA(p.machineInfo.CPUTopology, 0, 0, 1)
+	rawAggregate := coresInNUMA(p.machine.machineInfo.CPUTopology, 0, 0, 2)
+	realLeaf := coresInNUMA(p.machine.machineInfo.CPUTopology, 0, 0, 1)
 	p.state.SetPodEntries(state.PodEntries{
 		commonstate.PoolNameReclaim: {
 			commonstate.FakedContainerName: &state.AllocationInfo{
@@ -680,7 +680,7 @@ func TestBuildAdvisorBlockDescriptors_PreservesRawReclaimAggregateAndLeafOwnersh
 	}, rand.New(rand.NewSource(13)))
 
 	descriptors, err := buildAdvisorBlockDescriptors(
-		resp, p.machineInfo.CPUDetails, p.state.GetPodEntries(), nil, machine.NewCPUSet())
+		resp, p.machine.machineInfo.CPUDetails, p.state.GetPodEntries(), nil, machine.NewCPUSet())
 	require.NoError(t, err)
 	require.Len(t, descriptors, 2)
 	byID := make(map[string]advisorBlockDescriptor, len(descriptors))
@@ -691,7 +691,7 @@ func TestBuildAdvisorBlockDescriptors_PreservesRawReclaimAggregateAndLeafOwnersh
 	require.Equal(t, realLeaf, byID["leaf"].Committed)
 
 	snapshot, err := buildSteadyFakeNUMACommittedSnapshot(
-		descriptors, p.machineInfo.CPUDetails.CPUs())
+		descriptors, p.machine.machineInfo.CPUDetails.CPUs())
 	require.NoError(t, err)
 	require.Equal(t, rawAggregate, snapshot.rawReclaimAggregate)
 	require.Equal(t, rawAggregate, snapshot.reclaim)
@@ -699,7 +699,7 @@ func TestBuildAdvisorBlockDescriptors_PreservesRawReclaimAggregateAndLeafOwnersh
 		committedAssignmentForTest(t, &snapshot, "aggregate").cpus)
 	require.Equal(t, realLeaf,
 		committedAssignmentForTest(t, &snapshot, "leaf").cpus)
-	require.NoError(t, validateCommittedSteadyFakeNUMASnapshot(snapshot, nil, p.machineInfo.CPUTopology))
+	require.NoError(t, validateCommittedSteadyFakeNUMASnapshot(snapshot, nil, p.machine.machineInfo.CPUTopology))
 }
 
 func TestBuildAdvisorBlockDescriptors_PreservesCommittedCPUsOutsideEligibility(t *testing.T) {
@@ -708,7 +708,7 @@ func TestBuildAdvisorBlockDescriptors_PreservesCommittedCPUsOutsideEligibility(t
 	p, cleanup := newReclaimReuseTestPolicy(t)
 	defer cleanup()
 
-	rawAggregate := coresInNUMA(p.machineInfo.CPUTopology, 0, 0, 1)
+	rawAggregate := coresInNUMA(p.machine.machineInfo.CPUTopology, 0, 0, 1)
 	threads := rawAggregate.ToSliceInt()
 	require.Len(t, threads, 2)
 	p.state.SetPodEntries(state.PodEntries{
@@ -735,7 +735,7 @@ func TestBuildAdvisorBlockDescriptors_PreservesCommittedCPUsOutsideEligibility(t
 	}, rand.New(rand.NewSource(14)))
 
 	descriptors, err := buildAdvisorBlockDescriptors(
-		resp, p.machineInfo.CPUDetails, p.state.GetPodEntries(), nil, machine.NewCPUSet(threads[1]))
+		resp, p.machine.machineInfo.CPUDetails, p.state.GetPodEntries(), nil, machine.NewCPUSet(threads[1]))
 	require.NoError(t, err)
 	byID := make(map[string]advisorBlockDescriptor, len(descriptors))
 	for _, descriptor := range descriptors {
@@ -746,10 +746,10 @@ func TestBuildAdvisorBlockDescriptors_PreservesCommittedCPUsOutsideEligibility(t
 	require.Equal(t, machine.NewCPUSet(threads[0]), byID["leaf"].OldPreferred)
 
 	snapshot, err := buildSteadyFakeNUMACommittedSnapshot(
-		descriptors, p.machineInfo.CPUDetails.CPUs())
+		descriptors, p.machine.machineInfo.CPUDetails.CPUs())
 	require.NoError(t, err)
 	require.ErrorContains(t,
-		validateCommittedSteadyFakeNUMASnapshot(snapshot, nil, p.machineInfo.CPUTopology),
+		validateCommittedSteadyFakeNUMASnapshot(snapshot, nil, p.machine.machineInfo.CPUTopology),
 		fmt.Sprintf(`committed block "leaf" is outside eligibility: %d`, threads[1]))
 }
 
@@ -766,7 +766,7 @@ func TestBuildAdvisorBlockDescriptors_FailsClosedForDifferentAliasResourcePackag
 
 	_, err := buildAdvisorBlockDescriptors(
 		resp,
-		p.machineInfo.CPUDetails,
+		p.machine.machineInfo.CPUDetails,
 		nil,
 		map[string]machine.CPUSet{
 			"rp-a": machine.NewCPUSet(0, 1, 2),
@@ -825,7 +825,7 @@ func TestBuildAdvisorBlockDescriptors_EnforcesAliasResourcePackageCompatibility(
 			resp := advisorBlockTestResponse(tt.aliases, rand.New(rand.NewSource(int64(i))))
 			_, err := buildAdvisorBlockDescriptors(
 				resp,
-				p.machineInfo.CPUDetails,
+				p.machine.machineInfo.CPUDetails,
 				nil,
 				map[string]machine.CPUSet{"rp-a": machine.NewCPUSet(0, 1, 2)},
 				machine.NewCPUSet(),
@@ -852,7 +852,7 @@ func TestBuildAdvisorBlockDescriptors_RejectsDifferentResourcePackagesBeforeCapa
 
 	_, err := buildAdvisorBlockDescriptors(
 		resp,
-		p.machineInfo.CPUDetails,
+		p.machine.machineInfo.CPUDetails,
 		nil,
 		map[string]machine.CPUSet{
 			"rp-a": machine.NewCPUSet(0, 1),
@@ -878,7 +878,7 @@ func TestBuildAdvisorBlockDescriptors_ClassifiesAllBlockClasses(t *testing.T) {
 	}, rand.New(rand.NewSource(6)))
 
 	descriptors, err := buildAdvisorBlockDescriptors(
-		resp, p.machineInfo.CPUDetails, nil, nil, machine.NewCPUSet(),
+		resp, p.machine.machineInfo.CPUDetails, nil, nil, machine.NewCPUSet(),
 	)
 	require.NoError(t, err)
 	require.Equal(t, []advisorBlockClass{
@@ -906,7 +906,7 @@ func TestBuildAdvisorBlockDescriptors_ReportsClassificationErrors(t *testing.T) 
 		resp := advisorBlockTestResponse([]advisorBlockTestAlias{{
 			entry: "bad", numaID: 0, blockID: "bad", quantity: 1,
 		}}, rand.New(rand.NewSource(8)))
-		_, err := buildAdvisorBlockDescriptors(resp, p.machineInfo.CPUDetails, nil, nil, machine.NewCPUSet())
+		_, err := buildAdvisorBlockDescriptors(resp, p.machine.machineInfo.CPUDetails, nil, nil, machine.NewCPUSet())
 		require.ErrorContains(t, err, "cannot classify empty owner pool")
 	})
 
@@ -916,7 +916,7 @@ func TestBuildAdvisorBlockDescriptors_ReportsClassificationErrors(t *testing.T) 
 		}}, rand.New(rand.NewSource(9)))
 		resp.Entries["bad"].Entries[""].CalculationResultsByNumas[0].Blocks[0].OverlapTargets =
 			[]*advisorapi.OverlapTarget{nil}
-		_, err := buildAdvisorBlockDescriptors(resp, p.machineInfo.CPUDetails, nil, nil, machine.NewCPUSet())
+		_, err := buildAdvisorBlockDescriptors(resp, p.machine.machineInfo.CPUDetails, nil, nil, machine.NewCPUSet())
 		require.ErrorContains(t, err, "cannot classify nil overlap target")
 	})
 }
@@ -1062,13 +1062,13 @@ func TestBuildAdvisorBlockDescriptors_EnforcesRPAndReclaimBoundaries(t *testing.
 		{entry: "reclaim", subEntry: commonstate.FakedContainerName, owner: commonstate.PoolNameReclaim, numaID: 0, blockID: "reclaim", quantity: 2},
 	}, rand.New(rand.NewSource(3)))
 
-	numa0 := p.machineInfo.CPUDetails.CPUsInNUMANodes(0)
+	numa0 := p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(0)
 	numa0CPUs := numa0.ToSliceInt()
 	pinned := machine.NewCPUSet(numa0CPUs[0], numa0CPUs[1])
 	nonReclaimable := machine.NewCPUSet(numa0CPUs[2])
 	descriptors, err := buildAdvisorBlockDescriptors(
 		resp,
-		p.machineInfo.CPUDetails,
+		p.machine.machineInfo.CPUDetails,
 		nil,
 		map[string]machine.CPUSet{"rp-a": pinned},
 		nonReclaimable,
@@ -1091,7 +1091,7 @@ func TestBuildAdvisorBlockDescriptors_AppliesEligibilityByOwnerPoolSemantics(t *
 	p, cleanup := newReclaimReuseTestPolicy(t)
 	defer cleanup()
 
-	numa0 := p.machineInfo.CPUDetails.CPUsInNUMANodes(0)
+	numa0 := p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(0)
 	numa0CPUs := numa0.ToSliceInt()
 	require.GreaterOrEqual(t, len(numa0CPUs), 4)
 	pinned := machine.NewCPUSet(numa0CPUs[0], numa0CPUs[1])
@@ -1113,7 +1113,7 @@ func TestBuildAdvisorBlockDescriptors_AppliesEligibilityByOwnerPoolSemantics(t *
 		}, rand.New(rand.NewSource(10)))
 
 		descriptors, err := buildAdvisorBlockDescriptors(
-			resp, p.machineInfo.CPUDetails, nil, rpPinnedCPUSet, nonReclaimable,
+			resp, p.machine.machineInfo.CPUDetails, nil, rpPinnedCPUSet, nonReclaimable,
 		)
 		require.NoError(t, err)
 		require.Len(t, descriptors, 1)
@@ -1127,7 +1127,7 @@ func TestBuildAdvisorBlockDescriptors_AppliesEligibilityByOwnerPoolSemantics(t *
 		}}, rand.New(rand.NewSource(11)))
 
 		descriptors, err := buildAdvisorBlockDescriptors(
-			resp, p.machineInfo.CPUDetails, nil, rpPinnedCPUSet, nonReclaimable,
+			resp, p.machine.machineInfo.CPUDetails, nil, rpPinnedCPUSet, nonReclaimable,
 		)
 		require.NoError(t, err)
 		require.Len(t, descriptors, 1)
@@ -1142,7 +1142,7 @@ func TestBuildAdvisorBlockDescriptors_AppliesEligibilityByOwnerPoolSemantics(t *
 		}}, rand.New(rand.NewSource(12)))
 
 		descriptors, err := buildAdvisorBlockDescriptors(
-			resp, p.machineInfo.CPUDetails, nil, rpPinnedCPUSet, nonReclaimable,
+			resp, p.machine.machineInfo.CPUDetails, nil, rpPinnedCPUSet, nonReclaimable,
 		)
 		require.NoError(t, err)
 		require.Len(t, descriptors, 1)
@@ -1163,7 +1163,7 @@ func TestBuildAdvisorBlockDescriptors_FailsClosedWhenEligibleCapacityIsInsuffici
 
 	_, err := buildAdvisorBlockDescriptors(
 		resp,
-		p.machineInfo.CPUDetails,
+		p.machine.machineInfo.CPUDetails,
 		nil,
 		map[string]machine.CPUSet{"rp-a": machine.NewCPUSet(0, 1)},
 		machine.NewCPUSet(),

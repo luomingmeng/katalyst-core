@@ -66,9 +66,9 @@ func newResidualCleanupLivenessPolicy(t *testing.T) *DynamicPolicy {
 func TestClearResidualStateProgressingTargetDefersHealthy(t *testing.T) {
 	p := newResidualCleanupLivenessPolicy(t)
 	target := p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
-	p.cpuSetAdjustmentRetryMu.Lock()
-	target.lastProgressAt = time.Now().Add(-advisorPostCommitStuckThreshold(p.conf) - time.Second)
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	target.lastProgressAt = time.Now().Add(-advisorPostCommitStuckThreshold(p.config.conf) - time.Second)
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -82,9 +82,9 @@ func TestClearResidualStateUnchangedStuckTargetReportsError(t *testing.T) {
 	p := newResidualCleanupLivenessPolicy(t)
 	target := p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
 	p.recordAdvisorPostCommitProgress(target, advisorPostCommitPhasePhysicalApply)
-	p.cpuSetAdjustmentRetryMu.Lock()
-	target.lastProgressAt = time.Now().Add(-advisorPostCommitStuckThreshold(p.conf) - time.Second)
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	target.lastProgressAt = time.Now().Add(-advisorPostCommitStuckThreshold(p.config.conf) - time.Second)
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 
 	err := p.clearResidualStateAfterPodList(context.Background(), nil)
 	require.Error(t, err)
@@ -106,9 +106,9 @@ func TestClearResidualStateRecoversMatureResidualBehindStuckAdvisorTarget(t *tes
 	}
 	target := p.publishAdvisorPostCommitTarget(&advisorapi.ListAndWatchResponse{}, p.state.GetRevision())
 	p.recordAdvisorPostCommitProgress(target, advisorPostCommitPhasePhysicalApply)
-	p.cpuSetAdjustmentRetryMu.Lock()
-	target.lastProgressAt = time.Now().Add(-advisorPostCommitStuckThreshold(p.conf) - time.Second)
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	target.lastProgressAt = time.Now().Add(-advisorPostCommitStuckThreshold(p.config.conf) - time.Second)
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	require.FileExists(t, p.advisorPostCommitCheckpointPath())
 
 	err := p.clearResidualStateAfterPodList(context.Background(), nil)
@@ -118,10 +118,10 @@ func TestClearResidualStateRecoversMatureResidualBehindStuckAdvisorTarget(t *tes
 	require.FileExists(t, p.advisorPostCommitCheckpointPath())
 	require.Equal(t, advisorPostCommitPhaseCanonicalReconcile,
 		p.currentAdvisorPostCommitProgress().phase)
-	p.cpuSetAdjustmentRetryMu.Lock()
-	require.True(t, p.cpuSetAdjustmentRetryDirty)
-	require.Contains(t, p.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	require.True(t, p.adjustment.cpuSetAdjustmentRetryDirty)
+	require.Contains(t, p.adjustment.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 }
 
 func TestClearResidualStateAgesResidualOnlyOncePerInvocation(t *testing.T) {
@@ -264,7 +264,7 @@ func TestCheckCPUSetHealth(t *testing.T) {
 
 	t.Run("actual shared and dedicated overlap is not masked by committed cpusets", func(t *testing.T) {
 		policy := newTestDynamicPolicy(t, "check-cpuset-actual-overlap")
-		policy.emitter = &metrics.DummyMetrics{}
+		policy.emitter.emitter = &metrics.DummyMetrics{}
 		sharedUID, dedicatedUID := "health-shared", "health-dedicated"
 		sharedContainer, dedicatedContainer := "shared", "dedicated"
 		policy.state.SetPodEntries(state.PodEntries{
@@ -273,8 +273,8 @@ func TestCheckCPUSetHealth(t *testing.T) {
 			dedicatedUID: {dedicatedContainer: newAllocation(dedicatedUID, dedicatedContainer,
 				consts.PodAnnotationQoSLevelDedicatedCores, machine.MustParse("2-3"), machine.MustParse("4-5"))},
 		}, false)
-		policy.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
-		policy.metaServer = &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: &pod.PodFetcherStub{
+		policy.config.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+		policy.meta.metaServer = &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: &pod.PodFetcherStub{
 			PodList: []*v1.Pod{
 				newPod(sharedUID, sharedContainer, "shared-id"),
 				newPod(dedicatedUID, dedicatedContainer, "dedicated-id"),
@@ -294,22 +294,22 @@ func TestCheckCPUSetHealth(t *testing.T) {
 
 	t.Run("container id lookup failure is transient", func(t *testing.T) {
 		policy := newTestDynamicPolicy(t, "check-cpuset-container-id-error")
-		policy.emitter = &metrics.DummyMetrics{}
+		policy.emitter.emitter = &metrics.DummyMetrics{}
 		policy.state.SetPodEntries(state.PodEntries{"missing-pod": {"main": newAllocation(
 			"missing-pod", "main", consts.PodAnnotationQoSLevelDedicatedCores,
 			machine.MustParse("0-1"), machine.MustParse("0-1"))}}, false)
-		policy.metaServer = &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: &pod.PodFetcherStub{}}}
+		policy.meta.metaServer = &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: &pod.PodFetcherStub{}}}
 		policy.checkCPUSet(nil, nil, nil, nil, nil)
 		assertReady(t)
 	})
 
 	t.Run("container cgroup path lookup failure is transient", func(t *testing.T) {
 		policy := newTestDynamicPolicy(t, "check-cpuset-cgroup-path-error")
-		policy.emitter = &metrics.DummyMetrics{}
+		policy.emitter.emitter = &metrics.DummyMetrics{}
 		policy.state.SetPodEntries(state.PodEntries{"missing-cgroup": {"main": newAllocation(
 			"missing-cgroup", "main", consts.PodAnnotationQoSLevelDedicatedCores,
 			machine.MustParse("0-1"), machine.MustParse("0-1"))}}, false)
-		policy.metaServer = &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: &pod.PodFetcherStub{
+		policy.meta.metaServer = &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: &pod.PodFetcherStub{
 			PodList: []*v1.Pod{newPod("missing-cgroup", "main", "missing-id")},
 		}}}
 		policy.checkCPUSet(nil, nil, nil, nil, nil)
@@ -318,8 +318,8 @@ func TestCheckCPUSetHealth(t *testing.T) {
 }
 
 func TestEmitExceededMetricsWithNilDynamicConfiguration(t *testing.T) {
-	policy := &DynamicPolicy{emitter: &metrics.DummyMetrics{}, dynamicConfig: dynamicconfig.NewDynamicAgentConfiguration()}
-	policy.dynamicConfig.SetDynamicConfiguration(nil)
+	policy := &DynamicPolicy{emitter: emitterComponent{emitter: &metrics.DummyMetrics{}}, config: configComponent{dynamicConfig: dynamicconfig.NewDynamicAgentConfiguration()}}
+	policy.config.dynamicConfig.SetDynamicConfiguration(nil)
 	podUID := "nil-dynamic-configuration"
 	podEntries := state.PodEntries{podUID: {"main": {
 		AllocationMeta: commonstate.AllocationMeta{
@@ -347,25 +347,23 @@ func TestBuildCPUSetPodStateMap(t *testing.T) {
 
 	t.Run("test-with-pods", func(t *testing.T) {
 		t.Parallel()
-		p := &DynamicPolicy{
-			metaServer: &metaserver.MetaServer{
-				MetaAgent: &agent.MetaAgent{
-					PodFetcher: &pod.PodFetcherStub{
-						PodList: []*v1.Pod{
-							{
-								ObjectMeta: metav1.ObjectMeta{
-									UID:       "test-pod",
-									Namespace: "test-namespace",
-									Name:      "test-pod",
-								},
-								Spec: v1.PodSpec{
-									Containers: []v1.Container{
-										{
-											Name: "test-container",
-											Resources: v1.ResourceRequirements{
-												Requests: v1.ResourceList{
-													v1.ResourceCPU: resource.MustParse("4"),
-												},
+		p := &DynamicPolicy{meta: metaComponent{metaServer: &metaserver.MetaServer{
+			MetaAgent: &agent.MetaAgent{
+				PodFetcher: &pod.PodFetcherStub{
+					PodList: []*v1.Pod{
+						{
+							ObjectMeta: metav1.ObjectMeta{
+								UID:       "test-pod",
+								Namespace: "test-namespace",
+								Name:      "test-pod",
+							},
+							Spec: v1.PodSpec{
+								Containers: []v1.Container{
+									{
+										Name: "test-container",
+										Resources: v1.ResourceRequirements{
+											Requests: v1.ResourceList{
+												v1.ResourceCPU: resource.MustParse("4"),
 											},
 										},
 									},
@@ -375,7 +373,7 @@ func TestBuildCPUSetPodStateMap(t *testing.T) {
 					},
 				},
 			},
-		}
+		}}}
 
 		podUID := "test-pod"
 		containerName := "test-container"
@@ -449,10 +447,7 @@ func TestEmitExceededMetrics(t *testing.T) {
 	t.Parallel()
 	t.Run("test-shared-cores", func(t *testing.T) {
 		t.Parallel()
-		p := &DynamicPolicy{
-			emitter:       &metrics.DummyMetrics{},
-			dynamicConfig: dynamicconfig.NewDynamicAgentConfiguration(),
-		}
+		p := &DynamicPolicy{emitter: emitterComponent{emitter: &metrics.DummyMetrics{}}, config: configComponent{dynamicConfig: dynamicconfig.NewDynamicAgentConfiguration()}}
 
 		podUID := "test-pod"
 		pod := &v1.Pod{
@@ -501,10 +496,7 @@ func TestEmitExceededMetrics(t *testing.T) {
 
 	t.Run("test-dedicated-cores", func(t *testing.T) {
 		t.Parallel()
-		p := &DynamicPolicy{
-			emitter:       &metrics.DummyMetrics{},
-			dynamicConfig: dynamicconfig.NewDynamicAgentConfiguration(),
-		}
+		p := &DynamicPolicy{emitter: emitterComponent{emitter: &metrics.DummyMetrics{}}, config: configComponent{dynamicConfig: dynamicconfig.NewDynamicAgentConfiguration()}}
 
 		podUID := "test-pod"
 		pod := &v1.Pod{
@@ -577,7 +569,7 @@ func newCPUSet(start, size int) machine.CPUSet {
 func newPoolAllocationInfo(t *testing.T, policy *DynamicPolicy, poolName string, allocation machine.CPUSet) *state.AllocationInfo {
 	t.Helper()
 
-	assignments, err := machine.GetNumaAwareAssignments(policy.machineInfo.CPUTopology, allocation)
+	assignments, err := machine.GetNumaAwareAssignments(policy.machine.machineInfo.CPUTopology, allocation)
 	require.NoError(t, err)
 
 	return &state.AllocationInfo{
@@ -592,7 +584,7 @@ func newPoolAllocationInfo(t *testing.T, policy *DynamicPolicy, poolName string,
 func newSystemAllocationInfo(t *testing.T, policy *DynamicPolicy, podUID, containerName, specifiedPool string, allocation machine.CPUSet) *state.AllocationInfo {
 	t.Helper()
 
-	assignments, err := machine.GetNumaAwareAssignments(policy.machineInfo.CPUTopology, allocation)
+	assignments, err := machine.GetNumaAwareAssignments(policy.machine.machineInfo.CPUTopology, allocation)
 	require.NoError(t, err)
 
 	return &state.AllocationInfo{
@@ -626,18 +618,16 @@ func TestGetExpectedSystemExclusivePools(t *testing.T) {
 	}{
 		{
 			name: "skip invalid size and add system prefix",
-			policy: &DynamicPolicy{
-				dynamicConfig: func() *dynamicconfig.DynamicAgentConfiguration {
-					conf := dynamicconfig.NewConfiguration()
-					conf.SystemExclusivePool = map[string]int{
-						"latency": 2,
-						"broken":  0,
-					}
-					cfg := dynamicconfig.NewDynamicAgentConfiguration()
-					cfg.SetDynamicConfiguration(conf)
-					return cfg
-				}(),
-			},
+			policy: &DynamicPolicy{config: configComponent{dynamicConfig: func() *dynamicconfig.DynamicAgentConfiguration {
+				conf := dynamicconfig.NewConfiguration()
+				conf.SystemExclusivePool = map[string]int{
+					"latency": 2,
+					"broken":  0,
+				}
+				cfg := dynamicconfig.NewDynamicAgentConfiguration()
+				cfg.SetDynamicConfiguration(conf)
+				return cfg
+			}()}},
 			expectedPools: map[string]int{
 				commonstate.GetSystemPoolName("latency"): 2,
 			},
@@ -675,7 +665,7 @@ func TestCalculateSystemExclusivePoolChanges(t *testing.T) {
 		conf.SystemExclusivePoolShrinkMax = &maxShrink
 
 		policy := newTestDynamicPolicy(t, "calculate-system-exclusive-pool-changes-0")
-		policy.dynamicConfig.SetDynamicConfiguration(conf)
+		policy.config.dynamicConfig.SetDynamicConfiguration(conf)
 
 		currentPools := map[string]*state.AllocationInfo{
 			"system-latency": {AllocationResult: newCPUSet(0, 10)},
@@ -791,7 +781,7 @@ func TestAdjustSystemCoresPodAllocation(t *testing.T) {
 	t.Parallel()
 
 	policy := newTestDynamicPolicy(t, "adjust-system-cores-pod-allocation")
-	defaultSystemCPUs := policy.machineInfo.CPUDetails.CPUs()
+	defaultSystemCPUs := policy.machine.machineInfo.CPUDetails.CPUs()
 	poolName := commonstate.GetSystemPoolName("latency")
 	poolAllocation := newCPUSet(0, 2)
 
@@ -818,8 +808,8 @@ func TestApplySystemExclusivePoolChanges(t *testing.T) {
 	t.Parallel()
 
 	policy := newTestDynamicPolicy(t, "apply-system-exclusive-pool-changes")
-	policy.reservedCPUs = machine.NewCPUSet()
-	defaultSystemCPUs := policy.machineInfo.CPUDetails.CPUs()
+	policy.config.reservedCPUs = machine.NewCPUSet()
+	defaultSystemCPUs := policy.machine.machineInfo.CPUDetails.CPUs()
 
 	policy.state.SetAllocationInfo("pod-with-pool", "main",
 		newSystemAllocationInfo(t, policy, "pod-with-pool", "main", "latency", defaultSystemCPUs), false)
@@ -842,8 +832,8 @@ func TestApplySystemExclusivePoolChanges(t *testing.T) {
 
 func TestApplySystemExclusivePoolChangesRetriesFailedAtomicCommit(t *testing.T) {
 	policy := newTestDynamicPolicy(t, "apply-system-exclusive-pool-changes-atomic")
-	policy.reservedCPUs = machine.NewCPUSet()
-	defaultSystemCPUs := policy.machineInfo.CPUDetails.CPUs()
+	policy.config.reservedCPUs = machine.NewCPUSet()
+	defaultSystemCPUs := policy.machine.machineInfo.CPUDetails.CPUs()
 	require.NoError(t, policy.state.SetAllocationInfo("pod-with-pool", "main",
 		newSystemAllocationInfo(t, policy, "pod-with-pool", "main", "latency", defaultSystemCPUs), false))
 	oldEntries := policy.state.GetPodEntries()

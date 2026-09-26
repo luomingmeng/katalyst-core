@@ -37,7 +37,7 @@ import (
 func newPolicyForBypassTest(enabled bool) *DynamicPolicy {
 	dyn := dynamicconfig.NewDynamicAgentConfiguration()
 	dyn.GetDynamicConfiguration().EnableBypassCPUSetAdjustment = enabled
-	return &DynamicPolicy{dynamicConfig: dyn}
+	return &DynamicPolicy{config: configComponent{dynamicConfig: dyn}}
 }
 
 func TestShouldBypassCPUSetAdjustment(t *testing.T) {
@@ -63,7 +63,7 @@ func TestShouldBypassCPUSetAdjustment(t *testing.T) {
 
 	t.Run("nil dynamicConfig", func(t *testing.T) {
 		t.Parallel()
-		p := &DynamicPolicy{dynamicConfig: nil}
+		p := &DynamicPolicy{config: configComponent{dynamicConfig: nil}}
 		assert.False(t, p.shouldBypassCPUSetAdjustment())
 	})
 }
@@ -112,7 +112,7 @@ func TestGetResourcesAllocationBypassClearsNonDedicatedQoS(t *testing.T) {
 
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 	require.NoError(t, err)
-	p.dynamicConfig.GetDynamicConfiguration().EnableBypassCPUSetAdjustment = true
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableBypassCPUSetAdjustment = true
 
 	testCases := []struct {
 		podUID string
@@ -175,7 +175,7 @@ func TestAllocateResponseClearsSharedCPUSetWhenBypassEnabled(t *testing.T) {
 
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 	require.NoError(t, err)
-	p.dynamicConfig.GetDynamicConfiguration().EnableBypassCPUSetAdjustment = true
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableBypassCPUSetAdjustment = true
 
 	req := &pluginapi.ResourceRequest{
 		PodUid:         "shared-pod",
@@ -243,5 +243,5 @@ func TestDynamicPolicyInitializesBulkheadManager(t *testing.T) {
 
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
 	require.NoError(t, err)
-	require.NotNil(t, p.bulkheadManager)
+	require.NotNil(t, p.bulkhead.bulkheadManager)
 }

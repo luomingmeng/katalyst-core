@@ -105,7 +105,7 @@ func cpuSetAdjustmentExecutionLeaseFromContext(
 	p *DynamicPolicy,
 ) *cpuSetAdjustmentExecutionLease {
 	lease, _ := ctx.Value(cpuSetAdjustmentExecutionLeaseContextKey{}).(*cpuSetAdjustmentExecutionLease)
-	if !lease.isActiveFor(p, p.cpuSetAdjustmentExecution) {
+	if !lease.isActiveFor(p, p.adjustment.cpuSetAdjustmentExecution) {
 		return nil
 	}
 	return lease
@@ -254,13 +254,13 @@ func (p *DynamicPolicy) RegisterCPUSetAdjustmentHandler(name string, handler cpu
 	if handler == nil {
 		return fmt.Errorf("cpuset adjustment handler %q is nil", name)
 	}
-	if p.cpuSetAdjustmentHandlers == nil {
-		p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{}
+	if p.adjustment.cpuSetAdjustmentHandlers == nil {
+		p.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{}
 	}
-	if _, ok := p.cpuSetAdjustmentHandlers[name]; ok {
+	if _, ok := p.adjustment.cpuSetAdjustmentHandlers[name]; ok {
 		return fmt.Errorf("cpuset adjustment handler %q already registered", name)
 	}
-	p.cpuSetAdjustmentHandlers[name] = handler
+	p.adjustment.cpuSetAdjustmentHandlers[name] = handler
 	return nil
 }
 
@@ -332,7 +332,7 @@ func (s *cpuSetAdjustmentStateSnapshot) GetRevision() uint64 {
 }
 
 func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes ...cpusetutil.CPUSetAdjustmentMode) error {
-	if len(p.cpuSetAdjustmentHandlers) == 0 {
+	if len(p.adjustment.cpuSetAdjustmentHandlers) == 0 {
 		return nil
 	}
 	reconcileTarget, _ := ctx.Value(advisorPostCommitTargetContextKey{}).(*advisorPostCommitTarget)
@@ -357,12 +357,12 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 
 	for {
 		var topology *machine.CPUTopology
-		if p.machineInfo != nil {
-			topology = p.machineInfo.CPUTopology
+		if p.machine.machineInfo != nil {
+			topology = p.machine.machineInfo.CPUTopology
 		}
 		var dynamicConf *dynamicconfig.Configuration
-		if p.dynamicConfig != nil {
-			dynamicConf = p.dynamicConfig.GetDynamicConfiguration()
+		if p.config.dynamicConfig != nil {
+			dynamicConf = p.config.dynamicConfig.GetDynamicConfiguration()
 		}
 		stateRevision := uint64(0)
 		if p.state != nil {
@@ -371,32 +371,32 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 		stateSnapshot := newCPUSetAdjustmentStateSnapshot(p.state)
 		commitOverride := &cpusetutil.CPUSetAdjustmentCommitOverride{}
 		handlerCtx := cpusetutil.CPUSetAdjustmentHandlerCtx{
-			CoreConf:                  p.conf,
+			CoreConf:                  p.config.conf,
 			DynamicConf:               dynamicConf,
-			Emitter:                   p.emitter,
-			MetaServer:                p.metaServer,
+			Emitter:                   p.emitter.emitter,
+			MetaServer:                p.meta.metaServer,
 			State:                     stateSnapshot,
 			Topology:                  topology,
-			ReservedCPUs:              p.reservedCPUs.Clone(),
-			ReservedReclaimedCPUs:     p.reservedReclaimedCPUSet.Clone(),
-			ReservedReclaimedCPUsSize: p.reservedReclaimedCPUsSize,
+			ReservedCPUs:              p.config.reservedCPUs.Clone(),
+			ReservedReclaimedCPUs:     p.reclaim.reservedReclaimedCPUSet.Clone(),
+			ReservedReclaimedCPUsSize: p.reclaim.reservedReclaimedCPUsSize,
 			Mode:                      mode,
 			ScheduleFullRetry: func(reason cpusetutil.CPUSetAdjustmentRetryReason) {
 				p.scheduleCPUSetAdjustmentRetry(reason)
 			},
 			CommitOverride: commitOverride,
 		}
-		p.cpuSetAdjustmentGeneration++
-		handlerCtx.Generation = p.cpuSetAdjustmentGeneration
+		p.adjustment.cpuSetAdjustmentGeneration++
+		handlerCtx.Generation = p.adjustment.cpuSetAdjustmentGeneration
 		roundInvalidated := false
 		handlerCtx.CommitIfGenerationCurrent = func(generation uint64, commit func()) bool {
 			p.Lock()
 			defer p.Unlock()
 			var currentDynamicConf *dynamicconfig.Configuration
-			if p.dynamicConfig != nil {
-				currentDynamicConf = p.dynamicConfig.GetDynamicConfiguration()
+			if p.config.dynamicConfig != nil {
+				currentDynamicConf = p.config.dynamicConfig.GetDynamicConfiguration()
 			}
-			if generation != p.cpuSetAdjustmentGeneration ||
+			if generation != p.adjustment.cpuSetAdjustmentGeneration ||
 				dynamicConf != currentDynamicConf ||
 				!stateSnapshot.matches(p.state) {
 				roundInvalidated = true
@@ -406,11 +406,11 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 			return true
 		}
 
-		names := make([]string, 0, len(p.cpuSetAdjustmentHandlers))
-		handlers := make(map[string]cpusetutil.CPUSetAdjustmentHandler, len(p.cpuSetAdjustmentHandlers))
-		for name := range p.cpuSetAdjustmentHandlers {
+		names := make([]string, 0, len(p.adjustment.cpuSetAdjustmentHandlers))
+		handlers := make(map[string]cpusetutil.CPUSetAdjustmentHandler, len(p.adjustment.cpuSetAdjustmentHandlers))
+		for name := range p.adjustment.cpuSetAdjustmentHandlers {
 			names = append(names, name)
-			handlers[name] = p.cpuSetAdjustmentHandlers[name]
+			handlers[name] = p.adjustment.cpuSetAdjustmentHandlers[name]
 		}
 		sort.Strings(names)
 
@@ -474,12 +474,12 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 		}
 		if roundErr == nil && mode == cpusetutil.CPUSetAdjustmentModePeriodic &&
 			!p.hasAnyPendingAdvisorPostCommitTarget() {
-			p.cpuSetAdjustmentRetryMu.Lock()
-			if !p.cpuSetAdjustmentRetryQueued && !p.cpuSetAdjustmentRetryAgain {
-				p.cpuSetAdjustmentRetryDirty = false
-				p.cpuSetAdjustmentRetryReasons = nil
+			p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+			if !p.adjustment.cpuSetAdjustmentRetryQueued && !p.adjustment.cpuSetAdjustmentRetryAgain {
+				p.adjustment.cpuSetAdjustmentRetryDirty = false
+				p.adjustment.cpuSetAdjustmentRetryReasons = nil
 			}
-			p.cpuSetAdjustmentRetryMu.Unlock()
+			p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 		}
 		return roundErr
 	}
@@ -544,19 +544,19 @@ func (p *DynamicPolicy) prepareAdvisorPostCommitTarget(
 }
 
 func (p *DynamicPolicy) publishPreparedAdvisorPostCommitTarget(target *advisorPostCommitTarget) {
-	p.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
 	p.setAdvisorPostCommitTargetLocked(target)
 	p.recordAdvisorPostCommitProgressLocked(target, advisorPostCommitPhasePublished)
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 }
 
 func (p *DynamicPolicy) beginPreparedAdvisorPostCommitTarget(
 	target *advisorPostCommitTarget,
 	preCommitRevision uint64,
 ) *advisorPostCommitTarget {
-	p.cpuSetAdjustmentRetryMu.Lock()
-	defer p.cpuSetAdjustmentRetryMu.Unlock()
-	previous := p.advisorPostCommitTarget
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	defer p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
+	previous := p.adjustment.advisorPostCommitTarget
 	target.preCommitRevision = preCommitRevision
 	target.prepared = true
 	p.setAdvisorPostCommitTargetLocked(target)
@@ -565,9 +565,9 @@ func (p *DynamicPolicy) beginPreparedAdvisorPostCommitTarget(
 }
 
 func (p *DynamicPolicy) finishPreparedAdvisorPostCommitTarget(target *advisorPostCommitTarget) {
-	p.cpuSetAdjustmentRetryMu.Lock()
-	defer p.cpuSetAdjustmentRetryMu.Unlock()
-	if p.advisorPostCommitTarget == target {
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	defer p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
+	if p.adjustment.advisorPostCommitTarget == target {
 		target.prepared = false
 	}
 }
@@ -575,14 +575,14 @@ func (p *DynamicPolicy) finishPreparedAdvisorPostCommitTarget(target *advisorPos
 func (p *DynamicPolicy) rollbackPreparedAdvisorPostCommitTarget(
 	target, previous *advisorPostCommitTarget,
 ) {
-	p.cpuSetAdjustmentRetryMu.Lock()
-	defer p.cpuSetAdjustmentRetryMu.Unlock()
-	if p.advisorPostCommitTarget == target {
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	defer p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
+	if p.adjustment.advisorPostCommitTarget == target {
 		p.setAdvisorPostCommitTargetLocked(previous)
 	}
-	for permit, permitTarget := range p.advisorStateWritePermits {
+	for permit, permitTarget := range p.adjustment.advisorStateWritePermits {
 		if permitTarget == target {
-			delete(p.advisorStateWritePermits, permit)
+			delete(p.adjustment.advisorStateWritePermits, permit)
 		}
 	}
 }
@@ -590,21 +590,21 @@ func (p *DynamicPolicy) rollbackPreparedAdvisorPostCommitTarget(
 func (p *DynamicPolicy) markAdvisorPostCommitAbortPending(
 	target, previous *advisorPostCommitTarget,
 ) {
-	p.cpuSetAdjustmentRetryMu.Lock()
-	if p.advisorPostCommitTarget == target {
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	if p.adjustment.advisorPostCommitTarget == target {
 		target.abortPending = true
 		target.previousTarget = previous
 	}
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonApplyFailed)
 }
 
 func (p *DynamicPolicy) markAdvisorPostCommitPublicationPending(target *advisorPostCommitTarget) {
-	p.cpuSetAdjustmentRetryMu.Lock()
-	if p.advisorPostCommitTarget == target {
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	if p.adjustment.advisorPostCommitTarget == target {
 		target.publicationPending = true
 	}
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	p.markAdvisorApplyFailed(target.revision)
 }
 
@@ -708,8 +708,8 @@ func (p *DynamicPolicy) storeAdvisorPostCommitTarget(target *advisorPostCommitTa
 		return fmt.Errorf("marshal advisor response: %w", err)
 	}
 	var topology *machine.CPUTopology
-	if p.machineInfo != nil {
-		topology = p.machineInfo.CPUTopology
+	if p.machine.machineInfo != nil {
+		topology = p.machine.machineInfo.CPUTopology
 	}
 	transition, err := advisorMigrationCheckpointTransitionToWAL(
 		target.migrationCheckpointTransition, topology)
@@ -844,8 +844,8 @@ func (p *DynamicPolicy) ensureAdvisorPostCommitPublished(target *advisorPostComm
 
 	activePath := p.advisorPostCommitCheckpointPath()
 	var topology *machine.CPUTopology
-	if p.machineInfo != nil {
-		topology = p.machineInfo.CPUTopology
+	if p.machine.machineInfo != nil {
+		topology = p.machine.machineInfo.CPUTopology
 	}
 	active, err := loadAdvisorPostCommitTarget(activePath, topology)
 	if err != nil {
@@ -990,8 +990,8 @@ func (p *DynamicPolicy) restoreAdvisorPostCommitTarget() error {
 		mainRevision = p.state.GetRevision()
 	}
 	var topology *machine.CPUTopology
-	if p.machineInfo != nil {
-		topology = p.machineInfo.CPUTopology
+	if p.machine.machineInfo != nil {
+		topology = p.machine.machineInfo.CPUTopology
 	}
 	active, activeErr := loadAdvisorPostCommitTarget(activePath, topology)
 	staging, stagingErr := loadAdvisorPostCommitTarget(stagingPath, topology)
@@ -1031,16 +1031,16 @@ func (p *DynamicPolicy) restoreAdvisorPostCommitTarget() error {
 		}
 		return nil
 	}
-	p.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
 	p.setAdvisorPostCommitTargetLocked(selected)
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	return nil
 }
 
 func (p *DynamicPolicy) prepareAdvisorPostCommitTargetOnStart() error {
-	p.cpuSetAdjustmentRetryMu.Lock()
-	current := p.advisorPostCommitTarget
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	current := p.adjustment.advisorPostCommitTarget
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	if current == nil {
 		if err := p.restoreAdvisorPostCommitTarget(); err != nil {
 			return err
@@ -1052,27 +1052,27 @@ func (p *DynamicPolicy) prepareAdvisorPostCommitTargetOnStart() error {
 		stateRevision = p.state.GetRevision()
 	}
 
-	p.cpuSetAdjustmentRetryMu.Lock()
-	defer p.cpuSetAdjustmentRetryMu.Unlock()
-	if p.advisorPostCommitTarget == nil {
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	defer p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
+	if p.adjustment.advisorPostCommitTarget == nil {
 		return nil
 	}
-	if p.state == nil || p.advisorPostCommitTarget.revision != stateRevision {
+	if p.state == nil || p.adjustment.advisorPostCommitTarget.revision != stateRevision {
 		p.setAdvisorPostCommitTargetLocked(nil)
 		return p.removeAdvisorPostCommitCheckpoints()
 	}
-	p.cpuSetAdjustmentRetryDirty = true
-	if p.cpuSetAdjustmentRetryReasons == nil {
-		p.cpuSetAdjustmentRetryReasons = make(map[cpusetutil.CPUSetAdjustmentRetryReason]struct{})
+	p.adjustment.cpuSetAdjustmentRetryDirty = true
+	if p.adjustment.cpuSetAdjustmentRetryReasons == nil {
+		p.adjustment.cpuSetAdjustmentRetryReasons = make(map[cpusetutil.CPUSetAdjustmentRetryReason]struct{})
 	}
-	p.cpuSetAdjustmentRetryReasons[cpusetutil.RetryReasonApplyFailed] = struct{}{}
+	p.adjustment.cpuSetAdjustmentRetryReasons[cpusetutil.RetryReasonApplyFailed] = struct{}{}
 	return nil
 }
 
 func (p *DynamicPolicy) hasAnyPendingAdvisorPostCommitTarget() bool {
-	p.cpuSetAdjustmentRetryMu.Lock()
-	defer p.cpuSetAdjustmentRetryMu.Unlock()
-	return p.advisorPostCommitTarget != nil
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	defer p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
+	return p.adjustment.advisorPostCommitTarget != nil
 }
 
 func (p *DynamicPolicy) installCPUStateWritePermit() {
@@ -1081,11 +1081,11 @@ func (p *DynamicPolicy) installCPUStateWritePermit() {
 			return p.ensureCPUStateWriterAllowed(revision, "state."+operation, nil)
 		}
 
-		p.cpuSetAdjustmentRetryMu.Lock()
-		defer p.cpuSetAdjustmentRetryMu.Unlock()
-		target, ok := p.advisorStateWritePermits[permit]
-		delete(p.advisorStateWritePermits, permit)
-		if ok && target != nil && p.advisorPostCommitTarget == target {
+		p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+		defer p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
+		target, ok := p.adjustment.advisorStateWritePermits[permit]
+		delete(p.adjustment.advisorStateWritePermits, permit)
+		if ok && target != nil && p.adjustment.advisorPostCommitTarget == target {
 			if target.prepared && revision == target.preCommitRevision {
 				return nil
 			}
@@ -1094,8 +1094,8 @@ func (p *DynamicPolicy) installCPUStateWritePermit() {
 			}
 		}
 		pendingRevision := uint64(0)
-		if p.advisorPostCommitTarget != nil {
-			pendingRevision = p.advisorPostCommitTarget.revision
+		if p.adjustment.advisorPostCommitTarget != nil {
+			pendingRevision = p.adjustment.advisorPostCommitTarget.revision
 		}
 		return &advisorPostCommitPendingError{
 			pendingRevision:   pendingRevision,
@@ -1107,12 +1107,12 @@ func (p *DynamicPolicy) installCPUStateWritePermit() {
 
 func (p *DynamicPolicy) newAdvisorStateWritePermit(target *advisorPostCommitTarget) *state.WritePermit {
 	permit := state.NewWritePermit()
-	p.cpuSetAdjustmentRetryMu.Lock()
-	if p.advisorStateWritePermits == nil {
-		p.advisorStateWritePermits = make(map[*state.WritePermit]*advisorPostCommitTarget)
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	if p.adjustment.advisorStateWritePermits == nil {
+		p.adjustment.advisorStateWritePermits = make(map[*state.WritePermit]*advisorPostCommitTarget)
 	}
-	p.advisorStateWritePermits[permit] = target
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.advisorStateWritePermits[permit] = target
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	return permit
 }
 
@@ -1121,16 +1121,16 @@ func (p *DynamicPolicy) ensureCPUStateWriterAllowed(
 	source string,
 	reconcileTarget *advisorPostCommitTarget,
 ) error {
-	p.cpuSetAdjustmentRetryMu.Lock()
-	pendingTarget := p.advisorPostCommitTarget
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	pendingTarget := p.adjustment.advisorPostCommitTarget
 	if pendingTarget == nil || pendingTarget.writerFenceReleased {
-		p.cpuSetAdjustmentRetryMu.Unlock()
+		p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 		return nil
 	}
 	pendingPrepared := pendingTarget.prepared
 	pendingPreCommitRevision := pendingTarget.preCommitRevision
 	pendingRevision := pendingTarget.revision
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	if reconcileTarget == pendingTarget {
 		if pendingPrepared && attemptedRevision == pendingPreCommitRevision {
 			return nil
@@ -1147,33 +1147,33 @@ func (p *DynamicPolicy) ensureCPUStateWriterAllowed(
 }
 
 func (p *DynamicPolicy) currentAdvisorPostCommitTarget() *advisorPostCommitTarget {
-	p.cpuSetAdjustmentRetryMu.Lock()
-	defer p.cpuSetAdjustmentRetryMu.Unlock()
-	return p.advisorPostCommitTarget
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	defer p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
+	return p.adjustment.advisorPostCommitTarget
 }
 
 func (p *DynamicPolicy) currentAdvisorPostCommitTargetAndChange() (*advisorPostCommitTarget, <-chan struct{}) {
-	p.cpuSetAdjustmentRetryMu.Lock()
-	defer p.cpuSetAdjustmentRetryMu.Unlock()
-	if p.advisorPostCommitTargetChange == nil {
-		p.advisorPostCommitTargetChange = make(chan struct{})
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	defer p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
+	if p.adjustment.advisorPostCommitTargetChange == nil {
+		p.adjustment.advisorPostCommitTargetChange = make(chan struct{})
 	}
-	target := p.advisorPostCommitTarget
+	target := p.adjustment.advisorPostCommitTarget
 	if target != nil && target.writerFenceReleased {
 		target = nil
 	}
-	return target, p.advisorPostCommitTargetChange
+	return target, p.adjustment.advisorPostCommitTargetChange
 }
 
 func (p *DynamicPolicy) currentAdvisorPostCommitProgress() advisorPostCommitProgress {
-	p.cpuSetAdjustmentRetryMu.Lock()
-	defer p.cpuSetAdjustmentRetryMu.Unlock()
-	if p.advisorPostCommitTargetChange == nil {
-		p.advisorPostCommitTargetChange = make(chan struct{})
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	defer p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
+	if p.adjustment.advisorPostCommitTargetChange == nil {
+		p.adjustment.advisorPostCommitTargetChange = make(chan struct{})
 	}
-	target := p.advisorPostCommitTarget
+	target := p.adjustment.advisorPostCommitTarget
 	if target == nil {
-		return advisorPostCommitProgress{changed: p.advisorPostCommitTargetChange}
+		return advisorPostCommitProgress{changed: p.adjustment.advisorPostCommitTargetChange}
 	}
 	return advisorPostCommitProgress{
 		target:         target,
@@ -1182,7 +1182,7 @@ func (p *DynamicPolicy) currentAdvisorPostCommitProgress() advisorPostCommitProg
 		createdAt:      target.createdAt,
 		lastProgressAt: target.lastProgressAt,
 		generation:     target.progressGeneration,
-		changed:        p.advisorPostCommitTargetChange,
+		changed:        p.adjustment.advisorPostCommitTargetChange,
 	}
 }
 
@@ -1192,15 +1192,15 @@ func (p *DynamicPolicy) currentAdvisorPostCommitProgress() advisorPostCommitProg
 func (p *DynamicPolicy) advisorPostCommitProgressStuck(progress advisorPostCommitProgress) bool {
 	return progress.target != nil &&
 		progress.phase == advisorPostCommitPhasePhysicalApply &&
-		time.Since(progress.lastProgressAt) >= advisorPostCommitStuckThreshold(p.conf)
+		time.Since(progress.lastProgressAt) >= advisorPostCommitStuckThreshold(p.config.conf)
 }
 
 func (p *DynamicPolicy) recordAdvisorPostCommitProgress(
 	target *advisorPostCommitTarget,
 	phase advisorPostCommitPhase,
 ) {
-	p.cpuSetAdjustmentRetryMu.Lock()
-	defer p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	defer p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	p.recordAdvisorPostCommitProgressLocked(target, phase)
 }
 
@@ -1210,7 +1210,7 @@ func (p *DynamicPolicy) recordAdvisorPostCommitProgressLocked(
 	target *advisorPostCommitTarget,
 	phase advisorPostCommitPhase,
 ) {
-	if target == nil || p.advisorPostCommitTarget != target {
+	if target == nil || p.adjustment.advisorPostCommitTarget != target {
 		return
 	}
 	if target.phase == phase && target.progressGeneration > 0 {
@@ -1223,24 +1223,24 @@ func (p *DynamicPolicy) recordAdvisorPostCommitProgressLocked(
 	target.phase = phase
 	target.lastProgressAt = now
 	target.progressGeneration++
-	if p.advisorPostCommitTargetChange != nil {
-		close(p.advisorPostCommitTargetChange)
+	if p.adjustment.advisorPostCommitTargetChange != nil {
+		close(p.adjustment.advisorPostCommitTargetChange)
 	}
-	p.advisorPostCommitTargetChange = make(chan struct{})
+	p.adjustment.advisorPostCommitTargetChange = make(chan struct{})
 }
 
 // setAdvisorPostCommitTargetLocked publishes a pointer transition and wakes all
 // waiters that atomically observed the previous target and change channel.
 // cpuSetAdjustmentRetryMu must be held by the caller.
 func (p *DynamicPolicy) setAdvisorPostCommitTargetLocked(target *advisorPostCommitTarget) {
-	if p.advisorPostCommitTarget == target {
+	if p.adjustment.advisorPostCommitTarget == target {
 		return
 	}
-	if p.advisorPostCommitTargetChange != nil {
-		close(p.advisorPostCommitTargetChange)
+	if p.adjustment.advisorPostCommitTargetChange != nil {
+		close(p.adjustment.advisorPostCommitTargetChange)
 	}
-	p.advisorPostCommitTarget = target
-	p.advisorPostCommitTargetChange = make(chan struct{})
+	p.adjustment.advisorPostCommitTarget = target
+	p.adjustment.advisorPostCommitTargetChange = make(chan struct{})
 }
 
 func (p *DynamicPolicy) retryAdvisorPostCommitAbort(target *advisorPostCommitTarget) error {
@@ -1250,13 +1250,13 @@ func (p *DynamicPolicy) retryAdvisorPostCommitAbort(target *advisorPostCommitTar
 	}
 	previous := target.previousTarget
 	p.rollbackPreparedAdvisorPostCommitTarget(target, previous)
-	p.cpuSetAdjustmentRetryMu.Lock()
-	delete(p.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
-	if len(p.cpuSetAdjustmentRetryReasons) == 0 && previous == nil {
-		p.cpuSetAdjustmentRetryDirty = false
-		p.cpuSetAdjustmentRetryReasons = nil
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	delete(p.adjustment.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
+	if len(p.adjustment.cpuSetAdjustmentRetryReasons) == 0 && previous == nil {
+		p.adjustment.cpuSetAdjustmentRetryDirty = false
+		p.adjustment.cpuSetAdjustmentRetryReasons = nil
 	}
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	return nil
 }
 
@@ -1265,12 +1265,12 @@ func (p *DynamicPolicy) retryAdvisorPostCommitPublication(target *advisorPostCom
 		p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonApplyFailed)
 		return fmt.Errorf("publish committed advisor post-commit target: %w", err)
 	}
-	p.cpuSetAdjustmentRetryMu.Lock()
-	if p.advisorPostCommitTarget == target {
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	if p.adjustment.advisorPostCommitTarget == target {
 		target.publicationPending = false
 		p.recordAdvisorPostCommitProgressLocked(target, advisorPostCommitPhasePublished)
 	}
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	return nil
 }
 
@@ -1279,32 +1279,32 @@ func (p *DynamicPolicy) persistAdvisorPostCommitApplied(target *advisorPostCommi
 		p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonApplyFailed)
 		return fmt.Errorf("persist applied advisor post-commit target: %w", err)
 	}
-	p.cpuSetAdjustmentRetryMu.Lock()
-	if p.advisorPostCommitTarget == target {
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	if p.adjustment.advisorPostCommitTarget == target {
 		target.applyMarkerPending = false
 		target.cleanupPending = true
 		p.recordAdvisorPostCommitProgressLocked(target, advisorPostCommitPhaseCleanup)
 	}
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	return nil
 }
 
 func (p *DynamicPolicy) completeAdvisorPostCommitCleanup(target *advisorPostCommitTarget) error {
 	if err := p.removeAdvisorPostCommitCheckpoints(); err != nil {
-		p.cpuSetAdjustmentRetryMu.Lock()
-		if p.advisorPostCommitTarget == target {
+		p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+		if p.adjustment.advisorPostCommitTarget == target {
 			target.cleanupPending = true
 		}
-		p.cpuSetAdjustmentRetryMu.Unlock()
+		p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 		p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonApplyFailed)
 		return fmt.Errorf("remove reconciled advisor post-commit checkpoints: %w", err)
 	}
 
-	p.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
 	if p.releaseAdvisorPostCommitTargetFenceLocked(target) {
 		p.completeAdvisorPostCommitRetryLocked()
 	}
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	return nil
 }
 
@@ -1312,13 +1312,13 @@ func (p *DynamicPolicy) completeAdvisorPostCommitCleanup(target *advisorPostComm
 // its writer permits. Retry state is completed separately because abandoning a
 // stuck physical apply must leave canonical reconciliation dirty.
 func (p *DynamicPolicy) releaseAdvisorPostCommitTargetFenceLocked(target *advisorPostCommitTarget) bool {
-	if p.advisorPostCommitTarget != target {
+	if p.adjustment.advisorPostCommitTarget != target {
 		return false
 	}
 	p.setAdvisorPostCommitTargetLocked(nil)
-	for permit, permitTarget := range p.advisorStateWritePermits {
+	for permit, permitTarget := range p.adjustment.advisorStateWritePermits {
 		if permitTarget == target {
-			delete(p.advisorStateWritePermits, permit)
+			delete(p.adjustment.advisorStateWritePermits, permit)
 		}
 	}
 	return true
@@ -1329,12 +1329,12 @@ func (p *DynamicPolicy) releaseAdvisorPostCommitTargetFenceLocked(target *adviso
 // runtime-only handoff: after a crash the durable target is fenced and replayed
 // again, which is safer than losing an incomplete physical transaction.
 func (p *DynamicPolicy) releaseAdvisorPostCommitWriterFenceLocked(target *advisorPostCommitTarget) bool {
-	if p.advisorPostCommitTarget != target {
+	if p.adjustment.advisorPostCommitTarget != target {
 		return false
 	}
-	for permit, permitTarget := range p.advisorStateWritePermits {
+	for permit, permitTarget := range p.adjustment.advisorStateWritePermits {
 		if permitTarget == target {
-			delete(p.advisorStateWritePermits, permit)
+			delete(p.adjustment.advisorStateWritePermits, permit)
 		}
 	}
 	target.writerFenceReleased = true
@@ -1345,10 +1345,10 @@ func (p *DynamicPolicy) releaseAdvisorPostCommitWriterFenceLocked(target *adviso
 // completeAdvisorPostCommitRetryLocked clears apply-failure retry state only
 // after the target has completed physical apply and durable cleanup.
 func (p *DynamicPolicy) completeAdvisorPostCommitRetryLocked() {
-	delete(p.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
-	if len(p.cpuSetAdjustmentRetryReasons) == 0 {
-		p.cpuSetAdjustmentRetryDirty = false
-		p.cpuSetAdjustmentRetryReasons = nil
+	delete(p.adjustment.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonApplyFailed)
+	if len(p.adjustment.cpuSetAdjustmentRetryReasons) == 0 {
+		p.adjustment.cpuSetAdjustmentRetryDirty = false
+		p.adjustment.cpuSetAdjustmentRetryReasons = nil
 	}
 }
 
@@ -1392,25 +1392,25 @@ func (p *DynamicPolicy) recoverStuckAdvisorPostCommitTargetLocked(
 		}
 		return false, fmt.Errorf("replay stuck advisor response-owned state: %s", strings.Join(stageErrors, "; "))
 	}
-	p.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
 	released := p.releaseAdvisorPostCommitWriterFenceLocked(target)
-	if released && !p.cpuSetAdjustmentRetryStopping {
-		p.cpuSetAdjustmentRetryDirty = true
-		if p.cpuSetAdjustmentRetryReasons == nil {
-			p.cpuSetAdjustmentRetryReasons = make(map[cpusetutil.CPUSetAdjustmentRetryReason]struct{})
+	if released && !p.adjustment.cpuSetAdjustmentRetryStopping {
+		p.adjustment.cpuSetAdjustmentRetryDirty = true
+		if p.adjustment.cpuSetAdjustmentRetryReasons == nil {
+			p.adjustment.cpuSetAdjustmentRetryReasons = make(map[cpusetutil.CPUSetAdjustmentRetryReason]struct{})
 		}
-		p.cpuSetAdjustmentRetryReasons[cpusetutil.RetryReasonApplyFailed] = struct{}{}
+		p.adjustment.cpuSetAdjustmentRetryReasons[cpusetutil.RetryReasonApplyFailed] = struct{}{}
 	}
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	return released, nil
 }
 
 func (p *DynamicPolicy) advisorPostCommitTargetSuperseded(target *advisorPostCommitTarget) bool {
-	p.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
 	released := target != nil &&
-		p.advisorPostCommitTarget == target &&
+		p.adjustment.advisorPostCommitTarget == target &&
 		target.writerFenceReleased
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	return released && p.state != nil && p.state.GetRevision() != target.revision
 }
 
@@ -1422,9 +1422,9 @@ func (p *DynamicPolicy) retireSupersededAdvisorPostCommitTarget(target *advisorP
 	if err := p.removeAdvisorPostCommitCheckpoints(); err != nil {
 		return fmt.Errorf("remove superseded advisor post-commit checkpoints: %w", err)
 	}
-	p.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
 	p.releaseAdvisorPostCommitTargetFenceLocked(target)
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	return nil
 }
 
@@ -1464,14 +1464,14 @@ func (p *DynamicPolicy) reconcileAdvisorPostCommitTarget(
 		defer executionLease.release()
 		ctx = context.WithValue(ctx, cpuSetAdjustmentExecutionLeaseContextKey{}, executionLease)
 	}
-	p.cpuSetAdjustmentRetryMu.Lock()
-	current := p.advisorPostCommitTarget == target
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	current := p.adjustment.advisorPostCommitTarget == target
 	abortPending := target.abortPending
 	publicationPending := target.publicationPending
 	applyMarkerPending := target.applyMarkerPending
 	cleanupPending := target.cleanupPending
 	applied := target.applied
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	if !current {
 		return nil
 	}
@@ -1490,11 +1490,11 @@ func (p *DynamicPolicy) reconcileAdvisorPostCommitTarget(
 		cleanupPending = true
 	}
 	if applied && !cleanupPending {
-		p.cpuSetAdjustmentRetryMu.Lock()
-		if p.advisorPostCommitTarget == target {
+		p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+		if p.adjustment.advisorPostCommitTarget == target {
 			target.cleanupPending = true
 		}
-		p.cpuSetAdjustmentRetryMu.Unlock()
+		p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 		cleanupPending = true
 	}
 	if cleanupPending || applied {
@@ -1538,13 +1538,13 @@ func (p *DynamicPolicy) reconcileAdvisorPostCommitTarget(
 	adjustmentCtx := context.WithValue(ctx, advisorPostCommitTargetContextKey{}, target)
 	adjustmentErr := p.runCPUSetAdjustmentHandlers(adjustmentCtx, mode)
 	if headroomErr == nil && cgroupErr == nil && adjustmentErr == nil {
-		p.cpuSetAdjustmentRetryMu.Lock()
-		if p.advisorPostCommitTarget == target {
+		p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+		if p.adjustment.advisorPostCommitTarget == target {
 			target.applied = true
 			target.applyMarkerPending = true
 			p.recordAdvisorPostCommitProgressLocked(target, advisorPostCommitPhaseAppliedMarker)
 		}
-		p.cpuSetAdjustmentRetryMu.Unlock()
+		p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 		if err := p.persistAdvisorPostCommitApplied(target); err != nil {
 			return err
 		}
@@ -1579,9 +1579,9 @@ func (p *DynamicPolicy) advisorPostCommitTargetCurrent(target *advisorPostCommit
 func (p *DynamicPolicy) advisorPostCommitTargetStatus(
 	target *advisorPostCommitTarget,
 ) (bool, error) {
-	p.cpuSetAdjustmentRetryMu.Lock()
-	current := p.advisorPostCommitTarget
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	current := p.adjustment.advisorPostCommitTarget
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	if current != target || target == nil || p.state == nil {
 		return false, nil
 	}
@@ -1607,25 +1607,25 @@ func (p *DynamicPolicy) scheduleCPUSetAdjustmentPersistenceRetry() {
 }
 
 func (p *DynamicPolicy) markCPUSetAdjustmentPersistenceRequired() {
-	p.cpuSetAdjustmentRetryMu.Lock()
-	p.cpuSetAdjustmentRetryPersist = true
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.cpuSetAdjustmentRetryPersist = true
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 }
 
 func (p *DynamicPolicy) persistCPUSetAdjustmentStateIfNeeded() error {
-	p.cpuSetAdjustmentRetryMu.Lock()
-	pending := p.cpuSetAdjustmentRetryPersist
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	pending := p.adjustment.cpuSetAdjustmentRetryPersist
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	if !pending {
 		return nil
 	}
 	if err := p.state.StoreState(); err != nil {
 		return fmt.Errorf("persist restored CPU state: %w", err)
 	}
-	p.cpuSetAdjustmentRetryMu.Lock()
-	p.cpuSetAdjustmentRetryPersist = false
-	delete(p.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonPersistFailed)
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	p.adjustment.cpuSetAdjustmentRetryPersist = false
+	delete(p.adjustment.cpuSetAdjustmentRetryReasons, cpusetutil.RetryReasonPersistFailed)
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	return nil
 }
 
@@ -1654,45 +1654,45 @@ func (p *DynamicPolicy) retryLatestCPUSetAdjustment(
 }
 
 func (p *DynamicPolicy) markCPUSetAdjustmentDirty(reason cpusetutil.CPUSetAdjustmentRetryReason) {
-	p.cpuSetAdjustmentRetryMu.Lock()
-	defer p.cpuSetAdjustmentRetryMu.Unlock()
-	if p.cpuSetAdjustmentRetryStopping {
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	defer p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
+	if p.adjustment.cpuSetAdjustmentRetryStopping {
 		return
 	}
-	p.cpuSetAdjustmentRetryDirty = true
-	if p.cpuSetAdjustmentRetryReasons == nil {
-		p.cpuSetAdjustmentRetryReasons = make(map[cpusetutil.CPUSetAdjustmentRetryReason]struct{})
+	p.adjustment.cpuSetAdjustmentRetryDirty = true
+	if p.adjustment.cpuSetAdjustmentRetryReasons == nil {
+		p.adjustment.cpuSetAdjustmentRetryReasons = make(map[cpusetutil.CPUSetAdjustmentRetryReason]struct{})
 	}
-	p.cpuSetAdjustmentRetryReasons[reason] = struct{}{}
+	p.adjustment.cpuSetAdjustmentRetryReasons[reason] = struct{}{}
 }
 
 func (p *DynamicPolicy) scheduleCPUSetAdjustmentRetry(reason cpusetutil.CPUSetAdjustmentRetryReason) {
-	p.cpuSetAdjustmentRetryMu.Lock()
-	if p.cpuSetAdjustmentRetryStopping {
-		p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	if p.adjustment.cpuSetAdjustmentRetryStopping {
+		p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 		return
 	}
-	p.cpuSetAdjustmentRetryDirty = true
-	if p.cpuSetAdjustmentRetryReasons == nil {
-		p.cpuSetAdjustmentRetryReasons = make(map[cpusetutil.CPUSetAdjustmentRetryReason]struct{})
+	p.adjustment.cpuSetAdjustmentRetryDirty = true
+	if p.adjustment.cpuSetAdjustmentRetryReasons == nil {
+		p.adjustment.cpuSetAdjustmentRetryReasons = make(map[cpusetutil.CPUSetAdjustmentRetryReason]struct{})
 	}
-	p.cpuSetAdjustmentRetryReasons[reason] = struct{}{}
-	if p.cpuSetAdjustmentRetryQueued {
-		p.cpuSetAdjustmentRetryAgain = true
-		p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryReasons[reason] = struct{}{}
+	if p.adjustment.cpuSetAdjustmentRetryQueued {
+		p.adjustment.cpuSetAdjustmentRetryAgain = true
+		p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 		return
 	}
-	p.cpuSetAdjustmentRetryQueued = true
-	stopCh := p.cpuSetAdjustmentRetryStopCh
-	p.cpuSetAdjustmentRetryWG.Add(1)
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryQueued = true
+	stopCh := p.adjustment.cpuSetAdjustmentRetryStopCh
+	p.adjustment.cpuSetAdjustmentRetryWG.Add(1)
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	go func() {
-		defer p.cpuSetAdjustmentRetryWG.Done()
+		defer p.adjustment.cpuSetAdjustmentRetryWG.Done()
 		finishStopped := func() {
-			p.cpuSetAdjustmentRetryMu.Lock()
-			p.cpuSetAdjustmentRetryQueued = false
-			p.cpuSetAdjustmentRetryAgain = false
-			p.cpuSetAdjustmentRetryMu.Unlock()
+			p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+			p.adjustment.cpuSetAdjustmentRetryQueued = false
+			p.adjustment.cpuSetAdjustmentRetryAgain = false
+			p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 		}
 		attempt := 0
 		for {
@@ -1703,7 +1703,7 @@ func (p *DynamicPolicy) scheduleCPUSetAdjustmentRetry(reason cpusetutil.CPUSetAd
 			default:
 			}
 			p.Lock()
-			ctx, cancel := context.WithTimeout(context.Background(), cpuSetAdjustmentHandlerTimeout(p.conf))
+			ctx, cancel := context.WithTimeout(context.Background(), cpuSetAdjustmentHandlerTimeout(p.config.conf))
 			if stopCh != nil {
 				go func() {
 					select {
@@ -1721,19 +1721,19 @@ func (p *DynamicPolicy) scheduleCPUSetAdjustmentRetry(reason cpusetutil.CPUSetAd
 				general.Errorf("retry latest cpuset adjustment failed, reason=%s: %v", reason, err)
 			}
 
-			p.cpuSetAdjustmentRetryMu.Lock()
-			if p.cpuSetAdjustmentRetryStopping {
-				p.cpuSetAdjustmentRetryQueued = false
-				p.cpuSetAdjustmentRetryAgain = false
-				p.cpuSetAdjustmentRetryMu.Unlock()
+			p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+			if p.adjustment.cpuSetAdjustmentRetryStopping {
+				p.adjustment.cpuSetAdjustmentRetryQueued = false
+				p.adjustment.cpuSetAdjustmentRetryAgain = false
+				p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 				return
 			}
-			retryAgain := p.cpuSetAdjustmentRetryAgain
+			retryAgain := p.adjustment.cpuSetAdjustmentRetryAgain
 			if retryAgain {
-				p.cpuSetAdjustmentRetryAgain = false
+				p.adjustment.cpuSetAdjustmentRetryAgain = false
 			}
 			if (err != nil || retryAgain) && attempt < cpuSetAdjustmentRetryMaxAttempts {
-				p.cpuSetAdjustmentRetryMu.Unlock()
+				p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 				timer := time.NewTimer(cpuSetAdjustmentRetryBackoff(attempt))
 				select {
 				case <-timer.C:
@@ -1746,52 +1746,52 @@ func (p *DynamicPolicy) scheduleCPUSetAdjustmentRetry(reason cpusetutil.CPUSetAd
 				}
 				continue
 			}
-			if err == nil && !retryAgain && p.advisorPostCommitTarget == nil && !p.cpuSetAdjustmentRetryPersist {
-				p.cpuSetAdjustmentRetryDirty = false
-				p.cpuSetAdjustmentRetryReasons = nil
+			if err == nil && !retryAgain && p.adjustment.advisorPostCommitTarget == nil && !p.adjustment.cpuSetAdjustmentRetryPersist {
+				p.adjustment.cpuSetAdjustmentRetryDirty = false
+				p.adjustment.cpuSetAdjustmentRetryReasons = nil
 			} else {
-				p.cpuSetAdjustmentRetryDirty = true
+				p.adjustment.cpuSetAdjustmentRetryDirty = true
 			}
-			p.cpuSetAdjustmentRetryQueued = false
-			p.cpuSetAdjustmentRetryMu.Unlock()
+			p.adjustment.cpuSetAdjustmentRetryQueued = false
+			p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 			return
 		}
 	}()
 }
 
 func (p *DynamicPolicy) handleCgroupCreateEvent() {
-	p.cpuSetAdjustmentRetryMu.Lock()
-	_, deferredLeaf := p.cpuSetAdjustmentRetryReasons[cpusetutil.RetryReasonDeferredLeaf]
-	shouldRetry := p.cpuSetAdjustmentRetryDirty && deferredLeaf
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	_, deferredLeaf := p.adjustment.cpuSetAdjustmentRetryReasons[cpusetutil.RetryReasonDeferredLeaf]
+	shouldRetry := p.adjustment.cpuSetAdjustmentRetryDirty && deferredLeaf
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	if shouldRetry {
 		p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonDeferredLeaf)
 	}
 }
 
 func (p *DynamicPolicy) reconcileDirtyCPUSetAdjustment() error {
-	p.cpuSetAdjustmentRetryMu.Lock()
-	dirty := p.cpuSetAdjustmentRetryDirty && !p.cpuSetAdjustmentRetryQueued
-	p.cpuSetAdjustmentRetryMu.Unlock()
+	p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+	dirty := p.adjustment.cpuSetAdjustmentRetryDirty && !p.adjustment.cpuSetAdjustmentRetryQueued
+	p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	if !dirty {
 		return nil
 	}
 
 	p.Lock()
-	ctx, cancel := context.WithTimeout(context.Background(), cpuSetAdjustmentHandlerTimeout(p.conf))
+	ctx, cancel := context.WithTimeout(context.Background(), cpuSetAdjustmentHandlerTimeout(p.config.conf))
 	err := p.retryLatestCPUSetAdjustment(ctx, cpusetutil.CPUSetAdjustmentModePeriodic)
 	cancel()
 	p.Unlock()
 	if err != nil {
 		general.Errorf("periodic latest-state cpuset adjustment reconcile failed: %v", err)
 	} else {
-		p.cpuSetAdjustmentRetryMu.Lock()
-		if p.advisorPostCommitTarget == nil && !p.cpuSetAdjustmentRetryPersist &&
-			!p.cpuSetAdjustmentRetryQueued && !p.cpuSetAdjustmentRetryAgain {
-			p.cpuSetAdjustmentRetryDirty = false
-			p.cpuSetAdjustmentRetryReasons = nil
+		p.adjustment.cpuSetAdjustmentRetryMu.Lock()
+		if p.adjustment.advisorPostCommitTarget == nil && !p.adjustment.cpuSetAdjustmentRetryPersist &&
+			!p.adjustment.cpuSetAdjustmentRetryQueued && !p.adjustment.cpuSetAdjustmentRetryAgain {
+			p.adjustment.cpuSetAdjustmentRetryDirty = false
+			p.adjustment.cpuSetAdjustmentRetryReasons = nil
 		}
-		p.cpuSetAdjustmentRetryMu.Unlock()
+		p.adjustment.cpuSetAdjustmentRetryMu.Unlock()
 	}
 	return err
 }
@@ -1804,8 +1804,8 @@ func (p *DynamicPolicy) runBulkheadPeriodicalHandlers(
 	metaServer *metaserver.MetaServer,
 ) {
 	reconcileErr := p.reconcileDirtyCPUSetAdjustment()
-	if p.bulkheadManager != nil {
-		p.bulkheadManager.RunPeriodicalHandlers(coreConf, extraConf, dynamicConf, emitter, metaServer)
+	if p.bulkhead.bulkheadManager != nil {
+		p.bulkhead.bulkheadManager.RunPeriodicalHandlers(coreConf, extraConf, dynamicConf, emitter, metaServer)
 	}
 	if reconcileErr != nil {
 		_ = general.UpdateHealthzStateByError(cpuconsts.SyncBulkhead, reconcileErr)

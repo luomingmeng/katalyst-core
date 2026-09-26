@@ -94,7 +94,7 @@ func (p *DynamicPolicy) emitFinalPoolSizeMetrics(entries state.PodEntries) {
 }
 
 func (p *DynamicPolicy) emitPoolSizeMetric(poolName, formattedPoolName string, numaID, size int) {
-	_ = p.emitter.StoreInt64(util.MetricNamePoolSize, int64(size),
+	_ = p.emitter.emitter.StoreInt64(util.MetricNamePoolSize, int64(size),
 		metrics.MetricTypeNameRaw,
 		metrics.MetricTag{Key: "poolName", Val: poolName},
 		metrics.MetricTag{Key: "pool_type", Val: commonstate.GetPoolType(poolName)},

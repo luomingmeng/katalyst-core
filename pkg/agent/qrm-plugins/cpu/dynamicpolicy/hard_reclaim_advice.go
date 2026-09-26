@@ -346,11 +346,11 @@ const (
 // (decision), how the steady real-NUMA normalization decided each NUMA.
 // Per-NUMA / per-block detail stays in structured logs.
 func (p *DynamicPolicy) emitSteadyReclaimNormalizeMetrics(report steadyReclaimNormalizeReport) {
-	if p == nil || p.emitter == nil {
+	if p == nil || p.emitter.emitter == nil {
 		return
 	}
 	for _, record := range report.Records {
-		_ = p.emitter.StoreInt64(metricNameSteadyReclaimNormalizeDecision, 1,
+		_ = p.emitter.emitter.StoreInt64(metricNameSteadyReclaimNormalizeDecision, 1,
 			metrics.MetricTypeNameCount,
 			metrics.MetricTag{Key: "decision", Val: string(record.Decision)})
 	}
@@ -359,10 +359,10 @@ func (p *DynamicPolicy) emitSteadyReclaimNormalizeMetrics(report steadyReclaimNo
 // emitSteadyReclaimPlanOutcome records the typed planning outcome of the steady
 // real-NUMA path, using the existing hardReclaimSelectionError reason vocabulary.
 func (p *DynamicPolicy) emitSteadyReclaimPlanOutcome(reason hardReclaimSelectionFailureReason) {
-	if p == nil || p.emitter == nil || reason == "" {
+	if p == nil || p.emitter.emitter == nil || reason == "" {
 		return
 	}
-	_ = p.emitter.StoreInt64(metricNameSteadyReclaimPlanOutcome, 1,
+	_ = p.emitter.emitter.StoreInt64(metricNameSteadyReclaimPlanOutcome, 1,
 		metrics.MetricTypeNameCount,
 		metrics.MetricTag{Key: "outcome", Val: string(reason)})
 }

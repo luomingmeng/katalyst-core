@@ -65,9 +65,7 @@ func TestServeForAdvisorStopsWithoutGoroutineLeak(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	sock := filepath.Join(dir, "cpu-plugin.sock")
-	p := &DynamicPolicy{
-		cpuPluginSocketAbsPath: sock,
-	}
+	p := &DynamicPolicy{config: configComponent{cpuPluginSocketAbsPath: sock}}
 	stopCh := make(chan struct{})
 
 	serveDone := make(chan struct{})

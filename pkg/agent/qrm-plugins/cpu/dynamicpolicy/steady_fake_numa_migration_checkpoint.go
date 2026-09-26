@@ -204,13 +204,13 @@ func (p *DynamicPolicy) restoreSteadyFakeNUMAMigrationTarget() error {
 	if target.Size() != len(checkpoint.TargetCPUs) {
 		return fmt.Errorf("checkpoint target contains duplicate CPUs")
 	}
-	if p.machineInfo == nil || p.machineInfo.CPUTopology == nil {
+	if p.machine.machineInfo == nil || p.machine.machineInfo.CPUTopology == nil {
 		return fmt.Errorf("checkpoint validation requires CPU topology")
 	}
-	if outside := target.Difference(p.machineInfo.CPUTopology.CPUDetails.CPUs()); !outside.IsEmpty() {
+	if outside := target.Difference(p.machine.machineInfo.CPUTopology.CPUDetails.CPUs()); !outside.IsEmpty() {
 		return fmt.Errorf("checkpoint target contains CPUs outside topology: %s", outside.String())
 	}
-	if err := assertCoreAligned(target, p.machineInfo.CPUTopology); err != nil {
+	if err := assertCoreAligned(target, p.machine.machineInfo.CPUTopology); err != nil {
 		return fmt.Errorf("checkpoint target is not core aligned: %w", err)
 	}
 	p.steadyFakeNUMAMigrationTarget = &steadyFakeNUMAMigrationTarget{
@@ -287,11 +287,11 @@ func (p *DynamicPolicy) planSteadyFakeNUMAStageWithCheckpoint(
 	keep := steadyFakeNUMAMigrationCheckpointTransition{
 		kind: steadyFakeNUMAMigrationCheckpointKeep,
 	}
-	if p.machineInfo == nil || p.machineInfo.CPUTopology == nil {
+	if p.machine.machineInfo == nil || p.machine.machineInfo.CPUTopology == nil {
 		return nil, keep, fmt.Errorf(
 			"cannot project durable steady fake-NUMA migration without topology")
 	}
-	topology := p.machineInfo.CPUTopology
+	topology := p.machine.machineInfo.CPUTopology
 	digest, err := steadyFakeNUMAConstraintDigest(demands, fakeKeys, floors, topology)
 	if err != nil {
 		return nil, keep, err

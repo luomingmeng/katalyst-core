@@ -170,7 +170,7 @@ func (p *DynamicPolicy) allocateAdvisorSourceBlocksForCarve(
 
 		combinedResult := sourceResult + isolationQuantity
 		currentAvailableCPUs := availableCPUs.Difference(globalNonReclaimableCPUSet)
-		cpuset, _, err := calculator.TakeByNUMABalance(p.machineInfo, currentAvailableCPUs, combinedResult)
+		cpuset, _, err := calculator.TakeByNUMABalance(p.machine.machineInfo, currentAvailableCPUs, combinedResult)
 		if err != nil {
 			return fmt.Errorf("allocate source block: %s with combined req: %d failed with error: %v",
 				block.BlockId, combinedResult, err)
@@ -227,7 +227,7 @@ func (p *DynamicPolicy) tryCarveAdvisorBlockFromSource(
 
 	sourceCandidate := sourceCPUSet
 	if numaID != commonstate.FakedNUMAID {
-		sourceCandidate = sourceCandidate.Intersection(p.machineInfo.CPUDetails.CPUsInNUMANodes(numaID))
+		sourceCandidate = sourceCandidate.Intersection(p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(numaID))
 	}
 	if sourceResult, ok := sourceBlockResultByID[sourceBlockID]; ok {
 		sourceSurplusSize := sourceCPUSet.Size() - sourceResult
@@ -235,7 +235,7 @@ func (p *DynamicPolicy) tryCarveAdvisorBlockFromSource(
 			sourceCandidate = machine.NewCPUSet()
 		} else if sourceCandidate.Size() > sourceSurplusSize {
 			var err error
-			sourceCandidate, err = calculator.TakeByTopology(p.machineInfo, sourceCandidate, sourceSurplusSize, true)
+			sourceCandidate, err = calculator.TakeByTopology(p.machine.machineInfo, sourceCandidate, sourceSurplusSize, true)
 			if err != nil {
 				return false, fmt.Errorf("reserve source block: %s result: %d failed with error: %v",
 					sourceBlockID, sourceResult, err)
@@ -282,8 +282,8 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocksWithCheckpointTransition(
 	checkpointTransition *steadyFakeNUMAMigrationCheckpointTransition,
 ) (advisorapi.BlockCPUSet, error) {
 	var dynamicConf *dynamicconfig.Configuration
-	if p != nil && p.conf != nil {
-		dynamicConf = p.conf.GetDynamicConfiguration()
+	if p != nil && p.config.conf != nil {
+		dynamicConf = p.config.conf.GetDynamicConfiguration()
 	}
 	return p.planDisjointAdvisorBlocksWithCheckpointTransitionAndDynamicConfig(
 		resp, hardActive, checkpointTransition, dynamicConf)
@@ -295,7 +295,7 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocksWithCheckpointTransitionAndDyna
 	checkpointTransition *steadyFakeNUMAMigrationCheckpointTransition,
 	dynamicConf *dynamicconfig.Configuration,
 ) (advisorapi.BlockCPUSet, error) {
-	topology := p.machineInfo.CPUTopology
+	topology := p.machine.machineInfo.CPUTopology
 	allCPUs := topology.CPUDetails.CPUs()
 	machineState := p.state.GetMachineState()
 	rpPinnedCPUSet := machineState.GetResourcePackagePinnedCPUSet()
@@ -460,7 +460,7 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhaseWithCheckpointTransition(
 	hardActive bool,
 	checkpointTransition *steadyFakeNUMAMigrationCheckpointTransition,
 ) (machine.CPUSet, error) {
-	skipNUMAs := p.state.GetPodEntries().SteadyExclusiveNUMAs(p.machineInfo.CPUTopology)
+	skipNUMAs := p.state.GetPodEntries().SteadyExclusiveNUMAs(p.machine.machineInfo.CPUTopology)
 	return p.solveAdvisorDescriptorPhaseWithCheckpointTransitionAndSkipNUMAs(
 		descriptors, available, result, preserveClass, hardActive, checkpointTransition, skipNUMAs)
 }
@@ -498,7 +498,7 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhaseWithCheckpointTransitionAndSk
 		)
 		if expandHardReclaimPhase {
 			expanded, expandedBlockIDs, err = expandHardPartitionReclaimPhase(
-				descriptors, available, p.machineInfo.CPUTopology, skipNUMAs)
+				descriptors, available, p.machine.machineInfo.CPUTopology, skipNUMAs)
 		} else {
 			committedSnapshot, err = buildSteadyFakeNUMACommittedSnapshot(
 				descriptors, available)
@@ -506,7 +506,7 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhaseWithCheckpointTransitionAndSk
 				return available, fmt.Errorf("build committed blocks: %w", err)
 			}
 			expanded, expandedBlockIDs, coreFloors, err = expandSteadyFakeNUMAReclaimPhase(
-				descriptors, available, p.machineInfo.CPUTopology, skipNUMAs)
+				descriptors, available, p.machine.machineInfo.CPUTopology, skipNUMAs)
 		}
 		if err != nil {
 			return available, fmt.Errorf("expand reclaim phase: %w", err)
@@ -570,7 +570,7 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhaseWithCheckpointTransitionAndSk
 		blockIDByDemandKey[demandKey] = descriptor.BlockID
 	}
 	if expandHardReclaimPhase {
-		pinnedDemands, err := pinHardReclaimPartitionDemands(demands, available, p.machineInfo.CPUTopology, false)
+		pinnedDemands, err := pinHardReclaimPartitionDemands(demands, available, p.machine.machineInfo.CPUTopology, false)
 		if err != nil {
 			return available, fmt.Errorf("plan hard reclaim partition: %w", err)
 		}
@@ -578,7 +578,7 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhaseWithCheckpointTransitionAndSk
 	} else if preserveClass && !expandSteadyReclaimPhase {
 		// Steady real-NUMA path owns the committed whole-core fallback; the
 		// ramp-up/hard path above deliberately keeps its original semantics.
-		pinnedDemands, err := pinHardReclaimPartitionDemands(demands, available, p.machineInfo.CPUTopology, true)
+		pinnedDemands, err := pinHardReclaimPartitionDemands(demands, available, p.machine.machineInfo.CPUTopology, true)
 		if err != nil {
 			p.emitSteadyReclaimPlanOutcome(classifySteadyReclaimFailureReason(err))
 			return available, fmt.Errorf("plan steady real-NUMA reclaim partition: %w", err)
@@ -593,7 +593,7 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhaseWithCheckpointTransitionAndSk
 			steadyFakeDemandKeys,
 			committedSnapshot,
 			coreFloors,
-			p.machineInfo.CPUTopology,
+			p.machine.machineInfo.CPUTopology,
 			func(
 				demands []partitionDemand,
 				fakeKeys []string,
@@ -612,9 +612,9 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhaseWithCheckpointTransitionAndSk
 		)
 	} else if len(coreFloors) > 0 {
 		assignments, solveErr = solveDisjointPartitionsWithCoreFloors(
-			demands, coreFloors, p.machineInfo.CPUTopology)
+			demands, coreFloors, p.machine.machineInfo.CPUTopology)
 	} else {
-		assignments, solveErr = solveDisjointPartitions(demands, p.machineInfo.CPUTopology)
+		assignments, solveErr = solveDisjointPartitions(demands, p.machine.machineInfo.CPUTopology)
 	}
 	if solveErr != nil {
 		return available, solveErr
@@ -929,7 +929,7 @@ func validateAdvisorDescriptorPlan(
 // targetDrivenHardReclaimEnabled gates target-driven reclaim on three
 // runtime-config conditions; any one disabled means full legacy behaviour.
 func (p *DynamicPolicy) targetDrivenHardReclaimEnabled() bool {
-	dyn := p.dynamicConfig.GetDynamicConfiguration()
+	dyn := p.config.dynamicConfig.GetDynamicConfiguration()
 	return dyn != nil && dyn.EnableReclaim && dyn.EnableRampUpReclaimHardPartition &&
 		p.state.GetDisableDedicatedCoresOverlapReclaimedCores()
 }

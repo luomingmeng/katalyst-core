@@ -76,7 +76,7 @@ func TestAllocateFakeNUMANormalShareBlocks_ReusesOwnPoolCPUSet(t *testing.T) {
 			"seedpool-test": {EntryName: "seedpool-test"},
 		},
 	}
-	all := p.machineInfo.CPUDetails.CPUs()
+	all := p.machine.machineInfo.CPUDetails.CPUs()
 	blockCPUSet := advisorapi.BlockCPUSet{}
 	err := p.allocateFakeNUMANormalShareBlocks(
 		[]*advisorapi.BlockInfo{block},
@@ -176,7 +176,7 @@ func TestGenerateLegacyBlockCPUSet_HardPartitionBalancesFakeReclaim(t *testing.T
 			require.Equal(t, int(tc.quantity), reclaim.Size())
 			for numaID, want := range tc.wantPerNUMA {
 				require.Equal(t, want, reclaim.Intersection(
-					policy.machineInfo.CPUDetails.CPUsInNUMANodes(numaID)).Size())
+					policy.machine.machineInfo.CPUDetails.CPUsInNUMANodes(numaID)).Size())
 			}
 		})
 	}
@@ -198,8 +198,8 @@ func TestGenerateLegacyBlockCPUSet_HardPartitionRebalancesPreviousFakeReclaim(t 
 	blockCPUSet, err := policy.generateBlockCPUSet(legacyFakeReclaimResponse(4, false), nil, true)
 	require.NoError(t, err)
 	reclaim := blockCPUSet["reclaim"]
-	require.Equal(t, 2, reclaim.Intersection(policy.machineInfo.CPUDetails.CPUsInNUMANodes(0)).Size())
-	require.Equal(t, 2, reclaim.Intersection(policy.machineInfo.CPUDetails.CPUsInNUMANodes(1)).Size())
+	require.Equal(t, 2, reclaim.Intersection(policy.machine.machineInfo.CPUDetails.CPUsInNUMANodes(0)).Size())
+	require.Equal(t, 2, reclaim.Intersection(policy.machine.machineInfo.CPUDetails.CPUsInNUMANodes(1)).Size())
 }
 
 func TestGenerateLegacyBlockCPUSet_HardPartitionReservesBeforeNormalShare(t *testing.T) {
@@ -257,7 +257,7 @@ func TestGenerateLegacyBlockCPUSet_HardPartitionDisabledKeepsLegacyPlacement(t *
 	t.Parallel()
 
 	policy := newLegacyHardPartitionTestPolicy(t)
-	policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = false
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = false
 	previous := machine.NewCPUSet(0, 1, 2, 3)
 	policy.state.SetPodEntries(state.PodEntries{
 		commonstate.PoolNameReclaim: {
@@ -280,8 +280,8 @@ func newLegacyHardPartitionTestPolicy(t *testing.T) *DynamicPolicy {
 	require.NoError(t, err)
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 	require.NoError(t, err)
-	policy.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
-	policy.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
 	return policy
 }
 
