@@ -122,23 +122,20 @@ func newTestDynamicPolicy(t *testing.T, name string) *DynamicPolicy {
 	return policyImpl
 }
 
-var registerRelativeCgroupPathHandlerOnce sync.Once
-
-func registerRelativeCgroupPathHandler(podUID string) {
-	registerRelativeCgroupPathHandlerOnce.Do(func() {
-		cgroupcommon.RegisterRelativeCgroupPathHandler(cgroupcommon.RelativeCgroupPathHandler{
-			Name: "unit_test",
-			Handler: func(pUID, containerID string) (string, bool, error) {
-				if pUID != podUID {
-					return "", false, fmt.Errorf("pod uid mismatch")
-				}
-				if containerID != "cid0" && containerID != "cid1" {
-					return "", false, fmt.Errorf("container id mismatch")
-				}
-				return fmt.Sprintf("/unit-test/%s/%s", pUID, containerID), false, nil
-			},
-		})
-	})
+func registerRelativeCgroupPathHandler(t *testing.T, podUID string) {
+	t.Helper()
+	t.Cleanup(cgroupcommon.RegisterRelativeCgroupPathHandlerWithUnregister(cgroupcommon.RelativeCgroupPathHandler{
+		Name: "unit_test",
+		Handler: func(pUID, containerID string) (string, bool, error) {
+			if pUID != podUID {
+				return "", true, nil
+			}
+			if containerID != "cid0" && containerID != "cid1" {
+				return "", false, fmt.Errorf("container id mismatch")
+			}
+			return fmt.Sprintf("/unit-test/%s/%s", pUID, containerID), false, nil
+		},
+	}))
 }
 
 func TestDynamicPolicy_SetIRQTuner(t *testing.T) {
@@ -160,7 +157,7 @@ func TestDynamicPolicy_getPodContainerInfos(t *testing.T) {
 	policyImpl := newTestDynamicPolicy(t, "get-pod-container-infos")
 
 	podUID := "test-pod-uid"
-	registerRelativeCgroupPathHandler(podUID)
+	registerRelativeCgroupPathHandler(t, podUID)
 
 	runtimeClassName := "kata"
 	startedAt := metav1.NewTime(time.Now())
@@ -269,7 +266,7 @@ func TestDynamicPolicy_ListContainers(t *testing.T) {
 	policyImpl := newTestDynamicPolicy(t, "list-containers")
 
 	podUID := "test-pod-uid"
-	registerRelativeCgroupPathHandler(podUID)
+	registerRelativeCgroupPathHandler(t, podUID)
 
 	pod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{

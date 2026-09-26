@@ -57,6 +57,11 @@ type advisorBlockDescriptor struct {
 	Eligible     machine.CPUSet
 	Committed    machine.CPUSet
 	OldPreferred machine.CPUSet
+
+	// target-driven reclaim provenance (zero until the source-pool config gate enables it).
+	TargetDriven bool
+	SourceTarget int
+	ReclaimQuota int
 }
 
 type advisorBlockDescriptorBuilder struct {
@@ -155,6 +160,10 @@ func buildAdvisorBlockDescriptors(
 								Quantity:     quantity,
 								Eligible:     ownerEligible.Clone(),
 								OldPreferred: machine.NewCPUSet(),
+								// provenance gating happens at the source pool based on runtime config.
+								TargetDriven: false,
+								SourceTarget: 0,
+								ReclaimQuota: 0,
 							},
 							ownerSeen: make(map[string]struct{}),
 						}

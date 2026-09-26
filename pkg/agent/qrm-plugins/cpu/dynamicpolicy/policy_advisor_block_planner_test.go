@@ -482,6 +482,7 @@ func TestGenerateBlockCPUSetNormalizesRealMandatoryReclaimToWholeCore(t *testing
 	blocks, err := p.generateBlockCPUSet(resp, featureGates, true)
 
 	require.NoError(t, err)
+	// The hard/ramp-up whole-core normalization borrows upward to a complete core.
 	require.Equal(t, 20, blocks["dedicated-0"].Size())
 	require.Equal(t, 4, blocks["reclaim-0"].Size())
 	require.True(t, blocks["dedicated-0"].Intersection(blocks["reclaim-0"]).IsEmpty())
@@ -572,8 +573,11 @@ func TestGenerateBlockCPUSetSteadyNormalizesRealMandatoryReclaimToWholeCore(t *t
 	blocks, err := p.generateBlockCPUSet(resp, featureGates, false)
 
 	require.NoError(t, err)
-	require.Equal(t, 20, blocks["dedicated-0"].Size())
-	require.Equal(t, 4, blocks["reclaim-0"].Size())
+	// The steady real-NUMA path whole-core normalizes the odd advice (3) to the
+	// committed-anchored lower value (2) rather than borrowing a dedicated core
+	// upward to 4; the released CPU returns to dedicated (21 -> 22).
+	require.Equal(t, 22, blocks["dedicated-0"].Size())
+	require.Equal(t, 2, blocks["reclaim-0"].Size())
 	require.True(t, blocks["dedicated-0"].Intersection(blocks["reclaim-0"]).IsEmpty())
 }
 

@@ -98,6 +98,218 @@ func (e *requestStateOwnershipLostError) OwnershipLost() bool {
 	return true
 }
 
+type dnbAllocationFailureError struct {
+	adjustment error
+	rollback   error
+	persist    error
+	restore    error
+}
+
+const (
+	dnbErrorTraversalMaxVisits = 4096
+)
+
+type dnbErrorTraversalNode struct {
+	err error
+}
+
+type dnbErrorVisitKey struct {
+	typ reflect.Type
+	ptr uintptr
+}
+
+func newDNBAllocationFailureError(adjustment, rollback, persist, restore error) error {
+	return &dnbAllocationFailureError{
+		adjustment: adjustment,
+		rollback:   rollback,
+		persist:    persist,
+		restore:    restore,
+	}
+}
+
+func (e *dnbAllocationFailureError) Error() string {
+	return fmt.Sprintf("apply DNB allocation and reclaim floor failed: %v; state rollback error: %v; "+
+		"state persistence error: %v; machine restore error: %v",
+		e.adjustment, e.rollback, e.persist, e.restore)
+}
+
+func (e *dnbAllocationFailureError) Is(target error) bool {
+	return e.walkCauses(func(cause error) bool {
+		if safelyEqualErrors(cause, target) {
+			return true
+		}
+		if _, nested := cause.(*dnbAllocationFailureError); nested {
+			return false
+		}
+		if matcher, ok := cause.(interface{ Is(error) bool }); ok {
+			return safelyCallErrorPredicate(func() bool {
+				return matcher.Is(target)
+			})
+		}
+		return false
+	})
+}
+
+func (e *dnbAllocationFailureError) As(target interface{}) bool {
+	targetValue := reflect.ValueOf(target)
+	if !targetValue.IsValid() || targetValue.Kind() != reflect.Ptr || targetValue.IsNil() {
+		return false
+	}
+	targetType := targetValue.Elem().Type()
+
+	return e.walkCauses(func(cause error) bool {
+		causeValue := reflect.ValueOf(cause)
+		if causeValue.IsValid() && causeValue.Type().AssignableTo(targetType) {
+			return safelyCallErrorPredicate(func() bool {
+				targetValue.Elem().Set(causeValue)
+				return true
+			})
+		}
+		if _, nested := cause.(*dnbAllocationFailureError); nested {
+			return false
+		}
+		if matcher, ok := cause.(interface{ As(interface{}) bool }); ok {
+			return safelyCallErrorPredicate(func() bool {
+				return matcher.As(target)
+			})
+		}
+		return false
+	})
+}
+
+func (e *dnbAllocationFailureError) causes() [4]error {
+	return [4]error{e.adjustment, e.rollback, e.persist, e.restore}
+}
+
+func (e *dnbAllocationFailureError) walkCauses(matches func(error) bool) bool {
+	// Error methods are synchronous Go contracts: custom Is, As, and Unwrap
+	// implementations must return to their caller. This traversal bounds work
+	// between such calls with a global visit budget and detects identifiable
+	// cycles; it deliberately does not start timeout goroutines that could leak
+	// when a broken custom method never returns.
+	causes := e.causes()
+	stack := make([]dnbErrorTraversalNode, 0, len(causes))
+	for i := len(causes) - 1; i >= 0; i-- {
+		stack = append(stack, dnbErrorTraversalNode{err: causes[i]})
+	}
+	visited := make(map[dnbErrorVisitKey]struct{})
+	visits := 0
+
+	for len(stack) > 0 {
+		if visits >= dnbErrorTraversalMaxVisits {
+			return false
+		}
+		node := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		visits++
+		if isNilError(node.err) {
+			continue
+		}
+		if key, ok := dnbErrorIdentity(node.err); ok {
+			if _, found := visited[key]; found {
+				continue
+			}
+			visited[key] = struct{}{}
+		}
+		if matches(node.err) {
+			return true
+		}
+
+		if nested, ok := node.err.(*dnbAllocationFailureError); ok && nested != nil {
+			nestedCauses := nested.causes()
+			stack = appendDNBErrorTraversalChildren(
+				stack, nestedCauses[:], dnbErrorTraversalMaxVisits-visits)
+			continue
+		}
+		unwrapped := safelyUnwrapErrors(node.err)
+		stack = appendDNBErrorTraversalChildren(
+			stack, unwrapped, dnbErrorTraversalMaxVisits-visits)
+	}
+	return false
+}
+
+func appendDNBErrorTraversalChildren(
+	stack []dnbErrorTraversalNode,
+	children []error,
+	remainingVisits int,
+) []dnbErrorTraversalNode {
+	available := remainingVisits - len(stack)
+	if available <= 0 {
+		return stack
+	}
+	if len(children) > available {
+		children = children[:available]
+	}
+	for i := len(children) - 1; i >= 0; i-- {
+		stack = append(stack, dnbErrorTraversalNode{err: children[i]})
+	}
+	return stack
+}
+
+func isNilError(err error) bool {
+	if err == nil {
+		return true
+	}
+	value := reflect.ValueOf(err)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+func dnbErrorIdentity(err error) (key dnbErrorVisitKey, ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+
+	value := reflect.ValueOf(err)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Map, reflect.Ptr, reflect.UnsafePointer:
+		return dnbErrorVisitKey{typ: value.Type(), ptr: value.Pointer()}, true
+	default:
+		return dnbErrorVisitKey{}, false
+	}
+}
+
+func safelyEqualErrors(left, right error) (equal bool) {
+	defer func() {
+		if recover() != nil {
+			equal = false
+		}
+	}()
+	return left == right
+}
+
+func safelyCallErrorPredicate(predicate func() bool) (matched bool) {
+	defer func() {
+		if recover() != nil {
+			matched = false
+		}
+	}()
+	return predicate()
+}
+
+func safelyUnwrapErrors(err error) (causes []error) {
+	defer func() {
+		if recover() != nil {
+			causes = nil
+		}
+	}()
+
+	switch unwrapper := err.(type) {
+	case interface{ Unwrap() []error }:
+		return unwrapper.Unwrap()
+	case interface{ Unwrap() error }:
+		return []error{unwrapper.Unwrap()}
+	default:
+		return nil
+	}
+}
+
 func (p *DynamicPolicy) sharedCoresAllocationHandler(ctx context.Context,
 	req *pluginapi.ResourceRequest,
 	persistCheckpoint bool,
@@ -147,7 +359,17 @@ func (p *DynamicPolicy) sharedCoresWithoutNUMABindingAllocationHandler(ctx conte
 		return nil, fmt.Errorf("GetTopologyAwareAssignmentsByCPUSet failed with error: %v", err)
 	}
 	excludeRampUpReclaimFloor := func() error {
-		rampUpReclaimFloor, err := p.deriveRampUpReclaimFloor(machineState, podEntries, true)
+		// The entering shared_cores ramp-up is non-NUMA-binding, so it belongs
+		// to the global reclaim domain. Resolve it explicitly so the floor is
+		// scoped to the domains this admission actually activates.
+		enteringDomains, err := p.rampUpDomainForAllocation(&state.AllocationInfo{
+			AllocationMeta: commonstate.GenerateGenericContainerAllocationMeta(
+				req, commonstate.EmptyOwnerPoolName, apiconsts.PodAnnotationQoSLevelSharedCores),
+		})
+		if err != nil {
+			return fmt.Errorf("resolve entering shared_cores ramp-up domains failed: %w", err)
+		}
+		rampUpReclaimFloor, err := p.deriveRampUpReclaimFloor(machineState, podEntries, enteringDomains)
 		if err != nil {
 			return fmt.Errorf("derive reclaim floor for shared_cores ramp-up failed: %w", err)
 		}
@@ -762,7 +984,7 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 		disableDedicated: p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
 		persist:          persistCheckpoint,
 		source:           "DNB admission",
-		validate:         p.validatePendingAdvisorPartitionView,
+		validate:         p.validatePendingAdvisorPartitionViewWithRampUpExclusion,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("prepare DNB allocation and reclaim floor atomically failed: %w", err)
@@ -804,15 +1026,12 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 		}
 		var ownershipLost *requestStateOwnershipLostError
 		if errors.As(rollbackErr, &ownershipLost) {
+			p.markCPUSetAdjustmentPersistenceRequired()
 			p.scheduleCPUSetAdjustmentRetry(dynamicpolicyutil.RetryReasonOwnershipLost)
-			err := fmt.Errorf("apply DNB allocation and reclaim floor failed: %v; state rollback error: %w; "+
-				"state persistence error: %v; machine restore error: %v",
-				adjustErr, rollbackErr, persistErr, restoreErr)
+			err := newDNBAllocationFailureError(adjustErr, rollbackErr, persistErr, restoreErr)
 			return nil, &requestStateCompensatedError{err: err}
 		}
-		err := fmt.Errorf("apply DNB allocation and reclaim floor failed: %v; state rollback error: %v; "+
-			"state persistence error: %v; machine restore error: %v",
-			adjustErr, rollbackErr, persistErr, restoreErr)
+		err := newDNBAllocationFailureError(adjustErr, rollbackErr, persistErr, restoreErr)
 		if stateRolledBack || rollbackErr == nil {
 			return nil, &requestStateCompensatedError{err: err}
 		}
@@ -912,7 +1131,7 @@ func (p *DynamicPolicy) rollbackFailedDNBAllocation(
 		disableDedicated: p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
 		persist:          false,
 		source:           "DNB rollback",
-		validate:         p.validatePendingAdvisorPartitionView,
+		validate:         p.validatePendingAdvisorPartitionViewWithRampUpExclusion,
 	})
 	if err != nil {
 		return false, err, nil
@@ -1183,7 +1402,15 @@ func (p *DynamicPolicy) allocateNumaBindingCPUsWithEligibilityAndPreference(numC
 	if coverExclusivePartition && !podReclaimEnabled {
 		hardReclaimCPUs, err = p.deriveSteadyReclaimFloor(reclaimEligiblePerNUMA)
 	} else {
-		hardReclaimCPUs, err = p.deriveRampUpReclaimFloor(machineState, p.state.GetPodEntries(), true)
+		// The entering NUMA-binding request contributes its own reclaim domain
+		// (the NUMA(s) it is placed on); the rest of the floor comes from the
+		// ramp-up domains already recorded in the state entries.
+		enteringDomains, dErr := enteringNUMABindingRampUpDomains(reqAnnotations, hintNodes, p.machineInfo.CPUTopology)
+		if dErr != nil {
+			return machine.NewCPUSet(), machine.NewCPUSet(), nil,
+				fmt.Errorf("resolve entering numa-binding ramp-up domains failed: %w", dErr)
+		}
+		hardReclaimCPUs, err = p.deriveRampUpReclaimFloor(machineState, p.state.GetPodEntries(), enteringDomains)
 	}
 	if err != nil {
 		return machine.NewCPUSet(), machine.NewCPUSet(), nil, fmt.Errorf("derive node-level reclaim floor failed: %w", err)
@@ -1994,8 +2221,14 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloorForModeAtRev
 	hardPartitionEnabled := isRampUpReclaimHardPartitionEnabledWithConfig(attemptConfig.dynamic)
 	if hardPartitionEnabled && rampUpReclaimFloor.IsEmpty() {
 		var err error
+		// Pool adjustment admits no new allocation, so the ramp-up reclaim
+		// floor follows the domains already recorded in the candidate entries.
+		entriesRampUpDomains, dErr := p.activeRampUpDomainsFromEntries(entries)
+		if dErr != nil {
+			return fmt.Errorf("resolve active ramp-up domains before allocating pools: %w", dErr)
+		}
 		rampUpReclaimFloor, err = p.deriveRampUpReclaimFloorForModeWithDynamicConfig(
-			machineState, entries, false,
+			machineState, entries, entriesRampUpDomains,
 			p.state.GetDisableDedicatedCoresOverlapReclaimedCores(), attemptConfig)
 		if err != nil {
 			return fmt.Errorf("derive reclaim floor before allocating pools failed: %w", err)
@@ -2099,7 +2332,7 @@ func (p *DynamicPolicy) adjustPoolsAndIsolatedEntriesWithRampUpFloorForModeAtRev
 		ctx, cancel := context.WithTimeout(ctx, cpuSetAdjustmentHandlerTimeout(p.conf))
 		defer cancel()
 		if err := p.runCPUSetAdjustmentHandlers(ctx, dynamicpolicyutil.CPUSetAdjustmentModeAdmission); err != nil {
-			return fmt.Errorf("runCPUSetAdjustmentHandlers failed with error: %v", err)
+			return fmt.Errorf("runCPUSetAdjustmentHandlers failed with error: %w", err)
 		}
 	}
 
@@ -2388,14 +2621,19 @@ func (p *DynamicPolicy) buildDefaultShareEligibleCPUSet(
 	return eligible.Difference(rampUpReclaimFloor)
 }
 
-func activeRampUpCPUSet(entries state.PodEntries) machine.CPUSet {
+// globalDomainActiveRampUpCPUSet returns the CPUs held by ramp-up shared
+// allocations in the global (non-NUMA-scoped) domain. NUMA-binding ramp-up
+// allocations are excluded because their CPUs belong to a fixed per-NUMA pool,
+// not to the default share residual that this set is used to exempt.
+func globalDomainActiveRampUpCPUSet(entries state.PodEntries) machine.CPUSet {
 	result := machine.NewCPUSet()
 	for _, containerEntries := range entries {
 		if containerEntries.IsPoolEntry() {
 			continue
 		}
 		for _, allocationInfo := range containerEntries {
-			if allocationInfo == nil || !allocationInfo.RampUp || !allocationInfo.CheckShared() {
+			if allocationInfo == nil || !allocationInfo.RampUp || !allocationInfo.CheckShared() ||
+				allocationInfo.CheckNUMABinding() {
 				continue
 			}
 			result = result.Union(allocationInfo.AllocationResult)
@@ -2927,6 +3165,21 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 		}
 	}
 
+	// The hard-partition invariant is enforced against the FINAL reclaim pool:
+	// rampUpCPUs above is computed to include the reclaim pool (only the
+	// ramp-up reclaim floor is subtracted), so plain and SNB ramp-up shared
+	// allocations may end up overlapping the final reclaim pool after
+	// reviseReclaimPool. Restore mutual exclusion here, before the pending
+	// partition is committed. preservedSNBRampUp is nil because this path
+	// recomputes every ramp-up allocation from scratch (no advised/preserved
+	// distinction), so the rematerialization covers SNB allocations too.
+	if isRampUpReclaimHardPartitionEnabledWithConfig(p.dynamicConfig.GetDynamicConfiguration()) &&
+		newPodEntries.HasActiveRampUp() {
+		if err := p.rematerializeRampUpSharedAgainstFinalReclaim(newPodEntries, nil); err != nil {
+			return fmt.Errorf("rematerialize ramp-up shared allocations against final reclaim pool failed with error: %w", err)
+		}
+	}
+
 	_, _, err = p.commitPendingCPUPartition(pendingCPUPartition{
 		expectedRevision:          stateRevision,
 		entries:                   newPodEntries,
@@ -2935,7 +3188,7 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 		disableDedicated:          disableDedicatedCoresOverlapReclaimedCores,
 		persist:                   persistCheckpoint,
 		source:                    "pool adjustment",
-		validate:                  p.validatePendingAdvisorPartitionView,
+		validate:                  p.validatePendingAdvisorPartitionViewWithRampUpExclusion,
 		requireCoreAlignedReclaim: disableDedicatedCoresOverlapReclaimedCores,
 		residualFloor:             rampUpReclaimFloor,
 	})
@@ -4057,15 +4310,23 @@ func (p *DynamicPolicy) isReclaimEnabled() bool {
 // deriveRampUpReclaimFloor selects immutable per-NUMA targets only after
 // dedicated/reclaim disjoint mode has been negotiated. Legacy overlap keeps
 // the historical available-capacity-based target calculation.
+//
+// rampUpDomains carries the reclaim domains that are entering ramp-up with the
+// current request; it is unioned with the domains already recorded in
+// candidateEntries. A domain is FakedNUMAID for the global (non-binding)
+// domain, or a real NUMA id for a NUMA-binding ramp-up. The hard reclaim floor
+// is only imposed on the NUMAs those domains actually cover, so a NUMA with no
+// local ramp-up (e.g. a NUMA-exclusive region) is no longer pressed to the
+// reserved floor.
 func (p *DynamicPolicy) deriveRampUpReclaimFloor(
 	machineState state.NUMANodeMap,
 	candidateEntries state.PodEntries,
-	enteringRampUp bool,
+	rampUpDomains sets.Int,
 ) (machine.CPUSet, error) {
 	return p.deriveRampUpReclaimFloorForMode(
 		machineState,
 		candidateEntries,
-		enteringRampUp,
+		rampUpDomains,
 		p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
 	)
 }
@@ -4073,11 +4334,11 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloor(
 func (p *DynamicPolicy) deriveRampUpReclaimFloorForMode(
 	machineState state.NUMANodeMap,
 	candidateEntries state.PodEntries,
-	enteringRampUp bool,
+	rampUpDomains sets.Int,
 	immutablePerNUMA bool,
 ) (machine.CPUSet, error) {
 	return p.deriveRampUpReclaimFloorForModeWithDynamicConfig(
-		machineState, candidateEntries, enteringRampUp, immutablePerNUMA,
+		machineState, candidateEntries, rampUpDomains, immutablePerNUMA,
 		p.currentAdvisorAttemptConfiguration())
 }
 
@@ -4088,16 +4349,30 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloorForMode(
 func (p *DynamicPolicy) deriveRampUpReclaimFloorForModeWithDynamicConfig(
 	machineState state.NUMANodeMap,
 	candidateEntries state.PodEntries,
-	enteringRampUp bool,
+	rampUpDomains sets.Int,
 	immutablePerNUMA bool,
 	attemptConfig advisorAttemptConfiguration,
 ) (machine.CPUSet, error) {
 	floor := machine.NewCPUSet()
 	if !isRampUpReclaimHardPartitionEnabledWithConfig(attemptConfig.dynamic) ||
-		(!enteringRampUp && !candidateEntries.HasActiveRampUp()) ||
 		p.machineInfo == nil {
 		return floor, nil
 	}
+
+	// The effective ramp-up domains are the union of the ramp-up domains
+	// already recorded in the candidate entries and the domains entering with
+	// the current request. A missing/ambiguous domain derivation fails closed
+	// (the error propagates) rather than widening the floor node-wide.
+	effectiveRampUpDomains, err := candidateEntries.ActiveRampUpDomains(p.machineInfo.CPUTopology)
+	if err != nil {
+		return machine.NewCPUSet(), fmt.Errorf("derive ramp-up reclaim floor: resolve active ramp-up domains: %w", err)
+	}
+	effectiveRampUpDomains = effectiveRampUpDomains.Union(rampUpDomains)
+	if effectiveRampUpDomains.Len() == 0 {
+		return floor, nil
+	}
+
+	affectedNUMAs := affectedRampUpNUMAs(effectiveRampUpDomains, p.machineInfo.CPUTopology, immutablePerNUMA)
 
 	currentReclaim := machine.NewCPUSet()
 	if reclaimInfo := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName); reclaimInfo != nil {
@@ -4142,7 +4417,6 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloorForModeWithDynamicConfig(
 
 	targetByNUMA := make(map[int]int, len(numaIDs))
 	if immutablePerNUMA {
-		var err error
 		// feed the resolved floor as the fallback so the util derives per-NUMA
 		// targets from the canonical ratio config while honoring the reclaim floor
 		// scalar owned by floorConf.
@@ -4158,25 +4432,49 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloorForModeWithDynamicConfig(
 		}
 	} else {
 		minimumPerNUMA := minimumHardReclaimCoresPerNUMA * p.machineInfo.CPUTopology.CPUsPerCore()
-		// a NUMA whose eligible capacity cannot yield a single complete core
+		// The balanced distribution is scoped to the NUMAs an active ramp-up
+		// domain actually covers. A NUMA with no local ramp-up must not dilute
+		// the ratio-derived global target: distributing the target over all
+		// NUMAs would hand an unaffected NUMA's share to the affected NUMAs,
+		// over-provisioning the floor. For a pure global-domain overlap ramp-up
+		// affectedNUMAs covers every real NUMA, so this narrows back to the
+		// legacy node-wide distribution.
+		//
+		// A NUMA whose eligible capacity cannot yield a single complete core
 		// (e.g. fully occupied by dedicated / non-exclusive DNB workloads) has no
 		// room for a reclaim reserve; keep its target at 0 and exclude it from the
 		// balanced distribution so DistributeNUMATarget's per-NUMA minimum guard
 		// does not fail admission closed on it. this mirrors the immutable path,
 		// where a zero-core-eligible NUMA also resolves to a zero target.
 		distributableByNUMA := make(map[int]int, len(availableByNUMA))
+		affectedEligible := 0
 		for numaID, avail := range availableByNUMA {
+			if !affectedNUMAs.Has(numaID) {
+				targetByNUMA[numaID] = 0
+				continue
+			}
+			affectedEligible += avail
 			if avail < minimumPerNUMA {
 				targetByNUMA[numaID] = 0
 				continue
 			}
 			distributableByNUMA[numaID] = avail
 		}
+		// The node-wide configured reclaim floor is apportioned to the affected
+		// NUMAs by their eligible share: an unaffected NUMA already maintains
+		// its steady reclaim contribution, so the ramp-up floor must not heap the
+		// whole node-wide minimum onto the subset of ramp-up NUMAs. When every
+		// real NUMA is affected (a pure global-domain overlap ramp-up) the
+		// scaling factor is 1 and the result matches the legacy node-wide floor.
 		minimum := minimumPerNUMA * len(distributableByNUMA)
-		if configuredFloor > minimum {
-			minimum = configuredFloor
+		scaledConfiguredFloor := 0
+		if totalEligible > 0 {
+			scaledConfiguredFloor = configuredFloor * affectedEligible / totalEligible
 		}
-		globalTarget := machine.CalculateGlobalRampUpReclaimTarget(totalEligible, ratio, minimum)
+		if scaledConfiguredFloor > minimum {
+			minimum = scaledConfiguredFloor
+		}
+		globalTarget := machine.CalculateGlobalRampUpReclaimTarget(affectedEligible, ratio, minimum)
 		if len(distributableByNUMA) > 0 {
 			distributed, err := machine.DistributeNUMATarget(
 				distributableByNUMA, globalTarget, minimumPerNUMA)
@@ -4198,7 +4496,10 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloorForModeWithDynamicConfig(
 	steadyExclusiveNUMAs := candidateEntries.SteadyExclusiveNUMAs(p.machineInfo.CPUTopology)
 
 	for _, numaID := range numaIDs {
-		if steadyExclusiveNUMAs.Has(numaID) {
+		// The ramp-up reclaim floor is only imposed on NUMAs that an active
+		// ramp-up domain actually covers. A NUMA without local ramp-up (e.g. a
+		// NUMA-exclusive region) keeps its steady state and is left untouched.
+		if steadyExclusiveNUMAs.Has(numaID) || !affectedNUMAs.Has(numaID) {
 			continue
 		}
 		eligible := eligibleByNUMA[numaID]
@@ -4266,6 +4567,92 @@ func (p *DynamicPolicy) deriveRampUpReclaimFloorForModeWithDynamicConfig(
 		floor = floor.Union(floorInNUMA)
 	}
 	return floor, nil
+}
+
+// globalRampUpDomainActive reports whether the global (non-NUMA-binding)
+// ramp-up domain (FakedNUMAID) is among the active ramp-up domains.
+func globalRampUpDomainActive(rampUpDomains sets.Int) bool {
+	return rampUpDomains.Has(commonstate.FakedNUMAID)
+}
+
+// affectedRampUpNUMAs resolves which real NUMAs must receive the ramp-up
+// reclaim floor from the active ramp-up domains.
+//
+// In immutable (dedicated/reclaim disjoint) mode only a real NUMA ramp-up
+// domain narrows onto its own NUMA; the global (non-binding) domain lives in
+// the fake/reclaim space and must not touch a real NUMA.
+//
+// In legacy overlap mode a real NUMA domain still narrows onto itself, while
+// the global domain keeps the historical node-wide propagation onto every real
+// NUMA.
+func affectedRampUpNUMAs(rampUpDomains sets.Int, topology *machine.CPUTopology, immutablePerNUMA bool) sets.Int {
+	affected := sets.NewInt()
+	if topology == nil || rampUpDomains == nil {
+		return affected
+	}
+	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
+		if rampUpDomains.Has(numaID) {
+			affected.Insert(numaID)
+		}
+	}
+	if !immutablePerNUMA && globalRampUpDomainActive(rampUpDomains) {
+		for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
+			affected.Insert(numaID)
+		}
+	}
+	return affected
+}
+
+// activeRampUpDomainsFromEntries derives the active ramp-up reclaim domains
+// currently recorded in the pod entries.
+func (p *DynamicPolicy) activeRampUpDomainsFromEntries(entries state.PodEntries) (sets.Int, error) {
+	if p.machineInfo == nil || p.machineInfo.CPUTopology == nil {
+		return nil, fmt.Errorf("activeRampUpDomainsFromEntries got nil cpu topology")
+	}
+	return entries.ActiveRampUpDomains(p.machineInfo.CPUTopology)
+}
+
+// rampUpDomainForAllocation resolves the reclaim domain(s) a single entering
+// non-NUMA-binding allocation would activate. NUMA-binding entering requests
+// are resolved by enteringNUMABindingRampUpDomains from their hint nodes, since
+// the request side has no committed placement yet.
+func (p *DynamicPolicy) rampUpDomainForAllocation(allocationInfo *state.AllocationInfo) (sets.Int, error) {
+	if p.machineInfo == nil || p.machineInfo.CPUTopology == nil {
+		return nil, fmt.Errorf("rampUpDomainForAllocation got nil cpu topology")
+	}
+	if allocationInfo == nil {
+		return sets.NewInt(), nil
+	}
+	return allocationInfo.RampUpReclaimDomains(p.machineInfo.CPUTopology)
+}
+
+// enteringNUMABindingRampUpDomains resolves the reclaim domains of the NUMA-binding
+// request currently being placed. Unlike committed ramp-up allocations (which are
+// pinned to a single NUMA), an in-flight request may be distributed across several
+// hinted NUMAs; each hinted NUMA becomes its own reclaim domain. A non-binding
+// request maps to the global domain. A request with no hinted NUMAs fails closed.
+func enteringNUMABindingRampUpDomains(annotations map[string]string, hintNodes []uint64, topology *machine.CPUTopology) (sets.Int, error) {
+	if topology == nil {
+		return nil, fmt.Errorf("entering numa-binding ramp-up domains: missing topology")
+	}
+	meta := &commonstate.AllocationMeta{Annotations: annotations}
+	if !meta.CheckNUMABinding() {
+		return sets.NewInt(commonstate.FakedNUMAID), nil
+	}
+	domains := sets.NewInt()
+	for _, node := range hintNodes {
+		id := int(node)
+		if !topology.CPUDetails.NUMANodes().Contains(id) {
+			return nil, fmt.Errorf(
+				"out-of-range ramp-up domain: entering numa-binding hint node %d is not in topology", id)
+		}
+		domains.Insert(id)
+	}
+	if domains.Len() == 0 {
+		return nil, fmt.Errorf(
+			"missing ramp-up domain: numa-binding entering allocation has no hint nodes")
+	}
+	return domains, nil
 }
 
 func (p *DynamicPolicy) deriveSteadyReclaimFloor(

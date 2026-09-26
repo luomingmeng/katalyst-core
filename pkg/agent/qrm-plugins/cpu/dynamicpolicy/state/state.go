@@ -134,6 +134,108 @@ type NUMANodeState struct {
 
 type NUMANodeMap map[int]*NUMANodeState // keyed by numa node id
 
+// RampUpReclaimDomains resolves the set of reclaim domains this allocation belongs to.
+//
+//   - non-NUMA-binding allocation maps to the global domain (FakedNUMAID);
+//   - a NUMA-binding allocation placed on a single real NUMA maps to that NUMA,
+//     cross checked against the NUMA hint annotation when one is present;
+//   - a dedicated NUMA-binding allocation distributed across several NUMAs maps
+//     to every NUMA it is placed on (dedicated cores may legitimately span
+//     NUMAs); a shared NUMA-binding allocation spanning multiple NUMAs is
+//     ambiguous and fails closed.
+//
+// A NUMA-binding allocation that has not been materialized yet (no
+// TopologyAwareAssignments, e.g. an entering request being placed) resolves
+// from its explicit NUMA hint; a committed allocation with neither placement
+// nor a hint is inconsistent and fails closed. Any other missing or ambiguous
+// domain fails closed with an error rather than collapsing to node-global.
+func (ai *AllocationInfo) RampUpReclaimDomains(topology *machine.CPUTopology) (sets.Int, error) {
+	if ai == nil {
+		return nil, fmt.Errorf("RampUpReclaimDomains got nil allocationInfo")
+	}
+
+	// non-binding shared ramp-up always belongs to the global domain.
+	if !ai.CheckNUMABinding() {
+		return sets.NewInt(commonstate.FakedNUMAID), nil
+	}
+
+	placementNUMASet := ai.GetAllocationResultNUMASet()
+	if placementNUMASet.IsEmpty() {
+		// The allocation has not been materialized yet. If it carries an
+		// explicit NUMA hint, that is its intended reclaim domain; otherwise
+		// the committed state is inconsistent and we fail closed.
+		if !ai.CheckActualNUMABinding() {
+			return nil, fmt.Errorf(
+				"missing ramp-up domain: numa-binding ramp-up allocation %s/%s/%s has no TopologyAwareAssignments and no NUMA hint",
+				ai.PodNamespace, ai.PodName, ai.ContainerName)
+		}
+		hintNUMA, err := ai.GetSpecifiedNUMABindingNUMAID()
+		if err != nil {
+			return nil, fmt.Errorf(
+				"ambiguous ramp-up domain: numa-binding ramp-up allocation %s/%s/%s has unparseable NUMA hint: %v",
+				ai.PodNamespace, ai.PodName, ai.ContainerName, err)
+		}
+		if hintNUMA == commonstate.FakedNUMAID || !topology.CPUDetails.NUMANodes().Contains(hintNUMA) {
+			return nil, fmt.Errorf(
+				"out-of-range ramp-up domain: numa-binding ramp-up allocation %s/%s/%s has NUMA hint %d which is not in topology",
+				ai.PodNamespace, ai.PodName, ai.ContainerName, hintNUMA)
+		}
+		// Fallback: a committed ramp-up allocation should carry TopologyAwareAssignments.
+		// Resolving its domain from the NUMA hint alone indicates the committed state is
+		// inconsistent; log it so state corruption is observable rather than silent.
+		klog.Warningf("ramp-up reclaim domain resolved from NUMA hint for allocation %s/%s/%s (no TopologyAwareAssignments): committed state may be inconsistent",
+			ai.PodNamespace, ai.PodName, ai.ContainerName)
+		return sets.NewInt(hintNUMA), nil
+	}
+
+	// A dedicated NUMA-binding allocation may legitimately span multiple NUMAs
+	// (distributed evenly across NUMA nodes); every placement NUMA is its own
+	// reclaim domain. A shared NUMA-binding allocation spanning NUMAs is
+	// ambiguous: shared cores are pinned to a single NUMA by their pool.
+	if placementNUMASet.Size() > 1 {
+		if !ai.CheckDedicatedNUMABinding() {
+			return nil, fmt.Errorf(
+				"ambiguous ramp-up domain: shared numa-binding ramp-up allocation %s/%s/%s spans NUMAs %s, expected exactly one",
+				ai.PodNamespace, ai.PodName, ai.ContainerName, placementNUMASet.String())
+		}
+		domains := sets.NewInt()
+		for _, numaID := range placementNUMASet.ToSliceNoSortInt() {
+			if !topology.CPUDetails.NUMANodes().Contains(numaID) {
+				return nil, fmt.Errorf(
+					"out-of-range ramp-up domain: dedicated numa-binding ramp-up allocation %s/%s/%s placed on NUMA %d which is not in topology",
+					ai.PodNamespace, ai.PodName, ai.ContainerName, numaID)
+			}
+			domains.Insert(numaID)
+		}
+		return domains, nil
+	}
+
+	placementNUMA := placementNUMASet.ToSliceNoSortInt()[0]
+	if !topology.CPUDetails.NUMANodes().Contains(placementNUMA) {
+		return nil, fmt.Errorf(
+			"out-of-range ramp-up domain: numa-binding ramp-up allocation %s/%s/%s placed on NUMA %d which is not in topology",
+			ai.PodNamespace, ai.PodName, ai.ContainerName, placementNUMA)
+	}
+
+	// when an explicit NUMA hint is present it must agree with the placement,
+	// otherwise the domain is ambiguous and we fail closed.
+	if ai.CheckActualNUMABinding() {
+		hintNUMA, err := ai.GetSpecifiedNUMABindingNUMAID()
+		if err != nil {
+			return nil, fmt.Errorf(
+				"ambiguous ramp-up domain: numa-binding ramp-up allocation %s/%s/%s has unparseable NUMA hint: %v",
+				ai.PodNamespace, ai.PodName, ai.ContainerName, err)
+		}
+		if hintNUMA != placementNUMA {
+			return nil, fmt.Errorf(
+				"ambiguous ramp-up domain: numa-binding ramp-up allocation %s/%s/%s placed on NUMA %d but NUMA hint indicates %d",
+				ai.PodNamespace, ai.PodName, ai.ContainerName, placementNUMA, hintNUMA)
+		}
+	}
+
+	return sets.NewInt(placementNUMA), nil
+}
+
 func (ai *AllocationInfo) Clone() *AllocationInfo {
 	if ai == nil {
 		return nil

@@ -268,7 +268,7 @@ func (p *DynamicPolicy) validateResidualBackfillCandidateWithDynamicConfig(
 
 	eligible := p.buildDefaultShareEligibleCPUSet(entries, machineState, residualFloor)
 	expected := eligible.Difference(fixedPools).Difference(dedicated)
-	activeRampUp := activeRampUpCPUSet(entries)
+	activeRampUp := globalDomainActiveRampUpCPUSet(entries)
 	extraShare := share.Difference(expected)
 	uncoveredResidual := expected.Difference(share).Difference(activeRampUp)
 	if !extraShare.IsEmpty() || !uncoveredResidual.IsEmpty() {

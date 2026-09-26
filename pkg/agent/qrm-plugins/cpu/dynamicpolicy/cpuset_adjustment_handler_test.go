@@ -36,8 +36,11 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/stretchr/testify/require"
 
+	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
+
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/advisorsvc"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	bulkheadtopology "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
@@ -211,9 +214,11 @@ func (*frozenInitialSnapshotDriftTestError) Error() string {
 	return "frozen trace initial snapshot drift"
 }
 
-func (*frozenInitialSnapshotDriftTestError) FrozenInitialSnapshotDrift() bool { return true }
+func (*frozenInitialSnapshotDriftTestError) Unwrap() error {
+	return bulkheadtopology.ErrCoordinatorPlanStale
+}
 
-func TestAdmissionRetriesFrozenInitialSnapshotDriftInPlace(t *testing.T) {
+func TestAdmissionPropagatesFrozenInitialSnapshotDriftWithoutRetry(t *testing.T) {
 	t.Parallel()
 
 	firstCalls := 0
@@ -238,41 +243,51 @@ func TestAdmissionRetriesFrozenInitialSnapshotDriftInPlace(t *testing.T) {
 	err := p.runCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentModeAdmission)
 	p.Unlock()
 
-	require.NoError(t, err)
-	require.Equal(t, 2, firstCalls)
-	require.Equal(t, 1, secondCalls)
+	require.ErrorIs(t, err, bulkheadtopology.ErrCoordinatorPlanStale)
+	require.Equal(t, 1, firstCalls)
+	require.Zero(t, secondCalls)
 }
 
-func TestAdmissionFrozenInitialSnapshotDriftRetryIsBounded(t *testing.T) {
-	t.Parallel()
-
+func TestAdmissionContinuousFrozenInitialSnapshotDriftCallsPluginOnce(t *testing.T) {
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	require.NoError(t, err)
 	calls := 0
-	p := &DynamicPolicy{
-		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
-			"always-stale": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
-				calls++
-				return &frozenInitialSnapshotDriftTestError{}
-			},
+	p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"always-stale": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			calls++
+			return &frozenInitialSnapshotDriftTestError{}
 		},
 	}
+	beforeRevision := p.state.GetRevision()
+	beforeEntries := p.state.GetPodEntries()
+	beforeMachineState := p.state.GetMachineState()
+	target := &advisorPostCommitTarget{revision: beforeRevision}
+	p.advisorPostCommitTarget = target
+	stagingPath := p.advisorPostCommitStagingPath()
+	activePath := p.advisorPostCommitCheckpointPath()
+	require.NoError(t, os.WriteFile(stagingPath, []byte("staging-sentinel"), 0o600))
+	require.NoError(t, os.WriteFile(activePath, []byte("active-sentinel"), 0o600))
 
 	p.Lock()
-	err := p.runCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentModeAdmission)
+	err = p.runCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentModeAdmission)
 	p.Unlock()
 
 	require.Error(t, err)
-	require.Equal(t, cpuSetAdjustmentAdmissionReplans, calls)
+	require.ErrorIs(t, err, bulkheadtopology.ErrCoordinatorPlanStale)
+	require.Equal(t, 1, calls)
 	require.ErrorContains(t, err, "frozen trace initial snapshot drift")
-}
-
-type frozenSnapshotDriftAfterVerifiedRollbackTestError struct{}
-
-func (*frozenSnapshotDriftAfterVerifiedRollbackTestError) Error() string {
-	return "frozen trace final snapshot drift after verified rollback"
-}
-
-func (*frozenSnapshotDriftAfterVerifiedRollbackTestError) FrozenSnapshotDriftReplanSafe() bool {
-	return true
+	require.Equal(t, beforeRevision, p.state.GetRevision())
+	require.Equal(t, beforeEntries, p.state.GetPodEntries())
+	require.Equal(t, beforeMachineState, p.state.GetMachineState())
+	require.Same(t, target, p.currentAdvisorPostCommitTarget())
+	staging, readErr := os.ReadFile(stagingPath)
+	require.NoError(t, readErr)
+	require.Equal(t, []byte("staging-sentinel"), staging)
+	active, readErr := os.ReadFile(activePath)
+	require.NoError(t, readErr)
+	require.Equal(t, []byte("active-sentinel"), active)
 }
 
 type frozenFinalSnapshotDriftUnverifiedTestError struct{}
@@ -283,7 +298,7 @@ func (*frozenFinalSnapshotDriftUnverifiedTestError) Error() string {
 
 func (*frozenFinalSnapshotDriftUnverifiedTestError) FrozenFinalSnapshotDrift() bool { return true }
 
-func TestAdmissionRetriesFinalSnapshotDriftAfterVerifiedRollback(t *testing.T) {
+func TestAdmissionPropagatesFinalSnapshotDriftAfterVerifiedRollbackWithoutRetry(t *testing.T) {
 	t.Parallel()
 
 	calls := 0
@@ -292,7 +307,7 @@ func TestAdmissionRetriesFinalSnapshotDriftAfterVerifiedRollback(t *testing.T) {
 			"final-drift-once": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
 				calls++
 				if calls == 1 {
-					return &frozenSnapshotDriftAfterVerifiedRollbackTestError{}
+					return errors.New("frozen trace final snapshot drift after verified rollback")
 				}
 				return nil
 			},
@@ -303,8 +318,8 @@ func TestAdmissionRetriesFinalSnapshotDriftAfterVerifiedRollback(t *testing.T) {
 	err := p.runCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentModeAdmission)
 	p.Unlock()
 
-	require.NoError(t, err)
-	require.Equal(t, 2, calls)
+	require.Error(t, err)
+	require.Equal(t, 1, calls)
 }
 
 func TestAdmissionDoesNotRetryUnverifiedFinalSnapshotDrift(t *testing.T) {
@@ -667,6 +682,84 @@ func TestCPUSetAdjustmentCommitsTopologyReclaimOverride(t *testing.T) {
 	require.NotNil(t, reclaim)
 	require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(2, 3)),
 		"reclaim allocation=%s, want topology verified override 2-3", reclaim.AllocationResult)
+}
+
+// TestCPUSetAdjustmentRejectsRampUpSharedReclaimOverlapWhenHardPartitionEnabled
+// pins the M3 fix on the asynchronous cpuset adjustment commit path: when an
+// adjustment override rewrites the reclaim pool onto a ramp-up shared
+// allocation, the stacked mutual-exclusion validator must reject the commit
+// while the ramp-up reclaim hard partition switch is on — and must not reject
+// it when the switch is off (the two switches stay orthogonal on the async
+// path as well).
+func TestCPUSetAdjustmentRejectsRampUpSharedReclaimOverlapWhenHardPartitionEnabled(t *testing.T) {
+	t.Parallel()
+
+	newTest := func(t *testing.T, hardPartitionEnabled bool) *DynamicPolicy {
+		t.Helper()
+
+		p, cleanup := newReclaimReuseTestPolicy(t)
+		t.Cleanup(cleanup)
+
+		dynamicConf := p.dynamicConfig.GetDynamicConfiguration()
+		dynamicConf.EnableReclaim = true
+		dynamicConf.EnableRampUpReclaimHardPartition = hardPartitionEnabled
+
+		// setReclaimPoolCPUSet replaces the entire state, so it must run
+		// before we add the ramp-up pod on top.
+		setReclaimPoolCPUSet(t, p, machine.NewCPUSet(0, 1))
+		entries := p.state.GetPodEntries().Clone()
+		entries["ramp-up-shared-pod"] = state.ContainerEntries{
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "ramp-up-shared-pod",
+					ContainerName: "main",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+				},
+				RampUp:           true,
+				AllocationResult: machine.NewCPUSet(2, 3),
+			},
+		}
+		p.state.SetPodEntries(entries, false)
+
+		p.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+			"topology-override": func(_ context.Context, handlerCtx cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+				if handlerCtx.CommitOverride == nil {
+					t.Fatal("CPUSet adjustment runner did not provide a commit override")
+				}
+				// the override moves the reclaim pool straight onto the
+				// ramp-up shared allocation {2,3}
+				handlerCtx.CommitOverride.ReclaimEffective = machine.NewCPUSet(2, 3)
+				handlerCtx.CommitOverride.Source = "cpuset_topology"
+				return nil
+			},
+		}
+		return p
+	}
+
+	t.Run("hard partition enabled rejects the overlapping override", func(t *testing.T) {
+		t.Parallel()
+
+		p := newTest(t, true)
+		p.Lock()
+		err := p.runCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentModePeriodic)
+		p.Unlock()
+		require.ErrorContains(t, err, "ramp-up shared allocation overlaps the final reclaim pool")
+	})
+
+	t.Run("hard partition disabled commits the same override", func(t *testing.T) {
+		t.Parallel()
+
+		p := newTest(t, false)
+		p.Lock()
+		err := p.runCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentModePeriodic)
+		p.Unlock()
+		require.NoError(t, err)
+
+		reclaim := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+		require.NotNil(t, reclaim)
+		require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(2, 3)),
+			"reclaim allocation=%s, want override 2-3", reclaim.AllocationResult.String())
+	})
 }
 
 func TestCPUSetAdjustmentAlignsAdmissionReclaimOverrideToWholeCores(t *testing.T) {

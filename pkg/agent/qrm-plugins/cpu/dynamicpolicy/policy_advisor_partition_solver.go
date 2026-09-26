@@ -34,6 +34,15 @@ type partitionDemand struct {
 	eligible        machine.CPUSet
 	preferred       machine.CPUSet
 	class           advisorBlockClass
+
+	// targetDriven marks a target-driven reclaim dedicated source. targetDriven
+	// sources may shrink to their frozen sourceTarget (instead of preserving
+	// before==after ownership), but may never go below it. Legacy sources keep
+	// the old invariant.
+	targetDriven bool
+	sourceTarget int
+	reclaimQuota int // frozen reclaim source quota for targetDriven donors
+	numaID       int // NUMA id for domain-aware selection
 }
 
 type partitionFlowEdge struct {
@@ -60,20 +69,25 @@ const (
 var (
 	errPartitionAssignmentEdgeBudget = errors.New("partition graph edge budget exceeded")
 	errPartitionFlowOperationBudget  = errors.New("partition flow operation budget exceeded")
+	errPartitionNoFeasibleAssignment = errors.New("partition demands have no feasible assignment")
 )
 
-type partitionSolverBudget struct {
+type partitionGraphBudget struct {
 	maxAssignmentEdges int
-	maxFlowOperations  int
 	assignmentEdges    int
-	flowOperations     int
 }
 
-func defaultPartitionSolverBudget() partitionSolverBudget {
-	return partitionSolverBudget{
-		maxAssignmentEdges: partitionAssignmentEdgeBudget,
-		maxFlowOperations:  partitionFlowOperationBudget,
-	}
+type partitionSearchBudget struct {
+	maxFlowOperations int
+	flowOperations    int
+}
+
+func defaultPartitionGraphBudget() partitionGraphBudget {
+	return partitionGraphBudget{maxAssignmentEdges: partitionAssignmentEdgeBudget}
+}
+
+func defaultPartitionSearchBudget() partitionSearchBudget {
+	return partitionSearchBudget{maxFlowOperations: partitionFlowOperationBudget}
 }
 
 type partitionDistanceItem struct {
@@ -110,27 +124,40 @@ func solveDisjointPartitions(
 	demands []partitionDemand,
 	topology *machine.CPUTopology,
 ) (map[string]machine.CPUSet, error) {
-	return solveDisjointPartitionsWithBudget(demands, topology, defaultPartitionSolverBudget())
+	graphBudget := defaultPartitionGraphBudget()
+	searchBudget := defaultPartitionSearchBudget()
+	return solveDisjointPartitionsWithBudgets(
+		demands, topology, &graphBudget, &searchBudget)
 }
 
-func solveDisjointPartitionsWithBudget(
+func solveDisjointPartitionsWithBudgets(
 	demands []partitionDemand,
 	topology *machine.CPUTopology,
-	budget partitionSolverBudget,
+	graphBudget *partitionGraphBudget,
+	searchBudget *partitionSearchBudget,
 ) (map[string]machine.CPUSet, error) {
-	return solveDisjointPartitionsWithSharedBudget(demands, topology, &budget)
-}
-
-func solveDisjointPartitionsWithSharedBudget(
-	demands []partitionDemand,
-	topology *machine.CPUTopology,
-	budget *partitionSolverBudget,
-) (map[string]machine.CPUSet, error) {
+	if graphBudget == nil || graphBudget.maxAssignmentEdges <= 0 {
+		return nil, errPartitionAssignmentEdgeBudget
+	}
+	if searchBudget == nil || searchBudget.maxFlowOperations <= 0 {
+		return nil, errPartitionFlowOperationBudget
+	}
 	sortedDemands, cpus, total, err := validatePartitionDemands(demands, topology)
 	if err != nil {
 		return nil, err
 	}
+	return solveValidatedDisjointPartitions(
+		sortedDemands, cpus, total, topology, graphBudget, searchBudget)
+}
 
+func solveValidatedDisjointPartitions(
+	sortedDemands []partitionDemand,
+	cpus []int,
+	total int,
+	topology *machine.CPUTopology,
+	graphBudget *partitionGraphBudget,
+	searchBudget *partitionSearchBudget,
+) (map[string]machine.CPUSet, error) {
 	result := make(map[string]machine.CPUSet, len(sortedDemands))
 	for _, demand := range sortedDemands {
 		result[demand.key] = machine.NewCPUSet()
@@ -164,8 +191,8 @@ func solveDisjointPartitionsWithSharedBudget(
 			if !demand.eligible.Contains(cpu) {
 				continue
 			}
-			budget.assignmentEdges++
-			if budget.assignmentEdges > budget.maxAssignmentEdges {
+			graphBudget.assignmentEdges++
+			if graphBudget.assignmentEdges > graphBudget.maxAssignmentEdges {
 				return nil, errPartitionAssignmentEdgeBudget
 			}
 			cost, costErr := partitionEdgeCost(
@@ -188,12 +215,18 @@ func solveDisjointPartitionsWithSharedBudget(
 	}
 
 	flow, err := partitionMinCostFlowWithUsage(
-		graph, source, sink, total, &budget.flowOperations, budget.maxFlowOperations)
+		graph,
+		source,
+		sink,
+		total,
+		&searchBudget.flowOperations,
+		searchBudget.maxFlowOperations,
+	)
 	if err != nil {
 		return nil, err
 	}
 	if flow != total {
-		return nil, fmt.Errorf("partition demands have no feasible assignment")
+		return nil, errPartitionNoFeasibleAssignment
 	}
 	for cpuIndex, edges := range assignmentEdges {
 		cpuNode := cpuBase + cpuIndex
@@ -239,7 +272,7 @@ func validatePartitionDemands(
 			return nil, nil, 0, fmt.Errorf("partition demand %q has unsupported class %q", demand.key, demand.class)
 		}
 		if demand.eligible.Size() < demand.quantity {
-			return nil, nil, 0, fmt.Errorf("partition demands have no feasible assignment")
+			return nil, nil, 0, errPartitionNoFeasibleAssignment
 		}
 		for _, cpu := range demand.eligible.ToSliceInt() {
 			if _, ok := topology.CPUDetails[cpu]; !ok {
@@ -253,7 +286,7 @@ func validatePartitionDemands(
 		}
 	}
 	if allEligible.Size() < total {
-		return nil, nil, 0, fmt.Errorf("partition demands have no feasible assignment")
+		return nil, nil, 0, errPartitionNoFeasibleAssignment
 	}
 	return sortedDemands, allEligible.ToSliceInt(), total, nil
 }

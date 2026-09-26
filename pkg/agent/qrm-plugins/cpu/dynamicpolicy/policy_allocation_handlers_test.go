@@ -19,6 +19,7 @@ package dynamicpolicy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"reflect"
@@ -40,6 +41,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/accompanyresource"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
+	bulkheadtopology "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	dynamicpolicyutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
@@ -66,6 +68,19 @@ type recordingServiceProfilingManager struct {
 	baselineErr      error
 	baselineCalls    int
 	observedPodMeta  []metav1.ObjectMeta
+}
+
+// allRealNUMAsForRampUpFloor mechanically translates the legacy
+// enteringRampUp=true boolean (which meant "ramp-up active node-wide") into the
+// set of every real NUMA, so existing deriveRampUpReclaimFloor capacity tests
+// keep exercising the same per-NUMA distribution while the floor is now scoped
+// through affectedRampUpNUMAs.
+func allRealNUMAsForRampUpFloor(p *DynamicPolicy) sets.Int {
+	out := sets.NewInt()
+	for _, n := range p.machineInfo.CPUDetails.NUMANodes().ToSliceInt() {
+		out.Insert(n)
+	}
+	return out
 }
 
 func (m *recordingServiceProfilingManager) ServiceBusinessPerformanceLevel(
@@ -2934,14 +2949,14 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorCoversAllNUMAs(t *testing.T) {
 	}, false)
 
 	committedEntries := p.state.GetPodEntries()
-	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), committedEntries, true)
+	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), committedEntries, allRealNUMAsForRampUpFloor(p))
 	require.NoError(t, err)
 	require.True(t, floor.Equals(machine.NewCPUSet(14, 38, 62, 86)),
 		"floor=%s, want all-NUMA reserved reclaim CPUs", floor)
 	require.Equal(t, 2, floor.Intersection(p.machineInfo.CPUDetails.CPUsInNUMANodes(0)).Size())
 	require.Equal(t, 2, floor.Intersection(p.machineInfo.CPUDetails.CPUsInNUMANodes(1)).Size())
 
-	inactiveFloor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), committedEntries, false)
+	inactiveFloor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), committedEntries, sets.NewInt())
 	require.NoError(t, err)
 	require.True(t, inactiveFloor.IsEmpty(), "inactive candidate must not receive a temporary hard floor")
 
@@ -2953,13 +2968,13 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorCoversAllNUMAs(t *testing.T) {
 		AllocationResult: machine.NewCPUSet(1),
 		RampUp:           true,
 	}}
-	activeFloor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), activeCandidate, false)
+	activeFloor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), activeCandidate, sets.NewInt())
 	require.NoError(t, err)
 	require.True(t, activeFloor.Equals(machine.NewCPUSet(14, 38, 62, 86)))
 
 	p.state.SetPodEntries(activeCandidate, false)
 	finalExitCandidate := committedEntries.Clone()
-	finalExitFloor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), finalExitCandidate, false)
+	finalExitFloor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), finalExitCandidate, sets.NewInt())
 	require.NoError(t, err)
 	require.True(t, finalExitFloor.IsEmpty(), "candidate final exit must override committed active state")
 }
@@ -3893,7 +3908,7 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorAllowsFullNonExclusiveRatio(t *tes
 	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
 	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 1
 
-	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), true)
+	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), allRealNUMAsForRampUpFloor(p))
 	require.NoError(t, err)
 	require.True(t, floor.Equals(machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)),
 		"floor=%s, want every eligible CPU", floor)
@@ -3928,7 +3943,7 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorUsesEligiblePerNUMACapacity(t *tes
 	// immutable one-core baseline => 2 CPUs per NUMA. Deriving from the full
 	// 32-CPU capacity (the old behavior) would target 6 CPUs and fail closed
 	// whenever eligible capacity is smaller.
-	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), true)
+	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), allRealNUMAsForRampUpFloor(p))
 	require.NoError(t, err)
 	require.Equal(t, 2, floor.Intersection(numa0).Size())
 	require.Equal(t, 2, floor.Intersection(numa1).Size())
@@ -3980,7 +3995,7 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorRepairsPartialPreferredCore(t *tes
 		false,
 	)
 
-	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), true)
+	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), allRealNUMAsForRampUpFloor(p))
 	require.NoError(t, err)
 	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
 		require.Equal(t, 6, floor.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID)).Size(),
@@ -4059,7 +4074,7 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorRejectsUnrepairableReservedIdentit
 			p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
 
 			floor, err := p.deriveRampUpReclaimFloor(
-				p.state.GetMachineState(), p.state.GetPodEntries(), true)
+				p.state.GetMachineState(), p.state.GetPodEntries(), allRealNUMAsForRampUpFloor(p))
 			require.True(t, floor.IsEmpty())
 			require.ErrorContains(t, err, tt.wantErr)
 		})
@@ -4113,7 +4128,7 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorSkipsSteadyExclusiveNUMA(t *testin
 		},
 	}
 
-	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), candidate, true)
+	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), candidate, allRealNUMAsForRampUpFloor(p))
 	require.NoError(t, err)
 	require.Equal(t, 0, floor.Intersection(topology.CPUDetails.CPUsInNUMANodes(0)).Size(),
 		"steady exclusive NUMA must not receive a ramp-up immutable target, floor=%s", floor)
@@ -4150,7 +4165,7 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorToleratesFullyOccupiedNUMA(t *test
 		1: {DefaultCPUSet: coresInNUMA(topology, 1, 0, 4)},
 	}, false)
 
-	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), true)
+	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), allRealNUMAsForRampUpFloor(p))
 	require.NoError(t, err)
 	require.Equal(t, 0, floor.Intersection(numa0).Size(),
 		"fully occupied NUMA must keep a zero reclaim floor, floor=%s", floor)
@@ -4182,7 +4197,7 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorToleratesFullyOccupiedNUMAOverlap(
 		1: {DefaultCPUSet: machine.NewCPUSet(numa1.ToSliceInt()[:8]...)},
 	}, false)
 
-	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), true)
+	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), allRealNUMAsForRampUpFloor(p))
 	require.NoError(t, err)
 	require.Equal(t, 0, floor.Intersection(numa0).Size(),
 		"fully occupied NUMA must be excluded from the global target, floor=%s", floor)
@@ -4205,7 +4220,7 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorPreservesLegacyOverlapAlgorithm(t 
 	p.dynamicConfig.GetDynamicConfiguration().InitialRampUpReclaimCPUSetRatio = 0.5
 	p.state.SetDisableDedicatedCoresOverlapReclaimedCores(false, false)
 
-	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), true)
+	floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), allRealNUMAsForRampUpFloor(p))
 	require.NoError(t, err)
 	require.Equal(t, 4, floor.Size())
 }
@@ -4266,7 +4281,7 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorUsesDynamicConfiguredMinimum(t *te
 				p.conf.GetDynamicConfiguration().MinReclaimedResourceForAllocate = *tt.dynamicFloor
 			}
 
-			floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), true)
+			floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), allRealNUMAsForRampUpFloor(p))
 			require.NoError(t, err)
 			require.Equal(t, tt.wantFloorSize, floor.Size())
 			require.Equal(t, tt.wantFloorSize, machine.CalculateGlobalRampUpReclaimTarget(
@@ -4377,7 +4392,7 @@ func TestDynamicPolicyDeriveRampUpReclaimFloorBalancesGlobalTargetAcrossUnevenNU
 				}
 			}
 
-			floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), true)
+			floor, err := p.deriveRampUpReclaimFloor(p.state.GetMachineState(), p.state.GetPodEntries(), allRealNUMAsForRampUpFloor(p))
 			if tt.wantErr != "" {
 				require.ErrorContains(t, err, tt.wantErr)
 				return
@@ -4830,6 +4845,419 @@ func newDedicatedNUMAExclusiveFailureFixtureInDir(
 	return p, req
 }
 
+type dnbRollbackCauseTestError struct{}
+
+func (*dnbRollbackCauseTestError) Error() string { return "rollback cause" }
+
+type dnbPersistCauseTestError struct{}
+
+func (*dnbPersistCauseTestError) Error() string { return "persist cause" }
+
+type dnbRestoreCauseTestError struct{}
+
+func (*dnbRestoreCauseTestError) Error() string { return "restore cause" }
+
+type dnbTypedNilCauseTestError struct{}
+
+func (*dnbTypedNilCauseTestError) Error() string { return "typed nil cause" }
+func (*dnbTypedNilCauseTestError) Is(error) bool { panic("typed nil Is") }
+func (*dnbTypedNilCauseTestError) As(interface{}) bool {
+	panic("typed nil As")
+}
+func (*dnbTypedNilCauseTestError) Unwrap() error { panic("typed nil Unwrap") }
+
+type dnbCycleCauseTestError struct {
+	next error
+}
+
+func (*dnbCycleCauseTestError) Error() string { return "cycle cause" }
+func (e *dnbCycleCauseTestError) Unwrap() error {
+	return e.next
+}
+
+type dnbUncomparableCauseTestError []error
+
+func (dnbUncomparableCauseTestError) Error() string { return "uncomparable cause" }
+func (e dnbUncomparableCauseTestError) Unwrap() error {
+	if len(e) == 0 {
+		return nil
+	}
+	return e[0]
+}
+
+type dnbFuncCauseTestError func() error
+
+func (dnbFuncCauseTestError) Error() string { return "function cause" }
+func (e dnbFuncCauseTestError) Unwrap() error {
+	return e()
+}
+
+//go:noinline
+func newDNBFuncCauseTestError(cause error) dnbFuncCauseTestError {
+	return func() error { return cause }
+}
+
+type dnbSliceViewCauseTestError []error
+
+func (dnbSliceViewCauseTestError) Error() string { return "slice view cause" }
+func (e dnbSliceViewCauseTestError) Unwrap() error {
+	if len(e) == 0 {
+		return nil
+	}
+	return e[len(e)-1]
+}
+
+type dnbFuncMultiCauseTestError func() []error
+
+func (dnbFuncMultiCauseTestError) Error() string { return "function multi-cause" }
+func (e dnbFuncMultiCauseTestError) Unwrap() []error {
+	return e()
+}
+
+type dnbSliceMultiCauseTestError []error
+
+func (dnbSliceMultiCauseTestError) Error() string { return "slice multi-cause" }
+func (e dnbSliceMultiCauseTestError) Unwrap() []error {
+	return e
+}
+
+type dnbPanickingCauseTestError struct {
+	panicIs     bool
+	panicAs     bool
+	panicUnwrap bool
+}
+
+func (*dnbPanickingCauseTestError) Error() string { return "panicking cause" }
+func (e *dnbPanickingCauseTestError) Is(error) bool {
+	if e.panicIs {
+		panic("injected Is panic")
+	}
+	return false
+}
+func (e *dnbPanickingCauseTestError) As(interface{}) bool {
+	if e.panicAs {
+		panic("injected As panic")
+	}
+	return false
+}
+func (e *dnbPanickingCauseTestError) Unwrap() error {
+	if e.panicUnwrap {
+		panic("injected Unwrap panic")
+	}
+	return nil
+}
+
+func TestDNBAllocationFailureErrorSafelyTraversesHostileCauses(t *testing.T) {
+	stale := &frozenInitialSnapshotDriftTestError{}
+	wrappedStale := fmt.Errorf("wrapped stale: %w", stale)
+	ownershipLost := &requestStateOwnershipLostError{err: errors.New("ownership lost")}
+
+	selfCycle := &dnbCycleCauseTestError{}
+	selfCycle.next = selfCycle
+	mutualCycleA := &dnbCycleCauseTestError{}
+	mutualCycleB := &dnbCycleCauseTestError{next: mutualCycleA}
+	mutualCycleA.next = mutualCycleB
+	selfDNB := &dnbAllocationFailureError{}
+	selfDNB.adjustment = selfDNB
+	mutualDNBA := &dnbAllocationFailureError{}
+	mutualDNBB := &dnbAllocationFailureError{adjustment: mutualDNBA}
+	mutualDNBA.adjustment = mutualDNBB
+	var typedNil *dnbTypedNilCauseTestError
+
+	for _, tc := range []struct {
+		name    string
+		hostile error
+	}{
+		{name: "typed nil", hostile: typedNil},
+		{name: "self cycle", hostile: selfCycle},
+		{name: "mutual cycle", hostile: mutualCycleA},
+		{name: "self DNB cycle", hostile: selfDNB},
+		{name: "mutual DNB cycle", hostile: mutualDNBA},
+		{name: "uncomparable error", hostile: dnbUncomparableCauseTestError{wrappedStale}},
+		{name: "panicking Is", hostile: &dnbPanickingCauseTestError{panicIs: true}},
+		{name: "panicking As", hostile: &dnbPanickingCauseTestError{panicAs: true}},
+		{name: "panicking Unwrap", hostile: &dnbPanickingCauseTestError{panicUnwrap: true}},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			err := newDNBAllocationFailureError(tc.hostile, wrappedStale, ownershipLost, errors.New("restore"))
+
+			require.ErrorIs(t, err, bulkheadtopology.ErrCoordinatorPlanStale)
+			var typedStale *frozenInitialSnapshotDriftTestError
+			require.ErrorAs(t, err, &typedStale)
+			var typedOwnershipLost *requestStateOwnershipLostError
+			require.ErrorAs(t, err, &typedOwnershipLost)
+		})
+	}
+}
+
+func TestDNBAllocationFailureErrorPreservesStaleOwnershipLostCauseMatrix(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name        string
+		withPersist bool
+		withRestore bool
+	}{
+		{name: "rollback only"},
+		{name: "rollback and persist", withPersist: true},
+		{name: "rollback and restore", withRestore: true},
+		{name: "rollback persist and restore", withPersist: true, withRestore: true},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			stale := &frozenInitialSnapshotDriftTestError{}
+			rollbackCause := &dnbRollbackCauseTestError{}
+			ownershipLost := &requestStateOwnershipLostError{
+				err: fmt.Errorf("ownership rollback failed: %w", rollbackCause),
+			}
+			var persistErr error
+			if tc.withPersist {
+				persistErr = &dnbPersistCauseTestError{}
+			}
+			var restoreErr error
+			if tc.withRestore {
+				restoreErr = &dnbRestoreCauseTestError{}
+			}
+
+			err := newDNBAllocationFailureError(stale, ownershipLost, persistErr, restoreErr)
+
+			require.ErrorIs(t, err, bulkheadtopology.ErrCoordinatorPlanStale)
+			var typedStale *frozenInitialSnapshotDriftTestError
+			require.ErrorAs(t, err, &typedStale)
+			var typedOwnershipLost *requestStateOwnershipLostError
+			require.ErrorAs(t, err, &typedOwnershipLost)
+			var typedRollback *dnbRollbackCauseTestError
+			require.ErrorAs(t, err, &typedRollback)
+			require.ErrorIs(t, err, rollbackCause)
+
+			var typedPersist *dnbPersistCauseTestError
+			require.Equal(t, tc.withPersist, errors.As(err, &typedPersist))
+			if persistErr != nil {
+				require.ErrorIs(t, err, persistErr)
+			}
+			var typedRestore *dnbRestoreCauseTestError
+			require.Equal(t, tc.withRestore, errors.As(err, &typedRestore))
+			if restoreErr != nil {
+				require.ErrorIs(t, err, restoreErr)
+			}
+
+			require.ErrorContains(t, err, "apply DNB allocation and reclaim floor failed")
+			require.ErrorContains(t, err, "state rollback error")
+			require.ErrorContains(t, err, "state persistence error")
+			require.ErrorContains(t, err, "machine restore error")
+		})
+	}
+}
+
+func TestDNBAllocationFailureErrorDoesNotConflateFunctionOrSliceCauses(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		newCauses func(stale, rollback error) (error, error)
+	}{
+		{
+			name: "closures with the same code pointer",
+			newCauses: func(stale, rollback error) (error, error) {
+				return newDNBFuncCauseTestError(stale), newDNBFuncCauseTestError(rollback)
+			},
+		},
+		{
+			name: "slice views with the same backing pointer",
+			newCauses: func(stale, rollback error) (error, error) {
+				backing := dnbSliceViewCauseTestError{stale, rollback}
+				return backing[:1], backing[:2]
+			},
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			stale := &frozenInitialSnapshotDriftTestError{}
+			rollback := &dnbRollbackCauseTestError{}
+			first, second := tc.newCauses(stale, rollback)
+			require.Equal(t, reflect.ValueOf(first).Pointer(), reflect.ValueOf(second).Pointer())
+			err := newDNBAllocationFailureError(first, second, nil, nil)
+
+			require.ErrorIs(t, err, bulkheadtopology.ErrCoordinatorPlanStale)
+			require.ErrorIs(t, err, rollback)
+			var typedStale *frozenInitialSnapshotDriftTestError
+			require.ErrorAs(t, err, &typedStale)
+			var typedRollback *dnbRollbackCauseTestError
+			require.ErrorAs(t, err, &typedRollback)
+		})
+	}
+}
+
+func TestDNBAllocationFailureErrorBoundsFunctionAndSliceMultiCauseSelfCycles(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		newCycle func() error
+	}{
+		{
+			name: "function",
+			newCycle: func() error {
+				var cycle dnbFuncMultiCauseTestError
+				cycle = func() []error {
+					return []error{cycle, cycle}
+				}
+				return cycle
+			},
+		},
+		{
+			name: "slice",
+			newCycle: func() error {
+				cycle := make(dnbSliceMultiCauseTestError, 2)
+				cycle[0] = cycle
+				cycle[1] = cycle
+				return cycle
+			},
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			err := newDNBAllocationFailureError(tc.newCycle(), nil, nil, nil)
+			unmatched := errors.New("unmatched")
+
+			for _, query := range []struct {
+				name string
+				run  func() bool
+			}{
+				{
+					name: "Is",
+					run: func() bool {
+						return errors.Is(err, unmatched)
+					},
+				},
+				{
+					name: "As",
+					run: func() bool {
+						var typedRollback *dnbRollbackCauseTestError
+						return errors.As(err, &typedRollback)
+					},
+				},
+			} {
+				t.Run(query.name, func(t *testing.T) {
+					require.False(t, query.run())
+					allocations := testing.AllocsPerRun(1, func() {
+						_ = query.run()
+					})
+					require.LessOrEqual(t, allocations, float64(dnbErrorTraversalMaxVisits+32),
+						"one bounded traversal must keep allocations proportional to the global visit budget")
+				})
+			}
+		})
+	}
+}
+
+func TestDNBAllocationFailureErrorMatchesOrdinaryMultiCauseBeyondLegacyDepth(t *testing.T) {
+	stale := &frozenInitialSnapshotDriftTestError{}
+	var cause error = stale
+	for i := 0; i < 128; i++ {
+		child := cause
+		cause = dnbFuncMultiCauseTestError(func() []error {
+			return []error{errors.New("decoy"), child}
+		})
+	}
+	err := newDNBAllocationFailureError(cause, nil, nil, nil)
+
+	require.ErrorIs(t, err, bulkheadtopology.ErrCoordinatorPlanStale)
+	var typedStale *frozenInitialSnapshotDriftTestError
+	require.ErrorAs(t, err, &typedStale)
+}
+
+func TestDNBAllocationFailureErrorPreservesOrdinarySingleCause(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		newError func(error) error
+	}{
+		{
+			name: "adjustment",
+			newError: func(cause error) error {
+				return newDNBAllocationFailureError(cause, nil, nil, nil)
+			},
+		},
+		{
+			name: "rollback",
+			newError: func(cause error) error {
+				return newDNBAllocationFailureError(nil, cause, nil, nil)
+			},
+		},
+		{
+			name: "persist",
+			newError: func(cause error) error {
+				return newDNBAllocationFailureError(nil, nil, cause, nil)
+			},
+		},
+		{
+			name: "restore",
+			newError: func(cause error) error {
+				return newDNBAllocationFailureError(nil, nil, nil, cause)
+			},
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cause := errors.New("ordinary " + tc.name + " cause")
+			err := tc.newError(cause)
+			require.Error(t, err)
+			require.ErrorIs(t, err, cause)
+			require.NotContains(t, fmt.Sprintf("%T", err), "joinError")
+		})
+	}
+}
+
+func TestAllocatePropagatesTopologyStaleWithoutAdmissionRetryOrStateChange(t *testing.T) {
+	stateDir := t.TempDir()
+	p, req := newDedicatedNUMAExclusiveFailureFixtureInDir(
+		t, "exclusive-dnb-topology-stale", stateDir)
+	req.Annotations[apiconsts.PodAnnotationMemoryEnhancementKey] =
+		`{"numa_binding":"true","numa_exclusive":"true"}`
+	beforeRevision := p.state.GetRevision()
+	beforeEntries := p.state.GetPodEntries()
+	beforeMachineState := p.state.GetMachineState()
+	admissionCalls := 0
+	restoreCalls := 0
+	p.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
+		"always-stale": func(_ context.Context, in dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
+			if in.Mode == dynamicpolicyutil.CPUSetAdjustmentModeAdmission {
+				admissionCalls++
+				return &frozenInitialSnapshotDriftTestError{}
+			}
+			restoreCalls++
+			return nil
+		},
+	}
+
+	resp, err := p.Allocate(context.Background(), req)
+
+	require.Nil(t, resp)
+	require.ErrorIs(t, err, bulkheadtopology.ErrCoordinatorPlanStale)
+	require.Equal(t, 1, admissionCalls)
+	require.Equal(t, 1, restoreCalls)
+	require.Greater(t, p.state.GetRevision(), beforeRevision,
+		"the failed candidate and compensating rollback must retain monotonic CAS revisions")
+	require.Equal(t, beforeEntries, p.state.GetPodEntries())
+	require.Equal(t, beforeMachineState, p.state.GetMachineState())
+	restarted, restartErr := getTestDynamicPolicyWithoutInitialization(
+		p.machineInfo.CPUTopology, stateDir)
+	require.NoError(t, restartErr)
+	require.Equal(t, beforeEntries, restarted.state.GetPodEntries())
+	restartedMachineState := restarted.state.GetMachineState()
+	require.Equal(t, beforeMachineState[0].DefaultCPUSet, restartedMachineState[0].DefaultCPUSet)
+	require.Equal(t, beforeMachineState[0].AllocatedCPUSet, restartedMachineState[0].AllocatedCPUSet)
+	require.NoFileExists(t, p.advisorPostCommitStagingPath())
+	require.NoFileExists(t, p.advisorPostCommitCheckpointPath())
+	require.Nil(t, p.currentAdvisorPostCommitTarget())
+}
+
 func TestAllocateDedicatedNUMAExclusiveAdjustmentRollbackStoreFailureKeepsCanonicalMemoryAndDisk(t *testing.T) {
 	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
 	require.NoError(t, err)
@@ -4998,7 +5426,8 @@ func TestAllocateDedicatedNUMAExclusiveAdjustmentFailureDoesNotRollbackNewerStat
 func TestAllocateDedicatedNUMAExclusiveAdjustmentFailureDoesNotRestoreConcurrentlyDeletedCandidate(t *testing.T) {
 	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
 	require.NoError(t, err)
-	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+	stateDir := t.TempDir()
+	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, stateDir)
 	require.NoError(t, err)
 	p.reservedCPUs = machine.NewCPUSet()
 	p.reservedReclaimedCPUSet = machine.NewCPUSet()
@@ -5061,6 +5490,7 @@ func TestAllocateDedicatedNUMAExclusiveAdjustmentFailureDoesNotRestoreConcurrent
 	entries := p.state.GetPodEntries()
 	delete(entries, podUID)
 	p.state.SetPodEntries(entries, false)
+	deletedRevision := p.state.GetRevision()
 	p.Unlock()
 	close(releaseAdjustment)
 
@@ -5077,6 +5507,19 @@ func TestAllocateDedicatedNUMAExclusiveAdjustmentFailureDoesNotRestoreConcurrent
 	case <-time.After(time.Second):
 		t.Fatal("concurrent-delete ownership loss did not schedule a latest-state reconciliation")
 	}
+	p.cpuSetAdjustmentRetryWG.Wait()
+	require.Equal(t, deletedRevision, p.state.GetRevision(),
+		"latest-state retry must not roll the in-memory revision backward")
+
+	restarted, err := state.NewCheckpointState(
+		&statedirectory.StateDirectoryConfiguration{StateFileDirectory: stateDir},
+		"cpu_plugin_state", "dynamic", p.machineInfo.CPUTopology, false,
+		generateMachineStateFromPodEntries, metrics.DummyMetrics{})
+	require.NoError(t, err)
+	require.Equal(t, deletedRevision, restarted.GetRevision(),
+		"background persistence must store the latest in-memory revision")
+	require.Nil(t, restarted.GetAllocationInfo(podUID, "main"),
+		"the concurrently deleted candidate must not resurrect after restart")
 }
 
 func TestAllocateDedicatedNUMAExclusiveApplyFailureRestoresSourceAndRetriesSameStage(t *testing.T) {
@@ -5261,7 +5704,7 @@ func TestAllocateDedicatedNUMAExclusiveRollbackPersistsSourceDespitePersistentRe
 		"the failed candidate must not resurrect after restart")
 }
 
-func TestAllocateDedicatedNUMAExclusiveAdjustmentFailureReportsOwnershipLostAndReconcilesLatestState(t *testing.T) {
+func TestAllocateDedicatedNUMAExclusiveStaleAdjustmentPreservesOwnershipLostAndLatestState(t *testing.T) {
 	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
 	require.NoError(t, err)
 	p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
@@ -5277,12 +5720,14 @@ func TestAllocateDedicatedNUMAExclusiveAdjustmentFailureReportsOwnershipLostAndR
 	adjustmentStarted := make(chan struct{})
 	releaseAdjustment := make(chan struct{})
 	latestStateReconciled := make(chan struct{}, 1)
+	admissionCalls := 0
 	p.cpuSetAdjustmentHandlers = map[string]dynamicpolicyutil.CPUSetAdjustmentHandler{
 		"failing": func(_ context.Context, in dynamicpolicyutil.CPUSetAdjustmentHandlerCtx) error {
 			if in.Mode == dynamicpolicyutil.CPUSetAdjustmentModeAdmission {
+				admissionCalls++
 				close(adjustmentStarted)
 				<-releaseAdjustment
-				return errors.New("injected adjustment failure")
+				return &frozenInitialSnapshotDriftTestError{}
 			}
 			latestStateReconciled <- struct{}{}
 			return nil
@@ -5325,12 +5770,16 @@ func TestAllocateDedicatedNUMAExclusiveAdjustmentFailureReportsOwnershipLostAndR
 
 	allocationErr := <-result
 	require.Error(t, allocationErr)
+	require.ErrorIs(t, allocationErr, bulkheadtopology.ErrCoordinatorPlanStale)
+	var typedStale *frozenInitialSnapshotDriftTestError
+	require.ErrorAs(t, allocationErr, &typedStale)
 	var compensated *requestStateCompensatedError
 	require.ErrorAs(t, allocationErr, &compensated)
-	var ownershipLost interface{ OwnershipLost() bool }
+	var ownershipLost *requestStateOwnershipLostError
 	require.ErrorAs(t, allocationErr, &ownershipLost)
 	require.True(t, ownershipLost.OwnershipLost())
 	require.ErrorContains(t, allocationErr, "ownership lost")
+	require.Equal(t, 1, admissionCalls, "stale admission adjustment must not be retried")
 	require.True(t, p.state.GetAllocationInfo(podUID, "main").AllocationResult.Equals(advanced.AllocationResult),
 		"outer stale snapshot rollback overwrote the advanced allocation")
 	select {
@@ -5338,6 +5787,8 @@ func TestAllocateDedicatedNUMAExclusiveAdjustmentFailureReportsOwnershipLostAndR
 	case <-time.After(time.Second):
 		t.Fatal("ownership loss did not schedule a latest-state reconciliation")
 	}
+	require.True(t, p.state.GetAllocationInfo(podUID, "main").AllocationResult.Equals(advanced.AllocationResult),
+		"latest-state reconciliation changed the concurrently advanced allocation")
 }
 
 func TestAllocateDedicatedNUMAExclusiveRestoreFailureMarksDirtyAndSchedulesBoundedFullRetry(t *testing.T) {
@@ -5621,6 +6072,9 @@ func TestAllocateRestoresPreviousDNBWhenAtomicCommitFails(t *testing.T) {
 		AllocationResult:         machine.NewCPUSet(0, 1),
 		OriginalAllocationResult: machine.NewCPUSet(0, 1),
 		RampUp:                   true,
+		TopologyAwareAssignments: map[int]machine.CPUSet{
+			0: machine.NewCPUSet(0, 1),
+		},
 	}
 	p.state.SetAllocationInfo(podUID, "main", oldAllocation, false)
 	tracked := &atomicCommitTrackingState{
@@ -7417,4 +7871,339 @@ func TestNewRampUpPlanningPolicyPreservesCPUAdvisorState(t *testing.T) {
 		"planning policy must use a no-op metric emitter")
 	require.Same(t, p.advisorMonitor, planningPolicy.advisorMonitor,
 		"planning policy should share advisor health monitor with outer policy")
+}
+
+// ============================================================================
+// F1 closure tests: pool-adjustment path (applyPoolsAndIsolatedInfo) ramp-up
+// shared / reclaim overlap. These exercise the real production commit path
+// (source: "pool adjustment") rather than the rematerialization helper alone.
+// ============================================================================
+
+// newPoolAdjustmentRampUpTestPolicy builds a DynamicPolicy on the 2-NUMA dummy
+// topology (NUMA0={0,1,4,5}, NUMA1={2,3,6,7}; SMT pairs (0,4)(1,5)(2,6)(3,7))
+// with reserved core {0,4}. EnableReclaim is always on; HP and AO are
+// parameterised.
+func newPoolAdjustmentRampUpTestPolicy(t *testing.T, hardPartition, allowOverlap bool) *DynamicPolicy {
+	t.Helper()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reservedCPUs = machine.NewCPUSet(0, 4)
+
+	dynamicConf := p.dynamicConfig.GetDynamicConfiguration()
+	dynamicConf.EnableReclaim = true
+	dynamicConf.EnableRampUpReclaimHardPartition = hardPartition
+	p.state.SetAllowSharedCoresOverlapReclaimedCores(allowOverlap, false)
+	p.state.SetDisableDedicatedCoresOverlapReclaimedCores(false, false)
+
+	return p
+}
+
+// poolAdjustmentRampUpCurEntries seeds one plain shared ramp-up pod and an
+// empty reclaim pool entry. The ramp-up pod's initial allocation is
+// irrelevant: applyPoolsAndIsolatedInfo reassigns it to rampUpCPUs.
+func poolAdjustmentRampUpCurEntries() state.PodEntries {
+	return state.PodEntries{
+		"ramp-up-pod": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "ramp-up-pod",
+					PodNamespace:  "default",
+					PodName:       "ramp-up-pod",
+					ContainerName: "main",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+				},
+				RampUp:           true,
+				AllocationResult: machine.NewCPUSet(2, 6),
+				RequestQuantity:  1,
+			},
+		},
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(),
+			},
+		},
+	}
+}
+
+// poolAdjustmentRampUpPoolsCPUSet places the reclaim pool on NUMA1 core {2,6}.
+func poolAdjustmentRampUpPoolsCPUSet() map[string]machine.CPUSet {
+	return map[string]machine.CPUSet{
+		commonstate.PoolNameReclaim: machine.NewCPUSet(2, 6),
+	}
+}
+
+// TestApplyPoolsAndIsolatedInfoRampUpSharedReclaimOverlapQuadrants covers the
+// HP x AO quadrant matrix on the pool-adjustment commit path
+// (applyPoolsAndIsolatedInfo, source: "pool adjustment"). rampUpCPUs is
+// computed to include the reclaim pool (only the ramp-up reclaim floor is
+// subtracted), so without rematerialization the ramp-up shared allocation
+// would overlap the final reclaim pool in every quadrant.
+//
+// With reserved={0,4} and reclaim={2,6}: rampUpCPUs={1,2,3,5,6,7}; the
+// canonical rematerialization keeps whole cores {1,5} (NUMA0) and {3,7}
+// (NUMA1) only, i.e. {1,3,5,7}.
+func TestApplyPoolsAndIsolatedInfoRampUpSharedReclaimOverlapQuadrants(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name                 string
+		hardPartition        bool
+		allowOverlap         bool
+		wantRampUpAllocation machine.CPUSet
+	}{
+		{
+			name:                 "hp disabled ao disabled keeps overlap",
+			hardPartition:        false,
+			allowOverlap:         false,
+			wantRampUpAllocation: machine.NewCPUSet(1, 2, 3, 5, 6, 7),
+		},
+		{
+			name:                 "hp disabled ao enabled keeps overlap",
+			hardPartition:        false,
+			allowOverlap:         true,
+			wantRampUpAllocation: machine.NewCPUSet(1, 2, 3, 5, 6, 7),
+		},
+		{
+			name:                 "hp enabled ao disabled rematerializes",
+			hardPartition:        true,
+			allowOverlap:         false,
+			wantRampUpAllocation: machine.NewCPUSet(1, 3, 5, 7),
+		},
+		{
+			name:                 "hp enabled ao enabled rematerializes",
+			hardPartition:        true,
+			allowOverlap:         true,
+			wantRampUpAllocation: machine.NewCPUSet(1, 3, 5, 7),
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			p := newPoolAdjustmentRampUpTestPolicy(t, tc.hardPartition, tc.allowOverlap)
+			p.state.SetPodEntries(poolAdjustmentRampUpCurEntries(), false)
+
+			err := p.applyPoolsAndIsolatedInfo(
+				poolAdjustmentRampUpPoolsCPUSet(),
+				map[string]map[string]machine.CPUSet{},
+				p.state.GetPodEntries(),
+				p.state.GetMachineState(),
+				sets.NewInt(),
+				false,
+				machine.NewCPUSet(),
+				defaultShareMaterializationPlan{},
+				p.state.GetRevision(),
+			)
+			require.NoError(t, err)
+
+			reclaim := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+			require.NotNil(t, reclaim)
+			require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(2, 6)),
+				"final reclaim pool: %s", reclaim.AllocationResult.String())
+
+			got := p.state.GetAllocationInfo("ramp-up-pod", "main")
+			require.NotNil(t, got)
+			require.True(t, got.AllocationResult.Equals(tc.wantRampUpAllocation),
+				"ramp-up shared allocation: %s, want %s",
+				got.AllocationResult.String(), tc.wantRampUpAllocation.String())
+
+			if tc.hardPartition {
+				require.True(t, got.AllocationResult.Intersection(reclaim.AllocationResult).IsEmpty(),
+					"ramp-up shared allocation must be mutually exclusive with the final reclaim pool")
+				require.True(t, got.OriginalAllocationResult.Equals(tc.wantRampUpAllocation))
+			}
+
+			// Zero churn across frames: re-applying the same adjustment must
+			// converge to the same allocation instead of oscillating.
+			err = p.applyPoolsAndIsolatedInfo(
+				poolAdjustmentRampUpPoolsCPUSet(),
+				map[string]map[string]machine.CPUSet{},
+				p.state.GetPodEntries(),
+				p.state.GetMachineState(),
+				sets.NewInt(),
+				false,
+				machine.NewCPUSet(),
+				defaultShareMaterializationPlan{},
+				p.state.GetRevision(),
+			)
+			require.NoError(t, err)
+			gotAgain := p.state.GetAllocationInfo("ramp-up-pod", "main")
+			require.NotNil(t, gotAgain)
+			require.True(t, gotAgain.AllocationResult.Equals(tc.wantRampUpAllocation),
+				"second frame must be idempotent, got %s", gotAgain.AllocationResult.String())
+		})
+	}
+}
+
+// TestApplyPoolsAndIsolatedInfoSteadySharedUnaffectedByHardPartition verifies
+// that the hard-partition rematerialization does not touch steady (non-ramp-up)
+// shared allocations: their allocation is taken verbatim from the share pool
+// and is never rewritten by rematerializeRampUpSharedAgainstFinalReclaim
+// (which filters on ai.RampUp).
+func TestApplyPoolsAndIsolatedInfoSteadySharedUnaffectedByHardPartition(t *testing.T) {
+	t.Parallel()
+
+	p := newPoolAdjustmentRampUpTestPolicy(t, true, true)
+	entries := poolAdjustmentRampUpCurEntries()
+	entries["steady-pod"] = state.ContainerEntries{
+		"main": &state.AllocationInfo{
+			AllocationMeta: commonstate.AllocationMeta{
+				PodUid:        "steady-pod",
+				PodNamespace:  "default",
+				PodName:       "steady-pod",
+				ContainerName: "main",
+				OwnerPoolName: commonstate.PoolNameShare,
+				QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+			},
+			AllocationResult: machine.NewCPUSet(2, 3, 6, 7),
+			RequestQuantity:  1,
+		},
+	}
+	delete(entries, "ramp-up-pod")
+	entries[commonstate.PoolNameShare] = state.ContainerEntries{
+		commonstate.FakedContainerName: &state.AllocationInfo{
+			AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+			AllocationResult: machine.NewCPUSet(2, 3, 6, 7),
+		},
+	}
+	p.state.SetPodEntries(entries, false)
+
+	poolsCPUSet := poolAdjustmentRampUpPoolsCPUSet()
+	poolsCPUSet[commonstate.PoolNameShare] = machine.NewCPUSet(2, 3, 6, 7)
+
+	err := p.applyPoolsAndIsolatedInfo(
+		poolsCPUSet,
+		map[string]map[string]machine.CPUSet{},
+		p.state.GetPodEntries(),
+		p.state.GetMachineState(),
+		sets.NewInt(),
+		false,
+		machine.NewCPUSet(),
+		defaultShareMaterializationPlan{},
+		p.state.GetRevision(),
+	)
+	require.NoError(t, err)
+
+	// Steady shared allocation is taken verbatim from the share pool and is
+	// never touched by rematerialization (which filters on ai.RampUp).
+	got := p.state.GetAllocationInfo("steady-pod", "main")
+	require.NotNil(t, got)
+	require.True(t, got.AllocationResult.Equals(machine.NewCPUSet(2, 3, 6, 7)),
+		"steady shared allocation must be untouched by rematerialization: %s",
+		got.AllocationResult.String())
+	require.False(t, got.RampUp, "steady pod must not have RampUp flag")
+}
+
+// TestApplyPoolsAndIsolatedInfoSNBRampUpRematerializedAgainstFinalReclaim
+// covers the SNB (SharedNUMABinding) ramp-up branch on the pool-adjustment
+// path: because preservedSNBRampUp is nil here, the rematerialization must
+// shrink the SNB ramp-up allocation canonically (whole core, inside its NUMA)
+// instead of preserving the overlap.
+func TestApplyPoolsAndIsolatedInfoSNBRampUpRematerializedAgainstFinalReclaim(t *testing.T) {
+	t.Parallel()
+
+	p := newPoolAdjustmentRampUpTestPolicy(t, true, true)
+	topology := p.machineInfo.CPUTopology
+	numa1CPUs := topology.CPUDetails.CPUsInNUMANodes(1)
+	require.True(t, numa1CPUs.Equals(machine.NewCPUSet(2, 3, 6, 7)))
+
+	assignments, err := machine.GetNumaAwareAssignments(topology, numa1CPUs)
+	require.NoError(t, err)
+	entries := state.PodEntries{
+		"snb-ramp-up-pod": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "snb-ramp-up-pod",
+					PodNamespace:  "default",
+					PodName:       "snb-ramp-up-pod",
+					ContainerName: "main",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+					Annotations: map[string]string{
+						apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+						cpuconsts.CPUStateAnnotationKeyNUMAHint:             "1",
+					},
+				},
+				RampUp:                           true,
+				AllocationResult:                 numa1CPUs.Clone(),
+				OriginalAllocationResult:         numa1CPUs.Clone(),
+				TopologyAwareAssignments:         assignments,
+				OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(assignments),
+				RequestQuantity:                  2,
+			},
+		},
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(),
+			},
+		},
+	}
+	p.state.SetPodEntries(entries, false)
+
+	err = p.applyPoolsAndIsolatedInfo(
+		poolAdjustmentRampUpPoolsCPUSet(),
+		map[string]map[string]machine.CPUSet{},
+		p.state.GetPodEntries(),
+		p.state.GetMachineState(),
+		sets.NewInt(1),
+		false,
+		machine.NewCPUSet(),
+		defaultShareMaterializationPlan{},
+		p.state.GetRevision(),
+	)
+	require.NoError(t, err)
+
+	reclaim := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	require.NotNil(t, reclaim)
+	require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(2, 6)),
+		"final reclaim pool: %s", reclaim.AllocationResult.String())
+
+	got := p.state.GetAllocationInfo("snb-ramp-up-pod", "main")
+	require.NotNil(t, got)
+	require.True(t, got.AllocationResult.Intersection(reclaim.AllocationResult).IsEmpty(),
+		"SNB ramp-up allocation must be mutually exclusive with the final reclaim pool: %s",
+		got.AllocationResult.String())
+	require.True(t, got.AllocationResult.Equals(machine.NewCPUSet(3, 7)),
+		"SNB ramp-up allocation: %s, want {3,7}", got.AllocationResult.String())
+}
+
+// TestApplyPoolsAndIsolatedInfoNoRampUpSkipsRematerialization verifies that
+// when no active ramp-up allocation is present, the rematerialization gate is
+// closed and the pool-adjustment path behaves exactly as before (no extra
+// validation, no churn).
+func TestApplyPoolsAndIsolatedInfoNoRampUpSkipsRematerialization(t *testing.T) {
+	t.Parallel()
+
+	p := newPoolAdjustmentRampUpTestPolicy(t, true, false)
+	entries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(),
+			},
+		},
+	}
+	p.state.SetPodEntries(entries, false)
+
+	revisionBefore := p.state.GetRevision()
+	err := p.applyPoolsAndIsolatedInfo(
+		poolAdjustmentRampUpPoolsCPUSet(),
+		map[string]map[string]machine.CPUSet{},
+		p.state.GetPodEntries(),
+		p.state.GetMachineState(),
+		sets.NewInt(),
+		false,
+		machine.NewCPUSet(),
+		defaultShareMaterializationPlan{},
+		p.state.GetRevision(),
+	)
+	require.NoError(t, err)
+	// revision advanced exactly once by the commit CAS
+	require.Equal(t, revisionBefore+1, p.state.GetRevision(),
+		"revision should advance by exactly one commit, got %d -> %d",
+		revisionBefore, p.state.GetRevision())
 }

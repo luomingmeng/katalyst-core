@@ -595,7 +595,7 @@ func (p *DynamicPolicy) persistPodDeletionAfterAdjustFailure(
 		disableDedicated: p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
 		persist:          true,
 		source:           "deletion fallback",
-		validate:         p.validatePendingAdvisorPartitionView,
+		validate:         p.validatePendingAdvisorPartitionViewWithRampUpExclusion,
 	})
 	return err
 }

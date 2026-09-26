@@ -411,8 +411,13 @@ func (p *DynamicPolicy) getAdviceFromAdvisor(ctx context.Context) (isImplemented
 		}
 	}
 
+	// Convert the advisor response into internal entries before taking the policy
+	// lock. Target-driven reclaim is gated later by runtime config, not by
+	// any wire-level negotiation.
+	convertedResp := convertGetAdviceResponse(resp)
+
 	err = p.allocateByCPUAdvisorAtRevision(
-		request, convertGetAdviceResponse(resp), resp.SupportedFeatureGates, requestRevision)
+		request, convertedResp, resp.SupportedFeatureGates, requestRevision)
 	if err != nil {
 		return true, fmt.Errorf("allocate by GetAdvice response failed with error: %w", err)
 	}
@@ -540,6 +545,13 @@ func (p *DynamicPolicy) lwCPUAdvisorServer(stopCh <-chan struct{}) error {
 	}
 }
 
+// advisorRequestHasActiveRampUp reports whether the advisor request carries any
+// active ramp-up. This is a node-global observation used for the stale check
+// on both the hard-partition-enabled and disabled paths: the advisor request
+// carries no allocation annotations, so per-domain ramp-up resolution is not
+// possible on the request side. Domain-scoped hard-partition enforcement is
+// derived from currentEntries (authoritative snapshot) and re-derived from
+// newEntries on the response side.
 func advisorRequestHasActiveRampUp(req *advisorapi.GetAdviceRequest) bool {
 	if req == nil {
 		return false
@@ -647,36 +659,51 @@ func (p *DynamicPolicy) allocateByCPUAdvisorWithRevision(
 	}
 
 	currentEntries := p.state.GetPodEntries()
-	currentRampUpActive := currentEntries.HasActiveRampUp()
 	attemptConfig, err := p.captureAdvisorAttemptConfiguration()
 	if err != nil {
 		return fmt.Errorf("capture advisor attempt dynamic configuration: %w", err)
 	}
-	requestRampUpActive := currentRampUpActive
+
+	// Staleness is checked with the node-global ramp-up observation on both
+	// paths. The advisorapi request side carries no pod annotations, so a
+	// NUMA-binding reclaim domain cannot be resolved from the request alone;
+	// enforcing per-domain consistency from the request would be semantically
+	// asymmetric (a non-binding shared ramp-up maps to the global domain on the
+	// state side but to a single-NUMA placement on the request side). The
+	// domain-scoped enforcement is instead derived solely from the committed
+	// currentEntries, and the per-domain agreement is re-derived on the
+	// response-side newEntries before it is materialized.
+	hardPartitionEnabled := isRampUpReclaimHardPartitionEnabledWithConfig(attemptConfig.dynamic)
+	currentRampUpActive := currentEntries.HasActiveRampUp()
 	if req != nil {
-		requestRampUpActive = advisorRequestHasActiveRampUp(req)
+		requestRampUpActive := advisorRequestHasActiveRampUp(req)
 		if requestRampUpActive != currentRampUpActive {
 			return fmt.Errorf("advisor request ramp-up state is stale")
 		}
-		vErr := p.advisorValidator.ValidateRequest(req)
-		if vErr != nil {
+		if vErr := p.advisorValidator.ValidateRequest(req); vErr != nil {
 			return fmt.Errorf("ValidateCPUAdvisorReq failed with error: %v", vErr)
 		}
+	}
+	hardActiveDomains := sets.NewInt()
+	if hardPartitionEnabled && currentRampUpActive {
+		resolvedDomains, dErr := currentEntries.ActiveRampUpDomains(p.machineInfo.CPUTopology)
+		if dErr != nil {
+			return fmt.Errorf("resolve current active ramp-up domains for advisor: %w", dErr)
+		}
+		hardActiveDomains = resolvedDomains
 	}
 	vErr := p.validateAdvisorResponseWithDynamicConfig(resp, attemptConfig.dynamic)
 	if vErr != nil {
 		return fmt.Errorf("ValidateCPUAdvisorResp failed with error: %v", vErr)
 	}
 
-	hardActive := isRampUpReclaimHardPartitionEnabledWithConfig(attemptConfig.dynamic) &&
-		requestRampUpActive
 	blockToCPUSet, checkpointTransition, aErr := p.generateBlockCPUSetWithCheckpointTransitionForAttempt(
-		resp, featureGates, hardActive, attemptConfig)
+		resp, featureGates, hardActiveDomains, attemptConfig)
 	if aErr != nil {
-		return fmt.Errorf("generateBlockCPUSet failed with error: %v", aErr)
+		return fmt.Errorf("generateBlockCPUSet failed with error: %w", aErr)
 	}
 	if err := p.validateHardPartitionBlockPlanWithDynamicConfig(
-		resp, blockToCPUSet, hardActive, attemptConfig.floor); err != nil {
+		resp, blockToCPUSet, hardActiveDomains, attemptConfig.floor); err != nil {
 		return fmt.Errorf("validate hard-partition reclaim block plan failed: %w", err)
 	}
 
@@ -687,6 +714,7 @@ func (p *DynamicPolicy) allocateByCPUAdvisorWithRevision(
 	}
 
 	responseAllowOverlap := resp.AllowSharedCoresOverlapReclaimedCores
+	hardActive := rampUpDomainsToLegacyHardActive(hardActiveDomains)
 	pending, applyErr := p.applyBlocksWithDynamicConfig(
 		blockToCPUSet, resp, responseAllowOverlap, hardActive, attemptConfig)
 	if applyErr != nil {
@@ -1509,6 +1537,14 @@ func (p *DynamicPolicy) generateReclaimBlockCPUSet(
 
 // generateBlockCPUSet keeps legacy allocation completely isolated from the negotiated
 // dedicated/reclaim disjoint planner.
+// rampUpDomainsToLegacyHardActive converts the domain-scoped ramp-up set into the
+// node-global boolean used by the legacy block-planning helpers. The per-NUMA
+// scoping happens upstream; here we only need to know whether any ramp-up domain
+// is active.
+func rampUpDomainsToLegacyHardActive(hardActiveDomains sets.Int) bool {
+	return hardActiveDomains.Len() > 0
+}
+
 func (p *DynamicPolicy) generateBlockCPUSet(
 	resp *advisorapi.ListAndWatchResponse,
 	featureGates map[string]*advisorsvc.FeatureGate,
@@ -1528,20 +1564,25 @@ func (p *DynamicPolicy) generateBlockCPUSetWithCheckpointTransition(
 	steadyFakeNUMAMigrationCheckpointTransition,
 	error,
 ) {
+	domains := sets.NewInt()
+	if hardActive {
+		domains.Insert(commonstate.FakedNUMAID)
+	}
 	return p.generateBlockCPUSetWithCheckpointTransitionForAttempt(
-		resp, featureGates, hardActive, p.currentAdvisorAttemptConfiguration())
+		resp, featureGates, domains, p.currentAdvisorAttemptConfiguration())
 }
 
 func (p *DynamicPolicy) generateBlockCPUSetWithCheckpointTransitionForAttempt(
 	resp *advisorapi.ListAndWatchResponse,
 	featureGates map[string]*advisorsvc.FeatureGate,
-	hardActive bool,
+	hardActiveDomains sets.Int,
 	attemptConfig advisorAttemptConfiguration,
 ) (
 	advisorapi.BlockCPUSet,
 	steadyFakeNUMAMigrationCheckpointTransition,
 	error,
 ) {
+	hardActive := rampUpDomainsToLegacyHardActive(hardActiveDomains)
 	keep := steadyFakeNUMAMigrationCheckpointTransition{
 		kind: steadyFakeNUMAMigrationCheckpointKeep,
 	}
@@ -1581,16 +1622,21 @@ func (p *DynamicPolicy) validateHardPartitionBlockPlan(
 	if p != nil && p.conf != nil {
 		dynamicConf = p.conf.GetDynamicConfiguration()
 	}
+	domains := sets.NewInt()
+	if hardActive {
+		domains.Insert(commonstate.FakedNUMAID)
+	}
 	return p.validateHardPartitionBlockPlanWithDynamicConfig(
-		resp, blockCPUSet, hardActive, dynamicConf)
+		resp, blockCPUSet, domains, dynamicConf)
 }
 
 func (p *DynamicPolicy) validateHardPartitionBlockPlanWithDynamicConfig(
 	resp *advisorapi.ListAndWatchResponse,
 	blockCPUSet advisorapi.BlockCPUSet,
-	hardActive bool,
+	hardActiveDomains sets.Int,
 	dynamicConf *dynamicconfig.Configuration,
 ) error {
+	hardActive := rampUpDomainsToLegacyHardActive(hardActiveDomains)
 	if !hardActive {
 		return nil
 	}
@@ -2363,8 +2409,16 @@ func (p *DynamicPolicy) applyBlocksWithDynamicConfig(
 		}
 		rampUpReclaimFloor = reclaimInfo.AllocationResult.Clone()
 	} else if hardActive {
+		// The floor follows the ramp-up domains recorded in the negotiated
+		// newEntries (the derive function unions its own derivation with the
+		// passed-in set, which is empty here because no further allocation is
+		// entering mid-advisor).
+		negotiatedRampUpDomains, dErr := newEntries.ActiveRampUpDomains(p.machineInfo.CPUTopology)
+		if dErr != nil {
+			return nil, fmt.Errorf("resolve negotiated ramp-up domains for advisor floor: %w", dErr)
+		}
 		legacyFloor, err := p.deriveRampUpReclaimFloorForModeWithDynamicConfig(
-			currentMachineState, newEntries, hardActive, false, attemptConfig)
+			currentMachineState, newEntries, negotiatedRampUpDomains, false, attemptConfig)
 		if err != nil {
 			return nil, fmt.Errorf("derive reclaim floor for advisor ramp-up failed: %w", err)
 		}
@@ -2404,6 +2458,13 @@ func (p *DynamicPolicy) applyBlocksWithDynamicConfig(
 		return nil, fmt.Errorf("unable to calculate topologyAwareAssignments for rampUpCPUs, result cpuset: %s, error: %v",
 			rampUpCPUs.String(), err)
 	}
+
+	// preservedSNBRampUp records the unadvised shared-numa-binding ramp-up
+	// allocations that keep their current allocation in the loop below. The
+	// rematerialization step needs this to tell them apart from advised SNB
+	// ramp-up allocations, because both carry OwnerPoolName ==
+	// EmptyOwnerPoolName in newEntries after the loop.
+	preservedSNBRampUp := make(map[string]map[string]struct{})
 
 	// deal with blocks of reclaimed_cores and share_cores
 	for podUID, containerEntries := range curEntries {
@@ -2456,6 +2517,10 @@ func (p *DynamicPolicy) applyBlocksWithDynamicConfig(
 					!advisorReturnedAllocation {
 					general.Infof("pod: %s/%s container: %s is an unadvised shared numa-binding ramp-up allocation, preserve its current allocation",
 						allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName)
+					if preservedSNBRampUp[podUID] == nil {
+						preservedSNBRampUp[podUID] = make(map[string]struct{})
+					}
+					preservedSNBRampUp[podUID][containerName] = struct{}{}
 					continue containerLoop
 				}
 
@@ -2556,6 +2621,22 @@ func (p *DynamicPolicy) applyBlocksWithDynamicConfig(
 		}
 	}
 
+	// The hard-partition invariant is enforced against the FINAL reclaim pool:
+	// the adjustment commit override above may rewrite the reclaim pool after
+	// ramp-up shared allocations were assigned rampUpCPUs, so the mutual
+	// exclusion can only be restored here, before the pending advisor state is
+	// materialized. This is deliberately gated on the dynamic configuration
+	// (plus active ramp-up presence), not on the hardActive parameter: the
+	// parameter only controls floor derivation for this attempt, while the
+	// partition invariant itself follows the switch.
+	if isRampUpReclaimHardPartitionEnabledWithConfig(attemptConfig.dynamic) &&
+		newEntries.HasActiveRampUp() {
+		if err := p.rematerializeRampUpSharedAgainstFinalReclaim(
+			newEntries, preservedSNBRampUp); err != nil {
+			return nil, fmt.Errorf("rematerialize ramp-up shared allocations against final reclaim pool failed with error: %w", err)
+		}
+	}
+
 	return &pendingAdvisorState{
 		preCommitRevision: stateRevision,
 		entries:           newEntries,
@@ -2564,6 +2645,115 @@ func (p *DynamicPolicy) applyBlocksWithDynamicConfig(
 		residualFloor:     rampUpReclaimFloor,
 		dynamicConfig:     attemptConfig.dynamic,
 	}, nil
+}
+
+// rematerializeRampUpSharedAgainstFinalReclaim restores the hard-partition
+// invariant (ramp-up shared allocations never overlap the final reclaim pool)
+// against the reclaim pool as it exists AFTER the adjustment commit override
+// has been applied. Plain shared ramp-up allocations were assigned rampUpCPUs
+// before the override rewrote the reclaim pool, and preserved (unadvised) SNB
+// ramp-up allocations keep their previous cpuset, so both may end up
+// overlapping the final reclaim pool.
+//
+// Restoration is canonical, not a naive write-back of
+// allocation.Difference(reclaim): the candidate set is only used as input, and
+// the actual cpuset is re-selected through takeCoreAlignedCPUSet so the result
+// stays whole-core, deterministic and NUMA-consistent with the candidate
+// distribution. Any configuration in which no complete physical core survives
+// is rejected fail-closed instead of silently shrinking to a partial core.
+// Advised SNB ramp-up allocations are skipped here: the bulkhead partition
+// view already accounts them as non-reclaim owners, so the final reclaim pool
+// excludes their cpusets; a residual overlap for them is a partition bug and
+// is rejected by validateRampUpReclaimMutualExclusion instead of being papered
+// over here.
+func (p *DynamicPolicy) rematerializeRampUpSharedAgainstFinalReclaim(
+	newEntries state.PodEntries,
+	preservedSNBRampUp map[string]map[string]struct{},
+) error {
+	if p == nil || p.machineInfo == nil || p.machineInfo.CPUTopology == nil {
+		return nil
+	}
+	reclaimEntries := newEntries[commonstate.PoolNameReclaim]
+	if reclaimEntries == nil {
+		return nil
+	}
+	reclaimPool := reclaimEntries[commonstate.FakedContainerName]
+	if reclaimPool == nil || reclaimPool.AllocationResult.IsEmpty() {
+		return nil
+	}
+	finalReclaim := reclaimPool.AllocationResult
+
+	for podUID, containerEntries := range newEntries {
+		if containerEntries == nil || containerEntries.IsPoolEntry() {
+			continue
+		}
+		for containerName, ai := range containerEntries {
+			if ai == nil || !ai.RampUp || !ai.CheckShared() || ai.CheckReclaimed() {
+				continue
+			}
+			// When preservedSNBRampUp is nil (e.g. pool-adjustment paths that
+			// recompute every ramp-up allocation from scratch), every SNB
+			// ramp-up allocation is rematerialized. When it is non-nil (the
+			// advisor apply path), advised SNB ramp-up allocations are skipped
+			// because the bulkhead partition view already excludes their
+			// cpusets from the final reclaim pool.
+			if ai.CheckSharedNUMABinding() && preservedSNBRampUp != nil {
+				if _, preserved := preservedSNBRampUp[podUID][containerName]; !preserved {
+					continue
+				}
+			}
+
+			overlap := ai.AllocationResult.Intersection(finalReclaim)
+			if overlap.IsEmpty() {
+				// zero-churn: already mutually exclusive with the final
+				// reclaim pool, nothing to rematerialize.
+				continue
+			}
+
+			candidate := ai.AllocationResult.Difference(finalReclaim)
+			if candidate.IsEmpty() {
+				return fmt.Errorf("ramp-up shared allocation is completely covered by the final reclaim pool: "+
+					"pod: %s/%s container: %s allocation: %s reclaim: %s",
+					ai.PodNamespace, ai.PodName, ai.ContainerName,
+					ai.AllocationResult.String(), finalReclaim.String())
+			}
+
+			rematerialized := takeCoreAlignedCPUSet(
+				p.machineInfo.CPUTopology, candidate, candidate, candidate.Size())
+			if rematerialized.IsEmpty() {
+				return fmt.Errorf("no complete physical core remains for ramp-up shared allocation after "+
+					"excluding the final reclaim pool (reclaim/floor conflict): "+
+					"pod: %s/%s container: %s allocation: %s candidate: %s reclaim: %s",
+					ai.PodNamespace, ai.PodName, ai.ContainerName,
+					ai.AllocationResult.String(), candidate.String(), finalReclaim.String())
+			}
+			if rematerialized.Equals(ai.AllocationResult) {
+				// idempotent: the canonical selection reproduces the current
+				// allocation, skip the write-back to avoid churn.
+				continue
+			}
+
+			topologyAwareAssignments, err := machine.GetNumaAwareAssignments(
+				p.machineInfo.CPUTopology, rematerialized)
+			if err != nil {
+				return fmt.Errorf("unable to calculate topologyAwareAssignments for rematerialized "+
+					"ramp-up shared allocation: pod: %s/%s container: %s cpuset: %s, error: %v",
+					ai.PodNamespace, ai.PodName, ai.ContainerName,
+					rematerialized.String(), err)
+			}
+
+			general.Infof("rematerialize ramp-up shared allocation of pod: %s/%s container: %s from %s to %s "+
+				"to keep it mutually exclusive with the final reclaim pool: %s",
+				ai.PodNamespace, ai.PodName, ai.ContainerName,
+				ai.AllocationResult.String(), rematerialized.String(), finalReclaim.String())
+
+			ai.AllocationResult = rematerialized
+			ai.OriginalAllocationResult = rematerialized.Clone()
+			ai.TopologyAwareAssignments = topologyAwareAssignments
+			ai.OriginalTopologyAwareAssignments = machine.DeepcopyCPUAssignment(topologyAwareAssignments)
+		}
+	}
+	return nil
 }
 
 func projectDefaultShareOwnershipEntries(
@@ -2705,11 +2895,15 @@ func (p *DynamicPolicy) buildAdjustmentCommitOverrideFromPodEntriesWithDynamicCo
 	snapshot.disableDedicated = disableDedicatedCoresOverlapReclaimedCores
 	var view *bulkheadmodel.DesiredView
 	if p.hardBulkheadPartitionValidationEnabledWithDynamicConfig(dynamicConf) {
+		snapshotRampUpDomains, derr := snapshot.podEntries.ActiveRampUpDomains(p.machineInfo.CPUTopology)
+		if derr != nil {
+			return nil, fmt.Errorf("resolve snapshot ramp-up domains for bulkhead view: %w", derr)
+		}
 		view = bulkheadutils.BuildCPUSetPartitionView(
 			snapshot,
 			p.machineInfo.CPUTopology,
 			p.cpuSetPartitionViewOptionsWithDynamicConfig(
-				snapshot, snapshot.podEntries.HasActiveRampUp(), dynamicConf),
+				snapshot, snapshotRampUpDomains, dynamicConf),
 		)
 	} else {
 		var err error
@@ -2982,6 +3176,20 @@ func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommitWithDynamicConfig(
 		}
 	}
 
+	// Ramp-up shared allocations are governed by the ramp-up reclaim hard
+	// partition switch (HP), not by allowSharedCoresOverlapReclaimedCores (AO):
+	// when HP is active, they must stay mutually exclusive with the FINAL
+	// reclaim pool regardless of AO. This runs BEFORE the AO early-return below
+	// so the HP=true && AO=true quadrant is covered as well; applyBlocks has
+	// already rematerialized the restorable overlaps before commit, so an
+	// overlap reaching this point fails closed.
+	hpActive := isRampUpReclaimHardPartitionEnabledWithConfig(dynamicConf) && newEntries.HasActiveRampUp()
+	if hpActive {
+		if err := validateRampUpReclaimMutualExclusion(newEntries, dynamicConf); err != nil {
+			return err
+		}
+	}
+
 	if allowSharedCoresOverlapReclaimedCores {
 		return p.validatePendingAdvisorPartitionViewWithDynamicConfig(
 			newEntries,
@@ -3026,6 +3234,17 @@ func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommitWithDynamicConfig(
 			if ai.CheckReclaimed() || ai.CheckSystem() {
 				continue
 			}
+			// Ramp-up shared allocations are exclusively governed by
+			// validateRampUpReclaimMutualExclusion above: when the hard
+			// partition switch is off (hpActive == false), their overlap with
+			// the reclaim pool is legal; when it is on, any overlap has
+			// already been rejected above (applyBlocks rematerialized the
+			// restorable ones before commit), so exclude them here to avoid
+			// duplicate errors. Steady shared allocations keep flowing into
+			// the disallowed partition below, untouched.
+			if isRampUpShared := ai.RampUp && ai.CheckShared() && !ai.CheckReclaimed(); isRampUpShared {
+				continue
+			}
 			if ai.CheckDedicated() && !disableDedicatedCoresOverlapReclaimedCores {
 				continue
 			}
@@ -3042,6 +3261,79 @@ func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommitWithDynamicConfig(
 		disableDedicatedCoresOverlapReclaimedCores,
 		dynamicConf,
 	)
+}
+
+// validateRampUpReclaimMutualExclusion enforces the ramp-up reclaim hard
+// partition invariant: when the hard partition switch is active (and ramp-up
+// allocations are actually present), every ramp-up shared allocation must be
+// mutually exclusive with the FINAL reclaim pool, regardless of
+// allowSharedCoresOverlapReclaimedCores. It is self-contained on purpose so
+// the asynchronous cpuset adjustment path can stack it on top of the bulkhead
+// view validation without inheriting the full unified guard (which would be
+// wrong under an AO flip window).
+func validateRampUpReclaimMutualExclusion(
+	newEntries state.PodEntries,
+	dynamicConf *dynamicconfig.Configuration,
+) error {
+	if !isRampUpReclaimHardPartitionEnabledWithConfig(dynamicConf) || !newEntries.HasActiveRampUp() {
+		return nil
+	}
+	reclaimEntries := newEntries[commonstate.PoolNameReclaim]
+	if reclaimEntries == nil {
+		return nil
+	}
+	reclaimPool := reclaimEntries[commonstate.FakedContainerName]
+	if reclaimPool == nil {
+		return nil
+	}
+
+	for _, containerEntries := range newEntries {
+		if containerEntries == nil || containerEntries.IsPoolEntry() {
+			continue
+		}
+		for _, ai := range containerEntries {
+			if ai == nil || !ai.RampUp || !ai.CheckShared() || ai.CheckReclaimed() {
+				continue
+			}
+			if overlap := reclaimPool.AllocationResult.Intersection(ai.AllocationResult); !overlap.IsEmpty() {
+				return fmt.Errorf("ramp-up shared allocation overlaps the final reclaim pool while "+
+					"ramp-up reclaim hard partition is enabled: pod: %s/%s container: %s "+
+					"allocation: %s reclaim: %s overlap: %s",
+					ai.PodNamespace, ai.PodName, ai.ContainerName,
+					ai.AllocationResult.String(), reclaimPool.AllocationResult.String(), overlap.String())
+			}
+		}
+	}
+	return nil
+}
+
+// validatePendingAdvisorPartitionViewWithRampUpExclusion is the validator used
+// by the asynchronous cpuset adjustment commit path: it keeps the bulkhead
+// partition view validation and stacks the ramp-up/reclaim mutual exclusion on
+// top of it. It deliberately avoids the full unified
+// validateAdvisorPartitionBeforeCommit guard, because the async path commits
+// against a snapshot of the AO switch and running the steady shared guard here
+// could reject a commit that was legal when the override was computed (AO flip
+// window). The mutual exclusion, in contrast, is orthogonal to AO.
+func (p *DynamicPolicy) validatePendingAdvisorPartitionViewWithRampUpExclusion(
+	newEntries state.PodEntries,
+	newMachineState state.NUMANodeMap,
+	allowSharedCoresOverlapReclaimedCores bool,
+	disableDedicatedCoresOverlapReclaimedCores bool,
+) error {
+	if err := p.validatePendingAdvisorPartitionView(
+		newEntries,
+		newMachineState,
+		allowSharedCoresOverlapReclaimedCores,
+		disableDedicatedCoresOverlapReclaimedCores,
+	); err != nil {
+		return err
+	}
+	var dynamicConf *dynamicconfig.Configuration
+	if p != nil && p.dynamicConfig != nil {
+		dynamicConf = p.dynamicConfig.GetDynamicConfiguration()
+	}
+	return validateRampUpReclaimMutualExclusion(newEntries, dynamicConf)
 }
 
 func (p *DynamicPolicy) validatePendingAdvisorPartitionView(
@@ -3074,11 +3366,15 @@ func (p *DynamicPolicy) validatePendingAdvisorPartitionViewWithDynamicConfig(
 	snapshot.machineState = newMachineState.Clone()
 	snapshot.allowOverlap = allowSharedCoresOverlapReclaimedCores
 	snapshot.disableDedicated = disableDedicatedCoresOverlapReclaimedCores
+	commitViewRampUpDomains, derr := newEntries.ActiveRampUpDomains(p.machineInfo.CPUTopology)
+	if derr != nil {
+		return fmt.Errorf("resolve commit-time ramp-up domains for bulkhead view: %w", derr)
+	}
 	if _, err := bulkheadutils.BuildValidatedCPUSetPartitionView(
 		snapshot,
 		p.machineInfo.CPUTopology,
 		p.cpuSetPartitionViewOptionsWithDynamicConfig(
-			snapshot, newEntries.HasActiveRampUp(), dynamicConf),
+			snapshot, commitViewRampUpDomains, dynamicConf),
 	); err != nil {
 		return fmt.Errorf("validate pending advisor partition view before commit: %w", err)
 	}
@@ -3093,12 +3389,16 @@ func (p *DynamicPolicy) cpuSetPartitionViewOptions(
 	if p != nil && p.dynamicConfig != nil {
 		dynamicConf = p.dynamicConfig.GetDynamicConfiguration()
 	}
-	return p.cpuSetPartitionViewOptionsWithDynamicConfig(state, hardActive, dynamicConf)
+	domains := sets.NewInt()
+	if hardActive {
+		domains.Insert(commonstate.FakedNUMAID)
+	}
+	return p.cpuSetPartitionViewOptionsWithDynamicConfig(state, domains, dynamicConf)
 }
 
 func (p *DynamicPolicy) cpuSetPartitionViewOptionsWithDynamicConfig(
 	state state.ReadonlyState,
-	hardActive bool,
+	rampUpDomains sets.Int,
 	dynamicConf *dynamicconfig.Configuration,
 ) bulkheadutils.CPUSetPartitionViewOptions {
 	var coreConf *config.Configuration
@@ -3127,7 +3427,7 @@ func (p *DynamicPolicy) cpuSetPartitionViewOptionsWithDynamicConfig(
 			ReservedReclaimedCPUs:         reservedReclaimedCPUs,
 			ReservedReclaimedCPUsFallback: reservedReclaimedCPUsFallback,
 		},
-		hardActive,
+		rampUpDomains,
 	)
 }
 

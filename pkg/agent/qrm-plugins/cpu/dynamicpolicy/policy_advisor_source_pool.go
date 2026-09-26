@@ -315,6 +315,10 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocksWithCheckpointTransitionAndDyna
 	if err != nil {
 		return nil, err
 	}
+	// Runtime-config gate: target-driven provenance is honoured only when all three
+	// runtime-config conditions hold. Otherwise every descriptor stays on the
+	// legacy floor/ownership path regardless of block quantities.
+	descriptors = p.applyTargetDrivenReclaimGate(descriptors)
 
 	result := advisorapi.NewBlockCPUSet()
 	available, err := p.allocateStaticAndForbiddenPools(resp, result, allCPUs)
@@ -333,7 +337,14 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocksWithCheckpointTransitionAndDyna
 			descriptors, err = normalizeAdvisorDescriptorsForHardPartitionWholeCoreReclaim(
 				descriptors, available, topology, skipNUMAs)
 		} else {
-			descriptors, err = normalizeAdvisorDescriptorsForWholeCoreReclaim(descriptors, topology)
+			// Steady real-NUMA path: join the per-NUMA mandatory-reclaim and
+			// dedicated targets and rewrite an odd reclaim advice to the
+			// committed-anchored whole-core value, rather than borrowing a core out
+			// of a running dedicated group.
+			var normalizeReport steadyReclaimNormalizeReport
+			descriptors, normalizeReport, err = normalizeSteadyRealNUMATargets(
+				descriptors, available, topology, skipNUMAs)
+			p.emitSteadyReclaimNormalizeMetrics(normalizeReport)
 		}
 		if err != nil {
 			return nil, err
@@ -550,18 +561,26 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhaseWithCheckpointTransitionAndSk
 			eligible:        descriptor.Eligible.Intersection(available),
 			preferred:       descriptor.OldPreferred,
 			class:           class,
+			// target-driven reclaim provenance (zero for legacy blocks).
+			targetDriven: descriptor.TargetDriven,
+			sourceTarget: descriptor.SourceTarget,
+			reclaimQuota: descriptor.ReclaimQuota,
+			numaID:       descriptor.NUMAID,
 		})
 		blockIDByDemandKey[demandKey] = descriptor.BlockID
 	}
 	if expandHardReclaimPhase {
-		pinnedDemands, err := pinHardReclaimPartitionDemands(demands, available, p.machineInfo.CPUTopology)
+		pinnedDemands, err := pinHardReclaimPartitionDemands(demands, available, p.machineInfo.CPUTopology, false)
 		if err != nil {
 			return available, fmt.Errorf("plan hard reclaim partition: %w", err)
 		}
 		demands = pinnedDemands
 	} else if preserveClass && !expandSteadyReclaimPhase {
-		pinnedDemands, err := pinHardReclaimPartitionDemands(demands, available, p.machineInfo.CPUTopology)
+		// Steady real-NUMA path owns the committed whole-core fallback; the
+		// ramp-up/hard path above deliberately keeps its original semantics.
+		pinnedDemands, err := pinHardReclaimPartitionDemands(demands, available, p.machineInfo.CPUTopology, true)
 		if err != nil {
+			p.emitSteadyReclaimPlanOutcome(classifySteadyReclaimFailureReason(err))
 			return available, fmt.Errorf("plan steady real-NUMA reclaim partition: %w", err)
 		}
 		demands = pinnedDemands
@@ -905,4 +924,94 @@ func validateAdvisorDescriptorPlan(
 		}
 	}
 	return nil
+}
+
+// targetDrivenHardReclaimEnabled gates target-driven reclaim on three
+// runtime-config conditions; any one disabled means full legacy behaviour.
+func (p *DynamicPolicy) targetDrivenHardReclaimEnabled() bool {
+	dyn := p.dynamicConfig.GetDynamicConfiguration()
+	return dyn != nil && dyn.EnableReclaim && dyn.EnableRampUpReclaimHardPartition &&
+		p.state.GetDisableDedicatedCoresOverlapReclaimedCores()
+}
+
+// applyTargetDrivenReclaimGate honours target-driven reclaim only when all three
+// runtime-config conditions hold. Otherwise every descriptor stays on legacy
+// semantics (TargetDriven=false, no frozen target/quota).
+func (p *DynamicPolicy) applyTargetDrivenReclaimGate(descriptors []advisorBlockDescriptor) []advisorBlockDescriptor {
+	return applyTargetDrivenReclaimGate(descriptors, p.targetDrivenHardReclaimEnabled())
+}
+
+// applyTargetDrivenReclaimGate applies the config-gated target-driven provenance.
+//
+// Degradation is per-NUMA, not global: a real NUMA that hosts more than one
+// distinct dedicated source cannot be given a safe per-source donation cap in the
+// fast path (the group donation limit is aggregated per group), so only that NUMA
+// stays legacy. Single-source NUMAs on other NUMA nodes are still upgraded.
+func applyTargetDrivenReclaimGate(descriptors []advisorBlockDescriptor, enabled bool) []advisorBlockDescriptor {
+	if !enabled {
+		return descriptors
+	}
+	ambiguous := identifyAmbiguousTargetDrivenNUMAs(descriptors)
+	if len(ambiguous) > 0 {
+		general.InfoS("target-driven reclaim downgraded ambiguous NUMAs to legacy",
+			"ambiguousNUMAs", sortedIntKeys(ambiguous))
+	}
+	for i := range descriptors {
+		if descriptors[i].Class != advisorBlockClassDedicated {
+			continue
+		}
+		if descriptors[i].NUMAID == commonstate.FakedNUMAID {
+			continue
+		}
+		if _, isAmbiguous := ambiguous[descriptors[i].NUMAID]; isAmbiguous {
+			// Multiple distinct dedicated sources share this NUMA: keep legacy and
+			// do not guess a quota.
+			continue
+		}
+		descriptors[i].TargetDriven = true
+		descriptors[i].SourceTarget = descriptors[i].Quantity
+		// ReclaimQuota is the donatable excess: old preferred footprint minus the
+		// frozen target. On a single-source NUMA this is exactly the amount a
+		// dedicated source may donate; the group sum floor backstops it.
+		descriptors[i].ReclaimQuota = general.Max(0, descriptors[i].OldPreferred.Size()-descriptors[i].Quantity)
+	}
+	return descriptors
+}
+
+// identifyAmbiguousTargetDrivenNUMAs returns the set of real NUMA nodes that host
+// more than one distinct dedicated source. Distinct sources are distinguished by
+// BlockID: the same BlockID repeated (a pod and its sidecar sharing one block)
+// counts as a single source. FakeNUMA is excluded because it never participates in
+// target-driven reclaim. Ambiguous NUMAs must stay legacy: without a per-source
+// fast-path donation cap, guessing a quota would be unsafe.
+func identifyAmbiguousTargetDrivenNUMAs(descriptors []advisorBlockDescriptor) map[int]struct{} {
+	blockIDsByNUMA := map[int]map[string]struct{}{}
+	ambiguous := make(map[int]struct{})
+	for _, d := range descriptors {
+		if d.Class != advisorBlockClassDedicated {
+			continue
+		}
+		// FakeNUMA sources stay legacy and are excluded from ambiguity counting.
+		if d.NUMAID == commonstate.FakedNUMAID {
+			continue
+		}
+		// Defensive: an empty BlockID cannot identify a source, so two empty
+		// BlockIDs on one NUMA must not collapse into a single deduped source.
+		// Mark such a NUMA ambiguous directly (BlockIDs come from the advisor and
+		// are non-empty in practice; this guards against a malformed descriptor).
+		if d.BlockID == "" {
+			ambiguous[d.NUMAID] = struct{}{}
+			continue
+		}
+		if _, ok := blockIDsByNUMA[d.NUMAID]; !ok {
+			blockIDsByNUMA[d.NUMAID] = map[string]struct{}{}
+		}
+		blockIDsByNUMA[d.NUMAID][d.BlockID] = struct{}{}
+	}
+	for numaID, blockIDs := range blockIDsByNUMA {
+		if len(blockIDs) > 1 {
+			ambiguous[numaID] = struct{}{}
+		}
+	}
+	return ambiguous
 }

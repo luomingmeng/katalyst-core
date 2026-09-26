@@ -219,8 +219,10 @@ func TestPreparePendingCPUPartitionDerivesHardFloorFromFinalCandidate(t *testing
 		validate: func(entries state.PodEntries, _ state.NUMANodeMap, _, _ bool) error {
 			validated = true
 			require.True(t, entries.HasActiveRampUp())
+			testRampUpDomains, derr := entries.ActiveRampUpDomains(p.machineInfo.CPUTopology)
+			require.NoError(t, derr)
 			options := p.cpuSetPartitionViewOptionsWithDynamicConfig(
-				p.state, entries.HasActiveRampUp(), frozen.dynamic)
+				p.state, testRampUpDomains, frozen.dynamic)
 			require.True(t, options.HardPartitionEnabled)
 			return nil
 		},

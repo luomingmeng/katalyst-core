@@ -1998,7 +1998,7 @@ func productionReplacementSourcePoolFixture(t *testing.T) (
 	require.NoError(t, err)
 	p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	p.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
-	p.state.SetPodEntries(state.PodEntries{
+	require.NoError(t, p.state.SetPodEntries(state.PodEntries{
 		"dedicated-pod": {
 			"main": &state.AllocationInfo{
 				AllocationMeta: commonstate.AllocationMeta{
@@ -2021,7 +2021,7 @@ func productionReplacementSourcePoolFixture(t *testing.T) (
 				TopologyAwareAssignments: map[int]machine.CPUSet{2: reclaimBefore},
 			},
 		},
-	}, false)
+	}, false))
 
 	resp := &advisorapi.ListAndWatchResponse{
 		DisableDedicatedCoresOverlapReclaimedCores: true,

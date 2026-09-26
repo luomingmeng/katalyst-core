@@ -71,6 +71,11 @@ func IsReclaimedPool(name string) bool {
 
 // HasActiveRampUp reports whether a real container allocation is in ramp-up.
 // Generic pool entries are aggregate state and must not activate ramp-up behavior.
+//
+// This is a node-global observation only: it answers "is there any ramp-up at
+// all" and deliberately collapses every domain into a single boolean. Ramp-up
+// reclaim floor derivation must use ActiveRampUpDomains instead, because a
+// node-global true must not propagate the reclaim floor onto every real NUMA.
 func (pe PodEntries) HasActiveRampUp() bool {
 	for _, entries := range pe {
 		if entries.IsPoolEntry() {
@@ -83,6 +88,42 @@ func (pe PodEntries) HasActiveRampUp() bool {
 		}
 	}
 	return false
+}
+
+// ActiveRampUpDomains derives the set of reclaim domains that currently have an
+// active ramp-up allocation. A domain is either FakedNUMAID (-1) for the global
+// domain (non-NUMA-binding shared ramp-up), or a real NUMA id for a
+// NUMA-binding ramp-up pinned to that NUMA.
+//
+// Generic pool entries are aggregate state and never contribute a domain.
+//
+// The derivation is fail-closed: any ramp-up allocation whose reclaim domain
+// cannot be resolved unambiguously surfaces an error instead of falling back to
+// node-global propagation. Callers must treat such an error as "no safe domain
+// derivation" and must not widen the floor to the whole node.
+func (pe PodEntries) ActiveRampUpDomains(topology *machine.CPUTopology) (sets.Int, error) {
+	if topology == nil {
+		return nil, fmt.Errorf("ActiveRampUpDomains got nil topology")
+	}
+
+	domains := sets.NewInt()
+	for _, entries := range pe {
+		if entries.IsPoolEntry() {
+			continue
+		}
+		for _, allocationInfo := range entries {
+			if allocationInfo == nil || !allocationInfo.RampUp {
+				continue
+			}
+			allocationDomains, err := allocationInfo.RampUpReclaimDomains(topology)
+			if err != nil {
+				return nil, err
+			}
+			domains = domains.Union(allocationDomains)
+		}
+	}
+
+	return domains, nil
 }
 
 // GetUnitedPoolsCPUs returns the union of the specified pools' cpus.

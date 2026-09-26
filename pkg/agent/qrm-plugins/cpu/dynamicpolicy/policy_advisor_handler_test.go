@@ -489,6 +489,31 @@ func TestAllocateByCPUAdvisorConvergedFrameIsStrictNoOp(t *testing.T) {
 	require.False(t, policy.hasAnyPendingAdvisorPostCommitTarget())
 }
 
+func TestAllocateByCPUAdvisorPropagatesTopologyStaleWithoutPluginRetry(t *testing.T) {
+	policy, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	policy.cpuSetAdjustmentRetryMu.Lock()
+	policy.cpuSetAdjustmentRetryStopping = true
+	policy.cpuSetAdjustmentRetryMu.Unlock()
+
+	calls := 0
+	policy.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"always-stale": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			calls++
+			return &frozenInitialSnapshotDriftTestError{}
+		},
+	}
+
+	err := policy.allocateByCPUAdvisor(
+		nil,
+		&advisorapi.ListAndWatchResponse{Entries: map[string]*advisorapi.CalculationEntries{}},
+		nil,
+	)
+
+	require.ErrorIs(t, err, bulkheadtopology.ErrCoordinatorPlanStale)
+	require.Equal(t, 1, calls)
+}
+
 func TestAllocateByCPUAdvisorControlOnlyFrameIsNotStrictNoOp(t *testing.T) {
 	policy, cleanup := newReclaimReuseTestPolicy(t)
 	defer cleanup()
@@ -751,6 +776,101 @@ func TestAdvisorReplacementTransactionRetainsExactTargetAcrossRetry(t *testing.T
 	require.NoError(t, policy.ensureCPUStateWriterAllowed(
 		policy.state.GetRevision(), "replacement cleanup", nil),
 		"writer fence must be released only after cleanup")
+}
+
+func TestAdvisorReplacementSolverFailureDoesNotStageOrCommit(t *testing.T) {
+	t.Parallel()
+
+	policy, resp, topology, reclaimBefore, _ := productionReplacementSourcePoolFixture(t)
+	entries := policy.state.GetPodEntries()
+	entries["dedicated-pod"]["main"].RampUp = false
+	require.NoError(t, policy.state.SetPodEntries(entries, false))
+	setHardReclaimReplacementOptionsForTest(t, topology,
+		func(options *hardReclaimReplacementOptions) {
+			options.maxPartitionAssignmentEdges = 1
+		})
+	hierarchy := newReplacementRecordingHierarchyDriver(
+		topology, reclaimBefore, "test-primary", "test-reclaim", "test-reclaim/numa-")
+	policy.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"recording-hierarchy": func(ctx context.Context, _ cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			entry := hierarchy.entries["test-reclaim"]
+			return hierarchy.WriteCPUs(ctx, entry.Rel, entry.Identity, entry.CPUs)
+		},
+	}
+	request := &advisorapi.GetAdviceRequest{
+		Entries: map[string]*advisorapi.ContainerAllocationInfoEntries{
+			"dedicated-pod": {
+				Entries: map[string]*advisorapi.ContainerAllocationInfo{
+					"main": {
+						Metadata: &advisorsvc.ContainerMetadata{
+							PodUid:        "dedicated-pod",
+							ContainerName: "main",
+							QosLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+						},
+						AllocationInfo: &advisorapi.AllocationInfo{RampUp: false},
+					},
+				},
+			},
+		},
+	}
+	featureGates := map[string]*advisorsvc.FeatureGate{
+		feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition: {
+			Name: feature_cpu.NegotiationFeatureGateDedicatedReclaimDisjointPartition,
+		},
+	}
+
+	require.NoError(t, policy.state.StoreState())
+	checkpointPath := filepath.Join(
+		policy.advisorPostCommitCheckpointDir, cpuPluginStateFileName)
+	beforeCheckpoint, err := os.ReadFile(checkpointPath)
+	require.NoError(t, err)
+	canonicalSnapshot := func() struct {
+		revision       uint64
+		entries        state.PodEntries
+		machine        state.NUMANodeMap
+		numaHeadroom   map[int]float64
+		allowOverlap   bool
+		disableOverlap bool
+	} {
+		return struct {
+			revision       uint64
+			entries        state.PodEntries
+			machine        state.NUMANodeMap
+			numaHeadroom   map[int]float64
+			allowOverlap   bool
+			disableOverlap bool
+		}{
+			revision:       policy.state.GetRevision(),
+			entries:        policy.state.GetPodEntries(),
+			machine:        policy.state.GetMachineState(),
+			numaHeadroom:   policy.state.GetNUMAHeadroom(),
+			allowOverlap:   policy.state.GetAllowSharedCoresOverlapReclaimedCores(),
+			disableOverlap: policy.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+		}
+	}
+	beforeCanonical := canonicalSnapshot()
+	beforeTarget := policy.currentAdvisorPostCommitTarget()
+	activePath := policy.advisorPostCommitCheckpointPath()
+	stagingPath := policy.advisorPostCommitStagingPath()
+	require.NoFileExists(t, activePath)
+	require.NoFileExists(t, stagingPath)
+
+	err = policy.allocateByCPUAdvisor(request, resp, featureGates)
+
+	require.ErrorIs(t, err, errPartitionAssignmentEdgeBudget)
+	var budgetErr *hardReclaimSearchBudgetExceeded
+	require.ErrorAs(t, err, &budgetErr)
+	require.Equal(t, hardReclaimBudgetGraphEdges, budgetErr.Budget)
+	require.False(t, budgetErr.Diagnostics.Complete)
+	require.Equal(t, beforeCanonical, canonicalSnapshot())
+	afterCheckpoint, readErr := os.ReadFile(checkpointPath)
+	require.NoError(t, readErr)
+	require.Equal(t, beforeCheckpoint, afterCheckpoint)
+	require.True(t, advisorPostCommitTargetsEqual(
+		beforeTarget, policy.currentAdvisorPostCommitTarget()))
+	require.NoFileExists(t, activePath)
+	require.NoFileExists(t, stagingPath)
+	require.Empty(t, hierarchy.writes)
 }
 
 type replacementHierarchyWriteKind string
@@ -2392,6 +2512,758 @@ func TestValidateEmptyRampUpCPUReuseRejectsOverlapWithHardReclaimFloor(t *testin
 	}
 }
 
+// newRampUpOverlapTestPolicy builds a DynamicPolicy on the 2-NUMA dummy
+// topology (NUMA0={0,1,4,5}, NUMA1={2,3,6,7}; SMT pairs (0,4)(1,5)(2,6)(3,7))
+// with reserved core {0,4} and the ramp-up reclaim hard partition switch set
+// to hardPartitionEnabled. All CPUs are 1 whole core each:
+//
+//	core{0,4}, core{1,5} in NUMA0; core{2,6}, core{3,7} in NUMA1.
+func newRampUpOverlapTestPolicy(t *testing.T, hardPartitionEnabled bool) (*DynamicPolicy, *machine.CPUTopology) {
+	t.Helper()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	policy.reservedCPUs = machine.NewCPUSet(0, 4)
+	policy.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"noop": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			return nil
+		},
+	}
+
+	dynamicConf := policy.dynamicConfig.GetDynamicConfiguration()
+	dynamicConf.EnableReclaim = true
+	dynamicConf.EnableRampUpReclaimHardPartition = hardPartitionEnabled
+
+	return policy, topology
+}
+
+// rampUpOverlapTestEntries seeds one plain shared ramp-up pod (initially
+// holding NUMA1 core {2,6}) and the reclaim pool ({2,6}).
+func rampUpOverlapTestEntries() state.PodEntries {
+	return state.PodEntries{
+		"ramp-up-pod": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "ramp-up-pod",
+					ContainerName: "main",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+				},
+				RampUp:           true,
+				AllocationResult: machine.NewCPUSet(2, 6),
+				RequestQuantity:  1,
+			},
+		},
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(2, 6),
+			},
+		},
+	}
+}
+
+// rampUpOverlapTestResponse advises the reclaim pool with CPUs {2,6}.
+// FakedNUMAID is used deliberately: a single real-NUMA reclaim entry would be
+// misclassified as a shared-NUMA-binding pool by IsSharedNUMABindingPoolEntry,
+// causing all CPUs in that NUMA to be excluded from rampUpCPUs.
+func rampUpOverlapTestResponse(allowOverlap bool) (*advisorapi.ListAndWatchResponse, advisorapi.BlockCPUSet) {
+	resp := &advisorapi.ListAndWatchResponse{
+		AllowSharedCoresOverlapReclaimedCores: allowOverlap,
+		Entries: map[string]*advisorapi.CalculationEntries{
+			commonstate.PoolNameReclaim: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameReclaim,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							commonstate.FakedNUMAID: {Blocks: []*advisorapi.Block{{BlockId: "reclaim-1", Result: 2}}},
+						},
+					},
+				},
+			},
+		},
+	}
+	return resp, advisorapi.BlockCPUSet{
+		"reclaim-1": machine.NewCPUSet(2, 6),
+	}
+}
+
+// TestDynamicPolicyApplyBlocksRampUpSharedReclaimOverlapQuadrants covers the
+// HP x AO quadrant matrix for the plain shared ramp-up / final reclaim
+// overlap:
+//   - HP=false: the overlap is legal; applyBlocks keeps rampUpCPUs verbatim
+//     (no rematerialization) and the pre-commit guard accepts it.
+//   - HP=true: applyBlocks rematerializes the ramp-up shared allocation
+//     canonically against the FINAL reclaim pool, regardless of AO. The
+//     HP=true && AO=true case pins the D1 fix: the AO early-return in the
+//     guard no longer bypasses the mutual exclusion.
+//
+// With reserved={0,4} and reclaim={2,6}: rampUpCPUs={1,2,3,5,6,7}; the
+// canonical rematerialization keeps whole cores {1,5} (NUMA0) and {3,7}
+// (NUMA1) only, i.e. {1,3,5,7}.
+func TestDynamicPolicyApplyBlocksRampUpSharedReclaimOverlapQuadrants(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name                 string
+		hardPartition        bool
+		allowOverlap         bool
+		wantRampUpAllocation machine.CPUSet
+	}{
+		{
+			name:                 "hp disabled ao disabled keeps overlap",
+			hardPartition:        false,
+			allowOverlap:         false,
+			wantRampUpAllocation: machine.NewCPUSet(1, 2, 3, 5, 6, 7),
+		},
+		{
+			name:                 "hp disabled ao enabled keeps overlap",
+			hardPartition:        false,
+			allowOverlap:         true,
+			wantRampUpAllocation: machine.NewCPUSet(1, 2, 3, 5, 6, 7),
+		},
+		{
+			name:                 "hp enabled ao disabled rematerializes",
+			hardPartition:        true,
+			allowOverlap:         false,
+			wantRampUpAllocation: machine.NewCPUSet(1, 3, 5, 7),
+		},
+		{
+			name:                 "hp enabled ao enabled rematerializes (D1)",
+			hardPartition:        true,
+			allowOverlap:         true,
+			wantRampUpAllocation: machine.NewCPUSet(1, 3, 5, 7),
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			policy, topology := newRampUpOverlapTestPolicy(t, tc.hardPartition)
+			policy.state.SetPodEntries(rampUpOverlapTestEntries(), false)
+			resp, blockCPUSet := rampUpOverlapTestResponse(tc.allowOverlap)
+
+			require.NoError(t, prepareAndCommitAdvisorBlocks(policy, blockCPUSet, resp, tc.allowOverlap))
+
+			reclaim := policy.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+			require.NotNil(t, reclaim)
+			require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(2, 6)),
+				"final reclaim pool: %s", reclaim.AllocationResult.String())
+
+			got := policy.state.GetAllocationInfo("ramp-up-pod", "main")
+			require.NotNil(t, got)
+			require.True(t, got.AllocationResult.Equals(tc.wantRampUpAllocation),
+				"ramp-up shared allocation: %s, want %s",
+				got.AllocationResult.String(), tc.wantRampUpAllocation.String())
+
+			if tc.hardPartition {
+				// HP=true: mutual exclusion, whole-core, NUMA-aware.
+				require.True(t, got.AllocationResult.Intersection(reclaim.AllocationResult).IsEmpty(),
+					"ramp-up shared allocation must be mutually exclusive with the final reclaim pool")
+				requireCoreAligned(t, topology, got.AllocationResult)
+				require.Equal(t, machine.NewCPUSet(1, 5), got.TopologyAwareAssignments[0])
+				require.Equal(t, machine.NewCPUSet(3, 7), got.TopologyAwareAssignments[1])
+				require.True(t, got.OriginalAllocationResult.Equals(tc.wantRampUpAllocation))
+
+				// Zero churn across frames: re-applying the same advisor frame
+				// must converge to the same allocation instead of oscillating.
+				require.NoError(t, prepareAndCommitAdvisorBlocks(policy, blockCPUSet, resp, tc.allowOverlap))
+				gotAgain := policy.state.GetAllocationInfo("ramp-up-pod", "main")
+				require.NotNil(t, gotAgain)
+				require.True(t, gotAgain.AllocationResult.Equals(tc.wantRampUpAllocation),
+					"second frame must be idempotent, got %s", gotAgain.AllocationResult.String())
+			}
+		})
+	}
+}
+
+// TestValidateAdvisorPartitionBeforeCommitRampUpSharedOverlapMatrix pins the
+// M1 guard split at the validator level: the ramp-up/reclaim mutual exclusion
+// is driven by the hard partition switch only (and runs before the AO
+// early-return), while the steady shared guard keeps rejecting overlaps no
+// matter what the hard partition switch says.
+func TestValidateAdvisorPartitionBeforeCommitRampUpSharedOverlapMatrix(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name          string
+		hardPartition bool
+		allowShared   bool
+		rampUp        bool
+		numaBinding   bool
+		allocation    machine.CPUSet
+		wantErr       string
+	}{
+		{
+			name:          "hp disabled ao disabled ramp-up shared overlap legal",
+			hardPartition: false,
+			allowShared:   false,
+			rampUp:        true,
+			allocation:    machine.NewCPUSet(2, 6),
+		},
+		{
+			name:          "hp disabled ao enabled ramp-up shared overlap legal",
+			hardPartition: false,
+			allowShared:   true,
+			rampUp:        true,
+			allocation:    machine.NewCPUSet(2, 6),
+		},
+		{
+			name:          "hp enabled ao disabled ramp-up shared overlap rejected",
+			hardPartition: true,
+			allowShared:   false,
+			rampUp:        true,
+			allocation:    machine.NewCPUSet(2, 6),
+			wantErr:       "ramp-up shared allocation overlaps the final reclaim pool",
+		},
+		{
+			name:          "hp enabled ao enabled ramp-up shared overlap rejected (D1)",
+			hardPartition: true,
+			allowShared:   true,
+			rampUp:        true,
+			allocation:    machine.NewCPUSet(2, 6),
+			wantErr:       "ramp-up shared allocation overlaps the final reclaim pool",
+		},
+		{
+			name:          "hp enabled ao enabled SNB ramp-up overlap rejected",
+			hardPartition: true,
+			allowShared:   true,
+			rampUp:        true,
+			numaBinding:   true,
+			allocation:    machine.NewCPUSet(2, 6),
+			wantErr:       "ramp-up shared allocation overlaps the final reclaim pool",
+		},
+		{
+			name:          "hp enabled ramp-up shared disjoint legal",
+			hardPartition: true,
+			allowShared:   false,
+			rampUp:        true,
+			allocation:    machine.NewCPUSet(3, 7),
+		},
+		{
+			name:          "steady shared overlap rejected regardless of hp",
+			hardPartition: false,
+			allowShared:   false,
+			rampUp:        false,
+			allocation:    machine.NewCPUSet(2, 6),
+			wantErr:       "reclaim pool overlaps disallowed shared partition before commit",
+		},
+		{
+			name:          "steady shared overlap rejected with hp enabled",
+			hardPartition: true,
+			allowShared:   false,
+			rampUp:        false,
+			allocation:    machine.NewCPUSet(2, 6),
+			wantErr:       "reclaim pool overlaps disallowed shared partition before commit",
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			policy, _ := newRampUpOverlapTestPolicy(t, tc.hardPartition)
+
+			annotations := map[string]string{}
+			if tc.numaBinding {
+				annotations[apiconsts.PodAnnotationMemoryEnhancementNumaBinding] =
+					apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable
+			}
+			newEntries := state.PodEntries{
+				"overlap-pod": {
+					"main": &state.AllocationInfo{
+						AllocationMeta: commonstate.AllocationMeta{
+							PodUid:        "overlap-pod",
+							ContainerName: "main",
+							QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+							Annotations:   annotations,
+						},
+						RampUp:           tc.rampUp,
+						AllocationResult: tc.allocation.Clone(),
+					},
+				},
+				commonstate.PoolNameReclaim: {
+					commonstate.FakedContainerName: &state.AllocationInfo{
+						AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+						AllocationResult: machine.NewCPUSet(2, 6),
+						TopologyAwareAssignments: map[int]machine.CPUSet{
+							1: machine.NewCPUSet(2, 6),
+						},
+					},
+				},
+			}
+
+			err := policy.validateAdvisorPartitionBeforeCommit(
+				newEntries,
+				policy.state.GetMachineState(),
+				tc.allowShared,
+				false,
+			)
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestRematerializeRampUpSharedAgainstFinalReclaim unit-tests the canonical
+// rematerialization primitive directly: zero-churn skip, whole-core
+// re-selection, idempotence, both fail-closed errors, and the SNB handling
+// (advised SNB skipped, preserved SNB rematerialized).
+func TestRematerializeRampUpSharedAgainstFinalReclaim(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	rampUpEntry := func(allocation machine.CPUSet, numaBinding bool) *state.AllocationInfo {
+		annotations := map[string]string{}
+		if numaBinding {
+			annotations[apiconsts.PodAnnotationMemoryEnhancementNumaBinding] =
+				apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable
+		}
+		assignments, err := machine.GetNumaAwareAssignments(topology, allocation)
+		require.NoError(t, err)
+		return &state.AllocationInfo{
+			AllocationMeta: commonstate.AllocationMeta{
+				PodUid:        "ramp-up-pod",
+				ContainerName: "main",
+				QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+				Annotations:   annotations,
+			},
+			RampUp:                           true,
+			AllocationResult:                 allocation.Clone(),
+			OriginalAllocationResult:         allocation.Clone(),
+			TopologyAwareAssignments:         assignments,
+			OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(assignments),
+		}
+	}
+	reclaimEntry := func(allocation machine.CPUSet) *state.AllocationInfo {
+		return &state.AllocationInfo{
+			AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+			AllocationResult: allocation.Clone(),
+		}
+	}
+
+	t.Run("zero churn when disjoint", func(t *testing.T) {
+		entries := state.PodEntries{
+			"ramp-up-pod": {"main": rampUpEntry(machine.NewCPUSet(1, 3, 5, 7), false)},
+			commonstate.PoolNameReclaim: {
+				commonstate.FakedContainerName: reclaimEntry(machine.NewCPUSet(2, 6)),
+			},
+		}
+		require.NoError(t, policy.rematerializeRampUpSharedAgainstFinalReclaim(entries, nil))
+		got := entries["ramp-up-pod"]["main"]
+		require.True(t, got.AllocationResult.Equals(machine.NewCPUSet(1, 3, 5, 7)))
+		require.True(t, got.OriginalAllocationResult.Equals(machine.NewCPUSet(1, 3, 5, 7)))
+	})
+
+	t.Run("rematerializes to whole cores and is idempotent", func(t *testing.T) {
+		entries := state.PodEntries{
+			"ramp-up-pod": {"main": rampUpEntry(machine.NewCPUSet(1, 2, 3, 5, 6, 7), false)},
+			commonstate.PoolNameReclaim: {
+				commonstate.FakedContainerName: reclaimEntry(machine.NewCPUSet(2, 6)),
+			},
+		}
+		require.NoError(t, policy.rematerializeRampUpSharedAgainstFinalReclaim(entries, nil))
+		got := entries["ramp-up-pod"]["main"]
+		require.True(t, got.AllocationResult.Equals(machine.NewCPUSet(1, 3, 5, 7)),
+			"got %s", got.AllocationResult.String())
+		require.True(t, got.OriginalAllocationResult.Equals(machine.NewCPUSet(1, 3, 5, 7)))
+		require.Equal(t, machine.NewCPUSet(1, 5), got.TopologyAwareAssignments[0])
+		require.Equal(t, machine.NewCPUSet(3, 7), got.TopologyAwareAssignments[1])
+		require.Equal(t, machine.NewCPUSet(1, 5), got.OriginalTopologyAwareAssignments[0])
+		require.Equal(t, machine.NewCPUSet(3, 7), got.OriginalTopologyAwareAssignments[1])
+
+		// second call must not churn the already-canonical allocation
+		require.NoError(t, policy.rematerializeRampUpSharedAgainstFinalReclaim(entries, nil))
+		require.True(t, entries["ramp-up-pod"]["main"].AllocationResult.Equals(machine.NewCPUSet(1, 3, 5, 7)))
+	})
+
+	t.Run("completely covered fails closed", func(t *testing.T) {
+		entries := state.PodEntries{
+			"ramp-up-pod": {"main": rampUpEntry(machine.NewCPUSet(2, 6), false)},
+			commonstate.PoolNameReclaim: {
+				commonstate.FakedContainerName: reclaimEntry(machine.NewCPUSet(2, 6)),
+			},
+		}
+		err := policy.rematerializeRampUpSharedAgainstFinalReclaim(entries, nil)
+		require.ErrorContains(t, err, "completely covered by the final reclaim pool")
+	})
+
+	t.Run("no complete physical core fails closed", func(t *testing.T) {
+		entries := state.PodEntries{
+			"ramp-up-pod": {"main": rampUpEntry(machine.NewCPUSet(0, 4), false)},
+			commonstate.PoolNameReclaim: {
+				commonstate.FakedContainerName: reclaimEntry(machine.NewCPUSet(0)),
+			},
+		}
+		err := policy.rematerializeRampUpSharedAgainstFinalReclaim(entries, nil)
+		require.ErrorContains(t, err, "no complete physical core remains")
+	})
+
+	t.Run("advised SNB ramp-up is skipped", func(t *testing.T) {
+		entries := state.PodEntries{
+			"ramp-up-pod": {"main": rampUpEntry(machine.NewCPUSet(2, 6), true)},
+			commonstate.PoolNameReclaim: {
+				commonstate.FakedContainerName: reclaimEntry(machine.NewCPUSet(2, 6)),
+			},
+		}
+		// non-nil empty preserved map (advisor apply path): not in the map ->
+		// treated as advised SNB ramp-up, the bulkhead partition view owns
+		// its exclusion; rematerialization must not touch it.
+		preserved := map[string]map[string]struct{}{}
+		require.NoError(t, policy.rematerializeRampUpSharedAgainstFinalReclaim(entries, preserved))
+		require.True(t, entries["ramp-up-pod"]["main"].AllocationResult.Equals(machine.NewCPUSet(2, 6)))
+	})
+
+	t.Run("nil preserved map rematerializes SNB ramp-up (pool-adjustment path)", func(t *testing.T) {
+		entries := state.PodEntries{
+			"ramp-up-pod": {"main": rampUpEntry(machine.NewCPUSet(2, 3, 6, 7), true)},
+			commonstate.PoolNameReclaim: {
+				commonstate.FakedContainerName: reclaimEntry(machine.NewCPUSet(2, 6)),
+			},
+		}
+		// nil preserved map (pool-adjustment path): every SNB ramp-up
+		// allocation is rematerialized because there is no advised/preserved
+		// distinction and no bulkhead view to own exclusion.
+		require.NoError(t, policy.rematerializeRampUpSharedAgainstFinalReclaim(entries, nil))
+		got := entries["ramp-up-pod"]["main"]
+		require.True(t, got.AllocationResult.Equals(machine.NewCPUSet(3, 7)),
+			"got %s", got.AllocationResult.String())
+		require.True(t, got.AllocationResult.Intersection(machine.NewCPUSet(2, 6)).IsEmpty())
+	})
+
+	t.Run("preserved SNB ramp-up is rematerialized", func(t *testing.T) {
+		entries := state.PodEntries{
+			"ramp-up-pod": {"main": rampUpEntry(machine.NewCPUSet(2, 3, 6, 7), true)},
+			commonstate.PoolNameReclaim: {
+				commonstate.FakedContainerName: reclaimEntry(machine.NewCPUSet(2, 6)),
+			},
+		}
+		preserved := map[string]map[string]struct{}{
+			"ramp-up-pod": {"main": {}},
+		}
+		require.NoError(t, policy.rematerializeRampUpSharedAgainstFinalReclaim(entries, preserved))
+		got := entries["ramp-up-pod"]["main"]
+		require.True(t, got.AllocationResult.Equals(machine.NewCPUSet(3, 7)),
+			"got %s", got.AllocationResult.String())
+		require.Equal(t, machine.NewCPUSet(3, 7), got.TopologyAwareAssignments[1])
+	})
+
+	t.Run("empty final reclaim is a no-op", func(t *testing.T) {
+		entries := state.PodEntries{
+			"ramp-up-pod": {"main": rampUpEntry(machine.NewCPUSet(1, 2, 3, 5, 6, 7), false)},
+			commonstate.PoolNameReclaim: {
+				commonstate.FakedContainerName: reclaimEntry(machine.NewCPUSet()),
+			},
+		}
+		require.NoError(t, policy.rematerializeRampUpSharedAgainstFinalReclaim(entries, nil))
+		require.True(t, entries["ramp-up-pod"]["main"].AllocationResult.Equals(machine.NewCPUSet(1, 2, 3, 5, 6, 7)))
+	})
+}
+
+// TestDynamicPolicyApplyBlocksRampUpSharedFailClosedWhenReclaimCoversRampUp
+// verifies both fail-closed branches of the rematerialization through the
+// real applyBlocks path (HP=true via the dynamic configuration, hardActive
+// parameter kept false so the ramp-up reclaim floor stays empty and the
+// scenario is deterministic):
+//   - reclaim covering rampUpCPUs entirely -> "completely covered" error;
+//   - only a lone SMT sibling surviving -> "no complete physical core" error.
+func TestDynamicPolicyApplyBlocksRampUpSharedFailClosedWhenReclaimCoversRampUp(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		reserved machine.CPUSet
+		wantErr  string
+	}{
+		{
+			name:     "ramp-up CPUs completely covered by final reclaim",
+			reserved: machine.NewCPUSet(0, 4),
+			wantErr:  "completely covered by the final reclaim pool",
+		},
+		{
+			name:     "only a lone SMT sibling survives the final reclaim",
+			reserved: machine.NewCPUSet(0),
+			wantErr:  "no complete physical core remains",
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			policy, _ := newRampUpOverlapTestPolicy(t, true)
+			policy.reservedCPUs = tc.reserved
+			policy.state.SetPodEntries(rampUpOverlapTestEntries(), false)
+
+			// reclaim spans NUMA0 core {1,5} and both NUMA1 cores {2,6},{3,7};
+			// with reserved={0,4} this covers rampUpCPUs completely, with
+			// reserved={0} only the lone sibling 4 of core {0,4} survives.
+			resp := &advisorapi.ListAndWatchResponse{
+				Entries: map[string]*advisorapi.CalculationEntries{
+					commonstate.PoolNameReclaim: {
+						Entries: map[string]*advisorapi.CalculationInfo{
+							commonstate.FakedContainerName: {
+								OwnerPoolName: commonstate.PoolNameReclaim,
+								CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+									0: {Blocks: []*advisorapi.Block{{BlockId: "reclaim-0", Result: 2}}},
+									1: {Blocks: []*advisorapi.Block{{BlockId: "reclaim-1", Result: 4}}},
+								},
+							},
+						},
+					},
+				},
+			}
+			blockCPUSet := advisorapi.BlockCPUSet{
+				"reclaim-0": machine.NewCPUSet(1, 5),
+				"reclaim-1": machine.NewCPUSet(2, 3, 6, 7),
+			}
+
+			pending, err := policy.applyBlocks(blockCPUSet, resp, false, false)
+			require.Nil(t, pending)
+			require.ErrorContains(t, err, tc.wantErr)
+			require.ErrorContains(t, err, "rematerialize ramp-up shared allocations against final reclaim pool")
+		})
+	}
+}
+
+// TestDynamicPolicyApplyBlocksReusesRampUpAllocationWhenRampUpCPUsEmptyWithoutHardPartition
+// pins the HP=false empty-set reuse semantics: when rampUpCPUs is empty the
+// ramp-up pod keeps its previous allocation, even when that allocation
+// overlaps the reclaim pool, and the commit still succeeds.
+func TestDynamicPolicyApplyBlocksReusesRampUpAllocationWhenRampUpCPUsEmptyWithoutHardPartition(t *testing.T) {
+	t.Parallel()
+
+	policy, _ := newRampUpOverlapTestPolicy(t, false)
+	// every CPU reserved -> rampUpCPUs is empty
+	policy.reservedCPUs = policy.machineInfo.CPUDetails.CPUs()
+	policy.state.SetPodEntries(rampUpOverlapTestEntries(), false)
+	resp, blockCPUSet := rampUpOverlapTestResponse(false)
+
+	require.NoError(t, prepareAndCommitAdvisorBlocks(policy, blockCPUSet, resp, false))
+
+	got := policy.state.GetAllocationInfo("ramp-up-pod", "main")
+	require.NotNil(t, got)
+	require.True(t, got.AllocationResult.Equals(machine.NewCPUSet(2, 6)),
+		"empty rampUpCPUs must reuse the old allocation without tightening, got %s",
+		got.AllocationResult.String())
+}
+
+// TestDynamicPolicyApplyBlocksRematerializesPreservedSNBRampUpAgainstFinalReclaim
+// covers the unadvised (preserved) SNB ramp-up branch: with AO=true no
+// adjustment commit override is built, so the raw advisor reclaim stays in
+// place and may overlap the preserved SNB allocation; the rematerialization
+// must shrink it canonically (whole core, inside its NUMA) instead of
+// preserving the overlap.
+func TestDynamicPolicyApplyBlocksRematerializesPreservedSNBRampUpAgainstFinalReclaim(t *testing.T) {
+	t.Parallel()
+
+	policy, topology := newRampUpOverlapTestPolicy(t, true)
+	numa1CPUs := topology.CPUDetails.CPUsInNUMANodes(1)
+	require.True(t, numa1CPUs.Equals(machine.NewCPUSet(2, 3, 6, 7)))
+
+	assignments, err := machine.GetNumaAwareAssignments(topology, numa1CPUs)
+	require.NoError(t, err)
+	policy.state.SetPodEntries(state.PodEntries{
+		"snb-ramp-up-pod": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "snb-ramp-up-pod",
+					ContainerName: "main",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+					Annotations: map[string]string{
+						apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+					},
+				},
+				RampUp:                           true,
+				AllocationResult:                 numa1CPUs.Clone(),
+				OriginalAllocationResult:         numa1CPUs.Clone(),
+				TopologyAwareAssignments:         assignments,
+				OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(assignments),
+				RequestQuantity:                  2,
+			},
+		},
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(2, 6),
+			},
+		},
+	}, false)
+
+	// AO=true && DD=false: no commit override is built, the advisor reclaim
+	// {2,6} is the final reclaim pool. The pod is not advised, so it goes
+	// through the preserve branch and keeps {2,3,6,7} until the
+	// rematerialization step shrinks it to the surviving whole core {3,7}.
+	resp, blockCPUSet := rampUpOverlapTestResponse(true)
+
+	require.NoError(t, prepareAndCommitAdvisorBlocks(policy, blockCPUSet, resp, true))
+
+	reclaim := policy.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	require.NotNil(t, reclaim)
+	require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(2, 6)))
+
+	got := policy.state.GetAllocationInfo("snb-ramp-up-pod", "main")
+	require.NotNil(t, got)
+	require.True(t, got.AllocationResult.Equals(machine.NewCPUSet(3, 7)),
+		"preserved SNB ramp-up allocation: %s", got.AllocationResult.String())
+	require.True(t, got.AllocationResult.Intersection(reclaim.AllocationResult).IsEmpty())
+	requireCoreAligned(t, topology, got.AllocationResult)
+	require.Equal(t, machine.NewCPUSet(3, 7), got.TopologyAwareAssignments[1])
+}
+
+// TestDynamicPolicyApplyBlocksRampUpRematerializationWithDefaultSharePool
+// verifies the rematerialization coexists with the default share pool
+// materialization (FillDefaultSharePoolWithNonReclaimCPUs): the share pool is
+// materialized from the residual and the ramp-up shared allocation is still
+// rematerialized against the final reclaim pool.
+func TestDynamicPolicyApplyBlocksRampUpRematerializationWithDefaultSharePool(t *testing.T) {
+	t.Parallel()
+
+	policy, topology := newRampUpOverlapTestPolicy(t, true)
+	policy.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+	policy.state.SetPodEntries(rampUpOverlapTestEntries(), false)
+
+	resp, blockCPUSet := rampUpOverlapTestResponse(false)
+	resp.Entries[commonstate.PoolNameShare] = &advisorapi.CalculationEntries{
+		Entries: map[string]*advisorapi.CalculationInfo{
+			commonstate.FakedContainerName: {
+				OwnerPoolName: commonstate.PoolNameShare,
+				CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+					commonstate.FakedNUMAID: {
+						Blocks: []*advisorapi.Block{{BlockId: "share", Result: 8}},
+					},
+				},
+			},
+		},
+	}
+
+	pending, err := policy.applyBlocks(blockCPUSet, resp, false, false)
+	require.NoError(t, err)
+	require.NotNil(t, pending)
+
+	reclaim := pending.entries[commonstate.PoolNameReclaim][commonstate.FakedContainerName]
+	require.NotNil(t, reclaim)
+	require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(2, 6)))
+
+	got := pending.entries["ramp-up-pod"]["main"]
+	require.NotNil(t, got)
+	require.True(t, got.AllocationResult.Equals(machine.NewCPUSet(1, 3, 5, 7)),
+		"ramp-up shared allocation: %s", got.AllocationResult.String())
+	require.True(t, got.AllocationResult.Intersection(reclaim.AllocationResult).IsEmpty())
+	requireCoreAligned(t, topology, got.AllocationResult)
+	require.Equal(t, machine.NewCPUSet(1, 5), got.TopologyAwareAssignments[0])
+	require.Equal(t, machine.NewCPUSet(3, 7), got.TopologyAwareAssignments[1])
+
+	share := pending.entries[commonstate.PoolNameShare][commonstate.FakedContainerName]
+	if share != nil {
+		require.True(t, share.AllocationResult.Intersection(reclaim.AllocationResult).IsEmpty(),
+			"default share pool must stay disjoint from the final reclaim pool: %s",
+			share.AllocationResult.String())
+	}
+}
+
+// TestDynamicPolicyApplyBlocksRampUpRematerializationWithDisableDedicatedOverlap
+// covers the HP=true && AO=true && DisableDedicatedCoresOverlapReclaimedCores
+// corner: the adjustment commit override is reclaim-minus-dedicated, and the
+// ramp-up shared allocation must still be rematerialized against that final
+// reclaim pool.
+func TestDynamicPolicyApplyBlocksRampUpRematerializationWithDisableDedicatedOverlap(t *testing.T) {
+	t.Parallel()
+
+	policy, topology := newRampUpOverlapTestPolicy(t, true)
+	policy.state.SetPodEntries(state.PodEntries{
+		"ramp-up-pod": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "ramp-up-pod",
+					ContainerName: "main",
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelSharedCores,
+				},
+				RampUp:           true,
+				AllocationResult: machine.NewCPUSet(2, 3, 6, 7),
+				RequestQuantity:  1,
+			},
+		},
+		"dedicated-pod": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "dedicated-pod",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameDedicated,
+					QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
+				},
+				AllocationResult: machine.NewCPUSet(1, 5),
+				RequestQuantity:  2,
+			},
+		},
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(1, 2, 5, 6),
+			},
+		},
+	}, false)
+
+	resp := &advisorapi.ListAndWatchResponse{
+		AllowSharedCoresOverlapReclaimedCores:      true,
+		DisableDedicatedCoresOverlapReclaimedCores: true,
+		Entries: map[string]*advisorapi.CalculationEntries{
+			"dedicated-pod": {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					"main": {
+						OwnerPoolName: commonstate.PoolNameDedicated,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							0: {Blocks: []*advisorapi.Block{{BlockId: "dedicated", Result: 2}}},
+						},
+					},
+				},
+			},
+			commonstate.PoolNameReclaim: {
+				Entries: map[string]*advisorapi.CalculationInfo{
+					commonstate.FakedContainerName: {
+						OwnerPoolName: commonstate.PoolNameReclaim,
+						CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							0: {Blocks: []*advisorapi.Block{{BlockId: "reclaim-0", Result: 2}}},
+							1: {Blocks: []*advisorapi.Block{{BlockId: "reclaim-1", Result: 2}}},
+						},
+					},
+				},
+			},
+		},
+	}
+	blockCPUSet := advisorapi.BlockCPUSet{
+		"dedicated": machine.NewCPUSet(1, 5),
+		"reclaim-0": machine.NewCPUSet(1, 5),
+		"reclaim-1": machine.NewCPUSet(2, 6),
+	}
+
+	require.NoError(t, prepareAndCommitAdvisorBlocks(policy, blockCPUSet, resp, true))
+
+	// DD=true: the final reclaim pool is reclaim-minus-dedicated.
+	reclaim := policy.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	require.NotNil(t, reclaim)
+	require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(2, 6)),
+		"final reclaim pool: %s", reclaim.AllocationResult.String())
+
+	dedicated := policy.state.GetAllocationInfo("dedicated-pod", "main")
+	require.NotNil(t, dedicated)
+	require.True(t, dedicated.AllocationResult.Equals(machine.NewCPUSet(1, 5)))
+
+	got := policy.state.GetAllocationInfo("ramp-up-pod", "main")
+	require.NotNil(t, got)
+	require.True(t, got.AllocationResult.Equals(machine.NewCPUSet(3, 7)),
+		"ramp-up shared allocation: %s", got.AllocationResult.String())
+	require.True(t, got.AllocationResult.Intersection(reclaim.AllocationResult).IsEmpty())
+	require.True(t, got.AllocationResult.Intersection(dedicated.AllocationResult).IsEmpty())
+	requireCoreAligned(t, topology, got.AllocationResult)
+}
+
 func TestDynamicPolicyApplyBlocksPrunesOwnerlessEmptyDefaultShareWithoutPreviousPool(t *testing.T) {
 	t.Parallel()
 
@@ -2807,7 +3679,7 @@ func TestDefaultShareEligibleCPUSetUsesCurrentMachineStateGuards(t *testing.T) {
 	}, false)
 
 	machineState := policy.state.GetMachineState()
-	rampFloor, err := policy.deriveRampUpReclaimFloor(machineState, policy.state.GetPodEntries(), false)
+	rampFloor, err := policy.deriveRampUpReclaimFloor(machineState, policy.state.GetPodEntries(), sets.NewInt())
 	require.NoError(t, err)
 	got := policy.buildDefaultShareEligibleCPUSet(entries, machineState, rampFloor)
 	require.True(t, got.Equals(machine.NewCPUSet(7)),

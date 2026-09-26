@@ -590,36 +590,9 @@ func productionNUMA2ReplacementFixture(t *testing.T) (
 ) {
 	t.Helper()
 
-	topology, err := machine.GenerateDummyCPUTopology(128, 2, 4)
-	require.NoError(t, err)
-	require.Equal(t, 4, topology.NumNUMANodes)
-
-	available := topology.CPUDetails.CPUsInNUMANodes(2)
-	require.Equal(t, 32, available.Size())
-	reclaimBefore := machine.NewCPUSet(32, 46, 47, 96, 108, 109, 110, 111)
-	dedicatedBefore := machine.NewCPUSet(
-		33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
-		97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107,
-	)
-	demands := []partitionDemand{
-		{
-			key:       "reclaim-numa-2",
-			quantity:  8,
-			eligible:  available,
-			preferred: reclaimBefore,
-			class:     advisorBlockClassMandatoryReclaim,
-		},
-		{
-			key:             "dedicated-numa-2",
-			requestGroupKey: "pod/main",
-			quantity:        24,
-			requestQuantity: 62,
-			eligible:        available,
-			preferred:       dedicatedBefore,
-			class:           advisorBlockClassDedicated,
-		},
-	}
-	return topology, demands, reclaimBefore, dedicatedBefore
+	_, topology, demands, _ :=
+		loadHardReclaimFixture(t, "affected-numa2-boundary")
+	return topology, demands, demands[0].preferred.Clone(), demands[1].preferred.Clone()
 }
 
 func TestPlanHardReclaimPartitionRepairsDedicatedBoundaryByReplacement(t *testing.T) {
@@ -860,6 +833,40 @@ func TestHardReclaimReplacementIsDeterministic(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, first, second)
+}
+
+func TestSolveHardReclaimResidualCandidatesReusesExactGraph(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopologyWithoutSMT(4, 1, 1)
+	require.NoError(t, err)
+	available := machine.NewCPUSet(0, 1, 2, 3)
+	demands := []partitionDemand{
+		{
+			key: "reclaim", quantity: 1, eligible: available,
+			class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "shared", quantity: 1, eligible: available,
+			class: advisorBlockClassShared,
+		},
+	}
+	states := []hardReclaimReplacementGlobalState{
+		{reclaimAfter: machine.NewCPUSet(0)},
+		{reclaimAfter: machine.NewCPUSet(0)},
+	}
+	cache, err := newPartitionResidualSolveCache(topology)
+	require.NoError(t, err)
+	searchBudget := defaultPartitionSearchBudget()
+
+	assignments, proof, err := solveHardReclaimResidualCandidates(
+		states, demands, available, topology, map[int]int{0: 1},
+		defaultHardReclaimReplacementOptions(), cache, &searchBudget)
+	require.NoError(t, err)
+	require.NotNil(t, proof)
+	require.Len(t, assignments, 2)
+	require.Equal(t, 1, cache.misses)
+	require.Equal(t, 1, cache.hits)
 }
 
 func TestHardReclaimReplacementExcludesSharedOwnershipFromCandidates(t *testing.T) {
@@ -1280,7 +1287,7 @@ func TestHardReclaimReplacementComparatorPrefersRetainedReclaimBeforePartialCore
 		map[string]machine.CPUSet{}, rightProof))
 }
 
-func TestHardReclaimReplacementSharesResidualBudgetAcrossGlobalCandidates(t *testing.T) {
+func TestHardReclaimReplacementResetsAssignmentEdgesPerResidualGraph(t *testing.T) {
 	t.Parallel()
 
 	topology, err := machine.GenerateDummyCPUTopologyWithoutSMT(4, 1, 1)
@@ -1309,10 +1316,106 @@ func TestHardReclaimReplacementSharesResidualBudgetAcrossGlobalCandidates(t *tes
 		},
 	)
 
+	require.NoError(t, err)
+	require.NotNil(t, proof)
+	require.Len(t, assignments, 2)
+}
+
+func TestHardReclaimReplacementRejectsOneOversizedResidualGraph(t *testing.T) {
+	t.Parallel()
+
+	topology, demands, _, _ := productionNUMA2ReplacementFixture(t)
+	assignments, proof, err := solveHardReclaimWithReplacement(
+		demands, topology.CPUDetails.CPUs(), topology,
+		hardReclaimReplacementOptions{
+			maxCandidateStates:          100_000,
+			maxTerminalSolves:           4096,
+			maxPartitionAssignmentEdges: 1,
+			maxPartitionFlowOperations:  partitionFlowOperationBudget,
+		},
+	)
+
 	require.Nil(t, assignments)
 	require.Nil(t, proof)
-	var selectionErr *hardReclaimSelectionError
-	require.ErrorAs(t, err, &selectionErr)
-	require.Equal(t, hardReclaimFailureSearchBudget, selectionErr.reason)
 	require.ErrorIs(t, err, errPartitionAssignmentEdgeBudget)
+}
+
+func TestHardReclaimReplacementSharesFlowOperationsAcrossResidualGraphs(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopologyWithoutSMT(4, 1, 1)
+	require.NoError(t, err)
+	numa := topology.CPUDetails.CPUsInNUMANodes(0)
+	demands := []partitionDemand{
+		{
+			key: "reclaim", quantity: 1, eligible: numa,
+			preferred: machine.NewCPUSet(0), class: advisorBlockClassMandatoryReclaim,
+		},
+		{
+			key: "shared", quantity: 1, eligible: numa,
+			preferred: machine.NewCPUSet(1), class: advisorBlockClassShared,
+		},
+	}
+	options := hardReclaimReplacementOptions{
+		maxCandidateStates:          100,
+		maxTerminalSolves:           10,
+		maxPartitionAssignmentEdges: partitionAssignmentEdgeBudget,
+	}
+
+	residualGraphs, err := enumerateHardReclaimReplacementInNUMA(
+		demands, numa, topology, 0, 1, options)
+	require.NoError(t, err)
+	require.Greater(t, len(residualGraphs), 1)
+
+	maxSingleGraphFlowOperations := 0
+	totalFlowOperations := 0
+	for _, residualGraph := range residualGraphs {
+		graphBudget := defaultPartitionGraphBudget()
+		searchBudget := defaultPartitionSearchBudget()
+		_, solveErr := solveDisjointPartitionsWithBudgets(
+			hardReclaimResidualDemands(
+				demands, numa, residualGraph.proof.reclaimAfter),
+			topology,
+			&graphBudget,
+			&searchBudget,
+		)
+		require.NoError(t, solveErr)
+		if searchBudget.flowOperations > maxSingleGraphFlowOperations {
+			maxSingleGraphFlowOperations = searchBudget.flowOperations
+		}
+		totalFlowOperations += searchBudget.flowOperations
+	}
+	flowLimit := maxSingleGraphFlowOperations + 1
+	require.Greater(t, totalFlowOperations, flowLimit)
+
+	for _, residualGraph := range residualGraphs {
+		graphBudget := defaultPartitionGraphBudget()
+		searchBudget := partitionSearchBudget{maxFlowOperations: flowLimit}
+		_, solveErr := solveDisjointPartitionsWithBudgets(
+			hardReclaimResidualDemands(
+				demands, numa, residualGraph.proof.reclaimAfter),
+			topology,
+			&graphBudget,
+			&searchBudget,
+		)
+		require.NoError(t, solveErr)
+		require.Less(t, searchBudget.flowOperations, flowLimit)
+	}
+	t.Logf(
+		"flow limit %d exceeds every residual graph (max %d), but not their cumulative cost %d",
+		flowLimit, maxSingleGraphFlowOperations, totalFlowOperations)
+
+	assignments, proof, err := solveHardReclaimWithReplacement(
+		demands, numa, topology,
+		hardReclaimReplacementOptions{
+			maxCandidateStates:          options.maxCandidateStates,
+			maxTerminalSolves:           options.maxTerminalSolves,
+			maxPartitionAssignmentEdges: options.maxPartitionAssignmentEdges,
+			maxPartitionFlowOperations:  flowLimit,
+		},
+	)
+
+	require.Nil(t, assignments)
+	require.Nil(t, proof)
+	require.ErrorIs(t, err, errPartitionFlowOperationBudget)
 }

@@ -982,8 +982,16 @@ func (p *DynamicPolicy) GetResourcesAllocation(ctx context.Context,
 					general.Errorf("pod: %s/%s, container: %s init timestamp parsed failed with error: %v, re-ramp-up it",
 						allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName, tsErr)
 
+					// Legacy timestamp repair re-ramps this non-binding shared
+					// allocation, so it activates the global reclaim domain; the
+					// derive function unions it with the domains already recorded
+					// in the state entries.
+					enteringRampUpDomains, dErr := p.rampUpDomainForAllocation(allocationInfo)
+					if dErr != nil {
+						return nil, fmt.Errorf("resolve entering legacy re-ramp-up domains: %w", dErr)
+					}
 					rampUpReclaimFloor, err := p.deriveRampUpReclaimFloor(
-						machineState, p.state.GetPodEntries(), true)
+						machineState, p.state.GetPodEntries(), enteringRampUpDomains)
 					if err != nil {
 						return nil, fmt.Errorf("derive reclaim floor for legacy re-ramp-up failed: %w", err)
 					}
