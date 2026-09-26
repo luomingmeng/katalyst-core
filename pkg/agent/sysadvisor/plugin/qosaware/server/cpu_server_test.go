@@ -236,7 +236,10 @@ func TestAssemblePoolEntriesDoesNotUseLiveReclaimWithoutRampUp(t *testing.T) {
 	require.Equal(t, uint64(6), reclaimResult.Blocks[0].Result)
 }
 
-func TestAssemblePoolEntriesUsesLiveReclaimOnlyForRampUpWithoutHardPartition(t *testing.T) {
+// TestAssemblePoolEntriesIsSerializerOnly verifies that the cpu server never
+// modifies PoolEntry sizes during serialization. The assembler is the single
+// conservation boundary; the server only converts Size to proto block.Result.
+func TestAssemblePoolEntriesIsSerializerOnly(t *testing.T) {
 	t.Parallel()
 
 	cs := newTestCPUServer(t, &mockCPUResourceAdvisor{}, nil)
@@ -261,7 +264,8 @@ func TestAssemblePoolEntriesUsesLiveReclaimOnlyForRampUpWithoutHardPartition(t *
 
 	reclaimResult := entries[commonstate.PoolNameReclaim].Entries[commonstate.FakedContainerName].CalculationResultsByNumas[0]
 	require.Len(t, reclaimResult.Blocks, 1)
-	require.Equal(t, uint64(2), reclaimResult.Blocks[0].Result)
+	// Server must NOT clamp Size=1 up to live=2; assembler handles live continuity.
+	require.Equal(t, uint64(1), reclaimResult.Blocks[0].Result)
 }
 
 func TestAssemblePoolEntriesDoesNotOverrideAdvisorTargetWithLiveQRMReclaimSizeWhenHardPartitionEnabled(t *testing.T) {
@@ -1650,73 +1654,23 @@ func advisorReclaimTargetsForRampUpFloorTest() map[int]types.CPUResource {
 // live-reclaim floor must only raise reclaim on the NUMAs an active ramp-up
 // domain actually owns (or every NUMA for the global domain), and must never
 // lift reclaim on a NUMA that has no ramp-up of its own.
-func TestAssemblePoolEntriesRampUpFloorPerNUMA(t *testing.T) {
+// TestAssemblePoolEntriesSerializerOnly verifies that the cpu server never
+// modifies reclaim pool entry sizes, regardless of ramp-up domain state.
+// Live-reclaim continuity is the assembler's responsibility; the server is a
+// pure serializer. This guards against regressions where the server re-introduces
+// a post-hoc clamp that breaks capacity conservation.
+func TestAssemblePoolEntriesSerializerOnly(t *testing.T) {
 	t.Parallel()
-
-	liveSize := map[int]uint64{0: 8, 2: 6, 3: 5, 5: 3, 7: 2}
 
 	testCases := []struct {
 		name          string
-		rampUpActive  bool
 		rampUpDomains []int
 		hardPartition bool
-		flooredNUMAs  []int
 	}{
-		{
-			name:          "global shared ramp-up floors every real NUMA",
-			rampUpActive:  true,
-			rampUpDomains: []int{commonstate.FakedNUMAID},
-			flooredNUMAs:  rampUpFloorTestNUMAs,
-		},
-		{
-			name:          "SNB ramp-up on NUMA7 floors only NUMA7",
-			rampUpActive:  true,
-			rampUpDomains: []int{7},
-			flooredNUMAs:  []int{7},
-		},
-		{
-			name:          "ramp-up on NUMA0 does not floor NUMA7 (exclusive, no local ramp-up)",
-			rampUpActive:  true,
-			rampUpDomains: []int{0},
-			flooredNUMAs:  []int{0},
-		},
-		{
-			name:          "empty domain set floors nobody",
-			rampUpActive:  true,
-			rampUpDomains: []int{},
-			flooredNUMAs:  nil,
-		},
-		{
-			name:          "dedicated ramp-up spanning NUMA2 and NUMA3",
-			rampUpActive:  true,
-			rampUpDomains: []int{2, 3},
-			flooredNUMAs:  []int{2, 3},
-		},
-		{
-			name:          "parallel ramp-up on NUMA1 and NUMA5 floors only NUMA5",
-			rampUpActive:  true,
-			rampUpDomains: []int{1, 5},
-			flooredNUMAs:  []int{5},
-		},
-		{
-			name:          "ramp-up ended floors nobody",
-			rampUpActive:  false,
-			rampUpDomains: nil,
-			flooredNUMAs:  nil,
-		},
-		{
-			name:          "stale node-global bool true but domains exclude NUMA7",
-			rampUpActive:  true,
-			rampUpDomains: []int{0},
-			flooredNUMAs:  []int{0},
-		},
-		{
-			name:          "hard partition active skips the floor even for global domain",
-			rampUpActive:  true,
-			rampUpDomains: []int{commonstate.FakedNUMAID},
-			hardPartition: true,
-			flooredNUMAs:  nil,
-		},
+		{"global ramp-up domain present", []int{commonstate.FakedNUMAID}, false},
+		{"real NUMA ramp-up", []int{0}, false},
+		{"hard partition active", []int{commonstate.FakedNUMAID}, true},
+		{"no ramp-up", nil, false},
 	}
 
 	for _, tc := range testCases {
@@ -1724,31 +1678,30 @@ func TestAssemblePoolEntriesRampUpFloorPerNUMA(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			cs := newTestCPUServer(t, &mockCPUResourceAdvisor{}, nil)
+			// Set up metaCache with live reclaim larger than advisor target.
 			require.NoError(t, cs.metaCache.SetPoolInfo(commonstate.PoolNameReclaim, &types.PoolInfo{
-				PoolName:                 commonstate.PoolNameReclaim,
-				TopologyAwareAssignments: liveReclaimAssignmentForRampUpFloorTest(),
+				PoolName: commonstate.PoolNameReclaim,
+				TopologyAwareAssignments: types.TopologyAwareAssignment{
+					0: machine.NewCPUSet(0, 1, 2, 3),
+				},
 			}))
 
 			entries := make(map[string]*cpuadvisor.CalculationEntries)
 			bs := NewBlockSet()
+			advisorTarget := map[int]types.CPUResource{0: {Size: 1, Quota: -1}}
 			cs.assemblePoolEntries(&types.InternalCPUCalculationResult{
-				RampUpActive:              tc.rampUpActive,
+				RampUpActive:              true,
 				RampUpDomains:             tc.rampUpDomains,
 				RampUpHardPartitionActive: tc.hardPartition,
 				PoolEntries: map[string]map[int]types.CPUResource{
-					commonstate.PoolNameReclaim: advisorReclaimTargetsForRampUpFloorTest(),
+					commonstate.PoolNameReclaim: advisorTarget,
 				},
 			}, entries, bs)
 
-			floored := sets.NewInt(tc.flooredNUMAs...)
-			for _, numa := range rampUpFloorTestNUMAs {
-				got := reclaimBlockSize(entries, numa)
-				if floored.Has(numa) {
-					require.Equal(t, liveSize[numa], got, "NUMA%d should be floored to live reclaim size", numa)
-				} else {
-					require.Equal(t, uint64(1), got, "NUMA%d must keep the advisor target, no floor", numa)
-				}
-			}
+			reclaimResult := entries[commonstate.PoolNameReclaim].Entries[commonstate.FakedContainerName].CalculationResultsByNumas[0]
+			require.Len(t, reclaimResult.Blocks, 1)
+			// Server must pass through advisor Size unchanged (1), never clamp to live (4).
+			require.Equal(t, uint64(1), reclaimResult.Blocks[0].Result)
 		})
 	}
 }

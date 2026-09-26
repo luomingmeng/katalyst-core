@@ -1542,6 +1542,48 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		numaSet,
 		reservedForReclaim,
 	)
+
+	// Domain-scoped live reclaim continuity (best-effort).
+	// Keep reclaim at least at the QRM-committed live size only when:
+	//   - the current NUMA hosts an active ramp-up domain (real-NUMA binding), OR
+	//   - this is the global/faked NUMA and the global domain is active.
+	// A global ramp-up MUST NOT broadcast its live floor to real NUMAs.
+	// The floor is skipped when dedicated + live > NUMA capacity: CPURequest is a
+	// hard guarantee for reclaim-disabled dedicated pools and must not be reduced.
+	if pa.calculationContext.LiveReclaimByNUMA != nil {
+		rampUpDomainSet := make(map[int]bool, len(pa.calculationContext.RampUpDomains))
+		for _, d := range pa.calculationContext.RampUpDomains {
+			rampUpDomainSet[d] = true
+		}
+		domainActive := false
+		if numaID == commonstate.FakedNUMAID {
+			domainActive = rampUpDomainSet[commonstate.FakedNUMAID]
+		} else {
+			domainActive = rampUpDomainSet[numaID]
+		}
+		if domainActive {
+			if liveSize, ok := pa.calculationContext.LiveReclaimByNUMA[numaID]; ok && liveSize > reclaimedCoresSize {
+				numaCap := 0
+				if pa.metaServer != nil && pa.metaServer.CPUDetails != nil {
+					numaCap = pa.metaServer.CPUDetails.CPUsInNUMANodes(numaID).Size()
+				}
+				totalAllocated := general.SumUpMapValues(shareAndIsolateDedicatedPoolSizes)
+				if numaCap <= 0 || totalAllocated+liveSize <= numaCap {
+					general.InfoS("apply domain-scoped live reclaim floor",
+						"numaID", numaID, "currentReclaim", reclaimedCoresSize,
+						"liveReclaim", liveSize, "totalAllocated", totalAllocated,
+						"numaCapacity", numaCap)
+					reclaimedCoresSize = liveSize
+				} else {
+					general.InfoS("skip live reclaim floor: capacity overflow",
+						"numaID", numaID, "currentReclaim", reclaimedCoresSize,
+						"liveReclaim", liveSize, "totalAllocated", totalAllocated,
+						"numaCapacity", numaCap)
+				}
+			}
+		}
+	}
+
 	constraintScope := NewNonExclusiveReclaimConstraintScope(numaID)
 	desiredReclaimedCoresSize := reclaimedCoresSize
 	var constraintExcess int

@@ -874,31 +874,10 @@ func (cs *cpuServer) assemblePoolEntries(advisorResp *types.InternalCPUCalculati
 
 	if reclaimEntries, ok := advisorResp.PoolEntries[commonstate.PoolNameReclaim]; ok {
 		poolEntry := NewPoolCalculationEntries(commonstate.PoolNameReclaim)
-		// The ramp-up live-reclaim floor is a per-domain safety clamp, not a
-		// node-global setting. When the hard partition is active the advisor's
-		// per-NUMA cap map already pins reclaim quantities, so this floor must not
-		// fight it. Otherwise a NUMA is clamped up to the live reclaim size only
-		// when it hosts (or shares) an active ramp-up domain:
-		//   - a real-NUMA-binding ramp-up floors exactly its own NUMA(s);
-		//   - the global domain (FakedNUMAID, -1) floors every real NUMA, because a
-		//     non-binding shared ramp-up may place its reclaim backfill on any NUMA
-		//     and the live reclaim CPUs must not be pulled away mid-ramp.
-		// This deliberately differs from the hard-partition cap map, where -1 writes
-		// no per-NUMA cap: a cap is a *target* the advisor sets, while the floor is a
-		// *runtime safety clamp* on CPUs QRM is actually using.
-		var (
-			liveReclaimByNUMA map[int]int
-			rampUpDomainSet   map[int]bool
-			globalRampUp      bool
-		)
-		if !advisorResp.RampUpHardPartitionActive {
-			liveReclaimByNUMA = cs.getLiveReclaimSizeByNUMA()
-			rampUpDomainSet = make(map[int]bool, len(advisorResp.RampUpDomains))
-			for _, domain := range advisorResp.RampUpDomains {
-				rampUpDomainSet[domain] = true
-			}
-			globalRampUp = rampUpDomainSet[commonstate.FakedNUMAID]
-		}
+		// The cpu server is a serializer only: it converts assembler PoolEntries
+		// into proto blocks without modifying any Size. All quantity decisions,
+		// including live-reclaim continuity under domain-scoped ramp-up, are made
+		// by the assembler as the single conservation boundary.
 		for numaID, reclaimCPU := range reclaimEntries {
 			reclaimNUMACalculationResult, ok := poolEntry.Entries[commonstate.FakedContainerName].CalculationResultsByNumas[int64(numaID)]
 			if !ok {
@@ -906,14 +885,6 @@ func (cs *cpuServer) assemblePoolEntries(advisorResp *types.InternalCPUCalculati
 				poolEntry.Entries[commonstate.FakedContainerName].CalculationResultsByNumas[int64(numaID)] = reclaimNUMACalculationResult
 			}
 
-			// first init reclaim pool if reclaim size is greater than 0: clamp the
-			// advisor target up to the live reclaim size only for NUMAs an active
-			// ramp-up domain actually owns (or that share the global domain).
-			if liveSize, ok := liveReclaimByNUMA[numaID]; ok &&
-				(globalRampUp || rampUpDomainSet[numaID]) &&
-				reclaimCPU.Size < liveSize {
-				reclaimCPU.Size = liveSize
-			}
 			if reclaimCPU.Size > 0 {
 				block := NewBlock(uint64(reclaimCPU.Size), "")
 				innerBlock := NewInnerBlock(block, int64(numaID), commonstate.PoolNameReclaim, nil, reclaimNUMACalculationResult)
@@ -961,22 +932,6 @@ func (cs *cpuServer) assemblePoolEntries(advisorResp *types.InternalCPUCalculati
 	} else {
 		general.Warningf("cpu server meta cache does not exist interrupt pool")
 	}
-}
-
-func (cs *cpuServer) getLiveReclaimSizeByNUMA() map[int]int {
-	poolInfo, ok := cs.metaCache.GetPoolInfo(commonstate.PoolNameReclaim)
-	if !ok || poolInfo == nil {
-		return nil
-	}
-
-	result := make(map[int]int)
-	for numaID, cpuset := range poolInfo.TopologyAwareAssignments {
-		if cpuset.IsEmpty() {
-			continue
-		}
-		result[numaID] = cpuset.Size()
-	}
-	return result
 }
 
 // assemblePoolEntries fills up calculationEntriesMap and blockSet based on types.ContainerInfo

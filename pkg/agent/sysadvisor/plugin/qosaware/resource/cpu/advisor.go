@@ -1049,6 +1049,20 @@ func (cra *cpuResourceAdvisor) assembleProvision(dynamicConf *dynamic.Configurat
 		return types.InternalCPUCalculationResult{}, fmt.Errorf("no legal provision assembler")
 	}
 
+	// Snapshot the QRM-committed reclaim pool sizes per NUMA at cycle start.
+	// The assembler uses this as a best-effort lower bound under domain-scoped
+	// ramp-up protection, but never at the expense of dedicated guarantees.
+	liveReclaimByNUMA := make(map[int]int)
+	if cra.metaCache != nil {
+		if poolInfo, ok := cra.metaCache.GetPoolInfo(commonstate.PoolNameReclaim); ok && poolInfo != nil {
+			for numaID, cpuset := range poolInfo.TopologyAwareAssignments {
+				if !cpuset.IsEmpty() {
+					liveReclaimByNUMA[numaID] = cpuset.Size()
+				}
+			}
+		}
+	}
+
 	return cra.provisionAssembler.AssembleProvision(provisionassembler.ProvisionContext{
 		DynamicConfiguration: dynamicConf,
 		RampUpActive:         rampUpActive,
@@ -1056,6 +1070,7 @@ func (cra *cpuResourceAdvisor) assembleProvision(dynamicConf *dynamic.Configurat
 		ReclaimConstraint:    reclaimConstraint,
 		ReclaimCeilings:      reclaimCeilings,
 		ReclaimActiveScopes:  reclaimActiveScopes,
+		LiveReclaimByNUMA:    liveReclaimByNUMA,
 	})
 }
 

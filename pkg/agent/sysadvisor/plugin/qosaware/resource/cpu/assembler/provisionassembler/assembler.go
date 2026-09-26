@@ -47,17 +47,20 @@ type ProvisionContext struct {
 	DynamicConfiguration *dynamic.Configuration
 	RampUpActive         bool
 	// RampUpDomains is the per-NUMA domain set that hosts an active ramp-up at
-	// cycle start (FakedNUMAID -1 denotes the global/non-binding domain). It is
-	// forwarded verbatim into InternalCPUCalculationResult so the cpu server can
-	// gate the live-reclaim floor per domain instead of node-globally.
+	// cycle start (FakedNUMAID -1 denotes the global/non-binding domain).
 	RampUpDomains     []int
 	ReclaimConstraint ReclaimConstraint
 	ReclaimCeilings   map[ReclaimConstraintScope]int
 	// ReclaimActiveScopes identifies the scopes that host an active ramp-up domain
-	// in the current cycle. ApplyReclaimConstraint clamps only these scopes; every
-	// other scope passes through untouched so a ramp-up on one NUMA cannot compress
-	// the reclaim pool of an unrelated (dedicated) NUMA.
+	// in the current cycle.
 	ReclaimActiveScopes map[ReclaimConstraintScope]bool
+	// LiveReclaimByNUMA is the QRM-committed reclaim pool cpuset size per NUMA
+	// at cycle start. It is a best-effort lower bound: when a real-NUMA ramp-up
+	// domain is active and capacity allows, the assembler keeps reclaim at least
+	// at this value. Global domain (-1) does NOT broadcast to real NUMAs.
+	// CPURequest is a hard guarantee for reclaim-disabled non-exclusive dedicated
+	// pools; live continuity MUST NOT reduce dedicated to inflate reclaim.
+	LiveReclaimByNUMA map[int]int
 }
 
 type InitFunc func(conf *config.Configuration, extraConf interface{}, regionMap *map[string]region.QoSRegion,
