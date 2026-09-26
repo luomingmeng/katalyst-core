@@ -23,6 +23,7 @@ import (
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/calculator"
 	cpustate "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
@@ -703,50 +704,9 @@ func padNonReclaimPoolToMinSize(view *model.DesiredView, topology *machine.CPUTo
 		deficit = candidates.Size()
 	}
 
-	padding := takeCPUsByNUMABalanceWithSeed(topology, candidates, view.NonReclaimPool, deficit, opts.ReserveCPUReversely)
+	padding := calculator.TakeHTByNUMABalanceWithSeed(topology, candidates, view.NonReclaimPool, deficit, opts.ReserveCPUReversely)
 	view.NonReclaimPool = view.NonReclaimPool.Union(padding)
 	view.ReclaimEffective = view.ReclaimEffective.Difference(padding)
-}
-
-func takeCPUsByNUMABalanceWithSeed(topology *machine.CPUTopology, candidates, seed machine.CPUSet, count int, reverse bool) machine.CPUSet {
-	if topology == nil || count <= 0 || candidates.IsEmpty() {
-		return machine.NewCPUSet()
-	}
-
-	candidateByNUMA := map[int][]int{}
-	currentCountByNUMA := map[int]int{}
-	numaIDs := topology.CPUDetails.NUMANodes().ToSliceInt()
-	for _, numaID := range numaIDs {
-		numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
-		currentCountByNUMA[numaID] = seed.Intersection(numaCPUs).Size()
-		numaCandidates := candidates.Intersection(numaCPUs)
-		if reverse {
-			candidateByNUMA[numaID] = numaCandidates.ToSliceIntReversely()
-		} else {
-			candidateByNUMA[numaID] = numaCandidates.ToSliceInt()
-		}
-	}
-
-	result := machine.NewCPUSet()
-	for result.Size() < count {
-		selectedNUMA := -1
-		for _, numaID := range numaIDs {
-			if len(candidateByNUMA[numaID]) == 0 {
-				continue
-			}
-			if selectedNUMA == -1 || currentCountByNUMA[numaID] < currentCountByNUMA[selectedNUMA] {
-				selectedNUMA = numaID
-			}
-		}
-		if selectedNUMA == -1 {
-			break
-		}
-		cpu := candidateByNUMA[selectedNUMA][0]
-		candidateByNUMA[selectedNUMA] = candidateByNUMA[selectedNUMA][1:]
-		result.Add(cpu)
-		currentCountByNUMA[selectedNUMA]++
-	}
-	return result
 }
 
 func rebuildReclaimEffectivePerNUMA(view *model.DesiredView, topology *machine.CPUTopology) {

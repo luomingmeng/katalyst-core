@@ -551,6 +551,67 @@ successful:
 	return acc.result.Clone(), availableCPUs.Difference(acc.result), nil
 }
 
+// TakeHTByNUMABalanceWithSeed picks `count` logical cpus out of `candidates`,
+// spread across NUMAs, but -- unlike TakeHTByNUMABalance -- it starts from an
+// existing `seed` set and balances the *final* (seed + taken) per-NUMA counts.
+//
+// Algorithm: repeatedly select the NUMA that currently holds the fewest cpus
+// (seed intersect that NUMA, plus cpus already taken by this call), and take
+// the next candidate cpu from it. Ties break by ascending NUMA id. When
+// `reverse` is false candidates are consumed in ascending cpu-id order within
+// a NUMA, when true in descending order. If fewer than `count` candidates are
+// available, every candidate is returned (never an error).
+//
+// This is the per-logical-CPU (HT granularity) seed-aware padding policy used
+// by the bulkhead non-reclaim pool: it grows the pool to its minimum size while
+// pulling cpus onto the NUMA that is currently under-represented, so the added
+// padding does not pile onto an already-full NUMA. It deliberately differs
+// from TakeHTByNUMABalance, which is seed-blind (round-robins by NUMA id from
+// an empty result): with an empty seed the two coincide numerically, with a
+// non-empty seed they intentionally diverge.
+func TakeHTByNUMABalanceWithSeed(topology *machine.CPUTopology, candidates, seed machine.CPUSet,
+	count int, reverse bool,
+) machine.CPUSet {
+	if topology == nil || count <= 0 || candidates.IsEmpty() {
+		return machine.NewCPUSet()
+	}
+
+	candidateByNUMA := map[int][]int{}
+	currentCountByNUMA := map[int]int{}
+	numaIDs := topology.CPUDetails.NUMANodes().ToSliceInt()
+	for _, numaID := range numaIDs {
+		numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
+		currentCountByNUMA[numaID] = seed.Intersection(numaCPUs).Size()
+		numaCandidates := candidates.Intersection(numaCPUs)
+		if reverse {
+			candidateByNUMA[numaID] = numaCandidates.ToSliceIntReversely()
+		} else {
+			candidateByNUMA[numaID] = numaCandidates.ToSliceInt()
+		}
+	}
+
+	result := machine.NewCPUSet()
+	for result.Size() < count {
+		selectedNUMA := -1
+		for _, numaID := range numaIDs {
+			if len(candidateByNUMA[numaID]) == 0 {
+				continue
+			}
+			if selectedNUMA == -1 || currentCountByNUMA[numaID] < currentCountByNUMA[selectedNUMA] {
+				selectedNUMA = numaID
+			}
+		}
+		if selectedNUMA == -1 {
+			break
+		}
+		cpu := candidateByNUMA[selectedNUMA][0]
+		candidateByNUMA[selectedNUMA] = candidateByNUMA[selectedNUMA][1:]
+		result.Add(cpu)
+		currentCountByNUMA[selectedNUMA]++
+	}
+	return result
+}
+
 // TakeByNUMABalanceReversely tries to make the allocated cpu resersely spread on different
 // NUMAs, and it uses cpu Cores as the basic allocation unit
 func TakeByNUMABalanceReversely(info *machine.KatalystMachineInfo, availableCPUs machine.CPUSet,
