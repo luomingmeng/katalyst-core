@@ -2202,6 +2202,7 @@ type ordinaryOverlapAssemblerCase struct {
 	dedicatedPackage        string
 	pinnedCPUSet            machine.CPUSet
 	reserveCPUSet           machine.CPUSet
+	cpusPerCore             int
 }
 
 func runOrdinaryOverlapAssemblerCase(
@@ -2289,7 +2290,7 @@ func runOrdinaryOverlapAssemblerCase(
 	pa := NewProvisionAssemblerCommon(
 		conf, nil, &regionMap, &reservedForReclaim, &rampUpReclaimCPUSetCap, &numaAvailable, &nonBindingNUMAs,
 		&tc.allowSharedOverlap, &tc.disableDedicatedOverlap, metaReader,
-		newTestMetaServer(numaAvailable, 1), metrics.DummyMetrics{},
+		nonExclusiveTestMetaServer(numaAvailable, tc.cpusPerCore), metrics.DummyMetrics{},
 	).(*ProvisionAssemblerCommon)
 	result := &types.InternalCPUCalculationResult{
 		PoolEntries:                                map[string]map[int]types.CPUResource{},
@@ -2723,6 +2724,7 @@ func TestApplyReclaimConstraint(t *testing.T) {
 				tc.reservedForReclaim,
 				tc.constraint,
 				tc.ceilings,
+				map[ReclaimConstraintScope]bool{ReclaimConstraintScope("scope"): true},
 			)
 			require.Equal(t, tc.wantSize, gotSize)
 			require.Equal(t, tc.wantLimit, gotLimit)
@@ -3253,6 +3255,9 @@ func TestAssembleDedicatedNUMAExclusiveRegionDisjoint(t *testing.T) {
 		pa.calculationContext.ReclaimCeilings = map[ReclaimConstraintScope]int{
 			NewExclusiveReclaimConstraintScope("dedicated-exclusive"): 5,
 		}
+		pa.calculationContext.ReclaimActiveScopes = map[ReclaimConstraintScope]bool{
+			NewExclusiveReclaimConstraintScope("dedicated-exclusive"): true,
+		}
 		exclusiveRegion.SetProvision(types.ControlKnob{
 			configapi.ControlKnobNonReclaimedCPURequirement: {Value: 10},
 		})
@@ -3271,6 +3276,9 @@ func TestAssembleDedicatedNUMAExclusiveRegionDisjoint(t *testing.T) {
 		pa.calculationContext.ReclaimConstraint = ReclaimConstraintReservedFloor
 		pa.calculationContext.ReclaimCeilings = map[ReclaimConstraintScope]int{
 			NewLegacyExclusiveReclaimConstraintScope("dedicated-exclusive"): 5,
+		}
+		pa.calculationContext.ReclaimActiveScopes = map[ReclaimConstraintScope]bool{
+			NewLegacyExclusiveReclaimConstraintScope("dedicated-exclusive"): true,
 		}
 		exclusiveRegion.SetProvision(types.ControlKnob{
 			configapi.ControlKnobNonReclaimedCPURequirement: {Value: 10},
@@ -4104,9 +4112,9 @@ func TestFinalizeDefaultShareBackfillMatrix(t *testing.T) {
 		wantFixed       int
 	}{
 		{
-			name:            "reclaim advice does not lower qrm residual upper bound",
-			numaAvailable:   map[int]int{0: 95, 1: 95},
-			nonBinding:      machine.NewCPUSet(),
+			name:          "reclaim advice does not lower qrm residual upper bound",
+			numaAvailable: map[int]int{0: 95, 1: 95},
+			nonBinding:    machine.NewCPUSet(),
 			entries: []entry{
 				{commonstate.PoolNameReclaim, 0, 28},
 				{commonstate.PoolNameReclaim, 1, 28},
@@ -4248,4 +4256,80 @@ func TestAssembleProvisionBackfillEndToEnd(t *testing.T) {
 	// reclaim and fixed CPUSet union when materializing the actual share CPUSet.
 	require.Equal(t, 20, share)
 	require.Equal(t, share, result.DefaultShareBackfill.DefaultShareFinal)
+}
+
+// nonExclusiveTestMetaServer builds a test meta server whose per-NUMA CPUs are laid
+// out in physical cores of the requested width; width 0 defaults to 1 (no SMT).
+func nonExclusiveTestMetaServer(numaAvailable map[int]int, cpusPerCore int) *metaserver.MetaServer {
+	if cpusPerCore <= 0 {
+		cpusPerCore = 1
+	}
+	return newTestMetaServer(numaAvailable, cpusPerCore)
+}
+
+// TestAssembleWithoutNUMAExclusivePool_PassesThroughOddReclaimWhenNoDedicatedHeadroom is
+// the call-chain proof for the non-exclusive path: under the three hard-partition
+// gates on a real NUMA with SMT2, an odd non-overlap reclaim (3) is published. The
+// non-exclusive assembler sizes the dedicated pool exactly to its requirement minimum,
+// so there is no dedicated headroom to reallocate; the correct behavior is to leave
+// the odd target unchanged and let QRM's steady normalization own whole-core
+// materialization. This exercises descriptor -> pool entries -> joint normalization
+// -> passthrough end to end.
+func TestAssembleWithoutNUMAExclusivePool_PassesThroughOddReclaimWhenNoDedicatedHeadroom(t *testing.T) {
+	t.Parallel()
+	res, err := runOrdinaryOverlapAssemblerCase(t, ordinaryOverlapAssemblerCase{
+		capacity:                34,
+		reserved:                0,
+		hardPartition:           true,
+		hardTarget:              3,
+		disableDedicatedOverlap: true,
+		dedicatedEnableReclaim:  true,
+		dedicatedRequest:        22,
+		dedicatedRequirement:    22,
+		cpusPerCore:             2,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 3, res.PoolEntries[commonstate.PoolNameReclaim][0].Size)
+	require.Equal(t, 22, res.PoolEntries["dedicated-pod"][0].Size)
+	// conservation: reclaim + dedicated unchanged by normalization.
+	require.Equal(t, 3+22, res.PoolEntries[commonstate.PoolNameReclaim][0].Size+res.PoolEntries["dedicated-pod"][0].Size)
+}
+
+// TestAssembleWithoutNUMAExclusivePool_OddReclaimUnchangedWhenGateOff proves that with
+// the dedicated-overlap gate open the odd reclaim is published exactly as the solver
+// produced it (legacy path, no normalization attempted).
+func TestAssembleWithoutNUMAExclusivePool_OddReclaimUnchangedWhenGateOff(t *testing.T) {
+	t.Parallel()
+	res, err := runOrdinaryOverlapAssemblerCase(t, ordinaryOverlapAssemblerCase{
+		capacity:                34,
+		reserved:                0,
+		hardPartition:           true,
+		hardTarget:              3,
+		disableDedicatedOverlap: false,
+		dedicatedEnableReclaim:  true,
+		dedicatedRequest:        22,
+		dedicatedRequirement:    22,
+		cpusPerCore:             2,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 3, res.PoolEntries[commonstate.PoolNameReclaim][0].Size)
+}
+
+// TestAssembleWithoutNUMAExclusivePool_SMT1NoNormalization proves that with SMT=1
+// (no whole-core concept) the reclaim target is published unchanged.
+func TestAssembleWithoutNUMAExclusivePool_SMT1NoNormalization(t *testing.T) {
+	t.Parallel()
+	res, err := runOrdinaryOverlapAssemblerCase(t, ordinaryOverlapAssemblerCase{
+		capacity:                34,
+		reserved:                0,
+		hardPartition:           true,
+		hardTarget:              3,
+		disableDedicatedOverlap: true,
+		dedicatedEnableReclaim:  true,
+		dedicatedRequest:        22,
+		dedicatedRequirement:    22,
+		cpusPerCore:             1,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 3, res.PoolEntries[commonstate.PoolNameReclaim][0].Size)
 }

@@ -90,8 +90,11 @@ func (pa *ProvisionAssemblerCommon) cpuCountInNUMAs(numas machine.CPUSet) int {
 	return pa.metaServer.CPUDetails.CPUsInNUMANodes(numas.ToSliceInt()...).Size()
 }
 
-func (pa *ProvisionAssemblerCommon) reclaimRatioCPUsPerCore() (int, error) {
-	if !pa.rampUpHardPartitionActive() {
+func (pa *ProvisionAssemblerCommon) reclaimRatioCPUsPerCore(numaID int) (int, error) {
+	// Physical-core ratio rounding only applies to the specific NUMA that is under
+	// an active ramp-up hard partition; other NUMAs keep the historical logical-CPU
+	// rounding.
+	if !pa.rampUpHardPartitionActive(numaID) {
 		return 1, nil
 	}
 	if pa.metaServer == nil || pa.metaServer.CPUTopology == nil {
@@ -104,16 +107,61 @@ func (pa *ProvisionAssemblerCommon) reclaimRatioCPUsPerCore() (int, error) {
 	return cpusPerCore, nil
 }
 
-func (pa *ProvisionAssemblerCommon) rampUpHardPartitionActive() bool {
-	return pa.rampUpReclaimCPUSetCap != nil && len(*pa.rampUpReclaimCPUSetCap) > 0
+// rampUpHardPartitionActive reports whether the given NUMA is currently under an
+// active ramp-up hard partition. The ramp-up reclaim floor is scoped per NUMA:
+// only NUMAs that host an actual ramp-up source carry an entry in the cap map.
+// This deliberately replaces the former node-global "cap map non-empty" gate so a
+// ramp-up on one NUMA cannot switch hard-partition behavior on another NUMA's
+// dedicated pool.
+func (pa *ProvisionAssemblerCommon) rampUpHardPartitionActive(numaID int) bool {
+	if pa.rampUpReclaimCPUSetCap == nil {
+		return false
+	}
+	c, ok := (*pa.rampUpReclaimCPUSetCap)[numaID]
+	return ok && c > 0
+}
+
+// rampUpHardPartitionActiveAny is the node-level summary used for the result
+// struct that downstream (cpu server) consumes as a coarse feature flag. Per-NUMA
+// effects must always go through rampUpHardPartitionActive(numaID).
+func (pa *ProvisionAssemblerCommon) rampUpHardPartitionActiveAny() bool {
+	if pa.rampUpReclaimCPUSetCap == nil {
+		return false
+	}
+	for _, c := range *pa.rampUpReclaimCPUSetCap {
+		if c > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// rampUpHardPartitionActiveAnyIn reports whether any of the given NUMAs hosts an
+// active ramp-up hard-partition floor. It backs the global (FakedNUMAID) shared
+// pool, which aggregates reclaim over nonBindingNUMAs: hard partition must engage
+// there when any backing NUMA is an active ramp-up domain, without leaking onto
+// dedicated-binding NUMAs that are excluded from nonBindingNUMAs by construction.
+func (pa *ProvisionAssemblerCommon) rampUpHardPartitionActiveAnyIn(numas machine.CPUSet) bool {
+	if pa.rampUpReclaimCPUSetCap == nil || numas.IsEmpty() {
+		return false
+	}
+	for _, numaID := range numas.ToSliceInt() {
+		if c, ok := (*pa.rampUpReclaimCPUSetCap)[numaID]; ok && c > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (pa *ProvisionAssemblerCommon) effectiveReservedForReclaim(numas machine.CPUSet) int {
 	reserved := 0
 	for _, numaID := range numas.ToSliceInt() {
 		steady := (*pa.reservedForReclaim)[numaID]
-		if pa.rampUpHardPartitionActive() {
-			steady = general.Max(steady, (*pa.rampUpReclaimCPUSetCap)[numaID])
+		// The ramp-up hard floor only exists for NUMAs that host an active ramp-up
+		// source; NUMAs without one are left at the steady reserve. A missing or
+		// zero cap entry (the common cross-domain case) leaves steady unchanged.
+		if cap, ok := (*pa.rampUpReclaimCPUSetCap)[numaID]; ok && cap > steady {
+			steady = cap
 		}
 		reserved += steady
 	}
@@ -660,7 +708,7 @@ func (pa *ProvisionAssemblerCommon) assembleDedicatedNUMAExclusiveRegion(r regio
 	ratioPhysicalCap := 0
 	if ratio := pa.calculationContext.DynamicConfiguration.ReclaimedCPUMaxRatio; ratio > 0 {
 		if cpuCount := pa.cpuCountInNUMAs(r.GetBindingNumas()); cpuCount > 0 {
-			cpusPerCore, err := pa.reclaimRatioCPUsPerCore()
+			cpusPerCore, err := pa.reclaimRatioCPUsPerCore(regionNuma)
 			if err != nil {
 				return err
 			}
@@ -713,6 +761,7 @@ func (pa *ProvisionAssemblerCommon) assembleDedicatedNUMAExclusiveRegion(r regio
 		reservedForReclaim,
 		pa.calculationContext.ReclaimConstraint,
 		pa.calculationContext.ReclaimCeilings,
+		pa.calculationContext.ReclaimActiveScopes,
 	)
 	RecordReclaimConstraintTarget(result, pa.calculationContext.ReclaimConstraint,
 		constraintScope, desiredReclaimTarget, reservedForReclaim, constraintExcess)
@@ -735,6 +784,41 @@ func (pa *ProvisionAssemblerCommon) assembleDedicatedNUMAExclusiveRegion(r regio
 			)
 		}
 		dedicatedTarget = nextDedicatedTarget
+	}
+
+	// Quantize the final real-NUMA dedicated/reclaim target to a whole-core value:
+	// an odd reclaim target cannot be expressed as complete physical cores, which
+	// QRM materializes as whole cores. Rewrite it to the committed-anchored whole-core
+	// value so the block we publish is already representable. It is conservative:
+	// never shrinks below the reserved reclaim, and passes through when no legal
+	// whole-core value exists (QRM owns the reconcile there).
+	cpusPerCore := 1
+	if pa.metaServer != nil && pa.metaServer.CPUTopology != nil {
+		cpusPerCore = pa.metaServer.CPUTopology.CPUsPerCore()
+	}
+	quantizedReclaimTarget, quantizeDecision := quantizeDisjointReclaimTargetToWholeCore(
+		reclaimTarget, reservedForReclaim, cpusPerCore)
+	if quantizedReclaimTarget != reclaimTarget {
+		nextDedicated := partitionCapacity - quantizedReclaimTarget
+		if nextDedicated >= 0 && nextDedicated <= dedicatedCapacity {
+			klog.InfoS("quantized disjoint reclaim target to whole-core value",
+				"regionName", r.Name(),
+				"regionNuma", regionNuma,
+				"cpusPerCore", cpusPerCore,
+				"reservedForReclaim", reservedForReclaim,
+				"originalReclaimTarget", reclaimTarget,
+				"quantizedReclaimTarget", quantizedReclaimTarget,
+				"decision", quantizeDecision)
+			reclaimTarget = quantizedReclaimTarget
+			dedicatedTarget = nextDedicated
+		} else {
+			klog.InfoS("passing through non-whole-core reclaim target: quantized value out of dedicated bounds",
+				"regionName", r.Name(),
+				"originalReclaimTarget", reclaimTarget,
+				"quantizedReclaimTarget", quantizedReclaimTarget,
+				"dedicatedCapacity", dedicatedCapacity,
+				"decision", quantizeDecision)
+		}
 	}
 
 	for podUID := range r.GetPods() {
@@ -847,7 +931,7 @@ func (pa *ProvisionAssemblerCommon) assembleLegacyDedicatedNUMAExclusiveRegion(r
 
 	if ratio := pa.calculationContext.DynamicConfiguration.ReclaimedCPUMaxRatio; ratio > 0 {
 		if cpuCount := pa.cpuCountInNUMAs(r.GetBindingNumas()); cpuCount > 0 {
-			cpusPerCore, err := pa.reclaimRatioCPUsPerCore()
+			cpusPerCore, err := pa.reclaimRatioCPUsPerCore(regionNuma)
 			if err != nil {
 				return err
 			}
@@ -880,6 +964,7 @@ func (pa *ProvisionAssemblerCommon) assembleLegacyDedicatedNUMAExclusiveRegion(r
 		reservedForReclaim,
 		pa.calculationContext.ReclaimConstraint,
 		pa.calculationContext.ReclaimCeilings,
+		pa.calculationContext.ReclaimActiveScopes,
 	)
 	RecordReclaimConstraintTarget(result, pa.calculationContext.ReclaimConstraint,
 		constraintScope, desiredReclaimedCoresSize, reservedForReclaim, constraintExcess)
@@ -947,7 +1032,8 @@ func (pa *ProvisionAssemblerCommon) AssembleProvision(ctx ProvisionContext) (typ
 		AllowSharedCoresOverlapReclaimedCores:      *pa.allowSharedCoresOverlapReclaimedCores,
 		DisableDedicatedCoresOverlapReclaimedCores: *pa.disableDedicatedCoresOverlapReclaimedCores,
 		RampUpActive:                               ctx.RampUpActive,
-		RampUpHardPartitionActive:                  pa.rampUpHardPartitionActive(),
+		RampUpHardPartitionActive:                  pa.rampUpHardPartitionActiveAny(),
+		RampUpDomains:                              ctx.RampUpDomains,
 	}
 	// mark the backfill enabled once so downstream finalize can decide whether to
 	// override the default share pool quantity with the allocatable upper bound.
@@ -1064,7 +1150,15 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 	}
 
 	dynamicConf := pa.calculationContext.DynamicConfiguration
-	effectiveHard := pa.rampUpHardPartitionActive()
+	// Hard partition only applies to NUMAs that actually host a ramp-up source.
+	// A real NUMA must itself be an active ramp-up domain; the global
+	// (FakedNUMAID) shared pool aggregates over nonBindingNUMAs, so it engages when
+	// any of those backing NUMAs is active. Dedicated-binding NUMAs are excluded
+	// from nonBindingNUMAs by construction and are never pulled in here.
+	effectiveHard := pa.rampUpHardPartitionActive(numaID)
+	if !effectiveHard && numaID == commonstate.FakedNUMAID {
+		effectiveHard = pa.rampUpHardPartitionActiveAnyIn(numaSet)
+	}
 
 	// While ramp-up hard partition is active, publish the canonical target even
 	// when this NUMA has no workload region.
@@ -1229,6 +1323,11 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		"nonReclaimablePackages", nonReclaimablePackages,
 		"disableReclaimSelector", disableReclaimSelector)
 
+	// dedicatedPoolCeilings records, per dedicated pool, the post-reserve available
+	// capacity of its eligibility domain (its pinned package, or the unpinned domain).
+	// A dedicated pool may only grow within its own domain, so joint normalization
+	// must not use the NUMA-wide available as the ceiling.
+	dedicatedPoolCeilings := make(map[string]int)
 	// first calculate share and isolate dedicated pool sizes for each pinned region
 	for pkgName, pinnedCPUSize := range pinnedCPUSizeByPkg {
 		pinnedPoolAvailable := pinnedPoolAvailableByPkg[pkgName]
@@ -1258,6 +1357,9 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		for poolName, size := range poolSizes {
 			shareAndIsolateDedicatedPoolSizes[poolName] = size
 		}
+		for poolName := range allInfo.dedicatedRegionInfos.requests {
+			dedicatedPoolCeilings[poolName] = pinnedPoolAvailable
+		}
 
 		shareInfo.merge(allInfo.shareRegionInfo)
 		isolationInfo.merge(allInfo.isolationRegionInfo)
@@ -1283,6 +1385,9 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 	)
 	for poolName, size := range unpinnedPoolSizes {
 		shareAndIsolateDedicatedPoolSizes[poolName] = size
+	}
+	for poolName := range unpinnedDedicatedInfo.requests {
+		dedicatedPoolCeilings[poolName] = unpinnedShareAndIsolatedDedicatedPoolAvailable
 	}
 
 	shareInfo.merge(unpinnedShareRegionInfo)
@@ -1411,7 +1516,7 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		FinalLimit: reclaimedCoresQuota,
 	}
 	if ratio <= 0 || cpuCount > 0 {
-		cpusPerCore, err := pa.reclaimRatioCPUsPerCore()
+		cpusPerCore, err := pa.reclaimRatioCPUsPerCore(numaID)
 		if err != nil {
 			return err
 		}
@@ -1447,6 +1552,7 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		reservedForReclaim,
 		pa.calculationContext.ReclaimConstraint,
 		pa.calculationContext.ReclaimCeilings,
+		pa.calculationContext.ReclaimActiveScopes,
 	)
 	RecordReclaimConstraintTarget(result, pa.calculationContext.ReclaimConstraint,
 		constraintScope, desiredReclaimedCoresSize, reservedForReclaim, constraintExcess)
@@ -1488,6 +1594,55 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		"nonOverlapReclaimedCoresSize", nonOverlapReclaimedCoresSize,
 		"reclaimedCoresQuota", reclaimedCoresQuota,
 		"overlapAtoms", summarizeOverlapAtoms(reclaimPoolData.overlapAtoms))
+	// Jointly align the non-overlap reclaim target to a whole-core value before
+	// publication, only on a real NUMA under the three hard-partition gates. The
+	// adjustment keeps the controlled partition (non-overlap reclaim + the single
+	// dedicated pool) size-conserved: releasing reclaim returns CPUs to dedicated,
+	// growing reclaim takes them from dedicated headroom. share and isolation pools
+	// are never moved, and multi-source (more than one dedicated pool) passes through
+	// because there is no per-pool provenance to assign the core.
+	if numaID != commonstate.FakedNUMAID && pa.metaServer != nil && pa.metaServer.CPUTopology != nil &&
+		nodeEnableReclaim && effectiveHard && result.DisableDedicatedCoresOverlapReclaimedCores {
+		joint := jointlyNormalizeNonExclusiveTargets(nonExclusiveJointInput{
+			CPUsPerCore:        pa.metaServer.CPUTopology.CPUsPerCore(),
+			ReclaimTarget:      nonOverlapReclaimedCoresSize,
+			ReservedForReclaim: reservedForReclaim,
+			DedicatedPoolSizes: dedicatedPoolSizes,
+			DedicatedMinimums:  getPoolSizeRequirements(dedicatedInfo),
+			DedicatedCeilings:  dedicatedPoolCeilings,
+		})
+		switch joint.Decision {
+		case nonExclusiveJointRoundedDown, nonExclusiveJointRoundedUp:
+			general.InfoS("non-exclusive reclaim jointly normalized to whole-core target",
+				"numaID", numaID,
+				"decision", joint.Decision,
+				"beforeReclaim", nonOverlapReclaimedCoresSize,
+				"afterReclaim", joint.ReclaimSize,
+				"reservedForReclaim", reservedForReclaim)
+			nonOverlapReclaimedCoresSize = joint.ReclaimSize
+			// quota must not exceed the published non-overlap reclaim size.
+			if reclaimedCoresQuota > float64(nonOverlapReclaimedCoresSize) {
+				reclaimedCoresQuota = float64(nonOverlapReclaimedCoresSize)
+			}
+			if nonOverlapReclaimedCoresSize < overlapReclaimedCoresSize {
+				general.InfoS("non-exclusive reclaim normalization left overlap larger than non-overlap reclaim",
+					"numaID", numaID,
+					"nonOverlapReclaimedCoresSize", nonOverlapReclaimedCoresSize,
+					"overlapReclaimedCoresSize", overlapReclaimedCoresSize)
+			}
+			for poolName, newSize := range joint.DedicatedSizes {
+				for podUID := range dedicatedInfo.podSet[poolName] {
+					result.SetPoolEntry(podUID, numaID, newSize, -1)
+				}
+			}
+		case nonExclusiveJointPassthrough:
+			general.InfoS("non-exclusive reclaim leaves non-whole-core target to QRM",
+				"numaID", numaID,
+				"nonOverlapReclaimedCoresSize", nonOverlapReclaimedCoresSize,
+				"dedicatedPoolCount", len(dedicatedPoolSizes),
+				"reservedForReclaim", reservedForReclaim)
+		}
+	}
 	result.SetPoolEntry(commonstate.PoolNameReclaim, numaID, nonOverlapReclaimedCoresSize, reclaimedCoresQuota)
 
 	general.InfoS("assemble reclaim pool entry",

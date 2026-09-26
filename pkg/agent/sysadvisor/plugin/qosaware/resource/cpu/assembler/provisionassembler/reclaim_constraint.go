@@ -47,12 +47,16 @@ func NewLegacyExclusiveReclaimConstraintScope(regionName string) ReclaimConstrai
 }
 
 // ApplyReclaimConstraint clamps size and a non-negative quota limit to the
-// reserved floor or the scope's dynamic ceiling. A nil ceilings map is valid
-// and behaves as if no dynamic ceiling were configured.
+// reserved floor or the scope's dynamic ceiling. Only scopes listed in
+// activeScopes are constrained; every other scope passes through untouched so
+// a ramp-up on one NUMA cannot compress the reclaim pool of an unrelated
+// (dedicated) NUMA. A nil ceilings or activeScopes map is valid and behaves
+// as if no dynamic ceiling / no active scope were configured.
 func ApplyReclaimConstraint(scope ReclaimConstraintScope, size int, limit float64, reservedForReclaim int,
 	constraint ReclaimConstraint, ceilings map[ReclaimConstraintScope]int,
+	activeScopes map[ReclaimConstraintScope]bool,
 ) (int, float64, int) {
-	if constraint != ReclaimConstraintReservedFloor || size <= reservedForReclaim {
+	if constraint != ReclaimConstraintReservedFloor || !activeScopes[scope] || size <= reservedForReclaim {
 		return size, limit, 0
 	}
 
