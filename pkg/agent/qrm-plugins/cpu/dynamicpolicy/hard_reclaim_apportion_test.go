@@ -25,6 +25,78 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
+// TestApportionReclaimedPoolIsDeterministic pins map-iteration order: the
+// allocation loop in apportionReclaimedPool takes CPUs out of the shared
+// reclaimed set pool-by-pool, so the order pools are visited decides which pool
+// owns which physical CPUs. Go ranges a map in random order, so without sorting
+// the eligible pool names first, two runs over identical inputs can assign
+// different CPUs to the same pool. This test runs the apportionment many times
+// over fresh copies of the input and requires every run to yield the exact same
+// per-pool result. It is RED against the unsorted map iteration and GREEN once
+// the eligible pool names are sorted before the allocation loop.
+func TestApportionReclaimedPoolIsDeterministic(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(16, 2, 2)
+	require.NoError(t, err)
+	require.Equal(t, 2, topology.CPUsPerCore())
+
+	// Two non-resident, non-binding pools. alpha owns two whole cores, beta one;
+	// their different base sizes make the proportional take amounts differ, so
+	// iteration order visibly changes which pool receives which CPUs.
+	const poolAlpha = "share-alpha"
+	const poolBeta = "share-beta"
+
+	alphaBase := machine.NewCPUSet(0, 8, 1, 9) // two NUMA0 cores
+	betaBase := machine.NewCPUSet(4, 12)        // one NUMA1 core
+	nonBinding := map[string]int{
+		poolAlpha: alphaBase.Size(),
+		poolBeta:  betaBase.Size(),
+	}
+
+	// reclaimed holds every other whole core on both NUMAs (12 cpus, core-aligned).
+	reclaimed := machine.NewCPUSet(
+		2, 10, 3, 11, // NUMA0 cores 2,3
+		5, 13, 6, 14, 7, 15, // NUMA1 cores 5,6,7
+	)
+
+	const runs = 40
+	type runResult struct {
+		alpha string
+		beta  string
+	}
+	var first runResult
+	results := make(map[runResult]int)
+
+	for i := 0; i < runs; i++ {
+		poolsCPUSet := map[string]machine.CPUSet{
+			poolAlpha: alphaBase.Clone(),
+			poolBeta:  betaBase.Clone(),
+		}
+		p := &DynamicPolicy{
+			machineInfo: &machine.KatalystMachineInfo{
+				CPUTopology: topology,
+			},
+			reservedReclaimedCPUsSize: 2,
+		}
+		_ = p.apportionReclaimedPool(poolsCPUSet, reclaimed.Clone(), nonBinding)
+		r := runResult{
+			alpha: poolsCPUSet[poolAlpha].String(),
+			beta:  poolsCPUSet[poolBeta].String(),
+		}
+		results[r]++
+		if i == 0 {
+			first = r
+		}
+		require.Equal(t, first, r,
+			"run %d: apportion result diverged (alpha=%s beta=%s) from first run (alpha=%s beta=%s); map iteration order is non-deterministic",
+			i, r.alpha, r.beta, first.alpha, first.beta)
+	}
+
+	require.Len(t, results, 1,
+		"expected a single deterministic apportionment across %d runs, got %d distinct outcomes", runs, len(results))
+}
+
 // TestApportionReclaimedPoolKeepsReclaimResidualCoreAligned pins the physical
 // core isolation invariant on the reclaim-disabled apportion path. When
 // reclaim is disabled we lend reclaimed cpus to the non-binding share pool, and

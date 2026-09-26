@@ -2512,11 +2512,16 @@ func (p *DynamicPolicy) reclaimOverlapNUMABinding(poolsCPUSet map[string]machine
 		return nil
 	}
 
-	if entries.CheckPoolEmpty(commonstate.PoolNameReclaim) {
+	reclaimPool, ok := entries[commonstate.PoolNameReclaim]
+	if !ok {
+		return fmt.Errorf("reclaim pool misses in current entries")
+	}
+	fakeEntry, ok := reclaimPool[commonstate.FakedContainerName]
+	if !ok || fakeEntry.AllocationResult.IsEmpty() {
 		return fmt.Errorf("reclaim pool misses in current entries")
 	}
 
-	curReclaimCPUSet := entries[commonstate.PoolNameReclaim][commonstate.FakedContainerName].AllocationResult.Clone()
+	curReclaimCPUSet := fakeEntry.AllocationResult.Clone()
 	nonOverlapReclaimCPUSet := poolsCPUSet[commonstate.PoolNameReclaim].Clone()
 	general.Infof("curReclaimCPUSet: %s", curReclaimCPUSet.String())
 
@@ -3780,13 +3785,24 @@ func (p *DynamicPolicy) apportionReclaimedPool(poolsCPUSet map[string]machine.CP
 		return reclaimedCPUs
 	}
 
-	for poolName, poolCPUs := range poolsCPUSet {
+	// Iterate the eligible pools in a stable, sorted order. The loop below
+	// consumes CPUs out of the shared reclaimedCPUs set pool-by-pool, so the
+	// visit order decides which pool owns which physical CPUs. Ranging the map
+	// directly would make the assignment non-deterministic across runs.
+	eligiblePoolNames := make([]string, 0, len(poolsCPUSet))
+	for poolName := range poolsCPUSet {
 		if state.ResidentPools.Has(poolName) {
 			continue
 		} else if _, found := nonBindingPoolsQuantityMap[poolName]; !found {
 			// numa-binding && none-reclaimed pools already handled in generateNUMABindingPoolsCPUSetInPlace
 			continue
 		}
+		eligiblePoolNames = append(eligiblePoolNames, poolName)
+	}
+	sort.Strings(eligiblePoolNames)
+
+	for _, poolName := range eligiblePoolNames {
+		poolCPUs := poolsCPUSet[poolName]
 
 		proportionalSize := general.Max(getProportionalSize(poolCPUs.Size(), totalSize, availableSize, false /*ceil*/), 1)
 
@@ -3991,13 +4007,18 @@ func (p *DynamicPolicy) getReclaimOverlapShareRatio(entries state.PodEntries) (m
 		return nil, nil
 	}
 
-	if entries.CheckPoolEmpty(commonstate.PoolNameReclaim) {
+	reclaimPool, ok := entries[commonstate.PoolNameReclaim]
+	if !ok {
+		return nil, fmt.Errorf("reclaim pool misses in current entries")
+	}
+	fakeEntry, ok := reclaimPool[commonstate.FakedContainerName]
+	if !ok || fakeEntry.AllocationResult.IsEmpty() {
 		return nil, fmt.Errorf("reclaim pool misses in current entries")
 	}
 
 	reclaimOverlapShareRatio := make(map[string]float64)
 
-	curReclaimCPUSet := entries[commonstate.PoolNameReclaim][commonstate.FakedContainerName].AllocationResult
+	curReclaimCPUSet := fakeEntry.AllocationResult
 
 	// Iterate through all pools to calculate overlap ratios
 	for poolName, subEntries := range entries {

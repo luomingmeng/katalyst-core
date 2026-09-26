@@ -4646,6 +4646,56 @@ func TestReclaimOverlapNUMABindingValidatesReclaimWithDedicatedOverlapDisabled(t
 	}
 }
 
+// TestReclaimOverlapHandlersRejectPartialReclaimMapWithoutPanic pins the chained
+// map access on the reclaim pool. entries[PoolNameReclaim][FakedContainerName]
+// is dereferenced to read .AllocationResult; if the reclaim pool key exists but
+// the faked container sub-entry is absent, a plain chained deref would panic.
+// Both handlers must return a clean error instead of panicking.
+func TestReclaimOverlapHandlersRejectPartialReclaimMapWithoutPanic(t *testing.T) {
+	t.Parallel()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+	require.NoError(t, err)
+
+	// reclaim pool key exists, but its container map holds only a stray real
+	// container -- the faked pool entry sub-key is missing entirely.
+	partialEntries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			"stray-container": &state.AllocationInfo{
+				AllocationResult: machine.NewCPUSet(0),
+			},
+		},
+	}
+
+	t.Run("reclaimOverlapNUMABinding", func(t *testing.T) {
+		t.Parallel()
+		p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+		require.NoError(t, err)
+		p.enableCPUAdvisor = true
+		p.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+
+		poolsCPUSet := map[string]machine.CPUSet{
+			commonstate.PoolNameReclaim: machine.NewCPUSet(1),
+		}
+		// Must not panic; must return the reclaim-missing error.
+		require.ErrorContains(t,
+			p.reclaimOverlapNUMABinding(poolsCPUSet, partialEntries),
+			"reclaim pool misses in current entries")
+	})
+
+	t.Run("getReclaimOverlapShareRatio", func(t *testing.T) {
+		t.Parallel()
+		p, err := getTestDynamicPolicyWithInitialization(cpuTopology, t.TempDir())
+		require.NoError(t, err)
+		p.state.SetAllowSharedCoresOverlapReclaimedCores(true, true)
+
+		// Must not panic; must return the reclaim-missing error.
+		got, err := p.getReclaimOverlapShareRatio(partialEntries)
+		require.Error(t, err)
+		require.Nil(t, got)
+	})
+}
+
 func TestDedicatedNUMAExclusiveNonReclaimableStartsSteady(t *testing.T) {
 	t.Parallel()
 

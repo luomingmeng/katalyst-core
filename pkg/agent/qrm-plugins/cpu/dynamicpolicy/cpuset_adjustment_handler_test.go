@@ -3315,6 +3315,50 @@ func TestStopCancelsCPUSetAdjustmentRetryWorker(t *testing.T) {
 	}
 }
 
+func TestScheduleCPUSetAdjustmentRetryNoGoroutineLeak(t *testing.T) {
+	t.Parallel()
+
+	stopCh := make(chan struct{})
+	attempted := make(chan struct{}, 1)
+	p := &DynamicPolicy{
+		stopCh:                      stopCh,
+		cpuSetAdjustmentRetryStopCh: stopCh,
+		cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+			"noop": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+				select {
+				case attempted <- struct{}{}:
+				default:
+				}
+				return nil
+			},
+		},
+	}
+
+	p.scheduleCPUSetAdjustmentRetry(cpusetutil.RetryReasonDeferredLeaf)
+
+	select {
+	case <-attempted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("retry attempt never ran")
+	}
+
+	// The retry worker (func1) must wind down on its own after a successful
+	// attempt; the per-attempt stopCh watcher (func2) must exit on ctx.Done().
+	p.cpuSetAdjustmentRetryWG.Wait()
+
+	close(stopCh)
+	time.Sleep(200 * time.Millisecond)
+
+	for _, marker := range []string{
+		"dynamicpolicy.(*DynamicPolicy).scheduleCPUSetAdjustmentRetry.func1",
+		"dynamicpolicy.(*DynamicPolicy).scheduleCPUSetAdjustmentRetry.func2",
+	} {
+		require.Eventually(t, func() bool {
+			return goroutineFramesContaining(t, marker) == 0
+		}, 2*time.Second, 30*time.Millisecond, "leaked retry goroutine frame: %s", marker)
+	}
+}
+
 func TestRunCPUSetAdjustmentHandlersDoesNotHoldPolicyLockDuringExecution(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
