@@ -627,32 +627,34 @@ func TestTracePreflightSnapshotIdentityDriftAfterPhysicalWriteFailsClosed(t *tes
 	require.Contains(t, err.Error(), "physical_writes_after=1")
 }
 
-func TestFinalSnapshotDriftBecomesReplanSafeOnlyAfterVerifiedRollback(t *testing.T) {
+func TestVerifiedRollbackAuthorizesReplan(t *testing.T) {
 	t.Parallel()
 
+	live := newFakeHierarchyDriver()
+	live.allowUnwitnessedExpansion = true
+	live.add("a", CgroupIdentity{Device: 1, Inode: 1}, "0", "0")
+	stack := &traceMutationStack{}
+	applyCPUWriteForRollbackTest(t, live, stack, "a", "0", "0-1")
 	drift := &frozenFinalSnapshotDriftError{
 		stale: &PlanStaleError{
 			Rel: "controlled", Direction: WritePublish, Resource: "final_snapshot",
 			Err: fmt.Errorf("test final snapshot drift"),
 		},
 	}
-	var safe interface{ FrozenSnapshotDriftReplanSafe() bool }
-	require.False(t, errors.As(drift, &safe),
-		"a final drift is not retryable before the physical rollback is verified")
-
-	writer := safeCPSetWriter{}
+	writer := newSafeCPUSetWriter(live, NewBudgetTracker(ConvergenceBudget{}), nil)
 	res := &ConvergenceResult{Applied: 3, Journal: []AppliedPlanOperation{{PlanID: "seed"}}}
+	res.recordForwardWriteAttempt()
 	err := writer.failFrozenTrace(
-		context.Background(), drift, &traceMutationStack{}, nil, res, 1, 3)
+		context.Background(), drift, stack, rollbackOnlyTicket(1, 0), res, 1, 3)
 
-	require.ErrorAs(t, err, &safe)
-	require.True(t, safe.FrozenSnapshotDriftReplanSafe())
 	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	require.Equal(t, ReplanSafeAfterVerifiedRollback, res.ReplanDisposition)
+	require.Equal(t, machine.MustParse("0"), live.nodes["a"].cpus)
 	require.Equal(t, 3, res.Applied)
 	require.Len(t, res.Journal, 1)
 }
 
-func TestFinalSnapshotDriftWithUnverifiedRollbackIsNotReplanSafe(t *testing.T) {
+func TestRollbackFailurePreservesStaleCauseButDisallowsReplan(t *testing.T) {
 	t.Parallel()
 
 	trace, live := compiledTraceWithCPUAndMemoryWrites(t)
@@ -678,11 +680,98 @@ func TestFinalSnapshotDriftWithUnverifiedRollbackIsNotReplanSafe(t *testing.T) {
 
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "rollback failed")
-	var safe interface{ FrozenSnapshotDriftReplanSafe() bool }
-	require.False(t, errors.As(err, &safe),
-		"unverified rollback must never authorize an admission replan")
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	var stale *PlanStaleError
+	require.ErrorAs(t, err, &stale)
+	require.Same(t, drift.stale, stale)
+	require.Equal(t, ReplanNotAllowed, res.ReplanDisposition)
 	require.NotEmpty(t, res.Journal,
 		"unverified rollback must retain physical-impact evidence")
+}
+
+func TestRollbackVerificationFailureDisallowsReplan(t *testing.T) {
+	t.Parallel()
+
+	live := newFakeHierarchyDriver()
+	live.allowUnwitnessedExpansion = true
+	identity := CgroupIdentity{Device: 1, Inode: 1}
+	live.add("a", identity, "0", "0")
+	stack := &traceMutationStack{}
+	applyCPUWriteForRollbackTest(t, live, stack, "a", "0", "0-1")
+	verificationErr := errors.New("injected rollback verification failure")
+	driver := &failNthEntryReadDriver{
+		HierarchyDriver: live,
+		rel:             "a",
+		failAt:          2,
+		err:             verificationErr,
+	}
+	res := &ConvergenceResult{}
+	res.recordForwardWriteAttempt()
+	writer := newSafeCPUSetWriter(driver, NewBudgetTracker(ConvergenceBudget{}), res)
+	drift := &frozenFinalSnapshotDriftError{stale: &PlanStaleError{
+		Rel: "controlled", Direction: WritePublish, Resource: "final_snapshot",
+		Err: fmt.Errorf("test final snapshot drift"),
+	}}
+
+	err := writer.failFrozenTrace(
+		context.Background(), drift, stack, rollbackOnlyTicket(1, 0), res, 0, 0)
+
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	require.ErrorIs(t, err, verificationErr)
+	require.Equal(t, ReplanNotAllowed, res.ReplanDisposition)
+}
+
+func TestPartialRollbackDisallowsReplan(t *testing.T) {
+	t.Parallel()
+
+	live := newFakeHierarchyDriver()
+	live.allowUnwitnessedExpansion = true
+	live.add("a", CgroupIdentity{Device: 1, Inode: 1}, "0", "0")
+	live.add("b", CgroupIdentity{Device: 1, Inode: 2}, "1", "0")
+	stack := &traceMutationStack{}
+	applyCPUWriteForRollbackTest(t, live, stack, "a", "0", "0-1")
+	applyCPUWriteForRollbackTest(t, live, stack, "b", "1", "1-2")
+	driver := &injectedTraceDriver{
+		HierarchyDriver: live,
+		injection:       traceFailureInjection{failRollbackWriteAt: 1},
+		injected:        true,
+	}
+	res := &ConvergenceResult{}
+	res.recordForwardWriteAttempt()
+	res.recordForwardWriteAttempt()
+	writer := newSafeCPUSetWriter(driver, NewBudgetTracker(ConvergenceBudget{}), res)
+	drift := &frozenFinalSnapshotDriftError{stale: &PlanStaleError{
+		Rel: "controlled", Direction: WritePublish, Resource: "final_snapshot",
+		Err: fmt.Errorf("test final snapshot drift"),
+	}}
+
+	err := writer.failFrozenTrace(
+		context.Background(), drift, stack, rollbackOnlyTicket(2, 0), res, 0, 0)
+
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	require.ErrorContains(t, err, "rollback failed")
+	require.Equal(t, ReplanNotAllowed, res.ReplanDisposition)
+	require.NotEmpty(t, res.Journal)
+}
+
+func TestUnknownFailureAfterVerifiedRollbackDisallowsReplan(t *testing.T) {
+	t.Parallel()
+
+	live := newFakeHierarchyDriver()
+	live.allowUnwitnessedExpansion = true
+	live.add("a", CgroupIdentity{Device: 1, Inode: 1}, "0", "0")
+	stack := &traceMutationStack{}
+	applyCPUWriteForRollbackTest(t, live, stack, "a", "0", "0-1")
+	res := &ConvergenceResult{}
+	res.recordForwardWriteAttempt()
+	writer := newSafeCPUSetWriter(live, NewBudgetTracker(ConvergenceBudget{}), res)
+
+	err := writer.failFrozenTrace(
+		context.Background(), errors.New("unknown execution failure"), stack,
+		rollbackOnlyTicket(1, 0), res, 0, 0)
+
+	require.ErrorContains(t, err, "unknown execution failure")
+	require.Equal(t, ReplanNotAllowed, res.ReplanDisposition)
 }
 
 func TestFinalBoundaryOperationalFailuresAreNotMarkedAsFrozenFinalDrift(t *testing.T) {
@@ -763,7 +852,28 @@ func TestTracePreflightRejectsIdentityDriftWithoutWrites(t *testing.T) {
 
 func TestTracePreflightValidatesLaterOperationsAgainstOverlay(t *testing.T) {
 	trace, driver := compiledTraceWithCPUAndMemoryWrites(t)
-	require.True(t, traceRequiresEarlierParentOverlay(trace))
+	operations := flattenTraceOperations(trace)
+	var parentOperation, childOperation *PlanOperation
+	seen := make(map[string]*PlanOperation)
+	for i := range operations {
+		operation := &operations[i]
+		if parent := seen[operation.ParentRel]; parent != nil {
+			initialParent := trace.InitialSnapshot.Entries[operation.ParentRel]
+			if !operation.Target.CPUs.IsSubsetOf(initialParent.CPUs) {
+				parentOperation = parent
+				childOperation = operation
+				break
+			}
+		}
+		seen[operation.Rel] = operation
+	}
+	require.NotNil(t, parentOperation, "fixture must contain an earlier parent grow")
+	require.NotNil(t, childOperation, "fixture must contain a child invalid against the raw snapshot")
+	initialParent := trace.InitialSnapshot.Entries[childOperation.ParentRel]
+	require.False(t, childOperation.Target.CPUs.IsSubsetOf(initialParent.CPUs),
+		"counterexample requires raw-snapshot validation to reject the child")
+	require.True(t, childOperation.Target.CPUs.IsSubsetOf(parentOperation.Target.CPUs),
+		"counterexample requires the earlier parent target to authorize the child")
 	initialState := driver.snapshot()
 
 	err := newTracePreflightWriter(driver).preflightFrozenTrace(context.Background(), trace)
@@ -832,7 +942,7 @@ func TestTracePreflightRejectsInvalidV2InheritanceWithoutWrites(t *testing.T) {
 	require.Equal(t, initialState, driver.snapshot())
 }
 
-func TestFrozenTraceDriftAfterPreflightBeforeFirstWritePerformsNoUnauthorizedWrite(t *testing.T) {
+func TestPreWriteStaleAuthorizesReplanWithoutRollback(t *testing.T) {
 	trace, live := compiledTraceWithCPUAndMemoryWrites(t)
 	live.invariants = nil
 	initial := live.snapshot()
@@ -856,6 +966,7 @@ func TestFrozenTraceDriftAfterPreflightBeforeFirstWritePerformsNoUnauthorizedWri
 		"executor must not change any relation after rejecting external drift")
 	require.Empty(t, res.Journal)
 	require.Zero(t, res.Applied)
+	require.Equal(t, ReplanSafeNoPhysicalWrites, res.ReplanDisposition)
 }
 
 func TestFrozenTraceDriftBetweenOperationsRollsBackAppliedPrefix(t *testing.T) {
@@ -1575,9 +1686,19 @@ func TestFrozenTraceRollbackAfterForwardDeadlineRestoresInitialState(t *testing.
 	round := frozenExecutionRound(t, trace, driver)
 	round.budget = NewBudgetTracker(ConvergenceBudget{Deadline: deadline})
 	ticket := reserveTraceWithBudget(t, round.budget, trace)
+	adjustmentBudget := NewAdjustmentBudget(ctx, ConvergenceBudget{
+		MaxPlanOperations: trace.Cost.Total(),
+		Deadline:          deadline,
+	})
+	adjustmentReservation, reserveErr := adjustmentBudget.ReserveExecution(trace.Cost)
+	require.NoError(t, reserveErr)
+	round.adjustmentBudget = adjustmentBudget
 	res := &ConvergenceResult{}
 
-	_, err := round.executeFrozenTrace(ctx, trace, ticket, res)
+	validated, validateErr := validatedPhaseTraceForTest(ctx, trace)
+	require.NoError(t, validateErr)
+	_, err := round.executeValidatedFrozenTrace(
+		ctx, validated, ticket, res, adjustmentReservation)
 
 	require.ErrorIs(t, err, context.DeadlineExceeded,
 		"the original forward deadline must remain the primary unwrap chain")
@@ -1586,6 +1707,8 @@ func TestFrozenTraceRollbackAfterForwardDeadlineRestoresInitialState(t *testing.
 	require.Empty(t, res.Journal)
 	require.Zero(t, res.Applied)
 	require.Positive(t, ticket.consumedRollback.Total())
+	require.Equal(t, 2, adjustmentBudget.CumulativeWrites(),
+		"the real adjustment budget must account the forward and rollback attempts")
 	require.NotContains(t, err.Error(), "rollback failed")
 }
 
@@ -1605,9 +1728,18 @@ func TestFrozenTraceRecoveryDeadlineRetainsPhysicalImpactEvidence(t *testing.T) 
 	}
 	round := frozenExecutionRound(t, trace, driver)
 	ticket := reserveTraceWithBudget(t, round.budget, trace)
+	adjustmentBudget := NewAdjustmentBudget(ctx, ConvergenceBudget{
+		MaxPlanOperations: trace.Cost.Total(),
+	})
+	adjustmentReservation, reserveErr := adjustmentBudget.ReserveExecution(trace.Cost)
+	require.NoError(t, reserveErr)
+	round.adjustmentBudget = adjustmentBudget
 	res := &ConvergenceResult{}
 
-	_, err := round.executeFrozenTrace(ctx, trace, ticket, res)
+	validated, validateErr := validatedPhaseTraceForTest(ctx, trace)
+	require.NoError(t, validateErr)
+	_, err := round.executeValidatedFrozenTrace(
+		ctx, validated, ticket, res, adjustmentReservation)
 
 	require.ErrorIs(t, err, context.Canceled,
 		"the forward cancellation must remain the primary unwrap chain")
@@ -2064,9 +2196,6 @@ func TestRollbackENOENTRequiresExactFrozenWrittenIdentity(t *testing.T) {
 
 			require.Error(t, err)
 			require.ErrorContains(t, err, "rollback failed")
-			var safe interface{ FrozenSnapshotDriftReplanSafe() bool }
-			require.False(t, errors.As(err, &safe),
-				"rejected or unverified retirement must not authorize final-drift replan")
 			require.Zero(t, live.PhysicalWriteCount(),
 				"rejected disappearance must never write a live or replacement cgroup")
 		})
@@ -2160,9 +2289,6 @@ func TestFinalSnapshotDriftReplanAllowsConfirmedAuthorizedRollbackRetirementOnly
 	err := writer.failFrozenTrace(
 		context.Background(), drift, stack, rollbackOnlyTicket(1, 0), res, 0, 0)
 
-	var safe interface{ FrozenSnapshotDriftReplanSafe() bool }
-	require.ErrorAs(t, err, &safe)
-	require.True(t, safe.FrozenSnapshotDriftReplanSafe())
 	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
 	require.Zero(t, res.Applied)
 	require.Empty(t, res.Journal)
@@ -3036,6 +3162,27 @@ type readErrorHierarchyDriver struct {
 	HierarchyDriver
 	err error
 	rel string
+}
+
+type failNthEntryReadDriver struct {
+	HierarchyDriver
+	rel    string
+	failAt int
+	reads  int
+	err    error
+}
+
+func (d *failNthEntryReadDriver) ReadEntry(
+	ctx context.Context,
+	rel string,
+) (EntryState, error) {
+	if rel == d.rel {
+		d.reads++
+		if d.reads == d.failAt {
+			return EntryState{}, d.err
+		}
+	}
+	return d.HierarchyDriver.ReadEntry(ctx, rel)
 }
 
 func (d *readErrorHierarchyDriver) ReadEntry(

@@ -36,6 +36,11 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
+func registerRelativeCgroupPathHandlerForTest(t *testing.T, handler cgcommon.RelativeCgroupPathHandler) {
+	t.Helper()
+	t.Cleanup(cgcommon.RegisterRelativeCgroupPathHandlerWithUnregister(handler))
+}
+
 type contextAwareContainerIDFetcher struct {
 	metapod.PodFetcherStub
 	observed context.Context
@@ -124,7 +129,7 @@ func TestResolveContainerRelPathAndIDWithContextReturnsResolvedIdentity(t *testi
 		containerID   = "resolved-identity"
 		wantRel       = "kubepods/podpod-resolved-identity/resolved-identity"
 	)
-	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+	registerRelativeCgroupPathHandlerForTest(t, cgcommon.RelativeCgroupPathHandler{
 		Name: "return-resolved-identity",
 		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 			if gotPodUID == podUID && gotContainerID == containerID {
@@ -152,7 +157,7 @@ func TestResolveContainerRelPathAndIDCacheOnlyWithContextReturnsUsedIdentityOnPa
 		containerName = "main"
 		containerID   = "cached-identity"
 	)
-	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+	registerRelativeCgroupPathHandlerForTest(t, cgcommon.RelativeCgroupPathHandler{
 		Name: "cache-only-path-error",
 		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 			if gotPodUID == podUID && gotContainerID == containerID {
@@ -195,7 +200,7 @@ func TestResolveContainerRelPathWithContextDetectsContainerIdentityChange(t *tes
 		newContainer  = "container-new"
 		containerName = "main"
 	)
-	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+	registerRelativeCgroupPathHandlerForTest(t, cgcommon.RelativeCgroupPathHandler{
 		Name: "container-identity-change",
 		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 			if gotPodUID == podUID && gotContainerID == oldContainer {
@@ -248,7 +253,7 @@ func TestResolveContainerRelPathWithContextFailsClosedForStableMissingCgroup(t *
 		containerID   = "container-stable"
 		containerName = "main"
 	)
-	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+	registerRelativeCgroupPathHandlerForTest(t, cgcommon.RelativeCgroupPathHandler{
 		Name: "stable-missing-cgroup",
 		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 			if gotPodUID == podUID && gotContainerID == containerID {
@@ -295,7 +300,7 @@ func TestResolveContainerRelPathWithContextTreatsKubeletRunningRuntimeExitedAsNo
 		containerID   = "container-runtime-exited"
 		containerName = "main"
 	)
-	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+	registerRelativeCgroupPathHandlerForTest(t, cgcommon.RelativeCgroupPathHandler{
 		Name: "runtime-exited-container",
 		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 			if gotPodUID == podUID && gotContainerID == containerID {
@@ -332,7 +337,7 @@ func TestResolveContainerRelPathWithContextTreatsTerminatedContainerAsNotRunning
 		containerID   = "container-terminated"
 		containerName = "main"
 	)
-	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+	registerRelativeCgroupPathHandlerForTest(t, cgcommon.RelativeCgroupPathHandler{
 		Name: "terminated-container",
 		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 			if gotPodUID == podUID && gotContainerID == containerID {
@@ -369,7 +374,7 @@ func TestResolveContainerRelPathWithContextDetectsContainerDisappearance(t *test
 		containerID   = "container-disappeared"
 		containerName = "main"
 	)
-	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+	registerRelativeCgroupPathHandlerForTest(t, cgcommon.RelativeCgroupPathHandler{
 		Name: "container-disappeared",
 		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 			if gotPodUID == podUID && gotContainerID == containerID {
@@ -401,7 +406,7 @@ func TestResolveContainerRelPathWithContextFailsClosedWhenIdentityConfirmationFa
 		containerID   = "container-confirmation-failed"
 		containerName = "main"
 	)
-	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+	registerRelativeCgroupPathHandlerForTest(t, cgcommon.RelativeCgroupPathHandler{
 		Name: "identity-confirmation-failed",
 		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 			if gotPodUID == podUID && gotContainerID == containerID {

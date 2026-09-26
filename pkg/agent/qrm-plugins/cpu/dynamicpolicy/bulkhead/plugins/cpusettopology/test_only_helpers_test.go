@@ -22,8 +22,16 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
+	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent"
+	metapod "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
+
+func emptyLifecycleMetaServer() *metaserver.MetaServer {
+	return &metaserver.MetaServer{
+		MetaAgent: &agent.MetaAgent{PodFetcher: &metapod.PodFetcherStub{}},
+	}
+}
 
 // appliedViewFromFinalSnapshot is a test-only thin wrapper over
 // appliedViewFromFinalSnapshotWithContext using a background context.
@@ -34,47 +42,13 @@ func appliedViewFromFinalSnapshot(
 	snapshot *topology.CompleteSnapshot,
 	expectedCPUSetByRel ...map[string]machine.CPUSet,
 ) (*model.AppliedView, error) {
-	return appliedViewFromFinalSnapshotWithContext(
-		context.Background(), metaServer, desired, dag, snapshot, expectedCPUSetByRel...)
-}
-
-// containerCPUSetByPodFromFinalSnapshotWithContext is a test-only thin wrapper over
-// containerCPUSetByPodFromFinalSnapshotWithDeferredCleanup.
-func containerCPUSetByPodFromFinalSnapshotWithContext(
-	ctx context.Context,
-	metaServer *metaserver.MetaServer,
-	desired *model.DesiredView,
-	snapshot *topology.CompleteSnapshot,
-	expectedCPUSetByRel map[string]machine.CPUSet,
-	deferredCPUSetMaps ...map[string]machine.CPUSet,
-) (map[string]map[string]machine.CPUSet, error) {
-	var deferredCPUSetByRel map[string]machine.CPUSet
-	if len(deferredCPUSetMaps) > 0 {
-		deferredCPUSetByRel = deferredCPUSetMaps[0]
+	proofs, err := freezeContainerLifecycleProofs(nil, nil)
+	if err != nil {
+		return nil, err
 	}
-	return containerCPUSetByPodFromFinalSnapshotWithDeferredCleanup(
-		ctx, metaServer, desired, snapshot, expectedCPUSetByRel, deferredCPUSetByRel, nil,
-		containerLeafFinalization{})
-}
-
-// containerCPUSetByPodFromFinalSnapshotParentSafe is a test-only wrapper that
-// exercises the ParentSafe publish path with the safe-superset finalization
-// contract enabled.
-func containerCPUSetByPodFromFinalSnapshotParentSafe(
-	ctx context.Context,
-	metaServer *metaserver.MetaServer,
-	desired *model.DesiredView,
-	snapshot *topology.CompleteSnapshot,
-	expectedCPUSetByRel map[string]machine.CPUSet,
-	deferredCPUSetByRel map[string]machine.CPUSet,
-	finalPrimaryDomain machine.CPUSet,
-	finalReclaimDomain machine.CPUSet,
-) (map[string]map[string]machine.CPUSet, error) {
-	return containerCPUSetByPodFromFinalSnapshotWithDeferredCleanup(
-		ctx, metaServer, desired, snapshot, expectedCPUSetByRel, deferredCPUSetByRel, map[string]struct{}{},
-		containerLeafFinalization{
-			parentSafe:         true,
-			finalPrimaryDomain: finalPrimaryDomain,
-			finalReclaimDomain: finalReclaimDomain,
-		})
+	if metaServer == nil {
+		metaServer = emptyLifecycleMetaServer()
+	}
+	return appliedViewFromFinalSnapshotWithContext(
+		context.Background(), metaServer, desired, dag, snapshot, proofs, nil)
 }

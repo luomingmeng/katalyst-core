@@ -51,6 +51,8 @@ const (
 type safeCPSetWriter struct {
 	driver                HierarchyDriver
 	budget                *BudgetTracker
+	adjustmentBudget      *AdjustmentBudget
+	adjustmentReservation *AdjustmentWriteReservation
 	res                   *ConvergenceResult
 	physicalWriteAttempts *int
 	dormantProofs         map[string]DormantLeafProof
@@ -71,6 +73,11 @@ func newSafeCPUSetWriter(driver HierarchyDriver, budget *BudgetTracker, res *Con
 		res:                   res,
 		physicalWriteAttempts: &physicalWriteAttempts,
 	}
+}
+
+func (w safeCPSetWriter) withAdjustmentBudget(budget *AdjustmentBudget) safeCPSetWriter {
+	w.adjustmentBudget = budget
+	return w
 }
 
 func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {
@@ -132,6 +139,27 @@ func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 		precedingOperations[operation.Rel] = operation
 	}
 
+	reservation, err := w.adjustmentBudget.ReserveExecution(planExecutionReservationCost(plan))
+	if err != nil {
+		return err
+	}
+	w.adjustmentReservation = reservation
+	forwardStart, rollbackStart := 0, 0
+	if w.res != nil {
+		forwardStart = w.res.forwardWriteAttempts
+		rollbackStart = w.res.rollbackWriteAttempts
+	}
+	defer func() {
+		if w.res == nil {
+			_ = reservation.settleTotals(0, 0)
+			return
+		}
+		_ = reservation.settleTotals(
+			w.res.forwardWriteAttempts-forwardStart,
+			w.res.rollbackWriteAttempts-rollbackStart,
+		)
+	}()
+
 	if len(plan.Operations) > 0 {
 		if err := w.revalidateDormantProofs(ctx, ""); err != nil {
 			return err
@@ -151,6 +179,9 @@ func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 		wroteMems := false
 		wroteCPUs := false
 		if operation.WriteMems && operation.ExpectedCurrent.Mems != operation.Target.Mems {
+			if err := w.recordForwardPhysicalWriteAttempt(ctx, PhysicalWriteCost{MemsWrites: 1}); err != nil {
+				return err
+			}
 			if err := w.driver.WriteMems(ctx, operation.Rel, operation.ExpectedIdentity, operation.Target.Mems); err != nil {
 				if w.res != nil {
 					w.res.Failed++
@@ -162,6 +193,12 @@ func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 			wroteMems = true
 		}
 		if !operation.ExpectedCurrent.CPUs.Equals(operation.Target.CPUs) {
+			if err := w.recordForwardPhysicalWriteAttempt(ctx, PhysicalWriteCost{CPUSetWrites: 1}); err != nil {
+				if rollbackErr := w.rollbackOperationWithRecovery(operation, wroteCPUs, wroteMems); rollbackErr != nil {
+					return executionWithRollbackError(err, rollbackErr)
+				}
+				return err
+			}
 			if err := w.driver.WriteCPUs(ctx, operation.Rel, operation.ExpectedIdentity, operation.Target.CPUs); err != nil {
 				if w.res != nil {
 					w.res.Failed++
@@ -184,7 +221,7 @@ func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 						Current: current, Target: operation.Target.CPUs.String(), Err: err,
 					}
 				}
-				if rollbackErr := w.rollbackOperation(ctx, operation, wroteCPUs, wroteMems); rollbackErr != nil {
+				if rollbackErr := w.rollbackOperationWithRecovery(operation, wroteCPUs, wroteMems); rollbackErr != nil {
 					return executionWithRollbackError(writeErr, rollbackErr)
 				}
 				return writeErr
@@ -199,7 +236,7 @@ func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 			if w.res != nil {
 				w.res.Failed++
 			}
-			if rollbackErr := w.rollbackOperation(ctx, operation, wroteCPUs, wroteMems); rollbackErr != nil {
+			if rollbackErr := w.rollbackOperationWithRecovery(operation, wroteCPUs, wroteMems); rollbackErr != nil {
 				return executionWithRollbackError(err, rollbackErr)
 			}
 			return err
@@ -211,8 +248,40 @@ func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 	return nil
 }
 
+func planExecutionReservationCost(plan PhasePlan) ExecutionReservationCost {
+	var cost ExecutionReservationCost
+	for _, operation := range plan.Operations {
+		forward := physicalWriteCost(
+			operation.ExpectedCurrent, operation.Target, operation.WriteMems)
+		rollback := physicalWriteCost(
+			operation.Target, operation.ExpectedCurrent, operation.WriteMems)
+		cost.Forward = addPhysicalWriteCost(cost.Forward, forward)
+		cost.Rollback = addPhysicalWriteCost(cost.Rollback, rollback)
+	}
+	return cost
+}
+
 func executionWithRollbackError(executionErr, rollbackErr error) error {
-	return fmt.Errorf("%v: %w", rollbackErr, executionErr)
+	return newExecutionRollbackError(executionErr, rollbackErr)
+}
+
+func (w safeCPSetWriter) rollbackOperationWithRecovery(
+	operation PlanOperation,
+	wroteCPUs, wroteMems bool,
+) error {
+	rollbackWrites := 0
+	if wroteCPUs {
+		rollbackWrites++
+	}
+	if wroteMems {
+		rollbackWrites++
+	}
+	recoveryCtx, cancelRecovery, err := newAdjustmentRecoveryContext(rollbackWrites)
+	if err != nil {
+		return err
+	}
+	defer cancelRecovery()
+	return w.rollbackOperation(recoveryCtx, operation, wroteCPUs, wroteMems)
 }
 
 func (w safeCPSetWriter) rollbackOperation(
@@ -222,7 +291,9 @@ func (w safeCPSetWriter) rollbackOperation(
 ) error {
 	var rollbackErr error
 	if wroteCPUs {
-		if err := w.driver.WriteCPUs(
+		if err := w.recordRollbackPhysicalWriteAttempt(ctx, PhysicalWriteCost{CPUSetWrites: 1}); err != nil {
+			rollbackErr = utilerrors.NewAggregate([]error{rollbackErr, err})
+		} else if err := w.driver.WriteCPUs(
 			ctx, operation.Rel, operation.ExpectedIdentity, operation.ExpectedCurrent.CPUs,
 		); err != nil {
 			rollbackErr = utilerrors.NewAggregate([]error{
@@ -232,7 +303,9 @@ func (w safeCPSetWriter) rollbackOperation(
 		}
 	}
 	if wroteMems {
-		if err := w.driver.WriteMems(
+		if err := w.recordRollbackPhysicalWriteAttempt(ctx, PhysicalWriteCost{MemsWrites: 1}); err != nil {
+			rollbackErr = utilerrors.NewAggregate([]error{rollbackErr, err})
+		} else if err := w.driver.WriteMems(
 			ctx, operation.Rel, operation.ExpectedIdentity, operation.ExpectedCurrent.Mems,
 		); err != nil {
 			rollbackErr = utilerrors.NewAggregate([]error{
@@ -600,8 +673,14 @@ func newStrictReservedHierarchyDriver(
 }
 
 func (d *strictReservedHierarchyDriver) consume(ctx context.Context) error {
-	if err := d.budget.checkContextDeadline(ctx); err != nil {
-		return err
+	if isAdjustmentRecoveryContext(ctx) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	} else {
+		if err := d.budget.checkContextDeadline(ctx); err != nil {
+			return err
+		}
 	}
 	if d.remaining <= 0 {
 		return fmt.Errorf("%w: prepaid hierarchy I/O exhausted",

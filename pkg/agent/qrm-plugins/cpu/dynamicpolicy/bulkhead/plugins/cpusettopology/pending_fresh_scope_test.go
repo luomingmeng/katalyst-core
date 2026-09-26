@@ -224,33 +224,112 @@ func absentCandidateErrors(podUID string) map[string]error {
 }
 
 func TestResolvedContainerFreshnessRequiresTypedLeafAbsence(t *testing.T) {
+	t.Parallel()
+
 	const containerName = "main"
 	cpus := machine.NewCPUSet(4, 5)
 
 	tests := []struct {
 		name          string
 		freshPod      func(string, string) *v1.Pod
+		freshIDSame   bool
 		oldStatErr    error
 		oldExists     bool
 		newLeafExists bool
 		wantOld       bool
 		wantNew       bool
 		wantPending   bool
+		wantState     containerLifecycleState
+		wantProofID   string
+		wantProofRel  string
+		wantResolves  int
 		wantErr       error
 	}{
 		{
-			name:      "pod absent keeps exact old leaf while it exists",
+			name:      "pod absent retires proof but keeps exact old leaf protection while it exists",
 			oldExists: true,
 			wantOld:   true,
+			wantState: containerLifecycleRetired,
 		},
 		{
-			name:       "pod absent releases only after typed old leaf absence",
+			name:       "pod absent keeps proof retired after typed old leaf absence",
 			oldStatErr: os.ErrNotExist,
+			wantState:  containerLifecycleRetired,
 		},
 		{
 			name:       "old leaf operational error fails closed",
 			oldStatErr: syscall.EIO,
 			wantErr:    syscall.EIO,
+		},
+		{
+			name: "same identity with cached path and typed leaf absence remains pending",
+			freshPod: func(podUID, freshID string) *v1.Pod {
+				return &v1.Pod{
+					ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+					Spec:       v1.PodSpec{Containers: []v1.Container{{Name: containerName}}},
+					Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
+						Name: containerName, ContainerID: "containerd://" + freshID,
+					}}},
+				}
+			},
+			freshIDSame:  true,
+			oldStatErr:   os.ErrNotExist,
+			wantPending:  true,
+			wantState:    containerLifecyclePending,
+			wantProofID:  "fresh",
+			wantResolves: 2,
+		},
+		{
+			name: "same identity resolves only when fresh leaf exists",
+			freshPod: func(podUID, freshID string) *v1.Pod {
+				return &v1.Pod{
+					ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+					Spec:       v1.PodSpec{Containers: []v1.Container{{Name: containerName}}},
+					Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
+						Name: containerName, ContainerID: "containerd://" + freshID,
+					}}},
+				}
+			},
+			freshIDSame:  true,
+			oldExists:    true,
+			wantOld:      true,
+			wantNew:      true,
+			wantState:    containerLifecycleResolved,
+			wantProofID:  "fresh",
+			wantProofRel: "fresh",
+			wantResolves: 2,
+		},
+		{
+			name: "same identity fresh leaf permission error fails closed",
+			freshPod: func(podUID, freshID string) *v1.Pod {
+				return &v1.Pod{
+					ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+					Spec:       v1.PodSpec{Containers: []v1.Container{{Name: containerName}}},
+					Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
+						Name: containerName, ContainerID: "containerd://" + freshID,
+					}}},
+				}
+			},
+			freshIDSame:  true,
+			oldStatErr:   syscall.EACCES,
+			wantResolves: 2,
+			wantErr:      syscall.EACCES,
+		},
+		{
+			name: "same identity fresh leaf io error fails closed",
+			freshPod: func(podUID, freshID string) *v1.Pod {
+				return &v1.Pod{
+					ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+					Spec:       v1.PodSpec{Containers: []v1.Container{{Name: containerName}}},
+					Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
+						Name: containerName, ContainerID: "containerd://" + freshID,
+					}}},
+				}
+			},
+			freshIDSame:  true,
+			oldStatErr:   syscall.EIO,
+			wantResolves: 2,
+			wantErr:      syscall.EIO,
 		},
 		{
 			name: "new identity protects old and resolved current generations",
@@ -267,6 +346,9 @@ func TestResolvedContainerFreshnessRequiresTypedLeafAbsence(t *testing.T) {
 			newLeafExists: true,
 			wantOld:       true,
 			wantNew:       true,
+			wantState:     containerLifecycleResolved,
+			wantProofID:   "fresh",
+			wantProofRel:  "fresh",
 		},
 		{
 			name: "new identity with absent leaf remains scoped pending",
@@ -281,6 +363,8 @@ func TestResolvedContainerFreshnessRequiresTypedLeafAbsence(t *testing.T) {
 			},
 			oldStatErr:  os.ErrNotExist,
 			wantPending: true,
+			wantState:   containerLifecyclePending,
+			wantProofID: "fresh",
 		},
 		{
 			name: "name absent keeps exact old leaf while it exists",
@@ -289,6 +373,15 @@ func TestResolvedContainerFreshnessRequiresTypedLeafAbsence(t *testing.T) {
 			},
 			oldExists: true,
 			wantOld:   true,
+			wantState: containerLifecycleRetired,
+		},
+		{
+			name: "name absent retires after typed old leaf absence",
+			freshPod: func(podUID, _ string) *v1.Pod {
+				return &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)}}
+			},
+			oldStatErr: os.ErrNotExist,
+			wantState:  containerLifecycleRetired,
 		},
 	}
 
@@ -297,9 +390,14 @@ func TestResolvedContainerFreshnessRequiresTypedLeafAbsence(t *testing.T) {
 			podUID := fmt.Sprintf("resolved-freshness-%d", i)
 			oldID := fmt.Sprintf("old-%d", i)
 			newID := fmt.Sprintf("new-%d", i)
+			freshID := newID
+			if tt.freshIDSame {
+				freshID = oldID
+			}
 			oldRel := "kubepods/pod" + podUID + "/" + oldID
-			newRel := "kubepods/pod" + podUID + "/" + newID
-			cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+			newRel := "kubepods/pod" + podUID + "/" + freshID
+			resolveCalls := 0
+			unregister := cgcommon.RegisterRelativeCgroupPathHandlerWithUnregister(cgcommon.RelativeCgroupPathHandler{
 				Name: "resolved-freshness-" + podUID,
 				Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 					if gotPodUID != podUID {
@@ -307,21 +405,21 @@ func TestResolvedContainerFreshnessRequiresTypedLeafAbsence(t *testing.T) {
 					}
 					switch gotContainerID {
 					case oldID:
+						resolveCalls++
 						return "/" + oldRel, false, nil
-					case newID:
-						if tt.newLeafExists {
-							return "/" + newRel, false, nil
-						}
-						return "", false, os.ErrNotExist
+					case freshID:
+						resolveCalls++
+						return "/" + newRel, false, nil
 					default:
 						return "", true, nil
 					}
 				},
 			})
+			t.Cleanup(unregister)
 
 			var pods []*v1.Pod
 			if tt.freshPod != nil {
-				pods = append(pods, tt.freshPod(podUID, newID))
+				pods = append(pods, tt.freshPod(podUID, freshID))
 			}
 			fetcher := &strictSnapshotFetcher{
 				containerIDs: map[string]string{podUID + "/" + containerName: oldID},
@@ -330,6 +428,9 @@ func TestResolvedContainerFreshnessRequiresTypedLeafAbsence(t *testing.T) {
 			cg := &fakeCgroupClient{
 				existing:   map[string]bool{oldRel: tt.oldExists},
 				statErrors: map[string]error{oldRel: tt.oldStatErr},
+			}
+			if newRel != oldRel {
+				cg.existing[newRel] = tt.newLeafExists
 			}
 			res, err := (&CPUSetTopologyPlugin{
 				cfg:    bulkheadConfigWithPrimary("kubepods"),
@@ -348,6 +449,9 @@ func TestResolvedContainerFreshnessRequiresTypedLeafAbsence(t *testing.T) {
 			if fetcher.listCalls != 1 {
 				t.Fatalf("strict fresh pod list calls = %d, want 1", fetcher.listCalls)
 			}
+			if tt.wantResolves > 0 && resolveCalls != tt.wantResolves {
+				t.Fatalf("container path resolve calls = %d, want %d", resolveCalls, tt.wantResolves)
+			}
 			if tt.wantErr != nil {
 				return
 			}
@@ -359,6 +463,35 @@ func TestResolvedContainerFreshnessRequiresTypedLeafAbsence(t *testing.T) {
 			}
 			if got := len(res.PendingByPod) == 1; got != tt.wantPending {
 				t.Fatalf("scoped pending = %v, want %v; pending=%#v", got, tt.wantPending, res.PendingByPod)
+			}
+			if tt.wantPending && tt.wantProofID == "fresh" && res.PendingByPod[0].ContainerID != freshID {
+				t.Fatalf("pending physical container ID = %q, want fresh ID %q",
+					res.PendingByPod[0].ContainerID, freshID)
+			}
+			if got := len(res.LifecycleProofs.OrderedProofs); got != 1 {
+				t.Fatalf("lifecycle proof count = %d, want 1: %#v", got, res.LifecycleProofs.OrderedProofs)
+			}
+			if got := res.LifecycleProofs.OrderedProofs[0].State; got != tt.wantState {
+				t.Fatalf("lifecycle state = %v, want %v", got, tt.wantState)
+			}
+			proof := res.LifecycleProofs.OrderedProofs[0]
+			if tt.wantProofID == "fresh" && proof.ContainerID != freshID {
+				t.Fatalf("lifecycle proof container ID = %q, want fresh ID %q", proof.ContainerID, freshID)
+			}
+			if tt.wantProofRel == "fresh" && proof.RelativePath != newRel {
+				t.Fatalf("lifecycle proof relative path = %q, want fresh path %q", proof.RelativePath, newRel)
+			}
+			if tt.wantState == containerLifecyclePending && proof.RelativePath != "" {
+				t.Fatalf("pending lifecycle proof relative path = %q, want empty", proof.RelativePath)
+			}
+			if tt.name == "name absent keeps exact old leaf while it exists" {
+				if proof.ContainerID != oldID || proof.RelativePath != oldRel {
+					t.Fatalf("retired proof identity = id %q rel %q, want old id %q rel %q",
+						proof.ContainerID, proof.RelativePath, oldID, oldRel)
+				}
+				if !proof.DesiredCPUSet.Equals(cpus) {
+					t.Fatalf("retired proof cpuset = %s, want %s", proof.DesiredCPUSet.String(), cpus.String())
+				}
 			}
 		})
 	}
@@ -626,7 +759,7 @@ func TestBuildExpectedFiltersResolvedOnlyOutcomesAgainstOneStrictFreshSpec(t *te
 		currentRel  = "kubepods/podresolved-only-fresh-spec-pod/resolved-only-current-id"
 		removedRel  = "kubepods/podresolved-only-fresh-spec-pod/resolved-only-removed-id"
 	)
-	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+	registerRelativeCgroupPathHandlerForTest(t, cgcommon.RelativeCgroupPathHandler{
 		Name: "resolved-only-fresh-spec-filter",
 		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 			if gotPodUID != podUID {
@@ -672,10 +805,13 @@ func TestBuildExpectedFiltersResolvedOnlyOutcomesAgainstOneStrictFreshSpec(t *te
 	cfg.EnableAdmissionLeafDefer = true
 	p := &CPUSetTopologyPlugin{
 		cfg: cfg,
-		cgroup: &fakeCgroupClient{cpus: map[string]machine.CPUSet{
-			currentRel: machine.NewCPUSet(0),
-			removedRel: machine.NewCPUSet(1, 2),
-		}},
+		cgroup: &fakeCgroupClient{
+			existing: map[string]bool{currentRel: true},
+			cpus: map[string]machine.CPUSet{
+				currentRel: machine.NewCPUSet(0),
+				removedRel: machine.NewCPUSet(1, 2),
+			},
+		},
 		pendingProtections: map[string]pendingPodProtection{},
 	}
 
@@ -719,29 +855,35 @@ func TestBuildExpectedUsesOneStrictSnapshotForManyPods(t *testing.T) {
 	entries := make(map[string]machine.CPUSet, podCount)
 	for i := 0; i < podCount; i++ {
 		podUID := fmt.Sprintf("snapshot-pod-%d", i)
-		fetcher.containerIDs[podUID+"/main"] = "snapshot-container"
+		containerID := fmt.Sprintf("snapshot-container-%d", i)
+		fetcher.containerIDs[podUID+"/main"] = containerID
 		fetcher.pods = append(fetcher.pods, &v1.Pod{
 			ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
 			Spec:       v1.PodSpec{Containers: []v1.Container{{Name: "main"}}},
 			Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{
 				Name:        "main",
-				ContainerID: "containerd://snapshot-container",
+				ContainerID: "containerd://" + containerID,
 			}}},
 		})
 		entries[podUID] = machine.NewCPUSet(i % 8)
 	}
-	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+	registerRelativeCgroupPathHandlerForTest(t, cgcommon.RelativeCgroupPathHandler{
 		Name: "strict-snapshot-scaling",
 		Handler: func(podUID, containerID string) (string, bool, error) {
-			if strings.HasPrefix(podUID, "snapshot-pod-") && containerID == "snapshot-container" {
+			if strings.HasPrefix(podUID, "snapshot-pod-") && strings.HasPrefix(containerID, "snapshot-container-") {
 				return "/kubepods/pod" + podUID + "/" + containerID, false, nil
 			}
 			return "", true, nil
 		},
 	})
+	existing := make(map[string]bool, podCount)
+	for podUID, containerID := range fetcher.containerIDs {
+		podUID = strings.TrimSuffix(podUID, "/main")
+		existing["kubepods/pod"+podUID+"/"+containerID] = true
+	}
 	p := &CPUSetTopologyPlugin{
 		cfg:    bulkheadConfigWithPrimary("kubepods"),
-		cgroup: &fakeCgroupClient{},
+		cgroup: &fakeCgroupClient{existing: existing},
 	}
 
 	res, err := p.buildExpectedCPUSetByRel(context.Background(), pendingScopeTestContext(
@@ -768,7 +910,7 @@ func TestBuildExpectedUsesCacheOnlySnapshotBeforeStrictRefresh(t *testing.T) {
 		containerID   = "cached-id"
 		containerRel  = "kubepods/podcache-only-snapshot/cached-id"
 	)
-	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+	registerRelativeCgroupPathHandlerForTest(t, cgcommon.RelativeCgroupPathHandler{
 		Name: "cache-only-snapshot",
 		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 			if gotPodUID == podUID && gotContainerID == containerID {
@@ -790,7 +932,7 @@ func TestBuildExpectedUsesCacheOnlySnapshotBeforeStrictRefresh(t *testing.T) {
 	}
 	p := &CPUSetTopologyPlugin{
 		cfg:    bulkheadConfigWithPrimary("kubepods"),
-		cgroup: &fakeCgroupClient{},
+		cgroup: &fakeCgroupClient{existing: map[string]bool{containerRel: true}},
 	}
 
 	res, err := p.buildExpectedCPUSetByRel(context.Background(), pendingScopeTestContext(
@@ -816,7 +958,7 @@ func TestBuildExpectedResolvesFreshIDMissingFromCachedSnapshot(t *testing.T) {
 		freshID       = "fresh-id"
 		freshRel      = "kubepods/podfresh-id-resolution/fresh-id"
 	)
-	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+	registerRelativeCgroupPathHandlerForTest(t, cgcommon.RelativeCgroupPathHandler{
 		Name: "fresh-id-resolution",
 		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 			if gotPodUID == podUID && gotContainerID == freshID {
@@ -839,7 +981,7 @@ func TestBuildExpectedResolvesFreshIDMissingFromCachedSnapshot(t *testing.T) {
 	}
 	p := &CPUSetTopologyPlugin{
 		cfg:    bulkheadConfigWithPrimary("kubepods"),
-		cgroup: &fakeCgroupClient{},
+		cgroup: &fakeCgroupClient{existing: map[string]bool{freshRel: true}},
 	}
 
 	res, err := p.buildExpectedCPUSetByRel(context.Background(), pendingScopeTestContext(
@@ -905,7 +1047,7 @@ func TestBuildExpectedProtectsCurrentGenerationForEveryStatusKind(t *testing.T) 
 				containerIDs: map[string]string{podUID + "/" + containerName: oldID},
 				pods:         []*v1.Pod{pod},
 			}
-			cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+			registerRelativeCgroupPathHandlerForTest(t, cgcommon.RelativeCgroupPathHandler{
 				Name: "resolved-old-id-" + tt.name,
 				Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 					if gotPodUID == podUID && gotContainerID == oldID {
@@ -990,7 +1132,7 @@ func TestBuildExpectedKeepsResolvedContainerIDForEveryStatusKind(t *testing.T) {
 				containerIDs: map[string]string{podUID + "/" + containerName: containerID},
 				pods:         []*v1.Pod{pod},
 			}
-			cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+			registerRelativeCgroupPathHandlerForTest(t, cgcommon.RelativeCgroupPathHandler{
 				Name: "resolved-current-id-" + tt.name,
 				Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 					if gotPodUID == podUID && gotContainerID == containerID {
@@ -1001,7 +1143,7 @@ func TestBuildExpectedKeepsResolvedContainerIDForEveryStatusKind(t *testing.T) {
 			})
 			p := &CPUSetTopologyPlugin{
 				cfg:    bulkheadConfigWithPrimary("kubepods"),
-				cgroup: &fakeCgroupClient{},
+				cgroup: &fakeCgroupClient{existing: map[string]bool{rel: true}},
 			}
 			view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
 				ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
@@ -1030,7 +1172,7 @@ func TestBuildExpectedPreservesStrictSnapshotErrors(t *testing.T) {
 				containerIDs: map[string]string{"snapshot-error/main": "container"},
 				listErr:      wantErr,
 			}
-			cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+			registerRelativeCgroupPathHandlerForTest(t, cgcommon.RelativeCgroupPathHandler{
 				Name: "strict-snapshot-error-" + strings.ReplaceAll(wantErr.Error(), " ", "-"),
 				Handler: func(podUID, containerID string) (string, bool, error) {
 					if podUID == "snapshot-error" && containerID == "container" {
@@ -1068,7 +1210,7 @@ func TestBuildExpectedFiltersAllPodOutcomesAgainstOneStrictFreshMixedContainerSp
 		regularRel  = "kubepods/podmixed-resolved-and-pending-pod/mixed-regular-id"
 		staleRel    = "kubepods/podmixed-resolved-and-pending-pod/mixed-stale-id"
 	)
-	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+	registerRelativeCgroupPathHandlerForTest(t, cgcommon.RelativeCgroupPathHandler{
 		Name: "mixed-resolved-and-pending-fresh-filter",
 		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 			if gotPodUID != podUID {
@@ -1126,7 +1268,7 @@ func TestBuildExpectedFiltersAllPodOutcomesAgainstOneStrictFreshMixedContainerSp
 	}}
 	p := &CPUSetTopologyPlugin{
 		cfg:                bulkheadConfigWithPrimary("kubepods"),
-		cgroup:             &fakeCgroupClient{},
+		cgroup:             &fakeCgroupClient{existing: map[string]bool{regularRel: true}},
 		pendingProtections: map[string]pendingPodProtection{},
 	}
 

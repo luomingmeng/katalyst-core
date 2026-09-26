@@ -46,13 +46,61 @@ type CPUSetPartitionViewState struct {
 	ReservedReclaimedCPUsFallback int
 }
 
+// RampUpAffectedNUMAs returns the real NUMA ids that must receive a hard
+// reclaim floor when the given ramp-up domains are active. It must stay
+// lockstep with dynamicpolicy.affectedRampUpNUMAs:
+//
+//   - immutable-per-NUMA mode (dedicated/reclaim disjoint): only real NUMA
+//     domains affect their own NUMA; the global domain affects no real NUMA.
+//   - overlap mode: the global domain (FakedNUMAID) propagates to every real
+//     NUMA; real NUMA domains affect only their own NUMA.
+func RampUpAffectedNUMAs(rampUpDomains sets.Int, topology *machine.CPUTopology, immutablePerNUMA bool) sets.Int {
+	affected := sets.NewInt()
+	if rampUpDomains == nil || topology == nil {
+		return affected
+	}
+	for _, domain := range rampUpDomains.List() {
+		if domain == commonstate.FakedNUMAID {
+			if !immutablePerNUMA {
+				for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceNoSortInt() {
+					affected.Insert(numaID)
+				}
+			}
+			continue
+		}
+		affected.Insert(domain)
+	}
+	return affected
+}
+
+// scopeHardPartitionReclaimTargets zeroes the reclaim target for every NUMA not
+// in affectedNUMAs, but keeps all NUMA keys present so downstream validators do
+// not report a missing target.
+func scopeHardPartitionReclaimTargets(targets map[int]int, affectedNUMAs sets.Int, topology *machine.CPUTopology) map[int]int {
+	if targets == nil {
+		return targets
+	}
+	if affectedNUMAs == nil {
+		affectedNUMAs = sets.NewInt()
+	}
+	scoped := make(map[int]int, len(targets))
+	for numaID, target := range targets {
+		if affectedNUMAs.Has(numaID) {
+			scoped[numaID] = target
+		} else {
+			scoped[numaID] = 0
+		}
+	}
+	return scoped
+}
+
 func NewCPUSetPartitionViewOptions(
 	coreConf *config.Configuration,
 	dynamicConf *dynamicconfig.Configuration,
 	topology *machine.CPUTopology,
-	hardActive bool,
+	rampUpDomains sets.Int,
 ) CPUSetPartitionViewOptions {
-	opts := newCPUSetPartitionViewOptions(coreConf, dynamicConf, hardActive)
+	opts := newCPUSetPartitionViewOptions(coreConf, dynamicConf, rampUpDomains)
 	if !opts.HardPartitionEnabled {
 		return opts
 	}
@@ -66,7 +114,8 @@ func NewCPUSetPartitionViewOptions(
 	if err != nil {
 		opts.HardPartitionTargetError = err
 	} else {
-		opts.HardPartitionReclaimTargetPerNUMA = targets
+		opts.HardPartitionReclaimTargetPerNUMA = scopeHardPartitionReclaimTargets(
+			targets, RampUpAffectedNUMAs(rampUpDomains, topology, false), topology)
 	}
 	return opts
 }
@@ -76,9 +125,9 @@ func NewCPUSetPartitionViewOptionsWithState(
 	dynamicConf *dynamicconfig.Configuration,
 	topology *machine.CPUTopology,
 	viewState CPUSetPartitionViewState,
-	hardActive bool,
+	rampUpDomains sets.Int,
 ) CPUSetPartitionViewOptions {
-	opts := newCPUSetPartitionViewOptions(coreConf, dynamicConf, hardActive)
+	opts := newCPUSetPartitionViewOptions(coreConf, dynamicConf, rampUpDomains)
 	if !opts.HardPartitionEnabled {
 		return opts
 	}
@@ -88,6 +137,8 @@ func NewCPUSetPartitionViewOptionsWithState(
 		return opts
 	}
 
+	immutablePerNUMA := viewState.State != nil &&
+		viewState.State.GetDisableDedicatedCoresOverlapReclaimedCores()
 	eligibleByNUMA, err := eligibleCPUSetByNUMA(viewState.State, topology, viewState.ReservedCPUs)
 	if err != nil {
 		opts.HardPartitionTargetError = err
@@ -105,7 +156,8 @@ func NewCPUSetPartitionViewOptionsWithState(
 	if err != nil {
 		opts.HardPartitionTargetError = err
 	} else {
-		opts.HardPartitionReclaimTargetPerNUMA = targets
+		opts.HardPartitionReclaimTargetPerNUMA = scopeHardPartitionReclaimTargets(
+			targets, RampUpAffectedNUMAs(rampUpDomains, topology, immutablePerNUMA), topology)
 	}
 	return opts
 }
@@ -113,7 +165,7 @@ func NewCPUSetPartitionViewOptionsWithState(
 func newCPUSetPartitionViewOptions(
 	coreConf *config.Configuration,
 	dynamicConf *dynamicconfig.Configuration,
-	hardActive bool,
+	rampUpDomains sets.Int,
 ) CPUSetPartitionViewOptions {
 	nonReclaimPoolMinSize := configuredNonReclaimPoolMinSize(dynamicConf)
 	if nonReclaimPoolMinSize <= 0 && coreConf != nil && coreConf.DynamicAgentConfiguration != nil {
@@ -122,7 +174,7 @@ func newCPUSetPartitionViewOptions(
 
 	opts := CPUSetPartitionViewOptions{
 		NonReclaimPoolMinSize:             nonReclaimPoolMinSize,
-		HardPartitionEnabled:              hardActive && hardPartitionEnabled(dynamicConf),
+		HardPartitionEnabled:              rampUpDomains.Len() > 0 && hardPartitionEnabled(dynamicConf),
 		HardPartitionReclaimTargetPerNUMA: map[int]int{},
 	}
 	if coreConf != nil {

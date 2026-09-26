@@ -64,7 +64,19 @@ func completeSnapshotFixture(t *testing.T) *CompleteSnapshot {
 		DomainUnion: map[DomainID]machine.CPUSet{
 			DomainPrimary: machine.MustParse("0-3"),
 		},
-		ScanBoundary: ScanBoundary{Roots: []string{"kubepods"}},
+		OwnershipByRel: map[string]machine.CPUSet{
+			"child": machine.MustParse("0-1"),
+		},
+		UnavailableChildren: map[string]UnavailableChildEvidence{
+			"child/unavailable": {
+				Identity: CgroupIdentity{Device: 1, Inode: 4},
+				Reason:   UnavailableChildReasonControllerUnavailable,
+			},
+		},
+		ScanBoundary: ScanBoundary{
+			Roots:        []string{"kubepods"},
+			ExpandedRels: []string{"kubepods", "child"},
+		},
 	}
 }
 
@@ -89,6 +101,13 @@ func TestCloneCompleteSnapshotIsDeeplyIsolated(t *testing.T) {
 	original.Children["child"] = []ChildRef{{Name: "changed"}}
 	original.DomainByRel["child"] = DomainReclaim
 	original.DomainUnion[DomainPrimary].Add(9)
+	original.OwnershipByRel["child"].Add(9)
+	original.UnavailableChildren["child/unavailable"] = UnavailableChildEvidence{
+		Identity: CgroupIdentity{Device: 9, Inode: 9},
+		Reason:   UnavailableChildReasonControllerUnavailable,
+	}
+	original.ScanBoundary.Roots[0] = "changed"
+	original.ScanBoundary.ExpandedRels[0] = "changed"
 
 	require.Equal(t, "0-1", clone.Entries["child"].CPUs.String())
 	require.Equal(t, "0-3", clone.Entries["kubepods"].CPUs.String())
@@ -96,6 +115,11 @@ func TestCloneCompleteSnapshotIsDeeplyIsolated(t *testing.T) {
 	require.Equal(t, []ChildRef{{Name: "grandchild", Identity: CgroupIdentity{Device: 1, Inode: 3}}}, clone.Children["child"])
 	require.Equal(t, DomainPrimary, clone.DomainByRel["child"])
 	require.Equal(t, "0-3", clone.DomainUnion[DomainPrimary].String())
+	require.Equal(t, "0-1", clone.OwnershipByRel["child"].String())
+	require.Equal(t, CgroupIdentity{Device: 1, Inode: 4},
+		clone.UnavailableChildren["child/unavailable"].Identity)
+	require.Equal(t, []string{"kubepods"}, clone.ScanBoundary.Roots)
+	require.Equal(t, []string{"kubepods", "child"}, clone.ScanBoundary.ExpandedRels)
 }
 
 // TestCloneCompleteSnapshotNilReturnsNil documents the nil contract.

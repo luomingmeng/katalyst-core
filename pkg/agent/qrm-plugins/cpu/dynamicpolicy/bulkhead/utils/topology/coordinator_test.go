@@ -23,6 +23,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -37,6 +38,16 @@ import (
 type coordinatorSnapshotTestCgroup struct {
 	*topologyFakeCgroup
 	driver HierarchyDriver
+}
+
+type publicationReplanMarkerError struct {
+	err error
+}
+
+func (e *publicationReplanMarkerError) Error() string { return e.err.Error() }
+func (e *publicationReplanMarkerError) Unwrap() error { return e.err }
+func (*publicationReplanMarkerError) ReplanRequired() bool {
+	return true
 }
 
 type coordinatorVersionOnlyCgroup struct {
@@ -134,9 +145,53 @@ func TestParentSafeAdmissionCompilesReservesAndExecutesOneFrozenTrace(t *testing
 		t.Fatalf("executed journal = %d operations, want frozen trace length %d",
 			len(outcome.Journal), len(flattenTraceOperations(expectedTrace)))
 	}
-	if published != 1 || (!result.ParentSafe && !result.Converged) || !result.FinalSnapshotCurrent {
+	if published != 1 || (!result.ParentSafe && !result.Converged) || !result.FinalSnapshotCurrent ||
+		!result.Published || result.ReplanDisposition != ReplanNotAllowed {
 		t.Fatalf("published=%d result=%+v, want one successful frozen-trace publication", published, result)
 	}
+}
+
+func TestParentSafeAdmissionPublishStalePreservesActualWritesAndFinalSnapshot(t *testing.T) {
+	fixture, base := newTask9ParentSafeFixture(t)
+	adjustmentBudget := NewAdjustmentBudget(context.Background(), ConvergenceBudget{
+		MaxPlanOperations: 100,
+	})
+	fixture.round.adjustmentBudget = adjustmentBudget
+	initial := fixture.driver.snapshot()
+	result := &ConvergenceResult{}
+	publishCalls := 0
+	publishErr := &PlanStaleError{
+		Rel:       "primary/container",
+		Direction: WritePublish,
+		Resource:  "container_cpuset",
+		Current:   "0",
+		Target:    "1",
+	}
+
+	outcome, err := fixture.round.executeParentSafeAdmission(
+		context.Background(), base, result, nil,
+		func(snapshot *CompleteSnapshot, _ map[string]struct{}) error {
+			publishCalls++
+			require.NotNil(t, snapshot)
+			return publishErr
+		},
+	)
+
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	require.Equal(t, 1, publishCalls, "stale publication must be handed directly to the caller")
+	require.True(t, result.ParentSafe)
+	require.False(t, result.Converged)
+	require.True(t, result.FinalSnapshotCurrent)
+	require.NotNil(t, result.FinalSnapshot)
+	require.False(t, result.Published)
+	require.Equal(t, ReplanSafeFromVerifiedFinalState, result.ReplanDisposition)
+	require.NotEmpty(t, result.Journal)
+	require.Positive(t, result.Applied)
+	require.NotEqual(t, initial, fixture.driver.snapshot(),
+		"publication stale is not an execution failure and must not roll back actual writes")
+	require.Equal(t, result.FinalSnapshot, outcome.Snapshot)
+	require.True(t, adjustmentBudget.ReplanSafe(result.ReplanDisposition),
+		"fresh final scan after real frozen writes must authorize the verified-final-state replan")
 }
 
 func TestAdmissionCompileFailurePerformsZeroPhysicalWrites(t *testing.T) {
@@ -221,6 +276,46 @@ func TestAdmissionPostWriteDriftRollsBackBeforeReturning(t *testing.T) {
 	if got := fixture.driver.snapshot(); !reflect.DeepEqual(got, initial) {
 		t.Fatalf("post-write drift did not roll back complete prefix: got=%#v want=%#v", got, initial)
 	}
+}
+
+func TestAdmissionPreservesVerifiedRollbackReplanDisposition(t *testing.T) {
+	fixture, base := newTask9ParentSafeFixture(t)
+	adjustmentBudget := NewAdjustmentBudget(context.Background(), ConvergenceBudget{
+		MaxPlanOperations: 100,
+	})
+	fixture.round.adjustmentBudget = adjustmentBudget
+	trace, err := fixture.round.compileFixedPointTrace(context.Background(), base)
+	require.NoError(t, err)
+	fixture.round.round = 0
+	operations := flattenTraceOperations(trace)
+	require.GreaterOrEqual(t, len(operations), 2)
+	nextRel := ""
+	for _, operation := range operations[1:] {
+		if operation.Rel != operations[0].Rel {
+			nextRel = operation.Rel
+			break
+		}
+	}
+	require.NotEmpty(t, nextRel)
+	initial := fixture.driver.snapshot()
+	fixture.driver.invariants = nil
+	driver := newPreWriteDriftDriver(fixture.driver, trace.InitialSnapshot, 1, nextRel)
+	fixture.round.driver = driver
+	result := &ConvergenceResult{}
+
+	_, err = fixture.round.executeParentSafeAdmission(
+		context.Background(), base, result, nil, nil)
+
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	require.Equal(t, ReplanSafeAfterVerifiedRollback, result.ReplanDisposition)
+	require.Positive(t, result.forwardWriteAttempts)
+	require.Positive(t, result.rollbackWriteAttempts)
+	require.True(t, adjustmentBudget.ReplanSafe(result.ReplanDisposition),
+		"complete rollback verification after real frozen writes must authorize replan")
+	driftedState := fixture.driver.snapshot()
+	delete(initial, driver.driftedRel)
+	delete(driftedState, driver.driftedRel)
+	require.Equal(t, initial, driftedState)
 }
 
 func TestAdmissionPublishesOnlyAfterFreshFinalParentSafeProof(t *testing.T) {
@@ -327,10 +422,14 @@ func TestAdmissionFinalizeFailureRollsBackFrozenTrace(t *testing.T) {
 			require.Nil(t, result.FinalSnapshot)
 			require.Empty(t, result.Journal)
 			require.Zero(t, result.Applied)
+			require.False(t, result.Published)
+			require.Equal(t, ReplanNotAllowed, result.ReplanDisposition)
 			require.Equal(t, ConvergenceStateNonConverged, result.State)
 			require.Equal(t, RoundStatusBlocked, outcome.Status)
 			require.Positive(t, fixture.driver.PhysicalWriteCount(),
 				"failed finalization must execute and roll back a physical write prefix")
+			require.Positive(t, result.forwardWriteAttempts)
+			require.Positive(t, result.rollbackWriteAttempts)
 		})
 	}
 }
@@ -469,8 +568,13 @@ func TestTopologyCoordinatorV1FourNUMADormantBucketsConvergeWithPhysicalParentEn
 	if got, want := result.FinalSnapshot.DomainUnion[DomainReclaim], machine.MustParse("4-7"); !got.Equals(want) {
 		t.Fatalf("published reclaim ownership = %s, want %s", got.String(), want.String())
 	}
-	if published != result.FinalSnapshot {
-		t.Fatalf("published snapshot = %p, want final snapshot %p", published, result.FinalSnapshot)
+	if published == nil || published == result.FinalSnapshot {
+		t.Fatalf("published snapshot = %p, final snapshot = %p, want independent copies",
+			published, result.FinalSnapshot)
+	}
+	if published.ID != result.FinalSnapshot.ID {
+		t.Fatalf("published snapshot ID = %x, final snapshot ID = %x, want identical evidence",
+			published.ID, result.FinalSnapshot.ID)
 	}
 	for _, rel := range []string{"reclaim/numa-0", "reclaim/numa-1"} {
 		if got, ok := published.TargetProofCPUs(rel, machine.NewCPUSet()); !ok || !got.IsEmpty() {
@@ -578,11 +682,81 @@ func TestTopologyCoordinatorV2DisabledResetConvergesOnEmptyConfiguredCPUs(t *tes
 	if !result.Converged || result.State != ConvergenceStateConverged {
 		t.Fatalf("result = %+v, want converged v2 empty reset", result)
 	}
+	if !result.Published || result.ReplanDisposition != ReplanNotAllowed {
+		t.Fatalf("result = %+v, successful reset must explicitly report published terminal state", result)
+	}
 	state := driver.states["primary"]
 	got := state.CPUs.String()
 	if !state.ConfiguredCPUs.IsEmpty() || got != "0-3" {
 		t.Fatalf("state configured/effective = %q/%q, want empty/0-3", state.ConfiguredCPUs.String(), got)
 	}
+}
+
+func TestTopologyCoordinatorResetFirstWriterReadStaleAuthorizesNoPhysicalWriteReplan(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "missing entry", err: syscall.ENOENT},
+		{name: "identity changed", err: ErrCgroupIdentityChanged},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dag, cg, driver := newCoordinatorSnapshotTestFixture(t)
+			driver.nodes["primary"].cpus = machine.MustParse("0-1")
+			driver.nodes["primary"].configuredCPUs = machine.MustParse("0-1")
+			readCalls := 0
+			driver.beforeCall = func(op HierarchyOperation, rel string) error {
+				if op == HierarchyOperationRead && rel == "primary" {
+					readCalls++
+					if readCalls == 1 {
+						return tt.err
+					}
+				}
+				return nil
+			}
+
+			res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
+				DAG: dag, Cgroup: cg, Mems: "0", Mode: ResetModeGuard(),
+				Budget: ConvergenceBudget{MaxHierarchyIOOperations: 1000},
+			})
+
+			require.ErrorIs(t, err, tt.err, "readCalls=%d result=%+v", readCalls, res)
+			require.Equal(t, 1, readCalls, "the injected stale read must be the reset writer's first ReadEntry")
+			require.Equal(t, 1, res.Attempted)
+			require.Zero(t, res.Applied)
+			require.Empty(t, res.Journal)
+			require.Zero(t, driver.PhysicalWriteCount())
+			require.False(t, res.Published)
+			require.Equal(t, ReplanSafeNoPhysicalWrites, res.ReplanDisposition)
+		})
+	}
+}
+
+func TestTopologyCoordinatorResetStaleAfterPhysicalWriteDisallowsReplan(t *testing.T) {
+	dag, cg, driver := newCoordinatorSnapshotTestFixture(t)
+	driver.nodes["primary"].cpus = machine.MustParse("0-1")
+	driver.nodes["primary"].configuredCPUs = machine.MustParse("0-1")
+	driver.beforeCall = func(op HierarchyOperation, rel string) error {
+		if op == HierarchyOperationWriteCPUs && rel == "primary" {
+			return ErrCgroupIdentityChanged
+		}
+		return nil
+	}
+
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
+		DAG: dag, Cgroup: cg, Mems: "0", Mode: ResetModeGuard(),
+		Budget: ConvergenceBudget{MaxHierarchyIOOperations: 1000},
+	})
+
+	require.ErrorIs(t, err, ErrCgroupIdentityChanged)
+	require.Equal(t, 1, res.Attempted)
+	require.Zero(t, res.Applied)
+	require.Empty(t, res.Journal)
+	require.Equal(t, 1, driver.PhysicalWriteCount(), "cpuset.mems must be the only committed write")
+	require.False(t, res.Published)
+	require.Equal(t, ReplanNotAllowed, res.ReplanDisposition)
 }
 
 func TestTopologyCoordinatorResetModeAutoBudgetBoundsPostSnapshotDescendantChurn(t *testing.T) {
@@ -642,7 +816,7 @@ func newCoordinatorSnapshotTestFixture(t *testing.T) (*TopoDAG, *coordinatorSnap
 	return dag, &coordinatorSnapshotTestCgroup{topologyFakeCgroup: cg, driver: driver}, driver
 }
 
-func TestTopologyCoordinatorInitialSnapshotRetriesOneStaleScanInSameInvocation(t *testing.T) {
+func TestTopologyCoordinatorInitialSnapshotReturnsStaleWithoutInternalRetry(t *testing.T) {
 	dag, cg, driver := newCoordinatorSnapshotTestFixture(t)
 	staleFailures := 0
 	driver.beforeCall = func(op HierarchyOperation, rel string) error {
@@ -656,15 +830,16 @@ func TestTopologyCoordinatorInitialSnapshotRetriesOneStaleScanInSameInvocation(t
 	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG: dag, Cgroup: cg, CPUDetails: machine.CPUDetails{0: {}},
 	})
-	if err != nil {
-		t.Fatalf("Converge: %v", err)
+	var snapshotErr *SnapshotError
+	if !errors.As(err, &snapshotErr) || snapshotErr.Class != HierarchyErrorStale {
+		t.Fatalf("Converge error = %v, want typed stale", err)
 	}
-	if staleFailures != 1 || !res.Converged || res.FinalSnapshot == nil {
-		t.Fatalf("staleFailures=%d result=%+v, want one stale initial scan recovered and published", staleFailures, res)
+	if staleFailures != 1 || res.Converged || res.ReplanDisposition != ReplanSafeNoPhysicalWrites {
+		t.Fatalf("staleFailures=%d result=%+v, want one owner-visible stale scan", staleFailures, res)
 	}
 }
 
-func TestTopologyCoordinatorInitialSnapshotGenerationChurnUsesIOBudget(t *testing.T) {
+func TestTopologyCoordinatorInitialSnapshotGenerationChurnReturnsFirstStale(t *testing.T) {
 	dag, cg, driver := newCoordinatorSnapshotTestFixture(t)
 	staleFailures := 0
 	driver.beforeCall = func(op HierarchyOperation, rel string) error {
@@ -680,15 +855,16 @@ func TestTopologyCoordinatorInitialSnapshotGenerationChurnUsesIOBudget(t *testin
 		DAG: dag, Cgroup: cg, CPUDetails: machine.CPUDetails{0: {}},
 		Budget: ConvergenceBudget{MaxHierarchyIOOperations: 100},
 	})
-	if err != nil {
-		t.Fatalf("Converge: %v", err)
+	var snapshotErr *SnapshotError
+	if !errors.As(err, &snapshotErr) || snapshotErr.Class != HierarchyErrorStale {
+		t.Fatalf("Converge error = %v, want typed stale", err)
 	}
-	if staleFailures != 3 || !res.Converged || res.FinalSnapshot == nil {
-		t.Fatalf("staleFailures=%d result=%+v, want generation churn retried until convergence", staleFailures, res)
+	if staleFailures != 1 || res.Converged || res.ReplanDisposition != ReplanSafeNoPhysicalWrites {
+		t.Fatalf("staleFailures=%d result=%+v, want first stale returned to owner", staleFailures, res)
 	}
 }
 
-func TestTopologyCoordinatorInitialSnapshotGenerationChurnUsesAutoIOBudget(t *testing.T) {
+func TestTopologyCoordinatorInitialSnapshotGenerationChurnDoesNotHideBehindAutoIOBudget(t *testing.T) {
 	dag, cg, driver := newCoordinatorSnapshotTestFixture(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -711,16 +887,17 @@ func TestTopologyCoordinatorInitialSnapshotGenerationChurnUsesAutoIOBudget(t *te
 			DeadlineDuration: time.Minute,
 		},
 	})
-	if !errors.Is(err, ErrHierarchyIOOperationBudgetExceeded) {
-		t.Fatalf("Converge error = %v after %d stat calls, want %v",
-			err, statCalls, ErrHierarchyIOOperationBudgetExceeded)
+	var snapshotErr *SnapshotError
+	if !errors.As(err, &snapshotErr) || snapshotErr.Class != HierarchyErrorStale {
+		t.Fatalf("Converge error = %v after %d stat calls, want typed stale",
+			err, statCalls)
 	}
-	if statCalls >= 1000 {
-		t.Fatalf("automatic hierarchy I/O budget did not stop initial snapshot churn: statCalls=%d", statCalls)
+	if statCalls != 1 {
+		t.Fatalf("initial snapshot churn statCalls=%d, want one", statCalls)
 	}
 }
 
-func TestTopologyCoordinatorMissingConfiguredRelReturnsStaleWithoutDeadlineScanLoop(t *testing.T) {
+func TestTopologyCoordinatorPreWriteStaleAuthorizesNoWriteReplan(t *testing.T) {
 	dag, cg, driver := newCoordinatorSnapshotTestFixture(t)
 	delete(driver.nodes, "primary")
 	published := 0
@@ -740,6 +917,9 @@ func TestTopologyCoordinatorMissingConfiguredRelReturnsStaleWithoutDeadlineScanL
 	}
 	if res.Converged || res.State != ConvergenceStateNonConverged || res.FinalSnapshotCurrent || published != 0 {
 		t.Fatalf("result=%+v published=%d, want non-converged stale result without publication", res, published)
+	}
+	if res.Published || res.ReplanDisposition != ReplanSafeNoPhysicalWrites {
+		t.Fatalf("result=%+v, pre-write stale must authorize only a no-write replan", res)
 	}
 	if driver.calls > 2 {
 		t.Fatalf("hierarchy calls = %d, want one bounded retry rather than scanning to deadline", driver.calls)
@@ -782,7 +962,7 @@ func TestTopologyCoordinatorMaterializedConfiguredRelDisappearanceBlocksPublicat
 	}
 }
 
-func TestTopologyCoordinatorRoundSnapshotRetriesOneStaleScanInSameInvocation(t *testing.T) {
+func TestTopologyCoordinatorRoundSnapshotReturnsStaleWithoutInternalRetry(t *testing.T) {
 	dag, cg, driver := newCoordinatorSnapshotTestFixture(t)
 	primaryReads := 0
 	staleFailures := 0
@@ -800,11 +980,12 @@ func TestTopologyCoordinatorRoundSnapshotRetriesOneStaleScanInSameInvocation(t *
 	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG: dag, Cgroup: cg, CPUDetails: machine.CPUDetails{0: {}},
 	})
-	if err != nil {
-		t.Fatalf("Converge: %v", err)
+	var snapshotErr *SnapshotError
+	if !errors.As(err, &snapshotErr) || snapshotErr.Class != HierarchyErrorStale {
+		t.Fatalf("Converge error = %v, want typed stale", err)
 	}
-	if staleFailures != 1 || !res.Converged || res.FinalSnapshot == nil {
-		t.Fatalf("staleFailures=%d result=%+v, want one stale round scan recovered and published", staleFailures, res)
+	if staleFailures != 1 || res.Converged || res.ReplanDisposition != ReplanSafeNoPhysicalWrites {
+		t.Fatalf("staleFailures=%d result=%+v, want one stale returned to owner", staleFailures, res)
 	}
 }
 
@@ -845,17 +1026,14 @@ func TestTopologyCoordinatorMidRoundCancelReleasesModeForNextInvocation(t *testi
 	}
 }
 
-func TestTopologyCoordinatorPublishFailureRetriesWithoutWrites(t *testing.T) {
+func TestTopologyCoordinatorHardPublicationErrorDisallowsReplan(t *testing.T) {
 	dag, cg, driver := newCoordinatorSnapshotTestFixture(t)
 	gate := NewModeGate()
 	publishErr := errors.New("publish failed")
 	publishCalls := 0
 	publish := func(*CompleteSnapshot) error {
 		publishCalls++
-		if publishCalls == 1 {
-			return publishErr
-		}
-		return nil
+		return publishErr
 	}
 	input := CoordinatorInput{
 		DAG: dag, Cgroup: cg, Mode: NormalModeGuardWithGate(gate),
@@ -866,60 +1044,134 @@ func TestTopologyCoordinatorPublishFailureRetriesWithoutWrites(t *testing.T) {
 	if !errors.Is(err, publishErr) {
 		t.Fatalf("first Converge error = %T %v, want publish failure", err, err)
 	}
-	if first.FinalSnapshotCurrent {
-		t.Fatalf("first result = %+v, failed publication must not be current", first)
+	if first.Published || first.ReplanDisposition != ReplanNotAllowed {
+		t.Fatalf("first result = %+v, hard publication failure must terminate", first)
 	}
 	if len(driver.writes) != 0 {
 		t.Fatalf("first converged publication attempt wrote hierarchy: %#v", driver.writes)
 	}
-
-	second, err := (TopologyCoordinator{}).Converge(context.Background(), input)
-	if err != nil {
-		t.Fatalf("second Converge: %v", err)
-	}
-	if !second.Converged || !second.FinalSnapshotCurrent || publishCalls != 2 {
-		t.Fatalf("second result=%+v publishCalls=%d, want successful retry", second, publishCalls)
-	}
-	if len(driver.writes) != 0 {
-		t.Fatalf("zero-write retry wrote hierarchy: %#v", driver.writes)
+	if publishCalls != 1 {
+		t.Fatalf("publish calls = %d, want exactly one", publishCalls)
 	}
 }
 
-func TestTopologyCoordinatorReplansStalePublishWithinInvocation(t *testing.T) {
+func TestTopologyCoordinatorPublicationStalePreservesVerifiedFinalState(t *testing.T) {
 	dag, cg, driver := newCoordinatorSnapshotTestFixture(t)
 	publishCalls := 0
+	lifecycleErr := errors.New("container leaf changed before publication")
+	publishErr := &PlanStaleError{
+		Rel:       "primary/container",
+		Direction: WritePublish,
+		Resource:  "container_cpuset",
+		Current:   "0",
+		Target:    "1",
+		Err:       lifecycleErr,
+	}
 
 	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG: dag, Cgroup: cg, CPUDetails: machine.CPUDetails{0: {}},
 		PublishFinalSnapshot: func(snapshot *CompleteSnapshot) error {
 			publishCalls++
-			if publishCalls == 1 {
-				return &PlanStaleError{
-					Rel:       "primary/container",
-					Direction: WritePublish,
-					Resource:  "container_cpuset",
-					Current:   "0",
-					Target:    "1",
-					Err:       errors.New("container leaf changed before publication"),
-				}
-			}
 			if snapshot == nil {
 				return errors.New("nil final snapshot")
 			}
-			return nil
+			snapshot.Entries["primary"] = EntryState{
+				Rel:            "primary",
+				Identity:       snapshot.Entries["primary"].Identity,
+				CPUs:           machine.NewCPUSet(9),
+				ConfiguredCPUs: machine.NewCPUSet(9),
+				Mems:           "9",
+				ConfiguredMems: "9",
+			}
+			return publishErr
 		},
 	})
-	if err != nil {
-		t.Fatalf("Converge after stale publication: %v", err)
+	if !errors.Is(err, ErrCoordinatorPlanStale) {
+		t.Fatalf("Converge error = %T %v, want publication stale", err, err)
 	}
-	if !res.Converged || !res.FinalSnapshotCurrent {
-		t.Fatalf("result = %+v, want converged current snapshot", res)
+	require.ErrorIs(t, err, lifecycleErr, "publication stale must preserve the production lifecycle error chain")
+	if !res.Converged || !res.FinalSnapshotCurrent || res.FinalSnapshot == nil {
+		t.Fatalf("result = %+v, want verified current final snapshot preserved", res)
 	}
-	if publishCalls != 2 {
-		t.Fatalf("publish calls = %d, want 2", publishCalls)
+	require.Equal(t, "0", res.FinalSnapshot.Entries["primary"].CPUs.String(),
+		"publication callback must not mutate the verified result snapshot")
+	if res.Published || res.ReplanDisposition != ReplanSafeFromVerifiedFinalState {
+		t.Fatalf("result = %+v, want unpublished safe-final-state replan", res)
+	}
+	if publishCalls != 1 {
+		t.Fatalf("publish calls = %d, want no internal retry", publishCalls)
 	}
 	if len(driver.writes) != 0 {
-		t.Fatalf("stale zero-write publication retry wrote hierarchy: %#v", driver.writes)
+		t.Fatalf("stale publication wrote hierarchy: %#v", driver.writes)
+	}
+}
+
+func TestTopologyCoordinatorParentSafePublicationStalePreservesZeroWriteFinalSnapshot(t *testing.T) {
+	dag, cg, driver := newCoordinatorSnapshotTestFixture(t)
+	publishCalls := 0
+	lifecycleErr := errors.New("container lifecycle changed")
+	publishErr := fmt.Errorf("publish current snapshot: %w",
+		&PlanStaleError{
+			Rel:       "primary/container",
+			Direction: WritePublish,
+			Resource:  "container_cpuset",
+			Current:   "0",
+			Target:    "1",
+			Err:       lifecycleErr,
+		})
+
+	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
+		DAG: dag, Cgroup: cg, Objective: ConvergenceObjectiveParentSafe,
+		CPUDetails: machine.CPUDetails{0: {}},
+		PublishFinalSnapshot: func(snapshot *CompleteSnapshot) error {
+			publishCalls++
+			require.NotNil(t, snapshot)
+			entry := snapshot.Entries["primary"]
+			entry.CPUs.Add(9)
+			snapshot.Entries["primary"] = entry
+			return publishErr
+		},
+	})
+
+	require.ErrorIs(t, err, ErrCoordinatorPlanStale)
+	require.ErrorIs(t, err, lifecycleErr)
+	require.Equal(t, 1, publishCalls, "ParentSafe publication stale must not retry internally")
+	require.True(t, res.Converged)
+	require.False(t, res.ParentSafe)
+	require.True(t, res.FinalSnapshotCurrent)
+	require.NotNil(t, res.FinalSnapshot)
+	require.Equal(t, "0", res.FinalSnapshot.Entries["primary"].CPUs.String(),
+		"ParentSafe result must retain an independent verified snapshot")
+	require.False(t, res.Published)
+	require.Equal(t, ReplanSafeFromVerifiedFinalState, res.ReplanDisposition)
+	require.Empty(t, driver.writes, "already-converged ParentSafe publication must perform zero hierarchy writes")
+}
+
+func TestTopologyCoordinatorPublicationDoesNotGeneralizeReplanMarkers(t *testing.T) {
+	for _, objective := range []ConvergenceObjective{
+		ConvergenceObjectiveFull,
+		ConvergenceObjectiveParentSafe,
+	} {
+		t.Run(string(objective), func(t *testing.T) {
+			dag, cg, _ := newCoordinatorSnapshotTestFixture(t)
+			hardErr := errors.New("publication failed after lifecycle validation")
+			markerErr := &publicationReplanMarkerError{err: hardErr}
+
+			res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
+				DAG: dag, Cgroup: cg, Objective: objective,
+				CPUDetails: machine.CPUDetails{0: {}},
+				PublishFinalSnapshot: func(*CompleteSnapshot) error {
+					return markerErr
+				},
+			})
+
+			require.ErrorIs(t, err, hardErr)
+			require.False(t, errors.Is(err, ErrCoordinatorPlanStale))
+			require.False(t, res.Published)
+			require.Equal(t, ReplanNotAllowed, res.ReplanDisposition)
+			require.False(t, res.FinalSnapshotCurrent)
+			require.Nil(t, res.FinalSnapshot)
+		})
 	}
 }
 
@@ -943,7 +1195,7 @@ func TestTopologyCoordinatorPrioritizesStalePlanOverBudget(t *testing.T) {
 	}
 }
 
-func TestTopologyCoordinatorPersistentStaleSnapshotStopsAfterBoundedRetryWithoutPublishing(t *testing.T) {
+func TestTopologyCoordinatorPersistentStaleSnapshotStopsAfterFirstScanWithoutPublishing(t *testing.T) {
 	dag, cg, driver := newCoordinatorSnapshotTestFixture(t)
 	driver.beforeCall = func(op HierarchyOperation, rel string) error {
 		if op == HierarchyOperationStat && rel == "primary" {
@@ -965,8 +1217,8 @@ func TestTopologyCoordinatorPersistentStaleSnapshotStopsAfterBoundedRetryWithout
 	if !errors.As(err, &snapshotErr) || snapshotErr.Class != HierarchyErrorStale {
 		t.Fatalf("Converge error = %T %v, want stale snapshot failure; result=%+v", err, err, res)
 	}
-	if driver.calls != 2 {
-		t.Fatalf("underlying hierarchy calls = %d, want one bounded retry", driver.calls)
+	if driver.calls != 1 {
+		t.Fatalf("underlying hierarchy calls = %d, want no internal retry", driver.calls)
 	}
 	if published != 0 || res.Converged || res.State != ConvergenceStateNonConverged ||
 		res.FinalSnapshot != nil || res.FinalSnapshotCurrent || len(res.Rounds) != 0 {
@@ -1013,7 +1265,7 @@ func TestCoordinatorRoundNextSnapshotDoesNotRetryNonStaleErrors(t *testing.T) {
 	}
 }
 
-func TestCoordinatorRoundNextSnapshotDoesNotMergeMissingDifferentGenerations(t *testing.T) {
+func TestCoordinatorRoundNextSnapshotReturnsFirstMissingGeneration(t *testing.T) {
 	dag, err := BuildDAG([]NodeSpec{{
 		Rel: "primary", Domain: DomainPrimary, CPUs: machine.NewCPUSet(0), TrustAnchor: true,
 	}})
@@ -1039,15 +1291,15 @@ func TestCoordinatorRoundNextSnapshotDoesNotMergeMissingDifferentGenerations(t *
 		},
 	}
 
-	if _, err := round.nextSnapshot(context.Background()); err != nil {
-		t.Fatalf("nextSnapshot: %v", err)
+	if _, err := round.nextSnapshot(context.Background()); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("nextSnapshot error = %v, want first missing generation", err)
 	}
-	if calls != 3 {
-		t.Fatalf("snapshot calls = %d, want different missing generations retried independently", calls)
+	if calls != 1 {
+		t.Fatalf("snapshot calls = %d, want no generation merge or internal retry", calls)
 	}
 }
 
-func TestCoordinatorRoundNextSnapshotBoundsConfiguredRelMissingErrors(t *testing.T) {
+func TestCoordinatorRoundNextSnapshotReturnsConfiguredRelStaleImmediately(t *testing.T) {
 	dag, err := BuildDAG([]NodeSpec{{
 		Rel: "primary", Domain: DomainPrimary, CPUs: machine.NewCPUSet(0), TrustAnchor: true,
 	}})
@@ -1056,15 +1308,13 @@ func TestCoordinatorRoundNextSnapshotBoundsConfiguredRelMissingErrors(t *testing
 	}
 
 	tests := []struct {
-		name      string
-		staleErr  error
-		wantError bool
-		wantCalls int
+		name     string
+		staleErr error
 	}{
-		{name: "ENOENT", staleErr: syscall.ENOENT, wantError: true, wantCalls: 2},
-		{name: "ENOTDIR", staleErr: syscall.ENOTDIR, wantError: true, wantCalls: 2},
-		{name: "ENODEV", staleErr: syscall.ENODEV, wantError: true, wantCalls: 2},
-		{name: "other stale churn", staleErr: syscall.EBUSY, wantCalls: 3},
+		{name: "ENOENT", staleErr: syscall.ENOENT},
+		{name: "ENOTDIR", staleErr: syscall.ENOTDIR},
+		{name: "ENODEV", staleErr: syscall.ENODEV},
+		{name: "other stale churn", staleErr: syscall.EBUSY},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1088,21 +1338,17 @@ func TestCoordinatorRoundNextSnapshotBoundsConfiguredRelMissingErrors(t *testing
 			}
 
 			_, err := round.nextSnapshot(context.Background())
-			if tc.wantError {
-				if !errors.Is(err, tc.staleErr) {
-					t.Fatalf("nextSnapshot error = %v, want %v", err, tc.staleErr)
-				}
-			} else if err != nil {
-				t.Fatalf("nextSnapshot error = %v, want stale churn to keep retrying", err)
+			if !errors.Is(err, tc.staleErr) {
+				t.Fatalf("nextSnapshot error = %v, want %v", err, tc.staleErr)
 			}
-			if calls != tc.wantCalls {
-				t.Fatalf("snapshot calls = %d, want %d", calls, tc.wantCalls)
+			if calls != 1 {
+				t.Fatalf("snapshot calls = %d, want one", calls)
 			}
 		})
 	}
 }
 
-func TestCoordinatorRoundNextSnapshotMergesMissingSameGenerationAcrossEvidenceIDs(t *testing.T) {
+func TestCoordinatorRoundNextSnapshotDoesNotMergeSameGenerationEvidence(t *testing.T) {
 	dag, err := BuildDAG([]NodeSpec{{
 		Rel: "primary", Domain: DomainPrimary, CPUs: machine.NewCPUSet(0), TrustAnchor: true,
 	}})
@@ -1138,8 +1384,8 @@ func TestCoordinatorRoundNextSnapshotMergesMissingSameGenerationAcrossEvidenceID
 	if _, err := round.nextSnapshot(context.Background()); !errors.Is(err, syscall.ENOENT) {
 		t.Fatalf("nextSnapshot error = %v, want repeated missing generation", err)
 	}
-	if calls != 2 {
-		t.Fatalf("snapshot calls = %d, want same generation blocked after two observations", calls)
+	if calls != 1 {
+		t.Fatalf("snapshot calls = %d, want first evidence returned to owner", calls)
 	}
 }
 
@@ -1721,7 +1967,7 @@ func TestCoordinatorAutoCumulativeBudgetInputReturnsTypedPlanOverflow(t *testing
 	}
 }
 
-func TestTopologyCoordinatorConvergeContinuesAfterProgressAndConverges(t *testing.T) {
+func TestTopologyCoordinatorConvergeReturnsPostWriteStaleToAdjustmentOwner(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{
@@ -1743,21 +1989,21 @@ func TestTopologyCoordinatorConvergeContinuesAfterProgressAndConverges(t *testin
 		Cgroup:     cg,
 		CPUDetails: machine.CPUDetails{0: {}, 1: {}},
 	})
-	if err != nil {
-		t.Fatalf("Converge: %v", err)
+	if !errors.Is(err, ErrCoordinatorPlanStale) {
+		t.Fatalf("Converge error = %v, want owner-visible stale", err)
 	}
-	if !res.Converged || res.State != ConvergenceStateConverged {
-		t.Fatalf("result = %+v, want converged", res)
+	if res.Converged || res.State != ConvergenceStateNonConverged {
+		t.Fatalf("result = %+v, want non-converged stale attempt", res)
 	}
-	if got := len(res.Rounds); got < 2 {
-		t.Fatalf("rounds = %d, want multi-round convergence; writes=%#v", got, cg.writes)
+	if got := len(res.Rounds); got != 1 {
+		t.Fatalf("rounds = %d, want no internal stale recompile; writes=%#v", got, cg.writes)
 	}
-	final := res.Rounds[len(res.Rounds)-1]
-	if final.Status != RoundStatusConverged {
-		t.Fatalf("final round status = %s, want %s", final.Status, RoundStatusConverged)
+	if res.Rounds[0].Status != RoundStatusStale {
+		t.Fatalf("round status = %s, want %s", res.Rounds[0].Status, RoundStatusStale)
 	}
-	if final.Snapshot == nil || !final.Snapshot.Entries["primary"].CPUs.Equals(machine.NewCPUSet(0, 1)) {
-		t.Fatalf("final round should publish current converged snapshot: %+v", final.Snapshot)
+	if res.ReplanDisposition != ReplanNotAllowed ||
+		res.FinalSnapshotCurrent || res.FinalSnapshot != nil {
+		t.Fatalf("result = %+v, want no cross-attempt authority without an adjustment budget", res)
 	}
 }
 
@@ -2181,7 +2427,7 @@ func TestTopologyCoordinatorRevalidatesFreshSnapshotBeforePublishingUnderModeGat
 	}
 	gate := NewModeGate()
 
-	t.Run("snapshot changes once then stabilizes", func(t *testing.T) {
+	t.Run("snapshot drift returns to owner without internal retry", func(t *testing.T) {
 		cg := newTopologyFakeCgroup()
 		cg.cpus["primary"] = machine.NewCPUSet(0, 1)
 		cg.afterSnapshotRootRead = func(reads int) {
@@ -2200,14 +2446,15 @@ func TestTopologyCoordinatorRevalidatesFreshSnapshotBeforePublishingUnderModeGat
 				return nil
 			},
 		})
-		if err != nil {
-			t.Fatalf("Converge: %v", err)
+		if !errors.Is(err, ErrCoordinatorPlanStale) {
+			t.Fatalf("Converge error = %v, want final snapshot stale", err)
 		}
-		if !res.Converged || !res.FinalSnapshotCurrent || published != 1 {
-			t.Fatalf("result=%+v published=%d, want stable fresh snapshot published once", res, published)
+		if res.Converged || res.Published || published != 0 ||
+			res.ReplanDisposition != ReplanSafeNoPhysicalWrites {
+			t.Fatalf("result=%+v published=%d, want owner-visible zero-write stale", res, published)
 		}
-		if len(res.Rounds) != 2 {
-			t.Fatalf("rounds = %+v, want one stale publish round and one converged round", res.Rounds)
+		if len(res.Rounds) != 1 {
+			t.Fatalf("rounds = %+v, want one stale publish round", res.Rounds)
 		}
 		stale := res.Rounds[0]
 		var staleErr *PlanStaleError
@@ -2218,9 +2465,9 @@ func TestTopologyCoordinatorRevalidatesFreshSnapshotBeforePublishingUnderModeGat
 		if stale.Snapshot == nil || !stale.Snapshot.Entries["primary"].CPUs.Equals(machine.NewCPUSet(0)) {
 			t.Fatalf("stale snapshot=%v, want fresh changed snapshot retained for replan", stale.Snapshot)
 		}
-		if res.FinalSnapshot == nil ||
-			!res.FinalSnapshot.Entries["primary"].CPUs.Equals(machine.NewCPUSet(0, 1)) {
-			t.Fatalf("final snapshot=%v, want recovered current snapshot", res.FinalSnapshot)
+		if res.FinalSnapshot != nil || res.FinalSnapshotCurrent {
+			t.Fatalf("final snapshot=%v current=%t, want zero-write disposition to force owner rescan",
+				res.FinalSnapshot, res.FinalSnapshotCurrent)
 		}
 	})
 
@@ -2246,17 +2493,17 @@ func TestTopologyCoordinatorRevalidatesFreshSnapshotBeforePublishingUnderModeGat
 				return nil
 			},
 		})
-		if err != nil {
-			t.Fatalf("Converge: %v; result=%+v", err, res)
+		if !errors.Is(err, ErrCoordinatorPlanStale) {
+			t.Fatalf("Converge error=%v, want owner-visible stale; result=%+v", err, res)
 		}
-		if !res.Converged || res.State != ConvergenceStateConverged || !res.FinalSnapshotCurrent {
-			t.Fatalf("result=%+v, want grow progress to survive stale publish and converge", res)
+		if res.Converged || res.State != ConvergenceStateNonConverged {
+			t.Fatalf("result=%+v, want terminal coordinator attempt", res)
 		}
-		if published != 1 || len(res.Rounds) != 3 {
-			t.Fatalf("published=%d rounds=%+v, want two stale rounds then one publish", published, res.Rounds)
+		if published != 0 || len(res.Rounds) != 1 {
+			t.Fatalf("published=%d rounds=%+v, want one stale round and no publish", published, res.Rounds)
 		}
-		if !res.Rounds[1].Progress.MadeProgress() {
-			t.Fatalf("second stale round = %+v, want verified grow progress", res.Rounds[1])
+		if res.ReplanDisposition != ReplanSafeNoPhysicalWrites {
+			t.Fatalf("disposition=%v, want zero-write owner replan", res.ReplanDisposition)
 		}
 	})
 
@@ -2293,13 +2540,34 @@ func TestTopologyCoordinatorRevalidatesFreshSnapshotBeforePublishingUnderModeGat
 		if !res.Converged || !res.FinalSnapshotCurrent || published != 1 {
 			t.Fatalf("result=%+v published=%d, want unrelated churn ignored and one fresh snapshot published", res, published)
 		}
-		if res.FinalSnapshot == nil || res.FinalSnapshot != publishedSnapshot {
-			t.Fatalf("FinalSnapshot=%p published=%p, want the fresh complete snapshot passed to publication",
+		if res.FinalSnapshot == nil || publishedSnapshot == nil || res.FinalSnapshot == publishedSnapshot {
+			t.Fatalf("FinalSnapshot=%p published=%p, want independent copies of the verified snapshot",
 				res.FinalSnapshot, publishedSnapshot)
 		}
 		if _, hasLeafB := res.FinalSnapshot.Entries["primary/leaf-b"]; !hasLeafB {
 			t.Fatalf("FinalSnapshot entries=%v, want fresh complete snapshot containing latest unrelated leaf", res.FinalSnapshot.Entries)
 		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				publishedSnapshot.OwnershipByRel = map[string]machine.CPUSet{
+					"publication": machine.NewCPUSet(i),
+				}
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				res.FinalSnapshot.OwnershipByRel = map[string]machine.CPUSet{
+					"result": machine.NewCPUSet(i),
+				}
+			}
+		}()
+		wg.Wait()
+		require.NotContains(t, res.FinalSnapshot.OwnershipByRel, "publication")
+		require.NotContains(t, publishedSnapshot.OwnershipByRel, "result")
 	})
 
 	t.Run("expected materialized leaf keeps changing across publish attempts", func(t *testing.T) {
@@ -2325,14 +2593,15 @@ func TestTopologyCoordinatorRevalidatesFreshSnapshotBeforePublishingUnderModeGat
 				return nil
 			},
 		})
-		if err != nil {
-			t.Fatalf("Converge: %v; result=%+v", err, res)
+		if !errors.Is(err, ErrCoordinatorPlanStale) {
+			t.Fatalf("Converge error=%v, want owner-visible stale; result=%+v", err, res)
 		}
-		if !res.Converged || res.State != ConvergenceStateConverged || !res.FinalSnapshotCurrent || published != 1 {
-			t.Fatalf("result=%+v published=%d, want bridge grow and final shrink to converge", res, published)
+		if res.Converged || res.State != ConvergenceStateNonConverged || published != 0 {
+			t.Fatalf("result=%+v published=%d, want one coordinator stale attempt", res, published)
 		}
-		if len(res.Rounds) != 3 || !res.Rounds[1].Progress.MadeProgress() {
-			t.Fatalf("rounds = %+v, want stale then bridge progress then convergence", res.Rounds)
+		if len(res.Rounds) != 1 || res.ReplanDisposition != ReplanSafeNoPhysicalWrites {
+			t.Fatalf("rounds = %+v disposition=%v, want one zero-write stale owner replan",
+				res.Rounds, res.ReplanDisposition)
 		}
 	})
 
@@ -3312,56 +3581,6 @@ func TestPhaseWriterInvalidCPUWriteErrorIncludesPhaseCurrentAndTarget(t *testing
 	}
 }
 
-func TestStaleBlockedSignatureUsesCgroupGenerationAndLogicalState(t *testing.T) {
-	t.Parallel()
-
-	identityA := CgroupIdentity{Device: 1, Inode: 11}
-	identityB := CgroupIdentity{Device: 1, Inode: 21}
-	snapshotA := &CompleteSnapshot{Entries: map[string]EntryState{
-		"primary": {Rel: "primary", Identity: identityA, CPUs: machine.NewCPUSet(0, 1, 2, 3)},
-	}}
-	snapshotA.ID[0] = 1
-	snapshotB := &CompleteSnapshot{Entries: map[string]EntryState{
-		"primary": {Rel: "primary", Identity: identityA, CPUs: machine.NewCPUSet(0, 1, 2, 3)},
-	}}
-	snapshotB.ID[0] = 2
-	first := RoundOutcome{
-		Snapshot: snapshotA,
-		Blocker: &PlanStaleError{
-			Rel: "primary", Direction: WriteShrink, Resource: "cpuset.cpus",
-			Current: "0-3", Target: "0-1",
-			Err: fmt.Errorf("inode changed from 11 to 12"),
-		},
-	}
-	second := RoundOutcome{
-		Snapshot: snapshotB,
-		Blocker: &PlanStaleError{
-			Rel: "primary", Direction: WriteShrink, Resource: "cpuset.cpus",
-			Current: "0-3", Target: "0-1",
-			Err: fmt.Errorf("inode changed from 11 to 12"),
-		},
-	}
-	if got, want := staleBlockedSignature(first), staleBlockedSignature(second); got != want {
-		t.Fatalf("per-scan snapshot IDs split identical generation and state:\nfirst=%q\nsecond=%q", got, want)
-	}
-
-	snapshotB.Entries["primary"] = EntryState{
-		Rel: "primary", Identity: identityB, CPUs: machine.NewCPUSet(0, 1, 2, 3),
-	}
-	if got, want := staleBlockedSignature(first), staleBlockedSignature(second); got == want {
-		t.Fatalf("different cgroup generations share stale signature:\nfirst=%q\nsecond=%q", got, want)
-	}
-
-	second.Snapshot = snapshotA
-	second.Blocker = &PlanStaleError{
-		Rel: "primary", Direction: WriteShrink, Resource: "cpuset.mems",
-		Current: "0", Target: "0-1",
-	}
-	if staleBlockedSignature(first) == staleBlockedSignature(second) {
-		t.Fatalf("different stale resources must not share a logical signature")
-	}
-}
-
 func TestNoWriteBlockedSignatureUsesCgroupGenerationAndMismatchState(t *testing.T) {
 	t.Parallel()
 
@@ -3430,7 +3649,7 @@ func TestTopologyCoordinatorConvergeBlocksAfterRepeatedNoWriteMismatch(t *testin
 	}
 }
 
-func TestTopologyCoordinatorConvergeRescansAfterStaleRound(t *testing.T) {
+func TestTopologyCoordinatorConvergeDoesNotRescanAfterStaleRound(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{
@@ -3452,18 +3671,19 @@ func TestTopologyCoordinatorConvergeRescansAfterStaleRound(t *testing.T) {
 		Cgroup:     cg,
 		CPUDetails: machine.CPUDetails{0: {}, 1: {}},
 	})
-	if err != nil {
-		t.Fatalf("Converge: %v", err)
+	if !errors.Is(err, ErrCgroupIdentityChanged) {
+		t.Fatalf("Converge error = %v, want identity-stale cause", err)
 	}
-	if !res.Converged {
-		t.Fatalf("Converged = false, result=%+v writes=%#v", res, cg.writes)
+	if res.Converged || res.ReplanDisposition != ReplanNotAllowed ||
+		res.FinalSnapshotCurrent || res.FinalSnapshot != nil {
+		t.Fatalf("result=%+v, want no cross-attempt authority without an adjustment budget", res)
 	}
 	if got := len(cg.writes); got != 1 {
-		t.Fatalf("writes = %d, want one successful write after stale rescan; writes=%#v", got, cg.writes)
+		t.Fatalf("writes = %d, want one coordinator attempt; writes=%#v", got, cg.writes)
 	}
 }
 
-func TestTopologyCoordinatorConvergePostWriteRestoreUsesRoundBudget(t *testing.T) {
+func TestTopologyCoordinatorConvergePostWriteRestoreReturnsOwnerReplan(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{
@@ -3486,17 +3706,17 @@ func TestTopologyCoordinatorConvergePostWriteRestoreUsesRoundBudget(t *testing.T
 		CPUDetails: machine.CPUDetails{0: {}, 1: {}},
 		Budget:     ConvergenceBudget{MaxRounds: 3},
 	})
-	if !errors.Is(err, ErrRoundBudgetExceeded) {
-		t.Fatalf("Converge error = %T %v, want round budget exhaustion; result=%+v", err, err, res)
+	if !errors.Is(err, ErrCoordinatorPlanStale) {
+		t.Fatalf("Converge error = %T %v, want owner-visible stale; result=%+v", err, err, res)
 	}
 	if res.Converged || res.State != ConvergenceStateNonConverged {
-		t.Fatalf("result = %+v, want non-converged after round budget exhaustion", res)
+		t.Fatalf("result = %+v, want non-converged stale attempt", res)
 	}
-	if got := len(res.Rounds); got != 3 {
-		t.Fatalf("rounds = %d, want all three budgeted stale rounds; result=%+v", got, res)
+	if got := len(res.Rounds); got != 1 {
+		t.Fatalf("rounds = %d, want stale not to consume fixed-point rounds; result=%+v", got, res)
 	}
-	if got := len(res.Journal); got != 3 {
-		t.Fatalf("journal = %d, want one partial entry from each stale round; journal=%+v", got, res.Journal)
+	if got := len(res.Journal); got != 1 {
+		t.Fatalf("journal = %d, want one partial entry; journal=%+v", got, res.Journal)
 	}
 	for i, round := range res.Rounds {
 		if round.Status != RoundStatusStale || round.Blocker == nil {
@@ -3508,6 +3728,10 @@ func TestTopologyCoordinatorConvergePostWriteRestoreUsesRoundBudget(t *testing.T
 		if round.Journal[0].Observed.CPUs.Equals(round.Journal[0].Target.CPUs) {
 			t.Fatalf("round[%d] journal = %+v, want restored observation to prove no net progress", i, round.Journal)
 		}
+	}
+	if res.ReplanDisposition != ReplanNotAllowed ||
+		res.FinalSnapshotCurrent || res.FinalSnapshot != nil {
+		t.Fatalf("result=%+v, want no cross-attempt authority without an adjustment budget", res)
 	}
 }
 
@@ -3534,8 +3758,8 @@ func TestLiveFixedPointSessionReturnsJournalPrefixOnStale(t *testing.T) {
 		CPUDetails: machine.CPUDetails{0: {}, 1: {}},
 		Budget:     ConvergenceBudget{MaxRounds: 1},
 	})
-	if !errors.Is(err, ErrRoundBudgetExceeded) {
-		t.Fatalf("Converge error = %T %v, want round budget exhaustion; result=%+v", err, err, res)
+	if !errors.Is(err, ErrCoordinatorPlanStale) {
+		t.Fatalf("Converge error = %T %v, want owner-visible stale; result=%+v", err, err, res)
 	}
 	if len(res.Rounds) != 1 || res.Rounds[0].Status != RoundStatusStale {
 		t.Fatalf("rounds=%+v, want one stale single-round engine outcome", res.Rounds)
@@ -3548,7 +3772,7 @@ func TestLiveFixedPointSessionReturnsJournalPrefixOnStale(t *testing.T) {
 	}
 }
 
-func TestTopologyCoordinatorDrainRefreshesBetweenFrontiersAndPreservesEarlierProgress(t *testing.T) {
+func TestTopologyCoordinatorDrainRefreshReturnsStaleAndPreservesEarlierProgressEvidence(t *testing.T) {
 	t.Parallel()
 
 	dag, cg := deepDrainFixture(t)
@@ -3580,18 +3804,18 @@ func TestTopologyCoordinatorDrainRefreshesBetweenFrontiersAndPreservesEarlierPro
 		CPUDetails:          machine.CPUDetails{0: {}, 1: {}, 2: {}},
 		ExpectedCPUSetByRel: deepDrainDynamicTargets(),
 	})
-	if err != nil {
-		t.Fatalf("Converge: %v", err)
+	if !errors.Is(err, ErrCoordinatorPlanStale) {
+		t.Fatalf("Converge error = %v, want owner-visible stale", err)
 	}
-	if !res.Converged {
-		t.Fatalf("result = %+v, want converged", res)
+	if res.Converged {
+		t.Fatalf("result = %+v, want coordinator attempt to stop at stale frontier", res)
 	}
 	if rootReadsBeforeChild <= rootReadsAfterDeep {
 		t.Fatalf("root snapshot reads deep=%d before-child=%d, want a fresh snapshot between drain frontiers",
 			rootReadsAfterDeep, rootReadsBeforeChild)
 	}
-	if len(res.Rounds) < 2 || res.Rounds[0].Status != RoundStatusStale {
-		t.Fatalf("rounds = %+v, want first round stale and a later recovery round", res.Rounds)
+	if len(res.Rounds) != 1 || res.Rounds[0].Status != RoundStatusStale {
+		t.Fatalf("rounds = %+v, want exactly one stale round", res.Rounds)
 	}
 	stale := res.Rounds[0]
 	if stale.Snapshot == nil {
@@ -3602,6 +3826,10 @@ func TestTopologyCoordinatorDrainRefreshesBetweenFrontiersAndPreservesEarlierPro
 	}
 	if len(stale.ChangedRels) != 1 || stale.ChangedRels[0] != "primary/child/deep" {
 		t.Fatalf("stale changed rels = %v, want only verified deep frontier", stale.ChangedRels)
+	}
+	if res.ReplanDisposition != ReplanNotAllowed ||
+		res.FinalSnapshotCurrent || res.FinalSnapshot != nil {
+		t.Fatalf("result=%+v, want no cross-attempt authority without an adjustment budget", res)
 	}
 }
 
@@ -3624,11 +3852,11 @@ func TestTopologyCoordinatorExternalRestoreClearsEarlierDrainBatchProgress(t *te
 		ExpectedCPUSetByRel: deepDrainDynamicTargets(),
 		Budget:              ConvergenceBudget{MaxRounds: 4},
 	})
-	if !errors.Is(err, ErrRoundBudgetExceeded) {
-		t.Fatalf("Converge error = %T %v, want round budget exhaustion after external restore; result=%+v", err, err, res)
+	if !errors.Is(err, ErrCoordinatorPlanStale) {
+		t.Fatalf("Converge error = %T %v, want owner-visible stale after external restore; result=%+v", err, err, res)
 	}
-	if got := len(res.Rounds); got != 4 {
-		t.Fatalf("rounds = %d, want all four budgeted stale rounds; result=%+v", got, res)
+	if got := len(res.Rounds); got != 1 {
+		t.Fatalf("rounds = %d, want no internal stale recompiles; result=%+v", got, res)
 	}
 	for i, round := range res.Rounds {
 		if round.Snapshot == nil {

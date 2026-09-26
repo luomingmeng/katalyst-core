@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
@@ -28,14 +29,31 @@ import (
 const maxResetEnforceDepth = 8
 
 type resetCoordinatorWriter struct {
-	driver      HierarchyDriver
-	budget      *BudgetTracker
-	defaultMems string
-	res         *ConvergenceResult
+	driver           HierarchyDriver
+	budget           *BudgetTracker
+	adjustmentBudget *AdjustmentBudget
+	reservation      *AdjustmentWriteReservation
+	defaultMems      string
+	res              *ConvergenceResult
+}
+
+type resetWrite struct {
+	rel       string
+	parentRel string
+	current   machine.CPUSet
+	target    machine.CPUSet
+	mems      string
+	expected  bool
+	direction WriteDirection
 }
 
 func newResetCoordinatorWriter(driver HierarchyDriver, budget *BudgetTracker, defaultMems string, res *ConvergenceResult) resetCoordinatorWriter {
 	return resetCoordinatorWriter{driver: driver, budget: budget, defaultMems: defaultMems, res: res}
+}
+
+func (w resetCoordinatorWriter) withAdjustmentBudget(budget *AdjustmentBudget) resetCoordinatorWriter {
+	w.adjustmentBudget = budget
+	return w
 }
 
 func (w resetCoordinatorWriter) execute(
@@ -60,7 +78,8 @@ func (w resetCoordinatorWriter) execute(
 	if len(boundarySets) > 0 {
 		boundaries = boundarySets[0]
 	}
-	var firstErr error
+	var writes []resetWrite
+	var planErr error
 	_ = dag.ForEachExpand(func(n *TopoNode) error {
 		target := targets[n.Rel]
 		if target.IsEmpty() && !allowEmptyTarget {
@@ -69,34 +88,198 @@ func (w resetCoordinatorWriter) execute(
 			}
 			return nil
 		}
-		localErr := w.writeResetNode(ctx, n, target)
-		var propagateErr error
-		w.propagateResetTarget(ctx, n.Rel, target, controlled, expected, boundaries, &propagateErr, 0)
-		if n.Role == TopoNodeRoleReclaimNUMABucket && localErr != nil {
-			if err := w.writeResetNode(ctx, n, target); err == nil {
-				localErr = nil
-			}
+		parentRel := ""
+		if parent := parentNodeOf(n); parent != nil {
+			parentRel = parent.Rel
+		}
+		nodeWrite := resetWrite{
+			rel:       n.Rel,
+			parentRel: parentRel,
+			target:    target.Clone(),
+			mems:      memsForNode(n, w.defaultMems),
+			expected:  true,
+		}
+		writes = append(writes, nodeWrite)
+		w.collectPropagatedResetWrites(
+			ctx, n.Rel, target, controlled, expected, boundaries, &writes, &planErr, 0)
+		return nil
+	})
+	if planErr != nil {
+		return planErr
+	}
+	writes, err := w.orderResetWrites(ctx, writes)
+	if err != nil {
+		return err
+	}
+
+	var reservationCost ExecutionReservationCost
+	for _, write := range writes {
+		writeCost := PhysicalWriteCost{CPUSetWrites: 1}
+		if write.mems != "" {
+			writeCost.MemsWrites = 1
+		}
+		reservationCost.Forward = addPhysicalWriteCost(reservationCost.Forward, writeCost)
+	}
+	reservation, err := w.adjustmentBudget.ReserveExecution(reservationCost)
+	if err != nil {
+		return err
+	}
+	w.reservation = reservation
+	forwardStart := 0
+	if w.res != nil {
+		forwardStart = w.res.forwardWriteAttempts
+	}
+	defer func() {
+		if w.res == nil {
+			_ = reservation.settleTotals(0, 0)
+			return
+		}
+		_ = reservation.settleTotals(w.res.forwardWriteAttempts-forwardStart, 0)
+	}()
+
+	var firstErr error
+	skippedDynamicRoots := make(map[string]struct{})
+	for _, write := range writes {
+		if withinTraversalBoundary(write.rel, skippedDynamicRoots) {
+			continue
+		}
+		localErr := w.writeResetRel(ctx, write.rel, write.parentRel, write.target, write.mems)
+		if localErr != nil && w.shouldSkipDynamicUnavailableController(localErr, write.expected) {
+			w.markDynamicResetSkip()
+			skippedDynamicRoots[write.rel] = struct{}{}
+			continue
 		}
 		if firstErr == nil && localErr != nil {
 			firstErr = localErr
 		}
-		if firstErr == nil && propagateErr != nil {
-			firstErr = propagateErr
-		}
-		return nil
-	})
+	}
 	return firstErr
 }
 
-func (w resetCoordinatorWriter) writeResetNode(ctx context.Context, node *TopoNode, target machine.CPUSet) error {
-	if node == nil {
-		return nil
+func (w resetCoordinatorWriter) orderResetWrites(
+	ctx context.Context,
+	writes []resetWrite,
+) ([]resetWrite, error) {
+	byRel := make(map[string]int, len(writes))
+	for i := range writes {
+		driver, err := newReservedBudgetedHierarchyDriver(ctx, w.driver, w.budget, 1)
+		if err != nil {
+			return nil, err
+		}
+		current, err := driver.ReadEntry(ctx, writes[i].rel)
+		if err != nil {
+			if w.shouldSkipDynamicUnavailableController(err, writes[i].expected) {
+				writes[i].direction = WritePublish
+			} else {
+				if w.res != nil {
+					w.res.Attempted++
+					w.res.Failed++
+				}
+				return nil, w.classifyReadError(err, writes[i].rel, CgroupIdentity{})
+			}
+		} else {
+			writes[i].current = current.CPUs.Clone()
+			direction, changed, monotonic := classifySetDirection(current.CPUs, writes[i].target)
+			switch {
+			case !changed:
+				writes[i].direction = WritePublish
+			case monotonic:
+				writes[i].direction = direction
+			default:
+				// A replacement is deterministic but has no single monotonic
+				// direction. Parent/child safety edges below still take
+				// precedence over this neutral ordering class.
+				writes[i].direction = WritePublish
+			}
+		}
+		byRel[writes[i].rel] = i
 	}
-	parentRel := ""
-	if parent := parentNodeOf(node); parent != nil {
-		parentRel = parent.Rel
+
+	edges := make([][]int, len(writes))
+	indegree := make([]int, len(writes))
+	addEdge := func(from, to int) {
+		for _, existing := range edges[from] {
+			if existing == to {
+				return
+			}
+		}
+		edges[from] = append(edges[from], to)
+		indegree[to]++
 	}
-	return w.writeResetRel(ctx, node.Rel, parentRel, target, memsForNode(node, w.defaultMems))
+	for childIndex := range writes {
+		parentIndex, ok := byRel[writes[childIndex].parentRel]
+		if !ok {
+			continue
+		}
+		parent, child := writes[parentIndex], writes[childIndex]
+		childBeforeParent := parent.direction == WriteShrink && child.direction == WriteShrink ||
+			(!child.current.IsEmpty() && !child.current.IsSubsetOf(parent.target))
+		parentBeforeChild := parent.direction == WriteGrow && child.direction == WriteGrow ||
+			(!child.target.IsEmpty() && !child.target.IsSubsetOf(parent.current))
+		switch {
+		case childBeforeParent && parentBeforeChild:
+			return nil, fmt.Errorf(
+				"reset relation %q -> %q requires incompatible write ordering: parent current=%s target=%s child current=%s target=%s",
+				parent.rel, child.rel, parent.current.String(), parent.target.String(),
+				child.current.String(), child.target.String())
+		case childBeforeParent:
+			addEdge(childIndex, parentIndex)
+		case parentBeforeChild:
+			addEdge(parentIndex, childIndex)
+		}
+	}
+
+	less := func(left, right int) bool {
+		leftRank := resetDirectionRank(writes[left].direction)
+		rightRank := resetDirectionRank(writes[right].direction)
+		if leftRank != rightRank {
+			return leftRank < rightRank
+		}
+		leftDepth, rightDepth := childDepth(writes[left].rel), childDepth(writes[right].rel)
+		if writes[left].direction == WriteShrink && leftDepth != rightDepth {
+			return leftDepth > rightDepth
+		}
+		if writes[left].direction == WriteGrow && leftDepth != rightDepth {
+			return leftDepth < rightDepth
+		}
+		return writes[left].rel < writes[right].rel
+	}
+	ready := make([]int, 0, len(writes))
+	for i := range writes {
+		if indegree[i] == 0 {
+			ready = append(ready, i)
+		}
+	}
+	ordered := make([]resetWrite, 0, len(writes))
+	for len(ready) > 0 {
+		sort.Slice(ready, func(i, j int) bool { return less(ready[i], ready[j]) })
+		next := ready[0]
+		ready = ready[1:]
+		ordered = append(ordered, writes[next])
+		for _, dependent := range edges[next] {
+			indegree[dependent]--
+			if indegree[dependent] == 0 {
+				ready = append(ready, dependent)
+			}
+		}
+	}
+	if len(ordered) != len(writes) {
+		return nil, fmt.Errorf("reset write ordering contains incompatible parent/child dependencies")
+	}
+	return ordered, nil
+}
+
+func resetDirectionRank(direction WriteDirection) int {
+	switch direction {
+	case WriteGrow:
+		return 0
+	case WritePublish:
+		return 1
+	case WriteShrink:
+		return 2
+	default:
+		return 3
+	}
 }
 
 func (w resetCoordinatorWriter) writeResetRel(ctx context.Context, rel, parentRel string, target machine.CPUSet, mems string) error {
@@ -119,7 +302,7 @@ func (w resetCoordinatorWriter) writeResetRel(ctx context.Context, rel, parentRe
 		if w.res != nil {
 			w.res.Failed++
 		}
-		return err
+		return w.classifyReadError(err, rel, CgroupIdentity{})
 	}
 	if parentRel != "" {
 		parentBefore, err := driver.ReadEntry(ctx, parentRel)
@@ -127,14 +310,14 @@ func (w resetCoordinatorWriter) writeResetRel(ctx context.Context, rel, parentRe
 			if w.res != nil {
 				w.res.Failed++
 			}
-			return err
+			return w.classifyReadError(err, parentRel, CgroupIdentity{})
 		}
 		parentAfter, err := driver.ReadEntry(ctx, parentRel)
 		if err != nil {
 			if w.res != nil {
 				w.res.Failed++
 			}
-			return err
+			return w.classifyReadError(err, parentRel, parentBefore.Identity)
 		}
 		if parentAfter.Identity != parentBefore.Identity {
 			if w.res != nil {
@@ -145,6 +328,11 @@ func (w resetCoordinatorWriter) writeResetRel(ctx context.Context, rel, parentRe
 		}
 	}
 	if mems != "" {
+		if err := w.reservation.RecordWriteAttempt(
+			ctx, false, PhysicalWriteCost{MemsWrites: 1}); err != nil {
+			return err
+		}
+		w.res.recordForwardWriteAttempt()
 		if err := driver.WriteMems(ctx, rel, current.Identity, mems); err != nil {
 			if w.res != nil {
 				w.res.Failed++
@@ -152,6 +340,11 @@ func (w resetCoordinatorWriter) writeResetRel(ctx context.Context, rel, parentRe
 			return err
 		}
 	}
+	if err := w.reservation.RecordWriteAttempt(
+		ctx, false, PhysicalWriteCost{CPUSetWrites: 1}); err != nil {
+		return err
+	}
+	w.res.recordForwardWriteAttempt()
 	if err := driver.WriteCPUs(ctx, rel, current.Identity, target); err != nil {
 		if w.res != nil {
 			w.res.Failed++
@@ -164,13 +357,24 @@ func (w resetCoordinatorWriter) writeResetRel(ctx context.Context, rel, parentRe
 	return nil
 }
 
-func (w resetCoordinatorWriter) propagateResetTarget(
+func (w resetCoordinatorWriter) classifyReadError(err error, rel string, identity CgroupIdentity) error {
+	return &SnapshotError{
+		Operation: HierarchyOperationRead,
+		Rel:       rel,
+		Class:     w.driver.Classify(err, HierarchyOperationRead),
+		Identity:  identity,
+		Err:       err,
+	}
+}
+
+func (w resetCoordinatorWriter) collectPropagatedResetWrites(
 	ctx context.Context,
 	parentRel string,
 	parentTarget machine.CPUSet,
 	controlled map[string]*TopoNode,
 	expected map[string]machine.CPUSet,
 	boundaries map[string]struct{},
+	writes *[]resetWrite,
 	firstErr *error,
 	depth int,
 ) {
@@ -210,17 +414,11 @@ func (w resetCoordinatorWriter) propagateResetTarget(
 		if parentNode := controlled[parentRel]; parentNode != nil && parentNode.Role == TopoNodeRoleReclaimNUMABucket {
 			mems = memsForNode(parentNode, w.defaultMems)
 		}
-		if err := w.writeResetRel(ctx, childRel, parentRel, target, mems); err != nil {
-			if w.shouldSkipDynamicUnavailableController(err, hasExpected) {
-				w.markDynamicResetSkip()
-				continue
-			}
-			if *firstErr == nil {
-				*firstErr = err
-			}
-			continue
-		}
-		w.propagateResetTarget(ctx, childRel, target, controlled, expected, boundaries, firstErr, depth+1)
+		*writes = append(*writes, resetWrite{
+			rel: childRel, parentRel: parentRel, target: target.Clone(), mems: mems, expected: hasExpected,
+		})
+		w.collectPropagatedResetWrites(
+			ctx, childRel, target, controlled, expected, boundaries, writes, firstErr, depth+1)
 	}
 }
 

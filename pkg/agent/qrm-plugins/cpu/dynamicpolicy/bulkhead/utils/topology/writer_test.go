@@ -75,6 +75,28 @@ type resetConvergenceStateDriver struct {
 	capabilities HierarchyCapabilities
 }
 
+type expireAdjustmentAfterMemsDriver struct {
+	HierarchyDriver
+	adjustmentDone <-chan struct{}
+	expired        bool
+}
+
+func (d *expireAdjustmentAfterMemsDriver) WriteMems(
+	ctx context.Context,
+	rel string,
+	expected CgroupIdentity,
+	mems string,
+) error {
+	if err := d.HierarchyDriver.WriteMems(ctx, rel, expected, mems); err != nil {
+		return err
+	}
+	if !d.expired {
+		d.expired = true
+		<-d.adjustmentDone
+	}
+	return nil
+}
+
 func (d *resetConvergenceStateDriver) ReadEntry(_ context.Context, rel string) (EntryState, error) {
 	state, ok := d.states[rel]
 	if !ok {
@@ -365,6 +387,141 @@ func TestResetWriterRejectsControlledNodeWithoutCpusetController(t *testing.T) {
 	}
 }
 
+func TestResetWriterOrdersDynamicSubtreeFromCurrentToTargetDirection(t *testing.T) {
+	const (
+		bucket    = "numa-0"
+		pod       = bucket + "/pod-a"
+		container = pod + "/container-a"
+	)
+	tests := []struct {
+		name          string
+		currentBucket string
+		currentPod    string
+		currentCtr    string
+		targetBucket  string
+		targetPod     string
+		targetCtr     string
+		wantOrder     []string
+	}{
+		{
+			name:          "shrink is full postorder",
+			currentBucket: "0-3",
+			currentPod:    "0-3",
+			currentCtr:    "0-3",
+			targetBucket:  "0-1",
+			targetPod:     "0-1",
+			targetCtr:     "0-1",
+			wantOrder:     []string{container, pod, bucket},
+		},
+		{
+			name:          "grow is preorder",
+			currentBucket: "0",
+			currentPod:    "0",
+			currentCtr:    "0",
+			targetBucket:  "0-2",
+			targetPod:     "0-1",
+			targetCtr:     "0-1",
+			wantOrder:     []string{bucket, pod, container},
+		},
+		{
+			name:          "mixed relations use deterministic dependencies",
+			currentBucket: "0-2",
+			currentPod:    "0-2",
+			currentCtr:    "0-2",
+			targetBucket:  "0-3",
+			targetPod:     "0-1",
+			targetCtr:     "0-1",
+			wantOrder:     []string{bucket, container, pod},
+		},
+		{
+			name:          "shrinking parent and growing descendants stay deterministic",
+			currentBucket: "0-2",
+			currentPod:    "0",
+			currentCtr:    "0",
+			targetBucket:  "0-1",
+			targetPod:     "0-1",
+			targetCtr:     "0-1",
+			wantOrder:     []string{pod, container, bucket},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dag, err := BuildDAG([]NodeSpec{{
+				Rel: bucket, Role: TopoNodeRoleReclaimNUMABucket,
+				Domain: DomainReclaim, CPUs: machine.MustParse(tt.targetBucket),
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			driver := newFakeHierarchyDriver()
+			driver.allowUnwitnessedExpansion = true
+			driver.add(bucket, CgroupIdentity{Device: 1, Inode: 1}, tt.currentBucket, "0")
+			driver.add(pod, CgroupIdentity{Device: 1, Inode: 2}, tt.currentPod, "0")
+			driver.add(container, CgroupIdentity{Device: 1, Inode: 3}, tt.currentCtr, "0")
+
+			writer := newResetCoordinatorWriter(
+				driver, NewBudgetTracker(ConvergenceBudget{}), "", &ConvergenceResult{})
+			err = writer.execute(context.Background(), dag, map[string]machine.CPUSet{
+				bucket: machine.MustParse(tt.targetBucket),
+			}, false, map[string]machine.CPUSet{
+				pod:       machine.MustParse(tt.targetPod),
+				container: machine.MustParse(tt.targetCtr),
+			})
+			if err != nil {
+				t.Fatalf("reset writer error = %v", err)
+			}
+			got := make([]string, 0, len(driver.writes))
+			for _, write := range driver.writes {
+				got = append(got, write.rel)
+			}
+			if !reflect.DeepEqual(got, tt.wantOrder) {
+				t.Fatalf("write order = %v, want %v", got, tt.wantOrder)
+			}
+			seen := make(map[string]struct{}, len(got))
+			for _, rel := range got {
+				if _, ok := seen[rel]; ok {
+					t.Fatalf("reset writer retried rel %q: %v", rel, got)
+				}
+				seen[rel] = struct{}{}
+			}
+		})
+	}
+}
+
+func TestExecutionWithRollbackErrorPreservesExecutionAndReservationCauses(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	budget := NewAdjustmentBudget(ctx, ConvergenceBudget{MaxPlanOperations: 1})
+	reservation, err := budget.ReserveExecution(ExecutionReservationCost{
+		Rollback: PhysicalWriteCost{CPUSetWrites: 1},
+	})
+	if err != nil {
+		t.Fatalf("ReserveExecution() error = %v", err)
+	}
+	cancel()
+	reservationErr := reservation.RecordWriteAttempt(
+		ctx, true, PhysicalWriteCost{CPUSetWrites: 1})
+	stale := &PlanStaleError{Rel: "reclaim/numa-0", Resource: "write"}
+
+	err = executionWithRollbackError(stale, reservationErr)
+
+	if !errors.Is(err, ErrCoordinatorPlanStale) {
+		t.Fatalf("combined error = %v, want execution stale cause", err)
+	}
+	if !errors.Is(err, ErrAdjustmentDeadlineExceeded) ||
+		!errors.Is(err, context.Canceled) {
+		t.Fatalf("combined error = %v, want rollback reservation deadline/context causes", err)
+	}
+	var gotStale *PlanStaleError
+	if !errors.As(err, &gotStale) || gotStale != stale {
+		t.Fatalf("combined error stale = %#v, want %#v", gotStale, stale)
+	}
+	var budgetErr *AdjustmentBudgetExceededError
+	if !errors.As(err, &budgetErr) {
+		t.Fatalf("combined error = %v, want typed rollback reservation error", err)
+	}
+}
+
 func TestVerifyResetConvergenceKeepsEffectiveCPUsForNonEmptyTarget(t *testing.T) {
 	dag, err := BuildDAG([]NodeSpec{{
 		Rel: "primary", Domain: DomainPrimary, Role: TopoNodeRolePrimary,
@@ -439,6 +596,95 @@ func TestSafeWriterV2EmptyConfiguredCPUWriteRecordsSuccessfulJournal(t *testing.
 	}
 	if !roundOutcomeMadeNetProgress(RoundOutcome{Journal: result.Journal}) {
 		t.Fatal("verified empty configured CPU write must count as progress")
+	}
+}
+
+func TestSafeWriterAdjustmentReservationFailurePerformsNoWrites(t *testing.T) {
+	identity := CgroupIdentity{Device: 1, Inode: 1}
+	driver := newFakeHierarchyDriver()
+	driver.add("primary", identity, "0-1", "0-1")
+	plan := PhasePlan{
+		ConvergenceID: "adjustment-reservation-failure",
+		Kind:          PhaseDrain,
+		Capabilities:  driver.Capabilities(),
+		Operations: []PlanOperation{{
+			Rel:              "primary",
+			ExpectedIdentity: identity,
+			ExpectedCurrent:  CPUSetTarget{CPUs: machine.MustParse("0-1"), Mems: "0-1"},
+			Target:           CPUSetTarget{CPUs: machine.NewCPUSet(0), Mems: "0"},
+			Direction:        WriteShrink,
+			OwnsMems:         true,
+			WriteMems:        true,
+		}},
+	}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	plan.Operations[0].PlanID = plan.PlanID
+	adjustmentBudget := NewAdjustmentBudget(context.Background(), ConvergenceBudget{
+		MaxPlanOperations: 1,
+	})
+	adjustmentBudget.maxWrites = 3
+
+	err := newSafeCPUSetWriter(driver, NewBudgetTracker(ConvergenceBudget{}), &ConvergenceResult{}).
+		withAdjustmentBudget(adjustmentBudget).
+		execute(context.Background(), plan)
+
+	if !errors.Is(err, ErrAdjustmentWriteBudgetExceeded) {
+		t.Fatalf("execute() error = %v, want %v", err, ErrAdjustmentWriteBudgetExceeded)
+	}
+	if len(driver.writes) != 0 {
+		t.Fatalf("reservation failure performed writes: %#v", driver.writes)
+	}
+}
+
+func TestSafeWriterRollsBackFirstWriteAfterAdjustmentDeadline(t *testing.T) {
+	identity := CgroupIdentity{Device: 1, Inode: 1}
+	base := newFakeHierarchyDriver()
+	base.add("primary", identity, "0-1", "0-1")
+	initial := base.snapshot()
+	adjustmentCtx, cancelAdjustment := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelAdjustment()
+	driver := &expireAdjustmentAfterMemsDriver{
+		HierarchyDriver: base,
+		adjustmentDone:  adjustmentCtx.Done(),
+	}
+	plan := PhasePlan{
+		ConvergenceID: "deadline-after-first-write",
+		Kind:          PhaseDrain,
+		Capabilities:  base.Capabilities(),
+		Operations: []PlanOperation{{
+			Rel:              "primary",
+			ExpectedIdentity: identity,
+			ExpectedCurrent:  CPUSetTarget{CPUs: machine.MustParse("0-1"), Mems: "0-1"},
+			Target:           CPUSetTarget{CPUs: machine.NewCPUSet(0), Mems: "0"},
+			Direction:        WriteShrink,
+			OwnsMems:         true,
+			WriteMems:        true,
+		}},
+	}
+	plan.PlanID = canonicalExecutionPlanID(plan)
+	plan.Operations[0].PlanID = plan.PlanID
+	adjustmentBudget := NewAdjustmentBudget(adjustmentCtx, ConvergenceBudget{
+		MaxPlanOperations: 1,
+	})
+	result := &ConvergenceResult{}
+
+	err := newSafeCPUSetWriter(driver, NewBudgetTracker(ConvergenceBudget{}), result).
+		withAdjustmentBudget(adjustmentBudget).
+		execute(adjustmentCtx, plan)
+
+	if !errors.Is(err, ErrAdjustmentDeadlineExceeded) ||
+		!errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("execute() error = %v, want original adjustment deadline", err)
+	}
+	if got := base.snapshot(); !reflect.DeepEqual(got, initial) {
+		t.Fatalf("rollback state = %#v, want initial %#v", got, initial)
+	}
+	if got := adjustmentBudget.CumulativeWrites(); got != 2 {
+		t.Fatalf("cumulative writes = %d, want first write plus rollback", got)
+	}
+	if result.forwardWriteAttempts != 1 || result.rollbackWriteAttempts != 1 {
+		t.Fatalf("write attempts = forward:%d rollback:%d, want 1/1",
+			result.forwardWriteAttempts, result.rollbackWriteAttempts)
 	}
 }
 
@@ -1868,7 +2114,7 @@ func TestTopologyCoordinatorConvergeFailsClosedOnSnapshotDepthLimit(t *testing.T
 	}
 }
 
-func TestTopologyCoordinatorConvergeReportsNotConvergedWhenObservedTargetDiffers(t *testing.T) {
+func TestTopologyCoordinatorConvergeReturnsObservedTargetDriftToAdjustmentOwner(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{
@@ -1895,8 +2141,8 @@ func TestTopologyCoordinatorConvergeReportsNotConvergedWhenObservedTargetDiffers
 		},
 		Budget: ConvergenceBudget{MaxRounds: 3},
 	})
-	if !errors.Is(err, ErrRoundBudgetExceeded) {
-		t.Fatalf("TopologyCoordinatorConverge error = %T %v, want round budget exhaustion; result=%+v writes=%#v",
+	if !errors.Is(err, ErrCoordinatorPlanStale) {
+		t.Fatalf("TopologyCoordinatorConverge error = %T %v, want owner-visible stale; result=%+v writes=%#v",
 			err, err, res, cg.writes)
 	}
 	if res.Converged {
@@ -1905,12 +2151,16 @@ func TestTopologyCoordinatorConvergeReportsNotConvergedWhenObservedTargetDiffers
 	if res.State != ConvergenceStateNonConverged {
 		t.Fatalf("State = %s, want non-converged; result=%+v", res.State, res)
 	}
-	if got := len(res.Rounds); got != 3 {
-		t.Fatalf("rounds = %d, want all three budgeted stale rounds; result=%+v", got, res)
+	if got := len(res.Rounds); got != 1 {
+		t.Fatalf("rounds = %d, want stale not to consume fixed-point rounds; result=%+v", got, res)
+	}
+	if res.ReplanDisposition != ReplanNotAllowed ||
+		res.FinalSnapshotCurrent || res.FinalSnapshot != nil {
+		t.Fatalf("result=%+v, want no cross-attempt authority without an adjustment budget", res)
 	}
 }
 
-func TestTopologyCoordinatorConvergeReplansAfterCPUWriteEBUSY(t *testing.T) {
+func TestTopologyCoordinatorConvergeReturnsCPUWriteStaleToAdjustmentOwner(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{
@@ -1935,19 +2185,26 @@ func TestTopologyCoordinatorConvergeReplansAfterCPUWriteEBUSY(t *testing.T) {
 
 	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG: dag, Cgroup: cg, Mems: "0", CPUDetails: machine.CPUDetails{0: {}, 1: {}},
+		AdjustmentBudget: NewAdjustmentBudget(context.Background(), ConvergenceBudget{
+			MaxPlanOperations: 8,
+		}),
 	})
-	if err != nil {
-		t.Fatalf("Converge after transient EBUSY: %v; result=%+v", err, res)
+	if !errors.Is(err, ErrCoordinatorPlanStale) {
+		t.Fatalf("Converge error=%v, want stale returned to adjustment owner; result=%+v", err, res)
 	}
-	if !res.Converged || attempts != 2 {
-		t.Fatalf("result=%+v attempts=%d, want convergence after one stale replan", res, attempts)
+	if res.Converged || attempts != 1 {
+		t.Fatalf("result=%+v attempts=%d, want one coordinator compile with no internal replan", res, attempts)
 	}
-	if got := len(res.Rounds); got < 2 || res.Rounds[0].Status != RoundStatusStale {
-		t.Fatalf("rounds=%+v, want first EBUSY round stale followed by recovery", res.Rounds)
+	if got := len(res.Rounds); got != 1 || res.Rounds[0].Status != RoundStatusStale {
+		t.Fatalf("rounds=%+v, want exactly one stale round", res.Rounds)
+	}
+	if res.ReplanDisposition != ReplanSafeFromVerifiedFinalState ||
+		!res.FinalSnapshotCurrent || res.FinalSnapshot == nil {
+		t.Fatalf("result=%+v, want verified-current physical snapshot disposition", res)
 	}
 }
 
-func TestTopologyCoordinatorConvergePersistentCPUWriteEBUSYUsesRoundBudget(t *testing.T) {
+func TestTopologyCoordinatorConvergePersistentCPUWriteEBUSYDoesNotConsumeFixedPointRounds(t *testing.T) {
 	t.Parallel()
 
 	dag, err := BuildDAG([]NodeSpec{{
@@ -1970,11 +2227,15 @@ func TestTopologyCoordinatorConvergePersistentCPUWriteEBUSYUsesRoundBudget(t *te
 		DAG: dag, Cgroup: cg, Mems: "0", CPUDetails: machine.CPUDetails{0: {}, 1: {}},
 		Budget: ConvergenceBudget{MaxRounds: 3},
 	})
-	if !errors.Is(err, ErrRoundBudgetExceeded) {
-		t.Fatalf("Converge error=%T %v, want round budget exhaustion; result=%+v", err, err, res)
+	if !errors.Is(err, ErrCoordinatorPlanStale) {
+		t.Fatalf("Converge error=%T %v, want owner-visible stale; result=%+v", err, err, res)
 	}
-	if res.State != ConvergenceStateNonConverged || attempts != 3 || len(res.Rounds) != 3 {
-		t.Fatalf("result=%+v attempts=%d, want retries constrained by the three-round budget", res, attempts)
+	if res.State != ConvergenceStateNonConverged || attempts != 1 || len(res.Rounds) != 1 {
+		t.Fatalf("result=%+v attempts=%d, want one compile independent of fixed-point round budget", res, attempts)
+	}
+	if res.ReplanDisposition != ReplanNotAllowed ||
+		res.FinalSnapshotCurrent || res.FinalSnapshot != nil {
+		t.Fatalf("result=%+v, want no cross-attempt authority without an adjustment budget", res)
 	}
 }
 

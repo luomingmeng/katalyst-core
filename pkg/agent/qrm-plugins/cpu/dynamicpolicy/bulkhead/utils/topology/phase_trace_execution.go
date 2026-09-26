@@ -28,7 +28,11 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
-const frozenTraceRecoveryTimeout = time.Second
+const (
+	adjustmentRecoveryBase     = 250 * time.Millisecond
+	adjustmentRecoveryPerWrite = 10 * time.Millisecond
+	adjustmentRecoveryCap      = 5 * time.Second
+)
 
 var ErrFrozenTransferUnauthorized = errors.New("frozen transfer grow lacks invocation-local source release")
 
@@ -145,8 +149,6 @@ func (e *frozenInitialSnapshotDriftError) Unwrap() error {
 
 func (e *frozenInitialSnapshotDriftError) ReplanRequired() bool { return true }
 
-func (e *frozenInitialSnapshotDriftError) FrozenInitialSnapshotDrift() bool { return true }
-
 func newFrozenInitialSnapshotDriftError(
 	current *CompleteSnapshot,
 	expected *CompleteSnapshot,
@@ -251,10 +253,6 @@ func (e *frozenSnapshotDriftAfterVerifiedRollbackError) Unwrap() error {
 		return nil
 	}
 	return e.err
-}
-
-func (*frozenSnapshotDriftAfterVerifiedRollbackError) FrozenSnapshotDriftReplanSafe() bool {
-	return true
 }
 
 // preflightValidatedTraceOperations owns the no-write projection check for the
@@ -812,10 +810,32 @@ func (w safeCPSetWriter) physicalWriteCount() int {
 	return *w.physicalWriteAttempts
 }
 
-func (w safeCPSetWriter) recordPhysicalWriteAttempt() {
+func (w safeCPSetWriter) recordForwardPhysicalWriteAttempt(
+	ctx context.Context,
+	cost PhysicalWriteCost,
+) error {
+	if err := w.adjustmentReservation.RecordWriteAttempt(ctx, false, cost); err != nil {
+		return err
+	}
 	if w.physicalWriteAttempts != nil {
 		*w.physicalWriteAttempts++
 	}
+	w.res.recordForwardWriteAttempt()
+	return nil
+}
+
+func (w safeCPSetWriter) recordRollbackPhysicalWriteAttempt(
+	ctx context.Context,
+	cost PhysicalWriteCost,
+) error {
+	if err := w.adjustmentReservation.RecordWriteAttempt(ctx, true, cost); err != nil {
+		return err
+	}
+	if w.physicalWriteAttempts != nil {
+		*w.physicalWriteAttempts++
+	}
+	w.res.recordRollbackWriteAttempt()
+	return nil
 }
 
 func frozenChildrenFromSnapshot(
@@ -881,6 +901,7 @@ func (r *coordinatorRound) executeValidatedFrozenTrace(
 	validated *validatedPhaseTrace,
 	ticket *ExecutionReservationTicket,
 	res *ConvergenceResult,
+	adjustmentReservation *AdjustmentWriteReservation,
 	finalizers ...frozenTraceFinalizer,
 ) (RoundOutcome, error) {
 	outcome := RoundOutcome{Status: RoundStatusBlocked}
@@ -907,13 +928,17 @@ func (r *coordinatorRound) executeValidatedFrozenTrace(
 	defer ticket.ReleaseUnused()
 
 	writer := newSafeCPUSetWriter(r.driver, r.budget, res)
+	writer.adjustmentBudget = r.adjustmentBudget
+	writer.adjustmentReservation = adjustmentReservation
 	writer.dormantProofs = r.dormantProofs
 	preflight, err := writer.preflightValidatedTraceOperations(ctx, validated)
 	if err != nil {
+		authorizePreWriteStaleReplan(res, err)
 		return outcome, err
 	}
 	writer.driver = NewBudgetedHierarchyDriver(r.driver, r.budget)
 	if err := writer.revalidateDormantProofs(ctx, ""); err != nil {
+		authorizePreWriteStaleReplan(res, err)
 		return outcome, err
 	}
 
@@ -964,7 +989,7 @@ func (r *coordinatorRound) executeValidatedFrozenTrace(
 			ctx, err, stack, ticket, res, journalStart, appliedStart)
 	}
 
-	res.FinalSnapshot = finalization.snapshot
+	res.FinalSnapshot = CloneCompleteSnapshot(finalization.snapshot)
 	res.FinalSnapshotCurrent = true
 	res.ConvergenceReport = finalization.evaluation.Report
 	res.ParentSafe = frozen.Objective == ConvergenceObjectiveParentSafe &&
@@ -978,7 +1003,7 @@ func (r *coordinatorRound) executeValidatedFrozenTrace(
 		res.State = ConvergenceStateParentSafeLeafDeferred
 		outcome.Status = RoundStatusProgress
 	}
-	outcome.Snapshot = finalization.snapshot
+	outcome.Snapshot = CloneCompleteSnapshot(finalization.snapshot)
 	outcome.Journal = append(
 		outcome.Journal, res.Journal[journalStart:]...)
 	return outcome, nil
@@ -989,6 +1014,7 @@ func (r *coordinatorRound) proveFrozenTraceFinalState(
 	frozen *CompiledPhaseTrace,
 ) (frozenTraceFinalization, error) {
 	var finalization frozenTraceFinalization
+	observationEpoch := r.adjustmentBudget.BeginSnapshotObservation()
 	boundaryEvaluation, err := EvaluateFrozenBoundary(
 		ctx,
 		r.driver,
@@ -1036,6 +1062,7 @@ func (r *coordinatorRound) proveFrozenTraceFinalState(
 	if err := ctx.Err(); err != nil {
 		return finalization, err
 	}
+	r.adjustmentBudget.ObserveCurrentSnapshot(observationEpoch)
 	finalization.snapshot = fresh
 	finalization.evaluation = freshEvaluation
 	return finalization, nil
@@ -1075,7 +1102,9 @@ func (w safeCPSetWriter) applyFrozenOperation(
 		if err := ticket.consumeForward(PhysicalWriteCost{MemsWrites: 1}); err != nil {
 			return AppliedPlanOperation{}, err
 		}
-		w.recordPhysicalWriteAttempt()
+		if err := w.recordForwardPhysicalWriteAttempt(ctx, PhysicalWriteCost{MemsWrites: 1}); err != nil {
+			return AppliedPlanOperation{}, err
+		}
 		if err := w.driver.WriteMems(
 			ctx, operation.Rel, operation.ExpectedIdentity, operation.Target.Mems,
 		); err != nil {
@@ -1097,7 +1126,9 @@ func (w safeCPSetWriter) applyFrozenOperation(
 		if err := ticket.consumeForward(PhysicalWriteCost{CPUSetWrites: 1}); err != nil {
 			return AppliedPlanOperation{}, err
 		}
-		w.recordPhysicalWriteAttempt()
+		if err := w.recordForwardPhysicalWriteAttempt(ctx, PhysicalWriteCost{CPUSetWrites: 1}); err != nil {
+			return AppliedPlanOperation{}, err
+		}
 		if err := w.driver.WriteCPUs(
 			ctx, operation.Rel, operation.ExpectedIdentity, operation.Target.CPUs,
 		); err != nil {
@@ -1441,13 +1472,32 @@ func (w safeCPSetWriter) failFrozenTrace(
 	res.FinalSnapshotCurrent = false
 	res.DeferredLeafCount = 0
 	res.DeferredCPUCount = 0
+	res.ReplanDisposition = ReplanNotAllowed
 
-	recoveryCtx, cancelRecovery := newFrozenTraceRecoveryContext()
+	stale := phaseTraceStale(executionErr)
+	noPhysicalWrites := !res.hasPhysicalWriteEvidence() &&
+		(stack == nil || len(stack.writes) == 0)
+	if stale && noPhysicalWrites {
+		res.ReplanDisposition = ReplanSafeNoPhysicalWrites
+	}
+
+	rollbackWrites := 0
+	if stack != nil {
+		rollbackWrites = len(stack.writes)
+	}
+	recoveryCtx, cancelRecovery, recoveryErr := newAdjustmentRecoveryContext(rollbackWrites)
+	if recoveryErr != nil {
+		w.rebuildPhysicalImpactEvidence(stack, res, journalStart, appliedStart)
+		return newExecutionRollbackError(executionErr, recoveryErr)
+	}
 	defer cancelRecovery()
 	rollbackErr := w.rollbackTracePrefix(recoveryCtx, stack, ticket)
 	if rollbackErr == nil {
 		res.Journal = res.Journal[:journalStart]
 		res.Applied = appliedStart
+		if stale && !noPhysicalWrites && rollbackVerificationComplete(stack) {
+			res.ReplanDisposition = ReplanSafeAfterVerifiedRollback
+		}
 		var finalDrift interface{ FrozenFinalSnapshotDrift() bool }
 		if errors.As(executionErr, &finalDrift) && finalDrift.FrozenFinalSnapshotDrift() {
 			return &frozenSnapshotDriftAfterVerifiedRollbackError{err: executionErr}
@@ -1458,12 +1508,75 @@ func (w safeCPSetWriter) failFrozenTrace(
 	return newExecutionRollbackError(executionErr, rollbackErr)
 }
 
-// newFrozenTraceRecoveryContext detaches rollback from forward cancellation and
-// deadlines. The recovery window starts now and remains bounded by its short
-// internal cap; rollback work is bounded separately by the ticket's reserved
-// write and hierarchy-I/O quotas.
-func newFrozenTraceRecoveryContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), frozenTraceRecoveryTimeout)
+func authorizePreWriteStaleReplan(res *ConvergenceResult, err error) {
+	if res == nil {
+		return
+	}
+	res.ReplanDisposition = ReplanNotAllowed
+	if !res.hasPhysicalWriteEvidence() && phaseTraceStale(err) {
+		res.ReplanDisposition = ReplanSafeNoPhysicalWrites
+	}
+}
+
+func phaseTraceStale(err error) bool {
+	var stale *PlanStaleError
+	return errors.As(err, &stale)
+}
+
+func rollbackVerificationComplete(stack *traceMutationStack) bool {
+	rels := rollbackVerificationRels(stack)
+	if len(rels) == 0 || len(stack.rollbackObservations) != len(rels) {
+		return false
+	}
+	for _, rel := range rels {
+		observation, ok := stack.rollbackObservations[rel]
+		if !ok || observation.err != nil {
+			return false
+		}
+		if !observation.retired && observation.current.Identity == (CgroupIdentity{}) {
+			return false
+		}
+	}
+	return true
+}
+
+type adjustmentRecoveryContextKey struct{}
+
+func adjustmentRecoveryDuration(rollbackWrites int) (time.Duration, error) {
+	if rollbackWrites < 0 {
+		return 0, ErrInvalidAdjustmentWriteCount
+	}
+	maxScaledWrites := int((adjustmentRecoveryCap - adjustmentRecoveryBase) /
+		adjustmentRecoveryPerWrite)
+	if rollbackWrites >= maxScaledWrites {
+		return adjustmentRecoveryCap, nil
+	}
+	return adjustmentRecoveryBase +
+		time.Duration(rollbackWrites)*adjustmentRecoveryPerWrite, nil
+}
+
+// newAdjustmentRecoveryContext detaches rollback from forward cancellation and
+// deadlines. Its checked, hard-capped window is derived from the actual
+// rollback prefix; write and hierarchy-I/O authority remain independently
+// bounded by the reservation.
+func newAdjustmentRecoveryContext(
+	rollbackWrites int,
+) (context.Context, context.CancelFunc, error) {
+	timeout, err := adjustmentRecoveryDuration(rollbackWrites)
+	if err != nil {
+		return nil, nil, err
+	}
+	recoveryRoot := context.WithValue(
+		context.Background(), adjustmentRecoveryContextKey{}, struct{}{})
+	ctx, cancel := context.WithTimeout(recoveryRoot, timeout)
+	return ctx, cancel, nil
+}
+
+func isAdjustmentRecoveryContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	return ctx.Value(adjustmentRecoveryContextKey{}) != nil
 }
 
 // rollbackTracePrefix restores the recorded write prefix in reverse order under
@@ -1536,7 +1649,10 @@ func (w safeCPSetWriter) rollbackTracePrefix(
 					fmt.Errorf("parse rollback cpuset.cpus for %q: %w", write.Rel, err))
 				continue
 			}
-			w.recordPhysicalWriteAttempt()
+			if err := w.recordRollbackPhysicalWriteAttempt(ctx, PhysicalWriteCost{CPUSetWrites: 1}); err != nil {
+				rollbackErrors = append(rollbackErrors, err)
+				continue
+			}
 			if err := rollbackDriver.WriteCPUs(ctx, write.Rel, write.Identity, before); err != nil {
 				retired, retirementErr := confirmRollbackRetirement(
 					ctx, rollbackDriver, stack, write, err)
@@ -1554,7 +1670,10 @@ func (w safeCPSetWriter) rollbackTracePrefix(
 				rollbackErrors = append(rollbackErrors, err)
 				continue
 			}
-			w.recordPhysicalWriteAttempt()
+			if err := w.recordRollbackPhysicalWriteAttempt(ctx, PhysicalWriteCost{MemsWrites: 1}); err != nil {
+				rollbackErrors = append(rollbackErrors, err)
+				continue
+			}
 			if err := rollbackDriver.WriteMems(ctx, write.Rel, write.Identity, write.Before); err != nil {
 				retired, retirementErr := confirmRollbackRetirement(
 					ctx, rollbackDriver, stack, write, err)
@@ -1572,7 +1691,12 @@ func (w safeCPSetWriter) rollbackTracePrefix(
 				fmt.Errorf("unsupported rollback resource %q for %q", write.Resource, write.Rel))
 		}
 	}
-	rollbackErrors = append(rollbackErrors, w.verifyRolledBackPrefix(ctx, rollbackDriver, stack)...)
+	observationEpoch := w.adjustmentBudget.BeginSnapshotObservation()
+	verificationErrors := w.verifyRolledBackPrefix(ctx, rollbackDriver, stack)
+	rollbackErrors = append(rollbackErrors, verificationErrors...)
+	if len(rollbackErrors) == 0 {
+		w.adjustmentBudget.ObserveCurrentSnapshot(observationEpoch)
+	}
 	return utilerrors.NewAggregate(rollbackErrors)
 }
 

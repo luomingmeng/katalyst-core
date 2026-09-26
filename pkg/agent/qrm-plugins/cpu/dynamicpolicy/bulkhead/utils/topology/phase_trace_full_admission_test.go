@@ -42,6 +42,10 @@ func TestExecuteValidatedFrozenTraceFullAdmission(t *testing.T) {
 		initial := live.snapshot()
 		ctx, cancel := context.WithTimeout(context.Background(), fullAdmissionDeadline)
 		defer cancel()
+		adjustmentBudget := NewAdjustmentBudget(ctx, ConvergenceBudget{
+			MaxPlanOperations: trace.Cost.Total(),
+		})
+		fixture.round.adjustmentBudget = adjustmentBudget
 		res := &ConvergenceResult{}
 		finalPublishes, parentSafePublishes := 0, 0
 		publishFinal := func(snapshot *CompleteSnapshot) error {
@@ -61,6 +65,7 @@ func TestExecuteValidatedFrozenTraceFullAdmission(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, ctx.Err(), "full admission must finish before its deadline")
 		require.Equal(t, fullAdmissionWriteCount, live.PhysicalWriteCount())
+		require.Equal(t, fullAdmissionWriteCount, adjustmentBudget.CumulativeWrites())
 		require.Equal(t, fullAdmissionWriteCount, res.Applied)
 		require.Len(t, res.Journal, fullAdmissionWriteCount)
 		require.Equal(t, 1, finalPublishes)
@@ -85,6 +90,10 @@ func TestExecuteValidatedFrozenTraceFullAdmission(t *testing.T) {
 		fixture.round.driver = driver
 		ctx, cancel := context.WithTimeout(context.Background(), fullAdmissionDeadline)
 		defer cancel()
+		adjustmentBudget := NewAdjustmentBudget(ctx, ConvergenceBudget{
+			MaxPlanOperations: trace.Cost.Total(),
+		})
+		fixture.round.adjustmentBudget = adjustmentBudget
 		res := &ConvergenceResult{}
 		finalPublishes, parentSafePublishes := 0, 0
 		publishFinal := func(*CompleteSnapshot) error {
@@ -105,9 +114,14 @@ func TestExecuteValidatedFrozenTraceFullAdmission(t *testing.T) {
 		require.Equal(t, fullAdmissionWriteCount, driver.forwardSuccess,
 			"final-proof failure must be injected after every forward write")
 		require.Equal(t, fullAdmissionWriteCount*2, live.PhysicalWriteCount())
+		require.Equal(t, fullAdmissionWriteCount*2, adjustmentBudget.CumulativeWrites(),
+			"real adjustment budget must account every forward and inverse write")
 		require.Len(t, live.writes[fullAdmissionWriteCount:], fullAdmissionWriteCount,
 			"rollback must perform exactly one inverse write per forward write")
 		requireExactFullAdmissionInverseWrites(t, live.writes, initial)
+		t.Logf("full admission rollback complete: forward=%d inverse=%d cumulative=%d",
+			driver.forwardSuccess, len(live.writes[fullAdmissionWriteCount:]),
+			adjustmentBudget.CumulativeWrites())
 		require.Equal(t, initial, live.snapshot())
 		require.Zero(t, finalPublishes)
 		require.Zero(t, parentSafePublishes)

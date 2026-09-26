@@ -27,6 +27,7 @@ import (
 
 	cgroupclient "github.com/kubewharf/katalyst-core/pkg/util/cgroup/client"
 	cgcommon "github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
+	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -59,7 +60,9 @@ func (e *PlanStaleError) Error() string {
 	return message
 }
 
-func (e *PlanStaleError) Unwrap() error { return ErrCoordinatorPlanStale }
+func (e *PlanStaleError) Unwrap() error { return e.Err }
+
+func (e *PlanStaleError) Is(target error) bool { return target == ErrCoordinatorPlanStale }
 
 func (e *PlanStaleError) ReplanRequired() bool { return true }
 
@@ -219,10 +222,31 @@ type ConvergenceResult struct {
 	FinalSnapshot     *CompleteSnapshot
 	// FinalSnapshotCurrent is true only when FinalSnapshot is the snapshot used
 	// for the successful convergence decision and no later hierarchy write ran.
-	FinalSnapshotCurrent bool
-	ParentSafe           bool
-	DeferredLeafCount    int
-	DeferredCPUCount     int
+	FinalSnapshotCurrent  bool
+	ParentSafe            bool
+	DeferredLeafCount     int
+	DeferredCPUCount      int
+	ReplanDisposition     ReplanDisposition
+	Published             bool
+	forwardWriteAttempts  int
+	rollbackWriteAttempts int
+	publicationAttempted  bool
+}
+
+func (r *ConvergenceResult) recordForwardWriteAttempt() {
+	if r != nil {
+		r.forwardWriteAttempts = saturatingAdd(r.forwardWriteAttempts, 1)
+	}
+}
+
+func (r *ConvergenceResult) recordRollbackWriteAttempt() {
+	if r != nil {
+		r.rollbackWriteAttempts = saturatingAdd(r.rollbackWriteAttempts, 1)
+	}
+}
+
+func (r ConvergenceResult) hasPhysicalWriteEvidence() bool {
+	return r.forwardWriteAttempts != 0 || r.rollbackWriteAttempts != 0
 }
 
 func (r ConvergenceResult) FirstBlocker() string {
@@ -246,8 +270,12 @@ type CoordinatorInput struct {
 	Mems   string
 	Mode   ModeGuard
 
-	CPUDetails          machine.CPUDetails
-	ReservedCPUSet      machine.CPUSet
+	CPUDetails     machine.CPUDetails
+	ReservedCPUSet machine.CPUSet
+	// InitialSnapshot may seed a recompile only when the preceding coordinator
+	// returned ReplanSafeFromVerifiedFinalState. The caller passes a deep copy
+	// of that complete, current physical snapshot.
+	InitialSnapshot     *CompleteSnapshot
 	ExpectedCPUSetByRel map[string]machine.CPUSet
 	RequiredCPUSetByRel map[string]machine.CPUSet
 	// PendingProtections is the canonical owner of pending allocations. The
@@ -269,8 +297,11 @@ type CoordinatorInput struct {
 	DeferredCPUSetByRel map[string]machine.CPUSet
 	AdmissionBudget     *AdmissionConvergenceBudget
 
-	Budget         ConvergenceBudget
-	DrainSelection DrainSelectionPolicy
+	Budget ConvergenceBudget
+	// AdjustmentBudget is shared by every coordinator invocation belonging to
+	// one plugin adjustment and reserves physical forward plus rollback writes.
+	AdjustmentBudget *AdjustmentBudget
+	DrainSelection   DrainSelectionPolicy
 	// PublishFinalSnapshot runs while both the coordinator mode gate and the
 	// caller's manager mutex are still held. The coordinator invokes it only
 	// after a fresh complete snapshot has the same publish-relevant controlled
@@ -284,7 +315,10 @@ type CoordinatorInput struct {
 type TopologyCoordinator struct{}
 
 func (c TopologyCoordinator) Converge(ctx context.Context, in CoordinatorInput) (ConvergenceResult, error) {
-	res := ConvergenceResult{}
+	res := ConvergenceResult{
+		ReplanDisposition: ReplanNotAllowed,
+		Published:         false,
+	}
 	if in.DAG == nil {
 		return res, errors.New("TopologyCoordinator.Converge: nil DAG")
 	}
@@ -345,6 +379,16 @@ func (c TopologyCoordinator) Converge(ctx context.Context, in CoordinatorInput) 
 		result.FinalSnapshot = nil
 		result.FinalSnapshotCurrent = false
 	}
+	if err != nil &&
+		result.ReplanDisposition == ReplanNotAllowed &&
+		!result.Published &&
+		!result.publicationAttempted &&
+		result.Applied == 0 &&
+		len(result.Journal) == 0 &&
+		!result.hasPhysicalWriteEvidence() &&
+		(replanRequired(err) || (snapshotErr != nil && snapshotErr.Class == HierarchyErrorStale)) {
+		result.ReplanDisposition = ReplanSafeNoPhysicalWrites
+	}
 	return result, err
 }
 
@@ -391,6 +435,7 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 	}
 	defer snapshotDriver.Close()
 	round := newCoordinatorRoundWithBudget(in.DAG, in.Cgroup, in.CPUDetails, in.ReservedCPUSet, in.DrainSelection, budget)
+	round.adjustmentBudget = in.AdjustmentBudget
 	round.semanticTargetByRel = cloneCPUSetMap(effectiveTargets)
 	round.dynamicByRel = cloneCPUSetMap(in.ExpectedCPUSetByRel)
 	round.requiredByRel = cloneCPUSetMap(in.RequiredCPUSetByRel)
@@ -408,7 +453,16 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 		round.snapshotSource = newDormantCompleteSnapshotSource(snapshotDriver, in.DAG, budget, in.TraversalBoundaries)
 	}
 	round.driver = snapshotDriver
-	initialSnapshot, err := round.nextPlanningSnapshot(ctx)
+	var initialSnapshot *CompleteSnapshot
+	if in.InitialSnapshot != nil {
+		if err := ctx.Err(); err != nil {
+			return *res, err
+		}
+		initialSnapshot, err = round.preparePlanningSnapshot(
+			ctx, CloneCompleteSnapshot(in.InitialSnapshot))
+	} else {
+		initialSnapshot, err = round.nextPlanningSnapshot(ctx)
+	}
 	if err != nil {
 		return *res, err
 	}
@@ -440,21 +494,6 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 
 	var lastNoProgressSignature string
 	var repeatedNoProgress int
-	replanBlocked := func(outcome RoundOutcome) bool {
-		if in.Budget.MaxRounds != 0 || roundOutcomeMadeNetProgress(outcome) {
-			lastNoProgressSignature = ""
-			repeatedNoProgress = 0
-			return false
-		}
-		signature := staleBlockedSignature(outcome)
-		if signature == lastNoProgressSignature {
-			repeatedNoProgress++
-		} else {
-			lastNoProgressSignature = signature
-			repeatedNoProgress = 1
-		}
-		return repeatedNoProgress >= 2
-	}
 	for {
 		engineResult, engineErr := round.runFixedPointEngine(
 			ctx,
@@ -475,12 +514,8 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 			}
 			if replanRequired(err) {
 				res.Rounds = append(res.Rounds, outcome)
-				if replanBlocked(outcome) {
-					res.State = ConvergenceStateBlocked
-					return *res, &CoordinatorBlockedError{Blocker: outcome.Blocker}
-				}
-				res.State = ConvergenceStateNonConverged
-				continue
+				authorizeOwnerReplan(res, outcome.Snapshot, in.AdjustmentBudget)
+				return *res, err
 			}
 			return *res, err
 		}
@@ -520,13 +555,8 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 				outcome.Snapshot = fresh
 				outcome.Blocker = staleErr
 				res.Rounds[len(res.Rounds)-1] = outcome
-				round.pendingSnapshot = fresh
-				if replanBlocked(outcome) {
-					res.State = ConvergenceStateBlocked
-					return *res, &CoordinatorBlockedError{Blocker: staleErr}
-				}
-				res.State = ConvergenceStateNonConverged
-				continue
+				authorizeOwnerReplan(res, fresh, in.AdjustmentBudget)
+				return *res, staleErr
 			}
 			freshEvaluation, err := evaluateCoordinatorSnapshot(
 				fresh, in.DAG, round.targetByRel, round.semanticTargetByRel,
@@ -554,13 +584,8 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 				outcome.Snapshot = fresh
 				outcome.Blocker = staleErr
 				res.Rounds[len(res.Rounds)-1] = outcome
-				round.pendingSnapshot = fresh
-				if replanBlocked(outcome) {
-					res.State = ConvergenceStateBlocked
-					return *res, &CoordinatorBlockedError{Blocker: staleErr}
-				}
-				res.State = ConvergenceStateNonConverged
-				continue
+				authorizeOwnerReplan(res, fresh, in.AdjustmentBudget)
+				return *res, staleErr
 			}
 			if err := ctx.Err(); err != nil {
 				return *res, err
@@ -579,7 +604,7 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 			outcome.Status = RoundStatusConverged
 			outcome.Snapshot = fresh
 			res.Rounds[len(res.Rounds)-1] = outcome
-			res.FinalSnapshot = fresh
+			res.FinalSnapshot = CloneCompleteSnapshot(fresh)
 			res.FinalSnapshotCurrent = true
 			publish := func() error {
 				if parentSafeDeferred && in.PublishParentSafeSnapshot != nil {
@@ -587,34 +612,30 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 					for rel := range round.deferredCleanupRels {
 						deferredCleanupRels[rel] = struct{}{}
 					}
-					return in.PublishParentSafeSnapshot(fresh, deferredCleanupRels)
+					return in.PublishParentSafeSnapshot(CloneCompleteSnapshot(fresh), deferredCleanupRels)
 				}
 				if in.PublishFinalSnapshot != nil {
-					return in.PublishFinalSnapshot(fresh)
+					return in.PublishFinalSnapshot(CloneCompleteSnapshot(fresh))
 				}
 				return nil
 			}
+			res.publicationAttempted = parentSafeDeferred && in.PublishParentSafeSnapshot != nil ||
+				!parentSafeDeferred && in.PublishFinalSnapshot != nil
 			if err := publish(); err != nil {
+				res.Published = false
+				if errors.Is(err, ErrCoordinatorPlanStale) {
+					res.ReplanDisposition = ReplanSafeFromVerifiedFinalState
+					return *res, err
+				}
+				res.ReplanDisposition = ReplanNotAllowed
 				res.FinalSnapshotCurrent = false
 				res.FinalSnapshot = nil
 				res.Converged = false
 				res.ParentSafe = false
-				if replanRequired(err) {
-					outcome.Status = RoundStatusStale
-					outcome.Snapshot = fresh
-					outcome.Blocker = err
-					res.Rounds[len(res.Rounds)-1] = outcome
-					round.pendingSnapshot = fresh
-					round.dynamicByRel = cloneCPUSetMap(in.ExpectedCPUSetByRel)
-					if replanBlocked(outcome) {
-						res.State = ConvergenceStateBlocked
-						return *res, &CoordinatorBlockedError{Blocker: err}
-					}
-					res.State = ConvergenceStateNonConverged
-					continue
-				}
 				return *res, err
 			}
+			res.Published = true
+			res.ReplanDisposition = ReplanNotAllowed
 			return *res, nil
 		}
 		res.Converged = false
@@ -643,6 +664,39 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 		res.State = ConvergenceStateNonConverged
 		continue
 	}
+}
+
+// authorizeOwnerReplan records only evidence that can cross the coordinator
+// boundary. A stale compile with no attempted mutation is safe to restart from
+// a new snapshot. Once any write was attempted, only a complete snapshot taken
+// after that attempt may authorize the plugin to compile again.
+func authorizeOwnerReplan(
+	res *ConvergenceResult,
+	snapshot *CompleteSnapshot,
+	budget *AdjustmentBudget,
+) {
+	if res == nil {
+		return
+	}
+	res.Converged = false
+	res.ParentSafe = false
+	res.State = ConvergenceStateNonConverged
+	res.Published = false
+	if !res.hasPhysicalWriteEvidence() {
+		res.FinalSnapshot = nil
+		res.FinalSnapshotCurrent = false
+		res.ReplanDisposition = ReplanSafeNoPhysicalWrites
+		return
+	}
+	if snapshot == nil || !budget.ReplanSafe(ReplanSafeFromVerifiedFinalState) {
+		res.FinalSnapshot = nil
+		res.FinalSnapshotCurrent = false
+		res.ReplanDisposition = ReplanNotAllowed
+		return
+	}
+	res.FinalSnapshot = CloneCompleteSnapshot(snapshot)
+	res.FinalSnapshotCurrent = true
+	res.ReplanDisposition = ReplanSafeFromVerifiedFinalState
 }
 
 func coordinatorAutoCumulativeBudgetInput(
@@ -828,25 +882,6 @@ func roundOutcomeMadeNetProgress(outcome RoundOutcome) bool {
 	return measure.MadeProgress()
 }
 
-func staleBlockedSignature(outcome RoundOutcome) string {
-	var stale *PlanStaleError
-	if errors.As(outcome.Blocker, &stale) {
-		return fmt.Sprintf("state=%s;rel=%s;direction=%s;resource=%s;current=%s;target=%s",
-			snapshotLogicalState(outcome.Snapshot), stale.Rel, stale.Direction,
-			stale.Resource, stale.Current, stale.Target)
-	}
-	var snapshotErr *SnapshotError
-	if errors.As(outcome.Blocker, &snapshotErr) {
-		return fmt.Sprintf("generation=%v;rel=%s;direction=snapshot;resource=%s;error=%T",
-			snapshotErr.Identity,
-			snapshotErr.Rel, snapshotErr.Operation, snapshotErr.Err)
-	}
-	if errors.Is(outcome.Blocker, ErrCgroupIdentityChanged) {
-		return "rel=unknown;direction=unknown;resource=identity"
-	}
-	return fmt.Sprintf("rel=unknown;direction=unknown;resource=%T", outcome.Blocker)
-}
-
 func snapshotRelGeneration(snapshot *CompleteSnapshot, rel string) string {
 	if snapshot == nil {
 		return "unknown"
@@ -875,18 +910,6 @@ func snapshotLogicalState(snapshot *CompleteSnapshot) string {
 			entry.ConfiguredCPUs.String(), entry.ConfiguredMems)
 	}
 	return b.String()
-}
-
-func configuredRelMissing(dag *TopoDAG, err error) bool {
-	if dag == nil || !isCgroupNotFoundError(err) {
-		return false
-	}
-	var stale *PlanStaleError
-	if errors.As(err, &stale) {
-		return dag.index[stale.Rel] != nil
-	}
-	var snapshotErr *SnapshotError
-	return errors.As(err, &snapshotErr) && dag.index[snapshotErr.Rel] != nil
 }
 
 func noWriteBlockedSignature(snapshot *CompleteSnapshot, witnesses []ReleaseWitness, report ConvergenceReport) string {
@@ -949,18 +972,22 @@ func (c TopologyCoordinator) convergeReset(ctx context.Context, in CoordinatorIn
 			return *res, err
 		}
 	}
-	writer := newResetCoordinatorWriter(driver, budget, in.Mems, res)
+	writer := newResetCoordinatorWriter(driver, budget, in.Mems, res).
+		withAdjustmentBudget(in.AdjustmentBudget)
 	if err := writer.execute(ctx, in.DAG, targets, allowEmptyTarget, in.ExpectedCPUSetByRel, in.TraversalBoundaries); err != nil {
 		return *res, err
 	}
+	observationEpoch := in.AdjustmentBudget.BeginSnapshotObservation()
 	report, err := verifyResetConvergence(ctx, driver, budget, in.DAG, targets)
 	if err != nil {
 		return *res, err
 	}
+	in.AdjustmentBudget.ObserveCurrentSnapshot(observationEpoch)
 	res.ConvergenceReport = report
 	res.Converged = report.FullyConverged
 	if res.Converged {
 		res.State = ConvergenceStateConverged
+		res.Published = true
 	} else {
 		res.State = ConvergenceStateNonConverged
 	}
@@ -1023,6 +1050,7 @@ type coordinatorRound struct {
 	snapshotSource        func(context.Context) (*CompleteSnapshot, error)
 	driver                HierarchyDriver
 	budget                *BudgetTracker
+	adjustmentBudget      *AdjustmentBudget
 	planID                string
 	witnesses             []ReleaseWitness
 	blocked               map[DomainID]machine.CPUSet
@@ -1043,8 +1071,8 @@ func (r *coordinatorRound) executeParentSafeAdmission(
 	res *ConvergenceResult,
 	publishFinal func(*CompleteSnapshot) error,
 	publishParentSafe func(*CompleteSnapshot, map[string]struct{}) error,
-) (RoundOutcome, error) {
-	outcome := RoundOutcome{Status: RoundStatusBlocked}
+) (outcome RoundOutcome, err error) {
+	outcome = RoundOutcome{Status: RoundStatusBlocked}
 	if r == nil || r.objective.orFullDefault() != ConvergenceObjectiveParentSafe {
 		return outcome, fmt.Errorf("frozen admission execution requires ParentSafe objective")
 	}
@@ -1052,24 +1080,44 @@ func (r *coordinatorRound) executeParentSafeAdmission(
 		return outcome, fmt.Errorf("frozen admission execution requires convergence result")
 	}
 
-	validated, err := r.compileValidatedFixedPointTrace(ctx, base)
-	if err != nil {
-		return outcome, err
-	}
-	trace, err := validated.trace()
-	if err != nil {
-		return outcome, err
-	}
+	// maxParentSafeChurnAbsorptions bounds in-transaction recompilations that
+	// absorb dynamic frozen-boundary holder churn without consuming the caller's
+	// replan budget. A single fresh-snapshot retry is enough: holder churn is a
+	// transient race between compilation and preflight, and the fresh snapshot
+	// already contains the newly appeared holder.
+	const maxParentSafeChurnAbsorptions = 1
 
-	maxRequiredWrites := 0
-	if r.admissionBudget != nil {
-		maxRequiredWrites = r.admissionBudget.MaxRequiredWrites
-	}
-	ticket, err := r.budget.reserveValidatedPhaseTrace(ctx, validated, maxRequiredWrites)
-	if err != nil {
-		return outcome, err
-	}
+	baseSnapshot := base
+	var (
+		adjustmentReservation *AdjustmentWriteReservation
+		forwardStart          int
+		rollbackStart         int
+		churnAbsorbed         int
+	)
+	defer func() {
+		if adjustmentReservation == nil {
+			return
+		}
+		// Settle the final reservation against the actually observed write counts.
+		// A mismatch means write accounting disagreed with execution; surface it
+		// (Warningf) without clobbering a more important execution error: only
+		// replace err when there is no other failure, otherwise append the
+		// accounting failure to the error chain.
+		if settleErr := adjustmentReservation.settleTotals(
+			res.forwardWriteAttempts-forwardStart,
+			res.rollbackWriteAttempts-rollbackStart,
+		); settleErr != nil {
+			general.Warningf("cpuset_topology: adjustment reservation settle mismatch: %v", settleErr)
+			switch err {
+			case nil:
+				err = settleErr
+			default:
+				err = errors.Join(err, settleErr)
+			}
+		}
+	}()
 
+	var publishStaleErr error
 	finalize := func(
 		ctx context.Context,
 		frozen *CompiledPhaseTrace,
@@ -1085,29 +1133,122 @@ func (r *coordinatorRound) executeParentSafeAdmission(
 			!finalization.evaluation.Report.FullyConverged
 		switch {
 		case parentSafeDeferred && publishParentSafe != nil:
+			res.publicationAttempted = true
 			finalizeErr = publishParentSafe(
-				finalization.snapshot,
+				CloneCompleteSnapshot(finalization.snapshot),
 				cloneRelSet(frozen.EvaluationInput.DeferredCleanupRels),
 			)
 		case finalization.evaluation.Report.FullyConverged && publishFinal != nil:
-			finalizeErr = publishFinal(finalization.snapshot)
+			res.publicationAttempted = true
+			finalizeErr = publishFinal(CloneCompleteSnapshot(finalization.snapshot))
+		}
+		if errors.Is(finalizeErr, ErrCoordinatorPlanStale) {
+			publishStaleErr = finalizeErr
+			finalizeErr = nil
 		}
 		return finalization, finalizeErr
 	}
 
-	outcome, err = r.executeValidatedFrozenTrace(ctx, validated, ticket, res, finalize)
-	res.Rounds = append(res.Rounds, outcome)
-	if err != nil {
-		return outcome, err
-	}
-
-	if res.ParentSafe {
-		res.DeferredLeafCount = len(trace.EvaluationInput.DeferredByRel)
-		for _, cpus := range trace.EvaluationInput.DeferredByRel {
-			res.DeferredCPUCount += cpus.Size()
+	for {
+		validated, err := r.compileValidatedFixedPointTrace(ctx, baseSnapshot)
+		if err != nil {
+			return outcome, err
 		}
+		trace, err := validated.trace()
+		if err != nil {
+			return outcome, err
+		}
+
+		maxRequiredWrites := 0
+		if r.admissionBudget != nil {
+			maxRequiredWrites = r.admissionBudget.MaxRequiredWrites
+		}
+		ticket, err := r.budget.reserveValidatedPhaseTrace(ctx, validated, maxRequiredWrites)
+		if err != nil {
+			return outcome, err
+		}
+		adjustmentReservation, err = r.adjustmentBudget.ReserveExecution(trace.Cost)
+		if err != nil {
+			return outcome, err
+		}
+		forwardStart = res.forwardWriteAttempts
+		rollbackStart = res.rollbackWriteAttempts
+
+		outcome, err = r.executeValidatedFrozenTrace(
+			ctx, validated, ticket, res, adjustmentReservation, finalize)
+		res.Rounds = append(res.Rounds, outcome)
+		if err != nil {
+			res.Published = false
+			// Absorb a transient dynamic frozen-boundary drift in place: the new
+			// holder/coverage already exists in the live hierarchy, so a fresh
+			// snapshot folds it into the plan without any physical write and
+			// without consuming the caller's replan budget.
+			if churnAbsorbed < maxParentSafeChurnAbsorptions &&
+				!res.hasPhysicalWriteEvidence() &&
+				isFrozenBoundaryDynamicDrift(err) {
+				churnAbsorbed++
+				general.InfofV(4, "cpuset_topology: absorbed frozen boundary dynamic drift, retrying with fresh snapshot, attempt=%d", churnAbsorbed)
+				fresh, snapErr := r.nextPlanningSnapshot(ctx)
+				if snapErr != nil {
+					// Prefer the original stale evidence over a snapshot error:
+					// the caller already has a replan-safe classification.
+					return outcome, err
+				}
+				// The deferred settle only runs at function return, so release
+				// this iteration's reservation explicitly before recompiling.
+				// Zero writes are guaranteed by the hasPhysicalWriteEvidence
+				// guard above, so settling (0,0) matches the attempted counts.
+				// Fail closed on a mismatch: settleTotals leaves the reservation
+				// unsettled and does not release reservedWrites. Continuing would
+				// overwrite adjustmentReservation and leak this round's reserved
+				// writes permanently (the defer only settles the last round), so
+				// surface both the accounting failure and the original stale.
+				if settleErr := adjustmentReservation.settleTotals(0, 0); settleErr != nil {
+					return outcome, fmt.Errorf("churn absorption reservation settle failed: %w (original stale: %v)", settleErr, err)
+				}
+				baseSnapshot = fresh
+				continue
+			}
+			return outcome, err
+		}
+		if publishStaleErr != nil {
+			res.Published = false
+			res.ReplanDisposition = ReplanSafeFromVerifiedFinalState
+			return outcome, publishStaleErr
+		}
+		res.Published = true
+		res.ReplanDisposition = ReplanNotAllowed
+
+		if res.ParentSafe {
+			res.DeferredLeafCount = len(trace.EvaluationInput.DeferredByRel)
+			for _, cpus := range trace.EvaluationInput.DeferredByRel {
+				res.DeferredCPUCount += cpus.Size()
+			}
+		}
+		return outcome, nil
 	}
-	return outcome, nil
+}
+
+// isFrozenBoundaryDynamicDrift reports whether err carries a frozen-boundary
+// PlanStaleError on the dynamic (non-controlled) holder set. All such stales
+// originate from evaluateFrozenBoundarySnapshot's preflight pass before any
+// physical write, so a single bounded fresh-snapshot recompile is safe. This
+// covers both new-holder appearance and holder-coverage drift; persistent drift
+// on retry surfaces normally to the caller. The preflight wraps the boundary
+// stale inside an initial-snapshot-drift envelope, so the whole error chain is
+// walked rather than only inspecting the first PlanStaleError.
+func isFrozenBoundaryDynamicDrift(err error) bool {
+	for current := err; current != nil; {
+		var stale *PlanStaleError
+		if !errors.As(current, &stale) {
+			return false
+		}
+		if stale.Resource == "frozen_boundary" && stale.Rel == "dynamic" {
+			return true
+		}
+		current = errors.Unwrap(stale)
+	}
+	return false
 }
 
 func newCoordinatorRoundWithBudget(
@@ -1216,36 +1357,13 @@ func (r *coordinatorRound) nextRawSnapshot(ctx context.Context) (*CompleteSnapsh
 	if r.budget == nil {
 		return nil, fmt.Errorf("topology coordinator requires convergence budget")
 	}
-	var lastMissingSignature string
-	var repeatedMissing int
-	for {
-		snapshot, err := r.snapshotSource(ctx)
-		if err == nil {
-			return snapshot, nil
-		}
-		var snapshotErr *SnapshotError
-		if !errors.As(err, &snapshotErr) || snapshotErr.Class != HierarchyErrorStale {
-			return nil, err
-		}
-		if !configuredRelMissing(r.dag, err) {
-			lastMissingSignature = ""
-			repeatedMissing = 0
-			continue
-		}
-		// Evidence IDs describe individual scans. Identity binds repeated missing
-		// observations to the same cgroup generation without merging replacements.
-		signature := fmt.Sprintf("identity=%v;rel=%s;operation=%s",
-			snapshotErr.Identity, snapshotErr.Rel, snapshotErr.Operation)
-		if signature == lastMissingSignature {
-			repeatedMissing++
-		} else {
-			lastMissingSignature = signature
-			repeatedMissing = 1
-		}
-		if repeatedMissing >= 2 {
-			return nil, err
-		}
+	observationEpoch := r.adjustmentBudget.BeginSnapshotObservation()
+	snapshot, err := r.snapshotSource(ctx)
+	if err != nil {
+		return nil, err
 	}
+	r.adjustmentBudget.ObserveCurrentSnapshot(observationEpoch)
+	return snapshot, nil
 }
 
 // nextPlanningSnapshot starts each fixed-point round from current physical
@@ -1256,6 +1374,16 @@ func (r *coordinatorRound) nextPlanningSnapshot(ctx context.Context) (*CompleteS
 	snapshot, err := r.nextRawSnapshot(ctx)
 	if err != nil {
 		return nil, err
+	}
+	return r.preparePlanningSnapshot(ctx, snapshot)
+}
+
+func (r *coordinatorRound) preparePlanningSnapshot(
+	ctx context.Context,
+	snapshot *CompleteSnapshot,
+) (*CompleteSnapshot, error) {
+	if snapshot == nil {
+		return nil, errors.New("topology planning snapshot is nil")
 	}
 	materialized := materializeTargets(
 		r.dag, snapshot, r.allowEmptyTarget, r.semanticTargetByRel)
@@ -1393,7 +1521,8 @@ func (r *coordinatorRound) executePlan(ctx context.Context, plan PhasePlan, res 
 	if err := r.revalidateGrowAuthorization(ctx, plan); err != nil {
 		return err
 	}
-	writer := newSafeCPUSetWriter(r.driver, r.budget, res)
+	writer := newSafeCPUSetWriter(r.driver, r.budget, res).
+		withAdjustmentBudget(r.adjustmentBudget)
 	writer.dormantProofs = r.dormantProofs
 	return writer.execute(ctx, plan)
 }

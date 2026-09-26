@@ -24,6 +24,8 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/klog/v2"
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
@@ -186,8 +188,11 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 		AppliedView:                m.appliedView.DeepCopy(),
 		AppliedViewRevision:        m.appliedViewRevision,
 	}
-	hardActive := in.State != nil && in.State.GetPodEntries().HasActiveRampUp()
-	viewOptions := m.cpuSetPartitionViewOptions(in, hardActive)
+	rampUpDomains, dErr := m.activeRampUpDomains(in)
+	if dErr != nil {
+		return empty, fmt.Errorf("resolve active ramp-up domains for bulkhead apply: %w", dErr)
+	}
+	viewOptions := m.cpuSetPartitionViewOptions(in, rampUpDomains)
 	if !bulkheadEnabled(in.DynamicConf) {
 		// The global bulkhead switch is a hard gate: when it is off, do not run
 		// plugin Enable/adjust/disabled handlers. Disabled handlers may write
@@ -279,11 +284,14 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 						return empty, nonConverged
 					}
 					if desiredSnapshot != nil {
-						currentHardActive := in.State != nil && in.State.GetPodEntries().HasActiveRampUp()
+						currentRampUpDomains, dErr := m.activeRampUpDomains(in)
+						if dErr != nil {
+							return empty, fmt.Errorf("resolve active ramp-up domains after disabled topology reconcile: %w", dErr)
+						}
 						currentDesired, err := bulkheadutils.BuildValidatedCPUSetPartitionView(
 							in.State,
 							in.Topology,
-							m.cpuSetPartitionViewOptions(in, currentHardActive),
+							m.cpuSetPartitionViewOptions(in, currentRampUpDomains),
 						)
 						if err != nil {
 							return empty, fmt.Errorf("rebuild bulkhead desired view after disabled topology reconcile failed: %w", err)
@@ -388,11 +396,14 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 			if desiredSnapshot != nil {
 				// Rebuild desired intent after topology Apply so a result cannot be
 				// accepted, or authorize dependent side effects, after state changed.
-				currentHardActive := in.State != nil && in.State.GetPodEntries().HasActiveRampUp()
+				currentRampUpDomains, dErr := m.activeRampUpDomains(in)
+				if dErr != nil {
+					return empty, fmt.Errorf("resolve active ramp-up domains after topology apply: %w", dErr)
+				}
 				currentDesired, err := bulkheadutils.BuildValidatedCPUSetPartitionView(
 					in.State,
 					in.Topology,
-					m.cpuSetPartitionViewOptions(in, currentHardActive),
+					m.cpuSetPartitionViewOptions(in, currentRampUpDomains),
 				)
 				if err != nil {
 					return empty, fmt.Errorf("rebuild bulkhead desired view after topology apply failed: %w", err)
@@ -513,8 +524,12 @@ func (m *Manager) tryPublishAppliedView(
 		result == nil || !result.Converged || !result.FinalSnapshotCurrent || result.AppliedView == nil {
 		return false
 	}
-	hardActive := in.State != nil && in.State.GetPodEntries().HasActiveRampUp()
-	opts := m.cpuSetPartitionViewOptions(in.CPUSetAdjustmentHandlerCtx, hardActive)
+	rampUpDomains, dErr := m.activeRampUpDomains(in.CPUSetAdjustmentHandlerCtx)
+	if dErr != nil {
+		klog.Errorf("bulkhead: skip publishing applied view because active ramp-up domains could not be resolved: %v", dErr)
+		return false
+	}
+	opts := m.cpuSetPartitionViewOptions(in.CPUSetAdjustmentHandlerCtx, rampUpDomains)
 	finalDesired, err := bulkheadutils.BuildValidatedCPUSetPartitionView(in.State, in.Topology, opts)
 	if err != nil {
 		return false
@@ -548,9 +563,20 @@ func staleGenerationError() *NonConvergedError {
 	}}
 }
 
+// activeRampUpDomains resolves the ramp-up reclaim domains recorded in the
+// current pod entries. A resolution error is propagated to the caller: silently
+// collapsing to an empty set would disable the hard-partition reclaim floor on
+// ambiguous state, which is under-protection rather than a safe fallback.
+func (m *Manager) activeRampUpDomains(in cpusetutil.CPUSetAdjustmentHandlerCtx) (sets.Int, error) {
+	if in.State == nil || in.Topology == nil {
+		return sets.NewInt(), nil
+	}
+	return in.State.GetPodEntries().ActiveRampUpDomains(in.Topology)
+}
+
 func (m *Manager) cpuSetPartitionViewOptions(
 	in cpusetutil.CPUSetAdjustmentHandlerCtx,
-	hardActive bool,
+	rampUpDomains sets.Int,
 ) bulkheadutils.CPUSetPartitionViewOptions {
 	opts := bulkheadutils.NewCPUSetPartitionViewOptionsWithState(
 		in.CoreConf,
@@ -562,7 +588,7 @@ func (m *Manager) cpuSetPartitionViewOptions(
 			ReservedReclaimedCPUs:         in.ReservedReclaimedCPUs,
 			ReservedReclaimedCPUsFallback: in.ReservedReclaimedCPUsSize,
 		},
-		hardActive,
+		rampUpDomains,
 	)
 	if opts.NonReclaimPoolMinSize <= 0 {
 		opts.NonReclaimPoolMinSize = m.defaultNonReclaimPoolMinSize
@@ -579,8 +605,11 @@ func (m *Manager) validateAppliedHardPartition(
 		applied.ReclaimEffective.IsEmpty() {
 		return nil
 	}
-	hardActive := in.State != nil && in.State.GetPodEntries().HasActiveRampUp()
-	opts := m.cpuSetPartitionViewOptions(in, hardActive)
+	rampUpDomains, dErr := m.activeRampUpDomains(in)
+	if dErr != nil {
+		return fmt.Errorf("resolve active ramp-up domains for hard-partition validation: %w", dErr)
+	}
+	opts := m.cpuSetPartitionViewOptions(in, rampUpDomains)
 	if opts.HardPartitionTargetError != nil {
 		return opts.HardPartitionTargetError
 	}

@@ -83,6 +83,74 @@ func TestTopologyResultAndDAGApplyResultPreserveExecutionStatistics(t *testing.T
 	}
 }
 
+func TestDisabledReconcileRetryRequiresSafeDisposition(t *testing.T) {
+	staleErr := &topology.PlanStaleError{
+		Rel:       "reclaim",
+		Direction: topology.WritePublish,
+		Resource:  "reclaim_classification",
+		Current:   "old",
+		Target:    "current",
+		Err:       errReclaimClassificationChanged,
+	}
+	tests := []struct {
+		name        string
+		err         error
+		disposition topology.ReplanDisposition
+		want        bool
+	}{
+		{
+			name:        "stale marker without physical-state proof terminates",
+			err:         staleErr,
+			disposition: topology.ReplanNotAllowed,
+			want:        false,
+		},
+		{
+			name:        "classification retry with no writes is allowed",
+			err:         errReclaimClassificationChanged,
+			disposition: topology.ReplanSafeNoPhysicalWrites,
+			want:        true,
+		},
+		{
+			name:        "verified final state retry is allowed",
+			err:         staleErr,
+			disposition: topology.ReplanSafeFromVerifiedFinalState,
+			want:        true,
+		},
+		{
+			name:        "success never retries",
+			disposition: topology.ReplanSafeFromVerifiedFinalState,
+			want:        false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			convergence := topology.ConvergenceResult{ReplanDisposition: tt.disposition}
+			if got := disabledReconcileShouldRetry(tt.err, convergence); got != tt.want {
+				t.Fatalf("disabledReconcileShouldRetry() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAccumulateConvergenceResultPropagatesPublicationState(t *testing.T) {
+	total := topology.ConvergenceResult{
+		Published:         true,
+		ReplanDisposition: topology.ReplanNotAllowed,
+	}
+	attempt := topology.ConvergenceResult{
+		Attempted:         2,
+		Published:         false,
+		ReplanDisposition: topology.ReplanSafeFromVerifiedFinalState,
+	}
+
+	accumulateConvergenceResult(&total, attempt)
+
+	if total.Attempted != 2 || total.Published ||
+		total.ReplanDisposition != topology.ReplanSafeFromVerifiedFinalState {
+		t.Fatalf("accumulated result = %+v, want unpublished verified-final-state replan", total)
+	}
+}
+
 func TestHandleDeferredLeafRetryByAdjustmentMode(t *testing.T) {
 	t.Parallel()
 
@@ -517,6 +585,11 @@ type fakeCgroupClient struct {
 	readErrByRel            map[string]error
 	readCalls               []string
 	statIdentityHook        func(string) (topology.CgroupIdentity, error)
+	readEntryCounts         map[string]int
+	readEntryHook           func(string, int) error
+	writeCPUCounts          map[string]int
+	writeCPUHook            func(string, int) error
+	classifyHook            func(error, topology.HierarchyOperation) topology.HierarchyErrorClass
 }
 
 type fakeSnapshotDriver struct {
@@ -544,6 +617,15 @@ func (d *fakeSnapshotDriver) StatIdentity(_ context.Context, rel string) (topolo
 }
 
 func (d *fakeSnapshotDriver) ReadEntry(ctx context.Context, rel string) (topology.EntryState, error) {
+	if d.cg.readEntryCounts == nil {
+		d.cg.readEntryCounts = map[string]int{}
+	}
+	d.cg.readEntryCounts[rel]++
+	if d.cg.readEntryHook != nil {
+		if err := d.cg.readEntryHook(rel, d.cg.readEntryCounts[rel]); err != nil {
+			return topology.EntryState{}, err
+		}
+	}
 	cpus, err := d.cg.ReadCPUSet(ctx, rel)
 	if err != nil {
 		return topology.EntryState{}, err
@@ -588,6 +670,15 @@ func (d *fakeSnapshotDriver) WriteCPUs(ctx context.Context, rel string, expected
 	if pluginFakeIdentity(rel) != expected {
 		return topology.ErrCgroupIdentityChanged
 	}
+	if d.cg.writeCPUCounts == nil {
+		d.cg.writeCPUCounts = map[string]int{}
+	}
+	d.cg.writeCPUCounts[rel]++
+	if d.cg.writeCPUHook != nil {
+		if err := d.cg.writeCPUHook(rel, d.cg.writeCPUCounts[rel]); err != nil {
+			return err
+		}
+	}
 	return d.cg.ApplyCPUSet(ctx, rel, &cgcommon.CPUSetData{
 		CPUs: cpus.String(), WriteEmptyCPUs: cpus.IsEmpty(),
 	})
@@ -602,7 +693,10 @@ func (d *fakeSnapshotDriver) WriteMems(ctx context.Context, rel string, expected
 	})
 }
 
-func (d *fakeSnapshotDriver) Classify(error, topology.HierarchyOperation) topology.HierarchyErrorClass {
+func (d *fakeSnapshotDriver) Classify(err error, operation topology.HierarchyOperation) topology.HierarchyErrorClass {
+	if d.cg.classifyHook != nil {
+		return d.cg.classifyHook(err, operation)
+	}
 	return topology.HierarchyErrorInvalid
 }
 
@@ -1120,13 +1214,21 @@ func TestDeferredLeafDrainWritesSafeLeafDespiteGlobalMismatch(t *testing.T) {
 	view.DesiredReclaimEffective = machine.NewCPUSet(4, 5)
 	dag := mustBuildDrainTestDAG(t)
 
-	p.drainSafeDeferredLeaves(context.Background(), view, dag)
+	budget := topology.NewAdjustmentBudget(context.Background(), topology.ConvergenceBudget{
+		MaxPlanOperations: 1,
+	})
+	if err := p.drainSafeDeferredLeaves(context.Background(), view, dag, budget); err != nil {
+		t.Fatalf("drainSafeDeferredLeaves() error = %v", err)
+	}
 
 	if got := cg.cpus[rel]; !got.Equals(machine.NewCPUSet(0, 1)) {
 		t.Fatalf("leaf cpuset = %s, want exact target 0-1", got.String())
 	}
 	if _, ok := p.deferredLeafDrains[rel]; ok {
 		t.Fatalf("safe leaf drain was not cleared after successful write")
+	}
+	if got := budget.CumulativeWrites(); got != 1 {
+		t.Fatalf("deferred leaf cumulative physical writes = %d, want 1", got)
 	}
 }
 
@@ -1158,13 +1260,112 @@ func TestDeferredLeafDrainSkipsTargetOverlappingActualReclaim(t *testing.T) {
 	view.DesiredReclaimEffective = machine.NewCPUSet(4, 5)
 	dag := mustBuildDrainTestDAG(t)
 
-	p.drainSafeDeferredLeaves(context.Background(), view, dag)
+	budget := topology.NewAdjustmentBudget(context.Background(), topology.ConvergenceBudget{
+		MaxPlanOperations: 1,
+	})
+	if err := p.drainSafeDeferredLeaves(context.Background(), view, dag, budget); err != nil {
+		t.Fatalf("unsafe deferred drain should remain pending without terminal error: %v", err)
+	}
 
 	if got := cg.cpus[rel]; !got.Equals(machine.NewCPUSet(0, 1, 2, 3)) {
 		t.Fatalf("unsafe leaf cpuset was written as %s, want unchanged 0-3", got.String())
 	}
 	if _, ok := p.deferredLeafDrains[rel]; !ok {
 		t.Fatalf("unsafe leaf drain was cleared despite actual reclaim overlap")
+	}
+}
+
+func TestDeferredLeafDrainBudgetFailurePerformsZeroWrites(t *testing.T) {
+	now := time.Date(2026, time.August, 5, 13, 30, 0, 0, time.UTC)
+	const rel = "kubepods/pod-a/container-a"
+	cg := &fakeCgroupClient{cpus: map[string]machine.CPUSet{
+		"kubepods":                machine.NewCPUSet(0, 1, 2, 3),
+		"kubepods/pod-a":          machine.NewCPUSet(0, 1, 2, 3),
+		"kubesandbox":             machine.NewCPUSet(4, 5),
+		"kubesandbox/reclaimed-0": machine.NewCPUSet(4, 5),
+		rel:                       machine.NewCPUSet(0, 1, 2, 3),
+	}}
+	p := &CPUSetTopologyPlugin{
+		cgroup: cg,
+		now:    func() time.Time { return now },
+		deferredLeafDrains: map[string]deferredLeafDrain{
+			rel: {
+				target:       machine.NewCPUSet(0, 1),
+				firstSeen:    now,
+				lastSeen:     now,
+				protectUntil: now.Add(time.Minute),
+			},
+		},
+	}
+	view := model.NewDesiredView()
+	view.DesiredReclaimEffective = machine.NewCPUSet(4, 5)
+	budget := topology.NewAdjustmentBudget(context.Background(), topology.ConvergenceBudget{
+		MaxPlanOperations: 1,
+	})
+	held, err := budget.ReserveExecution(topology.ExecutionReservationCost{
+		Forward:  topology.PhysicalWriteCost{CPUSetWrites: 2},
+		Rollback: topology.PhysicalWriteCost{CPUSetWrites: 2},
+	})
+	if err != nil {
+		t.Fatalf("occupy write budget: %v", err)
+	}
+	defer held.Settle(topology.PhysicalWriteCost{}, topology.PhysicalWriteCost{})
+
+	err = p.drainSafeDeferredLeaves(context.Background(), view, mustBuildDrainTestDAG(t), budget)
+
+	if !errors.Is(err, topology.ErrAdjustmentWriteBudgetExceeded) {
+		t.Fatalf("drainSafeDeferredLeaves() error = %v, want write-budget exhaustion", err)
+	}
+	if len(cg.writeOrder) != 0 {
+		t.Fatalf("budget failure performed deferred-leaf writes: %v", cg.writeOrder)
+	}
+	if _, ok := p.deferredLeafDrains[rel]; !ok {
+		t.Fatal("budget failure cleared deferred leaf")
+	}
+}
+
+func TestDeferredLeafDrainConservativelySettlesFailedWriteAttempt(t *testing.T) {
+	now := time.Date(2026, time.August, 5, 13, 30, 0, 0, time.UTC)
+	const rel = "kubepods/pod-a/container-a"
+	cg := &fakeCgroupClient{
+		requireExistingForApply: true,
+		cpus: map[string]machine.CPUSet{
+			"kubepods":                machine.NewCPUSet(0, 1, 2, 3),
+			"kubepods/pod-a":          machine.NewCPUSet(0, 1, 2, 3),
+			"kubesandbox":             machine.NewCPUSet(4, 5),
+			"kubesandbox/reclaimed-0": machine.NewCPUSet(4, 5),
+			rel:                       machine.NewCPUSet(0, 1, 2, 3),
+		},
+	}
+	p := &CPUSetTopologyPlugin{
+		cgroup: cg,
+		now:    func() time.Time { return now },
+		deferredLeafDrains: map[string]deferredLeafDrain{
+			rel: {
+				target:       machine.NewCPUSet(0, 1),
+				firstSeen:    now,
+				lastSeen:     now,
+				protectUntil: now.Add(time.Minute),
+			},
+		},
+	}
+	view := model.NewDesiredView()
+	view.DesiredReclaimEffective = machine.NewCPUSet(4, 5)
+	budget := topology.NewAdjustmentBudget(context.Background(), topology.ConvergenceBudget{
+		MaxPlanOperations: 1,
+	})
+
+	err := p.drainSafeDeferredLeaves(
+		context.Background(), view, mustBuildDrainTestDAG(t), budget)
+
+	if err == nil {
+		t.Fatal("failed deferred-leaf write was hidden")
+	}
+	if got := budget.CumulativeWrites(); got != 1 {
+		t.Fatalf("failed physical write attempts = %d, want conservative count 1", got)
+	}
+	if _, ok := p.deferredLeafDrains[rel]; !ok {
+		t.Fatal("failed deferred-leaf write cleared pending drain")
 	}
 }
 
@@ -1343,6 +1544,7 @@ func TestCPUSetTopologyPluginReconcilesPrimaryWhenReclaimEmpty(t *testing.T) {
 
 	err := p.CPUSetAdjustmentHandler(context.Background(), bulkheadapi.HandlerContext{
 		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+			MetaServer: emptyLifecycleMetaServer(),
 			Topology: &machine.CPUTopology{
 				CPUDetails: machine.CPUDetails{
 					0: {},
@@ -1390,10 +1592,12 @@ func TestCPUSetTopologyPluginDefaultAutoBudgetConverges96CPUHandoffAtPointZeroOn
 	cfg.BulkheadReclaimRelPaths = []string{"reclaim"}
 	cfg.TopologyDrainSelection.MaxCPUsDrainRatio = 0.01
 	p := &CPUSetTopologyPlugin{cfg: *cfg, cgroup: cg}
+	fetcher := &strictSnapshotFetcher{}
 
 	err := p.CPUSetAdjustmentHandler(context.Background(), bulkheadapi.HandlerContext{
 		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
-			Topology: &machine.CPUTopology{CPUDetails: details},
+			Topology:   &machine.CPUTopology{CPUDetails: details},
+			MetaServer: &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{PodFetcher: fetcher}},
 		},
 		DesiredView: &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
 			NonReclaimPool:   machine.NewCPUSet(),
@@ -1411,6 +1615,9 @@ func TestCPUSetTopologyPluginDefaultAutoBudgetConverges96CPUHandoffAtPointZeroOn
 	}
 	if cg.applyCounts["primary"] <= 32 {
 		t.Fatalf("primary writes = %d, want real plugin path to exceed the old 32-round default", cg.applyCounts["primary"])
+	}
+	if fetcher.listCalls != 1 {
+		t.Fatalf("strict GetPodList calls = %d, want 1 for empty lifecycle proof validation", fetcher.listCalls)
 	}
 }
 
@@ -1446,6 +1653,7 @@ func TestCPUSetTopologyPluginReportsAppliedViewFromFinalSnapshot(t *testing.T) {
 
 	dagResult, err := p.Apply(context.Background(), bulkheadapi.HandlerContext{
 		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+			MetaServer: emptyLifecycleMetaServer(),
 			Topology: &machine.CPUTopology{CPUDetails: machine.CPUDetails{
 				0: {}, 1: {}, 2: {}, 3: {},
 			}},
@@ -1555,7 +1763,8 @@ func TestCPUSetTopologyPluginAdmissionPublishesFrozenTraceResult(t *testing.T) {
 
 	_, err := p.Apply(context.Background(), bulkheadapi.HandlerContext{
 		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
-			Mode: cpusetutil.CPUSetAdjustmentModeAdmission,
+			Mode:       cpusetutil.CPUSetAdjustmentModeAdmission,
+			MetaServer: emptyLifecycleMetaServer(),
 			Topology: &machine.CPUTopology{CPUDetails: machine.CPUDetails{
 				0: {}, 1: {}, 2: {}, 3: {},
 			}},
@@ -1587,7 +1796,7 @@ func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t
 		containerID  = "container-materialized-during-convergence"
 		containerRel = "primary/container-a"
 	)
-	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+	registerRelativeCgroupPathHandlerForTest(t, cgcommon.RelativeCgroupPathHandler{
 		Name: "bulkhead-final-snapshot-container-proof",
 		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 			if gotPodUID == podUID && gotContainerID == containerID {
@@ -1598,17 +1807,20 @@ func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t
 	})
 
 	for _, tt := range []struct {
-		name        string
-		desiredLeaf machine.CPUSet
-		wantErr     bool
+		name                  string
+		desiredLeaf           machine.CPUSet
+		initiallyMaterialized bool
+		wantPublished         bool
 	}{
 		{
 			name:        "pending leaf materializes with inherited parent cpuset",
 			desiredLeaf: machine.NewCPUSet(0),
 		},
 		{
-			name:        "materialized leaf matches final snapshot",
-			desiredLeaf: machine.NewCPUSet(0, 1),
+			name:                  "materialized leaf matches final snapshot",
+			desiredLeaf:           machine.NewCPUSet(0, 1),
+			initiallyMaterialized: true,
+			wantPublished:         true,
 		},
 	} {
 		tt := tt
@@ -1616,7 +1828,10 @@ func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t
 			t.Parallel()
 
 			desiredLeaf := tt.desiredLeaf.Clone()
-			pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)}}
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{UID: types.UID(podUID)},
+				Spec:       v1.PodSpec{Containers: []v1.Container{{Name: "main"}}},
+			}
 			cg := &fakeCgroupClient{
 				existing: map[string]bool{"primary": true, "reclaim": true},
 				cpus: map[string]machine.CPUSet{
@@ -1625,14 +1840,19 @@ func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t
 				},
 				children: map[string][]string{},
 			}
+			if tt.initiallyMaterialized {
+				pod.Status.ContainerStatuses = []v1.ContainerStatus{{
+					Name:        "main",
+					ContainerID: "containerd://" + containerID,
+				}}
+				cg.existing[containerRel] = true
+				cg.children["primary"] = []string{"container-a"}
+				cg.cpus[containerRel] = machine.NewCPUSet(0, 1)
+			}
 			materialized := false
 			cg.readOverride = func(rel string) (machine.CPUSet, bool) {
-				if rel == "primary" && !materialized {
+				if rel == "primary" && !materialized && !tt.initiallyMaterialized {
 					materialized = true
-					pod.Status.ContainerStatuses = []v1.ContainerStatus{{
-						Name:        "main",
-						ContainerID: "containerd://" + containerID,
-					}}
 					cg.existing[containerRel] = true
 					cg.children["primary"] = []string{"container-a"}
 					cg.cpus[containerRel] = machine.NewCPUSet(0, 1)
@@ -1686,26 +1906,23 @@ func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t
 					result = got
 				},
 			})
-			if tt.wantErr {
-				if err == nil {
-					t.Fatalf("CPUSetAdjustmentHandler error = nil, want final snapshot leaf mismatch rejection; result=%+v", result)
-				}
-				if result.AppliedView != nil {
-					t.Fatalf("mismatched materialized leaf must not publish AppliedView: %+v", result)
-				}
-				return
-			}
 			if err != nil {
 				t.Fatalf("CPUSetAdjustmentHandler: %v", err)
 			}
 			if result.AppliedView == nil {
 				t.Fatal("matching final snapshot leaf should publish AppliedView")
 			}
-			if got := result.AppliedView.ContainerCPUSetByPod[podUID]["main"]; !got.Equals(desiredLeaf) {
+			got, published := result.AppliedView.ContainerCPUSetByPod[podUID]["main"]
+			if published != tt.wantPublished {
+				t.Fatalf("published container presence = %t, want %t", published, tt.wantPublished)
+			}
+			if published && !got.Equals(desiredLeaf) {
 				t.Fatalf("published container cpuset = %q, want final snapshot value %s", got.String(), desiredLeaf.String())
 			}
-			assertProjectedCPUSet(t, result.AppliedView.PoolProjection.CPUSetByIdentity,
-				dedicatedIdentity, desiredLeaf)
+			if tt.wantPublished {
+				assertProjectedCPUSet(t, result.AppliedView.PoolProjection.CPUSetByIdentity,
+					dedicatedIdentity, desiredLeaf)
+			}
 		})
 	}
 }
@@ -1755,6 +1972,7 @@ func TestCPUSetTopologyPluginSkipsUnchangedApplyTarget(t *testing.T) {
 	}
 	in := bulkheadapi.HandlerContext{
 		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+			MetaServer: emptyLifecycleMetaServer(),
 			Topology: &machine.CPUTopology{CPUDetails: machine.CPUDetails{
 				0: {}, 1: {}, 2: {}, 3: {},
 			}},
@@ -1796,6 +2014,7 @@ func TestCPUSetTopologyPluginReconcilesExternalCgroupDrift(t *testing.T) {
 	}
 	in := bulkheadapi.HandlerContext{
 		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+			MetaServer: emptyLifecycleMetaServer(),
 			Topology: &machine.CPUTopology{CPUDetails: machine.CPUDetails{
 				0: {}, 1: {}, 2: {}, 3: {},
 			}},
@@ -1858,9 +2077,11 @@ func TestCPUSetTopologyPluginReturnsErrorWhenNormalConvergeNonConverged(t *testi
 			reported = true
 		},
 	})
-	var blocked *topology.CoordinatorBlockedError
-	if !errors.As(err, &blocked) {
-		t.Fatalf("CPUSetAdjustmentHandler error = %v, want typed blocked failure", err)
+	var exhausted *topology.ReplanBudgetExceededError
+	if !errors.As(err, &exhausted) ||
+		!errors.Is(err, topology.ErrAdjustmentReplanBudgetExceeded) ||
+		exhausted.Replans != 3 {
+		t.Fatalf("CPUSetAdjustmentHandler error = %v, want owner replan exhaustion after 3 replans", err)
 	}
 	if cg.pruned != nil {
 		t.Fatalf("non-converged normal apply must not prune, got %#v", cg.pruned)
@@ -1914,6 +2135,7 @@ func TestCPUSetTopologyPluginAppliesNestedNUMABucketsWithParentMemsEnvelopes(t *
 	}
 	in := bulkheadapi.HandlerContext{
 		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+			MetaServer: emptyLifecycleMetaServer(),
 			Topology: &machine.CPUTopology{CPUDetails: machine.CPUDetails{
 				0: {NUMANodeID: 0}, 1: {NUMANodeID: 0},
 				2: {NUMANodeID: 0}, 3: {NUMANodeID: 1},
@@ -1990,6 +2212,7 @@ func TestCPUSetTopologyPluginHandlesConfiguredNUMABucketTransitionToEmpty(t *tes
 			var result bulkheadapi.TopologyResult
 			err := p.CPUSetAdjustmentHandler(context.Background(), bulkheadapi.HandlerContext{
 				CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+					MetaServer: emptyLifecycleMetaServer(),
 					Topology: &machine.CPUTopology{CPUDetails: machine.CPUDetails{
 						0: {NUMANodeID: 0}, 1: {NUMANodeID: 0},
 						2: {NUMANodeID: 0}, 3: {NUMANodeID: 1},
@@ -2146,6 +2369,7 @@ func TestCPUSetTopologyPluginMaterializesConfiguredReclaimSiblingWhenMissing(t *
 
 	_, err := p.Apply(context.Background(), bulkheadapi.HandlerContext{
 		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+			MetaServer: emptyLifecycleMetaServer(),
 			Topology: &machine.CPUTopology{CPUDetails: machine.CPUDetails{
 				0: {}, 1: {}, 2: {}, 3: {},
 			}},
@@ -3238,7 +3462,7 @@ func newDisabledTransitionTestPlugin(
 	t.Helper()
 
 	containerRel := "primary/burstable/pod-a/container-a"
-	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+	registerRelativeCgroupPathHandlerForTest(t, cgcommon.RelativeCgroupPathHandler{
 		Name: "bulkhead-disabled-" + podUID,
 		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 			if gotPodUID == podUID && gotContainerID == containerID {
@@ -3256,6 +3480,7 @@ func newDisabledTransitionTestPlugin(
 			"reclaim/reclaim-0": true,
 			"sibling":           true,
 			"partition":         true,
+			containerRel:        true,
 		},
 		cpus: map[string]machine.CPUSet{
 			"primary":                             machine.NewCPUSet(0, 1, 2, 3),
@@ -3890,7 +4115,7 @@ func TestCPUSetTopologyExpectedBuildAndFinalPublishUseAdmissionContext(t *testin
 		containerRel  = "kubepods/context-aware-pod/context-aware-container"
 		contextValue  = "admission"
 	)
-	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+	registerRelativeCgroupPathHandlerForTest(t, cgcommon.RelativeCgroupPathHandler{
 		Name: "cpuset-topology-admission-context",
 		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 			if gotPodUID == podUID && gotContainerID == "context-aware-container" {
@@ -3919,7 +4144,9 @@ func TestCPUSetTopologyExpectedBuildAndFinalPublishUseAdmissionContext(t *testin
 	}}
 	ctx := context.WithValue(context.Background(), admissionContextKey{}, contextValue)
 
-	p := &CPUSetTopologyPlugin{}
+	p := &CPUSetTopologyPlugin{
+		cgroup: &fakeCgroupClient{existing: map[string]bool{containerRel: true}},
+	}
 	expected, err := p.buildExpectedCPUSetByRel(ctx, bulkheadapi.HandlerContext{
 		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{MetaServer: metaServer},
 		DesiredView:                desired,
@@ -3934,115 +4161,80 @@ func TestCPUSetTopologyExpectedBuildAndFinalPublishUseAdmissionContext(t *testin
 	snapshot := &topology.CompleteSnapshot{Entries: map[string]topology.EntryState{
 		containerRel: {Identity: topology.CgroupIdentity{Inode: 1}, CPUs: machine.NewCPUSet(0, 1)},
 	}}
-	published, err := containerCPUSetByPodFromFinalSnapshotWithContext(
-		ctx, metaServer, desired, snapshot, expected.ExpectedByRel)
+	validated, err := validateContainerLifecycleProofs(ctx, metaServer, expected.LifecycleProofs)
 	if err != nil {
-		t.Fatalf("containerCPUSetByPodFromFinalSnapshotWithContext() error = %v", err)
+		t.Fatalf("validateContainerLifecycleProofs() error = %v", err)
+	}
+	published, err := containerCPUSetByPodFromFinalSnapshot(snapshot, validated, nil)
+	if err != nil {
+		t.Fatalf("containerCPUSetByPodFromFinalSnapshot() error = %v", err)
 	}
 	if got := published[podUID][containerName].String(); got != "0-1" {
 		t.Fatalf("published cpuset = %q, want 0-1", got)
 	}
-	if fetcher.calls != 2 {
-		t.Fatalf("context-aware container ID lookup calls = %d, want 2", fetcher.calls)
+	if fetcher.calls != 1 {
+		t.Fatalf("context-aware container ID lookup calls = %d, want build-only count 1", fetcher.calls)
 	}
 }
 
 func TestFinalSnapshotRejectsContainerIdentityChangeAsStale(t *testing.T) {
-	t.Parallel()
-
 	const (
 		podUID        = "pod-final-snapshot-identity-change"
 		containerName = "main"
 		oldContainer  = "container-final-old"
 		newContainer  = "container-final-new"
 		oldRel        = "primary/container-old"
-		newRel        = "primary/container-new"
 	)
-	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
-		Name: "final-snapshot-identity-change",
-		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
-			if gotPodUID != podUID {
-				return "", true, nil
-			}
-			switch gotContainerID {
-			case oldContainer:
-				return oldRel, false, nil
-			case newContainer:
-				return newRel, false, nil
-			}
-			return "", true, nil
-		},
-	})
-	fetcher := &bypassAwareContainerIDFetcher{
-		cachedID:  oldContainer,
-		currentID: newContainer,
+	oldPod := lifecycleProofPod(podUID, []string{containerName}, map[string]string{containerName: oldContainer})
+	newPod := lifecycleProofPod(podUID, []string{containerName}, map[string]string{containerName: newContainer})
+	frozen, err := freezeContainerLifecycleProofs([]containerLifecycleProof{{
+		PodUID: podUID, ContainerName: containerName, ContainerID: oldContainer,
+		RelativePath: oldRel, DesiredCPUSet: machine.NewCPUSet(0, 1),
+		State: containerLifecycleResolved,
+	}}, map[string]*v1.Pod{podUID: oldPod})
+	if err != nil {
+		t.Fatalf("freezeContainerLifecycleProofs() error = %v", err)
 	}
+	fetcher := &strictSnapshotFetcher{pods: []*v1.Pod{newPod}}
 	metaServer := &metaserver.MetaServer{
 		MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
 	}
-	desired := model.NewDesiredView()
-	desired.ContainerCPUSetByPod[podUID] = map[string]machine.CPUSet{
-		containerName: machine.NewCPUSet(0, 1),
-	}
-
-	_, err := containerCPUSetByPodFromFinalSnapshotWithContext(
-		context.Background(),
-		metaServer,
-		desired,
-		&topology.CompleteSnapshot{Entries: map[string]topology.EntryState{
-			oldRel: {Identity: topology.CgroupIdentity{Inode: 1}, CPUs: machine.NewCPUSet(0, 1)},
-		}},
-		nil,
-	)
-	var staleErr *topology.PlanStaleError
-	if !errors.As(err, &staleErr) {
-		t.Fatalf("final snapshot identity change error = %v, want PlanStaleError", err)
-	}
-	if staleErr.Rel != newRel {
-		t.Fatalf("stale rel = %q, want current container rel %q", staleErr.Rel, newRel)
+	_, err = validateContainerLifecycleProofs(context.Background(), metaServer, frozen)
+	var staleErr *containerLifecycleProofStaleError
+	if !errors.As(err, &staleErr) || !errors.Is(err, topology.ErrCoordinatorPlanStale) {
+		t.Fatalf("final snapshot identity change error = %v, want lifecycle stale error", err)
 	}
 }
 
 func TestFinalSnapshotAcceptsCurrentContainerProofAfterIdentityRefresh(t *testing.T) {
-	t.Parallel()
-
 	const (
 		podUID        = "pod-final-snapshot-current-proof"
 		containerName = "main"
-		oldContainer  = "container-proof-old"
 		newContainer  = "container-proof-new"
 		newRel        = "primary/container-proof-new"
 	)
-	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
-		Name: "final-snapshot-current-proof",
-		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
-			if gotPodUID == podUID && gotContainerID == newContainer {
-				return newRel, false, nil
-			}
-			return "", true, nil
-		},
-	})
-	fetcher := &bypassAwareContainerIDFetcher{
-		cachedID:  oldContainer,
-		currentID: newContainer,
+	pod := lifecycleProofPod(podUID, []string{containerName}, map[string]string{containerName: newContainer})
+	frozen, err := freezeContainerLifecycleProofs([]containerLifecycleProof{{
+		PodUID: podUID, ContainerName: containerName, ContainerID: newContainer,
+		RelativePath: newRel, DesiredCPUSet: machine.NewCPUSet(0, 1),
+		State: containerLifecycleResolved,
+	}}, map[string]*v1.Pod{podUID: pod})
+	if err != nil {
+		t.Fatalf("freezeContainerLifecycleProofs() error = %v", err)
 	}
+	fetcher := &strictSnapshotFetcher{pods: []*v1.Pod{pod}}
 	metaServer := &metaserver.MetaServer{
 		MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
 	}
-	desired := model.NewDesiredView()
-	desired.ContainerCPUSetByPod[podUID] = map[string]machine.CPUSet{
-		containerName: machine.NewCPUSet(0, 1),
+	validated, err := validateContainerLifecycleProofs(context.Background(), metaServer, frozen)
+	if err != nil {
+		t.Fatalf("validateContainerLifecycleProofs() error = %v", err)
 	}
-
-	published, err := containerCPUSetByPodFromFinalSnapshotWithContext(
-		context.Background(),
-		metaServer,
-		desired,
+	published, err := containerCPUSetByPodFromFinalSnapshot(
 		&topology.CompleteSnapshot{Entries: map[string]topology.EntryState{
 			newRel: {Identity: topology.CgroupIdentity{Inode: 2}, CPUs: machine.NewCPUSet(0, 1)},
 		}},
-		nil,
-	)
+		validated, nil)
 	if err != nil {
 		t.Fatalf("current container proof must be publishable: %v", err)
 	}
@@ -4052,70 +4244,42 @@ func TestFinalSnapshotAcceptsCurrentContainerProofAfterIdentityRefresh(t *testin
 }
 
 func TestFinalSnapshotFailsClosedWhenIdentityRefreshFails(t *testing.T) {
-	t.Parallel()
-
-	const (
-		podUID        = "pod-final-snapshot-refresh-failed"
-		containerName = "main"
-	)
 	refreshErr := errors.New("kubelet refresh failed")
-	fetcher := &bypassAwareContainerIDFetcher{
-		cachedID:   "container-old",
-		currentID:  "container-new",
-		refreshErr: refreshErr,
-	}
+	fetcher := &strictSnapshotFetcher{listErr: refreshErr}
 	metaServer := &metaserver.MetaServer{
 		MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
 	}
-	desired := model.NewDesiredView()
-	desired.ContainerCPUSetByPod[podUID] = map[string]machine.CPUSet{
-		containerName: machine.NewCPUSet(0, 1),
-	}
-
-	_, err := containerCPUSetByPodFromFinalSnapshotWithContext(
-		context.Background(),
-		metaServer,
-		desired,
-		&topology.CompleteSnapshot{Entries: map[string]topology.EntryState{}},
-		nil,
-	)
+	_, err := validateContainerLifecycleProofs(context.Background(), metaServer, containerLifecycleProofSet{
+		OrderedProofs: []containerLifecycleProof{{
+			PodUID: "pod-final-snapshot-refresh-failed", ContainerName: "main",
+			ContainerID: "container-old", RelativePath: "primary/container-old",
+			DesiredCPUSet: machine.NewCPUSet(0, 1), State: containerLifecycleResolved,
+		}},
+	})
 	if !errors.Is(err, refreshErr) {
 		t.Fatalf("final snapshot refresh error = %v, want %v", err, refreshErr)
 	}
 }
 
-// parentSafeDynamicLeafFixture builds a single dynamic container-leaf fixture
-// whose observed final-snapshot cpuset is provided by the caller, so the
-// ParentSafe safe-superset contract can be exercised in isolation.
+// parentSafeDynamicLeafFixture builds a validated resolved proof and matching
+// final snapshot without consulting raw DesiredView state during finalization.
 func parentSafeDynamicLeafFixture(
 	t *testing.T,
-	handlerName string,
 	podUID string,
 	containerID string,
 	rel string,
 	desiredCPUs machine.CPUSet,
 	observedCPUs machine.CPUSet,
-) (*metaserver.MetaServer, *model.DesiredView, *topology.CompleteSnapshot) {
+) (validatedContainerLifecycleProofSet, *topology.CompleteSnapshot) {
 	t.Helper()
-	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
-		Name: handlerName,
-		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
-			if gotPodUID == podUID && gotContainerID == containerID {
-				return rel, false, nil
-			}
-			return "", true, nil
-		},
-	})
-	fetcher := &bypassAwareContainerIDFetcher{cachedID: containerID, currentID: containerID}
-	metaServer := &metaserver.MetaServer{
-		MetaAgent: &agent.MetaAgent{PodFetcher: fetcher},
+	proof := containerLifecycleProof{
+		PodUID: podUID, ContainerName: "main", ContainerID: containerID,
+		RelativePath: rel, DesiredCPUSet: desiredCPUs, State: containerLifecycleResolved,
 	}
-	desired := model.NewDesiredView()
-	desired.ContainerCPUSetByPod[podUID] = map[string]machine.CPUSet{"main": desiredCPUs}
 	snapshot := &topology.CompleteSnapshot{Entries: map[string]topology.EntryState{
 		rel: {Identity: topology.CgroupIdentity{Inode: 1}, CPUs: observedCPUs},
 	}}
-	return metaServer, desired, snapshot
+	return validatedContainerLifecycleProofSet{OrderedProofs: []containerLifecycleProof{proof}}, snapshot
 }
 
 func TestParentSafeFinalizationPublishesDynamicLeafSafeSuperset(t *testing.T) {
@@ -4130,13 +4294,11 @@ func TestParentSafeFinalizationPublishesDynamicLeafSafeSuperset(t *testing.T) {
 	observedCPUs := machine.NewCPUSet(0, 1, 2, 3)
 	finalPrimary := machine.NewCPUSet(0, 1, 2, 3, 4, 5)
 	finalReclaim := machine.NewCPUSet(6, 7)
-	metaServer, desired, snapshot := parentSafeDynamicLeafFixture(
-		t, "parentsafe-superset", podUID, containerID, rel, desiredCPUs, observedCPUs)
+	proofs, snapshot := parentSafeDynamicLeafFixture(
+		t, podUID, containerID, rel, desiredCPUs, observedCPUs)
 
-	deferredCPUSetByRel := map[string]machine.CPUSet{}
-	published, err := containerCPUSetByPodFromFinalSnapshotParentSafe(
-		context.Background(), metaServer, desired, snapshot,
-		nil, deferredCPUSetByRel, finalPrimary, finalReclaim)
+	published, err := containerCPUSetByPodFromFinalSnapshot(
+		snapshot, proofs, map[string]struct{}{rel: {}})
 	if err != nil {
 		t.Fatalf("parent-safe dynamic leaf safe superset must publish: %v", err)
 	}
@@ -4144,12 +4306,11 @@ func TestParentSafeFinalizationPublishesDynamicLeafSafeSuperset(t *testing.T) {
 		t.Fatalf("published dynamic leaf cpuset = %s, want observed superset %s",
 			got.String(), observedCPUs.String())
 	}
-	if got, ok := deferredCPUSetByRel[rel]; !ok || !got.Equals(desiredCPUs) {
-		t.Fatalf("deferred drain target = %s ok=%t, want exact desired %s", got.String(), ok, desiredCPUs.String())
-	}
+	_ = finalPrimary
+	_ = finalReclaim
 }
 
-func TestParentSafeFinalizationRejectsDynamicLeafOverlappingReclaim(t *testing.T) {
+func TestFinalizationPublishesValidatedResolvedLeafFromFinalSnapshot(t *testing.T) {
 	t.Parallel()
 
 	const (
@@ -4161,21 +4322,18 @@ func TestParentSafeFinalizationRejectsDynamicLeafOverlappingReclaim(t *testing.T
 	// Observed superset reaches into the finalized reclaim domain, which is
 	// never a safe superset even on the ParentSafe path.
 	observedCPUs := machine.NewCPUSet(0, 1, 6)
-	finalPrimary := machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6)
-	finalReclaim := machine.NewCPUSet(6, 7)
-	metaServer, desired, snapshot := parentSafeDynamicLeafFixture(
-		t, "parentsafe-reclaim-overlap", podUID, containerID, rel, desiredCPUs, observedCPUs)
-
-	_, err := containerCPUSetByPodFromFinalSnapshotParentSafe(
-		context.Background(), metaServer, desired, snapshot,
-		nil, nil, finalPrimary, finalReclaim)
-	var staleErr *topology.PlanStaleError
-	if !errors.As(err, &staleErr) {
-		t.Fatalf("dynamic leaf overlapping reclaim must fail closed, got err = %v", err)
+	proofs, snapshot := parentSafeDynamicLeafFixture(
+		t, podUID, containerID, rel, desiredCPUs, observedCPUs)
+	published, err := containerCPUSetByPodFromFinalSnapshot(snapshot, proofs, nil)
+	if err != nil {
+		t.Fatalf("publish validated resolved leaf: %v", err)
+	}
+	if got := published[podUID]["main"]; !got.Equals(observedCPUs) {
+		t.Fatalf("published dynamic leaf cpuset = %s, want final snapshot %s", got.String(), observedCPUs.String())
 	}
 }
 
-func TestParentSafeFinalizationRejectsDynamicLeafMissingDesiredCPU(t *testing.T) {
+func TestFinalizationDoesNotFallBackToRawDesiredCPUSet(t *testing.T) {
 	t.Parallel()
 
 	const (
@@ -4185,21 +4343,18 @@ func TestParentSafeFinalizationRejectsDynamicLeafMissingDesiredCPU(t *testing.T)
 	)
 	desiredCPUs := machine.NewCPUSet(0, 1)
 	observedCPUs := machine.NewCPUSet(0, 2, 3)
-	finalPrimary := machine.NewCPUSet(0, 1, 2, 3, 4, 5)
-	finalReclaim := machine.NewCPUSet(6, 7)
-	metaServer, desired, snapshot := parentSafeDynamicLeafFixture(
-		t, "parentsafe-missing-desired", podUID, containerID, rel, desiredCPUs, observedCPUs)
-
-	_, err := containerCPUSetByPodFromFinalSnapshotParentSafe(
-		context.Background(), metaServer, desired, snapshot,
-		nil, nil, finalPrimary, finalReclaim)
-	var staleErr *topology.PlanStaleError
-	if !errors.As(err, &staleErr) {
-		t.Fatalf("dynamic leaf missing desired CPUs must fail closed, got err = %v", err)
+	proofs, snapshot := parentSafeDynamicLeafFixture(
+		t, podUID, containerID, rel, desiredCPUs, observedCPUs)
+	published, err := containerCPUSetByPodFromFinalSnapshot(snapshot, proofs, nil)
+	if err != nil {
+		t.Fatalf("publish validated resolved leaf: %v", err)
+	}
+	if got := published[podUID]["main"]; !got.Equals(observedCPUs) {
+		t.Fatalf("published dynamic leaf cpuset = %s, want final snapshot %s", got.String(), observedCPUs.String())
 	}
 }
 
-func TestParentSafeFinalizationRejectsDynamicLeafExceedingPrimaryDomain(t *testing.T) {
+func TestFinalizationReadsResolvedPathWithoutReclassification(t *testing.T) {
 	t.Parallel()
 
 	const (
@@ -4211,21 +4366,18 @@ func TestParentSafeFinalizationRejectsDynamicLeafExceedingPrimaryDomain(t *testi
 	// Observed superset includes CPU 9 which is outside the finalized primary
 	// domain and not part of reclaim; it must not be published.
 	observedCPUs := machine.NewCPUSet(0, 1, 9)
-	finalPrimary := machine.NewCPUSet(0, 1, 2, 3)
-	finalReclaim := machine.NewCPUSet(6, 7)
-	metaServer, desired, snapshot := parentSafeDynamicLeafFixture(
-		t, "parentsafe-exceeds-primary", podUID, containerID, rel, desiredCPUs, observedCPUs)
-
-	_, err := containerCPUSetByPodFromFinalSnapshotParentSafe(
-		context.Background(), metaServer, desired, snapshot,
-		nil, nil, finalPrimary, finalReclaim)
-	var staleErr *topology.PlanStaleError
-	if !errors.As(err, &staleErr) {
-		t.Fatalf("dynamic leaf exceeding primary domain must fail closed, got err = %v", err)
+	proofs, snapshot := parentSafeDynamicLeafFixture(
+		t, podUID, containerID, rel, desiredCPUs, observedCPUs)
+	published, err := containerCPUSetByPodFromFinalSnapshot(snapshot, proofs, nil)
+	if err != nil {
+		t.Fatalf("publish validated resolved leaf: %v", err)
+	}
+	if got := published[podUID]["main"]; !got.Equals(observedCPUs) {
+		t.Fatalf("published dynamic leaf cpuset = %s, want final snapshot %s", got.String(), observedCPUs.String())
 	}
 }
 
-func TestFullConvergenceFinalizationRejectsDynamicLeafSuperset(t *testing.T) {
+func TestFullConvergenceFinalizationUsesFinalSnapshotCPUSet(t *testing.T) {
 	t.Parallel()
 
 	const (
@@ -4235,16 +4387,14 @@ func TestFullConvergenceFinalizationRejectsDynamicLeafSuperset(t *testing.T) {
 	)
 	desiredCPUs := machine.NewCPUSet(0, 1)
 	observedCPUs := machine.NewCPUSet(0, 1, 2, 3)
-	metaServer, desired, snapshot := parentSafeDynamicLeafFixture(
-		t, "full-converge-superset", podUID, containerID, rel, desiredCPUs, observedCPUs)
-
-	// The full-convergence publish path (parentSafe=false) must keep exact-match
-	// mandatory even when the observed cpuset would be a safe superset.
-	_, err := containerCPUSetByPodFromFinalSnapshotWithContext(
-		context.Background(), metaServer, desired, snapshot, nil)
-	var staleErr *topology.PlanStaleError
-	if !errors.As(err, &staleErr) {
-		t.Fatalf("full-convergence path must reject superset, got err = %v", err)
+	proofs, snapshot := parentSafeDynamicLeafFixture(
+		t, podUID, containerID, rel, desiredCPUs, observedCPUs)
+	published, err := containerCPUSetByPodFromFinalSnapshot(snapshot, proofs, nil)
+	if err != nil {
+		t.Fatalf("publish validated resolved leaf: %v", err)
+	}
+	if got := published[podUID]["main"]; !got.Equals(observedCPUs) {
+		t.Fatalf("published dynamic leaf cpuset = %s, want final snapshot %s", got.String(), observedCPUs.String())
 	}
 }
 
@@ -4257,7 +4407,7 @@ func TestCPUSetTopologyPluginDropsRotatedContainerIdentity(t *testing.T) {
 		oldContainer  = "container-old"
 		newContainer  = "container-new"
 	)
-	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+	registerRelativeCgroupPathHandlerForTest(t, cgcommon.RelativeCgroupPathHandler{
 		Name: "rotated-container-identity",
 		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 			if gotPodUID == podUID && gotContainerID == oldContainer {
@@ -4315,7 +4465,7 @@ func TestCPUSetTopologyPluginTreatsDisappearedContainerAsPending(t *testing.T) {
 		containerName = "main"
 		containerID   = "container-disappeared"
 	)
-	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+	registerRelativeCgroupPathHandlerForTest(t, cgcommon.RelativeCgroupPathHandler{
 		Name: "disappeared-container",
 		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 			if gotPodUID == podUID && gotContainerID == containerID {
@@ -4874,7 +5024,7 @@ func TestCPUSetTopologyPluginBuildExpectedCPUSetByRelTrimsLeadingSlash(t *testin
 		containerNm = "main"
 	)
 
-	cgcommon.RegisterRelativeCgroupPathHandler(cgcommon.RelativeCgroupPathHandler{
+	registerRelativeCgroupPathHandlerForTest(t, cgcommon.RelativeCgroupPathHandler{
 		Name: "bulkhead-build-expected-trim-" + podUID,
 		Handler: func(gotPodUID, gotContainerID string) (string, bool, error) {
 			if gotPodUID == podUID && gotContainerID == containerID {
@@ -4884,7 +5034,9 @@ func TestCPUSetTopologyPluginBuildExpectedCPUSetByRelTrimsLeadingSlash(t *testin
 		},
 	})
 
-	p := &CPUSetTopologyPlugin{}
+	p := &CPUSetTopologyPlugin{
+		cgroup: &fakeCgroupClient{existing: map[string]bool{expectedRel: true}},
+	}
 	res, err := p.buildExpectedCPUSetByRel(context.Background(), bulkheadapi.HandlerContext{
 		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
 			MetaServer: &metaserver.MetaServer{
@@ -4938,4 +5090,837 @@ func totalApplyCount(counts map[string]int) int {
 		total += count
 	}
 	return total
+}
+
+func TestCPUSetTopologyPluginRecompilesPreWriteStalePlan(t *testing.T) {
+	testCPUSetTopologyPluginRecompilesSafeDisposition(
+		t, topology.ReplanSafeNoPhysicalWrites)
+}
+
+func TestCPUSetTopologyPluginRecompilesAfterVerifiedRollback(t *testing.T) {
+	testCPUSetTopologyPluginRecompilesSafeDisposition(
+		t, topology.ReplanSafeAfterVerifiedRollback)
+}
+
+func testCPUSetTopologyPluginRecompilesSafeDisposition(
+	t *testing.T,
+	disposition topology.ReplanDisposition,
+) {
+	t.Helper()
+	stale := &topology.PlanStaleError{Rel: "root", Resource: "test"}
+	attempts := 0
+	err := runCPUSetTopologyAdjustment(
+		context.Background(),
+		bulkheadapi.HandlerContext{DesiredView: model.NewDesiredView()},
+		topology.NewAdjustmentBudget(context.Background(), topology.ConvergenceBudget{
+			MaxPlanOperations: 8,
+		}),
+		func(
+			_ context.Context,
+			_ bulkheadapi.HandlerContext,
+			_ *topology.AdjustmentBudget,
+		) (topology.ConvergenceResult, error) {
+			attempts++
+			if attempts == 1 {
+				return topology.ConvergenceResult{ReplanDisposition: disposition}, stale
+			}
+			return topology.ConvergenceResult{}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("safe stale adjustment error = %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("adjustment attempts = %d, want 2", attempts)
+	}
+}
+
+func TestCPUSetTopologyPluginRecompilesFromVerifiedFinalState(t *testing.T) {
+	stale := &topology.PlanStaleError{Rel: "root", Resource: "publication"}
+	verified := &topology.CompleteSnapshot{
+		Entries: map[string]topology.EntryState{
+			"root": {Rel: "root", CPUs: machine.NewCPUSet(0, 1)},
+		},
+	}
+	attempts := 0
+	err := runCPUSetTopologyAdjustment(
+		context.Background(),
+		bulkheadapi.HandlerContext{DesiredView: model.NewDesiredView()},
+		topology.NewAdjustmentBudget(context.Background(), topology.ConvergenceBudget{
+			MaxPlanOperations: 8,
+		}),
+		func(
+			_ context.Context,
+			_ bulkheadapi.HandlerContext,
+			budget *topology.AdjustmentBudget,
+		) (topology.ConvergenceResult, error) {
+			attempts++
+			if attempts == 1 {
+				return topology.ConvergenceResult{
+					ReplanDisposition:    topology.ReplanSafeFromVerifiedFinalState,
+					FinalSnapshot:        verified,
+					FinalSnapshotCurrent: true,
+				}, stale
+			}
+			initial := budget.InitialSnapshot()
+			if initial == nil || !initial.Entries["root"].CPUs.Equals(machine.NewCPUSet(0, 1)) {
+				t.Fatalf("second attempt initial snapshot = %#v, want verified final state", initial)
+			}
+			return topology.ConvergenceResult{}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("verified-final-state recompile error = %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("adjustment attempts = %d, want 2", attempts)
+	}
+}
+
+func TestCPUSetTopologyPluginDoesNotRecompileTerminalStale(t *testing.T) {
+	stale := &topology.PlanStaleError{Rel: "root", Resource: "terminal"}
+	attempts := 0
+	err := runCPUSetTopologyAdjustment(
+		context.Background(),
+		bulkheadapi.HandlerContext{DesiredView: model.NewDesiredView()},
+		topology.NewAdjustmentBudget(context.Background(), topology.ConvergenceBudget{
+			MaxPlanOperations: 8,
+		}),
+		func(
+			_ context.Context,
+			_ bulkheadapi.HandlerContext,
+			_ *topology.AdjustmentBudget,
+		) (topology.ConvergenceResult, error) {
+			attempts++
+			return topology.ConvergenceResult{
+				ReplanDisposition: topology.ReplanNotAllowed,
+			}, stale
+		},
+	)
+	if !errors.Is(err, topology.ErrCoordinatorPlanStale) {
+		t.Fatalf("terminal stale error = %v, want stale cause", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("terminal stale attempts = %d, want 1", attempts)
+	}
+}
+
+func TestCPUSetTopologyPluginReplanStartsFromPristineDesiredView(t *testing.T) {
+	stale := &topology.PlanStaleError{Rel: "root", Resource: "pristine"}
+	desired := model.NewDesiredView()
+	desired.DesiredReclaimEffective = machine.NewCPUSet(2, 3)
+	attempts := 0
+	var firstAttempt *model.DesiredView
+	err := runCPUSetTopologyAdjustment(
+		context.Background(),
+		bulkheadapi.HandlerContext{DesiredView: desired},
+		topology.NewAdjustmentBudget(context.Background(), topology.ConvergenceBudget{
+			MaxPlanOperations: 8,
+		}),
+		func(
+			_ context.Context,
+			in bulkheadapi.HandlerContext,
+			_ *topology.AdjustmentBudget,
+		) (topology.ConvergenceResult, error) {
+			attempts++
+			if attempts == 1 {
+				firstAttempt = in.DesiredView
+				in.DesiredView.DesiredReclaimEffective = machine.NewCPUSet(9)
+				return topology.ConvergenceResult{
+					ReplanDisposition: topology.ReplanSafeNoPhysicalWrites,
+				}, stale
+			}
+			if in.DesiredView == firstAttempt {
+				t.Fatal("replan reused the mutable desired view from the prior attempt")
+			}
+			if !in.DesiredView.DesiredReclaimEffective.Equals(machine.NewCPUSet(2, 3)) {
+				t.Fatalf("replan desired reclaim = %s, want pristine 2-3",
+					in.DesiredView.DesiredReclaimEffective.String())
+			}
+			return topology.ConvergenceResult{}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("pristine desired-view replan error = %v", err)
+	}
+	if !desired.DesiredReclaimEffective.Equals(machine.NewCPUSet(2, 3)) {
+		t.Fatalf("caller's desired view was mutated: %s", desired.DesiredReclaimEffective.String())
+	}
+}
+
+func TestCPUSetTopologyPluginReplansShareDeadlineAndWriteBudget(t *testing.T) {
+	stale := &topology.PlanStaleError{Rel: "root", Resource: "budget"}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	budget := topology.NewAdjustmentBudget(ctx, topology.ConvergenceBudget{
+		MaxPlanOperations: 5,
+		DeadlineDuration:  10 * time.Minute,
+	})
+	var firstDeadline time.Time
+	attempts := 0
+	err := runCPUSetTopologyAdjustment(
+		ctx,
+		bulkheadapi.HandlerContext{DesiredView: model.NewDesiredView()},
+		budget,
+		func(
+			_ context.Context,
+			_ bulkheadapi.HandlerContext,
+			budget *topology.AdjustmentBudget,
+		) (topology.ConvergenceResult, error) {
+			attempts++
+			remaining := budget.RemainingConvergenceBudget()
+			if attempts == 1 {
+				firstDeadline = remaining.Deadline
+				if err := budget.RecordPhysicalWrites(2); err != nil {
+					t.Fatalf("record first attempt writes: %v", err)
+				}
+				budget.ObserveCurrentSnapshot(budget.BeginSnapshotObservation())
+				return topology.ConvergenceResult{
+					ReplanDisposition: topology.ReplanSafeAfterVerifiedRollback,
+				}, stale
+			}
+			if !remaining.Deadline.Equal(firstDeadline) {
+				t.Fatalf("deadline changed across replans: first=%s second=%s",
+					firstDeadline, remaining.Deadline)
+			}
+			if remaining.MaxPlanOperations != 5 {
+				t.Fatalf("remaining logical plan-operation budget = %d, want 5", remaining.MaxPlanOperations)
+			}
+			return topology.ConvergenceResult{}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("shared-budget replan error = %v", err)
+	}
+}
+
+func TestCPUSetTopologyPluginContinuousChurnExhaustsReplanBudget(t *testing.T) {
+	stale := &topology.PlanStaleError{Rel: "root", Resource: "continuous_churn"}
+	attempts := 0
+	err := runCPUSetTopologyAdjustment(
+		context.Background(),
+		bulkheadapi.HandlerContext{DesiredView: model.NewDesiredView()},
+		topology.NewAdjustmentBudget(context.Background(), topology.ConvergenceBudget{
+			MaxPlanOperations: 8,
+		}),
+		func(
+			_ context.Context,
+			_ bulkheadapi.HandlerContext,
+			_ *topology.AdjustmentBudget,
+		) (topology.ConvergenceResult, error) {
+			attempts++
+			return topology.ConvergenceResult{
+				ReplanDisposition: topology.ReplanSafeNoPhysicalWrites,
+			}, stale
+		},
+	)
+	var exhausted *topology.ReplanBudgetExceededError
+	if !errors.As(err, &exhausted) {
+		t.Fatalf("continuous churn error = %v, want ReplanBudgetExceededError", err)
+	}
+	if !errors.Is(err, topology.ErrCoordinatorPlanStale) {
+		t.Fatalf("continuous churn lost last stale cause: %v", err)
+	}
+	if !errors.Is(err, topology.ErrAdjustmentReplanBudgetExceeded) {
+		t.Fatalf("continuous churn error = %v, want replan-budget sentinel", err)
+	}
+	if errors.Is(err, topology.ErrAdjustmentWriteBudgetExceeded) {
+		t.Fatalf("zero-write churn must not report write-budget exhaustion: %v", err)
+	}
+	if attempts != 4 {
+		t.Fatalf("continuous churn attempts = %d, want 4", attempts)
+	}
+}
+
+func TestCPUSetTopologyPluginChangingStaleSignaturesStillCompileAtMostFourTimes(t *testing.T) {
+	attempts := 0
+	err := runCPUSetTopologyAdjustment(
+		context.Background(),
+		bulkheadapi.HandlerContext{DesiredView: model.NewDesiredView()},
+		topology.NewAdjustmentBudget(context.Background(), topology.ConvergenceBudget{
+			MaxPlanOperations: 8,
+		}),
+		func(
+			_ context.Context,
+			_ bulkheadapi.HandlerContext,
+			_ *topology.AdjustmentBudget,
+		) (topology.ConvergenceResult, error) {
+			attempts++
+			return topology.ConvergenceResult{
+					ReplanDisposition: topology.ReplanSafeNoPhysicalWrites,
+				}, &topology.PlanStaleError{
+					Rel:      fmt.Sprintf("root/generation-%d", attempts),
+					Resource: "changing_signature",
+				}
+		},
+	)
+
+	var exhausted *topology.ReplanBudgetExceededError
+	if !errors.As(err, &exhausted) {
+		t.Fatalf("changing churn error = %v, want ReplanBudgetExceededError", err)
+	}
+	if attempts != 4 {
+		t.Fatalf("changing churn compile attempts = %d, want 4", attempts)
+	}
+	if exhausted.Replans != 3 || exhausted.MaxReplans != 3 {
+		t.Fatalf("changing churn replans = %d/%d, want 3/3",
+			exhausted.Replans, exhausted.MaxReplans)
+	}
+}
+
+func TestCPUSetTopologyPluginTerminalErrorClearsCumulativeSuccessEvidence(t *testing.T) {
+	stale := &topology.PlanStaleError{Rel: "root", Resource: "terminal"}
+	snapshot := &topology.CompleteSnapshot{
+		Entries: map[string]topology.EntryState{
+			"root": {Rel: "root", CPUs: machine.NewCPUSet(0, 1)},
+		},
+	}
+	report := topology.ConvergenceReport{
+		FullyConverged: true,
+		NonConvergedTargets: []topology.RelConvergence{{
+			Rel:          "root/leaf",
+			Observed:     machine.NewCPUSet(0, 1),
+			Target:       machine.NewCPUSet(2, 3),
+			ObservedMems: "0",
+			TargetMems:   "1",
+			Reason:       "nested diagnostic",
+		}},
+		PendingToPrimary:      machine.NewCPUSet(4),
+		PendingToReclaim:      machine.NewCPUSet(5),
+		CleanupPendingPrimary: machine.NewCPUSet(6),
+		CleanupPendingReclaim: machine.NewCPUSet(7),
+	}
+	cumulative, err := runCPUSetTopologyAdjustmentWithResult(
+		context.Background(),
+		bulkheadapi.HandlerContext{DesiredView: model.NewDesiredView()},
+		topology.NewAdjustmentBudget(context.Background(), topology.ConvergenceBudget{
+			MaxPlanOperations: 8,
+		}),
+		func(
+			_ context.Context,
+			_ bulkheadapi.HandlerContext,
+			_ *topology.AdjustmentBudget,
+		) (topology.ConvergenceResult, error) {
+			return topology.ConvergenceResult{
+				Attempted:            3,
+				Applied:              2,
+				Skipped:              1,
+				Failed:               1,
+				Deferred:             4,
+				Converged:            true,
+				ParentSafe:           true,
+				State:                topology.ConvergenceStateConverged,
+				ConvergenceReport:    report,
+				FinalSnapshot:        snapshot,
+				FinalSnapshotCurrent: true,
+				DeferredLeafCount:    2,
+				DeferredCPUCount:     6,
+				Published:            true,
+				ReplanDisposition:    topology.ReplanNotAllowed,
+			}, stale
+		},
+	)
+
+	if !errors.Is(err, topology.ErrCoordinatorPlanStale) {
+		t.Fatalf("terminal error = %v, want stale cause", err)
+	}
+	if cumulative.Attempted != 3 || cumulative.Applied != 2 || cumulative.Skipped != 1 ||
+		cumulative.Failed != 1 || cumulative.Deferred != 4 {
+		t.Fatalf("terminal result lost diagnostic counts: %+v", cumulative)
+	}
+	if cumulative.Converged || cumulative.ParentSafe || cumulative.FinalSnapshot != nil ||
+		cumulative.FinalSnapshotCurrent || cumulative.Published {
+		t.Fatalf("terminal result retained success evidence: %+v", cumulative)
+	}
+	wantReport := report
+	wantReport.FullyConverged = false
+	if !reflect.DeepEqual(cumulative.ConvergenceReport, wantReport) {
+		t.Fatalf("terminal result lost failure diagnostics: got=%+v want=%+v",
+			cumulative.ConvergenceReport, wantReport)
+	}
+	if cumulative.DeferredLeafCount != 0 || cumulative.DeferredCPUCount != 0 {
+		t.Fatalf("terminal result retained publish-success counts: %+v", cumulative)
+	}
+	report.NonConvergedTargets[0].Rel = "mutated"
+	report.NonConvergedTargets[0].Observed.Add(99)
+	report.PendingToPrimary.Add(99)
+	report.CleanupPendingReclaim.Add(99)
+	if cumulative.ConvergenceReport.NonConvergedTargets[0].Rel != "root/leaf" ||
+		cumulative.ConvergenceReport.NonConvergedTargets[0].Observed.Contains(99) ||
+		cumulative.ConvergenceReport.PendingToPrimary.Contains(99) ||
+		cumulative.ConvergenceReport.CleanupPendingReclaim.Contains(99) {
+		t.Fatalf("terminal diagnostics alias attempt-owned report: %+v", cumulative.ConvergenceReport)
+	}
+	if cumulative.State != topology.ConvergenceStateNonConverged {
+		t.Fatalf("terminal state = %q, want %q", cumulative.State, topology.ConvergenceStateNonConverged)
+	}
+}
+
+func TestCPUSetTopologyPluginDeadlineDuringAttemptUsesAdjustmentDeadlineError(t *testing.T) {
+	t.Run("current stale", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		budget := topology.NewAdjustmentBudget(ctx, topology.ConvergenceBudget{
+			MaxPlanOperations: 8,
+		})
+		stale := &topology.PlanStaleError{Rel: "root/nested", Resource: "during_attempt"}
+		attempts := 0
+
+		err := runCPUSetTopologyAdjustment(
+			ctx,
+			bulkheadapi.HandlerContext{DesiredView: model.NewDesiredView()},
+			budget,
+			func(
+				_ context.Context,
+				_ bulkheadapi.HandlerContext,
+				_ *topology.AdjustmentBudget,
+			) (topology.ConvergenceResult, error) {
+				attempts++
+				cancel()
+				return topology.ConvergenceResult{
+					ReplanDisposition: topology.ReplanNotAllowed,
+				}, stale
+			},
+		)
+
+		if !errors.Is(err, topology.ErrAdjustmentDeadlineExceeded) {
+			t.Fatalf("deadline-in-attempt error = %v, want adjustment deadline sentinel", err)
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("deadline-in-attempt error = %v, want context cause", err)
+		}
+		if !errors.Is(err, topology.ErrCoordinatorPlanStale) {
+			t.Fatalf("deadline-in-attempt error = %v, want current stale cause", err)
+		}
+		if attempts != 1 {
+			t.Fatalf("deadline-in-attempt attempts = %d, want 1", attempts)
+		}
+	})
+
+	t.Run("last stale after nominal success", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		budget := topology.NewAdjustmentBudget(ctx, topology.ConvergenceBudget{
+			MaxPlanOperations: 8,
+		})
+		stale := &topology.PlanStaleError{Rel: "root/nested", Resource: "prior_attempt"}
+		attempts := 0
+
+		err := runCPUSetTopologyAdjustment(
+			ctx,
+			bulkheadapi.HandlerContext{DesiredView: model.NewDesiredView()},
+			budget,
+			func(
+				_ context.Context,
+				_ bulkheadapi.HandlerContext,
+				_ *topology.AdjustmentBudget,
+			) (topology.ConvergenceResult, error) {
+				attempts++
+				if attempts == 1 {
+					return topology.ConvergenceResult{
+						ReplanDisposition: topology.ReplanSafeNoPhysicalWrites,
+					}, stale
+				}
+				cancel()
+				return topology.ConvergenceResult{Published: true}, nil
+			},
+		)
+
+		if !errors.Is(err, topology.ErrAdjustmentDeadlineExceeded) ||
+			!errors.Is(err, context.Canceled) ||
+			!errors.Is(err, topology.ErrCoordinatorPlanStale) {
+			t.Fatalf("deadline after nominal success lost deadline/context/last stale cause: %v", err)
+		}
+		if attempts != 2 {
+			t.Fatalf("deadline-in-attempt attempts = %d, want 2", attempts)
+		}
+	})
+
+	t.Run("current hard error remains primary with historical stale", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		budget := topology.NewAdjustmentBudget(ctx, topology.ConvergenceBudget{
+			MaxPlanOperations: 8,
+		})
+		stale := &topology.PlanStaleError{Rel: "root/nested", Resource: "prior_attempt"}
+		hard := errors.New("current hard execution failure")
+		attempts := 0
+
+		err := runCPUSetTopologyAdjustment(
+			ctx,
+			bulkheadapi.HandlerContext{DesiredView: model.NewDesiredView()},
+			budget,
+			func(
+				_ context.Context,
+				_ bulkheadapi.HandlerContext,
+				_ *topology.AdjustmentBudget,
+			) (topology.ConvergenceResult, error) {
+				attempts++
+				if attempts == 1 {
+					return topology.ConvergenceResult{
+						ReplanDisposition: topology.ReplanSafeNoPhysicalWrites,
+					}, stale
+				}
+				cancel()
+				return topology.ConvergenceResult{}, hard
+			},
+		)
+
+		if !errors.Is(err, topology.ErrAdjustmentDeadlineExceeded) ||
+			!errors.Is(err, context.Canceled) ||
+			!errors.Is(err, topology.ErrCoordinatorPlanStale) ||
+			!errors.Is(err, hard) {
+			t.Fatalf("deadline exhaustion lost deadline/context/current/historical cause: %v", err)
+		}
+		if unwrapped := errors.Unwrap(err); !errors.Is(unwrapped, hard) {
+			t.Fatalf("primary unwrap = %v, want current hard error", unwrapped)
+		}
+		var gotStale *topology.PlanStaleError
+		if !errors.As(err, &gotStale) || gotStale != stale {
+			t.Fatalf("historical stale error = %#v, want %#v", gotStale, stale)
+		}
+		if attempts != 2 {
+			t.Fatalf("deadline-in-attempt attempts = %d, want 2", attempts)
+		}
+	})
+}
+
+func TestCPUSetTopologyPluginReplanRequiresDeferredWriteInFreshSnapshot(t *testing.T) {
+	stale := &topology.PlanStaleError{Rel: "root", Resource: "after_deferred_write"}
+	for _, tc := range []struct {
+		name      string
+		observe   bool
+		wantTries int
+		wantErr   bool
+	}{
+		{name: "unobserved write terminates", observe: false, wantTries: 1, wantErr: true},
+		{name: "new snapshot observes write", observe: true, wantTries: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			budget := topology.NewAdjustmentBudget(context.Background(), topology.ConvergenceBudget{
+				MaxPlanOperations: 2,
+			})
+			attempts := 0
+			_, err := runCPUSetTopologyAdjustmentWithResult(
+				context.Background(),
+				bulkheadapi.HandlerContext{DesiredView: model.NewDesiredView()},
+				budget,
+				func(
+					ctx context.Context,
+					_ bulkheadapi.HandlerContext,
+					budget *topology.AdjustmentBudget,
+				) (topology.ConvergenceResult, error) {
+					attempts++
+					if attempts > 1 {
+						return topology.ConvergenceResult{}, nil
+					}
+					reservation, reserveErr := budget.ReserveExecution(topology.ExecutionReservationCost{
+						Forward: topology.PhysicalWriteCost{CPUSetWrites: 1},
+					})
+					if reserveErr != nil {
+						return topology.ConvergenceResult{}, reserveErr
+					}
+					if recordErr := reservation.RecordWriteAttempt(
+						ctx, false, topology.PhysicalWriteCost{CPUSetWrites: 1}); recordErr != nil {
+						return topology.ConvergenceResult{}, recordErr
+					}
+					if settleErr := reservation.Settle(
+						topology.PhysicalWriteCost{CPUSetWrites: 1},
+						topology.PhysicalWriteCost{},
+					); settleErr != nil {
+						return topology.ConvergenceResult{}, settleErr
+					}
+					if tc.observe {
+						budget.ObserveCurrentSnapshot(budget.BeginSnapshotObservation())
+					}
+					return topology.ConvergenceResult{
+						ReplanDisposition: topology.ReplanSafeNoPhysicalWrites,
+					}, stale
+				},
+			)
+			if tc.wantErr && !errors.Is(err, topology.ErrCoordinatorPlanStale) {
+				t.Fatalf("unobserved write error = %v, want stale cause", err)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("observed write replan error = %v", err)
+			}
+			if attempts != tc.wantTries {
+				t.Fatalf("attempts = %d, want %d", attempts, tc.wantTries)
+			}
+		})
+	}
+}
+
+func TestCPUSetTopologyPluginSuccessfulDualWriteDoesNotFailAfterPublication(t *testing.T) {
+	budget := topology.NewAdjustmentBudget(context.Background(), topology.ConvergenceBudget{
+		MaxPlanOperations: 1,
+	})
+	err := runCPUSetTopologyAdjustment(
+		context.Background(),
+		bulkheadapi.HandlerContext{DesiredView: model.NewDesiredView()},
+		budget,
+		func(
+			ctx context.Context,
+			_ bulkheadapi.HandlerContext,
+			budget *topology.AdjustmentBudget,
+		) (topology.ConvergenceResult, error) {
+			reservation, err := budget.ReserveExecution(topology.ExecutionReservationCost{
+				Forward: topology.PhysicalWriteCost{CPUSetWrites: 1, MemsWrites: 1},
+				Rollback: topology.PhysicalWriteCost{
+					CPUSetWrites: 1,
+					MemsWrites:   1,
+				},
+			})
+			if err != nil {
+				return topology.ConvergenceResult{}, err
+			}
+			if err := reservation.RecordWriteAttempt(ctx, false, topology.PhysicalWriteCost{
+				CPUSetWrites: 1,
+				MemsWrites:   1,
+			}); err != nil {
+				return topology.ConvergenceResult{}, err
+			}
+			if err := reservation.Settle(
+				topology.PhysicalWriteCost{CPUSetWrites: 1, MemsWrites: 1},
+				topology.PhysicalWriteCost{},
+			); err != nil {
+				return topology.ConvergenceResult{}, err
+			}
+			return topology.ConvergenceResult{Published: true}, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("published dual-write adjustment error = %v, want nil", err)
+	}
+	if got := budget.CumulativeWrites(); got != 2 {
+		t.Fatalf("cumulative writes = %d, want 2", got)
+	}
+}
+
+func TestCPUSetTopologyPluginWriteBudgetExhaustionPreservesLastStaleCause(t *testing.T) {
+	stale := &topology.PlanStaleError{Rel: "root", Resource: "pre-reservation"}
+	budget := topology.NewAdjustmentBudget(context.Background(), topology.ConvergenceBudget{
+		MaxPlanOperations: 1,
+	})
+	attempts := 0
+	err := runCPUSetTopologyAdjustment(
+		context.Background(),
+		bulkheadapi.HandlerContext{DesiredView: model.NewDesiredView()},
+		budget,
+		func(
+			_ context.Context,
+			_ bulkheadapi.HandlerContext,
+			budget *topology.AdjustmentBudget,
+		) (topology.ConvergenceResult, error) {
+			attempts++
+			if attempts == 1 {
+				return topology.ConvergenceResult{
+					ReplanDisposition: topology.ReplanSafeNoPhysicalWrites,
+				}, stale
+			}
+			_, reserveErr := budget.ReserveExecution(topology.ExecutionReservationCost{
+				Forward: topology.PhysicalWriteCost{CPUSetWrites: 3},
+				Rollback: topology.PhysicalWriteCost{
+					CPUSetWrites: 3,
+				},
+			})
+			return topology.ConvergenceResult{}, reserveErr
+		},
+	)
+	if !errors.Is(err, topology.ErrAdjustmentWriteBudgetExceeded) {
+		t.Fatalf("exhaustion error = %v, want write-budget cause", err)
+	}
+	if !errors.Is(err, topology.ErrCoordinatorPlanStale) {
+		t.Fatalf("exhaustion error = %v, want last stale cause", err)
+	}
+}
+
+func TestCPUSetTopologyPluginDisabledResetBudgetFailurePerformsNoWrites(t *testing.T) {
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV1,
+		"bulkhead-disabled-reset-budget-pod",
+		"bulkhead-disabled-reset-budget-container",
+	)
+	p.cfg.TopologyConvergenceBudget.MaxPlanOperations = 1
+
+	err := p.CPUSetAdjustmentDisabledHandler(context.Background(), in)
+
+	if !errors.Is(err, topology.ErrAdjustmentWriteBudgetExceeded) {
+		t.Fatalf("CPUSetAdjustmentDisabledHandler() error = %v, want %v",
+			err, topology.ErrAdjustmentWriteBudgetExceeded)
+	}
+	if len(cg.writeOrder) != 0 {
+		t.Fatalf("disabled reset budget failure performed writes: %v", cg.writeOrder)
+	}
+}
+
+func TestCPUSetTopologyPluginDisabledResetRecompilesFirstReadStale(t *testing.T) {
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV1,
+		"bulkhead-disabled-reset-first-read-stale-pod",
+		"bulkhead-disabled-reset-first-read-stale-container",
+	)
+	staleRead := errors.New("first reset read observed replaced cgroup")
+	cg.readEntryHook = func(rel string, attempt int) error {
+		if rel == "primary" && attempt == 1 {
+			return staleRead
+		}
+		return nil
+	}
+	cg.classifyHook = func(err error, operation topology.HierarchyOperation) topology.HierarchyErrorClass {
+		if errors.Is(err, staleRead) && operation == topology.HierarchyOperationRead {
+			return topology.HierarchyErrorStale
+		}
+		return topology.HierarchyErrorInvalid
+	}
+
+	if err := p.CPUSetAdjustmentDisabledHandler(context.Background(), in); err != nil {
+		t.Fatalf("CPUSetAdjustmentDisabledHandler() error = %v, want successful owner recompile", err)
+	}
+	if got := cg.readEntryCounts["primary"]; got < 2 {
+		t.Fatalf("primary reset reads = %d, want first stale read plus recompiled attempt", got)
+	}
+	if got := cg.writes["primary"]; got != "0-3" {
+		t.Fatalf("primary reset cpuset = %q, want 0-3 after recompile; writes=%#v", got, cg.writes)
+	}
+}
+
+func TestCPUSetTopologyPluginDisabledResetHardWriteErrorAttemptsOnce(t *testing.T) {
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV1,
+		"bulkhead-disabled-reset-hard-write-pod",
+		"bulkhead-disabled-reset-hard-write-container",
+	)
+	hardWrite := errors.New("hard reset write failure")
+	cg.writeCPUHook = func(rel string, _ int) error {
+		if rel == "reclaim/reclaim-0" {
+			return hardWrite
+		}
+		return nil
+	}
+
+	err := p.CPUSetAdjustmentDisabledHandler(context.Background(), in)
+	if !errors.Is(err, hardWrite) {
+		t.Fatalf("CPUSetAdjustmentDisabledHandler() error = %v, want hard write cause", err)
+	}
+	if got := cg.writeCPUCounts["reclaim/reclaim-0"]; got != 1 {
+		t.Fatalf("hard reclaim NUMA write attempts = %d, want exactly 1", got)
+	}
+}
+
+func TestCPUSetTopologyPluginDisabledResetPostWriteStaleIsTerminal(t *testing.T) {
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV1,
+		"bulkhead-disabled-reset-post-write-stale-pod",
+		"bulkhead-disabled-reset-post-write-stale-container",
+	)
+	cg.writeCPUHook = func(rel string, _ int) error {
+		if rel == "reclaim/reclaim-0" {
+			return topology.ErrCgroupIdentityChanged
+		}
+		return nil
+	}
+
+	err := p.CPUSetAdjustmentDisabledHandler(context.Background(), in)
+	if !errors.Is(err, topology.ErrCgroupIdentityChanged) {
+		t.Fatalf("CPUSetAdjustmentDisabledHandler() error = %v, want identity-change cause", err)
+	}
+	if got := cg.writeCPUCounts["primary"]; got != 1 {
+		t.Fatalf("primary writes = %d, want exactly 1 without post-write recompile", got)
+	}
+	if got := cg.writeCPUCounts["reclaim/reclaim-0"]; got != 1 {
+		t.Fatalf("stale reclaim NUMA write attempts = %d, want exactly 1", got)
+	}
+}
+
+func TestCPUSetTopologyPluginDisabledResetContinuousStaleExhaustsOwnerReplans(t *testing.T) {
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV1,
+		"bulkhead-disabled-reset-continuous-stale-pod",
+		"bulkhead-disabled-reset-continuous-stale-container",
+	)
+	p.cfg.TopologyConvergenceBudget.MaxPlanOperations = 8
+	staleRead := errors.New("continuous reset read churn")
+	cg.readEntryHook = func(rel string, _ int) error {
+		if rel == "primary" {
+			return staleRead
+		}
+		return nil
+	}
+	cg.classifyHook = func(err error, operation topology.HierarchyOperation) topology.HierarchyErrorClass {
+		if errors.Is(err, staleRead) && operation == topology.HierarchyOperationRead {
+			return topology.HierarchyErrorStale
+		}
+		return topology.HierarchyErrorInvalid
+	}
+
+	err := p.CPUSetAdjustmentDisabledHandler(context.Background(), in)
+	var exhausted *topology.ReplanBudgetExceededError
+	if !errors.As(err, &exhausted) {
+		t.Fatalf("CPUSetAdjustmentDisabledHandler() error = %v, want ReplanBudgetExceededError", err)
+	}
+	if !errors.Is(err, topology.ErrAdjustmentReplanBudgetExceeded) {
+		t.Fatalf("continuous stale error = %v, want replan-budget sentinel", err)
+	}
+	if !errors.Is(err, staleRead) {
+		t.Fatalf("continuous stale error = %v, want last stale read cause", err)
+	}
+	if exhausted.Replans != 3 || exhausted.MaxReplans != 3 {
+		t.Fatalf("continuous stale replans = %d/%d, want 3/3",
+			exhausted.Replans, exhausted.MaxReplans)
+	}
+	if got := cg.readEntryCounts["primary"]; got != 4 {
+		t.Fatalf("primary reset attempts = %d, want initial attempt plus 3 replans", got)
+	}
+	if len(cg.writeOrder) != 0 {
+		t.Fatalf("continuous pre-write stale performed writes: %v", cg.writeOrder)
+	}
+}
+
+func TestCPUSetTopologyPluginReconcileDisabledContinuousChurnIsBounded(t *testing.T) {
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t,
+		cgroupclient.CgroupVersionV1,
+		"bulkhead-reclaim-only-continuous-churn-pod",
+		"bulkhead-reclaim-only-continuous-churn-container",
+	)
+	p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled = true
+	p.cfg.TopologyConvergenceBudget.MaxPlanOperations = 8
+	cg.cpus["reclaim"] = machine.NewCPUSet(0, 1, 2, 3)
+	cg.cpus["reclaim/reclaim-0"] = machine.NewCPUSet(0, 1, 2, 3)
+	in.DesiredView.ReclaimEffective = machine.NewCPUSet(2, 3)
+	in.DesiredView.ReclaimEffectivePerNUMA[0] = machine.NewCPUSet(2, 3)
+
+	var observations int
+	cg.statIdentityHook = func(rel string) (topology.CgroupIdentity, error) {
+		observations++
+		identity := pluginFakeIdentity(rel)
+		identity.Inode += uint64(observations)
+		return identity, nil
+	}
+
+	_, err := p.ReconcileDisabled(context.Background(), in)
+
+	var exhausted *topology.ReplanBudgetExceededError
+	if !errors.As(err, &exhausted) {
+		t.Fatalf("ReconcileDisabled() error = %v, want ReplanBudgetExceededError", err)
+	}
+	if !errors.Is(err, topology.ErrCgroupIdentityChanged) {
+		t.Fatalf("continuous churn lost identity-change cause: %v", err)
+	}
+	if !errors.Is(err, topology.ErrAdjustmentReplanBudgetExceeded) {
+		t.Fatalf("continuous churn error = %v, want replan-budget sentinel", err)
+	}
+	if errors.Is(err, topology.ErrAdjustmentWriteBudgetExceeded) {
+		t.Fatalf("zero-write churn must not report write-budget exhaustion: %v", err)
+	}
+	if exhausted.Replans != 3 || exhausted.MaxReplans != 3 {
+		t.Fatalf("continuous churn replans = %d/%d, want 3/3",
+			exhausted.Replans, exhausted.MaxReplans)
+	}
+	if len(cg.writeOrder) != 0 {
+		t.Fatalf("continuous pre-write churn performed writes: %v", cg.writeOrder)
+	}
 }

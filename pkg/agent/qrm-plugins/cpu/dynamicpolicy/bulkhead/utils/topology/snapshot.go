@@ -908,6 +908,7 @@ func CloneCompleteSnapshot(in *CompleteSnapshot) *CompleteSnapshot {
 	out.UnavailableChildren = cloneUnavailableChildEvidenceMap(in.UnavailableChildren)
 	out.DomainByRel = cloneDomainByRel(in.DomainByRel)
 	out.DomainUnion = cloneDomainUnion(in.DomainUnion)
+	out.OwnershipByRel = cloneCPUSetMap(in.OwnershipByRel)
 	out.ScanBoundary = cloneScanBoundary(in.ScanBoundary)
 	return &out
 }

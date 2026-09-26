@@ -30,6 +30,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 func TestNewCPUSetPartitionViewOptionsUsesProductionConfigurationConsistently(t *testing.T) {
@@ -48,14 +49,14 @@ func TestNewCPUSetPartitionViewOptionsUsesProductionConfigurationConsistently(t 
 	topology := testTwoNUMATopologyN(32)
 
 	inactiveOpts := NewCPUSetPartitionViewOptionsWithState(
-		coreConf, currentDynamic, topology, CPUSetPartitionViewState{}, false)
+		coreConf, currentDynamic, topology, CPUSetPartitionViewState{}, sets.NewInt())
 	if inactiveOpts.HardPartitionEnabled || len(inactiveOpts.HardPartitionReclaimTargetPerNUMA) != 0 {
 		t.Fatalf("configured inactive hard partition must not resolve targets: %+v", inactiveOpts)
 	}
 
 	state := cpustate.NewCPUPluginState(topology)
 	opts := NewCPUSetPartitionViewOptionsWithState(
-		coreConf, currentDynamic, topology, CPUSetPartitionViewState{State: state}, true)
+		coreConf, currentDynamic, topology, CPUSetPartitionViewState{State: state}, sets.NewInt(commonstate.FakedNUMAID))
 	if opts.NonReclaimPoolMinSize != 5 || !opts.ReserveCPUReversely || !opts.HardPartitionEnabled {
 		t.Fatalf("unexpected current options: %+v", opts)
 	}
@@ -70,7 +71,7 @@ func TestNewCPUSetPartitionViewOptionsUsesProductionConfigurationConsistently(t 
 		v1.ResourceCPU: resource.MustParse("16"),
 	}
 	opts = NewCPUSetPartitionViewOptionsWithState(
-		coreConf, currentDynamic, topology, CPUSetPartitionViewState{State: state}, true)
+		coreConf, currentDynamic, topology, CPUSetPartitionViewState{State: state}, sets.NewInt(commonstate.FakedNUMAID))
 	if got := opts.HardPartitionReclaimTargetPerNUMA[0]; got != 8 {
 		t.Fatalf("NUMA 0 configured reclaim target = %d, want 8", got)
 	}
@@ -80,14 +81,14 @@ func TestNewCPUSetPartitionViewOptionsUsesProductionConfigurationConsistently(t 
 
 	currentDynamic.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.NonReclaimPoolMinSize = 0
 	opts = NewCPUSetPartitionViewOptionsWithState(
-		coreConf, currentDynamic, topology, CPUSetPartitionViewState{State: state}, true)
+		coreConf, currentDynamic, topology, CPUSetPartitionViewState{State: state}, sets.NewInt(commonstate.FakedNUMAID))
 	if opts.NonReclaimPoolMinSize != 7 {
 		t.Fatalf("fallback NonReclaimPoolMinSize = %d, want 7", opts.NonReclaimPoolMinSize)
 	}
 
 	currentDynamic.EnableReclaim = false
 	opts = NewCPUSetPartitionViewOptionsWithState(
-		coreConf, currentDynamic, topology, CPUSetPartitionViewState{State: state}, true)
+		coreConf, currentDynamic, topology, CPUSetPartitionViewState{State: state}, sets.NewInt(commonstate.FakedNUMAID))
 	if opts.HardPartitionEnabled {
 		t.Fatal("hard partition must be ineffective when reclaim is disabled")
 	}
@@ -118,7 +119,7 @@ func TestNewCPUSetPartitionViewOptionsUsesEligibleCapacityFromState(t *testing.T
 		nil, dynamicConf, topology, CPUSetPartitionViewState{
 			State:        state,
 			ReservedCPUs: machine.NewCPUSet(0),
-		}, true)
+		}, sets.NewInt(commonstate.FakedNUMAID))
 	if opts.HardPartitionTargetError != nil {
 		t.Fatalf("NewCPUSetPartitionViewOptions() error = %v", opts.HardPartitionTargetError)
 	}
@@ -149,7 +150,7 @@ func TestNewCPUSetPartitionViewOptionsWithStateUsesReservedReclaimFloors(t *test
 			ReservedReclaimedCPUs:         machine.NewCPUSet(0, 1, 2, 3),
 			ReservedReclaimedCPUsFallback: 4,
 		},
-		true,
+		sets.NewInt(commonstate.FakedNUMAID),
 	)
 	if opts.HardPartitionTargetError != nil {
 		t.Fatalf("NewCPUSetPartitionViewOptionsWithState() error = %v", opts.HardPartitionTargetError)
@@ -208,7 +209,7 @@ func TestNewCPUSetPartitionViewOptionsRejectsIncompleteEligibleCapacityState(t *
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			opts := NewCPUSetPartitionViewOptionsWithState(
-				nil, dynamicConf, topology, CPUSetPartitionViewState{State: tt.state}, true)
+				nil, dynamicConf, topology, CPUSetPartitionViewState{State: tt.state}, sets.NewInt(commonstate.FakedNUMAID))
 			if opts.HardPartitionTargetError == nil ||
 				!strings.Contains(opts.HardPartitionTargetError.Error(), tt.want) {
 				t.Fatalf("error = %v, want substring %q", opts.HardPartitionTargetError, tt.want)
@@ -235,7 +236,7 @@ func TestNewCPUSetPartitionViewOptionsHandlesEligibleCapacityCornerCases(t *test
 		state.SetMachineState(machineState)
 
 		opts := NewCPUSetPartitionViewOptionsWithState(
-			nil, dynamicConf, topology, CPUSetPartitionViewState{State: state}, true)
+			nil, dynamicConf, topology, CPUSetPartitionViewState{State: state}, sets.NewInt(commonstate.FakedNUMAID))
 		if opts.HardPartitionTargetError != nil {
 			t.Fatalf("NewCPUSetPartitionViewOptions() error = %v", opts.HardPartitionTargetError)
 		}
@@ -254,7 +255,7 @@ func TestNewCPUSetPartitionViewOptionsHandlesEligibleCapacityCornerCases(t *test
 			nil, dynamicConf, topology, CPUSetPartitionViewState{
 				State:        state,
 				ReservedCPUs: machine.NewCPUSet(0, 4, 99),
-			}, true)
+			}, sets.NewInt(commonstate.FakedNUMAID))
 		if opts.HardPartitionTargetError != nil {
 			t.Fatalf("NewCPUSetPartitionViewOptions() error = %v", opts.HardPartitionTargetError)
 		}
@@ -274,7 +275,7 @@ func TestNewCPUSetPartitionViewOptionsHandlesEligibleCapacityCornerCases(t *test
 		state.SetMachineState(machineState)
 
 		opts := NewCPUSetPartitionViewOptionsWithState(
-			nil, dynamicConf, topology, CPUSetPartitionViewState{State: state}, true)
+			nil, dynamicConf, topology, CPUSetPartitionViewState{State: state}, sets.NewInt(commonstate.FakedNUMAID))
 		if opts.HardPartitionTargetError == nil ||
 			!strings.Contains(opts.HardPartitionTargetError.Error(), "outside NUMA topology: 4") {
 			t.Fatalf("error = %v, want cross-NUMA machine-state error", opts.HardPartitionTargetError)
@@ -291,7 +292,7 @@ func TestNewCPUSetPartitionViewOptionsDoesNotRequireStateWhenHardPartitionInacti
 	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.EnableRampUpReclaimHardPartition = true
 
 	opts := NewCPUSetPartitionViewOptionsWithState(
-		nil, dynamicConf, topology, CPUSetPartitionViewState{}, false)
+		nil, dynamicConf, topology, CPUSetPartitionViewState{}, sets.NewInt())
 	if opts.HardPartitionTargetError != nil {
 		t.Fatalf("inactive hard partition unexpectedly resolved state: %v", opts.HardPartitionTargetError)
 	}
@@ -310,7 +311,7 @@ func TestNewCPUSetPartitionViewOptionsRequiresTopologyWhenHardPartitionActive(t 
 	opts := NewCPUSetPartitionViewOptionsWithState(
 		nil, dynamicConf, nil, CPUSetPartitionViewState{
 			State: cpustate.NewCPUPluginState(nil),
-		}, true)
+		}, sets.NewInt(commonstate.FakedNUMAID))
 	if opts.HardPartitionTargetError == nil ||
 		!strings.Contains(opts.HardPartitionTargetError.Error(), "missing topology") {
 		t.Fatalf("error = %v, want missing-topology error", opts.HardPartitionTargetError)

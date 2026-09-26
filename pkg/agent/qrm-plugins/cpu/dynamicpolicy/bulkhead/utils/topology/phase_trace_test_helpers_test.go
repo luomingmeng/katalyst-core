@@ -73,5 +73,5 @@ func (r *coordinatorRound) executeFrozenTrace(
 	if err != nil {
 		return RoundOutcome{Status: RoundStatusBlocked}, err
 	}
-	return r.executeValidatedFrozenTrace(ctx, validated, ticket, res, finalizers...)
+	return r.executeValidatedFrozenTrace(ctx, validated, ticket, res, nil, finalizers...)
 }
