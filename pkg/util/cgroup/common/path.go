@@ -60,14 +60,22 @@ var (
 			Handler: getContainerDefaultAbsCgroupPath,
 		},
 	}
-	relativeCgroupPathHandlerLock sync.RWMutex
-	relativeCgroupPathHandlerList = []RelativeCgroupPathHandler{
+	relativeCgroupPathHandlerLock   sync.RWMutex
+	nextRelativeCgroupPathHandlerID uint64
+	relativeCgroupPathHandlerList   = []registeredRelativeCgroupPathHandler{
 		{
-			Name:    defaultCgroupPathHandlerName,
-			Handler: getContainerDefaultRelativeAbsCgroupPath,
+			handler: RelativeCgroupPathHandler{
+				Name:    defaultCgroupPathHandlerName,
+				Handler: getContainerDefaultRelativeAbsCgroupPath,
+			},
 		},
 	}
 )
+
+type registeredRelativeCgroupPathHandler struct {
+	id      uint64
+	handler RelativeCgroupPathHandler
+}
 
 func RegisterAbsoluteCgroupPathHandler(handler AbsoluteCgroupPathHandler) {
 	absoluteCgroupPathHandlerLock.Lock()
@@ -75,10 +83,44 @@ func RegisterAbsoluteCgroupPathHandler(handler AbsoluteCgroupPathHandler) {
 	absoluteCgroupPathHandlerList = append(absoluteCgroupPathHandlerList, handler)
 }
 
+// RegisterRelativeCgroupPathHandler appends a handler for process lifetime.
 func RegisterRelativeCgroupPathHandler(handler RelativeCgroupPathHandler) {
+	_ = registerRelativeCgroupPathHandler(handler)
+}
+
+// RegisterRelativeCgroupPathHandlerWithUnregister appends a handler and returns
+// an idempotent function that removes only that registration.
+func RegisterRelativeCgroupPathHandlerWithUnregister(handler RelativeCgroupPathHandler) func() {
+	return registerRelativeCgroupPathHandler(handler)
+}
+
+func registerRelativeCgroupPathHandler(handler RelativeCgroupPathHandler) func() {
 	relativeCgroupPathHandlerLock.Lock()
-	defer relativeCgroupPathHandlerLock.Unlock()
-	relativeCgroupPathHandlerList = append(relativeCgroupPathHandlerList, handler)
+	nextRelativeCgroupPathHandlerID++
+	id := nextRelativeCgroupPathHandlerID
+	relativeCgroupPathHandlerList = append(relativeCgroupPathHandlerList, registeredRelativeCgroupPathHandler{
+		id:      id,
+		handler: handler,
+	})
+	relativeCgroupPathHandlerLock.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			relativeCgroupPathHandlerLock.Lock()
+			defer relativeCgroupPathHandlerLock.Unlock()
+			for i := range relativeCgroupPathHandlerList {
+				if relativeCgroupPathHandlerList[i].id != id {
+					continue
+				}
+				relativeCgroupPathHandlerList = append(
+					relativeCgroupPathHandlerList[:i],
+					relativeCgroupPathHandlerList[i+1:]...,
+				)
+				return
+			}
+		})
+	}
 }
 
 func snapshotAbsoluteCgroupPathHandlers() []AbsoluteCgroupPathHandler {
@@ -93,7 +135,9 @@ func snapshotRelativeCgroupPathHandlers() []RelativeCgroupPathHandler {
 	relativeCgroupPathHandlerLock.RLock()
 	defer relativeCgroupPathHandlerLock.RUnlock()
 	handlers := make([]RelativeCgroupPathHandler, len(relativeCgroupPathHandlerList))
-	copy(handlers, relativeCgroupPathHandlerList)
+	for i := range relativeCgroupPathHandlerList {
+		handlers[i] = relativeCgroupPathHandlerList[i].handler
+	}
 	return handlers
 }
 
