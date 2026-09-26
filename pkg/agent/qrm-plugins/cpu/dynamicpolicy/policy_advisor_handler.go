@@ -671,7 +671,10 @@ func (p *DynamicPolicy) allocateByCPUAdvisorWithRevision(
 	// domain-scoped enforcement is instead derived solely from the committed
 	// currentEntries, and the per-domain agreement is re-derived on the
 	// response-side newEntries before it is materialized.
-	hardPartitionEnabled := isRampUpReclaimHardPartitionEnabledWithConfig(attemptConfig.dynamic)
+	// The hard-partition reclaim gate is owned by the registered
+	// ReclaimStrategyHardPartitionRampUp strategy; this lookup is the live
+	// control-flow use of the reclaim strategy registry.
+	hardPartitionEnabled := hardPartitionReclaimConfigGated(attemptConfig.dynamic)
 	currentRampUpActive := currentEntries.HasActiveRampUp()
 	if req != nil {
 		requestRampUpActive := advisorRequestHasActiveRampUp(req)

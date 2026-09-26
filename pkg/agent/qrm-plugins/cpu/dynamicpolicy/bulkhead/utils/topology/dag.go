@@ -41,13 +41,8 @@ const (
 	TopoNodeRoleReclaimSibling    TopoNodeRole = "reclaim_sibling"
 )
 
-// DomainID identifies an ownership domain without relying on cgroup names.
-type DomainID string
-
-const (
-	DomainPrimary DomainID = "primary"
-	DomainReclaim DomainID = "reclaim"
-)
+// DomainID / DomainPrimary / DomainReclaim live in topology/model and are
+// re-exported above for backward compatibility.
 
 type TopologyScope string
 

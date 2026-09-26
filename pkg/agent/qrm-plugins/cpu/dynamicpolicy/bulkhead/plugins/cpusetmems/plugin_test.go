@@ -125,28 +125,6 @@ func TestCPUSetMemsPluginEnable(t *testing.T) {
 	}
 }
 
-func TestCPUSetMemsPluginAdmissionHandlersNoop(t *testing.T) {
-	t.Parallel()
-
-	cg := &fakeCgroupClient{
-		applyErr: map[string]error{
-			"reclaim/reclaim-0": &os.PathError{Op: "write", Path: "cpuset.mems", Err: syscall.EBUSY},
-		},
-	}
-	p := &CPUSetMemsPlugin{cfg: testBulkheadConfig(), cgroup: cg}
-	ctx := context.Background()
-
-	if err := p.CPUSetAdjustmentHandler(ctx, bulkheadapi.HandlerContext{}); err != nil {
-		t.Fatalf("CPUSetAdjustmentHandler: %v", err)
-	}
-	if err := p.CPUSetAdjustmentDisabledHandler(ctx, bulkheadapi.HandlerContext{}); err != nil {
-		t.Fatalf("CPUSetAdjustmentDisabledHandler: %v", err)
-	}
-	if cg.applyCallCount != 0 {
-		t.Fatalf("admission handlers wrote cpuset.mems %d times, want 0", cg.applyCallCount)
-	}
-}
-
 func TestCPUSetMemsPluginPeriodicalReconcileWritesMemsOnly(t *testing.T) {
 	t.Parallel()
 

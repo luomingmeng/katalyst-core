@@ -550,6 +550,4 @@ func TestCPUMetricsPluginStaticContract(t *testing.T) {
 	plugin := NewCPUMetricsPlugin(nil)
 	require.Equal(t, CPUMetricsPluginName, plugin.Name())
 	require.True(t, plugin.Enable(bulkheadapi.HandlerContext{}))
-	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), bulkheadapi.HandlerContext{}))
-	require.NoError(t, plugin.CPUSetAdjustmentDisabledHandler(context.Background(), bulkheadapi.HandlerContext{}))
 }

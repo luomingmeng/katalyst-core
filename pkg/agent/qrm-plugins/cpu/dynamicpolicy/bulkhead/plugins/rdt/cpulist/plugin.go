@@ -36,7 +36,10 @@ import (
 
 const CPUListPluginName = "rdt_cpulist"
 
-var _ bulkheadapi.Plugin = (*CPUListPlugin)(nil)
+var (
+	_ bulkheadapi.Plugin            = (*CPUListPlugin)(nil)
+	_ bulkheadapi.AdjustmentCapable = (*CPUListPlugin)(nil)
+)
 
 // Clos identifies a currently existing CLOS directory. Epoch changes when the
 // directory identity changes, so an applied value for a deleted CLOS is never
@@ -164,12 +167,6 @@ func (p *CPUListPlugin) CPUSetAdjustmentDisabledHandler(ctx context.Context, _ b
 		}
 	}
 	p.pruneApplied(active)
-	return nil
-}
-
-func (p *CPUListPlugin) PeriodicalHandler(context.Context, bulkheadapi.PeriodicalHandlerContext) error {
-	// TODO: CPUList policy is synchronous with CPUSet adjustment. A future
-	// periodical policy must only reconcile cpu_list and must not own CLOS lifecycle.
 	return nil
 }
 

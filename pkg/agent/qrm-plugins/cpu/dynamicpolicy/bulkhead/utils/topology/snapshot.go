@@ -35,8 +35,8 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 )
 
-// SnapshotID fingerprints all observed state and the exact scan boundary.
-type SnapshotID [sha256.Size]byte
+// SnapshotID fingerprints all observed state and the exact scan boundary; it
+// lives in topology/model and is re-exported by model_compat.go.
 
 type ScanPurpose string
 

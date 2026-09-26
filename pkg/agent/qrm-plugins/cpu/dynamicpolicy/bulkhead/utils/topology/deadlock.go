@@ -28,79 +28,12 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
-var ErrIncompleteRequiredCoreReleaseWitness = errors.New(
-	"incomplete required core release witness")
-
-const defaultDeadlockProbeBudget = 4096
-
-type ProbeCompleteness string
-
-const (
-	ProbeComplete      ProbeCompleteness = "complete"
-	ProbeIndeterminate ProbeCompleteness = "indeterminate"
-)
-
-type DrainAtom struct {
-	Source      DomainID
-	Destination DomainID
-	CPUs        machine.CPUSet
-}
-
-type DrainAtomClass string
-
-const (
-	DrainAtomClassV1Empty    DrainAtomClass = "v1_empty"
-	DrainAtomClassProtected  DrainAtomClass = "protected"
-	DrainAtomClassReleasable DrainAtomClass = "releasable"
-	DrainAtomClassHeld       DrainAtomClass = "held"
-)
-
-type DeadlockAnalysis struct {
-	Completeness   ProbeCompleteness
-	Atoms          []DrainAtom
-	AtomClasses    []DrainAtomClass
-	SafeSeed       *DrainAtom
-	SafeGrowAnchor machine.CPUSet
-	EmptyBlockers  map[string]machine.CPUSet
-	Protected      machine.CPUSet
-	ProbeStats     DeadlockProbeStats
-}
-
-type DeadlockProbeStats struct {
-	Atoms                      int
-	AtomIndex                  int
-	AtomSource                 DomainID
-	AtomDestination            DomainID
-	SnapshotEntries            int
-	SnapshotChildEdges         int
-	ProtectedRels              int
-	ProtectedPendingCPUs       int
-	ProbeOperations            int
-	ProbeLimit                 int
-	AutoBudget                 bool
-	ContextOperations          int
-	ContextPhase               string
-	BaseOperations             int
-	ProtectedOperations        int
-	RelIndexOperations         int
-	ChildIndexOps              int
-	ChildMembershipsScanned    int
-	FrontierIndexOps           int
-	FrontierMembershipsScanned int
-	AncestorClosureOps         int
-	AtomOperations             int
-	SnapshotID                 SnapshotID
-}
-
-type StructuralV1NonEmptyDeadlock struct {
-	Analysis DeadlockAnalysis
-}
-
-func (e *StructuralV1NonEmptyDeadlock) Error() string {
-	return fmt.Sprintf("structural cgroup v1 non-empty deadlock: atoms=%d blockers=%d",
-		len(e.Analysis.Atoms), len(e.Analysis.EmptyBlockers))
-}
-
+// The deadlock result types (ProbeCompleteness, DrainAtom, DrainAtomClass,
+// DeadlockAnalysis, DeadlockProbeStats, StructuralV1NonEmptyDeadlock and
+// ErrIncompleteRequiredCoreReleaseWitness) live in topology/deadlock; see
+// deadlock_compat.go for the type aliases that re-export them here. This file
+// keeps the planner-coupled probe entry point and its helpers, which still
+// operate on parent-package types (PhasePlanInput, CompleteSnapshot, BudgetTracker).
 func analyzeV1Deadlock(in PhasePlanInput) (analysis DeadlockAnalysis, err error) {
 	start := time.Now()
 	defer func() {

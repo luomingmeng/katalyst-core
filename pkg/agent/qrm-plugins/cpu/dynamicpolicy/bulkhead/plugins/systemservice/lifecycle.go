@@ -30,18 +30,6 @@ func (p *SystemServicePlugin) Enable(in bulkheadapi.HandlerContext) bool {
 	return enableBulkheadSystemService(in.DynamicConf)
 }
 
-// CPUSetAdjustmentHandler is intentionally a no-op: cpuset_topology exclusively
-// owns target cpuset writes, while migration runs in PeriodicalHandler.
-func (p *SystemServicePlugin) CPUSetAdjustmentHandler(context.Context, bulkheadapi.HandlerContext) error {
-	return nil
-}
-
-// CPUSetAdjustmentDisabledHandler is a no-op: when bulkhead is disabled we do
-// not proactively revert cgroup placement (there is no safe global undo).
-func (p *SystemServicePlugin) CPUSetAdjustmentDisabledHandler(context.Context, bulkheadapi.HandlerContext) error {
-	return nil
-}
-
 // PeriodicalHandler migrates every eligible root-cgroup PID into the target
 // cgroup via identity-bound attach when the plugin's dynamic switch is
 // enabled. When the switch transitions from enabled to disabled (or the

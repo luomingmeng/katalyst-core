@@ -1,5 +1,5 @@
-//go:build !linux && !darwin
-// +build !linux,!darwin
+//go:build linux
+// +build linux
 
 /*
 Copyright 2022 The Katalyst Authors.
@@ -17,11 +17,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package topology
+package identity
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"syscall"
+)
 
-// StatCgroupIdentity reports that stable Linux cgroup identity is unavailable.
+// StatCgroupIdentity returns the Linux device and inode identity for path.
 func StatCgroupIdentity(path string) (CgroupIdentity, error) {
-	return CgroupIdentity{}, fmt.Errorf("%w: platform does not expose Linux device/inode identity for %q", ErrCgroupIdentityUnsupported, path)
+	info, err := os.Stat(path)
+	if err != nil {
+		return CgroupIdentity{}, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return CgroupIdentity{}, fmt.Errorf("read cgroup identity %q: unexpected stat payload %T", path, info.Sys())
+	}
+	return CgroupIdentity{
+		Device: uint64(stat.Dev),
+		Inode:  stat.Ino,
+	}, nil
 }

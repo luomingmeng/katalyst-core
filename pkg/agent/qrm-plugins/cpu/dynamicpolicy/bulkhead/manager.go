@@ -251,7 +251,12 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 							cancel()
 							return empty, staleGenerationError()
 						}
-						err := p.CPUSetAdjustmentDisabledHandler(disabledCtx, handlerCtx)
+						adjuster, ok := p.(bulkheadapi.AdjustmentCapable)
+						if !ok {
+							cancel()
+							return empty, fmt.Errorf("bulkhead plugin %q is a disabled-topology reconciler without adjustment capability", p.Name())
+						}
+						err := adjuster.CPUSetAdjustmentDisabledHandler(disabledCtx, handlerCtx)
 						if err != nil {
 							cancel()
 							emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment_disabled", p.Name(), "failed", err.Error())
@@ -333,7 +338,10 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 			}) {
 				return empty, staleGenerationError()
 			}
-			err := p.CPUSetAdjustmentDisabledHandler(ctx, handlerCtx)
+			var err error
+			if adjuster, ok := p.(bulkheadapi.AdjustmentCapable); ok {
+				err = adjuster.CPUSetAdjustmentDisabledHandler(ctx, handlerCtx)
+			}
 			if !commitIfGenerationCurrent(in, func() {
 				if err == nil && leavingDisabledReconcile {
 					m.setDisabledTopologyResetState(p.Name(), disabledTopologyResetNone)
@@ -437,7 +445,10 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 			}
 			continue
 		}
-		err := p.CPUSetAdjustmentHandler(ctx, handlerCtx)
+		var err error
+		if adjuster, ok := p.(bulkheadapi.AdjustmentCapable); ok {
+			err = adjuster.CPUSetAdjustmentHandler(ctx, handlerCtx)
+		}
 		if !commitIfGenerationCurrent(in, func() {}) {
 			return empty, staleGenerationError()
 		}
@@ -728,7 +739,10 @@ func (m *Manager) RunPeriodicalHandlers(
 			pluginCtx.EffectiveEnabled = &enabled
 		}
 		handlerStarted := time.Now()
-		pluginErr := p.PeriodicalHandler(ctx, pluginCtx)
+		var pluginErr error
+		if periodical, ok := p.(bulkheadapi.PeriodicalCapable); ok {
+			pluginErr = periodical.PeriodicalHandler(ctx, pluginCtx)
+		}
 		handlerElapsed := time.Since(handlerStarted)
 		if handlerElapsed >= bulkheadSlowHandlerThreshold {
 			general.InfofV(2, "bulkhead periodical slow plugin=%s elapsed=%s", p.Name(), handlerElapsed)

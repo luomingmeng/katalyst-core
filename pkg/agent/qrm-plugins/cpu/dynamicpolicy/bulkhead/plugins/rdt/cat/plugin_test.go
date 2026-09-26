@@ -615,18 +615,3 @@ func TestCATPluginTreatsUnsupportedCapabilityAsNoop(t *testing.T) {
 	require.Empty(t, manager.invalidated)
 }
 
-func TestCATPluginCPUSetAdjustmentHandlersAreNoop(t *testing.T) {
-	manager := &fakeRDTManager{}
-	plugin := NewCATPluginWithManager(&qrmresctrl.ResctrlConfig{}, &fakeClosManager{
-		clos: []qrmresctrlmanager.CPUListClos{{ID: "dedicated"}},
-	}, manager, fakeCapabilityProvider{capabilities: map[int]rdt.CATCapability{
-		0: {CBMMask: 0xff, MinCBMBits: 1},
-	}})
-	conf := dynamicconfig.NewConfiguration()
-	conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.EnableCAT = true
-	conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.BulkheadRDTConfig.DefaultCATWays = catExpr("2")
-
-	require.NoError(t, plugin.CPUSetAdjustmentHandler(context.Background(), bulkheadapi.HandlerContext{}))
-	require.NoError(t, plugin.CPUSetAdjustmentDisabledHandler(context.Background(), bulkheadapi.HandlerContext{}))
-	require.Empty(t, manager.writes)
-}

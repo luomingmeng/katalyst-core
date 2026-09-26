@@ -34,7 +34,10 @@ import (
 
 const WorkqueuePluginName = "workqueue"
 
-var _ bulkheadapi.Plugin = (*WorkqueuePlugin)(nil)
+var (
+	_ bulkheadapi.Plugin            = (*WorkqueuePlugin)(nil)
+	_ bulkheadapi.AdjustmentCapable = (*WorkqueuePlugin)(nil)
+)
 
 type WorkqueuePlugin struct {
 	cfg bulkheadconfig.BulkheadConfiguration
@@ -67,13 +70,6 @@ func (p *WorkqueuePlugin) CPUSetAdjustmentHandler(_ context.Context, in bulkhead
 
 func (p *WorkqueuePlugin) CPUSetAdjustmentDisabledHandler(_ context.Context, in bulkheadapi.HandlerContext) error {
 	return p.resetWorkqueue(in)
-}
-
-func (p *WorkqueuePlugin) PeriodicalHandler(
-	context.Context,
-	bulkheadapi.PeriodicalHandlerContext,
-) error {
-	return nil
 }
 
 func (p *WorkqueuePlugin) reconcileWorkqueue(in bulkheadapi.HandlerContext) error {

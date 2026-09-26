@@ -45,8 +45,9 @@ const (
 )
 
 var (
-	_                 bulkheadapi.Plugin = (*CPUSetMemsPlugin)(nil)
-	errCPUSetMemsBusy                    = errors.New("cpuset.mems busy")
+	_                 bulkheadapi.Plugin            = (*CPUSetMemsPlugin)(nil)
+	_                 bulkheadapi.PeriodicalCapable = (*CPUSetMemsPlugin)(nil)
+	errCPUSetMemsBusy                               = errors.New("cpuset.mems busy")
 )
 
 type memsApplyOrder string
@@ -78,14 +79,6 @@ func (p *CPUSetMemsPlugin) Name() string {
 
 func (p *CPUSetMemsPlugin) Enable(in bulkheadapi.HandlerContext) bool {
 	return enableBulkheadCpusetMemsByDynamicConf(in.DynamicConf)
-}
-
-func (p *CPUSetMemsPlugin) CPUSetAdjustmentHandler(context.Context, bulkheadapi.HandlerContext) error {
-	return nil
-}
-
-func (p *CPUSetMemsPlugin) CPUSetAdjustmentDisabledHandler(context.Context, bulkheadapi.HandlerContext) error {
-	return nil
 }
 
 func (p *CPUSetMemsPlugin) PeriodicalHandler(ctx context.Context, in bulkheadapi.PeriodicalHandlerContext) error {

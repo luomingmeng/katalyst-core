@@ -38,7 +38,10 @@ import (
 
 const CATPluginName = "rdt_cat"
 
-var _ bulkheadapi.Plugin = (*CATPlugin)(nil)
+var (
+	_ bulkheadapi.Plugin            = (*CATPlugin)(nil)
+	_ bulkheadapi.PeriodicalCapable = (*CATPlugin)(nil)
+)
 
 type closLister interface {
 	ListManagedClos(context.Context) ([]qrmresctrlmanager.CPUListClos, error)
@@ -91,14 +94,6 @@ func (p *CATPlugin) Name() string { return CATPluginName }
 
 func (p *CATPlugin) Enable(in bulkheadapi.HandlerContext) bool {
 	return enableCAT(in.DynamicConf)
-}
-
-func (p *CATPlugin) CPUSetAdjustmentHandler(ctx context.Context, in bulkheadapi.HandlerContext) error {
-	return nil
-}
-
-func (p *CATPlugin) CPUSetAdjustmentDisabledHandler(ctx context.Context, in bulkheadapi.HandlerContext) error {
-	return nil
 }
 
 func (p *CATPlugin) PeriodicalHandler(ctx context.Context, in bulkheadapi.PeriodicalHandlerContext) error {

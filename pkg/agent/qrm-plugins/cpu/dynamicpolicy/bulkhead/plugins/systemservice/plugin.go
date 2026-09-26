@@ -70,7 +70,10 @@ const (
 
 const defaultProcfsPath = "/proc"
 
-var _ bulkheadapi.Plugin = (*SystemServicePlugin)(nil)
+var (
+	_ bulkheadapi.Plugin            = (*SystemServicePlugin)(nil)
+	_ bulkheadapi.PeriodicalCapable = (*SystemServicePlugin)(nil)
+)
 
 type SystemServicePlugin struct {
 	cfg    bulkheadconfig.BulkheadConfiguration

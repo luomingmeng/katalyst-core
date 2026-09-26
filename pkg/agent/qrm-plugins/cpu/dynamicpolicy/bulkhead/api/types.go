@@ -98,11 +98,30 @@ type PeriodicalHandlerContext struct {
 	EffectiveEnabled *bool
 }
 
+// Plugin is the core interface every bulkhead plugin must implement. It carries
+// only the identity and enablement hooks shared by all plugins. Synchronous
+// adjustment and periodical work are declared through the optional capability
+// interfaces below, so a plugin with no adjustment side effect is not forced to
+// implement empty methods; the manager detects those capabilities with type
+// assertions.
 type Plugin interface {
 	Name() string
 	Enable(HandlerContext) bool
+}
+
+// AdjustmentCapable is implemented by plugins that own a synchronous cpuset
+// adjustment and/or a disabled-reset side effect. The manager invokes these
+// hooks only when the plugin type-asserts to this interface; a plugin without it
+// has no adjustment/disabled behavior and is skipped on those paths.
+type AdjustmentCapable interface {
 	CPUSetAdjustmentHandler(context.Context, HandlerContext) error
 	CPUSetAdjustmentDisabledHandler(context.Context, HandlerContext) error
+}
+
+// PeriodicalCapable is implemented by plugins that reconcile external state on
+// the periodical tick. The manager calls PeriodicalHandler only for plugins that
+// type-assert to this interface.
+type PeriodicalCapable interface {
 	PeriodicalHandler(context.Context, PeriodicalHandlerContext) error
 }
 

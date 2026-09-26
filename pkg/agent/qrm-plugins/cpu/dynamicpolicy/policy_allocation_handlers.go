@@ -1963,13 +1963,31 @@ func (p *DynamicPolicy) calcPoolResizeRequest(originAllocation, allocation *stat
 
 // adjustAllocationEntries calculates and generates the latest checkpoint
 // It fetches resource package items and updates the allocation entries accordingly.
+// adjustAllocationOptions bundles the optional knobs for a single cpuset
+// adjustment attempt. Required inputs (entries, machineState, persistCheckpoint)
+// stay positional; the former telescoping WithXxx/AtRevision/WithContext wrappers
+// build this struct so new call sites do not need yet another forwarding variant.
+type adjustAllocationOptions struct {
+	ctx                 context.Context
+	expectedRevision    uint64
+	explicitRampUpFloor machine.CPUSet
+	runCPUSetHandlers   bool
+	defaultShareMode    defaultShareMaterializationMode
+}
+
 func (p *DynamicPolicy) adjustAllocationEntries(
 	entries state.PodEntries,
 	machineState state.NUMANodeMap,
 	persistCheckpoint bool,
 ) error {
-	return p.adjustAllocationEntriesAtRevision(
-		entries, machineState, persistCheckpoint, p.state.GetRevision())
+	return p.adjustAllocationEntriesWithOptions(
+		context.Background(), entries, machineState, persistCheckpoint,
+		adjustAllocationOptions{
+			expectedRevision:    p.state.GetRevision(),
+			explicitRampUpFloor: machine.NewCPUSet(),
+			runCPUSetHandlers:   true,
+			defaultShareMode:    defaultShareMaterializationNormal,
+		})
 }
 
 func (p *DynamicPolicy) adjustAllocationEntriesAtRevision(
@@ -1978,8 +1996,14 @@ func (p *DynamicPolicy) adjustAllocationEntriesAtRevision(
 	persistCheckpoint bool,
 	expectedRevision uint64,
 ) error {
-	return p.adjustAllocationEntriesAtRevisionWithContext(
-		context.Background(), entries, machineState, persistCheckpoint, expectedRevision)
+	return p.adjustAllocationEntriesWithOptions(
+		context.Background(), entries, machineState, persistCheckpoint,
+		adjustAllocationOptions{
+			expectedRevision:    expectedRevision,
+			explicitRampUpFloor: machine.NewCPUSet(),
+			runCPUSetHandlers:   true,
+			defaultShareMode:    defaultShareMaterializationNormal,
+		})
 }
 
 func (p *DynamicPolicy) adjustAllocationEntriesAtRevisionWithContext(
@@ -1989,9 +2013,14 @@ func (p *DynamicPolicy) adjustAllocationEntriesAtRevisionWithContext(
 	persistCheckpoint bool,
 	expectedRevision uint64,
 ) error {
-	return p.adjustAllocationEntriesWithRampUpFloorForModeAtRevisionWithContext(
-		ctx, entries, machineState, persistCheckpoint, machine.NewCPUSet(), true,
-		expectedRevision, defaultShareMaterializationNormal)
+	return p.adjustAllocationEntriesWithOptions(
+		ctx, entries, machineState, persistCheckpoint,
+		adjustAllocationOptions{
+			expectedRevision:    expectedRevision,
+			explicitRampUpFloor: machine.NewCPUSet(),
+			runCPUSetHandlers:   true,
+			defaultShareMode:    defaultShareMaterializationNormal,
+		})
 }
 
 func (p *DynamicPolicy) adjustAllocationEntriesForRecoveryAtRevision(
@@ -2011,9 +2040,14 @@ func (p *DynamicPolicy) adjustAllocationEntriesForRecoveryAtRevisionWithContext(
 	persistCheckpoint bool,
 	expectedRevision uint64,
 ) error {
-	if err := p.adjustAllocationEntriesWithRampUpFloorForModeAtRevisionWithContext(
-		ctx, entries, machineState, persistCheckpoint, machine.NewCPUSet(), false,
-		expectedRevision, defaultShareMaterializationRecovery); err != nil {
+	if err := p.adjustAllocationEntriesWithOptions(
+		ctx, entries, machineState, persistCheckpoint,
+		adjustAllocationOptions{
+			expectedRevision:    expectedRevision,
+			explicitRampUpFloor: machine.NewCPUSet(),
+			runCPUSetHandlers:   false,
+			defaultShareMode:    defaultShareMaterializationRecovery,
+		}); err != nil {
 		return err
 	}
 	p.markCPUSetAdjustmentDirty(dynamicpolicyutil.RetryReasonRecoveryCommit)
@@ -2058,9 +2092,14 @@ func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloor(
 	explicitRampUpFloor machine.CPUSet,
 	runCPUSetHandlers bool,
 ) error {
-	return p.adjustAllocationEntriesWithRampUpFloorAtRevision(
-		entries, machineState, persistCheckpoint, explicitRampUpFloor,
-		runCPUSetHandlers, p.state.GetRevision())
+	return p.adjustAllocationEntriesWithOptions(
+		context.Background(), entries, machineState, persistCheckpoint,
+		adjustAllocationOptions{
+			expectedRevision:    p.state.GetRevision(),
+			explicitRampUpFloor: explicitRampUpFloor,
+			runCPUSetHandlers:   runCPUSetHandlers,
+			defaultShareMode:    defaultShareMaterializationNormal,
+		})
 }
 
 func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloorAtRevision(
@@ -2071,9 +2110,14 @@ func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloorAtRevision(
 	runCPUSetHandlers bool,
 	expectedRevision uint64,
 ) error {
-	return p.adjustAllocationEntriesWithRampUpFloorForModeAtRevision(
-		entries, machineState, persistCheckpoint, explicitRampUpFloor,
-		runCPUSetHandlers, expectedRevision, defaultShareMaterializationNormal)
+	return p.adjustAllocationEntriesWithOptions(
+		context.Background(), entries, machineState, persistCheckpoint,
+		adjustAllocationOptions{
+			expectedRevision:    expectedRevision,
+			explicitRampUpFloor: explicitRampUpFloor,
+			runCPUSetHandlers:   runCPUSetHandlers,
+			defaultShareMode:    defaultShareMaterializationNormal,
+		})
 }
 
 func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloorForModeAtRevision(
@@ -2085,9 +2129,14 @@ func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloorForModeAtRevision(
 	expectedRevision uint64,
 	defaultShareMode defaultShareMaterializationMode,
 ) error {
-	return p.adjustAllocationEntriesWithRampUpFloorForModeAtRevisionWithContext(
-		context.Background(), entries, machineState, persistCheckpoint, explicitRampUpFloor,
-		runCPUSetHandlers, expectedRevision, defaultShareMode)
+	return p.adjustAllocationEntriesWithOptions(
+		context.Background(), entries, machineState, persistCheckpoint,
+		adjustAllocationOptions{
+			expectedRevision:    expectedRevision,
+			explicitRampUpFloor: explicitRampUpFloor,
+			runCPUSetHandlers:   runCPUSetHandlers,
+			defaultShareMode:    defaultShareMode,
+		})
 }
 
 func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloorForModeAtRevisionWithContext(
@@ -2100,6 +2149,34 @@ func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloorForModeAtRevisionW
 	expectedRevision uint64,
 	defaultShareMode defaultShareMaterializationMode,
 ) error {
+	return p.adjustAllocationEntriesWithOptions(
+		ctx, entries, machineState, persistCheckpoint,
+		adjustAllocationOptions{
+			expectedRevision:    expectedRevision,
+			explicitRampUpFloor: explicitRampUpFloor,
+			runCPUSetHandlers:   runCPUSetHandlers,
+			defaultShareMode:    defaultShareMode,
+		})
+}
+
+// adjustAllocationEntriesWithOptions is the single implementation behind the
+// adjustAllocationEntries* wrappers. It captures advisor configuration, derives
+// pool and isolated quantities, and materializes the default-share residual.
+func (p *DynamicPolicy) adjustAllocationEntriesWithOptions(
+	ctx context.Context,
+	entries state.PodEntries,
+	machineState state.NUMANodeMap,
+	persistCheckpoint bool,
+	opts adjustAllocationOptions,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	expectedRevision := opts.expectedRevision
+	explicitRampUpFloor := opts.explicitRampUpFloor
+	runCPUSetHandlers := opts.runCPUSetHandlers
+	defaultShareMode := opts.defaultShareMode
+
 	startTime := time.Now()
 	general.Infof("called")
 	defer func() {
@@ -2113,13 +2190,8 @@ func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloorForModeAtRevisionW
 
 	// Remove orphan non-resident pools from this adjustment's candidate before
 	// deriving pool quantities and materializing the default-share residual.
-	// The precommit cleanup remains as a defense against orphans introduced by
-	// later hooks.
 	p.cleanPoolsFromPodEntries(entries)
 
-	// since adjustAllocationEntries will cause re-generate pools,
-	// if sys advisor is enabled, we believe the pools' ratio that sys advisor indicates,
-	// else we do sum(containers req) for each pool to get pools ratio
 	var poolsQuantityMap map[string]map[int]int
 	sharedNUMABindingCPUIncrRatio := getSharedNUMABindingCPUIncrRatioWithConfig(attemptConfig.dynamic)
 	advisorHealthy := p.enableCPUAdvisor && p.advisorMonitor != nil &&
@@ -2144,7 +2216,7 @@ func (p *DynamicPolicy) adjustAllocationEntriesWithRampUpFloorForModeAtRevisionW
 			sharedNUMABindingCPUIncrRatio,
 		)
 		if err != nil {
-			return fmt.Errorf("GetSharedQuantityMapFromPodEntries failed with error: %v", err)
+			return fmt.Errorf("GetSharedQuantityMapFromPodEntries failed with error: %w", err)
 		}
 	}
 	isolatedQuantityMap := state.GetIsolatedQuantityMapFromPodEntries(entries, nil, p.getContainerRequestedCores)

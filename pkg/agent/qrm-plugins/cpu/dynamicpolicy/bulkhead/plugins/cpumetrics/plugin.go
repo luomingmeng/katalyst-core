@@ -65,7 +65,10 @@ const (
 	scopeNUMA   = "numa"
 )
 
-var _ bulkheadapi.Plugin = (*CPUMetricsPlugin)(nil)
+var (
+	_ bulkheadapi.Plugin            = (*CPUMetricsPlugin)(nil)
+	_ bulkheadapi.PeriodicalCapable = (*CPUMetricsPlugin)(nil)
+)
 
 type metricDescriptor struct {
 	globalName string
@@ -118,14 +121,6 @@ func (p *CPUMetricsPlugin) Name() string {
 
 func (p *CPUMetricsPlugin) Enable(bulkheadapi.HandlerContext) bool {
 	return true
-}
-
-func (p *CPUMetricsPlugin) CPUSetAdjustmentHandler(context.Context, bulkheadapi.HandlerContext) error {
-	return nil
-}
-
-func (p *CPUMetricsPlugin) CPUSetAdjustmentDisabledHandler(context.Context, bulkheadapi.HandlerContext) error {
-	return nil
 }
 
 func (p *CPUMetricsPlugin) PeriodicalHandler(_ context.Context, in bulkheadapi.PeriodicalHandlerContext) error {

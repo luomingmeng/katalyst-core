@@ -62,6 +62,8 @@ var (
 	_ bulkheadapi.Plugin                     = (*CPUSetTopologyPlugin)(nil)
 	_ bulkheadapi.TopologyPlugin             = (*CPUSetTopologyPlugin)(nil)
 	_ bulkheadapi.DisabledTopologyReconciler = (*CPUSetTopologyPlugin)(nil)
+	_ bulkheadapi.AdjustmentCapable          = (*CPUSetTopologyPlugin)(nil)
+	_ bulkheadapi.PeriodicalCapable          = (*CPUSetTopologyPlugin)(nil)
 )
 
 var errReclaimClassificationChanged = errors.New("reclaim path classification changed")

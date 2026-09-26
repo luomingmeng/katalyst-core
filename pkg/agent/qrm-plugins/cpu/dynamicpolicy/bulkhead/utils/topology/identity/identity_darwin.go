@@ -1,5 +1,5 @@
-//go:build linux
-// +build linux
+//go:build darwin
+// +build darwin
 
 /*
 Copyright 2022 The Katalyst Authors.
@@ -17,7 +17,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package topology
+package identity
 
 import (
 	"fmt"
@@ -25,7 +25,7 @@ import (
 	"syscall"
 )
 
-// StatCgroupIdentity returns the Linux device and inode identity for path.
+// StatCgroupIdentity returns the directory device and inode identity for path.
 func StatCgroupIdentity(path string) (CgroupIdentity, error) {
 	info, err := os.Stat(path)
 	if err != nil {
