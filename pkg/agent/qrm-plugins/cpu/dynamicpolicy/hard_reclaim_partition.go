@@ -577,10 +577,7 @@ func validateHardReclaimReplacement(
 		return nil, fmt.Errorf("hard reclaim replacement topology is nil")
 	}
 
-	sortedDemands := append([]partitionDemand(nil), demands...)
-	sort.Slice(sortedDemands, func(i, j int) bool {
-		return sortedDemands[i].key < sortedDemands[j].key
-	})
+	sortedDemands := sortedByKey(demands, func(d partitionDemand) string { return d.key })
 	proof := &hardReclaimReplacementProof{
 		reclaimBefore:                    machine.NewCPUSet(),
 		reclaimAfter:                     machine.NewCPUSet(),
@@ -1210,10 +1207,7 @@ func hardReclaimTerminalSignature(
 	demands []partitionDemand,
 	topology *machine.CPUTopology,
 ) string {
-	sortedDemands := append([]partitionDemand(nil), demands...)
-	sort.Slice(sortedDemands, func(i, j int) bool {
-		return sortedDemands[i].key < sortedDemands[j].key
-	})
+	sortedDemands := sortedByKey(demands, func(d partitionDemand) string { return d.key })
 	classCounts := make(map[string]int)
 	for _, cpu := range terminal.ToSliceInt() {
 		var signature strings.Builder

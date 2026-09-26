@@ -231,10 +231,7 @@ func writePartitionResidualCanonical(
 	topology *machine.CPUTopology,
 	canonical *partitionResidualCanonical,
 ) error {
-	sortedDemands := append([]partitionDemand(nil), demands...)
-	sort.Slice(sortedDemands, func(i, j int) bool {
-		return sortedDemands[i].key < sortedDemands[j].key
-	})
+	sortedDemands := sortedByKey(demands, func(d partitionDemand) string { return d.key })
 	if _, err := io.WriteString(writer, `{"demands":[`); err != nil {
 		return err
 	}

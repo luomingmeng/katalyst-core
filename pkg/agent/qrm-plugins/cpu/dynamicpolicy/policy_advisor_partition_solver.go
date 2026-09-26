@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"sort"
 
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
@@ -249,10 +248,7 @@ func validatePartitionDemands(
 		return nil, nil, 0, fmt.Errorf("partition topology is nil")
 	}
 
-	sortedDemands := append([]partitionDemand(nil), demands...)
-	sort.Slice(sortedDemands, func(i, j int) bool {
-		return sortedDemands[i].key < sortedDemands[j].key
-	})
+	sortedDemands := sortedByKey(demands, func(d partitionDemand) string { return d.key })
 
 	allEligible := machine.NewCPUSet()
 	total := 0
@@ -456,11 +452,6 @@ func addPartitionFlowEdge(graph [][]partitionFlowEdge, from, to, cap int, cost i
 	reverse := partitionFlowEdge{to: from, reverse: len(graph[from]), cap: 0, cost: -cost}
 	graph[from] = append(graph[from], forward)
 	graph[to] = append(graph[to], reverse)
-}
-
-func partitionMinCostFlow(graph [][]partitionFlowEdge, source, sink, wanted int) (int, error) {
-	return partitionMinCostFlowWithBudget(
-		graph, source, sink, wanted, partitionFlowOperationBudget)
 }
 
 func partitionMinCostFlowWithBudget(

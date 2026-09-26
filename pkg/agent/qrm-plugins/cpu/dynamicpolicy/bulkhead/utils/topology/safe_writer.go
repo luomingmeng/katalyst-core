@@ -48,7 +48,7 @@ const (
 	PhysicalImpactUncertain PhysicalImpact = "uncertain"
 )
 
-type safeCPSetWriter struct {
+type safeCPUSetWriter struct {
 	driver                HierarchyDriver
 	budget                *BudgetTracker
 	adjustmentBudget      *AdjustmentBudget
@@ -65,9 +65,9 @@ type stableLiveChildren struct {
 	byRel map[string]EntryState
 }
 
-func newSafeCPUSetWriter(driver HierarchyDriver, budget *BudgetTracker, res *ConvergenceResult) safeCPSetWriter {
+func newSafeCPUSetWriter(driver HierarchyDriver, budget *BudgetTracker, res *ConvergenceResult) safeCPUSetWriter {
 	physicalWriteAttempts := 0
-	return safeCPSetWriter{
+	return safeCPUSetWriter{
 		driver:                driver,
 		budget:                budget,
 		res:                   res,
@@ -75,12 +75,12 @@ func newSafeCPUSetWriter(driver HierarchyDriver, budget *BudgetTracker, res *Con
 	}
 }
 
-func (w safeCPSetWriter) withAdjustmentBudget(budget *AdjustmentBudget) safeCPSetWriter {
+func (w safeCPUSetWriter) withAdjustmentBudget(budget *AdjustmentBudget) safeCPUSetWriter {
 	w.adjustmentBudget = budget
 	return w
 }
 
-func (w safeCPSetWriter) execute(ctx context.Context, plan PhasePlan) error {
+func (w safeCPUSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 	if plan.PlanID == "" || canonicalExecutionPlanID(plan) != plan.PlanID {
 		return fmt.Errorf("phase writer requires canonical plan id")
 	}
@@ -265,7 +265,7 @@ func executionWithRollbackError(executionErr, rollbackErr error) error {
 	return newExecutionRollbackError(executionErr, rollbackErr)
 }
 
-func (w safeCPSetWriter) rollbackOperationWithRecovery(
+func (w safeCPUSetWriter) rollbackOperationWithRecovery(
 	operation PlanOperation,
 	wroteCPUs, wroteMems bool,
 ) error {
@@ -284,7 +284,7 @@ func (w safeCPSetWriter) rollbackOperationWithRecovery(
 	return w.rollbackOperation(recoveryCtx, operation, wroteCPUs, wroteMems)
 }
 
-func (w safeCPSetWriter) rollbackOperation(
+func (w safeCPUSetWriter) rollbackOperation(
 	ctx context.Context,
 	operation PlanOperation,
 	wroteCPUs, wroteMems bool,
@@ -317,7 +317,7 @@ func (w safeCPSetWriter) rollbackOperation(
 	return rollbackErr
 }
 
-func (w safeCPSetWriter) dormantProofCountUnder(ancestor string) int {
+func (w safeCPUSetWriter) dormantProofCountUnder(ancestor string) int {
 	count := 0
 	for root := range w.dormantProofs {
 		if ancestor == "" || isRelAtOrUnder(root, ancestor) {
@@ -334,7 +334,7 @@ func (w safeCPSetWriter) dormantProofCountUnder(ancestor string) int {
 // does not share a lifecycle lock with this writer, so every mismatch is stale
 // evidence that must abort the plan and trigger replanning; the writer must
 // never continue by retrying the old physical envelope.
-func (w safeCPSetWriter) revalidateDormantProofs(ctx context.Context, ancestor string) error {
+func (w safeCPUSetWriter) revalidateDormantProofs(ctx context.Context, ancestor string) error {
 	reader, ok := w.driver.(hierarchyActivityReader)
 	if !ok && len(w.dormantProofs) > 0 {
 		return &PlanStaleError{
@@ -403,7 +403,7 @@ func estimateFinalPreflightAndMutationHierarchyIO(operation PlanOperation, child
 	return operations
 }
 
-func (w safeCPSetWriter) classifyWriteError(
+func (w safeCPUSetWriter) classifyWriteError(
 	err error,
 	phase PhaseKind,
 	hierarchyOperation HierarchyOperation,
@@ -429,7 +429,7 @@ func phaseWriteError(
 		phase, operation.Rel, operation.Direction, resource, current, target, err)
 }
 
-func (w safeCPSetWriter) scanStableOperationChildren(
+func (w safeCPUSetWriter) scanStableOperationChildren(
 	ctx context.Context,
 	operations []PlanOperation,
 	capabilities HierarchyCapabilities,
@@ -645,7 +645,7 @@ func scanStableLiveChildren(
 }
 
 // strictReservedHierarchyDriver consumes only the slots atomically reserved by
-// safeCPSetWriter. Exhaustion is a fail-closed accounting bug; it must never
+// safeCPUSetWriter. Exhaustion is a fail-closed accounting bug; it must never
 // fall back to ordinary per-call charging after mutation preflight begins.
 type strictReservedHierarchyDriver struct {
 	HierarchyDriver
@@ -878,7 +878,7 @@ func proveSafeUnavailableChildSkip(
 	return true, nil
 }
 
-func (w safeCPSetWriter) precheckOperation(
+func (w safeCPUSetWriter) precheckOperation(
 	ctx context.Context,
 	operation PlanOperation,
 	stableChildUnion map[string]stableLiveChildren,
@@ -946,7 +946,7 @@ func (w safeCPSetWriter) precheckOperation(
 	return nil
 }
 
-func (w safeCPSetWriter) precheckOperationChildren(
+func (w safeCPUSetWriter) precheckOperationChildren(
 	operation PlanOperation,
 	stableChildUnion map[string]stableLiveChildren,
 	capabilities HierarchyCapabilities,
@@ -984,7 +984,7 @@ func (w safeCPSetWriter) precheckOperationChildren(
 	return nil
 }
 
-func (w safeCPSetWriter) readAfterWrite(ctx context.Context, operation PlanOperation) (AppliedPlanOperation, error) {
+func (w safeCPUSetWriter) readAfterWrite(ctx context.Context, operation PlanOperation) (AppliedPlanOperation, error) {
 	applied, err := w.readAppliedObservation(ctx, operation)
 	if err != nil {
 		return AppliedPlanOperation{}, err
@@ -1012,7 +1012,7 @@ func (w safeCPSetWriter) readAfterWrite(ctx context.Context, operation PlanOpera
 	return applied, nil
 }
 
-func (w safeCPSetWriter) readAppliedObservation(ctx context.Context, operation PlanOperation) (AppliedPlanOperation, error) {
+func (w safeCPUSetWriter) readAppliedObservation(ctx context.Context, operation PlanOperation) (AppliedPlanOperation, error) {
 	current, err := w.driver.ReadEntry(ctx, operation.Rel)
 	if err != nil {
 		return AppliedPlanOperation{}, w.classifyHierarchyReadError(err, operation)
@@ -1034,7 +1034,7 @@ func (w safeCPSetWriter) readAppliedObservation(ctx context.Context, operation P
 	return applied, nil
 }
 
-func (w safeCPSetWriter) classifyHierarchyReadError(err error, operation PlanOperation) error {
+func (w safeCPUSetWriter) classifyHierarchyReadError(err error, operation PlanOperation) error {
 	if w.driver.Classify(err, HierarchyOperationRead) != HierarchyErrorStale {
 		return err
 	}

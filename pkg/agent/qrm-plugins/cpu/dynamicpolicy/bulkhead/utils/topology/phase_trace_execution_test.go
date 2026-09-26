@@ -673,7 +673,7 @@ func TestRollbackFailurePreservesStaleCauseButDisallowsReplan(t *testing.T) {
 		Rel: "controlled", Direction: WritePublish, Resource: "final_snapshot",
 		Err: fmt.Errorf("test final snapshot drift"),
 	}}
-	writer := safeCPSetWriter{driver: live}
+	writer := safeCPUSetWriter{driver: live}
 	res := &ConvergenceResult{}
 
 	err := writer.failFrozenTrace(context.Background(), drift, stack, nil, res, 0, 0)
@@ -2468,7 +2468,7 @@ func TestFrozenTraceUncertainWriteRollbackRestoresV2EmptyConfiguredState(t *test
 func v2InheritedRollbackFixture(
 	t *testing.T,
 	resource HierarchyOperation,
-) (safeCPSetWriter, *fakeHierarchyDriver, PlanOperation, *ExecutionReservationTicket) {
+) (safeCPUSetWriter, *fakeHierarchyDriver, PlanOperation, *ExecutionReservationTicket) {
 	t.Helper()
 	live := newFakeHierarchyDriver()
 	live.allowUnwitnessedExpansion = true
@@ -3562,7 +3562,7 @@ func cpuWriteTargets(writes []fakeHierarchyWrite) []string {
 	return targets
 }
 
-func newTracePreflightWriter(driver *fakeHierarchyDriver) safeCPSetWriter {
+func newTracePreflightWriter(driver *fakeHierarchyDriver) safeCPUSetWriter {
 	return newSafeCPUSetWriter(driver, NewBudgetTracker(ConvergenceBudget{}), nil)
 }
 

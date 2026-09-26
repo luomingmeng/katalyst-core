@@ -28,6 +28,7 @@ import (
 	cgroupclient "github.com/kubewharf/katalyst-core/pkg/util/cgroup/client"
 	cgcommon "github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -436,16 +437,16 @@ func (c TopologyCoordinator) convergeNormal(ctx context.Context, in CoordinatorI
 	defer snapshotDriver.Close()
 	round := newCoordinatorRoundWithBudget(in.DAG, in.Cgroup, in.CPUDetails, in.ReservedCPUSet, in.DrainSelection, budget)
 	round.adjustmentBudget = in.AdjustmentBudget
-	round.semanticTargetByRel = cloneCPUSetMap(effectiveTargets)
-	round.dynamicByRel = cloneCPUSetMap(in.ExpectedCPUSetByRel)
-	round.requiredByRel = cloneCPUSetMap(in.RequiredCPUSetByRel)
+	round.semanticTargetByRel = model.CloneCPUSetMap(effectiveTargets)
+	round.dynamicByRel = model.CloneCPUSetMap(in.ExpectedCPUSetByRel)
+	round.requiredByRel = model.CloneCPUSetMap(in.RequiredCPUSetByRel)
 	round.objective = in.Objective.orFullDefault()
-	round.deferredByRel = cloneCPUSetMap(in.DeferredCPUSetByRel)
+	round.deferredByRel = model.CloneCPUSetMap(in.DeferredCPUSetByRel)
 	round.admissionBudget = in.AdmissionBudget
 	round.allowEmptyTarget = allowEmptyTarget
 	round.protectedPending = protectedPending
-	round.pendingRequiredByRel = cloneCPUSetMap(pendingRequiredByRel)
-	round.protectedByRel = cloneCPUSetMap(in.ProtectedCPUSetByRel)
+	round.pendingRequiredByRel = model.CloneCPUSetMap(pendingRequiredByRel)
+	round.protectedByRel = model.CloneCPUSetMap(in.ProtectedCPUSetByRel)
 	round.requiredIdentityByRel = cloneIdentityMap(in.RequiredIdentityByRel)
 	round.expectedAbsentRels = cloneRelSet(in.ExpectedAbsentRels)
 	round.snapshotSource = newCompleteSnapshotSource(snapshotDriver, in.DAG, budget, in.TraversalBoundaries)

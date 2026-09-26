@@ -26,6 +26,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -462,7 +463,7 @@ func (r *coordinatorRound) compileValidatedFixedPointTrace(
 		Objective:            projectedRound.objective.orFullDefault(),
 		InitialSnapshot:      CloneCompleteSnapshot(base),
 		CanonicalTargetByRel: cloneCPUSetTargetMap(result.CanonicalTargetByRel),
-		RequiredCPUSetByRel:  cloneCPUSetMap(projectedRound.requiredByRel),
+		RequiredCPUSetByRel:  model.CloneCPUSetMap(projectedRound.requiredByRel),
 		Capabilities:         capabilities,
 		EvaluationInput:      evaluationInput,
 		FrozenBoundary:       frozenBoundary,
@@ -803,13 +804,13 @@ func (r *coordinatorRound) applyDrainPhases(
 
 func (r *coordinatorRound) cloneForProjection() *coordinatorRound {
 	out := *r
-	out.targetByRel = cloneCPUSetMap(r.targetByRel)
-	out.dynamicByRel = cloneCPUSetMap(r.dynamicByRel)
-	out.deferredByRel = cloneCPUSetMap(r.deferredByRel)
-	out.requiredByRel = cloneCPUSetMap(r.requiredByRel)
-	out.pendingRequiredByRel = cloneCPUSetMap(r.pendingRequiredByRel)
+	out.targetByRel = model.CloneCPUSetMap(r.targetByRel)
+	out.dynamicByRel = model.CloneCPUSetMap(r.dynamicByRel)
+	out.deferredByRel = model.CloneCPUSetMap(r.deferredByRel)
+	out.requiredByRel = model.CloneCPUSetMap(r.requiredByRel)
+	out.pendingRequiredByRel = model.CloneCPUSetMap(r.pendingRequiredByRel)
 	out.protectedPending = r.protectedPending.Clone()
-	out.protectedByRel = cloneCPUSetMap(r.protectedByRel)
+	out.protectedByRel = model.CloneCPUSetMap(r.protectedByRel)
 	out.requiredIdentityByRel = cloneIdentityMap(r.requiredIdentityByRel)
 	out.expectedAbsentRels = cloneRelSet(r.expectedAbsentRels)
 	out.cpuDetails = cloneCPUDetails(r.cpuDetails)
@@ -853,17 +854,17 @@ func freezeCoordinatorEvaluationInput(
 ) FrozenCoordinatorEvaluationInput {
 	return FrozenCoordinatorEvaluationInput{
 		DAGSpecs:                nodeSpecsFromDAG(r.dag),
-		TargetByRel:             cloneCPUSetMap(r.targetByRel),
+		TargetByRel:             model.CloneCPUSetMap(r.targetByRel),
 		ParentSafetyTargetByRel: desiredTargets(r.dag),
 		TargetMemsByRel:         cloneStringMap(r.desiredMemsByRel()),
 		DesiredByDomain:         cloneDomainUnion(r.desiredDomainUnion()),
 		AllowedCPUs:             r.allowedCPUs().Clone(),
-		ExpectedByRel:           cloneCPUSetMap(r.dynamicByRel),
-		RequiredByRel:           cloneCPUSetMap(r.requiredByRel),
-		DeferredByRel:           cloneCPUSetMap(r.deferredByRel),
+		ExpectedByRel:           model.CloneCPUSetMap(r.dynamicByRel),
+		RequiredByRel:           model.CloneCPUSetMap(r.requiredByRel),
+		DeferredByRel:           model.CloneCPUSetMap(r.deferredByRel),
 		DeferredCleanupRels:     cloneRelSet(r.deferredCleanupRels),
 		ProtectedPending:        r.admissionSafetyCPUSet(),
-		PendingRequiredByRel:    cloneCPUSetMap(r.pendingRequiredByRel),
+		PendingRequiredByRel:    model.CloneCPUSetMap(r.pendingRequiredByRel),
 		Capabilities:            capabilities,
 		AllowEmptyTarget:        r.allowEmptyTarget,
 	}
@@ -874,17 +875,17 @@ func cloneFrozenCoordinatorEvaluationInput(
 ) FrozenCoordinatorEvaluationInput {
 	return FrozenCoordinatorEvaluationInput{
 		DAGSpecs:                cloneNodeSpecs(in.DAGSpecs),
-		TargetByRel:             cloneCPUSetMap(in.TargetByRel),
-		ParentSafetyTargetByRel: cloneCPUSetMap(in.ParentSafetyTargetByRel),
+		TargetByRel:             model.CloneCPUSetMap(in.TargetByRel),
+		ParentSafetyTargetByRel: model.CloneCPUSetMap(in.ParentSafetyTargetByRel),
 		TargetMemsByRel:         cloneStringMap(in.TargetMemsByRel),
 		DesiredByDomain:         cloneDomainUnion(in.DesiredByDomain),
 		AllowedCPUs:             in.AllowedCPUs.Clone(),
-		ExpectedByRel:           cloneCPUSetMap(in.ExpectedByRel),
-		RequiredByRel:           cloneCPUSetMap(in.RequiredByRel),
-		DeferredByRel:           cloneCPUSetMap(in.DeferredByRel),
+		ExpectedByRel:           model.CloneCPUSetMap(in.ExpectedByRel),
+		RequiredByRel:           model.CloneCPUSetMap(in.RequiredByRel),
+		DeferredByRel:           model.CloneCPUSetMap(in.DeferredByRel),
 		DeferredCleanupRels:     cloneRelSet(in.DeferredCleanupRels),
 		ProtectedPending:        in.ProtectedPending.Clone(),
-		PendingRequiredByRel:    cloneCPUSetMap(in.PendingRequiredByRel),
+		PendingRequiredByRel:    model.CloneCPUSetMap(in.PendingRequiredByRel),
 		Capabilities:            in.Capabilities,
 		AllowEmptyTarget:        in.AllowEmptyTarget,
 	}
@@ -1004,8 +1005,8 @@ func cloneCoordinatorSnapshotEvaluation(in coordinatorSnapshotEvaluation) coordi
 	out.ParentSafety.PendingOutsidePrimary = in.ParentSafety.PendingOutsidePrimary.Clone()
 	out.ParentSafety.PendingInsideReclaim = in.ParentSafety.PendingInsideReclaim.Clone()
 	out.ParentSafety.PrimaryReclaimOverlap = in.ParentSafety.PrimaryReclaimOverlap.Clone()
-	out.ParentSafety.PendingScopeDeficit = cloneCPUSetMap(in.ParentSafety.PendingScopeDeficit)
-	out.ParentSafety.RequiredFloorDeficit = cloneCPUSetMap(in.ParentSafety.RequiredFloorDeficit)
+	out.ParentSafety.PendingScopeDeficit = model.CloneCPUSetMap(in.ParentSafety.PendingScopeDeficit)
+	out.ParentSafety.RequiredFloorDeficit = model.CloneCPUSetMap(in.ParentSafety.RequiredFloorDeficit)
 	out.ParentSafety.UnsafeRequiredRels = cloneRelConvergences(in.ParentSafety.UnsafeRequiredRels)
 	out.ParentSafety.DeferredLeafMismatches = cloneRelConvergences(in.ParentSafety.DeferredLeafMismatches)
 	return out
@@ -1058,7 +1059,7 @@ func freezePhaseTrace(
 	out.TraceID = ""
 	out.InitialSnapshot = CloneCompleteSnapshot(in.InitialSnapshot)
 	out.CanonicalTargetByRel = cloneCPUSetTargetMap(in.CanonicalTargetByRel)
-	out.RequiredCPUSetByRel = cloneCPUSetMap(in.RequiredCPUSetByRel)
+	out.RequiredCPUSetByRel = model.CloneCPUSetMap(in.RequiredCPUSetByRel)
 	out.EvaluationInput = cloneFrozenCoordinatorEvaluationInput(in.EvaluationInput)
 	out.FrozenBoundary = cloneFrozenBoundary(in.FrozenBoundary)
 	out.RollbackRetirements = append(

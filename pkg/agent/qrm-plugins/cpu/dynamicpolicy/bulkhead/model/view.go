@@ -189,7 +189,7 @@ func (v *AppliedView) DeepCopy() *AppliedView {
 	return &AppliedView{
 		CPUSetPartitionView: *v.CPUSetPartitionView.DeepCopy(),
 		Level:               v.Level,
-		CPUSetByRel:         cloneCPUSetMap(v.CPUSetByRel),
+		CPUSetByRel:         CloneCPUSetMap(v.CPUSetByRel),
 		RelProofByRel:       cloneCgroupRelProofMap(v.RelProofByRel),
 		PoolProjection:      cloneAppliedPoolProjection(v.PoolProjection),
 	}
@@ -308,7 +308,7 @@ func equalCPUSetMap(a, b map[string]machine.CPUSet) bool {
 	return true
 }
 
-func cloneCPUSetMap(in map[string]machine.CPUSet) map[string]machine.CPUSet {
+func CloneCPUSetMap(in map[string]machine.CPUSet) map[string]machine.CPUSet {
 	out := make(map[string]machine.CPUSet, len(in))
 	for key, cpus := range in {
 		out[key] = cpus.Clone()

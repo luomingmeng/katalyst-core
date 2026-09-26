@@ -43,7 +43,7 @@ func (b *BudgetTracker) ReservePhaseTrace(
 	return b.reserveValidatedPhaseTrace(context.Background(), validated, maxRequiredWrites)
 }
 
-func (w safeCPSetWriter) preflightFrozenTrace(
+func (w safeCPUSetWriter) preflightFrozenTrace(
 	ctx context.Context,
 	trace *CompiledPhaseTrace,
 ) error {
@@ -51,7 +51,7 @@ func (w safeCPSetWriter) preflightFrozenTrace(
 	return err
 }
 
-func (w safeCPSetWriter) preflightFrozenTraceOperations(
+func (w safeCPUSetWriter) preflightFrozenTraceOperations(
 	ctx context.Context,
 	trace *CompiledPhaseTrace,
 ) ([]frozenOperationPreflight, error) {

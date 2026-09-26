@@ -1740,26 +1740,6 @@ func (p *DynamicPolicy) RemovePod(ctx context.Context,
 	return &pluginapi.RemovePodResponse{}, nil
 }
 
-func (p *DynamicPolicy) removePod(podUID string, podEntries state.PodEntries, persistCheckpoint bool) error {
-	delete(podEntries, podUID)
-
-	updatedMachineState, err := generateMachineStateFromPodEntries(p.machineInfo.CPUTopology, podEntries, p.state.GetMachineState())
-	if err != nil {
-		return fmt.Errorf("GenerateMachineStateFromPodEntries failed with error: %v", err)
-	}
-
-	if err := p.state.SetPodEntries(podEntries, false); err != nil {
-		return fmt.Errorf("set pod entries after removing pod: %w", err)
-	}
-	if err := p.state.SetMachineState(updatedMachineState, false); err != nil {
-		return fmt.Errorf("set machine state after removing pod: %w", err)
-	}
-	if persistCheckpoint {
-		return p.state.StoreState()
-	}
-	return nil
-}
-
 func (p *DynamicPolicy) removeContainer(podUID, containerName string, persistCheckpoint bool) error {
 	podEntries := p.state.GetPodEntries()
 

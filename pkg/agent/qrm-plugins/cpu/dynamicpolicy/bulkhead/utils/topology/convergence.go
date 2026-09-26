@@ -16,7 +16,10 @@ limitations under the License.
 
 package topology
 
-import "github.com/kubewharf/katalyst-core/pkg/util/machine"
+import (
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
+	"github.com/kubewharf/katalyst-core/pkg/util/machine"
+)
 
 type ConvergenceReport struct {
 	FullyConverged        bool
@@ -226,7 +229,7 @@ func buildParentSafetyReportWithScopedPending(
 }
 
 func mergeCPUSetMaps(left, right map[string]machine.CPUSet) map[string]machine.CPUSet {
-	out := cloneCPUSetMap(left)
+	out := model.CloneCPUSetMap(left)
 	for rel, cpus := range right {
 		out[rel] = cpus.Clone()
 	}

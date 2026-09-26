@@ -470,10 +470,6 @@ func (b *AdjustmentBudget) ExhaustionError(reason, last error) error {
 	return b.exhaustionErrorLocked(reason, cause, last)
 }
 
-func (b *AdjustmentBudget) DeadlineError(last error) error {
-	return b.DeadlineErrorWithHistory(last, nil)
-}
-
 // DeadlineErrorWithHistory keeps the current execution failure as the primary
 // unwrap chain while retaining stale evidence from an earlier attempt.
 func (b *AdjustmentBudget) DeadlineErrorWithHistory(current, history error) error {

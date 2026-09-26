@@ -2372,15 +2372,19 @@ func (p *CPUSetTopologyPlugin) tryDrainOneDeferredLeaf(
 	wrote := false
 	defer func() {
 		if wrote {
-			_ = reservation.Settle(
+			if settleErr := reservation.Settle(
 				topology.PhysicalWriteCost{CPUSetWrites: 1},
 				topology.PhysicalWriteCost{},
-			)
+			); settleErr != nil {
+				general.Warningf("cpuset_topology: settle forward reservation for deferred leaf write: %v", settleErr)
+			}
 		} else {
-			_ = reservation.Settle(
+			if settleErr := reservation.Settle(
 				topology.PhysicalWriteCost{},
 				topology.PhysicalWriteCost{},
-			)
+			); settleErr != nil {
+				general.Warningf("cpuset_topology: settle rollback reservation for deferred leaf write: %v", settleErr)
+			}
 		}
 	}()
 	if err := reservation.RecordWriteAttempt(

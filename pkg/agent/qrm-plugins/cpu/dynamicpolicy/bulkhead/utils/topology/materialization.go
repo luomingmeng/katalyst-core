@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -53,10 +54,10 @@ func materializeTargets(
 	semanticTargets map[string]machine.CPUSet,
 ) TargetMaterialization {
 	snapshot = snapshotWithoutOwnershipOverlay(snapshot)
-	semantic := cloneCPUSetMap(semanticTargets)
+	semantic := model.CloneCPUSetMap(semanticTargets)
 	result := TargetMaterialization{
 		SemanticByRel: semantic,
-		PhysicalByRel: cloneCPUSetMap(semantic),
+		PhysicalByRel: model.CloneCPUSetMap(semantic),
 		DormantRels:   make(map[string]struct{}),
 		DormantProofs: make(map[string]DormantLeafProof),
 		Snapshot:      snapshot,

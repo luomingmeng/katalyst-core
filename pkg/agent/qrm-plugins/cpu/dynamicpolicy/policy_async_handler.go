@@ -945,10 +945,6 @@ func (p *DynamicPolicy) applySystemExclusivePoolChanges(toCreate, toUpdate map[s
 	return nil
 }
 
-func (p *DynamicPolicy) deleteSystemExclusivePool(toDelete sets.String, availableCPUs machine.CPUSet) (machine.CPUSet, error) {
-	return p.deleteSystemExclusivePoolFromState(p.state, toDelete, availableCPUs)
-}
-
 func (p *DynamicPolicy) deleteSystemExclusivePoolFromState(
 	stateStore state.State,
 	toDelete sets.String,

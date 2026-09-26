@@ -239,11 +239,6 @@ func (p *DynamicPolicy) pushCPUAdvisor() error {
 	return nil
 }
 
-func (p *DynamicPolicy) createGetAdviceRequest() (*advisorapi.GetAdviceRequest, error) {
-	req, _, err := p.createGetAdviceRequestAtRevision()
-	return req, err
-}
-
 type advisorStateSnapshotReader interface {
 	GetAdvisorStateSnapshot() (state.PodEntries, state.NUMANodeMap, uint64)
 }

@@ -258,7 +258,7 @@ func (e *frozenSnapshotDriftAfterVerifiedRollbackError) Unwrap() error {
 // preflightValidatedTraceOperations owns the no-write projection check for the
 // production chain. Its carrier is already immutable and validated, so this
 // stage must not clone or replay trace validation.
-func (w safeCPSetWriter) preflightValidatedTraceOperations(
+func (w safeCPUSetWriter) preflightValidatedTraceOperations(
 	ctx context.Context,
 	validated *validatedPhaseTrace,
 ) ([]frozenOperationPreflight, error) {
@@ -803,14 +803,14 @@ func cloneFrozenSourceReleaseGuards(
 	return out
 }
 
-func (w safeCPSetWriter) physicalWriteCount() int {
+func (w safeCPUSetWriter) physicalWriteCount() int {
 	if w.physicalWriteAttempts == nil {
 		return 0
 	}
 	return *w.physicalWriteAttempts
 }
 
-func (w safeCPSetWriter) recordForwardPhysicalWriteAttempt(
+func (w safeCPUSetWriter) recordForwardPhysicalWriteAttempt(
 	ctx context.Context,
 	cost PhysicalWriteCost,
 ) error {
@@ -824,7 +824,7 @@ func (w safeCPSetWriter) recordForwardPhysicalWriteAttempt(
 	return nil
 }
 
-func (w safeCPSetWriter) recordRollbackPhysicalWriteAttempt(
+func (w safeCPUSetWriter) recordRollbackPhysicalWriteAttempt(
 	ctx context.Context,
 	cost PhysicalWriteCost,
 ) error {
@@ -1068,7 +1068,7 @@ func (r *coordinatorRound) proveFrozenTraceFinalState(
 	return finalization, nil
 }
 
-func (w safeCPSetWriter) applyFrozenOperation(
+func (w safeCPUSetWriter) applyFrozenOperation(
 	ctx context.Context,
 	phase PhaseKind,
 	logicalOperationIndex int,
@@ -1154,7 +1154,7 @@ func (w safeCPSetWriter) applyFrozenOperation(
 	return applied, nil
 }
 
-func (w safeCPSetWriter) authorizeFrozenGrowRelease(
+func (w safeCPUSetWriter) authorizeFrozenGrowRelease(
 	ctx context.Context,
 	operation PlanOperation,
 	preflight frozenOperationPreflight,
@@ -1239,7 +1239,7 @@ func (s *traceMutationStack) consumeFrozenGrowCredits(operations []PlanOperation
 	}
 }
 
-func (w safeCPSetWriter) validateFrozenOperationPredecessor(
+func (w safeCPUSetWriter) validateFrozenOperationPredecessor(
 	ctx context.Context,
 	operation PlanOperation,
 	preflight frozenOperationPreflight,
@@ -1352,7 +1352,7 @@ func frozenOperationStateString(
 		state.ConfiguredMems, state.EffectiveMems)
 }
 
-func (w safeCPSetWriter) capturePhysicalWriteBefore(
+func (w safeCPUSetWriter) capturePhysicalWriteBefore(
 	ctx context.Context,
 	operation PlanOperation,
 	resource HierarchyOperation,
@@ -1416,7 +1416,7 @@ func physicalWriteBeforeFromEntry(
 // failed write. When read-back cannot establish the physical result, it keeps a
 // conservative inverse candidate so rollback still uses the original identity.
 // A replacement generation is never written by the rollback path.
-func (w safeCPSetWriter) recordUncertainPhysicalWrite(
+func (w safeCPUSetWriter) recordUncertainPhysicalWrite(
 	ctx context.Context,
 	write AppliedPhysicalWrite,
 	stack *traceMutationStack,
@@ -1456,7 +1456,7 @@ func (w safeCPSetWriter) recordUncertainPhysicalWrite(
 	return nil
 }
 
-func (w safeCPSetWriter) failFrozenTrace(
+func (w safeCPUSetWriter) failFrozenTrace(
 	ctx context.Context,
 	executionErr error,
 	stack *traceMutationStack,
@@ -1585,7 +1585,7 @@ func isAdjustmentRecoveryContext(ctx context.Context) bool {
 // restored. Replacement generations, same-generation third states, and
 // untyped probe failures fail closed. The complete prefix is verified before
 // the caller may report an atomic failure.
-func (w safeCPSetWriter) rollbackTracePrefix(
+func (w safeCPUSetWriter) rollbackTracePrefix(
 	ctx context.Context,
 	stack *traceMutationStack,
 	ticket *ExecutionReservationTicket,
@@ -1839,7 +1839,7 @@ func rollbackPhysicalExpectedString(
 // to its initial physical state or is an authorized generation independently
 // confirmed retired. Retirement is revalidated against typed absence and the
 // frozen authority rather than trusting replay observations alone.
-func (w safeCPSetWriter) verifyRolledBackPrefix(
+func (w safeCPUSetWriter) verifyRolledBackPrefix(
 	ctx context.Context,
 	driver HierarchyDriver,
 	stack *traceMutationStack,
@@ -1961,7 +1961,7 @@ func rollbackVerificationRels(stack *traceMutationStack) []string {
 	return rels
 }
 
-func (w safeCPSetWriter) rebuildPhysicalImpactEvidence(
+func (w safeCPUSetWriter) rebuildPhysicalImpactEvidence(
 	stack *traceMutationStack,
 	res *ConvergenceResult,
 	journalStart, appliedStart int,

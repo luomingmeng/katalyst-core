@@ -29,6 +29,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -603,9 +604,9 @@ func (f *admissionTraceFixture) snapshot() *CompleteSnapshot {
 	f.round.dag = dag
 	f.round.driver = f.driver
 	f.round.selection = NormalizeDrainSelectionPolicy(f.selection)
-	f.round.targetByRel = cloneCPUSetMap(f.targetByRel)
-	f.round.requiredByRel = cloneCPUSetMap(f.requiredByRel)
-	f.round.dynamicByRel = cloneCPUSetMap(f.dynamicByRel)
+	f.round.targetByRel = model.CloneCPUSetMap(f.targetByRel)
+	f.round.requiredByRel = model.CloneCPUSetMap(f.requiredByRel)
+	f.round.dynamicByRel = model.CloneCPUSetMap(f.dynamicByRel)
 	f.round.snapshotSource = newCompleteSnapshotSource(f.driver, dag, f.budget)
 
 	base, err := f.round.snapshotSource(context.Background())

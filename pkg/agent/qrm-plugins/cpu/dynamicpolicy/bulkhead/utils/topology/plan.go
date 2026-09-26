@@ -1926,15 +1926,6 @@ func validateExecutableEmptyTargets(in PhasePlanInput) error {
 	return nil
 }
 
-func phaseTargetDomain(rel string, dag *TopoDAG, domainByRel map[string]DomainID) DomainID {
-	if dag != nil {
-		if node := dag.index[rel]; node != nil {
-			return node.Domain
-		}
-	}
-	return domainByRel[rel]
-}
-
 func buildPlannerRelations(
 	snapshot *CompleteSnapshot,
 	dag *TopoDAG,

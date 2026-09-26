@@ -412,10 +412,7 @@ func steadyFakeNUMAConstraintDigest(
 	if topology == nil {
 		return "", fmt.Errorf("cannot digest steady fake-NUMA constraints with nil topology")
 	}
-	sortedDemands := append([]partitionDemand(nil), demands...)
-	sort.Slice(sortedDemands, func(i, j int) bool {
-		return sortedDemands[i].key < sortedDemands[j].key
-	})
+	sortedDemands := sortedByKey(demands, func(d partitionDemand) string { return d.key })
 	sortedFakeKeys := append([]string(nil), fakeKeys...)
 	sort.Strings(sortedFakeKeys)
 	sortedFloors := append([]partitionCoreFloorConstraint(nil), floors...)

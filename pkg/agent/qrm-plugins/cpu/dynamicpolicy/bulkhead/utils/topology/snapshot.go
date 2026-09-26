@@ -30,6 +30,7 @@ import (
 
 	cgroupclient "github.com/kubewharf/katalyst-core/pkg/util/cgroup/client"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 )
 
 // SnapshotID fingerprints all observed state and the exact scan boundary.
@@ -868,14 +869,6 @@ func writeHashUint64(hash interface{ Write([]byte) (int, error) }, value uint64)
 	_, _ = hash.Write(encoded[:])
 }
 
-func cloneCPUSetMap(in map[string]machine.CPUSet) map[string]machine.CPUSet {
-	out := make(map[string]machine.CPUSet, len(in))
-	for rel, cpus := range in {
-		out[rel] = cpus.Clone()
-	}
-	return out
-}
-
 func cloneUnavailableChildEvidenceMap(
 	in map[string]UnavailableChildEvidence,
 ) map[string]UnavailableChildEvidence {
@@ -908,7 +901,7 @@ func CloneCompleteSnapshot(in *CompleteSnapshot) *CompleteSnapshot {
 	out.UnavailableChildren = cloneUnavailableChildEvidenceMap(in.UnavailableChildren)
 	out.DomainByRel = cloneDomainByRel(in.DomainByRel)
 	out.DomainUnion = cloneDomainUnion(in.DomainUnion)
-	out.OwnershipByRel = cloneCPUSetMap(in.OwnershipByRel)
+	out.OwnershipByRel = model.CloneCPUSetMap(in.OwnershipByRel)
 	out.ScanBoundary = cloneScanBoundary(in.ScanBoundary)
 	return &out
 }

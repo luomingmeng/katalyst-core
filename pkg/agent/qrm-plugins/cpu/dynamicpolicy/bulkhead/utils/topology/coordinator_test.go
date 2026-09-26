@@ -32,6 +32,7 @@ import (
 
 	cgroupclient "github.com/kubewharf/katalyst-core/pkg/util/cgroup/client"
 	cgcommon "github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
+	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -1512,7 +1513,7 @@ func TestTopologyCoordinatorSmallStepMatchesFullDrainFinalPartition(t *testing.T
 		if !res.Converged {
 			t.Fatalf("result = %+v, want converged", res)
 		}
-		return cloneCPUSetMap(cg.cpus), len(res.Rounds)
+		return model.CloneCPUSetMap(cg.cpus), len(res.Rounds)
 	}
 	full, fullRounds := run(DrainSelectionPolicy{MaxCPUsDrainRatio: 0, GroupByNUMA: true, RequirePairedSwapProgress: true})
 	small, smallRounds := run(DrainSelectionPolicy{MaxCPUsDrainRatio: 0.25, GroupByNUMA: true, RequirePairedSwapProgress: true})
