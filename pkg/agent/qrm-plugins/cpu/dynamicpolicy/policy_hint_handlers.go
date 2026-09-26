@@ -263,31 +263,8 @@ func (p *DynamicPolicy) calculateHints(
 		return nil, fmt.Errorf("NUMAsPerSocket failed with error: %v", err)
 	}
 
-	totalAvailableCPUs := machine.NewCPUSet()
-	numaToAvailableCPUCount := make(map[int]int, len(numaNodes))
-
-	availableNUMAs := p.filterNUMANodesByNonBinding(request, podEntries, machineState, req, numaNumber)
-	for _, nodeID := range numaNodes {
-		if machineState[nodeID] == nil {
-			general.Warningf("NUMA: %d has nil state", nodeID)
-			numaToAvailableCPUCount[nodeID] = 0
-			continue
-		}
-
-		if numaExclusive && machineState[nodeID].AllocatedCPUSet.Size() > 0 {
-			numaToAvailableCPUCount[nodeID] = 0
-			general.Warningf("numa_exclusive container skip NUMA: %d allocated: %d",
-				nodeID, machineState[nodeID].AllocatedCPUSet.Size())
-		} else if numaBinding && !availableNUMAs.Contains(nodeID) {
-			numaToAvailableCPUCount[nodeID] = 0
-			general.Warningf("numa_binding container skip NUMA: %d, allocated: %d",
-				nodeID, machineState[nodeID].AllocatedCPUSet.Size())
-		} else {
-			availableCPUs := machineState[nodeID].GetAvailableCPUSet(p.reservedCPUs)
-			numaToAvailableCPUCount[nodeID] = availableCPUs.Size()
-			totalAvailableCPUs.Add(availableCPUs.ToSliceNoSortInt()...)
-		}
-	}
+	numaToAvailableCPUCount, totalAvailableCPUs := p.countAvailableCPUsPerNUMA(
+		request, podEntries, machineState, req, numaNodes, numaNumber, numaBinding, numaExclusive)
 
 	general.Infof("calculate hints with req: %.3f, numaToAvailableCPUCount: %+v",
 		request, numaToAvailableCPUCount)
@@ -422,6 +399,43 @@ func (p *DynamicPolicy) calculateHints(
 	return map[string]*pluginapi.ListOfTopologyHints{
 		string(v1.ResourceCPU): hints,
 	}, nil
+}
+
+// countAvailableCPUsPerNUMA walks the machine NUMA state and tallies the
+// available CPUs per NUMA, skipping NUMAs disallowed by numa-exclusive /
+// numa-binding placement. It returns the per-NUMA available counts and the
+// union of available CPUs used later for even-distribution and full-PCPUs checks.
+func (p *DynamicPolicy) countAvailableCPUsPerNUMA(
+	request float64, podEntries state.PodEntries, machineState state.NUMANodeMap,
+	req *pluginapi.ResourceRequest, numaNodes []int, numaNumber int,
+	numaBinding, numaExclusive bool,
+) (numaToAvailableCPUCount map[int]int, totalAvailableCPUs machine.CPUSet) {
+	totalAvailableCPUs = machine.NewCPUSet()
+	numaToAvailableCPUCount = make(map[int]int, len(numaNodes))
+
+	availableNUMAs := p.filterNUMANodesByNonBinding(request, podEntries, machineState, req, numaNumber)
+	for _, nodeID := range numaNodes {
+		if machineState[nodeID] == nil {
+			general.Warningf("NUMA: %d has nil state", nodeID)
+			numaToAvailableCPUCount[nodeID] = 0
+			continue
+		}
+
+		if numaExclusive && machineState[nodeID].AllocatedCPUSet.Size() > 0 {
+			numaToAvailableCPUCount[nodeID] = 0
+			general.Warningf("numa_exclusive container skip NUMA: %d allocated: %d",
+				nodeID, machineState[nodeID].AllocatedCPUSet.Size())
+		} else if numaBinding && !availableNUMAs.Contains(nodeID) {
+			numaToAvailableCPUCount[nodeID] = 0
+			general.Warningf("numa_binding container skip NUMA: %d, allocated: %d",
+				nodeID, machineState[nodeID].AllocatedCPUSet.Size())
+		} else {
+			availableCPUs := machineState[nodeID].GetAvailableCPUSet(p.reservedCPUs)
+			numaToAvailableCPUCount[nodeID] = availableCPUs.Size()
+			totalAvailableCPUs.Add(availableCPUs.ToSliceNoSortInt()...)
+		}
+	}
+	return numaToAvailableCPUCount, totalAvailableCPUs
 }
 
 // canAlignedBySocket is a function that returns true if numa nodes used is aligned by socket.

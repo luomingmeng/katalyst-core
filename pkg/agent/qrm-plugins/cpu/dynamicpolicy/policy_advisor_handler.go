@@ -2277,108 +2277,16 @@ func (p *DynamicPolicy) applyBlocksWithDynamicConfig(
 	}
 
 	// deal with blocks of dedicated_cores and pools
-	for entryName, entry := range resp.Entries {
-		if entryName == commonstate.PoolNameInterrupt {
-			continue
-		}
-		if defaultSharePlan.enabled && entryName == commonstate.PoolNameShare {
-			continue
-		}
-
-		for subEntryName, calculationInfo := range entry.Entries {
-			if calculationInfo == nil {
-				general.Warningf("got nil calculationInfo entry: %s, subEntry: %s", entryName, subEntryName)
-				continue
-			} else if !(subEntryName == commonstate.FakedContainerName || calculationInfo.OwnerPoolName == commonstate.PoolNameDedicated) {
-				continue
-			}
-
-			// construct cpuset for this entry by union all blocks for it
-			entryCPUSet, err := calculationInfo.GetCPUSet(entryName, subEntryName, blockCPUSet)
-			if err != nil {
-				return nil, err
-			}
-
-			// transform cpuset into topologyAwareAssignments
-			topologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, entryCPUSet)
-			if err != nil {
-				return nil, fmt.Errorf("unable to calculate topologyAwareAssignments for entry: %s, subEntry: %s, entry cpuset: %s, error: %v",
-					entryName, subEntryName, entryCPUSet.String(), err)
-			}
-
-			// if allocation already exists, update them; otherwise, construct new a new one
-			allocationInfo := curEntries[entryName][subEntryName].Clone()
-			if allocationInfo == nil {
-				// currently, cpu advisor can only create new pools,
-				// all container entries or entries with owner pool name dedicated can't be created by cpu advisor
-				if calculationInfo.OwnerPoolName == commonstate.PoolNameDedicated || subEntryName != commonstate.FakedContainerName {
-					return nil, fmt.Errorf("no-pool entry isn't found in plugin cache, entry: %s, subEntry: %s", entryName, subEntryName)
-				} else if entryName != calculationInfo.OwnerPoolName {
-					return nil, fmt.Errorf("pool entryName: %s and OwnerPoolName: %s mismatch", entryName, calculationInfo.OwnerPoolName)
-				}
-
-				general.Infof("create new pool: %s cpuset result %s", entryName, entryCPUSet.String())
-				allocationInfo = &state.AllocationInfo{
-					AllocationMeta: commonstate.AllocationMeta{
-						PodUid:        entryName,
-						OwnerPoolName: entryName,
-					},
-					AllocationResult:                 entryCPUSet.Clone(),
-					OriginalAllocationResult:         entryCPUSet.Clone(),
-					TopologyAwareAssignments:         topologyAwareAssignments,
-					OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(topologyAwareAssignments),
-				}
-			} else {
-				general.Infof("entry: %s, subEntryName: %s cpuset allocation result transform from %s(size: %d) to %s(size: %d)",
-					entryName, subEntryName,
-					allocationInfo.AllocationResult.String(), allocationInfo.AllocationResult.Size(),
-					entryCPUSet.String(), entryCPUSet.Size())
-
-				allocationInfo.OwnerPoolName = calculationInfo.OwnerPoolName
-				allocationInfo.AllocationResult = entryCPUSet.Clone()
-				allocationInfo.OriginalAllocationResult = entryCPUSet.Clone()
-				allocationInfo.TopologyAwareAssignments = topologyAwareAssignments
-				allocationInfo.OriginalTopologyAwareAssignments = machine.DeepcopyCPUAssignment(topologyAwareAssignments)
-			}
-
-			if newEntries[entryName] == nil {
-				newEntries[entryName] = make(state.ContainerEntries)
-			}
-			newEntries[entryName][subEntryName] = allocationInfo
-			pooledUnionDedicatedCPUSet = pooledUnionDedicatedCPUSet.Union(allocationInfo.AllocationResult)
-
-			if allocationInfo.OwnerPoolName == commonstate.PoolNameDedicated {
-				dedicatedCPUSet = dedicatedCPUSet.Union(allocationInfo.AllocationResult)
-				general.Infof("try to apply dedicated_cores: %s/%s %s: %s",
-					allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName, allocationInfo.AllocationResult.String())
-			} else {
-				for numaID, cpus := range allocationInfo.TopologyAwareAssignments {
-					general.Infof("try to apply pool %s numa %d: %s", allocationInfo.OwnerPoolName, numaID, cpus.String())
-				}
-			}
-		}
+	dedicatedCPUSet, pooledUnionDedicatedCPUSet, err = p.buildAdvisorDedicatedPoolEntries(
+		blockCPUSet, resp, curEntries, newEntries, defaultSharePlan.enabled,
+	)
+	if err != nil {
+		return nil, err
 	}
 
-	// deal with interrupt pools
-	if subEntry, ok := curEntries[commonstate.PoolNameInterrupt]; ok {
-		newEntries[commonstate.PoolNameInterrupt] = make(state.ContainerEntries)
-		if ai, ok := subEntry[commonstate.FakedContainerName]; ok && ai != nil {
-			newEntries[commonstate.PoolNameInterrupt][commonstate.FakedContainerName] = ai.Clone()
-		}
-	}
-
-	// deal with system exclusive pools
-	for name, subEntry := range curEntries {
-		if !commonstate.IsSystemPool(name) {
-			continue
-		}
-		if _, exists := newEntries[name]; exists {
-			return nil, fmt.Errorf("system pool %s already exists", name)
-		}
-		newEntries[name] = make(state.ContainerEntries)
-		if ai, ok := subEntry[commonstate.FakedContainerName]; ok && ai != nil {
-			newEntries[name][commonstate.FakedContainerName] = ai.Clone()
-		}
+	// deal with interrupt pools and system exclusive pools
+	if err := p.copyInterruptAndSystemPools(curEntries, newEntries); err != nil {
+		return nil, err
 	}
 
 	if resp.DisableDedicatedCoresOverlapReclaimedCores {
@@ -2463,11 +2371,203 @@ func (p *DynamicPolicy) applyBlocksWithDynamicConfig(
 	// preservedSNBRampUp records the unadvised shared-numa-binding ramp-up
 	// allocations that keep their current allocation in the loop below. The
 	// rematerialization step needs this to tell them apart from advised SNB
-	// ramp-up allocations, because both carry OwnerPoolName ==
-	// EmptyOwnerPoolName in newEntries after the loop.
-	preservedSNBRampUp := make(map[string]map[string]struct{})
+	// ramp-up allocations.
+	preservedSNBRampUp, err := p.applyAdvisorNonPoolContainerEntries(
+		curEntries, newEntries, resp, rampUpCPUs, rampUpCPUsTopologyAwareAssignments,
+		rampUpReclaimFloor, hardActive, nonReclaimActualBindingNUMAs,
+	)
+	if err != nil {
+		return nil, err
+	}
 
-	// deal with blocks of reclaimed_cores and share_cores
+	commitOverride, err := p.buildAdjustmentCommitOverrideFromPodEntriesWithDynamicConfig(
+		newEntries,
+		allowSharedCoresOverlapReclaimedCores,
+		resp.DisableDedicatedCoresOverlapReclaimedCores,
+		attemptConfig.dynamic,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("build adjustment commit override from pod entries failed with error: %w", err)
+	}
+	if err := p.syncReclaimPoolWithAdjustmentCommitOverrideWithDynamicConfig(
+		newEntries, commitOverride, attemptConfig.dynamic, defaultSharePlan.eligibleCPUSet,
+	); err != nil {
+		return nil, fmt.Errorf("sync reclaim pool with adjustment commit override failed with error: %w", err)
+	}
+	if defaultSharePlan.enabled {
+		defaultSharePlan.eligibleCPUSet = p.buildDefaultShareEligibleCPUSet(
+			newEntries, currentMachineState, rampUpReclaimFloor)
+		if err := p.finalizeDefaultShareEntry(
+			newEntries, newEntries, defaultSharePlan.advisedQuantity, defaultSharePlan.eligibleCPUSet,
+		); err != nil {
+			return nil, err
+		}
+	}
+
+	// The hard-partition invariant is enforced against the FINAL reclaim pool:
+	// the adjustment commit override above may rewrite the reclaim pool after
+	// ramp-up shared allocations were assigned rampUpCPUs, so the mutual
+	// exclusion can only be restored here, before the pending advisor state is
+	// materialized. This is deliberately gated on the dynamic configuration
+	// (plus active ramp-up presence), not on the hardActive parameter: the
+	// parameter only controls floor derivation for this attempt, while the
+	// partition invariant itself follows the switch.
+	if isRampUpReclaimHardPartitionEnabledWithConfig(attemptConfig.dynamic) &&
+		newEntries.HasActiveRampUp() {
+		if err := p.rematerializeRampUpSharedAgainstFinalReclaim(
+			newEntries, preservedSNBRampUp); err != nil {
+			return nil, fmt.Errorf("rematerialize ramp-up shared allocations against final reclaim pool failed with error: %w", err)
+		}
+	}
+
+	return &pendingAdvisorState{
+		preCommitRevision: stateRevision,
+		entries:           newEntries,
+		allowOverlap:      allowSharedCoresOverlapReclaimedCores,
+		disableDedicated:  resp.DisableDedicatedCoresOverlapReclaimedCores,
+		residualFloor:     rampUpReclaimFloor,
+		dynamicConfig:     attemptConfig.dynamic,
+	}, nil
+}
+
+// buildAdvisorDedicatedPoolEntries walks the advisor response and constructs (or
+// updates) dedicated_cores and pool entries in newEntries, accumulating the
+// union dedicated CPUSets. It is the dedicated/pools stage of
+// applyBlocksWithDynamicConfig.
+func (p *DynamicPolicy) buildAdvisorDedicatedPoolEntries(
+	blockCPUSet advisorapi.BlockCPUSet,
+	resp *advisorapi.ListAndWatchResponse,
+	curEntries state.PodEntries,
+	newEntries state.PodEntries,
+	skipSharePool bool,
+) (dedicatedCPUSet machine.CPUSet, pooledUnionDedicatedCPUSet machine.CPUSet, err error) {
+	dedicatedCPUSet = machine.NewCPUSet()
+	pooledUnionDedicatedCPUSet = machine.NewCPUSet()
+	for entryName, entry := range resp.Entries {
+		if entryName == commonstate.PoolNameInterrupt {
+			continue
+		}
+		if skipSharePool && entryName == commonstate.PoolNameShare {
+			continue
+		}
+
+		for subEntryName, calculationInfo := range entry.Entries {
+			if calculationInfo == nil {
+				general.Warningf("got nil calculationInfo entry: %s, subEntry: %s", entryName, subEntryName)
+				continue
+			} else if !(subEntryName == commonstate.FakedContainerName || calculationInfo.OwnerPoolName == commonstate.PoolNameDedicated) {
+				continue
+			}
+
+			// construct cpuset for this entry by union all blocks for it
+			entryCPUSet, err := calculationInfo.GetCPUSet(entryName, subEntryName, blockCPUSet)
+			if err != nil {
+				return dedicatedCPUSet, pooledUnionDedicatedCPUSet, err
+			}
+
+			// transform cpuset into topologyAwareAssignments
+			topologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, entryCPUSet)
+			if err != nil {
+				return dedicatedCPUSet, pooledUnionDedicatedCPUSet, fmt.Errorf("unable to calculate topologyAwareAssignments for entry: %s, subEntry: %s, entry cpuset: %s, error: %v",
+					entryName, subEntryName, entryCPUSet.String(), err)
+			}
+
+			// if allocation already exists, update them; otherwise, construct new a new one
+			allocationInfo := curEntries[entryName][subEntryName].Clone()
+			if allocationInfo == nil {
+				// currently, cpu advisor can only create new pools,
+				// all container entries or entries with owner pool name dedicated can't be created by cpu advisor
+				if calculationInfo.OwnerPoolName == commonstate.PoolNameDedicated || subEntryName != commonstate.FakedContainerName {
+					return dedicatedCPUSet, pooledUnionDedicatedCPUSet, fmt.Errorf("no-pool entry isn't found in plugin cache, entry: %s, subEntry: %s", entryName, subEntryName)
+				} else if entryName != calculationInfo.OwnerPoolName {
+					return dedicatedCPUSet, pooledUnionDedicatedCPUSet, fmt.Errorf("pool entryName: %s and OwnerPoolName: %s mismatch", entryName, calculationInfo.OwnerPoolName)
+				}
+
+				general.Infof("create new pool: %s cpuset result %s", entryName, entryCPUSet.String())
+				allocationInfo = &state.AllocationInfo{
+					AllocationMeta: commonstate.AllocationMeta{
+						PodUid:        entryName,
+						OwnerPoolName: entryName,
+					},
+					AllocationResult:                 entryCPUSet.Clone(),
+					OriginalAllocationResult:         entryCPUSet.Clone(),
+					TopologyAwareAssignments:         topologyAwareAssignments,
+					OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(topologyAwareAssignments),
+				}
+			} else {
+				general.Infof("entry: %s, subEntryName: %s cpuset allocation result transform from %s(size: %d) to %s(size: %d)",
+					entryName, subEntryName,
+					allocationInfo.AllocationResult.String(), allocationInfo.AllocationResult.Size(),
+					entryCPUSet.String(), entryCPUSet.Size())
+
+				allocationInfo.OwnerPoolName = calculationInfo.OwnerPoolName
+				allocationInfo.AllocationResult = entryCPUSet.Clone()
+				allocationInfo.OriginalAllocationResult = entryCPUSet.Clone()
+				allocationInfo.TopologyAwareAssignments = topologyAwareAssignments
+				allocationInfo.OriginalTopologyAwareAssignments = machine.DeepcopyCPUAssignment(topologyAwareAssignments)
+			}
+
+			if newEntries[entryName] == nil {
+				newEntries[entryName] = make(state.ContainerEntries)
+			}
+			newEntries[entryName][subEntryName] = allocationInfo
+			pooledUnionDedicatedCPUSet = pooledUnionDedicatedCPUSet.Union(allocationInfo.AllocationResult)
+
+			if allocationInfo.OwnerPoolName == commonstate.PoolNameDedicated {
+				dedicatedCPUSet = dedicatedCPUSet.Union(allocationInfo.AllocationResult)
+				general.Infof("try to apply dedicated_cores: %s/%s %s: %s",
+					allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName, allocationInfo.AllocationResult.String())
+			} else {
+				for numaID, cpus := range allocationInfo.TopologyAwareAssignments {
+					general.Infof("try to apply pool %s numa %d: %s", allocationInfo.OwnerPoolName, numaID, cpus.String())
+				}
+			}
+		}
+	}
+	return dedicatedCPUSet, pooledUnionDedicatedCPUSet, nil
+}
+
+// copyInterruptAndSystemPools carries the interrupt pool and every system
+// exclusive pool over from the current entries into the new advisor frame.
+func (p *DynamicPolicy) copyInterruptAndSystemPools(curEntries, newEntries state.PodEntries) error {
+	if subEntry, ok := curEntries[commonstate.PoolNameInterrupt]; ok {
+		newEntries[commonstate.PoolNameInterrupt] = make(state.ContainerEntries)
+		if ai, ok := subEntry[commonstate.FakedContainerName]; ok && ai != nil {
+			newEntries[commonstate.PoolNameInterrupt][commonstate.FakedContainerName] = ai.Clone()
+		}
+	}
+
+	// deal with system exclusive pools
+	for name, subEntry := range curEntries {
+		if !commonstate.IsSystemPool(name) {
+			continue
+		}
+		if _, exists := newEntries[name]; exists {
+			return fmt.Errorf("system pool %s already exists", name)
+		}
+		newEntries[name] = make(state.ContainerEntries)
+		if ai, ok := subEntry[commonstate.FakedContainerName]; ok && ai != nil {
+			newEntries[name][commonstate.FakedContainerName] = ai.Clone()
+		}
+	}
+	return nil
+}
+
+// applyAdvisorNonPoolContainerEntries replays the non-pool container allocations
+// from the current entries into the new frame, applying shared/reclaimed/ramp-up
+// placement. It returns the set of preserved unadvised shared-NUMA-binding
+// ramp-up allocations.
+func (p *DynamicPolicy) applyAdvisorNonPoolContainerEntries(
+	curEntries state.PodEntries,
+	newEntries state.PodEntries,
+	resp *advisorapi.ListAndWatchResponse,
+	rampUpCPUs machine.CPUSet,
+	rampUpCPUsTopologyAwareAssignments map[int]machine.CPUSet,
+	rampUpReclaimFloor machine.CPUSet,
+	hardActive bool,
+	nonReclaimActualBindingNUMAs machine.CPUSet,
+) (preservedSNBRampUp map[string]map[string]struct{}, err error) {
+	preservedSNBRampUp = make(map[string]map[string]struct{})
 	for podUID, containerEntries := range curEntries {
 		if containerEntries.IsPoolEntry() {
 			continue
@@ -2597,55 +2697,7 @@ func (p *DynamicPolicy) applyBlocksWithDynamicConfig(
 			}
 		}
 	}
-
-	commitOverride, err := p.buildAdjustmentCommitOverrideFromPodEntriesWithDynamicConfig(
-		newEntries,
-		allowSharedCoresOverlapReclaimedCores,
-		resp.DisableDedicatedCoresOverlapReclaimedCores,
-		attemptConfig.dynamic,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("build adjustment commit override from pod entries failed with error: %w", err)
-	}
-	if err := p.syncReclaimPoolWithAdjustmentCommitOverrideWithDynamicConfig(
-		newEntries, commitOverride, attemptConfig.dynamic, defaultSharePlan.eligibleCPUSet,
-	); err != nil {
-		return nil, fmt.Errorf("sync reclaim pool with adjustment commit override failed with error: %w", err)
-	}
-	if defaultSharePlan.enabled {
-		defaultSharePlan.eligibleCPUSet = p.buildDefaultShareEligibleCPUSet(
-			newEntries, currentMachineState, rampUpReclaimFloor)
-		if err := p.finalizeDefaultShareEntry(
-			newEntries, newEntries, defaultSharePlan.advisedQuantity, defaultSharePlan.eligibleCPUSet,
-		); err != nil {
-			return nil, err
-		}
-	}
-
-	// The hard-partition invariant is enforced against the FINAL reclaim pool:
-	// the adjustment commit override above may rewrite the reclaim pool after
-	// ramp-up shared allocations were assigned rampUpCPUs, so the mutual
-	// exclusion can only be restored here, before the pending advisor state is
-	// materialized. This is deliberately gated on the dynamic configuration
-	// (plus active ramp-up presence), not on the hardActive parameter: the
-	// parameter only controls floor derivation for this attempt, while the
-	// partition invariant itself follows the switch.
-	if isRampUpReclaimHardPartitionEnabledWithConfig(attemptConfig.dynamic) &&
-		newEntries.HasActiveRampUp() {
-		if err := p.rematerializeRampUpSharedAgainstFinalReclaim(
-			newEntries, preservedSNBRampUp); err != nil {
-			return nil, fmt.Errorf("rematerialize ramp-up shared allocations against final reclaim pool failed with error: %w", err)
-		}
-	}
-
-	return &pendingAdvisorState{
-		preCommitRevision: stateRevision,
-		entries:           newEntries,
-		allowOverlap:      allowSharedCoresOverlapReclaimedCores,
-		disableDedicated:  resp.DisableDedicatedCoresOverlapReclaimedCores,
-		residualFloor:     rampUpReclaimFloor,
-		dynamicConfig:     attemptConfig.dynamic,
-	}, nil
+	return preservedSNBRampUp, nil
 }
 
 // rematerializeRampUpSharedAgainstFinalReclaim restores the hard-partition

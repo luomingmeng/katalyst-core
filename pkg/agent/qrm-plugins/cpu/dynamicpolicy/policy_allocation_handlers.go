@@ -2926,22 +2926,53 @@ func (p *DynamicPolicy) finalizeDefaultShareEntryForMode(
 // 1. construct entries for isolated containers (probably be dedicated_cores not numa_binding )
 // 2. construct entries for all pools
 // 3. construct entries for shared_cores, reclaimed_cores, numa_binding dedicated_cores containers
-func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine.CPUSet,
-	isolatedCPUSet map[string]map[string]machine.CPUSet, curEntries state.PodEntries,
-	machineState state.NUMANodeMap, sharedBindingNUMAs sets.Int, persistCheckpoint bool,
-	explicitRampUpFloor machine.CPUSet,
-	defaultSharePlan defaultShareMaterializationPlan,
-	stateRevision uint64,
+// buildIsolatedPodEntries constructs entries for dedicated-cores (without NUMA
+// binding) containers from the isolated cpuset plan, and returns them together
+// with the union of isolated CPUs. Containers that are absent from the current
+// checkpoint or not eligible isolation targets are skipped.
+// buildPoolEntries writes a faked container entry for every pool cpuset into
+// newPodEntries, computing NUMA-aware assignments for each pool.
+func (p *DynamicPolicy) buildPoolEntries(
+	newPodEntries state.PodEntries,
+	poolsCPUSet map[string]machine.CPUSet,
+	curEntries state.PodEntries,
 ) error {
-	allowSharedCoresOverlapReclaimedCores := p.state.GetAllowSharedCoresOverlapReclaimedCores()
-	disableDedicatedCoresOverlapReclaimedCores := p.state.GetDisableDedicatedCoresOverlapReclaimedCores()
+	for poolName, cset := range poolsCPUSet {
+		general.Infof("try to apply pool %s: %s", poolName, cset.String())
+		topologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, cset)
+		if err != nil {
+			return fmt.Errorf("unable to calculate topologyAwareAssignments for pool: %s, result cpuset: %s, error: %v",
+				poolName, cset.String(), err)
+		}
+
+		allocationInfo := curEntries[poolName][commonstate.FakedContainerName]
+		if allocationInfo != nil {
+			general.Infof("pool: %s allocation result transform from %s(size: %d) to %s(size: %d)",
+				poolName, allocationInfo.AllocationResult.String(), allocationInfo.AllocationResult.Size(),
+				cset.String(), cset.Size())
+		}
+
+		if newPodEntries[poolName] == nil {
+			newPodEntries[poolName] = make(state.ContainerEntries)
+		}
+		newPodEntries[poolName][commonstate.FakedContainerName] = &state.AllocationInfo{
+			AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(poolName),
+			AllocationResult:                 cset.Clone(),
+			OriginalAllocationResult:         cset.Clone(),
+			TopologyAwareAssignments:         topologyAwareAssignments,
+			OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(topologyAwareAssignments),
+		}
+	}
+	return nil
+}
+
+func (p *DynamicPolicy) buildIsolatedPodEntries(
+	isolatedCPUSet map[string]map[string]machine.CPUSet,
+	curEntries state.PodEntries,
+) (state.PodEntries, machine.CPUSet) {
 	newPodEntries := make(state.PodEntries)
 	unionDedicatedIsolatedCPUSet := machine.NewCPUSet()
 
-	// Calculate from this adjustment's candidate snapshot so materialization
-	// and precommit validation observe the same RNB ownership.
-	nonReclaimActualBindingNUMAs := machineState.GetFilteredNUMASet(state.WrapAllocationMetaFilter((*commonstate.AllocationMeta).CheckReclaimedActualNUMABinding))
-	// 1. construct entries for isolated containers (probably be dedicated_cores not numa_binding )
 	for podUID, containerEntries := range isolatedCPUSet {
 		for containerName, isolatedCPUs := range containerEntries {
 			allocationInfo := curEntries[podUID][containerName]
@@ -2985,6 +3016,23 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 			unionDedicatedIsolatedCPUSet = unionDedicatedIsolatedCPUSet.Union(isolatedCPUs)
 		}
 	}
+	return newPodEntries, unionDedicatedIsolatedCPUSet
+}
+
+func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine.CPUSet,
+	isolatedCPUSet map[string]map[string]machine.CPUSet, curEntries state.PodEntries,
+	machineState state.NUMANodeMap, sharedBindingNUMAs sets.Int, persistCheckpoint bool,
+	explicitRampUpFloor machine.CPUSet,
+	defaultSharePlan defaultShareMaterializationPlan,
+	stateRevision uint64,
+) error {
+	allowSharedCoresOverlapReclaimedCores := p.state.GetAllowSharedCoresOverlapReclaimedCores()
+	disableDedicatedCoresOverlapReclaimedCores := p.state.GetDisableDedicatedCoresOverlapReclaimedCores()
+	// Calculate from this adjustment's candidate snapshot so materialization
+	// and precommit validation observe the same RNB ownership.
+	nonReclaimActualBindingNUMAs := machineState.GetFilteredNUMASet(state.WrapAllocationMetaFilter((*commonstate.AllocationMeta).CheckReclaimedActualNUMABinding))
+	// 1. construct entries for isolated containers (probably be dedicated_cores not numa_binding)
+	newPodEntries, unionDedicatedIsolatedCPUSet := p.buildIsolatedPodEntries(isolatedCPUSet, curEntries)
 
 	// 2. construct entries for all pools
 	rampUpReclaimFloor := explicitRampUpFloor.Clone()
@@ -2995,31 +3043,8 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 		return fmt.Errorf("entry: %s is empty", commonstate.PoolNameReclaim)
 	}
 
-	for poolName, cset := range poolsCPUSet {
-		general.Infof("try to apply pool %s: %s", poolName, cset.String())
-		topologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machineInfo.CPUTopology, cset)
-		if err != nil {
-			return fmt.Errorf("unable to calculate topologyAwareAssignments for pool: %s, result cpuset: %s, error: %v",
-				poolName, cset.String(), err)
-		}
-
-		allocationInfo := curEntries[poolName][commonstate.FakedContainerName]
-		if allocationInfo != nil {
-			general.Infof("pool: %s allocation result transform from %s(size: %d) to %s(size: %d)",
-				poolName, allocationInfo.AllocationResult.String(), allocationInfo.AllocationResult.Size(),
-				cset.String(), cset.Size())
-		}
-
-		if newPodEntries[poolName] == nil {
-			newPodEntries[poolName] = make(state.ContainerEntries)
-		}
-		newPodEntries[poolName][commonstate.FakedContainerName] = &state.AllocationInfo{
-			AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(poolName),
-			AllocationResult:                 cset.Clone(),
-			OriginalAllocationResult:         cset.Clone(),
-			TopologyAwareAssignments:         topologyAwareAssignments,
-			OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(topologyAwareAssignments),
-		}
+	if err := p.buildPoolEntries(newPodEntries, poolsCPUSet, curEntries); err != nil {
+		return err
 	}
 
 	// revise reclaim pool size to avoid reclaimed_cores and numa_binding containers
@@ -3452,55 +3477,10 @@ func (p *DynamicPolicy) generatePoolsAndIsolation(
 		rampUpReclaimFloor = options[0].rampUpReclaimFloor.Clone()
 		enforceReclaimMinimum = options[0].enforceReclaimMinimum
 	}
-	poolsBindingNUMAs := sets.NewInt()
-	poolsToSkip := make([]string, 0, len(poolsQuantityMap))
-	nonBindingPoolsQuantityMap := make(map[string]int)
-	explicitReclaimQuantity := 0
-	for poolName, numaToQuantity := range poolsQuantityMap {
-		if poolName == commonstate.PoolNameReclaim {
-			for _, quantity := range numaToQuantity {
-				if quantity > 0 {
-					explicitReclaimQuantity += quantity
-				}
-			}
-		}
-		if len(numaToQuantity) > 1 {
-			err = fmt.Errorf("pool: %s cross NUMAs: %+v", poolName, numaToQuantity)
-			return
-		} else if len(numaToQuantity) == 1 {
-			for numaID, quantity := range numaToQuantity {
-				if quantity == 0 {
-					poolsToSkip = append(poolsToSkip, poolName)
-				} else {
-					if numaID != commonstate.FakedNUMAID {
-						poolsBindingNUMAs.Insert(numaID)
-					} else {
-						nonBindingPoolsQuantityMap[poolName] = quantity
-					}
-				}
-			}
-		} else {
-			poolsToSkip = append(poolsToSkip, poolName)
-		}
-	}
-
-	for _, poolName := range poolsToSkip {
-		general.Warningf("pool: %s with 0 quantity, skip generate", poolName)
-		delete(poolsQuantityMap, poolName)
-	}
-
-	// clear isolated map with zero quantity
-	for podUID, containerEntries := range isolatedQuantityMap {
-		for containerName, quantity := range containerEntries {
-			if quantity == 0 {
-				general.Warningf("isolated pod: %s, container: %s with 0 quantity, skip generate it", podUID, containerName)
-				delete(containerEntries, containerName)
-			}
-		}
-		if len(containerEntries) == 0 {
-			general.Warningf(" isolated pod: %s all container entries skipped", podUID)
-			delete(isolatedQuantityMap, podUID)
-		}
+	poolsBindingNUMAs, nonBindingPoolsQuantityMap, explicitReclaimQuantity, parseErr := p.parsePoolAndIsolationQuantities(poolsQuantityMap, isolatedQuantityMap)
+	if parseErr != nil {
+		err = parseErr
+		return
 	}
 
 	poolsCPUSet = make(map[string]machine.CPUSet)
@@ -3653,25 +3633,9 @@ func (p *DynamicPolicy) generatePoolsAndIsolation(
 	} else {
 		// p.state.GetAllowSharedCoresOverlapReclaimedCores() == true
 		poolsCPUSet[commonstate.PoolNameReclaim] = poolsCPUSet[commonstate.PoolNameReclaim].Union(availableCPUs)
-		for poolName, cset := range poolsCPUSet {
-			if ratio, found := reclaimOverlapShareRatio[poolName]; found && ratio > 0 {
-
-				req := int(math.Ceil(float64(cset.Size()) * ratio))
-
-				// if p.state.GetAllowSharedCoresOverlapReclaimedCores() == false, we will take cpus for reclaim pool lastly,
-				// else we also should take cpus for reclaim pool reversely overlapping with share type pool to aviod cpuset jumping obviously
-				var tErr error
-				overlapCPUs, _, tErr := calculator.TakeByNUMABalanceReversely(p.machineInfo, cset, req)
-				if tErr != nil {
-					err = fmt.Errorf("take overlapCPUs from: %s to %s by ratio: %.4f failed with err: %v",
-						poolName, commonstate.PoolNameReclaim, ratio, tErr)
-					return
-				}
-
-				general.Infof("merge overlapCPUs: %s from pool: %s to %s by ratio: %.4f",
-					overlapCPUs.String(), poolName, commonstate.PoolNameReclaim, ratio)
-				poolsCPUSet[commonstate.PoolNameReclaim] = poolsCPUSet[commonstate.PoolNameReclaim].Union(overlapCPUs)
-			}
+		if overlapErr := p.applyReclaimOverlapFromSharePools(poolsCPUSet, reclaimOverlapShareRatio); overlapErr != nil {
+			err = overlapErr
+			return
 		}
 	}
 
@@ -3731,7 +3695,112 @@ func (p *DynamicPolicy) generatePoolsAndIsolation(
 		poolsCPUSet[commonstate.PoolNameReclaim] = p.reservedReclaimedCPUSet.Clone()
 	}
 
-	// deal with forbidden pools
+	// deal with forbidden pools and system exclusive pools
+	p.appendForbiddenAndSystemPools(poolsCPUSet, currentPodEntries)
+
+	return
+}
+
+// parsePoolAndIsolationQuantities normalizes the requested pool and isolation
+// quantities: it collects binding/non-binding pool NUMAs, drops zero-quantity
+// pools and isolation containers, and tallies the explicit reclaim quantity. It
+// mutates its map arguments in place, matching the original inline normalization.
+func (p *DynamicPolicy) parsePoolAndIsolationQuantities(
+	poolsQuantityMap map[string]map[int]int,
+	isolatedQuantityMap map[string]map[string]int,
+) (
+	poolsBindingNUMAs sets.Int,
+	nonBindingPoolsQuantityMap map[string]int,
+	explicitReclaimQuantity int,
+	err error,
+) {
+	poolsBindingNUMAs = sets.NewInt()
+	poolsToSkip := make([]string, 0, len(poolsQuantityMap))
+	nonBindingPoolsQuantityMap = make(map[string]int)
+	explicitReclaimQuantity = 0
+	for poolName, numaToQuantity := range poolsQuantityMap {
+		if poolName == commonstate.PoolNameReclaim {
+			for _, quantity := range numaToQuantity {
+				if quantity > 0 {
+					explicitReclaimQuantity += quantity
+				}
+			}
+		}
+		if len(numaToQuantity) > 1 {
+			err = fmt.Errorf("pool: %s cross NUMAs: %+v", poolName, numaToQuantity)
+			return
+		} else if len(numaToQuantity) == 1 {
+			for numaID, quantity := range numaToQuantity {
+				if quantity == 0 {
+					poolsToSkip = append(poolsToSkip, poolName)
+				} else {
+					if numaID != commonstate.FakedNUMAID {
+						poolsBindingNUMAs.Insert(numaID)
+					} else {
+						nonBindingPoolsQuantityMap[poolName] = quantity
+					}
+				}
+			}
+		} else {
+			poolsToSkip = append(poolsToSkip, poolName)
+		}
+	}
+
+	for _, poolName := range poolsToSkip {
+		general.Warningf("pool: %s with 0 quantity, skip generate", poolName)
+		delete(poolsQuantityMap, poolName)
+	}
+
+	// clear isolated map with zero quantity
+	for podUID, containerEntries := range isolatedQuantityMap {
+		for containerName, quantity := range containerEntries {
+			if quantity == 0 {
+				general.Warningf("isolated pod: %s, container: %s with 0 quantity, skip generate it", podUID, containerName)
+				delete(containerEntries, containerName)
+			}
+		}
+		if len(containerEntries) == 0 {
+			general.Warningf(" isolated pod: %s all container entries skipped", podUID)
+			delete(isolatedQuantityMap, podUID)
+		}
+	}
+	return
+}
+
+// applyReclaimOverlapFromSharePools reverse-takes CPUs from each share-type pool
+// that carries an overlap ratio and merges them into the reclaim pool.
+func (p *DynamicPolicy) applyReclaimOverlapFromSharePools(
+	poolsCPUSet map[string]machine.CPUSet,
+	reclaimOverlapShareRatio map[string]float64,
+) error {
+	for poolName, cset := range poolsCPUSet {
+		if ratio, found := reclaimOverlapShareRatio[poolName]; found && ratio > 0 {
+
+			req := int(math.Ceil(float64(cset.Size()) * ratio))
+
+			// if p.state.GetAllowSharedCoresOverlapReclaimedCores() == false, we will take cpus for reclaim pool lastly,
+			// else we also should take cpus for reclaim pool reversely overlapping with share type pool to aviod cpuset jumping obviously
+			var tErr error
+			overlapCPUs, _, tErr := calculator.TakeByNUMABalanceReversely(p.machineInfo, cset, req)
+			if tErr != nil {
+				return fmt.Errorf("take overlapCPUs from: %s to %s by ratio: %.4f failed with err: %v",
+					poolName, commonstate.PoolNameReclaim, ratio, tErr)
+			}
+
+			general.Infof("merge overlapCPUs: %s from pool: %s to %s by ratio: %.4f",
+				overlapCPUs.String(), poolName, commonstate.PoolNameReclaim, ratio)
+			poolsCPUSet[commonstate.PoolNameReclaim] = poolsCPUSet[commonstate.PoolNameReclaim].Union(overlapCPUs)
+		}
+	}
+	return nil
+}
+
+// appendForbiddenAndSystemPools copies the forbidden pools and the system
+// exclusive pools from the current pod entries into the generated pool set.
+func (p *DynamicPolicy) appendForbiddenAndSystemPools(
+	poolsCPUSet map[string]machine.CPUSet,
+	currentPodEntries state.PodEntries,
+) {
 	for _, poolName := range state.ForbiddenPools.List() {
 		cset, err := currentPodEntries.GetCPUSetForPool(poolName)
 		if err != nil {
@@ -3752,8 +3821,6 @@ func (p *DynamicPolicy) generatePoolsAndIsolation(
 		}
 		poolsCPUSet[poolName] = allocationInfo.AllocationResult.Clone()
 	}
-
-	return
 }
 
 func (p *DynamicPolicy) generateProportionalPoolsCPUSetInPlace(poolsQuantityMap map[string]int,
