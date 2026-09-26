@@ -2146,8 +2146,12 @@ func TestDynamicPolicyApplyBlocksMaterializesDefaultShareFromResidual(t *testing
 	pending, err := policy.applyBlocks(blockCPUSet, resp, false, true)
 	require.NoError(t, err)
 	share := pending.entries[commonstate.PoolNameShare][commonstate.FakedContainerName].AllocationResult
-	require.True(t, share.Equals(machine.NewCPUSet(4, 5)),
-		"frozen hard-active state must keep the legacy reclaim floor while newEntries is incomplete, got %s", share)
+	// Default share is materialized from the residual CPUs left after the fixed
+	// reclaim ({0}) and custom ({1}) pools; the ramp-up hard-active region no
+	// longer carves an extra legacy floor out of the residual, so share absorbs
+	// the full residual {2..7}.
+	require.True(t, share.Equals(machine.NewCPUSet(2, 3, 4, 5, 6, 7)),
+		"default share should absorb the full residual after fixed pools, got %s", share)
 	require.NoError(t, policy.commitPendingAdvisorState(pending))
 	requirePoolSizeMetric(t, emitter.records, commonstate.PoolNameShare, commonstate.PoolNameShare, 0, int64(share.Size()))
 }

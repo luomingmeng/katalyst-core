@@ -17,6 +17,7 @@ limitations under the License.
 package dynamicpolicy
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -603,4 +604,59 @@ func cloneSteadyFakeNUMAMigrationTargetForTest(
 		constraintDigest: source.constraintDigest,
 		target:           source.target.Clone(),
 	}
+}
+
+// TestSteadyFakeNUMAMigrationCheckpointBackwardCompat pins the on-disk contract
+// after migrating the hand-rolled writer to the shared FileCheckpointStore: the
+// new writer must emit the legacy JSON schema, the new reader must decode a
+// hand-written legacy file, and corruption/unknown-field guards must survive.
+func TestSteadyFakeNUMAMigrationCheckpointBackwardCompat(t *testing.T) {
+	topology, err := machine.GenerateDummyCPUTopology(8, 1, 2)
+	require.NoError(t, err)
+	dir := t.TempDir()
+
+	const digest = "legacy-constraints"
+	cpus := []int{0, 1, 4, 5}
+	legacyRecord := steadyFakeNUMAMigrationCheckpoint{
+		Version:          steadyFakeNUMAMigrationCheckpointVersion,
+		ConstraintDigest: digest,
+		TargetCPUs:       cpus,
+	}
+	legacyRecord.Checksum = steadyFakeNUMAMigrationCheckpointChecksum(
+		legacyRecord.Version, legacyRecord.ConstraintDigest, legacyRecord.TargetCPUs)
+	legacyBytes, err := json.Marshal(legacyRecord)
+	require.NoError(t, err)
+
+	// New writer emits the legacy JSON schema.
+	writer, err := getTestDynamicPolicyWithoutInitialization(topology, dir)
+	require.NoError(t, err)
+	require.NoError(t, writer.storeSteadyFakeNUMAMigrationTarget(
+		&steadyFakeNUMAMigrationTarget{constraintDigest: digest, target: machine.NewCPUSet(cpus...)}))
+	written, err := os.ReadFile(filepath.Join(dir, steadyFakeNUMAMigrationCheckpointName))
+	require.NoError(t, err)
+	require.JSONEq(t, string(legacyBytes), string(written),
+		"new CheckpointStore codec must write the legacy JSON schema")
+
+	// New reader decodes a hand-written legacy file.
+	restored, err := getTestDynamicPolicyWithoutInitialization(topology, dir)
+	require.NoError(t, err)
+	require.Equal(t, digest, restored.steadyFakeNUMAMigrationTarget.constraintDigest)
+	require.Equal(t, machine.NewCPUSet(cpus...), restored.steadyFakeNUMAMigrationTarget.target)
+
+	// Corrupted checksum fails closed.
+	badRecord := legacyRecord
+	badRecord.Checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+	badBytes, err := json.Marshal(badRecord)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, steadyFakeNUMAMigrationCheckpointName), badBytes, 0o600))
+	_, err = getTestDynamicPolicyWithoutInitialization(topology, dir)
+	require.Error(t, err)
+
+	// Unknown fields are rejected (DisallowUnknownFields preserved).
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, steadyFakeNUMAMigrationCheckpointName),
+		[]byte(`{"version":1,"constraint_digest":"x","target_cpus":[0,1,4,5],"checksum":"x","future_field":true}`),
+		0o600))
+	_, err = getTestDynamicPolicyWithoutInitialization(topology, dir)
+	require.Error(t, err)
 }

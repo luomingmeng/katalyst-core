@@ -37,6 +37,7 @@ import (
 
 	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
 	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
+	checkpointutils "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	"github.com/kubewharf/katalyst-core/pkg/config"
@@ -53,6 +54,7 @@ const (
 	cpuSetAdjustmentRetryInitialBackoff = 10 * time.Millisecond
 	cpuSetAdjustmentRetryMaxBackoff     = 200 * time.Millisecond
 	advisorPostCommitCheckpointName     = "cpu_advisor_post_commit_target"
+	advisorPostCommitStagingName        = advisorPostCommitCheckpointName + ".staging"
 	advisorPostCommitCheckpointVersion  = 2
 	advisorPostCommitWALV2Magic         = "\x00KATALYST_CPU_ADVISOR_WAL_V2\x00"
 )
@@ -237,6 +239,150 @@ func advisorPostCommitCheckpointChecksum(
 		_, _ = hash.Write([]byte("\napplied"))
 	}
 	return hex.EncodeToString(hash.Sum(nil))
+}
+
+// advisorPostCommitCheckpointCodec adapts the advisor post-commit write-ahead
+// log record to the generic checkpointutils.CheckpointCodec contract. It keeps
+// the exact historical JSON envelope, WAL v2 magic, sha256 checksum digest, and
+// the v0 fallback decoding so checkpoints written by the legacy hand-rolled
+// writer remain readable (and vice versa) after the file I/O was replaced by the
+// shared FileCheckpointStore. Payload semantics (version gating, checksum
+// verification, topology-bounded transition validation, revision-CAS) stay here;
+// the store owns only the crash-safe file protocol.
+type advisorPostCommitCheckpointCodec struct {
+	version           int
+	preCommitRevision *uint64
+	revision          uint64
+	responseBytes     []byte // raw protobuf, WITHOUT the WAL v2 magic (the checksum input)
+	response          *advisorapi.ListAndWatchResponse
+	transition        *advisorMigrationCheckpointTransitionWAL
+	domainTransition  steadyFakeNUMAMigrationCheckpointTransition
+	applied           bool
+	checksum          string
+
+	// topology is transient: never serialized, but required to re-validate the
+	// migration checkpoint target domain bounds on Unmarshal, exactly as the
+	// legacy restore did.
+	topology *machine.CPUTopology
+}
+
+func (c *advisorPostCommitCheckpointCodec) Marshal() ([]byte, error) {
+	c.version = advisorPostCommitCheckpointVersion
+	record := advisorPostCommitCheckpoint{
+		Version:                       c.version,
+		PreCommitRevision:             c.preCommitRevision,
+		Revision:                      c.revision,
+		Response:                      append([]byte(advisorPostCommitWALV2Magic), c.responseBytes...),
+		MigrationCheckpointTransition: c.transition,
+		Applied:                       c.applied,
+	}
+	record.Checksum = advisorPostCommitCheckpointChecksum(
+		c.version, c.preCommitRevision, c.revision, c.responseBytes, c.transition, c.applied)
+	data, err := json.Marshal(record)
+	if err != nil {
+		return nil, fmt.Errorf("marshal advisor checkpoint: %w", err)
+	}
+	return data, nil
+}
+
+func (c *advisorPostCommitCheckpointCodec) Unmarshal(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var record advisorPostCommitCheckpoint
+	if err := decoder.Decode(&record); err != nil {
+		return fmt.Errorf("decode advisor checkpoint: %w", err)
+	}
+	if err := ensureSteadyFakeNUMACheckpointEOF(decoder); err != nil {
+		return fmt.Errorf("advisor checkpoint trailing data: %w", err)
+	}
+	responseBytes := record.Response
+	switch record.Version {
+	case 0:
+		if record.Checksum != "" || record.MigrationCheckpointTransition != nil ||
+			record.Applied ||
+			bytes.HasPrefix(responseBytes, []byte(advisorPostCommitWALV2Magic)) {
+			return fmt.Errorf("advisor checkpoint version is missing")
+		}
+	case advisorPostCommitCheckpointVersion:
+		if record.Checksum == "" {
+			return fmt.Errorf("advisor checkpoint checksum is missing")
+		}
+		if record.PreCommitRevision == nil {
+			return fmt.Errorf("advisor checkpoint pre-commit revision is missing")
+		}
+		if !bytes.HasPrefix(responseBytes, []byte(advisorPostCommitWALV2Magic)) {
+			return fmt.Errorf("advisor WAL V2 magic is missing")
+		}
+		responseBytes = responseBytes[len(advisorPostCommitWALV2Magic):]
+		if record.Checksum != advisorPostCommitCheckpointChecksum(
+			record.Version,
+			record.PreCommitRevision,
+			record.Revision,
+			responseBytes,
+			record.MigrationCheckpointTransition,
+			record.Applied,
+		) {
+			return fmt.Errorf("advisor checkpoint checksum mismatch")
+		}
+	default:
+		return fmt.Errorf(
+			"unsupported advisor checkpoint version %d", record.Version)
+	}
+	response := &advisorapi.ListAndWatchResponse{}
+	if err := proto.Unmarshal(responseBytes, response); err != nil {
+		return err
+	}
+	transition, err := advisorMigrationCheckpointTransitionFromWAL(
+		record.MigrationCheckpointTransition, c.topology)
+	if err != nil {
+		return err
+	}
+	if record.Version == advisorPostCommitCheckpointVersion {
+		postCommitRevision, err := nextAdvisorRevision(*record.PreCommitRevision)
+		if err != nil {
+			return fmt.Errorf("invalid advisor checkpoint revision transition: %w", err)
+		}
+		if record.Revision != postCommitRevision {
+			return fmt.Errorf(
+				"invalid advisor checkpoint revision transition: pre=%d post=%d",
+				*record.PreCommitRevision, record.Revision)
+		}
+	}
+	c.version = record.Version
+	c.preCommitRevision = record.PreCommitRevision
+	c.revision = record.Revision
+	c.responseBytes = responseBytes
+	c.response = response
+	c.transition = record.MigrationCheckpointTransition
+	c.domainTransition = transition
+	c.applied = record.Applied
+	c.checksum = record.Checksum
+	return nil
+}
+
+func (c *advisorPostCommitCheckpointCodec) New() checkpointutils.CheckpointCodec {
+	return &advisorPostCommitCheckpointCodec{topology: c.topology}
+}
+
+// toTarget rebuilds the in-memory post-commit target from a decoded codec,
+// mirroring the legacy loadAdvisorPostCommitTarget reconstruction.
+func (c *advisorPostCommitCheckpointCodec) toTarget() *advisorPostCommitTarget {
+	target := &advisorPostCommitTarget{
+		checkpointVersion:             c.version,
+		revision:                      c.revision,
+		response:                      c.response,
+		migrationCheckpointTransition: c.domainTransition,
+		applied:                       c.applied,
+	}
+	phase := advisorPostCommitPhasePublished
+	if c.applied {
+		phase = advisorPostCommitPhaseCleanup
+	}
+	initializeAdvisorPostCommitProgress(target, phase)
+	if c.preCommitRevision != nil {
+		target.preCommitRevision = *c.preCommitRevision
+	}
+	return target
 }
 
 func cpuSetAdjustmentHandlerTimeout(conf *config.Configuration) time.Duration {
@@ -699,6 +845,40 @@ func (p *DynamicPolicy) advisorPostCommitStagingPath() string {
 	return path + ".staging"
 }
 
+// advisorPostCommitCheckpointStore returns the CheckpointStore backing the
+// advisor post-commit WAL. It shares the checkpoint directory with the steady
+// fake-NUMA migration target, matching the historical file location.
+func (p *DynamicPolicy) advisorPostCommitCheckpointStore() checkpointutils.CheckpointStore {
+	return checkpointutils.NewFileCheckpointStore(p.advisorPostCommitCheckpointDir)
+}
+
+func (p *DynamicPolicy) advisorPostCommitTopology() *machine.CPUTopology {
+	if p.machine.machineInfo == nil {
+		return nil
+	}
+	return p.machine.machineInfo.CPUTopology
+}
+
+// recoverAdvisorPostCommitName reads and validates the checkpoint stored under
+// name (active or staging) via the shared CheckpointStore. A missing checkpoint
+// returns (nil, nil); a corrupt, wrong-version, or checksum-mismatched checkpoint
+// returns an error that the caller surfaces as a corrupted-slot failure.
+func (p *DynamicPolicy) recoverAdvisorPostCommitName(name string) (*advisorPostCommitTarget, error) {
+	factory := &advisorPostCommitCheckpointCodec{topology: p.advisorPostCommitTopology()}
+	recovered, err := p.advisorPostCommitCheckpointStore().Recover(name, factory)
+	if err != nil {
+		return nil, err
+	}
+	if recovered == nil {
+		return nil, nil
+	}
+	codec, ok := recovered.(*advisorPostCommitCheckpointCodec)
+	if !ok {
+		return nil, fmt.Errorf("unexpected advisor post-commit checkpoint codec type %T", recovered)
+	}
+	return codec.toTarget(), nil
+}
+
 func (p *DynamicPolicy) storeAdvisorPostCommitTarget(target *advisorPostCommitTarget, path string) error {
 	if path == "" || target == nil {
 		return nil
@@ -707,65 +887,26 @@ func (p *DynamicPolicy) storeAdvisorPostCommitTarget(target *advisorPostCommitTa
 	if err != nil {
 		return fmt.Errorf("marshal advisor response: %w", err)
 	}
-	var topology *machine.CPUTopology
-	if p.machine.machineInfo != nil {
-		topology = p.machine.machineInfo.CPUTopology
-	}
+	topology := p.advisorPostCommitTopology()
 	transition, err := advisorMigrationCheckpointTransitionToWAL(
 		target.migrationCheckpointTransition, topology)
 	if err != nil {
 		return err
 	}
-	checkpoint := advisorPostCommitCheckpoint{
-		Version:                       advisorPostCommitCheckpointVersion,
-		PreCommitRevision:             &target.preCommitRevision,
-		Revision:                      target.revision,
-		Response:                      append([]byte(advisorPostCommitWALV2Magic), response...),
-		MigrationCheckpointTransition: transition,
-		Applied:                       target.applied,
+	preCommitRevision := target.preCommitRevision
+	codec := &advisorPostCommitCheckpointCodec{
+		preCommitRevision: &preCommitRevision,
+		revision:          target.revision,
+		responseBytes:     response,
+		transition:        transition,
+		applied:           target.applied,
+		topology:          topology,
 	}
-	checkpoint.Checksum = advisorPostCommitCheckpointChecksum(
-		checkpoint.Version, checkpoint.PreCommitRevision, checkpoint.Revision, response, transition, checkpoint.Applied)
-	data, err := json.Marshal(checkpoint)
-	if err != nil {
-		return fmt.Errorf("marshal advisor checkpoint: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
-		return fmt.Errorf("create advisor checkpoint directory: %w", err)
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+advisorPostCommitCheckpointName+"-*")
-	if err != nil {
-		return fmt.Errorf("create temporary advisor checkpoint: %w", err)
-	}
-	tmpPath := tmp.Name()
-	defer func() {
-		_ = tmp.Close()
-		_ = os.Remove(tmpPath)
-	}()
-	if err := tmp.Chmod(0o600); err != nil {
-		return fmt.Errorf("chmod temporary advisor checkpoint: %w", err)
-	}
-	if _, err := tmp.Write(data); err != nil {
-		return fmt.Errorf("write temporary advisor checkpoint: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		return fmt.Errorf("sync temporary advisor checkpoint: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temporary advisor checkpoint: %w", err)
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return fmt.Errorf("publish advisor checkpoint: %w", err)
-	}
-	dir, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return fmt.Errorf("open advisor checkpoint directory: %w", err)
-	}
-	defer dir.Close()
-	if err := dir.Sync(); err != nil {
-		return fmt.Errorf("sync advisor checkpoint directory: %w", err)
-	}
-	return nil
+	// The temp-file -> fsync -> rename -> dir-fsync crash-safe write protocol
+	// lives in FileCheckpointStore.Store. The checkpoint file name is derived
+	// from path (active vs. staging), so staging-vs-active selection and the
+	// on-disk location are unchanged.
+	return p.advisorPostCommitCheckpointStore().Store(filepath.Base(path), codec)
 }
 
 func syncAdvisorPostCommitDirectory(path string) error {
@@ -809,15 +950,14 @@ func (p *DynamicPolicy) removeAdvisorPostCommitCheckpoints() error {
 }
 
 func (p *DynamicPolicy) promoteAdvisorPostCommitStaging() error {
-	stagingPath := p.advisorPostCommitStagingPath()
-	activePath := p.advisorPostCommitCheckpointPath()
-	if stagingPath == "" {
+	if p.advisorPostCommitCheckpointDir == "" {
 		return nil
 	}
-	if err := os.Rename(stagingPath, activePath); err != nil {
-		return fmt.Errorf("rename staging checkpoint: %w", err)
-	}
-	return syncAdvisorPostCommitDirectory(activePath)
+	// Atomic staging -> active rename plus directory fsync, owned by the shared
+	// FileCheckpointStore so the crash-safe promotion protocol is identical to
+	// the steady fake-NUMA checkpoint writer.
+	return p.advisorPostCommitCheckpointStore().Promote(
+		advisorPostCommitStagingName, advisorPostCommitCheckpointName)
 }
 
 func advisorPostCommitTargetsEqual(left, right *advisorPostCommitTarget) bool {
@@ -857,6 +997,11 @@ func (p *DynamicPolicy) ensureAdvisorPostCommitPublished(target *advisorPostComm
 	return syncAdvisorPostCommitDirectory(activePath)
 }
 
+// loadAdvisorPostCommitTarget reads a WAL checkpoint from an explicit path and
+// decodes it through advisorPostCommitCheckpointCodec. It preserves the legacy
+// contract of returning the raw os.ReadFile error (so callers can distinguish an
+// absent file from a decode failure) and the legacy error strings. The crash-safe
+// dual-file restore path goes through CheckpointStore.Recover instead.
 func loadAdvisorPostCommitTarget(
 	path string,
 	topology *machine.CPUTopology,
@@ -865,84 +1010,11 @@ func loadAdvisorPostCommitTarget(
 	if err != nil {
 		return nil, err
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	var checkpoint advisorPostCommitCheckpoint
-	if err := decoder.Decode(&checkpoint); err != nil {
-		return nil, fmt.Errorf("decode advisor checkpoint: %w", err)
-	}
-	if err := ensureSteadyFakeNUMACheckpointEOF(decoder); err != nil {
-		return nil, fmt.Errorf("advisor checkpoint trailing data: %w", err)
-	}
-	responseBytes := checkpoint.Response
-	switch checkpoint.Version {
-	case 0:
-		if checkpoint.Checksum != "" || checkpoint.MigrationCheckpointTransition != nil ||
-			checkpoint.Applied ||
-			bytes.HasPrefix(responseBytes, []byte(advisorPostCommitWALV2Magic)) {
-			return nil, fmt.Errorf("advisor checkpoint version is missing")
-		}
-	case advisorPostCommitCheckpointVersion:
-		if checkpoint.Checksum == "" {
-			return nil, fmt.Errorf("advisor checkpoint checksum is missing")
-		}
-		if checkpoint.PreCommitRevision == nil {
-			return nil, fmt.Errorf("advisor checkpoint pre-commit revision is missing")
-		}
-		if !bytes.HasPrefix(responseBytes, []byte(advisorPostCommitWALV2Magic)) {
-			return nil, fmt.Errorf("advisor WAL V2 magic is missing")
-		}
-		responseBytes = responseBytes[len(advisorPostCommitWALV2Magic):]
-		if checkpoint.Checksum != advisorPostCommitCheckpointChecksum(
-			checkpoint.Version,
-			checkpoint.PreCommitRevision,
-			checkpoint.Revision,
-			responseBytes,
-			checkpoint.MigrationCheckpointTransition,
-			checkpoint.Applied,
-		) {
-			return nil, fmt.Errorf("advisor checkpoint checksum mismatch")
-		}
-	default:
-		return nil, fmt.Errorf(
-			"unsupported advisor checkpoint version %d", checkpoint.Version)
-	}
-	response := &advisorapi.ListAndWatchResponse{}
-	if err := proto.Unmarshal(responseBytes, response); err != nil {
+	codec := &advisorPostCommitCheckpointCodec{topology: topology}
+	if err := codec.Unmarshal(data); err != nil {
 		return nil, err
 	}
-	transition, err := advisorMigrationCheckpointTransitionFromWAL(
-		checkpoint.MigrationCheckpointTransition, topology)
-	if err != nil {
-		return nil, err
-	}
-	if checkpoint.Version == advisorPostCommitCheckpointVersion {
-		postCommitRevision, err := nextAdvisorRevision(*checkpoint.PreCommitRevision)
-		if err != nil {
-			return nil, fmt.Errorf("invalid advisor checkpoint revision transition: %w", err)
-		}
-		if checkpoint.Revision != postCommitRevision {
-			return nil, fmt.Errorf(
-				"invalid advisor checkpoint revision transition: pre=%d post=%d",
-				*checkpoint.PreCommitRevision, checkpoint.Revision)
-		}
-	}
-	target := &advisorPostCommitTarget{
-		checkpointVersion:             checkpoint.Version,
-		revision:                      checkpoint.Revision,
-		response:                      response,
-		migrationCheckpointTransition: transition,
-		applied:                       checkpoint.Applied,
-	}
-	phase := advisorPostCommitPhasePublished
-	if checkpoint.Applied {
-		phase = advisorPostCommitPhaseCleanup
-	}
-	initializeAdvisorPostCommitProgress(target, phase)
-	if checkpoint.PreCommitRevision != nil {
-		target.preCommitRevision = *checkpoint.PreCommitRevision
-	}
-	return target, nil
+	return codec.toTarget(), nil
 }
 
 type advisorPostCommitRecoveryState int
@@ -980,21 +1052,20 @@ func advisorPostCommitRecoveryForRevision(
 }
 
 func (p *DynamicPolicy) restoreAdvisorPostCommitTarget() error {
-	activePath := p.advisorPostCommitCheckpointPath()
-	if activePath == "" {
+	if p.advisorPostCommitCheckpointDir == "" {
 		return nil
 	}
-	stagingPath := p.advisorPostCommitStagingPath()
 	mainRevision := uint64(0)
 	if p.state != nil {
 		mainRevision = p.state.GetRevision()
 	}
-	var topology *machine.CPUTopology
-	if p.machine.machineInfo != nil {
-		topology = p.machine.machineInfo.CPUTopology
-	}
-	active, activeErr := loadAdvisorPostCommitTarget(activePath, topology)
-	staging, stagingErr := loadAdvisorPostCommitTarget(stagingPath, topology)
+	// Read both slots through the shared CheckpointStore. Recover returns
+	// (nil, nil) for a missing file, so a non-nil error now always means a
+	// corrupt or unreadable slot (the legacy os.IsNotExist distinction is
+	// absorbed by the store). The four-way recovery decision below is pure
+	// revision-CAS business logic and is unchanged.
+	active, activeErr := p.recoverAdvisorPostCommitName(advisorPostCommitCheckpointName)
+	staging, stagingErr := p.recoverAdvisorPostCommitName(advisorPostCommitStagingName)
 	activeRecovery := advisorPostCommitRecoveryForRevision(active, mainRevision)
 	stagingRecovery := advisorPostCommitRecoveryForRevision(staging, mainRevision)
 
@@ -1010,10 +1081,10 @@ func (p *DynamicPolicy) restoreAdvisorPostCommitTarget() error {
 			return err
 		}
 	} else {
-		if activeErr != nil && !os.IsNotExist(activeErr) {
+		if activeErr != nil {
 			return fmt.Errorf("corrupted active advisor post-commit checkpoint: %w", activeErr)
 		}
-		if stagingErr != nil && !os.IsNotExist(stagingErr) {
+		if stagingErr != nil {
 			return fmt.Errorf("corrupted staging advisor post-commit checkpoint: %w", stagingErr)
 		}
 		if err := p.removeAdvisorPostCommitCheckpoint(); err != nil {

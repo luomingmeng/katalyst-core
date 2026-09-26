@@ -23,12 +23,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 
+	checkpointutils "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
@@ -109,57 +109,112 @@ func steadyFakeNUMAMigrationCheckpointChecksum(
 	return hex.EncodeToString(hash.Sum(nil))
 }
 
+// steadyFakeNUMAMigrationCheckpointCodec adapts the on-disk steady fake-NUMA
+// migration target to the generic checkpointutils.CheckpointCodec contract. It
+// keeps the exact historical JSON schema and sha256 checksum digest so
+// checkpoints written by the legacy writer remain readable (and vice versa) after
+// the hand-rolled file I/O was replaced by the shared FileCheckpointStore.
+type steadyFakeNUMAMigrationCheckpointCodec struct {
+	version          int
+	constraintDigest string
+	targetCPUs       []int
+	checksum         string
+
+	// topology is transient: it is never serialized, but it is required to
+	// re-validate domain bounds (CPUs within topology, whole-core alignment) on
+	// Unmarshal, exactly as the legacy restore did.
+	topology *machine.CPUTopology
+}
+
+func (c *steadyFakeNUMAMigrationCheckpointCodec) Marshal() ([]byte, error) {
+	c.version = steadyFakeNUMAMigrationCheckpointVersion
+	c.checksum = steadyFakeNUMAMigrationCheckpointChecksum(
+		c.version, c.constraintDigest, c.targetCPUs)
+	record := steadyFakeNUMAMigrationCheckpoint{
+		Version:          c.version,
+		ConstraintDigest: c.constraintDigest,
+		TargetCPUs:       c.targetCPUs,
+		Checksum:         c.checksum,
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return nil, fmt.Errorf("marshal steady fake-NUMA migration checkpoint: %w", err)
+	}
+	return data, nil
+}
+
+func (c *steadyFakeNUMAMigrationCheckpointCodec) Unmarshal(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var record steadyFakeNUMAMigrationCheckpoint
+	if err := decoder.Decode(&record); err != nil {
+		return fmt.Errorf("decode checkpoint: %w", err)
+	}
+	if err := ensureSteadyFakeNUMACheckpointEOF(decoder); err != nil {
+		return err
+	}
+	if record.Version != steadyFakeNUMAMigrationCheckpointVersion {
+		return fmt.Errorf("unsupported checkpoint version %d", record.Version)
+	}
+	if record.ConstraintDigest == "" {
+		return fmt.Errorf("checkpoint constraint digest is empty")
+	}
+	if record.Checksum != steadyFakeNUMAMigrationCheckpointChecksum(
+		record.Version, record.ConstraintDigest, record.TargetCPUs) {
+		return fmt.Errorf("checkpoint checksum mismatch")
+	}
+	target := machine.NewCPUSet(record.TargetCPUs...)
+	if target.Size() != len(record.TargetCPUs) {
+		return fmt.Errorf("checkpoint target contains duplicate CPUs")
+	}
+	if c.topology == nil || c.topology.CPUDetails == nil {
+		return fmt.Errorf("checkpoint validation requires CPU topology")
+	}
+	if outside := target.Difference(c.topology.CPUDetails.CPUs()); !outside.IsEmpty() {
+		return fmt.Errorf("checkpoint target contains CPUs outside topology: %s", outside.String())
+	}
+	if err := assertCoreAligned(target, c.topology); err != nil {
+		return fmt.Errorf("checkpoint target is not core aligned: %w", err)
+	}
+	c.version = record.Version
+	c.constraintDigest = record.ConstraintDigest
+	c.targetCPUs = record.TargetCPUs
+	c.checksum = record.Checksum
+	return nil
+}
+
+func (c *steadyFakeNUMAMigrationCheckpointCodec) New() checkpointutils.CheckpointCodec {
+	return &steadyFakeNUMAMigrationCheckpointCodec{topology: c.topology}
+}
+
+// steadyFakeNUMACheckpointStore returns the CheckpointStore backing this
+// checkpoint. It shares the advisor post-commit checkpoint directory, matching
+// the historical file location.
+func (p *DynamicPolicy) steadyFakeNUMACheckpointStore() checkpointutils.CheckpointStore {
+	return checkpointutils.NewFileCheckpointStore(p.advisorPostCommitCheckpointDir)
+}
+
+func (p *DynamicPolicy) steadyFakeNUMACheckpointTopology() *machine.CPUTopology {
+	if p.machine.machineInfo == nil {
+		return nil
+	}
+	return p.machine.machineInfo.CPUTopology
+}
+
 func (p *DynamicPolicy) storeSteadyFakeNUMAMigrationTarget(
 	target *steadyFakeNUMAMigrationTarget,
 ) error {
 	if target == nil || target.constraintDigest == "" {
 		return fmt.Errorf("invalid empty steady fake-NUMA migration target")
 	}
-	path := p.steadyFakeNUMAMigrationCheckpointPath()
-	if path == "" {
-		return nil
+	codec := &steadyFakeNUMAMigrationCheckpointCodec{
+		constraintDigest: target.constraintDigest,
+		targetCPUs:       target.target.ToSliceInt(),
+		topology:         p.steadyFakeNUMACheckpointTopology(),
 	}
-	targetCPUs := target.target.ToSliceInt()
-	checkpoint := steadyFakeNUMAMigrationCheckpoint{
-		Version:          steadyFakeNUMAMigrationCheckpointVersion,
-		ConstraintDigest: target.constraintDigest,
-		TargetCPUs:       targetCPUs,
-	}
-	checkpoint.Checksum = steadyFakeNUMAMigrationCheckpointChecksum(
-		checkpoint.Version, checkpoint.ConstraintDigest, checkpoint.TargetCPUs)
-	data, err := json.Marshal(checkpoint)
-	if err != nil {
-		return fmt.Errorf("marshal steady fake-NUMA migration target: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
-		return fmt.Errorf("create steady fake-NUMA migration checkpoint directory: %w", err)
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+steadyFakeNUMAMigrationCheckpointName+"-*")
-	if err != nil {
-		return fmt.Errorf("create temporary steady fake-NUMA migration checkpoint: %w", err)
-	}
-	tmpPath := tmp.Name()
-	defer func() {
-		_ = tmp.Close()
-		_ = os.Remove(tmpPath)
-	}()
-	if err := tmp.Chmod(0o600); err != nil {
-		return fmt.Errorf("chmod temporary steady fake-NUMA migration checkpoint: %w", err)
-	}
-	if _, err := tmp.Write(data); err != nil {
-		return fmt.Errorf("write temporary steady fake-NUMA migration checkpoint: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		return fmt.Errorf("sync temporary steady fake-NUMA migration checkpoint: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temporary steady fake-NUMA migration checkpoint: %w", err)
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return fmt.Errorf("publish steady fake-NUMA migration checkpoint: %w", err)
-	}
-	if err := syncAdvisorPostCommitDirectory(path); err != nil {
-		return fmt.Errorf("sync steady fake-NUMA migration checkpoint directory: %w", err)
+	if err := p.steadyFakeNUMACheckpointStore().Store(
+		steadyFakeNUMAMigrationCheckpointName, codec); err != nil {
+		return err
 	}
 	p.steadyFakeNUMAMigrationTarget = &steadyFakeNUMAMigrationTarget{
 		constraintDigest: target.constraintDigest,
@@ -169,65 +224,38 @@ func (p *DynamicPolicy) storeSteadyFakeNUMAMigrationTarget(
 }
 
 func (p *DynamicPolicy) restoreSteadyFakeNUMAMigrationTarget() error {
-	path := p.steadyFakeNUMAMigrationCheckpointPath()
-	if path == "" {
-		return nil
-	}
-	data, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
+	if p.advisorPostCommitCheckpointDir == "" {
 		p.steadyFakeNUMAMigrationTarget = nil
 		return nil
 	}
+	factory := &steadyFakeNUMAMigrationCheckpointCodec{
+		topology: p.steadyFakeNUMACheckpointTopology(),
+	}
+	recovered, err := p.steadyFakeNUMACheckpointStore().Recover(
+		steadyFakeNUMAMigrationCheckpointName, factory)
 	if err != nil {
-		return fmt.Errorf("read checkpoint: %w", err)
-	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	var checkpoint steadyFakeNUMAMigrationCheckpoint
-	if err := decoder.Decode(&checkpoint); err != nil {
-		return fmt.Errorf("decode checkpoint: %w", err)
-	}
-	if err := ensureSteadyFakeNUMACheckpointEOF(decoder); err != nil {
 		return err
 	}
-	if checkpoint.Version != steadyFakeNUMAMigrationCheckpointVersion {
-		return fmt.Errorf("unsupported checkpoint version %d", checkpoint.Version)
+	if recovered == nil {
+		p.steadyFakeNUMAMigrationTarget = nil
+		return nil
 	}
-	if checkpoint.ConstraintDigest == "" {
-		return fmt.Errorf("checkpoint constraint digest is empty")
-	}
-	if checkpoint.Checksum != steadyFakeNUMAMigrationCheckpointChecksum(
-		checkpoint.Version, checkpoint.ConstraintDigest, checkpoint.TargetCPUs) {
-		return fmt.Errorf("checkpoint checksum mismatch")
-	}
-	target := machine.NewCPUSet(checkpoint.TargetCPUs...)
-	if target.Size() != len(checkpoint.TargetCPUs) {
-		return fmt.Errorf("checkpoint target contains duplicate CPUs")
-	}
-	if p.machine.machineInfo == nil || p.machine.machineInfo.CPUTopology == nil {
-		return fmt.Errorf("checkpoint validation requires CPU topology")
-	}
-	if outside := target.Difference(p.machine.machineInfo.CPUTopology.CPUDetails.CPUs()); !outside.IsEmpty() {
-		return fmt.Errorf("checkpoint target contains CPUs outside topology: %s", outside.String())
-	}
-	if err := assertCoreAligned(target, p.machine.machineInfo.CPUTopology); err != nil {
-		return fmt.Errorf("checkpoint target is not core aligned: %w", err)
+	codec, ok := recovered.(*steadyFakeNUMAMigrationCheckpointCodec)
+	if !ok {
+		return fmt.Errorf("unexpected steady fake-NUMA checkpoint codec type %T", recovered)
 	}
 	p.steadyFakeNUMAMigrationTarget = &steadyFakeNUMAMigrationTarget{
-		constraintDigest: checkpoint.ConstraintDigest,
-		target:           target,
+		constraintDigest: codec.constraintDigest,
+		target:           machine.NewCPUSet(codec.targetCPUs...),
 	}
 	return nil
 }
 
 func (p *DynamicPolicy) removeSteadyFakeNUMAMigrationTarget() error {
-	path := p.steadyFakeNUMAMigrationCheckpointPath()
-	if path != "" {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove steady fake-NUMA migration checkpoint: %w", err)
-		}
-		if err := syncAdvisorPostCommitDirectory(path); err != nil {
-			return fmt.Errorf("sync steady fake-NUMA migration checkpoint directory: %w", err)
+	if p.advisorPostCommitCheckpointDir != "" {
+		if err := p.steadyFakeNUMACheckpointStore().Remove(
+			steadyFakeNUMAMigrationCheckpointName); err != nil {
+			return err
 		}
 	}
 	p.steadyFakeNUMAMigrationTarget = nil

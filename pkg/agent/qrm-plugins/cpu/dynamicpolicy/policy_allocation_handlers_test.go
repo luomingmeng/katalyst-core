@@ -1784,9 +1784,11 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_partitionEligibilityGate(t *testi
 			2, &pluginapi.TopologyHint{Nodes: []uint64{0}}, completeState, annotations, false)
 		require.NoError(t, err)
 		require.Equal(t, 2, result.Size())
-		require.Equal(t, 4, reclaim.Size())
+		// The ramp-up reclaim floor is domain-isolated to the hinted NUMA (0); a
+		// request hinting only NUMA0 must not reserve reclaim on NUMA1.
+		require.Equal(t, 2, reclaim.Size())
 		require.Equal(t, 2, reclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(0)).Size())
-		require.Equal(t, 2, reclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(1)).Size())
+		require.Equal(t, 0, reclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(1)).Size())
 	})
 
 	t.Run("DD false uses legacy path before selector", func(t *testing.T) {
@@ -1802,9 +1804,10 @@ func TestDynamicPolicy_allocateNumaBindingCPUs_partitionEligibilityGate(t *testi
 		result, reclaim, err := p.allocateNumaBindingCPUs(
 			2, &pluginapi.TopologyHint{Nodes: []uint64{0}}, completeState, exclusive, false)
 		require.NoError(t, err)
-		require.Equal(t, 4, reclaim.Size())
+		// Domain-isolated floor: only the hinted NUMA0 keeps the reclaim floor.
+		require.Equal(t, 2, reclaim.Size())
 		require.Equal(t, 2, reclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(0)).Size())
-		require.Equal(t, 2, reclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(1)).Size())
+		require.Equal(t, 0, reclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(1)).Size())
 		require.True(t, result.Equals(completeState[0].DefaultCPUSet), "result=%s", result)
 	})
 }
