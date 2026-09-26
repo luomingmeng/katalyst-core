@@ -46,8 +46,8 @@ func TestPrepareIncrementalContextBuildsMinimumOwnershipFrontier(t *testing.T) {
 		DesiredByRel: map[string]machine.CPUSet{"root": machine.NewCPUSet(0)},
 		AllowedCPUs:  machine.NewCPUSet(0, 1),
 	}
-	depth := buildSnapshotDepthByRel(snapshot, nil)
-	domainByRel, parentByRel := buildPlannerRelations(snapshot, dag, depth, nil)
+	depth, relOrder := buildSnapshotDepthByRel(snapshot, nil)
+	domainByRel, parentByRel := buildPlannerRelations(snapshot, dag, depth, relOrder.relsAsc, relOrder.childRelsByRel, nil)
 	projectionContext, err := buildDrainProjectionContext(
 		context.Background(), snapshot, nil, nil)
 	if err != nil {
@@ -91,8 +91,8 @@ func TestPrepareIncrementalContextIgnoresNonTransferMemberships(t *testing.T) {
 			DesiredByRel: map[string]machine.CPUSet{"root": machine.NewCPUSet()},
 			AllowedCPUs:  cpus,
 		}
-		depth := buildSnapshotDepthByRel(snapshot, nil)
-		domainByRel, parentByRel := buildPlannerRelations(snapshot, dag, depth, nil)
+		depth, relOrder := buildSnapshotDepthByRel(snapshot, nil)
+		domainByRel, parentByRel := buildPlannerRelations(snapshot, dag, depth, relOrder.relsAsc, relOrder.childRelsByRel, nil)
 		projectionContext, err := buildDrainProjectionContext(
 			context.Background(), snapshot, nil, nil)
 		if err != nil {
@@ -189,8 +189,8 @@ func TestProjectDrainTargetsMatchesPlannerAndReportsDomainUnion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildPhasePlan: %v", err)
 	}
-	depth := buildSnapshotDepthByRel(snapshot, nil)
-	domainByRel, parentByRel := buildPlannerRelations(snapshot, dag, depth, nil)
+	depth, relOrder := buildSnapshotDepthByRel(snapshot, nil)
+	domainByRel, parentByRel := buildPlannerRelations(snapshot, dag, depth, relOrder.relsAsc, relOrder.childRelsByRel, nil)
 	projection, err := projectDrainTargets(DrainProjectionInput{
 		PlanInput:       input,
 		DrainBatch:      plan.DrainBatch,
@@ -229,8 +229,8 @@ func TestProjectDrainTargetsReportsV1NonEmptyBlocker(t *testing.T) {
 		DesiredByRel: map[string]machine.CPUSet{"primary": machine.NewCPUSet(1)},
 		AllowedCPUs:  machine.NewCPUSet(0, 1),
 	}
-	depth := buildSnapshotDepthByRel(snapshot, nil)
-	domainByRel, parentByRel := buildPlannerRelations(snapshot, dag, depth, nil)
+	depth, relOrder := buildSnapshotDepthByRel(snapshot, nil)
+	domainByRel, parentByRel := buildPlannerRelations(snapshot, dag, depth, relOrder.relsAsc, relOrder.childRelsByRel, nil)
 	projection, err := projectDrainTargets(DrainProjectionInput{
 		PlanInput: input, DrainBatch: map[DomainID]machine.CPUSet{DomainPrimary: machine.NewCPUSet(0)},
 		LeavingByDomain: map[DomainID]machine.CPUSet{DomainPrimary: machine.NewCPUSet(0)},
@@ -275,8 +275,8 @@ func TestProjectDrainTargetsKeepsV1AnchorForObservedNUMAOverflow(t *testing.T) {
 		},
 		AllowedCPUs: machine.NewCPUSet(0, 2),
 	}
-	depth := buildSnapshotDepthByRel(snapshot, nil)
-	domainByRel, parentByRel := buildPlannerRelations(snapshot, dag, depth, nil)
+	depth, relOrder := buildSnapshotDepthByRel(snapshot, nil)
+	domainByRel, parentByRel := buildPlannerRelations(snapshot, dag, depth, relOrder.relsAsc, relOrder.childRelsByRel, nil)
 	projection, err := projectDrainTargets(DrainProjectionInput{
 		PlanInput:       input,
 		DrainBatch:      map[DomainID]machine.CPUSet{DomainReclaim: overflow},

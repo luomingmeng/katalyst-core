@@ -2263,7 +2263,7 @@ func TestBuildPlanOperationsV2EmptyConfiguredCPUsOrdersByMemsDirection(t *testin
 			}
 			operations := buildPlanOperations(
 				tc.kind, true, capabilities, targets, snapshot,
-				depthByRel, domainByRel, parentByRel, dag, 2, nil,
+				depthByRel, domainByRel, parentByRel, dag, 2, nil, nil,
 			)
 			gotOrder := make([]string, 0, len(operations))
 			for _, operation := range operations {
@@ -2486,7 +2486,7 @@ func TestBuildPlanOperationsDynamicMemsDifferenceNeverWritesMems(t *testing.T) {
 		nil,
 		dag,
 		1,
-		nil,
+		nil, nil,
 	)
 	if len(operations) != 1 {
 		t.Fatalf("operations = %#v, want one CPU operation", operations)
@@ -3548,7 +3548,7 @@ func TestSnapshotDepthByRelVisitsWideAndDeepTreesLinearly(t *testing.T) {
 			t.Run(fmt.Sprintf("%s-%d", shape, size), func(t *testing.T) {
 				_, snapshot, _ := planTreeFixture(t, shape, size)
 				stats := &depthBuildStats{}
-				depths := buildSnapshotDepthByRel(snapshot, stats)
+				depths, _ := buildSnapshotDepthByRel(snapshot, stats)
 				if len(depths) != size {
 					t.Fatalf("depth count = %d, want %d", len(depths), size)
 				}

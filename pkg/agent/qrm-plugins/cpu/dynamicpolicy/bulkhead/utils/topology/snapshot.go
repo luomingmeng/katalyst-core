@@ -25,8 +25,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	cgroupclient "github.com/kubewharf/katalyst-core/pkg/util/cgroup/client"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
@@ -858,15 +860,48 @@ func hierarchyCapabilitiesBits(capabilities HierarchyCapabilities) uint64 {
 	return bits
 }
 
-func writeHashString(hash interface{ Write([]byte) (int, error) }, value string) {
+// stringBytesNoAlloc converts a string to []byte without copying.
+	// hash.Write only reads the bytes and does not retain the slice, so this
+	// is safe for sha256 and similar digest implementations.
+	func stringBytesNoAlloc(s string) []byte {
+		type stringHeader struct {
+			Data unsafe.Pointer
+			Len  int
+		}
+		type sliceHeader struct {
+			Data unsafe.Pointer
+			Len  int
+			Cap  int
+		}
+		sh := (*stringHeader)(unsafe.Pointer(&s))
+		bh := sliceHeader{Data: sh.Data, Len: sh.Len, Cap: sh.Len}
+		return *(*[]byte)(unsafe.Pointer(&bh))
+	}
+
+	func writeHashString(hash interface{ Write([]byte) (int, error) }, value string) {
 	writeHashUint64(hash, uint64(len(value)))
-	_, _ = hash.Write([]byte(value))
+	if len(value) > 0 {
+		_, _ = hash.Write(stringBytesNoAlloc(value))
+	}
+}
+
+// hashUint64ScratchPool reuses the 8-byte little-endian encoding buffer. A local
+// [8]byte passed through the opaque io.Writer interface escapes to the heap on
+// every call (microbenchmark: 8 B/op, 1 allocs/op; a pre-allocated *[8]byte is 0).
+// Pooling a fixed buffer removes that allocation; PutUint64 overwrites all eight
+// bytes on every use, so no stale bytes can leak into the digest.
+var hashUint64ScratchPool = sync.Pool{
+	New: func() any {
+		b := new([8]byte)
+		return b
+	},
 }
 
 func writeHashUint64(hash interface{ Write([]byte) (int, error) }, value uint64) {
-	var encoded [8]byte
-	binary.LittleEndian.PutUint64(encoded[:], value)
-	_, _ = hash.Write(encoded[:])
+	buf := hashUint64ScratchPool.Get().(*[8]byte)
+	binary.LittleEndian.PutUint64(buf[:], value)
+	_, _ = hash.Write(buf[:])
+	hashUint64ScratchPool.Put(buf)
 }
 
 func cloneUnavailableChildEvidenceMap(

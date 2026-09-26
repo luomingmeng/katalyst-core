@@ -156,12 +156,15 @@ func (p *CPUMetricsPlugin) PeriodicalHandler(_ context.Context, in bulkheadapi.P
 		return nil
 	}
 
-	union := machine.NewCPUSet()
+	// Collect all pool CPUs into a single set in one shot instead of folding
+	// the growing union per pool (each Union copies the accumulated set).
+	var unionCPUs []int
 	for _, pool := range assignment.pools {
 		if !pool.cpus.IsEmpty() {
-			union = union.Union(pool.cpus)
+			unionCPUs = append(unionCPUs, pool.cpus.ToSliceNoSortInt()...)
 		}
 	}
+	union := machine.NewCPUSet(unionCPUs...)
 	if union.IsEmpty() {
 		general.InfofV(6, "bulkhead cpu_metrics: all projected pools are empty, skipping")
 		p.emitDiagnostics(in.Emitter, in.AppliedView, assignment, 0, 0)
@@ -172,13 +175,16 @@ func (p *CPUMetricsPlugin) PeriodicalHandler(_ context.Context, in bulkheadapi.P
 	globalAttempts := 0
 	numaAttempts := 0
 	numaCPUs := numaBuckets(in.MetaServer, union)
+	// numaCPUs does not change between pools; sort its keys once instead of
+	// re-sorting (and re-allocating the slice) on every pool iteration.
+	sortedNUMAs := sortedNUMAIDs(numaCPUs)
 	for _, pool := range assignment.pools {
 		if pool.cpus.IsEmpty() {
 			continue
 		}
 		globalAttempts += p.emitValues(in.Emitter, aggregateSamples(cache, pool.cpus), false,
 			metrics.MetricTag{Key: poolNameTagKey, Val: pool.label})
-		for _, numaID := range sortedNUMAIDs(numaCPUs) {
+		for _, numaID := range sortedNUMAs {
 			intersection := pool.cpus.Intersection(numaCPUs[numaID])
 			if intersection.IsEmpty() {
 				continue
@@ -272,12 +278,19 @@ func numaBuckets(ms *metaserver.MetaServer, cpus machine.CPUSet) map[int]machine
 		general.InfofV(6, "bulkhead cpu_metrics: nil or empty CPU topology, skipping NUMA metrics")
 		return result
 	}
+	// Collect CPU IDs per NUMA first, then build each bucket CPUSet once.
+	// Repeated per-CPU Union would copy the accumulating set on every step
+	// (O(N^2)) and allocate a fresh map per CPU.
+	byNUMA := make(map[int][]int)
 	for _, cpu := range cpus.ToSliceInt() {
 		detail, ok := ms.CPUDetails[cpu]
 		if !ok {
 			continue
 		}
-		result[detail.NUMANodeID] = result[detail.NUMANodeID].Union(machine.NewCPUSet(cpu))
+		byNUMA[detail.NUMANodeID] = append(byNUMA[detail.NUMANodeID], cpu)
+	}
+	for numaID, ids := range byNUMA {
+		result[numaID] = machine.NewCPUSet(ids...)
 	}
 	return result
 }

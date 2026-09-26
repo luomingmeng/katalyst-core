@@ -17,6 +17,7 @@ limitations under the License.
 package model
 
 import (
+	"fmt"
 	"sort"
 	"testing"
 
@@ -405,5 +406,22 @@ func TestAppliedViewReclaimOnlyLevelParticipatesInCopyAndEquality_BitsUT(t *test
 	copied.Level = AppliedViewLevelFull
 	if EqualAppliedView(applied, copied) {
 		t.Fatal("applied views with different levels should not compare equal")
+	}
+}
+
+// BenchmarkCloneCPUSetMap measures the deep-copy of a rel->CPUSet map, a hot
+// operation on every convergence round.
+func BenchmarkCloneCPUSetMap(b *testing.B) {
+	const relCount = 256
+	in := make(map[string]machine.CPUSet, relCount)
+	for i := 0; i < relCount; i++ {
+		in[fmt.Sprintf("root/node-%04d", i)] = machine.NewCPUSet(i*2, i*2+1)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if out := CloneCPUSetMap(in); len(out) != relCount {
+			b.Fatalf("cloned map size = %d, want %d", len(out), relCount)
+		}
 	}
 }

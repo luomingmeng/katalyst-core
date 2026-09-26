@@ -101,8 +101,9 @@ type NodeSpec struct {
 }
 
 type TopoDAG struct {
-	topLevel []*TopoNode
-	index    map[string]*TopoNode
+	topLevel     []*TopoNode
+	index        map[string]*TopoNode
+	sortedNodes  []*TopoNode // cached, immutable after BuildDAG
 }
 
 // BuildDAG constructs a topology DAG from node specs.
@@ -169,20 +170,22 @@ func BuildDAG(specs []NodeSpec) (*TopoDAG, error) {
 	if err := d.detectCycles(); err != nil {
 		return nil, err
 	}
+	d.sortedNodes = make([]*TopoNode, 0, len(d.index))
+	for _, node := range d.index {
+		d.sortedNodes = append(d.sortedNodes, node)
+	}
+	sort.Slice(d.sortedNodes, func(i, j int) bool { return lessNode(d.sortedNodes[i], d.sortedNodes[j]) })
 	return d, nil
 }
 
-// Nodes returns all nodes in deterministic role/path order.
+// Nodes returns all nodes in deterministic role/path order. The DAG is
+// immutable after BuildDAG, so the sorted slice is cached and returned
+// directly; callers must not mutate the returned slice.
 func (d *TopoDAG) Nodes() []*TopoNode {
 	if d == nil {
 		return nil
 	}
-	out := make([]*TopoNode, 0, len(d.index))
-	for _, node := range d.index {
-		out = append(out, node)
-	}
-	sort.Slice(out, func(i, j int) bool { return lessNode(out[i], out[j]) })
-	return out
+	return d.sortedNodes
 }
 
 // SelectUniqueControlledPrimaryCandidate selects the sole candidate covered by

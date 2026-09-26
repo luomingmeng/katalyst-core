@@ -775,7 +775,7 @@ func coordinatorAutoPlanOperationsTotal(rounds int, snapshot *CompleteSnapshot) 
 	// rebases the plan and charges the number of operations still pending.
 	// Derive that cumulative triangular term from the initial hierarchy shape:
 	// wide siblings share one frontier, while a deep chain has one per depth.
-	depthByRel := buildSnapshotDepthByRel(snapshot, nil)
+	depthByRel, _ := buildSnapshotDepthByRel(snapshot, nil)
 	frontierWidths := make(map[int]int)
 	for rel := range snapshot.Entries {
 		frontierWidths[depthByRel[rel]]++
@@ -1623,7 +1623,7 @@ func drainFrontier(plan PhasePlan) (PhasePlan, error) {
 		return PhasePlan{}, fmt.Errorf("%w: drain frontier limit=%d operations=%d",
 			ErrPlanOperationBudgetExceeded, remaining, len(plan.Operations))
 	}
-	depthByRel := buildSnapshotDepthByRel(plan.Base, nil)
+	depthByRel, _ := buildSnapshotDepthByRel(plan.Base, nil)
 	first := plan.Operations[0]
 	depth := depthByRel[first.Rel]
 	end := 1
@@ -1676,10 +1676,10 @@ func rebaseDrainPlan(plan PhasePlan, fresh *CompleteSnapshot, dag *TopoDAG, budg
 			delete(targets, rel)
 		}
 	}
-	depthByRel := buildSnapshotDepthByRel(fresh, nil)
-	domainByRel, parentByRel := buildPlannerRelations(fresh, dag, depthByRel, nil)
+	depthByRel, relOrder := buildSnapshotDepthByRel(fresh, nil)
+	domainByRel, parentByRel := buildPlannerRelations(fresh, dag, depthByRel, relOrder.relsAsc, relOrder.childRelsByRel, nil)
 	postProcessPhaseOperationTargets(plan.Kind, plan.AllowEmptyTarget, plan.Capabilities, targets, fresh)
-	if err := propagatePhaseTargetEnvelope(targets, parentByRel, depthByRel); err != nil {
+	if err := propagatePhaseTargetEnvelope(targets, parentByRel, depthByRel, relOrder.relsDesc); err != nil {
 		return PhasePlan{}, err
 	}
 	if !plan.AllowEmptyTarget {
@@ -1699,7 +1699,7 @@ func rebaseDrainPlan(plan PhasePlan, fresh *CompleteSnapshot, dag *TopoDAG, budg
 	plan.TargetByRel = targets
 	plan.Operations = buildPlanOperations(
 		plan.Kind, plan.AllowEmptyTarget, plan.Capabilities,
-		targets, fresh, depthByRel, domainByRel, parentByRel, dag, operationCount, nil,
+		targets, fresh, depthByRel, domainByRel, parentByRel, dag, operationCount, nil, nil,
 	)
 	plan.CostUpperBound.Operations = len(plan.Operations)
 	plan.PlanID = canonicalExecutionPlanID(plan)

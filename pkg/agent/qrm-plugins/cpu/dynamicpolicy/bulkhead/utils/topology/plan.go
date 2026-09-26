@@ -511,8 +511,8 @@ func buildPhasePlanWithStats(in PhasePlanInput, stats *plannerBuildStats) (Phase
 		return PhasePlan{}, err
 	}
 	depthStats := &depthBuildStats{}
-	depthByRel := buildSnapshotDepthByRel(in.Snapshot, depthStats)
-	domainByRel, parentByRel := buildPlannerRelations(in.Snapshot, in.DAG, depthByRel, stats)
+	depthByRel, relOrder := buildSnapshotDepthByRel(in.Snapshot, depthStats)
+	domainByRel, parentByRel := buildPlannerRelations(in.Snapshot, in.DAG, depthByRel, relOrder.relsAsc, relOrder.childRelsByRel, stats)
 	if stats != nil {
 		stats.DepthNodes = depthStats.NodesInitialized
 		stats.DepthEdges = depthStats.EdgesVisited
@@ -557,7 +557,7 @@ func buildPhasePlanWithStats(in PhasePlanInput, stats *plannerBuildStats) (Phase
 			return PhasePlan{}, err
 		}
 	case PhaseExpand:
-		if err := buildExpandTargets(&plan, in, domains, desiredByDomain, domainByRel, parentByRel, depthByRel); err != nil {
+		if err := buildExpandTargets(&plan, in, domains, desiredByDomain, domainByRel, parentByRel, depthByRel, relOrder); err != nil {
 			return PhasePlan{}, err
 		}
 	}
@@ -567,7 +567,7 @@ func buildPhasePlanWithStats(in PhasePlanInput, stats *plannerBuildStats) (Phase
 		}
 	}
 	postProcessPhaseOperationTargets(in.Kind, in.AllowEmptyTarget, in.Capabilities, plan.TargetByRel, in.Snapshot)
-	if err := propagatePhaseTargetEnvelope(plan.TargetByRel, parentByRel, depthByRel); err != nil {
+	if err := propagatePhaseTargetEnvelope(plan.TargetByRel, parentByRel, depthByRel, relOrder.relsDesc); err != nil {
 		return PhasePlan{}, err
 	}
 	if !in.AllowEmptyTarget {
@@ -598,6 +598,7 @@ func buildPhasePlanWithStats(in PhasePlanInput, stats *plannerBuildStats) (Phase
 		in.DAG,
 		operationCount,
 		stats,
+		relOrder.childRelsByRel,
 	)
 	plan.Operations = operations
 	plan.PlanID = canonicalExecutionPlanID(plan)
@@ -1013,6 +1014,7 @@ func buildExpandTargets(
 	domainByRel map[string]DomainID,
 	parentByRel map[string]string,
 	depthByRel map[string]int,
+	relOrder relDepthOrder,
 ) error {
 	gate, err := NewDomainGate(plan.ConvergenceID, in.Snapshot, desiredByDomain, in.AllowedCPUs, in.Witnesses)
 	if err != nil {
@@ -1021,6 +1023,7 @@ func buildExpandTargets(
 	for _, domain := range domains {
 		plan.AllowedEntering[domain] = gate.AllowedEntering(domain)
 	}
+	semanticByRel := semanticTargetsForPlan(in)
 	for rel, entry := range in.Snapshot.Entries {
 		if relInDormantSubtree(rel, in.DormantRels) {
 			continue
@@ -1030,7 +1033,11 @@ func buildExpandTargets(
 		if node != nil {
 			desired := in.DesiredByRel[rel]
 			available := plan.AllowedEntering[node.Domain].Union(in.Snapshot.DomainUnion[node.Domain])
-			available = available.Union(desired.Difference(semanticTargetsForPlan(in)[rel]))
+			// desired.Difference(semantic) is empty whenever desired is already a
+			// subset of the semantic target; skip the Difference+Union allocations.
+			if !desired.IsSubsetOf(semanticByRel[rel]) {
+				available = available.Union(desired.Difference(semanticByRel[rel]))
+			}
 			target, err = buildPhaseTransition(PhaseExpand, RelTransition{
 				Current:            entry.CPUs,
 				Final:              desired,
@@ -1065,7 +1072,7 @@ func buildExpandTargets(
 	); err != nil {
 		return err
 	}
-	closeExpandTargetsOverImmediateEdges(plan.TargetByRel, in.Snapshot, depthByRel)
+	closeExpandTargetsOverImmediateEdges(plan.TargetByRel, in.Snapshot, depthByRel, relOrder.relsDesc, relOrder.childRelsByRel)
 	return nil
 }
 
@@ -1147,16 +1154,27 @@ func finalCPUSetForRel(
 }
 
 func sortedSnapshotRels(snapshot *CompleteSnapshot, depthByRel map[string]int) []string {
-	rels := make([]string, 0, len(snapshot.Entries))
-	for rel := range snapshot.Entries {
-		rels = append(rels, rel)
+	// Rebuild the sorted order here; this is called from a secondary path
+	// (dynamic descendant closure) that does not have access to relOrder.
+	// The sort uses a local depth-keyed struct to avoid string map lookups.
+	type rd struct {
+		rel   string
+		depth int
 	}
-	sort.Slice(rels, func(i, j int) bool {
-		if depthByRel[rels[i]] != depthByRel[rels[j]] {
-			return depthByRel[rels[i]] < depthByRel[rels[j]]
+	all := make([]rd, 0, len(snapshot.Entries))
+	for rel := range snapshot.Entries {
+		all = append(all, rd{rel: rel, depth: depthByRel[rel]})
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].depth != all[j].depth {
+			return all[i].depth < all[j].depth
 		}
-		return rels[i] < rels[j]
+		return all[i].rel < all[j].rel
 	})
+	rels := make([]string, len(all))
+	for i, rd := range all {
+		rels[i] = rd.rel
+	}
 	return rels
 }
 
@@ -1346,24 +1364,16 @@ func executableTransferCycle(
 	return nil
 }
 
-func closeExpandTargetsOverImmediateEdges(targets map[string]CPUSetTarget, snapshot *CompleteSnapshot, depthByRel map[string]int) {
+func closeExpandTargetsOverImmediateEdges(targets map[string]CPUSetTarget, snapshot *CompleteSnapshot, depthByRel map[string]int, sortedRelsDesc []string, childRelsByRel map[string][]string) {
 	if snapshot == nil {
 		return
 	}
-	rels := make([]string, 0, len(snapshot.Entries))
-	for rel := range snapshot.Entries {
-		rels = append(rels, rel)
-	}
-	sort.Slice(rels, func(i, j int) bool {
-		return depthByRel[rels[i]] > depthByRel[rels[j]]
-	})
-	for _, parent := range rels {
+	for _, parent := range sortedRelsDesc {
 		parentTarget, ok := targets[parent]
 		if !ok {
 			continue
 		}
-		for _, child := range snapshot.Children[parent] {
-			childRel := filepath.Join(parent, child.Name)
+		for _, childRel := range childRelsByRel[parent] {
 			childTarget, exists := targets[childRel]
 			if !exists {
 				continue
@@ -1542,6 +1552,7 @@ func buildPlanOperations(
 	dag *TopoDAG,
 	operationCount int,
 	stats *plannerBuildStats,
+	childRelsByRel map[string][]string,
 ) []PlanOperation {
 	type operationSortKey struct {
 		rel       string
@@ -1627,8 +1638,7 @@ func buildPlanOperations(
 		}
 		childRefs := snapshot.Children[key.rel]
 		childUnion := machine.NewCPUSet()
-		for _, child := range childRefs {
-			childRel := filepath.Join(key.rel, child.Name)
+		for _, childRel := range childRelsByRel[key.rel] {
 			if entry, ok := snapshot.Entries[childRel]; ok {
 				childUnion = childUnion.Union(entry.CPUs)
 			}
@@ -1735,18 +1745,9 @@ func propagatePhaseTargetEnvelope(
 	targets map[string]CPUSetTarget,
 	parentByRel map[string]string,
 	depthByRel map[string]int,
+	sortedRelsDesc []string,
 ) error {
-	rels := make([]string, 0, len(targets))
-	for rel := range targets {
-		rels = append(rels, rel)
-	}
-	sort.Slice(rels, func(i, j int) bool {
-		if depthByRel[rels[i]] != depthByRel[rels[j]] {
-			return depthByRel[rels[i]] > depthByRel[rels[j]]
-		}
-		return rels[i] < rels[j]
-	})
-	for _, rel := range rels {
+	for _, rel := range sortedRelsDesc {
 		parentRel := parentByRel[rel]
 		if parentRel == "" {
 			continue
@@ -1805,29 +1806,53 @@ func propagateControlledPhaseTargetEnvelope(targets map[string]CPUSetTarget, dag
 		return nil
 	}
 	nodes := dag.Nodes()
-	sort.Slice(nodes, func(i, j int) bool {
-		if topoNodeDepth(nodes[i]) != topoNodeDepth(nodes[j]) {
-			return topoNodeDepth(nodes[i]) > topoNodeDepth(nodes[j])
+	// Compute all depths in a single top-down DFS (O(N)) instead of walking
+	// the parent chain per node (O(N²) on deep chains).
+	depthOf := make(map[*TopoNode]int, len(nodes))
+	maxDepth := 0
+	var assignDepth func(node *TopoNode, d int)
+	assignDepth = func(node *TopoNode, d int) {
+		depthOf[node] = d
+		if d > maxDepth {
+			maxDepth = d
 		}
-		return nodes[i].Rel < nodes[j].Rel
-	})
+		for _, child := range node.children {
+			assignDepth(child, d+1)
+		}
+	}
+	for _, root := range dag.topLevel {
+		assignDepth(root, 0)
+	}
+	// Bucket nodes by depth; iterate deepest-first. Within each depth bucket,
+	// sort by Rel to preserve deterministic tie-breaking.
+	buckets := make([][]*TopoNode, maxDepth+1)
 	for _, node := range nodes {
-		if node == nil || node.parent == nil {
-			continue
+		d := depthOf[node]
+		buckets[d] = append(buckets[d], node)
+	}
+	for d := maxDepth; d >= 0; d-- {
+		bucket := buckets[d]
+		if len(bucket) > 1 {
+			sort.Slice(bucket, func(i, j int) bool { return bucket[i].Rel < bucket[j].Rel })
 		}
-		parent, ok := targets[node.parent.Rel]
-		if !ok {
-			continue
+		for _, node := range bucket {
+			if node == nil || node.parent == nil {
+				continue
+			}
+			parent, ok := targets[node.parent.Rel]
+			if !ok {
+				continue
+			}
+			child := targets[node.Rel]
+			parent.CPUs = parent.CPUs.Union(child.CPUs)
+			mems, err := unionPhaseMemsEnvelope(parent.Mems, child.Mems)
+			if err != nil {
+				return fmt.Errorf("propagate controlled phase mems envelope from %q toward %q: %w",
+					node.Rel, node.parent.Rel, err)
+			}
+			parent.Mems = mems
+			targets[node.parent.Rel] = parent
 		}
-		child := targets[node.Rel]
-		parent.CPUs = parent.CPUs.Union(child.CPUs)
-		mems, err := unionPhaseMemsEnvelope(parent.Mems, child.Mems)
-		if err != nil {
-			return fmt.Errorf("propagate controlled phase mems envelope from %q toward %q: %w",
-				node.Rel, node.parent.Rel, err)
-		}
-		parent.Mems = mems
-		targets[node.parent.Rel] = parent
 	}
 	return nil
 }
@@ -1846,6 +1871,11 @@ func unionPhaseMemsEnvelope(parent, child string) (string, error) {
 	}
 	if parent == "" {
 		return child, nil
+	}
+	// Identical mem strings union to themselves; skip the Parse+Union+String
+	// round-trip (hot path: most controlled nodes share the same mem envelope).
+	if parent == child {
+		return parent, nil
 	}
 	parentSet, err := machine.Parse(parent)
 	if err != nil {
@@ -1930,26 +1960,18 @@ func buildPlannerRelations(
 	snapshot *CompleteSnapshot,
 	dag *TopoDAG,
 	depthByRel map[string]int,
+	sortedRelsAsc []string,
+	childRelsByRel map[string][]string,
 	stats *plannerBuildStats,
 ) (map[string]DomainID, map[string]string) {
 	domainByRel := make(map[string]DomainID, len(snapshot.Entries))
 	parentByRel := make(map[string]string, len(snapshot.Entries))
-	rels := make([]string, 0, len(snapshot.Entries))
-	for rel := range snapshot.Entries {
-		rels = append(rels, rel)
-	}
-	for parent, children := range snapshot.Children {
-		for _, child := range children {
-			parentByRel[filepath.Join(parent, child.Name)] = parent
+	for parent, childRels := range childRelsByRel {
+		for _, childRel := range childRels {
+			parentByRel[childRel] = parent
 		}
 	}
-	sort.Slice(rels, func(i, j int) bool {
-		if depthByRel[rels[i]] != depthByRel[rels[j]] {
-			return depthByRel[rels[i]] < depthByRel[rels[j]]
-		}
-		return rels[i] < rels[j]
-	})
-	for _, rel := range rels {
+	for _, rel := range sortedRelsAsc {
 		domain := snapshot.DomainByRel[rel]
 		if domain == "" {
 			if node := dag.index[rel]; node != nil {
@@ -1971,11 +1993,20 @@ type depthBuildStats struct {
 	EdgesVisited     int
 }
 
-// buildSnapshotDepthByRel computes all snapshot depths once in O(N+E).
-// The returned map is shared by closure and operation ordering.
-func buildSnapshotDepthByRel(snapshot *CompleteSnapshot, stats *depthBuildStats) map[string]int {
+// relDepthOrder pairs a rel with its precomputed depth to avoid map lookups
+// during sort comparisons (O(string-key-hash) per comparison).
+type relDepthOrder struct {
+	relsAsc        []string           // sorted by (depth ASC, rel ASC)
+	relsDesc       []string           // sorted by (depth DESC, rel ASC)
+	childRelsByRel map[string][]string // precomputed child rel paths per parent
+}
+
+// buildSnapshotDepthByRel computes all snapshot depths once in O(N+E) and
+// returns both the depth map and pre-sorted rel orderings so callers do not
+// repeat sort.Slice with string-key map-lookup comparators.
+func buildSnapshotDepthByRel(snapshot *CompleteSnapshot, stats *depthBuildStats) (map[string]int, relDepthOrder) {
 	if snapshot == nil {
-		return nil
+		return nil, relDepthOrder{}
 	}
 	depthByRel := make(map[string]int, len(snapshot.Entries))
 	indegree := make(map[string]int, len(snapshot.Entries))
@@ -2021,7 +2052,32 @@ func buildSnapshotDepthByRel(snapshot *CompleteSnapshot, stats *depthBuildStats)
 			}
 		}
 	}
-	return depthByRel
+	// Build sorted rel orderings once to avoid repeated sort.Slice calls
+	// with string-key map-lookup comparators in downstream consumers.
+	type rd struct {
+		rel   string
+		depth int
+	}
+	all := make([]rd, 0, len(depthByRel))
+	for rel, d := range depthByRel {
+		all = append(all, rd{rel: rel, depth: d})
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].depth != all[j].depth {
+			return all[i].depth < all[j].depth
+		}
+		return all[i].rel < all[j].rel
+	})
+	order := relDepthOrder{
+		relsAsc:        make([]string, len(all)),
+		relsDesc:       make([]string, len(all)),
+		childRelsByRel: childrenByRel,
+	}
+	for i, rd := range all {
+		order.relsAsc[i] = rd.rel
+		order.relsDesc[len(all)-1-i] = rd.rel
+	}
+	return depthByRel, order
 }
 
 func validateTopologyConstraints(in PhasePlanInput) error {
@@ -2086,6 +2142,10 @@ func validateMemsSubset(child, parent string) error {
 	}
 	if parent == "" {
 		return fmt.Errorf("non-empty child mems with empty parent")
+	}
+	// Identical mem strings are trivially a subset; skip the double Parse.
+	if child == parent {
+		return nil
 	}
 	childSet, childErr := machine.Parse(child)
 	parentSet, parentErr := machine.Parse(parent)

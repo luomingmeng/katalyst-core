@@ -251,3 +251,48 @@ func TestTenThousandNodeSnapshotBudgetFailClosed(t *testing.T) {
 		t.Fatalf("budget failure returned partial snapshot: %+v", snapshot)
 	}
 }
+
+// BenchmarkPlanHardReclaimPartition isolates the expand plan build that folds
+// per-child CPUSet unions up through controlled parent envelopes (the historical
+// hard-reclaim partition accumulation loop).
+func BenchmarkPlanHardReclaimPartition(b *testing.B) {
+	dag, snapshot, desired := planTreeFixture(b, "wide", 1000)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		budget := NewBudgetTracker(DefaultConvergenceBudget())
+		_, err := BuildPhasePlan(PhasePlanInput{
+			Kind:         PhaseExpand,
+			DAG:          dag,
+			Snapshot:     snapshot,
+			DesiredByRel: desired,
+			AllowedCPUs:  machine.NewCPUSet(0, 1),
+			Budget:       budget,
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkConvergeNormal exercises the coordinator convergence engine on a
+// two-domain swap topology (proven converging fixture).
+func BenchmarkConvergeNormal(b *testing.B) {
+	details := benchmarkCPUDetails(2, 4)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		dag, cg := benchmarkTwoDomainSwapFixture(b, details)
+		res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
+			DAG:            dag,
+			Cgroup:         cg,
+			CPUDetails:     details,
+			ReservedCPUSet: machine.NewCPUSet(),
+		})
+		if err != nil {
+			b.Fatalf("Converge: %v", err)
+		}
+		if !res.Converged {
+			b.Fatalf("not converged: %+v", res.ConvergenceReport)
+		}
+	}
+}

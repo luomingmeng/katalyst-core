@@ -176,8 +176,8 @@ func analyzeV1Deadlock(in PhasePlanInput) (analysis DeadlockAnalysis, err error)
 	}
 	probeCost := 0
 	protectedByDomain := protectedCPUSetByDomain(in.ProtectedByRel, in.ProtectedPending, in.DAG)
-	depthByRel := buildSnapshotDepthByRel(in.Snapshot, nil)
-	domainByRel, parentByRel := buildPlannerRelations(in.Snapshot, in.DAG, depthByRel, nil)
+	depthByRel, relOrder := buildSnapshotDepthByRel(in.Snapshot, nil)
+	domainByRel, parentByRel := buildPlannerRelations(in.Snapshot, in.DAG, depthByRel, relOrder.relsAsc, relOrder.childRelsByRel, nil)
 	projectionContext, err := buildDrainProjectionContext(ctx, in.Snapshot, in.ProtectedByRel, in.Budget)
 	if err != nil {
 		if errors.Is(err, ErrDeadlockProbeBudgetExceeded) {

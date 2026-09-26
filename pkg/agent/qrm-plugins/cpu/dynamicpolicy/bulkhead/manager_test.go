@@ -2777,3 +2777,26 @@ func TestNewManagerRegistersDefaultPluginsInOrder(t *testing.T) {
 		t.Fatalf("unexpected plugin names, got %v want %v", got, want)
 	}
 }
+
+// BenchmarkManagerApply measures the Manager.Apply main dispatch path
+// (lock, topology reconcile, applied-view publication, dependent plugins).
+func BenchmarkManagerApply(b *testing.B) {
+	topologyPlugin := &fakeDisabledTopologyPlugin{
+		fakePlugin:      &fakePlugin{name: "cpuset_topology", enabled: true},
+		shouldReconcile: true,
+		results: []bulkheadapi.DAGApplyResult{
+			reclaimOnlyResult(machine.NewCPUSet(1, 2)),
+		},
+	}
+	dependent := &fakePlugin{name: "dependent", enabled: true}
+	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, dependent}}
+	in := enabledCPUSetAdjustmentCtx()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := m.Apply(context.Background(), in); err != nil {
+			b.Fatalf("Apply: %v", err)
+		}
+	}
+}

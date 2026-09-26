@@ -521,8 +521,8 @@ func TestSingleAtomIncrementalProjectionMatchesFullReplay(t *testing.T) {
 	input := buildScaledOverlapChurnInput(t, 96, 12)
 	input.Budget = nil
 	desiredByDomain := desiredDomainUnions(input.DAG, input.DesiredByRel)
-	depthByRel := buildSnapshotDepthByRel(input.Snapshot, nil)
-	domainByRel, parentByRel := buildPlannerRelations(input.Snapshot, input.DAG, depthByRel, nil)
+	depthByRel, relOrder := buildSnapshotDepthByRel(input.Snapshot, nil)
+	domainByRel, parentByRel := buildPlannerRelations(input.Snapshot, input.DAG, depthByRel, relOrder.relsAsc, relOrder.childRelsByRel, nil)
 	leavingByDomain := map[DomainID]machine.CPUSet{
 		DomainPrimary: input.Snapshot.DomainUnion[DomainPrimary].Difference(desiredByDomain[DomainPrimary]),
 		DomainReclaim: input.Snapshot.DomainUnion[DomainReclaim].Difference(desiredByDomain[DomainReclaim]),
@@ -586,8 +586,8 @@ func TestSingleAtomIncrementalProjectionFallsBackForMultiCPUAtom(t *testing.T) {
 	input := buildScaledOverlapChurnInput(t, 96, 12)
 	input.Budget = nil
 	desiredByDomain := desiredDomainUnions(input.DAG, input.DesiredByRel)
-	depthByRel := buildSnapshotDepthByRel(input.Snapshot, nil)
-	domainByRel, parentByRel := buildPlannerRelations(input.Snapshot, input.DAG, depthByRel, nil)
+	depthByRel, relOrder := buildSnapshotDepthByRel(input.Snapshot, nil)
+	domainByRel, parentByRel := buildPlannerRelations(input.Snapshot, input.DAG, depthByRel, relOrder.relsAsc, relOrder.childRelsByRel, nil)
 	leavingByDomain := map[DomainID]machine.CPUSet{
 		DomainPrimary: input.Snapshot.DomainUnion[DomainPrimary].Difference(desiredByDomain[DomainPrimary]),
 		DomainReclaim: input.Snapshot.DomainUnion[DomainReclaim].Difference(desiredByDomain[DomainReclaim]),
@@ -635,8 +635,8 @@ func TestSingleAtomIncrementalProjectionFallbackIncludesPartialCost(t *testing.T
 	input := buildScaledOverlapChurnInput(t, 96, 12)
 	input.Budget = nil
 	desiredByDomain := desiredDomainUnions(input.DAG, input.DesiredByRel)
-	depthByRel := buildSnapshotDepthByRel(input.Snapshot, nil)
-	domainByRel, parentByRel := buildPlannerRelations(input.Snapshot, input.DAG, depthByRel, nil)
+	depthByRel, relOrder := buildSnapshotDepthByRel(input.Snapshot, nil)
+	domainByRel, parentByRel := buildPlannerRelations(input.Snapshot, input.DAG, depthByRel, relOrder.relsAsc, relOrder.childRelsByRel, nil)
 	leavingByDomain := map[DomainID]machine.CPUSet{
 		DomainPrimary: input.Snapshot.DomainUnion[DomainPrimary].Difference(desiredByDomain[DomainPrimary]),
 		DomainReclaim: input.Snapshot.DomainUnion[DomainReclaim].Difference(desiredByDomain[DomainReclaim]),
@@ -1185,8 +1185,8 @@ func measureLegacyDeadlockProbeOperations(t *testing.T, in PhasePlanInput) int {
 	domains := sortedDomains(in.Snapshot.DomainUnion, desiredByDomain)
 	graph := buildTransferGraph(domains, in.Snapshot.DomainUnion, desiredByDomain, nil)
 	protectedByDomain := protectedCPUSetByDomain(in.ProtectedByRel, in.ProtectedPending, in.DAG)
-	depthByRel := buildSnapshotDepthByRel(in.Snapshot, nil)
-	domainByRel, parentByRel := buildPlannerRelations(in.Snapshot, in.DAG, depthByRel, nil)
+	depthByRel, relOrder := buildSnapshotDepthByRel(in.Snapshot, nil)
+	domainByRel, parentByRel := buildPlannerRelations(in.Snapshot, in.DAG, depthByRel, relOrder.relsAsc, relOrder.childRelsByRel, nil)
 	leavingByDomain := make(map[DomainID]machine.CPUSet, len(domains))
 	for _, domain := range domains {
 		leavingByDomain[domain] = in.Snapshot.DomainUnion[domain].Difference(desiredByDomain[domain])

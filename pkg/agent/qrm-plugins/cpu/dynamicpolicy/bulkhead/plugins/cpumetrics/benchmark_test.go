@@ -66,3 +66,28 @@ func BenchmarkCPUMetricsPlugin256Pods8NUMA(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkNumABuckets isolates the numaBuckets per-NUMA bucketing that used to
+// fold a fresh CPUSet per CPU via repeated Union.
+func BenchmarkNumABuckets(b *testing.B) {
+	const (
+		cpuCount  = 256
+		numaCount = 8
+	)
+	details := make(machine.CPUDetails, cpuCount)
+	allCPUs := make([]int, 0, cpuCount)
+	for cpu := 0; cpu < cpuCount; cpu++ {
+		details[cpu] = machine.CPUTopoInfo{NUMANodeID: cpu % numaCount, SocketID: cpu % numaCount, CoreID: cpu}
+		allCPUs = append(allCPUs, cpu)
+	}
+	ms := metaServerWith(nil, details)
+	cpus := machine.NewCPUSet(allCPUs...)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if got := numaBuckets(ms, cpus); len(got) != numaCount {
+			b.Fatalf("numa buckets = %d, want %d", len(got), numaCount)
+		}
+	}
+}

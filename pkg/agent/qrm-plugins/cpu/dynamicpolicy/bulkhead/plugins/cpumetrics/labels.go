@@ -92,10 +92,14 @@ func assignPoolLabels(
 		if !ok {
 			continue
 		}
+		// pool.cpus is only read downstream (IsEmpty / ToSliceInt / Intersection),
+		// never mutated, and the projection is an immutable snapshot for this
+		// periodical run, so sharing the underlying CPUSet map avoids a per-pool
+		// deep Clone.
 		result.pools = append(result.pools, labeledPool{
 			identity: identity,
 			label:    label,
-			cpus:     byIdentity[identity].Clone(),
+			cpus:     byIdentity[identity],
 		})
 	}
 	return result
