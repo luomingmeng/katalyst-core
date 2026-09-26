@@ -28,37 +28,37 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
-func TestReclaimConstraintGuardWaitsForPublishedTotalACK(t *testing.T) {
+func TestReclaimConstraintGuardWaitsForPublishedACK(t *testing.T) {
 	t.Parallel()
 
-	const scope = "non-exclusive/0"
+	const scope = provisionassembler.ReclaimConstraintScope("non-exclusive/0")
 	targets := map[string]reclaimConstraintTarget{
-		scope: {Desired: 50, Floor: 24},
+		string(scope): {Desired: 50, Floor: 24},
 	}
 	guard := reclaimConstraintGuard{}
 
-	_, ceilings := guard.constraint(true, 0, true, 10)
-	require.Empty(t, ceilings, "the first hard-partition publication must use the floor")
-	guard.commit(true, ceilings, targets, 24, 10)
+	_, ceilings, _ := guard.constraint(activeScope(scope), observedScope(scope, 0), observedOKScope(scope, true), 10)
+	require.Equal(t, 0, ceilings[scope], "the first hard-partition publication must use the floor")
+	guard.commit(activeScope(scope), ceilings, targets, publishedScope(scope, 24), 10)
 
-	_, ceilings = guard.constraint(true, 0, true, 10)
-	require.Equal(t, map[provisionassembler.ReclaimConstraintScope]int{scope: 24}, ceilings,
+	_, ceilings, _ = guard.constraint(activeScope(scope), observedScope(scope, 0), observedOKScope(scope, true), 10)
+	require.Equal(t, 24, ceilings[scope],
 		"QRM skipped the first publication, so the ceiling must stay at the floor")
 
 	// A failed round does not call commit. Re-reading the constraint must not
 	// mutate or advance guard state.
-	_, ceilings = guard.constraint(true, 0, true, 10)
-	require.Equal(t, map[provisionassembler.ReclaimConstraintScope]int{scope: 24}, ceilings)
+	_, ceilings, _ = guard.constraint(activeScope(scope), observedScope(scope, 0), observedOKScope(scope, true), 10)
+	require.Equal(t, 24, ceilings[scope])
 
-	_, ceilings = guard.constraint(true, 24, true, 10)
-	require.Equal(t, map[provisionassembler.ReclaimConstraintScope]int{scope: 34}, ceilings,
+	_, ceilings, _ = guard.constraint(activeScope(scope), observedScope(scope, 24), observedOKScope(scope, true), 10)
+	require.Equal(t, 34, ceilings[scope],
 		"an observed ACK permits exactly one ramp-up step")
 }
 
 func TestReclaimConstraintGuardClampsLargeAndSmallDesiredAfterACK(t *testing.T) {
 	t.Parallel()
 
-	const scope = "non-exclusive/0"
+	const scope = provisionassembler.ReclaimConstraintScope("non-exclusive/0")
 	tests := []struct {
 		name        string
 		desired     int
@@ -74,12 +74,12 @@ func TestReclaimConstraintGuardClampsLargeAndSmallDesiredAfterACK(t *testing.T) 
 
 			guard := reclaimConstraintGuard{}
 			targets := map[string]reclaimConstraintTarget{
-				scope: {Desired: tc.desired, Floor: 24},
+				string(scope): {Desired: tc.desired, Floor: 24},
 			}
-			_, ceilings := guard.constraint(true, 0, true, 10)
-			guard.commit(true, ceilings, targets, 24, 10)
+			_, ceilings, _ := guard.constraint(activeScope(scope), observedScope(scope, 0), observedOKScope(scope, true), 10)
+			guard.commit(activeScope(scope), ceilings, targets, publishedScope(scope, 24), 10)
 
-			_, ceilings = guard.constraint(true, 24, true, 10)
+			_, ceilings, _ = guard.constraint(activeScope(scope), observedScope(scope, 24), observedOKScope(scope, true), 10)
 			require.Equal(t, tc.wantCeiling, ceilings[scope])
 		})
 	}
@@ -88,95 +88,133 @@ func TestReclaimConstraintGuardClampsLargeAndSmallDesiredAfterACK(t *testing.T) 
 func TestReclaimConstraintGuardHoldsUntilLatestPublicationIsObserved(t *testing.T) {
 	t.Parallel()
 
-	const scope = "non-exclusive/0"
+	const scope = provisionassembler.ReclaimConstraintScope("non-exclusive/0")
 	targets := map[string]reclaimConstraintTarget{
-		scope: {Desired: 50, Floor: 24},
+		string(scope): {Desired: 50, Floor: 24},
 	}
 	guard := reclaimConstraintGuard{}
 
-	_, ceilings := guard.constraint(true, 0, true, 10)
-	guard.commit(true, ceilings, targets, 24, 10)
-	_, ceilings = guard.constraint(true, 24, true, 10)
-	guard.commit(true, ceilings, targets, 34, 10)
+	_, ceilings, _ := guard.constraint(activeScope(scope), observedScope(scope, 0), observedOKScope(scope, true), 10)
+	guard.commit(activeScope(scope), ceilings, targets, publishedScope(scope, 24), 10)
+	_, ceilings, _ = guard.constraint(activeScope(scope), observedScope(scope, 24), observedOKScope(scope, true), 10)
+	guard.commit(activeScope(scope), ceilings, targets, publishedScope(scope, 34), 10)
 
-	_, ceilings = guard.constraint(true, 24, true, 10)
+	_, ceilings, _ = guard.constraint(activeScope(scope), observedScope(scope, 24), observedOKScope(scope, true), 10)
 	require.Equal(t, 34, ceilings[scope], "a stale ACK must not advance past the latest publication")
-	_, ceilings = guard.constraint(true, 34, true, 10)
+	_, ceilings, _ = guard.constraint(activeScope(scope), observedScope(scope, 34), observedOKScope(scope, true), 10)
 	require.Equal(t, 44, ceilings[scope])
 }
 
 func TestReclaimConstraintGuardDisableResetsACKState(t *testing.T) {
 	t.Parallel()
 
-	const scope = "non-exclusive/0"
+	const scope = provisionassembler.ReclaimConstraintScope("non-exclusive/0")
 	targets := map[string]reclaimConstraintTarget{
-		scope: {Desired: 50, Floor: 24},
+		string(scope): {Desired: 50, Floor: 24},
 	}
 	guard := reclaimConstraintGuard{}
 
-	_, ceilings := guard.constraint(true, 0, true, 10)
-	guard.commit(true, ceilings, targets, 24, 10)
-	guard.commit(false, nil, nil, 0, 10)
+	_, ceilings, _ := guard.constraint(activeScope(scope), observedScope(scope, 0), observedOKScope(scope, true), 10)
+	guard.commit(activeScope(scope), ceilings, targets, publishedScope(scope, 24), 10)
+	// Disabling = no active scopes = full reset.
+	guard.commit(nil, nil, nil, nil, 10)
 
-	constraint, ceilings := guard.constraint(false, 24, true, 10)
+	constraint, ceilings, active := guard.constraint(nil, nil, nil, 10)
 	require.Equal(t, provisionassembler.ReclaimConstraintNone, constraint)
 	require.Nil(t, ceilings)
+	require.Nil(t, active)
 
-	_, ceilings = guard.constraint(true, 24, true, 10)
-	require.Empty(t, ceilings, "re-enabling hard partition must bootstrap from the floor again")
+	_, ceilings, _ = guard.constraint(activeScope(scope), observedScope(scope, 24), observedOKScope(scope, true), 10)
+	require.Equal(t, 0, ceilings[scope], "re-enabling hard partition must bootstrap from the floor again")
 }
 
-func TestAdvisorReclaimTotalsUseObservedTopologyAndPublishedPoolEntries(t *testing.T) {
+func TestReclaimConstraintGuardDoesNotTreatMissingZeroPoolAsACK(t *testing.T) {
+	t.Parallel()
+
+	const scope = provisionassembler.ReclaimConstraintScope("non-exclusive/0")
+	targets := map[string]reclaimConstraintTarget{
+		string(scope): {Desired: 10, Floor: 0},
+	}
+	guard := reclaimConstraintGuard{}
+	_, ceilings, _ := guard.constraint(activeScope(scope), observedScope(scope, 0), observedOKScope(scope, false), 10)
+	guard.commit(activeScope(scope), ceilings, targets, publishedScope(scope, 0), 10)
+
+	_, ceilings, _ = guard.constraint(activeScope(scope), observedScope(scope, 0), observedOKScope(scope, false), 10)
+	require.Equal(t, 0, ceilings[scope], "a missing pool is not an ACK even when the last publication was zero")
+
+	_, ceilings, _ = guard.constraint(activeScope(scope), observedScope(scope, 0), observedOKScope(scope, true), 10)
+	require.Equal(t, 10, ceilings[scope], "an observed zero-sized pool acknowledges a zero publication")
+}
+
+func TestAdvisorObservedReclaimByScope(t *testing.T) {
 	t.Parallel()
 
 	metaCache := metacache.NewDummyMetaCacheImp()
 	advisor := &cpuResourceAdvisor{metaCache: metaCache}
-	total, observed := advisor.observedReclaimTotal()
-	require.Zero(t, total)
-	require.False(t, observed, "a missing reclaim pool must not acknowledge a publication")
 
+	scope0 := provisionassembler.NewNonExclusiveReclaimConstraintScope(0)
+	scope1 := provisionassembler.NewNonExclusiveReclaimConstraintScope(1)
+	scopeNumas := map[provisionassembler.ReclaimConstraintScope][]int{
+		scope0: {0},
+		scope1: {1},
+	}
+
+	// Missing pool: no scope is ACK-eligible.
+	observed, observedOK := advisor.observedReclaimByScope(scopeNumas)
+	require.Empty(t, observed)
+	require.Empty(t, observedOK)
+
+	// Nil pool: same as missing.
 	require.NoError(t, metaCache.SetPoolInfo(commonstate.PoolNameReclaim, nil))
-	total, observed = advisor.observedReclaimTotal()
-	require.Zero(t, total)
-	require.False(t, observed, "a nil reclaim pool must not acknowledge a publication")
+	observed, observedOK = advisor.observedReclaimByScope(scopeNumas)
+	require.Empty(t, observed)
+	require.Empty(t, observedOK)
 
+	// Populated pool: per-NUMA sizes aggregate to the correct scope.
 	require.NoError(t, metaCache.SetPoolInfo(commonstate.PoolNameReclaim, &types.PoolInfo{
 		TopologyAwareAssignments: map[int]machine.CPUSet{
 			0: machine.MustParse("0-2"),
 			1: machine.MustParse("8-9"),
 		},
 	}))
-	total, observed = advisor.observedReclaimTotal()
-	require.Equal(t, 5, total)
-	require.True(t, observed)
+	observed, observedOK = advisor.observedReclaimByScope(scopeNumas)
+	require.Equal(t, 3, observed[scope0])
+	require.Equal(t, 2, observed[scope1])
+	require.True(t, observedOK[scope0])
+	require.True(t, observedOK[scope1])
+}
 
+func TestAdvisorPublishedReclaimByScope(t *testing.T) {
+	t.Parallel()
+
+	advisor := &cpuResourceAdvisor{}
+	scope0 := provisionassembler.NewNonExclusiveReclaimConstraintScope(0)
+	scope1 := provisionassembler.NewNonExclusiveReclaimConstraintScope(1)
+	globalScope := provisionassembler.NewNonExclusiveReclaimConstraintScope(commonstate.FakedNUMAID)
+	scopeNumas := map[provisionassembler.ReclaimConstraintScope][]int{
+		scope0:      {0},
+		scope1:      {1},
+		globalScope: {commonstate.FakedNUMAID},
+	}
+
+	// Nil result.
+	require.Empty(t, advisor.publishedReclaimByScope(nil, scopeNumas))
+
+	// Per-NUMA entries aggregate to scopes; FakedNUMAID maps to global scope.
 	result := &types.InternalCPUCalculationResult{
 		PoolEntries: map[string]map[int]types.CPUResource{
 			commonstate.PoolNameReclaim: {
-				0: {Size: 7},
-				1: {Size: 11},
+				0:                       {Size: 7},
+				1:                       {Size: 11},
+				commonstate.FakedNUMAID: {Size: 5},
 			},
 		},
 	}
-	require.Equal(t, 18, publishedReclaimTotal(result))
-	require.Zero(t, publishedReclaimTotal(nil))
-	require.Zero(t, publishedReclaimTotal(&types.InternalCPUCalculationResult{}))
-}
+	published := advisor.publishedReclaimByScope(result, scopeNumas)
+	require.Equal(t, 7, published[scope0])
+	require.Equal(t, 11, published[scope1])
+	require.Equal(t, 5, published[globalScope])
 
-func TestReclaimConstraintGuardDoesNotTreatMissingZeroPoolAsACK(t *testing.T) {
-	t.Parallel()
-
-	const scope = "non-exclusive/0"
-	targets := map[string]reclaimConstraintTarget{
-		scope: {Desired: 10, Floor: 0},
-	}
-	guard := reclaimConstraintGuard{}
-	_, ceilings := guard.constraint(true, 0, false, 10)
-	guard.commit(true, ceilings, targets, 0, 10)
-
-	_, ceilings = guard.constraint(true, 0, false, 10)
-	require.Equal(t, 0, ceilings[scope], "a missing pool is not an ACK even when the last publication was zero")
-
-	_, ceilings = guard.constraint(true, 0, true, 10)
-	require.Equal(t, 10, ceilings[scope], "an observed zero-sized pool acknowledges a zero publication")
+	// Empty result.
+	require.Empty(t, advisor.publishedReclaimByScope(&types.InternalCPUCalculationResult{}, scopeNumas))
 }

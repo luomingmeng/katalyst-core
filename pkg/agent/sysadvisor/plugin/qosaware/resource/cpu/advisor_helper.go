@@ -162,6 +162,7 @@ func (cra *cpuResourceAdvisor) updateNumasAvailableResource(
 	dynamicConf *dynamic.Configuration,
 	hardActive bool,
 	steadyExclusiveNUMAs sets.Int,
+	rampUpDomains sets.Int,
 ) error {
 	numaAvailable := make(map[int]int)
 	reservePoolInfo, _ := cra.metaCache.GetPoolInfo(commonstate.PoolNameReserve)
@@ -207,7 +208,7 @@ func (cra *cpuResourceAdvisor) updateNumasAvailableResource(
 		cra.rampUpReclaimCPUSetCap = make(map[int]int)
 		return err
 	}
-	return cra.updateRampUpReclaimCPUSetCap(dynamicConf, hardActive, steadyExclusiveNUMAs)
+	return cra.updateRampUpReclaimCPUSetCap(dynamicConf, hardActive, steadyExclusiveNUMAs, rampUpDomains)
 }
 
 func (cra *cpuResourceAdvisor) updateReservedForReclaim(dynamicConf *dynamic.Configuration) error {
@@ -232,11 +233,32 @@ func (cra *cpuResourceAdvisor) updateRampUpReclaimCPUSetCap(
 	dynamicConf *dynamic.Configuration,
 	hardActive bool,
 	steadyExclusiveNUMAs sets.Int,
+	rampUpDomains sets.Int,
 ) error {
 	targets := make(map[int]int)
 	if dynamicConf == nil || !dynamicConf.EnableReclaim ||
 		!dynamicConf.EnableRampUpReclaimHardPartition || !hardActive {
 		cra.rampUpReclaimCPUSetCap = targets
+		return nil
+	}
+
+	// Scope the per-NUMA hard-partition reclaim floor to the real NUMAs that
+	// actually host an active ramp-up source. The global domain (FakedNUMAID/-1)
+	// represents a non-NUMA-binding shared ramp-up and must NOT raise a per-NUMA
+	// floor: doing so leaks the ramp-up reservation onto unrelated (dedicated)
+	// NUMAs. Domains that could not be resolved are already dropped upstream in
+	// snapshotRegionAssignments, so an empty real-NUMA set here means "no safe
+	// domain" and we fail closed with an empty cap map rather than widening.
+	activeRealNUMAs := sets.NewInt()
+	for numaID := range rampUpDomains {
+		if numaID == commonstate.FakedNUMAID {
+			continue
+		}
+		activeRealNUMAs.Insert(numaID)
+	}
+	if activeRealNUMAs.Len() == 0 {
+		cra.rampUpReclaimCPUSetCap = targets
+		general.Infof("rampUpReclaimCPUSetCap: no real-NUMA ramp-up domain, keeping per-NUMA cap empty")
 		return nil
 	}
 
@@ -252,9 +274,16 @@ func (cra *cpuResourceAdvisor) updateRampUpReclaimCPUSetCap(
 		cra.rampUpReclaimCPUSetCap = make(map[int]int)
 		return fmt.Errorf("resolve active ramp-up reclaim targets: %w", err)
 	}
+	// Keep only the NUMAs that host an active ramp-up source; every other NUMA
+	// keeps its steady reserve and must not inherit a foreign ramp-up target.
+	for numaID := range targets {
+		if !activeRealNUMAs.Has(numaID) {
+			delete(targets, numaID)
+		}
+	}
 	// A steady exclusive DNB has already finalized its NUMA partition. Keep
 	// that NUMA at the steady reserve even while another NUMA activates the
-	// node-level ramp-up hard target.
+	// ramp-up hard target.
 	for numaID := range steadyExclusiveNUMAs {
 		delete(targets, numaID)
 	}
@@ -301,6 +330,15 @@ func (cra *cpuResourceAdvisor) getRegionMaxRequirement(
 				res += float64(cra.numaAvailable[numaID] - cra.getEffectiveReservedForReclaim(numaID))
 			}
 		} else {
+			// ResourceUpperBound is the ceiling of CPUs this region may ever burst
+			// to, not its steady demand estimate. It deliberately sums CPULimit: the
+			// region is allowed to spike to its container limit, and reserving the
+			// limit keeps reclaim from stealing CPUs the region may need. This is a
+			// different quantity from PolicyCanonical.estimateCPUUsage, which -- per
+			// the reclaim-disabled non-exclusive dedicated contract -- estimates
+			// demand from CPURequest. The two views must not be conflated: the
+			// estimate drives the NonReclaimedCPURequirement knob, while this upper
+			// bound only caps how far the provision policy may grow the region.
 			cra.metaCache.RangeContainer(func(podUID string, containerName string, ci *types.ContainerInfo) bool {
 				if _, ok := r.GetPods()[podUID]; ok {
 					res += ci.CPULimit

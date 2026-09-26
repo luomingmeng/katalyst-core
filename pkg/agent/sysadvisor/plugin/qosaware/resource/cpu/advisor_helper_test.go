@@ -75,7 +75,7 @@ func TestCPUResourceAdvisorUpdateNUMAsAvailableUsesRealNUMAIDs(t *testing.T) {
 	}
 
 	require.NoError(t, cra.updateNumasAvailableResource(
-		conf.GetDynamicConfiguration(), false, nil))
+		conf.GetDynamicConfiguration(), false, nil, sets.NewInt()))
 	require.Equal(t, map[int]int{2: 3, 7: 2}, cra.numaAvailable)
 }
 
@@ -310,7 +310,7 @@ func TestCPUResourceAdvisorUpdateRampUpReclaimRejectsConfiguredFloorAboveCapacit
 	require.NoError(t, advisor.metaCache.AddContainer("pod", "main", &types.ContainerInfo{RampUp: true}))
 
 	require.NoError(t, advisor.updateReservedForReclaim(advisor.conf.GetDynamicConfiguration()))
-	err = advisor.updateRampUpReclaimCPUSetCap(advisor.conf.GetDynamicConfiguration(), true, nil)
+	err = advisor.updateRampUpReclaimCPUSetCap(advisor.conf.GetDynamicConfiguration(), true, nil, sets.NewInt(0, 1))
 
 	require.ErrorContains(t, err, "configured hard reclaim floor 17 exceeds total core-aligned NUMA capacity 16")
 }
@@ -362,7 +362,7 @@ func TestCPUResourceAdvisorUpdateRampUpReclaimUsesImmutableNUMACapacity(t *testi
 
 	require.NoError(t, cra.updateReservedForReclaim(cra.conf.GetDynamicConfiguration()))
 	assert.Equal(t, map[int]int{0: 2, 1: 2}, cra.reservedForReclaim)
-	require.NoError(t, cra.updateRampUpReclaimCPUSetCap(cra.conf.GetDynamicConfiguration(), true, nil))
+	require.NoError(t, cra.updateRampUpReclaimCPUSetCap(cra.conf.GetDynamicConfiguration(), true, nil, sets.NewInt(0, 1)))
 	// capacities: NUMA0 24 CPUs (12 cores), NUMA1 32 CPUs (16 cores),
 	// cpusPerCore==2, ratio 0.2. donated cores = floor(cores*0.2) complete
 	// cores: NUMA0 floor(2.4)=2 cores=4 CPUs, NUMA1 floor(3.2)=3 cores=6
@@ -512,47 +512,50 @@ func TestUpdateRampUpReclaimCPUSetCap(t *testing.T) {
 	tests := []struct {
 		name        string
 		enable      bool
-		rampUp      bool
-		assignments map[int]machine.CPUSet
+		rampDomains sets.Int
 		skipNUMAs   sets.Int
 		wantCap     map[int]int
 	}{
 		{
-			name:        "disabled",
+			name:        "disabled feature produces no cap even with active real-NUMA domain",
 			enable:      false,
-			rampUp:      true,
-			assignments: map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1)},
+			rampDomains: sets.NewInt(0),
 			wantCap:     map[int]int{},
 		},
 		{
-			name:        "enabled without ramp-up container",
+			name:        "enabled without any ramp-up domain produces no cap",
 			enable:      true,
-			rampUp:      false,
-			assignments: map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1)},
+			rampDomains: sets.NewInt(),
 			wantCap:     map[int]int{},
 		},
 		{
-			name:        "enabled with ramp-up container on NUMA 0 activates every NUMA",
+			name:        "global domain (-1) activates no real NUMA: cross-domain protection",
 			enable:      true,
-			rampUp:      true,
-			assignments: map[int]machine.CPUSet{0: machine.NewCPUSet(0, 1)},
+			rampDomains: sets.NewInt(commonstate.FakedNUMAID),
+			wantCap:     map[int]int{},
+		},
+		{
+			name:        "ramp-up on NUMA 0 activates only NUMA 0, not NUMA 1",
+			enable:      true,
+			rampDomains: sets.NewInt(0),
+			wantCap:     map[int]int{0: expectedTarget},
+		},
+		{
+			name:        "ramp-up on NUMA 1 activates only NUMA 1, not NUMA 0",
+			enable:      true,
+			rampDomains: sets.NewInt(1),
+			wantCap:     map[int]int{1: expectedTarget},
+		},
+		{
+			name:        "ramp-up on both NUMAs activates both independently",
+			enable:      true,
+			rampDomains: sets.NewInt(0, 1),
 			wantCap:     map[int]int{0: expectedTarget, 1: expectedTarget},
-		},
-		{
-			name:   "enabled with ramp-up container on NUMA 0 and 1 activates every NUMA",
-			enable: true,
-			rampUp: true,
-			assignments: map[int]machine.CPUSet{
-				0: machine.NewCPUSet(0, 1),
-				1: machine.NewCPUSet(48, 49),
-			},
-			wantCap: map[int]int{0: expectedTarget, 1: expectedTarget},
 		},
 		{
 			name:        "steady exclusive NUMA keeps steady reserve while another NUMA ramps up",
 			enable:      true,
-			rampUp:      true,
-			assignments: map[int]machine.CPUSet{1: machine.NewCPUSet(48, 49)},
+			rampDomains: sets.NewInt(0, 1),
 			skipNUMAs:   sets.NewInt(0),
 			wantCap:     map[int]int{1: expectedTarget},
 		},
@@ -569,15 +572,9 @@ func TestUpdateRampUpReclaimCPUSetCap(t *testing.T) {
 			dynamicConf.EnableRampUpReclaimHardPartition = tt.enable
 			dynamicConf.InitialRampUpReclaimCPUSetRatio = 0.25
 
-			metaCache := metacache.NewDummyMetaCacheImp()
-			require.NoError(t, metaCache.AddContainer("pod-0", "container-0", &types.ContainerInfo{
-				RampUp:                   tt.rampUp,
-				TopologyAwareAssignments: tt.assignments,
-			}))
-
 			cra := &cpuResourceAdvisor{
 				conf:      conf,
-				metaCache: metaCache,
+				metaCache: metacache.NewDummyMetaCacheImp(),
 				metaServer: &metaserver.MetaServer{
 					MetaAgent: &agent.MetaAgent{
 						KatalystMachineInfo: &machine.KatalystMachineInfo{
@@ -589,7 +586,7 @@ func TestUpdateRampUpReclaimCPUSetCap(t *testing.T) {
 
 			require.NoError(t, cra.updateReservedForReclaim(cra.conf.GetDynamicConfiguration()))
 			require.NoError(t, cra.updateRampUpReclaimCPUSetCap(
-				cra.conf.GetDynamicConfiguration(), tt.rampUp, tt.skipNUMAs))
+				cra.conf.GetDynamicConfiguration(), tt.enable, tt.skipNUMAs, tt.rampDomains))
 
 			assert.Equal(t, tt.wantCap, cra.rampUpReclaimCPUSetCap)
 		})

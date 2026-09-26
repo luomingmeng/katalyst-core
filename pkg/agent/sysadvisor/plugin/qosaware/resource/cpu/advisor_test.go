@@ -261,15 +261,18 @@ func TestSnapshotRegionAssignmentsCapturesRampUpAtCycleStart(t *testing.T) {
 	advisor := &cpuResourceAdvisor{metaCache: metaCache}
 
 	snapshot := advisor.snapshotRegionAssignments()
-	activeField := reflect.ValueOf(snapshot).FieldByName("activeRampUp")
-	require.True(t, activeField.IsValid(), "cycle-start snapshot must carry the RampUp decision")
-	require.True(t, activeField.Bool())
+	// A non-NUMA-binding ramp-up container resolves to the global domain (-1).
+	require.NotNil(t, snapshot.rampUpDomains, "cycle-start snapshot must carry the RampUp domain decision")
+	require.True(t, snapshot.rampUpDomains.Has(commonstate.FakedNUMAID),
+		"non-binding ramp-up must resolve to the global domain")
+	require.Equal(t, 1, snapshot.rampUpDomains.Len(), "non-binding ramp-up must not leak onto real NUMAs")
 
 	container, ok := metaCache.GetContainerInfo("pod", "main")
 	require.True(t, ok)
 	container.RampUp = false
 	require.NoError(t, metaCache.SetContainerInfo("pod", "main", container))
-	require.True(t, activeField.Bool(), "cycle-start RampUp decision must be immutable")
+	require.True(t, snapshot.rampUpDomains.Has(commonstate.FakedNUMAID),
+		"cycle-start RampUp domain decision must be immutable")
 }
 
 func TestSnapshotRegionAssignmentsCapturesSteadyExclusiveNUMAs(t *testing.T) {
@@ -303,7 +306,10 @@ func TestSnapshotRegionAssignmentsCapturesSteadyExclusiveNUMAs(t *testing.T) {
 
 	snapshot := advisor.snapshotRegionAssignments()
 
-	require.True(t, snapshot.activeRampUp)
+	// The ramp-up container has no numa-binding annotation, so it resolves to the
+	// global domain and must not claim a real NUMA.
+	require.True(t, snapshot.rampUpDomains.Has(commonstate.FakedNUMAID))
+	require.Equal(t, 1, snapshot.rampUpDomains.Len())
 	require.Equal(t, sets.NewInt(0), snapshot.steadyExclusiveNUMAs)
 }
 
@@ -317,11 +323,14 @@ func TestAssembleProvisionPassesCycleRampUpSnapshot(t *testing.T) {
 	_, err := advisor.assembleProvision(
 		dynamicConf,
 		true,
+		sets.NewInt(commonstate.FakedNUMAID, 7),
 		provisionassembler.ReclaimConstraintNone,
+		nil,
 		nil,
 	)
 	require.NoError(t, err)
 	require.True(t, assembler.ctx.RampUpActive)
+	require.ElementsMatch(t, []int{commonstate.FakedNUMAID, 7}, assembler.ctx.RampUpDomains)
 }
 
 func TestCPUResourceAdvisorUsesActiveHardTargetForRegionEssentials(t *testing.T) {
@@ -2221,4 +2230,150 @@ func TestEmitMetricsLabelsDedicatedPoolType(t *testing.T) {
 	reclaimType, ok := emitter.poolTypeByName(metricCPUAdvisorPoolSize, commonstate.PoolNameReclaim)
 	require.True(t, ok, "reclaim pool size metric should be emitted")
 	require.Equal(t, commonstate.PoolNameReclaim, reclaimType)
+}
+
+// new8NUMAMetaServer builds a MetaServer with 8 real NUMA nodes (0..7) and a
+// populated CPUDetails map, so ramp-up domain derivation validates container
+// placements against a realistic multi-NUMA topology instead of the lightweight
+// no-topology unit-test path.
+func new8NUMAMetaServer() *metaserver.MetaServer {
+	const cpusPerNuma = 8
+	cpuDetails := machine.CPUDetails{}
+	cpuID := 0
+	for numa := 0; numa < 8; numa++ {
+		for i := 0; i < cpusPerNuma; i++ {
+			cpuDetails[cpuID] = machine.CPUTopoInfo{NUMANodeID: numa, CoreID: cpuID}
+			cpuID++
+		}
+	}
+	return &metaserver.MetaServer{
+		MetaAgent: &agent.MetaAgent{
+			KatalystMachineInfo: &machine.KatalystMachineInfo{
+				CPUTopology: &machine.CPUTopology{
+					NumCPUs:      64,
+					NumCores:     64,
+					NumSockets:   1,
+					NumNUMANodes: 8,
+					CPUDetails:   cpuDetails,
+				},
+			},
+		},
+	}
+}
+
+func TestCPUAdvisorRampUpDomainsCrossDomain8NUMAs(t *testing.T) {
+	advisorGlobalRegistryMu.Lock()
+	defer advisorGlobalRegistryMu.Unlock()
+
+	// fixture builds a fresh 8-NUMA advisor + metaCache + a real provision
+	// assembler wired to the given per-NUMA hard-partition cap map. Each subtest
+	// gets its own fixture so ramp-up containers cannot leak across scenarios.
+	newFixture := func(t *testing.T, caps map[int]int) (*cpuResourceAdvisor, metacache.MetaCache) {
+		conf := generateTestConfiguration(t, t.TempDir(), t.TempDir())
+		dynConf := conf.GetDynamicConfiguration()
+		dynConf.EnableReclaim = true
+		dynConf.EnableRampUpReclaimHardPartition = true
+
+		mf := metric.NewFakeMetricsFetcher(metrics.DummyMetrics{})
+		metaCache, err := metacache.NewMetaCacheImp(conf, metricspool.DummyMetricsEmitterPool{}, mf)
+		require.NoError(t, err)
+
+		cra := NewCPUResourceAdvisor(conf, struct{}{}, metaCache, new8NUMAMetaServer(), metrics.DummyMetrics{})
+
+		regionMap := map[string]region.QoSRegion{}
+		reservedForReclaim := map[int]int{0: 2, 1: 2, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2, 7: 2}
+		numaAvailable := map[int]int{0: 8, 1: 8, 2: 8, 3: 8, 4: 8, 5: 8, 6: 8, 7: 8}
+		nonBindingNUMAs := machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)
+		allowSharedOverlap := false
+		disableDedicatedOverlap := true
+		metaReader := metacache.NewDummyMetaCacheImp()
+		require.NoError(t, metaReader.SetResourcePackageConfig(types.ResourcePackageConfig{}))
+		cra.provisionAssembler = provisionassembler.NewProvisionAssemblerCommon(
+			conf, nil, &regionMap, &reservedForReclaim, &caps, &numaAvailable, &nonBindingNUMAs,
+			&allowSharedOverlap, &disableDedicatedOverlap, metaReader, new8NUMAMetaServer(), metrics.DummyMetrics{},
+		)
+		return cra, metaCache
+	}
+
+	addNUMABindingRampUp := func(t *testing.T, metaCache metacache.MetaCache, podUID string, numa int) {
+		require.NoError(t, metaCache.AddContainer(podUID, "main", &types.ContainerInfo{
+			PodUID:                   podUID,
+			ContainerName:            "main",
+			RampUp:                   true,
+			Annotations:              map[string]string{consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable},
+			TopologyAwareAssignments: types.TopologyAwareAssignment{numa: machine.NewCPUSet(0)},
+		}))
+	}
+	addNonBindingRampUp := func(t *testing.T, metaCache metacache.MetaCache, podUID string) {
+		require.NoError(t, metaCache.AddContainer(podUID, "main", &types.ContainerInfo{
+			PodUID:        podUID,
+			ContainerName: "main",
+			RampUp:        true,
+		}))
+	}
+	assemble := func(t *testing.T, cra *cpuResourceAdvisor) types.InternalCPUCalculationResult {
+		snap := cra.snapshotRegionAssignments()
+		result, err := cra.assembleProvision(
+			cra.conf.GetDynamicConfiguration(),
+			snap.rampUpDomains.Len() > 0,
+			snap.rampUpDomains,
+			provisionassembler.ReclaimConstraintNone,
+			nil,
+			nil,
+		)
+		require.NoError(t, err)
+		return result
+	}
+
+	t.Run("A_SourceOnNUMA7FloorsOnlyItsOwnDomain", func(t *testing.T) {
+		cra, metaCache := newFixture(t, map[int]int{7: 8})
+		addNUMABindingRampUp(t, metaCache, "rampup-numa7", 7)
+
+		result := assemble(t, cra)
+
+		require.Equal(t, []int{7}, result.RampUpDomains, "only NUMA7 hosts the ramp-up source")
+		require.True(t, result.RampUpActive)
+		require.True(t, result.RampUpHardPartitionActive)
+
+		reclaim := result.PoolEntries[commonstate.PoolNameReclaim]
+		require.Contains(t, reclaim, 7, "NUMA7 must carry its local hard-partition reclaim target")
+		require.Equal(t, 8, reclaim[7].Size)
+		// Cross-domain closure: a NUMA7 ramp-up must not write a reclaim target onto
+		// NUMA0/2/3, so their dedicated pools keep their steady share.
+		for _, numa := range []int{0, 2, 3} {
+			_, leaked := reclaim[numa]
+			require.False(t, leaked, "NUMA%d must not inherit NUMA7's ramp-up reclaim target", numa)
+		}
+	})
+
+	t.Run("B_GlobalSourceDoesNotWritePerNUMATarget", func(t *testing.T) {
+		// A global (non-binding) ramp-up writes no per-NUMA hard-partition cap, so
+		// the cap map stays empty and no real NUMA gets a per-NUMA reclaim target.
+		cra, metaCache := newFixture(t, map[int]int{})
+		addNonBindingRampUp(t, metaCache, "rampup-global")
+
+		result := assemble(t, cra)
+
+		require.Equal(t, []int{commonstate.FakedNUMAID}, result.RampUpDomains,
+			"a non-binding shared ramp-up resolves to the global domain")
+		require.True(t, result.RampUpActive)
+		require.False(t, result.RampUpHardPartitionActive,
+			"the global domain must not engage the per-NUMA hard-partition cap map")
+		// The live-reclaim floor for the global domain is applied on every real NUMA
+		// in the cpu server output layer (covered by server-side tests); the advisor
+		// itself must not pin a real NUMA's dedicated target via a per-NUMA cap.
+		for numa, entry := range result.PoolEntries[commonstate.PoolNameReclaim] {
+			require.NotEqual(t, 8, entry.Size, "global ramp-up must not write a per-NUMA reclaim target, got NUMA%d=%d", numa, entry.Size)
+		}
+	})
+
+	t.Run("C_NoRampUpIsBitCompatibleWithLegacyBehavior", func(t *testing.T) {
+		cra, _ := newFixture(t, map[int]int{})
+
+		result := assemble(t, cra)
+
+		require.Nil(t, result.RampUpDomains, "no ramp-up source yields an empty domain set")
+		require.False(t, result.RampUpActive)
+		require.False(t, result.RampUpHardPartitionActive)
+	})
 }

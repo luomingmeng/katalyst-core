@@ -211,10 +211,24 @@ type InternalCPUCalculationResult struct {
 	TimeStamp                                  time.Time
 	AllowSharedCoresOverlapReclaimedCores      bool
 	DisableDedicatedCoresOverlapReclaimedCores bool
-	RampUpActive                               bool
-	RampUpHardPartitionActive                  bool
-	ReclaimConstraintExcess                    int
-	ReclaimConstraintTargets                   map[string]ReclaimConstraintTarget
+	// RampUpActive and RampUpHardPartitionActive are node-global lifecycle flags.
+	// They are kept only for node-level lifecycle bookkeeping (e.g. deciding
+	// whether the hard-partition cap map is engaged). They MUST NOT be used to
+	// make per-NUMA quantity decisions: an arbitrary NUMA's ramp-up must not
+	// raise the reclaim reservation (and thus lower the dedicated pool) on
+	// another NUMA. Use RampUpDomains for all per-NUMA gating instead.
+	RampUpActive              bool
+	RampUpHardPartitionActive bool
+	// RampUpDomains is the set of reclaim domains that host an active ramp-up at
+	// cycle start. A domain is FakedNUMAID (-1) for the global domain (a
+	// non-NUMA-binding shared ramp-up) or a real NUMA id for a NUMA-binding
+	// ramp-up pinned to that NUMA (a dedicated ramp-up may legitimately list
+	// several NUMAs). Downstream consumers (e.g. the cpu server reclaim floor)
+	// must gate per-NUMA decisions on membership in this set rather than on the
+	// node-global RampUpActive flag.
+	RampUpDomains            []int
+	ReclaimConstraintExcess  int
+	ReclaimConstraintTargets map[string]ReclaimConstraintTarget
 
 	// DefaultShareBackfill holds in-process only diagnostics for the default
 	// share pool residual backfill; it does not enter the advisor proto.

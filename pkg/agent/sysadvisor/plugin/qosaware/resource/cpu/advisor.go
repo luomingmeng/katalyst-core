@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -244,21 +245,37 @@ func (cra *cpuResourceAdvisor) update() (*types.InternalCPUCalculationResult, er
 	}
 	hardEnabled := dynamicConf.EnableReclaim &&
 		dynamicConf.EnableRampUpReclaimHardPartition &&
-		metadataSnapshot.activeRampUp
+		metadataSnapshot.rampUpDomains.Len() > 0
 	maxRampUpStep := cra.conf.CPUAdvisorConfiguration.MaxRampUpStep
-	observedReclaimTotal, reclaimObserved := cra.observedReclaimTotal()
-	reclaimConstraint, reclaimCeilings := cra.reclaimConstraintGuard.constraint(
-		hardEnabled, observedReclaimTotal, reclaimObserved, maxRampUpStep)
+
+	// Per-scope reclaim constraint: derive the scope->NUMA mapping from the
+	// current region map, then activate only the scopes whose NUMAs host an
+	// active ramp-up domain. Observed reclaim is broken down by NUMA and
+	// aggregated per scope so each scope carries an independent ACK.
+	scopeNumas := cra.scopeNUMAMapping()
+	var (
+		reclaimConstraint   provisionassembler.ReclaimConstraint
+		reclaimCeilings     map[provisionassembler.ReclaimConstraintScope]int
+		reclaimActiveScopes map[provisionassembler.ReclaimConstraintScope]bool
+	)
+	if hardEnabled {
+		activeScopes := cra.activeReclaimScopes(scopeNumas, metadataSnapshot.rampUpDomains)
+		observedByScope, observedOKByScope := cra.observedReclaimByScope(scopeNumas)
+		reclaimConstraint, reclaimCeilings, reclaimActiveScopes = cra.reclaimConstraintGuard.constraint(
+			activeScopes, observedByScope, observedOKByScope, maxRampUpStep)
+	} else {
+		reclaimConstraint = provisionassembler.ReclaimConstraintNone
+	}
 
 	result, err := cra.updateWithIsolationGuardian(
-		dynamicConf, metadataSnapshot.activeRampUp, hardEnabled, metadataSnapshot.steadyExclusiveNUMAs,
-		reclaimConstraint, reclaimCeilings, true)
+		dynamicConf, metadataSnapshot.rampUpDomains.Len() > 0, hardEnabled, metadataSnapshot.steadyExclusiveNUMAs,
+		metadataSnapshot.rampUpDomains, reclaimConstraint, reclaimCeilings, reclaimActiveScopes, true)
 	if err != nil {
 		if err == errIsolationSafetyCheckFailed {
 			klog.Warningf("[qosaware-cpu] failed to updateWithIsolationGuardian(true): %q", err)
 			result, err = cra.updateWithIsolationGuardian(
-				dynamicConf, metadataSnapshot.activeRampUp, hardEnabled, metadataSnapshot.steadyExclusiveNUMAs,
-				reclaimConstraint, reclaimCeilings, false)
+				dynamicConf, metadataSnapshot.rampUpDomains.Len() > 0, hardEnabled, metadataSnapshot.steadyExclusiveNUMAs,
+				metadataSnapshot.rampUpDomains, reclaimConstraint, reclaimCeilings, reclaimActiveScopes, false)
 		}
 		if err != nil {
 			return nil, err
@@ -270,42 +287,172 @@ func (cra *cpuResourceAdvisor) update() (*types.InternalCPUCalculationResult, er
 	cra.updateRegionStatus()
 	cra.emitMetrics(*result)
 	cra.reclaimConstraintGuard.commit(
-		hardEnabled,
+		reclaimActiveScopes,
 		reclaimCeilings,
 		result.ReclaimConstraintTargets,
-		publishedReclaimTotal(result),
+		cra.publishedReclaimByScope(result, scopeNumas),
 		maxRampUpStep,
 	)
 	updateSucceeded = true
 	general.InfoS("committed cpu reclaim constraint",
 		"constraint", reclaimConstraint,
 		"ceilings", reclaimCeilings,
+		"activeScopes", reclaimActiveScopes,
 		"excess", result.ReclaimConstraintExcess,
 		"hardEnabled", hardEnabled)
 	general.InfoS("finished", "duration", time.Since(startTime))
 	return result, nil
 }
 
-func (cra *cpuResourceAdvisor) observedReclaimTotal() (int, bool) {
+// scopeNUMAMapping derives the stable mapping from each ReclaimConstraintScope
+// to the set of NUMA ids it covers. Every real NUMA belongs to exactly one
+// scope:
+//   - a NUMA with an exclusive dedicated region      -> exclusive/{regionName}
+//   - a NUMA with a legacy-exclusive region          -> legacy-exclusive/{regionName}
+//   - a NUMA with a non-exclusive dedicated binding  -> non-exclusive/{numaID}
+//   - every remaining (non-binding) NUMA             -> non-exclusive/-1
+//
+// The mapping is read from the current regionMap; on the first cycle (empty
+// region map) only the global non-exclusive scope exists, which is a safe
+// passthrough baseline. Region names are sorted for deterministic iteration.
+func (cra *cpuResourceAdvisor) scopeNUMAMapping() map[provisionassembler.ReclaimConstraintScope][]int {
+	mapping := make(map[provisionassembler.ReclaimConstraintScope][]int)
+	claimed := sets.NewInt()
+
+	regionNames := make([]string, 0, len(cra.regionMap))
+	for name := range cra.regionMap {
+		regionNames = append(regionNames, name)
+	}
+	sort.Strings(regionNames)
+
+	for _, name := range regionNames {
+		r := cra.regionMap[name]
+		if r.Type() != configapi.QoSRegionTypeDedicated || !r.IsNumaBinding() {
+			continue
+		}
+		var scope provisionassembler.ReclaimConstraintScope
+		if r.IsNumaExclusive() {
+			if cra.disableDedicatedCoresOverlapReclaimedCores {
+				scope = provisionassembler.NewExclusiveReclaimConstraintScope(name)
+			} else {
+				scope = provisionassembler.NewLegacyExclusiveReclaimConstraintScope(name)
+			}
+		} else {
+			// Non-exclusive NUMA-binding dedicated (SNB): each binding NUMA is
+			// its own scope because the reclaim pool on that NUMA is pinned to
+			// the dedicated workload.
+			for _, numaID := range r.GetBindingNumas().ToSliceInt() {
+				if claimed.Has(numaID) {
+					continue
+				}
+				claimed.Insert(numaID)
+				s := provisionassembler.NewNonExclusiveReclaimConstraintScope(numaID)
+				mapping[s] = append(mapping[s], numaID)
+			}
+			continue
+		}
+		for _, numaID := range r.GetBindingNumas().ToSliceInt() {
+			if claimed.Has(numaID) {
+				continue
+			}
+			claimed.Insert(numaID)
+			mapping[scope] = append(mapping[scope], numaID)
+		}
+	}
+
+	// Every NUMA not claimed by a dedicated binding scope belongs to the
+	// global non-binding (faked) scope.
+	globalScope := provisionassembler.NewNonExclusiveReclaimConstraintScope(commonstate.FakedNUMAID)
+	for _, numaID := range cra.metaServer.CPUDetails.NUMANodes().ToSliceInt() {
+		if claimed.Has(numaID) {
+			continue
+		}
+		mapping[globalScope] = append(mapping[globalScope], numaID)
+	}
+	return mapping
+}
+
+// activeReclaimScopes returns the subset of scopes whose NUMA set intersects
+// the active ramp-up domains. The global (faked) scope is activated only by
+// the FakedNUMAID domain; a real-NUMA ramp-up never activates the global
+// scope, and vice versa.
+func (cra *cpuResourceAdvisor) activeReclaimScopes(
+	scopeNumas map[provisionassembler.ReclaimConstraintScope][]int,
+	rampUpDomains sets.Int,
+) map[provisionassembler.ReclaimConstraintScope]bool {
+	active := make(map[provisionassembler.ReclaimConstraintScope]bool)
+	globalScope := provisionassembler.NewNonExclusiveReclaimConstraintScope(commonstate.FakedNUMAID)
+	for scope, numas := range scopeNumas {
+		if scope == globalScope {
+			if rampUpDomains.Has(commonstate.FakedNUMAID) {
+				active[scope] = true
+			}
+			continue
+		}
+		for _, numaID := range numas {
+			if rampUpDomains.Has(numaID) {
+				active[scope] = true
+				break
+			}
+		}
+	}
+	return active
+}
+
+// observedReclaimByScope reads the current reclaim pool assignment from
+// metaCache and aggregates the per-NUMA cpuset size into each scope. A
+// missing or nil pool yields empty maps (no scope is ACK-eligible).
+func (cra *cpuResourceAdvisor) observedReclaimByScope(
+	scopeNumas map[provisionassembler.ReclaimConstraintScope][]int,
+) (map[provisionassembler.ReclaimConstraintScope]int, map[provisionassembler.ReclaimConstraintScope]bool) {
+	observed := make(map[provisionassembler.ReclaimConstraintScope]int)
+	observedOK := make(map[provisionassembler.ReclaimConstraintScope]bool)
 	if cra == nil || cra.metaCache == nil {
-		return 0, false
+		return observed, observedOK
 	}
 	poolInfo, ok := cra.metaCache.GetPoolInfo(commonstate.PoolNameReclaim)
 	if !ok || poolInfo == nil {
-		return 0, false
+		return observed, observedOK
 	}
-	return machine.CountCPUAssignmentCPUs(poolInfo.TopologyAwareAssignments), true
+	for scope, numas := range scopeNumas {
+		total := 0
+		for _, numaID := range numas {
+			if cpuset, ok := poolInfo.TopologyAwareAssignments[numaID]; ok {
+				total += cpuset.Size()
+			}
+		}
+		observed[scope] = total
+		observedOK[scope] = true
+	}
+	return observed, observedOK
 }
 
-func publishedReclaimTotal(result *types.InternalCPUCalculationResult) int {
+// publishedReclaimByScope aggregates the published reclaim PoolEntries (keyed
+// by NUMA id, including FakedNUMAID for the global pool) into each scope. A
+// NUMA not covered by the mapping is skipped with a warning.
+func (cra *cpuResourceAdvisor) publishedReclaimByScope(
+	result *types.InternalCPUCalculationResult,
+	scopeNumas map[provisionassembler.ReclaimConstraintScope][]int,
+) map[provisionassembler.ReclaimConstraintScope]int {
+	published := make(map[provisionassembler.ReclaimConstraintScope]int)
 	if result == nil {
-		return 0
+		return published
 	}
-	total := 0
-	for _, entry := range result.PoolEntries[commonstate.PoolNameReclaim] {
-		total += entry.Size
+	numaToScope := make(map[int]provisionassembler.ReclaimConstraintScope)
+	for scope, numas := range scopeNumas {
+		for _, numaID := range numas {
+			numaToScope[numaID] = scope
+		}
 	}
-	return total
+	for numaID, entry := range result.PoolEntries[commonstate.PoolNameReclaim] {
+		scope, ok := numaToScope[numaID]
+		if !ok {
+			klog.Warningf("[qosaware-cpu] published reclaim on NUMA %d not covered by scope mapping, skipping", numaID)
+			continue
+		}
+		published[scope] += entry.Size
+	}
+	return published
 }
 
 type containerRegionAssignment struct {
@@ -314,9 +461,15 @@ type containerRegionAssignment struct {
 }
 
 type regionAssignmentSnapshot struct {
-	containers           map[string]map[string]containerRegionAssignment
-	pools                map[string]sets.String
-	activeRampUp         bool
+	containers map[string]map[string]containerRegionAssignment
+	pools      map[string]sets.String
+	// rampUpDomains is the set of reclaim domains that host an active ramp-up
+	// container at cycle start. A domain is either FakedNUMAID (-1) for the
+	// global domain (a non-NUMA-binding shared ramp-up), or a real NUMA id for a
+	// NUMA-binding ramp-up pinned to that NUMA. This replaces the former
+	// node-global activeRampUp bool so a ramp-up on one NUMA cannot raise the
+	// reclaim reservation on another NUMA's dedicated pool.
+	rampUpDomains        sets.Int
 	steadyExclusiveNUMAs sets.Int
 }
 
@@ -324,6 +477,7 @@ func (cra *cpuResourceAdvisor) snapshotRegionAssignments() regionAssignmentSnaps
 	snapshot := regionAssignmentSnapshot{
 		containers:           make(map[string]map[string]containerRegionAssignment),
 		pools:                make(map[string]sets.String),
+		rampUpDomains:        sets.NewInt(),
 		steadyExclusiveNUMAs: sets.NewInt(),
 	}
 	cra.metaCache.RangeContainer(func(podUID, containerName string, ci *types.ContainerInfo) bool {
@@ -331,7 +485,16 @@ func (cra *cpuResourceAdvisor) snapshotRegionAssignments() regionAssignmentSnaps
 			snapshot.containers[podUID] = make(map[string]containerRegionAssignment)
 		}
 		if ci.RampUp {
-			snapshot.activeRampUp = true
+			// Derive the ramp-up reclaim domain per container. A container whose
+			// domain cannot be resolved unambiguously is dropped (fail closed)
+			// rather than widening ramp-up to the whole node.
+			domains, err := cra.rampUpReclaimDomainsForContainer(ci)
+			if err != nil {
+				klog.Warningf("[qosaware-cpu] dropping ramp-up reclaim domain for %s/%s: %v",
+					ci.PodUID, ci.ContainerName, err)
+			} else {
+				snapshot.rampUpDomains = snapshot.rampUpDomains.Union(domains)
+			}
 		} else if ci.IsDedicatedNumaExclusive() {
 			// Reclaimability is intentionally irrelevant here. Once an
 			// exclusive DNB is steady, its NUMA keeps the finalized reserve and
@@ -351,6 +514,87 @@ func (cra *cpuResourceAdvisor) snapshotRegionAssignments() regionAssignmentSnaps
 		return true
 	})
 	return snapshot
+}
+
+// rampUpReclaimDomainsForContainer derives the reclaim domains a single ramp-up
+// container may influence. It mirrors QRM's AllocationInfo.RampUpReclaimDomains
+// but operates on the SysAdvisor ContainerInfo view.
+//
+// Ramp-up must be scoped to the domain that actually hosts the ramp-up workload,
+// so a ramp-up on one NUMA cannot raise the reclaim reservation on another NUMA's
+// dedicated pool:
+//   - non-NUMA-binding ramp-up  -> the global domain (FakedNUMAID, -1), which only
+//     backs the global shared/reclaim pool and must not write a per-NUMA floor;
+//   - NUMA-binding ramp-up with materialized placement -> every placement NUMA
+//     (dedicated may legitimately span NUMAs; a shared ramp-up spanning NUMAs is
+//     ambiguous and fails closed);
+//   - NUMA-binding ramp-up without placement -> resolved from the explicit NUMA hint;
+//   - anything missing or out of topology range -> an error (fail closed).
+func (cra *cpuResourceAdvisor) rampUpReclaimDomainsForContainer(ci *types.ContainerInfo) (sets.Int, error) {
+	if ci == nil {
+		return nil, fmt.Errorf("rampUpReclaimDomains got nil containerInfo")
+	}
+
+	// non-binding shared ramp-up always belongs to the global domain.
+	if !ci.IsNumaBinding() {
+		return sets.NewInt(commonstate.FakedNUMAID), nil
+	}
+
+	// topologyNUMAs validates placements/hints against the real NUMA set. It is
+	// left empty when topology is unavailable (e.g. lightweight unit tests), in
+	// which case the structural domain derivation below is still honored.
+	topologyNUMAs := sets.NewInt()
+	if cra.metaServer != nil && cra.metaServer.CPUDetails != nil {
+		topologyNUMAs.Insert(cra.metaServer.CPUDetails.NUMANodes().ToSliceInt()...)
+	}
+
+	placement := make([]int, 0, len(ci.TopologyAwareAssignments))
+	for numaID := range ci.TopologyAwareAssignments {
+		placement = append(placement, numaID)
+	}
+
+	if len(placement) == 0 {
+		// The ramp-up allocation has not been materialized yet; fall back to the
+		// explicit NUMA hint. A committed ramp-up container should already carry
+		// TopologyAwareAssignments, so falling back here is itself a warning-level
+		// inconsistency rather than a silent whole-node propagation.
+		hintNUMA, err := ci.GetActualNUMABindingResult()
+		if err != nil {
+			return nil, fmt.Errorf("missing ramp-up domain: %s/%s has no placement and unreadable NUMA hint: %v",
+				ci.PodUID, ci.ContainerName, err)
+		}
+		if hintNUMA == commonstate.FakedNUMAID || (topologyNUMAs.Len() > 0 && !topologyNUMAs.Has(hintNUMA)) {
+			return nil, fmt.Errorf("out-of-range ramp-up domain: %s/%s NUMA hint %d is not a real NUMA",
+				ci.PodUID, ci.ContainerName, hintNUMA)
+		}
+		return sets.NewInt(hintNUMA), nil
+	}
+
+	if len(placement) > 1 {
+		// A dedicated NUMA-binding allocation may legitimately span NUMAs; every
+		// placement NUMA is its own reclaim domain. A shared NUMA-binding ramp-up
+		// spanning NUMAs is ambiguous (shared cores are pinned to a single NUMA).
+		if !ci.IsDedicatedNumaBinding() {
+			return nil, fmt.Errorf("ambiguous ramp-up domain: shared numa-binding ramp-up %s/%s spans NUMAs %v",
+				ci.PodUID, ci.ContainerName, placement)
+		}
+		domains := sets.NewInt()
+		for _, numaID := range placement {
+			if topologyNUMAs.Len() > 0 && !topologyNUMAs.Has(numaID) {
+				return nil, fmt.Errorf("out-of-range ramp-up domain: %s/%s placed on NUMA %d",
+					ci.PodUID, ci.ContainerName, numaID)
+			}
+			domains.Insert(numaID)
+		}
+		return domains, nil
+	}
+
+	numaID := placement[0]
+	if topologyNUMAs.Len() > 0 && !topologyNUMAs.Has(numaID) {
+		return nil, fmt.Errorf("out-of-range ramp-up domain: %s/%s placed on NUMA %d",
+			ci.PodUID, ci.ContainerName, numaID)
+	}
+	return sets.NewInt(numaID), nil
 }
 
 // restoreRegionAssignments rolls the metadata cache back to the snapshot taken at the start of the cycle.
@@ -391,8 +635,10 @@ func (cra *cpuResourceAdvisor) updateWithIsolationGuardian(dynamicConf *dynamic.
 	rampUpActive bool,
 	hardActive bool,
 	steadyExclusiveNUMAs sets.Int,
+	rampUpDomains sets.Int,
 	reclaimConstraint provisionassembler.ReclaimConstraint,
 	reclaimCeilings map[provisionassembler.ReclaimConstraintScope]int,
+	reclaimActiveScopes map[provisionassembler.ReclaimConstraintScope]bool,
 	tryIsolation bool,
 ) (
 	*types.InternalCPUCalculationResult,
@@ -412,7 +658,7 @@ func (cra *cpuResourceAdvisor) updateWithIsolationGuardian(dynamicConf *dynamic.
 		return nil, fmt.Errorf("reserve pool does not exist")
 	}
 
-	if err := cra.updateNumasAvailableResource(dynamicConf, hardActive, steadyExclusiveNUMAs); err != nil {
+	if err := cra.updateNumasAvailableResource(dynamicConf, hardActive, steadyExclusiveNUMAs, rampUpDomains); err != nil {
 		klog.Errorf("[qosaware-cpu] update NUMA available resource failed: %v", err)
 		return nil, fmt.Errorf("failed to update NUMA available resource: %w", err)
 	}
@@ -460,7 +706,7 @@ func (cra *cpuResourceAdvisor) updateWithIsolationGuardian(dynamicConf *dynamic.
 
 	// assemble provision result from each region
 	calculationResult, err := cra.assembleProvision(
-		dynamicConf, rampUpActive, reclaimConstraint, reclaimCeilings)
+		dynamicConf, rampUpActive, rampUpDomains, reclaimConstraint, reclaimCeilings, reclaimActiveScopes)
 	if err != nil {
 		klog.Errorf("[qosaware-cpu] assemble provision failed: %q", err)
 		return nil, fmt.Errorf("failed to assemble provisioner: %q", err)
@@ -786,10 +1032,18 @@ func (cra *cpuResourceAdvisor) updateAdvisorEssentials(dynamicConf *dynamic.Conf
 // assembleProvision generates internal calculation result.
 // must make sure pool names from cpu provision following qrm definition;
 // numa ID set as -1 means no numa-preference is needed.
+//
+// rampUpDomains is the cycle-start set of active ramp-up reclaim domains
+// (FakedNUMAID -1 = global/non-binding, otherwise a real NUMA id). It is
+// converted to a sorted []int and forwarded into InternalCPUCalculationResult
+// so the cpu server can gate the live-reclaim floor per domain instead of
+// trusting the node-global RampUpActive flag.
 func (cra *cpuResourceAdvisor) assembleProvision(dynamicConf *dynamic.Configuration,
 	rampUpActive bool,
+	rampUpDomains sets.Int,
 	reclaimConstraint provisionassembler.ReclaimConstraint,
 	reclaimCeilings map[provisionassembler.ReclaimConstraintScope]int,
+	reclaimActiveScopes map[provisionassembler.ReclaimConstraintScope]bool,
 ) (types.InternalCPUCalculationResult, error) {
 	if cra.provisionAssembler == nil {
 		return types.InternalCPUCalculationResult{}, fmt.Errorf("no legal provision assembler")
@@ -798,9 +1052,28 @@ func (cra *cpuResourceAdvisor) assembleProvision(dynamicConf *dynamic.Configurat
 	return cra.provisionAssembler.AssembleProvision(provisionassembler.ProvisionContext{
 		DynamicConfiguration: dynamicConf,
 		RampUpActive:         rampUpActive,
+		RampUpDomains:        sortedRampUpDomains(rampUpDomains),
 		ReclaimConstraint:    reclaimConstraint,
 		ReclaimCeilings:      reclaimCeilings,
+		ReclaimActiveScopes:  reclaimActiveScopes,
 	})
+}
+
+// sortedRampUpDomains converts the cycle-start ramp-up domain set into a stable,
+// ordered []int for propagation into InternalCPUCalculationResult. An empty set
+// yields nil, which downstream consumers treat as "no active ramp-up domain".
+// The order is irrelevant for set-membership gating but keeps the wire result
+// deterministic for tests and metrics.
+func sortedRampUpDomains(domains sets.Int) []int {
+	if domains.Len() == 0 {
+		return nil
+	}
+	out := make([]int, 0, domains.Len())
+	for domain := range domains {
+		out = append(out, domain)
+	}
+	sort.Ints(out)
+	return out
 }
 
 func (cra *cpuResourceAdvisor) emitMetrics(calculationResult types.InternalCPUCalculationResult) {
