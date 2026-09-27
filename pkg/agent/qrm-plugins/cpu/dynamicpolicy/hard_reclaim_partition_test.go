@@ -1120,7 +1120,7 @@ func TestHardReclaimReplacementOptimizesTouchedGroupUnionAcrossNUMAs(t *testing.
 	require.Equal(t, 2, assignments["group-b"].Size())
 }
 
-func TestSelectHardReclaimCoresRejectsTruncatedFeasibleFrontier(t *testing.T) {
+func TestSelectHardReclaimCoresAcceptsFeasibleFromTruncatedFrontier(t *testing.T) {
 	t.Parallel()
 
 	candidates := make([]coreAlignedCandidate, 0, hardReclaimCoreSelectionFrontierWidth+1)
@@ -1134,13 +1134,16 @@ func TestSelectHardReclaimCoresRejectsTruncatedFeasibleFrontier(t *testing.T) {
 		groupDonationLimit[groupKey] = 1
 	}
 
+	// With target=1 and 65 single-CPU candidates, the beam truncates at width=64
+	// but retains feasible terminal states (any single CPU hits the target).
+	// The planner must accept the best retained feasible solution rather than
+	// returning search_budget.
 	selected, err := selectHardReclaimCoresWithFrontier(
 		candidates, 1, machine.NewCPUSet(), groupCPUs, groupDonationLimit)
 
-	require.True(t, selected.IsEmpty())
-	var selectionErr *hardReclaimSelectionError
-	require.ErrorAs(t, err, &selectionErr)
-	require.Equal(t, hardReclaimFailureSearchBudget, selectionErr.reason)
+	require.NoError(t, err)
+	require.False(t, selected.IsEmpty())
+	require.Equal(t, 1, selected.Size())
 }
 
 func TestHardReclaimReplacementPropagatesResidualSolverBudget(t *testing.T) {

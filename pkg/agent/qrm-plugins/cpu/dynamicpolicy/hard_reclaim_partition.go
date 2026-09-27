@@ -420,9 +420,27 @@ func selectHardReclaimCoresByNUMAWithFrontier(
 		states, truncated = pruneHardReclaimCoreSelectionStates(nextByKey)
 		frontierTruncated = frontierTruncated || truncated
 	}
+	// Always scan for a feasible terminal, regardless of whether the frontier
+	// was truncated. Truncation only means we cannot prove global optimality;
+	// the retained states may still contain a valid solution that satisfies all
+	// hard constraints (NUMA targets, donation limits, whole-core alignment).
+	best := findBestFeasibleHardReclaimTerminal(states, targets)
+	if best != nil {
+		if frontierTruncated {
+			general.InfoS("hard reclaim accepted best-feasible from truncated frontier",
+				"candidateCount", len(candidates),
+				"stateCount", len(states),
+				"frontierWidth", hardReclaimCoreSelectionFrontierWidth,
+				"quality", "best_feasible",
+				"retained", best.retained,
+				"donated", best.donated)
+		}
+		return best.selected, nil
+	}
+
 	if frontierTruncated {
 		cause := fmt.Errorf(
-			"search frontier truncated at width %d before proving an optimal reclaim selection",
+			"search frontier truncated at width %d and no feasible terminal retained",
 			hardReclaimCoreSelectionFrontierWidth)
 		return machine.NewCPUSet(), &hardReclaimSelectionError{
 			reason: hardReclaimFailureSearchBudget,
@@ -430,17 +448,7 @@ func selectHardReclaimCoresByNUMAWithFrontier(
 		}
 	}
 
-	var best *hardReclaimCoreSelectionState
-	for i := range states {
-		if !intSlicesEqual(states[i].selectedByNUMA, targets) {
-			continue
-		}
-		if best == nil || hardReclaimCoreSelectionStateLess(states[i], *best) {
-			candidate := states[i]
-			best = &candidate
-		}
-	}
-	if best == nil {
+	{
 		var bestPartial *hardReclaimCoreSelectionState
 		for _, state := range states {
 			if bestPartial == nil || state.selected.Size() > bestPartial.selected.Size() ||
@@ -478,7 +486,26 @@ func selectHardReclaimCoresByNUMAWithFrontier(
 			cause:  cause,
 		}
 	}
-	return best.selected, nil
+}
+
+// findBestFeasibleHardReclaimTerminal scans all states for one where every NUMA
+// exactly hits its target. It returns the highest-scoring such state (by
+// retained-donated-lexicographic order) or nil if no terminal exists.
+func findBestFeasibleHardReclaimTerminal(
+	states []hardReclaimCoreSelectionState,
+	targets []int,
+) *hardReclaimCoreSelectionState {
+	var best *hardReclaimCoreSelectionState
+	for i := range states {
+		if !intSlicesEqual(states[i].selectedByNUMA, targets) {
+			continue
+		}
+		if best == nil || hardReclaimCoreSelectionStateLess(states[i], *best) {
+			cp := states[i]
+			best = &cp
+		}
+	}
+	return best
 }
 
 func intSlicesEqual(left, right []int) bool {
