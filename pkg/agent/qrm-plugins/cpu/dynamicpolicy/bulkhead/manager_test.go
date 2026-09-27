@@ -55,8 +55,6 @@ type fakePlugin struct {
 	periodicErr            error
 	disabledErr            error
 	disabledErrs           []error
-	topologyResult         *bulkheadapi.TopologyResult
-	afterReport            func()
 	adjustStarted          chan struct{}
 	adjustRelease          chan struct{}
 	periodicWaitForContext bool
@@ -113,12 +111,6 @@ func (p *fakePlugin) CPUSetAdjustmentHandler(ctx context.Context, in bulkheadapi
 	p.adjustOwnedViews = append(p.adjustOwnedViews, in.View)
 	p.adjustApplied = append(p.adjustApplied, in.AppliedView)
 	p.adjustRevision = append(p.adjustRevision, in.AppliedViewRevision)
-	if p.topologyResult != nil && in.ReportTopologyResult != nil {
-		if p.afterReport != nil {
-			p.afterReport()
-		}
-		in.ReportTopologyResult(*p.topologyResult)
-	}
 	if p.adjustStarted != nil {
 		close(p.adjustStarted)
 	}
@@ -134,20 +126,24 @@ func (p *fakePlugin) CPUSetAdjustmentHandler(ctx context.Context, in bulkheadapi
 
 type fakeTopologyPlugin struct {
 	*fakePlugin
-	result        bulkheadapi.DAGApplyResult
-	err           error
-	reportLegacy  bool
-	afterApply    func()
-	mutateDesired func(*model.DesiredView)
+	result         fakeDAGResult
+	err            error
+	afterApply     func()
+	mutateDesired  func(*model.DesiredView)
+	sawApplied     []*model.AppliedView
+	sawRevision    []uint64
 }
 
 type fakeDisabledTopologyPlugin struct {
 	*fakePlugin
 	shouldReconcile bool
 	reconcileCalls  int
-	results         []bulkheadapi.DAGApplyResult
+	results         []fakeDAGResult
 	reconcileErrs   []error
 	deadlines       []time.Time
+	resetComplete   bool
+	lastEnabled     bool
+	lastShouldReconcile bool
 }
 
 type lockObservedContext struct {
@@ -166,7 +162,7 @@ func (c *lockObservedContext) Done() <-chan struct{} {
 type fakeFullAndDisabledTopologyPlugin struct {
 	*fakeDisabledTopologyPlugin
 	applyCalls   int
-	applyResults []bulkheadapi.DAGApplyResult
+	applyResults []fakeDAGResult
 	applyErrs    []error
 }
 
@@ -174,19 +170,23 @@ func (p *fakeDisabledTopologyPlugin) ShouldReconcileWhenDisabled(
 	_ context.Context,
 	_ bulkheadapi.HandlerContext,
 ) bool {
+	if p.lastShouldReconcile != p.shouldReconcile {
+		p.resetComplete = false
+	}
+	p.lastShouldReconcile = p.shouldReconcile
 	return p.shouldReconcile
 }
 
 func (p *fakeDisabledTopologyPlugin) ReconcileDisabled(
 	ctx context.Context,
 	_ bulkheadapi.HandlerContext,
-) (bulkheadapi.DAGApplyResult, error) {
+) (bulkheadapi.TopologyOutcome, error) {
 	p.reconcileCalls++
 	if deadline, ok := ctx.Deadline(); ok {
 		p.deadlines = append(p.deadlines, deadline)
 	}
 	index := p.reconcileCalls - 1
-	var result bulkheadapi.DAGApplyResult
+	var result fakeDAGResult
 	if index < len(p.results) {
 		result = p.results[index]
 	}
@@ -194,16 +194,33 @@ func (p *fakeDisabledTopologyPlugin) ReconcileDisabled(
 	if index < len(p.reconcileErrs) {
 		err = p.reconcileErrs[index]
 	}
-	return result, err
+	return result.outcome(true), err
 }
+
+func (p *fakeDisabledTopologyPlugin) Enable(in bulkheadapi.HandlerContext) bool {
+	curr := p.fakePlugin.Enable(in)
+	if p.lastEnabled && !curr {
+		p.resetComplete = false
+	}
+	p.lastEnabled = curr
+	return curr
+}
+
+func (p *fakeDisabledTopologyPlugin) NeedsDisabledReset() bool { return !p.resetComplete }
+
+func (p *fakeDisabledTopologyPlugin) CPUSetAdjustmentDisabledHandler(ctx context.Context, in bulkheadapi.HandlerContext) error {
+	return p.fakePlugin.CPUSetAdjustmentDisabledHandler(ctx, in)
+}
+
+func (p *fakeDisabledTopologyPlugin) MarkDisabledResetComplete() { p.resetComplete = true }
 
 func (p *fakeFullAndDisabledTopologyPlugin) Apply(
 	_ context.Context,
 	_ bulkheadapi.HandlerContext,
-) (bulkheadapi.DAGApplyResult, error) {
+) (bulkheadapi.TopologyOutcome, error) {
 	p.applyCalls++
 	index := p.applyCalls - 1
-	var result bulkheadapi.DAGApplyResult
+	var result fakeDAGResult
 	if index < len(p.applyResults) {
 		result = p.applyResults[index]
 	}
@@ -211,27 +228,57 @@ func (p *fakeFullAndDisabledTopologyPlugin) Apply(
 	if index < len(p.applyErrs) {
 		err = p.applyErrs[index]
 	}
-	return result, err
+	return result.outcome(false), err
 }
 
-func (p *fakeTopologyPlugin) Apply(_ context.Context, in bulkheadapi.HandlerContext) (bulkheadapi.DAGApplyResult, error) {
-	if p.reportLegacy && in.ReportTopologyResult != nil {
-		in.ReportTopologyResult(bulkheadapi.TopologyResult{
-			Converged:            p.result.FullyConverged,
-			FinalSnapshotCurrent: p.result.FinalSnapshotCurrent,
-			AppliedView:          p.result.AppliedView.DeepCopy(),
-		})
-	}
+func (p *fakeTopologyPlugin) Apply(_ context.Context, in bulkheadapi.HandlerContext) (bulkheadapi.TopologyOutcome, error) {
+	p.sawApplied = append(p.sawApplied, in.AppliedView)
+	p.sawRevision = append(p.sawRevision, in.AppliedViewRevision)
 	if p.mutateDesired != nil {
 		p.mutateDesired(in.DesiredView)
 	}
 	if p.afterApply != nil {
 		p.afterApply()
 	}
-	return p.result, p.err
+	return p.result.outcome(false), p.err
 }
 
-func reclaimOnlyResult(cpus machine.CPUSet) bulkheadapi.DAGApplyResult {
+type fakeDAGResult struct {
+	FullyConverged       bool
+	ParentSafe           bool
+	FinalSnapshotCurrent bool
+	AppliedView          *model.AppliedView
+	DeferredLeafCount    int // ignored; recorded for fidelity, classification uses the booleans
+}
+
+func (r fakeDAGResult) outcome(requireReclaimOnly bool) bulkheadapi.TopologyOutcome {
+	if requireReclaimOnly {
+		if !r.FullyConverged || !r.FinalSnapshotCurrent || r.AppliedView == nil ||
+			r.AppliedView.Level != model.AppliedViewLevelReclaimOnly {
+			return bulkheadapi.TopologyOutcome{Level: bulkheadapi.ConvergenceLevelNone}
+		}
+		return bulkheadapi.TopologyOutcome{
+			Level:   bulkheadapi.ConvergenceLevelFull,
+			View:    r.AppliedView,
+			Reclaim: r.AppliedView.ReclaimEffective.Clone(),
+		}
+	}
+	successful := r.FullyConverged || r.ParentSafe
+	if !successful || !r.FinalSnapshotCurrent || r.AppliedView == nil {
+		return bulkheadapi.TopologyOutcome{Level: bulkheadapi.ConvergenceLevelNone}
+	}
+	level := bulkheadapi.ConvergenceLevelFull
+	if r.ParentSafe && !r.FullyConverged {
+		level = bulkheadapi.ConvergenceLevelPartial
+	}
+	return bulkheadapi.TopologyOutcome{
+		Level:   level,
+		View:    r.AppliedView,
+		Reclaim: r.AppliedView.ReclaimEffective.Clone(),
+	}
+}
+
+func reclaimOnlyResult(cpus machine.CPUSet) fakeDAGResult {
 	view := &model.AppliedView{
 		CPUSetPartitionView: model.NewCPUSetPartitionView(),
 		Level:               model.AppliedViewLevelReclaimOnly,
@@ -239,7 +286,7 @@ func reclaimOnlyResult(cpus machine.CPUSet) bulkheadapi.DAGApplyResult {
 		RelProofByRel:       map[string]model.CgroupRelProof{},
 	}
 	view.ReclaimEffective = cpus.Clone()
-	return bulkheadapi.DAGApplyResult{
+	return fakeDAGResult{
 		FullyConverged:       true,
 		FinalSnapshotCurrent: true,
 		AppliedView:          view,
@@ -252,7 +299,7 @@ func TestManagerReconcilesDisabledTopologyEveryRoundAndResetsOnce(t *testing.T) 
 	topologyPlugin := &fakeDisabledTopologyPlugin{
 		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
 		shouldReconcile: true,
-		results: []bulkheadapi.DAGApplyResult{
+		results: []fakeDAGResult{
 			reclaimOnlyResult(machine.NewCPUSet(1, 2)),
 			reclaimOnlyResult(machine.NewCPUSet(2, 3)),
 		},
@@ -294,7 +341,7 @@ func TestManagerRetainsDisabledResetAfterReconcileFailure(t *testing.T) {
 	topologyPlugin := &fakeDisabledTopologyPlugin{
 		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
 		shouldReconcile: true,
-		results: []bulkheadapi.DAGApplyResult{
+		results: []fakeDAGResult{
 			{},
 			reclaimOnlyResult(machine.NewCPUSet(1)),
 		},
@@ -332,7 +379,7 @@ func TestManagerRetriesInitialDisabledResetFailure(t *testing.T) {
 			disabledErrs: []error{resetErr, nil},
 		},
 		shouldReconcile: true,
-		results:         []bulkheadapi.DAGApplyResult{reclaimOnlyResult(machine.NewCPUSet(1))},
+		results:         []fakeDAGResult{reclaimOnlyResult(machine.NewCPUSet(1))},
 	}
 	dependent := &fakePlugin{name: "dependent", enabled: true}
 	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, dependent}}
@@ -427,7 +474,7 @@ func TestManagerRejectsStaleReclaimOnlySnapshotBeforePublishing(t *testing.T) {
 	topologyPlugin := &fakeDisabledTopologyPlugin{
 		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
 		shouldReconcile: true,
-		results:         []bulkheadapi.DAGApplyResult{result},
+		results:         []fakeDAGResult{result},
 	}
 	dependent := &fakePlugin{name: "dependent", enabled: true}
 	old := reclaimOnlyResult(machine.NewCPUSet(3)).AppliedView
@@ -458,7 +505,7 @@ func TestManagerRetriesDisabledResetAfterStaleGenerationFence(t *testing.T) {
 	topologyPlugin := &fakeDisabledTopologyPlugin{
 		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
 		shouldReconcile: true,
-		results:         []bulkheadapi.DAGApplyResult{reclaimOnlyResult(machine.NewCPUSet(1))},
+		results:         []fakeDAGResult{reclaimOnlyResult(machine.NewCPUSet(1))},
 	}
 	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin}}
 	in := enabledCPUSetAdjustmentCtx()
@@ -491,7 +538,7 @@ func TestManagerRejectsStaleGenerationAfterReclaimOnlyConvergence(t *testing.T) 
 	topologyPlugin := &fakeDisabledTopologyPlugin{
 		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
 		shouldReconcile: true,
-		results:         []bulkheadapi.DAGApplyResult{reclaimOnlyResult(machine.NewCPUSet(1))},
+		results:         []fakeDAGResult{reclaimOnlyResult(machine.NewCPUSet(1))},
 	}
 	dependent := &fakePlugin{name: "dependent", enabled: true}
 	old := reclaimOnlyResult(machine.NewCPUSet(3)).AppliedView
@@ -531,7 +578,7 @@ func TestManagerEmptyReclaimOnlyResultDoesNotWriteCommitOverride(t *testing.T) {
 	topologyPlugin := &fakeDisabledTopologyPlugin{
 		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
 		shouldReconcile: true,
-		results:         []bulkheadapi.DAGApplyResult{reclaimOnlyResult(machine.NewCPUSet())},
+		results:         []fakeDAGResult{reclaimOnlyResult(machine.NewCPUSet())},
 	}
 	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin}}
 	m.publishLatestAppliedReclaim(machine.NewCPUSet(3))
@@ -586,7 +633,7 @@ func TestManagerHardPartitionAcceptsEmptyReclaimOnlyResultWithoutCommitOverride(
 	topologyPlugin := &fakeDisabledTopologyPlugin{
 		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
 		shouldReconcile: true,
-		results:         []bulkheadapi.DAGApplyResult{reclaimOnlyResult(machine.NewCPUSet())},
+		results:         []fakeDAGResult{reclaimOnlyResult(machine.NewCPUSet())},
 	}
 	manager := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin}}
 	override := &cpusetutil.CPUSetAdjustmentCommitOverride{}
@@ -683,7 +730,7 @@ func TestManagerRejectsInvalidReclaimOnlyResult(t *testing.T) {
 	topologyPlugin := &fakeDisabledTopologyPlugin{
 		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
 		shouldReconcile: true,
-		results:         []bulkheadapi.DAGApplyResult{result},
+		results:         []fakeDAGResult{result},
 	}
 	dependent := &fakePlugin{name: "dependent", enabled: true}
 	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, dependent}}
@@ -704,7 +751,7 @@ func TestManagerDisabledResetAndReconcileShareDeadline(t *testing.T) {
 	topologyPlugin := &fakeDisabledTopologyPlugin{
 		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
 		shouldReconcile: true,
-		results:         []bulkheadapi.DAGApplyResult{reclaimOnlyResult(machine.NewCPUSet(1))},
+		results:         []fakeDAGResult{reclaimOnlyResult(machine.NewCPUSet(1))},
 	}
 	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin}}
 	in := enabledCPUSetAdjustmentCtx()
@@ -730,7 +777,7 @@ func TestManagerDisabledDeadlineStartsAfterLockAcquisition(t *testing.T) {
 	topologyPlugin := &fakeDisabledTopologyPlugin{
 		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
 		shouldReconcile: true,
-		results:         []bulkheadapi.DAGApplyResult{reclaimOnlyResult(machine.NewCPUSet(1))},
+		results:         []fakeDAGResult{reclaimOnlyResult(machine.NewCPUSet(1))},
 	}
 	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin}}
 	in := enabledCPUSetAdjustmentCtx()
@@ -770,7 +817,7 @@ func TestManagerClearsDisabledResetCompletionAfterEnabledRound(t *testing.T) {
 	topologyPlugin := &fakeDisabledTopologyPlugin{
 		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
 		shouldReconcile: true,
-		results: []bulkheadapi.DAGApplyResult{
+		results: []fakeDAGResult{
 			reclaimOnlyResult(machine.NewCPUSet(1)),
 			reclaimOnlyResult(machine.NewCPUSet(1)),
 		},
@@ -800,7 +847,7 @@ func TestManagerLeavingDisabledReconcileRunsAuthoritativeDisabledReset(t *testin
 	topologyPlugin := &fakeDisabledTopologyPlugin{
 		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
 		shouldReconcile: true,
-		results:         []bulkheadapi.DAGApplyResult{reclaimOnlyResult(machine.NewCPUSet(1))},
+		results:         []fakeDAGResult{reclaimOnlyResult(machine.NewCPUSet(1))},
 	}
 	dependent := &fakePlugin{name: "dependent", enabled: true}
 	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, dependent}}
@@ -831,7 +878,7 @@ func TestManagerLeavingDisabledReconcileRetriesFailedReset(t *testing.T) {
 			disabledErrs: []error{nil, resetErr, nil},
 		},
 		shouldReconcile: true,
-		results:         []bulkheadapi.DAGApplyResult{reclaimOnlyResult(machine.NewCPUSet(1))},
+		results:         []fakeDAGResult{reclaimOnlyResult(machine.NewCPUSet(1))},
 	}
 	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin}}
 	in := enabledCPUSetAdjustmentCtx()
@@ -857,7 +904,7 @@ func TestManagerLeavingDisabledReconcileRetriesStaleReset(t *testing.T) {
 	topologyPlugin := &fakeDisabledTopologyPlugin{
 		fakePlugin:      &fakePlugin{name: "cpuset_topology"},
 		shouldReconcile: true,
-		results:         []bulkheadapi.DAGApplyResult{reclaimOnlyResult(machine.NewCPUSet(1))},
+		results:         []fakeDAGResult{reclaimOnlyResult(machine.NewCPUSet(1))},
 	}
 	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin}}
 	in := enabledCPUSetAdjustmentCtx()
@@ -895,7 +942,7 @@ func TestManagerFullTopologyAttemptAfterReclaimOnlyMarksDisabledResetPending(t *
 		fakeDisabledTopologyPlugin: &fakeDisabledTopologyPlugin{
 			fakePlugin:      &fakePlugin{name: "cpuset_topology"},
 			shouldReconcile: true,
-			results:         []bulkheadapi.DAGApplyResult{reclaimOnlyResult(machine.NewCPUSet(1))},
+			results:         []fakeDAGResult{reclaimOnlyResult(machine.NewCPUSet(1))},
 		},
 		applyErrs: []error{applyErr},
 	}
@@ -1005,7 +1052,7 @@ func TestManagerApplyRequiresFullyConvergedTopologyBeforeDependents(t *testing.T
 
 	topologyPlugin := &fakeTopologyPlugin{
 		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
-		result: bulkheadapi.DAGApplyResult{
+		result: fakeDAGResult{
 			FullyConverged:       false,
 			FinalSnapshotCurrent: true,
 		},
@@ -1041,7 +1088,7 @@ func TestManagerApplyAcceptsParentSafeTopologyWithoutRunningDependents(t *testin
 	}
 	topologyPlugin := &fakeTopologyPlugin{
 		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
-		result: bulkheadapi.DAGApplyResult{
+		result: fakeDAGResult{
 			ParentSafe:           true,
 			DeferredLeafCount:    1,
 			FinalSnapshotCurrent: true,
@@ -1128,7 +1175,7 @@ func TestManagerApplyPassesOwnedVerifiedViewToDependentsAndReturnsReclaim(t *tes
 	}}
 	topologyPlugin := &fakeTopologyPlugin{
 		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
-		result: bulkheadapi.DAGApplyResult{
+		result: fakeDAGResult{
 			FullyConverged:       true,
 			FinalSnapshotCurrent: true,
 			AppliedView:          applied,
@@ -1216,7 +1263,7 @@ func TestManagerApplyRejectsFullyConvergedAppliedViewWithMissingPerNUMAProof(t *
 	}
 	topologyPlugin := &fakeTopologyPlugin{
 		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
-		result: bulkheadapi.DAGApplyResult{
+		result: fakeDAGResult{
 			FullyConverged:       true,
 			FinalSnapshotCurrent: true,
 			AppliedView:          applied,
@@ -1270,7 +1317,7 @@ func TestManagerPublishedPoolProjectionSurvivesSourceMutation(t *testing.T) {
 
 	topologyPlugin := &fakeTopologyPlugin{
 		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
-		result: bulkheadapi.DAGApplyResult{
+		result: fakeDAGResult{
 			FullyConverged:       true,
 			FinalSnapshotCurrent: true,
 			AppliedView:          source,
@@ -1309,7 +1356,7 @@ func TestManagerApplyPublishesPartitionMetricsAfterAppliedViewCommit(t *testing.
 	applied.SharePoolMap[commonstate.PoolNameShare] = machine.NewCPUSet()
 	topologyPlugin := &fakeTopologyPlugin{
 		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
-		result: bulkheadapi.DAGApplyResult{
+		result: fakeDAGResult{
 			FullyConverged:       true,
 			FinalSnapshotCurrent: true,
 			AppliedView:          applied,
@@ -1349,7 +1396,7 @@ func TestManagerApplyPartitionMetricsUsePostTopologyDesiredView(t *testing.T) {
 	applied.NonReclaimPool = machine.NewCPUSet(3)
 	topologyPlugin := &fakeTopologyPlugin{
 		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
-		result: bulkheadapi.DAGApplyResult{
+		result: fakeDAGResult{
 			FullyConverged:       true,
 			FinalSnapshotCurrent: true,
 			AppliedView:          applied,
@@ -1407,7 +1454,7 @@ func TestManagerApplyDoesNotPublishAppliedPartitionMetricsWhenTopologyDoesNotCon
 	state, topology := testBulkheadStateAndTopology()
 	topologyPlugin := &fakeTopologyPlugin{
 		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
-		result: bulkheadapi.DAGApplyResult{
+		result: fakeDAGResult{
 			FinalSnapshotCurrent: true,
 			AppliedView:          model.NewDesiredView().ToAppliedView(),
 		},
@@ -1456,9 +1503,8 @@ func TestManagerApplyDoesNotPublishTypedTopologyResultBeforeDependentsSucceed(t 
 	t.Parallel()
 
 	topologyPlugin := &fakeTopologyPlugin{
-		fakePlugin:   &fakePlugin{name: "cpuset_topology", enabled: true},
-		reportLegacy: true,
-		result: bulkheadapi.DAGApplyResult{
+		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
+		result: fakeDAGResult{
 			FullyConverged:       true,
 			FinalSnapshotCurrent: true,
 			AppliedView: &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
@@ -1498,7 +1544,7 @@ func TestManagerApplyRejectsStaleGenerationBeforeDependentSideEffects(t *testing
 	}}
 	topologyPlugin := &fakeTopologyPlugin{
 		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
-		result: bulkheadapi.DAGApplyResult{
+		result: fakeDAGResult{
 			FullyConverged:       true,
 			FinalSnapshotCurrent: true,
 			AppliedView:          newApplied,
@@ -1689,7 +1735,7 @@ func TestManagerApplyRejectsTypedTopologyResultWhenDesiredViewChanges(t *testing
 	}}
 	topologyPlugin := &fakeTopologyPlugin{
 		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
-		result: bulkheadapi.DAGApplyResult{
+		result: fakeDAGResult{
 			FullyConverged:       true,
 			FinalSnapshotCurrent: true,
 			AppliedView: &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
@@ -1738,7 +1784,7 @@ func TestManagerApplyRetainsRevisionForConsecutiveIdenticalTypedAppliedViews(t *
 	}}
 	topologyPlugin := &fakeTopologyPlugin{
 		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
-		result: bulkheadapi.DAGApplyResult{
+		result: fakeDAGResult{
 			FullyConverged:       true,
 			FinalSnapshotCurrent: true,
 			AppliedView:          applied,
@@ -2063,11 +2109,14 @@ func TestRunCPUSetAdjustmentHandlersPublishesAppliedViewAfterTopologyConverges_B
 		NonReclaimPool:   machine.NewCPUSet(0, 2, 3),
 		ReclaimEffective: machine.NewCPUSet(1),
 	}}
-	topologyPlugin := &fakePlugin{name: "cpuset_topology", enabled: true, topologyResult: &bulkheadapi.TopologyResult{
-		Converged:            true,
-		FinalSnapshotCurrent: true,
-		AppliedView:          topologyApplied,
-	}}
+	topologyPlugin := &fakeTopologyPlugin{
+		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
+		result: fakeDAGResult{
+			FullyConverged:       true,
+			FinalSnapshotCurrent: true,
+			AppliedView:          topologyApplied,
+		},
+	}
 	consumer := &fakePlugin{name: "workqueue", enabled: true}
 	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, consumer}}
 	state, topology := testBulkheadStateAndTopology()
@@ -2089,8 +2138,8 @@ func TestRunCPUSetAdjustmentHandlersPublishesAppliedViewAfterTopologyConverges_B
 	if consumer.adjustRevision[0] != 1 {
 		t.Fatalf("consumer applied revision = %d, want 1", consumer.adjustRevision[0])
 	}
-	if topologyPlugin.adjustApplied[0] != nil {
-		t.Fatalf("topology plugin should see previous applied view before publish")
+	if len(topologyPlugin.sawApplied) != 1 || topologyPlugin.sawApplied[0] != nil {
+		t.Fatalf("topology plugin should see previous (nil) applied view before publish, got %v", topologyPlugin.sawApplied)
 	}
 	assertCPUSet(t, "consumer applied reclaim from final snapshot", consumer.adjustApplied[0].ReclaimEffective, "1")
 
@@ -2107,7 +2156,7 @@ func TestRunCPUSetAdjustmentHandlersABCLifecyclePreservesBOnPlanningFailure(t *t
 	reclaimC := machine.MustParse("13-18,20-21,35-40,42,62-66,68,83-88,90")
 	topologyPlugin := &fakeTopologyPlugin{
 		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
-		result: bulkheadapi.DAGApplyResult{
+		result: fakeDAGResult{
 			FullyConverged:       true,
 			FinalSnapshotCurrent: true,
 			AppliedView: &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
@@ -2148,7 +2197,7 @@ func TestRunCPUSetAdjustmentHandlersABCLifecyclePreservesBOnPlanningFailure(t *t
 	}
 
 	topologyPlugin.err = nil
-	topologyPlugin.result = bulkheadapi.DAGApplyResult{
+	topologyPlugin.result = fakeDAGResult{
 		FullyConverged:       true,
 		FinalSnapshotCurrent: true,
 		AppliedView: &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
@@ -2176,6 +2225,9 @@ func TestRunCPUSetAdjustmentHandlersShortCircuitsConsumersUntilTopologyConverges
 	topologyPlugin := &fakePlugin{name: "cpuset_topology", enabled: true}
 	consumer := &fakePlugin{name: "workqueue", enabled: true}
 	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, consumer}}
+	// Legacy callback-path owner: it is not a typed TopologyPlugin, so pin the
+	// owner identity the way discovery would for the production plugin.
+	m.topologyOwner, m.topologyDiscovered = topologyPlugin, true
 	state, topology := testBulkheadStateAndTopology()
 
 	if err := m.RunCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
@@ -2200,13 +2252,16 @@ func TestRunCPUSetAdjustmentHandlersRetainsRevisionWhenTopologyResultIsNotCurren
 	oldApplied := &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
 		ReclaimEffective: machine.NewCPUSet(3),
 	}}
-	topologyPlugin := &fakePlugin{name: "cpuset_topology", enabled: true, topologyResult: &bulkheadapi.TopologyResult{
-		Converged:            true,
-		FinalSnapshotCurrent: false,
-		AppliedView: &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
-			ReclaimEffective: machine.NewCPUSet(1),
-		}},
-	}}
+	topologyPlugin := &fakeTopologyPlugin{
+		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
+		result: fakeDAGResult{
+			FullyConverged:       true,
+			FinalSnapshotCurrent: false,
+			AppliedView: &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
+				ReclaimEffective: machine.NewCPUSet(1),
+			}},
+		},
+	}
 	consumer := &fakePlugin{name: "workqueue", enabled: true}
 	m := &Manager{
 		plugins:             []bulkheadapi.Plugin{topologyPlugin, consumer},
@@ -2215,12 +2270,14 @@ func TestRunCPUSetAdjustmentHandlersRetainsRevisionWhenTopologyResultIsNotCurren
 	}
 	state, topology := testBulkheadStateAndTopology()
 
-	if err := m.RunCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
+	err := m.RunCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
 		DynamicConf: dynamicBulkheadConf(true),
 		State:       state,
 		Topology:    topology,
-	}); err != nil {
-		t.Fatalf("run failed: %v", err)
+	})
+	var nonConv *NonConvergedError
+	if !errors.As(err, &nonConv) {
+		t.Fatalf("err=%v, want NonConvergedError for stale final snapshot", err)
 	}
 
 	if got := len(consumer.adjustViews); got != 0 {
@@ -2248,17 +2305,16 @@ func TestRunCPUSetAdjustmentHandlersRetainsRevisionWhenDesiredChangesBeforeTopol
 	oldApplied := &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
 		ReclaimEffective: machine.NewCPUSet(3),
 	}}
-	topologyPlugin := &fakePlugin{
-		name:    "cpuset_topology",
-		enabled: true,
-		topologyResult: &bulkheadapi.TopologyResult{
-			Converged:            true,
+	topologyPlugin := &fakeTopologyPlugin{
+		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
+		result: fakeDAGResult{
+			FullyConverged:       true,
 			FinalSnapshotCurrent: true,
 			AppliedView: &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
 				ReclaimEffective: machine.NewCPUSet(1),
 			}},
 		},
-		afterReport: func() {
+		afterApply: func() {
 			state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &cpustate.AllocationInfo{
 				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
 				AllocationResult: machine.NewCPUSet(2, 3),
@@ -2272,12 +2328,14 @@ func TestRunCPUSetAdjustmentHandlersRetainsRevisionWhenDesiredChangesBeforeTopol
 		appliedViewRevision: 7,
 	}
 
-	if err := m.RunCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
+	err := m.RunCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
 		DynamicConf: dynamicBulkheadConf(true),
 		State:       state,
 		Topology:    topology,
-	}); err != nil {
-		t.Fatalf("run failed: %v", err)
+	})
+	var nonConv *NonConvergedError
+	if !errors.As(err, &nonConv) {
+		t.Fatalf("err=%v, want NonConvergedError when desired intent drifts after apply", err)
 	}
 
 	if got := len(consumer.adjustViews); got != 0 {
@@ -2300,6 +2358,7 @@ func TestRunCPUSetAdjustmentHandlersShortCircuitsConsumersWhenTopologyDisabled_B
 		appliedViewRevision:         1,
 		lastCPUSetAdjustmentEnabled: map[string]bool{topologyPlugin.Name(): true, consumer.Name(): true},
 	}
+	m.topologyOwner, m.topologyDiscovered = topologyPlugin, true
 	state, topology := testBulkheadStateAndTopology()
 
 	if err := m.RunCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
@@ -2332,6 +2391,7 @@ func TestRunCPUSetAdjustmentHandlersRunsDisabledResetAfterTopologyDisabled_BitsU
 			disabledReset.Name():   true,
 		},
 	}
+	m.topologyOwner, m.topologyDiscovered = topologyPlugin, true
 	state, topology := testBulkheadStateAndTopology()
 
 	if err := m.RunCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
@@ -2359,13 +2419,17 @@ func TestRunCPUSetAdjustmentHandlersRunsDisabledResetAfterTopologyDisabled_BitsU
 func TestRunPeriodicalHandlersWithholdsOldAppliedViewWhenTopologyNotPublished_BitsUT(t *testing.T) {
 	t.Parallel()
 
-	topologyPlugin := &fakePlugin{name: "cpuset_topology", enabled: true, topologyResult: &bulkheadapi.TopologyResult{
-		Converged:            true,
-		FinalSnapshotCurrent: true,
-		AppliedView: &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
-			ReclaimEffective: machine.NewCPUSet(1, 2, 3),
-		}},
+	convergedView := &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ReclaimEffective: machine.NewCPUSet(1, 2, 3),
 	}}
+	topologyPlugin := &fakeTopologyPlugin{
+		fakePlugin: &fakePlugin{name: "cpuset_topology", enabled: true},
+		result: fakeDAGResult{
+			FullyConverged:       true,
+			FinalSnapshotCurrent: true,
+			AppliedView:          convergedView,
+		},
+	}
 	systemService := &fakePlugin{name: "system_service", enabled: true}
 	m := &Manager{plugins: []bulkheadapi.Plugin{topologyPlugin, systemService}}
 	state, topology := testBulkheadStateAndTopology()
@@ -2381,13 +2445,13 @@ func TestRunPeriodicalHandlersWithholdsOldAppliedViewWhenTopologyNotPublished_Bi
 		t.Fatalf("initial run should publish internal applied view, view=%v revision=%d", m.appliedView, m.appliedViewRevision)
 	}
 
-	topologyPlugin.topologyResult = nil
+	topologyPlugin.result = fakeDAGResult{}
 	if err := m.RunCPUSetAdjustmentHandlers(context.Background(), cpusetutil.CPUSetAdjustmentHandlerCtx{
 		DynamicConf: dynamicBulkheadConf(true),
 		State:       state,
 		Topology:    topology,
-	}); err != nil {
-		t.Fatalf("non-converged run failed: %v", err)
+	}); err == nil {
+		t.Fatal("non-converged run err=nil, want NonConvergedError")
 	}
 	if m.appliedView == nil || m.appliedViewRevision != 1 {
 		t.Fatalf("non-publish run must retain internal old applied view/revision, view=%v revision=%d", m.appliedView, m.appliedViewRevision)
@@ -2784,7 +2848,7 @@ func BenchmarkManagerApply(b *testing.B) {
 	topologyPlugin := &fakeDisabledTopologyPlugin{
 		fakePlugin:      &fakePlugin{name: "cpuset_topology", enabled: true},
 		shouldReconcile: true,
-		results: []bulkheadapi.DAGApplyResult{
+		results: []fakeDAGResult{
 			reclaimOnlyResult(machine.NewCPUSet(1, 2)),
 		},
 	}

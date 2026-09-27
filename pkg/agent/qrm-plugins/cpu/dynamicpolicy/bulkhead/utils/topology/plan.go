@@ -1638,9 +1638,18 @@ func buildPlanOperations(
 		}
 		childRefs := snapshot.Children[key.rel]
 		childUnion := machine.NewCPUSet()
-		for _, childRel := range childRelsByRel[key.rel] {
-			if entry, ok := snapshot.Entries[childRel]; ok {
-				childUnion = childUnion.Union(entry.CPUs)
+		if childRelsByRel != nil {
+			for _, childRel := range childRelsByRel[key.rel] {
+				if entry, ok := snapshot.Entries[childRel]; ok {
+					childUnion = childUnion.Union(entry.CPUs)
+				}
+			}
+		} else {
+			for _, child := range childRefs {
+				childRel := filepath.Join(key.rel, child.Name)
+				if entry, ok := snapshot.Entries[childRel]; ok {
+					childUnion = childUnion.Union(entry.CPUs)
+				}
 			}
 		}
 		operations = append(operations, PlanOperation{

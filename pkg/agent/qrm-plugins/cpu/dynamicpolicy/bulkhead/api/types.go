@@ -20,7 +20,6 @@ import (
 	"context"
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/model"
-	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/bulkhead/utils/topology"
 	cpusetutil "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/util"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
@@ -38,12 +37,12 @@ type HandlerContext struct {
 	DesiredView          *model.DesiredView
 	AppliedView          *model.AppliedView
 	AppliedViewRevision  uint64
-	ReportTopologyResult func(TopologyResult)
 }
 
-// TopologyResult is the typed handoff from the cpuset topology owner to the
-// manager. AppliedView is publishable only when convergence was verified
-// against the coordinator's still-current final snapshot.
+// TopologyResult is the legacy in-flight handoff published by the topology
+// owner while a converge attempt is still running. It carries no internal
+// convergence diagnostics; the canonical, manager-visible result is
+// TopologyOutcome returned from TopologyPlugin.Apply.
 type TopologyResult struct {
 	Attempted            int
 	Applied              int
@@ -56,26 +55,6 @@ type TopologyResult struct {
 	DeferredLeafCount    int
 	DeferredCPUCount     int
 	FinalSnapshotCurrent bool
-	ConvergenceReport    topology.ConvergenceReport
-	AppliedView          *model.AppliedView
-}
-
-// DAGApplyResult is the Bulkhead-layer result returned by the topology owner.
-// AppliedView is valid only when (FullyConverged or ParentSafe) and
-// FinalSnapshotCurrent are both true. It is derived directly from the
-// coordinator's final snapshot and is the canonical handoff to the manager.
-type DAGApplyResult struct {
-	Attempted            int
-	Applied              int
-	Skipped              int
-	Failed               int
-	Deferred             int
-	FullyConverged       bool
-	ParentSafe           bool
-	DeferredLeafCount    int
-	DeferredCPUCount     int
-	FinalSnapshotCurrent bool
-	ConvergenceReport    topology.ConvergenceReport
 	AppliedView          *model.AppliedView
 }
 
@@ -125,16 +104,29 @@ type PeriodicalCapable interface {
 	PeriodicalHandler(context.Context, PeriodicalHandlerContext) error
 }
 
+// TopologyPlugin is the optional capability for the single plugin that owns the
+// DesiredView -> AppliedView convergence. Apply returns an opaque TopologyOutcome;
+// the manager switches on Level and never inspects topology internals.
 type TopologyPlugin interface {
 	Plugin
-	Apply(context.Context, HandlerContext) (DAGApplyResult, error)
+	Apply(context.Context, HandlerContext) (TopologyOutcome, error)
 }
 
 // DisabledTopologyReconciler owns a deliberately limited topology scope while
 // the plugin's full topology mode is disabled.
 type DisabledTopologyReconciler interface {
 	ShouldReconcileWhenDisabled(context.Context, HandlerContext) bool
-	ReconcileDisabled(context.Context, HandlerContext) (DAGApplyResult, error)
+	ReconcileDisabled(context.Context, HandlerContext) (TopologyOutcome, error)
+	// NeedsDisabledReset reports whether the plugin must run its disabled reset
+	// handler (AdjustmentCapable.CPUSetAdjustmentDisabledHandler) before the next
+	// disabled round. The plugin owns this transition: it returns true from the
+	// moment it enters disabled mode until a successful reset completes. This
+	// removes the manager's per-name reset-state bookkeeping.
+	NeedsDisabledReset() bool
+	// MarkDisabledResetComplete records that the disabled reset has finished
+	// successfully. The manager invokes it only inside a generation-fence commit,
+	// so a stale fence leaves the reset pending for the next round.
+	MarkDisabledResetComplete()
 }
 
 type PluginFactory func(conf *config.Configuration) Plugin

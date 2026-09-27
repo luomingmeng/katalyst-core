@@ -1649,8 +1649,6 @@ func TestCPUSetTopologyPluginReportsAppliedViewFromFinalSnapshot(t *testing.T) {
 	desired.PoolOwners[shareIdentity] = model.DesiredPoolOwner{
 		ExpectedCPUSet: machine.NewCPUSet(0, 1),
 	}
-	var result bulkheadapi.TopologyResult
-
 	dagResult, err := p.Apply(context.Background(), bulkheadapi.HandlerContext{
 		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
 			MetaServer: emptyLifecycleMetaServer(),
@@ -1659,17 +1657,15 @@ func TestCPUSetTopologyPluginReportsAppliedViewFromFinalSnapshot(t *testing.T) {
 			}},
 		},
 		DesiredView: desired,
-		ReportTopologyResult: func(got bulkheadapi.TopologyResult) {
-			result = got
-		},
 	})
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 
-	if !result.Converged || !result.FinalSnapshotCurrent {
-		t.Fatalf("topology result = %+v, want converged current final snapshot", result)
+	if dagResult.Level != bulkheadapi.ConvergenceLevelFull {
+		t.Fatalf("outcome level = %v, want full converged current final snapshot", dagResult.Level)
 	}
+	result := bulkheadapi.TopologyResult{AppliedView: dagResult.View.DeepCopy()}
 	if result.AppliedView == nil {
 		t.Fatalf("topology result should carry an AppliedView")
 	}
@@ -1684,10 +1680,10 @@ func TestCPUSetTopologyPluginReportsAppliedViewFromFinalSnapshot(t *testing.T) {
 			t.Fatalf("applied rel %q = %q, want final snapshot value %q", rel, got, want)
 		}
 	}
-	if dagResult.AppliedView == nil {
-		t.Fatal("DAGApplyResult should carry the final-snapshot AppliedView")
+	if dagResult.View == nil {
+		t.Fatal("TopologyOutcome should carry the final-snapshot AppliedView")
 	}
-	if got := dagResult.AppliedView.ReclaimEffective.String(); got != "2-3" {
+	if got := dagResult.View.ReclaimEffective.String(); got != "2-3" {
 		t.Fatalf("DAG applied reclaim = %q, want 2-3", got)
 	}
 	assertProjectedCPUSet(t, result.AppliedView.PoolProjection.CPUSetByIdentity,
@@ -1704,15 +1700,15 @@ func TestCPUSetTopologyPluginReportsAppliedViewFromFinalSnapshot(t *testing.T) {
 		t.Fatalf("applied reclaim after desired mutation = %q, want snapshot value 2-3", got)
 	}
 	result.AppliedView.ReclaimEffective.Add(0)
-	if dagResult.AppliedView.ReclaimEffective.Contains(0) {
+	if dagResult.View.ReclaimEffective.Contains(0) {
 		t.Fatal("DAGApplyResult AppliedView aliases callback result")
 	}
 	result.AppliedView.CPUSetByRel["reclaim"].Add(0)
-	if dagResult.AppliedView.CPUSetByRel["reclaim"].Contains(0) {
+	if dagResult.View.CPUSetByRel["reclaim"].Contains(0) {
 		t.Fatal("DAGApplyResult AppliedView per-rel proof aliases callback result")
 	}
 	result.AppliedView.PoolProjection.CPUSetByIdentity[reclaimIdentity].Add(0)
-	if dagResult.AppliedView.PoolProjection.CPUSetByIdentity[reclaimIdentity].Contains(0) {
+	if dagResult.View.PoolProjection.CPUSetByIdentity[reclaimIdentity].Contains(0) {
 		t.Fatal("DAGApplyResult AppliedView pool projection aliases callback result")
 	}
 }
@@ -1759,9 +1755,7 @@ func TestCPUSetTopologyPluginAdmissionPublishesFrozenTraceResult(t *testing.T) {
 	desired := model.NewDesiredView()
 	desired.NonReclaimPool = machine.NewCPUSet(0, 1)
 	desired.ReclaimEffective = machine.NewCPUSet(2, 3)
-	var result bulkheadapi.TopologyResult
-
-	_, err := p.Apply(context.Background(), bulkheadapi.HandlerContext{
+	outcome, err := p.Apply(context.Background(), bulkheadapi.HandlerContext{
 		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
 			Mode:       cpusetutil.CPUSetAdjustmentModeAdmission,
 			MetaServer: emptyLifecycleMetaServer(),
@@ -1770,15 +1764,13 @@ func TestCPUSetTopologyPluginAdmissionPublishesFrozenTraceResult(t *testing.T) {
 			}},
 		},
 		DesiredView: desired,
-		ReportTopologyResult: func(got bulkheadapi.TopologyResult) {
-			result = got
-		},
 	})
 	if err != nil {
 		t.Fatalf("Apply(admission) error = %v", err)
 	}
-	if !result.Converged || !result.FinalSnapshotCurrent || result.AppliedView == nil {
-		t.Fatalf("admission result = %+v, want published current frozen-trace result", result)
+	result := bulkheadapi.TopologyResult{AppliedView: outcome.View.DeepCopy()}
+	if outcome.Level != bulkheadapi.ConvergenceLevelFull || result.AppliedView == nil {
+		t.Fatalf("admission outcome = %+v, want published current frozen-trace result", outcome)
 	}
 	if got := result.AppliedView.NonReclaimPool.String(); got != "0-1" {
 		t.Fatalf("published non-reclaim pool = %q, want 0-1", got)
@@ -1892,7 +1884,7 @@ func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t
 				},
 			}
 			var result bulkheadapi.TopologyResult
-			err := p.CPUSetAdjustmentHandler(context.Background(), bulkheadapi.HandlerContext{
+			err := p.runNormalAdjustment(context.Background(), bulkheadapi.HandlerContext{
 				CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
 					MetaServer: &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{
 						PodFetcher: &metapod.PodFetcherStub{PodList: []*v1.Pod{pod}},
@@ -1902,9 +1894,9 @@ func TestCPUSetTopologyPluginPublishesOnlyContainerLeavesProvenByFinalSnapshot(t
 					}},
 				},
 				DesiredView: desired,
-				ReportTopologyResult: func(got bulkheadapi.TopologyResult) {
-					result = got
-				},
+			}, func(got bulkheadapi.TopologyResult) {
+				got.AppliedView = got.AppliedView.DeepCopy()
+				result = got
 			})
 			if err != nil {
 				t.Fatalf("CPUSetAdjustmentHandler: %v", err)
@@ -2063,7 +2055,7 @@ func TestCPUSetTopologyPluginReturnsErrorWhenNormalConvergeNonConverged(t *testi
 	}
 
 	reported := false
-	err := p.CPUSetAdjustmentHandler(context.Background(), bulkheadapi.HandlerContext{
+	err := p.runNormalAdjustment(context.Background(), bulkheadapi.HandlerContext{
 		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
 			Topology: &machine.CPUTopology{CPUDetails: machine.CPUDetails{
 				0: {}, 1: {}, 2: {}, 3: {},
@@ -2073,9 +2065,8 @@ func TestCPUSetTopologyPluginReturnsErrorWhenNormalConvergeNonConverged(t *testi
 			NonReclaimPool:   machine.NewCPUSet(0, 1),
 			ReclaimEffective: machine.NewCPUSet(2, 3),
 		}},
-		ReportTopologyResult: func(bulkheadapi.TopologyResult) {
-			reported = true
-		},
+	}, func(bulkheadapi.TopologyResult) {
+		reported = true
 	})
 	var exhausted *topology.ReplanBudgetExceededError
 	if !errors.As(err, &exhausted) ||
@@ -2210,7 +2201,7 @@ func TestCPUSetTopologyPluginHandlesConfiguredNUMABucketTransitionToEmpty(t *tes
 				cgroup: cg,
 			}
 			var result bulkheadapi.TopologyResult
-			err := p.CPUSetAdjustmentHandler(context.Background(), bulkheadapi.HandlerContext{
+			err := p.runNormalAdjustment(context.Background(), bulkheadapi.HandlerContext{
 				CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
 					MetaServer: emptyLifecycleMetaServer(),
 					Topology: &machine.CPUTopology{CPUDetails: machine.CPUDetails{
@@ -2226,9 +2217,9 @@ func TestCPUSetTopologyPluginHandlesConfiguredNUMABucketTransitionToEmpty(t *tes
 						1: machine.NewCPUSet(),
 					},
 				}},
-				ReportTopologyResult: func(got bulkheadapi.TopologyResult) {
-					result = got
-				},
+			}, func(got bulkheadapi.TopologyResult) {
+				got.AppliedView = got.AppliedView.DeepCopy()
+				result = got
 			})
 
 			if tc.version == cgroupclient.CgroupVersionV1 {
@@ -2365,9 +2356,7 @@ func TestCPUSetTopologyPluginMaterializesConfiguredReclaimSiblingWhenMissing(t *
 		},
 		cgroup: cg,
 	}
-	var result bulkheadapi.TopologyResult
-
-	_, err := p.Apply(context.Background(), bulkheadapi.HandlerContext{
+	outcome, err := p.Apply(context.Background(), bulkheadapi.HandlerContext{
 		CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
 			MetaServer: emptyLifecycleMetaServer(),
 			Topology: &machine.CPUTopology{CPUDetails: machine.CPUDetails{
@@ -2378,13 +2367,11 @@ func TestCPUSetTopologyPluginMaterializesConfiguredReclaimSiblingWhenMissing(t *
 			NonReclaimPool:   machine.NewCPUSet(0, 1),
 			ReclaimEffective: machine.NewCPUSet(2, 3),
 		}},
-		ReportTopologyResult: func(got bulkheadapi.TopologyResult) {
-			result = got
-		},
 	})
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
+	result := bulkheadapi.TopologyResult{AppliedView: outcome.View.DeepCopy()}
 	if got := cg.writes["system"]; got != "2-3" {
 		t.Fatalf("system cpuset = %q, want 2-3; writes=%#v", got, cg.writes)
 	}
@@ -2726,35 +2713,35 @@ func TestCPUSetTopologyPluginReconcileDisabledPublishesReclaimOnlyProof(t *testi
 	if err != nil {
 		t.Fatalf("ReconcileDisabled() error: %v", err)
 	}
-	if !result.FullyConverged || !result.FinalSnapshotCurrent {
+	if result.Level != bulkheadapi.ConvergenceLevelFull {
 		t.Fatalf("result = %+v, want current full convergence", result)
 	}
-	if result.AppliedView == nil || result.AppliedView.Level != model.AppliedViewLevelReclaimOnly {
-		t.Fatalf("applied view = %+v, want reclaim-only", result.AppliedView)
+	if result.View == nil || result.View.Level != model.AppliedViewLevelReclaimOnly {
+		t.Fatalf("applied view = %+v, want reclaim-only", result.View)
 	}
-	if !result.AppliedView.ReclaimEffective.Equals(machine.NewCPUSet(2, 3)) {
-		t.Fatalf("applied reclaim = %s, want 2-3", result.AppliedView.ReclaimEffective.String())
+	if !result.View.ReclaimEffective.Equals(machine.NewCPUSet(2, 3)) {
+		t.Fatalf("applied reclaim = %s, want 2-3", result.View.ReclaimEffective.String())
 	}
-	if _, ok := result.AppliedView.CPUSetByRel["primary"]; ok {
-		t.Fatalf("reclaim-only proof unexpectedly contains primary: %#v", result.AppliedView.CPUSetByRel)
+	if _, ok := result.View.CPUSetByRel["primary"]; ok {
+		t.Fatalf("reclaim-only proof unexpectedly contains primary: %#v", result.View.CPUSetByRel)
 	}
 	for _, rel := range []string{"reclaim", "reclaim/reclaim-0"} {
-		if _, ok := result.AppliedView.RelProofByRel[rel]; !ok {
-			t.Fatalf("reclaim-only proof misses %q: %#v", rel, result.AppliedView.RelProofByRel)
+		if _, ok := result.View.RelProofByRel[rel]; !ok {
+			t.Fatalf("reclaim-only proof misses %q: %#v", rel, result.View.RelProofByRel)
 		}
 	}
-	if !result.AppliedView.NonReclaimPool.IsEmpty() || len(result.AppliedView.ContainerCPUSetByPod) != 0 {
-		t.Fatalf("reclaim-only applied fields contain unproved state: %+v", result.AppliedView.CPUSetPartitionView)
+	if !result.View.NonReclaimPool.IsEmpty() || len(result.View.ContainerCPUSetByPod) != 0 {
+		t.Fatalf("reclaim-only applied fields contain unproved state: %+v", result.View.CPUSetPartitionView)
 	}
 	reclaimIdentity := model.CPUSetPoolIdentity{Kind: model.CPUSetPoolKindReclaim}
-	if len(result.AppliedView.PoolProjection.CPUSetByIdentity) != 1 {
-		t.Fatalf("reclaim-only pool projection = %+v, want exactly reclaim", result.AppliedView.PoolProjection)
+	if len(result.View.PoolProjection.CPUSetByIdentity) != 1 {
+		t.Fatalf("reclaim-only pool projection = %+v, want exactly reclaim", result.View.PoolProjection)
 	}
-	assertProjectedCPUSet(t, result.AppliedView.PoolProjection.CPUSetByIdentity,
+	assertProjectedCPUSet(t, result.View.PoolProjection.CPUSetByIdentity,
 		reclaimIdentity, machine.NewCPUSet(2, 3))
-	if !result.AppliedView.PoolProjection.UncoveredCPUs.IsEmpty() ||
-		!result.AppliedView.PoolProjection.AmbiguousCPUs.IsEmpty() {
-		t.Fatalf("reclaim-only diagnostics = %+v, want empty", result.AppliedView.PoolProjection)
+	if !result.View.PoolProjection.UncoveredCPUs.IsEmpty() ||
+		!result.View.PoolProjection.AmbiguousCPUs.IsEmpty() {
+		t.Fatalf("reclaim-only diagnostics = %+v, want empty", result.View.PoolProjection)
 	}
 }
 
@@ -2874,8 +2861,8 @@ func TestCPUSetTopologyPluginReconcileDisabledContextTerminationSummarizesAccumu
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("ReconcileDisabled() error = %v, want context cancellation", err)
 	}
-	if result.Attempted == 0 || result.Applied == 0 {
-		t.Fatalf("result = %+v, want accumulated work from the completed retry attempt", result)
+	if result.Level != bulkheadapi.ConvergenceLevelNone {
+		t.Fatalf("result = %+v, want no publish on cancellation", result)
 	}
 	summaries := 0
 	for _, metric := range emitter.metrics {
@@ -2926,14 +2913,14 @@ func TestCPUSetTopologyPluginReconcileDisabledTreatsAllMissingRootsAsEmptySucces
 	if err != nil {
 		t.Fatalf("ReconcileDisabled() error: %v", err)
 	}
-	if !result.FullyConverged || !result.FinalSnapshotCurrent || result.AppliedView == nil {
+	if result.Level != bulkheadapi.ConvergenceLevelFull || result.View == nil {
 		t.Fatalf("result = %+v, want current empty success", result)
 	}
-	if !result.AppliedView.ReclaimEffective.IsEmpty() ||
-		len(result.AppliedView.ReclaimEffectivePerNUMA) != 0 ||
-		len(result.AppliedView.CPUSetByRel) != 0 ||
-		len(result.AppliedView.RelProofByRel) != 0 {
-		t.Fatalf("missing reclaim paths published physical proof: %+v", result.AppliedView)
+	if !result.View.ReclaimEffective.IsEmpty() ||
+		len(result.View.ReclaimEffectivePerNUMA) != 0 ||
+		len(result.View.CPUSetByRel) != 0 ||
+		len(result.View.RelProofByRel) != 0 {
+		t.Fatalf("missing reclaim paths published physical proof: %+v", result.View)
 	}
 	if len(cg.writes) != 0 {
 		t.Fatalf("missing reclaim paths received writes: %#v", cg.writes)
@@ -2981,8 +2968,8 @@ func TestCPUSetTopologyPluginReconcileDisabledReclassifiesAppearingRoot(t *testi
 	if err != nil {
 		t.Fatalf("ReconcileDisabled() error: %v", err)
 	}
-	if _, ok := result.AppliedView.RelProofByRel["reclaim"]; !ok {
-		t.Fatalf("appearing reclaim root was not reclassified and proved: %#v", result.AppliedView.RelProofByRel)
+	if _, ok := result.View.RelProofByRel["reclaim"]; !ok {
+		t.Fatalf("appearing reclaim root was not reclassified and proved: %#v", result.View.RelProofByRel)
 	}
 	if rootStats < 3 {
 		t.Fatalf("reclaim root stat count = %d, want preflight, final absence check, and rebuilt classification", rootStats)
@@ -3005,14 +2992,14 @@ func TestCPUSetTopologyPluginReconcileDisabledSkipsMissingNUMABucket(t *testing.
 	if err != nil {
 		t.Fatalf("ReconcileDisabled() error: %v", err)
 	}
-	if _, ok := result.AppliedView.RelProofByRel["reclaim"]; !ok {
-		t.Fatalf("existing root proof missing: %#v", result.AppliedView.RelProofByRel)
+	if _, ok := result.View.RelProofByRel["reclaim"]; !ok {
+		t.Fatalf("existing root proof missing: %#v", result.View.RelProofByRel)
 	}
-	if _, ok := result.AppliedView.RelProofByRel["reclaim/reclaim-0"]; ok {
-		t.Fatalf("missing NUMA bucket was proved: %#v", result.AppliedView.RelProofByRel)
+	if _, ok := result.View.RelProofByRel["reclaim/reclaim-0"]; ok {
+		t.Fatalf("missing NUMA bucket was proved: %#v", result.View.RelProofByRel)
 	}
-	if len(result.AppliedView.ReclaimEffectivePerNUMA) != 0 {
-		t.Fatalf("missing NUMA bucket left applied key: %#v", result.AppliedView.ReclaimEffectivePerNUMA)
+	if len(result.View.ReclaimEffectivePerNUMA) != 0 {
+		t.Fatalf("missing NUMA bucket left applied key: %#v", result.View.ReclaimEffectivePerNUMA)
 	}
 }
 
@@ -3054,10 +3041,10 @@ func TestCPUSetTopologyPluginReconcileDisabledDrainsExistingNUMABucketRemovedFro
 	if bucket < 0 || root < 0 || bucket >= root {
 		t.Fatalf("write order = %v, want removed NUMA bucket before reclaim root", cg.writeOrder)
 	}
-	if result.AppliedView == nil || !result.AppliedView.ReclaimEffective.Equals(machine.NewCPUSet(0, 1)) {
-		t.Fatalf("applied reclaim = %+v, want 0-1", result.AppliedView)
+	if result.View == nil || !result.View.ReclaimEffective.Equals(machine.NewCPUSet(0, 1)) {
+		t.Fatalf("applied reclaim = %+v, want 0-1", result.View)
 	}
-	if got, ok := result.AppliedView.ReclaimEffectivePerNUMA[1]; ok && !got.IsEmpty() {
+	if got, ok := result.View.ReclaimEffectivePerNUMA[1]; ok && !got.IsEmpty() {
 		t.Fatalf("removed NUMA applied reclaim = %s, want absent or empty", got.String())
 	}
 }
@@ -3093,8 +3080,8 @@ func TestCPUSetTopologyPluginReconcileDisabledReclassifiesAppearingNUMABucket(t 
 	if err != nil {
 		t.Fatalf("ReconcileDisabled() error: %v", err)
 	}
-	if _, ok := result.AppliedView.RelProofByRel["reclaim/reclaim-0"]; !ok {
-		t.Fatalf("appearing NUMA bucket was not reclassified: %#v", result.AppliedView.RelProofByRel)
+	if _, ok := result.View.RelProofByRel["reclaim/reclaim-0"]; !ok {
+		t.Fatalf("appearing NUMA bucket was not reclassified: %#v", result.View.RelProofByRel)
 	}
 	if bucketStats < 2 {
 		t.Fatalf("NUMA bucket stat calls = %d, want reclassification", bucketStats)
@@ -3131,7 +3118,7 @@ func TestCPUSetTopologyPluginReconcileDisabledRetriesReplacedNUMABucketIdentity(
 	if err != nil {
 		t.Fatalf("ReconcileDisabled() error: %v", err)
 	}
-	proof := result.AppliedView.RelProofByRel["reclaim/reclaim-0"]
+	proof := result.View.RelProofByRel["reclaim/reclaim-0"]
 	if proof.Device != pluginFakeIdentity("reclaim/reclaim-0").Device ||
 		proof.Inode != pluginFakeIdentity("reclaim/reclaim-0").Inode {
 		t.Fatalf("published NUMA proof = %+v, want replacement identity", proof)
@@ -3235,7 +3222,7 @@ func TestCPUSetTopologyPluginReconcileDisabledAppliesNUMAMixedReplacement(t *tes
 	if err != nil {
 		t.Fatalf("ReconcileDisabled() error: %v", err)
 	}
-	if got := result.AppliedView.ReclaimEffectivePerNUMA[0]; !got.Equals(machine.NewCPUSet(2, 3)) {
+	if got := result.View.ReclaimEffectivePerNUMA[0]; !got.Equals(machine.NewCPUSet(2, 3)) {
 		t.Fatalf("applied NUMA target = %s, want 2-3", got.String())
 	}
 }

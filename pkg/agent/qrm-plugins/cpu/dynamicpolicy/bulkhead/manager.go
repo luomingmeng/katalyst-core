@@ -25,7 +25,6 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/klog/v2"
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
@@ -44,25 +43,25 @@ import (
 	metricutil "github.com/kubewharf/katalyst-core/pkg/util/metric"
 )
 
-type disabledTopologyResetState uint8
-
-const (
-	disabledTopologyResetNone disabledTopologyResetState = iota
-	disabledTopologyResetPending
-	disabledTopologyResetComplete
-)
-
 type Manager struct {
 	mu                            cancelableMutex
 	latestAppliedReclaimMu        sync.RWMutex
 	plugins                       []bulkheadapi.Plugin
 	defaultNonReclaimPoolMinSize  int64
 	lastCPUSetAdjustmentEnabled   map[string]bool
-	disabledTopologyResetStates   map[string]disabledTopologyResetState
 	appliedView                   *model.AppliedView
 	appliedViewRevision           uint64
 	appliedViewValidForPeriodical bool
 	latestAppliedReclaim          machine.CPUSet
+
+	// topologyOwner is the at-most-one plugin that converges topology. In
+	// production it implements both TopologyPlugin and DisabledTopologyReconciler;
+	// tests may split the two interfaces across fakes, so discovery accepts a
+	// plugin carrying either. It is resolved by interface assertion (never by
+	// name) and cached. Zero owners is valid (topology convergence disabled);
+	// two or more distinct owners is fatal.
+	topologyOwner       bulkheadapi.Plugin
+	topologyDiscovered  bool
 }
 
 // cancelableMutex is a zero-value-ready binary semaphore. Unlike sync.Mutex,
@@ -103,12 +102,11 @@ func (m *cancelableMutex) Unlock() {
 // NonConvergedError reports a retryable topology outcome that must not be
 // treated as successful Bulkhead apply or authorize dependent plugins.
 type NonConvergedError struct {
-	Result bulkheadapi.DAGApplyResult
+	Note string
 }
 
 func (e *NonConvergedError) Error() string {
-	return fmt.Sprintf("bulkhead topology not fully converged: current=%t deferred=%d report=%+v",
-		e.Result.FinalSnapshotCurrent, e.Result.Deferred, e.Result.ConvergenceReport)
+	return "bulkhead topology not fully converged: " + e.Note
 }
 
 const (
@@ -118,11 +116,6 @@ const (
 	metricBulkheadPartitionCPUDiffCores        = "bulkhead_partition_cpu_diff_cores"
 	metricBulkheadDefaultShareResidualCPUCores = "bulkhead_default_share_residual_cpu_cores"
 	bulkheadSlowHandlerThreshold               = 500 * time.Millisecond
-
-	// cpusetTopologyPluginName is the well-known name of the topology plugin
-	// that owns the authoritative applied view. It is referenced both when
-	// gating dependent plugins and when stamping the reclaim commit override.
-	cpusetTopologyPluginName = "cpuset_topology"
 )
 
 // applyLoopAccumulator groups the per-round mutable state threaded through the
@@ -135,7 +128,7 @@ type applyLoopAccumulator struct {
 	topologyStopped   bool
 	topologyApplied   bool
 	verifiedReclaim   machine.CPUSet
-	topologyResult    bulkheadapi.DAGApplyResult
+	outcome           bulkheadapi.TopologyOutcome
 }
 
 // preparedApply carries everything Apply needs after the preparation phase.
@@ -180,10 +173,44 @@ func NewManager(conf *config.Configuration) (*Manager, error) {
 		defaultConf := conf.DynamicAgentConfiguration.GetDynamicConfiguration()
 		defaultNonReclaimPoolMinSize = bulkheadNonReclaimPoolMinSize(defaultConf)
 	}
-	return &Manager{
+	m := &Manager{
 		plugins:                      plugins,
 		defaultNonReclaimPoolMinSize: defaultNonReclaimPoolMinSize,
-	}, nil
+	}
+	if err := m.discoverTopologyPlugin(); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// discoverTopologyPlugin resolves the single topology-owning plugin from the
+// registry by interface assertion. It never compares plugin names. Zero owners
+// is permitted; two or more distinct owners is a configuration error.
+func (m *Manager) discoverTopologyPlugin() error {
+	if m.topologyDiscovered {
+		return nil
+	}
+	var found []bulkheadapi.Plugin
+	for _, p := range m.plugins {
+		_, isTopology := p.(bulkheadapi.TopologyPlugin)
+		_, isReconciler := p.(bulkheadapi.DisabledTopologyReconciler)
+		if isTopology || isReconciler {
+			found = append(found, p)
+		}
+	}
+	switch len(found) {
+	case 0:
+	case 1:
+		m.topologyOwner = found[0]
+	default:
+		names := make([]string, 0, len(found))
+		for _, tp := range found {
+			names = append(names, tp.Name())
+		}
+		return fmt.Errorf("bulkhead manager expects at most one topology owner, got %d: %v", len(found), names)
+	}
+	m.topologyDiscovered = true
+	return nil
 }
 
 func (m *Manager) RunCPUSetAdjustmentHandlers(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) error {
@@ -213,6 +240,9 @@ func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandl
 		return machine.NewCPUSet(), fmt.Errorf("acquire bulkhead manager lock: %w", err)
 	}
 	defer m.mu.Unlock()
+	if err := m.discoverTopologyPlugin(); err != nil {
+		return machine.NewCPUSet(), err
+	}
 	disabledRoundStart := time.Now()
 	empty := machine.NewCPUSet()
 
@@ -274,7 +304,6 @@ func (m *Manager) prepareApply(in cpusetutil.CPUSetAdjustmentHandlerCtx) (*prepa
 		// bulkhead off.
 		if !commitIfGenerationCurrent(in, func() {
 			m.lastCPUSetAdjustmentEnabled = nil
-			m.disabledTopologyResetStates = nil
 		}) {
 			return nil, staleGenerationError()
 		}
@@ -299,13 +328,6 @@ func (m *Manager) prepareApply(in cpusetutil.CPUSetAdjustmentHandlerCtx) (*prepa
 	}
 	prepared.currentEnabled = m.buildPluginEnabledState(*prepared.handlerCtx)
 	prepared.desiredSnapshot = prepared.handlerCtx.DesiredView.DeepCopy()
-	desiredSnapshot := prepared.desiredSnapshot
-	hc := prepared.handlerCtx
-	acc := prepared.acc
-	prepared.handlerCtx.ReportTopologyResult = func(result bulkheadapi.TopologyResult) {
-		result.AppliedView = result.AppliedView.DeepCopy()
-		acc.topologyPublished = m.tryPublishAppliedView(hc, desiredSnapshot, &result)
-	}
 	return prepared, nil
 }
 
@@ -324,86 +346,113 @@ func (m *Manager) executeApply(
 	desiredSnapshot *model.DesiredView,
 	disabledRoundStart time.Time,
 ) error {
+	if m.topologyOwner != nil {
+		if err := m.processApplyPlugin(ctx, in, handlerCtx, m.topologyOwner, acc, currentEnabled, desiredSnapshot, disabledRoundStart); err != nil {
+			return err
+		}
+	}
 	for _, p := range m.plugins {
+		if p == m.topologyOwner {
+			continue
+		}
+		if err := m.processApplyPlugin(ctx, in, handlerCtx, p, acc, currentEnabled, desiredSnapshot, disabledRoundStart); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// processApplyPlugin runs one plugin's adjustment round. See executeApply.
+func (m *Manager) processApplyPlugin(
+	ctx context.Context,
+	in cpusetutil.CPUSetAdjustmentHandlerCtx,
+	handlerCtx *bulkheadapi.HandlerContext,
+	p bulkheadapi.Plugin,
+	acc *applyLoopAccumulator,
+	currentEnabled map[string]bool,
+	desiredSnapshot *model.DesiredView,
+	disabledRoundStart time.Time,
+) error {
+	// processApplyPlugin executes one plugin's disabled or enabled adjustment
+	// round. It is called twice per round: first for the topology owner (if any),
+	// then for all other plugins in registry order. Call order, generation fences,
+	// and gating are unchanged from the previous single loop.
 		if !commitIfGenerationCurrent(in, func() {}) {
 			return staleGenerationError()
 		}
 		if !currentEnabled[p.Name()] {
-			leavingDisabledReconcile := false
-			if reconciler, ok := p.(bulkheadapi.DisabledTopologyReconciler); ok {
-				if reconciler.ShouldReconcileWhenDisabled(ctx, *handlerCtx) {
-					disabledCtx, cancel := context.WithDeadline(ctx, disabledRoundStart.Add(managerTopologyDeadline(in.CoreConf)))
-					if m.disabledTopologyResetState(p.Name()) != disabledTopologyResetComplete {
-						if !commitIfGenerationCurrent(in, func() {
-							m.setDisabledTopologyResetState(p.Name(), disabledTopologyResetPending)
-						}) {
-							cancel()
-							return staleGenerationError()
-						}
-						adjuster, ok := p.(bulkheadapi.AdjustmentCapable)
-						if !ok {
-							cancel()
-							return fmt.Errorf("bulkhead plugin %q is a disabled-topology reconciler without adjustment capability", p.Name())
-						}
-						err := adjuster.CPUSetAdjustmentDisabledHandler(disabledCtx, *handlerCtx)
-						if err != nil {
-							cancel()
-							emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment_disabled", p.Name(), "failed", err.Error())
-							return fmt.Errorf("bulkhead plugin %q disabled transition failed: %w", p.Name(), err)
-						}
-						if !commitIfGenerationCurrent(in, func() {
-							m.setDisabledTopologyResetState(p.Name(), disabledTopologyResetComplete)
-						}) {
-							cancel()
-							return staleGenerationError()
-						}
-						emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment_disabled", p.Name(), "success", "")
-						acc.anyAdjusted = true
-					}
-					topologyCtx := *handlerCtx
-					topologyCtx.ReportTopologyResult = nil
-					result, err := reconciler.ReconcileDisabled(disabledCtx, topologyCtx)
-					cancel()
+			if reconciler, ok := p.(bulkheadapi.DisabledTopologyReconciler); ok &&
+				reconciler.ShouldReconcileWhenDisabled(ctx, *handlerCtx) {
+				disabledCtx, cancel := context.WithDeadline(ctx, disabledRoundStart.Add(managerTopologyDeadline(in.CoreConf)))
+				if reconciler.NeedsDisabledReset() {
 					if !commitIfGenerationCurrent(in, func() {}) {
+						cancel()
 						return staleGenerationError()
 					}
+					adjuster, ok := p.(bulkheadapi.AdjustmentCapable)
+					if !ok {
+						cancel()
+						return fmt.Errorf("bulkhead plugin %q is a disabled-topology reconciler without adjustment capability", p.Name())
+					}
+					err := adjuster.CPUSetAdjustmentDisabledHandler(disabledCtx, *handlerCtx)
 					if err != nil {
-						emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", p.Name(), "failed", err.Error())
-						return fmt.Errorf("bulkhead plugin %q disabled reconciliation failed: %w", p.Name(), err)
+						cancel()
+						emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment_disabled", p.Name(), "failed", err.Error())
+						return fmt.Errorf("bulkhead plugin %q disabled transition failed: %w", p.Name(), err)
 					}
-					if !result.FullyConverged || !result.FinalSnapshotCurrent || result.AppliedView == nil ||
-						result.AppliedView.Level != model.AppliedViewLevelReclaimOnly {
-						nonConverged := &NonConvergedError{Result: result}
-						emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", p.Name(), "failed", nonConverged.Error())
-						return nonConverged
+					if !commitIfGenerationCurrent(in, func() {
+						reconciler.MarkDisabledResetComplete()
+					}) {
+						cancel()
+						return staleGenerationError()
 					}
-					if err := m.acceptConvergedTopologyResult(in, handlerCtx, p.Name(), result, desiredSnapshot, acc, "after disabled topology reconcile"); err != nil {
-						return err
-					}
-					continue
+					emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment_disabled", p.Name(), "success", "")
+					acc.anyAdjusted = true
 				}
-				leavingDisabledReconcile = m.disabledTopologyResetState(p.Name()) != disabledTopologyResetNone
+				topologyCtx := *handlerCtx
+				outcome, err := reconciler.ReconcileDisabled(disabledCtx, topologyCtx)
+				cancel()
+				if !commitIfGenerationCurrent(in, func() {}) {
+					return staleGenerationError()
+				}
+				if err != nil {
+					emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", p.Name(), "failed", err.Error())
+					return fmt.Errorf("bulkhead plugin %q disabled reconciliation failed: %w", p.Name(), err)
+				}
+				if outcome.Level == bulkheadapi.ConvergenceLevelNone {
+					nonConverged := &NonConvergedError{Note: outcome.Note}
+					emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", p.Name(), "failed", nonConverged.Error())
+					return nonConverged
+				}
+				if err := m.acceptTopologyOutcome(in, handlerCtx, p.Name(), outcome, desiredSnapshot, acc, "after disabled topology reconcile"); err != nil {
+					return err
+				}
+				return nil
 			}
-			if !leavingDisabledReconcile && !m.needsDisabledReset(p.Name()) {
-				if p.Name() == cpusetTopologyPluginName {
+			// Disabled and not reconciling this round: run the disabled reset only
+			// when the plugin itself says it still needs one (transition into disabled
+			// mode, or a retried/authoritative exit reset).
+			needsReset := false
+			if reconciler, ok := p.(bulkheadapi.DisabledTopologyReconciler); ok {
+				needsReset = reconciler.NeedsDisabledReset()
+			} else if _, ok := p.(bulkheadapi.AdjustmentCapable); ok {
+				needsReset = m.needsDisabledReset(p.Name())
+			}
+			if !needsReset {
+				if p == m.topologyOwner {
 					acc.topologyStopped = true
 				}
-				continue
-			}
-			if leavingDisabledReconcile && !commitIfGenerationCurrent(in, func() {
-				m.setDisabledTopologyResetState(p.Name(), disabledTopologyResetPending)
-			}) {
-				return staleGenerationError()
+				return nil
 			}
 			var err error
 			if adjuster, ok := p.(bulkheadapi.AdjustmentCapable); ok {
 				err = adjuster.CPUSetAdjustmentDisabledHandler(ctx, *handlerCtx)
 			}
-			if !commitIfGenerationCurrent(in, func() {
-				if err == nil && leavingDisabledReconcile {
-					m.setDisabledTopologyResetState(p.Name(), disabledTopologyResetNone)
-				}
-			}) {
+			markComplete := func() {}
+			if reconciler, ok := p.(bulkheadapi.DisabledTopologyReconciler); ok && err == nil {
+				markComplete = reconciler.MarkDisabledResetComplete
+			}
+			if !commitIfGenerationCurrent(in, markComplete) {
 				return staleGenerationError()
 			}
 			if err != nil {
@@ -412,27 +461,16 @@ func (m *Manager) executeApply(
 			}
 			emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment_disabled", p.Name(), "success", "")
 			acc.anyAdjusted = true
-			if p.Name() == cpusetTopologyPluginName {
+			if p == m.topologyOwner {
 				acc.topologyStopped = true
 			}
-			continue
+			return nil
 		}
 		if acc.topologyStopped {
-			continue
-		}
-		if _, ok := p.(bulkheadapi.DisabledTopologyReconciler); ok {
-			if !commitIfGenerationCurrent(in, func() {
-				m.setDisabledTopologyResetState(p.Name(), disabledTopologyResetPending)
-			}) {
-				return staleGenerationError()
-			}
+			return nil
 		}
 		if topologyPlugin, ok := p.(bulkheadapi.TopologyPlugin); ok {
 			topologyCtx := *handlerCtx
-			// The typed result is the sole publication path for TopologyPlugin.
-			// Suppress the legacy callback so a dependent failure cannot publish
-			// manager state from the middle of this transaction.
-			topologyCtx.ReportTopologyResult = nil
 			// A full topology attempt may write part of the hierarchy before it
 			// fails. Mark the owner as requiring an authoritative disabled reset
 			// before starting the attempt, rather than only after convergence.
@@ -444,7 +482,7 @@ func (m *Manager) executeApply(
 			}) {
 				return staleGenerationError()
 			}
-			result, err := topologyPlugin.Apply(ctx, topologyCtx)
+			outcome, err := topologyPlugin.Apply(ctx, topologyCtx)
 			if !commitIfGenerationCurrent(in, func() {}) {
 				return staleGenerationError()
 			}
@@ -452,23 +490,23 @@ func (m *Manager) executeApply(
 				emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", p.Name(), "failed", err.Error())
 				return fmt.Errorf("bulkhead plugin %q cpuset adjustment failed: %w", p.Name(), err)
 			}
-			successfulTopology := result.FullyConverged || result.ParentSafe
-			if !successfulTopology || !result.FinalSnapshotCurrent || result.AppliedView == nil {
-				nonConverged := &NonConvergedError{Result: result}
+			if outcome.Level == bulkheadapi.ConvergenceLevelNone {
+				nonConverged := &NonConvergedError{Note: outcome.Note}
 				emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", p.Name(), "failed", nonConverged.Error())
 				return nonConverged
 			}
 			// Rebuild desired intent after topology Apply so a result cannot be
 			// accepted, or authorize dependent side effects, after state changed.
-			if err := m.acceptConvergedTopologyResult(in, handlerCtx, p.Name(), result, desiredSnapshot, acc, "after topology apply"); err != nil {
+			if err := m.acceptTopologyOutcome(in, handlerCtx, p.Name(), outcome, desiredSnapshot, acc, "after topology apply"); err != nil {
 				return err
 			}
-			if result.ParentSafe {
-				// A parent-safe view proves partition/reclaim safety only. Do not
-				// authorize dependent plugins that may require exact leaf state.
+			if outcome.Level == bulkheadapi.ConvergenceLevelPartial {
+				// A partial (parent-safe) view proves partition/reclaim safety
+				// only. Do not authorize dependent plugins that may require exact
+				// leaf state.
 				acc.topologyStopped = true
 			}
-			continue
+			return nil
 		}
 		var err error
 		if adjuster, ok := p.(bulkheadapi.AdjustmentCapable); ok {
@@ -483,15 +521,14 @@ func (m *Manager) executeApply(
 		}
 		emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", p.Name(), "success", "")
 		acc.anyAdjusted = true
-		if p.Name() == cpusetTopologyPluginName {
+		if p == m.topologyOwner {
 			if !acc.topologyPublished {
 				acc.topologyStopped = true
-				continue
+				return nil
 			}
 		}
+		return nil
 	}
-	return nil
-}
 
 // acceptConvergedTopologyResult is shared by the disabled-reconcile and the
 // full topology-apply success paths. It rebuilds the desired intent, rejects the
@@ -499,11 +536,11 @@ func (m *Manager) executeApply(
 // converged applied view into the per-round handler context and accumulator.
 // phase is embedded in the rebuild error strings to preserve the original
 // messages.
-func (m *Manager) acceptConvergedTopologyResult(
+func (m *Manager) acceptTopologyOutcome(
 	in cpusetutil.CPUSetAdjustmentHandlerCtx,
 	handlerCtx *bulkheadapi.HandlerContext,
 	pluginName string,
-	result bulkheadapi.DAGApplyResult,
+	outcome bulkheadapi.TopologyOutcome,
 	desiredSnapshot *model.DesiredView,
 	acc *applyLoopAccumulator,
 	phase string,
@@ -522,23 +559,22 @@ func (m *Manager) acceptConvergedTopologyResult(
 			return fmt.Errorf("rebuild bulkhead desired view %s failed: %w", phase, err)
 		}
 		if !model.EqualDesiredView(currentDesired, desiredSnapshot) {
-			result.FinalSnapshotCurrent = false
-			nonConverged := &NonConvergedError{Result: result}
+			nonConverged := &NonConvergedError{Note: "desired view drifted " + phase}
 			emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", pluginName, "failed", nonConverged.Error())
 			return nonConverged
 		}
 	}
-	if err := m.validateAppliedHardPartition(in, result.AppliedView); err != nil {
+	if err := m.validateAppliedHardPartition(in, outcome.View); err != nil {
 		return fmt.Errorf("validate bulkhead topology applied view: %w", err)
 	}
-	handlerCtx.AppliedView = result.AppliedView.DeepCopy()
+	handlerCtx.AppliedView = outcome.View.DeepCopy()
 	handlerCtx.View = handlerCtx.AppliedView.CPUSetPartitionView.DeepCopy()
 	acc.verifiedReclaim = handlerCtx.AppliedView.ReclaimEffective.Clone()
 	handlerCtx.AppliedViewRevision = m.appliedViewRevision
 	if !model.EqualAppliedView(m.appliedView, handlerCtx.AppliedView) {
 		handlerCtx.AppliedViewRevision++
 	}
-	acc.topologyResult = result
+	acc.outcome = outcome
 	acc.topologyApplied = true
 	acc.topologyPublished = true
 	acc.anyAdjusted = true
@@ -561,13 +597,11 @@ func (m *Manager) publishApply(
 		if !commitIfGenerationCurrent(in, func() {
 			m.appliedView = handlerCtx.AppliedView.DeepCopy()
 			m.appliedViewRevision = handlerCtx.AppliedViewRevision
-			m.appliedViewValidForPeriodical = acc.topologyResult.FullyConverged
+			m.appliedViewValidForPeriodical = acc.outcome.Level == bulkheadapi.ConvergenceLevelFull
 			m.publishLatestAppliedReclaim(acc.verifiedReclaim)
 			m.lastCPUSetAdjustmentEnabled = currentEnabled
 		}) {
-			acc.topologyResult.FinalSnapshotCurrent = false
 			nonConverged := staleGenerationError()
-			nonConverged.Result = acc.topologyResult
 			emitBulkheadPluginResult(handlerCtx.Emitter, "cpuset_adjustment", "generation_fence", "failed", nonConverged.Error())
 			return empty, nonConverged
 		}
@@ -585,9 +619,9 @@ func (m *Manager) publishApply(
 	}
 	emitBulkheadViewChanged(handlerCtx.Emitter, acc.anyAdjusted)
 	if acc.topologyApplied {
-		if acc.topologyResult.FullyConverged && handlerCtx.CommitOverride != nil && !acc.verifiedReclaim.IsEmpty() {
+		if acc.outcome.Level == bulkheadapi.ConvergenceLevelFull && handlerCtx.CommitOverride != nil && !acc.verifiedReclaim.IsEmpty() {
 			handlerCtx.CommitOverride.ReclaimEffective = acc.verifiedReclaim.Clone()
-			handlerCtx.CommitOverride.Source = cpusetTopologyPluginName
+			handlerCtx.CommitOverride.Source = m.topologyOwner.Name()
 		}
 		return acc.verifiedReclaim.Clone(), nil
 	}
@@ -609,40 +643,6 @@ func (m *Manager) LatestAppliedReclaim() machine.CPUSet {
 	return m.latestAppliedReclaim.Clone()
 }
 
-func (m *Manager) tryPublishAppliedView(
-	in *bulkheadapi.HandlerContext,
-	desiredSnapshot *model.DesiredView,
-	result *bulkheadapi.TopologyResult,
-) bool {
-	if in == nil || in.DesiredView == nil || desiredSnapshot == nil ||
-		result == nil || !result.Converged || !result.FinalSnapshotCurrent || result.AppliedView == nil {
-		return false
-	}
-	rampUpDomains, dErr := m.activeRampUpDomains(in.CPUSetAdjustmentHandlerCtx)
-	if dErr != nil {
-		klog.Errorf("bulkhead: skip publishing applied view because active ramp-up domains could not be resolved: %v", dErr)
-		return false
-	}
-	opts := m.cpuSetPartitionViewOptions(in.CPUSetAdjustmentHandlerCtx, rampUpDomains)
-	finalDesired, err := bulkheadutils.BuildValidatedCPUSetPartitionView(in.State, in.Topology, opts)
-	if err != nil {
-		return false
-	}
-	if !model.EqualDesiredView(finalDesired, desiredSnapshot) {
-		return false
-	}
-	if err := bulkheadutils.ValidateHardPartitionAppliedView(result.AppliedView, in.State, in.Topology, opts); err != nil {
-		return false
-	}
-	return commitIfGenerationCurrent(in.CPUSetAdjustmentHandlerCtx, func() {
-		m.appliedView = result.AppliedView.DeepCopy()
-		m.appliedViewRevision++
-		m.appliedViewValidForPeriodical = true
-		in.AppliedView = m.appliedView.DeepCopy()
-		in.AppliedViewRevision = m.appliedViewRevision
-	})
-}
-
 func commitIfGenerationCurrent(in cpusetutil.CPUSetAdjustmentHandlerCtx, commit func()) bool {
 	if in.CommitIfGenerationCurrent == nil {
 		commit()
@@ -652,9 +652,7 @@ func commitIfGenerationCurrent(in cpusetutil.CPUSetAdjustmentHandlerCtx, commit 
 }
 
 func staleGenerationError() *NonConvergedError {
-	return &NonConvergedError{Result: bulkheadapi.DAGApplyResult{
-		FinalSnapshotCurrent: false,
-	}}
+	return &NonConvergedError{Note: "stale generation fence"}
 }
 
 // activeRampUpDomains resolves the ramp-up reclaim domains recorded in the
@@ -729,20 +727,6 @@ func (m *Manager) buildPluginEnabledState(in bulkheadapi.HandlerContext) map[str
 // prior state (e.g. after restart) and must reset once to converge.
 func (m *Manager) needsDisabledReset(name string) bool {
 	return m.lastCPUSetAdjustmentEnabled == nil || m.lastCPUSetAdjustmentEnabled[name]
-}
-
-func (m *Manager) disabledTopologyResetState(name string) disabledTopologyResetState {
-	if m.disabledTopologyResetStates == nil {
-		return disabledTopologyResetNone
-	}
-	return m.disabledTopologyResetStates[name]
-}
-
-func (m *Manager) setDisabledTopologyResetState(name string, state disabledTopologyResetState) {
-	if m.disabledTopologyResetStates == nil {
-		m.disabledTopologyResetStates = make(map[string]disabledTopologyResetState)
-	}
-	m.disabledTopologyResetStates[name] = state
 }
 
 func bulkheadEnabled(conf *dynamicconfig.Configuration) bool {

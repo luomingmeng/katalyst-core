@@ -77,6 +77,17 @@ type CPUSetTopologyPlugin struct {
 	deferredLeafDrains map[string]deferredLeafDrain
 	modeGateMu         sync.Mutex
 	modeGate           *topology.ModeGate
+
+	// resetComplete records whether the authoritative disabled reset has run
+	// since the plugin last entered the disabled topology mode. It replaces the
+	// manager-side per-name reset-state map: the plugin owns its own transition.
+	resetComplete bool
+	// lastEnabled is the previous Enable() result, used to detect the
+	// enabled->disabled transition that requires a fresh reset.
+	lastEnabled bool
+	// lastShouldReconcile is the previous ShouldReconcileWhenDisabled result; a
+	// true->false transition requires an authoritative exit reset.
+	lastShouldReconcile bool
 }
 
 type pendingPodProtection struct {
@@ -130,21 +141,41 @@ func (p *CPUSetTopologyPlugin) Name() string { return CPUSetTopologyPluginName }
 
 func (p *CPUSetTopologyPlugin) Enable(in bulkheadapi.HandlerContext) bool {
 	if p.disabledOnCgroupV2(context.Background()) {
+		if p.lastEnabled {
+			// enabled -> disabled (cgroup v2 gate closed): require a fresh reset.
+			p.resetComplete = false
+		}
+		p.lastEnabled = false
 		return false
 	}
-	return enableBulkheadCpusetTopology(in)
+	curr := enableBulkheadCpusetTopology(in)
+	if p.lastEnabled && !curr {
+		// enabled -> disabled: a fresh disabled reset is required next round.
+		p.resetComplete = false
+	}
+	p.lastEnabled = curr
+	return curr
 }
 
 func (p *CPUSetTopologyPlugin) ShouldReconcileWhenDisabled(
 	ctx context.Context,
 	in bulkheadapi.HandlerContext,
 ) bool {
+	curr := true
 	if !p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled ||
 		enableBulkheadCpusetTopology(in) ||
 		(in.State != nil && in.State.GetAllowSharedCoresOverlapReclaimedCores()) {
-		return false
+		curr = false
+	} else {
+		curr = !p.disabledOnCgroupV2(ctx)
 	}
-	return !p.disabledOnCgroupV2(ctx)
+	if p.lastShouldReconcile != curr {
+		// Entering or leaving the reclaim-only reconcile epoch: a fresh disabled
+		// reset is required before the next disabled round.
+		p.resetComplete = false
+	}
+	p.lastShouldReconcile = curr
+	return curr
 }
 
 // disabledOnCgroupV2 reports whether the cpuset_topology plugin must stay inert
@@ -164,7 +195,7 @@ func (p *CPUSetTopologyPlugin) disabledOnCgroupV2(ctx context.Context) bool {
 func (p *CPUSetTopologyPlugin) Apply(
 	ctx context.Context,
 	in bulkheadapi.HandlerContext,
-) (out bulkheadapi.DAGApplyResult, err error) {
+) (out bulkheadapi.TopologyOutcome, err error) {
 	start := time.Now()
 	defer func() {
 		general.Infof("cpuset_topology: plugin apply finished duration=%s err=%v desired_view_nil=%t",
@@ -172,39 +203,35 @@ func (p *CPUSetTopologyPlugin) Apply(
 	}()
 
 	var published *bulkheadapi.TopologyResult
-	report := in.ReportTopologyResult
-	in.ReportTopologyResult = func(result bulkheadapi.TopologyResult) {
+	publish := func(result bulkheadapi.TopologyResult) {
 		copied := result
 		copied.AppliedView = result.AppliedView.DeepCopy()
 		published = &copied
-		if report != nil {
-			report(result)
-		}
 	}
 
-	err = p.CPUSetAdjustmentHandler(ctx, in)
+	err = p.runNormalAdjustment(ctx, in, publish)
 	var nonConverged *topologyApplyNonConvergedError
 	if errors.As(err, &nonConverged) {
-		return dagApplyResultFromConvergence(nonConverged.result), nil
+		return toOutcome(dagApplyResultFromConvergence(nonConverged.result), outcomeControl{}), nil
 	}
 	if err != nil {
-		return bulkheadapi.DAGApplyResult{}, err
+		return bulkheadapi.TopologyOutcome{}, err
 	}
 	if published == nil {
-		return bulkheadapi.DAGApplyResult{
+		return toOutcome(topology.DAGApplyResult{
 			FullyConverged:       in.DesiredView == nil,
 			FinalSnapshotCurrent: in.DesiredView == nil,
 			AppliedView:          nil,
-		}, nil
+		}, outcomeControl{}), nil
 	}
 	if published.AppliedView == nil {
-		return bulkheadapi.DAGApplyResult{}, fmt.Errorf("converged topology result is missing final-snapshot AppliedView")
+		return bulkheadapi.TopologyOutcome{}, fmt.Errorf("converged topology result is missing final-snapshot AppliedView")
 	}
-	return dagApplyResultFromTopologyResult(*published), nil
+	return toOutcome(dagApplyResultFromTopologyResult(*published), outcomeControl{}), nil
 }
 
-func dagApplyResultFromTopologyResult(result bulkheadapi.TopologyResult) bulkheadapi.DAGApplyResult {
-	return bulkheadapi.DAGApplyResult{
+func dagApplyResultFromTopologyResult(result bulkheadapi.TopologyResult) topology.DAGApplyResult {
+	return topology.DAGApplyResult{
 		Attempted:            result.Attempted,
 		Applied:              result.Applied,
 		Skipped:              result.Skipped,
@@ -215,13 +242,12 @@ func dagApplyResultFromTopologyResult(result bulkheadapi.TopologyResult) bulkhea
 		DeferredLeafCount:    result.DeferredLeafCount,
 		DeferredCPUCount:     result.DeferredCPUCount,
 		FinalSnapshotCurrent: result.FinalSnapshotCurrent,
-		ConvergenceReport:    result.ConvergenceReport,
 		AppliedView:          result.AppliedView.DeepCopy(),
 	}
 }
 
-func dagApplyResultFromConvergence(result topology.ConvergenceResult) bulkheadapi.DAGApplyResult {
-	out := bulkheadapi.DAGApplyResult{
+func dagApplyResultFromConvergence(result topology.ConvergenceResult) topology.DAGApplyResult {
+	out := topology.DAGApplyResult{
 		Attempted:            result.Attempted,
 		Applied:              result.Applied,
 		Skipped:              result.Skipped,
@@ -260,7 +286,6 @@ func topologyResultFromFinalConvergence(
 		DeferredLeafCount:    result.DeferredLeafCount,
 		DeferredCPUCount:     result.DeferredCPUCount,
 		FinalSnapshotCurrent: result.FinalSnapshotCurrent,
-		ConvergenceReport:    result.ConvergenceReport,
 		AppliedView:          applied,
 	}
 }
@@ -272,6 +297,18 @@ type topologyAdjustmentAttempt func(
 ) (topology.ConvergenceResult, error)
 
 func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in bulkheadapi.HandlerContext) error {
+	return p.runNormalAdjustment(ctx, in, nil)
+}
+
+// runNormalAdjustment runs the normal DesiredView -> AppliedView convergence.
+// publish, when non-nil, receives the final converged TopologyResult exactly
+// once (when FinalSnapshotCurrent holds); it is the internal handoff that used
+// to travel through HandlerContext.ReportTopologyResult.
+func (p *CPUSetTopologyPlugin) runNormalAdjustment(
+	ctx context.Context,
+	in bulkheadapi.HandlerContext,
+	publish func(bulkheadapi.TopologyResult),
+) error {
 	handlerStartedAt := time.Now()
 	if p.cfg.EnableAdmissionLeafDefer &&
 		in.Mode.OrFullDefault() == cpusetutil.CPUSetAdjustmentModeAdmission &&
@@ -285,7 +322,13 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentHandler(ctx context.Context, in b
 	}
 	budget := topology.NewAdjustmentBudget(
 		ctx, topologyBudgetFromConfig(p.cfg.TopologyConvergenceBudget))
-	return runCPUSetTopologyAdjustment(ctx, in, budget, p.adjustOnce)
+	attempt := func(ctx context.Context, in bulkheadapi.HandlerContext, b *topology.AdjustmentBudget) (topology.ConvergenceResult, error) {
+		var result topology.ConvergenceResult
+		err := p.adjustOnceWithResult(ctx, in, b, &result, publish)
+		return result, err
+	}
+	_, err := runCPUSetTopologyAdjustmentWithResult(ctx, in, budget, attempt)
+	return err
 }
 
 func runCPUSetTopologyAdjustment(
@@ -376,7 +419,7 @@ func (p *CPUSetTopologyPlugin) adjustOnce(
 	budget *topology.AdjustmentBudget,
 ) (topology.ConvergenceResult, error) {
 	var result topology.ConvergenceResult
-	err := p.adjustOnceWithResult(ctx, in, budget, &result)
+	err := p.adjustOnceWithResult(ctx, in, budget, &result, nil)
 	return result, err
 }
 
@@ -385,6 +428,7 @@ func (p *CPUSetTopologyPlugin) adjustOnceWithResult(
 	in bulkheadapi.HandlerContext,
 	adjustmentBudget *topology.AdjustmentBudget,
 	attemptResult *topology.ConvergenceResult,
+	publish func(bulkheadapi.TopologyResult),
 ) error {
 	relExists := func(rel string) error {
 		_, err := p.cgroup.StatDir(ctx, rel)
@@ -563,8 +607,8 @@ func (p *CPUSetTopologyPlugin) adjustOnceWithResult(
 		if finalAppliedView == nil {
 			return fmt.Errorf("final convergence result is missing final-snapshot AppliedView")
 		}
-		if in.ReportTopologyResult != nil {
-			in.ReportTopologyResult(topologyResultFromFinalConvergence(res, finalAppliedView))
+		if publish != nil {
+			publish(topologyResultFromFinalConvergence(res, finalAppliedView))
 		}
 	}
 	emitBulkheadTopologySummary(in.Emitter, "normal", res, nil)
@@ -718,16 +762,25 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentDisabledHandler(ctx context.Conte
 	return runCPUSetTopologyAdjustment(ctx, in, budget, p.resetCPUSetTopology)
 }
 
+// NeedsDisabledReset implements bulkheadapi.DisabledTopologyReconciler: it reports
+// true from the moment the plugin enters disabled topology mode until a
+// successful authoritative reset completes. The manager no longer tracks this.
+func (p *CPUSetTopologyPlugin) NeedsDisabledReset() bool { return !p.resetComplete }
+
+// MarkDisabledResetComplete records a successful disabled reset; the manager
+// calls this inside a generation-fence commit.
+func (p *CPUSetTopologyPlugin) MarkDisabledResetComplete() { p.resetComplete = true }
+
 func (p *CPUSetTopologyPlugin) ReconcileDisabled(
 	ctx context.Context,
 	in bulkheadapi.HandlerContext,
-) (result bulkheadapi.DAGApplyResult, terminalErr error) {
+) (bulkheadapi.TopologyOutcome, error) {
 	if !p.ShouldReconcileWhenDisabled(ctx, in) || in.DesiredView == nil {
-		return bulkheadapi.DAGApplyResult{}, nil
+		return bulkheadapi.TopologyOutcome{Level: bulkheadapi.ConvergenceLevelNone}, nil
 	}
 	budget := topology.NewAdjustmentBudget(
 		ctx, topologyBudgetFromConfig(p.cfg.TopologyConvergenceBudget))
-	var finalAttempt bulkheadapi.DAGApplyResult
+	var finalAttempt topology.DAGApplyResult
 	cumulative, err := runCPUSetTopologyAdjustmentWithResult(
 		ctx,
 		in,
@@ -744,13 +797,13 @@ func (p *CPUSetTopologyPlugin) ReconcileDisabled(
 		},
 	)
 	defer func() {
-		emitBulkheadTopologySummary(in.Emitter, "reclaim_only", cumulative, terminalErr)
+		emitBulkheadTopologySummary(in.Emitter, "reclaim_only", cumulative, err)
 	}()
-	result = dagApplyResultFromConvergence(cumulative)
+	result := dagApplyResultFromConvergence(cumulative)
 	if err == nil {
 		result.AppliedView = finalAttempt.AppliedView.DeepCopy()
 	}
-	return result, err
+	return toOutcome(result, outcomeControl{requireReclaimOnly: true}), err
 }
 
 func disabledReconcileShouldRetry(err error, convergence topology.ConvergenceResult) bool {
@@ -808,23 +861,23 @@ func (p *CPUSetTopologyPlugin) reconcileDisabledOnce(
 	ctx context.Context,
 	in bulkheadapi.HandlerContext,
 	adjustmentBudget *topology.AdjustmentBudget,
-) (bulkheadapi.DAGApplyResult, topology.ConvergenceResult, error) {
+) (topology.DAGApplyResult, topology.ConvergenceResult, error) {
 	configured := p.configuredReclaimRels(in.DesiredView, in.Topology)
 	observed, err := topology.ObserveConfiguredRels(ctx, p.cgroup, configured)
 	if err != nil {
-		return bulkheadapi.DAGApplyResult{}, topology.ConvergenceResult{}, fmt.Errorf("classify reclaim-only rels: %w", err)
+		return topology.DAGApplyResult{}, topology.ConvergenceResult{}, fmt.Errorf("classify reclaim-only rels: %w", err)
 	}
 	specs, activeRoots, err := p.buildReclaimOnlySpecs(in, observed)
 	if err != nil {
-		return bulkheadapi.DAGApplyResult{}, topology.ConvergenceResult{}, err
+		return topology.DAGApplyResult{}, topology.ConvergenceResult{}, err
 	}
 	if len(specs) == 0 {
 		current, err := topology.ObserveConfiguredRels(ctx, p.cgroup, configured)
 		if err != nil {
-			return bulkheadapi.DAGApplyResult{}, topology.ConvergenceResult{}, fmt.Errorf("recheck absent reclaim-only rels: %w", err)
+			return topology.DAGApplyResult{}, topology.ConvergenceResult{}, fmt.Errorf("recheck absent reclaim-only rels: %w", err)
 		}
 		if !equalRelObservations(observed, current) {
-			return bulkheadapi.DAGApplyResult{}, topology.ConvergenceResult{
+			return topology.DAGApplyResult{}, topology.ConvergenceResult{
 				ReplanDisposition: topology.ReplanSafeNoPhysicalWrites,
 			}, errReclaimClassificationChanged
 		}
@@ -833,7 +886,7 @@ func (p *CPUSetTopologyPlugin) reconcileDisabledOnce(
 			State:                topology.ConvergenceStateConverged,
 			FinalSnapshotCurrent: true,
 		}
-		return bulkheadapi.DAGApplyResult{
+		return topology.DAGApplyResult{
 			FullyConverged:       true,
 			FinalSnapshotCurrent: true,
 			AppliedView:          reclaimOnlyAppliedView(in.DesiredView, nil, nil),
@@ -842,11 +895,11 @@ func (p *CPUSetTopologyPlugin) reconcileDisabledOnce(
 
 	dag, err := topology.BuildDAG(specs)
 	if err != nil {
-		return bulkheadapi.DAGApplyResult{}, topology.ConvergenceResult{}, fmt.Errorf("build reclaim-only topology dag: %w", err)
+		return topology.DAGApplyResult{}, topology.ConvergenceResult{}, fmt.Errorf("build reclaim-only topology dag: %w", err)
 	}
 	expectedRes, err := p.buildExpectedCPUSetByRel(ctx, in)
 	if err != nil {
-		return bulkheadapi.DAGApplyResult{}, topology.ConvergenceResult{}, fmt.Errorf("build reclaim-only expected container cpuset: %w", err)
+		return topology.DAGApplyResult{}, topology.ConvergenceResult{}, fmt.Errorf("build reclaim-only expected container cpuset: %w", err)
 	}
 	expected := filterCPUSetByRoots(expectedRes.ExpectedByRel, activeRoots)
 	deferred := filterCPUSetByRoots(expectedRes.DeferredLeafByRel, activeRoots)
@@ -930,7 +983,7 @@ func (p *CPUSetTopologyPlugin) reconcileDisabledOnce(
 	result := dagApplyResultFromConvergence(res)
 	result.AppliedView = finalAppliedView.DeepCopy()
 	if result.FullyConverged && result.FinalSnapshotCurrent && result.AppliedView == nil {
-		return bulkheadapi.DAGApplyResult{}, res, fmt.Errorf("reclaim-only convergence is missing final-snapshot applied view")
+		return topology.DAGApplyResult{}, res, fmt.Errorf("reclaim-only convergence is missing final-snapshot applied view")
 	}
 	return result, res, nil
 }

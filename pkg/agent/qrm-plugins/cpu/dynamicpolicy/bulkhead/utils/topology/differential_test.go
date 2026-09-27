@@ -185,3 +185,74 @@ func TestDifferentialPlanEquivalence(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildPlanOperationsNilChildRelsByRelFallback is a regression test for the
+// E2E admission failure where buildPlanOperations was called with a nil
+// childRelsByRel (from the coordinator replan path), causing ExpectedChildUnion
+// to be empty for parent rels that DO have children. This triggered
+// "projected child union differs from frozen evidence" and replan exhaustion.
+func TestBuildPlanOperationsNilChildRelsByRelFallback(t *testing.T) {
+	for _, shape := range []string{"deep", "wide"} {
+		t.Run(shape, func(t *testing.T) {
+			_, snapshot, _ := planTreeFixture(t, shape, 20)
+			if snapshot == nil {
+				t.Skip("fixture unavailable")
+			}
+			depthByRel, relOrder := buildSnapshotDepthByRel(snapshot, nil)
+			domainByRel, parentByRel := buildPlannerRelations(snapshot, nil, depthByRel, relOrder.relsAsc, relOrder.childRelsByRel, nil)
+
+			// Shrink every rel to empty so operations are generated for ALL rels,
+			// including parent rels that have children.
+			targets := make(map[string]CPUSetTarget, len(snapshot.Entries))
+			for rel, entry := range snapshot.Entries {
+				targets[rel] = CPUSetTarget{CPUs: machine.NewCPUSet(), Mems: entry.Mems}
+			}
+
+			operationCount, err := countPlanOperations(PhaseDrain, HierarchyCapabilities{EmptyConfiguredCPUSet: true}, targets, snapshot, nil, nil)
+			if err != nil {
+				t.Fatalf("countPlanOperations: %v", err)
+			}
+
+			// Run with proper childRelsByRel (optimized path).
+			opsWithRel := buildPlanOperations(
+				PhaseDrain, true, HierarchyCapabilities{EmptyConfiguredCPUSet: true},
+				targets, snapshot, depthByRel, domainByRel, parentByRel,
+				nil, operationCount, nil, relOrder.childRelsByRel,
+			)
+
+			// Run with nil childRelsByRel (coordinator replan fallback path).
+			opsNil := buildPlanOperations(
+				PhaseDrain, true, HierarchyCapabilities{EmptyConfiguredCPUSet: true},
+				targets, snapshot, depthByRel, domainByRel, parentByRel,
+				nil, operationCount, nil, nil,
+			)
+
+			if len(opsWithRel) != len(opsNil) {
+				t.Fatalf("operation count mismatch: withChildRels=%d nil=%d", len(opsWithRel), len(opsNil))
+			}
+			// Build a lookup by rel for comparison.
+			nilByRel := make(map[string]PlanOperation, len(opsNil))
+			for _, op := range opsNil {
+				nilByRel[op.Rel] = op
+			}
+			for i := range opsWithRel {
+				rel := opsWithRel[i].Rel
+				opNil, ok := nilByRel[rel]
+				if !ok {
+					t.Fatalf("op %s missing from nil-childRels result", rel)
+				}
+				if !opsWithRel[i].ExpectedChildUnion.Equals(opNil.ExpectedChildUnion) {
+					t.Fatalf("op %s ExpectedChildUnion mismatch: withRel=%s nil=%s",
+						rel, opsWithRel[i].ExpectedChildUnion.String(), opNil.ExpectedChildUnion.String())
+				}
+				// Critical assertion: any parent with children must have non-empty ExpectedChildUnion.
+				if children, hasChildren := relOrder.childRelsByRel[rel]; hasChildren && len(children) > 0 {
+					if opNil.ExpectedChildUnion.IsEmpty() {
+						t.Fatalf("op %s ExpectedChildUnion is empty but has %d children (nil childRelsByRel regression)",
+							rel, len(children))
+					}
+				}
+			}
+		})
+	}
+}
