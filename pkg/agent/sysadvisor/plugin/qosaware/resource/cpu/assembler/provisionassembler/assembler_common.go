@@ -1666,20 +1666,21 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 	// FakeNUMA hard pool by the reserve value and erased the floor guarantee when
 	// the floor bound. Both scopes now publish through the same single formula.
 	nonOverlapReclaimedCoresSize := effectiveReclaimedCoresSize(reclaimedCoresSize, overlapReclaimedCoresSize)
-	general.InfoS("reclaim pool calculation output",
-		"numaID", numaID,
-		"nodeEnableReclaim", nodeEnableReclaim,
-		"policy", policy,
-		"ratio", ratio,
-		"cpuCount", cpuCount,
-		"rampUpReclaimCPUSetCap", pa.rampUpReclaimCPUSetCap,
-		"reclaimConstraint", pa.calculationContext.ReclaimConstraint,
-		"reservedForReclaim", reservedForReclaim,
-		"reclaimedCoresSize", reclaimedCoresSize,
-		"overlapReclaimedCoresSize", overlapReclaimedCoresSize,
-		"nonOverlapReclaimedCoresSize", nonOverlapReclaimedCoresSize,
-		"reclaimedCoresQuota", reclaimedCoresQuota,
-		"overlapAtoms", summarizeOverlapAtoms(reclaimPoolData.overlapAtoms))
+	// publishedEffectiveTarget is the baseline for the publishDelta probe. It is the
+	// constrained target for the FakeNUMA aggregate path, which has no whole-core
+	// normalization. For a real NUMA that gets jointly rounded below, the baseline is
+	// rewritten to the rounded reclaim size plus the overlap metadata: the rounding
+	// is a controlled, size-conserving reclaim<->dedicated adjustment (the released /
+	// gained CPUs move with the single dedicated pool), not a defect, so it must not
+	// surface as a non-zero delta. The invariant (entry + overlap == baseline) holds
+	// in the target-driven domain; after whole-core normalization it is measured
+	// against the normalized baseline, where the residual rounding error is by design.
+	publishedEffectiveTarget := reclaimedCoresSize
+	// No intermediate "reclaim pool calculation output" snapshot is logged here: the
+	// nonOverlap / quota values are still pre-normalization and may be rewritten by
+	// the real-NUMA joint normalization below, so logging them now would reproduce
+	// the stale-snapshot / "log prints 8, pool lands 4" observation split. The single
+	// terminal log after SetPoolEntry is the only authoritative record.
 	// Jointly align the non-overlap reclaim target to a whole-core value before
 	// publication, only on a real NUMA under the three hard-partition gates. The
 	// adjustment keeps the controlled partition (non-overlap reclaim + the single
@@ -1706,6 +1707,10 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 				"afterReclaim", joint.ReclaimSize,
 				"reservedForReclaim", reservedForReclaim)
 			nonOverlapReclaimedCoresSize = joint.ReclaimSize
+			// The normalized baseline for publishDelta is the rounded reclaim plus the
+			// overlap metadata, so the controlled whole-core rounding does not trip the
+			// conservation probe.
+			publishedEffectiveTarget = joint.ReclaimSize + overlapReclaimedCoresSize
 			// quota must not exceed the published non-overlap reclaim size.
 			if reclaimedCoresQuota > float64(nonOverlapReclaimedCoresSize) {
 				reclaimedCoresQuota = float64(nonOverlapReclaimedCoresSize)
@@ -1729,15 +1734,56 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 				"reservedForReclaim", reservedForReclaim)
 		}
 	}
-	result.SetPoolEntry(commonstate.PoolNameReclaim, numaID, nonOverlapReclaimedCoresSize, reclaimedCoresQuota)
+	// Final-state invariant check and observability. This runs after every
+	// adjustment (ratio clamp, live floor, constraint clamp, overlap metadata and
+	// whole-core joint normalization) and is emitted as a single log line and
+	// metrics sample immediately BEFORE the entry is published, so no value
+	// after this point can silently change the published contract.
+	// publishDelta is entry + overlap - baseline: 0 under the publish-layer
+	// conservation invariant (entry + overlap == publishedEffectiveTarget), and
+	// positive precisely when overlap overshoots the target (see below). The baseline
+	// is the constrained target for FakeNUMA and the normalized target for real NUMA.
+	publishDelta := nonOverlapReclaimedCoresSize + overlapReclaimedCoresSize - publishedEffectiveTarget
+	invariantStatus := "ok"
+	switch {
+	case nonOverlapReclaimedCoresSize < 0:
+		invariantStatus = "negative_entry"
+	// I3: overlap(n) must not exceed the allocatable target itself. The previous
+	// entry < overlap test is equivalent to overlap > target/2 for the convergent
+	// formula (entry = target - overlap), which falsely flags legitimate high
+	// overlap. A real double-count only exists when overlap exceeds the target.
+	case overlapReclaimedCoresSize > reclaimedCoresSize:
+		invariantStatus = "overlap_double_count"
+	case reclaimedCoresQuota >= 0 && reclaimedCoresQuota > float64(nonOverlapReclaimedCoresSize):
+		invariantStatus = "quota_gt_size"
+	}
+	if pa.emitter != nil {
+		tags := []metrics.MetricTag{{Key: "numa_id", Val: fmt.Sprintf("%d", numaID)}}
+		_ = pa.emitter.StoreInt64(metricReclaimPublishDelta, int64(publishDelta), metrics.MetricTypeNameRaw, tags...)
+		if invariantStatus != "ok" {
+			_ = pa.emitter.StoreInt64(metricReclaimInvariantViolationTotal, 1, metrics.MetricTypeNameCount,
+				append(tags, metrics.MetricTag{Key: "kind", Val: invariantStatus})...)
+		}
+	}
 
+	ceiling := -1
+	if c, ok := pa.calculationContext.ReclaimCeilings[constraintScope]; ok && c != nil {
+		ceiling = *c
+	}
 	general.InfoS("assemble reclaim pool entry",
 		"numaID", numaID,
-		"reservedForReclaim", reservedForReclaim,
-		"reclaimedCoresSize", reclaimedCoresSize,
+		"desired", desiredReclaimed,
+		"effectiveTarget", reclaimedCoresSize,
+		"ceiling", ceiling,
+		"floor", reservedForReclaim,
 		"overlapReclaimedCoresSize", overlapReclaimedCoresSize,
-		"nonOverlapReclaimedCoresSize", nonOverlapReclaimedCoresSize,
-		"reclaimedCoresQuota", reclaimedCoresQuota)
+		"publishedEntry", nonOverlapReclaimedCoresSize,
+		"memberNUMAs", memberNUMAs,
+		"reclaimedCoresQuota", reclaimedCoresQuota,
+		"publishDelta", publishDelta,
+		"invariant", invariantStatus)
+
+	result.SetPoolEntry(commonstate.PoolNameReclaim, numaID, nonOverlapReclaimedCoresSize, reclaimedCoresQuota)
 
 	return nil
 }
@@ -1840,6 +1886,14 @@ func clampReclaimOverlapMetadata(
 	}
 	return actual
 }
+
+// Publish-layer observability for the reclaim pool. reclaim_publish_delta is the
+// direct probe of the historical double-deduction defect: target minus the
+// published non-overlap entry plus overlap metadata, which must stay ~0.
+const (
+	metricReclaimPublishDelta            = "cpu_advisor_reclaim_publish_delta"
+	metricReclaimInvariantViolationTotal = "cpu_advisor_reclaim_invariant_violation_total"
+)
 
 // effectiveReclaimedCoresSize returns the reclaim pool entry size to publish for
 // one scope (a real NUMA or the global FakedNUMAID aggregate): the constrained,

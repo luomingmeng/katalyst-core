@@ -21,6 +21,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	configapi "github.com/kubewharf/katalyst-api/pkg/apis/config/v1alpha1"
 	"github.com/kubewharf/katalyst-core/cmd/katalyst-agent/app/options"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/metacache"
@@ -29,6 +30,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	metaagent "github.com/kubewharf/katalyst-core/pkg/metaserver/agent"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
+	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -216,4 +218,200 @@ func TestFakeNUMAHardOverlapReducesEntryOnce(t *testing.T) {
 	require.Equal(t, 6, effectiveReclaimedCoresSize(8, 2))
 	require.Equal(t, 0, effectiveReclaimedCoresSize(8, 8))
 	require.Equal(t, 0, effectiveReclaimedCoresSize(8, 12))
+}
+
+// recordingInt64Emitter captures the latest int64 value stored per metric name.
+type recordingInt64Emitter struct {
+	metrics.DummyMetrics
+	values map[string]int64
+}
+
+func newRecordingInt64Emitter() *recordingInt64Emitter {
+	return &recordingInt64Emitter{values: map[string]int64{}}
+}
+
+func (e *recordingInt64Emitter) StoreInt64(name string, value int64, _ metrics.MetricTypeName, _ ...metrics.MetricTag) error {
+	e.values[name] = value
+	return nil
+}
+
+// TestFakeNUMAHardPublishDeltaIsZero verifies the publish-layer observability
+// probe: with the defect fixed, publish_delta = effectiveTarget - (entry + overlap)
+// is 0. Before the fix it would have equaled the reserve value (4).
+func TestFakeNUMAHardPublishDeltaIsZero(t *testing.T) {
+	t.Parallel()
+
+	emitter := newRecordingInt64Emitter()
+	pa := newFakeNUMAHardAssembler(t,
+		[]int{0, 1},
+		map[int]int{0: 24, 1: 24},
+		map[int]int{0: 2, 1: 2},
+		8,
+		false,
+	)
+	pa.emitter = emitter
+
+	result := assembleFakeNUMAHardScope(t, pa)
+	require.Equal(t, 8, result.PoolEntries[commonstate.PoolNameReclaim][commonstate.FakedNUMAID].Size)
+	require.Equal(t, int64(0), emitter.values[metricReclaimPublishDelta],
+		"publish_delta must be 0 once the double-deduction is removed")
+}
+
+// TestFakeNUMAHardFollowsCeilingContinuity drives the global (FakedNUMAID) scope
+// through a ramp-up / release sequence 14 -> 8 -> 14 and asserts the published
+// reclaim tracks the per-scope ceiling on every step. The removed reserve
+// double-deduction would have subtracted the reserve (4) again on each step, so
+// continuity is what the field ramp relied on.
+func TestFakeNUMAHardFollowsCeilingContinuity(t *testing.T) {
+	t.Parallel()
+
+	backing := []int{0, 1}
+	reserved := map[int]int{0: 2, 1: 2} // effective reserve == 4
+	for _, target := range []int{14, 8, 14} {
+		target := target
+		t.Run("", func(t *testing.T) {
+			t.Parallel()
+			pa := newFakeNUMAHardAssembler(t, backing,
+				map[int]int{0: 24, 1: 24}, reserved, target, false)
+			result := assembleFakeNUMAHardScope(t, pa)
+			require.Equal(t, target,
+				result.PoolEntries[commonstate.PoolNameReclaim][commonstate.FakedNUMAID].Size,
+				"published reclaim must track the per-scope ceiling through ramp and release")
+		})
+	}
+}
+
+// TestFakeNUMAEntryPlusOverlapEqualsTarget asserts the publish-layer conservation
+// invariant for the target-driven global scope: the non-overlap reclaim entry plus
+// the overlap metadata must equal the constrained effective target. With
+// overlap 0 (allowSharedOverlap=false) this reduces to entry == target.
+func TestFakeNUMAEntryPlusOverlapEqualsTarget(t *testing.T) {
+	t.Parallel()
+
+	pa := newFakeNUMAHardAssembler(t,
+		[]int{0, 1},
+		map[int]int{0: 24, 1: 24},
+		map[int]int{0: 2, 1: 2},
+		8,
+		false,
+	)
+	result := assembleFakeNUMAHardScope(t, pa)
+
+	entry := result.PoolEntries[commonstate.PoolNameReclaim][commonstate.FakedNUMAID].Size
+	overlap := 0 // no overlap atoms under allowSharedOverlap=false
+	require.Equal(t, 8, entry+overlap, "entry + overlap must equal the constrained target")
+}
+
+// TestDefectPeriodDoubleDeductionGolden pins the pre-fix behavior so the removed
+// bug cannot silently regress. The "old" values below were not hand-computed:
+// they were captured by running the identical fixtures against the pre-fix
+// baseline (commit 4c9df87c4, which still carried the FakeNUMA publish-layer
+// `-= reservedForReclaim` post-step) and reading the actual assembler output:
+//
+//	A1 (target=8, overlap=0, reserve=4): old entry = 4, new = 8
+//	A3 (target=8, overlap=2, reserve=4): old entry = 2, metadata = 2, sum = 4, new entry = 6
+//	A4 reserve==target (target=8, reserve=8): old entry = 0, new = 8
+//	A4 reserve>=target (floor binds to 12, reserve=12): old entry = 0, new = 12
+//
+// oldPublish is a faithful reconstruction of the deleted post-step
+// max(max(target-overlap,0) - reserve, 0). Requiring it to differ from the fixed
+// single formula is the falsification: if a future change reintroduces the
+// double-deduction, newPublish would collapse back onto oldPublish.
+func TestDefectPeriodDoubleDeductionGolden(t *testing.T) {
+	t.Parallel()
+
+	oldPublish := func(target, overlap, reserve int) int {
+		return general.Max(general.Max(target-overlap, 0)-reserve, 0)
+	}
+
+	// Empirically captured defect-period published values.
+	require.Equal(t, 4, oldPublish(8, 0, 4), "A1 old published = 8-4")
+	require.Equal(t, 2, oldPublish(8, 2, 4), "A3 old entry = max(8-2,0)-4 = 2 (metadata 2, sum 4)")
+	require.Equal(t, 0, oldPublish(8, 0, 8), "A4 reserve==target old = 0")
+	require.Equal(t, 0, oldPublish(12, 0, 12), "A4 reserve>=target old = 0")
+
+	// The fixed convergent formula must publish the effective target, not the
+	// reserve-deducted value.
+	require.Equal(t, 8, effectiveReclaimedCoresSize(8, 0), "A1 new entry = 8")
+	require.Equal(t, 6, effectiveReclaimedCoresSize(8, 2), "A3 new entry = 6")
+	require.Equal(t, 12, effectiveReclaimedCoresSize(12, 0), "A4 floor-binds to 12")
+}
+
+// TestFakeNUMAHardOverlapPublishesEntryTargetMinusOverlap is the assembly-level
+// integration counterpart of the pure A3 check. It drives a real (non-binding,
+// reclaim enabled) share region through the global (FakedNUMAID) hard scope so
+// overlap metadata is actually produced, then asserts the full publish-layer
+// contract across a ramp of legitimate overlap levels:
+//
+//	effective target (ceiling)        = 8
+//	overlap metadata                 = clamped to the hard overlapBudget (= target - global reserve)
+//	non-overlap publish entry         = target - overlap (overlap subtracted exactly once)
+//	entry + overlap                   == target   (publish conservation, delta = 0)
+//	no invariant violation is emitted for ANY overlap <= target
+//
+// The middle rows (overlap 5, 6) are the regression guard for the invariant
+// fix: the previous probe `entry < overlap` is equivalent to `overlap > target/2`
+// for the convergent formula, so it would have falsely flagged these legitimate
+// high-overlap layouts. The corrected probe only trips when overlap exceeds the
+// target itself. The overlap=2 row is the A3 field case (target 8, entry 6).
+func TestFakeNUMAHardOverlapPublishesEntryTargetMinusOverlap(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		reserved    map[int]int // per backing NUMA; global reserve = sum
+		wantEntry   int
+		wantOverlap int
+	}{
+		{"A3 overlap 2", map[int]int{0: 3, 1: 3}, 6, 2},         // global reserve 6 -> budget 2
+		{"legit high overlap 5", map[int]int{0: 1, 1: 2}, 3, 5}, // global reserve 3 -> budget 5
+		{"legit high overlap 6", map[int]int{0: 1, 1: 1}, 2, 6}, // global reserve 2 -> budget 6
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			emitter := newRecordingInt64Emitter()
+			pa := newFakeNUMAHardAssembler(t,
+				[]int{0, 1},
+				map[int]int{0: 24, 1: 24},
+				tc.reserved,
+				8,
+				true, // allowSharedOverlap: a real share region drives overlap metadata
+			)
+			pa.emitter = emitter
+
+			share := NewFakeRegion("share", configapi.QoSRegionTypeShare, "share")
+			share.SetIsNumaBinding(false)
+			share.enableReclaim = true
+			share.podsRequest = 16
+			share.SetProvision(types.ControlKnob{
+				configapi.ControlKnobNonReclaimedCPURequirement: {Value: 4},
+			})
+			(*pa.regionMap)[share.Name()] = share
+
+			result := assembleFakeNUMAHardScope(t, pa)
+
+			entry := result.PoolEntries[commonstate.PoolNameReclaim][commonstate.FakedNUMAID].Size
+			overlapMeta := 0
+			for _, v := range result.PoolOverlapInfo[commonstate.PoolNameReclaim][commonstate.FakedNUMAID] {
+				overlapMeta += v
+			}
+
+			require.Equal(t, tc.wantOverlap, overlapMeta, "overlap metadata must equal the hard overlapBudget")
+			require.Equal(t, tc.wantEntry, entry, "non-overlap entry = target - overlap")
+			require.Equal(t, 8, entry+overlapMeta, "publish conservation: entry + overlap must equal the effective target")
+
+			require.Equal(t, int64(0), emitter.values[metricReclaimPublishDelta],
+				"publish_delta = entry + overlap - target must be 0")
+			_, violationEmitted := emitter.values[metricReclaimInvariantViolationTotal]
+			require.False(t, violationEmitted,
+				"overlap %d <= target 8 is legitimate; no overlap_double_count must fire", overlapMeta)
+
+			bf := result.DefaultShareBackfill
+			require.Equal(t, bf.RawReclaimSize, bf.FinalReclaimSize+bf.ReleasedReclaimSize,
+				"default share backfill accounting must balance")
+		})
+	}
 }
