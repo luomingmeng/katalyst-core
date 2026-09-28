@@ -1667,10 +1667,12 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		overlapBudget,
 		reclaimPoolData.overlapAtoms...,
 	)
-	nonOverlapReclaimedCoresSize := general.Max(reclaimedCoresSize-overlapReclaimedCoresSize, 0)
-	if effectiveHard && numaID == commonstate.FakedNUMAID {
-		nonOverlapReclaimedCoresSize = general.Max(nonOverlapReclaimedCoresSize-reservedForReclaim, 0)
-	}
+	// Publish the effective reclaim target directly. reservedForReclaim was
+	// already consumed once as the steady floor / ApplyReclaimConstraint input
+	// (floor encoding); subtracting it here a second time under-published the
+	// FakeNUMA hard pool by the reserve value and erased the floor guarantee when
+	// the floor bound. Both scopes now publish through the same single formula.
+	nonOverlapReclaimedCoresSize := effectiveReclaimedCoresSize(reclaimedCoresSize, overlapReclaimedCoresSize)
 	general.InfoS("reclaim pool calculation output",
 		"numaID", numaID,
 		"nodeEnableReclaim", nodeEnableReclaim,
@@ -1844,6 +1846,24 @@ func clampReclaimOverlapMetadata(
 		}
 	}
 	return actual
+}
+
+// effectiveReclaimedCoresSize returns the reclaim pool entry size to publish for
+// one scope (a real NUMA or the global FakedNUMAID aggregate): the constrained,
+// already-quantified reclaim target minus the portion of that target that was
+// already published as overlap metadata, clamped to the non-negative domain.
+//
+// reservedForReclaim is intentionally NOT adjusted here. In the target-driven
+// model the reservation is consumed exactly once as a floor/constraint input at
+// target derivation (ApplyReclaimConstraint / the steady floor), so no additive
+// reserve component exists at this publish scope to net out. Subtracting reserve
+// here a second time under floor encoding has no correct regime: it under-publishes
+// when the floor is inactive and fully erases the reservation guarantee when the
+// floor binds. Both the FakeNUMA aggregate path and the real-NUMA per-NUMA path
+// converge on this single formula so no residual reservedForReclaim adjustment
+// can survive at the publish layer.
+func effectiveReclaimedCoresSize(reclaimTarget, overlapReclaimedCoresSize int) int {
+	return general.Max(reclaimTarget-overlapReclaimedCoresSize, 0)
 }
 
 type reclaimPoolCalculationData struct {
