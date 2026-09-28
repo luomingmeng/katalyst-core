@@ -315,6 +315,22 @@ type CoordinatorInput struct {
 
 type TopologyCoordinator struct{}
 
+// Converge runs one topology adjustment pass to bring controlled cgroup
+// directories to the objective.
+//
+// Concurrency model:
+//   - Single writer per mode: in.Mode.TryEnter takes the shared ModeGate token
+//     before any cgroup write. A second overlapping Converge call (same or the
+//     opposite mode) fails fast with CoordinatorBusyError instead of contending,
+//     so at most one pass mutates the cgroup hierarchy at a time. The token is
+//     released by the deferred Exit.
+//   - Generation/fence: the pass snapshots the hierarchy up front and refuses to
+//     apply a plan against a stale view (SnapshotError/HierarchyErrorStale): the
+//     result is downgraded to non-converged and the caller replans, rather than
+//     writing an out-of-date cpuset over a newer external change.
+//   - Lock granularity: there is no coarse global lock. Mutual exclusion is only
+//     the mode token; budgets, snapshots and the journal are per-invocation, so a
+//     blocked or slow pass cannot pin unrelated readers.
 func (c TopologyCoordinator) Converge(ctx context.Context, in CoordinatorInput) (ConvergenceResult, error) {
 	res := ConvergenceResult{
 		ReplanDisposition: ReplanNotAllowed,

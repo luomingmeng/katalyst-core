@@ -586,6 +586,17 @@ func (m *Manager) acceptTopologyOutcome(
 // map when topology did not run), emits the applied metrics, and decides the
 // reclaim CPUSet to return. The caller records the apply-finished log flags
 // from the accumulator after a successful publish.
+// publishApply is the appliedView commit boundary for one adjustment pass.
+//
+// appliedView advances only inside commitIfGenerationCurrent: the fence checks
+// that in.Generation is still the current generation before running the commit
+// callback. If a newer adjustment pass (or a reset) started while this pass was
+// applying, the callback is skipped and publishApply returns a
+// staleGenerationError, so appliedView never reflects a plan that has already
+// been superseded. Within the winning generation, the appliedView snapshot, its
+// revision and the periodical-valid flag are mutated together as one commit; a
+// non-full convergence leaves appliedViewValidForPeriodical=false so the next
+// periodical reconcile re-derives state instead of trusting a half-converged view.
 func (m *Manager) publishApply(
 	in cpusetutil.CPUSetAdjustmentHandlerCtx,
 	handlerCtx *bulkheadapi.HandlerContext,

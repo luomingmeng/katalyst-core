@@ -67,13 +67,20 @@ type CheckpointCodec interface {
 // payload semantics: version gates, checksums, and topology validation remain
 // inside the CheckpointCodec.
 //
-// NOTE (migration status): this interface and the reference FileCheckpointStore
-// below are NEW code. The three existing checkpoint mechanisms are intentionally
-// NOT migrated in this phase. Checkpoint persistence is a data-safety critical
-// path; migrating each mechanism requires a dedicated PR that keeps the old
-// recovery tests green and adds crash/recovery tests (kill mid-rename, corrupt
-// checksum, version skew, partial write). Until then, the existing
-// implementations remain the source of truth.
+// NOTE (migration status): two of the three hand-written mechanisms have already
+// moved onto FileCheckpointStore and keep using it as their crash-safe protocol:
+//   - the cpuset-adjustment / advisor post-commit WAL and the advisor post-commit
+//     target share one store (cpuset_adjustment_handler.go, see
+//     advisorPostCommitCheckpointStore);
+//   - the steady fake-NUMA migration target checkpoint
+//     (steady_fake_numa_migration_checkpoint.go).
+//
+// The remaining legacy mechanism is the QRM allocation-state checkpoint
+// (state/state_checkpoint.go, written through checkpointmanager). It still uses
+// its own on-disk protocol and remains the source of truth; migrating it is a
+// data-safety critical change and needs a dedicated PR that keeps the existing
+// recovery tests green and adds crash/recovery coverage (kill mid-rename, corrupt
+// checksum, version skew, partial write).
 type CheckpointStore interface {
 	// Store atomically persists the codec-encoded payload for name. On success,
 	// a crash leaves either the previous or the new checkpoint, never a torn
