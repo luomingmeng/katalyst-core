@@ -79,6 +79,20 @@ const (
 	metricCPUAdvisorDefaultShareFinal        = "cpu_advisor_default_share_final"
 	metricCPUAdvisorUnassignedNonReclaimSize = "cpu_advisor_unassigned_non_reclaim_size"
 
+	// Per-scope reclaim constraint diagnostics. These report the internal
+	// rate-limited ceiling / target bookkeeping; they are NOT the published pool
+	// size (see cpu_advisor_pool_size for that).
+	metricReclaimScopeCeiling       = "cpu_advisor_reclaim_scope_ceiling"
+	metricReclaimScopeDesired       = "cpu_advisor_reclaim_scope_desired"
+	metricReclaimScopeFloor         = "cpu_advisor_reclaim_scope_floor"
+	metricReclaimScopeSteadyCap     = "cpu_advisor_reclaim_scope_steady_cap"
+	metricReclaimScopePhase         = "cpu_advisor_reclaim_scope_phase"
+	metricReclaimScopeLastPublished = "cpu_advisor_reclaim_scope_last_published"
+	metricReclaimScopeTargetError   = "cpu_advisor_reclaim_scope_target_error_total"
+	metricReclaimScopeAckStalled    = "cpu_advisor_reclaim_scope_ack_stalled_total"
+	metricReclaimScopeUnackedCycles = "cpu_advisor_reclaim_scope_unacked_cycles"
+	metricReclaimScopeAcked         = "cpu_advisor_reclaim_scope_acked"
+
 	cpuAdvisorHealthCheckName     = "cpu_advisor_update"
 	healthCheckTolerationDuration = 30 * time.Second
 )
@@ -117,9 +131,10 @@ type cpuResourceAdvisor struct {
 	regionMap              map[string]region.QoSRegion // map[regionName]region
 	reservedForReclaim     map[int]int                 // map[numaID]reservedForReclaim
 	rampUpReclaimCPUSetCap map[int]int                 // map[numaID]rampUpReclaimCPUSetCap
-	numaAvailable          map[int]int                 // map[numaID]availableResource
-	numRegionsPerNuma      map[int]int                 // map[numaID]regionQuantity
-	nonBindingNumas        machine.CPUSet              // numas without numa binding pods
+	rampUpDomainTargets    map[provisionassembler.ReclaimConstraintScope]types.ReclaimConstraintTarget
+	numaAvailable          map[int]int    // map[numaID]availableResource
+	numRegionsPerNuma      map[int]int    // map[numaID]regionQuantity
+	nonBindingNumas        machine.CPUSet // numas without numa binding pods
 
 	allowSharedCoresOverlapReclaimedCores      bool
 	disableDedicatedCoresOverlapReclaimedCores bool
@@ -151,6 +166,7 @@ func NewCPUResourceAdvisor(conf *config.Configuration, extraConf interface{}, me
 		regionMap:              make(map[string]region.QoSRegion),
 		reservedForReclaim:     make(map[int]int),
 		rampUpReclaimCPUSetCap: make(map[int]int),
+		rampUpDomainTargets:    make(map[provisionassembler.ReclaimConstraintScope]types.ReclaimConstraintTarget),
 		numaAvailable:          make(map[int]int),
 		numRegionsPerNuma:      make(map[int]int),
 		nonBindingNumas:        machine.NewCPUSet(),
@@ -255,14 +271,25 @@ func (cra *cpuResourceAdvisor) update() (*types.InternalCPUCalculationResult, er
 	scopeNumas := cra.scopeNUMAMapping()
 	var (
 		reclaimConstraint   provisionassembler.ReclaimConstraint
-		reclaimCeilings     map[provisionassembler.ReclaimConstraintScope]int
+		reclaimCeilings     map[provisionassembler.ReclaimConstraintScope]*int
 		reclaimActiveScopes map[provisionassembler.ReclaimConstraintScope]bool
+		reclaimAccounting   map[provisionassembler.ReclaimConstraintScope]decidedScope
+		// liveDomainScopes carries the scopes that own a live ramp-up domain this
+		// cycle. reclaimActiveScopes (from constraint()) additionally folds in the
+		// draining scopes the guard still clamps; commit() must see the live active
+		// set so a draining scope is tagged phase=draining (not acked) and its
+		// desired is reset to steadyCap.
+		liveDomainScopes = map[provisionassembler.ReclaimConstraintScope]bool{}
 	)
-	if hardEnabled {
-		activeScopes := cra.activeReclaimScopes(scopeNumas, metadataSnapshot.rampUpDomains)
+	// The guard runs whenever ramp-up hard partition is active OR whenever it still
+	// holds draining scope state (a scope that must step its ceiling back up to
+	// steadyCap after ramp-up exited). A scope with no active domain and no state
+	// collapses to ReclaimConstraintNone inside constraint().
+	if hardEnabled || cra.reclaimConstraintGuard.hasRetainedState() {
+		liveDomainScopes = cra.activeReclaimScopes(scopeNumas, metadataSnapshot.rampUpDomains)
 		observedByScope, observedOKByScope := cra.observedReclaimByScope(scopeNumas)
-		reclaimConstraint, reclaimCeilings, reclaimActiveScopes = cra.reclaimConstraintGuard.constraint(
-			activeScopes, observedByScope, observedOKByScope, maxRampUpStep)
+		reclaimConstraint, reclaimCeilings, reclaimActiveScopes, reclaimAccounting = cra.reclaimConstraintGuard.constraint(
+			liveDomainScopes, observedByScope, observedOKByScope, maxRampUpStep, cra.cpusPerCore())
 	} else {
 		reclaimConstraint = provisionassembler.ReclaimConstraintNone
 	}
@@ -287,11 +314,12 @@ func (cra *cpuResourceAdvisor) update() (*types.InternalCPUCalculationResult, er
 	cra.updateRegionStatus()
 	cra.emitMetrics(*result)
 	cra.reclaimConstraintGuard.commit(
-		reclaimActiveScopes,
+		liveDomainScopes,
 		reclaimCeilings,
+		reclaimAccounting,
 		result.ReclaimConstraintTargets,
 		cra.publishedReclaimByScope(result, scopeNumas),
-		maxRampUpStep,
+		scopeNumas,
 	)
 	updateSucceeded = true
 	general.InfoS("committed cpu reclaim constraint",
@@ -302,6 +330,18 @@ func (cra *cpuResourceAdvisor) update() (*types.InternalCPUCalculationResult, er
 		"hardEnabled", hardEnabled)
 	general.InfoS("finished", "duration", time.Since(startTime))
 	return result, nil
+}
+
+// cpusPerCore returns the node SMT width used to keep every per-cycle ceiling
+// movement and domain target whole-core, defaulting to 1 when the topology is
+// unavailable.
+func (cra *cpuResourceAdvisor) cpusPerCore() int {
+	if cra.metaServer != nil && cra.metaServer.CPUTopology != nil {
+		if c := cra.metaServer.CPUTopology.CPUsPerCore(); c > 0 {
+			return c
+		}
+	}
+	return 1
 }
 
 // scopeNUMAMapping derives the stable mapping from each ReclaimConstraintScope
@@ -443,6 +483,15 @@ func (cra *cpuResourceAdvisor) publishedReclaimByScope(
 		for _, numaID := range numas {
 			numaToScope[numaID] = scope
 		}
+	}
+	// The global non-binding pool is published as a single aggregate entry keyed by
+	// FakedNUMAID, while the scope's member list holds its backing real NUMAs. Map
+	// the faked id onto the global scope explicitly so the aggregate publication is
+	// recorded as that scope's ACK baseline; otherwise the global scope never
+	// acknowledges and its ceiling cannot advance.
+	globalScope := provisionassembler.NewNonExclusiveReclaimConstraintScope(commonstate.FakedNUMAID)
+	if _, hasGlobal := scopeNumas[globalScope]; hasGlobal {
+		numaToScope[commonstate.FakedNUMAID] = globalScope
 	}
 	for numaID, entry := range result.PoolEntries[commonstate.PoolNameReclaim] {
 		scope, ok := numaToScope[numaID]
@@ -637,7 +686,7 @@ func (cra *cpuResourceAdvisor) updateWithIsolationGuardian(dynamicConf *dynamic.
 	steadyExclusiveNUMAs sets.Int,
 	rampUpDomains sets.Int,
 	reclaimConstraint provisionassembler.ReclaimConstraint,
-	reclaimCeilings map[provisionassembler.ReclaimConstraintScope]int,
+	reclaimCeilings map[provisionassembler.ReclaimConstraintScope]*int,
 	reclaimActiveScopes map[provisionassembler.ReclaimConstraintScope]bool,
 	tryIsolation bool,
 ) (
@@ -1042,7 +1091,7 @@ func (cra *cpuResourceAdvisor) assembleProvision(dynamicConf *dynamic.Configurat
 	rampUpActive bool,
 	rampUpDomains sets.Int,
 	reclaimConstraint provisionassembler.ReclaimConstraint,
-	reclaimCeilings map[provisionassembler.ReclaimConstraintScope]int,
+	reclaimCeilings map[provisionassembler.ReclaimConstraintScope]*int,
 	reclaimActiveScopes map[provisionassembler.ReclaimConstraintScope]bool,
 ) (types.InternalCPUCalculationResult, error) {
 	if cra.provisionAssembler == nil {
@@ -1070,6 +1119,7 @@ func (cra *cpuResourceAdvisor) assembleProvision(dynamicConf *dynamic.Configurat
 		ReclaimConstraint:    reclaimConstraint,
 		ReclaimCeilings:      reclaimCeilings,
 		ReclaimActiveScopes:  reclaimActiveScopes,
+		ReclaimDomainTargets: cra.rampUpDomainTargets,
 		LiveReclaimByNUMA:    liveReclaimByNUMA,
 	})
 }
@@ -1169,7 +1219,34 @@ func (cra *cpuResourceAdvisor) emitMetrics(calculationResult types.InternalCPUCa
 		}
 	}
 
+	cra.emitReclaimScopeDiagnostics()
+
 	emitDefaultShareBackfillMetrics(cra.emitter, calculationResult.DefaultShareBackfill)
+}
+
+// emitReclaimScopeDiagnostics reports the per-scope reclaim constraint guard
+// state (rate-limited ceiling, desired, floor, steady cap, phase) as gauges. It
+// deliberately does NOT replace cpu_advisor_pool_size, which stays the published
+// quantity the assembler lands.
+func (cra *cpuResourceAdvisor) emitReclaimScopeDiagnostics() {
+	for _, d := range cra.reclaimConstraintGuard.snapshot() {
+		tags := []metrics.MetricTag{{Key: "scope", Val: d.Scope}}
+		_ = cra.emitter.StoreInt64(metricReclaimScopeCeiling, d.Ceiling, metrics.MetricTypeNameRaw, tags...)
+		_ = cra.emitter.StoreInt64(metricReclaimScopeDesired, d.Desired, metrics.MetricTypeNameRaw, tags...)
+		_ = cra.emitter.StoreInt64(metricReclaimScopeFloor, d.Floor, metrics.MetricTypeNameRaw, tags...)
+		_ = cra.emitter.StoreInt64(metricReclaimScopeSteadyCap, d.SteadyCap, metrics.MetricTypeNameRaw, tags...)
+		_ = cra.emitter.StoreInt64(metricReclaimScopeLastPublished, d.LastPublished, metrics.MetricTypeNameRaw, tags...)
+		// ACK health: unacked_cycles gauge, acked 0/1 gauge, and a cumulative
+		// ack_stalled counter so canary can tell whether the ACK loop is stuck.
+		_ = cra.emitter.StoreInt64(metricReclaimScopeUnackedCycles, d.UnackedCycles, metrics.MetricTypeNameRaw, tags...)
+		_ = cra.emitter.StoreInt64(metricReclaimScopeAcked, d.Acked, metrics.MetricTypeNameRaw, tags...)
+		_ = cra.emitter.StoreInt64(metricReclaimScopeAckStalled, d.StallCycles, metrics.MetricTypeNameCount, tags...)
+		// The active phase is reported purely as a tag on a presence gauge
+		// (value always 1): encoding the same information both as a numeric
+		// code and as a tag would duplicate it and drift on renames.
+		_ = cra.emitter.StoreInt64(metricReclaimScopePhase, 1, metrics.MetricTypeNameRaw,
+			append(tags, metrics.MetricTag{Key: "phase", Val: d.Phase})...)
+	}
 }
 
 // emitDefaultShareBackfillMetrics reports the structured diagnostics of the

@@ -117,8 +117,37 @@ func (pa *ProvisionAssemblerCommon) rampUpHardPartitionActive(numaID int) bool {
 	if pa.rampUpReclaimCPUSetCap == nil {
 		return false
 	}
+	// The global (faked) domain publishes a single aggregate reclaim pool over all
+	// non-binding NUMAs. It engages hard partition whenever it is itself an active
+	// ramp-up domain; its per-NUMA cap entries are only the distribution of that
+	// aggregate target and never each stand up their own pool.
+	if numaID == commonstate.FakedNUMAID {
+		return pa.isActiveRampUpDomain(commonstate.FakedNUMAID)
+	}
 	c, ok := (*pa.rampUpReclaimCPUSetCap)[numaID]
-	return ok && c > 0
+	if !ok || c <= 0 {
+		return false
+	}
+	// The global domain distributes its aggregate target across every non-binding
+	// backing NUMA, so those NUMAs carry cap entries without themselves hosting a
+	// ramp-up source. Such a backing NUMA must not engage the per-NUMA hard
+	// partition on its own behalf (the aggregate global entry already publishes the
+	// shared pool); only a NUMA that is itself an active ramp-up domain does. This
+	// keeps a global ramp-up from fanning out into per-NUMA reclaim entries that
+	// would double-count the aggregate pool.
+	return pa.isActiveRampUpDomain(numaID)
+}
+
+// isActiveRampUpDomain reports whether numaID is itself one of the ramp-up
+// domains active this cycle (FakedNUMAID for the global domain, or a real NUMA
+// for a NUMA-binding ramp-up).
+func (pa *ProvisionAssemblerCommon) isActiveRampUpDomain(numaID int) bool {
+	for _, d := range pa.calculationContext.RampUpDomains {
+		if d == numaID {
+			return true
+		}
+	}
+	return false
 }
 
 // rampUpHardPartitionActiveAny is the node-level summary used for the result
@@ -153,47 +182,18 @@ func (pa *ProvisionAssemblerCommon) rampUpHardPartitionActiveAnyIn(numas machine
 	return false
 }
 
+// effectiveReservedForReclaim sums the pure steady reservation floor across the
+// member NUMAs. The reservation floor is NEVER raised by the ramp-up target:
+// ramp-up only moves the dynamic ceiling, and a raised floor would (a) pin the
+// pool to the ramp-up target and bypass the slow ceiling, and (b) break the
+// invariant floor <= pool when initialRatio exceeds MaxRatio. The per-NUMA
+// ramp-up target lives in the optional per-scope ceiling instead.
 func (pa *ProvisionAssemblerCommon) effectiveReservedForReclaim(numas machine.CPUSet) int {
 	reserved := 0
 	for _, numaID := range numas.ToSliceInt() {
-		steady := (*pa.reservedForReclaim)[numaID]
-		// The ramp-up hard floor only exists for NUMAs that host an active ramp-up
-		// source; NUMAs without one are left at the steady reserve. A missing or
-		// zero cap entry (the common cross-domain case) leaves steady unchanged.
-		if cap, ok := (*pa.rampUpReclaimCPUSetCap)[numaID]; ok && cap > steady {
-			steady = cap
-		}
-		reserved += steady
+		reserved += (*pa.reservedForReclaim)[numaID]
 	}
 	return reserved
-}
-
-func (pa *ProvisionAssemblerCommon) applyRampUpReclaimCap(
-	size int,
-	limit float64,
-	numas machine.CPUSet,
-	reservedForReclaim int,
-) (int, float64) {
-	if pa.rampUpReclaimCPUSetCap == nil || numas.IsEmpty() {
-		return size, limit
-	}
-
-	capTotal := 0
-	for _, numaID := range numas.ToSliceInt() {
-		c, ok := (*pa.rampUpReclaimCPUSetCap)[numaID]
-		if !ok || c <= 0 {
-			return size, limit
-		}
-		capTotal += c
-	}
-	capTotal = general.Max(capTotal, reservedForReclaim)
-	if size > capTotal {
-		size = capTotal
-	}
-	if limit >= 0 && limit > float64(size) {
-		limit = float64(size)
-	}
-	return size, limit
 }
 
 // clampByReclaimedCPUMaxRatio caps the reclaim pool size (and quota when it is
@@ -745,12 +745,6 @@ func (pa *ProvisionAssemblerCommon) assembleDedicatedNUMAExclusiveRegion(r regio
 		}
 	}
 	originalReclaimTarget := reclaimTarget
-	reclaimTarget, reclaimQuotaLimit = pa.applyRampUpReclaimCap(
-		reclaimTarget,
-		reclaimQuotaLimit,
-		r.GetBindingNumas(),
-		reservedForReclaim,
-	)
 	constraintScope := NewExclusiveReclaimConstraintScope(r.Name())
 	desiredReclaimTarget := reclaimTarget
 	var constraintExcess int
@@ -763,8 +757,19 @@ func (pa *ProvisionAssemblerCommon) assembleDedicatedNUMAExclusiveRegion(r regio
 		pa.calculationContext.ReclaimCeilings,
 		pa.calculationContext.ReclaimActiveScopes,
 	)
+	// Exclusive-region invariant: an exclusive (NUMA-binding) region recomputes
+	// its own reclaim pool size above and the guard never drains it back. We
+	// therefore borrow the desired as the SteadyCap, so the published ceiling
+	// converges immediately (ceiling >= SteadyCap) and the scope retires rather
+	// than back-pulling the exclusive region. It is NOT the true MaxRatio upper
+	// bound -- there is no steady pool to return to for an exclusive region.
 	RecordReclaimConstraintTarget(result, pa.calculationContext.ReclaimConstraint,
-		constraintScope, desiredReclaimTarget, reservedForReclaim, constraintExcess)
+		constraintScope, types.ReclaimConstraintTarget{
+			Desired:     desiredReclaimTarget,
+			Floor:       reservedForReclaim,
+			SteadyCap:   desiredReclaimTarget,
+			MemberNUMAs: r.GetBindingNumas().ToSliceInt(),
+		}, constraintExcess)
 	if reclaimTarget > reclaimCapacity {
 		return fmt.Errorf(
 			"ramp-up reclaim target %d exceeds reclaim capacity %d for exclusive region %q",
@@ -948,12 +953,6 @@ func (pa *ProvisionAssemblerCommon) assembleLegacyDedicatedNUMAExclusiveRegion(r
 			}
 		}
 	}
-	reclaimedCoresSize, reclaimedCoresLimit = pa.applyRampUpReclaimCap(
-		reclaimedCoresSize,
-		reclaimedCoresLimit,
-		r.GetBindingNumas(),
-		reservedForReclaim,
-	)
 	constraintScope := NewLegacyExclusiveReclaimConstraintScope(r.Name())
 	desiredReclaimedCoresSize := reclaimedCoresSize
 	var constraintExcess int
@@ -966,8 +965,19 @@ func (pa *ProvisionAssemblerCommon) assembleLegacyDedicatedNUMAExclusiveRegion(r
 		pa.calculationContext.ReclaimCeilings,
 		pa.calculationContext.ReclaimActiveScopes,
 	)
+	// Exclusive-region invariant: an exclusive (NUMA-binding) region recomputes its
+	// own reclaim pool size above and the guard never drains it back. We therefore
+	// borrow the desired as the SteadyCap, so the published ceiling converges
+	// immediately and the scope retires rather than back-pulling the exclusive
+	// region. It is NOT the true MaxRatio upper bound -- there is no steady pool to
+	// return to.
 	RecordReclaimConstraintTarget(result, pa.calculationContext.ReclaimConstraint,
-		constraintScope, desiredReclaimedCoresSize, reservedForReclaim, constraintExcess)
+		constraintScope, types.ReclaimConstraintTarget{
+			Desired:     desiredReclaimedCoresSize,
+			Floor:       reservedForReclaim,
+			SteadyCap:   desiredReclaimedCoresSize,
+			MemberNUMAs: r.GetBindingNumas().ToSliceInt(),
+		}, constraintExcess)
 	klog.InfoS("assembleDedicatedNUMAExclusive info", "regionName", r.Name(), "reclaimedCoresSize", reclaimedCoresSize,
 		"reclaimedCoresLimit", reclaimedCoresLimit,
 		"available", available, "nonReclaimRequirement", nonReclaimRequirement,
@@ -1590,17 +1600,31 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		reclaimedCoresSize = clamp.FinalSize
 		reclaimedCoresQuota = clamp.FinalLimit
 	}
-	reclaimedCoresSize, reclaimedCoresQuota = pa.applyRampUpReclaimCap(
-		reclaimedCoresSize,
-		reclaimedCoresQuota,
-		numaSet,
-		reservedForReclaim,
-	)
+	// The ramp-up target is no longer enforced here. It is the desired value the
+	// per-scope optional ceiling tracks; the single quantity boundary is the
+	// ApplyReclaimConstraint clamp below, which honours the rate-limited ceiling
+	// while the steady MaxRatio clamp above remains the upper bound.
+	// steadyCap is the steady (MaxRatio) size captured before any live-floor raise,
+	// so the descriptive SteadyCap the guard sees is the pool's no-ramp-up upper
+	// bound, not a value already lifted by live continuity.
+	steadyCap := reclaimedCoresSize
 
+	// Domain-scoped live reclaim continuity (best-effort). Reuse the extracted
+	// helper so the live floor is defined in exactly one place; the global
+	// (faked) aggregate pool has no per-real-NUMA live floor here -- its
+	// continuity is seeded by the per-scope ceiling state machine instead.
 	reclaimedCoresSize = pa.applyDomainScopedLiveReclaimFloor(numaID, reclaimedCoresSize, shareAndIsolateDedicatedPoolSizes)
 
 	constraintScope := NewNonExclusiveReclaimConstraintScope(numaID)
-	desiredReclaimedCoresSize := reclaimedCoresSize
+	// The descriptive desired for this scope comes from the ramp-up domain built
+	// by the advisor. When no domain targets this scope (e.g. draining back to
+	// steady), the desired reverts to steadyCap so the guard publishes a coherent
+	// contract. The actual quantity decision is the optional ceiling clamp below.
+	domainTarget := pa.calculationContext.ReclaimDomainTargets[constraintScope]
+	desiredReclaimed := domainTarget.Desired
+	if desiredReclaimed == 0 {
+		desiredReclaimed = steadyCap
+	}
 	var constraintExcess int
 	reclaimedCoresSize, reclaimedCoresQuota, constraintExcess = ApplyReclaimConstraint(
 		constraintScope,
@@ -1611,8 +1635,18 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		pa.calculationContext.ReclaimCeilings,
 		pa.calculationContext.ReclaimActiveScopes,
 	)
+	memberNUMAs := numaSet.ToSliceInt()
+	if domainTarget.MemberNUMAs != nil {
+		memberNUMAs = domainTarget.MemberNUMAs
+	}
 	RecordReclaimConstraintTarget(result, pa.calculationContext.ReclaimConstraint,
-		constraintScope, desiredReclaimedCoresSize, reservedForReclaim, constraintExcess)
+		constraintScope, types.ReclaimConstraintTarget{
+			Desired:     desiredReclaimed,
+			Floor:       reservedForReclaim,
+			SteadyCap:   steadyCap,
+			Ceiling:     pa.calculationContext.ReclaimCeilings[constraintScope],
+			MemberNUMAs: memberNUMAs,
+		}, constraintExcess)
 	clamp.FinalSize = reclaimedCoresSize
 	clamp.FinalLimit = reclaimedCoresQuota
 	clamp.ReleasedSize = general.Max(0, clamp.RawSize-clamp.FinalSize)

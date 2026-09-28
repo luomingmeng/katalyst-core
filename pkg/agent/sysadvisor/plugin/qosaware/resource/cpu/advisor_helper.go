@@ -32,6 +32,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/plugin/qosaware/resource/cpu/region"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
+	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
@@ -236,19 +237,21 @@ func (cra *cpuResourceAdvisor) updateRampUpReclaimCPUSetCap(
 	rampUpDomains sets.Int,
 ) error {
 	targets := make(map[int]int)
+	domainTargets := make(map[provisionassembler.ReclaimConstraintScope]types.ReclaimConstraintTarget)
 	if dynamicConf == nil || !dynamicConf.EnableReclaim ||
 		!dynamicConf.EnableRampUpReclaimHardPartition || !hardActive {
 		cra.rampUpReclaimCPUSetCap = targets
+		cra.rampUpDomainTargets = domainTargets
 		return nil
 	}
 
-	// Scope the per-NUMA hard-partition reclaim floor to the real NUMAs that
-	// actually host an active ramp-up source. The global domain (FakedNUMAID/-1)
-	// represents a non-NUMA-binding shared ramp-up and must NOT raise a per-NUMA
-	// floor: doing so leaks the ramp-up reservation onto unrelated (dedicated)
-	// NUMAs. Domains that could not be resolved are already dropped upstream in
-	// snapshotRegionAssignments, so an empty real-NUMA set here means "no safe
-	// domain" and we fail closed with an empty cap map rather than widening.
+	cpusPerCore := cra.cpusPerCore()
+	maxRatio := dynamicConf.ReclaimedCPUMaxRatio
+
+	// Real-NUMA partition domains: each real NUMA that hosts an active ramp-up
+	// source keeps its own per-NUMA hard target. The global domain (FakedNUMAID/-1)
+	// is handled separately below because its capacity is the AGGREGATE of all
+	// non-binding NUMAs, not a single NUMA.
 	activeRealNUMAs := sets.NewInt()
 	for numaID := range rampUpDomains {
 		if numaID == commonstate.FakedNUMAID {
@@ -256,41 +259,157 @@ func (cra *cpuResourceAdvisor) updateRampUpReclaimCPUSetCap(
 		}
 		activeRealNUMAs.Insert(numaID)
 	}
-	if activeRealNUMAs.Len() == 0 {
-		cra.rampUpReclaimCPUSetCap = targets
-		general.Infof("rampUpReclaimCPUSetCap: no real-NUMA ramp-up domain, keeping per-NUMA cap empty")
-		return nil
-	}
-
-	var err error
-	targets, err = machine.ResolveHardPartitionReclaimTargets(
-		dynamicConf,
-		cra.metaServer.CPUTopology,
-		0,
-		func(numaID int) int { return cra.reservedForReclaim[numaID] },
-		nil,
-	)
-	if err != nil {
-		cra.rampUpReclaimCPUSetCap = make(map[int]int)
-		return fmt.Errorf("resolve active ramp-up reclaim targets: %w", err)
-	}
-	// Keep only the NUMAs that host an active ramp-up source; every other NUMA
-	// keeps its steady reserve and must not inherit a foreign ramp-up target.
-	for numaID := range targets {
-		if !activeRealNUMAs.Has(numaID) {
-			delete(targets, numaID)
+	if activeRealNUMAs.Len() > 0 {
+		resolved, err := machine.ResolveHardPartitionReclaimTargets(
+			dynamicConf,
+			cra.metaServer.CPUTopology,
+			0,
+			func(numaID int) int { return cra.reservedForReclaim[numaID] },
+			nil,
+		)
+		if err != nil {
+			cra.rampUpReclaimCPUSetCap = make(map[int]int)
+			cra.rampUpDomainTargets = domainTargets
+			return fmt.Errorf("resolve active ramp-up reclaim targets: %w", err)
+		}
+		// Keep only the NUMAs that host an active ramp-up source; every other
+		// NUMA keeps its steady reserve and must not inherit a foreign target.
+		for numaID := range resolved {
+			if activeRealNUMAs.Has(numaID) {
+				targets[numaID] = resolved[numaID]
+				scope := provisionassembler.NewNonExclusiveReclaimConstraintScope(numaID)
+				cap := 0
+				if cra.metaServer != nil && cra.metaServer.CPUDetails != nil {
+					cap = cra.metaServer.CPUDetails.CPUsInNUMANodes(numaID).Size()
+				}
+				steadyCap, _ := machine.CalculateAggregateRampUpTarget(cap, maxRatio, cpusPerCore)
+				snDesired := clampDescriptorDesired(resolved[numaID], steadyCap, cra.reservedForReclaim[numaID])
+				domainTargets[scope] = types.ReclaimConstraintTarget{
+					Desired:     snDesired,
+					Floor:       cra.reservedForReclaim[numaID],
+					SteadyCap:   steadyCap,
+					MemberNUMAs: []int{numaID},
+				}
+			}
 		}
 	}
-	// A steady exclusive DNB has already finalized its NUMA partition. Keep
-	// that NUMA at the steady reserve even while another NUMA activates the
-	// ramp-up hard target.
+	// A steady exclusive DNB has already finalized its NUMA partition. Keep that
+	// NUMA at the steady reserve even while another NUMA activates the ramp-up
+	// hard target.
 	for numaID := range steadyExclusiveNUMAs {
 		delete(targets, numaID)
 	}
 
+	// Global (faked) domain: a non-NUMA-binding ramp-up aggregates reclaim over
+	// every non-binding NUMA. The target is derived from the AGGREGATE member
+	// capacity first (whole-core rounding on the aggregate, never per-NUMA
+	// rounding then summing) and then distributed back across the member NUMAs as
+	// complete cores. It only writes onto non-binding NUMAs, so a global ramp-up
+	// cannot leak a reservation onto a dedicated-binding NUMA.
+	if rampUpDomains.Has(commonstate.FakedNUMAID) {
+		globalTargets, desc, err := cra.resolveGlobalRampUpTarget(dynamicConf, maxRatio)
+		if err != nil {
+			// Fail closed: leave the global domain without a ramp-up target
+			// rather than widening reservation across the node. The scope is not
+			// given a descriptor, so the guard leaves its ceiling nil/unconstrained
+			// and the pool keeps its steady size.
+			general.Warningf("rampUpReclaimCPUSetCap: skip global domain target: %v", err)
+			if cra.emitter != nil {
+				_ = cra.emitter.StoreInt64(metricReclaimScopeTargetError, 1, metrics.MetricTypeNameCount,
+					metrics.MetricTag{Key: "scope", Val: string(provisionassembler.NewNonExclusiveReclaimConstraintScope(commonstate.FakedNUMAID))})
+			}
+		} else {
+			for numaID, size := range globalTargets {
+				targets[numaID] = size
+			}
+			scope := provisionassembler.NewNonExclusiveReclaimConstraintScope(commonstate.FakedNUMAID)
+			domainTargets[scope] = types.ReclaimConstraintTarget{
+				Desired:     desc.DesiredTarget,
+				Floor:       desc.ReserveFloor,
+				SteadyCap:   desc.SteadyCap,
+				MemberNUMAs: desc.MemberNUMAs,
+			}
+		}
+	}
+
 	cra.rampUpReclaimCPUSetCap = targets
+	cra.rampUpDomainTargets = domainTargets
 	general.Infof("rampUpReclaimCPUSetCap: %v, ratio %v", targets, dynamicConf.InitialRampUpReclaimCPUSetRatio)
 	return nil
+}
+
+// clampDescriptorDesired reconciles the ramp-up desired with the steady upper
+// bound and the pure floor: desired = min(desired, steadyCap), then max(floor).
+func clampDescriptorDesired(desired, steadyCap, floor int) int {
+	if steadyCap > 0 && desired > steadyCap {
+		desired = steadyCap
+	}
+	if desired < floor {
+		desired = floor
+	}
+	return desired
+}
+
+// resolveGlobalRampUpTarget derives the per-NUMA ramp-up reclaim shares for the
+// global (faked) domain and the full domain descriptor (desired, steady upper
+// bound, pure floor, member NUMAs). Member NUMAs are exactly the non-binding
+// NUMAs; their logical capacities are aggregated, the whole-core-floor target is
+// computed on that aggregate with the shared domain target algorithm, and the
+// result is distributed back across members as complete cores (summing exactly
+// to the aggregate target). A missing topology / empty member set fails closed.
+func (cra *cpuResourceAdvisor) resolveGlobalRampUpTarget(
+	dynamicConf *dynamic.Configuration,
+	maxRatio float64,
+) (map[int]int, machine.RampUpDomainDescriptor, error) {
+	desc := machine.RampUpDomainDescriptor{}
+	if cra.metaServer == nil || cra.metaServer.CPUTopology == nil || cra.metaServer.CPUDetails == nil {
+		return nil, desc, fmt.Errorf("meta server topology unavailable")
+	}
+	memberNUMAs := cra.nonBindingNumas
+	if memberNUMAs.IsEmpty() {
+		return nil, desc, fmt.Errorf("global ramp-up domain has no non-binding NUMAs")
+	}
+	cpusPerCore := cra.metaServer.CPUTopology.CPUsPerCore()
+	memberIDs := memberNUMAs.ToSliceInt()
+	desc.MemberNUMAs = memberIDs
+
+	capacityByNUMA := make(map[int]int, len(memberIDs))
+	aggregateCapacity := 0
+	reserveFloor := 0
+	for _, numaID := range memberIDs {
+		cap := cra.metaServer.CPUDetails.CPUsInNUMANodes(numaID).Size()
+		capacityByNUMA[numaID] = cap
+		aggregateCapacity += cap
+		reserveFloor += cra.reservedForReclaim[numaID]
+	}
+	desc.ReserveFloor = reserveFloor
+
+	// steadyCap = coreAligned(aggregateCapacity * MaxRatio); MaxRatio only caps.
+	steadyCap, err := machine.CalculateAggregateRampUpTarget(aggregateCapacity, maxRatio, cpusPerCore)
+	if err != nil {
+		return nil, desc, fmt.Errorf("global ramp-up steady cap: %w", err)
+	}
+	desc.SteadyCap = steadyCap
+
+	target, err := machine.CalculateAggregateRampUpTarget(
+		aggregateCapacity, dynamicConf.InitialRampUpReclaimCPUSetRatio, cpusPerCore)
+	if err != nil {
+		return nil, desc, fmt.Errorf("global ramp-up aggregate target: %w", err)
+	}
+	desc.DesiredTarget = clampDescriptorDesired(target, steadyCap, reserveFloor)
+	if desc.DesiredTarget == 0 {
+		return map[int]int{}, desc, nil
+	}
+
+	baselineByNUMA := make(map[int]int, len(memberIDs))
+	for _, numaID := range memberIDs {
+		baselineByNUMA[numaID] = cra.reservedForReclaim[numaID]
+	}
+	distributed, err := machine.DistributeDomainTarget(desc.DesiredTarget, capacityByNUMA, baselineByNUMA, cpusPerCore)
+	if err != nil {
+		return nil, desc, fmt.Errorf("global ramp-up distribute: %w", err)
+	}
+	return distributed, desc, nil
 }
 
 func (cra *cpuResourceAdvisor) getNumasReservedForAllocate(dynamicConf *dynamic.Configuration, numas machine.CPUSet) float64 {
@@ -298,12 +417,13 @@ func (cra *cpuResourceAdvisor) getNumasReservedForAllocate(dynamicConf *dynamic.
 	return float64(reserved.Value()*int64(numas.Size())) / float64(cra.metaServer.NumNUMANodes)
 }
 
+// getEffectiveReservedForReclaim returns the pure steady reservation floor for a
+// NUMA. It is never raised by the ramp-up hard target: the ramp-up target is the
+// desired value tracked by the optional per-scope ceiling, not a floor. Raising
+// the floor here would pin the reclaim pool to the ramp-up target and bypass the
+// slow ceiling state machine.
 func (cra *cpuResourceAdvisor) getEffectiveReservedForReclaim(numaID int) int {
-	steady := cra.reservedForReclaim[numaID]
-	if target, ok := cra.rampUpReclaimCPUSetCap[numaID]; ok {
-		return general.Max(steady, target)
-	}
-	return steady
+	return cra.reservedForReclaim[numaID]
 }
 
 func (cra *cpuResourceAdvisor) getRegionMaxRequirement(

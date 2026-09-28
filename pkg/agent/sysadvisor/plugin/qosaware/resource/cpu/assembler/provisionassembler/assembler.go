@@ -50,10 +50,15 @@ type ProvisionContext struct {
 	// cycle start (FakedNUMAID -1 denotes the global/non-binding domain).
 	RampUpDomains     []int
 	ReclaimConstraint ReclaimConstraint
-	ReclaimCeilings   map[ReclaimConstraintScope]int
-	// ReclaimActiveScopes identifies the scopes that host an active ramp-up domain
-	// in the current cycle.
+	ReclaimCeilings   map[ReclaimConstraintScope]*int
+	// ReclaimActiveScopes identifies the scopes that are constrained this cycle
+	// (actively ramped scopes plus scopes still draining back to steadyCap).
 	ReclaimActiveScopes map[ReclaimConstraintScope]bool
+	// ReclaimDomainTargets carries the per-scope descriptive contract built from the
+	// ramp-up domains this cycle: the ramp-up Desired, the steady reservation Floor,
+	// the steady upper SteadyCap and the member NUMAs. It is recorded into the result
+	// for the guard commit and diagnostics; the assembler claps only to Ceilings.
+	ReclaimDomainTargets map[ReclaimConstraintScope]types.ReclaimConstraintTarget
 	// LiveReclaimByNUMA is the QRM-committed reclaim pool cpuset size per NUMA
 	// at cycle start. It is a best-effort lower bound: when a real-NUMA ramp-up
 	// domain is active and capacity allows, the assembler keeps reclaim at least

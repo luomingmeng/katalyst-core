@@ -353,8 +353,12 @@ func TestCPUResourceAdvisorUsesActiveHardTargetForRegionEssentials(t *testing.T)
 		numRegionsPerNuma:      map[int]int{0: 1},
 	}
 
-	require.Equal(t, float64(26), advisor.getRegionMaxRequirement(shareRegion, nil, nil))
-	require.Equal(t, float64(6), advisor.getRegionReservedForReclaim(shareRegion))
+	// The reservation floor is the pure steady reserve (2); the ramp-up hard cap
+	// (6) is the desired tracked by the optional per-scope ceiling and must NOT
+	// widen the floor. So the region keeps 32-2=30 available and the reserved
+	// amount reported back is the steady 2, not the ramp-up target 6.
+	require.Equal(t, float64(30), advisor.getRegionMaxRequirement(shareRegion, nil, nil))
+	require.Equal(t, float64(2), advisor.getRegionReservedForReclaim(shareRegion))
 }
 
 func TestAdvisorUpdateHardPartitionNUMAAvailability(t *testing.T) {
@@ -2376,4 +2380,112 @@ func TestCPUAdvisorRampUpDomainsCrossDomain8NUMAs(t *testing.T) {
 		require.False(t, result.RampUpActive)
 		require.False(t, result.RampUpHardPartitionActive)
 	})
+}
+
+// newProductionLikeSMT2MetaServer builds an 8-NUMA node with 24 logical CPUs per
+// NUMA (12 physical cores, SMT2), mirroring the production node's shape.
+func newProductionLikeSMT2MetaServer() *metaserver.MetaServer {
+	const (
+		numNUMAs     = 8
+		cpusPerNuma  = 24
+		cpusPerCore  = 2
+		coresPerNuma = cpusPerNuma / cpusPerCore
+	)
+	cpuDetails := machine.CPUDetails{}
+	cpuID := 0
+	for numa := 0; numa < numNUMAs; numa++ {
+		for core := 0; core < coresPerNuma; core++ {
+			coreID := numa*coresPerNuma + core
+			for sib := 0; sib < cpusPerCore; sib++ {
+				cpuDetails[cpuID] = machine.CPUTopoInfo{NUMANodeID: numa, CoreID: coreID}
+				cpuID++
+			}
+		}
+	}
+	return &metaserver.MetaServer{
+		MetaAgent: &agent.MetaAgent{
+			KatalystMachineInfo: &machine.KatalystMachineInfo{
+				CPUTopology: &machine.CPUTopology{
+					NumCPUs:      numNUMAs * cpusPerNuma,
+					NumCores:     numNUMAs * coresPerNuma,
+					NumSockets:   1,
+					NumNUMANodes: numNUMAs,
+					CPUDetails:   cpuDetails,
+				},
+			},
+		},
+	}
+}
+
+// TestUpdateRampUpReclaimCPUSetCapGlobalDomainAggregatesBeforeRounding drives the
+// real advisor cap derivation on a production-shaped node (binding NUMAs 0/3/7,
+// non-binding 1/2/4/5/6 = 120 logical CPUs, SMT2) and checks that a global
+// (faked) ramp-up derives the whole-core aggregate target 120*0.2=24 and distributes
+// it back across the non-binding NUMAs as complete cores, without touching the
+// binding NUMAs.
+func TestUpdateRampUpReclaimCPUSetCapGlobalDomainAggregatesBeforeRounding(t *testing.T) {
+	bindingNUMAs := sets.NewInt(0, 3, 7)
+	nonBinding := machine.NewCPUSet(1, 2, 4, 5, 6)
+
+	cra := &cpuResourceAdvisor{
+		metaServer:         newProductionLikeSMT2MetaServer(),
+		nonBindingNumas:    nonBinding,
+		reservedForReclaim: map[int]int{0: 2, 1: 2, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2, 7: 2},
+	}
+	dynConf := dynamic.NewConfiguration()
+	dynConf.EnableReclaim = true
+	dynConf.EnableRampUpReclaimHardPartition = true
+	dynConf.InitialRampUpReclaimCPUSetRatio = 0.2
+
+	domains := sets.NewInt(commonstate.FakedNUMAID)
+	require.NoError(t, cra.updateRampUpReclaimCPUSetCap(dynConf, true, sets.NewInt(), domains))
+
+	cap := cra.rampUpReclaimCPUSetCap
+	require.NotEmpty(t, cap, "global ramp-up must produce a per-NUMA cap map")
+
+	total := 0
+	for numaID, size := range cap {
+		require.False(t, bindingNUMAs.Has(numaID),
+			"global ramp-up must not write onto binding NUMA %d", numaID)
+		require.Equal(t, 0, size%2, "NUMA%d share must be whole-core, got %d", numaID, size)
+		total += size
+	}
+	require.Equal(t, 24, total, "aggregate target must be whole-core-floor(120*0.2)=24")
+
+	// Deterministic water-fill: 5 equal 24-CPU members, baseline 2 each (sum 10),
+	// remaining 14 CPUs = 7 cores -> first two NUMAs get an extra core each.
+	require.Equal(t, map[int]int{1: 6, 2: 6, 4: 4, 5: 4, 6: 4}, cap)
+}
+
+// TestUpdateRampUpReclaimCPUSetCapGlobalAndPartitionCoexist checks the global and
+// a NUMA-binding domain derive independent targets in the same cycle: the global
+// aggregate lands on non-binding NUMAs, while the binding NUMA keeps its own local
+// target and is not pulled into the global distribution.
+func TestUpdateRampUpReclaimCPUSetCapGlobalAndPartitionCoexist(t *testing.T) {
+	nonBinding := machine.NewCPUSet(1, 2, 4, 5, 6)
+	cra := &cpuResourceAdvisor{
+		metaServer:         newProductionLikeSMT2MetaServer(),
+		nonBindingNumas:    nonBinding,
+		reservedForReclaim: map[int]int{0: 2, 1: 2, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2, 7: 2},
+	}
+	dynConf := dynamic.NewConfiguration()
+	dynConf.EnableReclaim = true
+	dynConf.EnableRampUpReclaimHardPartition = true
+	dynConf.InitialRampUpReclaimCPUSetRatio = 0.2
+
+	// Global domain plus a binding ramp-up on NUMA 7.
+	domains := sets.NewInt(commonstate.FakedNUMAID, 7)
+	require.NoError(t, cra.updateRampUpReclaimCPUSetCap(dynConf, true, sets.NewInt(), domains))
+
+	cap := cra.rampUpReclaimCPUSetCap
+	require.Contains(t, cap, 7, "NUMA7 keeps its own local ramp-up target")
+	globalTotal := 0
+	for numaID, size := range cap {
+		if numaID == 7 {
+			continue
+		}
+		require.False(t, sets.NewInt(0, 3, 7).Has(numaID), "global target must not touch binding NUMA %d", numaID)
+		globalTotal += size
+	}
+	require.Equal(t, 24, globalTotal, "non-binding NUMAs still sum to the global aggregate target")
 }

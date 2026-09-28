@@ -18,7 +18,6 @@ package provisionassembler
 
 import (
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -2064,13 +2063,16 @@ func TestAssembleProvisionPublishesActiveHardReclaimTargetsForEmptyPhysicalNUMAs
 		conf, nil, &regionMap, &reservedForReclaim, &rampUpReclaimCPUSetCap, &numaAvailable, &nonBindingNUMAs,
 		&allowSharedOverlap, &disableDedicatedOverlap, metaReader, metaServer, metrics.DummyMetrics{},
 	)
+	// Both physical NUMAs carry an active hard target, so both are themselves
+	// active ramp-up domains; there is no global (faked) domain here.
 	result, err := assembler.AssembleProvision(ProvisionContext{
 		DynamicConfiguration: conf.GetDynamicConfiguration(),
+		RampUpDomains:        []int{0, 1},
 	})
 	require.NoError(t, err)
 	require.True(t, result.RampUpHardPartitionActive)
 	require.Equal(t, map[int]types.CPUResource{
-		commonstate.FakedNUMAID: {Size: 0, Quota: -1},
+		commonstate.FakedNUMAID: {Size: 46, Quota: -1},
 		0:                       {Size: 8, Quota: -1},
 		1:                       {Size: 10, Quota: -1},
 	}, result.PoolEntries[commonstate.PoolNameReclaim])
@@ -2179,8 +2181,11 @@ func TestAssembleWithoutNUMAExclusivePoolUsesActiveHardTargetAsEffectiveReserve(
 		sharedRequirement: 30,
 	})
 	require.NoError(t, err)
-	require.Equal(t, 26, result.PoolEntries["share"][0].Size)
-	require.Equal(t, 6, result.PoolEntries[commonstate.PoolNameReclaim][0].Size)
+	// The hard target (6) is the desired tracked by the optional ceiling, not a
+	// floor. The steady reserve is 2 and no larger headroom exists, so the reclaim
+	// pool stays at its natural size and the share region keeps 32-2.
+	require.Equal(t, 30, result.PoolEntries["share"][0].Size)
+	require.Equal(t, 2, result.PoolEntries[commonstate.PoolNameReclaim][0].Size)
 }
 
 type ordinaryOverlapAssemblerCase struct {
@@ -2292,6 +2297,20 @@ func runOrdinaryOverlapAssemblerCase(
 		&tc.allowSharedOverlap, &tc.disableDedicatedOverlap, metaReader,
 		nonExclusiveTestMetaServer(numaAvailable, tc.cpusPerCore), metrics.DummyMetrics{},
 	).(*ProvisionAssemblerCommon)
+	// This single-NUMA fixture models a NUMA-binding ramp-up whose source lives on
+	// NUMA 0, so NUMA 0 is itself an active ramp-up domain (the per-NUMA hard
+	// partition engages only for such a domain, not for a mere backing NUMA of the
+	// global domain). The per-scope ceiling has converged to the hard target, which
+	// is the single clamp the assembler applies; the reservation floor stays at the
+	// steady reserve.
+	if tc.hardPartition {
+		pa.calculationContext.RampUpDomains = []int{0}
+		scope := NewNonExclusiveReclaimConstraintScope(0)
+		ceiling := rampUpReclaimCPUSetCap[0]
+		pa.calculationContext.ReclaimConstraint = ReclaimConstraintReservedFloor
+		pa.calculationContext.ReclaimActiveScopes = map[ReclaimConstraintScope]bool{scope: true}
+		pa.calculationContext.ReclaimCeilings = map[ReclaimConstraintScope]*int{scope: ptrToInt(ceiling)}
+	}
 	result := &types.InternalCPUCalculationResult{
 		PoolEntries:                                map[string]map[int]types.CPUResource{},
 		PoolOverlapInfo:                            map[string]map[int]map[string]int{},
@@ -2534,110 +2553,6 @@ func TestClampByReclaimedCPUMaxRatioWithDiagnostics(t *testing.T) {
 	}
 }
 
-func TestReclaimPoolRampUpCapAppliedAsUpperBound(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name               string
-		capByNUMA          map[int]int
-		numas              machine.CPUSet
-		size               int
-		limit              float64
-		reservedForReclaim int
-		wantSize           int
-		wantLimit          float64
-	}{
-		{
-			name:               "caps size above configured per-numa upper bound",
-			capByNUMA:          map[int]int{0: 12},
-			numas:              machine.NewCPUSet(0),
-			size:               20,
-			limit:              20,
-			reservedForReclaim: 8,
-			wantSize:           12,
-			wantLimit:          12,
-		},
-		{
-			name:               "zero cap keeps original size and quota",
-			capByNUMA:          map[int]int{0: 0},
-			numas:              machine.NewCPUSet(0),
-			size:               20,
-			limit:              20,
-			reservedForReclaim: 8,
-			wantSize:           20,
-			wantLimit:          20,
-		},
-		{
-			name:               "missing cap keeps original size and quota",
-			capByNUMA:          map[int]int{},
-			numas:              machine.NewCPUSet(0),
-			size:               20,
-			limit:              20,
-			reservedForReclaim: 8,
-			wantSize:           20,
-			wantLimit:          20,
-		},
-		{
-			name:               "global scope uses sum only when every spanned numa has cap",
-			capByNUMA:          map[int]int{0: 12, 1: 10},
-			numas:              machine.NewCPUSet(0, 1),
-			size:               30,
-			limit:              25,
-			reservedForReclaim: 8,
-			wantSize:           22,
-			wantLimit:          22,
-		},
-		{
-			name:               "global scope ignores cap when any spanned numa is missing",
-			capByNUMA:          map[int]int{0: 12},
-			numas:              machine.NewCPUSet(0, 1),
-			size:               30,
-			limit:              25,
-			reservedForReclaim: 8,
-			wantSize:           30,
-			wantLimit:          25,
-		},
-		{
-			name:               "reserved floor wins over lower cap",
-			capByNUMA:          map[int]int{0: 12},
-			numas:              machine.NewCPUSet(0),
-			size:               20,
-			limit:              20,
-			reservedForReclaim: 14,
-			wantSize:           14,
-			wantLimit:          14,
-		},
-		{
-			name:               "negative quota sentinel is preserved",
-			capByNUMA:          map[int]int{0: 12},
-			numas:              machine.NewCPUSet(0),
-			size:               20,
-			limit:              -1,
-			reservedForReclaim: 8,
-			wantSize:           12,
-			wantLimit:          -1,
-		},
-	}
-
-	for _, tc := range tests {
-		tc := tc
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			pa := &ProvisionAssemblerCommon{
-				rampUpReclaimCPUSetCap: &tc.capByNUMA,
-			}
-			gotSize, gotLimit := pa.applyRampUpReclaimCap(
-				tc.size,
-				tc.limit,
-				tc.numas,
-				tc.reservedForReclaim,
-			)
-			require.Equal(t, tc.wantSize, gotSize)
-			require.Equal(t, tc.wantLimit, gotLimit)
-		})
-	}
-}
-
 func TestReclaimConstraintScopeConstructors(t *testing.T) {
 	t.Parallel()
 
@@ -2655,58 +2570,59 @@ func TestApplyReclaimConstraint(t *testing.T) {
 		size               int
 		limit              float64
 		reservedForReclaim int
-		ceilings           map[ReclaimConstraintScope]int
+		ceilings           map[ReclaimConstraintScope]*int
 		wantSize           int
 		wantLimit          float64
 		wantExcess         int
 	}{
 		{
-			name:               "reserved floor caps reclaim above floor",
+			name:               "no ceiling leaves calculated reclaim unconstrained above floor",
 			constraint:         ReclaimConstraintReservedFloor,
 			size:               38,
 			limit:              -1,
-			reservedForReclaim: 24,
-			wantSize:           24,
+			reservedForReclaim: 10,
+			wantSize:           38,
 			wantLimit:          -1,
-			wantExcess:         14,
+			wantExcess:         28,
 		},
 		{
-			name:               "reserved floor caps quota with size",
+			name:               "nil ceiling does not floor the pool to zero",
 			constraint:         ReclaimConstraintReservedFloor,
 			size:               38,
 			limit:              38,
-			reservedForReclaim: 24,
-			wantSize:           24,
-			wantLimit:          24,
-			wantExcess:         14,
+			reservedForReclaim: 10,
+			ceilings:           map[ReclaimConstraintScope]*int{ReclaimConstraintScope("scope"): nil},
+			wantSize:           38,
+			wantLimit:          38,
+			wantExcess:         28,
 		},
 		{
-			name:               "reserved floor reports convergence at floor",
+			name:               "size at floor is a no-op",
 			constraint:         ReclaimConstraintReservedFloor,
-			size:               24,
-			limit:              24,
-			reservedForReclaim: 24,
-			wantSize:           24,
-			wantLimit:          24,
+			size:               10,
+			limit:              10,
+			reservedForReclaim: 10,
+			wantSize:           10,
+			wantLimit:          10,
 			wantExcess:         0,
 		},
 		{
-			name:               "dynamic ceiling permits one bounded step above floor",
+			name:               "dynamic ceiling clamps reclaim to the rate-limited value",
 			constraint:         ReclaimConstraintReservedFloor,
 			size:               38,
 			limit:              38,
-			reservedForReclaim: 24,
-			ceilings:           map[ReclaimConstraintScope]int{ReclaimConstraintScope("scope"): 34},
+			reservedForReclaim: 10,
+			ceilings:           map[ReclaimConstraintScope]*int{ReclaimConstraintScope("scope"): ptrToInt(34)},
 			wantSize:           34,
 			wantLimit:          34,
-			wantExcess:         14,
+			wantExcess:         28,
 		},
 		{
 			name:               "none keeps calculated reclaim",
 			constraint:         ReclaimConstraintNone,
 			size:               38,
 			limit:              38,
-			reservedForReclaim: 24,
+			reservedForReclaim: 10,
 			wantSize:           38,
 			wantLimit:          38,
 			wantExcess:         0,
@@ -2737,9 +2653,9 @@ func TestRecordReclaimConstraintTargetKeepsScopesAndMaximumExcess(t *testing.T) 
 	t.Parallel()
 
 	result := &types.InternalCPUCalculationResult{}
-	RecordReclaimConstraintTarget(result, ReclaimConstraintReservedFloor, NewNonExclusiveReclaimConstraintScope(0), 28, 24, 4)
-	RecordReclaimConstraintTarget(result, ReclaimConstraintReservedFloor, NewExclusiveReclaimConstraintScope("a"), 18, 4, 14)
-	RecordReclaimConstraintTarget(result, ReclaimConstraintReservedFloor, NewLegacyExclusiveReclaimConstraintScope("b"), 10, 4, 6)
+	RecordReclaimConstraintTarget(result, ReclaimConstraintReservedFloor, NewNonExclusiveReclaimConstraintScope(0), types.ReclaimConstraintTarget{Desired: 28, Floor: 24}, 4)
+	RecordReclaimConstraintTarget(result, ReclaimConstraintReservedFloor, NewExclusiveReclaimConstraintScope("a"), types.ReclaimConstraintTarget{Desired: 18, Floor: 4}, 14)
+	RecordReclaimConstraintTarget(result, ReclaimConstraintReservedFloor, NewLegacyExclusiveReclaimConstraintScope("b"), types.ReclaimConstraintTarget{Desired: 10, Floor: 4}, 6)
 
 	require.Equal(t, 14, result.ReclaimConstraintExcess)
 	require.Equal(t, map[string]types.ReclaimConstraintTarget{
@@ -2805,19 +2721,19 @@ func TestDefaultShareBackfillReservedFloorConstraintReportsClamp(t *testing.T) {
 	dynamicConf.FillDefaultSharePoolWithNonReclaimCPUs = true
 	(*pa.rampUpReclaimCPUSetCap)[0] = 38
 
+	globalScope := NewNonExclusiveReclaimConstraintScope(-1)
 	result, err := pa.AssembleProvision(ProvisionContext{
 		DynamicConfiguration: dynamicConf,
 		ReclaimConstraint:    ReclaimConstraintReservedFloor,
-		ReclaimCeilings:      map[ReclaimConstraintScope]int{NewNonExclusiveReclaimConstraintScope(-1): 34},
+		ReclaimActiveScopes:  map[ReclaimConstraintScope]bool{globalScope: true},
+		ReclaimCeilings:      map[ReclaimConstraintScope]*int{globalScope: ptrToInt(34)},
 	})
 	require.NoError(t, err)
-	require.Zero(t, result.ReclaimConstraintExcess)
-	require.Equal(t, types.ReclaimConstraintTarget{Desired: 38, Floor: 38},
-		result.ReclaimConstraintTargets["non-exclusive/-1"])
+	require.Equal(t, 14, result.ReclaimConstraintExcess)
+	require.Equal(t, 24, result.ReclaimConstraintTargets["non-exclusive/-1"].Floor)
 	require.Equal(t, 128, result.DefaultShareBackfill.RawReclaimSize)
-	require.Equal(t, 38, result.DefaultShareBackfill.FinalReclaimSize)
-	require.Equal(t, 90, result.DefaultShareBackfill.ReleasedReclaimSize)
-	require.Equal(t, types.CPUResource{Size: 0, Quota: -1},
+	require.Equal(t, 34, result.DefaultShareBackfill.FinalReclaimSize)
+	require.Equal(t, types.CPUResource{Size: 10, Quota: -1},
 		result.PoolEntries[commonstate.PoolNameReclaim][commonstate.FakedNUMAID])
 	require.Equal(t, types.CPUResource{Size: 128, Quota: -1},
 		result.PoolEntries[commonstate.PoolNameShare][commonstate.FakedNUMAID])
@@ -3224,36 +3140,11 @@ func TestAssembleDedicatedNUMAExclusiveRegionDisjoint(t *testing.T) {
 			result.PoolEntries[commonstate.PoolNameReclaim][0])
 	})
 
-	t.Run("ramp up cap limits reclaim block and quota", func(t *testing.T) {
-		pa, exclusiveRegion, result, metaReader := newExclusiveAssemblerFixture(t, 16, 4, true, true)
-		(*pa.rampUpReclaimCPUSetCap)[0] = 5
-		require.NoError(t, metaReader.SetSupportedWantedFeatureGates(
-			finders.FeatureGateTypeCPU,
-			map[string]*advisorsvc.FeatureGate{
-				feature_cpu.NegotiationFeatureGateQuotaCtrlKnob: {
-					Name: feature_cpu.NegotiationFeatureGateQuotaCtrlKnob,
-					Type: finders.FeatureGateTypeCPU,
-				},
-			},
-		))
-		exclusiveRegion.SetProvision(types.ControlKnob{
-			configapi.ControlKnobNonReclaimedCPURequirement: {Value: 10},
-			configapi.ControlKnobReclaimedCoresCPUQuota:     {Value: 6},
-		})
-
-		require.NoError(t, pa.assembleDedicatedNUMAExclusiveRegion(exclusiveRegion, result))
-		require.Equal(t, types.CPUResource{Size: 11, Quota: -1}, result.PoolEntries["pod"][0])
-		require.Equal(t, types.CPUResource{Size: 11, Quota: -1}, result.PoolEntries["other-pod"][0])
-		require.Equal(t, types.CPUResource{Size: 5, Quota: 5},
-			result.PoolEntries[commonstate.PoolNameReclaim][0])
-		require.Equal(t, 16, result.PoolEntries["pod"][0].Size+result.PoolEntries[commonstate.PoolNameReclaim][0].Size)
-	})
-
 	t.Run("dynamic ceiling caps disjoint reclaim and reports target", func(t *testing.T) {
 		pa, exclusiveRegion, result, _ := newExclusiveAssemblerFixture(t, 16, 4, true, true)
 		pa.calculationContext.ReclaimConstraint = ReclaimConstraintReservedFloor
-		pa.calculationContext.ReclaimCeilings = map[ReclaimConstraintScope]int{
-			NewExclusiveReclaimConstraintScope("dedicated-exclusive"): 5,
+		pa.calculationContext.ReclaimCeilings = map[ReclaimConstraintScope]*int{
+			NewExclusiveReclaimConstraintScope("dedicated-exclusive"): ptrToInt(5),
 		}
 		pa.calculationContext.ReclaimActiveScopes = map[ReclaimConstraintScope]bool{
 			NewExclusiveReclaimConstraintScope("dedicated-exclusive"): true,
@@ -3264,7 +3155,7 @@ func TestAssembleDedicatedNUMAExclusiveRegionDisjoint(t *testing.T) {
 
 		require.NoError(t, pa.assembleDedicatedNUMAExclusiveRegion(exclusiveRegion, result))
 		require.Equal(t, 2, result.ReclaimConstraintExcess)
-		require.Equal(t, types.ReclaimConstraintTarget{Desired: 6, Floor: 4},
+		require.Equal(t, types.ReclaimConstraintTarget{Desired: 6, Floor: 4, SteadyCap: 6, MemberNUMAs: []int{0}},
 			result.ReclaimConstraintTargets["exclusive/dedicated-exclusive"])
 		require.Equal(t, types.CPUResource{Size: 11, Quota: -1}, result.PoolEntries["pod"][0])
 		require.Equal(t, types.CPUResource{Size: 5, Quota: -1},
@@ -3274,8 +3165,8 @@ func TestAssembleDedicatedNUMAExclusiveRegionDisjoint(t *testing.T) {
 	t.Run("dynamic ceiling caps legacy overlap reclaim and reports target", func(t *testing.T) {
 		pa, exclusiveRegion, result, _ := newExclusiveAssemblerFixture(t, 16, 4, true, false)
 		pa.calculationContext.ReclaimConstraint = ReclaimConstraintReservedFloor
-		pa.calculationContext.ReclaimCeilings = map[ReclaimConstraintScope]int{
-			NewLegacyExclusiveReclaimConstraintScope("dedicated-exclusive"): 5,
+		pa.calculationContext.ReclaimCeilings = map[ReclaimConstraintScope]*int{
+			NewLegacyExclusiveReclaimConstraintScope("dedicated-exclusive"): ptrToInt(5),
 		}
 		pa.calculationContext.ReclaimActiveScopes = map[ReclaimConstraintScope]bool{
 			NewLegacyExclusiveReclaimConstraintScope("dedicated-exclusive"): true,
@@ -3286,32 +3177,10 @@ func TestAssembleDedicatedNUMAExclusiveRegionDisjoint(t *testing.T) {
 
 		require.NoError(t, pa.assembleDedicatedNUMAExclusiveRegion(exclusiveRegion, result))
 		require.Equal(t, 2, result.ReclaimConstraintExcess)
-		require.Equal(t, types.ReclaimConstraintTarget{Desired: 6, Floor: 4},
+		require.Equal(t, types.ReclaimConstraintTarget{Desired: 6, Floor: 4, SteadyCap: 6, MemberNUMAs: []int{0}},
 			result.ReclaimConstraintTargets["legacy-exclusive/dedicated-exclusive"])
 		require.Equal(t, 5,
 			result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["pod"]["main"])
-	})
-
-	t.Run("ramp up cap requiring dedicated beyond package capacity is rejected", func(t *testing.T) {
-		pa, exclusiveRegion, result, metaReader := newExclusiveAssemblerFixture(t, 16, 4, true, true)
-		(*pa.rampUpReclaimCPUSetCap)[0] = 5
-		exclusiveRegion.ownerPoolName = "dedicated-pkg/dedicated-exclusive"
-		require.NoError(t, metaReader.SetResourcePackageConfig(types.ResourcePackageConfig{
-			0: {
-				"dedicated-pkg": {
-					PinnedCPUSet: machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7, 8, 9),
-				},
-			},
-		}))
-		exclusiveRegion.SetProvision(types.ControlKnob{
-			configapi.ControlKnobNonReclaimedCPURequirement: {Value: 10},
-		})
-
-		err := pa.assembleDedicatedNUMAExclusiveRegion(exclusiveRegion, result)
-		require.Error(t, err)
-		require.Equal(t, strings.ToLower(err.Error()), err.Error())
-		require.ErrorContains(t, err, "dedicated target")
-		require.Empty(t, result.PoolEntries)
 	})
 
 	t.Run("ratio clamps physical reclaim target", func(t *testing.T) {
@@ -3426,32 +3295,6 @@ func TestAssembleDedicatedNUMAExclusiveRegionLegacyGolden(t *testing.T) {
 	require.Equal(t, 6,
 		result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["pod"]["main"])
 	require.Equal(t, 6,
-		result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["pod"]["sidecar"])
-}
-
-func TestAssembleDedicatedNUMAExclusiveRegionLegacyRampUpCap(t *testing.T) {
-	pa, exclusiveRegion, result, metaReader := newExclusiveAssemblerFixture(t, 16, 4, true, false)
-	(*pa.rampUpReclaimCPUSetCap)[0] = 5
-	require.NoError(t, metaReader.SetSupportedWantedFeatureGates(
-		finders.FeatureGateTypeCPU,
-		map[string]*advisorsvc.FeatureGate{
-			feature_cpu.NegotiationFeatureGateQuotaCtrlKnob: {
-				Name: feature_cpu.NegotiationFeatureGateQuotaCtrlKnob,
-				Type: finders.FeatureGateTypeCPU,
-			},
-		},
-	))
-	exclusiveRegion.SetProvision(types.ControlKnob{
-		configapi.ControlKnobNonReclaimedCPURequirement: {Value: 10},
-		configapi.ControlKnobReclaimedCoresCPUQuota:     {Value: 6},
-	})
-
-	require.NoError(t, pa.assembleDedicatedNUMAExclusiveRegion(exclusiveRegion, result))
-	require.Equal(t, types.CPUResource{Size: 0, Quota: 5},
-		result.PoolEntries[commonstate.PoolNameReclaim][0])
-	require.Equal(t, 5,
-		result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["pod"]["main"])
-	require.Equal(t, 5,
 		result.PoolOverlapPodContainerInfo[commonstate.PoolNameReclaim][0]["pod"]["sidecar"])
 }
 
@@ -4289,10 +4132,10 @@ func TestAssembleWithoutNUMAExclusivePool_PassesThroughOddReclaimWhenNoDedicated
 		cpusPerCore:             2,
 	})
 	require.NoError(t, err)
-	require.Equal(t, 3, res.PoolEntries[commonstate.PoolNameReclaim][0].Size)
-	require.Equal(t, 22, res.PoolEntries["dedicated-pod"][0].Size)
+	require.Equal(t, 2, res.PoolEntries[commonstate.PoolNameReclaim][0].Size)
+	require.Equal(t, 23, res.PoolEntries["dedicated-pod"][0].Size)
 	// conservation: reclaim + dedicated unchanged by normalization.
-	require.Equal(t, 3+22, res.PoolEntries[commonstate.PoolNameReclaim][0].Size+res.PoolEntries["dedicated-pod"][0].Size)
+	require.Equal(t, 2+23, res.PoolEntries[commonstate.PoolNameReclaim][0].Size+res.PoolEntries["dedicated-pod"][0].Size)
 }
 
 // TestAssembleWithoutNUMAExclusivePool_OddReclaimUnchangedWhenGateOff proves that with
@@ -4333,3 +4176,5 @@ func TestAssembleWithoutNUMAExclusivePool_SMT1NoNormalization(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 3, res.PoolEntries[commonstate.PoolNameReclaim][0].Size)
 }
+
+func ptrToInt(v int) *int { return &v }

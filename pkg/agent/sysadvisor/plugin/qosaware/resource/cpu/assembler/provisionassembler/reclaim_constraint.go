@@ -47,13 +47,18 @@ func NewLegacyExclusiveReclaimConstraintScope(regionName string) ReclaimConstrai
 }
 
 // ApplyReclaimConstraint clamps size and a non-negative quota limit to the
-// reserved floor or the scope's dynamic ceiling. Only scopes listed in
-// activeScopes are constrained; every other scope passes through untouched so
-// a ramp-up on one NUMA cannot compress the reclaim pool of an unrelated
-// (dedicated) NUMA. A nil ceilings or activeScopes map is valid and behaves
-// as if no dynamic ceiling / no active scope were configured.
+// optional, rate-limited per-scope ceiling. Only scopes listed in activeScopes
+// are constrained; every other scope passes through untouched so a ramp-up on
+// one NUMA cannot compress the reclaim pool of an unrelated (dedicated) NUMA.
+//
+// The ceiling is *int: a nil (or absent) ceiling means "unconstrained" and the
+// pool keeps its steady (MaxRatio) size -- an unknown or unavailable target must
+// never be treated as 0 nor floored to an arbitrary value. reservedForReclaim is
+// the pure steady reservation floor; once size is already at/below it the
+// ceiling is a no-op and excess is zero. A nil ceilings or activeScopes map is
+// valid and behaves as if no dynamic ceiling / no active scope were configured.
 func ApplyReclaimConstraint(scope ReclaimConstraintScope, size int, limit float64, reservedForReclaim int,
-	constraint ReclaimConstraint, ceilings map[ReclaimConstraintScope]int,
+	constraint ReclaimConstraint, ceilings map[ReclaimConstraintScope]*int,
 	activeScopes map[ReclaimConstraintScope]bool,
 ) (int, float64, int) {
 	if constraint != ReclaimConstraintReservedFloor || !activeScopes[scope] || size <= reservedForReclaim {
@@ -61,12 +66,14 @@ func ApplyReclaimConstraint(scope ReclaimConstraintScope, size int, limit float6
 	}
 
 	excess := general.Max(size-reservedForReclaim, 0)
-	ceiling := reservedForReclaim
-	if configured, ok := ceilings[scope]; ok {
-		ceiling = general.Max(ceiling, configured)
-	}
-	if size > ceiling {
-		size = ceiling
+	if configured, ok := ceilings[scope]; ok && configured != nil {
+		upper := *configured
+		if upper < reservedForReclaim {
+			upper = reservedForReclaim
+		}
+		if size > upper {
+			size = upper
+		}
 	}
 	if limit >= 0 && limit > float64(size) {
 		limit = float64(size)
@@ -74,11 +81,15 @@ func ApplyReclaimConstraint(scope ReclaimConstraintScope, size int, limit float6
 	return size, limit, excess
 }
 
-// RecordReclaimConstraintTarget records the unconstrained target and floor for
-// one scope and retains the maximum excess across all scopes. It initializes a
-// nil target map and safely ignores a nil result.
+// RecordReclaimConstraintTarget records the unconstrained desired target, the
+// steady reservation floor, the steady upper bound, the optional rate-limited
+// ceiling and the member NUMA set for one scope, and retains the maximum excess
+// across all scopes. It initializes a nil target map and safely ignores a nil
+// result. The recorded target is the descriptive contract consumed by the
+// constraint guard commit and by diagnostic metrics; it never feeds back into
+// this cycle's quantity decision (the assembler is the only quantity boundary).
 func RecordReclaimConstraintTarget(result *types.InternalCPUCalculationResult, constraint ReclaimConstraint,
-	scope ReclaimConstraintScope, desired, floor, excess int,
+	scope ReclaimConstraintScope, target types.ReclaimConstraintTarget, excess int,
 ) {
 	if result == nil || constraint != ReclaimConstraintReservedFloor {
 		return
@@ -86,9 +97,6 @@ func RecordReclaimConstraintTarget(result *types.InternalCPUCalculationResult, c
 	if result.ReclaimConstraintTargets == nil {
 		result.ReclaimConstraintTargets = make(map[string]types.ReclaimConstraintTarget)
 	}
-	result.ReclaimConstraintTargets[string(scope)] = types.ReclaimConstraintTarget{
-		Desired: desired,
-		Floor:   floor,
-	}
+	result.ReclaimConstraintTargets[string(scope)] = target
 	result.ReclaimConstraintExcess = general.Max(result.ReclaimConstraintExcess, excess)
 }
