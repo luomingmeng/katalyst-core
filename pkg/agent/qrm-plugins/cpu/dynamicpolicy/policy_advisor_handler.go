@@ -2401,6 +2401,13 @@ func (p *DynamicPolicy) applyBlocksWithDynamicConfig(
 			rampUpCPUs.String(), err)
 	}
 
+	// preservedSNBRampUp records the unadvised shared-numa-binding ramp-up
+	// allocations that keep their current allocation in the loop below. The
+	// rematerialization step needs this to tell them apart from advised SNB
+	// ramp-up allocations, because both carry OwnerPoolName ==
+	// EmptyOwnerPoolName in newEntries after the loop.
+	preservedSNBRampUp := make(map[string]map[string]struct{})
+
 	// deal with blocks of reclaimed_cores and share_cores
 	for podUID, containerEntries := range curEntries {
 		if containerEntries.IsPoolEntry() {
@@ -2452,6 +2459,10 @@ func (p *DynamicPolicy) applyBlocksWithDynamicConfig(
 					!advisorReturnedAllocation {
 					general.Infof("pod: %s/%s container: %s is an unadvised shared numa-binding ramp-up allocation, preserve its current allocation",
 						allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName)
+					if preservedSNBRampUp[podUID] == nil {
+						preservedSNBRampUp[podUID] = make(map[string]struct{})
+					}
+					preservedSNBRampUp[podUID][containerName] = struct{}{}
 					continue containerLoop
 				}
 
@@ -2552,6 +2563,22 @@ func (p *DynamicPolicy) applyBlocksWithDynamicConfig(
 		}
 	}
 
+	// The hard-partition invariant is enforced against the FINAL reclaim pool:
+	// the adjustment commit override above may rewrite the reclaim pool after
+	// ramp-up shared allocations were assigned rampUpCPUs, so the mutual
+	// exclusion can only be restored here, before the pending advisor state is
+	// materialized. This is deliberately gated on the dynamic configuration
+	// (plus active ramp-up presence), not on the hardActive parameter: the
+	// parameter only controls floor derivation for this attempt, while the
+	// partition invariant itself follows the switch.
+	if isRampUpReclaimHardPartitionEnabledWithConfig(attemptConfig.dynamic) &&
+		newEntries.HasActiveRampUp() {
+		if err := p.rematerializeRampUpSharedAgainstFinalReclaim(
+			newEntries, preservedSNBRampUp); err != nil {
+			return nil, fmt.Errorf("rematerialize ramp-up shared allocations against final reclaim pool failed with error: %w", err)
+		}
+	}
+
 	return &pendingAdvisorState{
 		preCommitRevision: stateRevision,
 		entries:           newEntries,
@@ -2560,6 +2587,109 @@ func (p *DynamicPolicy) applyBlocksWithDynamicConfig(
 		residualFloor:     rampUpReclaimFloor,
 		dynamicConfig:     attemptConfig.dynamic,
 	}, nil
+}
+
+// rematerializeRampUpSharedAgainstFinalReclaim restores the hard-partition
+// invariant (ramp-up shared allocations never overlap the final reclaim pool)
+// against the reclaim pool as it exists AFTER the adjustment commit override
+// has been applied. Plain shared ramp-up allocations were assigned rampUpCPUs
+// before the override rewrote the reclaim pool, and preserved (unadvised) SNB
+// ramp-up allocations keep their previous cpuset, so both may end up
+// overlapping the final reclaim pool.
+//
+// Restoration is canonical, not a naive write-back of
+// allocation.Difference(reclaim): the candidate set is only used as input, and
+// the actual cpuset is re-selected through takeCoreAlignedCPUSet so the result
+// stays whole-core, deterministic and NUMA-consistent with the candidate
+// distribution. Any configuration in which no complete physical core survives
+// is rejected fail-closed instead of silently shrinking to a partial core.
+// Advised SNB ramp-up allocations are skipped here: the bulkhead partition
+// view already accounts them as non-reclaim owners, so the final reclaim pool
+// excludes their cpusets; a residual overlap for them is a partition bug and
+// is rejected by validateRampUpReclaimMutualExclusion instead of being papered
+// over here.
+func (p *DynamicPolicy) rematerializeRampUpSharedAgainstFinalReclaim(
+	newEntries state.PodEntries,
+	preservedSNBRampUp map[string]map[string]struct{},
+) error {
+	if p == nil || p.machineInfo == nil || p.machineInfo.CPUTopology == nil {
+		return nil
+	}
+	reclaimEntries := newEntries[commonstate.PoolNameReclaim]
+	if reclaimEntries == nil {
+		return nil
+	}
+	reclaimPool := reclaimEntries[commonstate.FakedContainerName]
+	if reclaimPool == nil || reclaimPool.AllocationResult.IsEmpty() {
+		return nil
+	}
+	finalReclaim := reclaimPool.AllocationResult
+
+	for podUID, containerEntries := range newEntries {
+		if containerEntries == nil || containerEntries.IsPoolEntry() {
+			continue
+		}
+		for containerName, ai := range containerEntries {
+			if ai == nil || !ai.RampUp || !ai.CheckShared() || ai.CheckReclaimed() {
+				continue
+			}
+			if ai.CheckSharedNUMABinding() {
+				if _, preserved := preservedSNBRampUp[podUID][containerName]; !preserved {
+					continue
+				}
+			}
+
+			overlap := ai.AllocationResult.Intersection(finalReclaim)
+			if overlap.IsEmpty() {
+				// zero-churn: already mutually exclusive with the final
+				// reclaim pool, nothing to rematerialize.
+				continue
+			}
+
+			candidate := ai.AllocationResult.Difference(finalReclaim)
+			if candidate.IsEmpty() {
+				return fmt.Errorf("ramp-up shared allocation is completely covered by the final reclaim pool: "+
+					"pod: %s/%s container: %s allocation: %s reclaim: %s",
+					ai.PodNamespace, ai.PodName, ai.ContainerName,
+					ai.AllocationResult.String(), finalReclaim.String())
+			}
+
+			rematerialized := takeCoreAlignedCPUSet(
+				p.machineInfo.CPUTopology, candidate, candidate, candidate.Size())
+			if rematerialized.IsEmpty() {
+				return fmt.Errorf("no complete physical core remains for ramp-up shared allocation after "+
+					"excluding the final reclaim pool (reclaim/floor conflict): "+
+					"pod: %s/%s container: %s allocation: %s candidate: %s reclaim: %s",
+					ai.PodNamespace, ai.PodName, ai.ContainerName,
+					ai.AllocationResult.String(), candidate.String(), finalReclaim.String())
+			}
+			if rematerialized.Equals(ai.AllocationResult) {
+				// idempotent: the canonical selection reproduces the current
+				// allocation, skip the write-back to avoid churn.
+				continue
+			}
+
+			topologyAwareAssignments, err := machine.GetNumaAwareAssignments(
+				p.machineInfo.CPUTopology, rematerialized)
+			if err != nil {
+				return fmt.Errorf("unable to calculate topologyAwareAssignments for rematerialized "+
+					"ramp-up shared allocation: pod: %s/%s container: %s cpuset: %s, error: %v",
+					ai.PodNamespace, ai.PodName, ai.ContainerName,
+					rematerialized.String(), err)
+			}
+
+			general.Infof("rematerialize ramp-up shared allocation of pod: %s/%s container: %s from %s to %s "+
+				"to keep it mutually exclusive with the final reclaim pool: %s",
+				ai.PodNamespace, ai.PodName, ai.ContainerName,
+				ai.AllocationResult.String(), rematerialized.String(), finalReclaim.String())
+
+			ai.AllocationResult = rematerialized
+			ai.OriginalAllocationResult = rematerialized.Clone()
+			ai.TopologyAwareAssignments = topologyAwareAssignments
+			ai.OriginalTopologyAwareAssignments = machine.DeepcopyCPUAssignment(topologyAwareAssignments)
+		}
+	}
+	return nil
 }
 
 func projectDefaultShareOwnershipEntries(
@@ -2978,6 +3108,20 @@ func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommitWithDynamicConfig(
 		}
 	}
 
+	// Ramp-up shared allocations are governed by the ramp-up reclaim hard
+	// partition switch (HP), not by allowSharedCoresOverlapReclaimedCores (AO):
+	// when HP is active, they must stay mutually exclusive with the FINAL
+	// reclaim pool regardless of AO. This runs BEFORE the AO early-return below
+	// so the HP=true && AO=true quadrant is covered as well; applyBlocks has
+	// already rematerialized the restorable overlaps before commit, so an
+	// overlap reaching this point fails closed.
+	hpActive := isRampUpReclaimHardPartitionEnabledWithConfig(dynamicConf) && newEntries.HasActiveRampUp()
+	if hpActive {
+		if err := validateRampUpReclaimMutualExclusion(newEntries, dynamicConf); err != nil {
+			return err
+		}
+	}
+
 	if allowSharedCoresOverlapReclaimedCores {
 		return p.validatePendingAdvisorPartitionViewWithDynamicConfig(
 			newEntries,
@@ -3022,6 +3166,17 @@ func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommitWithDynamicConfig(
 			if ai.CheckReclaimed() || ai.CheckSystem() {
 				continue
 			}
+			// Ramp-up shared allocations are exclusively governed by
+			// validateRampUpReclaimMutualExclusion above: when the hard
+			// partition switch is off (hpActive == false), their overlap with
+			// the reclaim pool is legal; when it is on, any overlap has
+			// already been rejected above (applyBlocks rematerialized the
+			// restorable ones before commit), so exclude them here to avoid
+			// duplicate errors. Steady shared allocations keep flowing into
+			// the disallowed partition below, untouched.
+			if isRampUpShared := ai.RampUp && ai.CheckShared() && !ai.CheckReclaimed(); isRampUpShared {
+				continue
+			}
 			if ai.CheckDedicated() && !disableDedicatedCoresOverlapReclaimedCores {
 				continue
 			}
@@ -3038,6 +3193,79 @@ func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommitWithDynamicConfig(
 		disableDedicatedCoresOverlapReclaimedCores,
 		dynamicConf,
 	)
+}
+
+// validateRampUpReclaimMutualExclusion enforces the ramp-up reclaim hard
+// partition invariant: when the hard partition switch is active (and ramp-up
+// allocations are actually present), every ramp-up shared allocation must be
+// mutually exclusive with the FINAL reclaim pool, regardless of
+// allowSharedCoresOverlapReclaimedCores. It is self-contained on purpose so
+// the asynchronous cpuset adjustment path can stack it on top of the bulkhead
+// view validation without inheriting the full unified guard (which would be
+// wrong under an AO flip window).
+func validateRampUpReclaimMutualExclusion(
+	newEntries state.PodEntries,
+	dynamicConf *dynamicconfig.Configuration,
+) error {
+	if !isRampUpReclaimHardPartitionEnabledWithConfig(dynamicConf) || !newEntries.HasActiveRampUp() {
+		return nil
+	}
+	reclaimEntries := newEntries[commonstate.PoolNameReclaim]
+	if reclaimEntries == nil {
+		return nil
+	}
+	reclaimPool := reclaimEntries[commonstate.FakedContainerName]
+	if reclaimPool == nil {
+		return nil
+	}
+
+	for _, containerEntries := range newEntries {
+		if containerEntries == nil || containerEntries.IsPoolEntry() {
+			continue
+		}
+		for _, ai := range containerEntries {
+			if ai == nil || !ai.RampUp || !ai.CheckShared() || ai.CheckReclaimed() {
+				continue
+			}
+			if overlap := reclaimPool.AllocationResult.Intersection(ai.AllocationResult); !overlap.IsEmpty() {
+				return fmt.Errorf("ramp-up shared allocation overlaps the final reclaim pool while "+
+					"ramp-up reclaim hard partition is enabled: pod: %s/%s container: %s "+
+					"allocation: %s reclaim: %s overlap: %s",
+					ai.PodNamespace, ai.PodName, ai.ContainerName,
+					ai.AllocationResult.String(), reclaimPool.AllocationResult.String(), overlap.String())
+			}
+		}
+	}
+	return nil
+}
+
+// validatePendingAdvisorPartitionViewWithRampUpExclusion is the validator used
+// by the asynchronous cpuset adjustment commit path: it keeps the bulkhead
+// partition view validation and stacks the ramp-up/reclaim mutual exclusion on
+// top of it. It deliberately avoids the full unified
+// validateAdvisorPartitionBeforeCommit guard, because the async path commits
+// against a snapshot of the AO switch and running the steady shared guard here
+// could reject a commit that was legal when the override was computed (AO flip
+// window). The mutual exclusion, in contrast, is orthogonal to AO.
+func (p *DynamicPolicy) validatePendingAdvisorPartitionViewWithRampUpExclusion(
+	newEntries state.PodEntries,
+	newMachineState state.NUMANodeMap,
+	allowSharedCoresOverlapReclaimedCores bool,
+	disableDedicatedCoresOverlapReclaimedCores bool,
+) error {
+	if err := p.validatePendingAdvisorPartitionView(
+		newEntries,
+		newMachineState,
+		allowSharedCoresOverlapReclaimedCores,
+		disableDedicatedCoresOverlapReclaimedCores,
+	); err != nil {
+		return err
+	}
+	var dynamicConf *dynamicconfig.Configuration
+	if p != nil && p.dynamicConfig != nil {
+		dynamicConf = p.dynamicConfig.GetDynamicConfiguration()
+	}
+	return validateRampUpReclaimMutualExclusion(newEntries, dynamicConf)
 }
 
 func (p *DynamicPolicy) validatePendingAdvisorPartitionView(

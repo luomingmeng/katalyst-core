@@ -488,7 +488,7 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 					disableDedicated:          p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
 					persist:                   true,
 					source:                    "cpuset override",
-					validate:                  p.validatePendingAdvisorPartitionView,
+					validate:                  p.validatePendingAdvisorPartitionViewWithRampUpExclusion,
 					requireCoreAlignedReclaim: p.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
 				}, reconcileTarget)
 				if err != nil {
