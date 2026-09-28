@@ -517,8 +517,11 @@ func TestGenerateBlockCPUSetSteadyNormalizesRealMandatoryReclaimToWholeCore(t *t
 	blocks, err := p.generateBlockCPUSet(resp, featureGates, false)
 
 	require.NoError(t, err)
-	require.Equal(t, 20, blocks["dedicated-0"].Size())
-	require.Equal(t, 4, blocks["reclaim-0"].Size())
+	// The odd mandatory-reclaim advice (3) is whole-core normalized to the
+	// committed-anchored lower value (2) rather than borrowing a dedicated core
+	// upward to 4; the released CPU returns to dedicated (21 -> 22).
+	require.Equal(t, 22, blocks["dedicated-0"].Size())
+	require.Equal(t, 2, blocks["reclaim-0"].Size())
 	require.True(t, blocks["dedicated-0"].Intersection(blocks["reclaim-0"]).IsEmpty())
 }
 

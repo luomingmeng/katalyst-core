@@ -322,12 +322,20 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocksWithCheckpointTransitionAndDyna
 		return nil, err
 	}
 	skipNUMAs := p.state.GetPodEntries().SteadyExclusiveNUMAs(topology)
+	var steadyNormalizeReport steadyReclaimNormalizeReport
 	if resp.DisableDedicatedCoresOverlapReclaimedCores {
 		if hardActive {
 			descriptors, err = normalizeAdvisorDescriptorsForHardPartitionWholeCoreReclaim(
 				descriptors, available, topology, skipNUMAs)
 		} else {
-			descriptors, err = normalizeAdvisorDescriptorsForWholeCoreReclaim(descriptors, topology)
+			// steady real-NUMA path: joint whole-core normalization anchored on the
+			// committed reclaim. Odd advice is rewritten to a whole-core target that
+			// needs no dedicated donation; fake-NUMA blocks are left to their solver.
+			descriptors, steadyNormalizeReport, err = normalizeSteadyRealNUMATargets(
+				descriptors, available, topology, skipNUMAs)
+			if err == nil {
+				p.emitSteadyReclaimNormalizeMetrics(steadyNormalizeReport)
+			}
 		}
 		if err != nil {
 			return nil, err
@@ -346,7 +354,8 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocksWithCheckpointTransitionAndDyna
 	available, err = p.solveAdvisorDescriptorPhaseWithCheckpointTransitionAndSkipNUMAs(
 		core, available, result, true, hardActive, checkpointTransition, skipNUMAs)
 	if err != nil {
-		return nil, fmt.Errorf("solve dedicated and mandatory reclaim: %w", err)
+		return nil, fmt.Errorf("solve dedicated and mandatory reclaim: %w",
+			p.annotateSteadyReclaimNormalizeError(err, steadyNormalizeReport))
 	}
 
 	sourceComponents, componentMembers, err := p.advisorSourceIsolationComponents(descriptors)
@@ -548,13 +557,15 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhaseWithCheckpointTransitionAndSk
 		blockIDByDemandKey[demandKey] = descriptor.BlockID
 	}
 	if expandHardReclaimPhase {
-		pinnedDemands, err := pinHardReclaimPartitionDemands(demands, available, p.machineInfo.CPUTopology)
+		pinnedDemands, err := pinHardReclaimPartitionDemands(demands, available, p.machineInfo.CPUTopology, false)
 		if err != nil {
 			return available, fmt.Errorf("plan hard reclaim partition: %w", err)
 		}
 		demands = pinnedDemands
 	} else if preserveClass && !expandSteadyReclaimPhase {
-		pinnedDemands, err := pinHardReclaimPartitionDemands(demands, available, p.machineInfo.CPUTopology)
+		// Steady real-NUMA path owns the committed whole-core fallback; the
+		// ramp-up/hard path above deliberately keeps its original semantics.
+		pinnedDemands, err := pinHardReclaimPartitionDemands(demands, available, p.machineInfo.CPUTopology, true)
 		if err != nil {
 			return available, fmt.Errorf("plan steady real-NUMA reclaim partition: %w", err)
 		}

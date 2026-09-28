@@ -262,12 +262,17 @@ func selectHardReclaimCoresByNUMAWithFrontier(
 		}
 		for i, target := range targets {
 			if bestPartial.selectedByNUMA[i] < target {
-				return machine.NewCPUSet(), fmt.Errorf(
-					"NUMA %d needs %d more reclaim CPUs",
-					numaIDs[i], target-bestPartial.selectedByNUMA[i])
+				return machine.NewCPUSet(), &hardReclaimAdviceError{
+					kind: hardReclaimErrInsufficientWholeCore,
+					cause: fmt.Errorf("NUMA %d needs %d more reclaim CPUs",
+						numaIDs[i], target-bestPartial.selectedByNUMA[i]),
+				}
 			}
 		}
-		return machine.NewCPUSet(), fmt.Errorf("no feasible hard reclaim selection")
+		return machine.NewCPUSet(), &hardReclaimAdviceError{
+			kind:  hardReclaimErrGlobalInfeasible,
+			cause: fmt.Errorf("no feasible hard reclaim selection"),
+		}
 	}
 	return best.selected, nil
 }
@@ -362,6 +367,7 @@ func pinHardReclaimPartitionDemands(
 	demands []partitionDemand,
 	available machine.CPUSet,
 	topology *machine.CPUTopology,
+	allowCommittedFallback bool,
 ) ([]partitionDemand, error) {
 	targetByNUMA := make(map[int]int)
 	currentReclaim := machine.NewCPUSet()
@@ -397,14 +403,23 @@ func pinHardReclaimPartitionDemands(
 		return append([]partitionDemand(nil), demands...), nil
 	}
 
-	plan, err := planHardReclaimPartition(hardReclaimPartitionInput{
+	input := hardReclaimPartitionInput{
 		topology:        topology,
 		targetByNUMA:    targetByNUMA,
 		currentReclaim:  currentReclaim,
 		free:            available.Difference(allCurrentlyOwned),
 		reclaimEligible: reclaimEligible,
 		donors:          donors,
-	})
+	}
+	plan, err := planHardReclaimPartition(input)
+	if err != nil && allowCommittedFallback {
+		// The committed fallback is exclusive to the steady real-NUMA path; the
+		// ramp-up/hard path keeps its original error semantics byte-for-byte.
+		plan, err = pnhCommittedFallback(input, err)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -421,4 +436,71 @@ func pinHardReclaimPartitionDemands(
 		}
 	}
 	return pinned, nil
+}
+
+// pnhCommittedFallback is the narrow committed fallback for the steady real-NUMA
+// fast path. It only engages when the requested whole-core target could not be
+// assembled (insufficient whole-core, typically a normalized odd advice) and the
+// already-committed reclaim itself is whole-core aligned. It retries the plan
+// anchored on the committed reclaim size per NUMA, which needs no new donation.
+// Any other failure, or a fallback that also fails, returns the original error so
+// unrelated infeasibility is never silently swallowed.
+func pnhCommittedFallback(
+	input hardReclaimPartitionInput,
+	planningErr error,
+) (*hardReclaimPartitionPlan, error) {
+	var advErr *hardReclaimAdviceError
+	if !errorsAsAdvice(planningErr, &advErr) || advErr.kind != hardReclaimErrInsufficientWholeCore {
+		return nil, planningErr
+	}
+
+	committedByNUMA := make(map[int]int)
+	for numaID := range input.targetByNUMA {
+		numaCPUs := input.topology.CPUDetails.CPUsInNUMANodes(numaID)
+		committedByNUMA[numaID] = input.currentReclaim.Intersection(numaCPUs).Size()
+	}
+
+	committedAligned := true
+	w := input.topology.CPUsPerCore()
+	floorReclaim := minimumHardReclaimCoresPerNUMA * w
+	for numaID, target := range input.targetByNUMA {
+		committed := committedByNUMA[numaID]
+		if target == committed {
+			continue
+		}
+		// A committed anchor below the per-NUMA reclaim floor cannot be a safe
+		// no-op target: anchoring on it would silently drop reclaim below the
+		// invariant minimum. Keep the original planning error instead.
+		if committed < floorReclaim {
+			return nil, planningErr
+		}
+		// A committed anchor that is itself not whole-core aligned is an invariant
+		// break, not a retry candidate; surface it as such.
+		if w > 1 && committed%w != 0 {
+			return nil, &hardReclaimAdviceError{
+				kind:  hardReclaimErrCommittedInvariant,
+				cause: planningErr,
+			}
+		}
+		committedAligned = false
+	}
+	if committedAligned {
+		// the requested target already equals the committed anchor; the failure is
+		// not recoverable by anchoring on committed.
+		return nil, planningErr
+	}
+
+	fallbackInput := input
+	fallbackInput.targetByNUMA = committedByNUMA
+	plan, err := planHardReclaimPartition(fallbackInput)
+	if err != nil {
+		// fallback did not resolve it; keep the original, typed planning error.
+		general.InfoS("committed whole-core reclaim fallback did not resolve planning error",
+			"originalError", planningErr.Error(),
+			"fallbackError", err.Error())
+		return nil, planningErr
+	}
+	general.InfoS("steady real-NUMA reclaim fell back to committed whole-core target",
+		"committedTargetByNUMA", committedByNUMA)
+	return plan, nil
 }
