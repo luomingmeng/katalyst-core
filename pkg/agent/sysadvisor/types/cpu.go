@@ -226,7 +226,12 @@ type InternalCPUCalculationResult struct {
 	// several NUMAs). Downstream consumers (e.g. the cpu server reclaim floor)
 	// must gate per-NUMA decisions on membership in this set rather than on the
 	// node-global RampUpActive flag.
-	RampUpDomains            []int
+	RampUpDomains []int
+	// ReclaimConstraintExcess is the per-NUMA diagnostic distance of the published
+	// reclaim pool size ABOVE its steady reservation floor (max(size - floor, 0)).
+	// It is NOT a constraint input: the actual clamp is the optional per-scope
+	// ceiling. It exists so canary/metrics can see how far the pool has grown past
+	// the floor under ramp-up.
 	ReclaimConstraintExcess  int
 	ReclaimConstraintTargets map[string]ReclaimConstraintTarget
 
@@ -236,8 +241,21 @@ type InternalCPUCalculationResult struct {
 }
 
 type ReclaimConstraintTarget struct {
+	// Desired is the ramp-up target the per-scope ceiling converges toward while
+	// ramp-up is active; after ramp-up exits the desired reverts to SteadyCap.
 	Desired int
-	Floor   int
+	// Floor is the pure reservation lower bound: the sum of member-NUMA steady
+	// reserves. It is never raised by the ramp-up target.
+	Floor int
+	// SteadyCap is the reclaim pool upper bound when no ramp-up is active:
+	// min(rawAvailable, coreAligned(aggregateCapacity * MaxRatio)).
+	SteadyCap int
+	// Ceiling is the rate-limited, optional per-scope pool upper bound decided by
+	// the constraint guard this cycle. nil means "unconstrained": the pool keeps
+	// its steady (MaxRatio) size and must not be floored to an arbitrary value.
+	Ceiling *int
+	// MemberNUMAs is the sorted member NUMA set this scope aggregates over.
+	MemberNUMAs []int
 }
 
 type CPUResource struct {
