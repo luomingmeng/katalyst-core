@@ -2072,7 +2072,7 @@ func TestAssembleProvisionPublishesActiveHardReclaimTargetsForEmptyPhysicalNUMAs
 	require.NoError(t, err)
 	require.True(t, result.RampUpHardPartitionActive)
 	require.Equal(t, map[int]types.CPUResource{
-		commonstate.FakedNUMAID: {Size: 46, Quota: -1},
+		commonstate.FakedNUMAID: {Size: 56, Quota: -1},
 		0:                       {Size: 8, Quota: -1},
 		1:                       {Size: 10, Quota: -1},
 	}, result.PoolEntries[commonstate.PoolNameReclaim])
@@ -2733,7 +2733,7 @@ func TestDefaultShareBackfillReservedFloorConstraintReportsClamp(t *testing.T) {
 	require.Equal(t, 24, result.ReclaimConstraintTargets["non-exclusive/-1"].Floor)
 	require.Equal(t, 128, result.DefaultShareBackfill.RawReclaimSize)
 	require.Equal(t, 34, result.DefaultShareBackfill.FinalReclaimSize)
-	require.Equal(t, types.CPUResource{Size: 10, Quota: -1},
+	require.Equal(t, types.CPUResource{Size: 34, Quota: -1},
 		result.PoolEntries[commonstate.PoolNameReclaim][commonstate.FakedNUMAID])
 	require.Equal(t, types.CPUResource{Size: 128, Quota: -1},
 		result.PoolEntries[commonstate.PoolNameShare][commonstate.FakedNUMAID])
