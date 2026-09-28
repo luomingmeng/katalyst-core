@@ -1866,14 +1866,6 @@ func propagateControlledPhaseTargetEnvelope(targets map[string]CPUSetTarget, dag
 	return nil
 }
 
-func topoNodeDepth(node *TopoNode) int {
-	depth := 0
-	for current := node; current != nil && current.parent != nil; current = current.parent {
-		depth++
-	}
-	return depth
-}
-
 func unionPhaseMemsEnvelope(parent, child string) (string, error) {
 	if child == "" {
 		return parent, nil
@@ -2005,8 +1997,8 @@ type depthBuildStats struct {
 // relDepthOrder pairs a rel with its precomputed depth to avoid map lookups
 // during sort comparisons (O(string-key-hash) per comparison).
 type relDepthOrder struct {
-	relsAsc        []string           // sorted by (depth ASC, rel ASC)
-	relsDesc       []string           // sorted by (depth DESC, rel ASC)
+	relsAsc        []string            // sorted by (depth ASC, rel ASC)
+	relsDesc       []string            // sorted by (depth DESC, rel ASC)
 	childRelsByRel map[string][]string // precomputed child rel paths per parent
 }
 

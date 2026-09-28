@@ -647,17 +647,6 @@ func mandatoryReclaimCoreWidth(
 	return uniformCandidateCoreWidth(topology, participatingCPUs)
 }
 
-func normalizeAdvisorDescriptorsForWholeCoreReclaim(
-	descriptors []advisorBlockDescriptor,
-	topology *machine.CPUTopology,
-) ([]advisorBlockDescriptor, error) {
-	if topology == nil {
-		return nil, fmt.Errorf("cannot normalize advisor descriptors with nil CPU topology")
-	}
-	return normalizeAdvisorDescriptorsForWholeCoreReclaimWithWidth(
-		descriptors, topology.CPUsPerCore())
-}
-
 func normalizeAdvisorDescriptorsForHardPartitionWholeCoreReclaim(
 	descriptors []advisorBlockDescriptor,
 	available machine.CPUSet,
@@ -689,14 +678,6 @@ func normalizeAdvisorDescriptorsForHardPartitionWholeCoreReclaim(
 	}
 	return normalizeAdvisorDescriptorsForWholeCoreReclaimWithWidthAndSkipNUMAs(
 		descriptors, cpusPerCore, skipNUMAs)
-}
-
-func normalizeAdvisorDescriptorsForWholeCoreReclaimWithWidth(
-	descriptors []advisorBlockDescriptor,
-	cpusPerCore int,
-) ([]advisorBlockDescriptor, error) {
-	return normalizeAdvisorDescriptorsForWholeCoreReclaimWithWidthAndSkipNUMAs(
-		descriptors, cpusPerCore, nil)
 }
 
 func normalizeAdvisorDescriptorsForWholeCoreReclaimWithWidthAndSkipNUMAs(

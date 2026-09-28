@@ -1862,17 +1862,9 @@ func validateHardPartitionReclaimDistributionWithEffectiveCapacity(
 	return nil
 }
 
-// generateLegacyBlockCPUSet computes the CPUSet allocation for all requested blocks using a two-phase allocation process.
+// generateLegacyBlockCPUSetWithDynamicConfig computes the CPUSet allocation for all requested blocks using a two-phase allocation process.
 // Phase 1 (High Priority): Allocates Dedicated and Share blocks, resolving NUMA boundaries and updating available CPUs.
 // Phase 2 (Low Priority): Allocates Reclaim blocks, ensuring they don't use non-reclaimable pinned CPUs or CPUs already taken.
-func (p *DynamicPolicy) generateLegacyBlockCPUSet(
-	resp *advisorapi.ListAndWatchResponse,
-	hardActive bool,
-) (advisorapi.BlockCPUSet, error) {
-	return p.generateLegacyBlockCPUSetWithDynamicConfig(
-		resp, hardActive, p.currentAdvisorAttemptConfiguration())
-}
-
 func (p *DynamicPolicy) generateLegacyBlockCPUSetWithDynamicConfig(
 	resp *advisorapi.ListAndWatchResponse,
 	hardActive bool,
@@ -3432,21 +3424,6 @@ func (p *DynamicPolicy) validatePendingAdvisorPartitionViewWithDynamicConfig(
 		return fmt.Errorf("validate pending advisor partition view before commit: %w", err)
 	}
 	return nil
-}
-
-func (p *DynamicPolicy) cpuSetPartitionViewOptions(
-	state state.ReadonlyState,
-	hardActive bool,
-) bulkheadutils.CPUSetPartitionViewOptions {
-	var dynamicConf *dynamicconfig.Configuration
-	if p != nil && p.config.dynamicConfig != nil {
-		dynamicConf = p.config.dynamicConfig.GetDynamicConfiguration()
-	}
-	domains := sets.NewInt()
-	if hardActive {
-		domains.Insert(commonstate.FakedNUMAID)
-	}
-	return p.cpuSetPartitionViewOptionsWithDynamicConfig(state, domains, dynamicConf)
 }
 
 func (p *DynamicPolicy) cpuSetPartitionViewOptionsWithDynamicConfig(

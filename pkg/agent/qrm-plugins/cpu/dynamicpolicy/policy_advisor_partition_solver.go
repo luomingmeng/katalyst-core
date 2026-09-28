@@ -454,15 +454,6 @@ func addPartitionFlowEdge(graph [][]partitionFlowEdge, from, to, cap int, cost i
 	graph[to] = append(graph[to], reverse)
 }
 
-func partitionMinCostFlowWithBudget(
-	graph [][]partitionFlowEdge,
-	source, sink, wanted, maxOperations int,
-) (int, error) {
-	operations := 0
-	return partitionMinCostFlowWithUsage(
-		graph, source, sink, wanted, &operations, maxOperations)
-}
-
 func partitionMinCostFlowWithUsage(
 	graph [][]partitionFlowEdge,
 	source, sink, wanted int,

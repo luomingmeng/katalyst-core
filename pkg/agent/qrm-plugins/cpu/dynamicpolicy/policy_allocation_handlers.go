@@ -1660,17 +1660,8 @@ func (p *DynamicPolicy) allocateSharedNumaBindingCPUs(ctx context.Context, req *
 	}
 }
 
-// putAllocationsAndAdjustAllocationEntries calculates and generates the latest checkpoint
+// putAllocationsAndAdjustAllocationEntriesAtRevision calculates and generates the latest checkpoint
 // - unlike adjustAllocationEntries, it will also consider AllocationInfo
-func (p *DynamicPolicy) putAllocationsAndAdjustAllocationEntries(
-	allocationInfos []*state.AllocationInfo,
-	incrByReq bool,
-	persistCheckpoint bool,
-) error {
-	return p.putAllocationsAndAdjustAllocationEntriesAtRevision(
-		context.Background(), nil, allocationInfos, incrByReq, persistCheckpoint, p.state.GetRevision())
-}
-
 func (p *DynamicPolicy) putAllocationsAndAdjustAllocationEntriesAtRevision(
 	ctx context.Context,
 	entries state.PodEntries,

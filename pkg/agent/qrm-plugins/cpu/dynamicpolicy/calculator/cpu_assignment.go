@@ -115,11 +115,6 @@ func (a *cpuAccumulator) freeCores() []int {
 	return free
 }
 
-// freeCPUs returns free CPU IDs as a slice sorted by sortAvailableCPUs().
-func (a *cpuAccumulator) freeCPUs() []int {
-	return a.sortAvailableCPUs()
-}
-
 // sort the provided list of sockets/cores/cpus referenced in 'ids' by the
 // number of available CPUs contained within them (smallest to largest). The
 // 'getCPU()' parameter defines the function that should be called to retrieve

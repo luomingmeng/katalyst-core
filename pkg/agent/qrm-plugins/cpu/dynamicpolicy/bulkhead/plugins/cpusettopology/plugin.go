@@ -413,16 +413,6 @@ func runCPUSetTopologyAdjustmentWithResult(
 	}
 }
 
-func (p *CPUSetTopologyPlugin) adjustOnce(
-	ctx context.Context,
-	in bulkheadapi.HandlerContext,
-	budget *topology.AdjustmentBudget,
-) (topology.ConvergenceResult, error) {
-	var result topology.ConvergenceResult
-	err := p.adjustOnceWithResult(ctx, in, budget, &result, nil)
-	return result, err
-}
-
 func (p *CPUSetTopologyPlugin) adjustOnceWithResult(
 	ctx context.Context,
 	in bulkheadapi.HandlerContext,
