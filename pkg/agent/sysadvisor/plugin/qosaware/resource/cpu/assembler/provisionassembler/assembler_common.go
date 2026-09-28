@@ -737,6 +737,41 @@ func (pa *ProvisionAssemblerCommon) assembleDedicatedNUMAExclusiveRegion(r regio
 		dedicatedTarget = nextDedicatedTarget
 	}
 
+	// L0 whole-core quantization: an odd reclaim target cannot be expressed as
+	// complete physical cores, which QRM materializes as whole cores. Rewrite it to
+	// the committed-anchored whole-core value so the block we publish is already
+	// representable. It is conservative: never shrinks below the reserved reclaim,
+	// and passes through when no legal whole-core value exists (QRM owns the
+	// reconcile there).
+	cpusPerCore := 1
+	if pa.metaServer != nil && pa.metaServer.CPUTopology != nil {
+		cpusPerCore = pa.metaServer.CPUTopology.CPUsPerCore()
+	}
+	quantizedReclaimTarget, quantizeDecision := quantizeDisjointReclaimTargetToWholeCore(
+		reclaimTarget, reservedForReclaim, cpusPerCore)
+	if quantizedReclaimTarget != reclaimTarget {
+		nextDedicated := partitionCapacity - quantizedReclaimTarget
+		if nextDedicated >= 0 && nextDedicated <= dedicatedCapacity {
+			klog.InfoS("quantized disjoint reclaim target to whole-core value",
+				"regionName", r.Name(),
+				"regionNuma", regionNuma,
+				"cpusPerCore", cpusPerCore,
+				"reservedForReclaim", reservedForReclaim,
+				"originalReclaimTarget", reclaimTarget,
+				"quantizedReclaimTarget", quantizedReclaimTarget,
+				"decision", quantizeDecision)
+			reclaimTarget = quantizedReclaimTarget
+			dedicatedTarget = nextDedicated
+		} else {
+			klog.InfoS("passing through non-whole-core reclaim target: quantized value out of dedicated bounds",
+				"regionName", r.Name(),
+				"originalReclaimTarget", reclaimTarget,
+				"quantizedReclaimTarget", quantizedReclaimTarget,
+				"dedicatedCapacity", dedicatedCapacity,
+				"decision", quantizeDecision)
+		}
+	}
+
 	for podUID := range r.GetPods() {
 		result.SetPoolEntry(podUID, regionNuma, dedicatedTarget, -1)
 	}
