@@ -266,7 +266,7 @@ func planHardReclaimPartition(in hardReclaimPartitionInput) (*hardReclaimPartiti
 			// bites when the same group mixes in a legacy donor whose ceil(requestQuantity)
 			// floor would otherwise inflate groupMinimum. The actual per-reclaim-target
 			// isolation of targetDriven donors from legacy ones is enforced upstream by
-			// the targetDrivenDonorCPUs candidate pool filter (G2), not by this cap.
+			// the targetDrivenDonorCPUs candidate pool filter, not by this cap.
 			groupDonationLimit[groupKey] = groupReclaimQuota[groupKey]
 		}
 		if groupDonationLimit[groupKey] < 0 {
@@ -288,7 +288,7 @@ func planHardReclaimPartition(in hardReclaimPartitionInput) (*hardReclaimPartiti
 		if target < 0 {
 			return nil, fmt.Errorf("NUMA %d has negative hard reclaim target %d", numaID, target)
 		}
-		// G1: a frozen reclaim target must be whole-core representable on this
+		// Whole-core feasibility invariant: a frozen reclaim target must be whole-core representable on this
 		// topology; an odd target is a typed whole_core_infeasible and is never
 		// silently rounded to a neighbouring pairing.
 		cpusPerCore := in.topology.CPUsPerCore()
@@ -310,7 +310,7 @@ func planHardReclaimPartition(in hardReclaimPartitionInput) (*hardReclaimPartiti
 
 		donorPool := allDonorCPUs
 		if _, isTargetDriven := in.targetDrivenReclaimNUMAs[numaID]; isTargetDriven {
-			// G2: a targetDriven reclaim target must never draw on legacy donor
+			// Target-driven isolation invariant: a targetDriven reclaim target must never draw on legacy donor
 			// capacity. Restrict the donor candidate pool to targetDriven donors only.
 			// The switch is keyed on the reclaim target's own target-driven-ness, not
 			// on the NUMA, so a legacy reclaim target on a targetDriven NUMA is
@@ -420,9 +420,27 @@ func selectHardReclaimCoresByNUMAWithFrontier(
 		states, truncated = pruneHardReclaimCoreSelectionStates(nextByKey)
 		frontierTruncated = frontierTruncated || truncated
 	}
+	// Always scan for a feasible terminal, regardless of whether the frontier
+	// was truncated. Truncation only means we cannot prove global optimality;
+	// the retained states may still contain a valid solution that satisfies all
+	// hard constraints (NUMA targets, donation limits, whole-core alignment).
+	best := findBestFeasibleHardReclaimTerminal(states, targets)
+	if best != nil {
+		if frontierTruncated {
+			general.InfoS("hard reclaim accepted best-feasible from truncated frontier",
+				"candidateCount", len(candidates),
+				"stateCount", len(states),
+				"frontierWidth", hardReclaimCoreSelectionFrontierWidth,
+				"quality", "best_feasible",
+				"retained", best.retained,
+				"donated", best.donated)
+		}
+		return best.selected, nil
+	}
+
 	if frontierTruncated {
 		cause := fmt.Errorf(
-			"search frontier truncated at width %d before proving an optimal reclaim selection",
+			"search frontier truncated at width %d and no feasible terminal retained",
 			hardReclaimCoreSelectionFrontierWidth)
 		return machine.NewCPUSet(), &hardReclaimSelectionError{
 			reason: hardReclaimFailureSearchBudget,
@@ -430,17 +448,7 @@ func selectHardReclaimCoresByNUMAWithFrontier(
 		}
 	}
 
-	var best *hardReclaimCoreSelectionState
-	for i := range states {
-		if !intSlicesEqual(states[i].selectedByNUMA, targets) {
-			continue
-		}
-		if best == nil || hardReclaimCoreSelectionStateLess(states[i], *best) {
-			candidate := states[i]
-			best = &candidate
-		}
-	}
-	if best == nil {
+	{
 		var bestPartial *hardReclaimCoreSelectionState
 		for _, state := range states {
 			if bestPartial == nil || state.selected.Size() > bestPartial.selected.Size() ||
@@ -478,7 +486,26 @@ func selectHardReclaimCoresByNUMAWithFrontier(
 			cause:  cause,
 		}
 	}
-	return best.selected, nil
+}
+
+// findBestFeasibleHardReclaimTerminal scans all states for one where every NUMA
+// exactly hits its target. It returns the highest-scoring such state (by
+// retained-donated-lexicographic order) or nil if no terminal exists.
+func findBestFeasibleHardReclaimTerminal(
+	states []hardReclaimCoreSelectionState,
+	targets []int,
+) *hardReclaimCoreSelectionState {
+	var best *hardReclaimCoreSelectionState
+	for i := range states {
+		if !intSlicesEqual(states[i].selectedByNUMA, targets) {
+			continue
+		}
+		if best == nil || hardReclaimCoreSelectionStateLess(states[i], *best) {
+			cp := states[i]
+			best = &cp
+		}
+	}
+	return best
 }
 
 func intSlicesEqual(left, right []int) bool {
@@ -649,10 +676,8 @@ func validateHardReclaimReplacement(
 					"hard reclaim replacement demand %q has invalid request quantity %v",
 					demand.key, demand.requestQuantity)
 			}
-			proof.dedicatedBeforeByGroup[groupKey] =
-				proof.dedicatedBeforeByGroup[groupKey].Union(demand.preferred)
-			proof.dedicatedAfterByGroup[groupKey] =
-				proof.dedicatedAfterByGroup[groupKey].Union(assignment)
+			proof.dedicatedBeforeByGroup[groupKey] = proof.dedicatedBeforeByGroup[groupKey].Union(demand.preferred)
+			proof.dedicatedAfterByGroup[groupKey] = proof.dedicatedAfterByGroup[groupKey].Union(assignment)
 			if demand.targetDriven {
 				if proof.dedicatedTargetDrivenByGroupNUMA[groupKey] == nil {
 					proof.dedicatedTargetDrivenByGroupNUMA[groupKey] = make(map[int]bool)
@@ -1141,9 +1166,8 @@ func enumerateHardReclaimReplacementInNUMADiagnosed(
 		candidates := coreAlignedCandidates(topology, source, reclaimBefore)
 		var candidateBudgetExceeded, terminalTruncated bool
 		var generated int
-		terminals, candidateBudgetExceeded, terminalTruncated, generated =
-			enumerateHardReclaimReplacementNUMATerminalsDiagnosed(
-				candidates, target, options.maxCandidateStates, options.maxTerminalSolves)
+		terminals, candidateBudgetExceeded, terminalTruncated, generated = enumerateHardReclaimReplacementNUMATerminalsDiagnosed(
+			candidates, target, options.maxCandidateStates, options.maxTerminalSolves)
 		diagnostics.GeneratedCandidateStates += generated
 		if candidateBudgetExceeded {
 			return nil, fmt.Errorf(
@@ -1335,9 +1359,8 @@ func enumerateHardReclaimReplacementNUMATerminals(
 	target int,
 	maxCandidateStates, maxTerminalSolves int,
 ) ([]machine.CPUSet, bool, bool) {
-	terminals, budgetExceeded, truncated, _ :=
-		enumerateHardReclaimReplacementNUMATerminalsDiagnosed(
-			candidates, target, maxCandidateStates, maxTerminalSolves)
+	terminals, budgetExceeded, truncated, _ := enumerateHardReclaimReplacementNUMATerminalsDiagnosed(
+		candidates, target, maxCandidateStates, maxTerminalSolves)
 	return terminals, budgetExceeded, truncated
 }
 
