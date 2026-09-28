@@ -39,7 +39,6 @@ import (
 	maputil "k8s.io/kubernetes/pkg/util/maps"
 
 	"github.com/kubewharf/katalyst-api/pkg/consts"
-	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/advisorsvc"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
 	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
@@ -2247,8 +2246,7 @@ func (p *DynamicPolicy) applyBlocksWithDynamicConfig(
 	stateRevision := p.state.GetRevision()
 	curEntries := p.state.GetPodEntries()
 	newEntries := make(state.PodEntries)
-	dedicatedCPUSet := machine.NewCPUSet()
-	pooledUnionDedicatedCPUSet := machine.NewCPUSet()
+	var dedicatedCPUSet, pooledUnionDedicatedCPUSet machine.CPUSet
 	defaultSharePlan := defaultShareMaterializationPlan{}
 	if attemptConfig.dynamic != nil &&
 		attemptConfig.dynamic.FillDefaultSharePoolWithNonReclaimCPUs {
@@ -2587,7 +2585,7 @@ func (p *DynamicPolicy) applyAdvisorNonPoolContainerEntries(
 			case consts.PodAnnotationQoSLevelDedicatedCores:
 				errMsg := fmt.Sprintf("dedicated_cores blocks aren't applied, pod: %s/%s, container: %s",
 					allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName)
-				general.Errorf(errMsg)
+				general.Errorf("%s", errMsg)
 				return nil, fmt.Errorf(errMsg)
 			case consts.PodAnnotationQoSLevelSystemCores:
 				poolCPUSet, topologyAwareAssignments, err := p.getSystemPoolCPUSetAndNumaAwareAssignments(newEntries, allocationInfo)
@@ -2651,11 +2649,11 @@ func (p *DynamicPolicy) applyAdvisorNonPoolContainerEntries(
 					}
 
 					if allocationInfo.CheckSharedNUMABinding() {
-						poolEntry.QoSLevel = apiconsts.PodAnnotationQoSLevelSharedCores
+						poolEntry.QoSLevel = consts.PodAnnotationQoSLevelSharedCores
 						// set SharedNUMABinding declarations to pool entry containing SharedNUMABinding containers,
 						// in order to differentiate them from non-binding share cores pools during GetFilteredPoolsCPUSetMap.
 						poolEntry.Annotations = general.MergeMap(poolEntry.Annotations, map[string]string{
-							apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+							consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
 						})
 					}
 
