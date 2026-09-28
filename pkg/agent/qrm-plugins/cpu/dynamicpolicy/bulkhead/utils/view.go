@@ -709,44 +709,41 @@ func padNonReclaimPoolToMinSize(view *model.DesiredView, topology *machine.CPUTo
 	view.ReclaimEffective = view.ReclaimEffective.Difference(padding)
 }
 
-func rebuildReclaimEffectivePerNUMA(view *model.DesiredView, topology *machine.CPUTopology) {
+// rebuildPerNUMA projects a CPUSet field onto per-NUMA intersections.
+// Shared by all *PerNUMA rebuilders to avoid divergent iteration order.
+func rebuildPerNUMA(
+	view *model.DesiredView,
+	topology *machine.CPUTopology,
+	source func(*model.DesiredView) machine.CPUSet,
+	target func(*model.DesiredView) *map[int]machine.CPUSet,
+) {
 	if view == nil {
 		return
 	}
-	view.ReclaimEffectivePerNUMA = map[int]machine.CPUSet{}
+	*target(view) = map[int]machine.CPUSet{}
 	if topology == nil {
 		return
 	}
 	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceNoSortInt() {
-		intersection := view.ReclaimEffective.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
-		view.ReclaimEffectivePerNUMA[numaID] = intersection
+		intersection := source(view).Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
+		(*target(view))[numaID] = intersection
 	}
+}
+
+func rebuildReclaimEffectivePerNUMA(view *model.DesiredView, topology *machine.CPUTopology) {
+	rebuildPerNUMA(view, topology,
+		func(v *model.DesiredView) machine.CPUSet { return v.ReclaimEffective },
+		func(v *model.DesiredView) *map[int]machine.CPUSet { return &v.ReclaimEffectivePerNUMA })
 }
 
 func rebuildDesiredReclaimEffectivePerNUMA(view *model.DesiredView, topology *machine.CPUTopology) {
-	if view == nil {
-		return
-	}
-	view.DesiredReclaimEffectivePerNUMA = map[int]machine.CPUSet{}
-	if topology == nil {
-		return
-	}
-	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceNoSortInt() {
-		intersection := view.DesiredReclaimEffective.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
-		view.DesiredReclaimEffectivePerNUMA[numaID] = intersection
-	}
+	rebuildPerNUMA(view, topology,
+		func(v *model.DesiredView) machine.CPUSet { return v.DesiredReclaimEffective },
+		func(v *model.DesiredView) *map[int]machine.CPUSet { return &v.DesiredReclaimEffectivePerNUMA })
 }
 
 func rebuildTransientProtectedNonReclaimPerNUMA(view *model.DesiredView, topology *machine.CPUTopology) {
-	if view == nil {
-		return
-	}
-	view.TransientProtectedNonReclaimPerNUMA = map[int]machine.CPUSet{}
-	if topology == nil {
-		return
-	}
-	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceNoSortInt() {
-		intersection := view.TransientProtectedNonReclaim.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
-		view.TransientProtectedNonReclaimPerNUMA[numaID] = intersection
-	}
+	rebuildPerNUMA(view, topology,
+		func(v *model.DesiredView) machine.CPUSet { return v.TransientProtectedNonReclaim },
+		func(v *model.DesiredView) *map[int]machine.CPUSet { return &v.TransientProtectedNonReclaimPerNUMA })
 }
