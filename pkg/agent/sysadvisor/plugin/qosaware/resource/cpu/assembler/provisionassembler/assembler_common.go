@@ -1103,6 +1103,60 @@ func (pa *ProvisionAssemblerCommon) assembleNUMABindingNUMAExclusive(regionHelpe
 	return nil
 }
 
+// applyDomainScopedLiveReclaimFloor raises reclaimedCoresSize to the QRM-committed
+// live size when the current NUMA hosts an active ramp-up domain.
+//
+// Invariants:
+//   - A global (FakedNUMAID) ramp-up MUST NOT broadcast its floor to real NUMAs:
+//     global backfill may land on any NUMA, so mid-ramp reclaim on a real NUMA
+//     is not guaranteed to stay there and cannot be protected.
+//   - The floor is best-effort: skipped when dedicated+live > NUMA capacity,
+//     because CPURequest is a hard guarantee for reclaim-disabled dedicated pools.
+//   - Returns the (possibly raised) reclaimedCoresSize.
+func (pa *ProvisionAssemblerCommon) applyDomainScopedLiveReclaimFloor(
+	numaID int,
+	reclaimedCoresSize int,
+	shareAndIsolateDedicatedPoolSizes map[string]int,
+) int {
+	if pa.calculationContext.LiveReclaimByNUMA == nil {
+		return reclaimedCoresSize
+	}
+	rampUpDomainSet := make(map[int]bool, len(pa.calculationContext.RampUpDomains))
+	for _, d := range pa.calculationContext.RampUpDomains {
+		rampUpDomainSet[d] = true
+	}
+	domainActive := false
+	if numaID == commonstate.FakedNUMAID {
+		domainActive = rampUpDomainSet[commonstate.FakedNUMAID]
+	} else {
+		domainActive = rampUpDomainSet[numaID]
+	}
+	if !domainActive {
+		return reclaimedCoresSize
+	}
+	liveSize, ok := pa.calculationContext.LiveReclaimByNUMA[numaID]
+	if !ok || liveSize <= reclaimedCoresSize {
+		return reclaimedCoresSize
+	}
+	numaCap := 0
+	if pa.metaServer != nil && pa.metaServer.CPUDetails != nil {
+		numaCap = pa.metaServer.CPUDetails.CPUsInNUMANodes(numaID).Size()
+	}
+	totalAllocated := general.SumUpMapValues(shareAndIsolateDedicatedPoolSizes)
+	if numaCap <= 0 || totalAllocated+liveSize <= numaCap {
+		general.InfoS("apply domain-scoped live reclaim floor",
+			"numaID", numaID, "currentReclaim", reclaimedCoresSize,
+			"liveReclaim", liveSize, "totalAllocated", totalAllocated,
+			"numaCapacity", numaCap)
+		return liveSize
+	}
+	general.InfoS("skip live reclaim floor: capacity overflow",
+		"numaID", numaID, "currentReclaim", reclaimedCoresSize,
+		"liveReclaim", liveSize, "totalAllocated", totalAllocated,
+		"numaCapacity", numaCap)
+	return reclaimedCoresSize
+}
+
 func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 	regionHelper *RegionMapHelper,
 	numaID int,
@@ -1543,46 +1597,7 @@ func (pa *ProvisionAssemblerCommon) assembleWithoutNUMAExclusivePool(
 		reservedForReclaim,
 	)
 
-	// Domain-scoped live reclaim continuity (best-effort).
-	// Keep reclaim at least at the QRM-committed live size only when:
-	//   - the current NUMA hosts an active ramp-up domain (real-NUMA binding), OR
-	//   - this is the global/faked NUMA and the global domain is active.
-	// A global ramp-up MUST NOT broadcast its live floor to real NUMAs.
-	// The floor is skipped when dedicated + live > NUMA capacity: CPURequest is a
-	// hard guarantee for reclaim-disabled dedicated pools and must not be reduced.
-	if pa.calculationContext.LiveReclaimByNUMA != nil {
-		rampUpDomainSet := make(map[int]bool, len(pa.calculationContext.RampUpDomains))
-		for _, d := range pa.calculationContext.RampUpDomains {
-			rampUpDomainSet[d] = true
-		}
-		domainActive := false
-		if numaID == commonstate.FakedNUMAID {
-			domainActive = rampUpDomainSet[commonstate.FakedNUMAID]
-		} else {
-			domainActive = rampUpDomainSet[numaID]
-		}
-		if domainActive {
-			if liveSize, ok := pa.calculationContext.LiveReclaimByNUMA[numaID]; ok && liveSize > reclaimedCoresSize {
-				numaCap := 0
-				if pa.metaServer != nil && pa.metaServer.CPUDetails != nil {
-					numaCap = pa.metaServer.CPUDetails.CPUsInNUMANodes(numaID).Size()
-				}
-				totalAllocated := general.SumUpMapValues(shareAndIsolateDedicatedPoolSizes)
-				if numaCap <= 0 || totalAllocated+liveSize <= numaCap {
-					general.InfoS("apply domain-scoped live reclaim floor",
-						"numaID", numaID, "currentReclaim", reclaimedCoresSize,
-						"liveReclaim", liveSize, "totalAllocated", totalAllocated,
-						"numaCapacity", numaCap)
-					reclaimedCoresSize = liveSize
-				} else {
-					general.InfoS("skip live reclaim floor: capacity overflow",
-						"numaID", numaID, "currentReclaim", reclaimedCoresSize,
-						"liveReclaim", liveSize, "totalAllocated", totalAllocated,
-						"numaCapacity", numaCap)
-				}
-			}
-		}
-	}
+	reclaimedCoresSize = pa.applyDomainScopedLiveReclaimFloor(numaID, reclaimedCoresSize, shareAndIsolateDedicatedPoolSizes)
 
 	constraintScope := NewNonExclusiveReclaimConstraintScope(numaID)
 	desiredReclaimedCoresSize := reclaimedCoresSize
