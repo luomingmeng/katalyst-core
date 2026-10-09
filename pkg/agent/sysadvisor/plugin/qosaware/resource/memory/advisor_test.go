@@ -21,7 +21,6 @@ import (
 	"io/ioutil"
 	"os"
 	"reflect"
-	"strconv"
 	"sync"
 	"testing"
 
@@ -54,9 +53,11 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/spd"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	metricspool "github.com/kubewharf/katalyst-core/pkg/metrics/metrics-pool"
+	"github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	metricutil "github.com/kubewharf/katalyst-core/pkg/util/metric"
+	"github.com/kubewharf/katalyst-core/pkg/util/reclaim"
 )
 
 var qosLevel2PoolName = map[string]string{
@@ -109,6 +110,13 @@ func generateTestConfiguration(t *testing.T, checkpointDir, stateFileDir string)
 
 func newTestMemoryAdvisor(t *testing.T, pods []*v1.Pod, checkpointDir, stateFileDir string, fetcher metrictypes.MetricsFetcher, plugins []types.MemoryAdvisorPluginName) (*memoryResourceAdvisor, metacache.MetaCache) {
 	conf := generateTestConfiguration(t, checkpointDir, stateFileDir)
+	conf.GetDynamicConfiguration().ReclaimedPercentageByConsumer = map[string]int{
+		reclaim.GenericConsumerName: 100,
+	}
+	cpuTopology, err := machine.GenerateDummyCPUTopology(96, 2, 4)
+	require.NoError(t, err)
+	reclaim.UnregisterConsumer(reclaim.GenericConsumerName)
+	require.NoError(t, reclaim.RegisterNamedGenericConsumer(reclaim.GenericConsumerName, conf, &machine.KatalystMachineInfo{CPUTopology: cpuTopology}))
 	if len(plugins) == 0 {
 		conf.MemoryAdvisorPlugins = []types.MemoryAdvisorPluginName{memadvisorplugin.CacheReaper}
 	} else {
@@ -119,8 +127,6 @@ func newTestMemoryAdvisor(t *testing.T, pods []*v1.Pod, checkpointDir, stateFile
 	require.NoError(t, err)
 	require.NotNil(t, metaCache)
 
-	cpuTopology, err := machine.GenerateDummyCPUTopology(96, 2, 4)
-	require.NoError(t, err)
 	memoryTopology, err := machine.GenerateDummyMemoryTopology(4, 500<<30)
 	require.NoError(t, err)
 	memoryTopology.NormalMemoryCapacity = 1000 << 30
@@ -462,6 +468,30 @@ var cgroupNUMAMetrics = []cgroupNUMAMetric{
 		metricName:  coreconsts.MetricsMemTotalPerNumaCgroup,
 		numaID:      3,
 		cgroupPath:  "/kubepods/besteffort",
+		metricValue: metricutil.MetricData{Value: 6 << 30},
+	},
+	{
+		metricName:  coreconsts.MetricsMemTotalPerNumaCgroup,
+		numaID:      0,
+		cgroupPath:  "/kubepods/besteffort-0",
+		metricValue: metricutil.MetricData{Value: 6 << 30},
+	},
+	{
+		metricName:  coreconsts.MetricsMemTotalPerNumaCgroup,
+		numaID:      1,
+		cgroupPath:  "/kubepods/besteffort-1",
+		metricValue: metricutil.MetricData{Value: 6 << 30},
+	},
+	{
+		metricName:  coreconsts.MetricsMemTotalPerNumaCgroup,
+		numaID:      2,
+		cgroupPath:  "/kubepods/besteffort-2",
+		metricValue: metricutil.MetricData{Value: 6 << 30},
+	},
+	{
+		metricName:  coreconsts.MetricsMemTotalPerNumaCgroup,
+		numaID:      3,
+		cgroupPath:  "/kubepods/besteffort-3",
 		metricValue: metricutil.MetricData{Value: 6 << 30},
 	},
 }
@@ -1266,8 +1296,36 @@ func TestUpdate(t *testing.T) {
 					{
 						CgroupPath: "/kubepods/besteffort",
 						Values: map[string]string{
-							string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes): strconv.Itoa(240 << 30),
-							string(memoryadvisor.ControlKnobKeyMemoryHigh):         strconv.FormatInt(int64(0.95*float64(240<<30)), 10),
+							string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes): "257698037760",
+							string(memoryadvisor.ControlKnobKeyMemoryHigh):         "244813135872",
+						},
+					},
+					{
+						CgroupPath: "/kubepods/besteffort-0",
+						Values: map[string]string{
+							string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes): "64424509440",
+							string(memoryadvisor.ControlKnobKeyMemoryHigh):         "61203283968",
+						},
+					},
+					{
+						CgroupPath: "/kubepods/besteffort-1",
+						Values: map[string]string{
+							string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes): "64424509440",
+							string(memoryadvisor.ControlKnobKeyMemoryHigh):         "61203283968",
+						},
+					},
+					{
+						CgroupPath: "/kubepods/besteffort-2",
+						Values: map[string]string{
+							string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes): "64424509440",
+							string(memoryadvisor.ControlKnobKeyMemoryHigh):         "61203283968",
+						},
+					},
+					{
+						CgroupPath: "/kubepods/besteffort-3",
+						Values: map[string]string{
+							string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes): "64424509440",
+							string(memoryadvisor.ControlKnobKeyMemoryHigh):         "61203283968",
 						},
 					},
 				},
@@ -1323,8 +1381,36 @@ func TestUpdate(t *testing.T) {
 					{
 						CgroupPath: "/kubepods/besteffort",
 						Values: map[string]string{
-							string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes): strconv.Itoa(184 << 30),
-							string(memoryadvisor.ControlKnobKeyMemoryHigh):         strconv.FormatInt(187690070835, 10),
+							string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes): "197568495616",
+							string(memoryadvisor.ControlKnobKeyMemoryHigh):         "187690070835",
+						},
+					},
+					{
+						CgroupPath: "/kubepods/besteffort-0",
+						Values: map[string]string{
+							string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes): "49392123904",
+							string(memoryadvisor.ControlKnobKeyMemoryHigh):         "46922517708",
+						},
+					},
+					{
+						CgroupPath: "/kubepods/besteffort-1",
+						Values: map[string]string{
+							string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes): "49392123904",
+							string(memoryadvisor.ControlKnobKeyMemoryHigh):         "46922517708",
+						},
+					},
+					{
+						CgroupPath: "/kubepods/besteffort-2",
+						Values: map[string]string{
+							string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes): "49392123904",
+							string(memoryadvisor.ControlKnobKeyMemoryHigh):         "46922517708",
+						},
+					},
+					{
+						CgroupPath: "/kubepods/besteffort-3",
+						Values: map[string]string{
+							string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes): "49392123904",
+							string(memoryadvisor.ControlKnobKeyMemoryHigh):         "46922517708",
 						},
 					},
 				},
@@ -1345,13 +1431,21 @@ func TestUpdate(t *testing.T) {
 					},
 				},
 			},
-			reclaimedEnable:  true,
-			wantErr:          true,
-			wantHeadroom:     *resource.NewQuantity(996<<30, resource.DecimalSI),
-			nodeMetrics:      defaultNodeMetrics,
-			numaMetrics:      defaultNumaMetrics,
-			plugins:          []types.MemoryAdvisorPluginName{memadvisorplugin.MemoryGuard},
-			wantAdviceResult: &types.InternalMemoryCalculationResult{},
+			reclaimedEnable: true,
+			wantErr:         true,
+			wantHeadroom:    *resource.NewQuantity(996<<30, resource.DecimalSI),
+			nodeMetrics:     defaultNodeMetrics,
+			numaMetrics:     defaultNumaMetrics,
+			plugins:         []types.MemoryAdvisorPluginName{memadvisorplugin.MemoryGuard},
+			// cgroupNUMAMetrics intentionally omitted: memory_guard's
+			// calculateReclaimedMemoryLimitFor must fail-fast when the
+			// per-NUMA cgroup metric is missing. That makes Reconcile
+			// return an error, which advisor.update aggregates as a
+			// non-fatal error while still returning a non-nil result
+			// with no ExtraEntries.
+			wantAdviceResult: &types.InternalMemoryCalculationResult{
+				ExtraEntries: nil,
+			},
 		},
 		{
 			name: "memory offloading",
@@ -4466,11 +4560,34 @@ func TestUpdate(t *testing.T) {
 			mockmu.Lock()
 			defer mockmu.Unlock()
 
-			if len(tt.zoneInfos) > 0 {
+			// memory-guard decides which reclaim cgroup paths are materialized by
+			// probing the real cgroupfs. On a plain test host none of the reclaim
+			// paths exist, so without this patch every configured reclaim cgroup is
+			// filtered out: the per-NUMA usage baseline silently drops to 0 (which
+			// desynchronizes the memory.high / memory.max golden values below) and the
+			// missing-per-NUMA-metric fail-fast the "failed" subtest relies on never
+			// fires. Treat every configured reclaim cgroup path as materialized so
+			// the mocked per-NUMA metrics drive the numbers deterministically,
+			// independent of the host cgroupfs layout.
+			mockReclaimCgroupPaths := false
+			for _, p := range tt.plugins {
+				if p == memadvisorplugin.MemoryGuard {
+					mockReclaimCgroupPaths = true
+				}
+			}
+
+			if len(tt.zoneInfos) > 0 || mockReclaimCgroupPaths {
 				defer mockey.UnPatchAll()
-				mockey.Mock(machine.GetNormalZoneInfo).To(func(s string) []machine.NormalZoneInfo {
-					return tt.zoneInfos
-				}).Build()
+				if len(tt.zoneInfos) > 0 {
+					mockey.Mock(machine.GetNormalZoneInfo).To(func(s string) []machine.NormalZoneInfo {
+						return tt.zoneInfos
+					}).Build()
+				}
+				if mockReclaimCgroupPaths {
+					mockey.Mock(common.GetExistingRelativeCgroupPaths).To(func(relativePaths ...string) []string {
+						return relativePaths
+					}).Build()
+				}
 			}
 			ckDir, err := ioutil.TempDir("", "checkpoint-TestUpdate")
 			require.NoError(t, err)
