@@ -239,8 +239,6 @@ func testMemoryOffloadingWithAbsolutePath(t *testing.T) {
 
 func TestDyingMemcgReclaimWithAbsolutePath(t *testing.T) {
 	t.Parallel()
-	mu.Lock()
-	defer mu.Unlock()
 
 	t.Run("missing reclaim file", func(t *testing.T) {
 		t.Parallel()
