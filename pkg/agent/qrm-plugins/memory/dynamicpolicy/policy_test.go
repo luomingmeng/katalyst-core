@@ -6038,14 +6038,23 @@ func TestSwitchBetweenAPIs(t *testing.T) {
 				// - verify that memory plugin switches to GetAdvice
 				as := require.New(t)
 
-				lwEndedChan := make(chan time.Time)
+				// lwStartedChan is closed the moment the plugin invokes the
+				// ListAndWatch handler; lwEndedChan is closed by the test to
+				// release it. This replaces the previously bare time.Sleep so
+				// the test proceeds deterministically as soon as the plugin has
+				// actually fallen back to ListAndWatch, rather than guessing a
+				// fixed delay that is flaky under -race and parallel load.
+				lwStartedChan := make(chan struct{})
+				lwEndedChan := make(chan struct{})
 				unimplementedGetAdviceCall := memoryAdvisorServer.
 					On("GetAdvice", mock.Anything, mock.Anything).
 					Once().
 					Return((*advisorsvc.GetAdviceResponse)(nil), status.Error(codes.Unimplemented, "GetAdvice not implemented"))
 				memoryAdvisorServer.On("ListAndWatch", mock.Anything, mock.Anything).
-					Once().
-					WaitUntil(lwEndedChan).
+					Run(func(args mock.Arguments) {
+						close(lwStartedChan)
+						<-lwEndedChan
+					}).
 					Return(nil).
 					NotBefore(unimplementedGetAdviceCall)
 
@@ -6053,29 +6062,36 @@ func TestSwitchBetweenAPIs(t *testing.T) {
 				as.NoError(err)
 				defer dynamicPolicy.Stop()
 
-				// Wait for the plugin to call advisor
-				time.Sleep(3 * time.Second)
+				// Wait for the plugin to have fallen back to ListAndWatch.
+				select {
+				case <-lwStartedChan:
+				case <-time.After(10 * time.Second):
+					t.Fatalf("ListAndWatch not started by plugin")
+				}
 				memoryAdvisorServer.AssertExpectations(t)
 
 				// ListAndWatch in progress, simulate an upgrade
 				unimplementedGetAdviceCall.Unset()
 
-				getAdviceCalledChan := make(chan struct{})
+				getAdviceCalledChan := make(chan struct{}, 1)
 				memoryAdvisorServer.
 					On("GetAdvice", mock.Anything, mock.Anything).
 					Run(func(args mock.Arguments) {
-						getAdviceCalledChan <- struct{}{}
+						select {
+						case getAdviceCalledChan <- struct{}{}:
+						default:
+						}
 					}).
 					Return(&advisorsvc.GetAdviceResponse{}, nil)
 
 				// terminate the old ListAndWatch
-				lwEndedChan <- time.Now()
+				close(lwEndedChan)
 
 				// plugin should switch to GetAdvice and call it periodically
 				for i := 0; i < 5; i++ {
 					select {
 					case <-getAdviceCalledChan:
-					case <-time.After(dynamicPolicy.getAdviceInterval * 2):
+					case <-time.After(dynamicPolicy.getAdviceInterval * 5):
 						t.Fatalf("GetAdvice not called")
 					}
 				}
@@ -6119,21 +6135,43 @@ func TestSwitchBetweenAPIs(t *testing.T) {
 
 				// simulate a downgrade
 				// lock to ensure that policy doesn't call GetAdvice after we have removed the old expectation but haven't set the new one
+				lwStartedChan := make(chan struct{})
+				lwEndedChan := make(chan struct{})
+				unimplementedCalledChan := make(chan struct{})
 				dynamicPolicy.Lock()
 				implementedGetAdviceCall.Unset()
 				unimplementedGetAdviceCall := memoryAdvisorServer.
 					On("GetAdvice", mock.Anything, mock.Anything).
 					Once().
+					Run(func(args mock.Arguments) {
+						close(unimplementedCalledChan)
+					}).
 					Return((*advisorsvc.GetAdviceResponse)(nil), status.Error(codes.Unimplemented, "GetAdvice not implemented"))
 				memoryAdvisorServer.On("ListAndWatch", mock.Anything, mock.Anything).
-					After(3 * time.Hour).
+					Run(func(args mock.Arguments) {
+						close(lwStartedChan)
+						<-lwEndedChan
+					}).
 					NotBefore(unimplementedGetAdviceCall).
 					Once().
 					Return(nil)
 				dynamicPolicy.Unlock()
 
-				time.Sleep(3 * time.Second)
+				// Wait deterministically for the plugin to poll the downgraded,
+				// unimplemented GetAdvice and then fall back to ListAndWatch,
+				// instead of guessing a fixed sleep.
+				select {
+				case <-unimplementedCalledChan:
+				case <-time.After(10 * time.Second):
+					t.Fatalf("downgraded GetAdvice not called")
+				}
+				select {
+				case <-lwStartedChan:
+				case <-time.After(10 * time.Second):
+					t.Fatalf("ListAndWatch not started after downgrade")
+				}
 				memoryAdvisorServer.AssertExpectations(t)
+				close(lwEndedChan)
 			},
 		},
 	} {
