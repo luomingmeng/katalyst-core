@@ -28,6 +28,8 @@ import (
 	"strconv"
 	"time"
 
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/util"
 	"github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
@@ -79,6 +81,20 @@ func ApplyCPUWithRelativePath(relCgroupPath string, data *common.CPUData) error 
 	return GetManager().ApplyCPU(absCgroupPath, data)
 }
 
+// ApplyCPUWithRelativePaths applies the same CPUData to each relative cgroup
+// path. It continues on failure and returns an aggregated error over every
+// failing path, so a single missing subtree does not block updates to sibling
+// subtrees and every failure is surfaced.
+func ApplyCPUWithRelativePaths(relCgroupPaths []string, data *common.CPUData) error {
+	var errs []error
+	for _, relCgroupPath := range relCgroupPaths {
+		if err := ApplyCPUWithRelativePath(relCgroupPath, data); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return utilerrors.NewAggregate(errs)
+}
+
 func ApplyCPUWithAbsolutePath(absCgroupPath string, data *common.CPUData) error {
 	if data == nil {
 		return fmt.Errorf("ApplyCPUWithAbsolutePath with nil cgroup data")
@@ -111,6 +127,21 @@ func ApplyCPUSetPartitionWithRelativePath(relCgroupPath string, partitionFlag co
 
 func ApplyCPUSetPartitionWithAbsolutePath(absCgroupPath string, partitionFlag common.CPUSetPartitionFlag) error {
 	return GetManager().ApplyCPUSetPartition(absCgroupPath, partitionFlag)
+}
+
+// ApplySchedLoadBalanceWithRelativePath writes cpuset.sched_load_balance for
+// the cgroup at relCgroupPath. It is only meaningful on cgroup v1; on v2 the
+// underlying manager returns common.ErrNotSupported and callers should decide
+// whether to short-circuit or surface the error.
+func ApplySchedLoadBalanceWithRelativePath(relCgroupPath string, enabled bool) error {
+	absCgroupPath := common.GetAbsCgroupPath(common.CgroupSubsysCPUSet, relCgroupPath)
+	return GetManager().ApplySchedLoadBalance(absCgroupPath, enabled)
+}
+
+// ApplySchedLoadBalanceWithAbsolutePath mirrors ApplySchedLoadBalanceWithRelativePath
+// for callers that already resolved the absolute cgroup path.
+func ApplySchedLoadBalanceWithAbsolutePath(absCgroupPath string, enabled bool) error {
+	return GetManager().ApplySchedLoadBalance(absCgroupPath, enabled)
 }
 
 func ApplyCPUSetForContainer(podUID, containerId string, data *common.CPUSetData) error {
@@ -404,7 +435,7 @@ func SetExtraCGMemLimitWithTimeoutAndRelCGPath(ctx context.Context, relCgroupPat
 }
 
 func SetExtraCGMemLimitWithTimeoutAndAbsCGPath(timeoutSecs int, absCgroupPath string, nbytes int64) error {
-	if nbytes == 0 {
+	if nbytes < 0 {
 		return fmt.Errorf("invalid memory limit nbytes: %d", nbytes)
 	}
 
@@ -414,10 +445,6 @@ func SetExtraCGMemLimitWithTimeoutAndAbsCGPath(timeoutSecs int, absCgroupPath st
 	)
 
 	if common.CheckCgroup2UnifiedMode() {
-		if nbytes == 0 {
-			general.Infof("[SetExtraCGMemLimitWithTimeoutAndAbsCGPath] skip drop cache on %s since nbytes is zero", absCgroupPath)
-			return nil
-		}
 		// cgv2
 		cgroupFile = "memory.max"
 	} else {
