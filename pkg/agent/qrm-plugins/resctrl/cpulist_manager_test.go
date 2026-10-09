@@ -244,3 +244,199 @@ func TestIsClosDirExcludesReservedRootEntries(t *testing.T) {
 	}
 	require.False(t, got["a_regular_file"], "regular files must not be treated as a CLOS dir")
 }
+
+// TestCPUListManagerOwnsEpochOnItsOwnCreation pins that when the manager
+// materializes a CLOS via ApplyCPUList it records the new directory identity
+// and advances the epoch synchronously, without waiting for a ListManagedClos
+// poll to re-derive the recreation from an inode diff.
+func TestCPUListManagerOwnsEpochOnItsOwnCreation(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, cpus), []byte("ffffffff\n"), 0o644))
+
+	manager := newCPUListManagerWithUpdater(root, nil)
+	require.NoError(t, manager.ApplyCPUList(context.Background(), "dedicated", "1"))
+
+	manager.mu.Lock()
+	epoch := manager.epochs["dedicated"]
+	_, hasIdentity := manager.handles["dedicated"]
+	manager.mu.Unlock()
+	require.Equal(t, uint64(1), epoch, "manager-created CLOS must own epoch 1 immediately")
+	require.True(t, hasIdentity, "manager must hold a handle to the created CLOS")
+
+	// A subsequent poll must not double-bump: the freshly recorded identity
+	// already matches the on-disk directory.
+	clos, err := manager.ListManagedClos(context.Background())
+	require.NoError(t, err)
+	require.Len(t, clos, 1)
+	require.Equal(t, uint64(1), clos[0].Epoch)
+}
+
+// TestCPUListManagerRecreatedClosBumpsEpoch verifies that deleting a CLOS and
+// having the manager recreate the same path advances the epoch even when the
+// recreation is performed by ApplyCPUList itself (the inode-reuse friendly
+// path that does not rely on a filesystem inode diff).
+func TestCPUListManagerRecreatedClosBumpsEpoch(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, cpus), []byte("ffffffff\n"), 0o644))
+	closPath := filepath.Join(root, "dedicated")
+	require.NoError(t, os.Mkdir(closPath, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(closPath, cpus), nil, 0o644))
+
+	manager := newCPUListManagerWithUpdater(root, nil)
+	first, err := manager.ListManagedClos(context.Background())
+	require.NoError(t, err)
+	require.Len(t, first, 1)
+
+	require.NoError(t, os.RemoveAll(closPath))
+	// Recreate via the manager instead of raw mkdir so the epoch transition is
+	// owned by the manager rather than inferred from an inode change.
+	require.NoError(t, manager.ApplyCPUList(context.Background(), "dedicated", "1"))
+
+	recreated, err := manager.ListManagedClos(context.Background())
+	require.NoError(t, err)
+	require.Len(t, recreated, 1)
+	require.Greater(t, recreated[0].Epoch, first[0].Epoch, "recreated same-path CLOS must bump epoch")
+}
+
+// TestCPUListManagerDropsEpochForDeletedClos ensures epoch generations do not
+// leak for CLOS that have disappeared.
+func TestCPUListManagerDropsEpochForDeletedClos(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, cpus), []byte("ffffffff\n"), 0o644))
+	require.NoError(t, os.Mkdir(filepath.Join(root, "dedicated"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "dedicated", cpus), nil, 0o644))
+
+	manager := newCPUListManagerWithUpdater(root, nil)
+	_, err := manager.ListManagedClos(context.Background())
+	require.NoError(t, err)
+
+	require.NoError(t, os.RemoveAll(filepath.Join(root, "dedicated")))
+	_, err = manager.ListManagedClos(context.Background())
+	require.NoError(t, err)
+
+	manager.mu.Lock()
+	_, leaked := manager.epochs["dedicated"]
+	_, leakedHandle := manager.handles["dedicated"]
+	handleCount := len(manager.handles)
+	manager.mu.Unlock()
+	require.False(t, leaked, "epoch must not leak for a deleted CLOS")
+	require.False(t, leakedHandle, "handle must be closed/removed for a deleted CLOS")
+	require.Zero(t, handleCount, "no handles should remain after the CLOS disappears")
+}
+
+// TestCPUListManagerConcurrentListAndApply is the concurrency boundary:
+// ListManagedClos and ApplyCPUList must be serializable on the manager mutex
+// without data races, and observed epochs must stay monotonic per CLOS.
+func TestCPUListManagerConcurrentListAndApply(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, cpus), []byte("ffffffff\n"), 0o644))
+	require.NoError(t, os.Mkdir(filepath.Join(root, "dedicated"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "dedicated", cpus), nil, 0o644))
+
+	manager := newCPUListManagerWithUpdater(root, nil)
+	ctx := context.Background()
+
+	var readers sync.WaitGroup
+	var writers sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < 4; i++ {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_, _ = manager.ListManagedClos(ctx)
+				}
+			}
+		}()
+	}
+	for i := 0; i < 2; i++ {
+		writers.Add(1)
+		go func() {
+			defer writers.Done()
+			for j := 0; j < 50; j++ {
+				_ = manager.ApplyCPUList(ctx, "dedicated", "1")
+			}
+		}()
+	}
+	writers.Wait()
+	close(stop)
+	readers.Wait()
+
+	clos, err := manager.ListManagedClos(ctx)
+	require.NoError(t, err)
+	require.Len(t, clos, 1)
+	require.GreaterOrEqual(t, clos[0].Epoch, uint64(1))
+}
+
+// TestCPUListManagerHandleLifecycleAcrossRecreateLoops exercises the fd fence
+// under repeated external delete+recreate: each recreation must bump the epoch,
+// the manager must keep exactly one open handle per live CLOS, and the epoch
+// must stay monotonic. On Linux the open handle pins the old inode so the new
+// mkdir cannot recycle it, making the recreation detectable even on filesystems
+// that reuse inode numbers.
+func TestCPUListManagerHandleLifecycleAcrossRecreateLoops(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, cpus), []byte("ffffffff\n"), 0o644))
+	closPath := filepath.Join(root, "dedicated")
+
+	manager := newCPUListManagerWithUpdater(root, nil)
+	prevEpoch := uint64(0)
+	for i := 0; i < 5; i++ {
+		require.NoError(t, os.Mkdir(closPath, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(closPath, cpus), nil, 0o644))
+
+		clos, err := manager.ListManagedClos(context.Background())
+		require.NoError(t, err)
+		require.Len(t, clos, 1)
+		require.Greater(t, clos[0].Epoch, prevEpoch, "recreate %d must bump epoch", i)
+		prevEpoch = clos[0].Epoch
+
+		manager.mu.Lock()
+		handleCount := len(manager.handles)
+		_, has := manager.handles["dedicated"]
+		manager.mu.Unlock()
+		require.Equal(t, 1, handleCount, "must hold exactly one handle")
+		require.True(t, has, "must hold a handle to dedicated")
+
+		require.NoError(t, os.RemoveAll(closPath))
+	}
+
+	// After the final removal, a poll must observe the CLOS gone and close the
+	// handle (no fd leak).
+	clos, err := manager.ListManagedClos(context.Background())
+	require.NoError(t, err)
+	require.Empty(t, clos)
+	manager.mu.Lock()
+	handleCount := len(manager.handles)
+	_, hasEpoch := manager.epochs["dedicated"]
+	manager.mu.Unlock()
+	require.Zero(t, handleCount, "handle must be closed after the CLOS disappears")
+	require.False(t, hasEpoch, "epoch must be dropped after the CLOS disappears")
+}
+
+// TestCPUListManagerRootResetClosesHandles ensures a missing resctrl root closes
+// every held directory handle instead of leaking fds.
+func TestCPUListManagerRootResetClosesHandles(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, cpus), []byte("ffffffff\n"), 0o644))
+	require.NoError(t, os.Mkdir(filepath.Join(root, "dedicated"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "dedicated", cpus), nil, 0o644))
+
+	manager := newCPUListManagerWithUpdater(root, nil)
+	_, err := manager.ListManagedClos(context.Background())
+	require.NoError(t, err)
+	manager.mu.Lock()
+	require.Len(t, manager.handles, 1)
+	manager.mu.Unlock()
+
+	require.NoError(t, os.RemoveAll(root))
+	_, err = manager.ListManagedClos(context.Background())
+	require.NoError(t, err)
+	manager.mu.Lock()
+	require.Empty(t, manager.handles, "all handles must be closed when root vanishes")
+	manager.mu.Unlock()
+}

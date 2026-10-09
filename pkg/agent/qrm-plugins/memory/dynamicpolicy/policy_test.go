@@ -81,6 +81,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/asyncworker"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	"github.com/kubewharf/katalyst-core/pkg/util/qos"
+	"github.com/kubewharf/katalyst-core/pkg/util/reclaim"
 )
 
 const (
@@ -389,6 +390,64 @@ func TestClearResidualState(t *testing.T) {
 		},
 	}
 	dynamicPolicy.clearResidualState(nil, nil, nil, nil, nil)
+}
+
+func TestClearResidualStateTreatsFailedPodAsResidual(t *testing.T) {
+	t.Parallel()
+
+	as := require.New(t)
+
+	tmpDir, err := ioutil.TempDir("", "checkpoint-TestClearResidualStateTreatsFailedPodAsResidual")
+	as.Nil(err)
+	defer os.RemoveAll(tmpDir)
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	as.Nil(err)
+
+	machineInfo := &info.MachineInfo{}
+
+	dynamicPolicy, err := getTestDynamicPolicyWithInitialization(cpuTopology, machineInfo, tmpDir)
+	as.Nil(err)
+
+	const podUID = "failed-pod-uid"
+	dynamicPolicy.state.SetPodResourceEntries(state.PodResourceEntries{
+		v1.ResourceMemory: state.PodEntries{
+			podUID: state.ContainerEntries{
+				"main": &state.AllocationInfo{
+					AllocationMeta: commonstate.AllocationMeta{
+						PodUid:        podUID,
+						PodNamespace:  "default",
+						PodName:       "failed-pod",
+						ContainerName: "main",
+						QoSLevel:      consts.PodAnnotationQoSLevelSharedCores,
+					},
+					AggregatedQuantity:   256 * 1024 * 1024,
+					NumaAllocationResult: machine.NewCPUSet(0),
+					TopologyAwareAllocations: map[int]uint64{
+						0: 256 * 1024 * 1024,
+					},
+				},
+			},
+		},
+	}, true)
+	dynamicPolicy.metaServer = &metaserver.MetaServer{
+		MetaAgent: &agent.MetaAgent{
+			PodFetcher: &pod.PodFetcherStub{PodList: []*v1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						UID:       types.UID(podUID),
+						Name:      "failed-pod",
+						Namespace: "default",
+					},
+					Status: v1.PodStatus{Phase: v1.PodFailed},
+				},
+			}},
+		},
+	}
+
+	dynamicPolicy.clearResidualState(nil, nil, nil, nil, nil)
+
+	as.Equal(int64(1), dynamicPolicy.residualHitMap[podUID])
 }
 
 func TestSetMemoryMigrate(t *testing.T) {
@@ -2659,6 +2718,137 @@ func TestGetTopologyAwareAllocatableResources(t *testing.T) {
 	}, resp)
 }
 
+func TestAddReclaimedMemoryAllocatable(t *testing.T) {
+	t.Parallel()
+	as := require.New(t)
+
+	tmpDir, err := ioutil.TempDir("", "checkpoint-TestAddReclaimedMemoryAllocatable")
+	as.Nil(err)
+	defer os.RemoveAll(tmpDir)
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	as.Nil(err)
+
+	machineInfo, err := machine.GenerateDummyMachineInfo(4, 32)
+	as.Nil(err)
+
+	dynamicPolicy, err := getTestDynamicPolicyWithExtraResourcesWithInitialization(cpuTopology, machineInfo, tmpDir)
+	as.Nil(err)
+
+	numaNodes := dynamicPolicy.topology.CPUDetails.NUMANodes().ToSliceInt()
+
+	dynamicPolicy.state.SetNUMAHeadroom(map[int]int64{
+		0: 1000,
+		1: 2000,
+		2: 3000,
+		3: 4000,
+	}, false)
+
+	// Register multiple consumers so GetReclaimedPercentage returns each
+	// consumer's own percentage; the single-consumer force-100 rule only
+	// applies when exactly one consumer is registered in the whole registry.
+	reclaim.UnregisterConsumer("kcnr-a")
+	reclaim.UnregisterConsumer("kcnr-b")
+	reclaim.UnregisterConsumer("kcnr-c")
+	dynamicPolicy.dynamicConf.GetDynamicConfiguration().ReclaimedPercentageByConsumer = map[string]int{
+		"kcnr-a": 50,
+		"kcnr-b": 30,
+		"kcnr-c": 20,
+	}
+	reg := func(name string) {
+		require.NoError(t, reclaim.RegisterNamedGenericConsumer(name, config.NewConfiguration(), nil))
+	}
+	reg("kcnr-a")
+	reg("kcnr-b")
+	reg("kcnr-c")
+
+	memKey := string(consts.ReclaimedResourceMemory)
+
+	newResource := func(pct float64) *pluginapi.AllocatableTopologyAwareResource {
+		list := []*pluginapi.TopologyAwareQuantity{
+			{ResourceValue: 1000 * pct / 100, Node: 0},
+			{ResourceValue: 2000 * pct / 100, Node: 1},
+			{ResourceValue: 3000 * pct / 100, Node: 2},
+			{ResourceValue: 4000 * pct / 100, Node: 3},
+		}
+		return &pluginapi.AllocatableTopologyAwareResource{
+			IsNodeResource:                       false,
+			IsScalarResource:                     true,
+			AggregatedAllocatableQuantity:        10000 * pct / 100,
+			TopologyAwareAllocatableQuantityList: list,
+			AggregatedCapacityQuantity:           10000 * pct / 100,
+			TopologyAwareCapacityQuantityList:    list,
+		}
+	}
+
+	testCases := []struct {
+		name      string
+		consumers []string
+		expected  *pluginapi.AllocatableTopologyAwareResource // nil means no entry is added
+	}{
+		{
+			name:      "empty config adds no entry",
+			consumers: nil,
+			expected:  nil,
+		},
+		{
+			name:      "single configured consumer",
+			consumers: []string{"kcnr-a"},
+			expected:  newResource(50),
+		},
+		{
+			name:      "multiple configured consumers are summed",
+			consumers: []string{"kcnr-a", "kcnr-b"},
+			expected:  newResource(80),
+		},
+		{
+			name:      "summed percentage at 100",
+			consumers: []string{"kcnr-a", "kcnr-b", "kcnr-c"},
+			expected:  newResource(100),
+		},
+		{
+			name:      "unknown consumer contributes zero",
+			consumers: []string{"kcnr-a", "does-not-exist"},
+			expected:  newResource(50),
+		},
+	}
+
+	dynamicPolicy.enableReclaimedResourceAllocatableReporting = true
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			as := require.New(t)
+
+			allocatableResources := make(map[string]*pluginapi.AllocatableTopologyAwareResource)
+			dynamicPolicy.addReclaimedMemoryAllocatable(allocatableResources, numaNodes, tc.consumers)
+
+			if tc.expected == nil {
+				_, ok := allocatableResources[memKey]
+				as.False(ok, "expected no ReclaimedResourceMemory entry when config is empty")
+				return
+			}
+			as.Equal(tc.expected, allocatableResources[memKey])
+		})
+	}
+
+	// end-to-end: the ReclaimedResourceMemory entry is present in the full
+	// response when ReclaimConsumersForKCNR is configured.
+	dynamicPolicy.reclaimConsumersForKCNR = []string{"kcnr-a"}
+	dynamicPolicy.enableReclaimedResourceAllocatableReporting = false
+	resp, err := dynamicPolicy.GetTopologyAwareAllocatableResources(context.Background(),
+		&pluginapi.GetTopologyAwareAllocatableResourcesRequest{})
+	as.Nil(err)
+	_, found := resp.AllocatableResources[memKey]
+	as.False(found)
+
+	dynamicPolicy.enableReclaimedResourceAllocatableReporting = true
+	resp, err = dynamicPolicy.GetTopologyAwareAllocatableResources(context.Background(),
+		&pluginapi.GetTopologyAwareAllocatableResourcesRequest{})
+	as.Nil(err)
+	as.Equal(newResource(50), resp.AllocatableResources[memKey])
+}
+
 func TestGetTopologyAwareResources(t *testing.T) {
 	t.Parallel()
 
@@ -4354,6 +4544,7 @@ func TestNewAndStartDynamicPolicy(t *testing.T) {
 		GenericConfiguration: &generic.GenericConfiguration{},
 		AgentConfiguration: &configagent.AgentConfiguration{
 			GenericAgentConfiguration: &configagent.GenericAgentConfiguration{
+				BaseConfiguration:       &global.BaseConfiguration{},
 				QRMAdvisorConfiguration: &global.QRMAdvisorConfiguration{},
 				GenericQRMPluginConfiguration: &qrmconfig.GenericQRMPluginConfiguration{
 					StateDirectoryConfiguration: &statedirectory.StateDirectoryConfiguration{

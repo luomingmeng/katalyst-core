@@ -60,10 +60,10 @@ type closResourceUpdater interface {
 type cpuListManager struct {
 	root string
 
-	mu       sync.Mutex
-	epochs   map[string]uint64
-	previous map[string]os.FileInfo
-	updater  closResourceUpdater
+	mu      sync.Mutex
+	epochs  map[string]uint64
+	handles map[string]*os.File
+	updater closResourceUpdater
 }
 
 func NewCPUListManager() CPUListManager {
@@ -72,27 +72,41 @@ func NewCPUListManager() CPUListManager {
 
 func newCPUListManagerWithUpdater(root string, updater closResourceUpdater) *cpuListManager {
 	return &cpuListManager{
-		root:     root,
-		epochs:   make(map[string]uint64),
-		previous: make(map[string]os.FileInfo),
-		updater:  updater,
+		root:    root,
+		epochs:  make(map[string]uint64),
+		handles: make(map[string]*os.File),
+		updater: updater,
 	}
 }
 
+// ListManagedClos enumerates the CLOS directories currently present at the
+// resctrl root and reports each with an Epoch that advances whenever the
+// directory at that path is a different incarnation than the one the manager
+// previously observed.
+//
+// Identity fencing is done with held open directory file descriptors, not with
+// stat timestamps: while the manager keeps a CLOS directory open, the kernel
+// cannot recycle that inode, so a same-path delete+recreate is guaranteed to
+// land on a different inode. Comparing the still-open old handle's f.Stat() to
+// the current path stat via os.SameFile therefore detects the recreation
+// reliably even on filesystems that reuse inode numbers (resctrl kernfs, Linux
+// tmpfs). Detected recreations bump the epoch, swap the held handle, and close
+// the old one; CLOS that disappeared have their handles closed.
 func (m *cpuListManager) ListManagedClos(_ context.Context) ([]CPUListClos, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	entries, err := os.ReadDir(m.root)
 	if os.IsNotExist(err) {
-		m.previous = make(map[string]os.FileInfo)
+		m.closeAllHandlesLocked()
+		m.epochs = make(map[string]uint64)
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("read resctrl root %q: %w", m.root, err)
 	}
 
-	current := make(map[string]os.FileInfo)
+	seen := make(map[string]struct{}, len(entries))
 	clos := make([]CPUListClos, 0, len(entries))
 	for _, entry := range entries {
 		if !isClosDir(entry) {
@@ -102,14 +116,31 @@ func (m *cpuListManager) ListManagedClos(_ context.Context) ([]CPUListClos, erro
 		if err != nil {
 			return nil, fmt.Errorf("stat CLOS %q: %w", entry.Name(), err)
 		}
-		previous, existed := m.previous[entry.Name()]
-		if !existed || !os.SameFile(previous, info) {
-			m.epochs[entry.Name()]++
+		id := entry.Name()
+		seen[id] = struct{}{}
+
+		reincarnated := true
+		if old, ok := m.handles[id]; ok {
+			if oldStat, err := old.Stat(); err == nil && os.SameFile(oldStat, info) {
+				reincarnated = false
+			}
 		}
-		current[entry.Name()] = info
-		clos = append(clos, CPUListClos{ID: entry.Name(), Epoch: m.epochs[entry.Name()]})
+		if reincarnated {
+			m.epochs[id]++
+			m.replaceHandleLocked(id)
+		}
+		clos = append(clos, CPUListClos{ID: id, Epoch: m.epochs[id]})
 	}
-	m.previous = current
+	// Close handles for CLOS that disappeared since the last poll, and drop
+	// their epoch generations so a deleted CLOS cannot leak an fd/memory nor be
+	// resurrected by a later reuse of the same name carrying a stale generation.
+	for id, h := range m.handles {
+		if _, ok := seen[id]; !ok {
+			h.Close()
+			delete(m.handles, id)
+			delete(m.epochs, id)
+		}
+	}
 	return clos, nil
 }
 
@@ -129,6 +160,15 @@ func (m *cpuListManager) ApplyCPUList(_ context.Context, closID, target string) 
 				return created, nil
 			}
 			return created, err
+		}
+		if created {
+			// The manager just materialized a new CLOS directory incarnation.
+			// Own the epoch transition and record the directory identity now
+			// (after cpus exists) so the next poll matches on both inode and
+			// mtime without a spurious double-bump. This is in addition to the
+			// polling-time sameCLOSIdentity check, which also catches recreations
+			// the manager did not perform itself.
+			m.noteClosCreated(closID)
 		}
 		return created, nil
 	}
@@ -173,6 +213,42 @@ func (m *cpuListManager) ensureClos(closID string, create bool) (bool, error) {
 		return false, fmt.Errorf("create CLOS %q: %w", closID, err)
 	}
 	return true, nil
+}
+
+// noteClosCreated records that the manager has just created a new CLOS
+// directory incarnation. It advances the per-CLOS epoch and swaps the held
+// directory handle to the freshly created path so the next ListManagedClos poll
+// sees a matching handle (no double-bump) and keeps the old inode pinned only
+// until the swap. Opening the new handle is best-effort: on failure the next
+// poll reconciles by replacing whatever handle it finds.
+func (m *cpuListManager) noteClosCreated(closID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.epochs[closID]++
+	m.replaceHandleLocked(closID)
+}
+
+// replaceHandleLocked closes any previously held handle for closID and opens a
+// new one on the directory at the manager root. Callers must hold m.mu.
+func (m *cpuListManager) replaceHandleLocked(closID string) {
+	if old, ok := m.handles[closID]; ok {
+		old.Close()
+		delete(m.handles, closID)
+	}
+	f, err := os.Open(filepath.Join(m.root, closID))
+	if err != nil {
+		return
+	}
+	m.handles[closID] = f
+}
+
+// closeAllHandlesLocked closes every held CLOS directory handle and clears the
+// map. Callers must hold m.mu.
+func (m *cpuListManager) closeAllHandlesLocked() {
+	for id, h := range m.handles {
+		h.Close()
+		delete(m.handles, id)
+	}
 }
 
 func (m *cpuListManager) formatCPUListMask(target string) (string, error) {

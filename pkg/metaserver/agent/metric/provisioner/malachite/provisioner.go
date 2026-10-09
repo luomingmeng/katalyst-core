@@ -40,6 +40,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	utilmetric "github.com/kubewharf/katalyst-core/pkg/util/metric"
+	"github.com/kubewharf/katalyst-core/pkg/util/reclaim"
 )
 
 const (
@@ -190,12 +191,9 @@ func (m *MalachiteMetricsProvisioner) updateSystemStats() error {
 }
 
 func (m *MalachiteMetricsProvisioner) getCgroupPaths() []string {
-	cgroupPaths := []string{m.baseConf.ReclaimRelativeRootCgroupPath, common.CgroupFsRootPathBurstable, common.CgroupFsRootPathBestEffort}
-	for _, path := range common.GetNUMABindingReclaimRelativeRootCgroupPaths(m.baseConf.ReclaimRelativeRootCgroupPath,
-		m.machineInfo.CPUDetails.NUMANodes().ToSliceNoSortInt()) {
-		cgroupPaths = append(cgroupPaths, path)
-	}
-	cgroupPaths = append(cgroupPaths, m.baseConf.ReclaimRelativeRootCgroupPath)
+	cgroupPaths := []string{common.CgroupFsRootPathBurstable, common.CgroupFsRootPathBestEffort}
+
+	cgroupPaths = append(cgroupPaths, reclaim.AggregateAllCgroupPaths()...)
 
 	for _, path := range m.baseConf.OptionalRelativeCgroupPaths {
 		absPath := common.GetAbsCgroupPath(common.DefaultSelectedSubsys, path)
@@ -723,8 +721,18 @@ func (m *MalachiteMetricsProvisioner) processSystemCPUComputeData(systemComputeD
 			utilmetric.MetricData{Value: cpu.CPUSchedWait * 1000, Time: &updateTime})
 		m.metricStore.SetCPUMetric(cpuID, consts.MetricCPUIOWaitRatio,
 			utilmetric.MetricData{Value: cpu.CPUIowaitRatio, Time: &updateTime})
+		m.metricStore.SetCPUMetric(cpuID, consts.MetricCPUIrqRatio,
+			utilmetric.MetricData{Value: cpu.CPUIrqRatio, Time: &updateTime})
 
 		if cpu.CpiData != nil {
+			m.metricStore.SetCPUMetric(cpuID, consts.MetricCPUCPI,
+				utilmetric.MetricData{Value: cpu.CpiData.Cpi, Time: &updateTime})
+			m.metricStore.SetCPUMetric(cpuID, consts.MetricCPUCycles,
+				utilmetric.MetricData{Value: cpu.CpiData.Cycles, Time: &updateTime})
+			m.metricStore.SetCPUMetric(cpuID, consts.MetricCPUInstructions,
+				utilmetric.MetricData{Value: cpu.CpiData.Instructions, Time: &updateTime})
+			m.metricStore.SetCPUMetric(cpuID, consts.MetricCPUL3Misses,
+				utilmetric.MetricData{Value: cpu.CpiData.L3Misses, Time: &updateTime})
 			cpiTotal += cpu.CpiData.Cpi
 			cpiCount += 1
 		}

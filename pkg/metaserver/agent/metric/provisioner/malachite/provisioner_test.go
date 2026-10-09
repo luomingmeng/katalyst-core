@@ -17,15 +17,19 @@ limitations under the License.
 package malachite
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/bytedance/mockey"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"github.com/kubewharf/katalyst-core/pkg/config"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/global"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/consts"
@@ -36,15 +40,38 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	utilmetric "github.com/kubewharf/katalyst-core/pkg/util/metric"
+	"github.com/kubewharf/katalyst-core/pkg/util/reclaim"
 )
+
+// malachiteRegistryMu serializes tests in this file that mutate the
+// process-global reclaim consumer registry (or invoke code paths that
+// read it while others might be writing). Without it, concurrent
+// registry writes racing with a reader inside AggregateNumaBindingCgroupPaths
+// can corrupt sync.RWMutex state and panic ("RUnlock of unlocked
+// RWMutex"), and Test_noneExistMetricsProvisioner sees /kubesandbox*
+// entries leaked from Test_getCgroupPaths_multiReclaim.
+var malachiteRegistryMu sync.Mutex
 
 func Test_noneExistMetricsProvisioner(t *testing.T) {
 	t.Parallel()
 
-	store := utilmetric.NewMetricStore()
-
+	// This test asserts on getCgroupPaths() output, which reads the
+	// process-global reclaim registry. Serialize with
+	// malachiteRegistryMu, register a single generic consumer that
+	// produces the expected "test" / "test-<n>" paths, and clean up.
+	malachiteRegistryMu.Lock()
+	defer malachiteRegistryMu.Unlock()
+	reclaim.UnregisterConsumer(reclaim.GenericConsumerName)
 	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
 	assert.Nil(t, err)
+	machineInfo := &machine.KatalystMachineInfo{CPUTopology: cpuTopology}
+	c := config.NewConfiguration()
+	c.BaseConfiguration.ReclaimRelativeRootCgroupPath = "test"
+	c.BaseConfiguration.GenericReclaimedResourcePercentage = 100
+	require.NoError(t, reclaim.RegisterNamedGenericConsumer(reclaim.GenericConsumerName, c, machineInfo))
+	defer reclaim.UnregisterConsumer(reclaim.GenericConsumerName)
+
+	store := utilmetric.NewMetricStore()
 
 	implement := NewMalachiteMetricsProvisioner(&global.BaseConfiguration{
 		ReclaimRelativeRootCgroupPath: "test",
@@ -53,9 +80,7 @@ func Test_noneExistMetricsProvisioner(t *testing.T) {
 			OptionalRelativeCgroupPaths: []string{"d3", "d4"},
 		},
 	}, &metaserver.MetricConfiguration{}, metrics.DummyMetrics{}, &pod.PodFetcherStub{}, store,
-		&machine.KatalystMachineInfo{
-			CPUTopology: cpuTopology,
-		})
+		machineInfo)
 
 	fakeSystemCompute := &malachitetypes.SystemComputeData{
 		CPU: []malachitetypes.CPU{
@@ -220,6 +245,93 @@ func Test_noneExistMetricsProvisioner(t *testing.T) {
 	})
 }
 
+func Test_getCgroupPaths_multiReclaim(t *testing.T) {
+	t.Parallel()
+
+	// Serialize with sibling tests that touch the reclaim registry (see
+	// malachiteRegistryMu). Without this, the registry mutations below
+	// race Test_noneExistMetricsProvisioner and corrupt sync.RWMutex.
+	malachiteRegistryMu.Lock()
+	defer malachiteRegistryMu.Unlock()
+
+	store := utilmetric.NewMetricStore()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	assert.Nil(t, err)
+
+	// seed the process-global reclaim registry: the default GenericConsumer
+	// (path "test", per-NUMA "test-<n>") plus a test-only nested consumer
+	// (path "/kubesandbox", per-NUMA "/kubesandbox/kubesandbox-<n>").
+	reclaim.UnregisterConsumer(reclaim.GenericConsumerName)
+	reclaim.UnregisterConsumer("malachite-test-nested")
+	machineInfo := &machine.KatalystMachineInfo{CPUTopology: cpuTopology}
+	reclaim.RegisterFactory("malachite-test-nested", func(_ *config.Configuration, machineInfo *machine.KatalystMachineInfo) reclaim.ReclaimedConsumer {
+		c := &nestedConsumer{}
+		if machineInfo == nil || machineInfo.CPUTopology == nil {
+			return c
+		}
+		c.numaBindingCgroupPaths = make(map[int]string)
+		for _, n := range machineInfo.CPUDetails.NUMANodes().ToSliceNoSortInt() {
+			c.numaBindingCgroupPaths[n] = fmt.Sprintf("/kubesandbox/kubesandbox-%d", n)
+		}
+		return c
+	})
+	conf := config.NewConfiguration()
+	conf.BaseConfiguration.ReclaimRelativeRootCgroupPath = "test"
+	conf.BaseConfiguration.GenericReclaimedResourcePercentage = 0
+	conf.BaseConfiguration.ReclaimConsumers = []string{reclaim.GenericConsumerName, "malachite-test-nested"}
+	require.NoError(t, reclaim.SetupConsumers(conf, machineInfo))
+	defer reclaim.UnregisterConsumer(reclaim.GenericConsumerName)
+	defer reclaim.UnregisterConsumer("malachite-test-nested")
+
+	implement := NewMalachiteMetricsProvisioner(&global.BaseConfiguration{
+		ReclaimRelativeRootCgroupPath: "test",
+		MalachiteConfiguration: &global.MalachiteConfiguration{
+			GeneralRelativeCgroupPaths:  []string{"d1", "d2"},
+			OptionalRelativeCgroupPaths: []string{"d3"},
+		},
+	}, &metaserver.MetricConfiguration{}, metrics.DummyMetrics{}, &pod.PodFetcherStub{}, store,
+		machineInfo)
+
+	defer mockey.UnPatchAll()
+	mockey.Mock(general.IsPathExists).To(func(_ string) bool { return true }).Build()
+	mockey.Mock(common.CheckCgroup2UnifiedMode).To(func() bool { return true }).Build()
+
+	paths := implement.(*MalachiteMetricsProvisioner).getCgroupPaths()
+	assert.ElementsMatch(t, paths, []string{
+		"d1", "d2", "d3",
+		"/kubepods/burstable", "/kubepods/besteffort",
+		"test", "test-0", "test-1", "test-2", "test-3",
+		"/kubesandbox",
+		"/kubesandbox/kubesandbox-0",
+		"/kubesandbox/kubesandbox-1",
+		"/kubesandbox/kubesandbox-2",
+		"/kubesandbox/kubesandbox-3",
+	})
+}
+
+// nestedConsumer is a test-only ReclaimedConsumer that produces the nested "/"
+// per-NUMA shape (parent "/kubesandbox", child "/kubesandbox/kubesandbox-<n>").
+type nestedConsumer struct {
+	numaBindingCgroupPaths map[int]string
+}
+
+func (*nestedConsumer) GetCgroupPath() string { return "/kubesandbox" }
+
+func (n *nestedConsumer) GetNumaBindingCgroupPaths() map[int]string {
+	return n.numaBindingCgroupPaths
+}
+
+func (n *nestedConsumer) GetAllCgroupPaths() []string {
+	paths := []string{n.GetCgroupPath()}
+	for _, path := range n.numaBindingCgroupPaths {
+		if path != "" {
+			paths = append(paths, path)
+		}
+	}
+	return paths
+}
+
 func Test_getCPI(t *testing.T) {
 	t.Parallel()
 
@@ -293,6 +405,60 @@ func Test_getCPI(t *testing.T) {
 	data, err = store.GetContainerMetric("pod2", "container1", consts.MetricCPUCPIContainer)
 	assert.NoError(t, err)
 	assert.Equal(t, float64(1), data.Value)
+}
+
+func Test_processSystemCPUComputeData_persistsCyclesAndInstructions(t *testing.T) {
+	t.Parallel()
+
+	store := utilmetric.NewMetricStore()
+
+	cpuTopology, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+	assert.Nil(t, err)
+
+	implement := NewMalachiteMetricsProvisioner(&global.BaseConfiguration{
+		ReclaimRelativeRootCgroupPath: "test",
+		MalachiteConfiguration:        &global.MalachiteConfiguration{},
+	}, &metaserver.MetricConfiguration{}, metrics.DummyMetrics{}, &pod.PodFetcherStub{}, store,
+		&machine.KatalystMachineInfo{CPUTopology: cpuTopology})
+
+	// cpu0 carries CpiData so cycles/instructions/cpi must all be persisted;
+	// cpu1 has no CpiData so none of the perf metrics should exist for it.
+	fakeSystemCompute := &malachitetypes.SystemComputeData{
+		CPU: []malachitetypes.CPU{
+			{
+				Name: "cpu0",
+				CpiData: &malachitetypes.CpiData{
+					Cpi:          2.0,
+					Cycles:       200,
+					Instructions: 100,
+					L3Misses:     10,
+				},
+			},
+			{
+				Name: "cpu1",
+			},
+		},
+	}
+
+	implement.(*MalachiteMetricsProvisioner).processSystemCPUComputeData(fakeSystemCompute)
+
+	cycles, err := store.GetCPUMetric(0, consts.MetricCPUCycles)
+	assert.NoError(t, err)
+	assert.Equal(t, float64(200), cycles.Value)
+
+	instructions, err := store.GetCPUMetric(0, consts.MetricCPUInstructions)
+	assert.NoError(t, err)
+	assert.Equal(t, float64(100), instructions.Value)
+
+	cpi, err := store.GetCPUMetric(0, consts.MetricCPUCPI)
+	assert.NoError(t, err)
+	assert.Equal(t, float64(2.0), cpi.Value)
+
+	// cpu1 has no CpiData, so cycles/instructions must be absent.
+	_, err = store.GetCPUMetric(1, consts.MetricCPUCycles)
+	assert.Error(t, err)
+	_, err = store.GetCPUMetric(1, consts.MetricCPUInstructions)
+	assert.Error(t, err)
 }
 
 func Test_setContainerMbmTotalMetric(t *testing.T) {
