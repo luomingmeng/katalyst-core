@@ -30,4 +30,23 @@ const (
 	// QRMPodAnnotationTopologyAllocationKey is the annotation key for pod annotation about the pod's topology aware allocations.
 	// It is set during allocation, and kubelet will read the annotation.
 	QRMPodAnnotationTopologyAllocationKey = "qrm.katalyst.kubewharf.io/topology_allocation"
+
+	// AllowBypassCPUSetAdjustmentAnnotationKey is the PUBLIC annotation key a user may
+	// set on a pod/container to declare whether the QRM CPU plugin is allowed to bypass
+	// cpuset adjustment for that workload. The value is strictly the string "true" or
+	// "false"; any other value fails closed to "not allowed".
+	//
+	// Semantics:
+	//   - It records only the declared allow capability captured at admission. The
+	//     effective bypass decision is still the live EnableBypassCPUSetAdjustment switch
+	//     AND this recorded allow; the annotation is not a live-config snapshot and does
+	//     not disable the switch.
+	//   - It is a public, user-visible annotation: the plugin must never strip it at the
+	//     request boundary, and it naturally clones/merges/round-trips through the
+	//     ResourceAllocationResponse annotations exactly like any other user annotation.
+	//
+	// It lives in this neutral core consts package (rather than the CPU plugin consts)
+	// so the generic QRM config default and the CPU policy can both reference it without
+	// introducing a config -> cpu-plugin dependency.
+	AllowBypassCPUSetAdjustmentAnnotationKey = "qrm.katalyst.kubewharf.io/allow-bypass-cpuset-adjustment"
 )
