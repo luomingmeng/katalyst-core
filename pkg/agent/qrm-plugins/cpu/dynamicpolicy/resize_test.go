@@ -122,11 +122,12 @@ func TestSNBVPA(t *testing.T) {
 			uint64(0): 3,
 		},
 		Annotations: map[string]string{
-			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
-			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
-			consts.PodAnnotationMemoryEnhancementNumaExclusive: "false",
-			cpuconsts.CPUStateAnnotationKeyNUMAHint:            "0",
-			coreconsts.QRMPodAnnotationTopologyAllocationKey:   `{"Numa":{"0":{"allocated":{"cpu":"2"}}}}`,
+			consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelSharedCores,
+			coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+			consts.PodAnnotationMemoryEnhancementNumaBinding:    consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			consts.PodAnnotationMemoryEnhancementNumaExclusive:  "false",
+			cpuconsts.CPUStateAnnotationKeyNUMAHint:             "0",
+			coreconsts.QRMPodAnnotationTopologyAllocationKey:    `{"Numa":{"0":{"allocated":{"cpu":"2"}}}}`,
 		},
 	}, resp1.PodResources[req.PodUid].ContainerResources[testName].ResourceAllocation[string(v1.ResourceCPU)])
 
@@ -223,12 +224,13 @@ func TestSNBVPA(t *testing.T) {
 			uint64(0): 3,
 		},
 		Annotations: map[string]string{
-			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
-			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
-			consts.PodAnnotationMemoryEnhancementNumaExclusive: "false",
-			cpuconsts.CPUStateAnnotationKeyNUMAHint:            "0",
-			consts.PodAnnotationInplaceUpdateResizingKey:       "true",
-			coreconsts.QRMPodAnnotationTopologyAllocationKey:   `{"Numa":{"0":{"allocated":{"cpu":"3"}}}}`,
+			consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelSharedCores,
+			coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+			consts.PodAnnotationMemoryEnhancementNumaBinding:    consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			consts.PodAnnotationMemoryEnhancementNumaExclusive:  "false",
+			cpuconsts.CPUStateAnnotationKeyNUMAHint:             "0",
+			consts.PodAnnotationInplaceUpdateResizingKey:        "true",
+			coreconsts.QRMPodAnnotationTopologyAllocationKey:    `{"Numa":{"0":{"allocated":{"cpu":"3"}}}}`,
 		},
 	}, resp1.PodResources[req.PodUid].ContainerResources[testName].ResourceAllocation[string(v1.ResourceCPU)])
 }
@@ -384,12 +386,13 @@ func TestSNBInplaceUpdateResizeWithSidecar(t *testing.T) {
 			uint64(0): 11,
 		},
 		Annotations: map[string]string{
-			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
-			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
-			consts.PodAnnotationMemoryEnhancementNumaExclusive: "false",
-			cpuconsts.CPUStateAnnotationKeyNUMAHint:            "0",
-			consts.PodAnnotationAggregatedRequestsKey:          "{\"cpu\":\"3\"}",
-			coreconsts.QRMPodAnnotationTopologyAllocationKey:   `{"Numa":{"0":{"allocated":{"cpu":"3"}}}}`,
+			consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelSharedCores,
+			coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+			consts.PodAnnotationMemoryEnhancementNumaBinding:    consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			consts.PodAnnotationMemoryEnhancementNumaExclusive:  "false",
+			cpuconsts.CPUStateAnnotationKeyNUMAHint:             "0",
+			consts.PodAnnotationAggregatedRequestsKey:           "{\"cpu\":\"3\"}",
+			coreconsts.QRMPodAnnotationTopologyAllocationKey:    `{"Numa":{"0":{"allocated":{"cpu":"3"}}}}`,
 		},
 	}, allocationRes.PodResources[mainReq.PodUid].ContainerResources[mainContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
@@ -417,12 +420,13 @@ func TestSNBInplaceUpdateResizeWithSidecar(t *testing.T) {
 			uint64(0): 11,
 		},
 		Annotations: map[string]string{
-			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
-			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
-			consts.PodAnnotationMemoryEnhancementNumaExclusive: "false",
-			cpuconsts.CPUStateAnnotationKeyNUMAHint:            "0",
-			consts.PodAnnotationAggregatedRequestsKey:          "{\"cpu\":\"3\"}",
-			coreconsts.QRMPodAnnotationTopologyAllocationKey:   `{"Numa":{"0":{"allocated":{"cpu":"3"}}}}`,
+			consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelSharedCores,
+			coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+			consts.PodAnnotationMemoryEnhancementNumaBinding:    consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			consts.PodAnnotationMemoryEnhancementNumaExclusive:  "false",
+			cpuconsts.CPUStateAnnotationKeyNUMAHint:             "0",
+			consts.PodAnnotationAggregatedRequestsKey:           "{\"cpu\":\"3\"}",
+			coreconsts.QRMPodAnnotationTopologyAllocationKey:    `{"Numa":{"0":{"allocated":{"cpu":"3"}}}}`,
 		},
 	}, allocationRes.PodResources[mainReq.PodUid].ContainerResources[sidecarContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
@@ -503,13 +507,14 @@ func TestSNBInplaceUpdateResizeWithSidecar(t *testing.T) {
 			uint64(0): 11,
 		},
 		Annotations: map[string]string{
-			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
-			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
-			consts.PodAnnotationMemoryEnhancementNumaExclusive: "false",
-			cpuconsts.CPUStateAnnotationKeyNUMAHint:            "0",
-			consts.PodAnnotationInplaceUpdateResizingKey:       "true",
-			consts.PodAnnotationAggregatedRequestsKey:          "{\"cpu\":\"4\"}",
-			coreconsts.QRMPodAnnotationTopologyAllocationKey:   `{"Numa":{"0":{"allocated":{"cpu":"4"}}}}`,
+			consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelSharedCores,
+			coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+			consts.PodAnnotationMemoryEnhancementNumaBinding:    consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			consts.PodAnnotationMemoryEnhancementNumaExclusive:  "false",
+			cpuconsts.CPUStateAnnotationKeyNUMAHint:             "0",
+			consts.PodAnnotationInplaceUpdateResizingKey:        "true",
+			consts.PodAnnotationAggregatedRequestsKey:           "{\"cpu\":\"4\"}",
+			coreconsts.QRMPodAnnotationTopologyAllocationKey:    `{"Numa":{"0":{"allocated":{"cpu":"4"}}}}`,
 		},
 	}, resizeMainContainerAllocations.PodResources[podUID].ContainerResources[mainContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
@@ -525,13 +530,14 @@ func TestSNBInplaceUpdateResizeWithSidecar(t *testing.T) {
 			uint64(0): 11,
 		},
 		Annotations: map[string]string{
-			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
-			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
-			consts.PodAnnotationMemoryEnhancementNumaExclusive: "false",
-			cpuconsts.CPUStateAnnotationKeyNUMAHint:            "0",
-			consts.PodAnnotationInplaceUpdateResizingKey:       "true",
-			consts.PodAnnotationAggregatedRequestsKey:          "{\"cpu\":\"4\"}",
-			coreconsts.QRMPodAnnotationTopologyAllocationKey:   `{"Numa":{"0":{"allocated":{"cpu":"4"}}}}`,
+			consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelSharedCores,
+			coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+			consts.PodAnnotationMemoryEnhancementNumaBinding:    consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			consts.PodAnnotationMemoryEnhancementNumaExclusive:  "false",
+			cpuconsts.CPUStateAnnotationKeyNUMAHint:             "0",
+			consts.PodAnnotationInplaceUpdateResizingKey:        "true",
+			consts.PodAnnotationAggregatedRequestsKey:           "{\"cpu\":\"4\"}",
+			coreconsts.QRMPodAnnotationTopologyAllocationKey:    `{"Numa":{"0":{"allocated":{"cpu":"4"}}}}`,
 		},
 	}, resizeMainContainerAllocations.PodResources[podUID].ContainerResources[sidecarContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
@@ -661,13 +667,14 @@ func TestSNBInplaceUpdateResizeWithSidecar(t *testing.T) {
 			uint64(0): 11,
 		},
 		Annotations: map[string]string{
-			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
-			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
-			consts.PodAnnotationMemoryEnhancementNumaExclusive: "false",
-			cpuconsts.CPUStateAnnotationKeyNUMAHint:            "0",
-			consts.PodAnnotationInplaceUpdateResizingKey:       "true",
-			consts.PodAnnotationAggregatedRequestsKey:          "{\"cpu\":\"5\"}",
-			coreconsts.QRMPodAnnotationTopologyAllocationKey:   `{"Numa":{"0":{"allocated":{"cpu":"5"}}}}`,
+			consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelSharedCores,
+			coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+			consts.PodAnnotationMemoryEnhancementNumaBinding:    consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			consts.PodAnnotationMemoryEnhancementNumaExclusive:  "false",
+			cpuconsts.CPUStateAnnotationKeyNUMAHint:             "0",
+			consts.PodAnnotationInplaceUpdateResizingKey:        "true",
+			consts.PodAnnotationAggregatedRequestsKey:           "{\"cpu\":\"5\"}",
+			coreconsts.QRMPodAnnotationTopologyAllocationKey:    `{"Numa":{"0":{"allocated":{"cpu":"5"}}}}`,
 		},
 	}, resizeSidecarContainerAllocations.PodResources[podUID].ContainerResources[sidecarContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
@@ -683,13 +690,14 @@ func TestSNBInplaceUpdateResizeWithSidecar(t *testing.T) {
 			uint64(0): 11,
 		},
 		Annotations: map[string]string{
-			consts.PodAnnotationQoSLevelKey:                    consts.PodAnnotationQoSLevelSharedCores,
-			consts.PodAnnotationMemoryEnhancementNumaBinding:   consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
-			consts.PodAnnotationMemoryEnhancementNumaExclusive: "false",
-			cpuconsts.CPUStateAnnotationKeyNUMAHint:            "0",
-			consts.PodAnnotationInplaceUpdateResizingKey:       "true",
-			consts.PodAnnotationAggregatedRequestsKey:          "{\"cpu\":\"5\"}",
-			coreconsts.QRMPodAnnotationTopologyAllocationKey:   `{"Numa":{"0":{"allocated":{"cpu":"5"}}}}`,
+			consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelSharedCores,
+			coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+			consts.PodAnnotationMemoryEnhancementNumaBinding:    consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			consts.PodAnnotationMemoryEnhancementNumaExclusive:  "false",
+			cpuconsts.CPUStateAnnotationKeyNUMAHint:             "0",
+			consts.PodAnnotationInplaceUpdateResizingKey:        "true",
+			consts.PodAnnotationAggregatedRequestsKey:           "{\"cpu\":\"5\"}",
+			coreconsts.QRMPodAnnotationTopologyAllocationKey:    `{"Numa":{"0":{"allocated":{"cpu":"5"}}}}`,
 		},
 	}, resizeSidecarContainerAllocations.PodResources[podUID].ContainerResources[mainContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
@@ -788,7 +796,8 @@ func TestNonBindingShareCoresInplaceUpdateResize(t *testing.T) {
 			uint64(3): 2,
 		},
 		Annotations: map[string]string{
-			consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelSharedCores,
+			consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelSharedCores,
+			coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
 		},
 	}, resp1.PodResources[req.PodUid].ContainerResources[testName].ResourceAllocation[string(v1.ResourceCPU)])
 
@@ -867,8 +876,9 @@ func TestNonBindingShareCoresInplaceUpdateResize(t *testing.T) {
 			uint64(3): 2,
 		},
 		Annotations: map[string]string{
-			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelSharedCores,
-			consts.PodAnnotationInplaceUpdateResizingKey: "true",
+			consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelSharedCores,
+			coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+			consts.PodAnnotationInplaceUpdateResizingKey:        "true",
 		},
 	}, resp1.PodResources[req.PodUid].ContainerResources[testName].ResourceAllocation[string(v1.ResourceCPU)])
 
@@ -1023,8 +1033,9 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 			uint64(3): 10,
 		},
 		Annotations: map[string]string{
-			consts.PodAnnotationQoSLevelKey:           consts.PodAnnotationQoSLevelSharedCores,
-			consts.PodAnnotationAggregatedRequestsKey: "{\"cpu\":\"3\"}",
+			consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelSharedCores,
+			coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+			consts.PodAnnotationAggregatedRequestsKey:           "{\"cpu\":\"3\"}",
 		},
 	}, allocationRes.PodResources[podUID].ContainerResources[mainContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
@@ -1094,9 +1105,10 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 			uint64(3): 10,
 		},
 		Annotations: map[string]string{
-			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelSharedCores,
-			consts.PodAnnotationInplaceUpdateResizingKey: "true",
-			consts.PodAnnotationAggregatedRequestsKey:    "{\"cpu\":\"4\"}",
+			consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelSharedCores,
+			coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+			consts.PodAnnotationInplaceUpdateResizingKey:        "true",
+			consts.PodAnnotationAggregatedRequestsKey:           "{\"cpu\":\"4\"}",
 		},
 	}, resizeMainContainerAllocations.PodResources[podUID].ContainerResources[mainContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
@@ -1116,9 +1128,10 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 			uint64(3): 10,
 		},
 		Annotations: map[string]string{
-			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelSharedCores,
-			consts.PodAnnotationInplaceUpdateResizingKey: "true",
-			consts.PodAnnotationAggregatedRequestsKey:    "{\"cpu\":\"4\"}",
+			consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelSharedCores,
+			coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+			consts.PodAnnotationInplaceUpdateResizingKey:        "true",
+			consts.PodAnnotationAggregatedRequestsKey:           "{\"cpu\":\"4\"}",
 		},
 	}, resizeMainContainerAllocations.PodResources[podUID].ContainerResources[sidecarContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
@@ -1193,9 +1206,10 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 			uint64(3): 10,
 		},
 		Annotations: map[string]string{
-			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelSharedCores,
-			consts.PodAnnotationInplaceUpdateResizingKey: "true",
-			consts.PodAnnotationAggregatedRequestsKey:    "{\"cpu\":\"5\"}",
+			consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelSharedCores,
+			coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+			consts.PodAnnotationInplaceUpdateResizingKey:        "true",
+			consts.PodAnnotationAggregatedRequestsKey:           "{\"cpu\":\"5\"}",
 		},
 	}, resizeSidecarContainerAllocations.PodResources[podUID].ContainerResources[mainContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
@@ -1215,9 +1229,10 @@ func TestNonBindingShareCoresInplaceUpdateResizeWithSidecar(t *testing.T) {
 			uint64(3): 10,
 		},
 		Annotations: map[string]string{
-			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelSharedCores,
-			consts.PodAnnotationInplaceUpdateResizingKey: "true",
-			consts.PodAnnotationAggregatedRequestsKey:    "{\"cpu\":\"5\"}",
+			consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelSharedCores,
+			coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+			consts.PodAnnotationInplaceUpdateResizingKey:        "true",
+			consts.PodAnnotationAggregatedRequestsKey:           "{\"cpu\":\"5\"}",
 		},
 	}, resizeSidecarContainerAllocations.PodResources[podUID].ContainerResources[sidecarContainerName].ResourceAllocation[string(v1.ResourceCPU)])
 
@@ -1273,9 +1288,10 @@ func TestReclaimedCoresVPA(t *testing.T) {
 								consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelReclaimedCores,
 							},
 							Annotations: map[string]string{
-								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelReclaimedCores,
-								consts.PodAnnotationMemoryEnhancementNumaBinding: "false",
-								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"cpu":"3"},"attributes":{"CpusetCpus":"0-2"}},"1":{"allocated":{"cpu":"3"},"attributes":{"CpusetCpus":"4-6"}}}}`,
+								consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelReclaimedCores,
+								coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+								consts.PodAnnotationMemoryEnhancementNumaBinding:    "false",
+								coreconsts.QRMPodAnnotationTopologyAllocationKey:    `{"Numa":{"0":{"allocated":{"cpu":"3"},"attributes":{"CpusetCpus":"0-2"}},"1":{"allocated":{"cpu":"3"},"attributes":{"CpusetCpus":"4-6"}}}}`,
 							},
 							QoSLevel: consts.PodAnnotationQoSLevelReclaimedCores,
 						},
@@ -1355,9 +1371,10 @@ func TestReclaimedCoresVPA(t *testing.T) {
 								Hints: []*pluginapi.TopologyHint{nil},
 							},
 							Annotations: map[string]string{
-								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelReclaimedCores,
-								consts.PodAnnotationMemoryEnhancementNumaBinding: "false",
-								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"cpu":"3"},"attributes":{"CpusetCpus":"0-2"}},"1":{"allocated":{"cpu":"3"},"attributes":{"CpusetCpus":"4-6"}}}}`,
+								consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelReclaimedCores,
+								coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+								consts.PodAnnotationMemoryEnhancementNumaBinding:    "false",
+								coreconsts.QRMPodAnnotationTopologyAllocationKey:    `{"Numa":{"0":{"allocated":{"cpu":"3"},"attributes":{"CpusetCpus":"0-2"}},"1":{"allocated":{"cpu":"3"},"attributes":{"CpusetCpus":"4-6"}}}}`,
 							},
 						},
 					},
@@ -1392,9 +1409,10 @@ func TestReclaimedCoresVPA(t *testing.T) {
 								consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelReclaimedCores,
 							},
 							Annotations: map[string]string{
-								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelReclaimedCores,
-								consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
-								cpuconsts.CPUStateAnnotationKeyNUMAHint:          "0",
+								consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelReclaimedCores,
+								coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+								consts.PodAnnotationMemoryEnhancementNumaBinding:    consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+								cpuconsts.CPUStateAnnotationKeyNUMAHint:             "0",
 							},
 							QoSLevel: consts.PodAnnotationQoSLevelReclaimedCores,
 						},
@@ -1484,10 +1502,11 @@ func TestReclaimedCoresVPA(t *testing.T) {
 								},
 							},
 							Annotations: map[string]string{
-								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelReclaimedCores,
-								consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
-								cpuconsts.CPUStateAnnotationKeyNUMAHint:          "0",
-								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"cpu":"1"}}}}`,
+								consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelReclaimedCores,
+								coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+								consts.PodAnnotationMemoryEnhancementNumaBinding:    consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+								cpuconsts.CPUStateAnnotationKeyNUMAHint:             "0",
+								coreconsts.QRMPodAnnotationTopologyAllocationKey:    `{"Numa":{"0":{"allocated":{"cpu":"1"}}}}`,
 							},
 						},
 					},
@@ -1523,9 +1542,10 @@ func TestReclaimedCoresVPA(t *testing.T) {
 								consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelReclaimedCores,
 							},
 							Annotations: map[string]string{
-								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelReclaimedCores,
-								consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
-								cpuconsts.CPUStateAnnotationKeyNUMAHint:          "0",
+								consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelReclaimedCores,
+								coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+								consts.PodAnnotationMemoryEnhancementNumaBinding:    consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+								cpuconsts.CPUStateAnnotationKeyNUMAHint:             "0",
 							},
 							QoSLevel: consts.PodAnnotationQoSLevelReclaimedCores,
 						},
@@ -1615,10 +1635,11 @@ func TestReclaimedCoresVPA(t *testing.T) {
 								},
 							},
 							Annotations: map[string]string{
-								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelReclaimedCores,
-								consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
-								cpuconsts.CPUStateAnnotationKeyNUMAHint:          "0",
-								coreconsts.QRMPodAnnotationTopologyAllocationKey: `{"Numa":{"0":{"allocated":{"cpu":"3"}}}}`,
+								consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelReclaimedCores,
+								coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+								consts.PodAnnotationMemoryEnhancementNumaBinding:    consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+								cpuconsts.CPUStateAnnotationKeyNUMAHint:             "0",
+								coreconsts.QRMPodAnnotationTopologyAllocationKey:    `{"Numa":{"0":{"allocated":{"cpu":"3"}}}}`,
 							},
 						},
 					},
@@ -1654,9 +1675,10 @@ func TestReclaimedCoresVPA(t *testing.T) {
 								consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelReclaimedCores,
 							},
 							Annotations: map[string]string{
-								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelReclaimedCores,
-								consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
-								cpuconsts.CPUStateAnnotationKeyNUMAHint:          "0",
+								consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelReclaimedCores,
+								coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+								consts.PodAnnotationMemoryEnhancementNumaBinding:    consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+								cpuconsts.CPUStateAnnotationKeyNUMAHint:             "0",
 							},
 							QoSLevel: consts.PodAnnotationQoSLevelReclaimedCores,
 						},
@@ -1713,8 +1735,9 @@ func TestReclaimedCoresVPA(t *testing.T) {
 								consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelReclaimedCores,
 							},
 							Annotations: map[string]string{
-								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelReclaimedCores,
-								consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+								consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelReclaimedCores,
+								coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+								consts.PodAnnotationMemoryEnhancementNumaBinding:    consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
 							},
 							QoSLevel: consts.PodAnnotationQoSLevelReclaimedCores,
 						},
@@ -1807,8 +1830,9 @@ func TestReclaimedCoresVPA(t *testing.T) {
 								},
 							},
 							Annotations: map[string]string{
-								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelReclaimedCores,
-								consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+								consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelReclaimedCores,
+								coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+								consts.PodAnnotationMemoryEnhancementNumaBinding:    consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
 							},
 						},
 					},
@@ -1844,8 +1868,9 @@ func TestReclaimedCoresVPA(t *testing.T) {
 								consts.PodAnnotationQoSLevelKey: consts.PodAnnotationQoSLevelReclaimedCores,
 							},
 							Annotations: map[string]string{
-								consts.PodAnnotationQoSLevelKey:                  consts.PodAnnotationQoSLevelReclaimedCores,
-								consts.PodAnnotationMemoryEnhancementNumaBinding: consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+								consts.PodAnnotationQoSLevelKey:                     consts.PodAnnotationQoSLevelReclaimedCores,
+								coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey: bypassCapabilityTrue,
+								consts.PodAnnotationMemoryEnhancementNumaBinding:    consts.PodAnnotationMemoryEnhancementNumaBindingEnable,
 							},
 							QoSLevel: consts.PodAnnotationQoSLevelReclaimedCores,
 						},

@@ -2446,6 +2446,13 @@ func (p *DynamicPolicy) updateAllocationInfo(podUID, containerName string, oldAl
 		}
 	}
 
+	// Record the QoS bypass capability (public annotation) on the main container
+	// being admitted through this legacy direct-write path. Sidecars are skipped:
+	// they inherit the key from their main via the sidecar sync.
+	if allocationInfo != nil && !allocationInfo.CheckSideCar() {
+		recordBypassCapability(allocationInfo)
+	}
+
 	// Defensive: a synchronous legacy allocation hook may mutate the resulting
 	// allocationInfo (e.g. set RampUp on a reclaimed container). Reuse the single
 	// authoritative predicate so an illegal reclaimed RampUp cannot be persisted
@@ -2472,10 +2479,15 @@ func (p *DynamicPolicy) shouldBypassCPUSetAdjustment() bool {
 	return dyn != nil && dyn.EnableBypassCPUSetAdjustment
 }
 
+// shouldBypassCPUSetAdjustmentForAllocation decides, at response time, whether
+// the response cpuset (X) for this allocation should be cleared. The effective
+// decision is the live EnableBypassCPUSetAdjustment switch AND the container's
+// recorded bypass capability (read from the public annotation, or derived from QoS
+// when absent). dedicated (and any non-bypassable QoS) has capability false, so it
+// never bypasses. A live-config flip takes effect on the next response; the
+// annotation only ever carries QoS capability, not a live snapshot.
 func (p *DynamicPolicy) shouldBypassCPUSetAdjustmentForAllocation(allocationInfo *state.AllocationInfo) bool {
-	return p.shouldBypassCPUSetAdjustment() &&
-		allocationInfo != nil &&
-		(allocationInfo.CheckShared() || allocationInfo.CheckReclaimed() || allocationInfo.CheckSystem())
+	return p.shouldBypassCPUSetAdjustment() && bypassCapabilityAllow(allocationInfo)
 }
 
 // clearCPUSetInAllocation clears the cpuset string on every entry of a

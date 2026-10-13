@@ -168,6 +168,22 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 		} else {
 			baseMachineState = baseMachineState.Clone()
 		}
+		// Record the QoS bypass capability (public annotation) on every committed main
+		// container before the machine state is rebuilt, so the persisted machine state
+		// and the entries agree. This is a deterministic QoS label, not a live-config
+		// snapshot and not hook anti-forgery: pool/fake entries carry no key, and
+		// sidecars inherit from their main via the sidecar sync that follows.
+		for _, containerEntries := range candidate {
+			if containerEntries.IsPoolEntry() {
+				continue
+			}
+			for _, info := range containerEntries {
+				if info == nil || info.CheckSideCar() {
+					continue
+				}
+				recordBypassCapability(info)
+			}
+		}
 		var err error
 		machineState, err = generateMachineStateFromPodEntries(
 			p.machine.machineInfo.CPUTopology, candidate, baseMachineState)
@@ -232,6 +248,7 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 			pending.source, pending.expectedRevision, "revalidate replacement baseline after partition validation",
 			fmt.Errorf("partition validator mutated its candidate"))
 	}
+	p.syncCandidateSidecarsFromMain(candidate)
 	return &preparedCPUPartition{
 		pending:      pending,
 		entries:      candidate,
