@@ -21,6 +21,7 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -51,7 +52,6 @@ const (
 //   - the pre-Converge token, even if surfaced at a higher verbosity, must never
 //     ride on an error-severity glog header.
 func TestSuccessfulAdmissionLogSeverityContract(t *testing.T) {
-	t.Parallel()
 	cg := &fakeCgroupClient{
 		existing: map[string]bool{"primary": true, "reclaim": true},
 		cpus: map[string]machine.CPUSet{
@@ -75,8 +75,9 @@ func TestSuccessfulAdmissionLogSeverityContract(t *testing.T) {
 	desired.ReclaimEffective = machine.NewCPUSet(2, 3)
 
 	// Capture klog output. klog defaults to logtostderr=true, so routing must be
-	// redirected away from stderr into the buffer; restore both afterwards.
-	var buf bytes.Buffer
+	// redirected away from stderr into the buffer; restore both afterwards. Use a
+	// mutex-protected buffer so concurrent logs from parallel tests do not race.
+	var buf synchronizedBuf
 	klog.SetOutput(&buf)
 	klog.LogToStderr(false)
 	defer func() {
@@ -122,4 +123,23 @@ func TestSuccessfulAdmissionLogSeverityContract(t *testing.T) {
 	if !strings.Contains(logs, admissionViewAppliedToken) {
 		t.Fatalf("E2E fence %q missing from default-verbosity logs:\n%s", admissionViewAppliedToken, logs)
 	}
+}
+
+// synchronizedBuf is a bytes.Buffer guarded by a mutex so klog may write into it
+// concurrently with other parallel tests while String() is read without a data race.
+type synchronizedBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *synchronizedBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *synchronizedBuf) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }

@@ -350,7 +350,7 @@ func TestResetWriterSkipsUncontrolledDynamicDescendantWithoutCpusetController(t 
 	writer := newResetCoordinatorWriter(fake, NewBudgetTracker(ConvergenceBudget{}), "", res)
 	err = writer.execute(context.Background(), dag, map[string]machine.CPUSet{
 		"primary": machine.NewCPUSet(),
-	}, true, nil)
+	}, true, nil, nil, nil, nil)
 	// cgroup-v2 containment safety: emptying the controlled primary while the
 	// unproven descendant still holds a non-empty cpuset must fail closed during
 	// planning, before any write.
@@ -399,7 +399,7 @@ func TestResetWriterFailsClosedOnUnreadableUnprovenDescendant(t *testing.T) {
 	writer := newResetCoordinatorWriter(fake, NewBudgetTracker(ConvergenceBudget{}), "", res)
 	err = writer.execute(context.Background(), dag, map[string]machine.CPUSet{
 		"primary": machine.NewCPUSet(),
-	}, true, nil)
+	}, true, nil, nil, nil, nil)
 	if err == nil {
 		t.Fatalf("expected fail-closed error for unreadable unproven descendant, writes=%#v", fake.writes)
 	}
@@ -458,7 +458,7 @@ func TestResetWriterToleratesKnownSafeUnprovenDescendantReadError(t *testing.T) 
 			writer := newResetCoordinatorWriter(fake, NewBudgetTracker(ConvergenceBudget{}), "", res)
 			err = writer.execute(context.Background(), dag, map[string]machine.CPUSet{
 				"primary": machine.NewCPUSet(),
-			}, true, nil)
+			}, true, nil, nil, nil, nil)
 			if err != nil {
 				t.Fatalf("known-safe read error %v must not fail closed; got err=%v writes=%#v", tc.err, err, fake.writes)
 			}
@@ -500,9 +500,131 @@ func TestResetWriterRejectsControlledNodeWithoutCpusetController(t *testing.T) {
 	writer := newResetCoordinatorWriter(fake, NewBudgetTracker(ConvergenceBudget{}), "", res)
 	err = writer.execute(context.Background(), dag, map[string]machine.CPUSet{
 		"primary": machine.NewCPUSet(),
-	}, true, nil)
+	}, true, nil, nil, nil, nil)
 	if !errors.Is(err, ErrCgroupControllerUnavailable) {
 		t.Fatalf("reset writer error = %v, want ErrCgroupControllerUnavailable", err)
+	}
+}
+
+// TestResetWriterPendingPodDirSkipsSubdirsAndDefers pins the pending guard: a Pod
+// dir holding an admit-pending container is expanded to the parent target, but none
+// of its subdirs are written this round and the result is marked deferred (not
+// converged) so the next round retries.
+func TestResetWriterPendingPodDirSkipsSubdirsAndDefers(t *testing.T) {
+	t.Parallel()
+	dag, err := BuildDAG([]NodeSpec{{
+		Rel: "primary", Domain: DomainPrimary, Role: TopoNodeRolePrimary,
+		CPUs: machine.MustParse("0-3"), TrustAnchor: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := newFakeHierarchyDriver()
+	fake.add("primary", CgroupIdentity{Device: 1, Inode: 1}, "0-3", "0")
+	fake.add("primary/pod-x", CgroupIdentity{Device: 1, Inode: 2}, "0-3", "0")
+	fake.add("primary/pod-x/container-main", CgroupIdentity{Device: 1, Inode: 3}, "0-3", "0")
+
+	res := &ConvergenceResult{}
+	writer := newResetCoordinatorWriter(fake, NewBudgetTracker(ConvergenceBudget{}), "", res)
+	if err := writer.execute(context.Background(), dag, map[string]machine.CPUSet{
+		"primary": machine.MustParse("0-3"),
+	}, false, nil, nil, map[string]struct{}{"primary/pod-x": {}}, map[string]struct{}{"primary/pod-x": {}}, nil); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	written := map[string]bool{}
+	for _, w := range fake.writes {
+		written[w.rel] = true
+	}
+	if !written["primary/pod-x"] {
+		t.Fatalf("pending Pod dir must be expanded to parent target; writes=%#v", fake.writes)
+	}
+	if written["primary/pod-x/container-main"] {
+		t.Fatalf("subdir of pending Pod dir must not be written; writes=%#v", fake.writes)
+	}
+	if res.Deferred == 0 {
+		t.Fatalf("expected deferred (not-converged) for pending Pod dir; res=%+v", res)
+	}
+}
+
+// TestResetWriterDefersSubdirCreatedAfterSnapshot pins the TOCTOU guard: a cgroup
+// dir that appears between the reset snapshot (freeze) and planning must not be
+// widened this round; the round reports not converged and retries next round, when
+// the dir is part of the snapshot and handled per normal rules.
+func TestResetWriterDefersSubdirCreatedAfterSnapshot(t *testing.T) {
+	t.Parallel()
+	dag, err := BuildDAG([]NodeSpec{{
+		Rel: "primary", Domain: DomainPrimary, Role: TopoNodeRolePrimary,
+		CPUs: machine.MustParse("0-3"), TrustAnchor: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := newFakeHierarchyDriver()
+	fake.add("primary", CgroupIdentity{Device: 1, Inode: 1}, "0-3", "0")
+
+	// Count ListChildren on "primary". The freeze scan is the first call; the
+	// planning walk is the second. Inject a brand-new subdir only on the second
+	// (planning) call, simulating a dir created after the snapshot.
+	var primaryListings int
+	fake.beforeCall = func(op HierarchyOperation, rel string) error {
+		if op == HierarchyOperationList && rel == "primary" {
+			primaryListings++
+			if primaryListings == 2 {
+				fake.add("primary/newpod", CgroupIdentity{Device: 1, Inode: 9}, "0-3", "0")
+			}
+		}
+		return nil
+	}
+
+	res := &ConvergenceResult{}
+	writer := newResetCoordinatorWriter(fake, NewBudgetTracker(ConvergenceBudget{}), "", res)
+	if err := writer.execute(context.Background(), dag, map[string]machine.CPUSet{
+		"primary": machine.MustParse("0-3"),
+	}, false, nil, nil, nil, nil); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	for _, w := range fake.writes {
+		if w.rel == "primary/newpod" {
+			t.Fatalf("dir created after snapshot must not be widened this round; writes=%#v", fake.writes)
+		}
+	}
+	if res.Deferred == 0 {
+		t.Fatalf("expected deferred (not-converged) for post-snapshot subdir; res=%+v", res)
+	}
+
+	// Next round: the dir is now in the snapshot but remains unclassified, so the
+	// fail-safe matrix still defers it (never widen an unknown subdir). Only once it is
+	// positively classified safe-to-widen (fresh Pod dir) does the reset expand it.
+	fake.beforeCall = nil
+	res2 := &ConvergenceResult{}
+	writer2 := newResetCoordinatorWriter(fake, NewBudgetTracker(ConvergenceBudget{}), "", res2)
+	if err := writer2.execute(context.Background(), dag, map[string]machine.CPUSet{
+		"primary": machine.MustParse("0-3"),
+	}, false, nil, nil, nil, nil); err != nil {
+		t.Fatalf("second execute: %v", err)
+	}
+	for _, w := range fake.writes {
+		if w.rel == "primary/newpod" {
+			t.Fatalf("unclassified subdir must stay deferred even in a later round; writes=%#v", fake.writes)
+		}
+	}
+
+	// Positively classified (fresh Pod dir): now widened.
+	res3 := &ConvergenceResult{}
+	writer3 := newResetCoordinatorWriter(fake, NewBudgetTracker(ConvergenceBudget{}), "", res3)
+	if err := writer3.execute(context.Background(), dag, map[string]machine.CPUSet{
+		"primary": machine.MustParse("0-3"),
+	}, false, nil, nil, nil, map[string]struct{}{"primary/newpod": {}}); err != nil {
+		t.Fatalf("third execute: %v", err)
+	}
+	written := false
+	for _, w := range fake.writes {
+		if w.rel == "primary/newpod" {
+			written = true
+		}
+	}
+	if !written {
+		t.Fatalf("positively-classified subdir should be widened; writes=%#v", fake.writes)
 	}
 }
 
@@ -522,16 +644,17 @@ func TestResetWriterOrdersDynamicSubtreeFromCurrentToTargetDirection(t *testing.
 		targetPod     string
 		targetCtr     string
 		wantOrder     []string
+		wantFailClose bool
 	}{
 		{
-			name:          "shrink is full postorder",
+			name:          "shrink is rejected fail-closed",
 			currentBucket: "0-3",
 			currentPod:    "0-3",
 			currentCtr:    "0-3",
 			targetBucket:  "0-1",
 			targetPod:     "0-1",
 			targetCtr:     "0-1",
-			wantOrder:     []string{container, pod, bucket},
+			wantFailClose: true,
 		},
 		{
 			name:          "grow is preorder",
@@ -541,27 +664,17 @@ func TestResetWriterOrdersDynamicSubtreeFromCurrentToTargetDirection(t *testing.
 			targetBucket:  "0-2",
 			targetPod:     "0-1",
 			targetCtr:     "0-1",
-			wantOrder:     []string{bucket, pod, container},
+			wantOrder:     []string{bucket, pod},
 		},
 		{
 			name:          "mixed relations use deterministic dependencies",
 			currentBucket: "0-2",
-			currentPod:    "0-2",
-			currentCtr:    "0-2",
+			currentPod:    "0-1",
+			currentCtr:    "0-1",
 			targetBucket:  "0-3",
 			targetPod:     "0-1",
 			targetCtr:     "0-1",
-			wantOrder:     []string{bucket, container, pod},
-		},
-		{
-			name:          "shrinking parent and growing descendants stay deterministic",
-			currentBucket: "0-2",
-			currentPod:    "0",
-			currentCtr:    "0",
-			targetBucket:  "0-1",
-			targetPod:     "0-1",
-			targetCtr:     "0-1",
-			wantOrder:     []string{pod, container, bucket},
+			wantOrder:     []string{bucket, pod},
 		},
 	}
 
@@ -587,9 +700,14 @@ func TestResetWriterOrdersDynamicSubtreeFromCurrentToTargetDirection(t *testing.
 			err = writer.execute(context.Background(), dag, map[string]machine.CPUSet{
 				bucket: machine.MustParse(tt.targetBucket),
 			}, false, map[string]machine.CPUSet{
-				pod:       machine.MustParse(tt.targetPod),
 				container: machine.MustParse(tt.targetCtr),
-			})
+			}, nil, nil, map[string]struct{}{pod: {}})
+			if tt.wantFailClose {
+				if err == nil {
+					t.Fatalf("expected fail-closed error for shrink, got nil; writes=%#v", driver.writes)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("reset writer error = %v", err)
 			}
@@ -1928,6 +2046,12 @@ func TestTopologyCoordinatorConvergeResetWritesOnlyControlledNodes(t *testing.T)
 		Cgroup: cg,
 		Mems:   "0",
 		Mode:   ResetModeGuard(),
+		// Fresh Pod dirs (resolved from a strict pod snapshot) are safe to widen;
+		// unclassified descendants are deferred, never written.
+		SafeWidenRels: map[string]struct{}{
+			"primary/child-a":                   {},
+			"kubesandbox/reclaimed-0/sandbox-x": {},
+		},
 	})
 	if err != nil {
 		t.Fatalf("TopologyCoordinatorConverge: %v; writes=%#v", err, cg.writes)
@@ -1935,11 +2059,21 @@ func TestTopologyCoordinatorConvergeResetWritesOnlyControlledNodes(t *testing.T)
 	if !res.Converged {
 		t.Fatalf("expected convergence, got %+v writes=%#v", res, cg.writes)
 	}
-	// Unproven descendants are never written: neither the external primary leaf nor
-	// the reclaim-domain dynamic pod inherits the parent target.
+	// Non-controlled descendants (QoS dirs, Pod/pause) are driven to their parent
+	// reset target; only proven protected leaves in ExpectedByRel are spared.
+	wantTarget := map[string]string{
+		"primary/child-a":                   "0-1",
+		"custom-reclaim-root/reclaimed-0/pod-x": "2-3",
+	}
+	gotTargets := map[string]string{}
 	for _, write := range cg.writes {
-		if write.rel == "primary/child-a" || write.rel == "custom-reclaim-root/reclaimed-0/pod-x" {
-			t.Fatalf("unproven descendant %s must not be written; writes=%#v", write.rel, cg.writes)
+		if _, ok := wantTarget[write.rel]; ok {
+			gotTargets[write.rel] = write.cpus
+		}
+	}
+	for rel, want := range wantTarget {
+		if gotTargets[rel] != want {
+			t.Fatalf("descendant %s = %q, want parent target %q; writes=%#v", rel, gotTargets[rel], want, cg.writes)
 		}
 	}
 	// Controlled DAG roots are still reset.

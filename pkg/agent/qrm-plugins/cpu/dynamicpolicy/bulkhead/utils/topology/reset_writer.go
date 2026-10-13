@@ -62,6 +62,9 @@ func (w resetCoordinatorWriter) execute(
 	targets map[string]machine.CPUSet,
 	allowEmptyTarget bool,
 	expected map[string]machine.CPUSet,
+	protectedLeaves map[string]struct{},
+	pendingPodDirs map[string]struct{},
+	safeWidenRels map[string]struct{},
 	boundarySets ...map[string]struct{},
 ) error {
 	if w.driver == nil {
@@ -80,6 +83,13 @@ func (w resetCoordinatorWriter) execute(
 	}
 	var writes []resetWrite
 	var planErr error
+	// Freeze the controlled subtree membership up front: the set of cgroup rels that
+	// exist at this reset snapshot. collectPropagatedResetWrites only writes/descends
+	// into members of this set; a subdir that appears between the snapshot and the
+	// write (e.g. a just-created dedicated protected leaf not yet in Expected)
+	// is skipped this round and counted deferred, so the round reports not converged
+	// and retries next round instead of widening an unknown leaf.
+	snapshotRels := w.freezeControlledSnapshot(ctx, dag, controlled, boundaries)
 	_ = dag.ForEachExpand(func(n *TopoNode) error {
 		target := targets[n.Rel]
 		if target.IsEmpty() && !allowEmptyTarget {
@@ -101,7 +111,7 @@ func (w resetCoordinatorWriter) execute(
 		}
 		writes = append(writes, nodeWrite)
 		w.collectPropagatedResetWrites(
-			ctx, n.Rel, target, allowEmptyTarget, controlled, expected, boundaries, &writes, &planErr, 0)
+			ctx, n.Rel, target, allowEmptyTarget, controlled, expected, protectedLeaves, pendingPodDirs, safeWidenRels, snapshotRels, boundaries, &writes, &planErr, 0)
 		return nil
 	})
 	if planErr != nil {
@@ -367,6 +377,45 @@ func (w resetCoordinatorWriter) classifyReadError(err error, rel string, identit
 	}
 }
 
+// freezeControlledSnapshot enumerates every cgroup rel under the controlled DAG
+// nodes at reset planning time and records them in snapshotRels. It is the
+// membership snapshot against which later planning checks a child before writing.
+func (w resetCoordinatorWriter) freezeControlledSnapshot(
+	ctx context.Context,
+	dag *TopoDAG,
+	controlled map[string]*TopoNode,
+	boundaries map[string]struct{},
+) map[string]struct{} {
+	snapshot := map[string]struct{}{}
+	driver, err := newReservedBudgetedHierarchyDriver(ctx, w.driver, w.budget, 1)
+	if err != nil {
+		return snapshot
+	}
+	var walk func(rel string, depth int)
+	walk = func(rel string, depth int) {
+		if depth > maxResetEnforceDepth {
+			return
+		}
+		children, err := driver.ListChildren(ctx, rel)
+		if err != nil {
+			return
+		}
+		for _, child := range children {
+			childRel := filepath.Join(rel, child.Name)
+			if withinTraversalBoundary(childRel, boundaries) {
+				continue
+			}
+			snapshot[filepath.Clean(childRel)] = struct{}{}
+			walk(childRel, depth+1)
+		}
+	}
+	for _, n := range dag.Nodes() {
+		snapshot[filepath.Clean(n.Rel)] = struct{}{}
+		walk(n.Rel, 0)
+	}
+	return snapshot
+}
+
 func (w resetCoordinatorWriter) collectPropagatedResetWrites(
 	ctx context.Context,
 	parentRel string,
@@ -374,6 +423,10 @@ func (w resetCoordinatorWriter) collectPropagatedResetWrites(
 	allowEmptyTarget bool,
 	controlled map[string]*TopoNode,
 	expected map[string]machine.CPUSet,
+	protectedLeaves map[string]struct{},
+	pendingPodDirs map[string]struct{},
+	safeWidenRels map[string]struct{},
+	snapshotRels map[string]struct{},
 	boundaries map[string]struct{},
 	writes *[]resetWrite,
 	firstErr *error,
@@ -382,6 +435,16 @@ func (w resetCoordinatorWriter) collectPropagatedResetWrites(
 	if depth > maxResetEnforceDepth {
 		if w.res != nil {
 			w.res.Skipped++
+		}
+		return
+	}
+	// Pending guard: this Pod dir holds an admit-pending container (Allocate done,
+	// no status ID yet). The Pod dir itself has already been expanded by its parent;
+	// write NONE of its subdirs this round and report not converged so the next round
+	// retries once the pending container materializes or clears.
+	if _, pending := pendingPodDirs[filepath.Clean(parentRel)]; pending {
+		if w.res != nil {
+			w.res.Deferred++
 		}
 		return
 	}
@@ -407,59 +470,122 @@ func (w resetCoordinatorWriter) collectPropagatedResetWrites(
 		if _, ok := controlled[childRel]; ok {
 			continue
 		}
-		target, hasExpected := expected[childRel]
-		if !hasExpected {
-			// No canonical DesiredView/checkpoint ownership proof for this leaf
-			// (external dedicated/shared/RNB Pod, pause, main container, or any
-			// reclaim-domain dynamic descendant). The disabled reset may write only
-			// controlled DAG nodes and proven leaves: never stamp the parent (machine)
-			// target onto an unproven leaf. Skip the write but keep descending so a
-			// deeper proven leaf still converges to its own canonical target.
-			//
-			// cgroup-v2 containment safety: when the controlled ancestor is being
-			// emptied (allowEmptyTarget) and this unproven leaf still carries a
-			// non-empty cpuset, we cannot empty the parent without stranding or
-			// clobbering a leaf we have no proof for. Fail the whole reset during
-			// planning, before any write, instead of leaving an inconsistent tree.
-			//
-			// The read itself must be trusted fail-closed too: only a genuinely
-			// absent leaf (its cgroup dir raced away) or a subtree whose cpuset
-			// controller is not attached has no cpuset that emptying the parent
-			// could strand or clamp. Any other read failure leaves the leaf's
-			// cpuset unproven, so failing open here would let an empty-parent
-			// write silently clamp it; abort planning instead.
-			if allowEmptyTarget && parentTarget.IsEmpty() {
-				entry, readErr := driver.ReadEntry(ctx, childRel)
-				switch {
-				case readErr == nil && !entry.CPUs.IsEmpty():
-					if *firstErr == nil {
-						*firstErr = fmt.Errorf(
-							"disabled reset would empty controlled ancestor %q but unproven descendant %q still holds non-empty cpuset %s: failing closed before any write",
-							parentRel, childRel, entry.CPUs.String())
-					}
-					return
-				case readErr != nil && !isCgroupPathAbsent(readErr) && !errors.Is(readErr, ErrCgroupControllerUnavailable):
-					if *firstErr == nil {
-						*firstErr = fmt.Errorf(
-							"disabled reset would empty controlled ancestor %q but unproven descendant %q cpuset is unreadable: %w: failing closed before any write",
-							parentRel, childRel, readErr)
-					}
-					return
-				}
+		// TOCTOU guard: a child that did not exist at the reset snapshot must not be
+		// widened this round — it may be a just-created dedicated protected leaf
+		// not yet in Expected/Deferred. Skip it and report not converged so the next
+		// round (which will have enumerated it) handles it per normal rules.
+		if _, inSnapshot := snapshotRels[filepath.Clean(childRel)]; !inSnapshot {
+			if w.res != nil {
+				w.res.Deferred++
 			}
-			w.collectPropagatedResetWrites(
-				ctx, childRel, parentTarget, allowEmptyTarget, controlled, expected, boundaries, writes, firstErr, depth+1)
 			continue
 		}
-		mems := ""
-		if parentNode := controlled[parentRel]; parentNode != nil && parentNode.Role == TopoNodeRoleReclaimNUMABucket {
-			mems = memsForNode(parentNode, w.defaultMems)
+		_, hasExpected := expected[childRel]
+		_, isProtected := protectedLeaves[childRel]
+		if hasExpected || isProtected {
+			// Protected leaf (main/app/init/ephemeral container) — either with a
+			// canonical DesiredView cpuset, or any other container ID declared by the
+			// fresh Pod status (e.g. an exited init container QRM never allocated).
+			// The disabled reset NEVER writes these, even to a canonical value; kubelet
+			// does not reliably repair them either (containerd's spec check can
+			// short-circuit UpdateContainerResources), so historical drift is not
+			// repaired. Keep descending only for deeper fail-closed inspection.
+			w.collectPropagatedResetWrites(
+				ctx, childRel, parentTarget, allowEmptyTarget, controlled, expected, protectedLeaves, pendingPodDirs, safeWidenRels, snapshotRels, boundaries, writes, firstErr, depth+1)
+			continue
+		}
+		// Not a protected leaf. Per the corrected disabled-reset boundary these
+		// are the intermediate directories the reset MUST drive to the parent
+		// (whole-machine) target: QoS class dirs (burstable/besteffort), Pod-level
+		// cgroup dirs (pod<uid>, under configured cgroup roots),
+		// and pause/sandbox container cgroups. kubelet never updates Pod dirs or
+		// pause, so leaving them narrow would later make a wider protected-leaf
+		// write violate cgroup v1 child⊆parent. Writing the parent target here is
+		// expand-only, so the skipped protected leaves always stay a subset.
+		//
+		// cgroup-v2 containment safety: when the controlled ancestor is being
+		// emptied (allowEmptyTarget) and this descendant still carries a non-empty
+		// cpuset, we cannot empty the parent without stranding/clobbering it. Fail
+		// the whole reset during planning, before any write. The read itself is
+		// trusted fail-closed: only an absent leaf or an unattached controller has
+		// no cpuset that emptying the parent could strand; any other read failure
+		// leaves the cpuset unproven, so abort planning rather than fail open.
+		// Read the descendant's current cpuset once, fail-closed, and decide whether
+		// it may be written to the parent target.
+		childGone := false
+		if !allowEmptyTarget && !parentTarget.IsEmpty() {
+			entry, readErr := driver.ReadEntry(ctx, childRel)
+			switch {
+			case readErr == nil && !entry.CPUs.IsEmpty() && !entry.CPUs.IsSubsetOf(parentTarget):
+				if *firstErr == nil {
+					*firstErr = fmt.Errorf(
+						"disabled reset would shrink descendant %q (current=%s) to parent target %s: failing closed before any write",
+						childRel, entry.CPUs.String(), parentTarget.String())
+				}
+				return
+			case readErr != nil && !isCgroupPathAbsent(readErr) && !errors.Is(readErr, ErrCgroupControllerUnavailable):
+				if *firstErr == nil {
+					*firstErr = fmt.Errorf(
+						"disabled reset descendant %q cpuset is unreadable: %w: failing closed before any write",
+						childRel, readErr)
+				}
+				return
+			case readErr != nil:
+				// The cgroup dir raced away or the controller is unattached: there is
+				// nothing to reset here and nothing deeper to descend into.
+				childGone = true
+			}
+		} else if allowEmptyTarget && parentTarget.IsEmpty() {
+			entry, readErr := driver.ReadEntry(ctx, childRel)
+			switch {
+			case readErr == nil && !entry.CPUs.IsEmpty():
+				if *firstErr == nil {
+					*firstErr = fmt.Errorf(
+						"disabled reset would empty controlled ancestor %q but descendant %q still holds non-empty cpuset %s: failing closed before any write",
+						parentRel, childRel, entry.CPUs.String())
+				}
+				return
+			case readErr != nil && !isCgroupPathAbsent(readErr) && !errors.Is(readErr, ErrCgroupControllerUnavailable):
+				if *firstErr == nil {
+					*firstErr = fmt.Errorf(
+						"disabled reset would empty controlled ancestor %q but descendant %q cpuset is unreadable: %w: failing closed before any write",
+						parentRel, childRel, readErr)
+				}
+				return
+			case readErr != nil:
+				childGone = true
+			}
+		}
+		if childGone {
+			return
+		}
+		// Fail-safe write matrix: a non-controlled, non-container descendant is widened
+		// to the parent target ONLY when it is positively classified safe-to-widen by
+		// the caller (a QoS class dir, a fresh Pod dir resolved from a strict pod
+		// snapshot, or a CRI-confirmed pause). Anything else — stale pod, pod absent
+		// from the fresh list, unknown dir under a QoS dir, unclassified — is never
+		// written: a mis-widened protected leaf does NOT self-heal (containerd
+		// short-circuits UpdateContainerResources when the spec is unchanged), so we
+		// defer and report not converged instead of risking a incorrect container write.
+		if _, ok := safeWidenRels[filepath.Clean(childRel)]; !ok {
+			// Fail-safe: never widen a dir that is not positively classified
+			// safe-to-widen. This covers pause (a non-container child of a resolved
+			// fresh Pod dir) and unknown leftover dirs that match no fresh pod and no
+			// protected leaf. These are LONG-LIVED, not transient: counting them as
+			// Deferred would pin every reset non-converged forever. Instead skip them
+			// and count them as UnclassifiedSkipped (logged, retried on later rounds
+			// via a fresh classification), so convergence proceeds. NOTE: historically
+			// drifted protected leaves are NOT repaired by this change.
+			if w.res != nil {
+				w.res.UnclassifiedSkipped++
+			}
+			continue
 		}
 		*writes = append(*writes, resetWrite{
-			rel: childRel, parentRel: parentRel, target: target.Clone(), mems: mems, expected: hasExpected,
+			rel: childRel, parentRel: parentRel, target: parentTarget.Clone(), expected: hasExpected,
 		})
 		w.collectPropagatedResetWrites(
-			ctx, childRel, target, allowEmptyTarget, controlled, expected, boundaries, writes, firstErr, depth+1)
+			ctx, childRel, parentTarget, allowEmptyTarget, controlled, expected, protectedLeaves, pendingPodDirs, safeWidenRels, snapshotRels, boundaries, writes, firstErr, depth+1)
 	}
 }
 

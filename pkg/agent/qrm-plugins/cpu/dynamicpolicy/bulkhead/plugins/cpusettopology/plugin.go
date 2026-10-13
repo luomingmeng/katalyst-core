@@ -81,23 +81,20 @@ type CPUSetTopologyPlugin struct {
 	modeGate           *topology.ModeGate
 
 	// resetComplete records whether the authoritative disabled reset has run
-	// since the plugin last observed a genuine enabled->disabled transition. It
-	// replaces the manager-side per-name reset-state map: the plugin owns its own
-	// transition.
+	// since the plugin last observed a genuine enabled->disabled transition or a
+	// fresh process start/restart. It replaces the manager-side per-name reset-state
+	// map: the plugin owns its own transition.
+	//
+	// Safety contract for startup/restart (preserve=false): the disabled reset
+	// writes ONLY the controlled non-leaf DAG nodes (primary/reclaim root, reclaim
+	// NUMA buckets, reclaim siblings) to the expand-only whole-machine target.
+	// Pod/pause/main-container leaves are never written by reset (kubelet converges
+	// them). Because the write set is restricted to controlled non-leaf nodes and the
+	// target is expand-only (child ⊆ parent), a restart no longer needs an in-memory
+	// ownership witness to safely reset those nodes; resetComplete therefore starts
+	// false and the first disabled round performs one idempotent reset (zero writes
+	// when already at target).
 	resetComplete bool
-	// hasOwnedTopology is the trustworthy ownership-proof witness. It is set true
-	// only when Enable observes the plugin actively managing the full partition
-	// DAG. On startup, and after a process restart, it stays false, so a disabled
-	// epoch that was never preceded by an enabled epoch is NOT treated as an
-	// enabled->disabled exit transition and the bulk reset never runs. This keeps
-	// startup-disabled / restart-without-proof from stamping the whole-machine
-	// cpuset onto dedicated/shared/RNB Pod, pause, and main-container leaves the
-	// plugin never owned.
-	hasOwnedTopology bool
-	// loggedNoOwnershipResetSkip records that the one-time diagnostic for skipping
-	// the disabled reset without ownership proof has already been emitted, so the
-	// per-round disabled rounds stay quiet after the first notice.
-	loggedNoOwnershipResetSkip bool
 	// lastEnabled is the previous Enable() result, used to detect the
 	// enabled->disabled transition that requires a fresh reset.
 	lastEnabled bool
@@ -175,11 +172,7 @@ func (p *CPUSetTopologyPlugin) Enable(in bulkheadapi.HandlerContext) bool {
 	}
 	curr := enableBulkheadCpusetTopology(in)
 	if curr {
-		// The plugin is actively managing the partition DAG: this is the only
-		// trustworthy proof that cpuset_topology owns the managed topology nodes.
-		// Only an enabled epoch entitles a later disabled exit to the bulk reset.
-		// Startup and process restart begin without this witness.
-		p.hasOwnedTopology = true
+		// The plugin is actively managing the partition DAG.
 	} else if p.lastEnabled {
 		// enabled -> disabled: a fresh disabled reset is required next round.
 		p.resetComplete = false
@@ -1172,20 +1165,17 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentDisabledHandler(ctx context.Conte
 }
 
 // NeedsDisabledReset implements bulkheadapi.DisabledTopologyReconciler: it reports
-// true only when the plugin has trustworthy proof that it owns the managed
-// topology (a prior enabled epoch, recorded by hasOwnedTopology) AND a fresh
-// authoritative reset has not run since the enabled->disabled transition. A
-// startup or restart that never entered an enabled epoch reports false: there is
-// no ownership proof, so the bulk reset must not rewrite dedicated/shared/RNB Pod,
-// pause, and main-container leaves the plugin never managed.
+// true until the authoritative disabled reset has run once. At process start and
+// after a restart resetComplete is false, so the first disabled round performs one
+// idempotent reset (zero writes when the controlled non-leaf nodes are already at
+// the whole-machine target). A genuine enabled->disabled exit and a preserve-mode
+// toggle both reset resetComplete to false so a fresh reset runs.
+//
+// The safety guarantee no longer depends on an in-memory ownership witness: the
+// reset writes only controlled non-leaf DAG nodes to the expand-only
+// whole-machine target, and leaves are never written (kubelet converges them).
 func (p *CPUSetTopologyPlugin) NeedsDisabledReset() bool {
-	// Emit the reason a single time when startup/restart disables reset for lack of
-	// ownership proof, then stay quiet on later rounds.
-	if !p.hasOwnedTopology && !p.loggedNoOwnershipResetSkip {
-		p.loggedNoOwnershipResetSkip = true
-		general.Infof("cpuset_topology: skipping disabled reset: no ownership proof (no enabled epoch observed); leaving dedicated/shared/RNB pod, pause, and main-container cpuset untouched")
-	}
-	return p.hasOwnedTopology && !p.resetComplete
+	return !p.resetComplete
 }
 
 // MarkDisabledResetComplete records a successful disabled reset; the manager
@@ -1849,16 +1839,16 @@ func (p *CPUSetTopologyPlugin) resetCPUSetTopology(
 		return topology.ConvergenceResult{}, err
 	}
 
-	// Reset (disabled transition) applies reset targets back towards the
-	// machine/root cpuset, but only to the controlled topology-owned nodes. Any
-	// external Pod/pause/main-container leaf is rewritten to only its canonical
-	// DesiredView/checkpoint allocation; a leaf without such proof is never
-	// fanned out to the parent machine target. Build that ownership proof
-	// fail-closed: if it cannot be established, abort the reset instead of running
-	// a blind machine-wide reset. Pending allocations whose leaves cannot be
-	// resolved are not protected here: protection addresses ancestor shrink during
-	// normal adjustment in the admission creation window, while reset cannot
-	// directly protect a leaf that does not exist.
+	// Reset (disabled transition) drives controlled topology-owned nodes, QoS class
+	// dirs, and positively-identified fresh Pod dirs back towards the machine/root
+	// cpuset. Protected leaves (Expected/Deferred and every fresh pod-status
+	// container ID) are NEVER written by the disabled reset — not even to their
+	// canonical allocation. A leaf without fresh-pod proof (stale pod, unknown dir)
+	// is deferred, not fanned out to the parent target: a mis-widened managed
+	// container does NOT self-heal (containerd's enable_update_resource_spec_check
+	// short-circuits UpdateContainerResources when the spec is unchanged), so a
+	// historical drift in a protected leaf is not repaired by this change. Pending
+	// allocations whose leaves cannot be resolved are deferred and retried next round.
 	expectedRes, err := p.buildExpectedCPUSetByRel(ctx, in)
 	if err != nil {
 		emitBulkheadPruneResult(in.Emitter, "skipped", "container_error")
@@ -1880,6 +1870,24 @@ func (p *CPUSetTopologyPlugin) resetCPUSetTopology(
 		}, nil
 	}
 
+	protectedLeaves := protectedLeafRels(expectedRes)
+	safeWiden := map[string]struct{}{}
+	// Positive classification for EVERY fresh pod (not just DesiredView pods): widen
+	// each fresh Pod dir (and its QoS parent) and mark every fresh pod-status container ID
+	// (current + lastState) as a protected leaf. Built even when DesiredView is empty.
+	if err := p.classifyFreshPodsForReset(ctx, in, protectedLeaves, safeWiden); err != nil {
+		emitBulkheadPruneResult(in.Emitter, "skipped", "fresh_pod_classify_failed")
+		return topology.ConvergenceResult{}, fmt.Errorf("disabled reset fresh pod classification: %w", err)
+	}
+	// Union the protected-leaf ancestor closure into the fresh-pod safeWiden set,
+	// then drop any protected leaf itself (defense in depth).
+	for rel := range safeWidenRelsForReset(protectedLeaves) {
+		safeWiden[rel] = struct{}{}
+	}
+	for rel := range protectedLeaves {
+		delete(safeWiden, path.Clean(rel))
+	}
+
 	var traversalBoundaries map[string]struct{}
 	if p.ShouldReconcileWhenDisabled(ctx, in) {
 		traversalBoundaries = reclaimResetBoundaries(p.cfg, in.DesiredView)
@@ -1889,6 +1897,9 @@ func (p *CPUSetTopologyPlugin) resetCPUSetTopology(
 		Cgroup:              p.cgroup,
 		Mode:                topology.ResetModeGuardWithGate(p.sharedModeGate()),
 		ExpectedCPUSetByRel: expected,
+		ProtectedLeafByRel:  protectedLeaves,
+		PendingPodDirs:      p.pendingPodDirRels(expectedRes),
+		SafeWidenRels:       safeWiden,
 		TraversalBoundaries: traversalBoundaries,
 		Budget:              adjustmentBudget.RemainingConvergenceBudget(),
 		AdjustmentBudget:    adjustmentBudget,
@@ -2071,7 +2082,176 @@ type expectedCPUSetBuildResult struct {
 	ExpectedByRel     map[string]machine.CPUSet
 	DeferredLeafByRel map[string]machine.CPUSet
 	PendingByPod      []pendingContainerCPUSet
-	LifecycleProofs   containerLifecycleProofSet
+	// SafeWidenRels is the positively-classified set of non-controlled cgroup rels the
+	// disabled reset may widen to the parent target: QoS class dirs and Pod-level dirs
+	// resolved from the strict fresh pod snapshot (UID + QoS, incl. configured cgroup paths).
+	// Any other descendant under a controlled node is deferred, never written.
+	SafeWidenRels   map[string]struct{}
+	LifecycleProofs containerLifecycleProofSet
+}
+
+// protectedLeafRels returns the set of protected leaf cgroup rels the disabled
+// reset must leave untouched: every container the fresh build resolved (both
+// QRM-allocated leaves and deferred/pending leaves). The disabled reset skips these
+// rather than resetting them to the parent target; kubelet owns protected leaves.
+func protectedLeafRels(res *expectedCPUSetBuildResult) map[string]struct{} {
+	out := map[string]struct{}{}
+	if res == nil {
+		return out
+	}
+	for rel := range res.ExpectedByRel {
+		out[rel] = struct{}{}
+	}
+	for rel := range res.DeferredLeafByRel {
+		out[rel] = struct{}{}
+	}
+	// Also include every fresh pod-status container rel the lifecycle proofs resolved
+	// (containerStatuses / initContainerStatuses / ephemeralContainerStatuses,
+	// current and lastState) — non-QRM protected leaves must never be considered
+	// for widening, even when QRM has no allocation for them.
+	for _, proof := range res.LifecycleProofs.OrderedProofs {
+		if rel := strings.Trim(proof.RelativePath, "/"); rel != "" {
+			out[path.Clean(rel)] = struct{}{}
+		}
+	}
+	return out
+}
+
+// pendingPodDirRels resolves the Pod-level cgroup dirs that contain an admit-pending
+// container. The disabled reset expands these Pod dirs but writes none of their
+// subdirs and reports not converged, so MarkDisabledResetComplete is held back and
+// the next round retries.
+func (p *CPUSetTopologyPlugin) pendingPodDirRels(res *expectedCPUSetBuildResult) map[string]struct{} {
+	out := map[string]struct{}{}
+	if res == nil {
+		return out
+	}
+	for _, pending := range res.PendingByPod {
+		for _, rel := range p.pendingPodScopeCandidatesForQOS(pending.PodUID, pending.NativeQOSClass) {
+			if rel = strings.Trim(rel, "/"); rel != "" {
+				out[path.Clean(rel)] = struct{}{}
+			}
+		}
+	}
+	return out
+}
+
+// freshPodDirRels resolves the Pod-level cgroup dir rels for every fresh pod
+// (UID + QoS, incl. configured cgroup path candidates). These are the only
+// non-controlled descendants the disabled reset may widen to the parent target;
+// everything else under a controlled node is deferred, never written.
+func (p *CPUSetTopologyPlugin) freshPodDirRels(freshPodsByUID map[string]*v1.Pod) map[string]struct{} {
+	out := map[string]struct{}{}
+	for uid, pod := range freshPodsByUID {
+		for _, rel := range p.pendingPodScopeCandidatesForQOS(uid, pod.Status.QOSClass) {
+			if rel = strings.Trim(rel, "/"); rel != "" {
+				rel = path.Clean(rel)
+				out[rel] = struct{}{}
+				// The intermediate QoS class dir (parent of the Pod dir) is also a
+				// non-container intermediate the disabled reset may widen.
+				if qos := path.Dir(rel); qos != "." && qos != "/" && qos != rel {
+					out[qos] = struct{}{}
+				}
+			}
+		}
+	}
+	return out
+}
+
+// safeWidenRelsForReset derives the non-controlled rels the disabled reset may widen
+// from the positively-identified protected leaves: the parent Pod dir of every resolved
+// protected leaf, and that Pod dir's QoS class parent. A Pod dir is considered
+// positively identified only when a fresh container (Expected/Deferred, or a fresh
+// status container ID) resolves under it — an unknown dir under a QoS class has no
+// such proof and stays deferred. Historically drifted protected leaves are NOT
+// restored by this fix; they are left untouched (see protectedLeafRels).
+// classifyFreshPodsForReset positively classifies EVERY fresh pod (not only those
+// in DesiredView): each fresh Pod dir (QoS + configured cgroup path candidates)
+// and its QoS parent are added to safeWiden; every fresh pod-status container ID
+// (containerStatuses / init / ephemeral, current and lastState.Terminated) is
+// resolved to a rel and added to protectedLeaves. Long-lived non-QRM pods are thus
+// classified deterministically and do not pin the reset non-converged.
+func (p *CPUSetTopologyPlugin) classifyFreshPodsForReset(
+	ctx context.Context,
+	in bulkheadapi.HandlerContext,
+	protectedLeaves map[string]struct{},
+	safeWiden map[string]struct{},
+) error {
+	if in.MetaServer == nil {
+		return fmt.Errorf("meta server unavailable for fresh pod classification")
+	}
+	freshPods, err := in.MetaServer.GetPodList(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("fetch fresh pods for disabled reset: %w", err)
+	}
+	addProtectedLeaf := func(podUID, containerID string) {
+		containerID = native.TrimContainerIDPrefix(containerID)
+		if containerID == "" {
+			return
+		}
+		rel, err := resolveContainerRelPathFromID(podUID, containerID)
+		if err != nil || rel == "" {
+			general.InfofV(2, "cpuset_topology: disabled reset could not resolve container id=%q rel: %v", containerID, err)
+			return
+		}
+		protectedLeaves[path.Clean(rel)] = struct{}{}
+	}
+	for _, pod := range freshPods {
+		if pod == nil {
+			continue
+		}
+		uid := string(pod.UID)
+		if uid == "" {
+			continue
+		}
+		for _, rel := range p.pendingPodScopeCandidatesForQOS(uid, pod.Status.QOSClass) {
+			if rel = strings.Trim(rel, "/"); rel != "" {
+				safeWiden[path.Clean(rel)] = struct{}{}
+				if qos := path.Dir(rel); qos != "." && qos != "/" && qos != rel {
+					safeWiden[path.Clean(qos)] = struct{}{}
+				}
+			}
+		}
+		for _, cs := range pod.Status.ContainerStatuses {
+			addProtectedLeaf(uid, cs.ContainerID)
+			if cs.LastTerminationState.Terminated != nil {
+				addProtectedLeaf(uid, cs.LastTerminationState.Terminated.ContainerID)
+			}
+		}
+		for _, cs := range pod.Status.InitContainerStatuses {
+			addProtectedLeaf(uid, cs.ContainerID)
+			if cs.LastTerminationState.Terminated != nil {
+				addProtectedLeaf(uid, cs.LastTerminationState.Terminated.ContainerID)
+			}
+		}
+		for _, cs := range pod.Status.EphemeralContainerStatuses {
+			addProtectedLeaf(uid, cs.ContainerID)
+			if cs.LastTerminationState.Terminated != nil {
+				addProtectedLeaf(uid, cs.LastTerminationState.Terminated.ContainerID)
+			}
+		}
+	}
+	return nil
+}
+
+func safeWidenRelsForReset(protectedLeaves map[string]struct{}) map[string]struct{} {
+	out := map[string]struct{}{}
+	for rel := range protectedLeaves {
+		podDir := path.Dir(rel)
+		if podDir == "." || podDir == "/" {
+			continue
+		}
+		out[path.Clean(podDir)] = struct{}{}
+		if qos := path.Dir(podDir); qos != "." && qos != "/" && qos != podDir {
+			out[path.Clean(qos)] = struct{}{}
+		}
+	}
+	// Defense in depth: a protected leaf must never itself be widened, even if the
+	// dirname closure or a future edit accidentally lands a protected-leaf rel in the set.
+	for rel := range protectedLeaves {
+		delete(out, path.Clean(rel))
+	}
+	return out
 }
 
 type expectedCPUSetOwnerBinder struct {
@@ -2251,6 +2431,7 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in 
 		}
 		freshPodsByUID[podUID] = pod
 	}
+	out.SafeWidenRels = p.freshPodDirRels(freshPodsByUID)
 	var lifecycleProofs []containerLifecycleProof
 	ownerBinder := expectedCPUSetOwnerBinder{
 		ownerByRel: make(map[string]containerLifecycleProofKey),
@@ -2297,7 +2478,7 @@ func (p *CPUSetTopologyPlugin) buildExpectedCPUSetByRel(ctx context.Context, in 
 						}
 						continue
 					}
-					// Symmetric reclaim-carve case: an already-placed business leaf
+					// Symmetric reclaim-carve case: an already-placed protected leaf
 					// is currently narrower than its desired allocation, and the
 					// only CPUs it is missing are exactly the reclaim-effective
 					// set. Reclaim has already been carved out of this leaf, so

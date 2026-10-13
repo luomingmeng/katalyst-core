@@ -2923,16 +2923,17 @@ func TestCPUSetTopologyPluginDisabledTransitionUsesTopologySpecsAndDAGExpandV1(t
 			t.Fatalf("cpuset @ %s = %q, want %q; writes=%#v", rel, got, wantMachine, cg.writes)
 		}
 	}
-	// External Pod/pause cgroups are not topology-owned: the reset must never fan
-	// the machine target out onto them, even during a genuine enabled->disabled
-	// transition.
+	// The QoS class dir and the Pod/pause dir are driven to the machine target
+	// (kubelet never updates them); only the protected leaf is spared.
 	for _, rel := range []string{"primary/burstable", "primary/burstable/pod-a"} {
-		if _, ok := cg.writes[rel]; ok {
-			t.Fatalf("external pod/pause cgroup @ %s must not receive machine reset write; writes=%#v", rel, cg.writes)
+		if got := cg.writes[rel]; got != wantMachine {
+			t.Fatalf("reset cpuset @ %s = %q, want machine %q; writes=%#v", rel, got, wantMachine, cg.writes)
 		}
 	}
-	if got := cg.writes[containerRel]; got != "0" {
-		t.Fatalf("container cpuset = %q, want canonical DesiredView 0; writes=%#v", got, cg.writes)
+	// The container leaf is converged by kubelet UpdateContainerResources and must
+	// never be written by the disabled reset.
+	if _, ok := cg.writes[containerRel]; ok {
+		t.Fatalf("container leaf @ %s must not receive a reset write; writes=%#v", containerRel, cg.writes)
 	}
 	if got := cg.cpusetWrites["reclaim/reclaim-0"].Mems; got != "" {
 		t.Fatalf("cpuset_topology wrote reclaim NUMA cpuset.mems = %q, want empty", got)
@@ -3033,10 +3034,9 @@ func TestCPUSetTopologyPluginPreserveModeResetExcludesReclaimSubtree(t *testing.
 			t.Fatalf("reset cpuset @ %s = %q, want 0-3; writes=%#v", rel, got, cg.writes)
 		}
 	}
-	// External pod cgroup is not topology-owned and must not receive the machine
-	// reset target.
-	if _, ok := cg.writes["primary/burstable"]; ok {
-		t.Fatalf("primary/burstable must not receive machine reset write; writes=%#v", cg.writes)
+	// The QoS dir under primary is driven to the machine target.
+	if got := cg.writes["primary/burstable"]; got != "0-3" {
+		t.Fatalf("primary/burstable = %q, want 0-3; writes=%#v", got, cg.writes)
 	}
 	for _, rel := range []string{"reclaim", "reclaim/reclaim-0", "reclaim/reclaim-0/dynamic"} {
 		if _, ok := cg.writes[rel]; ok {
@@ -3080,8 +3080,8 @@ func TestCPUSetTopologyPluginPreserveModeResetExcludesReclaimSubtreeUnderOverlap
 			t.Fatalf("reset cpuset @ %s = %q, want 0-3; writes=%#v", rel, got, cg.writes)
 		}
 	}
-	if _, ok := cg.writes["primary/burstable"]; ok {
-		t.Fatalf("primary/burstable must not receive machine reset write under overlap; writes=%#v", cg.writes)
+	if got := cg.writes["primary/burstable"]; got != "0-3" {
+		t.Fatalf("primary/burstable = %q, want 0-3 under overlap; writes=%#v", got, cg.writes)
 	}
 	// Reclaim subtree is preserved: no reset write may land on any reclaim bucket.
 	for _, rel := range []string{"reclaim", "reclaim/reclaim-0", "reclaim/reclaim-0/dynamic"} {
@@ -6163,11 +6163,11 @@ func TestCPUSetTopologyPluginChangingStaleSignaturesStillCompileAtMostFourTimes(
 		) (topology.ConvergenceResult, error) {
 			attempts++
 			return topology.ConvergenceResult{
-					ReplanDisposition: topology.ReplanSafeNoPhysicalWrites,
-				}, &topology.PlanStaleError{
-					Rel:      fmt.Sprintf("root/generation-%d", attempts),
-					Resource: "changing_signature",
-				}
+				ReplanDisposition: topology.ReplanSafeNoPhysicalWrites,
+			}, &topology.PlanStaleError{
+				Rel:      fmt.Sprintf("root/generation-%d", attempts),
+				Resource: "changing_signature",
+			}
 		},
 	)
 
