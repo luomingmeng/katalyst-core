@@ -528,21 +528,147 @@ func TestResetWriterPendingPodDirSkipsSubdirsAndDefers(t *testing.T) {
 	writer := newResetCoordinatorWriter(fake, NewBudgetTracker(ConvergenceBudget{}), "", res)
 	if err := writer.execute(context.Background(), dag, map[string]machine.CPUSet{
 		"primary": machine.MustParse("0-3"),
-	}, false, nil, nil, map[string]struct{}{"primary/pod-x": {}}, map[string]struct{}{"primary/pod-x": {}}, nil); err != nil {
+	}, false, nil, nil,
+		map[string]struct{}{"primary/pod-x": {}},
+		// Both the pending Pod dir AND its container leaf are positively classified
+		// safe-to-widen; the pending guard must still defer the whole subtree this
+		// round (pending && len(children)>0), whitelist membership does not preempt it.
+		map[string]struct{}{"primary/pod-x": {}, "primary/pod-x/container-main": {}}, nil); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	written := map[string]bool{}
 	for _, w := range fake.writes {
 		written[w.rel] = true
 	}
+	if written["primary/pod-x/container-main"] {
+		t.Fatalf("subdir of a pending Pod dir must not be widened even when whitelisted; writes=%#v", fake.writes)
+	}
+	// The pending Pod dir itself IS expanded to the parent target this round; only its
+	// pending descendants (container leaf) are skipped and the round reports deferred.
 	if !written["primary/pod-x"] {
 		t.Fatalf("pending Pod dir must be expanded to parent target; writes=%#v", fake.writes)
 	}
-	if written["primary/pod-x/container-main"] {
-		t.Fatalf("subdir of pending Pod dir must not be written; writes=%#v", fake.writes)
-	}
 	if res.Deferred == 0 {
 		t.Fatalf("expected deferred (not-converged) for pending Pod dir; res=%+v", res)
+	}
+}
+
+// TestResetWriterEmptyPendingPodDirDoesNotDefer covers a durable OCI StartError
+// shape: kubelet created the Pod cgroup, but no container leaf ever materialized.
+// With no child identity to protect, the expanded Pod directory is already a safe
+// final state and must not pin the node-wide disabled reset forever.
+func TestResetWriterEmptyPendingPodDirDoesNotDefer(t *testing.T) {
+	t.Parallel()
+	dag, err := BuildDAG([]NodeSpec{{
+		Rel: "primary", Domain: DomainPrimary, Role: TopoNodeRolePrimary,
+		CPUs: machine.MustParse("0-3"), TrustAnchor: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := newFakeHierarchyDriver()
+	fake.add("primary", CgroupIdentity{Device: 1, Inode: 1}, "0-3", "0")
+	fake.add("primary/pod-start-error", CgroupIdentity{Device: 1, Inode: 2}, "0-3", "0")
+
+	res := &ConvergenceResult{}
+	writer := newResetCoordinatorWriter(fake, NewBudgetTracker(ConvergenceBudget{}), "", res)
+	if err := writer.execute(context.Background(), dag, map[string]machine.CPUSet{
+		"primary": machine.MustParse("0-3"),
+	}, false, nil, nil,
+		map[string]struct{}{"primary/pod-start-error": {}},
+		map[string]struct{}{"primary/pod-start-error": {}}, nil); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if res.Deferred != 0 {
+		t.Fatalf("empty pending Pod dir has no leaf to protect, deferred=%d res=%+v", res.Deferred, res)
+	}
+	written := false
+	for _, write := range fake.writes {
+		if write.rel == "primary/pod-start-error" {
+			written = true
+		}
+	}
+	if !written {
+		t.Fatalf("empty pending Pod dir must still be expanded to the parent target; writes=%#v", fake.writes)
+	}
+}
+
+// TestResetWriterEmptyPendingThenNextAdjustmentChildProtected pins the empty-pending
+// lifecycle across adjustments: (1) an observed-empty pending Pod dir has no leaf to
+// protect, so the reset expands it and converges; (2) on the next adjustment a container
+// child appears inside that pending dir — even though whitelisted — the pending guard now
+// sees a child and defers the whole subtree (zero child write); (3) once the pending
+// classification is cleared, the previously-safe child widens normally.
+func TestResetWriterEmptyPendingThenNextAdjustmentChildProtected(t *testing.T) {
+	t.Parallel()
+	dag, err := BuildDAG([]NodeSpec{{
+		Rel: "primary", Domain: DomainPrimary, Role: TopoNodeRolePrimary,
+		CPUs: machine.MustParse("0-3"), TrustAnchor: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := newFakeHierarchyDriver()
+	fake.add("primary", CgroupIdentity{Device: 1, Inode: 1}, "0-3", "0")
+	fake.add("primary/pod-a", CgroupIdentity{Device: 1, Inode: 2}, "0-3", "0")
+
+	// Stage 1: empty pending pod dir, no child -> expanded, converges.
+	res1 := &ConvergenceResult{}
+	w1 := newResetCoordinatorWriter(fake, NewBudgetTracker(ConvergenceBudget{}), "", res1)
+	if err := w1.execute(context.Background(), dag, map[string]machine.CPUSet{
+		"primary": machine.MustParse("0-3"),
+	}, false, nil, nil,
+		map[string]struct{}{"primary/pod-a": {}},
+		map[string]struct{}{"primary/pod-a": {}}, nil); err != nil {
+		t.Fatalf("stage1 execute: %v", err)
+	}
+	if res1.Deferred != 0 {
+		t.Fatalf("stage1 empty pending must converge, deferred=%d", res1.Deferred)
+	}
+
+	// Stage 2: next adjustment — a container child appears inside the pending pod dir.
+	fake.add("primary/pod-a/container", CgroupIdentity{Device: 1, Inode: 3}, "0-3", "0")
+	res2 := &ConvergenceResult{}
+	w2 := newResetCoordinatorWriter(fake, NewBudgetTracker(ConvergenceBudget{}), "", res2)
+	if err := w2.execute(context.Background(), dag, map[string]machine.CPUSet{
+		"primary": machine.MustParse("0-3"),
+	}, false, nil, nil,
+		map[string]struct{}{"primary/pod-a": {}},
+		// child is positively classified, but pending guard still wins.
+		map[string]struct{}{"primary/pod-a": {}, "primary/pod-a/container": {}}, nil); err != nil {
+		t.Fatalf("stage2 execute: %v", err)
+	}
+	for _, w := range fake.writes {
+		if w.rel == "primary/pod-a/container" {
+			t.Fatalf("stage2 child born after observation must not be widened; writes=%#v", fake.writes)
+		}
+	}
+	if res2.Deferred == 0 {
+		t.Fatalf("stage2 pending-with-child must defer; res=%+v", res2)
+	}
+
+	// Stage 3: pending cleared. Both parent and child are positively classified; the
+	// pending guard no longer fires, the round converges (Deferred=0) and the child is
+	// widened this round.
+	res3 := &ConvergenceResult{}
+	w3 := newResetCoordinatorWriter(fake, NewBudgetTracker(ConvergenceBudget{}), "", res3)
+	if err := w3.execute(context.Background(), dag, map[string]machine.CPUSet{
+		"primary": machine.MustParse("0-3"),
+	}, false, nil, nil, nil,
+		map[string]struct{}{"primary/pod-a": {}, "primary/pod-a/container": {}}, nil); err != nil {
+		t.Fatalf("stage3 execute: %v", err)
+	}
+	if res3.Deferred != 0 {
+		t.Fatalf("stage3 cleared pending must converge, deferred=%d", res3.Deferred)
+	}
+	childWritten := false
+	for _, w := range fake.writes {
+		if w.rel == "primary/pod-a/container" {
+			childWritten = true
+		}
+	}
+	if !childWritten {
+		t.Fatalf("stage3 child must be widened once pending cleared; writes=%#v", fake.writes)
 	}
 }
 
@@ -2037,9 +2163,10 @@ func TestTopologyCoordinatorConvergeResetWritesOnlyControlledNodes(t *testing.T)
 	cg.cpus["custom-reclaim-root"] = machine.NewCPUSet(2, 3)
 	cg.cpus["custom-reclaim-root/reclaimed-0"] = machine.NewCPUSet(2, 3)
 	cg.cpus["custom-reclaim-root/reclaimed-0/pod-x"] = machine.NewCPUSet(2)
+	cg.cpus["custom-reclaim-root/reclaimed-0/pod-y"] = machine.NewCPUSet(2)
 	cg.children["primary"] = []string{"child-a"}
 	cg.children["custom-reclaim-root"] = []string{"reclaimed-0"}
-	cg.children["custom-reclaim-root/reclaimed-0"] = []string{"pod-x"}
+	cg.children["custom-reclaim-root/reclaimed-0"] = []string{"pod-x", "pod-y"}
 
 	res, err := (TopologyCoordinator{}).Converge(context.Background(), CoordinatorInput{
 		DAG:    dag,
@@ -2047,10 +2174,12 @@ func TestTopologyCoordinatorConvergeResetWritesOnlyControlledNodes(t *testing.T)
 		Mems:   "0",
 		Mode:   ResetModeGuard(),
 		// Fresh Pod dirs (resolved from a strict pod snapshot) are safe to widen;
-		// unclassified descendants are deferred, never written.
+		// unclassified descendants are skipped without blocking convergence.
+		// The whitelist contains the actual reclaim Pod child pod-x; pod-y below
+		// remains unclassified and must not be written.
 		SafeWidenRels: map[string]struct{}{
-			"primary/child-a":                   {},
-			"kubesandbox/reclaimed-0/sandbox-x": {},
+			"primary/child-a":                       {},
+			"custom-reclaim-root/reclaimed-0/pod-x": {},
 		},
 	})
 	if err != nil {
@@ -2059,14 +2188,17 @@ func TestTopologyCoordinatorConvergeResetWritesOnlyControlledNodes(t *testing.T)
 	if !res.Converged {
 		t.Fatalf("expected convergence, got %+v writes=%#v", res, cg.writes)
 	}
-	// Non-controlled descendants (QoS dirs, Pod/pause) are driven to their parent
-	// reset target; only proven protected leaves in ExpectedByRel are spared.
+	// Non-controlled descendants are driven to their parent reset target ONLY when
+	// positively classified safe-to-widen (primary/child-a and pod-x, both in
+	// SafeWidenRels).
 	wantTarget := map[string]string{
-		"primary/child-a":                   "0-1",
+		"primary/child-a":                       "0-1",
 		"custom-reclaim-root/reclaimed-0/pod-x": "2-3",
 	}
 	gotTargets := map[string]string{}
+	written := map[string]bool{}
 	for _, write := range cg.writes {
+		written[write.rel] = true
 		if _, ok := wantTarget[write.rel]; ok {
 			gotTargets[write.rel] = write.cpus
 		}
@@ -2075,6 +2207,10 @@ func TestTopologyCoordinatorConvergeResetWritesOnlyControlledNodes(t *testing.T)
 		if gotTargets[rel] != want {
 			t.Fatalf("descendant %s = %q, want parent target %q; writes=%#v", rel, gotTargets[rel], want, cg.writes)
 		}
+	}
+	// Negative: pod-y is absent from SafeWidenRels (unclassified) and must never be widened.
+	if written["custom-reclaim-root/reclaimed-0/pod-y"] {
+		t.Fatalf("unclassified reclaim pod child must not be widened; writes=%#v", cg.writes)
 	}
 	// Controlled DAG roots are still reset.
 	controlled := map[string]bool{"primary": false, "custom-reclaim-root": false, "custom-reclaim-root/reclaimed-0": false}

@@ -117,13 +117,26 @@ type deferredLeafDrain struct {
 }
 
 type disabledResetNotConvergedError struct {
-	state   topology.ConvergenceState
-	applied int
-	report  topology.ConvergenceReport
+	state    topology.ConvergenceState
+	applied  int
+	deferred int
+	failed   int
+	report   topology.ConvergenceReport
 }
 
 func (e *disabledResetNotConvergedError) Error() string {
-	return fmt.Sprintf("disabled reset topology dag not converged: state=%s applied=%d report=%+v", e.state, e.applied, e.report)
+	return fmt.Sprintf("disabled reset topology dag not converged: state=%s applied=%d deferred=%d failed=%d report=%+v",
+		e.state, e.applied, e.deferred, e.failed, e.report)
+}
+
+// Unwrap classifies only a physically successful, deferred-only reset as a safe
+// retry. A real write failure or a genuinely non-converged controlled target is
+// intentionally left unclassified so the manager continues to fail closed.
+func (e *disabledResetNotConvergedError) Unwrap() error {
+	if e != nil && e.failed == 0 && e.deferred > 0 && e.report.FullyConverged {
+		return bulkheadapi.ErrDisabledResetDeferred
+	}
+	return nil
 }
 
 type topologyApplyNonConvergedError struct {
@@ -1154,6 +1167,16 @@ func appliedViewFromFinalSnapshotWithDeferredCleanup(
 	return applied, nil
 }
 
+// CPUSetAdjustmentDisabledHandler implements AdjustmentCapable. It is inert on a
+// cgroup v2 host without the opt-in; otherwise it clears the pending-protection
+// state and runs resetCPUSetTopology. The reset converges the plugin's controlled
+// non-leaf DAG nodes and writes no AppliedView: while preserve mode is on it
+// excludes the configured reclaim roots, which ReconcileDisabled aligns, and while
+// preserve is off the reset DAG includes them. Converged controlled targets with
+// pending-Pod subtrees or post-snapshot descendants still deferred return
+// disabledResetNotConvergedError, whose Unwrap classifies ErrDisabledResetDeferred
+// for a later retry. UnclassifiedSkipped alone does not defer reset completion;
+// physical read/write failures remain hard errors.
 func (p *CPUSetTopologyPlugin) CPUSetAdjustmentDisabledHandler(ctx context.Context, in bulkheadapi.HandlerContext) error {
 	if p.disabledOnCgroupV2(ctx) {
 		return nil
@@ -1167,13 +1190,14 @@ func (p *CPUSetTopologyPlugin) CPUSetAdjustmentDisabledHandler(ctx context.Conte
 // NeedsDisabledReset implements bulkheadapi.DisabledTopologyReconciler: it reports
 // true until the authoritative disabled reset has run once. At process start and
 // after a restart resetComplete is false, so the first disabled round performs one
-// idempotent reset (zero writes when the controlled non-leaf nodes are already at
-// the whole-machine target). A genuine enabled->disabled exit and a preserve-mode
-// toggle both reset resetComplete to false so a fresh reset runs.
+// idempotent reset, even if the targets already have the desired values. A genuine
+// enabled->disabled exit and a preserve-mode toggle both clear resetComplete so a
+// fresh reset runs.
 //
-// The safety guarantee no longer depends on an in-memory ownership witness: the
-// reset writes only controlled non-leaf DAG nodes to the expand-only
-// whole-machine target, and leaves are never written (kubelet converges them).
+// The safety guarantee no longer depends on an in-memory ownership witness: reset
+// restores controlled DAG targets and positively classified safe-to-widen
+// intermediate directories. Protected container leaves and unclassified
+// descendants are not written; reset does not repair historical leaf drift.
 func (p *CPUSetTopologyPlugin) NeedsDisabledReset() bool {
 	return !p.resetComplete
 }
@@ -1182,6 +1206,13 @@ func (p *CPUSetTopologyPlugin) NeedsDisabledReset() bool {
 // calls this inside a generation-fence commit.
 func (p *CPUSetTopologyPlugin) MarkDisabledResetComplete() { p.resetComplete = true }
 
+// ReconcileDisabled implements DisabledTopologyReconciler. It returns a None
+// outcome when ShouldReconcileWhenDisabled declines the round or DesiredView is
+// nil; otherwise it converges only the configured reclaim roots into a ReclaimOnly
+// AppliedView and routes the result through toOutcome with requireReclaimOnly, so
+// the manager accepts it only on full reclaim-only convergence. It owns the
+// reclaim-only view; the disabled reset handler owns the disabled-transition
+// reset, excluding the reclaim roots only when preservation is enabled.
 func (p *CPUSetTopologyPlugin) ReconcileDisabled(
 	ctx context.Context,
 	in bulkheadapi.HandlerContext,
@@ -1916,9 +1947,11 @@ func (p *CPUSetTopologyPlugin) resetCPUSetTopology(
 		general.InfofV(4, "cpuset_topology: disabled reset not fully converged, report=%+v", res.ConvergenceReport)
 		emitBulkheadPruneResult(in.Emitter, "skipped", "reset_not_converged")
 		return res, &disabledResetNotConvergedError{
-			state:   res.State,
-			applied: res.Applied,
-			report:  res.ConvergenceReport,
+			state:    res.State,
+			applied:  res.Applied,
+			deferred: res.Deferred,
+			failed:   res.Failed,
+			report:   res.ConvergenceReport,
 		}
 	}
 

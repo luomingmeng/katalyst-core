@@ -4191,6 +4191,30 @@ func TestCPUSetTopologyPluginDisabledTransitionReturnsSiblingDiscoveryError(t *t
 	}
 }
 
+func TestDisabledResetNotConvergedErrorClassifiesDeferredOnly(t *testing.T) {
+	t.Parallel()
+
+	deferred := &disabledResetNotConvergedError{
+		state:    topology.ConvergenceStateNonConverged,
+		applied:  44,
+		deferred: 2,
+		report:   topology.ConvergenceReport{FullyConverged: true},
+	}
+	if !errors.Is(deferred, bulkheadapi.ErrDisabledResetDeferred) {
+		t.Fatalf("deferred-only reset error must unwrap to ErrDisabledResetDeferred: %v", deferred)
+	}
+
+	for _, err := range []*disabledResetNotConvergedError{
+		{state: topology.ConvergenceStateNonConverged, deferred: 2, failed: 1, report: topology.ConvergenceReport{FullyConverged: true}},
+		{state: topology.ConvergenceStateNonConverged, deferred: 2, report: topology.ConvergenceReport{FullyConverged: false}},
+		{state: topology.ConvergenceStateNonConverged, report: topology.ConvergenceReport{FullyConverged: true}},
+	} {
+		if errors.Is(err, bulkheadapi.ErrDisabledResetDeferred) {
+			t.Fatalf("real or unexplained non-convergence must stay fail-closed: %+v", err)
+		}
+	}
+}
+
 func TestCPUSetTopologyPluginDisabledTransitionReturnsTypedErrorWhenResetNotConverged(t *testing.T) {
 	t.Parallel()
 
@@ -6576,6 +6600,80 @@ func TestCPUSetTopologyPluginDisabledResetBudgetFailurePerformsNoWrites(t *testi
 	}
 	if len(cg.writeOrder) != 0 {
 		t.Fatalf("disabled reset budget failure performed writes: %v", cg.writeOrder)
+	}
+}
+
+// TestCPUSetTopologyPluginDisabledResetHardErrorsNotDeferredSentinel pins the
+// boundary at plugin.go's Converge hard-error wrap (the !err==nil branch)
+// against the disabledResetNotConvergedError sentinel construction (the
+// !res.Converged branch). A convergence-budget exhaustion or a canceled context
+// surfaces as a hard error from the real CPUSetAdjustmentDisabledHandler and
+// must stay unclassified: it must not unwrap to ErrDisabledResetDeferred, which
+// is reserved for the failed==0/deferred>0/FullyConverged retry shape.
+func TestCPUSetTopologyPluginDisabledResetHardErrorsNotDeferredSentinel(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name        string
+		podUID      string
+		containerID string
+		setup       func(p *CPUSetTopologyPlugin, cg *fakeCgroupClient) context.Context
+		wantCause   error
+	}{
+		{
+			name:        "convergence budget exhausted",
+			podUID:      "bulkhead-disabled-reset-harderr-budget-pod",
+			containerID: "bulkhead-disabled-reset-harderr-budget-container",
+			setup: func(p *CPUSetTopologyPlugin, _ *fakeCgroupClient) context.Context {
+				p.cfg.TopologyConvergenceBudget.MaxPlanOperations = 1
+				return context.Background()
+			},
+			wantCause: topology.ErrAdjustmentWriteBudgetExceeded,
+		},
+		{
+			name:        "canceled context mid-converge",
+			podUID:      "bulkhead-disabled-reset-harderr-cancel-pod",
+			containerID: "bulkhead-disabled-reset-harderr-cancel-container",
+			setup: func(_ *CPUSetTopologyPlugin, cg *fakeCgroupClient) context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cg.readEntryHook = func(string, int) error {
+					cancel()
+					return nil
+				}
+				return ctx
+			},
+			wantCause: context.Canceled,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			p, cg, in, _ := newDisabledTransitionTestPlugin(
+				t,
+				cgroupclient.CgroupVersionV1,
+				tc.podUID,
+				tc.containerID,
+			)
+			ctx := tc.setup(p, cg)
+
+			err := p.CPUSetAdjustmentDisabledHandler(ctx, in)
+
+			if err == nil {
+				t.Fatalf("CPUSetAdjustmentDisabledHandler() error = nil, want non-nil hard error")
+			}
+			if errors.Is(err, bulkheadapi.ErrDisabledResetDeferred) {
+				t.Fatalf("hard error must NOT unwrap to ErrDisabledResetDeferred: %v", err)
+			}
+			var notConverged *disabledResetNotConvergedError
+			if errors.As(err, &notConverged) {
+				t.Fatalf("hard error must not be a disabledResetNotConvergedError: %+v", notConverged)
+			}
+			if !errors.Is(err, tc.wantCause) {
+				t.Fatalf("CPUSetAdjustmentDisabledHandler() error = %v, want chain containing %v", err, tc.wantCause)
+			}
+		})
 	}
 }
 

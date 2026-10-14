@@ -438,16 +438,12 @@ func (w resetCoordinatorWriter) collectPropagatedResetWrites(
 		}
 		return
 	}
-	// Pending guard: this Pod dir holds an admit-pending container (Allocate done,
-	// no status ID yet). The Pod dir itself has already been expanded by its parent;
-	// write NONE of its subdirs this round and report not converged so the next round
-	// retries once the pending container materializes or clears.
-	if _, pending := pendingPodDirs[filepath.Clean(parentRel)]; pending {
-		if w.res != nil {
-			w.res.Deferred++
-		}
-		return
-	}
+	// Resolve the current children before applying the pending guard. A pending Pod
+	// dir with no children has no leaf to protect and must not pin an authoritative
+	// disabled reset forever (for example, an OCI StartError may leave only the Pod
+	// cgroup for hours). If a child appears after this observation, this round still
+	// performs no descendant write; kubelet owns the new leaf and the expanded Pod
+	// parent is already a valid superset.
 	driver, err := newReservedBudgetedHierarchyDriver(ctx, w.driver, w.budget, 1)
 	if err != nil {
 		if *firstErr == nil {
@@ -459,6 +455,15 @@ func (w resetCoordinatorWriter) collectPropagatedResetWrites(
 	if err != nil {
 		if *firstErr == nil {
 			*firstErr = err
+		}
+		return
+	}
+	// Pending guard: this Pod dir holds an admit-pending container (Allocate done,
+	// no status ID yet). When subdirs already exist their identity is uncertain, so
+	// write NONE of them this round and retry after they materialize or clear.
+	if _, pending := pendingPodDirs[filepath.Clean(parentRel)]; pending && len(children) > 0 {
+		if w.res != nil {
+			w.res.Deferred++
 		}
 		return
 	}
