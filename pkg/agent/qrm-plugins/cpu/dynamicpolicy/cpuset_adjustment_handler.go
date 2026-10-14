@@ -464,6 +464,10 @@ func (s *cpuSetAdjustmentStateSnapshot) GetPodEntries() state.PodEntries {
 	return s.podEntries.Clone()
 }
 
+func (s *cpuSetAdjustmentStateSnapshot) GetAdvisorStateSnapshot() (state.PodEntries, state.NUMANodeMap, uint64) {
+	return s.podEntries.Clone(), s.machineState.Clone(), s.revision
+}
+
 func (s *cpuSetAdjustmentStateSnapshot) GetAllocationInfo(podUID, containerName string) *state.AllocationInfo {
 	if allocationInfo := s.podEntries[podUID][containerName]; allocationInfo != nil {
 		return allocationInfo.Clone()
