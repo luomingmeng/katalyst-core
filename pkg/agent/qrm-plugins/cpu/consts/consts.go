@@ -44,6 +44,23 @@ const (
 	// CPUStateAnnotationKeyNUMAHint is the key stored in allocationInfo.Annotations
 	// to indicate NUMA hint for the entry
 	CPUStateAnnotationKeyNUMAHint = "numa_hint"
+
+	// CPUSetOmissionAllowedAnnotationKey is the PUBLIC annotation key that records
+	// whether the container's containerd spec has a QRM-written CPUSet. When the
+	// live bypass switch is on and this annotation is "true", QRM may omit the
+	// non-empty CPUSet from the response.
+	//
+	// Three-state semantics (strict "true"/"false", anything else fails closed):
+	//   - Missing key: legacy/older container; effective omission = live switch
+	//     AND bypassable QoS (shared/reclaimed/system). QRM does not backfill.
+	//   - "true": when live bypass is enabled, CPUSet may be omitted.
+	//   - "false": until the container is deleted and recreated, QRM must always
+	//     return a non-empty CPUSet (one-way: can only transition true → false).
+	//   - Any other value: treated as "false" (fail-closed).
+	//
+	// This is a public user-visible annotation: QRM never strips it at the request
+	// boundary, and it round-trips through ResourceAllocationResponse.
+	CPUSetOmissionAllowedAnnotationKey = "qrm.katalyst.kubewharf.io/cpuset-omission-allowed"
 )
 
 const (

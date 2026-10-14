@@ -1681,12 +1681,26 @@ func (p *DynamicPolicy) Allocate(ctx context.Context,
 
 	existReallocAnno, isReallocation := util.IsReallocation(req.Annotations)
 
+	// GetKatalystQoSLevelFromResourceReq strips annotations that are not in the
+	// kept-keys set. The cpuset-omission request is consumed explicitly by the
+	// allocation handlers instead of being kept as generic state, so capture it
+	// before that filter and restore it afterwards; it is therefore not required
+	// in the default kept-keys configuration.
+	cpusetOmissionReqVal, cpusetOmissionReqPresent := req.Annotations[cpuconsts.CPUSetOmissionAllowedAnnotationKey]
+
 	qosLevel, err := util.GetKatalystQoSLevelFromResourceReq(p.config.qosConfig, req, p.config.podAnnotationKeptKeys, p.config.podLabelKeptKeys)
 	if err != nil {
 		err = fmt.Errorf("GetKatalystQoSLevelFromResourceReq for pod: %s/%s, container: %s failed with error: %v",
 			req.PodNamespace, req.PodName, req.ContainerName, err)
 		general.Errorf("%s", err.Error())
 		return nil, err
+	}
+
+	if cpusetOmissionReqPresent {
+		if req.Annotations == nil {
+			req.Annotations = make(map[string]string)
+		}
+		req.Annotations[cpuconsts.CPUSetOmissionAllowedAnnotationKey] = cpusetOmissionReqVal
 	}
 
 	reqInt, reqFloat64, err := util.GetQuantityFromResourceReq(req)

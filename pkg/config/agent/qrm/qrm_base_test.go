@@ -23,7 +23,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	katalystapiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
-	coreconsts "github.com/kubewharf/katalyst-core/pkg/consts"
 )
 
 func TestNewGenericQRMPluginConfiguration_ContainsContainerCPUIdleAnnotation(t *testing.T) {
@@ -31,18 +30,6 @@ func TestNewGenericQRMPluginConfiguration_ContainsContainerCPUIdleAnnotation(t *
 
 	conf := NewGenericQRMPluginConfiguration()
 	assert.Contains(t, conf.PodAnnotationKeptKeys, katalystapiconsts.PodAnnotationContainerCPUIdleRateKey)
-}
-
-// TestNewGenericQRMPluginConfiguration_DefaultKeepsAllowBypassAnnotation proves the
-// public bypass-capability annotation is part of the baseline kept-annotation set,
-// so it survives the QRM annotation filter at admission without a per-call-site helper.
-// It references the neutral core consts package, keeping the config layer free of any
-// CPU-plugin dependency.
-func TestNewGenericQRMPluginConfiguration_DefaultKeepsAllowBypassAnnotation(t *testing.T) {
-	t.Parallel()
-
-	conf := NewGenericQRMPluginConfiguration()
-	assert.Contains(t, conf.PodAnnotationKeptKeys, coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey)
 }
 
 func TestNewQRMPluginsConfiguration_ResctrlConfigHasNoOptionDefaults(t *testing.T) {

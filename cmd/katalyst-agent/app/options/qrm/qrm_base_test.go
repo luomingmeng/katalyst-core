@@ -21,31 +21,31 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	katalystapiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	qrmconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/qrm"
-	coreconsts "github.com/kubewharf/katalyst-core/pkg/consts"
 )
 
 // TestGenericQRMPluginOptions_ApplyTo_AppendsCustomKeepsDefaults pins the merge
 // semantics: user-supplied --pod-annotation-kept-keys are APPENDED to the baseline
-// defaults, never replacing them. The public allow key (a default) must survive
-// explicit configuration, the custom key must be present, and a random
-// never-configured key must NOT be kept.
+// defaults, never replacing them. A built-in default key must survive explicit
+// configuration, the custom key must be present, and a random never-configured
+// key must NOT be kept.
 func TestGenericQRMPluginOptions_ApplyTo_AppendsCustomKeepsDefaults(t *testing.T) {
 	t.Parallel()
 	as := require.New(t)
 
-	// Baseline defaults already contain the public allow key.
+	// Baseline defaults already contain built-in kept keys.
 	conf := qrmconfig.NewGenericQRMPluginConfiguration()
-	as.Contains(conf.PodAnnotationKeptKeys, coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey)
+	as.Contains(conf.PodAnnotationKeptKeys, katalystapiconsts.PodAnnotationAggregatedRequestsKey)
 
 	// Simulate a user explicitly configuring extra kept annotation keys.
 	o := NewGenericQRMPluginOptions()
 	o.PodAnnotationKeptKeys = []string{"custom.example.com/keep-me", "custom.example.com/keep-me-too"}
 	as.NoError(o.ApplyTo(conf))
 
-	// Default allow key must survive explicit config (append, not replace).
-	as.Contains(conf.PodAnnotationKeptKeys, coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey,
-		"default allow key must survive explicit kept-keys config")
+	// A built-in default key must survive explicit config (append, not replace).
+	as.Contains(conf.PodAnnotationKeptKeys, katalystapiconsts.PodAnnotationAggregatedRequestsKey,
+		"default kept key must survive explicit kept-keys config")
 	// Custom keys must be present.
 	as.Contains(conf.PodAnnotationKeptKeys, "custom.example.com/keep-me")
 	as.Contains(conf.PodAnnotationKeptKeys, "custom.example.com/keep-me-too")

@@ -20,7 +20,6 @@ import (
 	katalystapiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/resctrl"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/qrm/statedirectory"
-	coreconsts "github.com/kubewharf/katalyst-core/pkg/consts"
 )
 
 type GenericQRMPluginConfiguration struct {
@@ -69,13 +68,6 @@ func NewGenericQRMPluginConfiguration() *GenericQRMPluginConfiguration {
 			katalystapiconsts.PodAnnotationAggregatedRequestsKey,
 			katalystapiconsts.PodAnnotationInplaceUpdateResizingKey,
 			katalystapiconsts.PodAnnotationContainerCPUIdleRateKey,
-			// The public bypass-capability annotation must survive the QRM annotation
-			// filter at admission so a user-declared allow/false reaches the allocation.
-			// It is a default here (not per call site) so the merge with explicitly
-			// configured kept keys stays an append. It references the neutral core
-			// consts package, never the CPU plugin consts, to avoid a config -> cpu
-			// dependency.
-			coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey,
 		},
 		PodLabelKeptKeys:            []string{},
 		StateDirectoryConfiguration: statedirectory.NewStateDirectoryConfiguration(),
