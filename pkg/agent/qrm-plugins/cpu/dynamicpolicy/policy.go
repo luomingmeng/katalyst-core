@@ -1117,9 +1117,8 @@ func (p *DynamicPolicy) GetResourcesAllocation(ctx context.Context,
 	defer releaseExecution.release()
 	ctx = context.WithValue(ctx, cpuSetAdjustmentExecutionLeaseContextKey{}, releaseExecution)
 
-	expectedRevision := p.state.GetRevision()
-	podEntries := p.state.GetPodEntries()
-	machineState := p.state.GetMachineState()
+	podEntries, machineState, expectedRevision := p.state.GetAdvisorStateSnapshot()
+	snapshotDirty := false
 	hasSharedRampUpExit := false
 	now := time.Now()
 	for _, containerEntries := range podEntries {
@@ -1164,6 +1163,7 @@ func (p *DynamicPolicy) GetResourcesAllocation(ctx context.Context,
 					continue
 				}
 				if p.applySidecarAllocationInfoFromMainContainer(allocationInfo, mainContainerAllocationInfo) {
+					snapshotDirty = true
 					general.Infof("pod: %s/%s, container: %s sync allocation info from main container",
 						allocationInfo.PodNamespace, allocationInfo.PodName, containerName)
 					if err := p.updateAllocationInfo(podUID, containerName, originAllocationInfo, allocationInfo, true); err != nil {
@@ -1180,6 +1180,7 @@ func (p *DynamicPolicy) GetResourcesAllocation(ctx context.Context,
 
 			_, tsErr := time.Parse(util.QRMTimeFormat, allocationInfo.InitTimestamp)
 			if tsErr != nil {
+				snapshotDirty = true
 				if allocationInfo.CheckShared() && !allocationInfo.CheckNUMABinding() {
 					general.Errorf("pod: %s/%s, container: %s init timestamp parsed failed with error: %v, re-ramp-up it",
 						allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName, tsErr)
@@ -1224,6 +1225,7 @@ func (p *DynamicPolicy) GetResourcesAllocation(ctx context.Context,
 						allocationInfo.PodNamespace, allocationInfo.PodName, containerName, err)
 				}
 			} else if finishRampUp, _ := shouldAllocationFinishRampUp(allocationInfo, p.config.transitionPeriod, time.Now()); finishRampUp {
+				snapshotDirty = true
 				general.Infof("pod: %s/%s, container: %s ramp up finished", allocationInfo.PodNamespace, allocationInfo.PodName, allocationInfo.ContainerName)
 				allocationInfo.RampUp = false
 				if allocationInfo.CheckShared() {
@@ -1267,7 +1269,25 @@ func (p *DynamicPolicy) GetResourcesAllocation(ctx context.Context,
 		}
 	}
 
-	podEntries = p.state.GetPodEntries()
+	// The ramp-up batch path is attempted whenever a shared finish-ramp-up
+	// candidate was collected. Refresh after it so response packing sees either
+	// the committed result or unchanged state; on failure, the stale local
+	// candidate must never be packed through the final CAS.
+	if len(allocationInfosJustFinishRampUp) > 0 || snapshotDirty {
+		podEntries, machineState, expectedRevision = p.state.GetAdvisorStateSnapshot()
+	}
+
+	// One-way demote before returning a non-empty CPUSet; never promotes. The
+	// candidate, its machine-state mirror and revision come from one generation.
+	// When the repair phase above touched state, refresh at most once before this
+	// final commit; otherwise reuse the entry snapshot captured at function start.
+	liveEnabled := p.shouldBypassCPUSetAdjustment()
+	podEntries, err = p.demoteCPUSetExposureOnSnapshot(
+		podEntries, machineState, expectedRevision, liveEnabled, true)
+	if err != nil {
+		return nil, err
+	}
+
 	podResources := make(map[string]*pluginapi.ContainerResources)
 	for podUID, containerEntries := range podEntries {
 		if containerEntries.IsPoolEntry() {
@@ -1305,7 +1325,7 @@ func (p *DynamicPolicy) GetResourcesAllocation(ctx context.Context,
 					},
 				},
 			}
-			if p.shouldBypassCPUSetAdjustmentForAllocation(allocationInfo) {
+			if cpusetOmissionAllowed(allocationInfo, liveEnabled) {
 				clearCPUSetInAllocation(podResources[podUID].ContainerResources[containerName])
 			}
 		}
@@ -1867,6 +1887,7 @@ func (p *DynamicPolicy) Allocate(ctx context.Context,
 				req.PodUid, req.ContainerName, err)
 		}
 	}
+
 	if existingAllocationSatisfiesRequest(allocationInfo, reqInt, p.isRampUpReclaimHardPartitionEnabled()) &&
 		!util.PodInplaceUpdateResizing(req) {
 		general.InfoS("already allocated and meet requirement",
@@ -1877,6 +1898,21 @@ func (p *DynamicPolicy) Allocate(ctx context.Context,
 			"originalAllocationResult", allocationInfo.OriginalAllocationResult.String(),
 			"currentResult", allocationInfo.AllocationResult.String())
 
+		// Reuse fast-return. Read the live switch once for this decision. Only the
+		// requested container can be exposed by this response, so demote exactly
+		// that container before returning a non-empty CPUSet. Other containers are
+		// left to their own Allocate response or the next GetResourcesAllocation.
+		// On any revision/permit failure, return an error without exposing CPUSet.
+		live := p.shouldBypassCPUSetAdjustment()
+		if needsCPUSetDemotion(allocationInfo, live) {
+			if err := p.commitCPUSetExposureForContainer(req.PodUid, req.ContainerName, false); err != nil {
+				return nil, err
+			}
+			if refreshed := p.state.GetAllocationInfo(req.PodUid, req.ContainerName); refreshed != nil {
+				allocationInfo = refreshed
+			}
+		}
+
 		resp, err = cpuutil.PackAllocationResponse(allocationInfo, string(v1.ResourceCPU), util.OCIPropertyNameCPUSetCPUs,
 			false, true, req, allocationInfo.Annotations)
 		if err != nil {
@@ -1884,7 +1920,9 @@ func (p *DynamicPolicy) Allocate(ctx context.Context,
 				req.PodNamespace, req.PodName, req.ContainerName, err)
 			return nil, fmt.Errorf("PackResourceAllocationResponseByAllocationInfo failed with error: %v", err)
 		}
-		p.clearCPUSetInAllocationResponseIfNeeded(resp, allocationInfo)
+		if cpusetOmissionAllowed(allocationInfo, live) {
+			clearCPUSetInAllocation(resp.AllocationResult)
+		}
 
 		return resp, nil
 	}
@@ -2381,13 +2419,24 @@ func (p *DynamicPolicy) applySidecarAllocationInfoFromMainContainer(sidecarAlloc
 		changed = true
 	}
 
-	// Copy annotations from main container
+	// Copy annotations from main container. The cpuset-omission key is one-way:
+	// a sidecar that already recorded "false" must stay "false" even if main is
+	// "true" or has no key, so capture the sidecar's pre-copy value and restore
+	// "false" afterwards. This keeps the monotonic rule in the apply core rather
+	// than relying on every caller.
+	sidecarPreOmission, hadPreOmission := sidecarAllocationInfo.Annotations[cpuconsts.CPUSetOmissionAllowedAnnotationKey]
 	if sidecarAllocationInfo.Annotations == nil && len(mainAllocationInfo.Annotations) > 0 {
 		sidecarAllocationInfo.Annotations = make(map[string]string, len(mainAllocationInfo.Annotations))
 	}
 	for key, value := range mainAllocationInfo.Annotations {
 		if sidecarAllocationInfo.Annotations[key] != value {
 			sidecarAllocationInfo.Annotations[key] = value
+			changed = true
+		}
+	}
+	if hadPreOmission && sidecarPreOmission == cpusetOmissionFalse {
+		if sidecarAllocationInfo.Annotations[cpuconsts.CPUSetOmissionAllowedAnnotationKey] != cpusetOmissionFalse {
+			sidecarAllocationInfo.Annotations[cpuconsts.CPUSetOmissionAllowedAnnotationKey] = cpusetOmissionFalse
 			changed = true
 		}
 	}
@@ -2460,13 +2509,6 @@ func (p *DynamicPolicy) updateAllocationInfo(podUID, containerName string, oldAl
 		}
 	}
 
-	// Record the QoS bypass capability (public annotation) on the main container
-	// being admitted through this legacy direct-write path. Sidecars are skipped:
-	// they inherit the key from their main via the sidecar sync.
-	if allocationInfo != nil && !allocationInfo.CheckSideCar() {
-		recordBypassCapability(allocationInfo)
-	}
-
 	// Defensive: a synchronous legacy allocation hook may mutate the resulting
 	// allocationInfo (e.g. set RampUp on a reclaimed container). Reuse the single
 	// authoritative predicate so an illegal reclaimed RampUp cannot be persisted
@@ -2493,17 +2535,6 @@ func (p *DynamicPolicy) shouldBypassCPUSetAdjustment() bool {
 	return dyn != nil && dyn.EnableBypassCPUSetAdjustment
 }
 
-// shouldBypassCPUSetAdjustmentForAllocation decides, at response time, whether
-// the response cpuset (X) for this allocation should be cleared. The effective
-// decision is the live EnableBypassCPUSetAdjustment switch AND the container's
-// recorded bypass capability (read from the public annotation, or derived from QoS
-// when absent). dedicated (and any non-bypassable QoS) has capability false, so it
-// never bypasses. A live-config flip takes effect on the next response; the
-// annotation only ever carries QoS capability, not a live snapshot.
-func (p *DynamicPolicy) shouldBypassCPUSetAdjustmentForAllocation(allocationInfo *state.AllocationInfo) bool {
-	return p.shouldBypassCPUSetAdjustment() && bypassCapabilityAllow(allocationInfo)
-}
-
 // clearCPUSetInAllocation clears the cpuset string on every entry of a
 // *pluginapi.ResourceAllocation in place, leaving TopologyAssignments,
 // AllocatedQuantity, ResourceHints and Annotations untouched. It is a no-op
@@ -2518,9 +2549,102 @@ func clearCPUSetInAllocation(alloc *pluginapi.ResourceAllocation) {
 	}
 }
 
-func (p *DynamicPolicy) clearCPUSetInAllocationResponseIfNeeded(resp *pluginapi.ResourceAllocationResponse, allocationInfo *state.AllocationInfo) {
-	if resp == nil || !p.shouldBypassCPUSetAdjustmentForAllocation(allocationInfo) {
-		return
+// commitCPUSetExposureForContainer one-way demotes exactly the container whose
+// Allocate reuse response is about to expose a non-empty CPUSet. The caller
+// performs a target-local preflight first. This helper then takes one atomic
+// state snapshot, updates the matching entry and its machine-state mirror, and
+// CAS-commits against that snapshot revision.
+func (p *DynamicPolicy) commitCPUSetExposureForContainer(podUID, containerName string, persist bool) error {
+	podEntries, machineState, revision := p.state.GetAdvisorStateSnapshot()
+
+	containerEntries := podEntries[podUID]
+	if containerEntries == nil || containerEntries.IsPoolEntry() {
+		return fmt.Errorf("demote cpuset exposure: pod %q is missing or is a pool entry", podUID)
 	}
-	clearCPUSetInAllocation(resp.AllocationResult)
+	allocationInfo := containerEntries[containerName]
+	if allocationInfo == nil {
+		return fmt.Errorf("demote cpuset exposure: container %q/%q is missing", podUID, containerName)
+	}
+	if !markCPUSetExposed(allocationInfo) {
+		return nil
+	}
+
+	return p.stampMirrorAndCommit(revision, podEntries, machineState,
+		[]podContainerRef{{podUID: podUID, containerName: containerName}}, persist)
+}
+
+// demoteCPUSetExposureOnSnapshot consumes one consistent state generation owned
+// by the caller. It marks every container that needs a one-way true-to-false
+// transition, mirrors only those metadata changes into machineState, and commits
+// at most once using expectedRevision. When nothing changes it returns the same
+// entries candidate without reading state or writing a checkpoint.
+func (p *DynamicPolicy) demoteCPUSetExposureOnSnapshot(
+	podEntries state.PodEntries,
+	machineState state.NUMANodeMap,
+	expectedRevision uint64,
+	liveEnabled bool,
+	persist bool,
+) (state.PodEntries, error) {
+
+	var changed []podContainerRef
+	for podUID, containerEntries := range podEntries {
+		if containerEntries.IsPoolEntry() {
+			continue
+		}
+		for _, ai := range containerEntries {
+			if needsCPUSetDemotion(ai, liveEnabled) && markCPUSetExposed(ai) {
+				changed = append(changed, podContainerRef{podUID, ai.ContainerName})
+			}
+		}
+	}
+	if len(changed) == 0 {
+		return podEntries, nil
+	}
+	if err := p.stampMirrorAndCommit(expectedRevision, podEntries, machineState, changed, persist); err != nil {
+		return nil, err
+	}
+	return podEntries, nil
+}
+
+// stampMirrorAndCommit propagates only the flipped containers onto the machineState
+// mirror (without rebuilding pools) and commits the marked podEntries under the
+// captured revision. The candidate, mirror and revision must come from one state
+// generation; callers either pass a GetAdvisorStateSnapshot result or invoke a
+// helper that takes such a snapshot after a target-local preflight.
+// When nothing flipped it returns nil without a write.
+func (p *DynamicPolicy) stampMirrorAndCommit(rev uint64, podEntries state.PodEntries, machineState state.NUMANodeMap, changed []podContainerRef, persist bool) error {
+	if len(changed) == 0 {
+		return nil
+	}
+	omissionKey := cpuconsts.CPUSetOmissionAllowedAnnotationKey
+	for _, c := range changed {
+		for _, ns := range machineState {
+			if ns == nil || ns.PodEntries == nil {
+				continue
+			}
+			entries, ok := ns.PodEntries[c.podUID]
+			if !ok {
+				continue
+			}
+			if ai, ok := entries[c.containerName]; ok && ai != nil {
+				if ai.Annotations == nil {
+					ai.Annotations = make(map[string]string)
+				}
+				ai.Annotations[omissionKey] = cpusetOmissionFalse
+			}
+		}
+	}
+
+	allowOverlap := p.state.GetAllowSharedCoresOverlapReclaimedCores()
+	disableDedicatedOverlap := p.state.GetDisableDedicatedCoresOverlapReclaimedCores()
+	if err := p.state.CommitAdvisorStateIfRevision(rev, podEntries, machineState, allowOverlap, disableDedicatedOverlap, persist); err != nil {
+		return fmt.Errorf("commit cpuset exposure demote: %w", err)
+	}
+	return nil
+}
+
+// podContainerRef identifies one container entry inside the podEntries snapshot.
+type podContainerRef struct {
+	podUID        string
+	containerName string
 }

@@ -17,94 +17,154 @@ limitations under the License.
 package dynamicpolicy
 
 import (
+	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
+	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
-	coreconsts "github.com/kubewharf/katalyst-core/pkg/consts"
 )
 
-// Strict annotation values for the public bypass-capability annotation. The
-// annotation key itself is the shared coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey;
-// these values are the only accepted strings.
+// Strict annotation values.
 const (
-	bypassCapabilityTrue  = "true"
-	bypassCapabilityFalse = "false"
+	cpusetOmissionTrue  = "true"
+	cpusetOmissionFalse = "false"
 )
 
-// hasBypassableQoS reports whether the allocation's QoS level is eligible to skip
-// response cpuset backfill at all. shared_cores / reclaimed_cores / system_cores
-// are capable; dedicated_cores (and any other QoS) never are.
+// hasBypassableQoS reports whether the allocation's QoS level is eligible to
+// skip response cpuset backfill at all. It delegates to qosIsBypassable so the
+// QoS predicate lives in exactly one place.
 func hasBypassableQoS(info *state.AllocationInfo) bool {
-	return info != nil &&
-		(info.CheckShared() || info.CheckReclaimed() || info.CheckSystem())
+	return info != nil && qosIsBypassable(info.QoSLevel)
 }
 
-// recordBypassCapability normalizes one main-container allocationInfo's public
-// bypass-capability annotation at the allocation lifecycle. It is deterministic
-// QoS labeling:
-//   - dedicated (and any non-bypassable QoS) is always recorded as "false",
-//     even if a user set "true";
-//   - for shared/reclaimed/system, a valid explicit "true"/"false" is preserved
-//     (an explicit "false" must NOT be overwritten with the QoS-derived "true");
-//   - a missing key is written with the QoS-derived value ("true" for bypassable QoS);
-//   - an invalid (non-strict) value is normalized to "false".
+// qosIsBypassable reports whether the given QoS level string is eligible.
+func qosIsBypassable(qosLevel string) bool {
+	return qosLevel == apiconsts.PodAnnotationQoSLevelSharedCores ||
+		qosLevel == apiconsts.PodAnnotationQoSLevelReclaimedCores ||
+		qosLevel == apiconsts.PodAnnotationQoSLevelSystemCores
+}
+
+// cpusetOmissionAllowed reports whether the live bypass decision allows omitting
+// the CPUSet in the response. It combines the live switch with the recorded
+// annotation state:
+//   - dedicated / non-bypassable QoS: always false;
+//   - live switch off: always false;
+//   - missing key: legacy compat, derives from QoS (true if bypassable);
+//   - "true": true;
+//   - "false" or any invalid value: false (fail-closed).
+func cpusetOmissionAllowed(info *state.AllocationInfo, liveEnabled bool) bool {
+	if !liveEnabled || info == nil || !hasBypassableQoS(info) {
+		return false
+	}
+	val, present := info.Annotations[cpuconsts.CPUSetOmissionAllowedAnnotationKey]
+	if !present {
+		return true // missing key derives from QoS (legacy)
+	}
+	return val == cpusetOmissionTrue
+}
+
+// initialCPUSetOmissionAllowed computes the annotation value to write on a
+// first Allocate for a brand-new container.
 //
-// Pool/fake entries and sidecars are handled by the caller (sidecars inherit
-// from their main).
-func recordBypassCapability(info *state.AllocationInfo) {
+// Rules:
+//   - dedicated / non-bypassable QoS: false;
+//   - bypassable QoS, live off: false;
+//   - bypassable QoS, live on, request explicit "false" or invalid: false;
+//   - bypassable QoS, live on, request "true" or missing: true.
+func initialCPUSetOmissionAllowed(qosLevel string, requestAnnotations map[string]string, liveEnabled bool) bool {
+	if !qosIsBypassable(qosLevel) {
+		return false
+	}
+	if !liveEnabled {
+		return false
+	}
+	val, present := requestAnnotations[cpuconsts.CPUSetOmissionAllowedAnnotationKey]
+	if present && val != cpusetOmissionTrue {
+		// Explicit "false" or any invalid value: fail-closed.
+		return false
+	}
+	return true
+}
+
+// needsCPUSetDemotion reports whether the entry actually needs a one-way true->false
+// write: it is bypassable, has a non-empty CPUSet to expose, the live decision does
+// NOT currently allow omission, and the recorded annotation is not already "false".
+// live=false still requires demoting a persisted "true"/missing/invalid entry so the
+// value cannot resurrect when the watcher flips back on; an entry already recording
+// "false" never needs another write.
+func needsCPUSetDemotion(info *state.AllocationInfo, liveEnabled bool) bool {
+	if info == nil || !hasBypassableQoS(info) || info.AllocationResult.IsEmpty() {
+		return false
+	}
+	if cpusetOmissionAllowed(info, liveEnabled) {
+		return false
+	}
+	val, present := info.Annotations[cpuconsts.CPUSetOmissionAllowedAnnotationKey]
+	return !present || val != cpusetOmissionFalse
+}
+
+// markCPUSetExposed sets the annotation to "false" on the given allocationInfo
+// clone. This is a one-way downgrade: it never writes "true".
+//
+// Returns true if the annotation was changed (and thus needs persistence):
+//   - dedicated / non-bypassable QoS: no-op (false);
+//   - entries already recording "false": no-op (false);
+//   - entries with nil Annotations, missing key, "true", or invalid value
+//     (but QoS-bypassable): create map if needed and set to "false" (true).
+func markCPUSetExposed(info *state.AllocationInfo) bool {
+	if info == nil || !hasBypassableQoS(info) {
+		return false
+	}
+	key := cpuconsts.CPUSetOmissionAllowedAnnotationKey
+	val, present := info.Annotations[key]
+	if present && val == cpusetOmissionFalse {
+		return false // already false
+	}
+	if info.Annotations == nil {
+		info.Annotations = make(map[string]string)
+	}
+	info.Annotations[key] = cpusetOmissionFalse
+	return true
+}
+
+// initNewMainContainerCPUSetOmission records the initial cpuset-omission-allowed
+// value on a brand-new MAIN container entry. It is the ONLY place the annotation
+// is born: existing/resize/reuse entries inherit it via inheritCPUSetOmission, and
+// afterwards it can only ever move true -> false (see markCPUSetExposed). It writes
+// an explicit "true"/"false" so newly-admitted containers do not rely on the
+// missing-key legacy derivation. It is a no-op for a nil info.
+func initNewMainContainerCPUSetOmission(info *state.AllocationInfo, reqAnnotations map[string]string, liveEnabled bool) {
 	if info == nil {
 		return
 	}
 	if info.Annotations == nil {
 		info.Annotations = make(map[string]string)
 	}
-	key := coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey
-
-	// Non-bypassable QoS (dedicated etc.) is always recorded as false.
-	if !hasBypassableQoS(info) {
-		info.Annotations[key] = bypassCapabilityFalse
-		return
-	}
-
-	// Bypassable QoS: distinguish missing from invalid.
-	val, present := info.Annotations[key]
-	if !present {
-		// Missing: write QoS-derived value.
-		info.Annotations[key] = bypassCapabilityTrue
-		return
-	}
-	switch val {
-	case bypassCapabilityTrue, bypassCapabilityFalse:
-		// Preserve explicit valid value; never downgrade an explicit false.
-	default:
-		// Invalid: normalize to false.
-		info.Annotations[key] = bypassCapabilityFalse
+	if initialCPUSetOmissionAllowed(info.QoSLevel, reqAnnotations, liveEnabled) {
+		info.Annotations[cpuconsts.CPUSetOmissionAllowedAnnotationKey] = cpusetOmissionTrue
+	} else {
+		info.Annotations[cpuconsts.CPUSetOmissionAllowedAnnotationKey] = cpusetOmissionFalse
 	}
 }
 
-// bypassCapabilityAllow reports whether the allocation is allowed to bypass
-// response cpuset backfill. It reads the public annotation strictly AND
-// requires a bypassable QoS:
-//   - dedicated (and any non-bypassable QoS) is always not allowed;
-//   - "true"  -> allowed;
-//   - "false"  -> not allowed;
-//   - a missing key (legacy checkpoint) derives from QoS for backward compat;
-//   - any other non-strict value fails closed to not allowed.
-//
-// The live EnableBypassCPUSetAdjustment switch is AND-ed on top by the caller, so
-// a recorded "true" does not bypass when the live switch is off.
-func bypassCapabilityAllow(info *state.AllocationInfo) bool {
-	if info == nil || !hasBypassableQoS(info) {
-		return false
+// inheritCPUSetOmission copies the cpuset-omission-allowed annotation from origin
+// to dst. If origin has the key, dst gets the same value. If origin lacks the key
+// (or origin is nil), dst's key is deleted. This ensures that on resize/reuse
+// paths, request annotations cannot leak or upgrade the persisted value.
+func inheritCPUSetOmission(dst, origin *state.AllocationInfo) {
+	if dst == nil {
+		return
 	}
-	val, present := info.Annotations[coreconsts.AllowBypassCPUSetAdjustmentAnnotationKey]
+	key := cpuconsts.CPUSetOmissionAllowedAnnotationKey
+	if origin == nil || origin.Annotations == nil {
+		delete(dst.Annotations, key)
+		return
+	}
+	val, present := origin.Annotations[key]
 	if !present {
-		// Missing key: derive from QoS (legacy checkpoint backward compat).
-		return true
+		delete(dst.Annotations, key)
+		return
 	}
-	switch val {
-	case bypassCapabilityTrue:
-		return true
-	default:
-		// "false" or any invalid value: fail closed.
-		return false
+	if dst.Annotations == nil {
+		dst.Annotations = make(map[string]string)
 	}
+	dst.Annotations[key] = val
 }
