@@ -54,12 +54,22 @@ const (
 	metricsNameThresholdMet       = "threshold_met_count"
 	metricsNameNumaMetric         = "numa_metric_raw"
 	metricsNameSystemMetric       = "system_metric_raw"
+	// metricsNameReclaimedMemorySafeZoneGateDecision counts reclaimed-memory
+	// safe-zone gate decisions (skip vs. allow) per NUMA / state / reason. The
+	// gate_state tag is a fixed low-cardinality set (closed/auto_shadow/enabled)
+	// derived from the (enable bool, ratio threshold) state machine, never from
+	// raw config strings. It describes only the safe-zone gate's own decision;
+	// the metric value never means the whole eviction is suppressed.
+	metricsNameReclaimedMemorySafeZoneGateDecision = "reclaimed_memory_safe_zone_gate_decision_count"
 
 	metricsTagKeyEvictionScope  = "eviction_scope"
 	metricsTagKeyDetectionLevel = "detection_level"
 	metricsTagKeyNumaID         = "numa_id"
 	metricsTagKeyAction         = "action"
 	metricsTagKeyMetricName     = "metric_name"
+	metricsTagKeyGateState      = "gate_state"
+	metricsTagKeyGateDecision   = "gate_decision"
+	metricsTagKeyGateReason     = "gate_reason"
 
 	metricsTagValueDetectionLevelNuma             = "numa"
 	metricsTagValueDetectionLevelSystem           = "system"
@@ -68,6 +78,13 @@ const (
 	metricsTagValueNumaFreeBelowWatermarkTimes    = "numa_free_below_watermark_times"
 	metricsTagValueSystemKswapdDiff               = "system_kswapd_diff"
 	metricsTagValueSystemKswapdRateExceedDuration = "system_kswapd_rate_exceed_duration"
+
+	metricsTagValueGateStateClosed     = "closed"
+	metricsTagValueGateStateAutoShadow = "auto_shadow"
+	metricsTagValueGateStateEnabled    = "enabled"
+
+	metricsTagValueGateDecisionSkip  = "skip"
+	metricsTagValueGateDecisionEvict = "evict"
 )
 
 const (

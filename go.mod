@@ -180,17 +180,25 @@ replace (
 	// BulkheadRDTConfig, CATPolicy/CATPlacementPolicy/CATBitUsage, the CATWays
 	// expression variables, MemoryGuardConfig.CriticalWatermarkSource,
 	// CPUProvisionConfig.ReclaimedCPUMaxRatio/FillDefaultSharePoolWithNonReclaimCPUs,
-	// CPUAdvisorConfig.DisableDedicatedCoresOverlapReclaimedCores, ...) that are
-	// not yet in an official kubewharf/katalyst-api release. They are provided by
-	// the published branch feat/qrm-sysadvisor-bulkhead-api
-	// (github.com/luomingmeng/katalyst-api @ 2489a858f32f16aa3b76bd552f5eac490feeaf86,
+	// CPUAdvisorConfig.DisableDedicatedCoresOverlapReclaimedCores, and the
+	// reclaimed-memory safe-zone gate knobs
+	// MemoryPressureEvictionConfig.EnableReclaimedMemorySafeZoneGate /
+	// ReclaimedMemoryUsageRatioThreshold) that are not yet in an official
+	// kubewharf/katalyst-api release. They are provided by the published branch
+	// feat/qrm-sysadvisor-bulkhead-api
+	// (github.com/luomingmeng/katalyst-api @ 9a54bca31f22daf8ffc141dc7875d25b08c9dd67,
 	// PR https://github.com/kubewharf/katalyst-api/pull/230). The fork carries no
 	// upstream tags, so Go resolves this branch head as a v0.0.0 pseudo-version
-	// (same convention as the prior 978cc28577a5 pin below). Keep this pin until the
-	// branch merges upstream / cuts an official release, then drop the replace and
-	// bump the require above to the upstream version. Do NOT merge with this replace
-	// unresolved.
-	github.com/kubewharf/katalyst-api => github.com/luomingmeng/katalyst-api v0.0.0-20261010092749-2489a858f32f
+	// (same convention as the prior pins). The reclaimed-memory safe-zone gate
+	// knobs MemoryPressureEvictionConfig.EnableReclaimedMemorySafeZoneGate
+	// (*bool, default false) / ReclaimedMemoryUsageRatioThreshold (*float64,
+	// default 0) live on this branch
+	// (github.com/luomingmeng/katalyst-api @ 774d83c254873d056e703a70043acb95729180d0,
+	// PR https://github.com/kubewharf/katalyst-api/pull/230). Keep this pin until
+	// the branch merges upstream / cuts an official release, then drop the replace
+	// and bump the require above to the upstream version. Do NOT merge with this
+	// replace unresolved.
+	github.com/kubewharf/katalyst-api => github.com/luomingmeng/katalyst-api v0.0.0-20261016082829-774d83c25487
 
 	k8s.io/api => k8s.io/api v0.24.6
 	k8s.io/apiextensions-apiserver => k8s.io/apiextensions-apiserver v0.24.6

@@ -79,6 +79,36 @@ type MemoryPressureEvictionConfiguration struct {
 	ReclaimedGracePeriod                          int64
 	EvictNonReclaimedAnnotationSelector           string
 	EvictNonReclaimedLabelSelector                string
+
+	// EnableReclaimedMemorySafeZoneGate controls whether the reclaimed-memory
+	// safe-zone gate may really skip actionReclaimedEviction on a NUMA when the
+	// reclaimed_cores workloads hold little memory on that NUMA (the "safe
+	// zone"). It defaults to false, and the gate state machine is keyed off
+	// (EnableReclaimedMemorySafeZoneGate, ReclaimedMemoryUsageRatioThreshold):
+	//   - ratio <= 0:   fully closed. The safe zone is not even evaluated: no
+	//                   observation, no would-skip decision, and no skip.
+	//                   gate_state=closed.
+	//   - ratio > 0 && Enable == false: auto-shadow arm. The safe-zone decision
+	//                   is evaluated and a would-skip hit is recorded
+	//                   (auto_shadow_would_skip) but never applied.
+	//                   gate_state=auto_shadow. A nil CR field resolves to
+	//                   false here.
+	//   - ratio > 0 && Enable == true:  the only arm that really skips on a low
+	//                   safe-zone ratio. gate_state=enabled.
+	// There is no "unknown" mode: the arm is a plain bool, so an omitted / old-CR
+	// field always means "do not really skip".
+	//
+	// Regardless of arm, danger watermarks (free < min, or additional pressure)
+	// always bypass the gate, and actionEviction (evicting all pods) is never
+	// affected by it. Every failure path (missing watermark snapshot, metric /
+	// QoS errors) fails safe by NOT skipping, i.e. falling back to the regular
+	// eviction path.
+	EnableReclaimedMemorySafeZoneGate bool
+	// ReclaimedMemoryUsageRatioThreshold is the reclaimed_cores NUMA
+	// memory-usage ratio below which the safe-zone skip fires when the gate is
+	// armed (positive). A non-positive value (the default 0.0) keeps the gate
+	// fully closed regardless of EnableReclaimedMemorySafeZoneGate.
+	ReclaimedMemoryUsageRatioThreshold float64
 }
 
 func NewMemoryPressureEvictionPluginConfiguration() *MemoryPressureEvictionConfiguration {
@@ -156,6 +186,17 @@ func (c *MemoryPressureEvictionConfiguration) ApplyConfiguration(conf *crd.Dynam
 
 		if len(config.EvictNonReclaimedLabelSelector) > 0 {
 			c.EvictNonReclaimedLabelSelector = config.EvictNonReclaimedLabelSelector
+		}
+
+		// A nil CR field (omitted / old CR) leaves the default false untouched,
+		// which is the auto-shadow / do-not-really-skip arm once the ratio is
+		// positive.
+		if config.EnableReclaimedMemorySafeZoneGate != nil {
+			c.EnableReclaimedMemorySafeZoneGate = *config.EnableReclaimedMemorySafeZoneGate
+		}
+
+		if config.ReclaimedMemoryUsageRatioThreshold != nil {
+			c.ReclaimedMemoryUsageRatioThreshold = *config.ReclaimedMemoryUsageRatioThreshold
 		}
 	}
 }
