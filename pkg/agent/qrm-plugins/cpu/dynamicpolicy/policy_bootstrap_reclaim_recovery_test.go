@@ -606,6 +606,37 @@ func TestNewDynamicPolicyBootstrapPreservesExistingReclaimPool(t *testing.T) {
 		"existing reclaim pool entry must be preserved, not replaced with seed")
 }
 
+func TestNewDynamicPolicyBootstrapRepairsExistingEmptyReclaimPool(t *testing.T) {
+	t.Parallel()
+
+	topology := contiguous180CPUTopology(t)
+	stateDir := t.TempDir()
+	first, err := getTestDynamicPolicyWithInitialization(topology, stateDir)
+	require.NoError(t, err)
+
+	empty := &state.AllocationInfo{
+		AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+		AllocationResult:                 machine.NewCPUSet(),
+		OriginalAllocationResult:         machine.NewCPUSet(),
+		TopologyAwareAssignments:         map[int]machine.CPUSet{},
+		OriginalTopologyAwareAssignments: map[int]machine.CPUSet{},
+	}
+	require.NoError(t, first.state.SetAllocationInfo(
+		commonstate.PoolNameReclaim, commonstate.FakedContainerName, empty, true))
+
+	agentCtx := freshRealConstructorContext(t, topology, stateDir)
+	conf := freshRealConstructorConf(t, stateDir)
+	ok, _, err := NewDynamicPolicy(agentCtx, conf, nil, "repair-empty-reclaim-pool")
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	restartedState := openCheckpointState(t, topology, stateDir)
+	post := restartedState.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	require.NotNil(t, post)
+	require.False(t, post.AllocationResult.IsEmpty(), "bootstrap must never accept an existing empty reclaim entry")
+	require.NoError(t, assertCoreAligned(post.AllocationResult, topology))
+}
+
 // TestDeriveDefaultReclaimPreferenceIsPure is a direct unit test of the pure
 // derive function: given a fixed topology and reservedCPUs, it returns a
 // deterministic, core-aligned cset that respects NUMA balance and never mutates

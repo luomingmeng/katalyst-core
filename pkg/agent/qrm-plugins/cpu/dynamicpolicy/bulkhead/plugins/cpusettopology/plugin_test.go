@@ -3019,6 +3019,178 @@ func TestCPUSetTopologyPluginPreserveModeResetTreatsAbsentReclaimRootAsTraversal
 	}
 }
 
+func TestDedicatedOverlapReclaimDisabledSkipsPhysicalReconcile(t *testing.T) {
+	t.Parallel()
+
+	p, cg, in, _ := newDisabledTransitionTestPlugin(
+		t, cgroupclient.CgroupVersionV1, "reclaim-disabled-owner", "main")
+	p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled = false
+	in.DynamicConf = bulkheadCpusetTopologyDynamicConf(false, false)
+	in.DynamicConf.EnableReclaim = false
+
+	cpuDetails := machine.CPUDetails{}
+	allCPUs := machine.NewCPUSet()
+	for cpu := 0; cpu < 16; cpu++ {
+		cpuDetails[cpu] = machine.CPUTopoInfo{NUMANodeID: cpu / 4, CoreID: cpu % 4}
+		allCPUs = allCPUs.Union(machine.NewCPUSet(cpu))
+	}
+	in.Topology.CPUDetails = cpuDetails
+	in.DesiredView.Dedicated = allCPUs.Clone()
+	in.DesiredView.ReclaimRaw = machine.NewCPUSet(0, 4)
+	in.DesiredView.ReclaimOverlap = machine.NewCPUSet(0, 4)
+	in.DesiredView.ReclaimEffective = machine.NewCPUSet(0, 4)
+	in.DesiredView.ReclaimEffectivePerNUMA = map[int]machine.CPUSet{
+		0: machine.NewCPUSet(0),
+		1: machine.NewCPUSet(4),
+		2: machine.NewCPUSet(),
+		3: machine.NewCPUSet(),
+	}
+	cg.cpus["reclaim"] = allCPUs.Clone()
+	cg.children["reclaim"] = []string{"reclaim-0", "reclaim-1", "reclaim-2", "reclaim-3"}
+	for numa := 0; numa < 4; numa++ {
+		rel := fmt.Sprintf("reclaim/reclaim-%d", numa)
+		cg.existing[rel] = true
+		cg.cpus[rel] = allCPUs.Clone()
+	}
+
+	if p.ShouldReconcileWhenDisabled(context.Background(), in) {
+		t.Fatal("reclaim-disabled mode must not run reclaim-only physical reconciliation")
+	}
+	if err := p.CPUSetAdjustmentDisabledHandler(context.Background(), in); err != nil {
+		t.Fatalf("CPUSetAdjustmentDisabledHandler() error: %v", err)
+	}
+	for _, rel := range append([]string{"reclaim"}, cg.children["reclaim"]...) {
+		if rel != "reclaim" {
+			rel = "reclaim/" + rel
+		}
+		if _, ok := cg.writes[rel]; ok {
+			t.Fatalf("reclaim-disabled reset wrote reclaim boundary %q; writes=%#v", rel, cg.writes)
+		}
+		if got := cg.cpus[rel]; !got.Equals(allCPUs) {
+			t.Fatalf("reclaim-disabled boundary %q = %s, want preserved %s", rel, got.String(), allCPUs.String())
+		}
+	}
+}
+
+func TestDedicatedOverlapReclaimEnabledStillUsesReclaimOnly(t *testing.T) {
+	t.Parallel()
+
+	p, _, in, _ := newDisabledTransitionTestPlugin(
+		t, cgroupclient.CgroupVersionV1, "reclaim-enabled-owner", "main")
+	p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled = false
+	in.DynamicConf = bulkheadCpusetTopologyDynamicConf(false, false)
+	in.DynamicConf.EnableReclaim = true
+	in.DesiredView.Dedicated = machine.NewCPUSet(0, 1, 2, 3)
+	in.DesiredView.ReclaimRaw = machine.NewCPUSet(2, 3)
+	in.DesiredView.ReclaimOverlap = machine.NewCPUSet(2, 3)
+	in.DesiredView.ReclaimEffective = machine.NewCPUSet(2, 3)
+	in.DesiredView.ReclaimEffectivePerNUMA[0] = machine.NewCPUSet(2, 3)
+
+	if !p.ShouldReconcileWhenDisabled(context.Background(), in) {
+		t.Fatal("reclaim-enabled dedicated overlap must retain reclaim-only reconciliation")
+	}
+}
+
+func TestDedicatedOverlapUsesReclaimOnlyWithoutPreserveFlag(t *testing.T) {
+	p, cg, in, _ := newDisabledTransitionTestPlugin(t, cgroupclient.CgroupVersionV1, "owner", "main")
+	p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled = false
+	cg.cpus["reclaim"] = machine.NewCPUSet(0, 1, 2, 3)
+	cg.cpus["reclaim/reclaim-0"] = machine.NewCPUSet(0, 1, 2, 3)
+	in.DesiredView.Dedicated = machine.NewCPUSet(0, 1, 2, 3)
+	in.DesiredView.ReclaimRaw = machine.NewCPUSet(2, 3)
+	in.DesiredView.ReclaimOverlap = machine.NewCPUSet(2, 3)
+	in.DesiredView.ReclaimEffective = machine.NewCPUSet(2, 3)
+	in.DesiredView.ReclaimEffectivePerNUMA[0] = machine.NewCPUSet(2, 3)
+	if enableBulkheadCpusetTopology(in) || !p.ShouldReconcileWhenDisabled(context.Background(), in) {
+		t.Fatal("actual dedicated overlap must select reclaim-only independent of preserve config")
+	}
+	before := cg.cpus["primary"].Clone()
+	result, err := p.ReconcileDisabled(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.View == nil || result.View.Level != model.AppliedViewLevelReclaimOnly || !result.View.ReclaimEffective.Equals(machine.NewCPUSet(2, 3)) {
+		t.Fatalf("invalid reclaim-only proof: %+v", result)
+	}
+	if !cg.cpus["primary"].Equals(before) {
+		t.Fatal("reclaim-only must not shrink dedicated primary")
+	}
+	if _, ok := result.View.RelProofByRel["primary"]; ok {
+		t.Fatal("reclaim-only must not claim an unverified primary proof")
+	}
+}
+
+func TestDedicatedOverlapCreatesMissingReclaimTargets(t *testing.T) {
+	for _, version := range []cgroupclient.CgroupVersion{cgroupclient.CgroupVersionV1, cgroupclient.CgroupVersionV2} {
+		t.Run(string(version), func(t *testing.T) {
+			p, cg, in, _ := newDisabledTransitionTestPlugin(t, version, "owner-cold", "main-cold")
+			p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled = false
+			for _, rel := range []string{"reclaim", "reclaim/reclaim-0"} {
+				delete(cg.existing, rel)
+				delete(cg.cpus, rel)
+			}
+			in.DesiredView.Dedicated = machine.NewCPUSet(0, 1, 2, 3)
+			in.DesiredView.ReclaimRaw = machine.NewCPUSet(2, 3)
+			in.DesiredView.ReclaimOverlap = machine.NewCPUSet(2, 3)
+			in.DesiredView.ReclaimEffective = machine.NewCPUSet(2, 3)
+			in.DesiredView.ReclaimEffectivePerNUMA[0] = machine.NewCPUSet(2, 3)
+			in.Topology.CPUDetails[4] = machine.CPUTopoInfo{NUMANodeID: 1, CoreID: 4}
+			in.DesiredView.ReclaimEffectivePerNUMA[1] = machine.NewCPUSet()
+			result, err := p.ReconcileDisabled(context.Background(), in)
+			if cg.existing["reclaim/reclaim-1"] {
+				t.Fatal("a missing zero-target NUMA bucket must remain absent")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.View == nil || !result.View.ReclaimEffective.Equals(machine.NewCPUSet(2, 3)) {
+				t.Fatalf("missing verified reclaim target: %+v", result)
+			}
+			for _, rel := range []string{"reclaim", "reclaim/reclaim-0"} {
+				if !cg.existing[rel] || !cg.cpus[rel].Equals(machine.NewCPUSet(2, 3)) {
+					t.Fatalf("target %q not materialized: %s", rel, cg.cpus[rel])
+				}
+			}
+		})
+	}
+}
+
+func TestDedicatedOverlapSwitchesPartitionModeBeforeCPUWrites(t *testing.T) {
+	for _, version := range []cgroupclient.CgroupVersion{cgroupclient.CgroupVersionV1, cgroupclient.CgroupVersionV2} {
+		t.Run(string(version), func(t *testing.T) {
+			p, cg, in, _ := newDisabledTransitionTestPlugin(t, version, "owner-switch", "main-switch")
+			in.DynamicConf = enabledBulkheadCpusetTopologyDynamicConf()
+			if !p.Enable(in) {
+				t.Fatal("initial disjoint topology should be enabled")
+			}
+			in.DesiredView.Dedicated = machine.NewCPUSet(0, 1, 2, 3)
+			in.DesiredView.ReclaimRaw = machine.NewCPUSet(2, 3)
+			in.DesiredView.ReclaimOverlap = machine.NewCPUSet(2, 3)
+			cg.cpus["reclaim"], cg.cpus["reclaim/reclaim-0"] = machine.NewCPUSet(0, 1), machine.NewCPUSet(0, 1)
+			if p.Enable(in) {
+				t.Fatal("overlapping target must leave exclusive topology mode")
+			}
+			// The fake filesystem does not enforce kernel partition constraints.
+			// Check the flag at the write boundary so an ordering regression fails.
+			cg.afterApply = func(rel string, _ *cgcommon.CPUSetData) {
+				if version == cgroupclient.CgroupVersionV1 && !cg.schedLoadBalance[""] {
+					t.Fatalf("scheduler domain not restored before write to %s", rel)
+				}
+				if version == cgroupclient.CgroupVersionV2 && cg.partitionWrites["partition"] != cgcommon.CPUSetPartitionFlagMember {
+					t.Fatalf("exclusive partition not released before write to %s", rel)
+				}
+			}
+			if _, err := p.ReconcileDisabled(context.Background(), in); err != nil {
+				t.Fatal(err)
+			}
+			in.DesiredView.ReclaimOverlap = machine.NewCPUSet()
+			if !p.Enable(in) || p.ShouldReconcileWhenDisabled(context.Background(), in) {
+				t.Fatal("disjoint target must return to normal topology reconciliation")
+			}
+		})
+	}
+}
+
 func TestCPUSetTopologyPluginReconcileDisabledPublishesReclaimOnlyProof(t *testing.T) {
 	t.Parallel()
 
@@ -4501,6 +4673,7 @@ func enabledBulkheadCpusetTopologyDynamicConf() *dynamicconfig.Configuration {
 
 func bulkheadCpusetTopologyDynamicConf(enableBulkheadCpusetTopology, allowSharedCoresOverlapReclaimedCores bool) *dynamicconfig.Configuration {
 	conf := dynamicconfig.NewConfiguration()
+	conf.EnableReclaim = true
 	conf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.EnableBulkheadCpusetTopology = enableBulkheadCpusetTopology
 	conf.AdminQoSConfiguration.CPUProvisionConfiguration.AllowSharedCoresOverlapReclaimedCores = allowSharedCoresOverlapReclaimedCores
 	return conf

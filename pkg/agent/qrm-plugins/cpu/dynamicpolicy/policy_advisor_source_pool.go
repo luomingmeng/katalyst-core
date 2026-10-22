@@ -318,9 +318,9 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocksWithCheckpointTransitionAndDyna
 	// Runtime-config gate: target-driven provenance is honored only when all three
 	// runtime-config conditions hold. Otherwise every descriptor stays on the
 	// legacy floor/ownership path regardless of block quantities.
-	allowElasticActual := dynamicConf.EnableReclaim && dynamicConf.EnableRampUpReclaimHardPartition &&
-		resp.DisableDedicatedCoresOverlapReclaimedCores
-	descriptors = applyTargetDrivenReclaimGate(descriptors, allowElasticActual)
+	allowElasticActual := dynamicConf.EnableReclaim && resp.DisableDedicatedCoresOverlapReclaimedCores
+	descriptors = applyTargetDrivenReclaimGate(descriptors,
+		allowElasticActual && dynamicConf.EnableRampUpReclaimHardPartition)
 
 	result := advisorapi.NewBlockCPUSet()
 	available, err := p.allocateStaticAndForbiddenPools(resp, result, allCPUs)
@@ -352,6 +352,13 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocksWithCheckpointTransitionAndDyna
 			return nil, err
 		}
 	}
+	transferPlanned := false
+	if allowElasticActual {
+		descriptors, transferPlanned, err = planDedicatedReclaimTransfers(descriptors, available, topology)
+		if err != nil {
+			return nil, err
+		}
+	}
 	baseAllocatable := available.Clone()
 	if err := allocateAdvisorStaticDescriptors(descriptors, result); err != nil {
 		return nil, err
@@ -364,7 +371,7 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocksWithCheckpointTransitionAndDyna
 	})
 	available, err = p.solveAdvisorDescriptorPhaseWithCheckpointTransitionAndSkipNUMAs(
 		core, available, result, true, hardActive, checkpointTransition, skipNUMAs,
-		podEntries, allowElasticActual)
+		podEntries, allowElasticActual, transferPlanned)
 	if err != nil {
 		return nil, fmt.Errorf("solve dedicated and mandatory reclaim: %w", err)
 	}
@@ -421,6 +428,108 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocksWithCheckpointTransitionAndDyna
 		return nil, err
 	}
 	return result, nil
+}
+
+// planDedicatedReclaimTransfers resolves reclaim-induced overcommit before block
+// quantities are frozen. It leaves feasible advice on the existing replacement
+// path, and never changes the persisted request or another owner's scope.
+func planDedicatedReclaimTransfers(descriptors []advisorBlockDescriptor, available machine.CPUSet, topology *machine.CPUTopology) ([]advisorBlockDescriptor, bool, error) {
+	targets := map[int]int{}
+	current, eligible, occupied := machine.NewCPUSet(), machine.NewCPUSet(), machine.NewCPUSet()
+	dedicatedQuantity := map[int]int{}
+	var donors []hardReclaimPartitionDonor
+	var fake *advisorBlockDescriptor
+	for i := range descriptors {
+		d := &descriptors[i]
+		occupied = occupied.Union(d.Committed)
+		switch d.Class {
+		case advisorBlockClassMandatoryReclaim:
+			current = current.Union(d.Committed)
+			eligible = eligible.Union(d.Eligible.Intersection(available))
+			if d.NUMAID == commonstate.FakedNUMAID {
+				if fake != nil {
+					return nil, false, fmt.Errorf("multiple global reclaim targets")
+				}
+				fake = d
+			} else {
+				targets[d.NUMAID] += d.Quantity
+			}
+		case advisorBlockClassDedicated:
+			if d.NUMAID != commonstate.FakedNUMAID {
+				dedicatedQuantity[d.NUMAID] += d.Quantity
+			}
+			donors = append(donors, hardReclaimPartitionDonor{
+				key: d.BlockID, groupKey: strings.Join(d.Owners, "\x1f"),
+				cpus:            d.Committed.Intersection(d.Eligible).Intersection(available),
+				requestQuantity: float64(topology.CPUsPerCore()),
+			})
+		}
+	}
+	if fake != nil && fake.Quantity > 0 {
+		capacity, preferred := map[int]int{}, map[int]int{}
+		var numaIDs []int
+		for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
+			if targets[numaID] > 0 {
+				continue
+			}
+			numaEligible := fake.Eligible.Intersection(available).Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
+			capacity[numaID] = completePreferredCoreCPUCount(topology, numaEligible, numaEligible)
+			if capacity[numaID] == 0 {
+				continue
+			}
+			numaIDs = append(numaIDs, numaID)
+			preferred[numaID] = fake.Committed.Intersection(numaEligible).Size()
+		}
+		quotas, err := planWholeCoreCapacityQuotas(fake.Quantity, topology.CPUsPerCore(), numaIDs, capacity, nil, preferred, false)
+		if err != nil {
+			return nil, false, fmt.Errorf("plan global reclaim transfer quotas: %w", err)
+		}
+		for numaID, quantity := range quotas {
+			targets[numaID] = quantity
+		}
+	}
+	needsTransfer := false
+	for numaID, target := range targets {
+		if dedicatedQuantity[numaID]+target > available.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID)).Size() {
+			needsTransfer = true
+			break
+		}
+	}
+	if !needsTransfer {
+		return descriptors, false, nil
+	}
+	plan, err := planHardReclaimPartition(hardReclaimPartitionInput{
+		topology: topology, targetByNUMA: targets, currentReclaim: current,
+		free: available.Difference(occupied), reclaimEligible: eligible, donors: donors,
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("plan dedicated reclaim transfer: %w", err)
+	}
+	out := append([]advisorBlockDescriptor(nil), descriptors...)
+	for i := range out {
+		d := &out[i]
+		if d.Class == advisorBlockClassMandatoryReclaim {
+			d.Eligible = d.Eligible.Intersection(plan.reclaim)
+			d.OldPreferred = d.OldPreferred.Intersection(plan.reclaim)
+		} else if d.Class == advisorBlockClassDedicated {
+			donated := d.Committed.Intersection(plan.reclaim).Size()
+			d.Eligible = d.Eligible.Difference(plan.reclaim)
+			d.OldPreferred = d.OldPreferred.Difference(plan.reclaim)
+			remaining := d.Committed.Difference(plan.reclaim)
+			// A repeated frame may still advertise the original request after the
+			// transfer committed. Retain that actual footprint rather than donating
+			// a second time or expanding back into the committed reclaim target.
+			if donated > 0 || (!remaining.IsEmpty() && d.Quantity > d.Eligible.Size()) {
+				d.Quantity = general.Min(d.Quantity, remaining.Size())
+				if d.Quantity <= 0 {
+					return nil, false, fmt.Errorf("dedicated reclaim transfer leaves empty block %q", d.BlockID)
+				}
+				d.SourceTarget = d.Quantity
+				d.ReclaimQuota = 0
+			}
+		}
+	}
+	return out, true, nil
 }
 
 func allocateAdvisorStaticDescriptors(
@@ -483,7 +592,9 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhaseWithCheckpointTransitionAndSk
 	skipNUMAs sets.Int,
 	requestEntries state.PodEntries,
 	allowElasticActual bool,
+	plannedTransfer ...bool,
 ) (machine.CPUSet, error) {
+	transferPlanned := len(plannedTransfer) > 0 && plannedTransfer[0]
 	if len(descriptors) == 0 {
 		return available, nil
 	}
@@ -493,8 +604,8 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhaseWithCheckpointTransitionAndSk
 	var coreFloors []partitionCoreFloorConstraint
 	var steadyFakeDemandKeys []string
 	var committedSnapshot steadyFakeNUMACommittedSnapshot
-	expandHardReclaimPhase := preserveClass && hardActive
-	expandSteadyReclaimPhase := preserveClass && !hardActive &&
+	expandHardReclaimPhase := preserveClass && hardActive && !transferPlanned
+	expandSteadyReclaimPhase := preserveClass && !hardActive && !transferPlanned &&
 		hasFakeNUMAMandatoryReclaimDescriptor(descriptors)
 	if expandHardReclaimPhase || expandSteadyReclaimPhase {
 		// NUMAs owned by a committed steady exclusive DNB keep only their finalized
@@ -586,7 +697,7 @@ func (p *DynamicPolicy) solveAdvisorDescriptorPhaseWithCheckpointTransitionAndSk
 			return available, fmt.Errorf("plan hard reclaim partition: %w", err)
 		}
 		demands = pinnedDemands
-	} else if preserveClass && !expandSteadyReclaimPhase {
+	} else if preserveClass && !expandSteadyReclaimPhase && !transferPlanned {
 		// Steady real-NUMA path owns the committed whole-core fallback; the
 		// ramp-up/hard path above deliberately keeps its original semantics.
 		pinnedDemands, err := pinHardReclaimPartitionDemands(demands, available, p.machine.machineInfo.CPUTopology, true)
@@ -655,11 +766,10 @@ func advisorDescriptorRequestQuantityFromEntries(
 			continue
 		}
 		ownerRequest := allocationInfo.RequestQuantity
-		if allowElasticActual && allocationInfo.RampUp &&
-			allocationInfo.CheckDedicatedNUMABinding() &&
-			!allocationInfo.OriginalAllocationResult.IsEmpty() &&
-			float64(allocationInfo.OriginalAllocationResult.Size()) < ownerRequest {
-			ownerRequest = float64(allocationInfo.OriginalAllocationResult.Size())
+		if allowElasticActual && descriptor.Class == advisorBlockClassDedicated && allocationInfo.CheckDedicated() {
+			// The descriptor carries the frozen physical target after reclaim
+			// planning; the original request remains on AllocationInfo unchanged.
+			ownerRequest = float64(descriptor.Quantity)
 		}
 		if ownerRequest > requestQuantity {
 			requestQuantity = ownerRequest

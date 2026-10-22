@@ -19,8 +19,11 @@ package model
 import "github.com/kubewharf/katalyst-core/pkg/util/machine"
 
 type CPUSetPartitionView struct {
-	Reserve                             machine.CPUSet
-	Dedicated                           machine.CPUSet
+	Reserve   machine.CPUSet
+	Dedicated machine.CPUSet
+	// ReclaimOverlap is the exact, snapshot-authorized overlap with ordinary
+	// dedicated owners. It is derived intent, never checkpointed or a config flag.
+	ReclaimOverlap                      machine.CPUSet
 	ReclaimRaw                          machine.CPUSet
 	SharePool                           machine.CPUSet
 	SharePoolMap                        map[string]machine.CPUSet
@@ -128,6 +131,7 @@ func NewCPUSetPartitionView() CPUSetPartitionView {
 	return CPUSetPartitionView{
 		Reserve:                             machine.NewCPUSet(),
 		Dedicated:                           machine.NewCPUSet(),
+		ReclaimOverlap:                      machine.NewCPUSet(),
 		ReclaimRaw:                          machine.NewCPUSet(),
 		SharePool:                           machine.NewCPUSet(),
 		SharePoolMap:                        map[string]machine.CPUSet{},
@@ -202,6 +206,7 @@ func (v *CPUSetPartitionView) DeepCopy() *CPUSetPartitionView {
 	out := &CPUSetPartitionView{
 		Reserve:                             v.Reserve.Clone(),
 		Dedicated:                           v.Dedicated.Clone(),
+		ReclaimOverlap:                      v.ReclaimOverlap.Clone(),
 		ReclaimRaw:                          v.ReclaimRaw.Clone(),
 		SharePool:                           v.SharePool.Clone(),
 		SharePoolMap:                        map[string]machine.CPUSet{},
@@ -280,6 +285,7 @@ func equalCPUSetPartitionView(a, b *CPUSetPartitionView) bool {
 	}
 	return a.Reserve.Equals(b.Reserve) &&
 		a.Dedicated.Equals(b.Dedicated) &&
+		a.ReclaimOverlap.Equals(b.ReclaimOverlap) &&
 		a.ReclaimRaw.Equals(b.ReclaimRaw) &&
 		a.SharePool.Equals(b.SharePool) &&
 		equalCPUSetMap(a.SharePoolMap, b.SharePoolMap) &&

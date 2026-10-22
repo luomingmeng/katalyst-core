@@ -1915,7 +1915,11 @@ func (p *DynamicPolicy) Allocate(ctx context.Context,
 		}
 	}
 
-	if existingAllocationSatisfiesRequest(allocationInfo, reqInt, p.isRampUpReclaimHardPartitionEnabled()) &&
+	allowShortAllocation := false
+	if allocationInfo != nil && allocationInfo.OriginalAllocationResult.Size() < reqInt {
+		allowShortAllocation = p.existingShortDedicatedAllocationReusable(allocationInfo, req)
+	}
+	if existingAllocationSatisfiesRequest(allocationInfo, reqInt, allowShortAllocation) &&
 		!util.PodInplaceUpdateResizing(req) {
 		general.InfoS("already allocated and meet requirement",
 			"podNamespace", req.PodNamespace,
@@ -2282,6 +2286,9 @@ func deriveDefaultReclaimPreference(
 	allAvailableCPUs := cpuDetails.CPUs().Difference(reservedCPUs)
 	numaIDs := cpuDetails.NUMANodes().ToSliceInt()
 	cpusPerCore := cpuTopology.CPUsPerCore()
+	if configuredReclaimSize <= 0 {
+		configuredReclaimSize = cpusPerCore
+	}
 	capacityByNUMA := make(map[int]int, len(numaIDs))
 	for _, numaID := range numaIDs {
 		candidates := allAvailableCPUs.Intersection(cpuDetails.CPUsInNUMANodes(numaID))
@@ -2351,7 +2358,7 @@ func (p *DynamicPolicy) installDerivedReclaimPreference() error {
 // preference. It never replaces an existing entry with the seed.
 func (p *DynamicPolicy) ensureInitialReclaimPool() error {
 	reclaimedAllocationInfo := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
-	if reclaimedAllocationInfo == nil {
+	if reclaimedAllocationInfo == nil || reclaimedAllocationInfo.AllocationResult.IsEmpty() {
 		podEntries := p.state.GetPodEntries()
 		noneResidentCPUs := podEntries.GetFilteredPoolsCPUSet(state.ResidentPools)
 

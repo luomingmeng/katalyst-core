@@ -34,6 +34,7 @@ import (
 
 type CPUSetPartitionViewOptions struct {
 	NonReclaimPoolMinSize             int64
+	EnableReclaim                     bool
 	HardPartitionEnabled              bool
 	HardPartitionReclaimTargetPerNUMA map[int]int
 	HardPartitionTargetError          error
@@ -176,6 +177,7 @@ func newCPUSetPartitionViewOptions(
 
 	opts := CPUSetPartitionViewOptions{
 		NonReclaimPoolMinSize:             nonReclaimPoolMinSize,
+		EnableReclaim:                     dynamicConf != nil && dynamicConf.EnableReclaim,
 		HardPartitionEnabled:              rampUpDomains.Len() > 0 && hardPartitionEnabled(dynamicConf),
 		HardPartitionReclaimTargetPerNUMA: map[int]int{},
 	}
@@ -406,6 +408,7 @@ func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CP
 		view.SharePoolMap[poolName] = view.SharePoolMap[poolName].Union(cpus)
 	}
 
+	ordinaryDedicated := machine.NewCPUSet()
 	for _, containerEntries := range podEntries {
 		if containerEntries.IsPoolEntry() {
 			continue
@@ -413,6 +416,9 @@ func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CP
 		for _, allocation := range containerEntries {
 			if allocation != nil && allocation.CheckDedicated() {
 				view.Dedicated = view.Dedicated.Union(allocation.AllocationResult)
+				if poolTypeOf(allocation.OwnerPoolName) == commonstate.PoolNameDedicated {
+					ordinaryDedicated = ordinaryDedicated.Union(allocation.AllocationResult)
+				}
 			}
 		}
 	}
@@ -448,28 +454,27 @@ func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CP
 	// NonReclaimPool/ReclaimEffective are transient-trimmed to reclaim them away via
 	// ApplyTransientProtectedNonReclaim below.
 	view.NonReclaimPool = view.SharePool.Difference(activeSNBProtected).Union(view.Dedicated).Union(view.Isolation)
+	if !state.GetDisableDedicatedCoresOverlapReclaimedCores() {
+		// Only ordinary dedicated ownership may overlap; an isolation owner with
+		// dedicated QoS does not acquire this permission.
+		view.ReclaimOverlap = view.ReclaimRaw.Intersection(ordinaryDedicated).
+			Difference(view.SharePool).Difference(view.Isolation).Difference(view.Reserve)
+	}
 	if allowOverlap {
 		view.ReclaimEffective = view.ReclaimRaw.Clone()
 	} else {
-		// ReclaimRaw is the affinity budget produced by SysAdvisor after applying
-		// reclaimed-cpu-max-ratio. QRM must never widen it when deriving the
-		// cgroup target: every CPU outside the effective reclaim set belongs to
-		// the non-reclaim domain instead. The effective reclaim set is therefore
-		// derived in three steps, each of which can only shrink it:
-		//   1. start from all machine CPUs minus the non-reclaim pool and reserve
-		//      (the CPUs structurally available to reclaim);
-		//   2. intersect with ReclaimRaw so we never exceed SysAdvisor's budget;
-		//   3. recompute NonReclaimPool as the complement so the two domains stay
-		//      mutually exclusive and jointly cover every non-reserved CPU.
+		// ReclaimRaw bounds the target. Ordinary dedicated overlap is explicitly
+		// retained; every other business ownership remains on the complement.
+		// Recompute that complement without dropping the authorized intersection.
 		view.ReclaimEffective = topology.CPUDetails.CPUs().Difference(view.NonReclaimPool).Difference(view.Reserve)
-		view.ReclaimEffective = view.ReclaimEffective.Intersection(view.ReclaimRaw)
+		view.ReclaimEffective = view.ReclaimEffective.Intersection(view.ReclaimRaw).Union(view.ReclaimOverlap)
 		if !view.ReclaimRaw.IsEmpty() && view.ReclaimEffective.IsEmpty() {
 			general.Warningf(
 				"bulkhead: reclaim_effective_collapsed raw=%s share=%s dedicated=%s isolation=%s reserve=%s placeholder_normalized=%t",
 				view.ReclaimRaw.String(), view.SharePool.String(), view.Dedicated.String(),
 				view.Isolation.String(), view.Reserve.String(), normalized)
 		}
-		view.NonReclaimPool = topology.CPUDetails.CPUs().Difference(view.ReclaimEffective).Difference(view.Reserve)
+		view.NonReclaimPool = topology.CPUDetails.CPUs().Difference(view.ReclaimEffective).Difference(view.Reserve).Union(view.ReclaimOverlap)
 		// Step 3 may leave CPUs in NonReclaimPool that no share/dedicated/isolation
 		// pool claims (e.g. reclaim was clamped below its structural budget). When
 		// the share pool is otherwise empty, seed it with these spare CPUs so they
@@ -485,7 +490,7 @@ func BuildCPUSetPartitionView(state cpustate.ReadonlyState, topology *machine.CP
 		// Hard-partition reclaim is already materialized and validated by QRM.
 		// Bulkhead only projects that ownership; it must not trim legal reclaim
 		// to satisfy its independent non-reclaim padding preference.
-		if !opts.HardPartitionEnabled {
+		if !opts.HardPartitionEnabled && view.ReclaimOverlap.IsEmpty() {
 			padNonReclaimPoolToMinSize(view, topology, opts)
 		}
 	}
@@ -715,6 +720,7 @@ func BuildCPUSetPartitionViewFromTarget(
 	}
 
 	view.ReclaimEffective = reclaimTarget.Clone()
+	view.ReclaimOverlap = view.ReclaimOverlap.Intersection(reclaimTarget)
 	view.ReclaimEffectivePerNUMA = map[int]machine.CPUSet{}
 	if topology == nil {
 		view.NonReclaimPool = machine.NewCPUSet()
@@ -722,7 +728,7 @@ func BuildCPUSetPartitionViewFromTarget(
 	}
 
 	available := topology.CPUDetails.CPUs().Difference(view.Reserve)
-	view.NonReclaimPool = available.Difference(view.ReclaimEffective)
+	view.NonReclaimPool = available.Difference(view.ReclaimEffective).Union(view.ReclaimOverlap)
 	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceNoSortInt() {
 		view.ReclaimEffectivePerNUMA[numaID] = view.ReclaimEffective.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
 	}
@@ -750,8 +756,12 @@ func ValidateCPUSetPartitionView(view *model.DesiredView, topology *machine.CPUT
 			return fmt.Errorf("bulkhead cpuset partition %s has CPUs outside machine topology: %s", name, outside.String())
 		}
 	}
-	if overlap := view.NonReclaimPool.Intersection(view.ReclaimEffective); !overlap.IsEmpty() {
+	if overlap := view.NonReclaimPool.Intersection(view.ReclaimEffective).Difference(view.ReclaimOverlap); !overlap.IsEmpty() {
 		return fmt.Errorf("bulkhead cpuset partition has non-reclaim/reclaim overlap: %s", overlap.String())
+	}
+	if !view.ReclaimOverlap.IsSubsetOf(view.Dedicated.Intersection(view.ReclaimRaw)) ||
+		!view.ReclaimOverlap.Intersection(view.SharePool.Union(view.Isolation).Union(view.Reserve)).IsEmpty() {
+		return fmt.Errorf("bulkhead reclaim overlap is outside authorized dedicated ownership")
 	}
 	if err := validateExactNUMAProjection(
 		"reclaim effective", view.ReclaimEffective, view.ReclaimEffectivePerNUMA, topology); err != nil {
@@ -806,7 +816,7 @@ func ApplyTransientProtectedNonReclaim(view *model.DesiredView, topology *machin
 	available := topology.CPUDetails.CPUs().Difference(view.Reserve)
 	view.TransientProtectedNonReclaim = protected.Intersection(available)
 	view.NonReclaimPool = view.DesiredNonReclaimPool.Union(view.TransientProtectedNonReclaim).Intersection(available)
-	view.ReclaimEffective = view.DesiredReclaimEffective.Difference(view.NonReclaimPool)
+	view.ReclaimEffective = view.DesiredReclaimEffective.Difference(view.NonReclaimPool.Difference(view.ReclaimOverlap)).Difference(view.TransientProtectedNonReclaim)
 	rebuildReclaimEffectivePerNUMA(view, topology)
 	rebuildTransientProtectedNonReclaimPerNUMA(view, topology)
 }

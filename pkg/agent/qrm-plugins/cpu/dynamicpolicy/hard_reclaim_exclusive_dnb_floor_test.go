@@ -63,6 +63,29 @@ func nonExclusiveAnnotations() map[string]string {
 	}
 }
 
+func TestDedicatedShortAllocationWithoutHardRampUp(t *testing.T) {
+	for _, exclusive := range []bool{false, true} {
+		p := newExclusiveDNBPolicy(t)
+		p.config.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = false
+		topology := p.machine.machineInfo.CPUTopology
+		floor := coresInNUMA(topology, 0, 0, 1)
+		p.reclaim.reservedReclaimedCPUSet = floor.Clone()
+		p.reclaim.reservedReclaimedCPUsSize = floor.Size()
+		setLiveReclaimPool(t, p, floor)
+		annotations := nonExclusiveAnnotations()
+		if exclusive {
+			annotations = exclusiveAnnotations()
+		}
+		request := topology.CPUDetails.CPUsInNUMANodes(0).Size()
+		actual, selected, err := p.allocateNumaBindingCPUs(request, &pluginapi.TopologyHint{Nodes: []uint64{0}}, wholeNUMAMachineState(t, p), annotations, false)
+		require.NoError(t, err)
+		require.Less(t, actual.Size(), request)
+		require.False(t, actual.IsEmpty())
+		require.True(t, actual.Intersection(selected).IsEmpty())
+		require.True(t, floor.IsSubsetOf(selected))
+	}
+}
+
 func TestDynamicPolicy_hardPartitionShortAllocationDoesNotDependOnPodReclaimability(t *testing.T) {
 	t.Parallel()
 

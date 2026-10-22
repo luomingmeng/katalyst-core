@@ -3064,10 +3064,10 @@ func TestDynamicPolicy_generatePoolsAndIsolation_reclaimLeftoverOnlyWhenReclaimD
 			wantShare:     machine.NewCPUSet(1, 5),
 		},
 		{
-			name:          "disable reclaim keeps legacy leftover apportion path",
+			name:          "disable reclaim preserves committed pool without leftover apportion",
 			enableReclaim: false,
-			wantReclaim:   machine.NewCPUSet(2, 3, 6, 7),
-			wantShare:     machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
+			wantReclaim:   machine.NewCPUSet(0, 4),
+			wantShare:     machine.NewCPUSet(1, 5),
 		},
 	}
 
