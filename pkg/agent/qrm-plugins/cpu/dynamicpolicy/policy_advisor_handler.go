@@ -742,6 +742,10 @@ func (p *DynamicPolicy) allocateByCPUAdvisorWithRevision(
 		return fmt.Errorf("ValidateCPUAdvisorResp failed with error: %v", vErr)
 	}
 
+	resp, err = p.withRequiredReclaimFallback(resp, dynamicConf)
+	if err != nil {
+		return err
+	}
 	blockToCPUSet, checkpointTransition, aErr := p.generateBlockCPUSetWithCheckpointTransitionForAttempt(
 		resp, featureGates, hardActiveDomains, dynamicConf)
 	if aErr != nil {
@@ -1786,6 +1790,19 @@ func (p *DynamicPolicy) validateHardPartitionBlockPlanWithDynamicConfig(
 		if err != nil {
 			return err
 		}
+		// Capacity belongs to the finalized physical plan, not the original
+		// request. A reclaim transfer may legitimately reduce a dedicated block.
+		for i := range descriptors {
+			d := &descriptors[i]
+			if d.Class != advisorBlockClassDedicated {
+				continue
+			}
+			actual, found := blockCPUSet[d.BlockID]
+			if !found || actual.IsEmpty() || actual.Size() > d.Quantity || !actual.IsSubsetOf(d.Eligible) {
+				return fmt.Errorf("hard-partition dedicated block %q has invalid physical target", d.BlockID)
+			}
+			d.Quantity = actual.Size()
+		}
 	}
 	mandatory = filterAdvisorDescriptors(descriptors, func(descriptor advisorBlockDescriptor) bool {
 		return descriptor.Class == advisorBlockClassMandatoryReclaim
@@ -2042,9 +2059,23 @@ func (p *DynamicPolicy) generateLegacyBlockCPUSetWithDynamicConfig(
 			"availableCPUs", availableCPUs.String())
 	}
 
+	// Dedicated ownership is consumed for business placement, but remains a
+	// legal reclaim source in overlap mode. Bound reuse to this frame's allocated
+	// blocks; static pools, isolation and non-reclaimable packages stay excluded.
+	dedicatedOverlap := machine.NewCPUSet()
+	if dynamicConf.EnableReclaim && !resp.DisableDedicatedCoresOverlapReclaimedCores {
+		for _, blocks := range numaToBlocks {
+			for _, block := range blocks {
+				if isDedicatedBlock(block) {
+					dedicatedOverlap = dedicatedOverlap.Union(blockCPUSet[block.BlockId])
+				}
+			}
+		}
+		dedicatedOverlap = dedicatedOverlap.Difference(globalNonReclaimableCPUSet)
+	}
 	if hardActive {
 		reserved, err := p.preallocateLegacyHardReclaim(
-			resp, nodeRemainingCPUs, rpPinnedCPUSet, globalNonReclaimableCPUSet, blockCPUSet)
+			resp, nodeRemainingCPUs.Union(dedicatedOverlap), rpPinnedCPUSet, globalNonReclaimableCPUSet, blockCPUSet)
 		if err != nil {
 			return nil, fmt.Errorf("preallocate legacy hard reclaim: %w", err)
 		}
@@ -2091,7 +2122,7 @@ func (p *DynamicPolicy) generateLegacyBlockCPUSetWithDynamicConfig(
 	}
 
 	// Phase 3: Allocate Reclaim blocks
-	err = p.generateReclaimBlockCPUSet(reclaimBlocksMap, nodeRemainingCPUs, availableCPUs, globalNonReclaimableCPUSet, blockCPUSet)
+	err = p.generateReclaimBlockCPUSet(reclaimBlocksMap, nodeRemainingCPUs.Union(dedicatedOverlap), availableCPUs.Union(dedicatedOverlap), globalNonReclaimableCPUSet, blockCPUSet)
 	if err != nil {
 		return nil, err
 	}
@@ -2123,6 +2154,10 @@ func (p *DynamicPolicy) preallocateLegacyHardReclaim(
 	skipNUMAs := p.state.GetPodEntries().SteadyExclusiveNUMAs(p.machine.machineInfo.CPUTopology)
 	demands, blockIDByDemandKey, err := expandHardPartitionReclaimPhase(
 		mandatory, available, p.machine.machineInfo.CPUTopology, skipNUMAs)
+	if err != nil {
+		return machine.NewCPUSet(), err
+	}
+	demands, err = pinHardReclaimPartitionDemands(demands, available, p.machine.machineInfo.CPUTopology, false)
 	if err != nil {
 		return machine.NewCPUSet(), err
 	}
@@ -2339,7 +2374,23 @@ func (p *DynamicPolicy) applyBlocksWithDynamicConfig(
 		return nil, err
 	}
 
-	if resp.DisableDedicatedCoresOverlapReclaimedCores {
+	if dynamicConf == nil || !dynamicConf.EnableReclaim {
+		// Disabled reclaim freezes the last successful partition. A historical empty
+		// checkpoint is repaired once with the minimum bounded whole-core fallback;
+		// failure remains no-write/not-ready.
+		if err := preserveCommittedReclaimPool(newEntries, curEntries); err != nil {
+			recoveryMode := reclaimFallbackMode{
+				enableReclaim:           true,
+				allowSharedOverlap:      allowSharedCoresOverlapReclaimedCores,
+				disableDedicatedOverlap: resp.DisableDedicatedCoresOverlapReclaimedCores,
+			}
+			if recoveryErr := p.reviseReclaimPool(
+				newEntries, nonReclaimActualBindingNUMAs, pooledUnionDedicatedCPUSet, recoveryMode,
+			); recoveryErr != nil {
+				return nil, fmt.Errorf("recover disabled reclaim pool: %w", recoveryErr)
+			}
+		}
+	} else if resp.DisableDedicatedCoresOverlapReclaimedCores {
 		// In disjoint mode the planner owns the complete reclaim target. Do not
 		// revise or fallback-expand it after planning.
 		if newEntries.CheckPoolEmpty(commonstate.PoolNameReclaim) {
@@ -2440,6 +2491,11 @@ func (p *DynamicPolicy) applyBlocksWithDynamicConfig(
 		return nil, err
 	}
 
+	if resp.DisableDedicatedCoresOverlapReclaimedCores {
+		if err := p.carveDedicatedReclaim(newEntries, reclaimPoolCPUSet(newEntries)); err != nil {
+			return nil, err
+		}
+	}
 	commitOverride, err := p.buildAdjustmentCommitOverrideFromPodEntriesWithDynamicConfig(
 		newEntries,
 		allowSharedCoresOverlapReclaimedCores,
@@ -3072,7 +3128,7 @@ func (p *DynamicPolicy) buildAdjustmentCommitOverrideFromPodEntriesWithDynamicCo
 		view, pendingProjection, err = bulkheadutils.BuildValidatedCPUSetPartitionView(
 			snapshot,
 			p.machine.machineInfo.CPUTopology,
-			bulkheadutils.CPUSetPartitionViewOptions{},
+			bulkheadutils.CPUSetPartitionViewOptions{EnableReclaim: dynamicConf != nil && dynamicConf.EnableReclaim},
 		)
 		if err != nil {
 			return nil, err
@@ -3120,12 +3176,16 @@ func (p *DynamicPolicy) coreAlignedReclaimOverride(
 			return machine.NewCPUSet(), fmt.Errorf("reclaim override cpu %d has no topology metadata", cpu)
 		}
 	}
-	return takeCoreAlignedCPUSet(
+	aligned := takeCoreAlignedCPUSet(
 		p.machine.machineInfo.CPUTopology,
 		reclaim,
 		reclaim,
 		reclaim.Size(),
-	), nil
+	)
+	if !reclaim.IsEmpty() && aligned.IsEmpty() {
+		return machine.NewCPUSet(), fmt.Errorf("non-empty reclaim override %s has no complete physical core", reclaim.String())
+	}
+	return aligned, nil
 }
 
 func (p *DynamicPolicy) syncReclaimPoolWithAdjustmentCommitOverride(
@@ -3362,57 +3422,12 @@ func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommitWithDynamicConfig(
 		)
 	}
 
-	disallowedSharedPartition := machine.NewCPUSet()
-	for name, containerEntries := range newEntries {
-		if containerEntries == nil {
-			continue
-		}
-		if containerEntries.IsPoolEntry() {
-			if name == commonstate.PoolNameReclaim {
-				continue
-			}
-			if commonstate.IsSystemPool(name) {
-				continue
-			}
-			if commonstate.GetPoolType(name) == commonstate.PoolNameDedicated &&
-				!disableDedicatedCoresOverlapReclaimedCores {
-				continue
-			}
-			if ai := containerEntries[commonstate.FakedContainerName]; ai != nil {
-				disallowedSharedPartition = disallowedSharedPartition.Union(ai.AllocationResult)
-			}
-			continue
-		}
-		for _, ai := range containerEntries {
-			if ai == nil {
-				continue
-			}
-			// system_cores containers are never part of the disallowed shared
-			// partition: bulkhead's BuildCPUSetPartitionView never folds them
-			// into NonReclaimPool, so they may legally overlap the reclaim pool
-			// (e.g. when a missing specified pool triggers whole-machine
-			// fallback). Exclude them here to keep this always-on invariant
-			// consistent with the bulkhead partition view.
-			if ai.CheckReclaimed() || ai.CheckSystem() {
-				continue
-			}
-			// Ramp-up shared allocations are exclusively governed by
-			// validateRampUpReclaimMutualExclusion above: when the hard
-			// partition switch is off (hpActive == false), their overlap with
-			// the reclaim pool is legal; when it is on, any overlap has
-			// already been rejected above (applyBlocks rematerialized the
-			// restorable ones before commit), so exclude them here to avoid
-			// duplicate errors. Steady shared allocations keep flowing into
-			// the disallowed partition below, untouched.
-			if isRampUpShared := ai.RampUp && ai.CheckShared() && !ai.CheckReclaimed(); isRampUpShared {
-				continue
-			}
-			if ai.CheckDedicated() && !disableDedicatedCoresOverlapReclaimedCores {
-				continue
-			}
-			disallowedSharedPartition = disallowedSharedPartition.Union(ai.AllocationResult)
-		}
-	}
+	disallowedSharedPartition := reclaimDisallowedOverlapCPUs(
+		newEntries,
+		allowSharedCoresOverlapReclaimedCores,
+		disableDedicatedCoresOverlapReclaimedCores,
+		hpActive,
+	)
 	if overlap := reclaimPool.AllocationResult.Intersection(disallowedSharedPartition); !overlap.IsEmpty() {
 		return fmt.Errorf("reclaim pool overlaps disallowed shared partition before commit: %s", overlap.String())
 	}
@@ -3423,6 +3438,51 @@ func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommitWithDynamicConfig(
 		disableDedicatedCoresOverlapReclaimedCores,
 		dynamicConf,
 	)
+}
+
+func reclaimDisallowedOverlapCPUs(
+	entries state.PodEntries,
+	allowSharedOverlap, disableDedicatedOverlap, hardRampUpPartition bool,
+) machine.CPUSet {
+	disallowed := machine.NewCPUSet()
+	for name, containerEntries := range entries {
+		if containerEntries == nil {
+			continue
+		}
+		if containerEntries.IsPoolEntry() {
+			if name == commonstate.PoolNameReclaim || commonstate.IsSystemPool(name) {
+				continue
+			}
+			poolType := commonstate.GetPoolType(name)
+			if poolType == commonstate.PoolNameDedicated && !disableDedicatedOverlap {
+				continue
+			}
+			if poolType == commonstate.PoolNameShare && allowSharedOverlap {
+				continue
+			}
+			if ai := containerEntries[commonstate.FakedContainerName]; ai != nil {
+				disallowed = disallowed.Union(ai.AllocationResult)
+			}
+			continue
+		}
+		for _, ai := range containerEntries {
+			if ai == nil || ai.CheckReclaimed() || ai.CheckSystem() {
+				continue
+			}
+			ownerPoolType := commonstate.GetPoolType(
+				commonstate.OwnerPoolNameTranslator.Translate(ai.OwnerPoolName))
+			if ai.CheckDedicated() && ownerPoolType == commonstate.PoolNameDedicated && !disableDedicatedOverlap {
+				continue
+			}
+			if ai.CheckShared() {
+				if allowSharedOverlap || (ai.RampUp && !hardRampUpPartition) {
+					continue
+				}
+			}
+			disallowed = disallowed.Union(ai.AllocationResult)
+		}
+	}
+	return disallowed
 }
 
 // validateRampUpReclaimMutualExclusion enforces the ramp-up reclaim hard
@@ -3708,8 +3768,10 @@ func (p *DynamicPolicy) reviseReclaimPool(
 	if newEntries.CheckPoolEmpty(commonstate.PoolNameReclaim) {
 		eligible := p.machine.machineInfo.CPUDetails.CPUs().
 			Difference(p.config.reservedCPUs).
-			Difference(pooledUnionDedicatedCPUSet).
 			Difference(notAllocatablePoolsCPUs)
+		if mode.disableDedicatedOverlap {
+			eligible = eligible.Difference(pooledUnionDedicatedCPUSet)
+		}
 		// Subtract the candidate ownership the current mode forbids reclaim to borrow:
 		//  - dedicated pool/non-isolated dedicated whenever disableDedicatedOverlap is set,
 		//    independently of strict/allowSharedOverlap;
@@ -3856,7 +3918,7 @@ func (p *DynamicPolicy) reviseReclaimPool(
 		// that prohibitedPoolCPUs (pool-level) does not cover — stay borrowable only in plain
 		// overlap mode. Once dedicated overlap is disabled (dd=true) they are subtracted even
 		// when share overlap remains allowed.
-		if !mode.allowSharedOverlap || mode.disableDedicatedOverlap {
+		if mode.disableDedicatedOverlap {
 			eligible = eligible.Difference(nonReclaimCPUSet)
 		}
 
@@ -3877,11 +3939,16 @@ func (p *DynamicPolicy) reviseReclaimPool(
 		if err != nil {
 			// An optional bucket that the current ownership/mode cannot supply is left
 			// absent rather than failing the whole revision; a required active-RNUMA NUMA
-			// still fails closed.
+			// still fails closed and keeps the workload context in the error.
 			if !required && (errors.Is(err, errReclaimFallbackCapacityInsufficient) ||
 				errors.Is(err, errReclaimFallbackEmptyRequired)) {
 				general.Infof("skip per-NUMA reclaim bucket on NUMA %d: %s", numaID, err)
 				return machine.NewCPUSet(), nil
+			}
+			if required {
+				return machine.NewCPUSet(), fmt.Errorf(
+					"reclaim pool cannot back active reclaimed-numa-binding on NUMA %d: %w",
+					numaID, err)
 			}
 			return machine.NewCPUSet(), fmt.Errorf("select bounded reclaim fallback in NUMA %d: %w", numaID, err)
 		}

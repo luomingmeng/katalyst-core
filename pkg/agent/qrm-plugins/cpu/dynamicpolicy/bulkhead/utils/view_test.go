@@ -1361,6 +1361,39 @@ func TestBuildCPUSetPartitionViewAppliesTransientProtectedNonReclaim(t *testing.
 	assertCPUSet(t, "empty reclaim numa 1", view.ReclaimEffectivePerNUMA[1], "")
 }
 
+func TestDedicatedOverlapProjectionKeepsOnlyAuthorizedIntersection(t *testing.T) {
+	topology := testTwoNUMASMTTopology()
+	state := cpustate.NewCPUPluginState(nil)
+	state.SetAllowSharedCoresOverlapReclaimedCores(false)
+	state.SetAllocationInfo("owner", "main", &cpustate.AllocationInfo{
+		AllocationMeta:   commonstate.AllocationMeta{OwnerPoolName: commonstate.PoolNameDedicated, QoSLevel: apiconsts.PodAnnotationQoSLevelDedicatedCores},
+		AllocationResult: machine.MustParse("0-7"),
+	})
+	state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName, &cpustate.AllocationInfo{
+		AllocationMeta: commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim), AllocationResult: machine.MustParse("2-3"),
+	})
+	view, _ := BuildCPUSetPartitionView(state, topology, CPUSetPartitionViewOptions{EnableReclaim: true})
+	if err := ValidateCPUSetPartitionView(view, topology); err != nil {
+		t.Fatal(err)
+	}
+	assertCPUSet(t, "authorized overlap", view.ReclaimOverlap, "2-3")
+	actual := BuildCPUSetPartitionViewFromTarget(view, machine.NewCPUSet(2), topology)
+	assertCPUSet(t, "actual overlap", actual.ReclaimOverlap, "2")
+	assertCPUSet(t, "dedicated remains in non-reclaim", actual.NonReclaimPool, "0-7")
+	ApplyTransientProtectedNonReclaim(view, topology, machine.NewCPUSet(2))
+	assertCPUSet(t, "protected overlap removed", view.ReclaimEffective, "3")
+	invalid := view.DeepCopy()
+	invalid.ReclaimOverlap.Add(1)
+	if err := ValidateCPUSetPartitionView(invalid, topology); err == nil {
+		t.Fatal("overlap outside raw reclaim must be rejected")
+	}
+	invalid = view.DeepCopy()
+	invalid.Isolation.Add(3)
+	if err := ValidateCPUSetPartitionView(invalid, topology); err == nil {
+		t.Fatal("isolation cannot inherit dedicated overlap permission")
+	}
+}
+
 func TestApplyTransientProtectedNonReclaimRebuildsReclaimPerNUMA(t *testing.T) {
 	t.Parallel()
 

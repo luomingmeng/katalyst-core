@@ -20,9 +20,11 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
@@ -208,6 +210,45 @@ func TestShouldUseNumaBindingAllocationPreferenceOnlyForExistingExclusiveDNB(t *
 	require.False(t, shouldUseNumaBindingAllocationPreference(nil))
 }
 
+func TestExistingShortDedicatedAllocationInSteadyState(t *testing.T) {
+	allocation := &state.AllocationInfo{
+		AllocationMeta:  commonstate.AllocationMeta{OwnerPoolName: commonstate.PoolNameDedicated, QoSLevel: apiconsts.PodAnnotationQoSLevelDedicatedCores},
+		RequestQuantity: 8, AllocationResult: machine.NewCPUSet(0, 1), OriginalAllocationResult: machine.NewCPUSet(0, 1),
+	}
+	require.True(t, existingAllocationSatisfiesRequest(allocation, 8, true))
+	require.False(t, existingAllocationSatisfiesRequest(allocation, 8, false))
+	require.False(t, existingAllocationSatisfiesRequest(allocation, 10, true))
+	allocation.OwnerPoolName = "isolation-owner"
+	require.False(t, existingAllocationSatisfiesRequest(allocation, 8, true))
+}
+
+func TestExistingShortDedicatedReuseRequiresCommittedReclaimAndScope(t *testing.T) {
+	p, err := getTestDynamicPolicyWithoutInitialization(mustDummyTopology(t, 8, 1, 1), t.TempDir())
+	require.NoError(t, err)
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	require.NoError(t, p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false))
+	allocation := &state.AllocationInfo{
+		AllocationMeta:  commonstate.AllocationMeta{OwnerPoolName: commonstate.PoolNameDedicated, QoSLevel: apiconsts.PodAnnotationQoSLevelDedicatedCores},
+		RequestQuantity: 8, AllocationResult: machine.NewCPUSet(0, 1, 2, 4, 5, 6), OriginalAllocationResult: machine.NewCPUSet(0, 1, 2, 4, 5, 6),
+	}
+	req := &pluginapi.ResourceRequest{Hint: &pluginapi.TopologyHint{Nodes: []uint64{0}}}
+	require.False(t, p.existingShortDedicatedAllocationReusable(allocation, req))
+	setLiveReclaimPool(t, p, machine.NewCPUSet(3, 7))
+	require.True(t, p.existingShortDedicatedAllocationReusable(allocation, req))
+	short := allocation.Clone()
+	short.AllocationResult, short.OriginalAllocationResult = machine.NewCPUSet(0, 4), machine.NewCPUSet(0, 4)
+	require.False(t, p.existingShortDedicatedAllocationReusable(short, req), "reclaim cannot explain an arbitrary missing allocation")
+	req.Hint.Nodes = []uint64{1}
+	require.False(t, p.existingShortDedicatedAllocationReusable(allocation, req))
+	req.Hint.Nodes = []uint64{0}
+	req.Annotations = map[string]string{apiconsts.PodAnnotationMemoryEnhancementNumaBinding: "true"}
+	require.False(t, p.existingShortDedicatedAllocationReusable(allocation, req))
+	allocation.Annotations = map[string]string{apiconsts.PodAnnotationMemoryEnhancementNumaBinding: "true", cpuconsts.CPUStateAnnotationKeyNUMAHint: "0"}
+	require.True(t, p.existingShortDedicatedAllocationReusable(allocation, req))
+	req.Hint.Nodes = []uint64{0, 1}
+	require.False(t, p.existingShortDedicatedAllocationReusable(allocation, req), "a wider hint must replan, not reuse the old scope")
+}
+
 func TestExistingAllocationSatisfiesRequestWithElasticNUMABindingDNB(t *testing.T) {
 	t.Parallel()
 
@@ -228,6 +269,7 @@ func TestExistingAllocationSatisfiesRequestWithElasticNUMABindingDNB(t *testing.
 				allocation.Annotations[apiconsts.PodAnnotationMemoryEnhancementNumaExclusive] = apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable
 			}
 			allocation.RequestQuantity = 6
+			allocation.OwnerPoolName = commonstate.PoolNameDedicated
 			allocation.RampUp = true
 
 			require.True(t, existingAllocationSatisfiesRequest(allocation, 6, true))

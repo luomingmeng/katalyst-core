@@ -18,9 +18,12 @@ package dynamicpolicy
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	advisorapi "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/cpuadvisor"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
+	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -39,7 +42,8 @@ type reclaimFallbackMode struct {
 	requireCoreAligned bool
 }
 
-// strict disjoint requires enableReclaim && !allowSharedOverlap && disableDedicatedOverlap.
+// strict identifies active disjoint sizing. Disabled mode freezes a committed
+// partition and therefore does not re-run strict capacity sizing.
 func (m reclaimFallbackMode) strict() bool {
 	return m.enableReclaim && !m.allowSharedOverlap && m.disableDedicatedOverlap
 }
@@ -51,12 +55,127 @@ var (
 	errReclaimFallbackEmptyRequired        = errors.New("reclaim fallback: non-empty reclaim pool required but no candidate")
 )
 
-// validateRequiredReclaimPool is the post-mutation terminal guard: after all pool
-// mutations (default share, ramp-up floor, container entries, normalize, resync),
-// the actual newEntries must have a non-empty reclaim pool. It is called from the
-// commitPending validate closure so a repair-then-mutation that empties reclaim is
-// rejected (no-write). It is a pure 2-line check, not a new validation framework.
-func validateRequiredReclaimPool(entries state.PodEntries) error {
+// withRequiredReclaimFallback moves an omitted disjoint reclaim target into the
+// planning frame. It never mutates the received response or overwrites positive
+// advice; the synthetic block is subject to the normal ownership/scope checks.
+func (p *DynamicPolicy) withRequiredReclaimFallback(resp *advisorapi.ListAndWatchResponse, dyn *dynamicconfig.Configuration) (*advisorapi.ListAndWatchResponse, error) {
+	if resp == nil || dyn == nil || !dyn.EnableReclaim || !resp.DisableDedicatedCoresOverlapReclaimedCores || p.reclaim.reservedReclaimedCPUsSize <= 0 {
+		return resp, nil
+	}
+	if entries := resp.Entries[commonstate.PoolNameReclaim]; entries != nil {
+		for _, info := range entries.Entries {
+			if info == nil {
+				continue
+			}
+			for _, result := range info.CalculationResultsByNumas {
+				if result == nil {
+					continue
+				}
+				for _, block := range result.Blocks {
+					if block != nil && block.Result > 0 {
+						return resp, nil
+					}
+				}
+			}
+		}
+	}
+	blocks, err := resp.GetBlocks()
+	if err != nil {
+		return nil, err
+	}
+	id := "reclaim-fallback"
+	for suffix := 0; ; suffix++ {
+		used := false
+		for _, numaBlocks := range blocks {
+			for _, block := range numaBlocks {
+				if block != nil && block.BlockId == id {
+					used = true
+				}
+			}
+		}
+		if !used {
+			break
+		}
+		id = fmt.Sprintf("reclaim-fallback-%d", suffix)
+	}
+	out := *resp
+	out.Entries = make(map[string]*advisorapi.CalculationEntries, len(resp.Entries)+1)
+	for name, entries := range resp.Entries {
+		out.Entries[name] = entries
+	}
+	out.Entries[commonstate.PoolNameReclaim] = &advisorapi.CalculationEntries{Entries: map[string]*advisorapi.CalculationInfo{
+		commonstate.FakedContainerName: {OwnerPoolName: commonstate.PoolNameReclaim, CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+			commonstate.FakedNUMAID: {Blocks: []*advisorapi.Block{{BlockId: id, Result: uint64(p.reclaim.reservedReclaimedCPUsSize)}}},
+		}},
+	}}
+	return &out, nil
+}
+
+// carveDedicatedReclaim forms the final candidate before precommit freezes its
+// shape. RequestQuantity is scheduling intent, not a floor on the physical set.
+// Isolation and package ownership are not reclassified as ordinary dedicated.
+func (p *DynamicPolicy) carveDedicatedReclaim(entries state.PodEntries, reclaim machine.CPUSet) error {
+	if reclaim.IsEmpty() {
+		return nil
+	}
+	type update struct {
+		allocation  *state.AllocationInfo
+		cpus        machine.CPUSet
+		assignments map[int]machine.CPUSet
+	}
+	var updates []update
+	for name, containers := range entries {
+		for _, allocation := range containers {
+			if allocation == nil || allocation.CheckSideCar() {
+				continue
+			}
+			owner := commonstate.GetPoolType(commonstate.OwnerPoolNameTranslator.Translate(allocation.OwnerPoolName))
+			ordinaryDedicated := owner == commonstate.PoolNameDedicated &&
+				(containers.IsPoolEntry() || allocation.CheckDedicated())
+			if !ordinaryDedicated || allocation.AllocationResult.Intersection(reclaim).IsEmpty() {
+				continue
+			}
+			remaining := allocation.AllocationResult.Difference(reclaim)
+			if remaining.IsEmpty() && !containers.IsPoolEntry() {
+				return fmt.Errorf("dedicated reclaim transfer leaves empty allocation for %s/%s", name, allocation.ContainerName)
+			}
+			assignments, err := machine.GetNumaAwareAssignments(p.machine.machineInfo.CPUTopology, remaining)
+			if err != nil {
+				return err
+			}
+			updates = append(updates, update{allocation, remaining, assignments})
+		}
+	}
+	// Validate every affected owner before changing any candidate entry.
+	for _, u := range updates {
+		u.allocation.AllocationResult = u.cpus
+		u.allocation.OriginalAllocationResult = u.cpus.Clone()
+		u.allocation.TopologyAwareAssignments = u.assignments
+		u.allocation.OriginalTopologyAwareAssignments = machine.DeepcopyCPUAssignment(u.assignments)
+	}
+	p.syncCandidateSidecarsFromMain(entries)
+	return nil
+}
+
+// preserveCommittedReclaimPool freezes the last successful reclaim identity in
+// a new candidate. Disabled reclaim may stop service and expansion, but it must
+// not erase or relocate the cpuset that still backs existing offline workloads.
+func preserveCommittedReclaimPool(candidate, committed state.PodEntries) error {
+	entry := committed[commonstate.PoolNameReclaim][commonstate.FakedContainerName]
+	if entry == nil || entry.AllocationResult.IsEmpty() {
+		return errReclaimFallbackEmptyRequired
+	}
+	if candidate[commonstate.PoolNameReclaim] == nil {
+		candidate[commonstate.PoolNameReclaim] = make(state.ContainerEntries)
+	}
+	candidate[commonstate.PoolNameReclaim][commonstate.FakedContainerName] = entry.Clone()
+	return nil
+}
+
+// validateFinalReclaimPool is the terminal state contract shared by every
+// successful CPU partition writer. Runtime reclaim enablement controls whether
+// the pool may be expanded; it never makes an empty committed pool legal.
+func validateFinalReclaimPool(entries state.PodEntries) error {
 	if entries.CheckPoolEmpty(commonstate.PoolNameReclaim) {
 		return errReclaimFallbackEmptyRequired
 	}
@@ -69,8 +188,8 @@ func validateRequiredReclaimPool(entries state.PodEntries) error {
 // Invariants enforced by every branch:
 //   - The result is always a subset of eligible (never superset, never whole machine).
 //   - The result size never exceeds want.
-//   - want==0 means "no requirement": returns empty; the caller decides emptiness
-//     acceptance and terminal validation enforces non-empty when required.
+//   - want==0 recovers exactly one complete physical core; it never makes an
+//     empty successful state legal.
 //   - committedPrior is intersected with eligible before use, so a stale or oversized
 //     prior is never materialized unfiltered.
 func selectBoundedReclaimFallback(
@@ -88,9 +207,9 @@ func selectBoundedReclaimFallback(
 		return machine.NewCPUSet(), errReclaimFallbackInvariant
 	}
 	if want == 0 {
-		// No explicit requirement: return empty. Never materialize an unfiltered
-		// prior/default here; the caller owns the empty-vs-seed policy decision.
-		return machine.NewCPUSet(), nil
+		// A zero configured target disables expansion, not partition existence.
+		// Recover the smallest complete physical core; if none is legal, fail closed.
+		want = topology.CPUsPerCore()
 	}
 
 	// comm is the committed prior that still fits the filtered eligible set.

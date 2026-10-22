@@ -566,6 +566,9 @@ func TestPreparePendingCPUPartitionRejectsReclaimEmptiedAfterRepair(t *testing.T
 		coresInNUMA(topology, 0, 0, 1),
 		coresInNUMA(topology, 0, 1, 2),
 	)
+	dynamicConf := p.config.dynamicConfig.GetDynamicConfiguration()
+	dynamicConf.EnableReclaim = true
+	p.reclaim.reservedReclaimedCPUsSize = reclaimPoolCPUSet(planned).Size()
 
 	_, _, err = p.commitPendingCPUPartition(pendingCPUPartition{
 		expectedRevision:          initialRevision,
@@ -575,6 +578,7 @@ func TestPreparePendingCPUPartitionRejectsReclaimEmptiedAfterRepair(t *testing.T
 		source:                    "reclaim emptied after repair",
 		requireCoreAlignedReclaim: true,
 		enforceSteadyReclaim:      true,
+		dynamicConfig:             dynamicConf,
 		validate: func(entries state.PodEntries, _ state.NUMANodeMap, _, _ bool) error {
 			// Simulate a repair/resync that empties the reclaim pool.
 			entries[commonstate.PoolNameReclaim][commonstate.FakedContainerName].

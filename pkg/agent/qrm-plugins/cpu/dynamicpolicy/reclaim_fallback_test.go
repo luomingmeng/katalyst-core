@@ -74,27 +74,35 @@ func TestSelectBoundedReclaimFallbackPrefersCommittedPrior(t *testing.T) {
 	assert.Equal(t, "8-11", got.String(), "prefer committed prior over re-seeding default")
 }
 
-func TestSelectBoundedReclaimFallbackWantZeroReturnsEmpty(t *testing.T) {
+func TestSelectBoundedReclaimFallbackWantZeroRecoversMinimumCore(t *testing.T) {
 	t.Parallel()
 	topo := mustTopology180(t)
-	// want<=0 means no explicit requirement: return empty. The caller owns the
-	// empty-vs-seed policy; the helper never materializes an unfiltered prior/default.
 	got, err := selectBoundedReclaimFallback(topo, machine.MustParse("0-39"), machine.NewCPUSet(), machine.MustParse("0-3"), 0, reclaimFallbackMode{})
 	assert.NoError(t, err)
-	assert.True(t, got.IsEmpty(), "want=0 must return empty, got %s", got)
+	assert.Equal(t, topo.CPUsPerCore(), got.Size(), "want=0 must recover one complete core")
+	assert.True(t, got.IsSubsetOf(machine.MustParse("0-39")))
 
-	// Even with a non-empty committed prior, want=0 returns empty.
 	got, err = selectBoundedReclaimFallback(topo, machine.MustParse("0-39"), machine.MustParse("4-7"), machine.MustParse("0-3"), 0, reclaimFallbackMode{})
 	assert.NoError(t, err)
-	assert.True(t, got.IsEmpty(), "want=0 must not unfiltered-restore prior, got %s", got)
+	assert.Equal(t, topo.CPUsPerCore(), got.Size())
+	assert.True(t, got.IsSubsetOf(machine.MustParse("4-7")), "minimum recovery must prefer committed identity")
 }
 
-func TestSelectBoundedReclaimFallbackEmptyEligibleReturnsRequiredError(t *testing.T) {
+func TestSelectBoundedReclaimFallbackEmptyEligibleHonorsRequiredContract(t *testing.T) {
 	t.Parallel()
 	topo := mustTopology180(t)
-	// want>0 but eligible empty (all reserved/forbidden) -> errEmptyRequired, no write.
+
+	// Enabled reclaim with a positive target still fails closed when no legal CPU
+	// exists. This is the real non-empty contract.
 	_, err := selectBoundedReclaimFallback(topo, machine.NewCPUSet(), machine.NewCPUSet(), machine.MustParse("0-3"), 4, reclaimFallbackMode{
 		enableReclaim: true, allowSharedOverlap: false, disableDedicatedOverlap: false,
+	})
+	assert.ErrorIs(t, err, errReclaimFallbackEmptyRequired)
+
+	// The same empty eligibility must also fail closed while reclaim is disabled.
+	// Disabled mode preserves the last successful pool; it never publishes empty.
+	_, err = selectBoundedReclaimFallback(topo, machine.NewCPUSet(), machine.NewCPUSet(), machine.MustParse("0-3"), 4, reclaimFallbackMode{
+		enableReclaim: false, allowSharedOverlap: false, disableDedicatedOverlap: false,
 	})
 	assert.ErrorIs(t, err, errReclaimFallbackEmptyRequired)
 }
@@ -138,12 +146,12 @@ func TestSelectBoundedReclaimFallbackForbiddenSeedNotCloned(t *testing.T) {
 	assert.ErrorIs(t, err, errReclaimFallbackEmptyRequired,
 		"must not unfiltered-clone seed when eligible is empty")
 
-	// Even non-strict overlap mode must not rescue the seed from forbidden CPUs.
+	// Disabled reclaim also fails closed: it must preserve a prior legal pool and
+	// cannot rescue forbidden CPUs or publish empty when none is usable.
 	_, err = selectBoundedReclaimFallback(topo, eligible, machine.NewCPUSet(), seed, 4, reclaimFallbackMode{
 		enableReclaim: false, allowSharedOverlap: true, disableDedicatedOverlap: false,
 	})
-	assert.ErrorIs(t, err, errReclaimFallbackEmptyRequired,
-		"legacy overlap must not clone forbidden seed")
+	assert.ErrorIs(t, err, errReclaimFallbackEmptyRequired)
 }
 
 func TestSelectBoundedReclaimFallbackPreservesPartialPriorThenFills(t *testing.T) {

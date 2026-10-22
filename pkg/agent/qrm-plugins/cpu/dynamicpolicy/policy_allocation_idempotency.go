@@ -20,9 +20,14 @@ import (
 	"math"
 	"sort"
 
+	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
+
+	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
+	cpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/cpu/dynamicpolicy/state"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
+	rputil "github.com/kubewharf/katalyst-core/pkg/util/resource-package"
 )
 
 type numaBindingAllocationPreference struct {
@@ -45,7 +50,7 @@ func shouldUseNumaBindingAllocationPreference(allocationInfo *state.AllocationIn
 func existingAllocationSatisfiesRequest(
 	allocationInfo *state.AllocationInfo,
 	reqInt int,
-	allowShortNUMABindingAllocation bool,
+	allowShortDedicatedAllocation bool,
 ) bool {
 	if allocationInfo == nil {
 		return false
@@ -53,13 +58,75 @@ func existingAllocationSatisfiesRequest(
 	if allocationInfo.OriginalAllocationResult.Size() >= reqInt {
 		return true
 	}
-	if !allowShortNUMABindingAllocation {
+	if !allowShortDedicatedAllocation {
 		return false
 	}
-	if !allocationInfo.CheckDedicatedNUMABinding() || allocationInfo.OriginalAllocationResult.IsEmpty() {
+	if !allocationInfo.CheckDedicated() || allocationInfo.OriginalAllocationResult.IsEmpty() ||
+		commonstate.GetPoolType(commonstate.OwnerPoolNameTranslator.Translate(allocationInfo.OwnerPoolName)) != commonstate.PoolNameDedicated {
 		return false
 	}
 	return int(math.Ceil(allocationInfo.RequestQuantity)) == reqInt
+}
+
+func (p *DynamicPolicy) existingShortDedicatedAllocationReusable(allocation *state.AllocationInfo, req *pluginapi.ResourceRequest) bool {
+	if allocation == nil || req == nil || !p.isReclaimEnabled() || !p.state.GetDisableDedicatedCoresOverlapReclaimedCores() {
+		return false
+	}
+	if !allocation.AllocationResult.Equals(allocation.OriginalAllocationResult) {
+		return false
+	}
+	reclaim := machine.NewCPUSet()
+	if pool := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName); pool != nil {
+		reclaim = pool.AllocationResult
+	}
+	if reclaim.IsEmpty() || !allocation.AllocationResult.Intersection(reclaim).IsEmpty() {
+		return false
+	}
+	// Keep the quantity helper pure. Only the short path checks the request's
+	// scope and the committed reclaim explanation; full allocations keep their
+	// historical fast-return behavior and do not scan topology or ownership.
+	for _, key := range []string{
+		apiconsts.PodAnnotationMemoryEnhancementNumaBinding,
+		apiconsts.PodAnnotationMemoryEnhancementNumaExclusive,
+	} {
+		if allocation.Annotations[key] != req.Annotations[key] {
+			return false
+		}
+	}
+	if rputil.GetResourcePackageName(allocation.Annotations) != rputil.GetResourcePackageName(req.Annotations) {
+		return false
+	}
+	scope := p.machine.machineInfo.CPUDetails.CPUs()
+	if req.Hint != nil {
+		if len(req.Hint.Nodes) == 0 {
+			return false
+		}
+		scope = machine.NewCPUSet()
+		for _, numa := range req.Hint.Nodes {
+			scope = scope.Union(p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(int(numa)))
+		}
+		if allocation.CheckDedicatedNUMABinding() {
+			if recorded := allocation.Annotations[cpuconsts.CPUStateAnnotationKeyNUMAHint]; recorded != "" {
+				numas, err := machine.Parse(recorded)
+				hinted, hintErr := machine.NewCPUSetUint64(req.Hint.Nodes...)
+				if err != nil || hintErr != nil || !numas.Equals(hinted) {
+					return false
+				}
+			}
+		}
+	}
+	if !allocation.AllocationResult.IsSubsetOf(scope) {
+		return false
+	}
+	if pkg := rputil.GetResourcePackageName(req.Annotations); pkg != "" {
+		if pinned := p.state.GetMachineState().GetResourcePackagePinnedCPUSet()[pkg]; !pinned.IsEmpty() {
+			scope = scope.Intersection(pinned)
+			if !allocation.AllocationResult.IsSubsetOf(scope) {
+				return false
+			}
+		}
+	}
+	return float64(allocation.AllocationResult.Size()+reclaim.Intersection(scope).Size()) >= allocation.RequestQuantity
 }
 
 func removePodOwnerEntriesForReallocation(podEntries state.PodEntries, podUID, containerName string) {

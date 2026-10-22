@@ -198,10 +198,10 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 	if err := validate(candidate, machineState, pending.allowOverlap, pending.disableDedicated); err != nil {
 		return nil, p.wrapPartitionPrecommitError(pending.source, pending.expectedRevision, "validate hard floor and partition", err)
 	}
-	// Terminal non-empty reclaim guard: after the external validate callback may have
-	// mutated the candidate (e.g. repair, resync), the actual candidate must still have
-	// a non-empty reclaim pool. Shared with the applyPools commitPending closure.
-	if err := validateRequiredReclaimPool(candidate); err != nil {
+	// Terminal non-empty reclaim guard: after every fallible mutation and the
+	// external validator, no successful writer may publish an empty reclaim pool.
+	// EnableReclaim controls service/expansion behavior, not partition existence.
+	if err := validateFinalReclaimPool(candidate); err != nil {
 		return nil, p.wrapPartitionPrecommitError(pending.source, pending.expectedRevision, "reclaim empty required", err)
 	}
 	// Keep the frozen plan authoritative through the complete prepare phase.

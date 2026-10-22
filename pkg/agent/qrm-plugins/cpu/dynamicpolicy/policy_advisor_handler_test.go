@@ -410,15 +410,17 @@ func TestAllocateByCPUAdvisorLegacyHardReclaimAliases(t *testing.T) {
 		}
 	}
 
-	t.Run("mandatory reclaim rejects aliases that fragment physical cores", func(t *testing.T) {
+	t.Run("mandatory reclaim keeps overlap aliases core aligned", func(t *testing.T) {
 		t.Parallel()
 		policy, resp := newPolicyAndResponse(t, true)
-		revision := policy.state.GetRevision()
 
-		err := policy.allocateByCPUAdvisor(nil, resp, nil)
-
-		require.ErrorContains(t, err, "not core-aligned")
-		require.Equal(t, revision, policy.state.GetRevision())
+		require.NoError(t, policy.allocateByCPUAdvisor(nil, resp, nil))
+		// The mandatory preallocation selects whole cores before merging the
+		// overlap aliases. Verify the final union, not the former fragmented
+		// first-fit selection that happened to fail validation.
+		reclaim := reclaimPoolCPUSet(policy.state.GetPodEntries())
+		require.False(t, reclaim.IsEmpty())
+		require.NoError(t, assertCoreAligned(reclaim, policy.machine.machineInfo.CPUTopology))
 	})
 
 	t.Run("overlap only fails closed without mandatory reclaim", func(t *testing.T) {
@@ -1737,6 +1739,7 @@ func TestExclusiveDisjointPartitionLifecycleAndFlagTransitions(t *testing.T) {
 	checkpointDir := t.TempDir()
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, checkpointDir)
 	require.NoError(t, err)
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	policy.advisorPostCommitCheckpointDir = checkpointDir
 
 	wholeNUMA := topology.CPUDetails.CPUsInNUMANodes(0)
@@ -2238,6 +2241,7 @@ func TestDynamicPolicyApplyBlocksExcludesDNBFromDefaultShareResidual(t *testing.
 	require.NoError(t, err)
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 	require.NoError(t, err)
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	policy.config.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
 
 	dnbCPUSet := machine.NewCPUSet(2, 6)
@@ -2321,6 +2325,7 @@ func TestDynamicPolicyApplyBlocksUsesCandidateEntriesForRNBTopology(t *testing.T
 	require.NoError(t, err)
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 	require.NoError(t, err)
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 
 	numa0 := topology.CPUDetails.CPUsInNUMANodes(0)
 	numa1 := topology.CPUDetails.CPUsInNUMANodes(1)
@@ -2448,6 +2453,7 @@ func TestDynamicPolicyApplyBlocksPrunesEmptyDefaultShareAfterLastOwnerMoves(t *t
 	require.NoError(t, err)
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 	require.NoError(t, err)
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	policy.config.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
 
 	previousShare := machine.NewCPUSet(2, 3)
@@ -3274,11 +3280,8 @@ func TestDynamicPolicyApplyBlocksRampUpRematerializationWithDefaultSharePool(t *
 	}
 }
 
-// TestDynamicPolicyApplyBlocksRampUpRematerializationWithDisableDedicatedOverlap
-// covers the HP=true && AO=true && DisableDedicatedCoresOverlapReclaimedCores
-// corner: the adjustment commit override is reclaim-minus-dedicated, and the
-// ramp-up shared allocation must still be rematerialized against that final
-// reclaim pool.
+// The candidate contains partial dedicated/reclaim overlap. Disjoint planning
+// transfers that subset without changing request and rematerializes shared ramp-up.
 func TestDynamicPolicyApplyBlocksRampUpRematerializationWithDisableDedicatedOverlap(t *testing.T) {
 	t.Parallel()
 
@@ -3344,27 +3347,20 @@ func TestDynamicPolicyApplyBlocksRampUpRematerializationWithDisableDedicatedOver
 		},
 	}
 	blockCPUSet := advisorapi.BlockCPUSet{
-		"dedicated": machine.NewCPUSet(1, 5),
+		"dedicated": machine.NewCPUSet(0, 1, 4, 5),
 		"reclaim-0": machine.NewCPUSet(1, 5),
 		"reclaim-1": machine.NewCPUSet(2, 6),
 	}
 
 	require.NoError(t, prepareAndCommitAdvisorBlocks(policy, blockCPUSet, resp, true))
-
-	// DD=true: the final reclaim pool is reclaim-minus-dedicated.
 	reclaim := policy.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
 	require.NotNil(t, reclaim)
-	require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(2, 6)),
-		"final reclaim pool: %s", reclaim.AllocationResult.String())
-
+	require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(1, 2, 5, 6)))
 	dedicated := policy.state.GetAllocationInfo("dedicated-pod", "main")
-	require.NotNil(t, dedicated)
-	require.True(t, dedicated.AllocationResult.Equals(machine.NewCPUSet(1, 5)))
-
+	require.True(t, dedicated.AllocationResult.Equals(machine.NewCPUSet(0, 4)))
+	require.Equal(t, float64(2), dedicated.RequestQuantity)
 	got := policy.state.GetAllocationInfo("ramp-up-pod", "main")
-	require.NotNil(t, got)
-	require.True(t, got.AllocationResult.Equals(machine.NewCPUSet(3, 7)),
-		"ramp-up shared allocation: %s", got.AllocationResult.String())
+	require.True(t, got.AllocationResult.Equals(machine.NewCPUSet(3, 7)))
 	require.True(t, got.AllocationResult.Intersection(reclaim.AllocationResult).IsEmpty())
 	require.True(t, got.AllocationResult.Intersection(dedicated.AllocationResult).IsEmpty())
 	requireCoreAligned(t, topology, got.AllocationResult)
@@ -3377,6 +3373,7 @@ func TestDynamicPolicyApplyBlocksPrunesOwnerlessEmptyDefaultShareWithoutPrevious
 	require.NoError(t, err)
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 	require.NoError(t, err)
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	policy.config.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
 
 	policy.state.SetPodEntries(state.PodEntries{
@@ -3433,6 +3430,7 @@ func TestDynamicPolicyApplyBlocksRejectsEmptyDefaultShareWhenOwnerMovesIn(t *tes
 	require.NoError(t, err)
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 	require.NoError(t, err)
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	policy.config.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
 
 	policy.state.SetPodEntries(state.PodEntries{
@@ -4386,6 +4384,7 @@ func TestDynamicPolicyApplyBlocksOverridesReclaimDedicatedOverlapBeforeCommit(t 
 
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, tmpDir)
 	require.NoError(t, err)
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	policy.state.SetPodEntries(state.PodEntries{
 		"pod-dedicated": {
 			"main": &state.AllocationInfo{
@@ -4450,8 +4449,12 @@ func TestDynamicPolicyApplyBlocksOverridesReclaimDedicatedOverlapBeforeCommit(t 
 
 	reclaimPool := policy.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
 	require.NotNil(t, reclaimPool)
-	require.True(t, reclaimPool.AllocationResult.Equals(machine.NewCPUSet(0)),
-		"applyBlocks must commit the pending non-overlap reclaim effective set")
+	// EnableReclaim=true, AllowShared=false, DisableDedicated=false: reclaim may
+	// overlap dedicated (dedicated overlap allowed) but must not borrow share.
+	// The advisor candidate reclaim-1={2} overlapping dedicated {2} is legal in
+	// this quadrant and must be committed rather than filtered away.
+	require.True(t, reclaimPool.AllocationResult.Equals(machine.NewCPUSet(0, 2)),
+		"applyBlocks must commit the pending reclaim effective set, got %s", reclaimPool.AllocationResult.String())
 	require.False(t, policy.state.GetAllowSharedCoresOverlapReclaimedCores(),
 		"applyBlocks must commit the pending overlap mode with pod and machine state")
 
@@ -4668,6 +4671,7 @@ func TestDynamicPolicyApplyBlocksPreservesExplicitDisjointReclaim(t *testing.T) 
 
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, tmpDir)
 	require.NoError(t, err)
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	policy.reclaim.reservedReclaimedCPUSet = machine.NewCPUSet(4, 6)
 	policy.reclaim.reservedReclaimedTopologyAwareAssignments = map[int]machine.CPUSet{
 		0: machine.NewCPUSet(4),
@@ -4744,6 +4748,7 @@ func TestDynamicPolicyApplyBlocksRejectsMissingDisjointReclaim(t *testing.T) {
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, tmpDir)
 	require.NoError(t, err)
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 
 	resp := &advisorapi.ListAndWatchResponse{
 		DisableDedicatedCoresOverlapReclaimedCores: true,
@@ -4765,12 +4770,14 @@ func TestDynamicPolicyApplyBlocksUsesResponseModeWhenDisablingOverlap(t *testing
 
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, tmpDir)
 	require.NoError(t, err)
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	policy.reclaim.reservedReclaimedCPUSet = machine.NewCPUSet(0, 2)
 	policy.reclaim.reservedReclaimedTopologyAwareAssignments = map[int]machine.CPUSet{
 		0: machine.NewCPUSet(0),
 		1: machine.NewCPUSet(2),
 	}
 	policy.state.SetAllowSharedCoresOverlapReclaimedCores(true, false)
+
 	policy.state.SetPodEntries(state.PodEntries{
 		"pod-dedicated": {
 			"main": &state.AllocationInfo{
@@ -4862,6 +4869,7 @@ func TestDynamicPolicyApplyBlocksUsesRevisionGuard(t *testing.T) {
 
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, tmpDir)
 	require.NoError(t, err)
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	policy.reclaim.reservedReclaimedCPUSet = machine.NewCPUSet(0, 2)
 	policy.reclaim.reservedReclaimedTopologyAwareAssignments = map[int]machine.CPUSet{
 		0: machine.NewCPUSet(0),
@@ -5096,7 +5104,7 @@ func TestDynamicPolicyReviseReclaimPoolUsesResponseMode(t *testing.T) {
 				newEntries,
 				machine.NewCPUSet(),
 				machine.NewCPUSet(2, 6),
-				reclaimFallbackMode{allowSharedOverlap: tc.responseMode, disableDedicatedOverlap: false},
+				reclaimFallbackMode{enableReclaim: true, allowSharedOverlap: tc.responseMode, disableDedicatedOverlap: false},
 			)
 			require.NoError(t, err)
 			reclaimPool := newEntries[commonstate.PoolNameReclaim][commonstate.FakedContainerName]

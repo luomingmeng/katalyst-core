@@ -3630,8 +3630,8 @@ func TestAllocateFailureRollbackDoesNotOverwriteNewerState(t *testing.T) {
 		"restored allocation=%s, want %s", restored.AllocationResult, originalAllocation.AllocationResult)
 	reclaim := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
 	require.NotNil(t, reclaim)
-	require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(2, 3, 4, 5)),
-		"reclaim allocation=%s, want latest-state replan 2-5", reclaim.AllocationResult)
+	require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(7)),
+		"reclaim allocation=%s, want newer committed non-empty state 7 to remain authoritative", reclaim.AllocationResult)
 }
 
 func TestAllocateFailureRollbackDoesNotOverwriteNewerSameContainerState(t *testing.T) {

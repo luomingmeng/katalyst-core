@@ -17,6 +17,8 @@ limitations under the License.
 package dynamicpolicy
 
 import (
+	"context"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"testing"
@@ -77,6 +79,222 @@ func newReclaimReuseTestPolicy(t *testing.T) (*DynamicPolicy, func()) {
 		require.NoError(t, err)
 	}
 	return p, func() { _ = os.RemoveAll(tmpDir) }
+}
+
+func TestAdvisorReclaimPartitionPreservesOrCarvesDedicated(t *testing.T) {
+	for _, disjoint := range []bool{false, true} {
+		t.Run(map[bool]string{false: "overlap", true: "disjoint"}[disjoint], func(t *testing.T) {
+			topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
+			require.NoError(t, err)
+			p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+			require.NoError(t, err)
+			p.config.reservedCPUs = machine.NewCPUSet()
+			dyn := p.config.dynamicConfig.GetDynamicConfiguration()
+			dyn.EnableReclaim = true
+			dyn.EnableRampUpReclaimHardPartition = false
+			all := topology.CPUDetails.CPUs()
+			assignments, err := machine.GetNumaAwareAssignments(topology, all)
+			require.NoError(t, err)
+			main := &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid: "owner", ContainerName: "main", OwnerPoolName: commonstate.PoolNameDedicated,
+					QoSLevel: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+				},
+				RequestQuantity: 8, AllocationResult: all.Clone(), OriginalAllocationResult: all.Clone(),
+				TopologyAwareAssignments: assignments, OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(assignments),
+			}
+			require.NoError(t, p.state.SetPodEntries(state.PodEntries{"owner": {"main": main}}, false))
+			resp := &advisorapi.ListAndWatchResponse{
+				DisableDedicatedCoresOverlapReclaimedCores: disjoint,
+				Entries: map[string]*advisorapi.CalculationEntries{
+					"owner": {Entries: map[string]*advisorapi.CalculationInfo{
+						"main": {OwnerPoolName: commonstate.PoolNameDedicated, CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							0: {Blocks: []*advisorapi.Block{{BlockId: "dedicated", Result: 8}}},
+						}},
+					}},
+					commonstate.PoolNameReclaim: {Entries: map[string]*advisorapi.CalculationInfo{
+						commonstate.FakedContainerName: {OwnerPoolName: commonstate.PoolNameReclaim, CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{
+							0: {Blocks: []*advisorapi.Block{{BlockId: "reclaim", Result: 2}}},
+						}},
+					}},
+				},
+			}
+			blocks := advisorapi.BlockCPUSet{"dedicated": all.Clone(), "reclaim": machine.NewCPUSet(3, 7)}
+			if disjoint {
+				planned, err := p.planDisjointAdvisorBlocksWithCheckpointTransitionAndDynamicConfig(resp, false, nil, dyn)
+				require.NoError(t, err)
+				require.Equal(t, 2, planned["reclaim"].Size())
+				require.Equal(t, 6, planned["dedicated"].Size())
+				require.True(t, planned["dedicated"].Intersection(planned["reclaim"]).IsEmpty())
+				blocks = planned
+			} else {
+				planned, err := p.generateLegacyBlockCPUSetWithDynamicConfig(resp, false, dyn)
+				require.NoError(t, err)
+				require.Equal(t, 2, planned["reclaim"].Size())
+				require.True(t, planned["dedicated"].Equals(all))
+				blocks = planned
+			}
+			// Exercise the real candidate builder and shared view, not a test-only
+			// carve helper. No hard-ramp-up gate authorizes this steady transfer.
+			pending, err := p.applyBlocksWithDynamicConfig(blocks, resp, false, false, dyn)
+			require.NoError(t, err)
+			reclaim := reclaimPoolCPUSet(pending.entries)
+			require.Equal(t, 2, reclaim.Size())
+			got := pending.entries["owner"]["main"]
+			require.Equal(t, float64(8), got.RequestQuantity)
+			if disjoint {
+				require.Equal(t, 6, got.AllocationResult.Size())
+				require.True(t, got.AllocationResult.Intersection(reclaim).IsEmpty())
+			} else {
+				require.True(t, got.AllocationResult.Equals(all))
+				require.True(t, reclaim.IsSubsetOf(got.AllocationResult))
+			}
+			snapshot := newCPUSetAdjustmentStateSnapshot(p.state)
+			snapshot.podEntries = pending.entries.Clone()
+			snapshot.allowOverlap, snapshot.disableDedicated = false, disjoint
+			view, _, err := bulkheadutils.BuildValidatedCPUSetPartitionView(snapshot, topology, bulkheadutils.CPUSetPartitionViewOptions{EnableReclaim: true})
+			require.NoError(t, err)
+			require.True(t, view.ReclaimEffective.Equals(reclaim), "physical view must preserve committed reclaim")
+			require.NoError(t, p.validateAdvisorPartitionBeforeCommitWithDynamicConfig(pending.entries, p.state.GetMachineState(), false, disjoint, dyn))
+			if disjoint {
+				require.NoError(t, p.commitPendingAdvisorState(pending))
+				repeated, err := p.planDisjointAdvisorBlocksWithCheckpointTransitionAndDynamicConfig(resp, false, nil, dyn)
+				require.NoError(t, err)
+				require.True(t, repeated["dedicated"].Equals(got.AllocationResult))
+				require.True(t, repeated["reclaim"].Equals(reclaim))
+				omitted := *resp
+				omitted.Entries = map[string]*advisorapi.CalculationEntries{"owner": resp.Entries["owner"]}
+				p.reclaim.reservedReclaimedCPUsSize = 2
+				frame, err := p.withRequiredReclaimFallback(&omitted, dyn)
+				require.NoError(t, err)
+				require.NotContains(t, omitted.Entries, commonstate.PoolNameReclaim)
+				fallbackBlocks, err := p.planDisjointAdvisorBlocksWithCheckpointTransitionAndDynamicConfig(frame, false, nil, dyn)
+				require.NoError(t, err)
+				fallbackPending, err := p.applyBlocksWithDynamicConfig(fallbackBlocks, frame, false, false, dyn)
+				require.NoError(t, err)
+				require.Equal(t, 2, reclaimPoolCPUSet(fallbackPending.entries).Size())
+				require.Equal(t, 6, fallbackPending.entries["owner"]["main"].AllocationResult.Size())
+			}
+		})
+	}
+}
+
+func TestAdvisorDedicatedReclaimMultiNUMAContract(t *testing.T) {
+	for _, disjoint := range []bool{false, true} {
+		for _, hard := range []bool{false, true} {
+			for _, global := range []bool{false, true} {
+				t.Run(fmt.Sprintf("disjoint=%t/hard=%t/global=%t", disjoint, hard, global), func(t *testing.T) {
+					topology, err := machine.GenerateDummyCPUTopology(32, 1, 2)
+					require.NoError(t, err)
+					p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+					require.NoError(t, err)
+					p.config.reservedCPUs = machine.NewCPUSet()
+					dyn := p.config.dynamicConfig.GetDynamicConfiguration()
+					dyn.EnableReclaim, dyn.EnableRampUpReclaimHardPartition = true, hard
+					entries := state.PodEntries{}
+					resp := &advisorapi.ListAndWatchResponse{DisableDedicatedCoresOverlapReclaimedCores: disjoint, Entries: map[string]*advisorapi.CalculationEntries{}}
+					for _, numa := range []int{0, 1} {
+						name := fmt.Sprintf("owner-%d", numa)
+						cpus := topology.CPUDetails.CPUsInNUMANodes(numa)
+						assignments, err := machine.GetNumaAwareAssignments(topology, cpus)
+						require.NoError(t, err)
+						main := &state.AllocationInfo{AllocationMeta: commonstate.AllocationMeta{
+							PodUid: name, ContainerName: "main", ContainerType: pluginapi.ContainerType_MAIN.String(),
+							OwnerPoolName: commonstate.PoolNameDedicated, QoSLevel: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+						}, RequestQuantity: float64(cpus.Size()), AllocationResult: cpus.Clone(), OriginalAllocationResult: cpus.Clone(),
+							TopologyAwareAssignments: assignments, OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(assignments)}
+						sidecar := main.Clone()
+						sidecar.ContainerName, sidecar.ContainerType = "sidecar", pluginapi.ContainerType_SIDECAR.String()
+						entries[name] = state.ContainerEntries{"main": main, "sidecar": sidecar}
+						resp.Entries[name] = &advisorapi.CalculationEntries{Entries: map[string]*advisorapi.CalculationInfo{"main": {
+							OwnerPoolName:             commonstate.PoolNameDedicated,
+							CalculationResultsByNumas: map[int64]*advisorapi.NumaCalculationResult{int64(numa): {Blocks: []*advisorapi.Block{{BlockId: name, Result: uint64(cpus.Size())}}}},
+						}}}
+						resp.Entries[name].Entries["sidecar"] = resp.Entries[name].Entries["main"]
+					}
+					results := map[int64]*advisorapi.NumaCalculationResult{}
+					if global {
+						results[commonstate.FakedNUMAID] = &advisorapi.NumaCalculationResult{Blocks: []*advisorapi.Block{{BlockId: "reclaim-global", Result: 4}}}
+					} else {
+						for _, numa := range []int{0, 1} {
+							results[int64(numa)] = &advisorapi.NumaCalculationResult{Blocks: []*advisorapi.Block{{BlockId: fmt.Sprintf("reclaim-%d", numa), Result: 2}}}
+						}
+					}
+					resp.Entries[commonstate.PoolNameReclaim] = &advisorapi.CalculationEntries{Entries: map[string]*advisorapi.CalculationInfo{commonstate.FakedContainerName: {OwnerPoolName: commonstate.PoolNameReclaim, CalculationResultsByNumas: results}}}
+					require.NoError(t, p.state.SetPodEntries(entries, false))
+					var blocks advisorapi.BlockCPUSet
+					if disjoint {
+						blocks, err = p.planDisjointAdvisorBlocksWithCheckpointTransitionAndDynamicConfig(resp, hard, nil, dyn)
+					} else {
+						blocks, err = p.generateLegacyBlockCPUSetWithDynamicConfig(resp, hard, dyn)
+					}
+					require.NoError(t, err)
+					require.NoError(t, p.validateHardPartitionBlockPlan(resp, blocks, hard))
+					pending, err := p.applyBlocksWithDynamicConfig(blocks, resp, false, hard, dyn)
+					require.NoError(t, err)
+					reclaim := reclaimPoolCPUSet(pending.entries)
+					require.Equal(t, 4, reclaim.Size())
+					for _, numa := range []int{0, 1} {
+						name := fmt.Sprintf("owner-%d", numa)
+						main, sidecar := pending.entries[name]["main"], pending.entries[name]["sidecar"]
+						require.Equal(t, float64(16), main.RequestQuantity)
+						require.True(t, main.AllocationResult.IsSubsetOf(topology.CPUDetails.CPUsInNUMANodes(numa)))
+						require.True(t, main.AllocationResult.Equals(sidecar.AllocationResult))
+						if disjoint {
+							require.Equal(t, 14, main.AllocationResult.Size())
+							require.True(t, main.AllocationResult.Intersection(reclaim).IsEmpty())
+						} else {
+							require.Equal(t, 16, main.AllocationResult.Size())
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestPoolAdjustmentPreservesDedicatedReclaimContract(t *testing.T) {
+	for _, initial := range []bool{false, true} {
+		for _, disjoint := range []bool{false, true} {
+			t.Run(fmt.Sprintf("initial=%t/disjoint=%t", initial, disjoint), func(t *testing.T) {
+				topology := mustDummyTopology(t, 8, 1, 1)
+				p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+				require.NoError(t, err)
+				p.config.reservedCPUs = machine.NewCPUSet()
+				dyn := p.config.dynamicConfig.GetDynamicConfiguration()
+				dyn.EnableReclaim, dyn.EnableRampUpReclaimHardPartition = true, false
+				p.reclaim.reservedReclaimedCPUsSize = 2
+				reclaim := machine.NewCPUSet(3, 7)
+				all := topology.CPUDetails.CPUs()
+				assignments, err := machine.GetNumaAwareAssignments(topology, all)
+				require.NoError(t, err)
+				main := &state.AllocationInfo{AllocationMeta: commonstate.AllocationMeta{
+					PodUid: "owner-adjust", ContainerName: "main", ContainerType: pluginapi.ContainerType_MAIN.String(),
+					OwnerPoolName: commonstate.PoolNameDedicated, QoSLevel: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+					Annotations: map[string]string{apiconsts.PodAnnotationMemoryEnhancementNumaBinding: "true", apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: "true"},
+				}, RequestQuantity: 8, AllocationResult: all.Clone(), OriginalAllocationResult: all.Clone(), TopologyAwareAssignments: assignments, OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(assignments)}
+				entries := state.PodEntries{"owner-adjust": {"main": main}, commonstate.PoolNameReclaim: {commonstate.FakedContainerName: {
+					AllocationMeta: commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim), AllocationResult: reclaim.Clone(), OriginalAllocationResult: reclaim.Clone(),
+				}}}
+				if initial {
+					delete(entries, commonstate.PoolNameReclaim)
+				}
+				require.NoError(t, p.state.SetPodEntries(entries, false))
+				require.NoError(t, p.state.SetDisableDedicatedCoresOverlapReclaimedCores(disjoint, false))
+				machineState, err := generateMachineStateFromPodEntries(topology, entries, p.state.GetMachineState())
+				require.NoError(t, err)
+				err = p.adjustPoolsAndIsolatedEntriesWithRampUpFloorForModeAtRevision(context.Background(), map[string]map[int]int{commonstate.PoolNameReclaim: {0: 2}}, nil, entries, machineState, false, machine.NewCPUSet(), false, p.state.GetRevision(), defaultShareMaterializationNormal, dyn)
+				require.NoError(t, err)
+				got := p.state.GetPodEntries()
+				require.Equal(t, float64(8), got["owner-adjust"]["main"].RequestQuantity)
+				require.Equal(t, 2, reclaimPoolCPUSet(got).Size())
+				if disjoint {
+					require.Equal(t, 6, got["owner-adjust"]["main"].AllocationResult.Size())
+					require.True(t, got["owner-adjust"]["main"].AllocationResult.Intersection(reclaimPoolCPUSet(got)).IsEmpty())
+				}
+			})
+		}
+	}
 }
 
 func TestSyncReclaimPoolWithAdjustmentCommitOverride(t *testing.T) {
@@ -343,7 +561,7 @@ func TestBuildAdjustmentCommitOverrideFromPodEntriesSkipsWhenResponseAllowsOverl
 	require.Nil(t, override)
 }
 
-func TestBuildAdjustmentCommitOverrideFromPodEntriesProtectsDedicatedWhenSharedOverlapAllowed(t *testing.T) {
+func TestBuildAdjustmentCommitOverrideFromPodEntriesRejectsPartialCoreAfterProtectingDedicated(t *testing.T) {
 	t.Parallel()
 
 	p, cleanup := newReclaimReuseTestPolicy(t)
@@ -378,10 +596,64 @@ func TestBuildAdjustmentCommitOverrideFromPodEntriesProtectsDedicatedWhenSharedO
 	}
 
 	override, err := p.buildAdjustmentCommitOverrideFromPodEntries(newEntries, true, true)
+	require.Nil(t, override)
+	require.ErrorContains(t, err, "has no complete physical core")
+}
+
+func TestBuildAdjustmentCommitOverrideFromPodEntriesPreservesOnlyAllowedDedicatedOverlap(t *testing.T) {
+	t.Parallel()
+
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	dynamicConf := p.config.dynamicConfig.GetDynamicConfiguration()
+	dynamicConf.EnableReclaim = true
+
+	newEntries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult:         machine.NewCPUSet(0, 1, 2, 3, 4),
+				OriginalAllocationResult: machine.NewCPUSet(0, 1, 2, 3, 4),
+			},
+		},
+		commonstate.PoolNameShare: {
+			commonstate.FakedContainerName: &state.AllocationInfo{
+				AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameShare),
+				AllocationResult:         machine.NewCPUSet(2, 3),
+				OriginalAllocationResult: machine.NewCPUSet(2, 3),
+			},
+		},
+		"pod-dedicated": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-dedicated",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNameDedicated,
+					QoSLevel:      "dedicated_cores",
+				},
+				AllocationResult: machine.NewCPUSet(0, 1),
+			},
+		},
+		"pod-isolation": {
+			"main": &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid:        "pod-isolation",
+					ContainerName: "main",
+					OwnerPoolName: commonstate.PoolNamePrefixIsolation + "-test",
+					QoSLevel:      "dedicated_cores",
+				},
+				AllocationResult: machine.NewCPUSet(4),
+			},
+		},
+	}
+
+	override, err := p.buildAdjustmentCommitOverrideFromPodEntriesWithDynamicConfig(
+		newEntries, false, false, dynamicConf)
 	require.NoError(t, err)
 	require.NotNil(t, override)
-	require.Empty(t, override.ReclaimEffective.ToSliceInt(),
-		"dedicated disjoint mode must drop every partial physical core from reclaim, got %s",
+	require.Equal(t, "advisor_pending_entries", override.Source)
+	require.True(t, override.ReclaimEffective.Equals(machine.NewCPUSet(0, 1)),
+		"dedicated-only overlap must retain plain dedicated CPUs and remove shared/isolation CPUs, got %s",
 		override.ReclaimEffective)
 }
 
@@ -416,10 +688,15 @@ func TestBuildAdjustmentCommitOverrideFromPodEntriesHandlesDirectContainerOverla
 	// overlap newly allocated non-reclaim containers. The commit override must
 	// use the same pending partition view to make reclaim consistent before
 	// pre-commit validation runs.
-	override, err := p.buildAdjustmentCommitOverrideFromPodEntries(newEntries, false, false)
+	dynamicConf := p.config.dynamicConfig.GetDynamicConfiguration()
+	dynamicConf.EnableReclaim = true
+	override, err := p.buildAdjustmentCommitOverrideFromPodEntriesWithDynamicConfig(
+		newEntries, false, false, dynamicConf)
 	require.NoError(t, err)
 	require.Equal(t, "advisor_pending_entries", override.Source)
-	require.True(t, override.ReclaimEffective.Equals(machine.NewCPUSet(2, 3)))
+	require.True(t, override.ReclaimEffective.Equals(machine.NewCPUSet(0, 1, 2, 3)),
+		"ordinary dedicated overlap plus structurally free reclaim must preserve the complete raw target, got %s",
+		override.ReclaimEffective)
 }
 
 func TestBuildAdjustmentCommitOverrideFromPodEntriesPreservesWholeCores(t *testing.T) {
@@ -458,7 +735,7 @@ func TestBuildAdjustmentCommitOverrideFromPodEntriesPreservesWholeCores(t *testi
 			"partial core must be removed from reclaim, got %s", override.ReclaimEffective)
 	})
 
-	t.Run("commits an empty reclaim override", func(t *testing.T) {
+	t.Run("rejects a partial-core reclaim override that would become empty", func(t *testing.T) {
 		t.Parallel()
 		newEntries := state.PodEntries{
 			commonstate.PoolNameReclaim: {
@@ -482,11 +759,10 @@ func TestBuildAdjustmentCommitOverrideFromPodEntriesPreservesWholeCores(t *testi
 		}
 
 		override, err := p.buildAdjustmentCommitOverrideFromPodEntries(newEntries, false, true)
-		require.NoError(t, err)
-		require.NotNil(t, override)
-		require.Empty(t, override.ReclaimEffective.ToSliceInt())
-		require.NoError(t, p.syncReclaimPoolWithAdjustmentCommitOverride(newEntries, override))
-		require.Empty(t, reclaimPoolCPUSet(newEntries).ToSliceInt())
+		require.Nil(t, override)
+		require.ErrorContains(t, err, "has no complete physical core")
+		require.True(t, reclaimPoolCPUSet(newEntries).Equals(machine.NewCPUSet(0, 48)),
+			"failed override must not mutate the candidate")
 	})
 }
 
@@ -788,7 +1064,7 @@ func TestReviseReclaimPoolFallbackReservedMissReusesCommittedOrSkipsEmpty(t *tes
 				newEntries,
 				machine.NewCPUSet(0),
 				machine.NewCPUSet(),
-				reclaimFallbackMode{allowSharedOverlap: false, disableDedicatedOverlap: false},
+				reclaimFallbackMode{enableReclaim: true, allowSharedOverlap: false, disableDedicatedOverlap: false},
 			)
 			require.NoError(t, err)
 
@@ -872,7 +1148,7 @@ func TestReviseReclaimPoolFailsClosedWhenActiveRNBHasNoFallback(t *testing.T) {
 		newEntries,
 		machine.NewCPUSet(0), // NUMA 0 is the non-reclaim-binding NUMA (skipped).
 		p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(1), // all NUMA-1 CPUs unavailable.
-		reclaimFallbackMode{allowSharedOverlap: false, disableDedicatedOverlap: false},
+		reclaimFallbackMode{enableReclaim: true, allowSharedOverlap: false, disableDedicatedOverlap: true},
 	)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "active reclaimed-numa-binding on NUMA 1")
@@ -954,7 +1230,7 @@ func TestReviseReclaimPoolFourNUMAActiveRNBOnOverlap(t *testing.T) {
 	newEntries["rnb-pod"]["main"].SetSpecifiedNUMABindingNUMAID([]uint64{3})
 
 	err = p.reviseReclaimPool(newEntries, machine.NewCPUSet(), machine.NewCPUSet(),
-		reclaimFallbackMode{allowSharedOverlap: true, disableDedicatedOverlap: false})
+		reclaimFallbackMode{enableReclaim: true, allowSharedOverlap: true, disableDedicatedOverlap: false})
 	require.NoError(t, err)
 
 	reclaimPool := newEntries[commonstate.PoolNameReclaim][commonstate.FakedContainerName]
@@ -1027,7 +1303,7 @@ func TestReviseReclaimPoolOverlapModeFlip(t *testing.T) {
 	// Overlap on: reserved NUMA-3 preference is reused directly.
 	on := newEntries()
 	require.NoError(t, p.reviseReclaimPool(on, machine.NewCPUSet(), machine.NewCPUSet(),
-		reclaimFallbackMode{allowSharedOverlap: true, disableDedicatedOverlap: false}))
+		reclaimFallbackMode{enableReclaim: true, allowSharedOverlap: true, disableDedicatedOverlap: false}))
 	require.True(t, on[commonstate.PoolNameReclaim][commonstate.FakedContainerName].
 		TopologyAwareAssignments[3].Equals(reserved[3]))
 
@@ -1035,7 +1311,7 @@ func TestReviseReclaimPoolOverlapModeFlip(t *testing.T) {
 	// core-aligned bucket (mode flip changes selection, not the contract).
 	off := newEntries()
 	require.NoError(t, p.reviseReclaimPool(off, machine.NewCPUSet(), machine.NewCPUSet(),
-		reclaimFallbackMode{allowSharedOverlap: false, disableDedicatedOverlap: false}))
+		reclaimFallbackMode{enableReclaim: true, allowSharedOverlap: false, disableDedicatedOverlap: false}))
 	numa3 := off[commonstate.PoolNameReclaim][commonstate.FakedContainerName].TopologyAwareAssignments[3]
 	require.False(t, numa3.IsEmpty())
 	require.Equal(t, reserved[3].Size(), numa3.Size())
@@ -1202,7 +1478,7 @@ func TestReviseReclaimPoolOverlapFallbackDropsForbiddenAndOffNUMa(t *testing.T) 
 	}
 
 	require.NoError(t, p.reviseReclaimPool(entries, machine.NewCPUSet(), machine.NewCPUSet(),
-		reclaimFallbackMode{allowSharedOverlap: true, disableDedicatedOverlap: false}))
+		reclaimFallbackMode{enableReclaim: true, allowSharedOverlap: true, disableDedicatedOverlap: false}))
 	bucket := entries[commonstate.PoolNameReclaim][commonstate.FakedContainerName].
 		TopologyAwareAssignments[0]
 	require.False(t, bucket.IsEmpty())

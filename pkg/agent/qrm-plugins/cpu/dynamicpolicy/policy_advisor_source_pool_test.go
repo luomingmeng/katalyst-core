@@ -71,9 +71,9 @@ func TestAdvisorDescriptorRequestQuantityUsesElasticActualFloor(t *testing.T) {
 		p.isRampUpReclaimHardPartitionEnabled() && p.state.GetDisableDedicatedCoresOverlapReclaimedCores()))
 
 	p.config.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = false
-	require.Equal(t, float64(6), advisorDescriptorRequestQuantityFromEntries(
+	require.Equal(t, float64(4), advisorDescriptorRequestQuantityFromEntries(
 		descriptor, p.state.GetPodEntries(),
-		p.isRampUpReclaimHardPartitionEnabled() && p.state.GetDisableDedicatedCoresOverlapReclaimedCores()))
+		p.isReclaimEnabled() && p.state.GetDisableDedicatedCoresOverlapReclaimedCores()))
 	p.config.dynamicConfig.GetDynamicConfiguration().EnableRampUpReclaimHardPartition = true
 
 	require.NoError(t, p.state.SetDisableDedicatedCoresOverlapReclaimedCores(false, false))
@@ -84,9 +84,14 @@ func TestAdvisorDescriptorRequestQuantityUsesElasticActualFloor(t *testing.T) {
 
 	allocation.RampUp = false
 	require.NoError(t, p.state.SetAllocationInfo("pod", "main", allocation, false))
-	require.Equal(t, float64(6), advisorDescriptorRequestQuantityFromEntries(
+	// Steady dedicated also consumes the frozen physical target; request is not
+	// restored as a solver floor after a legitimate reclaim transfer.
+	require.Equal(t, float64(4), advisorDescriptorRequestQuantityFromEntries(
 		descriptor, p.state.GetPodEntries(),
 		p.isRampUpReclaimHardPartitionEnabled() && p.state.GetDisableDedicatedCoresOverlapReclaimedCores()))
+	descriptor.Class = advisorBlockClassShared
+	require.Equal(t, float64(6), advisorDescriptorRequestQuantityFromEntries(descriptor, p.state.GetPodEntries(), true),
+		"an isolation/source component must not inherit dedicated transfer permission")
 }
 
 func mustDummyTopology(t *testing.T, cpus, sockets, numas int) *machine.CPUTopology {

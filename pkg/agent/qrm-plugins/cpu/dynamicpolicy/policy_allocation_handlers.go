@@ -845,7 +845,7 @@ func (p *DynamicPolicy) dedicatedCoresWithNUMABindingAllocationHandler(ctx conte
 	if p.state.GetRevision() != preCommitRevision {
 		return nil, fmt.Errorf("DNB admission source state changed while capturing overlap mode")
 	}
-	hardPartitionDisjoint := isRampUpReclaimHardPartitionEnabledWithConfig(dynamicConf) && sourceDisableDedicated
+	hardPartitionDisjoint := dynamicConf != nil && dynamicConf.EnableReclaim && sourceDisableDedicated
 	basePodEntries := sourcePodEntries.Clone()
 	baseMachineState := sourceMachineState.Clone()
 	oldAllocationInfo := sourcePodEntries[req.PodUid][req.ContainerName]
@@ -1468,7 +1468,7 @@ func (p *DynamicPolicy) allocateNumaBindingCPUsWithSnapshot(numCPUs int, hint *p
 	hintNodes := hint.Nodes
 	pkgName := rputil.GetResourcePackageName(reqAnnotations)
 	hardPartitionEnabled := isRampUpReclaimHardPartitionEnabledWithConfig(dynamicConf)
-	hardPartitionDisjoint := hardPartitionEnabled && disableDedicatedOverlap
+	hardPartitionDisjoint := dynamicConf != nil && dynamicConf.EnableReclaim && disableDedicatedOverlap
 	coverExclusivePartition := hardPartitionDisjoint && numaExclusive
 	var eligibility *numaBindingPartitionEligibilitySnapshot
 	dedicatedEligiblePerNUMA := make(map[int]machine.CPUSet)
@@ -1481,7 +1481,7 @@ func (p *DynamicPolicy) allocateNumaBindingCPUsWithSnapshot(numCPUs int, hint *p
 				eligibilityNUMAs = append(eligibilityNUMAs, uint64(numaID))
 			}
 		}
-		dedicatedEligiblePerNUMA, reclaimEligiblePerNUMA, err = p.numaBindingPartitionEligibility(machineState, pkgName, eligibilityNUMAs)
+		dedicatedEligiblePerNUMA, reclaimEligiblePerNUMA, err = p.numaBindingPartitionEligibility(machineState, pkgName, eligibilityNUMAs, dynamicConf)
 		if err != nil {
 			return machine.NewCPUSet(), machine.NewCPUSet(), nil, err
 		}
@@ -1541,8 +1541,8 @@ func (p *DynamicPolicy) allocateNumaBindingCPUsWithSnapshot(numCPUs int, hint *p
 	// read the same committed reclaim-pool generation. Reading reclaim from live
 	// state after this point would risk mixing state revisions within one plan.
 	var hardReclaimCPUs machine.CPUSet
-	if coverExclusivePartition && !podReclaimEnabled {
-		hardReclaimCPUs, err = p.deriveSteadyReclaimFloor(reclaimEligiblePerNUMA)
+	if coverExclusivePartition && (!podReclaimEnabled || !hardPartitionEnabled) {
+		hardReclaimCPUs, err = p.deriveSteadyReclaimFloorWithSnapshot(reclaimEligiblePerNUMA, committedEntries, dynamicConf)
 	} else {
 		// The entering NUMA-binding request contributes its own reclaim domain
 		// (the NUMA(s) it is placed on); the rest of the floor comes from the
@@ -1557,6 +1557,9 @@ func (p *DynamicPolicy) allocateNumaBindingCPUsWithSnapshot(numCPUs int, hint *p
 	}
 	if err != nil {
 		return machine.NewCPUSet(), machine.NewCPUSet(), nil, fmt.Errorf("derive node-level reclaim floor failed: %w", err)
+	}
+	if hardPartitionDisjoint && !hardPartitionEnabled {
+		hardReclaimCPUs = hardReclaimCPUs.Union(committedReclaimPoolCPUs(committedEntries).Intersection(alignedAvailableCPUs))
 	}
 	hardReclaimCPUs, err = p.selectNumaBindingReclaimPartitionWithPreference(
 		hardReclaimCPUs,
@@ -3676,6 +3679,11 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 		}
 	}
 
+	if reclaimMode.disableDedicatedOverlap {
+		if err := p.carveDedicatedReclaim(newPodEntries, reclaimPoolCPUSet(newPodEntries)); err != nil {
+			return err
+		}
+	}
 	_, _, err = p.commitPendingCPUPartition(pendingCPUPartition{
 		expectedRevision: stateRevision,
 		entries:          newPodEntries,
@@ -3685,11 +3693,6 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 		persist:          persistCheckpoint,
 		source:           "pool adjustment",
 		validate: func(entries state.PodEntries, ms state.NUMANodeMap, overlap, dedicated bool) error {
-			// Terminal non-empty reclaim check after all mutations; shared helper
-			// with preparePendingCPUPartition so the guard has one source of truth.
-			if err := validateRequiredReclaimPool(entries); err != nil {
-				return err
-			}
 			return p.validatePendingAdvisorPartitionViewWithRampUpExclusionWithDynamicConfig(entries, ms, overlap, dedicated, dynamicConf)
 		},
 		dynamicConfig:             dynamicConf,
@@ -3939,7 +3942,7 @@ func (p *DynamicPolicy) generatePoolsAndIsolation(
 	enableReclaim := dynamicConf != nil && dynamicConf.EnableReclaim
 	allowOverlap := p.state.GetAllowSharedCoresOverlapReclaimedCores()
 	disableDedicatedOverlap := p.state.GetDisableDedicatedCoresOverlapReclaimedCores()
-	strictDisjointReclaim := enableReclaim && !allowOverlap && disableDedicatedOverlap
+	strictDisjointReclaim := !allowOverlap && disableDedicatedOverlap
 	configuredReclaimMinimum := machine.NewCPUSet()
 
 	poolsCPUSet = make(map[string]machine.CPUSet)
@@ -4083,22 +4086,15 @@ func (p *DynamicPolicy) generatePoolsAndIsolation(
 		return
 	}
 
+	currentPodEntries := p.state.GetPodEntries()
 	if !enableReclaim {
-		// Reclaim disabled keeps the legacy downgrade behavior: use leftover CPUs as a
-		// temporary reclaim bucket, then apportion them back to non-binding pools.
-		poolsCPUSet[commonstate.PoolNameReclaim] = poolsCPUSet[commonstate.PoolNameReclaim].Union(availableCPUs)
-	}
-
-	general.Infof("poolsCPUSet before reclaim apportion/overlap: %+v", poolsCPUSet)
-
-	if !allowOverlap {
-		if !enableReclaim && poolsCPUSet[commonstate.PoolNameReclaim].Size() > p.reclaim.reservedReclaimedCPUsSize {
-			poolsCPUSet[commonstate.PoolNameReclaim] = p.apportionReclaimedPool(
-				poolsCPUSet, poolsCPUSet[commonstate.PoolNameReclaim].Clone(), nonBindingPoolsQuantityMap)
-			general.Infof("apportionReclaimedPool finished, current %s pool: %s",
-				commonstate.PoolNameReclaim, poolsCPUSet[commonstate.PoolNameReclaim].String())
+		// Freeze the last successful reclaim cpuset. Disabled mode stops service and
+		// expansion; it does not turn the pool into leftover capacity or apportion it
+		// back to business pools.
+		if committed, cErr := currentPodEntries.GetCPUSetForPool(commonstate.PoolNameReclaim); cErr == nil && !committed.IsEmpty() {
+			poolsCPUSet[commonstate.PoolNameReclaim] = committed.Clone()
 		}
-	} else {
+	} else if allowOverlap {
 		// p.state.GetAllowSharedCoresOverlapReclaimedCores() == true
 		poolsCPUSet[commonstate.PoolNameReclaim] = poolsCPUSet[commonstate.PoolNameReclaim].Union(availableCPUs)
 		if overlapErr := p.applyReclaimOverlapFromSharePools(poolsCPUSet, reclaimOverlapShareRatio); overlapErr != nil {
@@ -4107,10 +4103,8 @@ func (p *DynamicPolicy) generatePoolsAndIsolation(
 		}
 	}
 
-	general.Infof("poolsCPUSet after reclaim apportion/overlap: %+v", poolsCPUSet)
-
-	currentPodEntries := p.state.GetPodEntries()
-	if enableReclaim && !allowOverlap && poolsCPUSet[commonstate.PoolNameReclaim].IsEmpty() {
+	general.Infof("poolsCPUSet after reclaim preserve/overlap: %+v", poolsCPUSet)
+	if !allowOverlap && poolsCPUSet[commonstate.PoolNameReclaim].IsEmpty() {
 		if cset, cErr := currentPodEntries.GetCPUSetForPool(commonstate.PoolNameReclaim); cErr == nil && !cset.IsEmpty() {
 			allocatedNonReclaimCPUs := machine.NewCPUSet()
 			for poolName, poolCPUSet := range poolsCPUSet {
@@ -4193,12 +4187,9 @@ func (p *DynamicPolicy) generatePoolsAndIsolation(
 			disableDedicatedOverlap: disableDedicatedOverlap,
 		}
 		if want <= 0 {
-			// No explicit size requirement: use the bounded seed preference intersected
-			// with hard-eligible. Never unfiltered-clone reservedReclaimedCPUSet.
-			seed := p.reclaim.reservedReclaimedCPUSet.Clone().Intersection(eligible)
-			general.Infof("legacy bounded reclaim seed in generatePoolsAndIsolation: %s", seed.String())
-			poolsCPUSet[commonstate.PoolNameReclaim] = seed
-		} else {
+			want = p.machine.machineInfo.CPUTopology.CPUsPerCore()
+		}
+		{
 			reclaimFallback, fbErr := selectBoundedReclaimFallback(
 				p.machine.machineInfo.CPUTopology,
 				eligible,
@@ -5329,19 +5320,21 @@ func enteringNUMABindingRampUpDomains(annotations map[string]string, hintNodes [
 func (p *DynamicPolicy) deriveSteadyReclaimFloor(
 	reclaimEligiblePerNUMA map[int]machine.CPUSet,
 ) (machine.CPUSet, error) {
-	if !p.isRampUpReclaimHardPartitionEnabled() || p.machine.machineInfo == nil {
+	return p.deriveSteadyReclaimFloorWithSnapshot(reclaimEligiblePerNUMA,
+		p.state.GetPodEntries(), p.config.dynamicConfig.GetDynamicConfiguration())
+}
+
+func (p *DynamicPolicy) deriveSteadyReclaimFloorWithSnapshot(
+	reclaimEligiblePerNUMA map[int]machine.CPUSet,
+	entries state.PodEntries,
+	dynamicConf *dynamicconfig.Configuration,
+) (machine.CPUSet, error) {
+	if dynamicConf == nil || !dynamicConf.EnableReclaim || p.machine.machineInfo == nil {
 		return machine.NewCPUSet(), nil
 	}
 
-	var dynamicConf *dynamicconfig.Configuration
-	if p.config.dynamicConfig != nil {
-		dynamicConf = p.config.dynamicConfig.GetDynamicConfiguration()
-	}
 	targetByNUMA := machine.ResolvePerNUMAReservedForReclaim(dynamicConf, p.machine.machineInfo.CPUTopology)
-	currentReclaim := machine.NewCPUSet()
-	if reclaimInfo := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName); reclaimInfo != nil {
-		currentReclaim = reclaimInfo.AllocationResult
-	}
+	currentReclaim := committedReclaimPoolCPUs(entries)
 
 	floor := machine.NewCPUSet()
 	for _, numaID := range p.machine.machineInfo.CPUDetails.NUMANodes().ToSliceInt() {
@@ -5502,6 +5495,7 @@ func (p *DynamicPolicy) numaBindingPartitionEligibility(
 	machineState state.NUMANodeMap,
 	resourcePackageName string,
 	hintNodes []uint64,
+	dynamicConf *dynamicconfig.Configuration,
 ) (map[int]machine.CPUSet, map[int]machine.CPUSet, error) {
 	rpPinnedCPUSet := make(map[string]machine.CPUSet)
 	for _, numaState := range machineState {
@@ -5519,7 +5513,7 @@ func (p *DynamicPolicy) numaBindingPartitionEligibility(
 		allPinnedCPUs = allPinnedCPUs.Union(pinnedCPUs)
 	}
 
-	selectorText := p.config.dynamicConfig.GetDynamicConfiguration().DisableReclaimPinnedCPUSetResourcePackageSelector
+	selectorText := dynamicConf.DisableReclaimPinnedCPUSetResourcePackageSelector
 	disableReclaimSelector, err := general.ParseSelector(selectorText)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parse disable-reclaim resource package selector: %w", err)
@@ -5663,7 +5657,7 @@ func (p *DynamicPolicy) selectNumaBindingReclaimPartitionWithPreference(
 	coverExclusivePartition bool,
 	preference *numaBindingAllocationPreference,
 ) (machine.CPUSet, error) {
-	if !p.isRampUpReclaimHardPartitionEnabled() || !coverExclusivePartition {
+	if !coverExclusivePartition {
 		return derivedFloor, nil
 	}
 

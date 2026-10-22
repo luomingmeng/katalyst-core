@@ -278,8 +278,23 @@ func (p *CPUSetTopologyPlugin) ShouldReconcileWhenDisabled(
 	// the disabled reset DAG excludes the reclaim subtree and a reclaim-only
 	// reconcile aligns it to the desired view. cgroup v2 keeps the plugin inert
 	// unless explicitly opted in via EnableBulkheadCpusetTopologyOnCgroupV2.
+	// Reclaim-disabled mode keeps the committed logical reclaim pool in state, but
+	// does not require cpuset_topology to project that ownership to cgroup. In
+	// particular, an existing v1 NUMA bucket may still carry the reset/full-machine
+	// cpuset while its desired bucket is empty; entering reclaim-only convergence
+	// would then ask the v1 planner to empty a non-empty cpuset and keep post-commit
+	// pending forever. Leave the reclaim subtree as a disabled-reset boundary and
+	// perform no reclaim-only physical writes until reclaim is enabled again.
+	if reclaimDisabled(in) {
+		if p.lastShouldReconcile {
+			p.resetComplete = false
+		}
+		p.lastShouldReconcile = false
+		return false
+	}
+
 	var curr bool
-	if !p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled ||
+	if (!p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled && !dedicatedOverlapRequired(in)) ||
 		enableBulkheadCpusetTopology(in) {
 		curr = false
 	} else {
@@ -1309,6 +1324,17 @@ func (p *CPUSetTopologyPlugin) ReconcileDisabled(
 	if !p.ShouldReconcileWhenDisabled(ctx, in) || in.DesiredView == nil {
 		return bulkheadapi.TopologyOutcome{Level: bulkheadapi.ConvergenceLevelNone}, nil
 	}
+	if dedicatedOverlapRequired(in) {
+		// Exit exclusive scheduler domains before growing an overlapping cpuset.
+		// Reuse the same flag writer as periodic reconciliation, rather than
+		// waiting for a later tick after the overlapping target has been applied.
+		enabled := false
+		if err := p.PeriodicalHandler(ctx, bulkheadapi.PeriodicalHandlerContext{
+			DynamicConf: in.DynamicConf, EffectiveEnabled: &enabled,
+		}); err != nil {
+			return bulkheadapi.TopologyOutcome{}, err
+		}
+	}
 	budget := topology.NewAdjustmentBudget(
 		ctx, topologyBudgetFromConfig(p.cfg.TopologyConvergenceBudget))
 	var finalAttempt topology.DAGApplyResult
@@ -1386,6 +1412,30 @@ func (p *CPUSetTopologyPlugin) reconcileDisabledOnce(
 	adjustmentBudget *topology.AdjustmentBudget,
 ) (topology.DAGApplyResult, topology.ConvergenceResult, error) {
 	configured := p.configuredReclaimRels(in.DesiredView, in.Topology)
+	if dedicatedOverlapRequired(in) {
+		// Create only positive targets. A missing bucket with no assigned CPUs
+		// must stay absent, rather than introducing an empty v1 cgroup target.
+		for index, root := range p.cfg.BulkheadReclaimRelPaths {
+			if root == "" {
+				continue
+			}
+			if err := p.cgroup.EnsureDir(ctx, root); err != nil {
+				return topology.DAGApplyResult{}, topology.ConvergenceResult{}, fmt.Errorf("ensure overlapping reclaim rel %q: %w", root, err)
+			}
+			for numa, cpus := range in.DesiredView.ReclaimEffectivePerNUMA {
+				if cpus.IsEmpty() {
+					continue
+				}
+				rel := p.cfg.ReclaimPerNUMA(index, numa)
+				if rel == "" {
+					continue
+				}
+				if err := p.cgroup.EnsureDir(ctx, rel); err != nil {
+					return topology.DAGApplyResult{}, topology.ConvergenceResult{}, fmt.Errorf("ensure overlapping reclaim rel %q: %w", rel, err)
+				}
+			}
+		}
+	}
 	observed, err := topology.ObserveConfiguredRels(ctx, p.cgroup, configured)
 	if err != nil {
 		return topology.DAGApplyResult{}, topology.ConvergenceResult{}, fmt.Errorf("classify reclaim-only rels: %w", err)
@@ -1395,6 +1445,9 @@ func (p *CPUSetTopologyPlugin) reconcileDisabledOnce(
 		return topology.DAGApplyResult{}, topology.ConvergenceResult{}, err
 	}
 	if len(specs) == 0 {
+		if dedicatedOverlapRequired(in) {
+			return topology.DAGApplyResult{}, topology.ConvergenceResult{}, fmt.Errorf("overlapping reclaim target has no managed roots")
+		}
 		current, err := topology.ObserveConfiguredRels(ctx, p.cgroup, configured)
 		if err != nil {
 			return topology.DAGApplyResult{}, topology.ConvergenceResult{}, fmt.Errorf("recheck absent reclaim-only rels: %w", err)
@@ -1625,7 +1678,7 @@ func (p *CPUSetTopologyPlugin) buildReclaimOnlySpecs(
 	// running (checkpoint-pinned) reclaim buckets toward a same-cycle Desired
 	// expansion. Pin each reclaim NUMA bucket to its current cgroup cpuset and
 	// derive the reclaim root envelope from the pinned buckets.
-	if p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled {
+	if p.cfg.PreserveReclaimCPUSetWhenTopologyDisabled && !dedicatedOverlapRequired(in) {
 		if err := p.pinReclaimSpecsToRunning(ctx, specs, cpuDetails); err != nil {
 			return nil, nil, err
 		}
@@ -1895,7 +1948,7 @@ func (p *CPUSetTopologyPlugin) buildDisabledResetDAG(
 		}
 		general.InfofV(2, "bulkhead: topology node specs (disabled-reset) %v", relRoles)
 	}
-	if p.ShouldReconcileWhenDisabled(ctx, in) {
+	if p.ShouldReconcileWhenDisabled(ctx, in) || reclaimDisabled(in) {
 		reclaimRoots := normalizedReclaimRoots(p.cfg.BulkheadReclaimRelPaths)
 		filtered := specs[:0]
 		for _, spec := range specs {
@@ -2021,7 +2074,9 @@ func (p *CPUSetTopologyPlugin) resetCPUSetTopology(
 	}
 
 	var traversalBoundaries map[string]struct{}
-	if p.ShouldReconcileWhenDisabled(ctx, in) {
+	if reclaimDisabled(in) {
+		traversalBoundaries = reclaimResetBoundariesForced(p.cfg, in.DesiredView, true)
+	} else if p.ShouldReconcileWhenDisabled(ctx, in) {
 		traversalBoundaries = reclaimResetBoundaries(p.cfg, in.DesiredView)
 	}
 	res, err := (topology.TopologyCoordinator{}).Converge(ctx, topology.CoordinatorInput{
@@ -2074,7 +2129,15 @@ func reclaimResetBoundaries(
 	cfg bulkheadconfig.BulkheadConfiguration,
 	desired *model.DesiredView,
 ) map[string]struct{} {
-	if !cfg.PreserveReclaimCPUSetWhenTopologyDisabled {
+	return reclaimResetBoundariesForced(cfg, desired, false)
+}
+
+func reclaimResetBoundariesForced(
+	cfg bulkheadconfig.BulkheadConfiguration,
+	desired *model.DesiredView,
+	force bool,
+) map[string]struct{} {
+	if !force && !cfg.PreserveReclaimCPUSetWhenTopologyDisabled && (desired == nil || desired.ReclaimOverlap.IsEmpty()) {
 		return nil
 	}
 	out := make(map[string]struct{})
@@ -3771,7 +3834,20 @@ func desiredCPUSetPartitionView(view *model.DesiredView) *model.CPUSetPartitionV
 	return &view.CPUSetPartitionView
 }
 
+func dedicatedOverlapRequired(in bulkheadapi.HandlerContext) bool {
+	return in.DesiredView != nil && !in.DesiredView.ReclaimOverlap.IsEmpty()
+}
+
+func reclaimDisabled(in bulkheadapi.HandlerContext) bool {
+	return in.DynamicConf != nil && !in.DynamicConf.EnableReclaim
+}
+
 func enableBulkheadCpusetTopology(in bulkheadapi.HandlerContext) bool {
+	// Sibling exclusive partitions cannot represent intentional overlap. Keep
+	// dedicated leaves untouched and use the existing reclaim-only coordinator.
+	if dedicatedOverlapRequired(in) {
+		return false
+	}
 	if in.State != nil && in.State.GetAllowSharedCoresOverlapReclaimedCores() {
 		return false
 	}
