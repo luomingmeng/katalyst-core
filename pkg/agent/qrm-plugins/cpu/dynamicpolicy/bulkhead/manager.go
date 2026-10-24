@@ -47,6 +47,11 @@ import (
 
 type Manager struct {
 	mu                            cancelableMutex
+	periodicalMu                  sync.Mutex
+	periodicalCancels             map[uint64]context.CancelFunc
+	periodicalPreempted           map[uint64]struct{}
+	periodicalGeneration          uint64
+	admissionWaiters              int
 	latestAppliedReclaimMu        sync.RWMutex
 	plugins                       []bulkheadapi.Plugin
 	defaultNonReclaimPoolMinSize  int64
@@ -423,6 +428,10 @@ func (m *Manager) HasPendingDisabledReset(dyn *dynamicconfig.Configuration) bool
 // defer stay here so their ordering and late binding match the original.
 func (m *Manager) Apply(ctx context.Context, in cpusetutil.CPUSetAdjustmentHandlerCtx) (out machine.CPUSet, err error) {
 	start := time.Now()
+	if in.Mode.OrFullDefault() == cpusetutil.CPUSetAdjustmentModeAdmission {
+		m.beginAdmission()
+		defer m.endAdmission()
+	}
 	var topologyAppliedLog bool
 	var topologyPublishedLog bool
 	var anyAdjustedLog bool
@@ -1074,8 +1083,15 @@ func (m *Manager) RunPeriodicalHandlers(
 	metaServer *metaserver.MetaServer,
 ) {
 	ctx, cancel := context.WithTimeout(context.Background(), managerHandlerTimeout(coreConf))
-	defer cancel()
+	generation := m.registerPeriodicalCancel(cancel)
+	defer func() {
+		m.clearPeriodicalCancel(generation)
+		cancel()
+	}()
 	if err := m.mu.Lock(ctx); err != nil {
+		if errors.Is(err, context.Canceled) && m.periodicalWasPreempted(generation) {
+			return
+		}
 		_ = general.UpdateHealthzStateByError(cpuconsts.SyncBulkhead, err)
 		general.ErrorS(err, "bulkhead periodical handlers failed to acquire manager lock")
 		return
@@ -1138,6 +1154,9 @@ func (m *Manager) RunPeriodicalHandlers(
 			general.InfofV(2, "bulkhead periodical slow plugin=%s elapsed=%s", p.Name(), handlerElapsed)
 		}
 		if pluginErr != nil {
+			if errors.Is(pluginErr, context.Canceled) && m.periodicalWasPreempted(generation) {
+				continue
+			}
 			wrapped := fmt.Errorf("bulkhead plugin %q periodical failed: %w", p.Name(), pluginErr)
 			general.ErrorS(wrapped, "bulkhead periodical handler failed")
 			emitBulkheadPluginResult(emitter, "periodical", p.Name(), "failed", pluginErr.Error())
@@ -1147,6 +1166,58 @@ func (m *Manager) RunPeriodicalHandlers(
 		emitBulkheadPluginResult(emitter, "periodical", p.Name(), "success", "")
 	}
 	err = apierrors.NewAggregate(errs)
+}
+
+func (m *Manager) registerPeriodicalCancel(cancel context.CancelFunc) uint64 {
+	m.periodicalMu.Lock()
+	defer m.periodicalMu.Unlock()
+	m.periodicalGeneration++
+	if m.periodicalCancels == nil {
+		m.periodicalCancels = make(map[uint64]context.CancelFunc)
+	}
+	if m.periodicalPreempted == nil {
+		m.periodicalPreempted = make(map[uint64]struct{})
+	}
+	m.periodicalCancels[m.periodicalGeneration] = cancel
+	if m.admissionWaiters > 0 {
+		m.periodicalPreempted[m.periodicalGeneration] = struct{}{}
+		cancel()
+	}
+	return m.periodicalGeneration
+}
+
+func (m *Manager) clearPeriodicalCancel(generation uint64) {
+	m.periodicalMu.Lock()
+	defer m.periodicalMu.Unlock()
+	delete(m.periodicalCancels, generation)
+	delete(m.periodicalPreempted, generation)
+}
+
+func (m *Manager) periodicalWasPreempted(generation uint64) bool {
+	m.periodicalMu.Lock()
+	defer m.periodicalMu.Unlock()
+	_, ok := m.periodicalPreempted[generation]
+	return ok
+}
+
+func (m *Manager) beginAdmission() {
+	m.periodicalMu.Lock()
+	m.admissionWaiters++
+	cancels := make([]context.CancelFunc, 0, len(m.periodicalCancels))
+	for generation, cancel := range m.periodicalCancels {
+		m.periodicalPreempted[generation] = struct{}{}
+		cancels = append(cancels, cancel)
+	}
+	m.periodicalMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+func (m *Manager) endAdmission() {
+	m.periodicalMu.Lock()
+	defer m.periodicalMu.Unlock()
+	m.admissionWaiters--
 }
 
 func managerHandlerTimeout(coreConf *config.Configuration) time.Duration {

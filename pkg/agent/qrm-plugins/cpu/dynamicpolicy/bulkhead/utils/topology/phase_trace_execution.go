@@ -1482,6 +1482,12 @@ func (w safeCPUSetWriter) failFrozenTrace(
 		(stack == nil || len(stack.writes) == 0)
 	if stale && noPhysicalWrites {
 		res.ReplanDisposition = ReplanSafeNoPhysicalWrites
+		var initialDrift *frozenInitialSnapshotDriftError
+		if errors.As(executionErr, &initialDrift) && initialDrift.current != nil {
+			res.FinalSnapshot = CloneCompleteSnapshot(initialDrift.current)
+			res.FinalSnapshotCurrent = true
+			res.ReplanDisposition = ReplanSafeFromVerifiedFinalState
+		}
 	}
 
 	rollbackWrites := 0
@@ -1522,6 +1528,12 @@ func authorizePreWriteStaleReplan(res *ConvergenceResult, err error) {
 	res.ReplanDisposition = ReplanNotAllowed
 	if !res.hasPhysicalWriteEvidence() && phaseTraceStale(err) {
 		res.ReplanDisposition = ReplanSafeNoPhysicalWrites
+		var initialDrift *frozenInitialSnapshotDriftError
+		if errors.As(err, &initialDrift) && initialDrift.current != nil {
+			res.FinalSnapshot = CloneCompleteSnapshot(initialDrift.current)
+			res.FinalSnapshotCurrent = true
+			res.ReplanDisposition = ReplanSafeFromVerifiedFinalState
+		}
 	}
 }
 

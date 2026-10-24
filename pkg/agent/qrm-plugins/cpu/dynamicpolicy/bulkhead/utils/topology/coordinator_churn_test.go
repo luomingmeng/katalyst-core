@@ -198,8 +198,10 @@ func TestParentSafeAdmissionAbsorbsOneDynamicHolderChurn(t *testing.T) {
 	// drift, which is not absorbed.
 	require.Len(t, res.Rounds, 2, "initial drift round + one absorbed retry round")
 	require.Zero(t, res.Applied, "churn absorption must not perform physical writes")
-	require.Equal(t, ReplanSafeNoPhysicalWrites, res.ReplanDisposition,
-		"zero-write absorption must classify the surfaced stale replan-safe")
+	require.Equal(t, ReplanSafeFromVerifiedFinalState, res.ReplanDisposition,
+		"zero-write frozen drift must surface its fresh complete snapshot for caller replan")
+	require.True(t, res.FinalSnapshotCurrent)
+	require.NotNil(t, res.FinalSnapshot)
 	require.Equal(t, RoundStatusBlocked, outcome.Status)
 
 	// Zero physical writes were recorded against the budget: both reservations
