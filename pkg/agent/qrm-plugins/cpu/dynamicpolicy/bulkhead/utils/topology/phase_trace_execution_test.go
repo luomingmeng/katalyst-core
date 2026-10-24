@@ -2941,6 +2941,43 @@ func makeFrozenTraceHolderRetirable(t *testing.T, trace *CompiledPhaseTrace, hol
 	trace.TraceID = ""
 }
 
+func TestAuthorizePreWriteStaleReplanReusesFreshInitialDriftSnapshot(t *testing.T) {
+	t.Parallel()
+	fresh := &CompleteSnapshot{
+		Entries:  map[string]EntryState{},
+		Children: map[string][]ChildRef{},
+	}
+	stale := &PlanStaleError{Err: ErrCoordinatorPlanStale}
+	drift := &frozenInitialSnapshotDriftError{current: fresh, stale: stale}
+
+	res := &ConvergenceResult{}
+	authorizePreWriteStaleReplan(res, drift)
+	if res.ReplanDisposition != ReplanSafeFromVerifiedFinalState {
+		t.Fatalf("replan disposition = %v, want verified final state", res.ReplanDisposition)
+	}
+	if !res.FinalSnapshotCurrent || res.FinalSnapshot == nil {
+		t.Fatalf("fresh drift snapshot was not propagated: current=%t snapshot=%v", res.FinalSnapshotCurrent, res.FinalSnapshot)
+	}
+	if res.FinalSnapshot == fresh {
+		t.Fatal("fresh drift snapshot must be cloned before reuse")
+	}
+
+	res = &ConvergenceResult{}
+	authorizePreWriteStaleReplan(res, stale)
+	if res.ReplanDisposition != ReplanSafeNoPhysicalWrites || res.FinalSnapshot != nil || res.FinalSnapshotCurrent {
+		t.Fatalf("ordinary stale replan changed: disposition=%v current=%t snapshot=%v",
+			res.ReplanDisposition, res.FinalSnapshotCurrent, res.FinalSnapshot)
+	}
+
+	res = &ConvergenceResult{}
+	res.recordForwardWriteAttempt()
+	authorizePreWriteStaleReplan(res, drift)
+	if res.ReplanDisposition != ReplanNotAllowed || res.FinalSnapshot != nil || res.FinalSnapshotCurrent {
+		t.Fatalf("write-bearing drift reused snapshot: disposition=%v current=%t snapshot=%v",
+			res.ReplanDisposition, res.FinalSnapshotCurrent, res.FinalSnapshot)
+	}
+}
+
 type expectedTraceWrite struct {
 	phase    PhaseKind
 	resource HierarchyOperation

@@ -92,6 +92,7 @@ type fakePlugin struct {
 	adjustStarted          chan struct{}
 	adjustRelease          chan struct{}
 	periodicWaitForContext bool
+	periodicStarted        chan struct{}
 	periodicContextErr     error
 	disabledDeadlines      []time.Time
 }
@@ -1360,6 +1361,9 @@ func (p *fakePlugin) PeriodicalHandler(
 		p.periodicStates = append(p.periodicStates, *in.EffectiveEnabled)
 	}
 	if p.periodicWaitForContext {
+		if p.periodicStarted != nil {
+			close(p.periodicStarted)
+		}
 		<-ctx.Done()
 		p.periodicContextErr = ctx.Err()
 		return ctx.Err()
@@ -1679,6 +1683,46 @@ func TestManagerApplyLockWaitIsCancelable(t *testing.T) {
 	close(blocking.adjustRelease)
 	if err := <-firstDone; err != nil {
 		t.Fatalf("first Apply: %v", err)
+	}
+}
+
+func TestManagerAdmissionPreemptsPeriodicalHandler(t *testing.T) {
+	t.Parallel()
+	periodicStarted := make(chan struct{})
+	plugin := &fakePlugin{
+		name:                   "periodical",
+		periodicWaitForContext: true,
+		periodicStarted:        periodicStarted,
+	}
+	m := &Manager{plugins: []bulkheadapi.Plugin{plugin}}
+	coreConf := config.NewConfiguration()
+	coreConf.CPUQRMPluginConfig.BulkheadConfiguration.TopologyConvergenceBudget.DeadlineDuration = time.Minute
+
+	periodicalDone := make(chan struct{})
+	go func() {
+		m.RunPeriodicalHandlers(coreConf, nil, enabledDynamicAgentConf(), nil, nil)
+		close(periodicalDone)
+	}()
+	select {
+	case <-periodicStarted:
+	case <-time.After(time.Second):
+		t.Fatal("periodical handler did not start")
+	}
+
+	in := enabledCPUSetAdjustmentCtx()
+	in.Mode = cpusetutil.CPUSetAdjustmentModeAdmission
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := m.Apply(ctx, in); err != nil {
+		t.Fatalf("admission Apply() after periodical preemption: %v", err)
+	}
+	select {
+	case <-periodicalDone:
+	case <-time.After(time.Second):
+		t.Fatal("periodical handler did not stop after admission preemption")
+	}
+	if !errors.Is(plugin.periodicContextErr, context.Canceled) {
+		t.Fatalf("periodical context error = %v, want context canceled", plugin.periodicContextErr)
 	}
 }
 
