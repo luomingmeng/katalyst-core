@@ -50,3 +50,4 @@ Session.vim
 
 # Test coverage profile file
 coverage.txt
+artifacts/
