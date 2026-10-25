@@ -2278,43 +2278,11 @@ func deriveDefaultReclaimPreference(
 	reservedCPUs machine.CPUSet,
 	configuredReclaimSize int,
 ) (machine.CPUSet, int, map[int]machine.CPUSet, error) {
-	// for reclaimed pool, we must make them exist when the node isn't in hybrid mode even if cause overlap
 	allAvailableCPUs := cpuDetails.CPUs().Difference(reservedCPUs)
-	numaIDs := cpuDetails.NUMANodes().ToSliceInt()
-	cpusPerCore := cpuTopology.CPUsPerCore()
-	capacityByNUMA := make(map[int]int, len(numaIDs))
-	for _, numaID := range numaIDs {
-		candidates := allAvailableCPUs.Intersection(cpuDetails.CPUsInNUMANodes(numaID))
-		capacityByNUMA[numaID] = takeCoreAlignedCPUSet(
-			cpuTopology, candidates, machine.NewCPUSet(), candidates.Size(),
-		).Size()
-	}
-	reclaimTargets, err := machine.DistributeConfiguredHardReclaimFloor(
-		capacityByNUMA, nil, configuredReclaimSize, cpusPerCore)
+	defaultReservedReclaimedCPUSet, err := selectReclaimSeed(
+		cpuTopology, allAvailableCPUs, machine.NewCPUSet(), configuredReclaimSize)
 	if err != nil {
-		return machine.NewCPUSet(), 0, nil, fmt.Errorf("distribute core-aligned reserved reclaim cpus: %w", err)
-	}
-	availableNUMAIDs := make([]int, 0, len(numaIDs))
-	for _, numaID := range numaIDs {
-		if reclaimTargets[numaID] > 0 {
-			availableNUMAIDs = append(availableNUMAIDs, numaID)
-		}
-	}
-	defaultReservedReclaimedCPUSet := machine.NewCPUSet()
-	for _, numaID := range availableNUMAIDs {
-		target := reclaimTargets[numaID]
-		numaCPUs := cpuDetails.CPUsInNUMANodes(numaID)
-		selected := takeCoreAlignedCPUSet(
-			cpuTopology,
-			allAvailableCPUs.Intersection(numaCPUs),
-			numaCPUs,
-			target,
-		)
-		if selected.Size() != target {
-			return machine.NewCPUSet(), 0, nil, fmt.Errorf("select core-aligned reserved reclaim cpus in NUMA %d: got %d, want %d",
-				numaID, selected.Size(), target)
-		}
-		defaultReservedReclaimedCPUSet = defaultReservedReclaimedCPUSet.Union(selected)
+		return machine.NewCPUSet(), 0, nil, fmt.Errorf("select complete-core reclaim seed: %w", err)
 	}
 	defaultReservedTopologyAwareAssignments, err := machine.GetNumaAwareAssignments(cpuTopology, defaultReservedReclaimedCPUSet)
 	if err != nil {
@@ -2346,83 +2314,114 @@ func (p *DynamicPolicy) installDerivedReclaimPreference() error {
 	return nil
 }
 
-// ensureInitialReclaimPool preserves an existing valid reclaim pool entry and,
-// when none exists yet, materializes a seed reclaim bucket from the derived
-// preference. It never replaces an existing entry with the seed.
+// ensureInitialReclaimPool is the bootstrap boundary for a missing/empty pool.
+// A non-empty committed identity is never resized here. Select and rebuild before
+// the single revision CAS so failures cannot publish a partial checkpoint.
 func (p *DynamicPolicy) ensureInitialReclaimPool() error {
-	reclaimedAllocationInfo := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
-	if reclaimedAllocationInfo == nil {
-		podEntries := p.state.GetPodEntries()
-		noneResidentCPUs := podEntries.GetFilteredPoolsCPUSet(state.ResidentPools)
-
-		machineState := p.state.GetMachineState()
-		availableCPUs := machineState.GetFilteredAvailableCPUSet(p.config.reservedCPUs,
-			func(ai *state.AllocationInfo) bool {
-				return ai.CheckDedicated() || ai.CheckSharedNUMABinding()
-			},
-			state.WrapAllocationMetaFilter((*commonstate.AllocationMeta).CheckDedicatedNUMABinding)).Difference(noneResidentCPUs)
-
-		reclaimedCPUSet := machine.NewCPUSet()
-		// Iterate NUMA IDs in ascending order to preserve the original
-		// takeCoreAlignedCPUSet priority: Go map iteration order is random and
-		// would non-deterministically change which NUMA absorbs global shortage
-		// fallback.
-		sortedNUMAIDs := make([]int, 0, len(p.reclaim.reservedReclaimedTopologyAwareAssignments))
-		for numaID := range p.reclaim.reservedReclaimedTopologyAwareAssignments {
-			sortedNUMAIDs = append(sortedNUMAIDs, numaID)
-		}
-		sort.Ints(sortedNUMAIDs)
-		for _, numaID := range sortedNUMAIDs {
-			assignment := p.reclaim.reservedReclaimedTopologyAwareAssignments[numaID]
-			target := assignment.Size()
-			candidates := availableCPUs.Intersection(p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(numaID))
-			selected := takeCoreAlignedCPUSet(
-				p.machine.machineInfo.CPUTopology,
-				candidates,
-				assignment,
-				target,
-			)
-			reclaimedCPUSet = reclaimedCPUSet.Union(selected)
-		}
-
-		if shortfall := p.reclaim.reservedReclaimedCPUsSize - reclaimedCPUSet.Size(); shortfall > 0 {
-			selected := takeCoreAlignedCPUSet(
-				p.machine.machineInfo.CPUTopology,
-				availableCPUs.Difference(reclaimedCPUSet),
-				p.reclaim.reservedReclaimedCPUSet.Difference(reclaimedCPUSet),
-				shortfall,
-			)
-			reclaimedCPUSet = reclaimedCPUSet.Union(selected)
-		}
-
-		if reclaimedCPUSet.Size() != p.reclaim.reservedReclaimedCPUsSize {
-			return fmt.Errorf("select core-aligned reclaim cpus: got %d, want %d",
-				reclaimedCPUSet.Size(), p.reclaim.reservedReclaimedCPUsSize)
-		}
-
-		general.Infof("initReclaimPool %s: %s", commonstate.PoolNameReclaim, reclaimedCPUSet.String())
-		topologyAwareAssignments, err := machine.GetNumaAwareAssignments(p.machine.machineInfo.CPUTopology, reclaimedCPUSet)
+	podEntries, machineState, revision := p.state.GetAdvisorStateSnapshot()
+	if entry := podEntries[commonstate.PoolNameReclaim][commonstate.FakedContainerName]; entry != nil && !entry.AllocationResult.IsEmpty() {
+		return nil
+	}
+	// Scalars are authoritative, as in canonical precommit. Normalize before
+	// eligibility so stale buckets cannot later change the selected partition.
+	if err := p.normalizePendingCPUPartition(podEntries); err != nil {
+		return fmt.Errorf("normalize initial reclaim baseline: %w", err)
+	}
+	machineState, err := generateMachineStateFromPodEntries(p.machine.machineInfo.CPUTopology, podEntries, machineState)
+	if err != nil {
+		return fmt.Errorf("rebuild initial reclaim baseline: %w", err)
+	}
+	ownership, err := buildReclaimOwnershipView(podEntries, p.machine.machineInfo.CPUTopology)
+	if err != nil {
+		return fmt.Errorf("derive initial reclaim ownership: %w", err)
+	}
+	availableCPUs := machineState.GetFilteredAvailableCPUSet(p.config.reservedCPUs,
+		func(ai *state.AllocationInfo) bool {
+			return ai.CheckDedicated() || ai.CheckSharedNUMABinding()
+		},
+		state.WrapAllocationMetaFilter((*commonstate.AllocationMeta).CheckDedicatedNUMABinding)).
+		Difference(podEntries.GetFilteredPoolsCPUSet(state.ResidentPools))
+	// Required owner buckets take precedence over the optional seed preference.
+	// Only bootstrap needs this constraint; the general seed selector stays pure.
+	reclaimedCPUSet := machine.NewCPUSet()
+	requiredNUMAs := make([]int, 0, len(ownership.activeRNBTargetNUMAs))
+	for numaID := range ownership.activeRNBTargetNUMAs {
+		requiredNUMAs = append(requiredNUMAs, numaID)
+	}
+	sort.Ints(requiredNUMAs)
+	for _, numaID := range requiredNUMAs {
+		eligible := availableCPUs.Intersection(p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(numaID))
+		core, err := selectReclaimSeed(p.machine.machineInfo.CPUTopology, eligible, p.reclaim.reservedReclaimedCPUSet, 0)
 		if err != nil {
-			return fmt.Errorf("unable to calculate topologyAwareAssignments for pool: %s, "+
-				"result cpuset: %s, error: %v", commonstate.PoolNameReclaim, reclaimedCPUSet.String(), err)
+			return fmt.Errorf("seed required reclaim NUMA %d: %w", numaID, err)
 		}
-
-		curPoolAllocationInfo := &state.AllocationInfo{
+		reclaimedCPUSet = reclaimedCPUSet.Union(core)
+	}
+	if shortfall := p.reclaim.reservedReclaimedCPUsSize - reclaimedCPUSet.Size(); shortfall > 0 || reclaimedCPUSet.IsEmpty() {
+		supplement, err := selectReclaimSeed(p.machine.machineInfo.CPUTopology,
+			availableCPUs.Difference(reclaimedCPUSet), p.reclaim.reservedReclaimedCPUSet, shortfall)
+		if err != nil {
+			return fmt.Errorf("select initial reclaim pool: %w", err)
+		}
+		reclaimedCPUSet = reclaimedCPUSet.Union(supplement)
+	}
+	assignments, err := machine.GetNumaAwareAssignments(p.machine.machineInfo.CPUTopology, reclaimedCPUSet)
+	if err != nil {
+		return fmt.Errorf("calculate initial reclaim assignments: %w", err)
+	}
+	if podEntries == nil {
+		podEntries = make(state.PodEntries)
+	}
+	podEntries[commonstate.PoolNameReclaim] = state.ContainerEntries{
+		commonstate.FakedContainerName: &state.AllocationInfo{
 			AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
 			AllocationResult:                 reclaimedCPUSet.Clone(),
 			OriginalAllocationResult:         reclaimedCPUSet.Clone(),
-			TopologyAwareAssignments:         topologyAwareAssignments,
-			OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(topologyAwareAssignments),
-		}
-		if err := p.state.SetAllocationInfo(
-			commonstate.PoolNameReclaim, commonstate.FakedContainerName, curPoolAllocationInfo, true); err != nil {
-			return fmt.Errorf("persist initial reclaim pool: %w", err)
-		}
-	} else {
-		general.Infof("exist initial %s: %s", commonstate.PoolNameReclaim, reclaimedAllocationInfo.AllocationResult.String())
+			TopologyAwareAssignments:         assignments,
+			OriginalTopologyAwareAssignments: machine.DeepcopyCPUAssignment(assignments),
+		},
 	}
-
-	return nil
+	// A shallow view limits rematerialization to this pool and its members.
+	// The shared producer updates the candidate references, not unrelated pools.
+	reclaimMembers := state.PodEntries{commonstate.PoolNameReclaim: podEntries[commonstate.PoolNameReclaim]}
+	for podUID, containers := range podEntries {
+		if containers.IsPoolEntry() {
+			continue
+		}
+		for name, allocation := range containers {
+			if allocation == nil || allocation.OwnerPoolName != commonstate.PoolNameReclaim {
+				continue
+			}
+			if reclaimMembers[podUID] == nil {
+				reclaimMembers[podUID] = make(state.ContainerEntries)
+			}
+			reclaimMembers[podUID][name] = allocation
+		}
+	}
+	if err := validateNoReclaimedRampUp(podEntries); err != nil {
+		return err
+	}
+	if err := p.resyncPoolOwnedAllocationsWithView(reclaimMembers, ownership); err != nil {
+		return fmt.Errorf("resync initial reclaim ownership: %w", err)
+	}
+	updatedMachineState, err := generateMachineStateFromPodEntries(p.machine.machineInfo.CPUTopology, podEntries, machineState)
+	if err != nil {
+		return fmt.Errorf("rebuild initial reclaim machine state: %w", err)
+	}
+	if err := validatePendingPoolOwnershipWithView(podEntries, ownership); err != nil {
+		return fmt.Errorf("validate initial reclaim ownership: %w", err)
+	}
+	allowOverlap := p.state.GetAllowSharedCoresOverlapReclaimedCores()
+	disableDedicated := p.state.GetDisableDedicatedCoresOverlapReclaimedCores()
+	if err := p.validateAdvisorPartitionBeforeCommitWithDynamicConfig(podEntries, updatedMachineState,
+		allowOverlap, disableDedicated, p.config.dynamicConfig.GetDynamicConfiguration()); err != nil {
+		return fmt.Errorf("validate initial reclaim partition: %w", err)
+	}
+	if err := validateRequiredReclaimPool(podEntries); err != nil {
+		return err
+	}
+	return p.state.CommitAdvisorStateIfRevision(revision, podEntries, updatedMachineState,
+		allowOverlap, disableDedicated, true)
 }
 
 func (p *DynamicPolicy) initInterruptPool() error {

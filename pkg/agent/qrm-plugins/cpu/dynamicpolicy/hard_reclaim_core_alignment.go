@@ -228,6 +228,99 @@ func coreAlignedCandidatesWithIndex(
 	return completeCores
 }
 
+// selectReclaimSeed is a cold-start selector, unlike takeCoreAlignedCPUSet's
+// upper-bound semantics. It meets the requested floor using actual sibling counts;
+// non-positive requests seed one smallest complete core. No legal core fails closed.
+func selectReclaimSeed(topology *machine.CPUTopology, eligible, prefer machine.CPUSet, requested int) (machine.CPUSet, error) {
+	cores := coreAlignedCandidates(topology, eligible, prefer)
+	if len(cores) == 0 {
+		return machine.NewCPUSet(), errReclaimFallbackEmptyRequired
+	}
+	capacity, minSize, maxSize := 0, cores[0].cpus.Size(), 0
+	for _, core := range cores {
+		size := core.cpus.Size()
+		capacity += size
+		if size < minSize {
+			minSize = size
+		}
+		if size > maxSize {
+			maxSize = size
+		}
+	}
+	if requested <= 0 {
+		for _, core := range cores {
+			if core.cpus.Size() == minSize {
+				return core.cpus.Clone(), nil
+			}
+		}
+	}
+	if requested > capacity {
+		return machine.NewCPUSet(), errReclaimFallbackCapacityInsufficient
+	}
+
+	// Keep equal-preference cores balanced across NUMAs without rebuilding the
+	// topology index for each NUMA. The input already has deterministic key order.
+	ranks := make(map[[2]int]int)
+	rankByKey := make(map[physicalCoreKey]int, len(cores))
+	for _, core := range cores {
+		group := [2]int{core.preferredHit, core.key.numaID}
+		rankByKey[core.key] = ranks[group]
+		ranks[group]++
+	}
+	sort.SliceStable(cores, func(i, j int) bool {
+		if cores[i].preferredHit != cores[j].preferredHit {
+			return cores[i].preferredHit > cores[j].preferredHit
+		}
+		if rankByKey[cores[i].key] != rankByKey[cores[j].key] {
+			return rankByKey[cores[i].key] < rankByKey[cores[j].key]
+		}
+		return physicalCoreKeyLess(cores[i].key, cores[j].key)
+	})
+	selected := machine.NewCPUSet()
+	if minSize == maxSize {
+		// Uniform SMT (the usual case) needs no subset solver.
+		for _, core := range cores {
+			selected = selected.Union(core.cpus)
+			if selected.Size() >= requested {
+				return selected, nil
+			}
+		}
+	}
+
+	// Mixed SMT: one-dimensional 0/1 reachability minimizes overshoot. A minimal
+	// feasible total is below requested+maxSize; cap by capacity before addition
+	// to avoid oversized requests or overflow. Memory is O(window), not O(cores*window).
+	limit := capacity
+	if requested <= capacity-maxSize {
+		limit = requested + maxSize - 1
+	}
+	parent := make([]int, limit+1)
+	for sum := range parent {
+		parent[sum] = -1
+	}
+	parent[0] = -2
+	for i, core := range cores {
+		size := core.cpus.Size()
+		for sum := limit; sum >= size; sum-- {
+			if parent[sum] == -1 && parent[sum-size] != -1 {
+				parent[sum] = i
+			}
+		}
+	}
+	for target := requested; target <= limit; target++ {
+		if parent[target] == -1 {
+			continue
+		}
+		for sum := target; sum > 0; {
+			core := cores[parent[sum]]
+			selected = selected.Union(core.cpus)
+			sum -= core.cpus.Size()
+		}
+		return selected, nil
+	}
+	return selected, errReclaimFallbackCapacityInsufficient
+}
+
 func physicalCoreCPUs(topology *machine.CPUTopology) map[physicalCoreKey]machine.CPUSet {
 	return newPhysicalCoreIndex(topology).byKey
 }
