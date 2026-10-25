@@ -1021,7 +1021,7 @@ func TestDynamicPolicyInitReclaimPoolDoesNotReplayOverlappingReserve(t *testing.
 		entries, machineState, false, false, false))
 
 	err = policy.initReclaimPool()
-	require.ErrorContains(t, err, "select core-aligned reclaim cpus")
+	require.ErrorIs(t, err, errReclaimFallbackEmptyRequired)
 	require.Nil(t, policy.state.GetAllocationInfo(
 		commonstate.PoolNameReclaim, commonstate.FakedContainerName))
 }
