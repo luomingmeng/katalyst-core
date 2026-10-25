@@ -2214,10 +2214,24 @@ func (p *DynamicPolicy) pendingAdvisorStateMatchesCommitted(pending *pendingAdvi
 	if p == nil || p.state == nil || pending == nil {
 		return false
 	}
+	candidate := pending.entries
+	if pending.dynamicConfig != nil && !pending.dynamicConfig.EnableReclaim {
+		candidate = pending.entries.Clone()
+		if preserveCommittedReclaimPool(
+			candidate, p.state.GetPodEntries(), pending.allowOverlap) != nil {
+			return false
+		}
+		if p.machine.machineInfo != nil && p.machine.machineInfo.CPUTopology != nil {
+			if p.normalizePendingCPUPartition(candidate) != nil ||
+				p.resyncPoolOwnedAllocations(candidate) != nil {
+				return false
+			}
+		}
+	}
 	return pending.preCommitRevision == p.state.GetRevision() &&
 		pending.allowOverlap == p.state.GetAllowSharedCoresOverlapReclaimedCores() &&
 		pending.disableDedicated == p.state.GetDisableDedicatedCoresOverlapReclaimedCores() &&
-		reflect.DeepEqual(pending.entries, p.state.GetPodEntries())
+		reflect.DeepEqual(candidate, p.state.GetPodEntries())
 }
 
 // applyBlocks prepares an advisor state transition without

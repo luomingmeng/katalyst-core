@@ -3540,6 +3540,7 @@ func TestApplyPoolsAndIsolatedInfoAddsExplicitHardFloorToReclaim(t *testing.T) {
 	require.NoError(t, err)
 	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
 	require.NoError(t, err)
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	p.config.reservedCPUs = machine.NewCPUSet()
 	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
 
@@ -7736,8 +7737,8 @@ func TestAdjustAllocationEntriesForRecoveryPreservesLiveDefaultShareResidual(t *
 	require.NoError(t, err)
 	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
 	require.NoError(t, err)
-	p.config.reservedCPUs = machine.NewCPUSet()
 	p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.config.reservedCPUs = machine.NewCPUSet()
 	p.config.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
 	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
 	p.config.enableCPUAdvisor = true
@@ -7790,8 +7791,8 @@ func TestAdjustAllocationEntriesForRecoveryMarksLatestStateRetry(t *testing.T) {
 	require.NoError(t, err)
 	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
 	require.NoError(t, err)
-	p.config.reservedCPUs = machine.NewCPUSet()
 	p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.config.reservedCPUs = machine.NewCPUSet()
 	p.config.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
 	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
 	p.config.enableCPUAdvisor = true
@@ -7844,8 +7845,8 @@ func TestAdjustAllocationEntriesForRecoveryConcurrentCASHasSingleOutcome(t *test
 	require.NoError(t, err)
 	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
 	require.NoError(t, err)
-	p.config.reservedCPUs = machine.NewCPUSet()
 	p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.config.reservedCPUs = machine.NewCPUSet()
 	p.config.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
 	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
 	p.config.enableCPUAdvisor = true
@@ -8049,9 +8050,9 @@ func TestAdjustPoolsAndIsolatedEntriesWithRampUpFloorBackfillsDefaultShareResidu
 
 	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
 	require.NoError(t, err)
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 
 	p.config.reservedCPUs = machine.NewCPUSet(0)
-	p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	p.config.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
 	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
 
@@ -8170,9 +8171,10 @@ func TestAdjustPoolsAndIsolatedEntriesTreatsMissingDefaultShareQuantityAsZero(t 
 	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
 	require.NoError(t, err)
 	p.config.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
+	p.config.reservedCPUs = p.config.reservedCPUs.Union(machine.NewCPUSet(4, 5))
 
-	// poolsQuantityMap intentionally omits PoolNameShare, matching a fully
-	// exclusive node where the advisor publishes zero default share quantity.
+	// poolsQuantityMap intentionally omits PoolNameShare: reserve and system
+	// pools leave no eligible default-share residual.
 	err = p.adjustPoolsAndIsolatedEntriesWithRampUpFloor(
 		map[string]map[int]int{
 			commonstate.PoolNameReclaim: {
@@ -8225,10 +8227,17 @@ func TestAdjustAllocationEntriesAsyncTreatsMissingDefaultShareQuantityAsZero(t *
 	)
 	require.NoError(t, err)
 
-	// Fully-exclusive node: a single DNB pod owns the only NUMA, so no eligible
-	// (non-exclusive) CPUSet remains for a default share pool.
-	dnbCPUSet := topology.CPUDetails.CPUsInNUMANodes(0)
+	// Keep the initialized committed reclaim identity and occupy every other
+	// allocatable CPU with a dedicated container, leaving no default-share residual.
+	reclaim := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	require.NotNil(t, reclaim)
+	dedicatedCPUSet := topology.CPUDetails.CPUs().
+		Difference(p.config.reservedCPUs).
+		Difference(reclaim.AllocationResult)
 	entries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: reclaim.Clone(),
+		},
 		"dedicated-pod": {
 			"main": &state.AllocationInfo{
 				AllocationMeta: commonstate.AllocationMeta{
@@ -8238,16 +8247,10 @@ func TestAdjustAllocationEntriesAsyncTreatsMissingDefaultShareQuantityAsZero(t *
 					ContainerName: "main",
 					OwnerPoolName: commonstate.PoolNameDedicated,
 					QoSLevel:      apiconsts.PodAnnotationQoSLevelDedicatedCores,
-					Annotations: map[string]string{
-						apiconsts.PodAnnotationMemoryEnhancementNumaBinding:   apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
-						apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: apiconsts.PodAnnotationMemoryEnhancementNumaExclusiveEnable,
-					},
 				},
-				RequestQuantity:                  float64(dnbCPUSet.Size()),
-				AllocationResult:                 dnbCPUSet.Clone(),
-				OriginalAllocationResult:         dnbCPUSet.Clone(),
-				TopologyAwareAssignments:         map[int]machine.CPUSet{0: dnbCPUSet.Clone()},
-				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: dnbCPUSet.Clone()},
+				RequestQuantity:          float64(dedicatedCPUSet.Size()),
+				AllocationResult:         dedicatedCPUSet.Clone(),
+				OriginalAllocationResult: dedicatedCPUSet.Clone(),
 			},
 		},
 	}
@@ -8280,8 +8283,8 @@ func TestAdjustPoolsAndIsolatedEntriesKeepsDefaultShareAlongsideSNB(t *testing.T
 
 	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
 	require.NoError(t, err)
-	p.config.reservedCPUs = machine.NewCPUSet()
 	p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.config.reservedCPUs = machine.NewCPUSet()
 	p.config.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
 	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
 
@@ -8409,8 +8412,8 @@ func TestAdjustPoolsAndIsolatedEntriesKeepsDefaultShareForNonSNB(t *testing.T) {
 
 	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
 	require.NoError(t, err)
-	p.config.reservedCPUs = machine.NewCPUSet()
 	p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	p.config.reservedCPUs = machine.NewCPUSet()
 	p.config.dynamicConfig.GetDynamicConfiguration().FillDefaultSharePoolWithNonReclaimCPUs = true
 	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
 

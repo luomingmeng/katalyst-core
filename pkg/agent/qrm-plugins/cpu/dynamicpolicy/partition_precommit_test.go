@@ -604,6 +604,7 @@ func testPreparePendingCPUPartitionRejectsReplacementMutation(
 	stateDir := t.TempDir()
 	p, err := getTestDynamicPolicyWithoutInitialization(topology, stateDir)
 	require.NoError(t, err)
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 
 	require.NoError(t, p.state.StoreState())
 	initialRevision := p.state.GetRevision()
@@ -727,6 +728,7 @@ func TestPoolAdjustmentRejectsFragmentedReclaimBeforeCommit(t *testing.T) {
 	require.NoError(t, err)
 	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
 	require.NoError(t, err)
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false)
 	p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false)
 	currentReclaim := machine.NewCPUSet(1, 25, 49, 73)
@@ -1339,6 +1341,67 @@ func TestRampUpSidecarMirrorsMainContainerThroughPrecommitAndRampUpExit(t *testi
 	}
 }
 
+func TestPreparePendingCPUPartitionPreservesDisabledReclaimIdentity(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		candidate machine.CPUSet
+	}{
+		{name: "empty", candidate: machine.NewCPUSet()},
+		{name: "shrink", candidate: machine.NewCPUSet(4)},
+		{name: "grow", candidate: machine.NewCPUSet(4, 52, 53)},
+		{name: "reselect", candidate: machine.NewCPUSet(6, 54)},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			p, cleanup := newReclaimReuseTestPolicy(t)
+			defer cleanup()
+			dynamicConf := p.config.dynamicConfig.GetDynamicConfiguration()
+			dynamicConf.EnableReclaim = false
+
+			committedReclaim := machine.NewCPUSet(4, 52)
+			committedEntries := precommitPartitionEntries(committedReclaim, machine.NewCPUSet(2, 3))
+			committedMachineState, err := generateMachineStateFromPodEntries(
+				p.machine.machineInfo.CPUTopology, committedEntries, p.state.GetMachineState())
+			require.NoError(t, err)
+			require.NoError(t, p.state.CommitAdvisorState(
+				committedEntries, committedMachineState, false, true, false))
+
+			beforeRevision := p.state.GetRevision()
+			committed, _, err := p.commitPendingCPUPartition(pendingCPUPartition{
+				expectedRevision: beforeRevision,
+				entries:          precommitPartitionEntries(tc.candidate, machine.NewCPUSet(2, 3)),
+				disableDedicated: true,
+				persist:          false,
+				dynamicConfig:    dynamicConf,
+			})
+			require.NoError(t, err)
+			require.Equal(t, beforeRevision+1, p.state.GetRevision())
+			require.True(t, reclaimPoolCPUSet(committed).Equals(committedReclaim),
+				"disabled reclaim must preserve committed identity, got %s", reclaimPoolCPUSet(committed))
+		})
+	}
+}
+
+func TestPreparePendingCPUPartitionRejectsEmptyDisabledReclaimIdentity(t *testing.T) {
+	t.Parallel()
+	p, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	dynamicConf := p.config.dynamicConfig.GetDynamicConfiguration()
+	dynamicConf.EnableReclaim = false
+	p.state.SetPodEntries(state.PodEntries{}, false)
+
+	_, _, err := p.commitPendingCPUPartition(pendingCPUPartition{
+		expectedRevision: p.state.GetRevision(),
+		entries:          precommitPartitionEntries(machine.NewCPUSet(4, 52), machine.NewCPUSet(2, 3)),
+		disableDedicated: true,
+		persist:          false,
+		dynamicConfig:    dynamicConf,
+	})
+	require.ErrorIs(t, err, errReclaimFallbackEmptyRequired)
+}
+
 func precommitPartitionEntries(reclaim, dedicated machine.CPUSet) state.PodEntries {
 	return state.PodEntries{
 		commonstate.PoolNameReclaim: {
@@ -1388,6 +1451,7 @@ func newResidualBackfillPrecommitTestPolicy(t *testing.T) (*DynamicPolicy, error
 	}
 	p.config.reservedCPUs = machine.NewCPUSet()
 	dynamicConf := p.config.dynamicConfig.GetDynamicConfiguration()
+	dynamicConf.EnableReclaim = true
 	dynamicConf.FillDefaultSharePoolWithNonReclaimCPUs = true
 	dynamicConf.EnableRampUpReclaimHardPartition = false
 	dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.Enable = false
