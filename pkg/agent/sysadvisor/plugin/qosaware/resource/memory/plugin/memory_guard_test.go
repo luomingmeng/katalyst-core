@@ -29,6 +29,7 @@ import (
 
 	configv1alpha1 "github.com/kubewharf/katalyst-api/pkg/apis/config/v1alpha1"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/memory/dynamicpolicy/memoryadvisor"
+	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/metacache"
 	types "github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
@@ -38,6 +39,7 @@ import (
 	agentmetric "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric"
 	metrictypes "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric/types"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
+	metricspool "github.com/kubewharf/katalyst-core/pkg/metrics/metrics-pool"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	"github.com/kubewharf/katalyst-core/pkg/util/metric"
 	"github.com/kubewharf/katalyst-core/pkg/util/reclaim"
@@ -366,6 +368,7 @@ func TestCalculateReclaimedMemoryLimitFor_FailsFastWhenMaterializedCgroupMetricM
 	t.Parallel()
 
 	conf := config.NewConfiguration()
+	conf.ReclaimedMemoryLimitMargin = 100
 	snapshot := dynamicconfig.NewConfiguration()
 	snapshot.CriticalWatermarkSource = configv1alpha1.CriticalWatermarkSourceLow
 	conf.SetDynamicConfiguration(snapshot)
@@ -405,35 +408,133 @@ func TestCalculateReclaimedMemoryLimitFor_FailsFastWhenMaterializedCgroupMetricM
 	require.Equal(t, 0.0, limit)
 }
 
-func TestCalculateReclaimedMemoryLimitFor_MaxRatioClamp(t *testing.T) {
+func TestCalculateReclaimedMemoryLimitFor_LimitMargin(t *testing.T) {
 	t.Parallel()
 
-	clamp := func(reclaimMemoryLimit, ratio, numaTotal float64) float64 {
-		if ratio > 0 {
-			reclaimMemoryLimit = math.Min(reclaimMemoryLimit, ratio*numaTotal)
-		}
-		return reclaimMemoryLimit
-	}
-
-	numaTotal := 250.0 * (1 << 30)
-
 	cases := []struct {
-		name  string
-		ratio float64
-		raw   float64
-		want  float64
+		name   string
+		used   []float64
+		free   uint64
+		margin int64
+		ratio  float64
+		want   float64
 	}{
-		{name: "ratio 0 disables clamp", ratio: 0, raw: 200 * (1 << 30), want: 200 * (1 << 30)},
-		{name: "ratio caps to ratio*total", ratio: 0.2, raw: 200 * (1 << 30), want: 0.2 * numaTotal},
-		{name: "ratio above raw is no-op", ratio: 0.9, raw: 100 * (1 << 30), want: 100 * (1 << 30)},
-		{name: "negative ratio disables clamp", ratio: -1, raw: 200 * (1 << 30), want: 200 * (1 << 30)},
+		{name: "zero margin preserves tight limit", used: []float64{600}, free: 50, want: 600},
+		{name: "zero margin preserves ratio cap below usage", used: []float64{600}, free: 50, ratio: 0.5, want: 500},
+		{name: "ratio caps raw limit", used: []float64{100}, free: 900, ratio: 0.5, want: 500},
+		{name: "ratio above raw is unchanged", used: []float64{100}, free: 200, ratio: 0.9, want: 200},
+		{name: "negative ratio preserves disabled cap", used: []float64{100}, free: 900, ratio: -1, want: 900},
+		{name: "ample free memory is unchanged", used: []float64{600}, free: 300, margin: 100, want: 800},
+		{name: "below watermark keeps margin", used: []float64{600}, free: 50, margin: 100, want: 700},
+		{name: "at watermark keeps margin", used: []float64{600}, free: 100, margin: 100, want: 700},
+		{name: "small positive headroom is raised", used: []float64{600}, free: 150, margin: 100, want: 700},
+		{name: "margin overrides ratio cap", used: []float64{600}, free: 300, margin: 100, ratio: 0.65, want: 700},
+		{name: "margin overrides cap below usage", used: []float64{600}, free: 50, margin: 100, ratio: 0.5, want: 700},
+		{name: "margin stops at NUMA total", used: []float64{950}, free: 50, margin: 100, want: 1000},
+		{name: "large margin cannot overflow addition", used: []float64{600}, free: 50, margin: math.MaxInt64, want: 1000},
+		{name: "empty pool receives no margin", used: []float64{0}, free: 50, margin: 100, want: 0},
+		{name: "empty pool retains free budget", used: []float64{0}, free: 300, margin: 500, want: 200},
+		{name: "multiple parents receive one margin", used: []float64{200, 400}, free: 50, margin: 100, want: 700},
 	}
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			require.Equal(t, tc.want, clamp(tc.raw, tc.ratio, numaTotal))
+			conf := config.NewConfiguration()
+			conf.ReclaimedMemoryLimitMargin = tc.margin
+			snapshot := conf.GetDynamicConfiguration()
+			snapshot.CriticalWatermarkSource = configv1alpha1.CriticalWatermarkSourceLow
+			snapshot.ReclaimedMemoryMaxRatio = tc.ratio
+
+			now := time.Now()
+			fetcher := agentmetric.NewFakeMetricsFetcher(metrics.DummyMetrics{}).(*agentmetric.FakeMetricsFetcher)
+			fetcher.SetNodeMetric(consts.MetricMemScaleFactorSystem, metric.MetricData{Value: 0, Time: &now})
+			fetcher.SetNumaMetric(0, consts.MetricMemTotalNuma, metric.MetricData{Value: 1000, Time: &now})
+			fetcher.SetNumaMetric(0, consts.MetricMemFreeNuma, metric.MetricData{Value: float64(tc.free), Time: &now})
+			paths := make([]string, len(tc.used))
+			for i, used := range tc.used {
+				paths[i] = "/reclaimed-" + strconv.Itoa(i)
+				fetcher.SetCgroupNumaMetric(paths[i], 0, consts.MetricsMemTotalPerNumaCgroup, metric.MetricData{Value: used, Time: &now})
+			}
+			metaServer := &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{
+				MetricsFetcher: fetcher,
+				KatalystMachineInfo: &machine.KatalystMachineInfo{
+					MachineInfo:    &cadvisorinfo.MachineInfo{},
+					MemoryTopology: &machine.MemoryTopology{PageSize: 1},
+				},
+			}}
+			mg := NewMemoryGuard(conf, nil, nil, metaServer, metrics.DummyMetrics{}).(*memoryGuard)
+			mg.existingCgroupPathsFn = func(paths ...string) []string { return paths }
+			limit, err := mg.calculateReclaimedMemoryLimitFor(snapshot, 0, paths,
+				[]machine.NormalZoneInfo{{Node: 0, Free: tc.free, Low: 100}})
+			require.NoError(t, err)
+			require.Equal(t, tc.want, limit)
 		})
+	}
+}
+
+func TestMemoryGuardLimitMarginUpdatesAndAdvices(t *testing.T) {
+	t.Parallel()
+
+	conf := config.NewConfiguration()
+	conf.ReclaimedMemoryLimitMargin = 100
+	conf.StateFileDirectory = t.TempDir()
+	conf.GetDynamicConfiguration().MemoryGuardConfiguration.Enable = true
+	conf.GetDynamicConfiguration().CriticalWatermarkSource = configv1alpha1.CriticalWatermarkSourceLow
+	conf.GetDynamicConfiguration().ReclaimedMemoryMaxRatio = 0.5
+
+	now := time.Now()
+	fetcher := agentmetric.NewFakeMetricsFetcher(metrics.DummyMetrics{}).(*agentmetric.FakeMetricsFetcher)
+	fetcher.SetNodeMetric(consts.MetricMemScaleFactorSystem, metric.MetricData{Value: 0, Time: &now})
+	metaCache, err := metacache.NewMetaCacheImp(conf, metricspool.DummyMetricsEmitterPool{}, fetcher)
+	require.NoError(t, err)
+	metaServer := &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{
+		MetricsFetcher: fetcher,
+		KatalystMachineInfo: &machine.KatalystMachineInfo{
+			MachineInfo: &cadvisorinfo.MachineInfo{},
+			CPUTopology: &machine.CPUTopology{CPUDetails: machine.CPUDetails{
+				0: {NUMANodeID: 0}, 1: {NUMANodeID: 1}, 2: {NUMANodeID: 2},
+			}},
+			MemoryTopology: &machine.MemoryTopology{PageSize: 1},
+		},
+	}}
+	mg := NewMemoryGuard(conf, nil, metaCache, metaServer, metrics.DummyMetrics{}).(*memoryGuard)
+	mg.reclaimRelativeRootCgroupPaths = []string{"/margin-a", "/margin-b"}
+	mg.numaBindingRelativeRootCgroupPaths = map[int][]string{
+		0: {"/margin-a-0", "/margin-b-0"},
+		1: {"/margin-a-1", "/margin-b-1"},
+		2: {"/margin-a-2", "/margin-b-2"},
+	}
+	mg.existingCgroupPathsFn = func(paths ...string) []string { return paths }
+	zoneInfos := []machine.NormalZoneInfo{
+		{Node: 0, Free: 50, Low: 100},
+		{Node: 1, Free: 50, Low: 100},
+		{Node: 2, Free: 50, Low: 100},
+	}
+	mg.zoneInfoFn = func(string) []machine.NormalZoneInfo { return zoneInfos }
+	for numaID, used := range []float64{600, 200, 0} {
+		fetcher.SetNumaMetric(numaID, consts.MetricMemTotalNuma, metric.MetricData{Value: 1000, Time: &now})
+		fetcher.SetNumaMetric(numaID, consts.MetricMemFreeNuma, metric.MetricData{Value: 50, Time: &now})
+		for _, paths := range [][]string{mg.reclaimRelativeRootCgroupPaths, mg.numaBindingRelativeRootCgroupPaths[numaID]} {
+			for _, path := range paths {
+				fetcher.SetCgroupNumaMetric(path, numaID, consts.MetricsMemTotalPerNumaCgroup, metric.MetricData{Value: used / 2, Time: &now})
+			}
+		}
+	}
+
+	require.NoError(t, mg.Reconcile(nil))
+	advice := mg.GetAdvices()
+	require.Equal(t, int64(1000), memoryLimitAdvice(t, advice, "/margin-a"))
+	require.Equal(t, int64(1000), memoryLimitAdvice(t, advice, "/margin-b"))
+	for numaID, want := range map[int]int64{0: 700, 1: 300, 2: 0} {
+		for _, path := range mg.numaBindingRelativeRootCgroupPaths[numaID] {
+			require.Equal(t, want, memoryLimitAdvice(t, advice, path))
+		}
+	}
+	for _, entry := range advice.ExtraEntries {
+		limit := memoryLimitAdvice(t, advice, entry.CgroupPath)
+		require.Equal(t, strconv.FormatInt(limit*95/100, 10),
+			entry.Values[string(memoryadvisor.ControlKnobKeyMemoryHigh)])
 	}
 }
 
