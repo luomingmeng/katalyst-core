@@ -275,13 +275,26 @@ func (mg *memoryGuard) calculateReclaimedMemoryLimitFor(dynamicConfig *dynamicco
 	criticalWatermark *= criticalWatermarkScaleFactor
 
 	criticalWatermark = math.Max(float64(mg.minCriticalWatermark), criticalWatermark)
-	reclaimMemoryLimit := reclaimedMemoryUsed +
+	rawReclaimMemoryLimit := reclaimedMemoryUsed +
 		math.Max(numaFree-criticalWatermark, 0)
+	reclaimMemoryLimit := rawReclaimMemoryLimit
 
 	// clamp the reclaimMemory limit to the max ratio of total memory in this NUMA
 	reclaimedMemoryMaxRatio := dynamicConfig.ReclaimedMemoryMaxRatio
+	maxRatioLimit := .0
 	if reclaimedMemoryMaxRatio > 0 {
-		reclaimMemoryLimit = math.Min(reclaimMemoryLimit, reclaimedMemoryMaxRatio*numaTotal)
+		maxRatioLimit = reclaimedMemoryMaxRatio * numaTotal
+		reclaimMemoryLimit = math.Min(reclaimMemoryLimit, maxRatioLimit)
+	}
+
+	usageFloor := .0
+	usageFloorApplied := false
+	if mg.conf.ReclaimedMemoryLimitMargin > 0 && reclaimedMemoryUsed > 0 {
+		// Apply the floor after the ratio cap so active usage keeps its growth
+		// margin under pressure; empty pools must not gain budget from the margin.
+		usageFloor = math.Min(reclaimedMemoryUsed+float64(mg.conf.ReclaimedMemoryLimitMargin), numaTotal)
+		usageFloorApplied = usageFloor > reclaimMemoryLimit
+		reclaimMemoryLimit = math.Max(reclaimMemoryLimit, usageFloor)
 	}
 
 	general.InfoS("NUMA memory info", "numaID", numaID,
@@ -290,6 +303,12 @@ func (mg *memoryGuard) calculateReclaimedMemoryLimitFor(dynamicConfig *dynamicco
 		"numaFree", general.FormatMemoryQuantity(numaFree),
 		"criticalWatermarkScaleFactor", criticalWatermarkScaleFactor,
 		"reclaimedMemoryMaxRatio", reclaimedMemoryMaxRatio,
+		"rawReclaimMemoryLimit", general.FormatMemoryQuantity(rawReclaimMemoryLimit),
+		"maxRatioLimit", general.FormatMemoryQuantity(maxRatioLimit),
+		"reclaimedMemoryLimitMargin", mg.conf.ReclaimedMemoryLimitMargin,
+		"usageFloor", general.FormatMemoryQuantity(usageFloor),
+		"usageFloorApplied", usageFloorApplied,
+		"maxRatioOverridden", reclaimedMemoryMaxRatio > 0 && usageFloor > maxRatioLimit,
 		"reclaimMemoryLimit", general.FormatMemoryQuantity(reclaimMemoryLimit),
 		"zoneInfo", zoneInfo, "found", found)
 	return reclaimMemoryLimit, nil
