@@ -95,15 +95,37 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 		return nil, p.wrapPartitionPrecommitError(pending.source, pending.expectedRevision, "run allocation hooks", err)
 	}
 	p.syncCandidateSidecarsFromMain(candidate)
+	var topology *machine.CPUTopology
+	if p.machine.machineInfo != nil {
+		topology = p.machine.machineInfo.CPUTopology
+	}
+	replacementBaseline := pending.entries
+	if !pending.dynamicConfig.EnableReclaim {
+		replacementBaseline = pending.entries.Clone()
+		if err := preserveCommittedReclaimPool(candidate, currentEntries, pending.allowOverlap); err != nil {
+			return nil, p.wrapPartitionPrecommitError(
+				pending.source, pending.expectedRevision, "preserve disabled reclaim identity", err)
+		}
+		if err := preserveCommittedReclaimPool(replacementBaseline, currentEntries, pending.allowOverlap); err != nil {
+			return nil, p.wrapPartitionPrecommitError(
+				pending.source, pending.expectedRevision, "preserve disabled reclaim baseline", err)
+		}
+		if topology != nil {
+			if err := p.normalizePendingCPUPartition(replacementBaseline); err != nil {
+				return nil, p.wrapPartitionPrecommitError(
+					pending.source, pending.expectedRevision, "normalize disabled reclaim baseline", err)
+			}
+			if err := p.resyncPoolOwnedAllocations(replacementBaseline); err != nil {
+				return nil, p.wrapPartitionPrecommitError(
+					pending.source, pending.expectedRevision, "resync disabled reclaim baseline", err)
+			}
+		}
+	}
 
 	// Build the reclaim ownership view once from the post-hooks candidate: it is
 	// the single source of truth for the active RNB target NUMAs and the ordinary
 	// (non-RNB) reclaim-eligible NUMAs, reused by pool-member resync and ownership
 	// validation below so neither rescans the same candidate.
-	var topology *machine.CPUTopology
-	if p.machine.machineInfo != nil {
-		topology = p.machine.machineInfo.CPUTopology
-	}
 	ownershipView, err := buildReclaimOwnershipView(candidate, topology)
 	if err != nil {
 		return nil, p.wrapPartitionPrecommitError(
@@ -141,7 +163,7 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 				pending.source, pending.expectedRevision, "resync pool-owned allocations", err)
 		}
 		if err := validateAllocationShapeAfterHooks(
-			pending.entries, candidate, p.machine.machineInfo.CPUTopology,
+			replacementBaseline, candidate, p.machine.machineInfo.CPUTopology,
 		); err != nil {
 			return nil, p.wrapPartitionPrecommitError(
 				pending.source, pending.expectedRevision, "revalidate allocation shape after hooks", err)
@@ -204,12 +226,18 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 	if err := validateRequiredReclaimPool(candidate); err != nil {
 		return nil, p.wrapPartitionPrecommitError(pending.source, pending.expectedRevision, "reclaim empty required", err)
 	}
+	if !pending.dynamicConfig.EnableReclaim && !reclaimPoolCPUSet(candidate).Equals(reclaimPoolCPUSet(currentEntries)) {
+		return nil, p.wrapPartitionPrecommitError(
+			pending.source, pending.expectedRevision, "preserve disabled reclaim identity",
+			fmt.Errorf("candidate reclaim %s differs from committed reclaim %s",
+				reclaimPoolCPUSet(candidate), reclaimPoolCPUSet(currentEntries)))
+	}
 	// Keep the frozen plan authoritative through the complete prepare phase.
 	// A validator is expected to be read-only, but re-check the candidate here
 	// so a late mutation cannot bypass the hook-time replacement invariants.
 	if p.machine.machineInfo != nil && p.machine.machineInfo.CPUTopology != nil {
 		if err := validateAllocationShapeAfterHooks(
-			pending.entries, candidate, p.machine.machineInfo.CPUTopology,
+			replacementBaseline, candidate, p.machine.machineInfo.CPUTopology,
 		); err != nil {
 			return nil, p.wrapPartitionPrecommitError(
 				pending.source, pending.expectedRevision, "revalidate replacement baseline after partition validation", err)
@@ -832,7 +860,8 @@ func (p *DynamicPolicy) resyncPoolOwnedAllocationsWithView(
 			continue
 		}
 		for containerName, allocation := range containerEntries {
-			if allocation == nil || allocation.CheckSideCar() {
+			if allocation == nil ||
+				(allocation.CheckSideCar() && containerEntries.GetMainContainerEntry() != nil) {
 				continue
 			}
 			poolEntry, ok := poolEntries[allocation.OwnerPoolName]

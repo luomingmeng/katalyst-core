@@ -63,6 +63,36 @@ func validateRequiredReclaimPool(entries state.PodEntries) error {
 	return nil
 }
 
+// preserveCommittedReclaimPool freezes the last successful reclaim identity in
+// a new candidate. Disabled reclaim may stop service and expansion, but it must
+// not erase or relocate the cpuset that still backs existing offline workloads.
+func preserveCommittedReclaimPool(
+	candidate, committed state.PodEntries,
+	allowSharedOverlap bool,
+) error {
+	committedEntry := committed[commonstate.PoolNameReclaim][commonstate.FakedContainerName]
+	if committedEntry == nil || committedEntry.AllocationResult.IsEmpty() {
+		return errReclaimFallbackEmptyRequired
+	}
+	candidateEntry := candidate[commonstate.PoolNameReclaim][commonstate.FakedContainerName]
+	if !allowSharedOverlap && candidateEntry != nil {
+		shareEntry := candidate[commonstate.PoolNameShare][commonstate.FakedContainerName]
+		if shareEntry != nil {
+			shareEntry.AllocationResult = shareEntry.AllocationResult.
+				Union(candidateEntry.AllocationResult).
+				Difference(committedEntry.AllocationResult)
+			shareEntry.OriginalAllocationResult = shareEntry.OriginalAllocationResult.
+				Union(candidateEntry.OriginalAllocationResult).
+				Difference(committedEntry.OriginalAllocationResult)
+		}
+	}
+	if candidate[commonstate.PoolNameReclaim] == nil {
+		candidate[commonstate.PoolNameReclaim] = make(state.ContainerEntries)
+	}
+	candidate[commonstate.PoolNameReclaim][commonstate.FakedContainerName] = committedEntry.Clone()
+	return nil
+}
+
 // selectBoundedReclaimFallback picks the reclaim pool CPUs when the advisor/build yields an
 // empty reclaim entry. It is pure: no state read, no state write.
 //

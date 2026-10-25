@@ -520,6 +520,7 @@ func TestAdjustAllocationEntriesCleansOrphanInSingleDurableRevision(t *testing.T
 	stateDir := t.TempDir()
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, stateDir)
 	require.NoError(t, err)
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 
 	const (
 		podUID   = "orphan-owner"
@@ -1266,6 +1267,7 @@ func TestRemovePodRecoversStaleEntryBehindStuckAdvisorPostCommitTarget(t *testin
 	require.NoError(t, err)
 	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 	require.NoError(t, err)
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 
 	const podUID = "stale-pod"
 	entries := state.PodEntries{
@@ -1694,7 +1696,15 @@ func TestRemovePodCommitsCanonicalStateAtomically(t *testing.T) {
 		stateDir := t.TempDir()
 		policy, err := getTestDynamicPolicyWithoutInitialization(topology, stateDir)
 		require.NoError(t, err)
+		policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 		entries := state.PodEntries{
+			commonstate.PoolNameReclaim: {
+				commonstate.FakedContainerName: &state.AllocationInfo{
+					AllocationMeta:           commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+					AllocationResult:         machine.NewCPUSet(0, 4),
+					OriginalAllocationResult: machine.NewCPUSet(0, 4),
+				},
+			},
 			podUID: {
 				"main": &state.AllocationInfo{
 					AllocationMeta: commonstate.AllocationMeta{
@@ -3497,13 +3507,10 @@ func TestAllocate(t *testing.T) {
 
 			dynamicPolicy, err := getTestDynamicPolicyWithInitialization(tc.cpuTopology, tmpDir)
 			as.Nil(err)
+			dynamicPolicy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 
 			if tc.enhancementDefaultValues != nil {
 				dynamicPolicy.config.qosConfig.QoSEnhancementDefaultValues = tc.enhancementDefaultValues
-			}
-
-			if tc.enableReclaim {
-				dynamicPolicy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 			}
 
 			if tc.allowSharedCoresOverlapReclaimedCores {
@@ -3630,8 +3637,8 @@ func TestAllocateFailureRollbackDoesNotOverwriteNewerState(t *testing.T) {
 		"restored allocation=%s, want %s", restored.AllocationResult, originalAllocation.AllocationResult)
 	reclaim := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
 	require.NotNil(t, reclaim)
-	require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(2, 3, 4, 5)),
-		"reclaim allocation=%s, want latest-state replan 2-5", reclaim.AllocationResult)
+	require.True(t, reclaim.AllocationResult.Equals(machine.NewCPUSet(7)),
+		"reclaim allocation=%s, want latest committed identity 7", reclaim.AllocationResult)
 }
 
 func TestAllocateFailureRollbackDoesNotOverwriteNewerSameContainerState(t *testing.T) {
@@ -8072,16 +8079,16 @@ func TestGetTopologyAwareResources(t *testing.T) {
 					AggregatedQuantity:         10,
 					OriginalAggregatedQuantity: 10,
 					TopologyAwareQuantityList: []*pluginapi.TopologyAwareQuantity{
-						{ResourceValue: 2, Node: 0},
-						{ResourceValue: 2, Node: 1},
+						{ResourceValue: 1, Node: 0},
+						{ResourceValue: 1, Node: 1},
 						{ResourceValue: 4, Node: 2},
-						{ResourceValue: 2, Node: 3},
+						{ResourceValue: 4, Node: 3},
 					},
 					OriginalTopologyAwareQuantityList: []*pluginapi.TopologyAwareQuantity{
-						{ResourceValue: 2, Node: 0},
-						{ResourceValue: 2, Node: 1},
+						{ResourceValue: 1, Node: 0},
+						{ResourceValue: 1, Node: 1},
 						{ResourceValue: 4, Node: 2},
-						{ResourceValue: 2, Node: 3},
+						{ResourceValue: 4, Node: 3},
 					},
 				},
 			}
@@ -8150,13 +8157,13 @@ func TestGetResourcesAllocation(t *testing.T) {
 		IsScalarResource:  true,
 		AllocatedQuantity: 10,
 		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.config.reservedCPUs).Difference(reclaim.AllocationResult).String(),
-		// whole-core apportion balances lent cores across NUMAs, shifting the
-		// per-NUMA share split while the aggregate stays 10.
+		// Disabled reclaim keeps the committed cpuset, so report the NUMA
+		// distribution of that canonical residual.
 		TopologyAssignments: map[uint64]uint64{
-			0: 2,
-			1: 2,
+			0: 1,
+			1: 1,
 			2: 4,
-			3: 2,
+			3: 4,
 		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelSharedCores,
@@ -8185,12 +8192,12 @@ func TestGetResourcesAllocation(t *testing.T) {
 		IsNodeResource:    false,
 		IsScalarResource:  true,
 		AllocatedQuantity: 10,
-		AllocationResult:  machine.NewCPUSet(1, 3, 4, 5, 6, 9, 11, 12, 13, 14).String(),
+		AllocationResult:  cpuTopology.CPUDetails.CPUs().Difference(dynamicPolicy.config.reservedCPUs).Difference(reclaim.AllocationResult).String(),
 		TopologyAssignments: map[uint64]uint64{
-			0: 2,
-			1: 2,
+			0: 1,
+			1: 1,
 			2: 4,
-			3: 2,
+			3: 4,
 		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelSharedCores,
@@ -8232,17 +8239,18 @@ func TestGetResourcesAllocation(t *testing.T) {
 		IsNodeResource:    false,
 		IsScalarResource:  true,
 		AllocatedQuantity: 4,
-		AllocationResult:  machine.NewCPUSet(7, 8, 10, 15).String(),
+		AllocationResult:  reclaim.AllocationResult.String(),
 		TopologyAssignments: map[uint64]uint64{
-			uint64(0): 1,
-			uint64(1): 1,
-			uint64(3): 2,
+			uint64(0): 2,
+			uint64(1): 2,
 		},
 		Annotations: map[string]string{
 			consts.PodAnnotationQoSLevelKey:              consts.PodAnnotationQoSLevelReclaimedCores,
 			cpuconsts.CPUSetOmissionAllowedAnnotationKey: cpusetOmissionFalse,
 		},
 	}, resp2.PodResources[req.PodUid].ContainerResources[testName].ResourceAllocation[string(v1.ResourceCPU)])
+	_, err = dynamicPolicy.RemovePod(context.Background(), &pluginapi.RemovePodRequest{PodUid: req.PodUid})
+	as.Nil(err)
 
 	req = &pluginapi.ResourceRequest{
 		PodUid:         string(uuid.NewUUID()),
@@ -8319,7 +8327,7 @@ func TestGetResourcesAllocation(t *testing.T) {
 
 	reclaimEntry := dynamicPolicy.state.GetAllocationInfo(commonstate.PoolNameReclaim, "")
 	as.NotNil(reclaimEntry)
-	as.Equal(6, reclaimEntry.AllocationResult.Size()) // ceil("14 * (4 / 10)") == 6
+	as.Equal(3, reclaimEntry.AllocationResult.Size())
 }
 
 func TestRampUpDeadlineIsSharedByAllQoSPaths(t *testing.T) {

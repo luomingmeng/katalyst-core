@@ -76,6 +76,7 @@ func newReclaimReuseTestPolicy(t *testing.T) (*DynamicPolicy, func()) {
 		_ = os.RemoveAll(tmpDir)
 		require.NoError(t, err)
 	}
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	return p, func() { _ = os.RemoveAll(tmpDir) }
 }
 

@@ -303,23 +303,19 @@ func wantLabel(want int) string {
 // share residual. This is a real share-capacity load, not a reclaim-demand table.
 func TestRealShareLoadTable180(t *testing.T) {
 	t.Parallel()
-	// Per-point contract: share materializes min(request, 180) (the existing all-
-	// occupancy capacity floor; it must not silently shrink to 176). Reclaim is fixed
-	// want=4: wherever the leftover lets the prior identity through, committed reclaim
-	// is exactly 88-89,178-179. At share=178 the machine only leaves 2 free CPUs after
-	// share takes 178, so the legacy enable=false leftover path yields a partial 2-CPU
-	// reclaim (178-179) — explicitly expected, not a silent green.
+	// Disabled reclaim freezes the committed four-CPU identity, so default share
+	// is capped at 176 CPUs for every requested load point.
 	type expect struct {
 		shareSize   int
 		reclaimSize int
 	}
 	table := map[int]expect{
 		176: {shareSize: 176, reclaimSize: 4},
-		178: {shareSize: 178, reclaimSize: 2}, // legacy leftover partial, documented
-		180: {shareSize: 180, reclaimSize: 4},
-		184: {shareSize: 180, reclaimSize: 4},
-		192: {shareSize: 180, reclaimSize: 4},
-		198: {shareSize: 180, reclaimSize: 4},
+		178: {shareSize: 176, reclaimSize: 4},
+		180: {shareSize: 176, reclaimSize: 4},
+		184: {shareSize: 176, reclaimSize: 4},
+		192: {shareSize: 176, reclaimSize: 4},
+		198: {shareSize: 176, reclaimSize: 4},
 	}
 	prior := machine.MustParse("88-89,178-179")
 	for _, shareQty := range []int{176, 178, 180, 184, 192, 198} {

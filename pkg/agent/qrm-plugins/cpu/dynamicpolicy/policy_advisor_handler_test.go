@@ -209,6 +209,7 @@ func TestAllocateByCPUAdvisorPreservesUnadvisedSharedNUMABindingRampUpAllocation
 	require.NoError(t, err)
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 	require.NoError(t, err)
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	policy.config.reservedCPUs = topology.CPUDetails.CPUsInNUMANodes(1)
 	policy.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
 		"noop": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
@@ -1108,6 +1109,47 @@ func requireMigrationCheckpointTransitionEqual(
 	require.Equal(t, expected.target.target, actual.target.target)
 }
 
+func TestAllocateByCPUAdvisorDisabledReclaimConvergesAfterCanonicalFreeze(t *testing.T) {
+	t.Parallel()
+	policy, cleanup := newReclaimReuseTestPolicy(t)
+	defer cleanup()
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = false
+
+	committedReclaim := machine.NewCPUSet(4, 52)
+	committedEntries := precommitPartitionEntries(committedReclaim, machine.NewCPUSet())
+	committedMachineState, err := generateMachineStateFromPodEntries(
+		policy.machine.machineInfo.CPUTopology, committedEntries, policy.state.GetMachineState())
+	require.NoError(t, err)
+	require.NoError(t, policy.state.CommitAdvisorState(
+		committedEntries, committedMachineState, false, false, false))
+
+	handlersRun := 0
+	policy.adjustment.cpuSetAdjustmentHandlers = map[string]cpusetutil.CPUSetAdjustmentHandler{
+		"spy": func(context.Context, cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+			handlersRun++
+			return nil
+		},
+	}
+	resp := &advisorapi.ListAndWatchResponse{
+		Entries: map[string]*advisorapi.CalculationEntries{
+			"dedicated-pod": {Entries: map[string]*advisorapi.CalculationInfo{
+				"main": {OwnerPoolName: commonstate.PoolNameDedicated},
+			}},
+		},
+	}
+
+	revision := policy.state.GetRevision()
+	require.NoError(t, policy.allocateByCPUAdvisor(nil, resp, nil))
+	require.Equal(t, revision+1, policy.state.GetRevision())
+	require.Equal(t, 1, handlersRun)
+	require.True(t, reclaimPoolCPUSet(policy.state.GetPodEntries()).Equals(committedReclaim))
+
+	require.NoError(t, policy.allocateByCPUAdvisor(nil, resp, nil))
+	require.Equal(t, revision+1, policy.state.GetRevision())
+	require.Equal(t, 1, handlersRun)
+	require.True(t, reclaimPoolCPUSet(policy.state.GetPodEntries()).Equals(committedReclaim))
+}
+
 func TestAllocateByCPUAdvisorConcurrentFrameCannotOvertakePendingPostCommitApply(t *testing.T) {
 	t.Parallel()
 	policy, cleanup := newReclaimReuseTestPolicy(t)
@@ -1737,6 +1779,7 @@ func TestExclusiveDisjointPartitionLifecycleAndFlagTransitions(t *testing.T) {
 	checkpointDir := t.TempDir()
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, checkpointDir)
 	require.NoError(t, err)
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	policy.advisorPostCommitCheckpointDir = checkpointDir
 
 	wholeNUMA := topology.CPUDetails.CPUsInNUMANodes(0)
@@ -4386,6 +4429,7 @@ func TestDynamicPolicyApplyBlocksOverridesReclaimDedicatedOverlapBeforeCommit(t 
 
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, tmpDir)
 	require.NoError(t, err)
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	policy.state.SetPodEntries(state.PodEntries{
 		"pod-dedicated": {
 			"main": &state.AllocationInfo{
@@ -4668,6 +4712,7 @@ func TestDynamicPolicyApplyBlocksPreservesExplicitDisjointReclaim(t *testing.T) 
 
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, tmpDir)
 	require.NoError(t, err)
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	policy.reclaim.reservedReclaimedCPUSet = machine.NewCPUSet(4, 6)
 	policy.reclaim.reservedReclaimedTopologyAwareAssignments = map[int]machine.CPUSet{
 		0: machine.NewCPUSet(4),
@@ -4765,6 +4810,7 @@ func TestDynamicPolicyApplyBlocksUsesResponseModeWhenDisablingOverlap(t *testing
 
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, tmpDir)
 	require.NoError(t, err)
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	policy.reclaim.reservedReclaimedCPUSet = machine.NewCPUSet(0, 2)
 	policy.reclaim.reservedReclaimedTopologyAwareAssignments = map[int]machine.CPUSet{
 		0: machine.NewCPUSet(0),
@@ -4862,6 +4908,7 @@ func TestDynamicPolicyApplyBlocksUsesRevisionGuard(t *testing.T) {
 
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, tmpDir)
 	require.NoError(t, err)
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	policy.reclaim.reservedReclaimedCPUSet = machine.NewCPUSet(0, 2)
 	policy.reclaim.reservedReclaimedTopologyAwareAssignments = map[int]machine.CPUSet{
 		0: machine.NewCPUSet(0),
@@ -4941,6 +4988,7 @@ func TestDynamicPolicyApplyBlocksRejectsStaleFrameWithoutOverwritingDesiredState
 	require.NoError(t, err)
 	policy, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 	require.NoError(t, err)
+	policy.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 
 	oldDedicated := coresInNUMA(topology, 0, 0, 2)
 	oldReclaim := coresInNUMA(topology, 0, 2, 4)

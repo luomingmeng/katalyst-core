@@ -58,6 +58,7 @@ func newResidualCleanupLivenessPolicy(t *testing.T) *DynamicPolicy {
 	require.NoError(t, err)
 	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
 	require.NoError(t, err)
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
 	return p
 }
 
