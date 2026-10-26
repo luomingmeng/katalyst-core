@@ -80,6 +80,10 @@ func (m *unsupportedManager) GetNumaMemory(absCgroupPath string) (map[int]*commo
 	return nil, fmt.Errorf("unsupported manager v1")
 }
 
+func (m *unsupportedManager) GetHierarchicalNumaMemoryUsage(absCgroupPath string, pageSize uint64) (map[int]uint64, error) {
+	return nil, fmt.Errorf("unsupported manager v1")
+}
+
 func (m *unsupportedManager) GetMemoryPressure(absCgroupPath string, t common.PressureType) (*common.MemoryPressure, error) {
 	return nil, fmt.Errorf("unsupported manager v1")
 }

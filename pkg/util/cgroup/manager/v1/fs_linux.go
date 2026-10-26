@@ -269,15 +269,9 @@ func (m *manager) GetMemory(absCgroupPath string) (*common.MemoryStats, error) {
 }
 
 func (m *manager) GetNumaMemory(absCgroupPath string) (map[int]*common.MemoryNumaMetrics, error) {
-	const fileName = "memory.numa_stat"
-	content, err := libcgroups.ReadFile(absCgroupPath, fileName)
+	numaStat, err := common.ReadCgroupNumaStat(absCgroupPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read %s: %w", fileName, err)
-	}
-
-	numaStat, err := common.ParseCgroupNumaValue(content)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse numa stat: %w", err)
+		return nil, err
 	}
 
 	pageSize := uint64(syscall.Getpagesize())
@@ -307,6 +301,28 @@ func (m *manager) GetNumaMemory(absCgroupPath string) (map[int]*common.MemoryNum
 		}
 	}
 
+	return result, nil
+}
+
+func (m *manager) GetHierarchicalNumaMemoryUsage(absCgroupPath string, pageSize uint64) (map[int]uint64, error) {
+	if pageSize == 0 {
+		return nil, fmt.Errorf("page size must be positive")
+	}
+
+	numaStat, err := common.ReadCgroupNumaStat(absCgroupPath)
+	if err != nil {
+		return nil, err
+	}
+
+	hierarchicalTotal, ok := numaStat["hierarchical_total"]
+	if !ok {
+		return nil, fmt.Errorf("hierarchical_total is missing from memory.numa_stat")
+	}
+
+	result := make(map[int]uint64, len(hierarchicalTotal))
+	for numaID, pages := range hierarchicalTotal {
+		result[numaID] = pages * pageSize
+	}
 	return result, nil
 }
 

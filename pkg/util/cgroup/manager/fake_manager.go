@@ -68,6 +68,10 @@ func (f *FakeCgroupManager) GetNumaMemory(absCgroupPath string) (map[int]*common
 	return nil, nil
 }
 
+func (f *FakeCgroupManager) GetHierarchicalNumaMemoryUsage(absCgroupPath string, pageSize uint64) (map[int]uint64, error) {
+	return nil, nil
+}
+
 func (m *FakeCgroupManager) GetMemoryPressure(absCgroupPath string, t common.PressureType) (*common.MemoryPressure, error) {
 	return nil, nil
 }

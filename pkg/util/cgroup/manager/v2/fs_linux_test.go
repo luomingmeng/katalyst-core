@@ -62,6 +62,59 @@ func TestNewManager(t *testing.T) {
 	}
 }
 
+func Test_manager_GetHierarchicalNumaMemoryUsage(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	content := "anon N0=100 N1=200\nfile N0=30 N1=40\nunevictable N0=5 N1=6\n"
+	if err := os.WriteFile(filepath.Join(dir, "memory.numa_stat"), []byte(content), 0o644); err != nil {
+		t.Fatalf("write memory.numa_stat: %v", err)
+	}
+
+	got, err := NewManager().GetHierarchicalNumaMemoryUsage(dir, 0)
+	if err != nil {
+		t.Fatalf("GetHierarchicalNumaMemoryUsage() error = %v", err)
+	}
+	want := map[int]uint64{0: 135, 1: 246}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("GetHierarchicalNumaMemoryUsage() = %v, want %v", got, want)
+	}
+}
+
+func Test_manager_GetHierarchicalNumaMemoryUsageRejectsMissingAnonOrFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	// unevictable is optional, but anon/file are required inputs.
+	content := "anon N0=100\nunevictable N0=5\n"
+	if err := os.WriteFile(filepath.Join(dir, "memory.numa_stat"), []byte(content), 0o644); err != nil {
+		t.Fatalf("write memory.numa_stat: %v", err)
+	}
+
+	if _, err := NewManager().GetHierarchicalNumaMemoryUsage(dir, 0); err == nil {
+		t.Fatal("GetHierarchicalNumaMemoryUsage() expected error")
+	}
+}
+
+func Test_manager_GetHierarchicalNumaMemoryUsageTreatsMissingUnevictableAsZero(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	content := "anon N0=100 N1=200\nfile N0=30 N1=40\n"
+	if err := os.WriteFile(filepath.Join(dir, "memory.numa_stat"), []byte(content), 0o644); err != nil {
+		t.Fatalf("write memory.numa_stat: %v", err)
+	}
+
+	got, err := NewManager().GetHierarchicalNumaMemoryUsage(dir, 0)
+	if err != nil {
+		t.Fatalf("GetHierarchicalNumaMemoryUsage() error = %v", err)
+	}
+	want := map[int]uint64{0: 130, 1: 240}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("GetHierarchicalNumaMemoryUsage() = %v, want %v", got, want)
+	}
+}
+
 func Test_manager_ApplyCPUSetWritesEmptyValues(t *testing.T) {
 	t.Parallel()
 

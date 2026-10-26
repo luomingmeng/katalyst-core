@@ -17,6 +17,7 @@ limitations under the License.
 package plugin
 
 import (
+	"fmt"
 	"math"
 	"strconv"
 
@@ -33,6 +34,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
+	cgroupmgr "github.com/kubewharf/katalyst-core/pkg/util/cgroup/manager"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	"github.com/kubewharf/katalyst-core/pkg/util/reclaim"
@@ -71,6 +73,9 @@ type memoryGuard struct {
 	// zoneInfoFn reads /proc/zoneinfo. When nil, machine.GetNormalZoneInfo is
 	// used. Tests inject a fake to avoid patching the global host probe.
 	zoneInfoFn func(file string) []machine.NormalZoneInfo
+	// numaMemoryUsageFn reads hierarchical per-NUMA usage in bytes. When nil,
+	// cgroupmgr.GetHierarchicalNumaMemoryUsageWithRelativePath is used.
+	numaMemoryUsageFn func(path string, pageSize uint64) (map[int]uint64, error)
 }
 
 func (mg *memoryGuard) materializedCgroupPaths(paths ...string) []string {
@@ -78,6 +83,19 @@ func (mg *memoryGuard) materializedCgroupPaths(paths ...string) []string {
 		return mg.existingCgroupPathsFn(paths...)
 	}
 	return common.GetExistingRelativeCgroupPaths(paths...)
+}
+
+func (mg *memoryGuard) getHierarchicalNumaMemoryUsage(path string) (map[int]uint64, error) {
+	fn := mg.numaMemoryUsageFn
+	if fn == nil {
+		fn = cgroupmgr.GetHierarchicalNumaMemoryUsageWithRelativePath
+	}
+	return fn(path, uint64(mg.metaServer.KatalystMachineInfo.PageSize))
+}
+
+// SetNumaMemoryUsageFnForTest overrides the direct cgroupfs usage reader. Test-only.
+func (mg *memoryGuard) SetNumaMemoryUsageFnForTest(fn func(string, uint64) (map[int]uint64, error)) {
+	mg.numaMemoryUsageFn = fn
 }
 
 // SetReclaimPathsForTest overrides the reclaim cgroup paths the guard iterates.
@@ -235,11 +253,15 @@ func (mg *memoryGuard) calculateReclaimedMemoryLimitFor(dynamicConfig *dynamicco
 
 	reclaimedMemoryUsed := .0
 	for _, p := range existingCgroupPaths {
-		m, err := mg.metaServer.GetCgroupNumaMetric(p, numaID, consts.MetricsMemTotalPerNumaCgroup)
+		perNumaUsage, err := mg.getHierarchicalNumaMemoryUsage(p)
 		if err != nil {
 			return 0, err
 		}
-		reclaimedMemoryUsed += m.Value
+		used, ok := perNumaUsage[numaID]
+		if !ok {
+			return 0, fmt.Errorf("numa %d usage is missing for cgroup %s", numaID, p)
+		}
+		reclaimedMemoryUsed += float64(used)
 	}
 
 	tmp, err := mg.metaServer.GetNumaMetric(numaID, consts.MetricMemTotalNuma)

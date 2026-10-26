@@ -157,6 +157,7 @@ func newTestMemoryAdvisor(t *testing.T, pods []*v1.Pod, checkpointDir, stateFile
 type guardTestHooks interface {
 	SetZoneInfoFnForTest(func(string) []machine.NormalZoneInfo)
 	SetExistingCgroupPathsFnForTest(func(...string) []string)
+	SetNumaMemoryUsageFnForTest(func(string, uint64) (map[int]uint64, error))
 	SetReclaimPathsForTest(parent []string, numaBinding map[int][]string)
 }
 
@@ -164,7 +165,7 @@ type guardTestHooks interface {
 // the advisor. zoneInfos may be nil, in which case the host probe is left alone.
 // materializedAll controls whether every configured reclaim cgroup path is
 // treated as present on the host.
-func injectGuardFakes(t *testing.T, mra *memoryResourceAdvisor, zoneInfos []machine.NormalZoneInfo, materializedAll bool) {
+func injectGuardFakes(t *testing.T, mra *memoryResourceAdvisor, zoneInfos []machine.NormalZoneInfo, materializedAll bool, cgroupNUMAMetrics []cgroupNUMAMetric) {
 	t.Helper()
 	for _, p := range mra.plugins {
 		g, ok := p.(guardTestHooks)
@@ -179,6 +180,23 @@ func injectGuardFakes(t *testing.T, mra *memoryResourceAdvisor, zoneInfos []mach
 			numaBinding[numaID] = []string{fmt.Sprintf("/kubepods/besteffort-%d", numaID)}
 		}
 		g.SetReclaimPathsForTest([]string{"/kubepods/besteffort"}, numaBinding)
+		usageByPath := make(map[string]map[int]uint64)
+		for _, item := range cgroupNUMAMetrics {
+			if item.metricName != coreconsts.MetricsMemTotalPerNumaCgroup {
+				continue
+			}
+			if usageByPath[item.cgroupPath] == nil {
+				usageByPath[item.cgroupPath] = make(map[int]uint64)
+			}
+			usageByPath[item.cgroupPath][item.numaID] = uint64(item.metricValue.Value)
+		}
+		g.SetNumaMemoryUsageFnForTest(func(path string, _ uint64) (map[int]uint64, error) {
+			usage, ok := usageByPath[path]
+			if !ok {
+				return nil, fmt.Errorf("missing hierarchical NUMA usage for %s", path)
+			}
+			return usage, nil
+		})
 		if zoneInfos != nil {
 			g.SetZoneInfoFnForTest(func(string) []machine.NormalZoneInfo { return zoneInfos })
 		}
@@ -4617,15 +4635,12 @@ func TestUpdate(t *testing.T) {
 			for _, qosClassMetric := range tt.cgroupMetrics {
 				metricsFetcher.SetCgroupMetric(qosClassMetric.cgroupPath, qosClassMetric.metricName, qosClassMetric.metricValue)
 			}
-			for _, cgroupNUMAMetric := range tt.cgroupNUMAMetrics {
-				metricsFetcher.SetCgroupNumaMetric(cgroupNUMAMetric.cgroupPath, cgroupNUMAMetric.numaID, cgroupNUMAMetric.metricName, cgroupNUMAMetric.metricValue)
-			}
 			if tt.metricsFetcherSynced != nil {
 				metricsFetcher.SetSynced(*tt.metricsFetcherSynced)
 			}
 
 			advisor, metaCache := newTestMemoryAdvisor(t, tt.pods, ckDir, sfDir, fetcher, tt.plugins)
-			injectGuardFakes(t, advisor, tt.zoneInfos, mockReclaimCgroupPaths)
+			injectGuardFakes(t, advisor, tt.zoneInfos, mockReclaimCgroupPaths, tt.cgroupNUMAMetrics)
 			advisor.conf.GetDynamicConfiguration().EnableReclaim = tt.reclaimedEnable
 			transparentMemoryOffloadingConfiguration := tmo.NewTransparentMemoryOffloadingConfiguration()
 			transparentMemoryOffloadingConfiguration.QoSLevelConfigs[consts.QoSLevelReclaimedCores] = tmo.NewTMOConfigDetail(transparentMemoryOffloadingConfiguration.DefaultConfigurations)
