@@ -83,6 +83,20 @@ func GetCgroupParamInt(cgroupPath, cgroupFile string) (int64, error) {
 	return res, nil
 }
 
+func ReadCgroupNumaStat(absCgroupPath string) (map[string]map[int]uint64, error) {
+	const fileName = "memory.numa_stat"
+	content, err := cgroups.ReadFile(absCgroupPath, fileName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read %s: %w", fileName, err)
+	}
+
+	numaStat, err := ParseCgroupNumaValue(content)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse numa stat: %w", err)
+	}
+	return numaStat, nil
+}
+
 /*
 ParseCgroupNumaValue parse cgroup numa stat files like `memory.numa_stat`.
 

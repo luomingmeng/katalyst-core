@@ -17,6 +17,7 @@ limitations under the License.
 package plugin
 
 import (
+	"fmt"
 	"math"
 	"strconv"
 	"sync"
@@ -279,7 +280,6 @@ func TestUpdateActualNUMABindingReclaimMemoryLimitUsesOneDynamicConfigSnapshot(t
 	for _, numaID := range []int{0, 1} {
 		fakeFetcher.SetNumaMetric(numaID, consts.MetricMemTotalNuma, metric.MetricData{Value: 1000, Time: &now})
 		fakeFetcher.SetNumaMetric(numaID, consts.MetricMemFreeNuma, metric.MetricData{Value: 1000, Time: &now})
-		fakeFetcher.SetCgroupNumaMetric("/reclaimed", numaID, consts.MetricsMemTotalPerNumaCgroup, metric.MetricData{Value: 0, Time: &now})
 	}
 
 	switchingFetcher := &switchingMetricsFetcher{
@@ -311,6 +311,10 @@ func TestUpdateActualNUMABindingReclaimMemoryLimitUsesOneDynamicConfigSnapshot(t
 		},
 		numaBindingReclaimMemoryLimit: &atomic.Value{},
 		conf:                          conf,
+		numaMemoryUsageFn: func(path string, pageSize uint64) (map[int]uint64, error) {
+			return map[int]uint64{0: 0, 1: 0}, nil
+		},
+		existingCgroupPathsFn: func(paths ...string) []string { return paths },
 	}
 	zoneInfos := []machine.NormalZoneInfo{
 		{Node: 0, Free: 1000, Low: 100, High: 400},
@@ -320,6 +324,29 @@ func TestUpdateActualNUMABindingReclaimMemoryLimitUsesOneDynamicConfigSnapshot(t
 	require.NoError(t, mg.updateActualNUMABindingReclaimMemoryLimit(snapshot, zoneInfos))
 	require.Same(t, replacement, conf.GetDynamicConfiguration())
 	require.Equal(t, map[int]int64{0: 900, 1: 900}, mg.numaBindingReclaimMemoryLimit.Load())
+}
+
+func TestGetHierarchicalNumaMemoryUsageUsesMachinePageSize(t *testing.T) {
+	t.Parallel()
+
+	metaServer := &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{
+		KatalystMachineInfo: &machine.KatalystMachineInfo{
+			MachineInfo:    &cadvisorinfo.MachineInfo{},
+			MemoryTopology: &machine.MemoryTopology{PageSize: 65536},
+		},
+	}}
+	mg := &memoryGuard{
+		metaServer: metaServer,
+		numaMemoryUsageFn: func(path string, pageSize uint64) (map[int]uint64, error) {
+			require.Equal(t, "/reclaimed", path)
+			require.Equal(t, uint64(65536), pageSize)
+			return map[int]uint64{0: pageSize}, nil
+		},
+	}
+
+	got, err := mg.getHierarchicalNumaMemoryUsage("/reclaimed")
+	require.NoError(t, err)
+	require.Equal(t, map[int]uint64{0: 65536}, got)
 }
 
 func TestCalculateReclaimedMemoryLimitFor_SkipsMissingCgroupPath(t *testing.T) {
@@ -353,9 +380,8 @@ func TestCalculateReclaimedMemoryLimitFor_SkipsMissingCgroupPath(t *testing.T) {
 
 	zoneInfos := []machine.NormalZoneInfo{{Node: 0, Free: 1000, Low: 100, High: 400}}
 
-	// neither reclaimed parent is materialized on the test host, so both are
-	// filtered out before any per-numa metric lookup. the reconcile must not
-	// abort when the metric store has no entry for a missing reclaimed parent.
+	// Neither reclaimed parent is materialized on the test host, so both are
+	// filtered before any cgroupfs read and do not abort the reconcile.
 	limit, err := mg.calculateReclaimedMemoryLimitFor(snapshot, 0,
 		[]string{"/reclaimed-parent-a", "/reclaimed-parent-b"}, zoneInfos)
 	require.NoError(t, err)
@@ -364,7 +390,7 @@ func TestCalculateReclaimedMemoryLimitFor_SkipsMissingCgroupPath(t *testing.T) {
 	require.Equal(t, 900.0, limit)
 }
 
-func TestCalculateReclaimedMemoryLimitFor_FailsFastWhenMaterializedCgroupMetricMissing(t *testing.T) {
+func TestCalculateReclaimedMemoryLimitFor_FailsFastWhenCgroupReadFails(t *testing.T) {
 	t.Parallel()
 
 	conf := config.NewConfiguration()
@@ -378,7 +404,6 @@ func TestCalculateReclaimedMemoryLimitFor_FailsFastWhenMaterializedCgroupMetricM
 	fakeFetcher.SetNodeMetric(consts.MetricMemScaleFactorSystem, metric.MetricData{Value: 0, Time: &now})
 	fakeFetcher.SetNumaMetric(0, consts.MetricMemTotalNuma, metric.MetricData{Value: 1000, Time: &now})
 	fakeFetcher.SetNumaMetric(0, consts.MetricMemFreeNuma, metric.MetricData{Value: 1000, Time: &now})
-	// deliberately no SetCgroupNumaMetric for the reclaimed parent
 
 	metaServer := &metaserver.MetaServer{
 		MetaAgent: &agent.MetaAgent{
@@ -393,10 +418,11 @@ func TestCalculateReclaimedMemoryLimitFor_FailsFastWhenMaterializedCgroupMetricM
 		metaServer:           metaServer,
 		minCriticalWatermark: 0,
 		conf:                 conf,
-		// Treat every reclaimed parent as materialized on the host, so the
-		// existence filter keeps it but cAdvisor has not yet produced its
-		// per-NUMA counters. This must surface as a hard error (fail-fast)
-		// instead of being silently treated as zero usage.
+		numaMemoryUsageFn: func(path string, pageSize uint64) (map[int]uint64, error) {
+			return nil, fmt.Errorf("read memory.numa_stat")
+		},
+		// A materialized reclaimed parent must fail the reconcile when its direct
+		// cgroupfs read fails; treating the usage as zero could lower the limit.
 		existingCgroupPathsFn: func(paths ...string) []string { return paths },
 	}
 
@@ -452,9 +478,10 @@ func TestCalculateReclaimedMemoryLimitFor_LimitMargin(t *testing.T) {
 			fetcher.SetNumaMetric(0, consts.MetricMemTotalNuma, metric.MetricData{Value: 1000, Time: &now})
 			fetcher.SetNumaMetric(0, consts.MetricMemFreeNuma, metric.MetricData{Value: float64(tc.free), Time: &now})
 			paths := make([]string, len(tc.used))
+			usageByPath := make(map[string]uint64, len(tc.used))
 			for i, used := range tc.used {
 				paths[i] = "/reclaimed-" + strconv.Itoa(i)
-				fetcher.SetCgroupNumaMetric(paths[i], 0, consts.MetricsMemTotalPerNumaCgroup, metric.MetricData{Value: used, Time: &now})
+				usageByPath[paths[i]] = uint64(used)
 			}
 			metaServer := &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{
 				MetricsFetcher: fetcher,
@@ -465,6 +492,9 @@ func TestCalculateReclaimedMemoryLimitFor_LimitMargin(t *testing.T) {
 			}}
 			mg := NewMemoryGuard(conf, nil, nil, metaServer, metrics.DummyMetrics{}).(*memoryGuard)
 			mg.existingCgroupPathsFn = func(paths ...string) []string { return paths }
+			mg.numaMemoryUsageFn = func(path string, pageSize uint64) (map[int]uint64, error) {
+				return map[int]uint64{0: usageByPath[path]}, nil
+			}
 			limit, err := mg.calculateReclaimedMemoryLimitFor(snapshot, 0, paths,
 				[]machine.NormalZoneInfo{{Node: 0, Free: tc.free, Low: 100}})
 			require.NoError(t, err)
@@ -506,6 +536,10 @@ func TestMemoryGuardLimitMarginUpdatesAndAdvices(t *testing.T) {
 		2: {"/margin-a-2", "/margin-b-2"},
 	}
 	mg.existingCgroupPathsFn = func(paths ...string) []string { return paths }
+	usageByPath := make(map[string]map[int]uint64)
+	mg.numaMemoryUsageFn = func(path string, pageSize uint64) (map[int]uint64, error) {
+		return usageByPath[path], nil
+	}
 	zoneInfos := []machine.NormalZoneInfo{
 		{Node: 0, Free: 50, Low: 100},
 		{Node: 1, Free: 50, Low: 100},
@@ -517,7 +551,10 @@ func TestMemoryGuardLimitMarginUpdatesAndAdvices(t *testing.T) {
 		fetcher.SetNumaMetric(numaID, consts.MetricMemFreeNuma, metric.MetricData{Value: 50, Time: &now})
 		for _, paths := range [][]string{mg.reclaimRelativeRootCgroupPaths, mg.numaBindingRelativeRootCgroupPaths[numaID]} {
 			for _, path := range paths {
-				fetcher.SetCgroupNumaMetric(path, numaID, consts.MetricsMemTotalPerNumaCgroup, metric.MetricData{Value: used / 2, Time: &now})
+				if usageByPath[path] == nil {
+					usageByPath[path] = make(map[int]uint64)
+				}
+				usageByPath[path][numaID] = uint64(used / 2)
 			}
 		}
 	}

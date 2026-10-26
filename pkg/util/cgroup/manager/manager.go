@@ -51,6 +51,7 @@ type Manager interface {
 
 	GetMemory(absCgroupPath string) (*common.MemoryStats, error)
 	GetNumaMemory(absCgroupPath string) (map[int]*common.MemoryNumaMetrics, error)
+	GetHierarchicalNumaMemoryUsage(absCgroupPath string, pageSize uint64) (map[int]uint64, error)
 	GetMemoryPressure(absCgroupPath string, t common.PressureType) (*common.MemoryPressure, error)
 	GetCPU(absCgroupPath string) (*common.CPUStats, error)
 	GetCPUSet(absCgroupPath string) (*common.CPUSetStats, error)

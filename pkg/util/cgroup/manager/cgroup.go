@@ -254,6 +254,11 @@ func GetMemoryWithAbsolutePath(absCgroupPath string) (*common.MemoryStats, error
 	return GetManager().GetMemory(absCgroupPath)
 }
 
+func GetHierarchicalNumaMemoryUsageWithRelativePath(relCgroupPath string, pageSize uint64) (map[int]uint64, error) {
+	absCgroupPath := common.GetAbsCgroupPath(common.CgroupSubsysMemory, relCgroupPath)
+	return GetManager().GetHierarchicalNumaMemoryUsage(absCgroupPath, pageSize)
+}
+
 func GetMemoryPressureWithAbsolutePath(absCgroupPath string, t common.PressureType) (*common.MemoryPressure, error) {
 	return GetManager().GetMemoryPressure(absCgroupPath, t)
 }
