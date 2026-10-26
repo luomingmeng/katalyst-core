@@ -1450,6 +1450,17 @@ func (p *DynamicPolicy) persistAdvisorPostCommitApplied(target *advisorPostCommi
 }
 
 func (p *DynamicPolicy) completeAdvisorPostCommitCleanup(target *advisorPostCommitTarget) error {
+	// Terminal recovery-completion chokepoint: every success-declaring path funnels
+	// through here — a fresh physical apply, an apply-marker persisted after a
+	// crash, or an applied target loaded back from disk. Replay never re-plans
+	// canonical entries, so an empty/missing reclaim pool cannot be repaired; fail
+	// closed before removing the WAL or releasing the fence. The retained applied
+	// bit is not rolled back: target and WAL stay for inspection and bounded retry.
+	if err := validateRequiredReclaimPool(p.state.GetPodEntries()); err != nil {
+		return fmt.Errorf("recovered advisor post-commit revision %d has empty reclaim pool, refusing cleanup: %w",
+			target.revision, err)
+	}
+
 	if err := p.removeAdvisorPostCommitCheckpoints(); err != nil {
 		p.adjustment.cpuSetAdjustmentRetryMu.Lock()
 		if p.adjustment.advisorPostCommitTarget == target {
@@ -1670,6 +1681,18 @@ func (p *DynamicPolicy) reconcileAdvisorPostCommitTarget(
 	mode := cpusetutil.CPUSetAdjustmentModePeriodic
 	if len(modes) > 0 {
 		mode = modes[0].OrFullDefault()
+	}
+	// Pre-check before spending physical writes: replay only converges
+	// response-owned side effects and never re-plans canonical entries, so an
+	// empty/missing reclaim pool has no reliable exact cpuset to converge toward.
+	// Fail closed before applyTransition/headroom/cgroup/cpuset instead of writing
+	// physical state for a terminal result that cannot be made ready.
+	if err := validateRequiredReclaimPool(p.state.GetPodEntries()); err != nil {
+		if mode != cpusetutil.CPUSetAdjustmentModeRetry {
+			p.markAdvisorApplyFailed(target.revision)
+		}
+		return fmt.Errorf("replayed advisor post-commit revision %d left canonical reclaim pool empty: %w",
+			target.revision, err)
 	}
 	if err := p.steadyFakeNUMAMigration.applyTransition(
 		target.migrationCheckpointTransition); err != nil {

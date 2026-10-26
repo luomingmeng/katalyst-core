@@ -754,6 +754,13 @@ func NewDynamicPolicy(agentCtx *agent.GenericContext, conf *config.Configuration
 			return false, agent.ComponentStub{}, fmt.Errorf("dynamic policy ensureInitialReclaimPool failed with error: %v", err)
 		}
 	}
+	// A pending replayable WAL skips the bootstrap repair above and the replay does
+	// not re-plan entries, so an empty/missing reclaim pool in the restored
+	// checkpoint is tolerated here: the candidate may be constructed empty. The
+	// reclaim non-empty invariant is enforced at the replay-completion boundary in
+	// reconcileAdvisorPostCommitTarget, which fails closed (keeping the WAL, not
+	// marking applied/cleanup, not becoming ready) when the restored canonical
+	// state cannot provide a reliable exact reclaim cpuset.
 
 	if err := policyImplement.RegisterCPUSetAdjustmentHandler("bulkhead", policyImplement.bulkhead.bulkheadManager.RunCPUSetAdjustmentHandlers); err != nil {
 		return false, agent.ComponentStub{}, fmt.Errorf("dynamic policy register bulkhead cpuset adjustment handler failed with error: %v", err)
