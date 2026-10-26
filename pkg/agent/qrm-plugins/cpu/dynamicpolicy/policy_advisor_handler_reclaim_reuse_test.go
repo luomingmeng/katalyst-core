@@ -77,6 +77,11 @@ func newReclaimReuseTestPolicy(t *testing.T) (*DynamicPolicy, func()) {
 		require.NoError(t, err)
 	}
 	p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	// Production commits always carry a non-empty reclaim pool (the canonical
+	// precommit/apply/ensure paths all enforce it). Seed that invariant here so
+	// WAL-lifecycle reconciles exercise the success path; tests that control the
+	// "previous reclaim" cpuset override it via setReclaimPoolCPUSet.
+	setReclaimPoolCPUSet(t, p, machine.NewCPUSet(0, 1))
 	return p, func() { _ = os.RemoveAll(tmpDir) }
 }
 

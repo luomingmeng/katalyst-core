@@ -42,6 +42,8 @@ const (
 	periodicCleanupRoleSuccess  = "success"
 	periodicCleanupRoleError    = "error"
 	periodicCleanupRoleFatal    = "fatal"
+	periodicRoleInFlight        = "in-flight"
+	periodicRoleConverged       = "converged"
 )
 
 var errPeriodicCleanupSynthetic = errors.New("periodic cleanup synthetic failure")
@@ -148,6 +150,70 @@ func childPeriodicCleanupFatal(t *testing.T) {
 	require.Equal(t, 1, calls)
 }
 
+// childPeriodicInFlight drives the real periodic entry while a newly published
+// advisor post-commit target is still being applied. This normal transient state
+// must not make SyncBulkhead not ready; actual reconcile/apply failures remain
+// responsible for reporting their own health errors.
+func childPeriodicInFlight(t *testing.T) {
+	t.Helper()
+	general.RegisterReportCheck(cpuconsts.SyncBulkhead, 0, general.HealthzCheckStateReady)
+	t.Cleanup(func() { general.UnregisterHealthCheck(cpuconsts.SyncBulkhead) })
+
+	dyn := dynamicconfig.NewDynamicAgentConfiguration()
+	manager, err := bulkhead.NewManager(nil)
+	require.NoError(t, err)
+	p := &DynamicPolicy{
+		config:   configComponent{dynamicConfig: dyn},
+		bulkhead: bulkheadComponent{bulkheadManager: manager},
+		adjustment: adjustmentComponent{
+			advisorPostCommitTarget: &advisorPostCommitTarget{revision: 7},
+			cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+				"periodic-in-flight-recorder": func(_ context.Context, _ cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+					return nil
+				},
+			},
+		},
+	}
+
+	p.runBulkheadPeriodicalHandlers(nil, nil, p.config.dynamicConfig, nil, nil)
+
+	res := general.GetRegisterReadinessCheckResult()
+	state, ok := res[general.HealthzCheckName(cpuconsts.SyncBulkhead)]
+	require.True(t, ok)
+	require.True(t, state.Ready, "a fresh in-flight target must not make SyncBulkhead not ready")
+}
+
+// childPeriodicConverged drives the real periodic entry with no pending advisor
+// post-commit target (recovery fully completed). The manager may run and
+// SyncBulkhead must reach Ready.
+func childPeriodicConverged(t *testing.T) {
+	t.Helper()
+	general.RegisterReportCheck(cpuconsts.SyncBulkhead, 0, general.HealthzCheckStateReady)
+	t.Cleanup(func() { general.UnregisterHealthCheck(cpuconsts.SyncBulkhead) })
+
+	dyn := dynamicconfig.NewDynamicAgentConfiguration()
+	manager, err := bulkhead.NewManager(nil)
+	require.NoError(t, err)
+	p := &DynamicPolicy{
+		config:   configComponent{dynamicConfig: dyn},
+		bulkhead: bulkheadComponent{bulkheadManager: manager},
+		adjustment: adjustmentComponent{
+			cpuSetAdjustmentHandlers: map[string]cpusetutil.CPUSetAdjustmentHandler{
+				"periodic-gate-recorder": func(_ context.Context, _ cpusetutil.CPUSetAdjustmentHandlerCtx) error {
+					return nil
+				},
+			},
+		},
+	}
+
+	p.runBulkheadPeriodicalHandlers(nil, nil, p.config.dynamicConfig, nil, nil)
+
+	res := general.GetRegisterReadinessCheckResult()
+	state, ok := res[general.HealthzCheckName(cpuconsts.SyncBulkhead)]
+	require.True(t, ok)
+	require.True(t, state.Ready, "converged recovery must leave SyncBulkhead ready")
+}
+
 // runPeriodicCleanupSubprocess re-executes the test binary in an isolated child
 // process for the requested role and fails the parent on a non-zero exit.
 func runPeriodicCleanupSubprocess(t *testing.T, role string) {
@@ -184,6 +250,12 @@ func TestBulkheadPeriodicalCleanupAcquiresPolicyLockAndReleasesLease(t *testing.
 	case periodicCleanupRoleFatal:
 		childPeriodicCleanupFatal(t)
 		return
+	case periodicRoleInFlight:
+		childPeriodicInFlight(t)
+		return
+	case periodicRoleConverged:
+		childPeriodicConverged(t)
+		return
 	}
 
 	t.Run("success returns lock and drains lease", func(t *testing.T) {
@@ -199,5 +271,15 @@ func TestBulkheadPeriodicalCleanupAcquiresPolicyLockAndReleasesLease(t *testing.
 	t.Run("patched subprocess returns cleanly without unlocked-RWMutex fatal", func(t *testing.T) {
 		t.Parallel()
 		runPeriodicCleanupSubprocess(t, periodicCleanupRoleFatal)
+	})
+
+	t.Run("fresh in-flight target leaves SyncBulkhead ready", func(t *testing.T) {
+		t.Parallel()
+		runPeriodicCleanupSubprocess(t, periodicRoleInFlight)
+	})
+
+	t.Run("converged recovery leaves SyncBulkhead ready", func(t *testing.T) {
+		t.Parallel()
+		runPeriodicCleanupSubprocess(t, periodicRoleConverged)
 	})
 }

@@ -1977,6 +1977,9 @@ func TestAdvisorMigrationTransitionSurvivesCommitCrashAndRestart(t *testing.T) {
 	dir := t.TempDir()
 	first, err := getTestDynamicPolicyWithoutInitialization(topology, dir)
 	require.NoError(t, err)
+	// Production commits always carry a non-empty reclaim pool; seed it so the
+	// crash/restart replay reaches the cleanup path the test exercises.
+	setReclaimPoolCPUSet(t, first, machine.NewCPUSet(0))
 	targetCPUSet := coresInNUMA(topology, 0, 2, 4)
 	preCommitRevision := first.state.GetRevision()
 
