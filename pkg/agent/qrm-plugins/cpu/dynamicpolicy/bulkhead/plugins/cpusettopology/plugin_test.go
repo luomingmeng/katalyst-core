@@ -4506,6 +4506,62 @@ func bulkheadCpusetTopologyDynamicConf(enableBulkheadCpusetTopology, allowShared
 	return conf
 }
 
+func TestCPUSetTopologyPluginRetainsFreshMissingPodWithinAdmissionProtectionTTL(t *testing.T) {
+	t.Parallel()
+
+	podUID := "missing-pod"
+	podScope := "kubepods/podmissing-pod"
+	now := time.Unix(100, 0)
+	statErrors := make(map[string]error)
+	for _, rel := range cgcommon.GetPodRelativeCgroupPathCandidates(podUID) {
+		statErrors[strings.Trim(rel, "/")] = os.ErrNotExist
+	}
+	view := &model.DesiredView{CPUSetPartitionView: model.CPUSetPartitionView{
+		ContainerCPUSetByPod: map[string]map[string]machine.CPUSet{
+			podUID: {"main": machine.NewCPUSet(0, 1)},
+		},
+	}}
+	metaServer := &metaserver.MetaServer{
+		MetaAgent: &agent.MetaAgent{PodFetcher: &metapod.PodFetcherStub{}},
+	}
+
+	for _, tt := range []struct {
+		name         string
+		protectUntil time.Time
+		wantPending  bool
+	}{
+		{name: "unexpired admission protection", protectUntil: now.Add(time.Second), wantPending: true},
+		{name: "expired admission protection", protectUntil: now, wantPending: false},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			p := &CPUSetTopologyPlugin{
+				cgroup: &fakeCgroupClient{statErrors: statErrors},
+				now:    func() time.Time { return now },
+				pendingProtections: map[string]pendingPodProtection{
+					podUID: {rel: podScope, protectUntil: tt.protectUntil},
+				},
+			}
+			res, err := p.buildExpectedCPUSetByRel(context.Background(), bulkheadapi.HandlerContext{
+				CPUSetAdjustmentHandlerCtx: cpusetutil.CPUSetAdjustmentHandlerCtx{
+					MetaServer: metaServer,
+					Mode:       cpusetutil.CPUSetAdjustmentModeAdmission,
+				},
+				DesiredView: view,
+			})
+			if err != nil {
+				t.Fatalf("build expected cpuset: %v", err)
+			}
+			if got := len(res.PendingByPod); (got == 1) != tt.wantPending {
+				t.Fatalf("pending count = %d, want pending=%t: %#v", got, tt.wantPending, res.PendingByPod)
+			}
+			if tt.wantPending && res.PendingByPod[0].ScopeRel != podScope {
+				t.Fatalf("pending scope = %q, want %q", res.PendingByPod[0].ScopeRel, podScope)
+			}
+		})
+	}
+}
+
 func TestCPUSetTopologyPluginDropsFreshMissingPodWithoutPodCgroupFromPendingProtection(t *testing.T) {
 	t.Parallel()
 

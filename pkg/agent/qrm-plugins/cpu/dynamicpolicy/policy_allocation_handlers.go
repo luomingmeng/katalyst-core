@@ -580,12 +580,13 @@ func (p *DynamicPolicy) sharedCoresWithoutNUMABindingAllocationHandler(ctx conte
 				return nil, err
 			}
 		} else {
-			_, err := p.doAndCheckPutAllocationInfo(ctx, allocationInfo, true, persistCheckpoint)
+			checkedAllocationInfo, err := p.doAndCheckPutAllocationInfo(ctx, allocationInfo, true, persistCheckpoint)
 			if err != nil {
 				general.Errorf("pod: %s/%s, container: %s doAndCheckPutAllocationInfo failed: %q",
 					req.PodNamespace, req.PodName, req.ContainerName, err)
 				return nil, err
 			}
+			allocationInfo = checkedAllocationInfo
 		}
 		needSet = false
 	}
@@ -3633,15 +3634,12 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 		}
 	}
 
-	// The hard-partition invariant is enforced against the FINAL reclaim pool:
-	// rampUpCPUs above is computed to include the reclaim pool (only the
-	// ramp-up reclaim floor is subtracted), so plain ramp-up shared
-	// allocations may end up overlapping the final reclaim pool after
-	// reviseReclaimPool. Restore mutual exclusion here, before the pending
-	// partition is committed. SNB ramp-up allocations are protected by the
-	// bulkhead partition view and are not rematerialized here.
-	if isRampUpReclaimHardPartitionEnabledWithConfig(dynamicConf) &&
-		newPodEntries.HasActiveRampUp() {
+	// Explicit ramp-up cpusets must remain writable below the non-reclaim
+	// parent even when hard partitioning is disabled. Containers that may omit
+	// cpuset keep the historical logical overlap and inherit that parent.
+	hardPartition := isRampUpReclaimHardPartitionEnabledWithConfig(dynamicConf)
+	if newPodEntries.HasActiveRampUp() &&
+		(hardPartition || exposedRampUpNeedsPhysicalDisjoint(dynamicConf, allowSharedCoresOverlapReclaimedCores)) {
 		// The bulkhead BuildValidated view TPNR-trims the physical
 		// ReclaimEffective to exclude active SNB (Shared-NUMA-Binding) ramp-up
 		// CPUs (they stay a desired reclaim target). Write that physical value
@@ -3655,7 +3653,8 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 		// quadrant whose TPNR trim the view computes but otherwise discards.
 		// Dedicated/DNB ramp-up has no TPNR protection, and running the
 		// view-driven reclaim rewrite there would drop the DNB ramp-up floor.
-		if hasActiveSNBRampUp(newPodEntries) {
+		if (hardPartition || exposedRampUpNeedsPhysicalDisjoint(
+			dynamicConf, allowSharedCoresOverlapReclaimedCores)) && hasActiveSNBRampUp(newPodEntries) {
 			commitOverride, err := p.buildAdjustmentCommitOverrideFromPodEntriesWithDynamicConfig(
 				newPodEntries,
 				allowSharedCoresOverlapReclaimedCores,
@@ -3671,8 +3670,12 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 				return fmt.Errorf("sync reclaim pool with adjustment commit override for pool adjustment failed with error: %w", err)
 			}
 		}
-		if err := p.rematerializeRampUpSharedAgainstFinalReclaim(newPodEntries); err != nil {
-			return fmt.Errorf("rematerialize ramp-up shared allocations against final reclaim pool failed with error: %w", err)
+		if hardPartition {
+			if err := p.rematerializeRampUpSharedAgainstFinalReclaim(newPodEntries); err != nil {
+				return fmt.Errorf("rematerialize ramp-up shared allocations against final reclaim pool failed with error: %w", err)
+			}
+		} else if err := p.rematerializeExposedRampUpSharedAgainstFinalReclaim(newPodEntries); err != nil {
+			return fmt.Errorf("rematerialize exposed ramp-up shared allocations against final reclaim pool failed with error: %w", err)
 		}
 	}
 

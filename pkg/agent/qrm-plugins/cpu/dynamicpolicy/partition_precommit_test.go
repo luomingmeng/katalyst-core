@@ -1370,11 +1370,12 @@ func TestPreparePendingCPUPartitionPreservesDisabledReclaimIdentity(t *testing.T
 
 			beforeRevision := p.state.GetRevision()
 			committed, _, err := p.commitPendingCPUPartition(pendingCPUPartition{
-				expectedRevision: beforeRevision,
-				entries:          precommitPartitionEntries(tc.candidate, machine.NewCPUSet(2, 3)),
-				disableDedicated: true,
-				persist:          false,
-				dynamicConfig:    dynamicConf,
+				expectedRevision:     beforeRevision,
+				entries:              precommitPartitionEntries(tc.candidate, machine.NewCPUSet(2, 3)),
+				disableDedicated:     true,
+				persist:              false,
+				enforceSteadyReclaim: true,
+				dynamicConfig:        dynamicConf,
 			})
 			require.NoError(t, err)
 			require.Equal(t, beforeRevision+1, p.state.GetRevision())
