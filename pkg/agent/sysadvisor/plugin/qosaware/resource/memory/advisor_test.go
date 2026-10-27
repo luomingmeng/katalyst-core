@@ -1306,7 +1306,7 @@ func TestUpdate(t *testing.T) {
 			},
 		},
 		{
-			name: "set reclaimed group memory limit(succeeded)",
+			name: "set reclaimed group memory limit(failed, missing target zoneinfo)",
 			pools: map[string]*types.PoolInfo{
 				commonstate.PoolNameReserve: {
 					PoolName: commonstate.PoolNameReserve,
@@ -1321,13 +1321,16 @@ func TestUpdate(t *testing.T) {
 				},
 			},
 			reclaimedEnable:   true,
-			wantErr:           false,
+			wantErr:           true,
 			wantHeadroom:      *resource.NewQuantity(996<<30, resource.DecimalSI),
 			nodeMetrics:       defaultNodeMetrics,
 			numaMetrics:       defaultNumaMetrics,
 			cgroupMetrics:     cgroupMetrics,
 			cgroupNUMAMetrics: cgroupNUMAMetrics,
 			plugins:           []types.MemoryAdvisorPluginName{memadvisorplugin.MemoryGuard},
+			// The only zone entry targets Node -1, which never matches a real NUMA
+			// id. calculateReclaimedMemoryLimitFor must fail-closed on the missing
+			// zone info instead of falling back to cAdvisor metrics.
 			zoneInfos: []machine.NormalZoneInfo{
 				{
 					Node: -1,
@@ -1336,43 +1339,7 @@ func TestUpdate(t *testing.T) {
 				},
 			},
 			wantAdviceResult: &types.InternalMemoryCalculationResult{
-				ExtraEntries: []types.ExtraMemoryAdvices{
-					{
-						CgroupPath: "/kubepods/besteffort",
-						Values: map[string]string{
-							string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes): "257698037760",
-							string(memoryadvisor.ControlKnobKeyMemoryHigh):         "244813135872",
-						},
-					},
-					{
-						CgroupPath: "/kubepods/besteffort-0",
-						Values: map[string]string{
-							string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes): "64424509440",
-							string(memoryadvisor.ControlKnobKeyMemoryHigh):         "61203283968",
-						},
-					},
-					{
-						CgroupPath: "/kubepods/besteffort-1",
-						Values: map[string]string{
-							string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes): "64424509440",
-							string(memoryadvisor.ControlKnobKeyMemoryHigh):         "61203283968",
-						},
-					},
-					{
-						CgroupPath: "/kubepods/besteffort-2",
-						Values: map[string]string{
-							string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes): "64424509440",
-							string(memoryadvisor.ControlKnobKeyMemoryHigh):         "61203283968",
-						},
-					},
-					{
-						CgroupPath: "/kubepods/besteffort-3",
-						Values: map[string]string{
-							string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes): "64424509440",
-							string(memoryadvisor.ControlKnobKeyMemoryHigh):         "61203283968",
-						},
-					},
-				},
+				ExtraEntries: nil,
 			},
 		},
 		{
