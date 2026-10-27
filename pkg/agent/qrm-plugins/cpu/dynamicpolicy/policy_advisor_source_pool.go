@@ -129,9 +129,29 @@ func (p *DynamicPolicy) allocateAdvisorSourceBlocksForCarve(
 	globalNonReclaimableCPUSet machine.CPUSet,
 	sourceBlockByPool map[string]string,
 ) error {
+	return p.allocateAdvisorSourceBlocksForCarveWithConstraint(
+		sourceShareBlocks, isolationBlocks, blockCPUSet, availableCPUs, nodeRemainingCPUs,
+		globalNonReclaimableCPUSet, sourceBlockByPool, frozenReclaimPlacementConstraint{})
+}
+
+func (p *DynamicPolicy) allocateAdvisorSourceBlocksForCarveWithConstraint(
+	sourceShareBlocks []*advisorapi.BlockInfo,
+	isolationBlocks []*advisorapi.BlockInfo,
+	blockCPUSet advisorapi.BlockCPUSet,
+	availableCPUs *machine.CPUSet,
+	nodeRemainingCPUs *machine.CPUSet,
+	globalNonReclaimableCPUSet machine.CPUSet,
+	sourceBlockByPool map[string]string,
+	frozenReclaim frozenReclaimPlacementConstraint,
+) error {
+	entries := frozenReclaim.entries
+	if entries == nil {
+		entries = p.state.GetPodEntries()
+	}
 	isolationQuantityBySourceBlock := make(map[string]int)
+	sourceHasOverlapAllowedIsolation := make(map[string]bool)
 	for _, block := range isolationBlocks {
-		sourcePoolName, ok := deriveAdvisorIsolationSourcePool(block, p.state.GetPodEntries())
+		sourcePoolName, ok := deriveAdvisorIsolationSourcePool(block, entries)
 		if !ok {
 			continue
 		}
@@ -143,6 +163,9 @@ func (p *DynamicPolicy) allocateAdvisorSourceBlocksForCarve(
 		blockResult, err := general.CovertUInt64ToInt(block.Result)
 		if err != nil {
 			return fmt.Errorf("parse isolation block: %s result failed with error: %v", block.BlockId, err)
+		}
+		if !frozenReclaim.cpus.IsEmpty() && !frozenReclaim.blockDisallowed(block.OwnerPoolEntryMap) {
+			sourceHasOverlapAllowedIsolation[sourceBlockID] = true
 		}
 		isolationQuantityBySourceBlock[sourceBlockID] += blockResult
 	}
@@ -159,7 +182,7 @@ func (p *DynamicPolicy) allocateAdvisorSourceBlocksForCarve(
 		}
 
 		isolationQuantity := isolationQuantityBySourceBlock[block.BlockId]
-		if isolationQuantity == 0 {
+		if isolationQuantity == 0 || sourceHasOverlapAllowedIsolation[block.BlockId] {
 			continue
 		}
 
@@ -170,6 +193,9 @@ func (p *DynamicPolicy) allocateAdvisorSourceBlocksForCarve(
 
 		combinedResult := sourceResult + isolationQuantity
 		currentAvailableCPUs := availableCPUs.Difference(globalNonReclaimableCPUSet)
+		if frozenReclaim.blockDisallowed(block.OwnerPoolEntryMap) {
+			currentAvailableCPUs = currentAvailableCPUs.Difference(frozenReclaim.cpus)
+		}
 		cpuset, _, err := calculator.TakeByNUMABalance(p.machine.machineInfo, currentAvailableCPUs, combinedResult)
 		if err != nil {
 			return fmt.Errorf("allocate source block: %s with combined req: %d failed with error: %v",
@@ -203,6 +229,23 @@ func (p *DynamicPolicy) tryCarveAdvisorBlockFromSource(
 	numaID int,
 	blockResult int,
 ) (bool, error) {
+	return p.tryCarveAdvisorBlockFromSourceWithEntries(
+		block, sourceBlockByPool, sourceBlockResultByID, blockCPUSet, fallbackCandidate,
+		availableCPUs, nodeRemainingCPUs, numaID, blockResult, p.state.GetPodEntries())
+}
+
+func (p *DynamicPolicy) tryCarveAdvisorBlockFromSourceWithEntries(
+	block *advisorapi.BlockInfo,
+	sourceBlockByPool map[string]string,
+	sourceBlockResultByID map[string]int,
+	blockCPUSet advisorapi.BlockCPUSet,
+	fallbackCandidate machine.CPUSet,
+	availableCPUs *machine.CPUSet,
+	nodeRemainingCPUs *machine.CPUSet,
+	numaID int,
+	blockResult int,
+	entries state.PodEntries,
+) (bool, error) {
 	if block == nil {
 		return false, nil
 	}
@@ -210,7 +253,7 @@ func (p *DynamicPolicy) tryCarveAdvisorBlockFromSource(
 		return true, nil
 	}
 
-	sourcePoolName, ok := deriveAdvisorIsolationSourcePool(block, p.state.GetPodEntries())
+	sourcePoolName, ok := deriveAdvisorIsolationSourcePool(block, entries)
 	if !ok {
 		return false, nil
 	}
@@ -286,7 +329,7 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocksWithCheckpointTransition(
 		dynamicConf = p.config.conf.GetDynamicConfiguration()
 	}
 	return p.planDisjointAdvisorBlocksWithCheckpointTransitionAndDynamicConfig(
-		resp, hardActive, checkpointTransition, dynamicConf)
+		resp, hardActive, checkpointTransition, dynamicConf, frozenReclaimPlacementConstraint{})
 }
 
 func (p *DynamicPolicy) planDisjointAdvisorBlocksWithCheckpointTransitionAndDynamicConfig(
@@ -294,6 +337,7 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocksWithCheckpointTransitionAndDyna
 	hardActive bool,
 	checkpointTransition *steadyFakeNUMAMigrationCheckpointTransition,
 	dynamicConf *dynamicconfig.Configuration,
+	frozenReclaim frozenReclaimPlacementConstraint,
 ) (advisorapi.BlockCPUSet, error) {
 	topology := p.machine.machineInfo.CPUTopology
 	allCPUs := topology.CPUDetails.CPUs()
@@ -312,6 +356,10 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocksWithCheckpointTransitionAndDyna
 	descriptors, err := buildAdvisorBlockDescriptors(
 		resp, topology.CPUDetails, podEntries, rpPinnedCPUSet, nonReclaimableCPUSet,
 	)
+	if err != nil {
+		return nil, err
+	}
+	descriptors, err = applyFrozenReclaimConstraintToDisjointDescriptors(descriptors, frozenReclaim)
 	if err != nil {
 		return nil, err
 	}
@@ -369,7 +417,8 @@ func (p *DynamicPolicy) planDisjointAdvisorBlocksWithCheckpointTransitionAndDyna
 		return nil, fmt.Errorf("solve dedicated and mandatory reclaim: %w", err)
 	}
 
-	sourceComponents, componentMembers, err := p.advisorSourceIsolationComponents(descriptors)
+	sourceComponents, componentMembers, err := p.advisorSourceIsolationComponentsWithEntries(
+		descriptors, podEntries)
 	if err != nil {
 		return nil, err
 	}
@@ -690,6 +739,13 @@ func (p *DynamicPolicy) allocateStableAdvisorDescriptors(
 func (p *DynamicPolicy) advisorSourceIsolationComponents(
 	descriptors []advisorBlockDescriptor,
 ) ([]string, map[string][]advisorBlockDescriptor, error) {
+	return p.advisorSourceIsolationComponentsWithEntries(descriptors, p.state.GetPodEntries())
+}
+
+func (p *DynamicPolicy) advisorSourceIsolationComponentsWithEntries(
+	descriptors []advisorBlockDescriptor,
+	entries state.PodEntries,
+) ([]string, map[string][]advisorBlockDescriptor, error) {
 	type sourceDomain struct {
 		poolName            string
 		resourcePackageName string
@@ -728,7 +784,7 @@ func (p *DynamicPolicy) advisorSourceIsolationComponents(
 		if descriptor.Class != advisorBlockClassShared || !advisorDescriptorIsIsolation(descriptor) {
 			continue
 		}
-		domain, resolved, err := advisorIsolationDescriptorSourceDomain(descriptor, p.state.GetPodEntries())
+		domain, resolved, err := advisorIsolationDescriptorSourceDomain(descriptor, entries)
 		if err != nil {
 			return nil, nil, fmt.Errorf("derive isolation block %q source domain: %w", descriptor.BlockID, err)
 		}

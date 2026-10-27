@@ -743,7 +743,11 @@ func (p *DynamicPolicy) allocateByCPUAdvisorWithRevision(
 	}
 
 	blockToCPUSet, checkpointTransition, aErr := p.generateBlockCPUSetWithCheckpointTransitionForAttempt(
-		resp, featureGates, hardActiveDomains, dynamicConf)
+		resp, featureGates, hardActiveDomains, dynamicConf,
+		newFrozenReclaimPlacementConstraint(
+			currentEntries, dynamicConf,
+			resp.AllowSharedCoresOverlapReclaimedCores,
+			resp.DisableDedicatedCoresOverlapReclaimedCores))
 	if aErr != nil {
 		return fmt.Errorf("generateBlockCPUSet failed with error: %w", aErr)
 	}
@@ -1241,6 +1245,19 @@ func (p *DynamicPolicy) allocateFakeNUMANormalShareBlocks(
 	nodeRemainingCPUs *machine.CPUSet,
 	globalNonReclaimableCPUSet machine.CPUSet,
 ) error {
+	return p.allocateFakeNUMANormalShareBlocksWithConstraint(
+		blocks, blockCPUSet, availableCPUs, nodeRemainingCPUs,
+		globalNonReclaimableCPUSet, frozenReclaimPlacementConstraint{})
+}
+
+func (p *DynamicPolicy) allocateFakeNUMANormalShareBlocksWithConstraint(
+	blocks []*advisorapi.BlockInfo,
+	blockCPUSet advisorapi.BlockCPUSet,
+	availableCPUs *machine.CPUSet,
+	nodeRemainingCPUs *machine.CPUSet,
+	globalNonReclaimableCPUSet machine.CPUSet,
+	frozenReclaim frozenReclaimPlacementConstraint,
+) error {
 	for _, block := range blocks {
 		if block == nil {
 			continue
@@ -1259,6 +1276,9 @@ func (p *DynamicPolicy) allocateFakeNUMANormalShareBlocks(
 		}
 
 		candidates := availableCPUs.Difference(globalNonReclaimableCPUSet)
+		if frozenReclaim.blockDisallowed(block.OwnerPoolEntryMap) {
+			candidates = candidates.Difference(frozenReclaim.cpus)
+		}
 		previous := machine.NewCPUSet()
 		if allocationInfo := p.state.GetAllocationInfo(poolName, commonstate.FakedContainerName); allocationInfo != nil {
 			previous = allocationInfo.AllocationResult.Clone()
@@ -1395,6 +1415,25 @@ func (p *DynamicPolicy) allocateShareBlocks(
 	withNUMABinding *bool,
 	sourceBlockByPool map[string]string,
 ) error {
+	return p.allocateShareBlocksWithConstraint(
+		numaID, blocks, blockCPUSet, numaAvailableCPUs, nodeRemainingCPUs, availableCPUs,
+		rpPinnedCPUSet, allPinnedCPUSets, withNUMABinding, sourceBlockByPool,
+		frozenReclaimPlacementConstraint{})
+}
+
+func (p *DynamicPolicy) allocateShareBlocksWithConstraint(
+	numaID int,
+	blocks []*advisorapi.BlockInfo,
+	blockCPUSet advisorapi.BlockCPUSet,
+	numaAvailableCPUs machine.CPUSet,
+	nodeRemainingCPUs *machine.CPUSet,
+	availableCPUs *machine.CPUSet,
+	rpPinnedCPUSet map[string]machine.CPUSet,
+	allPinnedCPUSets machine.CPUSet,
+	withNUMABinding *bool,
+	sourceBlockByPool map[string]string,
+	frozenReclaim frozenReclaimPlacementConstraint,
+) error {
 	machineInfo := p.machine.machineInfo
 	sourceBlockResultByID, err := buildAdvisorSourceBlockResultByID(blocks, sourceBlockByPool)
 	if err != nil {
@@ -1438,8 +1477,17 @@ func (p *DynamicPolicy) allocateShareBlocks(
 		} else {
 			currentAvailableCPUs = currentAvailableCPUs.Difference(allPinnedCPUSets)
 		}
+		if frozenReclaim.blockDisallowed(block.OwnerPoolEntryMap) {
+			currentAvailableCPUs = currentAvailableCPUs.Difference(frozenReclaim.cpus)
+		}
 
-		carved, err := p.tryCarveAdvisorBlockFromSource(block, sourceBlockByPool, sourceBlockResultByID, blockCPUSet, currentAvailableCPUs, availableCPUs, nodeRemainingCPUs, numaID, blockResult)
+		entries := frozenReclaim.entries
+		if entries == nil {
+			entries = p.state.GetPodEntries()
+		}
+		carved, err := p.tryCarveAdvisorBlockFromSourceWithEntries(
+			block, sourceBlockByPool, sourceBlockResultByID, blockCPUSet,
+			currentAvailableCPUs, availableCPUs, nodeRemainingCPUs, numaID, blockResult, entries)
 		if err != nil {
 			return err
 		}
@@ -1502,7 +1550,7 @@ func (p *DynamicPolicy) generateReclaimBlockCPUSet(
 		}
 		numaAvailableCPUs := nodeRemainingCPUs.Intersection(topology.CPUDetails.CPUsInNUMANodes(numaID))
 
-		// Deduct the non-reclaimable CPUSet for this NUMA node
+		// Deduct the non-reclaimable CPUSet for this NUMA node.
 		currentAvailableCPUs := numaAvailableCPUs.Difference(globalNonReclaimableCPUSet)
 
 		for _, block := range blocks {
@@ -1640,7 +1688,8 @@ func (p *DynamicPolicy) generateBlockCPUSetWithCheckpointTransition(
 		domains.Insert(commonstate.FakedNUMAID)
 	}
 	return p.generateBlockCPUSetWithCheckpointTransitionForAttempt(
-		resp, featureGates, domains, p.config.dynamicConfig.GetDynamicConfiguration())
+		resp, featureGates, domains, p.config.dynamicConfig.GetDynamicConfiguration(),
+		frozenReclaimPlacementConstraint{})
 }
 
 func (p *DynamicPolicy) generateBlockCPUSetWithCheckpointTransitionForAttempt(
@@ -1648,6 +1697,7 @@ func (p *DynamicPolicy) generateBlockCPUSetWithCheckpointTransitionForAttempt(
 	featureGates map[string]*advisorsvc.FeatureGate,
 	hardActiveDomains sets.Int,
 	dynamicConf *dynamicconfig.Configuration,
+	frozenReclaim frozenReclaimPlacementConstraint,
 ) (
 	advisorapi.BlockCPUSet,
 	steadyFakeNUMAMigrationCheckpointTransition,
@@ -1670,7 +1720,7 @@ func (p *DynamicPolicy) generateBlockCPUSetWithCheckpointTransitionForAttempt(
 	}
 	if !planningResp.DisableDedicatedCoresOverlapReclaimedCores {
 		blockCPUSet, err := p.generateLegacyBlockCPUSetWithDynamicConfig(
-			planningResp, hardActive, dynamicConf)
+			planningResp, hardActive, dynamicConf, frozenReclaim)
 		return blockCPUSet, keep, err
 	}
 
@@ -1680,7 +1730,7 @@ func (p *DynamicPolicy) generateBlockCPUSetWithCheckpointTransitionForAttempt(
 	}
 	transition := keep
 	blockCPUSet, err := p.planDisjointAdvisorBlocksWithCheckpointTransitionAndDynamicConfig(
-		planningResp, hardActive, &transition, dynamicConf)
+		planningResp, hardActive, &transition, dynamicConf, frozenReclaim)
 	return blockCPUSet, transition, err
 }
 
@@ -1939,6 +1989,7 @@ func (p *DynamicPolicy) generateLegacyBlockCPUSetWithDynamicConfig(
 	resp *advisorapi.ListAndWatchResponse,
 	hardActive bool,
 	dynamicConf *dynamicconfig.Configuration,
+	frozenReclaim frozenReclaimPlacementConstraint,
 ) (advisorapi.BlockCPUSet, error) {
 	if resp == nil {
 		return nil, fmt.Errorf("got nil resp")
@@ -2022,7 +2073,9 @@ func (p *DynamicPolicy) generateLegacyBlockCPUSetWithDynamicConfig(
 			"nodeRemainingCPUs", nodeRemainingCPUs.String(),
 			"availableCPUs", availableCPUs.String())
 
-		err = p.allocateShareBlocks(numaID, shareBlocks, blockCPUSet, numaAvailableCPUs, &nodeRemainingCPUs, &availableCPUs, rpPinnedCPUSet, allPinnedCPUSets, &withNUMABindingShareOrDedicatedPod, sourceBlockByPool)
+		err = p.allocateShareBlocksWithConstraint(
+			numaID, shareBlocks, blockCPUSet, numaAvailableCPUs, &nodeRemainingCPUs, &availableCPUs,
+			rpPinnedCPUSet, allPinnedCPUSets, &withNUMABindingShareOrDedicatedPod, sourceBlockByPool, frozenReclaim)
 		if err != nil {
 			return nil, err
 		}
@@ -2069,18 +2122,25 @@ func (p *DynamicPolicy) generateLegacyBlockCPUSetWithDynamicConfig(
 		}
 		reclaimBlocksMap[commonstate.FakedNUMAID] = reclaimBlocks
 
-		err = p.allocateAdvisorSourceBlocksForCarve(normalShareBlocks, isolationBlocks, blockCPUSet, &availableCPUs, &nodeRemainingCPUs, globalNonReclaimableCPUSet, sourceBlockByPool)
+		err = p.allocateAdvisorSourceBlocksForCarveWithConstraint(
+			normalShareBlocks, isolationBlocks, blockCPUSet, &availableCPUs, &nodeRemainingCPUs,
+			globalNonReclaimableCPUSet, sourceBlockByPool, frozenReclaim)
 		if err != nil {
 			return nil, err
 		}
 
 		emptyNUMA := machine.NewCPUSet()
-		err = p.allocateShareBlocks(commonstate.FakedNUMAID, isolationBlocks, blockCPUSet, emptyNUMA, &nodeRemainingCPUs, &availableCPUs, rpPinnedCPUSet, allPinnedCPUSets, nil, sourceBlockByPool)
+		err = p.allocateShareBlocksWithConstraint(
+			commonstate.FakedNUMAID, isolationBlocks, blockCPUSet, emptyNUMA,
+			&nodeRemainingCPUs, &availableCPUs, rpPinnedCPUSet, allPinnedCPUSets,
+			nil, sourceBlockByPool, frozenReclaim)
 		if err != nil {
 			return nil, err
 		}
 
-		err = p.allocateFakeNUMANormalShareBlocks(normalShareBlocks, blockCPUSet, &availableCPUs, &nodeRemainingCPUs, globalNonReclaimableCPUSet)
+		err = p.allocateFakeNUMANormalShareBlocksWithConstraint(
+			normalShareBlocks, blockCPUSet, &availableCPUs, &nodeRemainingCPUs,
+			globalNonReclaimableCPUSet, frozenReclaim)
 		if err != nil {
 			return nil, err
 		}
@@ -2091,7 +2151,9 @@ func (p *DynamicPolicy) generateLegacyBlockCPUSetWithDynamicConfig(
 	}
 
 	// Phase 3: Allocate Reclaim blocks
-	err = p.generateReclaimBlockCPUSet(reclaimBlocksMap, nodeRemainingCPUs, availableCPUs, globalNonReclaimableCPUSet, blockCPUSet)
+	err = p.generateReclaimBlockCPUSet(
+		reclaimBlocksMap, nodeRemainingCPUs, availableCPUs,
+		globalNonReclaimableCPUSet, blockCPUSet)
 	if err != nil {
 		return nil, err
 	}
@@ -3382,46 +3444,20 @@ func (p *DynamicPolicy) validateAdvisorPartitionBeforeCommitWithDynamicConfig(
 			continue
 		}
 		if containerEntries.IsPoolEntry() {
-			if name == commonstate.PoolNameReclaim {
-				continue
-			}
-			if commonstate.IsSystemPool(name) {
-				continue
-			}
-			if commonstate.GetPoolType(name) == commonstate.PoolNameDedicated &&
-				!disableDedicatedCoresOverlapReclaimedCores {
-				continue
-			}
-			if ai := containerEntries[commonstate.FakedContainerName]; ai != nil {
+			if ai := containerEntries[commonstate.FakedContainerName]; ai != nil &&
+				reclaimOverlapDisallowed(
+					name, ai,
+					allowSharedCoresOverlapReclaimedCores,
+					disableDedicatedCoresOverlapReclaimedCores) {
 				disallowedSharedPartition = disallowedSharedPartition.Union(ai.AllocationResult)
 			}
 			continue
 		}
 		for _, ai := range containerEntries {
-			if ai == nil {
-				continue
-			}
-			// system_cores containers are never part of the disallowed shared
-			// partition: bulkhead's BuildCPUSetPartitionView never folds them
-			// into NonReclaimPool, so they may legally overlap the reclaim pool
-			// (e.g. when a missing specified pool triggers whole-machine
-			// fallback). Exclude them here to keep this always-on invariant
-			// consistent with the bulkhead partition view.
-			if ai.CheckReclaimed() || ai.CheckSystem() {
-				continue
-			}
-			// Ramp-up shared allocations are exclusively governed by
-			// validateRampUpReclaimMutualExclusion above: when the hard
-			// partition switch is off (hpActive == false), their overlap with
-			// the reclaim pool is legal; when it is on, any overlap has
-			// already been rejected above (applyBlocks rematerialized the
-			// restorable ones before commit), so exclude them here to avoid
-			// duplicate errors. Steady shared allocations keep flowing into
-			// the disallowed partition below, untouched.
-			if isRampUpShared := ai.RampUp && ai.CheckShared() && !ai.CheckReclaimed(); isRampUpShared {
-				continue
-			}
-			if ai.CheckDedicated() && !disableDedicatedCoresOverlapReclaimedCores {
+			if ai == nil || !reclaimOverlapDisallowed(
+				ai.GetOwnerPoolName(), ai,
+				allowSharedCoresOverlapReclaimedCores,
+				disableDedicatedCoresOverlapReclaimedCores) {
 				continue
 			}
 			disallowedSharedPartition = disallowedSharedPartition.Union(ai.AllocationResult)
