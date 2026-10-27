@@ -38,7 +38,6 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent"
 	agentmetric "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric"
-	metrictypes "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric/types"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	metricspool "github.com/kubewharf/katalyst-core/pkg/metrics/metrics-pool"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
@@ -251,18 +250,6 @@ func TestGetCriticalWatermarkPages(t *testing.T) {
 	}
 }
 
-type switchingMetricsFetcher struct {
-	metrictypes.MetricsFetcher
-	once     sync.Once
-	onSwitch func()
-}
-
-func (f *switchingMetricsFetcher) GetNodeMetric(metricName string) (metric.MetricData, error) {
-	data, err := f.MetricsFetcher.GetNodeMetric(metricName)
-	f.once.Do(f.onSwitch)
-	return data, err
-}
-
 func TestUpdateActualNUMABindingReclaimMemoryLimitUsesOneDynamicConfigSnapshot(t *testing.T) {
 	t.Parallel()
 
@@ -274,23 +261,8 @@ func TestUpdateActualNUMABindingReclaimMemoryLimitUsesOneDynamicConfigSnapshot(t
 	replacement := dynamicconfig.NewConfiguration()
 	replacement.CriticalWatermarkSource = configv1alpha1.CriticalWatermarkSourceHigh
 
-	now := time.Now()
-	fakeFetcher := agentmetric.NewFakeMetricsFetcher(metrics.DummyMetrics{}).(*agentmetric.FakeMetricsFetcher)
-	fakeFetcher.SetNodeMetric(consts.MetricMemScaleFactorSystem, metric.MetricData{Value: 0, Time: &now})
-	for _, numaID := range []int{0, 1} {
-		fakeFetcher.SetNumaMetric(numaID, consts.MetricMemTotalNuma, metric.MetricData{Value: 1000, Time: &now})
-		fakeFetcher.SetNumaMetric(numaID, consts.MetricMemFreeNuma, metric.MetricData{Value: 1000, Time: &now})
-	}
-
-	switchingFetcher := &switchingMetricsFetcher{
-		MetricsFetcher: fakeFetcher,
-		onSwitch: func() {
-			conf.SetDynamicConfiguration(replacement)
-		},
-	}
 	metaServer := &metaserver.MetaServer{
 		MetaAgent: &agent.MetaAgent{
-			MetricsFetcher: switchingFetcher,
 			KatalystMachineInfo: &machine.KatalystMachineInfo{
 				MachineInfo: &cadvisorinfo.MachineInfo{},
 				CPUTopology: &machine.CPUTopology{
@@ -299,10 +271,18 @@ func TestUpdateActualNUMABindingReclaimMemoryLimitUsesOneDynamicConfigSnapshot(t
 						1: {NUMANodeID: 1},
 					},
 				},
-				MemoryTopology: &machine.MemoryTopology{PageSize: 1},
+				MemoryTopology: &machine.MemoryTopology{
+					PageSize: 1,
+					NormalMemoryDetails: machine.MemoryDetails{
+						0: 1000,
+						1: 1000,
+						2: 1000,
+					},
+				},
 			},
 		},
 	}
+	var once sync.Once
 	mg := &memoryGuard{
 		metaServer: metaServer,
 		numaBindingRelativeRootCgroupPaths: map[int][]string{
@@ -312,6 +292,9 @@ func TestUpdateActualNUMABindingReclaimMemoryLimitUsesOneDynamicConfigSnapshot(t
 		numaBindingReclaimMemoryLimit: &atomic.Value{},
 		conf:                          conf,
 		numaMemoryUsageFn: func(path string, pageSize uint64) (map[int]uint64, error) {
+			once.Do(func() {
+				conf.SetDynamicConfiguration(replacement)
+			})
 			return map[int]uint64{0: 0, 1: 0}, nil
 		},
 		existingCgroupPathsFn: func(paths ...string) []string { return paths },
@@ -357,18 +340,21 @@ func TestCalculateReclaimedMemoryLimitFor_SkipsMissingCgroupPath(t *testing.T) {
 	snapshot.CriticalWatermarkSource = configv1alpha1.CriticalWatermarkSourceLow
 	conf.SetDynamicConfiguration(snapshot)
 
-	now := time.Now()
 	fakeFetcher := agentmetric.NewFakeMetricsFetcher(metrics.DummyMetrics{}).(*agentmetric.FakeMetricsFetcher)
-	fakeFetcher.SetNodeMetric(consts.MetricMemScaleFactorSystem, metric.MetricData{Value: 0, Time: &now})
-	fakeFetcher.SetNumaMetric(0, consts.MetricMemTotalNuma, metric.MetricData{Value: 1000, Time: &now})
-	fakeFetcher.SetNumaMetric(0, consts.MetricMemFreeNuma, metric.MetricData{Value: 1000, Time: &now})
 
 	metaServer := &metaserver.MetaServer{
 		MetaAgent: &agent.MetaAgent{
 			MetricsFetcher: fakeFetcher,
 			KatalystMachineInfo: &machine.KatalystMachineInfo{
-				MachineInfo:    &cadvisorinfo.MachineInfo{},
-				MemoryTopology: &machine.MemoryTopology{PageSize: 1},
+				MachineInfo: &cadvisorinfo.MachineInfo{},
+				MemoryTopology: &machine.MemoryTopology{
+					PageSize: 1,
+					NormalMemoryDetails: machine.MemoryDetails{
+						0: 1000,
+						1: 1000,
+						2: 1000,
+					},
+				},
 			},
 		},
 	}
@@ -399,18 +385,21 @@ func TestCalculateReclaimedMemoryLimitFor_FailsFastWhenCgroupReadFails(t *testin
 	snapshot.CriticalWatermarkSource = configv1alpha1.CriticalWatermarkSourceLow
 	conf.SetDynamicConfiguration(snapshot)
 
-	now := time.Now()
 	fakeFetcher := agentmetric.NewFakeMetricsFetcher(metrics.DummyMetrics{}).(*agentmetric.FakeMetricsFetcher)
-	fakeFetcher.SetNodeMetric(consts.MetricMemScaleFactorSystem, metric.MetricData{Value: 0, Time: &now})
-	fakeFetcher.SetNumaMetric(0, consts.MetricMemTotalNuma, metric.MetricData{Value: 1000, Time: &now})
-	fakeFetcher.SetNumaMetric(0, consts.MetricMemFreeNuma, metric.MetricData{Value: 1000, Time: &now})
 
 	metaServer := &metaserver.MetaServer{
 		MetaAgent: &agent.MetaAgent{
 			MetricsFetcher: fakeFetcher,
 			KatalystMachineInfo: &machine.KatalystMachineInfo{
-				MachineInfo:    &cadvisorinfo.MachineInfo{},
-				MemoryTopology: &machine.MemoryTopology{PageSize: 1},
+				MachineInfo: &cadvisorinfo.MachineInfo{},
+				MemoryTopology: &machine.MemoryTopology{
+					PageSize: 1,
+					NormalMemoryDetails: machine.MemoryDetails{
+						0: 1000,
+						1: 1000,
+						2: 1000,
+					},
+				},
 			},
 		},
 	}
@@ -432,6 +421,46 @@ func TestCalculateReclaimedMemoryLimitFor_FailsFastWhenCgroupReadFails(t *testin
 		[]string{"/reclaimed-parent"}, zoneInfos)
 	require.Error(t, err)
 	require.Equal(t, 0.0, limit)
+}
+
+func TestCalculateReclaimedMemoryLimitFor_FailsClosedOnMissingKernelInput(t *testing.T) {
+	t.Parallel()
+
+	snapshot := dynamicconfig.NewConfiguration()
+	snapshot.CriticalWatermarkSource = configv1alpha1.CriticalWatermarkSourceLow
+
+	newMemoryGuard := func(normalMemoryDetails machine.MemoryDetails) *memoryGuard {
+		return &memoryGuard{
+			metaServer: &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{
+				KatalystMachineInfo: &machine.KatalystMachineInfo{
+					MachineInfo: &cadvisorinfo.MachineInfo{},
+					MemoryTopology: &machine.MemoryTopology{
+						PageSize:            1,
+						NormalMemoryDetails: normalMemoryDetails,
+					},
+				},
+			}},
+			existingCgroupPathsFn: func(paths ...string) []string { return paths },
+			numaMemoryUsageFn: func(path string, pageSize uint64) (map[int]uint64, error) {
+				return map[int]uint64{0: 100}, nil
+			},
+		}
+	}
+
+	t.Run("missing normal zone", func(t *testing.T) {
+		mg := newMemoryGuard(machine.MemoryDetails{0: 1000})
+		limit, err := mg.calculateReclaimedMemoryLimitFor(snapshot, 0, []string{"/reclaimed"}, nil)
+		require.EqualError(t, err, "normal zone info is missing for numa 0")
+		require.Zero(t, limit)
+	})
+
+	t.Run("missing normal memory capacity", func(t *testing.T) {
+		mg := newMemoryGuard(nil)
+		limit, err := mg.calculateReclaimedMemoryLimitFor(snapshot, 0, []string{"/reclaimed"},
+			[]machine.NormalZoneInfo{{Node: 0, Free: 1000, Low: 100}})
+		require.EqualError(t, err, "normal memory capacity is missing for numa 0")
+		require.Zero(t, limit)
+	})
 }
 
 func TestCalculateReclaimedMemoryLimitFor_LimitMargin(t *testing.T) {
@@ -472,11 +501,7 @@ func TestCalculateReclaimedMemoryLimitFor_LimitMargin(t *testing.T) {
 			snapshot.CriticalWatermarkSource = configv1alpha1.CriticalWatermarkSourceLow
 			snapshot.ReclaimedMemoryMaxRatio = tc.ratio
 
-			now := time.Now()
 			fetcher := agentmetric.NewFakeMetricsFetcher(metrics.DummyMetrics{}).(*agentmetric.FakeMetricsFetcher)
-			fetcher.SetNodeMetric(consts.MetricMemScaleFactorSystem, metric.MetricData{Value: 0, Time: &now})
-			fetcher.SetNumaMetric(0, consts.MetricMemTotalNuma, metric.MetricData{Value: 1000, Time: &now})
-			fetcher.SetNumaMetric(0, consts.MetricMemFreeNuma, metric.MetricData{Value: float64(tc.free), Time: &now})
 			paths := make([]string, len(tc.used))
 			usageByPath := make(map[string]uint64, len(tc.used))
 			for i, used := range tc.used {
@@ -486,8 +511,15 @@ func TestCalculateReclaimedMemoryLimitFor_LimitMargin(t *testing.T) {
 			metaServer := &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{
 				MetricsFetcher: fetcher,
 				KatalystMachineInfo: &machine.KatalystMachineInfo{
-					MachineInfo:    &cadvisorinfo.MachineInfo{},
-					MemoryTopology: &machine.MemoryTopology{PageSize: 1},
+					MachineInfo: &cadvisorinfo.MachineInfo{},
+					MemoryTopology: &machine.MemoryTopology{
+						PageSize: 1,
+						NormalMemoryDetails: machine.MemoryDetails{
+							0: 1000,
+							1: 1000,
+							2: 1000,
+						},
+					},
 				},
 			}}
 			mg := NewMemoryGuard(conf, nil, nil, metaServer, metrics.DummyMetrics{}).(*memoryGuard)
@@ -513,9 +545,7 @@ func TestMemoryGuardLimitMarginUpdatesAndAdvices(t *testing.T) {
 	conf.GetDynamicConfiguration().CriticalWatermarkSource = configv1alpha1.CriticalWatermarkSourceLow
 	conf.GetDynamicConfiguration().ReclaimedMemoryMaxRatio = 0.5
 
-	now := time.Now()
 	fetcher := agentmetric.NewFakeMetricsFetcher(metrics.DummyMetrics{}).(*agentmetric.FakeMetricsFetcher)
-	fetcher.SetNodeMetric(consts.MetricMemScaleFactorSystem, metric.MetricData{Value: 0, Time: &now})
 	metaCache, err := metacache.NewMetaCacheImp(conf, metricspool.DummyMetricsEmitterPool{}, fetcher)
 	require.NoError(t, err)
 	metaServer := &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{
@@ -525,7 +555,14 @@ func TestMemoryGuardLimitMarginUpdatesAndAdvices(t *testing.T) {
 			CPUTopology: &machine.CPUTopology{CPUDetails: machine.CPUDetails{
 				0: {NUMANodeID: 0}, 1: {NUMANodeID: 1}, 2: {NUMANodeID: 2},
 			}},
-			MemoryTopology: &machine.MemoryTopology{PageSize: 1},
+			MemoryTopology: &machine.MemoryTopology{
+				PageSize: 1,
+				NormalMemoryDetails: machine.MemoryDetails{
+					0: 1000,
+					1: 1000,
+					2: 1000,
+				},
+			},
 		},
 	}}
 	mg := NewMemoryGuard(conf, nil, metaCache, metaServer, metrics.DummyMetrics{}).(*memoryGuard)
@@ -547,8 +584,6 @@ func TestMemoryGuardLimitMarginUpdatesAndAdvices(t *testing.T) {
 	}
 	mg.zoneInfoFn = func(string) []machine.NormalZoneInfo { return zoneInfos }
 	for numaID, used := range []float64{600, 200, 0} {
-		fetcher.SetNumaMetric(numaID, consts.MetricMemTotalNuma, metric.MetricData{Value: 1000, Time: &now})
-		fetcher.SetNumaMetric(numaID, consts.MetricMemFreeNuma, metric.MetricData{Value: 50, Time: &now})
 		for _, paths := range [][]string{mg.reclaimRelativeRootCgroupPaths, mg.numaBindingRelativeRootCgroupPaths[numaID]} {
 			for _, path := range paths {
 				if usageByPath[path] == nil {

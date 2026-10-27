@@ -1306,7 +1306,7 @@ func TestUpdate(t *testing.T) {
 			},
 		},
 		{
-			name: "set reclaimed group memory limit(succeeded)",
+			name: "set reclaimed group memory limit(failed, missing target zoneinfo)",
 			pools: map[string]*types.PoolInfo{
 				commonstate.PoolNameReserve: {
 					PoolName: commonstate.PoolNameReserve,
@@ -1321,7 +1321,7 @@ func TestUpdate(t *testing.T) {
 				},
 			},
 			reclaimedEnable:   true,
-			wantErr:           false,
+			wantErr:           true,
 			wantHeadroom:      *resource.NewQuantity(996<<30, resource.DecimalSI),
 			nodeMetrics:       defaultNodeMetrics,
 			numaMetrics:       defaultNumaMetrics,
@@ -1335,45 +1335,7 @@ func TestUpdate(t *testing.T) {
 					Low:  200 << 20,
 				},
 			},
-			wantAdviceResult: &types.InternalMemoryCalculationResult{
-				ExtraEntries: []types.ExtraMemoryAdvices{
-					{
-						CgroupPath: "/kubepods/besteffort",
-						Values: map[string]string{
-							string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes): "257698037760",
-							string(memoryadvisor.ControlKnobKeyMemoryHigh):         "244813135872",
-						},
-					},
-					{
-						CgroupPath: "/kubepods/besteffort-0",
-						Values: map[string]string{
-							string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes): "64424509440",
-							string(memoryadvisor.ControlKnobKeyMemoryHigh):         "61203283968",
-						},
-					},
-					{
-						CgroupPath: "/kubepods/besteffort-1",
-						Values: map[string]string{
-							string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes): "64424509440",
-							string(memoryadvisor.ControlKnobKeyMemoryHigh):         "61203283968",
-						},
-					},
-					{
-						CgroupPath: "/kubepods/besteffort-2",
-						Values: map[string]string{
-							string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes): "64424509440",
-							string(memoryadvisor.ControlKnobKeyMemoryHigh):         "61203283968",
-						},
-					},
-					{
-						CgroupPath: "/kubepods/besteffort-3",
-						Values: map[string]string{
-							string(memoryadvisor.ControlKnobKeyMemoryLimitInBytes): "64424509440",
-							string(memoryadvisor.ControlKnobKeyMemoryHigh):         "61203283968",
-						},
-					},
-				},
-			},
+			wantAdviceResult: &types.InternalMemoryCalculationResult{},
 		},
 		{
 			name: "set reclaimed group memory limit(succeeded, with zoneinfo)",

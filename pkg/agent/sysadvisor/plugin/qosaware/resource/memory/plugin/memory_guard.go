@@ -30,7 +30,6 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	dynamicconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic"
-	"github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
@@ -239,10 +238,32 @@ func calculateCgroupMemoryLimits(cgroupPaths []string, totalLimit int64) map[str
 }
 
 func (mg *memoryGuard) calculateReclaimedMemoryLimitFor(dynamicConfig *dynamicconfig.Configuration, numaID int, reclaimedCgroupPaths []string, zoneInfos []machine.NormalZoneInfo) (float64, error) {
-	watermarkScaleFactor, err := mg.metaServer.GetNodeMetric(consts.MetricMemScaleFactorSystem)
-	if err != nil {
-		general.ErrorS(err, "Can not get system watermark scale factor")
-		return 0, err
+	if mg.metaServer == nil || mg.metaServer.KatalystMachineInfo == nil || mg.metaServer.KatalystMachineInfo.MemoryTopology == nil {
+		return 0, fmt.Errorf("machine memory topology is unavailable")
+	}
+
+	pageSize := mg.metaServer.KatalystMachineInfo.PageSize
+	if pageSize <= 0 {
+		return 0, fmt.Errorf("invalid page size %d", pageSize)
+	}
+
+	numaTotalBytes, ok := mg.metaServer.KatalystMachineInfo.NormalMemoryDetails[numaID]
+	if !ok || numaTotalBytes == 0 {
+		return 0, fmt.Errorf("normal memory capacity is missing for numa %d", numaID)
+	}
+	numaTotal := float64(numaTotalBytes)
+
+	var zoneInfo machine.NormalZoneInfo
+	found := false
+	for _, z := range zoneInfos {
+		if z.Node == int64(numaID) {
+			zoneInfo = z
+			found = true
+			break
+		}
+	}
+	if !found {
+		return 0, fmt.Errorf("normal zone info is missing for numa %d", numaID)
 	}
 
 	// filter out reclaimed cgroup paths that are not materialized on this node.
@@ -264,34 +285,9 @@ func (mg *memoryGuard) calculateReclaimedMemoryLimitFor(dynamicConfig *dynamicco
 		reclaimedMemoryUsed += float64(used)
 	}
 
-	tmp, err := mg.metaServer.GetNumaMetric(numaID, consts.MetricMemTotalNuma)
-	if err != nil {
-		return 0, err
-	}
-	numaTotal := tmp.Value
-
-	tmp, err = mg.metaServer.GetNumaMetric(numaID, consts.MetricMemFreeNuma)
-	if err != nil {
-		return 0, err
-	}
-	numaFree := tmp.Value
-
-	criticalWatermark := numaTotal * watermarkScaleFactor.Value / float64(10000)
-
-	var zoneInfo machine.NormalZoneInfo
-	found := false
-	for _, z := range zoneInfos {
-		if z.Node == int64(numaID) {
-			zoneInfo = z
-			found = true
-			break
-		}
-	}
-	if found {
-		numaFree = float64(zoneInfo.Free) * float64(mg.metaServer.KatalystMachineInfo.PageSize)
-		watermarkPages := getCriticalWatermarkPages(&zoneInfo, dynamicConfig.CriticalWatermarkSource)
-		criticalWatermark = float64(watermarkPages) * float64(mg.metaServer.KatalystMachineInfo.PageSize)
-	}
+	numaFree := float64(zoneInfo.Free) * float64(pageSize)
+	watermarkPages := getCriticalWatermarkPages(&zoneInfo, dynamicConfig.CriticalWatermarkSource)
+	criticalWatermark := float64(watermarkPages) * float64(pageSize)
 
 	criticalWatermarkScaleFactor := dynamicConfig.CriticalWatermarkScaleFactor
 	criticalWatermark *= criticalWatermarkScaleFactor
