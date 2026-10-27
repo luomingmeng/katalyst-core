@@ -2808,6 +2808,22 @@ func (p *CPUSetTopologyPlugin) filterPodOutcomesAgainstFreshPod(
 	classification.ScopeRel = scopeRel
 	classification.Stale = stale && len(classification.Resolved) == 0
 	if classification.Stale {
+		// A successful admission can precede the strict Pod snapshot and cgroup
+		// materialization observed by the next advisor frame. Reuse only the
+		// existing admission protection for that bounded window; never renew it
+		// here, so checkpoint-only allocations still retire at the original TTL.
+		if protection, ok := p.pendingProtections[podUID]; ok {
+			now := time.Now()
+			if p.now != nil {
+				now = p.now()
+			}
+			if now.Before(protection.protectUntil) && strings.Trim(protection.rel, "/") != "" {
+				classification.ScopeRel = strings.Trim(protection.rel, "/")
+				classification.Stale = false
+			}
+		}
+	}
+	if classification.Stale {
 		for _, pending := range classification.Pending {
 			classification.Retired = append(classification.Retired,
 				lifecycleProofFromPending(pending, containerLifecycleRetired))

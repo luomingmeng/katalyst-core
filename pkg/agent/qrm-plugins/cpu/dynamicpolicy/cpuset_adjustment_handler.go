@@ -626,16 +626,20 @@ func (p *DynamicPolicy) runCPUSetAdjustmentHandlers(ctx context.Context, modes .
 			newEntries := p.state.GetPodEntries()
 			if err := p.syncReclaimPoolWithAdjustmentCommitOverride(newEntries, commitOverride); err != nil {
 				roundErr = fmt.Errorf("sync reclaim pool from cpuset adjustment override: %w", err)
-			} else if isRampUpReclaimHardPartitionEnabledWithConfig(dynamicConf) && newEntries.HasActiveRampUp() {
-				// The override may have moved the reclaim pool away from the reclaim
-				// the ramp-up business was last laid out against: the bulkhead
-				// verified reclaim is derived without the transient ramp-up
-				// side-channel, so it can land on top of existing business. Re-lay
-				// ramp-up shared business off THIS final reclaim pool before the
-				// precommit mutual-exclusion check, mirroring the synchronous
-				// advisor apply path. A reclaim that fully covers business fails
-				// closed here; this never bypasses the validator.
-				if err := p.rematerializeRampUpSharedAgainstFinalReclaim(newEntries); err != nil {
+			} else if newEntries.HasActiveRampUp() &&
+				(isRampUpReclaimHardPartitionEnabledWithConfig(dynamicConf) ||
+					exposedRampUpNeedsPhysicalDisjoint(
+						dynamicConf, p.state.GetAllowSharedCoresOverlapReclaimedCores())) {
+				// Keep explicit ramp-up cpusets inside the physical non-reclaim
+				// parent. Hard partitioning applies to every ramp-up allocation;
+				// soft non-overlap applies only after cpuset exposure.
+				var err error
+				if isRampUpReclaimHardPartitionEnabledWithConfig(dynamicConf) {
+					err = p.rematerializeRampUpSharedAgainstFinalReclaim(newEntries)
+				} else {
+					err = p.rematerializeExposedRampUpSharedAgainstFinalReclaim(newEntries)
+				}
+				if err != nil {
 					roundErr = fmt.Errorf("rematerialize ramp-up shared against async reclaim override: %w", err)
 				}
 			}

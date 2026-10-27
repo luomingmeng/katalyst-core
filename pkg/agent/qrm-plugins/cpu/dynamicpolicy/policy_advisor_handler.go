@@ -2540,17 +2540,20 @@ func (p *DynamicPolicy) applyBlocksWithDynamicConfig(
 		}
 	}
 
-	// The hard-partition invariant is enforced against the FINAL reclaim pool:
-	// the adjustment commit override above may rewrite the reclaim pool after
-	// ramp-up shared allocations were assigned rampUpCPUs, so the mutual
-	// exclusion can only be restored here, before the pending advisor state is
-	// materialized. This is deliberately gated on the dynamic configuration
-	// (plus active ramp-up presence), not on the hardActive parameter: the
-	// parameter only controls floor derivation for this attempt, while the
-	// partition invariant itself follows the switch.
-	if isRampUpReclaimHardPartitionEnabledWithConfig(dynamicConf) &&
-		newEntries.HasActiveRampUp() {
-		if err := p.rematerializeRampUpSharedAgainstFinalReclaim(newEntries); err != nil {
+	// Hard partitioning keeps every ramp-up allocation disjoint from final
+	// reclaim. With soft partitioning, only allocations whose cpuset has already
+	// been exposed need that physical invariant; omission-capable allocations
+	// keep the historical logical overlap and inherit the non-reclaim parent.
+	hardPartition := isRampUpReclaimHardPartitionEnabledWithConfig(dynamicConf)
+	if newEntries.HasActiveRampUp() &&
+		(hardPartition || exposedRampUpNeedsPhysicalDisjoint(dynamicConf, allowSharedCoresOverlapReclaimedCores)) {
+		var err error
+		if hardPartition {
+			err = p.rematerializeRampUpSharedAgainstFinalReclaim(newEntries)
+		} else {
+			err = p.rematerializeExposedRampUpSharedAgainstFinalReclaim(newEntries)
+		}
+		if err != nil {
 			return nil, fmt.Errorf("rematerialize ramp-up shared allocations against final reclaim pool failed with error: %w", err)
 		}
 	}
@@ -2861,10 +2864,34 @@ func (p *DynamicPolicy) applyAdvisorNonPoolContainerEntries(
 // after that protection view was built. Re-materializing from the SNB's own
 // remainder keeps its original NUMA scope while closing that revision window;
 // the terminal mutual-exclusion validator remains authoritative.
+func exposedRampUpNeedsPhysicalDisjoint(
+	dynamicConf *dynamicconfig.Configuration,
+	allowSharedOverlap bool,
+) bool {
+	if allowSharedOverlap || dynamicConf == nil || dynamicConf.AdminQoSConfiguration == nil ||
+		dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration == nil {
+		return false
+	}
+	bulkheadConfig := dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig
+	return bulkheadConfig.Enable && bulkheadConfig.EnableBulkheadCpusetTopology
+}
+
 func (p *DynamicPolicy) rematerializeRampUpSharedAgainstFinalReclaim(
 	newEntries state.PodEntries,
 ) error {
 	return p.rematerializeRampUpSharedAgainstReclaim(newEntries, p.latestAppliedReclaimCPUSet())
+}
+
+// rematerializeExposedRampUpSharedAgainstFinalReclaim is the soft-partition
+// counterpart used when shared/reclaim physical overlap is disabled. A ramp-up
+// allocation whose response may omit cpuset keeps the historical logical
+// overlap and inherits the non-reclaim parent. Once cpuset has been exposed,
+// however, the explicit response must fit below that parent, so only those
+// allocations are rematerialized.
+func (p *DynamicPolicy) rematerializeExposedRampUpSharedAgainstFinalReclaim(
+	newEntries state.PodEntries,
+) error {
+	return p.rematerializeRampUpSharedAgainstReclaimFiltered(newEntries, p.latestAppliedReclaimCPUSet(), true)
 }
 
 // latestAppliedReclaimCPUSet returns the reclaim cpuset most recently verified
@@ -2894,6 +2921,14 @@ func (p *DynamicPolicy) rematerializeRampUpSharedAgainstReclaim(
 	newEntries state.PodEntries,
 	appliedReclaim machine.CPUSet,
 ) error {
+	return p.rematerializeRampUpSharedAgainstReclaimFiltered(newEntries, appliedReclaim, false)
+}
+
+func (p *DynamicPolicy) rematerializeRampUpSharedAgainstReclaimFiltered(
+	newEntries state.PodEntries,
+	appliedReclaim machine.CPUSet,
+	exposedOnly bool,
+) error {
 	if p == nil || p.machine.machineInfo == nil || p.machine.machineInfo.CPUTopology == nil {
 		return nil
 	}
@@ -2915,7 +2950,8 @@ func (p *DynamicPolicy) rematerializeRampUpSharedAgainstReclaim(
 			continue
 		}
 		for _, ai := range containerEntries {
-			if ai == nil || !ai.RampUp || !ai.CheckShared() || ai.CheckReclaimed() {
+			if ai == nil || !ai.RampUp || !ai.CheckShared() || ai.CheckReclaimed() ||
+				(exposedOnly && ai.Annotations[cpuconsts.CPUSetOmissionAllowedAnnotationKey] != cpusetOmissionFalse) {
 				continue
 			}
 			overlap := ai.AllocationResult.Intersection(excludeReclaim)

@@ -175,7 +175,7 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 			}
 		}
 		if pending.enforceSteadyReclaim {
-			plannedReclaim := reclaimPoolCPUSet(pending.entries)
+			plannedReclaim := reclaimPoolCPUSet(replacementBaseline)
 			candidateReclaim := reclaimPoolCPUSet(candidate)
 			if err := validateSteadyReclaimPrecommitInvariant(
 				plannedReclaim, candidateReclaim, p.machine.machineInfo.CPUTopology,
@@ -251,7 +251,7 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 		}
 		if pending.enforceSteadyReclaim {
 			if err := validateSteadyReclaimPrecommitInvariant(
-				reclaimPoolCPUSet(pending.entries),
+				reclaimPoolCPUSet(replacementBaseline),
 				reclaimPoolCPUSet(candidate),
 				p.machine.machineInfo.CPUTopology,
 			); err != nil {

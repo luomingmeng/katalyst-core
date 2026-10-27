@@ -2712,13 +2712,16 @@ func rampUpOverlapTestResponse(allowOverlap bool) (*advisorapi.ListAndWatchRespo
 }
 
 // TestDynamicPolicyApplyBlocksRampUpSharedReclaimOverlapQuadrants covers the
-// HP x AO quadrant matrix for the plain shared ramp-up / final reclaim
+// HP x AO x cpuset-exposure matrix for the plain shared ramp-up / final reclaim
 // overlap:
-//   - HP=false: the overlap is legal; applyBlocks keeps rampUpCPUs verbatim
-//     (no rematerialization) and the pre-commit guard accepts it.
+//   - HP=false with an omitted cpuset: the logical overlap is legal; applyBlocks
+//     keeps rampUpCPUs verbatim and the runtime leaf inherits the non-reclaim parent.
+//   - HP=false, AO=false, and an exposed cpuset: applyBlocks rematerializes the
+//     response cpuset against final reclaim so it remains writable below the
+//     non-reclaim parent.
 //   - HP=true: applyBlocks rematerializes the ramp-up shared allocation
-//     canonically against the FINAL reclaim pool, regardless of AO. The
-//     HP=true && AO=true case pins the D1 fix: the AO early-return in the
+//     canonically against the FINAL reclaim pool, regardless of AO or omission.
+//     The HP=true && AO=true case pins the D1 fix: the AO early-return in the
 //     guard no longer bypasses the mutual exclusion.
 //
 // With reserved={0,4} and reclaim={2,6}: rampUpCPUs={1,2,3,5,6,7}; the
@@ -2731,18 +2734,32 @@ func TestDynamicPolicyApplyBlocksRampUpSharedReclaimOverlapQuadrants(t *testing.
 		name                 string
 		hardPartition        bool
 		allowOverlap         bool
+		cpusetExposed        bool
+		cpusetOmitted        bool
+		topologyEnabled      bool
 		wantRampUpAllocation machine.CPUSet
 	}{
 		{
-			name:                 "hp disabled ao disabled keeps overlap",
+			name:                 "hp disabled ao disabled omitted cpuset keeps logical overlap",
 			hardPartition:        false,
 			allowOverlap:         false,
+			cpusetOmitted:        true,
+			topologyEnabled:      true,
 			wantRampUpAllocation: machine.NewCPUSet(1, 2, 3, 5, 6, 7),
+		},
+		{
+			name:                 "hp disabled ao disabled exposed cpuset rematerializes",
+			hardPartition:        false,
+			allowOverlap:         false,
+			cpusetExposed:        true,
+			topologyEnabled:      true,
+			wantRampUpAllocation: machine.NewCPUSet(1, 3, 5, 7),
 		},
 		{
 			name:                 "hp disabled ao enabled keeps overlap",
 			hardPartition:        false,
 			allowOverlap:         true,
+			cpusetExposed:        true,
 			wantRampUpAllocation: machine.NewCPUSet(1, 2, 3, 5, 6, 7),
 		},
 		{
@@ -2763,7 +2780,19 @@ func TestDynamicPolicyApplyBlocksRampUpSharedReclaimOverlapQuadrants(t *testing.
 			t.Parallel()
 
 			policy, topology := newRampUpOverlapTestPolicy(t, tc.hardPartition)
-			policy.state.SetPodEntries(rampUpOverlapTestEntries(), false)
+			dynamicConf := policy.config.dynamicConfig.GetDynamicConfiguration()
+			dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.Enable = tc.topologyEnabled
+			dynamicConf.AdminQoSConfiguration.CPUPluginConfiguration.BulkheadConfig.EnableBulkheadCpusetTopology = tc.topologyEnabled
+			entries := rampUpOverlapTestEntries()
+			if tc.cpusetOmitted {
+				entries["ramp-up-pod"]["main"].Annotations = map[string]string{
+					cpuconsts.CPUSetOmissionAllowedAnnotationKey: cpusetOmissionTrue,
+				}
+			}
+			if tc.cpusetExposed {
+				markCPUSetExposed(entries["ramp-up-pod"]["main"])
+			}
+			policy.state.SetPodEntries(entries, false)
 			resp, blockCPUSet := rampUpOverlapTestResponse(tc.allowOverlap)
 
 			require.NoError(t, prepareAndCommitAdvisorBlocks(policy, blockCPUSet, resp, tc.allowOverlap))
@@ -3107,6 +3136,27 @@ func TestRematerializeRampUpSharedAgainstFinalReclaim(t *testing.T) {
 		require.True(t, got.AllocationResult.Intersection(machine.NewCPUSet(2, 6)).IsEmpty())
 		require.Equal(t, machine.NewCPUSet(3, 7), got.TopologyAwareAssignments[1])
 		require.Empty(t, got.TopologyAwareAssignments[0])
+	})
+
+	t.Run("soft non-overlap rematerializes exposed allocation only", func(t *testing.T) {
+		t.Parallel()
+		exposed := rampUpEntry(machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7), false)
+		markCPUSetExposed(exposed)
+		omitted := rampUpEntry(machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7), false)
+		omitted.Annotations[cpuconsts.CPUSetOmissionAllowedAnnotationKey] = cpusetOmissionTrue
+		entries := state.PodEntries{
+			"exposed-pod": {"main": exposed},
+			"omitted-pod": {"main": omitted},
+			commonstate.PoolNameReclaim: {
+				commonstate.FakedContainerName: reclaimEntry(machine.NewCPUSet(2, 3, 6, 7)),
+			},
+		}
+
+		require.NoError(t, policy.rematerializeExposedRampUpSharedAgainstFinalReclaim(entries))
+		require.True(t, exposed.AllocationResult.Equals(machine.NewCPUSet(0, 1, 4, 5)),
+			"exposed allocation must fit below the non-reclaim parent, got %s", exposed.AllocationResult.String())
+		require.True(t, omitted.AllocationResult.Equals(machine.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7)),
+			"omission-capable allocation keeps logical overlap, got %s", omitted.AllocationResult.String())
 	})
 
 	t.Run("empty final reclaim is a no-op", func(t *testing.T) {
