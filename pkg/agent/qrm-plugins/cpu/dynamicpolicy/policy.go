@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strconv"
 	"sync"
@@ -2321,13 +2322,232 @@ func (p *DynamicPolicy) installDerivedReclaimPreference() error {
 	return nil
 }
 
-// ensureInitialReclaimPool is the bootstrap boundary for a missing/empty pool.
-// A non-empty committed identity is never resized here. Select and rebuild before
-// the single revision CAS so failures cannot publish a partial checkpoint.
-func (p *DynamicPolicy) ensureInitialReclaimPool() error {
+// repairInitialReclaimFromDedicatedSurplus makes complete cores selectable only
+// from a NUMA-exclusive dedicated main container's persisted surplus. When the
+// active mode forbids dedicated/reclaim overlap, it also removes the selected
+// donor CPUs from every dedicated mirror before the existing revision CAS;
+// overlap-allowed mode leaves the dedicated ownership untouched.
+func (p *DynamicPolicy) repairInitialReclaimFromDedicatedSurplus(
+	podEntries state.PodEntries,
+	machineState state.NUMANodeMap,
+	eligibleCPUs, scopeCPUs, prefer machine.CPUSet,
+	requested int,
+	removeFromDedicated bool,
+) (machine.CPUSet, error) {
+	topology := p.machine.machineInfo.CPUTopology
+	if topology == nil {
+		return machine.NewCPUSet(), errReclaimFallbackEmptyRequired
+	}
+
+	type donor struct {
+		containers state.ContainerEntries
+		main       *state.AllocationInfo
+		surplus    int
+	}
+	donors := make([]*donor, 0)
+	ownerByCPU := make(map[int]*donor)
+	ownerCount := make(map[int]int)
+	podUIDs := make([]string, 0, len(podEntries))
+	for podUID, containers := range podEntries {
+		if !containers.IsPoolEntry() {
+			podUIDs = append(podUIDs, podUID)
+		}
+	}
+	sort.Strings(podUIDs)
+	for _, podUID := range podUIDs {
+		containers := podEntries[podUID]
+		main := containers.GetMainContainerEntry()
+		if main != nil {
+			for _, cpu := range main.AllocationResult.Union(main.OriginalAllocationResult).ToSliceInt() {
+				ownerCount[cpu]++
+			}
+		}
+		if main == nil || main.RampUp || !main.CheckDedicatedNUMABindingNUMAExclusive() ||
+			main.RequestQuantity <= 0 || !main.AllocationResult.Equals(main.OriginalAllocationResult) {
+			continue
+		}
+		requestedCPUs := state.CPUPreciseCeil(main.RequestQuantity)
+		if requestedCPUs <= 0 || main.AllocationResult.Size() <= requestedCPUs {
+			continue
+		}
+		assignments, err := machine.GetNumaAwareAssignments(topology, main.AllocationResult)
+		if err != nil || !reflect.DeepEqual(assignments, main.TopologyAwareAssignments) ||
+			!reflect.DeepEqual(assignments, main.OriginalTopologyAwareAssignments) {
+			continue
+		}
+		d := &donor{
+			containers: containers,
+			main:       main,
+			surplus:    main.AllocationResult.Size() - requestedCPUs,
+		}
+		donors = append(donors, d)
+		for _, cpu := range main.AllocationResult.ToSliceInt() {
+			if _, exists := ownerByCPU[cpu]; exists {
+				ownerByCPU[cpu] = nil
+			} else {
+				ownerByCPU[cpu] = d
+			}
+		}
+	}
+	if len(donors) == 0 {
+		return machine.NewCPUSet(), errReclaimFallbackEmptyRequired
+	}
+
+	protectedCPUs := p.config.reservedCPUs.Clone()
+	claimedCPUs := protectedCPUs.Clone()
+	for _, containers := range podEntries {
+		for _, allocation := range containers {
+			if allocation == nil {
+				continue
+			}
+			claimedCPUs = claimedCPUs.Union(allocation.AllocationResult).Union(allocation.OriginalAllocationResult)
+		}
+	}
+	for _, numaState := range machineState {
+		if numaState == nil {
+			continue
+		}
+		for _, resourcePackage := range numaState.ResourcePackageStates {
+			if resourcePackage != nil {
+				protectedCPUs = protectedCPUs.Union(resourcePackage.PinnedCPUSet)
+				claimedCPUs = claimedCPUs.Union(resourcePackage.PinnedCPUSet)
+			}
+		}
+	}
+	eligibleCPUs = eligibleCPUs.Union(topology.CPUDetails.CPUs().Difference(claimedCPUs)).Intersection(scopeCPUs)
+
+	type repairCandidate struct {
+		core         coreAlignedCandidate
+		donor        *donor
+		donorCPUs    machine.CPUSet
+		preferredHit int
+	}
+	index := newPhysicalCoreIndex(topology)
+	candidates := make([]repairCandidate, 0)
+	for key, coreCPUs := range index.byKey {
+		if !coreCPUs.IsSubsetOf(scopeCPUs) || !coreCPUs.Intersection(protectedCPUs).IsEmpty() {
+			continue
+		}
+		donorCPUs := coreCPUs.Difference(eligibleCPUs)
+		if donorCPUs.IsEmpty() {
+			continue
+		}
+		var d *donor
+		valid := true
+		for _, cpu := range donorCPUs.ToSliceInt() {
+			owner := ownerByCPU[cpu]
+			if owner == nil || ownerCount[cpu] != 1 || (d != nil && d != owner) {
+				valid = false
+				break
+			}
+			d = owner
+		}
+		if !valid || d == nil || donorCPUs.Size() > d.surplus {
+			continue
+		}
+		candidates = append(candidates, repairCandidate{
+			core:  coreAlignedCandidate{key: key, coreID: key.coreID, cpus: coreCPUs},
+			donor: d, donorCPUs: donorCPUs,
+			preferredHit: coreCPUs.Intersection(prefer).Size(),
+		})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].preferredHit != candidates[j].preferredHit {
+			return candidates[i].preferredHit > candidates[j].preferredHit
+		}
+		return physicalCoreKeyLess(candidates[i].core.key, candidates[j].core.key)
+	})
+	admitted := eligibleCPUs.Clone()
+	used := make(map[*donor]int)
+	admittedByKey := make(map[physicalCoreKey]repairCandidate)
+	for _, candidate := range candidates {
+		if used[candidate.donor]+candidate.donorCPUs.Size() > candidate.donor.surplus {
+			continue
+		}
+		used[candidate.donor] += candidate.donorCPUs.Size()
+		admitted = admitted.Union(candidate.core.cpus)
+		admittedByKey[candidate.core.key] = candidate
+	}
+	selected, err := selectReclaimSeed(topology, admitted, prefer, requested)
+	if errors.Is(err, errReclaimFallbackCapacityInsufficient) {
+		// The bootstrap target is a preference, not a reason to keep reclaim empty.
+		// If protected state leaves only one safe whole core, publish that core and
+		// let normal reconciliation grow the pool later.
+		selected, err = selectReclaimSeed(topology, admitted, prefer, 0)
+	}
+	if err != nil {
+		return machine.NewCPUSet(), err
+	}
+
+	if !removeFromDedicated {
+		return selected, nil
+	}
+
+	removeByDonor := make(map[*donor]machine.CPUSet)
+	for _, core := range coreAlignedCandidates(topology, selected, prefer) {
+		candidate, ok := admittedByKey[core.key]
+		if !ok {
+			continue
+		}
+		remove := removeByDonor[candidate.donor]
+		if !remove.Initialed {
+			remove = machine.NewCPUSet()
+		}
+		removeByDonor[candidate.donor] = remove.Union(candidate.donorCPUs)
+	}
+	for d, remove := range removeByDonor {
+		oldMain := d.main.Clone()
+		remaining := d.main.AllocationResult.Difference(remove)
+		if remaining.Size() < state.CPUPreciseCeil(d.main.RequestQuantity) {
+			return machine.NewCPUSet(), fmt.Errorf("initial reclaim repair exceeds dedicated request floor")
+		}
+		assignments, err := machine.GetNumaAwareAssignments(topology, remaining)
+		if err != nil {
+			return machine.NewCPUSet(), fmt.Errorf("rebuild repaired dedicated assignments: %w", err)
+		}
+		d.main.AllocationResult = remaining.Clone()
+		d.main.OriginalAllocationResult = remaining.Clone()
+		d.main.TopologyAwareAssignments = assignments
+		d.main.OriginalTopologyAwareAssignments = machine.DeepcopyCPUAssignment(assignments)
+		if err := p.topologyAllocationHook(oldMain, d.main); err != nil {
+			return machine.NewCPUSet(), fmt.Errorf("refresh repaired dedicated topology annotation: %w", err)
+		}
+		for _, allocation := range d.containers {
+			if allocation != nil && allocation.CheckSideCar() {
+				p.applySidecarAllocationInfoFromMainContainer(allocation, d.main)
+			}
+		}
+	}
+	return selected, nil
+}
+
+// ensureInitialReclaimPool is the startup repair boundary for a missing, empty,
+// or underfilled pool. Existing reclaim identity is always retained; only the
+// shortfall to the configured bootstrap target may be added. Selection and any
+// required dedicated-owner update are published by one revision CAS.
+func (p *DynamicPolicy) ensureInitialReclaimPool() (retErr error) {
 	podEntries, machineState, revision := p.state.GetAdvisorStateSnapshot()
-	if entry := podEntries[commonstate.PoolNameReclaim][commonstate.FakedContainerName]; entry != nil && !entry.AllocationResult.IsEmpty() {
+	currentReclaim := reclaimPoolCPUSet(podEntries)
+	if !currentReclaim.IsEmpty() && currentReclaim.Size() >= p.reclaim.reservedReclaimedCPUsSize {
 		return nil
+	}
+	underfilled := !currentReclaim.IsEmpty()
+	if underfilled {
+		defer func() {
+			if errors.Is(retErr, errReclaimFallbackEmptyRequired) ||
+				errors.Is(retErr, errReclaimFallbackCapacityInsufficient) {
+				general.Warningf("skip optional underfilled reclaim startup repair: %v", retErr)
+				retErr = nil
+			}
+		}()
+	}
+	allowOverlap := p.state.GetAllowSharedCoresOverlapReclaimedCores()
+	disableDedicatedOverlap := p.state.GetDisableDedicatedCoresOverlapReclaimedCores()
+	dynamicConf := p.config.dynamicConfig.GetDynamicConfiguration()
+	if underfilled {
+		if err := assertCoreAligned(currentReclaim, p.machine.machineInfo.CPUTopology); err != nil {
+			return nil
+		}
 	}
 	// Scalars are authoritative, as in canonical precommit. Normalize before
 	// eligibility so stale buckets cannot later change the selected partition.
@@ -2350,23 +2570,38 @@ func (p *DynamicPolicy) ensureInitialReclaimPool() error {
 		Difference(podEntries.GetFilteredPoolsCPUSet(state.ResidentPools))
 	// Required owner buckets take precedence over the optional seed preference.
 	// Only bootstrap needs this constraint; the general seed selector stays pure.
-	reclaimedCPUSet := machine.NewCPUSet()
+	reclaimedCPUSet := currentReclaim.Clone()
 	requiredNUMAs := make([]int, 0, len(ownership.activeRNBTargetNUMAs))
 	for numaID := range ownership.activeRNBTargetNUMAs {
 		requiredNUMAs = append(requiredNUMAs, numaID)
 	}
 	sort.Ints(requiredNUMAs)
 	for _, numaID := range requiredNUMAs {
-		eligible := availableCPUs.Intersection(p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(numaID))
+		numaCPUs := p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(numaID)
+		if !reclaimedCPUSet.Intersection(numaCPUs).IsEmpty() {
+			continue
+		}
+		eligible := availableCPUs.Intersection(numaCPUs)
 		core, err := selectReclaimSeed(p.machine.machineInfo.CPUTopology, eligible, p.reclaim.reservedReclaimedCPUSet, 0)
+		if errors.Is(err, errReclaimFallbackEmptyRequired) || errors.Is(err, errReclaimFallbackCapacityInsufficient) {
+			core, err = p.repairInitialReclaimFromDedicatedSurplus(podEntries, machineState, eligible,
+				p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(numaID), p.reclaim.reservedReclaimedCPUSet, 0,
+				disableDedicatedOverlap)
+		}
 		if err != nil {
 			return fmt.Errorf("seed required reclaim NUMA %d: %w", numaID, err)
 		}
 		reclaimedCPUSet = reclaimedCPUSet.Union(core)
 	}
 	if shortfall := p.reclaim.reservedReclaimedCPUsSize - reclaimedCPUSet.Size(); shortfall > 0 || reclaimedCPUSet.IsEmpty() {
+		eligible := availableCPUs.Difference(reclaimedCPUSet)
 		supplement, err := selectReclaimSeed(p.machine.machineInfo.CPUTopology,
-			availableCPUs.Difference(reclaimedCPUSet), p.reclaim.reservedReclaimedCPUSet, shortfall)
+			eligible, p.reclaim.reservedReclaimedCPUSet, shortfall)
+		if errors.Is(err, errReclaimFallbackEmptyRequired) || errors.Is(err, errReclaimFallbackCapacityInsufficient) {
+			supplement, err = p.repairInitialReclaimFromDedicatedSurplus(podEntries, machineState, eligible,
+				p.machine.machineInfo.CPUDetails.CPUs().Difference(reclaimedCPUSet), p.reclaim.reservedReclaimedCPUSet, shortfall,
+				disableDedicatedOverlap)
+		}
 		if err != nil {
 			return fmt.Errorf("select initial reclaim pool: %w", err)
 		}
@@ -2418,17 +2653,15 @@ func (p *DynamicPolicy) ensureInitialReclaimPool() error {
 	if err := validatePendingPoolOwnershipWithView(podEntries, ownership); err != nil {
 		return fmt.Errorf("validate initial reclaim ownership: %w", err)
 	}
-	allowOverlap := p.state.GetAllowSharedCoresOverlapReclaimedCores()
-	disableDedicated := p.state.GetDisableDedicatedCoresOverlapReclaimedCores()
 	if err := p.validateAdvisorPartitionBeforeCommitWithDynamicConfig(podEntries, updatedMachineState,
-		allowOverlap, disableDedicated, p.config.dynamicConfig.GetDynamicConfiguration()); err != nil {
+		allowOverlap, disableDedicatedOverlap, dynamicConf); err != nil {
 		return fmt.Errorf("validate initial reclaim partition: %w", err)
 	}
 	if err := validateRequiredReclaimPool(podEntries); err != nil {
 		return err
 	}
 	return p.state.CommitAdvisorStateIfRevision(revision, podEntries, updatedMachineState,
-		allowOverlap, disableDedicated, true)
+		allowOverlap, disableDedicatedOverlap, true)
 }
 
 func (p *DynamicPolicy) initInterruptPool() error {

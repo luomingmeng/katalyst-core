@@ -74,6 +74,374 @@ func TestInitialReclaimPoolRepairsEmptyAndMissing(t *testing.T) {
 	}
 }
 
+func TestInitialReclaimPoolRepairsWholeCoreFromExclusiveDedicatedSurplus(t *testing.T) {
+	t.Parallel()
+	topology := contiguous180CPUTopology(t)
+	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.config.reservedCPUs = machine.NewCPUSet()
+	p.reclaim.reservedReclaimedCPUsSize = 4
+	p.reclaim.reservedReclaimedCPUSet = machine.NewCPUSet(0, 1, 90, 91)
+
+	firstCPUs, err := machine.Parse("1-89")
+	require.NoError(t, err)
+	secondCPUs, err := machine.Parse("90-179")
+	require.NoError(t, err)
+	newDedicated := func(podUID string, cpus machine.CPUSet, numaID int, request float64) *state.AllocationInfo {
+		return &state.AllocationInfo{
+			AllocationMeta: commonstate.AllocationMeta{
+				PodUid: podUID, ContainerName: "main", ContainerType: pluginapi.ContainerType_MAIN.String(),
+				OwnerPoolName: commonstate.PoolNameDedicated, QoSLevel: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+				Annotations: exclusiveAnnotations(),
+			},
+			AllocationResult: cpus.Clone(), OriginalAllocationResult: cpus.Clone(),
+			TopologyAwareAssignments:         map[int]machine.CPUSet{numaID: cpus.Clone()},
+			OriginalTopologyAwareAssignments: map[int]machine.CPUSet{numaID: cpus.Clone()},
+			RequestQuantity:                  request,
+		}
+	}
+	first := newDedicated("dedicated-a", firstCPUs, 0, 88)
+	sidecar := first.Clone()
+	sidecar.ContainerName = "sidecar"
+	sidecar.ContainerType = pluginapi.ContainerType_SIDECAR.String()
+	second := newDedicated("dedicated-b", secondCPUs, 1, 88)
+	preOccCPUs := machine.MustParse("91-179")
+	preOcc := newDedicated("pre-occ", preOccCPUs, 1, 88)
+	preOcc.Annotations["pre-occ-delete-timestamp"] = "2026-08-11T03:34:51+08:00"
+	entries := state.PodEntries{
+		commonstate.PoolNameReclaim: {
+			commonstate.FakedContainerName: {
+				AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+				AllocationResult: machine.NewCPUSet(), OriginalAllocationResult: machine.NewCPUSet(),
+			},
+		},
+		"dedicated-a": {"main": first, "sidecar": sidecar},
+		"dedicated-b": {"main": second},
+	}
+	machineState, err := generateMachineStateFromPodEntries(topology, entries, p.state.GetMachineState())
+	require.NoError(t, err)
+	machineState[1].PreOccPodEntries = state.PodEntries{"pre-occ": {"main": preOcc}}
+	require.NoError(t, p.state.CommitAdvisorState(entries, machineState, false, false, true))
+	persistedPreOcc := p.state.GetMachineState()[1].PreOccPodEntries.Clone()
+	persistedFirst := p.state.GetAllocationInfo("dedicated-a", "main")
+	require.True(t, persistedFirst.CheckDedicatedNUMABindingNUMAExclusive())
+	require.Equal(t, float64(88), persistedFirst.RequestQuantity)
+	require.True(t, persistedFirst.AllocationResult.Equals(persistedFirst.OriginalAllocationResult))
+	expectedFirstAssignments, err := machine.GetNumaAwareAssignments(topology, persistedFirst.AllocationResult)
+	require.NoError(t, err)
+	require.Equal(t, expectedFirstAssignments, persistedFirst.TopologyAwareAssignments)
+	require.Equal(t, expectedFirstAssignments, persistedFirst.OriginalTopologyAwareAssignments)
+
+	before := p.state.GetRevision()
+	require.NoError(t, p.ensureInitialReclaimPool())
+	require.Equal(t, before+1, p.state.GetRevision())
+	pool := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+	require.True(t, pool.AllocationResult.Equals(machine.NewCPUSet(0, 1, 90, 91)))
+	require.NoError(t, assertCoreAligned(pool.AllocationResult, topology))
+	updatedMain := p.state.GetAllocationInfo("dedicated-a", "main")
+	updatedSidecar := p.state.GetAllocationInfo("dedicated-a", "sidecar")
+	require.True(t, updatedMain.AllocationResult.Equals(firstCPUs))
+	require.True(t, updatedMain.AllocationResult.Equals(updatedMain.OriginalAllocationResult))
+	require.Equal(t, updatedMain.AllocationResult, updatedSidecar.AllocationResult)
+	require.Equal(t, updatedMain.OriginalAllocationResult, updatedSidecar.OriginalAllocationResult)
+	require.True(t, p.state.GetAllocationInfo("dedicated-b", "main").AllocationResult.Equals(secondCPUs))
+	require.True(t, pool.AllocationResult.Intersection(updatedMain.AllocationResult).Equals(machine.NewCPUSet(1)))
+	require.True(t, pool.AllocationResult.Intersection(secondCPUs).Equals(machine.NewCPUSet(90, 91)))
+	require.Equal(t, persistedPreOcc, p.state.GetMachineState()[1].PreOccPodEntries)
+
+	publishedEntries, publishedMachineState, revision := p.state.GetAdvisorStateSnapshot()
+	require.NoError(t, p.ensureInitialReclaimPool())
+	require.Equal(t, revision, p.state.GetRevision())
+	require.Equal(t, publishedEntries, p.state.GetPodEntries())
+	require.Equal(t, publishedMachineState, p.state.GetMachineState())
+
+	ok, _, err := NewDynamicPolicy(freshRealConstructorContext(t, topology, p.advisorPostCommitCheckpointDir),
+		freshRealConstructorConf(t, p.advisorPostCommitCheckpointDir), nil, "repaired-reclaim-restart")
+	require.NoError(t, err)
+	require.True(t, ok)
+	restarted := openCheckpointState(t, topology, p.advisorPostCommitCheckpointDir)
+	require.True(t, restarted.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName).
+		AllocationResult.Equals(machine.NewCPUSet(0, 1, 90, 91)))
+	require.True(t, restarted.GetAllocationInfo("dedicated-a", "main").AllocationResult.Equals(firstCPUs))
+	require.True(t, restarted.GetAllocationInfo("dedicated-b", "main").AllocationResult.Equals(secondCPUs))
+}
+
+func TestInitialReclaimPoolRepairsUnderfilledAccordingToDedicatedOverlapMode(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name                     string
+		disableDedicatedOverlap  bool
+		expectedSecondAllocation machine.CPUSet
+	}{
+		{
+			name:                     "overlap allowed preserves dedicated allocation",
+			disableDedicatedOverlap:  false,
+			expectedSecondAllocation: machine.MustParse("90-179"),
+		},
+		{
+			name:                     "overlap disabled transfers dedicated surplus",
+			disableDedicatedOverlap:  true,
+			expectedSecondAllocation: machine.MustParse("92-179"),
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			topology := contiguous180CPUTopology(t)
+			stateDir := t.TempDir()
+			p, err := getTestDynamicPolicyWithoutInitialization(topology, stateDir)
+			require.NoError(t, err)
+			p.config.reservedCPUs = machine.NewCPUSet()
+			p.reclaim.reservedReclaimedCPUsSize = 4
+			p.reclaim.reservedReclaimedCPUSet = machine.NewCPUSet(0, 1, 90, 91)
+
+			newDedicated := func(podUID string, cpus machine.CPUSet, numaID int) *state.AllocationInfo {
+				return &state.AllocationInfo{
+					AllocationMeta: commonstate.AllocationMeta{
+						PodUid: podUID, ContainerName: "main", ContainerType: pluginapi.ContainerType_MAIN.String(),
+						OwnerPoolName: commonstate.PoolNameDedicated, QoSLevel: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+						Annotations: exclusiveAnnotations(),
+					},
+					AllocationResult: cpus.Clone(), OriginalAllocationResult: cpus.Clone(),
+					TopologyAwareAssignments:         map[int]machine.CPUSet{numaID: cpus.Clone()},
+					OriginalTopologyAwareAssignments: map[int]machine.CPUSet{numaID: cpus.Clone()},
+					RequestQuantity:                  88,
+				}
+			}
+
+			firstCPUs := machine.MustParse("2-89")
+			secondCPUs := machine.MustParse("90-179")
+			first := newDedicated("dedicated-a", firstCPUs, 0)
+			second := newDedicated("dedicated-b", secondCPUs, 1)
+			secondSidecar := second.Clone()
+			secondSidecar.ContainerName = "sidecar"
+			secondSidecar.ContainerType = pluginapi.ContainerType_SIDECAR.String()
+			preOcc := newDedicated("pre-occ", machine.MustParse("91-179"), 1)
+			preOcc.Annotations["pre-occ-delete-timestamp"] = "2026-08-11T03:34:51+08:00"
+			reclaim := machine.NewCPUSet(0, 1)
+			entries := state.PodEntries{
+				commonstate.PoolNameReclaim: {
+					commonstate.FakedContainerName: {
+						AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+						AllocationResult:                 reclaim.Clone(),
+						OriginalAllocationResult:         reclaim.Clone(),
+						TopologyAwareAssignments:         map[int]machine.CPUSet{0: reclaim.Clone()},
+						OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: reclaim.Clone()},
+					},
+				},
+				"dedicated-a": {"main": first},
+				"dedicated-b": {"main": second, "sidecar": secondSidecar},
+			}
+			machineState, err := generateMachineStateFromPodEntries(topology, entries, p.state.GetMachineState())
+			require.NoError(t, err)
+			machineState[1].PreOccPodEntries = state.PodEntries{"pre-occ": {"main": preOcc}}
+			require.NoError(t, p.state.CommitAdvisorState(
+				entries, machineState, false, tc.disableDedicatedOverlap, true))
+			persistedPreOcc := p.state.GetMachineState()[1].PreOccPodEntries.Clone()
+
+			before := p.state.GetRevision()
+			require.NoError(t, p.ensureInitialReclaimPool())
+			require.Equal(t, before+1, p.state.GetRevision())
+			pool := p.state.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName)
+			require.True(t, pool.AllocationResult.Equals(machine.NewCPUSet(0, 1, 90, 91)))
+			require.True(t, p.state.GetAllocationInfo("dedicated-a", "main").AllocationResult.Equals(firstCPUs))
+			updatedSecond := p.state.GetAllocationInfo("dedicated-b", "main")
+			updatedSidecar := p.state.GetAllocationInfo("dedicated-b", "sidecar")
+			require.True(t, updatedSecond.AllocationResult.Equals(tc.expectedSecondAllocation))
+			require.True(t, updatedSecond.OriginalAllocationResult.Equals(tc.expectedSecondAllocation))
+			require.True(t, updatedSidecar.AllocationResult.Equals(tc.expectedSecondAllocation))
+			require.Equal(t, updatedSecond.TopologyAwareAssignments, updatedSidecar.TopologyAwareAssignments)
+			require.Equal(t, persistedPreOcc, p.state.GetMachineState()[1].PreOccPodEntries)
+			if tc.disableDedicatedOverlap {
+				require.True(t, pool.AllocationResult.Intersection(updatedSecond.AllocationResult).IsEmpty())
+			} else {
+				require.True(t, pool.AllocationResult.Intersection(updatedSecond.AllocationResult).
+					Equals(machine.NewCPUSet(90, 91)))
+			}
+
+			reopened := openCheckpointState(t, topology, stateDir)
+			require.Equal(t, p.state.GetPodEntries(), reopened.GetPodEntries())
+			require.Equal(t, p.state.GetMachineState(), reopened.GetMachineState())
+			publishedRevision := p.state.GetRevision()
+			require.NoError(t, p.ensureInitialReclaimPool())
+			require.Equal(t, publishedRevision, p.state.GetRevision())
+		})
+	}
+}
+
+func TestInitialReclaimPoolLeavesNonCoreAlignedUnderfilledIdentityUntouched(t *testing.T) {
+	t.Parallel()
+	topology, err := machine.GenerateDummyCPUTopology(32, 1, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reclaim.reservedReclaimedCPUsSize = 4
+	reclaim := machine.NewCPUSet(0)
+	require.NoError(t, p.state.SetAllocationInfo(
+		commonstate.PoolNameReclaim,
+		commonstate.FakedContainerName,
+		&state.AllocationInfo{
+			AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+			AllocationResult:                 reclaim.Clone(),
+			OriginalAllocationResult:         reclaim.Clone(),
+			TopologyAwareAssignments:         map[int]machine.CPUSet{0: reclaim.Clone()},
+			OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: reclaim.Clone()},
+		},
+		true,
+	))
+
+	beforeEntries, beforeMachineState, beforeRevision := p.state.GetAdvisorStateSnapshot()
+	require.NoError(t, p.ensureInitialReclaimPool())
+	require.Equal(t, beforeRevision, p.state.GetRevision())
+	require.Equal(t, beforeEntries, p.state.GetPodEntries())
+	require.Equal(t, beforeMachineState, p.state.GetMachineState())
+}
+
+func TestInitialReclaimPoolKeepsUnderfilledIdentityWhenNoSafeSupplementExists(t *testing.T) {
+	t.Parallel()
+	topology, err := machine.GenerateDummyCPUTopology(32, 1, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.reclaim.reservedReclaimedCPUsSize = 4
+	reclaim := machine.NewCPUSet(0, 16)
+	p.config.reservedCPUs = topology.CPUDetails.CPUs().Difference(reclaim)
+	require.NoError(t, p.state.SetAllocationInfo(
+		commonstate.PoolNameReclaim,
+		commonstate.FakedContainerName,
+		&state.AllocationInfo{
+			AllocationMeta:                   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+			AllocationResult:                 reclaim.Clone(),
+			OriginalAllocationResult:         reclaim.Clone(),
+			TopologyAwareAssignments:         map[int]machine.CPUSet{0: reclaim.Clone()},
+			OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: reclaim.Clone()},
+		},
+		true,
+	))
+
+	beforeEntries, beforeMachineState, beforeRevision := p.state.GetAdvisorStateSnapshot()
+	require.NoError(t, p.ensureInitialReclaimPool())
+	require.Equal(t, beforeRevision, p.state.GetRevision())
+	require.Equal(t, beforeEntries, p.state.GetPodEntries())
+	require.Equal(t, beforeMachineState, p.state.GetMachineState())
+}
+
+func TestInitialReclaimDedicatedRepairStaleRevisionDoesNotPublish(t *testing.T) {
+	t.Parallel()
+	topology := contiguous180CPUTopology(t)
+	p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+	p.config.reservedCPUs = machine.NewCPUSet()
+	p.reclaim.reservedReclaimedCPUsSize = 2
+	p.reclaim.reservedReclaimedCPUSet = machine.NewCPUSet(0, 1)
+	firstCPUs := machine.MustParse("1-89")
+	secondCPUs := machine.MustParse("90-179")
+	newDedicated := func(podUID string, cpus machine.CPUSet, numaID int, request float64) *state.AllocationInfo {
+		return &state.AllocationInfo{
+			AllocationMeta: commonstate.AllocationMeta{
+				PodUid: podUID, ContainerName: "main", ContainerType: pluginapi.ContainerType_MAIN.String(),
+				OwnerPoolName: commonstate.PoolNameDedicated, QoSLevel: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+				Annotations: exclusiveAnnotations(),
+			},
+			AllocationResult: cpus.Clone(), OriginalAllocationResult: cpus.Clone(),
+			TopologyAwareAssignments:         map[int]machine.CPUSet{numaID: cpus.Clone()},
+			OriginalTopologyAwareAssignments: map[int]machine.CPUSet{numaID: cpus.Clone()},
+			RequestQuantity:                  request,
+		}
+	}
+	entries := state.PodEntries{
+		commonstate.PoolNameReclaim: {commonstate.FakedContainerName: {
+			AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+			AllocationResult: machine.NewCPUSet(), OriginalAllocationResult: machine.NewCPUSet(),
+		}},
+		"dedicated-a": {"main": newDedicated("dedicated-a", firstCPUs, 0, 88)},
+		"dedicated-b": {"main": newDedicated("dedicated-b", secondCPUs, 1, 90)},
+	}
+	machineState, err := generateMachineStateFromPodEntries(topology, entries, p.state.GetMachineState())
+	require.NoError(t, err)
+	require.NoError(t, p.state.CommitAdvisorState(entries, machineState, false, false, true))
+	underlying := p.state
+	tracked := &bypassTrackingState{State: underlying, bumpBeforeCommit: true}
+	p.state = tracked
+
+	err = p.ensureInitialReclaimPool()
+	require.Error(t, err)
+	require.Equal(t, 1, tracked.commitIfRevisionCalls)
+	require.True(t, underlying.GetAllocationInfo("dedicated-a", "main").AllocationResult.Equals(firstCPUs))
+	require.True(t, underlying.GetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName).
+		AllocationResult.IsEmpty())
+	require.NotNil(t, underlying.GetAllocationInfo("bump-pod", "bump-container"))
+}
+
+func TestInitialReclaimPoolRejectsUnsafeDedicatedRepair(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name        string
+		request     float64
+		annotations map[string]string
+		pinDonorCPU bool
+	}{
+		{name: "no surplus", request: 89, annotations: exclusiveAnnotations()},
+		{name: "non exclusive", request: 88, annotations: nonExclusiveAnnotations()},
+		{name: "resource package pinned", request: 88, annotations: exclusiveAnnotations(), pinDonorCPU: true},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			topology := contiguous180CPUTopology(t)
+			p, err := getTestDynamicPolicyWithoutInitialization(topology, t.TempDir())
+			require.NoError(t, err)
+			p.config.reservedCPUs = machine.NewCPUSet()
+			p.reclaim.reservedReclaimedCPUsSize = 2
+			p.reclaim.reservedReclaimedCPUSet = machine.NewCPUSet(0, 1)
+			firstCPUs, err := machine.Parse("1-89")
+			require.NoError(t, err)
+			secondCPUs, err := machine.Parse("90-179")
+			require.NoError(t, err)
+			first := &state.AllocationInfo{
+				AllocationMeta: commonstate.AllocationMeta{
+					PodUid: "dedicated-a", ContainerName: "main", ContainerType: pluginapi.ContainerType_MAIN.String(),
+					OwnerPoolName: commonstate.PoolNameDedicated, QoSLevel: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+					Annotations: tc.annotations,
+				},
+				AllocationResult: firstCPUs.Clone(), OriginalAllocationResult: firstCPUs.Clone(),
+				TopologyAwareAssignments:         map[int]machine.CPUSet{0: firstCPUs.Clone()},
+				OriginalTopologyAwareAssignments: map[int]machine.CPUSet{0: firstCPUs.Clone()},
+				RequestQuantity:                  tc.request,
+			}
+			second := first.Clone()
+			second.PodUid = "dedicated-b"
+			second.AllocationResult = secondCPUs.Clone()
+			second.OriginalAllocationResult = secondCPUs.Clone()
+			second.TopologyAwareAssignments = map[int]machine.CPUSet{1: secondCPUs.Clone()}
+			second.OriginalTopologyAwareAssignments = map[int]machine.CPUSet{1: secondCPUs.Clone()}
+			second.RequestQuantity = 90
+			entries := state.PodEntries{
+				commonstate.PoolNameReclaim: {commonstate.FakedContainerName: {
+					AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+					AllocationResult: machine.NewCPUSet(), OriginalAllocationResult: machine.NewCPUSet(),
+				}},
+				"dedicated-a": {"main": first}, "dedicated-b": {"main": second},
+			}
+			machineState, err := generateMachineStateFromPodEntries(topology, entries, p.state.GetMachineState())
+			require.NoError(t, err)
+			if tc.pinDonorCPU {
+				machineState[0].ResourcePackageStates = map[string]*state.ResourcePackageState{
+					"protected": {PinnedCPUSet: machine.NewCPUSet(1)},
+				}
+			}
+			require.NoError(t, p.state.CommitAdvisorState(entries, machineState, false, false, true))
+			beforeEntries, beforeMachineState, beforeRevision := p.state.GetAdvisorStateSnapshot()
+
+			err = p.ensureInitialReclaimPool()
+			require.ErrorIs(t, err, errReclaimFallbackEmptyRequired)
+			require.Equal(t, beforeRevision, p.state.GetRevision())
+			require.Equal(t, beforeEntries, p.state.GetPodEntries())
+			require.Equal(t, beforeMachineState, p.state.GetMachineState())
+		})
+	}
+}
+
 func TestInitialReclaimPoolNoCompleteCandidateDoesNotWrite(t *testing.T) {
 	t.Parallel()
 	topology, err := machine.GenerateDummyCPUTopology(8, 1, 1)
