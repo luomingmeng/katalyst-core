@@ -3963,10 +3963,46 @@ func (p *DynamicPolicy) generatePoolsAndIsolation(
 	if strictDisjointReclaim && enforceReclaimMinimum && explicitReclaimQuantity == 0 {
 		minimumOutsideFloor := p.reclaim.reservedReclaimedCPUsSize - rampUpReclaimFloor.Size()
 		if minimumOutsideFloor > 0 {
-			configuredReclaimMinimum, err = p.selectDisjointReclaimFallback(
-				availableCPUs.Difference(rampUpReclaimFloor), minimumOutsideFloor)
-			if err != nil {
-				return
+			// A still-valid committed reclaim floor already satisfies part or all of
+			// the configured minimum even when hard NUMA-binding pools have removed it
+			// from residual availability. Reuse that floor before selecting only the
+			// true deficit; otherwise a second exclusive admission can reserve the same
+			// minimum twice and fail with zero residual core capacity.
+			allocatedBindingCPUs := machine.NewCPUSet()
+			for _, cpus := range poolsCPUSet {
+				allocatedBindingCPUs = allocatedBindingCPUs.Union(cpus)
+			}
+			if currentReclaim, currentErr := p.state.GetPodEntries().GetCPUSetForPool(commonstate.PoolNameReclaim); currentErr == nil {
+				configuredReclaimMinimum = currentReclaim
+			}
+			if placement != nil {
+				configuredReclaimMinimum = configuredReclaimMinimum.Union(placement.historicalReclaim)
+			}
+			configuredReclaimMinimum = configuredReclaimMinimum.
+				Difference(rampUpReclaimFloor).Difference(allocatedBindingCPUs)
+			configuredReclaimMinimum = takeCoreAlignedCPUSet(
+				p.machine.machineInfo.CPUTopology,
+				configuredReclaimMinimum,
+				configuredReclaimMinimum,
+				configuredReclaimMinimum.Size(),
+			)
+			if configuredReclaimMinimum.Size() > minimumOutsideFloor {
+				configuredReclaimMinimum = takeCoreAlignedCPUSet(
+					p.machine.machineInfo.CPUTopology,
+					configuredReclaimMinimum,
+					configuredReclaimMinimum,
+					minimumOutsideFloor,
+				)
+			}
+			deficit := minimumOutsideFloor - configuredReclaimMinimum.Size()
+			if deficit > 0 {
+				var supplement machine.CPUSet
+				supplement, err = p.selectDisjointReclaimFallback(
+					availableCPUs.Difference(rampUpReclaimFloor).Difference(configuredReclaimMinimum), deficit)
+				if err != nil {
+					return
+				}
+				configuredReclaimMinimum = configuredReclaimMinimum.Union(supplement)
 			}
 			availableCPUs = availableCPUs.Difference(configuredReclaimMinimum)
 		}

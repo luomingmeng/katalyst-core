@@ -175,3 +175,48 @@ func TestAdmissionProjectionAuthorityNilAppliedViewFailClosed(t *testing.T) {
 	require.True(t, got[0].SharedProjectedCPUs.IsEmpty(),
 		"shared-projected must stay empty for a preserved exact seed")
 }
+
+func TestShadowAppliedFloorYieldsToPendingDedicatedOwnerTransfer(t *testing.T) {
+	t.Parallel()
+
+	topo := e2e128Topology()
+	all := topo.CPUDetails.CPUs()
+	numa0 := topo.CPUDetails.CPUsInNUMANodes(0)
+	oldFloor := machine.MustParse("4,20,68,84")
+	desiredFloor := machine.MustParse("20,84")
+	const podUID = "pending-dedicated-owner"
+
+	desired := &model.DesiredView{
+		CPUSetPartitionView: model.CPUSetPartitionView{
+			Reserve:                        machine.NewCPUSet(),
+			Dedicated:                      numa0.Clone(),
+			DesiredNonReclaimPool:          all.Difference(desiredFloor),
+			DesiredReclaimEffective:        desiredFloor.Clone(),
+			DesiredReclaimEffectivePerNUMA: map[int]machine.CPUSet{1: desiredFloor.Clone()},
+			NonReclaimPool:                 all.Difference(oldFloor),
+			ReclaimEffective:               oldFloor.Clone(),
+		},
+		PoolOwners: map[model.CPUSetPoolIdentity]model.DesiredPoolOwner{
+			{Kind: model.CPUSetPoolKindDedicated, PodNamespace: "default", PodName: "owner"}: {
+				ProofPodUID:    podUID,
+				ExpectedCPUSet: numa0.Clone(),
+			},
+		},
+	}
+	applied := &model.CPUSetPartitionView{
+		Reserve:          machine.NewCPUSet(),
+		NonReclaimPool:   all.Difference(oldFloor),
+		ReclaimEffective: oldFloor.Clone(),
+	}
+	protections := []topology.PendingProtection{{
+		PodUID: podUID,
+		CPUs:   numa0.Clone(),
+		Source: topology.PendingProtectionSourceExpectedPod,
+	}}
+
+	shadow := DeriveShadowPartitionWithAppliedEnforcement(desired, topo, protections, applied)
+	require.False(t, shadow.HoldCurrent, "pending dedicated ownership must not retain a superseded applied floor: %s", shadow.HoldReason)
+	require.Equal(t, desiredFloor, shadow.ReclaimEffective)
+	require.Equal(t, desiredFloor, shadow.ReclaimEffectivePerNUMA[1])
+	require.True(t, shadow.ReclaimEffectivePerNUMA[0].IsEmpty())
+}

@@ -621,8 +621,14 @@ func DeriveShadowPartitionWithAppliedEnforcement(
 	if enforce != nil &&
 		!enforce.ReclaimEffective.IsEmpty() &&
 		enforce.ReclaimEffective.Difference(available).IsEmpty() {
-		reclaimBudget = enforce.ReclaimEffective
-		nonReclaimBase = available.Difference(enforce.ReclaimEffective)
+		// A pending dedicated/isolation owner may atomically replace an applied
+		// reclaim floor inside its own exact ownership domain. Continuing that old
+		// floor would make the ownership transfer permanently defer. Keep every
+		// other applied floor and merge the transaction's desired reclaim target.
+		transferred := exactWhole.Intersection(selfExclusive)
+		reclaimBudget = enforce.ReclaimEffective.Difference(transferred).
+			Union(base.DesiredReclaimEffective)
+		nonReclaimBase = available.Difference(reclaimBudget)
 	}
 	nonReclaim := nonReclaimBase.Clone().Union(exactWhole).Union(sharedProjectedWhole)
 	// reclaim = available − nonReclaim, then clipped to the reclaim budget. With the
