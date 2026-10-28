@@ -3161,6 +3161,51 @@ func TestDynamicPolicy_generatePoolsAndIsolation_prefersHistoricalReclaimPool(t 
 		poolsCPUSet[commonstate.PoolNameShare].String())
 }
 
+func TestDynamicPolicy_generatePoolsAndIsolation_reusesHistoricalReclaimForConfiguredMinimum(t *testing.T) {
+	t.Parallel()
+
+	topology, err := machine.GenerateDummyCPUTopology(8, 2, 2)
+	require.NoError(t, err)
+	p, err := getTestDynamicPolicyWithInitialization(topology, t.TempDir())
+	require.NoError(t, err)
+
+	p.config.reservedCPUs = machine.NewCPUSet()
+	p.reclaim.reservedReclaimedCPUsSize = 2
+	p.config.dynamicConfig.GetDynamicConfiguration().EnableReclaim = true
+	require.NoError(t, p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false))
+	require.NoError(t, p.state.SetDisableDedicatedCoresOverlapReclaimedCores(true, false))
+
+	historicalFloor := coresInNUMA(topology, 1, 0, 1)
+	require.NoError(t, p.state.SetAllocationInfo(
+		commonstate.PoolNameReclaim, commonstate.FakedContainerName,
+		&state.AllocationInfo{
+			AllocationMeta:   commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim),
+			AllocationResult: historicalFloor.Clone(),
+		}, false))
+	placement := &poolPlacementSnapshot{
+		borrowedByPool:       make(map[string]machine.CPUSet),
+		dedicatedByContainer: make(map[string]map[string]machine.CPUSet),
+		ownByPool:            make(map[string]machine.CPUSet),
+		historicalReclaim:    historicalFloor.Clone(),
+	}
+
+	pools, _, err := p.generatePoolsAndIsolation(
+		map[string]map[int]int{},
+		map[string]map[string]int{},
+		machine.NewCPUSet(),
+		map[string]float64{},
+		generatePoolsAndIsolationOptions{
+			enforceReclaimMinimum: true,
+			dynamicConf:           p.config.dynamicConfig.GetDynamicConfiguration(),
+			placement:             placement,
+		},
+	)
+	require.NoError(t, err)
+	require.True(t, historicalFloor.IsSubsetOf(pools[commonstate.PoolNameReclaim]),
+		"committed floor must survive configured-minimum planning: floor=%s reclaim=%s",
+		historicalFloor, pools[commonstate.PoolNameReclaim])
+}
+
 func TestDynamicPolicy_generatePoolsAndIsolation_preservesAdvisorReclaimForSeedPool(t *testing.T) {
 	t.Parallel()
 
