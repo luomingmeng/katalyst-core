@@ -199,6 +199,24 @@ func newContainerLifecycleProofStaleError(
 	}
 }
 
+func resolvedContainerEntryFromFinalSnapshot(
+	snapshot *topology.CompleteSnapshot,
+	proof containerLifecycleProof,
+) (topology.EntryState, error) {
+	if snapshot != nil {
+		if entry, ok := snapshot.Entries[proof.RelativePath]; ok {
+			return entry, nil
+		}
+		if unavailable, ok := snapshot.UnavailableChildren[proof.RelativePath]; ok {
+			return topology.EntryState{}, fmt.Errorf(
+				"resolved final leaf %q is unavailable: reason=%s identity=%v",
+				proof.RelativePath, unavailable.Reason, unavailable.Identity)
+		}
+	}
+	return topology.EntryState{}, newContainerLifecycleProofStaleError(
+		proof, proof.ContainerID, "resolved final leaf is missing")
+}
+
 func containerCPUSetByPodFromFinalSnapshot(
 	snapshot *topology.CompleteSnapshot,
 	proofs validatedContainerLifecycleProofSet,
@@ -216,11 +234,10 @@ func containerCPUSetByPodFromFinalSnapshot(
 		case containerLifecyclePending, containerLifecycleRetired:
 			continue
 		case containerLifecycleResolved:
-			observed, ok := snapshot.TargetProofCPUs(proof.RelativePath, proof.DesiredCPUSet)
-			if !ok {
-				return nil, newContainerLifecycleProofStaleError(
-					proof, proof.ContainerID, "resolved final leaf is missing")
+			if _, err := resolvedContainerEntryFromFinalSnapshot(snapshot, proof); err != nil {
+				return nil, err
 			}
+			observed, _ := snapshot.TargetProofCPUs(proof.RelativePath, proof.DesiredCPUSet)
 			if out[proof.PodUID] == nil {
 				out[proof.PodUID] = make(map[string]machine.CPUSet)
 			}

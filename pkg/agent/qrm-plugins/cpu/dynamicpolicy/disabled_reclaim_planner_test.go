@@ -58,60 +58,78 @@ func TestFrozenReclaimConstraintToDisjointDescriptors(t *testing.T) {
 	}{
 		{
 			name: "steady ordinary share is disjoint when AO is disabled",
-			descriptor: advisorBlockDescriptor{Class: advisorBlockClassShared, Eligible: all,
-				Owners: []string{canonicalAdvisorBlockOwner(commonstate.PoolNameShare, "steady-share", "main", "")}},
+			descriptor: advisorBlockDescriptor{
+				Class: advisorBlockClassShared, Eligible: all,
+				Owners: []string{canonicalAdvisorBlockOwner(commonstate.PoolNameShare, "steady-share", "main", "")},
+			},
 			want: all.Difference(frozen),
 		},
 		{
 			name: "isolation is disjoint when AO is disabled",
-			descriptor: advisorBlockDescriptor{Class: advisorBlockClassShared, Eligible: all,
-				Owners: []string{canonicalAdvisorBlockOwner(commonstate.PoolNamePrefixIsolation+"-pod", "steady-share", "main", "")}},
+			descriptor: advisorBlockDescriptor{
+				Class: advisorBlockClassShared, Eligible: all,
+				Owners: []string{canonicalAdvisorBlockOwner(commonstate.PoolNamePrefixIsolation+"-pod", "steady-share", "main", "")},
+			},
 			want: all.Difference(frozen),
 		},
 		{
 			name: "dedicated overlap remains legal",
-			descriptor: advisorBlockDescriptor{Class: advisorBlockClassDedicated, Eligible: all,
-				Owners: []string{canonicalAdvisorBlockOwner(commonstate.PoolNameDedicated, "dedicated", "main", "")}},
+			descriptor: advisorBlockDescriptor{
+				Class: advisorBlockClassDedicated, Eligible: all,
+				Owners: []string{canonicalAdvisorBlockOwner(commonstate.PoolNameDedicated, "dedicated", "main", "")},
+			},
 			want: all,
 		},
 		{
 			name: "dedicated is disjoint when configured",
-			descriptor: advisorBlockDescriptor{Class: advisorBlockClassDedicated, Eligible: all,
-				Owners: []string{canonicalAdvisorBlockOwner(commonstate.PoolNameDedicated, "dedicated", "main", "")}},
+			descriptor: advisorBlockDescriptor{
+				Class: advisorBlockClassDedicated, Eligible: all,
+				Owners: []string{canonicalAdvisorBlockOwner(commonstate.PoolNameDedicated, "dedicated", "main", "")},
+			},
 			disableDedicated: true,
 			want:             all.Difference(frozen),
 		},
 		{
 			name: "ordinary share overlap remains legal when AO is enabled",
-			descriptor: advisorBlockDescriptor{Class: advisorBlockClassShared, Eligible: all,
-				Owners: []string{canonicalAdvisorBlockOwner(commonstate.PoolNameShare, "steady-share", "main", "")}},
+			descriptor: advisorBlockDescriptor{
+				Class: advisorBlockClassShared, Eligible: all,
+				Owners: []string{canonicalAdvisorBlockOwner(commonstate.PoolNameShare, "steady-share", "main", "")},
+			},
 			allowShared: true,
 			want:        all,
 		},
 		{
 			name: "ramp-up shared keeps existing non-HP semantics",
-			descriptor: advisorBlockDescriptor{Class: advisorBlockClassShared, Eligible: all,
-				Owners: []string{canonicalAdvisorBlockOwner(commonstate.PoolNameShare, "ramp-share", "main", "")}},
+			descriptor: advisorBlockDescriptor{
+				Class: advisorBlockClassShared, Eligible: all,
+				Owners: []string{canonicalAdvisorBlockOwner(commonstate.PoolNameShare, "ramp-share", "main", "")},
+			},
 			want: all,
 		},
 		{
 			name: "pool-style ramp-up isolation keeps existing non-HP semantics",
-			descriptor: advisorBlockDescriptor{Class: advisorBlockClassShared, Eligible: all,
+			descriptor: advisorBlockDescriptor{
+				Class: advisorBlockClassShared, Eligible: all,
 				Owners: []string{canonicalAdvisorBlockOwner(
 					commonstate.PoolNamePrefixIsolation+"-ramp",
-					commonstate.PoolNamePrefixIsolation+"-ramp", "", "")}},
+					commonstate.PoolNamePrefixIsolation+"-ramp", "", "")},
+			},
 			want: all,
 		},
 		{
 			name: "reclaim descriptor is fixed to frozen identity",
-			descriptor: advisorBlockDescriptor{Class: advisorBlockClassMandatoryReclaim, Eligible: all,
-				Owners: []string{canonicalAdvisorBlockOwner(commonstate.PoolNameReclaim, commonstate.PoolNameReclaim, commonstate.FakedContainerName, "")}},
+			descriptor: advisorBlockDescriptor{
+				Class: advisorBlockClassMandatoryReclaim, Eligible: all,
+				Owners: []string{canonicalAdvisorBlockOwner(commonstate.PoolNameReclaim, commonstate.PoolNameReclaim, commonstate.FakedContainerName, "")},
+			},
 			want: frozen,
 		},
 	}
 
 	for _, tc := range tests {
+		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			constraint := frozenReclaimPlacementConstraint{
 				entries: entries, cpus: frozen,
 				allowSharedOverlap: tc.allowShared, disableDedicatedOverlap: tc.disableDedicated,

@@ -84,58 +84,6 @@ func TestTopologyResultAndDAGApplyResultPreserveExecutionStatistics(t *testing.T
 	}
 }
 
-func TestDisabledReconcileRetryRequiresSafeDisposition(t *testing.T) {
-	t.Parallel()
-	staleErr := &topology.PlanStaleError{
-		Rel:       "reclaim",
-		Direction: topology.WritePublish,
-		Resource:  "reclaim_classification",
-		Current:   "old",
-		Target:    "current",
-		Err:       errReclaimClassificationChanged,
-	}
-	tests := []struct {
-		name        string
-		err         error
-		disposition topology.ReplanDisposition
-		want        bool
-	}{
-		{
-			name:        "stale marker without physical-state proof terminates",
-			err:         staleErr,
-			disposition: topology.ReplanNotAllowed,
-			want:        false,
-		},
-		{
-			name:        "classification retry with no writes is allowed",
-			err:         errReclaimClassificationChanged,
-			disposition: topology.ReplanSafeNoPhysicalWrites,
-			want:        true,
-		},
-		{
-			name:        "verified final state retry is allowed",
-			err:         staleErr,
-			disposition: topology.ReplanSafeFromVerifiedFinalState,
-			want:        true,
-		},
-		{
-			name:        "success never retries",
-			disposition: topology.ReplanSafeFromVerifiedFinalState,
-			want:        false,
-		},
-	}
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			convergence := topology.ConvergenceResult{ReplanDisposition: tt.disposition}
-			if got := disabledReconcileShouldRetry(tt.err, convergence); got != tt.want {
-				t.Fatalf("disabledReconcileShouldRetry() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
 func TestAccumulateConvergenceResultPropagatesPublicationState(t *testing.T) {
 	t.Parallel()
 	total := topology.ConvergenceResult{
@@ -4535,6 +4483,7 @@ func TestCPUSetTopologyPluginRetainsFreshMissingPodWithinAdmissionProtectionTTL(
 	} {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			p := &CPUSetTopologyPlugin{
 				cgroup: &fakeCgroupClient{statErrors: statErrors},
 				now:    func() time.Time { return now },

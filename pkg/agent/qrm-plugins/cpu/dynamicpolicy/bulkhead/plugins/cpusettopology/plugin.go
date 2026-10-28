@@ -181,10 +181,6 @@ func (e *topologyApplyNonConvergedError) Error() string {
 		e.result.State, e.result.ConvergenceReport)
 }
 
-func NewCPUSetTopologyPlugin(conf *config.Configuration) bulkheadapi.Plugin {
-	return NewCPUSetTopologyPluginWithCgroupClient(conf, nil)
-}
-
 // NewCPUSetTopologyPluginWithCgroupClient injects the cgroup client factory.
 // A nil factory defaults to cgroupclient.NewCgroupClient.
 func NewCPUSetTopologyPluginWithCgroupClient(
@@ -197,8 +193,8 @@ func NewCPUSetTopologyPluginWithCgroupClient(
 // NewCPUSetTopologyPluginWithDependencies is a test-only constructor exported
 // solely because integration tests in the sibling bulkhead package exercise the
 // real topology plugin against a synthetic cgroup hierarchy. Production wiring
-// must use NewCPUSetTopologyPlugin or NewCPUSetTopologyPluginWithCgroupClient and
-// must not override container path resolution.
+// must use NewCPUSetTopologyPluginWithCgroupClient and must not override
+// container path resolution.
 func NewCPUSetTopologyPluginWithDependencies(
 	conf *config.Configuration,
 	factory cgroupclient.CgroupClientFactory,
@@ -1023,9 +1019,9 @@ func (p *CPUSetTopologyPlugin) adjustOnceWithResult(
 		PendingProtections:   protections,
 		ProtectedCPUSetByRel: protectedByRel,
 		PublishFinalSnapshot: func(snapshot *topology.CompleteSnapshot) error {
-			appliedView, err := appliedViewFromFinalSnapshotWithContext(
-				ctx, in.MetaServer, in.DesiredView, dag, snapshot,
-				expectedRes.LifecycleProofs, nil)
+			appliedView, err := appliedViewFromFinalSnapshotWithDeferredCleanup(
+				ctx, in.MetaServer, in.DesiredView, dag, snapshot, nil,
+				expectedRes.LifecycleProofs)
 			if err != nil {
 				return fmt.Errorf("derive applied view from final topology snapshot: %w", err)
 			}
@@ -1153,19 +1149,6 @@ func admissionStageDeadlineError(ctx context.Context, stage string) error {
 	return nil
 }
 
-func appliedViewFromFinalSnapshotWithContext(
-	ctx context.Context,
-	metaServer *metaserver.MetaServer,
-	desired *model.DesiredView,
-	dag *topology.TopoDAG,
-	snapshot *topology.CompleteSnapshot,
-	lifecycleProofs containerLifecycleProofSet,
-	deferredCleanupRels map[string]struct{},
-) (*model.AppliedView, error) {
-	return appliedViewFromFinalSnapshotWithDeferredCleanup(
-		ctx, metaServer, desired, dag, snapshot, deferredCleanupRels, lifecycleProofs)
-}
-
 func appliedViewFromFinalSnapshotWithDeferredCleanup(
 	ctx context.Context,
 	metaServer *metaserver.MetaServer,
@@ -1236,9 +1219,9 @@ func appliedViewFromFinalSnapshotWithDeferredCleanup(
 		if proof.State != containerLifecycleResolved || proof.RelativePath == "" {
 			continue
 		}
-		entry, ok := snapshot.Entries[proof.RelativePath]
-		if !ok {
-			return nil, fmt.Errorf("final snapshot misses resolved container rel %q", proof.RelativePath)
+		entry, err := resolvedContainerEntryFromFinalSnapshot(snapshot, proof)
+		if err != nil {
+			return nil, err
 		}
 		applied.RelProofByRel[proof.RelativePath] = model.CgroupRelProof{
 			Device: entry.Identity.Device,
@@ -1334,10 +1317,6 @@ func (p *CPUSetTopologyPlugin) ReconcileDisabled(
 		result.AppliedView = finalAttempt.AppliedView.DeepCopy()
 	}
 	return toOutcome(result, outcomeControl{requireReclaimOnly: true}), err
-}
-
-func disabledReconcileShouldRetry(err error, convergence topology.ConvergenceResult) bool {
-	return err != nil && convergence.ReplanDisposition.AllowsReplan()
 }
 
 func accumulateConvergenceResult(total *topology.ConvergenceResult, attempt topology.ConvergenceResult) {
