@@ -319,6 +319,73 @@ func TestContainerCPUSetByPodFromFinalSnapshotRejectsMissingResolvedLeafAsStale(
 	}
 }
 
+func TestResolvedFinalLeafControllerUnavailableRemainsHardError(t *testing.T) {
+	t.Parallel()
+	proof := containerLifecycleProof{
+		PodUID: "pod-a", ContainerName: "main", ContainerID: "container-a",
+		RelativePath: "primary/container-a", DesiredCPUSet: machine.NewCPUSet(1),
+		State: containerLifecycleResolved,
+	}
+	pod := lifecycleProofPod("pod-a", []string{"main"}, map[string]string{"main": "container-a"})
+	validated := validateLifecycleProofSetForTest(t, []containerLifecycleProof{proof}, []*v1.Pod{pod})
+	snapshot := &topology.CompleteSnapshot{
+		Entries: map[string]topology.EntryState{},
+		UnavailableChildren: map[string]topology.UnavailableChildEvidence{
+			proof.RelativePath: {
+				Identity: topology.CgroupIdentity{Device: 7, Inode: 11},
+				Reason:   topology.UnavailableChildReasonControllerUnavailable,
+			},
+		},
+	}
+
+	_, err := containerCPUSetByPodFromFinalSnapshot(snapshot, validated, nil)
+	var stale *containerLifecycleProofStaleError
+	if err == nil || errors.As(err, &stale) || errors.Is(err, topology.ErrCoordinatorPlanStale) {
+		t.Fatalf("materialization error = %v, want non-stale unavailable-leaf error", err)
+	}
+	if got := err.Error(); got != "resolved final leaf \"primary/container-a\" is unavailable: reason=controller-unavailable identity={7 11}" {
+		t.Fatalf("materialization error = %q, want unavailable identity evidence", got)
+	}
+}
+
+func TestAppliedViewFromFinalSnapshotRejectsMissingResolvedLeafAsStale(t *testing.T) {
+	t.Parallel()
+	proof := containerLifecycleProof{
+		PodUID: "pod-a", ContainerName: "main", ContainerID: "container-a",
+		RelativePath: "primary/container-a", DesiredCPUSet: machine.NewCPUSet(1),
+		State: containerLifecycleResolved,
+	}
+	pod := lifecycleProofPod("pod-a", []string{"main"}, map[string]string{"main": "container-a"})
+	frozen := lifecycleProofSetForValidation(t, []containerLifecycleProof{proof}, []*v1.Pod{pod})
+	metaServer := &metaserver.MetaServer{MetaAgent: &agent.MetaAgent{
+		PodFetcher: &strictSnapshotFetcher{pods: []*v1.Pod{pod}},
+	}}
+	dag, err := topology.BuildDAG([]topology.NodeSpec{{
+		Rel: "primary", Role: topology.TopoNodeRolePrimary, Domain: topology.DomainPrimary,
+		CPUs: machine.NewCPUSet(0, 1), ControlledRoot: true, TrustAnchor: true,
+	}})
+	if err != nil {
+		t.Fatalf("BuildDAG() error = %v", err)
+	}
+	snapshot := &topology.CompleteSnapshot{Entries: map[string]topology.EntryState{
+		"primary": {
+			Rel: "primary", Identity: topology.CgroupIdentity{Device: 7, Inode: 10},
+			CPUs: machine.NewCPUSet(0, 1), ConfiguredCPUs: machine.NewCPUSet(0, 1),
+		},
+	}}
+
+	_, err = appliedViewFromFinalSnapshotWithDeferredCleanup(
+		context.Background(), metaServer, model.NewDesiredView(), dag, snapshot, nil, frozen)
+	var stale *containerLifecycleProofStaleError
+	if !errors.As(err, &stale) || !errors.Is(err, topology.ErrCoordinatorPlanStale) {
+		t.Fatalf("publication error = %v, want typed lifecycle stale", err)
+	}
+	if stale.PodUID != proof.PodUID || stale.ContainerName != proof.ContainerName ||
+		stale.FrozenID != proof.ContainerID || stale.Reason != "resolved final leaf is missing" {
+		t.Fatalf("publication stale = %#v, want missing resolved leaf identity", stale)
+	}
+}
+
 func lifecycleProofSetForValidation(
 	t *testing.T,
 	proofs []containerLifecycleProof,

@@ -33,8 +33,8 @@ func emptyLifecycleMetaServer() *metaserver.MetaServer {
 	}
 }
 
-// appliedViewFromFinalSnapshot is a test-only thin wrapper over
-// appliedViewFromFinalSnapshotWithContext using a background context.
+// appliedViewFromFinalSnapshot is a test-only wrapper that supplies an empty
+// lifecycle proof set and no deferred cleanup.
 func appliedViewFromFinalSnapshot(
 	metaServer *metaserver.MetaServer,
 	desired *model.DesiredView,
@@ -49,6 +49,6 @@ func appliedViewFromFinalSnapshot(
 	if metaServer == nil {
 		metaServer = emptyLifecycleMetaServer()
 	}
-	return appliedViewFromFinalSnapshotWithContext(
-		context.Background(), metaServer, desired, dag, snapshot, proofs, nil)
+	return appliedViewFromFinalSnapshotWithDeferredCleanup(
+		context.Background(), metaServer, desired, dag, snapshot, nil, proofs)
 }
