@@ -56,12 +56,24 @@ type CPUProvisionConfiguration struct {
 	// FillDefaultSharePoolWithNonReclaimCPUs makes the default non-NUMA-binding
 	// share pool consume all residual non-reclaim CPUs.
 	FillDefaultSharePoolWithNonReclaimCPUs bool
+	// ControlKnobConstraints is the effective restrict constraint list consumed by
+	// the region bounded executor. It is seeded once by CPUProvisionOptions.ApplyTo
+	// from the startup flag. The KCC manager deep-copies defaultConfig (which
+	// carries this seeded slice) on every round before calling ApplyConfiguration,
+	// so a fresh object always re-enters Apply with the startup value A. On a given
+	// object, ApplyConfiguration is invoked at most once: a non-nil AQC Constraints
+	// pointer whole-overrides this slice (an empty slice clears all bounds, a
+	// non-empty slice replaces verbatim, never merged); a nil pointer leaves the
+	// current slice untouched. Repeat ApplyConfiguration on the same object is not
+	// promised to restore A.
+	ControlKnobConstraints []v1alpha1.ControlKnobConstraints
 }
 
 func NewCPUProvisionConfiguration() *CPUProvisionConfiguration {
 	return &CPUProvisionConfiguration{
 		AllowSharedCoresOverlapReclaimedCores:      false,
 		DisableDedicatedCoresOverlapReclaimedCores: false,
+		ControlKnobConstraints:                     []v1alpha1.ControlKnobConstraints{},
 		RegionIndicatorTargetConfiguration: map[v1alpha1.QoSRegionType][]v1alpha1.IndicatorTargetConfiguration{
 			v1alpha1.QoSRegionTypeShare: {
 				{
@@ -94,6 +106,12 @@ func NewCPUProvisionConfiguration() *CPUProvisionConfiguration {
 	}
 }
 
+// ApplyConfiguration applies the dynamic AQC overrides onto the per-round
+// current object. KCC guarantees current is a fresh deep copy of the startup
+// defaultConfig (which carries the flag-seeded ControlKnobConstraints = A) on
+// every round before this method is called, so the startup value A is always
+// present on entry. ApplyConfiguration is invoked at most once on a given
+// object; it does not itself restore A.
 func (c *CPUProvisionConfiguration) ApplyConfiguration(conf *crd.DynamicConfigCRD) {
 	allowSharedCoresOverlapReclaimedCores := c.RequestedAllowSharedCoresOverlapReclaimedCores
 	disableDedicatedCoresOverlapReclaimedCores := c.RequestedDisableDedicatedCoresOverlapReclaimedCores
@@ -110,6 +128,15 @@ func (c *CPUProvisionConfiguration) ApplyConfiguration(conf *crd.DynamicConfigCR
 			if cfg := aqc.Spec.Config.AdvisorConfig.CPUAdvisorConfig.CPUProvisionConfig; cfg.FillDefaultSharePoolWithNonReclaimCPUs != nil {
 				c.FillDefaultSharePoolWithNonReclaimCPUs = *cfg.FillDefaultSharePoolWithNonReclaimCPUs
 			}
+			// Tri-state override: a non-nil Constraints pointer whole-replaces the
+			// per-round slice. An empty target slice ("constraints: []") clears all
+			// bounds; a non-empty slice replaces verbatim, never merged. A nil pointer
+			// (field omitted, or the whole CPUProvisionConfig absent/deleted) leaves
+			// the entry value A inherited from the deep-copied defaultConfig intact.
+			if cfg := aqc.Spec.Config.AdvisorConfig.CPUAdvisorConfig.CPUProvisionConfig; cfg.Constraints != nil {
+				c.ControlKnobConstraints = cloneControlKnobConstraints(*cfg.Constraints)
+			}
+			warnNameOnlyConstraints(c.ControlKnobConstraints)
 		}
 		if aqc.Spec.Config.AdvisorConfig.CPUAdvisorConfig.AllowSharedCoresOverlapReclaimedCores != nil {
 			allowSharedCoresOverlapReclaimedCores = *aqc.Spec.Config.AdvisorConfig.CPUAdvisorConfig.AllowSharedCoresOverlapReclaimedCores
@@ -126,6 +153,36 @@ func (c *CPUProvisionConfiguration) SetRequestedOverlapPolicy(allowSharedCoresOv
 	c.RequestedAllowSharedCoresOverlapReclaimedCores = allowSharedCoresOverlapReclaimedCores
 	c.RequestedDisableDedicatedCoresOverlapReclaimedCores = disableDedicatedCoresOverlapReclaimedCores
 	c.NormalizeOverlapPolicy()
+}
+
+// cloneControlKnobConstraints deep-copies the AQC constraint slice, including the
+// embedded pointer fields (Enforce, MaxUpperGap, MaxUpperGapRatio, ...), so the
+// dynamic config never aliases informer-owned objects.
+func cloneControlKnobConstraints(in []v1alpha1.ControlKnobConstraints) []v1alpha1.ControlKnobConstraints {
+	if len(in) == 0 {
+		return []v1alpha1.ControlKnobConstraints{}
+	}
+	out := make([]v1alpha1.ControlKnobConstraints, len(in))
+	for i := range in {
+		out[i] = *in[i].DeepCopy()
+	}
+	return out
+}
+
+// warnNameOnlyConstraints emits at most one warning per ApplyConfiguration when
+// any constraint entry has neither targetPolicy nor referencePolicy set. Such an
+// entry carries no bounded behavior; it only participates in the static exact
+// path for known knobs. The runtime executor stays silent on every tick, so the
+// single config-load warning is the only signal operators get for an ambiguous
+// name-only entry.
+func warnNameOnlyConstraints(constraints []v1alpha1.ControlKnobConstraints) {
+	for i := range constraints {
+		if constraints[i].TargetPolicy == "" && constraints[i].ReferencePolicy == "" {
+			general.Warningf("control knob constraint %q is name-only: no bounded upper/lower band is applied; it only feeds the static exact restrict path",
+				constraints[i].Name)
+			return
+		}
+	}
 }
 
 // NormalizeOverlapPolicy keeps CPU pool overlap flags in a supported policy combination.

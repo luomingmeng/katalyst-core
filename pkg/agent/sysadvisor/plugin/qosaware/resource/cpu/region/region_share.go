@@ -97,7 +97,12 @@ func (r *QoSRegionShare) TryUpdateProvision() {
 	rawControlKnobs := r.getProvisionControlKnob()
 
 	// restrict control knobs by reference policy
-	restrictedControlKnobs := r.restrictProvisionControlKnob(rawControlKnobs)
+	restrictedControlKnobs := r.restrictControlKnobByExactPolicy(rawControlKnobs)
+
+	// generic dynamic AQC bounded constraints (per-rule upper and/or lower bands
+	// anchored on a same-period reference policy; no-op unless AQC carries
+	// matching explicit target/ref pairs).
+	restrictedControlKnobs = r.applyBoundedControlKnobConstraints(restrictedControlKnobs)
 
 	// regulate control knobs
 	r.regulateProvisionControlKnob(restrictedControlKnobs, r.getEffectiveControlKnobs())

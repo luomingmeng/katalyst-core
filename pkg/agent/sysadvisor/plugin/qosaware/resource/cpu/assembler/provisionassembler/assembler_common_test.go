@@ -1306,7 +1306,7 @@ func generateTestConf(t *testing.T, enableReclaim bool, disableReclaimSelector s
 	conf.BaseConfiguration.ReclaimRelativeRootCgroupPath = ""
 	t.Cleanup(func() { reclaim.UnregisterConsumer(consumerName) })
 
-	conf.RestrictRefPolicy = nil
+	conf.ExactRestrictRefPolicy = nil
 	conf.CPUAdvisorConfiguration.ProvisionPolicies = map[configapi.QoSRegionType][]types.CPUProvisionPolicyName{
 		configapi.QoSRegionTypeShare: {types.CPUProvisionPolicyCanonical},
 	}

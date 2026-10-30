@@ -25,14 +25,14 @@ import (
 )
 
 type CPURegionOptions struct {
-	CPUShare          *CPUShareOptions
-	RestrictRefPolicy map[string]string
+	CPUShare               *CPUShareOptions
+	ExactRestrictRefPolicy map[string]string
 }
 
 func NewCPURegionOptions() *CPURegionOptions {
 	return &CPURegionOptions{
-		CPUShare:          NewCPUShareOptions(),
-		RestrictRefPolicy: map[string]string{string(types.CPUProvisionPolicyRama): string(types.CPUProvisionPolicyDynamicQuota)},
+		CPUShare:               NewCPUShareOptions(),
+		ExactRestrictRefPolicy: map[string]string{string(types.CPUProvisionPolicyRama): string(types.CPUProvisionPolicyDynamicQuota)},
 	}
 }
 
@@ -41,11 +41,12 @@ func (o *CPURegionOptions) ApplyTo(c *region.CPURegionConfiguration) error {
 	var errList []error
 	errList = append(errList, o.CPUShare.ApplyTo(c.CPUShareConfiguration))
 
-	restrictRefPolicy := make(map[types.CPUProvisionPolicyName]types.CPUProvisionPolicyName)
-	for k, v := range o.RestrictRefPolicy {
-		restrictRefPolicy[types.CPUProvisionPolicyName(k)] = types.CPUProvisionPolicyName(v)
+	exactRestrictRefPolicy := make(map[types.CPUProvisionPolicyName]types.CPUProvisionPolicyName)
+	for k, v := range o.ExactRestrictRefPolicy {
+		exactRestrictRefPolicy[types.CPUProvisionPolicyName(k)] = types.CPUProvisionPolicyName(v)
 	}
-	c.RestrictRefPolicy = restrictRefPolicy
+	c.ExactRestrictRefPolicy = exactRestrictRefPolicy
+
 	return errors.NewAggregate(errList)
 }
 
@@ -53,7 +54,6 @@ func (o *CPURegionOptions) ApplyTo(c *region.CPURegionConfiguration) error {
 func (o *CPURegionOptions) AddFlags(fs *pflag.FlagSet) {
 	o.CPUShare.AddFlags(fs)
 
-	// AddFlags adds flags to the specified FlagSet.
-	fs.StringToStringVar(&o.RestrictRefPolicy, "region-restrict-ref-policy", o.RestrictRefPolicy,
-		"the provision policy map is used to restrict the control knob of base policy by the one of reference for CPU region")
+	fs.StringToStringVar(&o.ExactRestrictRefPolicy, "region-exact-restrict-ref-policy", o.ExactRestrictRefPolicy,
+		"the provision policy map used to exact-restrict the control knob of a base policy by its single reference for CPU region. Format: target=ref, e.g. rama=dynamic-quota")
 }

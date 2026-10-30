@@ -17,7 +17,9 @@ limitations under the License.
 package advisor
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 
@@ -39,6 +41,14 @@ type CPUProvisionOptions struct {
 	IndicatorTargetMetricThresholdExpandFactors map[string]string
 	ReclaimedCPUMaxRatio                        float64
 	FillDefaultSharePoolWithNonReclaimCPUs      bool
+
+	// BoundedControlKnobConstraintsJSON is the raw payload of
+	// --region-bounded-control-knob-constraints-json, held as a string and decoded
+	// strictly in ApplyTo so malformed input fails agent startup rather than being
+	// silently dropped. The decoded set is seeded straight into the dynamic
+	// CPUProvisionConfiguration.ControlKnobConstraints as the startup default;
+	// KCC deep-copies it each round and lets AQC override it.
+	BoundedControlKnobConstraintsJSON string
 }
 
 func NewCPUProvisionOptions() *CPUProvisionOptions {
@@ -99,6 +109,18 @@ func (o *CPUProvisionOptions) ApplyTo(c *advisor.CPUProvisionConfiguration) erro
 		}
 	}
 
+	// Decode the startup bounded-control-knob defaults strictly and seed the
+	// dynamic CPUProvisionConfiguration.ControlKnobConstraints directly. The
+	// decoded slice is a fresh object graph produced by json.Decoder, so assigning
+	// it to the single field introduces no alias with flag-owned memory; the KCC
+	// manager deep-copies this seeded defaultConfig on every round before Apply.
+	constraints, err := parseBoundedControlKnobConstraintsJSON(o.BoundedControlKnobConstraintsJSON)
+	if err != nil {
+		errList = append(errList, err)
+	} else {
+		c.ControlKnobConstraints = constraints
+	}
+
 	return errors.NewAggregate(errList)
 }
 
@@ -121,4 +143,64 @@ func (o *CPUProvisionOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 		"the maximum ratio of whole-machine/NUMA CPUs that can be assigned to reclaimed_cores, 0 means no limit")
 	fs.BoolVar(&o.FillDefaultSharePoolWithNonReclaimCPUs, "fill-default-share-pool-with-non-reclaim-cpus", o.FillDefaultSharePoolWithNonReclaimCPUs,
 		"make the default share pool consume all residual non-reclaim cpus")
+	fs.StringVar(&o.BoundedControlKnobConstraintsJSON, "region-bounded-control-knob-constraints-json", o.BoundedControlKnobConstraintsJSON,
+		"strict JSON array of bounded control-knob restrict defaults. Each item: {\"name\":<knob>,\"targetPolicy\":<policy>,\"referencePolicy\":<policy>,\"maxUpperGap\":<n>,\"maxLowerGap\":<n>,\"maxUpperGapRatio\":<n>,\"maxLowerGapRatio\":<n>,\"enforce\":<bool>}. targetPolicy/referencePolicy must both be set; at least one tolerance must be positive; negative tolerances are rejected.")
+}
+
+// parseBoundedControlKnobConstraintsJSON strictly decodes the flag payload into
+// ControlKnobConstraints entries. It uses a streaming json.Decoder with
+// DisallowUnknownFields and a second Decode that must return io.EOF, so a typo'd
+// key, a malformed number, or trailing garbage after the first document fails
+// startup.
+func parseBoundedControlKnobConstraintsJSON(raw string) ([]v1alpha1.ControlKnobConstraints, error) {
+	if strings.TrimSpace(raw) == "" {
+		return []v1alpha1.ControlKnobConstraints{}, nil
+	}
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+	var out []v1alpha1.ControlKnobConstraints
+	if err := dec.Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode bounded control-knob constraints: %w", err)
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		return nil, fmt.Errorf("bounded control-knob constraints: trailing data after JSON document")
+	}
+	if err := validateBoundedControlKnobConstraints(out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// validateBoundedControlKnobConstraints enforces the startup invariants: name
+// non-empty; targetPolicy and referencePolicy must BOTH be set (a name-only or
+// one-sided entry is rejected at startup because it carries no bounded band);
+// at least one tolerance must be positive; any negative tolerance is rejected.
+func validateBoundedControlKnobConstraints(in []v1alpha1.ControlKnobConstraints) error {
+	for i := range in {
+		c := &in[i]
+		if strings.TrimSpace(string(c.Name)) == "" {
+			return fmt.Errorf("bounded control-knob constraint #%d: name must be non-empty", i)
+		}
+		if c.TargetPolicy == "" || c.ReferencePolicy == "" {
+			return fmt.Errorf("bounded control-knob constraint %q: targetPolicy and referencePolicy must both be set at startup", c.Name)
+		}
+		tolerances := []*float64{c.MaxUpperGap, c.MaxUpperGapRatio, c.MaxLowerGap, c.MaxLowerGapRatio}
+		positive := false
+		for _, g := range tolerances {
+			if g == nil {
+				continue
+			}
+			if *g < 0 {
+				return fmt.Errorf("bounded control-knob constraint %q: negative tolerance %v is rejected", c.Name, *g)
+			}
+			if *g > 0 {
+				positive = true
+			}
+		}
+		if !positive {
+			return fmt.Errorf("bounded control-knob constraint %q: at least one tolerance must be positive", c.Name)
+		}
+	}
+	return nil
 }

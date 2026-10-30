@@ -16,18 +16,24 @@ limitations under the License.
 
 package region
 
-import "github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
+import (
+	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
+)
 
 type CPURegionConfiguration struct {
 	*CPUShareConfiguration
 
-	RestrictRefPolicy map[types.CPUProvisionPolicyName]types.CPUProvisionPolicyName
+	// ExactRestrictRefPolicy maps a target provision policy to its single reference
+	// policy for the restrictControlKnobByExactPolicy path (policy-level, no knob
+	// dimension). It is consulted only for name-only AQC constraints; the bounded
+	// control-knob constraint executor never reads it.
+	ExactRestrictRefPolicy map[types.CPUProvisionPolicyName]types.CPUProvisionPolicyName
 }
 
 func NewCPURegionConfiguration() *CPURegionConfiguration {
 	return &CPURegionConfiguration{
 		CPUShareConfiguration: NewCPUShareConfiguration(),
 
-		RestrictRefPolicy: make(map[types.CPUProvisionPolicyName]types.CPUProvisionPolicyName),
+		ExactRestrictRefPolicy: make(map[types.CPUProvisionPolicyName]types.CPUProvisionPolicyName),
 	}
 }

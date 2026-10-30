@@ -29,7 +29,6 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/kubewharf/katalyst-api/pkg/apis/config/v1alpha1"
-	configapi "github.com/kubewharf/katalyst-api/pkg/apis/config/v1alpha1"
 	workloadv1alpha1 "github.com/kubewharf/katalyst-api/pkg/apis/workload/v1alpha1"
 	"github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/commonstate"
@@ -69,6 +68,12 @@ const (
 	metricTagKeyRegionNUMAs       = "region_numas"
 	metricTagKeyControlKnobName   = "control_knob_name"
 	metricTagKeyControlKnobAction = "control_knob_action"
+
+	// Generic control-knob restrict observation. Low-cardinality labels only; the
+	// high-cardinality region name is intentionally excluded. Label keys are the
+	// dedicated restrictTag* constants in bounded_constraint.go.
+	metricControlKnobRestrictUpperBound = "cpu_provision_control_knob_restrict_upper_bound"
+	metricControlKnobRestrictLowerBound = "cpu_provision_control_knob_restrict_lower_bound"
 )
 
 var IndicatorToMetricThreshold = map[string]string{
@@ -199,9 +204,6 @@ type QoSRegionBase struct {
 	provisionPolicyNameInUse types.CPUProvisionPolicyName
 	provisionPolicyResults   map[types.CPUProvisionPolicyName]*provisionPolicyResult
 
-	// ctrl knob need policy restrict
-	ctrlKnobsNeedPolicyRestrict map[v1alpha1.ControlKnobName]bool
-
 	// cpuRegulatorOptions is the regulator options for cpu regulator
 	cpuRegulatorOptions regulator.RegulatorOptions
 
@@ -210,6 +212,14 @@ type QoSRegionBase struct {
 	// policy in-use currently
 	headroomPolicies        []*internalHeadroomPolicy
 	headroomPolicyNameInUse types.CPUHeadroomPolicyName
+
+	// ctrlKnobsNeedPolicyExactRestrict is the closed set of knobs the
+	// restrictControlKnobByExactPolicy path exact-restricts against
+	// ExactRestrictRefPolicy. It is intentionally static. A name-only AQC
+	// constraint outside this set has no effect. The bounded path reads it only
+	// to reject a fully-explicit constraint on an exact-owned knob as
+	// invalid-config; it never uses the set to decide what to clamp.
+	ctrlKnobsNeedPolicyExactRestrict map[v1alpha1.ControlKnobName]bool
 
 	metaReader metacache.MetaReader
 	metaServer *metaserver.MetaServer
@@ -260,6 +270,10 @@ func NewQoSRegionBase(name string, ownerPoolName string, resourcePackageName str
 		headroomPolicyNameInUse:  types.CPUHeadroomPolicyNone,
 
 		provisionPolicyResults: make(map[types.CPUProvisionPolicyName]*provisionPolicyResult),
+
+		ctrlKnobsNeedPolicyExactRestrict: map[v1alpha1.ControlKnobName]bool{
+			v1alpha1.ControlKnobReclaimedCoresCPUQuota: true,
+		},
 		cpuRegulatorOptions: regulator.RegulatorOptions{
 			MaxRampUpStep:     conf.MaxRampUpStep,
 			MaxRampDownStep:   conf.MaxRampDownStep,
@@ -268,8 +282,6 @@ func NewQoSRegionBase(name string, ownerPoolName string, resourcePackageName str
 				return metaServer.CPUTopology.CPUsPerCore()
 			},
 		},
-
-		ctrlKnobsNeedPolicyRestrict: map[v1alpha1.ControlKnobName]bool{configapi.ControlKnobReclaimedCoresCPUQuota: true},
 
 		metaReader: metaReader,
 		metaServer: metaServer,
@@ -1072,40 +1084,44 @@ func (r *QoSRegionBase) getEffectiveReclaimResource() (quota float64, cpusetSize
 	return
 }
 
-// restrictProvisionControlKnob is used to restrict provision control knob by reference policy
-func (r *QoSRegionBase) restrictProvisionControlKnob(originControlKnob map[types.CPUProvisionPolicyName]types.ControlKnob) map[types.CPUProvisionPolicyName]types.ControlKnob {
+// restrictControlKnobByExactPolicy is the exact policy-reference restrict path.
+// It is completely independent of the dynamic AQC Constraints slice: its only
+// inputs are originControlKnob, r.conf.ExactRestrictRefPolicy, and the static
+// ctrlKnobsNeedPolicyExactRestrict set. For each target policy it looks up the
+// single ExactRestrictRefPolicy[target] reference; if the reference produces
+// the knob, it applies the exact raw>ref -> ref cap. It never reads bounded-path
+// metric state.
+func (r *QoSRegionBase) restrictControlKnobByExactPolicy(originControlKnob map[types.CPUProvisionPolicyName]types.ControlKnob) map[types.CPUProvisionPolicyName]types.ControlKnob {
 	restrictedControlKnob := make(map[types.CPUProvisionPolicyName]types.ControlKnob)
-	for policyName, controlKnob := range originControlKnob {
-		restrictedControlKnob[policyName] = controlKnob.Clone()
-		refPolicyName, ok := r.conf.RestrictRefPolicy[policyName]
+	for k, v := range originControlKnob {
+		restrictedControlKnob[k] = v.Clone()
+	}
+
+	for policyName, controlKnob := range restrictedControlKnob {
+		refPolicyName, ok := r.conf.ExactRestrictRefPolicy[policyName]
 		if !ok {
 			continue
 		}
 		refControlKnob, ok := originControlKnob[refPolicyName]
 		if !ok {
-			klog.Errorf("get control knob from reference policy %v for policy %v failed", refPolicyName, policyName)
 			continue
 		}
-
-		for controlKnobName, rawKnobValue := range controlKnob {
-			needed, ok := r.ctrlKnobsNeedPolicyRestrict[controlKnobName]
-			if !ok || !needed {
+		for knobName := range r.ctrlKnobsNeedPolicyExactRestrict {
+			rawKnobValue, ok := controlKnob[knobName]
+			if !ok {
 				continue
 			}
-
-			refKnobValue, ok := refControlKnob[controlKnobName]
+			refKnobValue, ok := refControlKnob[knobName]
 			if !ok {
 				continue
 			}
 			restrictedKnobValue := rawKnobValue
 			if rawKnobValue.Value > refKnobValue.Value {
 				restrictedKnobValue = refKnobValue
-
-				klog.Infof("[qosaware-cpu] restrict control knob %v for policy %v by policy %v from %.2f to %.2f, refKnobValue: %v",
-					controlKnobName, policyName, refPolicyName, rawKnobValue.Value, restrictedKnobValue.Value, refKnobValue.Value)
+				klog.Infof("[qosaware-cpu] restrict control knob %v for policy %v by policy %v from %.2f to %.2f",
+					knobName, policyName, refPolicyName, rawKnobValue.Value, restrictedKnobValue.Value)
 			}
-
-			restrictedControlKnob[policyName][controlKnobName] = restrictedKnobValue
+			restrictedControlKnob[policyName][knobName] = restrictedKnobValue
 		}
 	}
 	return restrictedControlKnob

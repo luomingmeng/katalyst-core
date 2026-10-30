@@ -21,7 +21,7 @@ require (
 	github.com/google/uuid v1.3.0
 	github.com/h2non/gock v1.2.0
 	github.com/klauspost/cpuid/v2 v2.2.6
-	github.com/kubewharf/katalyst-api v0.5.17-0.20261021093118-68a56ec85054
+	github.com/kubewharf/katalyst-api v0.5.17-0.20261029102823-b515ed5324b2
 	github.com/moby/sys/mountinfo v0.6.2
 	github.com/montanaflynn/stats v0.7.1
 	github.com/opencontainers/runc v1.1.6
@@ -209,3 +209,5 @@ replace (
 	k8s.io/sample-controller => k8s.io/sample-controller v0.24.6
 	sigs.k8s.io/json => sigs.k8s.io/json v0.0.0-20211020170558-c049b76a60c6
 )
+
+replace github.com/kubewharf/katalyst-api => github.com/luomingmeng/katalyst-api v0.0.0-20261030041238-b89e78e042a6

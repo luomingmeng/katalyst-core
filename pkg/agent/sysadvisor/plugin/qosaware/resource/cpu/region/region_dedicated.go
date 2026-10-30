@@ -125,7 +125,10 @@ func (r *QoSRegionDedicated) TryUpdateProvision() {
 	rawControlKnobs := r.getProvisionControlKnob()
 
 	// restrict control knobs by reference policy
-	restrictedControlKnobs := r.restrictProvisionControlKnob(rawControlKnobs)
+	restrictedControlKnobs := r.restrictControlKnobByExactPolicy(rawControlKnobs)
+
+	// bounded control-knob constraints (exact path output feeds bounded)
+	restrictedControlKnobs = r.applyBoundedControlKnobConstraints(restrictedControlKnobs)
 
 	// regulate control knobs
 	r.regulateProvisionControlKnob(restrictedControlKnobs, r.getEffectiveControlKnobs())
