@@ -20,6 +20,7 @@ package cpusettopology
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 
 	v1 "k8s.io/api/core/v1"
@@ -339,6 +340,9 @@ func TestOwnerProvenReclaimHandoffAdmissionDrainsSourceBeforeRetryGrowsLeaf(t *t
 	ctx := context.Background()
 	all := machine.MustParse("0-127")
 	handoff := machine.MustParse("4,68")
+	// Keep one whole core in NUMA0 reclaim so this test exercises the successful
+	// handoff path. Draining the last v1 source CPU stays zero-write fail-closed;
+	// that planner boundary is locked by TestV1PlannerRejectsExplicitOrControlledEmptyTargets.
 	retainedReclaim := machine.MustParse("5,69")
 	oldReclaim := fx.reclaim8.Union(retainedReclaim)
 	newReclaim := fx.reclaim6.Union(retainedReclaim)
@@ -432,7 +436,10 @@ func TestOwnerProvenReclaimHandoffAdmissionDrainsSourceBeforeRetryGrowsLeaf(t *t
 
 	budget := topology.NewAdjustmentBudget(ctx, topologyBudgetFromConfig(fx.plugin.cfg.TopologyConvergenceBudget))
 	var admission topology.ConvergenceResult
-	err := fx.plugin.adjustOnceWithResult(ctx, in, budget, &admission, nil)
+	var publishedAdmission bulkheadapi.TopologyResult
+	err := fx.plugin.adjustOnceWithResult(ctx, in, budget, &admission, func(result bulkheadapi.TopologyResult) {
+		publishedAdmission = result
+	})
 	if err != nil {
 		t.Fatalf("Admission handoff error = %v; result=%+v", err, admission)
 	}
@@ -457,6 +464,13 @@ func TestOwnerProvenReclaimHandoffAdmissionDrainsSourceBeforeRetryGrowsLeaf(t *t
 	if got := fx.cg.cpus["kubepods/besteffort"]; !got.Equals(oldNonReclaim) {
 		t.Fatalf("Admission widened dynamic ancestor early: got=%s want=%s", got.String(), oldNonReclaim.String())
 	}
+	bucketWrite := slices.Index(fx.cg.writeOrder, "reclaimed/reclaimed-0")
+	reclaimWrite := slices.Index(fx.cg.writeOrder, "reclaimed")
+	primaryWrite := slices.Index(fx.cg.writeOrder, "kubepods")
+	if bucketWrite < 0 || reclaimWrite < 0 || primaryWrite < 0 ||
+		bucketWrite >= primaryWrite || reclaimWrite >= primaryWrite {
+		t.Fatalf("Admission write order=%v, want reclaim source/root before controlled primary", fx.cg.writeOrder)
+	}
 	if !model.EqualDesiredView(fx.desired.DeepCopy(), desiredBefore) {
 		t.Fatal("Admission mutated canonical DesiredView content")
 	}
@@ -464,16 +478,23 @@ func TestOwnerProvenReclaimHandoffAdmissionDrainsSourceBeforeRetryGrowsLeaf(t *t
 		t.Fatal("Admission mutated canonical AppliedView content")
 	}
 
-	carvedApplied := fx.applied.DeepCopy()
-	carvedApplied.NonReclaimPool = newNonReclaim.Clone()
-	carvedApplied.ReclaimEffective = newReclaim.Clone()
-	carvedApplied.ReclaimEffectivePerNUMA[0] = retainedReclaim.Clone()
-	carvedApplied.PoolProjection.CPUSetByIdentity[reclaimOwnerID] = newReclaim.Clone()
-	carvedApplied.PoolProjection.UncoveredCPUs = machine.NewCPUSet()
-	in.AppliedView = carvedApplied
+	if publishedAdmission.AppliedView == nil {
+		t.Fatal("Admission did not publish its ParentSafe AppliedView")
+	}
+	if publishedAdmission.AppliedView.Level != model.AppliedViewLevelParentSafe {
+		t.Fatalf("Admission published level=%s, want ParentSafe", publishedAdmission.AppliedView.Level)
+	}
+	if got := publishedAdmission.AppliedView.ReclaimEffective; !got.Equals(newReclaim) {
+		t.Fatalf("Admission published reclaim=%s, want carved=%s", got.String(), newReclaim.String())
+	}
+	if got := publishedAdmission.AppliedView.ReclaimEffectivePerNUMA[0]; !got.Equals(retainedReclaim) {
+		t.Fatalf("Admission published NUMA0 reclaim=%s, want retained=%s", got.String(), retainedReclaim.String())
+	}
+	in.AppliedView = publishedAdmission.AppliedView.DeepCopy()
 	in.Mode = cpusetutil.CPUSetAdjustmentModeRetry
 
 	beforeRetryLeafWrites := fx.cg.applyCounts[leafRel]
+	beforeRetryWrites := len(fx.cg.writeOrder)
 	budget = topology.NewAdjustmentBudget(ctx, topologyBudgetFromConfig(fx.plugin.cfg.TopologyConvergenceBudget))
 	var retry topology.ConvergenceResult
 	if err := fx.plugin.adjustOnceWithResult(ctx, in, budget, &retry, nil); err != nil {
@@ -493,6 +514,14 @@ func TestOwnerProvenReclaimHandoffAdmissionDrainsSourceBeforeRetryGrowsLeaf(t *t
 	}
 	if got := fx.cg.cpus[runningPodRel]; !got.Equals(newNonReclaim) {
 		t.Fatalf("Retry pod ancestor=%s, want closure=%s", got.String(), newNonReclaim.String())
+	}
+	retryWrites := fx.cg.writeOrder[beforeRetryWrites:]
+	qosWrite := slices.Index(retryWrites, "kubepods/besteffort")
+	podWrite := slices.Index(retryWrites, runningPodRel)
+	leafWrite := slices.Index(retryWrites, leafRel)
+	if qosWrite < 0 || podWrite < 0 || leafWrite < 0 ||
+		qosWrite >= leafWrite || podWrite >= leafWrite {
+		t.Fatalf("Retry write order=%v, want dynamic ancestors before leaf", retryWrites)
 	}
 }
 
