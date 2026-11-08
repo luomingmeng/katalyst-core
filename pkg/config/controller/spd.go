@@ -17,10 +17,86 @@ limitations under the License.
 package controller
 
 import (
+	"fmt"
+	"strings"
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/sets"
+
+	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/util/datasource/prometheus"
 )
+
+// SPDBaselineSelector names a QoS refinement without introducing a new QoS level.
+type SPDBaselineSelector struct {
+	QoSLevel           string
+	Name               string
+	MemoryEnhancements map[string]string
+}
+
+var spdBaselineSelectors = []SPDBaselineSelector{
+	{
+		QoSLevel: apiconsts.PodAnnotationQoSLevelDedicatedCores,
+		Name:     "numa_binding_non_exclusive",
+		MemoryEnhancements: map[string]string{
+			apiconsts.PodAnnotationMemoryEnhancementNumaBinding: apiconsts.PodAnnotationMemoryEnhancementNumaBindingEnable,
+			// Absence must not imply non-exclusive: agents may default numa_exclusive to true.
+			apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: "false",
+		},
+	},
+}
+
+func (s SPDBaselineSelector) key() string {
+	return s.QoSLevel + ":" + s.Name
+}
+
+func BaselineSelectorKeys(qosLevel string, memoryEnhancements map[string]string) []string {
+	var keys []string
+	for _, selector := range spdBaselineSelectors {
+		if selector.QoSLevel != qosLevel {
+			continue
+		}
+		matched := true
+		for key, value := range selector.MemoryEnhancements {
+			if memoryEnhancements[key] != value {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			keys = append(keys, selector.key())
+		}
+	}
+	return keys
+}
+
+func SPDBaselinePercentKeys() []string {
+	keys := sets.NewString(
+		apiconsts.PodAnnotationQoSLevelSharedCores,
+		apiconsts.PodAnnotationQoSLevelDedicatedCores,
+		apiconsts.PodAnnotationQoSLevelReclaimedCores,
+		apiconsts.PodAnnotationQoSLevelSystemCores,
+	)
+	for _, selector := range spdBaselineSelectors {
+		keys.Insert(selector.key())
+	}
+	return keys.List()
+}
+
+func ValidateSPDBaselinePercent(baselinePercent map[string]int64) error {
+	keys := SPDBaselinePercentKeys()
+	validKeys := sets.NewString(keys...)
+	for key, value := range baselinePercent {
+		if !validKeys.Has(key) {
+			return fmt.Errorf("invalid --spd-qos-baseline-percent key %q; supported keys: %s", key, strings.Join(keys, ", "))
+		}
+		if value < apiconsts.SPDBaselinePercentMin || value > apiconsts.SPDBaselinePercentMax {
+			return fmt.Errorf("invalid --spd-qos-baseline-percent value for %q: %d; must be in [%d,%d]",
+				key, value, apiconsts.SPDBaselinePercentMin, apiconsts.SPDBaselinePercentMax)
+		}
+	}
+	return nil
+}
 
 type SPDConfig struct {
 	// ReSyncPeriod controls the resync period to generate spd

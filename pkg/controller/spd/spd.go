@@ -53,6 +53,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	"github.com/kubewharf/katalyst-core/pkg/util/native"
+	qosutil "github.com/kubewharf/katalyst-core/pkg/util/qos"
 )
 
 const spdControllerName = "spd"
@@ -676,9 +677,8 @@ func (sc *SPDController) getWorkload(gvr schema.GroupVersionResource, namespace,
 	return workload, nil
 }
 
-// defaultBaselinePercent returns default baseline ratio based on the qos level of workload,
-// and if the configured data cannot be found, we will return 100,
-// which signifies that the resources of this workload cannot be reclaimed to reclaimed_cores.
+// defaultBaselinePercent resolves a workload's baseline from its selector, then its QoS level.
+// If neither is configured, return 100 so the workload's resources cannot be reclaimed.
 func (sc *SPDController) defaultBaselinePercent(workload *unstructured.Unstructured) *int32 {
 	podTemplateSpec, err := native.GetUnstructuredPodTemplateSpec(workload)
 	if err != nil {
@@ -696,11 +696,22 @@ func (sc *SPDController) defaultBaselinePercent(workload *unstructured.Unstructu
 		general.ErrorS(err, "failed to GetQoSLevel")
 		return pointer.Int32(100)
 	}
+	memoryEnhancements := qosutil.ParseMemoryEnhancement(sc.qosConfig, pod)
+	for _, key := range controller.BaselineSelectorKeys(qosLevel, memoryEnhancements) {
+		if baselinePercent, ok := sc.conf.BaselinePercent[key]; ok {
+			general.InfoS("selected default baseline percent", "workload", klog.KObj(workload),
+				"qosLevel", qosLevel, "selector", key, "baselinePercent", baselinePercent, "source", "selector")
+			return pointer.Int32(int32(baselinePercent))
+		}
+	}
 	baselinePercent, ok := sc.conf.BaselinePercent[qosLevel]
 	if !ok {
-		general.InfoS("failed to get default baseline percent", "qosLevel", qosLevel)
-		return pointer.Int32(100)
+		general.InfoS("selected default baseline percent", "workload", klog.KObj(workload),
+			"qosLevel", qosLevel, "baselinePercent", apiconsts.SPDBaselinePercentMax, "source", "default")
+		return pointer.Int32(apiconsts.SPDBaselinePercentMax)
 	}
+	general.InfoS("selected default baseline percent", "workload", klog.KObj(workload),
+		"qosLevel", qosLevel, "baselinePercent", baselinePercent, "source", "qosLevel")
 	return pointer.Int32(int32(baselinePercent))
 }
 

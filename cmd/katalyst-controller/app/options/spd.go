@@ -18,6 +18,7 @@ package options
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	cliflag "k8s.io/component-base/cli/flag"
@@ -64,14 +65,20 @@ func (o *SPDOptions) AddFlags(fss *cliflag.NamedFlagSets) {
 		"Whether enable cnc cache to reduce agent api-server remote request")
 	fs.StringSliceVar(&o.IndicatorPlugins, "spd-indicator-plugins", o.IndicatorPlugins,
 		"A list of indicator plugins to be used")
-	fs.StringToInt64Var(&o.BaselinePercent, "spd-qos-baseline-percent", o.BaselinePercent, ""+
-		"A map of qosLeve to default baseline percent[0,100]")
+	fs.StringToInt64Var(&o.BaselinePercent, "spd-qos-baseline-percent", o.BaselinePercent,
+		"A map of QoS levels or QoS selectors to default baseline percent in [0,100]. "+
+			"A selector overrides its QoS level; an unconfigured selector falls back to the QoS level, then 100. "+
+			"Supported keys: "+strings.Join(controller.SPDBaselinePercentKeys(), ", "))
 
 	o.ResourcePortraitIndicatorPluginOptions.AddFlags(fss)
 }
 
 // ApplyTo fills up config with options
 func (o *SPDOptions) ApplyTo(c *controller.SPDConfig) error {
+	if err := controller.ValidateSPDBaselinePercent(o.BaselinePercent); err != nil {
+		return err
+	}
+
 	c.ReSyncPeriod = o.ResyncPeriod
 	c.SPDWorkloadGVResources = o.SPDWorkloadGVResources
 	c.SPDPodLabelIndexerKeys = o.SPDPodLabelIndexerKeys

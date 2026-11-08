@@ -342,6 +342,8 @@ func (c *QoSConfiguration) GetQoSEnhancementKVs(pod *v1.Pod, expandedAnnotations
 	err := json.Unmarshal([]byte(enhancementValue), &flattenedEnhancements)
 	if err != nil {
 		general.Errorf("parse enhancement %s failed: %v", enhancementKey, err)
+		// Unmarshal may populate entries before reporting a type error.
+		flattenedEnhancements = map[string]string{}
 		return
 	}
 	return flattenedEnhancements

@@ -23,26 +23,33 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	metrics "k8s.io/metrics/pkg/apis/metrics/v1beta1"
 	"k8s.io/utils/pointer"
 
 	apis "github.com/kubewharf/katalyst-api/pkg/apis/autoscaling/v1alpha1"
 	apiworkload "github.com/kubewharf/katalyst-api/pkg/apis/workload/v1alpha1"
+	apifake "github.com/kubewharf/katalyst-api/pkg/client/clientset/versioned/fake"
+	apilisters "github.com/kubewharf/katalyst-api/pkg/client/listers/workload/v1alpha1"
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	apimetricpod "github.com/kubewharf/katalyst-api/pkg/metric/pod"
 	katalystbase "github.com/kubewharf/katalyst-core/cmd/base"
+	"github.com/kubewharf/katalyst-core/pkg/client/control"
 	"github.com/kubewharf/katalyst-core/pkg/config/controller"
 	"github.com/kubewharf/katalyst-core/pkg/config/generic"
 	"github.com/kubewharf/katalyst-core/pkg/consts"
 	indicator_plugin "github.com/kubewharf/katalyst-core/pkg/controller/spd/indicator-plugin"
+	coremetrics "github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/native"
 )
 
@@ -51,6 +58,178 @@ var (
 	stsGVR = schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "statefulsets"}
 	dpGVK  = schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}
 )
+
+func TestSPDController_DefaultBaselinePercent(t *testing.T) {
+	t.Parallel()
+	const selectorKey = "dedicated_cores:numa_binding_non_exclusive"
+	tests := []struct {
+		name             string
+		qosLevel         string
+		memory           string
+		baseline         map[string]int64
+		missingTemplate  bool
+		conflictingQoS   bool
+		legacyQoS        bool
+		legacyMemory     bool
+		mapLegacyMemory  bool
+		defaultExclusive bool
+		want             int32
+	}{
+		{name: "non-exclusive override", qosLevel: "dedicated_cores", memory: `{"numa_binding":"true","numa_exclusive":"false"}`,
+			baseline: map[string]int64{"dedicated_cores": 0, selectorKey: 100}, want: 100},
+		{name: "explicit zero override", qosLevel: "dedicated_cores", memory: `{"numa_binding":"true","numa_exclusive":"false"}`,
+			baseline: map[string]int64{"dedicated_cores": 100, selectorKey: 0}, want: 0},
+		{name: "partial override", qosLevel: "dedicated_cores", memory: `{"numa_binding":"true","numa_exclusive":"false"}`,
+			baseline: map[string]int64{"dedicated_cores": 100, selectorKey: 35}, want: 35},
+		{name: "exclusive inherits qos", qosLevel: "dedicated_cores", memory: `{"numa_binding":"true","numa_exclusive":"true"}`,
+			baseline: map[string]int64{"dedicated_cores": 0, selectorKey: 100}, want: 0},
+		{name: "unconfigured selector inherits qos", qosLevel: "dedicated_cores", memory: `{"numa_binding":"true","numa_exclusive":"false"}`,
+			baseline: map[string]int64{"dedicated_cores": 20}, want: 20},
+		{name: "unconfigured selector and qos default to maximum", qosLevel: "dedicated_cores", memory: `{"numa_binding":"true","numa_exclusive":"false"}`, want: 100},
+		{name: "selector without qos default", qosLevel: "dedicated_cores", memory: `{"numa_binding":"true","numa_exclusive":"false"}`,
+			baseline: map[string]int64{selectorKey: 0}, want: 0},
+		{name: "exclusive without qos default", qosLevel: "dedicated_cores", memory: `{"numa_binding":"true","numa_exclusive":"true"}`,
+			baseline: map[string]int64{selectorKey: 0}, want: 100},
+		{name: "binding disabled inherits qos", qosLevel: "dedicated_cores", memory: `{"numa_binding":"false","numa_exclusive":"false"}`,
+			baseline: map[string]int64{"dedicated_cores": 20, selectorKey: 100}, want: 20},
+		{name: "binding missing inherits qos", qosLevel: "dedicated_cores", memory: `{"numa_exclusive":"false"}`,
+			baseline: map[string]int64{"dedicated_cores": 20, selectorKey: 100}, want: 20},
+		{name: "exclusive missing inherits qos", qosLevel: "dedicated_cores", memory: `{"numa_binding":"true"}`,
+			baseline: map[string]int64{"dedicated_cores": 20, selectorKey: 100}, defaultExclusive: true, want: 20},
+		{name: "exclusive invalid inherits qos", qosLevel: "dedicated_cores", memory: `{"numa_binding":"true","numa_exclusive":"invalid"}`,
+			baseline: map[string]int64{"dedicated_cores": 20, selectorKey: 100}, want: 20},
+		{name: "no enhancement inherits qos", qosLevel: "dedicated_cores",
+			baseline: map[string]int64{"dedicated_cores": 20, selectorKey: 100}, want: 20},
+		{name: "invalid json inherits qos", qosLevel: "dedicated_cores", memory: `{"numa_binding":`,
+			baseline: map[string]int64{"dedicated_cores": 20, selectorKey: 100}, want: 20},
+		{name: "partially decoded invalid enhancement inherits qos", qosLevel: "dedicated_cores", memory: `{"numa_binding":"true","numa_exclusive":"false","other":true}`,
+			baseline: map[string]int64{"dedicated_cores": 20, selectorKey: 100}, want: 20},
+		{name: "shared binding never matches dedicated selector", qosLevel: "shared_cores", memory: `{"numa_binding":"true","numa_exclusive":"false"}`,
+			baseline: map[string]int64{"shared_cores": 10, selectorKey: 100}, want: 10},
+		{name: "no qos annotations uses shared", baseline: map[string]int64{"shared_cores": 10, selectorKey: 100}, want: 10},
+		{name: "legacy qos selector", qosLevel: "dedicated_cores", memory: `{"numa_binding":"true","numa_exclusive":"false"}`,
+			legacyQoS: true, baseline: map[string]int64{"dedicated_cores": 0, selectorKey: 100}, want: 100},
+		{name: "unmapped legacy enhancement inherits qos", qosLevel: "dedicated_cores", memory: `{"numa_binding":"true","numa_exclusive":"false"}`,
+			legacyMemory: true, baseline: map[string]int64{"dedicated_cores": 20, selectorKey: 100}, want: 20},
+		{name: "mapped legacy enhancement matches selector", qosLevel: "dedicated_cores", memory: `{"numa_binding":"true","numa_exclusive":"false"}`,
+			legacyMemory: true, mapLegacyMemory: true, baseline: map[string]int64{"dedicated_cores": 0, selectorKey: 100}, want: 100},
+		{name: "missing template retains maximum", baseline: map[string]int64{"shared_cores": 0}, missingTemplate: true, want: 100},
+		{name: "conflicting qos retains maximum", qosLevel: "dedicated_cores", conflictingQoS: true,
+			baseline: map[string]int64{"dedicated_cores": 0, selectorKey: 0}, want: 100},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			qosConfig := generic.NewQoSConfiguration()
+			annotations := map[string]interface{}{}
+			if tt.qosLevel != "" {
+				key := apiconsts.PodAnnotationQoSLevelKey
+				if tt.legacyQoS {
+					key = "legacy/qos_level"
+					qosConfig.SetExpandQoSLevelSelector(tt.qosLevel, map[string]string{key: tt.qosLevel})
+				}
+				annotations[key] = tt.qosLevel
+			}
+			if tt.conflictingQoS {
+				qosConfig.SetExpandQoSLevelSelector(tt.qosLevel, map[string]string{"legacy/qos_level": tt.qosLevel})
+				annotations["legacy/qos_level"] = "shared_cores"
+			}
+			if tt.memory != "" {
+				key := apiconsts.PodAnnotationMemoryEnhancementKey
+				if tt.legacyMemory {
+					key = "legacy/memory_enhancement"
+				}
+				annotations[key] = tt.memory
+			}
+			if tt.mapLegacyMemory {
+				qosConfig.SetExpandQoSEnhancementKey(map[string]string{apiconsts.PodAnnotationMemoryEnhancementKey: "legacy/memory_enhancement"})
+			}
+			if tt.defaultExclusive {
+				qosConfig.SetEnhancementDefaultValues(map[string]string{apiconsts.PodAnnotationMemoryEnhancementNumaExclusive: "true"})
+			}
+			workload := &unstructured.Unstructured{Object: map[string]interface{}{
+				"spec": map[string]interface{}{"template": map[string]interface{}{
+					"metadata": map[string]interface{}{"annotations": annotations},
+				}},
+			}}
+			if tt.missingTemplate {
+				delete(workload.Object, "spec")
+			}
+			sc := &SPDController{conf: &controller.SPDConfig{BaselinePercent: tt.baseline}, qosConfig: qosConfig}
+			assert.Equal(t, tt.want, *sc.defaultBaselinePercent(workload))
+		})
+	}
+}
+
+func TestSPDController_BaselinePercentCreation(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name     string
+		existing bool
+		want     int32
+	}{
+		{name: "new spd uses selector", want: 100},
+		{name: "existing spd retains baseline", existing: true, want: 15},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			workload := &unstructured.Unstructured{Object: map[string]interface{}{
+				"apiVersion": "apps/v1", "kind": "Deployment",
+				"metadata": map[string]interface{}{
+					"name": "workload", "namespace": "default",
+					"annotations": map[string]interface{}{apiconsts.WorkloadAnnotationSPDEnableKey: apiconsts.WorkloadAnnotationSPDEnabled},
+				},
+				"spec": map[string]interface{}{
+					"selector": map[string]interface{}{"matchLabels": map[string]interface{}{"app": "workload"}},
+					"template": map[string]interface{}{
+						"metadata": map[string]interface{}{"annotations": map[string]interface{}{
+							apiconsts.PodAnnotationQoSLevelKey:          "dedicated_cores",
+							apiconsts.PodAnnotationMemoryEnhancementKey: `{"numa_binding":"true","numa_exclusive":"false"}`,
+						}},
+					},
+				},
+			}}
+			client := apifake.NewSimpleClientset()
+			indexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+			workloadIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+			require.NoError(t, workloadIndexer.Add(workload))
+			podIndexer := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{})
+			var original *apiworkload.ServiceProfileDescriptor
+			if tt.existing {
+				original = &apiworkload.ServiceProfileDescriptor{
+					ObjectMeta: metav1.ObjectMeta{Name: "workload", Namespace: "default"},
+					Spec: apiworkload.ServiceProfileDescriptorSpec{
+						TargetRef:       apis.CrossVersionObjectReference{APIVersion: "apps/v1", Kind: "Deployment", Name: "workload"},
+						BaselinePercent: pointer.Int32(15),
+					},
+				}
+				require.NoError(t, indexer.Add(original))
+			}
+			sc := &SPDController{
+				ctx: context.Background(), qosConfig: generic.NewQoSConfiguration(),
+				conf: &controller.SPDConfig{BaselinePercent: map[string]int64{
+					"dedicated_cores": 0, "dedicated_cores:numa_binding_non_exclusive": 100,
+				}},
+				spdLister: apilisters.NewServiceProfileDescriptorLister(indexer),
+				workloadLister: map[schema.GroupVersionResource]cache.GenericLister{
+					{Group: "apps", Version: "v1", Resource: "deployments"}: cache.NewGenericLister(workloadIndexer, schema.GroupResource{Group: "apps", Resource: "deployments"}),
+				},
+				podLister:  corelisters.NewPodLister(podIndexer),
+				spdControl: control.NewSPDControlImp(client), metricsEmitter: coremetrics.DummyMetrics{},
+			}
+			spd, err := sc.getOrCreateSPDForWorkload(workload)
+			require.NoError(t, err)
+			require.NotNil(t, spd)
+			assert.Equal(t, tt.want, *spd.Spec.BaselinePercent)
+			if tt.existing {
+				assert.Same(t, original, spd)
+				assert.Empty(t, client.Actions())
+			} else {
+				stored, err := client.WorkloadV1alpha1().ServiceProfileDescriptors("default").Get(context.Background(), "workload", metav1.GetOptions{})
+				require.NoError(t, err)
+				assert.Equal(t, tt.want, *stored.Spec.BaselinePercent)
+			}
+		})
+	}
+}
 
 func TestSPDController_Run(t *testing.T) {
 	t.Parallel()
