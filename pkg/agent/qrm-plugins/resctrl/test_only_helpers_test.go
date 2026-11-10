@@ -16,6 +16,20 @@ limitations under the License.
 
 package resctrl
 
+import (
+	"os"
+
+	"github.com/kubewharf/katalyst-core/pkg/util/machine"
+)
+
+func readCPUListMask(path string) (machine.CPUSet, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return machine.NewCPUSet(), err
+	}
+	return parseCPUListMask(content)
+}
+
 // newCPUListManager is a test-only thin wrapper over newCPUListManagerWithUpdater
 // with a nil updater.
 func newCPUListManager(root string) *cpuListManager {
