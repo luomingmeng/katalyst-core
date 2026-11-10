@@ -21,11 +21,14 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	resctrlutil "github.com/kubewharf/katalyst-core/pkg/util/resctrl"
 )
 
 func TestCPUListManagerApplyCPUListWritesResctrlMask(t *testing.T) {
@@ -40,7 +43,7 @@ func TestCPUListManagerApplyCPUListWritesResctrlMask(t *testing.T) {
 
 	content, err := os.ReadFile(filepath.Join(root, "dedicated", cpus))
 	require.NoError(t, err)
-	require.Equal(t, "00000000,00020000,020000fe", string(content))
+	require.Equal(t, "00000000,00020000,020000fe", strings.TrimSpace(string(content)))
 }
 
 func TestCPUListManagerApplyCPUListWritesZeroMaskForEmptyTarget(t *testing.T) {
@@ -55,7 +58,7 @@ func TestCPUListManagerApplyCPUListWritesZeroMaskForEmptyTarget(t *testing.T) {
 
 	content, err := os.ReadFile(filepath.Join(root, "reclaim", cpus))
 	require.NoError(t, err)
-	require.Equal(t, "00000000,00000000,00000000", string(content))
+	require.Equal(t, "00000000,00000000,00000000", strings.TrimSpace(string(content)))
 }
 
 func TestCPUListManagerApplyCPUListWritesExistingClos(t *testing.T) {
@@ -73,10 +76,10 @@ func TestCPUListManagerApplyCPUListWritesExistingClos(t *testing.T) {
 
 	content, err := os.ReadFile(filepath.Join(root, "dedicated", cpus))
 	require.NoError(t, err)
-	require.Equal(t, "00000002", string(content))
+	require.Equal(t, "00000002", strings.TrimSpace(string(content)))
 	content, err = os.ReadFile(filepath.Join(root, "reclaim", cpus))
 	require.NoError(t, err)
-	require.Equal(t, "00000000", string(content))
+	require.Equal(t, "00000000", strings.TrimSpace(string(content)))
 }
 
 func TestCPUListManagerApplyCPUListCreatesMissingClosBeforeWrite(t *testing.T) {
@@ -89,7 +92,7 @@ func TestCPUListManagerApplyCPUListCreatesMissingClosBeforeWrite(t *testing.T) {
 
 	content, err := os.ReadFile(filepath.Join(root, "dedicated", cpus))
 	require.NoError(t, err)
-	require.Equal(t, "00000002", string(content))
+	require.Equal(t, "00000002", strings.TrimSpace(string(content)))
 }
 
 func TestCPUListManagerApplyCPUListSkipsMissingClosForEmptyTarget(t *testing.T) {
@@ -196,7 +199,7 @@ func TestCPUListManagerApplyCPUListWaitsForClosLifecycleUpdate(t *testing.T) {
 	require.NoError(t, <-applyDone)
 	content, err := os.ReadFile(filepath.Join(root, "dedicated", cpus))
 	require.NoError(t, err)
-	require.Equal(t, "00000002", string(content))
+	require.Equal(t, "00000002", strings.TrimSpace(string(content)))
 }
 
 type testClosResourceCoordinator struct {
@@ -236,7 +239,7 @@ func (c *testClosResourceCoordinator) getClosMu(closID string) *sync.Mutex {
 func TestIsClosDirExcludesReservedRootEntries(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	for _, name := range []string{"info", "mon_data", monGroupsDir, "clos0", "clos1"} {
+	for _, name := range []string{"info", "mon_data", resctrlutil.MonGroupsDir, "clos0", "clos1"} {
 		require.NoError(t, os.Mkdir(filepath.Join(root, name), 0o755))
 	}
 	require.NoError(t, os.WriteFile(filepath.Join(root, "a_regular_file"), nil, 0o644))
@@ -250,7 +253,7 @@ func TestIsClosDirExcludesReservedRootEntries(t *testing.T) {
 	}
 	require.True(t, got["clos0"], "clos0 should be recognized as a CLOS dir")
 	require.True(t, got["clos1"], "clos1 should be recognized as a CLOS dir")
-	for _, reserved := range []string{"info", "mon_data", monGroupsDir} {
+	for _, reserved := range []string{"info", "mon_data", resctrlutil.MonGroupsDir} {
 		require.False(t, got[reserved], "%q must not be treated as a CLOS dir", reserved)
 	}
 	require.False(t, got["a_regular_file"], "regular files must not be treated as a CLOS dir")
