@@ -178,8 +178,11 @@ func ReadNumaUnusableIndex(numaID, order int) (float64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("read %s: %w", UnusableIndexFilePath, err)
 	}
+	return parseNumaUnusableIndex(string(data), numaID, order)
+}
 
-	for _, line := range strings.Split(string(data), "\n") {
+func parseNumaUnusableIndex(data string, numaID, order int) (float64, error) {
+	for _, line := range strings.Split(data, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 4 || fields[0] != "Node" || fields[2] != "zone" || fields[3] != "Normal" {
 			continue
@@ -222,8 +225,15 @@ func ReadNumaFreeMemorySizeAtOrAboveOrder(numaID, minOrder int) (uint64, error) 
 	if err != nil {
 		return 0, fmt.Errorf("read %s: %w", buddyInfoPath, err)
 	}
+	return parseNumaFreeMemory(string(data), numaID, minOrder)
+}
 
-	for _, line := range strings.Split(string(data), "\n") {
+func parseNumaFreeMemory(data string, numaID, minOrder int) (uint64, error) {
+	buddyInfoPath := filepath.Join(ProcFSRoot, "buddyinfo")
+	if minOrder < 0 {
+		return 0, fmt.Errorf("invalid negative order %d", minOrder)
+	}
+	for _, line := range strings.Split(data, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 4 || fields[0] != "Node" || fields[2] != "zone" || fields[3] != "Normal" {
 			continue
@@ -253,6 +263,41 @@ func ReadNumaFreeMemorySizeAtOrAboveOrder(numaID, minOrder int) (uint64, error) 
 	}
 
 	return 0, fmt.Errorf("NUMA %d Normal zone not found in %s", numaID, buddyInfoPath)
+}
+
+// NumaFragmentation keeps independent metric failures in one observation snapshot.
+type NumaFragmentation struct {
+	NUMAID           int
+	UnusableIndex    float64
+	UnusableIndexErr error
+	FreeMemory       uint64
+	FreeMemoryErr    error
+}
+
+// ReadNumaFragmentation reads each kernel file once for all requested NUMA nodes.
+func ReadNumaFragmentation(numaIDs []int, order int) []NumaFragmentation {
+	indexData, indexErr := os.ReadFile(UnusableIndexFilePath)
+	buddyPath := filepath.Join(ProcFSRoot, "buddyinfo")
+	buddyData, buddyErr := os.ReadFile(buddyPath)
+	if indexErr != nil {
+		indexErr = fmt.Errorf("read %s: %w", UnusableIndexFilePath, indexErr)
+	}
+	if buddyErr != nil {
+		buddyErr = fmt.Errorf("read %s: %w", buddyPath, buddyErr)
+	}
+	indexText, buddyText := string(indexData), string(buddyData)
+	results := make([]NumaFragmentation, 0, len(numaIDs))
+	for _, id := range numaIDs {
+		result := NumaFragmentation{NUMAID: id, UnusableIndexErr: indexErr, FreeMemoryErr: buddyErr}
+		if indexErr == nil {
+			result.UnusableIndex, result.UnusableIndexErr = parseNumaUnusableIndex(indexText, id, order)
+		}
+		if buddyErr == nil {
+			result.FreeMemory, result.FreeMemoryErr = parseNumaFreeMemory(buddyText, id, order)
+		}
+		results = append(results, result)
+	}
+	return results
 }
 
 // discoverNumaKcompactdPids walks ProcFSRoot and records, per NUMA node, the pid of its kcompactd
