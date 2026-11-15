@@ -104,6 +104,28 @@ func TestAccumulateConvergenceResultPropagatesPublicationState(t *testing.T) {
 	}
 }
 
+func TestPendingAuthorityDistinguishesCanonicalReplayFromDeferredRetry(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []cpusetutil.CPUSetAdjustmentMode{"", cpusetutil.CPUSetAdjustmentModeAdmission, cpusetutil.CPUSetAdjustmentModeRetry, cpusetutil.CPUSetAdjustmentModePeriodic} {
+		for _, canonical := range []bool{false, true} {
+			for _, admissionHint := range []bool{false, true} {
+				in := bulkheadapi.HandlerContext{
+					CPUSetAdjustmentHandlerCtx:        cpusetutil.CPUSetAdjustmentHandlerCtx{Mode: mode, ReconcileCanonicalPartition: canonical},
+					ProjectPendingToDesiredNonReclaim: admissionHint,
+					AppliedView:                       &model.AppliedView{CPUSetPartitionView: model.CPUSetPartitionView{ReclaimEffective: machine.NewCPUSet(1)}},
+				}
+				want := !canonical && (admissionHint || mode == cpusetutil.CPUSetAdjustmentModeRetry)
+				if got := shouldProjectPendingToValidatedAuthority(in); got != want {
+					t.Fatalf("mode=%q canonical=%t hint=%t: projection=%t want=%t", mode, canonical, admissionHint, got, want)
+				}
+				if got := admissionEnforcementBaseline(in); (got != nil) != want {
+					t.Fatalf("mode=%q canonical=%t hint=%t: baseline=%+v", mode, canonical, admissionHint, got)
+				}
+			}
+		}
+	}
+}
+
 func TestScheduleFixedPointRetryByAdjustmentMode(t *testing.T) {
 	t.Parallel()
 

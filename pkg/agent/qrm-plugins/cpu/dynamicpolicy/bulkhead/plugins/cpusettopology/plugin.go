@@ -530,6 +530,11 @@ func admissionEnforcementBaseline(in bulkheadapi.HandlerContext) *model.CPUSetPa
 // or on a deferred-leaf Retry carrying a validated AppliedView; overlap and
 // periodical/full rounds without that hint stay on the raw business baseline.
 func shouldProjectPendingToValidatedAuthority(in bulkheadapi.HandlerContext) bool {
+	// Post-commit replay must drive its canonical target from fresh physical
+	// state, not freeze the previous admission's reclaim partition.
+	if in.ReconcileCanonicalPartition {
+		return false
+	}
 	if in.ProjectPendingToDesiredNonReclaim {
 		return true
 	}
