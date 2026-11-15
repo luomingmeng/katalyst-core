@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"sync"
 
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -126,6 +127,22 @@ func NewMetaAgent(conf *config.Configuration, clientSet *client.GenericClientSet
 	}
 
 	return metaAgent, nil
+}
+
+// GetPodMetricTargets forwards optional metric targeting to the installed PodFetcher.
+// The metrics provisioner is constructed before Adapter replaces that fetcher.
+func (a *MetaAgent) GetPodMetricTargets(ctx context.Context) ([]types.PodMetricTarget, error) {
+	if provider, ok := a.PodFetcher.(types.PodMetricTargetProvider); ok {
+		return provider.GetPodMetricTargets(ctx)
+	}
+	return nil, nil
+}
+
+func (a *MetaAgent) ResolvePodMetricTarget(ctx context.Context, p *v1.Pod) (types.PodMetricTarget, bool, error) {
+	if provider, ok := a.PodFetcher.(types.PodMetricTargetProvider); ok {
+		return provider.ResolvePodMetricTarget(ctx, p)
+	}
+	return types.PodMetricTarget{}, false, nil
 }
 
 func (a *MetaAgent) SetPodFetcher(p pod.PodFetcher) {

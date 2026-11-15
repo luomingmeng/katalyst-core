@@ -41,6 +41,7 @@ import (
 	cnrmeta "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/cnr"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/kubeletconfig"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric"
+	metrictypes "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric/types"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/node"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
@@ -89,6 +90,38 @@ type ObjectFetcherTest struct {
 
 func (o *ObjectFetcherTest) GetUnstructured(_ context.Context, _, _ string) (*unstructured.Unstructured, error) {
 	return o.obj, nil
+}
+
+type metricTargetPodFetcher struct {
+	pod.PodFetcherStub
+	target metrictypes.PodMetricTarget
+}
+
+func (f *metricTargetPodFetcher) GetPodMetricTargets(context.Context) ([]metrictypes.PodMetricTarget, error) {
+	return []metrictypes.PodMetricTarget{f.target}, nil
+}
+
+func (f *metricTargetPodFetcher) ResolvePodMetricTarget(context.Context, *v1.Pod) (metrictypes.PodMetricTarget, bool, error) {
+	return f.target, true, nil
+}
+
+func TestMetricTargetsFollowInstalledPodFetcher(t *testing.T) {
+	t.Parallel()
+	a := &MetaAgent{PodFetcher: &pod.PodFetcherStub{}}
+	// Metrics construction retains this MetaAgent before Adapter calls SetPodFetcher.
+	var provider metrictypes.PodMetricTargetProvider = a
+	targets, err := provider.GetPodMetricTargets(context.Background())
+	assert.NoError(t, err)
+	assert.Empty(t, targets)
+	target := metrictypes.PodMetricTarget{Pod: &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: "target"}}, CgroupPath: "/target", MappingRevision: 1}
+	a.SetPodFetcher(&metricTargetPodFetcher{target: target})
+	targets, err = provider.GetPodMetricTargets(context.Background())
+	assert.NoError(t, err)
+	assert.Equal(t, []metrictypes.PodMetricTarget{target}, targets)
+	resolved, handled, err := provider.ResolvePodMetricTarget(context.Background(), target.Pod)
+	assert.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, target, resolved)
 }
 
 func TestFetcher(t *testing.T) {

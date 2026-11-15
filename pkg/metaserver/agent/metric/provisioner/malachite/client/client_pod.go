@@ -23,6 +23,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric/provisioner/malachite/types"
+	metrictypes "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric/types"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	cgroupcm "github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
@@ -37,6 +38,12 @@ func (c *MalachiteClient) GetAllPodContainersStats(ctx context.Context) (map[str
 
 	podsContainersStats := make(map[string]map[string]*types.MalachiteCgroupInfo)
 	for _, pod := range pods {
+		if provider, ok := c.fetcher.(metrictypes.PodMetricTargetProvider); ok {
+			_, handled, _ := provider.ResolvePodMetricTarget(ctx, pod)
+			if handled {
+				continue
+			}
+		}
 		stats, err := c.GetPodStats(ctx, string(pod.UID))
 		if err != nil {
 			general.Errorf("GetAllPodContainersStats err %v", err)

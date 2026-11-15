@@ -36,7 +36,10 @@ const (
 	CgroupSubsysCPUSet = "cpuset"
 	CgroupSubsysMemory = "memory"
 	CgroupSubsysCPU    = "cpu"
-	CgroupSubsysIO     = "io"
+	// CgroupSubsysCPUAcct identifies CPU accounting in v1, distinct from the
+	// cpu scheduling controller. In v2, path helpers use the unified hierarchy.
+	CgroupSubsysCPUAcct = "cpuacct"
+	CgroupSubsysIO      = "io"
 	// CgroupSubsysNetCls is the net_cls sub-system
 	CgroupSubsysNetCls = "net_cls"
 

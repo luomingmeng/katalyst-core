@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,6 +69,7 @@ func NewMalachiteMetricsProvisioner(baseConf *global.BaseConfiguration, _ *metas
 ) types.MetricsProvisioner {
 	return &MalachiteMetricsProvisioner{
 		malachiteClient:    client.NewMalachiteClient(fetcher, emitter),
+		podFetcher:         fetcher,
 		metricStore:        metricStore,
 		emitter:            emitter,
 		baseConf:           baseConf,
@@ -81,6 +83,8 @@ func NewMalachiteMetricsProvisioner(baseConf *global.BaseConfiguration, _ *metas
 type MalachiteMetricsProvisioner struct {
 	metricStore     *utilmetric.MetricStore
 	malachiteClient *client.MalachiteClient
+	podFetcher      pod.PodFetcher
+	cgroupStatFn    func(string) (os.FileInfo, error)
 	baseConf        *global.BaseConfiguration
 	emitter         metrics.MetricEmitter
 	machineInfo     *machine.KatalystMachineInfo
@@ -137,6 +141,10 @@ func (m *MalachiteMetricsProvisioner) sample(ctx context.Context) {
 	}
 	// Update pod data
 	if err := m.updatePodsCgroupData(ctx); err != nil {
+		errList = append(errList, err)
+	}
+	// Update whole-workload projections independently of container collection.
+	if err := m.updatePodMetrics(ctx); err != nil {
 		errList = append(errList, err)
 	}
 	// Update top level cgroup of kubepods
@@ -883,6 +891,12 @@ func (m *MalachiteMetricsProvisioner) processSystemNUMAComputeData(systemCompute
 }
 
 func (m *MalachiteMetricsProvisioner) processCgroupCPUData(cgroupPath string, cgStats *malachitetypes.MalachiteCgroupInfo) {
+	processor := cgroupMetricProcessor{writer: m.metricStore}
+	processor.processCgroupCPUScalarData(cgroupPath, cgStats)
+	m.processCgroupPerNumaCPUData(cgroupPath, cgStats)
+}
+
+func (m *cgroupMetricProcessor) processCgroupCPUScalarData(cgroupPath string, cgStats *malachitetypes.MalachiteCgroupInfo) {
 	if cgStats == nil {
 		return
 	}
@@ -893,92 +907,94 @@ func (m *MalachiteMetricsProvisioner) processCgroupCPUData(cgroupPath string, cg
 
 		// todo it's kind of confusing but the `cpu-usage-ratio` in `cgroup-level` actually represents `actual cores`,
 		//  we will always rename metric in local store to eliminate `ratio` to avoid ambiguity.
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricCPULimitCgroup, utilmetric.MetricData{Value: float64(cpu.CfsQuotaUs) / float64(cpu.CfsPeriodUs), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricCPUUsageCgroup, utilmetric.MetricData{Value: cpu.CPUUsageRatio, Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricCPUUsageUserCgroup, utilmetric.MetricData{Value: cpu.CPUUserUsageRatio, Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricCPUUsageSysCgroup, utilmetric.MetricData{Value: cpu.CPUSysUsageRatio, Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricCPULimitCgroup, utilmetric.MetricData{Value: float64(cpu.CfsQuotaUs) / float64(cpu.CfsPeriodUs), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricCPUUsageCgroup, utilmetric.MetricData{Value: cpu.CPUUsageRatio, Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricCPUUsageUserCgroup, utilmetric.MetricData{Value: cpu.CPUUserUsageRatio, Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricCPUUsageSysCgroup, utilmetric.MetricData{Value: cpu.CPUSysUsageRatio, Time: &updateTime})
 
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricCPUShareCgroup, utilmetric.MetricData{Value: float64(cpu.CPUShares), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricCPUQuotaCgroup, utilmetric.MetricData{Value: float64(cpu.CfsQuotaUs), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricCPUPeriodCgroup, utilmetric.MetricData{Value: float64(cpu.CfsPeriodUs), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricCPUNrThrottledCgroup, utilmetric.MetricData{Value: float64(cpu.CPUNrThrottled), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricCPUThrottledPeriodCgroup, utilmetric.MetricData{Value: float64(cpu.CPUNrPeriods), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricCPUThrottledTimeCgroup, utilmetric.MetricData{Value: float64(cpu.CPUThrottledTime / 1000), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricCPUShareCgroup, utilmetric.MetricData{Value: float64(cpu.CPUShares), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricCPUQuotaCgroup, utilmetric.MetricData{Value: float64(cpu.CfsQuotaUs), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricCPUPeriodCgroup, utilmetric.MetricData{Value: float64(cpu.CfsPeriodUs), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricCPUNrThrottledCgroup, utilmetric.MetricData{Value: float64(cpu.CPUNrThrottled), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricCPUThrottledPeriodCgroup, utilmetric.MetricData{Value: float64(cpu.CPUNrPeriods), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricCPUThrottledTimeCgroup, utilmetric.MetricData{Value: float64(cpu.CPUThrottledTime / 1000), Time: &updateTime})
 
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricCPUNrRunnableCgroup, utilmetric.MetricData{Value: float64(cpu.TaskNrRunning), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricCPUNrUninterruptibleCgroup, utilmetric.MetricData{Value: float64(cpu.TaskNrUninterruptible), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricCPUNrIOWaitCgroup, utilmetric.MetricData{Value: float64(cpu.TaskNrIoWait), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricCPUNrRunnableCgroup, utilmetric.MetricData{Value: float64(cpu.TaskNrRunning), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricCPUNrUninterruptibleCgroup, utilmetric.MetricData{Value: float64(cpu.TaskNrUninterruptible), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricCPUNrIOWaitCgroup, utilmetric.MetricData{Value: float64(cpu.TaskNrIoWait), Time: &updateTime})
 
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricLoad1MinCgroup, utilmetric.MetricData{Value: cpu.Load.One, Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricLoad5MinCgroup, utilmetric.MetricData{Value: cpu.Load.Five, Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricLoad15MinCgroup, utilmetric.MetricData{Value: cpu.Load.Fifteen, Time: &updateTime})
-
-		if m.cpuToNumaMap == nil {
-			return
-		}
-		numaCPUUsage := make(map[int]uint64)
-		for cpuID, usage := range cpu.PercpuUsage {
-			numaID := m.cpuToNumaMap[cpuID]
-			numaCPUUsage[numaID] += usage
-		}
-		for numaID, usage := range numaCPUUsage {
-			numaCPUUsageOld, err := m.metricStore.GetCgroupNumaMetric(cgroupPath, numaID, consts.MetricsCPUUsageCountNUMAContainer)
-			if err == nil && numaCPUUsageOld.Time.Before(updateTime) {
-				rate := (float64(usage) - numaCPUUsageOld.Value) / updateTime.Sub(*numaCPUUsageOld.Time).Seconds() / 1000000000
-				m.metricStore.SetCgroupNumaMetric(cgroupPath, numaID, consts.MetricsCPUUsageNUMAContainer, utilmetric.MetricData{Value: rate, Time: &updateTime})
-			}
-
-			m.metricStore.SetCgroupNumaMetric(cgroupPath, numaID, consts.MetricsCPUUsageCountNUMAContainer,
-				utilmetric.MetricData{Value: float64(usage), Time: &updateTime})
-		}
-
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricLoad1MinCgroup, utilmetric.MetricData{Value: cpu.Load.One, Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricLoad5MinCgroup, utilmetric.MetricData{Value: cpu.Load.Five, Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricLoad15MinCgroup, utilmetric.MetricData{Value: cpu.Load.Fifteen, Time: &updateTime})
 	} else if cgStats.CgroupType == "V2" && cgStats.V2 != nil {
 		cpu := cgStats.V2.Cpu
 		updateTime := time.Unix(cgStats.V2.Cpu.UpdateTime, 0)
 
 		// todo it's kind of confusing but the `cpu-usage-ratio` in `cgroup-level` actually represents `actual cores`,
 		//  we will always rename metric in local store to eliminate `ratio` to avoid ambiguity.
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricCPUUsageCgroup, utilmetric.MetricData{Value: cpu.CPUUsageRatio, Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricCPUUsageUserCgroup, utilmetric.MetricData{Value: cpu.CPUUserUsageRatio, Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricCPUUsageSysCgroup, utilmetric.MetricData{Value: cpu.CPUSysUsageRatio, Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricCPUUsageCgroup, utilmetric.MetricData{Value: cpu.CPUUsageRatio, Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricCPUUsageUserCgroup, utilmetric.MetricData{Value: cpu.CPUUserUsageRatio, Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricCPUUsageSysCgroup, utilmetric.MetricData{Value: cpu.CPUSysUsageRatio, Time: &updateTime})
 
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricCPUNrRunnableCgroup, utilmetric.MetricData{Value: float64(cpu.TaskNrRunning), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricCPUNrUninterruptibleCgroup, utilmetric.MetricData{Value: float64(cpu.TaskNrUninterruptible), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricCPUNrIOWaitCgroup, utilmetric.MetricData{Value: float64(cpu.TaskNrIoWait), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricCPUNrRunnableCgroup, utilmetric.MetricData{Value: float64(cpu.TaskNrRunning), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricCPUNrUninterruptibleCgroup, utilmetric.MetricData{Value: float64(cpu.TaskNrUninterruptible), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricCPUNrIOWaitCgroup, utilmetric.MetricData{Value: float64(cpu.TaskNrIoWait), Time: &updateTime})
 
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricLoad1MinCgroup, utilmetric.MetricData{Value: cpu.Load.One, Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricLoad5MinCgroup, utilmetric.MetricData{Value: cpu.Load.Five, Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricLoad15MinCgroup, utilmetric.MetricData{Value: cpu.Load.Fifteen, Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricLoad1MinCgroup, utilmetric.MetricData{Value: cpu.Load.One, Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricLoad5MinCgroup, utilmetric.MetricData{Value: cpu.Load.Five, Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricLoad15MinCgroup, utilmetric.MetricData{Value: cpu.Load.Fifteen, Time: &updateTime})
 
 		quota := float64(cpu.Max)
 		if cpu.Max == math.MaxUint64 {
 			quota = -1
 		}
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricCPUQuotaCgroup, utilmetric.MetricData{Value: quota, Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricCPUPeriodCgroup, utilmetric.MetricData{Value: float64(cpu.MaxPeriod), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricCPUQuotaCgroup, utilmetric.MetricData{Value: quota, Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricCPUPeriodCgroup, utilmetric.MetricData{Value: float64(cpu.MaxPeriod), Time: &updateTime})
+	}
+}
 
-		if m.cpuToNumaMap == nil {
-			return
+// NUMA CPU rates use the static cgroup store's previous counters. Whole-workload
+// samples call only the scalar processor and cannot consume this path-only history.
+func (m *MalachiteMetricsProvisioner) processCgroupPerNumaCPUData(cgroupPath string, cgStats *malachitetypes.MalachiteCgroupInfo) {
+	if cgStats == nil || m.cpuToNumaMap == nil {
+		return
+	}
+	var (
+		perCPUUsage []uint64
+		updateTime  time.Time
+	)
+	if cgStats.CgroupType == "V1" && cgStats.V1 != nil {
+		perCPUUsage = cgStats.V1.Cpu.PercpuUsage
+		updateTime = time.Unix(cgStats.V1.Cpu.UpdateTime, 0)
+	} else if cgStats.CgroupType == "V2" && cgStats.V2 != nil {
+		perCPUUsage = cgStats.V2.Cpu.PercpuUsage
+		updateTime = time.Unix(cgStats.V2.Cpu.UpdateTime, 0)
+	} else {
+		return
+	}
+	numaCPUUsage := make(map[int]uint64)
+	for cpuID, usage := range perCPUUsage {
+		numaID := m.cpuToNumaMap[cpuID]
+		numaCPUUsage[numaID] += usage
+	}
+	for numaID, usage := range numaCPUUsage {
+		numaCPUUsageOld, err := m.metricStore.GetCgroupNumaMetric(cgroupPath, numaID, consts.MetricsCPUUsageCountNUMAContainer)
+		if err == nil && numaCPUUsageOld.Time.Before(updateTime) {
+			rate := (float64(usage) - numaCPUUsageOld.Value) / updateTime.Sub(*numaCPUUsageOld.Time).Seconds() / 1000000000
+			m.metricStore.SetCgroupNumaMetric(cgroupPath, numaID, consts.MetricsCPUUsageNUMAContainer, utilmetric.MetricData{Value: rate, Time: &updateTime})
 		}
-		numaCPUUsage := make(map[int]uint64)
-		for cpuID, usage := range cpu.PercpuUsage {
-			numaID := m.cpuToNumaMap[cpuID]
-			numaCPUUsage[numaID] += usage
-		}
-		for numaID, usage := range numaCPUUsage {
-			numaCPUUsageOld, err := m.metricStore.GetCgroupNumaMetric(cgroupPath, numaID, consts.MetricsCPUUsageCountNUMAContainer)
-			if err == nil && numaCPUUsageOld.Time.Before(updateTime) {
-				rate := (float64(usage) - numaCPUUsageOld.Value) / updateTime.Sub(*numaCPUUsageOld.Time).Seconds() / 1000000000
-				m.metricStore.SetCgroupNumaMetric(cgroupPath, numaID, consts.MetricsCPUUsageNUMAContainer, utilmetric.MetricData{Value: rate, Time: &updateTime})
-			}
 
-			m.metricStore.SetCgroupNumaMetric(cgroupPath, numaID, consts.MetricsCPUUsageCountNUMAContainer,
-				utilmetric.MetricData{Value: float64(usage), Time: &updateTime})
-		}
+		m.metricStore.SetCgroupNumaMetric(cgroupPath, numaID, consts.MetricsCPUUsageCountNUMAContainer,
+			utilmetric.MetricData{Value: float64(usage), Time: &updateTime})
 	}
 }
 
 func (m *MalachiteMetricsProvisioner) processCgroupMemoryData(cgroupPath string, cgStats *malachitetypes.MalachiteCgroupInfo) {
+	processor := cgroupMetricProcessor{writer: m.metricStore}
+	processor.processCgroupMemoryData(cgroupPath, cgStats)
+}
+
+func (m *cgroupMetricProcessor) processCgroupMemoryData(cgroupPath string, cgStats *malachitetypes.MalachiteCgroupInfo) {
 	if cgStats == nil {
 		return
 	}
@@ -987,53 +1003,53 @@ func (m *MalachiteMetricsProvisioner) processCgroupMemoryData(cgroupPath string,
 		mem := cgStats.V1.Memory
 		updateTime := time.Unix(cgStats.V1.Memory.UpdateTime, 0)
 
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemSwapCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.TotalSwap)})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemLimitCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.MemoryLimitInBytes)})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemUsageCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.MemoryUsageInBytes)})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemUsageUserCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.MemoryLimitInBytes - mem.KernMemoryUsageInBytes)})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemUsageSysCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.KernMemoryUsageInBytes)})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemRssCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.TotalRss)})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemCacheCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.TotalCache)})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemShmemCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.TotalShmem)})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemSwapCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.TotalSwap)})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemLimitCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.MemoryLimitInBytes)})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemUsageCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.MemoryUsageInBytes)})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemUsageUserCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.MemoryLimitInBytes - mem.KernMemoryUsageInBytes)})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemUsageSysCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.KernMemoryUsageInBytes)})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemRssCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.TotalRss)})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemCacheCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.TotalCache)})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemShmemCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.TotalShmem)})
 
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemDirtyCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.TotalDirty)})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemWritebackCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.TotalWriteback)})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemPgfaultCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.TotalPgfault)})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemPgmajfaultCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.TotalPgmajfault)})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemAllocstallCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.TotalAllocstall)})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemKswapdstealCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.KswapdSteal)})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemActiveAnonCgroup, utilmetric.MetricData{Value: float64(mem.TotalActiveAnon), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemInactiveAnonCgroup, utilmetric.MetricData{Value: float64(mem.TotalInactiveAnon), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemActiveFileCgroup, utilmetric.MetricData{Value: float64(mem.TotalActiveFile), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemInactiveFileCgroup, utilmetric.MetricData{Value: float64(mem.TotalInactiveFile), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemDirtyCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.TotalDirty)})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemWritebackCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.TotalWriteback)})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemPgfaultCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.TotalPgfault)})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemPgmajfaultCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.TotalPgmajfault)})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemAllocstallCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.TotalAllocstall)})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemKswapdstealCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.KswapdSteal)})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemActiveAnonCgroup, utilmetric.MetricData{Value: float64(mem.TotalActiveAnon), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemInactiveAnonCgroup, utilmetric.MetricData{Value: float64(mem.TotalInactiveAnon), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemActiveFileCgroup, utilmetric.MetricData{Value: float64(mem.TotalActiveFile), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemInactiveFileCgroup, utilmetric.MetricData{Value: float64(mem.TotalInactiveFile), Time: &updateTime})
 
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemOomCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.BpfMemStat.OomCnt)})
-		// m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemScaleFactorCgroup, utilmetric.MetricData{Time: &updateTime, Value: general.UIntPointerToFloat64(mem.WatermarkScaleFactor)})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemOomCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.BpfMemStat.OomCnt)})
+		// m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemScaleFactorCgroup, utilmetric.MetricData{Time: &updateTime, Value: general.UIntPointerToFloat64(mem.WatermarkScaleFactor)})
 	} else if cgStats.CgroupType == "V2" && cgStats.V2 != nil {
 		mem := cgStats.V2.Memory
 		updateTime := time.Unix(cgStats.V2.Memory.UpdateTime, 0)
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemSwapCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.SwapCurrent)})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemLimitCgroup, utilmetric.MetricData{Value: float64(mem.Max), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemUsageCgroup, utilmetric.MetricData{Value: float64(mem.MemoryUsageInBytes), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemRssCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.Anon), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemCacheCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.File), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemSwapCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(mem.SwapCurrent)})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemLimitCgroup, utilmetric.MetricData{Value: float64(mem.Max), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemUsageCgroup, utilmetric.MetricData{Value: float64(mem.MemoryUsageInBytes), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemRssCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.Anon), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemCacheCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.File), Time: &updateTime})
 
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemShmemCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.Shmem), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemPgfaultCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.Pgfault), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemPgmajfaultCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.Pgmajfault), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemShmemCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.Shmem), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemPgfaultCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.Pgfault), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemPgmajfaultCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.Pgmajfault), Time: &updateTime})
 
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemOomCgroup, utilmetric.MetricData{Value: float64(mem.BpfMemStat.OomCnt), Time: &updateTime})
-		// m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemScaleFactorCgroup, utilmetric.MetricData{Value: general.UInt64PointerToFloat64(mem.WatermarkScaleFactor), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemPgstealCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.Pgsteal), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemPgscanCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.Pgscan), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemWorkingsetRefaultCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.WorkingsetRefault), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemWorkingsetActivateCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.WorkingsetActivate), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemPsiAvg60Cgroup, utilmetric.MetricData{Value: mem.MemPressure.Some.Avg60, Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemActiveAnonCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.ActiveAnon), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemInactiveAnonCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.InactiveAnon), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemActiveFileCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.ActiveFile), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemInactiveFileCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.InactiveFile), Time: &updateTime})
-		m.metricStore.SetCgroupMetric(cgroupPath, consts.MetricMemMappedCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.FileMapped), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemOomCgroup, utilmetric.MetricData{Value: float64(mem.BpfMemStat.OomCnt), Time: &updateTime})
+		// m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemScaleFactorCgroup, utilmetric.MetricData{Value: general.UInt64PointerToFloat64(mem.WatermarkScaleFactor), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemPgstealCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.Pgsteal), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemPgscanCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.Pgscan), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemWorkingsetRefaultCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.WorkingsetRefault), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemWorkingsetActivateCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.WorkingsetActivate), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemPsiAvg60Cgroup, utilmetric.MetricData{Value: mem.MemPressure.Some.Avg60, Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemActiveAnonCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.ActiveAnon), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemInactiveAnonCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.InactiveAnon), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemActiveFileCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.ActiveFile), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemInactiveFileCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.InactiveFile), Time: &updateTime})
+		m.writer.SetCgroupMetric(cgroupPath, consts.MetricMemMappedCgroup, utilmetric.MetricData{Value: float64(mem.MemStats.FileMapped), Time: &updateTime})
 	}
 }
 
@@ -1085,6 +1101,11 @@ func (m *MalachiteMetricsProvisioner) processCgroupNetData(cgroupPath string, cg
 }
 
 func (m *MalachiteMetricsProvisioner) processCgroupPerNumaMemoryData(cgroupPath string, cgStats *malachitetypes.MalachiteCgroupInfo) {
+	processor := cgroupMetricProcessor{writer: m.metricStore}
+	processor.processCgroupPerNumaMemoryData(cgroupPath, cgStats)
+}
+
+func (m *cgroupMetricProcessor) processCgroupPerNumaMemoryData(cgroupPath string, cgStats *malachitetypes.MalachiteCgroupInfo) {
 	if cgStats == nil {
 		return
 	}
@@ -1100,9 +1121,9 @@ func (m *MalachiteMetricsProvisioner) processCgroupPerNumaMemoryData(cgroupPath 
 				klog.ErrorS(err, "failed to parse numa", "str", numaIDStr)
 				continue
 			}
-			m.metricStore.SetCgroupNumaMetric(cgroupPath, numaID, consts.MetricsMemTotalPerNumaCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(data.HierarchicalTotal << pageShift)})
-			m.metricStore.SetCgroupNumaMetric(cgroupPath, numaID, consts.MetricsMemFilePerNumaCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(data.HierarchicalFile << pageShift)})
-			m.metricStore.SetCgroupNumaMetric(cgroupPath, numaID, consts.MetricsMemAnonPerNumaCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(data.HierarchicalAnon << pageShift)})
+			m.writer.SetCgroupNumaMetric(cgroupPath, numaID, consts.MetricsMemTotalPerNumaCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(data.HierarchicalTotal << pageShift)})
+			m.writer.SetCgroupNumaMetric(cgroupPath, numaID, consts.MetricsMemFilePerNumaCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(data.HierarchicalFile << pageShift)})
+			m.writer.SetCgroupNumaMetric(cgroupPath, numaID, consts.MetricsMemAnonPerNumaCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(data.HierarchicalAnon << pageShift)})
 		}
 	} else if cgStats.CgroupType == "V2" && cgStats.V2 != nil {
 		numaStats := cgStats.V2.Memory.MemNumaStats
@@ -1116,9 +1137,9 @@ func (m *MalachiteMetricsProvisioner) processCgroupPerNumaMemoryData(cgroupPath 
 				continue
 			}
 			total := data.Anon + data.File + data.Unevictable
-			m.metricStore.SetCgroupNumaMetric(cgroupPath, numaID, consts.MetricsMemTotalPerNumaCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(total)})
-			m.metricStore.SetCgroupNumaMetric(cgroupPath, numaID, consts.MetricsMemFilePerNumaCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(data.File)})
-			m.metricStore.SetCgroupNumaMetric(cgroupPath, numaID, consts.MetricsMemAnonPerNumaCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(data.Anon)})
+			m.writer.SetCgroupNumaMetric(cgroupPath, numaID, consts.MetricsMemTotalPerNumaCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(total)})
+			m.writer.SetCgroupNumaMetric(cgroupPath, numaID, consts.MetricsMemFilePerNumaCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(data.File)})
+			m.writer.SetCgroupNumaMetric(cgroupPath, numaID, consts.MetricsMemAnonPerNumaCgroup, utilmetric.MetricData{Time: &updateTime, Value: float64(data.Anon)})
 		}
 	}
 }

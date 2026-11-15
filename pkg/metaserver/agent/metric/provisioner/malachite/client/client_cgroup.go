@@ -17,6 +17,7 @@ limitations under the License.
 package client
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -29,7 +30,13 @@ import (
 )
 
 func (c *MalachiteClient) GetCgroupStats(cgroupPath string) (*types.MalachiteCgroupInfo, error) {
-	cgroupStatsRaw, err := c.getCgroupStats(cgroupPath)
+	return c.GetCgroupStatsWithContext(context.Background(), cgroupPath)
+}
+
+// GetCgroupStatsWithContext shares the existing decoder and observations while
+// allowing whole-workload collection to honor its caller's deadline.
+func (c *MalachiteClient) GetCgroupStatsWithContext(ctx context.Context, cgroupPath string) (*types.MalachiteCgroupInfo, error) {
+	cgroupStatsRaw, err := c.getCgroupStats(ctx, cgroupPath)
 	if err != nil {
 		return nil, err
 	}
@@ -83,7 +90,7 @@ func (c *MalachiteClient) GetCgroupStats(cgroupPath string) (*types.MalachiteCgr
 	return cgroupInfo, nil
 }
 
-func (c *MalachiteClient) getCgroupStats(cgroupPath string) ([]byte, error) {
+func (c *MalachiteClient) getCgroupStats(ctx context.Context, cgroupPath string) ([]byte, error) {
 	c.RLock()
 	defer c.RUnlock()
 
@@ -92,7 +99,7 @@ func (c *MalachiteClient) getCgroupStats(cgroupPath string) ([]byte, error) {
 		return nil, fmt.Errorf("no url for %v", CgroupResource)
 	}
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to http.NewRequest, url: %s, err %s", url, err)
 	}

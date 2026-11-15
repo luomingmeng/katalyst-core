@@ -27,20 +27,30 @@ import (
 )
 
 // GetPodMetric returns the value of a pod-level metric.
-// And the value of a pod-level metric is calculated by summing the metric values for all containers in that pod.
+// Ordinary Pods are aggregated from containers; whole-workload projections use
+// MetricsReader.GetPodMetric without falling back on unavailable metrics.
 func GetPodMetric(metricsFetcher types.MetricsFetcher, emitter metrics.MetricEmitter, pod *v1.Pod, metricName string, numaID int) (float64, error) {
 	if pod == nil {
 		return 0, errors.New("nil pod")
 	}
 
 	var podMetricValue float64
-	for _, container := range pod.Spec.Containers {
-		containerMetricValue, err := GetContainerMetric(metricsFetcher, emitter, string(pod.UID), container.Name, metricName, numaID)
+	data, handled, err := metricsFetcher.GetPodMetric(pod, metricName, numaID)
+	if handled {
 		if err != nil {
 			return 0, err
 		}
+		podMetricValue = data.Value
+	}
+	if !handled {
+		for _, container := range pod.Spec.Containers {
+			containerMetricValue, err := GetContainerMetric(metricsFetcher, emitter, string(pod.UID), container.Name, metricName, numaID)
+			if err != nil {
+				return 0, err
+			}
 
-		podMetricValue += containerMetricValue
+			podMetricValue += containerMetricValue
+		}
 	}
 
 	_ = emitter.StoreFloat64(metricsNamePodMetric, podMetricValue, metrics.MetricTypeNameRaw,

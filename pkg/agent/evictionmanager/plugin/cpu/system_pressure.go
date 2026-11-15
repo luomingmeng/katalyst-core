@@ -203,13 +203,19 @@ func (s *SystemPressureEvictionPlugin) collectMetrics(ctx context.Context) {
 
 	podAggregatedNodeMetrics := make(map[string]float64)
 	filteredGuaranteedPodsMetrics := make(map[string]float64)
+	unavailablePodMetrics := sets.NewString()
 
 	// If we are in NodeMetric mode and there are excluded pods, we also need to collect metrics for the excluded guaranteed pods
 	// so we can subtract them from the node metrics
 	if dynamicConfig.SystemEvictionMetricMode == evictionconfig.NodeMetric && len(excludedPods) > 0 {
 		for _, pod := range excludedPods {
 			for _, bound := range boundaries {
-				metricData := s.metaServer.AggregatePodMetric([]*v1.Pod{pod}, bound.PodMetricName, metric.AggregatorSum, metric.DefaultContainerMetricFilter)
+				metricData, err := s.getPodMetric(pod, bound.PodMetricName)
+				if err != nil {
+					unavailablePodMetrics.Insert(bound.PodMetricName)
+					general.Errorf("get pod metric %s failed: %v", bound.PodMetricName, err)
+					continue
+				}
 				filteredGuaranteedPodsMetrics[bound.NodeMetricName] += metricData.Value
 			}
 		}
@@ -217,7 +223,15 @@ func (s *SystemPressureEvictionPlugin) collectMetrics(ctx context.Context) {
 
 	for _, pod := range podList {
 		for _, metricName := range metricsToCollectForPods.UnsortedList() {
-			metricData := s.metaServer.AggregatePodMetric([]*v1.Pod{pod}, metricName, metric.AggregatorSum, metric.DefaultContainerMetricFilter)
+			metricData, err := s.getPodMetric(pod, metricName)
+			if err != nil {
+				if dynamicConfig.SystemEvictionMetricMode == evictionconfig.PodAggregatedMetric {
+					unavailablePodMetrics.Insert(metricName)
+				}
+				general.Errorf("get pod metric %s failed: %v", metricName, err)
+				_ = s.emitter.StoreInt64(FetchMetricFailed, 1, metrics.MetricTypeNameCount, metrics.MetricTag{Key: "metric", Val: metricName})
+				continue
+			}
 
 			snapshot := &cpuutil.MetricSnapshot{
 				Info: cpuutil.MetricInfo{
@@ -241,6 +255,9 @@ func (s *SystemPressureEvictionPlugin) collectMetrics(ctx context.Context) {
 
 	// Fetch Node Metrics
 	for _, bound := range boundaries {
+		if unavailablePodMetrics.Has(bound.PodMetricName) {
+			continue // do not publish a partial Sandbox sum or exclusion adjustment
+		}
 		var metricVal float64
 		if dynamicConfig.SystemEvictionMetricMode == evictionconfig.NodeMetric {
 			nodeMetric, err := s.metaServer.MetricsFetcher.GetNodeMetric(bound.NodeMetricName)
@@ -265,6 +282,16 @@ func (s *SystemPressureEvictionPlugin) collectMetrics(ctx context.Context) {
 		general.Infof("collectMetrics, metricName: %v, metricVal: %v, capacity: %v, ratio: %.3f",
 			bound.NodeMetricName, metricVal, capacity, metricVal/float64(capacity))
 	}
+}
+
+// Keep ordinary Pod aggregation unchanged; whole-workload projections must not
+// fall back to container data or contribute a zero snapshot on a read failure.
+func (s *SystemPressureEvictionPlugin) getPodMetric(pod *v1.Pod, name string) (metric.MetricData, error) {
+	data, handled, err := s.metaServer.MetricsFetcher.GetPodMetric(pod, name, -1)
+	if handled {
+		return data, err
+	}
+	return s.metaServer.AggregatePodMetric([]*v1.Pod{pod}, name, metric.AggregatorSum, metric.DefaultContainerMetricFilter), nil
 }
 
 func (s *SystemPressureEvictionPlugin) ThresholdMet(_ context.Context, _ *v1alpha1.GetThresholdMetRequest) (*v1alpha1.ThresholdMetResponse, error) {

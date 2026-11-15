@@ -54,10 +54,11 @@ func NewFakeMetricsFetcher(emitter metrics.MetricEmitter) types.MetricsFetcher {
 
 type FakeMetricsFetcher struct {
 	sync.RWMutex
-	metricStore           *metric.MetricStore
-	emitter               metrics.MetricEmitter
-	registeredMetric      []func(store *metric.MetricStore)
-	checkMetricDataExpire CheckMetricDataExpireFunc
+	metricStore             *metric.MetricStore
+	emitter                 metrics.MetricEmitter
+	registeredMetric        []func(store *metric.MetricStore)
+	checkMetricDataExpire   CheckMetricDataExpireFunc
+	podMetricTargetProvider types.PodMetricTargetProvider
 
 	hasSynced bool
 }
@@ -131,6 +132,21 @@ func (f *FakeMetricsFetcher) GetContainerNumaMetrics(podUID, containerName, metr
 		}
 	}
 	return numaMetrics, err
+}
+
+// SetPodMetricTargetProvider explicitly selects whole-workload targets for tests.
+// Without a provider, GetPodMetric preserves ordinary container fallback.
+func (f *FakeMetricsFetcher) SetPodMetricTargetProvider(provider types.PodMetricTargetProvider) {
+	f.Lock()
+	defer f.Unlock()
+	f.podMetricTargetProvider = provider
+}
+
+func (f *FakeMetricsFetcher) GetPodMetric(p *v1.Pod, metricName string, numaID int) (metric.MetricData, bool, error) {
+	f.RLock()
+	provider := f.podMetricTargetProvider
+	f.RUnlock()
+	return getPodMetric(provider, f.metricStore, f.checkMetricDataExpire, p, metricName, numaID)
 }
 
 func (f *FakeMetricsFetcher) GetPodVolumeMetric(podUID, volumeName, metricName string) (metric.MetricData, error) {

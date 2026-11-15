@@ -37,6 +37,101 @@ import (
 	utilmetric "github.com/kubewharf/katalyst-core/pkg/util/metric"
 )
 
+func TestContainerAndCgroupMetricsPreserveDistinctSemantics(t *testing.T) {
+	t.Parallel()
+	for _, version := range []string{"V1", "V2"} {
+		version := version
+		t.Run(version, func(t *testing.T) {
+			t.Parallel()
+			for _, disableTaskLoad := range []bool{false, true} {
+				store := utilmetric.NewMetricStore()
+				m := &MalachiteMetricsProvisioner{metricStore: store, baseConf: &global.BaseConfiguration{MalachiteConfiguration: &global.MalachiteConfiguration{DisableCGroupV2TaskLoadMetrics: disableTaskLoad}}, cpuToNumaMap: map[int]int{0: 0}}
+				stats := &malachitetypes.MalachiteCgroupInfo{CgroupType: version}
+				for round := int64(1); round <= 2; round++ {
+					updated := int64(100) + round
+					if version == "V1" {
+						stats.V1 = &malachitetypes.MalachiteCgroupV1Info{
+							Cpu:    &malachitetypes.CPUCgDataV1{CPUUsageRatio: 2.5, CPUUserUsageRatio: 1.5, CPUSysUsageRatio: 1, TaskNrRunning: 4, TaskNrUninterruptible: 5, TaskNrIoWait: 6, Load: malachitetypes.Load{One: 7, Five: 8, Fifteen: 9}, CfsQuotaUs: 200000, CfsPeriodUs: 100000, Cycles: uint64(round) * 200, Instructions: uint64(round) * 100, PercpuUsage: []uint64{uint64(round) * 1000000000}, UpdateTime: updated},
+							Memory: &malachitetypes.MemoryCgDataV1{MemoryUsageInBytes: 100, TotalRss: 60, TotalCache: 30, TotalShmem: 10, Rss: 1, Cache: 2, Shmem: 3, Dirty: 4, TotalDirty: 40, Pgfault: uint64(round), TotalPgfault: uint64(round) * 10, UpdateTime: updated, NumaStats: []malachitetypes.NumaStatsV1{{NumaName: "N0", Total: 1, File: 2, Anon: 3, HierarchicalTotal: 10, HierarchicalFile: 20, HierarchicalAnon: 30}}},
+						}
+					} else {
+						stats.V2 = &malachitetypes.MalachiteCgroupV2Info{
+							Cpu:    &malachitetypes.CPUCgDataV2{CPUUsageRatio: 2.5, CPUUserUsageRatio: 1.5, CPUSysUsageRatio: 1, TaskNrRunning: 4, TaskNrUninterruptible: 5, TaskNrIoWait: 6, Load: malachitetypes.Load{One: 7, Five: 8, Fifteen: 9}, Max: 200000, MaxPeriod: 100000, Cycles: uint64(round) * 200, Instructions: uint64(round) * 100, PercpuUsage: []uint64{uint64(round) * 1000000000}, UpdateTime: updated},
+							Memory: &malachitetypes.MemoryCgDataV2{MemoryUsageInBytes: 100, MemStats: malachitetypes.MemStatsV2{Anon: 60, File: 30, Shmem: 10, Pgfault: uint64(round)}, UpdateTime: updated, MemNumaStats: map[string]malachitetypes.NumaStatsV2{"N0": {Anon: 3, File: 2, Unevictable: 1}}},
+						}
+					}
+					m.processContainerCPUData("pod", "container", stats)
+					m.processContainerMemoryData("pod", "container", stats)
+					m.processContainerPerNumaMemoryData("pod", "container", stats)
+					m.processCgroupCPUData("/static", stats)
+					m.processCgroupMemoryData("/static", stats)
+					m.processCgroupPerNumaMemoryData("/static", stats)
+					for name, value := range map[string]float64{
+						consts.MetricCPUUsageContainer: 2.5, consts.MetricCPUUsageUserContainer: 1.5, consts.MetricCPUUsageSysContainer: 1,
+						consts.MetricMemUsageContainer: 100, consts.MetricMemRssContainer: 60, consts.MetricMemCacheContainer: 30, consts.MetricMemShmemContainer: 10,
+					} {
+						container, err := store.GetContainerMetric("pod", "container", name)
+						assert.NoError(t, err)
+						assert.Equal(t, value, container.Value)
+						assert.Equal(t, updated, container.Time.Unix())
+						cgroup, err := store.GetCgroupMetric("/static", strings.TrimSuffix(name, consts.MetricContainerSuffix)+consts.MetricCgroupSuffix)
+						assert.NoError(t, err)
+						assert.Equal(t, container, cgroup)
+					}
+					for name, value := range map[string]float64{consts.MetricCPUNrRunnableContainer: 4, consts.MetricCPUNrUninterruptibleContainer: 5, consts.MetricCPUNrIOWaitContainer: 6, consts.MetricLoad1MinContainer: 7, consts.MetricLoad5MinContainer: 8, consts.MetricLoad15MinContainer: 9} {
+						container, err := store.GetContainerMetric("pod", "container", name)
+						if version == "V2" && disableTaskLoad {
+							assert.Error(t, err)
+						} else {
+							assert.NoError(t, err)
+							assert.Equal(t, value, container.Value)
+						}
+						cgroup, err := store.GetCgroupMetric("/static", strings.TrimSuffix(name, consts.MetricContainerSuffix)+consts.MetricCgroupSuffix)
+						assert.NoError(t, err)
+						assert.Equal(t, value, cgroup.Value)
+					}
+					ratio, err := store.GetContainerMetric("pod", "container", consts.MetricCPUUsageRatioContainer)
+					assert.NoError(t, err)
+					assert.Equal(t, 1.25, ratio.Value)
+					if round == 2 {
+						cpi, err := store.GetContainerMetric("pod", "container", consts.MetricCPUCPIContainer)
+						assert.NoError(t, err)
+						assert.Equal(t, float64(2), cpi.Value)
+						rate, err := store.GetContainerNumaMetric("pod", "container", 0, consts.MetricsCPUUsageNUMAContainer)
+						assert.NoError(t, err)
+						assert.Equal(t, float64(1), rate.Value)
+					}
+					local, err := store.GetContainerNumaMetric("pod", "container", 0, consts.MetricsMemTotalPerNumaContainer)
+					assert.NoError(t, err)
+					hierarchical, err := store.GetCgroupNumaMetric("/static", 0, consts.MetricsMemTotalPerNumaCgroup)
+					assert.NoError(t, err)
+					if version == "V1" {
+						assert.Equal(t, float64(1<<pageShift), local.Value)
+						assert.Equal(t, float64(10<<pageShift), hierarchical.Value)
+						localDirty, err := store.GetContainerMetric("pod", "container", consts.MetricMemDirtyContainer)
+						assert.NoError(t, err)
+						assert.Equal(t, float64(4), localDirty.Value)
+						totalDirty, err := store.GetCgroupMetric("/static", consts.MetricMemDirtyCgroup)
+						assert.NoError(t, err)
+						assert.Equal(t, float64(40), totalDirty.Value)
+						faults, err := store.GetContainerMetric("pod", "container", consts.MetricMemPgfaultContainer)
+						assert.NoError(t, err)
+						assert.Equal(t, float64(round), faults.Value)
+						totalFaults, err := store.GetCgroupMetric("/static", consts.MetricMemPgfaultCgroup)
+						assert.NoError(t, err)
+						assert.Equal(t, float64(round*10), totalFaults.Value)
+					} else {
+						assert.Equal(t, float64(6), local.Value)
+						assert.Equal(t, local, hierarchical)
+					}
+					_, err = store.GetPodMetric("pod", "/static", 1, consts.MetricMemRssCgroup, -1)
+					assert.Error(t, err)
+				}
+			}
+		})
+	}
+}
+
 func Test_noneExistMetricsProvisioner(t *testing.T) {
 	t.Parallel()
 

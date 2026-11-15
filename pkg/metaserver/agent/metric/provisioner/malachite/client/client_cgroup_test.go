@@ -17,6 +17,7 @@ limitations under the License.
 package client
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -91,6 +92,28 @@ var (
 func init() {
 	subSystemGroupsV1Data, _ = json.Marshal(subSystemGroupsV1)
 	subSystemGroupsV2Data, _ = json.Marshal(subSystemGroupsV2)
+}
+
+func TestGetCgroupStatsHonorsCancellation(t *testing.T) {
+	t.Parallel()
+	entered := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	c := NewMalachiteClient(&pod.PodFetcherStub{}, metrics.DummyMetrics{})
+	c.SetURL(map[string]string{CgroupResource: server.URL})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.GetCgroupStatsWithContext(ctx, "/target")
+		done <- err
+	}()
+	<-entered
+	cancel()
+	assert.Error(t, <-done)
 }
 
 func TestGetCgroupStats(t *testing.T) {
