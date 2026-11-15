@@ -65,7 +65,7 @@ func (r *ruleBasedKiller) Name() string {
 	return KillerNameRuleBasedKiller
 }
 
-func (r *ruleBasedKiller) Evict(ctx context.Context, pod *v1.Pod, gracePeriodSeconds int64, reason, plugin string) error {
+func (r *ruleBasedKiller) selectKiller(pod *v1.Pod) (Killer, error) {
 	killer := r.defaultKiller
 	for _, rule := range r.rules {
 		matched, ruleKiller := rule.Match(pod)
@@ -73,11 +73,19 @@ func (r *ruleBasedKiller) Evict(ctx context.Context, pod *v1.Pod, gracePeriodSec
 			continue
 		}
 		if ruleKiller == nil {
-			return fmt.Errorf("killer rule %q matched nil killer", rule.Name())
+			return nil, fmt.Errorf("killer rule %q matched nil killer", rule.Name())
 		}
 		killer = ruleKiller
 		break
 	}
 
+	return killer, nil
+}
+
+func (r *ruleBasedKiller) Evict(ctx context.Context, pod *v1.Pod, gracePeriodSeconds int64, reason, plugin string) error {
+	killer, err := r.selectKiller(pod)
+	if err != nil {
+		return err
+	}
 	return killer.Evict(ctx, pod, gracePeriodSeconds, reason, plugin)
 }

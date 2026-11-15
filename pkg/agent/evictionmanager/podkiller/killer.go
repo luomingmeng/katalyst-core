@@ -57,6 +57,14 @@ type Killer interface {
 	Evict(ctx context.Context, pod *v1.Pod, gracePeriodSeconds int64, reason, plugin string) error
 }
 
+// FixedSourceKiller resolves a queued target only through its own source.
+// Resolution errors must not fall back to another source or execution backend.
+// This binds lookup and execution, not business eligibility or runtime stop state.
+type FixedSourceKiller interface {
+	Killer
+	ResolveEvictionTarget(ctx context.Context, target *v1.Pod) (*v1.Pod, error)
+}
+
 // DummyKiller is a stub implementation for Killer interface.
 type DummyKiller struct{}
 

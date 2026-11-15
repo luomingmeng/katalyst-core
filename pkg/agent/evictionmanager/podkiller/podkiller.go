@@ -147,6 +147,8 @@ type evictPodInfo struct {
 	Pod    *v1.Pod
 	Reason string
 	Plugin string
+	// Only fixed-source backends are bound here; ordinary backends are selected by the worker.
+	Killer FixedSourceKiller
 }
 
 func getEvictPodInfo(rp *rule.RuledEvictPod) *evictPodInfo {
@@ -204,29 +206,54 @@ func (a *AsynchronizedPodKiller) EvictPod(rp *rule.RuledEvictPod) error {
 		return fmt.Errorf("getGracefulDeletionPeriod for pod: %s/%s failed with error: %v", rp.Pod.Namespace, rp.Pod.Name, err)
 	}
 	podKey := podKeyFunc(rp.Pod.Namespace, rp.Pod.Name, string(rp.Pod.UID))
+	info := getEvictPodInfo(rp)
+	selected := false
+	for {
+		a.Lock()
+		if a.processingPods[podKey] != nil {
+			var minOne int64 = math.MaxInt64
+			for recordedGracePeriod, recorded := range a.processingPods[podKey] {
+				// A shorter grace request must not replace an already bound backend.
+				if recorded.Killer != nil {
+					info.Killer = recorded.Killer
+					info.Pod = recorded.Pod
+				}
+				if recordedGracePeriod < minOne {
+					minOne = recordedGracePeriod
+				}
+			}
 
-	a.Lock()
-	if a.processingPods[podKey] != nil {
-		var minOne int64 = math.MaxInt64
-		for recordedGracePeriod := range a.processingPods[podKey] {
-			if recordedGracePeriod < minOne {
-				minOne = recordedGracePeriod
+			if gracePeriod >= minOne {
+				a.Unlock()
+				klog.Infof("[asynchronous] pod: %s/%s is being processed with smaller grace period, skip it", rp.Pod.Namespace, rp.Pod.Name)
+				return nil
 			}
 		}
 
-		if gracePeriod >= minOne {
+		if info.Killer == nil && !selected {
+			// Rules may call external code. Select outside the queue lock, then
+			// recheck deduplication and any binding committed while selecting.
 			a.Unlock()
-			klog.Infof("[asynchronous] pod: %s/%s is being processed with smaller grace period, skip it", rp.Pod.Namespace, rp.Pod.Name)
-			return nil
+			killer := a.killer
+			if router, ok := killer.(*ruleBasedKiller); ok {
+				killer, err = router.selectKiller(info.Pod)
+			}
+			info.Killer, _ = killer.(FixedSourceKiller)
+			selected = true
+			continue
 		}
-	}
+		if info.Killer == nil && err != nil {
+			a.Unlock()
+			return err
+		}
+		if a.processingPods[podKey] == nil {
+			a.processingPods[podKey] = make(map[int64]*evictPodInfo)
+		}
 
-	if a.processingPods[podKey] == nil {
-		a.processingPods[podKey] = make(map[int64]*evictPodInfo)
+		a.processingPods[podKey][gracePeriod] = info
+		a.Unlock()
+		break
 	}
-
-	a.processingPods[podKey][gracePeriod] = getEvictPodInfo(rp)
-	a.Unlock()
 
 	a.queue.AddRateLimited(evictionKeyFunc(podKey, gracePeriod))
 	return nil
@@ -316,6 +343,27 @@ func (a *AsynchronizedPodKiller) sync(key string) (retError error, requeue bool)
 			a.Unlock()
 		}
 	}()
+
+	a.RLock()
+	info := a.processingPods[podKey][gracePeriodSeconds]
+	a.RUnlock()
+	if info == nil {
+		return fmt.Errorf("[asynchronous] evict pod can't be found by podKey: %s and gracePeriodSeconds: %d", podKey, gracePeriodSeconds), false
+	}
+	if info.Killer != nil {
+		ctx := context.Background()
+		pod, err := info.Killer.ResolveEvictionTarget(ctx, info.Pod.DeepCopy())
+		if err != nil {
+			return err, true
+		}
+		if pod == nil || pod.UID != info.Pod.UID || pod.Name != info.Pod.Name || pod.Namespace != info.Pod.Namespace {
+			return fmt.Errorf("fixed-source eviction target identity changed"), true
+		}
+		// TODO: distinguish request outcomes from stop confirmation before enabling
+		// automated retries; source binding does not establish retry safety.
+		err = info.Killer.Evict(ctx, pod, gracePeriodSeconds, info.Reason, info.Plugin)
+		return err, err != nil
+	}
 
 	// todo: actually, this function is safe enough without comparing with pod uid
 	//  if the same pod is created just after the last one exists
