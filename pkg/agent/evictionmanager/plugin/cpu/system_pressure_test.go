@@ -18,6 +18,7 @@ package cpu
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -77,6 +78,111 @@ func makeMetaServer() *metaserver.MetaServer {
 				},
 			},
 		},
+	}
+}
+
+type wholeWorkloadCPUReader struct {
+	*metric.FakeMetricsFetcher
+	targetUID types.UID
+	readErr   error
+}
+
+func (f *wholeWorkloadCPUReader) GetPodMetric(p *v1.Pod, name string, numaID int) (utilMetric.MetricData, bool, error) {
+	if p.UID != f.targetUID {
+		return utilMetric.MetricData{}, false, nil
+	}
+	return utilMetric.MetricData{Value: 7}, true, f.readErr
+}
+
+func TestCPUSystemPressureReadsWholeWorkload(t *testing.T) {
+	t.Parallel()
+	for _, failure := range []bool{false, true} {
+		conf := config.NewConfiguration()
+		dyn := conf.GetDynamicConfiguration().EvictionConfiguration.CPUSystemPressureEvictionPluginConfiguration
+		dyn.MetricRingSize = 10
+		dyn.EnableCPUSystemEviction = true
+		dyn.SystemEvictionMetricMode = evictionconfig.PodAggregatedMetric
+		dyn.SystemLoadUpperBoundRatio = 0.8
+		dyn.SystemUsageUpperBoundRatio = 0.8
+		base := metric.NewFakeMetricsFetcher(metrics.DummyMetrics{}).(*metric.FakeMetricsFetcher)
+		reader := &wholeWorkloadCPUReader{FakeMetricsFetcher: base, targetUID: "target"}
+		if failure {
+			reader.readErr = errors.New("sample unavailable")
+		}
+		target := &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: "target"}, Spec: v1.PodSpec{Containers: []v1.Container{{Name: "one"}, {Name: "two"}}}, Status: v1.PodStatus{Phase: v1.PodRunning}}
+		ordinary := &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: "ordinary"}, Spec: v1.PodSpec{Containers: []v1.Container{{Name: "one"}, {Name: "missing"}}}, Status: v1.PodStatus{Phase: v1.PodRunning}}
+		old := time.Now().Add(-2 * time.Minute)
+		for _, name := range []string{consts.MetricCPUUsageContainer, consts.MetricLoad1MinContainer} {
+			base.SetContainerMetric("target", "one", name, utilMetric.MetricData{Value: 99})
+			base.SetContainerMetric("target", "two", name, utilMetric.MetricData{Value: 99})
+			base.SetContainerMetric("ordinary", "one", name, utilMetric.MetricData{Value: 3, Time: &old})
+		}
+		meta := makeMetaServer()
+		meta.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{target, ordinary}}
+		meta.MetricsFetcher = reader
+		plugin := NewCPUSystemPressureEvictionPlugin(nil, nil, meta, metrics.DummyMetrics{}, conf).(*SystemPressureEvictionPlugin)
+		plugin.collectMetrics(context.Background())
+		for _, name := range []string{consts.MetricCPUUsageContainer, consts.MetricLoad1MinContainer} {
+			if failure {
+				assert.Nil(t, plugin.podMetricsHistory[name]["target"])
+			} else {
+				assert.Equal(t, float64(7), plugin.podMetricsHistory[name]["target"].Queue[0].Info.Value)
+			}
+			assert.Equal(t, float64(3), plugin.podMetricsHistory[name]["ordinary"].Queue[0].Info.Value)
+		}
+		for _, name := range []string{consts.MetricCPUUsageSystem, consts.MetricLoad1MinSystem} {
+			if failure {
+				assert.Nil(t, plugin.nodeMetricsHistory[name])
+			} else {
+				assert.Equal(t, float64(10), plugin.nodeMetricsHistory[name].Queue[0].Info.Value)
+			}
+		}
+	}
+}
+
+func TestCPUSystemPressureNodeMetricWholeWorkload(t *testing.T) {
+	t.Parallel()
+	for _, excluded := range []bool{false, true} {
+		for _, failure := range []bool{false, true} {
+			conf := config.NewConfiguration()
+			dyn := conf.GetDynamicConfiguration().CPUSystemPressureEvictionPluginConfiguration
+			dyn.EnableCPUSystemEviction = true
+			dyn.SystemEvictionMetricMode = evictionconfig.NodeMetric
+			dyn.SystemUsageUpperBoundRatio = 0.8
+			dyn.MetricRingSize = 10
+			dyn.CheckCPUManager = excluded
+			base := metric.NewFakeMetricsFetcher(metrics.DummyMetrics{}).(*metric.FakeMetricsFetcher)
+			base.SetNodeMetric(consts.MetricCPUUsageSystem, utilMetric.MetricData{Value: 20})
+			reader := &wholeWorkloadCPUReader{FakeMetricsFetcher: base, targetUID: "target"}
+			if failure {
+				reader.readErr = errors.New("sample unavailable")
+			}
+			target := &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: "target"}, Spec: v1.PodSpec{Containers: []v1.Container{{Name: "one"}}}, Status: v1.PodStatus{Phase: v1.PodRunning}}
+			if excluded {
+				resources := v1.ResourceList{v1.ResourceCPU: resource.MustParse("2"), v1.ResourceMemory: resource.MustParse("1Gi")}
+				target.Spec.Containers[0].Resources = v1.ResourceRequirements{Requests: resources, Limits: resources.DeepCopy()}
+				target.Status.QOSClass = v1.PodQOSGuaranteed
+			}
+			base.SetContainerMetric("target", "one", consts.MetricCPUUsageContainer, utilMetric.MetricData{Value: 99})
+			meta := makeMetaServer()
+			meta.MetricsFetcher = reader
+			meta.PodFetcher = &pod.PodFetcherStub{PodList: []*v1.Pod{target}}
+			meta.KubeletConfigFetcher = &fakeKubeletConfigFetcher{config: &native.KubeletConfiguration{CPUManagerPolicy: "static"}}
+			plugin := NewCPUSystemPressureEvictionPlugin(nil, nil, meta, metrics.DummyMetrics{}, conf).(*SystemPressureEvictionPlugin)
+			plugin.collectMetrics(context.Background())
+			if excluded && failure {
+				assert.Nil(t, plugin.nodeMetricsHistory[consts.MetricCPUUsageSystem])
+				continue
+			}
+			expected := float64(20)
+			if excluded {
+				expected -= 7
+			}
+			assert.Equal(t, expected, plugin.nodeMetricsHistory[consts.MetricCPUUsageSystem].Queue[0].Info.Value)
+			if !excluded && failure {
+				assert.Nil(t, plugin.podMetricsHistory[consts.MetricCPUUsageContainer]["target"])
+			}
+		}
 	}
 }
 

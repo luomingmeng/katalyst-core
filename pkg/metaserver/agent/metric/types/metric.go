@@ -83,6 +83,11 @@ type MetricsReader interface {
 	// GetContainerNumaMetrics get metrics of container for all numas
 	GetContainerNumaMetrics(podUID, containerName, metricName string) (map[int]metric.MetricData, error)
 
+	// GetPodMetric selects whole-workload metrics. handled=false leaves ordinary
+	// container aggregation to the caller. handled=true includes unsupported and
+	// unavailable metrics; neither may fall back to container aggregation.
+	GetPodMetric(pod *v1.Pod, metricName string, numaID int) (metric.MetricData, bool, error)
+
 	// GetPodVolumeMetric get metric of pod volume.
 	GetPodVolumeMetric(podUID, volumeName, metricName string) (metric.MetricData, error)
 

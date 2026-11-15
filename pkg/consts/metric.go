@@ -28,6 +28,12 @@ const (
 	Delta = ".delta"
 )
 
+// Metric name suffixes identify storage scope, not collection capability.
+const (
+	MetricContainerSuffix = ".container"
+	MetricCgroupSuffix    = ".cgroup"
+)
+
 // System compute metrics
 const (
 	MetricCPUTotalSystem = "cpu.total.system"

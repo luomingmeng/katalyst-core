@@ -271,6 +271,7 @@ type MetricsFetcherImpl struct {
 	checkMetricDataExpire  CheckMetricDataExpireFunc
 
 	defaultInterval time.Duration
+	podFetcher      pod.PodFetcher
 	provisioners    map[string]types.MetricsProvisioner
 	intervals       map[string]time.Duration
 }
@@ -305,6 +306,7 @@ func NewMetricsFetcher(baseConf *global.BaseConfiguration,
 		checkMetricDataExpire:  checkMetricDataExpireFunc(metricConf.MetricInsurancePeriod),
 
 		defaultInterval: metricConf.DefaultInterval,
+		podFetcher:      podFetcher,
 		provisioners:    provisioners,
 		intervals:       intervals,
 	}
