@@ -3522,6 +3522,15 @@ func (p *CPUSetTopologyPlugin) pendingProtectionScopes(
 			aggregated[pending.PodUID] = pending
 			continue
 		}
+		// Union must not erase an exact container's obligation when another
+		// container classifies the same logical CPU as shared-projectable.
+		exact := current.CPUs.Difference(current.projectionCPUs)
+		pendingExact := pending.CPUs.Difference(pending.projectionCPUs)
+		if !exact.Intersection(pending.projectionCPUs).IsEmpty() ||
+			!pendingExact.Intersection(current.projectionCPUs).IsEmpty() {
+			return nil, fmt.Errorf("%w: pod=%q shared and exact pending CPUs overlap",
+				topology.ErrInvalidPendingProtection, pending.PodUID)
+		}
 		current.CPUs = current.CPUs.Union(pending.CPUs)
 		if current.ScopeRel == "" {
 			current.ScopeRel = pending.ScopeRel
