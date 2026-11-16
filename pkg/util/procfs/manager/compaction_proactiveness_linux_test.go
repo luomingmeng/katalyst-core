@@ -2,7 +2,7 @@
 // +build linux
 
 /*
-Copyright 2026 The Katalyst Authors.
+Copyright 2022 The Katalyst Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -31,14 +31,14 @@ func TestVMCompactionProactivenessReadAndWrite(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "parameter")
 	for _, value := range []int32{0, 20, 100} {
-		require.NoError(t, os.WriteFile(path, []byte("20"), 0600))
+		require.NoError(t, os.WriteFile(path, []byte("20"), 0o600))
 		require.NoError(t, WriteVMCompactionProactivenessAtPath(path, value))
 		actual, err := ReadVMCompactionProactivenessAtPath(path)
 		require.NoError(t, err)
 		require.Equal(t, value, actual)
 	}
 	for _, text := range []string{"", "invalid", "1.5", "-1", "101", "4294967296", "9223372036854775808"} {
-		require.NoError(t, os.WriteFile(path, []byte(text), 0600))
+		require.NoError(t, os.WriteFile(path, []byte(text), 0o600))
 		_, err := ReadVMCompactionProactivenessAtPath(path)
 		require.Error(t, err, text)
 	}
@@ -47,7 +47,7 @@ func TestVMCompactionProactivenessReadAndWrite(t *testing.T) {
 func TestVMCompactionProactivenessRejectsBeforeWriting(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "parameter")
-	require.NoError(t, os.WriteFile(path, []byte("20"), 0600))
+	require.NoError(t, os.WriteFile(path, []byte("20"), 0o600))
 	for _, value := range []int32{-1, 101} {
 		require.Error(t, WriteVMCompactionProactivenessAtPath(path, value))
 		actual, err := os.ReadFile(path)
@@ -64,7 +64,7 @@ func TestVMCompactionProactivenessNeverCreatesOrTruncates(t *testing.T) {
 	require.True(t, os.IsNotExist(err))
 	_, err = ReadVMCompactionProactivenessAtPath(path)
 	require.Error(t, err)
-	require.NoError(t, os.WriteFile(path, []byte("20\n   \n"), 0600))
+	require.NoError(t, os.WriteFile(path, []byte("20\n   \n"), 0o600))
 	require.NoError(t, WriteVMCompactionProactivenessAtPath(path, 0))
 	actual, err := os.ReadFile(path)
 	require.NoError(t, err)
