@@ -1,5 +1,21 @@
 //go:build linux
+// +build linux
 
+/*
+Copyright 2022 The Katalyst Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
 package compaction
 
 import (
@@ -12,7 +28,27 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestNUMACompactionNeverCreatesOrTruncatesKnob(t *testing.T) {
+	t.Parallel()
+	serializeCompactionTest(t)
+	root := t.TempDir()
+	oldPath := hostMemNodePath
+	hostMemNodePath = filepath.Join(root, "node")
+	t.Cleanup(func() { hostMemNodePath = oldPath })
+	path := filepath.Join(root, "node0", "compact")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	require.ErrorIs(t, setHostMemCompact(0), os.ErrNotExist)
+	_, err := os.Stat(path)
+	require.ErrorIs(t, err, os.ErrNotExist)
+	require.NoError(t, os.WriteFile(path, []byte("suffix"), 0o600))
+	require.NoError(t, setHostMemCompact(0))
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, "1uffix", string(data))
+}
+
 func TestDifferentNUMACompactionsRemainIndependent(t *testing.T) {
+	t.Parallel()
 	serializeCompactionTest(t)
 	require.True(t, tryAcquireNumaCompacting(0))
 	defer releaseNumaCompacting(0)
@@ -22,6 +58,7 @@ func TestDifferentNUMACompactionsRemainIndependent(t *testing.T) {
 }
 
 func TestGlobalCompactionReleasesGuardAfterPanic(t *testing.T) {
+	t.Parallel()
 	serializeCompactionTest(t)
 	withFakeProcFS(t)
 	oldFn := CompactMemoryNodeFn
@@ -39,6 +76,7 @@ func TestGlobalCompactionReleasesGuardAfterPanic(t *testing.T) {
 }
 
 func TestGlobalCompactionMissingKnobIsNotCreated(t *testing.T) {
+	t.Parallel()
 	serializeCompactionTest(t)
 	root := withFakeProcFS(t)
 	path := filepath.Join(root, "sys/vm/compact_memory")
@@ -51,6 +89,7 @@ func TestGlobalCompactionMissingKnobIsNotCreated(t *testing.T) {
 }
 
 func TestGlobalCompactionWritesProcOnce(t *testing.T) {
+	t.Parallel()
 	serializeCompactionTest(t)
 	root := withFakeProcFS(t)
 	path := filepath.Join(root, "sys/vm/compact_memory")
@@ -66,6 +105,7 @@ func TestGlobalCompactionWritesProcOnce(t *testing.T) {
 }
 
 func TestGlobalCompactionExcludesNUMAWrites(t *testing.T) {
+	t.Parallel()
 	serializeCompactionTest(t)
 	withFakeProcFS(t)
 	oldFn := CompactMemoryNodeFn
@@ -92,6 +132,7 @@ func TestGlobalCompactionExcludesNUMAWrites(t *testing.T) {
 }
 
 func TestGlobalCompactionBlockedByNUMAWrite(t *testing.T) {
+	t.Parallel()
 	serializeCompactionTest(t)
 	withFakeProcFS(t)
 	require.True(t, tryAcquireNumaCompacting(1))
@@ -102,6 +143,7 @@ func TestGlobalCompactionBlockedByNUMAWrite(t *testing.T) {
 }
 
 func TestGlobalCompactionChecksAllKcompactd(t *testing.T) {
+	t.Parallel()
 	serializeCompactionTest(t)
 	root := withFakeProcFS(t)
 	writeFakeProc(t, root, 100, "kcompactd0", "S (sleeping)")
@@ -115,6 +157,7 @@ func TestGlobalCompactionChecksAllKcompactd(t *testing.T) {
 }
 
 func TestCompactNUMANodeResult(t *testing.T) {
+	t.Parallel()
 	serializeCompactionTest(t)
 	root := withFakeProcFS(t)
 	writeFakeProc(t, root, 100, "kcompactd0", "S (sleeping)")
@@ -143,6 +186,7 @@ func TestCompactNUMANodeResult(t *testing.T) {
 }
 
 func TestCompactNUMANodeReleasesGuardAfterPanic(t *testing.T) {
+	t.Parallel()
 	serializeCompactionTest(t)
 	withFakeProcFS(t)
 	oldFn := CompactMemoryNodeFn

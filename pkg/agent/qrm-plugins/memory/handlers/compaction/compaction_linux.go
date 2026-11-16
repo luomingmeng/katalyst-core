@@ -111,19 +111,19 @@ func releaseNumaCompacting(numaID int) {
 func setHostMemCompact(node int) error {
 	targetFile := hostMemNodePath + strconv.Itoa(node) + "/compact"
 	if node == GlobalNUMAID {
-		// Kernel knobs must already exist. Never create a regular-file substitute.
-		file, err := os.OpenFile(filepath.Join(ProcFSRoot, "sys/vm/compact_memory"), os.O_WRONLY, 0)
-		if err != nil {
-			return err
-		}
-		_, writeErr := file.WriteString("1")
-		closeErr := file.Close()
-		if writeErr != nil {
-			return writeErr
-		}
-		return closeErr
+		targetFile = filepath.Join(ProcFSRoot, "sys/vm/compact_memory")
 	}
-	return os.WriteFile(targetFile, []byte("1"), 0o644)
+	// Both kernel knobs must already exist; never create or truncate a substitute.
+	file, err := os.OpenFile(targetFile, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	_, writeErr := file.WriteString("1")
+	closeErr := file.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	return closeErr
 }
 
 func calculateTHPOrder(basePageSize int, thpSize uint64) (int, error) {

@@ -293,6 +293,7 @@ func TestSetHostMemCompact(t *testing.T) {
 
 	nodePath := hostMemNodePath + "0"
 	require.NoError(t, os.Mkdir(nodePath, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(nodePath, "compact"), nil, 0o600))
 	require.NoError(t, setHostMemCompact(0))
 	content, err := os.ReadFile(filepath.Join(nodePath, "compact"))
 	require.NoError(t, err)
