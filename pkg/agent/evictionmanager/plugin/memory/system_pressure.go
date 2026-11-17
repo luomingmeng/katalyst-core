@@ -20,11 +20,13 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 	"strconv"
 	"sync"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/events"
@@ -74,7 +76,9 @@ func NewSystemPressureEvictionPlugin(_ *client.GenericClientSet, _ events.EventR
 		qosConf:                   conf.QoSConfiguration,
 		reclaimedPodFilter:        conf.CheckReclaimedQoSForPod,
 		evictionHelper:            NewEvictionHelper(emitter, metaServer, conf),
-		workloadPath:              conf.WorkloadPath,
+		workloadPaths:             append([]string(nil), conf.WorkloadPaths...),
+		readPSI:                   cgroupmgr.GetMemoryPressureWithAbsolutePath,
+		statCgroup:                os.Stat,
 		memSomeThreshold:          conf.MemPressureSomeThreshold,
 		memFullThreshold:          conf.MemPressureFullThreshold,
 		memPressureDuration:       conf.MemPressureDuration,
@@ -108,12 +112,14 @@ type SystemPressureEvictionPlugin struct {
 	kswapdStealRateExceedStartTime *time.Time
 	lastEvictionTime               time.Time
 
-	// memory pressure protection
-	workloadMemHighPressureHitThresAt time.Time
-	workloadPath                      string
-	memSomeThreshold                  int
-	memFullThreshold                  int
-	memPressureDuration               int
+	// PSI state is scoped to the actual cgroup root, not the object source.
+	workloadPaths       []string
+	workloadPSIStates   map[string]workloadPSIState
+	readPSI             func(string, common.PressureType) (*common.MemoryPressure, error)
+	statCgroup          func(string) (os.FileInfo, error)
+	memSomeThreshold    int
+	memFullThreshold    int
+	memPressureDuration int
 }
 
 func (s *SystemPressureEvictionPlugin) Name() string {
@@ -173,10 +179,13 @@ func (s *SystemPressureEvictionPlugin) detectSystemPressures(_ context.Context) 
 	s.isUnderSystemPressure = false
 	s.systemAction = actionNoop
 
-	err = s.detectSystemWatermarkPressure()
+	errs := []error{s.detectSystemWatermarkPressure()}
 	if common.CheckCgroup2UnifiedMode() {
-		err = s.detectWorkloadMemPSI()
+		errs = append(errs, s.detectWorkloadMemPSI())
+	} else {
+		s.workloadPSIStates = nil
 	}
+	err = utilerrors.NewAggregate(errs)
 
 	switch s.systemAction {
 	case actionReclaimedEviction:
@@ -217,89 +226,6 @@ func (s *SystemPressureEvictionPlugin) detectSystemWatermarkPressure() error {
 	if free < threshold {
 		s.isUnderSystemPressure = true
 		s.systemAction = actionReclaimedEviction
-	}
-	return nil
-}
-
-func (s *SystemPressureEvictionPlugin) detectWorkloadMemPSI() error {
-	workloadPath := s.workloadPath
-	memSomeThreshold := s.memSomeThreshold
-	memFullThreshold := s.memFullThreshold
-	duration := s.memPressureDuration
-
-	pressure, err := cgroupmgr.GetMemoryPressureWithAbsolutePath(workloadPath, common.SOME)
-	if err != nil {
-		general.Errorf("detectWorkloadMemPSI error: %v", err)
-		s.workloadMemHighPressureHitThresAt = time.Time{}
-		return err
-	}
-
-	now := time.Now()
-	if pressure.Avg10 >= uint64(memSomeThreshold) {
-		// calculate the mem.pressure of high qos jobs.
-		ctx := context.Background()
-		podList, err := s.metaServer.GetPodList(ctx, native.PodIsActive)
-		if err != nil {
-			general.Errorf("get pod list failed: %v", err)
-			return err
-		}
-
-		var totalAvg10, avgAvg10, count, pressureCount uint64
-		for _, pod := range podList {
-			if pod == nil {
-				continue
-			}
-
-			qosLevel, err := s.qosConf.GetQoSLevelForPod(pod)
-			if err != nil {
-				general.Errorf("get qos level failed for pod %+v/%+v, skip check rss overuse, err: %v", pod.Namespace, pod.Name, err)
-				continue
-			}
-
-			if !s.supportedQosLevels.Has(qosLevel) {
-				continue
-			}
-
-			podUID := string(pod.UID)
-			absPath, err := common.GetPodAbsCgroupPath(common.CgroupSubsysMemory, podUID)
-			if err != nil {
-				continue
-			}
-			memPressure, err := cgroupmgr.GetMemoryPressureWithAbsolutePath(absPath, common.SOME)
-			if err != nil {
-				continue
-			}
-			if memPressure.Avg10 > minMemPressure {
-				pressureCount++
-			}
-			totalAvg10 += memPressure.Avg10
-			count++
-		}
-
-		if pressureCount < minPods {
-			return nil
-		}
-		if count > 0 {
-			avgAvg10 = totalAvg10 / count
-		}
-
-		if avgAvg10 >= uint64(memFullThreshold) {
-			if s.workloadMemHighPressureHitThresAt.IsZero() {
-				s.workloadMemHighPressureHitThresAt = now
-			}
-			diff := now.Sub(s.workloadMemHighPressureHitThresAt).Seconds()
-			general.Infof("Detect high mem.pressure: psi=%v, time=%v, dur=%v.", avgAvg10, s.workloadMemHighPressureHitThresAt, uint64(diff))
-			if uint64(diff) >= uint64(duration) {
-				s.isUnderSystemPressure = true
-				s.systemAction = actionReclaimedEviction
-			}
-			if uint64(diff) >= uint64(duration*3) {
-				s.systemAction = actionEviction
-			}
-			general.Infof("Trigger action:%v, thresholdMet: psi=%+v, duration=%+v", s.systemAction, avgAvg10, uint64(diff))
-		}
-	} else {
-		s.workloadMemHighPressureHitThresAt = time.Time{}
 	}
 	return nil
 }
