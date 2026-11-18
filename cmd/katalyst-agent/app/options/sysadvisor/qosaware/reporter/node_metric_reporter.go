@@ -29,6 +29,7 @@ import (
 // NodeMetricReporterOptions holds the configurations for node metric reporter in qos aware plugin
 type NodeMetricReporterOptions struct {
 	DisableGroupMetric      bool
+	IncludeShmem            bool
 	SyncPeriod              time.Duration
 	MetricSlidingWindowTime time.Duration
 	AggregateFuncs          map[string]string
@@ -55,6 +56,8 @@ func NewNodeMetricReporterOptions() *NodeMetricReporterOptions {
 func (o *NodeMetricReporterOptions) AddFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&o.DisableGroupMetric, "node-metric-reporter-disable-group-metric", o.DisableGroupMetric,
 		"Skip QoS group metric collection and reporting while retaining node metrics")
+	fs.BoolVar(&o.IncludeShmem, "node-metric-reporter-include-shmem", o.IncludeShmem,
+		"Add resident shmem back to node and NUMA memory usage before aggregation; enable only when the metric source excludes shmem")
 	fs.DurationVar(&o.SyncPeriod, "node-metric-reporter-sync-period", o.SyncPeriod,
 		"period for node metric reporter to sync node metrics")
 	fs.DurationVar(&o.MetricSlidingWindowTime, "node-metric-reporter-sliding-window", o.MetricSlidingWindowTime,
@@ -68,6 +71,7 @@ func (o *NodeMetricReporterOptions) AddFlags(fs *pflag.FlagSet) {
 // ApplyTo fills up config with options
 func (o *NodeMetricReporterOptions) ApplyTo(c *reporter.NodeMetricReporterConfiguration) error {
 	c.DisableGroupMetric = o.DisableGroupMetric
+	c.IncludeShmem = o.IncludeShmem
 	c.SyncPeriod = o.SyncPeriod
 	c.MetricSlidingWindowTime = o.MetricSlidingWindowTime
 	for name, f := range o.AggregateFuncs {
