@@ -24,6 +24,8 @@ import (
 
 // NodeMetricReporterConfiguration stores configurations of node metric reporter in qos aware plugin
 type NodeMetricReporterConfiguration struct {
+	// DisableGroupMetric skips QoS group collection and reporting, retaining node metrics.
+	DisableGroupMetric      bool
 	SyncPeriod              time.Duration
 	MetricSlidingWindowTime time.Duration
 	AggregateFuncs          map[v1.ResourceName]string

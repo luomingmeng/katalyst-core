@@ -31,6 +31,7 @@ import (
 	katalyst_base "github.com/kubewharf/katalyst-core/cmd/base"
 	"github.com/kubewharf/katalyst-core/cmd/katalyst-agent/app/options"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/metacache"
+	advisortypes "github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent"
@@ -86,6 +87,27 @@ func generateTestMetaCache(t *testing.T, conf *config.Configuration, metricsRead
 	require.NoError(t, err)
 	require.NotNil(t, metaCache)
 	return metaCache
+}
+
+func TestQoSAwareWithNodeMetricReporter(t *testing.T) {
+	t.Parallel()
+	conf := generateTestConfiguration(t, t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir())
+	conf.Reporters = append(conf.Reporters, "node_metric_reporter")
+	conf.NodeMetricReporterConfiguration.DisableGroupMetric = true
+	metaServer := generateTestMetaServer(t, conf)
+	metaCache := generateTestMetaCache(t, conf, metaServer.MetricsFetcher)
+	p, err := NewQoSAwarePlugin("test-qos-aware-plugin", conf, nil, metricspool.DummyMetricsEmitterPool{}, metaServer, metaCache)
+	require.NoError(t, err)
+	qap := p.(*QoSAwarePlugin)
+	require.Len(t, qap.reporters, 2)
+	require.Equal(t, []string{"headroom_reporter", "node_metric_reporter"}, conf.Reporters)
+	require.Equal(t, []string{"cpu", "memory"}, conf.QRMServers)
+	require.Equal(t, []string{"cpu", "memory"}, conf.ResourceAdvisors)
+	require.NotNil(t, qap.qrmServer)
+	_, err = qap.resourceAdvisor.GetSubAdvisor(advisortypes.QoSResourceCPU)
+	require.NoError(t, err)
+	_, err = qap.resourceAdvisor.GetSubAdvisor(advisortypes.QoSResourceMemory)
+	require.NoError(t, err)
 }
 
 func TestQoSAwarePlugin(t *testing.T) {
