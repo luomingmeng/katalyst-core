@@ -190,6 +190,14 @@ func TestNodeMetricReporterWithoutGroupMetrics(t *testing.T) {
 }
 
 func TestNodeMetricReportingToCNR(t *testing.T) {
+	for _, includeShmem := range []bool{false, true} {
+		t.Run(fmt.Sprintf("includeShmem=%t", includeShmem), func(t *testing.T) {
+			testNodeMetricReportingToCNR(t, includeShmem)
+		})
+	}
+}
+
+func testNodeMetricReportingToCNR(t *testing.T, includeShmem bool) {
 	regDir, ckDir, stateDir, err := tmpDirs()
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -200,6 +208,7 @@ func TestNodeMetricReportingToCNR(t *testing.T) {
 	conf := generateTestConfiguration(t, regDir, ckDir, stateDir)
 	conf.NodeMetricReporterConfiguration.DisableGroupMetric = true
 	conf.NodeMetricReporterConfiguration.MetricSlidingWindowTime = conf.NodeMetricReporterConfiguration.SyncPeriod
+	conf.NodeMetricReporterConfiguration.IncludeShmem = includeShmem
 	conf.AgentReporters = []string{util.CNRGroupVersionKind.Kind}
 	oldTime := metav1.NewTime(time.Now().Add(-time.Hour))
 	original := &nodeapis.CustomNodeResource{
@@ -216,10 +225,12 @@ func TestNodeMetricReportingToCNR(t *testing.T) {
 	metaServer := generateTestMetaServer(clients, conf)
 	metricsFetcher := metaServer.MetricsFetcher.(*metric.FakeMetricsFetcher)
 	metricsFetcher.SetNodeMetric(consts.MetricMemUsedSystem, utilmetric.MetricData{Value: 200 << 30})
+	metricsFetcher.SetNodeMetric(consts.MetricMemShmemSystem, utilmetric.MetricData{Value: 8 << 30})
 	metricsFetcher.SetNodeMetric(consts.MetricCPUUsageRatio, utilmetric.MetricData{Value: 0.5})
 	for numaID := 0; numaID < metaServer.NumNUMANodes; numaID++ {
 		metricsFetcher.SetNumaMetric(numaID, consts.MetricMemUsedNuma, utilmetric.MetricData{Value: 50 << 30})
 		metricsFetcher.SetNumaMetric(numaID, consts.MetricMemFilepageNuma, utilmetric.MetricData{Value: 10 << 30})
+		metricsFetcher.SetNumaMetric(numaID, consts.MetricMemShmemNuma, utilmetric.MetricData{Value: 2 << 30})
 		metricsFetcher.SetNumaMetric(numaID, consts.MetricCPUUsageNuma, utilmetric.MetricData{Value: 2})
 	}
 	resourcereporter.RegisterReporterInitializer(util.CNRGroupVersionKind, cnrreporter.NewCNRReporter)
@@ -267,8 +278,136 @@ func TestNodeMetricReportingToCNR(t *testing.T) {
 	}, 5*time.Second, 20*time.Millisecond)
 	require.Equal(t, original.Labels, observed.Labels)
 	require.Nil(t, observed.Status.NodeMetricStatus.GroupMetric)
-	require.Equal(t, int64(200<<30), observed.Status.NodeMetricStatus.NodeMetric.GenericUsage.Memory().Value())
+	wantNodeMemory, wantNUMAMemory := int64(200<<30), int64(40<<30)
+	if includeShmem {
+		wantNodeMemory += 8 << 30
+		wantNUMAMemory += 2 << 30
+	}
+	require.Equal(t, wantNodeMemory, observed.Status.NodeMetricStatus.NodeMetric.GenericUsage.Memory().Value())
 	require.Len(t, observed.Status.NodeMetricStatus.NodeMetric.NUMAUsage, metaServer.NumNUMANodes)
+	for _, numa := range observed.Status.NodeMetricStatus.NodeMetric.NUMAUsage {
+		require.Equal(t, wantNUMAMemory, numa.Usage.Memory().Value())
+	}
+}
+
+func TestNodeMetricIncludeShmem(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		enabled       bool
+		omitNodeShmem bool
+		omitNUMAShmem bool
+		shmem         float64
+		wantNodeGiB   int64
+		wantNUMAGiB   int64
+		wantFailure   bool
+	}{
+		{name: "default excludes shmem", shmem: 8 << 30, wantNodeGiB: 200, wantNUMAGiB: 40},
+		{name: "disabled does not require shmem", omitNodeShmem: true, omitNUMAShmem: true, wantNodeGiB: 200, wantNUMAGiB: 40},
+		{name: "enabled includes resident shmem", enabled: true, shmem: 8 << 30, wantNodeGiB: 208, wantNUMAGiB: 42},
+		{name: "zero shmem is valid", enabled: true, wantNodeGiB: 200, wantNUMAGiB: 40},
+		{name: "missing node shmem keeps old status", enabled: true, omitNodeShmem: true, shmem: 8 << 30, wantFailure: true},
+		{name: "missing NUMA shmem keeps old status", enabled: true, omitNUMAShmem: true, shmem: 8 << 30, wantFailure: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			regDir, ckDir, stateDir, err := tmpDirs()
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				_ = os.RemoveAll(regDir)
+				_ = os.RemoveAll(ckDir)
+				_ = os.RemoveAll(stateDir)
+			})
+			conf := generateTestConfiguration(t, regDir, ckDir, stateDir)
+			conf.NodeMetricReporterConfiguration.DisableGroupMetric = true
+			conf.NodeMetricReporterConfiguration.IncludeShmem = tc.enabled
+			conf.NodeMetricReporterConfiguration.MetricSlidingWindowTime = conf.NodeMetricReporterConfiguration.SyncPeriod
+			metaServer := generateTestMetaServer(generateTestGenericClientSet(nil, nil), conf)
+			f := metric.NewFakeMetricsFetcher(metrics.DummyMetrics{}).(*metric.FakeMetricsFetcher)
+			metaServer.MetricsFetcher = f
+			f.SetNodeMetric(consts.MetricMemUsedSystem, utilmetric.MetricData{Value: 200 << 30})
+			f.SetNodeMetric(consts.MetricCPUUsageRatio, utilmetric.MetricData{Value: 0.5})
+			if !tc.omitNodeShmem {
+				f.SetNodeMetric(consts.MetricMemShmemSystem, utilmetric.MetricData{Value: tc.shmem})
+			}
+			for numaID := 0; numaID < metaServer.NumNUMANodes; numaID++ {
+				f.SetNumaMetric(numaID, consts.MetricMemUsedNuma, utilmetric.MetricData{Value: 50 << 30})
+				f.SetNumaMetric(numaID, consts.MetricMemFilepageNuma, utilmetric.MetricData{Value: 10 << 30})
+				f.SetNumaMetric(numaID, consts.MetricCPUUsageNuma, utilmetric.MetricData{Value: 2})
+				if !tc.omitNUMAShmem || numaID != 0 {
+					f.SetNumaMetric(numaID, consts.MetricMemShmemNuma, utilmetric.MetricData{Value: tc.shmem / 4 * float64(numaID+1)})
+				}
+			}
+			r, err := NewNodeMetricsReporter(metrics.DummyMetrics{}, metaServer, nil, conf)
+			require.NoError(t, err)
+			p := r.(*nodeMetricsReporterImpl).GenericPlugin.(*skeleton.PluginRegistrationWrapper).GenericPlugin.(*nodeMetricsReporterPlugin)
+			old := &nodeapis.NodeMetricStatus{UpdateTime: metav1.NewTime(time.Now().Add(-time.Hour))}
+			p.nodeMetricStatus = old
+			p.updateNodeMetrics()
+			if tc.wantFailure {
+				require.Same(t, old, p.nodeMetricStatus)
+				return
+			}
+			resp, err := p.GetReportContent(context.Background(), &v1alpha1.Empty{})
+			require.NoError(t, err)
+			var status nodeapis.NodeMetricStatus
+			require.NoError(t, json.Unmarshal(resp.Content[0].Field[0].Value, &status))
+			require.True(t, status.UpdateTime.After(old.UpdateTime.Time))
+			require.Equal(t, tc.wantNodeGiB<<30, status.NodeMetric.GenericUsage.Memory().Value())
+			require.Equal(t, int64(8000), status.NodeMetric.GenericUsage.Cpu().MilliValue())
+			require.Len(t, status.NodeMetric.NUMAUsage, metaServer.NumNUMANodes)
+			for _, numa := range status.NodeMetric.NUMAUsage {
+				want := tc.wantNUMAGiB << 30
+				if tc.enabled {
+					want += int64(tc.shmem / 4 * float64(numa.NUMAId))
+				}
+				require.Equal(t, want, numa.Usage.Memory().Value())
+				require.Equal(t, int64(2000), numa.Usage.Cpu().MilliValue())
+			}
+			// Correction is confined to the reporter, not the shared metric store.
+			raw, err := f.GetNodeMetric(consts.MetricMemUsedSystem)
+			require.NoError(t, err)
+			require.Equal(t, float64(200<<30), raw.Value)
+		})
+	}
+}
+
+func TestNodeMetricShmemBeforeAggregation(t *testing.T) {
+	regDir, ckDir, stateDir, err := tmpDirs()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = os.RemoveAll(regDir)
+		_ = os.RemoveAll(ckDir)
+		_ = os.RemoveAll(stateDir)
+	})
+	conf := generateTestConfiguration(t, regDir, ckDir, stateDir)
+	conf.NodeMetricReporterConfiguration.IncludeShmem = true
+	conf.NodeMetricReporterConfiguration.MetricSlidingWindowTime = 2 * conf.NodeMetricReporterConfiguration.SyncPeriod
+	conf.NodeMetricReporterConfiguration.AggregateFuncs[corev1.ResourceMemory] = "perc"
+	conf.NodeMetricReporterConfiguration.AggregateArgs[corev1.ResourceMemory] = "95"
+	metaServer := generateTestMetaServer(generateTestGenericClientSet(nil, nil), conf)
+	f := metaServer.MetricsFetcher.(*metric.FakeMetricsFetcher)
+	r, err := NewNodeMetricsReporter(metrics.DummyMetrics{}, metaServer, nil, conf)
+	require.NoError(t, err)
+	p := r.(*nodeMetricsReporterImpl).GenericPlugin.(*skeleton.PluginRegistrationWrapper).GenericPlugin.(*nodeMetricsReporterPlugin)
+	// Anti-correlated samples distinguish P95(usage + shmem) from
+	// P95(usage) + P95(shmem), and from adding only the latest shmem.
+	for i, sample := range []struct{ used, shmem float64 }{{100 << 30, 1 << 30}, {1 << 30, 100 << 30}} {
+		f.SetNodeMetric(consts.MetricMemUsedSystem, utilmetric.MetricData{Value: sample.used})
+		f.SetNodeMetric(consts.MetricMemShmemSystem, utilmetric.MetricData{Value: sample.shmem})
+		f.SetNumaMetric(0, consts.MetricMemUsedNuma, utilmetric.MetricData{Value: sample.used + (10 << 30)})
+		f.SetNumaMetric(0, consts.MetricMemFilepageNuma, utilmetric.MetricData{Value: 10 << 30})
+		f.SetNumaMetric(0, consts.MetricMemShmemNuma, utilmetric.MetricData{Value: sample.shmem})
+		nodeMemory, nodeErr := p.getNodeMemoryUsage()
+		numaMemory, numaErr := p.getNodeNUMAMemoryUsage(0)
+		if i == 0 {
+			require.Error(t, nodeErr)
+			require.Error(t, numaErr)
+			continue
+		}
+		require.NoError(t, nodeErr)
+		require.NoError(t, numaErr)
+		require.Equal(t, int64(101<<30), nodeMemory.Value())
+		require.Equal(t, int64(101<<30), numaMemory.Value())
+	}
 }
 
 func TestNodeMetricUpdate(t *testing.T) {

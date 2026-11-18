@@ -25,7 +25,10 @@ import (
 // NodeMetricReporterConfiguration stores configurations of node metric reporter in qos aware plugin
 type NodeMetricReporterConfiguration struct {
 	// DisableGroupMetric skips QoS group collection and reporting, retaining node metrics.
-	DisableGroupMetric      bool
+	DisableGroupMetric bool
+	// IncludeShmem adds resident shmem back to node and NUMA memory usage before aggregation.
+	// Leave disabled for metric sources that already include shmem in memory usage.
+	IncludeShmem            bool
 	SyncPeriod              time.Duration
 	MetricSlidingWindowTime time.Duration
 	AggregateFuncs          map[v1.ResourceName]string

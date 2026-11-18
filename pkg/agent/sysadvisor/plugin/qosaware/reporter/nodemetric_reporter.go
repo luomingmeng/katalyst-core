@@ -110,6 +110,7 @@ type nodeMetricsReporterPlugin struct {
 
 	stop               chan struct{}
 	disableGroupMetric bool
+	includeShmem       bool
 	syncPeriod         time.Duration
 	metricAggregators  metricAggregators
 	smoothWindowOpts   map[v1.ResourceName]general.SmoothWindowOpts
@@ -125,6 +126,7 @@ func newNodeMetricsReporterPlugin(emitter metrics.MetricEmitter, metaServer *met
 		emitter:            emitter,
 		qosConf:            conf.QoSConfiguration,
 		disableGroupMetric: conf.NodeMetricReporterConfiguration.DisableGroupMetric,
+		includeShmem:       conf.NodeMetricReporterConfiguration.IncludeShmem,
 		syncPeriod:         conf.NodeMetricReporterConfiguration.SyncPeriod,
 		metricAggregators:  map[string]general.SmoothWindow{},
 		smoothWindowOpts: map[v1.ResourceName]general.SmoothWindowOpts{
@@ -597,7 +599,15 @@ func (p *nodeMetricsReporterPlugin) getNodeMemoryUsage() (*resource.Quantity, er
 		return nil, fmt.Errorf("failed to get MetricMemUsedSystem, err %v", err)
 	}
 
-	v := resource.NewQuantity(int64(metricMemUsed.Value), resource.BinarySI)
+	memoryUsage := metricMemUsed.Value
+	if p.includeShmem {
+		metricShmem, err := p.metaServer.GetNodeMetric(consts.MetricMemShmemSystem)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get MetricMemShmemSystem, err %v", err)
+		}
+		memoryUsage += metricShmem.Value
+	}
+	v := resource.NewQuantity(int64(memoryUsage), resource.BinarySI)
 	v = p.getAggregatedMetric(v, v1.ResourceMemory, "getNodeMemoryUsage")
 	if v == nil {
 		return nil, fmt.Errorf("failed to get enough samples for node memory")
@@ -627,7 +637,15 @@ func (p *nodeMetricsReporterPlugin) getNodeNUMAMemoryUsage(numaID int) (*resourc
 	if err != nil {
 		return nil, fmt.Errorf("failed to get MetricMemFilepageNuma of numa%v, err %v", numaID, err)
 	}
-	v := resource.NewQuantity(int64(metricNumaMemUsed.Value-metricNumaMemFile.Value), resource.BinarySI)
+	memoryUsage := metricNumaMemUsed.Value - metricNumaMemFile.Value
+	if p.includeShmem {
+		metricShmem, err := p.metaServer.GetNumaMetric(numaID, consts.MetricMemShmemNuma)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get MetricMemShmemNuma of numa%v, err %v", numaID, err)
+		}
+		memoryUsage += metricShmem.Value
+	}
+	v := resource.NewQuantity(int64(memoryUsage), resource.BinarySI)
 	v = p.getAggregatedMetric(v, v1.ResourceMemory, "getNodeNUMAMemoryUsage", strconv.Itoa(numaID))
 	if v == nil {
 		return nil, fmt.Errorf("failed to get enough samples for numa%v memory", numaID)

@@ -25,6 +25,31 @@ import (
 	reporterconfig "github.com/kubewharf/katalyst-core/pkg/config/agent/sysadvisor/qosaware/reporter"
 )
 
+func TestNodeMetricIncludeShmem(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "default preserves memory accounting"},
+		{name: "include shmem", args: []string{"--node-metric-reporter-include-shmem=true"}, want: true},
+		{name: "explicitly exclude shmem", args: []string{"--node-metric-reporter-include-shmem=false"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := NewNodeMetricReporterOptions()
+			flags := pflag.NewFlagSet(tc.name, pflag.ContinueOnError)
+			opts.AddFlags(flags)
+			require.NoError(t, flags.Parse(tc.args))
+			conf := reporterconfig.NewNodeMetricReporterConfiguration()
+			require.NoError(t, opts.ApplyTo(conf))
+			flag := flags.Lookup("node-metric-reporter-include-shmem")
+			require.NotNil(t, flag)
+			require.Equal(t, tc.want, conf.IncludeShmem)
+		})
+	}
+}
+
 func TestNodeMetricDisableGroupMetric(t *testing.T) {
 	t.Parallel()
 
