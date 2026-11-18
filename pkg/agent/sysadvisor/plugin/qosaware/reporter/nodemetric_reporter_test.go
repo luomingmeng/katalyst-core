@@ -19,7 +19,9 @@ package reporter
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"testing"
@@ -29,23 +31,29 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
 	nodeapis "github.com/kubewharf/katalyst-api/pkg/apis/node/v1alpha1"
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-api/pkg/plugins/skeleton"
 	"github.com/kubewharf/katalyst-api/pkg/protocol/reporterplugin/v1alpha1"
+	"github.com/kubewharf/katalyst-core/pkg/agent/resourcemanager/fetcher"
+	resourcereporter "github.com/kubewharf/katalyst-core/pkg/agent/resourcemanager/reporter"
+	cnrreporter "github.com/kubewharf/katalyst-core/pkg/agent/resourcemanager/reporter/cnr"
 	"github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/metacache"
 	types2 "github.com/kubewharf/katalyst-core/pkg/agent/sysadvisor/types"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	"github.com/kubewharf/katalyst-core/pkg/consts"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric/types"
+	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	metricspool "github.com/kubewharf/katalyst-core/pkg/metrics/metrics-pool"
 	"github.com/kubewharf/katalyst-core/pkg/util"
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 	utilmetric "github.com/kubewharf/katalyst-core/pkg/util/metric"
+	"github.com/kubewharf/katalyst-core/pkg/util/process"
 )
 
 func generateTestMetaCache(t *testing.T, conf *config.Configuration, metricsReader types.MetricsReader, containers ...types2.ContainerInfo) *metacache.MetaCacheImp {
@@ -97,6 +105,170 @@ func TestRunNodeMetricReporter(t *testing.T) {
 func mustParse(str string) *resource.Quantity {
 	q := resource.MustParse(str)
 	return &q
+}
+
+type unavailableGroupPodFetcher struct {
+	pod.PodFetcher
+	listCalls int
+}
+
+func (f *unavailableGroupPodFetcher) GetPodList(context.Context, func(*corev1.Pod) bool) ([]*corev1.Pod, error) {
+	f.listCalls++
+	return nil, fmt.Errorf("pod source unavailable")
+}
+
+func TestNodeMetricReporterWithoutGroupMetrics(t *testing.T) {
+	regDir, ckDir, stateDir, err := tmpDirs()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = os.RemoveAll(regDir)
+		_ = os.RemoveAll(ckDir)
+		_ = os.RemoveAll(stateDir)
+	})
+	conf := generateTestConfiguration(t, regDir, ckDir, stateDir)
+	conf.NodeMetricReporterConfiguration.DisableGroupMetric = true
+	conf.NodeMetricReporterConfiguration.MetricSlidingWindowTime = conf.NodeMetricReporterConfiguration.SyncPeriod
+	metaServer := generateTestMetaServer(generateTestGenericClientSet(nil, nil), conf)
+	podFetcher := &unavailableGroupPodFetcher{PodFetcher: metaServer.PodFetcher}
+	metaServer.PodFetcher = podFetcher
+
+	// A node-only reporter must not need container metadata or a Pod inventory.
+	r, err := NewNodeMetricsReporter(metrics.DummyMetrics{}, metaServer, nil, conf)
+	require.NoError(t, err)
+	p := r.(*nodeMetricsReporterImpl).GenericPlugin.(*skeleton.PluginRegistrationWrapper).GenericPlugin.(*nodeMetricsReporterPlugin)
+	fetcher := metaServer.MetricsFetcher.(*metric.FakeMetricsFetcher)
+	fetcher.SetNodeMetric(consts.MetricMemUsedSystem, utilmetric.MetricData{Value: 200 << 30})
+	fetcher.SetNodeMetric(consts.MetricCPUUsageRatio, utilmetric.MetricData{Value: 0.5})
+	for numaID := 0; numaID < metaServer.NumNUMANodes; numaID++ {
+		fetcher.SetNumaMetric(numaID, consts.MetricMemUsedNuma, utilmetric.MetricData{Value: 50 << 30})
+		fetcher.SetNumaMetric(numaID, consts.MetricMemFilepageNuma, utilmetric.MetricData{Value: 10 << 30})
+		fetcher.SetNumaMetric(numaID, consts.MetricCPUUsageNuma, utilmetric.MetricData{Value: 2})
+	}
+	oldTime := metav1.NewTime(time.Now().Add(-time.Hour))
+	p.nodeMetricStatus = &nodeapis.NodeMetricStatus{
+		UpdateTime:  oldTime,
+		GroupMetric: []nodeapis.GroupMetricInfo{{QoSLevel: apiconsts.PodAnnotationQoSLevelSharedCores}},
+	}
+	p.updateNodeMetrics()
+	require.Zero(t, podFetcher.listCalls)
+	resp, err := p.GetReportContent(context.Background(), &v1alpha1.Empty{})
+	require.NoError(t, err)
+	require.Len(t, resp.Content, 1)
+	require.Equal(t, &util.CNRGroupVersionKind, resp.Content[0].GroupVersionKind)
+	require.Len(t, resp.Content[0].Field, 1)
+	field := resp.Content[0].Field[0]
+	require.Equal(t, v1alpha1.FieldType_Status, field.FieldType)
+	require.Equal(t, util.CNRFieldNameNodeMetricStatus, field.FieldName)
+	var status nodeapis.NodeMetricStatus
+	require.NoError(t, json.Unmarshal(field.Value, &status))
+	require.Nil(t, status.GroupMetric)
+	require.True(t, status.UpdateTime.After(oldTime.Time))
+	require.Equal(t, int64(200<<30), status.NodeMetric.GenericUsage.Memory().Value())
+	require.Equal(t, int64(8000), status.NodeMetric.GenericUsage.Cpu().MilliValue())
+	require.Len(t, status.NodeMetric.NUMAUsage, metaServer.NumNUMANodes)
+	for _, numa := range status.NodeMetric.NUMAUsage {
+		require.Equal(t, int64(40<<30), numa.Usage.Memory().Value())
+		require.Equal(t, int64(2000), numa.Usage.Cpu().MilliValue())
+	}
+	var payload map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(field.Value, &payload))
+	require.NotContains(t, payload, "groupMetric")
+
+	// Node sampling errors must not publish a fresh timestamp or partial sample.
+	published := p.nodeMetricStatus
+	metaServer.MetricsFetcher = metric.NewFakeMetricsFetcher(metrics.DummyMetrics{})
+	p.updateNodeMetrics()
+	require.Same(t, published, p.nodeMetricStatus)
+	require.Zero(t, podFetcher.listCalls)
+	metaServer.MetricsFetcher = fetcher
+
+	// Group-enabled behavior still requires a successful Pod source.
+	p.disableGroupMetric = false
+	p.updateNodeMetrics()
+	require.Equal(t, 1, podFetcher.listCalls)
+	require.Same(t, published, p.nodeMetricStatus)
+}
+
+func TestNodeMetricReportingToCNR(t *testing.T) {
+	regDir, ckDir, stateDir, err := tmpDirs()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = os.RemoveAll(regDir)
+		_ = os.RemoveAll(ckDir)
+		_ = os.RemoveAll(stateDir)
+	})
+	conf := generateTestConfiguration(t, regDir, ckDir, stateDir)
+	conf.NodeMetricReporterConfiguration.DisableGroupMetric = true
+	conf.NodeMetricReporterConfiguration.MetricSlidingWindowTime = conf.NodeMetricReporterConfiguration.SyncPeriod
+	conf.AgentReporters = []string{util.CNRGroupVersionKind.Kind}
+	oldTime := metav1.NewTime(time.Now().Add(-time.Hour))
+	original := &nodeapis.CustomNodeResource{
+		TypeMeta:   metav1.TypeMeta{APIVersion: util.CNRGroupVersionKind.Group + "/" + util.CNRGroupVersionKind.Version, Kind: util.CNRGroupVersionKind.Kind},
+		ObjectMeta: metav1.ObjectMeta{Name: conf.NodeName, Labels: map[string]string{"existing": "retained"}},
+		Status: nodeapis.CustomNodeResourceStatus{
+			NodeMetricStatus: &nodeapis.NodeMetricStatus{
+				UpdateTime:  oldTime,
+				GroupMetric: []nodeapis.GroupMetricInfo{{QoSLevel: apiconsts.PodAnnotationQoSLevelSharedCores}},
+			},
+		},
+	}
+	clients := generateTestGenericClientSet(nil, []runtime.Object{original})
+	metaServer := generateTestMetaServer(clients, conf)
+	metricsFetcher := metaServer.MetricsFetcher.(*metric.FakeMetricsFetcher)
+	metricsFetcher.SetNodeMetric(consts.MetricMemUsedSystem, utilmetric.MetricData{Value: 200 << 30})
+	metricsFetcher.SetNodeMetric(consts.MetricCPUUsageRatio, utilmetric.MetricData{Value: 0.5})
+	for numaID := 0; numaID < metaServer.NumNUMANodes; numaID++ {
+		metricsFetcher.SetNumaMetric(numaID, consts.MetricMemUsedNuma, utilmetric.MetricData{Value: 50 << 30})
+		metricsFetcher.SetNumaMetric(numaID, consts.MetricMemFilepageNuma, utilmetric.MetricData{Value: 10 << 30})
+		metricsFetcher.SetNumaMetric(numaID, consts.MetricCPUUsageNuma, utilmetric.MetricData{Value: 2})
+	}
+	resourcereporter.RegisterReporterInitializer(util.CNRGroupVersionKind, cnrreporter.NewCNRReporter)
+	manager, err := resourcereporter.NewReporterManager(clients, metaServer, metrics.DummyMetrics{}, conf)
+	require.NoError(t, err)
+	pluginManager, err := fetcher.NewReporterPluginManager(manager, metrics.DummyMetrics{}, metaServer, conf)
+	require.NoError(t, err)
+	r, err := NewNodeMetricsReporter(metrics.DummyMetrics{}, metaServer, nil, conf)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		r.Run(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-finished
+	}()
+	socket := filepath.Join(regDir, nodeMetricsReporterPluginName+".sock")
+	conn, err := process.Dial(socket, 5*time.Second)
+	require.NoError(t, err)
+	_ = conn.Close()
+	require.NoError(t, pluginManager.RegisterPlugin(nodeMetricsReporterPluginName, socket, nil))
+	managerFinished := make(chan struct{})
+	go func() {
+		defer close(managerFinished)
+		pluginManager.Run(ctx)
+	}()
+	defer func() {
+		cancel()
+		pluginManager.DeRegisterPlugin(nodeMetricsReporterPluginName)
+		<-managerFinished
+	}()
+
+	var observed *nodeapis.CustomNodeResource
+	require.Eventually(t, func() bool {
+		observed, err = clients.InternalClient.NodeV1alpha1().CustomNodeResources().Get(ctx, conf.NodeName, metav1.GetOptions{})
+		if err != nil || observed.Status.NodeMetricStatus == nil {
+			return false
+		}
+		status := observed.Status.NodeMetricStatus
+		return status.NodeMetric != nil && status.UpdateTime.After(oldTime.Time) && len(status.GroupMetric) == 0
+	}, 5*time.Second, 20*time.Millisecond)
+	require.Equal(t, original.Labels, observed.Labels)
+	require.Nil(t, observed.Status.NodeMetricStatus.GroupMetric)
+	require.Equal(t, int64(200<<30), observed.Status.NodeMetricStatus.NodeMetric.GenericUsage.Memory().Value())
+	require.Len(t, observed.Status.NodeMetricStatus.NodeMetric.NUMAUsage, metaServer.NumNUMANodes)
 }
 
 func TestNodeMetricUpdate(t *testing.T) {

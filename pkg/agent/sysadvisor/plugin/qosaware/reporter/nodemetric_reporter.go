@@ -108,23 +108,25 @@ type nodeMetricsReporterPlugin struct {
 	emitter    metrics.MetricEmitter
 	qosConf    *generic.QoSConfiguration
 
-	stop              chan struct{}
-	syncPeriod        time.Duration
-	metricAggregators metricAggregators
-	smoothWindowOpts  map[v1.ResourceName]general.SmoothWindowOpts
+	stop               chan struct{}
+	disableGroupMetric bool
+	syncPeriod         time.Duration
+	metricAggregators  metricAggregators
+	smoothWindowOpts   map[v1.ResourceName]general.SmoothWindowOpts
 
 	nodeMetricStatus *nodeapis.NodeMetricStatus
 }
 
 func newNodeMetricsReporterPlugin(emitter metrics.MetricEmitter, metaServer *metaserver.MetaServer, metaReader metacache.MetaReader, conf *config.Configuration) (skeleton.GenericPlugin, error) {
 	reporter := &nodeMetricsReporterPlugin{
-		RWMutex:           sync.RWMutex{},
-		metaServer:        metaServer,
-		metaReader:        metaReader,
-		emitter:           emitter,
-		qosConf:           conf.QoSConfiguration,
-		syncPeriod:        conf.NodeMetricReporterConfiguration.SyncPeriod,
-		metricAggregators: map[string]general.SmoothWindow{},
+		RWMutex:            sync.RWMutex{},
+		metaServer:         metaServer,
+		metaReader:         metaReader,
+		emitter:            emitter,
+		qosConf:            conf.QoSConfiguration,
+		disableGroupMetric: conf.NodeMetricReporterConfiguration.DisableGroupMetric,
+		syncPeriod:         conf.NodeMetricReporterConfiguration.SyncPeriod,
+		metricAggregators:  map[string]general.SmoothWindow{},
 		smoothWindowOpts: map[v1.ResourceName]general.SmoothWindowOpts{
 			v1.ResourceCPU: {
 				WindowSize:    int(conf.MetricSlidingWindowTime.Seconds() / conf.NodeMetricReporterConfiguration.SyncPeriod.Seconds()),
@@ -257,9 +259,12 @@ func (p *nodeMetricsReporterPlugin) updateNodeMetrics() {
 		errList = append(errList, err)
 	}
 
-	groupMetricInfo, err := p.getGroupMetricInfo()
-	if err != nil {
-		errList = append(errList, err)
+	var groupMetricInfo []nodeapis.GroupMetricInfo
+	if !p.disableGroupMetric {
+		groupMetricInfo, err = p.getGroupMetricInfo()
+		if err != nil {
+			errList = append(errList, err)
+		}
 	}
 
 	err = errors.NewAggregate(errList)
