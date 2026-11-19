@@ -1844,12 +1844,17 @@ func (p *DynamicPolicy) Allocate(ctx context.Context,
 				respErr = fmt.Errorf("add container to qos aware server failed with error: %v", err)
 			}
 		}
+		var rollbackPersisted bool
 		if respErr != nil {
 			inplaceUpdateResizing := util.PodInplaceUpdateResizing(req)
 			var compensated *requestStateCompensatedError
 			if rollbackSnapshot != nil && !errors.As(respErr, &compensated) {
 				if err := p.rollbackAllocationState(req, *rollbackSnapshot); err != nil {
 					respErr = fmt.Errorf("%w; allocation rollback failed: %v", respErr, err)
+				} else {
+					// A changed revision was durably restored by rollback. Saving it
+					// again only prolongs the policy/execution lease after failure.
+					rollbackPersisted = p.state.GetRevision() != rollbackSnapshot.revision
 				}
 			}
 
@@ -1862,7 +1867,7 @@ func (p *DynamicPolicy) Allocate(ctx context.Context,
 			}
 			_ = p.emitter.emitter.StoreInt64(util.MetricNameAllocateFailed, 1, metrics.MetricTypeNameRaw, metricTags...)
 		}
-		if rollbackSnapshot != nil {
+		if rollbackSnapshot != nil && !rollbackPersisted {
 			if err := p.state.StoreState(); err != nil {
 				general.ErrorS(err, "store state failed", "podName", req.PodName, "containerName", req.ContainerName)
 				resp = nil

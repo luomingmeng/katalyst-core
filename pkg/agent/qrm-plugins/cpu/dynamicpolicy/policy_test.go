@@ -3549,6 +3549,62 @@ func TestAllocate(t *testing.T) {
 	}
 }
 
+func TestAllocateFailureDoesNotPersistSuccessfulRollbackTwice(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		changeState  bool
+		failRollback bool
+		wantStores   int
+	}{
+		{name: "durable rollback", changeState: true},
+		{name: "failed rollback", changeState: true, failRollback: true, wantStores: 1},
+		{name: "unchanged state", wantStores: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			topo, err := machine.GenerateDummyCPUTopology(16, 2, 4)
+			require.NoError(t, err)
+			dir := t.TempDir()
+			p, err := getTestDynamicPolicyWithInitialization(topo, dir)
+			require.NoError(t, err)
+			p.config.enableCPUAdvisor = false
+			tracking := &atomicCommitTrackingState{State: p.state}
+			if tc.failRollback {
+				tracking.commitErr = errors.New("rollback checkpoint failed")
+				// The first CAS is stale; the second is the durable rollback.
+				tracking.failCommits = 2
+			}
+			p.state = tracking
+			p.allocation.allocationHandlers[consts.PodAnnotationQoSLevelSharedCores] = func(_ context.Context, req *pluginapi.ResourceRequest, _ bool) (*pluginapi.ResourceAllocationResponse, error) {
+				if !tc.changeState {
+					return nil, errors.New("allocation failed")
+				}
+				require.NoError(t, p.state.SetAllocationInfo(req.PodUid, req.ContainerName, &state.AllocationInfo{
+					AllocationMeta: commonstate.AllocationMeta{PodUid: req.PodUid, ContainerName: req.ContainerName,
+						OwnerPoolName: commonstate.PoolNameShare, QoSLevel: consts.PodAnnotationQoSLevelSharedCores},
+					AllocationResult: machine.NewCPUSet(4), OriginalAllocationResult: machine.NewCPUSet(4), RequestQuantity: 1,
+				}, false))
+				return nil, errors.New("allocation failed")
+			}
+			_, err = p.Allocate(context.Background(), &pluginapi.ResourceRequest{
+				PodUid: "allocation", PodNamespace: "default", PodName: "allocation", ContainerName: "main",
+				ContainerType: pluginapi.ContainerType_MAIN, ResourceName: string(v1.ResourceCPU),
+				ResourceRequests: map[string]float64{string(v1.ResourceCPU): 1}, Labels: map[string]string{}, Annotations: map[string]string{},
+			})
+			require.ErrorContains(t, err, "allocation failed")
+			require.Equal(t, tc.wantStores, tracking.storeCalls)
+			if tc.failRollback {
+				require.ErrorContains(t, err, "rollback checkpoint failed")
+			} else {
+				require.Nil(t, p.state.GetAllocationInfo("allocation", "main"))
+				restored, err := getTestDynamicPolicyWithoutInitialization(topo, dir)
+				require.NoError(t, err)
+				require.Equal(t, p.state.GetPodEntries(), restored.state.GetPodEntries())
+				require.Equal(t, p.state.GetMachineState(), restored.state.GetMachineState())
+			}
+		})
+	}
+}
+
 func TestAllocateFailureRollbackDoesNotOverwriteNewerState(t *testing.T) {
 	t.Parallel()
 
