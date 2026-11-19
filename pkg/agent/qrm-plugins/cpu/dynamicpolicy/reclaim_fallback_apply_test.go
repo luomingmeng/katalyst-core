@@ -17,6 +17,7 @@ limitations under the License.
 package dynamicpolicy
 
 import (
+	"fmt"
 	"io/ioutil"
 	"os"
 	"testing"
@@ -274,6 +275,57 @@ func TestApplyPoolsRejectsEmptyEligibleNoWrite180(t *testing.T) {
 	require.Equal(t, beforeRevision, p.state.GetRevision(), "revision must not advance on empty-eligible reject")
 	require.Equal(t, beforeEntries, p.state.GetPodEntries(), "pod entries must not be written")
 	require.Equal(t, beforeMachineState, p.state.GetMachineState(), "machine state must not be written")
+}
+
+func TestEnabledNonOverlapShareReservesReclaimBeforeSoftAllocation(t *testing.T) {
+	for _, load := range []int{189, 191, 192, 193, 199} {
+		t.Run(fmt.Sprint(load), func(t *testing.T) {
+			topo, err := machine.GenerateDummyCPUTopology(192, 2, 4)
+			require.NoError(t, err)
+			dir := t.TempDir()
+			p, err := getTestDynamicPolicyWithoutInitialization(topo, dir)
+			require.NoError(t, err)
+			p.config.reservedCPUs = machine.NewCPUSet()
+			prior := machine.MustParse("47,95,143,191")
+			p.reclaim.reservedReclaimedCPUSet = prior.Clone()
+			p.reclaim.reservedReclaimedCPUsSize = 4
+			require.NoError(t, p.state.SetAllocationInfo(commonstate.PoolNameReclaim, commonstate.FakedContainerName,
+				&state.AllocationInfo{AllocationMeta: commonstate.GenerateGenericPoolAllocationMeta(commonstate.PoolNameReclaim), AllocationResult: prior}, false))
+			dyn := p.config.dynamicConfig.GetDynamicConfiguration()
+			dyn.EnableReclaim = true
+			require.NoError(t, p.state.SetAllowSharedCoresOverlapReclaimedCores(false, false))
+			require.NoError(t, p.state.SetDisableDedicatedCoresOverlapReclaimedCores(false, false))
+			before := p.state.GetRevision()
+			pools, isolated, err := p.generatePoolsAndIsolation(
+				map[string]map[int]int{commonstate.PoolNameShare: {commonstate.FakedNUMAID: load}},
+				map[string]map[string]int{}, topo.CPUDetails.CPUs(), nil,
+				generatePoolsAndIsolationOptions{enforceReclaimMinimum: true, dynamicConf: dyn})
+			require.NoError(t, err)
+			reclaim := pools[commonstate.PoolNameReclaim]
+			require.False(t, reclaim.IsEmpty())
+			if load >= 192 {
+				require.Equal(t, 2, reclaim.Size(), "saturated soft share must leave one complete SMT core")
+			}
+			require.True(t, reclaim.Intersection(pools[commonstate.PoolNameShare]).IsEmpty())
+			if load >= 192 {
+				require.Equal(t, 192-reclaim.Size(), pools[commonstate.PoolNameShare].Size())
+			} else {
+				require.Equal(t, load, pools[commonstate.PoolNameShare].Size(), "non-saturated share target must remain unchanged")
+			}
+			require.Equal(t, before, p.state.GetRevision(), "planning must not mutate committed state")
+			require.NoError(t, p.applyPoolsAndIsolatedInfo(
+				pools, isolated, p.state.GetPodEntries(), p.state.GetMachineState(),
+				sets.NewInt(), true, machine.NewCPUSet(), defaultShareMaterializationPlan{}, before, dyn))
+			committed, err := p.state.GetPodEntries().GetCPUSetForPool(commonstate.PoolNameReclaim)
+			require.NoError(t, err)
+			require.True(t, reclaim.Equals(committed))
+			require.Greater(t, p.state.GetRevision(), before)
+			restored, err := getTestDynamicPolicyWithoutInitialization(topo, dir)
+			require.NoError(t, err)
+			require.Equal(t, p.state.GetPodEntries(), restored.state.GetPodEntries())
+			require.Equal(t, p.state.GetMachineState(), restored.state.GetMachineState())
+		})
+	}
 }
 
 func wantLabel(want int) string {

@@ -4026,6 +4026,24 @@ func (p *DynamicPolicy) generatePoolsAndIsolation(
 	nonBindingAvailableSize := nonBindingAvailableCPUs.Size()
 	nonBindingPoolsTotalQuantity := general.SumUpMapValues(nonBindingPoolsQuantityMap)
 
+	// Saturated default share is a soft target, but enabled non-overlap reclaim
+	// must remain runnable. Reserve one legal core before proportional allocation
+	// instead of asking the fallback to borrow CPUs already owned by share.
+	// Keep binding, isolation, explicit floors, and non-saturated targets unchanged.
+	if enableReclaim && !allowOverlap && !strictDisjointReclaim &&
+		rampUpReclaimFloor.IsEmpty() && enforceReclaimMinimum && explicitReclaimQuantity == 0 &&
+		len(nonBindingPoolsQuantityMap) == 1 && len(isolatedQuantityMap) == 0 &&
+		nonBindingAvailableSize > 0 && nonBindingPoolsQuantityMap[commonstate.PoolNameShare] >= nonBindingAvailableSize {
+		prior, _ := p.state.GetPodEntries().GetCPUSetForPool(commonstate.PoolNameReclaim)
+		configuredReclaimMinimum, err = selectReclaimSeed(
+			p.machine.machineInfo.CPUTopology, nonBindingAvailableCPUs, prior, 0)
+		if err != nil {
+			return
+		}
+		nonBindingAvailableCPUs = nonBindingAvailableCPUs.Difference(configuredReclaimMinimum)
+		nonBindingAvailableSize = nonBindingAvailableCPUs.Size()
+	}
+
 	isolatedCPUSet = make(map[string]map[string]machine.CPUSet)
 	isolatedTotalQuantity := general.SumUpMultipleMapValues(isolatedQuantityMap)
 
