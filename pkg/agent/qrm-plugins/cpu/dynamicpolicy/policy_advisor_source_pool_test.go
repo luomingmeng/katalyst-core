@@ -519,8 +519,7 @@ func TestDynamicPolicy_allocateShareBlocks_carvesIsolationFromAllocatedSource(t 
 		},
 	}
 
-	err = p.allocateShareBlocks(
-		commonstate.FakedNUMAID,
+	err = p.allocateShareBlocksWithConstraint(commonstate.FakedNUMAID,
 		blocks,
 		blockCPUSet,
 		machine.NewCPUSet(),
@@ -529,8 +528,7 @@ func TestDynamicPolicy_allocateShareBlocks_carvesIsolationFromAllocatedSource(t 
 		nil,
 		machine.NewCPUSet(),
 		nil,
-		sourceBlockByPool,
-	)
+		sourceBlockByPool, frozenReclaimPlacementConstraint{})
 	require.NoError(t, err)
 	require.True(t, blockCPUSet["block-isolation"].IsSubsetOf(machine.NewCPUSet(0, 1, 2, 3)),
 		"isolation block should be carved from source share block, got %s",
@@ -586,8 +584,7 @@ func TestDynamicPolicy_allocateShareBlocks_sourceCarveFallbackRespectsNUMA(t *te
 		},
 	}
 
-	err = p.allocateShareBlocks(
-		0,
+	err = p.allocateShareBlocksWithConstraint(0,
 		blocks,
 		blockCPUSet,
 		cpuTopology.CPUDetails.CPUsInNUMANodes(0),
@@ -596,8 +593,7 @@ func TestDynamicPolicy_allocateShareBlocks_sourceCarveFallbackRespectsNUMA(t *te
 		nil,
 		machine.NewCPUSet(),
 		nil,
-		map[string]string{commonstate.PoolNameShare + commonstate.NUMAPoolInfix + "0": "block-share-numa0"},
-	)
+		map[string]string{commonstate.PoolNameShare + commonstate.NUMAPoolInfix + "0": "block-share-numa0"}, frozenReclaimPlacementConstraint{})
 	require.NoError(t, err)
 	require.True(t, blockCPUSet["block-isolation"].IsSubsetOf(cpuTopology.CPUDetails.CPUsInNUMANodes(0)),
 		"NUMA-bound isolation fallback should stay within NUMA0, got %s",
@@ -661,8 +657,7 @@ func TestDynamicPolicy_allocateShareBlocks_preservesRealNUMASourceResult(t *test
 		},
 	}
 
-	err = p.allocateShareBlocks(
-		0,
+	err = p.allocateShareBlocksWithConstraint(0,
 		blocks,
 		blockCPUSet,
 		cpuTopology.CPUDetails.CPUsInNUMANodes(0),
@@ -671,8 +666,7 @@ func TestDynamicPolicy_allocateShareBlocks_preservesRealNUMASourceResult(t *test
 		nil,
 		machine.NewCPUSet(),
 		nil,
-		map[string]string{sourcePoolName: "block-share-numa0"},
-	)
+		map[string]string{sourcePoolName: "block-share-numa0"}, frozenReclaimPlacementConstraint{})
 	require.NoError(t, err)
 	require.Equal(t, 4, blockCPUSet["block-share-numa0"].Size(),
 		"source block must keep its advisor result after isolation carve, got %s",
