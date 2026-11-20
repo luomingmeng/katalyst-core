@@ -418,7 +418,15 @@ func (am AllocationMap) getNumberDevices() int {
 		return 0
 	}
 
-	return len(am)
+	// AllocationMap also contains zero-capacity ownership placeholders.
+	// Ratios describe live capacity, not the number of bookkeeping entries.
+	count := 0
+	for _, allocation := range am {
+		if allocation != nil && allocation.Allocatable > 0 {
+			count++
+		}
+	}
+	return count
 }
 
 type DefaultResourceStateGeneratorRegistry struct {

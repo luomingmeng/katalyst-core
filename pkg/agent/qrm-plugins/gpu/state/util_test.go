@@ -52,7 +52,8 @@ func TestGenerateDefaultResourceState_MultiDevices(t *testing.T) {
 	state, err := generator.GenerateDefaultResourceState()
 
 	assert.NoError(t, err)
-	assert.Len(t, state, 1)
+	assert.Len(t, state, 2)
+	assert.Contains(t, state, "d1")
 	assert.Contains(t, state, "d2")
 }
 

@@ -33,6 +33,7 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager"
 
 	nodev1alpha1 "github.com/kubewharf/katalyst-api/pkg/apis/node/v1alpha1"
+	apiConsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-api/pkg/plugins/registration"
 	"github.com/kubewharf/katalyst-api/pkg/plugins/skeleton"
 	"github.com/kubewharf/katalyst-api/pkg/protocol/reporterplugin/v1alpha1"
@@ -125,6 +126,7 @@ type gpuReporterPlugin struct {
 	reportNotifyCh                  chan struct{}
 	reportRetryInterval             time.Duration
 	lastReportContent               *v1alpha1.GetReportContentResponse
+	reportGeneration                uint64
 	kubeletCheckpointManager        checkpointmanager.CheckpointManager
 	kubeletDevicePluginPath         string
 	enableKubeletCheckpointFallback bool
@@ -251,37 +253,45 @@ func (p *gpuReporterPlugin) Stop() error {
 
 // GetReportContent implements ReporterPluginServer to report the gpu device topology information to CNR.
 func (p *gpuReporterPlugin) GetReportContent(ctx context.Context, _ *v1alpha1.Empty) (*v1alpha1.GetReportContentResponse, error) {
-	p.RLock()
-	if p.lastReportContent != nil {
-		resp := p.lastReportContent
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		p.RLock()
+		if p.lastReportContent != nil {
+			resp := p.lastReportContent
+			p.RUnlock()
+			return resp, nil
+		}
+		generation := p.reportGeneration
 		p.RUnlock()
+		resp, err := p.buildReportResponse()
+		p.Lock()
+		if generation != p.reportGeneration {
+			p.Unlock()
+			continue // Trigger invalidated this build, including any stale error.
+		}
+		if err != nil {
+			p.Unlock()
+			return nil, err
+		}
+		if p.lastReportContent != nil {
+			resp = p.lastReportContent
+		} else {
+			p.lastReportContent = resp
+		}
+		p.Unlock()
 		return resp, nil
 	}
-	p.RUnlock()
-
-	resp, err := p.buildReportResponse()
-	if err != nil {
-		return nil, err
-	}
-
-	p.Lock()
-	if p.lastReportContent != nil {
-		resp = p.lastReportContent
-	} else {
-		p.lastReportContent = resp
-	}
-	p.Unlock()
-
-	return resp, nil
 }
 
 func (p *gpuReporterPlugin) buildReportResponse() (*v1alpha1.GetReportContentResponse, error) {
-	// The reporter picks the latest topology from all configured GPU devices to report to CNR.
+	// The reporter uses the union of configured names, resolving overlapping IDs by source recency.
 	topologiesMap, ok := p.deviceTopologyRegistry.GetDeviceTopologies(p.gpuDeviceNames)
 	if !ok {
 		return nil, fmt.Errorf("failed to get any device topology")
 	}
-	latestDeviceTopology, _ := machine.PickLatestDeviceTopology(topologiesMap)
+	latestDeviceTopology := state.MergeDeviceTopologies(topologiesMap)
 
 	stateImpl := p.stateGetter()
 	if stateImpl == nil {
@@ -459,6 +469,7 @@ func (p *gpuReporterPlugin) getZoneResources(topologiesMap map[string]*machine.D
 		return nil
 	}
 
+	mergedGPU := state.MergeDeviceTopologies(topologiesMap)
 	// 1. first construct temporary map from device ID to resources to merge resources for the same device
 	idToResources := make(map[string]nodev1alpha1.Resources)
 	for resourceName, allocMap := range machineState {
@@ -501,6 +512,16 @@ func (p *gpuReporterPlugin) getZoneResources(topologiesMap map[string]*machine.D
 			} else {
 				allocatableQuantity = *resource.NewQuantity(int64(allocState.Allocatable), resource.DecimalSI)
 				capacityQuantity = *resource.NewQuantity(int64(allocState.Allocatable), resource.DecimalSI)
+				// Virtual resources share the physical GPU's health gate.
+				if resourceName == apiConsts.ResourceGPUMemory || resourceName == apiConsts.ResourceMilliGPU {
+					healthy := false
+					if mergedGPU != nil {
+						healthy, _ = mergedGPU.IsDeviceHealthy(id)
+					}
+					if !healthy {
+						allocatableQuantity = zeroQuantity
+					}
+				}
 
 				resources, ok := idToResources[id]
 				if !ok {
@@ -718,7 +739,7 @@ func (p *gpuReporterPlugin) ListAndWatchReportContent(_ *v1alpha1.Empty, server 
 	var retryCh <-chan time.Time
 
 	for {
-		resp, err := p.buildReportResponse()
+		resp, err := p.GetReportContent(server.Context(), &v1alpha1.Empty{})
 		if err != nil {
 			general.Errorf("failed to build report response: %v, will retry in %s", err, p.reportRetryInterval)
 			// Start a retry timer to ensure the listwatch stream doesn't break due to intermittent failures (e.g. state/topology parsing error)
@@ -726,9 +747,7 @@ func (p *gpuReporterPlugin) ListAndWatchReportContent(_ *v1alpha1.Empty, server 
 		} else {
 			// Clear retry timer if build succeeds
 			retryCh = nil
-			p.Lock()
-			p.lastReportContent = resp
-			p.Unlock()
+			// GetReportContent publishes only a generation-valid build.
 
 			// Send report only when it's the first time or the content has changed
 			if isFirst || !proto.Equal(lastSentContent, resp) {
@@ -762,6 +781,7 @@ func (p *gpuReporterPlugin) ListAndWatchReportContent(_ *v1alpha1.Empty, server 
 // Trigger invalidates the cached report content and triggers a new report to be built and sent
 func (p *gpuReporterPlugin) Trigger() {
 	p.Lock()
+	p.reportGeneration++
 	p.lastReportContent = nil
 	p.Unlock()
 
