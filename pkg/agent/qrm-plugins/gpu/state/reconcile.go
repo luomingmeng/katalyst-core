@@ -61,6 +61,7 @@ func ReconcileMachineState(current AllocationResourcesMap, entries PodResourceEn
 			continue
 		}
 		frozen := generator
+		var topology *machine.DeviceTopology
 		if g, ok := generator.(*genericDefaultResourceStateGenerator); ok {
 			topologies := make(map[string]*machine.DeviceTopology)
 			for _, deviceName := range g.deviceNames {
@@ -68,7 +69,7 @@ func ReconcileMachineState(current AllocationResourcesMap, entries PodResourceEn
 					topologies[deviceName] = t
 				}
 			}
-			topology := MergeDeviceTopologies(topologies)
+			topology = MergeDeviceTopologies(topologies)
 			if topology == nil {
 				// Optional resources and pending discovery must not erase existing state.
 				continue
@@ -94,14 +95,7 @@ func ReconcileMachineState(current AllocationResourcesMap, entries PodResourceEn
 		}
 		// For concrete topology-backed resources, mark disappeared devices unavailable
 		// but retain allocations. Unallocated residual entries need not accumulate.
-		if g, ok := generator.(*genericDefaultResourceStateGenerator); ok {
-			topologyMap := make(map[string]*machine.DeviceTopology)
-			for _, n := range g.deviceNames {
-				if t := views[g.topologyRegistry][n]; t != nil {
-					topologyMap[n] = t
-				}
-			}
-			topology := MergeDeviceTopologies(topologyMap)
+		if topology != nil {
 			for id := range merged {
 				if _, present := topology.Devices[id]; present {
 					continue

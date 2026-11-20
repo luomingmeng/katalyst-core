@@ -203,7 +203,7 @@ func (p *VirtualGPUPlugin) calculateHints(
 ) (map[string]*pluginapi.ListOfTopologyHints, error) {
 	gpuTopology, err := state.GetMergedDeviceTopology(p.DeviceTopologyRegistry, p.Conf.GPUDeviceNames)
 	if err != nil {
-		return nil, fmt.Errorf("GetLatestDeviceTopology failed with error: %v", err)
+		return nil, fmt.Errorf("GetMergedDeviceTopology failed with error: %v", err)
 	}
 
 	// Check if milligpu is requested and handle gpuReq
@@ -654,6 +654,7 @@ func (p *VirtualGPUPlugin) GetTopologyAwareAllocatableResources(ctx context.Cont
 
 	// Get all resources to return: main resource + extra resources
 	pluginResources := p.getAllPluginResources()
+	machineState := p.GetState().GetMachineState()
 
 	// Generate allocatable resources for each resource
 	allocatableResources := make(map[string]*pluginapi.AllocatableTopologyAwareResource)
@@ -667,7 +668,6 @@ func (p *VirtualGPUPlugin) GetTopologyAwareAllocatableResources(ctx context.Cont
 		topologyAwareCapacityQuantityList := make([]*pluginapi.TopologyAwareQuantity, 0, len(gpuTopology.Devices))
 		var aggregatedAllocatableQuantity, aggregatedCapacityQuantity float64
 
-		machineState := p.GetState().GetMachineState()
 		allocPerGPU := float64(allocatableQuantity.Value())
 		for deviceID, deviceInfo := range gpuTopology.Devices {
 			// Resource discovery is not permission to expose capacity until

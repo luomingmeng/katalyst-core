@@ -75,7 +75,7 @@ func (p *BasePlugin) MergeKubeletGPUAllocationEntries(stateImpl state.State) (st
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to get active pod list for kubelet GPU state hydration: %w", err)
 	}
-	_, gpuTopologies, err := p.getGPUStateAndTopologyForKubeletHydration(stateImpl)
+	gpuTopologies, err := p.getGPUStateAndTopologyForKubeletHydration(stateImpl)
 	if err != nil {
 		return nil, false, err
 	}
@@ -115,23 +115,23 @@ func (p *BasePlugin) getActivePodMapForKubeletGPUHydration() (map[string]*v1.Pod
 	}), nil
 }
 
-// getGPUStateAndTopologyForKubeletHydration loads the current GPU resource state and each configured GPU topology.
-// Current topology only supplies optional NUMA information; ownership is
-// never discarded merely because a device has not been discovered yet.
+// getGPUStateAndTopologyForKubeletHydration verifies the GPU resource state view is
+// initialized and loads each configured GPU topology. Current topology only supplies
+// optional NUMA information; ownership is never discarded merely because a device has
+// not been discovered yet.
 func (p *BasePlugin) getGPUStateAndTopologyForKubeletHydration(
 	stateImpl state.State,
-) (state.AllocationMap, map[string]*machine.DeviceTopology, error) {
+) (map[string]*machine.DeviceTopology, error) {
 	machineState := stateImpl.GetMachineState()
-	gpuState, ok := machineState[v1.ResourceName(gpuconsts.GPUDeviceType)]
-	if !ok {
-		return nil, nil, fmt.Errorf("GPU device state %q is not initialized", gpuconsts.GPUDeviceType)
+	if _, ok := machineState[v1.ResourceName(gpuconsts.GPUDeviceType)]; !ok {
+		return nil, fmt.Errorf("GPU device state %q is not initialized", gpuconsts.GPUDeviceType)
 	}
 
 	gpuTopologies, ok := p.DeviceTopologyRegistry.GetDeviceTopologies(p.Conf.GPUDeviceNames)
 	if !ok {
-		return nil, nil, fmt.Errorf("get GPU topologies for kubelet state hydration failed")
+		return nil, fmt.Errorf("get GPU topologies for kubelet state hydration failed")
 	}
-	return gpuState, gpuTopologies, nil
+	return gpuTopologies, nil
 }
 
 // getGPUPodEntriesForKubeletHydration returns cloned pod-resource entries and the GPU pod entries within them.

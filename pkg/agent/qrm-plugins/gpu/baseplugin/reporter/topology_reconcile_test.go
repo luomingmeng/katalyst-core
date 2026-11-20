@@ -174,12 +174,12 @@ func TestUnhealthyGPUReportsZeroVirtualAllocatable(t *testing.T) {
 	p := &gpuReporterPlugin{deviceTypeToNames: map[string]sets.String{gpuconsts.GPUDeviceType: sets.NewString("gpu")}}
 	topologies := map[string]*machine.DeviceTopology{"gpu": {Devices: map[string]machine.DeviceInfo{"device": {Health: "Unhealthy"}}}}
 	resources := state.AllocationResourcesMap{}
-	for name, capacity := range map[v1.ResourceName]float64{gpuconsts.GPUDeviceType: 1, apiConsts.ResourceGPUMemory: 100, apiConsts.ResourceMilliGPU: 1000} {
+	for name, capacity := range map[v1.ResourceName]float64{gpuconsts.GPUDeviceType: 1, apiConsts.ResourceGPUMemory: 100, apiConsts.ResourceMilliGPU: 1000, "custom-slice": 50} {
 		resources[name] = state.AllocationMap{"device": {Allocatable: capacity}}
 	}
-	zones := p.getZoneResources(topologies, resources)
+	zones := p.getZoneResources(topologies, state.MergeDeviceTopologies(topologies), resources)
 	zone := util.GenerateDeviceZoneNode("device", string(nodeapi.TopologyTypeGPU))
-	for _, name := range []v1.ResourceName{"gpu", apiConsts.ResourceGPUMemory, apiConsts.ResourceMilliGPU} {
+	for _, name := range []v1.ResourceName{"gpu", apiConsts.ResourceGPUMemory, apiConsts.ResourceMilliGPU, "custom-slice"} {
 		allocated := (*zones[zone].Allocatable)[name]
 		capacity := (*zones[zone].Capacity)[name]
 		require.True(t, allocated.IsZero())

@@ -30,10 +30,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
+	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager"
 
 	nodev1alpha1 "github.com/kubewharf/katalyst-api/pkg/apis/node/v1alpha1"
-	apiConsts "github.com/kubewharf/katalyst-api/pkg/consts"
 	"github.com/kubewharf/katalyst-api/pkg/plugins/registration"
 	"github.com/kubewharf/katalyst-api/pkg/plugins/skeleton"
 	"github.com/kubewharf/katalyst-api/pkg/protocol/reporterplugin/v1alpha1"
@@ -358,7 +358,7 @@ func (p *gpuReporterPlugin) getTopologyZoneReportField(topologiesMap map[string]
 		zoneAttributes = make(map[util.ZoneNode]util.ZoneAttributes)
 	}
 
-	zoneResources := p.getZoneResources(topologiesMap, machineState)
+	zoneResources := p.getZoneResources(topologiesMap, latestDeviceTopology, machineState)
 	if zoneResources == nil {
 		return nil, fmt.Errorf("no zone resources found for device topology")
 	}
@@ -388,7 +388,14 @@ func (p *gpuReporterPlugin) getTopologyZoneReportField(topologiesMap map[string]
 func (p *gpuReporterPlugin) gpuAllocatedDeviceIDs(machineState state.AllocationResourcesMap) map[string]struct{} {
 	result := make(map[string]struct{})
 	gpuNames := sets.NewString(p.gpuDeviceNames...)
-	gpuNames.Insert(gpuconsts.GPUDeviceType, string(apiConsts.ResourceGPUMemory), string(apiConsts.ResourceMilliGPU))
+	gpuNames.Insert(gpuconsts.GPUDeviceType)
+	for resourceName := range machineState {
+		if _, deviceBacked := p.deviceTypeToNames[string(resourceName)]; !deviceBacked {
+			// Resource views without their own device type are backed by the
+			// GPU topology, so allocations in them also keep the device zone.
+			gpuNames.Insert(string(resourceName))
+		}
+	}
 	for resourceName, allocMap := range machineState {
 		if !gpuNames.Has(string(resourceName)) {
 			continue
@@ -492,12 +499,11 @@ func (p *gpuReporterPlugin) getGPUZoneAttributes(deviceTopology *machine.DeviceT
 
 // getZoneResources returns the map of gpu zone nodes to their resources
 // it merges resources from different device names (e.g. nvidia.com/gpu) for the same physical device ID
-func (p *gpuReporterPlugin) getZoneResources(topologiesMap map[string]*machine.DeviceTopology, machineState state.AllocationResourcesMap) map[util.ZoneNode]nodev1alpha1.Resources {
+func (p *gpuReporterPlugin) getZoneResources(topologiesMap map[string]*machine.DeviceTopology, mergedGPU *machine.DeviceTopology, machineState state.AllocationResourcesMap) map[util.ZoneNode]nodev1alpha1.Resources {
 	if len(topologiesMap) == 0 {
 		return nil
 	}
 
-	mergedGPU := state.MergeDeviceTopologies(topologiesMap)
 	idToResources := make(map[string]nodev1alpha1.Resources)
 	ensureResources := func(id string) nodev1alpha1.Resources {
 		resources, ok := idToResources[id]
@@ -550,15 +556,14 @@ func (p *gpuReporterPlugin) getZoneResources(topologiesMap map[string]*machine.D
 			} else {
 				capacityQuantity = *resource.NewQuantity(int64(allocState.Allocatable), resource.DecimalSI)
 				allocatableQuantity = capacityQuantity
-				// Virtual resources share the physical GPU's health gate.
-				if resourceName == apiConsts.ResourceGPUMemory || resourceName == apiConsts.ResourceMilliGPU {
-					healthy := false
-					if mergedGPU != nil {
-						healthy, _ = mergedGPU.IsDeviceHealthy(id)
-					}
-					if !healthy {
-						allocatableQuantity = zeroQuantity
-					}
+				// A resource without its own device type is a view backed by the
+				// physical GPU, so it follows the same health gate.
+				healthy := false
+				if mergedGPU != nil {
+					healthy, _ = mergedGPU.IsDeviceHealthy(id)
+				}
+				if !healthy {
+					allocatableQuantity = zeroQuantity
 				}
 				(*resources.Allocatable)[resourceName] = allocatableQuantity
 				(*resources.Capacity)[resourceName] = capacityQuantity
@@ -728,7 +733,7 @@ func (p *gpuReporterPlugin) addGPUZoneNodes(deviceTopology *machine.DeviceTopolo
 	}
 	for id := range extraDeviceIDs {
 		if _, exists := deviceInfos[id]; !exists {
-			deviceInfos[id] = machine.DeviceInfo{Health: "Unhealthy"}
+			deviceInfos[id] = machine.DeviceInfo{Health: pluginapi.Unhealthy}
 		}
 	}
 
