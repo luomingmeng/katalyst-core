@@ -28,6 +28,7 @@ import (
 )
 
 type pendingCPUPartition struct {
+	numaHeadroom                 map[int]float64
 	expectedRevision             uint64
 	entries                      state.PodEntries
 	baseMachineState             state.NUMANodeMap
@@ -663,15 +664,12 @@ func (p *DynamicPolicy) commitPreparedCPUPartitionForAdvisorTarget(
 	if reconcileTarget != nil {
 		permits = append(permits, p.newAdvisorStateWritePermit(reconcileTarget))
 	}
-	if err := p.state.CommitAdvisorStateIfRevision(
-		prepared.pending.expectedRevision,
-		prepared.entries,
-		prepared.machineState,
-		prepared.pending.allowOverlap,
-		prepared.pending.disableDedicated,
-		prepared.pending.persist,
-		permits...,
-	); err != nil {
+	if err := p.state.Commit(state.StateUpdate{
+		PodEntries: prepared.entries, MachineState: prepared.machineState,
+		AllowSharedCoresOverlapReclaimedCores:      prepared.pending.allowOverlap,
+		DisableDedicatedCoresOverlapReclaimedCores: prepared.pending.disableDedicated,
+		NUMAHeadroom: prepared.pending.numaHeadroom,
+	}, state.CommitOptions{ExpectedRevision: &prepared.pending.expectedRevision, Persist: prepared.pending.persist}, permits...); err != nil {
 		return err
 	}
 	p.emitFinalPoolSizeMetrics(prepared.entries)
