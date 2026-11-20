@@ -690,7 +690,9 @@ func (p *StaticPolicy) UpdateAllocatableAssociatedDevices(
 	ctx context.Context, request *pluginapi.UpdateAllocatableAssociatedDevicesRequest,
 ) (*pluginapi.UpdateAllocatableAssociatedDevicesResponse, error) {
 	general.InfofV(4, "called")
-	if request == nil || len(request.Devices) == 0 {
+	// An empty device list is a valid all-undiscovered inventory; the plugin and registry
+	// already handle an empty topology. Only a nil request is rejected here.
+	if request == nil {
 		return nil, fmt.Errorf("request is nil")
 	}
 
