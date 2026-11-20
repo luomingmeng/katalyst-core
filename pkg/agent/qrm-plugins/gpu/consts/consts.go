@@ -41,6 +41,10 @@ const (
 	GPUDeviceType  = "gpu_device"
 	RDMADeviceType = "rdma_device"
 
+	// GPUResourceRetentionGroup ties the physical GPU map and its resource
+	// views to one device lifecycle.
+	GPUResourceRetentionGroup = "gpu"
+
 	// GPUResourcePluginPolicyNameStatic is the policy name of static gpu resource plugin
 	GPUResourcePluginPolicyNameStatic = string(consts.ResourcePluginPolicyNameStatic)
 

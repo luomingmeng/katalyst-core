@@ -61,6 +61,8 @@ func NewVirtualGPUPlugin(base *baseplugin.BasePlugin) resourceplugin.ResourcePlu
 		state.NewGenericDefaultResourceStateGenerator(base.Conf.GPUDeviceNames, base.DeviceTopologyRegistry, float64(base.Conf.GPUMemoryAllocatablePerGPU.Value()), true))
 	base.DefaultResourceStateGeneratorRegistry.RegisterResourceStateGenerator(string(consts.ResourceMilliGPU),
 		state.NewGenericDefaultResourceStateGenerator(base.Conf.GPUDeviceNames, base.DeviceTopologyRegistry, float64(base.Conf.MilliGPUAllocatablePerGPU.Value()), true))
+	base.DefaultResourceStateGeneratorRegistry.RegisterResourceStateRetentionGroup(gpuconsts.GPUResourceRetentionGroup,
+		gpuconsts.GPUDeviceType, string(consts.ResourceGPUMemory), string(consts.ResourceMilliGPU))
 	return &VirtualGPUPlugin{
 		BasePlugin: base,
 	}

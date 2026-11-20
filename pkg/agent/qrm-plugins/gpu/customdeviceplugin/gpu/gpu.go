@@ -58,6 +58,8 @@ func NewGPUDevicePlugin(base *baseplugin.BasePlugin) customdeviceplugin.CustomDe
 	// while GPUDeviceNames are the actual resource names used to fetch the GPU device topologies.
 	base.DefaultResourceStateGeneratorRegistry.RegisterResourceStateGenerator(gpuconsts.GPUDeviceType,
 		state.NewGenericDefaultResourceStateGenerator(base.Conf.GPUDeviceNames, base.DeviceTopologyRegistry, 1, true))
+	base.DefaultResourceStateGeneratorRegistry.RegisterResourceStateRetentionGroup(gpuconsts.GPUResourceRetentionGroup,
+		gpuconsts.GPUDeviceType, string(consts.ResourceGPUMemory), string(consts.ResourceMilliGPU))
 	base.RegisterDeviceNames(base.Conf.GPUDeviceNames, gpuconsts.GPUDeviceType)
 
 	return &GPUDevicePlugin{

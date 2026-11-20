@@ -115,6 +115,7 @@ func ReconcileMachineState(current AllocationResourcesMap, entries PodResourceEn
 		}
 		candidate[resourceName] = merged
 	}
+	retainResourceGroupDevices(candidate, entries, registry)
 	return candidate, nil
 }
 

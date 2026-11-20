@@ -94,6 +94,8 @@ func GenerateMachineStateFromPodEntries(
 		machineState[v1.ResourceName(resourceName)] = allocationMap
 	}
 
+	retainResourceGroupDevices(machineState, podResourceEntries, defaultMachineStateGenerators)
+
 	return machineState, nil
 }
 

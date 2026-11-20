@@ -37,6 +37,7 @@ import (
 	"github.com/kubewharf/katalyst-api/pkg/plugins/registration"
 	"github.com/kubewharf/katalyst-api/pkg/plugins/skeleton"
 	"github.com/kubewharf/katalyst-api/pkg/protocol/reporterplugin/v1alpha1"
+	gpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/kubelet"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/state"
 	"github.com/kubewharf/katalyst-core/pkg/config"
@@ -339,14 +340,16 @@ func (p *gpuReporterPlugin) getTopologyZoneReportField(topologiesMap map[string]
 		return nil, fmt.Errorf("failed to create topology zone generator: %w", err)
 	}
 
-	// add the GPU zone nodes in and generate their topology zones by merging their resources and attributes
-	if err = p.addGPUZoneNodes(latestDeviceTopology, topologyZoneGenerator); err != nil {
+	// Add a GPU zone for every device that still owns an allocation even if
+	// the device plugin no longer reports it. The zone remains until the last
+	// GPU-related allocation on that device is released.
+	if err = p.addGPUZoneNodes(latestDeviceTopology, topologyZoneGenerator, p.gpuAllocatedDeviceIDs(machineState)); err != nil {
 		return nil, err
 	}
 
 	zoneAttributes := p.getGPUZoneAttributes(latestDeviceTopology)
 	if zoneAttributes == nil {
-		return nil, fmt.Errorf("no zone attributes found for device topology")
+		zoneAttributes = make(map[util.ZoneNode]util.ZoneAttributes)
 	}
 
 	zoneResources := p.getZoneResources(topologiesMap, machineState)
@@ -372,6 +375,25 @@ func (p *gpuReporterPlugin) getTopologyZoneReportField(topologiesMap map[string]
 		FieldName: util.CNRFieldNameTopologyZone,
 		Value:     zoneValues,
 	}, nil
+}
+
+// gpuAllocatedDeviceIDs returns device IDs with a live GPU-related allocation
+// in either the physical device map or one of its resource-state views.
+func (p *gpuReporterPlugin) gpuAllocatedDeviceIDs(machineState state.AllocationResourcesMap) map[string]struct{} {
+	result := make(map[string]struct{})
+	gpuNames := sets.NewString(p.gpuDeviceNames...)
+	gpuNames.Insert(gpuconsts.GPUDeviceType, string(apiConsts.ResourceGPUMemory), string(apiConsts.ResourceMilliGPU))
+	for resourceName, allocMap := range machineState {
+		if !gpuNames.Has(string(resourceName)) {
+			continue
+		}
+		for id, allocState := range allocMap {
+			if allocState != nil && len(allocState.PodEntries) > 0 {
+				result[id] = struct{}{}
+			}
+		}
+	}
+	return result
 }
 
 func (p *gpuReporterPlugin) getResourcePropertyReportField(latestDeviceTopology *machine.DeviceTopology) (*v1alpha1.ReportField, error) {
@@ -470,14 +492,28 @@ func (p *gpuReporterPlugin) getZoneResources(topologiesMap map[string]*machine.D
 	}
 
 	mergedGPU := state.MergeDeviceTopologies(topologiesMap)
-	// 1. first construct temporary map from device ID to resources to merge resources for the same device
 	idToResources := make(map[string]nodev1alpha1.Resources)
+	ensureResources := func(id string) nodev1alpha1.Resources {
+		resources, ok := idToResources[id]
+		if !ok {
+			resources = nodev1alpha1.Resources{
+				Allocatable: &v1.ResourceList{},
+				Capacity:    &v1.ResourceList{},
+			}
+		}
+		return resources
+	}
+
 	for resourceName, allocMap := range machineState {
 		for id, allocState := range allocMap {
-			var allocatableQuantity resource.Quantity
-			var capacityQuantity resource.Quantity
+			if allocState == nil {
+				continue
+			}
+			var allocatableQuantity, capacityQuantity resource.Quantity
+			resources := ensureResources(id)
 
 			if deviceNames, ok := p.deviceTypeToNames[string(resourceName)]; ok {
+				found := false
 				for deviceName := range deviceNames {
 					topology, ok := topologiesMap[deviceName]
 					if !ok {
@@ -488,30 +524,26 @@ func (p *gpuReporterPlugin) getZoneResources(topologiesMap map[string]*machine.D
 					if !deviceOk {
 						continue
 					}
-					// Allocatable: 1 is reported when device is healthy, 0 is reported when device is unhealthy
+					found = true
+					allocatableQuantity = *resource.NewQuantity(int64(allocState.Allocatable), resource.DecimalSI)
 					if !healthy {
 						allocatableQuantity = zeroQuantity
-					} else {
-						allocatableQuantity = *resource.NewQuantity(int64(allocState.Allocatable), resource.DecimalSI)
 					}
-
 					capacityQuantity = *resource.NewQuantity(int64(allocState.Allocatable), resource.DecimalSI)
-
-					resources, ok := idToResources[id]
-					if !ok {
-						resources = nodev1alpha1.Resources{
-							Allocatable: &v1.ResourceList{},
-							Capacity:    &v1.ResourceList{},
-						}
-					}
-
 					(*resources.Allocatable)[v1.ResourceName(deviceName)] = allocatableQuantity
 					(*resources.Capacity)[v1.ResourceName(deviceName)] = capacityQuantity
-					idToResources[id] = resources
+				}
+				if !found {
+					// A device no longer reported is unavailable, but its
+					// allocation must remain visible until it is released.
+					for deviceName := range deviceNames {
+						(*resources.Allocatable)[v1.ResourceName(deviceName)] = zeroQuantity
+						(*resources.Capacity)[v1.ResourceName(deviceName)] = zeroQuantity
+					}
 				}
 			} else {
-				allocatableQuantity = *resource.NewQuantity(int64(allocState.Allocatable), resource.DecimalSI)
 				capacityQuantity = *resource.NewQuantity(int64(allocState.Allocatable), resource.DecimalSI)
+				allocatableQuantity = capacityQuantity
 				// Virtual resources share the physical GPU's health gate.
 				if resourceName == apiConsts.ResourceGPUMemory || resourceName == apiConsts.ResourceMilliGPU {
 					healthy := false
@@ -522,19 +554,10 @@ func (p *gpuReporterPlugin) getZoneResources(topologiesMap map[string]*machine.D
 						allocatableQuantity = zeroQuantity
 					}
 				}
-
-				resources, ok := idToResources[id]
-				if !ok {
-					resources = nodev1alpha1.Resources{
-						Allocatable: &v1.ResourceList{},
-						Capacity:    &v1.ResourceList{},
-					}
-				}
-
 				(*resources.Allocatable)[resourceName] = allocatableQuantity
 				(*resources.Capacity)[resourceName] = capacityQuantity
-				idToResources[id] = resources
 			}
+			idToResources[id] = resources
 		}
 	}
 
@@ -592,25 +615,24 @@ func (p *gpuReporterPlugin) addStateAllocations(topologiesMap map[string]*machin
 			for podUID, containerEntries := range podEntries {
 				// Get any pod namespace and pod name from allocationMeta
 				for _, allocInfo := range containerEntries {
-					podNamespace := allocInfo.PodNamespace
-					podName := allocInfo.PodName
-
-					// Override the resource name if there is a specified device name
+					if allocInfo == nil {
+						continue
+					}
+					effectiveResourceName := resourceName
 					if allocInfo.DeviceName != "" {
-						// Skip reporting if it is not a GPU device
+						// Skip reporting allocations owned by devices outside this GPU view.
 						if _, ok := topologiesMap[allocInfo.DeviceName]; !ok {
 							continue
 						}
-
-						resourceName = v1.ResourceName(allocInfo.DeviceName)
+						effectiveResourceName = v1.ResourceName(allocInfo.DeviceName)
 					}
 
 					allocated := allocInfo.AllocatedAllocation
 					gpuResourceList := make(v1.ResourceList)
-					gpuResourceList[resourceName] = *resource.NewQuantity(int64(allocated.Quantity), resource.DecimalSI)
+					gpuResourceList[effectiveResourceName] = *resource.NewQuantity(int64(allocated.Quantity), resource.DecimalSI)
 
 					idToAllocations[id] = append(idToAllocations[id], &nodev1alpha1.Allocation{
-						Consumer: native.GenerateNamespaceNameUIDKey(podNamespace, podName, podUID),
+						Consumer: native.GenerateNamespaceNameUIDKey(allocInfo.PodNamespace, allocInfo.PodName, podUID),
 						Requests: &gpuResourceList,
 					})
 				}
@@ -686,14 +708,27 @@ func (p *gpuReporterPlugin) addKubeletCheckpointAllocations(idToAllocations map[
 }
 
 // addGPUZoneNodes adds the gpu zone nodes to the topology zone generator.
-func (p *gpuReporterPlugin) addGPUZoneNodes(deviceTopology *machine.DeviceTopology, generator *util.TopologyZoneGenerator) error {
-	if deviceTopology == nil {
+// extraDeviceIDs keeps zones for allocated devices that discovery no longer reports.
+func (p *gpuReporterPlugin) addGPUZoneNodes(deviceTopology *machine.DeviceTopology, generator *util.TopologyZoneGenerator, extraDeviceIDs map[string]struct{}) error {
+	if generator == nil {
 		return nil
+	}
+
+	deviceInfos := make(map[string]machine.DeviceInfo)
+	if deviceTopology != nil {
+		for id, device := range deviceTopology.Devices {
+			deviceInfos[id] = device
+		}
+	}
+	for id := range extraDeviceIDs {
+		if _, exists := deviceInfos[id]; !exists {
+			deviceInfos[id] = machine.DeviceInfo{Health: "Unhealthy"}
+		}
 	}
 
 	var errList []error
 
-	for id, device := range deviceTopology.Devices {
+	for id, device := range deviceInfos {
 		deviceNode := util.GenerateDeviceZoneNode(id, string(nodev1alpha1.TopologyTypeGPU))
 
 		numaNodes := device.NumaNodes
