@@ -254,6 +254,12 @@ func (p *gpuReporterPlugin) Stop() error {
 
 // GetReportContent implements ReporterPluginServer to report the gpu device topology information to CNR.
 func (p *gpuReporterPlugin) GetReportContent(ctx context.Context, _ *v1alpha1.Empty) (*v1alpha1.GetReportContentResponse, error) {
+	return p.getOrBuildReportContent(ctx)
+}
+
+// getOrBuildReportContent returns the cached generation-valid content or builds
+// a new one when the cache was invalidated.
+func (p *gpuReporterPlugin) getOrBuildReportContent(ctx context.Context) (*v1alpha1.GetReportContentResponse, error) {
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -774,7 +780,7 @@ func (p *gpuReporterPlugin) ListAndWatchReportContent(_ *v1alpha1.Empty, server 
 	var retryCh <-chan time.Time
 
 	for {
-		resp, err := p.GetReportContent(server.Context(), &v1alpha1.Empty{})
+		resp, err := p.getOrBuildReportContent(server.Context())
 		if err != nil {
 			general.Errorf("failed to build report response: %v, will retry in %s", err, p.reportRetryInterval)
 			// Start a retry timer to ensure the listwatch stream doesn't break due to intermittent failures (e.g. state/topology parsing error)
@@ -782,7 +788,7 @@ func (p *gpuReporterPlugin) ListAndWatchReportContent(_ *v1alpha1.Empty, server 
 		} else {
 			// Clear retry timer if build succeeds
 			retryCh = nil
-			// GetReportContent publishes only a generation-valid build.
+			// getOrBuildReportContent publishes only a generation-valid build.
 
 			// Send report only when it's the first time or the content has changed
 			if isFirst || !proto.Equal(lastSentContent, resp) {
