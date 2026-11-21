@@ -49,7 +49,6 @@ import (
 var advisorTestMutex = &sync.Mutex{}
 
 func TestDynamicPolicy_checkAndApplyIfCgroupV1(t *testing.T) {
-	t.Parallel()
 
 	mockPod := &v1.Pod{
 		Spec: v1.PodSpec{
@@ -131,7 +130,6 @@ func TestDynamicPolicy_checkAndApplyIfCgroupV1(t *testing.T) {
 }
 
 func TestDynamicPolicy_getAllDirs(t *testing.T) {
-	t.Parallel()
 
 	policy := &DynamicPolicy{}
 
@@ -164,7 +162,6 @@ func (m mockDirEntry) Type() os.FileMode          { return 0 }
 func (m mockDirEntry) Info() (os.FileInfo, error) { return nil, nil }
 
 func TestDynamic_getCurrentPathAllPodsDirAndMap(t *testing.T) {
-	t.Parallel()
 
 	advisorTestMutex.Lock()
 	defer advisorTestMutex.Unlock()
@@ -205,7 +202,6 @@ func TestDynamic_getCurrentPathAllPodsDirAndMap(t *testing.T) {
 }
 
 func TestDynamicPolicy_getPodAndRelativePath(t *testing.T) {
-	t.Parallel()
 
 	advisorTestMutex.Lock()
 	defer advisorTestMutex.Unlock()
@@ -244,7 +240,6 @@ func TestDynamicPolicy_getPodAndRelativePath(t *testing.T) {
 }
 
 func TestDynamicPolicy_getAllPodsPathMap(t *testing.T) {
-	t.Parallel()
 
 	mockPods := []*v1.Pod{
 		{
@@ -286,7 +281,6 @@ func TestDynamicPolicy_getAllPodsPathMap(t *testing.T) {
 }
 
 func TestDynamicPolicy_getAllContainersRelativePathMap(t *testing.T) {
-	t.Parallel()
 
 	mockPod := &v1.Pod{
 		Spec: v1.PodSpec{
@@ -325,7 +319,6 @@ func TestDynamicPolicy_getAllContainersRelativePathMap(t *testing.T) {
 }
 
 func TestDynamicPolicy_checkAllPodsQuota(t *testing.T) {
-	t.Parallel()
 
 	p := &DynamicPolicy{
 		metaServer: &metaserver.MetaServer{
@@ -470,7 +463,6 @@ func TestDynamicPolicy_checkAllPodsQuota(t *testing.T) {
 }
 
 func TestDynamicPolicy_applyAllContainersQuota(t *testing.T) {
-	t.Parallel()
 
 	p := &DynamicPolicy{
 		metaServer: &metaserver.MetaServer{
@@ -546,7 +538,6 @@ func TestDynamicPolicy_applyAllContainersQuota(t *testing.T) {
 }
 
 func TestDynamicPolicy_checkAndApplySubCgroupPath(t *testing.T) {
-	t.Parallel()
 
 	p := &DynamicPolicy{
 		metaServer: &metaserver.MetaServer{

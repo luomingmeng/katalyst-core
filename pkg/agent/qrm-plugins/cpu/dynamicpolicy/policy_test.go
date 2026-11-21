@@ -7542,7 +7542,6 @@ func TestStartWithContainerCPUIdle(t *testing.T) {
 }
 
 func TestStartWithContainerCPUIdleRegisterFailure(t *testing.T) {
-	t.Parallel()
 
 	policyTestMutex.Lock()
 	defer policyTestMutex.Unlock()
