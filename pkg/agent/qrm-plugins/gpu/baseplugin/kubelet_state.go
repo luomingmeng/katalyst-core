@@ -49,36 +49,39 @@ type kubeletGPUAllocationKey struct {
 // hydrateKubeletGPUAllocations updates katalyst GPU state with allocations from the kubelet device manager.
 // Allocations that are present in both the kubelet device manager and the katalyst GPU state are deduplicated.
 func (p *BasePlugin) hydrateKubeletGPUAllocations(stateImpl state.State) error {
-	if !p.Conf.EnableKubeletCheckpointFallback || p.Conf.KubeletDevicePluginPath == "" {
-		return nil
+	entries, changed, err := p.MergeKubeletGPUAllocationEntries(stateImpl)
+	if err != nil || !changed {
+		return err
 	}
+	return p.rebuildAndStoreGPUState(stateImpl, entries, entries[gpuconsts.GPUDeviceType])
+}
 
+// MergeKubeletGPUAllocationEntries prepares an ownership snapshot without
+// publishing state. The caller serializes it with allocation/removal and commits
+// it together with the resource state, before exposing newly discovered capacity.
+func (p *BasePlugin) MergeKubeletGPUAllocationEntries(stateImpl state.State) (state.PodResourceEntries, bool, error) {
+	podResourceEntries, podEntries := getGPUPodEntriesForKubeletHydration(stateImpl)
+	if !p.Conf.EnableKubeletCheckpointFallback || p.Conf.KubeletDevicePluginPath == "" {
+		return podResourceEntries, false, nil
+	}
 	allocations, err := p.readKubeletGPUAllocations()
 	if err != nil {
-		return err
+		return nil, false, err
 	}
 	if len(allocations) == 0 {
-		return nil
+		return podResourceEntries, false, nil
 	}
-
 	activePodMap, err := p.getActivePodMapForKubeletGPUHydration()
 	if err != nil {
-		general.Errorf("failed to get active pod list for kubelet GPU state hydration: %v", err)
-		return fmt.Errorf("failed to get active pod list for kubelet GPU state hydration: %w", err)
+		return nil, false, fmt.Errorf("failed to get active pod list for kubelet GPU state hydration: %w", err)
 	}
-
-	gpuState, gpuTopologies, err := p.getGPUStateAndTopologyForKubeletHydration(stateImpl)
+	gpuTopologies, err := p.getGPUStateAndTopologyForKubeletHydration(stateImpl)
 	if err != nil {
-		return err
+		return nil, false, err
 	}
-
-	podResourceEntries, podEntries := getGPUPodEntriesForKubeletHydration(stateImpl)
-	imported := p.collectKubeletGPUAllocations(allocations, activePodMap, podEntries, gpuState, gpuTopologies)
-	if applyKubeletGPUAllocations(podEntries, imported) == 0 {
-		return nil
-	}
-
-	return p.rebuildAndStoreGPUState(stateImpl, podResourceEntries, podEntries)
+	imported := p.collectKubeletGPUAllocations(allocations, activePodMap, podEntries, gpuTopologies)
+	changed := applyKubeletGPUAllocations(podEntries, imported) != 0
+	return podResourceEntries, changed, nil
 }
 
 // readKubeletGPUAllocations reads GPU allocations from the kubelet device manager checkpoint.
@@ -112,22 +115,23 @@ func (p *BasePlugin) getActivePodMapForKubeletGPUHydration() (map[string]*v1.Pod
 	}), nil
 }
 
-// getGPUStateAndTopologyForKubeletHydration loads the current GPU resource state and each configured GPU topology.
-// These are used to validate checkpoint device IDs before importing them into Katalyst state.
+// getGPUStateAndTopologyForKubeletHydration verifies the GPU resource state view is
+// initialized and loads each configured GPU topology. Current topology only supplies
+// optional NUMA information; ownership is never discarded merely because a device has
+// not been discovered yet.
 func (p *BasePlugin) getGPUStateAndTopologyForKubeletHydration(
 	stateImpl state.State,
-) (state.AllocationMap, map[string]*machine.DeviceTopology, error) {
+) (map[string]*machine.DeviceTopology, error) {
 	machineState := stateImpl.GetMachineState()
-	gpuState, ok := machineState[v1.ResourceName(gpuconsts.GPUDeviceType)]
-	if !ok {
-		return nil, nil, fmt.Errorf("GPU device state %q is not initialized", gpuconsts.GPUDeviceType)
+	if _, ok := machineState[v1.ResourceName(gpuconsts.GPUDeviceType)]; !ok {
+		return nil, fmt.Errorf("GPU device state %q is not initialized", gpuconsts.GPUDeviceType)
 	}
 
 	gpuTopologies, ok := p.DeviceTopologyRegistry.GetDeviceTopologies(p.Conf.GPUDeviceNames)
 	if !ok {
-		return nil, nil, fmt.Errorf("get GPU topologies for kubelet state hydration failed")
+		return nil, fmt.Errorf("get GPU topologies for kubelet state hydration failed")
 	}
-	return gpuState, gpuTopologies, nil
+	return gpuTopologies, nil
 }
 
 // getGPUPodEntriesForKubeletHydration returns cloned pod-resource entries and the GPU pod entries within them.
@@ -147,21 +151,18 @@ func getGPUPodEntriesForKubeletHydration(stateImpl state.State) (state.PodResour
 }
 
 // collectKubeletGPUAllocations converts kubelet checkpoint allocations into GPU allocation infos.
-// It skips inactive pods, existing Katalyst allocations, duplicate devices, and devices missing from current state or topology.
+// It preserves existing QRM metadata and merges missing checkpoint device IDs.
+// An allocated ID must be retained even before discovery exposes its topology.
 func (p *BasePlugin) collectKubeletGPUAllocations(
 	allocations []kubelet.Allocation,
 	activePodMap map[string]*v1.Pod,
 	podEntries state.PodEntries,
-	gpuState state.AllocationMap,
 	gpuTopologies map[string]*machine.DeviceTopology,
 ) map[kubeletGPUAllocationKey]*state.AllocationInfo {
 	imported := make(map[kubeletGPUAllocationKey]*state.AllocationInfo)
 	for _, entry := range allocations {
 		key := kubeletGPUAllocationKey{podUID: entry.PodUID, containerName: entry.ContainerName}
-		// Do nothing if the allocation is already in the katalyst GPU state.
-		if podEntries.GetAllocationInfo(entry.PodUID, entry.ContainerName) != nil {
-			continue
-		}
+		existing := podEntries.GetAllocationInfo(entry.PodUID, entry.ContainerName)
 
 		pod, ok := activePodMap[entry.PodUID]
 		if !ok {
@@ -171,38 +172,49 @@ func (p *BasePlugin) collectKubeletGPUAllocations(
 
 		allocationInfo := imported[key]
 		if allocationInfo == nil {
-			allocationInfo = &state.AllocationInfo{
-				AllocationMeta:           p.generateKubeletGPUAllocationMeta(pod, entry.ContainerName),
-				DeviceName:               entry.ResourceName,
-				TopologyAwareAllocations: make(map[string]state.Allocation),
+			if existing != nil {
+				allocationInfo = existing.Clone()
+			} else {
+				allocationInfo = &state.AllocationInfo{
+					AllocationMeta: p.generateKubeletGPUAllocationMeta(pod, entry.ContainerName),
+					DeviceName:     entry.ResourceName,
+				}
 			}
-			imported[key] = allocationInfo
+			if allocationInfo.TopologyAwareAllocations == nil {
+				allocationInfo.TopologyAwareAllocations = make(map[string]state.Allocation)
+			}
 		}
 
 		for _, deviceID := range entry.DeviceIDs {
-			if _, exists := allocationInfo.TopologyAwareAllocations[deviceID]; exists {
+			if allocation, exists := allocationInfo.TopologyAwareAllocations[deviceID]; exists {
+				// A checkpoint ID retained before discovery has unknown NUMA.
+				// Fill that metadata when it arrives, without changing ownership
+				// or replacing metadata already supplied by QRM.
+				if len(allocation.NUMANodes) == 0 {
+					if topology := gpuTopologies[entry.ResourceName]; topology != nil {
+						if device, found := topology.Devices[deviceID]; found && len(device.NumaNodes) > 0 {
+							allocation.NUMANodes = append([]int(nil), device.NumaNodes...)
+							allocationInfo.TopologyAwareAllocations[deviceID] = allocation
+							imported[key] = allocationInfo
+						}
+					}
+				}
 				continue
 			}
-			if _, exists := gpuState[deviceID]; !exists {
-				general.Infof("GPU state does not contain device %s, skipping", deviceID)
-				continue
-			}
-			gpuTopology, ok := gpuTopologies[entry.ResourceName]
-			if !ok {
-				general.Infof("GPU topology does not exist for resource %s, skipping device %s",
-					entry.ResourceName, deviceID)
-				continue
-			}
-			device, exists := gpuTopology.Devices[deviceID]
-			if !exists {
-				general.Infof("GPU topology does not contain device %s, skipping", deviceID)
-				continue
+			// Checkpoint allocation is authoritative for ownership, even when
+			// discovery has not exposed the ID yet. Keep topology unknown until
+			// the device arrives, rather than dropping the allocation.
+			var numaNodes []int
+			if topology := gpuTopologies[entry.ResourceName]; topology != nil {
+				if device, exists := topology.Devices[deviceID]; exists {
+					numaNodes = append([]int(nil), device.NumaNodes...)
+				}
 			}
 			allocationInfo.TopologyAwareAllocations[deviceID] = state.Allocation{
-				Quantity:  1,
-				NUMANodes: append([]int(nil), device.NumaNodes...),
+				Quantity: 1, NUMANodes: numaNodes,
 			}
 			allocationInfo.AllocatedAllocation.Quantity++
+			imported[key] = allocationInfo
 		}
 	}
 	return imported

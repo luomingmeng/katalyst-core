@@ -61,6 +61,12 @@ type StaticPolicy struct {
 	stopCh  chan struct{}
 	started bool
 
+	lifecycleMu           sync.Mutex
+	topologyNotifierOnce  sync.Once
+	topologyNotifyCh      chan struct{}
+	topologyReconcileDone chan struct{}
+	persistPending        bool
+
 	emitter metrics.MetricEmitter
 
 	residualHitMap map[string]int64
@@ -118,6 +124,8 @@ var _ skeleton.QRMPlugin = (*StaticPolicy)(nil)
 
 // Start starts this plugin
 func (p *StaticPolicy) Start() (err error) {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
 	general.Infof("called")
 
 	p.Lock()
@@ -147,12 +155,14 @@ func (p *StaticPolicy) Start() (err error) {
 		appqrm.QRMGPUPluginPeriodicalHandlerGroupName, p.clearResidualState, gpuconsts.StateCheckPeriod, gpuconsts.StateCheckTolerationTimes)
 	if err != nil {
 		general.Errorf("start %v failed, err: %v", gpuconsts.ClearResidualState, err)
+		return err
 	}
 
 	go wait.Until(func() {
 		periodicalhandler.ReadyToStartHandlersByGroup(appqrm.QRMGPUPluginPeriodicalHandlerGroupName)
 	}, 5*time.Second, p.stopCh)
 
+	p.startTopologyReconcilerLocked()
 	p.BasePlugin.Run(p.stopCh)
 
 	return nil
@@ -160,20 +170,22 @@ func (p *StaticPolicy) Start() (err error) {
 
 // Stop stops this plugin
 func (p *StaticPolicy) Stop() error {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
 	p.Lock()
-	defer func() {
-		p.started = false
-		p.Unlock()
-		general.Infof("stopped")
-	}()
-
 	if !p.started {
-		general.Warningf("already stopped")
+		p.Unlock()
 		return nil
 	}
-
+	p.started = false
 	close(p.stopCh)
-
+	done := p.topologyReconcileDone
+	p.Unlock()
+	// The reconciler acquires the policy lock; never wait for it while holding it.
+	if done != nil {
+		<-done
+	}
+	general.Infof("stopped")
 	return nil
 }
 
@@ -192,6 +204,10 @@ func (p *StaticPolicy) ensureState(resourceName string) error {
 	defer p.Unlock()
 
 	if p.GetState() == nil {
+		topology, err := state.GetMergedDeviceTopology(p.DeviceTopologyRegistry, p.Conf.GPUDeviceNames)
+		if err != nil || topology == nil || len(topology.Devices) == 0 {
+			return fmt.Errorf("GPU device topology is not ready")
+		}
 		if err := p.InitState(); err != nil {
 			return fmt.Errorf("init state failed: %v", err)
 		}
@@ -473,6 +489,10 @@ func (p *StaticPolicy) Allocate(
 	}
 
 	p.Lock()
+	if err := p.reconcileDeviceStateLocked(); err != nil {
+		p.Unlock()
+		return nil, fmt.Errorf("reconcile GPU ownership before allocation: %w", err)
+	}
 	defer func() {
 		if err != nil {
 			_ = p.removeContainer(req.PodUid, req.ContainerName, v1.ResourceName(req.ResourceName))
@@ -749,6 +769,10 @@ func (p *StaticPolicy) AllocateAssociatedDevice(
 	}
 
 	p.Lock()
+	if err := p.reconcileDeviceStateLocked(); err != nil {
+		p.Unlock()
+		return nil, fmt.Errorf("reconcile GPU ownership before device allocation: %w", err)
+	}
 	defer func() {
 		// Reset state for accompany resource and target resource if there is an error
 		if respErr != nil {
