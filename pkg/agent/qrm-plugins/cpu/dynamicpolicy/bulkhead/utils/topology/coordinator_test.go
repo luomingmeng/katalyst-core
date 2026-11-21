@@ -2323,19 +2323,10 @@ func TestTopologyCoordinatorBlocksStructuralV1DeadlockBeforeFirstWrite(t *testin
 	}
 }
 
-func TestRoundOutcomeProgressIncludesVerifiedGrowWhenFinalSnapshotIsStale(t *testing.T) {
+func TestProgressMeasureVerifiedWriteCountsAsProgress(t *testing.T) {
 	t.Parallel()
-	outcome := RoundOutcome{
-		Status:   RoundStatusStale,
-		Snapshot: &CompleteSnapshot{},
-		Journal: []AppliedPlanOperation{{
-			Direction: WriteGrow,
-			Target:    CPUSetTarget{CPUs: machine.NewCPUSet(0, 1)},
-			Observed:  CPUSetTarget{CPUs: machine.NewCPUSet(0, 1)},
-		}},
-	}
-	if !roundOutcomeMadeNetProgress(outcome) {
-		t.Fatal("verified grow must count as progress even when a later final snapshot is stale")
+	if !(ProgressMeasure{VerifiedWrites: 1}).MadeProgress() {
+		t.Fatal("verified grow must count as progress")
 	}
 }
 

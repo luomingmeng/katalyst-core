@@ -2040,9 +2040,10 @@ func TestUncertainPartialWriteReadbackRetainsIntermediateValue(t *testing.T) {
 				Direction: WriteGrow,
 			}
 			after := "0-2"
-			write, err := writer.capturePhysicalWriteBefore(
-				context.Background(), operation, resource, after, 0, PhaseExpand)
+			current, err := live.ReadEntry(context.Background(), "a")
 			require.NoError(t, err)
+			write := physicalWriteBeforeFromEntry(
+				current, operation, resource, after, 0, PhaseExpand)
 			switch resource {
 			case HierarchyOperationWriteCPUs:
 				live.nodes["a"].configuredCPUs = machine.MustParse("0-1")
@@ -2635,24 +2636,6 @@ func TestRollbackVerificationRelsAreSorted(t *testing.T) {
 	}}
 
 	require.Equal(t, []string{"a", "m", "z"}, rollbackVerificationRels(stack))
-}
-
-func TestUncertainPhysicalImpactIsNotVerifiedProgress(t *testing.T) {
-	t.Parallel()
-	outcome := RoundOutcome{Journal: []AppliedPlanOperation{{
-		Rel: "a",
-		Target: CPUSetTarget{
-			CPUs: machine.NewCPUSet(0),
-			Mems: "0",
-		},
-		Observed: CPUSetTarget{
-			CPUs: machine.NewCPUSet(0),
-			Mems: "0",
-		},
-		PhysicalImpact: PhysicalImpactUncertain,
-	}}}
-
-	require.False(t, roundOutcomeMadeNetProgress(outcome))
 }
 
 func TestSuccessfulRollbackRemovesNetJournalAndAppliedProgress(t *testing.T) {

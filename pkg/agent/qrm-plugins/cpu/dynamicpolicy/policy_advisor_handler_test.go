@@ -788,7 +788,8 @@ func TestAdvisorVolatileTargetActivatesWALBeforeLivePluginEnable(t *testing.T) {
 					return nil
 				},
 			}
-			resp := &advisorapi.ListAndWatchResponse{Entries: map[string]*advisorapi.CalculationEntries{},
+			resp := &advisorapi.ListAndWatchResponse{
+				Entries:      map[string]*advisorapi.CalculationEntries{},
 				ExtraEntries: []*advisorsvc.CalculationInfo{{CalculationResult: &advisorsvc.CalculationResult{}}},
 			}
 			err := p.allocateByCPUAdvisor(nil, resp, nil)
@@ -1136,7 +1137,8 @@ func TestAdvisorControlFailureDoesNotSkipPhysicalRetry(t *testing.T) {
 		}
 		return nil
 	}
-	resp := &advisorapi.ListAndWatchResponse{Entries: map[string]*advisorapi.CalculationEntries{},
+	resp := &advisorapi.ListAndWatchResponse{
+		Entries: map[string]*advisorapi.CalculationEntries{},
 		ExtraEntries: []*advisorsvc.CalculationInfo{{CalculationResult: &advisorsvc.CalculationResult{Values: map[string]string{
 			string(advisorapi.ControlKnobKeyCgroupConfig): `{}`,
 		}}}},
@@ -1169,7 +1171,8 @@ func TestAdvisorExtraControlsRequireRedelivery(t *testing.T) {
 		}
 		return nil
 	}
-	resp := &advisorapi.ListAndWatchResponse{Entries: map[string]*advisorapi.CalculationEntries{},
+	resp := &advisorapi.ListAndWatchResponse{
+		Entries: map[string]*advisorapi.CalculationEntries{},
 		ExtraEntries: []*advisorsvc.CalculationInfo{{CalculationResult: &advisorsvc.CalculationResult{Values: map[string]string{
 			string(advisorapi.ControlKnobKeyCgroupConfig): `{}`,
 		}}}},
@@ -2492,7 +2495,18 @@ func TestSolveAdvisorDescriptorPhaseDoesNotStarveNarrowShared(t *testing.T) {
 			descriptors[i], descriptors[j] = descriptors[j], descriptors[i]
 		})
 		got := advisorapi.BlockCPUSet{}
-		remaining, solveErr := policy.solveAdvisorDescriptorPhase(descriptors, allCPUs, got, true, false)
+		entries := policy.state.GetPodEntries()
+		remaining, solveErr := policy.solveAdvisorDescriptorPhaseWithCheckpointTransitionAndSkipNUMAs(
+			descriptors,
+			allCPUs,
+			got,
+			true,
+			false,
+			nil,
+			entries.SteadyExclusiveNUMAs(policy.machine.machineInfo.CPUTopology),
+			entries,
+			policy.isRampUpReclaimHardPartitionEnabled() && policy.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+		)
 		require.NoError(t, solveErr, "seed %d", seed)
 		require.Equal(t, 28, got["reclaim-numa0"].Size(), "seed %d", seed)
 		require.Equal(t, 220, got["reclaim-global"].Size(), "seed %d", seed)
@@ -2545,7 +2559,18 @@ func TestSolveAdvisorDescriptorPhaseHandles24Plus178Plus4(t *testing.T) {
 	}
 
 	got := advisorapi.BlockCPUSet{}
-	remaining, err := policy.solveAdvisorDescriptorPhase(descriptors, available, got, true, false)
+	entries := policy.state.GetPodEntries()
+	remaining, err := policy.solveAdvisorDescriptorPhaseWithCheckpointTransitionAndSkipNUMAs(
+		descriptors,
+		available,
+		got,
+		true,
+		false,
+		nil,
+		entries.SteadyExclusiveNUMAs(policy.machine.machineInfo.CPUTopology),
+		entries,
+		policy.isRampUpReclaimHardPartitionEnabled() && policy.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+	)
 
 	require.Equal(t, available, remaining)
 	require.ErrorContains(t, err, "insufficient aggregate capacity for quantity 178")
@@ -2577,7 +2602,18 @@ func TestSolveAdvisorDescriptorPhaseFailureIsAtomic(t *testing.T) {
 		},
 	}
 
-	remaining, err := policy.solveAdvisorDescriptorPhase(descriptors, allCPUs, result, true, false)
+	entries := policy.state.GetPodEntries()
+	remaining, err := policy.solveAdvisorDescriptorPhaseWithCheckpointTransitionAndSkipNUMAs(
+		descriptors,
+		allCPUs,
+		result,
+		true,
+		false,
+		nil,
+		entries.SteadyExclusiveNUMAs(policy.machine.machineInfo.CPUTopology),
+		entries,
+		policy.isRampUpReclaimHardPartitionEnabled() && policy.state.GetDisableDedicatedCoresOverlapReclaimedCores(),
+	)
 
 	require.Error(t, err)
 	require.Equal(t, allCPUs, remaining)

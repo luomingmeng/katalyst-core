@@ -800,64 +800,6 @@ func (d *strictReservedHierarchyDriver) WriteMems(
 	return d.HierarchyDriver.WriteMems(ctx, rel, expected, mems)
 }
 
-func scanLiveChildrenOnce(
-	ctx context.Context,
-	driver HierarchyDriver,
-	operation PlanOperation,
-	failClosedRels map[string]struct{},
-) (stableLiveChildren, error) {
-	before, err := driver.ListChildren(ctx, operation.Rel)
-	if err != nil {
-		return stableLiveChildren{}, err
-	}
-	children := stableLiveChildren{
-		cpus: machine.NewCPUSet(),
-		mems: machine.NewCPUSet(),
-		refs: before,
-	}
-	for _, child := range before {
-		childRel := filepath.Join(operation.Rel, child.Name)
-		entry, readErr := driver.ReadEntry(ctx, childRel)
-		if readErr != nil {
-			skip, proofErr := proveSafeUnavailableChildSkip(
-				ctx, driver, childRel, child.Identity, readErr, failClosedRels)
-			if proofErr != nil {
-				return stableLiveChildren{}, proofErr
-			}
-			if skip {
-				continue
-			}
-			return stableLiveChildren{}, readErr
-		}
-		if entry.Identity != child.Identity {
-			return stableLiveChildren{}, &PlanStaleError{
-				Rel: operation.Rel, Direction: operation.Direction, Resource: "child_identity",
-				Current: fmt.Sprint(entry.Identity), Target: fmt.Sprint(child.Identity),
-				Err: fmt.Errorf("live child identity changed"),
-			}
-		}
-		childMems, parseErr := machine.Parse(entry.Mems)
-		if parseErr != nil {
-			return stableLiveChildren{}, fmt.Errorf("parse live child %q cpuset.mems=%q: %w",
-				childRel, entry.Mems, parseErr)
-		}
-		children.cpus = children.cpus.Union(entry.CPUs)
-		children.mems = children.mems.Union(childMems)
-	}
-	after, err := driver.ListChildren(ctx, operation.Rel)
-	if err != nil {
-		return stableLiveChildren{}, err
-	}
-	if ChildrenFingerprint(before) != ChildrenFingerprint(after) {
-		return stableLiveChildren{}, &PlanStaleError{
-			Rel: operation.Rel, Direction: operation.Direction, Resource: "children",
-			Current: ChildrenFingerprint(after), Target: ChildrenFingerprint(before),
-			Err: fmt.Errorf("live children changed before shrink"),
-		}
-	}
-	return children, nil
-}
-
 func safeWriterFailClosedRels(plan PhasePlan) map[string]struct{} {
 	rels := make(map[string]struct{}, len(plan.Operations)+len(plan.ControlledRels))
 	for _, rel := range plan.ControlledRels {

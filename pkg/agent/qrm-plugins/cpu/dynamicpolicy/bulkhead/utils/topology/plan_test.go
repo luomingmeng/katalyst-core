@@ -206,7 +206,7 @@ func operationRels(operations []PlanOperation) []string {
 	return rels
 }
 
-func TestFinalAdmissionTargetPreservesCanonicalTargetOverIntermediateDrainOperation(t *testing.T) {
+func TestRequiredAdmissionTargetPreservesCanonicalTargetOverIntermediateDrainOperation(t *testing.T) {
 	t.Parallel()
 
 	const rel = "reclaimed-0"
@@ -251,18 +251,13 @@ func TestFinalAdmissionTargetPreservesCanonicalTargetOverIntermediateDrainOperat
 		t.Fatalf("intermediate drain target size = %d, want 2", got)
 	}
 
-	finalTargets := finalAdmissionTarget(required)
-	if !reflect.DeepEqual(finalTargets, required.TargetByRel) {
-		t.Fatalf("final admission targets = %+v, want required canonical targets %+v",
-			finalTargets, required.TargetByRel)
+	if !reflect.DeepEqual(required.TargetByRel, canonicalTargets) {
+		t.Fatalf("required admission targets = %+v, want original canonical targets %+v",
+			required.TargetByRel, canonicalTargets)
 	}
-	if !reflect.DeepEqual(finalTargets, canonicalTargets) {
-		t.Fatalf("final admission targets = %+v, want original canonical targets %+v",
-			finalTargets, canonicalTargets)
-	}
-	got, ok := finalTargets[rel]
+	got, ok := required.TargetByRel[rel]
 	if !ok {
-		t.Fatalf("finalAdmissionTarget() did not find canonical target for %q", rel)
+		t.Fatalf("required target did not retain canonical target for %q", rel)
 	}
 	if got.CPUs.Size() != 18 || !got.CPUs.Equals(canonicalCPUs) {
 		t.Fatalf("final admission CPUs = %s (size %d), want canonical %s (size 18)",

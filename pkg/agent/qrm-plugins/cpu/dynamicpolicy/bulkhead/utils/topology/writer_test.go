@@ -1006,7 +1006,8 @@ func TestSafeWriterV2EmptyConfiguredCPUWriteRecordsSuccessfulJournal(t *testing.
 		t.Fatalf("journal observed/target CPUs = %q/%q, want empty/empty",
 			applied.Observed.CPUs.String(), applied.Target.CPUs.String())
 	}
-	if !roundOutcomeMadeNetProgress(RoundOutcome{Journal: result.Journal}) {
+	outcome := RoundOutcome{Progress: ProgressMeasure{VerifiedWrites: len(result.Journal)}}
+	if !outcome.Progress.MadeProgress() {
 		t.Fatal("verified empty configured CPU write must count as progress")
 	}
 }
@@ -1746,7 +1747,7 @@ func TestSafeWriterSkipsStableUncontrolledV2ChildWithoutCpusetController(t *test
 	}
 }
 
-func TestScanLiveChildrenOnceFailsClosedWithoutSkipProof(t *testing.T) {
+func TestScanStableLiveChildrenFailsClosedWithoutSkipProof(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name            string
@@ -1783,10 +1784,11 @@ func TestScanLiveChildrenOnceFailsClosedWithoutSkipProof(t *testing.T) {
 				return ErrCgroupControllerUnavailable
 			}
 
-			_, err := scanLiveChildrenOnce(
-				context.Background(), driver, plan.Operations[0], safeWriterFailClosedRels(plan))
+			_, err := scanStableLiveChildren(
+				context.Background(), driver, plan.Operations[0].Rel, true,
+				safeWriterFailClosedRels(plan))
 			if !errors.Is(err, tc.wantErr) {
-				t.Fatalf("scanLiveChildrenOnce() error = %v, want %v", err, tc.wantErr)
+				t.Fatalf("scanStableLiveChildren() error = %v, want %v", err, tc.wantErr)
 			}
 		})
 	}
