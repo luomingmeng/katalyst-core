@@ -166,6 +166,8 @@ func (e *EvictionHelper) getEvictionCmpFuncs(rankingMetrics []string, numaID int
 
 				// prioritize evicting the pod whose QoS level is reclaimed_cores
 				return general.CmpBool(isReclaimedPod1, isReclaimedPod2)
+			case evictionconfig.FakeMetricNativeQoS:
+				return native.PodNativeQoSCmpFunc(p1, p2)
 			case evictionconfig.FakeMetricPriority:
 				// prioritize evicting the pod whose priority is lower
 				return general.ReverseCmpFunc(native.PodPriorityCmpFunc)(p1, p2)

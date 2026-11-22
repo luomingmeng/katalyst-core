@@ -20,9 +20,10 @@ import "github.com/kubewharf/katalyst-core/pkg/config/agent/dynamic/crd"
 
 // Fake metrics are not fetched from meta-server
 const (
-	FakeMetricQoSLevel = "qos.pod"
-	FakeMetricPriority = "priority.pod"
-	FakeMetricSaleMode = "sale_mode.pod"
+	FakeMetricQoSLevel  = "qos.pod"
+	FakeMetricNativeQoS = "native.qos.pod"
+	FakeMetricPriority  = "priority.pod"
+	FakeMetricSaleMode  = "sale_mode.pod"
 )
 
 // DefaultEvictionRankingMetrics is the default ranking metrics for eviction
