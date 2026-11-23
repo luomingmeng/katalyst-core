@@ -574,6 +574,13 @@ func (tmo *transparentMemoryOffloading) Reconcile(status *types.MemoryPressureSt
 			general.Infof("Get nil pod from meta server.")
 			continue
 		}
+		// TMO currently operates on Kubernetes container metrics only. Whole-Pod
+		// targets remain excluded even when their metric mapping is unavailable.
+		_, handled, resolveErr := tmo.metaServer.ResolvePodMetricTarget(context.Background(), pod)
+		if handled || resolveErr != nil {
+			continue
+		}
+
 		qos, err := tmo.conf.QoSConfiguration.GetQoSLevel(pod, map[string]string{})
 		if err != nil {
 			general.Infof("Failed to get qos level for pod uid: %s", pod.UID)
