@@ -287,15 +287,16 @@ func (m *MalachiteMetricsProvisioner) updateCgroupData() error {
 
 // Get raw cgroup data by malachite sdk and set container metrics to metricStore, GC not existed pod metrics
 func (m *MalachiteMetricsProvisioner) updatePodsCgroupData(ctx context.Context) error {
-	podsContainersStats, err := m.malachiteClient.GetAllPodContainersStats(ctx)
+	result, err := m.malachiteClient.GetAllPodContainersStats(ctx)
 	if err != nil {
-		klog.Errorf("[malachite] GetAllPodsContainersStats failed, error %v", err)
+		general.Errorf("[malachite] GetAllPodContainersStats failed: %v", err)
 		_ = m.emitter.StoreInt64(metricsNameMalachiteGetPodStatusFailed, 1, metrics.MetricTypeNameCount)
 	}
+	if result.PodUIDSet == nil {
+		return err
+	}
 
-	podUIDSet := make(map[string]bool)
-	for podUID, containerStats := range podsContainersStats {
-		podUIDSet[podUID] = true
+	for podUID, containerStats := range result.Stats {
 		for containerName, cgStats := range containerStats {
 			m.processContainerCPUData(podUID, containerName, cgStats)
 			m.processContainerMemoryData(podUID, containerName, cgStats)
@@ -305,8 +306,9 @@ func (m *MalachiteMetricsProvisioner) updatePodsCgroupData(ctx context.Context) 
 			m.processContainerPerNumaMemoryData(podUID, containerName, cgStats)
 		}
 	}
-	m.metricStore.GCPodsMetric(podUIDSet)
-	return err
+	m.metricStore.GCPodsMetric(result.PodUIDSet)
+	// Individual sample failures are logged above, not treated as readiness failures.
+	return nil
 }
 
 func (m *MalachiteMetricsProvisioner) processSystemInfoData(systemInfoData *malachitetypes.SystemInfoData) {

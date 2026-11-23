@@ -21,6 +21,7 @@ import (
 	"fmt"
 
 	v1 "k8s.io/api/core/v1"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric/provisioner/malachite/types"
 	metrictypes "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric/types"
@@ -30,30 +31,52 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/native"
 )
 
-func (c *MalachiteClient) GetAllPodContainersStats(ctx context.Context) (map[string]map[string]*types.MalachiteCgroupInfo, error) {
+// PodContainersStats keeps source membership separate from successful samples.
+// A nil PodUIDSet means inventory failed and must not authorize metric GC.
+type PodContainersStats struct {
+	PodUIDSet map[string]bool
+	Stats     map[string]map[string]*types.MalachiteCgroupInfo
+}
+
+func (c *MalachiteClient) GetAllPodContainersStats(ctx context.Context) (PodContainersStats, error) {
 	pods, err := c.fetcher.GetPodList(ctx, func(_ *v1.Pod) bool { return true })
 	if err != nil {
-		return nil, fmt.Errorf("GetAllPodContainersStats fetch-pods err %v", err)
+		return PodContainersStats{}, fmt.Errorf("GetAllPodContainersStats fetch-pods: %w", err)
 	}
-
-	podsContainersStats := make(map[string]map[string]*types.MalachiteCgroupInfo)
-	for _, pod := range pods {
+	result := PodContainersStats{
+		PodUIDSet: make(map[string]bool, len(pods)),
+		Stats:     make(map[string]map[string]*types.MalachiteCgroupInfo),
+	}
+	var errs []error
+	for _, p := range pods {
+		if p == nil || p.UID == "" {
+			return PodContainersStats{}, fmt.Errorf("container metric inventory has no Pod UID")
+		}
 		if provider, ok := c.fetcher.(metrictypes.PodMetricTargetProvider); ok {
-			_, handled, _ := provider.ResolvePodMetricTarget(ctx, pod)
+			_, handled, resolveErr := provider.ResolvePodMetricTarget(ctx, p)
 			if handled {
 				continue
 			}
+			if resolveErr != nil {
+				return PodContainersStats{}, fmt.Errorf("container metric inventory Pod %s: %w", p.UID, resolveErr)
+			}
 		}
-		stats, err := c.GetPodStats(ctx, string(pod.UID))
-		if err != nil {
-			general.Errorf("GetAllPodContainersStats err %v", err)
-			continue
-		} else if len(stats) == 0 {
-			continue
+		uid := string(p.UID)
+		if result.PodUIDSet[uid] {
+			return PodContainersStats{}, fmt.Errorf("container metric inventory has duplicate Pod UID %s", uid)
 		}
-		podsContainersStats[string(pod.UID)] = stats
+		result.PodUIDSet[uid] = true
 	}
-	return podsContainersStats, nil
+	for uid := range result.PodUIDSet {
+		stats, err := c.GetPodStats(ctx, uid)
+		if err != nil {
+			errs = append(errs, err)
+		}
+		if len(stats) > 0 {
+			result.Stats[uid] = stats
+		}
+	}
+	return result, utilerrors.NewAggregate(errs)
 }
 
 func (c *MalachiteClient) GetPodStats(ctx context.Context, podUID string) (map[string]*types.MalachiteCgroupInfo, error) {
@@ -63,10 +86,12 @@ func (c *MalachiteClient) GetPodStats(ctx context.Context, podUID string) (map[s
 	}
 
 	containersStats := make(map[string]*types.MalachiteCgroupInfo)
+	var errs []error
 	for _, containerStatus := range pod.Status.ContainerStatuses {
 		containerID := native.TrimContainerIDPrefix(containerStatus.ContainerID)
 		stats, err := c.GetPodContainerStats(podUID, containerID)
 		if err != nil {
+			errs = append(errs, fmt.Errorf("Pod %s container %s stats: %w", podUID, containerStatus.Name, err))
 			general.Errorf("failed to get pod %s container %s stats, err %v", podUID, containerID, err)
 			_ = c.emitter.StoreInt64(metricMalachiteContainerStatsMissing, 1, metrics.MetricTypeNameCount,
 				metrics.MetricTag{Key: "podUID", Val: podUID},
@@ -76,7 +101,7 @@ func (c *MalachiteClient) GetPodStats(ctx context.Context, podUID string) (map[s
 		}
 		containersStats[containerStatus.Name] = stats
 	}
-	return containersStats, nil
+	return containersStats, utilerrors.NewAggregate(errs)
 }
 
 func (c *MalachiteClient) GetPodContainerStats(podUID, containerID string) (*types.MalachiteCgroupInfo, error) {

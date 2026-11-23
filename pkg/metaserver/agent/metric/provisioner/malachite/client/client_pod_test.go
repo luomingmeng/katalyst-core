@@ -160,8 +160,9 @@ func TestGetPodContainerStats(t *testing.T) {
 	})
 
 	stats, err := malachiteClient.GetAllPodContainersStats(context.Background())
-	assert.NoError(t, err)
-	assert.Equal(t, 0, len(stats))
+	assert.Error(t, err)
+	assert.Empty(t, stats.Stats)
+	assert.Len(t, stats.PodUIDSet, 4)
 
 	relativePathFunc := func(podUID, containerId string) (string, error) {
 		return path.Join(fmt.Sprintf("%s%s", common.PodCgroupPathPrefix, podUID), containerId), nil
@@ -169,18 +170,19 @@ func TestGetPodContainerStats(t *testing.T) {
 	malachiteClient.relativePathFunc = &relativePathFunc
 
 	stats, err = malachiteClient.GetAllPodContainersStats(context.Background())
-	assert.NoError(t, err)
-	assert.Equal(t, 3, len(stats))
+	assert.Error(t, err)
+	assert.Len(t, stats.Stats, 3)
+	assert.Len(t, stats.PodUIDSet, 4)
 
-	assert.NotNil(t, stats["p-uid1"]["p1-c-name1"].V1)
-	assert.Nil(t, stats["p-uid1"]["p1-c-name1"].V2)
+	assert.NotNil(t, stats.Stats["p-uid1"]["p1-c-name1"].V1)
+	assert.Nil(t, stats.Stats["p-uid1"]["p1-c-name1"].V2)
 
-	assert.NotNil(t, stats["p-uid1"]["p1-c-name2"].V2)
-	assert.Nil(t, stats["p-uid1"]["p1-c-name2"].V1)
+	assert.NotNil(t, stats.Stats["p-uid1"]["p1-c-name2"].V2)
+	assert.Nil(t, stats.Stats["p-uid1"]["p1-c-name2"].V1)
 
-	assert.NotNil(t, stats["p-uid2"]["p2-c-name1"].V1)
-	assert.Nil(t, stats["p-uid2"]["p2-c-name1"].V2)
+	assert.NotNil(t, stats.Stats["p-uid2"]["p2-c-name1"].V1)
+	assert.Nil(t, stats.Stats["p-uid2"]["p2-c-name1"].V2)
 
-	assert.NotNil(t, stats["p-uid3"]["p3-c-name1"].V2)
-	assert.Nil(t, stats["p-uid3"]["p3-c-name1"].V1)
+	assert.NotNil(t, stats.Stats["p-uid3"]["p3-c-name1"].V2)
+	assert.Nil(t, stats.Stats["p-uid3"]["p3-c-name1"].V1)
 }

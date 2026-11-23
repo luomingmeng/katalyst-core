@@ -234,7 +234,8 @@ func TestPodMetricCollectionSingleReadAndFailure(t *testing.T) {
 	f.PodList = []*v1.Pod{f.target.Pod}
 	containers, err := c.GetAllPodContainersStats(context.Background())
 	require.NoError(t, err)
-	assert.Empty(t, containers)
+	assert.Empty(t, containers.Stats)
+	assert.Empty(t, containers.PodUIDSet)
 	assert.Zero(t, atomic.LoadInt32(&calls))
 	for round := 0; round < 2; round++ {
 		require.NoError(t, m.updatePodMetrics(context.Background()))
