@@ -82,10 +82,23 @@ func (m *managerImpl) UpdateCPUBurst(conf *config.Configuration, dynamicConfig *
 	}
 
 	var errList []error
-
-	isSoleSharedCoresPod := util.IsSoleSharedCoresPod(conf, podList, dynamicConfig)
-
+	containerPods := make([]*v1.Pod, 0, len(podList))
 	for _, pod := range podList {
+		_, handled, resolveErr := m.metaServer.ResolvePodMetricTarget(ctx, pod)
+		if handled {
+			continue
+		}
+		if resolveErr != nil {
+			errList = append(errList, fmt.Errorf("resolve cpu burst Pod %s: %w", pod.UID, resolveErr))
+			continue
+		}
+		containerPods = append(containerPods, pod)
+	}
+
+	// Whole-workload projections must not affect ordinary Pod burst defaults.
+	isSoleSharedCoresPod := util.IsSoleSharedCoresPod(conf, containerPods, dynamicConfig)
+
+	for _, pod := range containerPods {
 		cpuBurstPolicy, err := util.GetPodCPUBurstPolicy(conf, pod, dynamicConfig, isSoleSharedCoresPod)
 		if err != nil {
 			errList = append(errList, fmt.Errorf("error getting cpu burst policy for pod %s: %v", pod.Name, err))
