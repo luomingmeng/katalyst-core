@@ -418,17 +418,27 @@ func (am AllocationMap) getNumberDevices() int {
 		return 0
 	}
 
-	return len(am)
+	// AllocationMap also contains zero-capacity ownership placeholders.
+	// Ratios describe live capacity, not the number of bookkeeping entries.
+	count := 0
+	for _, allocation := range am {
+		if allocation != nil && allocation.Allocatable > 0 {
+			count++
+		}
+	}
+	return count
 }
 
 type DefaultResourceStateGeneratorRegistry struct {
-	mutex      sync.RWMutex
-	generators map[string]DefaultResourceStateGenerator
+	mutex           sync.RWMutex
+	generators      map[string]DefaultResourceStateGenerator
+	retentionGroups map[string]map[string]struct{}
 }
 
 func NewDefaultResourceStateGeneratorRegistry() *DefaultResourceStateGeneratorRegistry {
 	return &DefaultResourceStateGeneratorRegistry{
-		generators: make(map[string]DefaultResourceStateGenerator),
+		generators:      make(map[string]DefaultResourceStateGenerator),
+		retentionGroups: make(map[string]map[string]struct{}),
 	}
 }
 
@@ -437,6 +447,38 @@ func (r *DefaultResourceStateGeneratorRegistry) RegisterResourceStateGenerator(r
 	defer r.mutex.Unlock()
 
 	r.generators[resourceName] = generator
+}
+
+// RegisterResourceStateRetentionGroup makes resources that share one physical
+// device lifecycle retain that device until every member has released it.
+func (r *DefaultResourceStateGeneratorRegistry) RegisterResourceStateRetentionGroup(group string, resourceNames ...string) {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+
+	if r.retentionGroups == nil {
+		r.retentionGroups = make(map[string]map[string]struct{})
+	}
+	members, ok := r.retentionGroups[group]
+	if !ok {
+		members = make(map[string]struct{})
+		r.retentionGroups[group] = members
+	}
+	for _, name := range resourceNames {
+		members[name] = struct{}{}
+	}
+}
+
+func (r *DefaultResourceStateGeneratorRegistry) GetResourceStateRetentionGroups() map[string][]string {
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+
+	result := make(map[string][]string, len(r.retentionGroups))
+	for group, members := range r.retentionGroups {
+		for name := range members {
+			result[group] = append(result[group], name)
+		}
+	}
+	return result
 }
 
 func (r *DefaultResourceStateGeneratorRegistry) GetGenerators() map[string]DefaultResourceStateGenerator {

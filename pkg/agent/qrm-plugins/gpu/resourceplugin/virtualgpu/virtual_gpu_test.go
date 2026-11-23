@@ -139,6 +139,31 @@ func makeTestBasePlugin(t *testing.T) *baseplugin.BasePlugin {
 	return basePlugin
 }
 
+// prepareGPUDeviceState models policy convergence for tests of plugin behavior.
+// It retains fixture allocations while filling discovered device capacity.
+func prepareGPUDeviceState(t *testing.T, base *baseplugin.BasePlugin) {
+	t.Helper()
+	topology, err := state.GetMergedDeviceTopology(base.DeviceTopologyRegistry, base.Conf.GPUDeviceNames)
+	if err != nil {
+		return
+	} // tests that deliberately omit discovery
+	m := base.GetState().GetMachineState()
+	for name, capacity := range map[v1.ResourceName]float64{"gpu_device": 1, consts.ResourceGPUMemory: float64(base.Conf.GPUMemoryAllocatablePerGPU.Value()), consts.ResourceMilliGPU: float64(base.Conf.MilliGPUAllocatablePerGPU.Value())} {
+		if m[name] == nil {
+			m[name] = state.AllocationMap{}
+		}
+		for id := range topology.Devices {
+			if m[name][id] == nil {
+				m[name][id] = &state.AllocationState{Allocatable: capacity}
+			}
+			if name == "gpu_device" {
+				m[name][id].Allocatable = 1
+			}
+		}
+	}
+	base.GetState().SetMachineState(m, false)
+}
+
 func TestVirtualGPUPlugin_GetTopologyHints(t *testing.T) {
 	t.Parallel()
 
@@ -1824,6 +1849,7 @@ func TestVirtualGPUPlugin_Allocate(t *testing.T) {
 			if tt.allocationResourcesMap != nil {
 				basePlugin.GetState().SetMachineState(*tt.allocationResourcesMap, true)
 			}
+			prepareGPUDeviceState(t, basePlugin)
 
 			resourcePlugin := NewVirtualGPUPlugin(basePlugin)
 
@@ -2296,6 +2322,7 @@ func TestVirtualGPUPlugin_GetTopologyAwareAllocatableResources(t *testing.T) {
 				assert.NoError(t, err)
 			}
 
+			prepareGPUDeviceState(t, basePlugin)
 			resp, err := gpuComputePlugin.GetTopologyAwareAllocatableResources(context.Background())
 			if tt.expectedErr {
 				assert.Error(t, err)
@@ -2627,6 +2654,7 @@ func TestVirtualGPUPlugin_Allocate_DisableEnvInjectionAnnotation(t *testing.T) {
 				return
 			}
 
+			prepareGPUDeviceState(t, basePlugin)
 			resp, err := plugin.Allocate(context.Background(), &pluginapi.ResourceRequest{
 				PodUid:        "test-pod-env-gate",
 				ContainerName: "test-container-env-gate",

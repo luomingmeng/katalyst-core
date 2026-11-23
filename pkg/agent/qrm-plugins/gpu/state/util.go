@@ -94,6 +94,8 @@ func GenerateMachineStateFromPodEntries(
 		machineState[v1.ResourceName(resourceName)] = allocationMap
 	}
 
+	retainResourceGroupDevices(machineState, podResourceEntries, defaultMachineStateGenerators)
+
 	return machineState, nil
 }
 
@@ -105,6 +107,15 @@ func GenerateResourceStateFromPodEntries(
 	machineState, err := generator.GenerateDefaultResourceState()
 	if err != nil {
 		return nil, fmt.Errorf("GenerateDefaultResourceState failed with error: %v", err)
+	}
+
+	// Keep allocated device IDs even when discovery temporarily omits them.
+	// Zero allocatable prevents these retained entries from becoming new capacity.
+	if _, topologyBacked := generator.(*genericDefaultResourceStateGenerator); topologyBacked {
+		retainAllocatedDevices(machineState, podEntries)
+	}
+	if _, frozen := generator.(*frozenResourceStateGenerator); frozen {
+		retainAllocatedDevices(machineState, podEntries)
 	}
 
 	for deviceID, allocationState := range machineState {
@@ -164,8 +175,8 @@ func (g *genericDefaultResourceStateGenerator) GenerateDefaultResourceState() (A
 		return nil, fmt.Errorf("topology provider registry must not be nil")
 	}
 
-	// We pick the latest topology from multiple device names to generate a single unified state
-	latestTopology, _, err := g.topologyRegistry.GetLatestDeviceTopology(g.deviceNames)
+	// Resource state covers the union, not whichever alias updated last.
+	latestTopology, err := GetMergedDeviceTopology(g.topologyRegistry, g.deviceNames)
 	if err != nil {
 		return nil, fmt.Errorf("topology provider registry failed to get latest topology: %v", err)
 	}

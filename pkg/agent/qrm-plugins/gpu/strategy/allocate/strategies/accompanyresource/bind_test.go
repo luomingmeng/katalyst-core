@@ -34,7 +34,7 @@ import (
 
 // helper to create a pre-allocated allocation state for a specific pod/container
 func preallocState(podUID, container string) *state.AllocationState {
-	return &state.AllocationState{PodEntries: state.PodEntries{
+	return &state.AllocationState{Allocatable: 1, PodEntries: state.PodEntries{
 		podUID: state.ContainerEntries{
 			container: &state.AllocationInfo{},
 		},
@@ -68,7 +68,7 @@ func TestBind(t *testing.T) {
 							"r1": preallocState("p", "c"),
 						},
 						gpuconsts.GPUDeviceType: {
-							"g0": nil,
+							"g0": {Allocatable: 1},
 						},
 					}
 				}(),
@@ -98,7 +98,7 @@ func TestBind(t *testing.T) {
 							"r0": preallocState("p", "c"),
 						},
 						gpuconsts.GPUDeviceType: {
-							"g0": nil,
+							"g0": {Allocatable: 1},
 						},
 					}
 				}(),
@@ -128,7 +128,7 @@ func TestBind(t *testing.T) {
 						},
 						// Keep only one GPU in machine state to ensure ratio=1.
 						gpuconsts.GPUDeviceType: {
-							"1": nil,
+							"1": {Allocatable: 1},
 						},
 					}
 				}(),
@@ -162,8 +162,8 @@ func TestBind(t *testing.T) {
 						},
 						// Only two GPUs in machine state to keep ratio = 1
 						gpuconsts.GPUDeviceType: {
-							"1": nil,
-							"2": nil,
+							"1": {Allocatable: 1},
+							"2": {Allocatable: 1},
 						},
 					}
 				}(),
@@ -199,9 +199,9 @@ func TestBind(t *testing.T) {
 							"r1": preallocState("p", "c"),
 						},
 						gpuconsts.GPUDeviceType: {
-							"g0": nil,
-							"g1": nil,
-							"g2": nil,
+							"g0": {Allocatable: 1},
+							"g1": {Allocatable: 1},
+							"g2": {Allocatable: 1},
 						},
 					}
 				}(),
@@ -228,9 +228,9 @@ func TestBind(t *testing.T) {
 							"r1": preallocState("p", "c"),
 						},
 						gpuconsts.GPUDeviceType: {
-							"g0": nil,
-							"g1": nil,
-							"g2": nil,
+							"g0": {Allocatable: 1},
+							"g1": {Allocatable: 1},
+							"g2": {Allocatable: 1},
 						},
 					}
 				}(),
@@ -259,8 +259,8 @@ func TestBind(t *testing.T) {
 							"r1": preallocState("p", "c"),
 						},
 						gpuconsts.GPUDeviceType: {
-							"g0": nil,
-							"g1": nil,
+							"g0": {Allocatable: 1},
+							"g1": {Allocatable: 1},
 						},
 					}
 				}(),
@@ -291,8 +291,8 @@ func TestBind(t *testing.T) {
 							"r3": preallocState("p", "c"),
 						},
 						gpuconsts.GPUDeviceType: {
-							"g0": nil,
-							"g1": nil,
+							"g0": {Allocatable: 1},
+							"g1": {Allocatable: 1},
 						},
 					}
 				}(),
@@ -326,8 +326,8 @@ func TestBind(t *testing.T) {
 						},
 						gpuconsts.GPUDeviceType: {
 							// Two GPUs in machine state so ratio computes to 1
-							"g0": nil,
-							"g1": nil,
+							"g0": {Allocatable: 1},
+							"g1": {Allocatable: 1},
 						},
 					}
 				}(),
@@ -382,8 +382,8 @@ func TestBind(t *testing.T) {
 							"1": preallocState("p", "c"),
 						},
 						gpuconsts.GPUDeviceType: {
-							"0": nil,
-							"1": nil,
+							"0": {Allocatable: 1},
+							"1": {Allocatable: 1},
 						},
 					}
 				}(),
@@ -416,8 +416,8 @@ func TestBind(t *testing.T) {
 							"1": preallocState("p", "c"),
 						},
 						gpuconsts.GPUDeviceType: {
-							"0": nil,
-							"1": nil,
+							"0": {Allocatable: 1},
+							"1": {Allocatable: 1},
 						},
 					}
 				}(),
@@ -451,8 +451,8 @@ func TestBind(t *testing.T) {
 							"1": preallocState("p", "c"),
 						},
 						gpuconsts.GPUDeviceType: {
-							"0": nil,
-							"1": nil,
+							"0": {Allocatable: 1},
+							"1": {Allocatable: 1},
 						},
 					}
 				}(),
@@ -486,8 +486,8 @@ func TestBind(t *testing.T) {
 							"r0": preallocState("p", "c"),
 						},
 						gpuconsts.GPUDeviceType: {
-							"g0": nil,
-							"g1": nil,
+							"g0": {Allocatable: 1},
+							"g1": {Allocatable: 1},
 						},
 					}
 				}(),
@@ -517,9 +517,9 @@ func TestBind(t *testing.T) {
 							"r1": preallocState("p", "c"),
 						},
 						gpuconsts.GPUDeviceType: {
-							"g0": nil,
-							"g1": nil,
-							"g2": nil,
+							"g0": {Allocatable: 1},
+							"g1": {Allocatable: 1},
+							"g2": {Allocatable: 1},
 						},
 					}
 				}(),
@@ -551,11 +551,11 @@ func TestBind(t *testing.T) {
 							"r1": preallocState("p", "c"),
 						},
 						gpuconsts.GPUDeviceType: {
-							"g0": nil,
-							"g1": nil,
-							"g2": nil,
-							"g3": nil,
-							"g4": nil,
+							"g0": {Allocatable: 1},
+							"g1": {Allocatable: 1},
+							"g2": {Allocatable: 1},
+							"g3": {Allocatable: 1},
+							"g4": {Allocatable: 1},
 						},
 					}
 				}(),
@@ -586,12 +586,12 @@ func TestBind(t *testing.T) {
 					return state.AllocationResourcesMap{
 						gpuconsts.RDMADeviceType: {
 							"r0": preallocState("p", "c"), // 1 allocated
-							"r1": nil,                     // total 2
+							"r1": {Allocatable: 1},        // total 2
 						},
 						gpuconsts.GPUDeviceType: {
-							"g0": nil,
-							"g1": nil,
-							"g2": nil,
+							"g0": {Allocatable: 1},
+							"g1": {Allocatable: 1},
+							"g2": {Allocatable: 1},
 						},
 					}
 				}(),
@@ -617,9 +617,9 @@ func TestBind(t *testing.T) {
 							"r0": preallocState("p", "c"),
 						},
 						gpuconsts.GPUDeviceType: {
-							"g0": nil,
-							"g1": nil,
-							"g2": nil,
+							"g0": {Allocatable: 1},
+							"g1": {Allocatable: 1},
+							"g2": {Allocatable: 1},
 						},
 					}
 				}(),
@@ -646,9 +646,9 @@ func TestBind(t *testing.T) {
 							"r0": preallocState("p", "c"),
 						},
 						gpuconsts.GPUDeviceType: {
-							"g0": nil,
-							"g1": nil,
-							"g2": nil,
+							"g0": {Allocatable: 1},
+							"g1": {Allocatable: 1},
+							"g2": {Allocatable: 1},
 						},
 					}
 				}(),
@@ -677,8 +677,8 @@ func TestBind(t *testing.T) {
 							"r1": preallocState("p", "c"),
 						},
 						gpuconsts.GPUDeviceType: {
-							"g0": nil,
-							"g1": nil,
+							"g0": {Allocatable: 1},
+							"g1": {Allocatable: 1},
 						},
 					}
 				}(),
@@ -708,7 +708,7 @@ func TestBind(t *testing.T) {
 							"r1": preallocState("p", "c"),
 						},
 						gpuconsts.GPUDeviceType: {
-							"g0": nil,
+							"g0": {Allocatable: 1},
 						},
 					}
 				}(),

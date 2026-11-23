@@ -78,6 +78,7 @@ func generateTestConfiguration(t *testing.T) *config.Configuration {
 	conf := config.NewConfiguration()
 	tmpDir := t.TempDir()
 	conf.QRMPluginSocketDirs = []string{tmpDir}
+	conf.PluginRegistrationDir = tmpDir
 	conf.CheckpointManagerDir = tmpDir
 	conf.KubeletDevicePluginPath = tmpDir
 	conf.GPUDeviceNames = []string{testResourcePluginName} // Add default device name for tests
@@ -731,14 +732,14 @@ func TestStaticPolicy_UpdateAllocatableAssociatedDevices(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, resp)
 
-	// Test error handling for no device request
+	// An empty device list is a valid all-undiscovered inventory and passes through to the plugin.
 	noDeviceRequest := &pluginapi.UpdateAllocatableAssociatedDevicesRequest{
 		DeviceName: testCustomDevicePluginName,
 	}
 
 	resp, err = policy.UpdateAllocatableAssociatedDevices(context.Background(), noDeviceRequest)
-	assert.Error(t, err)
-	assert.Nil(t, resp)
+	assert.NoError(t, err)
+	assert.NotNil(t, resp)
 
 	// Test error handling for non-existent custom device plugin
 	invalidReq := &pluginapi.UpdateAllocatableAssociatedDevicesRequest{
@@ -764,6 +765,38 @@ func TestStaticPolicy_UpdateAllocatableAssociatedDevices(t *testing.T) {
 	resp, err = policy.UpdateAllocatableAssociatedDevices(context.Background(), newReq)
 	assert.NoError(t, err)
 	assert.NotNil(t, resp)
+}
+
+// TestStaticPolicy_UpdateAllocatableAssociatedDevicesAcceptsEmptyInventory traces the real
+// StaticPolicy entry through the registered GPU plugin into the topology registry. An empty
+// device list is a valid all-undiscovered inventory and must reach the plugin and registry;
+// only a nil request is rejected at the entry boundary.
+func TestStaticPolicy_UpdateAllocatableAssociatedDevicesAcceptsEmptyInventory(t *testing.T) {
+	t.Parallel()
+
+	policy := makeTestStaticPolicy(t)
+
+	// nil request stays rejected at the entry boundary.
+	nilResp, err := policy.UpdateAllocatableAssociatedDevices(context.Background(), nil)
+	assert.Error(t, err)
+	assert.Nil(t, nilResp)
+
+	// Empty inventory goes through the real registered GPU plugin to the registry.
+	emptyReq := &pluginapi.UpdateAllocatableAssociatedDevicesRequest{DeviceName: testResourcePluginName}
+	resp, err := policy.UpdateAllocatableAssociatedDevices(context.Background(), emptyReq)
+	assert.NoError(t, err)
+	assert.NotNil(t, resp)
+
+	topology, err := policy.DeviceTopologyRegistry.GetDeviceTopology(testResourcePluginName)
+	assert.NoError(t, err)
+	assert.NotNil(t, topology)
+	assert.Empty(t, topology.Devices)
+
+	// Unknown plugin name is still rejected before any registry write.
+	unknownResp, err := policy.UpdateAllocatableAssociatedDevices(context.Background(),
+		&pluginapi.UpdateAllocatableAssociatedDevicesRequest{DeviceName: "non-existent-device"})
+	assert.Error(t, err)
+	assert.Nil(t, unknownResp)
 }
 
 func TestStaticPolicy_AllocateAssociatedDevices(t *testing.T) {

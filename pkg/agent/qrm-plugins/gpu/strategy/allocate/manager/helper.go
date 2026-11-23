@@ -21,6 +21,7 @@ import (
 
 	pluginapi "k8s.io/kubelet/pkg/apis/resourceplugin/v1alpha1"
 
+	gpuconsts "github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/consts"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/state"
 	"github.com/kubewharf/katalyst-core/pkg/agent/qrm-plugins/gpu/strategy/allocate"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent/qrm"
@@ -41,6 +42,38 @@ func AllocateDevicesUsingStrategy(
 	qosLevel, resourceName, accompanyResourceName string,
 	deviceNameToTypeMap map[string]string,
 ) (*allocate.AllocationResult, error) {
+	if resourceReq == nil || deviceReq == nil || gpuConfig == nil || deviceTopologyRegistry == nil {
+		return nil, fmt.Errorf("nil device allocation input")
+	}
+	// GPU resource requests must not use retained state for a disappeared or
+	// unhealthy device, including when custom strategies replace all filters.
+	for _, name := range gpuConfig.GPUDeviceNames {
+		if name != deviceReq.DeviceName {
+			continue
+		}
+		topology, err := deviceTopologyRegistry.GetDeviceTopology(name)
+		if err != nil {
+			return nil, err
+		}
+		requestCopy := *deviceReq
+		filter := func(ids []string) []string {
+			result := make([]string, 0, len(ids))
+			for _, id := range ids {
+				if healthy, exists := topology.IsDeviceHealthy(id); exists && healthy {
+					allocation := machineState[gpuconsts.GPUDeviceType][id]
+					if allocation != nil && allocation.Allocatable > 0 {
+						result = append(result, id)
+					}
+				}
+			}
+			return result
+		}
+		requestCopy.AvailableDevices = filter(deviceReq.AvailableDevices)
+		requestCopy.ReusableDevices = filter(deviceReq.ReusableDevices)
+		deviceReq = &requestCopy
+		break
+	}
+
 	// Get hint nodes
 	hintNodes, err := machine.NewCPUSetUint64(deviceReq.GetHint().GetNodes()...)
 	if err != nil {

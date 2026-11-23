@@ -407,16 +407,16 @@ func TestGPUDevicePlugin_AllocateAssociatedDevice(t *testing.T) {
 			deviceTopology: &machine.DeviceTopology{
 				Devices: map[string]machine.DeviceInfo{
 					"test-gpu-0": {
-						NumaNodes: []int{0},
+						NumaNodes: []int{0}, Health: pluginapi.Healthy,
 					},
 					"test-gpu-1": {
-						NumaNodes: []int{1},
+						NumaNodes: []int{1}, Health: pluginapi.Healthy,
 					},
 					"test-gpu-2": {
-						NumaNodes: []int{0},
+						NumaNodes: []int{0}, Health: pluginapi.Healthy,
 					},
 					"test-gpu-3": {
-						NumaNodes: []int{1},
+						NumaNodes: []int{1}, Health: pluginapi.Healthy,
 					},
 				},
 			},
@@ -450,16 +450,16 @@ func TestGPUDevicePlugin_AllocateAssociatedDevice(t *testing.T) {
 			deviceTopology: &machine.DeviceTopology{
 				Devices: map[string]machine.DeviceInfo{
 					"test-gpu-0": {
-						NumaNodes: []int{0},
+						NumaNodes: []int{0}, Health: pluginapi.Healthy,
 					},
 					"test-gpu-1": {
-						NumaNodes: []int{1},
+						NumaNodes: []int{1}, Health: pluginapi.Healthy,
 					},
 					"test-gpu-2": {
-						NumaNodes: []int{0},
+						NumaNodes: []int{0}, Health: pluginapi.Healthy,
 					},
 					"test-gpu-3": {
-						NumaNodes: []int{1},
+						NumaNodes: []int{1}, Health: pluginapi.Healthy,
 					},
 				},
 			},
@@ -499,6 +499,18 @@ func TestGPUDevicePlugin_AllocateAssociatedDevice(t *testing.T) {
 			if tt.deviceTopology != nil {
 				err := basePlugin.DeviceTopologyRegistry.SetDeviceTopology("test-gpu", tt.deviceTopology)
 				assert.NoError(t, err)
+				m := basePlugin.GetState().GetMachineState()
+				if m[gpuconsts.GPUDeviceType] == nil {
+					m[gpuconsts.GPUDeviceType] = state.AllocationMap{}
+				}
+				for id := range tt.deviceTopology.Devices {
+					if m[gpuconsts.GPUDeviceType][id] == nil {
+						m[gpuconsts.GPUDeviceType][id] = &state.AllocationState{Allocatable: 1}
+					} else {
+						m[gpuconsts.GPUDeviceType][id].Allocatable = 1
+					}
+				}
+				basePlugin.GetState().SetMachineState(m, false)
 			}
 
 			resourceReq := &pluginapi.ResourceRequest{
@@ -1603,6 +1615,20 @@ func TestGPUDevicePlugin_GetAssociatedDeviceTopologyHints(t *testing.T) {
 				basePlugin.PodAnnotationKeptKeys = append(basePlugin.PodAnnotationKeptKeys, tt.gpuSelectionAnnotationKey)
 			}
 
+			if tt.deviceTopology != nil {
+				m := basePlugin.GetState().GetMachineState()
+				if m[gpuconsts.GPUDeviceType] == nil {
+					m[gpuconsts.GPUDeviceType] = state.AllocationMap{}
+				}
+				for id := range tt.deviceTopology.Devices {
+					if m[gpuconsts.GPUDeviceType][id] == nil {
+						m[gpuconsts.GPUDeviceType][id] = &state.AllocationState{Allocatable: 1}
+					} else {
+						m[gpuconsts.GPUDeviceType][id].Allocatable = 1
+					}
+				}
+				basePlugin.GetState().SetMachineState(m, false)
+			}
 			resp, err := devicePlugin.GetAssociatedDeviceTopologyHints(context.Background(), tt.deviceReq)
 			if tt.expectedErr {
 				assert.Error(t, err)

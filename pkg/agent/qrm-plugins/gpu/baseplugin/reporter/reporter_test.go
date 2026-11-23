@@ -3013,7 +3013,7 @@ func TestGpuReporterPlugin_addGPUZoneNodes(t *testing.T) {
 			emitter := newMockMetricsEmitter()
 			p := &gpuReporterPlugin{emitter: emitter}
 
-			err = p.addGPUZoneNodes(tc.topology, generator)
+			err = p.addGPUZoneNodes(tc.topology, generator, nil)
 			assert.NoError(t, err)
 
 			got := collectDeviceParents(t, generator)

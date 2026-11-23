@@ -81,14 +81,14 @@ func TestAllocationResourcesMap_GetRatioOfAccompanyResourceToTargetResource(t *t
 			targetResourceName:    "targetResource",
 			arm: AllocationResourcesMap{
 				v1.ResourceName("accompanyResource"): {
-					"accompany1": {},
-					"accompany2": {},
-					"accompany3": {},
-					"accompany4": {},
+					"accompany1": {Allocatable: 1},
+					"accompany2": {Allocatable: 1},
+					"accompany3": {Allocatable: 1},
+					"accompany4": {Allocatable: 1},
 				},
 				v1.ResourceName("targetResource"): {
-					"target1": {},
-					"target2": {},
+					"target1": {Allocatable: 1},
+					"target2": {Allocatable: 1},
 				},
 			},
 			want: 2.0,
@@ -99,14 +99,14 @@ func TestAllocationResourcesMap_GetRatioOfAccompanyResourceToTargetResource(t *t
 			targetResourceName:    "targetResource",
 			arm: AllocationResourcesMap{
 				v1.ResourceName("accompanyResource"): {
-					"accompany1": {},
-					"accompany2": {},
+					"accompany1": {Allocatable: 1},
+					"accompany2": {Allocatable: 1},
 				},
 				v1.ResourceName("targetResource"): {
-					"target1": {},
-					"target2": {},
-					"target3": {},
-					"target4": {},
+					"target1": {Allocatable: 1},
+					"target2": {Allocatable: 1},
+					"target3": {Allocatable: 1},
+					"target4": {Allocatable: 1},
 				},
 			},
 			want: 0.5,
@@ -117,8 +117,8 @@ func TestAllocationResourcesMap_GetRatioOfAccompanyResourceToTargetResource(t *t
 			targetResourceName:    "targetResource",
 			arm: AllocationResourcesMap{
 				v1.ResourceName("accompanyResource"): {
-					"accompany1": {},
-					"accompany2": {},
+					"accompany1": {Allocatable: 1},
+					"accompany2": {Allocatable: 1},
 				},
 			},
 			want: 0,
