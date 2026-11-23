@@ -85,12 +85,22 @@ func (m *managerImpl) UpdateContainerCPUIdle(conf *config.Configuration) error {
 		return nil
 	}
 
-	podList, err := m.metaServer.GetPodList(context.Background(), native.PodIsActive)
+	ctx := context.Background()
+	podList, err := m.metaServer.GetPodList(ctx, native.PodIsActive)
 	if err != nil {
 		return fmt.Errorf("error getting pod list: %v", err)
 	}
 
+	var resolveErrors []error
 	for _, pod := range podList {
+		_, handled, resolveErr := m.metaServer.ResolvePodMetricTarget(ctx, pod)
+		if handled {
+			continue
+		}
+		if resolveErr != nil {
+			resolveErrors = append(resolveErrors, fmt.Errorf("resolve container cpu idle Pod %s: %w", pod.UID, resolveErr))
+			continue
+		}
 		found, idleConfig, err := qosutil.GetPodContainerCPUIdleRateConfigFromAnnotation(pod.Annotations)
 		if err != nil {
 			general.Warningf("parse container cpu idle annotation for pod %s/%s failed: %v",
@@ -107,7 +117,7 @@ func (m *managerImpl) UpdateContainerCPUIdle(conf *config.Configuration) error {
 		}
 	}
 
-	return nil
+	return utilerrors.NewAggregate(resolveErrors)
 }
 
 func (m *managerImpl) applyCPUIdleSettingsForPod(conf *config.Configuration, pod *v1.Pod, idleConfig katalystapiconsts.ContainerCPUIdleRateConfig) error {
