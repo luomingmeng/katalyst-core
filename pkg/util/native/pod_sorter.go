@@ -36,6 +36,12 @@ var (
 		apiconsts.PodAnnotationQoSLevelSystemCores:    3,
 	}
 
+	podNativeQoSRank = map[v1.PodQOSClass]int{
+		v1.PodQOSBestEffort: 0,
+		v1.PodQOSBurstable:  1,
+		v1.PodQOSGuaranteed: 2,
+	}
+
 	podSaleModeRank = map[string]int{
 		apiconsts.PodSaleModeSpot:      0,
 		apiconsts.PodSaleModeScheduled: 1,
@@ -153,22 +159,9 @@ func PodQoSCmpFunc(i1, i2 interface{}) int {
 // PodNativeQoSCmpFunc uses requests/limits instead of Status, which may be absent
 // on projected Sandbox objects. Smaller ranks are evicted first.
 func PodNativeQoSCmpFunc(i1, i2 interface{}) int {
-	rank := func(pod *v1.Pod) int {
-		if pod == nil || len(pod.Spec.Containers) == 0 {
-			return 3
-		}
-		switch qos.GetPodQOS(pod) {
-		case v1.PodQOSBestEffort:
-			return 0
-		case v1.PodQOSBurstable:
-			return 1
-		case v1.PodQOSGuaranteed:
-			return 2
-		default:
-			return 3
-		}
-	}
-	return cmpRank(rank(i1.(*v1.Pod)), rank(i2.(*v1.Pod)))
+	p1, p2 := i1.(*v1.Pod), i2.(*v1.Pod)
+
+	return cmpRank(getPodNativeQoSRank(p1), getPodNativeQoSRank(p2))
 }
 
 // PodSaleModeCmpFunc sorts pods by eviction sale mode priority.
@@ -208,6 +201,18 @@ func getPodQoSRank(pod *v1.Pod) int {
 	}
 
 	return len(podQoSRank)
+}
+
+func getPodNativeQoSRank(pod *v1.Pod) int {
+	if pod == nil || len(pod.Spec.Containers) == 0 {
+		return len(podNativeQoSRank)
+	}
+
+	if rank, ok := podNativeQoSRank[qos.GetPodQOS(pod)]; ok {
+		return rank
+	}
+
+	return len(podNativeQoSRank)
 }
 
 func getPodSaleModeRank(pod *v1.Pod, annotationKey string) int {

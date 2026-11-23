@@ -21,6 +21,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
@@ -116,6 +117,42 @@ func TestPodQoSCmpFunc(t *testing.T) {
 	sortedPods := NewPodSourceList(pods).Sort(PodQoSCmpFunc).Pods()
 
 	assert.Equal(t, []string{"reclaimed", "shared", "dedicated", "system", "unknown"}, podNamesForSourceListTest(sortedPods))
+}
+
+func TestPodNativeQoSCmpFunc(t *testing.T) {
+	t.Parallel()
+
+	requests := v1.ResourceList{
+		v1.ResourceCPU:    resource.MustParse("1"),
+		v1.ResourceMemory: resource.MustParse("1Gi"),
+	}
+	bestEffort := &v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{{Name: "main"}}}}
+	bestEffort.Status.QOSClass = v1.PodQOSGuaranteed
+	burstable := &v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{{Name: "main", Resources: v1.ResourceRequirements{Requests: requests}}}}}
+	guaranteed := &v1.Pod{Spec: v1.PodSpec{Containers: []v1.Container{{Name: "main", Resources: v1.ResourceRequirements{Requests: requests, Limits: requests.DeepCopy()}}}}}
+	initBurstable := guaranteed.DeepCopy()
+	initBurstable.Spec.InitContainers = []v1.Container{{Name: "init"}}
+	multiBurstable := guaranteed.DeepCopy()
+	multiBurstable.Spec.Containers = append(multiBurstable.Spec.Containers, v1.Container{Name: "sidecar"})
+	initOnly := &v1.Pod{Spec: v1.PodSpec{InitContainers: guaranteed.Spec.Containers}}
+
+	pods := []*v1.Pod{bestEffort, burstable, guaranteed, {}, nil, initOnly}
+	for i, p1 := range pods {
+		for j, p2 := range pods {
+			want := 0
+			if i != j && (i < 3 || j < 3) {
+				want = 1
+				if i < j {
+					want = -1
+				}
+			}
+			assert.Equal(t, want, PodNativeQoSCmpFunc(p1, p2), "pair %d/%d", i, j)
+		}
+	}
+	assert.Zero(t, PodNativeQoSCmpFunc(initBurstable, burstable))
+	assert.Zero(t, PodNativeQoSCmpFunc(multiBurstable, burstable))
+	assert.Equal(t, []*v1.Pod{bestEffort, burstable, guaranteed},
+		NewPodSourceList([]*v1.Pod{guaranteed, bestEffort, burstable}).Sort(PodNativeQoSCmpFunc).Pods())
 }
 
 func TestPodSaleModeCmpFunc(t *testing.T) {
