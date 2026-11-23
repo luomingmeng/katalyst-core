@@ -97,7 +97,12 @@ func (w safeCPUSetWriter) withAdjustmentBudget(budget *AdjustmentBudget) safeCPU
 // subsystem. The preflight freeze prevents "write to A, then discover B is
 // stale" partial-application bugs; the rollback prevents drifting cgroup state
 // after a mid-plan failure.
-func (w safeCPUSetWriter) execute(ctx context.Context, plan PhasePlan) error {
+func (w safeCPUSetWriter) execute(ctx context.Context, plan PhasePlan) (executionErr error) {
+	// Recovery accounting must also work when the caller does not request a
+	// result. The existing mutation stack owns only this invocation's writes.
+	if w.res == nil {
+		w.res = &ConvergenceResult{}
+	}
 	if plan.PlanID == "" || canonicalExecutionPlanID(plan) != plan.PlanID {
 		return fmt.Errorf("phase writer requires canonical plan id")
 	}
@@ -126,9 +131,14 @@ func (w safeCPUSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 	for _, operation := range plan.Operations {
 		ioOperations = saturatingAdd(ioOperations,
 			estimateFinalPreflightAndMutationHierarchyIO(operation, len(stableChildUnion[operation.Rel].refs)))
+		cost := physicalWriteCost(operation.ExpectedCurrent, operation.Target, operation.WriteMems)
+		ioOperations = saturatingAdd(ioOperations, 1+cost.Total()) // pinned before-read and failed-write readback
+		if plan.Capabilities.EmptyConfiguredCPUSet && operation.ParentRel != "" && (operation.Target.CPUs.IsEmpty() || operation.Target.Mems == "") {
+			ioOperations = saturatingAdd(ioOperations, 1) // inherited effective after-state
+		}
 		ioOperations = saturatingAdd(ioOperations, w.dormantProofCountUnder(operation.Rel))
 	}
-	ioOperations = saturatingAdd(ioOperations, len(w.dormantProofs))
+	ioOperations = saturatingAdd(ioOperations, w.dormantProofCountUnder(""))
 	driver, err := newStrictReservedHierarchyDriver(ctx, w.driver, w.budget, ioOperations)
 	if err != nil {
 		return err
@@ -161,6 +171,14 @@ func (w safeCPUSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 		return err
 	}
 	w.adjustmentReservation = reservation
+	cost := planExecutionReservationCost(plan)
+	ticket := &ExecutionReservationTicket{
+		reserved: cost, rollbackIOOperations: saturatingMultiply(cost.Rollback.Total(), 5),
+	}
+	defer ticket.ReleaseUnused()
+	stack := &traceMutationStack{}
+	var failureObservation *AppliedPlanOperation
+	journalStart, appliedStart := len(w.res.Journal), w.res.Applied
 	forwardStart, rollbackStart := 0, 0
 	if w.res != nil {
 		forwardStart = w.res.forwardWriteAttempts
@@ -176,13 +194,27 @@ func (w safeCPUSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 			w.res.rollbackWriteAttempts-rollbackStart,
 		)
 	}()
+	defer func() {
+		if executionErr != nil && len(stack.writes) != 0 {
+			executionErr = w.failFrozenTrace(ctx, executionErr, stack, ticket, w.res, journalStart, appliedStart)
+			// Restoring this plan does not establish authority to restart a
+			// coordinator attempt that may include earlier phases.
+			w.res.ReplanDisposition = ReplanNotAllowed
+			if failureObservation != nil && rollbackVerificationComplete(stack) && len(w.res.Journal) == journalStart {
+				if observation, ok := stack.rollbackObservations[failureObservation.Rel]; ok && observation.err == nil && !observation.retired {
+					failureObservation.Observed = CPUSetTarget{CPUs: observation.current.CPUs.Clone(), Mems: observation.current.Mems}
+					w.res.Journal = append(w.res.Journal, *failureObservation)
+				}
+			}
+		}
+	}()
 
 	if len(plan.Operations) > 0 {
 		if err := w.revalidateDormantProofs(ctx, ""); err != nil {
 			return err
 		}
 	}
-	for _, operation := range plan.Operations {
+	for operationIndex, operation := range plan.Operations {
 		// Recheck only the dormant envelopes that this operation's ancestor
 		// containment depends on. This keeps the authorization close to the
 		// corresponding write without multiplying activity scans for unrelated
@@ -190,32 +222,69 @@ func (w safeCPUSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 		if err := w.revalidateDormantProofs(ctx, operation.Rel); err != nil {
 			return err
 		}
+		current, err := w.driver.ReadEntry(ctx, operation.Rel)
+		if err != nil {
+			return w.classifyHierarchyReadError(err, operation)
+		}
+		if current.Identity != operation.ExpectedIdentity {
+			return &PlanStaleError{
+				Rel: operation.Rel, Direction: operation.Direction, Resource: "identity",
+				Current: fmt.Sprint(current.Identity), Target: fmt.Sprint(operation.ExpectedIdentity),
+			}
+		}
+		if err := validateLiveOperationDirection(operation, current, plan.Capabilities); err != nil {
+			return err
+		}
+		afterCPUs, afterMems := operation.Target.CPUs.Clone(), operation.Target.Mems
+		if plan.Capabilities.EmptyConfiguredCPUSet {
+			afterMems = current.Mems
+			if operation.WriteMems && operation.Target.Mems != "" {
+				afterMems = operation.Target.Mems
+			}
+			if operation.Target.CPUs.IsEmpty() {
+				afterCPUs = current.CPUs.Clone()
+			}
+			if operation.ParentRel != "" && (operation.Target.CPUs.IsEmpty() || (operation.WriteMems && operation.Target.Mems == "")) {
+				parent, err := w.driver.ReadEntry(ctx, operation.ParentRel)
+				if err != nil {
+					return w.classifyHierarchyReadError(err, operation)
+				}
+				if parent.Identity != operation.ExpectedParentIdentity {
+					return ErrCgroupIdentityChanged
+				}
+				if operation.Target.CPUs.IsEmpty() {
+					afterCPUs = parent.CPUs.Clone()
+				}
+				if operation.WriteMems && operation.Target.Mems == "" {
+					afterMems = parent.Mems
+				}
+			}
+		}
 		if w.res != nil {
 			w.res.Attempted++
 		}
-		wroteMems := false
-		wroteCPUs := false
 		if operation.WriteMems && operation.ExpectedCurrent.Mems != operation.Target.Mems {
 			if err := w.recordForwardPhysicalWriteAttempt(ctx, PhysicalWriteCost{MemsWrites: 1}); err != nil {
 				return err
 			}
+			write := physicalWriteBeforeFromEntry(current, operation, HierarchyOperationWriteMems,
+				operation.Target.Mems, operationIndex, plan.Kind, afterMems)
 			if err := w.driver.WriteMems(ctx, operation.Rel, operation.ExpectedIdentity, operation.Target.Mems); err != nil {
-				if w.res != nil {
-					w.res.Failed++
-				}
-				return w.classifyWriteError(
+				w.res.Failed++
+				readbackErr := w.recordUncertainPhysicalWrite(ctx, write, stack)
+				return newExecutionEvidenceError(w.classifyWriteError(
 					err, plan.Kind, HierarchyOperationWriteMems, operation, "cpuset.mems",
-					operation.ExpectedCurrent.Mems, operation.Target.Mems)
+					operation.ExpectedCurrent.Mems, operation.Target.Mems), readbackErr)
 			}
-			wroteMems = true
+			stack.writes = append(stack.writes, write)
+			current.ConfiguredMems, current.Mems = operation.Target.Mems, afterMems
 		}
 		if !operation.ExpectedCurrent.CPUs.Equals(operation.Target.CPUs) {
 			if err := w.recordForwardPhysicalWriteAttempt(ctx, PhysicalWriteCost{CPUSetWrites: 1}); err != nil {
-				if rollbackErr := w.rollbackOperationWithRecovery(operation, wroteCPUs, wroteMems); rollbackErr != nil {
-					return executionWithRollbackError(err, rollbackErr)
-				}
 				return err
 			}
+			write := physicalWriteBeforeFromEntry(current, operation, HierarchyOperationWriteCPUs,
+				operation.Target.CPUs.String(), operationIndex, plan.Kind, afterCPUs.String())
 			if err := w.driver.WriteCPUs(ctx, operation.Rel, operation.ExpectedIdentity, operation.Target.CPUs); err != nil {
 				if w.res != nil {
 					w.res.Failed++
@@ -228,33 +297,25 @@ func (w safeCPUSetWriter) execute(ctx context.Context, plan PhasePlan) error {
 					)
 				} else {
 					current := operation.ExpectedCurrent.CPUs.String()
-					if wroteMems {
-						if applied, readErr := w.readAppliedObservation(ctx, operation); readErr == nil {
-							current = applied.Observed.CPUs.String()
-						}
-					}
 					writeErr = &PlanStaleError{
 						Rel: operation.Rel, Direction: operation.Direction, Resource: "cpuset.cpus",
 						Current: current, Target: operation.Target.CPUs.String(), Err: err,
 					}
 				}
-				if rollbackErr := w.rollbackOperationWithRecovery(operation, wroteCPUs, wroteMems); rollbackErr != nil {
-					return executionWithRollbackError(writeErr, rollbackErr)
-				}
-				return writeErr
+				return newExecutionEvidenceError(writeErr, w.recordUncertainPhysicalWrite(ctx, write, stack))
 			}
-			wroteCPUs = true
+			stack.writes = append(stack.writes, write)
 		}
 		applied, err := w.readAfterWrite(ctx, operation)
 		if w.res != nil && applied.PlanID != "" {
 			w.res.Journal = append(w.res.Journal, applied)
 		}
 		if err != nil {
+			if applied.PlanID != "" {
+				failureObservation = &applied
+			}
 			if w.res != nil {
 				w.res.Failed++
-			}
-			if rollbackErr := w.rollbackOperationWithRecovery(operation, wroteCPUs, wroteMems); rollbackErr != nil {
-				return executionWithRollbackError(err, rollbackErr)
 			}
 			return err
 		}
@@ -336,9 +397,10 @@ func (w safeCPUSetWriter) rollbackOperation(
 
 func (w safeCPUSetWriter) dormantProofCountUnder(ancestor string) int {
 	count := 0
-	for root := range w.dormantProofs {
-		if ancestor == "" || isRelAtOrUnder(root, ancestor) {
-			count++
+	for root, proof := range w.dormantProofs {
+		if ancestor == "" || isRelAtOrUnder(root, ancestor) || len(proof.Ancestors) != 0 {
+			count = saturatingAdd(count, 1)
+			count = saturatingAdd(count, saturatingMultiply(2, len(proof.Ancestors)))
 		}
 	}
 	return count
@@ -365,10 +427,39 @@ func (w safeCPUSetWriter) revalidateDormantProofs(ctx context.Context, ancestor 
 	}
 	sort.Strings(roots)
 	for _, root := range roots {
-		if ancestor != "" && !isRelAtOrUnder(root, ancestor) {
+		proof := w.dormantProofs[root]
+		if ancestor != "" && !isRelAtOrUnder(root, ancestor) && len(proof.Ancestors) == 0 {
 			continue
 		}
-		proof := w.dormantProofs[root]
+		ancestorRels := make([]string, 0, len(proof.Ancestors))
+		for rel := range proof.Ancestors {
+			ancestorRels = append(ancestorRels, rel)
+		}
+		sort.Strings(ancestorRels)
+		for _, rel := range ancestorRels {
+			observed := proof.Ancestors[rel]
+			current, err := reader.ReadEntryWithActivity(ctx, rel, observed.Identity)
+			if err != nil {
+				if w.driver.Classify(err, HierarchyOperationRead) == HierarchyErrorStale {
+					return &PlanStaleError{Rel: rel, Direction: WritePublish, Resource: "dormant_ancestor", Err: err}
+				}
+				return err
+			}
+			children, err := w.driver.ListChildren(ctx, rel)
+			if err != nil {
+				if w.driver.Classify(err, HierarchyOperationList) == HierarchyErrorStale {
+					return &PlanStaleError{Rel: rel, Direction: WritePublish, Resource: "dormant_ancestor", Err: err}
+				}
+				return err
+			}
+			if current.Identity != observed.Identity || !current.Activity.TasksEmpty ||
+				!current.Activity.CgroupProcsEmpty || ChildrenFingerprint(children) != observed.Children {
+				return &PlanStaleError{
+					Rel: rel, Direction: WritePublish, Resource: "dormant_ancestor",
+					Current: "activity or child identity changed", Target: "observed direct empty membership",
+				}
+			}
+		}
 		entry, err := reader.ReadEntryWithActivity(ctx, root, proof.Identity)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||

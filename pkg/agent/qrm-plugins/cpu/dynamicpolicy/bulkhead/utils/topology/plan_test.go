@@ -698,7 +698,7 @@ func TestMaterializeTargetsKeepsLegalV1FourNUMAParentChildContainment(t *testing
 	inactive := CgroupActivity{TasksEmpty: true, CgroupProcsEmpty: true, Childless: true}
 	snapshot := planSnapshot(map[string]EntryState{
 		"primary":        {Identity: CgroupIdentity{Inode: 1}, CPUs: machine.MustParse("0-3"), Mems: "0-3"},
-		"reclaim":        {Identity: CgroupIdentity{Inode: 2}, CPUs: allCPUs, Mems: "0-3"},
+		"reclaim":        {Identity: CgroupIdentity{Inode: 2}, CPUs: allCPUs, Mems: "0-3", Activity: CgroupActivity{TasksEmpty: true, CgroupProcsEmpty: true}},
 		"reclaim/numa-0": {Identity: CgroupIdentity{Inode: 3}, CPUs: allCPUs, Mems: "0", Activity: inactive},
 		"reclaim/numa-1": {Identity: CgroupIdentity{Inode: 4}, CPUs: allCPUs, Mems: "1", Activity: inactive},
 		"reclaim/numa-2": {Identity: CgroupIdentity{Inode: 5}, CPUs: machine.MustParse("4-5"), Mems: "2"},
@@ -713,6 +713,12 @@ func TestMaterializeTargetsKeepsLegalV1FourNUMAParentChildContainment(t *testing
 		"reclaim/numa-2": DomainReclaim, "reclaim/numa-3": DomainReclaim,
 	}
 	snapshot.Children = map[string][]ChildRef{
+		"reclaim": {
+			{Name: "numa-0", Identity: snapshot.Entries["reclaim/numa-0"].Identity},
+			{Name: "numa-1", Identity: snapshot.Entries["reclaim/numa-1"].Identity},
+			{Name: "numa-2", Identity: snapshot.Entries["reclaim/numa-2"].Identity},
+			{Name: "numa-3", Identity: snapshot.Entries["reclaim/numa-3"].Identity},
+		},
 		"reclaim/numa-0": nil,
 		"reclaim/numa-1": nil,
 	}

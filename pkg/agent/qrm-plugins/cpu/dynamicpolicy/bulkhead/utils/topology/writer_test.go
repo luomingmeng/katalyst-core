@@ -1125,9 +1125,10 @@ func TestV1FourNUMAWriterSkipsDormantBucketsAndWritesActiveBuckets(t *testing.T)
 	driver.add("reclaim/numa-3", CgroupIdentity{Device: 1, Inode: 5}, "6-7", "3")
 	driver.nodes["reclaim/numa-0"].activity = inactive
 	driver.nodes["reclaim/numa-1"].activity = inactive
+	driver.markInactive("reclaim")
 
 	snapshot := planSnapshot(map[string]EntryState{
-		"reclaim":        {Identity: driver.nodes["reclaim"].identity, CPUs: machine.MustParse("0-7"), Mems: "0-3"},
+		"reclaim":        {Identity: driver.nodes["reclaim"].identity, CPUs: machine.MustParse("0-7"), Mems: "0-3", Activity: CgroupActivity{TasksEmpty: true, CgroupProcsEmpty: true}},
 		"reclaim/numa-0": {Identity: driver.nodes["reclaim/numa-0"].identity, CPUs: machine.MustParse("0-7"), Mems: "0", Activity: inactive},
 		"reclaim/numa-1": {Identity: driver.nodes["reclaim/numa-1"].identity, CPUs: machine.MustParse("0-7"), Mems: "1", Activity: inactive},
 		"reclaim/numa-2": {Identity: driver.nodes["reclaim/numa-2"].identity, CPUs: machine.MustParse("4-5"), Mems: "2"},
