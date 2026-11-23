@@ -3547,9 +3547,10 @@ func (p *DynamicPolicy) applyPoolsAndIsolatedInfo(poolsCPUSet map[string]machine
 			}
 			return p.validatePendingAdvisorPartitionViewWithRampUpExclusionWithDynamicConfig(entries, ms, overlap, dedicated, dynamicConf)
 		},
-		dynamicConfig:             dynamicConf,
-		requireCoreAlignedReclaim: disableDedicatedCoresOverlapReclaimedCores,
-		residualFloor:             rampUpReclaimFloor,
+		dynamicConfig:              dynamicConf,
+		requireCoreAlignedReclaim:  disableDedicatedCoresOverlapReclaimedCores,
+		enforceNUMAReclaimPresence: true,
+		residualFloor:              rampUpReclaimFloor,
 	})
 	return err
 }
@@ -3855,6 +3856,24 @@ func (p *DynamicPolicy) generatePoolsAndIsolation(
 					return
 				}
 				configuredReclaimMinimum = configuredReclaimMinimum.Union(supplement)
+			}
+			// A reclaim NUMA that lost its only core to a non-reclaim allocation is
+			// reseeded inside that same NUMA. Topping the quantity up on another NUMA
+			// would silently drop the per-NUMA reclaim capacity.
+			if p.machine.machineInfo != nil && p.machine.machineInfo.CPUTopology != nil {
+				priorReclaim := machine.NewCPUSet()
+				if cset, cErr := p.state.GetPodEntries().GetCPUSetForPool(commonstate.PoolNameReclaim); cErr == nil {
+					priorReclaim = cset
+				}
+				adjusted, presenceErr := reclaimNUMAPresence(
+					p.machine.machineInfo.CPUTopology,
+					configuredReclaimMinimum, priorReclaim,
+					availableCPUs.Difference(rampUpReclaimFloor))
+				if presenceErr != nil {
+					err = presenceErr
+					return
+				}
+				configuredReclaimMinimum = adjusted
 			}
 			availableCPUs = availableCPUs.Difference(configuredReclaimMinimum)
 		}

@@ -373,6 +373,88 @@ func completeEligibleCoresForPreferredCPUSet(
 	return selected, nil
 }
 
+// reclaimNUMAPresence keeps the reclaim allocation represented on every physical
+// NUMA that already held reclaim CPUs before this attempt. When a non-reclaim
+// allocation consumes a NUMA's only reclaim core, the vacated CPUs are replaced
+// by a whole core from that same NUMA and the released budget is taken from a
+// core the NUMA did not previously own. It returns an error instead of moving the
+// budget to another NUMA: concentrating reclaim on a subset of NUMAs silently
+// removes the per-NUMA reclaim capacity that must stay available.
+func reclaimNUMAPresence(
+	topology *machine.CPUTopology,
+	selected, prior, eligible machine.CPUSet,
+) (machine.CPUSet, error) {
+	if topology == nil || prior.IsEmpty() {
+		return selected.Clone(), nil
+	}
+	result := selected.Clone()
+	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
+		numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
+		if numaCPUs.Intersection(prior).IsEmpty() || !numaCPUs.Intersection(result).IsEmpty() {
+			continue
+		}
+		// A NUMA whose whole capacity is owned by other pools cannot hold reclaim;
+		// only an avoidable concentration is rejected.
+		if numaCPUs.Intersection(eligible).IsEmpty() {
+			continue
+		}
+		replacement := machine.NewCPUSet()
+		for _, core := range coreAlignedCandidates(topology, eligible.Difference(result), prior) {
+			if core.cpus.Intersection(numaCPUs).Size() == core.cpus.Size() {
+				replacement = core.cpus.Clone()
+				break
+			}
+		}
+		if replacement.IsEmpty() {
+			return machine.NewCPUSet(), fmt.Errorf(
+				"reclaim must stay present on NUMA %d but no eligible whole core remains there", numaID)
+		}
+		victim, ok := reclaimBudgetVictim(topology, result, prior, numaID)
+		if !ok {
+			return machine.NewCPUSet(), fmt.Errorf(
+				"reclaim must stay present on NUMA %d but no reclaim core can be released elsewhere", numaID)
+		}
+		result = result.Difference(victim).Union(replacement)
+	}
+	return result, nil
+}
+
+// reclaimBudgetVictim picks the whole core to release so the reclaim quantity
+// does not grow. A core the NUMA did not previously own is released first; a core
+// that continues an existing reclaim NUMA is used only when nothing else exists.
+func reclaimBudgetVictim(
+	topology *machine.CPUTopology,
+	selected, prior machine.CPUSet,
+	targetNUMA int,
+) (machine.CPUSet, bool) {
+	if topology == nil {
+		return machine.NewCPUSet(), false
+	}
+	fallback := machine.NewCPUSet()
+	for _, numaID := range topology.CPUDetails.NUMANodes().ToSliceInt() {
+		if numaID == targetNUMA {
+			continue
+		}
+		numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
+		cores := coreAlignedCandidates(topology, selected.Intersection(numaCPUs), machine.NewCPUSet())
+		for i := len(cores) - 1; i >= 0; i-- {
+			if cores[i].cpus.Intersection(numaCPUs).Size() != cores[i].cpus.Size() {
+				continue
+			}
+			if !cores[i].cpus.IsSubsetOf(prior) {
+				return cores[i].cpus.Clone(), true
+			}
+			if fallback.IsEmpty() {
+				fallback = cores[i].cpus.Clone()
+			}
+		}
+	}
+	if !fallback.IsEmpty() {
+		return fallback, true
+	}
+	return machine.NewCPUSet(), false
+}
+
 // assertCoreAligned is a fail-loud safety net: it returns a lowercase error when
 // reclaim holds a partial physical core. It never repairs silently; a violation signals an upstream
 // invariant break (quantity/reserve/selection) that must be surfaced, not masked.
