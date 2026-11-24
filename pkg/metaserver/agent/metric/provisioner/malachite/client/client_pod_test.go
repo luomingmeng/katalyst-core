@@ -19,6 +19,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -31,10 +32,48 @@ import (
 	apitypes "k8s.io/apimachinery/pkg/types"
 
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric/provisioner/malachite/types"
+	metrictypes "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric/types"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/pod"
 	"github.com/kubewharf/katalyst-core/pkg/metrics"
 	"github.com/kubewharf/katalyst-core/pkg/util/cgroup/common"
 )
+
+type resolveErrorPodFetcher struct {
+	pod.PodFetcherStub
+	errUID string
+}
+
+func (f *resolveErrorPodFetcher) GetPodMetricTargets(context.Context) ([]metrictypes.PodMetricTarget, error) {
+	return nil, nil
+}
+
+func (f *resolveErrorPodFetcher) ResolvePodMetricTarget(
+	_ context.Context,
+	p *v1.Pod,
+) (metrictypes.PodMetricTarget, bool, error) {
+	if string(p.UID) == f.errUID {
+		return metrictypes.PodMetricTarget{}, false, errors.New("target source unavailable")
+	}
+	return metrictypes.PodMetricTarget{}, false, nil
+}
+
+func TestGetAllPodContainersStatsSkipsPodWhenMetricTargetResolutionFails(t *testing.T) {
+	t.Parallel()
+
+	fetcher := &resolveErrorPodFetcher{
+		PodFetcherStub: pod.PodFetcherStub{PodList: []*v1.Pod{
+			{ObjectMeta: metav1.ObjectMeta{UID: "bad"}},
+			{ObjectMeta: metav1.ObjectMeta{UID: "good"}},
+		}},
+		errUID: "bad",
+	}
+	client := NewMalachiteClient(fetcher, metrics.DummyMetrics{})
+
+	stats, err := client.GetAllPodContainersStats(context.Background())
+	assert.NoError(t, err)
+	assert.Equal(t, map[string]bool{"good": true}, stats.PodUIDSet)
+	assert.Empty(t, stats.Stats)
+}
 
 func TestGetPodContainerStats(t *testing.T) {
 	t.Parallel()

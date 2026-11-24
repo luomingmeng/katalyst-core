@@ -242,7 +242,7 @@ func TestContainerMetricGCUsesInventory(t *testing.T) {
 			c := client.NewMalachiteClient(f, metrics.DummyMetrics{})
 			c.SetURL(map[string]string{client.CgroupResource: server.URL})
 			m := &MalachiteMetricsProvisioner{podFetcher: f, malachiteClient: c, metricStore: store, emitter: metrics.DummyMetrics{}, baseConf: &global.BaseConfiguration{MalachiteConfiguration: &global.MalachiteConfiguration{}}}
-			inventoryFailed := scenario == "list failure" || scenario == "nil member" || scenario == "empty UID" || scenario == "duplicate UID" || scenario == "resolve failure"
+			inventoryFailed := scenario == "list failure" || scenario == "nil member" || scenario == "empty UID" || scenario == "duplicate UID"
 			err := m.updatePodsCgroupData(context.Background())
 			if inventoryFailed {
 				require.Error(t, err)
@@ -252,7 +252,10 @@ func TestContainerMetricGCUsesInventory(t *testing.T) {
 			for _, member := range []string{uid, "deleted"} {
 				value, metricErr := store.GetContainerMetric(member, "failed", consts.MetricMemRssContainer)
 				numa, numaErr := store.GetContainerNumaMetric(member, "failed", 0, consts.MetricsMemTotalPerNumaContainer)
-				keep := inventoryFailed || (member == uid && scenario != "empty inventory" && scenario != "whole workload")
+				keep := inventoryFailed || (member == uid &&
+					scenario != "empty inventory" &&
+					scenario != "whole workload" &&
+					scenario != "resolve failure")
 				if keep {
 					require.NoError(t, metricErr)
 					require.NoError(t, numaErr)

@@ -54,11 +54,13 @@ func (c *MalachiteClient) GetAllPodContainersStats(ctx context.Context) (PodCont
 		}
 		if provider, ok := c.fetcher.(metrictypes.PodMetricTargetProvider); ok {
 			_, handled, resolveErr := provider.ResolvePodMetricTarget(ctx, p)
-			if handled {
+			if resolveErr != nil {
+				general.Errorf("skip container metric inventory Pod %s: resolve metric target failed: %v",
+					p.UID, resolveErr)
 				continue
 			}
-			if resolveErr != nil {
-				return PodContainersStats{}, fmt.Errorf("container metric inventory Pod %s: %w", p.UID, resolveErr)
+			if handled {
+				continue
 			}
 		}
 		uid := string(p.UID)
