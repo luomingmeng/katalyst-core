@@ -53,8 +53,7 @@ type MetricStore struct {
 	cgroupMetricMap                    map[string]map[string]MetricData                    // map[cgroupPath]map[metricName]value
 	cgroupNumaMetricMap                map[string]map[int]map[string]MetricData            // map[cgroupPath]map[numaNode]map[metricName]value
 	stringIndexedMetricMap             map[string]interface{}
-	podMetricMap map[string]PodMetricData
-
+	podMetricMap                       map[string]PodMetricData
 }
 
 func NewMetricStore() *MetricStore {
@@ -71,8 +70,7 @@ func NewMetricStore() *MetricStore {
 		cgroupMetricMap:                    make(map[string]map[string]MetricData),
 		cgroupNumaMetricMap:                make(map[string]map[int]map[string]MetricData),
 		stringIndexedMetricMap:             make(map[string]interface{}),
-		podMetricMap: make(map[string]PodMetricData),
-
+		podMetricMap:                       make(map[string]PodMetricData),
 	}
 }
 
