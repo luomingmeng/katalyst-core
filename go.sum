@@ -589,6 +589,8 @@ github.com/logrusorgru/aurora v0.0.0-20181002194514-a7b3b318ed4e/go.mod h1:7rIyQ
 github.com/lpabon/godbc v0.1.1/go.mod h1:Jo9QV0cf3U6jZABgiJ2skINAXb9j8m51r07g4KI92ZA=
 github.com/luomingmeng/katalyst-api v0.0.0-20261121152805-4bbc5bfb6b67 h1:ATXgtRLhF6Bq5iqODapk3P8Cmk2m8Ged2iM753FIWc0=
 github.com/luomingmeng/katalyst-api v0.0.0-20261121152805-4bbc5bfb6b67/go.mod h1:zPTihN6wCNf7cz/EWqbUbCmL4UyucQPUG1shqgYZuUo=
+github.com/luomingmeng/katalyst-api v0.0.0-20261124235744-31b7f6a79212 h1:u9sNUrO/nPHGHcl0VAfqLXWvL8dXq6gAk2ub5SweIfA=
+github.com/luomingmeng/katalyst-api v0.0.0-20261124235744-31b7f6a79212/go.mod h1:zPTihN6wCNf7cz/EWqbUbCmL4UyucQPUG1shqgYZuUo=
 github.com/lyft/protoc-gen-validate v0.0.13/go.mod h1:XbGvPuh87YZc5TdIa2/I4pLk0QoUACkjt2znoq26NVQ=
 github.com/magiconair/properties v1.8.0/go.mod h1:PppfXfuXeibc/6YijjN8zIbojt8czPbwD3XqdrwzmxQ=
 github.com/magiconair/properties v1.8.1/go.mod h1:PppfXfuXeibc/6YijjN8zIbojt8czPbwD3XqdrwzmxQ=

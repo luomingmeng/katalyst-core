@@ -209,3 +209,5 @@ replace (
 	k8s.io/sample-controller => k8s.io/sample-controller v0.24.6
 	sigs.k8s.io/json => sigs.k8s.io/json v0.0.0-20211020170558-c049b76a60c6
 )
+
+replace github.com/kubewharf/katalyst-api => github.com/luomingmeng/katalyst-api v0.0.0-20261124235744-31b7f6a79212
