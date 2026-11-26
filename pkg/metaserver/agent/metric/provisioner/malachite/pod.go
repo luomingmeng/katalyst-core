@@ -26,6 +26,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric/provisioner/malachite/client"
 	malachitetypes "github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric/provisioner/malachite/types"
 	"github.com/kubewharf/katalyst-core/pkg/metaserver/agent/metric/types"
+	"github.com/kubewharf/katalyst-core/pkg/util/general"
 	utilmetric "github.com/kubewharf/katalyst-core/pkg/util/metric"
 )
 
@@ -51,6 +52,8 @@ func (s *podMetricWriter) SetCgroupNumaMetric(_ string, numa int, name string, d
 	s.NumaMetrics[numa][name] = data
 }
 
+// updatePodMetrics returns inventory errors, but logs individual collection failures
+// so one target cannot mark the whole sampling round unhealthy.
 func (m *MalachiteMetricsProvisioner) updatePodMetrics(ctx context.Context) error {
 	provider, ok := m.podFetcher.(types.PodMetricTargetProvider)
 	if !ok {
@@ -61,7 +64,6 @@ func (m *MalachiteMetricsProvisioner) updatePodMetrics(ctx context.Context) erro
 		return err
 	}
 	members := make(map[string]bool, len(targets))
-	errList := make([]error, 0)
 	for _, target := range targets {
 		if target.Pod == nil || target.Pod.UID == "" {
 			return fmt.Errorf("metric target has no UID")
@@ -78,11 +80,12 @@ func (m *MalachiteMetricsProvisioner) updatePodMetrics(ctx context.Context) erro
 		data, err := m.collectPodMetrics(ctx, provider, target, m.preparePodMemoryMetrics, m.preparePodCPUMetrics)
 		m.metricStore.SetPodMetrics(string(target.Pod.UID), data)
 		if err != nil {
-			errList = append(errList, err)
+			general.Errorf("collect pod metrics failed for %s/%s (UID %s, cgroup %s, revision %d): %v",
+				target.Pod.Namespace, target.Pod.Name, target.Pod.UID, target.CgroupPath, target.MappingRevision, err)
 		}
 	}
 	m.metricStore.GCPodMetricSamples(members)
-	return errors.NewAggregate(errList)
+	return nil
 }
 
 // Resource preparation captures controller identity before the shared read.

@@ -104,12 +104,7 @@ func TestPodCPUCollectionSharedReadAndResourceIsolation(t *testing.T) {
 				if mode == "request failure" {
 					atomic.StoreInt32(&requestFailure, 1)
 				}
-				err := m.updatePodMetrics(context.Background())
-				if mode == "success" {
-					require.NoError(t, err)
-				} else {
-					require.Error(t, err)
-				}
+				require.NoError(t, m.updatePodMetrics(context.Background()))
 				assert.Equal(t, int32(round+1), atomic.LoadInt32(&reads))
 				for name, value := range expected {
 					data, err := store.GetPodMetric("target", "/target", 1, name, -1)

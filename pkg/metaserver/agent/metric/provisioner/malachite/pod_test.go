@@ -44,6 +44,7 @@ import (
 type metricTargetFetcher struct {
 	pod.PodFetcherStub
 	target   metrictypes.PodMetricTarget
+	targets  []metrictypes.PodMetricTarget
 	listErr  error
 	empty    bool
 	revision uint64
@@ -55,6 +56,9 @@ func (f *metricTargetFetcher) GetPodMetricTargets(context.Context) ([]metrictype
 	}
 	if f.empty {
 		return nil, nil
+	}
+	if f.targets != nil {
+		return f.targets, nil
 	}
 	return []metrictypes.PodMetricTarget{f.target}, nil
 }
@@ -248,14 +252,14 @@ func TestPodMetricCollectionSingleReadAndFailure(t *testing.T) {
 		assert.Equal(t, int32(round+1), atomic.LoadInt32(&calls))
 	}
 	atomic.StoreInt32(&fail, 1)
-	require.Error(t, m.updatePodMetrics(context.Background()))
+	require.NoError(t, m.updatePodMetrics(context.Background()))
 	_, err = store.GetPodMetric("target", "/target", 1, consts.MetricMemRssCgroup, -1)
 	require.Error(t, err)
 	assert.Equal(t, int32(3), atomic.LoadInt32(&calls))
 	atomic.StoreInt32(&fail, 0)
 	require.NoError(t, m.updatePodMetrics(context.Background()))
 	atomic.StoreInt32(&invalidNuma, 1)
-	require.Error(t, m.updatePodMetrics(context.Background()))
+	require.NoError(t, m.updatePodMetrics(context.Background()))
 	_, err = store.GetPodMetric("target", "/target", 1, consts.MetricMemRssCgroup, -1)
 	require.NoError(t, err)
 	_, err = store.GetPodMetric("target", "/target", 1, consts.MetricsMemTotalPerNumaCgroup, 0)
@@ -273,13 +277,13 @@ func TestPodMetricCollectionSingleReadAndFailure(t *testing.T) {
 		changedFile = true
 		return os.Stat(directory)
 	}
-	require.Error(t, m.updatePodMetrics(context.Background()))
+	require.NoError(t, m.updatePodMetrics(context.Background()))
 	_, err = store.GetPodMetric("target", "/target", 1, consts.MetricMemRssCgroup, -1)
 	require.Error(t, err)
 	m.cgroupStatFn = func(string) (os.FileInfo, error) { return os.Stat(directory) }
 	require.NoError(t, m.updatePodMetrics(context.Background()))
 	f.listErr = errors.New("inventory failed")
-	require.Error(t, m.updatePodMetrics(context.Background()))
+	require.ErrorIs(t, m.updatePodMetrics(context.Background()), f.listErr)
 	_, err = store.GetPodMetric("target", "/target", 1, consts.MetricMemRssCgroup, -1)
 	require.NoError(t, err) // retained, but the source-bound business reader rejects this inventory
 	f.listErr = nil
@@ -287,6 +291,95 @@ func TestPodMetricCollectionSingleReadAndFailure(t *testing.T) {
 	require.NoError(t, m.updatePodMetrics(context.Background()))
 	_, err = store.GetPodMetric("target", "/target", 1, consts.MetricMemRssCgroup, -1)
 	require.Error(t, err)
+}
+
+func TestUpdatePodMetricsInvalidInventoryPreservesSamples(t *testing.T) {
+	t.Parallel()
+	for _, scenario := range []string{"unsupported provider", "inventory failure", "nil target", "empty UID", "duplicate UID", "empty inventory"} {
+		t.Run(scenario, func(t *testing.T) {
+			store := utilmetric.NewMetricStore()
+			target := metrictypes.PodMetricTarget{Pod: &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: "target"}}, CgroupPath: "/target", MappingRevision: 1}
+			store.SetPodMetrics("target", utilmetric.PodMetricData{
+				CgroupPath: "/target", MappingRevision: 1,
+				Metrics: map[string]utilmetric.MetricData{consts.MetricMemRssCgroup: {Value: 99}},
+			})
+			f := &metricTargetFetcher{target: target}
+			m := &MalachiteMetricsProvisioner{podFetcher: f, metricStore: store}
+			switch scenario {
+			case "unsupported provider":
+				m.podFetcher = &pod.PodFetcherStub{}
+			case "inventory failure":
+				f.listErr = errors.New("inventory failed")
+			case "nil target":
+				f.targets = []metrictypes.PodMetricTarget{target, {}}
+			case "empty UID":
+				f.targets = []metrictypes.PodMetricTarget{target, {Pod: &v1.Pod{}}}
+			case "duplicate UID":
+				f.targets = []metrictypes.PodMetricTarget{target, target}
+			case "empty inventory":
+				f.empty = true
+			}
+			// No client is installed: invalid inventories must return before any collection.
+			updateErr := m.updatePodMetrics(context.Background())
+			switch scenario {
+			case "unsupported provider", "empty inventory":
+				require.NoError(t, updateErr)
+			case "inventory failure":
+				require.ErrorIs(t, updateErr, f.listErr)
+			default:
+				require.Error(t, updateErr)
+			}
+			data, err := store.GetPodMetric("target", "/target", 1, consts.MetricMemRssCgroup, -1)
+			if scenario == "empty inventory" {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, float64(99), data.Value)
+			}
+		})
+	}
+}
+
+func TestUpdatePodMetricsContinuesAfterTargetFailure(t *testing.T) {
+	t.Parallel()
+	good := metrictypes.PodMetricTarget{Pod: &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: "good"}}, CgroupPath: "/good", MappingRevision: 1}
+	bad := metrictypes.PodMetricTarget{Pod: &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: "bad"}}, CgroupPath: "/bad", MappingRevision: 1}
+	f := &metricTargetFetcher{target: good, targets: []metrictypes.PodMetricTarget{bad, good}}
+	var reads int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reads, 1)
+		assert.Equal(t, "/good", r.URL.Query().Get(client.CgroupPathParamKey))
+		subsys := mt.SubSystemGroupsV1{}
+		subsys.Memory.V1.MemoryV1Data = mt.MemoryCgDataV1{TotalRss: 7, UpdateTime: time.Now().Unix()}
+		subsys.Cpuacct.V1.CPUData = mt.CPUCgDataV1{CPUUsageRatio: 2, UpdateTime: time.Now().Unix()}
+		raw, err := json.Marshal(subsys)
+		require.NoError(t, err)
+		require.NoError(t, json.NewEncoder(w).Encode(mt.MalachiteCgroupResponse{Data: mt.CgroupDataInner{CgroupType: "V1", SubSystemGroups: raw}}))
+	}))
+	defer server.Close()
+	c := client.NewMalachiteClient(f, metrics.DummyMetrics{})
+	c.SetURL(map[string]string{client.CgroupResource: server.URL})
+	store := utilmetric.NewMetricStore()
+	for _, uid := range []string{"bad", "deleted"} {
+		store.SetPodMetrics(uid, utilmetric.PodMetricData{
+			CgroupPath: "/" + uid, MappingRevision: 1,
+			Metrics: map[string]utilmetric.MetricData{consts.MetricMemRssCgroup: {Value: 99}},
+		})
+	}
+	directory := t.TempDir()
+	m := &MalachiteMetricsProvisioner{podFetcher: f, malachiteClient: c, metricStore: store,
+		cgroupStatFn: func(string) (os.FileInfo, error) { return os.Stat(directory) }}
+	require.NoError(t, m.updatePodMetrics(context.Background()))
+	assert.Equal(t, int32(1), atomic.LoadInt32(&reads))
+	for name, expected := range map[string]float64{consts.MetricMemRssCgroup: 7, consts.MetricCPUUsageCgroup: 2} {
+		data, err := store.GetPodMetric("good", "/good", 1, name, -1)
+		require.NoError(t, err)
+		assert.Equal(t, expected, data.Value)
+	}
+	for _, uid := range []string{"bad", "deleted"} {
+		_, err := store.GetPodMetric(uid, "/"+uid, 1, consts.MetricMemRssCgroup, -1)
+		require.Error(t, err)
+	}
 }
 
 func TestPrepareCgroupIdentityCheck(t *testing.T) {

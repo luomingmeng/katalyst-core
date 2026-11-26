@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -45,8 +46,10 @@ import (
 
 type containerInventoryFetcher struct {
 	pod.PodFetcherStub
-	listErr error
-	getErr  error
+	listErr          error
+	getErr           error
+	metricTargets    []metrictypes.PodMetricTarget
+	metricTargetsErr error
 }
 
 func (f *containerInventoryFetcher) GetPod(ctx context.Context, uid string) (*v1.Pod, error) {
@@ -64,7 +67,7 @@ func (f *containerInventoryFetcher) GetPodList(ctx context.Context, filter func(
 }
 
 func (f *containerInventoryFetcher) GetPodMetricTargets(context.Context) ([]metrictypes.PodMetricTarget, error) {
-	return nil, nil
+	return f.metricTargets, f.metricTargetsErr
 }
 
 func (f *containerInventoryFetcher) ResolvePodMetricTarget(_ context.Context, p *v1.Pod) (metrictypes.PodMetricTarget, bool, error) {
@@ -74,6 +77,11 @@ func (f *containerInventoryFetcher) ResolvePodMetricTarget(_ context.Context, p 
 	if p.Annotations["resolve-error"] == "true" {
 		return metrictypes.PodMetricTarget{}, false, errors.New("target source unavailable")
 	}
+	for _, target := range f.metricTargets {
+		if target.Pod != nil && target.Pod.UID == p.UID {
+			return target, true, nil
+		}
+	}
 	return metrictypes.PodMetricTarget{}, false, nil
 }
 
@@ -81,7 +89,7 @@ func TestContainerSamplingFailuresDoNotAffectReadiness(t *testing.T) {
 	general.RegisterReportCheck(malachiteProvisionerHealthCheckName, 0, general.HealthzCheckStateReady)
 	t.Cleanup(func() { general.UnregisterHealthCheck(malachiteProvisionerHealthCheckName) })
 
-	for _, scenario := range []string{"running sample failure", "terminal sample failure", "partial samples", "pod reread failure", "inventory failure", "system failure"} {
+	for _, scenario := range []string{"running sample failure", "terminal sample failure", "partial samples", "pod reread failure", "inventory failure", "system failure", "pod metric inventory failure", "pod metric nil target", "pod metric empty UID", "pod metric duplicate UID", "pod metric mapping failure", "pod metric request failure", "pod metric resource failure"} {
 		t.Run(scenario, func(t *testing.T) {
 			uid := "readiness-" + scenario
 			p := &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: apitypes.UID(uid)}, Status: v1.PodStatus{
@@ -99,6 +107,19 @@ func TestContainerSamplingFailuresDoNotAffectReadiness(t *testing.T) {
 				f.getErr = context.DeadlineExceeded
 			case "inventory failure":
 				f.listErr = context.DeadlineExceeded
+			case "pod metric inventory failure":
+				f.metricTargetsErr = context.DeadlineExceeded
+			case "pod metric nil target":
+				f.metricTargets = []metrictypes.PodMetricTarget{{}}
+			case "pod metric empty UID":
+				f.metricTargets = []metrictypes.PodMetricTarget{{Pod: &v1.Pod{}}}
+			case "pod metric duplicate UID":
+				f.metricTargets = []metrictypes.PodMetricTarget{{Pod: p}, {Pod: p.DeepCopy()}}
+			case "pod metric mapping failure":
+				p.Annotations = map[string]string{"whole-workload": "true"}
+				f.metricTargets = []metrictypes.PodMetricTarget{{Pod: p, CgroupPath: "/workload", MappingRevision: 1}}
+			case "pod metric request failure", "pod metric resource failure":
+				f.metricTargets = []metrictypes.PodMetricTarget{{Pod: p, CgroupPath: "/workload", MappingRevision: 1}}
 			}
 			unregister := common.RegisterRelativeCgroupPathHandlerWithUnregister(common.RelativeCgroupPathHandler{
 				Name: uid,
@@ -114,7 +135,7 @@ func TestContainerSamplingFailuresDoNotAffectReadiness(t *testing.T) {
 			})
 			defer unregister()
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path == "/fail" {
+				if r.URL.Path == "/fail" || r.URL.Path == "/cgroup" && scenario == "pod metric request failure" {
 					w.WriteHeader(http.StatusServiceUnavailable)
 					return
 				}
@@ -144,19 +165,26 @@ func TestContainerSamplingFailuresDoNotAffectReadiness(t *testing.T) {
 			old := utilmetric.MetricData{Value: 99, Time: &oldTime}
 			store.SetContainerMetric(uid, "failed", consts.MetricMemRssContainer, old)
 			m := &MalachiteMetricsProvisioner{podFetcher: f, malachiteClient: c, metricStore: store, emitter: metrics.DummyMetrics{},
-				baseConf: &global.BaseConfiguration{MalachiteConfiguration: &global.MalachiteConfiguration{}}, pathExistsFn: func(string) bool { return false }, reclaimPathsFn: func() []string { return nil }}
+				baseConf: &global.BaseConfiguration{MalachiteConfiguration: &global.MalachiteConfiguration{}}, pathExistsFn: func(string) bool { return false }, reclaimPathsFn: func() []string { return nil },
+				cgroupStatFn: func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }}
 			// Start from NotReady to prove a successful collection round recovers it.
 			require.NoError(t, general.UpdateHealthzState(malachiteProvisionerHealthCheckName, general.HealthzCheckStateNotReady, "previous failure"))
 			m.sample(context.Background())
 			result := general.GetRegisterReadinessCheckResult()[general.HealthzCheckName(malachiteProvisionerHealthCheckName)]
-			wantReady := scenario != "inventory failure" && scenario != "system failure"
+			inventoryFailed := scenario == "inventory failure" || scenario == "pod metric inventory failure" ||
+				scenario == "pod metric nil target" || scenario == "pod metric empty UID" || scenario == "pod metric duplicate UID"
+			wantReady := !inventoryFailed && scenario != "system failure"
 			require.Equal(t, wantReady, result.Ready, result.Message)
 			if wantReady {
 				require.Empty(t, result.Message)
 			}
 			value, err := store.GetContainerMetric(uid, "failed", consts.MetricMemRssContainer)
-			require.NoError(t, err)
-			require.Equal(t, old, value)
+			if scenario == "pod metric mapping failure" || scenario == "pod metric request failure" || scenario == "pod metric resource failure" || scenario == "pod metric duplicate UID" {
+				require.Error(t, err) // whole-workload targets are excluded from container inventory
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, old, value)
+			}
 			if scenario == "partial samples" {
 				value, err := store.GetContainerMetric(uid, "success", consts.MetricMemRssContainer)
 				require.NoError(t, err)
