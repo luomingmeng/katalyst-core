@@ -10899,7 +10899,8 @@ func TestCheckCPUSet(t *testing.T) {
 }
 
 func TestSchedIdle(t *testing.T) {
-	t.Parallel()
+	// Global function patches must finish before parallel tests start.
+	// The testing scheduler serializes this top-level test with their callers.
 	// this test is used to verify the sched idle support status
 
 	as := require.New(t)

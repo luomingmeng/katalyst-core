@@ -303,15 +303,13 @@ func TestEnabledNonOverlapShareReservesReclaimBeforeSoftAllocation(t *testing.T)
 			require.NoError(t, err)
 			reclaim := pools[commonstate.PoolNameReclaim]
 			require.False(t, reclaim.IsEmpty())
-			if load >= 192 {
-				require.Equal(t, 2, reclaim.Size(), "saturated soft share must leave one complete SMT core")
-			}
+			requireReclaimOnEveryNUMA(t, topo, reclaim)
 			require.True(t, reclaim.Intersection(pools[commonstate.PoolNameShare]).IsEmpty())
-			if load >= 192 {
-				require.Equal(t, 192-reclaim.Size(), pools[commonstate.PoolNameShare].Size())
-			} else {
-				require.Equal(t, load, pools[commonstate.PoolNameShare].Size(), "non-saturated share target must remain unchanged")
+			wantShare := load
+			if wantShare > 192-reclaim.Size() {
+				wantShare = 192 - reclaim.Size()
 			}
+			require.Equal(t, wantShare, pools[commonstate.PoolNameShare].Size(), "soft share is capped after per-NUMA reclaim reservation")
 			require.Equal(t, before, p.state.GetRevision(), "planning must not mutate committed state")
 			require.NoError(t, p.applyPoolsAndIsolatedInfo(
 				pools, isolated, p.state.GetPodEntries(), p.state.GetMachineState(),

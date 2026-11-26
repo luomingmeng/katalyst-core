@@ -24,8 +24,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Diagnostic probe: the ordinary PhasePlan writer must not be equated with the
-// frozen-trace writer's prefix rollback. This intentionally exposes a gap.
+// Ancestor activity changing after the first write must reject the remaining
+// operations and restore the ordinary PhasePlan's already-written prefix.
 func TestPhaseWriterAncestorActivationRestoresWrittenPrefix(t *testing.T) {
 	f, _ := dormantTransferFixture(t)
 	f.driver.markInactive("reclaim")

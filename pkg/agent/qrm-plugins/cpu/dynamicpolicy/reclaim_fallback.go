@@ -83,8 +83,6 @@ func validateReclaimNUMAPresence(
 		if !candidate.Intersection(numaCPUs).IsEmpty() {
 			continue
 		}
-		// A NUMA whose whole capacity is reserved or owned by non-reclaim pools
-		// cannot hold reclaim; only an avoidable concentration is rejected.
 		if numaCPUs.Difference(unavailable).IsEmpty() {
 			continue
 		}

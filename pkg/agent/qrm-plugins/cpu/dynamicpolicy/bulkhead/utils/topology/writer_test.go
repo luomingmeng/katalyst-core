@@ -913,7 +913,7 @@ func TestExecutionWithRollbackErrorPreservesExecutionAndReservationCauses(t *tes
 		ctx, true, PhysicalWriteCost{CPUSetWrites: 1})
 	stale := &PlanStaleError{Rel: "reclaim/numa-0", Resource: "write"}
 
-	err = executionWithRollbackError(stale, reservationErr)
+	err = newExecutionRollbackError(stale, reservationErr)
 
 	if !errors.Is(err, ErrCoordinatorPlanStale) {
 		t.Fatalf("combined error = %v, want execution stale cause", err)

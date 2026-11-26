@@ -373,13 +373,9 @@ func completeEligibleCoresForPreferredCPUSet(
 	return selected, nil
 }
 
-// reclaimNUMAPresence keeps the reclaim allocation represented on every physical
-// NUMA that already held reclaim CPUs before this attempt. When a non-reclaim
-// allocation consumes a NUMA's only reclaim core, the vacated CPUs are replaced
-// by a whole core from that same NUMA and the released budget is taken from a
-// core the NUMA did not previously own. It returns an error instead of moving the
-// budget to another NUMA: concentrating reclaim on a subset of NUMAs silently
-// removes the per-NUMA reclaim capacity that must stay available.
+// reclaimNUMAPresence preserves committed per-NUMA reclaim capacity while
+// replacing unavailable cores within the same NUMA. Only surplus whole cores
+// may fund a replacement; a donor's last whole core is never released.
 func reclaimNUMAPresence(
 	topology *machine.CPUTopology,
 	selected, prior, eligible machine.CPUSet,
@@ -419,9 +415,8 @@ func reclaimNUMAPresence(
 	return result, nil
 }
 
-// reclaimBudgetVictim picks the whole core to release so the reclaim quantity
-// does not grow. A core the NUMA did not previously own is released first; a core
-// that continues an existing reclaim NUMA is used only when nothing else exists.
+// reclaimBudgetVictim releases only surplus whole cores, preferring cores not
+// in prior. Every donor keeps at least one complete physical core.
 func reclaimBudgetVictim(
 	topology *machine.CPUTopology,
 	selected, prior machine.CPUSet,
@@ -437,6 +432,9 @@ func reclaimBudgetVictim(
 		}
 		numaCPUs := topology.CPUDetails.CPUsInNUMANodes(numaID)
 		cores := coreAlignedCandidates(topology, selected.Intersection(numaCPUs), machine.NewCPUSet())
+		if len(cores) <= 1 {
+			continue
+		}
 		for i := len(cores) - 1; i >= 0; i-- {
 			if cores[i].cpus.Intersection(numaCPUs).Size() != cores[i].cpus.Size() {
 				continue

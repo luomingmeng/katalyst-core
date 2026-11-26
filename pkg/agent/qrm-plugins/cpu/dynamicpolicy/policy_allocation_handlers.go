@@ -2561,6 +2561,26 @@ func (p *DynamicPolicy) getNotAllocatablePoolCPUs(entries state.PodEntries) mach
 	)
 }
 
+// saturatedReclaimPresence reserves one complete core in every NUMA before a
+// soft default-share target consumes the residual capacity. Committed reclaim
+// is only a placement preference because earlier hard allocations own capacity.
+func (p *DynamicPolicy) saturatedReclaimPresence(available, committed machine.CPUSet) (machine.CPUSet, error) {
+	presence := machine.NewCPUSet()
+	if p.machine.machineInfo == nil || p.machine.machineInfo.CPUTopology == nil {
+		return presence, nil
+	}
+	for _, numaID := range p.machine.machineInfo.CPUDetails.NUMANodes().ToSliceInt() {
+		numaCPUs := p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(numaID)
+		seed, seedErr := selectReclaimSeed(p.machine.machineInfo.CPUTopology,
+			available.Intersection(numaCPUs), committed.Intersection(numaCPUs), 0)
+		if seedErr != nil {
+			return machine.NewCPUSet(), fmt.Errorf("reserve reclaim core in NUMA %d before soft share: %w", numaID, seedErr)
+		}
+		presence = presence.Union(seed)
+	}
+	return presence, nil
+}
+
 func (p *DynamicPolicy) groupAndAllocatePoolsWithPlacement(
 	poolsQuantityMap map[string]map[int]int,
 	isolatedQuantityMap map[string]map[string]int,
@@ -3798,6 +3818,35 @@ func (p *DynamicPolicy) generatePoolsAndIsolation(
 	strictDisjointReclaim := enableReclaim && !allowOverlap && disableDedicatedOverlap
 	configuredReclaimMinimum := machine.NewCPUSet()
 
+	// An explicit reclaim target is a quantity contract even when soft share is
+	// far below saturation. Reject an infeasible per-domain budget before any
+	// pool allocation, rather than letting saturation decide whether it is valid.
+	if enableReclaim && !allowOverlap && enforceReclaimMinimum && explicitReclaimQuantity > 0 {
+		prior := committedReclaimPoolCPUs(p.state.GetPodEntries())
+		index := newPhysicalCoreIndex(p.machine.machineInfo.CPUTopology)
+		minimumCoreByNUMA := make(map[int]int)
+		floorNUMAs := make(map[int]bool)
+		for key, siblings := range index.byKey {
+			if siblings.IsSubsetOf(rampUpReclaimFloor) {
+				floorNUMAs[key.numaID] = true
+			}
+			if current := minimumCoreByNUMA[key.numaID]; current == 0 || siblings.Size() < current {
+				minimumCoreByNUMA[key.numaID] = siblings.Size()
+			}
+		}
+		minimum := 0
+		for _, numaID := range p.machine.machineInfo.CPUDetails.NUMANodes().ToSliceInt() {
+			if !floorNUMAs[numaID] && !prior.Intersection(p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(numaID)).IsEmpty() {
+				minimum += minimumCoreByNUMA[numaID]
+			}
+		}
+		if explicitReclaimQuantity < minimum {
+			err = fmt.Errorf("explicit reclaim quantity %d cannot preserve a whole core in every committed NUMA (needs %d)",
+				explicitReclaimQuantity, minimum)
+			return
+		}
+	}
+
 	poolsCPUSet = make(map[string]machine.CPUSet)
 	var nbpErr error
 	availableCPUs, nbpErr = p.generateNUMABindingPoolsCPUSetInPlace(poolsCPUSet, poolsQuantityMap, availableCPUs, dynamicConf)
@@ -3825,12 +3874,11 @@ func (p *DynamicPolicy) generatePoolsAndIsolation(
 			for _, cpus := range poolsCPUSet {
 				allocatedBindingCPUs = allocatedBindingCPUs.Union(cpus)
 			}
+			committedReclaim := machine.NewCPUSet()
 			if currentReclaim, currentErr := p.state.GetPodEntries().GetCPUSetForPool(commonstate.PoolNameReclaim); currentErr == nil {
-				configuredReclaimMinimum = currentReclaim
+				committedReclaim = currentReclaim
 			}
-			if placement != nil {
-				configuredReclaimMinimum = configuredReclaimMinimum.Union(placement.historicalReclaim)
-			}
+			configuredReclaimMinimum = committedReclaim
 			configuredReclaimMinimum = configuredReclaimMinimum.
 				Difference(rampUpReclaimFloor).Difference(allocatedBindingCPUs)
 			configuredReclaimMinimum = takeCoreAlignedCPUSet(
@@ -3839,13 +3887,28 @@ func (p *DynamicPolicy) generatePoolsAndIsolation(
 				configuredReclaimMinimum,
 				configuredReclaimMinimum.Size(),
 			)
+			// Retain one whole core in each historical domain before filling
+			// the remaining node minimum. The configured minimum is a floor.
+			retained := machine.NewCPUSet()
+			for _, numaID := range p.machine.machineInfo.CPUDetails.NUMANodes().ToSliceInt() {
+				numaHistory := configuredReclaimMinimum.Intersection(p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(numaID))
+				if numaHistory.IsEmpty() {
+					continue
+				}
+				seed, seedErr := selectReclaimSeed(p.machine.machineInfo.CPUTopology, numaHistory, numaHistory, 0)
+				if seedErr != nil {
+					err = seedErr
+					return
+				}
+				retained = retained.Union(seed)
+			}
 			if configuredReclaimMinimum.Size() > minimumOutsideFloor {
-				configuredReclaimMinimum = takeCoreAlignedCPUSet(
+				configuredReclaimMinimum = retained.Union(takeCoreAlignedCPUSet(
 					p.machine.machineInfo.CPUTopology,
+					configuredReclaimMinimum.Difference(retained),
 					configuredReclaimMinimum,
-					configuredReclaimMinimum,
-					minimumOutsideFloor,
-				)
+					minimumOutsideFloor-retained.Size(),
+				))
 			}
 			deficit := minimumOutsideFloor - configuredReclaimMinimum.Size()
 			if deficit > 0 {
@@ -3864,6 +3927,14 @@ func (p *DynamicPolicy) generatePoolsAndIsolation(
 				priorReclaim := machine.NewCPUSet()
 				if cset, cErr := p.state.GetPodEntries().GetCPUSetForPool(commonstate.PoolNameReclaim); cErr == nil {
 					priorReclaim = cset
+				}
+				if !rampUpReclaimFloor.IsEmpty() {
+					for key, siblings := range newPhysicalCoreIndex(p.machine.machineInfo.CPUTopology).byKey {
+						if siblings.IsSubsetOf(rampUpReclaimFloor) {
+							// Complete caller-owned floors already cover their NUMA.
+							priorReclaim = priorReclaim.Difference(p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(key.numaID))
+						}
+					}
 				}
 				adjusted, presenceErr := reclaimNUMAPresence(
 					p.machine.machineInfo.CPUTopology,
@@ -3887,28 +3958,54 @@ func (p *DynamicPolicy) generatePoolsAndIsolation(
 
 		nonBindingAvailableCPUs = nonBindingAvailableCPUs.Union(p.machine.machineInfo.CPUDetails.CPUsInNUMANodes(numaID).Intersection(availableCPUs))
 	}
-	availableCPUs = availableCPUs.Difference(nonBindingAvailableCPUs)
 
 	nonBindingAvailableSize := nonBindingAvailableCPUs.Size()
 	nonBindingPoolsTotalQuantity := general.SumUpMapValues(nonBindingPoolsQuantityMap)
 
-	// Saturated default share is a soft target, but enabled non-overlap reclaim
-	// must remain runnable. Reserve one legal core before proportional allocation
-	// instead of asking the fallback to borrow CPUs already owned by share.
-	// Keep binding, isolation, explicit floors, and non-saturated targets unchanged.
+	// Preserve one committed whole core per NUMA before any soft share target.
+	// This is the single presence reservation: it protects the committed
+	// reclaim identity and prevents a later seed from double-debiting the
+	// advisor quantity.
 	if enableReclaim && !allowOverlap && !strictDisjointReclaim &&
-		rampUpReclaimFloor.IsEmpty() && enforceReclaimMinimum && explicitReclaimQuantity == 0 &&
-		len(nonBindingPoolsQuantityMap) == 1 && len(isolatedQuantityMap) == 0 &&
-		nonBindingAvailableSize > 0 && nonBindingPoolsQuantityMap[commonstate.PoolNameShare] >= nonBindingAvailableSize {
+		rampUpReclaimFloor.IsEmpty() && enforceReclaimMinimum {
 		prior, _ := p.state.GetPodEntries().GetCPUSetForPool(commonstate.PoolNameReclaim)
-		configuredReclaimMinimum, err = selectReclaimSeed(
-			p.machine.machineInfo.CPUTopology, nonBindingAvailableCPUs, prior, 0)
-		if err != nil {
-			return
+		quantity := nonBindingPoolsQuantityMap[commonstate.PoolNameReclaim]
+		presence := machine.NewCPUSet()
+		shareQuantity := nonBindingPoolsQuantityMap[commonstate.PoolNameShare]
+		if len(isolatedQuantityMap) == 0 && shareQuantity > 0 {
+			fullPresence, fullPresenceErr := p.saturatedReclaimPresence(availableCPUs, prior)
+			if fullPresenceErr == nil {
+				shareCapacityAfterPresence := nonBindingAvailableSize -
+					fullPresence.Intersection(nonBindingAvailableCPUs).Size()
+				if shareQuantity >= shareCapacityAfterPresence {
+					presence = fullPresence
+				}
+			} else if shareQuantity >= nonBindingAvailableSize {
+				err = fullPresenceErr
+				return
+			}
 		}
-		nonBindingAvailableCPUs = nonBindingAvailableCPUs.Difference(configuredReclaimMinimum)
-		nonBindingAvailableSize = nonBindingAvailableCPUs.Size()
+		if !presence.IsEmpty() {
+			if explicitReclaimQuantity > 0 && presence.Size() > explicitReclaimQuantity {
+				err = fmt.Errorf("explicit reclaim quantity %d cannot preserve a whole core in every committed NUMA (needs %d)",
+					explicitReclaimQuantity, presence.Size())
+				return
+			}
+			if quantity > presence.Size() {
+				nonBindingPoolsQuantityMap[commonstate.PoolNameReclaim] = quantity - presence.Size()
+			} else {
+				delete(nonBindingPoolsQuantityMap, commonstate.PoolNameReclaim)
+			}
+			poolsCPUSet[commonstate.PoolNameReclaim] = poolsCPUSet[commonstate.PoolNameReclaim].Union(presence)
+			configuredReclaimMinimum = configuredReclaimMinimum.Union(presence)
+			availableCPUs = availableCPUs.Difference(presence)
+			nonBindingAvailableCPUs = nonBindingAvailableCPUs.Difference(presence)
+			nonBindingAvailableSize = nonBindingAvailableCPUs.Size()
+			nonBindingPoolsTotalQuantity = general.SumUpMapValues(nonBindingPoolsQuantityMap)
+		}
 	}
+
+	availableCPUs = availableCPUs.Difference(nonBindingAvailableCPUs)
 
 	isolatedCPUSet = make(map[string]map[string]machine.CPUSet)
 	isolatedTotalQuantity := general.SumUpMultipleMapValues(isolatedQuantityMap)
@@ -4140,6 +4237,18 @@ func (p *DynamicPolicy) generatePoolsAndIsolation(
 				// the terminal final-validator rejects the empty reclaim pool (no-write).
 				err = fbErr
 				return
+			}
+			if enableReclaim && !allowOverlap && !priorReclaim.IsEmpty() {
+				reclaimFallback, fbErr = reclaimNUMAPresence(
+					p.machine.machineInfo.CPUTopology,
+					reclaimFallback,
+					priorReclaim,
+					eligible,
+				)
+				if fbErr != nil {
+					err = fbErr
+					return
+				}
 			}
 			general.Infof("bounded reclaim fallback in generatePoolsAndIsolation: %s", reclaimFallback.String())
 			poolsCPUSet[commonstate.PoolNameReclaim] = reclaimFallback

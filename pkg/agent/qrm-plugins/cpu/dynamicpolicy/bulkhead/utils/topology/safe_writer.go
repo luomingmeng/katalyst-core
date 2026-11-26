@@ -23,8 +23,6 @@ import (
 	"path/filepath"
 	"sort"
 
-	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-
 	"github.com/kubewharf/katalyst-core/pkg/util/machine"
 )
 
@@ -338,62 +336,6 @@ func planExecutionReservationCost(plan PhasePlan) ExecutionReservationCost {
 		cost.Rollback = addPhysicalWriteCost(cost.Rollback, rollback)
 	}
 	return cost
-}
-
-func executionWithRollbackError(executionErr, rollbackErr error) error {
-	return newExecutionRollbackError(executionErr, rollbackErr)
-}
-
-func (w safeCPUSetWriter) rollbackOperationWithRecovery(
-	operation PlanOperation,
-	wroteCPUs, wroteMems bool,
-) error {
-	rollbackWrites := 0
-	if wroteCPUs {
-		rollbackWrites++
-	}
-	if wroteMems {
-		rollbackWrites++
-	}
-	recoveryCtx, cancelRecovery, err := newAdjustmentRecoveryContext(rollbackWrites)
-	if err != nil {
-		return err
-	}
-	defer cancelRecovery()
-	return w.rollbackOperation(recoveryCtx, operation, wroteCPUs, wroteMems)
-}
-
-func (w safeCPUSetWriter) rollbackOperation(
-	ctx context.Context,
-	operation PlanOperation,
-	wroteCPUs, wroteMems bool,
-) error {
-	var rollbackErr error
-	if wroteCPUs {
-		if err := w.recordRollbackPhysicalWriteAttempt(ctx, PhysicalWriteCost{CPUSetWrites: 1}); err != nil {
-			rollbackErr = utilerrors.NewAggregate([]error{rollbackErr, err})
-		} else if err := w.driver.WriteCPUs(
-			ctx, operation.Rel, operation.ExpectedIdentity, operation.ExpectedCurrent.CPUs,
-		); err != nil {
-			rollbackErr = utilerrors.NewAggregate([]error{
-				rollbackErr,
-				fmt.Errorf("rollback cpuset.cpus for %q: %w", operation.Rel, err),
-			})
-		}
-	}
-	if wroteMems {
-		if err := w.recordRollbackPhysicalWriteAttempt(ctx, PhysicalWriteCost{MemsWrites: 1}); err != nil {
-			rollbackErr = utilerrors.NewAggregate([]error{rollbackErr, err})
-		} else if err := w.driver.WriteMems(
-			ctx, operation.Rel, operation.ExpectedIdentity, operation.ExpectedCurrent.Mems,
-		); err != nil {
-			rollbackErr = utilerrors.NewAggregate([]error{
-				rollbackErr,
-				fmt.Errorf("rollback cpuset.mems for %q: %w", operation.Rel, err),
-			})
-		}
-	}
-	return rollbackErr
 }
 
 func (w safeCPUSetWriter) dormantProofCountUnder(ancestor string) int {

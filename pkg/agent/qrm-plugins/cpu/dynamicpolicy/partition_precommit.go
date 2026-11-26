@@ -242,20 +242,17 @@ func (p *DynamicPolicy) preparePendingCPUPartition(
 	if pending.enforceNUMAReclaimPresence && !pending.allowOverlap &&
 		p.machine.machineInfo != nil && p.machine.machineInfo.CPUTopology != nil &&
 		(pending.dynamicConfig == nil || pending.dynamicConfig.EnableReclaim) {
-		// Capacity that cannot hold reclaim: reserved CPUs plus every allocation in
-		// the candidate outside the reclaim pool. A NUMA fully covered by these has
-		// no reclaim room, so losing its bucket there is not an avoidable
-		// concentration.
+		// Hard ownership can make a committed NUMA physically unavailable, but
+		// the default soft share pool must never excuse a missing reclaim bucket.
 		unavailable := p.config.reservedCPUs.Clone()
 		for poolName, containerEntries := range candidate {
-			for containerName, allocation := range containerEntries {
-				if allocation == nil || allocation.AllocationResult.IsEmpty() {
-					continue
+			if poolName == commonstate.PoolNameShare || poolName == commonstate.PoolNameReclaim {
+				continue
+			}
+			for _, allocation := range containerEntries {
+				if allocation != nil {
+					unavailable = unavailable.Union(allocation.AllocationResult)
 				}
-				if poolName == commonstate.PoolNameReclaim && containerName == commonstate.FakedContainerName {
-					continue
-				}
-				unavailable = unavailable.Union(allocation.AllocationResult)
 			}
 		}
 		if err := validateReclaimNUMAPresence(
