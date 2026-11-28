@@ -33,6 +33,8 @@ package metric_emitter
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
 	"runtime"
 	"testing"
 	"time"
@@ -224,6 +226,19 @@ func TestCustomMetricEmitter_EmptySyncersReturnsOnCancel(t *testing.T) {
 func TestCustomMetricEmitter_NoGoroutineLeak(t *testing.T) {
 	t.Parallel()
 
+	// Keep process-wide sampling separate from parallel tests that start goroutines.
+	const childKey = "KATALYST_METRIC_EMITTER_LEAK_TEST"
+	if os.Getenv(childKey) != t.Name() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0],
+			"-test.run=^TestCustomMetricEmitter_NoGoroutineLeak$", "-test.count=1", "-test.timeout=8s")
+		cmd.Env = append(os.Environ(), childKey+"="+t.Name())
+		output, err := cmd.CombinedOutput()
+		require.NoError(t, err, "isolated metric emitter leak test failed: %s", output)
+		return
+	}
+
 	// warm up so runtime goroutine bookkeeping settles
 	runtime.Gosched()
 	before := runtime.NumGoroutine()
@@ -242,8 +257,21 @@ func TestCustomMetricEmitter_NoGoroutineLeak(t *testing.T) {
 	requireClosed(t, healthy.stopped, "healthy stopped")
 	requireClosed(t, done, "emitter.Run returned")
 
-	// settle and allow any stray managed goroutine to finish
-	require.Eventually(t, func() bool {
-		return runtime.NumGoroutine() <= before
-	}, testTimeout, 5*time.Millisecond, "goroutine count should not grow after emitter shutdown")
+	// Sample in this goroutine: Eventually starts a goroutine for each sample,
+	// which would itself increase the count we are checking.
+	timer := time.NewTimer(testTimeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if runtime.NumGoroutine() <= before {
+			return
+		}
+		select {
+		case <-timer.C:
+			require.LessOrEqual(t, runtime.NumGoroutine(), before, "goroutine count should not grow after emitter shutdown")
+			return
+		case <-ticker.C:
+		}
+	}
 }
