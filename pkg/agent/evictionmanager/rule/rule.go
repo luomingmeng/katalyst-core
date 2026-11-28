@@ -17,6 +17,7 @@ limitations under the License.
 package rule
 
 import (
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 	kubelettypes "k8s.io/kubernetes/pkg/kubelet/types"
 
@@ -34,6 +35,9 @@ var evictionScopePriority = map[string]int{
 type EvictionStrategy interface {
 	// CandidateSort defines the eviction priority among different EvictPods
 	CandidateSort(rpList RuledEvictPodList)
+
+	// FilterPods applies the same protection as the final execution check.
+	FilterPods(pods []*v1.Pod) []*v1.Pod
 
 	// CandidateValidate defines whether the given pod is permitted for
 	// eviction since some specific EvictPods should always keep running.
@@ -69,26 +73,35 @@ func (e *EvictionStrategyImpl) CandidateSort(rpList RuledEvictPodList) {
 	general.NewMultiSorter(e.compares...).Sort(rpList)
 }
 
-// CandidateValidate will try to filter out EvictPods from eviction
-// - EvictPods with katalyst SystemQoS
-// - EvictPods marked as critical
+// FilterPods excludes protected or unclassifiable pods before plugin selection.
+func (e *EvictionStrategyImpl) FilterPods(pods []*v1.Pod) []*v1.Pod {
+	filtered := make([]*v1.Pod, 0, len(pods))
+	for _, pod := range pods {
+		if e.validatePod(pod) {
+			filtered = append(filtered, pod)
+		}
+	}
+	return filtered
+}
+
+// CandidateValidate retains the execution-time protection for plugin results.
 func (e *EvictionStrategyImpl) CandidateValidate(rp *RuledEvictPod) bool {
-	pod := rp.EvictPod.Pod
-	if pod == nil {
+	if rp == nil || rp.EvictPod == nil {
 		return false
 	}
+	return e.validatePod(rp.Pod)
+}
 
-	if ok, err := e.conf.CheckSystemQoSForPod(pod); err != nil {
-		klog.Errorf("failed to get qos for pod %v, err: %v", pod.Name, err)
-		return true
-	} else if ok {
+func (e *EvictionStrategyImpl) validatePod(pod *v1.Pod) bool {
+	if pod == nil || kubelettypes.IsCriticalPod(pod) {
 		return false
 	}
-
-	if kubelettypes.IsCriticalPod(pod) {
+	system, err := e.conf.CheckSystemQoSForPod(pod)
+	if err != nil {
+		general.Errorf("skip eviction for pod %s/%s: failed to get qos: %v", pod.Namespace, pod.Name, err)
 		return false
 	}
-	return true
+	return !system
 }
 
 // CompareKatalystQoS compares KatalystQoS for EvictPods, if we failed to

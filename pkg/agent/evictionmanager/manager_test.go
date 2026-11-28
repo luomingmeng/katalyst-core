@@ -24,11 +24,14 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/events"
+	kubelettypes "k8s.io/kubernetes/pkg/kubelet/types"
 
 	"github.com/kubewharf/katalyst-api/pkg/apis/node/v1alpha1"
 	apiconsts "github.com/kubewharf/katalyst-api/pkg/consts"
@@ -36,6 +39,7 @@ import (
 	endpointpkg "github.com/kubewharf/katalyst-core/pkg/agent/evictionmanager/endpoint"
 	"github.com/kubewharf/katalyst-core/pkg/agent/evictionmanager/podkiller"
 	"github.com/kubewharf/katalyst-core/pkg/agent/evictionmanager/record"
+	"github.com/kubewharf/katalyst-core/pkg/agent/evictionmanager/rule"
 	"github.com/kubewharf/katalyst-core/pkg/client"
 	"github.com/kubewharf/katalyst-core/pkg/config"
 	"github.com/kubewharf/katalyst-core/pkg/config/agent"
@@ -51,6 +55,7 @@ import (
 	"github.com/kubewharf/katalyst-core/pkg/util/credential"
 	"github.com/kubewharf/katalyst-core/pkg/util/credential/authorization"
 	"github.com/kubewharf/katalyst-core/pkg/util/general"
+	"github.com/kubewharf/katalyst-core/pkg/util/native"
 )
 
 type recordingManagerKiller struct {
@@ -881,4 +886,143 @@ func TestMetricsPodToEvictAddsPodMetricAnnotations(t *testing.T) {
 	assert.Equal(t, "test", tagMap["pod_app"])
 	assert.Equal(t, apiconsts.PodSaleModeSpot, tagMap["pod_anno_"+apiconsts.PodAnnotationSaleModeKey])
 	assert.Equal(t, UserUnknown, tagMap["pod_anno_missing.annotation"])
+}
+
+// candidateFilterPlugin deliberately ranks the protected Burstable pod before
+// the Guaranteed workload unless the manager removes it before selection.
+type candidateFilterPlugin struct {
+	pluginSkeleton
+	candidates     []*v1.Pod
+	getInput       []*v1.Pod
+	thresholdInput []*v1.Pod
+	topInput       []*v1.Pod
+}
+
+func (p *candidateFilterPlugin) GetEvictPods(_ context.Context, r *pluginapi.GetEvictPodsRequest) (*pluginapi.GetEvictPodsResponse, error) {
+	p.getInput = r.ActivePods
+	return &pluginapi.GetEvictPodsResponse{}, nil
+}
+
+func (p *candidateFilterPlugin) ThresholdMet(_ context.Context, r *pluginapi.GetThresholdMetRequest) (*pluginapi.ThresholdMetResponse, error) {
+	p.thresholdInput = r.ActivePods
+	return &pluginapi.ThresholdMetResponse{
+		MetType:       pluginapi.ThresholdMetType_HARD_MET,
+		EvictionScope: "test-memory",
+		CandidatePods: p.candidates,
+	}, nil
+}
+
+func (p *candidateFilterPlugin) GetTopEvictionPods(_ context.Context, r *pluginapi.GetTopEvictionPodsRequest) (*pluginapi.GetTopEvictionPodsResponse, error) {
+	p.topInput = r.ActivePods
+	return &pluginapi.GetTopEvictionPodsResponse{TargetPods: native.NewPodSourceList(r.ActivePods).Sort(native.PodNativeQoSCmpFunc).TopN(r.TopN)}, nil
+}
+
+type candidateFilterEmitter struct {
+	recordingMetricEmitter
+	victims      []string
+	runningCount int64
+}
+
+func (e *candidateFilterEmitter) StoreInt64(key string, value int64, typ metrics.MetricTypeName, tags ...metrics.MetricTag) error {
+	if key == MetricsNameRunningPodCNT {
+		e.runningCount = value
+	}
+	if key == MetricsNameDryRunVictimPodCNT || key == MetricsNameVictimPodCNT {
+		if name := metricTagsToMap(tags)["victim_name"]; name != "" {
+			e.victims = append(e.victims, name)
+		}
+	}
+	return e.recordingMetricEmitter.StoreInt64(key, value, typ, tags...)
+}
+
+func TestCandidateProtectionBeforeSelection(t *testing.T) {
+	for _, dryRun := range []bool{true, false} {
+		for _, override := range []bool{true, false} {
+			t.Run(fmt.Sprintf("dryRun=%v/override=%v", dryRun, override), func(t *testing.T) {
+				mgr := makeEvictionManager(t)
+				system := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "protected", UID: "protected", Annotations: map[string]string{
+					apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelSystemCores,
+				}}, Spec: v1.PodSpec{Containers: []v1.Container{{Name: "main", Resources: v1.ResourceRequirements{Limits: v1.ResourceList{v1.ResourceMemory: resource.MustParse("24Gi")}}}}}}
+				workload := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "workload", UID: "workload"}, Spec: v1.PodSpec{Containers: []v1.Container{{Name: "main", Resources: v1.ResourceRequirements{
+					Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("1"), v1.ResourceMemory: resource.MustParse("1Gi")},
+					Limits:   v1.ResourceList{v1.ResourceCPU: resource.MustParse("1"), v1.ResourceMemory: resource.MustParse("1Gi")},
+				}}}}}
+				input := []*v1.Pod{system, workload}
+				mgr.metaGetter.PodFetcher = &pod.PodFetcherStub{PodList: input}
+				p := &candidateFilterPlugin{}
+				if override {
+					p.candidates = input
+				}
+				mgr.endpoints = map[string]endpointpkg.Endpoint{"candidate-filter": p}
+				em := &candidateFilterEmitter{}
+				mgr.emitter = em
+				if dryRun {
+					mgr.conf.GetDynamicConfiguration().DryRun = []string{"*"}
+				}
+				mgr.sync(context.Background())
+				assert.Equal(t, input, mgr.metaGetter.PodFetcher.(*pod.PodFetcherStub).PodList, "do not remove system pods from the original inventory")
+				assert.Equal(t, int64(2), em.runningCount)
+				assert.Equal(t, []*v1.Pod{workload}, p.getInput)
+				assert.Equal(t, []*v1.Pod{workload}, p.thresholdInput)
+				assert.Equal(t, []*v1.Pod{workload}, p.topInput, "a plugin candidate override must not restore protected pods")
+				assert.Equal(t, []string{"workload"}, em.victims, "system must not occupy Top1 or appear in dryRun/real victim metrics")
+			})
+		}
+	}
+}
+
+func TestCandidateOverrideOnlyProtectedPods(t *testing.T) {
+	mgr := makeEvictionManager(t)
+	protected := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "protected", UID: "protected", Annotations: map[string]string{
+		apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelSystemCores,
+	}}}
+	p := &candidateFilterPlugin{candidates: []*v1.Pod{protected}}
+	mgr.endpoints = map[string]endpointpkg.Endpoint{"candidate-filter": p}
+	mgr.conf.GetDynamicConfiguration().DryRun = []string{"*"}
+	em := &candidateFilterEmitter{}
+	mgr.emitter = em
+	collector, err := mgr.collectEvictionResult(context.Background(), pods)
+	assert.NoError(t, err)
+	assert.Empty(t, p.topInput, "do not fall back to the full inventory when an override filters to empty")
+	assert.Empty(t, collector.getForceEvictPods())
+	assert.Empty(t, em.victims)
+}
+
+func TestFinalCandidateValidationRejectsInvalidQoS(t *testing.T) {
+	mgr := makeEvictionManager(t)
+	errPod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "invalid", UID: "invalid", Annotations: map[string]string{apiconsts.PodAnnotationQoSLevelKey: "invalid"}}}
+	rp := &rule.RuledEvictPod{EvictPod: &pluginapi.EvictPod{Pod: errPod}}
+	assert.False(t, mgr.killStrategy.CandidateValidate(rp))
+	killer := &recordingManagerKiller{name: "test"}
+	mgr.podKiller = podkiller.NewSynchronizedPodKiller(killer)
+	assert.NoError(t, mgr.doEvict(nil, map[string]*rule.RuledEvictPod{"invalid": rp}))
+	assert.Zero(t, killer.calls, "QoS errors must not reach the killer")
+}
+
+func TestEvictionCandidateFiltersAreShared(t *testing.T) {
+	mgr := makeEvictionManager(t)
+	mgr.conf.EvictionSkippedAnnotationKeys = sets.NewString("warm")
+	mgr.conf.EvictionSkippedLabelKeys = sets.NewString("pool")
+	makePod := func(name string, annotations, labels map[string]string) *v1.Pod {
+		return &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(name), Annotations: annotations, Labels: labels}}
+	}
+	normal := makePod("normal", nil, nil)
+	input := []*v1.Pod{
+		nil,
+		makePod("system", map[string]string{apiconsts.PodAnnotationQoSLevelKey: apiconsts.PodAnnotationQoSLevelSystemCores}, nil),
+		makePod("invalid", map[string]string{apiconsts.PodAnnotationQoSLevelKey: "invalid"}, nil),
+		makePod("critical", map[string]string{kubelettypes.ConfigSourceAnnotationKey: "file"}, nil),
+		makePod("warm", map[string]string{"warm": "false"}, nil),
+		makePod("pool", nil, map[string]string{"pool": "false"}),
+		normal,
+	}
+	assert.Equal(t, []*v1.Pod{normal}, mgr.filterEvictionCandidates(input))
+	assert.Len(t, input, 7, "filter must not mutate the caller inventory")
+	// Nil candidates are checked above; the protobuf response cannot encode nil Pods.
+	p := &candidateFilterPlugin{candidates: input[1:]}
+	mgr.endpoints = map[string]endpointpkg.Endpoint{"candidate-filter": p}
+	mgr.conf.GetDynamicConfiguration().DryRun = []string{"*"}
+	_, err := mgr.collectEvictionResult(context.Background(), []*v1.Pod{normal})
+	assert.NoError(t, err)
+	assert.Equal(t, []*v1.Pod{normal}, p.topInput, "candidate overrides must retain skip-key and critical protections too")
 }

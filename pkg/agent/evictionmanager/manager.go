@@ -373,7 +373,7 @@ func (m *EvictionManger) sync(ctx context.Context) {
 	general.Infof(" currently, there are %v active pods", len(activePods))
 	_ = m.emitter.StoreInt64(MetricsNameRunningPodCNT, int64(len(activePods)), metrics.MetricTypeNameRaw)
 
-	pods := native.FilterOutSkipEvictionPods(activePods, m.conf.EvictionSkippedAnnotationKeys, m.conf.EvictionSkippedLabelKeys)
+	pods := m.filterEvictionCandidates(activePods)
 	general.Infof(" currently, there are %v candidate pods", len(pods))
 	_ = m.emitter.StoreInt64(MetricsNameCandidatePodCNT, int64(len(pods)), metrics.MetricTypeNameRaw)
 
@@ -395,6 +395,11 @@ func (m *EvictionManger) sync(ctx context.Context) {
 	if len(errList) > 0 {
 		err = errors.NewAggregate(errList)
 	}
+}
+
+func (m *EvictionManger) filterEvictionCandidates(pods []*v1.Pod) []*v1.Pod {
+	pods = native.FilterOutSkipEvictionPods(pods, m.conf.EvictionSkippedAnnotationKeys, m.conf.EvictionSkippedLabelKeys)
+	return m.killStrategy.FilterPods(pods)
 }
 
 func (m *EvictionManger) collectEvictionResult(ctx context.Context, pods []*v1.Pod) (*evictionRespCollector, error) {
@@ -471,11 +476,11 @@ func (m *EvictionManger) collectEvictionResult(ctx context.Context, pods []*v1.P
 		activePods := pods
 		candidateEvictionRecords := make([]*pluginapi.EvictionRecord, 0, len(threshold.CandidatePods))
 		if len(threshold.CandidatePods) > 0 {
-			// use candidate pods as active pods if they are not empty
-			activePods = threshold.CandidatePods
+			// Candidate overrides must not restore protected pods or occupy TopN.
+			activePods = m.filterEvictionCandidates(threshold.CandidatePods)
 
-			// get eviction records for all candidate pods
-			for _, pod := range threshold.CandidatePods {
+			// get eviction records only for the filtered candidates
+			for _, pod := range activePods {
 				if r, ok := records[string(pod.UID)]; ok {
 					candidateEvictionRecords = append(candidateEvictionRecords, r)
 				}

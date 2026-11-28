@@ -64,6 +64,13 @@ func TestEvictionStrategyImp(t *testing.T) {
 			expected: false,
 		},
 		{
+			comment: "invalid qos must not permit eviction",
+			ep: makeRuledEvictPodWithAnnotation("invalid-p", "", map[string]string{
+				apiconsts.PodAnnotationQoSLevelKey: "invalid",
+			}),
+			expected: false,
+		},
+		{
 			comment:  "normal pod should  not be skipped",
 			ep:       makeRuledEvictPodWithAnnotation("system-p", "", map[string]string{}),
 			expected: true,
